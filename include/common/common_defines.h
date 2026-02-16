@@ -252,6 +252,20 @@ inline const char* config_to_string(int config) {
 	}
 }
 
+// Long config name with narrowband awareness
+inline const char* config_to_string_nb(int config, bool narrowband) {
+	if (!narrowband) return config_to_string(config);
+	switch (config) {
+		case ROBUST_0: return "ROBUST 0 NB (8-MFSK, ~28 bps)";
+		case ROBUST_1: return "ROBUST 1 NB (4-MFSK x2, ~37 bps)";
+		case ROBUST_2: return "ROBUST 2 NB (4-MFSK x2, ~149 bps)";
+		case CONFIG_0:  return "CONFIG 0 NB (BPSK 1/16, ~61 bps)";
+		case CONFIG_15: return "CONFIG 15 NB (16QAM 14/16, ~1018 bps)";
+		case CONFIG_16: return "CONFIG 16 NB (32QAM 14/16, ~1133 bps)";
+		default: return config_to_string(config); // fallback to wideband string
+	}
+}
+
 // Short config label for status bar
 inline const char* config_to_short_string(int config) {
 	switch (config) {
@@ -276,6 +290,34 @@ inline const char* config_to_short_string(int config) {
 		case CONFIG_15: return "CFG 15 16QAM";
 		case CONFIG_16: return "CFG 16 32QAM";
 		default: return "???";
+	}
+}
+
+// Short config label with narrowband prefix
+inline const char* config_to_short_string_nb(int config, bool narrowband) {
+	if (!narrowband) return config_to_short_string(config);
+	switch (config) {
+		case ROBUST_0: return "NB ROB 0";
+		case ROBUST_1: return "NB ROB 1";
+		case ROBUST_2: return "NB ROB 2";
+		case CONFIG_0:  return "NB C0 BPSK";
+		case CONFIG_1:  return "NB C1 BPSK";
+		case CONFIG_2:  return "NB C2 BPSK";
+		case CONFIG_3:  return "NB C3 BPSK";
+		case CONFIG_4:  return "NB C4 BPSK";
+		case CONFIG_5:  return "NB C5 BPSK";
+		case CONFIG_6:  return "NB C6 BPSK";
+		case CONFIG_7:  return "NB C7 QPSK";
+		case CONFIG_8:  return "NB C8 QPSK";
+		case CONFIG_9:  return "NB C9 QPSK";
+		case CONFIG_10: return "NB C10 8PSK";
+		case CONFIG_11: return "NB C11 8PSK";
+		case CONFIG_12: return "NB C12 QPSK";
+		case CONFIG_13: return "NB C13 16QAM";
+		case CONFIG_14: return "NB C14 8PSK";
+		case CONFIG_15: return "NB C15 16QAM";
+		case CONFIG_16: return "NB C16 32QAM";
+		default: return "NB ???";
 	}
 }
 

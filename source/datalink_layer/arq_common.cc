@@ -133,6 +133,7 @@ cl_arq_controller::cl_arq_controller()
 
 	gear_shift_on=NO;
 	robust_enabled=NO;
+	narrowband_enabled=NO;
 	gear_shift_algorithm=SUCCESS_BASED_LADDER;
 
 	gear_shift_up_success_rate_precentage=70;
@@ -2852,7 +2853,9 @@ void cl_arq_controller::receive()
 			// BREAK pattern detection: after failed decode, check for emergency
 			// "drop to ROBUST_0" signal from commander. Works in both OFDM and MFSK
 			// modes — metric threshold + matched count prevent false positives.
-			if(break_detected == NO)
+			// Suppress during turboshift: probing different configs produces false
+			// BREAK matches (especially NB M=8 vs OFDM energy).
+			if(break_detected == NO && !turboshift_active)
 			{
 				int matched = 0;
 				double metric = telecom_system->detect_break_pattern_from_passband(

@@ -142,6 +142,7 @@ struct st_gui_state {
     // ========== Modem Options ==========
     std::atomic<bool> coarse_freq_sync_enabled{false}; // Coarse freq search (±30 Hz), for HF radio use
     std::atomic<bool> robust_mode_enabled{false};      // MFSK robust mode for weak-signal hailing
+    std::atomic<bool> narrowband_enabled{false};       // Narrowband mode (Nc=10, BW=469 Hz)
 
     // ========== GUI Control ==========
     std::atomic<bool> gui_running{true};

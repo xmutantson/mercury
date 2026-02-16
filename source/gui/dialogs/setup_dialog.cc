@@ -37,6 +37,7 @@ SetupDialog::SetupDialog()
     , ldpc_iterations_max_(50)
     , coarse_freq_sync_enabled_(false)
     , robust_mode_enabled_(false)
+    , narrowband_enabled_(false)
     , hide_console_(false)
 {
     memset(my_callsign_, 0, sizeof(my_callsign_));
@@ -82,6 +83,7 @@ void SetupDialog::loadSettings() {
     ldpc_iterations_max_ = g_settings.ldpc_iterations_max;
     coarse_freq_sync_enabled_ = g_settings.coarse_freq_sync_enabled;
     robust_mode_enabled_ = g_settings.robust_mode_enabled;
+    narrowband_enabled_ = g_settings.narrowband_enabled;
 
     hide_console_ = g_settings.hide_console;
 }
@@ -157,6 +159,8 @@ bool SetupDialog::render() {
             g_gui_state.coarse_freq_sync_enabled.store(coarse_freq_sync_enabled_);
             g_settings.robust_mode_enabled = robust_mode_enabled_;
             g_gui_state.robust_mode_enabled.store(robust_mode_enabled_);
+            g_settings.narrowband_enabled = narrowband_enabled_;
+            g_gui_state.narrowband_enabled.store(narrowband_enabled_);
             g_settings.hide_console = hide_console_;
 
             settings_applied = true;
@@ -190,6 +194,8 @@ bool SetupDialog::render() {
             g_gui_state.coarse_freq_sync_enabled.store(coarse_freq_sync_enabled_);
             g_settings.robust_mode_enabled = robust_mode_enabled_;
             g_gui_state.robust_mode_enabled.store(robust_mode_enabled_);
+            g_settings.narrowband_enabled = narrowband_enabled_;
+            g_gui_state.narrowband_enabled.store(narrowband_enabled_);
             g_settings.hide_console = hide_console_;
 
             settings_applied = true;
@@ -358,6 +364,13 @@ void SetupDialog::renderGearShiftTab() {
     ImGui::Checkbox("Enable Robust Mode (MFSK)", &robust_mode_enabled_);
     ImGui::TextWrapped("Uses narrowband FSK for weak-signal hailing and low-speed data. "
                        "When combined with Gear Shift, hails on Robust then shifts to OFDM.");
+
+    ImGui::Spacing();
+
+    ImGui::Checkbox("Narrowband Mode (500 Hz)", &narrowband_enabled_);
+    ImGui::TextWrapped("Restricts bandwidth to 469 Hz (10 subcarriers). Use for 500 Hz channel "
+                       "allocations. Concentrates power for +6.7 dB SNR advantage. "
+                       "Both stations must use the same mode.");
 
     ImGui::Spacing();
 

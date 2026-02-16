@@ -108,6 +108,7 @@ int main(int argc, char *argv[])
     int operation_mode = ARQ_MODE;
     int gear_shift_mode = NO_GEAR_SHIFT;
     int robust_mode = 0;  // 0=disabled, 1=enabled via -R flag
+    int narrowband_mode = 0;  // 0=wideband, 1=narrowband (500 Hz) via -N flag
     bool explicit_config = false;  // true if user specified -s
     int base_tcp_port = 0;
 
@@ -174,6 +175,7 @@ int main(int argc, char *argv[])
         printf(" -f [offset_hz]             TX carrier offset in Hz for testing frequency sync (e.g., -f 25 for 25 Hz offset).\n");
         printf(" -I [iterations]            LDPC decoder max iterations (5-50, default 50). Lower = less CPU.\n");
         printf(" -R                         Enable Robust mode (MFSK for weak-signal hailing/low-speed data).\n");
+        printf(" -N                         Enable Narrowband mode (500 Hz bandwidth, 10 subcarriers).\n");
         printf(" -T [tx_gain_db]            TX gain in dB (temporary, overrides GUI slider). E.g. -T -25.6 for -30 dBFS output.\n");
         printf(" -G [rx_gain_db]            RX gain in dB (temporary, overrides GUI slider). E.g. -G 25.6 to boost weak input.\n");
         printf(" -v                         Verbose debug output (OFDM sync, RX timing, ACK detection).\n");
@@ -185,7 +187,7 @@ int main(int argc, char *argv[])
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RP:vT:G:")) != -1)
+    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:")) != -1)
     {
         switch (opt)
         {
@@ -319,6 +321,10 @@ int main(int argc, char *argv[])
         case 'R':
             robust_mode = 1;
             printf("Robust mode (MFSK) enabled.\n");
+            break;
+        case 'N':
+            narrowband_mode = 1;
+            printf("Narrowband mode (500 Hz) enabled.\n");
             break;
         case 'v':
             g_verbose = 1;
@@ -523,6 +529,9 @@ start_modem:
         exit(EXIT_FAILURE);
     }
 
+    // Set narrowband mode on telecom_system for all modes (ARQ sets it again below)
+    telecom_system.narrowband_enabled = narrowband_mode ? YES : NO;
+
     // initializing audio system
     pthread_t radio_capture, radio_playback, radio_capture_prep;
 
@@ -556,6 +565,10 @@ start_modem:
         if (robust_mode)
             g_settings.robust_mode_enabled = true;
         g_gui_state.robust_mode_enabled.store(g_settings.robust_mode_enabled);
+        // Narrowband mode: CLI -N overrides INI setting
+        if (narrowband_mode)
+            g_settings.narrowband_enabled = true;
+        g_gui_state.narrowband_enabled.store(g_settings.narrowband_enabled);
         // TX gain override from -T flag (temporary, not saved to INI)
         if (tx_gain_override > -900.0) {
             g_gui_state.tx_gain_db.store(tx_gain_override);
@@ -596,9 +609,12 @@ start_modem:
         // Robust mode: CLI -R or INI setting enables MFSK hailing
 #ifdef MERCURY_GUI_ENABLED
         ARQ.robust_enabled = (g_settings.robust_mode_enabled || robust_mode) ? YES : NO;
+        ARQ.narrowband_enabled = (g_settings.narrowband_enabled || narrowband_mode) ? YES : NO;
 #else
         ARQ.robust_enabled = robust_mode ? YES : NO;
+        ARQ.narrowband_enabled = narrowband_mode ? YES : NO;
 #endif
+        telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
         ARQ.init(base_tcp_port, (gear_shift_mode == NO_GEAR_SHIFT)? NO : YES, mod_config);
 
         // Apply command-line arguments
@@ -668,8 +684,10 @@ start_modem:
                 // Update SNR measurements (uplink = what we receive, downlink = what remote receives from us)
                 gui_update_arq_measurements(ARQ.get_snr_uplink(), ARQ.get_snr_downlink());
 
-                // Sync robust mode from GUI to ARQ (takes effect on next connection)
+                // Sync robust mode and narrowband from GUI to ARQ (takes effect on next connection)
                 ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;
+                ARQ.narrowband_enabled = g_gui_state.narrowband_enabled.load() ? YES : NO;
+                telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
 
                 // Rolling throughput (10-second window, updated every 1s)
                 {
@@ -781,7 +799,6 @@ start_modem:
         telecom_system.constellation_plot.reset("PLOT");
 
         telecom_system.BER_PLOT_passband_process_main();
-
         telecom_system.constellation_plot.close();
     }
 

@@ -33,6 +33,11 @@ CONFIG_NAMES = {
     **{i: f"CONFIG_{i}" for i in range(17)}
 }
 
+CONFIG_NAMES_NB = {
+    100: "ROBUST_0_NB", 101: "ROBUST_1_NB", 102: "ROBUST_2_NB",
+    **{i: f"CONFIG_{i}_NB" for i in range(17)}
+}
+
 # Theoretical max throughput (bps) per config — from Mercury config table
 CONFIG_MAX_BPS = {
     100: 14, 101: 22, 102: 87,
@@ -40,6 +45,16 @@ CONFIG_MAX_BPS = {
     5: 631, 6: 841, 7: 1051, 8: 1262, 9: 1682,
     10: 2102, 11: 2523, 12: 2943, 13: 3363,
     14: 3924, 15: 4785, 16: 5735,
+}
+
+# Narrowband (Nc=10) PHY bitrates — ROBUST measured via BER, OFDM estimated
+# OFDM NB: same LDPC K bits but 5x longer frames (Nsymb scaled by Nc ratio)
+CONFIG_MAX_BPS_NB = {
+    100: 7, 101: 9, 102: 42,   # Measured: 6.82, 9.17, 41.93 bps
+    0: 18, 1: 36, 2: 54, 3: 72, 4: 90,
+    5: 143, 6: 191, 7: 250, 8: 300, 9: 400,
+    10: 500, 11: 600, 12: 700, 13: 800,
+    14: 950, 15: 1150, 16: 1400,
 }
 
 
@@ -76,6 +91,8 @@ class NoiseInjector:
     # Mercury OFDM passband RMS: sqrt(Nc)/sqrt(Nfft) * carrier_amplitude
     # = sqrt(50)/sqrt(256) * sqrt(2) ≈ 0.625 → -4.1 dBFS
     DEFAULT_SIGNAL_DBFS = -4.4  # conservative estimate accounting for peak clip
+    # Narrowband (Nc=10): sqrt(10)/sqrt(256) * sqrt(2) ≈ 0.279 → -11.1 dBFS
+    DEFAULT_SIGNAL_DBFS_NB = -11.1
 
     def __init__(self, device_index, snr_db=30, sample_rate=48000, signal_dbfs=None):
         self.device_index = device_index
@@ -184,6 +201,38 @@ def tcp_send_commands(port, commands):
         except socket.timeout:
             pass
     return sock
+
+
+def build_extra_args(args):
+    """Build Mercury CLI extra args from benchmark flags (narrowband, tx-attenuate)."""
+    extra = []
+    narrowband = getattr(args, 'narrowband', False)
+
+    if narrowband:
+        extra.append("-N")
+
+    if getattr(args, 'tx_attenuate', False) or narrowband:
+        # Modem's native output level depends on Nc
+        native_dbfs = (NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if narrowband
+                       else NoiseInjector.DEFAULT_SIGNAL_DBFS)
+        # How much to attenuate TX to reach signal_dbfs on the cable
+        atten_db = args.signal_dbfs - native_dbfs  # negative = attenuate
+        # Boost RX by same amount to restore signal level inside modem
+        extra += ["-T", f"{atten_db:.1f}", "-G", f"{-atten_db:.1f}"]
+        print(f"[GAIN] TX {atten_db:.1f} dB (cable at {args.signal_dbfs:.1f} dBFS), "
+              f"RX +{-atten_db:.1f} dB (restores to ~{native_dbfs:.1f} dBFS)")
+
+    return extra
+
+
+def get_config_names(narrowband=False):
+    """Get config name dict for current mode."""
+    return CONFIG_NAMES_NB if narrowband else CONFIG_NAMES
+
+
+def get_config_max_bps(narrowband=False):
+    """Get max BPS dict for current mode."""
+    return CONFIG_MAX_BPS_NB if narrowband else CONFIG_MAX_BPS
 
 
 # ============================================================
@@ -302,14 +351,30 @@ class MercurySession:
                 break
 
     def wait_connected(self, timeout=120):
-        """Wait for CONNECTED status on control port."""
+        """Wait for CONNECTED status on control port.
+        Uses a line buffer to handle TCP stream fragmentation — keywords like
+        CONNECTED can be split across recv() calls when BUFFER messages flood."""
         self._cmd_ctrl.settimeout(2)
         start = time.time()
+        buf = b''
         while time.time() - start < timeout:
             try:
                 data = self._cmd_ctrl.recv(4096)
-                if data and b'CONNECTED' in data:
-                    return True
+                if data:
+                    buf += data
+                    # Process complete lines (delimited by \r or \n)
+                    while b'\r' in buf or b'\n' in buf:
+                        idx = len(buf)
+                        for delim in (b'\r', b'\n'):
+                            pos = buf.find(delim)
+                            if pos >= 0 and pos < idx:
+                                idx = pos
+                        line = buf[:idx]
+                        buf = buf[idx+1:]
+                        if b'CONNECTED' in line and b'DISCONNECTED' not in line:
+                            return True
+                        if b'DISCONNECTED' in line:
+                            return False
             except socket.timeout:
                 continue
             except ConnectionError:
@@ -506,8 +571,10 @@ def generate_sweep_chart(csv_path, output_path):
                 linewidth=2, markersize=4)
 
         # Theoretical max as dashed line
-        if cfg in CONFIG_MAX_BPS:
-            max_bpm = CONFIG_MAX_BPS[cfg] / 8 * 60  # bps → bytes/min
+        is_nb = '_NB' in data['name']
+        bps_table = CONFIG_MAX_BPS_NB if is_nb else CONFIG_MAX_BPS
+        if cfg in bps_table:
+            max_bpm = bps_table[cfg] / 8 * 60  # bps → bytes/min
             ax.axhline(y=max_bpm, color=colors[idx], linestyle='--', alpha=0.3, linewidth=1)
 
     ax.set_xlabel('SNR (dB)', fontsize=12)
@@ -607,11 +674,15 @@ def run_sweep(args):
     log_dir = os.path.join(args.output_dir, f'logs_{ts}')
     os.makedirs(log_dir, exist_ok=True)
 
+    nb = getattr(args, 'narrowband', False)
+    names = get_config_names(nb)
+    max_bps = get_config_max_bps(nb)
+
     print(f"{'='*70}")
-    print(f"Mercury Benchmark — SNR Sweep")
+    print(f"Mercury Benchmark — SNR Sweep{' (NARROWBAND)' if nb else ''}")
     print(f"{'='*70}")
     print(f"Signal level: {args.signal_dbfs:.1f} dBFS")
-    print(f"Configs: {[CONFIG_NAMES.get(c, f'CONFIG_{c}') for c in configs]}")
+    print(f"Configs: {[names.get(c, f'CONFIG_{c}') for c in configs]}")
     print(f"SNR levels: {snr_levels} dB")
     print(f"Measurement duration: {args.measure_duration}s per point")
     print(f"Settle time: {args.settle_time}s between points")
@@ -621,16 +692,7 @@ def run_sweep(args):
     print(f"Output: {csv_path}")
     print()
 
-    # TX gain override: only with --tx-attenuate (for real radio with RX gain).
-    # --tx-attenuate: lower TX to signal_dbfs, boost RX by the same amount.
-    # RX gain is applied in audioio.c capture path before the modem core,
-    # so both signal and noise get the same boost → SNR preserved.
-    extra_args = []
-    if hasattr(args, 'tx_attenuate') and args.tx_attenuate:
-        gain_db = args.signal_dbfs - NoiseInjector.DEFAULT_SIGNAL_DBFS  # negative
-        extra_args = ["-T", f"{gain_db:.1f}", "-G", f"{-gain_db:.1f}"]
-        print(f"[GAIN] TX {gain_db:.1f} dB (signal at {args.signal_dbfs:.1f} dBFS), "
-              f"RX +{-gain_db:.1f} dB (restores to ~{NoiseInjector.DEFAULT_SIGNAL_DBFS:.1f} dBFS)")
+    extra_args = build_extra_args(args)
 
     # Setup noise injector
     device_idx = find_wasapi_cable_output()
@@ -645,7 +707,7 @@ def run_sweep(args):
 
     try:
         for cfg_idx, cfg in enumerate(configs):
-            cfg_name = CONFIG_NAMES.get(cfg, f'CONFIG_{cfg}')
+            cfg_name = names.get(cfg, f'CONFIG_{cfg}')
             print(f"\n{'='*70}")
             print(f"[{cfg_idx+1}/{len(configs)}] Starting {cfg_name} (config={cfg})")
             print(f"{'='*70}")
@@ -803,10 +865,10 @@ def run_sweep(args):
 
         # Summary
         print(f"\n{'='*70}")
-        print("SWEEP COMPLETE")
+        print(f"SWEEP COMPLETE{' (NARROWBAND)' if nb else ''}")
         print(f"{'='*70}")
         for cfg in configs:
-            cfg_name = CONFIG_NAMES.get(cfg, f'CONFIG_{cfg}')
+            cfg_name = names.get(cfg, f'CONFIG_{cfg}')
             cfg_rows = [r for r in results if r['config'] == cfg]
             max_bpm = max((r['bytes_per_min'] for r in cfg_rows), default=0)
             waterfall_snr = None
@@ -849,10 +911,13 @@ def run_stress(args):
     chart_path = os.path.join(args.output_dir, f'benchmark_stress_{ts}.png')
     log_path = os.path.join(args.output_dir, f'benchmark_stress_{ts}.log')
 
+    nb = getattr(args, 'narrowband', False)
+    names = get_config_names(nb)
+
     print(f"{'='*70}")
-    print(f"Mercury Benchmark — Stress Test")
+    print(f"Mercury Benchmark — Stress Test{' (NARROWBAND)' if nb else ''}")
     print(f"{'='*70}")
-    print(f"Start config: {CONFIG_NAMES.get(args.start_config, str(args.start_config))}")
+    print(f"Start config: {names.get(args.start_config, str(args.start_config))}")
     print(f"Bursts: {args.num_bursts}")
     print(f"Noise schedule:")
     for s in schedule:
@@ -862,11 +927,7 @@ def run_stress(args):
     print(f"Estimated total: {total_est/60:.0f} min")
     print()
 
-    extra_args = []
-    if hasattr(args, 'tx_attenuate') and args.tx_attenuate:
-        gain_db = args.signal_dbfs - NoiseInjector.DEFAULT_SIGNAL_DBFS
-        extra_args = ["-T", f"{gain_db:.1f}", "-G", f"{-gain_db:.1f}"]
-        print(f"[GAIN] TX {gain_db:.1f} dB, RX +{-gain_db:.1f} dB")
+    extra_args = build_extra_args(args)
 
     device_idx = find_wasapi_cable_output()
     noise = NoiseInjector(device_idx, snr_db=30, sample_rate=SAMPLE_RATE,
@@ -1088,8 +1149,10 @@ def run_adaptive(args):
     chart_path = os.path.join(args.output_dir, f'benchmark_adaptive_{ts}.png')
     log_path = os.path.join(args.output_dir, f'benchmark_adaptive_{ts}.log')
 
+    nb = getattr(args, 'narrowband', False)
+
     print(f"{'='*70}")
-    print(f"Mercury Benchmark — Adaptive (Gearshift) SNR Sweep")
+    print(f"Mercury Benchmark — Adaptive (Gearshift) SNR Sweep{' (NARROWBAND)' if nb else ''}")
     print(f"{'='*70}")
     print(f"SNR levels: {snr_levels} dB")
     print(f"Measurement duration: {args.measure_duration}s per point")
@@ -1098,11 +1161,7 @@ def run_adaptive(args):
     print(f"Estimated time: {est_time/60:.0f} min")
     print()
 
-    extra_args = []
-    if hasattr(args, 'tx_attenuate') and args.tx_attenuate:
-        gain_db = args.signal_dbfs - NoiseInjector.DEFAULT_SIGNAL_DBFS
-        extra_args = ["-T", f"{gain_db:.1f}", "-G", f"{-gain_db:.1f}"]
-        print(f"[GAIN] TX {gain_db:.1f} dB, RX +{-gain_db:.1f} dB")
+    extra_args = build_extra_args(args)
 
     device_idx = find_wasapi_cable_output()
     noise = NoiseInjector(device_idx, snr_db=30, sample_rate=SAMPLE_RATE,
@@ -1274,6 +1333,9 @@ def main():
                         help='Attenuate Mercury TX and boost RX to match --signal-dbfs. '
                              'Passes -T (TX atten) and -G (RX boost) to both Mercury processes. '
                              'Noise is calibrated to the attenuated signal level for correct SNR.')
+    parser.add_argument('--narrowband', '-N', action='store_true',
+                        help='Enable narrowband mode (500 Hz, Nc=10). Passes -N to Mercury '
+                             'and adjusts noise calibration for narrowband signal level.')
 
     sub = parser.add_subparsers(dest='command', help='Sub-command')
 
@@ -1337,6 +1399,14 @@ def main():
 
     # Propagate common args
     args.output_dir = os.path.abspath(args.output_dir)
+
+    # Apply narrowband defaults
+    if args.narrowband:
+        # In narrowband, default to -30 dBFS on cable to avoid saturation,
+        # with TX attenuation and RX gain boost handled by build_extra_args()
+        if args.signal_dbfs == NoiseInjector.DEFAULT_SIGNAL_DBFS:
+            args.signal_dbfs = -30.0
+            print(f"[NB] Narrowband mode: cable signal level set to {args.signal_dbfs:.1f} dBFS")
 
     if args.command == 'sweep':
         run_sweep(args)

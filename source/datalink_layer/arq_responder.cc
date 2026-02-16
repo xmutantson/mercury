@@ -643,9 +643,22 @@ void cl_arq_controller::process_control_responder()
 
 		if(received_crc == my_crc)
 		{
-			destination_call_sign = callsign_unpack(&messages_control.data[2]);
-			printf("[RX-CTRL] Unpacked commander callsign: '%s'\n", destination_call_sign.c_str());
+			int peer_flags = 0;
+			destination_call_sign = callsign_unpack(&messages_control.data[2], &peer_flags);
+			printf("[RX-CTRL] Unpacked commander callsign: '%s', flags=0x%02X\n", destination_call_sign.c_str(), peer_flags);
 			fflush(stdout);
+
+			// Check narrowband mode agreement (flag embedded in packed callsign bit 39)
+			bool peer_narrowband = (peer_flags & 0x01) != 0;
+			if (peer_narrowband != (narrowband_enabled == YES))
+			{
+				printf("[RX-CTRL] START_CONNECTION REJECTED - narrowband mismatch! "
+					"peer=%s, local=%s\n",
+					peer_narrowband ? "NB" : "WB",
+					narrowband_enabled ? "NB" : "WB");
+				messages_control.status=FREE;
+				return;
+			}
 
 			// Send PENDING to Winlink to notify incoming connection
 			// This allows Winlink to stop scanning and prepare PTT
