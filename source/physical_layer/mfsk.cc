@@ -68,6 +68,10 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		tone_hop_step = 13;  // 13 is prime, coprime with 32
 	else if (M == 16)
 		tone_hop_step = 7;   // 7 is prime, coprime with 16
+	else if (M == 8)
+		tone_hop_step = 3;   // 3 is prime, coprime with 8 (narrowband)
+	else if (M == 4)
+		tone_hop_step = 1;   // coprime with 4 (narrowband 2-stream)
 	else
 		tone_hop_step = 1;
 
@@ -96,6 +100,22 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		preamble_tones[2] = 6;
 		preamble_tones[3] = 14;
 	}
+	else if (M == 8)
+	{
+		// Narrowband: spread across 0-7
+		preamble_tones[0] = 1;
+		preamble_tones[1] = 5;
+		preamble_tones[2] = 3;
+		preamble_tones[3] = 7;
+	}
+	else if (M == 4)
+	{
+		// Narrowband 2-stream: spread across 0-3
+		preamble_tones[0] = 0;
+		preamble_tones[1] = 2;
+		preamble_tones[2] = 1;
+		preamble_tones[3] = 3;
+	}
 	else
 	{
 		// Generic: spread evenly
@@ -123,6 +143,23 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		ack_tones[4] = 13; ack_tones[5] = 1;
 		ack_tones[6] = 9;  ack_tones[7] = 15;
 	}
+	else if (M == 8)
+	{
+		// Narrowband: Costas-like permutation of 0-7. Avoids preamble {1,5,3,7}.
+		ack_tones[0] = 0;  ack_tones[1] = 4;
+		ack_tones[2] = 6;  ack_tones[3] = 2;
+		ack_tones[4] = 5;  ack_tones[5] = 1;
+		ack_tones[6] = 7;  ack_tones[7] = 3;
+	}
+	else if (M == 4)
+	{
+		// Narrowband 2-stream: 4 tones used 2x each, interleaved.
+		// Avoids preamble {0,2,1,3}.
+		ack_tones[0] = 3;  ack_tones[1] = 1;
+		ack_tones[2] = 0;  ack_tones[3] = 2;
+		ack_tones[4] = 1;  ack_tones[5] = 3;
+		ack_tones[6] = 2;  ack_tones[7] = 0;
+	}
 	else
 	{
 		// Generic: offset from preamble tones
@@ -149,6 +186,22 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		break_tones[2] = 2;  break_tones[3] = 3;
 		break_tones[4] = 10; break_tones[5] = 8;
 		break_tones[6] = 11; break_tones[7] = 15;
+	}
+	else if (M == 8)
+	{
+		// Narrowband: different permutation from ACK. Avoids preamble {1,5,3,7}.
+		break_tones[0] = 6;  break_tones[1] = 2;
+		break_tones[2] = 0;  break_tones[3] = 4;
+		break_tones[4] = 3;  break_tones[5] = 7;
+		break_tones[6] = 1;  break_tones[7] = 5;
+	}
+	else if (M == 4)
+	{
+		// Narrowband 2-stream: different interleave from ACK.
+		break_tones[0] = 2;  break_tones[1] = 0;
+		break_tones[2] = 3;  break_tones[3] = 1;
+		break_tones[4] = 0;  break_tones[5] = 2;
+		break_tones[6] = 1;  break_tones[7] = 3;
 	}
 	else
 	{

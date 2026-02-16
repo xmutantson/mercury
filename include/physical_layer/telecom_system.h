@@ -108,6 +108,7 @@ public:
 	int use_last_good_time_sync;
 	int use_last_good_freq_offset;
 	int mfsk_fixed_delay;  // >= 0: bypass time_sync with this delay (BER test); -1: use time_sync
+	int ofdm_forced_delay; // >= 0: override time_sync result (BER test, keeps passband_to_baseband); -1: normal
 	int test_puncture_nBits;  // > 0: zero out LLRs past this position (punctured LDPC BER test); 0: disabled
 
 	// MFSK short control frames: punctured LDPC for ACK/control messages
@@ -192,6 +193,8 @@ public:
 	int outer_code_reserved_bits;
 
 	int bit_energy_dispersal_seed;
+
+	int narrowband_enabled;  // 0=wideband (Nc=50, BW=2344 Hz), 1=narrowband (Nc=10, BW=469 Hz)
 
 	st_reinit_subsystems reinit_subsystems;
 

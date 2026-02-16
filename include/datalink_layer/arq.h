@@ -41,11 +41,14 @@ union u_SNR {
 
 // Base-36 callsign packing: fits up to 6 chars (A-Z, 0-9) into 5 bytes.
 // Used by START_CONNECTION to avoid callsign truncation on small frames.
-// Format: [4-bit length][6 chars x 6 bits] = 40 bits = 5 bytes.
-inline void callsign_pack(const char* callsign, int len, char* out)
+// Format: [1-bit flags][3-bit length][6 chars x 6 bits] = 40 bits = 5 bytes.
+// Bit 39: narrowband flag (0=wideband, 1=narrowband).
+// Bits 38-36: length (0-6). Bits 35-0: 6 chars x 6 bits.
+inline void callsign_pack(const char* callsign, int len, char* out, int flags = 0)
 {
 	if(len > 6) len = 6;
-	uint64_t packed = ((uint64_t)(len & 0xF)) << 36;
+	uint64_t packed = ((uint64_t)(len & 0x7)) << 36;
+	if(flags & 0x01) packed |= ((uint64_t)1) << 39;  // narrowband flag
 	for(int i = 0; i < 6; i++)
 	{
 		int val = 0;
@@ -65,7 +68,7 @@ inline void callsign_pack(const char* callsign, int len, char* out)
 	out[4] = (char)(packed & 0xFF);
 }
 
-inline std::string callsign_unpack(const char* data)
+inline std::string callsign_unpack(const char* data, int* out_flags = nullptr)
 {
 	uint64_t packed = 0;
 	packed |= ((uint64_t)(unsigned char)data[0]) << 32;
@@ -73,8 +76,13 @@ inline std::string callsign_unpack(const char* data)
 	packed |= ((uint64_t)(unsigned char)data[2]) << 16;
 	packed |= ((uint64_t)(unsigned char)data[3]) << 8;
 	packed |= ((uint64_t)(unsigned char)data[4]);
-	int len = (int)((packed >> 36) & 0xF);
+	int len = (int)((packed >> 36) & 0x7);  // 3 bits for length
 	if(len > 6) len = 6;
+	if(out_flags)
+	{
+		*out_flags = 0;
+		if(packed & (((uint64_t)1) << 39)) *out_flags |= 0x01;  // narrowband
+	}
 	std::string result;
 	for(int i = 0; i < len; i++)
 	{
@@ -358,6 +366,7 @@ public:
 
   int gear_shift_on;
   int robust_enabled;
+  int narrowband_enabled;  // 0=wideband (2344 Hz), 1=narrowband (469 Hz)
   int gear_shift_algorithm;
   double gear_shift_up_success_rate_precentage;
   double gear_shift_down_success_rate_precentage;

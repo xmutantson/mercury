@@ -1194,9 +1194,20 @@ void cl_preamble_configurator::configure()
 	int fft_zeros_tmp[Nfft];
 	int fft_zeros_depadded_tmp[Nc];
 
+	// For narrowband (Nc <= 10), use ALL subcarriers as preamble.
+	// The even-only pattern gives only 4 preamble bins for Nc=10, which is
+	// insufficient for FFT-based time sync detection (~9 dB processing gain
+	// vs ~15 dB needed). Using all 10 bins gives +4 dB.
+	// GI correlation is cyclic-prefix-based and works with any pattern.
+	bool all_preamble = (Nc <= 10);
+
 	for(int j=0;j<Nfft;j++)
 	{
-		if(j%2==1)
+		if(all_preamble)
+		{
+			fft_zeros_tmp[j]=1;
+		}
+		else if(j%2==1)
 		{
 			fft_zeros_tmp[j]=0;
 		}
@@ -1335,15 +1346,6 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 
-	// Debug: how many pilots found in ofdm_frame?
-	static int ls_debug_count = 0;
-	if(ls_debug_count < 5) {
-		printf("[LS-DEBUG] ofdm_frame=%p Nsymb=%d Nc=%d pilot_index=%d\n",
-			(void*)ofdm_frame, Nsymb, Nc, pilot_index);
-		fflush(stdout);
-		ls_debug_count++;
-	}
-
 	int nPilots=0;
 	std::complex <double> ch_tmp;
 
@@ -1450,6 +1452,73 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
  */
 }
 
+void cl_ofdm::CPE_correction(std::complex<double>* in)
+{
+	if (Nsymb <= 0 || Nc <= 0) return;
+
+	int Dy = pilot_configurator.Dy;
+	if (Dy <= 0) return;
+
+	// Estimate residual frequency offset from pilot phase rotation.
+	// For each subcarrier column, adjacent pilot rows (separated by Dy
+	// symbols) give a phase-change measurement. Averaging all such pairs
+	// across the frame gives a robust estimate of the per-symbol phase
+	// rate, which is then removed from the received data BEFORE channel
+	// estimation. This prevents LS window phase cancellation.
+	//
+	// With NB (Nc=10, Dy=3): ~320 pilot pairs → very robust even at low SNR.
+	// With WB (Nc=50, Dy=3): ~800+ pairs → marginal extra improvement.
+
+	// Per-column state: last pilot row and raw H value
+	int prev_row[Nc];                    // VLA, Nc <= 50
+	std::complex<double> prev_H[Nc];     // VLA
+	for (int j = 0; j < Nc; j++) prev_row[j] = -1;
+
+	std::complex<double> dH_sum(0, 0);
+	int dH_count = 0;
+
+	int pilot_index = 0;
+	for (int i = 0; i < Nsymb; i++)
+	{
+		for (int j = 0; j < Nc; j++)
+		{
+			if ((ofdm_frame + i * Nc + j)->type == PILOT)
+			{
+				std::complex<double> X = pilot_configurator.sequence[pilot_index];
+				std::complex<double> H_raw = *(in + i * Nc + j) / X;
+
+				if (prev_row[j] >= 0 && (i - prev_row[j]) == Dy)
+				{
+					dH_sum += H_raw * std::conj(prev_H[j]);
+					dH_count++;
+				}
+
+				prev_row[j] = i;
+				prev_H[j] = H_raw;
+				pilot_index++;
+			}
+		}
+	}
+
+	if (dH_count < 2) return;
+
+	double phase_per_Dy = std::arg(dH_sum);
+	double phase_rate = phase_per_Dy / Dy;    // radians per symbol
+
+	// Skip correction if negligible (< 0.1 degree/symbol)
+	if (std::abs(phase_rate) < 0.00175) return;
+
+	// Remove linear phase rotation from all symbols (symbol 0 = reference)
+	for (int i = 0; i < Nsymb; i++)
+	{
+		std::complex<double> correction = std::exp(std::complex<double>(0, -phase_rate * i));
+		for (int j = 0; j < Nc; j++)
+		{
+			*(in + i * Nc + j) *= correction;
+		}
+	}
+}
+
 void cl_ofdm::restore_channel_amplitude()
 {
 	for(int i=0;i<Nsymb;i++)
@@ -1482,10 +1551,6 @@ void cl_ofdm::automatic_gain_control(std::complex <double>*in)
 	}
 	pilot_amp/=pilot_index;
 	agc=pilot_configurator.boost/pilot_amp;
-
-	printf("[AGC] raw_pilot_amp=%.6f count=%d boost=%.3f gain=%.4f\n",
-		pilot_amp, pilot_index, pilot_configurator.boost, agc);
-	fflush(stdout);
 
 	for(int i=0;i<Nsymb;i++)
 	{
@@ -1779,26 +1844,19 @@ int cl_ofdm::time_sync_preamble(std::complex <double>*in, int size, int interpol
 		corss_corr=0;
 		norm_a=0;
 		norm_b=0;
+		// GI-only correlation: the guard interval is a copy of the last Ngi
+		// samples of the OFDM symbol, so GI[n] correlates perfectly with
+		// symbol[Nfft+n] for real preambles regardless of which FFT bins
+		// are active. The original Schmidl-Cox half-symbol correlation
+		// (x[n] vs x[n+N/2]) requires only even-indexed subcarriers,
+		// which Mercury's preamble does not satisfy (it uses all Nc bins).
+		// Using GI-only gives metric ~1.0 for real preambles, ~0 for noise.
 		for(int l=0;l<preamble_configurator.Nsymb;l++)
 		{
 			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate;
 			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Nfft*interpolation_rate;
 
 			for(int m=0;m<this->Ngi*interpolation_rate;m++)
-			{
-				corss_corr+=a_c[m].real()*b_c[m].real();
-				norm_a+=a_c[m].real()*a_c[m].real();
-				norm_b+=b_c[m].real()*b_c[m].real();
-
-				corss_corr+=a_c[m].imag()*b_c[m].imag();
-				norm_a+=a_c[m].imag()*a_c[m].imag();
-				norm_b+=b_c[m].imag()*b_c[m].imag();
-			}
-
-			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Ngi*interpolation_rate;
-			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+(this->Ngi+this->Nfft/2)*interpolation_rate;
-
-			for(int m=0;m<(this->Nfft/2)*interpolation_rate;m++)
 			{
 				corss_corr+=a_c[m].real()*b_c[m].real();
 				norm_a+=a_c[m].real()*a_c[m].real();
@@ -1898,26 +1956,13 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 		corss_corr=0;
 		norm_a=0;
 		norm_b=0;
+		// GI-only correlation (see comment in time_sync_preamble above)
 		for(int l=0;l<preamble_configurator.Nsymb;l++)
 		{
 			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate;
 			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Nfft*interpolation_rate;
 
 			for(int m=0;m<this->Ngi*interpolation_rate;m++)
-			{
-				corss_corr+=a_c[m].real()*b_c[m].real();
-				norm_a+=a_c[m].real()*a_c[m].real();
-				norm_b+=b_c[m].real()*b_c[m].real();
-
-				corss_corr+=a_c[m].imag()*b_c[m].imag();
-				norm_a+=a_c[m].imag()*a_c[m].imag();
-				norm_b+=b_c[m].imag()*b_c[m].imag();
-			}
-
-			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Ngi*interpolation_rate;
-			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+(this->Ngi+this->Nfft/2)*interpolation_rate;
-
-			for(int m=0;m<(this->Nfft/2)*interpolation_rate;m++)
 			{
 				corss_corr+=a_c[m].real()*b_c[m].real();
 				norm_a+=a_c[m].real()*a_c[m].real();
@@ -1963,6 +2008,169 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	max_correlation = corss_corr_vals[location_to_return];
 	result.correlation = max_correlation;
 
+	return result;
+}
+
+TimeSyncResult cl_ofdm::time_sync_preamble_fft(
+	std::complex<double>* baseband_interp, int buffer_size_interp,
+	int interpolation_rate, int preamble_nSymb)
+{
+	/*
+	 * Two-pass FFT-based preamble detection for narrowband OFDM.
+	 *
+	 * Problem: GI correlation has insufficient SNR for NB (Nc=10) because
+	 * the wide time-sync FIR passes 7x more noise than signal bandwidth.
+	 *
+	 * Pass 1 (coarse): Step by symbol period. Non-coherent energy metric
+	 * (sum |FFT[k]|^2 at preamble bins). Phase-invariant — works even when
+	 * the FFT window doesn't align with symbol boundaries. 488 candidates.
+	 *
+	 * Pass 2 (fine): Around the best coarse candidate, step by Ngi (guard
+	 * interval). Coherent correlation metric. When within ±Ngi/2 of the
+	 * true boundary, the GI provides circular extension → no spectral leakage.
+	 * ~34 candidates (±1 symbol window).
+	 *
+	 * Total: ~488 + 34 = 522 FFT evaluations × 4 symbols ≈ 2088 FFTs.
+	 */
+
+	int Nofdm = Nfft + Ngi;
+	int symbol_interp = Nofdm * interpolation_rate;
+	int preamble_interp = preamble_nSymb * symbol_interp;
+	int gi_interp = Ngi * interpolation_rate;
+
+	// Precompute preamble bin list
+	int preamble_bins[256];  // subcarrier index → FFT bin (only for PREAMBLE type)
+	int n_preamble_bins_per_sym[16] = {};
+	int preamble_bin_list[16][256];  // per-symbol list of (subcarrier_k, fft_bin)
+	int preamble_bin_fft[16][256];
+
+	for(int sym = 0; sym < preamble_nSymb && sym < 16; sym++)
+	{
+		int nb = 0;
+		for(int k = 0; k < Nc; k++)
+		{
+			if(ofdm_preamble[sym * Nc + k].type == PREAMBLE)
+			{
+				int fft_bin;
+				if(k < Nc / 2)
+					fft_bin = k + Nfft - Nc / 2;
+				else
+					fft_bin = k - Nc / 2 + start_shift;
+				preamble_bin_list[sym][nb] = k;
+				preamble_bin_fft[sym][nb] = fft_bin;
+				nb++;
+			}
+		}
+		n_preamble_bins_per_sym[sym] = nb;
+	}
+
+	// Local FFT buffers
+	std::complex<double> fft_in[256];
+	std::complex<double> fft_out[256];
+
+	// === Pass 1: Coarse — per-bin coherent, cross-bin non-coherent metric ===
+	// Timing offset adds phase e^{-j2πkΔ/N} that's CONSTANT across symbols
+	// within each bin k. Coherent sum across symbols gives +12 dB gain per bin.
+	// Non-coherent sum across bins gives +10 dB. Total: +22 dB processing gain.
+	int n_coarse = (buffer_size_interp - preamble_interp) / symbol_interp;
+	if(n_coarse < 0) n_coarse = 0;
+
+	double best_coarse_metric = -1.0;
+	int best_coarse_pos = 0;
+
+	// Per-bin accumulator for coherent cross-symbol combining
+	std::complex<double> bin_accum[256];
+
+	for(int pos = 0; pos <= n_coarse; pos++)
+	{
+		int sample_start = pos * symbol_interp;
+
+		// Reset per-bin accumulators
+		int max_bins = n_preamble_bins_per_sym[0];
+		for(int b = 0; b < max_bins; b++)
+			bin_accum[b] = std::complex<double>(0.0, 0.0);
+
+		for(int sym = 0; sym < preamble_nSymb; sym++)
+		{
+			int sym_start = sample_start + sym * symbol_interp;
+			int fft_start = sym_start + gi_interp;
+
+			if(fft_start + (Nfft - 1) * interpolation_rate >= buffer_size_interp)
+				break;
+
+			for(int k = 0; k < Nfft; k++)
+				fft_in[k] = baseband_interp[fft_start + k * interpolation_rate];
+
+			fft(fft_in, fft_out, Nfft);
+
+			// Accumulate per-bin matched filter across symbols
+			for(int b = 0; b < n_preamble_bins_per_sym[sym]; b++)
+			{
+				int sc = preamble_bin_list[sym][b];
+				bin_accum[b] += fft_out[preamble_bin_fft[sym][b]] * std::conj(ofdm_preamble[sym * Nc + sc].value);
+			}
+		}
+
+		// Non-coherent sum across bins: Σ |per-bin coherent sum|²
+		double metric = 0.0;
+		for(int b = 0; b < max_bins; b++)
+			metric += std::norm(bin_accum[b]);
+
+		if(metric > best_coarse_metric)
+		{
+			best_coarse_metric = metric;
+			best_coarse_pos = sample_start;
+		}
+	}
+
+	// === Pass 2: Fine — coherent correlation at GI step around coarse ===
+	int fine_start = best_coarse_pos - symbol_interp;
+	if(fine_start < 0) fine_start = 0;
+	int fine_end = best_coarse_pos + symbol_interp;
+	int fine_limit = buffer_size_interp - preamble_interp;
+	if(fine_end > fine_limit) fine_end = fine_limit;
+
+	double best_fine_metric = -1.0;
+	int best_fine_pos = best_coarse_pos;
+
+	for(int sample_start = fine_start; sample_start <= fine_end; sample_start += gi_interp)
+	{
+		double metric = 0.0;
+
+		for(int sym = 0; sym < preamble_nSymb; sym++)
+		{
+			int sym_start = sample_start + sym * symbol_interp;
+			int fft_start = sym_start + gi_interp;
+
+			if(fft_start + (Nfft - 1) * interpolation_rate >= buffer_size_interp)
+				break;
+
+			for(int k = 0; k < Nfft; k++)
+				fft_in[k] = baseband_interp[fft_start + k * interpolation_rate];
+
+			fft(fft_in, fft_out, Nfft);
+
+			// Coherent correlation against known preamble values
+			std::complex<double> corr(0.0, 0.0);
+			for(int b = 0; b < n_preamble_bins_per_sym[sym]; b++)
+			{
+				int sc = preamble_bin_list[sym][b];
+				corr += fft_out[preamble_bin_fft[sym][b]] * std::conj(ofdm_preamble[sym * Nc + sc].value);
+			}
+
+			metric += std::norm(corr);
+		}
+
+		if(metric > best_fine_metric)
+		{
+			best_fine_metric = metric;
+			best_fine_pos = sample_start;
+		}
+	}
+
+	TimeSyncResult result;
+	result.delay = best_fine_pos;
+	result.correlation = best_fine_metric;
 	return result;
 }
 

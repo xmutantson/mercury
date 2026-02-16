@@ -56,6 +56,7 @@ cl_telecom_system::cl_telecom_system()
 	use_last_good_time_sync=NO;
 	use_last_good_freq_offset=NO;
 	mfsk_fixed_delay=-1;
+	ofdm_forced_delay=-1;
 	test_puncture_nBits=0;
 	ctrl_nBits=0;
 	ctrl_nsymb=0;
@@ -84,6 +85,7 @@ cl_telecom_system::cl_telecom_system()
 	outer_code=NO_OUTER_CODE;
 	outer_code_reserved_bits=0;
 	bit_energy_dispersal_seed=0;
+	narrowband_enabled=NO;
 	pre_equalization_channel=NULL;
 }
 
@@ -292,8 +294,14 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 		{
 			mfsk_fixed_delay = ((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate;
 		}
+		else
+		{
+			// No forced delay: real time sync + Moose runs.
+			// CPE correction handles any residual Moose freq offset.
+		}
 		this->receive_byte(data_container.passband_delayed_data,data_container.hd_decoded_data_byte);
 		mfsk_fixed_delay = -1;
+		ofdm_forced_delay = -1;
 		byte_to_bit(data_container.hd_decoded_data_byte,data_container.hd_decoded_data_bit,(nReal_data-outer_code_reserved_bits));
 
 		if(nDataPlot > 0)
@@ -686,14 +694,54 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			receive_stats.delay=ofdm.time_sync_mfsk(data_container.baseband_data_interpolated,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.interpolation_rate,data_container.preamble_nSymb,mfsk.preamble_tones,mfsk.M,mfsk.nStreams,mfsk.stream_offsets,search_start);
 
 		}
+		else if(narrowband_enabled)
+		{
+			// NB OFDM: Two-stage preamble detection.
+			// Stage 1 — Coarse FFT-based: correlate known preamble subcarrier pattern
+			// in frequency domain at each symbol-period position. Non-coherent combining
+			// across preamble symbols handles unknown freq offset (within ±23 Hz).
+			int buf_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			TimeSyncResult coarse_fft = ofdm.time_sync_preamble_fft(
+				data_container.baseband_data_interpolated, buf_interp,
+				data_container.interpolation_rate, data_container.preamble_nSymb);
+
+			// Stage 2 — Fine GI-based: refine within ±1 symbol of coarse position.
+			// Small search window (~2K samples) drastically reduces false alarm rate
+			// compared to full-buffer GI search (~530K samples).
+			int sym_interp = data_container.Nofdm * frequency_interpolation_rate;
+			int pream_interp = data_container.preamble_nSymb * sym_interp;
+			int win_start = coarse_fft.delay - sym_interp;
+			if(win_start < 0) win_start = 0;
+			int win_end = coarse_fft.delay + pream_interp + sym_interp;
+			if(win_end > buf_interp) win_end = buf_interp;
+			int win_size = win_end - win_start;
+
+			TimeSyncResult fine_gi = ofdm.time_sync_preamble_with_metric(
+				&data_container.baseband_data_interpolated[win_start], win_size,
+				data_container.interpolation_rate, 0, 1, 1);
+
+			receive_stats.delay = win_start + fine_gi.delay;
+			receive_stats.coarse_metric = fine_gi.correlation;
+		}
 		else
 		{
+			// WB OFDM: Standard GI correlation (proven to work)
 			TimeSyncResult coarse_result = ofdm.time_sync_preamble_with_metric(data_container.baseband_data_interpolated,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.interpolation_rate,0,step, 1);
 			receive_stats.delay = coarse_result.delay;
 			receive_stats.coarse_metric = coarse_result.correlation;
 		}
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
+
+		// OFDM forced delay: override time_sync result with known position.
+		// passband_to_baseband already ran (baseband populated), so this just
+		// redirects the demod to the correct preamble position.
+		if(ofdm_forced_delay >= 0 && M != MOD_MFSK) {
+			receive_stats.delay = ofdm_forced_delay;
+			receive_stats.coarse_metric = 1.0;  // bypass metric gate
+			pream_symb_loc = receive_stats.delay / (data_container.Nofdm * data_container.interpolation_rate);
+			if(pream_symb_loc < 1) { pream_symb_loc = 1; }
+		}
 	}
 
 	// MFSK frame completeness check: if the frame extends beyond the buffer,
@@ -837,9 +885,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			// Metric threshold: reject weak Schmidl-Cox peaks that pass the energy
 			// gate but correspond to noise-on-signal, not a real OFDM preamble.
-			// Real preambles: metric 0.80-0.93. Noise peaks: metric 0.09-0.17.
+			// GI-only correlation: real preambles ~0.90-1.00, noise ~0.0-0.2.
 			// Threshold 0.5 provides wide margin between the two clusters.
-			if(energy_ok && receive_stats.coarse_metric < 0.5)
+			// For narrowband: skip metric gate — FFT detection already validated
+			// the position, and GI correlation metric is naturally lower (~0.4-0.6)
+			// due to fewer subcarriers and wider noise from time-sync FIR.
+			if(energy_ok && !narrowband_enabled && receive_stats.coarse_metric < 0.5)
 			{
 				if (g_verbose)
 					printf("[OFDM-SYNC] metric=%.3f at delay=%d — weak peak, skipping decode\n",
@@ -934,6 +985,12 @@ skip_h_retry_point:
 			{
 				// Known delay - skip all time_sync refinement
 				receive_stats.delay = mfsk_fixed_delay;
+			}
+			else if(ofdm_forced_delay >= 0)
+			{
+				// OFDM forced delay (BER test): skip sync refinement, use known position
+				receive_stats.delay = ofdm_forced_delay;
+				if(receive_stats.sync_trials > 0) break;  // one trial only
 			}
 			else if(M == MOD_MFSK)
 			{
@@ -1071,41 +1128,37 @@ skip_h_retry_point:
 			// Use corrected carrier frequency if coarse sync applied
 			double effective_carrier_freq = carrier_frequency + coarse_freq_offset;
 
-			// DIAGNOSTIC: Save baseband snapshot from FIR_rx_time_sync before overwrite
-			std::complex<double> ts_snap[4];
-			if(M != MOD_MFSK && receive_stats.sync_trials == 0) {
-				for(int k=0; k<4; k++)
-					ts_snap[k] = data_container.baseband_data_interpolated[receive_stats.delay + k];
-			}
-
 			ofdm.passband_to_baseband((double*)data,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,effective_carrier_freq,carrier_amplitude,1,&ofdm.FIR_rx_data);
 
-			// DIAGNOSTIC: Compare FIR_rx_time_sync vs FIR_rx_data at delay position
-			if(M != MOD_MFSK && receive_stats.sync_trials == 0) {
-				printf("[FIR-CMP] delay=%d ts_fir: ", receive_stats.delay);
-				for(int k=0; k<4; k++)
-					printf("(%.6f,%.6f) ", ts_snap[k].real(), ts_snap[k].imag());
-				printf("data_fir: ");
-				for(int k=0; k<4; k++)
-					printf("(%.6f,%.6f) ", data_container.baseband_data_interpolated[receive_stats.delay + k].real(), data_container.baseband_data_interpolated[receive_stats.delay + k].imag());
-				printf("\n"); fflush(stdout);
+			// Correct for FIR group delay difference between time-sync and data filters.
+			// Time sync finds preamble position relative to FIR_rx_time_sync output.
+			// Data extraction uses FIR_rx_data output, which has different group delay.
+			// For NB: ts=33 taps, data=161 taps → correction = (161-33)/2 = 64 interp samples.
+			// For WB: both FIRs have the same taps → correction = 0.
+			int fir_delay_correction = (ofdm.FIR_rx_data.filter_nTaps - ofdm.FIR_rx_time_sync.filter_nTaps) / 2;
+			int extraction_delay = receive_stats.delay + fir_delay_correction;
+			// Clamp to valid range
+			int buf_size_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
+			if(extraction_delay < 0) extraction_delay = 0;
+			if(extraction_delay > buf_size_interp - frame_size_interp)
+				extraction_delay = buf_size_interp - frame_size_interp;
 
-				// Also check baseband energy around the extraction point
-				double energy_at_delay = 0.0, energy_mid_frame = 0.0;
-				int mid_offset = receive_stats.delay + (data_container.preamble_nSymb + data_container.Nsymb/2) * data_container.Nofdm * frequency_interpolation_rate;
-				for(int k=0; k<256; k++) {
-					energy_at_delay += std::norm(data_container.baseband_data_interpolated[receive_stats.delay + k]);
-					if(mid_offset + k < data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate)
-						energy_mid_frame += std::norm(data_container.baseband_data_interpolated[mid_offset + k]);
-				}
-				printf("[BB-ENERGY] at_delay=%.6f mid_frame=%.6f\n", energy_at_delay / 256, energy_mid_frame / 256);
-				fflush(stdout);
+			ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
+
+
+			if(ofdm_forced_delay >= 0 || narrowband_enabled)
+			{
+				// Skip Moose for:
+				// - Forced delay (BER test): true freq offset is 0
+				// - Narrowband: all-subcarrier preamble breaks Moose's half-symbol
+				//   repetition assumption (even-only bins create identical halves;
+				//   all bins don't). Moose gives garbage (~15 Hz fake offset) that
+				//   exceeds CPE's ±7 Hz unwrapping range, destroying the signal.
+				//   TODO: implement FFT-based freq estimation for NB real HF use.
+				freq_offset_measured = 0;
 			}
-
-			ofdm.rational_resampler(&data_container.baseband_data_interpolated[receive_stats.delay], (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
-
-
-			if(receive_stats.sync_trials==time_sync_trials_max && use_last_good_freq_offset==YES && receive_stats.freq_offset_of_last_decoded_message!=0)
+			else if(receive_stats.sync_trials==time_sync_trials_max && use_last_good_freq_offset==YES && receive_stats.freq_offset_of_last_decoded_message!=0)
 			{
 				freq_offset_measured=receive_stats.freq_offset_of_last_decoded_message;
 			}
@@ -1127,7 +1180,7 @@ skip_h_retry_point:
 			{
 				// Apply fine correction on top of coarse correction
 				ofdm.passband_to_baseband((double*)data,(data_container.Nofdm*data_container.buffer_Nsymb)*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,effective_carrier_freq+freq_offset_measured,carrier_amplitude,1,&ofdm.FIR_rx_data);
-				ofdm.rational_resampler(&data_container.baseband_data_interpolated[receive_stats.delay], (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
+				ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
 			}
 			{
 				// In ctrl mode, only demod ctrl_nsymb symbols; otherwise full Nsymb
@@ -1196,21 +1249,10 @@ skip_h_retry_point:
 			{
 				ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
 
-				// DIAGNOSTIC: Print first few pilot subcarrier values after AGC
-				{
-					int diag_count = 0;
-					printf("[PILOT-DIAG] trial=%d first_pilots_after_AGC: ", receive_stats.sync_trials);
-					for(int si = 0; si < ofdm.Nsymb && diag_count < 5; si++) {
-						for(int sc = 0; sc < ofdm.Nc && diag_count < 5; sc++) {
-							if((ofdm.ofdm_frame + si*ofdm.Nc + sc)->type == PILOT) {
-								std::complex<double> v = data_container.ofdm_symbol_demodulated_data[si*data_container.Nc + sc];
-								printf("[%d,%d]=(%.3f,%.3f)|%.3f ", si, sc, v.real(), v.imag(), std::abs(v));
-								diag_count++;
-							}
-						}
-					}
-					printf("\n"); fflush(stdout);
-				}
+				// CPE: remove residual freq offset phase rotation before
+				// channel estimation so the LS window doesn't average
+				// rotating phasors (which causes H cancellation).
+				ofdm.CPE_correction(data_container.ofdm_symbol_demodulated_data);
 
 				if(ofdm.channel_estimator==ZERO_FORCE)
 				{
@@ -1221,48 +1263,20 @@ skip_h_retry_point:
 					ofdm.LS_channel_estimator(data_container.ofdm_symbol_demodulated_data);
 				}
 
-				// Channel estimate diagnostic (BEFORE equalizer clears status)
+				// Compute mean channel estimate magnitude for quality gate
 				double mean_H = -1.0;
 				{
-					double h_sum = 0, h_min = 1e9, h_max = 0;
-					int h_measured = 0, h_interpolated = 0;
+					double h_sum = 0;
+					int h_count = 0;
 					for(int ci = 0; ci < ofdm.Nsymb * ofdm.Nc; ci++)
 					{
 						if(ofdm.estimated_channel[ci].status == MEASURED)
 						{
-							double h_abs = std::abs(ofdm.estimated_channel[ci].value);
-							h_sum += h_abs;
-							if(h_abs < h_min) h_min = h_abs;
-							if(h_abs > h_max) h_max = h_abs;
-							h_measured++;
-						}
-						else if(ofdm.estimated_channel[ci].status == INTERPOLATED)
-						{
-							h_interpolated++;
+							h_sum += std::abs(ofdm.estimated_channel[ci].value);
+							h_count++;
 						}
 					}
-					if(h_measured > 0) mean_H = h_sum / h_measured;
-					printf("[CHAN-EST] measured=%d interpolated=%d", h_measured, h_interpolated);
-					if(h_measured > 0)
-						printf(" mean_H=%.4f min_H=%.4f max_H=%.4f", mean_H, h_min, h_max);
-					printf(" freq=%.1f metric=%.3f\n", freq_offset_measured, receive_stats.coarse_metric);
-					fflush(stdout);
-					// DIAGNOSTIC: Print first few H complex values on trial 0
-					if(receive_stats.sync_trials == 0) {
-						int hd = 0;
-						printf("[H-DIAG] first_H: ");
-						for(int ci = 0; ci < ofdm.Nsymb * ofdm.Nc && hd < 5; ci++) {
-							if(ofdm.estimated_channel[ci].status == MEASURED) {
-								printf("[%d,%d]=(%.4f,%.4f)|%.4f ",
-									ci / ofdm.Nc, ci % ofdm.Nc,
-									ofdm.estimated_channel[ci].value.real(),
-									ofdm.estimated_channel[ci].value.imag(),
-									std::abs(ofdm.estimated_channel[ci].value));
-								hd++;
-							}
-						}
-						printf("\n"); fflush(stdout);
-					}
+					if(h_count > 0) mean_H = h_sum / h_count;
 				}
 
 				// Early exit: bad channel estimate means the preamble was a
@@ -1805,8 +1819,71 @@ void cl_telecom_system::init()
 {
 	if(ofdm.Nc==AUTO_SELLECT)
 	{
-		ofdm.Nc=50;
+		ofdm.Nc = narrowband_enabled ? 10 : 50;
 	}
+
+	// Recompute bandwidth-dependent parameters from actual Nc
+	// physical_config.cc computed these with hardcoded Nc=50; recompute for actual Nc
+	{
+		double bw = 48000.0 * ofdm.Nc / ofdm.Nfft / frequency_interpolation_rate;
+		default_configurations_telecom_system.bandwidth = bw;
+		// Back-compute carrier_frequency_offset from existing carrier_frequency:
+		// original: cf = offset + (bw_original/2 + 300), so offset = cf - bw_original/2 - 300
+		double bw_original = 48000.0 * 50.0 / ofdm.Nfft / frequency_interpolation_rate;
+		double offset = default_configurations_telecom_system.carrier_frequency - bw_original / 2 - 300;
+		double cf = offset + (bw / 2 + 300);
+		default_configurations_telecom_system.carrier_frequency = cf;
+		default_configurations_telecom_system.ofdm_FIR_rx_time_sync_lpf_filter_cut_frequency = 0.9 * bw / 2;
+		default_configurations_telecom_system.ofdm_FIR_rx_data_lpf_filter_cut_frequency = 1.0 * bw / 2;
+		default_configurations_telecom_system.ofdm_FIR_tx1_lpf_filter_cut_frequency = cf + bw / 2;
+		default_configurations_telecom_system.ofdm_FIR_tx1_hpf_filter_cut_frequency = cf - bw / 2;
+		default_configurations_telecom_system.ofdm_FIR_tx2_lpf_filter_cut_frequency = cf + bw / 2;
+		default_configurations_telecom_system.ofdm_FIR_tx2_hpf_filter_cut_frequency = cf - bw / 2;
+
+		// FIR transition bandwidth scaling for narrowband (Option A — split FIR).
+		//
+		// GI preservation constraint: filter_nTaps <= Ngi*interp = 64 samples.
+		// nTaps = 2*fs/transition_BW, so transition_BW >= 1500 Hz for 64 taps.
+		// Any filter in the TX→RX chain that processes the passband/baseband signal
+		// with more taps than the GI window will destroy the GI-copy property,
+		// making Schmidl-Cox preamble detection fail.
+		//
+		// TIME-SYNC RX FIR: Keep transition at 3000 Hz (33 taps). GI-safe.
+		// DATA RX FIR: Narrow transition (600 Hz, 161 taps). Runs AFTER time sync
+		//   determines the delay, so GI structure is irrelevant.
+		// TX FIRs: Keep transition at 1000 Hz (97 taps, same as WB). The WB TX
+		//   filter at 97 taps slightly exceeds the 64-sample GI, but the outermost
+		//   Hamming-windowed taps contribute negligible energy. 481 taps (from
+		//   scaling to 200 Hz) would be catastrophic — 7.5x the GI window.
+		double bw_ratio = bw / bw_original;
+		// time_sync: cutoff narrows, transition stays wide (preserves GI structure)
+		default_configurations_telecom_system.ofdm_FIR_rx_time_sync_filter_transition_bandwidth = 3000;
+		// data: cutoff and transition both narrow (tight noise rejection for demod)
+		default_configurations_telecom_system.ofdm_FIR_rx_data_filter_transition_bandwidth = 3000 * bw_ratio;
+		// TX: cutoff narrows to NB band, transition stays at WB default (GI-safe)
+		default_configurations_telecom_system.ofdm_FIR_tx1_filter_transition_bandwidth = 1000;
+		default_configurations_telecom_system.ofdm_FIR_tx2_filter_transition_bandwidth = 1000;
+
+		// Also update the actual member variables so FIR design() (called below in init)
+		// uses the correct narrowband cutoffs. The load_configuration() copies at lines ~2856-2890
+		// already ran with OLD defaults; we must override them here before FIR design.
+		bandwidth = bw;
+		carrier_frequency = cf;
+		ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency = 0.9 * bw / 2;
+		ofdm.FIR_rx_time_sync.filter_transition_bandwidth = 3000;  // wide: 33 taps, GI-safe
+		ofdm.FIR_rx_data.lpf_filter_cut_frequency = 1.0 * bw / 2;
+		ofdm.FIR_rx_data.filter_transition_bandwidth = 3000 * bw_ratio;  // narrow: 161 taps, tight
+		ofdm.FIR_tx1.lpf_filter_cut_frequency = cf + bw / 2;
+		ofdm.FIR_tx1.hpf_filter_cut_frequency = cf - bw / 2;
+		ofdm.FIR_tx1.filter_transition_bandwidth = 1000;  // WB default: 97 taps, GI-tolerable
+		ofdm.FIR_tx2.lpf_filter_cut_frequency = cf + bw / 2;
+		ofdm.FIR_tx2.hpf_filter_cut_frequency = cf - bw / 2;
+		ofdm.FIR_tx2.filter_transition_bandwidth = 1000;  // WB default: 97 taps, GI-tolerable
+	}
+
+	// Nsymb scales with Nc: narrowband (Nc=10) needs 5× more symbols than wideband (Nc=50)
+	int nc_scale = 50 / ofdm.Nc;
+
 	if(ofdm.Nsymb==AUTO_SELLECT)
 	{
 		if(M==MOD_MFSK)
@@ -1817,21 +1894,21 @@ void cl_telecom_system::init()
 		}
 		else if(ofdm.pilot_configurator.pilot_density==HIGH_DENSITY)
 		{
-			if(M==MOD_BPSK){ofdm.Nsymb=48;} //48,1,3
-			if(M==MOD_QPSK){ofdm.Nsymb=24;} //24,1,3
-			if(M==MOD_8PSK){ofdm.Nsymb=16;} //16,1,3
-			if(M==MOD_16QAM){ofdm.Nsymb=12;} //12,1,3
-			if(M==MOD_32QAM){ofdm.Nsymb=9;}
-			if(M==MOD_64QAM){ofdm.Nsymb=8;}
+			if(M==MOD_BPSK){ofdm.Nsymb=48 * nc_scale;}
+			if(M==MOD_QPSK){ofdm.Nsymb=24 * nc_scale;}
+			if(M==MOD_8PSK){ofdm.Nsymb=16 * nc_scale;}
+			if(M==MOD_16QAM){ofdm.Nsymb=12 * nc_scale;}
+			if(M==MOD_32QAM){ofdm.Nsymb=9 * nc_scale;}
+			if(M==MOD_64QAM){ofdm.Nsymb=8 * nc_scale;}
 		}
 		else if(ofdm.pilot_configurator.pilot_density==LOW_DENSITY)
 		{
-			if(M==MOD_BPSK){ofdm.Nsymb=40;} //40,1,5
-			if(M==MOD_QPSK){ofdm.Nsymb=20;} //20,1,5
-			if(M==MOD_8PSK){ofdm.Nsymb=16;} //13,1,5 (Nc=51)
-			if(M==MOD_16QAM){ofdm.Nsymb=10;} //10,1,5
-			if(M==MOD_32QAM){ofdm.Nsymb=9;} //Nc=53
-			if(M==MOD_64QAM){ofdm.Nsymb=8;}
+			if(M==MOD_BPSK){ofdm.Nsymb=40 * nc_scale;}
+			if(M==MOD_QPSK){ofdm.Nsymb=20 * nc_scale;}
+			if(M==MOD_8PSK){ofdm.Nsymb=16 * nc_scale;}
+			if(M==MOD_16QAM){ofdm.Nsymb=10 * nc_scale;}
+			if(M==MOD_32QAM){ofdm.Nsymb=9 * nc_scale;}
+			if(M==MOD_64QAM){ofdm.Nsymb=8 * nc_scale;}
 		}
 	}
 
@@ -1883,20 +1960,7 @@ void cl_telecom_system::init()
 
 	if(reinit_subsystems.ofdm==YES)
 	{
-		printf("[PHY-DEBUG] Before ofdm.init(): Nsymb=%d Nc=%d Dx=%d Dy=%d density=%d M=%d\n",
-			ofdm.Nsymb, ofdm.Nc, ofdm.pilot_configurator.Dx, ofdm.pilot_configurator.Dy,
-			ofdm.pilot_configurator.pilot_density, M);
-		fflush(stdout);
 		ofdm.init();
-		printf("[PHY-DEBUG] After ofdm.init(): nPilots=%d nData=%d ofdm_frame=%p\n",
-			ofdm.pilot_configurator.nPilots, ofdm.pilot_configurator.nData,
-			(void*)ofdm.ofdm_frame);
-		// Verify PILOT count directly in ofdm_frame
-		int verify_pilots = 0;
-		for(int i = 0; i < ofdm.Nsymb * ofdm.Nc; i++)
-			if(ofdm.ofdm_frame[i].type == PILOT) verify_pilots++;
-		printf("[PHY-DEBUG] Direct pilot count in ofdm_frame: %d\n", verify_pilots);
-		fflush(stdout);
 		reinit_subsystems.ofdm=NO;
 	}
 
@@ -2436,7 +2500,7 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 	// MFSK: sweep channel SNR from -25 to +5 dB in 1 dB steps (VARA claims ~-10 dB for SL1)
 	// OFDM: sweep Es/N0 from -10 to +2.5 dB in 0.5 dB steps
 	int nPoints = (M == MOD_MFSK) ? 31 : 25;
-	int nFrames_per_point = (M == MOD_MFSK) ? 3 : 100;
+	int nFrames_per_point = (M == MOD_MFSK) ? 3 : 5;
 	float data_plot[nPoints][2];
 	float data_plot_theo[nPoints][2];
 	output_power_Watt=1;
@@ -2695,8 +2759,8 @@ void cl_telecom_system::load_configuration(int configuration)
 	if(_modulation==MOD_MFSK && M==MOD_MFSK)
 	{
 		int new_mfsk_M, new_nStreams;
-		if(configuration == ROBUST_0) { new_mfsk_M = 32; new_nStreams = 1; }
-		else { new_mfsk_M = 16; new_nStreams = 2; } // ROBUST_1, ROBUST_2
+		if(configuration == ROBUST_0) { new_mfsk_M = narrowband_enabled ? 8 : 32; new_nStreams = 1; }
+		else { new_mfsk_M = narrowband_enabled ? 4 : 16; new_nStreams = 2; } // ROBUST_1, ROBUST_2
 		if(new_mfsk_M != mfsk.M || new_nStreams != mfsk.nStreams)
 		{
 			reinit_subsystems.telecom_system=YES;
@@ -2808,6 +2872,10 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm.LS_window_hight++;
 	}
 
+	// NB LS window: with CPE correction (pre-LS residual freq offset removal),
+	// the full default window height can be used for NB too — CPE removes the
+	// phase rotation that previously caused H cancellation in the LS window.
+
 	bit_energy_dispersal_seed=default_configurations_telecom_system.bit_energy_dispersal_seed;
 
 	ldpc.standard=default_configurations_telecom_system.ldpc_standard;
@@ -2877,8 +2945,13 @@ void cl_telecom_system::load_configuration(int configuration)
 		if(M == MOD_MFSK)
 		{
 			int mfsk_M, mfsk_nStreams;
-			if(current_configuration == ROBUST_0) { mfsk_M = 32; mfsk_nStreams = 1; }
-			else { mfsk_M = 16; mfsk_nStreams = 2; } // ROBUST_1, ROBUST_2: 2x parallel 16-MFSK
+			if(current_configuration == ROBUST_0) {
+				mfsk_M = narrowband_enabled ? 8 : 32;
+				mfsk_nStreams = 1;
+			} else {
+				mfsk_M = narrowband_enabled ? 4 : 16;
+				mfsk_nStreams = 2;
+			}
 			mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
 		}
 		else
@@ -2895,6 +2968,17 @@ void cl_telecom_system::load_configuration(int configuration)
 		printf("[PHY-REINIT] init complete\n");
 		fflush(stdout);
 		reinit_subsystems.telecom_system=NO;
+
+		// Re-apply bandwidth-dependent parameters that init() recomputed
+		// (original copies at lines above happened before init() ran)
+		bandwidth = default_configurations_telecom_system.bandwidth;
+		carrier_frequency = default_configurations_telecom_system.carrier_frequency;
+		ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency = default_configurations_telecom_system.ofdm_FIR_rx_time_sync_lpf_filter_cut_frequency;
+		ofdm.FIR_rx_data.lpf_filter_cut_frequency = default_configurations_telecom_system.ofdm_FIR_rx_data_lpf_filter_cut_frequency;
+		ofdm.FIR_tx1.lpf_filter_cut_frequency = default_configurations_telecom_system.ofdm_FIR_tx1_lpf_filter_cut_frequency;
+		ofdm.FIR_tx1.hpf_filter_cut_frequency = default_configurations_telecom_system.ofdm_FIR_tx1_hpf_filter_cut_frequency;
+		ofdm.FIR_tx2.lpf_filter_cut_frequency = default_configurations_telecom_system.ofdm_FIR_tx2_lpf_filter_cut_frequency;
+		ofdm.FIR_tx2.hpf_filter_cut_frequency = default_configurations_telecom_system.ofdm_FIR_tx2_hpf_filter_cut_frequency;
 	}
 
 	// Re-init MFSK now that ofdm.Nc is finalized (was AUTO_SELLECT during mfsk.init above)
@@ -2902,8 +2986,13 @@ void cl_telecom_system::load_configuration(int configuration)
 	if(M == MOD_MFSK)
 	{
 		int mfsk_M, mfsk_nStreams;
-		if(current_configuration == ROBUST_0) { mfsk_M = 32; mfsk_nStreams = 1; }
-		else { mfsk_M = 16; mfsk_nStreams = 2; } // ROBUST_1, ROBUST_2
+		if(current_configuration == ROBUST_0) {
+			mfsk_M = narrowband_enabled ? 8 : 32;
+			mfsk_nStreams = 1;
+		} else {
+			mfsk_M = narrowband_enabled ? 4 : 16;
+			mfsk_nStreams = 2;
+		}
 		mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
 	}
 
@@ -3000,10 +3089,13 @@ void cl_telecom_system::load_configuration(int configuration)
 		mfsk_ctrl_mode = false;
 	}
 
-	// Universal ACK pattern: dedicated ack_mfsk with fixed M=16, nStreams=1 for ALL modes.
+	// Universal ACK pattern: dedicated ack_mfsk with fixed M, nStreams=1 for ALL modes.
 	// Config-independent: both sides always agree on ACK tone parameters,
 	// so no config switching needed for ACK pattern TX/RX.
-	ack_mfsk.init(16, data_container.Nc, 1);  // M=16, Nc=50, 1 stream centered in band
+	{
+		int ack_M = narrowband_enabled ? 8 : 16;  // M=8 fits in Nc=10, M=16 fits in Nc=50
+		ack_mfsk.init(ack_M, data_container.Nc, 1);
+	}
 
 	ack_pattern_passband_samples = cl_mfsk::ACK_PATTERN_NSYMB * data_container.Nofdm * frequency_interpolation_rate;
 

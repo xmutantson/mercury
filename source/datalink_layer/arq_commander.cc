@@ -298,8 +298,11 @@ int cl_arq_controller::add_message_control(char code)
 		{
 			messages_control.data[0]=code;
 			messages_control.data[1]=CRC8_calc((char*)destination_call_sign.c_str(), destination_call_sign.length());
-			callsign_pack(my_call_sign.c_str(), my_call_sign.length(), &messages_control.data[2]);
-			messages_control.length=7;  // cmd(1) + CRC8(1) + packed_callsign(5)
+			// Pack callsign with flags embedded in bit 39 (narrowband flag)
+			int pack_flags = 0;
+			if (narrowband_enabled) pack_flags |= 0x01;
+			callsign_pack(my_call_sign.c_str(), my_call_sign.length(), &messages_control.data[2], pack_flags);
+			messages_control.length=7;  // cmd(1) + CRC8(1) + packed_callsign(5, flags embedded)
 			messages_control.id=0;
 			connection_id=BROADCAST_ID;
 		}
