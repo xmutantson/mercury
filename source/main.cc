@@ -108,7 +108,7 @@ int main(int argc, char *argv[])
     int operation_mode = ARQ_MODE;
     int gear_shift_mode = NO_GEAR_SHIFT;
     int robust_mode = 0;  // 0=disabled, 1=enabled via -R flag
-    int narrowband_mode = 0;  // 0=wideband, 1=narrowband (500 Hz) via -N flag
+    int narrowband_mode = -1;  // -1=use INI, 0=force wideband (-W), 1=force narrowband (-N)
     bool explicit_config = false;  // true if user specified -s
     int base_tcp_port = 0;
 
@@ -123,6 +123,8 @@ int main(int argc, char *argv[])
     int puncture_nBits = 0;  // 0 = disabled; >0 = punctured LDPC BER test
     double tx_gain_override = -999.0;  // -999 = not set; otherwise override TX gain in dB
     double rx_gain_override = -999.0;  // -999 = not set; otherwise override RX gain in dB
+    double boost_override = -1.0;     // -1 = use default; >= 0 = override NB MFSK 1S gain (-B flag)
+    int nb_probe_max = -1;            // -1 = use default (2); >= 0 = override nb_probe_max
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
     output_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -178,6 +180,7 @@ int main(int argc, char *argv[])
         printf(" -N                         Enable Narrowband mode (500 Hz bandwidth, 10 subcarriers).\n");
         printf(" -T [tx_gain_db]            TX gain in dB (temporary, overrides GUI slider). E.g. -T -25.6 for -30 dBFS output.\n");
         printf(" -G [rx_gain_db]            RX gain in dB (temporary, overrides GUI slider). E.g. -G 25.6 to boost weak input.\n");
+        printf(" -Q [nb_probe_max]          NB auto-negotiation probe attempts (0=disable, default 2).\n");
         printf(" -v                         Verbose debug output (OFDM sync, RX timing, ACK detection).\n");
 #ifdef MERCURY_GUI_ENABLED
         printf(" -n                         Disable GUI (headless mode). GUI is enabled by default.\n");
@@ -187,7 +190,7 @@ int main(int argc, char *argv[])
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:")) != -1)
+    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:")) != -1)
     {
         switch (opt)
         {
@@ -326,6 +329,10 @@ int main(int argc, char *argv[])
             narrowband_mode = 1;
             printf("Narrowband mode (500 Hz) enabled.\n");
             break;
+        case 'W':
+            narrowband_mode = 0;
+            printf("Wideband mode (2344 Hz) forced.\n");
+            break;
         case 'v':
             g_verbose = 1;
             printf("Verbose debug output enabled.\n");
@@ -342,6 +349,20 @@ int main(int argc, char *argv[])
             {
                 rx_gain_override = atof(optarg);
                 printf("RX gain override: %.1f dB\n", rx_gain_override);
+            }
+            break;
+        case 'B':
+            if (optarg)
+            {
+                boost_override = atof(optarg);
+                printf("NB MFSK boost override: %.4f\n", boost_override);
+            }
+            break;
+        case 'Q':
+            if (optarg)
+            {
+                nb_probe_max = atoi(optarg);
+                printf("NB probe max: %d\n", nb_probe_max);
             }
             break;
         case 'h':
@@ -530,7 +551,24 @@ start_modem:
     }
 
     // Set narrowband mode on telecom_system for all modes (ARQ sets it again below)
-    telecom_system.narrowband_enabled = narrowband_mode ? YES : NO;
+    telecom_system.narrowband_enabled = (narrowband_mode == 1) ? YES : NO;
+
+    // Apply -B boost override to NB gain table entries
+    if (boost_override >= 0.0)
+    {
+        double ratio_2s = telecom_system.tx_gain[TX_SIG_MFSK_2S][1][1] /
+                          (telecom_system.tx_gain[TX_SIG_MFSK_1S][1][1] + 1e-30);
+        telecom_system.tx_gain[TX_SIG_MFSK_1S][1][0] = boost_override;
+        telecom_system.tx_gain[TX_SIG_MFSK_1S][1][1] = boost_override;
+        telecom_system.tx_gain[TX_SIG_MFSK_2S][1][0] = boost_override * ratio_2s;
+        telecom_system.tx_gain[TX_SIG_MFSK_2S][1][1] = boost_override * ratio_2s;
+        telecom_system.tx_gain[TX_SIG_ACK][1][0] = boost_override;
+        telecom_system.tx_gain[TX_SIG_ACK][1][1] = boost_override;
+        telecom_system.tx_gain[TX_SIG_BREAK][1][0] = boost_override;
+        telecom_system.tx_gain[TX_SIG_BREAK][1][1] = boost_override;
+        printf("[TX-GAIN] Override: NB MFSK_1S=%.4f  MFSK_2S=%.4f  ACK/BREAK=%.4f\n",
+               boost_override, boost_override * ratio_2s, boost_override);
+    }
 
     // initializing audio system
     pthread_t radio_capture, radio_playback, radio_capture_prep;
@@ -565,9 +603,11 @@ start_modem:
         if (robust_mode)
             g_settings.robust_mode_enabled = true;
         g_gui_state.robust_mode_enabled.store(g_settings.robust_mode_enabled);
-        // Narrowband mode: CLI -N overrides INI setting
-        if (narrowband_mode)
+        // Narrowband mode: CLI -N/-W overrides INI setting
+        if (narrowband_mode == 1)
             g_settings.narrowband_enabled = true;
+        else if (narrowband_mode == 0)
+            g_settings.narrowband_enabled = false;
         g_gui_state.narrowband_enabled.store(g_settings.narrowband_enabled);
         // TX gain override from -T flag (temporary, not saved to INI)
         if (tx_gain_override > -900.0) {
@@ -609,10 +649,10 @@ start_modem:
         // Robust mode: CLI -R or INI setting enables MFSK hailing
 #ifdef MERCURY_GUI_ENABLED
         ARQ.robust_enabled = (g_settings.robust_mode_enabled || robust_mode) ? YES : NO;
-        ARQ.narrowband_enabled = (g_settings.narrowband_enabled || narrowband_mode) ? YES : NO;
+        ARQ.narrowband_enabled = g_settings.narrowband_enabled ? YES : NO;
 #else
         ARQ.robust_enabled = robust_mode ? YES : NO;
-        ARQ.narrowband_enabled = narrowband_mode ? YES : NO;
+        ARQ.narrowband_enabled = (narrowband_mode == 1) ? YES : NO;
 #endif
         telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
         ARQ.init(base_tcp_port, (gear_shift_mode == NO_GEAR_SHIFT)? NO : YES, mod_config);
@@ -622,6 +662,8 @@ start_modem:
         ARQ.link_timeout = link_timeout_ms;
         ARQ.max_connection_attempts = max_connection_attempts;
         ARQ.exit_on_disconnect = exit_on_disconnect;
+        if (nb_probe_max >= 0)
+            ARQ.nb_probe_max = nb_probe_max;
 
         // Ensure timeouts are adequate for MFSK frame durations
         {
@@ -632,8 +674,11 @@ start_modem:
                        ARQ.connection_timeout, min_ct);
                 ARQ.connection_timeout = min_ct;
             }
-            int min_lt = (ARQ.data_batch_size + ARQ.ack_batch_size + 2)
-                * ARQ.message_transmission_time_ms + 5000;
+            // Link timeout must survive multiple consecutive NAck cycles.
+            // Each cycle: data/ctrl TX + ACK wait ≈ 2 × message_time.
+            // Allow 5 consecutive NAck cycles before disconnect.
+            int min_lt = 5 * 2 * ARQ.message_transmission_time_ms + 5000;
+            if (min_lt < 90000) min_lt = 90000;  // minimum 90s for very slow modes
             if (ARQ.link_timeout < min_lt) {
                 printf("Adjusting link_timeout from %d to %d ms for frame duration\n",
                        ARQ.link_timeout, min_lt);

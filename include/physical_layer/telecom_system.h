@@ -45,6 +45,20 @@
 #define msleep(a) usleep(a * 1000)
 #endif
 
+// TX gain table: amplitude boost per signal type × NB/WB mode
+// Indexed as tx_gain[signal_type][nb_mode][nb_fir]
+// nb_mode: 0=WB modulation (Nc=50), 1=NB modulation (Nc=10)
+// nb_fir:  0=WB FIR filter,         1=NB FIR filter
+// Currently mod and FIR always match; cross-entries exist for future per-mode tuning.
+enum tx_signal_type {
+	TX_SIG_MFSK_1S = 0,  // MFSK data frame, 1 stream  (ROBUST_0)
+	TX_SIG_MFSK_2S,       // MFSK data frame, 2 streams (ROBUST_1, ROBUST_2)
+	TX_SIG_OFDM,          // OFDM data frame (CONFIG_0..CONFIG_16)
+	TX_SIG_ACK,           // ACK pattern
+	TX_SIG_BREAK,         // BREAK pattern
+	TX_SIG_COUNT
+};
+
 struct st_reinit_subsystems{
 	int microphone=YES;
 	int speaker=YES;
@@ -120,7 +134,7 @@ public:
 	int get_active_nbits() const;  // ctrl_nBits when mfsk_ctrl_mode, else nBits
 
 	// ACK pattern: short known-tone sequence for pattern-based ACK
-	int ack_pattern_passband_samples;    // = ACK_PATTERN_NSYMB * Nofdm * freq_interp_rate
+	int ack_pattern_passband_samples;    // = ack_mfsk.ack_pattern_nsymb * Nofdm * freq_interp_rate
 	double ack_pattern_detection_threshold;  // metric threshold for detection
 	int generate_ack_pattern_passband(double* out);  // TX: returns samples written
 	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr);  // RX: returns metric
@@ -195,6 +209,12 @@ public:
 	int bit_energy_dispersal_seed;
 
 	int narrowband_enabled;  // 0=wideband (Nc=50, BW=2344 Hz), 1=narrowband (Nc=10, BW=469 Hz)
+
+	// TX gain table: per signal-type × NB/WB mode amplitude scalars
+	double tx_gain[TX_SIG_COUNT][2][2];  // [signal_type][nb_mod][nb_fir]
+	double get_tx_gain(tx_signal_type sig) const;
+	void init_tx_gain_defaults();
+	void print_tx_gain_table() const;
 
 	st_reinit_subsystems reinit_subsystems;
 

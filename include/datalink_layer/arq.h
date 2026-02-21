@@ -93,17 +93,6 @@ inline std::string callsign_unpack(const char* data, int* out_flags = nullptr)
 	return result;
 }
 
-inline void hex_trace(const char* label, const char* data, int len, int max_show = 48)
-{
-	printf("[DATA-TRACE] %s (%d bytes):", label, len);
-	int show = len < max_show ? len : max_show;
-	for(int i = 0; i < show; i++)
-		printf(" %02X", (unsigned char)data[i]);
-	if(len > max_show)
-		printf(" ...");
-	printf("\n");
-	fflush(stdout);
-}
 
 struct st_message
 {
@@ -367,6 +356,9 @@ public:
   int gear_shift_on;
   int robust_enabled;
   int narrowband_enabled;  // 0=wideband (2344 Hz), 1=narrowband (469 Hz)
+  int commander_configured_nb;  // commander's original NB setting (-1=unset, YES/NO)
+  int nb_probe_max;             // max NB probe attempts before fallback (default 2)
+  bool session_narrowband;      // negotiated NB for this session (NB always wins)
   int gear_shift_algorithm;
   double gear_shift_up_success_rate_precentage;
   double gear_shift_down_success_rate_precentage;
@@ -433,6 +425,7 @@ private:
 
   char get_configuration(double SNR);
   void load_configuration(int configuration, int level, int backup_configuration);
+  void switch_narrowband_mode(int nb_enabled);
   void return_to_last_configuration();
   int init_messages_buffers();
   int deinit_messages_buffers();

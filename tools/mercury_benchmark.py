@@ -57,6 +57,80 @@ CONFIG_MAX_BPS_NB = {
     14: 950, 15: 1150, 16: 1400,
 }
 
+# Config presets for common benchmark scenarios
+CONFIG_PRESETS = {
+    'nb-mfsk': 'nb:100,nb:101,nb:102',
+    'wb-mfsk': 'wb:100,wb:101,wb:102',
+    'nb-ofdm': ','.join(f'nb:{i}' for i in range(17)),
+    'wb-ofdm': ','.join(f'wb:{i}' for i in range(17)),
+    'all-nb': 'nb:100,nb:101,nb:102,' + ','.join(f'nb:{i}' for i in range(17)),
+    'all-wb': 'wb:100,wb:101,wb:102,' + ','.join(f'wb:{i}' for i in range(17)),
+}
+
+
+def parse_config_spec(spec_str, default_nb=False):
+    """Parse config specs like 'nb:100,wb:101,0' into list of (config_id, is_nb).
+
+    Supports presets: 'nb-mfsk', 'wb-mfsk', 'nb-ofdm', 'wb-ofdm', 'all-nb', 'all-wb'
+    Combine with commas: 'nb-mfsk,wb-mfsk,nb-ofdm'
+    Without prefix, inherits default_nb from --narrowband flag.
+    """
+    parts = spec_str.split(',')
+    expanded = []
+    for p in parts:
+        p = p.strip()
+        if p in CONFIG_PRESETS:
+            expanded.extend(CONFIG_PRESETS[p].split(','))
+        else:
+            expanded.append(p)
+
+    specs = []
+    for s in expanded:
+        s = s.strip()
+        if not s:
+            continue
+        if s.startswith('nb:'):
+            specs.append((int(s[3:]), True))
+        elif s.startswith('wb:'):
+            specs.append((int(s[3:]), False))
+        else:
+            specs.append((int(s), default_nb))
+    return specs
+
+
+def config_name(config_id, is_nb):
+    """Get display name for a config."""
+    names = CONFIG_NAMES_NB if is_nb else CONFIG_NAMES
+    return names.get(config_id, f'CONFIG_{config_id}')
+
+
+def config_max_bps(config_id, is_nb):
+    """Get theoretical max throughput for a config."""
+    table = CONFIG_MAX_BPS_NB if is_nb else CONFIG_MAX_BPS
+    return table.get(config_id, 100)
+
+
+def build_config_extra_args(is_nb, signal_dbfs):
+    """Build Mercury CLI args for a specific config's NB/WB mode and cable level."""
+    extra = ["-Q", "0"]  # Disable NB auto-negotiation probing (both sides same mode)
+    if is_nb:
+        extra.append("-N")
+    native_dbfs = (NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if is_nb
+                   else NoiseInjector.DEFAULT_SIGNAL_DBFS)
+    atten_db = signal_dbfs - native_dbfs
+    extra += ["-T", f"{atten_db:.1f}", "-G", f"{-atten_db:.1f}"]
+    return extra
+
+
+def auto_measure_duration(config_id, is_nb, base_duration, max_duration=600):
+    """Scale measurement duration up for slow modes to get enough data."""
+    bps = config_max_bps(config_id, is_nb)
+    arq_efficiency = 0.4  # conservative ARQ overhead estimate
+    expected_bytes_per_s = bps * arq_efficiency / 8
+    min_bytes_target = 200  # want at least 200 bytes for reliable measurement
+    needed = min_bytes_target / max(expected_bytes_per_s, 0.01)
+    return min(max_duration, max(base_duration, needed))
+
 
 # ============================================================
 # Reused infrastructure (from awgn_turboshift_test.py)
@@ -204,20 +278,19 @@ def tcp_send_commands(port, commands):
 
 
 def build_extra_args(args):
-    """Build Mercury CLI extra args from benchmark flags (narrowband, tx-attenuate)."""
-    extra = []
+    """Build Mercury CLI extra args from benchmark flags (narrowband, tx-attenuate).
+    Used by stress and adaptive sub-commands. Sweep uses build_config_extra_args() instead."""
+    extra = ["-Q", "0"]  # Disable NB auto-negotiation probing
     narrowband = getattr(args, 'narrowband', False)
 
     if narrowband:
         extra.append("-N")
 
-    if getattr(args, 'tx_attenuate', False) or narrowband:
-        # Modem's native output level depends on Nc
-        native_dbfs = (NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if narrowband
-                       else NoiseInjector.DEFAULT_SIGNAL_DBFS)
-        # How much to attenuate TX to reach signal_dbfs on the cable
-        atten_db = args.signal_dbfs - native_dbfs  # negative = attenuate
-        # Boost RX by same amount to restore signal level inside modem
+    # Always apply TX/RX gain when cable level differs from native
+    native_dbfs = (NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if narrowband
+                   else NoiseInjector.DEFAULT_SIGNAL_DBFS)
+    atten_db = args.signal_dbfs - native_dbfs  # negative = attenuate
+    if abs(atten_db) > 0.5:  # only if meaningful difference
         extra += ["-T", f"{atten_db:.1f}", "-G", f"{-atten_db:.1f}"]
         print(f"[GAIN] TX {atten_db:.1f} dB (cable at {args.signal_dbfs:.1f} dBFS), "
               f"RX +{-atten_db:.1f} dB (restores to ~{native_dbfs:.1f} dBFS)")
@@ -528,7 +601,7 @@ def generate_sweep_chart(csv_path, output_path):
         import matplotlib.pyplot as plt
     except ImportError:
         print("[CHART] matplotlib not available. Install with: pip install matplotlib")
-        print(f"[CHART] CSV data saved to {csv_path} — you can plot it manually.")
+        print(f"[CHART] CSV data saved to {csv_path} -- you can plot it manually.")
         return False
 
     # Read CSV
@@ -660,7 +733,8 @@ def generate_stress_chart(timeline_csv, output_path):
 
 def run_sweep(args):
     """Fixed-config SNR sweep — measures throughput at each SNR level per config."""
-    configs = [int(c) for c in args.configs.split(',')]
+    default_nb = getattr(args, 'narrowband', False)
+    config_specs = parse_config_spec(args.configs, default_nb=default_nb)
     snr_levels = []
     snr = args.snr_start
     while snr >= args.snr_stop:
@@ -674,27 +748,33 @@ def run_sweep(args):
     log_dir = os.path.join(args.output_dir, f'logs_{ts}')
     os.makedirs(log_dir, exist_ok=True)
 
-    nb = getattr(args, 'narrowband', False)
-    names = get_config_names(nb)
-    max_bps = get_config_max_bps(nb)
+    has_nb = any(nb for _, nb in config_specs)
+    has_wb = any(not nb for _, nb in config_specs)
+    mode_str = "NB+WB" if (has_nb and has_wb) else ("NB" if has_nb else "WB")
+    use_auto_dur = getattr(args, 'auto_duration', False)
 
     print(f"{'='*70}")
-    print(f"Mercury Benchmark — SNR Sweep{' (NARROWBAND)' if nb else ''}")
+    print(f"Mercury Benchmark -- SNR Sweep ({mode_str})")
     print(f"{'='*70}")
-    print(f"Signal level: {args.signal_dbfs:.1f} dBFS")
-    print(f"Configs: {[names.get(c, f'CONFIG_{c}') for c in configs]}")
-    print(f"SNR levels: {snr_levels} dB")
-    print(f"Measurement duration: {args.measure_duration}s per point")
+    print(f"Cable signal level: {args.signal_dbfs:.1f} dBFS")
+    print(f"Configs ({len(config_specs)}):")
+    for cfg_id, is_nb in config_specs:
+        name = config_name(cfg_id, is_nb)
+        bps = config_max_bps(cfg_id, is_nb)
+        dur = auto_measure_duration(cfg_id, is_nb, args.measure_duration) if use_auto_dur else args.measure_duration
+        print(f"  {name:16s} max={bps:5d} bps  measure={dur:.0f}s")
+    print(f"SNR levels: {snr_levels[0]}dB -> {snr_levels[-1]}dB (step {args.snr_step}dB, {len(snr_levels)} points)")
+    print(f"Auto-duration: {'ON' if use_auto_dur else 'OFF'}")
     print(f"Settle time: {args.settle_time}s between points")
-    print(f"Total points: {len(configs)} configs x {len(snr_levels)} SNRs = {len(configs)*len(snr_levels)}")
-    est_time = len(configs) * (len(snr_levels) * (args.measure_duration + args.settle_time) + 30)
-    print(f"Estimated time: {est_time/3600:.1f} hours")
+    total_points = len(config_specs) * len(snr_levels)
+    avg_dur = sum(auto_measure_duration(c, n, args.measure_duration) if use_auto_dur else args.measure_duration
+                  for c, n in config_specs) / max(len(config_specs), 1)
+    est_time = len(config_specs) * (len(snr_levels) * (avg_dur + args.settle_time) + 30)
+    print(f"Total points: {total_points} (est {est_time/3600:.1f} hours)")
     print(f"Output: {csv_path}")
     print()
 
-    extra_args = build_extra_args(args)
-
-    # Setup noise injector
+    # Setup noise injector — calibrated to cable signal level (same for NB and WB)
     device_idx = find_wasapi_cable_output()
     noise = NoiseInjector(device_idx, snr_db=30, sample_rate=SAMPLE_RATE,
                            signal_dbfs=args.signal_dbfs)
@@ -706,10 +786,18 @@ def run_sweep(args):
                   'throughput_bps', 'bytes_per_min', 'nacks', 'breaks', 'process_alive']
 
     try:
-        for cfg_idx, cfg in enumerate(configs):
-            cfg_name = names.get(cfg, f'CONFIG_{cfg}')
+        for cfg_idx, (cfg, is_nb) in enumerate(config_specs):
+            cfg_name = config_name(cfg, is_nb)
+            extra_args = build_config_extra_args(is_nb, args.signal_dbfs)
+            measure_dur = (auto_measure_duration(cfg, is_nb, args.measure_duration)
+                           if use_auto_dur else args.measure_duration)
+            native_dbfs = NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if is_nb else NoiseInjector.DEFAULT_SIGNAL_DBFS
+            atten_db = args.signal_dbfs - native_dbfs
+
             print(f"\n{'='*70}")
-            print(f"[{cfg_idx+1}/{len(configs)}] Starting {cfg_name} (config={cfg})")
+            print(f"[{cfg_idx+1}/{len(config_specs)}] Starting {cfg_name} (config={cfg})")
+            print(f"  TX {atten_db:.1f}dB -> cable {args.signal_dbfs:.1f}dBFS, "
+                  f"RX +{-atten_db:.1f}dB, measure={measure_dur:.0f}s")
             print(f"{'='*70}")
 
             session = MercurySession(cfg, gearshift=False, mercury_path=args.mercury,
@@ -719,6 +807,29 @@ def run_sweep(args):
 
                 if not session.wait_connected(timeout=args.timeout):
                     print(f"  [ERROR] Connection failed for {cfg_name}")
+                    # Dump key diagnostic lines from modem output
+                    for role, lines in [('RSP', session.rsp_lines), ('CMD', session.cmd_lines)]:
+                        decode_lines = [l for l in lines if 'RX-DECODE' in l or 'NO-PREAMBLE' in l
+                                        or 'CMD-ACK-PAT' in l or 'ACK-CTRL' in l or 'CONNECTED' in l
+                                        or 'link_status:Conn' in l or 'START_CONN' in l
+                                        or 'TEST_CONN' in l or 'NAck' in l
+                                        or 'ACK-RX' in l or 'CMD-RX' in l or 'CFG]' in l
+                                        or 'PHY]' in l or 'recv_timeout' in l
+                                        or 'ACK-DET' in l or 'ACK-SEND' in l
+                                        or 'ACK-DIAG' in l or 'ACK-WINDOW' in l]
+                        # Also find ACK-DIAG lines separately (they appear early)
+                        diag_lines = [l for l in lines if 'ACK-DIAG' in l]
+                        if diag_lines:
+                            print(f"  [ACK-DIAG-{role}] ({len(diag_lines)} lines):")
+                            for dl in diag_lines[:30]:
+                                print(f"    {dl.rstrip()}")
+                        if decode_lines:
+                            print(f"  [DIAG-{role}] ({len(decode_lines)} key lines, showing last 60):")
+                            for dl in decode_lines[-60:]:
+                                print(f"    {dl.rstrip()}")
+                        else:
+                            print(f"  [DIAG-{role}] No key diagnostic lines in {len(lines)} total lines")
+                    sys.stdout.flush()
                     for snr_db in snr_levels:
                         results.append({
                             'config': cfg, 'config_name': cfg_name, 'snr_db': snr_db,
@@ -752,7 +863,7 @@ def run_sweep(args):
 
                 for snr_idx, snr_db in enumerate(snr_levels):
                     if not session.is_alive():
-                        print(f"  [CRASH] Process died at SNR={snr_db}dB")
+                        print(f"  [CRASH] Process died at SNR={snr_db}dB", flush=True)
                         # Record remaining as dead
                         for remaining_snr in snr_levels[snr_idx:]:
                             results.append({
@@ -766,7 +877,8 @@ def run_sweep(args):
                     noise.noise_on()
 
                     pre_stat = len(session.rsp_lines)
-                    result = session.measure_throughput(args.measure_duration)
+                    result = session.measure_throughput(measure_dur)
+                    sys.stdout.flush()
                     stats = session.get_stats(pre_stat)
 
                     noise.noise_off()
@@ -789,7 +901,7 @@ def run_sweep(args):
                           f"{result['bytes_per_min']:.0f} B/min "
                           f"({result['throughput_bps']:.0f} bps), "
                           f"{result['rx_bytes']}B in {result['duration_s']:.0f}s, "
-                          f"NAcks={nacks} [{status}]")
+                          f"NAcks={nacks} [{status}]", flush=True)
 
                     # Debug: dump Mercury output on zero throughput
                     if result['rx_bytes'] == 0 and snr_idx == 0:
@@ -833,7 +945,7 @@ def run_sweep(args):
                     if result['rx_bytes'] == 0:
                         zero_count += 1
                         if wf_threshold > 0 and zero_count >= wf_threshold:
-                            print(f"  [WATERFALL] {wf_threshold} consecutive zero-throughput points — skipping remaining SNRs")
+                            print(f"  [WATERFALL] {wf_threshold} consecutive zero-throughput points -- skipping remaining SNRs")
                             for remaining_snr in snr_levels[snr_idx+1:]:
                                 results.append({
                                     'config': cfg, 'config_name': cfg_name, 'snr_db': remaining_snr,
@@ -865,20 +977,20 @@ def run_sweep(args):
 
         # Summary
         print(f"\n{'='*70}")
-        print(f"SWEEP COMPLETE{' (NARROWBAND)' if nb else ''}")
+        print(f"SWEEP COMPLETE ({mode_str})")
         print(f"{'='*70}")
-        for cfg in configs:
-            cfg_name = names.get(cfg, f'CONFIG_{cfg}')
-            cfg_rows = [r for r in results if r['config'] == cfg]
+        for cfg_id, is_nb in config_specs:
+            name = config_name(cfg_id, is_nb)
+            cfg_rows = [r for r in results if r['config_name'] == name]
             max_bpm = max((r['bytes_per_min'] for r in cfg_rows), default=0)
             waterfall_snr = None
             for r in sorted(cfg_rows, key=lambda x: x['snr_db'], reverse=True):
                 if r['bytes_per_min'] > 0:
                     waterfall_snr = r['snr_db']
             if waterfall_snr is not None:
-                print(f"  {cfg_name:12s}: peak {max_bpm:.0f} B/min, waterfall ~{waterfall_snr:.0f} dB")
+                print(f"  {name:16s}: peak {max_bpm:.0f} B/min, waterfall ~{waterfall_snr:.0f} dB")
             else:
-                print(f"  {cfg_name:12s}: no throughput measured")
+                print(f"  {name:16s}: no throughput measured")
 
     finally:
         noise.stop()
@@ -915,7 +1027,7 @@ def run_stress(args):
     names = get_config_names(nb)
 
     print(f"{'='*70}")
-    print(f"Mercury Benchmark — Stress Test{' (NARROWBAND)' if nb else ''}")
+    print(f"Mercury Benchmark -- Stress Test{' (NARROWBAND)' if nb else ''}")
     print(f"{'='*70}")
     print(f"Start config: {names.get(args.start_config, str(args.start_config))}")
     print(f"Bursts: {args.num_bursts}")
@@ -953,7 +1065,7 @@ def run_stress(args):
         # Wait for turboshift
         print("[TURBO] Waiting for turboshift to complete...")
         if not session.wait_turboshift(timeout=args.timeout):
-            print("[WARN] Turboshift did not complete — proceeding anyway")
+            print("[WARN] Turboshift did not complete -- proceeding anyway")
         else:
             print(f"[TURBO] Complete at T+{time.time()-t_origin:.0f}s")
 
@@ -1152,7 +1264,7 @@ def run_adaptive(args):
     nb = getattr(args, 'narrowband', False)
 
     print(f"{'='*70}")
-    print(f"Mercury Benchmark — Adaptive (Gearshift) SNR Sweep{' (NARROWBAND)' if nb else ''}")
+    print(f"Mercury Benchmark -- Adaptive (Gearshift) SNR Sweep{' (NARROWBAND)' if nb else ''}")
     print(f"{'='*70}")
     print(f"SNR levels: {snr_levels} dB")
     print(f"Measurement duration: {args.measure_duration}s per point")
@@ -1324,33 +1436,37 @@ def main():
                         help='Output directory for CSV/charts/logs')
     parser.add_argument('--timeout', type=float, default=600,
                         help='Per-scenario timeout in seconds')
-    parser.add_argument('--signal-dbfs', type=float,
-                        default=NoiseInjector.DEFAULT_SIGNAL_DBFS,
-                        help=f'Modem signal reference level in dBFS '
-                             f'(default: {NoiseInjector.DEFAULT_SIGNAL_DBFS}). '
-                             f'Mercury OFDM RMS is ~-4.4 dBFS with Nc=50, Nfft=256.')
+    parser.add_argument('--signal-dbfs', type=float, default=-30.0,
+                        help='Cable signal level in dBFS (default: -30.0). '
+                             'TX is attenuated and RX boosted to match. '
+                             'Noise is calibrated to this level for correct SNR.')
     parser.add_argument('--tx-attenuate', action='store_true',
-                        help='Attenuate Mercury TX and boost RX to match --signal-dbfs. '
-                             'Passes -T (TX atten) and -G (RX boost) to both Mercury processes. '
-                             'Noise is calibrated to the attenuated signal level for correct SNR.')
+                        help='(Legacy) Attenuate Mercury TX and boost RX. '
+                             'Now always enabled — TX/RX gain is auto-computed per config.')
     parser.add_argument('--narrowband', '-N', action='store_true',
-                        help='Enable narrowband mode (500 Hz, Nc=10). Passes -N to Mercury '
-                             'and adjusts noise calibration for narrowband signal level.')
+                        help='Default NB mode for configs without nb:/wb: prefix. '
+                             'Not needed when using prefixed config specs like nb:100,wb:0.')
 
     sub = parser.add_subparsers(dest='command', help='Sub-command')
 
     # sweep
-    p_sweep = sub.add_parser('sweep', help='Fixed-config SNR sweep')
-    p_sweep.add_argument('--configs', default='100,101,102,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16',
-                         help='Comma-separated config numbers')
+    p_sweep = sub.add_parser('sweep', help='Fixed-config SNR sweep',
+                             epilog='Config spec: nb:100,wb:101,0 or presets: '
+                                    'nb-mfsk, wb-mfsk, nb-ofdm, wb-ofdm, all-nb, all-wb')
+    p_sweep.add_argument('--configs', default='nb-mfsk,wb-mfsk,nb-ofdm',
+                         help='Config specs: nb:100,wb:0 or presets (nb-mfsk,wb-mfsk,nb-ofdm,...)')
     p_sweep.add_argument('--snr-start', type=float, default=30,
                          help='Starting SNR (dB)')
-    p_sweep.add_argument('--snr-stop', type=float, default=-5,
+    p_sweep.add_argument('--snr-stop', type=float, default=-20,
                          help='Ending SNR (dB)')
     p_sweep.add_argument('--snr-step', type=float, default=-3,
                          help='SNR step (negative)')
     p_sweep.add_argument('--measure-duration', type=float, default=120,
-                         help='Measurement time per SNR point (seconds)')
+                         help='Base measurement time per SNR point (seconds)')
+    p_sweep.add_argument('--auto-duration', action='store_true', default=True,
+                         help='Auto-extend measurement for slow modes (default: on)')
+    p_sweep.add_argument('--no-auto-duration', action='store_true',
+                         help='Disable auto-duration extension')
     p_sweep.add_argument('--settle-time', type=float, default=15,
                          help='Recovery time between SNR points (seconds)')
     p_sweep.add_argument('--waterfall-threshold', type=int, default=None,
@@ -1400,13 +1516,9 @@ def main():
     # Propagate common args
     args.output_dir = os.path.abspath(args.output_dir)
 
-    # Apply narrowband defaults
-    if args.narrowband:
-        # In narrowband, default to -30 dBFS on cable to avoid saturation,
-        # with TX attenuation and RX gain boost handled by build_extra_args()
-        if args.signal_dbfs == NoiseInjector.DEFAULT_SIGNAL_DBFS:
-            args.signal_dbfs = -30.0
-            print(f"[NB] Narrowband mode: cable signal level set to {args.signal_dbfs:.1f} dBFS")
+    # Resolve auto-duration for sweep
+    if args.command == 'sweep' and getattr(args, 'no_auto_duration', False):
+        args.auto_duration = False
 
     if args.command == 'sweep':
         run_sweep(args)
