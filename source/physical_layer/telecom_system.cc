@@ -849,19 +849,49 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		}
 		else if(narrowband_enabled)
 		{
-			// NB OFDM: Two-stage preamble detection.
-			// Stage 1 — Coarse FFT-based: correlate known preamble subcarrier pattern
-			// in frequency domain at each symbol-period position. Non-coherent combining
-			// across preamble symbols handles unknown freq offset (within ±23 Hz).
+			// NB OFDM: FFT coarse + GI fine preamble detection.
+			//
+			// FFT coarse (Pass 1 of time_sync_preamble_fft): correlates received
+			// FFT bins against known preamble values. Per-bin coherent across
+			// symbols (timing phase cancels), non-coherent across bins (avoids
+			// cross-bin phase spread). PREAMBLE-SPECIFIC: data symbols produce
+			// low metric because their values don't match preamble.
+			//
+			// Metric normalization: raw Σ|bin_accum|² / Σ|FFT_bin|² ≈ Nsym=4
+			// at preamble, ≈ 1 at noise/data. Threshold of 2.0 discriminates.
+			//
+			// GI fine: cyclic prefix correlation in ±1 symbol window around FFT
+			// position. Finds exact symbol boundary (phase-invariant).
+
 			int buf_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			int sym_interp = data_container.Nofdm * frequency_interpolation_rate;
+			int frame_interp = (data_container.preamble_nSymb + ofdm.Nsymb) * sym_interp;
+			int max_valid_delay = buf_interp - frame_interp;
+
+			// Stage 1: FFT coarse — preamble-specific matched filter
 			TimeSyncResult coarse_fft = ofdm.time_sync_preamble_fft(
 				data_container.baseband_data_interpolated, buf_interp,
 				data_container.interpolation_rate, data_container.preamble_nSymb);
 
-			// Stage 2 — Fine GI-based: refine within ±1 symbol of coarse position.
-			// Small search window (~2K samples) drastically reduces false alarm rate
-			// compared to full-buffer GI search (~530K samples).
-			int sym_interp = data_container.Nofdm * frequency_interpolation_rate;
+			if(g_verbose)
+				printf("[NB-OFDM] FFT coarse: delay=%d symb=%d metric=%.2f\n",
+					coarse_fft.delay, coarse_fft.delay / sym_interp, coarse_fft.correlation);
+
+			// Reject: normalized metric < 2.0 (noise/data ≈ 1, preamble ≈ 4)
+			// or position doesn't allow full frame extraction
+			if(coarse_fft.correlation < 2.0 || coarse_fft.delay > max_valid_delay || coarse_fft.delay < 0)
+			{
+				if(g_verbose)
+					printf("[NB-OFDM] coarse rejected: metric=%.2f delay=%d max=%d\n",
+						coarse_fft.correlation, coarse_fft.delay, max_valid_delay);
+				st_receive_stats no_preamble = {};
+				no_preamble.message_decoded = NO;
+				no_preamble.delay = -1;
+				no_preamble.signal_stregth_dbm = receive_stats.signal_stregth_dbm;
+				return no_preamble;
+			}
+
+			// Stage 2: GI fine — refine within ±1 symbol of FFT position
 			int pream_interp = data_container.preamble_nSymb * sym_interp;
 			int win_start = coarse_fft.delay - sym_interp;
 			if(win_start < 0) win_start = 0;
@@ -875,6 +905,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			receive_stats.delay = win_start + fine_gi.delay;
 			receive_stats.coarse_metric = fine_gi.correlation;
+
+			if(g_verbose)
+				printf("[NB-OFDM] GI fine: delay=%d symb=%d gi_metric=%.3f\n",
+					receive_stats.delay, receive_stats.delay / sym_interp, fine_gi.correlation);
 		}
 		else
 		{

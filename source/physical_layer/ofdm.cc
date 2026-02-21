@@ -2085,21 +2085,21 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 	int interpolation_rate, int preamble_nSymb)
 {
 	/*
-	 * Two-pass FFT-based preamble detection for narrowband OFDM.
+	 * FFT-based preamble detection for narrowband OFDM.
 	 *
-	 * Problem: GI correlation has insufficient SNR for NB (Nc=10) because
-	 * the wide time-sync FIR passes 7x more noise than signal bandwidth.
+	 * Coarse search at symbol-period steps. Per-bin coherent across symbols
+	 * (timing-dependent phase is constant per bin across symbols), non-coherent
+	 * across bins (avoids cross-bin phase spread from timing offset).
 	 *
-	 * Pass 1 (coarse): Step by symbol period. Non-coherent energy metric
-	 * (sum |FFT[k]|^2 at preamble bins). Phase-invariant — works even when
-	 * the FFT window doesn't align with symbol boundaries. 488 candidates.
+	 * PREAMBLE-SPECIFIC: correlates against known preamble subcarrier values.
+	 * Data symbols produce metric ≈ 1 (random correlation), preamble ≈ Nsym.
 	 *
-	 * Pass 2 (fine): Around the best coarse candidate, step by Ngi (guard
-	 * interval). Coherent correlation metric. When within ±Ngi/2 of the
-	 * true boundary, the GI provides circular extension → no spectral leakage.
-	 * ~34 candidates (±1 symbol window).
+	 * Normalized metric = Σ|bin_accum|² / Σ|FFT_bin|² × |P|²
+	 *   ≈ preamble_nSymb at preamble (coherent gain)
+	 *   ≈ 1 at noise or data (random walk)
+	 * Threshold of ~2 gives reliable discrimination.
 	 *
-	 * Total: ~488 + 34 = 522 FFT evaluations × 4 symbols ≈ 2088 FFTs.
+	 * Fine timing is handled by GI correlation in the caller (±1 symbol window).
 	 */
 
 	int Nofdm = Nfft + Ngi;
@@ -2108,9 +2108,8 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 	int gi_interp = Ngi * interpolation_rate;
 
 	// Precompute preamble bin list
-	int preamble_bins[256];  // subcarrier index → FFT bin (only for PREAMBLE type)
 	int n_preamble_bins_per_sym[16] = {};
-	int preamble_bin_list[16][256];  // per-symbol list of (subcarrier_k, fft_bin)
+	int preamble_bin_list[16][256];
 	int preamble_bin_fft[16][256];
 
 	for(int sym = 0; sym < preamble_nSymb && sym < 16; sym++)
@@ -2137,24 +2136,19 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 	std::complex<double> fft_in[256];
 	std::complex<double> fft_out[256];
 
-	// === Pass 1: Coarse — per-bin coherent, cross-bin non-coherent metric ===
-	// Timing offset adds phase e^{-j2πkΔ/N} that's CONSTANT across symbols
-	// within each bin k. Coherent sum across symbols gives +12 dB gain per bin.
-	// Non-coherent sum across bins gives +10 dB. Total: +22 dB processing gain.
+	// Coarse search: step by symbol period, per-bin coherent metric
 	int n_coarse = (buffer_size_interp - preamble_interp) / symbol_interp;
 	if(n_coarse < 0) n_coarse = 0;
 
 	double best_coarse_metric = -1.0;
 	int best_coarse_pos = 0;
 
-	// Per-bin accumulator for coherent cross-symbol combining
 	std::complex<double> bin_accum[256];
 
 	for(int pos = 0; pos <= n_coarse; pos++)
 	{
 		int sample_start = pos * symbol_interp;
 
-		// Reset per-bin accumulators
 		int max_bins = n_preamble_bins_per_sym[0];
 		for(int b = 0; b < max_bins; b++)
 			bin_accum[b] = std::complex<double>(0.0, 0.0);
@@ -2172,7 +2166,6 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 
 			fft(fft_in, fft_out, Nfft);
 
-			// Accumulate per-bin matched filter across symbols
 			for(int b = 0; b < n_preamble_bins_per_sym[sym]; b++)
 			{
 				int sc = preamble_bin_list[sym][b];
@@ -2180,7 +2173,6 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 			}
 		}
 
-		// Non-coherent sum across bins: Σ |per-bin coherent sum|²
 		double metric = 0.0;
 		for(int b = 0; b < max_bins; b++)
 			metric += std::norm(bin_accum[b]);
@@ -2192,20 +2184,10 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 		}
 	}
 
-	// === Pass 2: Fine — coherent correlation at GI step around coarse ===
-	int fine_start = best_coarse_pos - symbol_interp;
-	if(fine_start < 0) fine_start = 0;
-	int fine_end = best_coarse_pos + symbol_interp;
-	int fine_limit = buffer_size_interp - preamble_interp;
-	if(fine_end > fine_limit) fine_end = fine_limit;
-
-	double best_fine_metric = -1.0;
-	int best_fine_pos = best_coarse_pos;
-
-	for(int sample_start = fine_start; sample_start <= fine_end; sample_start += gi_interp)
+	// Normalize: re-FFT at best position and compute energy at preamble bins
+	double energy = 0.0;
 	{
-		double metric = 0.0;
-
+		int sample_start = best_coarse_pos;
 		for(int sym = 0; sym < preamble_nSymb; sym++)
 		{
 			int sym_start = sample_start + sym * symbol_interp;
@@ -2219,27 +2201,14 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 
 			fft(fft_in, fft_out, Nfft);
 
-			// Coherent correlation against known preamble values
-			std::complex<double> corr(0.0, 0.0);
 			for(int b = 0; b < n_preamble_bins_per_sym[sym]; b++)
-			{
-				int sc = preamble_bin_list[sym][b];
-				corr += fft_out[preamble_bin_fft[sym][b]] * std::conj(ofdm_preamble[sym * Nc + sc].value);
-			}
-
-			metric += std::norm(corr);
-		}
-
-		if(metric > best_fine_metric)
-		{
-			best_fine_metric = metric;
-			best_fine_pos = sample_start;
+				energy += std::norm(fft_out[preamble_bin_fft[sym][b]]);
 		}
 	}
 
 	TimeSyncResult result;
-	result.delay = best_fine_pos;
-	result.correlation = best_fine_metric;
+	result.delay = best_coarse_pos;
+	result.correlation = (energy > 0.0) ? best_coarse_metric / energy : 0.0;
 	return result;
 }
 
