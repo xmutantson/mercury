@@ -2962,7 +2962,7 @@ void cl_arq_controller::receive()
 			}
 
 			if (g_verbose)
-				printf("[RX-TIMING] FAIL: nUnder=%d proc=%.0fms search_raw=%d delay_last=%d mod=%d\n",
+				printf("[RX-TIMING] FAIL: nUnder=%d proc=%.0fms search_raw=%d delay_last=%d mod=%.0f\n",
 					telecom_system->data_container.nUnder_processing_events.load(), proc_ms,
 					telecom_system->receive_stats.mfsk_search_raw,
 					telecom_system->receive_stats.delay_of_last_decoded_message,
