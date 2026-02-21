@@ -35,10 +35,14 @@ cl_mfsk::cl_mfsk()
 		stream_offsets[i] = 0;
 	for (int i = 0; i < MAX_PREAMBLE_SYMB; i++)
 		preamble_tones[i] = 0;
-	for (int i = 0; i < ACK_PATTERN_LEN; i++)
+	for (int i = 0; i < MAX_ACK_TONES; i++)
 		ack_tones[i] = 0;
-	for (int i = 0; i < ACK_PATTERN_LEN; i++)
+	for (int i = 0; i < MAX_ACK_TONES; i++)
 		break_tones[i] = 0;
+	ack_pattern_len = 0;
+	ack_pattern_nsymb = 0;
+	ack_match_threshold = 0;
+	break_match_threshold = 0;
 }
 
 cl_mfsk::~cl_mfsk()
@@ -85,9 +89,11 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 
 	// MFSK preamble: known tone sequence spread across each stream's band
 	// Same tone index used in all streams simultaneously
-	preamble_nSymb = 4;
+	// NB (M<=8): 8-symbol preamble for cross-correlation detection
+	// WB (M>=16): 4-symbol preamble for FFT energy detection
 	if (M == 32)
 	{
+		preamble_nSymb = 4;
 		preamble_tones[0] = 4;
 		preamble_tones[1] = 20;
 		preamble_tones[2] = 12;
@@ -95,6 +101,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	}
 	else if (M == 16)
 	{
+		preamble_nSymb = 4;
 		preamble_tones[0] = 2;
 		preamble_tones[1] = 10;
 		preamble_tones[2] = 6;
@@ -102,111 +109,140 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	}
 	else if (M == 8)
 	{
-		// Narrowband: spread across 0-7
+		// Narrowband: 8 symbols, all tones used once
+		preamble_nSymb = 8;
 		preamble_tones[0] = 1;
 		preamble_tones[1] = 5;
 		preamble_tones[2] = 3;
 		preamble_tones[3] = 7;
+		preamble_tones[4] = 0;
+		preamble_tones[5] = 6;
+		preamble_tones[6] = 2;
+		preamble_tones[7] = 4;
 	}
 	else if (M == 4)
 	{
-		// Narrowband 2-stream: spread across 0-3
+		// Narrowband 2-stream: 8 symbols, palindrome for symmetry
+		preamble_nSymb = 8;
 		preamble_tones[0] = 0;
 		preamble_tones[1] = 2;
 		preamble_tones[2] = 1;
 		preamble_tones[3] = 3;
+		preamble_tones[4] = 3;
+		preamble_tones[5] = 1;
+		preamble_tones[6] = 2;
+		preamble_tones[7] = 0;
 	}
 	else
 	{
+		preamble_nSymb = 4;
 		// Generic: spread evenly
 		for (int i = 0; i < preamble_nSymb && i < MAX_PREAMBLE_SYMB; i++)
 			preamble_tones[i] = (i * M / preamble_nSymb + M / (2 * preamble_nSymb)) % M;
 	}
 
-	// ACK pattern tones: Welch-Costas array (p=17, g=5) for optimal autocorrelation.
-	// Costas property: all pairwise (dt, df) difference vectors are unique,
-	// giving at most 1 coincidence at any non-zero time shift.
-	// Values = (5^i mod 17) - 1 for i=1..8.
+	// ACK pattern tones.
+	// WB (M>=16): Welch-Costas array (p=17, g=5), 8 base tones × 2 reps = 16 symbols.
+	//   Costas property: all pairwise (dt, df) difference vectors are unique.
+	//   Tone hopping provides additional frequency diversity.
+	// NB (M<=8): Sidelnikov sequences — longer patterns (32/48 symbols) with optimal
+	//   Hamming autocorrelation. No repetition, no tone hopping (diversity is intrinsic).
+	//   Needed because small M makes short Costas arrays vulnerable to false detection
+	//   (P(false/poll) = 2.7% for M=8, 50% for M=4 with 16-symbol patterns).
 	if (M == 32)
 	{
 		// 2x scaled M=16 Costas values. Avoids preamble {4,20,12,28}.
-		ack_tones[0] = 8;  ack_tones[1] = 14;
-		ack_tones[2] = 10; ack_tones[3] = 24;
-		ack_tones[4] = 26; ack_tones[5] = 2;
-		ack_tones[6] = 18; ack_tones[7] = 30;
+		ack_pattern_len = 8;
+		ack_pattern_nsymb = 16; // 8 × 2 reps
+		ack_match_threshold = 8;
+		const int tones[] = {8, 14, 10, 24, 26, 2, 18, 30};
+		for (int i = 0; i < 8; i++) ack_tones[i] = tones[i];
 	}
 	else if (M == 16)
 	{
 		// Welch-Costas (p=17, g=5). Avoids preamble {2,6,10,14}.
-		ack_tones[0] = 4;  ack_tones[1] = 7;
-		ack_tones[2] = 5;  ack_tones[3] = 12;
-		ack_tones[4] = 13; ack_tones[5] = 1;
-		ack_tones[6] = 9;  ack_tones[7] = 15;
+		ack_pattern_len = 8;
+		ack_pattern_nsymb = 16;
+		ack_match_threshold = 8;
+		const int tones[] = {4, 7, 5, 12, 13, 1, 9, 15};
+		for (int i = 0; i < 8; i++) ack_tones[i] = tones[i];
 	}
 	else if (M == 8)
 	{
-		// Narrowband: Costas-like permutation of 0-7. Avoids preamble {1,5,3,7}.
-		ack_tones[0] = 0;  ack_tones[1] = 4;
-		ack_tones[2] = 6;  ack_tones[3] = 2;
-		ack_tones[4] = 5;  ack_tones[5] = 1;
-		ack_tones[6] = 7;  ack_tones[7] = 3;
+		// Sidelnikov (p=37, g=2, offset=3). 32 symbols, no repetition.
+		// Hamming autocorrelation: max 3 coincidences at any shift (L-G bound).
+		ack_pattern_len = 32;
+		ack_pattern_nsymb = 32;
+		ack_match_threshold = 24; // 75% — P(false|p=0.25) ≈ 10^-11
+		const int tones[] = {
+			1, 3, 6, 5, 3, 7, 6, 5, 2, 5, 3, 6, 4, 1, 3, 7,
+			7, 7, 6, 4, 1, 2, 4, 0, 1, 2, 5, 2, 4, 1, 3, 6
+		};
+		for (int i = 0; i < 32; i++) ack_tones[i] = tones[i];
 	}
 	else if (M == 4)
 	{
-		// Narrowband 2-stream: 4 tones used 2x each, interleaved.
-		// Avoids preamble {0,2,1,3}.
-		ack_tones[0] = 3;  ack_tones[1] = 1;
-		ack_tones[2] = 0;  ack_tones[3] = 2;
-		ack_tones[4] = 1;  ack_tones[5] = 3;
-		ack_tones[6] = 2;  ack_tones[7] = 0;
+		// Sidelnikov (p=53, g=2, offset=3). 48 symbols, no repetition.
+		ack_pattern_len = 48;
+		ack_pattern_nsymb = 48;
+		ack_match_threshold = 40; // 83% — P(false|p=0.5) ≈ 10^-9
+		const int tones[] = {
+			0, 1, 2, 0, 1, 3, 2, 1, 2, 1, 2, 0, 1, 2, 0, 0,
+			0, 1, 3, 3, 2, 0, 1, 3, 3, 3, 3, 2, 1, 3, 2, 0,
+			1, 2, 1, 2, 1, 3, 2, 1, 3, 3, 3, 2, 0, 0, 1, 3
+		};
+		for (int i = 0; i < 48; i++) ack_tones[i] = tones[i];
 	}
 	else
 	{
-		// Generic: offset from preamble tones
-		for (int i = 0; i < ACK_PATTERN_LEN; i++)
-			ack_tones[i] = (i * M / ACK_PATTERN_LEN + 1) % M;
+		ack_pattern_len = 8;
+		ack_pattern_nsymb = 16;
+		ack_match_threshold = 8;
+		for (int i = 0; i < ack_pattern_len; i++)
+			ack_tones[i] = (i * M / ack_pattern_len + 1) % M;
 	}
 
-	// BREAK pattern tones: Welch-Costas array (p=17, g=7) for emergency fallback.
-	// Different generator from ACK (g=5) gives different Costas array with same
-	// autocorrelation properties but near-zero cross-correlation with ACK.
-	// Values = (7^i mod 17) - 1 for i=1..8.
+	// BREAK pattern tones.
+	// WB: Welch-Costas (p=17, g=7) — different generator from ACK (g=5).
+	// NB: Sidelnikov with different primitive root (g=5 vs ACK g=2).
+	// Cross-correlation at shift 0: M=8: 5/32, M=4: 13/48 (near random baseline).
 	if (M == 32)
 	{
-		// 2x scaled M=16 Costas values.
-		break_tones[0] = 12; break_tones[1] = 28;
-		break_tones[2] = 4;  break_tones[3] = 6;
-		break_tones[4] = 20; break_tones[5] = 16;
-		break_tones[6] = 22; break_tones[7] = 30;
+		const int tones[] = {12, 28, 4, 6, 20, 16, 22, 30};
+		for (int i = 0; i < 8; i++) break_tones[i] = tones[i];
+		break_match_threshold = 8;
 	}
 	else if (M == 16)
 	{
-		// Welch-Costas (p=17, g=7).
-		break_tones[0] = 6;  break_tones[1] = 14;
-		break_tones[2] = 2;  break_tones[3] = 3;
-		break_tones[4] = 10; break_tones[5] = 8;
-		break_tones[6] = 11; break_tones[7] = 15;
+		const int tones[] = {6, 14, 2, 3, 10, 8, 11, 15};
+		for (int i = 0; i < 8; i++) break_tones[i] = tones[i];
+		break_match_threshold = 12;
 	}
 	else if (M == 8)
 	{
-		// Narrowband: different permutation from ACK. Avoids preamble {1,5,3,7}.
-		break_tones[0] = 6;  break_tones[1] = 2;
-		break_tones[2] = 0;  break_tones[3] = 4;
-		break_tones[4] = 3;  break_tones[5] = 7;
-		break_tones[6] = 1;  break_tones[7] = 5;
+		// Sidelnikov (p=37, g=5, offset=3). 32 symbols.
+		const int tones[] = {
+			3, 7, 3, 2, 3, 3, 1, 6, 0, 2, 2, 6, 6, 7, 4, 7,
+			6, 2, 4, 0, 4, 5, 4, 4, 6, 1, 7, 5, 5, 1, 1, 0
+		};
+		for (int i = 0; i < 32; i++) break_tones[i] = tones[i];
+		break_match_threshold = 24;
 	}
 	else if (M == 4)
 	{
-		// Narrowband 2-stream: different interleave from ACK.
-		break_tones[0] = 2;  break_tones[1] = 0;
-		break_tones[2] = 3;  break_tones[3] = 1;
-		break_tones[4] = 0;  break_tones[5] = 2;
-		break_tones[6] = 1;  break_tones[7] = 3;
+		// Sidelnikov (p=53, g=5, offset=3). 48 symbols.
+		const int tones[] = {
+			1, 3, 3, 3, 0, 1, 1, 0, 1, 3, 1, 0, 3, 0, 0, 0,
+			2, 1, 2, 2, 2, 2, 1, 3, 3, 2, 2, 0, 0, 0, 3, 2,
+			2, 3, 2, 0, 2, 3, 0, 3, 3, 3, 1, 2, 1, 1, 1, 1
+		};
+		for (int i = 0; i < 48; i++) break_tones[i] = tones[i];
+		break_match_threshold = 40;
 	}
 	else
 	{
-		// Generic: shifted offset from ACK tones
-		for (int i = 0; i < ACK_PATTERN_LEN; i++)
+		break_match_threshold = 8;
+		for (int i = 0; i < ack_pattern_len; i++)
 			break_tones[i] = (ack_tones[i] + M / 2) % M;
 	}
 }
@@ -245,29 +281,24 @@ void cl_mfsk::generate_preamble(std::complex<double>* preamble_out, int nSymb)
 	}
 }
 
-// Generate ACK pattern: known tones with hopping, repeated ACK_PATTERN_REPS times
+// Generate ACK pattern: ack_pattern_nsymb symbols of known tones.
+// WB: 8 base tones with hopping, repeated 2x. NB: full Sidelnikov sequence, no hopping.
 void cl_mfsk::generate_ack_pattern(std::complex<double>* pattern_out)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
 
-	// Same amplitude as preamble/data: total power = Nc, split across nStreams
 	double amp = sqrt((double)Nc / nStreams);
 
-	for (int s = 0; s < ACK_PATTERN_NSYMB; s++)
+	for (int s = 0; s < ack_pattern_nsymb; s++)
 	{
-		// Zero all subcarriers
 		for (int k = 0; k < Nc; k++)
 		{
 			pattern_out[s * Nc + k] = std::complex<double>(0.0, 0.0);
 		}
 
-		// Which tone from the ack_tones sequence (wraps with ACK_PATTERN_LEN)
-		int tone_base = ack_tones[s % ACK_PATTERN_LEN];
-
-		// Apply tone hopping for frequency diversity (same step as data)
+		int tone_base = ack_tones[s % ack_pattern_len];
 		int actual_tone = (tone_base + s * tone_hop_step) % M;
 
-		// Place in each stream's band (same tone in all streams, like preamble)
 		for (int st = 0; st < nStreams; st++)
 		{
 			pattern_out[s * Nc + stream_offsets[st] + actual_tone] = std::complex<double>(amp, 0.0);
@@ -282,14 +313,14 @@ void cl_mfsk::generate_break_pattern(std::complex<double>* pattern_out)
 
 	double amp = sqrt((double)Nc / nStreams);
 
-	for (int s = 0; s < ACK_PATTERN_NSYMB; s++)
+	for (int s = 0; s < ack_pattern_nsymb; s++)
 	{
 		for (int k = 0; k < Nc; k++)
 		{
 			pattern_out[s * Nc + k] = std::complex<double>(0.0, 0.0);
 		}
 
-		int tone_base = break_tones[s % ACK_PATTERN_LEN];
+		int tone_base = break_tones[s % ack_pattern_len];
 		int actual_tone = (tone_base + s * tone_hop_step) % M;
 
 		for (int st = 0; st < nStreams; st++)

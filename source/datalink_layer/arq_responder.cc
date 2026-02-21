@@ -224,6 +224,10 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		messages_control.status=ACKED;
 		stats.nAcks_sent_control++;
 
+		// Bug #36: reset nUnder BEFORE ACK TX so only turnaround-period
+		// nUnder is counted (not accumulated LISTENING nUnder).
+		telecom_system->data_container.nUnder_processing_events = 0;
+
 		if(ack_pattern_time_ms > 0)
 		{
 			// ACK pattern uses dedicated ack_mfsk — no config switch needed
@@ -254,10 +258,9 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			send_batch();
 			load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
 		}
-		// Capture frame + turnaround gap: ~1200ms for CMD ACK detection (~900ms
-		// polling at 4-sym intervals) + guard (200ms) + config load + encode/TX.
-		// Must match buffer allocation (data_container.cc) to avoid preamble
-		// position exceeding upper_bound when arrival is late.
+		// Capture frame + turnaround gap: CMD processing overhead only.
+		// See acknowledging_data for detailed comment.
+		// Must match buffer allocation (data_container.cc).
 		telecom_system->set_mfsk_ctrl_mode(false);
 		{
 			// During load_configuration(), the capture thread keeps shifting
@@ -272,26 +275,42 @@ void cl_arq_controller::process_messages_acknowledging_control()
 
 			double sym_time_ms = telecom_system->data_container.Nofdm
 				* telecom_system->data_container.interpolation_rate / 48.0;
-			int turnaround_symb = (int)ceil(1200.0 / sym_time_ms) + 4;
+			int frame_symb = telecom_system->data_container.preamble_nSymb
+				+ telecom_system->data_container.Nsymb;
+			// Turnaround = CMD processing overhead only (ACK detect ~100ms +
+			// guard 563ms + encode ~50ms + PTT ~300ms + margin ~1000ms ≈ 2000ms).
+			// CMD frame TX runs concurrently with our ftr countdown, so frame_symb
+			// is NOT added to turnaround. (Revised from Bug #44 frame_symb + 4000ms.)
+			int turnaround_symb = (int)ceil(2000.0 / sym_time_ms) + 4;
 			turnaround_symb -= nUnder_during_load;
 			if(turnaround_symb < 0) turnaround_symb = 0;
-			int ftr = telecom_system->data_container.preamble_nSymb
-				+ telecom_system->data_container.Nsymb
-				+ turnaround_symb;
+			int ftr = frame_symb + turnaround_symb;
 			int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
 			if(ftr > buf_nsymb) ftr = buf_nsymb;
 			telecom_system->data_container.frames_to_read = ftr;
 
 			printf("[ACK-CTRL] ftr=%d (turnaround=%d - load_shift=%d)\n",
-				ftr, (int)ceil(1200.0 / sym_time_ms) + 4, nUnder_during_load);
+				ftr, turnaround_symb + nUnder_during_load, nUnder_during_load);
 			fflush(stdout);
 		}
 
+		char ack_command = messages_control.data[0];  // Save before potential NB switch
 		messages_control.status=FREE;
 		connection_status=RECEIVING;
 		connection_id=assigned_connection_id;
 
-		if (messages_control.data[0]==SWITCH_ROLE)
+		// NB/WB auto-negotiation: deferred switch after START_CONNECTION ACK
+		// Must happen after ACK is sent in WB (so commander can hear it)
+		// but before receiving next message (TEST_CONNECTION in NB)
+		if(link_status == CONNECTION_RECEIVED && session_narrowband && narrowband_enabled == NO)
+		{
+			printf("[NB-NEG] Responder: switching to narrowband after START_CONNECTION ACK\n");
+			fflush(stdout);
+			commander_configured_nb = NO;  // Save original WB for restore on disconnect
+			switch_narrowband_mode(YES);
+		}
+
+		if (ack_command==SWITCH_ROLE)
 		{
 			set_role(COMMANDER);
 			this->link_status=CONNECTED;
@@ -405,7 +424,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			last_message_sent_type=NONE;
 			last_received_message_sequence=-1;
 		}
-		else if(messages_control.data[0]==CLOSE_CONNECTION)
+		else if(ack_command==CLOSE_CONNECTION)
 		{
 			reset_session_state();
 			load_configuration(init_configuration,FULL,YES);
@@ -432,6 +451,10 @@ void cl_arq_controller::process_messages_acknowledging_data()
 	receiving_timer.stop();
 	receiving_timer.reset();
 
+	// Bug #36: reset nUnder BEFORE ACK TX so only turnaround-period
+	// nUnder is counted (not accumulated frame-processing nUnder).
+	telecom_system->data_container.nUnder_processing_events = 0;
+
 	if(ack_pattern_time_ms > 0)
 	{
 		// Send ACK tone pattern (universal, all modes)
@@ -454,10 +477,11 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		// ACK pattern uses dedicated ack_mfsk (M=16, nStreams=1) — no config switch needed
 		send_ack_pattern();
 
-		// Capture frame + turnaround gap: ~1200ms for CMD ACK detection (~900ms
-		// polling at 4-sym intervals) + guard (200ms) + config load + encode/TX.
-		// Must match buffer allocation (data_container.cc) to avoid preamble
-		// position exceeding upper_bound when arrival is late.
+		// Capture frame + turnaround gap: CMD processing overhead only (ACK detect
+		// ~100ms + guard 563ms + encode ~50ms + PTT ~300ms + margin ~1000ms ≈ 2000ms).
+		// CMD frame TX runs concurrently with our ftr countdown. (Revised from
+		// Bug #44 frame_symb + 4000ms — was 2x too long.)
+		// Must match buffer allocation (data_container.cc).
 		telecom_system->set_mfsk_ctrl_mode(false);
 		{
 			int nUnder_during_load = telecom_system->data_container.nUnder_processing_events.load();
@@ -465,18 +489,20 @@ void cl_arq_controller::process_messages_acknowledging_data()
 
 			double sym_time_ms = telecom_system->data_container.Nofdm
 				* telecom_system->data_container.interpolation_rate / 48.0;
-			int turnaround_symb = (int)ceil(1200.0 / sym_time_ms) + 4;
+			int frame_symb = telecom_system->data_container.preamble_nSymb
+				+ telecom_system->data_container.Nsymb;
+			// Turnaround = CMD processing overhead only. CMD frame TX runs
+			// concurrently with ftr countdown. (Revised from Bug #44.)
+			int turnaround_symb = (int)ceil(2000.0 / sym_time_ms) + 4;
 			turnaround_symb -= nUnder_during_load;
 			if(turnaround_symb < 0) turnaround_symb = 0;
-			int ftr = telecom_system->data_container.preamble_nSymb
-				+ telecom_system->data_container.Nsymb
-				+ turnaround_symb;
+			int ftr = frame_symb + turnaround_symb;
 			int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
 			if(ftr > buf_nsymb) ftr = buf_nsymb;
 			telecom_system->data_container.frames_to_read = ftr;
 
 			printf("[ACK-DATA] ftr=%d (turnaround=%d - load_shift=%d)\n",
-				ftr, (int)ceil(1200.0 / sym_time_ms) + 4, nUnder_during_load);
+				ftr, turnaround_symb + nUnder_during_load, nUnder_during_load);
 			fflush(stdout);
 		}
 
@@ -648,16 +674,19 @@ void cl_arq_controller::process_control_responder()
 			printf("[RX-CTRL] Unpacked commander callsign: '%s', flags=0x%02X\n", destination_call_sign.c_str(), peer_flags);
 			fflush(stdout);
 
-			// Check narrowband mode agreement (flag embedded in packed callsign bit 39)
+			// NB/WB auto-negotiation: NB always wins
 			bool peer_narrowband = (peer_flags & 0x01) != 0;
-			if (peer_narrowband != (narrowband_enabled == YES))
+			bool local_narrowband = (narrowband_enabled == YES);
+			session_narrowband = peer_narrowband || local_narrowband;
+			if(session_narrowband && !local_narrowband)
 			{
-				printf("[RX-CTRL] START_CONNECTION REJECTED - narrowband mismatch! "
-					"peer=%s, local=%s\n",
-					peer_narrowband ? "NB" : "WB",
-					narrowband_enabled ? "NB" : "WB");
-				messages_control.status=FREE;
-				return;
+				printf("[NB-NEG] Responder: commander wants NB, will switch after ACK\n");
+				fflush(stdout);
+			}
+			else if(session_narrowband && local_narrowband && !peer_narrowband)
+			{
+				printf("[NB-NEG] Responder: local is NB, peer is WB, session=NB\n");
+				fflush(stdout);
 			}
 
 			// Send PENDING to Winlink to notify incoming connection
@@ -843,19 +872,12 @@ void cl_arq_controller::process_buffer_data_responder()
 {
 	if(link_status==CONNECTED)
 	{
-		int fifo_used = fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size();
-		if(fifo_used > 0)
-		{
-			printf("[DBG-RSP-TX] fifo_rx has %d bytes, tcp_status=%d\n",
-				fifo_used, tcp_socket_data.get_status());
-			fflush(stdout);
-		}
 		if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
 		{
 			while(fifo_buffer_rx.get_size()!=fifo_buffer_rx.get_free_size())
 			{
 				tcp_socket_data.message->length=fifo_buffer_rx.pop(tcp_socket_data.message->buffer,max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH);
-				hex_trace("S9-TCP-OUT", tcp_socket_data.message->buffer, tcp_socket_data.message->length);
+	
 				tcp_socket_data.transmit();
 			}
 		}

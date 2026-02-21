@@ -188,6 +188,16 @@ void cl_arq_controller::process_messages_commander()
 
 	if(this->link_status==CONNECTING)
 	{
+		// NB/WB auto-negotiation Phase 1: WB commander switches to NB
+		// to probe for NB responders (first nb_probe_max attempts)
+		if(connection_attempts == 0 && messages_control.status == FREE &&
+		   commander_configured_nb >= 0 && commander_configured_nb != YES &&
+		   nb_probe_max > 0)
+		{
+			printf("[NB-NEG] Commander: Phase 1 NB probe (WB commander)\n");
+			fflush(stdout);
+			switch_narrowband_mode(YES);
+		}
 		add_message_control(START_CONNECTION);
 	}
 	else if(this->link_status==CONNECTION_ACCEPTED)
@@ -298,9 +308,10 @@ int cl_arq_controller::add_message_control(char code)
 		{
 			messages_control.data[0]=code;
 			messages_control.data[1]=CRC8_calc((char*)destination_call_sign.c_str(), destination_call_sign.length());
-			// Pack callsign with flags embedded in bit 39 (narrowband flag)
+			// Pack callsign with NB flag: reflects current physical mode or commander's NB preference
 			int pack_flags = 0;
-			if (narrowband_enabled) pack_flags |= 0x01;
+			if (narrowband_enabled == YES || commander_configured_nb == YES)
+				pack_flags |= 0x01;
 			callsign_pack(my_call_sign.c_str(), my_call_sign.length(), &messages_control.data[2], pack_flags);
 			messages_control.length=7;  // cmd(1) + CRC8(1) + packed_callsign(5, flags embedded)
 			messages_control.id=0;
@@ -343,9 +354,10 @@ int cl_arq_controller::add_message_control(char code)
 			messages_control.data[2] = reverse_configuration;
 			messages_control.length = 3;
 
-			printf("[GEARSHIFT] SET_CONFIG: forward=%d reverse=%d (SNR down=%.1f up=%.1f)\n",
+			printf("[GEARSHIFT] SET_CONFIG: forward=%d reverse=%d (SNR down=%.1f up=%.1f) link_status=%d\n",
 				forward_configuration, reverse_configuration,
-				measurements.SNR_downlink, measurements.SNR_uplink);
+				measurements.SNR_downlink, measurements.SNR_uplink, (int)link_status);
+			fflush(stdout);
 		}
 		else if(code==REPEAT_LAST_ACK)
 		{
@@ -392,6 +404,51 @@ void cl_arq_controller::process_messages_tx_control()
 				// Reset timer for this new attempt (making connection_timeout a per-attempt timeout)
 				connection_attempt_timer.reset();
 				connection_attempt_timer.start();
+
+				// NB/WB auto-negotiation: phase transitions
+				if(commander_configured_nb >= 0 && nb_probe_max > 0)
+				{
+					if(commander_configured_nb == NO)
+					{
+						// WB commander: NB probes for attempts 0..nb_probe_max-1, then WB forever
+						if(connection_attempts == nb_probe_max)
+						{
+							printf("[NB-NEG] Commander: Phase 2 - restoring WB\n");
+							fflush(stdout);
+							switch_narrowband_mode(NO);
+							messages_control.status = FREE;
+							return;
+						}
+					}
+					else
+					{
+						// NB commander: alternate NB/WB in blocks of nb_probe_max
+						// NB probes (0..1), WB probes (2..3), NB probes (4..5), ...
+						// This ensures both NB and WB responders eventually get reached
+						int phase = connection_attempts / nb_probe_max;
+						int phase_start = phase * nb_probe_max;
+						bool should_be_wb = (phase % 2 == 1);  // odd phases = WB
+						if(connection_attempts == phase_start)
+						{
+							if(should_be_wb && narrowband_enabled == YES)
+							{
+								printf("[NB-NEG] Commander: switching to WB probe (attempt %d)\n", connection_attempts);
+								fflush(stdout);
+								switch_narrowband_mode(NO);
+								messages_control.status = FREE;
+								return;
+							}
+							else if(!should_be_wb && narrowband_enabled == NO)
+							{
+								printf("[NB-NEG] Commander: switching back to NB (attempt %d)\n", connection_attempts);
+								fflush(stdout);
+								switch_narrowband_mode(YES);
+								messages_control.status = FREE;
+								return;
+							}
+						}
+					}
+				}
 			}
 
 			messages_batch_tx[message_batch_counter_tx]=messages_control;
@@ -412,13 +469,31 @@ void cl_arq_controller::process_messages_tx_control()
 		telecom_system->set_mfsk_ctrl_mode(false);
 		pad_messages_batch_tx(control_batch_size);
 		send_batch();
+
+		// Flush self-echo from BOTH the circular capture buffer and the
+		// sliding passband buffer. On VB-Cable loopback, the CMD hears its
+		// own 9-second TX as self-echo filling the ring buffer. Without
+		// flushing capture_buffer, the capture thread drains stale self-echo
+		// into passband_delayed_data BEFORE real-time audio (the RSP's ACK)
+		// arrives — so the ACK is buried behind seconds of backlog. (Bug #38)
+		circular_buf_reset(capture_buffer);
+		{
+			MUTEX_LOCK(&capture_prep_mutex);
+			int signal_period = telecom_system->data_container.Nofdm
+				* telecom_system->data_container.buffer_Nsymb
+				* telecom_system->data_container.interpolation_rate;
+			memset(telecom_system->data_container.passband_delayed_data, 0,
+				signal_period * sizeof(double));
+			MUTEX_UNLOCK(&capture_prep_mutex);
+		}
+
 		if(ack_pattern_time_ms > 0)
 		{
-			// Expect ACK tone pattern. Poll frequently — receive_ack_pattern()
-			// scans only the tail of the buffer, so each poll is cheap (~120μs).
-			// The ACK arrives after responder decode + prep + TX + audio latency;
-			// polling adapts to any round-trip time without timing estimation.
-			telecom_system->data_container.frames_to_read = 4;
+			// Expect ACK tone pattern. Wait for full pattern + margin before first poll.
+			// Buffer was zeroed (self-echo flush), so fresh audio starts immediately.
+			// WB: 16+24=40 symbols (907ms). NB M=8: 32+24=56 (1,269ms). NB M=4: 48+24=72.
+			const int tail_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb + 8 + 16;
+			telecom_system->data_container.frames_to_read = tail_nsymb;
 		}
 		else
 		{
@@ -558,10 +633,25 @@ void cl_arq_controller::process_messages_tx_data()
 		telecom_system->set_mfsk_ctrl_mode(false);  // data TX (full-length frames)
 		pad_messages_batch_tx(data_batch_size);
 		send_batch();
+
+		// Flush self-echo from both ring buffer and sliding buffer (Bug #38).
+		circular_buf_reset(capture_buffer);
+		{
+			MUTEX_LOCK(&capture_prep_mutex);
+			int signal_period = telecom_system->data_container.Nofdm
+				* telecom_system->data_container.buffer_Nsymb
+				* telecom_system->data_container.interpolation_rate;
+			memset(telecom_system->data_container.passband_delayed_data, 0,
+				signal_period * sizeof(double));
+			MUTEX_UNLOCK(&capture_prep_mutex);
+		}
+
 		if(ack_pattern_time_ms > 0)
 		{
-			// Expect ACK tone pattern — poll frequently (same as control path).
-			telecom_system->data_container.frames_to_read = 4;
+			// Expect ACK tone pattern — wait for fresh audio (same as control path).
+			// WB: 16+8=24. NB M=8: 32+8=40. NB M=4: 48+8=56.
+			const int tail_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb + 8;
+			telecom_system->data_container.frames_to_read = tail_nsymb;
 		}
 		else
 		{
@@ -588,15 +678,16 @@ void cl_arq_controller::process_messages_rx_acks_control()
 	{
 		if(ack_pattern_time_ms > 0)
 		{
-			// Detect ACK tone pattern instead of decoding LDPC frame
-			// Only call receive_ack_pattern while still waiting for the ACK.
-			// Once ACKED, stop checking — re-detection would zero the buffer
-			// and destroy the next frame's preamble arriving during the guard.
-			if(messages_control.status==PENDING_ACK)
+			// Detect ACK tone pattern instead of decoding LDPC frame.
+			// Keep checking until ACKED (not just PENDING_ACK): update_status()
+			// may set ACK_TIMED_OUT before the receive window expires, but the
+			// ACK pattern can still arrive within receiving_timeout.
+			if(messages_control.status != ACKED)
 			{
 				if(receive_ack_pattern())
 				{
-					printf("[CMD-ACK-PAT] Control ACK pattern detected!\n");
+					printf("[CMD-ACK-PAT] Control ACK for code=%d detected! elapsed=%dms link=%d status=%d\n",
+					(int)messages_control.data[0], (int)receiving_timer.get_elapsed_time_ms(), (int)link_status, (int)messages_control.status);
 					fflush(stdout);
 					// Flush old batch audio from playback buffer so responder
 					// doesn't demodulate stale frames before the new batch.
@@ -608,10 +699,10 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					messages_control.status=ACKED;
 					stats.nAcked_control++;
 
-					// Guard delay: wait for responder to finish ACK TX + config load.
-					// ACK pattern ~363ms, CMD detects mid-way, RSP needs ~200ms after
-					// ACK for config load. Guard + ~300ms CMD processing = turnaround.
-					int guard = ptt_off_delay_ms + 200;
+					// Guard delay: wait for responder to finish ACK TX + settle.
+					// ACK pattern detected early (~50% of symbols); must wait
+					// for full pattern TX + radio TX→RX + settle before next TX.
+					int guard = ack_pattern_time_ms + ptt_off_delay_ms + 200;
 					receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 				}
 			}
@@ -747,7 +838,11 @@ void cl_arq_controller::process_messages_rx_acks_control()
 
 			// Turboshift probe failure: handle directly (1 retry, then ceiling+BREAK).
 			// Bypasses nResends sub-retries and gearshift_timeout for fast OTA response.
-			if(turboshift_active && this->role == COMMANDER)
+			// Guard: only during CONNECTED — during CONNECTING, the failed message is
+			// START_CONNECTION, not a turboshift SET_CONFIG. Without this guard,
+			// turboshift_active (true from init) hijacks the first NAck and replaces
+			// START_CONNECTION with SET_CONFIG, preventing connection. (Bug #35)
+			if(turboshift_active && this->role == COMMANDER && link_status == CONNECTED)
 			{
 				// Force-clear control message (prevent nResends sub-retries)
 				messages_control.ack_timeout=0;
@@ -919,16 +1014,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				gear_shift_timer.reset();
 				data_ack_received=YES;
 
-				// Pattern = ACK for all pending messages (batch_size=1)
+				// Pattern = ACK for all pending messages (batch_size=1).
+				// Also catch ACK_TIMED_OUT: update_status() may fire before
+				// the ACK pattern arrives within the receive window.
 				for(int i=0; i<nMessages; i++)
 				{
-					if(messages_tx[i].status==PENDING_ACK)
+					if(messages_tx[i].status==PENDING_ACK || messages_tx[i].status==ACK_TIMED_OUT)
 					{
 						register_ack(i);
 					}
 				}
 
-				if(messages_control.data[0]==REPEAT_LAST_ACK && messages_control.status==PENDING_ACK)
+				if(messages_control.data[0]==REPEAT_LAST_ACK &&
+				   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
 				{
 					this->messages_control.ack_timeout=0;
 					this->messages_control.id=0;
@@ -939,8 +1037,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					stats.nAcked_control++;
 				}
 
-				// Guard delay: wait for responder to finish ACK TX + config load
-				int guard = ptt_off_delay_ms + 200;
+				// Guard delay: wait for responder to finish full ACK TX + settle.
+				// Detection fires early (~8/16 symbols); wait for remaining
+				// ACK pattern + radio TX→RX transition + settling margin.
+				int guard = ack_pattern_time_ms + ptt_off_delay_ms + 200;
 				receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 			}
 		}
@@ -1000,7 +1100,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			}
 		}
 	}
-	else if (data_ack_received==NO && !(last_message_sent_type==CONTROL && last_message_sent_code==REPEAT_LAST_ACK))
+	else if (data_ack_received==NO && ack_pattern_time_ms <= 0 && !(last_message_sent_type==CONTROL && last_message_sent_code==REPEAT_LAST_ACK))
 	{
 		consecutive_data_acks = 0;  // Reset on failure
 
@@ -1045,8 +1145,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			return;
 		}
 
-		if(ack_pattern_time_ms <= 0)
-			load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
+		load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
 		add_message_control(REPEAT_LAST_ACK);
 	}
 	else
@@ -1057,11 +1156,58 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		{
 			stats.nNAcked_control++;
 		}
+		if(data_ack_received == NO && ack_pattern_time_ms > 0)
+		{
+			// Pattern ACK timeout: REPEAT_LAST_ACK is useless (responder can't
+			// receive control frames while waiting for data). Skip directly to
+			// retransmit — avoids stuck loop where REPEAT_LAST_ACK was queued
+			// but never sent (connection_status stayed RECEIVING_ACKS_DATA).
+			printf("[CMD-ACK-PAT] Timeout: no ACK pattern detected, retransmitting\n");
+			fflush(stdout);
+			stats.nNAcked_data++;
+		}
 		this->cleanup();
 
 		// Emergency BREAK: track consecutive complete failures (data + REPEAT_LAST_ACK)
 		if(data_ack_received == NO)
 		{
+			consecutive_data_acks = 0;
+
+			// Frame gearshift just applied but data failed — BREAK immediately
+			if(frame_gearshift_just_applied && ack_pattern_time_ms > 0)
+			{
+				frame_gearshift_just_applied = false;
+				int working_config = config_ladder_down(data_configuration, robust_enabled);
+				frame_shift_threshold *= 2;
+
+				printf("[GEARSHIFT] FRAME UP DATA FAILED (pat): config %d -> BREAK to %d (threshold %d)\n",
+					data_configuration, working_config, frame_shift_threshold);
+				fflush(stdout);
+
+				for(int i=0; i<nMessages; i++)
+				{
+					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+						fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
+					messages_tx[i].status = FREE;
+				}
+				fifo_buffer_backup.flush();
+				block_under_tx = NO;
+
+				data_configuration = working_config;
+				negotiated_configuration = working_config;
+				emergency_previous_config = working_config;
+				break_drop_step = 0;
+				emergency_break_active = 1;
+				emergency_break_retries = 3;
+				emergency_nack_count = 0;
+
+				send_break_pattern();
+				telecom_system->data_container.frames_to_read = 4;
+				calculate_receiving_timeout();
+				receiving_timer.start();
+				return;
+			}
+
 			emergency_nack_count++;
 			printf("[BREAK] Block failure #%d at config %d (threshold=%d)\n",
 				emergency_nack_count, current_configuration, emergency_nack_threshold);
@@ -1175,6 +1321,13 @@ void cl_arq_controller::process_control_commander()
 	{
 		if(this->link_status==CONNECTING && messages_control.data[0]==START_CONNECTION)
 		{
+			// NB/WB auto-negotiation: NB commander in WB Phase 2 — switch back to NB
+			if(commander_configured_nb == YES && narrowband_enabled == NO)
+			{
+				printf("[NB-NEG] Commander: NB commander connected via WB, switching to NB\n");
+				fflush(stdout);
+				switch_narrowband_mode(YES);
+			}
 			watchdog_timer.start();
 			this->link_status=CONNECTION_ACCEPTED;
 			connection_status=TRANSMITTING_CONTROL;
@@ -1597,7 +1750,6 @@ void cl_arq_controller::process_buffer_data_commander()
 				}
 				else if(data_read_size==max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH)
 				{
-					hex_trace("S2-FIFO-POP DATA_LONG", message_TxRx_byte_buffer, data_read_size);
 					block_under_tx=YES;
 					add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
 					fifo_buffer_backup.push(message_TxRx_byte_buffer,data_read_size);
@@ -1605,21 +1757,15 @@ void cl_arq_controller::process_buffer_data_commander()
 				}
 				else
 				{
-					hex_trace("S2-FIFO-POP DATA_SHORT", message_TxRx_byte_buffer, data_read_size);
 					block_under_tx=YES;
 					add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
 					fifo_buffer_backup.push(message_TxRx_byte_buffer,data_read_size);
 					filled++;
 				}
 			}
-			printf("[DBG-FILL] Filled %d/%d messages (batch_size=%d, pop_size=%d)\n",
-				filled, fill_limit, data_batch_size, max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH);
-			fflush(stdout);
 		}
 		else if(block_under_tx==YES && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
-			printf("[DBG-BLOCKEND] Adding BLOCK_END\n");
-			fflush(stdout);
 			add_message_control(BLOCK_END);
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)

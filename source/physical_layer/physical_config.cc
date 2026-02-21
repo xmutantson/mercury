@@ -85,7 +85,7 @@ cl_configuration_telecom_system::cl_configuration_telecom_system()
 	time_sync_trials_max=2;
 	use_last_good_time_sync=YES;
 	use_last_good_freq_offset=YES;
-	carrier_frequency = carrier_frequency_offset + (bandwidth / 2 + 300);
+	carrier_frequency = carrier_frequency_offset + 1500.0;  // Center at 1500 Hz (SSB passband center)
 	output_power_Watt=0.1;
 
 	printf("Center frequency: %f Hz low: %f Hz high: %f Hz\n", carrier_frequency, carrier_frequency - bandwidth/2, carrier_frequency + bandwidth/2);

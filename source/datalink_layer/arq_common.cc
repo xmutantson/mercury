@@ -22,6 +22,7 @@
 
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
+#include "debug/canary_guard.h"
 #include <cmath>
 #include <cstring>
 #include <chrono>
@@ -134,6 +135,9 @@ cl_arq_controller::cl_arq_controller()
 	gear_shift_on=NO;
 	robust_enabled=NO;
 	narrowband_enabled=NO;
+	commander_configured_nb=-1;
+	nb_probe_max=2;
+	session_narrowband=false;
 	gear_shift_algorithm=SUCCESS_BASED_LADDER;
 
 	gear_shift_up_success_rate_precentage=70;
@@ -343,8 +347,10 @@ void cl_arq_controller::calculate_receiving_timeout()
 	{
 		if(ack_pattern_time_ms > 0)
 		{
-			// ACK pattern. Allow responder decode + pattern TX + margins.
-			int timeout = message_transmission_time_ms + ack_pattern_time_ms + ptt_on_delay_ms + ptt_off_delay_ms + 3000;
+			// ACK pattern. Allow responder ftr countdown + decode + pattern TX.
+			// RSP turnaround includes CMD frame TX time (Bug #44), so CMD must
+			// wait for: turnaround (frame_TX + 4000ms overhead) + ACK + margins.
+			int timeout = 2 * message_transmission_time_ms + ack_pattern_time_ms + ptt_on_delay_ms + ptt_off_delay_ms + 3000;
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -715,9 +721,11 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 
 	if(ack_pattern_time_ms > 0)
 	{
-		// ACK is a short tone pattern, not a full LDPC frame
-		set_ack_timeout_data((data_batch_size+1)*message_transmission_time_ms + ack_pattern_time_ms + 4*ptt_on_delay_ms + 4*ptt_off_delay_ms + 1500);
-		set_ack_timeout_control(control_batch_size*message_transmission_time_ms + ack_pattern_time_ms + 2*ptt_on_delay_ms + 2*ptt_off_delay_ms + 1500);
+		// ACK is a short tone pattern, not a full LDPC frame.
+		// Bug #44: responder turnaround includes CMD frame TX time, so
+		// ack_timeout must cover: TX + responder ftr (frame_TX + 4000ms) + ACK.
+		set_ack_timeout_data((data_batch_size+2)*message_transmission_time_ms + ack_pattern_time_ms + 4*ptt_on_delay_ms + 4*ptt_off_delay_ms + 3000);
+		set_ack_timeout_control((control_batch_size+1)*message_transmission_time_ms + ack_pattern_time_ms + 2*ptt_on_delay_ms + 2*ptt_off_delay_ms + 3000);
 	}
 	else
 	{
@@ -765,14 +773,16 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 
 	calculate_receiving_timeout();
 
-	// Guard: ack_timeout_control must cover the full TX + receive window.
+	// Guard: ack_timeout must cover the full TX + receive window.
 	// ack_timer starts at frame send (T=0); receiving_timer starts after TX + PTT.
 	// Without this, ack_timeout can expire while CMD is still polling for ACK.
-	if(gear_shift_on && turboshift_phase != TURBO_DONE && this->role == COMMANDER)
+	if(this->role == COMMANDER)
 	{
 		int min_ack = message_transmission_time_ms + ptt_off_delay_ms + receiving_timeout + 500;
 		if(ack_timeout_control < min_ack)
 			set_ack_timeout_control(min_ack);
+		if(ack_timeout_data < min_ack)
+			set_ack_timeout_data(min_ack);
 	}
 
 	if(level==FULL)
@@ -1123,6 +1133,25 @@ void cl_arq_controller::update_status()
 	{
 		std::cout<<"Connection attempt timeout after "<<connection_timeout<<" ms"<<std::endl;
 
+		// NB/WB auto-negotiation: Phase 1 → Phase 2 transition when timer fires.
+		// WB commanders: were in NB probe, restore WB.
+		// NB commanders: NB failed (responder may be WB), switch to WB temporarily.
+		if(role == COMMANDER && link_status == CONNECTING &&
+		   commander_configured_nb >= 0 && connection_attempts < nb_probe_max)
+		{
+			connection_attempts = nb_probe_max;  // Skip remaining probes
+			printf("[NB-NEG] Commander: Phase 2 (timeout-triggered) - switching to %s\n",
+				commander_configured_nb == YES ? "WB (temporary, NB commander)" : "WB (restore)");
+			fflush(stdout);
+			switch_narrowband_mode(NO);  // Switch to WB
+			// Reset timer and control message for fresh Phase 2 attempt
+			connection_attempt_timer.reset();
+			connection_attempt_timer.start();
+			messages_control.status = FREE;
+			// Stay in CONNECTING — process_messages_commander will send new START_CONNECTION
+			return;
+		}
+
 		// Send CANCELPENDING and DISCONNECTED to Winlink (connection attempt timed out)
 		if(role==COMMANDER && tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
 		{
@@ -1242,6 +1271,8 @@ void cl_arq_controller::update_status()
 			// connection_attempt_timeout handler will give up after max retries.
 			printf("[LINK-TIMEOUT] Commander retrying connection at init config\n");
 			fflush(stdout);
+			// Re-save NB preference (reset_session_state cleared it)
+			commander_configured_nb = narrowband_enabled;
 			load_configuration(init_configuration, FULL, YES);
 			link_status=CONNECTING;
 			connection_status=TRANSMITTING_CONTROL;
@@ -1255,7 +1286,8 @@ void cl_arq_controller::update_status()
 			connection_attempts = 0;
 			connection_attempt_timer.reset();
 			connection_attempt_timer.start();
-			add_message_control(START_CONNECTION);
+			// Don't add_message_control here — CONNECTING flow in
+			// process_messages_commander handles NB probe + START_CONNECTION
 		}
 		else if(this->role==RESPONDER)
 		{
@@ -1669,7 +1701,6 @@ void cl_arq_controller::process_main()
 		if(nBytes_received>0)
 		{
 			tcp_socket_data.timer.start();
-			hex_trace("S1-TCP-IN", tcp_socket_data.message->buffer, tcp_socket_data.message->length);
 			fifo_buffer_tx.push(tcp_socket_data.message->buffer, tcp_socket_data.message->length);
 
 			std::string str="BUFFER ";
@@ -1709,10 +1740,10 @@ void cl_arq_controller::process_main()
 
 	// Signal measurement when idle: measure_signal_only() uses FIR_rx_time_sync,
 	// the same filter that receive_byte() uses for preamble detection. Running both
-	// on the same iteration corrupts the FIR delay line state. During active
-	// connections, receive_byte() already provides signal strength, so we only
-	// need measure_signal_only() when idle/listening (no receive() calls happening).
-	if(link_status == LISTENING || link_status == IDLE || link_status == DROPPED)
+	// on the same iteration corrupts the FIR delay line state, making Schmidl-Cox
+	// GI correlation fail (Bug #28). Only run when receive() is NOT called.
+	// LISTENING has active receive() calls → signal strength comes from receive_byte().
+	if(link_status == IDLE || link_status == DROPPED)
 	{
 		MUTEX_LOCK(&capture_prep_mutex);
 		if(telecom_system->data_container.frames_to_read == 0)
@@ -1757,6 +1788,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		command=command.substr(8,std::string::npos);
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
+		commander_configured_nb=narrowband_enabled;
 		original_role=COMMANDER;
 		set_role(COMMANDER);
 		link_status=CONNECTING;
@@ -2015,11 +2047,36 @@ void cl_arq_controller::reset_session_state()
 	last_message_received_code = NONE;
 	last_received_message_sequence = 255;
 
+	// NB/WB negotiation: restore pre-session NB mode
+	if(commander_configured_nb >= 0)
+	{
+		narrowband_enabled = commander_configured_nb;
+		telecom_system->narrowband_enabled = commander_configured_nb;
+		commander_configured_nb = -1;
+	}
+	session_narrowband = false;
+
 	// Connection
 	connection_id = 0;
 	assigned_connection_id = 0;
 	connection_attempts = 0;
 	disconnect_requested = NO;
+}
+
+void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
+{
+	if(narrowband_enabled == nb_enabled)
+		return;
+	printf("[NB-NEG] Switching to %s mode\n", nb_enabled ? "narrowband" : "wideband");
+	fflush(stdout);
+	narrowband_enabled = nb_enabled;
+	telecom_system->narrowband_enabled = nb_enabled;
+	// Force reload by clearing current config on BOTH ARQ and PHY
+	// (telecom_system skips load_configuration if config number matches,
+	// even though narrowband_enabled changed the physical parameters)
+	current_configuration = CONFIG_NONE;
+	telecom_system->current_configuration = CONFIG_NONE;
+	load_configuration(init_configuration, FULL, YES);
 }
 
 
@@ -2076,9 +2133,16 @@ void cl_arq_controller::send(st_message* message, int message_location)
 		telecom_system->data_container.data_byte[i]=(int)(unsigned char)message_TxRx_byte_buffer[i];
 	}
 
-	if(message->type == DATA_LONG || message->type == DATA_SHORT)
+	// Bug #34 diagnostic: print TX frame bytes for CONTROL messages
+	if(message->type == CONTROL || message->type == ACK_CONTROL)
 	{
-		hex_trace("S3-TX-PACK", message_TxRx_byte_buffer, header_length + message->length);
+		int total = header_length + message->length;
+		printf("[TX-CTRL] type=%d hdr=%d len=%d total=%d bytes:",
+			message->type, header_length, message->length, total);
+		for(int i = 0; i < total && i < 10; i++)
+			printf(" %02x", telecom_system->data_container.data_byte[i] & 0xFF);
+		printf("\n");
+		fflush(stdout);
 	}
 
 	telecom_system->transmit_byte(telecom_system->data_container.data_byte,header_length+message->length,telecom_system->data_container.ready_to_transmit_passband_data_tx,message_location);
@@ -2138,9 +2202,10 @@ void cl_arq_controller::send_batch()
 	double *batch_frames_output_data_filtered1=NULL;
 	double *batch_frames_output_data_filtered2=NULL;
 
-	batch_frames_output_data=new double[(message_batch_counter_tx+2)*frame_output_size];
-	batch_frames_output_data_filtered1=new double[(message_batch_counter_tx+2)*frame_output_size];
-	batch_frames_output_data_filtered2=new double[(message_batch_counter_tx+2)*frame_output_size];
+	int batch_alloc_count = (message_batch_counter_tx+2)*frame_output_size;
+	batch_frames_output_data=new double[batch_alloc_count];
+	batch_frames_output_data_filtered1=new double[batch_alloc_count];
+	batch_frames_output_data_filtered2=new double[batch_alloc_count];
 
 	if (batch_frames_output_data==NULL)
 	{
@@ -2444,7 +2509,9 @@ void cl_arq_controller::send_ack_pattern()
 		memset(telecom_system->data_container.passband_delayed_data, 0, buf_samples * sizeof(double));
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
-	telecom_system->data_container.nUnder_processing_events = 0;
+	// nUnder is NOT reset here — let it accumulate during ACK TX so the
+	// responder's ftr calculation can subtract elapsed time. The initial
+	// reset happens before ACK TX (arq_responder.cc, Bug #36).
 	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
 	telecom_system->receive_stats.mfsk_search_raw = 0;
 
@@ -2544,13 +2611,15 @@ void cl_arq_controller::send_break_pattern()
 }
 
 // Receive and detect ACK tone pattern, returns true if detected.
-// Scans only the TAIL (newest 24 symbols) of the capture buffer.
-// Self-echo from our TX lives in the older part and is never scanned.
-// Called frequently (every ~4 symbols / 91ms) to adapt to any round-trip latency.
+// Scans the TAIL (newest symbols) of the capture buffer.
+// Buffer was zeroed after TX, so the tail contains only fresh audio.
+// Called frequently (every ~2 symbols / 45ms) to adapt to any round-trip latency.
 bool cl_arq_controller::receive_ack_pattern()
 {
-	// Tail = ACK pattern (16 sym) + guard (8 sym) = 24 symbols
-	const int tail_nsymb = cl_mfsk::ACK_PATTERN_NSYMB + 8;
+	// Tail must cover the entire fresh audio region (= initial guard).
+	// Tail = pattern length + margin. Ensures ACKs arriving early are captured.
+	// WB: 16+24=40 symbols (907ms). NB M=8: 32+24=56 (1,269ms). NB M=4: 48+24=72.
+	const int tail_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb + 8 + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
 	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
@@ -2576,12 +2645,10 @@ bool cl_arq_controller::receive_ack_pattern()
 			telecom_system->data_container.ready_to_process_passband_delayed_data,
 			tail_samples, &matched_count);
 
-		printf("[ACK-RX] metric=%.3f threshold=%.3f matched=%d/16\n",
-			metric, telecom_system->ack_pattern_detection_threshold, matched_count);
-		fflush(stdout);
-
-		if(metric >= telecom_system->ack_pattern_detection_threshold &&
-		   matched_count >= cl_mfsk::ACK_PATTERN_NSYMB / 2)
+		// ACK detection with energy gate + carrier image recovery (Bug #39).
+		// WB: 8/16 matches, sufficient for M=16/32.
+		// NB: 24/32 (M=8) or 40/48 (M=4) — Sidelnikov sequences eliminate false alarms.
+		if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold && metric >= 3.0)
 		{
 			// Detected — start capturing a full frame immediately so audio
 			// accumulates during guard delay and next preamble isn't missed.
@@ -2594,8 +2661,10 @@ bool cl_arq_controller::receive_ack_pattern()
 			return true;
 		}
 
-		// Not detected — poll again in 4 symbols (~91ms)
-		telecom_system->data_container.frames_to_read = 4;
+		// Not detected — poll again in 2 symbols (~45ms).
+		// Faster polling doubles detection opportunities during the ~6-symbol
+		// window where the full ACK is visible in the tail, reducing NAcks.
+		telecom_system->data_container.frames_to_read = 2;
 		telecom_system->data_container.nUnder_processing_events = 0;
 		return false;
 	}
@@ -2688,6 +2757,42 @@ void cl_arq_controller::receive()
 
 		measurements.signal_stregth_dbm = received_message_stats.signal_stregth_dbm;
 
+		// Bug #35 diagnostic: track every decode attempt
+		{
+			static int decode_attempt = 0;
+			decode_attempt++;
+			if(received_message_stats.message_decoded == YES)
+			{
+				int nrd = telecom_system->data_container.nBits - telecom_system->ldpc.P;
+				int fs = (nrd - 16) / 8;  // frame_size with CRC16
+				printf("[RX-DECODE#%d] OK: delay=%d iters=%d Nsymb=%d nBits=%d frame_size=%d bytes: %02x %02x %02x %02x %02x %02x\n",
+					decode_attempt, received_message_stats.delay, received_message_stats.iterations_done,
+					telecom_system->data_container.Nsymb, telecom_system->data_container.nBits, fs,
+					telecom_system->data_container.data_byte[0] & 0xFF,
+					telecom_system->data_container.data_byte[1] & 0xFF,
+					telecom_system->data_container.data_byte[2] & 0xFF,
+					telecom_system->data_container.data_byte[3] & 0xFF,
+					telecom_system->data_container.data_byte[4] & 0xFF,
+					telecom_system->data_container.data_byte[5] & 0xFF);
+			}
+			else
+			{
+				if(received_message_stats.delay == -1)
+					printf("[RX-DECODE#%d] NO-PREAMBLE: search_raw=%d nUnder=%d link=%d\n",
+						decode_attempt,
+						telecom_system->receive_stats.mfsk_search_raw,
+						telecom_system->data_container.nUnder_processing_events.load(),
+						(int)link_status);
+				else
+					printf("[RX-DECODE#%d] FAIL: delay=%d search_raw=%d nUnder=%d link=%d conn=%d\n",
+						decode_attempt, received_message_stats.delay,
+						telecom_system->receive_stats.mfsk_search_raw,
+						telecom_system->data_container.nUnder_processing_events.load(),
+						(int)link_status, (int)connection_status);
+			}
+			fflush(stdout);
+		}
+
 		if (received_message_stats.message_decoded==YES)
 		{
 			int rx_nsymb = telecom_system->get_active_nsymb();
@@ -2747,7 +2852,7 @@ void cl_arq_controller::receive()
 				{
 					message_TxRx_byte_buffer[i] = (char)telecom_system->data_container.data_byte[i];
 				}
-				hex_trace("S6-RX-RAW", message_TxRx_byte_buffer, byte_copy_len);
+	
 			}
 			if(message_TxRx_byte_buffer[1] == this->connection_id || message_TxRx_byte_buffer[1] == BROADCAST_ID)
 			{
@@ -2786,7 +2891,7 @@ void cl_arq_controller::receive()
 					{
 						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+DATA_LONG_HEADER_LENGTH];
 					}
-					hex_trace("S7-RX-DATA_LONG", messages_rx_buffer.data, messages_rx_buffer.length);
+	
 				}
 				else if(messages_rx_buffer.type==DATA_SHORT)
 				{
@@ -2803,7 +2908,7 @@ void cl_arq_controller::receive()
 					{
 						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+DATA_SHORT_HEADER_LENGTH];
 					}
-					hex_trace("S7-RX-DATA_SHORT", messages_rx_buffer.data, messages_rx_buffer.length);
+	
 				}
 
 				last_message_received_type=messages_rx_buffer.type;
@@ -2817,27 +2922,41 @@ void cl_arq_controller::receive()
 		{
 			// MFSK frame completeness: if the frame extends beyond captured audio,
 			// capture the remaining symbols instead of wasting a full recapture cycle.
-			if(received_message_stats.frame_overflow_symbols > 0)
+			// The metric threshold in time_sync_mfsk already filters false preambles,
+			// so any detected preamble with overflow is worth recapturing.
+			// For NB ROBUST_0, frame (537) = capture window, so ALL real preambles
+			// in the new-data half of the buffer have large overflow — must allow it.
+			int frame_symb = telecom_system->data_container.preamble_nSymb +
+			                 telecom_system->data_container.Nsymb;
+			if(received_message_stats.frame_overflow_symbols > 0 &&
+			   received_message_stats.frame_overflow_symbols < frame_symb)
 			{
 				int shift_symbols = received_message_stats.frame_overflow_symbols + 4;
+
+				// Read nUnder BEFORE resetting — these shifts already happened to the
+				// live buffer during processing and must be included in the total shift
+				// when adjusting mfsk_search_raw for the recaptured buffer.
+				int nUnder_current = telecom_system->data_container.nUnder_processing_events.load();
+				int total_shift = shift_symbols + nUnder_current;
+
 				telecom_system->data_container.frames_to_read = shift_symbols;
 				telecom_system->data_container.nUnder_processing_events = 0;
-				telecom_system->receive_stats.mfsk_search_raw = 0;
 
-				// Save the preamble position adjusted for the upcoming buffer shift.
-				// On the recapture attempt, receive_byte() uses this directly instead
-				// of re-searching — avoids false peaks from FIR transients at the
-				// zero/audio boundary in the shifted buffer.
-				telecom_system->mfsk_fixed_delay =
-					received_message_stats.delay - shift_symbols * symbol_period;
-				if(telecom_system->mfsk_fixed_delay < 0)
-					telecom_system->mfsk_fixed_delay = 0;
+				// Adjust search_raw for the buffer shift so anti-re-decode skips past
+				// previously decoded frames (now at shifted positions). Don't use
+				// mfsk_fixed_delay — its pre-computed delay was systematically wrong
+				// (didn't account for nUnder during processing). Let the normal
+				// preamble search find the correct position after recapture.
+				// Math: after shift of total_shift symbols, frame end is at
+				// buffer_Nsymb - 4 - nUnder — always fits within buffer.
+				int adjusted_search = telecom_system->receive_stats.mfsk_search_raw - total_shift;
+				if(adjusted_search < 0) adjusted_search = 0;
+				telecom_system->receive_stats.mfsk_search_raw = adjusted_search;
 
 				if (g_verbose)
-					printf("[RX-TIMING] INCOMPLETE: overflow=%d symbols, capturing %d more, saved_delay=%d\n",
+					printf("[RX-TIMING] INCOMPLETE: overflow=%d symbols, capturing %d more, nUnder=%d search_raw=%d\n",
 						received_message_stats.frame_overflow_symbols,
-						telecom_system->data_container.frames_to_read.load(),
-						telecom_system->mfsk_fixed_delay);
+						shift_symbols, nUnder_current, adjusted_search);
 				fflush(stdout);
 				return;
 			}
@@ -2851,34 +2970,94 @@ void cl_arq_controller::receive()
 			fflush(stdout);
 
 			// BREAK pattern detection: after failed decode, check for emergency
-			// "drop to ROBUST_0" signal from commander. Works in both OFDM and MFSK
-			// modes — metric threshold + matched count prevent false positives.
-			// Suppress during turboshift: probing different configs produces false
-			// BREAK matches (especially NB M=8 vs OFDM energy).
-			if(break_detected == NO && !turboshift_active)
+			// "drop to ROBUST_0" signal from commander during turboshift.
+			// Only active when: gearshift enabled + responder role.
+			// Commander never needs to detect BREAK (it sends BREAK, not receives).
+			// Without gearshift, BREAK has no purpose — disable to avoid false positives
+			// (matched=8/16 threshold too easy to hit on random MFSK data).
+			if(break_detected == NO && gear_shift_on && role == RESPONDER)
 			{
 				int matched = 0;
 				double metric = telecom_system->detect_break_pattern_from_passband(
 					telecom_system->data_container.ready_to_process_passband_delayed_data,
 					signal_period, &matched);
+				// Require break_match_threshold (WB:12/16, NB M=8:24/32, NB M=4:40/48)
 				if(metric >= telecom_system->ack_pattern_detection_threshold
-				   && matched >= cl_mfsk::ACK_PATTERN_NSYMB / 2)
+				   && matched >= telecom_system->ack_mfsk.break_match_threshold)
 				{
-					printf("[BREAK] Emergency pattern detected! metric=%.2f matched=%d/16\n",
-						metric, matched);
+					printf("[BREAK] Emergency pattern detected! metric=%.2f matched=%d/%d\n",
+						metric, matched, telecom_system->ack_mfsk.ack_pattern_nsymb);
 					fflush(stdout);
 					break_detected = YES;
 				}
 			}
 
-			// Prevent OFDM FAIL spin loop: pause 8 callbacks (~181ms) to let the
-			// buffer accumulate fresh audio instead of burning CPU on doomed LDPC
-			// decodes of the same shifting frame. MFSK has anti-re-decode so it
-			// doesn't spin on the same frame.
+			// Prevent OFDM FAIL spin loop: pause to let the buffer accumulate
+			// fresh audio instead of burning CPU on doomed LDPC decodes.
+			// Smart fast-forward (Bug #33): after a config transition, the
+			// buffer is half-empty and the preamble lands beyond upper_bound
+			// (frame doesn't fit).  Instead of the default 8-symbol shift
+			// (~181ms, needing ~17 iterations), calculate the exact overflow
+			// and shift by that amount in one go.
 			if(telecom_system->M != MOD_MFSK && telecom_system->data_container.frames_to_read == 0)
 			{
-				telecom_system->data_container.frames_to_read = 8;
+				int ftr = 8;  // default anti-spin
+
+				if(received_message_stats.delay > 0)
+				{
+					int sym_period = telecom_system->data_container.Nofdm
+						* telecom_system->data_container.interpolation_rate;
+					int pream_symb = received_message_stats.delay / sym_period;
+					int frame_symb = telecom_system->data_container.Nsymb
+						+ telecom_system->data_container.preamble_nSymb;
+					int upper = telecom_system->data_container.buffer_Nsymb - frame_symb;
+
+					if(pream_symb > upper
+						&& telecom_system->receive_stats.coarse_metric >= 0.5)
+					{
+						ftr = pream_symb - upper + 2;  // +2 margin
+						printf("[RX-TIMING] OFDM fast-forward: pream=%d upper=%d shift=%d\n",
+							pream_symb, upper, ftr);
+						fflush(stdout);
+					}
+				}
+
+				telecom_system->data_container.frames_to_read = ftr;
 				telecom_system->data_container.nUnder_processing_events = 0;
+			}
+
+			// MFSK anti-spin (Bug #37): without this, MFSK NO-PREAMBLE leaves
+			// frames_to_read=0 → capture thread never shifts the buffer →
+			// receive_byte reprocesses the same content indefinitely.
+			//
+			// Signal-aware strategy (Bug #43):
+			// - NO-PREAMBLE (delay==-1): buffer has noise/silence. Use a small
+			//   shift (8 symbols ~181ms) to poll quickly for an incoming frame.
+			//   This avoids a 12s penalty when the buffer simply has no signal.
+			// - LDPC-FAIL (delay>=0): structured MFSK tones present but decode
+			//   failed. Full-frame shift to skip past the stale/bad frame.
+			//   Set mfsk_search_raw to search only the fresh region, preventing
+			//   partial decode of incomplete frames (Bug #42).
+			if(telecom_system->M == MOD_MFSK && telecom_system->data_container.frames_to_read == 0)
+			{
+				if(received_message_stats.delay >= 0)
+				{
+					// Structured signal present — full-frame shift
+					int ftr = telecom_system->data_container.preamble_nSymb
+						+ telecom_system->data_container.Nsymb;
+					telecom_system->data_container.frames_to_read = ftr;
+					telecom_system->data_container.nUnder_processing_events = 0;
+					int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
+					telecom_system->receive_stats.mfsk_search_raw = buf_nsymb - ftr;
+					if(telecom_system->receive_stats.mfsk_search_raw < 0)
+						telecom_system->receive_stats.mfsk_search_raw = 0;
+				}
+				else
+				{
+					// No signal — small shift, poll again quickly
+					telecom_system->data_container.frames_to_read = 8;
+					telecom_system->data_container.nUnder_processing_events = 0;
+				}
 			}
 
 			if(telecom_system->data_container.frames_to_read==0 && telecom_system->receive_stats.delay_of_last_decoded_message!=-1)
@@ -2908,9 +3087,6 @@ void cl_arq_controller::copy_data_to_buffer()
 	{
 		if(messages_rx[i].status==ACKED)
 		{
-			char s8_label[64];
-			snprintf(s8_label, sizeof(s8_label), "S8-RX-FIFO msg[%d]", i);
-			hex_trace(s8_label, messages_rx[i].data, messages_rx[i].length);
 			fifo_buffer_rx.push(messages_rx[i].data,messages_rx[i].length);
 			total_bytes += messages_rx[i].length;
 			messages_rx[i].status=FREE;
@@ -2918,15 +3094,9 @@ void cl_arq_controller::copy_data_to_buffer()
 		}
 		else if(messages_rx[i].status!=FREE)
 		{
-			printf("[DBG-COPY] CLEARING stale msg[%d] status=%d (not ACKED=%d, not FREE=%d)\n",
-				i, messages_rx[i].status, ACKED, FREE);
-			fflush(stdout);
 			messages_rx[i].status=FREE;
 		}
 	}
-	printf("[DBG-COPY] copy_data_to_buffer: copied %d/%d messages, %d bytes to fifo_rx\n",
-		copied, this->nMessages, total_bytes);
-	fflush(stdout);
 	block_ready=1;
 }
 

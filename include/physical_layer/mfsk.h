@@ -47,13 +47,16 @@ public:
 	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol
 	int preamble_nSymb;                     // Number of preamble symbols used
 
-	// ACK pattern: known tone sequence for pattern-based ACK
-	// 8 unique tones transmitted 2x = 16 symbols total
-	static const int ACK_PATTERN_LEN = 8;
-	static const int ACK_PATTERN_REPS = 2;
-	static const int ACK_PATTERN_NSYMB = 16; // ACK_PATTERN_LEN * ACK_PATTERN_REPS
-	int ack_tones[ACK_PATTERN_LEN]; // Known tone indices for ACK pattern
-	int break_tones[ACK_PATTERN_LEN]; // BREAK pattern tones (different Welch-Costas, g=7)
+	// ACK/BREAK pattern: known tone sequences for pattern-based ACK/BREAK.
+	// WB (M>=16): 8 Welch-Costas tones × 2 reps = 16 symbols, with tone hopping.
+	// NB (M<=8): 32/48-element Sidelnikov sequences, no repetition, no hopping.
+	static const int MAX_ACK_TONES = 48;  // Max for M=4 NB (48 symbols)
+	int ack_tones[MAX_ACK_TONES];
+	int break_tones[MAX_ACK_TONES];
+	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
+	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
+	int ack_match_threshold;   // Min matched symbols for ACK detection
+	int break_match_threshold; // Min matched symbols for BREAK detection
 
 	cl_mfsk();
 	~cl_mfsk();
@@ -68,8 +71,8 @@ public:
 	// preamble_out: nSymb * Nc complex values
 	void generate_preamble(std::complex<double>* preamble_out, int nSymb);
 
-	// Generate ACK pattern: ACK_PATTERN_NSYMB symbols of known tones with hopping
-	// pattern_out: ACK_PATTERN_NSYMB * Nc complex values
+	// Generate ACK pattern: ack_pattern_nsymb symbols of known tones
+	// pattern_out: ack_pattern_nsymb * Nc complex values
 	void generate_ack_pattern(std::complex<double>* pattern_out);
 
 	// Generate BREAK pattern: same structure as ACK but with break_tones

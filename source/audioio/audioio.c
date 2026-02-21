@@ -1044,7 +1044,13 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 				continue;
 			}
 
-			if(data_container_ptr->data_ready == 1)
+			// Only count overrun shifts: when buffer is full (ftr==0) but
+			// processing thread hasn't consumed data yet (data_ready==1).
+			// During normal fill (ftr>0), shifts are expected — NOT overruns.
+			// Without this gate, NB MFSK fills of 500+ symbols inflate nUnder
+			// to ~500, wiping out mfsk_search_raw and causing re-decode of
+			// stale preambles (RSP stuck in FAIL decode loop).
+			if(data_container_ptr->data_ready == 1 && data_container_ptr->frames_to_read <= 0)
 				data_container_ptr->nUnder_processing_events++;
 
 			shift_left(data_container_ptr->passband_delayed_data, sp, symbol_period);
@@ -1190,6 +1196,10 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 	clear_buffer(capture_buffer);
 	clear_buffer(playback_buffer);
 
+#if defined(_WIN32)
+    capture_prep_mutex = CreateMutex(NULL, FALSE, NULL);
+#endif
+
     pthread_create(radio_capture, NULL, radio_capture_thread, (void *) capture_dev);
 	pthread_create(radio_playback, NULL, radio_playback_thread, (void *) playback_dev);
 	pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread, (void *) telecom_system);
@@ -1199,6 +1209,10 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 
 int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_t *radio_capture_prep)
 {
+    // Guard: if audio was never initialized (e.g. BER test modes), skip everything
+    if(!capture_buffer)
+        return 0;
+
     pthread_join(*radio_capture_prep, NULL);
     pthread_join(*radio_capture, NULL);
     pthread_join(*radio_playback, NULL);
@@ -1208,6 +1222,8 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 #endif
 
 #if defined(_WIN32)
+	CloseHandle(capture_prep_mutex);
+	capture_prep_mutex = NULL;
 	free(capture_buffer->buffer);
 	circular_buf_free(capture_buffer);
 	free(playback_buffer->buffer);
