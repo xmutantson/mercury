@@ -808,6 +808,36 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 		receive_stats.signal_stregth_dbm=ofdm.measure_signal_stregth(data_container.baseband_data_interpolated, data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate);
 
+		// WB diagnostic: scan buffer for signal energy distribution
+		if(g_verbose && M != MOD_MFSK)
+		{
+			int sym_samp = data_container.Nofdm * frequency_interpolation_rate;
+			int buf_samp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			int nsyms = data_container.buffer_Nsymb;
+			double max_e = 0.0;
+			int max_s = -1;
+			int signal_count = 0;
+			for(int s = 0; s < nsyms; s++)
+			{
+				int offset = s * sym_samp;
+				double e = 0.0;
+				int cnt = 0;
+				for(int i = 0; i < sym_samp && (offset + i) < buf_samp; i++)
+				{
+					double re = data_container.baseband_data_interpolated[offset + i].real();
+					double im = data_container.baseband_data_interpolated[offset + i].imag();
+					e += re*re + im*im;
+					cnt++;
+				}
+				e = (cnt > 0) ? e / cnt : 0.0;
+				if(e > max_e) { max_e = e; max_s = s; }
+				if(e > 0.001) signal_count++;
+			}
+			printf("[DIAG] buffer %d symbs, %d with signal (>0.001), max_energy=%.4e at symb=%d, sig_dbm=%.1f\n",
+				nsyms, signal_count, max_e, max_s, receive_stats.signal_stregth_dbm);
+			fflush(stdout);
+		}
+
 		if(M == MOD_MFSK)
 		{
 			// MFSK preamble detection
@@ -816,9 +846,9 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			if(search_start < 0) search_start = 0;
 			double mfsk_sync_metric = 0;
 
-			if(narrowband_enabled && ofdm.mfsk_corr_template != NULL)
+			if(ofdm.mfsk_corr_template != NULL)
 			{
-				// NB: waveform cross-correlation (2000:1 noise discrimination)
+				// Waveform cross-correlation (2000:1 noise discrimination, NB+WB)
 				receive_stats.delay = ofdm.time_sync_mfsk_corr(
 					data_container.baseband_data_interpolated,
 					data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate,
@@ -893,6 +923,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			receive_stats.delay = win_start + fine_gi.delay;
 			receive_stats.coarse_metric = coarse_bb.correlation;
+
+			if(g_verbose)
+			{
+				printf("[DIAG] halfsym: coarse_delay=%d (symb=%d) metric=%.4f, fine_delay=%d, final=%d\n",
+					coarse_delay_interp, coarse_delay_interp / sym_interp, coarse_bb.correlation,
+					fine_gi.delay, receive_stats.delay);
+				fflush(stdout);
+			}
 		}
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
@@ -1446,16 +1484,17 @@ skip_h_retry_point:
 						}
 					}
 					if(h_count > 0) mean_H = h_sum / h_count;
-					if(g_verbose && narrowband_enabled && receive_stats.sync_trials == 0)
+					if(g_verbose && receive_stats.sync_trials == 0)
 					{
-						// Print first row of channel estimates for NB debugging
-						printf("[CHAN-NB] mean_H=%.4f h_count=%d Nc=%d Nsymb=%d\n", mean_H, h_count, ofdm.Nc, ofdm.Nsymb);
-						printf("[CHAN-NB] H[0..9]: ");
+						// Print channel estimates for debugging
+						printf("[CHAN-EST] mean_H=%.4f h_count=%d Nc=%d Nsymb=%d config=%d\n",
+							mean_H, h_count, ofdm.Nc, ofdm.Nsymb, current_configuration);
+						printf("[CHAN-EST] H[0..9]: ");
 						for(int k = 0; k < ofdm.Nc && k < 10; k++)
 							printf("%.4f ", std::abs(ofdm.estimated_channel[k].value));
 						printf("\n");
-						// Show raw demodulated preamble symbols
-						printf("[CHAN-NB] pream Y[0..9]: ");
+						// Show raw demodulated data at pilot positions
+						printf("[CHAN-EST] Y[0..9]: ");
 						for(int k = 0; k < ofdm.Nc && k < 10; k++)
 							printf("(%.3f,%.3f) ", data_container.ofdm_symbol_demodulated_data[k].real(),
 								data_container.ofdm_symbol_demodulated_data[k].imag());
@@ -1465,7 +1504,7 @@ skip_h_retry_point:
 				}
 
 				{
-					double mean_H_threshold = 0.3;
+					double mean_H_threshold = 0.30;
 					if(mean_H < mean_H_threshold)
 					{
 						skip_h_count++;
@@ -3311,11 +3350,11 @@ void cl_telecom_system::load_configuration(int configuration)
 		mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
 	}
 
-	// Generate MFSK cross-correlation template for NB preamble detection.
+	// Generate MFSK cross-correlation template for preamble detection (NB+WB).
 	// Round-trip through passband signal chain so template matches RX exactly:
 	// symbol_mod → baseband_to_passband → passband_to_baseband(FIR) → decimate
-	printf("[PHY-DBG] NB MFSK template gen check: nb=%d M=%.0f\n", narrowband_enabled, M); fflush(stdout);
-	if(narrowband_enabled && M == MOD_MFSK)
+	printf("[PHY-DBG] MFSK template gen check: nb=%d M=%.0f\n", narrowband_enabled, M); fflush(stdout);
+	if(M == MOD_MFSK)
 	{
 		printf("[PHY-DBG] generating MFSK template: Nc=%d Nofdm=%d preamble_nSymb=%d\n",
 			data_container.Nc, data_container.Nofdm, data_container.preamble_nSymb); fflush(stdout);

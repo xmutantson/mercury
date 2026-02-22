@@ -22,6 +22,7 @@
 
 #include "physical_layer/data_container.h"
 #include "debug/canary_guard.h"
+#include <cstring>
 
 
 cl_data_container::cl_data_container()
@@ -143,7 +144,9 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	int passband_ack = 16 * Nofdm * frequency_interpolation_rate;
 	this->passband_data=CNEW(double, (passband_frame > passband_ack) ? passband_frame : passband_ack, "dc.passband_data");
 	this->passband_delayed_data=CNEW(double, 2*Nofdm*buffer_Nsymb*frequency_interpolation_rate, "dc.passband_delayed_data");
+	memset(this->passband_delayed_data, 0, 2*Nofdm*buffer_Nsymb*frequency_interpolation_rate * sizeof(double));
 	this->ready_to_process_passband_delayed_data=CNEW(double, Nofdm*buffer_Nsymb*frequency_interpolation_rate, "dc.ready_to_process_pdd");
+	memset(this->ready_to_process_passband_delayed_data, 0, Nofdm*buffer_Nsymb*frequency_interpolation_rate * sizeof(double));
 	this->baseband_data=CNEW(std::complex<double>, Nofdm*buffer_Nsymb, "dc.baseband_data");
 	this->baseband_data_interpolated=CNEW(std::complex<double>, Nofdm*buffer_Nsymb*frequency_interpolation_rate, "dc.baseband_data_interp");
 
@@ -160,10 +163,11 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	this->passband_data_tx_filtered_fir_2=CNEW(double, 2*total_frame_size, "dc.passband_data_tx_filt2");
 	this->ready_to_transmit_passband_data_tx=CNEW(double, total_frame_size, "dc.ready_to_tx_passband");
 
-	for(int i=0;i<2*Nofdm*buffer_Nsymb*frequency_interpolation_rate;i++)
-	{
-		this->passband_delayed_data[i]=(double)(rand()%1000 -500)/1000.0;
-	}
+	// Buffer is zero-initialized (memset above). Do NOT fill with random noise:
+	// after a config switch (e.g. MFSK→OFDM gearshift), random data in the buffer
+	// passes the energy gate and gets decoded as noise, producing garbage channel
+	// estimates (mean_H ≈ 0.12). Zero-fill lets the energy gate skip empty frames
+	// until real audio arrives from the capture thread.
 }
 
 void cl_data_container::deinit()
