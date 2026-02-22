@@ -632,6 +632,15 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// the audio callback accesses (passband_delayed_data, etc.)
 	telecom_system->data_container.frames_to_read = 0;
 	telecom_system->load_configuration(configuration);
+
+	// Note: after config switch (e.g. MFSK→OFDM), the zeroed buffer may still
+	// receive stale audio from VB-Cable's internal buffer (~7 symbols). This can
+	// cause Schmidl-Cox false triggers on MFSK remnants. However, extended buffer
+	// flushing causes gearshift timeouts (NB CONFIG_0 buffer_Nsymb=581 → 13.2s).
+	// The OFDM decoder's energy gate + mean_H threshold handle stale data adequately.
+	// WB OFDM fails on VB-Cable regardless (high-pass filter attenuates subcarriers
+	// below 600 Hz; WB lowest subcarrier is at 328 Hz). On real radio, the buffer
+	// starts zeroed (memset in set_size) and VB-Cable latency is not an issue.
 	int nBytes_header=0;
 	if (ACK_MULTI_ACK_RANGE_HEADER_LENGTH>nBytes_header) nBytes_header=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	if (CONTROL_ACK_CONTROL_HEADER_LENGTH>nBytes_header) nBytes_header=CONTROL_ACK_CONTROL_HEADER_LENGTH;

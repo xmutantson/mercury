@@ -2308,6 +2308,47 @@ int cl_ofdm::time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_si
 
 	if (out_metric) *out_metric = best_metric;
 
+	if (g_verbose)
+	{
+		printf("[MFSK-SYNC] best_metric=%.3f threshold=%.1f best_sym=%d buffer_nsymb=%d preamble_nSymb=%d Nc=%d M=%d\n",
+			best_metric, threshold, best_sym_idx, buffer_nsymb, preamble_nSymb, Nc, mfsk_M);
+
+		// Show energy distribution at best position
+		if (best_sym_idx >= 0 && best_metric > 0.01)
+		{
+			for (int p = 0; p < preamble_nSymb; p++)
+			{
+				int sym_idx = best_sym_idx + p;
+				int offset = sym_idx * sym_period_interp + Ngi * interpolation_rate;
+				if (offset + Nfft * interpolation_rate > buffer_size_interp)
+					break;
+
+				for (int i = 0; i < Nfft; i++)
+					decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+				fft(decimated_sym, fft_out, Nfft);
+
+				double e_target = 0, e_total = 0;
+				int half = Nc / 2;
+				for (int st = 0; st < nStreams; st++)
+				{
+					int bin = preamble_bins[p][st];
+					e_target += fft_out[bin].real() * fft_out[bin].real() +
+					            fft_out[bin].imag() * fft_out[bin].imag();
+				}
+				for (int k = 0; k < Nc; k++)
+				{
+					int bk = (k < half) ? (Nfft - half + k) : (start_shift + (k - half));
+					e_total += fft_out[bk].real() * fft_out[bk].real() +
+					           fft_out[bk].imag() * fft_out[bk].imag();
+				}
+				printf("  p%d: tone=%d bin=%d e_target=%.3e e_total=%.3e ratio=%.3f\n",
+					p, preamble_tones[p], preamble_bins[p][0], e_target, e_total,
+					e_total > 0 ? e_target / e_total : 0.0);
+			}
+		}
+		fflush(stdout);
+	}
+
 	if (best_metric < threshold)
 		return -1;  // No valid preamble found
 

@@ -633,6 +633,13 @@ start_modem:
         else if (narrowband_mode == 0)
             g_settings.narrowband_enabled = false;
         g_gui_state.narrowband_enabled.store(g_settings.narrowband_enabled);
+        // Initialize GUI gain state from INI (needed even with -n nogui,
+        // since gui_apply_tx_gain/rx_gain read from g_gui_state always)
+        g_gui_state.tx_gain_db.store(g_settings.tx_gain_db);
+        g_gui_state.rx_gain_db.store(g_settings.rx_gain_db);
+        g_gui_state.gains_locked.store(g_settings.gains_locked);
+        printf("[TX-GAIN] INI: %.1f dB  [RX-GAIN] INI: %.1f dB\n",
+               g_settings.tx_gain_db, g_settings.rx_gain_db);
         // TX gain override from -T flag (temporary, not saved to INI)
         if (tx_gain_override > -900.0) {
             g_gui_state.tx_gain_db.store(tx_gain_override);
