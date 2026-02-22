@@ -125,6 +125,7 @@ int main(int argc, char *argv[])
     double rx_gain_override = -999.0;  // -999 = not set; otherwise override RX gain in dB
     double boost_override = -1.0;     // -1 = use default; >= 0 = override NB MFSK 1S gain (-B flag)
     int nb_probe_max = -1;            // -1 = use default (2); >= 0 = override nb_probe_max
+    int audio_channel_override = -1;  // -1 = use INI settings; >= 0 = override both input+output channel index
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
     output_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -190,7 +191,7 @@ int main(int argc, char *argv[])
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:")) != -1)
+    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:A:")) != -1)
     {
         switch (opt)
         {
@@ -365,6 +366,13 @@ int main(int argc, char *argv[])
                 printf("NB probe max: %d\n", nb_probe_max);
             }
             break;
+        case 'A':
+            if (optarg)
+            {
+                audio_channel_override = atoi(optarg);
+                printf("Audio channel override: %d\n", audio_channel_override);
+            }
+            break;
         case 'h':
 
         default:
@@ -412,9 +420,19 @@ start_modem:
             // Apply channel configuration from settings
             configured_input_channel = g_settings.input_channel;
             configured_output_channel = g_settings.output_channel;
-            printf("Audio channels: input=%s, output=%s\n",
-                   configured_input_channel == 0 ? "LEFT" : configured_input_channel == 1 ? "RIGHT" : "STEREO",
-                   configured_output_channel == 0 ? "LEFT" : configured_output_channel == 1 ? "RIGHT" : "STEREO");
+            // Override with -A flag if specified
+            if (audio_channel_override >= 0) {
+                configured_input_channel = audio_channel_override;
+                configured_output_channel = audio_channel_override;
+            }
+            if (configured_input_channel > 2 || configured_output_channel > 2) {
+                printf("Audio channels: input=%d, output=%d\n",
+                       configured_input_channel, configured_output_channel);
+            } else {
+                printf("Audio channels: input=%s, output=%s\n",
+                       configured_input_channel == 0 ? "LEFT" : configured_input_channel == 1 ? "RIGHT" : "STEREO",
+                       configured_output_channel == 0 ? "LEFT" : configured_output_channel == 1 ? "RIGHT" : "STEREO");
+            }
 
             // Apply TCP port settings from INI (if not overridden by command line)
             if (base_tcp_port == 0) {
@@ -425,6 +443,12 @@ start_modem:
         } else {
             printf("No settings file found, using defaults\n");
         }
+    }
+    // Apply -A audio channel override (even without INI file)
+    if (audio_channel_override >= 0) {
+        configured_input_channel = audio_channel_override;
+        configured_output_channel = audio_channel_override;
+        printf("Audio channel override (-A): %d\n", audio_channel_override);
     }
     fflush(stdout);  // Ensure output is synchronized
 #endif

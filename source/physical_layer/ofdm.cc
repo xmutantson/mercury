@@ -1190,12 +1190,13 @@ void cl_preamble_configurator::configure()
 	int fft_zeros_tmp[Nfft];
 	int fft_zeros_depadded_tmp[Nc];
 
-	// For narrowband (Nc <= 10), use ALL subcarriers as preamble.
-	// The even-only pattern gives only 4 preamble bins for Nc=10, which is
-	// insufficient for FFT-based time sync detection (~9 dB processing gain
-	// vs ~15 dB needed). Using all 10 bins gives +4 dB.
-	// GI correlation is cyclic-prefix-based and works with any pattern.
-	bool all_preamble = (Nc <= 10);
+	// Even-only subcarrier preamble: creates half-symbol periodicity (L=Nfft/2)
+	// for Schmidl-Cox detection, which works at any timing offset.
+	// Previously NB (Nc<=10) used all subcarriers for FFT-based detection,
+	// but that required GI-aligned search grid (only 5.9% hit rate — Bug #41).
+	// With even-only, NB gets 4 preamble subcarriers (bins 252,254,2,4).
+	// WB gets ~24 (Nc/2). Both use time_sync_preamble_halfsym().
+	bool all_preamble = false;
 
 	for(int j=0;j<Nfft;j++)
 	{

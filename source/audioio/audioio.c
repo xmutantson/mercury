@@ -297,13 +297,12 @@ int validate_audio_config(const char *capture_dev, const char *playback_dev, int
 
 						printf("  Format: %s / %u Hz / %u channels\n", fmt_name, sample_rate, channels);
 
-						if (channels != 2) {
-							printf("  *** ERROR: Must be 2 channels (stereo), found %u ***\n", channels);
-							printf("  FIX: Windows Sound Settings -> Recording -> %s\n", name);
-							printf("       -> Properties -> Advanced -> Set to 2 channel, 48000 Hz\n");
-							errors |= 4;
-						} else {
+						if (channels == 1) {
+							printf("  Channels: OK (mono)\n");
+						} else if (channels == 2) {
 							printf("  Channels: OK (stereo)\n");
+						} else {
+							printf("  Channels: %u (multi-channel)\n", channels);
 						}
 
 						if (sample_rate != 48000) {
@@ -374,13 +373,12 @@ int validate_audio_config(const char *capture_dev, const char *playback_dev, int
 
 						printf("  Format: %s / %u Hz / %u channels\n", fmt_name, sample_rate, channels);
 
-						if (channels != 2) {
-							printf("  *** ERROR: Must be 2 channels (stereo), found %u ***\n", channels);
-							printf("  FIX: Windows Sound Settings -> Playback -> %s\n", name);
-							printf("       -> Properties -> Advanced -> Set to 2 channel, 48000 Hz\n");
-							errors |= 8;
-						} else {
+						if (channels == 1) {
+							printf("  Channels: OK (mono)\n");
+						} else if (channels == 2) {
 							printf("  Channels: OK (stereo)\n");
+						} else {
+							printf("  Channels: %u (multi-channel)\n", channels);
 						}
 
 						if (sample_rate != 48000) {
@@ -424,6 +422,9 @@ void *radio_playback_thread(void *device_ptr)
 {
     ffaudio_interface *audio;
 	int device_is_mono = 0;  // Will be set after device opens
+	int out_ch_idx = 0;
+	int out_stereo = 0;
+	int out_nch = 2;
 	struct conf conf = {};
 	conf.buf.app_name = "mercury_playback";
 	conf.buf.format = FFAUDIO_F_INT32;
@@ -508,7 +509,7 @@ void *radio_playback_thread(void *device_ptr)
 	int32_t *buffer_internal_stereo = (int32_t *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(int32_t) * 2); // a big enough buffer
 
 	ffuint total_written = 0;
-	int ch_layout = STEREO;
+
 
 #if ENABLE_FLOAT64_TAP == 1
 	FILE *tap_pay = fopen("tap-playback.f64", "w");
@@ -549,15 +550,17 @@ void *radio_playback_thread(void *device_ptr)
 	frame_size = cfg->channels * (cfg->format & 0xff) / 8;
 	msec_bytes = cfg->sample_rate * frame_size / 1000;
 
-	// Use configured output channel from settings
-	if (configured_output_channel == 0)
-		ch_layout = LEFT;
-	else if (configured_output_channel == 1)
-		ch_layout = RIGHT;
-	else
-		ch_layout = STEREO;
-	// Set mono flag based on actual device channels
+	// Determine output channel index (0-based)
+	// For multi-channel devices (>2ch), configured_output_channel is used directly as index.
+	// For 2ch devices: 0=LEFT, 1=RIGHT, 2=STEREO (backwards compatible).
+	out_ch_idx = configured_output_channel;
+	out_stereo = 0;
 	device_is_mono = (cfg->channels == 1);
+	if (!device_is_mono && cfg->channels == 2 && configured_output_channel == 2)
+		out_stereo = 1;  // STEREO only for 2-channel devices
+	if (out_ch_idx >= (int)cfg->channels)
+		out_ch_idx = 0;  // safety fallback
+	out_nch = cfg->channels;
 
     while (!shutdown_)
     {
@@ -611,56 +614,35 @@ void *radio_playback_thread(void *device_ptr)
 			if (clamped > 1.0) clamped = 1.0;
 			if (clamped < -1.0) clamped = -1.0;
 
-			int idx = i * cfg->channels;
-
-			// Handle mono device - just write single channel
 			if (device_is_mono)
 			{
-				if (is_float32) {
+				// Mono device: single sample per frame
+				if (is_float32)
 					buffer_float_out[i] = (float)clamped;
-				} else if (is_int16) {
+				else if (is_int16)
 					buffer_int16_out[i] = (int16_t)(clamped * 32767.0);
-				} else {
+				else
 					buffer_internal_stereo[i] = clamped * INT_MAX;
-				}
 			}
-			else if (ch_layout == LEFT)
+			else
 			{
+				// Multi-channel: zero all channels, write active channel(s)
+				int idx = i * out_nch;
 				if (is_float32) {
-					buffer_float_out[idx] = (float)clamped;
-					buffer_float_out[idx + 1] = 0.0f;
+					memset(&buffer_float_out[idx], 0, out_nch * sizeof(float));
+					buffer_float_out[idx + out_ch_idx] = (float)clamped;
+					if (out_stereo)
+						buffer_float_out[idx + 1] = (float)clamped;
 				} else if (is_int16) {
-					buffer_int16_out[idx] = (int16_t)(clamped * 32767.0);
-					buffer_int16_out[idx + 1] = 0;
+					memset(&buffer_int16_out[idx], 0, out_nch * sizeof(int16_t));
+					buffer_int16_out[idx + out_ch_idx] = (int16_t)(clamped * 32767.0);
+					if (out_stereo)
+						buffer_int16_out[idx + 1] = buffer_int16_out[idx + out_ch_idx];
 				} else {
-					buffer_internal_stereo[idx] = clamped * INT_MAX;
-					buffer_internal_stereo[idx + 1] = 0;
-				}
-			}
-			else if (ch_layout == RIGHT)
-			{
-				if (is_float32) {
-					buffer_float_out[idx] = 0.0f;
-					buffer_float_out[idx + 1] = (float)clamped;
-				} else if (is_int16) {
-					buffer_int16_out[idx] = 0;
-					buffer_int16_out[idx + 1] = (int16_t)(clamped * 32767.0);
-				} else {
-					buffer_internal_stereo[idx] = 0;
-					buffer_internal_stereo[idx + 1] = clamped * INT_MAX;
-				}
-			}
-			else // STEREO
-			{
-				if (is_float32) {
-					buffer_float_out[idx] = (float)clamped;
-					buffer_float_out[idx + 1] = (float)clamped;
-				} else if (is_int16) {
-					buffer_int16_out[idx] = (int16_t)(clamped * 32767.0);
-					buffer_int16_out[idx + 1] = buffer_int16_out[idx];
-				} else {
-					buffer_internal_stereo[idx] = clamped * INT_MAX;
-					buffer_internal_stereo[idx + 1] = buffer_internal_stereo[idx];
+					memset(&buffer_internal_stereo[idx], 0, out_nch * sizeof(int32_t));
+					buffer_internal_stereo[idx + out_ch_idx] = clamped * INT_MAX;
+					if (out_stereo)
+						buffer_internal_stereo[idx + 1] = buffer_internal_stereo[idx + out_ch_idx];
 				}
 			}
 		}
@@ -739,6 +721,9 @@ void *radio_capture_thread(void *device_ptr)
 {
     ffaudio_interface *audio;
 	int device_is_mono = 0;  // Will be set after device opens
+	int in_ch_idx = 0;
+	int in_stereo = 0;
+	int in_nch = 2;
 	struct conf conf = {};
 	conf.buf.app_name = "mercury_capture";
 	conf.buf.format = FFAUDIO_F_INT32;
@@ -815,7 +800,7 @@ void *radio_capture_thread(void *device_ptr)
 
 	int32_t *buffer = NULL;
 
-	int ch_layout = STEREO;
+
 
 	double *buffer_internal = NULL;
 
@@ -859,16 +844,17 @@ void *radio_capture_thread(void *device_ptr)
 
 	buffer_internal = (double *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(double) * 2);
 
-	// Use configured input channel from settings
-	if (configured_input_channel == 0)
-		ch_layout = LEFT;
-	else if (configured_input_channel == 1)
-		ch_layout = RIGHT;
-	else
-		ch_layout = STEREO;
-
-	// Detect if device is mono - override ch_layout to work with single channel
+	// Determine input channel index (0-based)
+	// For multi-channel devices (>2ch), configured_input_channel is used directly as index.
+	// For 2ch devices: 0=LEFT, 1=RIGHT, 2=STEREO (backwards compatible).
+	in_ch_idx = configured_input_channel;
+	in_stereo = 0;
 	device_is_mono = (cfg->channels == 1);
+	if (!device_is_mono && cfg->channels == 2 && configured_input_channel == 2)
+		in_stereo = 1;
+	if (in_ch_idx >= (int)cfg->channels)
+		in_ch_idx = 0;  // safety fallback
+	in_nch = cfg->channels;
 
 	static int read_loop_counter = 0;
 	while (!shutdown_)
@@ -898,9 +884,9 @@ void *radio_capture_thread(void *device_ptr)
 
 		for (int i = 0; i < frames_to_write; i++)
 		{
-			// Handle mono device - just read single channel directly
 			if (device_is_mono)
 			{
+				// Mono device: single sample per frame
 				if (is_float32)
 					buffer_internal[i] = (double) buffer_float[i];
 				else if (is_int16)
@@ -908,26 +894,9 @@ void *radio_capture_thread(void *device_ptr)
 				else
 					buffer_internal[i] = (double) buffer[i] / (double) INT_MAX;
 			}
-			else if (ch_layout == LEFT)
+			else if (in_stereo)
 			{
-				if (is_float32)
-					buffer_internal[i] = (double) buffer_float[i*2];
-				else if (is_int16)
-					buffer_internal[i] = (double) buffer_int16[i*2] / 32768.0;
-				else
-					buffer_internal[i] = (double) buffer[i*2] / (double) INT_MAX;
-			}
-			else if (ch_layout == RIGHT)
-			{
-				if (is_float32)
-					buffer_internal[i] = (double) buffer_float[i*2 + 1];
-				else if (is_int16)
-					buffer_internal[i] = (double) buffer_int16[i*2 + 1] / 32768.0;
-				else
-					buffer_internal[i] = (double) buffer[i*2 + 1] / (double) INT_MAX;
-			}
-			else // STEREO - average both channels
-			{
+				// STEREO: average channels 0+1 (only for 2ch devices)
 				if (is_float32)
 					buffer_internal[i] = (double) ((buffer_float[i*2] + buffer_float[i*2 + 1]) / 2.0);
 				else if (is_int16)
@@ -935,7 +904,17 @@ void *radio_capture_thread(void *device_ptr)
 				else
 					buffer_internal[i] = (double) ((buffer[i*2] + buffer[i*2 + 1]) / 2.0) / (double) INT_MAX;
 			}
-
+			else
+			{
+				// Indexed channel: works for 2ch (LEFT/RIGHT) and multi-channel (0-15)
+				int pos = i * in_nch + in_ch_idx;
+				if (is_float32)
+					buffer_internal[i] = (double) buffer_float[pos];
+				else if (is_int16)
+					buffer_internal[i] = (double) buffer_int16[pos] / 32768.0;
+				else
+					buffer_internal[i] = (double) buffer[pos] / (double) INT_MAX;
+			}
 		}
 
 #ifdef MERCURY_GUI_ENABLED
