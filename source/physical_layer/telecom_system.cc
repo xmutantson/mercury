@@ -847,76 +847,17 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			}
 
 		}
-		else if(narrowband_enabled)
-		{
-			// NB OFDM: FFT coarse + GI fine preamble detection.
-			//
-			// FFT coarse (Pass 1 of time_sync_preamble_fft): correlates received
-			// FFT bins against known preamble values. Per-bin coherent across
-			// symbols (timing phase cancels), non-coherent across bins (avoids
-			// cross-bin phase spread). PREAMBLE-SPECIFIC: data symbols produce
-			// low metric because their values don't match preamble.
-			//
-			// Metric normalization: raw Σ|bin_accum|² / Σ|FFT_bin|² ≈ Nsym=4
-			// at preamble, ≈ 1 at noise/data. Threshold of 2.0 discriminates.
-			//
-			// GI fine: cyclic prefix correlation in ±1 symbol window around FFT
-			// position. Finds exact symbol boundary (phase-invariant).
-
-			int buf_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-			int sym_interp = data_container.Nofdm * frequency_interpolation_rate;
-			int frame_interp = (data_container.preamble_nSymb + ofdm.Nsymb) * sym_interp;
-			int max_valid_delay = buf_interp - frame_interp;
-
-			// Stage 1: FFT coarse — preamble-specific matched filter
-			TimeSyncResult coarse_fft = ofdm.time_sync_preamble_fft(
-				data_container.baseband_data_interpolated, buf_interp,
-				data_container.interpolation_rate, data_container.preamble_nSymb);
-
-			if(g_verbose)
-				printf("[NB-OFDM] FFT coarse: delay=%d symb=%d metric=%.2f\n",
-					coarse_fft.delay, coarse_fft.delay / sym_interp, coarse_fft.correlation);
-
-			// Reject: normalized metric < 2.0 (noise/data ≈ 1, preamble ≈ 4)
-			// or position doesn't allow full frame extraction
-			if(coarse_fft.correlation < 2.0 || coarse_fft.delay > max_valid_delay || coarse_fft.delay < 0)
-			{
-				if(g_verbose)
-					printf("[NB-OFDM] coarse rejected: metric=%.2f delay=%d max=%d\n",
-						coarse_fft.correlation, coarse_fft.delay, max_valid_delay);
-				st_receive_stats no_preamble = {};
-				no_preamble.message_decoded = NO;
-				no_preamble.delay = -1;
-				no_preamble.signal_stregth_dbm = receive_stats.signal_stregth_dbm;
-				return no_preamble;
-			}
-
-			// Stage 2: GI fine — refine within ±1 symbol of FFT position
-			int pream_interp = data_container.preamble_nSymb * sym_interp;
-			int win_start = coarse_fft.delay - sym_interp;
-			if(win_start < 0) win_start = 0;
-			int win_end = coarse_fft.delay + pream_interp + sym_interp;
-			if(win_end > buf_interp) win_end = buf_interp;
-			int win_size = win_end - win_start;
-
-			TimeSyncResult fine_gi = ofdm.time_sync_preamble_with_metric(
-				&data_container.baseband_data_interpolated[win_start], win_size,
-				data_container.interpolation_rate, 0, 1, 1);
-
-			receive_stats.delay = win_start + fine_gi.delay;
-			receive_stats.coarse_metric = fine_gi.correlation;
-
-			if(g_verbose)
-				printf("[NB-OFDM] GI fine: delay=%d symb=%d gi_metric=%.3f\n",
-					receive_stats.delay, receive_stats.delay / sym_interp, fine_gi.correlation);
-		}
 		else
 		{
-			// WB OFDM: Two-phase preamble detection (Bug #29 fix).
+			// NB + WB OFDM: Two-phase Schmidl-Cox preamble detection.
+			// Both use even-only subcarrier preamble → half-symbol periodicity.
+			// Bug #41 fix: NB previously used FFT-based detection with all 10
+			// subcarriers, requiring GI-aligned search grid (5.9% hit rate).
+			// Now NB uses the same halfsym path as WB → works at any timing.
 			// Phase 1: Decimate 48→12 kHz, half-symbol correlation at baseband.
-			//   At 12 kHz the signal fills ~40% of bandwidth → strong half-symbol
-			//   metric (~0.9 at preamble, ~0.0 at data). At 48 kHz the signal
-			//   is 5% of bandwidth and half-symbol metric fails.
+			//   At 12 kHz: WB fills ~40%, NB fills ~8% of bandwidth.
+			//   Halfsym metric is normalized [0,1] — approaches 1.0 at preamble
+			//   regardless of bandwidth utilization, ~0.0 at data/noise.
 			// Phase 2: GI-based fine sync at 48 kHz for sample-accurate alignment.
 			int buf_bb = data_container.Nofdm * data_container.buffer_Nsymb;
 			int interp = data_container.interpolation_rate;
@@ -1108,10 +1049,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			// Metric threshold: reject weak peaks that pass the energy gate but
 			// correspond to data symbols, not a real OFDM preamble.
-			// WB uses half-symbol correlation (Bug #29): preamble ~0.95-1.0,
+			// Both NB and WB use half-symbol correlation: preamble ~0.95-1.0,
 			// data ~0.10-0.20, noise ~0.05. Threshold 0.5 cleanly separates.
-			// NB uses FFT detection — skip metric gate (already validated).
-			if(energy_ok && !narrowband_enabled && receive_stats.coarse_metric < 0.5)
+			// NB has 4 even subcarriers (vs WB's ~24) — metric may be lower,
+			// but still well above 0.5 at detection SNRs.
+			if(energy_ok && receive_stats.coarse_metric < 0.5)
 			{
 				if (g_verbose)
 					printf("[OFDM-SYNC] metric=%.3f at delay=%d — weak peak, skipping decode\n",
@@ -1122,15 +1064,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			// Silence-skip: when the best Schmidl-Cox peak lands in silence
 			// (energy gate rejected), scan forward to find where signal actually
-			// starts and re-run Schmidl-Cox from there. This handles
+			// starts and re-run with GI correlation from there. This handles
 			// silence-preceded buffers (e.g. SET_CONFIG after ACK) where silence
 			// or boundary peaks beat the real preamble in the initial search.
-			// On real HF this rarely activates (noise floor > energy threshold),
-			// but keeps Schmidl-Cox correlation for when it matters.
-			// Skip for WB OFDM: the half-symbol already searched the whole
-			// buffer. If metric < 0.5, there's no preamble. GI-based recovery
-			// would just find data boundaries (Bug #29).
-			if(!energy_ok && narrowband_enabled)
+			// Both NB and WB now use halfsym which searches the whole buffer,
+			// so this rarely activates. Kept as safety net for edge cases.
+			if(!energy_ok)
 			{
 				int signal_start_symb = -1;
 				for(int s = pream_symb_loc + 1; s <= upper_bound; s++)

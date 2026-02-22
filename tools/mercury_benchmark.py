@@ -115,6 +115,8 @@ def build_config_extra_args(is_nb, signal_dbfs):
     extra = ["-Q", "0"]  # Disable NB auto-negotiation probing (both sides same mode)
     if is_nb:
         extra.append("-N")
+    else:
+        extra.append("-W")  # Force wideband: INI may have Narrowband=true
     native_dbfs = (NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if is_nb
                    else NoiseInjector.DEFAULT_SIGNAL_DBFS)
     atten_db = signal_dbfs - native_dbfs
@@ -153,13 +155,17 @@ def find_wasapi_cable_output():
 class NoiseInjector:
     """Plays AWGN noise on VB-Cable via WASAPI shared mode.
 
-    SNR is calibrated relative to Mercury's actual passband RMS level.
-    Mercury TX chain: PSK(±1) → IFFT(256) → /sqrt(256) → ×sqrt(2) → peak_clip
-    With Nc=50 active subcarriers: RMS ≈ sqrt(50)/sqrt(256) × sqrt(2) ≈ 0.625
-    Peak around -4 to -6 dBFS depending on PAPR clipping.
+    SNR is referenced to a 4 kHz noise bandwidth, matching HF modem convention
+    (PACTOR, WINMOR, etc.). This makes the SNR axis directly comparable between
+    NB and WB modes and with other HF modem benchmarks.
+
+    White noise at fs=48kHz has PSD = sigma^2 / (fs/2).
+    Noise power in 4 kHz ref BW = sigma^2 * REF_BW / (fs/2).
+    So: sigma = signal_amp * sqrt(fs / (2 * REF_BW)) * 10^(-SNR/20)
+    Correction factor: sqrt(48000 / 8000) = sqrt(6) = 2.449 (+7.78 dB).
 
     signal_dbfs sets the reference level. Default -4.4 dBFS = 0.6 amplitude,
-    matching the theoretical RMS. Noise amplitude = signal_amplitude × 10^(-SNR/20).
+    matching Mercury's WB OFDM theoretical RMS with peak clipping.
     """
 
     # Mercury OFDM passband RMS: sqrt(Nc)/sqrt(Nfft) * carrier_amplitude
@@ -167,6 +173,8 @@ class NoiseInjector:
     DEFAULT_SIGNAL_DBFS = -4.4  # conservative estimate accounting for peak clip
     # Narrowband (Nc=10): sqrt(10)/sqrt(256) * sqrt(2) ≈ 0.279 → -11.1 dBFS
     DEFAULT_SIGNAL_DBFS_NB = -11.1
+    # Reference noise bandwidth (Hz) — HF standard, matches PACTOR benchmarks
+    NOISE_REF_BW = 4000
 
     def __init__(self, device_index, snr_db=30, sample_rate=48000, signal_dbfs=None):
         self.device_index = device_index
@@ -176,12 +184,16 @@ class NoiseInjector:
         self._rng = np.random.default_rng()
         self.signal_dbfs = signal_dbfs if signal_dbfs is not None else self.DEFAULT_SIGNAL_DBFS
         self.signal_amplitude = 10 ** (self.signal_dbfs / 20.0)
+        # Bandwidth correction: scale noise so SNR is measured in NOISE_REF_BW
+        # sqrt(fs / (2 * ref_bw)) — ratio of Nyquist BW to reference BW
+        self.bw_correction = np.sqrt(self.sample_rate / (2.0 * self.NOISE_REF_BW))
         self.set_snr(snr_db)
 
     def set_snr(self, snr_db):
         self.snr_db = snr_db
-        # Noise amplitude relative to actual modem signal level
-        self.noise_amplitude = self.signal_amplitude * 10 ** (-snr_db / 20.0)
+        # Noise amplitude: referenced to 4 kHz bandwidth
+        # sigma = signal_amp * bw_correction * 10^(-SNR/20)
+        self.noise_amplitude = self.signal_amplitude * self.bw_correction * 10 ** (-snr_db / 20.0)
 
     def _callback(self, outdata, frames, time_info, status):
         if self.playing:
@@ -198,7 +210,8 @@ class NoiseInjector:
         )
         self._stream.start()
         print(f"[NOISE] Signal ref: {self.signal_dbfs:.1f} dBFS (amplitude={self.signal_amplitude:.4f})")
-        print(f"[NOISE] SNR={self.snr_db:.1f}dB -> noise amplitude={self.noise_amplitude:.4f}")
+        print(f"[NOISE] Ref bandwidth: {self.NOISE_REF_BW} Hz, correction: {self.bw_correction:.3f} ({20*np.log10(self.bw_correction):.1f} dB)")
+        print(f"[NOISE] SNR={self.snr_db:.1f}dB (in {self.NOISE_REF_BW}Hz) -> noise amplitude={self.noise_amplitude:.4f}")
 
     def noise_on(self):
         self.playing = True
@@ -208,6 +221,73 @@ class NoiseInjector:
 
     def stop(self):
         self.playing = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+
+class MultiChannelNoiseInjector:
+    """Plays independent AWGN noise on each channel of a multi-channel WASAPI device.
+
+    Each channel has its own SNR level, controlled thread-safely via set_channel_snr().
+    Uses the same 4 kHz reference bandwidth as NoiseInjector.
+    """
+
+    NOISE_REF_BW = 4000  # Hz — HF standard
+
+    def __init__(self, device_index, num_channels, sample_rate=48000, signal_dbfs=None):
+        self.device_index = device_index
+        self.num_channels = num_channels
+        self.sample_rate = sample_rate
+        self._lock = threading.Lock()
+        self._rng = np.random.default_rng()
+        self._stream = None
+        if signal_dbfs is None:
+            signal_dbfs = NoiseInjector.DEFAULT_SIGNAL_DBFS
+        self.signal_dbfs = signal_dbfs
+        self.signal_amplitude = 10 ** (signal_dbfs / 20.0)
+        self.bw_correction = np.sqrt(sample_rate / (2.0 * self.NOISE_REF_BW))
+        # Per-channel noise amplitudes (0 = silent)
+        self.noise_amplitudes = np.zeros(num_channels)
+
+    def set_channel_snr(self, channel, snr_db):
+        """Thread-safe: set noise level for one channel."""
+        amp = self.signal_amplitude * self.bw_correction * 10 ** (-snr_db / 20.0)
+        with self._lock:
+            self.noise_amplitudes[channel] = amp
+
+    def silence_channel(self, channel):
+        """Mute noise on a channel."""
+        with self._lock:
+            self.noise_amplitudes[channel] = 0.0
+
+    def silence_all(self):
+        """Mute all channels."""
+        with self._lock:
+            self.noise_amplitudes[:] = 0.0
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self._lock:
+            amps = self.noise_amplitudes.copy()
+        for ch in range(self.num_channels):
+            if amps[ch] > 0:
+                outdata[:, ch] = self._rng.normal(0, amps[ch], frames).astype(np.float32)
+            else:
+                outdata[:, ch] = 0.0
+
+    def start(self):
+        import sounddevice as sd
+        self._stream = sd.OutputStream(
+            device=self.device_index, samplerate=self.sample_rate,
+            channels=self.num_channels, dtype='float32',
+            callback=self._callback, blocksize=1024)
+        self._stream.start()
+        print(f"[NOISE-MC] Started {self.num_channels}ch noise on device {self.device_index}, "
+              f"ref={self.signal_dbfs:.1f}dBFS, bw_corr={self.bw_correction:.3f}")
+
+    def stop(self):
+        self.silence_all()
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -315,12 +395,19 @@ def get_config_max_bps(narrowband=False):
 class MercurySession:
     """Manages a commander+responder modem pair lifecycle."""
 
-    def __init__(self, config, gearshift=False, mercury_path=MERCURY_DEFAULT, extra_args=None):
+    def __init__(self, config, gearshift=False, mercury_path=MERCURY_DEFAULT,
+                 extra_args=None, rsp_port=None, cmd_port=None,
+                 vb_in=None, vb_out=None, audio_channel=None):
         self.config = config
         self.gearshift = gearshift
         self.mercury_path = mercury_path
         self.robust = config >= 100
         self.extra_args = extra_args or []
+        self.rsp_port = rsp_port if rsp_port is not None else RSP_PORT
+        self.cmd_port = cmd_port if cmd_port is not None else CMD_PORT
+        self.vb_in = vb_in if vb_in is not None else VB_IN
+        self.vb_out = vb_out if vb_out is not None else VB_OUT
+        self.audio_channel = audio_channel  # None = use default, 0-15 = specific channel
 
         self.procs = []
         self.sockets = []
@@ -333,19 +420,22 @@ class MercurySession:
         self._rx_lock = threading.Lock()
         self._rx_events = []  # (timestamp, delta_bytes, total_bytes)
 
-    def start(self, timeout=30):
-        """Launch both processes, connect TCP, start TX thread. Returns True on success."""
-        os.system("taskkill /F /IM mercury.exe 2>nul >nul")
-        time.sleep(1)
+    def start(self, timeout=30, kill_all=True):
+        """Launch both processes, connect TCP, start TX thread. Returns True on success.
+        If kill_all=False, skip the global taskkill (for parallel mode)."""
+        if kill_all:
+            os.system("taskkill /F /IM mercury.exe 2>nul >nul")
+            time.sleep(1)
 
         robust_flag = ["-R"] if self.robust else []
         gear_flag = ["-g"] if self.gearshift else []
+        channel_flag = ["-A", str(self.audio_channel)] if self.audio_channel is not None else []
 
         # Start responder
         rsp_cmd = [
             self.mercury_path, "-m", "ARQ", "-s", str(self.config),
-            *robust_flag, *gear_flag, *self.extra_args,
-            "-p", str(RSP_PORT), "-i", VB_IN, "-o", VB_OUT, "-x", "wasapi", "-n"
+            *robust_flag, *gear_flag, *channel_flag, *self.extra_args,
+            "-p", str(self.rsp_port), "-i", self.vb_in, "-o", self.vb_out, "-x", "wasapi", "-n"
         ]
         rsp = subprocess.Popen(rsp_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.procs.append(rsp)
@@ -355,8 +445,8 @@ class MercurySession:
         # Start commander
         cmd_cmd = [
             self.mercury_path, "-m", "ARQ", "-s", str(self.config),
-            *robust_flag, *gear_flag, *self.extra_args,
-            "-p", str(CMD_PORT), "-i", VB_IN, "-o", VB_OUT, "-x", "wasapi", "-n"
+            *robust_flag, *gear_flag, *channel_flag, *self.extra_args,
+            "-p", str(self.cmd_port), "-i", self.vb_in, "-o", self.vb_out, "-x", "wasapi", "-n"
         ]
         cmd = subprocess.Popen(cmd_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.procs.append(cmd)
@@ -364,14 +454,14 @@ class MercurySession:
         time.sleep(3)
 
         # Setup responder
-        rsp_ctrl = tcp_send_commands(RSP_PORT, ["MYCALL TESTB\r\n", "LISTEN ON\r\n"])
+        rsp_ctrl = tcp_send_commands(self.rsp_port, ["MYCALL TESTB\r\n", "LISTEN ON\r\n"])
         self.sockets.append(rsp_ctrl)
         time.sleep(1)
 
         # Data ports
-        cmd_data = tcp_connect_retry(CMD_PORT + 1)
+        cmd_data = tcp_connect_retry(self.cmd_port + 1)
         self.sockets.append(cmd_data)
-        rsp_data = tcp_connect_retry(RSP_PORT + 1)
+        rsp_data = tcp_connect_retry(self.rsp_port + 1)
         self.sockets.append(rsp_data)
 
         # TX thread (pre-fill FIFO)
@@ -386,7 +476,7 @@ class MercurySession:
         self._rx_thread.start()
 
         # Connect
-        cmd_ctrl = tcp_send_commands(CMD_PORT, ["CONNECT TESTA TESTB\r\n"])
+        cmd_ctrl = tcp_send_commands(self.cmd_port, ["CONNECT TESTA TESTB\r\n"])
         self.sockets.append(cmd_ctrl)
         self._cmd_ctrl = cmd_ctrl
 
@@ -567,16 +657,22 @@ class MercurySession:
     def is_alive(self):
         return all(p.poll() is None for p in self.procs)
 
-    def stop(self):
+    def stop(self, kill_all=False):
+        """Stop this session's processes. If kill_all=True, also run global taskkill."""
         self.stop_event.set()
         for s in self.sockets:
             try: s.close()
             except: pass
         for p in self.procs:
-            try: p.kill()
-            except: pass
-        os.system("taskkill /F /IM mercury.exe 2>nul >nul")
-        time.sleep(1)
+            try:
+                p.terminate()
+                p.wait(timeout=3)
+            except:
+                try: p.kill()
+                except: pass
+        if kill_all:
+            os.system("taskkill /F /IM mercury.exe 2>nul >nul")
+        time.sleep(0.5)
 
     def save_log(self, path):
         """Save full modem output to log file."""
@@ -650,7 +746,7 @@ def generate_sweep_chart(csv_path, output_path):
             max_bpm = bps_table[cfg] / 8 * 60  # bps → bytes/min
             ax.axhline(y=max_bpm, color=colors[idx], linestyle='--', alpha=0.3, linewidth=1)
 
-    ax.set_xlabel('SNR (dB)', fontsize=12)
+    ax.set_xlabel('SNR (dB in 4 kHz)', fontsize=12)
     ax.set_ylabel('Throughput (bytes/min)', fontsize=12)
     ax.set_title('Mercury Modem — Throughput vs SNR', fontsize=14)
     ax.legend(loc='upper left', fontsize=8, ncol=2)
@@ -725,6 +821,480 @@ def generate_stress_chart(timeline_csv, output_path):
     print(f"[CHART] Saved to {output_path}")
     plt.close()
     return True
+
+
+# ============================================================
+# Multi-channel parallel sweep infrastructure
+# ============================================================
+
+from collections import namedtuple
+import queue
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+
+CableInfo = namedtuple('CableInfo', [
+    'playback_name', 'capture_name', 'num_channels',
+    'playback_idx', 'capture_idx'
+])
+
+
+def discover_multichannel_cables():
+    """Discover WASAPI cables with >2 channels for parallel benchmarking.
+
+    Returns list of CableInfo sorted by name (Cable A first, then B, etc.).
+    """
+    import sounddevice as sd
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    # Find WASAPI hostapi index
+    wasapi_idx = None
+    for i, h in enumerate(hostapis):
+        if 'WASAPI' in h['name']:
+            wasapi_idx = i
+            break
+    if wasapi_idx is None:
+        return []
+
+    # Find multi-channel CABLE playback/capture pairs
+    playbacks = {}  # key: cable letter (A, B, ...) -> device info
+    captures = {}
+
+    for i, d in enumerate(devices):
+        if d['hostapi'] != wasapi_idx:
+            continue
+        name = d['name']
+        # Playback: "CABLE-A In 16ch (VB-Audio Virtual Cable A)"
+        if 'CABLE-' in name and 'In' in name and d['max_output_channels'] > 2:
+            letter = name.split('CABLE-')[1][0]  # 'A', 'B', etc.
+            playbacks[letter] = (i, d)
+        # Capture: "CABLE-A Output (VB-Audio Virtual Cable A)"
+        if 'CABLE-' in name and 'Output' in name and d['max_input_channels'] > 2:
+            letter = name.split('CABLE-')[1][0]
+            captures[letter] = (i, d)
+
+    cables = []
+    for letter in sorted(playbacks.keys()):
+        if letter not in captures:
+            continue
+        pb_idx, pb_dev = playbacks[letter]
+        cap_idx, cap_dev = captures[letter]
+        nch = min(pb_dev['max_output_channels'], cap_dev['max_input_channels'])
+        cables.append(CableInfo(
+            playback_name=pb_dev['name'],
+            capture_name=cap_dev['name'],
+            num_channels=nch,
+            playback_idx=pb_idx,
+            capture_idx=cap_idx,
+        ))
+    return cables
+
+
+class BenchmarkWorker:
+    """One worker = one audio channel. Pulls work items from a shared queue."""
+
+    def __init__(self, worker_id, cable, channel, noise_injector,
+                 results_queue, args, log_dir):
+        self.worker_id = worker_id
+        self.cable = cable
+        self.channel = channel
+        self.rsp_port = 7002 + worker_id * 10
+        self.cmd_port = 7006 + worker_id * 10
+        self.vb_in = cable.capture_name
+        self.vb_out = cable.playback_name
+        self.noise = noise_injector
+        self.results = results_queue
+        self.args = args
+        self.log_dir = log_dir
+        self.items_done = 0
+
+    def _kill_own_ports(self):
+        """Kill any Mercury processes listening on this worker's ports."""
+        for port in (self.rsp_port, self.cmd_port):
+            try:
+                result = subprocess.run(
+                    ['netstat', '-ano'], capture_output=True, text=True, timeout=5)
+                for line in result.stdout.splitlines():
+                    if f':{port} ' in line and 'LISTENING' in line:
+                        parts = line.split()
+                        pid = int(parts[-1])
+                        if pid > 0:
+                            subprocess.run(['taskkill', '/F', '/PID', str(pid)],
+                                           capture_output=True, timeout=5)
+            except Exception:
+                pass
+
+    def _start_session(self, cfg_id, is_nb, max_retries=2):
+        """Start a Mercury session with retries. Returns session or None."""
+        name = config_name(cfg_id, is_nb)
+        extra_args = build_config_extra_args(is_nb, self.args.signal_dbfs)
+
+        for attempt in range(max_retries):
+            session = MercurySession(
+                cfg_id, gearshift=False,
+                mercury_path=self.args.mercury,
+                rsp_port=self.rsp_port, cmd_port=self.cmd_port,
+                vb_in=self.vb_in, vb_out=self.vb_out,
+                audio_channel=self.channel, extra_args=extra_args)
+            try:
+                session.start(kill_all=False)
+
+                if session.wait_connected(timeout=self.args.timeout):
+                    if session.wait_data_batches(2, timeout=self.args.timeout):
+                        return session
+                    else:
+                        print(f"  [W{self.worker_id}] NO_DATA for {name} (attempt {attempt+1})", flush=True)
+                else:
+                    print(f"  [W{self.worker_id}] CONN_FAIL for {name} (attempt {attempt+1})", flush=True)
+            except Exception as e:
+                print(f"  [W{self.worker_id}] START_ERROR for {name} (attempt {attempt+1}): {e}", flush=True)
+
+            # Always clean up — kill session processes AND any zombies on our ports
+            try:
+                session.stop()
+            except Exception:
+                pass
+            self._kill_own_ports()
+
+            if attempt < max_retries - 1:
+                time.sleep(5)
+
+        return None
+
+    def run(self, work_queue):
+        """Main loop — pull (config, is_nb, snr_list) work items until queue empty.
+
+        Each work item is a full config with all SNR points. The worker connects once
+        and sweeps all SNR levels, getting natural warmup on the first point.
+        """
+        # Stagger startup to avoid simultaneous Mercury launches
+        time.sleep(self.worker_id * 2)
+
+        consecutive_fails = 0
+        MAX_CONSECUTIVE_FAILS = 3
+
+        while True:
+            try:
+                cfg_id, is_nb, snr_list = work_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            name = config_name(cfg_id, is_nb)
+
+            # Circuit breaker: stop if this worker keeps failing
+            if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                print(f"  [W{self.worker_id}] CIRCUIT BREAKER: {consecutive_fails} consecutive "
+                      f"failures, returning {name} to queue", flush=True)
+                # Put item back for a healthy worker
+                work_queue.put((cfg_id, is_nb, snr_list))
+                work_queue.task_done()
+                self._kill_own_ports()
+                break
+            use_auto_dur = getattr(self.args, 'auto_duration', False)
+            measure_dur = (auto_measure_duration(cfg_id, is_nb, self.args.measure_duration)
+                           if use_auto_dur else self.args.measure_duration)
+
+            try:
+                session = self._start_session(cfg_id, is_nb)
+                if not session:
+                    consecutive_fails += 1
+                    # Connection failed — record zeros for all SNR points
+                    for snr_db in snr_list:
+                        self.results.put({
+                            'config': cfg_id, 'config_name': name,
+                            'snr_db': snr_db, 'rx_bytes': 0, 'duration_s': 0,
+                            'throughput_bps': 0, 'bytes_per_min': 0,
+                            'nacks': 0, 'breaks': 0, 'process_alive': False,
+                            'worker': self.worker_id, 'status': 'CONN_FAIL'
+                        })
+                    work_queue.task_done()
+                    continue
+
+                consecutive_fails = 0  # Connected successfully
+                print(f"  [W{self.worker_id}] Connected {name}, ch={self.channel}, "
+                      f"{len(snr_list)} SNR points, measure={measure_dur:.0f}s", flush=True)
+
+                # Warmup: run one high-SNR measurement to fill the ARQ pipeline.
+                # NB OFDM frames take 10-20s to transit; without warmup the first
+                # 1-2 measurement windows are empty and trigger false waterfall.
+                self.noise.silence_channel(self.channel)
+                warmup_dur = min(measure_dur, 45)
+                warmup_result = session.measure_throughput(warmup_dur)
+                print(f"  [W{self.worker_id}] {name} warmup: {warmup_result['rx_bytes']}B "
+                      f"in {warmup_dur:.0f}s", flush=True)
+
+                # Waterfall detection — only after first successful measurement
+                wf_threshold = 4 if cfg_id >= 100 else 2
+                zero_count = 0
+                seen_data = False
+
+                for snr_idx, snr_db in enumerate(snr_list):
+                    if not session.is_alive():
+                        print(f"  [W{self.worker_id}] CRASH {name} @ SNR={snr_db}", flush=True)
+                        for remaining_snr in snr_list[snr_idx:]:
+                            self.results.put({
+                                'config': cfg_id, 'config_name': name,
+                                'snr_db': remaining_snr, 'rx_bytes': 0, 'duration_s': 0,
+                                'throughput_bps': 0, 'bytes_per_min': 0,
+                                'nacks': 0, 'breaks': 0, 'process_alive': False,
+                                'worker': self.worker_id, 'status': 'CRASH'
+                            })
+                        break
+
+                    self.noise.set_channel_snr(self.channel, snr_db)
+                    time.sleep(self.args.settle_time)
+
+                    pre_stat = len(session.rsp_lines)
+                    result = session.measure_throughput(measure_dur)
+                    stats = session.get_stats(pre_stat)
+
+                    self.noise.silence_channel(self.channel)
+
+                    nacks = stats['nacks_rsp'] + stats['nacks_cmd']
+                    breaks = stats['breaks_rsp'] + stats['breaks_cmd']
+                    status = 'OK' if result['rx_bytes'] > 0 else 'ZERO'
+
+                    self.results.put({
+                        'config': cfg_id, 'config_name': name,
+                        'snr_db': snr_db,
+                        'rx_bytes': result['rx_bytes'],
+                        'duration_s': round(result['duration_s'], 1),
+                        'throughput_bps': round(result['throughput_bps'], 1),
+                        'bytes_per_min': round(result['bytes_per_min'], 1),
+                        'nacks': nacks, 'breaks': breaks,
+                        'process_alive': session.is_alive(),
+                        'worker': self.worker_id, 'status': status,
+                    })
+
+                    print(f"  [W{self.worker_id}] {name} SNR={snr_db:+.0f}dB: "
+                          f"{result['bytes_per_min']:.0f} B/min "
+                          f"({result['throughput_bps']:.0f} bps) [{status}]", flush=True)
+
+                    self.items_done += 1
+
+                    # Waterfall detection — only after first non-zero measurement
+                    if result['rx_bytes'] > 0:
+                        seen_data = True
+                        zero_count = 0
+                    elif seen_data:
+                        zero_count += 1
+                        if zero_count >= wf_threshold:
+                            print(f"  [W{self.worker_id}] {name} WATERFALL at SNR={snr_db}", flush=True)
+                            for remaining_snr in snr_list[snr_idx+1:]:
+                                self.results.put({
+                                    'config': cfg_id, 'config_name': name,
+                                    'snr_db': remaining_snr, 'rx_bytes': 0, 'duration_s': 0,
+                                    'throughput_bps': 0, 'bytes_per_min': 0,
+                                    'nacks': 0, 'breaks': 0,
+                                    'process_alive': session.is_alive(),
+                                    'worker': self.worker_id, 'status': 'WATERFALL'
+                                })
+                            break
+
+                    if snr_idx < len(snr_list) - 1:
+                        time.sleep(self.args.settle_time)
+
+                # Save log and stop session
+                self.noise.silence_channel(self.channel)
+                session.save_log(os.path.join(self.log_dir, f'w{self.worker_id}_{name}.log'))
+                session.stop()
+
+            except Exception as e:
+                consecutive_fails += 1
+                print(f"  [W{self.worker_id}] ERROR on {name}: {e}", flush=True)
+                # Kill any zombie processes on our ports
+                self._kill_own_ports()
+                for snr_db in snr_list:
+                    self.results.put({
+                        'config': cfg_id, 'config_name': name,
+                        'snr_db': snr_db, 'rx_bytes': 0, 'duration_s': 0,
+                        'throughput_bps': 0, 'bytes_per_min': 0,
+                        'nacks': 0, 'breaks': 0, 'process_alive': False,
+                        'worker': self.worker_id, 'status': f'ERROR:{e}'
+                    })
+
+            work_queue.task_done()
+
+        print(f"  [W{self.worker_id}] Done ({self.items_done} items)", flush=True)
+
+
+def run_parallel_sweep(args):
+    """Parallel multi-channel SNR sweep using work queue architecture."""
+    default_nb = getattr(args, 'narrowband', False)
+    config_specs = parse_config_spec(args.configs, default_nb=default_nb)
+    snr_levels = []
+    snr = args.snr_start
+    while snr >= args.snr_stop:
+        snr_levels.append(snr)
+        snr += args.snr_step
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs(args.output_dir, exist_ok=True)
+    csv_path = os.path.join(args.output_dir, f'benchmark_parallel_{ts}.csv')
+    chart_path = os.path.join(args.output_dir, f'benchmark_parallel_{ts}.png')
+    log_dir = os.path.join(args.output_dir, f'logs_parallel_{ts}')
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Discover multi-channel cables
+    cables = discover_multichannel_cables()
+    if not cables:
+        print("[ERROR] No multi-channel WASAPI cables found.")
+        print("        Configure VB-Cable A/B to 16 channels in Windows Sound Settings.")
+        sys.exit(1)
+
+    total_channels = sum(c.num_channels for c in cables)
+    max_workers = getattr(args, 'max_workers', total_channels) or total_channels
+    max_workers = min(max_workers, total_channels)
+
+    has_nb = any(nb for _, nb in config_specs)
+    has_wb = any(not nb for _, nb in config_specs)
+    mode_str = "NB+WB" if (has_nb and has_wb) else ("NB" if has_nb else "WB")
+    use_auto_dur = getattr(args, 'auto_duration', False)
+
+    # Generate work items: (config_id, is_nb, snr_list)
+    # Each work item is one config with ALL its SNR points.
+    # Worker connects once, sweeps all points — natural warmup on first point.
+    work_items = [(cfg_id, is_nb, list(snr_levels)) for cfg_id, is_nb in config_specs]
+    total_points = len(config_specs) * len(snr_levels)
+
+    # Limit workers to number of configs (no benefit from more)
+    max_workers = min(max_workers, len(work_items))
+
+    print(f"{'='*70}")
+    print(f"Mercury Benchmark -- PARALLEL SNR Sweep ({mode_str})")
+    print(f"{'='*70}")
+    print(f"Cables discovered: {len(cables)}")
+    for c in cables:
+        print(f"  {c.playback_name} <-> {c.capture_name} ({c.num_channels}ch)")
+    print(f"Workers: {max_workers} (across {total_channels} total channels)")
+    print(f"Cable signal level: {args.signal_dbfs:.1f} dBFS")
+    print(f"Configs ({len(config_specs)}):")
+    for cfg_id, is_nb in config_specs:
+        name = config_name(cfg_id, is_nb)
+        bps = config_max_bps(cfg_id, is_nb)
+        dur = auto_measure_duration(cfg_id, is_nb, args.measure_duration) if use_auto_dur else args.measure_duration
+        print(f"  {name:16s} max={bps:5d} bps  measure={dur:.0f}s")
+    print(f"SNR: {snr_levels[0]}dB -> {snr_levels[-1]}dB (step {args.snr_step}dB, {len(snr_levels)} points)")
+    print(f"Work items: {len(work_items)} configs ({total_points} total SNR points)")
+    avg_dur = sum(auto_measure_duration(c, n, args.measure_duration) if use_auto_dur else args.measure_duration
+                  for c, n in config_specs) / max(len(config_specs), 1)
+    # Estimate: slowest config determines wall time (all run in parallel)
+    max_config_dur = max(
+        len(snr_levels) * (auto_measure_duration(c, n, args.measure_duration)
+                           if use_auto_dur else args.measure_duration + args.settle_time)
+        for c, n in config_specs)
+    est_time = max_config_dur + 30  # + connect overhead
+    print(f"Estimated time: {est_time/60:.0f} min (limited by slowest config)")
+    print(f"Output: {csv_path}")
+    print()
+
+    # Kill any existing mercury processes first
+    os.system("taskkill /F /IM mercury.exe 2>nul >nul")
+    time.sleep(2)
+
+    # Create work queue — one item per config
+    work_queue = queue.Queue()
+    for item in work_items:
+        work_queue.put(item)
+
+    results_queue = queue.Queue()
+
+    # Create workers and noise injectors (only for cables with assigned workers)
+    workers = []
+    noise_injectors = []
+
+    for cable_idx, cable in enumerate(cables):
+        if len(workers) >= max_workers:
+            break
+        noise = MultiChannelNoiseInjector(
+            cable.playback_idx, cable.num_channels,
+            sample_rate=SAMPLE_RATE, signal_dbfs=args.signal_dbfs)
+        noise.start()
+        noise_injectors.append(noise)
+
+        for ch in range(cable.num_channels):
+            if len(workers) >= max_workers:
+                break
+            w = BenchmarkWorker(len(workers), cable, ch, noise,
+                                results_queue, args, log_dir)
+            workers.append(w)
+
+    print(f"[PARALLEL] {len(work_items)} work items, {len(workers)} workers")
+    print(f"[PARALLEL] Starting...\n")
+
+    try:
+        # Launch all workers
+        with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+            futures = {pool.submit(w.run, work_queue): w for w in workers}
+
+            # Wait with progress reporting
+            done_count = 0
+            total = len(work_items)
+            last_report = time.time()
+            for f in concurrent.futures.as_completed(futures):
+                w = futures[f]
+                try:
+                    f.result()
+                except Exception as e:
+                    print(f"  [W{w.worker_id}] Worker crashed: {e}", flush=True)
+                done_count += w.items_done
+                now = time.time()
+                if now - last_report > 10:
+                    pending = results_queue.qsize()
+                    print(f"  [PROGRESS] ~{pending}/{total} results collected", flush=True)
+                    last_report = now
+
+        # Collect results
+        results = []
+        while not results_queue.empty():
+            results.append(results_queue.get())
+
+        # Sort by (config, snr_db) for consistent CSV output
+        results.sort(key=lambda r: (r['config'], r['config_name'], r['snr_db']))
+
+        # Write CSV — use same format as sequential sweep for compatibility
+        fieldnames = ['config', 'config_name', 'snr_db', 'rx_bytes', 'duration_s',
+                      'throughput_bps', 'bytes_per_min', 'nacks', 'breaks',
+                      'process_alive', 'worker', 'status']
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"\n[CSV] Saved to {csv_path}")
+
+        # Generate chart — reuse existing sweep chart generator
+        generate_sweep_chart(csv_path, chart_path)
+
+        # Summary
+        print(f"\n{'='*70}")
+        print(f"PARALLEL SWEEP COMPLETE ({mode_str})")
+        print(f"{'='*70}")
+        for cfg_id, is_nb in config_specs:
+            name = config_name(cfg_id, is_nb)
+            cfg_rows = [r for r in results if r['config_name'] == name]
+            max_bpm = max((r['bytes_per_min'] for r in cfg_rows), default=0)
+            waterfall_snr = None
+            for r in sorted(cfg_rows, key=lambda x: x['snr_db'], reverse=True):
+                if r['bytes_per_min'] > 0:
+                    waterfall_snr = r['snr_db']
+            fails = sum(1 for r in cfg_rows if r.get('status') not in ('OK', 'ZERO'))
+            if waterfall_snr is not None:
+                extra = f" ({fails} fails)" if fails else ""
+                print(f"  {name:16s}: peak {max_bpm:.0f} B/min, waterfall ~{waterfall_snr:.0f} dB{extra}")
+            else:
+                print(f"  {name:16s}: no throughput measured")
+
+        total_ok = sum(1 for r in results if r.get('status') == 'OK')
+        total_zero = sum(1 for r in results if r.get('status') == 'ZERO')
+        total_fail = sum(1 for r in results if r.get('status') not in ('OK', 'ZERO'))
+        print(f"\n  Totals: {total_ok} OK, {total_zero} ZERO, {total_fail} failures")
+        print(f"{'='*70}")
+
+    finally:
+        for noise in noise_injectors:
+            noise.stop()
+        # Safety cleanup
+        os.system("taskkill /F /IM mercury.exe 2>nul >nul")
 
 
 # ============================================================
@@ -1384,7 +1954,7 @@ def run_adaptive(args):
                         [r['bytes_per_min'] for r in up_rows],
                         'rs-', linewidth=2, markersize=5, label='SNR increasing')
 
-            ax.set_xlabel('SNR (dB)', fontsize=12)
+            ax.set_xlabel('SNR (dB in 4 kHz)', fontsize=12)
             ax.set_ylabel('Throughput (bytes/min)', fontsize=12)
             ax.set_title('Mercury Modem — Adaptive Throughput vs SNR', fontsize=14)
             ax.legend(fontsize=10)
@@ -1474,6 +2044,10 @@ def main():
                               '(default: 4 for ROBUST, 2 for OFDM). Use 0 to disable.')
     p_sweep.add_argument('--no-waterfall', action='store_true',
                          help='Disable waterfall detection entirely')
+    p_sweep.add_argument('--parallel', action='store_true',
+                         help='Enable multi-channel parallel mode (uses all discovered VB-Cable A/B channels)')
+    p_sweep.add_argument('--max-workers', type=int, default=None,
+                         help='Limit number of parallel workers (default: all available channels)')
 
     # stress
     p_stress = sub.add_parser('stress', help='Random noise stress test')
@@ -1521,7 +2095,10 @@ def main():
         args.auto_duration = False
 
     if args.command == 'sweep':
-        run_sweep(args)
+        if getattr(args, 'parallel', False):
+            run_parallel_sweep(args)
+        else:
+            run_sweep(args)
     elif args.command == 'stress':
         run_stress(args)
     elif args.command == 'adaptive':
