@@ -230,6 +230,7 @@ public:
   void process_messages_rx_acks_data();
   void process_control_commander();
   void process_buffer_data_commander();
+  void finalize_block_commander();
 
 
   void process_messages_responder();
@@ -359,6 +360,10 @@ public:
   int commander_configured_nb;  // commander's original NB setting (-1=unset, YES/NO)
   int nb_probe_max;             // max NB probe attempts before fallback (default 2)
   bool session_narrowband;      // negotiated NB for this session (NB always wins)
+  int bandwidth_mode;           // BW_AUTO=0, BW_NB_ONLY=1
+  uint8_t local_capability;    // CAP_WB_CAPABLE if auto mode
+  uint8_t peer_capability;     // Received from peer via TEST_CONNECTION
+  bool wb_upgrade_pending;     // True between SWITCH_BANDWIDTH send and ACK
   int gear_shift_algorithm;
   double gear_shift_up_success_rate_precentage;
   double gear_shift_down_success_rate_precentage;

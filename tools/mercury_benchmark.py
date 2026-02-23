@@ -114,9 +114,9 @@ def build_config_extra_args(is_nb, signal_dbfs):
     """Build Mercury CLI args for a specific config's NB/WB mode and cable level."""
     extra = ["-Q", "0"]  # Disable NB auto-negotiation probing (both sides same mode)
     if is_nb:
-        extra.append("-N")
+        extra += ["-M", "nb"]    # Force nb_only mode (stays NB, no WB upgrade)
     else:
-        extra.append("-W")  # Force wideband: INI may have Narrowband=true
+        extra += ["-M", "auto"]  # Auto mode: starts NB, negotiates WB upgrade
     native_dbfs = (NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if is_nb
                    else NoiseInjector.DEFAULT_SIGNAL_DBFS)
     atten_db = signal_dbfs - native_dbfs
@@ -364,7 +364,9 @@ def build_extra_args(args):
     narrowband = getattr(args, 'narrowband', False)
 
     if narrowband:
-        extra.append("-N")
+        extra += ["-M", "nb"]    # Force nb_only mode (stays NB, no WB upgrade)
+    else:
+        extra += ["-M", "auto"]  # Auto mode: starts NB, negotiates WB upgrade
 
     # Always apply TX/RX gain when cable level differs from native
     native_dbfs = (NoiseInjector.DEFAULT_SIGNAL_DBFS_NB if narrowband
@@ -2086,6 +2088,26 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Warn if mercury.ini has mismatched TX/RX gain (common misconfiguration for loopback)
+    ini_path = os.path.join(os.environ.get('APPDATA', ''), 'Mercury', 'mercury.ini')
+    if os.path.isfile(ini_path):
+        try:
+            import configparser
+            ini = configparser.ConfigParser()
+            ini.read(ini_path)
+            tx_db = float(ini.get('GUI', 'TxGainDb', fallback='0'))
+            rx_db = float(ini.get('GUI', 'RxGainDb', fallback='0'))
+            if abs(tx_db - rx_db) > 1.0:
+                print(f"WARNING: mercury.ini has TxGainDb={tx_db} RxGainDb={rx_db} "
+                      f"(difference: {abs(tx_db - rx_db):.1f} dB)")
+                print(f"  The benchmark uses -T/-G flags to set test levels, but the INI")
+                print(f"  values are still applied by the GUI. For loopback testing,")
+                print(f"  ensure TxGainDb and RxGainDb are both 0 in the INI, or use")
+                print(f"  -n (nogui) mode where INI gains are not applied.")
+                print()
+        except Exception:
+            pass  # Don't block benchmark on INI parse failure
 
     # Propagate common args
     args.output_dir = os.path.abspath(args.output_dir)

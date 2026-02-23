@@ -138,6 +138,10 @@ cl_arq_controller::cl_arq_controller()
 	commander_configured_nb=-1;
 	nb_probe_max=2;
 	session_narrowband=false;
+	bandwidth_mode=BW_AUTO;
+	local_capability=0;
+	peer_capability=0;
+	wb_upgrade_pending=false;
 	gear_shift_algorithm=SUCCESS_BASED_LADDER;
 
 	gear_shift_up_success_rate_precentage=70;
@@ -638,8 +642,8 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// cause Schmidl-Cox false triggers on MFSK remnants. However, extended buffer
 	// flushing causes gearshift timeouts (NB CONFIG_0 buffer_Nsymb=581 → 13.2s).
 	// The OFDM decoder's energy gate + mean_H threshold handle stale data adequately.
-	// WB OFDM fails on VB-Cable regardless (high-pass filter attenuates subcarriers
-	// below 600 Hz; WB lowest subcarrier is at 328 Hz). On real radio, the buffer
+	// WB OFDM fails on VB-Cable (cause under investigation — likely TX clipping
+	// or Moose freq sync issue, not VB-Cable itself). On real radio, the buffer
 	// starts zeroed (memset in set_size) and VB-Cable latency is not an issue.
 	int nBytes_header=0;
 	if (ACK_MULTI_ACK_RANGE_HEADER_LENGTH>nBytes_header) nBytes_header=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
@@ -1798,6 +1802,9 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
+		local_capability = (bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
+		peer_capability = 0;
+		wb_upgrade_pending = false;
 		original_role=COMMANDER;
 		set_role(COMMANDER);
 		link_status=CONNECTING;
@@ -1891,6 +1898,9 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
+		local_capability = (bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
+		peer_capability = 0;
+		wb_upgrade_pending = false;
 		link_status=LISTENING;
 		connection_status=RECEIVING;
 		reset_session_state();
@@ -1917,10 +1927,37 @@ void cl_arq_controller::process_user_command(std::string command)
 		tcp_socket_control.message->buffer[2]='\r';
 		tcp_socket_control.message->length=3;
 	}
-	else if(command=="BW2300")
+	else if(command=="BW500")
 	{
-		telecom_system->bandwidth=2300;
-		load_configuration(data_configuration,FULL,YES);
+		// Narrowband only mode (500 Hz, Nc=10)
+		printf("[BW] Setting NB only (500 Hz)\n");
+		fflush(stdout);
+		bandwidth_mode = BW_NB_ONLY;
+		local_capability = 0;
+#ifdef MERCURY_GUI_ENABLED
+		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
+#endif
+		if(narrowband_enabled != YES)
+			switch_narrowband_mode(YES);
+
+		tcp_socket_control.message->buffer[0]='O';
+		tcp_socket_control.message->buffer[1]='K';
+		tcp_socket_control.message->buffer[2]='\r';
+		tcp_socket_control.message->length=3;
+	}
+	else if(command=="BW2300" || command=="BW2750")
+	{
+		// Auto mode (start NB, upgrade to WB if peer supports)
+		printf("[BW] Setting auto mode (%s)\n", command.c_str());
+		fflush(stdout);
+		bandwidth_mode = BW_AUTO;
+		local_capability = CAP_WB_CAPABLE;
+#ifdef MERCURY_GUI_ENABLED
+		g_gui_state.bandwidth_mode.store(BW_AUTO);
+#endif
+		// Start in NB (auto-negotiation will upgrade if peer supports WB)
+		if(narrowband_enabled != YES)
+			switch_narrowband_mode(YES);
 
 		tcp_socket_control.message->buffer[0]='O';
 		tcp_socket_control.message->buffer[1]='K';
@@ -1929,8 +1966,16 @@ void cl_arq_controller::process_user_command(std::string command)
 	}
 	else if(command=="BW2500")
 	{
-		telecom_system->bandwidth=2500;
-		load_configuration(data_configuration,FULL,YES);
+		// Legacy command — treat same as BW2300
+		printf("[BW] Setting auto mode (BW2500, legacy)\n");
+		fflush(stdout);
+		bandwidth_mode = BW_AUTO;
+		local_capability = CAP_WB_CAPABLE;
+#ifdef MERCURY_GUI_ENABLED
+		g_gui_state.bandwidth_mode.store(BW_AUTO);
+#endif
+		if(narrowband_enabled != YES)
+			switch_narrowband_mode(YES);
 
 		tcp_socket_control.message->buffer[0]='O';
 		tcp_socket_control.message->buffer[1]='K';
@@ -2064,6 +2109,8 @@ void cl_arq_controller::reset_session_state()
 		commander_configured_nb = -1;
 	}
 	session_narrowband = false;
+	peer_capability = 0;
+	wb_upgrade_pending = false;
 
 	// Connection
 	connection_id = 0;
@@ -3323,6 +3370,7 @@ void cl_arq_controller::print_stats()
 		else if (this->last_message_sent_code==BLOCK_END) msg_sent_code_str = "BLOCK_END";
 		else if (this->last_message_sent_code==SET_CONFIG) msg_sent_code_str = "SET_CONFIG";
 		else if (this->last_message_sent_code==REPEAT_LAST_ACK) msg_sent_code_str = "REPEAT_LAST_ACK";
+		else if (this->last_message_sent_code==SWITCH_BANDWIDTH) msg_sent_code_str = "SWITCH_BANDWIDTH";
 	}
 	printf("%s%s\n", msg_sent_str, msg_sent_code_str);
 
@@ -3371,6 +3419,7 @@ void cl_arq_controller::print_stats()
 		else if (this->last_message_received_code==BLOCK_END) msg_recv_code_str = "BLOCK_END";
 		else if (this->last_message_received_code==SET_CONFIG) msg_recv_code_str = "SET_CONFIG";
 		else if (this->last_message_received_code==REPEAT_LAST_ACK) msg_recv_code_str = "REPEAT_LAST_ACK";
+		else if (this->last_message_received_code==SWITCH_BANDWIDTH) msg_recv_code_str = "SWITCH_BANDWIDTH";
 	}
 	printf("%s%s\n", msg_recv_str, msg_recv_code_str);
 

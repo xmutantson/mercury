@@ -83,6 +83,7 @@ struct MercurySettings {
     bool coarse_freq_sync_enabled;  // Enable coarse freq search (±30 Hz) for HF radio drift
     bool robust_mode_enabled;       // MFSK robust mode for weak-signal hailing
     bool narrowband_enabled;        // Narrowband mode (Nc=10, BW=469 Hz)
+    int bandwidth_mode;             // BW_AUTO=0, BW_NB_ONLY=1
 
     // GUI settings
     double tx_gain_db;

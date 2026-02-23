@@ -81,6 +81,13 @@
 #define BLOCK_END 0x3A
 #define SET_CONFIG 0x3B
 #define REPEAT_LAST_ACK 0x3C
+#define SWITCH_BANDWIDTH 0x3D
+
+// Capability flags (embedded in TEST_CONNECTION byte 5)
+#define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
+
+// Bandwidth mode (persisted in INI, controls NB/WB negotiation)
+enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 
 //Error control
 #define MESSAGE_ID_ERROR -4
