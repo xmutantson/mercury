@@ -655,14 +655,8 @@ double cl_ofdm::frequency_sync_coarse(std::complex<double>* in, double subcarrie
 	// Typical signal energy is ~10-100, noise is <1
 	const double min_energy = 1.0;
 	if (input_energy < min_energy) {
-		printf("[COARSE-FREQ] Low energy (%.3f < %.1f) - skip\n", input_energy, min_energy);
-		fflush(stdout);
 		return 0.0;  // No signal, don't apply any correction
 	}
-
-	printf("[COARSE-FREQ] Entry: Nfft=%d Ngi=%d interp=%d energy=%.3f\n",
-		   Nfft, Ngi, interpolation_rate, input_energy);
-	fflush(stdout);
 
 	for (int n = 0; n < half_symbol; n++)
 	{
@@ -682,18 +676,13 @@ double cl_ofdm::frequency_sync_coarse(std::complex<double>* in, double subcarrie
 
 	// Correlation quality check
 	double corr_mag = (R > 0.0) ? (std::abs(P) / R) : 0.0;
-	printf("[COARSE-FREQ] Fractional CFO: %.4f subcarriers (|P|=%.6f R=%.6f corr_mag=%.4f)\n",
-	       frac_cfo_subcarriers, std::abs(P), R, corr_mag);
 
 	// Gate on correlation quality - low correlation means we're not looking at a valid preamble
 	// A good preamble detection should have corr_mag > 0.5
 	const double min_corr_mag = 0.5;
 	if (corr_mag < min_corr_mag) {
-		printf("[COARSE-FREQ] Low correlation (%.3f < %.1f) - skip\n", corr_mag, min_corr_mag);
-		fflush(stdout);
 		return 0.0;
 	}
-	fflush(stdout);
 
 	// Note: We don't early exit here because the fractional CFO from noise
 	// is typically close to 0 anyway, and we'll check confidence on the
@@ -719,22 +708,6 @@ double cl_ofdm::frequency_sync_coarse(std::complex<double>* in, double subcarrie
 
 	// FFT the corrected preamble symbol
 	fft(corrected_symbol, fft_out);
-
-	// Debug: check FFT energy
-	double total_fft_energy = 0.0;
-	double max_bin_energy = 0.0;
-	int max_bin = 0;
-	for (int i = 0; i < Nfft; i++) {
-		double e = std::norm(fft_out[i]);
-		total_fft_energy += e;
-		if (e > max_bin_energy) {
-			max_bin_energy = e;
-			max_bin = i;
-		}
-	}
-	printf("[COARSE-FREQ] FFT: total_energy=%.4f max_bin=%d max_energy=%.4f Nfft=%d Nc=%d\n",
-		   total_fft_energy, max_bin, max_bin_energy, Nfft, Nc);
-	fflush(stdout);
 
 	// Note: Correlation quality check disabled - fractional estimate is used directly
 	// The filter in telecom_system.cc handles bogus values
@@ -800,8 +773,6 @@ double cl_ofdm::frequency_sync_coarse(std::complex<double>* in, double subcarrie
 				best_int_cfo = k;
 			}
 		}
-		printf("[COARSE-FREQ] Integer CFO: best k=%d metric=%.4f\n", best_int_cfo, best_metric);
-		fflush(stdout);
 	}
 
 	// Determine effective integer CFO (only use if confident)
@@ -814,10 +785,6 @@ double cl_ofdm::frequency_sync_coarse(std::complex<double>* in, double subcarrie
 	// Total CFO: fractional + integer (if confident)
 	double total_cfo_subcarriers = frac_cfo_subcarriers + (double)effective_int_cfo;
 	double total_cfo_hz = total_cfo_subcarriers * subcarrier_spacing;
-
-	printf("[COARSE-FREQ] Result: frac=%.3f int=%d total=%.1f Hz (corr=%.2f)\n",
-	       frac_cfo_subcarriers, effective_int_cfo, total_cfo_hz, corr_mag);
-	fflush(stdout);
 
 	return total_cfo_hz;
 }
@@ -1497,13 +1464,17 @@ void cl_ofdm::CPE_correction(std::complex<double>* in)
 		}
 	}
 
-	if (dH_count < 2) return;
+	if (dH_count < 2) {
+		return;
+	}
 
 	double phase_per_Dy = std::arg(dH_sum);
 	double phase_rate = phase_per_Dy / Dy;    // radians per symbol
 
 	// Skip correction if negligible (< 0.1 degree/symbol)
-	if (std::abs(phase_rate) < 0.00175) return;
+	if (std::abs(phase_rate) < 0.00175) {
+		return;
+	}
 
 	// Remove linear phase rotation from all symbols (symbol 0 = reference)
 	for (int i = 0; i < Nsymb; i++)
@@ -1953,13 +1924,32 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 		corss_corr=0;
 		norm_a=0;
 		norm_b=0;
-		// GI-only correlation (see comment in time_sync_preamble above)
+		// GI + half-symbol correlation.
+		// GI: correlate cyclic prefix with end of FFT symbol (Ngi samples/symbol).
+		// Halfsym: even-only subcarrier preamble has period Nfft/2 in time domain,
+		// so first half of FFT window correlates with second half (Nfft/2 samples).
+		// Combined: 576 samples/symbol × 4 symbols = 2304 total — robust enough
+		// to reject false peaks from data symbols (which lack half-symbol periodicity).
 		for(int l=0;l<preamble_configurator.Nsymb;l++)
 		{
 			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate;
 			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Nfft*interpolation_rate;
 
 			for(int m=0;m<this->Ngi*interpolation_rate;m++)
+			{
+				corss_corr+=a_c[m].real()*b_c[m].real();
+				norm_a+=a_c[m].real()*a_c[m].real();
+				norm_b+=b_c[m].real()*b_c[m].real();
+
+				corss_corr+=a_c[m].imag()*b_c[m].imag();
+				norm_a+=a_c[m].imag()*a_c[m].imag();
+				norm_b+=b_c[m].imag()*b_c[m].imag();
+			}
+
+			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Ngi*interpolation_rate;
+			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+(this->Ngi+this->Nfft/2)*interpolation_rate;
+
+			for(int m=0;m<(this->Nfft/2)*interpolation_rate;m++)
 			{
 				corss_corr+=a_c[m].real()*b_c[m].real();
 				norm_a+=a_c[m].real()*a_c[m].real();
@@ -2033,7 +2023,8 @@ TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int
 	result.delay = 0;
 	result.correlation = 0.0;
 
-	double best_metric = -1.0;
+	double best_weighted = -1.0;
+	double best_normalized = 0.0;
 	int best_pos = 0;
 
 	for(int d = 0; d <= size - pream_len; d += step)
@@ -2069,15 +2060,23 @@ TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int
 		if(denom > 1e-20)
 			metric = (P_real * P_real + P_imag * P_imag) / denom;
 
-		if(metric > best_metric)
+		// Energy-weighted selection: use metric * energy to pick best position.
+		// Pure normalized metric gives false peaks on silence (VB-Cable digital
+		// silence has energy ~1e-12, making denom ~1e-19 which barely exceeds
+		// 1e-20, producing unstable correlation ratios ~0.1-1.0).
+		// Weighting by (A2+R) ensures silence (energy ~0) never beats real
+		// signal, while preserving correct detection among signal positions.
+		double weighted = metric * (A2 + R);
+		if(weighted > best_weighted)
 		{
-			best_metric = metric;
+			best_weighted = weighted;
+			best_normalized = metric;
 			best_pos = d;
 		}
 	}
 
 	result.delay = best_pos;
-	result.correlation = best_metric;
+	result.correlation = best_normalized;
 	return result;
 }
 
@@ -2380,27 +2379,31 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 	int buffer_nsymb = buffer_size_interp / sym_period_interp;
 	int template_nsymb = mfsk_corr_template_nsymb;
 
-	double best_metric = -1.0;
-	int best_sym_idx = -1;
+	int p1_start_interp = (search_start_symb > 0) ? search_start_symb * sym_period_interp : 0;
+	int p1_end_interp = (buffer_nsymb - template_nsymb) * sym_period_interp;
 
-	int s_start = (search_start_symb > 0) ? search_start_symb : 0;
+	// Phase 1 oversampling: search at sub-symbol resolution to catch preambles
+	// that fall between symbol boundaries. With M=4 NB, the preamble metric at
+	// half-symbol misalignment drops to ~0.25 — comparable to data content false
+	// peaks (~0.22). At 4× oversampling, max misalignment is 12.5% of a symbol,
+	// keeping preamble metric > 0.76 — well above data content. (Bug #44)
+	static const int P1_OVERSAMPLE = 4;
+	int p1_step = sym_period_interp / P1_OVERSAMPLE;
 
-	for (int s = s_start; s <= buffer_nsymb - template_nsymb; s++)
+	// Collect top-K Phase 1 candidates for multi-candidate Phase 2 evaluation.
+	static const int P1_TOP_K = 8;
+	struct { int pos_interp; double metric; } p1_candidates[P1_TOP_K];
+	int n_candidates = 0;
+
+	double best_p1_metric = -1.0;
+	int best_p1_pos = -1;
+
+	for (int base_interp = p1_start_interp; base_interp <= p1_end_interp; base_interp += p1_step)
 	{
-		int base_interp = s * sym_period_interp;
-
 		// Check bounds: need all template symbols
 		if (base_interp + (template_nsymb * Nofdm - 1) * interpolation_rate >= buffer_size_interp)
 			break;
 
-		// Per-symbol correlation: correlate each symbol independently,
-		// sum |corr_sym|² / (E_t_sym × E_rx_sym)
-		// Per-symbol minimum check: reject positions where ANY symbol's metric
-		// falls below per_sym_floor. Non-matching MFSK tones give per-sym metric
-		// ≈ 1/Nofdm ≈ 0.004, while matching tones give ≈ 0.2+ at waterfall SNR.
-		// Without this, M=4 (NB ROBUST_1) has random correlation floor 1/M = 0.25
-		// which exceeds the overall threshold 0.15 → every buffer triggers false
-		// preamble detection. (Bug #34)
 		double total_metric = 0.0;
 		int valid_syms = 0;
 		bool rejected = false;
@@ -2447,10 +2450,30 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 
 		double metric = (valid_syms > 0) ? total_metric / valid_syms : 0.0;
 
-		if (metric > best_metric)
+		// Insert into top-K sorted array (descending by metric)
+		if (n_candidates < P1_TOP_K || metric > p1_candidates[n_candidates - 1].metric)
 		{
-			best_metric = metric;
-			best_sym_idx = s;
+			int insert_at = n_candidates < P1_TOP_K ? n_candidates : P1_TOP_K - 1;
+			for (int t = 0; t < n_candidates && t < P1_TOP_K; t++)
+			{
+				if (metric > p1_candidates[t].metric)
+				{
+					insert_at = t;
+					break;
+				}
+			}
+			// Shift down
+			int end = (n_candidates < P1_TOP_K) ? n_candidates : P1_TOP_K - 1;
+			for (int u = end; u > insert_at; u--)
+				p1_candidates[u] = p1_candidates[u - 1];
+			p1_candidates[insert_at] = {base_interp, metric};
+			if (n_candidates < P1_TOP_K) n_candidates++;
+		}
+
+		if (metric > best_p1_metric)
+		{
+			best_p1_metric = metric;
+			best_p1_pos = base_interp;
 		}
 		// Early exit on first strong preamble: prefer the earliest detection
 		// to avoid finding a commander resend whose frame overflows the buffer
@@ -2460,85 +2483,86 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 			break;
 	}
 
-	// Phase 1 found the best symbol-level candidate. Phase 2 refines it at
-	// base-rate resolution BEFORE applying the threshold. This is critical for
-	// M=4 NB (ROBUST_1/2) where carrier image phase rotation limits Phase 1
-	// metric to ~0.35 at typical timing offsets, but Phase 2 finds the exact
-	// position and restores metric to ~1.0. (Bug #40 fix)
-	//
 	// Phase 1 must have found at least one non-rejected candidate for Phase 2
 	// to have something to refine. If Phase 1 found nothing (all positions
 	// rejected by per_sym_floor or empty buffer), skip Phase 2.
-	if (best_sym_idx < 0)
+	if (best_p1_pos < 0)
 	{
-		if (out_metric) *out_metric = best_metric;
+		if (out_metric) *out_metric = best_p1_metric;
 		return -1;
 	}
 
 	// Phase 2: Fine timing refinement at base-rate resolution.
-	// Phase 1 gives symbol-level precision (±Nofdm/2 base-rate samples error).
-	// For NB with Ngi=16, this far exceeds GI tolerance → ICI → intermediate LLRs.
-	// Search ±1 full symbol period: Phase 1's early exit (metric > 0.5) can lock
-	// onto a symbol adjacent to the true preamble (partial correlation > 0.5).
-	// With only ±sym_period/2, Phase 2 can't reach the true peak → fine_off
-	// saturates at 544 (boundary) and E_sym[last]=0. Full period guarantees
-	// the true peak is reachable.
-	int coarse = best_sym_idx * sym_period_interp;
+	// Run on ALL top-K Phase 1 candidates. With 4× oversampled Phase 1, the
+	// preamble should be in top-K (metric > 0.76 vs data content ~0.22).
+	// Phase 2 refines to exact sample position within ±1 symbol of each candidate.
 	int search_half = sym_period_interp;
-	int best_fine = coarse;
+	int best_fine = best_p1_pos;
 	double best_fine_metric = -1.0;
+	int best_fine_cand = 0;
 
-	for (int d = coarse - search_half; d <= coarse + search_half; d += interpolation_rate)
+	for (int ci = 0; ci < n_candidates; ci++)
 	{
-		if (d < 0) continue;
+		int coarse = p1_candidates[ci].pos_interp;
 
-		double total_metric = 0.0;
-		int valid_syms = 0;
-		bool out_of_bounds = false;
-
-		for (int k = 0; k < template_nsymb && !out_of_bounds; k++)
+		for (int d = coarse - search_half; d <= coarse + search_half; d += interpolation_rate)
 		{
-			int tmpl_off = k * Nofdm;
-			int rx_base = d + k * sym_period_interp;
+			if (d < 0) continue;
 
-			if (rx_base + (Nofdm - 1) * interpolation_rate >= buffer_size_interp)
+			double total_metric = 0.0;
+			int valid_syms = 0;
+			bool out_of_bounds = false;
+
+			for (int k = 0; k < template_nsymb && !out_of_bounds; k++)
 			{
-				out_of_bounds = true;
-				break;
+				int tmpl_off = k * Nofdm;
+				int rx_base = d + k * sym_period_interp;
+
+				if (rx_base + (Nofdm - 1) * interpolation_rate >= buffer_size_interp)
+				{
+					out_of_bounds = true;
+					break;
+				}
+
+				double cr = 0.0, ci2 = 0.0, erx = 0.0;
+				for (int n = 0; n < Nofdm; n++)
+				{
+					std::complex<double> rx = baseband_interp[rx_base + n * interpolation_rate];
+					double t_re = mfsk_corr_template[tmpl_off + n].real();
+					double t_im = mfsk_corr_template[tmpl_off + n].imag();
+					cr += t_re * rx.real() + t_im * rx.imag();
+					ci2 += t_im * rx.real() - t_re * rx.imag();
+					erx += rx.real() * rx.real() + rx.imag() * rx.imag();
+				}
+
+				double denom = mfsk_corr_template_sym_energy[k] * erx;
+				if (denom > 1e-30)
+				{
+					total_metric += (cr * cr + ci2 * ci2) / denom;
+					valid_syms++;
+				}
 			}
 
-			double cr = 0.0, ci = 0.0, erx = 0.0;
-			for (int n = 0; n < Nofdm; n++)
+			if (out_of_bounds) continue;
+			double metric = (valid_syms > 0) ? total_metric / valid_syms : 0.0;
+			if (metric > best_fine_metric)
 			{
-				std::complex<double> rx = baseband_interp[rx_base + n * interpolation_rate];
-				double t_re = mfsk_corr_template[tmpl_off + n].real();
-				double t_im = mfsk_corr_template[tmpl_off + n].imag();
-				cr += t_re * rx.real() + t_im * rx.imag();
-				ci += t_im * rx.real() - t_re * rx.imag();
-				erx += rx.real() * rx.real() + rx.imag() * rx.imag();
-			}
-
-			double denom = mfsk_corr_template_sym_energy[k] * erx;
-			if (denom > 1e-30)
-			{
-				total_metric += (cr * cr + ci * ci) / denom;
-				valid_syms++;
+				best_fine_metric = metric;
+				best_fine = d;
+				best_fine_cand = ci;
 			}
 		}
 
-		if (out_of_bounds) continue;
-		double metric = (valid_syms > 0) ? total_metric / valid_syms : 0.0;
-		if (metric > best_fine_metric)
-		{
-			best_fine_metric = metric;
-			best_fine = d;
-		}
+		// Early exit: if this candidate already passed threshold, no need to
+		// check lower-ranked candidates
+		if (best_fine_metric > 0.5)
+			break;
 	}
 
 	// Threshold: apply to Phase 2 refined metric (not Phase 1 coarse metric).
 	// Real preamble after Phase 2 refinement: metric ≈ 1.0.
 	// Random MFSK data at Phase 2 best: up to ~0.44 for M=4 (NB ROBUST_1).
-	// Noise: ~0.004. Threshold 0.5 cleanly separates. (Bug #34, Bug #40)
+	// Noise: ~0.004. Threshold 0.5 cleanly separates. (Bug #34, Bug #40, Bug #44)
 	double threshold = 0.5;
 
 	if (best_fine_metric < threshold)

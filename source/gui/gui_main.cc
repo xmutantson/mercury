@@ -700,6 +700,44 @@ static void RenderGUI() {
                 ImGui::Text("%lld B transferred", total_bytes);
         }
         ImGui::EndGroup();
+
+        ImGui::SameLine();
+
+        // Right: Bandwidth mode display (local + remote)
+        ImGui::BeginGroup();
+        {
+            bool local_nb = g_gui_state.narrowband_enabled.load();
+            bool connected = (g_gui_state.link_status.load() == 2);
+            bool session_wb = g_gui_state.session_is_wideband.load();
+            bool peer_wb = g_gui_state.peer_wb_capable.load();
+            int bw_mode = g_gui_state.bandwidth_mode.load();
+
+            // Local bandwidth
+            const char* local_bw;
+            if (connected)
+                local_bw = session_wb ? "2300 Hz" : "500 Hz";
+            else
+                local_bw = local_nb ? "500 Hz" : "2300 Hz";
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Local");
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), " %s", local_bw);
+            if (!connected && bw_mode == 0)
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), " (auto)");
+
+            ImGui::Spacing();
+
+            // Remote bandwidth (only meaningful when connected)
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Remote");
+            if (connected)
+            {
+                const char* remote_bw = session_wb ? "2300 Hz" : "500 Hz";
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), " %s", remote_bw);
+                if (peer_wb && !session_wb)
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), " (WB ok)");
+            }
+            else
+                ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), " ---");
+        }
+        ImGui::EndGroup();
     }
     ImGui::EndChild();
 
@@ -1101,6 +1139,23 @@ static void RenderGUI() {
     ImGui::Text("%s", status_str);
     ImGui::SameLine(150);
     ImGui::Text("| %s |", config_to_short_string(g_gui_state.current_configuration.load()));
+    ImGui::SameLine();
+
+    {
+        bool session_wb = g_gui_state.session_is_wideband.load();
+        int bw = g_gui_state.bandwidth_mode.load();
+        const char* bw_str;
+        ImVec4 bw_col;
+        if (connected) {
+            bw_str = session_wb ? "WB" : "NB";
+            bw_col = session_wb ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f)   // green
+                                : ImVec4(1.0f, 1.0f, 0.3f, 1.0f);  // yellow
+        } else {
+            bw_str = (bw == 1) ? "NB" : "AUTO";
+            bw_col = ImVec4(0.5f, 0.8f, 1.0f, 1.0f);  // blue
+        }
+        ImGui::TextColored(bw_col, "| %s |", bw_str);
+    }
     ImGui::SameLine();
 
     bool is_tx = g_gui_state.is_transmitting.load();

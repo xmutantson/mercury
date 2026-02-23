@@ -37,7 +37,7 @@ SetupDialog::SetupDialog()
     , ldpc_iterations_max_(50)
     , coarse_freq_sync_enabled_(false)
     , robust_mode_enabled_(false)
-    , narrowband_enabled_(false)
+    , bandwidth_mode_(0)
     , hide_console_(false)
 {
     memset(my_callsign_, 0, sizeof(my_callsign_));
@@ -83,7 +83,7 @@ void SetupDialog::loadSettings() {
     ldpc_iterations_max_ = g_settings.ldpc_iterations_max;
     coarse_freq_sync_enabled_ = g_settings.coarse_freq_sync_enabled;
     robust_mode_enabled_ = g_settings.robust_mode_enabled;
-    narrowband_enabled_ = g_settings.narrowband_enabled;
+    bandwidth_mode_ = g_settings.bandwidth_mode;
 
     hide_console_ = g_settings.hide_console;
 }
@@ -159,8 +159,11 @@ bool SetupDialog::render() {
             g_gui_state.coarse_freq_sync_enabled.store(coarse_freq_sync_enabled_);
             g_settings.robust_mode_enabled = robust_mode_enabled_;
             g_gui_state.robust_mode_enabled.store(robust_mode_enabled_);
-            g_settings.narrowband_enabled = narrowband_enabled_;
-            g_gui_state.narrowband_enabled.store(narrowband_enabled_);
+            g_settings.bandwidth_mode = bandwidth_mode_;
+            g_gui_state.bandwidth_mode.store(bandwidth_mode_);
+            // narrowband_enabled driven by bandwidth_mode: always start NB
+            g_settings.narrowband_enabled = true;
+            g_gui_state.narrowband_enabled.store(true);
             g_settings.hide_console = hide_console_;
 
             settings_applied = true;
@@ -194,8 +197,11 @@ bool SetupDialog::render() {
             g_gui_state.coarse_freq_sync_enabled.store(coarse_freq_sync_enabled_);
             g_settings.robust_mode_enabled = robust_mode_enabled_;
             g_gui_state.robust_mode_enabled.store(robust_mode_enabled_);
-            g_settings.narrowband_enabled = narrowband_enabled_;
-            g_gui_state.narrowband_enabled.store(narrowband_enabled_);
+            g_settings.bandwidth_mode = bandwidth_mode_;
+            g_gui_state.bandwidth_mode.store(bandwidth_mode_);
+            // narrowband_enabled driven by bandwidth_mode: always start NB
+            g_settings.narrowband_enabled = true;
+            g_gui_state.narrowband_enabled.store(true);
             g_settings.hide_console = hide_console_;
 
             settings_applied = true;
@@ -367,10 +373,13 @@ void SetupDialog::renderGearShiftTab() {
 
     ImGui::Spacing();
 
-    ImGui::Checkbox("Narrowband Mode (500 Hz)", &narrowband_enabled_);
-    ImGui::TextWrapped("Restricts bandwidth to 469 Hz (10 subcarriers). Use for 500 Hz channel "
-                       "allocations. Concentrates power for +6.7 dB SNR advantage. "
-                       "Both stations must use the same mode.");
+    ImGui::Text("Bandwidth Mode:");
+    ImGui::SameLine(180);
+    ImGui::SetNextItemWidth(300);
+    const char* bw_items[] = { "Auto (NB hail, WB upgrade)", "Narrowband Only (500 Hz)" };
+    ImGui::Combo("##bw_mode", &bandwidth_mode_, bw_items, 2);
+    ImGui::TextWrapped("Auto: all connections start narrowband. If both stations support wideband, "
+                       "upgrades to 2344 Hz after connecting. NB Only: stays at 500 Hz always.");
 
     ImGui::Spacing();
 

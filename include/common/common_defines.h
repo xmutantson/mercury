@@ -67,6 +67,11 @@ extern int g_verbose;
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
+// NB mode cap — raised to CONFIG_15 for empirical testing.
+// Original cap was CONFIG_6 (BPSK rate 8/16); CONFIG_7+ use QPSK/QAM which may
+// need more pilot density than Nc=10 provides. Testing will reveal actual ceiling.
+#define NB_CONFIG_MAX CONFIG_15
+
 // Unified config ladder for gearshift (ROBUST → OFDM)
 // Used when robust_enabled + gearshift: ROBUST_0 → ROBUST_1 → ROBUST_2 → CONFIG_0 → ... → CONFIG_15
 // CONFIG_16 (32QAM rate 14/16, 1 preamble) excluded: poor channel estimation makes it
@@ -86,14 +91,18 @@ inline int config_ladder_index(int config) {
 	return -1;
 }
 
-inline int config_ladder_up(int config, bool robust_enabled) {
+inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = false) {
+	int ceiling = narrowband ? NB_CONFIG_MAX : CONFIG_15;
 	if (!robust_enabled) {
-		// OFDM only: simple increment within CONFIG_0-16
-		return (config < CONFIG_15) ? config + 1 : config;
+		return (config < ceiling) ? config + 1 : config;
 	}
 	int idx = config_ladder_index(config);
-	if (idx >= 0 && idx < FULL_CONFIG_LADDER_SIZE - 1) return FULL_CONFIG_LADDER[idx + 1];
-	return config;
+	if (idx < 0) return config;
+	int next_idx = idx + 1;
+	if (next_idx >= FULL_CONFIG_LADDER_SIZE) return config;
+	int next = FULL_CONFIG_LADDER[next_idx];
+	if (narrowband && is_ofdm_config(next) && next > NB_CONFIG_MAX) return config;
+	return next;
 }
 
 inline int config_ladder_down(int config, bool robust_enabled) {
@@ -116,7 +125,8 @@ inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
 	return FULL_CONFIG_LADDER[idx];
 }
 
-inline bool config_is_at_top(int config, bool robust_enabled) {
+inline bool config_is_at_top(int config, bool robust_enabled, bool narrowband = false) {
+	if (narrowband && is_ofdm_config(config)) return config >= NB_CONFIG_MAX;
 	if (!robust_enabled) return config == CONFIG_15;
 	return config_ladder_index(config) == FULL_CONFIG_LADDER_SIZE - 1;
 }

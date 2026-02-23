@@ -143,6 +143,9 @@ struct st_gui_state {
     std::atomic<bool> coarse_freq_sync_enabled{false}; // Coarse freq search (±30 Hz), for HF radio use
     std::atomic<bool> robust_mode_enabled{false};      // MFSK robust mode for weak-signal hailing
     std::atomic<bool> narrowband_enabled{false};       // Narrowband mode (Nc=10, BW=469 Hz)
+    std::atomic<int> bandwidth_mode{0};               // BW_AUTO=0, BW_NB_ONLY=1
+    std::atomic<bool> session_is_wideband{false};     // True when connected in WB after upgrade
+    std::atomic<bool> peer_wb_capable{false};         // Remote station supports WB (from TEST_CONNECTION)
 
     // ========== GUI Control ==========
     std::atomic<bool> gui_running{true};

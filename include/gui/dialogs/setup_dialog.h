@@ -83,7 +83,7 @@ private:
     // Modem
     bool coarse_freq_sync_enabled_;
     bool robust_mode_enabled_;
-    bool narrowband_enabled_;
+    int bandwidth_mode_;
 
     // Advanced
     bool hide_console_;

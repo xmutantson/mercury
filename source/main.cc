@@ -109,6 +109,7 @@ int main(int argc, char *argv[])
     int gear_shift_mode = NO_GEAR_SHIFT;
     int robust_mode = 0;  // 0=disabled, 1=enabled via -R flag
     int narrowband_mode = -1;  // -1=use INI, 0=force wideband (-W), 1=force narrowband (-N)
+    int bandwidth_mode_cli = -1;  // -1=use INI, 0=BW_AUTO, 1=BW_NB_ONLY
     bool explicit_config = false;  // true if user specified -s
     int base_tcp_port = 0;
 
@@ -191,7 +192,7 @@ int main(int argc, char *argv[])
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:A:")) != -1)
+    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:A:M:")) != -1)
     {
         switch (opt)
         {
@@ -371,6 +372,19 @@ int main(int argc, char *argv[])
             {
                 audio_channel_override = atoi(optarg);
                 printf("Audio channel override: %d\n", audio_channel_override);
+            }
+            break;
+        case 'M':
+            if (optarg)
+            {
+                std::string bw_arg(optarg);
+                if (bw_arg == "auto" || bw_arg == "0")
+                    bandwidth_mode_cli = BW_AUTO;
+                else if (bw_arg == "nb" || bw_arg == "1")
+                    bandwidth_mode_cli = BW_NB_ONLY;
+                else
+                    printf("Unknown bandwidth mode '%s', use 'auto' or 'nb'\n", optarg);
+                printf("Bandwidth mode: %s\n", bandwidth_mode_cli == BW_AUTO ? "auto" : "nb_only");
             }
             break;
         case 'h':
@@ -627,12 +641,14 @@ start_modem:
         if (robust_mode)
             g_settings.robust_mode_enabled = true;
         g_gui_state.robust_mode_enabled.store(g_settings.robust_mode_enabled);
-        // Narrowband mode: CLI -N/-W overrides INI setting
-        if (narrowband_mode == 1)
-            g_settings.narrowband_enabled = true;
-        else if (narrowband_mode == 0)
-            g_settings.narrowband_enabled = false;
-        g_gui_state.narrowband_enabled.store(g_settings.narrowband_enabled);
+        // All stations always start NB — bandwidth_mode controls WB upgrade.
+        // CLI -N/-W still available for BER testing but ignored for ARQ.
+        g_settings.narrowband_enabled = true;
+        g_gui_state.narrowband_enabled.store(true);
+        // Bandwidth mode: CLI -M overrides INI setting
+        if (bandwidth_mode_cli >= 0)
+            g_settings.bandwidth_mode = bandwidth_mode_cli;
+        g_gui_state.bandwidth_mode.store(g_settings.bandwidth_mode);
         // Initialize GUI gain state from INI (needed even with -n nogui,
         // since gui_apply_tx_gain/rx_gain read from g_gui_state always)
         g_gui_state.tx_gain_db.store(g_settings.tx_gain_db);
@@ -680,10 +696,14 @@ start_modem:
         // Robust mode: CLI -R or INI setting enables MFSK hailing
 #ifdef MERCURY_GUI_ENABLED
         ARQ.robust_enabled = (g_settings.robust_mode_enabled || robust_mode) ? YES : NO;
-        ARQ.narrowband_enabled = g_settings.narrowband_enabled ? YES : NO;
+        ARQ.narrowband_enabled = YES;  // Always start NB; bandwidth_mode controls WB upgrade
+        ARQ.bandwidth_mode = g_settings.bandwidth_mode;
+        ARQ.local_capability = (ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
 #else
         ARQ.robust_enabled = robust_mode ? YES : NO;
-        ARQ.narrowband_enabled = (narrowband_mode == 1) ? YES : NO;
+        ARQ.narrowband_enabled = YES;  // Always start NB; bandwidth_mode controls WB upgrade
+        ARQ.bandwidth_mode = (bandwidth_mode_cli >= 0) ? bandwidth_mode_cli : BW_AUTO;
+        ARQ.local_capability = (ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
 #endif
         telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
         ARQ.init(base_tcp_port, (gear_shift_mode == NO_GEAR_SHIFT)? NO : YES, mod_config);
@@ -760,10 +780,17 @@ start_modem:
                 // Update SNR measurements (uplink = what we receive, downlink = what remote receives from us)
                 gui_update_arq_measurements(ARQ.get_snr_uplink(), ARQ.get_snr_downlink());
 
-                // Sync robust mode and narrowband from GUI to ARQ (takes effect on next connection)
+                // Sync robust mode and bandwidth mode from GUI to ARQ
                 ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;
-                ARQ.narrowband_enabled = g_gui_state.narrowband_enabled.load() ? YES : NO;
-                telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
+                ARQ.bandwidth_mode = g_gui_state.bandwidth_mode.load();
+                ARQ.local_capability = (ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
+                // Don't overwrite narrowband_enabled while connected — WB upgrade changes it
+                if (ARQ.link_status != CONNECTED) {
+                    ARQ.narrowband_enabled = YES;  // Always start NB
+                    telecom_system.narrowband_enabled = YES;
+                }
+                g_gui_state.session_is_wideband.store(ARQ.narrowband_enabled == NO && ARQ.link_status == CONNECTED);
+                g_gui_state.peer_wb_capable.store((ARQ.peer_capability & CAP_WB_CAPABLE) != 0);
 
                 // Rolling throughput (10-second window, updated every 1s)
                 {

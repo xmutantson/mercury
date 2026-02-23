@@ -310,6 +310,15 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			switch_narrowband_mode(YES);
 		}
 
+		// BW negotiation: deferred WB switch after SWITCH_BANDWIDTH ACK
+		if(wb_upgrade_pending)
+		{
+			printf("[BW-NEG] Responder: switching to WB after SWITCH_BANDWIDTH ACK\n");
+			fflush(stdout);
+			wb_upgrade_pending = false;
+			switch_narrowband_mode(NO);
+		}
+
 		if (ack_command==SWITCH_ROLE)
 		{
 			set_role(COMMANDER);
@@ -369,9 +378,9 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				turboshift_active = true;
 				turboshift_last_good = pre_switch_config;
 
-				if(!config_is_at_top(current_configuration, robust_enabled))
+				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 				{
-					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled);
+					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
 					printf("[TURBO] Phase: REVERSE — probing responder->commander\n");
 					printf("[TURBO] UP: config %d -> %d\n",
 						current_configuration, negotiated_configuration);
@@ -504,6 +513,15 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			printf("[ACK-DATA] ftr=%d (turnaround=%d - load_shift=%d)\n",
 				ftr, turnaround_symb + nUnder_during_load, nUnder_during_load);
 			fflush(stdout);
+		}
+
+		// Implicit BLOCK_END for batch_size=1 (MFSK modes): flush data to
+		// application immediately after Data ACK, skipping the explicit
+		// BLOCK_END frame round-trip. Commander does the same locally.
+		if(data_batch_size == 1)
+		{
+			copy_data_to_buffer();
+			messages_last_ack_bu.type=NONE;
 		}
 
 		calculate_receiving_timeout();
@@ -730,12 +748,21 @@ void cl_arq_controller::process_control_responder()
 		}
 		measurements.SNR_uplink=(double)tmp_SNR.f_SNR;
 
+		// Read commander's capability from byte 5 of decoded LDPC frame.
+		// Always present (LDPC decodes full block; unused bytes are zero-padded).
+		// Backwards-compatible: old firmware doesn't fill byte 5 → decodes as 0 = no WB.
+		peer_capability = (uint8_t)messages_control.data[5];
+		printf("[BW-NEG] Commander capability: 0x%02X (WB=%s)\n",
+			peer_capability, (peer_capability & CAP_WB_CAPABLE) ? "yes" : "no");
+		fflush(stdout);
+
 		tmp_SNR.f_SNR=(float)measurements.SNR_downlink;
 		for(int i=0;i<4;i++)
 		{
 			messages_control.data[i+1]=tmp_SNR.char4_SNR[i];;
 		}
-		messages_control.length=5;
+		messages_control.data[5]=(char)local_capability;
+		messages_control.length=6;
 
 		if(this->link_status==CONNECTION_RECEIVED)
 		{
@@ -756,9 +783,36 @@ void cl_arq_controller::process_control_responder()
 
 
 	}
-	else if(link_status==CONNECTED && (code==SET_CONFIG || code==BLOCK_END || code==FILE_END_ || code==SWITCH_ROLE || code==REPEAT_LAST_ACK))
+	else if(link_status==CONNECTED && (code==SET_CONFIG || code==BLOCK_END || code==FILE_END_ || code==SWITCH_ROLE || code==REPEAT_LAST_ACK || code==SWITCH_BANDWIDTH))
 	{
-		if(code==SET_CONFIG)
+		if(code==SWITCH_BANDWIDTH)
+		{
+			printf("[BW-NEG] Received SWITCH_BANDWIDTH (target=%d) my_mode=%d\n",
+				(int)(unsigned char)messages_control.data[1], bandwidth_mode);
+			fflush(stdout);
+			if(bandwidth_mode == BW_NB_ONLY)
+			{
+				// Reject: don't ACK — commander will timeout and stay NB.
+				// MFSK ACK patterns carry no data, so we can't signal rejection
+				// through ACK content. Silence = rejection.
+				printf("[BW-NEG] Rejecting WB upgrade (nb_only mode), not ACKing\n");
+				fflush(stdout);
+				wb_upgrade_pending = false;
+				messages_control.status = FREE;  // Discard so next message can be received
+				connection_status = RECEIVING;
+				link_timer.start();
+				watchdog_timer.start();
+			}
+			else
+			{
+				// Accept: standard ACK → deferred WB switch after ACK sent
+				wb_upgrade_pending = true;
+				connection_status = ACKNOWLEDGING_CONTROL;
+				link_timer.start();
+				watchdog_timer.start();
+			}
+		}
+		else if(code==SET_CONFIG)
 		{
 			// Asymmetric gearshift: extract forward and reverse configs
 			// data[0]=SET_CONFIG, data[1]=forward, data[2]=reverse

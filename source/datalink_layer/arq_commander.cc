@@ -327,8 +327,19 @@ int cl_arq_controller::add_message_control(char code)
 			{
 				messages_control.data[i+1]=tmp_SNR.char4_SNR[i];;
 			}
-			messages_control.length=5;
+			messages_control.data[5]=(char)local_capability;
+			messages_control.length=6;
 			messages_control.id=0;
+		}
+		else if(code==SWITCH_BANDWIDTH)
+		{
+			messages_control.data[0]=code;
+			messages_control.data[1]=0;  // 0 = switch to WB
+			messages_control.length=2;
+			messages_control.id=0;
+			// Fast fail: nb_only responders silently reject (don't ACK).
+			// 2 retries keeps detection under ~10 seconds on MFSK modes.
+			messages_control.nResends=2;
 		}
 		else if(code==SET_CONFIG)
 		{
@@ -489,11 +500,11 @@ void cl_arq_controller::process_messages_tx_control()
 
 		if(ack_pattern_time_ms > 0)
 		{
-			// Expect ACK tone pattern. Wait for full pattern + margin before first poll.
-			// Buffer was zeroed (self-echo flush), so fresh audio starts immediately.
-			// WB: 16+24=40 symbols (907ms). NB M=8: 32+24=56 (1,269ms). NB M=4: 48+24=72.
-			const int tail_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb + 8 + 16;
-			telecom_system->data_container.frames_to_read = tail_nsymb;
+			// Expect ACK tone pattern. Start polling quickly (4 symbols ~90ms);
+			// receive_ack_pattern() re-polls every 2 symbols until pattern arrives.
+			// Large initial ftr delays first poll and pushes the OFDM turnaround
+			// past the responder's buffer upper_bound (CONFIG_0 entry regression).
+			telecom_system->data_container.frames_to_read = 4;
 		}
 		else
 		{
@@ -516,6 +527,16 @@ void cl_arq_controller::process_messages_tx_control()
 			ack_configuration, receiving_timeout, message_transmission_time_ms, ctrl_transmission_time_ms, ack_batch_size,
 			telecom_system->data_container.frames_to_read.load());
 		fflush(stdout);
+
+		if(messages_control.data[0]==SWITCH_BANDWIDTH)
+		{
+			// Short timeout: responder ACKs in one frame or silently rejects.
+			// One ctrl TX + ACK pattern + PTT delays + margin.
+			receiving_timeout = ctrl_transmission_time_ms + ack_pattern_time_ms
+				+ 2*ptt_on_delay_ms + 2*ptt_off_delay_ms + 3000;
+			printf("[BW-NEG] SWITCH_BANDWIDTH recv_timeout=%d\n", receiving_timeout);
+			fflush(stdout);
+		}
 
 		if(messages_control.data[0]==SET_CONFIG)
 		{
@@ -648,10 +669,8 @@ void cl_arq_controller::process_messages_tx_data()
 
 		if(ack_pattern_time_ms > 0)
 		{
-			// Expect ACK tone pattern — wait for fresh audio (same as control path).
-			// WB: 16+8=24. NB M=8: 32+8=40. NB M=4: 48+8=56.
-			const int tail_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb + 8;
-			telecom_system->data_container.frames_to_read = tail_nsymb;
+			// Expect ACK tone pattern — start polling quickly (same as control path).
+			telecom_system->data_container.frames_to_read = 4;
 		}
 		else
 		{
@@ -700,9 +719,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					stats.nAcked_control++;
 
 					// Guard delay: wait for responder to finish ACK TX + settle.
-					// ACK pattern detected early (~50% of symbols); must wait
-					// for full pattern TX + radio TX→RX + settle before next TX.
-					int guard = ack_pattern_time_ms + ptt_off_delay_ms + 200;
+					// ptt_off covers the radio TX→RX transition; +200ms margin.
+					int guard = ptt_off_delay_ms + 200;
 					receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 				}
 			}
@@ -834,6 +852,50 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					receiving_timer.start();
 					return;
 				}
+			}
+
+			// SWITCH_BANDWIDTH failure: responder is nb_only, didn't ACK.
+			// Stay NB and start turboshift normally.
+			if(wb_upgrade_pending && link_status == CONNECTED)
+			{
+				printf("[BW-NEG] SWITCH_BANDWIDTH not ACKed (peer is nb_only), staying NB\n");
+				fflush(stdout);
+				wb_upgrade_pending = false;
+
+				// Force-clear control message
+				messages_control.ack_timeout = 0;
+				messages_control.id = 0;
+				messages_control.length = 0;
+				messages_control.nResends = 0;
+				messages_control.status = FREE;
+				messages_control.type = NONE;
+
+				receiving_timer.stop();
+				receiving_timer.reset();
+
+				// Start turboshift in NB
+				if(turboshift_active && gear_shift_on == YES &&
+					!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+				{
+					turboshift_initiator = true;
+					turboshift_phase = TURBO_FORWARD;
+					turboshift_last_good = current_configuration;
+					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
+					printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
+					printf("[TURBO] UP: config %d -> %d\n",
+						current_configuration, negotiated_configuration);
+					fflush(stdout);
+					cleanup();
+					add_message_control(SET_CONFIG);
+					connection_status = TRANSMITTING_CONTROL;
+				}
+				else
+				{
+					turboshift_active = false;
+					turboshift_phase = TURBO_DONE;
+					connection_status = TRANSMITTING_DATA;
+				}
+				return;
 			}
 
 			// Turboshift probe failure: handle directly (1 retry, then ceiling+BREAK).
@@ -1038,9 +1100,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				}
 
 				// Guard delay: wait for responder to finish full ACK TX + settle.
-				// Detection fires early (~8/16 symbols); wait for remaining
-				// ACK pattern + radio TX→RX transition + settling margin.
-				int guard = ack_pattern_time_ms + ptt_off_delay_ms + 200;
+				// ptt_off covers the radio TX→RX transition; +200ms margin.
+				int guard = ptt_off_delay_ms + 200;
 				receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 			}
 		}
@@ -1242,12 +1303,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 		// Frame-level gearshift: after N consecutive successful data ACKs, shift up immediately
 		{
-			int proposed_frame = config_ladder_up(current_configuration, robust_enabled);
+			int proposed_frame = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
 			bool frame_at_ceiling = (turboshift_phase == TURBO_DONE && turboshift_last_good >= 0
 				&& config_ladder_index(proposed_frame) > config_ladder_index(turboshift_last_good));
 		if(data_ack_received==YES && gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
 			messages_control.status==FREE &&
-			!config_is_at_top(current_configuration, robust_enabled) && !frame_at_ceiling)
+			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !frame_at_ceiling)
 		{
 			consecutive_data_acks++;
 			if(consecutive_data_acks >= frame_shift_threshold)
@@ -1359,6 +1420,16 @@ void cl_arq_controller::process_control_commander()
 			}
 			measurements.SNR_downlink=tmp_SNR.f_SNR;
 
+			// Read responder's capability from byte 5.
+			// With LDPC ACK: this is the responder's reply (correct).
+			// With ACK pattern: no data payload, so this is our own TX data (assumes
+			// symmetric capability — works when both sides use same bandwidth_mode).
+			// Responder's SWITCH_BANDWIDTH handler rejects if nb_only as a safety net.
+			peer_capability = (uint8_t)messages_control.data[5];
+			printf("[BW-NEG] Responder capability: 0x%02X (WB=%s)\n",
+				peer_capability, (peer_capability & CAP_WB_CAPABLE) ? "yes" : "no");
+			fflush(stdout);
+
 			switch_role_test_timer.stop();
 			switch_role_test_timer.reset();
 
@@ -1391,13 +1462,29 @@ void cl_arq_controller::process_control_commander()
 				connection_attempt_timer.stop();
 				connection_attempt_timer.reset();
 
+				// BW negotiation: if we support WB and currently NB, propose WB upgrade.
+				// Don't check peer_capability here — MFSK ACK patterns don't carry data,
+				// so peer_capability is unreliable. The responder's accept/reject comes
+				// back in the SWITCH_BANDWIDTH LDPC ACK (data[1]).
+				bool we_want_wb = (local_capability & CAP_WB_CAPABLE);
+				bool currently_nb = (narrowband_enabled == YES);
+
+				if(we_want_wb && currently_nb)
+				{
+					printf("[BW-NEG] Both WB-capable, initiating WB upgrade\n");
+					fflush(stdout);
+					wb_upgrade_pending = true;
+					cleanup();
+					add_message_control(SWITCH_BANDWIDTH);
+					this->connection_status=TRANSMITTING_CONTROL;
+				}
 				// Turboshift: start probing instead of jumping to data
-				if(turboshift_active && gear_shift_on==YES && !config_is_at_top(current_configuration, robust_enabled))
+				else if(turboshift_active && gear_shift_on==YES && !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 				{
 					turboshift_initiator = true;
 					turboshift_phase = TURBO_FORWARD;
 					turboshift_last_good = current_configuration;
-					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled);
+					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
 					printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
 					printf("[TURBO] UP: config %d -> %d\n", current_configuration, negotiated_configuration);
 					fflush(stdout);
@@ -1434,6 +1521,35 @@ void cl_arq_controller::process_control_commander()
 			}
 			tcp_socket_control.transmit();
 		}
+		else if(this->link_status==CONNECTED && messages_control.data[0]==SWITCH_BANDWIDTH)
+		{
+			// ACK received = responder accepted (nb_only responders don't ACK at all)
+			printf("[BW-NEG] SWITCH_BANDWIDTH accepted, switching to WB\n");
+			fflush(stdout);
+			wb_upgrade_pending = false;
+			switch_narrowband_mode(NO);
+
+			// Start turboshift in WB
+			if(turboshift_active && gear_shift_on==YES && !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+			{
+				turboshift_initiator = true;
+				turboshift_phase = TURBO_FORWARD;
+				turboshift_last_good = current_configuration;
+				negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
+				printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
+				printf("[TURBO] UP: config %d -> %d\n", current_configuration, negotiated_configuration);
+				fflush(stdout);
+				cleanup();
+				add_message_control(SET_CONFIG);
+				this->connection_status=TRANSMITTING_CONTROL;
+			}
+			else
+			{
+				turboshift_active = false;
+				turboshift_phase = TURBO_DONE;
+				this->connection_status=TRANSMITTING_DATA;
+			}
+		}
 		else if(this->link_status==CONNECTED)
 		{
 			if (messages_control.data[0]==FILE_END_)
@@ -1443,104 +1559,7 @@ void cl_arq_controller::process_control_commander()
 			}
 			else if (messages_control.data[0]==BLOCK_END)
 			{
-				for(int i=0;i<this->nMessages;i++)
-				{
-					this->messages_tx[i].ack_timeout=0;
-					this->messages_tx[i].id=0;
-					this->messages_tx[i].length=0;
-					this->messages_tx[i].nResends=0;
-					this->messages_tx[i].status=FREE;
-					this->messages_tx[i].type=NONE;
-				}
-				block_under_tx=NO;
-				fifo_buffer_backup.flush();
-
-				last_transmission_block_stats.success_rate_data=100*(1-((float)last_transmission_block_stats.nReSent_data/(float)last_transmission_block_stats.nSent_data));
-				last_transmission_block_stats.nReSent_data=0;
-				last_transmission_block_stats.nSent_data=0;
-				std::string str="BUFFER ";
-				str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
-				str+='\r';
-				for(long unsigned int i=0;i<str.length();i++)
-				{
-					tcp_socket_control.message->buffer[i]=str[i];
-				}
-				tcp_socket_control.message->length=str.length();
-				tcp_socket_control.transmit();
-
-				if(gear_shift_on==YES)
-				{
-					if(gear_shift_algorithm==SNR_BASED)
-					{
-						cleanup();
-						add_message_control(TEST_CONNECTION);
-					}
-					else if(gear_shift_algorithm==SUCCESS_BASED_LADDER)
-					{
-						gear_shift_blocked_for_nBlocks++;
-						if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage && gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total)
-						{
-							{
-								int proposed = config_ladder_up(current_configuration, robust_enabled);
-								bool at_ceiling = (turboshift_phase == TURBO_DONE && turboshift_last_good >= 0
-									&& config_ladder_index(proposed) > config_ladder_index(turboshift_last_good));
-							if(!config_is_at_top(current_configuration, robust_enabled) && !at_ceiling)
-							{
-								negotiated_configuration=proposed;
-								printf("[GEARSHIFT] LADDER UP: success=%.0f%% > %.0f%%, config %d -> %d\n",
-									last_transmission_block_stats.success_rate_data, gear_shift_up_success_rate_precentage,
-									current_configuration, negotiated_configuration);
-								fflush(stdout);
-								cleanup();
-								add_message_control(SET_CONFIG);
-							}
-							else
-							{
-								if(at_ceiling)
-									printf("[GEARSHIFT] LADDER: at turboshift ceiling %d (config %d), success=%.0f%%\n",
-										turboshift_last_good, current_configuration, last_transmission_block_stats.success_rate_data);
-								else
-									printf("[GEARSHIFT] LADDER: at top (config %d), success=%.0f%%\n",
-										current_configuration, last_transmission_block_stats.success_rate_data);
-								fflush(stdout);
-								this->connection_status=TRANSMITTING_DATA;
-							}
-						}
-						}
-						else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage)
-						{
-							if(!config_is_at_bottom(current_configuration, robust_enabled))
-							{
-								negotiated_configuration=config_ladder_down(current_configuration, robust_enabled);
-								printf("[GEARSHIFT] LADDER DOWN: success=%.0f%% < %.0f%%, config %d -> %d\n",
-									last_transmission_block_stats.success_rate_data, gear_shift_down_success_rate_precentage,
-									current_configuration, negotiated_configuration);
-								fflush(stdout);
-								cleanup();
-								add_message_control(SET_CONFIG);
-							}
-							else
-							{
-								printf("[GEARSHIFT] LADDER: at bottom (config %d), success=%.0f%%\n",
-									current_configuration, last_transmission_block_stats.success_rate_data);
-								fflush(stdout);
-								this->connection_status=TRANSMITTING_DATA;
-							}
-							gear_shift_blocked_for_nBlocks=0;
-						}
-						else
-						{
-							printf("[GEARSHIFT] LADDER: hold config %d, success=%.0f%%\n",
-								current_configuration, last_transmission_block_stats.success_rate_data);
-							fflush(stdout);
-							this->connection_status=TRANSMITTING_DATA;
-						}
-					}
-				}
-				else
-				{
-					this->connection_status=TRANSMITTING_DATA;
-				}
+				finalize_block_commander();
 
 			}
 			else if (messages_control.data[0]==SWITCH_ROLE)
@@ -1669,9 +1688,9 @@ void cl_arq_controller::process_control_commander()
 				{
 					turboshift_last_good = prev_configuration;
 					turboshift_retries = 1;  // reset retry for next config
-					if(!config_is_at_top(current_configuration, robust_enabled))
+					if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 					{
-						negotiated_configuration = config_ladder_up(current_configuration, robust_enabled);
+						negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
 						printf("[TURBO] UP: config %d -> %d\n",
 							current_configuration, negotiated_configuration);
 						fflush(stdout);
@@ -1727,6 +1746,121 @@ void cl_arq_controller::process_control_commander()
 			}
 			tcp_socket_control.transmit();
 		}
+
+		// Bug #41: After processing any ACKed control message, free the slot so
+		// the next handshake message can be queued. Without this, messages_control
+		// stays ACKED after START_CONNECTION ACK, and add_message_control(TEST_CONNECTION)
+		// in process_messages_commander returns ERROR_ (status != FREE).
+		// cleanup() is idempotent: branches that already call it (SET_CONFIG, etc.)
+		// will find status=FREE on the second call, which is a no-op.
+		cleanup();
+	}
+}
+
+// Shared BLOCK_END state transitions: reset block, flush backup, stats, gearshift.
+// Called from both explicit BLOCK_END ACK handler and implicit path (batch_size==1).
+void cl_arq_controller::finalize_block_commander()
+{
+	for(int i=0;i<this->nMessages;i++)
+	{
+		this->messages_tx[i].ack_timeout=0;
+		this->messages_tx[i].id=0;
+		this->messages_tx[i].length=0;
+		this->messages_tx[i].nResends=0;
+		this->messages_tx[i].status=FREE;
+		this->messages_tx[i].type=NONE;
+	}
+	block_under_tx=NO;
+	fifo_buffer_backup.flush();
+
+	if(last_transmission_block_stats.nSent_data > 0)
+		last_transmission_block_stats.success_rate_data=100*(1-((float)last_transmission_block_stats.nReSent_data/(float)last_transmission_block_stats.nSent_data));
+	else
+		last_transmission_block_stats.success_rate_data=100;
+	last_transmission_block_stats.nReSent_data=0;
+	last_transmission_block_stats.nSent_data=0;
+	std::string str="BUFFER ";
+	str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
+	str+='\r';
+	for(long unsigned int i=0;i<str.length();i++)
+	{
+		tcp_socket_control.message->buffer[i]=str[i];
+	}
+	tcp_socket_control.message->length=str.length();
+	tcp_socket_control.transmit();
+
+	if(gear_shift_on==YES)
+	{
+		if(gear_shift_algorithm==SNR_BASED)
+		{
+			cleanup();
+			add_message_control(TEST_CONNECTION);
+		}
+		else if(gear_shift_algorithm==SUCCESS_BASED_LADDER)
+		{
+			gear_shift_blocked_for_nBlocks++;
+			if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage && gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total)
+			{
+				{
+					int proposed = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
+					bool at_ceiling = (turboshift_phase == TURBO_DONE && turboshift_last_good >= 0
+						&& config_ladder_index(proposed) > config_ladder_index(turboshift_last_good));
+				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !at_ceiling)
+				{
+					negotiated_configuration=proposed;
+					printf("[GEARSHIFT] LADDER UP: success=%.0f%% > %.0f%%, config %d -> %d\n",
+						last_transmission_block_stats.success_rate_data, gear_shift_up_success_rate_precentage,
+						current_configuration, negotiated_configuration);
+					fflush(stdout);
+					cleanup();
+					add_message_control(SET_CONFIG);
+				}
+				else
+				{
+					if(at_ceiling)
+						printf("[GEARSHIFT] LADDER: at turboshift ceiling %d (config %d), success=%.0f%%\n",
+							turboshift_last_good, current_configuration, last_transmission_block_stats.success_rate_data);
+					else
+						printf("[GEARSHIFT] LADDER: at top (config %d), success=%.0f%%\n",
+							current_configuration, last_transmission_block_stats.success_rate_data);
+					fflush(stdout);
+					this->connection_status=TRANSMITTING_DATA;
+				}
+			}
+			}
+			else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage)
+			{
+				if(!config_is_at_bottom(current_configuration, robust_enabled))
+				{
+					negotiated_configuration=config_ladder_down(current_configuration, robust_enabled);
+					printf("[GEARSHIFT] LADDER DOWN: success=%.0f%% < %.0f%%, config %d -> %d\n",
+						last_transmission_block_stats.success_rate_data, gear_shift_down_success_rate_precentage,
+						current_configuration, negotiated_configuration);
+					fflush(stdout);
+					cleanup();
+					add_message_control(SET_CONFIG);
+				}
+				else
+				{
+					printf("[GEARSHIFT] LADDER: at bottom (config %d), success=%.0f%%\n",
+						current_configuration, last_transmission_block_stats.success_rate_data);
+					fflush(stdout);
+					this->connection_status=TRANSMITTING_DATA;
+				}
+				gear_shift_blocked_for_nBlocks=0;
+			}
+			else
+			{
+				printf("[GEARSHIFT] LADDER: hold config %d, success=%.0f%%\n",
+					current_configuration, last_transmission_block_stats.success_rate_data);
+				fflush(stdout);
+				this->connection_status=TRANSMITTING_DATA;
+			}
+		}
+	}
+	else
+	{
+		this->connection_status=TRANSMITTING_DATA;
 	}
 }
 
@@ -1766,7 +1900,18 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==YES && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
-			add_message_control(BLOCK_END);
+			if(data_batch_size == 1)
+			{
+				// Implicit BLOCK_END for batch_size=1 (MFSK modes): skip the
+				// explicit BLOCK_END frame + ACK round-trip (~10s for MFSK).
+				// Both sides know the block ends after 1 data frame.
+				// Responder auto-flushes data after its Data ACK.
+				finalize_block_commander();
+			}
+			else
+			{
+				add_message_control(BLOCK_END);
+			}
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
