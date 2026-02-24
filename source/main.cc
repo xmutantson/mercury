@@ -84,6 +84,8 @@ extern "C" {
     // Audio channel configuration (0=LEFT, 1=RIGHT, 2=STEREO)
     extern int configured_input_channel;
     extern int configured_output_channel;
+    extern int multichannel_mode;
+    extern double noise_snr_db;
 }
 
 int g_verbose = 0;
@@ -192,7 +194,7 @@ int main(int argc, char *argv[])
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:A:M:")) != -1)
+    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:A:M:Z:")) != -1)
     {
         switch (opt)
         {
@@ -371,7 +373,8 @@ int main(int argc, char *argv[])
             if (optarg)
             {
                 audio_channel_override = atoi(optarg);
-                printf("Audio channel override: %d\n", audio_channel_override);
+                multichannel_mode = 1;
+                printf("Audio channel override: %d (multichannel mode)\n", audio_channel_override);
             }
             break;
         case 'M':
@@ -385,6 +388,13 @@ int main(int argc, char *argv[])
                 else
                     printf("Unknown bandwidth mode '%s', use 'auto' or 'nb'\n", optarg);
                 printf("Bandwidth mode: %s\n", bandwidth_mode_cli == BW_AUTO ? "auto" : "nb_only");
+            }
+            break;
+        case 'Z':
+            if (optarg)
+            {
+                noise_snr_db = atof(optarg);
+                printf("AWGN noise injection: SNR=%.1f dB (ref 4kHz BW, cable=-30 dBFS)\n", noise_snr_db);
             }
             break;
         case 'h':

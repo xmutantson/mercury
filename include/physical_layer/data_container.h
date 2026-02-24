@@ -68,6 +68,7 @@ class cl_data_container
 	_Atomic(int) data_ready;
 	_Atomic(int) nUnder_processing_events;
 	_Atomic(int) buffer_Nsymb;
+	_Atomic(int) rx_mute;
 
 	int total_frame_size;
 

@@ -69,6 +69,7 @@ cl_data_container::cl_data_container()
 	this->frames_to_read=0;
 	this->data_ready=0;
 	this->nUnder_processing_events=0;
+	this->rx_mute=0;
 	this->interpolation_rate=0;
 
 	this->total_frame_size=0;
@@ -127,10 +128,9 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	this->bit_energy_dispersal_sequence=CNEW(int, N_MAX, "dc.bit_energy_dispersal_seq");
 
 	// Buffer must accommodate: previous frame data still in buffer + turnaround
-	// gap + a full new frame. Turnaround is CMD processing overhead only (ACK
-	// detect ~100ms + guard 563ms + encode ~50ms + PTT ~300ms + margin ~1000ms
-	// ≈ 2000ms). CMD frame TX runs concurrently with ftr countdown, so frame_symb
-	// is NOT added to turnaround. (Revised from Bug #44 frame_symb + 4000ms.)
+	// gap + a full new frame. Buffer zeroing removed (rx_mute handles echo),
+	// so signal persists across anti-spin polls. 2000ms is sufficient; the
+	// anti-spin mechanism (ftr=8) polls every ~260ms to catch late arrivals.
 	double sym_time_ms = 1000.0 * Nofdm * frequency_interpolation_rate / 48000.0;
 	int frame_symb = preamble_nSymb + Nsymb;
 	int turnaround_symb = (int)ceil(2000.0 / sym_time_ms) + 4;
