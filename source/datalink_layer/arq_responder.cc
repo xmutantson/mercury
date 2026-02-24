@@ -215,9 +215,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 void cl_arq_controller::process_messages_acknowledging_control()
 {
 	message_batch_counter_tx=0;
-	printf("[ACK-CTRL] status=%d (need %d=RECEIVED), ack_cfg=%d\n",
-		messages_control.status, RECEIVED, ack_configuration);
-	fflush(stdout);
+	if(g_verbose) { printf("[ACK-CTRL] status=%d (need %d=RECEIVED), ack_cfg=%d\n", messages_control.status, RECEIVED, ack_configuration); fflush(stdout); }
 	if(messages_control.status==RECEIVED)
 	{
 		messages_control.type=ACK_CONTROL;
@@ -231,25 +229,21 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		if(ack_pattern_time_ms > 0)
 		{
 			// ACK pattern uses dedicated ack_mfsk — no config switch needed
-			printf("[ACK-CTRL] Sending ACK pattern (no config switch)\n");
-			fflush(stdout);
+			if(g_verbose) { printf("[ACK-CTRL] Sending ACK pattern (no config switch)\n"); fflush(stdout); }
 			send_ack_pattern();
 			// If config changed (e.g., SET_CONFIG), load the new data config now.
 			// ACK was sent on old config (correct — commander is still on old config),
 			// but we need to switch to new config before receiving data.
 			if(data_configuration != current_configuration)
 			{
-				printf("[ACK-CTRL] Loading new data config %d (was %d)\n",
-					data_configuration, current_configuration);
-				fflush(stdout);
+				if(g_verbose) { printf("[ACK-CTRL] Loading new data config %d (was %d)\n", data_configuration, current_configuration); fflush(stdout); }
 				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
 			}
 		}
 		else
 		{
 			// Fallback: LDPC ACK needs ack_configuration for correct modulation
-			printf("[ACK-CTRL] Sending LDPC ACK, loading config %d...\n", ack_configuration);
-			fflush(stdout);
+			if(g_verbose) { printf("[ACK-CTRL] Sending LDPC ACK, loading config %d...\n", ack_configuration); fflush(stdout); }
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
 			messages_batch_tx[message_batch_counter_tx]=messages_control;
 			message_batch_counter_tx++;
@@ -273,25 +267,15 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			int nUnder_during_load = telecom_system->data_container.nUnder_processing_events.load();
 			telecom_system->data_container.nUnder_processing_events = 0;
 
-			double sym_time_ms = telecom_system->data_container.Nofdm
-				* telecom_system->data_container.interpolation_rate / 48.0;
 			int frame_symb = telecom_system->data_container.preamble_nSymb
 				+ telecom_system->data_container.Nsymb;
-			// Turnaround = CMD processing overhead only (ACK detect ~100ms +
-			// guard 563ms + encode ~50ms + PTT ~300ms + margin ~1000ms ≈ 2000ms).
-			// CMD frame TX runs concurrently with our ftr countdown, so frame_symb
-			// is NOT added to turnaround. (Revised from Bug #44 frame_symb + 4000ms.)
-			int turnaround_symb = (int)ceil(2000.0 / sym_time_ms) + 4;
-			turnaround_symb -= nUnder_during_load;
-			if(turnaround_symb < 0) turnaround_symb = 0;
-			int ftr = frame_symb + turnaround_symb;
-			int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
-			if(ftr > buf_nsymb) ftr = buf_nsymb;
-			telecom_system->data_container.frames_to_read = ftr;
+			// After ACK+flush, set ftr = frame_symb so we wait just long
+			// enough for one frame to accumulate. Quick anti-spin FAILs
+			// bridge any turnaround gap (~5ms each, empty buffer).
+			telecom_system->data_container.frames_to_read = frame_symb;
+			telecom_system->data_container.nUnder_processing_events = 0;
 
-			printf("[ACK-CTRL] ftr=%d (turnaround=%d - load_shift=%d)\n",
-				ftr, turnaround_symb + nUnder_during_load, nUnder_during_load);
-			fflush(stdout);
+			if(g_verbose) { printf("[ACK-CTRL] ftr=%d (frame_symb=%d)\n", frame_symb, frame_symb); fflush(stdout); }
 		}
 
 		char ack_command = messages_control.data[0];  // Save before potential NB switch
@@ -493,26 +477,15 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		// Must match buffer allocation (data_container.cc).
 		telecom_system->set_mfsk_ctrl_mode(false);
 		{
-			int nUnder_during_load = telecom_system->data_container.nUnder_processing_events.load();
+			// After ACK+flush, set ftr = rx_frame so we wait just long
+			// enough for one frame to accumulate. Quick anti-spin FAILs
+			// bridge any turnaround gap (~5ms each, empty buffer).
 			telecom_system->data_container.nUnder_processing_events = 0;
+			int rx_frame = telecom_system->data_container.preamble_nSymb
+				+ telecom_system->get_active_nsymb();
+			telecom_system->data_container.frames_to_read = rx_frame;
 
-			double sym_time_ms = telecom_system->data_container.Nofdm
-				* telecom_system->data_container.interpolation_rate / 48.0;
-			int frame_symb = telecom_system->data_container.preamble_nSymb
-				+ telecom_system->data_container.Nsymb;
-			// Turnaround = CMD processing overhead only. CMD frame TX runs
-			// concurrently with ftr countdown. (Revised from Bug #44.)
-			int turnaround_symb = (int)ceil(2000.0 / sym_time_ms) + 4;
-			turnaround_symb -= nUnder_during_load;
-			if(turnaround_symb < 0) turnaround_symb = 0;
-			int ftr = frame_symb + turnaround_symb;
-			int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
-			if(ftr > buf_nsymb) ftr = buf_nsymb;
-			telecom_system->data_container.frames_to_read = ftr;
-
-			printf("[ACK-DATA] ftr=%d (turnaround=%d - load_shift=%d)\n",
-				ftr, turnaround_symb + nUnder_during_load, nUnder_during_load);
-			fflush(stdout);
+			if(g_verbose) { printf("[ACK-DATA] ftr=%d (rx_frame=%d)\n", rx_frame, rx_frame); fflush(stdout); }
 		}
 
 		// Implicit BLOCK_END for batch_size=1 (MFSK modes): flush data to

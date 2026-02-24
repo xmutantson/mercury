@@ -27,12 +27,18 @@
 #include <cstring>
 #include <chrono>
 
+extern "C" {
+    extern double noise_snr_db;
+}
+
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
 
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
+
+static const int RX_MUTE_GUARD_MS = 50;
 
 cl_arq_controller::cl_arq_controller()
 {
@@ -1993,6 +1999,22 @@ void cl_arq_controller::process_user_command(std::string command)
 		}
 		tcp_socket_control.message->length=reply.length();
 	}
+	else if(command.substr(0,9)=="NOISESNR ")
+	{
+		// Dynamic noise injection control: "NOISESNR <db>" or "NOISESNR OFF"
+		std::string arg=command.substr(9);
+		if(arg=="OFF" || arg=="off") {
+			noise_snr_db = 999.0;
+			printf("[NOISE-Z] Noise OFF\n");
+		} else {
+			noise_snr_db = std::stod(arg);
+			printf("[NOISE-Z] SNR set to %.1f dB\n", noise_snr_db);
+		}
+		tcp_socket_control.message->buffer[0]='O';
+		tcp_socket_control.message->buffer[1]='K';
+		tcp_socket_control.message->buffer[2]='\r';
+		tcp_socket_control.message->length=3;
+	}
 	else
 	{
 		tcp_socket_control.message->buffer[0]='O';
@@ -2224,10 +2246,12 @@ void cl_arq_controller::send(st_message* message, int message_location)
 
 void cl_arq_controller::send_batch()
 {
-	printf("[TX] send_batch() on CONFIG_%d, %d messages, first type=%d\n",
-		current_configuration, message_batch_counter_tx,
-		message_batch_counter_tx > 0 ? messages_batch_tx[0].type : -1);
-	fflush(stdout);
+	if(g_verbose) {
+		printf("[TX] send_batch() on CONFIG_%d, %d messages, first type=%d\n",
+			current_configuration, message_batch_counter_tx,
+			message_batch_counter_tx > 0 ? messages_batch_tx[0].type : -1);
+		fflush(stdout);
+	}
 
 	// Flush capture buffer at the START of send_batch(), before TX begins.
 	// On VB-Cable (and real radios), the responder decodes the frame and sends
@@ -2331,8 +2355,7 @@ void cl_arq_controller::send_batch()
 			telecom_system->data_container.data_byte[j]=(int)(unsigned char)message_TxRx_byte_buffer[j];
 		}
 
-		// Debug: show serialized bytes before transmit
-		{
+		if(g_verbose) {
 			int total = header_length + messages_batch_tx[i].length;
 			printf("[TX-BYTES] frame=%d type=%d connid=%d hdr=%d len=%d bytes:",
 				i, messages_batch_tx[i].type, (int)(unsigned char)connection_id,
@@ -2401,13 +2424,11 @@ void cl_arq_controller::send_batch()
 
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
-		printf("[TX] tx_transfer frame %d/%d, size=%d\n", i, message_batch_counter_tx, frame_output_size);
-		fflush(stdout);
+		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, size=%d\n", i, message_batch_counter_tx, frame_output_size); fflush(stdout); }
 		tx_transfer(&batch_frames_output_data_filtered2[(i+1)*frame_output_size], frame_output_size);
 	}
 
-	printf("[TX] Waiting for playback buffer to drain...\n");
-	fflush(stdout);
+	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
 	// wait buffer to be played
 	while (size_buffer(playback_buffer) > 0)
 		msleep(1);
@@ -2463,21 +2484,17 @@ void cl_arq_controller::send_batch()
 
 
 
-	// Buffer was flushed at start of send_batch(). Self-echo + ACK are in
-	// the sliding buffer. Set frames_to_read for default data frame reception
-	// — callers may override for ACK pattern capture after send_batch() returns.
+	// After TX, set ftr to preamble length. The commander overrides this
+	// to ftr=4 when entering receive mode, so this is just a default.
 	telecom_system->data_container.frames_to_read =
-		telecom_system->data_container.preamble_nSymb + telecom_system->get_active_nsymb();
-	printf("[TX-END] frames_to_read=%d (ctrl=%d)\n",
-		telecom_system->data_container.frames_to_read.load(),
-		telecom_system->mfsk_ctrl_mode ? 1 : 0);
+		telecom_system->data_container.preamble_nSymb;
+	if(g_verbose) { printf("[TX-END] frames_to_read=%d (ctrl=%d)\n", telecom_system->data_container.frames_to_read.load(), telecom_system->mfsk_ctrl_mode ? 1 : 0); }
 }
 
 // Transmit short ACK tone pattern instead of LDPC-encoded ACK frame
 void cl_arq_controller::send_ack_pattern()
 {
-	printf("[TX-ACK-PAT] Sending ACK pattern on CONFIG_%d\n", current_configuration);
-	fflush(stdout);
+	if(g_verbose) { printf("[TX-ACK-PAT] Sending ACK pattern on CONFIG_%d\n", current_configuration); fflush(stdout); }
 
 	ptt_on();
 
@@ -2557,7 +2574,11 @@ void cl_arq_controller::send_ack_pattern()
 	delete[] filtered1;
 	delete[] filtered2;
 
-	// Flush capture buffer and passband_delayed_data (discard self-echo + stale patterns)
+	// Mute briefly after TX to catch echo tail in audio pipeline,
+	// then flush buffer to remove self-echo. Unmute after flush so
+	// the other station's signal can enter the clean buffer.
+	telecom_system->data_container.rx_mute = 1;
+	msleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -2565,14 +2586,27 @@ void cl_arq_controller::send_ack_pattern()
 		memset(telecom_system->data_container.passband_delayed_data, 0, buf_samples * sizeof(double));
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
-	// nUnder is NOT reset here — let it accumulate during ACK TX so the
-	// responder's ftr calculation can subtract elapsed time. The initial
-	// reset happens before ACK TX (arq_responder.cc, Bug #36).
+	telecom_system->data_container.rx_mute = 0;
+	// Bug #41: Reset nUnder after flush. The flush destroyed all pre-flush
+	// audio, so nUnder accumulated during ACK TX is stale — those captured
+	// symbols no longer exist in the buffer. Without this reset, same-modulation
+	// transitions (e.g. CONFIG_0→CONFIG_1) keep stale nUnder (~28 symbols),
+	// the ftr calculation subtracts it, shrinking the capture window so the
+	// commander's next frame arrives past upper_bound.
+	telecom_system->data_container.nUnder_processing_events = 0;
 	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
 	telecom_system->receive_stats.mfsk_search_raw = 0;
+	// After flush, set ftr = rx_frame so we wait just long enough for one
+	// frame worth of audio to accumulate. If the other side hasn't started TX
+	// yet (turnaround delay), a quick anti-spin FAIL (~5ms, empty buffer) and
+	// retry bridges the gap. This avoids the ~2s turnaround_symb padding that
+	// upper_bound adds, which was a major bottleneck in WB turboshift.
+	{
+		int rx_frame = telecom_system->data_container.preamble_nSymb + telecom_system->get_active_nsymb();
+		telecom_system->data_container.frames_to_read = rx_frame;
+	}
 
-	printf("[TX-ACK-PAT] Done, flushed capture buffer\n");
-	fflush(stdout);
+	if(g_verbose) { printf("[TX-ACK-PAT] Done, flushed capture buffer, nUnder reset, ftr=%d\n", telecom_system->data_container.frames_to_read.load()); fflush(stdout); }
 }
 
 // Transmit BREAK tone pattern — emergency "drop to ROBUST_0" signal
@@ -2651,6 +2685,8 @@ void cl_arq_controller::send_break_pattern()
 	delete[] filtered1;
 	delete[] filtered2;
 
+	telecom_system->data_container.rx_mute = 1;
+	msleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -2658,11 +2694,17 @@ void cl_arq_controller::send_break_pattern()
 		memset(telecom_system->data_container.passband_delayed_data, 0, buf_samples * sizeof(double));
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
+	telecom_system->data_container.rx_mute = 0;
 	telecom_system->data_container.nUnder_processing_events = 0;
 	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
 	telecom_system->receive_stats.mfsk_search_raw = 0;
+	{
+		int frame_symb = telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+		telecom_system->data_container.frames_to_read =
+			telecom_system->data_container.buffer_Nsymb - frame_symb;
+	}
 
-	printf("[TX-BREAK] Done, flushed capture buffer\n");
+	printf("[TX-BREAK] Done, flushed capture buffer, ftr=%d\n", telecom_system->data_container.frames_to_read.load());
 	fflush(stdout);
 }
 
@@ -2752,34 +2794,39 @@ void cl_arq_controller::receive()
 
 		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data, telecom_system->data_container.passband_delayed_data, signal_period * sizeof(double));
 
+		// Previously: zero passband_delayed_data after copy to prevent stale
+		// preamble re-detection from self-echo. Now handled by rx_mute (Bug #44):
+		// capture thread zeros audio during TX, so self-echo never enters buffer.
+		// Removing zeroing is critical for OFDM gearshift: after ACK TX + flush,
+		// CMD turnaround takes ~1-2s. With zeroing + ftr=8 anti-spin, only 8
+		// symbols accumulate before the next attempt zeros everything — signal
+		// never builds up for a full 52-symbol frame. Without zeroing, signal
+		// accumulates across attempts until a full frame is available.
+
 		// Clear data_ready while we have the lock, before unlocking
 		telecom_system->data_container.data_ready = 0;
 
 		MUTEX_UNLOCK(&capture_prep_mutex);
 
-		// Buffer energy diagnostic: peak |amplitude| per ~11-symbol chunk (10 chunks for 109-symb buffer)
-		// Shows energy distribution to detect self-hearing (H5c) or silence-preceded frames
-		if(telecom_system->M != MOD_MFSK)
+		if(telecom_system->M != MOD_MFSK && g_verbose)
 		{
 			int sym_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
 			int buf_nsymb = telecom_system->data_container.buffer_Nsymb;
-			int chunk_symb = (buf_nsymb + 9) / 10;  // ~11 symbols per chunk
+			int chunk_symb = (buf_nsymb + 9) / 10;
 			int chunk_samples = chunk_symb * sym_samples;
-			if (g_verbose) {
-				printf("[BUF-ENERGY] nUnder=%d |", telecom_system->data_container.nUnder_processing_events.load());
-				for(int c = 0; c < signal_period; c += chunk_samples)
+			printf("[BUF-ENERGY] nUnder=%d |", telecom_system->data_container.nUnder_processing_events.load());
+			for(int c = 0; c < signal_period; c += chunk_samples)
+			{
+				double peak = 0.0;
+				int end = (c + chunk_samples < signal_period) ? c + chunk_samples : signal_period;
+				for(int s = c; s < end; s++)
 				{
-					double peak = 0.0;
-					int end = (c + chunk_samples < signal_period) ? c + chunk_samples : signal_period;
-					for(int s = c; s < end; s++)
-					{
-						double v = fabs(telecom_system->data_container.ready_to_process_passband_delayed_data[s]);
-						if(v > peak) peak = v;
-					}
-					printf(" %.3f", peak);
+					double v = fabs(telecom_system->data_container.ready_to_process_passband_delayed_data[s]);
+					if(v > peak) peak = v;
 				}
-				printf("\n");
+				printf(" %.3f", peak);
 			}
+			printf("\n");
 			fflush(stdout);
 		}
 

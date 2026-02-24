@@ -278,21 +278,12 @@ cl_error_rate cl_telecom_system::baseband_test_EsN0(float EsN0,int max_frame_no)
 
 		ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit);
 
-		if(ofdm.channel_estimator_amplitude_restoration==YES)
+		// Always use fully-equalized data for visualization (tight clusters).
+		// Amplitude restoration still helps the decoder via the separate path.
+		for(int i=0;i<ofdm.pilot_configurator.nData;i++)
 		{
-			for(int i=0;i<ofdm.pilot_configurator.nData;i++)
-			{
-				contellation[constellation_plot_counter*ofdm.pilot_configurator.nData+i][0]=data_container.ofdm_deframed_data_without_amplitude_restoration[i].real();
-				contellation[constellation_plot_counter*ofdm.pilot_configurator.nData+i][1]=data_container.ofdm_deframed_data_without_amplitude_restoration[i].imag();
-			}
-		}
-		else
-		{
-			for(int i=0;i<ofdm.pilot_configurator.nData;i++)
-			{
-				contellation[constellation_plot_counter*ofdm.pilot_configurator.nData+i][0]=data_container.ofdm_deframed_data[i].real();
-				contellation[constellation_plot_counter*ofdm.pilot_configurator.nData+i][1]=data_container.ofdm_deframed_data[i].imag();
-			}
+			contellation[constellation_plot_counter*ofdm.pilot_configurator.nData+i][0]=data_container.ofdm_deframed_data[i].real();
+			contellation[constellation_plot_counter*ofdm.pilot_configurator.nData+i][1]=data_container.ofdm_deframed_data[i].imag();
 		}
 
 		constellation_plot_counter++;
@@ -387,21 +378,11 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 
 		if(nDataPlot > 0)
 		{
-			if(ofdm.channel_estimator_amplitude_restoration==YES)
+			// Always use fully-equalized data for visualization (tight clusters).
+			for(int i=0;i<nDataPlot;i++)
 			{
-				for(int i=0;i<nDataPlot;i++)
-				{
-					contellation[constellation_plot_counter*nDataPlot+i][0]=data_container.ofdm_deframed_data_without_amplitude_restoration[i].real();
-					contellation[constellation_plot_counter*nDataPlot+i][1]=data_container.ofdm_deframed_data_without_amplitude_restoration[i].imag();
-				}
-			}
-			else
-			{
-				for(int i=0;i<nDataPlot;i++)
-				{
-					contellation[constellation_plot_counter*nDataPlot+i][0]=data_container.ofdm_deframed_data[i].real();
-					contellation[constellation_plot_counter*nDataPlot+i][1]=data_container.ofdm_deframed_data[i].imag();
-				}
+				contellation[constellation_plot_counter*nDataPlot+i][0]=data_container.ofdm_deframed_data[i].real();
+				contellation[constellation_plot_counter*nDataPlot+i][1]=data_container.ofdm_deframed_data[i].imag();
 			}
 
 			constellation_plot_counter++;
@@ -778,6 +759,42 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 		receive_stats.signal_stregth_dbm=ofdm.measure_signal_stregth(data_container.baseband_data_interpolated, data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate);
 
+		// Pre-scan passband for signal region to constrain OFDM preamble search.
+		// After ACK TX + buffer flush, the buffer is: [zeros | VB-Cable silence | signal | silence].
+		// VB-Cable silence has a DC offset that produces high GI+halfsym correlation
+		// (metric ~0.97), competitive with real preambles. Scanning peak passband
+		// amplitude identifies where real signal starts, letting us skip the silence.
+		// Uses peak absolute value (like BUF-ENERGY), NOT mean squared — OFDM has
+		// ~10-12 dB PAPR with 50 subcarriers, so mean squared is ~0.02 even when
+		// peak is ~0.5. Threshold 0.1 peak: silence ~0, TX ramp ~0.02, signal 0.3+.
+		int signal_start_symb = 0;
+		if(M != MOD_MFSK)
+		{
+			int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
+			int buf_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			double max_peak_seen = 0.0;
+			for(int s = 0; s < data_container.buffer_Nsymb; s++)
+			{
+				int offset = s * sym_samples;
+				double peak = 0.0;
+				for(int i = 0; i < sym_samples && (offset + i) < buf_samples; i++)
+				{
+					double v = fabs(data[offset + i]);
+					if(v > peak) peak = v;
+				}
+				if(peak > max_peak_seen) max_peak_seen = peak;
+				if(peak > 0.1)
+				{
+					signal_start_symb = s;
+					if(g_verbose)
+						printf("[PRESCAN] signal_start_symb=%d peak=%.4f\n", s, peak);
+					break;
+				}
+			}
+			if(g_verbose && signal_start_symb == 0)
+				printf("[PRESCAN] no signal found, max_peak=%.6f\n", max_peak_seen);
+		}
+
 		if(M == MOD_MFSK)
 		{
 			// MFSK preamble detection
@@ -867,18 +884,26 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		}
 		else
 		{
-			// WB OFDM: Full-buffer GI+halfsym at 48 kHz.
+			// WB OFDM: GI+halfsym at 48 kHz, starting from signal region.
 			// Combined GI (Ngi samples) + halfsym (Nfft/2 samples) correlation
 			// gives robust detection with metric ~0.95 on real preambles.
-			// The two-phase decimated approach (halfsym-only at 12 kHz) produces
-			// unreliable metrics (~0.036) for WB CONFIG_0 on VB-Cable — reverted
-			// to the proven full-rate approach that worked at the fork point.
+			// The search starts from signal_start_symb (passband energy pre-scan)
+			// to skip silence where VB-Cable DC offset produces false GI peaks.
+			int sym_samples_wb = data_container.Nofdm * frequency_interpolation_rate;
+			int buf_samples_wb = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			int search_offset = signal_start_symb * sym_samples_wb;
+			int search_size = buf_samples_wb - search_offset;
 			TimeSyncResult coarse_result = ofdm.time_sync_preamble_with_metric(
-				data_container.baseband_data_interpolated,
-				data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate,
+				&data_container.baseband_data_interpolated[search_offset],
+				search_size,
 				data_container.interpolation_rate, 0, step, 1);
+			coarse_result.delay += search_offset;
 			receive_stats.delay = coarse_result.delay;
 			receive_stats.coarse_metric = coarse_result.correlation;
+
+			if(g_verbose)
+				printf("[OFDM-SYNC] signal_start_symb=%d search_offset=%d metric=%.4f delay=%d\n",
+					signal_start_symb, search_offset, coarse_result.correlation, (int)receive_stats.delay);
 		}
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
@@ -1133,6 +1158,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 		if(energy_ok)
 		{
+		if(M != MOD_MFSK && g_verbose)
+		{
+			printf("[OFDM-ENTRY] metric=%.3f delay=%d symb=%d %s Nc=%d Nsymb=%d\n",
+				receive_stats.coarse_metric, receive_stats.delay, pream_symb_loc,
+				narrowband_enabled ? "NB" : "WB", ofdm.Nc, ofdm.Nsymb);
+			fflush(stdout);
+		}
+
 		int skip_h_count = 0;
 		bool skip_h_recovery_attempted = false;
 skip_h_retry_point:
@@ -1235,7 +1268,16 @@ skip_h_retry_point:
 			else
 			{
 				// Window = preamble+4 symbols (±2 sym search range) — see trial 1 comment
-			receive_stats.delay=(pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate+ofdm.time_sync_preamble(&data_container.baseband_data_interpolated[(pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate],(ofdm.preamble_configurator.Nsymb+4)*data_container.Nofdm*data_container.interpolation_rate,data_container.interpolation_rate,receive_stats.sync_trials,1,time_sync_trials_max);
+				// Bug #53: Use _with_metric (GI+halfsym) not GI-only. On VB-Cable,
+				// GI correlation is ~1.0 at ALL symbol boundaries (preamble AND data).
+				// GI-only fine sync can pick a data boundary, shifting frame by 1-2
+				// symbols → pilot grid misaligned → mean_H ≈ 0.08 (noise).
+				// Halfsym detects even-only preamble periodicity, rejecting data peaks.
+				TimeSyncResult fine_result = ofdm.time_sync_preamble_with_metric(
+					&data_container.baseband_data_interpolated[(pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate],
+					(ofdm.preamble_configurator.Nsymb+4)*data_container.Nofdm*data_container.interpolation_rate,
+					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max);
+				receive_stats.delay = (pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate + fine_result.delay;
 			}
 
 			if(receive_stats.delay<0){receive_stats.delay=0;}
@@ -1309,7 +1351,6 @@ skip_h_retry_point:
 				extraction_delay = buf_size_interp - frame_size_interp;
 
 			ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
-
 
 			if(ofdm_forced_delay >= 0)
 			{
@@ -1459,7 +1500,6 @@ skip_h_retry_point:
 					}
 					if(h_count > 0) mean_H = h_sum / h_count;
 				}
-
 				{
 					double mean_H_threshold = 0.30;
 					if(mean_H < mean_H_threshold)
@@ -1586,13 +1626,21 @@ skip_h_retry_point:
 				}
 				else if(ofdm.channel_estimator==ZERO_FORCE)
 				{
-					bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, data_container.hd_decoded_data_bit, nReal_data);
+					// ZF SNR measurement: re-encode decoded bits to get ideal
+					// modulated symbols, then compare with received symbols.
+					// Must re-apply bit_energy_dispersal (undo the descrambling
+					// done earlier) since the LDPC encoder expects scrambled data.
+					// Use a temp buffer to avoid corrupting hd_decoded_data_bit
+					// (which the BER test compares against the original data).
+					int temp_bits[N_MAX];
+					memcpy(temp_bits, data_container.hd_decoded_data_bit, nReal_data * sizeof(int));
+					bit_energy_dispersal(temp_bits, data_container.bit_energy_dispersal_sequence, temp_bits, nReal_data);
 
 					for(int i=0;i<nVirtual_data;i++)
 					{
-						data_container.hd_decoded_data_bit[nReal_data+i]=data_container.hd_decoded_data_bit[i];
+						temp_bits[nReal_data+i]=temp_bits[i];
 					}
-					ldpc.encode(data_container.hd_decoded_data_bit,data_container.encoded_data);
+					ldpc.encode(temp_bits,data_container.encoded_data);
 					for(int i=0;i<ldpc.P;i++)
 					{
 						data_container.encoded_data[nReal_data+i]=data_container.encoded_data[i+ldpc.K];
@@ -1614,13 +1662,10 @@ skip_h_retry_point:
 				receive_stats.message_decoded=YES;
 
 #ifdef MERCURY_GUI_ENABLED
-				// Push constellation IQ data to GUI for scatter plot
+				// Push fully-equalized data for visualization (tight clusters).
+				// Amplitude restoration still helps the decoder via the separate path.
 				if (M != MOD_MFSK) {
-					const std::complex<double>* iq_src =
-						(ofdm.channel_estimator_amplitude_restoration == YES)
-						? data_container.ofdm_deframed_data_without_amplitude_restoration
-						: data_container.ofdm_deframed_data;
-					gui_push_constellation(iq_src, data_container.nData, (int)M, false);
+					gui_push_constellation(data_container.ofdm_deframed_data, data_container.nData, (int)M, false);
 				} else {
 					gui_push_constellation(nullptr, 0, (int)M, true);
 				}
@@ -2066,10 +2111,12 @@ void cl_telecom_system::init()
 		ofdm.FIR_tx2.lpf_filter_cut_frequency = cf + bw / 2;
 		ofdm.FIR_tx2.hpf_filter_cut_frequency = cf - bw / 2;
 		ofdm.FIR_tx2.filter_transition_bandwidth = 1000;  // WB default: 97 taps, GI-tolerable
-		printf("[INIT-DIAG] Nc=%d bw=%.1f cf=%.1f FIR_data_cut=%.1f FIR_ts_cut=%.1f nb=%d\n",
-			ofdm.Nc, bw, cf, ofdm.FIR_rx_data.lpf_filter_cut_frequency,
-			ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency, narrowband_enabled);
-		fflush(stdout);
+		if(g_verbose) {
+			printf("[INIT-DIAG] Nc=%d bw=%.1f cf=%.1f FIR_data_cut=%.1f FIR_ts_cut=%.1f nb=%d\n",
+				ofdm.Nc, bw, cf, ofdm.FIR_rx_data.lpf_filter_cut_frequency,
+				ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency, narrowband_enabled);
+			fflush(stdout);
+		}
 	}
 
 	// Nsymb scales with Nc: narrowband (Nc=10) needs 5× more symbols than wideband (Nc=50)
@@ -3047,6 +3094,13 @@ void cl_telecom_system::load_configuration(int configuration)
 	// NB MFSK: 8-symbol preamble for cross-correlation detection
 	if(narrowband_enabled && M == MOD_MFSK)
 		ofdm.preamble_configurator.Nsymb = 8;
+	// Fix A: NB OFDM uses ZF instead of LS. The LS estimator averages pilots
+	// across multiple symbol rows (Dy=3 spacing). Any residual freq offset
+	// rotates the phase per row, causing the complex average to cancel out
+	// (mean_H≈0.08 instead of ~1.0). ZF computes H=Y/P per pilot with no
+	// cross-pilot averaging, so it's immune to phase rotation.
+	if(narrowband_enabled && ofdm_channel_estimator == LEAST_SQUARE)
+		ofdm_channel_estimator = ZERO_FORCE;
 	ofdm.channel_estimator=ofdm_channel_estimator;
 
 	awgn_channel.set_seed(rand());

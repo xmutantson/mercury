@@ -523,10 +523,7 @@ void cl_arq_controller::process_messages_tx_control()
 		// receiving_timeout stale (e.g. 900ms), too short for the control round-trip.
 		calculate_receiving_timeout();
 		receiving_timer.start();
-		printf("[CMD-RX] Entering receive mode: ack_cfg=%d recv_timeout=%d msg_tx_time=%d ctrl_tx_time=%d ack_batch=%d ftr=%d\n",
-			ack_configuration, receiving_timeout, message_transmission_time_ms, ctrl_transmission_time_ms, ack_batch_size,
-			telecom_system->data_container.frames_to_read.load());
-		fflush(stdout);
+		if(g_verbose) { printf("[CMD-RX] Entering receive mode: ack_cfg=%d recv_timeout=%d msg_tx_time=%d ctrl_tx_time=%d ack_batch=%d ftr=%d\n", ack_configuration, receiving_timeout, message_transmission_time_ms, ctrl_transmission_time_ms, ack_batch_size, telecom_system->data_container.frames_to_read.load()); fflush(stdout); }
 
 		if(messages_control.data[0]==SWITCH_BANDWIDTH)
 		{
@@ -1604,10 +1601,28 @@ void cl_arq_controller::process_control_commander()
 				// from being ACKed alongside legitimate data in the next batch.
 				for(int i=0;i<nMessages;i++) messages_rx[i].status=FREE;
 				messages_rx_buffer.status=FREE;
-				// Reset RX state machine - wait for fresh data (prevents decode of self-received TX audio).
-				// Frame completeness gating handles late arrivals adaptively.
-				telecom_system->data_container.frames_to_read =
-					telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+				// After SWITCH_ROLE, the buffer contains stale ACK pattern audio
+				// from the ACK detection polling. MFSK ACK tones create false
+				// OFDM preamble correlations → 10-15 LDPC FAILs before the real
+				// frame shifts in. Flush the buffer to eliminate false detections.
+				{
+					MUTEX_LOCK(&capture_prep_mutex);
+					int signal_period = telecom_system->data_container.Nofdm
+						* telecom_system->data_container.buffer_Nsymb
+						* telecom_system->data_container.interpolation_rate;
+					memset(telecom_system->data_container.passband_delayed_data, 0,
+						signal_period * sizeof(double));
+					MUTEX_UNLOCK(&capture_prep_mutex);
+				}
+				circular_buf_reset(capture_buffer);
+				// Set ftr = rx_frame so we wait just long enough for one frame
+				// to accumulate after the flush. Quick anti-spin FAILs bridge
+				// any turnaround gap (~5ms each, empty buffer).
+				{
+					int rx_frame = telecom_system->data_container.preamble_nSymb
+						+ telecom_system->get_active_nsymb();
+					telecom_system->data_container.frames_to_read = rx_frame;
+				}
 				telecom_system->data_container.nUnder_processing_events = 0;
 				telecom_system->receive_stats.mfsk_search_raw = 0;
 			}

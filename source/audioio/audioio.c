@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <string.h>
+#include <math.h>
 #ifdef _WIN32
 #include <wchar.h>
 #endif
@@ -43,6 +44,31 @@ extern int radio_type;
 // 0=LEFT, 1=RIGHT, 2=STEREO (L+R)
 int configured_input_channel = 0;   // Default: LEFT (matches pre-GUI CLI default)
 int configured_output_channel = 2;  // Default: STEREO
+int multichannel_mode = 0;          // Set to 1 when -A flag is used (forces 16ch WASAPI)
+
+// Internal AWGN noise injection (-Z flag)
+// When noise_snr_db < 999, white noise is added to captured audio at the specified SNR.
+// SNR is relative to the signal level AFTER TX/RX gain (i.e. the cable level).
+double noise_snr_db = 999.0;       // 999 = disabled
+static uint64_t noise_rng_state[2] = {0x853c49e6748fea9bULL, 0xda3e39cb94b95bdbULL};
+
+// xoshiro128+ PRNG — fast, good quality for noise generation
+static inline uint64_t noise_rng_next(void) {
+	uint64_t s0 = noise_rng_state[0], s1 = noise_rng_state[1];
+	uint64_t result = s0 + s1;
+	s1 ^= s0;
+	noise_rng_state[0] = ((s0 << 55) | (s0 >> 9)) ^ s1 ^ (s1 << 14);
+	noise_rng_state[1] = (s1 << 36) | (s1 >> 28);
+	return result;
+}
+
+// Box-Muller: two uniform → two Gaussian
+static inline double noise_gaussian(void) {
+	double u1 = (noise_rng_next() >> 11) * (1.0 / 9007199254740992.0);  // (0,1)
+	double u2 = (noise_rng_next() >> 11) * (1.0 / 9007199254740992.0);
+	if (u1 < 1e-15) u1 = 1e-15;
+	return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}
 
 // Tune tone state (for GUI tune button)
 static long tune_sample_index = 0;
@@ -429,7 +455,13 @@ void *radio_playback_thread(void *device_ptr)
 	conf.buf.app_name = "mercury_playback";
 	conf.buf.format = FFAUDIO_F_INT32;
 	conf.buf.sample_rate = 48000;
-	conf.buf.channels = 2;
+	// When -A flag is used (multichannel_mode=1), request 16 channels so
+	// WASAPI shared-mode streams all use the same format. This allows noise
+	// injection and multiple Mercury instances to mix on the same device.
+	if (multichannel_mode)
+		conf.buf.channels = 16;
+	else
+		conf.buf.channels = 2;
 	conf.buf.device_id = (const char *) device_ptr;
 	uint32_t period_ms;
 	uint32_t period_bytes;
@@ -506,7 +538,8 @@ void *radio_playback_thread(void *device_ptr)
 
 	uint8_t *buffer = (uint8_t *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(double) * 2);
 	double *buffer_double =  (double *) buffer;
-	int32_t *buffer_internal_stereo = (int32_t *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(int32_t) * 2); // a big enough buffer
+	int out_nch_alloc = multichannel_mode ? 16 : 2;
+	int32_t *buffer_internal_stereo = (int32_t *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(int32_t) * out_nch_alloc);
 
 	ffuint total_written = 0;
 
@@ -728,7 +761,11 @@ void *radio_capture_thread(void *device_ptr)
 	conf.buf.app_name = "mercury_capture";
 	conf.buf.format = FFAUDIO_F_INT32;
 	conf.buf.sample_rate = 48000;
-	conf.buf.channels = 2;
+	// Match playback: request 16 channels when -A flag is used.
+	if (multichannel_mode)
+		conf.buf.channels = 16;
+	else
+		conf.buf.channels = 2;
 	conf.buf.device_id = (const char *) device_ptr;
 
 #if defined(_WIN32)
@@ -917,6 +954,24 @@ void *radio_capture_thread(void *device_ptr)
 			}
 		}
 
+		// Internal AWGN noise injection (-Z flag or NOISESNR command)
+		// Adds noise BEFORE RX gain, at the cable signal level.
+		// noise_snr_db is referenced to 4 kHz standard HF bandwidth.
+		if (noise_snr_db < 999.0) {
+			static double noise_sigma = 0.0;
+			static double last_snr_db = 999.0;
+			if (noise_snr_db != last_snr_db) {
+				double signal_amp = pow(10.0, -30.0 / 20.0);
+				double bw_correction = sqrt(48000.0 / (2.0 * 4000.0));
+				noise_sigma = signal_amp * bw_correction * pow(10.0, -noise_snr_db / 20.0);
+				printf("[NOISE-Z] SNR=%.1f dB, sigma=%.6f\n", noise_snr_db, noise_sigma);
+				last_snr_db = noise_snr_db;
+			}
+			for (int i = 0; i < frames_to_write; i++) {
+				buffer_internal[i] += noise_sigma * noise_gaussian();
+			}
+		}
+
 #ifdef MERCURY_GUI_ENABLED
 		// Apply RX gain as preprocessing step (affects Mercury's core too)
 		gui_apply_rx_gain_for_display(buffer_internal, frames_to_write);
@@ -1002,6 +1057,10 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 		}
 
 		rx_transfer(buffer_temp, symbol_period);
+
+		if(data_container_ptr->rx_mute) {
+			memset(buffer_temp, 0, symbol_period * sizeof(double));
+		}
 
 		MUTEX_LOCK(&capture_prep_mutex);
 
