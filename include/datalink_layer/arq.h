@@ -32,6 +32,7 @@
 #include "datalink_defines.h"
 #include "common/common_defines.h"
 #include "audioio/audioio.h"
+#include "compression/mercury_compress.h"
 #include <iomanip>
 
 union u_SNR {
@@ -364,9 +365,11 @@ public:
   int nb_probe_max;             // max NB probe attempts before fallback (default 2)
   bool session_narrowband;      // negotiated NB for this session (NB always wins)
   int bandwidth_mode;           // BW_AUTO=0, BW_NB_ONLY=1
-  uint8_t local_capability;    // CAP_WB_CAPABLE if auto mode
+  uint8_t local_capability;    // CAP_WB_CAPABLE | CAP_COMPRESSION
   uint8_t peer_capability;     // Received from peer via TEST_CONNECTION
   bool wb_upgrade_pending;     // True between SWITCH_BANDWIDTH send and ACK
+  cl_compressor compressor;           // Block compression (PPMd + zstd)
+  bool compression_enabled;           // Negotiated: both sides have CAP_COMPRESSION
   int gear_shift_algorithm;
   double gear_shift_up_success_rate_precentage;
   double gear_shift_down_success_rate_precentage;

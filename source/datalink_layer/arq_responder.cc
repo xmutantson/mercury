@@ -827,9 +827,21 @@ void cl_arq_controller::process_control_responder()
 		// Always present (LDPC decodes full block; unused bytes are zero-padded).
 		// Backwards-compatible: old firmware doesn't fill byte 5 → decodes as 0 = no WB.
 		peer_capability = (uint8_t)messages_control.data[5];
-		printf("[BW-NEG] Commander capability: 0x%02X (WB=%s)\n",
-			peer_capability, (peer_capability & CAP_WB_CAPABLE) ? "yes" : "no");
+		printf("[BW-NEG] Commander capability: 0x%02X (WB=%s, COMPRESS=%s)\n",
+			peer_capability,
+			(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",
+			(peer_capability & CAP_COMPRESSION) ? "yes" : "no");
 		fflush(stdout);
+
+		// Compression: enable if both sides support it
+		compression_enabled = (local_capability & CAP_COMPRESSION) &&
+		                      (peer_capability & CAP_COMPRESSION);
+		if(compression_enabled)
+		{
+			compressor.init();
+			printf("[COMPRESS] Enabled (both peers support compression)\n");
+			fflush(stdout);
+		}
 
 		tmp_SNR.f_SNR=(float)measurements.SNR_downlink;
 		for(int i=0;i<4;i++)

@@ -1473,9 +1473,21 @@ void cl_arq_controller::process_control_commander()
 			// symmetric capability — works when both sides use same bandwidth_mode).
 			// Responder's SWITCH_BANDWIDTH handler rejects if nb_only as a safety net.
 			peer_capability = (uint8_t)messages_control.data[5];
-			printf("[BW-NEG] Responder capability: 0x%02X (WB=%s)\n",
-				peer_capability, (peer_capability & CAP_WB_CAPABLE) ? "yes" : "no");
+			printf("[BW-NEG] Responder capability: 0x%02X (WB=%s, COMPRESS=%s)\n",
+				peer_capability,
+				(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",
+				(peer_capability & CAP_COMPRESSION) ? "yes" : "no");
 			fflush(stdout);
+
+			// Compression: enable if both sides support it
+			compression_enabled = (local_capability & CAP_COMPRESSION) &&
+			                      (peer_capability & CAP_COMPRESSION);
+			if(compression_enabled)
+			{
+				compressor.init();
+				printf("[COMPRESS] Enabled (both peers support compression)\n");
+				fflush(stdout);
+			}
 
 			switch_role_test_timer.stop();
 			switch_role_test_timer.reset();
@@ -2026,29 +2038,45 @@ void cl_arq_controller::process_buffer_data_commander()
 		{
 			int filled = 0;
 			int fill_limit = data_batch_size;  // Fill exactly one batch worth of messages
+			int max_frame = max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH;
+			// When compression is enabled, reserve space for the 5-byte header
+			int max_raw = compression_enabled ? (max_frame - COMPRESS_HEADER_SIZE) : max_frame;
+			char compress_buf[512];  // Temp buffer for compressed output
+
 			for(int i=0;i<fill_limit;i++)
 			{
-				data_read_size=fifo_buffer_tx.pop(message_TxRx_byte_buffer,max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH);
+				data_read_size=fifo_buffer_tx.pop(message_TxRx_byte_buffer, max_raw);
 				if(data_read_size==0)
 				{
 					last_transmission_block_stats.nSent_data=0;
 					last_transmission_block_stats.nReSent_data=0;
 					break;
 				}
-				else if(data_read_size==max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH)
+
+				// Backup stores raw data (for restore after BREAK)
+				fifo_buffer_backup.push(message_TxRx_byte_buffer, data_read_size);
+
+				char* frame_data = message_TxRx_byte_buffer;
+				int frame_size = data_read_size;
+
+				if(compression_enabled)
 				{
-					block_under_tx=YES;
-					add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
-					fifo_buffer_backup.push(message_TxRx_byte_buffer,data_read_size);
-					filled++;
+					int comp_size = compressor.compress_block(
+						message_TxRx_byte_buffer, data_read_size,
+						compress_buf, max_frame);
+					if(comp_size > 0)
+					{
+						frame_data = compress_buf;
+						frame_size = comp_size;
+					}
 				}
+
+				block_under_tx=YES;
+				if(frame_size==max_frame)
+					add_message_tx_data(DATA_LONG, frame_size, frame_data);
 				else
-				{
-					block_under_tx=YES;
-					add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
-					fifo_buffer_backup.push(message_TxRx_byte_buffer,data_read_size);
-					filled++;
-				}
+					add_message_tx_data(DATA_SHORT, frame_size, frame_data);
+				filled++;
 			}
 		}
 		else if(block_under_tx==YES && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)

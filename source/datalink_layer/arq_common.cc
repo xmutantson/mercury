@@ -146,9 +146,10 @@ cl_arq_controller::cl_arq_controller()
 	nb_probe_max=2;
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
-	local_capability=0;
+	local_capability=CAP_COMPRESSION;  // Always advertise compression support
 	peer_capability=0;
 	wb_upgrade_pending=false;
+	compression_enabled=false;
 	gear_shift_algorithm=SUCCESS_BASED_LADDER;
 
 	gear_shift_up_success_rate_precentage=70;
@@ -1811,9 +1812,10 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = (bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
+		compression_enabled = false;
 		original_role=COMMANDER;
 		set_role(COMMANDER);
 		link_status=CONNECTING;
@@ -1907,9 +1909,10 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = (bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
+		compression_enabled = false;
 		link_status=LISTENING;
 		connection_status=RECEIVING;
 		reset_session_state();
@@ -1942,7 +1945,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = 0;
+		local_capability = CAP_COMPRESSION;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -1960,7 +1963,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE;
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -1979,7 +1982,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE;
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2113,6 +2116,11 @@ void cl_arq_controller::reset_session_state()
 	break_detected = NO;
 	hail_detected = NO;
 	hail_sent = NO;
+
+	// Compression — deinit contexts, will re-init on next negotiation
+	if(compression_enabled)
+		compressor.deinit();
+	compression_enabled = false;
 
 	// Data exchange
 	block_under_tx = NO;
@@ -3356,12 +3364,37 @@ void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
 	int total_bytes = 0;
+	char decompress_buf[512];  // Temp buffer for decompressed output
+
 	for(int i=0;i<this->nMessages;i++)
 	{
 		if(messages_rx[i].status==ACKED)
 		{
-			fifo_buffer_rx.push(messages_rx[i].data,messages_rx[i].length);
-			total_bytes += messages_rx[i].length;
+			if(compression_enabled && messages_rx[i].length >= COMPRESS_HEADER_SIZE)
+			{
+				int dec_size = compressor.decompress_block(
+					messages_rx[i].data, messages_rx[i].length,
+					decompress_buf, (int)sizeof(decompress_buf));
+				if(dec_size > 0)
+				{
+					fifo_buffer_rx.push(decompress_buf, dec_size);
+					total_bytes += dec_size;
+				}
+				else
+				{
+					// Decompression error — push raw as fallback
+					printf("[DECOMPRESS] Error on message %d, pushing raw %d bytes\n",
+						i, messages_rx[i].length);
+					fflush(stdout);
+					fifo_buffer_rx.push(messages_rx[i].data, messages_rx[i].length);
+					total_bytes += messages_rx[i].length;
+				}
+			}
+			else
+			{
+				fifo_buffer_rx.push(messages_rx[i].data, messages_rx[i].length);
+				total_bytes += messages_rx[i].length;
+			}
 			messages_rx[i].status=FREE;
 			copied++;
 		}
