@@ -2,6 +2,11 @@
 
 **Status**: Planned — not yet implemented
 
+# Notes From User:
+We should consider using  aquick entropy test before compression to determine if we should even try ppmd or if we should use zstd
+we need to make sure we try the uncompressed case too, so we might end up running both compression algos but if the raw block is smaller (sending a zip file attachement for example) then send the raw block becuase compressing adds overhead.
+
+
 ## Context
 
 Mercury's PHY layer is competitive with VARA HF, but VARA reports ~2x higher

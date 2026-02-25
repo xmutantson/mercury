@@ -144,6 +144,10 @@ public:
 	int generate_break_pattern_passband(double* out);  // TX: returns samples written
 	double detect_break_pattern_from_passband(double* data, int size, int* out_matched = nullptr);  // RX: returns metric
 
+	// HAIL pattern: "I am Mercury" beacon (different tones from ACK and BREAK)
+	int generate_hail_pattern_passband(double* out);  // TX: returns samples written
+	double detect_hail_pattern_from_passband(double* data, int size, int* out_matched = nullptr);  // RX: returns metric
+
 	st_receive_stats receive_stats;
 
 	int operation_mode;

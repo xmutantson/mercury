@@ -39,10 +39,13 @@ cl_mfsk::cl_mfsk()
 		ack_tones[i] = 0;
 	for (int i = 0; i < MAX_ACK_TONES; i++)
 		break_tones[i] = 0;
+	for (int i = 0; i < MAX_ACK_TONES; i++)
+		hail_tones[i] = 0;
 	ack_pattern_len = 0;
 	ack_pattern_nsymb = 0;
 	ack_match_threshold = 0;
 	break_match_threshold = 0;
+	hail_match_threshold = 0;
 }
 
 cl_mfsk::~cl_mfsk()
@@ -245,6 +248,54 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		for (int i = 0; i < ack_pattern_len; i++)
 			break_tones[i] = (ack_tones[i] + M / 2) % M;
 	}
+
+	// HAIL pattern tones: "I am Mercury" beacon.
+	// WB: Welch-Costas (p=17, g=6) — different generator from ACK (g=5) and BREAK (g=7).
+	//   Cross-correlation: vs ACK 1/8, vs BREAK 2/8 (near random).
+	// NB: Sidelnikov with different primitive roots:
+	//   M=8: (p=37, g=24, offset=3) — vs ACK 8/32, vs BREAK 6/32.
+	//   M=4: (p=53, g=13, offset=3) — vs ACK 10/48, vs BREAK 11/48.
+	if (M == 32)
+	{
+		// 2x scaled M=16 Welch-Costas (g=6)
+		const int tones[] = {0, 10, 2, 22, 6, 12, 14, 26};
+		for (int i = 0; i < 8; i++) hail_tones[i] = tones[i];
+		hail_match_threshold = 8;
+	}
+	else if (M == 16)
+	{
+		// Welch-Costas (p=17, g=6)
+		const int tones[] = {0, 5, 1, 11, 3, 6, 7, 13};
+		for (int i = 0; i < 8; i++) hail_tones[i] = tones[i];
+		hail_match_threshold = 8;
+	}
+	else if (M == 8)
+	{
+		// Sidelnikov (p=37, g=24, offset=3). 32 symbols.
+		const int tones[] = {
+			4, 3, 0, 2, 5, 5, 6, 0, 4, 2, 7, 1, 5, 5, 4, 3,
+			2, 7, 7, 0, 3, 1, 6, 6, 5, 3, 7, 1, 4, 2, 6, 6
+		};
+		for (int i = 0; i < 32; i++) hail_tones[i] = tones[i];
+		hail_match_threshold = 24;
+	}
+	else if (M == 4)
+	{
+		// Sidelnikov (p=53, g=13, offset=3). 48 symbols.
+		const int tones[] = {
+			0, 0, 1, 3, 2, 3, 1, 2, 3, 3, 1, 3, 0, 0, 0, 1,
+			3, 2, 3, 1, 2, 3, 3, 1, 3, 0, 0, 0, 1, 3, 2, 3,
+			1, 2, 3, 3, 1, 3, 0, 0, 0, 1, 3, 2, 3, 1, 2, 3
+		};
+		for (int i = 0; i < 48; i++) hail_tones[i] = tones[i];
+		hail_match_threshold = 40;
+	}
+	else
+	{
+		hail_match_threshold = 8;
+		for (int i = 0; i < ack_pattern_len; i++)
+			hail_tones[i] = (ack_tones[i] + M / 4) % M;
+	}
 }
 
 void cl_mfsk::deinit()
@@ -321,6 +372,30 @@ void cl_mfsk::generate_break_pattern(std::complex<double>* pattern_out)
 		}
 
 		int tone_base = break_tones[s % ack_pattern_len];
+		int actual_tone = (tone_base + s * tone_hop_step) % M;
+
+		for (int st = 0; st < nStreams; st++)
+		{
+			pattern_out[s * Nc + stream_offsets[st] + actual_tone] = std::complex<double>(amp, 0.0);
+		}
+	}
+}
+
+// Generate HAIL pattern: "I am Mercury" beacon, identical structure to ACK but with hail_tones
+void cl_mfsk::generate_hail_pattern(std::complex<double>* pattern_out)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+
+	double amp = sqrt((double)Nc / nStreams);
+
+	for (int s = 0; s < ack_pattern_nsymb; s++)
+	{
+		for (int k = 0; k < Nc; k++)
+		{
+			pattern_out[s * Nc + k] = std::complex<double>(0.0, 0.0);
+		}
+
+		int tone_base = hail_tones[s % ack_pattern_len];
 		int actual_tone = (tone_base + s * tone_hop_step) % M;
 
 		for (int st = 0; st < nStreams; st++)

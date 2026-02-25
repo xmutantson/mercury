@@ -220,6 +220,30 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
   				R=CNEW(double, N*Vwidth, "ldpc.R");
   				Q=CNEW(double, N*Vwidth, "ldpc.Q");
   			}
+  			else if(K==1000)//rate == 10/16
+  			{
+  				Cwidth=mercury_normal_Cwidth_10_16;
+  				Vwidth=mercury_normal_Vwidth_10_16;
+  				dwidth=mercury_normal_dwidth_10_16;
+  				QCmatrixC=&mercury_normal_QCmatrixC_10_16[0][0];
+  				QCmatrixEnc=&mercury_normal_QCmatrixEnc_10_16[0][0];
+  				QCmatrixV=&mercury_normal_QCmatrixV_10_16[0][0];
+  				QCmatrixd=&mercury_normal_QCmatrixd_10_16[0];
+  				R=CNEW(double, N*Vwidth, "ldpc.R");
+  				Q=CNEW(double, N*Vwidth, "ldpc.Q");
+  			}
+  			else if(K==1200)//rate == 12/16
+  			{
+  				Cwidth=mercury_normal_Cwidth_12_16;
+  				Vwidth=mercury_normal_Vwidth_12_16;
+  				dwidth=mercury_normal_dwidth_12_16;
+  				QCmatrixC=&mercury_normal_QCmatrixC_12_16[0][0];
+  				QCmatrixEnc=&mercury_normal_QCmatrixEnc_12_16[0][0];
+  				QCmatrixV=&mercury_normal_QCmatrixV_12_16[0][0];
+  				QCmatrixd=&mercury_normal_QCmatrixd_12_16[0];
+  				R=CNEW(double, N*Vwidth, "ldpc.R");
+  				Q=CNEW(double, N*Vwidth, "ldpc.Q");
+  			}
   			else if(K==1400)//rate == 14/16
   			{
   				Cwidth=mercury_normal_Cwidth_14_16;

@@ -1967,6 +1967,61 @@ double cl_telecom_system::detect_break_pattern_from_passband(double* data, int s
 	return metric;
 }
 
+// TX: Generate HAIL pattern as passband audio (identical to ACK but with hail_tones)
+int cl_telecom_system::generate_hail_pattern_passband(double* out)
+{
+	if(ack_pattern_passband_samples <= 0) return 0;
+
+	int nsymb = ack_mfsk.ack_pattern_nsymb;
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	ack_mfsk.generate_hail_pattern(data_container.ofdm_framed_data);
+
+	for(int i = 0; i < nsymb; i++)
+	{
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	}
+
+	double hail_boost = get_tx_gain(TX_SIG_ACK);  // same gain as ACK
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * hail_boost;
+	}
+
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	ofdm.peak_clip(out, ack_pattern_passband_samples, ofdm.data_papr_cut);
+
+	return ack_pattern_passband_samples;
+}
+
+// RX: Detect HAIL pattern in passband audio buffer (uses hail_tones)
+double cl_telecom_system::detect_hail_pattern_from_passband(double* data, int size, int* out_matched)
+{
+	if(ack_pattern_passband_samples <= 0) return 0.0;
+
+	ofdm.passband_to_baseband(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, carrier_frequency, carrier_amplitude,
+		1, &ofdm.FIR_rx_data);
+
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, size,
+		data_container.interpolation_rate,
+		ack_mfsk.ack_pattern_nsymb,
+		ack_mfsk.hail_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		out_matched);
+
+	return metric;
+}
+
 // ACK pattern detection test: sweep SNR, measure detection metric and false alarm rate
 void cl_telecom_system::ack_pattern_detection_test()
 {
@@ -2755,9 +2810,9 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 {
 	BER_plot.open("BER");
 	BER_plot.reset("BER");
-	// MFSK: sweep channel SNR from -25 to +5 dB in 1 dB steps (VARA claims ~-10 dB for SL1)
-	// OFDM: sweep Es/N0 from -10 to +2.5 dB in 0.5 dB steps
-	int nPoints = (M == MOD_MFSK) ? 31 : 25;
+	// MFSK: sweep channel SNR from -25 to +5 dB in 1 dB steps
+	// OFDM: sweep Es/N0 from -10 to +15 dB in 0.5 dB steps
+	int nPoints = (M == MOD_MFSK) ? 31 : 51;
 	int nFrames_per_point = (M == MOD_MFSK) ? 3 : 100;
 	float data_plot[nPoints][2];
 	float data_plot_theo[nPoints][2];
@@ -2926,8 +2981,8 @@ void cl_telecom_system::load_configuration(int configuration)
 	}
 	else if(configuration==CONFIG_13)
 	{
-		_modulation=MOD_16QAM;
-		_ldpc_rate=8/16.0;
+		_modulation=MOD_8PSK;
+		_ldpc_rate=12/16.0;
 		ofdm_preamble_configurator_Nsymb=2;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
@@ -2943,14 +2998,14 @@ void cl_telecom_system::load_configuration(int configuration)
 		_modulation=MOD_16QAM;
 		_ldpc_rate=14/16.0;
 		ofdm_preamble_configurator_Nsymb=2;
-		ofdm_channel_estimator=ZERO_FORCE;
+		ofdm_channel_estimator=LEAST_SQUARE;
 	}
 	else if(configuration==CONFIG_16)
 	{
 		_modulation=MOD_32QAM;
 		_ldpc_rate=14/16.0;
 		ofdm_preamble_configurator_Nsymb=1;
-		ofdm_channel_estimator=ZERO_FORCE;
+		ofdm_channel_estimator=LEAST_SQUARE;
 	}
 	else if(configuration==ROBUST_0)
 	{
@@ -3094,13 +3149,19 @@ void cl_telecom_system::load_configuration(int configuration)
 	// NB MFSK: 8-symbol preamble for cross-correlation detection
 	if(narrowband_enabled && M == MOD_MFSK)
 		ofdm.preamble_configurator.Nsymb = 8;
-	// Fix A: NB OFDM uses ZF instead of LS. The LS estimator averages pilots
-	// across multiple symbol rows (Dy=3 spacing). Any residual freq offset
-	// rotates the phase per row, causing the complex average to cancel out
-	// (mean_H≈0.08 instead of ~1.0). ZF computes H=Y/P per pilot with no
-	// cross-pilot averaging, so it's immune to phase rotation.
+	// Fix A: NB OFDM estimator override.
+	// ZF (per-pilot H=Y/P) is immune to phase rotation from residual freq
+	// offset (Bug #51) but noisy on Nc=10. Works well for phase-only mods.
+	// LS averages across Dy=3 pilot rows — smooths noise, critical for QAM
+	// amplitude discrimination. Phase rotation is handled by CPE_correction
+	// which runs before the estimator in the RX chain.
 	if(narrowband_enabled && ofdm_channel_estimator == LEAST_SQUARE)
-		ofdm_channel_estimator = ZERO_FORCE;
+	{
+		if(M == MOD_16QAM || M == MOD_32QAM || M == MOD_64QAM)
+			ofdm_channel_estimator = LEAST_SQUARE; // keep LS — CPE handles phase
+		else
+			ofdm_channel_estimator = ZERO_FORCE;   // phase-only mods: ZF is fine
+	}
 	ofdm.channel_estimator=ofdm_channel_estimator;
 
 	awgn_channel.set_seed(rand());
@@ -3482,74 +3543,47 @@ void cl_telecom_system::return_to_last_configuration()
 	current_configuration=tmp;
 }
 
+// SNR-to-config mapping for supershift (BER waterfall + 2 dB margin).
+// Callers apply SUPERSHIFT_MARGIN_DB (3 dB) on top, so effective margin = 5 dB.
+// BER waterfalls (100 frames, passband, EsN0):
+//   C0:-14 C1:-11 C2:-10 C3:-9 C4:-8 C5:-7 C6:-6 C7:-5
+//   C8:-4  C9:-2  C10:-1 C11:+1 C12:+2 C13:+4 C14:+7 C15:+9 C16:+12
 char cl_telecom_system::get_configuration(double SNR)
 {
 	char configuration;
 
-	if(SNR>12.5)
-	{
+	if(SNR>11)
 		configuration=CONFIG_15;
-	}
 	else if(SNR>9)
-	{
 		configuration=CONFIG_14;
-	}
-	else if(SNR>7.5)
-	{
+	else if(SNR>6)
 		configuration=CONFIG_13;
-	}
-	else if(SNR>6.5)
-	{
-		configuration=CONFIG_12;
-	}
 	else if(SNR>4)
-	{
-		configuration=CONFIG_11;
-	}
+		configuration=CONFIG_12;
 	else if(SNR>3)
-	{
+		configuration=CONFIG_11;
+	else if(SNR>1)
 		configuration=CONFIG_10;
-	}
-	else if(SNR>1.5)
-	{
+	else if(SNR>0)
 		configuration=CONFIG_9;
-	}
-	else if(SNR>0.5)
-	{
+	else if(SNR>-2)
 		configuration=CONFIG_8;
-	}
-	else if(SNR>-0.5)
-	{
+	else if(SNR>-3)
 		configuration=CONFIG_7;
-	}
-	else if(SNR>-1.5)
-	{
+	else if(SNR>-4)
 		configuration=CONFIG_6;
-	}
-	else if(SNR>-2.5)
-	{
+	else if(SNR>-5)
 		configuration=CONFIG_5;
-	}
-	else if(SNR>-3.5)
-	{
-		configuration=CONFIG_4;
-	}
-	else if(SNR>-4.5)
-	{
-		configuration=CONFIG_3;
-	}
 	else if(SNR>-6)
-	{
+		configuration=CONFIG_4;
+	else if(SNR>-7)
+		configuration=CONFIG_3;
+	else if(SNR>-8)
 		configuration=CONFIG_2;
-	}
-	else if(SNR>-7.5)
-	{
+	else if(SNR>-9)
 		configuration=CONFIG_1;
-	}
 	else
-	{
 		configuration=CONFIG_0;
-	}
 
 	return configuration;
 }
