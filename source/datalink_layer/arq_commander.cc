@@ -198,6 +198,37 @@ void cl_arq_controller::process_messages_commander()
 			fflush(stdout);
 			switch_narrowband_mode(YES);
 		}
+
+		// "I am Mercury" HAIL phase: fast MFSK beacons replace slow LDPC probes.
+		// Send HAIL, listen for response. Repeat up to max_connection_attempts.
+		// Only proceed to START_CONNECTION after HAIL response detected.
+		if(ack_pattern_time_ms > 0 && hail_detected == NO)
+		{
+			send_hail_pattern();
+			connection_attempts++;
+			printf("[HAIL] Sent beacon %d of %d\n", connection_attempts, max_connection_attempts);
+			fflush(stdout);
+
+			// Listen for response (pattern time + responder turnaround)
+			int listen_ms = 2 * ack_pattern_time_ms + 1500;
+			cl_timer hail_listen;
+			hail_listen.start();
+			while(hail_listen.get_elapsed_time_ms() < listen_ms)
+			{
+				if(receive_hail_pattern())
+				{
+					printf("[HAIL] Response received — peer is Mercury\n");
+					fflush(stdout);
+					hail_detected = YES;
+					break;
+				}
+				msleep(50);
+			}
+
+			if(hail_detected == NO)
+				return; // Retry next cycle (max_connection_attempts check in update_status)
+		}
+
 		add_message_control(START_CONNECTION);
 	}
 	else if(this->link_status==CONNECTION_ACCEPTED)
@@ -877,10 +908,29 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					turboshift_initiator = true;
 					turboshift_phase = TURBO_FORWARD;
 					turboshift_last_good = current_configuration;
-					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-					printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
-					printf("[TURBO] UP: config %d -> %d\n",
-						current_configuration, negotiated_configuration);
+
+					int snr_target = -1;
+					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+					{
+						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+						if(narrowband_enabled == YES && snr_target > NB_CONFIG_MAX)
+							snr_target = NB_CONFIG_MAX;
+					}
+
+					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
+					{
+						negotiated_configuration = snr_target;
+						printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration);
+					}
+					else
+					{
+						negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
+						printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
+						printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n",
+							current_configuration, negotiated_configuration);
+					}
 					fflush(stdout);
 					cleanup();
 					add_message_control(SET_CONFIG);
@@ -1481,9 +1531,29 @@ void cl_arq_controller::process_control_commander()
 					turboshift_initiator = true;
 					turboshift_phase = TURBO_FORWARD;
 					turboshift_last_good = current_configuration;
-					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-					printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
-					printf("[TURBO] UP: config %d -> %d\n", current_configuration, negotiated_configuration);
+
+					// SNR-based supershift: if on OFDM with measured SNR, jump directly
+					int snr_target = -1;
+					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+					{
+						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+						if(narrowband_enabled == YES && snr_target > NB_CONFIG_MAX)
+							snr_target = NB_CONFIG_MAX;
+					}
+
+					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
+					{
+						negotiated_configuration = snr_target;
+						printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration);
+					}
+					else
+					{
+						negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
+						printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
+						printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n", current_configuration, negotiated_configuration);
+					}
 					fflush(stdout);
 					cleanup();
 					add_message_control(SET_CONFIG);
@@ -1532,9 +1602,28 @@ void cl_arq_controller::process_control_commander()
 				turboshift_initiator = true;
 				turboshift_phase = TURBO_FORWARD;
 				turboshift_last_good = current_configuration;
-				negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-				printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
-				printf("[TURBO] UP: config %d -> %d\n", current_configuration, negotiated_configuration);
+
+				int snr_target = -1;
+				if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+				{
+					snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+					if(narrowband_enabled == YES && snr_target > NB_CONFIG_MAX)
+						snr_target = NB_CONFIG_MAX;
+				}
+
+				if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
+				{
+					negotiated_configuration = snr_target;
+					printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
+					printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
+						measurements.SNR_uplink, current_configuration, negotiated_configuration);
+				}
+				else
+				{
+					negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
+					printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
+					printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n", current_configuration, negotiated_configuration);
+				}
 				fflush(stdout);
 				cleanup();
 				add_message_control(SET_CONFIG);
@@ -1554,11 +1643,8 @@ void cl_arq_controller::process_control_commander()
 				this->connection_status=TRANSMITTING_DATA;
 				std::cout<<"end of file acked"<<std::endl;
 			}
-			else if (messages_control.data[0]==BLOCK_END)
-			{
-				finalize_block_commander();
-
-			}
+			// BLOCK_END eliminated — pattern ACK / silence is sole flow control.
+			// finalize_block_commander() called directly after data ACK.
 			else if (messages_control.data[0]==SWITCH_ROLE)
 			{
 				// Asymmetric gearshift: swap forward/reverse for the return path
@@ -1705,9 +1791,30 @@ void cl_arq_controller::process_control_commander()
 					turboshift_retries = 1;  // reset retry for next config
 					if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 					{
-						negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-						printf("[TURBO] UP: config %d -> %d\n",
-							current_configuration, negotiated_configuration);
+						// SNR-based supershift: on OFDM configs, use measured SNR to jump
+						// directly to optimal config instead of blind stepping.
+						int snr_target = -1;
+						if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+						{
+							snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+							// Enforce NB ceiling
+							if(narrowband_enabled == YES && snr_target > NB_CONFIG_MAX)
+								snr_target = NB_CONFIG_MAX;
+						}
+
+						if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
+						{
+							negotiated_configuration = snr_target;
+							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
+								measurements.SNR_uplink, current_configuration, negotiated_configuration);
+						}
+						else
+						{
+							// ROBUST or no SNR: step 3 up the ladder
+							negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
+							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n",
+								current_configuration, negotiated_configuration);
+						}
 						fflush(stdout);
 						cleanup();
 						add_message_control(SET_CONFIG);
@@ -1722,10 +1829,41 @@ void cl_arq_controller::process_control_commander()
 				}
 				else
 				{
-					// Frame gearshift applied — if data fails immediately, BREAK
-					if(data_configuration != prev_configuration)
-						frame_gearshift_just_applied = true;
-					this->connection_status=TRANSMITTING_DATA;
+					// Supershift re-trigger: after a ladder gearshift SET_CONFIG success,
+					// fresh OFDM SNR is available. If it suggests we're far below optimal,
+					// re-enter turboshift to jump ahead (rise fast, fall slow).
+					bool retriggered = false;
+					if(turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
+						is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+					{
+						int snr_ideal = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+						if(narrowband_enabled == YES && snr_ideal > NB_CONFIG_MAX)
+							snr_ideal = NB_CONFIG_MAX;
+						int gap = config_ladder_index(snr_ideal) - config_ladder_index(current_configuration);
+						if(gap >= SUPERSHIFT_RETRIGGER_CONFIGS)
+						{
+							printf("[TURBO] RE-TRIGGER: SNR=%.1f dB suggests config %d (current %d, gap=%d)\n",
+								measurements.SNR_uplink, snr_ideal, current_configuration, gap);
+							fflush(stdout);
+							turboshift_active = true;
+							turboshift_phase = TURBO_FORWARD;
+							turboshift_initiator = true;
+							turboshift_last_good = current_configuration;
+							turboshift_retries = 1;
+							negotiated_configuration = snr_ideal;
+							cleanup();
+							add_message_control(SET_CONFIG);
+							this->connection_status = TRANSMITTING_CONTROL;
+							retriggered = true;
+						}
+					}
+					if(!retriggered)
+					{
+						// Frame gearshift applied — if data fails immediately, BREAK
+						if(data_configuration != prev_configuration)
+							frame_gearshift_just_applied = true;
+						this->connection_status=TRANSMITTING_DATA;
+					}
 				}
 				watchdog_timer.start();
 				link_timer.start();
@@ -1915,18 +2053,11 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==YES && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
-			if(data_batch_size == 1)
-			{
-				// Implicit BLOCK_END for batch_size=1 (MFSK modes): skip the
-				// explicit BLOCK_END frame + ACK round-trip (~10s for MFSK).
-				// Both sides know the block ends after 1 data frame.
-				// Responder auto-flushes data after its Data ACK.
-				finalize_block_commander();
-			}
-			else
-			{
-				add_message_control(BLOCK_END);
-			}
+			// BLOCK_END eliminated: pattern ACK / silence is sole flow control.
+			// Commander finalizes immediately after all data frames ACKed.
+			// Responder flushes data to app after sending pattern ACK.
+			// Downshift on decode failure handled by emergency BREAK (threshold=2).
+			finalize_block_commander();
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{

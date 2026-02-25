@@ -103,6 +103,52 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 
 void cl_arq_controller::process_messages_rx_data_control()
 {
+	// Fast HAIL scanning while LISTENING: use receive_hail_pattern() (~32ms cycles)
+	// instead of slow receive() (multi-second LDPC frame captures).
+	if(link_status == LISTENING && ack_pattern_time_ms > 0 && hail_detected == NO)
+	{
+		// Override large frames_to_read from LISTENING init — HAIL scanning
+		// needs frames_to_read==0 to check the buffer. The audio callback
+		// continuously fills the buffer regardless, so audio is always fresh.
+		if(telecom_system->data_container.frames_to_read > 2)
+		{
+			MUTEX_LOCK(&capture_prep_mutex);
+			telecom_system->data_container.frames_to_read = 2;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+		}
+
+		if(receive_hail_pattern())
+		{
+			printf("[HAIL] 'I am Mercury' beacon detected!\n");
+			fflush(stdout);
+
+			// Notify Winlink/trimode that incoming traffic detected
+			std::string pending_str = "PENDING\r";
+			tcp_socket_control.message->length = pending_str.length();
+			for(int i = 0; i < (int)pending_str.length(); i++)
+				tcp_socket_control.message->buffer[i] = pending_str[i];
+			tcp_socket_control.transmit();
+
+			// Respond with our own HAIL
+			send_hail_pattern();
+			printf("[HAIL] Responded with beacon\n");
+			fflush(stdout);
+
+			hail_detected = YES;
+
+			// Prepare for START_CONNECTION (generous timeout for commander turnaround)
+			set_receiving_timeout(3 * message_transmission_time_ms + 5000);
+			receiving_timer.start();
+			connection_status = RECEIVING;
+
+			// Restore frames_to_read for full LDPC frame capture
+			// (send_hail_pattern leaves ftr=2 which is too short for START_CONNECTION)
+			telecom_system->data_container.frames_to_read =
+				telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+		}
+		return; // Keep scanning (fast cycle) or just responded
+	}
+
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
 	{
 		this->receive();
@@ -129,6 +175,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 			// Wait for SET_CONFIG from commander
 			calculate_receiving_timeout();
 			receiving_timer.start();
+			batch_rx_frame_count = 0;
 			connection_status = RECEIVING;
 			link_timer.start();
 			return;
@@ -186,6 +233,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 					messages_rx_buffer.length);
 				fflush(stdout);
 				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
+				batch_rx_frame_count++;
 				set_receiving_timeout((data_batch_size-messages_rx_buffer.sequence_number-1)*message_transmission_time_ms+time_left_to_send_last_frame+ptt_on_delay_ms);
 				receiving_timer.start();
 			}
@@ -209,6 +257,15 @@ void cl_arq_controller::process_messages_rx_data_control()
 
 		receiving_timer.stop();
 		receiving_timer.reset();
+
+		// If we responded to HAIL but START_CONNECTION never arrived,
+		// go back to HAIL scanning for the next beacon.
+		if(link_status == LISTENING && hail_detected == YES)
+		{
+			printf("[HAIL] Timeout waiting for START_CONNECTION, resuming HAIL scan\n");
+			fflush(stdout);
+			hail_detected = NO;
+		}
 	}
 }
 
@@ -280,6 +337,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 
 		char ack_command = messages_control.data[0];  // Save before potential NB switch
 		messages_control.status=FREE;
+		batch_rx_frame_count = 0;
 		connection_status=RECEIVING;
 		connection_id=assigned_connection_id;
 
@@ -364,10 +422,28 @@ void cl_arq_controller::process_messages_acknowledging_control()
 
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 				{
-					negotiated_configuration = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-					printf("[TURBO] Phase: REVERSE — probing responder->commander\n");
-					printf("[TURBO] UP: config %d -> %d\n",
-						current_configuration, negotiated_configuration);
+					int snr_target = -1;
+					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+					{
+						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+						if(narrowband_enabled == YES && snr_target > NB_CONFIG_MAX)
+							snr_target = NB_CONFIG_MAX;
+					}
+
+					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
+					{
+						negotiated_configuration = snr_target;
+						printf("[TURBO] Phase: REVERSE — probing responder->commander\n");
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration);
+					}
+					else
+					{
+						negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
+						printf("[TURBO] Phase: REVERSE — probing responder->commander\n");
+						printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n",
+							current_configuration, negotiated_configuration);
+					}
 					fflush(stdout);
 					add_message_control(SET_CONFIG);
 					this->connection_status = TRANSMITTING_CONTROL;
@@ -422,6 +498,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			reset_session_state();
 			load_configuration(init_configuration,FULL,YES);
 			this->link_status=LISTENING;
+			batch_rx_frame_count = 0;
 			this->connection_status=RECEIVING;
 			reset_all_timers();
 			// Reset RX state machine - wait for fresh data (prevents decode of self-received TX audio)
@@ -453,6 +530,33 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		// Send ACK tone pattern (universal, all modes)
 		if(repeating_last_ack==NO)
 		{
+			// Gate: require all frames in batch decoded before sending ACK.
+			// Pattern ACK carries no per-frame info — commander marks ALL
+			// pending frames as ACKED. If we only decoded a partial batch,
+			// suppress ACK so commander times out and retransmits.
+			// After 2 consecutive NAcks, emergency BREAK drops config.
+			if(data_batch_size > 1 && batch_rx_frame_count < data_batch_size)
+			{
+				printf("[ACK-GATE] Suppressing ACK: decoded %d/%d frames, waiting for retransmit\n",
+					batch_rx_frame_count, data_batch_size);
+				fflush(stdout);
+				// Free partial messages so retransmit can re-populate slots
+				for(int i=0; i<this->nMessages; i++)
+				{
+					if(messages_rx[i].status==RECEIVED)
+					{
+						messages_rx[i].status=FREE;
+					}
+				}
+				stats.nNAcked_data++;
+				batch_rx_frame_count = 0;
+				// Return to RECEIVING — commander will timeout and retransmit
+				calculate_receiving_timeout();
+				receiving_timer.start();
+				connection_status=RECEIVING;
+				return;
+			}
+
 			// Mark all received messages as ACKED and count for stats
 			for(int i=0; i<this->nMessages; i++)
 			{
@@ -488,17 +592,14 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			if(g_verbose) { printf("[ACK-DATA] ftr=%d (rx_frame=%d)\n", rx_frame, rx_frame); fflush(stdout); }
 		}
 
-		// Implicit BLOCK_END for batch_size=1 (MFSK modes): flush data to
-		// application immediately after Data ACK, skipping the explicit
-		// BLOCK_END frame round-trip. Commander does the same locally.
-		if(data_batch_size == 1)
-		{
-			copy_data_to_buffer();
-			messages_last_ack_bu.type=NONE;
-		}
+		// BLOCK_END eliminated: flush data to application immediately after
+		// sending pattern ACK. Commander finalizes locally in parallel.
+		copy_data_to_buffer();
+		messages_last_ack_bu.type=NONE;
 
 		calculate_receiving_timeout();
 		receiving_timer.start();
+		batch_rx_frame_count = 0;
 		connection_status=RECEIVING;
 	}
 	else
@@ -582,6 +683,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		telecom_system->data_container.frames_to_read =
 			telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
 
+		batch_rx_frame_count = 0;
 		connection_status=RECEIVING;
 	}
 
@@ -772,6 +874,7 @@ void cl_arq_controller::process_control_responder()
 				fflush(stdout);
 				wb_upgrade_pending = false;
 				messages_control.status = FREE;  // Discard so next message can be received
+				batch_rx_frame_count = 0;
 				connection_status = RECEIVING;
 				link_timer.start();
 				watchdog_timer.start();
@@ -812,15 +915,8 @@ void cl_arq_controller::process_control_responder()
 			watchdog_timer.start();
 			gear_shift_timer.start();
 		}
-		else if(code==BLOCK_END)
-		{
-			connection_status=ACKNOWLEDGING_CONTROL;
-			printf("end of block\n");
-			copy_data_to_buffer();
-			messages_last_ack_bu.type=NONE;
-			link_timer.start();
-			watchdog_timer.start();
-		}
+		// BLOCK_END eliminated — data flush now happens after pattern ACK in
+		// process_messages_acknowledging_data(). Commander never sends BLOCK_END.
 		else if(code==FILE_END_)
 		{
 			connection_status=ACKNOWLEDGING_CONTROL;

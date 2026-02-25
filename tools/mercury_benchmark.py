@@ -740,20 +740,30 @@ class VaraSession:
     Signal level is controlled via Windows mixer (not CLI flags).
     """
 
-    def __init__(self, rsp_port=8300, cmd_port=8310, bandwidth='2300'):
+    def __init__(self, rsp_port=8300, cmd_port=8310, bandwidth='2300',
+                 cmd_call='KG7VSN', rsp_call='TESTB'):
         self.rsp_port = rsp_port
         self.cmd_port = cmd_port
         self.bandwidth = bandwidth
+        self.cmd_call = cmd_call
+        self.rsp_call = rsp_call
         self.sockets = []
         self.stop_event = threading.Event()
         self._tx_thread = None
         self._rx_thread = None
+        self._ctrl_thread = None
         self._tx_sock = None
         self._rx_sock = None
         self._cmd_ctrl = None
         self._rx_bytes = 0
         self._rx_lock = threading.Lock()
         self._rx_events = []
+        self._buffer_level = 0
+        self._buffer_lock = threading.Lock()
+        self.BUFFER_HIGH = 4000    # pause TX when VARA buffer exceeds this
+        self.BUFFER_LOW = 2000     # resume TX when buffer drops below this
+        self._connected_event = threading.Event()
+        self._disconnected = False
 
     def start(self, timeout=30):
         """Connect to both VARA instances and set up the link."""
@@ -762,7 +772,7 @@ class VaraSession:
         self.sockets.append(rsp_ctrl)
 
         # Send responder setup commands
-        for cmd in [f"BW{self.bandwidth}\r", "MYCALL TESTB\r", "LISTEN ON\r"]:
+        for cmd in [f"BW{self.bandwidth}\r", f"MYCALL {self.rsp_call}\r", "LISTEN ON\r"]:
             rsp_ctrl.sendall(cmd.encode())
             time.sleep(0.3)
             try:
@@ -784,7 +794,11 @@ class VaraSession:
         rsp_data = tcp_connect_retry(self.rsp_port + 1, timeout=timeout)
         self.sockets.append(rsp_data)
 
-        # Start TX thread (pumps data into commander)
+        # Start control reader thread (tracks BUFFER level from VARA)
+        self._ctrl_thread = threading.Thread(target=self._ctrl_loop, daemon=True)
+        self._ctrl_thread.start()
+
+        # Start TX thread (pumps data into commander, throttled by buffer level)
         self._tx_sock = cmd_data
         self._tx_thread = threading.Thread(target=self._tx_loop, daemon=True)
         self._tx_thread.start()
@@ -796,7 +810,7 @@ class VaraSession:
         self._rx_thread.start()
 
         # Send commander connect command
-        for cmd in [f"BW{self.bandwidth}\r", "CONNECT TESTA TESTB\r"]:
+        for cmd in [f"BW{self.bandwidth}\r", f"CONNECT {self.cmd_call} {self.rsp_call}\r"]:
             cmd_ctrl.sendall(cmd.encode())
             time.sleep(0.3)
             try:
@@ -807,10 +821,51 @@ class VaraSession:
 
         return True
 
-    def _tx_loop(self):
-        chunk = bytes(range(256)) * 4
-        self._tx_sock.settimeout(30)
+    def _ctrl_loop(self):
+        """Read VARA control port, track BUFFER level and connection state."""
+        self._cmd_ctrl.settimeout(2)
+        buf = b''
         while not self.stop_event.is_set():
+            try:
+                data = self._cmd_ctrl.recv(4096)
+                if not data:
+                    break
+                buf += data
+                while b'\r' in buf:
+                    idx = buf.find(b'\r')
+                    line = buf[:idx].decode(errors='replace').strip()
+                    buf = buf[idx+1:]
+                    if line.startswith('BUFFER'):
+                        try:
+                            level = int(line.split()[1])
+                            with self._buffer_lock:
+                                self._buffer_level = level
+                        except (IndexError, ValueError):
+                            pass
+                    elif 'CONNECTED' in line and 'DISCONNECTED' not in line:
+                        self._connected_event.set()
+                    elif 'DISCONNECTED' in line:
+                        self._disconnected = True
+                        self._connected_event.set()  # unblock wait
+            except socket.timeout:
+                continue
+            except (ConnectionError, OSError):
+                break
+
+    def _tx_loop(self):
+        chunk = bytes(range(256)) * 4  # 1024 bytes
+        self._tx_sock.settimeout(30)
+        throttled = False
+        while not self.stop_event.is_set():
+            # Check VARA buffer level — pause if too full
+            with self._buffer_lock:
+                level = self._buffer_level
+            if level > self.BUFFER_HIGH:
+                if not throttled:
+                    throttled = True
+                time.sleep(0.2)
+                continue
+            throttled = False
             try:
                 self._tx_sock.send(chunk)
             except socket.timeout:
@@ -835,27 +890,9 @@ class VaraSession:
                 break
 
     def wait_connected(self, timeout=120):
-        """Wait for CONNECTED status on commander control port."""
-        self._cmd_ctrl.settimeout(2)
-        start = time.time()
-        buf = b''
-        while time.time() - start < timeout:
-            try:
-                data = self._cmd_ctrl.recv(4096)
-                if data:
-                    buf += data
-                    while b'\r' in buf:
-                        idx = buf.find(b'\r')
-                        line = buf[:idx]
-                        buf = buf[idx+1:]
-                        if b'CONNECTED' in line and b'DISCONNECTED' not in line:
-                            return True
-                        if b'DISCONNECTED' in line:
-                            return False
-            except socket.timeout:
-                continue
-            except ConnectionError:
-                return False
+        """Wait for CONNECTED status (tracked by _ctrl_loop)."""
+        if self._connected_event.wait(timeout=timeout):
+            return not self._disconnected
         return False
 
     def measure_throughput(self, duration_s):
@@ -3095,7 +3132,8 @@ def run_vara_sweep(args):
     noise.start()
 
     session = VaraSession(rsp_port=args.rsp_port, cmd_port=args.cmd_port,
-                           bandwidth=bw)
+                           bandwidth=bw,
+                           cmd_call=args.cmd_call, rsp_call=args.rsp_call)
     results = []
     fieldnames = ['snr_db', 'direction', 'rx_bytes', 'duration_s',
                   'throughput_bps', 'bytes_per_min']
@@ -3455,6 +3493,10 @@ def main():
                         help='Recovery time between SNR points (seconds)')
     p_vara.add_argument('--no-round-trip', action='store_true',
                         help='Skip the sweep back up')
+    p_vara.add_argument('--cmd-call', default='KG7VSN',
+                        help='Commander callsign (default: KG7VSN)')
+    p_vara.add_argument('--rsp-call', default='TESTB',
+                        help='Responder callsign (default: TESTB)')
 
     # compare
     p_compare = sub.add_parser('compare',

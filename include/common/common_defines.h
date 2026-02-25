@@ -67,22 +67,19 @@ extern int g_verbose;
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
-// NB mode cap — raised to CONFIG_15 for empirical testing.
-// Original cap was CONFIG_6 (BPSK rate 8/16); CONFIG_7+ use QPSK/QAM which may
-// need more pilot density than Nc=10 provides. Testing will reveal actual ceiling.
-#define NB_CONFIG_MAX CONFIG_15
+// NB mode cap — CONFIG_16 reachable in NB (ZF estimator handles sparse pilots).
+// WB cap stays at CONFIG_15 (CONFIG_16's 32QAM + 1 preamble + LS = poor WB estimation).
+#define NB_CONFIG_MAX CONFIG_16
 
 // Unified config ladder for gearshift (ROBUST → OFDM)
-// Used when robust_enabled + gearshift: ROBUST_0 → ROBUST_1 → ROBUST_2 → CONFIG_0 → ... → CONFIG_15
-// CONFIG_16 (32QAM rate 14/16, 1 preamble) excluded: poor channel estimation makes it
-// strictly worse than CONFIG_15 at all tested SNRs (10k vs 19k B/min at +30 dB).
+// CONFIG_16 included for NB; WB ceiling (CONFIG_15) enforced in config_ladder_up().
 static const int FULL_CONFIG_LADDER[] = {
 	ROBUST_0, ROBUST_1, ROBUST_2,
 	CONFIG_0, CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4, CONFIG_5, CONFIG_6,
 	CONFIG_7, CONFIG_8, CONFIG_9, CONFIG_10, CONFIG_11, CONFIG_12,
-	CONFIG_13, CONFIG_14, CONFIG_15
+	CONFIG_13, CONFIG_14, CONFIG_15, CONFIG_16
 };
-static const int FULL_CONFIG_LADDER_SIZE = 19;
+static const int FULL_CONFIG_LADDER_SIZE = 20;
 
 inline int config_ladder_index(int config) {
 	for (int i = 0; i < FULL_CONFIG_LADDER_SIZE; i++) {
@@ -102,6 +99,22 @@ inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = f
 	if (next_idx >= FULL_CONFIG_LADDER_SIZE) return config;
 	int next = FULL_CONFIG_LADDER[next_idx];
 	if (narrowband && is_ofdm_config(next) && next > NB_CONFIG_MAX) return config;
+	return next;
+}
+
+inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool narrowband = false) {
+	int ceiling = narrowband ? NB_CONFIG_MAX : CONFIG_15;
+	if (!robust_enabled) {
+		int target = config + steps;
+		return (target < ceiling) ? target : ceiling;
+	}
+	int idx = config_ladder_index(config);
+	if (idx < 0) return config;
+	int next_idx = idx + steps;
+	if (next_idx >= FULL_CONFIG_LADDER_SIZE) next_idx = FULL_CONFIG_LADDER_SIZE - 1;
+	int next = FULL_CONFIG_LADDER[next_idx];
+	if (narrowband && is_ofdm_config(next) && next > NB_CONFIG_MAX)
+		return NB_CONFIG_MAX;
 	return next;
 }
 
@@ -231,6 +244,14 @@ CONFIG_16 (5664.7 bps).
 // #define NO_GEAR_SHIFT_LADDER 2
 // #define NO_GEAR_SHIFT_SNR 3
 
+// SNR-based supershift margin: subtract this from measured SNR before config lookup.
+// Lands ~2 configs below the edge for reliable first probe; slow ladder closes the gap.
+#define SUPERSHIFT_MARGIN_DB 3.0
+
+// Re-trigger supershift if measured SNR suggests we're this many configs below optimal.
+// Checked after each ladder gearshift SET_CONFIG success (fresh OFDM SNR available).
+#define SUPERSHIFT_RETRIGGER_CONFIGS 3
+
 #define YES 1
 #define NO 0
 
@@ -254,7 +275,7 @@ inline const char* config_to_string(int config) {
 		case CONFIG_10: return "CONFIG 10 (8PSK 6/16, ~1354 bps)";
 		case CONFIG_11: return "CONFIG 11 (8PSK 8/16, ~1818 bps)";
 		case CONFIG_12: return "CONFIG 12 (QPSK 14/16, ~2655 bps)";
-		case CONFIG_13: return "CONFIG 13 (16QAM 8/16, ~2882 bps)";
+		case CONFIG_13: return "CONFIG 13 (8PSK 12/16, ~2882 bps)";
 		case CONFIG_14: return "CONFIG 14 (8PSK 14/16, ~3390 bps)";
 		case CONFIG_15: return "CONFIG 15 (16QAM 14/16, ~5088 bps)";
 		case CONFIG_16: return "CONFIG 16 (32QAM 14/16, ~5665 bps)";
@@ -295,7 +316,7 @@ inline const char* config_to_short_string(int config) {
 		case CONFIG_10: return "CFG 10 8PSK";
 		case CONFIG_11: return "CFG 11 8PSK";
 		case CONFIG_12: return "CFG 12 QPSK";
-		case CONFIG_13: return "CFG 13 16QAM";
+		case CONFIG_13: return "CFG 13 8PSK";
 		case CONFIG_14: return "CFG 14 8PSK";
 		case CONFIG_15: return "CFG 15 16QAM";
 		case CONFIG_16: return "CFG 16 32QAM";
@@ -323,7 +344,7 @@ inline const char* config_to_short_string_nb(int config, bool narrowband) {
 		case CONFIG_10: return "NB C10 8PSK";
 		case CONFIG_11: return "NB C11 8PSK";
 		case CONFIG_12: return "NB C12 QPSK";
-		case CONFIG_13: return "NB C13 16QAM";
+		case CONFIG_13: return "NB C13 8PSK";
 		case CONFIG_14: return "NB C14 8PSK";
 		case CONFIG_15: return "NB C15 16QAM";
 		case CONFIG_16: return "NB C16 32QAM";

@@ -706,13 +706,23 @@ start_modem:
         // Robust mode: CLI -R or INI setting enables MFSK hailing
 #ifdef MERCURY_GUI_ENABLED
         ARQ.robust_enabled = (g_settings.robust_mode_enabled || robust_mode) ? YES : NO;
-        ARQ.narrowband_enabled = YES;  // Always start NB; bandwidth_mode controls WB upgrade
         ARQ.bandwidth_mode = g_settings.bandwidth_mode;
+        // -Q 0 with auto mode: skip NB start, go directly to WB.
+        // Both sides are controlled (benchmark/test), no NB probe needed.
+        if (nb_probe_max == 0 && ARQ.bandwidth_mode == BW_AUTO)
+            ARQ.narrowband_enabled = NO;
+        else
+            ARQ.narrowband_enabled = YES;  // Normal: start NB, negotiate WB via probe
         ARQ.local_capability = (ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
 #else
         ARQ.robust_enabled = robust_mode ? YES : NO;
-        ARQ.narrowband_enabled = YES;  // Always start NB; bandwidth_mode controls WB upgrade
         ARQ.bandwidth_mode = (bandwidth_mode_cli >= 0) ? bandwidth_mode_cli : BW_AUTO;
+        // -Q 0 with auto mode: skip NB start, go directly to WB.
+        // Both sides are controlled (benchmark/test), no NB probe needed.
+        if (nb_probe_max == 0 && ARQ.bandwidth_mode == BW_AUTO)
+            ARQ.narrowband_enabled = NO;
+        else
+            ARQ.narrowband_enabled = YES;  // Normal: start NB, negotiate WB via probe
         ARQ.local_capability = (ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0;
 #endif
         telecom_system.narrowband_enabled = ARQ.narrowband_enabled;

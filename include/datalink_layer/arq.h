@@ -226,6 +226,8 @@ public:
   void send_ack_pattern();   // Level 3: TX short tone pattern instead of LDPC ACK
   bool receive_ack_pattern(); // Level 3: RX + detect ACK pattern, returns true if detected
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
+  void send_hail_pattern();    // TX "I am Mercury" beacon
+  bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
   void process_messages_rx_acks_control();
   void process_messages_rx_acks_data();
   void process_control_commander();
@@ -288,6 +290,7 @@ public:
   int data_batch_size;
   int control_batch_size;
   int ack_batch_size;
+  int batch_rx_frame_count;  // Total data frames decoded in current RX batch (including padding duplicates)
   int block_ready;
   int block_under_tx;
   int max_message_length;
@@ -391,6 +394,8 @@ public:
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int break_detected;             // YES if BREAK pattern detected by responder
+  int hail_detected;              // YES if HAIL beacon detected (responder LISTENING)
+  int hail_sent;                  // YES if commander has sent HAIL in current CONNECTING phase
 
   int ptt_on_delay_ms;
   int ptt_off_delay_ms;
