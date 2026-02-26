@@ -98,7 +98,7 @@ inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = f
 	int next_idx = idx + 1;
 	if (next_idx >= FULL_CONFIG_LADDER_SIZE) return config;
 	int next = FULL_CONFIG_LADDER[next_idx];
-	if (narrowband && is_ofdm_config(next) && next > NB_CONFIG_MAX) return config;
+	if (is_ofdm_config(next) && next > ceiling) return config;
 	return next;
 }
 
@@ -113,8 +113,8 @@ inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool n
 	int next_idx = idx + steps;
 	if (next_idx >= FULL_CONFIG_LADDER_SIZE) next_idx = FULL_CONFIG_LADDER_SIZE - 1;
 	int next = FULL_CONFIG_LADDER[next_idx];
-	if (narrowband && is_ofdm_config(next) && next > NB_CONFIG_MAX)
-		return NB_CONFIG_MAX;
+	if (is_ofdm_config(next) && next > ceiling)
+		return ceiling;
 	return next;
 }
 
@@ -139,7 +139,10 @@ inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
 }
 
 inline bool config_is_at_top(int config, bool robust_enabled, bool narrowband = false) {
-	if (narrowband && is_ofdm_config(config)) return config >= NB_CONFIG_MAX;
+	if (is_ofdm_config(config)) {
+		int ceiling = narrowband ? NB_CONFIG_MAX : CONFIG_15;
+		return config >= ceiling;
+	}
 	if (!robust_enabled) return config == CONFIG_15;
 	return config_ladder_index(config) == FULL_CONFIG_LADDER_SIZE - 1;
 }

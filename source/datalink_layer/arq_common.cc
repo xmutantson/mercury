@@ -626,7 +626,11 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	{
 		if(level==FULL)
 		{
+			printf("[CFG] CONFIG_NONE path: deinit_messages_buffers\n");
+			fflush(stdout);
 			this->deinit_messages_buffers();
+			printf("[CFG] CONFIG_NONE path: deinit_messages_buffers done\n");
+			fflush(stdout);
 		}
 		if(backup_configuration==YES)
 		{
@@ -646,7 +650,12 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// telecom_system->load_configuration may deinit/reinit buffers that
 	// the audio callback accesses (passband_delayed_data, etc.)
 	telecom_system->data_container.frames_to_read = 0;
+	printf("[CFG] Calling telecom_system->load_configuration(%d) nb=%d\n",
+		configuration, telecom_system->narrowband_enabled);
+	fflush(stdout);
 	telecom_system->load_configuration(configuration);
+	printf("[CFG] telecom_system->load_configuration done\n");
+	fflush(stdout);
 
 	// Note: after config switch (e.g. MFSK→OFDM), the zeroed buffer may still
 	// receive stale audio from VB-Cable's internal buffer (~7 symbols). This can
@@ -811,7 +820,11 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 
 	if(level==FULL)
 	{
+		printf("[CFG] init_messages_buffers (nMessages=%d)\n", nMessages);
+		fflush(stdout);
 		this->init_messages_buffers();
+		printf("[CFG] init_messages_buffers done\n");
+		fflush(stdout);
 	}
 }
 
@@ -2170,8 +2183,15 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 {
 	if(narrowband_enabled == nb_enabled)
 		return;
-	printf("[NB-NEG] Switching to %s mode\n", nb_enabled ? "narrowband" : "wideband");
+	printf("[NB-SWITCH] Switching to %s mode (init_config=%d, cur_config=%d)\n",
+		nb_enabled ? "narrowband" : "wideband", init_configuration, current_configuration);
 	fflush(stdout);
+
+	// Pause audio processing before the switch: set data_ready=0 so the
+	// processing thread won't start a new receive() cycle, and stop the
+	// capture_prep thread from accumulating nUnder during the transition.
+	telecom_system->data_container.data_ready = 0;
+
 	narrowband_enabled = nb_enabled;
 	telecom_system->narrowband_enabled = nb_enabled;
 	// Force reload by clearing current config on BOTH ARQ and PHY
@@ -2179,7 +2199,14 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 	// even though narrowband_enabled changed the physical parameters)
 	current_configuration = CONFIG_NONE;
 	telecom_system->current_configuration = CONFIG_NONE;
+
+	printf("[NB-SWITCH] Calling load_configuration(%d, FULL, YES)\n", init_configuration);
+	fflush(stdout);
 	load_configuration(init_configuration, FULL, YES);
+	printf("[NB-SWITCH] load_configuration complete, cur_config=%d Nc=%d Nsymb=%d Nofdm=%d\n",
+		current_configuration, telecom_system->ofdm.Nc,
+		telecom_system->ofdm.Nsymb, telecom_system->data_container.Nofdm);
+	fflush(stdout);
 }
 
 
