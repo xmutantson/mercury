@@ -150,6 +150,7 @@ cl_arq_controller::cl_arq_controller()
 	peer_capability=0;
 	wb_upgrade_pending=false;
 	compression_enabled=false;
+	compress_ratio_estimate=2.0f;
 	gear_shift_algorithm=SUCCESS_BASED_LADDER;
 
 	gear_shift_up_success_rate_precentage=70;
@@ -1487,6 +1488,7 @@ void cl_arq_controller::update_status()
 						+ telecom_system->data_container.Nsymb;
 					telecom_system->data_container.nUnder_processing_events = 0;
 					telecom_system->receive_stats.mfsk_search_raw = 0;
+					telecom_system->receive_stats.ofdm_search_raw = 0;
 				}
 				else
 				{
@@ -1625,7 +1627,10 @@ void cl_arq_controller::cleanup()
 
 void cl_arq_controller::pad_messages_batch_tx(int size)
 {
-	int counter=0;
+	// Start from last unique message so it gets a duplicate first,
+	// then wrap to 0. With 12 unique + 11 dups: IDs 0-9,11 get 2 copies,
+	// only ID 10 has 1 copy (less critical than ID 0 header or last frame).
+	int counter = (message_batch_counter_tx > 0) ? message_batch_counter_tx - 1 : 0;
 	if(message_batch_counter_tx!=0 && message_batch_counter_tx<size)
 	{
 		for(int i=0;i<size-message_batch_counter_tx;i++)
@@ -1720,34 +1725,41 @@ void cl_arq_controller::process_main()
 		{
 			tcp_socket_data.timer.start();
 		}
-		int nBytes_received=tcp_socket_data.receive();
-		if(nBytes_received>0)
+		// Only receive from TCP if FIFO has room for the max recv size.
+		// Otherwise data pulled from the socket would be silently dropped
+		// by push() (returns 0 when full). Leaving data in the TCP socket
+		// buffer creates natural backpressure to the sender.
+		if(fifo_buffer_tx.get_free_size() >= MAX_BUFFER_SIZE)
 		{
-			tcp_socket_data.timer.start();
-			fifo_buffer_tx.push(tcp_socket_data.message->buffer, tcp_socket_data.message->length);
-
-			std::string str="BUFFER ";
-			str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
-			str+='\r';
-			for(long unsigned int i=0;i<str.length();i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.message->length=str.length();
-			tcp_socket_control.transmit();
-		}
-		else if(nBytes_received==0 || (tcp_socket_data.timer.get_elapsed_time_ms()>=tcp_socket_data.timeout_ms && tcp_socket_data.timeout_ms!=INFINITE_))
-		{
-
-			fifo_buffer_tx.flush();
-			fifo_buffer_backup.flush();
-			fifo_buffer_rx.flush();
-
-			tcp_socket_data.check_incomming_connection();
-
-			if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
+			int nBytes_received=tcp_socket_data.receive();
+			if(nBytes_received>0)
 			{
 				tcp_socket_data.timer.start();
+				fifo_buffer_tx.push(tcp_socket_data.message->buffer, tcp_socket_data.message->length);
+
+				std::string str="BUFFER ";
+				str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
+				str+='\r';
+				for(long unsigned int i=0;i<str.length();i++)
+				{
+					tcp_socket_control.message->buffer[i]=str[i];
+				}
+				tcp_socket_control.message->length=str.length();
+				tcp_socket_control.transmit();
+			}
+			else if(nBytes_received==0 || (tcp_socket_data.timer.get_elapsed_time_ms()>=tcp_socket_data.timeout_ms && tcp_socket_data.timeout_ms!=INFINITE_))
+			{
+
+				fifo_buffer_tx.flush();
+				fifo_buffer_backup.flush();
+				fifo_buffer_rx.flush();
+
+				tcp_socket_data.check_incomming_connection();
+
+				if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
+				{
+					tcp_socket_data.timer.start();
+				}
 			}
 		}
 
@@ -2282,6 +2294,7 @@ void cl_arq_controller::send_batch()
 	telecom_system->data_container.nUnder_processing_events = 0;
 	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
 	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
 
 	ptt_on();
 
@@ -2609,6 +2622,7 @@ void cl_arq_controller::send_ack_pattern()
 	telecom_system->data_container.nUnder_processing_events = 0;
 	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
 	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
 	// After flush, set ftr = rx_frame so we wait just long enough for one
 	// frame worth of audio to accumulate. If the other side hasn't started TX
 	// yet (turnaround delay), a quick anti-spin FAIL (~5ms, empty buffer) and
@@ -2711,6 +2725,7 @@ void cl_arq_controller::send_break_pattern()
 	telecom_system->data_container.nUnder_processing_events = 0;
 	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
 	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
 	{
 		int frame_symb = telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
 		telecom_system->data_container.frames_to_read =
@@ -2810,6 +2825,7 @@ void cl_arq_controller::send_hail_pattern()
 	telecom_system->data_container.nUnder_processing_events = 0;
 	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
 	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
 	// Short ftr for fast HAIL response scanning (not a full LDPC frame).
 	// The listen loop polls receive_hail_pattern() which needs ftr==0.
 	telecom_system->data_container.frames_to_read = 2;
@@ -2853,6 +2869,7 @@ bool cl_arq_controller::receive_hail_pattern()
 				telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
 			telecom_system->data_container.nUnder_processing_events = 0;
 			telecom_system->receive_stats.mfsk_search_raw = 0;
+			telecom_system->receive_stats.ofdm_search_raw = 0;
 			MUTEX_UNLOCK(&capture_prep_mutex);
 			return true;
 		}
@@ -2914,6 +2931,7 @@ bool cl_arq_controller::receive_ack_pattern()
 				telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
 			telecom_system->data_container.nUnder_processing_events = 0;
 			telecom_system->receive_stats.mfsk_search_raw = 0;
+			telecom_system->receive_stats.ofdm_search_raw = 0;
 			MUTEX_UNLOCK(&capture_prep_mutex);
 			return true;
 		}
@@ -3027,9 +3045,11 @@ void cl_arq_controller::receive()
 			{
 				int nrd = telecom_system->data_container.nBits - telecom_system->ldpc.P;
 				int fs = (nrd - 16) / 8;  // frame_size with CRC16
-				printf("[RX-DECODE#%d] OK: delay=%d iters=%d Nsymb=%d nBits=%d frame_size=%d bytes: %02x %02x %02x %02x %02x %02x\n",
+				printf("[RX-DECODE#%d] OK: delay=%d iters=%d ofdm_raw=%d ftr=%d nUnder=%d bytes: %02x %02x %02x %02x %02x %02x\n",
 					decode_attempt, received_message_stats.delay, received_message_stats.iterations_done,
-					telecom_system->data_container.Nsymb, telecom_system->data_container.nBits, fs,
+					telecom_system->receive_stats.ofdm_search_raw,
+					telecom_system->data_container.frames_to_read.load(),
+					telecom_system->data_container.nUnder_processing_events.load(),
 					telecom_system->data_container.data_byte[0] & 0xFF,
 					telecom_system->data_container.data_byte[1] & 0xFF,
 					telecom_system->data_container.data_byte[2] & 0xFF,
@@ -3040,15 +3060,17 @@ void cl_arq_controller::receive()
 			else
 			{
 				if(received_message_stats.delay == -1)
-					printf("[RX-DECODE#%d] NO-PREAMBLE: search_raw=%d nUnder=%d link=%d\n",
+					printf("[RX-DECODE#%d] NO-PREAMBLE: mfsk_raw=%d ofdm_raw=%d nUnder=%d link=%d\n",
 						decode_attempt,
 						telecom_system->receive_stats.mfsk_search_raw,
+						telecom_system->receive_stats.ofdm_search_raw,
 						telecom_system->data_container.nUnder_processing_events.load(),
 						(int)link_status);
 				else
-					printf("[RX-DECODE#%d] FAIL: delay=%d search_raw=%d nUnder=%d link=%d conn=%d\n",
+					printf("[RX-DECODE#%d] FAIL: delay=%d metric=%.3f ofdm_raw=%d nUnder=%d link=%d conn=%d\n",
 						decode_attempt, received_message_stats.delay,
-						telecom_system->receive_stats.mfsk_search_raw,
+						telecom_system->receive_stats.coarse_metric,
+						telecom_system->receive_stats.ofdm_search_raw,
 						telecom_system->data_container.nUnder_processing_events.load(),
 						(int)link_status, (int)connection_status);
 			}
@@ -3065,13 +3087,25 @@ void cl_arq_controller::receive()
 				frames_left_in_buffer=0;
 
 			int nUnder_snapshot = telecom_system->data_container.nUnder_processing_events.load();
-			telecom_system->data_container.frames_to_read=rx_frame-frames_left_in_buffer-nUnder_snapshot;
+			// Only subtract nUnder when there's buffer margin to absorb it.
+			// When frames_left <= nUnder, subtracting causes ftr < rx_frame,
+			// which means the next frame drifts 1+ symbols higher per decode.
+			// Eventually the preamble lands beyond upper_bound and can't decode.
+			int nUnder_adj = (frames_left_in_buffer > nUnder_snapshot) ? nUnder_snapshot : 0;
+			telecom_system->data_container.frames_to_read=rx_frame-frames_left_in_buffer-nUnder_adj;
 
 			int ftr_clamped = 0;
-			if(telecom_system->data_container.frames_to_read > rx_frame || telecom_system->data_container.frames_to_read<0)
+			if(telecom_system->data_container.frames_to_read < 0)
 			{
-				telecom_system->data_container.frames_to_read = rx_frame-frames_left_in_buffer;
+				// Buffer already has enough data for the next frame — decode immediately.
+				// ofdm_search_raw / mfsk_search_raw will skip past the just-decoded frame.
+				telecom_system->data_container.frames_to_read = 0;
 				ftr_clamped = 1;
+			}
+			else if(telecom_system->data_container.frames_to_read > rx_frame)
+			{
+				telecom_system->data_container.frames_to_read = rx_frame;
+				ftr_clamped = 2;
 			}
 
 			if (g_verbose)
@@ -3090,7 +3124,27 @@ void cl_arq_controller::receive()
 			if(telecom_system->M == MOD_MFSK)
 			{
 				int frame_end_symb = received_message_stats.delay / symbol_period + rx_frame;
-				telecom_system->receive_stats.mfsk_search_raw = frame_end_symb - telecom_system->data_container.frames_to_read;
+				telecom_system->receive_stats.mfsk_search_raw =
+					frame_end_symb - telecom_system->data_container.frames_to_read;
+			}
+			else
+			{
+				// OFDM anti-re-decode: record frame end so next Schmidl-Cox
+				// search skips past this decoded preamble.
+				// -1 margin: effective = frame_end - ftr - 1 - nUnder. Catches
+				// frames that land 1 symbol below the expected position. SC may
+				// find false peaks in old frame body, but the in-bounds FAIL
+				// handler (ftr=2 + search_raw tracking) recovers efficiently.
+				int frame_end_symb = received_message_stats.delay / symbol_period + rx_frame;
+				telecom_system->receive_stats.ofdm_search_raw =
+					frame_end_symb - telecom_system->data_container.frames_to_read - 1;
+				if(telecom_system->receive_stats.ofdm_search_raw < 0)
+					telecom_system->receive_stats.ofdm_search_raw = 0;
+
+				printf("[OFDM-SKIP] frame_end=%d ftr=%d search_raw=%d clamped=%d\n",
+					frame_end_symb, telecom_system->data_container.frames_to_read.load(),
+					telecom_system->receive_stats.ofdm_search_raw, ftr_clamped);
+				fflush(stdout);
 			}
 
 			telecom_system->receive_stats.delay_of_last_decoded_message += (rx_frame - (telecom_system->data_container.frames_to_read + telecom_system->data_container.nUnder_processing_events)) * symbol_period;
@@ -3293,16 +3347,57 @@ void cl_arq_controller::receive()
 						+ telecom_system->data_container.preamble_nSymb;
 					int upper = telecom_system->data_container.buffer_Nsymb - frame_symb;
 
-					if(pream_symb > upper
-						&& telecom_system->receive_stats.coarse_metric >= 0.5)
+					if(pream_symb > upper)
 					{
-						ftr = pream_symb - upper + 2;  // +2 margin
-						printf("[RX-TIMING] OFDM fast-forward: pream=%d upper=%d shift=%d\n",
-							pream_symb, upper, ftr);
+						if(telecom_system->receive_stats.coarse_metric >= 0.5)
+						{
+							// Beyond-bounds with meaningful metric: fast-forward
+							// to bring the preamble within bounds in one shift.
+							ftr = pream_symb - upper + 2;  // +2 margin
+						}
+						else
+						{
+							// Very low metric beyond bounds: noise/false peak.
+							// Minimal shift to avoid pushing real frame out of reach.
+							ftr = 2;
+						}
+						// Track buffer shift: reduce search_raw by ftr so the
+						// anti-re-decode skip stays aligned with frame positions.
+						telecom_system->receive_stats.ofdm_search_raw -= ftr;
+						if(telecom_system->receive_stats.ofdm_search_raw < 0)
+							telecom_system->receive_stats.ofdm_search_raw = 0;
+						printf("[RX-TIMING] OFDM beyond-bounds: pream=%d upper=%d metric=%.3f shift=%d search_raw=%d\n",
+							pream_symb, upper,
+							telecom_system->receive_stats.coarse_metric,
+							ftr,
+							telecom_system->receive_stats.ofdm_search_raw);
 						fflush(stdout);
+					}
+					else if(telecom_system->receive_stats.ofdm_search_raw > 0)
+					{
+						// In-bounds FAIL with batch search active. Use minimal shift
+						// and track the buffer movement to avoid skipping the real
+						// next preamble. On VB-Cable, in-bounds FAILs with high metric
+						// (0.88+) are false SC peaks in the old frame body — data
+						// symbols have GI correlation that looks like a preamble.
+						ftr = 2;
+						telecom_system->receive_stats.ofdm_search_raw -= ftr;
+						if(telecom_system->receive_stats.ofdm_search_raw < 0)
+							telecom_system->receive_stats.ofdm_search_raw = 0;
 					}
 				}
 
+				if(telecom_system->receive_stats.ofdm_search_raw > 0)
+				{
+					// Preserve effective search position: ofdm_search_raw - nUnder.
+					// Resetting nUnder to 0 without adjusting search_raw would make
+					// the effective position jump forward by nUnder symbols, skipping
+					// valid preambles.
+					int nUnder_snap = telecom_system->data_container.nUnder_processing_events.load();
+					telecom_system->receive_stats.ofdm_search_raw -= nUnder_snap;
+					if(telecom_system->receive_stats.ofdm_search_raw < 0)
+						telecom_system->receive_stats.ofdm_search_raw = 0;
+				}
 				telecom_system->data_container.frames_to_read = ftr;
 				telecom_system->data_container.nUnder_processing_events = 0;
 			}
@@ -3335,10 +3430,37 @@ void cl_arq_controller::receive()
 				}
 				else
 				{
-					// No signal — small shift, poll again quickly
+					// No signal — small shift, poll again quickly.
+					// Preserve effective mfsk_search_raw position.
+					int nUnder_snap = telecom_system->data_container.nUnder_processing_events.load();
+					telecom_system->receive_stats.mfsk_search_raw -= nUnder_snap;
+					if(telecom_system->receive_stats.mfsk_search_raw < 0)
+						telecom_system->receive_stats.mfsk_search_raw = 0;
 					telecom_system->data_container.frames_to_read = 8;
 					telecom_system->data_container.nUnder_processing_events = 0;
 				}
+			}
+
+			// OFDM anti-spin: on FAIL with structured signal (preamble found but
+			// LDPC failed), skip past the detected preamble to avoid re-finding it.
+			// Same pattern as MFSK anti-spin above.
+			if(telecom_system->M != MOD_MFSK
+				&& telecom_system->data_container.frames_to_read == 0
+				&& received_message_stats.delay >= 0)
+			{
+				int rx_frame = telecom_system->get_active_nsymb()
+					+ telecom_system->data_container.preamble_nSymb;
+				telecom_system->data_container.frames_to_read = rx_frame;
+				telecom_system->data_container.nUnder_processing_events = 0;
+				int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
+				telecom_system->receive_stats.ofdm_search_raw = buf_nsymb - rx_frame;
+				if(telecom_system->receive_stats.ofdm_search_raw < 0)
+					telecom_system->receive_stats.ofdm_search_raw = 0;
+			}
+			else if(telecom_system->M != MOD_MFSK && received_message_stats.delay >= 0)
+			{
+				// OFDM anti-spin SKIP: ftr != 0, so anti-spin doesn't apply.
+				// Frame will be shifted out naturally via ftr countdown.
 			}
 
 			if(telecom_system->data_container.frames_to_read==0 && telecom_system->receive_stats.delay_of_last_decoded_message!=-1)
@@ -3364,46 +3486,151 @@ void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
 	int total_bytes = 0;
-	char decompress_buf[512];  // Temp buffer for decompressed output
 
-	for(int i=0;i<this->nMessages;i++)
+	if(compression_enabled)
 	{
-		if(messages_rx[i].status==ACKED)
+		// --- Batch-level decompression ---
+		// Reassemble ACKED frames from current batch into one contiguous buffer,
+		// then decompress as a single block.
+		// IMPORTANT: Only iterate data_batch_size slots (not nMessages) to avoid
+		// including stale ACKED data from previous batches in higher-numbered slots.
+		char assembled[16384];
+		int assembled_size = 0;
+
+		for(int i=0;i<this->data_batch_size;i++)
 		{
-			if(compression_enabled && messages_rx[i].length >= COMPRESS_HEADER_SIZE)
+			if(messages_rx[i].status==ACKED)
 			{
-				int dec_size = compressor.decompress_block(
-					messages_rx[i].data, messages_rx[i].length,
-					decompress_buf, (int)sizeof(decompress_buf));
-				if(dec_size > 0)
+				if(assembled_size + messages_rx[i].length <= (int)sizeof(assembled))
 				{
-					fifo_buffer_rx.push(decompress_buf, dec_size);
-					total_bytes += dec_size;
+					memcpy(assembled + assembled_size,
+						messages_rx[i].data, messages_rx[i].length);
+					assembled_size += messages_rx[i].length;
 				}
-				else
-				{
-					// Decompression error — push raw as fallback
-					printf("[DECOMPRESS] Error on message %d, pushing raw %d bytes\n",
-						i, messages_rx[i].length);
-					fflush(stdout);
-					fifo_buffer_rx.push(messages_rx[i].data, messages_rx[i].length);
-					total_bytes += messages_rx[i].length;
-				}
+				messages_rx[i].status=FREE;
+				copied++;
 			}
 			else
 			{
+				messages_rx[i].status=FREE;
+			}
+		}
+		// Clear any stale slots beyond batch boundary
+		for(int i=this->data_batch_size;i<this->nMessages;i++)
+			messages_rx[i].status=FREE;
+
+		if(assembled_size >= COMPRESS_HEADER_SIZE)
+		{
+
+			char decomp_buf[COMPRESS_WORKSPACE_SIZE];
+			int dec_size = compressor.decompress_block(
+				assembled, assembled_size,
+				decomp_buf, (int)sizeof(decomp_buf));
+			if(dec_size > 0)
+			{
+				fifo_buffer_rx.push(decomp_buf, dec_size);
+				total_bytes += dec_size;
+			}
+			else
+			{
+				// Decompression error — push assembled raw as fallback
+				const unsigned char* ehdr = (const unsigned char*)assembled;
+				printf("[DECOMPRESS] Batch error (assembled %d bytes, hdr: algo=%d comp=%d orig=%d), pushing raw\n",
+					assembled_size, (int)ehdr[0],
+					(int)(ehdr[1] | (ehdr[2] << 8)),
+					(int)(ehdr[3] | (ehdr[4] << 8)));
+				fflush(stdout);
+				fifo_buffer_rx.push(assembled, assembled_size);
+				total_bytes += assembled_size;
+			}
+		}
+		else if(assembled_size > 0)
+		{
+			// Too small for compression header — push raw
+			fifo_buffer_rx.push(assembled, assembled_size);
+			total_bytes += assembled_size;
+		}
+	}
+	else
+	{
+		// --- No compression: original per-message push ---
+		// Only iterate data_batch_size slots for current batch
+		for(int i=0;i<this->data_batch_size;i++)
+		{
+			if(messages_rx[i].status==ACKED)
+			{
 				fifo_buffer_rx.push(messages_rx[i].data, messages_rx[i].length);
 				total_bytes += messages_rx[i].length;
+				messages_rx[i].status=FREE;
+				copied++;
 			}
-			messages_rx[i].status=FREE;
-			copied++;
+			else if(messages_rx[i].status!=FREE)
+			{
+				messages_rx[i].status=FREE;
+			}
 		}
-		else if(messages_rx[i].status!=FREE)
+		// Clear stale slots beyond batch boundary
+		for(int i=this->data_batch_size;i<this->nMessages;i++)
 		{
-			messages_rx[i].status=FREE;
+			if(messages_rx[i].status!=FREE)
+				messages_rx[i].status=FREE;
 		}
 	}
 	block_ready=1;
+}
+
+void cl_arq_controller::restore_tx_from_compressed()
+{
+	// Reassemble compressed chunks from messages_tx, decompress back to raw,
+	// push raw data to fifo_buffer_tx for re-compression at new config.
+	char assembled[16384];
+	int assembled_size = 0;
+
+	for(int i=0; i<nMessages; i++)
+	{
+		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+		{
+			if(assembled_size + messages_tx[i].length <= (int)sizeof(assembled))
+			{
+				memcpy(assembled + assembled_size,
+					messages_tx[i].data, messages_tx[i].length);
+				assembled_size += messages_tx[i].length;
+			}
+		}
+		messages_tx[i].status = FREE;
+	}
+
+	if(assembled_size >= COMPRESS_HEADER_SIZE)
+	{
+		char decomp_buf[COMPRESS_WORKSPACE_SIZE];
+		int dec_size = compressor.decompress_block(
+			assembled, assembled_size,
+			decomp_buf, (int)sizeof(decomp_buf));
+		if(dec_size > 0)
+		{
+			fifo_buffer_tx.push_front(decomp_buf, dec_size);
+			printf("[RESTORE_TX] Decompressed %d -> %d bytes, pushed to FIFO\n",
+				assembled_size, dec_size);
+		}
+		else
+		{
+			// Decompression failed — fall back to backup buffer
+			printf("[RESTORE_TX] Decompress failed (%d bytes), restoring from backup\n",
+				assembled_size);
+			restore_backup_buffer_data();
+			return;  // backup restore already handles fifo_buffer_backup
+		}
+	}
+	else if(assembled_size > 0)
+	{
+		// Too small for header — push raw assembled data
+		fifo_buffer_tx.push_front(assembled, assembled_size);
+		printf("[RESTORE_TX] No header (%d bytes), pushed raw\n", assembled_size);
+	}
+
+	// Flush backup — no longer needed, we recovered from messages_tx
+	fifo_buffer_backup.flush();
+	fflush(stdout);
 }
 
 void cl_arq_controller::restore_backup_buffer_data()

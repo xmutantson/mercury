@@ -86,6 +86,8 @@ cl_compressor::cl_compressor()
 	ppmd_mem = nullptr;
 	zstd_cctx = nullptr;
 	zstd_dctx = nullptr;
+	workspace = nullptr;
+	workspace_size = 0;
 	initialized = false;
 }
 
@@ -122,9 +124,18 @@ void cl_compressor::init()
 	// zstd level 3: good ratio, fast on small blocks
 	ZSTD_CCtx_setParameter((ZSTD_CCtx*)zstd_cctx, ZSTD_c_compressionLevel, 3);
 
+	// Workspace for batch-level compression intermediate buffers
+	workspace_size = COMPRESS_WORKSPACE_SIZE;
+	workspace = (unsigned char*)malloc(workspace_size);
+	if (!workspace)
+	{
+		deinit();
+		return;
+	}
+
 	initialized = true;
-	printf("[COMPRESS] Initialized: PPMd8 (order %d, %d KB) + zstd (level 3)\n",
-		PPMD_ORDER, PPMD_MEM_SIZE / 1024);
+	printf("[COMPRESS] Initialized: PPMd8 (order %d, %d KB) + zstd (level 3), workspace %d KB\n",
+		PPMD_ORDER, PPMD_MEM_SIZE / 1024, workspace_size / 1024);
 	fflush(stdout);
 }
 
@@ -145,6 +156,12 @@ void cl_compressor::deinit()
 	{
 		ZSTD_freeDCtx((ZSTD_DCtx*)zstd_dctx);
 		zstd_dctx = nullptr;
+	}
+	if (workspace)
+	{
+		free(workspace);
+		workspace = nullptr;
+		workspace_size = 0;
 	}
 	initialized = false;
 }
@@ -257,11 +274,7 @@ int cl_compressor::zstd_decompress_buf(const unsigned char* in, int in_len,
 
 int cl_compressor::compress_block(const char* in, int in_len, char* out, int out_capacity)
 {
-	if (!initialized || in_len <= 0)
-		return 0;
-
-	int raw_total = COMPRESS_HEADER_SIZE + in_len;
-	if (raw_total > out_capacity)
+	if (!initialized || in_len <= 0 || !workspace)
 		return 0;
 
 	const unsigned char* uin = (const unsigned char*)in;
@@ -272,44 +285,55 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 
 	int best_algo = COMPRESS_ALGO_RAW;
 	int best_comp_size = in_len;
-	const unsigned char* best_payload = uin;
+	int best_offset = 0;  // offset into workspace where best payload lives
+	bool best_is_raw = true;
 
-	// Temp buffers for compression output (max frame payload is ~173 bytes)
-	unsigned char zstd_buf[512];
-	unsigned char ppmd_buf[512];
+	// Use heap workspace split in two halves for zstd and PPMd output
+	int half = workspace_size / 2;
 
 	// Try zstd if entropy suggests compressibility
 	if (entropy <= ENTROPY_SKIP_ALL)
 	{
-		int zs = zstd_compress_buf(uin, in_len, zstd_buf, (int)sizeof(zstd_buf));
+		int zs = zstd_compress_buf(uin, in_len, workspace, half);
 		if (zs > 0 && zs < best_comp_size)
 		{
 			best_algo = COMPRESS_ALGO_ZSTD;
 			best_comp_size = zs;
-			best_payload = zstd_buf;
+			best_offset = 0;
+			best_is_raw = false;
 		}
 	}
 
 	// Try PPMd if entropy suggests text-like data
 	if (entropy < ENTROPY_ZSTD_ONLY)
 	{
-		int ps = ppmd_compress(uin, in_len, ppmd_buf, (int)sizeof(ppmd_buf));
+		int ps = ppmd_compress(uin, in_len, workspace + half, half);
 		if (ps > 0 && ps < best_comp_size)
 		{
 			best_algo = COMPRESS_ALGO_PPMD;
 			best_comp_size = ps;
-			best_payload = ppmd_buf;
+			best_offset = half;
+			best_is_raw = false;
 		}
 	}
 
-	// If compressed + header >= raw + header, send raw
+	// Check if compressed + header fits in output
 	int compressed_total = COMPRESS_HEADER_SIZE + best_comp_size;
-	if (compressed_total >= raw_total)
+	int raw_total = COMPRESS_HEADER_SIZE + in_len;
+
+	// If compressed >= raw, prefer raw (no overhead)
+	if (!best_is_raw && compressed_total >= raw_total)
 	{
 		best_algo = COMPRESS_ALGO_RAW;
 		best_comp_size = in_len;
-		best_payload = uin;
+		best_is_raw = true;
 	}
+
+	int total = COMPRESS_HEADER_SIZE + best_comp_size;
+
+	// Check if result fits in output buffer
+	if (total > out_capacity)
+		return -1;  // caller must reduce input or send without compression
 
 	// Write 5-byte header: [algo:1][comp_size:2 LE][orig_size:2 LE]
 	uout[0] = (unsigned char)best_algo;
@@ -319,9 +343,10 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 	uout[4] = (unsigned char)((in_len >> 8) & 0xFF);
 
 	// Write payload
-	memcpy(uout + COMPRESS_HEADER_SIZE, best_payload, best_comp_size);
-
-	int total = COMPRESS_HEADER_SIZE + best_comp_size;
+	if (best_is_raw)
+		memcpy(uout + COMPRESS_HEADER_SIZE, uin, in_len);
+	else
+		memcpy(uout + COMPRESS_HEADER_SIZE, workspace + best_offset, best_comp_size);
 
 	if (best_algo != COMPRESS_ALGO_RAW)
 	{

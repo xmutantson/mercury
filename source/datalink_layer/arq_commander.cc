@@ -89,20 +89,25 @@ void cl_arq_controller::process_messages_commander()
 				fflush(stdout);
 
 				{
-					int saved = 0;
-					for(int i=nMessages-1; i>=0; i--)
+					if(compression_enabled)
 					{
-						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-						{
-							fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
-							saved++;
-						}
-						messages_tx[i].status = FREE;
+						// Decompress messages_tx back to raw, push to FIFO
+						// for re-compression at new config.
+						restore_tx_from_compressed();
 					}
-					fifo_buffer_backup.flush();
+					else
+					{
+						for(int i=nMessages-1; i>=0; i--)
+						{
+							if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+								fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
+							messages_tx[i].status = FREE;
+						}
+						fifo_buffer_backup.flush();
+					}
 					block_under_tx = NO;
 					int fifo_load = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
-					printf("[BREAK] Saved %d messages to FIFO (%d bytes total)\n", saved, fifo_load);
+					printf("[BREAK] Saved data to FIFO (%d bytes total)\n", fifo_load);
 					fflush(stdout);
 				}
 
@@ -162,13 +167,20 @@ void cl_arq_controller::process_messages_commander()
 					negotiated_configuration, forward_configuration, data_configuration, target);
 				fflush(stdout);
 
-				for(int i=nMessages-1; i>=0; i--)
+				if(compression_enabled)
 				{
-					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-						fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
-					messages_tx[i].status = FREE;
+					restore_tx_from_compressed();
 				}
-				fifo_buffer_backup.flush();
+				else
+				{
+					for(int i=nMessages-1; i>=0; i--)
+					{
+						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+							fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
+						messages_tx[i].status = FREE;
+					}
+					fifo_buffer_backup.flush();
+				}
 				block_under_tx = NO;
 
 				// Force-clear: cleanup() skips PENDING_ACK status
@@ -1223,14 +1235,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				data_configuration, working_config, frame_shift_threshold);
 			fflush(stdout);
 
-			// Preserve all pending data — push messages_tx back to FIFO for resend at working config
-			for(int i=0; i<nMessages; i++)
+			// Preserve all pending data for resend at working config
+			if(compression_enabled)
 			{
-				if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-					fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-				messages_tx[i].status = FREE;
+				restore_tx_from_compressed();
 			}
-			fifo_buffer_backup.flush();
+			else
+			{
+				for(int i=0; i<nMessages; i++)
+				{
+					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+						fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
+					messages_tx[i].status = FREE;
+				}
+				fifo_buffer_backup.flush();
+			}
 			block_under_tx = NO;
 
 			int fifo_load = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
@@ -1366,16 +1385,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				fflush(stdout);
 				consecutive_data_acks = 0;
 
-				// Put all pending messages back into TX FIFO for re-encoding at new config
-				for(int i=nMessages-1; i>=0; i--)
+				// Put all pending data back into TX FIFO for re-encoding at new config
+				if(compression_enabled)
 				{
-					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-					{
-						fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
-					}
-					messages_tx[i].status = FREE;
+					restore_tx_from_compressed();
 				}
-				fifo_buffer_backup.flush();
+				else
+				{
+					for(int i=nMessages-1; i>=0; i--)
+					{
+						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+							fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
+						messages_tx[i].status = FREE;
+					}
+					fifo_buffer_backup.flush();
+				}
 				block_under_tx = NO;
 
 				add_message_control(SET_CONFIG);
@@ -1723,6 +1747,7 @@ void cl_arq_controller::process_control_commander()
 				}
 				telecom_system->data_container.nUnder_processing_events = 0;
 				telecom_system->receive_stats.mfsk_search_raw = 0;
+				telecom_system->receive_stats.ofdm_search_raw = 0;
 			}
 			else if (messages_control.data[0]==SET_CONFIG)
 			{
@@ -2036,47 +2061,180 @@ void cl_arq_controller::process_buffer_data_commander()
 	{
 		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && block_under_tx==NO)
 		{
-			int filled = 0;
-			int fill_limit = data_batch_size;  // Fill exactly one batch worth of messages
 			int max_frame = max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH;
-			// When compression is enabled, reserve space for the 5-byte header
-			int max_raw = compression_enabled ? (max_frame - COMPRESS_HEADER_SIZE) : max_frame;
-			char compress_buf[512];  // Temp buffer for compressed output
 
-			for(int i=0;i<fill_limit;i++)
+			if(compression_enabled)
 			{
-				data_read_size=fifo_buffer_tx.pop(message_TxRx_byte_buffer, max_raw);
-				if(data_read_size==0)
+				// --- Batch-level compression with adaptive sizing ---
+				// Pop raw data based on estimated compression ratio, compress,
+				// iteratively add more data until batch is 85%+ full.
+				int batch_capacity = data_batch_size * max_frame;
+
+				// Initial guess based on running ratio estimate.
+				// Staging can be up to COMPRESS_WORKSPACE_SIZE (64KB) because
+				// high-ratio compressors (zstd/PPMd) can shrink 33KB+ to <1.5KB.
+				const int staging_max = 65535;  // Header orig_size is uint16; cap to prevent overflow
+				int initial_pop = (int)(batch_capacity * compress_ratio_estimate);
+				if(initial_pop > staging_max) initial_pop = staging_max;
+				if(initial_pop < batch_capacity - COMPRESS_HEADER_SIZE)
+					initial_pop = batch_capacity - COMPRESS_HEADER_SIZE;
+
+				char staging[COMPRESS_WORKSPACE_SIZE];
+				int raw_size = fifo_buffer_tx.pop(staging, initial_pop);
+				if(raw_size == 0)
 				{
 					last_transmission_block_stats.nSent_data=0;
 					last_transmission_block_stats.nReSent_data=0;
-					break;
 				}
-
-				// Backup stores raw data (for restore after BREAK)
-				fifo_buffer_backup.push(message_TxRx_byte_buffer, data_read_size);
-
-				char* frame_data = message_TxRx_byte_buffer;
-				int frame_size = data_read_size;
-
-				if(compression_enabled)
-				{
-					int comp_size = compressor.compress_block(
-						message_TxRx_byte_buffer, data_read_size,
-						compress_buf, max_frame);
-					if(comp_size > 0)
-					{
-						frame_data = compress_buf;
-						frame_size = comp_size;
-					}
-				}
-
-				block_under_tx=YES;
-				if(frame_size==max_frame)
-					add_message_tx_data(DATA_LONG, frame_size, frame_data);
 				else
-					add_message_tx_data(DATA_SHORT, frame_size, frame_data);
-				filled++;
+				{
+					char comp_buf[16384];
+					int comp_size = 0;
+					bool compress_ok = false;
+
+					// Adaptive fill loop: compress, check fill ratio, add more
+					for(int iter = 0; iter < 4; iter++)
+					{
+						comp_size = compressor.compress_block(
+							staging, raw_size, comp_buf, batch_capacity);
+
+						if(comp_size > 0)
+						{
+							// Compression succeeded — check fill ratio
+							float fill_ratio = (float)comp_size / (float)batch_capacity;
+							if(fill_ratio >= 0.85f || iter == 3)
+							{
+								compress_ok = true;
+								break;  // Good enough
+							}
+							// Under-filled: estimate how much more raw data to add
+							int comp_payload = comp_size - COMPRESS_HEADER_SIZE;
+							if(comp_payload <= 0) { compress_ok = true; break; }
+							float current_ratio = (float)raw_size / (float)comp_payload;
+							int remaining_comp = batch_capacity - comp_size;
+							int more_raw = (int)(remaining_comp * current_ratio);
+							if(more_raw < 1) { compress_ok = true; break; }
+							if(raw_size + more_raw > staging_max)
+								more_raw = staging_max - raw_size;
+							if(more_raw <= 0) { compress_ok = true; break; }
+
+							int got = fifo_buffer_tx.pop(staging + raw_size, more_raw);
+							if(got == 0) { compress_ok = true; break; }  // FIFO empty
+							raw_size += got;
+							// Loop back to compress with more data
+						}
+						else if(comp_size == -1)
+						{
+							// Doesn't fit — push back 40% and retry
+							int pushback = raw_size * 2 / 5;
+							if(pushback < 1) pushback = 1;
+							fifo_buffer_tx.push_front(
+								staging + raw_size - pushback, pushback);
+							raw_size -= pushback;
+							if(raw_size < 1) break;
+							// Loop back to retry compression
+						}
+						else
+						{
+							// Error (0) — fall through to raw
+							break;
+						}
+					}
+
+					if(compress_ok && comp_size > 0)
+					{
+						// Update running ratio estimate (EMA)
+						int comp_payload = comp_size - COMPRESS_HEADER_SIZE;
+						if(comp_payload > 0)
+						{
+							float measured = (float)raw_size / (float)comp_payload;
+							compress_ratio_estimate = 0.7f * compress_ratio_estimate + 0.3f * measured;
+						}
+						fifo_buffer_backup.push(staging, raw_size);
+					}
+					else
+					{
+						// compress_block() error fallback — wrap raw data in ALGO_RAW.
+						// Cap to batch capacity minus header.
+						int max_raw = batch_capacity - COMPRESS_HEADER_SIZE;
+						if(raw_size > max_raw)
+						{
+							fifo_buffer_tx.push_front(
+								staging + max_raw,
+								raw_size - max_raw);
+							raw_size = max_raw;
+						}
+						comp_buf[0] = COMPRESS_ALGO_RAW;
+						comp_buf[1] = (char)(raw_size & 0xFF);
+						comp_buf[2] = (char)((raw_size >> 8) & 0xFF);
+						comp_buf[3] = (char)(raw_size & 0xFF);
+						comp_buf[4] = (char)((raw_size >> 8) & 0xFF);
+						memcpy(comp_buf + COMPRESS_HEADER_SIZE, staging, raw_size);
+						comp_size = COMPRESS_HEADER_SIZE + raw_size;
+						fifo_buffer_backup.push(staging, raw_size);
+					}
+
+					// No zero-padding: send only actual compressed data frames.
+					// pad_messages_batch_tx() fills remaining batch slots with
+					// duplicates (same IDs → idempotent overwrite on RX).
+
+					// Ensure contiguous IDs 0..data_batch_size-1
+					for(int i = 0; i < data_batch_size; i++)
+					{
+						if(messages_tx[i].status != FREE)
+							messages_tx[i].status = FREE;
+					}
+
+					// Split comp_buf into frames
+					int pos = 0;
+					int frame_num = 0;
+					while(pos < comp_size)
+					{
+						int chunk = comp_size - pos;
+						if(chunk > max_frame) chunk = max_frame;
+						block_under_tx = YES;
+						int result;
+						if(chunk == max_frame)
+							result = add_message_tx_data(DATA_LONG, chunk, comp_buf + pos);
+						else
+							result = add_message_tx_data(DATA_SHORT, chunk, comp_buf + pos);
+						if(result != SUCCESSFUL)
+						{
+							printf("[COMPRESS-TX] ERROR: add_message_tx_data failed at frame %d (result=%d)\n",
+								frame_num, result);
+							fflush(stdout);
+						}
+						pos += chunk;
+						frame_num++;
+					}
+					printf("[COMPRESS-TX] %d raw -> %d comp (%d frames), ratio_est=%.2f, fill=%.0f%%\n",
+						raw_size, comp_size, frame_num, compress_ratio_estimate,
+						100.0f * comp_size / batch_capacity);
+					fflush(stdout);
+				}
+			}
+			else
+			{
+				// --- No compression: original per-frame loop ---
+				int filled = 0;
+				int fill_limit = data_batch_size;
+				for(int i=0;i<fill_limit;i++)
+				{
+					data_read_size=fifo_buffer_tx.pop(message_TxRx_byte_buffer, max_frame);
+					if(data_read_size==0)
+					{
+						last_transmission_block_stats.nSent_data=0;
+						last_transmission_block_stats.nReSent_data=0;
+						break;
+					}
+					fifo_buffer_backup.push(message_TxRx_byte_buffer, data_read_size);
+					block_under_tx=YES;
+					if(data_read_size==max_frame)
+						add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
+					else
+						add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
+					filled++;
+				}
 			}
 		}
 		else if(block_under_tx==YES && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
