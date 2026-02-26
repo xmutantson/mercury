@@ -2136,20 +2136,26 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 	std::complex<double> fft_in[256];
 	std::complex<double> fft_out[256];
 
-	// Coarse search: step by symbol period, per-bin coherent metric
-	int n_coarse = (buffer_size_interp - preamble_interp) / symbol_interp;
+	// Coarse search: step by GI period for sub-symbol alignment accuracy.
+	// Symbol-period steps (old approach) miss the preamble when the search
+	// grid is phase-misaligned: NB GI is only 64 interp samples, so even
+	// small phase errors cause ISI in the FFT window (metric ≈ 1.0 everywhere).
+	// GI-period steps guarantee worst-case offset of ±gi_interp/2 = ±32 samples,
+	// well within the guard interval. Cost: ~200 FFTs vs ~12 (under 2ms total).
+	int search_step = gi_interp;
+	int n_coarse = (buffer_size_interp - preamble_interp) / search_step;
 	if(n_coarse < 0) n_coarse = 0;
-	if(n_coarse > 255) n_coarse = 255;  // safety cap for local arrays
+	if(n_coarse > 1023) n_coarse = 1023;  // safety cap for local arrays
 
 	double best_coarse_metric = -1.0;
 	int best_coarse_pos = 0;
-	double coarse_metrics[256];
+	double* coarse_metrics = new double[n_coarse + 1];
 
 	std::complex<double> bin_accum[256];
 
 	for(int pos = 0; pos <= n_coarse; pos++)
 	{
-		int sample_start = pos * symbol_interp;
+		int sample_start = pos * search_step;
 
 		int max_bins = n_preamble_bins_per_sym[0];
 		for(int b = 0; b < max_bins; b++)
@@ -2199,7 +2205,7 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 		if(coarse_metrics[pos] >= early_threshold)
 		{
 			best_coarse_metric = coarse_metrics[pos];
-			best_coarse_pos = pos * symbol_interp;
+			best_coarse_pos = pos * search_step;
 			break;
 		}
 	}
@@ -2225,6 +2231,8 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 				energy += std::norm(fft_out[preamble_bin_fft[sym][b]]);
 		}
 	}
+
+	delete[] coarse_metrics;
 
 	TimeSyncResult result;
 	result.delay = best_coarse_pos;

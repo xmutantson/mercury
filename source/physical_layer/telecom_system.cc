@@ -845,137 +845,196 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		}
 		else if(narrowband_enabled)
 		{
-			// NB OFDM: Two-phase Schmidl-Cox preamble detection.
-			// Even-only subcarrier preamble → half-symbol periodicity.
-			// Bug #41 fix: NB previously used FFT-based detection with all 10
-			// subcarriers, requiring GI-aligned search grid (5.9% hit rate).
-			// Now NB uses halfsym path → works at any timing.
-			// Phase 1: Decimate 48→12 kHz, half-symbol correlation at baseband.
-			//   At 12 kHz: NB fills ~8% of bandwidth.
-			//   Halfsym metric is normalized [0,1] — approaches 1.0 at preamble
-			//   regardless of bandwidth utilization, ~0.0 at data/noise.
-			// Phase 2: GI-based fine sync at 48 kHz for sample-accurate alignment.
+			// NB OFDM preamble detection.
+			// Two paths: FFT-based for batch mode, halfsym for initial search.
 			int buf_bb = data_container.Nofdm * data_container.buffer_Nsymb;
 			int interp = data_container.interpolation_rate;
-
-			// Phase 1: Decimate to 12 kHz baseband
-			ofdm.rational_resampler(data_container.baseband_data_interpolated,
-				buf_bb * interp, data_container.baseband_data, interp, DECIMATION);
-
-			// Anti-re-decode: skip past last decoded OFDM frame in Phase 1
+			int sym_samples_nb = data_container.Nofdm * interp;
+			int buf_interp = buf_bb * interp;
 			int ofdm_skip = receive_stats.ofdm_search_raw - data_container.nUnder_processing_events;
 			if(ofdm_skip < 0) ofdm_skip = 0;
-			int skip_bb = ofdm_skip * data_container.Nofdm;
-			if(skip_bb >= buf_bb) skip_bb = 0;  // safety
 
-			// Half-symbol correlation on 12 kHz buffer (interpolation_rate=1)
-			int step_bb = step / interp;
-			if(step_bb < 1) step_bb = 1;
-			TimeSyncResult coarse_bb = ofdm.time_sync_preamble_halfsym(
-				&data_container.baseband_data[skip_bb], buf_bb - skip_bb, 1, step_bb);
-			coarse_bb.delay += skip_bb;  // adjust back to full-buffer coordinates
-
-			// Scale position back to 48 kHz
-			int coarse_delay_interp = coarse_bb.delay * interp;
-
-			// Phase 2: fine sync around the coarse position.
-			int sym_interp = data_container.Nofdm * interp;
-			int buf_interp = buf_bb * interp;
-
-			if(data_container.preamble_nSymb <= 2)
+			if(receive_stats.ofdm_search_raw > 0)
 			{
-				// Short-preamble configs (QAM: 1-2 preamble symbols).
-				// Halfsym coarse detection with 1-2 symbols is weak (128-256
-				// correlation samples), so widen Phase 2 to ±3 symbols to
-				// tolerate coarse errors. GI-only correlation over ALL frame
-				// symbols provides robust discrimination: e.g. CONFIG_16 NB
-				// = 46 symbols × 128 GI samples = 5888 total correlation.
-				// Two-pass search: coarse step=4 over ±3 symbols, then
-				// refine to sample-level in ±8 around the coarse peak.
-				int frame_symb = data_container.preamble_nSymb + get_active_nsymb();
-				int frame_len = frame_symb * sym_interp;
-				int Ngi_interp = data_container.Ngi * interp;
-				int Nfft_interp = data_container.Nfft * interp;
+				// NB BATCH MODE: FFT-based preamble detection.
+				// Halfsym is unreliable for NB batch: data symbols produce
+				// false peaks (metric ~0.5) competing with preamble (~1.0).
+				// FFT metric: ~Nsymb at preamble, ~1 at data — clean separation.
+				//
+				// LOOK-BACK: ofdm_search_raw (= frame_end - ftr - 1) consistently
+				// overshoots the actual preamble by ~3-6 symbols. Root cause: nUnder
+				// shifts, integer truncation of delay/symbol_period, and capture
+				// thread timing all shift the preamble earlier than predicted.
+				// Start the search 8 symbols before ofdm_skip to catch it reliably.
+				// The FFT uses GI-period steps (64 interp samples) so alignment is
+				// automatic within ±32 samples (well within NB GI of 64).
+				int lookback = 8;  // symbols before ofdm_skip
+				int search_start = ofdm_skip - lookback;
+				if(search_start < 0) search_start = 0;
+				int search_offset = search_start * sym_samples_nb;
+				int search_size = buf_interp - search_offset;
 
-				int search_syms = 3;  // ±3 symbols (was ±1)
-				int gi_start = coarse_delay_interp - search_syms * sym_interp;
-				if(gi_start < 0) gi_start = 0;
-				int gi_end = coarse_delay_interp + search_syms * sym_interp;
-				if(gi_end + frame_len > buf_interp)
-					gi_end = buf_interp - frame_len;
-				if(gi_end < gi_start) gi_end = gi_start;
+				// Narrow window: lookback + preamble + margin ahead
+				int narrow_max = (lookback + data_container.preamble_nSymb + 4) * sym_samples_nb;
+				if(search_size > narrow_max)
+					search_size = narrow_max;
 
-				// Lambda: evaluate GI correlation metric at a given position.
-				auto gi_metric = [&](int pos) -> double {
-					double corr = 0, na = 0, nb = 0;
-					for(int s = 0; s < frame_symb; s++)
-					{
-						int base = pos + s * sym_interp;
-						std::complex<double>* a = &data_container.baseband_data_interpolated[base];
-						std::complex<double>* b = &data_container.baseband_data_interpolated[base + Nfft_interp];
-						for(int m = 0; m < Ngi_interp; m++)
-						{
-							corr += a[m].real() * b[m].real() + a[m].imag() * b[m].imag();
-							na += a[m].real() * a[m].real() + a[m].imag() * a[m].imag();
-							nb += b[m].real() * b[m].real() + b[m].imag() * b[m].imag();
-						}
-					}
-					if(na > 0.001 && nb > 0.001)
-						return corr / sqrt(na * nb);
-					return -1.0;
-				};
+				// Phase 1: FFT coarse detection (symbol-period steps)
+				TimeSyncResult fft_coarse = ofdm.time_sync_preamble_fft(
+					&data_container.baseband_data_interpolated[search_offset],
+					search_size, interp, data_container.preamble_nSymb);
 
-				// Pass 1: coarse search with step=4.
-				double best_corr = -1.0;
-				int best_pos = coarse_delay_interp;
-				int coarse_step = 4;
+				printf("[NB-FFT-BATCH] skip=%d start=%d offset=%d size=%d metric=%.4f delay=%d preamNsymb=%d Nc=%d\n",
+					ofdm_skip, search_start, search_offset, search_size,
+					fft_coarse.correlation, fft_coarse.delay,
+					data_container.preamble_nSymb, ofdm.Nc);
+				fflush(stdout);
 
-				for(int pos = gi_start; pos <= gi_end; pos += coarse_step)
+				if(fft_coarse.correlation < 2.0)
 				{
-					double metric = gi_metric(pos);
-					if(metric > best_corr)
+					// No preamble found in search region
+					receive_stats.delay = search_offset + fft_coarse.delay;
+					receive_stats.coarse_metric = fft_coarse.correlation / (double)data_container.preamble_nSymb;
+					receive_stats.ofdm_search_raw = 0;
+				}
+				else
+				{
+					// Phase 2: GI+halfsym fine sync in ±1 symbol window.
+					// FFT coarse gives symbol-period accuracy; GI correlation
+					// refines to exact GI boundary for OFDM demodulation.
+					int pream_interp = data_container.preamble_nSymb * sym_samples_nb;
+					int win_start = fft_coarse.delay - sym_samples_nb;
+					if(win_start < 0) win_start = 0;
+					int win_end = fft_coarse.delay + pream_interp + sym_samples_nb;
+					if(win_end > search_size) win_end = search_size;
+					int win_size = win_end - win_start;
+
+					if(win_size > pream_interp)
 					{
-						best_corr = metric;
-						best_pos = pos;
+						TimeSyncResult fine = ofdm.time_sync_preamble_with_metric(
+							&data_container.baseband_data_interpolated[search_offset + win_start],
+							win_size, interp, 0, 1, 1);
+						receive_stats.delay = search_offset + win_start + fine.delay;
+						receive_stats.coarse_metric = fine.correlation;
+					}
+					else
+					{
+						receive_stats.delay = search_offset + fft_coarse.delay;
+						receive_stats.coarse_metric = fft_coarse.correlation;
 					}
 				}
-
-				// Pass 2: refine to sample-level in ±8 around coarse peak.
-				int fine_start = best_pos - 8;
-				if(fine_start < gi_start) fine_start = gi_start;
-				int fine_end = best_pos + 8;
-				if(fine_end > gi_end) fine_end = gi_end;
-
-				for(int pos = fine_start; pos <= fine_end; pos++)
-				{
-					double metric = gi_metric(pos);
-					if(metric > best_corr)
-					{
-						best_corr = metric;
-						best_pos = pos;
-					}
-				}
-
-				receive_stats.delay = best_pos;
-				receive_stats.coarse_metric = coarse_bb.correlation;
 			}
 			else
 			{
-				// Normal preamble (≥3 symbols): GI+halfsym fine sync.
-				// 4 preamble symbols × 576 = 2304 correlation samples — robust.
-				int win_start = coarse_delay_interp - sym_interp;
-				if(win_start < 0) win_start = 0;
-				int pream_interp = data_container.preamble_nSymb * sym_interp;
-				int win_end = coarse_delay_interp + pream_interp + sym_interp;
-				if(win_end > buf_interp) win_end = buf_interp;
-				int win_size = win_end - win_start;
+				// NB INITIAL SEARCH: Two-phase Schmidl-Cox (halfsym) detection.
+				// Bug #41: FFT requires GI-aligned search grid (symbol-period
+				// steps). Without prior timing reference, steps can miss the
+				// preamble (5.9% hit rate). Halfsym uses L=Nfft/2=128
+				// correlation which works at any sample offset.
+				// Phase 1: Decimate 48→12 kHz, halfsym at baseband.
+				// Phase 2: GI-based fine sync at 48 kHz.
+				ofdm.rational_resampler(data_container.baseband_data_interpolated,
+					buf_bb * interp, data_container.baseband_data, interp, DECIMATION);
 
-				TimeSyncResult fine_gi = ofdm.time_sync_preamble_with_metric(
-					&data_container.baseband_data_interpolated[win_start], win_size,
-					interp, 0, 1, 1);
+				int skip_bb = ofdm_skip * data_container.Nofdm;
+				if(skip_bb >= buf_bb) skip_bb = 0;  // safety
 
-				receive_stats.delay = win_start + fine_gi.delay;
-				receive_stats.coarse_metric = coarse_bb.correlation;
+				int step_bb = step / interp;
+				if(step_bb < 1) step_bb = 1;
+				TimeSyncResult coarse_bb = ofdm.time_sync_preamble_halfsym(
+					&data_container.baseband_data[skip_bb], buf_bb - skip_bb, 1, step_bb);
+				coarse_bb.delay += skip_bb;
+
+				int coarse_delay_interp = coarse_bb.delay * interp;
+				int sym_interp = sym_samples_nb;
+
+				if(data_container.preamble_nSymb <= 2)
+				{
+					// Short-preamble configs (QAM: 1-2 preamble symbols).
+					// Halfsym coarse with 1-2 symbols is weak, so widen Phase 2
+					// to ±3 symbols. GI-only correlation over ALL frame symbols.
+					// Two-pass: coarse step=4, then sample-level ±8.
+					int frame_symb = data_container.preamble_nSymb + get_active_nsymb();
+					int frame_len = frame_symb * sym_interp;
+					int Ngi_interp = data_container.Ngi * interp;
+					int Nfft_interp = data_container.Nfft * interp;
+
+					int search_syms = 3;
+					int gi_start = coarse_delay_interp - search_syms * sym_interp;
+					if(gi_start < 0) gi_start = 0;
+					int gi_end = coarse_delay_interp + search_syms * sym_interp;
+					if(gi_end + frame_len > buf_interp)
+						gi_end = buf_interp - frame_len;
+					if(gi_end < gi_start) gi_end = gi_start;
+
+					auto gi_metric = [&](int pos) -> double {
+						double corr = 0, na = 0, nb = 0;
+						for(int s = 0; s < frame_symb; s++)
+						{
+							int base = pos + s * sym_interp;
+							std::complex<double>* a = &data_container.baseband_data_interpolated[base];
+							std::complex<double>* b = &data_container.baseband_data_interpolated[base + Nfft_interp];
+							for(int m = 0; m < Ngi_interp; m++)
+							{
+								corr += a[m].real() * b[m].real() + a[m].imag() * b[m].imag();
+								na += a[m].real() * a[m].real() + a[m].imag() * a[m].imag();
+								nb += b[m].real() * b[m].real() + b[m].imag() * b[m].imag();
+							}
+						}
+						if(na > 0.001 && nb > 0.001)
+							return corr / sqrt(na * nb);
+						return -1.0;
+					};
+
+					double best_corr = -1.0;
+					int best_pos = coarse_delay_interp;
+					int coarse_step = 4;
+
+					for(int pos = gi_start; pos <= gi_end; pos += coarse_step)
+					{
+						double metric = gi_metric(pos);
+						if(metric > best_corr)
+						{
+							best_corr = metric;
+							best_pos = pos;
+						}
+					}
+
+					int fine_start = best_pos - 8;
+					if(fine_start < gi_start) fine_start = gi_start;
+					int fine_end = best_pos + 8;
+					if(fine_end > gi_end) fine_end = gi_end;
+
+					for(int pos = fine_start; pos <= fine_end; pos++)
+					{
+						double metric = gi_metric(pos);
+						if(metric > best_corr)
+						{
+							best_corr = metric;
+							best_pos = pos;
+						}
+					}
+
+					receive_stats.delay = best_pos;
+					receive_stats.coarse_metric = coarse_bb.correlation;
+				}
+				else
+				{
+					// Normal preamble (≥3 symbols): GI+halfsym fine sync.
+					int win_start = coarse_delay_interp - sym_interp;
+					if(win_start < 0) win_start = 0;
+					int pream_interp = data_container.preamble_nSymb * sym_interp;
+					int win_end = coarse_delay_interp + pream_interp + sym_interp;
+					if(win_end > buf_interp) win_end = buf_interp;
+					int win_size = win_end - win_start;
+
+					TimeSyncResult fine_gi = ofdm.time_sync_preamble_with_metric(
+						&data_container.baseband_data_interpolated[win_start], win_size,
+						interp, 0, 1, 1);
+
+					receive_stats.delay = win_start + fine_gi.delay;
+					receive_stats.coarse_metric = coarse_bb.correlation;
+				}
 			}
 
 		}
