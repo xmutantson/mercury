@@ -3129,7 +3129,22 @@ void cl_arq_controller::receive()
 				telecom_system->data_container.frames_to_read = 0;
 				ftr_clamped = 1;
 			}
-			else if(telecom_system->data_container.frames_to_read > rx_frame)
+
+			// Minimum shift to keep next frame within extraction bounds.
+			// For NB configs (frame_symb ≈ buffer/2), the nUnder adjustment
+			// can push ftr negative→clamped to 0, leaving ofdm_search_raw
+			// at frame_end-1 which exceeds upper_bound (buffer-rx_frame).
+			// The next search then starts past the extraction limit, unable
+			// to fit a complete frame, causing cascading FAILs.
+			int upper_bound = telecom_system->data_container.buffer_Nsymb - rx_frame;
+			int min_ftr = end_of_current_message - upper_bound;
+			if(min_ftr > 0 && telecom_system->data_container.frames_to_read < min_ftr)
+			{
+				telecom_system->data_container.frames_to_read = min_ftr;
+				ftr_clamped = 3;
+			}
+
+			if(telecom_system->data_container.frames_to_read > rx_frame)
 			{
 				telecom_system->data_container.frames_to_read = rx_frame;
 				ftr_clamped = 2;
