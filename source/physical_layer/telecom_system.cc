@@ -44,6 +44,7 @@ cl_telecom_system::cl_telecom_system()
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
 	receive_stats.mfsk_search_raw=0;
+	receive_stats.ofdm_search_raw=0;
 	receive_stats.time_peak_symb_location=0;
 	receive_stats.time_peak_subsymb_location=0;
 	receive_stats.sync_trials=0;
@@ -54,6 +55,7 @@ cl_telecom_system::cl_telecom_system()
 	receive_stats.SNR=-99.9;
 	receive_stats.signal_stregth_dbm=-999;
 	receive_stats.mfsk_search_raw=0;
+	receive_stats.ofdm_search_raw=0;
 
 	time_sync_trials_max=20;
 	use_last_good_time_sync=NO;
@@ -853,70 +855,183 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			ofdm.rational_resampler(data_container.baseband_data_interpolated,
 				buf_bb * interp, data_container.baseband_data, interp, DECIMATION);
 
+			// Anti-re-decode: skip past last decoded OFDM frame in Phase 1
+			int ofdm_skip = receive_stats.ofdm_search_raw - data_container.nUnder_processing_events;
+			if(ofdm_skip < 0) ofdm_skip = 0;
+			int skip_bb = ofdm_skip * data_container.Nofdm;
+			if(skip_bb >= buf_bb) skip_bb = 0;  // safety
+
 			// Half-symbol correlation on 12 kHz buffer (interpolation_rate=1)
 			int step_bb = step / interp;
 			if(step_bb < 1) step_bb = 1;
 			TimeSyncResult coarse_bb = ofdm.time_sync_preamble_halfsym(
-				data_container.baseband_data, buf_bb, 1, step_bb);
+				&data_container.baseband_data[skip_bb], buf_bb - skip_bb, 1, step_bb);
+			coarse_bb.delay += skip_bb;  // adjust back to full-buffer coordinates
 
 			// Scale position back to 48 kHz
 			int coarse_delay_interp = coarse_bb.delay * interp;
 
-			// Phase 2: GI-based fine sync in ±1 symbol around the coarse position
-			// GI correlation is sample-accurate at any SNR; we just need to
-			// constrain the search window so only the preamble boundary is found.
+			// Phase 2: fine sync in ±1 symbol around the coarse position.
 			int sym_interp = data_container.Nofdm * interp;
 			int buf_interp = buf_bb * interp;
-			int win_start = coarse_delay_interp - sym_interp;
-			if(win_start < 0) win_start = 0;
-			int pream_interp = data_container.preamble_nSymb * sym_interp;
-			int win_end = coarse_delay_interp + pream_interp + sym_interp;
-			if(win_end > buf_interp) win_end = buf_interp;
-			int win_size = win_end - win_start;
 
-			TimeSyncResult fine_gi = ofdm.time_sync_preamble_with_metric(
-				&data_container.baseband_data_interpolated[win_start], win_size,
-				interp, 0, 1, 1);
+			if(data_container.preamble_nSymb <= 2)
+			{
+				// Short-preamble configs (QAM: 1-2 preamble symbols).
+				// GI+halfsym over 1-2 symbols gives only 576-1152 correlation
+				// samples — insufficient for QAM fine timing. Instead, use
+				// GI-only correlation over ALL symbols in the frame (preamble
+				// + data). Data symbols have GI too. For CONFIG_16 NB:
+				// 46 symbols × 64 GI samples = 2944 correlation samples.
+				int frame_symb = data_container.preamble_nSymb + get_active_nsymb();
+				int frame_len = frame_symb * sym_interp;
+				int Ngi_interp = data_container.Ngi * interp;
+				int Nfft_interp = data_container.Nfft * interp;
 
-			receive_stats.delay = win_start + fine_gi.delay;
-			receive_stats.coarse_metric = coarse_bb.correlation;
+				int gi_start = coarse_delay_interp - sym_interp;
+				if(gi_start < 0) gi_start = 0;
+				int gi_end = coarse_delay_interp + sym_interp;
+				if(gi_end + frame_len > buf_interp)
+					gi_end = buf_interp - frame_len;
+				if(gi_end < gi_start) gi_end = gi_start;
+
+				double best_corr = -1.0;
+				int best_pos = coarse_delay_interp;
+
+				for(int pos = gi_start; pos <= gi_end; pos++)
+				{
+					double corr = 0, na = 0, nb = 0;
+					for(int s = 0; s < frame_symb; s++)
+					{
+						int base = pos + s * sym_interp;
+						std::complex<double>* a = &data_container.baseband_data_interpolated[base];
+						std::complex<double>* b = &data_container.baseband_data_interpolated[base + Nfft_interp];
+						for(int m = 0; m < Ngi_interp; m++)
+						{
+							corr += a[m].real() * b[m].real() + a[m].imag() * b[m].imag();
+							na += a[m].real() * a[m].real() + a[m].imag() * a[m].imag();
+							nb += b[m].real() * b[m].real() + b[m].imag() * b[m].imag();
+						}
+					}
+					if(na > 0.001 && nb > 0.001)
+					{
+						double metric = corr / sqrt(na * nb);
+						if(metric > best_corr)
+						{
+							best_corr = metric;
+							best_pos = pos;
+						}
+					}
+				}
+
+				receive_stats.delay = best_pos;
+				receive_stats.coarse_metric = coarse_bb.correlation;
+			}
+			else
+			{
+				// Normal preamble (≥3 symbols): GI+halfsym fine sync.
+				// 4 preamble symbols × 576 = 2304 correlation samples — robust.
+				int win_start = coarse_delay_interp - sym_interp;
+				if(win_start < 0) win_start = 0;
+				int pream_interp = data_container.preamble_nSymb * sym_interp;
+				int win_end = coarse_delay_interp + pream_interp + sym_interp;
+				if(win_end > buf_interp) win_end = buf_interp;
+				int win_size = win_end - win_start;
+
+				TimeSyncResult fine_gi = ofdm.time_sync_preamble_with_metric(
+					&data_container.baseband_data_interpolated[win_start], win_size,
+					interp, 0, 1, 1);
+
+				receive_stats.delay = win_start + fine_gi.delay;
+				receive_stats.coarse_metric = coarse_bb.correlation;
+			}
 
 		}
 		else
 		{
-			// WB OFDM: GI+halfsym at 48 kHz, starting from signal region.
-			// Combined GI (Ngi samples) + halfsym (Nfft/2 samples) correlation
-			// gives robust detection with metric ~0.95 on real preambles.
-			// The search starts from signal_start_symb (passband energy pre-scan)
-			// to skip silence where VB-Cable DC offset produces false GI peaks.
+			// WB OFDM: preamble detection at 48 kHz, starting from signal region.
+			// Anti-re-decode: skip past last decoded OFDM frame (same as MFSK's
+			// mfsk_search_raw). Also skip silence via signal_start_symb prescan.
 			int sym_samples_wb = data_container.Nofdm * frequency_interpolation_rate;
 			int buf_samples_wb = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-			int search_offset = signal_start_symb * sym_samples_wb;
+			int ofdm_skip = receive_stats.ofdm_search_raw - data_container.nUnder_processing_events;
+			if(ofdm_skip < 0) ofdm_skip = 0;
+			int effective_start = (ofdm_skip > signal_start_symb) ? ofdm_skip : signal_start_symb;
+			int search_offset = effective_start * sym_samples_wb;
 			int search_size = buf_samples_wb - search_offset;
-			TimeSyncResult coarse_result = ofdm.time_sync_preamble_with_metric(
+
+			TimeSyncResult coarse_result;
+
+			// FFT-based preamble detection for both initial and batch mode.
+			// FFT correlates against known preamble subcarrier values:
+			// metric ≈ Nsymb (4) at preamble, ≈ 1 at data.  This cleanly
+			// discriminates preamble from data, unlike GI+halfsym which
+			// gives 0.88-0.99 on ALL OFDM symbols.
+			int fft_search_size = search_size;
+			if(receive_stats.ofdm_search_raw > 0)
+			{
+				// Batch tracking: narrow window around predicted position.
+				// After frame N, ofdm_search_raw places us ~1 symbol before
+				// frame N+1's preamble.  Limit search to prevent false peaks
+				// on distant data.
+				int narrow_max = (data_container.preamble_nSymb + 8) * sym_samples_wb;
+				if(fft_search_size > narrow_max)
+					fft_search_size = narrow_max;
+			}
+
+			// Phase 1: FFT coarse detection (symbol-period steps).
+			TimeSyncResult fft_coarse = ofdm.time_sync_preamble_fft(
 				&data_container.baseband_data_interpolated[search_offset],
-				search_size,
-				data_container.interpolation_rate, 0, step, 1);
-			coarse_result.delay += search_offset;
+				fft_search_size,
+				data_container.interpolation_rate,
+				data_container.preamble_nSymb);
+
+			if(fft_coarse.correlation < 2.0)
+			{
+				// No preamble in search region.
+				coarse_result.delay = search_offset + fft_coarse.delay;
+				coarse_result.correlation = fft_coarse.correlation / (double)data_container.preamble_nSymb;
+				if(receive_stats.ofdm_search_raw > 0)
+					receive_stats.ofdm_search_raw = 0;
+			}
+			else
+			{
+				// Phase 2: GI+halfsym fine sync (step=1) in ±1 symbol window.
+				// FFT coarse gives symbol-period accuracy; GI correlation
+				// refines to exact GI boundary for proper OFDM demodulation.
+				int pream_interp = data_container.preamble_nSymb * sym_samples_wb;
+				int win_start = fft_coarse.delay - sym_samples_wb;
+				if(win_start < 0) win_start = 0;
+				int win_end = fft_coarse.delay + pream_interp + sym_samples_wb;
+				if(win_end > fft_search_size) win_end = fft_search_size;
+				int win_size = win_end - win_start;
+
+				if(win_size > pream_interp)
+				{
+					TimeSyncResult fine = ofdm.time_sync_preamble_with_metric(
+						&data_container.baseband_data_interpolated[search_offset + win_start],
+						win_size,
+						data_container.interpolation_rate, 0, 1, 1);
+					coarse_result.delay = search_offset + win_start + fine.delay;
+					coarse_result.correlation = fine.correlation;
+				}
+				else
+				{
+					coarse_result.delay = search_offset + fft_coarse.delay;
+					coarse_result.correlation = fft_coarse.correlation;
+				}
+			}
 			receive_stats.delay = coarse_result.delay;
 			receive_stats.coarse_metric = coarse_result.correlation;
 
 			if(g_verbose)
-				printf("[OFDM-SYNC] signal_start_symb=%d search_offset=%d metric=%.4f delay=%d\n",
-					signal_start_symb, search_offset, coarse_result.correlation, (int)receive_stats.delay);
+				printf("[OFDM-SYNC] signal_start_symb=%d search_offset=%d metric=%.4f delay=%d batch=%d\n",
+					signal_start_symb, search_offset, coarse_result.correlation, (int)receive_stats.delay,
+					receive_stats.ofdm_search_raw > 0 ? 1 : 0);
 		}
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
 
-		// OFDM forced delay: override time_sync result with known position.
-		// passband_to_baseband already ran (baseband populated), so this just
-		// redirects the demod to the correct preamble position.
-		if(ofdm_forced_delay >= 0 && M != MOD_MFSK) {
-			receive_stats.delay = ofdm_forced_delay;
-			receive_stats.coarse_metric = 1.0;  // bypass metric gate
-			pream_symb_loc = receive_stats.delay / (data_container.Nofdm * data_container.interpolation_rate);
-			if(pream_symb_loc < 1) { pream_symb_loc = 1; }
-		}
 	}
 
 	// MFSK frame completeness check: if the frame extends beyond the buffer,
@@ -952,18 +1067,37 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 	// Recovery for OFDM when preamble lands outside the valid bounds.
 	// Even with full-buffer coarse search, Schmidl-Cox may peak at a position
-	// too close to the start or end to extract a complete frame. Scan the full
+	// too close to the start or end to extract a complete frame. Scan the
 	// buffer for signal energy and re-run Schmidl-Cox from the signal start.
+	//
+	// IMPORTANT: Respect anti-re-decode. When ofdm_search_raw has advanced past
+	// upper_bound, the search region has no room for complete frames. The recovery
+	// must NOT rescan from the start (which would re-find already-decoded frames).
 	if(M != MOD_MFSK && !(pream_symb_loc > lower_bound && pream_symb_loc <= upper_bound))
 	{
+		// Anti-re-decode check: if skip is past upper_bound, there are no
+		// un-decoded frames left in the buffer. Skip recovery → FAIL → buffer shift.
+		int ofdm_eff = receive_stats.ofdm_search_raw - data_container.nUnder_processing_events;
+		if(ofdm_eff < 0) ofdm_eff = 0;
+		if(ofdm_eff > upper_bound)
+		{
+			// No room for new frames — force FAIL
+			pream_symb_loc = 0;
+		}
+		else
+		{
+
 		int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
 		int buf_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 
 		if (g_verbose) printf("[OFDM-SYNC] bounds-failed: pream_symb=%d, scanning full buffer for signal\n", pream_symb_loc);
 		fflush(stdout);
 
+		// Start scan from anti-re-decode position to avoid re-finding old preambles
+		int scan_start = lower_bound + 1;
+		if(ofdm_eff > scan_start) scan_start = ofdm_eff;
 		int signal_start_symb = -1;
-		for(int s = lower_bound + 1; s <= upper_bound; s++)
+		for(int s = scan_start; s <= upper_bound; s++)
 		{
 			int offset = s * sym_samples;
 			double e = 0.0;
@@ -1026,6 +1160,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				}
 			}
 		}
+		} // else: recovery with anti-re-decode scan
 	}
 
 	if(pream_symb_loc > lower_bound && pream_symb_loc <= upper_bound)
@@ -2343,6 +2478,7 @@ void cl_telecom_system::init()
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
 	receive_stats.mfsk_search_raw=0;
+	receive_stats.ofdm_search_raw=0;
 	receive_stats.time_peak_symb_location=0;
 	receive_stats.time_peak_subsymb_location=0;
 	receive_stats.sync_trials=0;
@@ -3149,18 +3285,17 @@ void cl_telecom_system::load_configuration(int configuration)
 	// NB MFSK: 8-symbol preamble for cross-correlation detection
 	if(narrowband_enabled && M == MOD_MFSK)
 		ofdm.preamble_configurator.Nsymb = 8;
-	// Fix A: NB OFDM estimator override.
+	// Fix A: NB OFDM estimator override — ZF for ALL NB configs.
 	// ZF (per-pilot H=Y/P) is immune to phase rotation from residual freq
-	// offset (Bug #51) but noisy on Nc=10. Works well for phase-only mods.
-	// LS averages across Dy=3 pilot rows — smooths noise, critical for QAM
-	// amplitude discrimination. Phase rotation is handled by CPE_correction
-	// which runs before the estimator in the RX chain.
+	// offset (Bug #51). With Nc=10, LS averaging was tried for QAM amplitude
+	// discrimination, but CONFIG_15-16 (preamble_nSymb 1-2) fail to decode
+	// reliably: LS's cross-pilot averaging + small NB pilot grid → noisy H
+	// estimates on high-order QAM. ZF handles both amplitude and phase
+	// per-pilot and works for all modulations on VB-Cable. CPE_correction
+	// still runs pre-estimator for any residual freq offset.
 	if(narrowband_enabled && ofdm_channel_estimator == LEAST_SQUARE)
 	{
-		if(M == MOD_16QAM || M == MOD_32QAM || M == MOD_64QAM)
-			ofdm_channel_estimator = LEAST_SQUARE; // keep LS — CPE handles phase
-		else
-			ofdm_channel_estimator = ZERO_FORCE;   // phase-only mods: ZF is fine
+		ofdm_channel_estimator = ZERO_FORCE;
 	}
 	ofdm.channel_estimator=ofdm_channel_estimator;
 
@@ -3452,6 +3587,7 @@ void cl_telecom_system::load_configuration(int configuration)
 	receive_stats.delay_of_last_decoded_message = -1;
 	receive_stats.freq_offset_of_last_decoded_message = 0;
 	receive_stats.mfsk_search_raw = 0;
+	receive_stats.ofdm_search_raw = 0;
 
 	printf("[PHY] Config %d active: M=%.0f LDPC_rate=%.3f BW=%.0fHz Nc=%d Nsymb=%d nBits=%d\n",
 		current_configuration, M, ldpc.rate, bandwidth,

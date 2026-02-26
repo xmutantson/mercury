@@ -2139,9 +2139,11 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 	// Coarse search: step by symbol period, per-bin coherent metric
 	int n_coarse = (buffer_size_interp - preamble_interp) / symbol_interp;
 	if(n_coarse < 0) n_coarse = 0;
+	if(n_coarse > 255) n_coarse = 255;  // safety cap for local arrays
 
 	double best_coarse_metric = -1.0;
 	int best_coarse_pos = 0;
+	double coarse_metrics[256];
 
 	std::complex<double> bin_accum[256];
 
@@ -2174,13 +2176,31 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 		}
 
 		double metric = 0.0;
-		for(int b = 0; b < max_bins; b++)
+		for(int b = 0; b < n_preamble_bins_per_sym[0]; b++)
 			metric += std::norm(bin_accum[b]);
 
+		coarse_metrics[pos] = metric;
 		if(metric > best_coarse_metric)
 		{
 			best_coarse_metric = metric;
 			best_coarse_pos = sample_start;
+		}
+	}
+
+	// Prefer earliest position with metric >= 50% of max.
+	// Preamble gives ~Nsymb² × E, data gives ~Nsymb × E (random walk).
+	// At ratio 4:1, 50% of preamble max is 2× average data max —
+	// data never reaches this, so the earliest preamble is always selected.
+	// This prevents the FFT from jumping to a later frame when an earlier
+	// preamble has slightly lower metric (e.g., timing offset effects).
+	double early_threshold = best_coarse_metric * 0.5;
+	for(int pos = 0; pos <= n_coarse; pos++)
+	{
+		if(coarse_metrics[pos] >= early_threshold)
+		{
+			best_coarse_metric = coarse_metrics[pos];
+			best_coarse_pos = pos * symbol_interp;
+			break;
 		}
 	}
 

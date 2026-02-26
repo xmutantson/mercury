@@ -234,7 +234,24 @@ void cl_arq_controller::process_messages_rx_data_control()
 				fflush(stdout);
 				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
 				batch_rx_frame_count++;
-				set_receiving_timeout((data_batch_size-messages_rx_buffer.sequence_number-1)*message_transmission_time_ms+time_left_to_send_last_frame+ptt_on_delay_ms);
+
+				// Note: early completion removed — commander sends all
+				// data_batch_size frames (including padding). Sending ACK
+				// before all frames finish TX causes audio collision on
+				// VB-Cable and half-duplex channels. Timer handles completion.
+
+				{
+					// Add one msg_time margin for FAIL recovery: after each
+					// decode, SC may find false peaks in the old frame body
+					// (1-2 FAIL iterations × ~300ms each). Without margin,
+					// the last frame's timeout is ~400ms and a single FAIL
+					// causes the timer to fire before the real frame is found.
+					int rx_timeout = (data_batch_size-messages_rx_buffer.sequence_number-1)
+						*message_transmission_time_ms
+						+time_left_to_send_last_frame+ptt_on_delay_ms
+						+message_transmission_time_ms;
+					set_receiving_timeout(rx_timeout);
+				}
 				receiving_timer.start();
 			}
 			messages_rx_buffer.status=FREE;
@@ -530,32 +547,60 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		// Send ACK tone pattern (universal, all modes)
 		if(repeating_last_ack==NO)
 		{
-			// Gate: require all frames in batch decoded before sending ACK.
+			// Gate: require all expected frames before sending ACK.
 			// Pattern ACK carries no per-frame info — commander marks ALL
 			// pending frames as ACKED. If we only decoded a partial batch,
 			// suppress ACK so commander times out and retransmits.
-			// After 2 consecutive NAcks, emergency BREAK drops config.
-			if(data_batch_size > 1 && batch_rx_frame_count < data_batch_size)
+			//
+			// Use actual RECEIVED slot count (immune to OFDM re-decode).
+			// With compression + no zero-padding, expected frames < data_batch_size.
+			// Derive expected count from compression header in frame 0.
+			int rx_received = 0;
+			for(int i = 0; i < data_batch_size; i++)
+				if(messages_rx[i].status == RECEIVED) rx_received++;
+
+			int expected = data_batch_size;  // Default for non-compressed
+			if(compression_enabled
+				&& messages_rx[0].status == RECEIVED
+				&& messages_rx[0].length >= COMPRESS_HEADER_SIZE)
 			{
-				printf("[ACK-GATE] Suppressing ACK: decoded %d/%d frames, waiting for retransmit\n",
-					batch_rx_frame_count, data_batch_size);
+				const unsigned char* hdr = (const unsigned char*)messages_rx[0].data;
+				int hdr_comp = hdr[1] | (hdr[2] << 8);
+				int total_compressed = COMPRESS_HEADER_SIZE + hdr_comp;
+				int mf = max_data_length + max_header_length - DATA_LONG_HEADER_LENGTH;
+				expected = (total_compressed + mf - 1) / mf;
+				if(expected > data_batch_size) expected = data_batch_size;
+				if(expected < 1) expected = 1;
+			}
+
+			if(data_batch_size > 1 && rx_received < expected)
+			{
+				printf("[ACK-GATE] Suppressing: received %d/%d (expected %d)\n",
+					rx_received, data_batch_size, expected);
 				fflush(stdout);
-				// Free partial messages so retransmit can re-populate slots
-				for(int i=0; i<this->nMessages; i++)
-				{
-					if(messages_rx[i].status==RECEIVED)
-					{
-						messages_rx[i].status=FREE;
-					}
-				}
+				// Keep partial messages_rx (DON'T free) — add_message_rx_data
+				// overwrites unconditionally, so retransmit fills in missing
+				// frames while already-received frames are preserved.
 				stats.nNAcked_data++;
 				batch_rx_frame_count = 0;
+				// Reset RX state for fresh retransmission capture
+				telecom_system->data_container.frames_to_read =
+					telecom_system->data_container.preamble_nSymb
+					+ telecom_system->get_active_nsymb();
+				telecom_system->data_container.nUnder_processing_events = 0;
+				// DON'T reset search_raw here. If the timer fires mid-batch
+				// while frames are still arriving, resetting to 0 causes
+				// re-decode of already-received frames. Keep position so
+				// the decode loop continues forward through the buffer.
 				// Return to RECEIVING — commander will timeout and retransmit
 				calculate_receiving_timeout();
 				receiving_timer.start();
 				connection_status=RECEIVING;
 				return;
 			}
+			printf("[ACK-GATE] PASS: received %d/%d (expected %d)\n",
+				rx_received, data_batch_size, expected);
+			fflush(stdout);
 
 			// Mark all received messages as ACKED and count for stats
 			for(int i=0; i<this->nMessages; i++)

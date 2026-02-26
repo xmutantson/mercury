@@ -266,6 +266,7 @@ public:
 
   void copy_data_to_buffer();
   void restore_backup_buffer_data();
+  void restore_tx_from_compressed();  // Decompress messages_tx back to raw in fifo_buffer_tx
 
 	//! Receives a data or a control message from the other end (via ALSA driver).
 	    /*!
@@ -370,6 +371,7 @@ public:
   bool wb_upgrade_pending;     // True between SWITCH_BANDWIDTH send and ACK
   cl_compressor compressor;           // Block compression (PPMd + zstd)
   bool compression_enabled;           // Negotiated: both sides have CAP_COMPRESSION
+  float compress_ratio_estimate;      // Running compression ratio (raw/compressed), init 2.0
   int gear_shift_algorithm;
   double gear_shift_up_success_rate_precentage;
   double gear_shift_down_success_rate_precentage;

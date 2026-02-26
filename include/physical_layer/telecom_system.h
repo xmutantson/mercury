@@ -91,6 +91,7 @@ struct st_receive_stats{
 	int crc;
 	int all_zeros;
 	int mfsk_search_raw;  // MFSK anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
+	int ofdm_search_raw;  // OFDM anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
 	int frame_overflow_symbols;  // >0: MFSK frame extends beyond captured audio by this many symbols
 	double coarse_metric;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
 };

@@ -1,6 +1,11 @@
 /*
  * Mercury block compression — adaptive dual-algorithm (PPMd + zstd).
  *
+ * Operates at **batch level**: the ARQ layer accumulates an entire batch
+ * of raw data (potentially several KB), compresses it as one block, then
+ * splits the compressed output across individual frames.  This gives the
+ * compressor enough context for real compression ratios (3-5× on text).
+ *
  * Each compressed block carries a 5-byte header:
  *   [algo:1][comp_size:2 LE][orig_size:2 LE][payload...]
  *
@@ -28,18 +33,22 @@
 #define ENTROPY_ZSTD_ONLY       6.0f   // Mixed — try zstd only
                                        // Below 6.0: try both PPMd and zstd
 
+#define COMPRESS_WORKSPACE_SIZE  65536  // 64 KB workspace for intermediate buffers
+
 class cl_compressor {
 public:
     cl_compressor();
     ~cl_compressor();
 
-    void init();       // Allocate PPMd model and zstd contexts
-    void deinit();     // Free all contexts
+    void init();       // Allocate PPMd model, zstd contexts, workspace
+    void deinit();     // Free all contexts and workspace
 
     // TX: compress input block, write header+payload to output.
+    // Input can be up to COMPRESS_WORKSPACE_SIZE bytes (batch-level).
     // Tries PPMd and/or zstd based on entropy, picks smallest.
     // Falls back to raw if compression doesn't help.
     // Returns total bytes written (header + payload), or 0 on error.
+    // Returns -1 if raw doesn't fit either (caller must reduce input).
     int compress_block(const char* in, int in_len, char* out, int out_capacity);
 
     // RX: decompress a single block (header + payload already assembled).
@@ -57,6 +66,8 @@ private:
     void* ppmd_mem;    // PPMd allocator memory
     void* zstd_cctx;   // ZSTD_CCtx*
     void* zstd_dctx;   // ZSTD_DCtx*
+    unsigned char* workspace;  // Temp buffer for PPMd/zstd intermediate output
+    int workspace_size;
     bool initialized;
 };
 
