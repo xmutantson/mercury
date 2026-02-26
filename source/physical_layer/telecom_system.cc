@@ -732,6 +732,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.sync_trials=0;
 
+	// Timing breakdown
+	double timing_pb_tsync_ms = 0, timing_pb_data_ms = 0, timing_ldpc_ms = 0;
+	auto timing_total_start = std::chrono::steady_clock::now();
+
 	int step=100;
 	int pream_symb_loc;
 
@@ -757,7 +761,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	}
 	else
 	{
+		auto t0_pb = std::chrono::steady_clock::now();
 		ofdm.passband_to_baseband((double*)data,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,carrier_frequency,carrier_amplitude,1,&ofdm.FIR_rx_time_sync);
+		auto t1_pb = std::chrono::steady_clock::now();
+		timing_pb_tsync_ms = std::chrono::duration<double, std::milli>(t1_pb - t0_pb).count();
 
 		receive_stats.signal_stregth_dbm=ofdm.measure_signal_stregth(data_container.baseband_data_interpolated, data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate);
 
@@ -871,35 +878,35 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// Scale position back to 48 kHz
 			int coarse_delay_interp = coarse_bb.delay * interp;
 
-			// Phase 2: fine sync in ±1 symbol around the coarse position.
+			// Phase 2: fine sync around the coarse position.
 			int sym_interp = data_container.Nofdm * interp;
 			int buf_interp = buf_bb * interp;
 
 			if(data_container.preamble_nSymb <= 2)
 			{
 				// Short-preamble configs (QAM: 1-2 preamble symbols).
-				// GI+halfsym over 1-2 symbols gives only 576-1152 correlation
-				// samples — insufficient for QAM fine timing. Instead, use
-				// GI-only correlation over ALL symbols in the frame (preamble
-				// + data). Data symbols have GI too. For CONFIG_16 NB:
-				// 46 symbols × 64 GI samples = 2944 correlation samples.
+				// Halfsym coarse detection with 1-2 symbols is weak (128-256
+				// correlation samples), so widen Phase 2 to ±3 symbols to
+				// tolerate coarse errors. GI-only correlation over ALL frame
+				// symbols provides robust discrimination: e.g. CONFIG_16 NB
+				// = 46 symbols × 128 GI samples = 5888 total correlation.
+				// Two-pass search: coarse step=4 over ±3 symbols, then
+				// refine to sample-level in ±8 around the coarse peak.
 				int frame_symb = data_container.preamble_nSymb + get_active_nsymb();
 				int frame_len = frame_symb * sym_interp;
 				int Ngi_interp = data_container.Ngi * interp;
 				int Nfft_interp = data_container.Nfft * interp;
 
-				int gi_start = coarse_delay_interp - sym_interp;
+				int search_syms = 3;  // ±3 symbols (was ±1)
+				int gi_start = coarse_delay_interp - search_syms * sym_interp;
 				if(gi_start < 0) gi_start = 0;
-				int gi_end = coarse_delay_interp + sym_interp;
+				int gi_end = coarse_delay_interp + search_syms * sym_interp;
 				if(gi_end + frame_len > buf_interp)
 					gi_end = buf_interp - frame_len;
 				if(gi_end < gi_start) gi_end = gi_start;
 
-				double best_corr = -1.0;
-				int best_pos = coarse_delay_interp;
-
-				for(int pos = gi_start; pos <= gi_end; pos++)
-				{
+				// Lambda: evaluate GI correlation metric at a given position.
+				auto gi_metric = [&](int pos) -> double {
 					double corr = 0, na = 0, nb = 0;
 					for(int s = 0; s < frame_symb; s++)
 					{
@@ -914,13 +921,38 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						}
 					}
 					if(na > 0.001 && nb > 0.001)
+						return corr / sqrt(na * nb);
+					return -1.0;
+				};
+
+				// Pass 1: coarse search with step=4.
+				double best_corr = -1.0;
+				int best_pos = coarse_delay_interp;
+				int coarse_step = 4;
+
+				for(int pos = gi_start; pos <= gi_end; pos += coarse_step)
+				{
+					double metric = gi_metric(pos);
+					if(metric > best_corr)
 					{
-						double metric = corr / sqrt(na * nb);
-						if(metric > best_corr)
-						{
-							best_corr = metric;
-							best_pos = pos;
-						}
+						best_corr = metric;
+						best_pos = pos;
+					}
+				}
+
+				// Pass 2: refine to sample-level in ±8 around coarse peak.
+				int fine_start = best_pos - 8;
+				if(fine_start < gi_start) fine_start = gi_start;
+				int fine_end = best_pos + 8;
+				if(fine_end > gi_end) fine_end = gi_end;
+
+				for(int pos = fine_start; pos <= fine_end; pos++)
+				{
+					double metric = gi_metric(pos);
+					if(metric > best_corr)
+					{
+						best_corr = metric;
+						best_pos = pos;
 					}
 				}
 
@@ -1469,21 +1501,29 @@ skip_h_retry_point:
 			// Use corrected carrier frequency if coarse sync applied
 			double effective_carrier_freq = carrier_frequency + coarse_freq_offset;
 
-			ofdm.passband_to_baseband((double*)data,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,effective_carrier_freq,carrier_amplitude,1,&ofdm.FIR_rx_data);
-
-			// FIR apply() already compensates for group delay (output[0] aligns
-			// with input[0]), so no delay correction between filters is needed.
-			// Bug #41: The old formula (nTaps_data - nTaps_timesync)/2 added 56
-			// passband samples for NB (=14 baseband samples), consuming 87% of
-			// the 16-sample guard interval and causing ICI → mean_H ≈ 0.10.
-			// For WB both filters had the same nTaps, so correction was 0.
+			// Compute extraction range before data FIR so we can scope it.
 			int extraction_delay = receive_stats.delay;
-
 			int buf_size_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 			int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
 			if(extraction_delay < 0) extraction_delay = 0;
 			if(extraction_delay > buf_size_interp - frame_size_interp)
 				extraction_delay = buf_size_interp - frame_size_interp;
+
+			// Scoped data FIR: only process the frame region + FIR margin.
+			// The time_sync FIR already processed the full buffer for preamble search;
+			// the data FIR only needs the frame. Saves 80-90% for high configs
+			// where frame (10 symbols) is much smaller than buffer (113 symbols).
+			int fir_margin = ofdm.FIR_rx_data.filter_nTaps * frequency_interpolation_rate;
+			int pb_start = extraction_delay - fir_margin;
+			if(pb_start < 0) pb_start = 0;
+			int pb_end = extraction_delay + frame_size_interp + fir_margin;
+			if(pb_end > buf_size_interp) pb_end = buf_size_interp;
+			int pb_size = pb_end - pb_start;
+
+			auto t2_pb = std::chrono::steady_clock::now();
+			ofdm.passband_to_baseband(&data[pb_start],pb_size,&data_container.baseband_data_interpolated[pb_start],sampling_frequency,effective_carrier_freq,carrier_amplitude,1,&ofdm.FIR_rx_data,pb_start);
+			auto t3_pb = std::chrono::steady_clock::now();
+			timing_pb_data_ms += std::chrono::duration<double, std::milli>(t3_pb - t2_pb).count();
 
 			ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
 
@@ -1536,8 +1576,11 @@ skip_h_retry_point:
 			}
 			else if(fabs(freq_offset_measured)>ofdm.freq_offset_ignore_limit)
 			{
-				// Apply fine correction on top of coarse correction
-				ofdm.passband_to_baseband((double*)data,(data_container.Nofdm*data_container.buffer_Nsymb)*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,effective_carrier_freq+freq_offset_measured,carrier_amplitude,1,&ofdm.FIR_rx_data);
+				// Apply fine correction on top of coarse correction (scoped to frame region)
+				auto t6_pb = std::chrono::steady_clock::now();
+				ofdm.passband_to_baseband(&data[pb_start],pb_size,&data_container.baseband_data_interpolated[pb_start],sampling_frequency,effective_carrier_freq+freq_offset_measured,carrier_amplitude,1,&ofdm.FIR_rx_data,pb_start);
+				auto t7_pb = std::chrono::steady_clock::now();
+				timing_pb_data_ms += std::chrono::duration<double, std::milli>(t7_pb - t6_pb).count();
 				ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
 			}
 			{
@@ -1694,7 +1737,10 @@ skip_h_retry_point:
 				data_container.deinterleaved_data[nReal_data+i]=data_container.deinterleaved_data[i];
 			}
 
+			auto t4_ldpc = std::chrono::steady_clock::now();
 			receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit);
+			auto t5_ldpc = std::chrono::steady_clock::now();
+			timing_ldpc_ms += std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
 
 			bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, data_container.hd_decoded_data_bit, nReal_data);
 
@@ -1901,6 +1947,25 @@ skip_h_retry_point:
 		std::cout<<"decoded in "<< receive_stats.iterations_done<<" iterations."<<std::endl;
 	}
 
+	// Timing breakdown (printed periodically to avoid log flood)
+	{
+		auto timing_total_end = std::chrono::steady_clock::now();
+		double timing_total_ms = std::chrono::duration<double, std::milli>(timing_total_end - timing_total_start).count();
+		double frame_samples = (double)(data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb) * data_container.interpolation_rate);
+		double frame_ms = (frame_samples / 48000.0) * 1000.0;
+		static int timing_print_counter = 0;
+		if(timing_print_counter++ % 20 == 0)
+		{
+			printf("[TIMING] total=%.1fms (%.0f%% of %.0fms frame) | pb_tsync=%.1f pb_data=%.1f ldpc=%.1f other=%.1f | buf_symb=%d frame_symb=%d iter=%d\n",
+				timing_total_ms, frame_ms > 0 ? 100.0*timing_total_ms/frame_ms : 0, frame_ms,
+				timing_pb_tsync_ms, timing_pb_data_ms, timing_ldpc_ms,
+				timing_total_ms - timing_pb_tsync_ms - timing_pb_data_ms - timing_ldpc_ms,
+				(int)data_container.buffer_Nsymb,
+				data_container.preamble_nSymb + data_container.Nsymb,
+				receive_stats.iterations_done);
+			fflush(stdout);
+		}
+	}
 
 #ifdef MERCURY_GUI_ENABLED
 	// Update GUI with receive statistics
@@ -3269,6 +3334,8 @@ void cl_telecom_system::load_configuration(int configuration)
 		// consistent state — never an intermediate mix.
 		if(reinit_subsystems.data_container==YES)
 		{
+			printf("[PHY-SWITCH] Taking capture_prep_mutex, zeroing Nofdm/buffer_Nsymb\n");
+			fflush(stdout);
 			MUTEX_LOCK(&capture_prep_mutex);
 			capture_mutex_held = true;
 			data_container.Nofdm = 0;
@@ -3276,7 +3343,11 @@ void cl_telecom_system::load_configuration(int configuration)
 			data_container.data_ready = 0;
 		}
 
+		printf("[PHY-SWITCH] deinit() start\n");
+		fflush(stdout);
 		this->deinit();
+		printf("[PHY-SWITCH] deinit() done\n");
+		fflush(stdout);
 	}
 
 	M=_modulation;
@@ -3430,13 +3501,21 @@ void cl_telecom_system::load_configuration(int configuration)
 	}
 	if(reinit_subsystems.telecom_system==YES)
 	{
+		printf("[PHY-SWITCH] init() start (nb=%d M=%d config=%d)\n",
+			narrowband_enabled, M, current_configuration);
+		fflush(stdout);
 		this->init();
+		printf("[PHY-SWITCH] init() done (Nc=%d Nsymb=%d Nofdm=%d buffer_Nsymb=%d)\n",
+			ofdm.Nc, ofdm.Nsymb, (int)data_container.Nofdm, (int)data_container.buffer_Nsymb);
+		fflush(stdout);
 
 		// Bug #42: Release the mutex after init() has fully set up the new
 		// data_container buffers and parameters. The capture_prep thread will
 		// now see a fully consistent new state.
 		if(capture_mutex_held)
 		{
+			printf("[PHY-SWITCH] Releasing capture_prep_mutex\n");
+			fflush(stdout);
 			MUTEX_UNLOCK(&capture_prep_mutex);
 			capture_mutex_held = false;
 		}

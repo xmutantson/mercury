@@ -2966,7 +2966,7 @@ void cl_ofdm::baseband_to_passband(std::complex <double>* in, int in_size, doubl
 		passband_start_sample++;
 	}
 }
-void cl_ofdm::passband_to_baseband(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int decimation_rate, cl_FIR* filter)
+void cl_ofdm::passband_to_baseband(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int decimation_rate, cl_FIR* filter, int sample_offset)
 {
 	double sampling_interval=1.0/sampling_frequency;
 
@@ -2982,8 +2982,8 @@ void cl_ofdm::passband_to_baseband(double* in, int in_size, std::complex <double
 
 	for(int i=0;i<in_size;i++)
 	{
-		p2b_l_data[i].real(in[i]*carrier_amplitude*cos(2*M_PI*carrier_frequency*(double)i * sampling_interval));
-		p2b_l_data[i].imag(in[i]*carrier_amplitude*sin(2*M_PI*carrier_frequency*(double)i * sampling_interval));
+		p2b_l_data[i].real(in[i]*carrier_amplitude*cos(2*M_PI*carrier_frequency*(double)(i+sample_offset) * sampling_interval));
+		p2b_l_data[i].imag(in[i]*carrier_amplitude*sin(2*M_PI*carrier_frequency*(double)(i+sample_offset) * sampling_interval));
 	}
 
 	filter->apply(p2b_l_data,p2b_data_filtered,in_size);

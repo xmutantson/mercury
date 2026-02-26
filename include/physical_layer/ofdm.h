@@ -161,7 +161,7 @@ public:
 	int symbol_sync(std::complex <double>*, int size, int interpolation_rate, int location_to_return);
 	void rational_resampler(std::complex <double>* in, int in_size , std::complex <double>* out, int rate, int interpolation_decimation);
 	void baseband_to_passband(std::complex <double>* in, int in_size, double* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int interpolation_rate);
-	void passband_to_baseband(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int decimation_rate, cl_FIR* filter);
+	void passband_to_baseband(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int decimation_rate, cl_FIR* filter, int sample_offset=0);
 	struct st_channel_complex * estimated_channel, *estimated_channel_without_amplitude_restoration;
 	int Nfft,Nc,Nsymb;
 	float gi;

@@ -443,8 +443,10 @@ void cl_arq_controller::process_messages_acknowledging_control()
 					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
 						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						if(narrowband_enabled == YES && snr_target > NB_CONFIG_MAX)
-							snr_target = NB_CONFIG_MAX;
+						// Enforce bandwidth ceiling
+						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_15;
+						if(snr_target > cfg_ceiling)
+							snr_target = cfg_ceiling;
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
