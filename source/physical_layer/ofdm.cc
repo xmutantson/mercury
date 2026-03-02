@@ -127,6 +127,8 @@ void cl_ofdm::init()
 	ffted_data=CNEW(std::complex<double>, Nfft, "ofdm.ffted_data");
 	estimated_channel=CNEW(struct st_channel_complex, this->Nsymb*this->Nc, "ofdm.estimated_channel");
 	estimated_channel_without_amplitude_restoration=CNEW(struct st_channel_complex, this->Nsymb*this->Nc, "ofdm.est_channel_noamp");
+	carried_channel=CNEW(struct st_channel_complex, this->Nc, "ofdm.carried_channel");
+	channel_carry_valid=false;
 	ofdm_preamble = CNEW(struct st_carrier, this->preamble_configurator.Nsymb*this->Nc, "ofdm.ofdm_preamble");
 	passband_start_sample=0;
 
@@ -185,6 +187,8 @@ void cl_ofdm::deinit()
 	CDELETE(gi_removed_data);
 	CDELETE(ffted_data);
 	CDELETE(estimated_channel);
+	CDELETE(carried_channel);
+	channel_carry_valid = false;
 	CDELETE(estimated_channel_without_amplitude_restoration);
 	if(p2b_l_data!=NULL){delete[] p2b_l_data; p2b_l_data=NULL;}
 	if(p2b_data_filtered!=NULL){delete[] p2b_data_filtered; p2b_data_filtered=NULL;}
@@ -1493,6 +1497,36 @@ void cl_ofdm::CPE_correction(std::complex<double>* in)
 		for (int j = 0; j < Nc; j++)
 		{
 			*(in + i * Nc + j) *= correction;
+		}
+	}
+}
+
+void cl_ofdm::save_carried_channel()
+{
+	// Save last pilot row's channel estimate for carry-through to next frame.
+	// Last row (Nsymb-1) is always PILOT per pilot policy.
+	int last_row = Nsymb - 1;
+	for(int j = 0; j < Nc; j++)
+	{
+		carried_channel[j] = estimated_channel[last_row * Nc + j];
+	}
+	channel_carry_valid = true;
+}
+
+void cl_ofdm::seed_carried_channel()
+{
+	// Seed row 0 non-pilot positions from carried channel (previous frame's last row).
+	// Called AFTER ZF/LS estimation, which marks pilots as MEASURED and extrapolates
+	// the rest. Carried channel from the same session is more accurate than row 0
+	// extrapolation (which spans 3+ pilot rows). Skip actual pilot positions (MEASURED
+	// from real data) — only override INTERPOLATED/UNKNOWN positions.
+	if(!channel_carry_valid) return;
+	for(int j = 0; j < Nc; j++)
+	{
+		if(estimated_channel[0 * Nc + j].status != MEASURED)
+		{
+			estimated_channel[0 * Nc + j] = carried_channel[j];
+			estimated_channel[0 * Nc + j].status = MEASURED;
 		}
 	}
 }

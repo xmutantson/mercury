@@ -158,11 +158,15 @@ public:
 
 	double output_power_Watt;
 
-	void transmit_bit(int *data, double *out, int message_location);
+	void transmit_bit(int *data, double *out, int message_location, bool suppress_preamble=false);
 	st_receive_stats receive_bit(double *data, int *out);
 
-	void transmit_byte(int* data, int nBytes, double *out, int message_location);
+	void transmit_byte(int* data, int nBytes, double *out, int message_location, bool suppress_preamble=false);
+	int get_frame_output_size(bool with_preamble=true);
 	st_receive_stats receive_byte(double *data, int* out);
+
+	// Preamble-less RX state: set by ARQ before each receive_byte() call
+	bool rx_expect_preamble;
 
 	// Lightweight signal measurement only (no decoding)
 	double measure_signal_only(double *data);

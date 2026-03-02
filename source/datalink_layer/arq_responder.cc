@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include <algorithm>
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -457,8 +458,30 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				}
 			}
 
+			// Drift exchange: check before turboshift (only active when TURBO_DONE)
+			if(drift_exchange_phase == DRIFT_P3_REPORT_PENDING)
+			{
+				// Phase 3: I'm now commander (was responder). Send DRIFT_REPORT with my good measurement.
+				printf("[PREAMBLE] Phase 3: became commander, sending DRIFT_REPORT (drift=%.3f, good)\n",
+					measured_drift_local);
+				fflush(stdout);
+				drift_exchange_phase = DRIFT_P3_REPORT_TX;
+				add_message_control(DRIFT_REPORT);
+				this->connection_status = TRANSMITTING_CONTROL;
+			}
+			else if(drift_exchange_phase == DRIFT_P5_REPORT_PENDING)
+			{
+				// Phase 5: restored as original commander. Send final DRIFT_REPORT with measurement
+				// from Phase 3 data reception.
+				printf("[PREAMBLE] Phase 5: restored as commander, sending DRIFT_REPORT (drift=%.3f, good)\n",
+					measured_drift_local);
+				fflush(stdout);
+				drift_exchange_phase = DRIFT_P5_REPORT_TX;
+				add_message_control(DRIFT_REPORT);
+				this->connection_status = TRANSMITTING_CONTROL;
+			}
 			// Turboshift: start probing reverse direction as new commander
-			if(has_asymmetric && turboshift_phase == TURBO_FORWARD && gear_shift_on == YES)
+			else if(has_asymmetric && turboshift_phase == TURBO_FORWARD && gear_shift_on == YES)
 			{
 				turboshift_phase = TURBO_REVERSE;
 				turboshift_active = true;
@@ -675,6 +698,26 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		// sending pattern ACK. Commander finalizes locally in parallel.
 		copy_data_to_buffer();
 		messages_last_ack_bu.type=NONE;
+
+		// Drift measurement (responder side): measure from commander's OFDM data frames
+		if(turboshift_phase == TURBO_DONE && !drift_measurement_done
+			&& (local_capability & CAP_PREAMBLE_SUPPRESS) && (peer_capability & CAP_PREAMBLE_SUPPRESS))
+		{
+			if(drift_measurement_batch_count < 0 && current_configuration >= CONFIG_5)
+			{
+				drift_measurement_batch_count = 0;
+				if(drift_exchange_phase == DRIFT_IDLE)
+					drift_exchange_phase = DRIFT_MEASURING;
+				printf("[PREAMBLE] Responder drift measurement starting at CONFIG_%d\n",
+					current_configuration);
+				fflush(stdout);
+			}
+			if(drift_measurement_batch_count >= 0)
+			{
+				drift_measurement_batch_count++;
+				measured_drift_local = telecom_system->receive_stats.ofdm_drift_per_frame;
+			}
+		}
 
 		calculate_receiving_timeout();
 		receiving_timer.start();
@@ -967,7 +1010,7 @@ void cl_arq_controller::process_control_responder()
 
 
 	}
-	else if(link_status==CONNECTED && (code==SET_CONFIG || code==BLOCK_END || code==FILE_END_ || code==SWITCH_ROLE || code==REPEAT_LAST_ACK || code==SWITCH_BANDWIDTH))
+	else if(link_status==CONNECTED && (code==SET_CONFIG || code==BLOCK_END || code==FILE_END_ || code==SWITCH_ROLE || code==REPEAT_LAST_ACK || code==SWITCH_BANDWIDTH || code==DRIFT_REPORT))
 	{
 		if(code==SWITCH_BANDWIDTH)
 		{
@@ -1037,36 +1080,68 @@ void cl_arq_controller::process_control_responder()
 		}
 		else if(code==SWITCH_ROLE)
 		{
+			// Advance drift exchange phase on SWITCH_ROLE
+			if(drift_exchange_phase == DRIFT_P1_SWITCH_PENDING)
+			{
+				drift_exchange_phase = DRIFT_P3_REPORT_PENDING;
+				printf("[PREAMBLE] Phase 1→3: SWITCH_ROLE received, will become commander\n");
+				fflush(stdout);
+			}
+			else if(drift_exchange_phase == DRIFT_P3_DATA || drift_exchange_phase == DRIFT_P3_REPORT_PENDING)
+			{
+				drift_exchange_phase = DRIFT_P5_REPORT_PENDING;
+				printf("[PREAMBLE] Phase 3→5: SWITCH_ROLE received, will become commander\n");
+				fflush(stdout);
+			}
+
 			connection_status=ACKNOWLEDGING_CONTROL;
 			printf("switch role\n");
 			copy_data_to_buffer();
 			link_timer.start();
 			watchdog_timer.start();
-			// Received data test code
-//			char data,data2;
-//			int error=NO;
-//			srand(5);
-//			int nRec= fifo_buffer_rx.get_size()-fifo_buffer_rx.get_free_size();
-//			std::cout<<"nRec= "<<nRec<<std::endl;
-//			for(int i=0;i<nRec;i++)
-//			{
-//				fifo_buffer_rx.pop(&data, 1);
-//				data2=(char)(rand()%0xff);
-//				if(data!=data2)
-//				{
-//					std::cout<<"error @" <<i<<" data="<<(int)data<<" data2="<<(int)data2<<std::endl;
-//					error=YES;
-//				}
-//			}
-//			if(error==YES)
-//			{
-//				exit(0);
-//			}
-//			else
-//			{
-//				std::cout<<"all is good"<<std::endl;
-//				exit(0);
-//			}
+		}
+		else if(code==DRIFT_REPORT)
+		{
+			int16_t fp8 = (int16_t)(((unsigned char)messages_control.data[1] << 8) |
+			               (unsigned char)messages_control.data[2]);
+			measured_drift_remote = (float)fp8 / 256.0f;
+			printf("[PREAMBLE] Received DRIFT_REPORT from commander: drift=%.3f samples/frame (phase=%d)\n",
+				measured_drift_remote, (int)drift_exchange_phase);
+			fflush(stdout);
+
+			if(drift_exchange_phase == DRIFT_MEASURING || drift_exchange_phase == DRIFT_IDLE)
+			{
+				// Phase 1: initial signal from commander — note exchange in progress
+				drift_exchange_phase = DRIFT_P1_SWITCH_PENDING;
+				printf("[PREAMBLE] Phase 1: received, expecting SWITCH_ROLE next\n");
+				fflush(stdout);
+			}
+			else if(drift_exchange_phase == DRIFT_P3_REPORT_PENDING)
+			{
+				// Phase 3: received good measurement from new commander (peer)
+				// Store but don't activate — Phase 5 will finalize
+				printf("[PREAMBLE] Phase 3: stored peer's good measurement (%.3f)\n",
+					measured_drift_remote);
+				fflush(stdout);
+			}
+			else if(drift_exchange_phase == DRIFT_P5_REPORT_PENDING)
+			{
+				// Phase 5: final report — activate suppression!
+				float max_drift = std::max(fabs(measured_drift_local), fabs(measured_drift_remote));
+				compute_preamble_interval(max_drift);
+				drift_measurement_done = true;
+				preamble_suppress_active = true;
+				drift_exchange_phase = DRIFT_DONE;
+				printf("[PREAMBLE] Suppression ACTIVE (responder): interval=%d max_drift=%.3f "
+					"(local=%.3f remote=%.3f)\n",
+					preamble_interval_samples, max_drift,
+					measured_drift_local, measured_drift_remote);
+				fflush(stdout);
+			}
+
+			connection_status=ACKNOWLEDGING_CONTROL;
+			link_timer.start();
+			watchdog_timer.start();
 		}
 		else if(code==REPEAT_LAST_ACK)
 		{

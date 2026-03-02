@@ -86,6 +86,7 @@ extern "C" {
     extern int configured_output_channel;
     extern int multichannel_mode;
     extern double noise_snr_db;
+    extern double drift_ppm;
 }
 
 int g_verbose = 0;
@@ -187,6 +188,7 @@ int main(int argc, char *argv[])
         printf(" -G [rx_gain_db]            RX gain in dB (temporary, overrides GUI slider). E.g. -G 25.6 to boost weak input.\n");
         printf(" -Q [nb_probe_max]          NB auto-negotiation probe attempts (0=disable, default 2).\n");
         printf(" -F [on|off]                Force compression on (for non-Winlink traffic). Default: off (auto-detect B2F).\n");
+        printf(" -D <ppm>                   Simulate RX clock drift (for testing). Default: 0.\n");
         printf(" -v                         Verbose debug output (OFDM sync, RX timing, ACK detection).\n");
 #ifdef MERCURY_GUI_ENABLED
         printf(" -n                         Disable GUI (headless mode). GUI is enabled by default.\n");
@@ -196,7 +198,7 @@ int main(int argc, char *argv[])
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:A:M:Z:F:")) != -1)
+    while ((opt = getopt(argc, argv, "hc:m:s:lr:i:o:x:p:zgt:a:k:eCnf:I:RNP:vT:G:WB:Q:A:M:Z:F:D:")) != -1)
     {
         switch (opt)
         {
@@ -410,6 +412,13 @@ int main(int argc, char *argv[])
             {
                 noise_snr_db = atof(optarg);
                 printf("AWGN noise injection: SNR=%.1f dB (ref 4kHz BW, cable=-30 dBFS)\n", noise_snr_db);
+            }
+            break;
+        case 'D':
+            if (optarg)
+            {
+                drift_ppm = atof(optarg);
+                printf("Drift simulation: %.1f ppm\n", drift_ppm);
             }
             break;
         case 'h':
@@ -728,7 +737,7 @@ start_modem:
             ARQ.narrowband_enabled = NO;
         else
             ARQ.narrowband_enabled = YES;  // Normal: start NB, negotiate WB via probe
-        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
+        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
 #else
         ARQ.robust_enabled = robust_mode ? YES : NO;
@@ -739,7 +748,7 @@ start_modem:
             ARQ.narrowband_enabled = NO;
         else
             ARQ.narrowband_enabled = YES;  // Normal: start NB, negotiate WB via probe
-        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
+        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
         ARQ.force_compress = (force_compress_cli == 1);
 #endif
         telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
@@ -820,7 +829,7 @@ start_modem:
                 // Sync robust mode and bandwidth mode from GUI to ARQ
                 ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;
                 ARQ.bandwidth_mode = g_gui_state.bandwidth_mode.load();
-                ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
+                ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
                 // narrowband_enabled is set at startup (line ~728) based on -Q and -M flags.
                 // Do NOT override here — forcing NB on telecom_system while the actual
                 // config is WB causes get_tx_gain() to return NB gains (+7 dB overboosted).

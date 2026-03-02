@@ -147,7 +147,7 @@ cl_arq_controller::cl_arq_controller()
 	nb_probe_max=2;
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
-	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL;  // Always advertise compression + B2F unroll
+	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
 	peer_capability=0;
 	wb_upgrade_pending=false;
 	compression_enabled=false;
@@ -169,6 +169,15 @@ cl_arq_controller::cl_arq_controller()
 	turboshift_last_good=-1;
 	turboshift_initiator=false;
 	turboshift_retries=1;
+
+	preamble_suppress_active=false;
+	preamble_interval_samples=0;
+	measured_drift_local=0.0f;
+	measured_drift_remote=0.0f;
+	drift_measurement_done=false;
+	drift_measurement_batch_count=-1;
+	drift_exchange_phase=DRIFT_IDLE;
+	drift_exchange_batch_count=0;
 
 	emergency_nack_count=0;
 	emergency_nack_threshold=2;
@@ -657,6 +666,7 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		configuration, telecom_system->narrowband_enabled);
 	fflush(stdout);
 	telecom_system->load_configuration(configuration);
+	telecom_system->ofdm.channel_carry_valid = false;  // Invalidate on config change
 	printf("[CFG] telecom_system->load_configuration done\n");
 	fflush(stdout);
 
@@ -1878,7 +1888,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -1975,7 +1985,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2011,7 +2021,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -2029,7 +2039,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2048,7 +2058,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_PREAMBLE_SUPPRESS;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2188,6 +2198,16 @@ void cl_arq_controller::reset_session_state()
 	compression_enabled = false;
 	b2f_compression_pending = false;
 
+	// Preamble suppression — reset for next connection
+	preamble_suppress_active = false;
+	preamble_interval_samples = 0;
+	measured_drift_local = 0.0f;
+	measured_drift_remote = 0.0f;
+	drift_measurement_done = false;
+	drift_measurement_batch_count = -1;
+	drift_exchange_phase = DRIFT_IDLE;
+	drift_exchange_batch_count = 0;
+
 	// B2F handler — reset state for next connection
 	b2f_handler.reset();
 
@@ -2221,6 +2241,47 @@ void cl_arq_controller::reset_session_state()
 	assigned_connection_id = 0;
 	connection_attempts = 0;
 	disconnect_requested = NO;
+}
+
+void cl_arq_controller::compute_preamble_interval(float max_drift_per_frame)
+{
+	int Ngi = telecom_system->ofdm.Nfft * telecom_system->ofdm.gi;  // GI in baseband samples
+	int interp = telecom_system->data_container.interpolation_rate;
+	int active_nsymb = telecom_system->get_active_nsymb();
+	int preamble_nSymb = telecom_system->data_container.preamble_nSymb;
+	int sym_samples = telecom_system->data_container.Nofdm * interp;
+	float frame_duration_samples = (float)((active_nsymb + preamble_nSymb) * sym_samples);
+
+	if(max_drift_per_frame < 0.001f)
+	{
+		// Near-zero drift: suppress aggressively (all but first frame)
+		preamble_interval_samples = 999999;
+		printf("[PREAMBLE] Near-zero drift (%.4f), maximum suppression\n", max_drift_per_frame);
+		fflush(stdout);
+		return;
+	}
+
+	// drift_per_sample = max_drift_per_frame / frame_duration_samples
+	// safe_samples = (Ngi/2 * interp) / drift_per_sample  (half GI = safety margin)
+	float drift_per_sample = max_drift_per_frame / frame_duration_samples;
+	float safe_samples = ((float)Ngi * (float)interp / 2.0f) / drift_per_sample;
+
+	// Apply 20% extra margin
+	preamble_interval_samples = (int)(safe_samples * 0.8f);
+	if(preamble_interval_samples < (int)frame_duration_samples)
+	{
+		// Drift too high: can't even suppress one frame
+		preamble_interval_samples = 0;
+		preamble_suppress_active = false;
+		printf("[PREAMBLE] Drift too high (%.3f samples/frame), suppression DISABLED\n",
+			max_drift_per_frame);
+		fflush(stdout);
+		return;
+	}
+
+	printf("[PREAMBLE] Interval computed: %d samples (Ngi=%d interp=%d drift=%.3f safe=%.0f)\n",
+		preamble_interval_samples, Ngi, interp, max_drift_per_frame, safe_samples);
+	fflush(stdout);
 }
 
 void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
@@ -2388,16 +2449,58 @@ void cl_arq_controller::send_batch()
 	ptt_on_delay.start();
 
 	int active_nsymb = telecom_system->get_active_nsymb();
-	int frame_output_size = telecom_system->data_container.Nofdm*telecom_system->data_container.interpolation_rate*(active_nsymb+telecom_system->data_container.preamble_nSymb);
+	int frame_full_size = telecom_system->get_frame_output_size(true);
+	int frame_data_size = telecom_system->get_frame_output_size(false);
+
+	// Compute per-frame preamble schedule
+	bool frame_has_preamble[256];  // max batch size
+	int frame_offset[257];         // cumulative offset per frame (slot 0 = padding)
+	int cumulative_samples = 0;
+	int suppressed_count = 0;
+	for(int i = 0; i < message_batch_counter_tx; i++)
+	{
+		bool emit_preamble = (i == 0);  // Frame 0 always gets preamble
+		if(!emit_preamble && preamble_suppress_active && preamble_interval_samples > 0)
+		{
+			emit_preamble = (cumulative_samples >= preamble_interval_samples);
+		}
+		else if(!preamble_suppress_active)
+		{
+			emit_preamble = true;
+		}
+		frame_has_preamble[i] = emit_preamble;
+		if(emit_preamble) cumulative_samples = 0;
+		int this_size = emit_preamble ? frame_full_size : frame_data_size;
+		cumulative_samples += this_size;
+		if(!emit_preamble) suppressed_count++;
+	}
+
+	// Compute offsets: slot 0 = padding (first frame copy), slots 1..N = frames, slot N+1 = padding
+	frame_offset[0] = 0;
+	int first_frame_size = frame_has_preamble[0] ? frame_full_size : frame_data_size;
+	frame_offset[1] = first_frame_size;  // slot 0 padding = copy of first frame
+	for(int i = 0; i < message_batch_counter_tx; i++)
+	{
+		int this_size = frame_has_preamble[i] ? frame_full_size : frame_data_size;
+		frame_offset[i + 2] = frame_offset[i + 1] + this_size;
+	}
+	int last_frame_size = frame_has_preamble[message_batch_counter_tx - 1] ? frame_full_size : frame_data_size;
+	int total_batch_samples = frame_offset[message_batch_counter_tx + 1] + last_frame_size;
+
+	if(suppressed_count > 0)
+	{
+		printf("[PREAMBLE-TX] Suppressed %d/%d preambles (interval=%d)\n",
+			suppressed_count, message_batch_counter_tx, preamble_interval_samples);
+		fflush(stdout);
+	}
 
 	double *batch_frames_output_data=NULL;
 	double *batch_frames_output_data_filtered1=NULL;
 	double *batch_frames_output_data_filtered2=NULL;
 
-	int batch_alloc_count = (message_batch_counter_tx+2)*frame_output_size;
-	batch_frames_output_data=new double[batch_alloc_count];
-	batch_frames_output_data_filtered1=new double[batch_alloc_count];
-	batch_frames_output_data_filtered2=new double[batch_alloc_count];
+	batch_frames_output_data=new double[total_batch_samples];
+	batch_frames_output_data_filtered1=new double[total_batch_samples];
+	batch_frames_output_data_filtered2=new double[total_batch_samples];
 
 	if (batch_frames_output_data==NULL)
 	{
@@ -2469,16 +2572,17 @@ void cl_arq_controller::send_batch()
 
 		if(g_verbose) {
 			int total = header_length + messages_batch_tx[i].length;
-			printf("[TX-BYTES] frame=%d type=%d connid=%d hdr=%d len=%d bytes:",
+			printf("[TX-BYTES] frame=%d type=%d connid=%d hdr=%d len=%d preamble=%d bytes:",
 				i, messages_batch_tx[i].type, (int)(unsigned char)connection_id,
-				header_length, messages_batch_tx[i].length);
+				header_length, messages_batch_tx[i].length, frame_has_preamble[i] ? 1 : 0);
 			for(int j=0; j<total && j<12; j++)
 				printf(" %02x", (unsigned char)message_TxRx_byte_buffer[j]);
 			printf("\n");
 			fflush(stdout);
 		}
 
-		telecom_system->transmit_byte(telecom_system->data_container.data_byte,header_length+messages_batch_tx[i].length,&batch_frames_output_data[(i+1)*frame_output_size],NO_FILTER_MESSAGE);
+		bool suppress = !frame_has_preamble[i];
+		telecom_system->transmit_byte(telecom_system->data_container.data_byte,header_length+messages_batch_tx[i].length,&batch_frames_output_data[frame_offset[i+1]],NO_FILTER_MESSAGE, suppress);
 
 
 		last_message_sent_type=messages_batch_tx[i].type;
@@ -2490,35 +2594,37 @@ void cl_arq_controller::send_batch()
 
 	}
 
-	for(int i=0;i<frame_output_size;i++) //padding start and end to prepare for filtering
+	// Padding: copy first frame to slot 0, last frame to slot N+1
+	for(int i=0;i<first_frame_size;i++)
 	{
-		batch_frames_output_data[(0)*frame_output_size+i]=batch_frames_output_data[(0+1)*frame_output_size+i];
-		batch_frames_output_data[(message_batch_counter_tx+1)*frame_output_size+i]=batch_frames_output_data[(message_batch_counter_tx)*frame_output_size+i];
+		batch_frames_output_data[i]=batch_frames_output_data[frame_offset[1]+i];
+	}
+	for(int i=0;i<last_frame_size;i++)
+	{
+		batch_frames_output_data[frame_offset[message_batch_counter_tx+1]+i]=batch_frames_output_data[frame_offset[message_batch_counter_tx]+i];
 	}
 
 	{
-		int total_fir_size = (message_batch_counter_tx+2)*frame_output_size;
-		memset(batch_frames_output_data_filtered1, 0, total_fir_size * sizeof(double));
-		memset(batch_frames_output_data_filtered2, 0, total_fir_size * sizeof(double));
-		telecom_system->ofdm.FIR_tx1.apply(batch_frames_output_data,batch_frames_output_data_filtered1,total_fir_size);
-		telecom_system->ofdm.FIR_tx2.apply(batch_frames_output_data_filtered1,batch_frames_output_data_filtered2,total_fir_size);
+		memset(batch_frames_output_data_filtered1, 0, total_batch_samples * sizeof(double));
+		memset(batch_frames_output_data_filtered2, 0, total_batch_samples * sizeof(double));
+		telecom_system->ofdm.FIR_tx1.apply(batch_frames_output_data,batch_frames_output_data_filtered1,total_batch_samples);
+		telecom_system->ofdm.FIR_tx2.apply(batch_frames_output_data_filtered1,batch_frames_output_data_filtered2,total_batch_samples);
 
 		// DIAG: TX peak amplitude after FIR filtering
 		{
 			double pk_pre = 0, pk_post = 0;
-			for(int j = 0; j < total_fir_size; j++) {
+			for(int j = 0; j < total_batch_samples; j++) {
 				if(fabs(batch_frames_output_data[j]) > pk_pre) pk_pre = fabs(batch_frames_output_data[j]);
 				if(fabs(batch_frames_output_data_filtered2[j]) > pk_post) pk_post = fabs(batch_frames_output_data_filtered2[j]);
 			}
 			printf("[TX-PEAK] pre_fir=%.4f post_fir=%.4f frames=%d size=%d cfg=%d\n",
-				pk_pre, pk_post, message_batch_counter_tx, total_fir_size, current_configuration);
+				pk_pre, pk_post, message_batch_counter_tx, total_batch_samples, current_configuration);
 			fflush(stdout);
 		}
 	}
 
 	// === TX SELF-TEST: verify matched filter template vs actual batch TX output ===
-	// The first frame in the batch starts at offset frame_output_size in the filtered data
-	// (position 0 is the padding copy). Preamble is at the start of the first frame.
+	// Only runs on first frame (which always has a preamble)
 	{
 		static int batch_selftest_count = 0;
 		static int batch_selftest_last_config = -1;
@@ -2533,9 +2639,8 @@ void cl_arq_controller::send_batch()
 			int interp = telecom_system->frequency_interpolation_rate;
 			int Nofdm_l = telecom_system->data_container.Nofdm;
 			int preamble_nsymb = telecom_system->data_container.preamble_nSymb;
-			// First frame in batch is at offset frame_output_size (slot 1; slot 0 is padding)
-			double* frame_pb = &batch_frames_output_data_filtered2[frame_output_size];
-			int frame_len = frame_output_size;
+			double* frame_pb = &batch_frames_output_data_filtered2[frame_offset[1]];
+			int frame_len = frame_full_size;
 
 			std::complex<double>* tx_bb = new std::complex<double>[frame_len];
 			telecom_system->ofdm.passband_to_baseband(frame_pb, frame_len, tx_bb,
@@ -2544,7 +2649,7 @@ void cl_arq_controller::send_batch()
 
 			int sym_interp = Nofdm_l * interp;
 			printf("[TX-SELFTEST-BATCH] CONFIG_%d frames=%d frame_size=%d\n",
-				current_configuration, message_batch_counter_tx, frame_output_size);
+				current_configuration, message_batch_counter_tx, frame_full_size);
 			double total_metric = 0;
 			for(int k = 0; k < preamble_nsymb && k < telecom_system->ofdm.ofdm_corr_template_nsymb; k++)
 			{
@@ -2618,10 +2723,12 @@ void cl_arq_controller::send_batch()
 		delete[] pilot_buffer;
 	}
 
+	// Transfer each frame to the audio output with correct per-frame size
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
-		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, size=%d\n", i, message_batch_counter_tx, frame_output_size); fflush(stdout); }
-		tx_transfer(&batch_frames_output_data_filtered2[(i+1)*frame_output_size], frame_output_size);
+		int this_size = frame_has_preamble[i] ? frame_full_size : frame_data_size;
+		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, size=%d preamble=%d\n", i, message_batch_counter_tx, this_size, frame_has_preamble[i] ? 1 : 0); fflush(stdout); }
+		tx_transfer(&batch_frames_output_data_filtered2[frame_offset[i+1]], this_size);
 	}
 
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
@@ -3270,6 +3377,45 @@ void cl_arq_controller::receive()
 			telecom_system->ldpc.nIteration_max = gui_ldpc_max;
 #endif
 
+		// Preamble suppression: compute whether the next frame should have a preamble
+		// based on the same deterministic schedule as TX (frame index within batch).
+		if(preamble_suppress_active && telecom_system->M != MOD_MFSK
+			&& batch_rx_frame_count > 0)
+		{
+			// Same logic as send_batch(): frame 0 always has preamble,
+			// subsequent frames check cumulative_samples vs preamble_interval_samples
+			int interp = telecom_system->data_container.interpolation_rate;
+			int frame_full = telecom_system->data_container.Nofdm * interp *
+				(telecom_system->get_active_nsymb() + telecom_system->data_container.preamble_nSymb);
+			int frame_data = telecom_system->data_container.Nofdm * interp *
+				telecom_system->get_active_nsymb();
+
+			bool expect_preamble = false;  // frame 0 always has preamble (not us)
+			int cumulative = 0;
+			for(int fi = 0; fi < batch_rx_frame_count + 1; fi++)
+			{
+				bool this_has_preamble;
+				if(fi == 0)
+					this_has_preamble = true;
+				else if(preamble_interval_samples > 0)
+					this_has_preamble = (cumulative >= preamble_interval_samples);
+				else
+					this_has_preamble = true;
+
+				if(this_has_preamble) cumulative = 0;
+				int this_size = this_has_preamble ? frame_full : frame_data;
+				cumulative += this_size;
+
+				if(fi == batch_rx_frame_count)
+					expect_preamble = this_has_preamble;
+			}
+			telecom_system->rx_expect_preamble = expect_preamble;
+		}
+		else
+		{
+			telecom_system->rx_expect_preamble = true;  // Default: always expect preamble
+		}
+
 		auto proc_start = std::chrono::steady_clock::now();
 		received_message_stats = telecom_system->receive_byte(telecom_system->data_container.ready_to_process_passband_delayed_data,telecom_system->data_container.data_byte);
 		auto proc_end = std::chrono::steady_clock::now();
@@ -3306,8 +3452,9 @@ void cl_arq_controller::receive()
 			&& received_message_stats.delay > 0)
 		{
 			int sp = signal_period;
-			int frame_syms = telecom_system->data_container.preamble_nSymb
-				+ telecom_system->get_active_nsymb();
+			int zero_pream_syms = telecom_system->rx_expect_preamble
+				? telecom_system->data_container.preamble_nSymb : 0;
+			int frame_syms = zero_pream_syms + telecom_system->get_active_nsymb();
 			int frame_samples = frame_syms * symbol_period;
 			int frame_ring_start = (rwi + received_message_stats.delay) % sp;
 
@@ -3364,7 +3511,9 @@ void cl_arq_controller::receive()
 		if (received_message_stats.message_decoded==YES)
 		{
 			int rx_nsymb = telecom_system->get_active_nsymb();
-			int rx_frame = rx_nsymb + telecom_system->data_container.preamble_nSymb;
+			int rx_preamble_syms = telecom_system->rx_expect_preamble
+				? telecom_system->data_container.preamble_nSymb : 0;
+			int rx_frame = rx_nsymb + rx_preamble_syms;
 			int end_of_current_message = received_message_stats.delay / symbol_period  + rx_frame;
 			int frames_left_in_buffer = telecom_system->data_container.buffer_Nsymb - end_of_current_message;
 			if(frames_left_in_buffer<0)
@@ -4248,6 +4397,7 @@ void cl_arq_controller::print_stats()
 		else if (this->last_message_sent_code==SET_CONFIG) msg_sent_code_str = "SET_CONFIG";
 		else if (this->last_message_sent_code==REPEAT_LAST_ACK) msg_sent_code_str = "REPEAT_LAST_ACK";
 		else if (this->last_message_sent_code==SWITCH_BANDWIDTH) msg_sent_code_str = "SWITCH_BANDWIDTH";
+		else if (this->last_message_sent_code==DRIFT_REPORT) msg_sent_code_str = "DRIFT_REPORT";
 	}
 	printf("%s%s\n", msg_sent_str, msg_sent_code_str);
 
@@ -4297,6 +4447,7 @@ void cl_arq_controller::print_stats()
 		else if (this->last_message_received_code==SET_CONFIG) msg_recv_code_str = "SET_CONFIG";
 		else if (this->last_message_received_code==REPEAT_LAST_ACK) msg_recv_code_str = "REPEAT_LAST_ACK";
 		else if (this->last_message_received_code==SWITCH_BANDWIDTH) msg_recv_code_str = "SWITCH_BANDWIDTH";
+		else if (this->last_message_received_code==DRIFT_REPORT) msg_recv_code_str = "DRIFT_REPORT";
 	}
 	printf("%s%s\n", msg_recv_str, msg_recv_code_str);
 

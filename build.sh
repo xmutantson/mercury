@@ -220,46 +220,68 @@ source/audioio/ffaudio/ffaudio/pulse.c
 "
 fi
 
-# Build C++ sources
+# Parallel job count (default: number of CPU cores)
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+echo "Using $NPROC parallel jobs"
+
+# Build all C++ sources (main + ImGui) in parallel
 echo "Compiling C++ sources..."
 OBJ_FILES=""
+ALL_CXX_JOBS=""
 for src in $CPP_SOURCES; do
     obj="${src%.cc}.o"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
-        echo "  $src"
-        $CXX $CXXFLAGS -c -o "$obj" "$src"
-    fi
     OBJ_FILES="$OBJ_FILES $obj"
+    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
+        ALL_CXX_JOBS="$ALL_CXX_JOBS $src"
+    fi
 done
 
-# Build ImGui sources
 echo "Compiling ImGui..."
 for src in $IMGUI_SOURCES; do
     obj="${src%.cpp}.o"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
-        echo "  $src"
-        $CXX $CXXFLAGS -c -o "$obj" "$src"
-    fi
     OBJ_FILES="$OBJ_FILES $obj"
+    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
+        ALL_CXX_JOBS="$ALL_CXX_JOBS $src"
+    fi
 done
 
-# Build audio sources
+# Compile all C++ files in parallel
+if [ -n "$ALL_CXX_JOBS" ]; then
+    echo "$ALL_CXX_JOBS" | tr ' ' '\n' | grep -v '^$' | xargs -P "$NPROC" -I{} bash -c '
+        src="{}"
+        if [[ "$src" == *.cc ]]; then
+            obj="${src%.cc}.o"
+        else
+            obj="${src%.cpp}.o"
+        fi
+        echo "  $src"
+        '"$CXX"' '"$CXXFLAGS"' -c -o "$obj" "$src"
+    '
+fi
+
+# Build audio sources in parallel
 echo "Compiling audio subsystem..."
 mkdir -p source/audioio/ffaudio/ffaudio
+AUDIO_JOBS=""
 for src in $AUDIO_C_SOURCES; do
     obj="${src%.c}.o"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
-        echo "  $src"
-        if [[ "$src" == *audioio.c ]]; then
-            # audioio.c includes C++ headers, must compile as C++
-            $CXX $CXXFLAGS -c -o "$obj" "$src"
-        elif [[ "$src" == *.cc ]]; then
-            $CXX $CXXFLAGS -c -o "$obj" "$src"
-        else
-            $CC $CFLAGS -c -o "$obj" "$src"
-        fi
+        AUDIO_JOBS="$AUDIO_JOBS $src"
     fi
 done
+
+if [ -n "$AUDIO_JOBS" ]; then
+    echo "$AUDIO_JOBS" | tr ' ' '\n' | grep -v '^$' | xargs -P "$NPROC" -I{} bash -c '
+        src="{}"
+        obj="${src%.c}.o"
+        echo "  $src"
+        if [[ "$src" == *audioio.c ]]; then
+            '"$CXX"' '"$CXXFLAGS"' -c -o "$obj" "$src"
+        else
+            '"$CC"' '"$CFLAGS"' -c -o "$obj" "$src"
+        fi
+    '
+fi
 
 # Create audioio.a
 echo "Creating audioio.a..."
@@ -269,21 +291,30 @@ for src in $AUDIO_C_SOURCES; do
 done
 ar rc source/audioio/audioio.a $AUDIO_OBJ_FILES
 
-# Build compression library C sources (PPMd8, zstd, LZHUF)
+# Build compression library C sources in parallel (PPMd8, zstd, LZHUF)
 echo "Compiling compression libraries..."
 COMPRESS_OBJ_FILES=""
+COMPRESS_JOBS=""
 for src in $COMPRESSION_C_SOURCES; do
     obj="${src%.c}.o"
+    COMPRESS_OBJ_FILES="$COMPRESS_OBJ_FILES $obj"
     if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
+        COMPRESS_JOBS="$COMPRESS_JOBS $src"
+    fi
+done
+
+if [ -n "$COMPRESS_JOBS" ]; then
+    echo "$COMPRESS_JOBS" | tr ' ' '\n' | grep -v '^$' | xargs -P "$NPROC" -I{} bash -c '
+        src="{}"
+        obj="${src%.c}.o"
         echo "  $src"
         EXTRA_C=""
         if [[ "$src" == *lzhuf.c ]]; then
             EXTRA_C="-DLZHUF -DB2F"
         fi
-        $CC $CFLAGS -Wno-extra -Wno-sign-compare -Wno-implicit-fallthrough $EXTRA_C -c -o "$obj" "$src"
-    fi
-    COMPRESS_OBJ_FILES="$COMPRESS_OBJ_FILES $obj"
-done
+        '"$CC"' '"$CFLAGS"' -Wno-extra -Wno-sign-compare -Wno-implicit-fallthrough $EXTRA_C -c -o "$obj" "$src"
+    '
+fi
 
 # Link
 echo "Linking $OUTPUT..."

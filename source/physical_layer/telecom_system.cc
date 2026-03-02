@@ -77,6 +77,7 @@ cl_telecom_system::cl_telecom_system()
 	time_freq_interleaver_block_size=1;
 	output_power_Watt=1;
 	carrier_amplitude=sqrt(2.0);
+	rx_expect_preamble=true;
 	sampling_frequency=0;
 	Shannon_limit=0;
 	rbc=0;
@@ -415,7 +416,7 @@ int cl_telecom_system::get_frame_size_bits()
     return data_container.nBits - ldpc.P - outer_code_reserved_bits;
 }
 
-void cl_telecom_system::transmit_byte(int *data, int nBytes, double* out, int message_location)
+void cl_telecom_system::transmit_byte(int *data, int nBytes, double* out, int message_location, bool suppress_preamble)
 {
 	int nReal_data = data_container.nBits - ldpc.P;
 	int msB = 0, lsB = 0;
@@ -454,10 +455,17 @@ void cl_telecom_system::transmit_byte(int *data, int nBytes, double* out, int me
 		data_container.data_bit[i] = 0;
 	}
 
-	transmit_bit(data_container.data_bit, out, message_location);
+	transmit_bit(data_container.data_bit, out, message_location, suppress_preamble);
 }
 
-void cl_telecom_system::transmit_bit(int* data, double* out, int message_location)
+int cl_telecom_system::get_frame_output_size(bool with_preamble)
+{
+	int active_nsymb = get_active_nsymb();
+	int pream = with_preamble ? data_container.preamble_nSymb : 0;
+	return data_container.Nofdm * data_container.interpolation_rate * (active_nsymb + pream);
+}
+
+void cl_telecom_system::transmit_bit(int* data, double* out, int message_location, bool suppress_preamble)
 {
 	int nVirtual_data=ldpc.N-data_container.nBits;
 	int nReal_data=data_container.nBits-ldpc.P;
@@ -534,17 +542,22 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 		ofdm.framer(data_container.ofdm_time_freq_interleaved_data,data_container.ofdm_framed_data);
 	}
 
-	if(M == MOD_MFSK)
+	int preamble_syms = suppress_preamble ? 0 : data_container.preamble_nSymb;
+
+	if(!suppress_preamble)
 	{
-		// MFSK preamble: known single-tone symbols (concentrated energy, detectable in weak signal)
-		mfsk.generate_preamble(data_container.preamble_data, data_container.preamble_nSymb);
-	}
-	else
-	{
-		// OFDM preamble: broadband known symbols (all subcarriers)
-		for(int i=0;i<data_container.preamble_nSymb*ofdm.Nc;i++)
+		if(M == MOD_MFSK)
 		{
-			data_container.preamble_data[i]=ofdm.ofdm_preamble[i].value;
+			// MFSK preamble: known single-tone symbols (concentrated energy, detectable in weak signal)
+			mfsk.generate_preamble(data_container.preamble_data, data_container.preamble_nSymb);
+		}
+		else
+		{
+			// OFDM preamble: broadband known symbols (all subcarriers)
+			for(int i=0;i<data_container.preamble_nSymb*ofdm.Nc;i++)
+			{
+				data_container.preamble_data[i]=ofdm.ofdm_preamble[i].value;
+			}
 		}
 	}
 
@@ -569,11 +582,14 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 			}
 		}
 		// Pre-equalization (OFDM only, not used for MFSK)
-		for(int i=0;i<data_container.preamble_nSymb;i++)
+		if(!suppress_preamble)
 		{
-			for(int j=0;j<data_container.Nc;j++)
+			for(int i=0;i<data_container.preamble_nSymb;i++)
 			{
-				data_container.preamble_data[i*data_container.Nc+j]*=pre_equalization_channel[j].value;
+				for(int j=0;j<data_container.Nc;j++)
+				{
+					data_container.preamble_data[i*data_container.Nc+j]*=pre_equalization_channel[j].value;
+				}
 			}
 		}
 
@@ -586,9 +602,12 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 		}
 	}
 
-	for(int i=0;i<data_container.preamble_nSymb;i++)
+	if(!suppress_preamble)
 	{
-		ofdm.symbol_mod(&data_container.preamble_data[i*data_container.Nc],&data_container.preamble_symbol_modulated_data[i*data_container.Nofdm]);
+		for(int i=0;i<data_container.preamble_nSymb;i++)
+		{
+			ofdm.symbol_mod(&data_container.preamble_data[i*data_container.Nc],&data_container.preamble_symbol_modulated_data[i*data_container.Nofdm]);
+		}
 	}
 
 	int active_nsymb = get_active_nsymb();
@@ -610,14 +629,17 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 		mfsk_boost = get_tx_gain(TX_SIG_OFDM);
 	}
 
-	// Preamble boost: OFDM uses sqrt(2) boost for detection headroom;
-	// MFSK preamble is already a concentrated single tone — no boost needed.
-	double preamble_boost = (M == MOD_MFSK) ? 1.0 : ofdm.preamble_configurator.boost;
-
-	for(int j=0;j<data_container.Nofdm*data_container.preamble_nSymb;j++)
+	if(!suppress_preamble)
 	{
-		data_container.preamble_symbol_modulated_data[j]/=power_normalization;
-		data_container.preamble_symbol_modulated_data[j]*=sqrt(output_power_Watt)*preamble_boost*mfsk_boost;
+		// Preamble boost: OFDM uses sqrt(2) boost for detection headroom;
+		// MFSK preamble is already a concentrated single tone — no boost needed.
+		double preamble_boost = (M == MOD_MFSK) ? 1.0 : ofdm.preamble_configurator.boost;
+
+		for(int j=0;j<data_container.Nofdm*data_container.preamble_nSymb;j++)
+		{
+			data_container.preamble_symbol_modulated_data[j]/=power_normalization;
+			data_container.preamble_symbol_modulated_data[j]*=sqrt(output_power_Watt)*preamble_boost*mfsk_boost;
+		}
 	}
 
 	for(int j=0;j<data_container.Nofdm*active_nsymb;j++)
@@ -628,15 +650,26 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 
 	// Apply test TX carrier offset for frequency sync testing
 	double tx_carrier = carrier_frequency + test_tx_carrier_offset;
-	ofdm.baseband_to_passband(data_container.preamble_symbol_modulated_data,data_container.Nofdm*data_container.preamble_nSymb,data_container.passband_data_tx,sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
-	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,data_container.Nofdm*active_nsymb,&data_container.passband_data_tx[data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate],sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
+	int frame_output_size = data_container.Nofdm * frequency_interpolation_rate * (active_nsymb + preamble_syms);
 
-	ofdm.peak_clip(data_container.passband_data_tx, data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate,ofdm.preamble_papr_cut);
-	ofdm.peak_clip(&data_container.passband_data_tx[data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate], data_container.Nofdm*active_nsymb*frequency_interpolation_rate,ofdm.data_papr_cut);
+	if(!suppress_preamble)
+	{
+		ofdm.baseband_to_passband(data_container.preamble_symbol_modulated_data,data_container.Nofdm*data_container.preamble_nSymb,data_container.passband_data_tx,sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
+		ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,data_container.Nofdm*active_nsymb,&data_container.passband_data_tx[data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate],sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
+
+		ofdm.peak_clip(data_container.passband_data_tx, data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate,ofdm.preamble_papr_cut);
+		ofdm.peak_clip(&data_container.passband_data_tx[data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate], data_container.Nofdm*active_nsymb*frequency_interpolation_rate,ofdm.data_papr_cut);
+	}
+	else
+	{
+		// Suppressed preamble: data symbols only, placed at start of passband buffer
+		ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,data_container.Nofdm*active_nsymb,data_container.passband_data_tx,sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
+		ofdm.peak_clip(data_container.passband_data_tx, data_container.Nofdm*active_nsymb*frequency_interpolation_rate,ofdm.data_papr_cut);
+	}
 
 	if(message_location==NO_FILTER_MESSAGE)
 	{
-		for(int i=0;i<data_container.total_frame_size;i++)
+		for(int i=0;i<frame_output_size;i++)
 		{
 			*(out+i)=data_container.passband_data_tx[i];
 		}
@@ -985,7 +1018,36 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			bool batch_verified = false;
 
-			if(receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
+			// Preamble-less frame: skip detection entirely, use prediction directly.
+			// CRITICAL: use delay_of_last_decoded_message (sub-symbol precise from
+			// Schmidl-Cox) — NOT ofdm_skip * sym_samples which quantizes to symbol
+			// boundaries (1024-sample grid). With GI=64 interp samples, any error
+			// > 32 samples causes ISI and decode failure.
+			if(!rx_expect_preamble && receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
+			{
+				int predicted_pos;
+				if(receive_stats.delay_of_last_decoded_message >= 0)
+				{
+					// delay_of_last_decoded_message after ARQ += update (line 3618)
+					// already points to the start of THIS frame with sub-symbol precision.
+					predicted_pos = receive_stats.delay_of_last_decoded_message
+						+ (int)receive_stats.ofdm_drift_per_frame;
+				}
+				else
+				{
+					// Fallback: symbol-aligned (shouldn't happen — first frame always has preamble)
+					predicted_pos = ofdm_skip * sym_samples + (int)receive_stats.ofdm_drift_per_frame;
+				}
+				if(predicted_pos < 0) predicted_pos = 0;
+				receive_stats.delay = predicted_pos;
+				receive_stats.coarse_metric = 1.0;  // synthetic high metric
+				batch_verified = true;
+				printf("[PREAMBLE-LESS] predicted_pos=%d dolm=%d ofdm_skip=%d skip_pos=%d drift=%.1f buf=%d\n",
+					predicted_pos, receive_stats.delay_of_last_decoded_message,
+					ofdm_skip, ofdm_skip * sym_samples,
+					receive_stats.ofdm_drift_per_frame, buf_interp);
+			}
+			else if(receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
 			{
 				// BATCH mode: predict + verify. After successful decode, the next
 				// preamble position is predictable from ofdm_skip. Try a tiny
@@ -1100,8 +1162,9 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		}
 	}
 
-	int lower_bound = data_container.preamble_nSymb;
-	int upper_bound = data_container.buffer_Nsymb-(data_container.Nsymb+data_container.preamble_nSymb);
+	int rx_pream_bound = rx_expect_preamble ? data_container.preamble_nSymb : 0;
+	int lower_bound = rx_pream_bound;
+	int upper_bound = data_container.buffer_Nsymb-(data_container.Nsymb+rx_pream_bound);
 	double preamble_detect_threshold = 0.15;
 
 	if(M != MOD_MFSK)
@@ -1415,7 +1478,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 skip_h_retry_point:
 		while (receive_stats.sync_trials<=time_sync_trials_max)
 		{
-			if(mfsk_fixed_delay >= 0)
+			if(!rx_expect_preamble && M != MOD_MFSK)
+			{
+				// Preamble-less OFDM: prediction set delay, no refinement needed
+				if(receive_stats.sync_trials > 0) break;
+			}
+			else if(mfsk_fixed_delay >= 0)
 			{
 				// Known delay - skip all time_sync refinement
 				receive_stats.delay = mfsk_fixed_delay;
@@ -1546,7 +1614,8 @@ skip_h_retry_point:
 			// Clamp delay to prevent buffer overflow in rational_resampler
 			{
 				int buf_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-				int frame_size = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
+				int rx_pream_clamp = rx_expect_preamble ? data_container.preamble_nSymb : 0;
+				int frame_size = (data_container.Nofdm*(data_container.Nsymb+rx_pream_clamp))*frequency_interpolation_rate;
 				int max_delay = buf_size - frame_size;
 				if(receive_stats.delay > max_delay)
 				{
@@ -1598,7 +1667,8 @@ skip_h_retry_point:
 			// Compute extraction range before data FIR so we can scope it.
 			int extraction_delay = receive_stats.delay;
 			int buf_size_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-			int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
+			int rx_preamble_syms = rx_expect_preamble ? data_container.preamble_nSymb : 0;
+			int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+rx_preamble_syms))*frequency_interpolation_rate;
 			if(extraction_delay < 0) extraction_delay = 0;
 			if(extraction_delay > buf_size_interp - frame_size_interp)
 				extraction_delay = buf_size_interp - frame_size_interp;
@@ -1621,7 +1691,14 @@ skip_h_retry_point:
 
 			ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
 
-			if(ofdm_forced_delay >= 0)
+			if(!rx_expect_preamble)
+			{
+				// Preamble-less frame: no preamble for Moose, rely on CPE from pilots
+				freq_offset_measured = 0;
+				if(g_verbose)
+					printf("[PREAMBLE-LESS] skipping Moose (no preamble), using CPE\n");
+			}
+			else if(ofdm_forced_delay >= 0)
 			{
 				// BER test: true freq offset is 0, skip estimation
 				freq_offset_measured = 0;
@@ -1679,9 +1756,10 @@ skip_h_retry_point:
 			}
 			{
 				int rx_nsymb = get_active_nsymb();
+				int demod_offset = rx_preamble_syms * data_container.Nofdm;
 				for(int i=0;i<rx_nsymb;i++)
 				{
-					ofdm.symbol_demod(&data_container.baseband_data[i*data_container.Nofdm+data_container.Nofdm*data_container.preamble_nSymb],&data_container.ofdm_symbol_demodulated_data[i*data_container.Nc]);
+					ofdm.symbol_demod(&data_container.baseband_data[i*data_container.Nofdm+demod_offset],&data_container.ofdm_symbol_demodulated_data[i*data_container.Nc]);
 				}
 			}
 
@@ -1741,7 +1819,9 @@ skip_h_retry_point:
 			else
 			{
 				ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
-				if(narrowband_enabled)
+
+				// CPE: always for NB, also for WB preamble-less frames (no Moose available)
+				if(narrowband_enabled || !rx_expect_preamble)
 					ofdm.CPE_correction(data_container.ofdm_symbol_demodulated_data);
 
 				if(ofdm.channel_estimator==ZERO_FORCE)
@@ -1752,6 +1832,13 @@ skip_h_retry_point:
 				{
 					ofdm.LS_channel_estimator(data_container.ofdm_symbol_demodulated_data);
 				}
+
+				// Seed channel carry-through AFTER estimation (not before —
+				// ZF/LS mark all non-pilot positions UNKNOWN, overwriting seeds).
+				// Override row 0 extrapolated values with carried channel from
+				// previous frame's last pilot row (more accurate than extrapolation).
+				if(!rx_expect_preamble)
+					ofdm.seed_carried_channel();
 
 				mean_H = -1.0;
 				int h_count = 0;
@@ -1766,6 +1853,12 @@ skip_h_retry_point:
 						}
 					}
 					if(h_count > 0) mean_H = h_sum / h_count;
+				}
+				if(!rx_expect_preamble)
+				{
+					printf("[PREAMBLE-LESS-RX] mean_H=%.4f h_count=%d delay=%d trial=%d\n",
+						mean_H, h_count, receive_stats.delay, receive_stats.sync_trials);
+					fflush(stdout);
 				}
 				{
 					double mean_H_threshold = 0.50;
@@ -1930,6 +2023,10 @@ skip_h_retry_point:
 				}
 
 				receive_stats.message_decoded=YES;
+
+				// Save channel estimate for carry-through to next preamble-less frame
+				if(M != MOD_MFSK)
+					ofdm.save_carried_channel();
 
 #ifdef MERCURY_GUI_ENABLED
 				// Push fully-equalized data for visualization (tight clusters).

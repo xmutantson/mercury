@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include <algorithm>
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -428,6 +429,16 @@ int cl_arq_controller::add_message_control(char code)
 				forward_configuration, reverse_configuration,
 				measurements.SNR_downlink, measurements.SNR_uplink, (int)link_status);
 			fflush(stdout);
+		}
+		else if(code==DRIFT_REPORT)
+		{
+			int16_t fp8 = (int16_t)(measured_drift_local * 256.0f);
+			messages_control.data[0]=code;
+			messages_control.data[1]=(unsigned char)((fp8 >> 8) & 0xFF);
+			messages_control.data[2]=(unsigned char)(fp8 & 0xFF);
+			messages_control.length=3;
+			messages_control.id=0;
+			messages_control.nResends=2;
 		}
 		else if(code==REPEAT_LAST_ACK)
 		{
@@ -1409,6 +1420,64 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			fflush(stdout);
 		}
 
+		// Drift exchange: role-switch protocol for bidirectional drift measurement
+		if(data_ack_received==YES && turboshift_phase == TURBO_DONE && !drift_measurement_done
+			&& (local_capability & CAP_PREAMBLE_SUPPRESS) && (peer_capability & CAP_PREAMBLE_SUPPRESS))
+		{
+			// IDLE → MEASURING: start counting after turboshift settles at CONFIG_5+
+			if(drift_exchange_phase == DRIFT_IDLE && current_configuration >= CONFIG_5)
+			{
+				drift_exchange_phase = DRIFT_MEASURING;
+				drift_measurement_batch_count = 0;
+				printf("[PREAMBLE] Drift exchange starting at CONFIG_%d\n", current_configuration);
+				fflush(stdout);
+			}
+			// MEASURING → P1: after 3 batches, send DRIFT_REPORT #1 (placeholder signal)
+			if(drift_exchange_phase == DRIFT_MEASURING)
+			{
+				drift_measurement_batch_count++;
+				measured_drift_local = telecom_system->receive_stats.ofdm_drift_per_frame;
+
+				if(drift_measurement_batch_count >= 3 && messages_control.status == FREE)
+				{
+					printf("[PREAMBLE] Phase 1: sending DRIFT_REPORT (drift=%.3f, placeholder)\n",
+						measured_drift_local);
+					fflush(stdout);
+					drift_exchange_phase = DRIFT_P1_REPORT_TX;
+					add_message_control(DRIFT_REPORT);
+					return;
+				}
+			}
+			// P3_DATA: count data batches during reverse measurement phase
+			if(drift_exchange_phase == DRIFT_P3_DATA)
+			{
+				drift_exchange_batch_count++;
+				printf("[PREAMBLE] Phase 3: data batch %d/3 ACKed\n", drift_exchange_batch_count);
+				fflush(stdout);
+
+				if(drift_exchange_batch_count >= 3 && messages_control.status == FREE)
+				{
+					printf("[PREAMBLE] Phase 3 complete, sending SWITCH_ROLE to restore roles\n");
+					fflush(stdout);
+					drift_exchange_phase = DRIFT_P3_SWITCH_TX;
+					cleanup();
+					add_message_control(SWITCH_ROLE);
+					connection_status = TRANSMITTING_CONTROL;
+					return;
+				}
+			}
+			// P5_REPORT_PENDING: original commander sends final DRIFT_REPORT (good measurement)
+			if(drift_exchange_phase == DRIFT_P5_REPORT_PENDING && messages_control.status == FREE)
+			{
+				printf("[PREAMBLE] Phase 5: sending final DRIFT_REPORT (drift=%.3f, good)\n",
+					measured_drift_local);
+				fflush(stdout);
+				drift_exchange_phase = DRIFT_P5_REPORT_TX;
+				add_message_control(DRIFT_REPORT);
+				return;
+			}
+		}
+
 		// Frame-level gearshift: after N consecutive successful data ACKs, shift up immediately
 		{
 			int proposed_frame = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
@@ -1774,6 +1843,21 @@ void cl_arq_controller::process_control_commander()
 					}
 				}
 
+				// Drift exchange: advance phase before role switch
+				if(drift_exchange_phase == DRIFT_P1_SWITCH_TX)
+				{
+					drift_exchange_phase = DRIFT_P3_REPORT_PENDING;
+					drift_measurement_batch_count = 0;  // Fresh measurement as responder
+					printf("[PREAMBLE] Phase 1→3: becoming responder for drift measurement\n");
+					fflush(stdout);
+				}
+				else if(drift_exchange_phase == DRIFT_P3_SWITCH_TX)
+				{
+					drift_exchange_phase = DRIFT_P5_REPORT_PENDING;
+					printf("[PREAMBLE] Phase 3→5: becoming responder, will send final report when restored\n");
+					fflush(stdout);
+				}
+
 				set_role(RESPONDER);
 				this->link_status=CONNECTED;
 				this->connection_status=RECEIVING;
@@ -1972,6 +2056,54 @@ void cl_arq_controller::process_control_commander()
 				}
 				watchdog_timer.start();
 				link_timer.start();
+			}
+			else if (messages_control.data[0]==DRIFT_REPORT)
+			{
+				if(drift_exchange_phase == DRIFT_P1_REPORT_TX)
+				{
+					// Phase 1 ACKed → send SWITCH_ROLE to let responder become commander
+					printf("[PREAMBLE] Phase 1: DRIFT_REPORT ACKed, sending SWITCH_ROLE\n");
+					fflush(stdout);
+					drift_exchange_phase = DRIFT_P1_SWITCH_TX;
+					cleanup();
+					add_message_control(SWITCH_ROLE);
+					this->connection_status = TRANSMITTING_CONTROL;
+				}
+				else if(drift_exchange_phase == DRIFT_P3_REPORT_TX)
+				{
+					// Phase 3 DRIFT_REPORT ACKed → transmit data for peer to measure drift
+					printf("[PREAMBLE] Phase 3: DRIFT_REPORT ACKed, transmitting data\n");
+					fflush(stdout);
+					drift_exchange_phase = DRIFT_P3_DATA;
+					drift_exchange_batch_count = 0;
+					this->connection_status = TRANSMITTING_DATA;
+					watchdog_timer.start();
+					link_timer.start();
+				}
+				else if(drift_exchange_phase == DRIFT_P5_REPORT_TX)
+				{
+					// Phase 5 ACKed → activate suppression on both sides
+					float max_drift = std::max(fabs(measured_drift_local), fabs(measured_drift_remote));
+					compute_preamble_interval(max_drift);
+					drift_measurement_done = true;
+					preamble_suppress_active = true;
+					drift_exchange_phase = DRIFT_DONE;
+					printf("[PREAMBLE] Suppression ACTIVE (commander): interval=%d max_drift=%.3f "
+						"(local=%.3f remote=%.3f)\n",
+						preamble_interval_samples, max_drift,
+						measured_drift_local, measured_drift_remote);
+					fflush(stdout);
+					this->connection_status = TRANSMITTING_DATA;
+					watchdog_timer.start();
+					link_timer.start();
+				}
+				else
+				{
+					// Fallback
+					this->connection_status = TRANSMITTING_DATA;
+					watchdog_timer.start();
+					link_timer.start();
+				}
 			}
 		}
 		else if(this->link_status==DISCONNECTING && messages_control.data[0]==CLOSE_CONNECTION)
@@ -2319,7 +2451,16 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
-			if(switch_role_timer.counting==NO)
+			// Drift exchange Phase 3: no data to send → switch back immediately
+			if(drift_exchange_phase == DRIFT_P3_DATA)
+			{
+				printf("[PREAMBLE] Phase 3: no data to send, switching back immediately\n");
+				fflush(stdout);
+				drift_exchange_phase = DRIFT_P3_SWITCH_TX;
+				add_message_control(SWITCH_ROLE);
+				connection_status = TRANSMITTING_CONTROL;
+			}
+			else if(switch_role_timer.counting==NO)
 			{
 				switch_role_timer.reset();
 				switch_role_timer.start();

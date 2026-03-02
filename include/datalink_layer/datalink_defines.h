@@ -82,11 +82,13 @@
 #define SET_CONFIG 0x3B
 #define REPEAT_LAST_ACK 0x3C
 #define SWITCH_BANDWIDTH 0x3D
+#define DRIFT_REPORT 0x3E
 
 // Capability flags (embedded in TEST_CONNECTION byte 5)
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
 #define CAP_COMPRESSION  0x02   // Supports block compression (PPMd/zstd)
 #define CAP_B2F_UNROLL   0x04   // Supports B2F LZHUF unroll/reroll (Winlink optimization)
+#define CAP_PREAMBLE_SUPPRESS 0x08  // Supports adaptive preamble suppression
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };

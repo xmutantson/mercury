@@ -165,6 +165,13 @@ public:
 	void baseband_to_passband(std::complex <double>* in, int in_size, double* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int interpolation_rate);
 	void passband_to_baseband(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int decimation_rate, cl_FIR* filter, int sample_offset=0);
 	struct st_channel_complex * estimated_channel, *estimated_channel_without_amplitude_restoration;
+
+	// Channel carry-through: store last frame's final channel estimate for preamble-less frames
+	struct st_channel_complex* carried_channel;  // [Nc] array
+	bool channel_carry_valid;
+	void save_carried_channel();
+	void seed_carried_channel();
+
 	int Nfft,Nc,Nsymb;
 	float gi;
 	struct st_carrier* ofdm_frame;

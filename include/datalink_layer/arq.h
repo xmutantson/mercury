@@ -393,6 +393,33 @@ public:
   bool turboshift_initiator;       // true = I started turboshift (original commander)
   int turboshift_retries;          // retries left at current config (0 = ceiling)
 
+  // Adaptive preamble suppression: skip preambles on frames 2+ within a batch
+  bool preamble_suppress_active;     // Suppression engaged (after drift measurement)
+  int preamble_interval_samples;     // Computed safe interval (0 = every frame)
+  float measured_drift_local;        // Drift we measured from incoming frames (samples/frame)
+  float measured_drift_remote;       // Drift peer measured from our frames
+  bool drift_measurement_done;       // Both sides have exchanged drift reports
+  int drift_measurement_batch_count; // Batches since turboshift settled (-1 = not started)
+
+  // Drift exchange state machine (role-switch protocol)
+  // Protocol: P1 (signal) → SWITCH_ROLE → P3 (reverse measurement) → SWITCH_ROLE → P5 (final report)
+  enum DriftExchangePhase {
+    DRIFT_IDLE = 0,
+    DRIFT_MEASURING,         // Both: accumulating 3 batches for trigger
+    DRIFT_P1_REPORT_TX,      // Commander: sent DRIFT_REPORT #1 (placeholder), awaiting ACK
+    DRIFT_P1_SWITCH_PENDING, // Responder: received DRIFT_REPORT #1, expecting SWITCH_ROLE
+    DRIFT_P1_SWITCH_TX,      // Commander: sent SWITCH_ROLE #1, awaiting ACK
+    DRIFT_P3_REPORT_PENDING, // New commander: needs to send DRIFT_REPORT #2 (good measurement)
+    DRIFT_P3_REPORT_TX,      // New commander: sent DRIFT_REPORT #2, awaiting ACK
+    DRIFT_P3_DATA,           // New commander: transmitting data batches for peer to measure
+    DRIFT_P3_SWITCH_TX,      // New commander: sent SWITCH_ROLE #2, awaiting ACK
+    DRIFT_P5_REPORT_PENDING, // Original commander: needs to send DRIFT_REPORT #3 (good measurement)
+    DRIFT_P5_REPORT_TX,      // Original commander: sent DRIFT_REPORT #3, awaiting ACK
+    DRIFT_DONE
+  };
+  DriftExchangePhase drift_exchange_phase;
+  int drift_exchange_batch_count;    // Batch counter for Phase 3 data
+
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)
@@ -446,6 +473,7 @@ private:
   void load_configuration(int configuration, int level, int backup_configuration);
   void switch_narrowband_mode(int nb_enabled);
   void return_to_last_configuration();
+  void compute_preamble_interval(float max_drift_per_frame);
   int init_messages_buffers();
   int deinit_messages_buffers();
   void check_buffer_canaries(const char* caller);

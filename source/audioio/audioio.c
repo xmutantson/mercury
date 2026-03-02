@@ -50,6 +50,12 @@ int multichannel_mode = 0;          // Set to 1 when -A flag is used (forces 16c
 // When noise_snr_db < 999, white noise is added to captured audio at the specified SNR.
 // SNR is relative to the signal level AFTER TX/RX gain (i.e. the cable level).
 double noise_snr_db = 999.0;       // 999 = disabled
+
+// RX clock drift simulation (-D flag)
+// Simulates sample clock offset by skipping/duplicating samples in the capture path.
+// At 50 ppm and 48 kHz, this skips ~2.4 samples/sec — realistic for cheap USB sound cards.
+double drift_ppm = 0.0;
+static double drift_accumulator = 0.0;
 static uint64_t noise_rng_state[2] = {0x853c49e6748fea9bULL, 0xda3e39cb94b95bdbULL};
 
 // xoshiro128+ PRNG — fast, good quality for noise generation
@@ -1004,6 +1010,32 @@ void *radio_capture_thread(void *device_ptr)
 			for (int i = 0; i < frames_to_write; i++) {
 				buffer_internal[i] += noise_sigma * noise_gaussian();
 			}
+		}
+
+		// RX clock drift simulation: skip/duplicate samples to simulate
+		// sample rate mismatch between TX and RX sound cards.
+		if(drift_ppm != 0.0)
+		{
+			double drift_per_sample = drift_ppm * 1e-6;
+			int out_idx = 0;
+			for(int i = 0; i < frames_to_write; i++)
+			{
+				drift_accumulator += drift_per_sample;
+				if(drift_accumulator >= 1.0)
+				{
+					drift_accumulator -= 1.0;
+					continue;  // skip sample (RX clock fast)
+				}
+				else if(drift_accumulator <= -1.0)
+				{
+					drift_accumulator += 1.0;
+					buffer_internal[out_idx++] = buffer_internal[i];
+					buffer_internal[out_idx++] = buffer_internal[i];  // duplicate
+					continue;
+				}
+				buffer_internal[out_idx++] = buffer_internal[i];
+			}
+			frames_to_write = out_idx;
 		}
 
 #ifdef MERCURY_GUI_ENABLED
