@@ -588,11 +588,11 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			int expected = data_batch_size;  // Default for non-compressed
 			if(compression_enabled
 				&& messages_rx[0].status == RECEIVED
-				&& messages_rx[0].length >= COMPRESS_HEADER_SIZE)
+				&& messages_rx[0].length >= compressor.get_header_size())
 			{
 				const unsigned char* hdr = (const unsigned char*)messages_rx[0].data;
 				int hdr_comp = hdr[1] | (hdr[2] << 8);
-				int total_compressed = COMPRESS_HEADER_SIZE + hdr_comp;
+				int total_compressed = compressor.get_header_size() + hdr_comp;
 				int mf = max_data_length + max_header_length - DATA_LONG_HEADER_LENGTH;
 				expected = (total_compressed + mf - 1) / mf;
 				if(expected > data_batch_size) expected = data_batch_size;
@@ -913,16 +913,21 @@ void cl_arq_controller::process_control_responder()
 		{
 			bool both_support = (local_capability & CAP_COMPRESSION) &&
 			                    (peer_capability & CAP_COMPRESSION);
+			bool streaming_ok = both_support &&
+			                    (local_capability & CAP_STREAMING) &&
+			                    (peer_capability & CAP_STREAMING);
 			if(force_compress && both_support)
 			{
 				compression_enabled = true;
 				compressor.init();
+				if(streaming_ok) compressor.streaming_enable();
 				printf("[COMPRESS] Force-enabled (--compress flag)\n");
 				fflush(stdout);
 			}
 			else if(both_support)
 			{
 				compressor.init();  // Pre-init contexts, arm later on B2F detection
+				if(streaming_ok) compressor.streaming_enable();
 				printf("[COMPRESS] Deferred (waiting for B2F detection)\n");
 				fflush(stdout);
 			}

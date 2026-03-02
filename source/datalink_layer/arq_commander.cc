@@ -1546,16 +1546,21 @@ void cl_arq_controller::process_control_commander()
 			{
 				bool both_support = (local_capability & CAP_COMPRESSION) &&
 				                    (peer_capability & CAP_COMPRESSION);
+				bool streaming_ok = both_support &&
+				                    (local_capability & CAP_STREAMING) &&
+				                    (peer_capability & CAP_STREAMING);
 				if(force_compress && both_support)
 				{
 					compression_enabled = true;
 					compressor.init();
+					if(streaming_ok) compressor.streaming_enable();
 					printf("[COMPRESS] Force-enabled (--compress flag)\n");
 					fflush(stdout);
 				}
 				else if(both_support)
 				{
 					compressor.init();  // Pre-init contexts, arm later on B2F detection
+					if(streaming_ok) compressor.streaming_enable();
 					printf("[COMPRESS] Deferred (waiting for B2F detection)\n");
 					fflush(stdout);
 				}
@@ -2028,6 +2033,10 @@ void cl_arq_controller::finalize_block_commander()
 	block_under_tx=NO;
 	fifo_buffer_backup.flush();
 
+	// Commit streaming context after successful block ACK
+	if(compressor.is_streaming())
+		compressor.commit_pending();
+
 #ifdef MERCURY_GUI_ENABLED
 	if(batch_uncompressed_size > 0)
 		gui_add_throughput_bytes_tx(batch_uncompressed_size);
@@ -2147,8 +2156,9 @@ void cl_arq_controller::process_buffer_data_commander()
 				const int staging_max = 65535;  // Header orig_size is uint16; cap to prevent overflow
 				int initial_pop = (int)(batch_capacity * compress_ratio_estimate);
 				if(initial_pop > staging_max) initial_pop = staging_max;
-				if(initial_pop < batch_capacity - COMPRESS_HEADER_SIZE)
-					initial_pop = batch_capacity - COMPRESS_HEADER_SIZE;
+				int hdr_size = compressor.get_header_size();
+				if(initial_pop < batch_capacity - hdr_size)
+					initial_pop = batch_capacity - hdr_size;
 
 				char staging[COMPRESS_WORKSPACE_SIZE];
 				int raw_size = fifo_buffer_tx.pop(staging, initial_pop);
@@ -2179,7 +2189,7 @@ void cl_arq_controller::process_buffer_data_commander()
 								break;  // Good enough
 							}
 							// Under-filled: estimate how much more raw data to add
-							int comp_payload = comp_size - COMPRESS_HEADER_SIZE;
+							int comp_payload = comp_size - compressor.get_header_size();
 							if(comp_payload <= 0) { compress_ok = true; break; }
 							float current_ratio = (float)raw_size / (float)comp_payload;
 							int remaining_comp = batch_capacity - comp_size;
@@ -2215,7 +2225,8 @@ void cl_arq_controller::process_buffer_data_commander()
 					if(compress_ok && comp_size > 0)
 					{
 						// Update running ratio estimate (EMA)
-						int comp_payload = comp_size - COMPRESS_HEADER_SIZE;
+						int comp_hdr = compressor.get_header_size();
+						int comp_payload = comp_size - comp_hdr;
 						if(comp_payload > 0)
 						{
 							float measured = (float)raw_size / (float)comp_payload;
@@ -2223,6 +2234,8 @@ void cl_arq_controller::process_buffer_data_commander()
 						}
 						fifo_buffer_backup.push(staging, raw_size);
 						batch_uncompressed_size = raw_size;
+						if(compressor.is_streaming())
+							compressor.set_pending_raw((unsigned char*)staging, raw_size);
 #ifdef MERCURY_GUI_ENABLED
 						// Push algo to GUI (read from compressed header byte 0)
 						g_gui_state.compression_algo.store((int)(unsigned char)comp_buf[0]);
@@ -2232,7 +2245,8 @@ void cl_arq_controller::process_buffer_data_commander()
 					{
 						// compress_block() error fallback — wrap raw data in ALGO_RAW.
 						// Cap to batch capacity minus header.
-						int max_raw = batch_capacity - COMPRESS_HEADER_SIZE;
+						int fallback_hdr = compressor.get_header_size();
+						int max_raw = batch_capacity - fallback_hdr;
 						if(raw_size > max_raw)
 						{
 							fifo_buffer_tx.push_front(
@@ -2245,10 +2259,25 @@ void cl_arq_controller::process_buffer_data_commander()
 						comp_buf[2] = (char)((raw_size >> 8) & 0xFF);
 						comp_buf[3] = (char)(raw_size & 0xFF);
 						comp_buf[4] = (char)((raw_size >> 8) & 0xFF);
-						memcpy(comp_buf + COMPRESS_HEADER_SIZE, staging, raw_size);
-						comp_size = COMPRESS_HEADER_SIZE + raw_size;
+						if(compressor.is_streaming())
+						{
+							// CRC16 even on raw fallback (streaming header is 7 bytes)
+							uint16_t crc = 0xFFFF;
+							for(int j = 0; j < raw_size; j++)
+							{
+								crc ^= (unsigned char)staging[j];
+								for(int b = 0; b < 8; b++)
+									crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+							}
+							comp_buf[5] = (char)(crc & 0xFF);
+							comp_buf[6] = (char)((crc >> 8) & 0xFF);
+						}
+						memcpy(comp_buf + fallback_hdr, staging, raw_size);
+						comp_size = fallback_hdr + raw_size;
 						fifo_buffer_backup.push(staging, raw_size);
 						batch_uncompressed_size = raw_size;
+						if(compressor.is_streaming())
+							compressor.set_pending_raw((unsigned char*)staging, raw_size);
 					}
 
 					// No zero-padding: send only actual compressed data frames.

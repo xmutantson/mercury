@@ -147,7 +147,7 @@ cl_arq_controller::cl_arq_controller()
 	nb_probe_max=2;
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
-	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL;  // Always advertise compression + B2F unroll
+	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING;  // Always advertise compression + B2F + streaming
 	peer_capability=0;
 	wb_upgrade_pending=false;
 	compression_enabled=false;
@@ -1879,7 +1879,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -1976,7 +1976,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2012,7 +2012,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -2030,7 +2030,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2049,7 +2049,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL;
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -3916,7 +3916,7 @@ void cl_arq_controller::copy_data_to_buffer()
 		for(int i=this->data_batch_size;i<this->nMessages;i++)
 			messages_rx[i].status=FREE;
 
-		if(assembled_size >= COMPRESS_HEADER_SIZE)
+		if(assembled_size >= compressor.get_header_size())
 		{
 
 			char decomp_buf[COMPRESS_WORKSPACE_SIZE];
@@ -3928,12 +3928,18 @@ void cl_arq_controller::copy_data_to_buffer()
 				fifo_buffer_rx.push(decomp_buf, dec_size);
 				total_bytes += dec_size;
 				// Update compression ratio on responder side (EMA)
-				int comp_payload = assembled_size - COMPRESS_HEADER_SIZE;
+				int comp_hdr = compressor.get_header_size();
+				int comp_payload = assembled_size - comp_hdr;
 				if(comp_payload > 0)
 				{
 					float measured = (float)dec_size / (float)comp_payload;
 					compress_ratio_estimate = 0.7f * compress_ratio_estimate + 0.3f * measured;
 				}
+
+				// Commit streaming context (raw data = decompressed output)
+				if(compressor.is_streaming())
+					compressor.streaming_commit((unsigned char*)decomp_buf, dec_size);
+
 #ifdef MERCURY_GUI_ENABLED
 				// Push algo to GUI from decompressed header (responder side)
 				g_gui_state.compression_algo.store((int)(unsigned char)assembled[0]);
@@ -3950,6 +3956,10 @@ void cl_arq_controller::copy_data_to_buffer()
 				fflush(stdout);
 				fifo_buffer_rx.push(assembled, assembled_size);
 				total_bytes += assembled_size;
+
+				// Decompression failure — reset streaming context
+				if(compressor.is_streaming())
+					compressor.streaming_reset();
 			}
 		}
 		else if(assembled_size > 0)
@@ -3993,6 +4003,20 @@ void cl_arq_controller::copy_data_to_buffer()
 
 void cl_arq_controller::restore_tx_from_compressed()
 {
+	// With streaming, messages_tx was compressed with accumulated context that
+	// we can't reproduce after reset. Use the raw backup buffer instead.
+	if(compressor.is_streaming())
+	{
+		printf("[RESTORE_TX] Streaming active — resetting context, restoring from backup\n");
+		fflush(stdout);
+		compressor.streaming_reset();
+		compressor.clear_pending();
+		for(int i = 0; i < nMessages; i++)
+			messages_tx[i].status = FREE;
+		restore_backup_buffer_data();
+		return;
+	}
+
 	// Reassemble compressed chunks from messages_tx, decompress back to raw,
 	// push raw data to fifo_buffer_tx for re-compression at new config.
 	char assembled[16384];
@@ -4012,7 +4036,7 @@ void cl_arq_controller::restore_tx_from_compressed()
 		messages_tx[i].status = FREE;
 	}
 
-	if(assembled_size >= COMPRESS_HEADER_SIZE)
+	if(assembled_size >= compressor.get_header_size())
 	{
 		char decomp_buf[COMPRESS_WORKSPACE_SIZE];
 		int dec_size = compressor.decompress_block(

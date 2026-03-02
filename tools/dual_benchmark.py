@@ -111,8 +111,8 @@ def run_single_test(mercury_bin, config, bandwidth, data_type, text_data,
     else:
         nb_flags = ["-M", "auto"]
 
-    # Force compression for binary data (no B2F SID to auto-detect)
-    compress_flag = ["-F"] if data_type == "binary" else []
+    # Force compression on (benchmark traffic has no B2F SID to auto-detect)
+    compress_flag = ["-F", "on"]
 
     # Start responder
     rsp_cmd = [
