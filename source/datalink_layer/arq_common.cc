@@ -192,6 +192,7 @@ cl_arq_controller::cl_arq_controller()
 	supershift_proven_ceiling=-1;
 	turbo_snr_ack_enabled=false;
 	turbo_received_snr=-99.0f;
+	turbo_switch_role_retries=0;
 
 	emergency_nack_count=0;
 	emergency_nack_threshold=2;
@@ -2497,6 +2498,7 @@ void cl_arq_controller::reset_session_state()
 	supershift_proven_ceiling = -1;
 	turbo_snr_ack_enabled = false;
 	turbo_received_snr = -99.0f;
+	turbo_switch_role_retries = 0;
 
 	// BREAK / recovery
 	emergency_nack_count = 0;

@@ -87,6 +87,20 @@ Only used during turboshift; normal data exchange uses short ACK.
 
 **Improvement**: SUPERSHIFT jumps save 1-2 probe rounds (~8-12s) per direction. CONFIG_13-14 reachable where CONFIG_12 was previous ceiling.
 
+### §3.5 Bugs Found During IONOS Testing (2026-03-24)
+
+1. **turbo_snr_ack_enabled not cleared** (responder): After TURBO_DONE, responder still sent SNR suffix on ACK patterns, breaking ACK detection for normal data exchange. Fix: clear `turbo_snr_ack_enabled=false` and `turbo_received_snr=-99` at both TURBO_DONE paths in `arq_responder.cc`.
+
+2. **SNR overshoot** (commander): Step-3 blind fallback overshot the SNR ceiling (e.g., jumped to CONFIG_16 at 11 dB SNR). Two fixes in `arq_commander.cc`:
+   - Replace step-3 with SNR-capped step-1 when SNR available but target ≤ current
+   - Pre-probe SNR guard: before sending SET_CONFIG, check `get_configuration(effective_snr)` vs target. If SNR says target won't work, finish turbo at current config. Prevents both sides from loading an undecodable config (permanent stuck state).
+
+3. **SWITCH_ROLE infinite retransmit during turboshift** (Bug #60, commander): When `finish_turbo_direction()` sends SWITCH_ROLE after TURBO_FORWARD, it sets `turboshift_phase=TURBO_REVERSE` and `turboshift_active=false`. If SWITCH_ROLE isn't ACKed:
+   - Turboshift SET_CONFIG handler (`arq_commander.cc:1079`) skips it: `turboshift_active=false`
+   - BREAK counter guard (`arq_commander.cc:1194`) skips it: `turboshift_phase != TURBO_DONE`
+   - Result: commander retransmits SWITCH_ROLE forever with no BREAK escalation
+   - Fix: new handler catches SWITCH_ROLE NAck during turbo (2 retries, then BREAK to ROBUST_0/CONFIG_0 and settle at `turboshift_last_good`). Added `turbo_switch_role_retries` counter in `arq.h`.
+
 ## §4 Open Questions
 
 - [?] WB mode (M=16) not yet tested on IONOS — should work better (more tones, larger margin)

@@ -1140,6 +1140,70 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				return;
 			}
 
+			// Turboshift SWITCH_ROLE failure: if the role-swap frame isn't ACKed
+			// during turboshift, retry twice then BREAK. Without this, the commander
+			// retransmits SWITCH_ROLE forever because the normal BREAK counter
+			// (line ~1194) requires turboshift_phase == TURBO_DONE. (Bug #60)
+			if(messages_control.data[0] == SWITCH_ROLE
+				&& turboshift_phase != TURBO_DONE
+				&& link_status == CONNECTED
+				&& !emergency_break_active)
+			{
+				turbo_switch_role_retries++;
+				printf("[TURBO] SWITCH_ROLE NAck #%d at config %d (phase=%d)\n",
+					turbo_switch_role_retries, current_configuration,
+					(int)turboshift_phase);
+				fflush(stdout);
+
+				if(turbo_switch_role_retries <= 2)
+				{
+					// Retry — the frame may have been corrupted by noise
+					connection_status = TRANSMITTING_CONTROL;
+				}
+				else
+				{
+					// Retries exhausted — BREAK and end turboshift at last good config
+					int settle_config = (turboshift_last_good >= 0) ?
+						turboshift_last_good : init_configuration;
+
+					printf("[TURBO] SWITCH_ROLE failed %d times, BREAK to settle at config %d\n",
+						turbo_switch_role_retries, settle_config);
+					fflush(stdout);
+
+					turbo_switch_role_retries = 0;
+					turboshift_phase = TURBO_DONE;
+					turboshift_active = false;
+					turbo_snr_ack_enabled = false;
+					turbo_received_snr = -99.0f;
+
+					// Cancel pending control message
+					messages_control.ack_timeout=0;
+					messages_control.id=0;
+					messages_control.length=0;
+					messages_control.nResends=0;
+					messages_control.status=FREE;
+					messages_control.type=NONE;
+
+					data_configuration = settle_config;
+					emergency_previous_config = current_configuration;
+					break_drop_step = 1;
+					supershift_proven_ceiling = config_ladder_down(current_configuration, robust_enabled);
+					emergency_break_active = 1;
+					emergency_break_retries = 3;
+					emergency_nack_count = 0;
+
+					for(int i=0; i<nMessages; i++)
+						messages_tx[i].status = FREE;
+					fifo_buffer_backup.flush();
+
+					send_break_pattern();
+					telecom_system->data_container.frames_to_read = 4;
+					calculate_receiving_timeout();
+					receiving_timer.start();
+					return;
+				}
+			}
+
 			// Frame gearshift up failure: BREAK immediately, double threshold.
 			// Only one attempt — no retries. Recover to the working config and
 			// require 2x consecutive ACKs before trying to upshift again.
@@ -2060,6 +2124,7 @@ void cl_arq_controller::process_control_commander()
 			// finalize_block_commander() called directly after data ACK.
 			else if (messages_control.data[0]==SWITCH_ROLE)
 			{
+				turbo_switch_role_retries = 0;  // Reset on success
 				// Asymmetric gearshift: swap forward/reverse for the return path
 				if(forward_configuration != CONFIG_NONE && reverse_configuration != CONFIG_NONE)
 				{
@@ -2237,11 +2302,34 @@ void cl_arq_controller::process_control_commander()
 							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB (turbo_rx=%.1f) -> config %d -> %d (direct, ceiling=%d)\n",
 								effective_snr, turbo_received_snr, current_configuration, negotiated_configuration, supershift_proven_ceiling);
 						}
+						else if(effective_snr > -90)
+						{
+							// SNR says ceiling is at or below current -- step-1 (cautious)
+							negotiated_configuration = config_ladder_up_n(current_configuration, 1, robust_enabled, narrowband_enabled == YES);
+							printf("[TURBO] SNR-capped step-1: config %d -> %d (snr=%.1f, target=%d)\n",
+								current_configuration, negotiated_configuration, effective_snr, snr_target);
+						}
 						else
 						{
+							// No valid SNR: blind step-3
 							negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
-							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3, snr=%.1f)\n",
-								current_configuration, negotiated_configuration, effective_snr);
+							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3, no SNR)\n",
+								current_configuration, negotiated_configuration);
+						}
+						// Guard: if target config is beyond SNR capability, do not probe.
+						// Probing to an undecodable config leaves both sides stuck.
+						if(effective_snr > -90)
+						{
+							int snr_max_cfg = get_configuration(effective_snr);
+							if(config_ladder_index(snr_max_cfg) < config_ladder_index(negotiated_configuration))
+							{
+								printf("[TURBO] SNR %.1f too low for config %d (max=%d), finishing at %d\n",
+									effective_snr, negotiated_configuration, snr_max_cfg, current_configuration);
+								fflush(stdout);
+								turboshift_last_good = current_configuration;
+								finish_turbo_direction();
+								return;
+							}
 						}
 						fflush(stdout);
 						cleanup();
