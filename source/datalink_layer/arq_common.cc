@@ -190,6 +190,8 @@ cl_arq_controller::cl_arq_controller()
 	turboshift_retries=1;
 	turbo_settle_pending=false;
 	supershift_proven_ceiling=-1;
+	turbo_snr_ack_enabled=false;
+	turbo_received_snr=-99.0f;
 
 	emergency_nack_count=0;
 	emergency_nack_threshold=2;
@@ -1602,6 +1604,8 @@ void cl_arq_controller::update_status()
 			turboshift_last_good = -1;
 			turbo_settle_pending = false;
 			supershift_proven_ceiling = -1;
+			turbo_snr_ack_enabled = false;
+			turbo_received_snr = -99.0f;
 
 			messages_control.status = FREE;
 			connection_attempts = 0;
@@ -2491,6 +2495,8 @@ void cl_arq_controller::reset_session_state()
 	turboshift_initiator = false;
 	turboshift_retries = 1;
 	supershift_proven_ceiling = -1;
+	turbo_snr_ack_enabled = false;
+	turbo_received_snr = -99.0f;
 
 	// BREAK / recovery
 	emergency_nack_count = 0;
@@ -3214,6 +3220,117 @@ void cl_arq_controller::send_ack_pattern()
 	ptt_off();
 }
 
+// Transmit ACK + SNR suffix pattern (turboshift only)
+void cl_arq_controller::send_ack_pattern_with_snr(float snr)
+{
+	if(passive_monitor) return;
+	printf("[TX-ACK-SNR] Sending ACK+SNR pattern (SNR=%.1f dB, tone=%d) on CONFIG_%d\n",
+		snr, telecom_system->ack_mfsk.snr_to_tone(snr), current_configuration);
+	fflush(stdout);
+
+	// Guard delay for MFSK modes (same as send_ack_pattern)
+	if(is_robust_config(current_configuration))
+	{
+		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
+		msleep(wait_ms);
+	}
+
+	ptt_on();
+
+	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
+	ptt_on_delay_timer.start();
+
+	int pattern_samples = telecom_system->ack_snr_pattern_passband_samples;
+	int symbol_period = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
+
+	int padded_size = pattern_samples + 2 * symbol_period;
+	double *raw_output = new double[padded_size];
+	double *filtered1 = new double[padded_size];
+	double *filtered2 = new double[padded_size];
+
+	if(!raw_output || !filtered1 || !filtered2) exit(-36);
+
+	memset(raw_output, 0, padded_size * sizeof(double));
+
+	telecom_system->generate_ack_snr_pattern_passband(&raw_output[symbol_period], snr);
+
+	memcpy(&raw_output[0], &raw_output[symbol_period], symbol_period * sizeof(double));
+	memcpy(&raw_output[symbol_period + pattern_samples], &raw_output[pattern_samples], symbol_period * sizeof(double));
+
+	memset(filtered1, 0, padded_size * sizeof(double));
+	memset(filtered2, 0, padded_size * sizeof(double));
+	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
+	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
+
+	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
+		msleep(1);
+
+	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
+	{
+		const double SAMPLE_RATE = 48000.0;
+		const double PILOT_FREQ = (double)pilot_tone_hz;
+		const double PI = 3.14159265358979323846;
+		int pilot_samples = (int)(pilot_tone_ms * SAMPLE_RATE / 1000.0);
+		double* pilot_buffer = new double[pilot_samples];
+		for(int i = 0; i < pilot_samples; i++)
+		{
+			double t = (double)i / SAMPLE_RATE;
+			double envelope = 1.0;
+			int ramp_samples = (int)(SAMPLE_RATE * 0.005);
+			if(i < ramp_samples)
+				envelope = (double)i / ramp_samples;
+			else if(i > pilot_samples - ramp_samples)
+				envelope = (double)(pilot_samples - i) / ramp_samples;
+			pilot_buffer[i] = envelope * 0.5 * sin(2.0 * PI * PILOT_FREQ * t);
+		}
+		tx_transfer(pilot_buffer, pilot_samples);
+		delete[] pilot_buffer;
+	}
+
+	tx_transfer(&filtered2[symbol_period], pattern_samples);
+
+	while(size_buffer(playback_buffer) > 0)
+		msleep(1);
+
+	delete[] raw_output;
+	delete[] filtered1;
+	delete[] filtered2;
+
+	// Same flush sequence as send_ack_pattern
+	telecom_system->data_container.rx_mute = 1;
+	msleep(RX_MUTE_GUARD_MS);
+	circular_buf_reset(capture_buffer);
+	{
+		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		memset(telecom_system->data_container.passband_delayed_data, 0, 2 * buf_samples * sizeof(double));
+		telecom_system->data_container.ring_write_index = 0;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+	telecom_system->data_container.rx_mute = 0;
+	telecom_system->data_container.rx_mute_samples = 0;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	{
+		int rx_frame = telecom_system->data_container.preamble_nSymb
+		             + telecom_system->data_container.Nsymb;
+		int margin = 10;
+		telecom_system->data_container.frames_to_read = rx_frame + margin;
+	}
+
+	printf("[TX-ACK-SNR] Done, flushed capture buffer\n");
+	fflush(stdout);
+
+	ptt_off_delay_timer.start();
+	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
+		msleep(1);
+
+	ptt_off();
+}
+
 // Transmit BREAK tone pattern — emergency "drop to ROBUST_0" signal
 void cl_arq_controller::send_break_pattern()
 {
@@ -3503,12 +3620,20 @@ bool cl_arq_controller::receive_hail_pattern()
 // Scans the TAIL (newest symbols) of the capture buffer.
 // Buffer was zeroed after TX, so the tail contains only fresh audio.
 // Called frequently (every ~2 symbols / 45ms) to adapt to any round-trip latency.
+// When turbo_snr_ack_enabled, also decodes 8 SNR suffix symbols and stores in turbo_received_snr.
 bool cl_arq_controller::receive_ack_pattern()
 {
 	// Tail must cover the entire fresh audio region (= initial guard).
-	// Tail = pattern length + margin. Ensures ACKs arriving early are captured.
-	// WB: 16+24=40 symbols (907ms). NB M=8: 32+24=56 (1,269ms). NB M=4: 48+24=72.
-	const int tail_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb + 8 + 16;
+	// Tail = pattern length + margin + SNR suffix. Ensures ACKs arriving early are captured.
+	// Tail must be large enough that even if the ACK is detected late in the buffer,
+	// the suffix symbols still fit. Need: ack_pattern_nsymb for search range +
+	// full pattern (with suffix) + margin.
+	// WB: 16+20+16=52. NB M=8: 32+40+16=88. NB M=4: 48+56+16=120.
+	int ack_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int pattern_len = turbo_snr_ack_enabled ?
+		telecom_system->ack_mfsk.ack_snr_pattern_nsymb() :
+		ack_nsymb;
+	const int tail_nsymb = ack_nsymb + pattern_len + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
 	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
@@ -3531,29 +3656,106 @@ bool cl_arq_controller::receive_ack_pattern()
 		MUTEX_UNLOCK(&capture_prep_mutex);
 
 		int matched_count = 0;
-		double metric = telecom_system->detect_ack_pattern_from_passband(
-			telecom_system->data_container.ready_to_process_passband_delayed_data,
-			tail_samples, &matched_count);
 
-		// ACK detection with energy gate + carrier image recovery (Bug #39).
-		// WB: 8/16 matches, sufficient for M=16/32.
-		// NB: 24/32 (M=8) or 40/48 (M=4) — Sidelnikov sequences eliminate false alarms.
-		if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold && metric >= 3.0)
+		if(turbo_snr_ack_enabled)
 		{
+			// Turboshift mode: detect ACK and decode SNR suffix.
+			// The suffix symbols arrive AFTER the ACK pattern. The ACK is
+			// detected when 24+ of 32 symbols are in the buffer, but the
+			// 8 suffix symbols may still be in flight (~200ms NB, ~100ms WB).
+			// When ACK is found but suffix is unreadable, defer and keep
+			// polling until the suffix arrives (up to 500ms timeout).
+			bool snr_valid = false;
+			float decoded_snr = telecom_system->detect_ack_snr_from_passband(
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				tail_samples, &matched_count, &snr_valid);
+
+			if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold)
+			{
+				if(snr_valid)
+				{
+					turbo_received_snr = decoded_snr;
+					turbo_snr_defer_timer.reset();
+					printf("[CMD-ACK-SNR] ACK detected with SNR=%.1f dB (matched=%d)\n",
+						decoded_snr, matched_count);
+					fflush(stdout);
+
 #ifdef MERCURY_GUI_ENABLED
-			gui_push_monitor_event("[ACK]", false);
+					gui_push_monitor_event("[ACK+SNR]", false);
 #endif
-			// Detected — commander is about to TX next batch. Small ftr
-			// keeps polling responsive; audio accumulated here is destroyed
-			// by the pre-TX flush in send_batch() anyway.
-			MUTEX_LOCK(&capture_prep_mutex);
-			telecom_system->data_container.frames_to_read = 4;
-			telecom_system->data_container.nUnder_processing_events = 0;
-			telecom_system->receive_stats.mfsk_search_raw = 0;
-			telecom_system->receive_stats.ofdm_search_raw = 0;
-			telecom_system->receive_stats.ofdm_batch_active = false;
-			MUTEX_UNLOCK(&capture_prep_mutex);
-			return true;
+					MUTEX_LOCK(&capture_prep_mutex);
+					telecom_system->data_container.frames_to_read = 4;
+					telecom_system->data_container.nUnder_processing_events = 0;
+					telecom_system->receive_stats.mfsk_search_raw = 0;
+					telecom_system->receive_stats.ofdm_search_raw = 0;
+					telecom_system->receive_stats.ofdm_batch_active = false;
+					MUTEX_UNLOCK(&capture_prep_mutex);
+					return true;
+				}
+				else
+				{
+					// ACK detected but suffix not yet arrived. Start/check defer timer.
+					if(turbo_snr_defer_timer.counting != COUNTING)
+					{
+						turbo_snr_defer_timer.start();
+						printf("[CMD-ACK-SNR] ACK detected, waiting for suffix (matched=%d)\n",
+							matched_count);
+						fflush(stdout);
+					}
+					else if(turbo_snr_defer_timer.get_elapsed_time_ms() > 500)
+					{
+						// Timeout: accept ACK without SNR
+						turbo_received_snr = -99.0f;
+						turbo_snr_defer_timer.reset();
+						printf("[CMD-ACK-SNR] ACK detected, suffix timeout (matched=%d)\n",
+							matched_count);
+						fflush(stdout);
+
+#ifdef MERCURY_GUI_ENABLED
+						gui_push_monitor_event("[ACK+SNR]", false);
+#endif
+						MUTEX_LOCK(&capture_prep_mutex);
+						telecom_system->data_container.frames_to_read = 4;
+						telecom_system->data_container.nUnder_processing_events = 0;
+						telecom_system->receive_stats.mfsk_search_raw = 0;
+						telecom_system->receive_stats.ofdm_search_raw = 0;
+						telecom_system->receive_stats.ofdm_batch_active = false;
+						MUTEX_UNLOCK(&capture_prep_mutex);
+						return true;
+					}
+					// else: keep polling, suffix not yet in buffer
+					return false;
+				}
+			}
+			else
+			{
+				// No ACK detected at all — reset defer timer if it was running
+				if(turbo_snr_defer_timer.counting == COUNTING &&
+				   turbo_snr_defer_timer.get_elapsed_time_ms() > 500)
+					turbo_snr_defer_timer.reset();
+			}
+		}
+		else
+		{
+			// Normal mode: just detect ACK pattern
+			double metric = telecom_system->detect_ack_pattern_from_passband(
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				tail_samples, &matched_count);
+
+			if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold && metric >= 3.0)
+			{
+#ifdef MERCURY_GUI_ENABLED
+				gui_push_monitor_event("[ACK]", false);
+#endif
+				MUTEX_LOCK(&capture_prep_mutex);
+				telecom_system->data_container.frames_to_read = 4;
+				telecom_system->data_container.nUnder_processing_events = 0;
+				telecom_system->receive_stats.mfsk_search_raw = 0;
+				telecom_system->receive_stats.ofdm_search_raw = 0;
+				telecom_system->receive_stats.ofdm_batch_active = false;
+				MUTEX_UNLOCK(&capture_prep_mutex);
+				return true;
+			}
 		}
 
 		// Not detected — poll again in 2 symbols (~45ms).

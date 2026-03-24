@@ -288,6 +288,7 @@ public:
   void send(st_message* message, int message_location);
   void send_batch();
   void send_ack_pattern();   // Level 3: TX short tone pattern instead of LDPC ACK
+  void send_ack_pattern_with_snr(float snr);  // TX ACK + 4 MFSK symbols encoding SNR
   bool receive_ack_pattern(); // Level 3: RX + detect ACK pattern, returns true if detected
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
@@ -472,6 +473,9 @@ public:
   int turboshift_retries;          // retries left at current config (0 = ceiling)
   bool turbo_settle_pending;       // waiting for settle SET_CONFIG ACK before finish
   int supershift_proven_ceiling;   // highest config that failed BREAK — caps all SUPERSHIFT targets (-1 = no ceiling)
+  bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
+  float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
+  cl_timer turbo_snr_defer_timer;  // defer ACK return until suffix arrives
 
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks

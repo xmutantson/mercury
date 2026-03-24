@@ -139,9 +139,12 @@ public:
 
 	// ACK pattern: short known-tone sequence for pattern-based ACK
 	int ack_pattern_passband_samples;    // = ack_mfsk.ack_pattern_nsymb * Nofdm * freq_interp_rate
+	int ack_snr_pattern_passband_samples;  // = (ack_pattern_nsymb + SNR_SUFFIX_LEN) * Nofdm * freq_interp_rate
 	double ack_pattern_detection_threshold;  // metric threshold for detection
 	int generate_ack_pattern_passband(double* out);  // TX: returns samples written
+	int generate_ack_snr_pattern_passband(double* out, float snr);  // TX: ACK + SNR suffix, returns samples
 	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr);  // RX: returns metric
+	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	void ack_pattern_detection_test();  // SNR sweep + false alarm test
 
 	// BREAK pattern: emergency "drop to ROBUST_0" signal (different tones from ACK)

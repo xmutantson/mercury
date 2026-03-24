@@ -72,6 +72,7 @@ cl_telecom_system::cl_telecom_system()
 	mfsk_ctrl_mode=false;
 	coarse_freq_sync_enabled=false;
 	ack_pattern_passband_samples=0;
+	ack_snr_pattern_passband_samples=0;
 	ack_pattern_detection_threshold=0.8;
 	operation_mode=BER_PLOT_baseband;
 	bit_interleaver_block_size=1;
@@ -2280,6 +2281,122 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 	return metric;
 }
 
+// TX: Generate ACK + SNR suffix pattern as passband audio
+int cl_telecom_system::generate_ack_snr_pattern_passband(double* out, float snr)
+{
+	if(ack_snr_pattern_passband_samples <= 0) return 0;
+
+	int nsymb = ack_mfsk.ack_snr_pattern_nsymb();
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	ack_mfsk.generate_ack_snr_pattern(data_container.ofdm_framed_data, snr);
+
+	for(int i = 0; i < nsymb; i++)
+	{
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	}
+
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	ofdm.peak_clip(out, ack_snr_pattern_passband_samples, ofdm.data_papr_cut);
+
+	return ack_snr_pattern_passband_samples;
+}
+
+// RX: Detect ACK pattern and decode SNR suffix tones.
+// Returns decoded SNR (dB). Sets *out_snr_valid = true if suffix decoded reliably.
+float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
+	int* out_matched, bool* out_snr_valid)
+{
+	*out_snr_valid = false;
+	if(ack_pattern_passband_samples <= 0) return -99.0f;
+
+	// Passband to baseband
+	ofdm.passband_to_baseband(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, carrier_frequency, carrier_amplitude,
+		1, &ofdm.FIR_rx_data);
+
+	// Detect ACK pattern and get the detected position.
+	// Reserve SNR_SUFFIX_LEN symbols after the ACK so suffix always fits.
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, size,
+		data_container.interpolation_rate,
+		ack_mfsk.ack_pattern_nsymb,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		out_matched, 0, nullptr, &best_offset,
+		cl_mfsk::SNR_SUFFIX_LEN);
+
+	if(*out_matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
+		return -99.0f;
+
+	// Decode suffix tones at the detected position
+	int suffix_tones[cl_mfsk::SNR_SUFFIX_LEN];
+	ofdm.decode_suffix_tones(
+		data_container.baseband_data_interpolated, size,
+		data_container.interpolation_rate,
+		best_offset, ack_mfsk.ack_pattern_nsymb,
+		cl_mfsk::SNR_SUFFIX_LEN,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		suffix_tones);
+
+	// Majority vote: find most common tone among the 8 suffix symbols
+	int vote_counts[64] = {};  // M <= 64
+	int valid_count = 0;
+	for(int i = 0; i < cl_mfsk::SNR_SUFFIX_LEN; i++)
+	{
+		if(suffix_tones[i] >= 0 && suffix_tones[i] < ack_mfsk.M)
+		{
+			vote_counts[suffix_tones[i]]++;
+			valid_count++;
+		}
+	}
+
+	if(valid_count < 3)
+		return -99.0f;  // not enough symbols decoded
+
+	int best_tone = 0;
+	int best_votes = 0;
+	int second_votes = 0;
+	for(int t = 0; t < ack_mfsk.M; t++)
+	{
+		if(vote_counts[t] > best_votes)
+		{
+			second_votes = best_votes;
+			best_votes = vote_counts[t];
+			best_tone = t;
+		}
+		else if(vote_counts[t] > second_votes)
+		{
+			second_votes = vote_counts[t];
+		}
+	}
+
+	// Require: at least 3/8 agree AND winner has 2+ more votes than runner-up
+	if(best_votes >= 3 && (best_votes - second_votes) >= 2)
+	{
+		*out_snr_valid = true;
+		return ack_mfsk.tone_to_snr(best_tone);
+	}
+
+	return -99.0f;
+}
+
 // TX: Generate BREAK pattern as passband audio (identical to ACK but with break_tones)
 int cl_telecom_system::generate_break_pattern_passband(double* out)
 {
@@ -4052,6 +4169,7 @@ void cl_telecom_system::load_configuration(int configuration)
 	}
 
 	ack_pattern_passband_samples = ack_mfsk.ack_pattern_nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	ack_snr_pattern_passband_samples = ack_mfsk.ack_snr_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
 
 	// Per-mode detection threshold (all using ack_mfsk: M=16, nStreams=1):
 	// ROBUST_0 (-13 dB): low SNR, need conservative threshold
