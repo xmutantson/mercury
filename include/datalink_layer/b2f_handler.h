@@ -52,7 +52,8 @@ struct st_b2f_proposal
 	char mid[13];           // Message ID (null-terminated)
 	uint32_t uncomp_size;   // Uncompressed size (from FC line)
 	uint32_t comp_size;     // Compressed size including 6-byte B2F header (from FC line)
-	int accepted;           // 1 = accepted (+), 0 = rejected (-), -1 = deferred (=)
+	int accepted;           // 1 = accepted (+/Y/!/H), 0 = rejected (-/N/R/E), -1 = deferred (=/L)
+	uint32_t resume_offset; // byte offset for '!' resume (0 = full transfer)
 };
 
 class cl_b2f_handler

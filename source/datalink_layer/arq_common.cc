@@ -189,6 +189,7 @@ cl_arq_controller::cl_arq_controller()
 	turboshift_initiator=false;
 	turboshift_retries=1;
 	turbo_settle_pending=false;
+	supershift_proven_ceiling=-1;
 
 	emergency_nack_count=0;
 	emergency_nack_threshold=2;
@@ -1600,6 +1601,7 @@ void cl_arq_controller::update_status()
 			turboshift_phase = TURBO_DONE;
 			turboshift_last_good = -1;
 			turbo_settle_pending = false;
+			supershift_proven_ceiling = -1;
 
 			messages_control.status = FREE;
 			connection_attempts = 0;
@@ -2076,9 +2078,29 @@ void cl_arq_controller::process_main()
 				tcp_socket_control.message->length=str.length();
 				tcp_socket_control.transmit();
 			}
-			else if(nBytes_received==0 || (tcp_socket_data.timer.get_elapsed_time_ms()>=tcp_socket_data.timeout_ms && tcp_socket_data.timeout_ms!=INFINITE_))
+			else if(nBytes_received==0)
 			{
+				// TCP connection closed (FIN received) — flush and re-accept
+				fifo_buffer_tx.flush();
+				fifo_buffer_backup.flush();
+				fifo_buffer_rx.flush();
 
+				tcp_socket_data.check_incomming_connection();
+
+				if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
+				{
+					tcp_socket_data.timer.start();
+				}
+			}
+			else if(role == COMMANDER &&
+				tcp_socket_data.timer.get_elapsed_time_ms()>=tcp_socket_data.timeout_ms &&
+				tcp_socket_data.timeout_ms!=INFINITE_)
+			{
+				// Commander only: timeout waiting for data from TCP client.
+				// Responder skips this — its data client is read-only (never sends),
+				// so recv() always returns EWOULDBLOCK. The old code treated this as
+				// a disconnect, flushing buffers and dropping the connection every
+				// 1 second. (Bug #61: responder data delivery)
 				fifo_buffer_tx.flush();
 				fifo_buffer_backup.flush();
 				fifo_buffer_rx.flush();
@@ -2468,6 +2490,7 @@ void cl_arq_controller::reset_session_state()
 	turbo_settle_pending = false;
 	turboshift_initiator = false;
 	turboshift_retries = 1;
+	supershift_proven_ceiling = -1;
 
 	// BREAK / recovery
 	emergency_nack_count = 0;
