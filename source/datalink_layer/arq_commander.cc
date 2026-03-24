@@ -1016,16 +1016,16 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					turboshift_initiator = true;
 					turboshift_phase = TURBO_FORWARD;
 					turboshift_last_good = current_configuration;
+					turbo_snr_ack_enabled = true;
+					turbo_received_snr = -99.0f;
 
 					int snr_target = -1;
 					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
 						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						// Enforce bandwidth ceiling
 						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
 						if(snr_target > cfg_ceiling)
 							snr_target = cfg_ceiling;
-						// Enforce proven ceiling from prior BREAK failures
 						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
 							snr_target = supershift_proven_ceiling;
 					}
@@ -1579,6 +1579,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 void cl_arq_controller::finish_turbo_direction()
 {
 	turboshift_active = false;
+	turbo_snr_ack_enabled = false;
+	turbo_received_snr = -99.0f;
 
 	if(turboshift_phase == TURBO_FORWARD)
 	{
@@ -1821,8 +1823,9 @@ void cl_arq_controller::process_control_commander()
 					turboshift_initiator = true;
 					turboshift_phase = TURBO_FORWARD;
 					turboshift_last_good = current_configuration;
+					turbo_snr_ack_enabled = true;
+					turbo_received_snr = -99.0f;
 
-					// SNR-based supershift: if on OFDM with measured SNR, jump directly
 					int snr_target = -1;
 					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
@@ -2006,6 +2009,8 @@ void cl_arq_controller::process_control_commander()
 				turboshift_initiator = true;
 				turboshift_phase = TURBO_FORWARD;
 				turboshift_last_good = current_configuration;
+				turbo_snr_ack_enabled = true;
+				turbo_received_snr = -99.0f;
 
 				int snr_target = -1;
 				if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
@@ -2211,13 +2216,14 @@ void cl_arq_controller::process_control_commander()
 					turboshift_retries = 1;  // reset retry for next config
 					if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 					{
-						// SNR-based supershift: on OFDM configs, use measured SNR to jump
-						// directly to optimal config instead of blind stepping.
+						// SNR-based supershift: prefer turbo_received_snr (from ACK suffix)
+						// over measurements.SNR_uplink (commander's own, stale during FORWARD).
+						double effective_snr = (turbo_received_snr > -90) ?
+							turbo_received_snr : measurements.SNR_uplink;
 						int snr_target = -1;
-						if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+						if(is_ofdm_config(current_configuration) && effective_snr > -90)
 						{
-							snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-							// Enforce bandwidth ceiling
+							snr_target = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
 							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
 							if(snr_target > cfg_ceiling)
 								snr_target = cfg_ceiling;
@@ -2228,16 +2234,14 @@ void cl_arq_controller::process_control_commander()
 						if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 						{
 							negotiated_configuration = snr_target;
-							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
-								measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
+							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB (turbo_rx=%.1f) -> config %d -> %d (direct, ceiling=%d)\n",
+								effective_snr, turbo_received_snr, current_configuration, negotiated_configuration, supershift_proven_ceiling);
 						}
 						else
 						{
-							// Step 3 up the ladder (ROBUST and OFDM alike).
-							// If the jump overshoots, the ceiling handler steps down by 1.
 							negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
-							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n",
-								current_configuration, negotiated_configuration);
+							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3, snr=%.1f)\n",
+								current_configuration, negotiated_configuration, effective_snr);
 						}
 						fflush(stdout);
 						cleanup();
@@ -2294,6 +2298,8 @@ void cl_arq_controller::process_control_commander()
 							turboshift_active = true;
 							turboshift_phase = TURBO_FORWARD;
 							turboshift_initiator = true;
+							turbo_snr_ack_enabled = true;
+							turbo_received_snr = -99.0f;
 							turboshift_last_good = current_configuration;
 							turboshift_retries = 1;
 							negotiated_configuration = snr_ideal;

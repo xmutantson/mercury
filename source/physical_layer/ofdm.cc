@@ -3210,13 +3210,15 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
                                    int tone_hop_step, int mfsk_M,
                                    int nStreams, const int* stream_offsets,
                                    int* out_matched,
-                                   int suffix_start, int* out_suffix_matched)
+                                   int suffix_start, int* out_suffix_matched,
+                                   int* out_best_offset, int reserve_after)
 {
 	int Nofdm = Nfft + Ngi;
 	int sym_period_interp = Nofdm * interpolation_rate;
 	int buffer_nsymb = buffer_size_interp / sym_period_interp;
 
-	if (buffer_nsymb < ack_nsymb) return 0.0;
+	int total_needed = ack_nsymb + reserve_after;
+	if (buffer_nsymb < total_needed) return 0.0;
 
 	std::complex<double>* decimated_sym = work_buf_a;
 	std::complex<double>* fft_out = work_buf_b;
@@ -3227,7 +3229,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	int best_matched = 0;
 	int best_suffix_matched = 0;
 
-	for (int s = 0; s <= buffer_nsymb - ack_nsymb; s++)
+	for (int s = 0; s <= buffer_nsymb - total_needed; s++)
 	{
 		double metric = 0;
 		int matched = 0;
@@ -3447,16 +3449,91 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			best_matched = fine_best_matched;
 			best_suffix_matched = fine_best_suffix;
 			best_metric = fine_best_metric;
-			best_pos = fine_best_offset / sym_period_interp;
+			best_pos = fine_best_offset;  // keep as interpolated sample offset
 		}
+		else
+		{
+			best_pos = best_pos * sym_period_interp;  // convert coarse to sample offset
+		}
+	}
+	else if (best_pos >= 0)
+	{
+		best_pos = best_pos * sym_period_interp;  // no fine search: convert coarse
 	}
 
 	if (out_matched)
 		*out_matched = best_matched;
 	if (out_suffix_matched)
 		*out_suffix_matched = best_suffix_matched;
+	if (out_best_offset)
+		*out_best_offset = best_pos;  // interpolated sample offset (-1 if not found)
 
 	return best_metric;
+}
+
+// Decode suffix tones after a detected ACK pattern.
+// pattern_offset: interpolated sample offset of the detected pattern start.
+// pattern_nsymb: number of symbols in the detected pattern (e.g. 16 for WB ACK).
+// suffix_len: number of suffix symbols to decode.
+// out_tones: output array of decoded tone indices (size >= suffix_len).
+void cl_ofdm::decode_suffix_tones(std::complex<double>* baseband_interp, int buffer_size_interp,
+	int interpolation_rate, int pattern_offset, int pattern_nsymb,
+	int suffix_len, int tone_hop_step, int mfsk_M,
+	int nStreams, const int* stream_offsets, int* out_tones)
+{
+	int Nofdm_local = Nfft + Ngi;
+	int sym_period_interp = Nofdm_local * interpolation_rate;
+	int half = Nc / 2;
+
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+
+	for (int s = 0; s < suffix_len; s++)
+	{
+		out_tones[s] = -1;  // default: undecoded
+
+		int abs_s = pattern_nsymb + s;  // absolute symbol index (for tone hopping)
+		int offset = pattern_offset + abs_s * sym_period_interp + Ngi * interpolation_rate;
+		if (offset + Nfft * interpolation_rate > buffer_size_interp)
+			continue;
+
+		// Decimate and FFT
+		for (int i = 0; i < Nfft; i++)
+			decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+		fft(decimated_sym, fft_out, Nfft);
+
+		// Find peak energy bin across all streams (primary bin only — no carrier
+		// image recovery, because mirrored bins make tone pairs indistinguishable:
+		// e.g. NB tone 0 (bin 252) and tone 7 (bin 4) share mirror bins)
+		double best_energy = -1.0;
+		int best_tone = 0;
+
+		for (int t = 0; t < mfsk_M; t++)
+		{
+			double e_combined = 0;
+			for (int st = 0; st < nStreams; st++)
+			{
+				int sub = stream_offsets[st] + t;
+				int b = (sub < half) ? Nfft - half + sub
+				                     : start_shift + (sub - half);
+				double e = fft_out[b].real() * fft_out[b].real() +
+				           fft_out[b].imag() * fft_out[b].imag();
+				e_combined += e;
+			}
+			if (e_combined > best_energy)
+			{
+				best_energy = e_combined;
+				best_tone = t;
+			}
+		}
+
+
+		// Reverse tone hopping: actual_tone = (data_tone + abs_s * hop) % M
+		// So data_tone = (actual_tone - abs_s * hop) % M
+		int hop = (abs_s * tone_hop_step) % mfsk_M;
+		int data_tone = (best_tone - hop + mfsk_M * 256) % mfsk_M;
+		out_tones[s] = data_tone;
+	}
 }
 
 int cl_ofdm::symbol_sync(std::complex <double>*in, int size, int interpolation_rate, int location_to_return)

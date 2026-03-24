@@ -74,6 +74,17 @@ public:
 	void set_hail_target(const char* callsign, int len);
 	void clear_hail_target();
 
+	// SNR suffix for turboshift ACK: 8 extra symbols encoding quantized SNR.
+	// WB (M=16): tone 0-15 → SNR = tone*2 - 5 dB (range -5 to +25 dB, 2 dB step)
+	// NB (M=8):  tone 0-7  → SNR = tone*2 - 9 dB (range -9 to +5 dB, 2 dB step)
+	// All 8 symbols carry the same tone (majority vote on decode, need 3/8).
+	static const int SNR_SUFFIX_LEN = 8;
+	int snr_to_tone(float snr) const;
+	float tone_to_snr(int tone) const;
+	void generate_ack_snr_pattern(std::complex<double>* pattern_out, float snr);
+	// Total symbols when SNR suffix is active
+	int ack_snr_pattern_nsymb() const { return ack_pattern_nsymb + SNR_SUFFIX_LEN; }
+
 	cl_mfsk();
 	~cl_mfsk();
 

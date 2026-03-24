@@ -441,9 +441,22 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		}
 		else if(ack_pattern_time_ms > 0)
 		{
-			// ACK pattern uses dedicated ack_mfsk — no config switch needed
-			if(g_verbose) { printf("[ACK-CTRL] Sending ACK pattern (no config switch)\n"); fflush(stdout); }
-			send_ack_pattern();
+			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT
+			bool is_turbo_setconfig = (turboshift_active || turboshift_phase != TURBO_DONE) &&
+				messages_control.data[0] == SET_CONFIG &&
+				measurements.SNR_uplink > -90;
+			if(is_turbo_setconfig)
+			{
+				printf("[ACK-CTRL] Sending ACK+SNR pattern (SNR=%.1f dB)\n",
+					measurements.SNR_uplink);
+				fflush(stdout);
+				send_ack_pattern_with_snr((float)measurements.SNR_uplink);
+			}
+			else
+			{
+				if(g_verbose) { printf("[ACK-CTRL] Sending ACK pattern (no config switch)\n"); fflush(stdout); }
+				send_ack_pattern();
+			}
 			// If config changed (e.g., SET_CONFIG), load the new data config now.
 			// ACK was sent on old config (correct — commander is still on old config),
 			// but we need to switch to new config before receiving data.
@@ -604,6 +617,8 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				turboshift_phase = TURBO_REVERSE;
 				turboshift_active = true;
 				turboshift_last_good = pre_switch_config;
+				turbo_snr_ack_enabled = true;
+				turbo_received_snr = -99.0f;
 
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 				{

@@ -466,6 +466,52 @@ void cl_mfsk::generate_hail_pattern(std::complex<double>* pattern_out)
 	}
 }
 
+// SNR quantization: map float SNR to MFSK tone index
+int cl_mfsk::snr_to_tone(float snr) const
+{
+	if (M == 0) return 0;
+	// WB (M>=16): tone = (SNR + 5) / 2, range -5..+25 dB
+	// NB (M<=8):  tone = (SNR + 9) / 2, range -9..+5 dB
+	float offset = (M >= 16) ? 5.0f : 9.0f;
+	int tone = (int)((snr + offset) / 2.0f + 0.5f);
+	if (tone < 0) tone = 0;
+	if (tone >= M) tone = M - 1;
+	return tone;
+}
+
+float cl_mfsk::tone_to_snr(int tone) const
+{
+	if (M == 0) return -99.0f;
+	float offset = (M >= 16) ? 5.0f : 9.0f;
+	return (float)tone * 2.0f - offset;
+}
+
+// Generate ACK pattern + 4 SNR suffix symbols
+void cl_mfsk::generate_ack_snr_pattern(std::complex<double>* pattern_out, float snr)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+
+	// First: generate normal ACK pattern
+	generate_ack_pattern(pattern_out);
+
+	// Then: append SNR suffix symbols
+	int snr_tone = snr_to_tone(snr);
+	double amp = sqrt((double)Nc / nStreams);
+
+	for (int s = 0; s < SNR_SUFFIX_LEN; s++)
+	{
+		int abs_s = ack_pattern_nsymb + s;  // absolute symbol index
+		for (int k = 0; k < Nc; k++)
+			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+
+		// Apply tone hopping consistent with ACK pattern (same formula)
+		int actual_tone = (snr_tone + abs_s * tone_hop_step) % M;
+
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] = std::complex<double>(amp, 0.0);
+	}
+}
+
 // TX: Map groups of bits to one-hot subcarrier vectors across all streams
 // Each symbol period consumes nStreams * nBits input bits
 void cl_mfsk::mod(const int* bits_in, int total_bits,
