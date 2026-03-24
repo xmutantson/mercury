@@ -615,14 +615,16 @@ void cl_arq_controller::process_messages_acknowledging_control()
 						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_15;
 						if(snr_target > cfg_ceiling)
 							snr_target = cfg_ceiling;
+						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
+							snr_target = supershift_proven_ceiling;
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 					{
 						negotiated_configuration = snr_target;
 						printf("[TURBO] Phase: REVERSE — probing responder->commander\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration);
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
 					}
 					else
 					{

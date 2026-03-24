@@ -471,6 +471,7 @@ public:
   bool turboshift_initiator;       // true = I started turboshift (original commander)
   int turboshift_retries;          // retries left at current config (0 = ceiling)
   bool turbo_settle_pending;       // waiting for settle SET_CONFIG ACK before finish
+  int supershift_proven_ceiling;   // highest config that failed BREAK — caps all SUPERSHIFT targets (-1 = no ceiling)
 
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks

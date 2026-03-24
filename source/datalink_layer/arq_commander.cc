@@ -932,6 +932,12 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					printf("[BREAK-RECOVERY] Config %d failed probe, sending BREAK\n",
 						current_configuration);
 					fflush(stdout);
+
+					// Lower the proven ceiling — this config failed too
+					int new_ceil = config_ladder_down(current_configuration, robust_enabled);
+					if(supershift_proven_ceiling < 0 || new_ceil < supershift_proven_ceiling)
+						supershift_proven_ceiling = new_ceil;
+
 					receiving_timer.stop();
 					receiving_timer.reset();
 					// Force-clear: cleanup() skips PENDING_ACK status
@@ -1019,14 +1025,17 @@ void cl_arq_controller::process_messages_rx_acks_control()
 						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
 						if(snr_target > cfg_ceiling)
 							snr_target = cfg_ceiling;
+						// Enforce proven ceiling from prior BREAK failures
+						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
+							snr_target = supershift_proven_ceiling;
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 					{
 						negotiated_configuration = snr_target;
 						printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration);
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
 					}
 					else
 					{
@@ -1101,8 +1110,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				int settle_config = (turboshift_last_good >= 0) ?
 					turboshift_last_good : init_configuration;
 
-				printf("[TURBO] CEILING at config %d, BREAK to %d then probe down from %d\n",
-					failed_config, settle_config, failed_config);
+				printf("[TURBO] CEILING at config %d, BREAK to %d then probe down from %d (proven_ceiling=%d)\n",
+					failed_config, settle_config, failed_config, supershift_proven_ceiling);
 				printf("[TURBO] CEILING state: turboshift_last_good=%d init_config=%d "
 					"negotiated=%d data_cfg=%d current=%d\n",
 					turboshift_last_good, init_configuration,
@@ -1113,6 +1122,9 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				data_configuration = settle_config;
 				emergency_previous_config = failed_config;
 				break_drop_step = 1;
+
+				// Remember this ceiling so re-trigger never jumps back above it
+				supershift_proven_ceiling = config_ladder_down(failed_config, robust_enabled);
 				emergency_break_active = 1;
 				emergency_break_retries = 3;
 				emergency_nack_count = 0;
@@ -1338,8 +1350,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			int working_config = config_ladder_down(data_configuration, robust_enabled);
 			frame_shift_threshold *= 2;
 
-			printf("[GEARSHIFT] FRAME UP DATA FAILED: config %d can't pass data, BREAK to %d (threshold now %d)\n",
-				data_configuration, working_config, frame_shift_threshold);
+			// This config failed during data — cap future SUPERSHIFT attempts
+			if(supershift_proven_ceiling < 0 || working_config < supershift_proven_ceiling)
+				supershift_proven_ceiling = working_config;
+
+			printf("[GEARSHIFT] FRAME UP DATA FAILED: config %d can't pass data, BREAK to %d (threshold now %d, ceiling=%d)\n",
+				data_configuration, working_config, frame_shift_threshold, supershift_proven_ceiling);
 			fflush(stdout);
 
 			// Preserve all pending data for resend at working config
@@ -1814,14 +1830,16 @@ void cl_arq_controller::process_control_commander()
 						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
 						if(snr_target > cfg_ceiling)
 							snr_target = cfg_ceiling;
+						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
+							snr_target = supershift_proven_ceiling;
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 					{
 						negotiated_configuration = snr_target;
 						printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration);
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
 					}
 					else
 					{
@@ -1997,14 +2015,16 @@ void cl_arq_controller::process_control_commander()
 					int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
 					if(snr_target > cfg_ceiling)
 						snr_target = cfg_ceiling;
+					if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
+						snr_target = supershift_proven_ceiling;
 				}
 
 				if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 				{
 					negotiated_configuration = snr_target;
 					printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
-					printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
-						measurements.SNR_uplink, current_configuration, negotiated_configuration);
+					printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
+						measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
 				}
 				else
 				{
@@ -2201,13 +2221,15 @@ void cl_arq_controller::process_control_commander()
 							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
 							if(snr_target > cfg_ceiling)
 								snr_target = cfg_ceiling;
+							if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
+								snr_target = supershift_proven_ceiling;
 						}
 
 						if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 						{
 							negotiated_configuration = snr_target;
-							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct)\n",
-								measurements.SNR_uplink, current_configuration, negotiated_configuration);
+							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
+								measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
 						}
 						else
 						{
@@ -2260,11 +2282,14 @@ void cl_arq_controller::process_control_commander()
 						int snr_ideal = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
 						if(narrowband_enabled == YES && snr_ideal > NB_CONFIG_MAX)
 							snr_ideal = NB_CONFIG_MAX;
+						// Enforce proven ceiling from prior BREAK failures
+						if(supershift_proven_ceiling >= 0 && snr_ideal > supershift_proven_ceiling)
+							snr_ideal = supershift_proven_ceiling;
 						int gap = config_ladder_index(snr_ideal) - config_ladder_index(current_configuration);
 						if(gap >= SUPERSHIFT_RETRIGGER_CONFIGS)
 						{
-							printf("[TURBO] RE-TRIGGER: SNR=%.1f dB suggests config %d (current %d, gap=%d)\n",
-								measurements.SNR_uplink, snr_ideal, current_configuration, gap);
+							printf("[TURBO] RE-TRIGGER: SNR=%.1f dB suggests config %d (current %d, gap=%d, ceiling=%d)\n",
+								measurements.SNR_uplink, snr_ideal, current_configuration, gap, supershift_proven_ceiling);
 							fflush(stdout);
 							turboshift_active = true;
 							turboshift_phase = TURBO_FORWARD;
