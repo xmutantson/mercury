@@ -659,6 +659,8 @@ void cl_arq_controller::process_messages_acknowledging_control()
 					fflush(stdout);
 					turboshift_active = false;
 					turboshift_phase = TURBO_DONE;
+					turbo_snr_ack_enabled = false;
+					turbo_received_snr = -99.0f;
 					cleanup();
 					add_message_control(SWITCH_ROLE);
 					this->connection_status = TRANSMITTING_CONTROL;
@@ -670,6 +672,8 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				// Returning to original roles after reverse probe
 				turboshift_phase = TURBO_DONE;
 				turboshift_active = false;
+				turbo_snr_ack_enabled = false;
+				turbo_received_snr = -99.0f;
 				printf("[TURBO] DONE — starting data exchange\n");
 				fflush(stdout);
 				this->connection_status = TRANSMITTING_DATA;

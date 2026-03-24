@@ -476,6 +476,7 @@ public:
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
   float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
   cl_timer turbo_snr_defer_timer;  // defer ACK return until suffix arrives
+  int turbo_switch_role_retries;   // consecutive SWITCH_ROLE failures during turbo (Bug #60)
 
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
