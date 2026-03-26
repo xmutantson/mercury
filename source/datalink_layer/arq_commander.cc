@@ -1595,13 +1595,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		}
 
 		// Frame-level gearshift: after N consecutive successful data ACKs, shift up immediately
+		// No ceiling: ladder can climb above turboshift_last_good. BREAK recovery handles failures.
 		{
 			int proposed_frame = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-			bool frame_at_ceiling = (turboshift_phase == TURBO_DONE && turboshift_last_good >= 0
-				&& config_ladder_index(proposed_frame) > config_ladder_index(turboshift_last_good));
 		if(data_ack_received==YES && gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
 			messages_control.status==FREE &&
-			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !frame_at_ceiling)
+			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 		{
 			consecutive_data_acks++;
 			if(consecutive_data_acks >= frame_shift_threshold)
@@ -2216,6 +2215,17 @@ void cl_arq_controller::process_control_commander()
 					printf("[GEARSHIFT] SET_CONFIG ACKed, loaded config %d\n", data_configuration);
 					fflush(stdout);
 
+					// Bug #60: PHY reinit race condition.
+					// When modulation changes (e.g. 8PSK->32QAM), both sides do a full
+					// PHY deinit+init. The responder sends its ACK BEFORE reinitializing
+					// (the ACK uses the old config's frame structure). Without this delay,
+					// the commander's next frame arrives while the responder is still
+					// reinitializing -- lost frame -> BREAK -> cycle repeats forever.
+					// 300ms covers worst-case RPi5 reinit (~100-200ms) with margin.
+					printf("[GEARSHIFT] Settling 300ms for responder PHY reinit\n");
+					fflush(stdout);
+					usleep(300000);
+
 					// Re-fill TX messages for the new config's message sizes
 					for(int i=0;i<nMessages;i++)
 					{
@@ -2506,9 +2516,8 @@ void cl_arq_controller::finalize_block_commander()
 			{
 				{
 					int proposed = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-					bool at_ceiling = (turboshift_phase == TURBO_DONE && turboshift_last_good >= 0
-						&& config_ladder_index(proposed) > config_ladder_index(turboshift_last_good));
-				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !at_ceiling)
+				// No ceiling: ladder can climb above turboshift_last_good. BREAK recovery handles failures.
+				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 				{
 					negotiated_configuration=proposed;
 					printf("[GEARSHIFT] LADDER UP: success=%.0f%% > %.0f%%, config %d -> %d\n",
@@ -2520,12 +2529,8 @@ void cl_arq_controller::finalize_block_commander()
 				}
 				else
 				{
-					if(at_ceiling)
-						printf("[GEARSHIFT] LADDER: at ceiling %d (config %d, batch=%d), success=%.0f%%\n",
-							turboshift_last_good, current_configuration, data_batch_size, last_transmission_block_stats.success_rate_data);
-					else
-						printf("[GEARSHIFT] LADDER: at top (config %d), success=%.0f%%\n",
-							current_configuration, last_transmission_block_stats.success_rate_data);
+					printf("[GEARSHIFT] LADDER: at top (config %d), success=%.0f%%\n",
+						current_configuration, last_transmission_block_stats.success_rate_data);
 					fflush(stdout);
 					this->connection_status=TRANSMITTING_DATA;
 				}

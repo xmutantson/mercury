@@ -838,15 +838,16 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				fflush(stdout);
 			}
 		}
-		// Impulse noise blanking: clip passband samples exceeding 10× RMS.
-		// HF atmospheric noise (QRN) creates short, high-energy bursts that
-		// produce outlier LLRs and poison the LDPC soft decoder. Clipping
-		// limits the damage to a bounded constellation error.
-		// Threshold 10× RMS: OFDM peaks reach ~4× RMS (50 subcarriers),
-		// pre-equalization can push to ~8×. Impulse noise is 15-50× RMS.
-		// NOTE: Disabled in BER test path (data is passed const, clipper
-		// modifies in-place which is safe for ARQ but must not clip BER).
-		if(M != MOD_MFSK)  // guard: only on OFDM, skip if buffer is too quiet
+		// RX passband normalization + impulse noise blanking.
+		// The OFDM pipeline (channel estimation, equalization, LLR computation)
+		// assumes RX signal at roughly the same level as TX output_power_Watt.
+		// External audio paths (SGTL5000 via IONOS, radio links) attenuate
+		// the signal by 20-50 dB. Without normalization, |H| ≈ 0.01 instead
+		// of ≈ 1.0, the equalizer amplifies noise, and LDPC gets garbage.
+		// Normalize: scale passband so RMS matches sqrt(output_power_Watt).
+		// This is a signal processing normalization, not radio AGC — it
+		// preserves SNR and is equivalent to what the TX produced.
+		if(M != MOD_MFSK)
 		{
 			int pb_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 			double* pb = (double*)data;
@@ -854,12 +855,27 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			for(int i = 0; i < pb_samples; i++)
 				sum_sq += pb[i] * pb[i];
 			double rms = sqrt(sum_sq / pb_samples);
-			if(rms > 1e-6) {  // skip if buffer is silence/empty
+			if(rms > 1e-8) {
+				// Target RMS: sqrt(output_power / 2) for passband signal
+				// (factor /2 because passband has carrier modulation overhead)
+				double target_rms = sqrt(output_power_Watt) * 0.5;
+				double scale = target_rms / rms;
+				// Clamp scale to prevent insane amplification on near-silence
+				if(scale > 10000.0) scale = 10000.0;
+				if(scale < 0.001) scale = 0.001;
+				// Only normalize if significantly off (>3 dB)
+				if(scale > 1.5 || scale < 0.67)
+				{
+					for(int i = 0; i < pb_samples; i++)
+						pb[i] *= scale;
+					// Recalculate RMS after scaling
+					rms *= scale;
+				}
+				// Impulse noise blanking: clip at 10× RMS
 				double clip_threshold = 10.0 * rms;
-				int clipped = 0;
 				for(int i = 0; i < pb_samples; i++) {
-					if(pb[i] > clip_threshold) { pb[i] = clip_threshold; clipped++; }
-					else if(pb[i] < -clip_threshold) { pb[i] = -clip_threshold; clipped++; }
+					if(pb[i] > clip_threshold) { pb[i] = clip_threshold; }
+					else if(pb[i] < -clip_threshold) { pb[i] = -clip_threshold; }
 				}
 			}
 		}
@@ -1146,11 +1162,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 	if(M != MOD_MFSK)
 	{
-		if (g_verbose)
-			printf("[OFDM-SYNC] coarse: pream_symb=%d delay=%d bounds=[%d,%d] metric=%.3f %s\n",
-				pream_symb_loc, receive_stats.delay, lower_bound, upper_bound,
-				receive_stats.coarse_metric,
-				(pream_symb_loc > lower_bound && pream_symb_loc <= upper_bound) ? "PASS" : "SKIP");
+		printf("[OFDM-SYNC] coarse: pream_symb=%d delay=%d bounds=[%d,%d] metric=%.3f bufNsymb=%d Nsymb=%d preamNsymb=%d %s\n",
+			pream_symb_loc, receive_stats.delay, lower_bound, upper_bound,
+			receive_stats.coarse_metric,
+			(int)data_container.buffer_Nsymb, data_container.Nsymb, data_container.preamble_nSymb,
+			(pream_symb_loc > lower_bound && pream_symb_loc <= upper_bound) ? "PASS" : "SKIP");
 		fflush(stdout);
 	}
 
@@ -1262,7 +1278,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		// Schmidl-Cox gives high correlation on near-zero noise (ratio of tiny
 		// values is unstable). Check actual signal energy at the detected
 		// preamble position before spending ~120ms on 3 LDPC decode trials.
+		// Uses RELATIVE threshold: preamble energy vs buffer mean energy.
+		// Old absolute threshold (0.001) was calibrated for VB-Cable (~0.1 mean)
+		// and rejected SGTL5000 audio at ~1e-6 mean (40 dB lower).
 		bool energy_ok = true;
+		double pream_mean_energy = 0.0;  // saved for data energy gate comparison
 		if(M != MOD_MFSK)
 		{
 			int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
@@ -1277,15 +1297,31 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				count++;
 			}
 			double mean_energy = (count > 0) ? energy_sum / count : 0.0;
+			pream_mean_energy = mean_energy;
 
-			// Threshold: real OFDM signal has mean energy ~0.05-0.25;
-			// VB-Cable silence has ~1e-10. Use 0.001 as conservative gate.
-			if(mean_energy < 0.001)
+			// Compute buffer mean energy for relative comparison
+			double buf_energy_sum = 0.0;
+			for(int i = 0; i < buf_samples; i++)
 			{
-				if (g_verbose)
-					printf("[OFDM-SYNC] energy=%.2e at delay=%d — silence, skipping decode\n",
-						mean_energy, receive_stats.delay);
-				fflush(stdout);
+				double re = data_container.baseband_data_interpolated[i].real();
+				double im = data_container.baseband_data_interpolated[i].imag();
+				buf_energy_sum += re*re + im*im;
+			}
+			double buf_mean_energy = buf_energy_sum / buf_samples;
+
+			// Reject if buffer is truly silent (no audio hardware connected)
+			// AND preamble energy is indistinguishable from buffer average.
+			// Real signal: preamble energy >> silence-region energy.
+			// False alarm: preamble energy ≈ buffer mean (noise floor throughout).
+			// Absolute floor 1e-12: below any real ADC noise floor.
+			bool is_silence = (buf_mean_energy < 1e-12) && (mean_energy < 1e-12);
+			printf("[OFDM-ENERGY] pream=%.4e buf=%.4e count=%d delay=%d symb=%d metric=%.3f %s\n",
+				mean_energy, buf_mean_energy, count, receive_stats.delay, pream_symb_loc,
+				receive_stats.coarse_metric,
+				is_silence ? "REJECT" : "PASS");
+			fflush(stdout);
+			if(is_silence)
+			{
 				energy_ok = false;
 			}
 
@@ -1294,9 +1330,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// Threshold 0.10 blocks data peaks while allowing degraded preambles.
 			if(energy_ok && receive_stats.coarse_metric < 0.10)
 			{
-				if (g_verbose)
-					printf("[OFDM-SYNC] metric=%.3f at delay=%d — weak peak, skipping decode\n",
-						receive_stats.coarse_metric, receive_stats.delay);
+				printf("[OFDM-ENERGY] metric=%.3f at delay=%d — weak peak, skipping decode\n",
+					receive_stats.coarse_metric, receive_stats.delay);
 				fflush(stdout);
 				energy_ok = false;
 			}
@@ -1324,7 +1359,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						cnt++;
 					}
 					e = (cnt > 0) ? e / cnt : 0.0;
-					if(e > 0.001)
+					if(e > buf_mean_energy * 2.0 && e > 1e-12)
 					{
 						signal_start_symb = s;
 						break;
@@ -1366,12 +1401,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						}
 						retry_energy = (rcnt > 0) ? retry_energy / rcnt : 0.0;
 
-						if (g_verbose)
-							printf("[OFDM-SYNC] silence-skip: orig=%d signal=%d retry=%d metric=%.3f energy=%.2e\n",
-								pream_symb_loc, signal_start_symb, retry_symb, retry.correlation, retry_energy);
+						printf("[OFDM-SYNC] silence-skip: orig=%d signal=%d retry=%d metric=%.3f energy=%.2e\n",
+							pream_symb_loc, signal_start_symb, retry_symb, retry.correlation, retry_energy);
 						fflush(stdout);
 
-						if(retry_energy >= 0.001 && retry.correlation >= preamble_detect_threshold
+						if(retry_energy > 1e-12 && retry.correlation >= preamble_detect_threshold
 							&& retry_symb > lower_bound && retry_symb <= upper_bound)
 						{
 							receive_stats.delay = retry.delay;
@@ -1429,10 +1463,13 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				fflush(stdout);
 			}
 
-			if(data_e < 0.001)
+			// Data missing if data energy is <10% of preamble energy (relative)
+			// or truly zero (absolute floor). Old 0.001 threshold rejected
+			// SGTL5000 signals at -40 dBFS.
+			if(data_e < 1e-12 || (pream_mean_energy > 1e-12 && data_e < pream_mean_energy * 0.1))
 			{
-				printf("[OFDM-SYNC] data_energy=%.2e at pream=%d delay=%d — frame incomplete, skipping decode\n",
-					data_e, pream_symb_loc, receive_stats.delay);
+				printf("[OFDM-SYNC] data_energy=%.2e pream_energy=%.2e at pream=%d delay=%d — frame incomplete, skipping decode\n",
+					data_e, pream_mean_energy, pream_symb_loc, receive_stats.delay);
 				fflush(stdout);
 				energy_ok = false;
 				receive_stats.frame_data_missing = true;
@@ -1608,7 +1645,7 @@ skip_h_retry_point:
 				for(int i = 0; i < sym_samples && (receive_stats.delay + i) < buf_samples; i++)
 					fine_energy += std::norm(data_container.baseband_data_interpolated[receive_stats.delay + i]);
 				fine_energy /= sym_samples;
-				if(fine_energy < 0.001)
+				if(fine_energy < 1e-12)
 				{
 					int orig_delay = receive_stats.delay;
 					for(int fwd = sym_samples; fwd <= 3*sym_samples; fwd += sym_samples)
@@ -1619,7 +1656,7 @@ skip_h_retry_point:
 						for(int i = 0; i < sym_samples; i++)
 							e += std::norm(data_container.baseband_data_interpolated[candidate + i]);
 						e /= sym_samples;
-						if(e >= 0.001)
+						if(e > 1e-12)
 						{
 							if (g_verbose)
 								printf("[OFDM-SYNC] fine-energy-fix: delay %d->%d (fwd %d sym)\n",
@@ -1695,11 +1732,25 @@ skip_h_retry_point:
 					printf("[WB-FREQ] Moose=%.4f Hz\n", freq_offset_measured);
 			}
 
-			// Clamp fine freq correction to ±subcarrier_spacing/4.
-			// Coarse sync handles larger offsets; any Moose/NB estimate beyond this
-			// is likely wrong and would introduce ICI rather than correct it.
+			// Moose sanity check + clamp.
+			// Crystal oscillators on SGTL5000 boards typically differ by <20 Hz.
+			// A Moose estimate > 30 Hz almost certainly means the preamble timing
+			// is wrong (false Schmidl-Cox peak). Skip to next trial instead of
+			// applying a wild correction that makes things worse.
 			{
-				double max_correction = bandwidth / (double)data_container.Nc / 4.0;
+				double subcarrier_spacing = bandwidth / (double)data_container.Nc;
+				double moose_sanity_limit = subcarrier_spacing * 0.7;  // ~32.8 Hz for WB
+				if(g_verbose)
+					printf("[MOOSE-RAW] unclamped=%.4f Hz, sanity=%.1f Hz\n", freq_offset_measured, moose_sanity_limit);
+				if(fabs(freq_offset_measured) > moose_sanity_limit && receive_stats.sync_trials < time_sync_trials_max)
+				{
+					printf("[MOOSE-REJECT] freq=%.1f Hz exceeds sanity limit — bad timing, advancing trial\n", freq_offset_measured);
+					fflush(stdout);
+					receive_stats.sync_trials++;
+					continue;
+				}
+				// Clamp to ±1 subcarrier spacing (covers real offsets up to ~47 Hz)
+				double max_correction = subcarrier_spacing;
 				if(freq_offset_measured > max_correction) freq_offset_measured = max_correction;
 				if(freq_offset_measured < -max_correction) freq_offset_measured = -max_correction;
 			}
@@ -1781,8 +1832,9 @@ skip_h_retry_point:
 			else
 			{
 				ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
-				if(narrowband_enabled)
-					ofdm.CPE_correction(data_container.ofdm_symbol_demodulated_data);
+				// CPE correction: remove residual freq offset before channel estimation.
+				// Previously NB-only, but WB also benefits (reduces pilot residuals).
+				ofdm.CPE_correction(data_container.ofdm_symbol_demodulated_data);
 
 				if(ofdm.channel_estimator==ZERO_FORCE)
 				{
@@ -1808,11 +1860,16 @@ skip_h_retry_point:
 					if(h_count > 0) mean_H = h_sum / h_count;
 				}
 				{
-					double mean_H_threshold = 0.50;
+					// Timing-quality gate: if mean|H| < 0.30, the preamble timing
+				// is almost certainly wrong by 1+ OFDM symbols. Pilots land on
+				// data positions where LS gives |H|≈0 (random phase cancellation).
+				// Even CONFIG_0 (rate 1/16) can't decode below ~0.33.
+				// Good-timing frames: meanH ≥ 0.74 (SGTL5000 at -40 dBFS).
+				// Bad-timing frames: meanH = 0.07-0.24 (data/pilot misalignment).
+				double mean_H_threshold = 0.30;
 					if(mean_H < mean_H_threshold)
 					{
 						skip_h_count++;
-						if (g_verbose)
 						{
 							printf("[OFDM-SYNC] trial %d SKIP-H: mean_H=%.4f too low (threshold=%.2f), skipping LDPC\n",
 								receive_stats.sync_trials, mean_H, mean_H_threshold);
@@ -1848,10 +1905,52 @@ skip_h_retry_point:
 				}
 
 				ofdm.channel_equalizer(data_container.ofdm_symbol_demodulated_data,data_container.equalized_data);
-				variance=ofdm.measure_variance(data_container.equalized_data);
+				double measure_var=ofdm.measure_variance(data_container.equalized_data);
+				// Bug #62 fix: CSI-weighted LLR for ZF equalization.
+				// ZF amplifies noise by 1/|H_k|² per subcarrier. Using a single
+				// global variance makes the decoder overconfident on weak subcarriers.
+				// Fix: demod with pre-ZF noise (σ²_n), then scale each symbol's LLRs
+				// by |H_k|² → LLR_k = (Dmin1-Dmin0) * |H_k|² / σ²_n.
+				// For PSK with amplitude restoration, |H_k|=1 → weight=1 → no change.
+				variance = ofdm.noise_variance_estimate;
+				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f Nsymb=%d amprest=%d\n",
+					receive_stats.sync_trials, current_configuration,
+					ofdm.noise_variance_estimate, measure_var, ofdm.Nsymb,
+					ofdm.channel_estimator_amplitude_restoration);
+				fflush(stdout);
+
+				// Extract per-subcarrier CSI weight |H_k|² and deframe (DATA cells only)
+				float* csi_deframed = new float[data_container.nData];
+				int csi_di = 0;
+				for(int si = 0; si < ofdm.Nsymb; si++)
+				{
+					for(int sj = 0; sj < ofdm.Nc; sj++)
+					{
+						if((ofdm.ofdm_frame + si * ofdm.Nc + sj)->type == DATA)
+						{
+							std::complex<double> H = (ofdm.estimated_channel + si * ofdm.Nc + sj)->value;
+							csi_deframed[csi_di++] = (float)(H.real() * H.real() + H.imag() * H.imag());
+						}
+					}
+				}
+				// Deinterleave CSI weights (same path as equalized data)
+				float* csi_deinterleaved = new float[data_container.nData];
+				deinterleaver(csi_deframed, csi_deinterleaved, data_container.nData, time_freq_interleaver_block_size);
+				delete[] csi_deframed;
+
 				ofdm.deframer(data_container.equalized_data,data_container.ofdm_deframed_data);
 				deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
 				psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
+
+				// Scale each LLR by its subcarrier's |H_k|²
+				int nBps = (int)log2(M);
+				for(int si = 0; si < data_container.nData; si++)
+				{
+					float w = csi_deinterleaved[si];
+					for(int bi = 0; bi < nBps; bi++)
+						data_container.demodulated_data[si * nBps + bi] *= w;
+				}
+				delete[] csi_deinterleaved;
 			}
 
 			deinterleaver(data_container.demodulated_data,data_container.deinterleaved_data,data_container.nBits,bit_interleaver_block_size);
@@ -3593,6 +3692,16 @@ void cl_telecom_system::load_configuration(int configuration)
 		reinit_subsystems.pre_equalization_channel=YES;
 	}
 
+	// Bug #61: LDPC parity matrix must be regenerated when rate changes.
+	// Without this, turboshift config changes leave the decoder using the
+	// old config's parity matrix, causing LDPC failure at every rate change.
+	// Previous tests passed because -s <config> starts from CONFIG_NONE
+	// (full init), but turboshift's incremental path never reinitialized LDPC.
+	if(_ldpc_rate != ldpc.rate)
+	{
+		reinit_subsystems.ldpc=YES;
+	}
+
 	// MFSK: different ROBUST configs may change M or nStreams, need full reinit
 	if(_modulation==MOD_MFSK && M==MOD_MFSK)
 	{
@@ -4210,7 +4319,9 @@ char cl_telecom_system::get_configuration(double SNR)
 {
 	char configuration;
 
-	if(SNR>11)
+	if(SNR>13)
+		configuration=CONFIG_16;
+	else if(SNR>11)
 		configuration=CONFIG_15;
 	else if(SNR>9)
 		configuration=CONFIG_14;
