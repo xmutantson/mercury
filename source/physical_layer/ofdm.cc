@@ -1732,35 +1732,38 @@ double cl_ofdm::measure_SNR(std::complex <double>*in_s, std::complex <double>*in
 
 void cl_ofdm::channel_equalizer(std::complex <double>* in, std::complex <double>* out)
 {
-	// MMSE-regularized ZF: out = in / H, but when |H|² < σ²_n the channel
-	// is too faded to recover — output zero (soft erasure) instead of
-	// amplifying noise.  At good subcarriers this is identical to ZF.
-	// At spectral nulls it prevents noise blowup that poisons LDPC LLRs.
-	double nv = noise_variance_estimate;
+	// ZF equalizer: out = in / H.
+	// Note: MMSE-regularized zeroing (blanking subcarriers where |H|² < σ²_n)
+	// is intentionally disabled. With amplitude restoration (PSK modes),
+	// H is forced to |H|=1 but noise_variance_estimate is at the original
+	// signal scale, making the comparison meaningless. Even without restoration,
+	// the LS estimator's noise_variance can be inflated by interpolation
+	// error, model mismatch, or frequency offset — causing false blanking.
+	// Pure ZF lets the LDPC soft decoder handle weak subcarriers via
+	// variance-weighted LLRs, which is more robust than hard erasure.
 	for(int i=0;i<Nsymb;i++)
 	{
 		for(int j=0;j<Nc;j++)
 		{
 			std::complex<double> H = (estimated_channel+i*Nc+j)->value;
 			double H_mag_sq = H.real()*H.real() + H.imag()*H.imag();
-			if(H_mag_sq > nv)
+			if(H_mag_sq > 1e-12)
 				*(out+i*Nc+j) = *(in+i*Nc+j) / H;
 			else
-				*(out+i*Nc+j) = std::complex<double>(0.0, 0.0);  // erasure
+				*(out+i*Nc+j) = std::complex<double>(0.0, 0.0);  // true zero
 			(estimated_channel+i*Nc+j)->status=UNKNOWN;
 		}
 	}
 }
 void cl_ofdm::channel_equalizer_without_amplitude_restoration(std::complex <double>* in,std::complex <double>* out)
 {
-	double nv = noise_variance_estimate;
 	for(int i=0;i<Nsymb;i++)
 	{
 		for(int j=0;j<Nc;j++)
 		{
 			std::complex<double> H = (estimated_channel_without_amplitude_restoration+i*Nc+j)->value;
 			double H_mag_sq = H.real()*H.real() + H.imag()*H.imag();
-			if(H_mag_sq > nv)
+			if(H_mag_sq > 1e-12)
 				*(out+i*Nc+j) = *(in+i*Nc+j) / H;
 			else
 				*(out+i*Nc+j) = std::complex<double>(0.0, 0.0);

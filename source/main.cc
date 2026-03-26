@@ -987,6 +987,21 @@ start_modem:
             telecom_system.default_configurations_telecom_system.ldpc_nIteration_max = ldpc_iterations;
 #endif
 
+        // RX digital gain (works in both GUI and headless builds)
+        {
+            extern double rx_gain_linear;  // defined in audioio.c
+            double rx_gain_db = 0.0;
+#ifdef MERCURY_GUI_ENABLED
+            rx_gain_db = g_gui_state.rx_gain_db.load();
+#endif
+            if (rx_gain_override > -900.0)
+                rx_gain_db = rx_gain_override;
+            if (rx_gain_db != 0.0) {
+                rx_gain_linear = pow(10.0, rx_gain_db / 20.0);
+                printf("[RX-GAIN] %.1f dB (linear=%.4f)\n", rx_gain_db, rx_gain_linear);
+            }
+        }
+
         // Apply guard interval: CLI --gi overrides INI, INI overrides default (3.0ms)
         {
             double gi_ms = 3.0;  // default

@@ -61,8 +61,8 @@ cl_configuration_telecom_system::cl_configuration_telecom_system()
 
 	ofdm_channel_estimator=LEAST_SQUARE;
 	ofdm_channel_estimator_amplitude_restoration=NO;
-	ofdm_LS_window_width=20;
-	ofdm_LS_window_hight=20;
+	ofdm_LS_window_width=2;
+	ofdm_LS_window_hight=8;
 
 	bit_energy_dispersal_seed=0;
 

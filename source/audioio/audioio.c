@@ -71,6 +71,10 @@ static inline double noise_gaussian(void) {
 	return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
 }
 
+// Headless RX digital gain (set from main.cc via -G flag or INI RxGainDb)
+// 1.0 = unity (0 dB). Applied unconditionally in capture path.
+double rx_gain_linear = 1.0;
+
 // Tune tone state (for GUI tune button)
 static long tune_sample_index = 0;
 
@@ -1028,10 +1032,14 @@ void *radio_capture_thread(void *device_ptr)
 			}
 		}
 
-#ifdef MERCURY_GUI_ENABLED
-		// Apply RX gain as preprocessing step (affects Mercury's core too)
-		gui_apply_rx_gain_for_display(buffer_internal, frames_to_write);
+		// Apply RX digital gain (headless path, always active)
+		if (rx_gain_linear != 1.0) {
+			for (int i = 0; i < frames_to_write; i++) {
+				buffer_internal[i] *= rx_gain_linear;
+			}
+		}
 
+#ifdef MERCURY_GUI_ENABLED
 		// RX overload detection: average energy over 1-second window
 		for (int i = 0; i < frames_to_write; i++) {
 			rx_energy_sum += buffer_internal[i] * buffer_internal[i];
