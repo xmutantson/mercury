@@ -143,6 +143,7 @@ public:
 	double frequency_sync_coarse(std::complex<double>* in, double subcarrier_spacing, int search_range_subcarriers = 0, int interpolation_rate = 1);
 	void channel_equalizer(std::complex <double>* in, std::complex <double>* out);
 	void channel_equalizer_without_amplitude_restoration(std::complex <double>* in,std::complex <double>* out);
+	void smooth_channel_estimate_dft();
 
 	void automatic_gain_control(std::complex <double>*in);
 	double measure_variance(std::complex <double>*in);

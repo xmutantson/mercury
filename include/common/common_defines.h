@@ -73,15 +73,20 @@ inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 // sparse pilot grid (Nc=10, Dy=3) cannot provide with sufficient accuracy.
 #define NB_CONFIG_MAX CONFIG_14
 
+// WB mode cap — CONFIG_16 (32QAM) disabled: control frames decode at much lower
+// SNR than data frames, causing false turboshift ceilings. Data frames at CONFIG_16
+// show <12% success even at 20 dB SNR on real channels.
+#define WB_CONFIG_MAX CONFIG_15
+
 // Unified config ladder for gearshift (ROBUST → OFDM)
-// CONFIG_16 included for both NB and WB.
+// CONFIG_16 removed — unreliable on real channels (32QAM too fragile).
 static const int FULL_CONFIG_LADDER[] = {
 	ROBUST_0, ROBUST_1, ROBUST_2,
 	CONFIG_0, CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4, CONFIG_5, CONFIG_6,
 	CONFIG_7, CONFIG_8, CONFIG_9, CONFIG_10, CONFIG_11, CONFIG_12,
-	CONFIG_13, CONFIG_14, CONFIG_15, CONFIG_16
+	CONFIG_13, CONFIG_14, CONFIG_15
 };
-static const int FULL_CONFIG_LADDER_SIZE = 20;
+static const int FULL_CONFIG_LADDER_SIZE = 19;
 
 inline int config_ladder_index(int config) {
 	for (int i = 0; i < FULL_CONFIG_LADDER_SIZE; i++) {
@@ -91,7 +96,7 @@ inline int config_ladder_index(int config) {
 }
 
 inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = false) {
-	int ceiling = narrowband ? NB_CONFIG_MAX : CONFIG_16;
+	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled) {
 		return (config < ceiling) ? config + 1 : config;
 	}
@@ -105,7 +110,7 @@ inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = f
 }
 
 inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool narrowband = false) {
-	int ceiling = narrowband ? NB_CONFIG_MAX : CONFIG_16;
+	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled) {
 		int target = config + steps;
 		return (target < ceiling) ? target : ceiling;
@@ -142,10 +147,10 @@ inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
 
 inline bool config_is_at_top(int config, bool robust_enabled, bool narrowband = false) {
 	if (is_ofdm_config(config)) {
-		int ceiling = narrowband ? NB_CONFIG_MAX : CONFIG_16;
+		int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 		return config >= ceiling;
 	}
-	if (!robust_enabled) return config == CONFIG_16;
+	if (!robust_enabled) return config == WB_CONFIG_MAX;
 	return config_ladder_index(config) == FULL_CONFIG_LADDER_SIZE - 1;
 }
 

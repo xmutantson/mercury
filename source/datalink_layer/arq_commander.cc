@@ -670,6 +670,11 @@ void cl_arq_controller::process_messages_tx_control()
 			{
 				data_configuration=negotiated_configuration;
 				gear_shift_timer.start();
+				// Reset batch stats so gearshift evaluation only reflects new config
+				last_transmission_block_stats.nBatches_sent = 0;
+				last_transmission_block_stats.nBatches_acked = 0;
+				last_transmission_block_stats.nReSent_data = 0;
+				last_transmission_block_stats.nSent_data = 0;
 			}
 			// Always wait for SET_CONFIG ACK (stay in RECEIVING_ACKS_CONTROL).
 			// Previously jumped to TRANSMITTING_DATA when negotiated==current,
@@ -780,6 +785,8 @@ void cl_arq_controller::process_messages_tx_data()
 		telecom_system->set_mfsk_ctrl_mode(false);  // data TX (full-length frames)
 		pad_messages_batch_tx(data_batch_size);
 		send_batch();
+		stats.nBatches_sent++;
+		last_transmission_block_stats.nBatches_sent++;
 
 		// Flush self-echo from both ring buffer and sliding buffer (Bug #38).
 		circular_buf_reset(capture_buffer);
@@ -944,7 +951,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					messages_control.status = FREE;
 					emergency_previous_config = current_configuration;
 					emergency_break_active = 1;
-					emergency_break_retries = 3;
+					emergency_break_retries = 1;
 					break_recovery_phase = 0;  // BREAK ACK handler will set to 1
 					send_break_pattern();
 					telecom_system->data_container.frames_to_read = 4;
@@ -980,7 +987,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					messages_control.status = FREE;
 					// Keep emergency_previous_config unchanged (still targeting original settle config)
 					emergency_break_active = 1;
-					emergency_break_retries = 3;
+					emergency_break_retries = 1;
 					break_recovery_phase = 0;
 					send_break_pattern();
 					telecom_system->data_container.frames_to_read = 4;
@@ -1018,12 +1025,13 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					turboshift_last_good = current_configuration;
 					turbo_snr_ack_enabled = true;
 					turbo_received_snr = -99.0f;
+					turbo_best_snr = -99.0f;
 
 					int snr_target = -1;
 					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
 						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
+						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 						if(snr_target > cfg_ceiling)
 							snr_target = cfg_ceiling;
 						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
@@ -1102,31 +1110,67 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					return;
 				}
 
-				// Ceiling — BREAK to ROBUST_0, then use BREAK recovery to probe
-				// down from the failed config: CONFIG_0 → ROBUST_2 → ROBUST_1 → ROBUST_0.
-				// emergency_previous_config = failed config so config_ladder_down_n()
-				// steps down from it. break_drop_step = 1 starts one step below.
+				// Ceiling — config failed, handle based on turboshift phase
 				int failed_config = current_configuration;
 				int settle_config = (turboshift_last_good >= 0) ?
 					turboshift_last_good : init_configuration;
 
-				printf("[TURBO] CEILING at config %d, BREAK to %d then probe down from %d (proven_ceiling=%d)\n",
-					failed_config, settle_config, failed_config, supershift_proven_ceiling);
+				printf("[TURBO] CEILING at config %d, settle=%d (proven_ceiling=%d, phase=%d)\n",
+					failed_config, settle_config, supershift_proven_ceiling,
+					turboshift_phase);
 				printf("[TURBO] CEILING state: turboshift_last_good=%d init_config=%d "
 					"negotiated=%d data_cfg=%d current=%d\n",
 					turboshift_last_good, init_configuration,
 					negotiated_configuration, data_configuration, current_configuration);
 				fflush(stdout);
 
+				// During TURBO_REVERSE: if the reverse path can't even do CONFIG_0,
+				// skip BREAK (which confuses the role-swapped state) and finish
+				// immediately. The reverse path is MFSK-only for ACKs.
+				if(turboshift_phase == TURBO_REVERSE && is_robust_config(settle_config))
+				{
+					printf("[TURBO] REVERSE path MFSK-only (ceiling=%d), finishing without BREAK\n",
+						settle_config);
+					fflush(stdout);
+
+					// Restore to ROBUST_0 and finish
+					data_configuration = settle_config;
+					negotiated_configuration = settle_config;
+					load_configuration(settle_config, PHYSICAL_LAYER_ONLY, YES);
+					turboshift_last_good = settle_config;
+					finish_turbo_direction();
+					return;
+				}
+
+				// TURBO_FORWARD or higher ceiling: BREAK to ROBUST_0, then drop to
+				// the SNR-predicted start config (not just 1 step below ceiling).
+				// Dropping 1 step at a time wastes time probing configs that can't work.
 				turboshift_active = false;
 				data_configuration = settle_config;
-				emergency_previous_config = failed_config;
-				break_drop_step = 1;
+				// Compute SNR-based target so BREAK drops far enough
+				int snr_target_config = -1;
+				if(turbo_best_snr > -90)
+					snr_target_config = config_ladder_down_n(
+						get_configuration(turbo_best_snr - SUPERSHIFT_MARGIN_DB), 2, robust_enabled);
+				if(snr_target_config >= 0)
+				{
+					// Calculate how many steps to drop from failed_config to snr_target
+					int steps = config_ladder_index(failed_config) - config_ladder_index(snr_target_config);
+					if(steps < 1) steps = 1;
+					emergency_previous_config = failed_config;
+					break_drop_step = steps;
+				}
+				else
+				{
+					emergency_previous_config = failed_config;
+					break_drop_step = 1;
+				}
 
 				// Remember this ceiling so re-trigger never jumps back above it
-				supershift_proven_ceiling = config_ladder_down(failed_config, robust_enabled);
+				supershift_proven_ceiling = (snr_target_config >= 0) ?
+					snr_target_config : config_ladder_down(failed_config, robust_enabled);
 				emergency_break_active = 1;
-				emergency_break_retries = 3;
+				emergency_break_retries = 1;
 				emergency_nack_count = 0;
 
 				for(int i=0; i<nMessages; i++)
@@ -1189,7 +1233,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					break_drop_step = 1;
 					supershift_proven_ceiling = config_ladder_down(current_configuration, robust_enabled);
 					emergency_break_active = 1;
-					emergency_break_retries = 3;
+					emergency_break_retries = 1;
 					emergency_nack_count = 0;
 
 					for(int i=0; i<nMessages; i++)
@@ -1243,7 +1287,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				emergency_previous_config = working_config;
 				break_drop_step = 0;
 				emergency_break_active = 1;
-				emergency_break_retries = 3;
+				emergency_break_retries = 1;
 				emergency_nack_count = 0;
 
 				send_break_pattern();
@@ -1266,6 +1310,15 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				if(emergency_nack_count >= emergency_nack_threshold
 					&& !config_is_at_bottom(current_configuration, robust_enabled))
 				{
+					// Lower ceiling to prevent climbing back to failing config
+					int new_ceiling = config_ladder_down(current_configuration, robust_enabled);
+					if(supershift_proven_ceiling < 0 || new_ceiling < supershift_proven_ceiling)
+					{
+						supershift_proven_ceiling = new_ceiling;
+						ceiling_success_count = 0;
+						printf("[BREAK] Lowered ceiling to %d\n", new_ceiling);
+						fflush(stdout);
+					}
 					printf("[BREAK] Sending emergency BREAK pattern (control failure)\n");
 					fflush(stdout);
 
@@ -1279,7 +1332,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 
 					emergency_previous_config = current_configuration;
 					emergency_break_active = 1;
-					emergency_break_retries = 3;
+					emergency_break_retries = 1;
 					send_break_pattern();
 					telecom_system->data_container.frames_to_read = 4;
 					calculate_receiving_timeout();
@@ -1317,6 +1370,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
 				data_ack_received=YES;
+				stats.nBatches_acked++;
+				last_transmission_block_stats.nBatches_acked++;
 
 				// Pattern = ACK for all pending messages (batch_size=1).
 				// Also catch ACK_TIMED_OUT: update_status() may fire before
@@ -1363,6 +1418,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				if(messages_rx_buffer.type==ACK_RANGE)
 				{
 					data_ack_received=YES;
+					stats.nBatches_acked++;
+					last_transmission_block_stats.nBatches_acked++;
 					int start=(unsigned char)messages_rx_buffer.data[0];
 					int end=(unsigned char)messages_rx_buffer.data[1];
 					// Guard: start > end under garbage frames wraps unsigned char → infinite loop
@@ -1377,6 +1434,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				else if(messages_rx_buffer.type==ACK_MULTI)
 				{
 					data_ack_received=YES;
+					stats.nBatches_acked++;
+					last_transmission_block_stats.nBatches_acked++;
 					// Clamp count to buffer bounds — garbage frames can have data[0]=255,
 					// reading past the 200-byte messages_rx_buffer.data (Bug #15)
 					int ack_count = (unsigned char)messages_rx_buffer.data[0];
@@ -1449,7 +1508,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			emergency_previous_config = working_config;
 			break_drop_step = 0;
 			emergency_break_active = 1;
-			emergency_break_retries = 3;
+			emergency_break_retries = 1;
 			emergency_nack_count = 0;
 
 			send_break_pattern();
@@ -1521,7 +1580,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				emergency_previous_config = working_config;
 				break_drop_step = 0;
 				emergency_break_active = 1;
-				emergency_break_retries = 3;
+				emergency_break_retries = 1;
 				emergency_nack_count = 0;
 
 				send_break_pattern();
@@ -1531,24 +1590,26 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				return;
 			}
 
-			// Adaptive batch: reduce before emergency BREAK
-			if(data_batch_size > 1 && gear_shift_on == YES && turboshift_phase == TURBO_DONE)
+			// Count toward emergency BREAK. Batch halving doesn't bypass this.
+			emergency_nack_count++;
+
+			// Adaptive batch: halve batch before triggering BREAK.
+			// Still counts as a failure (above) so BREAK fires after threshold.
+			if(data_batch_size > 1 && gear_shift_on == YES && turboshift_phase == TURBO_DONE
+				&& emergency_nack_count < emergency_nack_threshold)
 			{
 				int prev = data_batch_size;
 				data_batch_size = data_batch_size / 2;
 				if(data_batch_size < 1) data_batch_size = 1;
 				recalculate_ack_timeout_for_batch();
-				// Batch reduction = this config is marginal. Set ceiling.
-				turboshift_last_good = current_configuration;
-				printf("[BATCH-ADAPT] Emergency reduce: %d -> %d at config %d (ceiling set)\n",
-					prev, data_batch_size, current_configuration);
+				batch_consec_acks = 0;
+				printf("[BATCH-ADAPT] Emergency reduce: %d -> %d at config %d (failure %d/%d)\n",
+					prev, data_batch_size, current_configuration,
+					emergency_nack_count, emergency_nack_threshold);
 				fflush(stdout);
-				// Retry at smaller batch — messages already ACK_TIMED_OUT from force-clear above
 				connection_status = TRANSMITTING_DATA;
 				return;
 			}
-
-			emergency_nack_count++;
 			printf("[BREAK] Block failure #%d at config %d (threshold=%d, batch=%d)\n",
 				emergency_nack_count, current_configuration, emergency_nack_threshold, data_batch_size);
 			fflush(stdout);
@@ -1560,11 +1621,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			   && turboshift_phase == TURBO_DONE
 			   && gear_shift_on == YES)
 			{
+				// Lower ceiling to prevent climbing back to failing config
+				int new_ceiling = config_ladder_down(current_configuration, robust_enabled);
+				if(supershift_proven_ceiling < 0 || new_ceiling < supershift_proven_ceiling)
+				{
+					supershift_proven_ceiling = new_ceiling;
+					ceiling_success_count = 0;
+					printf("[BREAK] Lowered ceiling to %d\n", new_ceiling);
+					fflush(stdout);
+				}
 				printf("[BREAK] Sending emergency BREAK pattern\n");
 				fflush(stdout);
 				emergency_previous_config = current_configuration;
 				emergency_break_active = 1;
-				emergency_break_retries = 3;
+				emergency_break_retries = 1;
 				send_break_pattern();
 				// Poll for ACK from responder
 				telecom_system->data_container.frames_to_read = 4;
@@ -1577,6 +1647,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		{
 			emergency_nack_count = 0;  // Reset on success
 			break_drop_step = 1;
+			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
 		}
 
@@ -1594,13 +1665,46 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				compressor.streaming_enable();
 		}
 
+		// Adaptive batch growth: after 3 consecutive successful ACKs, grow batch by 50%.
+		// This balances the all-or-nothing ACK penalty: large batches are efficient when
+		// the link is good, but P(all N frames decode) drops exponentially with N.
+		if(data_ack_received == YES && turboshift_phase == TURBO_DONE
+			&& !is_robust_config(current_configuration))
+		{
+			batch_consec_acks++;
+			// Only grow batch when well below ceiling (2+ configs of headroom).
+			// Near the ceiling, batch growth triggers failures that cascade into BREAKs.
+			bool near_ceiling = (supershift_proven_ceiling >= 0 &&
+				config_ladder_index(supershift_proven_ceiling) - config_ladder_index(current_configuration) < 2);
+			if(data_batch_size < nominal_batch_size && batch_consec_acks >= 5 && !near_ceiling)
+			{
+				int prev = data_batch_size;
+				data_batch_size = data_batch_size + 2;  // grow by +2 (conservative)
+				if(data_batch_size > nominal_batch_size)
+					data_batch_size = nominal_batch_size;
+				recalculate_ack_timeout_for_batch();
+				batch_consec_acks = 0;
+				printf("[BATCH-ADAPT] Grow: %d -> %d (max=%d) after %d ACKs\n",
+					prev, data_batch_size, nominal_batch_size, 5);
+				fflush(stdout);
+			}
+		}
+		else if(data_ack_received == NO && turboshift_phase == TURBO_DONE
+			&& !is_robust_config(current_configuration))
+		{
+			batch_consec_acks = 0;
+		}
+
 		// Frame-level gearshift: after N consecutive successful data ACKs, shift up immediately
-		// No ceiling: ladder can climb above turboshift_last_good. BREAK recovery handles failures.
+		// Respect proven ceiling — don't re-try configs above what turboshift/BREAK verified.
 		{
 			int proposed_frame = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
+			bool frame_ceiling_blocked = (supershift_proven_ceiling >= 0 &&
+				config_ladder_index(proposed_frame) > config_ladder_index(supershift_proven_ceiling));
 		if(data_ack_received==YES && gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
 			messages_control.status==FREE &&
-			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
+			!frame_ceiling_blocked)
 		{
 			consecutive_data_acks++;
 			if(consecutive_data_acks >= frame_shift_threshold)
@@ -1643,13 +1747,56 @@ void cl_arq_controller::finish_turbo_direction()
 {
 	turboshift_active = false;
 	turbo_snr_ack_enabled = false;
+	// turbo_best_snr preserves the best SNR seen across ALL turbo probes,
+	// unlike turbo_received_snr which is reset after each probe step.
 	turbo_received_snr = -99.0f;
 
-	if(turboshift_phase == TURBO_FORWARD)
+	if(turboshift_phase == TURBO_FORWARD && skip_turbo_reverse)
+	{
+		// Forward direction probed. Skip REVERSE probe (--skip-turbo-reverse).
+		// Reverse path only needs MFSK ACKs on asymmetric channels.
+		turboshift_phase = TURBO_DONE;
+
+		// Turbo probing with single frames is unreliable — it may skip configs
+		// (via SNR supershift) leaving gaps in the tested range. Use the SNR
+		// measurement as the primary guidance for both ceiling and start config.
+		float effective_snr = (turbo_best_snr > -90) ? turbo_best_snr : measurements.SNR_uplink;
+		int snr_config = -1;
+		if(effective_snr > -90)
+			snr_config = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
+
+		// Start 2 configs below SNR prediction to account for fading channel
+		// degradation vs AWGN calibration table. Ladder climbs from here.
+		int start_config;
+		if(snr_config >= 0)
+			start_config = config_ladder_down_n(snr_config, 2, robust_enabled);
+		else
+			start_config = config_ladder_down_n(turboshift_last_good, 2, robust_enabled);
+
+		// Set ceiling = start config. The SNR→config table is calibrated for AWGN
+		// but fading channels need 3-6 dB more margin. Setting ceiling at start
+		// prevents the ladder from immediately climbing into failing configs.
+		// Ceiling recovery (20 good blocks) allows gradual upward exploration.
+		supershift_proven_ceiling = start_config;
+
+		printf("[TURBO] FORWARD complete (skip-reverse): ceiling=%d, proven_ceiling=%d, snr=%.1f, snr_cfg=%d, starting at config %d\n",
+			turboshift_last_good, supershift_proven_ceiling, effective_snr, snr_config, start_config);
+		fflush(stdout);
+
+		if(start_config != current_configuration)
+		{
+			data_configuration = start_config;
+			negotiated_configuration = start_config;
+			load_configuration(start_config, PHYSICAL_LAYER_ONLY, YES);
+		}
+		// No SWITCH_ROLE — commander stays as commander, start data exchange
+		connection_status = TRANSMITTING_DATA;
+	}
+	else if(turboshift_phase == TURBO_FORWARD)
 	{
 		// Forward direction probed. Advance to REVERSE (other side will probe).
 		turboshift_phase = TURBO_REVERSE;
-		printf("[TURBO] FORWARD complete: ceiling=%d, switching roles\n",
+		printf("[TURBO] FORWARD complete: ceiling=%d, switching roles for REVERSE\n",
 			turboshift_last_good);
 		fflush(stdout);
 		cleanup();
@@ -1888,12 +2035,13 @@ void cl_arq_controller::process_control_commander()
 					turboshift_last_good = current_configuration;
 					turbo_snr_ack_enabled = true;
 					turbo_received_snr = -99.0f;
+					turbo_best_snr = -99.0f;
 
 					int snr_target = -1;
 					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
 						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
+						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 						if(snr_target > cfg_ceiling)
 							snr_target = cfg_ceiling;
 						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
@@ -2074,13 +2222,14 @@ void cl_arq_controller::process_control_commander()
 				turboshift_last_good = current_configuration;
 				turbo_snr_ack_enabled = true;
 				turbo_received_snr = -99.0f;
+				turbo_best_snr = -99.0f;
 
 				int snr_target = -1;
 				if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 				{
 					snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
 					// Enforce bandwidth ceiling
-					int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
+					int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 					if(snr_target > cfg_ceiling)
 						snr_target = cfg_ceiling;
 					if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
@@ -2291,15 +2440,22 @@ void cl_arq_controller::process_control_commander()
 					turboshift_retries = 1;  // reset retry for next config
 					if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
 					{
-						// SNR-based supershift: prefer turbo_received_snr (from ACK suffix)
-						// over measurements.SNR_uplink (commander's own, stale during FORWARD).
-						double effective_snr = (turbo_received_snr > -90) ?
-							turbo_received_snr : measurements.SNR_uplink;
+						// SNR-based supershift: prefer turbo_received_snr (from ACK suffix).
+						// During TURBO_REVERSE, measurements.SNR_uplink is the FORWARD path
+						// SNR (stale, from before role swap) — do NOT use it as fallback.
+						// Only use turbo_received_snr (actual reverse-path feedback).
+						double effective_snr;
+						if(turbo_received_snr > -90)
+							effective_snr = turbo_received_snr;
+						else if(turboshift_phase != TURBO_REVERSE)
+							effective_snr = measurements.SNR_uplink;
+						else
+							effective_snr = -99.0;  // Force incremental probing
 						int snr_target = -1;
 						if(is_ofdm_config(current_configuration) && effective_snr > -90)
 						{
 							snr_target = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
-							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_16;
+							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 							if(snr_target > cfg_ceiling)
 								snr_target = cfg_ceiling;
 							if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
@@ -2325,6 +2481,12 @@ void cl_arq_controller::process_control_commander()
 							negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
 							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3, no SNR)\n",
 								current_configuration, negotiated_configuration);
+						}
+						// Enforce WB/NB ceiling on turboshift probe target
+						{
+							int turbo_cap = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
+							if(negotiated_configuration > turbo_cap)
+								negotiated_configuration = turbo_cap;
 						}
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
@@ -2398,6 +2560,7 @@ void cl_arq_controller::process_control_commander()
 							turboshift_initiator = true;
 							turbo_snr_ack_enabled = true;
 							turbo_received_snr = -99.0f;
+							turbo_best_snr = -99.0f;
 							turboshift_last_good = current_configuration;
 							turboshift_retries = 1;
 							negotiated_configuration = snr_ideal;
@@ -2486,12 +2649,27 @@ void cl_arq_controller::finalize_block_commander()
 	batch_uncompressed_size = 0;
 #endif
 
-	if(last_transmission_block_stats.nSent_data > 0)
+	// Success rate: use batch-level metric for pattern ACK (all-or-nothing ACK).
+	// Frame-level nReSent/nSent is poisoned by ACK-loss retransmissions that aren't
+	// real OFDM failures. Batch-level = % of batches that got ACKed.
+	if(ack_pattern_time_ms > 0 && last_transmission_block_stats.nBatches_sent > 0)
+	{
+		last_transmission_block_stats.success_rate_data = 100.0 *
+			last_transmission_block_stats.nBatches_acked /
+			last_transmission_block_stats.nBatches_sent;
+	}
+	else if(last_transmission_block_stats.nSent_data > 0)
+	{
 		last_transmission_block_stats.success_rate_data=100*(1-((float)last_transmission_block_stats.nReSent_data/(float)last_transmission_block_stats.nSent_data));
+		if(last_transmission_block_stats.success_rate_data < 0)
+			last_transmission_block_stats.success_rate_data = 0;
+	}
 	else
 		last_transmission_block_stats.success_rate_data=100;
 	last_transmission_block_stats.nReSent_data=0;
 	last_transmission_block_stats.nSent_data=0;
+	last_transmission_block_stats.nBatches_sent=0;
+	last_transmission_block_stats.nBatches_acked=0;
 	std::string str="BUFFER ";
 	str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
 	str+='\r';
@@ -2516,8 +2694,10 @@ void cl_arq_controller::finalize_block_commander()
 			{
 				{
 					int proposed = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
-				// No ceiling: ladder can climb above turboshift_last_good. BREAK recovery handles failures.
-				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+				// Respect proven ceiling — don't re-try configs that already failed during turboshift
+				bool ceiling_blocked = (supershift_proven_ceiling >= 0 &&
+					config_ladder_index(proposed) > config_ladder_index(supershift_proven_ceiling));
+				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;
 					printf("[GEARSHIFT] LADDER UP: success=%.0f%% > %.0f%%, config %d -> %d\n",
@@ -2529,8 +2709,29 @@ void cl_arq_controller::finalize_block_commander()
 				}
 				else
 				{
-					printf("[GEARSHIFT] LADDER: at top (config %d), success=%.0f%%\n",
-						current_configuration, last_transmission_block_stats.success_rate_data);
+					// Ceiling recovery: after N consecutive good blocks at ceiling, raise ceiling by 1.
+					// Use 20 blocks to avoid oscillation where ceiling raises and immediately fails.
+					if(ceiling_blocked)
+					{
+						ceiling_success_count++;
+						if(ceiling_success_count >= 20)
+						{
+							int old_ceiling = supershift_proven_ceiling;
+							supershift_proven_ceiling = proposed;  // raise ceiling to what we wanted to try
+							ceiling_success_count = 0;
+							printf("[GEARSHIFT] CEILING RECOVERY: %d -> %d after %d good blocks\n",
+								old_ceiling, supershift_proven_ceiling, 20);
+							fflush(stdout);
+							// Don't shift up yet — let the next block's ladder evaluation do it
+						}
+					}
+					else
+					{
+						ceiling_success_count = 0;
+					}
+					printf("[GEARSHIFT] LADDER: at top (config %d), success=%.0f%%%s\n",
+						current_configuration, last_transmission_block_stats.success_rate_data,
+						ceiling_blocked ? " [ceiling-limited]" : "");
 					fflush(stdout);
 					this->connection_status=TRANSMITTING_DATA;
 				}
@@ -2538,16 +2739,16 @@ void cl_arq_controller::finalize_block_commander()
 			}
 			else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage)
 			{
+				// Halve batch first — smaller batches have higher P(all decode).
+				// Only downshift config when batch=1 still fails.
 				if(data_batch_size > 1)
 				{
-					// Adaptive batch: reduce before downshifting config
 					int prev = data_batch_size;
 					data_batch_size = data_batch_size / 2;
 					if(data_batch_size < 1) data_batch_size = 1;
 					recalculate_ack_timeout_for_batch();
-					// Batch reduction = this config is marginal. Set ceiling.
-					turboshift_last_good = current_configuration;
-					printf("[BATCH-ADAPT] Ladder reduce: %d -> %d at config %d (success=%.0f%%, ceiling set)\n",
+					batch_consec_acks = 0;
+					printf("[BATCH-ADAPT] Ladder reduce: %d -> %d at config %d (success=%.0f%%)\n",
 						prev, data_batch_size, current_configuration,
 						last_transmission_block_stats.success_rate_data);
 					fflush(stdout);
@@ -2557,6 +2758,16 @@ void cl_arq_controller::finalize_block_commander()
 				else if(!config_is_at_bottom(current_configuration, robust_enabled))
 				{
 					negotiated_configuration=config_ladder_down(current_configuration, robust_enabled);
+					// Lower ceiling to prevent immediate re-upshift to the failing config.
+					// Ceiling recovery (8 good blocks) will raise it if channel improves.
+					if(supershift_proven_ceiling < 0 ||
+					   config_ladder_index(current_configuration) <= config_ladder_index(supershift_proven_ceiling))
+					{
+						supershift_proven_ceiling = negotiated_configuration;
+						ceiling_success_count = 0;
+						printf("[GEARSHIFT] LADDER DOWN: ceiling lowered to %d\n", negotiated_configuration);
+						fflush(stdout);
+					}
 					printf("[GEARSHIFT] LADDER DOWN: success=%.0f%% < %.0f%%, config %d -> %d (batch=1)\n",
 						last_transmission_block_stats.success_rate_data, gear_shift_down_success_rate_precentage,
 						current_configuration, negotiated_configuration);

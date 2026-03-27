@@ -1897,6 +1897,19 @@ skip_h_retry_point:
 					}
 				}
 
+				// Noise variance gate: if noise_variance > 0.5 (SNR < ~3 dB), the
+				// signal is either noise (false preamble detection) or completely
+				// unusable. Good frames: var=0.01-0.10. Garbage: var=1.7-3.3.
+				// Skip LDPC to free receiver for real frames.
+				if(ofdm.noise_variance_estimate > 0.5)
+				{
+					printf("[OFDM-SYNC] trial %d SKIP-VAR: var=%.4f too high (>0.5), skipping LDPC\n",
+						receive_stats.sync_trials, ofdm.noise_variance_estimate);
+					fflush(stdout);
+					receive_stats.sync_trials++;
+					continue;
+				}
+
 				if(ofdm.channel_estimator_amplitude_restoration==YES)
 				{
 					ofdm.restore_channel_amplitude();
@@ -1942,13 +1955,22 @@ skip_h_retry_point:
 				deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
 				psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
 
-				// Scale each LLR by its subcarrier's |H_k|²
+				// Scale each LLR by its subcarrier's |H_k|² and clamp.
+				// CSI weighting: LLR_k = (Dmin1-Dmin0)/σ²_n * |H_k|²
+				// Clamp: prevent extreme LLRs from dominating LDPC belief
+				// propagation. ±12 is generous (keeps 99.9%+ of good LLRs)
+				// while preventing numerical issues from ZF noise spikes.
 				int nBps = (int)log2(M);
 				for(int si = 0; si < data_container.nData; si++)
 				{
 					float w = csi_deinterleaved[si];
 					for(int bi = 0; bi < nBps; bi++)
-						data_container.demodulated_data[si * nBps + bi] *= w;
+					{
+						float llr = data_container.demodulated_data[si * nBps + bi] * w;
+						if(llr > 12.0f) llr = 12.0f;
+						else if(llr < -12.0f) llr = -12.0f;
+						data_container.demodulated_data[si * nBps + bi] = llr;
+					}
 				}
 				delete[] csi_deinterleaved;
 			}
@@ -3680,7 +3702,6 @@ void cl_telecom_system::load_configuration(int configuration)
 		last_configuration=current_configuration;
 		current_configuration=configuration;
 	}
-
 	if(_modulation!=M || ofdm_preamble_configurator_Nsymb!=ofdm.preamble_configurator.Nsymb)
 	{
 		reinit_subsystems.microphone=YES;
@@ -3924,7 +3945,7 @@ void cl_telecom_system::load_configuration(int configuration)
 	}
 	if(reinit_subsystems.telecom_system==YES)
 	{
-		printf("[PHY-SWITCH] init() start (nb=%d M=%d config=%d)\n",
+		printf("[PHY-SWITCH] init() start (nb=%d M=%.0f config=%d)\n",
 			narrowband_enabled, M, current_configuration);
 		fflush(stdout);
 		this->init();
@@ -4319,9 +4340,7 @@ char cl_telecom_system::get_configuration(double SNR)
 {
 	char configuration;
 
-	if(SNR>13)
-		configuration=CONFIG_16;
-	else if(SNR>11)
+	if(SNR>11)
 		configuration=CONFIG_15;
 	else if(SNR>9)
 		configuration=CONFIG_14;

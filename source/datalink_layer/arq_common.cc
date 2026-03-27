@@ -77,6 +77,8 @@ cl_arq_controller::cl_arq_controller()
 	stats.nLost_data=0;
 	stats.nReSent_data=0;
 	stats.nAcks_sent_data=0;
+	stats.nBatches_sent=0;
+	stats.nBatches_acked=0;
 	stats.nNAcked_data=0;
 
 	stats.nSent_control=0;
@@ -95,6 +97,8 @@ cl_arq_controller::cl_arq_controller()
 	last_transmission_block_stats.nLost_data=0;
 	last_transmission_block_stats.nReSent_data=0;
 	last_transmission_block_stats.nAcks_sent_data=0;
+	last_transmission_block_stats.nBatches_sent=0;
+	last_transmission_block_stats.nBatches_acked=0;
 	last_transmission_block_stats.nNAcked_data=0;
 
 	last_transmission_block_stats.nSent_control=0;
@@ -113,6 +117,7 @@ cl_arq_controller::cl_arq_controller()
 
 	data_batch_size=1;
 	nominal_batch_size=1;
+	batch_consec_acks=0;
 	control_batch_size=1;
 	ack_batch_size=1;
 	batch_rx_frame_count=0;
@@ -175,9 +180,9 @@ cl_arq_controller::cl_arq_controller()
 	monitor_primary_buffer_nsymb=0;
 	gear_shift_algorithm=SUCCESS_BASED_LADDER;
 
-	gear_shift_up_success_rate_precentage=70;
-	gear_shift_down_success_rate_precentage=40;
-	gear_shift_block_for_nBlocks_total=0;
+	gear_shift_up_success_rate_precentage=85;
+	gear_shift_down_success_rate_precentage=55;
+	gear_shift_block_for_nBlocks_total=5;
 	gear_shift_blocked_for_nBlocks=0;
 	consecutive_data_acks=0;
 	frame_shift_threshold=3;
@@ -190,18 +195,21 @@ cl_arq_controller::cl_arq_controller()
 	turboshift_retries=1;
 	turbo_settle_pending=false;
 	supershift_proven_ceiling=-1;
+	skip_turbo_reverse=false;
 	turbo_snr_ack_enabled=false;
 	turbo_received_snr=-99.0f;
+	turbo_best_snr=-99.0f;
 	turbo_switch_role_retries=0;
 
 	emergency_nack_count=0;
-	emergency_nack_threshold=2;
+	emergency_nack_threshold=6;
 	emergency_break_active=0;
 	emergency_break_retries=3;
 	emergency_previous_config=CONFIG_0;
 	break_drop_step=1;
 	break_recovery_phase=0;
 	break_recovery_retries=0;
+	ceiling_success_count=0;
 	break_detected=NO;
 	hail_detected=NO;
 	hail_sent=NO;
@@ -966,7 +974,7 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	gear_shift_down_success_rate_precentage=default_configuration_ARQ.gear_shift_down_success_rate_limit_precentage;
 
 	gear_shift_block_for_nBlocks_total=default_configuration_ARQ.gear_shift_block_for_nBlocks_total;
-	gear_shift_blocked_for_nBlocks=default_configuration_ARQ.gear_shift_block_for_nBlocks_total;
+	gear_shift_blocked_for_nBlocks=0;
 	consecutive_data_acks=0;
 	// NOTE: turboshift state is NOT reset here — it persists across config changes.
 	// Only reset at connection init (see init code above).
@@ -986,24 +994,28 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 
 	// Scale data_batch_size based on block duration (OFDM modes only).
 	// MFSK modes keep batch_size=1 for pattern ACK optimization.
-	// Adapts each gearshift: fast configs send more frames per block.
-	// NB (Nc≤10): ~25s target. NB frames are ~2.4s each, so the 10s target
-	// gives only 5 frames/batch, wasting ~40% of cycle time on ACK turnaround.
-	// With 11 frames (25s), overhead drops to ~22% and throughput exceeds PHY.
+	// Batch sizing: with all-or-nothing MFSK ACK, P(batch success) = p_ofdm^N × p_ack.
+	// Start conservative (5 frames), adaptive growth finds optimal batch for link quality.
+	// nominal_batch_size = ceiling from 12s target — adaptive mechanism grows toward it.
 	if(!is_robust_config(configuration) && message_transmission_time_ms > 0)
 	{
-		int target_time_ms = 10000;
-		int target_batch = (int)((float)target_time_ms / message_transmission_time_ms + 0.5);
-		if(target_batch < 5) target_batch = 5;
-		if(target_batch > nMessages) target_batch = nMessages;
-		set_data_batch_size(target_batch);
-		printf("[CFG] Batch scaling: msg_time=%dms target=%d actual=%d nMessages=%d\n",
-			message_transmission_time_ms, target_batch, data_batch_size, nMessages);
+		int target_time_ms = 12000;
+		int max_batch = (int)((float)target_time_ms / message_transmission_time_ms + 0.5);
+		if(max_batch < 5) max_batch = 5;
+		if(max_batch > nMessages) max_batch = nMessages;
+		// Start at 5 frames — adaptation grows toward max_batch if link sustains it
+		int initial_batch = 5;
+		if(initial_batch > max_batch) initial_batch = max_batch;
+		set_data_batch_size(initial_batch);
+		nominal_batch_size = max_batch;  // ceiling for adaptive growth
+		printf("[CFG] Batch scaling: msg_time=%dms initial=%d max=%d nMessages=%d\n",
+			message_transmission_time_ms, data_batch_size, max_batch, nMessages);
 		fflush(stdout);
 	}
-
-	// Save nominal batch size for adaptive batch reduction/restoration
-	nominal_batch_size = data_batch_size;
+	else
+	{
+		nominal_batch_size = data_batch_size;
+	}
 
 	// ACK pattern transmission time (universal: all modes)
 	if(telecom_system->ack_pattern_passband_samples > 0)
@@ -1670,7 +1682,7 @@ void cl_arq_controller::update_status()
 		last_data_configuration=data_configuration;
 		load_configuration(data_configuration,PHYSICAL_LAYER_ONLY,YES);
 
-		gear_shift_blocked_for_nBlocks=gear_shift_block_for_nBlocks_total;
+		gear_shift_blocked_for_nBlocks=0;  // Force cooldown: wait N blocks before shifting up again
 
 		watchdog_timer.stop();
 		watchdog_timer.reset();
@@ -2508,6 +2520,7 @@ void cl_arq_controller::reset_session_state()
 	break_drop_step = 1;
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
+	ceiling_success_count = 0;
 	break_detected = NO;
 	hail_detected = NO;
 	hail_sent = NO;
@@ -3677,6 +3690,8 @@ bool cl_arq_controller::receive_ack_pattern()
 				if(snr_valid)
 				{
 					turbo_received_snr = decoded_snr;
+					if(decoded_snr > turbo_best_snr)
+						turbo_best_snr = decoded_snr;
 					turbo_snr_defer_timer.reset();
 					printf("[CMD-ACK-SNR] ACK detected with SNR=%.1f dB (matched=%d)\n",
 						decoded_snr, matched_count);

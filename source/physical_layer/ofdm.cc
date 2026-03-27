@@ -1293,10 +1293,16 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 			}
 		}
 	}
+
+	// DFT-based channel estimate smoothing: suppress estimation noise
+	// by windowing the time-domain impulse response. Applied before noise
+	// variance estimation so residuals reflect actual noise, not estimation error.
+	smooth_channel_estimate_dft();
+
 	// Estimate noise variance from pilot residuals for MMSE equalization.
 	// noise = received_pilot - H_interpolated * known_pilot_value
-	// This measures how well the (interpolated) channel estimate explains the
-	// actual received pilots — the residual is noise + estimation error.
+	// This measures how well the (smoothed) channel estimate explains the
+	// actual received pilots — the residual is noise + residual estimation error.
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;
@@ -1450,6 +1456,10 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 			interpolate_bilinear_matrix(estimated_channel,Nc,Nsymb,j,Nc-1,0,Nsymb-1);
 		}
 	}
+
+	// DFT-based channel estimate smoothing (same as ZF estimator)
+	smooth_channel_estimate_dft();
+
 	// Estimate noise variance from pilot residuals (same as ZF estimator)
 	{
 		double noise_sum = 0.0;
@@ -1730,27 +1740,85 @@ double cl_ofdm::measure_SNR(std::complex <double>*in_s, std::complex <double>*in
 	return SNR;
 }
 
+void cl_ofdm::smooth_channel_estimate_dft()
+{
+	// DFT-based channel estimation noise suppression.
+	// Per-symbol: IFFT to time domain, window to keep GI-proportional taps,
+	// FFT back to frequency domain. Suppresses estimation noise while
+	// preserving real channel structure within the guard interval.
+	// Ref: Edfors et al., "On Channel Estimation in OFDM Systems," VTC 1995.
+	if(Nc < 4) return;  // Too few subcarriers for meaningful smoothing
+
+	// Window width: number of time-domain taps to keep on each side of DC.
+	// gi = Ngi/Nfft. Channel delay spread fits within GI, so gi*Nc taps suffice.
+	// Add margin of +2 for timing uncertainty and filter leakage.
+	int window_taps = (int)(gi * Nc + 0.5) + 2;
+	if(window_taps < 3) window_taps = 3;
+	if(window_taps >= Nc / 2) return;  // Window too wide, smoothing won't help
+
+	std::complex<double>* buf_in = new std::complex<double>[Nc];
+	std::complex<double>* buf_out = new std::complex<double>[Nc];
+
+	for(int i = 0; i < Nsymb; i++)
+	{
+		// Extract H[0..Nc-1] for this OFDM symbol
+		for(int j = 0; j < Nc; j++)
+			buf_in[j] = (estimated_channel + i*Nc + j)->value;
+
+		// IFFT: frequency domain → time-domain impulse response
+		// PocketFFT handles arbitrary sizes (Nc=50 = 2×5²)
+		ifft(buf_in, buf_out, Nc);
+
+		// Window: keep first window_taps (causal delay) and last window_taps
+		// (acausal / timing misalignment), zero the rest (noise)
+		for(int t = window_taps; t < Nc - window_taps; t++)
+			buf_out[t] = std::complex<double>(0.0, 0.0);
+
+		// FFT: smoothed time domain → smoothed frequency domain
+		fft(buf_out, buf_in, Nc);
+
+		// Write back smoothed channel estimate
+		for(int j = 0; j < Nc; j++)
+			(estimated_channel + i*Nc + j)->value = buf_in[j];
+	}
+
+	delete[] buf_in;
+	delete[] buf_out;
+}
+
 void cl_ofdm::channel_equalizer(std::complex <double>* in, std::complex <double>* out)
 {
-	// ZF equalizer: out = in / H.
-	// Note: MMSE-regularized zeroing (blanking subcarriers where |H|² < σ²_n)
-	// is intentionally disabled. With amplitude restoration (PSK modes),
-	// H is forced to |H|=1 but noise_variance_estimate is at the original
-	// signal scale, making the comparison meaningless. Even without restoration,
-	// the LS estimator's noise_variance can be inflated by interpolation
-	// error, model mismatch, or frequency offset — causing false blanking.
-	// Pure ZF lets the LDPC soft decoder handle weak subcarriers via
-	// variance-weighted LLRs, which is more robust than hard erasure.
+	// Hybrid ZF/MMSE equalizer.
+	// PSK modes (amplitude restoration ON): pure ZF — H has |H|=1, ZF is optimal.
+	// QAM modes (amplitude restoration OFF): ZF with MMSE-informed erasure.
+	// Subcarriers where |H|² < σ²_n/9 (MMSE gain α < 0.1) are erased rather
+	// than noise-amplified. CSI-weighted LLRs handle the rest.
 	for(int i=0;i<Nsymb;i++)
 	{
 		for(int j=0;j<Nc;j++)
 		{
 			std::complex<double> H = (estimated_channel+i*Nc+j)->value;
 			double H_mag_sq = H.real()*H.real() + H.imag()*H.imag();
-			if(H_mag_sq > 1e-12)
-				*(out+i*Nc+j) = *(in+i*Nc+j) / H;
+
+			if(channel_estimator_amplitude_restoration == YES)
+			{
+				// PSK: |H|=1 after restoration, ZF is exact
+				if(H_mag_sq > 1e-12)
+					*(out+i*Nc+j) = *(in+i*Nc+j) / H;
+				else
+					*(out+i*Nc+j) = std::complex<double>(0.0, 0.0);
+			}
 			else
-				*(out+i*Nc+j) = std::complex<double>(0.0, 0.0);  // true zero
+			{
+				// QAM: MMSE-informed erasure on deeply faded subcarriers.
+				// alpha = |H|²/(|H|²+σ²_n). When alpha < 0.1, the subcarrier
+				// carries less information than noise — erase it.
+				double alpha = H_mag_sq / (H_mag_sq + noise_variance_estimate);
+				if(alpha > 0.1 && H_mag_sq > 1e-12)
+					*(out+i*Nc+j) = *(in+i*Nc+j) / H;
+				else
+					*(out+i*Nc+j) = std::complex<double>(0.0, 0.0);
+			}
 			(estimated_channel+i*Nc+j)->status=UNKNOWN;
 		}
 	}

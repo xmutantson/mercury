@@ -179,6 +179,8 @@ struct st_stats
 	  int nReSent_data;
 	  int nAcks_sent_data;
 	  int nNAcked_data;
+	  int nBatches_sent;      // total data batches transmitted
+	  int nBatches_acked;     // data batches that received ACK
 
 	  int nSent_control;
 	  int nAcked_control;
@@ -354,7 +356,8 @@ public:
   int ctrl_transmission_time_ms;
   int ack_pattern_time_ms;  // Level 3: ACK pattern TX duration (ms)
   int data_batch_size;
-  int nominal_batch_size;   // Full batch size for current config (from load_configuration)
+  int nominal_batch_size;   // Max batch size for current config (12s target ceiling)
+  int batch_consec_acks;    // Consecutive successful batch ACKs (for adaptive growth)
   int control_batch_size;
   int ack_batch_size;
   int batch_rx_frame_count;  // Total data frames decoded in current RX batch (including padding duplicates)
@@ -473,8 +476,10 @@ public:
   int turboshift_retries;          // retries left at current config (0 = ceiling)
   bool turbo_settle_pending;       // waiting for settle SET_CONFIG ACK before finish
   int supershift_proven_ceiling;   // highest config that failed BREAK — caps all SUPERSHIFT targets (-1 = no ceiling)
+  bool skip_turbo_reverse;         // CLI --skip-turbo-reverse: skip TURBO_REVERSE phase
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
   float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
+  float turbo_best_snr;            // Best SNR seen across entire turbo phase (-99 = none)
   cl_timer turbo_snr_defer_timer;  // defer ACK return until suffix arrives
   int turbo_switch_role_retries;   // consecutive SWITCH_ROLE failures during turbo (Bug #60)
 
@@ -487,6 +492,7 @@ public:
   int break_drop_step;            // ladder steps to drop (1,2,4,4,4...)
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
+  int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)
   int break_detected;             // YES if BREAK pattern detected by responder
   int hail_detected;              // YES if HAIL beacon detected (responder LISTENING)
   int hail_sent;                  // YES if commander has sent HAIL in current CONNECTING phase
