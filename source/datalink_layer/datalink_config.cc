@@ -45,13 +45,13 @@ cl_configuration_arq::cl_configuration_arq()
 	gear_shift_on=NO;
 	gear_shift_algorithm=SUCCESS_BASED_LADDER;
 
-	gear_shift_up_success_rate_limit_precentage=70;
-	gear_shift_down_success_rate_limit_precentage=45;
+	gear_shift_up_success_rate_limit_precentage=85;
+	gear_shift_down_success_rate_limit_precentage=55;
 
-	gear_shift_block_for_nBlocks_total=2;
+	gear_shift_block_for_nBlocks_total=5;
 
 	batch_size=5; //MAX Max_data_length-3 (ack header) bytes
-	nMessages=75; //MAX 255
+	nMessages=120; //MAX 255
 
 	nResends=20;
 	ack_batch_size=2;

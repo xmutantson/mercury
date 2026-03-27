@@ -271,7 +271,10 @@ int main(int argc, char *argv[])
     double boost_override = -1.0;     // -1 = use default; >= 0 = override NB MFSK 1S gain (-B flag)
     int nb_probe_max = -1;            // -1 = use default (2); >= 0 = override nb_probe_max
     int audio_channel_override = -1;  // -1 = use INI settings; >= 0 = override both input+output channel index
+    int rx_channel_cli = -1;          // -1 = use default; 0=LEFT, 1=RIGHT, 2=STEREO
+    int tx_channel_cli = -1;          // -1 = use default; 0=LEFT, 1=RIGHT, 2=STEREO
     bool monitor_stdout = false;      // --stdout: output decoded plaintext to stdout
+    bool skip_turbo_reverse = false;  // --skip-turbo-reverse: skip TURBO_REVERSE phase
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -320,11 +323,14 @@ int main(int argc, char *argv[])
         printf("  -o [device]       Audio playback device\n");
         printf("  -x [api]          Sound system: alsa, pulse, dsound, wasapi (default: alsa/wasapi)\n");
         printf("  -A [channel]      Audio channel index override (enables multichannel mode)\n");
+        printf("  --rx-channel [0|1|2]  RX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 0)\n");
+        printf("  --tx-channel [0|1|2]  TX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 2)\n");
         printf("  -r [radio]        Radio type: stockhf, sbitx\n");
         printf("  -c [cpu_nr]       Pin to CPU core (-1 = auto, default)\n");
         printf("  -C                Check audio config (stereo, sample rate) before starting\n");
         printf("  -z                List available sound devices\n");
 
+        printf("  --skip-turbo-reverse  Skip TURBO_REVERSE phase (benchmark mode)\n");
         printf("\nModulation and bandwidth:\n");
         printf("  -s [config]       Modulation: 0-16 (OFDM), 100-102 (ROBUST MFSK). Use -l to list.\n");
         printf("  -g                Enable adaptive gearshift\n");
@@ -391,6 +397,28 @@ int main(int argc, char *argv[])
             argc -= 2;
             i--;
         }
+        else if (strcmp(argv[i], "--rx-channel") == 0 && i + 1 < argc)
+        {
+            rx_channel_cli = atoi(argv[i + 1]);
+            if (rx_channel_cli < 0 || rx_channel_cli > 2) rx_channel_cli = 0;
+            printf("RX channel: %d (%s)\n", rx_channel_cli,
+                   rx_channel_cli == 0 ? "LEFT" : rx_channel_cli == 1 ? "RIGHT" : "STEREO");
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        }
+        else if (strcmp(argv[i], "--tx-channel") == 0 && i + 1 < argc)
+        {
+            tx_channel_cli = atoi(argv[i + 1]);
+            if (tx_channel_cli < 0 || tx_channel_cli > 2) tx_channel_cli = 0;
+            printf("TX channel: %d (%s)\n", tx_channel_cli,
+                   tx_channel_cli == 0 ? "LEFT" : tx_channel_cli == 1 ? "RIGHT" : "STEREO");
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        }
         else if (strcmp(argv[i], "--gi") == 0 && i + 1 < argc)
         {
             guard_interval_ms_cli = atof(argv[i + 1]);
@@ -402,6 +430,15 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 2; j++)
                 argv[j] = argv[j + 2];
             argc -= 2;
+            i--;
+        }
+        else if (strcmp(argv[i], "--skip-turbo-reverse") == 0)
+        {
+            skip_turbo_reverse = true;
+            printf("Turboshift: skipping REVERSE phase\n");
+            for (int j = i; j < argc - 1; j++)
+                argv[j] = argv[j + 1];
+            argc -= 1;
             i--;
         }
     }
@@ -698,11 +735,16 @@ start_modem:
             // Apply channel configuration from settings
             configured_input_channel = g_settings.input_channel;
             configured_output_channel = g_settings.output_channel;
-            // Override with -A flag if specified
+            // Override with -A flag if specified (sets both to same channel)
             if (audio_channel_override >= 0) {
                 configured_input_channel = audio_channel_override;
                 configured_output_channel = audio_channel_override;
             }
+            // Override with --rx-channel / --tx-channel (takes precedence over -A)
+            if (rx_channel_cli >= 0)
+                configured_input_channel = rx_channel_cli;
+            if (tx_channel_cli >= 0)
+                configured_output_channel = tx_channel_cli;
             if (configured_input_channel > 2 || configured_output_channel > 2) {
                 printf("Audio channels: input=%d, output=%d\n",
                        configured_input_channel, configured_output_channel);
@@ -727,6 +769,17 @@ start_modem:
         configured_input_channel = audio_channel_override;
         configured_output_channel = audio_channel_override;
         printf("Audio channel override (-A): %d\n", audio_channel_override);
+    }
+    // Apply --rx-channel / --tx-channel (even without INI, takes precedence over -A)
+    if (rx_channel_cli >= 0) {
+        configured_input_channel = rx_channel_cli;
+        printf("RX channel override: %d (%s)\n", rx_channel_cli,
+               rx_channel_cli == 0 ? "LEFT" : rx_channel_cli == 1 ? "RIGHT" : "STEREO");
+    }
+    if (tx_channel_cli >= 0) {
+        configured_output_channel = tx_channel_cli;
+        printf("TX channel override: %d (%s)\n", tx_channel_cli,
+               tx_channel_cli == 0 ? "LEFT" : tx_channel_cli == 1 ? "RIGHT" : "STEREO");
     }
     // Set up tee logging from INI if --log wasn't specified on CLI
     if (!log_file_path[0] && g_settings.log_enabled) {
@@ -1069,6 +1122,7 @@ start_modem:
             ARQ.narrowband_enabled = YES;  // Normal: start NB, negotiate WB via probe
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
         ARQ.force_compress = (force_compress_cli == 1);
+        ARQ.skip_turbo_reverse = skip_turbo_reverse;
         // Encryption: CLI -E flag
         ARQ.encryption_mode = (encryption_mode_cli >= 0) ? encryption_mode_cli : ENCRYPT_OFF;
         if (ARQ.encryption_mode != ENCRYPT_OFF)

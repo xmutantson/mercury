@@ -611,60 +611,19 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				}
 			}
 
-			// Turboshift: start probing reverse direction as new commander
-			if(has_asymmetric && turboshift_phase == TURBO_FORWARD && gear_shift_on == YES)
+			// Turboshift: start probing reverse direction as new commander.
+			// Skip TURBO_REVERSE when --skip-turbo-reverse is set.
+			// Otherwise, proceed with reverse probe (roles swapped, responder probes).
+			if(skip_turbo_reverse && turboshift_phase == TURBO_FORWARD && gear_shift_on == YES)
 			{
-				turboshift_phase = TURBO_REVERSE;
-				turboshift_active = true;
-				turboshift_last_good = pre_switch_config;
-				turbo_snr_ack_enabled = true;
+				turboshift_phase = TURBO_DONE;
+				turboshift_active = false;
+				turbo_snr_ack_enabled = false;
 				turbo_received_snr = -99.0f;
-
-				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
-				{
-					int snr_target = -1;
-					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
-					{
-						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						// Enforce bandwidth ceiling
-						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : CONFIG_15;
-						if(snr_target > cfg_ceiling)
-							snr_target = cfg_ceiling;
-						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
-							snr_target = supershift_proven_ceiling;
-					}
-
-					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
-					{
-						negotiated_configuration = snr_target;
-						printf("[TURBO] Phase: REVERSE — probing responder->commander\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
-					}
-					else
-					{
-						negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
-						printf("[TURBO] Phase: REVERSE — probing responder->commander\n");
-						printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n",
-							current_configuration, negotiated_configuration);
-					}
-					fflush(stdout);
-					add_message_control(SET_CONFIG);
-					this->connection_status = TRANSMITTING_CONTROL;
-				}
-				else
-				{
-					printf("[TURBO] REVERSE: already at top (%d), done\n",
-						current_configuration);
-					fflush(stdout);
-					turboshift_active = false;
-					turboshift_phase = TURBO_DONE;
-					turbo_snr_ack_enabled = false;
-					turbo_received_snr = -99.0f;
-					cleanup();
-					add_message_control(SWITCH_ROLE);
-					this->connection_status = TRANSMITTING_CONTROL;
-				}
+				printf("[TURBO] Skipping REVERSE probe (--skip-turbo-reverse, forward ceiling=%d), DONE\n",
+					pre_switch_config);
+				fflush(stdout);
+				this->connection_status = TRANSMITTING_DATA;
 			}
 			else if(has_asymmetric &&
 				(turboshift_phase == TURBO_REVERSE || turboshift_phase == TURBO_DONE))
