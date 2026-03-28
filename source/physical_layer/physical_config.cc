@@ -71,7 +71,7 @@ cl_configuration_telecom_system::cl_configuration_telecom_system()
 
 	ldpc_decoding_algorithm=SPA;
 	ldpc_GBF_eta=0.5;
-	ldpc_nIteration_max=50;
+	ldpc_nIteration_max=100;
 	ldpc_print_nIteration=NO;
 
 	outer_code=CRC16_MODBUS_RTU;

@@ -1593,23 +1593,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// Count toward emergency BREAK. Batch halving doesn't bypass this.
 			emergency_nack_count++;
 
-			// Adaptive batch: halve batch before triggering BREAK.
-			// Still counts as a failure (above) so BREAK fires after threshold.
-			if(data_batch_size > 1 && gear_shift_on == YES && turboshift_phase == TURBO_DONE
-				&& emergency_nack_count < emergency_nack_threshold)
-			{
-				int prev = data_batch_size;
-				data_batch_size = data_batch_size / 2;
-				if(data_batch_size < 1) data_batch_size = 1;
-				recalculate_ack_timeout_for_batch();
-				batch_consec_acks = 0;
-				printf("[BATCH-ADAPT] Emergency reduce: %d -> %d at config %d (failure %d/%d)\n",
-					prev, data_batch_size, current_configuration,
-					emergency_nack_count, emergency_nack_threshold);
-				fflush(stdout);
-				connection_status = TRANSMITTING_DATA;
-				return;
-			}
+			// Batch halving disabled (batch size is fixed at negotiated value).
+			// Halving causes CMD/RSP batch size mismatch → ACK-GATE desync.
 			printf("[BREAK] Block failure #%d at config %d (threshold=%d, batch=%d)\n",
 				emergency_nack_count, current_configuration, emergency_nack_threshold, data_batch_size);
 			fflush(stdout);
@@ -1665,29 +1650,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				compressor.streaming_enable();
 		}
 
-		// Adaptive batch growth: after 3 consecutive successful ACKs, grow batch by 50%.
-		// This balances the all-or-nothing ACK penalty: large batches are efficient when
-		// the link is good, but P(all N frames decode) drops exponentially with N.
+		// Adaptive batch growth disabled: CMD batch growth causes desync with RSP.
+		// RSP's data_batch_size stays at the negotiated value, so CMD sending more
+		// frames than RSP expects corrupts slot state and triggers ACK-GATE suppression.
+		// TODO: communicate batch size to RSP (e.g., in frame header) before re-enabling.
 		if(data_ack_received == YES && turboshift_phase == TURBO_DONE
 			&& !is_robust_config(current_configuration))
 		{
 			batch_consec_acks++;
-			// Only grow batch when well below ceiling (2+ configs of headroom).
-			// Near the ceiling, batch growth triggers failures that cascade into BREAKs.
-			bool near_ceiling = (supershift_proven_ceiling >= 0 &&
-				config_ladder_index(supershift_proven_ceiling) - config_ladder_index(current_configuration) < 2);
-			if(data_batch_size < nominal_batch_size && batch_consec_acks >= 5 && !near_ceiling)
-			{
-				int prev = data_batch_size;
-				data_batch_size = data_batch_size + 2;  // grow by +2 (conservative)
-				if(data_batch_size > nominal_batch_size)
-					data_batch_size = nominal_batch_size;
-				recalculate_ack_timeout_for_batch();
-				batch_consec_acks = 0;
-				printf("[BATCH-ADAPT] Grow: %d -> %d (max=%d) after %d ACKs\n",
-					prev, data_batch_size, nominal_batch_size, 5);
-				fflush(stdout);
-			}
 		}
 		else if(data_ack_received == NO && turboshift_phase == TURBO_DONE
 			&& !is_robust_config(current_configuration))
@@ -1783,14 +1753,18 @@ void cl_arq_controller::finish_turbo_direction()
 			turboshift_last_good, supershift_proven_ceiling, effective_snr, snr_config, start_config);
 		fflush(stdout);
 
+		data_configuration = start_config;
+		negotiated_configuration = start_config;
+		reverse_configuration = start_config;
 		if(start_config != current_configuration)
-		{
-			data_configuration = start_config;
-			negotiated_configuration = start_config;
 			load_configuration(start_config, PHYSICAL_LAYER_ONLY, YES);
-		}
-		// No SWITCH_ROLE — commander stays as commander, start data exchange
-		connection_status = TRANSMITTING_DATA;
+
+		// Must send SET_CONFIG to inform responder of the new data config.
+		// Without this, RSP stays at the last turbo probe config and can't
+		// decode data frames (completely mismatched PHY parameters).
+		cleanup();
+		add_message_control(SET_CONFIG);
+		connection_status = TRANSMITTING_CONTROL;
 	}
 	else if(turboshift_phase == TURBO_FORWARD)
 	{
@@ -2690,6 +2664,9 @@ void cl_arq_controller::finalize_block_commander()
 		else if(gear_shift_algorithm==SUCCESS_BASED_LADDER)
 		{
 			gear_shift_blocked_for_nBlocks++;
+			// Reset downshift failure counter on any good block
+			if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
+				gear_shift_down_consecutive_fails = 0;
 			if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage && gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total)
 			{
 				{
@@ -2739,20 +2716,16 @@ void cl_arq_controller::finalize_block_commander()
 			}
 			else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage)
 			{
-				// Halve batch first — smaller batches have higher P(all decode).
-				// Only downshift config when batch=1 still fails.
-				if(data_batch_size > 1)
+				// Require 3 consecutive bad blocks before downshifting.
+				// A single ACK timeout on an otherwise good channel shouldn't
+				// trigger a config downshift (the retry will succeed).
+				gear_shift_down_consecutive_fails++;
+				if(gear_shift_down_consecutive_fails < 3)
 				{
-					int prev = data_batch_size;
-					data_batch_size = data_batch_size / 2;
-					if(data_batch_size < 1) data_batch_size = 1;
-					recalculate_ack_timeout_for_batch();
-					batch_consec_acks = 0;
-					printf("[BATCH-ADAPT] Ladder reduce: %d -> %d at config %d (success=%.0f%%)\n",
-						prev, data_batch_size, current_configuration,
-						last_transmission_block_stats.success_rate_data);
+					printf("[GEARSHIFT] LADDER: poor block %d/3 (success=%.0f%%), holding config %d\n",
+						gear_shift_down_consecutive_fails, last_transmission_block_stats.success_rate_data,
+						current_configuration);
 					fflush(stdout);
-					gear_shift_blocked_for_nBlocks = 0;
 					this->connection_status=TRANSMITTING_DATA;
 				}
 				else if(!config_is_at_bottom(current_configuration, robust_enabled))

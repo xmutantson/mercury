@@ -1919,12 +1919,13 @@ skip_h_retry_point:
 
 				ofdm.channel_equalizer(data_container.ofdm_symbol_demodulated_data,data_container.equalized_data);
 				double measure_var=ofdm.measure_variance(data_container.equalized_data);
-				// Bug #62 fix: CSI-weighted LLR for ZF equalization.
+				// CSI-weighted LLR for ZF equalization.
 				// ZF amplifies noise by 1/|H_k|² per subcarrier. Using a single
 				// global variance makes the decoder overconfident on weak subcarriers.
 				// Fix: demod with pre-ZF noise (σ²_n), then scale each symbol's LLRs
-				// by |H_k|² → LLR_k = (Dmin1-Dmin0) * |H_k|² / σ²_n.
-				// For PSK with amplitude restoration, |H_k|=1 → weight=1 → no change.
+				// by normalized |H_k|² → tells LDPC which bits to trust.
+				// CSI from DFT-smoothed estimated_channel gives per-subcarrier |H|²,
+				// normalized by mean to prevent LLR saturation.
 				variance = ofdm.noise_variance_estimate;
 				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f Nsymb=%d amprest=%d\n",
 					receive_stats.sync_trials, current_configuration,
@@ -1932,7 +1933,10 @@ skip_h_retry_point:
 					ofdm.channel_estimator_amplitude_restoration);
 				fflush(stdout);
 
-				// Extract per-subcarrier CSI weight |H_k|² and deframe (DATA cells only)
+				// Extract per-subcarrier CSI weight |H_k|² and deframe (DATA cells only).
+				// DFT-smoothed estimated_channel has true |H|², giving per-subcarrier
+				// reliability to LDPC. Normalized by mean to prevent LLR saturation.
+				struct st_channel_complex* csi_source = ofdm.estimated_channel;
 				float* csi_deframed = new float[data_container.nData];
 				int csi_di = 0;
 				for(int si = 0; si < ofdm.Nsymb; si++)
@@ -1941,7 +1945,7 @@ skip_h_retry_point:
 					{
 						if((ofdm.ofdm_frame + si * ofdm.Nc + sj)->type == DATA)
 						{
-							std::complex<double> H = (ofdm.estimated_channel + si * ofdm.Nc + sj)->value;
+							std::complex<double> H = (csi_source + si * ofdm.Nc + sj)->value;
 							csi_deframed[csi_di++] = (float)(H.real() * H.real() + H.imag() * H.imag());
 						}
 					}
@@ -1955,20 +1959,29 @@ skip_h_retry_point:
 				deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
 				psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
 
-				// Scale each LLR by its subcarrier's |H_k|² and clamp.
-				// CSI weighting: LLR_k = (Dmin1-Dmin0)/σ²_n * |H_k|²
-				// Clamp: prevent extreme LLRs from dominating LDPC belief
-				// propagation. ±12 is generous (keeps 99.9%+ of good LLRs)
-				// while preventing numerical issues from ZF noise spikes.
+				// Normalize CSI weights by mean → average weight = 1.0.
+				// This preserves relative per-subcarrier quality (tells LDPC which
+				// bits are reliable) without changing overall LLR magnitude.
+				// For phase-only EQ (PSK), LLRs already encode |H| implicitly in
+				// constellation distances. Normalized CSI adds the RELATIVE variation:
+				// strong subcarrier → weight > 1 → higher LLR confidence
+				// weak subcarrier → weight < 1 → lower LLR confidence
+				// On flat channels (AWGN), all weights ≈ 1 → no change.
 				int nBps = (int)log2(M);
+				float mean_w = 0;
+				for(int si = 0; si < data_container.nData; si++)
+					mean_w += csi_deinterleaved[si];
+				mean_w /= data_container.nData;
+				if(mean_w < 1e-6f) mean_w = 1.0f;
+
 				for(int si = 0; si < data_container.nData; si++)
 				{
-					float w = csi_deinterleaved[si];
+					float w = csi_deinterleaved[si] / mean_w;
 					for(int bi = 0; bi < nBps; bi++)
 					{
 						float llr = data_container.demodulated_data[si * nBps + bi] * w;
-						if(llr > 12.0f) llr = 12.0f;
-						else if(llr < -12.0f) llr = -12.0f;
+						if(llr > 20.0f) llr = 20.0f;
+						else if(llr < -20.0f) llr = -20.0f;
 						data_container.demodulated_data[si * nBps + bi] = llr;
 					}
 				}
@@ -3302,7 +3315,7 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 #ifdef MERCURY_GUI_ENABLED
 		// Apply live LDPC iteration limit from GUI
 		int gui_ldpc_max = g_gui_state.ldpc_iterations_max.load();
-		if (gui_ldpc_max >= 5 && gui_ldpc_max <= 50)
+		if (gui_ldpc_max >= 5 && gui_ldpc_max <= 100)
 			ldpc.nIteration_max = gui_ldpc_max;
 #endif
 
@@ -3661,14 +3674,10 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
 
-	if(_modulation==MOD_BPSK || _modulation==MOD_QPSK || _modulation==MOD_8PSK)
-	{
-		ofdm.channel_estimator_amplitude_restoration=YES;
-	}
-	else
-	{
-		ofdm.channel_estimator_amplitude_restoration=NO;
-	}
+	// Amplitude restoration disabled for all modes: full ZF equalization
+	// preserves |H| for MMSE erasure and CSI weighting on frequency-selective channels.
+	// Previously PSK modes forced |H|=1, losing 35 dB SNR on analog channels with ~8 dB variation.
+	ofdm.channel_estimator_amplitude_restoration=NO;
 
 	if(current_configuration!=CONFIG_NONE)
 	{
