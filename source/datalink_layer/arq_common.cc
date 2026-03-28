@@ -184,6 +184,7 @@ cl_arq_controller::cl_arq_controller()
 	gear_shift_down_success_rate_precentage=55;
 	gear_shift_block_for_nBlocks_total=5;
 	gear_shift_blocked_for_nBlocks=0;
+	gear_shift_down_consecutive_fails=0;
 	consecutive_data_acks=0;
 	frame_shift_threshold=3;
 	frame_gearshift_just_applied=false;
@@ -1003,11 +1004,13 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		int max_batch = (int)((float)target_time_ms / message_transmission_time_ms + 0.5);
 		if(max_batch < 5) max_batch = 5;
 		if(max_batch > nMessages) max_batch = nMessages;
-		// Start at 5 frames — adaptation grows toward max_batch if link sustains it
-		int initial_batch = 5;
-		if(initial_batch > max_batch) initial_batch = max_batch;
-		set_data_batch_size(initial_batch);
-		nominal_batch_size = max_batch;  // ceiling for adaptive growth
+		// Fixed batch size (BATCH-ADAPT disabled — CMD/RSP must agree).
+		// Batch=31 too aggressive (1 OFDM failure kills entire batch).
+		// Batch=10 balances duty cycle (79%) vs batch failure probability.
+		int fixed_batch = 10;
+		if(fixed_batch > max_batch) fixed_batch = max_batch;
+		set_data_batch_size(fixed_batch);
+		nominal_batch_size = fixed_batch;
 		printf("[CFG] Batch scaling: msg_time=%dms initial=%d max=%d nMessages=%d\n",
 			message_transmission_time_ms, data_batch_size, max_batch, nMessages);
 		fflush(stdout);

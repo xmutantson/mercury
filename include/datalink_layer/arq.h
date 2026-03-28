@@ -463,6 +463,7 @@ public:
   double gear_shift_down_success_rate_precentage;
   int gear_shift_block_for_nBlocks_total;
   int gear_shift_blocked_for_nBlocks;
+  int gear_shift_down_consecutive_fails;  // Consecutive bad blocks before downshift
   int consecutive_data_acks;       // Frame-level gearshift: consecutive successful data ACKs
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
