@@ -741,6 +741,68 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 
 void cl_arq_controller::process_messages_tx_data()
 {
+	// SACK retransmit path: send only the missing frames from last SACK
+	if(sack_enabled && retransmit_count > 0)
+	{
+		printf("[CMD-RETX] Sending %d retransmit frames\n", retransmit_count);
+		fflush(stdout);
+
+		message_batch_counter_tx = 0;
+		for(int r = 0; r < retransmit_count; r++)
+		{
+			messages_batch_tx[message_batch_counter_tx].type = retransmit_frame_types[r];
+			messages_batch_tx[message_batch_counter_tx].length = retransmit_frame_lengths[r];
+			memcpy(messages_batch_tx[message_batch_counter_tx].data,
+				retransmit_frames[r], retransmit_frame_lengths[r]);
+			messages_batch_tx[message_batch_counter_tx].id = retransmit_frame_positions[r];
+			messages_batch_tx[message_batch_counter_tx].nResends = nResends;
+			messages_batch_tx[message_batch_counter_tx].ack_timeout = ack_timeout_data;
+			messages_batch_tx[message_batch_counter_tx].status = ADDED_TO_BATCH_BUFFER;
+			messages_batch_tx[message_batch_counter_tx].sequence_number = r;
+			message_batch_counter_tx++;
+			stats.nReSent_data++;
+			last_transmission_block_stats.nReSent_data++;
+		}
+		retransmit_count = 0;  // Consumed
+
+		// Mark retransmit frames as PENDING_ACK in messages_tx so ACK/SACK
+		// detection can find them. Use the first N slots.
+		for(int r = 0; r < message_batch_counter_tx; r++)
+		{
+			messages_tx[r] = messages_batch_tx[r];
+			messages_tx[r].status = PENDING_ACK;
+		}
+		block_under_tx = YES;
+
+		telecom_system->set_mfsk_ctrl_mode(false);
+		pad_messages_batch_tx(message_batch_counter_tx); // No padding needed — exact count
+		send_batch();
+
+		stats.nBatches_sent++;
+		last_transmission_block_stats.nBatches_sent++;
+
+		// Post-TX: same as normal path (flush, timeout, etc.)
+		circular_buf_reset(capture_buffer);
+		{
+			MUTEX_LOCK(&capture_prep_mutex);
+			int signal_period = telecom_system->data_container.Nofdm
+				* telecom_system->data_container.buffer_Nsymb
+				* telecom_system->data_container.interpolation_rate;
+			memset(telecom_system->data_container.passband_delayed_data, 0,
+				2 * signal_period * sizeof(double));
+			telecom_system->data_container.ring_write_index = 0;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+		}
+
+		if(ack_pattern_time_ms > 0)
+			telecom_system->data_container.frames_to_read = 4;
+		data_ack_received = NO;
+		connection_status = RECEIVING_ACKS_DATA;
+		calculate_receiving_timeout();
+		receiving_timer.start();
+		return;
+	}
+
 	for(int i=0;i<this->nMessages;i++)
 	{
 		if(messages_tx[i].status==ADDED_TO_LIST)
@@ -1401,6 +1463,77 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				int guard = ptt_off_delay_ms + 200;
 				receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 			}
+			// SACK: if ACK not detected, try detecting SACK pattern (partial batch ACK)
+			else if(data_ack_received==NO && sack_enabled)
+			{
+				bool sack_bitmap[MAX_SACK_BATCH_SIZE];
+				memset(sack_bitmap, 0, sizeof(sack_bitmap));
+				if(receive_sack_pattern(sack_bitmap, data_batch_size))
+				{
+					printf("[CMD-SACK] Partial batch ACK detected!\n");
+					fflush(stdout);
+					clear_buffer(playback_buffer);
+					link_timer.start();
+					watchdog_timer.start();
+					gear_shift_timer.stop();
+					gear_shift_timer.reset();
+
+					// Build retransmit queue: save missing frames' encrypted payloads
+					retransmit_count = 0;
+					int rx_count = 0;
+					for(int i = 0; i < nMessages; i++)
+					{
+						if(messages_tx[i].status != PENDING_ACK && messages_tx[i].status != ACK_TIMED_OUT)
+							continue;
+
+						if(i < data_batch_size && sack_bitmap[i])
+						{
+							// Frame received by responder — mark ACKED
+							messages_tx[i].status = ACKED;
+							stats.nAcked_data++;
+							rx_count++;
+						}
+						else if(retransmit_count < MAX_RETRANSMIT_HEADROOM)
+						{
+							// Frame missing — save encrypted payload for retransmit
+							int len = messages_tx[i].length;
+							if(len > MAX_SACK_FRAME_SIZE) len = MAX_SACK_FRAME_SIZE;
+							memcpy(retransmit_frames[retransmit_count], messages_tx[i].data, len);
+							retransmit_frame_lengths[retransmit_count] = len;
+							retransmit_frame_positions[retransmit_count] = i;
+							retransmit_frame_types[retransmit_count] = messages_tx[i].type;
+							retransmit_count++;
+							// Mark ACKED so cleanup() frees the slot (payload saved above)
+							messages_tx[i].status = ACKED;
+							stats.nAcked_data++;
+						}
+					}
+
+					printf("[CMD-SACK] %d/%d received, %d queued for retransmit\n",
+						rx_count, data_batch_size, retransmit_count);
+					fflush(stdout);
+
+					data_ack_received = YES;
+					stats.nBatches_acked++;
+					last_transmission_block_stats.nBatches_acked++;
+
+					if(messages_control.data[0]==REPEAT_LAST_ACK &&
+					   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
+					{
+						this->messages_control.ack_timeout=0;
+						this->messages_control.id=0;
+						this->messages_control.length=0;
+						this->messages_control.nResends=0;
+						this->messages_control.status=FREE;
+						this->messages_control.type=NONE;
+						stats.nAcked_control++;
+					}
+
+					// Guard delay (SACK is longer than ACK — extra margin)
+					int guard = ptt_off_delay_ms + 400;
+					receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
+				}
+			}
 		}
 		else
 		{
@@ -1938,6 +2071,23 @@ void cl_arq_controller::process_control_commander()
 				{
 					printf("[STREAMING] Not enabled (local=0x%02X peer=0x%02X compress=%d)\n",
 						local_capability, peer_capability, compression_enabled);
+				}
+			}
+
+			// SACK negotiation
+			{
+				bool both_sack = (local_capability & CAP_SACK)
+					&& (peer_capability & CAP_SACK);
+				sack_enabled = both_sack;
+				if(sack_enabled)
+				{
+					printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d)\n",
+						radio_batch_size, crypto_batch_size, retransmit_headroom);
+				}
+				else
+				{
+					printf("[SACK] Not enabled (local=0x%02X peer=0x%02X)\n",
+						local_capability, peer_capability);
 				}
 			}
 			fflush(stdout);
@@ -2781,6 +2931,11 @@ void cl_arq_controller::process_buffer_data_commander()
 		// process_commander() gates process_messages_tx_data(), but this function
 		// is called separately from process_messages() and needs its own gate.
 		if(encryption_enabled && !cipher_suite.is_active())
+			return;
+
+		// SACK retransmit pending: don't create new crypto batch from FIFO.
+		// process_messages_tx_data() will send retransmit-only batch.
+		if(sack_enabled && retransmit_count > 0)
 			return;
 
 		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && block_under_tx==NO)

@@ -122,6 +122,23 @@ cl_arq_controller::cl_arq_controller()
 	ack_batch_size=1;
 	batch_rx_frame_count=0;
 	batch_data_delivered=false;
+
+	// SACK state initialization
+	sack_enabled=false;
+	radio_batch_size=25;
+	crypto_batch_size=20;
+	retransmit_headroom=5;
+	crypto_batch_counter_tx=0;
+	crypto_batch_counter_rx=0;
+	retransmit_count=0;
+	retransmit_batch_id=-1;
+	for(int i=0;i<MAX_RETRANSMIT_HEADROOM;i++) {
+		retransmit_frame_lengths[i]=0;
+		retransmit_frame_positions[i]=0;
+		retransmit_frame_types[i]=0;
+	}
+	crypto_buf[0].clear();
+	crypto_buf[1].clear();
 	message_transmission_time_ms=500;
 	ctrl_transmission_time_ms=500;
 	ack_pattern_time_ms=0;
@@ -155,7 +172,7 @@ cl_arq_controller::cl_arq_controller()
 	nb_probe_max=2;
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
-	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING;  // Always advertise compression + B2F unroll + streaming
+	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;  // Always advertise compression + B2F unroll + streaming + SACK
 	peer_capability=0;
 	wb_upgrade_pending=false;
 	psk_mismatch_pending=false;
@@ -402,7 +419,16 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// ACK pattern. Allow responder ftr countdown + decode + pattern TX.
 			// RSP turnaround includes CMD frame TX time (Bug #44), so CMD must
 			// wait for: turnaround (frame_TX + 4000ms overhead) + ACK + margins.
-			int timeout = 2 * message_transmission_time_ms + ack_pattern_time_ms + ptt_on_delay_ms + ptt_off_delay_ms + 3000;
+			int pattern_time = ack_pattern_time_ms;
+			// SACK pattern is longer (base + bitmap suffix). Add extra margin.
+			if(sack_enabled && telecom_system)
+			{
+				int sack_samples = telecom_system->sack_pattern_passband_samples(data_batch_size);
+				int sack_ms = (int)ceil(1000.0 * sack_samples / telecom_system->sampling_frequency);
+				if(sack_ms > pattern_time)
+					pattern_time = sack_ms;
+			}
+			int timeout = 2 * message_transmission_time_ms + pattern_time + ptt_on_delay_ms + ptt_off_delay_ms + 3000;
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -424,7 +450,17 @@ void cl_arq_controller::calculate_receiving_timeout()
 void cl_arq_controller::recalculate_ack_timeout_for_batch()
 {
 	if(ack_pattern_time_ms > 0)
-		set_ack_timeout_data((data_batch_size+2)*message_transmission_time_ms + ack_pattern_time_ms + 4*ptt_on_delay_ms + 4*ptt_off_delay_ms + 3000);
+	{
+		int pattern_time = ack_pattern_time_ms;
+		if(sack_enabled && telecom_system)
+		{
+			int sack_samples = telecom_system->sack_pattern_passband_samples(data_batch_size);
+			int sack_ms = (int)ceil(1000.0 * sack_samples / telecom_system->sampling_frequency);
+			if(sack_ms > pattern_time)
+				pattern_time = sack_ms;
+		}
+		set_ack_timeout_data((data_batch_size+2)*message_transmission_time_ms + pattern_time + 4*ptt_on_delay_ms + 4*ptt_off_delay_ms + 3000);
+	}
 	else
 		set_ack_timeout_data((data_batch_size+1)*message_transmission_time_ms+control_batch_size*message_transmission_time_ms+2*ack_batch_size*ctrl_transmission_time_ms+time_left_to_send_last_frame+4*ptt_on_delay_ms+4*ptt_off_delay_ms);
 }
@@ -1004,10 +1040,10 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		int max_batch = (int)((float)target_time_ms / message_transmission_time_ms + 0.5);
 		if(max_batch < 5) max_batch = 5;
 		if(max_batch > nMessages) max_batch = nMessages;
-		// Fixed batch size (BATCH-ADAPT disabled — CMD/RSP must agree).
-		// Batch=31 too aggressive (1 OFDM failure kills entire batch).
-		// Batch=10 balances duty cycle (79%) vs batch failure probability.
-		int fixed_batch = 10;
+		// Batch sizing: with SACK, partial batches are retransmitted selectively,
+		// so larger batches improve duty cycle without risking full retransmission.
+		// Without SACK: batch=10 balances duty cycle vs batch failure probability.
+		int fixed_batch = sack_enabled ? radio_batch_size : 10;
 		if(fixed_batch > max_batch) fixed_batch = max_batch;
 		set_data_batch_size(fixed_batch);
 		nominal_batch_size = fixed_batch;
@@ -2196,7 +2232,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2293,7 +2329,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2347,7 +2383,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2366,7 +2402,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -3347,6 +3383,181 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 		msleep(1);
 
 	ptt_off();
+}
+
+// Transmit SACK pattern with bitmap suffix (partial batch acknowledgement)
+void cl_arq_controller::send_sack_pattern(const bool* received_bitmap, int nframes)
+{
+	if(passive_monitor) return;
+
+	// Log which frames were received
+	printf("[TX-SACK] Sending SACK pattern (batch=%d, received:", nframes);
+	for(int i = 0; i < nframes; i++)
+		printf(" %d", received_bitmap[i] ? 1 : 0);
+	printf(") on CONFIG_%d\n", current_configuration);
+	fflush(stdout);
+
+	// Guard delay: same logic as send_ack_pattern
+	if(is_ofdm_config(current_configuration))
+	{
+		int interp = telecom_system->data_container.interpolation_rate;
+		int sym_samples = telecom_system->data_container.Nofdm * interp;
+		int frame_sym = telecom_system->data_container.preamble_nSymb
+		              + telecom_system->data_container.Nsymb;
+		int buf_sym = telecom_system->data_container.buffer_Nsymb.load();
+		int delay_sym = (sym_samples > 0)
+		              ? telecom_system->receive_stats.delay / sym_samples : 0;
+		int frame_end_sym = delay_sym + frame_sym;
+		int remaining_sym = frame_end_sym - buf_sym;
+		if(remaining_sym < 0) remaining_sym = 0;
+
+		int wait_ms = (remaining_sym * telecom_system->data_container.Nofdm
+		              * 1000 + 47999) / 48000;
+		wait_ms += ptt_off_delay_ms + ptt_on_delay_ms;
+
+		if(wait_ms > 0)
+		{
+			printf("[TX-SACK] Waiting %dms for guard\n", wait_ms);
+			fflush(stdout);
+			msleep(wait_ms);
+		}
+	}
+	else
+	{
+		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
+		msleep(wait_ms);
+	}
+
+	ptt_on();
+
+	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
+	ptt_on_delay_timer.start();
+
+	int pattern_samples = telecom_system->sack_pattern_passband_samples(nframes);
+	int symbol_period = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
+
+	int padded_size = pattern_samples + 2 * symbol_period;
+	double *raw_output = new double[padded_size];
+	double *filtered1 = new double[padded_size];
+	double *filtered2 = new double[padded_size];
+
+	if(!raw_output || !filtered1 || !filtered2) exit(-37);
+
+	memset(raw_output, 0, padded_size * sizeof(double));
+
+	telecom_system->generate_sack_bitmap_pattern_passband(&raw_output[symbol_period], received_bitmap, nframes);
+
+	memcpy(&raw_output[0], &raw_output[symbol_period], symbol_period * sizeof(double));
+	memcpy(&raw_output[symbol_period + pattern_samples], &raw_output[pattern_samples], symbol_period * sizeof(double));
+
+	memset(filtered1, 0, padded_size * sizeof(double));
+	memset(filtered2, 0, padded_size * sizeof(double));
+	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
+	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
+
+	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
+		msleep(1);
+
+	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
+	{
+		const double SAMPLE_RATE = 48000.0;
+		const double PILOT_FREQ = (double)pilot_tone_hz;
+		const double PI = 3.14159265358979323846;
+		int pilot_samples = (int)(pilot_tone_ms * SAMPLE_RATE / 1000.0);
+		double* pilot_buffer = new double[pilot_samples];
+		for(int i = 0; i < pilot_samples; i++)
+		{
+			double t = (double)i / SAMPLE_RATE;
+			double envelope = 1.0;
+			int ramp_samples = (int)(SAMPLE_RATE * 0.005);
+			if(i < ramp_samples)
+				envelope = (double)i / ramp_samples;
+			else if(i > pilot_samples - ramp_samples)
+				envelope = (double)(pilot_samples - i) / ramp_samples;
+			pilot_buffer[i] = envelope * 0.5 * sin(2.0 * PI * PILOT_FREQ * t);
+		}
+		tx_transfer(pilot_buffer, pilot_samples);
+		delete[] pilot_buffer;
+	}
+
+	tx_transfer(&filtered2[symbol_period], pattern_samples);
+
+	while(size_buffer(playback_buffer) > 0)
+		msleep(1);
+
+	delete[] raw_output;
+	delete[] filtered1;
+	delete[] filtered2;
+
+	// Same flush sequence as send_ack_pattern
+	telecom_system->data_container.rx_mute = 1;
+	msleep(RX_MUTE_GUARD_MS);
+	circular_buf_reset(capture_buffer);
+	{
+		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		memset(telecom_system->data_container.passband_delayed_data, 0, 2 * buf_samples * sizeof(double));
+		telecom_system->data_container.ring_write_index = 0;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+	telecom_system->data_container.rx_mute = 0;
+	telecom_system->data_container.rx_mute_samples = 0;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	{
+		int rx_frame = telecom_system->data_container.preamble_nSymb
+		             + telecom_system->data_container.Nsymb;
+		int margin = 10;
+		telecom_system->data_container.frames_to_read = rx_frame + margin;
+	}
+
+	printf("[TX-SACK] Done, flushed capture buffer, ftr=%d\n",
+		telecom_system->data_container.frames_to_read.load());
+	fflush(stdout);
+
+	ptt_off_delay_timer.start();
+	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
+		msleep(1);
+
+	ptt_off();
+}
+
+// Receive SACK pattern and decode bitmap from suffix
+bool cl_arq_controller::receive_sack_pattern(bool* out_bitmap, int nframes)
+{
+	if(telecom_system->ack_pattern_passband_samples <= 0) return false;
+
+	// Use the ring buffer for detection (same as receive_ack_pattern)
+	int ring_size = telecom_system->data_container.Nofdm
+		* telecom_system->data_container.buffer_Nsymb
+		* telecom_system->data_container.interpolation_rate;
+	double* ring_data = telecom_system->data_container.passband_delayed_data;
+
+	int suffix_tones[14]; // MAX_SACK_BITMAP_SYMBOLS
+	for(int i = 0; i < 14; i++) suffix_tones[i] = -1;
+
+	int matched = 0;
+	double metric = telecom_system->detect_sack_pattern_from_passband(
+		ring_data, ring_size, &matched, nframes, suffix_tones);
+
+	if(matched >= telecom_system->ack_mfsk.sack_match_threshold && metric >= 3.0)
+	{
+		// Decode bitmap from suffix tones
+		int nsuffix = telecom_system->ack_mfsk.sack_bitmap_nsuffix(nframes);
+		telecom_system->ack_mfsk.decode_sack_bitmap(suffix_tones, nsuffix, nframes, out_bitmap);
+
+		printf("[RX-SACK] Detected (matched=%d, metric=%.1f), bitmap:", matched, metric);
+		for(int i = 0; i < nframes; i++)
+			printf(" %d", out_bitmap[i] ? 1 : 0);
+		printf("\n");
+		fflush(stdout);
+		return true;
+	}
+
+	return false;
 }
 
 // Transmit BREAK tone pattern — emergency "drop to ROBUST_0" signal

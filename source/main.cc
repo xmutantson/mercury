@@ -275,6 +275,9 @@ int main(int argc, char *argv[])
     int tx_channel_cli = -1;          // -1 = use default; 0=LEFT, 1=RIGHT, 2=STEREO
     bool monitor_stdout = false;      // --stdout: output decoded plaintext to stdout
     bool skip_turbo_reverse = false;  // --skip-turbo-reverse: skip TURBO_REVERSE phase
+    int ptt_delay_cli = -1;           // --ptt-delay: override both PTT on/off delays (ms)
+    int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
+    int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -331,6 +334,7 @@ int main(int argc, char *argv[])
         printf("  -z                List available sound devices\n");
 
         printf("  --skip-turbo-reverse  Skip TURBO_REVERSE phase (benchmark mode)\n");
+        printf("  --ptt-delay [ms]  Override PTT on/off delay (0 for no-PTT setups)\n");
         printf("\nModulation and bandwidth:\n");
         printf("  -s [config]       Modulation: 0-16 (OFDM), 100-102 (ROBUST MFSK). Use -l to list.\n");
         printf("  -g                Enable adaptive gearshift\n");
@@ -359,6 +363,8 @@ int main(int argc, char *argv[])
         printf("  -B [gain]         NB MFSK boost override\n");
         printf("  -Q [n]            NB probe max (0=disable, default 2)\n");
         printf("  --gi [ms]         Guard interval in ms (1.0-8.0, default 3.0)\n");
+        printf("  --radio-batch [n] Total frames per radio TX for SACK (default: 25)\n");
+        printf("  --retransmit-headroom [n]  Max retransmit frames per batch (default: 5)\n");
 
         printf("\nTesting and debug:\n");
         printf("  -Z [snr_dB]       Inject AWGN noise at specified SNR\n");
@@ -439,6 +445,38 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++)
                 argv[j] = argv[j + 1];
             argc -= 1;
+            i--;
+        }
+        else if (strcmp(argv[i], "--ptt-delay") == 0 && i + 1 < argc)
+        {
+            ptt_delay_cli = atoi(argv[i + 1]);
+            if (ptt_delay_cli < 0) ptt_delay_cli = 0;
+            printf("PTT delay override: on=%d ms, off=%d ms\n", ptt_delay_cli, ptt_delay_cli);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        }
+        else if (strcmp(argv[i], "--radio-batch") == 0 && i + 1 < argc)
+        {
+            radio_batch_cli = atoi(argv[i + 1]);
+            if (radio_batch_cli < 5) radio_batch_cli = 5;
+            if (radio_batch_cli > MAX_SACK_BATCH_SIZE) radio_batch_cli = MAX_SACK_BATCH_SIZE;
+            printf("Radio batch size override: %d frames\n", radio_batch_cli);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        }
+        else if (strcmp(argv[i], "--retransmit-headroom") == 0 && i + 1 < argc)
+        {
+            retransmit_headroom_cli = atoi(argv[i + 1]);
+            if (retransmit_headroom_cli < 1) retransmit_headroom_cli = 1;
+            if (retransmit_headroom_cli > MAX_RETRANSMIT_HEADROOM) retransmit_headroom_cli = MAX_RETRANSMIT_HEADROOM;
+            printf("Retransmit headroom override: %d frames\n", retransmit_headroom_cli);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         }
     }
@@ -993,6 +1031,34 @@ start_modem:
                g_settings.ptt_on_delay_ms, g_settings.ptt_off_delay_ms,
                g_settings.pilot_tone_ms, g_settings.pilot_tone_hz);
 #endif
+
+        // CLI --ptt-delay overrides INI PTT timing
+        if (ptt_delay_cli >= 0)
+        {
+            ARQ.default_configuration_ARQ.ptt_on_delay_ms = ptt_delay_cli;
+            ARQ.default_configuration_ARQ.ptt_off_delay_ms = ptt_delay_cli;
+            printf("PTT delay CLI override: on=%d ms, off=%d ms\n", ptt_delay_cli, ptt_delay_cli);
+        }
+
+        // CLI --radio-batch and --retransmit-headroom override SACK defaults
+        if (radio_batch_cli >= 0)
+        {
+            ARQ.radio_batch_size = radio_batch_cli;
+            if (retransmit_headroom_cli >= 0)
+                ARQ.retransmit_headroom = retransmit_headroom_cli;
+            ARQ.crypto_batch_size = ARQ.radio_batch_size - ARQ.retransmit_headroom;
+            if (ARQ.crypto_batch_size < 1) ARQ.crypto_batch_size = 1;
+            printf("SACK CLI: radio_batch=%d crypto_batch=%d headroom=%d\n",
+                ARQ.radio_batch_size, ARQ.crypto_batch_size, ARQ.retransmit_headroom);
+        }
+        else if (retransmit_headroom_cli >= 0)
+        {
+            ARQ.retransmit_headroom = retransmit_headroom_cli;
+            ARQ.crypto_batch_size = ARQ.radio_batch_size - ARQ.retransmit_headroom;
+            if (ARQ.crypto_batch_size < 1) ARQ.crypto_batch_size = 1;
+            printf("SACK CLI: radio_batch=%d crypto_batch=%d headroom=%d\n",
+                ARQ.radio_batch_size, ARQ.crypto_batch_size, ARQ.retransmit_headroom);
+        }
 
         // Apply LDPC iterations: CLI overrides INI, INI overrides default
 #ifdef MERCURY_GUI_ENABLED

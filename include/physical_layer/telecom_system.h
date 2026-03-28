@@ -155,6 +155,12 @@ public:
 	int generate_hail_pattern_passband(double* out);  // TX: returns samples written
 	double detect_hail_pattern_from_passband(double* data, int size, int* out_matched = nullptr, int suffix_start = 0, int* out_suffix_matched = nullptr);  // RX: returns metric
 
+	// SACK pattern: selective ACK with bitmap suffix (partial batch acknowledgement)
+	int generate_sack_bitmap_pattern_passband(double* out, const bool* received, int nframes);  // TX: SACK + bitmap, returns samples
+	int sack_pattern_passband_samples(int nframes) const;  // Duration in samples for given batch size
+	double detect_sack_pattern_from_passband(double* data, int size, int* out_matched = nullptr,
+	                                          int nframes = 0, int* out_suffix_tones = nullptr);  // RX: detect SACK + decode bitmap suffix
+
 	st_receive_stats receive_stats;
 
 	int operation_mode;

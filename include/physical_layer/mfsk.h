@@ -47,19 +47,22 @@ public:
 	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol
 	int preamble_nSymb;                     // Number of preamble symbols used
 
-	// ACK/BREAK/HAIL pattern: known tone sequences for pattern-based signaling.
+	// ACK/BREAK/HAIL/SACK pattern: known tone sequences for pattern-based signaling.
 	// WB (M>=16): 8 Welch-Costas tones × 2 reps = 16 symbols, with tone hopping.
 	// NB (M<=8): 32/48-element Sidelnikov sequences, no repetition, no hopping.
 	// ACK = data acknowledged, BREAK = emergency downshift, HAIL = "I am Mercury" beacon.
+	// SACK = selective ACK (partial batch received), followed by bitmap suffix.
 	static const int MAX_ACK_TONES = 48;  // Max for M=4 NB (48 symbols)
 	int ack_tones[MAX_ACK_TONES];
 	int break_tones[MAX_ACK_TONES];
 	int hail_tones[MAX_ACK_TONES];
+	int sack_tones[MAX_ACK_TONES];
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
 	int break_match_threshold; // Min matched symbols for BREAK detection
 	int hail_match_threshold;  // Min matched symbols for undirected HAIL detection
+	int sack_match_threshold;  // Min matched symbols for SACK detection
 
 	// Directed HAIL: 4-tone CRC suffix appended after the "I am Mercury" prefix.
 	// Derived from FNV-1a hash of the target callsign (including SSID).
@@ -73,6 +76,22 @@ public:
 
 	void set_hail_target(const char* callsign, int len);
 	void clear_hail_target();
+
+	// SACK bitmap suffix: encodes which frames in a batch were received.
+	// Each MFSK symbol carries log2(M) bits. Bitmap packed LSB-first.
+	// WB: 2x repetition for reliability. NB: no repetition (Sidelnikov diversity).
+	static const int MAX_SACK_BITMAP_SYMBOLS = 14; // Max: M=16, batch=25, 7 sym × 2 reps
+	int sack_bitmap_nsuffix(int nframes) const;  // Total suffix symbols for given batch size
+	int sack_total_nsymb(int nframes) const { return ack_pattern_nsymb + sack_bitmap_nsuffix(nframes); }
+	void encode_sack_bitmap(const bool* received, int nframes, int* out_tones) const;
+	void decode_sack_bitmap(const int* suffix_tones, int nsuffix, int nframes, bool* out_received) const;
+
+	// Generate SACK pattern: base + bitmap suffix
+	void generate_sack_pattern(std::complex<double>* pattern_out);
+
+	// Generate SACK pattern with bitmap suffix appended
+	void generate_sack_bitmap_pattern(std::complex<double>* pattern_out,
+	                                   const bool* received, int nframes);
 
 	// SNR suffix for turboshift ACK: 8 extra symbols encoding quantized SNR.
 	// WB (M=16): tone 0-15 → SNR = tone*2 - 5 dB (range -5 to +25 dB, 2 dB step)
