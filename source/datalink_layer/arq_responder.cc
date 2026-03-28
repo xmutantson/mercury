@@ -746,6 +746,35 @@ void cl_arq_controller::process_messages_acknowledging_data()
 
 			if(data_batch_size > 1 && rx_received < expected && !passive_monitor)
 			{
+				if(sack_enabled && rx_received > 0)
+				{
+					// SACK: send selective ACK with bitmap of received frames
+					printf("[ACK-GATE] SACK: received %d/%d (expected %d)\n",
+						rx_received, data_batch_size, expected);
+					fflush(stdout);
+
+					// Build bitmap: true = frame received
+					bool sack_bitmap[MAX_SACK_BATCH_SIZE];
+					for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
+						sack_bitmap[i] = (messages_rx[i].status == RECEIVED);
+
+					// Send SACK pattern with bitmap suffix
+					send_sack_pattern(sack_bitmap, data_batch_size);
+
+					// Keep partial messages_rx (DON'T free) — retransmit fills gaps
+					stats.nNAcked_data++;
+					batch_rx_frame_count = 0;
+					last_received_end_of_batch_seq = -1;
+
+					// Same post-TX cleanup as send_ack_pattern
+					telecom_system->set_mfsk_ctrl_mode(false);
+					telecom_system->data_container.nUnder_processing_events = 0;
+					calculate_receiving_timeout();
+					receiving_timer.start();
+					connection_status=RECEIVING;
+					return;
+				}
+
 				printf("[ACK-GATE] Suppressing: received %d/%d (expected %d)\n",
 					rx_received, data_batch_size, expected);
 				fflush(stdout);
@@ -1207,6 +1236,23 @@ void cl_arq_controller::process_control_responder()
 			{
 				printf("[STREAMING] Not enabled (local=0x%02X peer=0x%02X compress=%d)\n",
 					local_capability, peer_capability, compression_enabled);
+			}
+		}
+
+		// SACK negotiation
+		{
+			bool both_sack = (local_capability & CAP_SACK)
+				&& (peer_capability & CAP_SACK);
+			sack_enabled = both_sack;
+			if(sack_enabled)
+			{
+				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d)\n",
+					radio_batch_size, crypto_batch_size, retransmit_headroom);
+			}
+			else
+			{
+				printf("[SACK] Not enabled (local=0x%02X peer=0x%02X)\n",
+					local_capability, peer_capability);
 			}
 		}
 		fflush(stdout);

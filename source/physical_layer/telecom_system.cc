@@ -2644,6 +2644,92 @@ double cl_telecom_system::detect_hail_pattern_from_passband(double* data, int si
 	return metric;
 }
 
+// SACK: calculate passband samples for SACK pattern with bitmap suffix
+int cl_telecom_system::sack_pattern_passband_samples(int nframes) const
+{
+	int nsymb = ack_mfsk.sack_total_nsymb(nframes);
+	return nsymb * data_container.Nofdm * frequency_interpolation_rate;
+}
+
+// TX: Generate SACK pattern with bitmap suffix as passband audio
+int cl_telecom_system::generate_sack_bitmap_pattern_passband(double* out, const bool* received, int nframes)
+{
+	int total_nsymb = ack_mfsk.sack_total_nsymb(nframes);
+	int passband_samples = total_nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	if(passband_samples <= 0) return 0;
+
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	// Generate subcarrier-domain SACK pattern with bitmap suffix
+	ack_mfsk.generate_sack_bitmap_pattern(data_container.ofdm_framed_data, received, nframes);
+
+	// IFFT each symbol to time domain
+	for(int i = 0; i < total_nsymb; i++)
+	{
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	}
+
+	// TX gain
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * total_nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	// Baseband to passband
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * total_nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	// Peak clipping
+	ofdm.peak_clip(out, passband_samples, ofdm.data_papr_cut);
+
+	return passband_samples;
+}
+
+// RX: Detect SACK pattern in passband audio and decode bitmap suffix tones
+double cl_telecom_system::detect_sack_pattern_from_passband(double* data, int size,
+                                                             int* out_matched,
+                                                             int nframes, int* out_suffix_tones)
+{
+	if(ack_pattern_passband_samples <= 0) return 0.0;
+
+	ofdm.passband_to_baseband(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, carrier_frequency, carrier_amplitude,
+		1, &ofdm.FIR_rx_data);
+
+	// Detect SACK base pattern (same length as ACK base, just different tones)
+	int bitmap_nsuffix = ack_mfsk.sack_bitmap_nsuffix(nframes);
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, size,
+		data_container.interpolation_rate,
+		ack_mfsk.ack_pattern_nsymb,  // base pattern length (16 WB, 32 NB)
+		ack_mfsk.sack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		out_matched, 0, nullptr, &best_offset,
+		bitmap_nsuffix);  // reserve_after for bitmap suffix
+
+	// If base detected and suffix requested, decode bitmap suffix tones
+	if(out_suffix_tones && nframes > 0 && best_offset >= 0 && out_matched && *out_matched >= ack_mfsk.sack_match_threshold)
+	{
+		ofdm.decode_suffix_tones(
+			data_container.baseband_data_interpolated, size,
+			data_container.interpolation_rate,
+			best_offset, ack_mfsk.ack_pattern_nsymb,
+			bitmap_nsuffix, ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			out_suffix_tones);
+	}
+
+	return metric;
+}
+
 // ACK pattern detection test: sweep SNR, measure detection metric and false alarm rate
 void cl_telecom_system::ack_pattern_detection_test()
 {

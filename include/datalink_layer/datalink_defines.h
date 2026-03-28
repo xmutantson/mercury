@@ -93,6 +93,7 @@
 #define CAP_B2F_UNROLL   0x04   // Supports B2F LZHUF unroll/reroll (Winlink optimization)
 #define CAP_ENCRYPTION   0x08   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
 #define CAP_STREAMING    0x10   // Supports streaming compression context (PPMd carry + zstd prefix)
+#define CAP_SACK         0x20   // Supports selective ACK (partial batch retransmission)
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };

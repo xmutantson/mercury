@@ -170,6 +170,34 @@ struct st_message
 	cl_timer ack_timer;
 };
 
+// SACK: Double-buffered crypto batch storage for partial batch handling.
+// Responder stores frames from up to 2 crypto batches (the one being completed
+// via retransmits and the new one arriving in the same radio batch).
+#define MAX_SACK_BATCH_SIZE  32   // Max frames per crypto batch
+#define MAX_SACK_FRAME_SIZE  256  // Max frame payload size
+#define MAX_RETRANSMIT_HEADROOM 8 // Max retransmit slots per radio batch
+
+struct st_crypto_batch_buffer {
+	int batch_id;           // crypto batch counter mod 8, or -1 if empty
+	int expected_frames;    // from crypto_batch_size or end-of-batch detection
+	bool frame_received[MAX_SACK_BATCH_SIZE];
+	unsigned char frame_data[MAX_SACK_BATCH_SIZE][MAX_SACK_FRAME_SIZE];
+	int frame_lengths[MAX_SACK_BATCH_SIZE];
+	int frame_types[MAX_SACK_BATCH_SIZE];  // DATA_LONG or DATA_SHORT
+	int frames_received_count;
+
+	void clear() {
+		batch_id = -1;
+		expected_frames = 0;
+		frames_received_count = 0;
+		for (int i = 0; i < MAX_SACK_BATCH_SIZE; i++) {
+			frame_received[i] = false;
+			frame_lengths[i] = 0;
+			frame_types[i] = 0;
+		}
+	}
+};
+
 struct st_stats
 {
 	  int nSent_data;
@@ -292,6 +320,8 @@ public:
   void send_ack_pattern();   // Level 3: TX short tone pattern instead of LDPC ACK
   void send_ack_pattern_with_snr(float snr);  // TX ACK + 4 MFSK symbols encoding SNR
   bool receive_ack_pattern(); // Level 3: RX + detect ACK pattern, returns true if detected
+  void send_sack_pattern(const bool* received_bitmap, int nframes);  // SACK: partial batch ACK with bitmap
+  bool receive_sack_pattern(bool* out_bitmap, int nframes); // SACK: detect + decode bitmap
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
@@ -364,6 +394,25 @@ public:
   bool batch_data_delivered; // True after copy_data_to_buffer() — prevents re-delivery on retransmission
   int block_ready;
   int block_under_tx;
+
+  // SACK: Selective ACK for partial batch retransmission
+  bool sack_enabled;                   // Negotiated: both sides have CAP_SACK
+  int radio_batch_size;                // Total frames per radio TX (e.g., 25)
+  int crypto_batch_size;               // Frames per encryption unit (e.g., 20)
+  int retransmit_headroom;             // radio_batch_size - crypto_batch_size (e.g., 5)
+  int crypto_batch_counter_tx;         // Monotonic crypto batch ID for TX (mod 8 in header)
+  int crypto_batch_counter_rx;         // Expected crypto batch ID for RX
+
+  // Commander: retransmit queue (missing frames from last SACK)
+  int retransmit_count;                // Number of frames to retransmit
+  int retransmit_batch_id;             // Crypto batch ID of frames being retransmitted
+  unsigned char retransmit_frames[MAX_RETRANSMIT_HEADROOM][MAX_SACK_FRAME_SIZE];
+  int retransmit_frame_lengths[MAX_RETRANSMIT_HEADROOM];
+  int retransmit_frame_positions[MAX_RETRANSMIT_HEADROOM]; // Original frame_pos within crypto batch
+  int retransmit_frame_types[MAX_RETRANSMIT_HEADROOM];     // DATA_LONG or DATA_SHORT
+
+  // Responder: double-buffered crypto batch storage
+  st_crypto_batch_buffer crypto_buf[2]; // [0] = oldest pending, [1] = current
   int max_message_length;
   int max_data_length;
   int max_header_length;
