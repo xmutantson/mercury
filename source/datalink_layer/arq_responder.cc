@@ -307,20 +307,24 @@ void cl_arq_controller::process_messages_rx_data_control()
 #endif
 				}
 
-				printf("[RX-DATA] type=%d id=%d seq=%d/%d len=%d\n",
-					messages_rx_buffer.type, (int)(unsigned char)messages_rx_buffer.id,
-					messages_rx_buffer.sequence_number, data_batch_size,
-					messages_rx_buffer.length);
-				fflush(stdout);
+				{
+					static cl_timer batch_rx_stopwatch;
+					if(batch_rx_frame_count == 0) batch_rx_stopwatch.start();
+					printf("[RX-DATA] type=%d id=%d seq=%d/%d len=%d t=%dms\n",
+						messages_rx_buffer.type, (int)(unsigned char)messages_rx_buffer.id,
+						messages_rx_buffer.sequence_number, data_batch_size,
+						messages_rx_buffer.length,
+						(int)batch_rx_stopwatch.get_elapsed_time_ms());
+					fflush(stdout);
+				}
 				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
 				batch_rx_frame_count++;
-
+				int rx_timeout = 0;
+				int effective_batch = data_batch_size;
 				{
-					int rx_timeout;
 					// Determine actual expected frame count.
 					// With adaptive batch sizing, commander may send fewer frames
 					// than data_batch_size. Use compression header to detect this.
-					int effective_batch = data_batch_size;
 					// End-of-batch flag: commander marks last frame with bit 7
 					if(last_received_end_of_batch_seq >= 0)
 					{
@@ -347,8 +351,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 
 					if(batch_rx_frame_count >= effective_batch)
 					{
-						// All expected frames decoded — ACK immediately.
-						// Handles adaptive batch (commander sent fewer than data_batch_size).
+						// All expected frames decoded -- ACK immediately.
 						rx_timeout = ptt_on_delay_ms;
 					}
 					else
@@ -361,9 +364,41 @@ void cl_arq_controller::process_messages_rx_data_control()
 							+ time_left_to_send_last_frame + ptt_on_delay_ms
 							+ message_transmission_time_ms;
 					}
-					set_receiving_timeout(rx_timeout);
 				}
-				receiving_timer.start();
+				// SACK timing: when batch incomplete, keep the initial timeout
+				// from calculate_receiving_timeout() which covers full CMD TX.
+				// Reducing timeout or restarting timer per-frame causes RSP to
+				// send SACK while CMD still transmitting.
+				if(!sack_enabled || batch_rx_frame_count >= effective_batch)
+				{
+					printf("[RSP-TIMER] SET: sack=%d rxcnt=%d eff=%d seq=%d rx_t=%d old_t=%d\n",
+						sack_enabled?1:0, batch_rx_frame_count, effective_batch,
+						messages_rx_buffer.sequence_number, rx_timeout, receiving_timeout);
+					fflush(stdout);
+					set_receiving_timeout(rx_timeout);
+					receiving_timer.start();
+				}
+				else
+				{
+					// If the timer was stopped (expired previously with 0 frames
+					// before any data arrived), restart it so ACK-GATE can trigger
+					// after the remaining frames arrive or the timer expires again.
+					if(receiving_timer.counting != COUNTING)
+					{
+						printf("[RSP-TIMER] RESTART: sack=%d rxcnt=%d eff=%d seq=%d cur_t=%d (was stopped)\n",
+							sack_enabled?1:0, batch_rx_frame_count, effective_batch,
+							messages_rx_buffer.sequence_number, receiving_timeout);
+						fflush(stdout);
+						receiving_timer.start();
+					}
+					else
+					{
+						printf("[RSP-TIMER] KEEP: sack=%d rxcnt=%d eff=%d seq=%d rx_t=%d cur_t=%d\n",
+							sack_enabled?1:0, batch_rx_frame_count, effective_batch,
+							messages_rx_buffer.sequence_number, rx_timeout, receiving_timeout);
+						fflush(stdout);
+					}
+				}
 			}
 			messages_rx_buffer.status=FREE;
 			link_timer.start();
@@ -388,14 +423,22 @@ void cl_arq_controller::process_messages_rx_data_control()
 
 		if(link_status == CONNECTED && batch_rx_frame_count == 0)
 		{
-			printf("[RX-TIMEOUT] No frames decoded. cfg=%d Nsymb=%d M=%.0f nBits=%d ftr=%d batch=%d\n",
+			printf("[RX-TIMEOUT] No frames decoded. cfg=%d Nsymb=%d M=%.0f nBits=%d ftr=%d batch=%d timeout=%d\n",
 				current_configuration,
 				telecom_system->data_container.Nsymb,
 				telecom_system->M,
 				telecom_system->data_container.nBits,
 				telecom_system->data_container.frames_to_read.load(),
-				data_batch_size);
+				data_batch_size,
+				receiving_timeout);
 			fflush(stdout);
+
+			// Restart timer so we can receive the next CMD retransmit.
+			// Without this, the stopped timer returns 0 forever and the
+			// RSP is stuck in RECEIVING (0 < timeout always true, but
+			// the else block never triggers again).
+			calculate_receiving_timeout();
+			receiving_timer.start();
 		}
 
 		// If we responded to HAIL but START_CONNECTION never arrived,
@@ -611,19 +654,42 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				}
 			}
 
-			// Turboshift: start probing reverse direction as new commander.
-			// Skip TURBO_REVERSE when --skip-turbo-reverse is set.
-			// Otherwise, proceed with reverse probe (roles swapped, responder probes).
-			if(skip_turbo_reverse && turboshift_phase == TURBO_FORWARD && gear_shift_on == YES)
+			// Turboshift: decide whether to probe the reverse direction.
+			// skip_turbo_reverse: skip entirely (symmetric assumption).
+			// Otherwise: start at forward-settled config and verify (fast on
+			// symmetric channels, falls back on asymmetric).
+			if(has_asymmetric && turboshift_phase == TURBO_FORWARD && gear_shift_on == YES)
 			{
-				turboshift_phase = TURBO_DONE;
-				turboshift_active = false;
-				turbo_snr_ack_enabled = false;
-				turbo_received_snr = -99.0f;
-				printf("[TURBO] Skipping REVERSE probe (--skip-turbo-reverse, forward ceiling=%d), DONE\n",
-					pre_switch_config);
-				fflush(stdout);
-				this->connection_status = TRANSMITTING_DATA;
+				if(skip_turbo_reverse)
+				{
+					// Skip reverse probe — assume reverse path matches forward.
+					turboshift_phase = TURBO_DONE;
+					turboshift_active = false;
+					turbo_snr_ack_enabled = false;
+					printf("[TURBO] REVERSE: skipped (skip_turbo_reverse)\n");
+					fflush(stdout);
+					this->connection_status = TRANSMITTING_DATA;
+				}
+				else
+				{
+					// Start reverse probe at forward-settled config (not ROBUST_0).
+					// If symmetric, first probe succeeds immediately. If asymmetric,
+					// the normal ladder fall-back handles it.
+					turboshift_phase = TURBO_REVERSE;
+					turboshift_active = true;
+					turboshift_last_good = pre_switch_config;
+					turbo_snr_ack_enabled = true;
+					turbo_received_snr = -99.0f;
+
+					negotiated_configuration = config_ladder_up_n(
+						current_configuration, 1, robust_enabled,
+						narrowband_enabled == YES);
+					printf("[TURBO] Phase: REVERSE — probing from config %d -> %d\n",
+						current_configuration, negotiated_configuration);
+					fflush(stdout);
+					add_message_control(SET_CONFIG);
+					this->connection_status = TRANSMITTING_CONTROL;
+				}
 			}
 			else if(has_asymmetric &&
 				(turboshift_phase == TURBO_REVERSE || turboshift_phase == TURBO_DONE))
@@ -685,6 +751,10 @@ void cl_arq_controller::process_messages_acknowledging_control()
 
 void cl_arq_controller::process_messages_acknowledging_data()
 {
+	printf("[RSP-RX-TIMEOUT] Entering ACK-GATE: rx_count=%d timeout=%d batch=%d\n",
+		batch_rx_frame_count, receiving_timeout, data_batch_size);
+	fflush(stdout);
+
 	int nAck_messages=0;
 	receiving_timer.stop();
 	receiving_timer.reset();
@@ -761,7 +831,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					// Send SACK pattern with bitmap suffix
 					send_sack_pattern(sack_bitmap, data_batch_size);
 
-					// Keep partial messages_rx (DON'T free) — retransmit fills gaps
+					// Keep partial messages_rx (DON'T free) - retransmit fills gaps
 					stats.nNAcked_data++;
 					batch_rx_frame_count = 0;
 					last_received_end_of_batch_seq = -1;
@@ -770,6 +840,16 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					telecom_system->set_mfsk_ctrl_mode(false);
 					telecom_system->data_container.nUnder_processing_events = 0;
 					calculate_receiving_timeout();
+					// Post-SACK timeout: cover CMD listen + CMD retransmit TX.
+					// 1.5x is enough: CMD extended listen (~7.8s) + retransmit
+					// (~9.85s) = ~17.6s cycle. 1.5x * 9850 = 14775ms, so RSP
+					// responds before CMD's next retransmit TX starts.
+					// (Was 2x=19700ms which exceeded CMD cycle, causing RSP ACK
+					// to arrive during CMD retransmit TX — half-duplex collision.)
+					receiving_timeout = receiving_timeout * 3 / 2;
+					printf("[RSP-POST-SACK] timeout=%dms (1.5x normal for retransmit)\n",
+						receiving_timeout);
+					fflush(stdout);
 					receiving_timer.start();
 					connection_status=RECEIVING;
 					return;
@@ -778,7 +858,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				printf("[ACK-GATE] Suppressing: received %d/%d (expected %d)\n",
 					rx_received, data_batch_size, expected);
 				fflush(stdout);
-				// Keep partial messages_rx (DON'T free) — add_message_rx_data
+				// Keep partial messages_rx (DON'T free) - add_message_rx_data
 				// overwrites unconditionally, so retransmit fills in missing
 				// frames while already-received frames are preserved.
 				stats.nNAcked_data++;
@@ -793,7 +873,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				// while frames are still arriving, resetting to 0 causes
 				// re-decode of already-received frames. Keep position so
 				// the decode loop continues forward through the buffer.
-				// Return to RECEIVING — commander will timeout and retransmit
+				// Return to RECEIVING - commander will timeout and retransmit
 				calculate_receiving_timeout();
 				receiving_timer.start();
 				connection_status=RECEIVING;
@@ -1246,8 +1326,18 @@ void cl_arq_controller::process_control_responder()
 			sack_enabled = both_sack;
 			if(sack_enabled)
 			{
-				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d)\n",
-					radio_batch_size, crypto_batch_size, retransmit_headroom);
+				// Update batch size now that SACK is negotiated
+				int max_batch = (message_transmission_time_ms > 0)
+					? (int)(12000.0 / message_transmission_time_ms + 0.5) : 31;
+				if(max_batch < 5) max_batch = 5;
+				if(max_batch > nMessages) max_batch = nMessages;
+				int new_batch = radio_batch_size;
+				if(new_batch > max_batch) new_batch = max_batch;
+				set_data_batch_size(new_batch);
+				nominal_batch_size = new_batch;
+				recalculate_ack_timeout_for_batch();
+				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
+					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
 			}
 			else
 			{
@@ -1790,5 +1880,3 @@ void cl_arq_controller::process_buffer_data_responder()
 
 	}
 }
-
-

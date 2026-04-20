@@ -270,6 +270,60 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
   			// Pre-allocate V_pos workspace for SPA decoder (eliminates per-frame heap churn)
   			V_pos=CNEW(int, P*Cwidth, "ldpc.V_pos");
   		}
+  		else if(N==MERCURY_SACK)
+  		{
+  			if(K==32)//rate == 4/16 (1/4)
+  			{
+  				Cwidth=mercury_sack_Cwidth_4_16;
+  				Vwidth=mercury_sack_Vwidth_4_16;
+  				dwidth=mercury_sack_dwidth_4_16;
+  				QCmatrixC=&mercury_sack_QCmatrixC_4_16[0][0];
+  				QCmatrixEnc=&mercury_sack_QCmatrixEnc_4_16[0][0];
+  				QCmatrixV=&mercury_sack_QCmatrixV_4_16[0][0];
+  				QCmatrixd=&mercury_sack_QCmatrixd_4_16[0];
+  				R=CNEW(double, N*Vwidth, "ldpc.R");
+  				Q=CNEW(double, N*Vwidth, "ldpc.Q");
+  			}
+  			else
+  			{
+  				std::cout<<"SACK LDPC: K="<<K<<" unsupported"<<std::endl;
+  				success=-1;
+  				exit(1);
+  			}
+  			if(R==NULL || Q==NULL)
+  			{
+  				std::cout<<"Memory allocation error"<<std::endl;
+  				exit(2);
+  			}
+  			V_pos=CNEW(int, P*Cwidth, "ldpc.V_pos");
+  		}
+  		else if(N==MERCURY_SACK_LONG)
+  		{
+  			if(K==32)//rate == 2/16 (1/8)
+  			{
+  				Cwidth=mercury_sack_Cwidth_2_16;
+  				Vwidth=mercury_sack_Vwidth_2_16;
+  				dwidth=mercury_sack_dwidth_2_16;
+  				QCmatrixC=&mercury_sack_QCmatrixC_2_16[0][0];
+  				QCmatrixEnc=&mercury_sack_QCmatrixEnc_2_16[0][0];
+  				QCmatrixV=&mercury_sack_QCmatrixV_2_16[0][0];
+  				QCmatrixd=&mercury_sack_QCmatrixd_2_16[0];
+  				R=CNEW(double, N*Vwidth, "ldpc.R");
+  				Q=CNEW(double, N*Vwidth, "ldpc.Q");
+  			}
+  			else
+  			{
+  				std::cout<<"SACK LDPC: K="<<K<<" unsupported"<<std::endl;
+  				success=-1;
+  				exit(1);
+  			}
+  			if(R==NULL || Q==NULL)
+  			{
+  				std::cout<<"Memory allocation error"<<std::endl;
+  				exit(2);
+  			}
+  			V_pos=CNEW(int, P*Cwidth, "ldpc.V_pos");
+  		}
 
   	}
   	return success;

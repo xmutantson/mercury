@@ -26,15 +26,15 @@ for arg in "$@"; do
     esac
 done
 
+# Build directory (separate per mode to avoid cross-mode stale objects)
+BUILDDIR="build/${MODE}"
+mkdir -p "$BUILDDIR"
+
 # Clean function
 do_clean() {
     echo "Cleaning..."
-    rm -f mercury mercury.exe mercury_*.exe mercury_*
-    rm -f source/*.o source/datalink_layer/*.o source/physical_layer/*.o source/common/*.o
-    rm -f source/gui/*.o source/gui/widgets/*.o source/gui/dialogs/*.o
-    rm -f third_party/imgui/*.o third_party/imgui/backends/*.o
-    rm -f source/audioio/*.o source/audioio/*.a source/audioio/ffaudio/ffaudio/*.o
-    rm -f source/crypto/*.o source/crypto/mlkem/*.o
+    rm -f mercury mercury.exe mercury_*.exe
+    rm -rf build/
     echo "Clean done."
 }
 
@@ -43,9 +43,10 @@ if [ "$CLEAN" = "1" ] && [ "$MODE" = "clean" ]; then
     exit 0
 fi
 
-# Always clean — build.sh doesn't track header dependencies,
-# so stale .o files cause struct layout ABI mismatches.
-do_clean
+if [ "$CLEAN" = "1" ]; then
+    do_clean
+    mkdir -p "$BUILDDIR"
+fi
 
 # Set optimization flags based on mode
 case "$MODE" in
@@ -174,6 +175,106 @@ else
     OUTPUT="mercury${SUFFIX}"
 fi
 
+# Parallel job count
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+# --- Dependency-tracked parallel compilation ---
+# Uses gcc -MMD to generate .d files alongside .o files.
+# On rebuild, only files whose source or headers changed are recompiled.
+
+PIDS=()
+FAIL=0
+OBJ_FILES=""
+
+# Wait for background jobs, enforcing max parallelism
+wait_slot() {
+    while [ ${#PIDS[@]} -ge "$NPROC" ]; do
+        # Wait for any one child to finish
+        local new_pids=()
+        for pid in "${PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                new_pids+=("$pid")
+            else
+                wait "$pid" || FAIL=1
+            fi
+        done
+        if [ ${#new_pids[@]} -ge "$NPROC" ]; then
+            # All still running — wait for one
+            wait -n 2>/dev/null || {
+                # wait -n not available (older bash) — wait for all
+                for pid in "${PIDS[@]}"; do wait "$pid" || FAIL=1; done
+                PIDS=()
+                return
+            }
+            # Reap finished
+            new_pids=()
+            for pid in "${PIDS[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    new_pids+=("$pid")
+                else
+                    wait "$pid" || FAIL=1
+                fi
+            done
+        fi
+        PIDS=("${new_pids[@]}")
+    done
+}
+
+wait_all() {
+    for pid in "${PIDS[@]}"; do
+        wait "$pid" || FAIL=1
+    done
+    PIDS=()
+    if [ "$FAIL" = "1" ]; then
+        echo "*** Compilation failed"
+        exit 1
+    fi
+}
+
+# needs_rebuild SRC OBJ — true if obj is missing, src is newer, or any dep header changed
+needs_rebuild() {
+    local src="$1" obj="$2"
+    [ ! -f "$obj" ] && return 0
+    [ "$src" -nt "$obj" ] && return 0
+    # Check gcc-generated dependency file
+    local dep="${obj%.o}.d"
+    if [ -f "$dep" ]; then
+        # .d file lists obj: src header1 header2 ...
+        # Check if any dependency is newer than obj
+        while IFS= read -r line; do
+            # Remove backslash continuations and the target prefix
+            line="${line%\\}"
+            line="${line#*: }"
+            for f in $line; do
+                [ -f "$f" ] && [ "$f" -nt "$obj" ] && return 0
+            done
+        done < "$dep"
+    else
+        # No dep file — must rebuild to generate it
+        return 0
+    fi
+    return 1
+}
+
+# compile_cc SRC OBJ [extra flags...] — compile one C++ file
+compile_cc() {
+    local src="$1" obj="$2"; shift 2
+    local dep="${obj%.o}.d"
+    $CXX $CXXFLAGS -MMD -MF "$dep" "$@" -c -o "$obj" "$src"
+}
+
+# compile_c SRC OBJ [extra flags...] — compile one C file
+compile_c() {
+    local src="$1" obj="$2"; shift 2
+    local dep="${obj%.o}.d"
+    $CC $CFLAGS -MMD -MF "$dep" "$@" -c -o "$obj" "$src"
+}
+
+# Map source path to build dir obj path: source/foo/bar.cc -> build/MODE/source/foo/bar.o
+obj_path() {
+    echo "${BUILDDIR}/${1%.*}.o"
+}
+
 # Source files
 CPP_SOURCES="
 source/main.cc
@@ -206,6 +307,8 @@ source/physical_layer/mercury_normal_6_16.cc
 source/physical_layer/mercury_normal_8_16.cc
 source/physical_layer/mercury_normal_10_16.cc
 source/physical_layer/mercury_normal_12_16.cc
+source/physical_layer/mercury_sack_4_16.cc
+source/physical_layer/mercury_sack_2_16.cc
 source/physical_layer/misc.cc
 source/physical_layer/ofdm.cc
 source/physical_layer/physical_config.cc
@@ -268,90 +371,118 @@ source/audioio/ffaudio/ffaudio/pulse.c
 "
 fi
 
-# Build C++ sources
-echo "Compiling C++ sources..."
-OBJ_FILES=""
+# Create build subdirectories
+for src in $CPP_SOURCES $IMGUI_SOURCES $AUDIO_C_SOURCES $COMPRESSION_C_SOURCES $CRYPTO_C_SOURCES; do
+    mkdir -p "${BUILDDIR}/$(dirname "$src")"
+done
+
+# --- Compile all sources in parallel ---
+COMPILED=0
+
+echo "Compiling ($NPROC parallel jobs)..."
+
+# C++ sources
 for src in $CPP_SOURCES; do
-    obj="${src%.cc}.o"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
-        echo "  $src"
-        $CXX $CXXFLAGS -c -o "$obj" "$src"
-    fi
+    obj=$(obj_path "$src")
     OBJ_FILES="$OBJ_FILES $obj"
+    if needs_rebuild "$src" "$obj"; then
+        echo "  $src"
+        wait_slot
+        compile_cc "$src" "$obj" &
+        PIDS+=($!)
+        ((COMPILED++)) || true
+    fi
 done
 
-# Build ImGui sources
-echo "Compiling ImGui..."
+# ImGui sources (.cpp)
 for src in $IMGUI_SOURCES; do
-    obj="${src%.cpp}.o"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
-        echo "  $src"
-        $CXX $CXXFLAGS -c -o "$obj" "$src"
-    fi
+    obj=$(obj_path "$src")
     OBJ_FILES="$OBJ_FILES $obj"
-done
-
-# Build audio sources
-echo "Compiling audio subsystem..."
-mkdir -p source/audioio/ffaudio/ffaudio
-for src in $AUDIO_C_SOURCES; do
-    obj="${src%.c}.o"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
+    if needs_rebuild "$src" "$obj"; then
         echo "  $src"
-        if [[ "$src" == *audioio.c ]]; then
-            # audioio.c includes C++ headers, must compile as C++
-            $CXX $CXXFLAGS -c -o "$obj" "$src"
-        elif [[ "$src" == *.cc ]]; then
-            $CXX $CXXFLAGS -c -o "$obj" "$src"
-        else
-            $CC $CFLAGS -c -o "$obj" "$src"
-        fi
+        wait_slot
+        compile_cc "$src" "$obj" &
+        PIDS+=($!)
+        ((COMPILED++)) || true
     fi
 done
 
-# Create audioio.a
-echo "Creating audioio.a..."
+# Audio sources
 AUDIO_OBJ_FILES=""
 for src in $AUDIO_C_SOURCES; do
-    AUDIO_OBJ_FILES="$AUDIO_OBJ_FILES ${src%.c}.o"
+    obj=$(obj_path "$src")
+    AUDIO_OBJ_FILES="$AUDIO_OBJ_FILES $obj"
+    if needs_rebuild "$src" "$obj"; then
+        echo "  $src"
+        wait_slot
+        if [[ "$src" == *audioio.c ]]; then
+            # audioio.c includes C++ headers, must compile as C++
+            compile_cc "$src" "$obj" &
+        else
+            compile_c "$src" "$obj" &
+        fi
+        PIDS+=($!)
+        ((COMPILED++)) || true
+    fi
 done
-ar rc source/audioio/audioio.a $AUDIO_OBJ_FILES
 
-# Build compression library C sources (PPMd8, zstd, LZHUF)
-echo "Compiling compression libraries..."
+# Compression C sources
 COMPRESS_OBJ_FILES=""
 for src in $COMPRESSION_C_SOURCES; do
-    obj="${src%.c}.o"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
+    obj=$(obj_path "$src")
+    COMPRESS_OBJ_FILES="$COMPRESS_OBJ_FILES $obj"
+    if needs_rebuild "$src" "$obj"; then
         echo "  $src"
         EXTRA_C=""
         if [[ "$src" == *lzhuf.c ]]; then
             EXTRA_C="-DLZHUF -DB2F"
         fi
-        $CC $CFLAGS -Wno-extra -Wno-sign-compare -Wno-implicit-fallthrough $EXTRA_C -c -o "$obj" "$src"
+        wait_slot
+        compile_c "$src" "$obj" -Wno-extra -Wno-sign-compare -Wno-implicit-fallthrough $EXTRA_C &
+        PIDS+=($!)
+        ((COMPILED++)) || true
     fi
-    COMPRESS_OBJ_FILES="$COMPRESS_OBJ_FILES $obj"
 done
 
-# Build crypto C sources (monocypher, ML-KEM-768)
-echo "Compiling crypto libraries..."
+# Crypto C sources
 CRYPTO_OBJ_FILES=""
 for src in $CRYPTO_C_SOURCES; do
-    obj="${src%.c}.o"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$CLEAN" = "1" ]; then
+    obj=$(obj_path "$src")
+    CRYPTO_OBJ_FILES="$CRYPTO_OBJ_FILES $obj"
+    if needs_rebuild "$src" "$obj"; then
         echo "  $src"
         EXTRA_C=""
         if [[ "$src" == *mlkem_native.c ]]; then
             EXTRA_C="-I./source/crypto/mlkem -DMLK_CONFIG_PARAMETER_SET=768"
         fi
-        $CC $CFLAGS -Wno-extra -Wno-sign-compare $EXTRA_C -c -o "$obj" "$src"
+        wait_slot
+        compile_c "$src" "$obj" -Wno-extra -Wno-sign-compare $EXTRA_C &
+        PIDS+=($!)
+        ((COMPILED++)) || true
     fi
-    CRYPTO_OBJ_FILES="$CRYPTO_OBJ_FILES $obj"
 done
+
+# Wait for all compilations to finish
+wait_all
+
+if [ "$COMPILED" -eq 0 ]; then
+    # Check if output exists and is up to date
+    if [ -f "$OUTPUT" ]; then
+        echo "  (nothing changed)"
+        echo "=== Build complete: $OUTPUT ==="
+        ls -la "$OUTPUT"
+        exit 0
+    fi
+fi
+
+echo "  $COMPILED files compiled"
+
+# Create audioio.a
+ar rc "${BUILDDIR}/audioio.a" $AUDIO_OBJ_FILES
 
 # Link
 echo "Linking $OUTPUT..."
-$CXX -o "$OUTPUT" $OBJ_FILES $COMPRESS_OBJ_FILES $CRYPTO_OBJ_FILES source/audioio/audioio.a $LDFLAGS
+$CXX -o "$OUTPUT" $OBJ_FILES $COMPRESS_OBJ_FILES $CRYPTO_OBJ_FILES "${BUILDDIR}/audioio.a" $LDFLAGS
 
 echo "=== Build complete: $OUTPUT ==="
 ls -la "$OUTPUT"

@@ -26,6 +26,8 @@
 #include <complex>
 #include <cmath>
 
+class cl_ldpc;
+
 #define MOD_MFSK 200
 
 class cl_mfsk
@@ -80,10 +82,10 @@ public:
 	// SACK bitmap suffix: encodes which frames in a batch were received.
 	// Each MFSK symbol carries log2(M) bits. Bitmap packed LSB-first.
 	// WB: 2x repetition for reliability. NB: no repetition (Sidelnikov diversity).
-	static const int MAX_SACK_BITMAP_SYMBOLS = 14; // Max: M=16, batch=25, 7 sym × 2 reps
-	int sack_bitmap_nsuffix(int nframes) const;  // Total suffix symbols for given batch size
-	int sack_total_nsymb(int nframes) const { return ack_pattern_nsymb + sack_bitmap_nsuffix(nframes); }
-	void encode_sack_bitmap(const bool* received, int nframes, int* out_tones) const;
+	static const int MAX_SACK_BITMAP_SYMBOLS = 32; // Max: LDPC N=128, M=16, 128/4=32 tones
+	int sack_bitmap_nsuffix(int nframes, cl_ldpc* sack_ldpc = nullptr) const;  // Total suffix symbols for given batch size
+	int sack_total_nsymb(int nframes, cl_ldpc* sack_ldpc = nullptr) const { return ack_pattern_nsymb + sack_bitmap_nsuffix(nframes, sack_ldpc); }
+	void encode_sack_bitmap(const bool* received, int nframes, int* out_tones, cl_ldpc* sack_ldpc = nullptr) const;
 	void decode_sack_bitmap(const int* suffix_tones, int nsuffix, int nframes, bool* out_received) const;
 
 	// Generate SACK pattern: base + bitmap suffix
@@ -91,7 +93,8 @@ public:
 
 	// Generate SACK pattern with bitmap suffix appended
 	void generate_sack_bitmap_pattern(std::complex<double>* pattern_out,
-	                                   const bool* received, int nframes);
+	                                   const bool* received, int nframes,
+	                                   cl_ldpc* sack_ldpc = nullptr);
 
 	// SNR suffix for turboshift ACK: 8 extra symbols encoding quantized SNR.
 	// WB (M=16): tone 0-15 → SNR = tone*2 - 5 dB (range -5 to +25 dB, 2 dB step)
