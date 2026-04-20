@@ -3433,6 +3433,9 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 		     d += interpolation_rate)
 		{
 			if (d < 0) continue;
+			// Ensure suffix (reserve_after) fits within buffer
+			if (reserve_after > 0 && d + total_needed * sym_period_interp > buffer_size_interp)
+				continue;
 
 			double metric_f = 0;
 			int matched_f = 0;
@@ -3604,6 +3607,99 @@ void cl_ofdm::decode_suffix_tones(std::complex<double>* baseband_interp, int buf
 		int hop = (abs_s * tone_hop_step) % mfsk_M;
 		int data_tone = (best_tone - hop + mfsk_M * 256) % mfsk_M;
 		out_tones[s] = data_tone;
+
+		// Diagnostic: show top-3 tones and their energies
+		if(suffix_len > 0 && s < 3)
+		{
+			double energies[32];
+			for(int t2 = 0; t2 < mfsk_M && t2 < 32; t2++)
+			{
+				double ec = 0;
+				for(int st2 = 0; st2 < nStreams; st2++)
+				{
+					int sub2 = stream_offsets[st2] + t2;
+					int b2 = (sub2 < half) ? Nfft - half + sub2
+					                       : start_shift + (sub2 - half);
+					double e2 = fft_out[b2].real()*fft_out[b2].real() + fft_out[b2].imag()*fft_out[b2].imag();
+					ec += e2;
+				}
+				energies[t2] = ec;
+			}
+			printf("[SUFFIX-FFT] s=%d abs_s=%d offset=%d best_phys=%d(e=%.2f) hop=%d data=%d",
+				s, abs_s, offset, best_tone, best_energy, hop, data_tone);
+			// Print all tone energies for comparison
+			printf(" energies:");
+			for(int t2 = 0; t2 < mfsk_M && t2 < 16; t2++)
+				printf(" %d:%.1f", t2, energies[t2]);
+			printf("\n"); fflush(stdout);
+		}
+	}
+}
+
+void cl_ofdm::decode_suffix_tones_soft(std::complex<double>* baseband_interp, int buffer_size_interp,
+	int interpolation_rate, int pattern_offset, int pattern_nsymb,
+	int suffix_len, int tone_hop_step, int mfsk_M,
+	int nStreams, const int* stream_offsets,
+	float* out_energies, int* out_hard_tones)
+{
+	int Nofdm_local = Nfft + Ngi;
+	int sym_period_interp = Nofdm_local * interpolation_rate;
+	int half = Nc / 2;
+
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+
+	for (int s = 0; s < suffix_len; s++)
+	{
+		// Zero out energies for this symbol
+		for (int m = 0; m < mfsk_M; m++)
+			out_energies[s * mfsk_M + m] = 0.0f;
+		if (out_hard_tones) out_hard_tones[s] = -1;
+
+		int abs_s = pattern_nsymb + s;  // absolute symbol index (for tone hopping)
+		int offset = pattern_offset + abs_s * sym_period_interp + Ngi * interpolation_rate;
+		if (offset + Nfft * interpolation_rate > buffer_size_interp)
+			continue;
+
+		// Decimate and FFT
+		for (int i = 0; i < Nfft; i++)
+			decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+		fft(decimated_sym, fft_out, Nfft);
+
+		// Collect energy for ALL M bins across all streams
+		double raw_energy[64]; // M <= 64
+		for (int t = 0; t < mfsk_M; t++)
+		{
+			double e_combined = 0;
+			for (int st = 0; st < nStreams; st++)
+			{
+				int sub = stream_offsets[st] + t;
+				int b = (sub < half) ? Nfft - half + sub
+				                     : start_shift + (sub - half);
+				double e = fft_out[b].real() * fft_out[b].real() +
+				           fft_out[b].imag() * fft_out[b].imag();
+				e_combined += e;
+			}
+			raw_energy[t] = e_combined;
+		}
+
+		// Reverse tone hopping: data_energy[m] = raw_energy[(m + hop) % M]
+		int hop = (abs_s * tone_hop_step) % mfsk_M;
+		double best_energy = -1.0;
+		int best_tone = 0;
+		for (int m = 0; m < mfsk_M; m++)
+		{
+			int actual = (m + hop) % mfsk_M;
+			double e = raw_energy[actual];
+			out_energies[s * mfsk_M + m] = (float)e;
+			if (e > best_energy)
+			{
+				best_energy = e;
+				best_tone = m;
+			}
+		}
+
+		if (out_hard_tones) out_hard_tones[s] = best_tone;
 	}
 }
 

@@ -275,6 +275,7 @@ int main(int argc, char *argv[])
     int tx_channel_cli = -1;          // -1 = use default; 0=LEFT, 1=RIGHT, 2=STEREO
     bool monitor_stdout = false;      // --stdout: output decoded plaintext to stdout
     bool skip_turbo_reverse = false;  // --skip-turbo-reverse: skip TURBO_REVERSE phase
+    int max_config_cli = -1;          // --max-config: hard ceiling on turboshift
     int ptt_delay_cli = -1;           // --ptt-delay: override both PTT on/off delays (ms)
     int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
     int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
@@ -334,6 +335,7 @@ int main(int argc, char *argv[])
         printf("  -z                List available sound devices\n");
 
         printf("  --skip-turbo-reverse  Skip TURBO_REVERSE phase (benchmark mode)\n");
+        printf("  --max-config [N]      Hard ceiling on turboshift (0-15, default: no limit)\n");
         printf("  --ptt-delay [ms]  Override PTT on/off delay (0 for no-PTT setups)\n");
         printf("\nModulation and bandwidth:\n");
         printf("  -s [config]       Modulation: 0-16 (OFDM), 100-102 (ROBUST MFSK). Use -l to list.\n");
@@ -445,6 +447,17 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++)
                 argv[j] = argv[j + 1];
             argc -= 1;
+            i--;
+        }
+        else if (strcmp(argv[i], "--max-config") == 0 && i + 1 < argc)
+        {
+            max_config_cli = atoi(argv[i + 1]);
+            if (max_config_cli < 0) max_config_cli = 0;
+            if (max_config_cli > 15) max_config_cli = 15;
+            printf("Turboshift: max config capped at CONFIG_%d\n", max_config_cli);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         }
         else if (strcmp(argv[i], "--ptt-delay") == 0 && i + 1 < argc)
@@ -1170,6 +1183,8 @@ start_modem:
             ARQ.narrowband_enabled = YES;  // Normal: start NB, negotiate WB via probe
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
+        ARQ.skip_turbo_reverse = skip_turbo_reverse;
+        ARQ.max_config_override = max_config_cli;
         // Encryption: CLI -E overrides INI setting
         ARQ.encryption_mode = (encryption_mode_cli >= 0) ? encryption_mode_cli : g_settings.encryption_mode;
         if (ARQ.encryption_mode != ENCRYPT_OFF)
@@ -1189,6 +1204,7 @@ start_modem:
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL;
         ARQ.force_compress = (force_compress_cli == 1);
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
+        ARQ.max_config_override = max_config_cli;
         // Encryption: CLI -E flag
         ARQ.encryption_mode = (encryption_mode_cli >= 0) ? encryption_mode_cli : ENCRYPT_OFF;
         if (ARQ.encryption_mode != ENCRYPT_OFF)

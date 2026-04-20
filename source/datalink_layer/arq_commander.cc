@@ -596,23 +596,7 @@ void cl_arq_controller::process_messages_tx_control()
 		pad_messages_batch_tx(control_batch_size);
 		send_batch();
 
-		// Flush self-echo from BOTH the circular capture buffer and the
-		// sliding passband buffer. On VB-Cable loopback, the CMD hears its
-		// own 9-second TX as self-echo filling the ring buffer. Without
-		// flushing capture_buffer, the capture thread drains stale self-echo
-		// into passband_delayed_data BEFORE real-time audio (the RSP's ACK)
-		// arrives — so the ACK is buried behind seconds of backlog. (Bug #38)
-		circular_buf_reset(capture_buffer);
-		{
-			MUTEX_LOCK(&capture_prep_mutex);
-			int signal_period = telecom_system->data_container.Nofdm
-				* telecom_system->data_container.buffer_Nsymb
-				* telecom_system->data_container.interpolation_rate;
-			memset(telecom_system->data_container.passband_delayed_data, 0,
-				2 * signal_period * sizeof(double));
-			telecom_system->data_container.ring_write_index = 0;
-			MUTEX_UNLOCK(&capture_prep_mutex);
-		}
+		// Post-TX flush handled inside send_batch() via rx_mute.
 
 		if(messages_control.data[0] == KEY_EXCHANGE_1)
 		{
@@ -758,7 +742,10 @@ void cl_arq_controller::process_messages_tx_data()
 			messages_batch_tx[message_batch_counter_tx].nResends = nResends;
 			messages_batch_tx[message_batch_counter_tx].ack_timeout = ack_timeout_data;
 			messages_batch_tx[message_batch_counter_tx].status = ADDED_TO_BATCH_BUFFER;
-			messages_batch_tx[message_batch_counter_tx].sequence_number = r;
+			// Use ORIGINAL sequence number so responder places frame in correct slot.
+			// Do NOT set end-of-batch flag — RSP already has the expected count
+			// from the original batch's compression header or end-of-batch frame.
+			messages_batch_tx[message_batch_counter_tx].sequence_number = retransmit_frame_positions[r];
 			message_batch_counter_tx++;
 			stats.nReSent_data++;
 			last_transmission_block_stats.nReSent_data++;
@@ -776,29 +763,26 @@ void cl_arq_controller::process_messages_tx_data()
 
 		telecom_system->set_mfsk_ctrl_mode(false);
 		pad_messages_batch_tx(message_batch_counter_tx); // No padding needed — exact count
+		sack_retransmit_active = true;
 		send_batch();
+		sack_retransmit_active = false;
 
 		stats.nBatches_sent++;
 		last_transmission_block_stats.nBatches_sent++;
 
-		// Post-TX: same as normal path (flush, timeout, etc.)
-		circular_buf_reset(capture_buffer);
-		{
-			MUTEX_LOCK(&capture_prep_mutex);
-			int signal_period = telecom_system->data_container.Nofdm
-				* telecom_system->data_container.buffer_Nsymb
-				* telecom_system->data_container.interpolation_rate;
-			memset(telecom_system->data_container.passband_delayed_data, 0,
-				2 * signal_period * sizeof(double));
-			telecom_system->data_container.ring_write_index = 0;
-			MUTEX_UNLOCK(&capture_prep_mutex);
-		}
+		// Post-TX flush handled inside send_batch() via rx_mute.
 
 		if(ack_pattern_time_ms > 0)
 			telecom_system->data_container.frames_to_read = 4;
 		data_ack_received = NO;
 		connection_status = RECEIVING_ACKS_DATA;
+		ack_diag_peak_matched = 0;
+		ack_diag_peak_metric = 0.0;
+		ack_diag_poll_count = 0;
 		calculate_receiving_timeout();
+		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
+			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
+		fflush(stdout);
 		receiving_timer.start();
 		return;
 	}
@@ -850,18 +834,7 @@ void cl_arq_controller::process_messages_tx_data()
 		stats.nBatches_sent++;
 		last_transmission_block_stats.nBatches_sent++;
 
-		// Flush self-echo from both ring buffer and sliding buffer (Bug #38).
-		circular_buf_reset(capture_buffer);
-		{
-			MUTEX_LOCK(&capture_prep_mutex);
-			int signal_period = telecom_system->data_container.Nofdm
-				* telecom_system->data_container.buffer_Nsymb
-				* telecom_system->data_container.interpolation_rate;
-			memset(telecom_system->data_container.passband_delayed_data, 0,
-				2 * signal_period * sizeof(double));
-			telecom_system->data_container.ring_write_index = 0;
-			MUTEX_UNLOCK(&capture_prep_mutex);
-		}
+		// Post-TX flush handled inside send_batch() via rx_mute.
 
 		if(ack_pattern_time_ms > 0)
 		{
@@ -877,12 +850,18 @@ void cl_arq_controller::process_messages_tx_data()
 		}
 		data_ack_received=NO;
 		connection_status=RECEIVING_ACKS_DATA;
+		ack_diag_peak_matched = 0;
+		ack_diag_peak_metric = 0.0;
+		ack_diag_poll_count = 0;
 		// ACK pattern detection uses dedicated ack_mfsk — no config switch needed
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
 		// Recalculate timeout: guard delays from prior ACK detection can leave
 		// receiving_timeout stale, too short for the next ACK round-trip.
 		calculate_receiving_timeout();
+		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
+			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
+		fflush(stdout);
 		receiving_timer.start();
 	}
 }
@@ -1098,14 +1077,16 @@ void cl_arq_controller::process_messages_rx_acks_control()
 							snr_target = cfg_ceiling;
 						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
 							snr_target = supershift_proven_ceiling;
+						if(max_config_override >= 0 && snr_target > max_config_override)
+							snr_target = max_config_override;
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 					{
 						negotiated_configuration = snr_target;
 						printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d/%d)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling, max_config_override);
 					}
 					else
 					{
@@ -1417,15 +1398,99 @@ void cl_arq_controller::process_messages_rx_acks_data()
 	{
 		if(ack_pattern_time_ms > 0)
 		{
-			// Detect ACK tone pattern
-			// Only check while waiting — once detected, stop to avoid
-			// buffer zeroing that destroys the next frame's preamble.
-			if(data_ack_received==NO && receive_ack_pattern())
+			// Detection strategy: check SACK alongside ACK from the start.
+			// The ACK cross-check inside receive_sack_pattern() prevents
+			// false SACK triggers. We only require a short minimum delay
+			// (ack_pattern_time_ms) so the RSP has time to send its response.
+			// CRITICAL: the ring buffer is only ~3.4s (buffer_Nsymb=139 symbols).
+			// The old deferral of 2*msg_tx_time+ack_pat_time (8200ms for CONFIG_15)
+			// meant SACK audio was overwritten by silence before we ever looked.
+			bool sack_window_open = sack_enabled && data_ack_received == NO
+				&& receiving_timer.get_elapsed_time_ms() > (unsigned int)(ack_pattern_time_ms);
+
+			bool sack_detected = false;
+			bool sack_bitmap[MAX_SACK_BATCH_SIZE];
+
+			if(sack_window_open)
+			{
+				memset(sack_bitmap, 0, sizeof(sack_bitmap));
+				sack_detected = receive_sack_pattern(sack_bitmap, data_batch_size);
+			}
+
+			if(sack_detected)
+			{
+				printf("[CMD-SACK] Partial batch ACK detected!\n");
+				printf("[CMD-SACK-DIAG] messages_tx status:");
+				for(int d = 0; d < data_batch_size; d++)
+					printf(" %d:%d", d, (int)messages_tx[d].status);
+				printf("\n");
+				fflush(stdout);
+				clear_buffer(playback_buffer);
+				link_timer.start();
+				watchdog_timer.start();
+				gear_shift_timer.stop();
+				gear_shift_timer.reset();
+
+				// Build retransmit queue: save missing frames' encrypted payloads
+				retransmit_count = 0;
+				int rx_count = 0;
+				for(int i = 0; i < nMessages; i++)
+				{
+					if(messages_tx[i].status != PENDING_ACK && messages_tx[i].status != ACK_TIMED_OUT)
+						continue;
+
+					if(i < data_batch_size && sack_bitmap[i])
+					{
+						// Frame received by responder — mark ACKED
+						messages_tx[i].status = ACKED;
+						stats.nAcked_data++;
+						rx_count++;
+					}
+					else if(retransmit_count < MAX_RETRANSMIT_HEADROOM)
+					{
+						// Frame missing — save encrypted payload for retransmit
+						int len = messages_tx[i].length;
+						if(len > MAX_SACK_FRAME_SIZE) len = MAX_SACK_FRAME_SIZE;
+						memcpy(retransmit_frames[retransmit_count], messages_tx[i].data, len);
+						retransmit_frame_lengths[retransmit_count] = len;
+						retransmit_frame_positions[retransmit_count] = i;
+						retransmit_frame_types[retransmit_count] = messages_tx[i].type;
+						retransmit_count++;
+						// Mark ACKED so cleanup() frees the slot (payload saved above)
+						messages_tx[i].status = ACKED;
+						stats.nAcked_data++;
+					}
+				}
+
+				printf("[CMD-SACK] %d/%d received, %d queued for retransmit\n",
+					rx_count, data_batch_size, retransmit_count);
+				fflush(stdout);
+
+				data_ack_received = YES;
+				stats.nBatches_acked++;
+				last_transmission_block_stats.nBatches_acked++;
+
+				if(messages_control.data[0]==REPEAT_LAST_ACK &&
+				   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
+				{
+					this->messages_control.ack_timeout=0;
+					this->messages_control.id=0;
+					this->messages_control.length=0;
+					this->messages_control.nResends=0;
+					this->messages_control.status=FREE;
+					this->messages_control.type=NONE;
+					stats.nAcked_control++;
+				}
+
+				// Guard delay (SACK is longer than ACK — extra margin)
+				int guard = ptt_off_delay_ms + 400;
+				receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
+			}
+			// ACK detection: check when SACK not detected (or before SACK window)
+			else if(data_ack_received==NO && receive_ack_pattern())
 			{
 				printf("[CMD-ACK-PAT] Data ACK pattern detected!\n");
 				fflush(stdout);
-				// Flush old batch audio from playback buffer so responder
-				// doesn't demodulate stale frames before the new batch.
 				clear_buffer(playback_buffer);
 				link_timer.start();
 				watchdog_timer.start();
@@ -1435,9 +1500,6 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;
 
-				// Pattern = ACK for all pending messages (batch_size=1).
-				// Also catch ACK_TIMED_OUT: update_status() may fire before
-				// the ACK pattern arrives within the receive window.
 				for(int i=0; i<nMessages; i++)
 				{
 					if(messages_tx[i].status==PENDING_ACK || messages_tx[i].status==ACK_TIMED_OUT)
@@ -1459,80 +1521,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				}
 
 				// Guard delay: wait for responder to finish full ACK TX + settle.
-				// ptt_off covers the radio TX→RX transition; +200ms margin.
 				int guard = ptt_off_delay_ms + 200;
 				receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
-			}
-			// SACK: if ACK not detected, try detecting SACK pattern (partial batch ACK)
-			else if(data_ack_received==NO && sack_enabled)
-			{
-				bool sack_bitmap[MAX_SACK_BATCH_SIZE];
-				memset(sack_bitmap, 0, sizeof(sack_bitmap));
-				if(receive_sack_pattern(sack_bitmap, data_batch_size))
-				{
-					printf("[CMD-SACK] Partial batch ACK detected!\n");
-					fflush(stdout);
-					clear_buffer(playback_buffer);
-					link_timer.start();
-					watchdog_timer.start();
-					gear_shift_timer.stop();
-					gear_shift_timer.reset();
-
-					// Build retransmit queue: save missing frames' encrypted payloads
-					retransmit_count = 0;
-					int rx_count = 0;
-					for(int i = 0; i < nMessages; i++)
-					{
-						if(messages_tx[i].status != PENDING_ACK && messages_tx[i].status != ACK_TIMED_OUT)
-							continue;
-
-						if(i < data_batch_size && sack_bitmap[i])
-						{
-							// Frame received by responder — mark ACKED
-							messages_tx[i].status = ACKED;
-							stats.nAcked_data++;
-							rx_count++;
-						}
-						else if(retransmit_count < MAX_RETRANSMIT_HEADROOM)
-						{
-							// Frame missing — save encrypted payload for retransmit
-							int len = messages_tx[i].length;
-							if(len > MAX_SACK_FRAME_SIZE) len = MAX_SACK_FRAME_SIZE;
-							memcpy(retransmit_frames[retransmit_count], messages_tx[i].data, len);
-							retransmit_frame_lengths[retransmit_count] = len;
-							retransmit_frame_positions[retransmit_count] = i;
-							retransmit_frame_types[retransmit_count] = messages_tx[i].type;
-							retransmit_count++;
-							// Mark ACKED so cleanup() frees the slot (payload saved above)
-							messages_tx[i].status = ACKED;
-							stats.nAcked_data++;
-						}
-					}
-
-					printf("[CMD-SACK] %d/%d received, %d queued for retransmit\n",
-						rx_count, data_batch_size, retransmit_count);
-					fflush(stdout);
-
-					data_ack_received = YES;
-					stats.nBatches_acked++;
-					last_transmission_block_stats.nBatches_acked++;
-
-					if(messages_control.data[0]==REPEAT_LAST_ACK &&
-					   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
-					{
-						this->messages_control.ack_timeout=0;
-						this->messages_control.id=0;
-						this->messages_control.length=0;
-						this->messages_control.nResends=0;
-						this->messages_control.status=FREE;
-						this->messages_control.type=NONE;
-						stats.nAcked_control++;
-					}
-
-					// Guard delay (SACK is longer than ACK — extra margin)
-					int guard = ptt_off_delay_ms + 400;
-					receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
-				}
 			}
 		}
 		else
@@ -1668,7 +1658,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// receive control frames while waiting for data). Skip directly to
 			// retransmit — avoids stuck loop where REPEAT_LAST_ACK was queued
 			// but never sent (connection_status stayed RECEIVING_ACKS_DATA).
-			printf("[CMD-ACK-PAT] Timeout: no ACK pattern detected, retransmitting\n");
+			printf("[CMD-ACK-PAT] Timeout: no ACK detected, peak_matched=%d/%d peak_metric=%.1f polls=%d\n",
+				ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold,
+				ack_diag_peak_metric, ack_diag_poll_count);
 			fflush(stdout);
 			stats.nNAcked_data++;
 			// Force all PENDING_ACK messages to ACK_TIMED_OUT so
@@ -1752,7 +1744,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				fflush(stdout);
 				emergency_previous_config = current_configuration;
 				emergency_break_active = 1;
-				emergency_break_retries = 1;
+				emergency_break_retries = 3;
 				send_break_pattern();
 				// Poll for ACK from responder
 				telecom_system->data_container.frames_to_read = 4;
@@ -1803,7 +1795,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		{
 			int proposed_frame = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
 			bool frame_ceiling_blocked = (supershift_proven_ceiling >= 0 &&
-				config_ladder_index(proposed_frame) > config_ladder_index(supershift_proven_ceiling));
+				config_ladder_index(proposed_frame) > config_ladder_index(supershift_proven_ceiling))
+				|| (max_config_override >= 0 && proposed_frame > max_config_override);
 		if(data_ack_received==YES && gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
 			messages_control.status==FREE &&
 			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
@@ -1875,6 +1868,10 @@ void cl_arq_controller::finish_turbo_direction()
 			start_config = config_ladder_down_n(snr_config, 2, robust_enabled);
 		else
 			start_config = config_ladder_down_n(turboshift_last_good, 2, robust_enabled);
+
+		// Enforce --max-config CLI ceiling
+		if(max_config_override >= 0 && start_config > max_config_override)
+			start_config = max_config_override;
 
 		// Set ceiling = start config. The SNR→config table is calibrated for AWGN
 		// but fading channels need 3-6 dB more margin. Setting ceiling at start
@@ -2081,8 +2078,18 @@ void cl_arq_controller::process_control_commander()
 				sack_enabled = both_sack;
 				if(sack_enabled)
 				{
-					printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d)\n",
-						radio_batch_size, crypto_batch_size, retransmit_headroom);
+					// Update batch size now that SACK is negotiated
+					int max_batch = (message_transmission_time_ms > 0)
+						? (int)(12000.0 / message_transmission_time_ms + 0.5) : 31;
+					if(max_batch < 5) max_batch = 5;
+					if(max_batch > nMessages) max_batch = nMessages;
+					int new_batch = radio_batch_size;
+					if(new_batch > max_batch) new_batch = max_batch;
+					set_data_batch_size(new_batch);
+					nominal_batch_size = new_batch;
+					recalculate_ack_timeout_for_batch();
+					printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
+						radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
 				}
 				else
 				{
@@ -2170,14 +2177,16 @@ void cl_arq_controller::process_control_commander()
 							snr_target = cfg_ceiling;
 						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
 							snr_target = supershift_proven_ceiling;
+						if(max_config_override >= 0 && snr_target > max_config_override)
+							snr_target = max_config_override;
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 					{
 						negotiated_configuration = snr_target;
 						printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
+						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d/%d)\n",
+							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling, max_config_override);
 					}
 					else
 					{
@@ -2358,14 +2367,16 @@ void cl_arq_controller::process_control_commander()
 						snr_target = cfg_ceiling;
 					if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
 						snr_target = supershift_proven_ceiling;
+					if(max_config_override >= 0 && snr_target > max_config_override)
+						snr_target = max_config_override;
 				}
 
 				if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 				{
 					negotiated_configuration = snr_target;
 					printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
-					printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d)\n",
-						measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling);
+					printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d/%d)\n",
+						measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling, max_config_override);
 				}
 				else
 				{
@@ -2562,7 +2573,8 @@ void cl_arq_controller::process_control_commander()
 				{
 					turboshift_last_good = prev_configuration;
 					turboshift_retries = 1;  // reset retry for next config
-					if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+					if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES)
+						&& !(max_config_override >= 0 && current_configuration >= max_config_override))
 					{
 						// SNR-based supershift: prefer turbo_received_snr (from ACK suffix).
 						// During TURBO_REVERSE, measurements.SNR_uplink is the FORWARD path
@@ -2584,13 +2596,15 @@ void cl_arq_controller::process_control_commander()
 								snr_target = cfg_ceiling;
 							if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
 								snr_target = supershift_proven_ceiling;
+							if(max_config_override >= 0 && snr_target > max_config_override)
+								snr_target = max_config_override;
 						}
 
 						if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
 						{
 							negotiated_configuration = snr_target;
-							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB (turbo_rx=%.1f) -> config %d -> %d (direct, ceiling=%d)\n",
-								effective_snr, turbo_received_snr, current_configuration, negotiated_configuration, supershift_proven_ceiling);
+							printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB (turbo_rx=%.1f) -> config %d -> %d (direct, ceiling=%d/%d)\n",
+								effective_snr, turbo_received_snr, current_configuration, negotiated_configuration, supershift_proven_ceiling, max_config_override);
 						}
 						else if(effective_snr > -90)
 						{
@@ -2611,6 +2625,8 @@ void cl_arq_controller::process_control_commander()
 							int turbo_cap = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 							if(negotiated_configuration > turbo_cap)
 								negotiated_configuration = turbo_cap;
+							if(max_config_override >= 0 && negotiated_configuration > max_config_override)
+								negotiated_configuration = max_config_override;
 						}
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
@@ -2823,7 +2839,8 @@ void cl_arq_controller::finalize_block_commander()
 					int proposed = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
 				// Respect proven ceiling — don't re-try configs that already failed during turboshift
 				bool ceiling_blocked = (supershift_proven_ceiling >= 0 &&
-					config_ladder_index(proposed) > config_ladder_index(supershift_proven_ceiling));
+					config_ladder_index(proposed) > config_ladder_index(supershift_proven_ceiling))
+					|| (max_config_override >= 0 && proposed > max_config_override);
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;

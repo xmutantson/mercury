@@ -21,6 +21,7 @@
  */
 
 #include "physical_layer/mfsk.h"
+#include "physical_layer/ldpc.h"
 #include <cstdint>
 #include <cstdio>
 
@@ -166,7 +167,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		// 2x scaled M=16 Costas values. Avoids preamble {4,20,12,28}.
 		ack_pattern_len = 8;
 		ack_pattern_nsymb = 16; // 8 × 2 reps
-		ack_match_threshold = 8;
+		ack_match_threshold = 7; // 7/16: P(false)=2.5e-7/poll. SACK-before-ACK guard catches cross-pattern false positives.
 		const int tones[] = {8, 14, 10, 24, 26, 2, 18, 30};
 		for (int i = 0; i < 8; i++) ack_tones[i] = tones[i];
 	}
@@ -175,7 +176,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		// Welch-Costas (p=17, g=5). Avoids preamble {2,6,10,14}.
 		ack_pattern_len = 8;
 		ack_pattern_nsymb = 16;
-		ack_match_threshold = 8;
+		ack_match_threshold = 7; // 7/16: P(false|M=16)=2.4e-5/poll. Lowered from 8: IONOS ACK detection showed peak_matched=7/8.
 		const int tones[] = {4, 7, 5, 12, 13, 1, 9, 15};
 		for (int i = 0; i < 8; i++) ack_tones[i] = tones[i];
 	}
@@ -222,7 +223,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	{
 		const int tones[] = {12, 28, 4, 6, 20, 16, 22, 30};
 		for (int i = 0; i < 8; i++) break_tones[i] = tones[i];
-		break_match_threshold = 8;
+		break_match_threshold = 7;  // 7/16: P(false|M=32)=2.5e-7/poll.
 	}
 	else if (M == 16)
 	{
@@ -269,7 +270,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		// 2x scaled M=16 Welch-Costas (g=6)
 		const int tones[] = {0, 10, 2, 22, 6, 12, 14, 26};
 		for (int i = 0; i < 8; i++) hail_tones[i] = tones[i];
-		hail_match_threshold = 8;
+		hail_match_threshold = 7;  // 7/16: P(false|M=32)=2.5e-7/poll.
 	}
 	else if (M == 16)
 	{
@@ -315,14 +316,14 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		// 2x scaled M=16 Welch-Costas (g=3)
 		const int tones[] = {0, 4, 16, 18, 24, 8, 28, 20};
 		for (int i = 0; i < 8; i++) sack_tones[i] = tones[i];
-		sack_match_threshold = 8;
+		sack_match_threshold = 10;  // 10/16: P(false|M=32)≈negligible. 2 sym margin from cross-correlation.
 	}
 	else if (M == 16)
 	{
 		// Welch-Costas (p=17, g=3)
 		const int tones[] = {0, 2, 8, 9, 12, 4, 14, 10};
 		for (int i = 0; i < 8; i++) sack_tones[i] = tones[i];
-		sack_match_threshold = 8;
+		sack_match_threshold = 10;  // 10/16: lowered from 12 for fading channel.
 	}
 	else if (M == 8)
 	{
@@ -583,7 +584,8 @@ void cl_mfsk::generate_sack_pattern(std::complex<double>* pattern_out)
 
 // Generate SACK pattern with bitmap suffix: base pattern + encoded bitmap of received frames
 void cl_mfsk::generate_sack_bitmap_pattern(std::complex<double>* pattern_out,
-                                            const bool* received, int nframes)
+                                            const bool* received, int nframes,
+                                            cl_ldpc* sack_ldpc)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
 
@@ -592,8 +594,8 @@ void cl_mfsk::generate_sack_bitmap_pattern(std::complex<double>* pattern_out,
 
 	// Encode bitmap into suffix tones
 	int suffix_tones[MAX_SACK_BITMAP_SYMBOLS];
-	int nsuffix = sack_bitmap_nsuffix(nframes);
-	encode_sack_bitmap(received, nframes, suffix_tones);
+	int nsuffix = sack_bitmap_nsuffix(nframes, sack_ldpc);
+	encode_sack_bitmap(received, nframes, suffix_tones, sack_ldpc);
 
 	double amp = sqrt((double)Nc / nStreams);
 
@@ -612,10 +614,16 @@ void cl_mfsk::generate_sack_bitmap_pattern(std::complex<double>* pattern_out,
 }
 
 // Calculate number of SACK bitmap suffix symbols for a given batch size.
-// WB (M>=16): unique symbols × 2 reps. NB (M<=8): unique symbols only.
-int cl_mfsk::sack_bitmap_nsuffix(int nframes) const
+// With LDPC (WB M>=16): N_LDPC / nBits = 128 / 4 = 32 tones (LDPC provides redundancy, no reps).
+// Without LDPC: WB unique × 2 reps, NB unique only.
+int cl_mfsk::sack_bitmap_nsuffix(int nframes, cl_ldpc* sack_ldpc) const
 {
 	if (M == 0 || nBits == 0 || nframes <= 0) return 0;
+
+	// LDPC mode: fixed 32 suffix symbols for WB M=16 (128 coded bits / 4 bits per tone)
+	if (sack_ldpc != nullptr && M >= 16)
+		return 128 / nBits;  // 128 / 4 = 32
+
 	int unique = (nframes + nBits - 1) / nBits;  // ceil(nframes / bits_per_symbol)
 	if (M >= 16)
 		return unique * 2;  // 2x repetition for WB
@@ -624,12 +632,43 @@ int cl_mfsk::sack_bitmap_nsuffix(int nframes) const
 }
 
 // Encode received-frame bitmap into MFSK suffix tones.
-// Packs bits LSB-first into symbols of nBits bits each.
-// WB: each unique symbol repeated 2x. NB: no repetition.
-void cl_mfsk::encode_sack_bitmap(const bool* received, int nframes, int* out_tones) const
+// With LDPC: pack 25 bitmap bits into K=32 info bits, LDPC-encode to N=128 coded bits,
+//            map to 32 M=16 tones (4 bits/tone, natural binary).
+// Without LDPC: packs bits LSB-first into symbols. WB: 2x reps. NB: no repetition.
+void cl_mfsk::encode_sack_bitmap(const bool* received, int nframes, int* out_tones, cl_ldpc* sack_ldpc) const
 {
 	if (M == 0 || nBits == 0 || nframes <= 0) return;
 
+	// LDPC-encoded path (WB M>=16 only)
+	if (sack_ldpc != nullptr && M >= 16)
+	{
+		// Pack bitmap into K=32 info bits (first 25 from received[], rest zero-padded)
+		int info_bits[32];
+		for (int i = 0; i < 32; i++)
+		{
+			if (i < nframes)
+				info_bits[i] = received[i] ? 1 : 0;
+			else
+				info_bits[i] = 0;
+		}
+
+		// LDPC encode: K=32 -> N=128 coded bits
+		int coded_bits[128];
+		sack_ldpc->encode(info_bits, coded_bits);
+
+		// Map 128 coded bits to 32 M=16 tones (4 bits per tone, natural binary LSB-first)
+		int ntones = 128 / nBits;  // 128 / 4 = 32
+		for (int i = 0; i < ntones; i++)
+		{
+			int tone = 0;
+			for (int b = 0; b < nBits; b++)
+				tone |= (coded_bits[i * nBits + b] << b);
+			out_tones[i] = tone;
+		}
+		return;
+	}
+
+	// Legacy path (no LDPC): direct bit-packing with optional 2x repetition
 	int unique = (nframes + nBits - 1) / nBits;
 
 	// Pack bits into unique tone values
@@ -676,31 +715,38 @@ void cl_mfsk::decode_sack_bitmap(const int* suffix_tones, int nsuffix,
 
 	if (M >= 16)
 	{
-		// WB: 2x reps, majority vote
+		// WB: 2x reps, bit-level merge
 		for (int u = 0; u < unique && u < 8; u++)
 		{
 			int tone_a = (u < nsuffix) ? suffix_tones[u] : -1;
 			int tone_b = (u + unique < nsuffix) ? suffix_tones[u + unique] : -1;
 
-			int tone;
-			if (tone_a >= 0 && tone_a < M && tone_b >= 0 && tone_b < M)
-			{
-				// Both valid: prefer matching, otherwise take first
-				tone = (tone_a == tone_b) ? tone_a : tone_a;
-			}
-			else if (tone_a >= 0 && tone_a < M)
-				tone = tone_a;
-			else if (tone_b >= 0 && tone_b < M)
-				tone = tone_b;
-			else
-				continue; // Both invalid
+			bool a_valid = (tone_a >= 0 && tone_a < M);
+			bool b_valid = (tone_b >= 0 && tone_b < M);
 
-			// Unpack bits
+			if (!a_valid && !b_valid)
+				continue;
+
+			// Bit-level merge: compare each bit from both reps
 			for (int b = 0; b < nBits; b++)
 			{
 				int frame_idx = u * nBits + b;
-				if (frame_idx < nframes)
-					out_received[frame_idx] = (tone >> b) & 1;
+				if (frame_idx >= nframes) break;
+
+				int bit_a = a_valid ? ((tone_a >> b) & 1) : -1;
+				int bit_b = b_valid ? ((tone_b >> b) & 1) : -1;
+
+				if (bit_a >= 0 && bit_b >= 0)
+				{
+					// Both valid: if they agree, use value.
+					// If they disagree, default to 0 (not received)
+					// → safer to retransmit than to miss a lost frame.
+					out_received[frame_idx] = (bit_a == bit_b) ? bit_a : 0;
+				}
+				else if (bit_a >= 0)
+					out_received[frame_idx] = bit_a;
+				else
+					out_received[frame_idx] = bit_b;
 			}
 		}
 	}

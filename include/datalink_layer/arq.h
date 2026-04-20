@@ -404,6 +404,7 @@ public:
   int crypto_batch_counter_rx;         // Expected crypto batch ID for RX
 
   // Commander: retransmit queue (missing frames from last SACK)
+  bool sack_retransmit_active;         // True during retransmit batch TX (skip seq renumbering)
   int retransmit_count;                // Number of frames to retransmit
   int retransmit_batch_id;             // Crypto batch ID of frames being retransmitted
   unsigned char retransmit_frames[MAX_RETRANSMIT_HEADROOM][MAX_SACK_FRAME_SIZE];
@@ -527,11 +528,17 @@ public:
   bool turbo_settle_pending;       // waiting for settle SET_CONFIG ACK before finish
   int supershift_proven_ceiling;   // highest config that failed BREAK — caps all SUPERSHIFT targets (-1 = no ceiling)
   bool skip_turbo_reverse;         // CLI --skip-turbo-reverse: skip TURBO_REVERSE phase
+  int max_config_override;         // CLI --max-config: hard ceiling on turboshift (-1 = use default)
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
   float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
   float turbo_best_snr;            // Best SNR seen across entire turbo phase (-99 = none)
   cl_timer turbo_snr_defer_timer;  // defer ACK return until suffix arrives
   int turbo_switch_role_retries;   // consecutive SWITCH_ROLE failures during turbo (Bug #60)
+
+  // ACK detection diagnostics (per-window tracking, no printf in hot loop)
+  int ack_diag_peak_matched;
+  double ack_diag_peak_metric;
+  int ack_diag_poll_count;
 
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
