@@ -107,6 +107,16 @@ are never in frame.
 
 ## §5 Proposed fixes (to be tested in order)
 
+> **STATUS (2026-05-08):** §5.1–§5.3 were **superseded** by the v2
+> redesign attempt documented in `SACK_REDESIGN_PLAN.md` §3.1
+> (Design A: OFDM-framed SACK). The v2 attempt was implemented
+> 2026-04-25 and **reverted entirely** — see SACK_REDESIGN_PLAN §9.
+> HEAD is at `7076a4b` "Fix A" only, which addresses unrelated frame
+> overflow but not the late-snapshot architecture. The §6 [?] open
+> questions below are folded into the IONOS-era validation plan
+> (Phase 4.1 instrumentation) as cited in
+> `IONOS_ERA_VALIDATION_PLAN.md` §14.5.
+
 ### §5.1 Option 1 — enlarge small-buffer call paths
 Change the ACK cross-check call sites to use a SACK-sized tail_samples
 when SACK is enabled. Smallest code change; most conservative. Testable
