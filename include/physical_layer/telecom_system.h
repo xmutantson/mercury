@@ -174,6 +174,12 @@ public:
 
 	int operation_mode;
 
+	// Phase-2 validation flag (set via --skip-var-gate=on|off CLI). Default true
+	// keeps HEAD behavior. When false, the noise_variance > 0.5 SKIP-VAR gate
+	// in receive_byte() is bypassed so LDPC trials run regardless. See
+	// IONOS_ERA_VALIDATION_PLAN.md §16.2 (b806b76 drift-catalog item).
+	bool skip_var_gate_enabled;
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);
