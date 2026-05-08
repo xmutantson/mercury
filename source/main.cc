@@ -279,6 +279,7 @@ int main(int argc, char *argv[])
     int ptt_delay_cli = -1;           // --ptt-delay: override both PTT on/off delays (ms)
     int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
     int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
+    int skip_var_gate_cli = -1;       // --skip-var-gate=on|off: -1=default(on), 0=off, 1=on
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -404,6 +405,15 @@ int main(int argc, char *argv[])
                 argv[j] = argv[j + 2];
             argc -= 2;
             i--;
+        }
+        else if (strncmp(argv[i], "--skip-var-gate=", 16) == 0)
+        {
+            const char* val = argv[i] + 16;
+            if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) skip_var_gate_cli = 0;
+            else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) skip_var_gate_cli = 1;
+            else { fprintf(stderr, "--skip-var-gate: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
         }
         else if (strcmp(argv[i], "--rx-channel") == 0 && i + 1 < argc)
         {
@@ -968,6 +978,11 @@ start_modem:
 
     cl_telecom_system telecom_system;
     telecom_system.operation_mode = operation_mode;
+    if (skip_var_gate_cli != -1) {
+        telecom_system.skip_var_gate_enabled = (skip_var_gate_cli == 1);
+        printf("[FLAG] --skip-var-gate=%s\n",
+               telecom_system.skip_var_gate_enabled ? "on" : "off");
+    }
 
     if (list_modes)
     {

@@ -40,6 +40,7 @@ extern "C" double test_tx_carrier_offset;
 
 cl_telecom_system::cl_telecom_system()
 {
+	skip_var_gate_enabled = true;  // default = HEAD behavior; CLI --skip-var-gate=off disables
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -1908,7 +1909,8 @@ skip_h_retry_point:
 				// signal is either noise (false preamble detection) or completely
 				// unusable. Good frames: var=0.01-0.10. Garbage: var=1.7-3.3.
 				// Skip LDPC to free receiver for real frames.
-				if(ofdm.noise_variance_estimate > 0.5)
+				// Phase-2 validation: --skip-var-gate=off bypasses this gate.
+				if(skip_var_gate_enabled && ofdm.noise_variance_estimate > 0.5)
 				{
 					printf("[OFDM-SYNC] trial %d SKIP-VAR: var=%.4f too high (>0.5), skipping LDPC\n",
 						receive_stats.sync_trials, ofdm.noise_variance_estimate);
