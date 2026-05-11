@@ -2506,9 +2506,14 @@ void cl_arq_controller::process_control_commander()
 					// the commander's next frame arrives while the responder is still
 					// reinitializing -- lost frame -> BREAK -> cycle repeats forever.
 					// 300ms covers worst-case RPi5 reinit (~100-200ms) with margin.
-					printf("[GEARSHIFT] Settling 300ms for responder PHY reinit\n");
-					fflush(stdout);
-					usleep(300000);
+					// Phase-2 validation: --phy-reinit-settle-ms=N overrides.
+					if(phy_reinit_settle_us > 0)
+					{
+						printf("[GEARSHIFT] Settling %dms for responder PHY reinit\n",
+						       phy_reinit_settle_us / 1000);
+						fflush(stdout);
+						usleep(phy_reinit_settle_us);
+					}
 
 					// Re-fill TX messages for the new config's message sizes
 					for(int i=0;i<nMessages;i++)
