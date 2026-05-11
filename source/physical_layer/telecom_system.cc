@@ -42,6 +42,7 @@ cl_telecom_system::cl_telecom_system()
 {
 	skip_var_gate_enabled = true;  // default = HEAD behavior; CLI --skip-var-gate=off disables
 	rx_normalize_enabled  = true;  // default = HEAD behavior; CLI --rx-normalize=off disables
+	csi_llr_enabled       = true;  // default = HEAD behavior; CLI --csi-llr=off disables
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -1946,6 +1947,7 @@ skip_h_retry_point:
 					ofdm.channel_estimator_amplitude_restoration);
 				fflush(stdout);
 
+				if(csi_llr_enabled) {
 				// Extract per-subcarrier CSI weight |H_k|² and deframe (DATA cells only).
 				// DFT-smoothed estimated_channel has true |H|², giving per-subcarrier
 				// reliability to LDPC. Normalized by mean to prevent LLR saturation.
@@ -1999,6 +2001,12 @@ skip_h_retry_point:
 					}
 				}
 				delete[] csi_deinterleaved;
+				} else {
+					// Phase-2: --csi-llr=off — uniform LLR path (pre-IONOS behavior).
+					ofdm.deframer(data_container.equalized_data,data_container.ofdm_deframed_data);
+					deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
+					psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
+				}
 			}
 
 			deinterleaver(data_container.demodulated_data,data_container.deinterleaved_data,data_container.nBits,bit_interleaver_block_size);
