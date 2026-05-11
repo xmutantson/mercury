@@ -290,6 +290,7 @@ int main(int argc, char *argv[])
     double psk_var_floor_cli = -1;     // --psk-var-floor=F: <0=default(0.001), 0..=override
     double energy_gate_floor_cli = -1; // --energy-gate-floor=F: <0=default(1e-12), 0..=override
     int ls_window_w_cli = -1, ls_window_h_cli = -1; // --ls-window=WxH (-1 = default 2x8)
+    int ofdm_defer_overflow_cli = -1;  // --ofdm-defer-overflow=on|off (-1=default on)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -501,6 +502,15 @@ int main(int argc, char *argv[])
             if (ls_window_w_cli <= 0 || ls_window_h_cli <= 0) {
                 fprintf(stderr, "--ls-window: W and H must be > 0\n"); exit(1);
             }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ofdm-defer-overflow=", 22) == 0)
+        {
+            const char* val = argv[i] + 22;
+            if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) ofdm_defer_overflow_cli = 0;
+            else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) ofdm_defer_overflow_cli = 1;
+            else { fprintf(stderr, "--ofdm-defer-overflow: expected on|off, got %s\n", val); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1106,6 +1116,11 @@ start_modem:
         telecom_system.default_configurations_telecom_system.ofdm_LS_window_width  = ls_window_w_cli;
         telecom_system.default_configurations_telecom_system.ofdm_LS_window_hight = ls_window_h_cli;
         printf("[FLAG] --ls-window=%dx%d\n", ls_window_w_cli, ls_window_h_cli);
+    }
+    if (ofdm_defer_overflow_cli != -1) {
+        telecom_system.ofdm_defer_overflow_enabled = (ofdm_defer_overflow_cli == 1);
+        printf("[FLAG] --ofdm-defer-overflow=%s\n",
+               telecom_system.ofdm_defer_overflow_enabled ? "on" : "off");
     }
 
     if (list_modes)

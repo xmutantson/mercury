@@ -203,6 +203,13 @@ public:
 	// See PHASE2_FLAGS_DESIGN.md §2.4.
 	double energy_gate_floor;
 
+	// Phase-2 validation flag (--ofdm-defer-overflow=on|off). Default true =
+	// HEAD (7076a4b Fix A). When false, the frame-end-past-buffer detector at
+	// receive_byte() is bypassed; overflow frames proceed through normal
+	// processing (likely failing decode, then triggering ftr=shift fast-fwd).
+	// See PHASE2_FLAGS_DESIGN.md §3.6.
+	bool ofdm_defer_overflow_enabled;
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);
