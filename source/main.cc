@@ -287,6 +287,7 @@ int main(int argc, char *argv[])
     int emergency_nack_cli = -1;       // --emergency-nack=N: -1=default(3), >=0=override
     int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
     double mean_h_gate_cli = -1;       // --mean-h-gate=F: <0=default(0.30), 0..=override
+    double psk_var_floor_cli = -1;     // --psk-var-floor=F: <0=default(0.001), 0..=override
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -471,6 +472,13 @@ int main(int argc, char *argv[])
         {
             mean_h_gate_cli = atof(argv[i] + 14);
             if (mean_h_gate_cli < 0) { fprintf(stderr, "--mean-h-gate: must be >= 0\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--psk-var-floor=", 16) == 0)
+        {
+            psk_var_floor_cli = atof(argv[i] + 16);
+            if (psk_var_floor_cli < 0) { fprintf(stderr, "--psk-var-floor: must be >= 0\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1062,6 +1070,10 @@ start_modem:
     if (mean_h_gate_cli >= 0) {
         telecom_system.mean_h_gate_threshold = mean_h_gate_cli;
         printf("[FLAG] --mean-h-gate=%.3f\n", telecom_system.mean_h_gate_threshold);
+    }
+    if (psk_var_floor_cli >= 0) {
+        telecom_system.psk.var_floor = (float)psk_var_floor_cli;
+        printf("[FLAG] --psk-var-floor=%.5f\n", (double)telecom_system.psk.var_floor);
     }
 
     if (list_modes)

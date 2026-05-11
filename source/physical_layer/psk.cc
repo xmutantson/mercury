@@ -31,6 +31,7 @@ cl_psk::cl_psk()
 	LLR_buf=NULL;
 	nBits=0;
 	nSymbols=0;
+	var_floor=0.001f;  // Phase-2 flag default = HEAD (b806b76); pre-IONOS was 0.05
 }
 
 cl_psk::~cl_psk()
@@ -287,7 +288,8 @@ void cl_psk::demod(const std::complex <double> *in,int nItems,float *out,float v
 	// With LS channel estimation, noise_variance_estimate is always > 0, so
 	// the floor only needs to prevent numerical issues. Value 0.001 allows
 	// effective SNR up to 30 dB while keeping max |LLR| bounded.
-	float eff_var = (variance > 0.001f) ? variance : 0.001f;
+	// Phase-2: --psk-var-floor=F overrides.
+	float eff_var = (variance > var_floor) ? variance : var_floor;
 
 	for(int i=0;i<nItems;i+=nBits)
 	{
