@@ -546,6 +546,11 @@ public:
   // See IONOS_ERA_VALIDATION_PLAN.md §15b.4 / PHASE2_FLAGS_DESIGN.md §2.7.
   int phy_reinit_settle_us;
 
+  // Phase-2 validation flag: ACK detection metric threshold (7076a4b 3.0→0.5).
+  // CLI --ack-metric-threshold=F. Default 0.5 = HEAD; pass 3.0 to revert.
+  // PHASE2_FLAGS_DESIGN.md §3.1.
+  double ack_metric_threshold;
+
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)

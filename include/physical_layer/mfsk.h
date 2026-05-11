@@ -65,6 +65,11 @@ public:
 	int break_match_threshold; // Min matched symbols for BREAK detection
 	int hail_match_threshold;  // Min matched symbols for undirected HAIL detection
 	int sack_match_threshold;  // Min matched symbols for SACK detection
+	// Phase-2 validation: --wb-match-threshold-bias=N added to ack/break/hail
+	// match thresholds for M=16 and M=32 (the WB cases). Default 0 = HEAD.
+	// Pass +1 to revert b806b76+7076a4b's 8→7 reductions. Applied at end of
+	// cl_mfsk::init() so it stacks with the computed defaults.
+	int wb_match_threshold_bias;
 
 	// Directed HAIL: 4-tone CRC suffix appended after the "I am Mercury" prefix.
 	// Derived from FNV-1a hash of the target callsign (including SSID).
