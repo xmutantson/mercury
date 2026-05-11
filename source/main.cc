@@ -286,6 +286,7 @@ int main(int argc, char *argv[])
     double ack_metric_threshold_cli = -1; // --ack-metric-threshold=F: <0 = default(0.5)
     int emergency_nack_cli = -1;       // --emergency-nack=N: -1=default(3), >=0=override
     int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
+    double mean_h_gate_cli = -1;       // --mean-h-gate=F: <0=default(0.30), 0..=override
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -463,6 +464,13 @@ int main(int argc, char *argv[])
         else if (strncmp(argv[i], "--wb-match-threshold-bias=", 26) == 0)
         {
             wb_match_bias_cli = atoi(argv[i] + 26);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--mean-h-gate=", 14) == 0)
+        {
+            mean_h_gate_cli = atof(argv[i] + 14);
+            if (mean_h_gate_cli < 0) { fprintf(stderr, "--mean-h-gate: must be >= 0\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1050,6 +1058,10 @@ start_modem:
         telecom_system.mfsk.wb_match_threshold_bias = wb_match_bias_cli;
         telecom_system.ack_mfsk.wb_match_threshold_bias = wb_match_bias_cli;
         printf("[FLAG] --wb-match-threshold-bias=%d\n", wb_match_bias_cli);
+    }
+    if (mean_h_gate_cli >= 0) {
+        telecom_system.mean_h_gate_threshold = mean_h_gate_cli;
+        printf("[FLAG] --mean-h-gate=%.3f\n", telecom_system.mean_h_gate_threshold);
     }
 
     if (list_modes)
