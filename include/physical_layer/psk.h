@@ -54,6 +54,10 @@ public:
 	void mod(const int *in,int nItems,std::complex <double> *out);
 	void demod(const std::complex <double> *in,int nItems,float *out,float variance);
 
+	// Phase-2 validation flag (--psk-var-floor=F). Default 0.001 = HEAD (b806b76);
+	// pre-IONOS was 0.05. Lower-bound on variance used in LLR computation.
+	// See PHASE2_FLAGS_DESIGN.md §2.2.
+	float var_floor;
 };
 
 #endif
