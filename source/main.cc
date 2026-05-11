@@ -289,6 +289,7 @@ int main(int argc, char *argv[])
     double mean_h_gate_cli = -1;       // --mean-h-gate=F: <0=default(0.30), 0..=override
     double psk_var_floor_cli = -1;     // --psk-var-floor=F: <0=default(0.001), 0..=override
     double energy_gate_floor_cli = -1; // --energy-gate-floor=F: <0=default(1e-12), 0..=override
+    int ls_window_w_cli = -1, ls_window_h_cli = -1; // --ls-window=WxH (-1 = default 2x8)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -487,6 +488,19 @@ int main(int argc, char *argv[])
         {
             energy_gate_floor_cli = atof(argv[i] + 20);
             if (energy_gate_floor_cli < 0) { fprintf(stderr, "--energy-gate-floor: must be >= 0\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ls-window=", 12) == 0)
+        {
+            const char* val = argv[i] + 12;
+            const char* x = strchr(val, 'x');
+            if (!x) { fprintf(stderr, "--ls-window: expected WxH (e.g. 20x20), got %s\n", val); exit(1); }
+            ls_window_w_cli = atoi(val);
+            ls_window_h_cli = atoi(x + 1);
+            if (ls_window_w_cli <= 0 || ls_window_h_cli <= 0) {
+                fprintf(stderr, "--ls-window: W and H must be > 0\n"); exit(1);
+            }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1086,6 +1100,12 @@ start_modem:
     if (energy_gate_floor_cli >= 0) {
         telecom_system.energy_gate_floor = energy_gate_floor_cli;
         printf("[FLAG] --energy-gate-floor=%g\n", telecom_system.energy_gate_floor);
+    }
+    if (ls_window_w_cli > 0 && ls_window_h_cli > 0) {
+        // Override BEFORE load_configuration so it propagates to ofdm.LS_window_*.
+        telecom_system.default_configurations_telecom_system.ofdm_LS_window_width  = ls_window_w_cli;
+        telecom_system.default_configurations_telecom_system.ofdm_LS_window_hight = ls_window_h_cli;
+        printf("[FLAG] --ls-window=%dx%d\n", ls_window_w_cli, ls_window_h_cli);
     }
 
     if (list_modes)
