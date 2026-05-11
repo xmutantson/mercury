@@ -291,6 +291,7 @@ int main(int argc, char *argv[])
     double energy_gate_floor_cli = -1; // --energy-gate-floor=F: <0=default(1e-12), 0..=override
     int ls_window_w_cli = -1, ls_window_h_cli = -1; // --ls-window=WxH (-1 = default 2x8)
     int ofdm_defer_overflow_cli = -1;  // --ofdm-defer-overflow=on|off (-1=default on)
+    int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 3000)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -511,6 +512,13 @@ int main(int argc, char *argv[])
             if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) ofdm_defer_overflow_cli = 0;
             else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) ofdm_defer_overflow_cli = 1;
             else { fprintf(stderr, "--ofdm-defer-overflow: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--sack-timeout-extra-ms=", 24) == 0)
+        {
+            sack_timeout_extra_ms_cli = atoi(argv[i] + 24);
+            if (sack_timeout_extra_ms_cli < 0) { fprintf(stderr, "--sack-timeout-extra-ms: must be >= 0\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1191,6 +1199,10 @@ start_modem:
         if (emergency_nack_cli >= 1) {
             ARQ.emergency_nack_threshold = emergency_nack_cli;
             printf("[FLAG] --emergency-nack=%d\n", ARQ.emergency_nack_threshold);
+        }
+        if (sack_timeout_extra_ms_cli >= 0) {
+            ARQ.sack_timeout_extra_ms = sack_timeout_extra_ms_cli;
+            printf("[FLAG] --sack-timeout-extra-ms=%d\n", ARQ.sack_timeout_extra_ms);
         }
 
         // Monitor mode: force monitor on, disable TX

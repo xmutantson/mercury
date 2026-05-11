@@ -226,6 +226,7 @@ cl_arq_controller::cl_arq_controller()
 
 	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
 	ack_metric_threshold=0.5;     // Phase-2 flag default = HEAD (7076a4b 3.0→0.5)
+	sack_timeout_extra_ms=3000;   // Phase-2 flag default = HEAD (7076a4b new)
 	emergency_nack_count=0;
 	emergency_nack_threshold=3;
 	emergency_break_active=0;
@@ -445,8 +446,9 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// SACK retransmit cycle: RSP may send SACK (1.7s) then wait for
 			// retransmit. CMD needs extra listen time so its retransmit cycle
 			// doesn't overlap with RSP's ACK response (half-duplex collision).
+			// Phase-2: --sack-timeout-extra-ms=N overrides (default 3000).
 			if(sack_enabled)
-				timeout += 3000;
+				timeout += sack_timeout_extra_ms;
 			set_receiving_timeout(timeout);
 		}
 		else
