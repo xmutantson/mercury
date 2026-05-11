@@ -185,6 +185,12 @@ public:
 	// noise blanking still runs). See PHASE2_FLAGS_DESIGN.md §2.8.
 	bool rx_normalize_enabled;
 
+	// Phase-2 validation flag (--csi-llr=on|off). Default true = HEAD. When
+	// false, the b806b76 CSI-weighted LLR loop is skipped — LLRs from psk.demod
+	// are passed straight to deinterleaver (uniform weighting). Tests whether
+	// CSI weighting helps or hurts on flat channels. See PHASE2_FLAGS_DESIGN.md §2.6.
+	bool csi_llr_enabled;
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);
