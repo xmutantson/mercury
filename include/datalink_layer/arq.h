@@ -551,6 +551,12 @@ public:
   // PHASE2_FLAGS_DESIGN.md §3.1.
   double ack_metric_threshold;
 
+  // Phase-2 validation flag: extra timeout added to receive_timeout when
+  // sack_enabled (7076a4b new). CLI --sack-timeout-extra-ms=N. Default 3000
+  // = HEAD; pass 0 to revert pre-7076a4b behavior. Suspected contributor to
+  // the NB_CFG10 162→54 bps cliff at HEAD.
+  int sack_timeout_extra_ms;
+
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)
