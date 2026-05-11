@@ -45,6 +45,7 @@ cl_telecom_system::cl_telecom_system()
 	csi_llr_enabled       = true;  // default = HEAD behavior; CLI --csi-llr=off disables
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
+	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -1155,7 +1156,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// the fast-forward `ftr=shift` branch which wastes 700ms of audio (~30
 	// frames). Deferring via overflow path preserves those frames. See
 	// fact-documents/SACK_LATE_SNAPSHOT_BUG.md §Preamble bounds.
-	if(mfsk_fixed_delay < 0)
+	// Phase-2: --ofdm-defer-overflow=off bypasses Fix A.
+	if(mfsk_fixed_delay < 0 && ofdm_defer_overflow_enabled)
 	{
 		int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
 		int active_nsymb = get_active_nsymb();
