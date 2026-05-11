@@ -288,6 +288,7 @@ int main(int argc, char *argv[])
     int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
     double mean_h_gate_cli = -1;       // --mean-h-gate=F: <0=default(0.30), 0..=override
     double psk_var_floor_cli = -1;     // --psk-var-floor=F: <0=default(0.001), 0..=override
+    double energy_gate_floor_cli = -1; // --energy-gate-floor=F: <0=default(1e-12), 0..=override
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -479,6 +480,13 @@ int main(int argc, char *argv[])
         {
             psk_var_floor_cli = atof(argv[i] + 16);
             if (psk_var_floor_cli < 0) { fprintf(stderr, "--psk-var-floor: must be >= 0\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--energy-gate-floor=", 20) == 0)
+        {
+            energy_gate_floor_cli = atof(argv[i] + 20);
+            if (energy_gate_floor_cli < 0) { fprintf(stderr, "--energy-gate-floor: must be >= 0\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1074,6 +1082,10 @@ start_modem:
     if (psk_var_floor_cli >= 0) {
         telecom_system.psk.var_floor = (float)psk_var_floor_cli;
         printf("[FLAG] --psk-var-floor=%.5f\n", (double)telecom_system.psk.var_floor);
+    }
+    if (energy_gate_floor_cli >= 0) {
+        telecom_system.energy_gate_floor = energy_gate_floor_cli;
+        printf("[FLAG] --energy-gate-floor=%g\n", telecom_system.energy_gate_floor);
     }
 
     if (list_modes)

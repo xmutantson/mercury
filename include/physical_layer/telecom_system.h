@@ -196,6 +196,13 @@ public:
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.
 	double mean_h_gate_threshold;
 
+	// Phase-2 validation flag (--energy-gate-floor=F). Default 1e-12 = HEAD
+	// (b806b76 effectively disables absolute silence detection).
+	// Pre-IONOS was 0.001. Used at 7 sites in receive_byte() as the absolute
+	// energy floor for is_silence / data-energy gates.
+	// See PHASE2_FLAGS_DESIGN.md §2.4.
+	double energy_gate_floor;
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);
