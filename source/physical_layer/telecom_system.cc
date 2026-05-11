@@ -43,6 +43,7 @@ cl_telecom_system::cl_telecom_system()
 	skip_var_gate_enabled = true;  // default = HEAD behavior; CLI --skip-var-gate=off disables
 	rx_normalize_enabled  = true;  // default = HEAD behavior; CLI --rx-normalize=off disables
 	csi_llr_enabled       = true;  // default = HEAD behavior; CLI --csi-llr=off disables
+	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -1879,7 +1880,8 @@ skip_h_retry_point:
 				// Even CONFIG_0 (rate 1/16) can't decode below ~0.33.
 				// Good-timing frames: meanH ≥ 0.74 (SGTL5000 at -40 dBFS).
 				// Bad-timing frames: meanH = 0.07-0.24 (data/pilot misalignment).
-				double mean_H_threshold = 0.30;
+				// Phase-2: --mean-h-gate=F overrides.
+				double mean_H_threshold = mean_h_gate_threshold;
 					if(mean_H < mean_H_threshold)
 					{
 						skip_h_count++;

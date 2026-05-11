@@ -191,6 +191,11 @@ public:
 	// CSI weighting helps or hurts on flat channels. See PHASE2_FLAGS_DESIGN.md §2.6.
 	bool csi_llr_enabled;
 
+	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
+	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
+	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.
+	double mean_h_gate_threshold;
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);
