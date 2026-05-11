@@ -281,6 +281,7 @@ int main(int argc, char *argv[])
     int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
     int skip_var_gate_cli = -1;       // --skip-var-gate=on|off: -1=default(on), 0=off, 1=on
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
+    int rx_normalize_cli = -1;         // --rx-normalize=on|off: -1=default(on), 0=off, 1=on
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -420,6 +421,15 @@ int main(int argc, char *argv[])
         {
             phy_reinit_settle_ms_cli = atoi(argv[i] + 23);
             if (phy_reinit_settle_ms_cli < 0) { fprintf(stderr, "--phy-reinit-settle-ms: must be >= 0\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--rx-normalize=", 15) == 0)
+        {
+            const char* val = argv[i] + 15;
+            if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) rx_normalize_cli = 0;
+            else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) rx_normalize_cli = 1;
+            else { fprintf(stderr, "--rx-normalize: expected on|off, got %s\n", val); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -990,6 +1000,11 @@ start_modem:
         telecom_system.skip_var_gate_enabled = (skip_var_gate_cli == 1);
         printf("[FLAG] --skip-var-gate=%s\n",
                telecom_system.skip_var_gate_enabled ? "on" : "off");
+    }
+    if (rx_normalize_cli != -1) {
+        telecom_system.rx_normalize_enabled = (rx_normalize_cli == 1);
+        printf("[FLAG] --rx-normalize=%s\n",
+               telecom_system.rx_normalize_enabled ? "on" : "off");
     }
 
     if (list_modes)

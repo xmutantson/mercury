@@ -41,6 +41,7 @@ extern "C" double test_tx_carrier_offset;
 cl_telecom_system::cl_telecom_system()
 {
 	skip_var_gate_enabled = true;  // default = HEAD behavior; CLI --skip-var-gate=off disables
+	rx_normalize_enabled  = true;  // default = HEAD behavior; CLI --rx-normalize=off disables
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -858,22 +859,25 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				sum_sq += pb[i] * pb[i];
 			double rms = sqrt(sum_sq / pb_samples);
 			if(rms > 1e-8) {
-				// Target RMS: sqrt(output_power / 2) for passband signal
-				// (factor /2 because passband has carrier modulation overhead)
-				double target_rms = sqrt(output_power_Watt) * 0.5;
-				double scale = target_rms / rms;
-				// Clamp scale to prevent insane amplification on near-silence
-				if(scale > 10000.0) scale = 10000.0;
-				if(scale < 0.001) scale = 0.001;
-				// Only normalize if significantly off (>3 dB)
-				if(scale > 1.5 || scale < 0.67)
-				{
-					for(int i = 0; i < pb_samples; i++)
-						pb[i] *= scale;
-					// Recalculate RMS after scaling
-					rms *= scale;
+				// Phase-2: --rx-normalize=off bypasses this auto-rescaling block.
+				if(rx_normalize_enabled) {
+					// Target RMS: sqrt(output_power / 2) for passband signal
+					// (factor /2 because passband has carrier modulation overhead)
+					double target_rms = sqrt(output_power_Watt) * 0.5;
+					double scale = target_rms / rms;
+					// Clamp scale to prevent insane amplification on near-silence
+					if(scale > 10000.0) scale = 10000.0;
+					if(scale < 0.001) scale = 0.001;
+					// Only normalize if significantly off (>3 dB)
+					if(scale > 1.5 || scale < 0.67)
+					{
+						for(int i = 0; i < pb_samples; i++)
+							pb[i] *= scale;
+						// Recalculate RMS after scaling
+						rms *= scale;
+					}
 				}
-				// Impulse noise blanking: clip at 10× RMS
+				// Impulse noise blanking: clip at 10× RMS (always on)
 				double clip_threshold = 10.0 * rms;
 				for(int i = 0; i < pb_samples; i++) {
 					if(pb[i] > clip_threshold) { pb[i] = clip_threshold; }
