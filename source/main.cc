@@ -283,6 +283,9 @@ int main(int argc, char *argv[])
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
     int rx_normalize_cli = -1;         // --rx-normalize=on|off: -1=default(on), 0=off, 1=on
     int csi_llr_cli = -1;              // --csi-llr=on|off: -1=default(on), 0=off, 1=on
+    double ack_metric_threshold_cli = -1; // --ack-metric-threshold=F: <0 = default(0.5)
+    int emergency_nack_cli = -1;       // --emergency-nack=N: -1=default(3), >=0=override
+    int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -440,6 +443,26 @@ int main(int argc, char *argv[])
             if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) csi_llr_cli = 0;
             else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) csi_llr_cli = 1;
             else { fprintf(stderr, "--csi-llr: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ack-metric-threshold=", 23) == 0)
+        {
+            ack_metric_threshold_cli = atof(argv[i] + 23);
+            if (ack_metric_threshold_cli < 0) { fprintf(stderr, "--ack-metric-threshold: must be >= 0\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--emergency-nack=", 17) == 0)
+        {
+            emergency_nack_cli = atoi(argv[i] + 17);
+            if (emergency_nack_cli < 1) { fprintf(stderr, "--emergency-nack: must be >= 1\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--wb-match-threshold-bias=", 26) == 0)
+        {
+            wb_match_bias_cli = atoi(argv[i] + 26);
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1021,6 +1044,13 @@ start_modem:
         printf("[FLAG] --csi-llr=%s\n",
                telecom_system.csi_llr_enabled ? "on" : "off");
     }
+    if (wb_match_bias_cli != 0) {
+        // Apply to both mfsk instances; cl_mfsk::init() will pick up the bias
+        // at the end of each init() call.
+        telecom_system.mfsk.wb_match_threshold_bias = wb_match_bias_cli;
+        telecom_system.ack_mfsk.wb_match_threshold_bias = wb_match_bias_cli;
+        printf("[FLAG] --wb-match-threshold-bias=%d\n", wb_match_bias_cli);
+    }
 
     if (list_modes)
     {
@@ -1082,6 +1112,14 @@ start_modem:
             ARQ.phy_reinit_settle_us = phy_reinit_settle_ms_cli * 1000;
             printf("[FLAG] --phy-reinit-settle-ms=%d (us=%d)\n",
                    phy_reinit_settle_ms_cli, ARQ.phy_reinit_settle_us);
+        }
+        if (ack_metric_threshold_cli >= 0) {
+            ARQ.ack_metric_threshold = ack_metric_threshold_cli;
+            printf("[FLAG] --ack-metric-threshold=%.3f\n", ARQ.ack_metric_threshold);
+        }
+        if (emergency_nack_cli >= 1) {
+            ARQ.emergency_nack_threshold = emergency_nack_cli;
+            printf("[FLAG] --emergency-nack=%d\n", ARQ.emergency_nack_threshold);
         }
 
         // Monitor mode: force monitor on, disable TX

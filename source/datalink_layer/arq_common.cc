@@ -225,6 +225,7 @@ cl_arq_controller::cl_arq_controller()
 	ack_diag_poll_count=0;
 
 	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
+	ack_metric_threshold=0.5;     // Phase-2 flag default = HEAD (7076a4b 3.0→0.5)
 	emergency_nack_count=0;
 	emergency_nack_threshold=3;
 	emergency_break_active=0;
@@ -4173,7 +4174,8 @@ bool cl_arq_controller::receive_ack_pattern()
 			// Metric threshold: For WB M=16, matched>=8/16 has P(false)~5.6e-5/pos.
 			// Random noise has metric≈8/Nc=0.16 at 8 matches. metric>=0.5 rejects
 			// noise while accepting marginal signals (was 3.0, caused ~50% timeouts).
-			if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold && metric >= 0.5)
+			// Phase-2: --ack-metric-threshold=F overrides.
+			if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold && metric >= ack_metric_threshold)
 			{
 				// SACK-before-ACK guard: when SACK is enabled, cross-check against
 				// SACK correlator on the same audio. If SACK matches MORE symbols

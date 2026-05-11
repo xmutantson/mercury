@@ -56,6 +56,7 @@ cl_mfsk::cl_mfsk()
 	break_match_threshold = 0;
 	hail_match_threshold = 0;
 	sack_match_threshold = 0;
+	wb_match_threshold_bias = 0;  // Phase-2 flag default = HEAD
 }
 
 cl_mfsk::~cl_mfsk()
@@ -357,6 +358,17 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 
 	// Initialize directed HAIL detect arrays (undirected by default)
 	clear_hail_target();
+
+	// Phase-2 validation: --wb-match-threshold-bias=N adds N to ack/break/hail
+	// match thresholds for the WB cases (M=16, M=32). Pass +1 to revert
+	// b806b76+7076a4b's 8→7 reductions on those thresholds. Sack threshold
+	// not biased (sack is a newer mechanism, separate concern).
+	if(wb_match_threshold_bias != 0 && (M == 16 || M == 32))
+	{
+		ack_match_threshold   += wb_match_threshold_bias;
+		break_match_threshold += wb_match_threshold_bias;
+		hail_match_threshold  += wb_match_threshold_bias;
+	}
 }
 
 void cl_mfsk::set_hail_target(const char* callsign, int len)
