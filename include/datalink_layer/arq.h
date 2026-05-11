@@ -540,6 +540,12 @@ public:
   double ack_diag_peak_metric;
   int ack_diag_poll_count;
 
+  // Phase-2 validation flag: PHY reinit settle delay after SET_CONFIG ACK.
+  // Default 300000 us (= 300 ms, HEAD behavior, b806b76 Bug #60). CLI:
+  // --phy-reinit-settle-ms=N. Pass 0 to disable the settle entirely.
+  // See IONOS_ERA_VALIDATION_PLAN.md §15b.4 / PHASE2_FLAGS_DESIGN.md §2.7.
+  int phy_reinit_settle_us;
+
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)

@@ -280,6 +280,7 @@ int main(int argc, char *argv[])
     int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
     int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
     int skip_var_gate_cli = -1;       // --skip-var-gate=on|off: -1=default(on), 0=off, 1=on
+    int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -412,6 +413,13 @@ int main(int argc, char *argv[])
             if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) skip_var_gate_cli = 0;
             else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) skip_var_gate_cli = 1;
             else { fprintf(stderr, "--skip-var-gate: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--phy-reinit-settle-ms=", 23) == 0)
+        {
+            phy_reinit_settle_ms_cli = atoi(argv[i] + 23);
+            if (phy_reinit_settle_ms_cli < 0) { fprintf(stderr, "--phy-reinit-settle-ms: must be >= 0\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1040,6 +1048,11 @@ start_modem:
         ARQ.telecom_system = &telecom_system;
         ARQ.passive_monitor = is_monitor_mode;
         ARQ.monitor_stdout = is_monitor_mode && monitor_stdout;
+        if (phy_reinit_settle_ms_cli != -1) {
+            ARQ.phy_reinit_settle_us = phy_reinit_settle_ms_cli * 1000;
+            printf("[FLAG] --phy-reinit-settle-ms=%d (us=%d)\n",
+                   phy_reinit_settle_ms_cli, ARQ.phy_reinit_settle_us);
+        }
 
         // Monitor mode: force monitor on, disable TX
         if (is_monitor_mode) {

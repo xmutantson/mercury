@@ -224,6 +224,7 @@ cl_arq_controller::cl_arq_controller()
 	ack_diag_peak_metric=0.0;
 	ack_diag_poll_count=0;
 
+	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
 	emergency_nack_count=0;
 	emergency_nack_threshold=3;
 	emergency_break_active=0;
