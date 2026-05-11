@@ -44,6 +44,7 @@ cl_telecom_system::cl_telecom_system()
 	rx_normalize_enabled  = true;  // default = HEAD behavior; CLI --rx-normalize=off disables
 	csi_llr_enabled       = true;  // default = HEAD behavior; CLI --csi-llr=off disables
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
+	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -1327,7 +1328,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// Real signal: preamble energy >> silence-region energy.
 			// False alarm: preamble energy ≈ buffer mean (noise floor throughout).
 			// Absolute floor 1e-12: below any real ADC noise floor.
-			bool is_silence = (buf_mean_energy < 1e-12) && (mean_energy < 1e-12);
+			bool is_silence = (buf_mean_energy < energy_gate_floor) && (mean_energy < energy_gate_floor);
 			printf("[OFDM-ENERGY] pream=%.4e buf=%.4e count=%d delay=%d symb=%d metric=%.3f %s\n",
 				mean_energy, buf_mean_energy, count, receive_stats.delay, pream_symb_loc,
 				receive_stats.coarse_metric,
@@ -1372,7 +1373,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						cnt++;
 					}
 					e = (cnt > 0) ? e / cnt : 0.0;
-					if(e > buf_mean_energy * 2.0 && e > 1e-12)
+					if(e > buf_mean_energy * 2.0 && e > energy_gate_floor)
 					{
 						signal_start_symb = s;
 						break;
@@ -1418,7 +1419,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 							pream_symb_loc, signal_start_symb, retry_symb, retry.correlation, retry_energy);
 						fflush(stdout);
 
-						if(retry_energy > 1e-12 && retry.correlation >= preamble_detect_threshold
+						if(retry_energy > energy_gate_floor && retry.correlation >= preamble_detect_threshold
 							&& retry_symb > lower_bound && retry_symb <= upper_bound)
 						{
 							receive_stats.delay = retry.delay;
@@ -1479,7 +1480,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// Data missing if data energy is <10% of preamble energy (relative)
 			// or truly zero (absolute floor). Old 0.001 threshold rejected
 			// SGTL5000 signals at -40 dBFS.
-			if(data_e < 1e-12 || (pream_mean_energy > 1e-12 && data_e < pream_mean_energy * 0.1))
+			if(data_e < energy_gate_floor || (pream_mean_energy > energy_gate_floor && data_e < pream_mean_energy * 0.1))
 			{
 				printf("[OFDM-SYNC] data_energy=%.2e pream_energy=%.2e at pream=%d delay=%d — frame incomplete, skipping decode\n",
 					data_e, pream_mean_energy, pream_symb_loc, receive_stats.delay);
@@ -1659,7 +1660,7 @@ skip_h_retry_point:
 				for(int i = 0; i < sym_samples && (receive_stats.delay + i) < buf_samples; i++)
 					fine_energy += std::norm(data_container.baseband_data_interpolated[receive_stats.delay + i]);
 				fine_energy /= sym_samples;
-				if(fine_energy < 1e-12)
+				if(fine_energy < energy_gate_floor)
 				{
 					int orig_delay = receive_stats.delay;
 					for(int fwd = sym_samples; fwd <= 3*sym_samples; fwd += sym_samples)
@@ -1670,7 +1671,7 @@ skip_h_retry_point:
 						for(int i = 0; i < sym_samples; i++)
 							e += std::norm(data_container.baseband_data_interpolated[candidate + i]);
 						e /= sym_samples;
-						if(e > 1e-12)
+						if(e > energy_gate_floor)
 						{
 							if (g_verbose)
 								printf("[OFDM-SYNC] fine-energy-fix: delay %d->%d (fwd %d sym)\n",
