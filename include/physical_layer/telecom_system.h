@@ -180,6 +180,11 @@ public:
 	// IONOS_ERA_VALIDATION_PLAN.md §16.2 (b806b76 drift-catalog item).
 	bool skip_var_gate_enabled;
 
+	// Phase-2 validation flag (--rx-normalize=on|off). Default true = HEAD. When
+	// false, the b806b76 RX passband auto-rescaling block is bypassed (impulse
+	// noise blanking still runs). See PHASE2_FLAGS_DESIGN.md §2.8.
+	bool rx_normalize_enabled;
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);
