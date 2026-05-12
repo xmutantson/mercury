@@ -292,7 +292,8 @@ int main(int argc, char *argv[])
     int ls_window_w_cli = -1, ls_window_h_cli = -1; // --ls-window=WxH (-1 = default 2x8)
     int ofdm_defer_overflow_cli = -1;  // --ofdm-defer-overflow=on|off (-1=default on)
     int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 3000)
-    bool no_sack_cli = false;          // --no-sack: strip CAP_SACK from local_capability
+    bool no_sack_cli = false;          // --no-sack: force disable (no-op after B2 fix)
+    bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -526,6 +527,12 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--no-sack") == 0)
         {
             no_sack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--enable-sack") == 0)
+        {
+            enable_sack_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1214,7 +1221,17 @@ start_modem:
         if (no_sack_cli) {
             ARQ.disable_sack = true;
             ARQ.local_capability &= ~CAP_SACK;  // strip from current value too
-            printf("[FLAG] --no-sack: CAP_SACK masked from local_capability\n");
+            printf("[FLAG] --no-sack: CAP_SACK masked from local_capability "
+                   "(no-op after B2 fix; default is now disabled)\n");
+        }
+        if (enable_sack_cli) {
+            ARQ.disable_sack = false;
+            ARQ.local_capability |= CAP_SACK;
+            printf("[FLAG] --enable-sack: opt-in SACK negotiation (default after B2 is OFF)\n");
+        }
+        if (no_sack_cli && enable_sack_cli) {
+            fprintf(stderr, "ERROR: cannot pass both --no-sack and --enable-sack\n");
+            exit(1);
         }
 
         // Monitor mode: force monitor on, disable TX

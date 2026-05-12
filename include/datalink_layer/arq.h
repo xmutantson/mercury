@@ -557,12 +557,14 @@ public:
   // the NB_CFG10 162→54 bps cliff at HEAD.
   int sack_timeout_extra_ms;
 
-  // Phase-2 validation flag: mask CAP_SACK out of local_capability.
-  // CLI --no-sack. Default false = HEAD (SACK negotiated by default).
-  // When true, all 5 local_capability assignments AND the constructor-default
-  // strip CAP_SACK, so SACK is never negotiated and the entire SACK code path
-  // is dormant. Tests the "kill SACK entirely" hypothesis for the
-  // NB_CFG10 135→84 residual regression.
+  // CAP_SACK gating (production B2 fix, 2026-05-12, plan §15c).
+  // Default true: SACK is NOT negotiated by default. SACK enabled-by-default
+  // was confirmed as the root cause of both WB and NB regressions vs
+  // pre-IONOS (NB_CFG10: 84→151 bps, WB_CFG15: 1690→2353 bps, both with
+  // --no-sack). SACK is also alpha (v2 redesign attempted+reverted).
+  // CLI overrides:
+  //   --no-sack       (forces disable; no-op since default is now disabled)
+  //   --enable-sack   (forces enable; opt-in for users who want SACK)
   bool disable_sack;
 
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
