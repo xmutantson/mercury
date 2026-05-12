@@ -508,12 +508,49 @@ The validation campaign's actionable recommendation:
 - Only `--csi-llr=off` and `--sack-timeout-extra-ms=0` are confirmed
   hard-required at HEAD; everything else is +/- small effect.
 
-### §15c.4 Open work
+### §15c.4 B2 fix landed and verified (2026-05-12)
 
-- [?] Should SACK be removed entirely or just gated to WB? Need WB A/B
-  with `--no-sack` (this work was NB-only).
-- [?] Does `--no-sack` similarly restore WB_CFG15? — needs testing.
-- [?] PI 1.2/1.3 fading bisect to confirm pattern on hardware.
+Production fix landed as commit `856f024`: `cl_arq_controller::disable_sack`
+default flipped from `false` to `true`. SACK is now opt-in via the
+new `--enable-sack` flag.
+
+**Verification — default behavior (no flag) after B2 fix:**
+
+| Config | HEAD baseline (SACK on, yesterday) | Default after B2 (today) | `--no-sack` (yesterday) | Historical |
+|---|---|---|---|---|
+| HOST NB_CFG10 | 84.6 | **154.1** ✓ | 151.1 | 135 / 181 |
+| HOST WB_CFG15 | 1690 | **2253.3** ✓ | 2353.4 | 2479 / 2599 |
+| PI NB_CFG10 | 54.4 (2/3) | **72.5** (3/3) ↑33% | not tested | 135 / 181 |
+| PI WB_CFG15 | 1001.4 | **1752.5** ↑75% | not tested | 2479 / 2599 |
+
+Default behavior now matches the `--no-sack` measurement on HOST. PI
+also benefits but is slower than HOST overall — that residual is real
+hardware overhead (audio DAC/ADC, slower Pi CPU, IONOS analog
+passthrough), not the IONOS-era regression.
+
+Why default-off rather than NB-only gate (per the original §15c.3
+recommendation): data showed SACK hurts both NB and WB. SACK is alpha
+(v2 redesign attempted and reverted — see SACK_REDESIGN_PLAN.md §9).
+Users who want SACK can opt in with `--enable-sack`.
+
+### §15c.5 Resolved open work
+
+- ~~Should SACK be removed entirely or just gated to WB?~~ — disabled
+  everywhere; data showed both bands suffer (`856f024`).
+- ~~Does `--no-sack` similarly restore WB_CFG15?~~ — yes; 1690→2353 bps
+  on HOST, 1001→1752 on PI.
+- PI 1.2/1.3 fading bisect — still optional; the headline regression is
+  resolved by B2 fix.
+
+### §15c.6 Remaining gaps (post-B2)
+
+- **PI < HOST** even after B2: NB_CFG10 PI is 47% of HOST, WB_CFG15 PI
+  is 78% of HOST. Hardware/audio-path overhead, not a regression.
+- **NB on PI still below pre-IONOS** (72.5 vs 135 bps): SACK fix removed
+  ~33% of the gap but a residual ~46% loss remains, unique to NB on
+  real audio. Could be NB MFSK sensitivity to analog noise/timing,
+  ARQ behavior on slower Pi CPU, or other unflagged sub-changes.
+  Not investigated further this session — fixing SACK was the headline.
 
 ## §15b Phase 0 corrected baselines (2026-05-10)
 
