@@ -173,7 +173,7 @@ cl_arq_controller::cl_arq_controller()
 	nb_probe_max=2;
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
-	disable_sack=false;  // moved up so the masks below see the correct value
+	disable_sack=true;  // B2 fix (2026-05-12): SACK off by default. See arq.h.
 	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;
 	if(disable_sack) local_capability &= ~CAP_SACK;
 	peer_capability=0;
