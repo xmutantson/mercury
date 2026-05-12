@@ -557,6 +557,14 @@ public:
   // the NB_CFG10 162→54 bps cliff at HEAD.
   int sack_timeout_extra_ms;
 
+  // Phase-2 validation flag: mask CAP_SACK out of local_capability.
+  // CLI --no-sack. Default false = HEAD (SACK negotiated by default).
+  // When true, all 5 local_capability assignments AND the constructor-default
+  // strip CAP_SACK, so SACK is never negotiated and the entire SACK code path
+  // is dormant. Tests the "kill SACK entirely" hypothesis for the
+  // NB_CFG10 135→84 residual regression.
+  bool disable_sack;
+
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)

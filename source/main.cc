@@ -292,6 +292,7 @@ int main(int argc, char *argv[])
     int ls_window_w_cli = -1, ls_window_h_cli = -1; // --ls-window=WxH (-1 = default 2x8)
     int ofdm_defer_overflow_cli = -1;  // --ofdm-defer-overflow=on|off (-1=default on)
     int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 3000)
+    bool no_sack_cli = false;          // --no-sack: strip CAP_SACK from local_capability
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -519,6 +520,12 @@ int main(int argc, char *argv[])
         {
             sack_timeout_extra_ms_cli = atoi(argv[i] + 24);
             if (sack_timeout_extra_ms_cli < 0) { fprintf(stderr, "--sack-timeout-extra-ms: must be >= 0\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--no-sack") == 0)
+        {
+            no_sack_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1203,6 +1210,11 @@ start_modem:
         if (sack_timeout_extra_ms_cli >= 0) {
             ARQ.sack_timeout_extra_ms = sack_timeout_extra_ms_cli;
             printf("[FLAG] --sack-timeout-extra-ms=%d\n", ARQ.sack_timeout_extra_ms);
+        }
+        if (no_sack_cli) {
+            ARQ.disable_sack = true;
+            ARQ.local_capability &= ~CAP_SACK;  // strip from current value too
+            printf("[FLAG] --no-sack: CAP_SACK masked from local_capability\n");
         }
 
         // Monitor mode: force monitor on, disable TX

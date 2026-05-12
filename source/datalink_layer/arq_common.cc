@@ -173,7 +173,9 @@ cl_arq_controller::cl_arq_controller()
 	nb_probe_max=2;
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
+	disable_sack=false;  // moved up so the masks below see the correct value
 	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;
+	if(disable_sack) local_capability &= ~CAP_SACK;
 	peer_capability=0;
 	wb_upgrade_pending=false;
 	psk_mismatch_pending=false;
@@ -227,6 +229,8 @@ cl_arq_controller::cl_arq_controller()
 	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
 	ack_metric_threshold=0.5;     // Phase-2 flag default = HEAD (7076a4b 3.0→0.5)
 	sack_timeout_extra_ms=3000;   // Phase-2 flag default = HEAD (7076a4b new)
+	// Note: disable_sack initialized at top of constructor (~line 175) before
+	// the local_capability assignment so the mask there sees the correct value.
 	emergency_nack_count=0;
 	emergency_nack_threshold=3;
 	emergency_break_active=0;
@@ -2258,6 +2262,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
 		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2355,6 +2360,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		original_role=RESPONDER;
 		set_role(RESPONDER);
 		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2391,6 +2397,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
 		local_capability = CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -2409,6 +2416,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
 		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2428,6 +2436,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
 		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
