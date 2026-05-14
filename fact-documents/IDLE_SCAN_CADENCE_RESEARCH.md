@@ -1,5 +1,5 @@
 ---
-status: research complete — verdict delivered, plan included
+status: research complete; primitive committed; integration (Step 3) PARKED at user's call — see §9
 created: 2026-05-14
 author: idle-scan-cadence research agent
 relates_to: TIMESYNC_POLYPHASE_PLAN.md (Plan B, §7 Step-6 RPi1 idle-CPU profile)
@@ -658,3 +658,36 @@ builds (`TIMESYNC_POLYPHASE_PLAN.md` §10).
 - `mercury/fact-documents/timing_data/perf_rpi1_1778778318.txt`,
   `perf_rpi1_1778777920.txt` — pre-Plan-B idle profiles (`cl_FIR::apply`
   ~92 %, `Total Lost Samples: 0`).
+
+---
+
+## §9. Disposition (2026-05-14)
+
+**Integration HALTED — gate primitive committed, the `process_main()` wiring is
+NOT done. Priority 3 open item if ever revisited.**
+
+After Step 0/2's measurement showed idle CPU is already ~1% (Plan B Step 6c-ext
+`23c4ab7` having already converted `measure_signal_only` itself to the decimated
+FIR — see the §0/§3 ‼ CORRECTION above), the user deprioritised finishing the
+energy gate: trimming a residual ~1% is polishing a non-problem, not the
+~65-point reclaim the original §0 framing implied. The bulk of the idle-CPU win
+the cadence change was meant to chase was already delivered by Plan B.
+
+Committed — the honest record of the investigation:
+- `631a2ca` — `IDLE_GATE_TRACE` instrumentation (`#ifdef`-gated, off by default)
+- `b18a608` — `tools/test_idle_energy_gate.cc` unit test for the gate primitive
+- `0061e0f` — measured RPi1 quiet-channel RMS distribution + calibrated
+  `IDLE_ENERGY_GATE_RMS = 0.002`
+- (this commit) — `include/datalink_layer/idle_energy_gate.h`: the pure,
+  header-only gate primitive (`idle_passband_rms` / `idle_energy_gate_open`),
+  ZERO behaviour change (no production caller). Unit test 3/3 passing; the
+  test's `M_PI` compile error on the MinGW toolchain was fixed
+  (`_USE_MATH_DEFINES` before `<cmath>`).
+
+NOT done — the open item (still Priority 3):
+- Step 3: wire `idle_energy_gate_open()` into the `process_main()` IDLE block so
+  the decimated FIR is skipped on a quiet channel (~25-30 lines), then re-profile
+  RPi1. The §7 step sequence and the calibrated threshold are ready; only the
+  integration + verification remain. The abandoned-integration host smoke tool
+  (`tools/idle_gate_loopback_smoke.py`) was discarded — it has no value without
+  the integration and is trivial to recreate from the §7 plan.
