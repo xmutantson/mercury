@@ -26,6 +26,7 @@
 #include <complex>
 #include <math.h>
 #include <iostream>
+#include <cstdint>
 #include "misc.h"
 #include "physical_defines.h"
 #include "fir_filter.h"
@@ -160,13 +161,20 @@ public:
 	TimeSyncResult time_sync_preamble_fft(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb);
 	TimeSyncResult time_sync_preamble_fft_fine(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int coarse_pos, int search_half_window);
 	int time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, const int* preamble_tones, int mfsk_M, int nStreams, const int* stream_offsets, int search_start_symb = 0, double* out_metric = nullptr);
-	double detect_ack_pattern(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int ack_nsymb, const int* ack_tones, int ack_pattern_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int* out_matched = nullptr, int suffix_start = 0, int* out_suffix_matched = nullptr, int* out_best_offset = nullptr, int reserve_after = 0);
+	double detect_ack_pattern(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int ack_nsymb, const int* ack_tones, int ack_pattern_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int* out_matched = nullptr, int suffix_start = 0, int* out_suffix_matched = nullptr, int* out_best_offset = nullptr, int reserve_after = 0, uint32_t* out_match_mask = nullptr);
 	void decode_suffix_tones(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int pattern_offset, int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int* out_tones);
 	void decode_suffix_tones_soft(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int pattern_offset, int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, float* out_energies, int* out_hard_tones = nullptr);
 	int symbol_sync(std::complex <double>*, int size, int interpolation_rate, int location_to_return);
 	void rational_resampler(std::complex <double>* in, int in_size , std::complex <double>* out, int rate, int interpolation_decimation);
 	void baseband_to_passband(std::complex <double>* in, int in_size, double* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int interpolation_rate);
 	void passband_to_baseband(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int decimation_rate, cl_FIR* filter, int sample_offset=0);
+	// Combined mix + polyphase FIR + decimate: writes in_size/M complex samples
+	// directly to `out` at the decimated rate. Use when the caller would
+	// otherwise call passband_to_baseband() at the high rate then immediately
+	// rational_resampler() to decimate — this fuses both and skips the
+	// (M-1)/M of FIR outputs the old chain threw away. Profile on Pi RX side
+	// showed FIR at 92% CPU; this drops the FIR portion ~M× on hot paths.
+	void passband_to_baseband_decimated(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int M, cl_FIR* filter, int sample_offset=0);
 	struct st_channel_complex * estimated_channel, *estimated_channel_without_amplitude_restoration;
 	int Nfft,Nc,Nsymb;
 	float gi;

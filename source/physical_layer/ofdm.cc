@@ -30,6 +30,34 @@
 #define POCKETFFT_NO_MULTITHREADING
 #include "physical_layer/pocketfft_hdronly.h"
 
+#include <map>
+
+namespace {
+// FFT plan cache. pocketfft's c2c() builds a new plan on every call, allocating
+// twiddle factors via sincos — profile on Pi showed pocketfft_c::cfftp ctor +
+// sincos_2pibyn ctor at ~12% CPU. Caching plans by size eliminates that.
+// Single-threaded access (Mercury FFT calls are all from the ARQ thread per
+// the comment at line 146 — time_sync_mfsk and detect_ack_pattern never run
+// concurrently). No mutex needed.
+std::map<size_t, pocketfft::detail::pocketfft_c<double>>& fft_plan_cache()
+{
+	static std::map<size_t, pocketfft::detail::pocketfft_c<double>> cache;
+	return cache;
+}
+const pocketfft::detail::pocketfft_c<double>& get_fft_plan(size_t n)
+{
+	auto& cache = fft_plan_cache();
+	auto it = cache.find(n);
+	if (it == cache.end())
+	{
+		it = cache.emplace(std::piecewise_construct,
+		                   std::forward_as_tuple(n),
+		                   std::forward_as_tuple(n)).first;
+	}
+	return it->second;
+}
+} // anonymous namespace
+
 
 cl_ofdm::cl_ofdm()
 {
@@ -271,22 +299,21 @@ void cl_ofdm::deinit_fft_tables()
 	fft_twiddle_size = 0;
 }
 
-// Optimized FFT — PocketFFT (mixed-radix, auto-vectorized)
+// Optimized FFT — PocketFFT with cached plans.
+// pocketfft::c2c() reconstructs the plan on every call; we cache by size.
+// std::complex<double> and pocketfft::detail::cmplx<double> have identical
+// layout ({real, imag}), so reinterpret_cast is safe.
 void cl_ofdm::_fft_fast(std::complex<double>* v, int n)
 {
-	pocketfft::shape_t shape{(size_t)n};
-	pocketfft::stride_t stride{(ptrdiff_t)sizeof(std::complex<double>)};
-	pocketfft::shape_t axes{0};
-	pocketfft::c2c(shape, stride, stride, axes, pocketfft::FORWARD, v, v, 1.0);
+	const auto& plan = get_fft_plan((size_t)n);
+	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(v), 1.0, true);
 }
 
-// Optimized IFFT — PocketFFT (mixed-radix, auto-vectorized)
+// Optimized IFFT — PocketFFT with cached plans.
 void cl_ofdm::_ifft_fast(std::complex<double>* v, int n)
 {
-	pocketfft::shape_t shape{(size_t)n};
-	pocketfft::stride_t stride{(ptrdiff_t)sizeof(std::complex<double>)};
-	pocketfft::shape_t axes{0};
-	pocketfft::c2c(shape, stride, stride, axes, pocketfft::BACKWARD, v, v, 1.0);
+	const auto& plan = get_fft_plan((size_t)n);
+	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(v), 1.0, false);
 }
 
 void cl_ofdm::zero_padder(std::complex <double>* in, std::complex <double>* out)
@@ -343,31 +370,20 @@ void cl_ofdm::gi_remover(std::complex <double>* in, std::complex <double>* out)
 
 void cl_ofdm::fft(std::complex <double>* in, std::complex <double>* out)
 {
-	for(int i=0;i<Nfft;i++)
-	{
-		out[i]=in[i];
-	}
-	_fft_fast(out,Nfft);  // Use optimized FFT
-
-	for(int i=0;i<Nfft;i++)
-	{
-		out[i]=out[i]/(double)Nfft;
-	}
-
+	// Single std::copy (compiler emits memcpy), then in-place FFT with the
+	// 1/Nfft scale folded into pocketfft's exec factor — removes the second
+	// pass over Nfft samples that the explicit divide loop did.
+	std::copy(in, in + Nfft, out);
+	const auto& plan = get_fft_plan((size_t)Nfft);
+	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(out),
+	          1.0 / (double)Nfft, true);
 }
 void cl_ofdm::fft(std::complex <double>* in, std::complex <double>* out, int _Nfft)
 {
-	for(int i=0;i<_Nfft;i++)
-	{
-		out[i]=in[i];
-	}
-	_fft_fast(out,_Nfft);  // Use optimized FFT
-
-	for(int i=0;i<_Nfft;i++)
-	{
-		out[i]=out[i]/(double)_Nfft;
-	}
-
+	std::copy(in, in + _Nfft, out);
+	const auto& plan = get_fft_plan((size_t)_Nfft);
+	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(out),
+	          1.0 / (double)_Nfft, true);
 }
 
 void cl_ofdm::_fft(std::complex <double> *v, int n)
@@ -403,20 +419,16 @@ void cl_ofdm::_fft(std::complex <double> *v, int n)
 
 void cl_ofdm::ifft(std::complex <double>* in, std::complex <double>* out)
 {
-	for(int i=0;i<Nfft;i++)
-	{
-		out[i]=in[i];
-	}
-	_ifft_fast(out,Nfft);  // Use optimized IFFT
+	std::copy(in, in + Nfft, out);
+	const auto& plan = get_fft_plan((size_t)Nfft);
+	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(out), 1.0, false);
 }
 
 void cl_ofdm::ifft(std::complex <double>* in, std::complex <double>* out,int _Nfft)
 {
-	for(int i=0;i<_Nfft;i++)
-	{
-		out[i]=in[i];
-	}
-	_ifft_fast(out,_Nfft);  // Use optimized IFFT
+	std::copy(in, in + _Nfft, out);
+	const auto& plan = get_fft_plan((size_t)_Nfft);
+	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(out), 1.0, false);
 }
 
 void cl_ofdm::_ifft(std::complex <double>* v,int n)
@@ -3282,7 +3294,8 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
                                    int nStreams, const int* stream_offsets,
                                    int* out_matched,
                                    int suffix_start, int* out_suffix_matched,
-                                   int* out_best_offset, int reserve_after)
+                                   int* out_best_offset, int reserve_after,
+                                   uint32_t* out_match_mask)
 {
 	int Nofdm = Nfft + Ngi;
 	int sym_period_interp = Nofdm * interpolation_rate;
@@ -3299,12 +3312,14 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	int best_pos = -1;
 	int best_matched = 0;
 	int best_suffix_matched = 0;
+	uint32_t best_match_mask = 0;
 
 	for (int s = 0; s <= buffer_nsymb - total_needed; s++)
 	{
 		double metric = 0;
 		int matched = 0;
 		int suffix_matched = 0;
+		uint32_t match_mask = 0;
 
 		for (int p = 0; p < ack_nsymb; p++)
 		{
@@ -3384,6 +3399,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 				continue;
 
 			matched++;
+			if (p < 32) match_mask |= (1u << p);
 			if (suffix_start > 0 && p >= suffix_start)
 				suffix_matched++;
 
@@ -3411,6 +3427,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			best_pos = s;
 			best_matched = matched;
 			best_suffix_matched = suffix_matched;
+			best_match_mask = match_mask;
 		}
 	}
 
@@ -3429,6 +3446,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 		int fine_best_suffix = 0;
 		int fine_best_offset = coarse_offset;
 
+		uint32_t fine_best_mask = 0;
 		for (int d = coarse_offset - search_half; d <= coarse_offset + search_half;
 		     d += interpolation_rate)
 		{
@@ -3440,6 +3458,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			double metric_f = 0;
 			int matched_f = 0;
 			int suffix_f = 0;
+			uint32_t mask_f = 0;
 			bool oob = false;
 
 			for (int p = 0; p < ack_nsymb && !oob; p++)
@@ -3489,6 +3508,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 
 				if (streams_ok < nStreams) continue;
 				matched_f++;
+				if (p < 32) mask_f |= (1u << p);
 				if (suffix_start > 0 && p >= suffix_start)
 					suffix_f++;
 
@@ -3513,6 +3533,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 				fine_best_suffix = suffix_f;
 				fine_best_metric = metric_f;
 				fine_best_offset = d;
+				fine_best_mask = mask_f;
 			}
 		}
 
@@ -3524,6 +3545,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			best_suffix_matched = fine_best_suffix;
 			best_metric = fine_best_metric;
 			best_pos = fine_best_offset;  // keep as interpolated sample offset
+			best_match_mask = fine_best_mask;
 		}
 		else
 		{
@@ -3541,6 +3563,8 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 		*out_suffix_matched = best_suffix_matched;
 	if (out_best_offset)
 		*out_best_offset = best_pos;  // interpolated sample offset (-1 if not found)
+	if (out_match_mask)
+		*out_match_mask = best_match_mask;
 
 	return best_metric;
 }
@@ -3846,13 +3870,83 @@ void cl_ofdm::passband_to_baseband(double* in, int in_size, std::complex <double
 		p2b_buffer_size = in_size;
 	}
 
+	// Phase recurrence: replace per-sample sincos with one complex multiply.
+	// Pre-Pi profile showed __sincos at 10.1% CPU; this loop is the dominant
+	// caller. Drift over a single in_size call (≤~325k samples) is well below
+	// floating-point round-off significance for the downstream FIR.
+	double angle_step = 2.0 * M_PI * carrier_frequency * sampling_interval;
+	double angle_start = angle_step * (double)sample_offset;
+	double pr = std::cos(angle_start);
+	double pi = std::sin(angle_start);
+	double sr = std::cos(angle_step);
+	double si = std::sin(angle_step);
 	for(int i=0;i<in_size;i++)
 	{
-		p2b_l_data[i].real(in[i]*carrier_amplitude*cos(2*M_PI*carrier_frequency*(double)(i+sample_offset) * sampling_interval));
-		p2b_l_data[i].imag(in[i]*carrier_amplitude*sin(2*M_PI*carrier_frequency*(double)(i+sample_offset) * sampling_interval));
+		double a = in[i] * carrier_amplitude;
+		p2b_l_data[i].real(a * pr);
+		p2b_l_data[i].imag(a * pi);
+		// Rotate phasor: (pr + j*pi) *= (sr + j*si)
+		double npr = pr * sr - pi * si;
+		double npi = pr * si + pi * sr;
+		pr = npr;
+		pi = npi;
 	}
 
-	filter->apply(p2b_l_data,p2b_data_filtered,in_size);
-
+	// Note: callers currently pass decimation_rate=1 here, so this loop is
+	// pure FIR (no decimation). Actual decimation by interpolation_rate is
+	// done by a separate rational_resampler() call downstream. To unlock
+	// the polyphase ~8× FIR win, callers would need to be refactored to
+	// pass decimation_rate=interpolation_rate and route through
+	// `filter->apply_decimate(...)`. That refactor touches many call sites
+	// (telecom_system.cc and time_sync paths) and is deferred — the
+	// apply_decimate function is in place and bit-exact-tested, ready for
+	// use when the surrounding refactor happens. See PI_CPU_OPTIMIZATION_REPORT.
+	filter->apply(p2b_l_data, p2b_data_filtered, in_size);
 	rational_resampler(p2b_data_filtered, in_size, out, decimation_rate, DECIMATION);
+}
+
+// Combined mix + polyphase FIR + decimate. Writes in_size/M complex samples
+// directly to `out` at the decimated rate.
+//
+// Used by the detector hot paths (detect_*_pattern_from_passband) that
+// previously did mix -> FIR-at-high-rate -> downstream picks every Mth
+// sample. The FIR portion of those paths was 92% of CPU on Pi RX side;
+// the polyphase identity drops it ~M× because only the kept outputs are
+// computed. Bit-exact equivalent to passband_to_baseband(... rate=1 ...)
+// followed by picking every Mth sample.
+void cl_ofdm::passband_to_baseband_decimated(double* in, int in_size,
+	std::complex<double>* out, double sampling_frequency, double carrier_frequency,
+	double carrier_amplitude, int M, cl_FIR* filter, int sample_offset)
+{
+	double sampling_interval = 1.0 / sampling_frequency;
+
+	if (p2b_buffer_size < in_size)
+	{
+		if (p2b_l_data != NULL) delete[] p2b_l_data;
+		if (p2b_data_filtered != NULL) delete[] p2b_data_filtered;
+		p2b_l_data = new std::complex<double>[in_size];
+		p2b_data_filtered = new std::complex<double>[in_size];
+		p2b_buffer_size = in_size;
+	}
+
+	// Mix to baseband via phase recurrence (no per-sample sincos).
+	double angle_step = 2.0 * M_PI * carrier_frequency * sampling_interval;
+	double angle_start = angle_step * (double)sample_offset;
+	double pr = std::cos(angle_start);
+	double pi = std::sin(angle_start);
+	double sr = std::cos(angle_step);
+	double si = std::sin(angle_step);
+	for (int i = 0; i < in_size; i++)
+	{
+		double a = in[i] * carrier_amplitude;
+		p2b_l_data[i].real(a * pr);
+		p2b_l_data[i].imag(a * pi);
+		double npr = pr * sr - pi * si;
+		double npi = pr * si + pi * sr;
+		pr = npr;
+		pi = npi;
+	}
+
+	// Combined FIR + decimation: produces only in_size/M outputs.
+	filter->apply_decimate(p2b_l_data, out, in_size, M);
 }

@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include "common/timing_log.h"
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -779,6 +780,11 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_matched = 0;
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
+		sack_diag_peak_matched = 0;
+		sack_diag_peak_metric = 0.0;
+		sack_diag_poll_count = 0;
+		sack_diag_peak_max_e = 0.0;
+		sack_diag_peak_max_seg = -1;
 		calculate_receiving_timeout();
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
@@ -830,7 +836,10 @@ void cl_arq_controller::process_messages_tx_data()
 	{
 		telecom_system->set_mfsk_ctrl_mode(false);  // data TX (full-length frames)
 		pad_messages_batch_tx(data_batch_size);
+		mtl::log_event_kv("cmd_batch_tx_start", "batch=%lld nframes=%d cfg=%d",
+		                  stats.nBatches_sent + 1, data_batch_size, current_configuration);
 		send_batch();
+		mtl::log_event_kv("cmd_batch_tx_done", "batch=%lld", stats.nBatches_sent + 1);
 		stats.nBatches_sent++;
 		last_transmission_block_stats.nBatches_sent++;
 
@@ -853,6 +862,11 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_matched = 0;
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
+		sack_diag_peak_matched = 0;
+		sack_diag_peak_metric = 0.0;
+		sack_diag_poll_count = 0;
+		sack_diag_peak_max_e = 0.0;
+		sack_diag_peak_max_seg = -1;
 		// ACK pattern detection uses dedicated ack_mfsk — no config switch needed
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
@@ -1491,6 +1505,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			{
 				printf("[CMD-ACK-PAT] Data ACK pattern detected!\n");
 				fflush(stdout);
+				mtl::log_event_kv("cmd_ack_detected", "batch=%lld", stats.nBatches_sent);
 				clear_buffer(playback_buffer);
 				link_timer.start();
 				watchdog_timer.start();
@@ -1658,10 +1673,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// receive control frames while waiting for data). Skip directly to
 			// retransmit — avoids stuck loop where REPEAT_LAST_ACK was queued
 			// but never sent (connection_status stayed RECEIVING_ACKS_DATA).
-			printf("[CMD-ACK-PAT] Timeout: no ACK detected, peak_matched=%d/%d peak_metric=%.1f polls=%d\n",
-				ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold,
-				ack_diag_peak_metric, ack_diag_poll_count);
-			fflush(stdout);
+			{
+				// Per-symbol mask diagnostic: which positions matched at peak.
+				int nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
+				if(nsymb > 32) nsymb = 32;
+				char mask_str[80]; int mp = 0;
+				for(int i = 0; i < nsymb && mp < (int)sizeof(mask_str) - 2; i++)
+					mask_str[mp++] = (ack_diag_peak_mask & (1u << i)) ? '1' : '0';
+				mask_str[mp] = '\0';
+				printf("[CMD-ACK-PAT] Timeout: no ACK detected, peak_matched=%d/%d peak_metric=%.1f polls=%d mask=%s\n",
+					ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold,
+					ack_diag_peak_metric, ack_diag_poll_count, mask_str);
+				// Plan A1: SACK diag — what did the SACK detector see during the same window?
+				printf("[CMD-SACK-DIAG] sack_peak_matched=%d/%d sack_peak_metric=%.2f polls=%d max_seg=%d max_e=%.6f\n",
+					sack_diag_peak_matched, telecom_system->ack_mfsk.sack_match_threshold,
+					sack_diag_peak_metric, sack_diag_poll_count,
+					sack_diag_peak_max_seg, sack_diag_peak_max_e);
+				fflush(stdout);
+			}
 			stats.nNAcked_data++;
 			// Force all PENDING_ACK messages to ACK_TIMED_OUT so
 			// process_messages_tx_data() can resend them immediately.

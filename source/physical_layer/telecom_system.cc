@@ -781,6 +781,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.message_decoded=NO;
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.frame_data_missing=false;
+	receive_stats.frame_skip_var_aborted=false;
 	receive_stats.sync_trials=0;
 
 	// Timing breakdown
@@ -1505,6 +1506,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		skip_h_count = 0;
 		double mean_H = -1.0;
 		bool skip_h_recovery_attempted = false;
+		int consecutive_skip_var = 0;  // Phase-F stall fix: break trial loop if N+ SKIP-VAR in a row
 skip_h_retry_point:
 		while (receive_stats.sync_trials<=time_sync_trials_max)
 		{
@@ -1709,11 +1711,25 @@ skip_h_retry_point:
 			int pb_size = pb_end - pb_start;
 
 			auto t2_pb = std::chrono::steady_clock::now();
-			ofdm.passband_to_baseband(&data[pb_start],pb_size,&data_container.baseband_data_interpolated[pb_start],sampling_frequency,effective_carrier_freq,carrier_amplitude,1,&ofdm.FIR_rx_data,pb_start);
+			// Fused polyphase: mix + FIR + decimate-by-M in one pass. Writes
+			// pb_size/M decimated samples to baseband_data_interpolated[0..],
+			// then we extract the frame region (skipping FIR margin) to
+			// baseband_data. Bit-exact equivalent to the old apply-then-pick
+			// chain. (extraction_delay - pb_start) is fir_margin, a multiple
+			// of M, so the index arithmetic is exact.
+			{
+				int Mdec = data_container.interpolation_rate;
+				int margin_dec = (extraction_delay - pb_start) / Mdec;
+				int frame_dec = frame_size_interp / Mdec;
+				ofdm.passband_to_baseband_decimated(&data[pb_start], pb_size,
+					data_container.baseband_data_interpolated,
+					sampling_frequency, effective_carrier_freq, carrier_amplitude,
+					Mdec, &ofdm.FIR_rx_data, pb_start);
+				for(int i = 0; i < frame_dec; i++)
+					data_container.baseband_data[i] = data_container.baseband_data_interpolated[margin_dec + i];
+			}
 			auto t3_pb = std::chrono::steady_clock::now();
 			timing_pb_data_ms += std::chrono::duration<double, std::milli>(t3_pb - t2_pb).count();
-
-			ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
 
 			if(ofdm_forced_delay >= 0)
 			{
@@ -1780,10 +1796,22 @@ skip_h_retry_point:
 			{
 				// Apply fine correction on top of coarse correction (scoped to frame region)
 				auto t6_pb = std::chrono::steady_clock::now();
-				ofdm.passband_to_baseband(&data[pb_start],pb_size,&data_container.baseband_data_interpolated[pb_start],sampling_frequency,effective_carrier_freq+freq_offset_measured,carrier_amplitude,1,&ofdm.FIR_rx_data,pb_start);
+				// Fused polyphase (fine-frequency-correction branch).
+				{
+					int Mdec = data_container.interpolation_rate;
+					int margin_dec = (extraction_delay - pb_start) / Mdec;
+					int frame_dec = frame_size_interp / Mdec;
+					ofdm.passband_to_baseband_decimated(&data[pb_start], pb_size,
+						data_container.baseband_data_interpolated,
+						sampling_frequency,
+						effective_carrier_freq + freq_offset_measured,
+						carrier_amplitude,
+						Mdec, &ofdm.FIR_rx_data, pb_start);
+					for(int i = 0; i < frame_dec; i++)
+						data_container.baseband_data[i] = data_container.baseband_data_interpolated[margin_dec + i];
+				}
 				auto t7_pb = std::chrono::steady_clock::now();
 				timing_pb_data_ms += std::chrono::duration<double, std::milli>(t7_pb - t6_pb).count();
-				ofdm.rational_resampler(&data_container.baseband_data_interpolated[extraction_delay], frame_size_interp, data_container.baseband_data, data_container.interpolation_rate, DECIMATION);
 			}
 			{
 				int rx_nsymb = get_active_nsymb();
@@ -1920,14 +1948,32 @@ skip_h_retry_point:
 				// unusable. Good frames: var=0.01-0.10. Garbage: var=1.7-3.3.
 				// Skip LDPC to free receiver for real frames.
 				// Phase-2 validation: --skip-var-gate=off bypasses this gate.
+				//
+				// Phase-F stall fix (2026-05-12): if 3+ consecutive trials all
+				// SKIP-VAR, the entire trial range is noise — abort the trial
+				// loop entirely so the caller advances the buffer past this
+				// noise region instead of burning 20 trials (~2 s) on it.
 				if(skip_var_gate_enabled && ofdm.noise_variance_estimate > 0.5)
 				{
 					printf("[OFDM-SYNC] trial %d SKIP-VAR: var=%.4f too high (>0.5), skipping LDPC\n",
 						receive_stats.sync_trials, ofdm.noise_variance_estimate);
 					fflush(stdout);
 					receive_stats.sync_trials++;
+					consecutive_skip_var++;
+					if(consecutive_skip_var >= 3)
+					{
+						printf("[OFDM-SYNC] %d consecutive SKIP-VAR — abort trial loop, advance buffer\n",
+							consecutive_skip_var);
+						fflush(stdout);
+						// Signal caller to zero the false preamble region and advance
+						// the search cursor past it. Without this, the next receive_byte
+						// call re-locks on the same noise and we burn another 3 trials.
+						receive_stats.frame_skip_var_aborted = true;
+						break;
+					}
 					continue;
 				}
+				consecutive_skip_var = 0;  // reset on any non-SKIP-VAR path
 
 				if(ofdm.channel_estimator_amplitude_restoration==YES)
 				{
@@ -2418,26 +2464,29 @@ int cl_telecom_system::generate_ack_pattern_passband(double* out)
 
 // RX: Detect ACK pattern in passband audio buffer
 // Returns detection metric (0.0 = noise, up to ack_pattern_nsymb = perfect)
-double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int size, int* out_matched)
+double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int size, int* out_matched, uint32_t* out_match_mask)
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
 
-	// Passband to baseband — use corrected carrier (same offset as OFDM data demod)
+	// Fused mix + polyphase FIR + decimate: only the kept samples are computed,
+	// dropping the FIR portion ~M× vs the prior mix → FIR-at-high-rate → pick-every-Mth
+	// chain. Detector then runs on the already-decimated stream (interp_rate=1).
+	int M = data_container.interpolation_rate;
 	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
-	ofdm.passband_to_baseband(data, size,
+	ofdm.passband_to_baseband_decimated(data, size,
 		data_container.baseband_data_interpolated,
 		sampling_frequency, effective_carrier, carrier_amplitude,
-		1, &ofdm.FIR_rx_data);
+		M, &ofdm.FIR_rx_data);
 
 	// Run matched-filter ACK detector — always use dedicated ack_mfsk (config-independent)
 	double metric = ofdm.detect_ack_pattern(
-		data_container.baseband_data_interpolated, size,
-		data_container.interpolation_rate,
+		data_container.baseband_data_interpolated, size / M,
+		1,
 		ack_mfsk.ack_pattern_nsymb,
 		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
-		out_matched);
+		out_matched, 0, nullptr, nullptr, 0, out_match_mask);
 
 	return metric;
 }
@@ -2483,19 +2532,21 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	*out_snr_valid = false;
 	if(ack_pattern_passband_samples <= 0) return -99.0f;
 
-	// Passband to baseband — use corrected carrier (same offset as OFDM data demod)
+	// Polyphase decimated path: mix + FIR + decimate fused.
+	int M = data_container.interpolation_rate;
+	int dec_size = size / M;
 	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
-	ofdm.passband_to_baseband(data, size,
+	ofdm.passband_to_baseband_decimated(data, size,
 		data_container.baseband_data_interpolated,
 		sampling_frequency, effective_carrier, carrier_amplitude,
-		1, &ofdm.FIR_rx_data);
+		M, &ofdm.FIR_rx_data);
 
 	// Detect ACK pattern and get the detected position.
 	// Reserve SNR_SUFFIX_LEN symbols after the ACK so suffix always fits.
 	int best_offset = -1;
 	double metric = ofdm.detect_ack_pattern(
-		data_container.baseband_data_interpolated, size,
-		data_container.interpolation_rate,
+		data_container.baseband_data_interpolated, dec_size,
+		1,
 		ack_mfsk.ack_pattern_nsymb,
 		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
@@ -2506,11 +2557,11 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	if(*out_matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
 		return -99.0f;
 
-	// Decode suffix tones at the detected position
+	// Decode suffix tones at the detected position (decimated buffer, rate=1).
 	int suffix_tones[cl_mfsk::SNR_SUFFIX_LEN];
 	ofdm.decode_suffix_tones(
-		data_container.baseband_data_interpolated, size,
-		data_container.interpolation_rate,
+		data_container.baseband_data_interpolated, dec_size,
+		1,
 		best_offset, ack_mfsk.ack_pattern_nsymb,
 		cl_mfsk::SNR_SUFFIX_LEN,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
@@ -2598,15 +2649,16 @@ double cl_telecom_system::detect_break_pattern_from_passband(double* data, int s
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
 
+	int M = data_container.interpolation_rate;
 	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
-	ofdm.passband_to_baseband(data, size,
+	ofdm.passband_to_baseband_decimated(data, size,
 		data_container.baseband_data_interpolated,
 		sampling_frequency, effective_carrier, carrier_amplitude,
-		1, &ofdm.FIR_rx_data);
+		M, &ofdm.FIR_rx_data);
 
 	double metric = ofdm.detect_ack_pattern(
-		data_container.baseband_data_interpolated, size,
-		data_container.interpolation_rate,
+		data_container.baseband_data_interpolated, size / M,
+		1,
 		ack_mfsk.ack_pattern_nsymb,
 		ack_mfsk.break_tones, ack_mfsk.ack_pattern_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
@@ -2656,15 +2708,16 @@ double cl_telecom_system::detect_hail_pattern_from_passband(double* data, int si
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
 
+	int M = data_container.interpolation_rate;
 	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
-	ofdm.passband_to_baseband(data, size,
+	ofdm.passband_to_baseband_decimated(data, size,
 		data_container.baseband_data_interpolated,
 		sampling_frequency, effective_carrier, carrier_amplitude,
-		1, &ofdm.FIR_rx_data);
+		M, &ofdm.FIR_rx_data);
 
 	double metric = ofdm.detect_ack_pattern(
-		data_container.baseband_data_interpolated, size,
-		data_container.interpolation_rate,
+		data_container.baseband_data_interpolated, size / M,
+		1,
 		ack_mfsk.hail_detect_nsymb,
 		ack_mfsk.hail_detect_tones, ack_mfsk.hail_detect_nsymb,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,

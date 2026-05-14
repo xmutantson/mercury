@@ -23,6 +23,7 @@
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
+#include "common/timing_log.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -225,6 +226,12 @@ cl_arq_controller::cl_arq_controller()
 	ack_diag_peak_matched=0;
 	ack_diag_peak_metric=0.0;
 	ack_diag_poll_count=0;
+	ack_diag_peak_mask=0;
+	sack_diag_peak_matched=0;
+	sack_diag_peak_metric=0.0;
+	sack_diag_poll_count=0;
+	sack_diag_peak_max_e=0.0;
+	sack_diag_peak_max_seg=-1;
 
 	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
 	ack_metric_threshold=0.5;     // Phase-2 flag default = HEAD (7076a4b 3.0→0.5)
@@ -3102,12 +3109,14 @@ void cl_arq_controller::send_batch()
 	}
 	telecom_system->data_container.rx_mute = 0;
 	telecom_system->data_container.rx_mute_samples = 0;
+	mtl::log_event("cmd_post_tx_unmute");
 
 	ptt_off_delay.start();
 	while(ptt_off_delay.get_elapsed_time_ms() < ptt_off_delay_ms)
 		msleep(1);
 
 	ptt_off();
+	mtl::log_event("cmd_ptt_off");
 
 	if (batch_frames_output_data!=NULL)
 	{
@@ -3175,6 +3184,7 @@ void cl_arq_controller::send_ack_pattern()
 	cl_timer ack_turnaround_timer;
 	ack_turnaround_timer.start();
 	printf("[TX-ACK-PAT] Sending ACK pattern on CONFIG_%d at t=%dms\n", current_configuration, (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
+	mtl::log_event("rsp_ack_send_start");
 
 	// Wait for the full OFDM frame to finish being received before
 	// transmitting. With high-redundancy LDPC (e.g. CONFIG_0 rate 1/16),
@@ -3293,6 +3303,7 @@ void cl_arq_controller::send_ack_pattern()
 		msleep(1);
 
 	printf("[TX-ACK-PAT] Audio done at t=%dms\n", (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
+	mtl::log_event("rsp_ack_audio_done");
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -3340,6 +3351,7 @@ void cl_arq_controller::send_ack_pattern()
 	}
 
 	printf("[TX-ACK-PAT] Done at t=%dms, flushed capture buffer, nUnder reset, ftr=%d\n", (int)ack_turnaround_timer.get_elapsed_time_ms(), telecom_system->data_container.frames_to_read.load());
+	mtl::log_event_kv("rsp_post_ack_flush_done", "ftr=%d", telecom_system->data_container.frames_to_read.load());
 	fflush(stdout);
 
 	// PTT off delay + release after flush. The capture thread is active
@@ -3684,6 +3696,17 @@ bool cl_arq_controller::receive_sack_pattern(bool* out_bitmap, int nframes)
 		// Diagnostic printf removed from hot polling loop — causes 175-875ms
 		// cumulative latency on Windows console (same issue as ACK polling,
 		// see comment at line ~4124).
+		// Plan A1: lightweight tracker — record peak matched/metric across
+		// the polling window so we can see what the detector saw even when
+		// it never crosses threshold. No printf in hot loop; report on exit.
+		if(matched > sack_diag_peak_matched)
+		{
+			sack_diag_peak_matched = matched;
+			sack_diag_peak_metric = metric;
+			sack_diag_peak_max_e = max_e;
+			sack_diag_peak_max_seg = max_seg;
+		}
+		sack_diag_poll_count++;
 
 		if(matched >= telecom_system->ack_mfsk.sack_match_threshold && metric >= 0.5)
 		{
@@ -4070,6 +4093,43 @@ bool cl_arq_controller::receive_ack_pattern()
 
 		int matched_count = 0;
 
+		// Energy gate (Opt 1): the ACK matched filter runs ~528 FFTs per call,
+		// dominating CPU during idle polling. Skip the entire detection when
+		// the recent audio tail has no signal. Floor measured at -73 dBFS
+		// (≈0.0002 RMS); a single MFSK tone is at ≈0.02 RMS. Gate at 0.001
+		// (≈14 dB above noise) — well below the smallest real ACK level but
+		// well above silence/rx_mute noise.
+		// Per-window reset of energy-log tracker (diagnostic).
+		static bool energy_logged_this_window = false;
+		if(ack_diag_poll_count == 0)
+		{
+			mtl::log_event("cmd_first_ack_poll");
+			energy_logged_this_window = false;
+		}
+		const double ACK_ENERGY_GATE_RMS = 0.001;
+		int probe_n = 8 * sym_samples;
+		if(probe_n > tail_samples) probe_n = tail_samples;
+		double* tail_ptr = telecom_system->data_container.ready_to_process_passband_delayed_data
+			+ (tail_samples - probe_n);
+		double sumsq = 0.0;
+		for(int i = 0; i < probe_n; i++) sumsq += tail_ptr[i] * tail_ptr[i];
+		double tail_rms = std::sqrt(sumsq / probe_n);
+		if(!energy_logged_this_window && tail_rms > 0.005)
+		{
+			mtl::log_event_kv("cmd_ack_buffer_energy", "rms=%.4f", tail_rms);
+			energy_logged_this_window = true;
+		}
+		if(tail_rms < ACK_ENERGY_GATE_RMS)
+		{
+			// Silent buffer — skip FFT-heavy ACK search this poll.
+			ack_diag_poll_count++;
+			MUTEX_LOCK(&capture_prep_mutex);
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			return false;
+		}
+
 		if(turbo_snr_ack_enabled)
 		{
 			// Turboshift mode: detect ACK and decode SNR suffix.
@@ -4173,12 +4233,17 @@ bool cl_arq_controller::receive_ack_pattern()
 		else
 		{
 			// Normal mode: just detect ACK pattern
+			uint32_t this_mask = 0;
 			double metric = telecom_system->detect_ack_pattern_from_passband(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
-				tail_samples, &matched_count);
+				tail_samples, &matched_count, &this_mask);
 
 			// Track peak detection values for timeout diagnostic (no printf in hot loop)
-			if(matched_count > ack_diag_peak_matched) ack_diag_peak_matched = matched_count;
+			if(matched_count > ack_diag_peak_matched)
+			{
+				ack_diag_peak_matched = matched_count;
+				ack_diag_peak_mask = this_mask;
+			}
 			if(metric > ack_diag_peak_metric) ack_diag_peak_metric = metric;
 			ack_diag_poll_count++;
 

@@ -294,6 +294,7 @@ int main(int argc, char *argv[])
     int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 3000)
     bool no_sack_cli = false;          // --no-sack: force disable (no-op after B2 fix)
     bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
+    int audio_buffer_ms_cli = 0;       // --alsa-buffer-ms=N (Linux only; 0 = use 30ms default)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
     input_dev = (char *) malloc(ALSA_MAX_PATH);
@@ -533,6 +534,13 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--enable-sack") == 0)
         {
             enable_sack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--alsa-buffer-ms=", 17) == 0)
+        {
+            audio_buffer_ms_cli = atoi(argv[i] + 17);
+            if (audio_buffer_ms_cli < 3) { fprintf(stderr, "--alsa-buffer-ms: must be >= 3\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1217,6 +1225,10 @@ start_modem:
         if (sack_timeout_extra_ms_cli >= 0) {
             ARQ.sack_timeout_extra_ms = sack_timeout_extra_ms_cli;
             printf("[FLAG] --sack-timeout-extra-ms=%d\n", ARQ.sack_timeout_extra_ms);
+        }
+        if (audio_buffer_ms_cli > 0) {
+            g_audio_buffer_ms_override = audio_buffer_ms_cli;
+            printf("[FLAG] --alsa-buffer-ms=%d (Linux only)\n", audio_buffer_ms_cli);
         }
         if (no_sack_cli) {
             ARQ.disable_sack = true;

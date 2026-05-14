@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include "common/timing_log.h"
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -316,6 +317,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 						messages_rx_buffer.length,
 						(int)batch_rx_stopwatch.get_elapsed_time_ms());
 					fflush(stdout);
+					mtl::log_event_kv("rsp_data_frame_rxed", "id=%d seq=%d/%d len=%d",
+						(int)(unsigned char)messages_rx_buffer.id,
+						messages_rx_buffer.sequence_number, data_batch_size,
+						messages_rx_buffer.length);
 				}
 				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
 				batch_rx_frame_count++;

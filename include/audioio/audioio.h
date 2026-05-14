@@ -34,6 +34,9 @@
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
+// Phase-F validation: override ALSA buffer length (Linux only). 0 = default 30ms.
+extern int g_audio_buffer_ms_override;
+
 #if defined(_WIN32)
 extern HANDLE            capture_prep_mutex;
 #else

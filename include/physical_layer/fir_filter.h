@@ -55,6 +55,12 @@ public:
 	void design();
 	void apply(std::complex <double>* in, std::complex <double>* out, int nItems);
 	void apply(double* in, double* out, int nItems);
+	// Combined FIR + decimation: computes only the kept outputs (every Mth
+	// sample of what cl_FIR::apply would produce). Bit-exact equivalent of
+	// apply() followed by picking out[m*M], but does M× less work.
+	// out_size = in_size / M (caller's responsibility).
+	void apply_decimate(std::complex <double>* in, std::complex <double>* out,
+	                    int in_size, int M);
 	void deinit();
 
 	int filter_window;
