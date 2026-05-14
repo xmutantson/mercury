@@ -576,6 +576,14 @@ public:
   //   --enable-sack   (forces enable; opt-in for users who want SACK)
   bool disable_sack;
 
+  // Fault-injection toggle (CLI --test-sack-ldpc-fail). When true,
+  // receive_sack_pattern() forces ldpc_ok=false for every SACK reception,
+  // deterministically exercising the ldpc=NO code path on an otherwise
+  // healthy SACK. Used by the SACK ldpc=NO hard-fallback repro test
+  // (fact-documents/SACK_LDPC_FALLBACK_INVESTIGATION.md §7 Step 1).
+  // Default false — no effect on production builds.
+  bool force_sack_ldpc_fail;
+
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)
