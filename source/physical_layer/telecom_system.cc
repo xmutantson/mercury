@@ -925,14 +925,52 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				}
 			}
 		}
+		// Plan-B Step 6c: the eager full-rate time_sync FIR over the WHOLE
+		// passband buffer — the ~92% RPi RX-side idle-scan CPU cost — is
+		// REMOVED from the production OFDM path. Every OFDM time_sync consumer
+		// has been converted: the coarse Schmidl-Cox search (sites 2-7, 2247 +
+		// the primary site 3) runs on baseband_data_decimated; the fine
+		// refinement (Step-5 site-3 fine slice + Step-6b site-8) mixes+FIRs a
+		// small scoped full-rate slice from raw `data` on demand; every
+		// energy/signal gate (Step 6a) reads baseband_data_decimated.
+		// baseband_data_interpolated is no longer the full-buffer full-rate
+		// buffer for OFDM — it is only used as decimated-FIR scratch by the
+		// data-extraction path (passband_to_baseband_decimated writes there).
+		//
+		// EXCEPTION — MFSK (§7-inventory correction, found in Step 6c): the
+		// MFSK preamble detectors time_sync_mfsk_corr / time_sync_mfsk
+		// (telecom_system.cc:~1108/1117) ALSO consume the full-rate buffer,
+		// and time_sync_mfsk_corr does a 4x sub-symbol OVERSAMPLED search
+		// (P1_OVERSAMPLE=4, ofdm.cc:3100, Bug #44) — it needs FINER-than-
+		// decimated resolution and cannot run on baseband_data_decimated
+		// without a DSP redesign. The §7 inventory enumerated only the 9
+		// OFDM-time_sync consumers and missed this. Since the plan's CPU goal
+		// (§1) is the OFDM Schmidl-Cox idle scan, and MFSK is a separate,
+		// non-hot detector, the conservative fix is: keep the eager full-rate
+		// FIR ONLY when M == MOD_MFSK. For every OFDM config (the entire
+		// point of the plan) the FIR is gone.
+		//
+		// Under -DTIMESYNC_TRACE the eager call is ALSO kept (for all M) so
+		// the dual-path #ifdef verification checks (STEP2/3/4/5/6A/6B/6C)
+		// still have the old full-rate full-buffer buffer to compare against.
+		// Step 7 narrows this back to the M == MOD_MFSK case only.
+#ifdef TIMESYNC_TRACE
 		ofdm.passband_to_baseband((double*)data,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,carrier_frequency,carrier_amplitude,1,&ofdm.FIR_rx_time_sync);
+#else
+		if(M == MOD_MFSK)
+		{
+			ofdm.passband_to_baseband((double*)data,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,carrier_frequency,carrier_amplitude,1,&ofdm.FIR_rx_time_sync);
+		}
+#endif
 
-		// Plan-B Step 2: populate the decimated-rate buffer alongside the
-		// full-rate one. The time_sync FIR is the RPi RX-side hot path; once
-		// every time_sync consumer is converted (later steps) this REPLACES
-		// the full-rate call above. For now BOTH run — the extra cost is
-		// temporary and intentional. Bit-exact equivalent to the full-rate
-		// FIR followed by picking every Mth sample (see fir_filter.cc:227).
+		// Populate the decimated-rate buffer — the hot-path time_sync FIR now
+		// runs ONLY at the decimated rate (M× cheaper) for OFDM. Bit-exact
+		// equivalent to the full-rate FIR followed by picking every Mth sample
+		// (see fir_filter.cc:227). Skipped for MFSK: baseband_data_decimated is
+		// only consumed by the OFDM time_sync/energy paths (the MFSK detector
+		// reads baseband_data_interpolated, populated by the M==MOD_MFSK eager
+		// call above) — populating it for MFSK would be pure wasted work.
+		if(M != MOD_MFSK)
 		{
 			int p2b_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 			int p2b_M = data_container.interpolation_rate;
@@ -1163,10 +1201,22 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						if(st_start + st_size > buf_interp_st) st_size = buf_interp_st - st_start;
 						if(st_size > 0)
 						{
+							// Plan-B Step 6c (site 1, BER self-test — once per
+							// config, diagnostic only): run the coarse search on
+							// the decimated buffer. st_start and st_size are
+							// multiples of sym_st (= Nofdm*M), so /M is exact;
+							// the original used step = interp_st (= M), which
+							// only ever evaluates the M-grid, so the decimated
+							// step=1 search lands on the SAME grid — resolution-
+							// equivalent. Result mapped back to full rate.
+							// This is exactly the Step-3 recovery-site pattern.
+							int st_M = data_container.interpolation_rate;
+							int st_start_dec = st_start / st_M;
+							int st_size_dec = st_size / st_M;
 							TimeSyncResult selftest = ofdm.time_sync_preamble_halfsym(
-								&data_container.baseband_data_interpolated[st_start],
-								st_size, interp_st, interp_st);
-							int detected_delay = st_start + selftest.delay;
+								&data_container.baseband_data_decimated[st_start_dec],
+								st_size_dec, 1, 1);
+							int detected_delay = st_start + selftest.delay * st_M;
 							int gi_interp_st = data_container.Ngi * interp_st;
 							printf("[BER-DET] config=%d metric=%.4f delay=%d expected=%d %s\n",
 								current_configuration,
@@ -1174,6 +1224,30 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 								(selftest.correlation < preamble_detect_threshold
 								 || abs(detected_delay - ofdm_forced_delay) > gi_interp_st)
 								? "WARN-lowSNR" : "OK");
+#ifdef TIMESYNC_TRACE
+							// Dual-path: the old full-rate path must agree on the
+							// [BER-DET] verdict (metric threshold + delay window).
+							{
+								TimeSyncResult st_old = ofdm.time_sync_preamble_halfsym(
+									&data_container.baseband_data_interpolated[st_start],
+									st_size, interp_st, interp_st);
+								int dd_old = st_start + st_old.delay;
+								bool warn_new = (selftest.correlation < preamble_detect_threshold
+									|| abs(detected_delay - ofdm_forced_delay) > gi_interp_st);
+								bool warn_old = (st_old.correlation < preamble_detect_threshold
+									|| abs(dd_old - ofdm_forced_delay) > gi_interp_st);
+								if(timesync_trace_fp)
+								{
+									fprintf(timesync_trace_fp,
+										"# STEP6C-SITE1 new_delay=%d old_delay=%d diff=%d new_metric=%.6f old_metric=%.6f new_warn=%d old_warn=%d %s\n",
+										detected_delay, dd_old, detected_delay - dd_old,
+										selftest.correlation, st_old.correlation,
+										warn_new ? 1 : 0, warn_old ? 1 : 0,
+										(warn_new == warn_old) ? "OK" : "MISMATCH");
+									fflush(timesync_trace_fp);
+								}
+							}
+#endif
 						}
 					}
 				}
@@ -3035,23 +3109,28 @@ skip_h_retry_point:
 			if(search_start_symb < upper_bound
 				&& available > data_container.preamble_nSymb * sym_samples)
 			{
-				// Plan-B Step 3 (site 2247, SKIP-H recovery): the coarse search
-				// runs on a freshly re-mixed decimated buffer. The full-rate
-				// baseband_data_interpolated re-mix is KEPT for now because the
-				// post-`goto` trial loop re-enters site 8 (time_sync_preamble_
-				// with_metric, still on the full-rate buffer until Step 5) and
-				// the data extraction may have clobbered baseband_data_
-				// interpolated on the prior iteration. Step 5 removes this
-				// re-mix when site 8 is converted. SKIP-H is the rarest path
-				// (fires only after all 20 trials fail), so the transient
-				// extra FIR pass here is acceptable.
+				// Plan-B Step 3/6c (site 2247, SKIP-H recovery): the coarse
+				// search runs on a freshly re-mixed DECIMATED buffer. SKIP-H
+				// resets coarse_freq_offset = 0 before the goto, so the re-mix
+				// (and everything after the goto) is at carrier_frequency.
+				//
+				// Step 6c: the full-rate baseband_data_interpolated re-mix is
+				// now REDUNDANT in production — site 8 (Step 6b) sources its
+				// fine sync from a scoped slice off raw `data`, and every
+				// energy gate after the goto (Step 6a) reads
+				// baseband_data_decimated. The full-rate re-mix is kept ONLY
+				// under -DTIMESYNC_TRACE so the post-goto dual-path #ifdef
+				// checks (site 8, energy gates, STEP3-SITE2247) still have a
+				// valid full-rate buffer to compare against. Step 7 removes it.
 				int p3_M = data_container.interpolation_rate;
 				int p3_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+#ifdef TIMESYNC_TRACE
 				ofdm.passband_to_baseband((double*)data,
 					p3_full_size,
 					data_container.baseband_data_interpolated,
 					sampling_frequency, carrier_frequency, carrier_amplitude,
 					1, &ofdm.FIR_rx_time_sync);
+#endif
 				ofdm.passband_to_baseband_decimated((double*)data,
 					p3_full_size,
 					data_container.baseband_data_decimated,
