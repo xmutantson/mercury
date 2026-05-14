@@ -31,9 +31,10 @@
  *       tools/test_idle_energy_gate.cc
  */
 
+#define _USE_MATH_DEFINES   // M_PI on MSVC/MinGW — must precede <cmath>
+#include <cmath>
 #include "datalink_layer/idle_energy_gate.h"
 #include <cstdio>
-#include <cmath>
 #include <cstdlib>
 #include <vector>
 
