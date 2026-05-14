@@ -1,30 +1,38 @@
 ---
-status: Steps 0-6c done & validated; Step 7 + Pi profile pending
+status: COMPLETE — Steps 0-7 done, validated & committed on `monitor`
 created: 2026-05-13
 updated: 2026-05-14
-author: Plan-B prep agent; Step 6 by Step-6 execution agent
+author: Plan-B prep agent; Steps 6-7 by Step-6 execution agent
 ---
 
 ## Execution log
 
-**Steps 0-5 DONE & VALIDATED & COMMITTED (`1686641`, 2026-05-13).
-Step 6 DONE as 3 reversible sub-steps 6a/6b/6c (2026-05-14), each committed:
-6a `e868e9b` (energy/signal gates → decimated), 6b `f9f1172` (site 8 →
-scoped full-rate slice), 6c `3188c16` (site 1 + eager :928 removal for
-OFDM). The eager :928 full-rate time_sync FIR — the ~92% RPi OFDM idle-scan
-cost — is REMOVED from the production OFDM path as of 6c. Remaining: Step 7
-(strip the `TIMESYNC_TRACE` instrumentation) + the RPi1 idle-CPU profile
-(now measurable for the first time).**
+**COMPLETE (2026-05-14).** Steps 0-5 committed `1686641` (2026-05-13).
+Step 6 done as reversible sub-steps — 6a `e868e9b`, 6b `f9f1172`,
+6c `3188c16`, 6c-ext `23c4ab7` — RPi1 profile `0c0ee33`, Step 7 the final
+commit. See the **FINAL STATUS** table at the end of §7.
 
-§7-inventory correction found in 6c: the MFSK preamble detectors are a
-10th full-rate-buffer consumer the inventory missed; the eager :928 FIR is
-kept for `M == MOD_MFSK` only (see the 6c RESULT block in §7).
+Headline: every full-rate `FIR_rx_time_sync` caller (`receive_byte`
+preamble search + `measure_signal_only` idle path) now runs the FIR
+through the polyphase decimation primitive. RPi1 call-graph profile
+confirms `cl_FIR::apply` (full-rate) is GONE → `cl_FIR::apply_decimate`.
+**Measured RPi1 idle CPU: 91% → ~73%.** The plan's §1 "~12-15%" target was
+an over-optimistic projection (it ignored the idle loop's fixed
+`usleep(2000)`); the polyphase conversion delivered the ~M× absolute FIR
+reduction it was designed to — see the Step-6 Pi-profile block + FINAL
+STATUS in §7.
+
+Two §7-inventory corrections found during Step 6: (1) the MFSK preamble
+detectors are a 10th full-rate-buffer consumer (Bug #44 4× oversampling →
+not convertible without DSP redesign → eager :928 FIR kept for
+`M == MOD_MFSK` only); (2) `measure_signal_only` — the actual idle-state
+FIR — was never in the inventory at all (converted in 6c-ext).
 
 Steps 0-5 stood up and bit-exactly validated the entire decimate-before-
 time_sync machinery (decimated buffer, the polyphase primitive in situ, all
 5 recovery sites, the BATCH-verify site, and the PRIMARY site-3 coarse-
 decimated + full-rate-fine-slice with §6.3 TOL=0 met 153/153). Step 6
-converted the remaining 9 OFDM consumers + removed the eager FIR.
+converted the remaining OFDM consumers + removed the eager FIR.
 
 - **Step 0 — DONE & VALIDATED (2026-05-13).** TIMESYNC_TRACE instrumentation
   added (file-static, not class members — see §10). Build without the define is
@@ -854,11 +862,65 @@ change to convert the confirmed ~M× absolute reduction into the projected
 ~12-15 % CPU% — should be its own plan with its own latency/responsiveness
 analysis (longer idle sleep delays preamble detection on an incoming call).
 
-### Step 7 — Remove instrumentation
+### Step 7 — Remove instrumentation — DONE & VALIDATED (2026-05-14)
 - **Action:** Delete the `TIMESYNC_TRACE` `#ifdef` blocks and the in-situ
   asserts from Steps 0/2.
 - **Test:** Build clean; final loopback + benchmark smoke.
 - **Rollback:** Trivial — re-add the diagnostic block.
+- **RESULT (2026-05-14): PASS.** Stripped all 25 `#ifdef TIMESYNC_TRACE`
+  regions from `telecom_system.cc` (24 plain `#ifdef…#endif` blocks deleted
+  whole; 1 `#ifdef…#else…#endif` — the eager :928 call — kept only its
+  `#else` branch, i.e. the production `if(M == MOD_MFSK)` form, exactly as
+  the 6c RESULT block specified). Removed the file-static trace state, the
+  trace-fp-open block, and the `build.sh` `TIMESYNC_TRACE=1` env hook.
+  Cleaned the two now-stale `-DTIMESYNC_TRACE` comment references.
+  - **Binary byte-identical to the 6c-ext production build** (`25492461`
+    bytes both) — proof that the stripped code was already `#ifdef`-excluded
+    from production: Step 7 is a pure source cleanup with zero behavior
+    change. `grep` confirms no orphaned `STEP*` / `_old` dual-path artifacts.
+  - Clean build (no define, the only build now). Host loopback WB_CFG10
+    815 bps (healthy); `-m PLOT_PASSBAND -s 4` full 51 BER points.
+  - `tools/timesync_trace_validate.py` is kept as the record of the Step-6
+    dual-path validation methodology — it needs the instrumentation re-added
+    (the trivial Step-7 rollback) to run again.
+
+---
+
+## Plan B — FINAL STATUS (2026-05-14)
+
+**COMPLETE.** Steps 0-7 done, validated, committed on `monitor`:
+
+| step | commit | what |
+|------|--------|------|
+| 0-5 | `1686641` | instrumentation + decimated buffer + recovery/BATCH/PRIMARY sites + fine-slice machinery (bit-exact, 153/153) |
+| 6a | `e868e9b` | 7 energy/signal gates → decimated buffer (359 dual-path checks, 0 mismatches) |
+| 6b | `f9f1172` | site 8 fine sync → scoped full-rate slice (WB 79/79 EXACT; NB does not reach site 8) |
+| 6c | `3188c16` | site 1 + eager :928 FIR removed for OFDM (BER waterfall bit-exact vs HEAD, 154/154) |
+| 6c-ext | `23c4ab7` | `measure_signal_only` → decimated FIR (§7-inventory miss #2 — the actual idle-scan FIR) |
+| profile | `0c0ee33` | RPi1 idle CPU 91% → 73%; plan's 12-15% projection corrected |
+| 7 | `<this>` | `TIMESYNC_TRACE` instrumentation removed |
+
+**Delivered:** every full-rate `FIR_rx_time_sync` caller (the `receive_byte`
+preamble-search path AND the `measure_signal_only` idle path) now runs the
+FIR at the decimated rate via the polyphase primitive. RPi1 call-graph
+profile confirms `cl_FIR::apply` (full-rate) is gone, replaced by
+`cl_FIR::apply_decimate`. Measured RPi1 idle CPU: **91% → ~73%**.
+
+**Not delivered (plan projection error, not a conversion failure):** the §1
+"~12-15%" target. The idle loop's CPU% is floored by `process_main()`'s
+fixed `usleep(2000)`; the polyphase conversion cut the *absolute* FIR cost
+~M× (≈4×) as designed, but the *ratio* can only go 91%→~73% while the sleep
+is fixed. Reaching ~15% needs an idle-scan *cadence* change (adaptive
+`IDLE`-state sleep / event-driven measurement) — a separate optimization
+with its own latency analysis, **out of Plan B's scope**.
+
+**Two §7-inventory corrections found during Step 6** (both now handled):
+1. MFSK preamble detectors (`time_sync_mfsk_corr` / `time_sync_mfsk`) are a
+   10th full-rate-buffer consumer; `time_sync_mfsk_corr`'s Bug #44 4×
+   sub-symbol oversampling needs finer-than-decimated resolution → NOT
+   converted; eager :928 FIR kept for `M == MOD_MFSK` only.
+2. `measure_signal_only` (the idle-state FIR) was never in the inventory —
+   converted in 6c-ext with 6a's proven rate-invariant transform.
 
 ---
 

@@ -146,16 +146,7 @@ check_deps() {
 # Compiler settings
 CXX=g++
 CC=gcc
-# Optional: TIMESYNC_TRACE=1 ./build.sh o3 — enables the Plan-B polyphase
-# time_sync delay-trace + passband-corpus instrumentation (diagnostic only,
-# behind #ifdef TIMESYNC_TRACE). Without the env var the binary is unaffected.
-TRACE_CFLAGS=""
-if [ "${TIMESYNC_TRACE:-0}" = "1" ]; then
-    TRACE_CFLAGS="-DTIMESYNC_TRACE"
-    echo "  (TIMESYNC_TRACE instrumentation ENABLED)"
-fi
-
-CXXFLAGS="$OPT $DBG $EXTRA_CFLAGS $TRACE_CFLAGS -Wall -Wextra -Wno-format -Wno-unused -std=c++14 -I./include -I./source/audioio/ffaudio -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -DMERCURY_GUI_ENABLED -I./third_party/imgui -I./third_party/imgui/backends"
+CXXFLAGS="$OPT $DBG $EXTRA_CFLAGS -Wall -Wextra -Wno-format -Wno-unused -std=c++14 -I./include -I./source/audioio/ffaudio -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -DMERCURY_GUI_ENABLED -I./third_party/imgui -I./third_party/imgui/backends"
 CFLAGS="$OPT $DBG $EXTRA_CFLAGS -Wall -Wno-unused -I./source/audioio/ffbase/ -I./source/audioio/ffaudio/ -I./include -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -std=c17"
 
 # Platform-specific flags
