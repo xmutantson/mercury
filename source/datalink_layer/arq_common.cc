@@ -175,6 +175,7 @@ cl_arq_controller::cl_arq_controller()
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
 	disable_sack=true;  // B2 fix (2026-05-12): SACK off by default. See arq.h.
+	force_sack_ldpc_fail=false;  // CLI --test-sack-ldpc-fail repro toggle (off in production)
 	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;
 	if(disable_sack) local_capability &= ~CAP_SACK;
 	peer_capability=0;
@@ -3807,6 +3808,18 @@ bool cl_arq_controller::receive_sack_pattern(bool* out_bitmap, int nframes)
 				ldpc_ok = telecom_system->decode_sack_bitmap_ldpc(
 					telecom_system->data_container.ready_to_process_passband_delayed_data,
 					tail_samples, nframes, out_bitmap);
+			}
+
+			// Fault-injection (CLI --test-sack-ldpc-fail): force the ldpc=NO
+			// code path even on a healthy SACK reception, so the hard-fallback
+			// behaviour can be observed deterministically in a loopback repro.
+			// See fact-documents/SACK_LDPC_FALLBACK_INVESTIGATION.md §7 Step 1.
+			if (force_sack_ldpc_fail && ldpc_ok)
+			{
+				printf("[RX-SACK-TESTFAIL] --test-sack-ldpc-fail: forcing ldpc_ok=false "
+				       "(LDPC actually decoded OK)\n");
+				fflush(stdout);
+				ldpc_ok = false;
 			}
 
 			if (!ldpc_ok)

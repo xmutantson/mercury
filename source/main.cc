@@ -294,6 +294,7 @@ int main(int argc, char *argv[])
     int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 3000)
     bool no_sack_cli = false;          // --no-sack: force disable (no-op after B2 fix)
     bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
+    bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
     int audio_buffer_ms_cli = 0;       // --alsa-buffer-ms=N (Linux only; 0 = use 30ms default)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
@@ -534,6 +535,14 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--enable-sack") == 0)
         {
             enable_sack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sack-ldpc-fail") == 0)
+        {
+            // Fault-injection repro toggle: forces ldpc_ok=false for every
+            // SACK reception (see SACK_LDPC_FALLBACK_INVESTIGATION.md §7 Step 1).
+            test_sack_ldpc_fail_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1244,6 +1253,11 @@ start_modem:
         if (no_sack_cli && enable_sack_cli) {
             fprintf(stderr, "ERROR: cannot pass both --no-sack and --enable-sack\n");
             exit(1);
+        }
+        if (test_sack_ldpc_fail_cli) {
+            ARQ.force_sack_ldpc_fail = true;
+            printf("[FLAG] --test-sack-ldpc-fail: forcing ldpc_ok=false on every "
+                   "SACK reception (repro test — SACK_LDPC_FALLBACK_INVESTIGATION.md)\n");
         }
 
         // Monitor mode: force monitor on, disable TX
