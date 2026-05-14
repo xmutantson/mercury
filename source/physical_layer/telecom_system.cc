@@ -2302,11 +2302,94 @@ skip_h_retry_point:
 				// the halfsym alignment that even-only preamble subcarriers
 				// provide. GI+halfsym finds a position where mean_H≥0.30,
 				// allowing LDPC decode. See PHASE2_FFT_REPLACEMENT.md §8.
+				//
+				// Plan-B Step 6b (site 8, trial-loop fine sync): site 8 runs
+				// time_sync_preamble_with_metric at step=1 — full sub-sample
+				// resolution — over a SMALL, already-bounded window
+				// [(pream_symb_loc-1)*Nofdm*M, +(preamble_nSymb+4)*Nofdm*M).
+				// Unlike the site-3 idle scan, site 8 already KNOWS where its
+				// window is, so no decimated coarse search is needed: we mix +
+				// FIR that exact window at full rate from raw `data` into the
+				// Step-5 scratch slice (baseband_data_fine_slice) and run
+				// with_metric on it UNCHANGED. This is bit-exact — with_metric
+				// reads the identical full-rate samples it would have read from
+				// baseband_data_interpolated, just sourced from a scoped slice
+				// instead of the full buffer (which the eager :928 FIR populated
+				// in HEAD; :928 is removed in Step 6c). The N-th-best-peak
+				// trial-loop semantics (location_to_return = sync_trials) are
+				// preserved exactly because with_metric still sees the whole
+				// window at step=1.
+				//
+				// Carrier: mix the slice at carrier_frequency + coarse_freq_
+				// offset. In HEAD, baseband_data_interpolated holds the eager
+				// :928 mixing at carrier_frequency on trial 0 (coarse_freq_
+				// offset == 0), and on later trials the site-7 re-mix at
+				// carrier_frequency + coarse_freq_offset. Mixing the slice at
+				// carrier_frequency + coarse_freq_offset reproduces both.
+				int s8_M = data_container.interpolation_rate;
+				int s8_win_start = (pream_symb_loc - 1) * data_container.Nofdm * frequency_interpolation_rate;
+				int s8_win_len = (ofdm.preamble_configurator.Nsymb + 4) * data_container.Nofdm * s8_M;
+				int s8_buf_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+				if(s8_win_start < 0) s8_win_start = 0;
+				if(s8_win_start + s8_win_len > s8_buf_interp)
+					s8_win_len = s8_buf_interp - s8_win_start;
+				// FIR guard margin (rounded up to M): the slice FIR transient
+				// (zero-pad at slice edges) is pushed outside the searched
+				// window so the searched samples get the SAME full-support FIR
+				// values the :928 full-buffer FIR produced. Same idiom as the
+				// Step-5 fine slice.
+				int s8_taps = ofdm.FIR_rx_time_sync.filter_nTaps;
+				int s8_fir_margin = ((s8_taps + s8_M - 1) / s8_M) * s8_M;
+				int s8_ext_start = s8_win_start - s8_fir_margin;
+				int s8_ext_end = s8_win_start + s8_win_len + s8_fir_margin;
+				if(s8_ext_start < 0) s8_ext_start = 0;
+				if(s8_ext_end > s8_buf_interp) s8_ext_end = s8_buf_interp;
+				int s8_ext_len = s8_ext_end - s8_ext_start;
+				if(s8_ext_len > data_container.baseband_data_fine_slice_size)
+					s8_ext_len = data_container.baseband_data_fine_slice_size;
+				// Mix + full-rate FIR the guard-extended slice from raw `data`.
+				// sample_offset = s8_ext_start keeps the mixing phase continuous
+				// with the rest of the buffer (matches the :928 / site-7 mix).
+				ofdm.passband_to_baseband(&((double*)data)[s8_ext_start],
+					s8_ext_len, data_container.baseband_data_fine_slice,
+					sampling_frequency, carrier_frequency + coarse_freq_offset,
+					carrier_amplitude, 1, &ofdm.FIR_rx_time_sync, s8_ext_start);
+				// with_metric on the interior [s8_win_start, +s8_win_len),
+				// which in fine_slice coordinates begins at (s8_win_start -
+				// s8_ext_start). Unchanged step=1, location_to_return, nTrials.
+				int s8_interior = s8_win_start - s8_ext_start;
+				int s8_search_len = s8_win_len;
+				if(s8_interior + s8_search_len > s8_ext_len)
+					s8_search_len = s8_ext_len - s8_interior;
 				TimeSyncResult fine_result = ofdm.time_sync_preamble_with_metric(
-					&data_container.baseband_data_interpolated[(pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate],
-					(ofdm.preamble_configurator.Nsymb+4)*data_container.Nofdm*data_container.interpolation_rate,
+					&data_container.baseband_data_fine_slice[s8_interior],
+					s8_search_len,
 					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max);
-				receive_stats.delay = (pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate + fine_result.delay;
+				receive_stats.delay = s8_win_start + fine_result.delay;
+#ifdef TIMESYNC_TRACE
+				// §6.3-style bit-exact check: the old path read the same window
+				// from baseband_data_interpolated (still the valid full-buffer
+				// full-rate buffer in 6b — the eager :928 is not removed until
+				// 6c). The slice-sourced result must be IDENTICAL. TOL = 0.
+				{
+					TimeSyncResult fine_old = ofdm.time_sync_preamble_with_metric(
+						&data_container.baseband_data_interpolated[(pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate],
+						(ofdm.preamble_configurator.Nsymb+4)*data_container.Nofdm*data_container.interpolation_rate,
+						data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max);
+					int old_delay = (pream_symb_loc-1)*data_container.Nofdm*frequency_interpolation_rate + fine_old.delay;
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP6B-SITE8 new_delay=%d old_delay=%d diff=%d new_metric=%.6f old_metric=%.6f trial=%d %s\n",
+							receive_stats.delay, old_delay,
+							receive_stats.delay - old_delay,
+							fine_result.correlation, fine_old.correlation,
+							receive_stats.sync_trials,
+							(receive_stats.delay == old_delay) ? "EXACT" : "DIFF");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
 			}
 
 			if(receive_stats.delay<0){receive_stats.delay=0;}

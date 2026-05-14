@@ -266,7 +266,11 @@ def _decision_harmless(tag, line, is_nb):
         if diff <= 32:
             return True
         return False
-    return False  # 6a tags: any MISMATCH/WARN is a real failure
+    # STEP6B-SITE8: site 8 runs only after the energy gates passed (real
+    # preamble candidate present) and the slice mixes the IDENTICAL window —
+    # it must be bit-exact (TOL=0). Any DIFF is a real failure.
+    # 6a tags (STEP6A-*): any MISMATCH/WARN is a real failure.
+    return False
 
 
 def parse_traces(trace_files, is_nb):
