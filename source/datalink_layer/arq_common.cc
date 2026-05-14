@@ -3133,6 +3133,11 @@ void cl_arq_controller::send_batch()
 	while (size_buffer(playback_buffer) > 0)
 		msleep(1);
 
+	// M1 (SACK turnaround trace): the true "last DATA audio sample left the
+	// sound card" instant — the playback buffer just drained, and this is
+	// BEFORE the capture ring reset. Anchors the CMD↔RSP overlap window.
+	mtl::log_event("cmd_batch_last_sym_out");
+
 	// Unmute + flush right after playback drain (before ptt_off_delay).
 	// During TX, rx_mute=1 kept self-echo out of the ring.
 	// Now unmute so the RSP's ACK can arrive during ptt_off_delay.
@@ -3149,6 +3154,10 @@ void cl_arq_controller::send_batch()
 		telecom_system->data_container.ring_write_index = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
+	// M2 (SACK turnaround trace): post-TX capture ring reset complete, rx still
+	// muted. The M2 -> cmd_post_tx_unmute delta is the CMD-side dead window
+	// where freshly-captured RX audio would be clobbered by the ring reset.
+	mtl::log_event("cmd_ring_reset_done");
 	telecom_system->data_container.rx_mute = 0;
 	telecom_system->data_container.rx_mute_samples = 0;
 	mtl::log_event("cmd_post_tx_unmute");
@@ -3531,6 +3540,13 @@ void cl_arq_controller::send_sack_pattern(const bool* received_bitmap, int nfram
 	// Guard delay: same logic as send_ack_pattern
 	cl_timer sack_turnaround_timer;
 	sack_turnaround_timer.start();
+
+	// M5 (SACK turnaround trace): RSP committed to SACK TX, guard about to run.
+	// send_sack_pattern() was previously entirely uninstrumented — this is the
+	// single most important TX in the SACK collision bug. Mirror of
+	// rsp_ack_send_start. M6-M5 = the guard duration actually applied.
+	mtl::log_event("rsp_sack_send_start");
+
 	if(is_ofdm_config(current_configuration))
 	{
 		int interp = telecom_system->data_container.interpolation_rate;
@@ -3572,6 +3588,10 @@ void cl_arq_controller::send_sack_pattern(const bool* received_bitmap, int nfram
 	}
 
 	ptt_on();
+
+	// M6 (SACK turnaround trace): RSP SACK PTT-on instant — the root-cause
+	// doc's quantity-of-interest "RSP SACK-ptt-on vs CMD last-DATA-symbol-out".
+	mtl::log_event("rsp_sack_ptt_on");
 
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
 	ptt_on_delay_timer.start();
@@ -3627,6 +3647,9 @@ void cl_arq_controller::send_sack_pattern(const bool* received_bitmap, int nfram
 		(int)sack_turnaround_timer.get_elapsed_time_ms(),
 		pattern_samples, (int)(pattern_samples * 1000.0 / 48000.0));
 	fflush(stdout);
+	// M7 (SACK turnaround trace): first SACK sample to the sound card — the
+	// SACK audio (not PTT) is what must land in CMD's listening window.
+	mtl::log_event_kv("rsp_sack_audio_start", "samples=%d", pattern_samples);
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
 	while(size_buffer(playback_buffer) > 0)
@@ -3634,6 +3657,10 @@ void cl_arq_controller::send_sack_pattern(const bool* received_bitmap, int nfram
 	printf("[TX-SACK] Audio done at t=%dms\n",
 		(int)sack_turnaround_timer.get_elapsed_time_ms());
 	fflush(stdout);
+	// M8 (SACK turnaround trace): SACK audio end. With M7 this defines the
+	// full SACK occupancy window [M7,M8] compared against CMD's rx-usable
+	// window. Mirror of rsp_ack_audio_done.
+	mtl::log_event("rsp_sack_audio_done");
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -3667,6 +3694,11 @@ void cl_arq_controller::send_sack_pattern(const bool* received_bitmap, int nfram
 		(int)sack_turnaround_timer.get_elapsed_time_ms(),
 		telecom_system->data_container.frames_to_read.load());
 	fflush(stdout);
+	// M9 (SACK turnaround trace): RSP back to listening after the SACK TX.
+	// Mirror of rsp_post_ack_flush_done — bounds the RSP-side post-SACK
+	// window symmetrically with the ACK path.
+	mtl::log_event_kv("rsp_post_sack_flush_done", "ftr=%d",
+		telecom_system->data_container.frames_to_read.load());
 
 	ptt_off_delay_timer.start();
 	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
