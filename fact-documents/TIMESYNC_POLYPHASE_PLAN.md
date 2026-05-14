@@ -811,9 +811,48 @@ delay-trace plus the loopback recipe and `tools/bisect_benchmark.py` /
     below.
   - **Rollback:** revert the `measure_signal_only` body — independent of
     6a/6b/6c.
-  - **Follow-up [?]:** is there a THIRD `FIR_rx_time_sync` full-rate caller?
-    The post-6c-ext RPi1 profile answers this — if `cl_FIR::apply` finally
-    collapses, the inventory is complete.
+
+#### Step 6 RPi1 idle-CPU profile (2026-05-14) — headline result + plan correction
+
+Deployed `23c4ab7` (6c-ext) to RPi1/RPi2 via `tools/mercury_deploy_rpi.py`
+(workspace-level tools/, not `mercury/tools/`). Measured idle-mode CPU
+(ARQ, `-s 15`, no connection → `link_status == IDLE` → the
+`measure_signal_only` loop) with identical methodology for HEAD vs 6c-ext:
+
+| build | RPi1 idle %CPU (ps, 6 samples) | hot-fn profile |
+|-------|--------------------------------|----------------|
+| HEAD `1686641` | **91.0–91.2 %** (stable) | `cl_FIR::apply` ~92 % (full-rate) |
+| 6c-ext `23c4ab7` | **72.6–72.7 %** (stable) | `cl_FIR::apply_decimate` ~86 %, `passband_to_baseband_decimated` ~8 % — `cl_FIR::apply` GONE |
+
+**`cl_FIR::apply` (the full-rate FIR) is eliminated** from the idle path —
+the call-graph profile now shows `apply_decimate` (the M×-cheaper polyphase
+primitive) as the FIR. The conversion did exactly what it was designed to:
+**the absolute idle-scan FIR cost dropped ~M× (≈4×).**
+
+**PLAN CORRECTION — the §1 "~92 % → ~12-15 %" projection was wrong.** §1
+modelled idle CPU as "FIR ≈ 92 % of a fixed workload → remove it → ~8-15 %
+left." It did NOT account for `cl_arq_controller::process_main()`'s **fixed
+`usleep(2000)`** in the idle loop (`arq_common.cc:2250`). The idle loop is
+`measure_signal_only()` + `usleep(2000)` + `process_messages()`. With the
+FIR ~4× cheaper, `measure_signal_only` drops from ~20-22 ms to ~7 ms, but
+the 2 ms sleep is fixed — so the **CPU% ratio** only moves
+`T/(T+2)`: 91 % → ~73 %, NOT 12-15 %. The *absolute* CPU time per loop
+dropped ~3× (the real, designed win); the *ratio* is floored by the fixed
+sleep.
+
+**To actually reach ~12-15 % idle CPU%** the idle-scan *cadence* must also
+change (longer/adaptive sleep when `IDLE`, or event-driven signal
+measurement) — a separate optimization, **out of scope for Plan B** (whose
+charter is "route the time_sync FIR through the polyphase primitive").
+Plan B's deliverable — the M× FIR-cost reduction on every full-rate
+`FIR_rx_time_sync` caller — is **complete and confirmed**: idle path
+(`measure_signal_only`) and receive path (`receive_byte`) both converted;
+`cl_FIR::apply` no longer appears in the RPi1 idle profile.
+
+**[?] Follow-up (out of Plan B scope):** an `IDLE`-state sleep/cadence
+change to convert the confirmed ~M× absolute reduction into the projected
+~12-15 % CPU% — should be its own plan with its own latency/responsiveness
+analysis (longer idle sleep delays preamble detection on an incoming call).
 
 ### Step 7 — Remove instrumentation
 - **Action:** Delete the `TIMESYNC_TRACE` `#ifdef` blocks and the in-situ
