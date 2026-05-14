@@ -95,6 +95,7 @@ struct st_receive_stats{
 	bool ofdm_batch_active;  // true when consecutive OFDM frames expected (narrow BATCH window)
 	int frame_overflow_symbols;  // >0: MFSK frame extends beyond captured audio by this many symbols
 	bool frame_data_missing;  // true: preamble found but data symbols are silence (incomplete capture)
+	bool frame_skip_var_aborted;  // true: trial loop aborted on consecutive SKIP-VAR — caller should zero false preamble and advance cursor past noise region
 	double coarse_metric;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
 	double ofdm_drift_per_frame;  // IIR-filtered prediction error (interp samples) for BATCH verify
 };
@@ -150,7 +151,7 @@ public:
 	double ack_pattern_detection_threshold;  // metric threshold for detection
 	int generate_ack_pattern_passband(double* out);  // TX: returns samples written
 	int generate_ack_snr_pattern_passband(double* out, float snr);  // TX: ACK + SNR suffix, returns samples
-	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr);  // RX: returns metric
+	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr);  // RX: returns metric
 	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	void ack_pattern_detection_test();  // SNR sweep + false alarm test
 	void sack_pattern_detection_test(); // SACK pattern roundtrip + bitmap test

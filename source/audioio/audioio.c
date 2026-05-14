@@ -83,6 +83,11 @@ cbuf_handle_t playback_buffer;
 
 int audio_subsystem;
 
+// Phase-F validation: --alsa-buffer-ms=N override. 0 = use built-in default
+// (30 ms on Linux). Tests whether shrinking the ALSA buffer reduces the
+// per-cycle audio-path latency on Pi (suspected 506ms PI-vs-HOST gap source).
+int g_audio_buffer_ms_override = 0;
+
 #if defined(_WIN32)
     HANDLE            capture_prep_mutex;
 #else
@@ -509,6 +514,7 @@ void *radio_playback_thread(void *device_ptr)
 	}
 #elif defined(__linux__)
     conf.buf.buffer_length_msec = 30;
+    if (g_audio_buffer_ms_override > 0) conf.buf.buffer_length_msec = g_audio_buffer_ms_override;
 	period_ms = conf.buf.buffer_length_msec / 3;
     if (audio_subsystem == AUDIO_SUBSYSTEM_ALSA)
         audio = (ffaudio_interface *) &ffalsa;
@@ -604,6 +610,16 @@ void *radio_playback_thread(void *device_ptr)
 	if (out_ch_idx >= (int)cfg->channels)
 		out_ch_idx = 0;  // safety fallback
 	out_nch = cfg->channels;
+
+	// Clock-drift instrumentation: track effective playback sample rate.
+	struct timespec clk_tx_start, clk_tx_window_start, clk_tx_prev_call;
+	long long clk_tx_window_frames;
+	int clk_tx_glitch_count;
+	clock_gettime(CLOCK_MONOTONIC, &clk_tx_start);
+	clk_tx_window_start = clk_tx_start;
+	clk_tx_prev_call = clk_tx_start;
+	clk_tx_window_frames = 0;
+	clk_tx_glitch_count = 0;
 
     while (!shutdown_)
     {
@@ -738,6 +754,39 @@ void *radio_playback_thread(void *device_ptr)
             n -= r;
         }
         // printf("n = %lld total written = %u\n", n, total_written);
+
+		// Clock-drift: accumulate frames played and periodically report rate.
+		// Counts only frames that were actually delivered to the audio sink.
+		clk_tx_window_frames += samples_read;
+		{
+			struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+			double dt_call = (now.tv_sec - clk_tx_prev_call.tv_sec) +
+			                 (now.tv_nsec - clk_tx_prev_call.tv_nsec) * 1e-9;
+			clk_tx_prev_call = now;
+			if (dt_call > 0.025) {
+				double dt_total = (now.tv_sec - clk_tx_start.tv_sec) +
+				                  (now.tv_nsec - clk_tx_start.tv_nsec) * 1e-9;
+				printf("[CLK-TX-GLITCH] dt_call=%.1fms samples=%d total_t=%.3fs\n",
+					dt_call * 1000.0, samples_read, dt_total);
+				fflush(stdout);
+				clk_tx_glitch_count++;
+			}
+			double dt_window = (now.tv_sec - clk_tx_window_start.tv_sec) +
+			                   (now.tv_nsec - clk_tx_window_start.tv_nsec) * 1e-9;
+			if (dt_window >= 10.0) {
+				double rate = clk_tx_window_frames / dt_window;
+				double dt_total = (now.tv_sec - clk_tx_start.tv_sec) +
+				                  (now.tv_nsec - clk_tx_start.tv_nsec) * 1e-9;
+				double drift_ppm = (rate - 48000.0) / 48000.0 * 1e6;
+				printf("[CLK-TX] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
+					dt_window, (long long)clk_tx_window_frames, rate, drift_ppm, dt_total,
+					clk_tx_glitch_count);
+				fflush(stdout);
+				clk_tx_window_start = now;
+				clk_tx_window_frames = 0;
+				clk_tx_glitch_count = 0;
+			}
+		}
     }
 
 #if ENABLE_FLOAT64_TAP == 1
@@ -844,6 +893,7 @@ void *radio_capture_thread(void *device_ptr)
 	}
 #elif defined(__linux__)
     conf.buf.buffer_length_msec = 30;
+    if (g_audio_buffer_ms_override > 0) conf.buf.buffer_length_msec = g_audio_buffer_ms_override;
     if (audio_subsystem == AUDIO_SUBSYSTEM_ALSA)
         audio = (ffaudio_interface *) &ffalsa;
     if (audio_subsystem == AUDIO_SUBSYSTEM_PULSE)
@@ -933,6 +983,21 @@ void *radio_capture_thread(void *device_ptr)
 
 	static int read_loop_counter = 0;
 
+	// Clock-drift instrumentation: track effective capture sample rate over
+	// rolling 10 s windows. Reveals ALSA/codec clock divergence from 48 kHz.
+	struct timespec clk_rx_start, clk_rx_window_start, clk_rx_prev_call;
+	long long clk_rx_cum_frames, clk_rx_window_frames;
+	clock_gettime(CLOCK_MONOTONIC, &clk_rx_start);
+	clk_rx_window_start = clk_rx_start;
+	clk_rx_prev_call = clk_rx_start;
+	clk_rx_cum_frames = 0;
+	clk_rx_window_frames = 0;
+	// Per-call glitch detection: ALSA period is ~10ms (buffer/3 = 30/3).
+	// Flag any inter-call wait >25 ms (>2.5x normal) — suggests scheduler
+	// preemption or a dropped period.
+	int clk_rx_glitch_count;
+	clk_rx_glitch_count = 0;
+
 	while (!shutdown_)
     {
 		r = audio->read(b, (const void **)&buffer);
@@ -951,6 +1016,41 @@ void *radio_capture_thread(void *device_ptr)
 
 		int frames_read = r / frame_size;
 		int frames_to_write = frames_read;
+
+		// Clock-drift: accumulate frames and periodically report rate
+		clk_rx_cum_frames += frames_read;
+		clk_rx_window_frames += frames_read;
+		{
+			struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+			// Per-call timing: detect scheduler stalls or dropped periods.
+			double dt_call = (now.tv_sec - clk_rx_prev_call.tv_sec) +
+			                 (now.tv_nsec - clk_rx_prev_call.tv_nsec) * 1e-9;
+			clk_rx_prev_call = now;
+			if (dt_call > 0.025) {
+				// >25 ms gap — log with absolute time for correlation w/ [T] events
+				double dt_total = (now.tv_sec - clk_rx_start.tv_sec) +
+				                  (now.tv_nsec - clk_rx_start.tv_nsec) * 1e-9;
+				printf("[CLK-RX-GLITCH] dt_call=%.1fms frames=%d total_t=%.3fs\n",
+					dt_call * 1000.0, frames_read, dt_total);
+				fflush(stdout);
+				clk_rx_glitch_count++;
+			}
+			double dt_window = (now.tv_sec - clk_rx_window_start.tv_sec) +
+			                   (now.tv_nsec - clk_rx_window_start.tv_nsec) * 1e-9;
+			if (dt_window >= 10.0) {
+				double rate = clk_rx_window_frames / dt_window;
+				double dt_total = (now.tv_sec - clk_rx_start.tv_sec) +
+				                  (now.tv_nsec - clk_rx_start.tv_nsec) * 1e-9;
+				double drift_ppm = (rate - 48000.0) / 48000.0 * 1e6;
+				printf("[CLK-RX] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
+					dt_window, (long long)clk_rx_window_frames, rate, drift_ppm, dt_total,
+					clk_rx_glitch_count);
+				fflush(stdout);
+				clk_rx_window_start = now;
+				clk_rx_window_frames = 0;
+				clk_rx_glitch_count = 0;
+			}
+		}
 
 		// Check format: FLOAT32 (WASAPI), INT32 (DirectSound/ALSA), or INT16 (DirectSound with 16-bit)
 		int is_float32 = (cfg->format == FFAUDIO_F_FLOAT32);

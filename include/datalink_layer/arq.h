@@ -25,6 +25,7 @@
 
 #include "timer.h"
 #include <unistd.h>
+#include <cstdint>
 #include "tcp_socket.h"
 #include "fifo_buffer.h"
 #include "physical_layer/telecom_system.h"
@@ -539,6 +540,14 @@ public:
   int ack_diag_peak_matched;
   double ack_diag_peak_metric;
   int ack_diag_poll_count;
+  uint32_t ack_diag_peak_mask;  // bit i set = symbol i matched at peak detection
+
+  // SACK detection diagnostics (Plan A1) — same shape as ACK diag.
+  int sack_diag_peak_matched;
+  double sack_diag_peak_metric;
+  int sack_diag_poll_count;
+  double sack_diag_peak_max_e;   // peak per-segment energy at best poll
+  int sack_diag_peak_max_seg;    // which of the 8 tail segments held the energy
 
   // Phase-2 validation flag: PHY reinit settle delay after SET_CONFIG ACK.
   // Default 300000 us (= 300 ms, HEAD behavior, b806b76 Bug #60). CLI:
