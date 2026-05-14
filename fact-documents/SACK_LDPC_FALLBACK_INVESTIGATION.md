@@ -269,12 +269,20 @@ should be its own step after A2 is validated. Candidate C is rejected.
 
 ---
 
-## §7 Reversible implementation plan (Candidate A2 — NOT YET IMPLEMENTED)
+## §7 Reversible implementation plan (Candidate A2 — IMPLEMENTED 2026-05-14)
+
+> **STATUS: DONE.** Steps 1–4 implemented and validated on the IONOS Pi
+> testbed — see §10 for the implementation log and per-step RESULT blocks,
+> and §8 for the resolved threshold question. Commits: `baa125f` (Step 1
+> repro harness), `e076823` (Step 2 Candidate A2). Step 5 (Candidate B
+> suffix-quality gate) remains an optional follow-up, out of scope here.
 
 Mercury has **no source-level unit-test harness**; validation is loopback
 (`-m ARQ -s <cfg> -Q 0 -M auto`) plus the IONOS Pi testbed via the butler
 (`localhost:7700`). Steps are individually reversible (each is a single
-commit; revert = `git revert`).
+commit; revert = `git revert`). NB: the two-writer VB-Cable host loopback
+could not carry the SACK reverse path (§10.1 RESULT); all FAIL-before /
+PASS-after validation was done on the Pi testbed.
 
 | Step | Action | Revert | Pass criterion |
 |------|--------|--------|----------------|
@@ -292,13 +300,35 @@ honest full-batch retransmit), and correctness is restored unconditionally.
 
 ## §8 Open questions
 
-- [?] **Live `matched` paired with `metric=6.6`.** The original
-  `pi_rpi2_…:1774` log is gone (§1). One targeted capture settles §4: run
-  WB_CFG15 `--enable-sack` on a moderately degraded channel until an
-  `ldpc=NO` event is logged, and read its `matched`. If `matched` is near the
-  threshold (10-11), also revisit `sack_match_threshold` / add a suffix gate
-  (Candidate B). If `matched` is 14-16, the base detection is fine and §3 is
-  the whole story. Does not block the §6/§7 fix.
+- **RESOLVED — Live `matched` paired with a degraded `ldpc=NO`.** The §8
+  capture was taken on the IONOS Pi testbed, 2026-05-14 (degraded WGN:25
+  channel, CONFIG_15 WB, `--enable-sack`, no fault injection — see §10.5(b)).
+  A genuine `ldpc=NO` event was logged with **`matched=16, metric=8.1`** —
+  `matched` is the **maximum** (16/16), nowhere near the detection threshold
+  of 10. Across **every** `[RX-SACK] Detected` line captured in all five
+  2026-05-14 Pi runs (FAIL_BEFORE, PASS_AFTER, PASS_AFTER_S25, DEGRADED_REAL,
+  + the SNR-40 run), `matched` was **16 in 100% of cases** — the SACK base
+  pattern, when detected at all, was detected cleanly. The degraded `ldpc=NO`
+  reception had `metric=8.1` vs the healthy `ldpc=YES` events at `metric=16.0`
+  — i.e. the *base* pattern was perfect (`matched=16`) and only the *suffix
+  tone energy concentration* (`metric`) was degraded enough to defeat the
+  rate-1/4 LDPC code. This is exactly the §4 hypothesis "if `matched` were
+  14-16, the base detection is fine and only the suffix was degraded."
+
+  **Verdict:** the base `sack_match_threshold=10` does **NOT** need revisiting
+  — no detection ever landed near it, and the one degraded `ldpc=NO` event was
+  at `matched=16`. **Candidate A2 alone is sufficient** for correctness: it
+  makes the `ldpc=NO` outcome safe (clean full-batch retransmit) regardless of
+  how degraded the suffix is. Candidate B (a suffix-region quality gate to
+  *reject* a SACK whose suffix is too poor to decode) remains a reasonable
+  optional throughput optimisation — it would let CMD skip the one wasted
+  full-batch retransmit per `ldpc=NO` — but it is **not a correctness
+  requirement** and is explicitly out of scope here (its own follow-up plan
+  per §7 Step 5). Caveat: only **one** genuine `ldpc=NO` event was captured;
+  the `matched=16` finding is consistent and unambiguous but the sample is
+  thin — a future degraded run that accumulates more genuine `ldpc=NO` events
+  would strengthen it, though it cannot change the A2-is-sufficient verdict
+  (A2 is safe at any `matched`/`metric`).
 - [?] **`decode_sack_bitmap_ldpc()` convergence test edge cases.** At
   `telecom_system.cc:3361`, `converged = (iterations < sack_ldpc.nIteration_max)`.
   In `ldpc_decoder_SPA.cc`: a decode that satisfies parity *exactly on* the
@@ -388,3 +418,141 @@ Implementation session 2026-05-14. Each step is a single commit on `monitor`.
   carry the reverse path (it worked in March 2026 per `tools/mercury_*_700*.log`).
 - Step 1 binary builds clean (`bash build.sh o3`, only a pre-existing unrelated
   sign-compare warning at `arq_commander.cc:1423`).
+
+**Commit:** `baa125f` — *sack test: --test-sack-ldpc-fail fault-injection
+toggle + repro harness*.
+
+### §10.2 Step 2 — Candidate A2 implemented
+
+**Implemented** (`source/datalink_layer/arq_common.cc`, `receive_sack_pattern()`):
+the `if(!ldpc_ok){…}` block was split on the active SACK wire format
+(`ldpc_wire_format = M>=16 && sack_ldpc.N>0`, mirroring the predicate that
+gates `decode_sack_bitmap_ldpc()`):
+- **LDPC wire format** (`ldpc_wire_format == true`): the hard fallback
+  `decode_sack_bitmap()` is **skipped entirely**; `out_bitmap` is explicitly
+  cleared to all-`false` (every frame NACKed). Logs
+  `[RX-SACK] ldpc=NO -> full-batch retransmit (hard fallback skipped for LDPC
+  wire format)`. Function still `return true` below — the genuine "RSP
+  responded / batch finished" signal is preserved. The explicit clear (rather
+  than relying on the caller's `memset` + `decode_sack_bitmap_ldpc`'s init) is
+  deliberate: it is robust independent of caller state, and it is *required*
+  for the fault-injection path where `--test-sack-ldpc-fail` forces
+  `ldpc_ok=false` *after* a successful decode left a real bitmap in
+  `out_bitmap`.
+- **Legacy NB / non-LDPC format** (`ldpc_wire_format == false`): unchanged —
+  `decode_sack_bitmap()` IS the correct inverse of the legacy
+  `encode_sack_bitmap()` format there.
+- The `ldpc=YES` path is **wholly untouched** — the entire change is inside the
+  existing `if(!ldpc_ok)` block.
+- `arq_responder.cc` and `mfsk.cc` untouched; `CAP_SACK` default unchanged.
+- Builds clean (`bash build.sh o3`).
+
+**Commit:** `e076823` — *fix: SACK ldpc=NO no longer fabricates a bitmap
+(Candidate A2)*.
+
+### §10.3 Pi test harness fixes (prerequisite for Steps 3–4)
+
+`tools/mercury_ionos_sack_test.py` required three fixes before it could
+validate the change:
+- **`--enable-sack` / `--test-sack-ldpc-fail` / `--label` CLI flags** added.
+  `--enable-sack` is passed to both Mercury instances (SACK is off by default
+  after the B2 fix); `--test-sack-ldpc-fail` is passed to the **commander
+  only** (the bug and the A2 fix both live in CMD's `receive_sack_pattern()`).
+- **Audio device fix**: `AUDIO_DEV` was `plughw:1,0` — wrong card index;
+  `snd_pcm_open` returned `-2 No such file or directory` and Mercury exited
+  before opening its TCP port (the first FAIL-before attempt failed here). The
+  Fe-Pi card is card 0 and the index is not stable; switched to the named form
+  `plughw:Audio`.
+- **DOWNLOAD path-with-spaces fix**: the butler's `DOWNLOAD` splits its
+  argument line on whitespace, so a destination under the "hermes and mercury"
+  workspace share was silently truncated at the first space — the file landed
+  nowhere and the butler still answered `OK` (this is the §9.2 stale-log
+  harness bug class from `SACK_TURNAROUND_FIX_PLAN.md`). Fixed by downloading
+  into a space-free `tempfile.mkdtemp()` dir and `shutil.move`-ing to the real
+  destination — the same pattern as the already-fixed `timing_pull_pi_logs.py`
+  (workspace `088cfc6`).
+
+### §10.4 Step 1 RESULT — FAIL-before reproduced on the Pi testbed
+
+Binary: `baa125f` (Step-1 toggle present, A2 fix **absent** — produced by
+`git checkout baa125f -- source/datalink_layer/arq_common.cc` then
+`mercury_deploy_rpi.py`). Run: `--enable-sack --test-sack-ldpc-fail
+--label FAIL_BEFORE --snr 40`, CONFIG_15 WB, both Pis. Logs:
+`tools/ionos_results/sack_test_FAIL_BEFORE_20260514_144424_{cmd,rsp}_log.log`.
+
+The fault-injection toggle deterministically drove the `!ldpc_ok` hard
+fallback on healthy SACK receptions. For **each** of the 3 forced events the
+CMD log shows:
+```
+[RX-SACK-TESTFAIL] --test-sack-ldpc-fail: forcing ldpc_ok=false (LDPC actually decoded OK)
+[RX-SACK-RAW] LDPC failed, hard fallback nsuffix=32 suffix_tones: 15 15 15 15 15 11 1 0 3 9 …
+[RX-SACK] Detected (matched=16, metric=16.0, ack_xcheck=5, ldpc=NO), bitmap: 0 0 0 0 1 1 0 0 1 0 0 1 1 1 1 1 0 0 1 1 1 1 0 1 1
+[CMD-SACK] 14/25 received, 8 queued for retransmit
+```
+Cross-checked against what RSP actually sent
+(`[TX-SACK] Sending SACK pattern (batch=25, received: …)`):
+
+| Event | RSP actually requested | CMD `ldpc=NO` decoded bitmap |
+|-------|------------------------|------------------------------|
+| 1 | `1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 1 1` (24/25 rx, only frame 22 missing) | `0 0 0 0 1 1 0 0 1 0 0 1 1 1 1 1 0 0 1 1 1 1 0 1 1` (14 ones — **fabricated**) |
+| 3 | `1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 1 1` (24/25 rx, only frame 22 missing) | `0 0 0 0 1 0 1 0 1 0 0 1 1 1 1 1 0 0 0 1 0 1 1 0 1` (12 ones — **fabricated**) |
+
+The decoded bitmap is **structurally unrelated** to RSP's request — it marks
+frames 0–3 as *not received* when RSP explicitly said all of 0–21 *were*
+received. This is precisely the §3 root cause (LDPC-coded suffix tones decoded
+with the legacy un-coded codebook) and reproduces the §9.4 symptom
+("12/25 received" vs the true "24/25"). **Bug reproduced deterministically.
+FAIL-before confirmed.**
+
+### §10.5 Steps 2–4 RESULT — PASS-after + degraded-channel validation on the Pi testbed
+
+Binary: `e076823` (A2 fix present — working tree restored to `HEAD`, then
+`mercury_deploy_rpi.py`).
+
+**(a) PASS-after — forced `ldpc=NO` (fault injection), degraded channel.**
+Run: `--enable-sack --test-sack-ldpc-fail --label PASS_AFTER_S25 --snr 25`,
+CONFIG_15 WB. Logs:
+`tools/ionos_results/sack_test_PASS_AFTER_S25_20260514_*_​{cmd,rsp}_log.log`.
+RSP sent 6 real `[TX-SACK]` patterns; CMD's toggle forced `ldpc=NO` on 2 of
+the receptions it detected. For both:
+```
+[RX-SACK-TESTFAIL] --test-sack-ldpc-fail: forcing ldpc_ok=false (LDPC actually decoded OK)
+[RX-SACK] ldpc=NO -> full-batch retransmit (hard fallback skipped for LDPC wire format)
+[RX-SACK] Detected (matched=16, metric=16.0, ack_xcheck=5, ldpc=NO), bitmap: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+[CMD-SACK] 0/25 received, 8 queued for retransmit
+```
+- `out_bitmap` is **all-zero** — NOT a fabricated bitmap (contrast §10.4's
+  14-/12-one garbage).
+- **No `[RX-SACK-RAW]` line** — the buggy `decode_sack_bitmap()` hard fallback
+  is never called (`RX-SACK-RAW` count = 0 across the whole run).
+- `[CMD-SACK] 0/25 received` — CMD marks **zero** frames ACKED; every pending
+  frame is queued for retransmit. No truly-missing frame is wrongly marked
+  ACKED; the ACK-timeout safety net is not spuriously suppressed by a
+  fabricated "received" flag.
+- `[CMD-SACK] Partial batch ACK detected!` still fires → the genuine "RSP
+  responded / batch finished" signal is preserved (A2, not A1).
+
+**(b) Degraded channel, NO fault injection — genuine `ldpc=NO` + `ldpc=YES`
+regression.** Run: `--enable-sack --label DEGRADED_REAL --snr 25`, CONFIG_15
+WB. Logs: `tools/ionos_results/sack_test_DEGRADED_REAL_20260514_*_{cmd,rsp}_log.log`.
+RSP sent 9 real `[TX-SACK]`; CMD detected 3 SACKs:
+```
+[RX-SACK] Detected (matched=16, metric=16.0, ack_xcheck=6, ldpc=YES), bitmap: 1 1 0 1 1 0 1 1 …  -> [CMD-SACK] 23/25 received, 2 queued
+[RX-SACK] Detected (matched=16, metric=16.0, ack_xcheck=5, ldpc=YES), bitmap: 1 1 1 1 1 1 1 0 …  -> [CMD-SACK] 22/25 received, 3 queued
+[RX-SACK] Detected (matched=16, metric=8.1,  ack_xcheck=5, ldpc=NO),  bitmap: 0 0 0 0 0 0 0 0 …  -> [CMD-SACK] 0/25 received, 8 queued
+```
+- **`ldpc=YES` regression: PASS.** The healthy path is byte-for-byte
+  unaffected — the decoded bitmap is acted on normally (23/25, 22/25
+  received). A2 only touches the `!ldpc_ok` branch.
+- **Genuine `ldpc=NO` on a real channel (`metric=8.1` — exactly the §9.4
+  `metric≈6.6`-class degraded reception): PASS.** All-zero bitmap →
+  `[CMD-SACK] 0/25 received, 8 queued` → clean full-batch retransmit.
+  `full-batch retransmit` marker count = 1, `RX-SACK-RAW` count = 0 — the
+  fix engages on real channel events, not just the fault-injection path. **No
+  wrong-frame retransmit.**
+
+**Overall:** FAIL-before (`baa125f`) fabricates a bitmap and acts on it;
+PASS-after (`e076823`) leaves `out_bitmap` all-false → clean full-batch
+retransmit, never calls the buggy hard fallback, never wrongly ACKs a frame,
+and the `ldpc=YES` path is unchanged. The four-phase "test that fails before
+the fix and passes after" requirement is satisfied on real hardware.
