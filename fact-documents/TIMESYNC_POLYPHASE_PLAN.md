@@ -618,6 +618,54 @@ delay-trace plus the loopback recipe and `tools/bisect_benchmark.py` /
     Do it as 2-3 reversible sub-steps (energy gates → site 8 → site 1 +
     :928 removal), not one commit.
 
+#### Step 6 execution (2026-05-14) — done as 3 reversible sub-steps 6a/6b/6c
+
+- **Sub-step 6a — DONE & VALIDATED (2026-05-14).** Re-pointed all 7
+  rate-invariant energy/signal gates at `baseband_data_decimated` with `/M`
+  indexing (`sym_samples → Nofdm`, `buf_samples → Nofdm*buffer_Nsymb`):
+  (1) `measure_signal_stregth`, (3) bounds-failed recovery scans
+  (signal-start + retry-position), (4) main signal energy gate
+  (preamble + buffer-mean), (5) silence-skip recovery scans, (6) data
+  energy gate + ENERGY-DIAG, (8-energy) post-fine-sync energy gate,
+  (9-energy) SKIP-H retry-position + FAIL-DIAG scan. Each conversion is
+  guarded by a dual-path `#ifdef TIMESYNC_TRACE` decision-equality check
+  (`STEP6A-*` trace lines).
+  - **Full-rate indices floored to /M:** every gate that indexed at a
+    full-rate `receive_stats.delay`/`retry.delay` (not symbol-aligned) is
+    floored to the decimated grid. The <M-sample shift is negligible for a
+    per-symbol *mean*-energy threshold. The post-fine-sync gate (8-energy)
+    *modifies* `receive_stats.delay` by whole symbols — that arithmetic stays
+    in full-rate units; only the energy *reads* moved to the decimated buffer.
+  - **The ENERGY-DIAG raw-passband reads (`pb_pream`/`pb_data`) and the
+    FAIL-DIAG block are diagnostics** — converted for buffer consistency, but
+    they read raw `data` (passband) which is unaffected; only `bb_pream` and
+    the per-symbol means moved.
+  - **Validation:** `TIMESYNC_TRACE=1` build + `tools/timesync_trace_validate.py`
+    (new helper, runs short WB+NB loopbacks, aggregates the `STEP6A-*`
+    decision-equality lines). **STEP6A-DATAGATE, STEP6A-ENERGYGATE,
+    STEP6A-FINEENERGY, STEP6A-SIGSTR: 359 checks, 0 decision mismatches**
+    across WB_CFG10 + NB_CFG10. The pre-existing STEP3-PRIMITIVE /
+    STEP5-SITE3 checks show only `harmless` DIFFs (sub-threshold-both-sides
+    or sub-symbol M-grid deltas — exactly the §7 Step-3 RESULT documented
+    behavior and the §6.3 corpus-coverage gap noted below). Production
+    no-define build clean; host loopback WB_CFG10 846 bps, WB_CFG4 268 bps,
+    NB_CFG10 163 bps (re-run; first NB run 72 bps + a connect_timeout — the
+    documented NB-on-VB-Cable marginality, not a regression: 6a is
+    energy-gate-only and every dual-path decision agreed).
+  - **§6.3 corpus-coverage gap recorded (NOT a 6a regression):** the Step-5
+    "153/153 EXACT" was measured on the §6.3 corpus, which only holds
+    buffers with `coarse_metric > 0.3` (real preambles). A live run also
+    hits pure-noise buffers, where the decimated-coarse and old full-rate
+    `halfsym_2phase` early-exit can land on *different* sub-threshold noise
+    peaks (`STEP5-SITE3 ... diff=-188220 new_metric=0.076 old_metric=0.074`).
+    Both metrics are below the detection threshold (0.15 WB / 0.30 NB) so
+    **both paths reject the frame — the decision is identical.** This is a
+    pre-existing characteristic of commit `1686641` (6a does not touch the
+    STEP5-SITE3 code path or the contents of either buffer). Resolves §9
+    open question about early-exit transition-edge behavior: it only
+    diverges on sub-threshold noise, where it cannot flip a decision.
+  - **Rollback:** revert the 7 energy-gate edits — independent of 6b/6c.
+
 ### Step 7 — Remove instrumentation
 - **Action:** Delete the `TIMESYNC_TRACE` `#ifdef` blocks and the in-situ
   asserts from Steps 0/2.
@@ -651,12 +699,18 @@ delay-trace plus the loopback recipe and `tools/bisect_benchmark.py` /
   time_sync calls in a given `receive_byte`. Aliasing may be safe and saves
   `Nofdm*buffer_Nsymb*16` bytes; needs a write-ordering audit before
   committing to it. Default to a fresh allocation (Step 1) until confirmed.
-- **[?]** `halfsym_2phase` internal `early_exit` widening logic
+- ~~**[?]** `halfsym_2phase` internal `early_exit` widening logic
   (`ofdm.cc:2297`, `fine_margin = pream_len` when early-exit active) assumes
   the coarse position can be ~2 symbols early. On the decimated buffer the
   coarse stride is GI/M — does the early-exit transition-edge behavior change
   enough to matter? Must be checked against the corpus in Step 5; if it
-  does, the fine-slice window in §6.2 step 3 widens to `pream_len_full`.
+  does, the fine-slice window in §6.2 step 3 widens to `pream_len_full`.~~
+  **RESOLVED (Step 6a live trace):** the decimated-coarse and old full-rate
+  `halfsym_2phase` early-exit only diverge on **sub-threshold noise buffers**
+  (`STEP5-SITE3 diff=-188220, both metrics ~0.07 < detection threshold`).
+  On real preambles (metric ~0.99+) they are bit-exact (`diff=0`). A
+  sub-threshold divergence cannot flip a decision — both paths reject the
+  frame. No fine-slice widening needed.
 - ~~**[?]** NB path: NB uses `time_sync_preamble_fft` / `_fft_fine`
   (`ofdm.cc:2312/2467`) in some configurations — confirm whether the NB
   preamble search reaches `halfsym`/`halfsym_2phase` at all in current

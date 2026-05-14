@@ -1014,7 +1014,33 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		}
 #endif
 
-		receive_stats.signal_stregth_dbm=ofdm.measure_signal_stregth(data_container.baseband_data_interpolated, data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate);
+		// Plan-B Step 6a (site 1, signal-strength gate): mean power per sample
+		// in dBm is rate-invariant — the anti-alias FIR passes the signal band,
+		// so decimating preserves mean power. Read the decimated buffer; this
+		// is a whole-buffer read, so the decimated count is Nofdm*buffer_Nsymb.
+		receive_stats.signal_stregth_dbm=ofdm.measure_signal_stregth(data_container.baseband_data_decimated, data_container.Nofdm*data_container.buffer_Nsymb);
+#ifdef TIMESYNC_TRACE
+		// Dual-path decision-equality check: the signal-strength gate has no
+		// hard threshold of its own (it is reported, not gated), but verify the
+		// decimated estimate tracks the full-rate one within a small dB margin.
+		{
+			static int ss_checks = 0;
+			if(ss_checks < 16 && M != MOD_MFSK)
+			{
+				ss_checks++;
+				double ss_old = ofdm.measure_signal_stregth(data_container.baseband_data_interpolated, data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate);
+				double ss_new = receive_stats.signal_stregth_dbm;
+				if(timesync_trace_fp)
+				{
+					fprintf(timesync_trace_fp,
+						"# STEP6A-SIGSTR new_dbm=%.3f old_dbm=%.3f diff=%.3f %s\n",
+						ss_new, ss_old, ss_new - ss_old,
+						(fabs(ss_new - ss_old) < 1.0) ? "OK" : "WARN");
+					fflush(timesync_trace_fp);
+				}
+			}
+		}
+#endif
 
 		// Pre-scan passband for signal region to constrain OFDM preamble search.
 		// After ACK TX + buffer flush, the buffer is: [zeros | VB-Cable silence | signal | silence].
@@ -1527,6 +1553,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 		int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
 		int buf_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+		// Plan-B Step 6a (site 3, bounds-failed recovery energy scans): the
+		// signal-start scan and retry-position energy check compare per-symbol
+		// MEAN energy to an absolute threshold (0.001). Mean energy per sample
+		// is rate-invariant (the anti-alias FIR passes the signal band), so the
+		// scan can run on the decimated buffer with Nofdm-sized symbol regions.
+		int sym_dec = data_container.Nofdm;                                  // decimated symbol length
+		int buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;     // decimated buffer length
+		int p6_M = data_container.interpolation_rate;
 
 		if (g_verbose) printf("[OFDM-SYNC] bounds-failed: pream_symb=%d, scanning full buffer for signal\n", pream_symb_loc);
 		fflush(stdout);
@@ -1537,13 +1571,13 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		int signal_start_symb = -1;
 		for(int s = scan_start; s <= upper_bound; s++)
 		{
-			int offset = s * sym_samples;
+			int offset_dec = s * sym_dec;
 			double e = 0.0;
 			int cnt = 0;
-			for(int i = 0; i < sym_samples && (offset + i) < buf_samples; i++)
+			for(int i = 0; i < sym_dec && (offset_dec + i) < buf_dec; i++)
 			{
-				double re = data_container.baseband_data_interpolated[offset + i].real();
-				double im = data_container.baseband_data_interpolated[offset + i].imag();
+				double re = data_container.baseband_data_decimated[offset_dec + i].real();
+				double im = data_container.baseband_data_decimated[offset_dec + i].imag();
 				e += re*re + im*im;
 				cnt++;
 			}
@@ -1554,6 +1588,35 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				break;
 			}
 		}
+#ifdef TIMESYNC_TRACE
+		// Dual-path decision-equality check: the old full-rate scan must pick
+		// the SAME signal_start_symb (the per-symbol mean-energy > 0.001 gate
+		// fires at the same symbol index).
+		{
+			int sss_old = -1;
+			for(int s = scan_start; s <= upper_bound; s++)
+			{
+				int offset = s * sym_samples;
+				double e = 0.0; int cnt = 0;
+				for(int i = 0; i < sym_samples && (offset + i) < buf_samples; i++)
+				{
+					double re = data_container.baseband_data_interpolated[offset + i].real();
+					double im = data_container.baseband_data_interpolated[offset + i].imag();
+					e += re*re + im*im; cnt++;
+				}
+				e = (cnt > 0) ? e / cnt : 0.0;
+				if(e > 0.001) { sss_old = s; break; }
+			}
+			if(timesync_trace_fp)
+			{
+				fprintf(timesync_trace_fp,
+					"# STEP6A-BOUNDSCAN new_sss=%d old_sss=%d %s\n",
+					signal_start_symb, sss_old,
+					(signal_start_symb == sss_old) ? "EXACT" : "DIFF");
+				fflush(timesync_trace_fp);
+			}
+		}
+#endif
 
 		if(signal_start_symb >= 0)
 		{
@@ -1605,16 +1668,44 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				int retry_symb = retry.delay / sym_samples;
 				if(retry_symb < 1) retry_symb = 1;
 
+				// Plan-B Step 6a: retry-position energy on the decimated buffer.
+				// retry.delay is a full-rate index; floor it to the decimated
+				// grid (the <M-sample shift is negligible for a mean-energy
+				// gate). Energy region is Nofdm decimated samples per symbol.
 				double retry_energy = 0.0;
 				int rcnt = 0;
-				for(int i = 0; i < sym_samples && (retry.delay + i) < buf_samples; i++)
+				int retry_delay_dec = retry.delay / p6_M;
+				for(int i = 0; i < sym_dec && (retry_delay_dec + i) < buf_dec; i++)
 				{
-					double re = data_container.baseband_data_interpolated[retry.delay + i].real();
-					double im = data_container.baseband_data_interpolated[retry.delay + i].imag();
+					double re = data_container.baseband_data_decimated[retry_delay_dec + i].real();
+					double im = data_container.baseband_data_decimated[retry_delay_dec + i].imag();
 					retry_energy += re*re + im*im;
 					rcnt++;
 				}
 				retry_energy = (rcnt > 0) ? retry_energy / rcnt : 0.0;
+#ifdef TIMESYNC_TRACE
+				// Dual-path decision-equality: the >= 0.001 gate must fire the
+				// same way on the full-rate buffer.
+				{
+					double re_old = 0.0; int rc_old = 0;
+					for(int i = 0; i < sym_samples && (retry.delay + i) < buf_samples; i++)
+					{
+						double re = data_container.baseband_data_interpolated[retry.delay + i].real();
+						double im = data_container.baseband_data_interpolated[retry.delay + i].imag();
+						re_old += re*re + im*im; rc_old++;
+					}
+					re_old = (rc_old > 0) ? re_old / rc_old : 0.0;
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP6A-BOUNDSRETRY new_e=%.4e old_e=%.4e new_gate=%d old_gate=%d %s\n",
+							retry_energy, re_old,
+							(retry_energy >= 0.001) ? 1 : 0, (re_old >= 0.001) ? 1 : 0,
+							((retry_energy >= 0.001) == (re_old >= 0.001)) ? "OK" : "MISMATCH");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
 
 				if (g_verbose)
 					printf("[OFDM-SYNC] bounds-skip: signal=%d retry=%d metric=%.3f energy=%.2e\n",
@@ -1649,12 +1740,22 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		{
 			int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
 			int buf_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			// Plan-B Step 6a (site 4, main signal energy gate): preamble mean
+			// energy and buffer mean energy are both per-sample means compared
+			// to an absolute floor (energy_gate_floor) / used as a ratio in the
+			// data gate — rate-invariant, so read the decimated buffer.
+			// receive_stats.delay is a full-rate index, floored to the
+			// decimated grid (<M-sample shift, negligible for a mean gate).
+			int eg_M = data_container.interpolation_rate;
+			int eg_sym_dec = data_container.Nofdm;
+			int eg_buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;
+			int eg_delay_dec = receive_stats.delay / eg_M;
 			double energy_sum = 0.0;
 			int count = 0;
-			for(int i = 0; i < sym_samples && (receive_stats.delay + i) < buf_samples; i++)
+			for(int i = 0; i < eg_sym_dec && (eg_delay_dec + i) < eg_buf_dec; i++)
 			{
-				double re = data_container.baseband_data_interpolated[receive_stats.delay + i].real();
-				double im = data_container.baseband_data_interpolated[receive_stats.delay + i].imag();
+				double re = data_container.baseband_data_decimated[eg_delay_dec + i].real();
+				double im = data_container.baseband_data_decimated[eg_delay_dec + i].imag();
 				energy_sum += re*re + im*im;
 				count++;
 			}
@@ -1663,13 +1764,45 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			// Compute buffer mean energy for relative comparison
 			double buf_energy_sum = 0.0;
-			for(int i = 0; i < buf_samples; i++)
+			for(int i = 0; i < eg_buf_dec; i++)
 			{
-				double re = data_container.baseband_data_interpolated[i].real();
-				double im = data_container.baseband_data_interpolated[i].imag();
+				double re = data_container.baseband_data_decimated[i].real();
+				double im = data_container.baseband_data_decimated[i].imag();
 				buf_energy_sum += re*re + im*im;
 			}
-			double buf_mean_energy = buf_energy_sum / buf_samples;
+			double buf_mean_energy = buf_energy_sum / eg_buf_dec;
+#ifdef TIMESYNC_TRACE
+			// Dual-path decision-equality: is_silence gate must match.
+			{
+				double es_old = 0.0; int c_old = 0;
+				for(int i = 0; i < sym_samples && (receive_stats.delay + i) < buf_samples; i++)
+				{
+					double re = data_container.baseband_data_interpolated[receive_stats.delay + i].real();
+					double im = data_container.baseband_data_interpolated[receive_stats.delay + i].imag();
+					es_old += re*re + im*im; c_old++;
+				}
+				double me_old = (c_old > 0) ? es_old / c_old : 0.0;
+				double bes_old = 0.0;
+				for(int i = 0; i < buf_samples; i++)
+				{
+					double re = data_container.baseband_data_interpolated[i].real();
+					double im = data_container.baseband_data_interpolated[i].imag();
+					bes_old += re*re + im*im;
+				}
+				double bme_old = bes_old / buf_samples;
+				bool sil_new = (buf_mean_energy < energy_gate_floor) && (mean_energy < energy_gate_floor);
+				bool sil_old = (bme_old < energy_gate_floor) && (me_old < energy_gate_floor);
+				if(timesync_trace_fp)
+				{
+					fprintf(timesync_trace_fp,
+						"# STEP6A-ENERGYGATE new_pream=%.4e old_pream=%.4e new_buf=%.4e old_buf=%.4e new_sil=%d old_sil=%d %s\n",
+						mean_energy, me_old, buf_mean_energy, bme_old,
+						sil_new ? 1 : 0, sil_old ? 1 : 0,
+						(sil_new == sil_old) ? "OK" : "MISMATCH");
+					fflush(timesync_trace_fp);
+				}
+			}
+#endif
 
 			// Reject if buffer is truly silent (no audio hardware connected)
 			// AND preamble energy is indistinguishable from buffer average.
@@ -1707,16 +1840,23 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// so this rarely activates. Kept as safety net for edge cases.
 			if(!energy_ok)
 			{
+				// Plan-B Step 6a (site 5, silence-skip recovery energy scans):
+				// forward signal-start scan and retry-position energy on the
+				// decimated buffer. The forward scan compares per-symbol mean
+				// energy to buf_mean_energy*2 (a ratio — rate-invariant) and to
+				// energy_gate_floor (absolute, rate-invariant for a mean).
+				// buf_mean_energy here is the decimated buffer mean (computed at
+				// site 4 above), so both sides of the ratio are decimated-rate.
 				int signal_start_symb = -1;
 				for(int s = pream_symb_loc + 1; s <= upper_bound; s++)
 				{
-					int offset = s * sym_samples;
+					int offset_dec = s * eg_sym_dec;
 					double e = 0.0;
 					int cnt = 0;
-					for(int i = 0; i < sym_samples && (offset + i) < buf_samples; i++)
+					for(int i = 0; i < eg_sym_dec && (offset_dec + i) < eg_buf_dec; i++)
 					{
-						double re = data_container.baseband_data_interpolated[offset + i].real();
-						double im = data_container.baseband_data_interpolated[offset + i].imag();
+						double re = data_container.baseband_data_decimated[offset_dec + i].real();
+						double im = data_container.baseband_data_decimated[offset_dec + i].imag();
 						e += re*re + im*im;
 						cnt++;
 					}
@@ -1727,6 +1867,44 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						break;
 					}
 				}
+#ifdef TIMESYNC_TRACE
+				// Dual-path decision-equality: old full-rate scan picks the same
+				// signal_start_symb. The old scan used the FULL-RATE buffer mean
+				// (buf_mean_energy was full-rate in HEAD), so recompute it here
+				// to drive the old comparison faithfully.
+				{
+					double bes_old = 0.0;
+					for(int i = 0; i < buf_samples; i++)
+					{
+						double re = data_container.baseband_data_interpolated[i].real();
+						double im = data_container.baseband_data_interpolated[i].imag();
+						bes_old += re*re + im*im;
+					}
+					double bme_old = bes_old / buf_samples;
+					int sss_old = -1;
+					for(int s = pream_symb_loc + 1; s <= upper_bound; s++)
+					{
+						int offset = s * sym_samples;
+						double e = 0.0; int cnt = 0;
+						for(int i = 0; i < sym_samples && (offset + i) < buf_samples; i++)
+						{
+							double re = data_container.baseband_data_interpolated[offset + i].real();
+							double im = data_container.baseband_data_interpolated[offset + i].imag();
+							e += re*re + im*im; cnt++;
+						}
+						e = (cnt > 0) ? e / cnt : 0.0;
+						if(e > bme_old * 2.0 && e > energy_gate_floor) { sss_old = s; break; }
+					}
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP6A-SILENCESKIP new_sss=%d old_sss=%d %s\n",
+							signal_start_symb, sss_old,
+							(signal_start_symb == sss_old) ? "EXACT" : "DIFF");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
 
 				if(signal_start_symb >= 0)
 				{
@@ -1774,17 +1952,42 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						int retry_symb = retry.delay / sym_samples;
 						if(retry_symb < 1) retry_symb = 1;
 
-						// Check energy at the retry position
+						// Check energy at the retry position (Step 6a: decimated
+						// buffer; retry.delay is full-rate, floored to /M).
 						double retry_energy = 0.0;
 						int rcnt = 0;
-						for(int i = 0; i < sym_samples && (retry.delay + i) < buf_samples; i++)
+						int retry_delay_dec = retry.delay / eg_M;
+						for(int i = 0; i < eg_sym_dec && (retry_delay_dec + i) < eg_buf_dec; i++)
 						{
-							double re = data_container.baseband_data_interpolated[retry.delay + i].real();
-							double im = data_container.baseband_data_interpolated[retry.delay + i].imag();
+							double re = data_container.baseband_data_decimated[retry_delay_dec + i].real();
+							double im = data_container.baseband_data_decimated[retry_delay_dec + i].imag();
 							retry_energy += re*re + im*im;
 							rcnt++;
 						}
 						retry_energy = (rcnt > 0) ? retry_energy / rcnt : 0.0;
+#ifdef TIMESYNC_TRACE
+						// Dual-path decision-equality: > energy_gate_floor gate.
+						{
+							double re_old = 0.0; int rc_old = 0;
+							for(int i = 0; i < sym_samples && (retry.delay + i) < buf_samples; i++)
+							{
+								double re = data_container.baseband_data_interpolated[retry.delay + i].real();
+								double im = data_container.baseband_data_interpolated[retry.delay + i].imag();
+								re_old += re*re + im*im; rc_old++;
+							}
+							re_old = (rc_old > 0) ? re_old / rc_old : 0.0;
+							if(timesync_trace_fp)
+							{
+								fprintf(timesync_trace_fp,
+									"# STEP6A-SILENCERETRY new_e=%.4e old_e=%.4e new_gate=%d old_gate=%d %s\n",
+									retry_energy, re_old,
+									(retry_energy > energy_gate_floor) ? 1 : 0,
+									(re_old > energy_gate_floor) ? 1 : 0,
+									((retry_energy > energy_gate_floor) == (re_old > energy_gate_floor)) ? "OK" : "MISMATCH");
+								fflush(timesync_trace_fp);
+							}
+						}
+#endif
 
 						printf("[OFDM-SYNC] silence-skip: orig=%d signal=%d retry=%d metric=%.3f energy=%.2e\n",
 							pream_symb_loc, signal_start_symb, retry_symb, retry.correlation, retry_energy);
@@ -1811,14 +2014,24 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		{
 			int sym_samples_de = data_container.Nofdm * frequency_interpolation_rate;
 			int buf_samples_de = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			// Plan-B Step 6a (site 6, data energy gate + ENERGY-DIAG): data
+			// mean energy vs energy_gate_floor (absolute) and pream_mean_energy
+			// (ratio) — rate-invariant; read the decimated buffer. The raw
+			// passband `data` reads in ENERGY-DIAG are unaffected (they are not
+			// the decimated buffer).
+			int de_M = data_container.interpolation_rate;
+			int de_sym_dec = data_container.Nofdm;
+			int de_buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;
 			int data_offset = receive_stats.delay + data_container.preamble_nSymb * sym_samples_de;
+			int data_offset_dec = receive_stats.delay / de_M + data_container.preamble_nSymb * de_sym_dec;
 			double data_e = 0.0;
 			int d_count = 0;
 			int check_len = 4 * sym_samples_de; // first 4 data symbols
-			for(int i = 0; i < check_len && (data_offset + i) < buf_samples_de; i++)
+			int check_len_dec = 4 * de_sym_dec;
+			for(int i = 0; i < check_len_dec && (data_offset_dec + i) < de_buf_dec; i++)
 			{
-				double re = data_container.baseband_data_interpolated[data_offset + i].real();
-				double im = data_container.baseband_data_interpolated[data_offset + i].imag();
+				double re = data_container.baseband_data_decimated[data_offset_dec + i].real();
+				double im = data_container.baseband_data_decimated[data_offset_dec + i].imag();
 				data_e += re*re + im*im;
 				d_count++;
 			}
@@ -1827,17 +2040,21 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// DIAG: compare passband vs baseband energy at preamble and data positions
 			{
 				int pream_offset = receive_stats.delay;
+				int pream_offset_dec = receive_stats.delay / de_M;
 				double pb_pream = 0, pb_data = 0, bb_pream = 0;
 				int pream_len = data_container.preamble_nSymb * sym_samples_de;
+				int pream_len_dec = data_container.preamble_nSymb * de_sym_dec;
 				for(int i = 0; i < pream_len && (pream_offset + i) < buf_samples_de; i++) {
 					double v = ((double*)data)[pream_offset + i];
 					pb_pream += v*v;
-					double re = data_container.baseband_data_interpolated[pream_offset + i].real();
-					double im = data_container.baseband_data_interpolated[pream_offset + i].imag();
+				}
+				for(int i = 0; i < pream_len_dec && (pream_offset_dec + i) < de_buf_dec; i++) {
+					double re = data_container.baseband_data_decimated[pream_offset_dec + i].real();
+					double im = data_container.baseband_data_decimated[pream_offset_dec + i].imag();
 					bb_pream += re*re + im*im;
 				}
 				pb_pream /= pream_len;
-				bb_pream /= pream_len;
+				bb_pream /= pream_len_dec;
 				for(int i = 0; i < check_len && (data_offset + i) < buf_samples_de; i++) {
 					double v = ((double*)data)[data_offset + i];
 					pb_data += v*v;
@@ -1847,6 +2064,29 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					pb_pream, bb_pream, pb_data, data_e, receive_stats.delay, data_offset, buf_samples_de);
 				fflush(stdout);
 			}
+#ifdef TIMESYNC_TRACE
+			// Dual-path decision-equality: data-missing gate must match.
+			{
+				double de_old = 0.0; int dc_old = 0;
+				for(int i = 0; i < check_len && (data_offset + i) < buf_samples_de; i++)
+				{
+					double re = data_container.baseband_data_interpolated[data_offset + i].real();
+					double im = data_container.baseband_data_interpolated[data_offset + i].imag();
+					de_old += re*re + im*im; dc_old++;
+				}
+				de_old = (dc_old > 0) ? de_old / dc_old : 0.0;
+				bool miss_new = (data_e < energy_gate_floor || (pream_mean_energy > energy_gate_floor && data_e < pream_mean_energy * 0.1));
+				bool miss_old = (de_old < energy_gate_floor || (pream_mean_energy > energy_gate_floor && de_old < pream_mean_energy * 0.1));
+				if(timesync_trace_fp)
+				{
+					fprintf(timesync_trace_fp,
+						"# STEP6A-DATAGATE new_de=%.4e old_de=%.4e new_miss=%d old_miss=%d %s\n",
+						data_e, de_old, miss_new ? 1 : 0, miss_old ? 1 : 0,
+						(miss_new == miss_old) ? "OK" : "MISMATCH");
+					fflush(timesync_trace_fp);
+				}
+			}
+#endif
 
 			// Data missing if data energy is <10% of preamble energy (relative)
 			// or truly zero (absolute floor). Old 0.001 threshold rejected
@@ -2105,23 +2345,53 @@ skip_h_retry_point:
 			// to find signal onset while preserving sub-symbol alignment.
 			if(M != MOD_MFSK)
 			{
+				// Plan-B Step 6a (site 8-energy, post-fine-sync energy gate):
+				// per-symbol mean energy vs energy_gate_floor — rate-invariant.
+				// The energy reads move to the decimated buffer; receive_stats.
+				// delay arithmetic stays full-rate (the forward step `fwd` is a
+				// multiple of full-rate sym_samples, i.e. a multiple of M, so
+				// the decimated index candidate/M is exact and consistent).
 				int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
-				int buf_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+				int fe_M = data_container.interpolation_rate;
+				int fe_sym_dec = data_container.Nofdm;
+				int fe_buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;
+				int delay_dec = receive_stats.delay / fe_M;
 				double fine_energy = 0.0;
-				for(int i = 0; i < sym_samples && (receive_stats.delay + i) < buf_samples; i++)
-					fine_energy += std::norm(data_container.baseband_data_interpolated[receive_stats.delay + i]);
-				fine_energy /= sym_samples;
+				for(int i = 0; i < fe_sym_dec && (delay_dec + i) < fe_buf_dec; i++)
+					fine_energy += std::norm(data_container.baseband_data_decimated[delay_dec + i]);
+				fine_energy /= fe_sym_dec;
+#ifdef TIMESYNC_TRACE
+				{
+					int buf_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+					double fe_old = 0.0;
+					for(int i = 0; i < sym_samples && (receive_stats.delay + i) < buf_samples; i++)
+						fe_old += std::norm(data_container.baseband_data_interpolated[receive_stats.delay + i]);
+					fe_old /= sym_samples;
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP6A-FINEENERGY new_fe=%.4e old_fe=%.4e new_gate=%d old_gate=%d %s\n",
+							fine_energy, fe_old,
+							(fine_energy < energy_gate_floor) ? 1 : 0,
+							(fe_old < energy_gate_floor) ? 1 : 0,
+							((fine_energy < energy_gate_floor) == (fe_old < energy_gate_floor)) ? "OK" : "MISMATCH");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
 				if(fine_energy < energy_gate_floor)
 				{
 					int orig_delay = receive_stats.delay;
+					int orig_delay_dec = orig_delay / fe_M;
 					for(int fwd = sym_samples; fwd <= 3*sym_samples; fwd += sym_samples)
 					{
 						int candidate = orig_delay + fwd;
-						if(candidate + sym_samples > buf_samples) break;
+						int candidate_dec = orig_delay_dec + fwd / fe_M;
+						if(candidate_dec + fe_sym_dec > fe_buf_dec) break;
 						double e = 0.0;
-						for(int i = 0; i < sym_samples; i++)
-							e += std::norm(data_container.baseband_data_interpolated[candidate + i]);
-						e /= sym_samples;
+						for(int i = 0; i < fe_sym_dec; i++)
+							e += std::norm(data_container.baseband_data_decimated[candidate_dec + i]);
+						e /= fe_sym_dec;
 						if(e > energy_gate_floor)
 						{
 							if (g_verbose)
@@ -2735,17 +3005,43 @@ skip_h_retry_point:
 				int retry_symb = retry.delay / sym_samples;
 				if(retry_symb < 1) retry_symb = 1;
 
-				// Check energy at the retry position
+				// Check energy at the retry position (Step 6a: decimated
+				// buffer; retry.delay full-rate, floored to /M).
 				double retry_energy = 0.0;
 				int rcnt = 0;
-				for(int i = 0; i < sym_samples && (retry.delay + i) < buf_samples; i++)
+				int sh_sym_dec = data_container.Nofdm;
+				int sh_buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;
+				int retry_delay_dec = retry.delay / p3_M;
+				for(int i = 0; i < sh_sym_dec && (retry_delay_dec + i) < sh_buf_dec; i++)
 				{
-					double re = data_container.baseband_data_interpolated[retry.delay + i].real();
-					double im = data_container.baseband_data_interpolated[retry.delay + i].imag();
+					double re = data_container.baseband_data_decimated[retry_delay_dec + i].real();
+					double im = data_container.baseband_data_decimated[retry_delay_dec + i].imag();
 					retry_energy += re*re + im*im;
 					rcnt++;
 				}
 				retry_energy = (rcnt > 0) ? retry_energy / rcnt : 0.0;
+#ifdef TIMESYNC_TRACE
+				// Dual-path decision-equality: >= 0.001 gate.
+				{
+					double re_old = 0.0; int rc_old = 0;
+					for(int i = 0; i < sym_samples && (retry.delay + i) < buf_samples; i++)
+					{
+						double re = data_container.baseband_data_interpolated[retry.delay + i].real();
+						double im = data_container.baseband_data_interpolated[retry.delay + i].imag();
+						re_old += re*re + im*im; rc_old++;
+					}
+					re_old = (rc_old > 0) ? re_old / rc_old : 0.0;
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP6A-SKIPHRETRY new_e=%.4e old_e=%.4e new_gate=%d old_gate=%d %s\n",
+							retry_energy, re_old,
+							(retry_energy >= 0.001) ? 1 : 0, (re_old >= 0.001) ? 1 : 0,
+							((retry_energy >= 0.001) == (re_old >= 0.001)) ? "OK" : "MISMATCH");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
 
 				if (g_verbose)
 					printf("[OFDM-SYNC] SKIP-H recovery: orig=%d retry=%d metric=%.3f energy=%.2e\n",
@@ -2771,24 +3067,28 @@ skip_h_retry_point:
 		// Diagnostic: decode failure analysis (verbose only — energy scan is expensive)
 		if(receive_stats.message_decoded != YES && g_verbose)
 		{
+			// Plan-B Step 6a (site 9, FAIL-DIAG energy scan): diagnostic-only
+			// per-symbol mean energies — rate-invariant. pream_start/data_start
+			// are symbol-index multiples (pream_symb_loc * sym), so on the
+			// decimated buffer they map cleanly to (index * Nofdm).
 			const char* fail_type = (skip_h_count > 0) ? "SKIP-H" : "LDPC";
-			int sym_samp = data_container.Nofdm * frequency_interpolation_rate;
-			int buf_samp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			int sym_dec_fd = data_container.Nofdm;
+			int buf_dec_fd = data_container.Nofdm * data_container.buffer_Nsymb;
 			double pream_energy = 0.0, data_energy = 0.0;
-			int pream_start = pream_symb_loc * sym_samp;
-			int data_start = (pream_symb_loc + data_container.preamble_nSymb) * sym_samp;
-			for(int i = 0; i < sym_samp && (pream_start + i) < buf_samp; i++) {
-				double re = data_container.baseband_data_interpolated[pream_start + i].real();
-				double im = data_container.baseband_data_interpolated[pream_start + i].imag();
+			int pream_start = pream_symb_loc * sym_dec_fd;
+			int data_start = (pream_symb_loc + data_container.preamble_nSymb) * sym_dec_fd;
+			for(int i = 0; i < sym_dec_fd && (pream_start + i) < buf_dec_fd; i++) {
+				double re = data_container.baseband_data_decimated[pream_start + i].real();
+				double im = data_container.baseband_data_decimated[pream_start + i].imag();
 				pream_energy += re*re + im*im;
 			}
-			pream_energy /= sym_samp;
-			for(int i = 0; i < 4*sym_samp && (data_start + i) < buf_samp; i++) {
-				double re = data_container.baseband_data_interpolated[data_start + i].real();
-				double im = data_container.baseband_data_interpolated[data_start + i].imag();
+			pream_energy /= sym_dec_fd;
+			for(int i = 0; i < 4*sym_dec_fd && (data_start + i) < buf_dec_fd; i++) {
+				double re = data_container.baseband_data_decimated[data_start + i].real();
+				double im = data_container.baseband_data_decimated[data_start + i].imag();
 				data_energy += re*re + im*im;
 			}
-			data_energy /= (4*sym_samp);
+			data_energy /= (4*sym_dec_fd);
 			printf("[FAIL-DIAG] %s: metric=%.3f pream_sym=%d skip_h=%d/%d delay=%d mean_H=%.4f pE=%.2e dE=%.2e\n",
 				fail_type, receive_stats.coarse_metric, pream_symb_loc,
 				skip_h_count, time_sync_trials_max + 1,
