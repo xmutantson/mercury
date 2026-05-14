@@ -489,8 +489,8 @@ session per CLAUDE.md §"Plan before coding".
 | 4 | Record the measured numbers (overlap ms, miss ms, inter-frame gap, CMD turnaround, EOB-frame decode rate) back into THIS fact document, new §6. | Edit the doc | Numbers cited to the parsed log file:line | **DONE** — §6 above. Headline gap **6140–8674 ms (mean 7286)**; CMD post-TX 0/200 ms (not slow); root mechanism = open-loop `[RSP-TIMER] KEEP` at a 3780 ms budget vs ~9879 ms CMD batch TX (§6.4). |
 | 5 | Build the failing test: `tools/sack_turnaround_test.py` wrapping steps 3's tools + the §2.4 predicate (§3.2a / §3.3). | Delete the new file | Run against un-fixed instrumented binary → MUST report FAIL (≥1 of 3 runs shows collision). If it does not FAIL, test is invalid — fix the test before proceeding. | **DONE** — see §5-Step-5 RESULT below the table. |
 | 6 | Using step 4's data, finalize the §4 candidate selection (§4.4) and write the chosen design as a new §8 in this doc. Get approval before coding (CLAUDE.md §"Plan before coding"). | Edit the doc | Approval recorded | **DONE** — §8 written: **A+B** selected (C rejected per §6.3). User approved A+B in the Step-7/8 task brief. |
-| 7 | Implement the chosen fix in `arq_responder.cc` ONLY (§8.4). | `git revert` the fix commit | `tools/sack_turnaround_test.py` flips FAIL→PASS | see §8 RESULT below |
-| 8 | Regression: re-run `phase0_baseline.py` for `--enable-sack` WB_CFG15 (bps recovers toward ~2496), plus a no-SACK run (unchanged). agent-judged. | Revert step 7 commit | bps numbers within expected bands; no collateral regression | see §8 RESULT below |
+| 7 | Implement the chosen fix in `arq_responder.cc` ONLY (§8.4). | `git revert` the fix commit | `tools/sack_turnaround_test.py` flips FAIL→PASS | **DONE** — mercury `monitor` `f2dbf34`. Trace-verified (§9.1): Fix A active (`[RSP-TIMER] SET … rx_t=9850 old_t=3780`), Fix B fires (`seq=24 eob=24 rx_t=300`), `nReSent_data` 50→2, `--self-test` two-sided PASS. See §9. |
+| 8 | Regression: re-run `phase0_baseline.py` for `--enable-sack` WB_CFG15 (bps recovers toward ~2496), plus a no-SACK run (unchanged). agent-judged. | Revert step 7 commit | bps numbers within expected bands; no collateral regression | **DONE** — §9.3: `--enable-sack` 1690–2253 bps (was 281–563), no-SACK mean 2178 bps (unchanged). Two harness bugs fixed in workspace `monitor` `088cfc6` (§9.2). |
 
 Steps 1–5 are "trace + reproduce" (the user's chosen approach, fully reversible,
 no fix code touched) — **all five DONE**. Step 6 is an approval gate (the user
@@ -793,3 +793,176 @@ change. No `arq_commander.cc` change. Confined to one function.
   already did `set_receiving_timeout(rx_timeout); start()` every frame — Fix A
   makes the SACK path *identical* to it, so the OFF path is byte-for-byte
   untouched).
+
+---
+
+## §9 RESULT — Step 7 (fix implemented) + Step 8 (validation)
+
+Validation date: 2026-05-14. Fix binary: mercury `monitor` commit `f2dbf34`
+(`arq_responder.cc` only — A+B per §8). Validation harness: workspace `monitor`
+commit `088cfc6` (`tools/sack_turnaround_test.py` + `tools/timing_pull_pi_logs.py`).
+
+### §9.1 RESULT — Step 7: the fix WORKS (rigorous trace verification)
+
+**VERDICT: the fix works.** Verified offset-free on RSP's own `steady_clock`
+(per §6.5), cross-checked against the CMD log. Fresh post-fix traces:
+`pi_rpi1_20260514_130939.log` (RSP), `pi_rpi2_20260514_130939.log` (CMD),
+combined `sack_fresh_combined.log`; plus 3 fresh `--capture` runs (§9.3).
+
+**Fix A is active.** `pi_rpi1_20260514_130939.log:1650` —
+`[RSP-TIMER] SET: sack=1 rxcnt=1 ... seq=0 eob=-1 rx_t=9850 old_t=3780`. The
+broken `KEEP`/`RESTART` branch is gone; every DATA frame re-arms the timer with
+the computed remaining-batch estimate (`SET`, `rx_t` decreasing 9850→9460→…
+per frame, `:1650-2747`). The pre-fix trace at the same lines showed
+`KEEP ... cur_t=3780` frozen for every frame (§6.4).
+
+**Fix B fires.** `pi_rpi1_20260514_130939.log:2747` —
+`[RSP-TIMER] SET: ... seq=24 eob=24 rx_t=300` — the EOB frame (seq=24) latched
+`last_received_end_of_batch_seq=24`, and `rx_timeout` collapsed to the short
+EOB fast-path value (`rx_t=300`; also `rx_t=100` at `:4370, :5581` for 25/25
+batches). RSP gates promptly on positive proof CMD finished the batch.
+
+**The anomalous `rx_count=2` gate is RESOLVED — it is NOT a residual
+collision.** `pi_rpi1_20260514_130939.log:3195` —
+`rsp_ack_gate_entry abs_ms=19049 rx_count=2 batch=25`. The immediately-following
+`[ACK-GATE-DIAG]` at `:3196` reads **`rx=25/25 exp=25 seqs: 0 1 2 … 24`** and
+`:3197` `[ACK-GATE] PASS: received 25/25`. This is the healthy SACK-retransmit
+recovery round: gate 1 (`:2794`, rx_count=23) SACK'd seqs 19 & 22
+(`[TX-SACK] ... received: 1×19 0 1 1 0 1 1` — 0s exactly at 19,22, `:2797`);
+CMD detected it (`pi_rpi2_…:1489` `[RX-SACK] Detected matched=16 metric=16.0
+ldpc=YES`, identical bitmap; `:1492` `[CMD-SACK] 23/25 received, 2 queued`);
+CMD retransmitted exactly seq 19 & 22; RSP received exactly those two
+(`:2956 seq=19`, `:3008 seq=22`) → batch 1 now 25/25 → RSP sent a **plain ACK**
+(`:3199 rsp_ack_send_start`, not a SACK). `rx_count=2` is the retransmit-round
+segment counter, NOT a partial-batch indicator. RSP did **not** gate early on a
+2/25 partial batch mid-CMD-TX.
+
+**The `rx_count=25` "25 frames after gate" were next-batch frames, not
+same-batch collision frames.** The original predicate's "frames after the
+gate" swept the entire NEXT batch (seq resets 0→24, never "drops") — gates 3,4,5
+(`:4417,:5628,:6881`, all `[ACK-GATE-DIAG] rx=25/25`) gated on a fully complete
+batch and the "25 frames after" are batch N+1. Not collisions.
+
+**CMD genuinely detects the SACKs; the retransmit storm is gone.**
+`pi_rpi2_20260514_130939.log`: `[RX-SACK] Detected` ×2 (`:1489` and the gate-6
+SACK), `ldpc=YES`, bitmaps with `0`s exactly at the lost seqs. `cmd_ack_detected`
+present for batches 2-5 (`:1887,:2170,:2416,:2655`). `stats.nReSent_data` max =
+**2** across the whole run (`:1650`) — vs the pre-fix ~35-50 retransmit storm
+(`pi_rpi2_20260514_123229.log` `nReSent_data=50`).
+
+**All 6 gates in the fresh trace are healthy** (`sack_turnaround_test.py
+--from-logs sack_fresh_combined.log`): 2 partial-but-EOB-latched (Fix B fast
+path), 3 complete-batch (25/25), 1 SACK-retransmit recovery round. **Zero real
+collisions.** Contrast the pre-fix Step-3 trace: 3 of 4 gates are real
+collisions (gated at 11/18/21 of 25, no EOB latched, CMD heard nothing).
+
+### §9.2 RESULT — the two harness bugs and their fixes (workspace `088cfc6`)
+
+The Step-8 harness produced untrustworthy results (md5-identical "independent"
+capture logs; FAIL on fresh post-fix logs). Two confirmed bugs:
+
+**Harness Bug 1 — stale-log pull/combine.** Root mechanism:
+`tools/timing_pull_pi_logs.py` handed the butler a `DOWNLOAD` destination path
+containing spaces (the `…/hermes and mercury/…` workspace share). The butler
+parses `DOWNLOAD` args with `rest.split()` on whitespace (`tools/ionos_butler.py`
+~L299), silently **truncating the path at the first space** (the file landed at
+`X:/Storage/Documents/hermes`) while still answering `OK`. The per-run logs
+never reached `timing_data/`, so `sack_turnaround_test.py`'s old
+`sorted(os.listdir())[-1]` grabbed a *stale* log — all three `--capture` runs
+combined the pre-fix Step-3 trace (`md5 ed9e7723…`, byte-identical), even
+though the JSONs recorded real distinct throughput (563/1690/2253 bps).
+*Fix:* `timing_pull_pi_logs.py` now downloads into a space-free temp dir and
+moves the file to the real destination locally; accepts `--prefix` for
+deterministic per-run names; echoes machine-readable `PULLED <rpi> <path>`.
+`sack_turnaround_test.py --capture` consumes those exact paths — it never
+re-scans the directory.
+
+**Harness Bug 2 — collision predicate false positives.** The old predicate
+("any ACK-GATE with same-batch higher-seq frames after it, gap > one SACK
+pattern, ~1168 ms") was written to match the *broken* binary's signature. On
+post-fix logs it false-positived two ways: (a) it counted the entire **next
+batch** (seq resets 0→24, never "drops", so the "seq dropped → next batch"
+guard never tripped) as "frames after the gate"; (b) it counted the healthy
+**SACK-retransmit recovery round** as a collision. It reported
+`FAIL — COLLISION` on every fresh post-fix log.
+*Fix:* a gate is a **REAL collision iff it is NOT healthy**, where healthy =
+ANY of:
+  1. **complete** — `[ACK-GATE-DIAG] rx >= batch` (authoritative batch
+     completeness; the `[T]` event's `rx_count` is only a per-segment counter);
+  2. **EOB latched** — `eob>=0` in the phase's `[RSP-TIMER] SET` lines (literally
+     `last_received_end_of_batch_seq`, the exact state Fix B keys on; the
+     pre-fix binary uses `RESTART`/`KEEP`, has no `eob` field, never latches);
+  3. **SACK heard** — CMD's `[RX-SACK] Detected` reports the *exact* bitmap this
+     gate sent (the SACK provably landed where CMD was listening — the literal
+     negation of a turnaround collision; also clears the case where the EOB
+     frame was lost in the channel but Fix A's per-frame timer still waited out
+     the remaining-batch estimate before gating);
+  4. **recovery round** — preceded by a SACK and CMD detected ≥1 SACK/ACK in
+     the run (causal anchor: in the pre-fix collision trace CMD detects
+     *nothing*, so no gate is ever a recovery round).
+Offset-free (no cross-process clock alignment — §6.5), no fix-code change, no
+binary fingerprinting. `tools/timing_log_parse.py` needed **no change** — the
+predicate is self-contained in `sack_turnaround_test.py`. New `--self-test`
+mode runs the two-sided validity check.
+
+**Two-sided validity check (the proof the corrected predicate is valid, not
+merely permissive)** — `sack_turnaround_test.py --self-test`:
+- **FAILs on the pre-fix Step-3 trace** `sack_trace_combined.log` (un-fixed
+  binary): 3 real collisions — gates at `[ACK-GATE-DIAG]` `11/25`, `18/25`,
+  `21/25`, all no-EOB, CMD heard nothing. Exit 1. ✓
+- **PASSes on the fixed binary's fresh trace** `sack_fresh_combined.log`: 0 real
+  collisions, all 6 gates healthy. Exit 0. ✓
+- `RESULT: SELF-TEST PASS — predicate is two-sided valid`.
+
+### §9.3 RESULT — Step 8: regression numbers (agent-judged, all PASS)
+
+**`--enable-sack` throughput, 3 fresh `--capture` runs** (WB_CFG15, clean, 60 s,
+fixed `--capture` pipeline; `sack_turnaround_test_r{1,2,3}.json` +
+`…_r{1,2,3}_combined.log`):
+
+| run | bps | predicate verdict |
+|-----|-----|-------------------|
+| r1  | 1689.9 | PASS — 0 collisions (5 gates: all complete batch) |
+| r2  | 2253.2 | PASS — 0 collisions (4 healthy + gate@59514 "CMD detected this exact SACK") |
+| r3  | 2253.2 | PASS — 0 collisions (4 complete + 1 partial-EOB-latched) |
+
+Plus the earlier 1-run capture `pi_rpi1_20260514_130939.log` = **1689.9 bps**
+(its r-named JSONs also recorded 1690/2253/2253). SACK-enabled WB_CFG15 now runs
+**1690–2253 bps** — recovered from the broken **281–563 bps** (§0, §6) and into
+the no-SACK band. All three fresh `--capture` runs PASS the corrected predicate
+(0 real collisions); run 2's `gate@59514` (`[ACK-GATE-DIAG] rx=11/25`, EOB frame
+lost in the channel so `eob` never latched) is correctly cleared by healthy
+criterion #3 — `pi_rpi2_sackto_r2_…:3432` `[RX-SACK] Detected … ldpc=YES
+metric=16.0` reports that gate's *exact* SACK bitmap, proving the SACK landed;
+RSP's Fix-A per-frame timer (`[RSP-TIMER] SET … seq=23 … rx_t=880`) correctly
+waited out the remaining-batch estimate after CMD's `cmd_batch_tx_done abs_ms=
+59045` before gating — not a collision.
+
+**No-SACK regression** (`--enable-sack` OFF, `phase0_baseline.py --mode pi
+--channel clean --configs WB_CFG15 --runs 3 --duration 60`,
+`sack_nosack_regression.json`): **2027.9 / 2253.2 / 2253.2 bps, mean 2178.1,
+σ=106.2, 0 failures.** Within the expected no-SACK WB_CFG15 band
+(~2140–2496 bps). The fix does not perturb the normal path — consistent with
+§8.5: Fix A makes the SACK per-frame timer block *identical* to the already-
+correct non-SACK block, so the `--enable-sack`-OFF path is byte-for-byte
+untouched.
+
+### §9.4 Out-of-scope observation (not part of this fix)
+
+The Step-8 captures surfaced a *separate* SACK-reliability issue (NOT the
+turnaround collision, NOT addressed here): a `--capture` run
+(`pi_rpi2_…:1774`) showed `[RX-SACK] Detected … metric=6.6 ldpc=NO` — a
+**degraded SACK reception** where CMD decoded the wrong bitmap (`12/25 received,
+8 queued` when RSP had requested only 1 frame), causing CMD to retransmit the
+wrong frames and RSP to re-SACK. The corrected predicate correctly classifies
+the re-SACK gate as healthy (recovery round — CMD did hear *a* SACK), so it does
+not affect this fix's verdict. Recorded here as a known follow-up: SACK-pattern
+detection robustness at low metric / `ldpc=NO` is worth a separate
+investigation. Out of scope for the turnaround-collision fix.
+
+### §9.5 Step 7 + Step 8 status
+
+| Step | Status |
+|------|--------|
+| 7 — implement A+B in `arq_responder.cc` | **DONE** — mercury `monitor` `f2dbf34`. `tools/sack_turnaround_test.py` flips FAIL→PASS (two-sided self-test PASS). |
+| 8 — regression: `--enable-sack` recovers, no-SACK unchanged | **DONE** — `--enable-sack` 1690–2253 bps (was 281–563); no-SACK mean 2178 bps (unchanged). Harness bugs 1 & 2 fixed in workspace `monitor` `088cfc6`. |
