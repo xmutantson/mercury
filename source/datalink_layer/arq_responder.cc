@@ -426,6 +426,13 @@ void cl_arq_controller::process_messages_rx_data_control()
 		receiving_timer.stop();
 		receiving_timer.reset();
 
+		// M4 (SACK turnaround trace): the RX-timeout just expired — this is the
+		// root trigger that pushes the RSP state machine into
+		// ACKNOWLEDGING_DATA. M4 = timer expired; M3 = ACK-GATE handler
+		// running. Both are kept so scheduler latency between them is visible.
+		mtl::log_event_kv("rsp_rx_timeout_fired", "timeout=%d rx_count=%d",
+			receiving_timeout, batch_rx_frame_count);
+
 		if(link_status == CONNECTED && batch_rx_frame_count == 0)
 		{
 			printf("[RX-TIMEOUT] No frames decoded. cfg=%d Nsymb=%d M=%.0f nBits=%d ftr=%d batch=%d timeout=%d\n",
@@ -759,6 +766,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 	printf("[RSP-RX-TIMEOUT] Entering ACK-GATE: rx_count=%d timeout=%d batch=%d\n",
 		batch_rx_frame_count, receiving_timeout, data_batch_size);
 	fflush(stdout);
+
+	// M3 (SACK turnaround trace): the collision STARTS the moment RSP decides
+	// to ACK-GATE. Anchors the decision instant on the common clock — the
+	// existing line above is a plain printf the parser cannot ingest.
+	mtl::log_event_kv("rsp_ack_gate_entry", "rx_count=%d batch=%d",
+		batch_rx_frame_count, data_batch_size);
 
 	int nAck_messages=0;
 	receiving_timer.stop();
