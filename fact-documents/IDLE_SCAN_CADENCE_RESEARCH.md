@@ -548,8 +548,53 @@ builds (`TIMESYNC_POLYPHASE_PLAN.md` §10).
   `IDLE_GATE_TRACE` `fir_runs` counter measured on RPi1 — Step 0 / Step 3.
 - **Rollback:** delete `tools/test_idle_energy_gate.cc`. Self-contained.
 
-### Step 0/2 — Pi RMS measurement + threshold calibration
-- _(in progress / see RESULT block appended below once Pi data is captured)_
+### Step 0 (Pi run) + Step 2 — measured RMS + threshold calibration — DONE
+- **Tooling:** `tools/idle_gate_measure.py` — rebuilds RPi1 with
+  `IDLE_GATE_TRACE=1` (force-recompiles `arq_common.o` because `build.sh`'s
+  `needs_rebuild()` is timestamp-based and does **not** see `-D` flag changes),
+  runs `mercury -m ARQ -n` with **no connection / no `LISTEN ON`** so
+  `link_status == IDLE`, captures the `[T] idle_gate_trace` lines + `ps` %CPU.
+- **Raw capture:** `fact-documents/timing_data/idle_gate_rpi1_1778783797.log`
+  (70 s IDLE window; 64 status dumps all `link_status:Idle`, 0 Listening/
+  Connected; `signal_stregth_dbm` tracks −99.9 → −42.3 confirming the FIR
+  genuinely runs).
+- **MEASURED — quiet-channel raw-passband RMS (whole `signal_period` buffer):**
+  - `rms_mean = 0.000369`, `rms_min = 0.000130`, `rms_max = 0.000383`
+  - **Very tight distribution** — one constant threshold is sound (answers the
+    §7 `[?]` "is the floor stable enough"). Matches Opt 1's documented noise
+    floor (~0.0002 RMS ≈ −73 dBFS, `arq_common.cc:4098-4101`).
+  - `fir_runs = 4194` over ~70 s ≈ **60 FIR runs/s** — i.e. the IDLE path **IS
+    actively exercised** when the modem is in `-m ARQ` with no `LISTEN ON`
+    (resolves the §7 `[?]` for that posture: it is hit, not dormant).
+- **MEASURED — idle CPU%% (ps, 14 samples): min 1.0, max 1.0, mean 1.0.**
+- **‼ CORRECTION to §0 / §3 — the "73 %% idle CPU" figure is STALE.**
+  ~~RPi1 idle CPU is 73 %% on HEAD~~ — on the *current* branch HEAD `2022256`
+  the measured idle CPU is **1 %%**, not 73 %%. The 73 %% in §0/§3 came from
+  `perf_rpi1_1778778847.txt`, captured **before Plan B's Step 6c-ext (commit
+  `23c4ab7`)** converted `measure_signal_only` itself to the *decimated* FIR
+  (`telecom_system.cc:2733-2739` — `passband_to_baseband_decimated`, M× cheaper;
+  the in-code comment at `:2719-2732` documents exactly this fix). That Step-6
+  conversion already delivered the bulk of the idle-CPU win the cadence change
+  was meant to chase. So:
+  - The headline "73 %% → ~5-10 %%" projection of §0/§5.1 **no longer applies** —
+    idle CPU is *already* ~1 %%. The harm the gate removes is now even smaller
+    than §3's "cosmetic" verdict.
+  - The energy gate is **still worth landing** for exactly the §0 reasons
+    (architecturally clean, zero-latency, in-codebase-precedented, ~30 lines,
+    `git`-bisectable): on a quiet channel it replaces a per-loop decimated FIR
+    pass with a per-loop O(N) RMS sum, trimming the residual ~1 %% further and —
+    more importantly — making the idle loop spend CPU *only when there is
+    signal*. It is no longer a "reclaim 65 points of CPU" change; it is a
+    "finish the structural job Plan B Step 6 started" change. Priority stays 3.
+- **Step 2 — calibrated `IDLE_ENERGY_GATE_RMS = 0.002`:**
+  - = **5.2× (≈14.4 dB) above** the measured quiet-channel `rms_max` 0.000383 —
+    comfortably above the silence/noise floor.
+  - = **10× (20 dB) below** a real on-air MFSK tone (~0.02 RMS, Opt 1
+    `arq_common.cc:4099`) — comfortably below the weakest real signal.
+  - This is a *measured* calibration (not a guessed band-aid): it classifies
+    every Step-0 quiet capture (max 0.000383) as "quiet" with >5× margin and a
+    real tone as "signal" with >10× margin. Derivation documented in the Step-3
+    code comment, mirroring Opt 1's derivation.
 
 ---
 
