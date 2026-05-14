@@ -146,7 +146,17 @@ check_deps() {
 # Compiler settings
 CXX=g++
 CC=gcc
-CXXFLAGS="$OPT $DBG $EXTRA_CFLAGS -Wall -Wextra -Wno-format -Wno-unused -std=c++14 -I./include -I./source/audioio/ffaudio -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -DMERCURY_GUI_ENABLED -I./third_party/imgui -I./third_party/imgui/backends"
+# Optional: IDLE_GATE_TRACE=1 ./build.sh o3 — enables the idle-scan cadence
+# Step-0 instrumentation (idle-loop FIR-run rate + raw-passband RMS distribution,
+# diagnostic only, behind #ifdef IDLE_GATE_TRACE). Without the env var the
+# binary is byte-identical to baseline.
+TRACE_CFLAGS=""
+if [ "${IDLE_GATE_TRACE:-0}" = "1" ]; then
+    TRACE_CFLAGS="$TRACE_CFLAGS -DIDLE_GATE_TRACE"
+    echo "  (IDLE_GATE_TRACE instrumentation ENABLED)"
+fi
+
+CXXFLAGS="$OPT $DBG $EXTRA_CFLAGS $TRACE_CFLAGS -Wall -Wextra -Wno-format -Wno-unused -std=c++14 -I./include -I./source/audioio/ffaudio -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -DMERCURY_GUI_ENABLED -I./third_party/imgui -I./third_party/imgui/backends"
 CFLAGS="$OPT $DBG $EXTRA_CFLAGS -Wall -Wno-unused -I./source/audioio/ffbase/ -I./source/audioio/ffaudio/ -I./include -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -std=c17"
 
 # Platform-specific flags

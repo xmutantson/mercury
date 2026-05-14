@@ -2237,6 +2237,48 @@ void cl_arq_controller::process_main()
 
 			MUTEX_UNLOCK(&capture_prep_mutex);
 
+#ifdef IDLE_GATE_TRACE
+			// Step-0 instrumentation (IDLE_SCAN_CADENCE_RESEARCH.md §6 Step 0):
+			// measure the raw-passband RMS of the buffer the Step-3 gate would
+			// probe, and count how often this IDLE-loop FIR path runs. File-
+			// static counters only (no class members — ODR hazard, see Plan B
+			// §10). Whole #ifdef block is compiled out of the default build, so
+			// the binary without -DIDLE_GATE_TRACE is byte-identical to baseline.
+			{
+				const double* idle_buf =
+					telecom_system->data_container.ready_to_process_passband_delayed_data;
+				double idle_sumsq = 0.0;
+				for(int i = 0; i < signal_period; i++)
+					idle_sumsq += idle_buf[i] * idle_buf[i];
+				double idle_rms = std::sqrt(idle_sumsq / (double)signal_period);
+
+				static long long idle_gate_fir_runs = 0;   // FIR (measure_signal_only) invocations
+				static double    idle_gate_rms_sum  = 0.0;  // running RMS sum for mean
+				static double    idle_gate_rms_min  = 1e30;
+				static double    idle_gate_rms_max  = 0.0;
+				static long long idle_gate_rms_n    = 0;    // RMS samples (== FIR runs here)
+				static long long idle_gate_last_ms  = -1;
+
+				idle_gate_fir_runs++;
+				idle_gate_rms_n++;
+				idle_gate_rms_sum += idle_rms;
+				if(idle_rms < idle_gate_rms_min) idle_gate_rms_min = idle_rms;
+				if(idle_rms > idle_gate_rms_max) idle_gate_rms_max = idle_rms;
+
+				long long now_ms = mtl::now_ms();
+				if(idle_gate_last_ms < 0) idle_gate_last_ms = now_ms;
+				if(now_ms - idle_gate_last_ms >= 5000)
+				{
+					mtl::log_event_kv("idle_gate_trace",
+						"fir_runs=%lld n=%lld rms_mean=%.6f rms_min=%.6f rms_max=%.6f rms_last=%.6f",
+						idle_gate_fir_runs, idle_gate_rms_n,
+						idle_gate_rms_n ? idle_gate_rms_sum / (double)idle_gate_rms_n : 0.0,
+						idle_gate_rms_min, idle_gate_rms_max, idle_rms);
+					idle_gate_last_ms = now_ms;
+				}
+			}
+#endif
+
 			measurements.signal_stregth_dbm = telecom_system->measure_signal_only(
 				telecom_system->data_container.ready_to_process_passband_delayed_data);
 		}
