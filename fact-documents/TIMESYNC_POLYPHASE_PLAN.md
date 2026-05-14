@@ -1,22 +1,30 @@
 ---
-status: in-progress (Steps 0-5 done & validated; Step 6 stopped — under-specified)
+status: Steps 0-6c done & validated; Step 7 + Pi profile pending
 created: 2026-05-13
-author: Plan-B prep agent
+updated: 2026-05-14
+author: Plan-B prep agent; Step 6 by Step-6 execution agent
 ---
 
 ## Execution log
 
-**Steps 0-5 DONE & VALIDATED (2026-05-13). Step 6 STOPPED (under-specified —
-see Step 6 below). Working tree left in the Step-5 state; production no-define
-build healthy (WB_CFG10 725 bps ×2, NB_CFG10 118 bps — all in the documented
-VB-Cable range). Not committed — awaiting review.**
+**Steps 0-5 DONE & VALIDATED & COMMITTED (`1686641`, 2026-05-13).
+Step 6 DONE as 3 reversible sub-steps 6a/6b/6c (2026-05-14), each committed:
+6a `e868e9b` (energy/signal gates → decimated), 6b `f9f1172` (site 8 →
+scoped full-rate slice), 6c `<pending>` (site 1 + eager :928 removal for
+OFDM). The eager :928 full-rate time_sync FIR — the ~92% RPi OFDM idle-scan
+cost — is REMOVED from the production OFDM path as of 6c. Remaining: Step 7
+(strip the `TIMESYNC_TRACE` instrumentation) + the RPi1 idle-CPU profile
+(now measurable for the first time).**
 
-The eager :928 full-rate time_sync FIR (the ~92% RPi idle-scan cost) is
-**still present** — its removal is Step 6. Steps 0-5 stood up and bit-exactly
-validated the entire decimate-before-time_sync machinery (decimated buffer,
-the polyphase primitive in situ, all 5 recovery sites, the BATCH-verify site,
-and the PRIMARY site-3 coarse-decimated + full-rate-fine-slice with §6.3
-TOL=0 met 153/153). The CPU payoff lands in Step 6 when :928 is deleted.
+§7-inventory correction found in 6c: the MFSK preamble detectors are a
+10th full-rate-buffer consumer the inventory missed; the eager :928 FIR is
+kept for `M == MOD_MFSK` only (see the 6c RESULT block in §7).
+
+Steps 0-5 stood up and bit-exactly validated the entire decimate-before-
+time_sync machinery (decimated buffer, the polyphase primitive in situ, all
+5 recovery sites, the BATCH-verify site, and the PRIMARY site-3 coarse-
+decimated + full-rate-fine-slice with §6.3 TOL=0 met 153/153). Step 6
+converted the remaining 9 OFDM consumers + removed the eager FIR.
 
 - **Step 0 — DONE & VALIDATED (2026-05-13).** TIMESYNC_TRACE instrumentation
   added (file-static, not class members — see §10). Build without the define is
@@ -709,6 +717,66 @@ delay-trace plus the loopback recipe and `tools/bisect_benchmark.py` /
     NB_CFG10 108-163 bps (unaffected — NB does not reach site 8).
   - **Rollback:** revert the site-8 edit — independent of 6a; 6c not yet
     applied so the eager :928 still populates `baseband_data_interpolated`.
+
+- **Sub-step 6c — DONE & VALIDATED (2026-05-14).** Converted site 1 (BER
+  self-test), removed the eager :928 full-rate FIR from the production OFDM
+  path, and removed site 2247's redundant full-rate re-mix.
+  - **Site 1 (BER self-test):** once-per-config diagnostic `halfsym` over an
+    M-aligned window — converted exactly like a Step-3 recovery site
+    (decimated buffer, `interp_rate=1, step=1`, `delay = retry.delay*M +
+    st_start`). Diagnostic-only (`[BER-DET]` printf), does not affect decode.
+    Dual-path `STEP6C-SITE1` decision-equality check (verdict = metric
+    threshold + delay window).
+  - **Eager :928 removed for OFDM:** wrapped so that in production it runs
+    ONLY when `M == MOD_MFSK`; under `-DTIMESYNC_TRACE` it runs for all M
+    (so the dual-path checks keep a valid full-rate comparison buffer). The
+    decimated-buffer population is correspondingly gated `M != MOD_MFSK`
+    (it is only consumed by OFDM paths). **This is the change that removes
+    the ~92% RPi OFDM-idle-scan FIR cost.**
+  - **§7-INVENTORY CORRECTION — the MFSK consumer (10th consumer, missed):**
+    the §7 inventory enumerated only the 9 *OFDM* time_sync consumers. The
+    **MFSK preamble detectors** `time_sync_mfsk_corr` / `time_sync_mfsk`
+    (telecom_system.cc:~1108/1117) ALSO consume the full-rate
+    `baseband_data_interpolated`, and `time_sync_mfsk_corr` runs a **4×
+    sub-symbol OVERSAMPLED search** (`P1_OVERSAMPLE=4`, ofdm.cc:3100,
+    Bug #44) — it needs FINER-than-decimated timing resolution and cannot
+    run on `baseband_data_decimated` without a DSP redesign (which CLAUDE.md
+    §1 would require research for). Per the "discover a missed consumer →
+    STOP and report rather than improvise" rule, the MFSK detector was NOT
+    converted. Instead, since the plan's CPU goal (§1) is the **OFDM**
+    Schmidl-Cox idle scan and MFSK is a separate, non-hot detector, the
+    conservative fix is: keep the eager full-rate FIR only for
+    `M == MOD_MFSK`. For every OFDM config (the entire point of the plan)
+    the FIR is gone. **Open follow-up [?]:** if the MFSK/ROBUST idle-scan
+    FIR ever needs the same win, `time_sync_mfsk_corr` needs its own
+    polyphase conversion preserving the Bug #44 4× oversampling — a separate
+    research+design task, out of scope for Plan B.
+  - **Site 2247 full-rate re-mix removed:** site 8 (6b) now sources its fine
+    sync from a scoped slice, and every post-`goto` energy gate (6a) reads
+    the decimated buffer, so the full-rate re-mix is redundant in production
+    — wrapped `#ifdef TIMESYNC_TRACE` (kept only for the post-`goto`
+    dual-path checks). The decimated re-mix at SKIP-H stays (SKIP-H resets
+    `coarse_freq_offset = 0`, so it is correctly at `carrier_frequency`).
+  - **Validation:**
+    - `TIMESYNC_TRACE=1` build + `timesync_trace_validate.py` (WB+NB): all
+      STEP6A/6B + STEP3/5 checks PASS (STEP3/5 harmless-only). STEP6C-SITE1
+      does not fire in ARQ loopback — site 1 is BER-mode-only.
+    - Production no-define build clean; host loopback WB_CFG10 846, WB_CFG4
+      268 bps (**identical to 6a/6b** — the OFDM decimated-coarse +
+      scoped-fine path is functionally equivalent), NB_CFG10 145 bps.
+    - **Full `-m PLOT_PASSBAND` BER sweep, cfg 0/4/10/15, 6c vs HEAD
+      (`1686641`):** the **BER waterfall is BIT-EXACT** — every point in the
+      decoder-working region (BER < 0.4) is 0.000e+00 difference
+      (38/38, 38/38, 39/39, 39/39). The only differences are in the
+      noise-floor region (BER ≈ 0.5, decoder below the Shannon limit
+      producing random bits) where independent random-noise runs jitter
+      ~1-6e-3 — HEAD-vs-HEAD would show the same. The BER curve is unchanged
+      (as expected: site 1 is diagnostic-only and the `ofdm_forced_delay>=0`
+      decode path bypasses detection).
+  - **Rollback:** un-wrap the :928 call (and site 2247 re-mix) so they run
+    for all M again, and re-point site 1 at `baseband_data_interpolated`.
+    Because the eager call is the last thing removed, 6a/6b remain
+    independently valid even after a 6c rollback.
 
 ### Step 7 — Remove instrumentation
 - **Action:** Delete the `TIMESYNC_TRACE` `#ifdef` blocks and the in-situ
