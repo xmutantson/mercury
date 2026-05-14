@@ -515,6 +515,39 @@ builds (`TIMESYNC_POLYPHASE_PLAN.md` §10).
     Step-0 "byte-identical" contract (code-identical modulo debug info).
 - **Rollback:** revert the `build.sh` hook + the `#ifdef IDLE_GATE_TRACE` block.
 
+### Step 1 — Add a failing test that captures the bug — DONE
+- **Commit:** _(see below — committed immediately after this block)_
+- **Note on test methodology — RECONCILED WITH CODEBASE REALITY:** Step 1 as
+  written ("add a unit/integration check to the `mercury.exe --test` suite")
+  rests on a `--test` harness that **does not exist** — CLAUDE.md / MEMORY.md
+  reference `mercury.exe --test` but `main.cc` has no such mode, and
+  `MFSK_TIMESYNC_POLYPHASE_PLAN.md` §7 states plainly "Mercury has no
+  source-level unit-test harness." The in-codebase precedent for a unit test
+  is a standalone compiled `tools/*.cc` linked against the production source
+  (`tools/test_b2f_handler.cc`). `process_main()` itself is not unit-testable
+  standalone (it pulls the whole telecom_system + ofdm + FIR + sockets graph,
+  and there is no file-input audio mode — audio is always live device I/O).
+- **What landed:** `tools/test_idle_energy_gate.cc` — a standalone test of the
+  production gate predicate `idle_energy_gate_open(buf, n, gate_rms)` that
+  Step 3 will introduce in `include/datalink_layer/idle_energy_gate.h` and that
+  `process_main()` will call to gate the FIR. The test asserts the bug-capturing
+  contract: a silent / sub-threshold buffer keeps the gate CLOSED (FIR skipped),
+  a signal-present buffer OPENs it (FIR runs), and the decision is monotonic in
+  RMS at the threshold.
+- **Test — RED on HEAD `2022256`:** PASS (it fails as required).
+  `g++ -O2 -std=c++14 -I./include -o tools/test_idle_energy_gate.exe
+  tools/test_idle_energy_gate.cc` → `fatal error: datalink_layer/idle_energy_gate.h:
+  No such file or directory`. On HEAD there is **no gate predicate and no gate**
+  — the FIR runs on every silent IDLE loop. The test references the production
+  API the fix must introduce; it cannot build until Step 3 adds it, and once it
+  does, the test exercises the *same* predicate `process_main()` uses. This is a
+  genuine red→green: red = won't build (no gate exists), green = builds + all
+  cases pass (Step 3).
+- **Integration proof** that the FIR is actually skipped *inside the live
+  `process_main()` loop* (not just that the predicate is correct) is the
+  `IDLE_GATE_TRACE` `fir_runs` counter measured on RPi1 — Step 0 / Step 3.
+- **Rollback:** delete `tools/test_idle_energy_gate.cc`. Self-contained.
+
 ### Step 0/2 — Pi RMS measurement + threshold calibration
 - _(in progress / see RESULT block appended below once Pi data is captured)_
 
