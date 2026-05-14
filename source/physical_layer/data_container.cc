@@ -65,6 +65,9 @@ cl_data_container::cl_data_container()
 	this->ready_to_process_passband_delayed_data=NULL;
 	this->baseband_data=NULL;
 	this->baseband_data_interpolated=NULL;
+	this->baseband_data_decimated=NULL;
+	this->baseband_data_fine_slice=NULL;
+	this->baseband_data_fine_slice_size=0;
 
 	this->frames_to_read=0;
 	this->data_ready=0;
@@ -157,6 +160,18 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	memset(this->ready_to_process_passband_delayed_data, 0, Nofdm*buffer_Nsymb*frequency_interpolation_rate * sizeof(double));
 	this->baseband_data=CNEW(std::complex<double>, Nofdm*buffer_Nsymb, "dc.baseband_data");
 	this->baseband_data_interpolated=CNEW(std::complex<double>, Nofdm*buffer_Nsymb*frequency_interpolation_rate, "dc.baseband_data_interp");
+	// Plan-B: decimated-rate buffer for the Schmidl-Cox preamble search.
+	// passband_to_baseband_decimated writes (Nofdm*buffer_Nsymb*freq_interp)/M
+	// = Nofdm*buffer_Nsymb samples here. Allocated now; first consumer wired
+	// in a later Plan-B step.
+	this->baseband_data_decimated=CNEW(std::complex<double>, Nofdm*buffer_Nsymb, "dc.baseband_data_decimated");
+	// Plan-B Step 5: full-rate fine-slice scratch. The fine slice is
+	// 3*pream_len_full plus an FIR guard margin on each side (so the FIR
+	// transient never reaches the searched region). FIR_rx_time_sync has
+	// <= Ngi*interp taps, so 2*Ngi*interp covers both guard margins with
+	// headroom. (3*preamble_nSymb+4)*Nofdm*freq_interp is a safe upper bound.
+	this->baseband_data_fine_slice_size=(3*preamble_nSymb+4)*Nofdm*frequency_interpolation_rate;
+	this->baseband_data_fine_slice=CNEW(std::complex<double>, baseband_data_fine_slice_size, "dc.baseband_data_fine_slice");
 
 	this->frames_to_read=preamble_nSymb+Nsymb;
 	this->data_ready=0;
@@ -221,6 +236,9 @@ void cl_data_container::deinit()
 	CDELETE(this->ready_to_process_passband_delayed_data);
 	CDELETE(this->baseband_data);
 	CDELETE(this->baseband_data_interpolated);
+	CDELETE(this->baseband_data_decimated);
+	CDELETE(this->baseband_data_fine_slice);
+	this->baseband_data_fine_slice_size=0;
 	CDELETE(this->passband_data_tx);
 	CDELETE(this->passband_data_tx_buffer);
 	CDELETE(this->passband_data_tx_filtered_fir_1);

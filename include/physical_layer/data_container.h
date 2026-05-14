@@ -57,6 +57,20 @@ class cl_data_container
 	double* ready_to_process_passband_delayed_data;
 	std::complex <double>* baseband_data;
 	std::complex <double>* baseband_data_interpolated;
+	// Plan-B (decimate-before-time_sync): decimated-rate copy of the RX
+	// passband, produced by passband_to_baseband_decimated() and consumed by
+	// the Schmidl-Cox preamble search. Same element count as baseband_data
+	// (Nofdm*buffer_Nsymb) — it holds the whole buffer at the decimated rate.
+	std::complex <double>* baseband_data_decimated;
+	// Plan-B Step 5: small full-rate scratch slice. The primary preamble
+	// search runs its coarse phase on the decimated buffer, then mixes+FIRs
+	// only a small full-rate slice around the coarse peak into this buffer
+	// for the fine (sub-decimated-grid) refinement. Sized (3*preamble_nSymb+4)
+	// *Nofdm*interp — strictly ≥ the largest fine slice (3*pream_len_full +
+	// 4*gi_full). Keeps baseband_data_interpolated (still the full-buffer
+	// full-rate buffer until Step 6) untouched.
+	std::complex <double>* baseband_data_fine_slice;
+	int baseband_data_fine_slice_size;
 	float* demodulated_data;
 	float* deinterleaved_data;
 	int* hd_decoded_data_bit;

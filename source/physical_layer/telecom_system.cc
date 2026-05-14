@@ -37,6 +37,18 @@ extern cbuf_handle_t playback_buffer;
 // Test mode: artificial TX carrier offset in Hz (for testing frequency sync)
 extern "C" double test_tx_carrier_offset;
 
+#ifdef TIMESYNC_TRACE
+// Plan-B (decimate-before-time_sync) Step 0 instrumentation. Diagnostic only —
+// these are file-static (NOT class members) on purpose: only telecom_system.cc
+// is compiled with -DTIMESYNC_TRACE, so adding members to cl_telecom_system
+// would change its layout in this TU only — an ODR violation that corrupts the
+// members when other TUs (arq_common.cc, main.cc) access the same object.
+// File-static keeps the class layout identical across all TUs.
+static int  timesync_trace_frame_index = 0;
+static int  timesync_trace_corpus_saved = 0;
+static FILE* timesync_trace_fp = NULL;
+#endif
+
 
 cl_telecom_system::cl_telecom_system()
 {
@@ -774,6 +786,29 @@ st_receive_stats cl_telecom_system::receive_bit(double *data, int* out)
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 {
 
+#ifdef TIMESYNC_TRACE
+	// Plan-B instrumentation (Step 0): bit-exact delay trace + passband corpus.
+	// Diagnostic only — entire block compiled out unless -DTIMESYNC_TRACE.
+	// timesync_trace_frame_index is a file-static counter incremented per call.
+	// Filenames are PID-suffixed: loopback runs two mercury processes (CMD+RSP)
+	// in the same cwd, so a shared filename would be clobbered.
+	// The CSV file is opened here; the per-frame delay line and the passband
+	// corpus dump are emitted later, inside the confirmed-OFDM detection path.
+	timesync_trace_frame_index++;
+	if(timesync_trace_fp == NULL)
+	{
+		char tfname[128];
+		snprintf(tfname, sizeof(tfname), "timesync_trace_%ld.csv",
+			(long)GetCurrentProcessId());
+		timesync_trace_fp = fopen(tfname, "w");
+		if(timesync_trace_fp)
+		{
+			fprintf(timesync_trace_fp, "frame_index,mode,nb,delay,coarse_metric,pream_symb_loc\n");
+			fflush(timesync_trace_fp);
+		}
+	}
+#endif
+
 	float variance = 1.0f;
 	int nVirtual_data=ldpc.N-data_container.nBits;
 	int nReal_data=data_container.nBits-ldpc.P;
@@ -891,8 +926,93 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			}
 		}
 		ofdm.passband_to_baseband((double*)data,data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,data_container.baseband_data_interpolated,sampling_frequency,carrier_frequency,carrier_amplitude,1,&ofdm.FIR_rx_time_sync);
+
+		// Plan-B Step 2: populate the decimated-rate buffer alongside the
+		// full-rate one. The time_sync FIR is the RPi RX-side hot path; once
+		// every time_sync consumer is converted (later steps) this REPLACES
+		// the full-rate call above. For now BOTH run — the extra cost is
+		// temporary and intentional. Bit-exact equivalent to the full-rate
+		// FIR followed by picking every Mth sample (see fir_filter.cc:227).
+		{
+			int p2b_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			int p2b_M = data_container.interpolation_rate;
+			ofdm.passband_to_baseband_decimated((double*)data, p2b_full_size,
+				data_container.baseband_data_decimated,
+				sampling_frequency, carrier_frequency, carrier_amplitude,
+				p2b_M, &ofdm.FIR_rx_time_sync);
+		}
 		auto t1_pb = std::chrono::steady_clock::now();
 		timing_pb_tsync_ms = std::chrono::duration<double, std::milli>(t1_pb - t0_pb).count();
+
+#ifdef TIMESYNC_TRACE
+		// Plan-B Step 2 verification: prove passband_to_baseband_decimated
+		// matches passband_to_baseband + pick-every-Mth on REAL live RX
+		// buffers (not just a unit corpus). One-shot per process: scan all
+		// decimated samples, report worst abs deviation from
+		// baseband_data_interpolated[k*M]. Tolerance 1e-9.
+		{
+			static bool ts_step2_checked = false;
+			if(!ts_step2_checked && M != MOD_MFSK)
+			{
+				ts_step2_checked = true;
+				int p2b_M = data_container.interpolation_rate;
+				int dec_n = data_container.Nofdm * data_container.buffer_Nsymb;  // == full_size / M
+				double worst = 0.0; int worst_k = -1;
+				for(int k = 0; k < dec_n; k++)
+				{
+					std::complex<double> a = data_container.baseband_data_decimated[k];
+					std::complex<double> b = data_container.baseband_data_interpolated[(long)k * p2b_M];
+					double d = std::abs(a - b);
+					if(d > worst) { worst = d; worst_k = k; }
+				}
+				if(timesync_trace_fp)
+				{
+					fprintf(timesync_trace_fp,
+						"# STEP2-BITEXACT M=%d dec_n=%d worst_abs=%.3e at k=%d %s\n",
+						p2b_M, dec_n, worst, worst_k,
+						(worst <= 1e-9) ? "PASS" : "FAIL");
+					fflush(timesync_trace_fp);
+				}
+			}
+		}
+
+		// Plan-B Step 3 verification: prove that the Schmidl-Cox coarse search
+		// on the DECIMATED buffer (interp_rate=1, step=1) lands on the SAME
+		// full-rate position as the old full-rate search (interp_rate=M,
+		// step=M). All 5 Step-3 recovery sites apply exactly this
+		// transformation; the original sites used step=M (the autocorrelator
+		// only ever evaluates the M-grid), so the decimated step=1 search is
+		// resolution-equivalent. Run on the first ~16 OFDM buffers per process
+		// over the full search region (the worst-case, like site 3). Recovery
+		// sites rarely fire in clean loopback, so this in-situ check is the
+		// deterministic validator for the conversion logic.
+		{
+			static int ts_step3_checks = 0;
+			if(ts_step3_checks < 16 && M != MOD_MFSK)
+			{
+				ts_step3_checks++;
+				int p3_M = data_container.interpolation_rate;
+				int full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+				TimeSyncResult t_old = ofdm.time_sync_preamble_halfsym(
+					data_container.baseband_data_interpolated,
+					full_size, p3_M, p3_M);
+				t_old.delay += 0;
+				TimeSyncResult t_dec = ofdm.time_sync_preamble_halfsym(
+					data_container.baseband_data_decimated,
+					full_size / p3_M, 1, 1);
+				int dec_full = t_dec.delay * p3_M;
+				if(timesync_trace_fp)
+				{
+					fprintf(timesync_trace_fp,
+						"# STEP3-PRIMITIVE old_delay=%d dec_delay=%d diff=%d old_metric=%.6f dec_metric=%.6f %s\n",
+						t_old.delay, dec_full, dec_full - t_old.delay,
+						t_old.correlation, t_dec.correlation,
+						(dec_full == t_old.delay) ? "EXACT" : "DIFF");
+					fflush(timesync_trace_fp);
+				}
+			}
+		}
+#endif
 
 		receive_stats.signal_stregth_dbm=ofdm.measure_signal_stregth(data_container.baseband_data_interpolated, data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate);
 
@@ -1064,14 +1184,58 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 				if(verify_size > 0)
 				{
+					// Plan-B Step 4 (site 2, BATCH predict-verify — HOT): run
+					// the tiny verify-window coarse search on the decimated
+					// buffer. verify_start is NOT guaranteed M-aligned —
+					// predicted_pos carries (int)ofdm_drift_per_frame which is
+					// an arbitrary integer — so floor verify_start to the
+					// M-grid and extend the decimated window to still cover
+					// [verify_start, verify_start+verify_size). The original
+					// used step = interp (= M), so this is resolution-
+					// equivalent up to the M-grid PHASE (the old grid was
+					// {verify_start + k·M}, the decimated grid is {k·M}); the
+					// resulting delay can differ by < M samples. That is
+					// harmless: (a) the ±2·gi_interp verify margin is ≫ M,
+					// (b) the trial loop's site-8 fine sync re-refines
+					// receive_stats.delay, (c) drift is computed in full-rate
+					// units below so the drift IIR stays in full-rate units
+					// (its resolution drops from 1 to ~M/2 samples — swamped
+					// by the verify margin).
+					int v_M = data_container.interpolation_rate;
+					int verify_start_dec = verify_start / v_M;       // floor to M-grid
+					int verify_start_full = verify_start_dec * v_M;
+					int verify_end = verify_start + verify_size;
+					int verify_size_dec = (verify_end - verify_start_full + v_M - 1) / v_M;
+					int dec_buf = data_container.Nofdm * data_container.buffer_Nsymb;
+					if(verify_start_dec + verify_size_dec > dec_buf)
+						verify_size_dec = dec_buf - verify_start_dec;
 					TimeSyncResult verify = ofdm.time_sync_preamble_halfsym(
-						&data_container.baseband_data_interpolated[verify_start],
-						verify_size, interp, interp);
+						&data_container.baseband_data_decimated[verify_start_dec],
+						verify_size_dec, 1, 1);
+					verify.delay = verify.delay * v_M + verify_start_full;
+#ifdef TIMESYNC_TRACE
+					{
+						TimeSyncResult verify_old = ofdm.time_sync_preamble_halfsym(
+							&data_container.baseband_data_interpolated[verify_start],
+							verify_size, interp, interp);
+						verify_old.delay += verify_start;
+						if(timesync_trace_fp)
+						{
+							fprintf(timesync_trace_fp,
+								"# STEP4-SITE2 dec_delay=%d old_delay=%d diff=%d dec_metric=%.6f old_metric=%.6f start_phase=%d\n",
+								verify.delay, verify_old.delay,
+								verify.delay - verify_old.delay,
+								verify.correlation, verify_old.correlation,
+								verify_start % v_M);
+							fflush(timesync_trace_fp);
+						}
+					}
+#endif
 
 					if(verify.correlation >= preamble_detect_threshold)
 					{
 						// Prediction verified — use directly, skip wider search
-						receive_stats.delay = verify_start + verify.delay;
+						receive_stats.delay = verify.delay;
 						receive_stats.coarse_metric = verify.correlation;
 						int drift = (int)receive_stats.delay - predicted_pos;
 						receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * drift;
@@ -1111,11 +1275,134 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				// energy-weighted metric from shadowing earlier ones (seq=00)
 				// when multiple back-to-back frames are in the buffer.
 				// Batch prediction handles sequential frames after first lock.
-				TimeSyncResult matched = ofdm.time_sync_preamble_halfsym_2phase(
-					&data_container.baseband_data_interpolated[search_offset],
-					search_size, interp, 0.5);
+				//
+				// Plan-B Step 5 (PRIMARY site — the ~92% RPi idle-scan FIR
+				// cost): the dominant full-buffer search runs its COARSE phase
+				// (halfsym_2phase Phase 1: GI-stride, early_exit 0.5) on the
+				// DECIMATED buffer, then mixes+FIRs only a small full-rate
+				// SLICE around the coarse peak and runs Phase 2 (halfsym
+				// step=M, no early-exit) on that slice.
+				//
+				// CRITICAL — replicate halfsym_2phase EXACTLY, not via a
+				// nested halfsym_2phase. The original is:
+				//   Phase 1 = halfsym(buf, size, M, gi_interp, 0.5)
+				//             -> first GI-stride pos from search_offset
+				//                with metric >= 0.5  (coarse_delay)
+				//   Phase 2 = halfsym(buf+coarse-pream_len, 3*pream_len, M, M)
+				//             -> max-metric M-grid pos  (NO early-exit)
+				//   result  = (coarse - pream_len) + Phase2.delay
+				// Running a nested halfsym_2phase on a slice would re-run
+				// Phase 1's early-exit anchored to the SLICE start, not to
+				// search_offset — that re-anchoring shifts which "first"
+				// preamble the early-exit lands on (observed: whole-symbol
+				// offsets, same metric). So we keep Phase 1 = the decimated
+				// coarse, and run ONLY Phase 2 on the slice. The decimated
+				// GI-stride grid {search_offset/M + k*Ngi} maps to full rate
+				// {search_offset + k*gi_interp} — the SAME grid Phase 1 used.
+				// Phase 2's window is +/-pream_len, wide enough to absorb the
+				// decimated coarse landing a few GI-steps off the full-rate
+				// coarse; both old and new Phase 2 search the canonical
+				// M-grid, so step=M finds the identical max position.
+				int s5_M = interp;
+				int s5_search_off_dec = search_offset / s5_M;
+				int s5_search_size_dec = search_size / s5_M;
+				int s5_gi_dec = data_container.Ngi;  // decimated GI stride
+				TimeSyncResult s5_coarse = ofdm.time_sync_preamble_halfsym(
+					&data_container.baseband_data_decimated[s5_search_off_dec],
+					s5_search_size_dec, 1, s5_gi_dec, 0.5);
+				int s5_coarse_full = s5_coarse.delay * s5_M + search_offset;
 
-				receive_stats.delay = search_offset + matched.delay;
+				int s5_pream_full = data_container.preamble_nSymb * data_container.Nofdm * s5_M;
+				// Phase-2 window, matching halfsym_2phase EXACTLY:
+				//   fine_start = coarse - pream_len  (clamped >= 0 RELATIVE to
+				//                search_offset, i.e. absolute >= search_offset)
+				//   fine_size  = 3*pream_len         (clamped so the window
+				//                stays within [search_offset, +search_size))
+				int s5_slice_start = s5_coarse_full - s5_pream_full;
+				if(s5_slice_start < search_offset) s5_slice_start = search_offset;
+				int s5_slice_len = 3 * s5_pream_full;
+				if(s5_slice_start + s5_slice_len > search_offset + search_size)
+					s5_slice_len = (search_offset + search_size) - s5_slice_start;
+
+				TimeSyncResult matched;
+				// halfsym_2phase edge cases, replicated:
+				//   (A) coarse.correlation < 0.05  -> return coarse
+				//   (B) fine_size <= pream_len     -> return coarse
+				// In both, the original returns coarse.delay (GI-stride pos);
+				// mapped to full rate that is s5_coarse_full.
+				if(s5_coarse.correlation < 0.05 || s5_slice_len <= s5_pream_full)
+				{
+					matched.delay = s5_coarse_full;
+					matched.correlation = s5_coarse.correlation;
+				}
+				else
+				{
+					// FIR guard margin: extend the FIR'd region by fir_margin
+					// samples on each side so the FIR transient (zero-pad at
+					// the slice edges) never reaches the searched window — the
+					// searched samples get the SAME full-support FIR values as
+					// the full-buffer FIR. fir_margin is rounded up to a
+					// multiple of M for clean indexing. The full-buffer FIR at
+					// :928 still has transients only at the WHOLE-buffer edges,
+					// so as long as the slice's guard region stays inside the
+					// buffer the slice samples are bit-identical to :928's.
+					int s5_taps = ofdm.FIR_rx_time_sync.filter_nTaps;
+					int s5_fir_margin = ((s5_taps + s5_M - 1) / s5_M) * s5_M;
+					int s5_ext_start = s5_slice_start - s5_fir_margin;
+					int s5_ext_end = s5_slice_start + s5_slice_len + s5_fir_margin;
+					// Clamp the extended FIR region to the buffer. If a guard
+					// margin is clipped, the searched samples nearest that
+					// clipped edge see the SAME transient the full-buffer FIR
+					// would (both zero-pad at the buffer boundary) — still
+					// bit-identical.
+					if(s5_ext_start < 0) s5_ext_start = 0;
+					if(s5_ext_end > buf_interp) s5_ext_end = buf_interp;
+					int s5_ext_len = s5_ext_end - s5_ext_start;
+					if(s5_ext_len > data_container.baseband_data_fine_slice_size)
+						s5_ext_len = data_container.baseband_data_fine_slice_size;
+					// Mix + full-rate FIR the guard-extended slice. sample_offset
+					// keeps the mixing phase continuous with the rest of the buffer.
+					ofdm.passband_to_baseband(&((double*)data)[s5_ext_start],
+						s5_ext_len, data_container.baseband_data_fine_slice,
+						sampling_frequency, carrier_frequency, carrier_amplitude,
+						1, &ofdm.FIR_rx_time_sync, s5_ext_start);
+					// Phase 2 ONLY: halfsym step=M, no early-exit (max-metric),
+					// run on the interior [s5_slice_start, +s5_slice_len) which
+					// in fine_slice coordinates begins at (s5_slice_start -
+					// s5_ext_start).
+					int s5_interior = s5_slice_start - s5_ext_start;
+					int s5_search_len = s5_slice_len;
+					if(s5_interior + s5_search_len > s5_ext_len)
+						s5_search_len = s5_ext_len - s5_interior;
+					TimeSyncResult s5_fine = ofdm.time_sync_preamble_halfsym(
+						&data_container.baseband_data_fine_slice[s5_interior],
+						s5_search_len, interp, interp);
+					matched.delay = s5_slice_start + s5_fine.delay;
+					matched.correlation = s5_fine.correlation;
+				}
+#ifdef TIMESYNC_TRACE
+				{
+					// §6.3 bit-exact delay-delta check: the old full-rate
+					// full-buffer halfsym_2phase must produce the IDENTICAL
+					// delay. TOL = 0. A real miss is a FAIL (not relaxed).
+					TimeSyncResult matched_old = ofdm.time_sync_preamble_halfsym_2phase(
+						&data_container.baseband_data_interpolated[search_offset],
+						search_size, interp, 0.5);
+					int old_delay = search_offset + matched_old.delay;
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP5-SITE3 new_delay=%d old_delay=%d diff=%d new_metric=%.6f old_metric=%.6f coarse_full=%d slice_start=%d slice_len=%d %s\n",
+							matched.delay, old_delay, matched.delay - old_delay,
+							matched.correlation, matched_old.correlation,
+							s5_coarse_full, s5_slice_start, s5_slice_len,
+							(matched.delay == old_delay) ? "EXACT" : "DIFF");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
+
+				receive_stats.delay = matched.delay;
 				receive_stats.coarse_metric = matched.correlation;
 
 				if(matched.correlation < preamble_detect_threshold)
@@ -1146,6 +1433,35 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		}
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
+
+#ifdef TIMESYNC_TRACE
+		// Plan-B Step 0: dump the raw passband buffer for the §6.3 corpus.
+		// Reached only for OFDM detection (this is the non-MFSK-fixed-delay
+		// path); guard on M to skip MFSK frames. Saves the first N buffers
+		// that produced a plausible coarse peak — these are the inputs the
+		// Step 5 replay test feeds through both the old and new time_sync.
+		if(M != MOD_MFSK && timesync_trace_corpus_saved < 32
+			&& receive_stats.coarse_metric > 0.3)
+		{
+			int pb_n = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			char fname[160];
+			snprintf(fname, sizeof(fname), "ts_corpus_%ld_%03d.pb",
+				(long)GetCurrentProcessId(), timesync_trace_corpus_saved);
+			FILE* cf = fopen(fname, "wb");
+			if(cf)
+			{
+				// Header: pb_n, Nofdm, buffer_Nsymb, freq_interp, current_config, narrowband
+				int hdr[6] = { pb_n, data_container.Nofdm,
+					(int)data_container.buffer_Nsymb,
+					frequency_interpolation_rate, current_configuration,
+					narrowband_enabled ? 1 : 0 };
+				fwrite(hdr, sizeof(int), 6, cf);
+				fwrite((double*)data, sizeof(double), pb_n, cf);
+				fclose(cf);
+				timesync_trace_corpus_saved++;
+			}
+		}
+#endif
 
 	}
 
@@ -1251,11 +1567,40 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			{
 				// Schmidl-Cox autocorrelation: preamble L-sample periodicity
 				// discriminates preamble from data (data has no L-period).
+				// Plan-B Step 3 (site 4, bounds-failed recovery): run the
+				// coarse search on the decimated buffer. search_start and
+				// available are multiples of sym_samples (= Nofdm*M), hence
+				// multiples of M, so the /M arithmetic is exact. The original
+				// call used step = interpolation_rate (= M), i.e. it only ever
+				// evaluated positions on the M-grid — the decimated step=1
+				// search lands on that SAME grid, so this is resolution-
+				// equivalent, not a precision loss.
+				int p3_M = data_container.interpolation_rate;
+				int search_start_dec = search_start / p3_M;
+				int available_dec = available / p3_M;
 				TimeSyncResult retry = ofdm.time_sync_preamble_halfsym(
-					&data_container.baseband_data_interpolated[search_start],
-					available, data_container.interpolation_rate,
-					data_container.interpolation_rate);
-				retry.delay += search_start;
+					&data_container.baseband_data_decimated[search_start_dec],
+					available_dec, 1, 1);
+				retry.delay = retry.delay * p3_M + search_start;
+#ifdef TIMESYNC_TRACE
+				// Dual-path check: the old full-rate path must agree.
+				{
+					TimeSyncResult retry_old = ofdm.time_sync_preamble_halfsym(
+						&data_container.baseband_data_interpolated[search_start],
+						available, data_container.interpolation_rate,
+						data_container.interpolation_rate);
+					retry_old.delay += search_start;
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP3-SITE4 dec_delay=%d old_delay=%d diff=%d %s\n",
+							retry.delay, retry_old.delay,
+							retry.delay - retry_old.delay,
+							(retry.delay == retry_old.delay) ? "EXACT" : "DIFF");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
 
 				int retry_symb = retry.delay / sym_samples;
 				if(retry_symb < 1) retry_symb = 1;
@@ -1397,11 +1742,34 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					{
 						// Schmidl-Cox autocorrelation: preamble L-sample periodicity
 						// discriminates preamble from data (data has no L-period).
+						// Plan-B Step 3 (site 5, silence-skip recovery): coarse
+						// search on the decimated buffer. Same /M-exact offsets
+						// and resolution-equivalent step=1 as site 4.
+						int p3_M = data_container.interpolation_rate;
+						int search_start_dec = search_start / p3_M;
+						int available_dec = available / p3_M;
 						TimeSyncResult retry = ofdm.time_sync_preamble_halfsym(
-							&data_container.baseband_data_interpolated[search_start],
-							available, data_container.interpolation_rate,
-							data_container.interpolation_rate);
-						retry.delay += search_start;
+							&data_container.baseband_data_decimated[search_start_dec],
+							available_dec, 1, 1);
+						retry.delay = retry.delay * p3_M + search_start;
+#ifdef TIMESYNC_TRACE
+						{
+							TimeSyncResult retry_old = ofdm.time_sync_preamble_halfsym(
+								&data_container.baseband_data_interpolated[search_start],
+								available, data_container.interpolation_rate,
+								data_container.interpolation_rate);
+							retry_old.delay += search_start;
+							if(timesync_trace_fp)
+							{
+								fprintf(timesync_trace_fp,
+									"# STEP3-SITE5 dec_delay=%d old_delay=%d diff=%d %s\n",
+									retry.delay, retry_old.delay,
+									retry.delay - retry_old.delay,
+									(retry.delay == retry_old.delay) ? "EXACT" : "DIFF");
+								fflush(timesync_trace_fp);
+							}
+						}
+#endif
 
 						int retry_symb = retry.delay / sym_samples;
 						if(retry_symb < 1) retry_symb = 1;
@@ -1554,12 +1922,20 @@ skip_h_retry_point:
 				int sym_samp = data_container.Nofdm * frequency_interpolation_rate;
 				for (int i = 0; i < n_search; i++)
 				{
-					ofdm.passband_to_baseband((double*)data,
-						data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate,
-						data_container.baseband_data_interpolated,
+					// Plan-B Step 3 (site 6, coarse-freq search): re-mix at the
+					// trial carrier directly to the decimated rate, then run the
+					// coarse search on the decimated buffer. This re-mix MUST be
+					// per-trial-carrier — the top-of-function decimated buffer
+					// was mixed at carrier_frequency only. base_off and avail are
+					// multiples of sym_samp (= Nofdm*M), so /M is exact.
+					int p3_M = data_container.interpolation_rate;
+					int p3_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+					ofdm.passband_to_baseband_decimated((double*)data,
+						p3_full_size,
+						data_container.baseband_data_decimated,
 						sampling_frequency,
 						carrier_frequency + freq_search[i],
-						carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
+						carrier_amplitude, p3_M, &ofdm.FIR_rx_time_sync);
 
 					// FFT fine search around known preamble position.
 					// FFT metric discriminates preamble vs data (4× ratio)
@@ -1570,11 +1946,36 @@ skip_h_retry_point:
 					int avail = buf_lim - base_off;
 					int need = (data_container.preamble_nSymb + 4) * sym_samp;
 					if(avail > need) avail = need;
+					int base_off_dec = base_off / p3_M;
+					int avail_dec = avail / p3_M;
 					TimeSyncResult ts_result = ofdm.time_sync_preamble_halfsym(
-						&data_container.baseband_data_interpolated[base_off],
-						avail, data_container.interpolation_rate,
-						data_container.interpolation_rate);
-					ts_result.delay += base_off;
+						&data_container.baseband_data_decimated[base_off_dec],
+						avail_dec, 1, 1);
+					ts_result.delay = ts_result.delay * p3_M + base_off;
+#ifdef TIMESYNC_TRACE
+					{
+						// Dual-path: re-mix full-rate at the same carrier, run
+						// the old path, compare.
+						ofdm.passband_to_baseband((double*)data, p3_full_size,
+							data_container.baseband_data_interpolated,
+							sampling_frequency, carrier_frequency + freq_search[i],
+							carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
+						TimeSyncResult ts_old = ofdm.time_sync_preamble_halfsym(
+							&data_container.baseband_data_interpolated[base_off],
+							avail, data_container.interpolation_rate,
+							data_container.interpolation_rate);
+						ts_old.delay += base_off;
+						if(timesync_trace_fp)
+						{
+							fprintf(timesync_trace_fp,
+								"# STEP3-SITE6 freq=%.0f dec_delay=%d old_delay=%d diff=%d %s\n",
+								freq_search[i], ts_result.delay, ts_old.delay,
+								ts_result.delay - ts_old.delay,
+								(ts_result.delay == ts_old.delay) ? "EXACT" : "DIFF");
+							fflush(timesync_trace_fp);
+						}
+					}
+#endif
 
 					if (fabs(freq_search[i]) < 0.1)
 						zero_hz_correlation = ts_result.correlation;
@@ -1600,27 +2001,58 @@ skip_h_retry_point:
 					if (pream_symb_loc < 1) { pream_symb_loc = 1; }
 				}
 
-				// Restore baseband for time sync (at possibly corrected frequency)
-				ofdm.passband_to_baseband((double*)data,
-					data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate,
-					data_container.baseband_data_interpolated,
-					sampling_frequency,
-					carrier_frequency + coarse_freq_offset,
-					carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
-
-				// Schmidl-Cox fine time sync at the corrected frequency
+				// Plan-B Step 3 (site 7, fine-sync after coarse-freq): restore
+				// the decimated baseband at the corrected carrier for the fine
+				// Schmidl-Cox search. The full-rate baseband_data_interpolated
+				// is intentionally NOT re-mixed here — its only downstream
+				// consumers are energy gates (std::norm), which are invariant
+				// to the carrier mixing frequency, and the data extraction
+				// re-mixes from raw `data` itself.
 				{
+					int p3_M = data_container.interpolation_rate;
+					int p3_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+					ofdm.passband_to_baseband_decimated((double*)data,
+						p3_full_size,
+						data_container.baseband_data_decimated,
+						sampling_frequency,
+						carrier_frequency + coarse_freq_offset,
+						carrier_amplitude, p3_M, &ofdm.FIR_rx_time_sync);
+
+					// Schmidl-Cox fine time sync at the corrected frequency
 					int sym_samp = data_container.Nofdm * frequency_interpolation_rate;
 					int base_off = (pream_symb_loc > 0 ? pream_symb_loc - 1 : 0) * sym_samp;
 					int buf_lim = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 					int avail = buf_lim - base_off;
 					int need = (data_container.preamble_nSymb + 4) * sym_samp;
 					if(avail > need) avail = need;
+					int base_off_dec = base_off / p3_M;
+					int avail_dec = avail / p3_M;
 					TimeSyncResult ts_result = ofdm.time_sync_preamble_halfsym(
-						&data_container.baseband_data_interpolated[base_off],
-						avail, data_container.interpolation_rate,
-						data_container.interpolation_rate);
-					receive_stats.delay = base_off + ts_result.delay;
+						&data_container.baseband_data_decimated[base_off_dec],
+						avail_dec, 1, 1);
+					receive_stats.delay = base_off + ts_result.delay * p3_M;
+#ifdef TIMESYNC_TRACE
+					{
+						ofdm.passband_to_baseband((double*)data, p3_full_size,
+							data_container.baseband_data_interpolated,
+							sampling_frequency, carrier_frequency + coarse_freq_offset,
+							carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
+						TimeSyncResult ts_old = ofdm.time_sync_preamble_halfsym(
+							&data_container.baseband_data_interpolated[base_off],
+							avail, data_container.interpolation_rate,
+							data_container.interpolation_rate);
+						int old_delay = base_off + ts_old.delay;
+						if(timesync_trace_fp)
+						{
+							fprintf(timesync_trace_fp,
+								"# STEP3-SITE7 dec_delay=%d old_delay=%d diff=%d %s\n",
+								receive_stats.delay, old_delay,
+								receive_stats.delay - old_delay,
+								(receive_stats.delay == old_delay) ? "EXACT" : "DIFF");
+							fflush(timesync_trace_fp);
+						}
+					}
+#endif
 				}
 			}
 			else
@@ -1638,6 +2070,21 @@ skip_h_retry_point:
 			}
 
 			if(receive_stats.delay<0){receive_stats.delay=0;}
+
+#ifdef TIMESYNC_TRACE
+			// Plan-B Step 0: trace the post-fine-sync delay (full-rate index).
+			// One line per trial; the golden baseline keys on (frame_index, delay).
+			if(timesync_trace_fp && mfsk_fixed_delay < 0 && ofdm_forced_delay < 0)
+			{
+				fprintf(timesync_trace_fp, "%d,%s,%d,%d,%.6f,%d\n",
+					timesync_trace_frame_index,
+					(M == MOD_MFSK) ? "MFSK" : "OFDM",
+					narrowband_enabled ? 1 : 0,
+					receive_stats.delay, receive_stats.coarse_metric,
+					pream_symb_loc);
+				fflush(timesync_trace_fp);
+			}
+#endif
 
 			// Clamp delay to prevent buffer overflow in rational_resampler
 			{
@@ -2235,20 +2682,55 @@ skip_h_retry_point:
 			if(search_start_symb < upper_bound
 				&& available > data_container.preamble_nSymb * sym_samples)
 			{
-				// Re-run passband_to_baseband with time_sync FIR for fresh search
+				// Plan-B Step 3 (site 2247, SKIP-H recovery): the coarse search
+				// runs on a freshly re-mixed decimated buffer. The full-rate
+				// baseband_data_interpolated re-mix is KEPT for now because the
+				// post-`goto` trial loop re-enters site 8 (time_sync_preamble_
+				// with_metric, still on the full-rate buffer until Step 5) and
+				// the data extraction may have clobbered baseband_data_
+				// interpolated on the prior iteration. Step 5 removes this
+				// re-mix when site 8 is converted. SKIP-H is the rarest path
+				// (fires only after all 20 trials fail), so the transient
+				// extra FIR pass here is acceptable.
+				int p3_M = data_container.interpolation_rate;
+				int p3_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 				ofdm.passband_to_baseband((double*)data,
-					data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate,
+					p3_full_size,
 					data_container.baseband_data_interpolated,
 					sampling_frequency, carrier_frequency, carrier_amplitude,
 					1, &ofdm.FIR_rx_time_sync);
+				ofdm.passband_to_baseband_decimated((double*)data,
+					p3_full_size,
+					data_container.baseband_data_decimated,
+					sampling_frequency, carrier_frequency, carrier_amplitude,
+					p3_M, &ofdm.FIR_rx_time_sync);
 
 				// Schmidl-Cox autocorrelation: preamble L-sample periodicity
 				// discriminates preamble from data (data has no L-period).
+				int search_start_dec = search_start / p3_M;
+				int available_dec = available / p3_M;
 				TimeSyncResult retry = ofdm.time_sync_preamble_halfsym(
-					&data_container.baseband_data_interpolated[search_start],
-					available, data_container.interpolation_rate,
-					data_container.interpolation_rate);
-				retry.delay += search_start;
+					&data_container.baseband_data_decimated[search_start_dec],
+					available_dec, 1, 1);
+				retry.delay = retry.delay * p3_M + search_start;
+#ifdef TIMESYNC_TRACE
+				{
+					TimeSyncResult retry_old = ofdm.time_sync_preamble_halfsym(
+						&data_container.baseband_data_interpolated[search_start],
+						available, data_container.interpolation_rate,
+						data_container.interpolation_rate);
+					retry_old.delay += search_start;
+					if(timesync_trace_fp)
+					{
+						fprintf(timesync_trace_fp,
+							"# STEP3-SITE2247 dec_delay=%d old_delay=%d diff=%d %s\n",
+							retry.delay, retry_old.delay,
+							retry.delay - retry_old.delay,
+							(retry.delay == retry_old.delay) ? "EXACT" : "DIFF");
+						fflush(timesync_trace_fp);
+					}
+				}
+#endif
 
 				int retry_symb = retry.delay / sym_samples;
 				if(retry_symb < 1) retry_symb = 1;
