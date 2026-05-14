@@ -359,6 +359,23 @@ void cl_arq_controller::process_messages_rx_data_control()
 						// All expected frames decoded -- ACK immediately.
 						rx_timeout = ptt_on_delay_ms;
 					}
+					else if(sack_enabled && last_received_end_of_batch_seq >= 0)
+					{
+						// Fix B (SACK turnaround, SACK_TURNAROUND_FIX_PLAN.md §8.3):
+						// EOB-frame fast path. The commander marks its LAST DATA
+						// frame with bit 7 of sequence_number; decoding it sets
+						// last_received_end_of_batch_seq >= 0. That is POSITIVE
+						// PROOF the commander has finished transmitting this batch
+						// -- so RSP must NOT wait out the full remaining-batch
+						// estimate before SACKing. Use a short turnaround
+						// (ptt_on + ptt_off, ~300 ms) so the receiving timer
+						// expires just after the EOB frame and RSP SACKs the gaps
+						// immediately. send_sack_pattern()'s own guard supplies the
+						// precise CMD-drain margin. Only correct paired with Fix A:
+						// if the EOB frame itself is lost this branch never runs
+						// and Fix A's per-frame rx_timeout is the fallback.
+						rx_timeout = ptt_on_delay_ms + ptt_off_delay_ms;
+					}
 					else
 					{
 						// More frames expected.  Add one msg_time margin for
@@ -370,40 +387,29 @@ void cl_arq_controller::process_messages_rx_data_control()
 							+ message_transmission_time_ms;
 					}
 				}
-				// SACK timing: when batch incomplete, keep the initial timeout
-				// from calculate_receiving_timeout() which covers full CMD TX.
-				// Reducing timeout or restarting timer per-frame causes RSP to
-				// send SACK while CMD still transmitting.
-				if(!sack_enabled || batch_rx_frame_count >= effective_batch)
-				{
-					printf("[RSP-TIMER] SET: sack=%d rxcnt=%d eff=%d seq=%d rx_t=%d old_t=%d\n",
-						sack_enabled?1:0, batch_rx_frame_count, effective_batch,
-						messages_rx_buffer.sequence_number, rx_timeout, receiving_timeout);
-					fflush(stdout);
-					set_receiving_timeout(rx_timeout);
-					receiving_timer.start();
-				}
-				else
-				{
-					// If the timer was stopped (expired previously with 0 frames
-					// before any data arrived), restart it so ACK-GATE can trigger
-					// after the remaining frames arrive or the timer expires again.
-					if(receiving_timer.counting != COUNTING)
-					{
-						printf("[RSP-TIMER] RESTART: sack=%d rxcnt=%d eff=%d seq=%d cur_t=%d (was stopped)\n",
-							sack_enabled?1:0, batch_rx_frame_count, effective_batch,
-							messages_rx_buffer.sequence_number, receiving_timeout);
-						fflush(stdout);
-						receiving_timer.start();
-					}
-					else
-					{
-						printf("[RSP-TIMER] KEEP: sack=%d rxcnt=%d eff=%d seq=%d rx_t=%d cur_t=%d\n",
-							sack_enabled?1:0, batch_rx_frame_count, effective_batch,
-							messages_rx_buffer.sequence_number, rx_timeout, receiving_timeout);
-						fflush(stdout);
-					}
-				}
+				// Fix A (SACK turnaround, SACK_TURNAROUND_FIX_PLAN.md §8.2):
+				// re-arm the receiving timer on EVERY decoded DATA frame with the
+				// per-frame rx_timeout computed above. rx_timeout is the
+				// remaining-batch estimate anchored to which seq just arrived and
+				// to the measured frame geometry (message_transmission_time_ms) --
+				// NOT an open-loop budget. This is the §4.1 idle timer in its
+				// structurally-correct form: each frame re-arms the timer for "the
+				// whole rest of the batch", so RSP only ACK-GATEs once the channel
+				// has genuinely been idle longer than the entire remaining batch
+				// could take. Previously the sack_enabled+incomplete path threw
+				// rx_timeout away (KEEP did nothing; RESTART restarted the timer
+				// but not the timeout), so the timer ran on a stale value started
+				// mid-batch -- it expired 6-9 s before CMD finished (§6.4). The
+				// non-SACK path already did exactly this every frame; Fix A makes
+				// the SACK path identical to it, so the --enable-sack-OFF path is
+				// byte-for-byte unchanged.
+				printf("[RSP-TIMER] SET: sack=%d rxcnt=%d eff=%d seq=%d eob=%d rx_t=%d old_t=%d\n",
+					sack_enabled?1:0, batch_rx_frame_count, effective_batch,
+					messages_rx_buffer.sequence_number,
+					last_received_end_of_batch_seq, rx_timeout, receiving_timeout);
+				fflush(stdout);
+				set_receiving_timeout(rx_timeout);
+				receiving_timer.start();
 			}
 			messages_rx_buffer.status=FREE;
 			link_timer.start();

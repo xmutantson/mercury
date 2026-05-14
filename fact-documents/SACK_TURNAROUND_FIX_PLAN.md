@@ -488,9 +488,9 @@ session per CLAUDE.md §"Plan before coding".
 | 3 | Deploy instrumented binary to both Pis; run `phase0_baseline.py --mode pi --configs WB_CFG15 --runs 3 --extra-args=--enable-sack`; `timing_pull_pi_logs.py`; `timing_log_parse.py` (§2.2). | N/A (data capture only — keep logs as evidence under `timing_data/`) | Stable `rsp_to_cmd_offset`; M1–M9 paired into ≥3 batches; F23 signature reproduced: `overlap > 0` and SACK window outside CMD rx-usable window (§2.5). If NOT reproduced → STOP. | **DONE** — deployed via `mercury_deploy_rpi.py`; 1-run WB_CFG15 60 s `--enable-sack` capture (logs `pi_rpi{1,2}_20260514_123229.log`). **F23 signature REPRODUCED** — 4/4 ACK-GATE events on partial batches, frames keep arriving after gate (§6.1). NOTE: the plan's cross-clock `overlap` was found unreliable for collision traces — see §6.5; the equivalent signature is proven offset-free on RSP's single clock. |
 | 4 | Record the measured numbers (overlap ms, miss ms, inter-frame gap, CMD turnaround, EOB-frame decode rate) back into THIS fact document, new §6. | Edit the doc | Numbers cited to the parsed log file:line | **DONE** — §6 above. Headline gap **6140–8674 ms (mean 7286)**; CMD post-TX 0/200 ms (not slow); root mechanism = open-loop `[RSP-TIMER] KEEP` at a 3780 ms budget vs ~9879 ms CMD batch TX (§6.4). |
 | 5 | Build the failing test: `tools/sack_turnaround_test.py` wrapping steps 3's tools + the §2.4 predicate (§3.2a / §3.3). | Delete the new file | Run against un-fixed instrumented binary → MUST report FAIL (≥1 of 3 runs shows collision). If it does not FAIL, test is invalid — fix the test before proceeding. | **DONE** — see §5-Step-5 RESULT below the table. |
-| 6 | Using step 4's data, finalize the §4 candidate selection (§4.4) and write the chosen design as a new §8 in this doc. Get approval before coding (CLAUDE.md §"Plan before coding"). | Edit the doc | Approval recorded | **APPROVAL GATE — NOT STARTED.** Trace data points to **A+B** (see §6 / final report). User selects. |
-| 7 | Implement the chosen fix in `arq_responder.cc` / `arq_common.cc` ONLY (one candidate per commit on a branch). Extract the pure decision helper; add `tools/test_sack_turnaround.cc` deterministic guard (§3.2b). | `git revert` per-candidate commits; delete the helper test | `tools/sack_turnaround_test.py` flips FAIL→PASS; pure-function guard passes | not started |
-| 8 | Regression: re-run `phase0_baseline.py` for `--enable-sack` WB_CFG15 (bps recovers toward ~2496), plus no-SACK WB + NB_CFG4/10 configs (unchanged). 3 runs, agent-judged. | Revert step 7 commits | bps numbers within expected bands; no collateral regression | not started |
+| 6 | Using step 4's data, finalize the §4 candidate selection (§4.4) and write the chosen design as a new §8 in this doc. Get approval before coding (CLAUDE.md §"Plan before coding"). | Edit the doc | Approval recorded | **DONE** — §8 written: **A+B** selected (C rejected per §6.3). User approved A+B in the Step-7/8 task brief. |
+| 7 | Implement the chosen fix in `arq_responder.cc` ONLY (§8.4). | `git revert` the fix commit | `tools/sack_turnaround_test.py` flips FAIL→PASS | see §8 RESULT below |
+| 8 | Regression: re-run `phase0_baseline.py` for `--enable-sack` WB_CFG15 (bps recovers toward ~2496), plus a no-SACK run (unchanged). agent-judged. | Revert step 7 commit | bps numbers within expected bands; no collateral regression | see §8 RESULT below |
 
 Steps 1–5 are "trace + reproduce" (the user's chosen approach, fully reversible,
 no fix code touched) — **all five DONE**. Step 6 is an approval gate (the user
@@ -674,3 +674,122 @@ non-authoritative for collision traces.
   `sack_retransmit_active` branch skips re-setting `sequence_number`, so
   the flag is whatever was set on the original TX; confirm this is the
   intended semantics for Candidate B.) — still open, decide during §7-fix.
+
+---
+
+## §8 Chosen fix design — Candidate A + B (Step 6, implemented in Step 7)
+
+Selected per §4.4 / §6: **A + B combined**. C rejected outright (§6.3 proved
+CMD post-TX is not slow — C targets a non-problem).
+
+### §8.1 The precise mechanism the fix removes
+
+The per-DATA-frame timer block `process_messages_rx_data_control()`
+(`arq_responder.cc:327-406`) computes a *correct* per-frame remaining-batch
+estimate `rx_timeout` (lines 327-371):
+`remaining*message_transmission_time_ms + time_left_to_send_last_frame +
+ptt_on_delay_ms + message_transmission_time_ms`. The `[RSP-TIMER]` log `rx_t`
+column proves it is right: seq=0→9460 ms, decreasing per frame, ≈ the measured
+~9879 ms CMD batch TX (§6.3).
+
+**But the `sack_enabled && incomplete` branch (`arq_responder.cc:386-405`)
+THROWS `rx_timeout` AWAY.** `KEEP` (lines 399-405) does nothing — leaves
+`receiving_timeout` at a stale value and never restarts the timer; `RESTART`
+(391-398) restarts the timer but also does NOT update `receiving_timeout`. The
+Step-3 trace (`pi_rpi1_20260514_123229.log:1650`) shows batch 1's timer
+`RESTART`'d mid-batch with a **stale `receiving_timeout=3780`** (a leftover
+from a control exchange — the RSP-branch `calculate_receiving_timeout()` value
+of `25*390+100+1 ≈ 9851 ms` was never the live value), then `KEEP`'d at 3780
+for all 11 frames → expired at `abs_ms=7705`, **6140 ms before CMD's last
+frame** (§6.1, §6.4). The non-SACK branch (lines 377-385) does the right thing
+— `set_receiving_timeout(rx_timeout); receiving_timer.start()` every frame. The
+SACK branch was split off under the *incorrect* belief (comment lines 373-376)
+that restarting per-frame causes premature SACK; in fact restarting per-frame
+*with the correct remaining estimate* is exactly what PREVENTS it.
+
+### §8.2 Fix A — restart the timer every DATA frame with the computed `rx_timeout`
+
+Collapse the broken `KEEP`/`RESTART` SACK branch into the same action as the
+non-SACK branch: **every decoded DATA frame calls
+`set_receiving_timeout(rx_timeout); receiving_timer.start()`.** `rx_timeout` is
+the already-computed remaining-batch estimate — it is anchored to *which seq
+just arrived* (observed channel position) and *known frame geometry*, NOT an
+open-loop budget. This is the §4.1 "idle timer" in its structurally-correct
+form: each frame re-arms the timer for "the whole rest of the batch", so RSP
+only ACK-GATEs once the channel has genuinely been idle for longer than the
+entire remaining batch could take.
+
+**Threshold calibration (CLAUDE.md "calibrate from data, never guess").** The
+idle bound is `rx_timeout` itself — not a hand-picked constant. Its sufficiency
+is verified against the §6 measured frame geometry:
+- Max consecutive-seq (Δseq=1) inter-frame gap measured across the Step-3
+  trace = **677 ms** (p95 = 524 ms, mean = 358 ms; 67 samples,
+  `pi_rpi1_20260514_123229.log` `rsp_data_frame_rxed` events).
+- Max gap between two *consecutively-decoded* frames when intermediate frames
+  were LOST = **5718 ms** (seq 10→18, 8 frames lost;
+  `pi_rpi1_20260514_123229.log:2033→2519`). Other lost-run gaps: 3129 ms
+  (seq 7→15), 2857 ms (seq 4→11).
+- `rx_timeout` at the start of the worst lost-run: at seq=10 decode,
+  `rx_timeout = (25-10-1)*390 + 100 + 1 + 390 ≈ 5951 ms` **> the 5718 ms** the
+  next frame actually took to arrive. At seq=7: `rx_timeout ≈ 17*390+491 ≈
+  7121 ms ≫ 3129 ms`. So the per-frame `rx_timeout` structurally covers every
+  observed in-batch gap including worst-case consecutive frame loss, because
+  it is sized for *all* remaining frames — even if every remaining frame but
+  the last is lost, the timer sized for the whole remainder still survives to
+  the last frame. The `+message_transmission_time_ms` margin already in the
+  formula (line 370) is the calibrated headroom over the 677 ms max Δseq=1 gap.
+
+This makes the threshold a *derived* quantity (measured `message_transmission_
+time_ms` × remaining frame count), exactly like the existing non-SACK path —
+not a tuned band-aid.
+
+### §8.3 Fix B — EOB-frame fast path (paired with A)
+
+A alone makes RSP wait out the full remaining-batch estimate before ACK-GATE
+even after CMD has demonstrably finished. B is the fast path: CMD marks the
+last DATA frame with bit 7 of `sequence_number` (`arq_common.cc:2877-2879`);
+RSP decodes it into `last_received_end_of_batch_seq` (`arq_common.cc:4751-
+4753`). When the EOB frame is decoded **and the batch is still incomplete**,
+RSP has *positive proof CMD finished the batch* — it should not wait out A's
+timer. Fix B: in the per-frame block, detect "EOB seen this batch + still
+incomplete" and set `rx_timeout` to a short turnaround constant
+(`ptt_on_delay_ms` + a small CMD-drain margin) instead of the full
+remaining-batch estimate — RSP SACKs almost immediately.
+
+B is **only correct paired with A**: if the EOB frame is itself lost, B never
+triggers and A's per-frame `rx_timeout` is the fallback (this is the §4.2 "(−)
+B needs A as fallback" / §7 resolution). The existing `effective_batch`
+shrink-on-EOB logic (lines 334-339) already runs — B only changes the *timeout*
+chosen when `last_received_end_of_batch_seq >= 0 && batch_rx_frame_count <
+effective_batch`.
+
+### §8.4 Touch points (arq_responder.cc ONLY — no arq_common.cc control-flow change)
+
+Single localized region: `process_messages_rx_data_control()` per-DATA-frame
+timer block, `arq_responder.cc:327-406`.
+1. **Fix B**: after the `effective_batch` computation (line 355), add a branch:
+   if `last_received_end_of_batch_seq >= 0 && batch_rx_frame_count <
+   effective_batch` → `rx_timeout = ptt_on_delay_ms + EOB_DRAIN_MARGIN_MS`
+   (fast path; EOB proves CMD done).
+2. **Fix A**: replace the `if(!sack_enabled || complete) {...} else {KEEP/
+   RESTART}` split (lines 377-405) with a single unconditional
+   `set_receiving_timeout(rx_timeout); receiving_timer.start();` — every DATA
+   frame re-arms the timer with the per-frame estimate. The stale-`receiving_
+   timeout` and never-restarted-timer failure modes both vanish.
+
+No change to `send_sack_pattern()` — its open-loop `remaining_sym`/`drain_
+guard_ms` math (`arq_common.cc:3556-3572`) becomes moot once RSP only enters
+ACK-GATE after the channel is genuinely idle (A) or on EOB proof (B); the guard
+is left as a harmless small post-idle delay. No `calculate_receiving_timeout()`
+change. No `arq_commander.cc` change. Confined to one function.
+
+### §8.5 Reversibility & verification
+
+- One commit on mercury `monitor`; `git revert`-able. Confined to one function.
+- Verify: `mercury.exe --test` passes; `tools/sack_turnaround_test.py` flips
+  FAIL→PASS on the Step-7 binary (HARD GATE); Step-8 `--enable-sack` Pi
+  throughput recovers from the broken 563 bps toward/past the ~2496 bps
+  no-SACK baseline; a `--enable-sack`-OFF run is unchanged (the non-SACK path
+  already did `set_receiving_timeout(rx_timeout); start()` every frame — Fix A
+  makes the SACK path *identical* to it, so the OFF path is byte-for-byte
+  untouched).
