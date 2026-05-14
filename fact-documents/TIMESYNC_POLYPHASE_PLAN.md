@@ -666,6 +666,50 @@ delay-trace plus the loopback recipe and `tools/bisect_benchmark.py` /
     diverges on sub-threshold noise, where it cannot flip a decision.
   - **Rollback:** revert the 7 energy-gate edits — independent of 6b/6c.
 
+- **Sub-step 6b — DONE & VALIDATED (2026-05-14).** Converted site 8
+  (`time_sync_preamble_with_metric`, the trial-loop fine sync) to source its
+  input from a scoped full-rate slice instead of the full-buffer
+  `baseband_data_interpolated`.
+  - **Why NOT a decimated coarse search (deviation from the §7 wording, with
+    rationale):** §7(b) said "convert site 8 to the Step-5 fine-slice
+    (decimated coarse + fine-slice of its own)." Site 8 is structurally
+    *unlike* site 3: site 3's `halfsym_2phase` is an idle-scan over the WHOLE
+    buffer (it needs a coarse search to FIND the preamble); site 8 runs
+    *after* detection over an ALREADY-BOUNDED small window
+    `[(pream_symb_loc-1)*Nofdm*M, +(preamble_nSymb+4)*Nofdm*M)` and uses
+    `step=1` with `location_to_return = sync_trials` (N-th-best peak). It
+    already KNOWS where its window is — a decimated coarse search would add
+    nothing but a semantic risk (the N-th-best decimated peak ordering can
+    differ from the N-th-best full-rate ordering on a flat ridge). The
+    faithful application of the *Step-5 idiom* ("mix+FIR a scoped full-rate
+    slice from raw `data` instead of relying on the full-buffer FIR") is:
+    mix+FIR site 8's exact window into `baseband_data_fine_slice` at full
+    rate, run `with_metric` UNCHANGED on it. This is **bit-exact** and
+    preserves the trial-loop N-th-best semantics exactly.
+  - **Carrier:** the slice is mixed at `carrier_frequency + coarse_freq_offset`.
+    In HEAD, `baseband_data_interpolated` holds the eager :928 mix at
+    `carrier_frequency` on trial 0 (offset==0) and the site-7 re-mix at
+    `carrier_frequency + coarse_freq_offset` on later trials —
+    `+ coarse_freq_offset` reproduces both. `sample_offset = s8_ext_start`
+    keeps the mixing phase continuous (matches :928 / site-7). FIR guard
+    margin `roundup(FIR_rx_time_sync.filter_nTaps, M)` keeps the slice FIR
+    transient outside the searched window — same idiom as the Step-5 slice.
+  - **Buffer reuse:** `baseband_data_fine_slice` is shared with the Step-5
+    site-3 slice. Safe: site 3's slice is consumed immediately (it is not
+    retained past `matched.delay`), and site 3 runs in the pre-trial-loop
+    block while site 8 runs inside the trial loop.
+  - **Validation:** `STEP6B-SITE8` dual-path check (TOL=0, bit-exact — site 8
+    runs only after the energy gates passed, so there is always a real
+    preamble candidate). **WB_CFG10: 79/79 EXACT.** NB produces **zero**
+    STEP6B-SITE8 lines — confirmed correct: site 8 is the final `else`
+    branch, and NB takes the `narrowband_enabled` branch instead (NB skips
+    Moose fine sync entirely, per the §4 table and MEMORY). Site 8 is
+    WB-only. All 6a checks still pass. Production build clean; host loopback
+    WB_CFG10 846, WB_CFG4 268 bps — *identical to 6a* (bit-exact conversion),
+    NB_CFG10 108-163 bps (unaffected — NB does not reach site 8).
+  - **Rollback:** revert the site-8 edit — independent of 6a; 6c not yet
+    applied so the eager :928 still populates `baseband_data_interpolated`.
+
 ### Step 7 — Remove instrumentation
 - **Action:** Delete the `TIMESYNC_TRACE` `#ifdef` blocks and the in-situ
   asserts from Steps 0/2.
