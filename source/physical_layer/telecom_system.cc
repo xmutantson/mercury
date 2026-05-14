@@ -923,11 +923,19 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		// Populate the decimated-rate buffer — the hot-path time_sync FIR now
 		// runs ONLY at the decimated rate (M× cheaper) for OFDM. Bit-exact
 		// equivalent to the full-rate FIR followed by picking every Mth sample
-		// (see fir_filter.cc:227). Skipped for MFSK: baseband_data_decimated is
-		// only consumed by the OFDM time_sync/energy paths (the MFSK detector
-		// reads baseband_data_interpolated, populated by the M==MOD_MFSK eager
-		// call above) — populating it for MFSK would be pure wasted work.
-		if(M != MOD_MFSK)
+		// (see fir_filter.cc:227).
+		//
+		// Plan-C Step 1: the WB MFSK FFT-energy detector time_sync_mfsk
+		// (ofdm.cc) now also reads baseband_data_decimated (it has no
+		// sub-symbol-oversampling constraint — it scans on a 1-symbol grid and
+		// reads a single decimation phase). So populate the decimated buffer
+		// for MFSK too, but ONLY when the FFT-energy path is selected
+		// (mfsk_corr_template == NULL). When mfsk_corr_template != NULL the
+		// cross-correlation detector time_sync_mfsk_corr is used instead — it
+		// still consumes baseband_data_interpolated (Bug #44 4x sub-symbol
+		// oversampled search; Plan-C Steps 2-4, not done here), so populating
+		// the decimated buffer for that path would be pure wasted work.
+		if(M != MOD_MFSK || ofdm.mfsk_corr_template == NULL)
 		{
 			int p2b_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 			int p2b_M = data_container.interpolation_rate;
@@ -1001,14 +1009,27 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			}
 			else
 			{
-				// WB: FFT energy ratio detection
-				receive_stats.delay = ofdm.time_sync_mfsk(
-					data_container.baseband_data_interpolated,
-					data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate,
-					data_container.interpolation_rate,
+				// WB: FFT energy ratio detection.
+				// Plan-C Step 1: read the single-phase decimated buffer
+				// (baseband_data_decimated) with interpolation_rate = 1 — every
+				// "* interpolation_rate" inside time_sync_mfsk collapses, the
+				// FFT reads contiguous decimated samples, the 1-symbol-grid scan
+				// is unchanged. time_sync_mfsk has NO Bug #44 sub-symbol
+				// oversampling constraint (it scans on a full-symbol grid and
+				// reads decimation phase 0 only), so this is a straight
+				// re-point. The returned delay is now a DECIMATED index
+				// (best_sym_idx * Nofdm) — multiply by interpolation_rate to
+				// restore a full-rate receive_stats.delay (frame extraction and
+				// the energy gates all expect a full-rate index).
+				int mfsk_delay_dec = ofdm.time_sync_mfsk(
+					data_container.baseband_data_decimated,
+					data_container.Nofdm * data_container.buffer_Nsymb,
+					1,
 					data_container.preamble_nSymb, mfsk.preamble_tones,
 					mfsk.M, mfsk.nStreams, mfsk.stream_offsets,
 					search_start, &mfsk_sync_metric);
+				receive_stats.delay = (mfsk_delay_dec < 0) ? -1
+					: mfsk_delay_dec * data_container.interpolation_rate;
 			}
 
 			if(receive_stats.delay < 0)
