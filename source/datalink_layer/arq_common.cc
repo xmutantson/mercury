@@ -3822,17 +3822,54 @@ bool cl_arq_controller::receive_sack_pattern(bool* out_bitmap, int nframes)
 				ldpc_ok = false;
 			}
 
+			// Whether the LDPC wire format is the active SACK encoding for this
+			// link. Mirrors the predicate that gated decode_sack_bitmap_ldpc()
+			// above. For this format the TX puts an LDPC *codeword* in the
+			// suffix tones (mfsk.cc:655-680); the legacy hard decoder
+			// decode_sack_bitmap() is NOT its inverse.
+			bool ldpc_wire_format =
+				(telecom_system->ack_mfsk.M >= 16 && telecom_system->sack_ldpc.N > 0);
+
 			if (!ldpc_ok)
 			{
-				// Fallback: hard-decision decode from suffix tones
-				int nsuffix = telecom_system->ack_mfsk.sack_bitmap_nsuffix(nframes, &telecom_system->sack_ldpc);
+				if (ldpc_wire_format)
+				{
+					// Candidate A2 (SACK_LDPC_FALLBACK_INVESTIGATION.md §6/§7):
+					// the LDPC soft-decision decoder is the ONLY correct decoder
+					// for this wire format. On ldpc=NO the bitmap is
+					// unrecoverable — the old hard fallback
+					// (decode_sack_bitmap()) decoded the LDPC-coded tones with
+					// the legacy un-coded codebook and fabricated a bitmap
+					// structurally unrelated to what RSP sent, causing
+					// wrong-frame retransmits AND a spurious data_ack_received.
+					// Correct fail-safe: leave out_bitmap all-false (every frame
+					// NACKed) -> CMD does a clean full-batch retransmit, and the
+					// genuine "RSP responded / batch finished" signal is still
+					// delivered via the return true below. This matches
+					// decode_sack_bitmap_ldpc()'s documented "NACK everything on
+					// failure" intent (telecom_system.cc:3268-3270).
+					for(int i = 0; i < nframes; i++)
+						out_bitmap[i] = false;
 
-				printf("[RX-SACK-RAW] LDPC failed, hard fallback nsuffix=%d suffix_tones:", nsuffix);
-				for(int i = 0; i < nsuffix; i++)
-					printf(" %d", suffix_tones[i]);
-				printf("\n"); fflush(stdout);
+					printf("[RX-SACK] ldpc=NO -> full-batch retransmit "
+					       "(hard fallback skipped for LDPC wire format)\n");
+					fflush(stdout);
+				}
+				else
+				{
+					// Legacy NB / non-LDPC wire format (M<16 or sack_ldpc not
+					// initialised): the TX *does* use the legacy un-coded
+					// encode_sack_bitmap() format (mfsk.cc:683-712), so
+					// decode_sack_bitmap() IS its correct inverse here. Keep it.
+					int nsuffix = telecom_system->ack_mfsk.sack_bitmap_nsuffix(nframes, &telecom_system->sack_ldpc);
 
-				telecom_system->ack_mfsk.decode_sack_bitmap(suffix_tones, nsuffix, nframes, out_bitmap);
+					printf("[RX-SACK-RAW] LDPC failed, hard fallback nsuffix=%d suffix_tones:", nsuffix);
+					for(int i = 0; i < nsuffix; i++)
+						printf(" %d", suffix_tones[i]);
+					printf("\n"); fflush(stdout);
+
+					telecom_system->ack_mfsk.decode_sack_bitmap(suffix_tones, nsuffix, nframes, out_bitmap);
+				}
 			}
 
 			printf("[RX-SACK] Detected (matched=%d, metric=%.1f, ack_xcheck=%d, ldpc=%s), bitmap:",
