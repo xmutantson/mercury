@@ -3298,16 +3298,33 @@ skip_h_retry_point:
 double cl_telecom_system::measure_signal_only(double *data)
 {
 	// Lightweight signal measurement - only passband to baseband + measure strength
-	// No preamble detection or decoding
-	ofdm.passband_to_baseband((double*)data,
-		data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate,
-		data_container.baseband_data_interpolated,
+	// No preamble detection or decoding.
+	//
+	// Plan-B Step 6c (§7-inventory correction): this function — called from
+	// cl_arq_controller::process_main() when link_status == IDLE/DROPPED — is
+	// the FIR_rx_time_sync hot path while the modem is TRULY idle (the :928
+	// call in receive_byte is hot only while LISTENING/receiving). The §7
+	// inventory and all of Plan B scoped everything to receive_byte and missed
+	// this — yet an RPi1 call-graph perf profile showed THIS is the ~92%
+	// cl_FIR::apply cost during an idle-after-connect session. The fix is the
+	// SAME rate-invariant conversion already applied to measure_signal_stregth
+	// in receive_byte (Step 6a): the FIR runs at the decimated rate (M× cheaper)
+	// and the mean-power measurement reads the decimated buffer. Mean power per
+	// sample is rate-invariant (the anti-alias FIR passes the signal band).
+	// Writing baseband_data_decimated instead of baseband_data_interpolated
+	// also fully decouples this idle path from receive_byte's scratch buffer
+	// (eliminates the Bug #28 same-buffer concern entirely).
+	int ms_M = data_container.interpolation_rate;
+	int ms_full_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+	ofdm.passband_to_baseband_decimated((double*)data,
+		ms_full_size,
+		data_container.baseband_data_decimated,
 		sampling_frequency, carrier_frequency, carrier_amplitude,
-		1, &ofdm.FIR_rx_time_sync);
+		ms_M, &ofdm.FIR_rx_time_sync);
 
 	double signal_dbm = ofdm.measure_signal_stregth(
-		data_container.baseband_data_interpolated,
-		data_container.Nofdm*data_container.buffer_Nsymb*frequency_interpolation_rate);
+		data_container.baseband_data_decimated,
+		data_container.Nofdm * data_container.buffer_Nsymb);
 
 	receive_stats.signal_stregth_dbm = signal_dbm;
 

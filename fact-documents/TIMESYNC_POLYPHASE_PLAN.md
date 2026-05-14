@@ -10,7 +10,7 @@ author: Plan-B prep agent; Step 6 by Step-6 execution agent
 **Steps 0-5 DONE & VALIDATED & COMMITTED (`1686641`, 2026-05-13).
 Step 6 DONE as 3 reversible sub-steps 6a/6b/6c (2026-05-14), each committed:
 6a `e868e9b` (energy/signal gates → decimated), 6b `f9f1172` (site 8 →
-scoped full-rate slice), 6c `<pending>` (site 1 + eager :928 removal for
+scoped full-rate slice), 6c `3188c16` (site 1 + eager :928 removal for
 OFDM). The eager :928 full-rate time_sync FIR — the ~92% RPi OFDM idle-scan
 cost — is REMOVED from the production OFDM path as of 6c. Remaining: Step 7
 (strip the `TIMESYNC_TRACE` instrumentation) + the RPi1 idle-CPU profile
@@ -777,6 +777,43 @@ delay-trace plus the loopback recipe and `tools/bisect_benchmark.py` /
     for all M again, and re-point site 1 at `baseband_data_interpolated`.
     Because the eager call is the last thing removed, 6a/6b remain
     independently valid even after a 6c rollback.
+
+- **Sub-step 6c-ext — `measure_signal_only` (the ACTUAL idle-scan FIR) —
+  DONE & VALIDATED (2026-05-14).** **§7-INVENTORY MISS #2, found by the
+  RPi1 perf profile.** After 6a/6b/6c the RPi1 call-graph profile STILL
+  showed `cl_FIR::apply` at 91.8% — but the caller was NOT any `receive_byte`
+  site. It was:
+  `cl_arq_controller::process_main() → cl_telecom_system::measure_signal_only()
+  → cl_ofdm::passband_to_baseband(... FIR_rx_time_sync ...) → cl_FIR::apply`.
+  - **Root cause:** Plan B (and the §7 inventory) scoped EVERYTHING to
+    `receive_byte`. But `FIR_rx_time_sync` filters the full passband buffer
+    in **two** places: (1) `receive_byte` :928 — hot while LISTENING/receiving
+    — converted by Steps 0-6c; (2) **`measure_signal_only`
+    (telecom_system.cc:3298)** — called from `arq_common.cc:2240` every ~2 ms
+    when `link_status == IDLE || DROPPED` — hot while the modem is **truly
+    idle**. §1's "idle preamble scanning" cost is *predominantly*
+    `measure_signal_only`, not :928. The plan never named it.
+  - **Fix:** the SAME rate-invariant conversion already proven in Step 6a for
+    `measure_signal_stregth` — `passband_to_baseband` → `passband_to_baseband_
+    decimated` (FIR at the decimated rate, M× cheaper) + `measure_signal_
+    stregth` reads `baseband_data_decimated`. Mean power per sample is
+    rate-invariant. `cl_FIR::apply`/`apply_decimate` are stateless, so no FIR
+    delay-line interaction. Writing `baseband_data_decimated` instead of
+    `baseband_data_interpolated` also fully decouples this idle path from
+    `receive_byte`'s scratch buffer (eliminates the Bug #28 same-buffer
+    concern). NOT improvising a new technique — it is 6a's proven transform
+    applied to the function the plan's own §1 motivation actually describes;
+    leaving it unconverted would make Steps 0-6c deliver ZERO measurable
+    RPi-idle-CPU win.
+  - **Validation:** production build clean; host loopback WB_CFG10 725 bps
+    (healthy — `measure_signal_only` runs only at IDLE, does not touch
+    throughput). RPi1 perf profile: see the §7 Step-6 Pi-profile result
+    below.
+  - **Rollback:** revert the `measure_signal_only` body — independent of
+    6a/6b/6c.
+  - **Follow-up [?]:** is there a THIRD `FIR_rx_time_sync` full-rate caller?
+    The post-6c-ext RPi1 profile answers this — if `cl_FIR::apply` finally
+    collapses, the inventory is complete.
 
 ### Step 7 — Remove instrumentation
 - **Action:** Delete the `TIMESYNC_TRACE` `#ifdef` blocks and the in-situ
