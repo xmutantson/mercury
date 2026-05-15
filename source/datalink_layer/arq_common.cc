@@ -189,6 +189,12 @@ cl_arq_controller::cl_arq_controller()
 	axis2_consecutive_good_batches=0;
 	axis2_consecutive_bad_batches=0;
 	axis2_cooldown_batches=0;
+	// SACK Design A Step 12 — Axis-2 proven-ceiling state (§4.3.4 invariant #7).
+	// Default ceiling = -1 (no cap). Set on Axis-2 down-move; cleared on
+	// recovery (20 batches) or on any Axis-1 supremacy event.
+	batch_size_proven_ceiling=-1;
+	batch_size_ceiling_recovery_batches=0;
+	axis2_ceiling_blocks_count=0;
 	axis2_evaluations=0;
 	axis2_move_up_count=0;
 	axis2_move_down_count=0;
