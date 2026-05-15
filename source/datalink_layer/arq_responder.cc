@@ -63,7 +63,10 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 		return success;
 	}
 
-	if(type==DATA_LONG && length>(max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH))
+	// SACK Design A Step 1 — DATA_LONG payload capacity is reduced by 1 byte
+	// when sack_v2_enabled. v1 path uses the legacy 4-byte macro; bytes-on-the
+	// -wire and bounds are identical to pre-Step-1.
+	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -82,7 +85,8 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 		messages_rx[loc].data[j]=data[j];
 	}
 	{
-		int fill_end = max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH;
+		// SACK Design A Step 1 — zero-pad up to effective DATA_LONG payload size.
+		int fill_end = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled);
 		if(fill_end > N_MAX/8) fill_end = N_MAX/8;
 		for(int j=messages_rx[loc].length;j<fill_end;j++)
 		{
@@ -347,7 +351,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 						int hdr_comp = hdr[1] | (hdr[2] << 8);
 						int gate_hdr_size = compressor.get_header_size();
 						int total_compressed = gate_hdr_size + hdr_comp;
-						int mf = max_data_length + max_header_length - DATA_LONG_HEADER_LENGTH;
+						// SACK Design A Step 1 — effective DATA_LONG header.
+						int mf = max_data_length + max_header_length - effective_data_long_header_length(sack_v2_enabled);
 						int hdr_expected = (total_compressed + mf - 1) / mf;
 						if(hdr_expected < 1) hdr_expected = 1;
 						if(hdr_expected < effective_batch)
@@ -824,7 +829,8 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				int hdr_comp = hdr[1] | (hdr[2] << 8);
 				int gate_hdr_size = compressor.get_header_size();
 				int total_compressed = gate_hdr_size + hdr_comp;
-				int mf = max_data_length + max_header_length - DATA_LONG_HEADER_LENGTH;
+				// SACK Design A Step 1 — effective DATA_LONG header.
+				int mf = max_data_length + max_header_length - effective_data_long_header_length(sack_v2_enabled);
 				expected = (total_compressed + mf - 1) / mf;
 				if(expected > data_batch_size) expected = data_batch_size;
 				if(expected < 1) expected = 1;
@@ -1876,7 +1882,9 @@ void cl_arq_controller::process_buffer_data_responder()
 			{
 				// Pop raw data from RX FIFO
 				char rx_raw[MAX_BUFFER_SIZE];
-				int rx_raw_len = fifo_buffer_rx.pop(rx_raw, max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH);
+				// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
+				// data-pop size; v1 (default) identical to legacy macro.
+				int rx_raw_len = fifo_buffer_rx.pop(rx_raw, max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled));
 
 				// B2F filter: parse incoming stream, reroll plaintext to LZHUF
 				if(b2f_handler.is_initialized())

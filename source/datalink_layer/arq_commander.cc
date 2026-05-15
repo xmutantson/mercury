@@ -690,7 +690,10 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 		return success;
 	}
 
-	if(type==DATA_LONG && length>(max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH))
+	// SACK Design A Step 1 — DATA_LONG payload capacity is reduced by 1 byte
+	// when sack_v2_enabled (the new batch_seq_id byte occupies that space).
+	// In v1 mode the effective value is identical to the legacy 4-byte macro.
+	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -3006,7 +3009,10 @@ void cl_arq_controller::process_buffer_data_commander()
 
 		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && block_under_tx==NO)
 		{
-			int max_frame = max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH;
+			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
+			// payload budget. In v1 (default) identical to legacy macro; in v2
+			// loses 1 byte to the batch_seq_id field.
+			int max_frame = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled);
 
 			if(compression_enabled)
 			{
