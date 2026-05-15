@@ -317,16 +317,25 @@ void cl_arq_controller::process_messages_rx_data_control()
 
 				// SACK Design A Step 4 — RSP cross-batch routing decision.
 				// Gated on sack_v2_enabled (v1 path takes the same code path as
-				// pre-Step-4: v2_route_drop stays false, all storage proceeds).
+				// pre-Step-4: v2_route_drop and v2_route_to_prev both stay false,
+				// all storage proceeds into messages_rx[]).
 				// Per §4.2.3 + §4.3.4 invariant #3:
 				//   • match `rsp_current_expected_batch_seq_id`  → route to current
-				//   • match `rsp_prev_batch_seq_id` (Step 8 territory) → route to prev
+				//   • match `rsp_prev_batch_seq_id`              → route to prev
+				//     (Step 8a — when rsp_prev_batch_active is true; otherwise
+				//      the match-prev branch is a stale-window late retransmit
+				//      with no live storage, treated as a duplicate and
+				//      DISCARDED to avoid silent corruption.)
 				//   • unknown / out-of-window                     → discard + log
-				// In today's mechanism-(a) traffic, retransmits carry the CURRENT
-				// batch_seq_id, so the prev path is dormant and the discard path
-				// must NOT fire in clean traffic. The discard branch is defensive
-				// scaffolding for the Step 8 retransmit-into-next-batch case.
-				bool v2_route_drop = false;
+				// In Step 8a, mechanism-(a) standalone retransmits hit the
+				// match-prev branch (the SACK-RSP-send bump has already
+				// advanced current to N+1 by the time CMD's retransmit-only
+				// batch for N arrives). Those frames now land in
+				// `messages_rx_prev[]` — the parallel storage that §7.8.3
+				// named as the missing piece. The match-current branch
+				// routes to `messages_rx[]` (the v1-shaped path; unchanged).
+				bool v2_route_drop    = false;
+				bool v2_route_to_prev = false;
 				if(sack_v2_enabled)
 				{
 					int bsi = messages_rx_buffer.batch_seq_id;
@@ -370,9 +379,152 @@ void cl_arq_controller::process_messages_rx_data_control()
 							rsp_v2_drop_count);
 						fflush(stdout);
 					}
+					else if(match_prev && !match_current)
+					{
+						// Step 8a: route to messages_rx_prev[] if the prev
+						// buffer is live. If a Step 4 ACK-GATE-PASS bump
+						// (clean batch path) advanced prev without
+						// activating the prev buffer, late retransmits for
+						// that already-delivered batch have no live storage
+						// — drop them as duplicates (preserves §4.3.4 #3
+						// "no silent corruption"; symmetric with the v1
+						// path which also relies on idempotent delivery).
+						if(rsp_prev_batch_active)
+						{
+							v2_route_to_prev = true;
+						}
+						else
+						{
+							v2_route_drop = true;
+							rsp_v2_drop_count++;
+							printf("[RSP-V2-DROP] batch_seq_id=%d expected=%d prev=%d "
+								"reason=prev_inactive_late_retransmit (drop_count=%lld)\n",
+								bsi, rsp_current_expected_batch_seq_id,
+								rsp_prev_batch_seq_id, rsp_v2_drop_count);
+							fflush(stdout);
+						}
+					}
 				}
 
-				if(!v2_route_drop)
+				// SACK Design A Step 8a — match-prev branch: store the frame
+				// into messages_rx_prev[] without touching messages_rx[] or
+				// the current-batch receive timer. The prev path runs to
+				// completion independently from the current-batch ACK-GATE.
+				if(v2_route_to_prev)
+				{
+					int loc = (int)((unsigned char)messages_rx_buffer.id);
+					int eff_long  = effective_data_long_header_length(sack_v2_enabled);
+					int eff_short = effective_data_short_header_length(sack_v2_enabled);
+					int max_long  = max_data_length + max_header_length - eff_long;
+					int max_short = max_data_length + max_header_length - eff_short;
+					bool len_ok = true;
+					if(messages_rx_buffer.type == DATA_LONG
+					   && messages_rx_buffer.length > max_long) len_ok = false;
+					if(messages_rx_buffer.type == DATA_SHORT
+					   && messages_rx_buffer.length > max_short) len_ok = false;
+					(void)eff_short;  // referenced via max_short above
+					if(loc < 0 || loc >= this->nMessages)         len_ok = false;
+					if(messages_rx_buffer.length < 0)             len_ok = false;
+					if(len_ok)
+					{
+						// Capture pre-store status so we can detect newly
+						// RECEIVED slots (avoid double-counting on repeat
+						// retransmits — RSP may see the same retx multiple
+						// times if CMD couldn't decode the SACK_RSP).
+						char prev_status = messages_rx_prev[loc].status;
+						messages_rx_prev[loc].type   = messages_rx_buffer.type;
+						messages_rx_prev[loc].length = messages_rx_buffer.length;
+						for(int j=0; j<messages_rx_buffer.length; j++)
+							messages_rx_prev[loc].data[j] = messages_rx_buffer.data[j];
+						{
+							int fill_end = max_long;
+							if(fill_end > N_MAX/8) fill_end = N_MAX/8;
+							for(int j=messages_rx_buffer.length; j<fill_end; j++)
+								messages_rx_prev[loc].data[j] = 0;
+						}
+						messages_rx_prev[loc].status = RECEIVED;
+						messages_rx_prev[loc].batch_seq_id = messages_rx_buffer.batch_seq_id;
+						if(prev_status != RECEIVED && prev_status != ACKED)
+							rsp_prev_batch_received_count++;
+
+						printf("[RSP-V2-PREV-RX] bsi=%d id=%d seq=%d/%d len=%d "
+							"prev_received=%d/%d\n",
+							(int)(unsigned char)messages_rx_buffer.batch_seq_id,
+							(int)(unsigned char)messages_rx_buffer.id,
+							messages_rx_buffer.sequence_number, data_batch_size,
+							messages_rx_buffer.length,
+							rsp_prev_batch_received_count,
+							rsp_prev_batch_expected_count);
+						fflush(stdout);
+
+						// Prev-batch completion: deliver via copy_data_to_buffer
+						// using a temporary pointer swap so the existing
+						// compression/decryption/delivery loop runs verbatim
+						// against messages_rx_prev[] (the same delivery code
+						// path the current-batch uses — no parallel pipeline,
+						// no duplicated logic). After delivery, clear prev
+						// slots back to FREE and deactivate.
+						if(rsp_prev_batch_active
+						   && rsp_prev_batch_received_count >= rsp_prev_batch_expected_count)
+						{
+							// Preserve current-batch state during the swap.
+							struct st_message* saved_rx     = messages_rx;
+							bool saved_data_delivered       = batch_data_delivered;
+							messages_rx                     = messages_rx_prev;
+							batch_data_delivered            = false;
+							printf("[RSP-V2-PREV-DELIVER-BEGIN] prev_batch_seq_id=%d "
+								"received=%d/%d (swapping messages_rx pointer for delivery)\n",
+								rsp_prev_batch_seq_id,
+								rsp_prev_batch_received_count,
+								rsp_prev_batch_expected_count);
+							fflush(stdout);
+							// Mark RECEIVED slots as ACKED so copy_data_to_buffer's
+							// ACKED-only iteration picks them up.
+							for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+							{
+								if(messages_rx[i].status == RECEIVED)
+									messages_rx[i].status = ACKED;
+							}
+							copy_data_to_buffer();
+							// Restore current-batch pointer + delivery state.
+							messages_rx                     = saved_rx;
+							batch_data_delivered            = saved_data_delivered;
+							// Clear prev slots back to FREE (copy_data_to_buffer
+							// already freed them via the swapped pointer, but
+							// double-ensure safety).
+							for(int i=0; i<this->nMessages; i++)
+								messages_rx_prev[i].status = FREE;
+							rsp_prev_batch_active            = false;
+							rsp_prev_batch_received_count    = 0;
+							rsp_prev_batch_expected_count    = 0;
+							rsp_prev_batch_delivered_count++;
+							printf("[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=%d "
+								"deliveries_total=%lld (cross-storage path drained; "
+								"current-batch storage untouched)\n",
+								rsp_prev_batch_seq_id, rsp_prev_batch_delivered_count);
+							fflush(stdout);
+						}
+					}
+					else
+					{
+						printf("[RSP-V2-PREV-DROP] bsi=%d id=%d len=%d "
+							"reason=length_or_loc_out_of_range\n",
+							(int)(unsigned char)messages_rx_buffer.batch_seq_id,
+							(int)(unsigned char)messages_rx_buffer.id,
+							messages_rx_buffer.length);
+						fflush(stdout);
+					}
+					// Frame fully handled by the prev path — DO NOT fall
+					// through to match-current storage. The existing
+					// `messages_rx_buffer.status=FREE; link_timer.start(); ...`
+					// tail (after the v2_route_drop block) runs as today;
+					// we just skip the messages_rx[] write + receiving-timer
+					// re-arm path. The current-batch receiving timer is left
+					// undisturbed (prev path is independent of current-batch
+					// ACK-GATE pacing — §4.3.4 #1 "one outstanding batch"
+					// still holds via data_ack_received on the CMD side).
+				}
+				else if(!v2_route_drop)
 				{
 
 				{

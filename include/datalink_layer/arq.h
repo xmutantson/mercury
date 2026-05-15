@@ -599,6 +599,92 @@ public:
                                               // configure time; cleared when
                                               // the corruption fires).
 
+  // SACK Design A Step 8a — RSP-side prev-batch parallel storage.
+  // ALL gated on sack_v2_enabled. v1 path never reads or writes any of these
+  // (the parallel buffer is allocated unconditionally for simplicity but is
+  // only ever populated or routed-into when sack_v2_enabled).
+  //
+  // §7.8.3 named the architectural problem this solves: when CMD will (in a
+  // future Step 8b) send mixed retransmit+new-data batches, the in-flight
+  // new-data batch (current) and the prior batch's retransmits (prev) must
+  // not collide on the single flat `messages_rx[]` array. Step 8a adds the
+  // parallel `messages_rx_prev[]` storage and the bump-at-SACK-RSP-send hook
+  // so prev-batch retransmits land in their own buffer, independent from
+  // current-batch frames. Step 8a does NOT change CMD behavior — CMD still
+  // sends standalone retransmit-only batches; the new path is exercised by
+  // those v2 standalone retransmits flowing into the prev buffer.
+  //
+  // Lifecycle of `messages_rx_prev[]`:
+  //   1. SACK partial branch (`arq_responder.cc:914-975`) calls
+  //      `send_sack_v2_frame()` for batch N.
+  //   2. Inside `send_sack_v2_frame()`, BEFORE TX: transfer (not copy) the
+  //      in-flight `messages_rx[]` contents for slots 0..data_batch_size-1
+  //      into `messages_rx_prev[]`; mark `messages_rx[]` slots FREE; record
+  //      `rsp_prev_batch_active=true`, `rsp_prev_batch_seq_id = N`, bump
+  //      `rsp_current_expected_batch_seq_id = N+1`. This is the NEW bump
+  //      site that §7.8.2 named as missing. The Step 4 ACK-GATE-PASS bump
+  //      (`arq_responder.cc:1029-1037`) is preserved in addition (it fires
+  //      on clean-batch full delivery — the prev buffer stays inactive in
+  //      that case).
+  //   3. CMD sends standalone retransmit-only batch for N (today's
+  //      mechanism (a) — unchanged in Step 8a). Frames carry bsi=N.
+  //   4. RSP routing: `match_prev` is now true → frames are stored into
+  //      `messages_rx_prev[]` (NOT `messages_rx[]`). This is the routing
+  //      modification: Step 4 routed match-prev hits into `messages_rx[]`
+  //      which §7.8.3 named as the silent-corruption hazard.
+  //   5. When `rsp_prev_batch_received_count >= rsp_prev_batch_expected_count`,
+  //      deliver the prev batch via `copy_data_to_buffer()` with a
+  //      `messages_rx`/`messages_rx_prev` pointer swap, then clear
+  //      `messages_rx_prev[]` slots back to FREE and set
+  //      `rsp_prev_batch_active = false`.
+  //   6. Subsequent batch N+1 new-data frames carry bsi=N+1 → match_current
+  //      → routed to `messages_rx[]` (now empty, no collision).
+  struct st_message* messages_rx_prev;
+                                         // RSP: parallel prev-batch buffer.
+                                         //      Allocated identically to
+                                         //      `messages_rx` (size nMessages,
+                                         //      each slot's `data` of size
+                                         //      N_MAX/8 + CANARY_SIZE). Frames
+                                         //      whose bsi matches the *prev*
+                                         //      window are stored here instead
+                                         //      of in `messages_rx`. NULL until
+                                         //      `init_messages_buffers()` runs.
+  bool rsp_prev_batch_active;            // RSP: true while a prev-batch is
+                                         //      waiting for retransmits to
+                                         //      complete. Set when
+                                         //      `send_sack_v2_frame()` transfers
+                                         //      messages_rx → messages_rx_prev;
+                                         //      cleared when prev delivery
+                                         //      completes (or when forcibly
+                                         //      discarded — see prev-stale
+                                         //      branch). Defaults to false.
+  int rsp_prev_batch_received_count;     // RSP: count of slots currently in
+                                         //      RECEIVED state in
+                                         //      messages_rx_prev for the
+                                         //      active prev batch.
+  int rsp_prev_batch_expected_count;     // RSP: expected RECEIVED count for
+                                         //      prev-batch completion. Set
+                                         //      from `last_received_end_of_batch_seq + 1`
+                                         //      (if known) or data_batch_size
+                                         //      at SACK_RSP-send time. The
+                                         //      same EOB-inference logic
+                                         //      `process_messages_acknowledging_data`
+                                         //      uses for the *current* batch.
+  long long rsp_prev_batch_delivered_count; // RSP: count of prev batches
+                                         //      successfully delivered via
+                                         //      the prev path (diagnostic;
+                                         //      validates "no silent loss" on
+                                         //      with-losses tests).
+  long long rsp_prev_batch_stale_count;  // RSP: count of times a new SACK_RSP
+                                         //      send would have overwritten
+                                         //      an active prev batch (rare —
+                                         //      means CMD never finished
+                                         //      retransmits for the prior
+                                         //      prev batch within RSP's
+                                         //      visibility window). Indicates
+                                         //      a stalled retransmit cycle;
+                                         //      logged via [RSP-V2-PREV-STALE].
+
   // Responder: double-buffered crypto batch storage
   st_crypto_batch_buffer crypto_buf[2]; // [0] = oldest pending, [1] = current
   int max_message_length;

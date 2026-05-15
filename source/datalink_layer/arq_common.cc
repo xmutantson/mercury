@@ -57,6 +57,7 @@ cl_arq_controller::cl_arq_controller()
 	messages_rx_buffer.data=NULL;
 	messages_tx=NULL;
 	messages_rx=NULL;
+	messages_rx_prev=NULL;   // SACK Design A Step 8a — RSP prev-batch storage
 	messages_batch_tx=NULL;
 	messages_batch_ack=NULL;
 	message_TxRx_byte_buffer=NULL;
@@ -170,6 +171,14 @@ cl_arq_controller::cl_arq_controller()
 	cmd_sack_v2_last_rx_batch_seq_id=-1;
 	test_rsp_sack_rsp_crc_corrupt=false;
 	test_rsp_sack_rsp_crc_corrupt_armed=false;
+	// SACK Design A Step 8a — RSP prev-batch parallel-storage bookkeeping.
+	// All gated on sack_v2_enabled; v1 path leaves these at their sentinels.
+	// `messages_rx_prev` itself is allocated in init_messages_buffers().
+	rsp_prev_batch_active=false;
+	rsp_prev_batch_received_count=0;
+	rsp_prev_batch_expected_count=0;
+	rsp_prev_batch_delivered_count=0;
+	rsp_prev_batch_stale_count=0;
 	crypto_buf[0].clear();
 	crypto_buf[1].clear();
 	message_transmission_time_ms=500;
@@ -1323,6 +1332,12 @@ void cl_arq_controller::check_buffer_canaries(const char* caller)
 		for(int i=0; i<nMessages; i++)
 			corrupted += check_canary(messages_rx[i].data, alloc_size, "messages_rx", i);
 	}
+	// SACK Design A Step 8a — parallel prev-batch buffer canaries.
+	if(messages_rx_prev != NULL)
+	{
+		for(int i=0; i<nMessages; i++)
+			corrupted += check_canary(messages_rx_prev[i].data, alloc_size, "messages_rx_prev", i);
+	}
 	if(messages_batch_ack != NULL)
 	{
 		for(int i=0; i<255; i++)
@@ -1403,6 +1418,41 @@ int cl_arq_controller::init_messages_buffers()
 			set_canary(this->messages_rx[i].data, alloc_size);
 
 			if(this->messages_rx[i].data==NULL)
+			{
+				success=MEMORY_ERROR;
+			}
+		}
+	}
+
+	// SACK Design A Step 8a — allocate parallel prev-batch storage.
+	// Sized identically to messages_rx (nMessages slots, each data buffer
+	// alloc_size + CANARY_SIZE). Only ever populated when sack_v2_enabled.
+	// On v1 sessions, the buffer sits idle — no read/write — so its presence
+	// is byte-invisible to the v1 wire path (the v1↔v1 SHA-256 stability
+	// gate proves this).
+	this->messages_rx_prev=new st_message[nMessages];
+
+	if(this->messages_rx_prev==NULL)
+	{
+		success=MEMORY_ERROR;
+	}
+	else
+	{
+		for(int i=0;i<this->nMessages;i++)
+		{
+			this->messages_rx_prev[i].ack_timeout=0;
+			this->messages_rx_prev[i].id=0;
+			this->messages_rx_prev[i].length=0;
+			this->messages_rx_prev[i].nResends=0;
+			this->messages_rx_prev[i].status=FREE;
+			this->messages_rx_prev[i].type=NONE;
+			this->messages_rx_prev[i].data=NULL;
+			this->messages_rx_prev[i].batch_seq_id=-1;
+
+			this->messages_rx_prev[i].data=new char[alloc_size + CANARY_SIZE];
+			set_canary(this->messages_rx_prev[i].data, alloc_size);
+
+			if(this->messages_rx_prev[i].data==NULL)
 			{
 				success=MEMORY_ERROR;
 			}
@@ -1541,6 +1591,26 @@ int cl_arq_controller::deinit_messages_buffers()
 		delete[] messages_rx;
 		messages_rx=NULL;
 	}
+
+	// SACK Design A Step 8a — free parallel prev-batch storage.
+	if(messages_rx_prev!=NULL)
+	{
+		for(int i=0;i<nMessages;i++)
+		{
+			if(messages_rx_prev[i].data!=NULL)
+			{
+				delete[] messages_rx_prev[i].data;
+				messages_rx_prev[i].data=NULL;
+			}
+		}
+		delete[] messages_rx_prev;
+		messages_rx_prev=NULL;
+	}
+	// Reset prev-batch state (parallels what the constructor does so a
+	// post-deinit re-init starts with no false prev_active claim).
+	rsp_prev_batch_active=false;
+	rsp_prev_batch_received_count=0;
+	rsp_prev_batch_expected_count=0;
 
 	if(messages_batch_ack!=NULL)
 	{
@@ -4078,6 +4148,113 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 			nframes, MAX_SACK_BATCH_SIZE);
 		fflush(stdout);
 		return 0;
+	}
+
+	// SACK Design A Step 8a — bump-at-SACK-RSP-send: transfer the in-flight
+	// `messages_rx[]` content for the soon-to-be-prev batch into the parallel
+	// `messages_rx_prev[]` buffer, then bump the routing window so subsequent
+	// frames keyed with bsi=N+1 land in `messages_rx[]` (now empty) while
+	// retransmits keyed with bsi=N land in `messages_rx_prev[]` (just-loaded
+	// with the partial state). This is the NEW bump site §7.8.2 named as
+	// missing; the Step 4 ACK-GATE-PASS bump (`arq_responder.cc:1029-1037`)
+	// is preserved for the clean-batch (no-loss) case.
+	//
+	// Invariants honored:
+	//   • §4.3.4 #1: still one outstanding batch (data_ack_received gate
+	//     unchanged); CMD must finish retransmits for batch N before next.
+	//   • §4.3.4 #2: monotonic +1 mod 256, never reset.
+	//   • §4.3.4 #3: no silent corruption — match-prev now routes to its OWN
+	//     storage; the previous Step 4 path (which routed match-prev hits
+	//     into `messages_rx[]` and would have overwritten current-batch
+	//     slots in a future Step 8b mixed batch) is replaced.
+	//
+	// CMD remains mechanism (a) — standalone retransmit-only batches —
+	// throughout Step 8a. The new RSP storage path is exercised by those v2
+	// standalone retransmits (whose bsi will now match `prev`, not
+	// `current`, after this bump).
+	if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+	{
+		// If a prev batch is still active when we bump again, it means CMD
+		// never finished filling the previous prev batch via retransmits.
+		// We must discard the stale prev to make room (it would otherwise
+		// corrupt subsequent prev-routing). Log + count for visibility.
+		if(rsp_prev_batch_active)
+		{
+			rsp_prev_batch_stale_count++;
+			printf("[RSP-V2-PREV-STALE] discarding incomplete prev batch_seq_id=%d "
+				"(received=%d/%d) — replacing with new prev_batch_seq_id=%d "
+				"(stale_count=%lld)\n",
+				rsp_prev_batch_seq_id, rsp_prev_batch_received_count,
+				rsp_prev_batch_expected_count,
+				rsp_current_expected_batch_seq_id, rsp_prev_batch_stale_count);
+			fflush(stdout);
+			// Clear stale prev slots before re-using the buffer.
+			for(int i=0; i<this->nMessages; i++)
+				messages_rx_prev[i].status = FREE;
+		}
+
+		// Determine expected count for the *new* prev (the batch we're
+		// about to seal). Mirror the EOB-or-data_batch_size inference used
+		// by `process_messages_acknowledging_data`'s rx_received counter.
+		int prev_expected = data_batch_size;
+		if(last_received_end_of_batch_seq >= 0)
+		{
+			int eob = last_received_end_of_batch_seq + 1;
+			if(eob < prev_expected) prev_expected = eob;
+		}
+		if(prev_expected < 1) prev_expected = 1;
+		if(prev_expected > this->nMessages) prev_expected = this->nMessages;
+
+		// Transfer (not copy) batch-N content from messages_rx → messages_rx_prev:
+		// memcpy the payload, copy the metadata, then free the source slot.
+		// We pre-count the post-transfer RECEIVED slots so prev-batch
+		// completion can detect "already complete on transfer" (which only
+		// happens if SACK fires at a moment where all expected slots happen
+		// to be RECEIVED but the ACK-GATE-PASS branch was preempted; under
+		// the normal SACK partial branch, rx_received < expected by
+		// construction, so received_count is strictly < expected_count here).
+		int xferred = 0;
+		int xferred_received = 0;
+		const int alloc_size = N_MAX / 8;
+		for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+		{
+			messages_rx_prev[i].type   = messages_rx[i].type;
+			messages_rx_prev[i].id     = messages_rx[i].id;
+			messages_rx_prev[i].length = messages_rx[i].length;
+			messages_rx_prev[i].status = messages_rx[i].status;
+			messages_rx_prev[i].batch_seq_id = messages_rx[i].batch_seq_id;
+			if(messages_rx[i].length > 0 && messages_rx[i].length <= alloc_size)
+			{
+				memcpy(messages_rx_prev[i].data, messages_rx[i].data,
+					messages_rx[i].length);
+			}
+			if(messages_rx[i].status == RECEIVED) xferred_received++;
+			xferred++;
+			// Free the source slot so the current-batch (N+1) frames land
+			// into a clean messages_rx[].
+			messages_rx[i].status = FREE;
+			messages_rx[i].length = 0;
+			messages_rx[i].batch_seq_id = -1;
+		}
+		// Make sure prev slots beyond data_batch_size are FREE (defensive —
+		// they should already be).
+		for(int i=this->data_batch_size; i<this->nMessages; i++)
+		{
+			if(messages_rx_prev[i].status != FREE)
+				messages_rx_prev[i].status = FREE;
+		}
+
+		rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
+		rsp_current_expected_batch_seq_id =
+			(rsp_current_expected_batch_seq_id + 1) & 0xFF;
+		rsp_prev_batch_active            = true;
+		rsp_prev_batch_received_count    = xferred_received;
+		rsp_prev_batch_expected_count    = prev_expected;
+		printf("[RSP-V2-PREV-BUMP] prev_batch_seq_id=%d next_expected=%d "
+			"transferred=%d received_on_transfer=%d/%d (cross-storage routing armed)\n",
+			rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
+			xferred, rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
+		fflush(stdout);
 	}
 
 	int bitmap_bytes = (nframes + 7) / 8;
