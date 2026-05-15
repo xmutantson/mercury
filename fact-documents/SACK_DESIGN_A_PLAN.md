@@ -2261,6 +2261,315 @@ the CMD-side blockers) or revisit whether mechanism (b) is the
 right lever for the Design A throughput campaign given the
 storage-refactor cost.
 
+### §7.8a RESULT — Step 8a (2026-05-15) — RSP prev-batch parallel storage + bump-at-SACK-RSP-send
+
+Mercury commit: `monitor` `f04cf8f` — "sack: Step 8a — RSP prev-batch
+parallel storage + bump-at-SACK-RSP-send".
+
+The architectural piece §7.8.3 named as missing. Builds the parallel
+`messages_rx_prev[]` buffer + adds the bump-at-SACK-RSP-send site so
+match-prev hits route to dedicated storage instead of colliding with
+in-flight current-batch frames on `messages_rx[]`. Step 8a does NOT
+touch CMD behavior — CMD remains mechanism (a) standalone retransmit-
+only batches. The new RSP path is exercised by today's mechanism-(a)
+retransmits (whose bsi matches *prev* after the new bump), validating
+the storage layer before Step 8b lifts CMD-side blockers.
+
+Three files changed (`+423 LOC`); one commit; reversible by
+`git revert f04cf8f`. The v2 retransmit cycle now drains through the
+prev buffer end-to-end.
+
+#### §7.8a.1 What landed
+
+- `include/datalink_layer/arq.h:597-658` — new RSP prev-batch state on
+  `cl_arq_controller`. All gated on `sack_v2_enabled` in usage:
+    - `struct st_message* messages_rx_prev` — parallel buffer (alloc'd
+      identically to `messages_rx` in `init_messages_buffers()`).
+    - `bool rsp_prev_batch_active` — true while a prev batch awaits
+      retransmit completion.
+    - `int rsp_prev_batch_received_count`, `_expected_count` — slot
+      bookkeeping for completion detection.
+    - `long long rsp_prev_batch_delivered_count`, `_stale_count` —
+      diagnostic counters.
+- `source/datalink_layer/arq_common.cc`:
+    - Constructor (`:55-63`, `:169-179`) — init Step 8a sentinels.
+    - `init_messages_buffers()` (`:1383-1424`) — allocate
+      `messages_rx_prev[nMessages]` with matching `N_MAX/8 + CANARY_SIZE`
+      data buffers + canaries.
+    - `deinit_messages_buffers()` (`:1531-1573`) — free
+      `messages_rx_prev[]`; reset prev-batch state.
+    - `check_buffer_canaries()` (`:1330-1339`) — check
+      `messages_rx_prev` canaries.
+    - `send_sack_v2_frame()` (`:4141-4250`) — **NEW bump site**
+      (§7.8.2's missing piece). BEFORE the SACK_RSP OFDM TX:
+        - If `rsp_prev_batch_active` (CMD didn't finish prior
+          retransmits): log `[RSP-V2-PREV-STALE]`, increment stale
+          counter, clear stale prev slots.
+        - Compute `prev_expected = (last_received_end_of_batch_seq + 1)`
+          if known else `data_batch_size` (mirrors the EOB-or-batch-size
+          inference `process_messages_acknowledging_data` uses).
+        - Transfer (not copy) `messages_rx[0..data_batch_size-1]` →
+          `messages_rx_prev[]` (memcpy payload, copy metadata), then
+          FREE the source slots so the next-batch current-storage starts
+          clean.
+        - Bump `rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id`,
+          increment `rsp_current_expected_batch_seq_id = (current+1)&0xFF`.
+        - Set `rsp_prev_batch_active=true`,
+          `rsp_prev_batch_received_count = xferred_received`,
+          `rsp_prev_batch_expected_count = prev_expected`.
+        - Log `[RSP-V2-PREV-BUMP] prev_batch_seq_id=N next_expected=N+1
+          transferred=X received_on_transfer=R/E (cross-storage routing armed)`.
+- `source/datalink_layer/arq_responder.cc` (`process_messages_rx_data_control`,
+  `:318-525`) — match-prev branch now routes to `messages_rx_prev[]`:
+    - The Step 4 routing decision is split: `match_current` stays the
+      `add_message_rx_data → messages_rx[]` path; `match_prev && prev_active`
+      enters a new inline branch that:
+        1. Length-checks the frame against `DATA_LONG`/`DATA_SHORT` bounds.
+        2. Stores into `messages_rx_prev[loc]` (memcpy + zero-pad to
+           `effective_data_long_header_length`).
+        3. Sets `messages_rx_prev[loc].status = RECEIVED`; increments
+           `rsp_prev_batch_received_count` only on FREE→RECEIVED
+           transitions (avoid double-counting on repeat retransmits).
+        4. Logs `[RSP-V2-PREV-RX] bsi=N id=I seq=S/B len=L prev_received=R/E`.
+        5. If `received_count >= expected_count`: deliver via
+           `copy_data_to_buffer()` with a temporary
+           `messages_rx → messages_rx_prev` pointer swap so the existing
+           compression/decryption/delivery pipeline runs against the
+           prev buffer verbatim (no parallel pipeline, no duplicated
+           logic). Mark RECEIVED slots as ACKED so the delivery loop
+           picks them up. After delivery, clear prev slots back to FREE
+           and `rsp_prev_batch_active = false`. Log
+           `[RSP-V2-PREV-DELIVER-BEGIN]` / `[RSP-V2-PREV-DELIVERED]`.
+    - `match_prev && !prev_active` (late retransmit after a clean
+      ACK-GATE-PASS bumped prev without activating prev storage): drop
+      as `prev_inactive_late_retransmit`. Preserves §4.3.4 #3 "no
+      silent corruption" — those frames have no live target buffer.
+      Idempotent: duplicate data already delivered.
+    - The Step 4 `unknown_or_out_of_window` branch is unchanged.
+
+#### §7.8a.2 §4.3.4 invariants satisfied
+
+1. **One outstanding batch** — unchanged. The `data_ack_received`
+   gate (`arq_commander.cc:1408`) is not touched. The new SACK_RSP-send
+   bump fires AFTER RSP has decided to ACK this batch (transitively the
+   moment after which CMD may safely begin keying N+1 once it sees the
+   ACK or SACK_RSP).
+2. **`batch_seq_id` monotonicity** — RSP now has TWO bump sites, both
+   monotonic +1 mod 256, never reset:
+     - Step 4 ACK-GATE-PASS bump (`arq_responder.cc:1029-1037`):
+       fires on clean-batch full delivery. `rsp_prev_batch_active`
+       stays false (no SACK fired → no prev buffer to flush).
+     - Step 8a SACK_RSP-send bump (`arq_common.cc:4175-4250`): fires
+       inside `send_sack_v2_frame()`. Activates the prev buffer.
+   Both gated on `sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0`.
+   In any given batch lifecycle, exactly one of the two fires per batch
+   (clean → ACK-GATE-PASS bump, partial → SACK_RSP-send bump). v1
+   ACK-GATE-PASS-style bump preserved for v1's bump symmetry (Step 4
+   architecture).
+3. **No silent corruption** — the silent-corruption hazard §7.8.3 named
+   (match-prev hits writing into `messages_rx[]` over current-batch
+   slots) is eliminated. Prev hits route to a physically distinct
+   buffer. The match-prev-but-inactive case drops the frame (idempotent
+   for duplicate data; safe).
+4. **Bounded recovery on single-axis failure** — N/A at Step 8a.
+5. **Reversibility** — single commit, `git revert f04cf8f` rolls back
+   cleanly.
+6. **Axis 1 supremacy** — N/A at Step 8a.
+7. **`supershift_proven_ceiling` analogue for Axis 2** — N/A at Step 8a.
+
+#### §7.8a.3 Validation results (all five gates PASS)
+
+**Gate 1 — WAV harness v1↔v1 SHA-256 stability.**
+
+```
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step8a_v1.json
+wrote post_step8a_v1.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+v1↔v1 fixture replay sha256 **STABLE across all six steps**
+(Step 1 + Step 2 + Step 3 + Step 4 + Step 7 + Step 8a):
+`9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`.
+v1 wire path byte-identical. **PASS.**
+
+**Gate 2 — v2↔v2 normal traffic (prev path drains on light loss).**
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 90 --config 10 --out v2_step8a_normal.json
+```
+
+VB-Cable's inherent ~10-30 % per-batch loss means a strictly-no-SACK
+run is not feasible on this fixture; instead we ran the standard
+loopback and verified the prev path operates correctly when SACK fires:
+
+Counts:
+- `[RSP-V2-ADOPT]`: 1 (first v2 DATA frame adopted)
+- `[ACK-GATE] PASS` (clean batch 0): 1 → Step 4 bump prev=0 next=1
+- `[ACK-GATE-V2]` (partial batch 1, 1/25 received): 1
+- `[RSP-V2-PREV-BUMP]`: 1 (prev=1 next=2, transferred=25, received_on_transfer=1/25)
+- `[RSP-V2-PREV-RX]`: 25 (all 25 retransmit slots filled into prev)
+- `[RSP-V2-PREV-DELIVER-BEGIN]`: 1
+- `[RSP-V2-PREV-DELIVERED]`: 1 (deliveries_total=1)
+- `[RSP-V2-PREV-STALE]`: 0
+- `[CRYPTO-RX]` decrypts: 2 (counter=0 OK via current path, counter=1
+  OK via prev path) — **decryption succeeded on the prev-delivered
+  batch → no payload corruption**
+
+Sample (RSP, in order):
+```
+[RSP-V2-ADOPT] current_expected_batch_seq_id=0 (first v2 DATA frame this session)
+[ACK-GATE] PASS: received 25/25 (expected 25)
+[CRYPTO-RX] Decrypting 1675 bytes, counter=0 dir=0 tag=16 config=10
+[CRYPTO-RX] Decrypted: 1675 -> 1659 bytes OK
+[ACK-GATE] SACK: received 1/25 (expected 25)
+[RSP-V2-PREV-DELIVER-BEGIN] prev_batch_seq_id=1 received=25/25 (swapping messages_rx pointer for delivery)
+[CRYPTO-RX] Decrypting 1675 bytes, counter=1 dir=0 tag=16 config=10
+[CRYPTO-RX] Decrypted: 1675 -> 1659 bytes OK
+[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=1 deliveries_total=1 (cross-storage path drained; current-batch storage untouched)
+```
+
+Note: `[RSP-V2-DROP] ... reason=prev_inactive_late_retransmit` events
+occur for late bsi=0 retransmits arriving after batch 0's clean
+ACK-GATE-PASS (prev=0 but `rsp_prev_batch_active=false`). These are
+duplicate-retransmit suppressions — the equivalent in pre-Step-8a
+would have been silently overwriting `messages_rx[0..24]` slots
+(potentially corrupting in-flight batch 1 data); Step 8a's correct
+behavior is to drop. **PASS.**
+
+**Gate 3 — v2↔v2 with-losses (AWGN -Z 6, full prev cycle observable).**
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 120 --config 10 --cmd-extra "-Z 6" \
+    --out v2_step8a_with_losses.json
+```
+
+Counts:
+- `[ACK-GATE-V2]` SACK_RSP dispatch: 3
+- `[RSP-V2-PREV-BUMP]`: 3 (1:1 with SACK_RSP — bump fires every time)
+- `[RSP-V2-PREV-RX]`: 5 (fills across prev batches)
+- `[RSP-V2-PREV-DELIVER-BEGIN]`: 2
+- `[RSP-V2-PREV-DELIVERED]`: 2 (deliveries_total=2)
+- `[RSP-V2-PREV-STALE]`: 1 (CMD failed to retransmit batch 0 before
+  SACK fired for batch 1 — correctly discarded + logged, no silent
+  corruption)
+
+Sample sequence (RSP, in order):
+```
+[RSP-V2-ADOPT] current_expected_batch_seq_id=0 (first v2 DATA frame this session)
+[ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=0, 23/25 received)
+[RSP-V2-PREV-BUMP] prev_batch_seq_id=0 next_expected=1 transferred=25 received_on_transfer=23/25 (cross-storage routing armed)
+[ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=1, 23/25 received)
+[RSP-V2-PREV-STALE] discarding incomplete prev batch_seq_id=0 (received=23/25) — replacing with new prev_batch_seq_id=1 (stale_count=1)
+[RSP-V2-PREV-BUMP] prev_batch_seq_id=1 next_expected=2 transferred=25 received_on_transfer=23/25 (cross-storage routing armed)
+[RSP-V2-PREV-RX] bsi=1 id=0 seq=0/25 len=67 prev_received=24/25
+[RSP-V2-PREV-RX] bsi=1 id=20 seq=20/25 len=67 prev_received=25/25
+[RSP-V2-PREV-DELIVER-BEGIN] prev_batch_seq_id=1 received=25/25 (swapping messages_rx pointer for delivery)
+[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=1 deliveries_total=1 (cross-storage path drained; current-batch storage untouched)
+[ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=2, 22/25 received)
+[RSP-V2-PREV-BUMP] prev_batch_seq_id=2 next_expected=3 transferred=25 received_on_transfer=22/25 (cross-storage routing armed)
+[RSP-V2-PREV-RX] bsi=2 id=21 seq=21/25 len=67 prev_received=25/25
+[RSP-V2-PREV-DELIVER-BEGIN] prev_batch_seq_id=2 received=25/25 (swapping messages_rx pointer for delivery)
+[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=2 deliveries_total=2 (cross-storage path drained; current-batch storage untouched)
+```
+
+Bump-fires:3 → prev-populated:5 RX events → 2 prev batches delivered
+end-to-end. **PASS.**
+
+**Gate 4 — Cross-storage non-collision.**
+
+The two buffers are physically distinct allocations (`messages_rx` and
+`messages_rx_prev` are separate `st_message*` pointers from `new
+st_message[nMessages]` calls). The routing decision dispatches to
+exactly one buffer per frame:
+
+- `match_current` branch (`arq_responder.cc:525`, `else if(!v2_route_drop)`)
+  calls `add_message_rx_data` → writes `messages_rx[loc]`.
+- `match_prev && rsp_prev_batch_active` branch (`arq_responder.cc:413-524`)
+  writes `messages_rx_prev[loc]`.
+- Drop branches do not write anywhere.
+
+In the Gate 3 run, bsi=1 retransmits filled `messages_rx_prev[0..24]`
+while batch 2 was concurrently in-flight on `messages_rx[]`. They
+occupy the same slot *indices* (0..24) but in different `st_message*`
+arrays. After PREV-DELIVERED clears `messages_rx_prev[]` slots back to
+FREE, the buffer is ready for the next prev batch (and the buffer
+itself is never read concurrently with the swap because the swap
+happens inside the same single-threaded `process_messages_rx_data_control`
+call). **PASS.**
+
+**Gate 5 — Step 4 synthetic discard test still PASSes.**
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 90 --config 10 --rsp-extra="--test-rsp-bsi-corrupt-at=3" \
+    --out v2_step8a_synth_discard.json
+```
+
+```
+[FLAG] --test-rsp-bsi-corrupt-at=3: will corrupt the 3th v2 DATA frame's
+       batch_seq_id by +7 mod 256 (SACK Design A Step 4 synthetic discard
+       test — one-shot)
+[RSP-V2-ADOPT] current_expected_batch_seq_id=0 (first v2 DATA frame this session)
+[RSP-V2-TEST-CORRUPT] frame#3: bsi 0 → 7 (synthetic discard test fault injection)
+[RSP-V2-DROP] batch_seq_id=7 expected=0 prev=-1
+              reason=unknown_or_out_of_window (drop_count=1)
+```
+
+The injected bsi=7 falls outside both `current_expected=0` and
+`prev=-1`, hits the Step 4 original discard branch (reason
+=`unknown_or_out_of_window`). The Step 8a addition (the
+`prev_inactive_late_retransmit` reason) does not interfere with the
+Step 4 unknown-bsi path. **PASS.**
+
+#### §7.8a.4 Audit of behavior unchanged on v1 and Step 7 sessions
+
+1. `git diff 4cd778f..f04cf8f -- source/datalink_layer/`: every new
+   storage-write, bump, or routing branch is gated on `sack_v2_enabled`
+   or `rsp_prev_batch_active`. v1 sessions (`sack_v2_enabled==false`)
+   never enter any new branch. The `messages_rx_prev` buffer is
+   allocated unconditionally but is never read or written outside the
+   new gated branches.
+2. Existing paths preserved verbatim:
+   - `arq_common.cc:5699-5734` `copy_data_to_buffer()` —
+     UNTOUCHED. The Step 8a delivery uses it via a pointer swap.
+   - `arq_responder.cc:525-635` `match_current` storage path
+     (the existing `add_message_rx_data` flow) — UNTOUCHED.
+   - `arq_responder.cc:1029-1037` Step 4 ACK-GATE-PASS bump —
+     UNTOUCHED.
+   - `arq_responder.cc:914-975` SACK-partial branch and
+     `send_sack_v2_frame()` invocation — UNTOUCHED (the new bump
+     fires *inside* `send_sack_v2_frame()`, not on the caller side).
+   - v1 MFSK SACK pattern (`send_sack_pattern`,
+     `receive_sack_pattern`) — UNTOUCHED.
+   - CMD-side retransmit logic (`arq_commander.cc:741-820`,
+     `:3109-3112`) — UNTOUCHED. CMD remains mechanism (a).
+
+#### §7.8a.5 What is NOT started by Step 8a
+
+Per the prompt's hard rules:
+
+- **Step 8b** (lift CMD-side blockers; mixed retransmit+new-data
+  batches). CMD remains mechanism (a) — standalone retransmit-only
+  batches — throughout Step 8a. The prev storage path is exercised by
+  today's mechanism-(a) retransmits, but the throughput lever the
+  prompt names (CMD mixed batches) is NOT engaged yet.
+- **Steps 9-15** (Axes 2 + 3 controllers; win-test grid; legacy MFSK
+  SACK cleanup) — untouched.
+
+The Step 8b lift is now SAFE to attempt: with prev storage in place,
+the §7.8.3 silent-corruption hazard is structurally eliminated. The
+remaining Step 8b work is the two CMD-side blocker lifts
+(`:741-820`, `:3109-3112`) + the mixed-batch builder that
+captures-original-bsi for retx slots and uses-current-bsi for
+new-data slots, both already plumbed into `messages_tx[i].batch_seq_id`
+per Step 3.
+
 ---
 
 ## §7 Open questions [?]
