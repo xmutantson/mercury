@@ -236,7 +236,11 @@ cl_arq_controller::cl_arq_controller()
 
 	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
 	ack_metric_threshold=0.5;     // Phase-2 flag default = HEAD (7076a4b 3.0→0.5)
-	sack_timeout_extra_ms=3000;   // Phase-2 flag default = HEAD (7076a4b new)
+	sack_timeout_extra_ms=0;      // SACK_FIX_PLAN §7 step 3: default 0 post-(a).
+	                              // Pre-(a) default was 3000 (commit 7076a4b)
+	                              // — a band-aid for the now-closed Plan-A
+	                              // turnaround race. CLI override
+	                              // --sack-timeout-extra-ms=N is preserved.
 	// Note: disable_sack initialized at top of constructor (~line 175) before
 	// the local_capability assignment so the mask there sees the correct value.
 	emergency_nack_count=0;
@@ -436,11 +440,26 @@ void cl_arq_controller::calculate_receiving_timeout()
 	{
 		if(ack_pattern_time_ms > 0)
 		{
-			// ACK pattern. Allow responder ftr countdown + decode + pattern TX.
-			// RSP turnaround includes CMD frame TX time (Bug #44), so CMD must
-			// wait for: turnaround (frame_TX + 4000ms overhead) + ACK + margins.
+			// SACK_FIX_PLAN §7 step 3 (Candidate (a)) — geometry-derived
+			// post-TX timeout. Replaces the pre-fix formula whose two
+			// hardcoded 3000-ms adders were band-aids for the pre-Plan-A
+			// turnaround race (now structurally closed by f2dbf34).
+			//
+			// timeout = frame_drain + sack_arrival + margin
+			//   frame_drain  = 2 * message_transmission_time_ms
+			//                  (CMD's last frame still in channel)
+			//   sack_arrival = ptt_off_delay + RSP_DECODE_MARGIN_MS
+			//                  + pattern_time + ptt_on_delay
+			//                  (geometry of: CMD->silence; RSP decodes;
+			//                   RSP keys SACK; SACK LE at CMD)
+			//   margin       = SACK_ARRIVAL_MARGIN_MS (calibrated:
+			//                  SACK_FIX_PLAN.md §11.1, worst observed
+			//                  arrival 2102 ms vs geometric 1768 ms)
+			//
+			// sack_timeout_extra_ms is preserved as a runtime override
+			// (default now 0); set with --sack-timeout-extra-ms=N if a
+			// field deployment surfaces a regression.
 			int pattern_time = ack_pattern_time_ms;
-			// SACK pattern is longer (base + bitmap suffix). Add extra margin.
 			if(sack_enabled && telecom_system)
 			{
 				int sack_samples = telecom_system->sack_pattern_passband_samples(data_batch_size);
@@ -448,19 +467,26 @@ void cl_arq_controller::calculate_receiving_timeout()
 				if(sack_ms > pattern_time)
 					pattern_time = sack_ms;
 			}
-			int timeout = 2 * message_transmission_time_ms + pattern_time
-				+ ptt_on_delay_ms + ptt_off_delay_ms + 3000;
+			int frame_drain  = 2 * message_transmission_time_ms;
+			int sack_arrival = ptt_off_delay_ms + RSP_DECODE_MARGIN_MS
+			                 + pattern_time + ptt_on_delay_ms;
+			int margin       = SACK_ARRIVAL_MARGIN_MS;
+			int timeout = frame_drain + sack_arrival + margin;
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
 			if(gear_shift_on && turboshift_phase != TURBO_DONE)
 				timeout += 2000;
-			// SACK retransmit cycle: RSP may send SACK (1.7s) then wait for
-			// retransmit. CMD needs extra listen time so its retransmit cycle
-			// doesn't overlap with RSP's ACK response (half-duplex collision).
-			// Phase-2: --sack-timeout-extra-ms=N overrides (default 3000).
+			// Runtime override safety net (--sack-timeout-extra-ms=N).
+			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
+			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d batch=%d sack=%d\n",
+				timeout, frame_drain, sack_arrival,
+				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
+				margin, sack_enabled ? sack_timeout_extra_ms : 0,
+				data_batch_size, sack_enabled ? 1 : 0);
+			fflush(stdout);
 			set_receiving_timeout(timeout);
 		}
 		else

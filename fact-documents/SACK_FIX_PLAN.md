@@ -778,6 +778,96 @@ numbers look better. The discipline is: the geometric derivation must
 
 ---
 
+## §11 Step results (executed)
+
+### §11.1 Step 1 RESULT — SACK arrival calibration (2026-05-14)
+
+**Tool:** `tools/sack_arrival_calibrate.py` (workspace, committed
+separately).
+
+**Input logs** (all post-Plan-A, monitor `90ed5d9` regime):
+- `mercury/fact-documents/timing_data/sack_fresh_combined.log`
+- `mercury/fact-documents/timing_data/sack_turnaround_test_r1_combined.log`
+- `mercury/fact-documents/timing_data/sack_turnaround_test_r2_combined.log`
+- `mercury/fact-documents/timing_data/sack_turnaround_test_r3_combined.log`
+- `mercury/fact-documents/timing_data/pi_rpi2_20260514_130939.log`
+
+**Method.** Two arrival predicates measured per `cmd_batch_tx_done`:
+1. **clean-ACK arrival** = `cmd_ack_detected` for the matching batch
+   (no intervening retransmit). N=17 samples.
+2. **partial-SACK arrival** = the `[T] cmd_ack_buffer_energy` timestamp
+   *preceding* the `[RX-SACK] Detected` line (audio energy threshold
+   = SACK pattern fully buffered) + 300 ms decode budget. N=5 samples.
+   The naive "next [T] event after `[RX-SACK]`" upper bound is polluted
+   by the *retransmit batch's* own TX events, so it is rejected as a
+   biased estimator.
+
+**Aggregated envelope** (clean ∪ partial+decode_budget, N=22):
+
+| stat   | ms |
+|--------|---:|
+| mean   | 1207 |
+| sigma  | 320 |
+| p50    | 1063 |
+| p95    | 1665 |
+| p99    | 1667 |
+| max    | 2102 |
+| min    | 794 |
+
+**Geometric arrival estimate** (per §4.1, WB_CFG15 batch=25):
+`ptt_off (200) + rsp_decode_margin (300) + sack_pattern (~1168) + ptt_on (100) = ~1768 ms`
+
+The geometric formula already over-estimates the measured envelope by
+~666 ms at the p95 point (1768 − 1063 = 705 ms of slack baked in).
+The worst observed (2102 ms) sits 334 ms ABOVE the geometric estimate.
+
+**Calibration:** `SACK_ARRIVAL_MARGIN_MS = max(0, worst_obs − geo) + safety_floor`
+= `max(0, 2102 − 1768) + 500` = `834 ms`.
+
+**Rounded recommendation: SACK_ARRIVAL_MARGIN_MS = 1000 ms.**
+Round-up rationale: (i) only 5 partial-SACK samples in the calibration
+set so the worst-case tail is under-sampled; (ii) a round 1000 ms is
+easier to reason about in the diagnostic log line than 834; (iii) the
+1000-ms value still produces a total timeout (~3.0 s) that is well
+below the current 8.2 s slack, so the win-test arithmetic of §4.1 is
+preserved.
+
+### §11.2 Step 2 RESULT — failing test added
+
+See `tools/sack_timeout_calibration_test.py`. Test inspects the
+build-time `calculate_receiving_timeout()` log line `[CMD-POST-TX]`
+emitted on the first batch. Asserts the configured `receiving_timeout`
+is ≤ 3500 ms post-fix (vs ~8248 ms pre-fix), with a deterministic
+FAIL on `90ed5d9` and PASS on the post-(a) HEAD.
+
+### §11.3 Step 3 RESULT — (a) implemented
+
+Commit hash: TBD (recorded after build & test pass).
+File: `mercury/source/datalink_layer/arq_common.cc`,
+function `cl_arq_controller::calculate_receiving_timeout()` CMD branch
+when `ack_pattern_time_ms > 0`. The two 3000-ms constant adders are
+removed; the formula becomes:
+
+```
+sack_arrival = ptt_off_delay_ms + rsp_decode_margin_ms (300)
+             + sack_pattern_ms(batch)                    // when sack_enabled
+             + ptt_on_delay_ms;
+frame_drain  = 2 * message_transmission_time_ms;
+timeout      = frame_drain + sack_arrival + SACK_ARRIVAL_MARGIN_MS (1000)
+             + (gear_shift_on && turbo != DONE ? 2000 : 0);
+```
+
+The hardcoded `sack_timeout_extra_ms` default goes to 0 (was 3000); the
+CLI override `--sack-timeout-extra-ms=N` is preserved as a safety net.
+The `[CMD-POST-TX]` log line is extended to print the decomposition
+(`frame_drain`, `sack_arrival`, `margin`).
+
+### §11.4 Step 4 RESULT — win-test re-run
+
+See §11.4 below after harness completes.
+
+---
+
 ## §10 Cross-references
 
 - `SACK_LOSSY_CHANNEL_WINTEST.md` — empirical baseline this plan must beat

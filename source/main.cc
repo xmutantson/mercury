@@ -291,7 +291,7 @@ int main(int argc, char *argv[])
     double energy_gate_floor_cli = -1; // --energy-gate-floor=F: <0=default(1e-12), 0..=override
     int ls_window_w_cli = -1, ls_window_h_cli = -1; // --ls-window=WxH (-1 = default 2x8)
     int ofdm_defer_overflow_cli = -1;  // --ofdm-defer-overflow=on|off (-1=default on)
-    int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 3000)
+    int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 0 post-SACK_FIX_PLAN §7 step 3)
     bool no_sack_cli = false;          // --no-sack: force disable (no-op after B2 fix)
     bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
     bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
