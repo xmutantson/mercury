@@ -486,6 +486,42 @@ public:
                                        //      only; no decision branches on it at Step 3.
                                        //      -1 = never received (v1 session, or no DATA yet).
 
+  // SACK Design A Step 4 — RSP cross-batch routing decision state.
+  // All members gated on sack_v2_enabled; v1 path never reads these.
+  // Per §4.2.3 + §4.3.4 invariant #3: RSP routes DATA frames using
+  // batch_seq_id. Unknown / out-of-window ids are discarded + logged
+  // ([RSP-V2-DROP]). The "prev" slot is the SACK-retransmit window
+  // (mechanism (b) lands in Step 8 — for Step 4 it is defensive
+  // scaffolding; in today's mechanism (a) retransmits carry the
+  // CURRENT batch_seq_id and always match `rsp_current_expected_batch_seq_id`).
+  int rsp_current_expected_batch_seq_id; // RSP: expected current batch_seq_id.
+                                         //      Adopted from first v2 DATA frame seen
+                                         //      (-1 sentinel = not yet adopted). Bumped
+                                         //      by +1 mod 256 at ACK-GATE-PASS (full
+                                         //      batch ACKed). NEVER bumped on partial /
+                                         //      SACK paths.
+  int rsp_prev_batch_seq_id;             // RSP: previous batch_seq_id (one back from
+                                         //      current_expected, mod 256). Set at the
+                                         //      same ACK-GATE-PASS moment that bumps
+                                         //      current_expected. -1 = no prior batch
+                                         //      yet (first session batch in progress).
+  long long rsp_v2_drop_count;           // RSP: counter of [RSP-V2-DROP] events
+                                         //      (frames discarded for unknown
+                                         //      batch_seq_id). Validates the Step 4
+                                         //      "must NOT fire in clean traffic"
+                                         //      property. v2-loopback tests assert
+                                         //      this is 0.
+  // Test-scaffold fault injection (CLI --test-rsp-bsi-corrupt-at=N). When > 0,
+  // corrupts the Nth v2 DATA frame's parsed batch_seq_id by adding 7 (mod 256)
+  // BEFORE routing — guaranteed to fall outside {current_expected, prev}.
+  // Lets the synthetic discard test demonstrate the new branch fires. Default 0
+  // (off); only the Nth frame is touched, subsequent frames pass through clean.
+  int test_rsp_bsi_corrupt_at;           // RSP: 1-indexed frame number to corrupt;
+                                         //      0 = scaffold off.
+  int test_rsp_bsi_v2_frame_counter;     // RSP: count of v2 DATA frames received
+                                         //      (1-indexed); used to match
+                                         //      test_rsp_bsi_corrupt_at exactly once.
+
   // Responder: double-buffered crypto batch storage
   st_crypto_batch_buffer crypto_buf[2]; // [0] = oldest pending, [1] = current
   int max_message_length;
