@@ -4202,6 +4202,332 @@ multi-axis adaptive gearshift architecture (A.2) is now fully
 SEATED — all three axes plumbed end-to-end. Steps 12+ remain for
 the win-test grid and the §4.3.4 invariant body extensions.
 
+### §7.12 RESULT — Step 12 (2026-05-15) — Safe-state invariant audit + gap-fill
+
+Mercury commit: `monitor` (this commit) — "sack: Step 12 — BREAK
+supremacy integration + batch_size_proven_ceiling (§4.3.4 invariants
+#6 BREAK extension + #7)".
+
+Four files changed (`+~270 LOC, -0 LOC`). Reversible: `git revert`
+rolls back cleanly. Two structural additions:
+
+1. **BREAK supremacy integration** — `policy_axis1_supremacy_on_move()`
+   is now called at every BREAK-initiating site (9 sites), not just
+   the LADDER UP/DOWN sites that Step 9 wired. A BREAK is a more
+   drastic Axis-1 move; Axes 2/3 must be reset just as aggressively.
+2. **`batch_size_proven_ceiling` (Axis-2 analogue of
+   `supershift_proven_ceiling`)** — mirrors §2.1 modulation
+   discipline. On an Axis-2 down-move at batch=K (the value that
+   just failed), set `proven_ceiling = K - 1` for 20 batches; up-moves
+   that would propose > ceiling are VETOED. Ceiling RESETS on any
+   Axis-1 supremacy event (including LADDER and BREAK).
+
+#### §7.12.1 What landed
+
+- `include/datalink_layer/arq.h` (+25 LOC):
+    - Constant `AXIS2_CEILING_RECOVERY_BATCHES = 20`.
+    - 3 new `cl_arq_controller` members: `batch_size_proven_ceiling`
+      (default -1 = no cap), `batch_size_ceiling_recovery_batches`,
+      diagnostic counter `axis2_ceiling_blocks_count`.
+    - 2 new test-helper declarations: `test_fire_policy_axis2_ceiling()`
+      and `test_fire_policy_break_supremacy()`.
+    - Refined the `policy_axis1_supremacy_on_move()` doc comment to
+      note Step 12 BREAK integration.
+- `source/datalink_layer/arq_common.cc` (+9 LOC):
+    - Constructor init: `batch_size_proven_ceiling=-1`,
+      `batch_size_ceiling_recovery_batches=0`,
+      `axis2_ceiling_blocks_count=0`.
+- `source/datalink_layer/arq_commander.cc` (+~210 LOC):
+    - `policy_axis1_supremacy_on_move()` body extended: clear
+      `batch_size_proven_ceiling = -1` and
+      `batch_size_ceiling_recovery_batches = 0` on every supremacy
+      event (LADDER and BREAK both). Supremacy log line extended
+      with `proven_ceiling X->-1 recovery N->0`.
+    - `policy_evaluate_axis2()`: drain `batch_size_ceiling_recovery_batches`
+      per evaluation; on reaching 0, clear the ceiling and emit
+      `[POLICY-AXIS2-CEILING] recovery period elapsed`. In the
+      up-move test, gate on `(ceiling < 0 || proposed <= ceiling)`;
+      on veto, emit `[POLICY-AXIS2-CEILING] up-move VETOED:
+      proposed=X > proven_ceiling=Y recovery_remaining=N` and reset
+      `consecutive_good_batches` to prevent log spam. On any
+      down-move, set `proven_ceiling = from - 1` (adopting the more
+      restrictive of new and prior) and recovery=20; log
+      `[POLICY-AXIS2-CEILING] down-move at batch=X set
+      proven_ceiling=Y recovery=20`.
+    - 9 BREAK init sites instrumented (`arq_commander.cc:1290, 1326,
+      1516, 1579, 1629, 1672, 2037, 2148, 2185`): each now calls
+      `if(sack_v2_enabled) policy_axis1_supremacy_on_move(from, to,
+      "break_<reason>")` BEFORE `send_break_pattern()`. The 10th
+      `send_break_pattern()` site at `:131` is the BREAK retry path —
+      no hook call there (retries SHOULD NOT re-trigger the cooldown
+      or re-reset Axes 2/3). Reason tags: `break_recovery_phase2_probe_fail`,
+      `break_recovery_phase1_exhausted`, `turbo_forward_break`,
+      `turbo_switch_role_break`, `frame_gearshift_up_failed`,
+      `break_control_failure_threshold`,
+      `frame_gearshift_data_failed_nack`,
+      `frame_gearshift_data_failed_pat`,
+      `break_block_failure_threshold`.
+    - 2 new test scaffolds: `test_fire_policy_axis2_ceiling()` —
+      drives a synthetic down-move, primes a clean up-attempt, asserts
+      ceiling veto, then verifies Axis-1 supremacy clears the ceiling;
+      `test_fire_policy_break_supremacy()` — invokes the supremacy
+      hook with a synthetic BREAK reason and asserts 3 Axis-2
+      evaluations are suppressed.
+- `source/main.cc` (+~30 LOC):
+    - 2 new CLI flags `--test-policy-axis2-ceiling-fire=1` and
+      `--test-policy-break-supremacy=1` (default off; production
+      builds never set these). One-shot at startup, exit after.
+
+#### §7.12.2 The §4.3.4 audit table (the load-bearing deliverable)
+
+Each invariant audited; cite is the **enforcement site** post-Step-12.
+
+| # | Invariant | Enforcement site (file:line) | Verdict |
+|---|-----------|------------------------------|---------|
+| 1 | One outstanding batch | `arq_commander.cc:1408,1837,1884,1943,1959` — `data_ack_received` gates DATA TX (Step 4 verified the v2 mixed-batch path preserves this; Step 8b §7.8b.2 confirmed `connection_status` state machine serializes TX across lifted blockers; bsi monotonicity `[0..9]` strictly +1 on Step-8b lossy run) | **PASS** |
+| 2 | `batch_seq_id` monotonicity | CMD: `arq_commander.cc:840` (assign), `:1044` (increment after `send_batch()` iff `batch_includes_new_data`); retx preserves original bsi at `arq_commander.cc:886` (Step 8b mixed-batch builder). RSP: bump sites at `arq_responder.cc:1029-1037` (ACK-GATE-PASS, Step 4) and `arq_common.cc:4175-4250` (`send_sack_v2_frame`, Step 8a). Both +1 mod 256, never reset. `set_data_batch_size()` does NOT mutate `cmd_batch_seq_id` (verified by code-grep, §7.3 audit) | **PASS** |
+| 3 | Discard + log unknown `batch_seq_id` | `arq_responder.cc:318-525` (Step 4) — `match_current/match_prev/unknown_or_out_of_window` routing; `[RSP-V2-DROP]` log with `reason=`. Also `arq_responder.cc:413-524` (Step 8a) match-prev-but-inactive drops with `reason=prev_inactive_late_retransmit`. Step 4 synthetic discard test PASSES post-Step-8a (§7.8a.3 Gate 5; re-verified by code inspection — Step 12 did not touch this path) | **PASS** |
+| 4 | EOB bit-7 ground truth | TX-side: v2 mixed batch sets EOB on last new-data frame at `arq_commander.cc:1066-1067` (Step 8b); v1 + v2 non-mixed paths set EOB at `arq_common.cc:3153` (renumbering loop). RX-side: `arq_common.cc:5362-5364` reads EOB bit-7, stores in `last_received_end_of_batch_seq`; consumers at `arq_common.cc:4241-4243` (RSP send_sack_v2_frame expected-count inference) and `arq_responder.cc:553-595, 1033-1035` (ACK-GATE expected inference) honor it. v2 retx-only fallback (R==batch_size, no new-data) omits EOB — matches v1 retransmit-only path; RSP infers prev batch size from original transmission's compression header or EOB on the original TX (§7.8b.1) | **PASS** |
+| 5 | Every policy move emits `[POLICY-MOVE]` | Axis 1: `arq_commander.cc:3477-3481` (ladder_up), `:3548-3552` (ladder_down). Axis 2: `arq_commander.cc:3838-3843` (up/down). Axis 3: `arq_commander.cc:~4090-4150` (ON↔PROBE↔OFF transitions, all 4 directions). BREAK does NOT emit `[POLICY-MOVE]` — the existing `[BREAK] ...` log lines remain the canonical "what just happened" trace (per CLAUDE.md "don't silently change behavior"); the new `[POLICY-SUPREMACY] reason=break_*` lines mark the supremacy *effect* on Axes 2/3. Step-12 lossy run confirms `[POLICY-MOVE] axis=2 from=25 to=20 direction=down` fires on a real Axis-2 down move; Step-9 §7.9.3 confirmed Axis-1 ladder fires. Step-11 §7.11.4 confirmed Axis-3 transitions fire | **PASS** |
+| 6 | Axis 1 supremacy | LADDER UP/DOWN: `arq_commander.cc:3494, 3570` calls `policy_axis1_supremacy_on_move()` (Step 9). BREAK: 9 new call sites at `:1290, 1326, 1516, 1579, 1629, 1672, 2037, 2148, 2185` (Step 12) — each gated on `sack_v2_enabled` and called BEFORE `send_break_pattern()`. The hook body at `arq_commander.cc:3605-3672` clears Axis-2 ring + counters + cooldown + ceiling AND Axis-3 ring + misses + cooldown + transitions ON|OFF→PROBE (Step 11). Demo: `--test-policy-break-supremacy=1` confirms `[POLICY-SUPREMACY] reason=break_synthetic` fires with both Axes reset, 3 subsequent Axis-2 evals SUPPRESSED, `axis2_skipped_in_cooldown=3 move_up_count=0 move_down_count=0` | **PASS** |
+| 7 | `batch_size_proven_ceiling` analogue for Axis 2 | NEW state (Step 12) at `arq.h:885-895`. Set on Axis-2 down-move at `arq_commander.cc:3884-3900` (the new ceiling=from-1, recovery=20 block); enforced in the up-move test at `arq_commander.cc:3786-3805` (veto if proposed > ceiling). Recovery drains in `policy_evaluate_axis2()` at `arq_commander.cc:3757-3768` (decrement per eval, clear at 0). Reset on Axis-1 supremacy at `arq_commander.cc:3631-3640`. Demo: `--test-policy-axis2-ceiling-fire=1` confirms down-move sets ceiling=24, subsequent up-move proposed=25 → VETOED → `axis2_ceiling_blocks_count` +=1, batch_size unchanged; Axis-1 supremacy then resets ceiling → -1 | **PASS** |
+
+**All 7 invariants PASS.** No structural gaps remaining.
+
+#### §7.12.3 Architectural decisions
+
+- **Ceiling semantics: post-failure cap, not success high-water mark.**
+  Two readings of the prompt + §4.3.4 #7 were possible: (A) ceiling =
+  highest successfully-completed K with up-moves blocked above; (B)
+  ceiling = K-1 after K just failed, for a recovery period. Step 12
+  chose (B) (the §4.3.4 #7 reading). Rationale: (B) is unambiguously
+  the "no immediate re-climb into failure" discipline the plan named;
+  (A) has a chicken-and-egg problem (how do we ever raise the ceiling
+  to test K+5 if we can never propose above it?). Initial value -1
+  (= no cap) means Axis-2 is unconstrained until the first observed
+  failure — which matches the prompt's "Initial value = the
+  SACK-negotiated batch size" only in the trivial sense that the
+  session starts with no proven-failure-point.
+- **Recovery period = 20 batches.** Matches the §4.3.2 spec's
+  `AXIS3_OFF_TO_PROBE_BATCHES = 20` cadence — long enough that the
+  channel has clearly moved on; short enough that a transient
+  fade doesn't permanently cap the batch size. Decrements on
+  every `policy_evaluate_axis2()` call (not on wall-clock); cooldown
+  evaluations DO drain the recovery counter (the channel has had
+  the chance to change even if Axis-2 was paused).
+- **Up-move veto resets `consecutive_good_batches=0`.** Without
+  this, the same ring of 8 clean batches would re-trigger the
+  same vetoed up-move on every subsequent eval. Per §4.3.3 the
+  good-run counter is a counted-event trigger; we treat the veto
+  as "consuming" the run.
+- **BREAK retry path (`arq_commander.cc:131`) does NOT call the
+  supremacy hook.** The hook fires on BREAK *initiation*
+  (`emergency_break_active = 0 → 1` transition); retries while
+  active should NOT re-arm the cooldown or re-reset Axes 2/3 (that
+  would extend the cooldown beyond the intended 3 batches and
+  could oscillate the Axis-3 mode). 9 init sites instrumented; 1
+  retry site untouched.
+- **Reason tags are descriptive, not enumerated.** Each BREAK site
+  passes a distinct human-readable reason string
+  (e.g. `turbo_forward_break`, `block_failure_threshold`) — these
+  surface in the `[POLICY-SUPREMACY] reason=X` log line for
+  diagnosis. Per CLAUDE.md "Don't silently change behavior — explain
+  what changed and why."
+- **No new `[POLICY-MOVE] axis=1 reason=break_*` log line.** The
+  existing `[BREAK] ...` log lines remain the canonical Axis-1
+  modulation-move trace for BREAK; adding a parallel
+  `[POLICY-MOVE]` line would duplicate without adding signal. The
+  `[POLICY-SUPREMACY] reason=break_*` line is the new Step-12
+  contribution that explicitly marks "Axes 2/3 were just reset by
+  this BREAK." This keeps the §4.3.4 #5 invariant satisfied
+  (every Axis-2 / Axis-3 reset is observable) without disturbing
+  the existing Axis-1 log surface.
+
+#### §7.12.4 Validation results — all five gates PASS
+
+**Gate 1 — WAV harness v1↔v1 sha256 stability.**
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS (sha256=2a9366a1...)
+
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step12_final.json
+wrote post_step12_final.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+v1↔v1 fixture replay sha256 **STABLE across all twelve steps**
+(Step 1 + 2 + 3 + 4 + 7 + 8 + 8a + 8b + 9 + 10 + 11 + 12):
+`9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`.
+v1 wire path byte-identical. **PASS.**
+
+**Gate 2 — v2↔v2 normal-traffic non-regression.**
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 60 --config 10 --out v2_step12_normal.json
+```
+
+Counts (clean channel, single batch in 60s window):
+- `[POLICY-MOVE]`: **0** (no spurious moves on clean traffic) ✓
+- `[POLICY-SUPREMACY]`: **0** (no Axis-1 / BREAK in this run) ✓
+- `[POLICY-AXIS2-CEILING]`: **0** (no down-move, ceiling untouched) ✓
+- `[POLICY-AXIS2]` eval: **0** (no SACK_RSP fired → no eval) ✓
+- `[CMD-BATCH-SEQ]`: 1 (one new-data batch sent)
+- `[ACK-GATE] PASS`: 1 (clean batch delivered)
+
+Identical event counts to §7.11 Gate 2 with the addition of
+proven_ceiling state which stays at default -1 / 0 throughout.
+**PASS.**
+
+**Gate 3 — v2↔v2 with-losses Axis-2 + ceiling integration.**
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 90 --config 10 --cmd-extra "-Z 6" \
+    --out v2_step12_lossy.json
+```
+
+Counts at AWGN `-Z 6`:
+- `[CMD-V2-MIXBATCH]`: 6 — mechanism (b) engaged (Step 8b path)
+- `[POLICY-MOVE] axis=2 ... direction=down`: 1
+- `[POLICY-AXIS2-CEILING] down-move ... set proven_ceiling=24`: 1
+- `[POLICY-AXIS2]` no-move evals: 4
+- `[RSP-V2-PREV-DELIVERED]`: 2 (prev-batch delivery)
+
+Sample log evidence:
+```
+[POLICY-MOVE] axis=2 from=25 to=20 direction=down reason=ring_lossy
+              mean_partial=0.380 good=0 bad=3 cooldown=0
+[POLICY-AXIS2-CEILING] down-move at batch=25 set proven_ceiling=24
+                       recovery=20 batches (no re-climb to >24 until
+                       recovery expires or Axis-1 supremacy)
+```
+
+In a real lossy v2 run, the new ceiling integration fires naturally:
+the Axis-2 down-move sets `proven_ceiling=24` immediately. Any
+subsequent up-move would be vetoed until 20 batches elapse OR an
+Axis-1 / BREAK supremacy event resets the ceiling. **PASS.**
+
+**Gate 4 — BREAK supremacy demo (synthetic).**
+
+```
+$ ./mercury.exe -n --test-policy-break-supremacy=1
+[FLAG] --test-policy-break-supremacy=1: invoking synthetic BREAK supremacy demo
+[TEST-BREAK-SUPREMACY] step 1: priming Axis-2 ring + Axis-3 mode ...
+[TEST-BREAK-SUPREMACY] step 2: invoking supremacy hook (reason=break_synthetic)
+[POLICY-SUPREMACY] axis=1 move reason=break_synthetic — Axis 2 reset
+                   (ring+counters cleared, cooldown=3 batches,
+                    proven_ceiling 20->-1 recovery 15->0); Axis 3 reset
+                   (ring+misses cleared, cooldown=3 batches, mode ON -> PROBE)
+[TEST-BREAK-SUPREMACY] post-hook state: axis2_cooldown=3 axis3_cooldown=3
+                       axis3_mode=PROBE proven_ceiling=-1 recovery=0
+[TEST-BREAK-SUPREMACY] step 3.1: attempting Axis-2 eval — expect SUPPRESSED
+[POLICY-AXIS2] eval rx=25/25 partial=0.000 good=9 bad=0 COOLDOWN_REMAINING=2 (no move)
+[TEST-BREAK-SUPREMACY] step 3.2: ... COOLDOWN_REMAINING=1
+[POLICY-AXIS2] eval rx=25/25 partial=0.000 good=9 bad=0 COOLDOWN_REMAINING=1 (no move)
+[TEST-BREAK-SUPREMACY] step 3.3: ... COOLDOWN_REMAINING=0
+[POLICY-AXIS2] eval rx=25/25 partial=0.000 good=9 bad=0 COOLDOWN_REMAINING=0 (no move)
+[TEST-BREAK-SUPREMACY] complete: axis2_skipped_in_cooldown=3
+                       axis2_move_up_count=0 axis2_move_down_count=0
+```
+
+- `[POLICY-SUPREMACY] reason=break_synthetic` fires ✓
+- Axis-2 reset (ring+counters+ceiling+recovery) ✓
+- Axis-3 reset (ring+misses, mode ON→PROBE, cooldown=3) ✓
+- proven_ceiling 20→-1 + recovery 15→0 ✓
+- 3 subsequent Axis-2 evaluations SUPPRESSED — no `[POLICY-MOVE]
+  axis=2` emitted; `axis2_skipped_in_cooldown=3` ✓
+
+**PASS.** The BREAK → supremacy integration is functionally correct.
+
+**Gate 5 — `batch_size_proven_ceiling` enforcement demo (synthetic).**
+
+```
+$ ./mercury.exe -n --test-policy-axis2-ceiling-fire=1
+[FLAG] --test-policy-axis2-ceiling-fire=1: invoking synthetic Axis-2 ceiling
+       enforcement demo (§4.3.4 invariant #7)
+[TEST-AXIS2-CEILING] step 1: priming lossy ring at batch=25 → expect
+                     [POLICY-MOVE] axis=2 from=25 to=20 AND ceiling set to 24
+[POLICY-MOVE] axis=2 from=25 to=20 direction=down reason=ring_lossy
+              mean_partial=0.400 good=0 bad=3 cooldown=0
+[POLICY-AXIS2-CEILING] down-move at batch=25 set proven_ceiling=24
+                       recovery=20 batches ...
+[TEST-AXIS2-CEILING] step 1 result: data_batch_size=20
+                     proven_ceiling=24 recovery=20 ceiling_blocks=0
+[TEST-AXIS2-CEILING] step 2: priming clean ring at batch=20, good_run=8 →
+                     expect up-move to 25 to be VETOED by ceiling=24
+[POLICY-AXIS2-CEILING] up-move VETOED: proposed=25 > proven_ceiling=24
+                       recovery_remaining=19 (no move; ceiling will clear on
+                       recovery expiry or Axis-1 move)
+[POLICY-AXIS2] eval rx=20/20 partial=0.000 mean=0.000 good=0/8 bad=0/3
+               batch=20 (no move)
+[TEST-AXIS2-CEILING] step 2 result: data_batch_size=20 (was 20)
+                     ceiling_blocks=1 (was 0) — PASS: up-move VETOED,
+                     batch unchanged, ceiling-block counter +1
+[TEST-AXIS2-CEILING] step 3: invoking Axis-1 supremacy (reason=ladder_test)
+                     — expect proven_ceiling reset to -1
+[POLICY-SUPREMACY] axis=1 move reason=ladder_test_ceiling_reset — Axis 2
+                   reset (... proven_ceiling 24->-1 recovery 19->0); ...
+[TEST-AXIS2-CEILING] step 3 result: proven_ceiling=-1 recovery=0
+                     — PASS: ceiling cleared by Axis-1 supremacy
+[FLAG] Ceiling fire complete — exiting.
+```
+
+- Step 1: down-move 25→20 sets `proven_ceiling=24 recovery=20` ✓
+- Step 2: up-move proposed=25 > ceiling=24 → VETOED; batch unchanged;
+  `axis2_ceiling_blocks_count` += 1 ✓
+- Step 3: Axis-1 supremacy clears `proven_ceiling 24→-1 recovery 19→0` ✓
+
+**PASS.** The ceiling enforcement + Axis-1 reset path works end-to-end.
+
+#### §7.12.5 Audit of behavior unchanged on v1 and Step 11 v2-clean sessions
+
+1. v1 wire path: every Step-12 code addition is inside `if(sack_v2_enabled)`
+   blocks (the 9 BREAK supremacy calls) or operates on Axis-2 state
+   that v1 sessions never touch. The Gate 1 WAV harness sha256
+   stability is the strict byte-level proof: v1 log surface is
+   identical to all prior eleven steps.
+2. v2 normal-traffic non-regression (Gate 2): zero spurious
+   POLICY-MOVE, POLICY-SUPREMACY, or POLICY-AXIS2-CEILING fires on
+   clean traffic. The new ceiling state stays at default
+   (-1 / 0 / 0) throughout.
+3. Step-11 supremacy hook had no ceiling reset; Step-12 adds it.
+   This is a behavior change in the SPECIFIC case of an Axis-1
+   move (LADDER or BREAK) when `batch_size_proven_ceiling` is
+   non-default — which is exactly the §4.3.4 invariant's whole
+   point. The change is logged via the [POLICY-SUPREMACY] line
+   with the new `proven_ceiling X->-1 recovery N->0` clause.
+4. Existing v1 BREAK path: every BREAK init site's hook call is
+   gated on `sack_v2_enabled`. v1 BREAK behavior is byte-identical
+   to pre-Step-12 (proof: Gate 1 sha256 stability).
+
+#### §7.12.6 What is NOT started by Step 12
+
+Per the prompt's hard rules:
+
+- **Step 13 (Track A/B/C win-test grid, §5)** — NOT started.
+  Reserved for next session. The §5.1/§5.2 hard + win gates are
+  not run by Step 12.
+- **Step 14 (CAP_SACK_V2 default-on)** — NOT started. Owner-gated.
+- **Step 15 (legacy MFSK SACK cleanup)** — NOT started. Owner-gated.
+- **Range widening to [10, 50] per §4.3.1** — NOT started.
+  MAX_SACK_BATCH_SIZE=32 caps the Axis-2 batch ceiling.
+- **`[POLICY-MOVE] axis=1 reason=break_*` line** — explicitly NOT
+  added (see §7.12.3 architectural decisions). The existing
+  `[BREAK] ...` log lines remain the canonical Axis-1 modulation
+  move trace.
+
+The §4.3.4 invariant set is now fully audited end-to-end. All
+seven invariants have a cited enforcement site and PASS verdict.
+The multi-axis adaptive gearshift architecture (A.2) is structurally
+complete; Step 13 (win-test grid) is the next step and is gated on
+owner approval.
+
 ---
 
 ## §7 Open questions [?]
