@@ -134,6 +134,24 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 #define DATA_LONG_HEADER_LENGTH 4
 #define DATA_SHORT_HEADER_LENGTH 5
 
+// SACK Design A Step 1 — gated DATA_LONG header growth.
+// When sack_v2_enabled is false (v1 path / default), DATA_LONG header is 4
+// bytes [type, conn_id, seq_num(EOB bit7), id] — identical to pre-Step-1
+// wire format. When sack_v2_enabled is true, DATA_LONG header grows to 5
+// bytes [type, conn_id, seq_num(EOB bit7), batch_seq_id, id]. The
+// batch_seq_id byte is a placeholder (0) until Step 3 plumbs the real
+// counter. Header growth is the ONLY irreversible wire change in this
+// step; v1↔v1 traffic remains byte-identical. See SACK_DESIGN_A_PLAN.md
+// §4.2.1 and §7 (revised order).
+#define DATA_LONG_HEADER_LENGTH_V2 5
+// SACK Design A Step 2 — gated DATA_SHORT header growth.
+// When sack_v2_enabled is false (v1 path / default), DATA_SHORT header is
+// 5 bytes [type, conn_id, seq_num(EOB bit7), id, length] — identical to
+// pre-Step-2 wire format. When sack_v2_enabled is true, DATA_SHORT header
+// grows to 6 bytes [type, conn_id, seq_num(EOB bit7), batch_seq_id, id,
+// length]. Same placeholder-then-plumb semantics as DATA_LONG_HEADER_LENGTH_V2.
+#define DATA_SHORT_HEADER_LENGTH_V2 6
+
 //Load config level
 #define FULL 0
 #define PHYSICAL_LAYER_ONLY 1

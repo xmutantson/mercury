@@ -1040,7 +1040,16 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	int nBytes_header=0;
 	if (ACK_MULTI_ACK_RANGE_HEADER_LENGTH>nBytes_header) nBytes_header=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	if (CONTROL_ACK_CONTROL_HEADER_LENGTH>nBytes_header) nBytes_header=CONTROL_ACK_CONTROL_HEADER_LENGTH;
-	if (DATA_LONG_HEADER_LENGTH>nBytes_header) nBytes_header=DATA_LONG_HEADER_LENGTH;
+	// SACK Design A Step 1 — DATA_LONG header is 4 bytes (v1) or 5 bytes (v2).
+	// Uses effective_data_long_header_length() so buffer sizing matches the
+	// runtime wire format. Pre-negotiation sack_v2_enabled is false → legacy
+	// 4-byte value (byte-identical to pre-Step-1). Post-negotiation, if both
+	// peers advertised CAP_SACK_V2, the next load_configuration() call picks
+	// up the 5-byte effective length.
+	{
+		int eff_long = effective_data_long_header_length(sack_v2_enabled);
+		if (eff_long>nBytes_header) nBytes_header=eff_long;
+	}
 	if (DATA_SHORT_HEADER_LENGTH>nBytes_header) nBytes_header=DATA_SHORT_HEADER_LENGTH;
 
 	int nBytes_data=(telecom_system->data_container.nBits-telecom_system->ldpc.P-telecom_system->outer_code_reserved_bits)/8 - nBytes_header;
@@ -2789,11 +2798,23 @@ void cl_arq_controller::send(st_message* message, int message_location)
 	int header_length=0;
 	if(message->type==DATA_LONG)
 	{
+		// SACK Design A Step 1 — DATA_LONG header growth gated on sack_v2_enabled.
+		// v1 (default): 4 bytes [type, conn_id, seq(EOB bit7), id].
+		// v2: 5 bytes [type, conn_id, seq(EOB bit7), batch_seq_id, id].
+		// batch_seq_id is a placeholder (0) here; Step 3 wires the real counter.
 		message_TxRx_byte_buffer[0]=message->type;
 		message_TxRx_byte_buffer[1]=connection_id;
 		message_TxRx_byte_buffer[2]=message->sequence_number;
-		message_TxRx_byte_buffer[3]=message->id;
-		header_length=DATA_LONG_HEADER_LENGTH;
+		if(sack_v2_enabled)
+		{
+			message_TxRx_byte_buffer[3]=0;            // batch_seq_id placeholder (Step 3 plumbs)
+			message_TxRx_byte_buffer[4]=message->id;
+		}
+		else
+		{
+			message_TxRx_byte_buffer[3]=message->id;
+		}
+		header_length=effective_data_long_header_length(sack_v2_enabled);
 	}
 	else if (message->type==DATA_SHORT)
 	{
@@ -2960,11 +2981,21 @@ void cl_arq_controller::send_batch()
 
 		if(messages_batch_tx[i].type==DATA_LONG)
 		{
+			// SACK Design A Step 1 — DATA_LONG header growth gated on sack_v2_enabled.
+			// See cl_arq_controller::send() for full format documentation.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
 			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
-			message_TxRx_byte_buffer[3]=messages_batch_tx[i].id;
-			header_length=DATA_LONG_HEADER_LENGTH;
+			if(sack_v2_enabled)
+			{
+				message_TxRx_byte_buffer[3]=0;        // batch_seq_id placeholder (Step 3 plumbs)
+				message_TxRx_byte_buffer[4]=messages_batch_tx[i].id;
+			}
+			else
+			{
+				message_TxRx_byte_buffer[3]=messages_batch_tx[i].id;
+			}
+			header_length=effective_data_long_header_length(sack_v2_enabled);
 		}
 		else if (messages_batch_tx[i].type==DATA_SHORT)
 		{
@@ -4860,15 +4891,31 @@ void cl_arq_controller::receive()
 				}
 				else if(messages_rx_buffer.type==DATA_LONG)
 				{
-					messages_rx_buffer.id=message_TxRx_byte_buffer[3];
-					int copy_len = max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH;
+					// SACK Design A Step 1 — DATA_LONG header parse gated on sack_v2_enabled.
+					// v1 (default): byte[3] = id. v2: byte[3] = batch_seq_id (placeholder),
+					// byte[4] = id. Step 3 will plumb batch_seq_id into messages_rx_buffer
+					// for cross-batch routing — at Step 1 it is parsed but discarded (no
+					// decision keys off its value).
+					int eff_hdr = effective_data_long_header_length(sack_v2_enabled);
+					if(sack_v2_enabled)
+					{
+						// batch_seq_id at offset 3 is currently a placeholder (0). Step 3
+						// will replace this comment with a proper RSP-side store + log.
+						(void)message_TxRx_byte_buffer[3];
+						messages_rx_buffer.id=message_TxRx_byte_buffer[4];
+					}
+					else
+					{
+						messages_rx_buffer.id=message_TxRx_byte_buffer[3];
+					}
+					int copy_len = max_data_length+max_header_length-eff_hdr;
 					if(copy_len > alloc_size) copy_len = alloc_size;
 					messages_rx_buffer.length=copy_len;
 					for(int j=0;j<copy_len;j++)
 					{
-						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+DATA_LONG_HEADER_LENGTH];
+						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+eff_hdr];
 					}
-	
+
 				}
 				else if(messages_rx_buffer.type==DATA_SHORT)
 				{
@@ -5621,17 +5668,21 @@ void cl_arq_controller::restore_tx_from_compressed()
 
 void cl_arq_controller::restore_backup_buffer_data()
 {
+	// SACK Design A Step 1 — effective DATA_LONG header length gates per-frame
+	// payload capacity. In v1 (default) this is the legacy 4-byte value; in v2
+	// it grows by 1 byte (matching the wire format the prior batch was sent in).
+	int eff_long_hdr = effective_data_long_header_length(sack_v2_enabled);
 	int nBackedup_bytes, data_read_size, nMessages;
 	nBackedup_bytes=fifo_buffer_backup.get_size()-fifo_buffer_backup.get_free_size();
-	if(nBackedup_bytes!=0 && (max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH)!=0)
+	if(nBackedup_bytes!=0 && (max_data_length+max_header_length-eff_long_hdr)!=0)
 	{
-		nMessages=nBackedup_bytes/(max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH);
+		nMessages=nBackedup_bytes/(max_data_length+max_header_length-eff_long_hdr);
 
 		char restore_buf[N_MAX/8 * 20];
 		int total_restore = 0;
 		for(int i=0;i<nMessages+1;i++)
 		{
-			data_read_size=fifo_buffer_backup.pop(restore_buf + total_restore,max_data_length+max_header_length-DATA_LONG_HEADER_LENGTH);
+			data_read_size=fifo_buffer_backup.pop(restore_buf + total_restore,max_data_length+max_header_length-eff_long_hdr);
 			if(data_read_size > 0)
 				total_restore += data_read_size;
 		}

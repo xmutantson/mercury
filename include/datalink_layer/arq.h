@@ -171,6 +171,25 @@ struct st_message
 	cl_timer ack_timer;
 };
 
+// SACK Design A Steps 1 + 2 — effective header length helpers.
+// Returns the runtime DATA_LONG / DATA_SHORT header length on the wire,
+// gated on the session's sack_v2_enabled. When v2 is OFF (default), these
+// return the legacy macro values (4 / 5) — wire format identical to
+// pre-Step-1. When v2 is ON (both peers advertised CAP_SACK_V2 in
+// TEST_CONNECTION), the header grows by 1 byte to make room for the
+// batch_seq_id field (offset 3 in the header).
+// See SACK_DESIGN_A_PLAN.md §4.2.1, §6 reversibility analysis (these
+// helpers are the irreversibility mitigation — the new wire bytes are
+// ONLY emitted when sack_v2_enabled is true on both peers).
+inline int effective_data_long_header_length(bool sack_v2)
+{
+	return sack_v2 ? DATA_LONG_HEADER_LENGTH_V2 : DATA_LONG_HEADER_LENGTH;
+}
+inline int effective_data_short_header_length(bool sack_v2)
+{
+	return sack_v2 ? DATA_SHORT_HEADER_LENGTH_V2 : DATA_SHORT_HEADER_LENGTH;
+}
+
 // SACK: Double-buffered crypto batch storage for partial batch handling.
 // Responder stores frames from up to 2 crypto batches (the one being completed
 // via retransmits and the new one arriving in the same radio batch).
