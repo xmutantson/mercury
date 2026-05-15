@@ -72,7 +72,10 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 		return success;
 	}
 
-	if(type==DATA_SHORT && length>(max_data_length+max_header_length-DATA_SHORT_HEADER_LENGTH))
+	// SACK Design A Step 2 — DATA_SHORT payload capacity is reduced by 1 byte
+	// when sack_v2_enabled. v1 path uses the legacy 5-byte macro; bytes-on-the
+	// -wire and bounds are identical to pre-Step-2.
+	if(type==DATA_SHORT && length>(max_data_length+max_header_length-effective_data_short_header_length(sack_v2_enabled)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
