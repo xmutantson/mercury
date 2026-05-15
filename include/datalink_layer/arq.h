@@ -363,6 +363,28 @@ public:
   bool receive_ack_pattern(); // Level 3: RX + detect ACK pattern, returns true if detected
   void send_sack_pattern(const bool* received_bitmap, int nframes);  // SACK: partial batch ACK with bitmap
   bool receive_sack_pattern(bool* out_bitmap, int nframes); // SACK: detect + decode bitmap
+  // SACK Design A Step 7 — OFDM SACK_RSP TX (RSP side). Builds the control
+  // frame [batch_seq_id, bitmap_bytes, CRC8] and TX's it via send_batch() at
+  // the data configuration. Returns the wall-clock TX duration in ms
+  // (measured from the moment send_batch() is invoked until it returns;
+  // this is the wire-occupancy figure compared against the legacy MFSK
+  // SACK pattern's ~1168 ms — see SACK_DESIGN_A_PLAN.md §7.7).
+  // Pre-conditions: caller has verified sack_v2_enabled && nframes > 0.
+  // bitmap[i] = true iff frame i of the batch was RECEIVED (matches the
+  // existing send_sack_pattern() semantics).
+  long long send_sack_v2_frame(const bool* bitmap, int nframes,
+                               unsigned char batch_seq_id);
+  // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
+  // receive() landed a frame with messages_rx_buffer.type == SACK_RSP. The
+  // function:
+  //   - Validates CRC8. On mismatch: increments cmd_sack_v2_crc_fail_count,
+  //     emits [CMD-SACK-V2-CRC-FAIL], and returns false (caller continues
+  //     waiting / falls back to existing ACK-timeout path; nothing is
+  //     fabricated, §9.4/A2 lesson).
+  //   - On CRC pass: writes the bitmap (true = RECEIVED) into out_bitmap[0..nframes-1],
+  //     out_batch_seq_id, increments cmd_sack_v2_rx_count, returns true.
+  bool decode_sack_v2_frame(bool* out_bitmap, int nframes,
+                            unsigned char* out_batch_seq_id);
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
@@ -521,6 +543,61 @@ public:
   int test_rsp_bsi_v2_frame_counter;     // RSP: count of v2 DATA frames received
                                          //      (1-indexed); used to match
                                          //      test_rsp_bsi_corrupt_at exactly once.
+
+  // SACK Design A Step 7 — SACK_RSP OFDM control-frame state.
+  // ALL gated on sack_v2_enabled. v1 path never reads or writes these.
+  // §4.2.2: SACK_RSP replaces the ~1168 ms MFSK SACK pattern with a single
+  // OFDM LDPC control frame (~390 ms at WB_CFG10). Wire payload after the
+  // standard 3-byte msg header: [batch_seq_id : u8][bitmap : ceil(N/8) bytes][CRC8 : u8].
+  // The TX-side ground truth bitmap is logged via [TX-SACK-V2]; the RX-side
+  // decoded bitmap is logged via [CMD-SACK-V2]; a v2<->v2 round-trip asserts
+  // the two are byte-identical (the Gate-2 deliverable).
+  long long rsp_sack_v2_tx_count;        // RSP: count of SACK_RSP frames TX'd.
+                                         //      Diagnostic only; v2-loopback tests
+                                         //      assert this is > 0 when the SACK
+                                         //      partial path was exercised.
+  long long cmd_sack_v2_rx_count;        // CMD: count of SACK_RSP frames received
+                                         //      AND CRC-validated (CRC-failed frames
+                                         //      do NOT increment this — they bump
+                                         //      cmd_sack_v2_crc_fail_count instead).
+  long long cmd_sack_v2_crc_fail_count;  // CMD: count of SACK_RSP frames whose
+                                         //      CRC8 did not match. Discarded with
+                                         //      [CMD-SACK-V2-CRC-FAIL] log; bitmap
+                                         //      is NOT applied to retransmit queue
+                                         //      (§9.4/A2 "no fabrication" lesson —
+                                         //      the missing SACK falls back to the
+                                         //      existing ACK timeout / retransmit
+                                         //      path, exactly as if the OFDM
+                                         //      control frame had been lost on
+                                         //      the air).
+  unsigned char cmd_sack_v2_last_rx_bitmap[MAX_SACK_BATCH_SIZE / 8 + 1];
+                                         // CMD: most recent decoded bitmap bytes
+                                         //      (post-CRC). For test scaffold
+                                         //      observability. Sized to fit any
+                                         //      Design A batch size (max 50 → 7
+                                         //      bytes; we provision MAX_SACK_BATCH_SIZE/8+1
+                                         //      = 5 bytes which covers
+                                         //      data_batch_size up to 32).
+  int           cmd_sack_v2_last_rx_nbits;
+                                         // CMD: number of valid bits in
+                                         //      cmd_sack_v2_last_rx_bitmap (= the
+                                         //      data_batch_size for which the
+                                         //      SACK_RSP was generated). -1 = no
+                                         //      SACK_RSP received this session.
+  int           cmd_sack_v2_last_rx_batch_seq_id;
+                                         // CMD: batch_seq_id field from the most
+                                         //      recent CRC-validated SACK_RSP.
+                                         //      -1 = none.
+  // Test-scaffold fault injection (CLI --test-rsp-sack-rsp-crc-corrupt). When
+  // true, the next SACK_RSP frame the RSP transmits has its trailing CRC8 byte
+  // XOR'd with 0xFF before TX. One-shot; clears after firing. Used to
+  // demonstrate the CMD's CRC8 discard branch fires (§4.2.2 / §9.4/A2). Default
+  // false; production builds never pass this flag.
+  bool test_rsp_sack_rsp_crc_corrupt;
+  bool test_rsp_sack_rsp_crc_corrupt_armed;   // one-shot arm flag (mirrors
+                                              // test_rsp_sack_rsp_crc_corrupt at
+                                              // configure time; cleared when
+                                              // the corruption fires).
 
   // Responder: double-buffered crypto batch storage
   st_crypto_batch_buffer crypto_buf[2]; // [0] = oldest pending, [1] = current

@@ -297,6 +297,7 @@ int main(int argc, char *argv[])
     bool enable_sack_v2_cli = false;   // --enable-sack-v2: SACK Design A Step 6 (negotiate-only opt-in)
     bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
     int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
+    bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
     int audio_buffer_ms_cli = 0;       // --alsa-buffer-ms=N (Linux only; 0 = use 30ms default)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
@@ -566,6 +567,19 @@ int main(int argc, char *argv[])
             // pass this flag.
             test_rsp_bsi_corrupt_at_cli = atoi(argv[i] + 26);
             if (test_rsp_bsi_corrupt_at_cli < 0) test_rsp_bsi_corrupt_at_cli = 0;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rsp-sack-rsp-crc-corrupt") == 0)
+        {
+            // SACK Design A Step 7 — synthetic CRC8 corruption test (one-shot).
+            // On the first SACK_RSP OFDM frame the RSP transmits after this
+            // flag is set, the trailing CRC8 byte is XOR'd with 0xFF, causing
+            // the CMD-side decoder to fail the CRC check. The CMD then logs
+            // [CMD-SACK-V2-CRC-FAIL] and DISCARDS the bitmap (no fabrication
+            // per §9.4/A2). Default off; production builds never pass this
+            // flag. The corruption clears itself after firing exactly once.
+            test_rsp_sack_rsp_crc_corrupt_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1301,6 +1315,13 @@ start_modem:
                    "DATA frame's batch_seq_id by +7 mod 256 (SACK Design A Step 4 "
                    "synthetic discard test — one-shot)\n",
                    test_rsp_bsi_corrupt_at_cli, test_rsp_bsi_corrupt_at_cli);
+        }
+        if (test_rsp_sack_rsp_crc_corrupt_cli) {
+            ARQ.test_rsp_sack_rsp_crc_corrupt = true;
+            ARQ.test_rsp_sack_rsp_crc_corrupt_armed = true;
+            printf("[FLAG] --test-rsp-sack-rsp-crc-corrupt: next SACK_RSP TX will have "
+                   "CRC8 XOR'd with 0xFF (SACK Design A Step 7 synthetic CRC8 fault "
+                   "injection — one-shot)\n");
         }
 
         // Monitor mode: force monitor on, disable TX

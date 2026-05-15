@@ -1484,7 +1484,52 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			if(sack_window_open)
 			{
 				memset(sack_bitmap, 0, sizeof(sack_bitmap));
-				sack_detected = receive_sack_pattern(sack_bitmap, data_batch_size);
+				if(sack_v2_enabled)
+				{
+					// SACK Design A Step 7 — OFDM SACK_RSP receive path.
+					// Instead of the MFSK SACK pattern correlator
+					// (receive_sack_pattern), demodulate any OFDM LDPC
+					// frame that landed. If it parses as SACK_RSP and the
+					// CRC8 validates, accept the bitmap. On CRC failure,
+					// the bitmap is DISCARDED (no fabrication per §9.4/A2)
+					// and we fall through to ACK-pattern detection /
+					// timeout-driven retransmit, exactly as if the
+					// control frame had been lost in the air.
+					this->receive();
+					if(messages_rx_buffer.status == RECEIVED
+					   && messages_rx_buffer.type == SACK_RSP)
+					{
+						unsigned char rx_bsi = 0;
+						if(decode_sack_v2_frame(sack_bitmap, data_batch_size, &rx_bsi))
+						{
+							sack_detected = true;
+							printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — applying to retransmit queue\n",
+								(unsigned)rx_bsi, cmd_batch_seq_id);
+							fflush(stdout);
+						}
+						// On CRC fail, decode_sack_v2_frame already logged
+						// [CMD-SACK-V2-CRC-FAIL]; we discard and continue.
+						messages_rx_buffer.status = FREE;
+					}
+					else
+					{
+						// No SACK_RSP frame yet — keep the receive loop
+						// going (the existing ACK-pattern check below
+						// will run on this same poll).
+						if(messages_rx_buffer.status == RECEIVED)
+						{
+							// Unexpected non-SACK_RSP frame arrived during
+							// the SACK window. Don't act on it here; leave
+							// it for the existing fallback dispatcher to
+							// process on the next iteration.
+							// (Keeping messages_rx_buffer.status as-is.)
+						}
+					}
+				}
+				else
+				{
+					sack_detected = receive_sack_pattern(sack_bitmap, data_batch_size);
+				}
 			}
 
 			if(sack_detected)

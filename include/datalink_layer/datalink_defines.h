@@ -86,7 +86,21 @@
 #define KEY_EXCHANGE_2   0x3F   // ML-KEM encaps key (sent as data, 1184 bytes)
 #define KEY_EXCHANGE_3   0x40   // ML-KEM ciphertext (sent as data, 1088 bytes)
 #define KEY_ACTIVATE     0x41   // Encryption activated (both sides switch to encrypted data)
-// 0x42 reserved for SACK_RSP (Design A §4.2.2; not yet wired)
+#define SACK_RSP         0x42   // SACK Design A §4.2.2 — OFDM control frame carrying a
+                                // partial-batch ACK bitmap. Replaces the legacy MFSK SACK
+                                // pattern (~1168 ms on wire at WB M=16) with a single OFDM
+                                // LDPC control frame (~390 ms at WB_CFG10) on
+                                // sack_v2_enabled sessions. Wire payload (after the
+                                // standard 3-byte msg header [type, conn_id, seq_num]):
+                                //   [batch_seq_id : u8][bitmap : ceil(N/8) bytes][CRC8 : u8]
+                                // where N = data_batch_size at TX time (CMD and RSP agree
+                                // on N because data_batch_size is negotiated at TEST_CONNECTION
+                                // and never moves within a Design A Step 7 session). CRC8
+                                // covers batch_seq_id || bitmap_bytes (NOT the standard
+                                // msg header). Polynomial: POLY_CRC8 (=0xF4), matching the
+                                // existing CRC8_calc() helper. v1 MFSK SACK path is
+                                // untouched; it remains operational on
+                                // sack_enabled && !sack_v2_enabled peers.
 #define SET_LINK_PARAMS  0x43   // SACK Design A Axes 2+3 policy update (batch, sack mode)
                                 // Phase: SCAFFOLDING — message type defined, RSP-side no-op
                                 // stub logs receipt only; no CMD-side sender; no state mutation.
