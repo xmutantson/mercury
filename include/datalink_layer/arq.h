@@ -419,13 +419,14 @@ public:
   void policy_evaluate_axis1();
 
   // SACK Design A Step 9 — Axis 1 supremacy hook (§4.3.4 invariant #6).
-  // Called from policy_evaluate_axis1() on every modulation move, and (when
-  // Steps 10/11 land) from the BREAK path. At Step 9 the body is a logging
-  // stub — no Axes 2/3 controllers exist to reset. The hook is the explicit
-  // contract point that Steps 10/11 will fill in:
-  //   - reset batch_size to `radio_batch_size_floor = 10`
-  //   - set sack_mode to PROBE
-  //   - cancel in-flight Axes 2/3 moves
+  // Called from policy_evaluate_axis1() on every modulation move (Step 9)
+  // AND from every BREAK initiation site (Step 12) — BREAK is a more drastic
+  // Axis-1 move, so Axes 2/3 must be reset just as aggressively. Step 10
+  // filled in the Axis-2 ring + cooldown reset; Step 11 added the Axis-3
+  // ring + cooldown + mode-to-PROBE transition; Step 12 adds the
+  // batch_size_proven_ceiling reset (§4.3.4 invariant #7) and the BREAK
+  // call-sites. Gated on `sack_v2_enabled` at the call site — v1 sessions
+  // never enter.
   void policy_axis1_supremacy_on_move(int from_cfg, int to_cfg, const char* reason);
 
   // SACK Design A Step 9 — synthetic Axis 1 fire (test-only).
@@ -486,6 +487,22 @@ public:
   // by the Axis-1 supremacy hook to express "Axis 2 must wait N batches
   // after any Axis 1 move." Pure-state, no logging.
   int axis2_cooldown_tick();
+
+  // SACK Design A Step 12 — synthetic Axis-2 ceiling fire (test-only).
+  // CLI: --test-policy-axis2-ceiling-fire=1. Drives a synthetic
+  // "K just failed → ceiling=K-1" scenario, then attempts a synthetic
+  // Axis-2 up-move from below K back toward K and asserts the up-move
+  // is VETOED by the batch_size_proven_ceiling check. Default builds
+  // never call this.
+  void test_fire_policy_axis2_ceiling();
+
+  // SACK Design A Step 12 — synthetic BREAK supremacy fire (test-only).
+  // CLI: --test-policy-break-supremacy=1. Primes Axis-2 + Axis-3 state
+  // to clean (no cooldown) then invokes the supremacy hook with a
+  // synthetic BREAK reason tag. Demonstrates the new BREAK → supremacy
+  // integration AND that 3 subsequent Axis-2 evaluations are suppressed.
+  // Default builds never call this.
+  void test_fire_policy_break_supremacy();
 
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
@@ -876,6 +893,15 @@ public:
   static const int AXIS2_UP_GOOD_RUN = 8;  // §4.3.2 hysteresis: up after this many good batches
   static const int AXIS2_DOWN_BAD_RUN = 3; // §4.3.2 hysteresis: down after this many bad batches
   static const int AXIS2_CROSS_AXIS_COOLDOWN_BATCHES = 3; // §4.3.3 set by Axis-1 supremacy hook
+  // SACK Design A Step 12 — Axis-2 `batch_size_proven_ceiling` analogue
+  // (§4.3.4 invariant #7). After a down-move at K (the batch_size that just
+  // produced > 20 % partial rate), Axis-2 is forbidden from proposing any
+  // value above (K-1) for AXIS2_CEILING_RECOVERY_BATCHES subsequent
+  // evaluations. Mirrors the §2.1 supershift_proven_ceiling discipline for
+  // Axis 1 (modulation): a config that just failed cannot be re-tried
+  // without an explicit recovery interval. The ceiling RESETS on any
+  // Axis-1 move (channel changed, prior ceiling stale).
+  static const int AXIS2_CEILING_RECOVERY_BATCHES = 20;
 
   float axis2_partial_rate_ring[AXIS2_RING_DEPTH];
   int   axis2_partial_rate_count;        // [0..AXIS2_RING_DEPTH]; pre-fill before mean
@@ -885,6 +911,14 @@ public:
   int   axis2_cooldown_batches;          // §4.3.3 Axis-1 supremacy cooldown — Axis-2
                                          //      skips evaluation while >0; decremented
                                          //      per evaluation call.
+  // §4.3.4 invariant #7 — proven-ceiling state (Step 12).
+  //  ceiling == -1 ⇒ no cap (default; either no prior failure or already recovered).
+  //  ceiling >=  0 ⇒ Axis-2 may NOT propose to > ceiling until recovery_remaining == 0.
+  // Recovery counter decrements on every policy_evaluate_axis2() call; on reaching
+  // 0, the ceiling clears (-1). Axis-1 supremacy resets the ceiling unconditionally.
+  int   batch_size_proven_ceiling;       // mirrors supershift_proven_ceiling (Axis-1)
+  int   batch_size_ceiling_recovery_batches; // batches remaining before ceiling clears
+  long long axis2_ceiling_blocks_count;  // count of up-moves vetoed by the ceiling
   long long axis2_evaluations;           // count of policy_evaluate_axis2() calls
   long long axis2_move_up_count;         // count of step-up moves
   long long axis2_move_down_count;       // count of step-down moves

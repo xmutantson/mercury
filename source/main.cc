@@ -326,6 +326,12 @@ int main(int argc, char *argv[])
     int test_force_sack_mode_cli = -1;  // --force-sack-mode={off,on,probe}: SACK Design A Step 11 — set Axis-3 mode at startup
                                         // (after init, before CONNECTED). Used for Gate 4 (SACK_OFF graceful fallback in
                                         // live session) and Gate 7 (SET_LINK_PARAMS sack_mode round-trip). -1 = unset.
+    int test_policy_axis2_ceiling_fire_cli = 0; // --test-policy-axis2-ceiling-fire=1: SACK Design A Step 12 — drive a synthetic
+                                        // Axis-2 down-move (sets proven_ceiling) then attempt an up-move (must be VETOED
+                                        // by the ceiling). One-shot at startup, then exit.
+    int test_policy_break_supremacy_cli = 0; // --test-policy-break-supremacy=1: SACK Design A Step 12 — invoke the supremacy
+                                        // hook with a synthetic BREAK reason; assert Axis-2 + Axis-3 reset + 3 evaluations
+                                        // suppressed. One-shot at startup, then exit.
     int audio_buffer_ms_cli = 0;       // --alsa-buffer-ms=N (Linux only; 0 = use 30ms default)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
@@ -665,6 +671,32 @@ int main(int argc, char *argv[])
             if (strcmp(arg, "up") == 0)        test_policy_axis2_fire_cli = 1;
             else if (strcmp(arg, "down") == 0) test_policy_axis2_fire_cli = 2;
             else { fprintf(stderr, "--test-policy-axis2-fire: expected 'up' or 'down'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis2-ceiling-fire=", 33) == 0)
+        {
+            // SACK Design A Step 12 — synthetic Axis-2 proven-ceiling fire
+            // (§4.3.4 invariant #7). Drives a synthetic Axis-2 down-move (which
+            // sets batch_size_proven_ceiling) then attempts an up-move that
+            // MUST be VETOED by the ceiling check. One-shot at startup, then
+            // exit. Default off; production builds never pass this flag.
+            const char* arg = argv[i] + 33;
+            if (strcmp(arg, "1") == 0) test_policy_axis2_ceiling_fire_cli = 1;
+            else { fprintf(stderr, "--test-policy-axis2-ceiling-fire: expected '1'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-break-supremacy=", 30) == 0)
+        {
+            // SACK Design A Step 12 — synthetic BREAK supremacy fire
+            // (§4.3.4 invariant #6, BREAK integration). Invokes the supremacy
+            // hook with a synthetic BREAK reason tag and confirms Axis-2 +
+            // Axis-3 reset + 3 evaluations suppressed by the cooldown.
+            // One-shot at startup, then exit. Default off.
+            const char* arg = argv[i] + 30;
+            if (strcmp(arg, "1") == 0) test_policy_break_supremacy_cli = 1;
+            else { fprintf(stderr, "--test-policy-break-supremacy: expected '1'\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1520,6 +1552,26 @@ start_modem:
             fflush(stdout);
             ARQ.test_fire_policy_axis2(test_policy_axis2_fire_cli);
             printf("[FLAG] Synthetic fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_policy_axis2_ceiling_fire_cli != 0) {
+            // SACK Design A Step 12 — Axis-2 proven-ceiling fire (one-shot, then exit).
+            printf("[FLAG] --test-policy-axis2-ceiling-fire=1: invoking synthetic "
+                   "Axis-2 ceiling enforcement demo (§4.3.4 invariant #7)\n");
+            fflush(stdout);
+            ARQ.test_fire_policy_axis2_ceiling();
+            printf("[FLAG] Ceiling fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_policy_break_supremacy_cli != 0) {
+            // SACK Design A Step 12 — synthetic BREAK supremacy fire (one-shot, then exit).
+            printf("[FLAG] --test-policy-break-supremacy=1: invoking synthetic "
+                   "BREAK supremacy demo (§4.3.4 invariant #6 — BREAK integration)\n");
+            fflush(stdout);
+            ARQ.test_fire_policy_break_supremacy();
+            printf("[FLAG] BREAK supremacy fire complete — exiting.\n");
             fflush(stdout);
             exit(0);
         }

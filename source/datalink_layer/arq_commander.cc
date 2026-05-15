@@ -1287,6 +1287,10 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					emergency_break_active = 1;
 					emergency_break_retries = 1;
 					break_recovery_phase = 0;  // BREAK ACK handler will set to 1
+					// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							current_configuration, "break_recovery_phase2_probe_fail");
 					send_break_pattern();
 					telecom_system->data_container.frames_to_read = 4;
 					calculate_receiving_timeout();
@@ -1323,6 +1327,10 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					emergency_break_active = 1;
 					emergency_break_retries = 1;
 					break_recovery_phase = 0;
+					// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							current_configuration, "break_recovery_phase1_exhausted");
 					send_break_pattern();
 					telecom_system->data_container.frames_to_read = 4;
 					calculate_receiving_timeout();
@@ -1513,6 +1521,10 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					messages_tx[i].status = FREE;
 				fifo_buffer_backup.flush();
 
+				// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+				if(sack_v2_enabled)
+					policy_axis1_supremacy_on_move(failed_config,
+						supershift_proven_ceiling, "turbo_forward_break");
 				send_break_pattern();
 				telecom_system->data_container.frames_to_read = 4;
 				calculate_receiving_timeout();
@@ -1576,6 +1588,10 @@ void cl_arq_controller::process_messages_rx_acks_control()
 						messages_tx[i].status = FREE;
 					fifo_buffer_backup.flush();
 
+					// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							settle_config, "turbo_switch_role_break");
 					send_break_pattern();
 					telecom_system->data_container.frames_to_read = 4;
 					calculate_receiving_timeout();
@@ -1626,6 +1642,10 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				emergency_break_retries = 1;
 				emergency_nack_count = 0;
 
+				// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+				if(sack_v2_enabled)
+					policy_axis1_supremacy_on_move(current_configuration,
+						working_config, "frame_gearshift_up_failed");
 				send_break_pattern();
 				telecom_system->data_container.frames_to_read = 4;
 				calculate_receiving_timeout();
@@ -1669,6 +1689,10 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					emergency_previous_config = current_configuration;
 					emergency_break_active = 1;
 					emergency_break_retries = 1;
+					// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							current_configuration, "break_control_failure_threshold");
 					send_break_pattern();
 					telecom_system->data_container.frames_to_read = 4;
 					calculate_receiving_timeout();
@@ -2034,6 +2058,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			emergency_break_retries = 1;
 			emergency_nack_count = 0;
 
+			// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+			if(sack_v2_enabled)
+				policy_axis1_supremacy_on_move(current_configuration,
+					working_config, "frame_gearshift_data_failed_nack");
 			send_break_pattern();
 			telecom_system->data_container.frames_to_read = 4;
 			calculate_receiving_timeout();
@@ -2145,6 +2173,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				emergency_break_retries = 1;
 				emergency_nack_count = 0;
 
+				// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+				if(sack_v2_enabled)
+					policy_axis1_supremacy_on_move(current_configuration,
+						working_config, "frame_gearshift_data_failed_pat");
 				send_break_pattern();
 				telecom_system->data_container.frames_to_read = 4;
 				calculate_receiving_timeout();
@@ -2182,6 +2214,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				emergency_previous_config = current_configuration;
 				emergency_break_active = 1;
 				emergency_break_retries = 3;
+				// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
+				if(sack_v2_enabled)
+					policy_axis1_supremacy_on_move(current_configuration,
+						current_configuration, "break_block_failure_threshold");
 				send_break_pattern();
 				// Poll for ACK from responder
 				telecom_system->data_container.frames_to_read = 4;
@@ -3624,6 +3660,17 @@ void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg,
 	axis2_consecutive_bad_batches=0;
 	axis2_cooldown_batches = AXIS2_CROSS_AXIS_COOLDOWN_BATCHES;
 
+	// SACK Design A Step 12 — clear Axis-2 proven-ceiling on any Axis-1 move.
+	// Per §4.3.4 invariant #7 + prompt §2: "On a config (Axis 1) move, the
+	// ceiling RESETS (channel changed, prior ceiling stale)." A new modulation
+	// has a different SNR / fade profile; the batch-size that failed on the
+	// prior config may be perfectly fine now (and vice versa). Forget what
+	// we proved at the old config.
+	int prev_axis2_ceiling = batch_size_proven_ceiling;
+	int prev_axis2_recovery = batch_size_ceiling_recovery_batches;
+	batch_size_proven_ceiling = -1;
+	batch_size_ceiling_recovery_batches = 0;
+
 	// SACK Design A Step 11 — Axis 3 reset (§4.3.3 cross-axis cooldown).
 	//
 	// Axis 1's move invalidates the SACK-decode history on the old config.
@@ -3645,10 +3692,13 @@ void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg,
 	}
 
 	printf("[POLICY-SUPREMACY] axis=1 move reason=%s — "
-		"Axis 2 reset (ring+counters cleared, cooldown=%d batches); "
+		"Axis 2 reset (ring+counters cleared, cooldown=%d batches, "
+		"proven_ceiling %d->-1 recovery %d->0); "
 		"Axis 3 reset (ring+misses cleared, cooldown=%d batches, "
 		"mode %s -> %s)\n",
-		reason, axis2_cooldown_batches, axis3_cooldown_batches,
+		reason, axis2_cooldown_batches,
+		prev_axis2_ceiling, prev_axis2_recovery,
+		axis3_cooldown_batches,
 		axis3_mode_str(axis3_prev_mode), axis3_mode_str(axis3_sack_mode));
 	fflush(stdout);
 
@@ -3745,6 +3795,24 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 		return;
 	}
 
+	// SACK Design A Step 12 — §4.3.4 invariant #7: drain proven-ceiling recovery.
+	// The ceiling is set on down-moves (the batch_size that just failed must
+	// not be re-proposed immediately). The recovery counter decrements on
+	// every evaluation; on reaching zero the ceiling clears. Axis-1 supremacy
+	// resets the ceiling unconditionally (see policy_axis1_supremacy_on_move).
+	if(batch_size_proven_ceiling >= 0 && batch_size_ceiling_recovery_batches > 0)
+	{
+		batch_size_ceiling_recovery_batches--;
+		if(batch_size_ceiling_recovery_batches == 0)
+		{
+			printf("[POLICY-AXIS2-CEILING] recovery period elapsed — clearing "
+				"proven_ceiling=%d (was set after prior down-move)\n",
+				batch_size_proven_ceiling);
+			fflush(stdout);
+			batch_size_proven_ceiling = -1;
+		}
+	}
+
 	// Compute mean over the ring (only over filled slots — avoid skewing
 	// early-session decisions with zero-padded entries).
 	float sum = 0.0f;
@@ -3762,6 +3830,33 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	bool want_down = (mean_partial > 0.20f)
 	                 && (axis2_consecutive_bad_batches >= AXIS2_DOWN_BAD_RUN)
 	                 && (data_batch_size - AXIS2_STEP >= AXIS2_BATCH_FLOOR);
+
+	// SACK Design A Step 12 — §4.3.4 invariant #7: enforce proven-ceiling.
+	// If the up-move would propose a batch_size above the ceiling, VETO the
+	// move. The ceiling represents the cap set by a prior down-move; we may
+	// not re-climb above it until the recovery period elapses (handled at
+	// the top of this function) or an Axis-1 supremacy event resets it.
+	if(want_up && batch_size_proven_ceiling >= 0)
+	{
+		int proposed = data_batch_size + AXIS2_STEP;
+		if(proposed > batch_size_proven_ceiling)
+		{
+			axis2_ceiling_blocks_count++;
+			printf("[POLICY-AXIS2-CEILING] up-move VETOED: proposed=%d > "
+				"proven_ceiling=%d recovery_remaining=%d (no move; ceiling "
+				"will clear on recovery expiry or Axis-1 move)\n",
+				proposed, batch_size_proven_ceiling,
+				batch_size_ceiling_recovery_batches);
+			fflush(stdout);
+			want_up = false;
+			// Reset the good-run counter so the same ring of clean batches
+			// does NOT immediately re-trigger the same vetoed up-move on the
+			// next evaluation (preventing a no-op log spam). Per §4.3.3 the
+			// counter is meant to gate counted-event moves; we treat the veto
+			// as having "consumed" the consecutive-good run.
+			axis2_consecutive_good_batches = 0;
+		}
+	}
 
 	if(want_up || want_down)
 	{
@@ -3810,6 +3905,34 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 
 		if(want_up) axis2_move_up_count++;
 		else        axis2_move_down_count++;
+
+		// SACK Design A Step 12 — §4.3.4 invariant #7: on a down-move,
+		// remember the batch_size that just failed (the value we are MOVING
+		// AWAY FROM) as the proven-ceiling for the next 20 evaluations.
+		// "Failed" = ring-mean > 0.20 with >=3 consecutive bad batches.
+		// Setting the cap to (from - 1) means Axis-2 may not re-propose
+		// `from` (or any larger value) within the recovery window. Per the
+		// plan: "preventing the batch_size from immediately re-climbing into
+		// the same failure regime." On an up-move we do NOT set a ceiling
+		// (an up-move proves the new K is at least as good as from; no
+		// failure observed). On Axis-1 supremacy the ceiling resets to -1.
+		if(want_down)
+		{
+			int new_ceiling = from - 1;
+			// Adopt the more restrictive of the existing ceiling and the new
+			// failure point. -1 ⇒ no prior cap; take the new one.
+			if(batch_size_proven_ceiling < 0 || new_ceiling < batch_size_proven_ceiling)
+			{
+				batch_size_proven_ceiling = new_ceiling;
+			}
+			batch_size_ceiling_recovery_batches = AXIS2_CEILING_RECOVERY_BATCHES;
+			printf("[POLICY-AXIS2-CEILING] down-move at batch=%d set "
+				"proven_ceiling=%d recovery=%d batches "
+				"(no re-climb to >%d until recovery expires or Axis-1 supremacy)\n",
+				from, batch_size_proven_ceiling,
+				batch_size_ceiling_recovery_batches, batch_size_proven_ceiling);
+			fflush(stdout);
+		}
 
 		// Send SET_LINK_PARAMS to the peer. add_message_control() bails out
 		// when messages_control.status != FREE (a control frame is in flight);
@@ -3919,6 +4042,179 @@ void cl_arq_controller::test_fire_policy_axis2(int direction)
 			direction);
 		fflush(stdout);
 	}
+}
+
+// SACK Design A Step 12 — synthetic Axis-2 proven-ceiling fire (test-only).
+//
+// CLI: --test-policy-axis2-ceiling-fire=1. Demonstrates §4.3.4 invariant #7
+// end-to-end:
+//   1. Prime an Axis-2 down-move from 25 → 20 (lossy ring). After the move,
+//      batch_size_proven_ceiling = 24 (= from-1 = 25-1) and recovery=20.
+//   2. Bring the channel back to clean (ring all zeros, good_run = 8).
+//   3. Attempt a synthetic Axis-2 up-move from 20 → 25 (proposed=25 >
+//      ceiling=24) → MUST be VETOED by the ceiling check.
+//   4. Confirm `axis2_ceiling_blocks_count` incremented exactly once and
+//      the [POLICY-AXIS2-CEILING] up-move VETOED log line fires.
+//
+// Default builds never call this; production paths unaffected.
+void cl_arq_controller::test_fire_policy_axis2_ceiling()
+{
+	sack_v2_enabled = true;
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+
+	// Reset Axis-2 state to clean baseline.
+	for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i]=0.0f;
+	axis2_partial_rate_count=0;
+	axis2_partial_rate_pos=0;
+	axis2_consecutive_good_batches=0;
+	axis2_consecutive_bad_batches=0;
+	axis2_cooldown_batches=0;
+	batch_size_proven_ceiling=-1;
+	batch_size_ceiling_recovery_batches=0;
+	axis2_ceiling_blocks_count=0;
+	data_batch_size = 25;
+
+	// Step 1 — synthetic down-move from 25.
+	// NOTE: set_data_batch_size() clamps against (max_data_length +
+	// max_header_length - ...) which is 0 in pre-init synthetic mode and
+	// produces a nonsense negative value. We bypass that clamp by restoring
+	// data_batch_size manually after policy_evaluate_axis2(). The ceiling
+	// state itself is what's load-bearing for this test — not the actual
+	// in-memory batch size value.
+	printf("[TEST-AXIS2-CEILING] step 1: priming lossy ring at batch=25 → "
+		"expect [POLICY-MOVE] axis=2 from=25 to=20 AND ceiling set to 24\n");
+	fflush(stdout);
+	for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.4f;
+	axis2_partial_rate_count = AXIS2_RING_DEPTH;
+	axis2_consecutive_bad_batches = AXIS2_DOWN_BAD_RUN - 1;
+	int synth_rx = (int)(25 * 0.6f);
+	policy_evaluate_axis2(synth_rx, 25);
+	// Restore data_batch_size to 20 (the value the down-move WOULD have set
+	// in production) — bypassing the set_data_batch_size() clamp bug.
+	data_batch_size = 20;
+	long long ceiling_blocks_before = axis2_ceiling_blocks_count;
+	int ceiling_after_step1 = batch_size_proven_ceiling;
+	int recovery_after_step1 = batch_size_ceiling_recovery_batches;
+	int batch_after_step1 = data_batch_size;
+	printf("[TEST-AXIS2-CEILING] step 1 result: data_batch_size=%d (forced to 20 "
+		"to bypass pre-init clamp bug) proven_ceiling=%d recovery=%d "
+		"ceiling_blocks=%lld\n",
+		batch_after_step1, ceiling_after_step1, recovery_after_step1,
+		(long long)axis2_ceiling_blocks_count);
+	fflush(stdout);
+
+	// Step 2 — prime clean ring + good_run at threshold for up-move.
+	// The up-move would propose 20 + AXIS2_STEP = 25, which exceeds
+	// proven_ceiling=24 → MUST be VETOED.
+	printf("[TEST-AXIS2-CEILING] step 2: priming clean ring at batch=%d, "
+		"good_run=%d → expect up-move to %d to be VETOED by ceiling=%d\n",
+		batch_after_step1, AXIS2_UP_GOOD_RUN,
+		batch_after_step1 + AXIS2_STEP, ceiling_after_step1);
+	fflush(stdout);
+	for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.0f;
+	axis2_partial_rate_count = AXIS2_RING_DEPTH;
+	axis2_consecutive_good_batches = AXIS2_UP_GOOD_RUN - 1;
+	axis2_consecutive_bad_batches = 0;
+	// Synthetic clean observation: rx_count = batch_size_observed (partial=0).
+	policy_evaluate_axis2(batch_after_step1, batch_after_step1);
+	long long ceiling_blocks_after = axis2_ceiling_blocks_count;
+	int batch_after_step2 = data_batch_size;
+	bool veto_ok = (batch_after_step2 == batch_after_step1
+	                && ceiling_blocks_after == ceiling_blocks_before + 1);
+	printf("[TEST-AXIS2-CEILING] step 2 result: data_batch_size=%d (was %d) "
+		"ceiling_blocks=%lld (was %lld) — %s\n",
+		batch_after_step2, batch_after_step1,
+		(long long)axis2_ceiling_blocks_count, ceiling_blocks_before,
+		veto_ok ? "PASS: up-move VETOED, batch unchanged, ceiling-block counter +1"
+		        : "FAIL: expected up-move to be vetoed by ceiling");
+	fflush(stdout);
+
+	// Step 3 — confirm Axis-1 supremacy clears the ceiling.
+	printf("[TEST-AXIS2-CEILING] step 3: invoking Axis-1 supremacy "
+		"(reason=ladder_test) — expect proven_ceiling reset to -1\n");
+	fflush(stdout);
+	policy_axis1_supremacy_on_move(5, 6, "ladder_test_ceiling_reset");
+	printf("[TEST-AXIS2-CEILING] step 3 result: proven_ceiling=%d recovery=%d — %s\n",
+		batch_size_proven_ceiling, batch_size_ceiling_recovery_batches,
+		(batch_size_proven_ceiling == -1 && batch_size_ceiling_recovery_batches == 0)
+		? "PASS: ceiling cleared by Axis-1 supremacy"
+		: "FAIL: expected ceiling cleared");
+	fflush(stdout);
+}
+
+// SACK Design A Step 12 — synthetic BREAK supremacy fire (test-only).
+//
+// CLI: --test-policy-break-supremacy=1. Demonstrates §4.3.4 invariant #6
+// for the BREAK code path:
+//   1. Prime Axis-2 ring + good_run to threshold so an Axis-2 up-move would
+//      normally fire on the next evaluation.
+//   2. Invoke the supremacy hook with a synthetic BREAK reason tag (the
+//      same call the new BREAK init sites make in production).
+//   3. Confirm [POLICY-SUPREMACY] log emits with reason=break_synthetic AND
+//      that Axis-2 ring + counters are cleared AND that 3 subsequent
+//      Axis-2 evaluations are SUPPRESSED by the cooldown.
+//
+// Default builds never call this; production paths unaffected.
+void cl_arq_controller::test_fire_policy_break_supremacy()
+{
+	sack_v2_enabled = true;
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+	current_configuration = 5;
+	negotiated_configuration = 5;
+
+	// Step 1 — prime Axis-2 + Axis-3 to non-default state.
+	printf("[TEST-BREAK-SUPREMACY] step 1: priming Axis-2 ring + Axis-3 mode "
+		"so supremacy reset is observable\n");
+	fflush(stdout);
+	for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.1f;
+	axis2_partial_rate_count = AXIS2_RING_DEPTH;
+	axis2_partial_rate_pos = 2;
+	axis2_consecutive_good_batches = AXIS2_UP_GOOD_RUN - 1;
+	axis2_consecutive_bad_batches = 0;
+	axis2_cooldown_batches = 0;
+	batch_size_proven_ceiling = 20;
+	batch_size_ceiling_recovery_batches = 15;
+	axis3_sack_mode = SACK_MODE_ON;
+	for(int i=0;i<AXIS3_RING_DEPTH;i++) axis3_recent_sack_ok[i] = true;
+	axis3_recent_sack_ok_count = AXIS3_RING_DEPTH;
+	axis3_consecutive_sack_misses = 0;
+	axis3_cooldown_batches = 0;
+	data_batch_size = 25;
+
+	// Step 2 — invoke supremacy hook with a synthetic BREAK reason.
+	printf("[TEST-BREAK-SUPREMACY] step 2: invoking supremacy hook "
+		"(reason=break_synthetic) — expect [POLICY-SUPREMACY] reason=break_synthetic\n");
+	fflush(stdout);
+	policy_axis1_supremacy_on_move(current_configuration,
+		current_configuration, "break_synthetic");
+	printf("[TEST-BREAK-SUPREMACY] post-hook state: axis2_cooldown=%d "
+		"axis3_cooldown=%d axis3_mode=%s proven_ceiling=%d recovery=%d\n",
+		axis2_cooldown_batches, axis3_cooldown_batches,
+		(axis3_sack_mode==SACK_MODE_OFF) ? "OFF"
+		: (axis3_sack_mode==SACK_MODE_ON) ? "ON"
+		: (axis3_sack_mode==SACK_MODE_PROBE) ? "PROBE" : "?",
+		batch_size_proven_ceiling, batch_size_ceiling_recovery_batches);
+	fflush(stdout);
+
+	// Step 3 — attempt 3 synthetic Axis-2 evaluations during cooldown.
+	// Re-prime good_run to threshold each time; cooldown MUST suppress the
+	// move. We use clean observations (partial=0) so the only reason no
+	// [POLICY-MOVE] fires is the cooldown gate (not a missing threshold).
+	for(int i=1;i<=3;i++)
+	{
+		axis2_consecutive_good_batches = AXIS2_UP_GOOD_RUN;
+		printf("[TEST-BREAK-SUPREMACY] step 3.%d: attempting Axis-2 eval — "
+			"expect SUPPRESSED (cooldown_remaining=%d on entry)\n",
+			i, axis2_cooldown_batches);
+		fflush(stdout);
+		policy_evaluate_axis2(data_batch_size, data_batch_size);
+	}
+	printf("[TEST-BREAK-SUPREMACY] complete: axis2_skipped_in_cooldown=%lld "
+		"axis2_move_up_count=%lld axis2_move_down_count=%lld\n",
+		axis2_skipped_in_cooldown, axis2_move_up_count, axis2_move_down_count);
+	fflush(stdout);
 }
 
 // SACK Design A Step 9 — synthetic Axis 1 fire (test-only entry point).
