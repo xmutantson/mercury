@@ -315,6 +315,66 @@ void cl_arq_controller::process_messages_rx_data_control()
 #endif
 				}
 
+				// SACK Design A Step 4 — RSP cross-batch routing decision.
+				// Gated on sack_v2_enabled (v1 path takes the same code path as
+				// pre-Step-4: v2_route_drop stays false, all storage proceeds).
+				// Per §4.2.3 + §4.3.4 invariant #3:
+				//   • match `rsp_current_expected_batch_seq_id`  → route to current
+				//   • match `rsp_prev_batch_seq_id` (Step 8 territory) → route to prev
+				//   • unknown / out-of-window                     → discard + log
+				// In today's mechanism-(a) traffic, retransmits carry the CURRENT
+				// batch_seq_id, so the prev path is dormant and the discard path
+				// must NOT fire in clean traffic. The discard branch is defensive
+				// scaffolding for the Step 8 retransmit-into-next-batch case.
+				bool v2_route_drop = false;
+				if(sack_v2_enabled)
+				{
+					int bsi = messages_rx_buffer.batch_seq_id;
+					test_rsp_bsi_v2_frame_counter++;
+					// Test scaffold: corrupt the Nth v2 DATA frame's bsi to a
+					// known-bad value (parsed + 7 mod 256). Falls outside both
+					// current_expected and prev, so it must trigger the discard
+					// branch. One-shot: cleared after firing exactly once.
+					if(test_rsp_bsi_corrupt_at > 0
+					   && test_rsp_bsi_v2_frame_counter == test_rsp_bsi_corrupt_at)
+					{
+						int orig = bsi;
+						bsi = (bsi + 7) & 0xFF;
+						printf("[RSP-V2-TEST-CORRUPT] frame#%d: bsi %d → %d "
+							"(synthetic discard test fault injection)\n",
+							test_rsp_bsi_v2_frame_counter, orig, bsi);
+						fflush(stdout);
+						test_rsp_bsi_corrupt_at = 0;  // one-shot
+					}
+					// Adopt current_expected from the first v2 DATA frame seen
+					// this session (initial state -1 = unset).
+					if(rsp_current_expected_batch_seq_id < 0)
+					{
+						rsp_current_expected_batch_seq_id = bsi;
+						printf("[RSP-V2-ADOPT] current_expected_batch_seq_id=%d "
+							"(first v2 DATA frame this session)\n", bsi);
+						fflush(stdout);
+					}
+					bool match_current = (bsi == rsp_current_expected_batch_seq_id);
+					bool match_prev    = (rsp_prev_batch_seq_id >= 0
+					                      && bsi == rsp_prev_batch_seq_id);
+					if(!match_current && !match_prev)
+					{
+						v2_route_drop = true;
+						rsp_v2_drop_count++;
+						printf("[RSP-V2-DROP] batch_seq_id=%d expected=%d prev=%d "
+							"reason=%s (drop_count=%lld)\n",
+							bsi, rsp_current_expected_batch_seq_id,
+							rsp_prev_batch_seq_id,
+							"unknown_or_out_of_window",
+							rsp_v2_drop_count);
+						fflush(stdout);
+					}
+				}
+
+				if(!v2_route_drop)
+				{
+
 				{
 					static cl_timer batch_rx_stopwatch;
 					if(batch_rx_frame_count == 0) batch_rx_stopwatch.start();
@@ -418,6 +478,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 				fflush(stdout);
 				set_receiving_timeout(rx_timeout);
 				receiving_timer.start();
+
+				}  // end if(!v2_route_drop) — SACK Design A Step 4 routing decision
 			}
 			messages_rx_buffer.status=FREE;
 			link_timer.start();
@@ -932,6 +994,22 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				}
 			}
 			stats.nAcks_sent_data += nAck_messages;
+
+			// SACK Design A Step 4 — full batch ACKed → bump current_expected.
+			// This is the ONLY site that bumps; SACK-partial paths above
+			// (line ~852-889) leave current_expected unchanged because the
+			// in-flight batch is not yet complete. Mechanism-(a) retransmits
+			// carry the same batch_seq_id, so they continue to match current.
+			// Per §4.3.4 invariant #2: monotonic +1 mod 256, never reset.
+			if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+			{
+				rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
+				rsp_current_expected_batch_seq_id =
+					(rsp_current_expected_batch_seq_id + 1) & 0xFF;
+				printf("[RSP-V2-BATCH-DONE] prev=%d next_expected=%d\n",
+					rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id);
+				fflush(stdout);
+			}
 		}
 		repeating_last_ack=NO;
 		messages_control.status=FREE;

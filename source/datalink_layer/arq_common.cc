@@ -149,6 +149,16 @@ cl_arq_controller::cl_arq_controller()
 	cmd_batch_seq_id=0;
 	captured_batch_seq_id_for_retransmit=-1;
 	last_received_batch_seq_id=-1;
+	// SACK Design A Step 4 — RSP cross-batch routing state. All gated on
+	// sack_v2_enabled; v1 path leaves these at their sentinels. Per §4.2.3,
+	// `current_expected` is adopted from the first v2 DATA frame received;
+	// `prev` stays -1 until the first ACK-GATE-PASS. `drop_count` tracks
+	// [RSP-V2-DROP] events for test assertions.
+	rsp_current_expected_batch_seq_id=-1;
+	rsp_prev_batch_seq_id=-1;
+	rsp_v2_drop_count=0;
+	test_rsp_bsi_corrupt_at=0;
+	test_rsp_bsi_v2_frame_counter=0;
 	crypto_buf[0].clear();
 	crypto_buf[1].clear();
 	message_transmission_time_ms=500;
