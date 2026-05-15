@@ -438,6 +438,54 @@ public:
   // Default builds never call this; production paths are unaffected.
   void test_fire_policy_axis1(int direction);
 
+  // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
+  //
+  // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:
+  //   - observable: mean(recent_partial_rate) over rolling 5-batch ring;
+  //     partial_rate = frames_lost / batch_size (from SACK_RSP bitmap on
+  //     SACK-partial, 0.0 on clean full-ACK).
+  //   - cadence: per-batch (called from process_messages_rx_acks_data after
+  //     SACK_RSP receipt + after clean full-batch ACK).
+  //   - action: step `data_batch_size` ±5, clamped to [AXIS2_BATCH_FLOOR,
+  //     AXIS2_BATCH_CEIL].
+  //   - hysteresis: up after >=8 consecutive good batches (partial<0.05) AND
+  //     mean<0.05; down after >=3 consecutive bad batches (partial>0.20) AND
+  //     mean>0.20; reset counters + ring on any move.
+  //   - axis-1 supremacy: skip when axis2_cooldown_batches > 0 (set by
+  //     policy_axis1_supremacy_on_move()). Cooldown decremented per call.
+  //
+  // On move: CMD calls add_message_control(SET_LINK_PARAMS) carrying the
+  // new batch size; RSP applies via set_data_batch_size() on receipt
+  // (arq_responder.cc SET_LINK_PARAMS handler). CMD applies locally on the
+  // same call. Both sides update before the NEXT batch starts (the existing
+  // RECEIVING_ACKS_CONTROL handshake gates the next data TX until SET_LINK_PARAMS
+  // is ACKed).
+  //
+  // Emits `[POLICY-MOVE] axis=2 from=N to=M reason=R mean_partial=X good=G bad=B`
+  // per §4.3.4 invariant #5 on every move. Gated on `sack_v2_enabled` at the
+  // call site; v1 sessions never call this.
+  //
+  // rx_count is the number of frames the receiver acknowledged for the just-
+  // completed batch (= batch_size on a clean full ACK, < batch_size when
+  // SACK reported missing slots). batch_size_observed is the data_batch_size
+  // value at the time this batch was sent (used to compute partial_rate
+  // *before* applying any new batch size).
+  void policy_evaluate_axis2(int rx_count, int batch_size_observed);
+
+  // SACK Design A Step 10 — synthetic Axis 2 fire (test-only).
+  // CLI: --test-policy-axis2-fire=up|down. Primes the partial-rate ring + the
+  // consecutive-good / consecutive-bad counters at the move threshold and
+  // calls policy_evaluate_axis2() once with a synthetic rx_count consistent
+  // with the requested direction. Demonstrates the [POLICY-MOVE] axis=2 + the
+  // SET_LINK_PARAMS TX path on a single one-shot fire. direction: 1=up,
+  // 2=down. No-op for any other value. Default builds never call this.
+  void test_fire_policy_axis2(int direction);
+
+  // SACK Design A Step 10 — Axis-2 cooldown helper. Decrement the cooldown
+  // counter by one (clamped at 0) and return the post-decrement value. Used
+  // by the Axis-1 supremacy hook to express "Axis 2 must wait N batches
+  // after any Axis 1 move." Pure-state, no logging.
+  int axis2_cooldown_tick();
 
   void process_messages_responder();
 	//! Adds the received data message to the buffer.
@@ -728,6 +776,64 @@ public:
                                          //      visibility window). Indicates
                                          //      a stalled retransmit cycle;
                                          //      logged via [RSP-V2-PREV-STALE].
+
+  // SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
+  // ALL CMD-side; gated on `sack_v2_enabled` at the call sites. v1 sessions
+  // never read or write these (they stay at sentinels). RSP keeps no Axis-2
+  // state of its own — RSP only RECEIVES SET_LINK_PARAMS and applies the
+  // new batch size; CMD owns the decision (§3.8 initiator-controls-flow).
+  //
+  // §4.3.1 state-space row 2: data_batch_size already exists; this block
+  // adds the observation window (rolling 5-batch ring) and the hysteresis
+  // counters. §4.3.2 thresholds: up at mean<0.05 AND >=8 good; down at
+  // mean>0.20 AND >=3 bad. Reset on any move. §4.3.3 cross-axis cooldown:
+  // skip when axis2_cooldown_batches > 0 (set to 3 by the Axis-1 supremacy
+  // hook on every Axis-1 move).
+  //
+  // §4.3.1 batch-size range nominally [10, 50]; Mercury's existing
+  // MAX_SACK_BATCH_SIZE=32 bitmap allocation caps the runtime ceiling to 32
+  // for Step 10 — documented in §7.10 RESULT. AXIS2_BATCH_FLOOR and
+  // AXIS2_BATCH_CEIL provide a single source of truth for clamping.
+  static const int AXIS2_BATCH_FLOOR = 10;
+  static const int AXIS2_BATCH_CEIL  = 32;  // capped by MAX_SACK_BATCH_SIZE
+  static const int AXIS2_STEP        = 5;
+  static const int AXIS2_RING_DEPTH  = 5;
+  static const int AXIS2_UP_GOOD_RUN = 8;  // §4.3.2 hysteresis: up after this many good batches
+  static const int AXIS2_DOWN_BAD_RUN = 3; // §4.3.2 hysteresis: down after this many bad batches
+  static const int AXIS2_CROSS_AXIS_COOLDOWN_BATCHES = 3; // §4.3.3 set by Axis-1 supremacy hook
+
+  float axis2_partial_rate_ring[AXIS2_RING_DEPTH];
+  int   axis2_partial_rate_count;        // [0..AXIS2_RING_DEPTH]; pre-fill before mean
+  int   axis2_partial_rate_pos;          // ring write index
+  int   axis2_consecutive_good_batches;  // partial_rate < 0.05 hits
+  int   axis2_consecutive_bad_batches;   // partial_rate > 0.20 hits
+  int   axis2_cooldown_batches;          // §4.3.3 Axis-1 supremacy cooldown — Axis-2
+                                         //      skips evaluation while >0; decremented
+                                         //      per evaluation call.
+  long long axis2_evaluations;           // count of policy_evaluate_axis2() calls
+  long long axis2_move_up_count;         // count of step-up moves
+  long long axis2_move_down_count;       // count of step-down moves
+  long long axis2_skipped_in_cooldown;   // count of evaluations skipped due to cooldown
+  // Test-scaffold for synthetic Axis-2 fire (CLI --test-policy-axis2-fire=up|down).
+  // 0 = off; 1 = up; 2 = down. One-shot — cleared after firing.
+  int   test_policy_axis2_fire_armed;
+  // Test-scaffold to demonstrate the cross-axis cooldown:
+  // --test-cmd-axis2-suppressed-after-axis1=1 fires synthetic Axis-1
+  // moves followed by attempted Axis-2 fires, and asserts they are
+  // suppressed for the cooldown duration.
+  int   test_cmd_axis2_suppressed_after_axis1;
+  // RSP-side diagnostic counters for SET_LINK_PARAMS receipt.
+  long long rsp_set_link_params_rx_count;       // CRC-valid SET_LINK_PARAMS received
+  long long rsp_set_link_params_crc_fail_count; // CRC failed; ignored
+
+  // CMD-side staging fields used by add_message_control(SET_LINK_PARAMS)
+  // to read the target batch size + sack_mode that the Axis-2 (Step 10) /
+  // Axis-3 (Step 11) controllers decided on. policy_evaluate_axis2() writes
+  // these before calling add_message_control(SET_LINK_PARAMS); the control
+  // frame's data payload is built from them. Sentinels: -1 = unset (caller
+  // will substitute current data_batch_size / 1=ON).
+  int pending_link_params_batch_size;
+  int pending_link_params_sack_mode;
 
   // Responder: double-buffered crypto batch storage
   st_crypto_batch_buffer crypto_buf[2]; // [0] = oldest pending, [1] = current

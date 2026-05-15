@@ -2074,20 +2074,90 @@ void cl_arq_controller::process_control_responder()
 			connection_status=ACKNOWLEDGING_DATA;
 		}
 	}
-	else if(link_status==CONNECTED && code==SET_LINK_PARAMS)
+	else if((link_status==CONNECTED || link_status==DROPPED) && code==SET_LINK_PARAMS)
 	{
-		// SACK Design A §4.3.2 / §4.4 scaffolding (Step 5).
-		// Pure wire-format addition: log receipt and free the control slot.
-		// No state mutation, no peer-visible response. CMD-side sender does
-		// not yet exist; this branch is exercised only by later steps.
-		// Existing peers that do not recognize 0x43 fall through to the
-		// final `else` block below and likewise ignore it — verified before
-		// landing this step (process_control_responder dispatch is closed
-		// over a fixed code list; unknown codes are silently dropped).
-		printf("[RSP-LINK-PARAMS] SET_LINK_PARAMS received (len=%d) — no-op stub (Step 5)\n",
-			messages_control.length);
-		fflush(stdout);
-		messages_control.status = FREE;
+		// SACK Design A Step 10 — RSP-side SET_LINK_PARAMS handler.
+		// Note: link_status DROPPED accepted too because the lossy paths that
+		// motivate Axis-2 (channel just dropped batches → CMD is shrinking
+		// batch_size) often coincide with the RSP transiently reading the
+		// link as DROPPED. The CMD's intent is to push the new batch size
+		// regardless — accepting in DROPPED gives the link a faster recovery.
+		//
+		// Wire format (§4.4): [code, batch_size_u8, sack_mode_u8, CRC8]
+		// CRC8 covers data[1..2] only (the standard 3-byte msg header has its
+		// own LDPC + CRC16 integrity; that's already validated by the time
+		// we reach this code path).
+		//
+		// On CRC-pass: apply the new batch size via set_data_batch_size()
+		// and log [RSP-LINK-PARAMS] APPLIED. Step 11 will also pick up
+		// sack_mode; Step 10 only consumes batch_size.
+		// On CRC-fail: ignore + log + bump fail counter (§4.3.4 invariant 3
+		// "no silent corruption" — CMD will time out and retransmit, exactly
+		// as if the OFDM control frame had been lost on the air).
+		//
+		// Note: messages_control.length is hardcoded to 1 on the RX path
+		// (arq_responder.cc:267) for all incoming control frames — the
+		// authoritative payload length is in messages_rx_buffer at receive
+		// time but is not preserved across the dispatch boundary. SET_CONFIG
+		// works around this by reading data[1] and data[2] unconditionally
+		// (knowing the format is fixed). SET_LINK_PARAMS has a fixed 4-byte
+		// payload — so we likewise read data[0..3] unconditionally, gating
+		// the CRC check on sack_v2_enabled (the only path that can produce
+		// these wire bytes).
+		if(sack_v2_enabled)
+		{
+			int new_batch_u8   = (unsigned char)messages_control.data[1];
+			int new_sack_u8    = (unsigned char)messages_control.data[2];
+			unsigned char rx_crc = (unsigned char)messages_control.data[3];
+			unsigned char computed_crc = CRC8_calc(
+				(char*)&messages_control.data[1], 2);
+			if(rx_crc != computed_crc)
+			{
+				rsp_set_link_params_crc_fail_count++;
+				printf("[RSP-LINK-PARAMS-CRC-FAIL] rx_crc=0x%02x computed=0x%02x "
+					"batch=%d sack_mode=%d (discarding; CMD will retransmit) "
+					"fail_count=%lld\n",
+					rx_crc, computed_crc, new_batch_u8, new_sack_u8,
+					rsp_set_link_params_crc_fail_count);
+				fflush(stdout);
+				// Discard frame; do NOT ACK. CMD's existing control-frame
+				// timeout will fire and resend.
+				messages_control.status = FREE;
+			}
+			else
+			{
+				// Clamp to the AXIS2 range — defensive. RSP trusts CMD's
+				// decision but rejects out-of-range values.
+				int target = new_batch_u8;
+				if(target < AXIS2_BATCH_FLOOR) target = AXIS2_BATCH_FLOOR;
+				if(target > AXIS2_BATCH_CEIL)  target = AXIS2_BATCH_CEIL;
+
+				int old_batch = data_batch_size;
+				set_data_batch_size(target);
+				recalculate_ack_timeout_for_batch();
+				rsp_set_link_params_rx_count++;
+				printf("[RSP-LINK-PARAMS] APPLIED batch %d -> %d sack_mode=%d "
+					"(crc8=0x%02x rx_count=%lld) — Step 11 will consume sack_mode\n",
+					old_batch, data_batch_size, new_sack_u8,
+					rx_crc, rsp_set_link_params_rx_count);
+				fflush(stdout);
+				// ACK the control frame via the normal control-ACK path —
+				// the existing process_messages_acknowledging_control() flow
+				// will TX a control ACK once we mark it RECEIVED.
+				connection_status = ACKNOWLEDGING_CONTROL;
+				link_timer.start();
+				watchdog_timer.start();
+			}
+		}
+		else
+		{
+			// v2 not negotiated — should not happen on a well-behaved peer
+			// (a v1-only peer never emits 0x43). Log and free.
+			printf("[RSP-LINK-PARAMS] received len=%d v2=%d — IGNORED (v2 not negotiated)\n",
+				messages_control.length, (int)sack_v2_enabled);
+			fflush(stdout);
+			messages_control.status = FREE;
+		}
 	}
 	else
 	{
