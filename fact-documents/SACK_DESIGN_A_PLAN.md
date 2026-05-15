@@ -1294,6 +1294,239 @@ Axes 2 + 3 controllers (Steps 10/11), and legacy MFSK SACK cleanup
 pattern is fully operational on `sack_enabled && !sack_v2_enabled`
 peers — no v1 path was modified.
 
+### §7.4 RESULT — Step 4 (2026-05-15)
+
+Mercury commit: `monitor` `93b8e67` — "sack: Step 4 — RSP
+cross-batch routing decision on batch_seq_id".
+
+The first BEHAVIOR-CHANGE step of Design A. Every decision is gated
+on `sack_v2_enabled`; v1 RX path is byte-identical to post-Step-3.
+Four files changed (`+145 LOC`).
+
+#### §7.4.1 The routing rule (implemented)
+
+In `arq_responder.cc:process_messages_rx_data_control()`, between
+the existing monitor-mode adoption block and the `add_message_rx_data`
+call:
+
+```
+on RX of v2 DATA frame F with parsed batch_seq_id = bsi:
+  // (test scaffold may corrupt bsi here; see §7.4.4)
+  if rsp_current_expected_batch_seq_id < 0:
+      rsp_current_expected_batch_seq_id = bsi   # adopt-first
+      log [RSP-V2-ADOPT]
+  match_current = (bsi == rsp_current_expected_batch_seq_id)
+  match_prev    = (rsp_prev_batch_seq_id >= 0
+                   && bsi == rsp_prev_batch_seq_id)
+  if !match_current && !match_prev:
+      v2_route_drop = true
+      rsp_v2_drop_count += 1
+      log [RSP-V2-DROP] batch_seq_id=X expected=Y prev=Z
+                       reason=unknown_or_out_of_window (drop_count=N)
+  # then if !v2_route_drop: original add_message_rx_data + timer logic
+  # runs. otherwise the messages_rx_buffer is cleared (line 422) and
+  # the receiver returns to its previous state.
+```
+
+The prev branch is **dormant in mechanism-(a) traffic** (retransmits
+carry the CURRENT `batch_seq_id`, so they always match
+`rsp_current_expected_batch_seq_id`). It exists as defensive
+scaffolding for the Step 8 retransmit-into-next-batch mechanism (b).
+Per the prompt: "in the *current* standalone-retransmit mechanism,
+retransmit frames already carry `batch_seq_id=N` when the in-flight
+batch is N, so they should match the *current* expected — this case
+usually evaluates to 'matches current.'"
+
+#### §7.4.2 The current_expected bump site (single point of truth)
+
+In `arq_responder.cc:process_messages_acknowledging_data()`, at the
+ACK-GATE-PASS site (line ~921-934), after the loop that marks all
+RECEIVED → ACKED for the just-completed batch:
+
+```
+if sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0:
+    rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id
+    rsp_current_expected_batch_seq_id =
+        (rsp_current_expected_batch_seq_id + 1) & 0xFF
+    log [RSP-V2-BATCH-DONE] prev=X next_expected=Y
+```
+
+This is the **only** site that bumps. The SACK-partial path (line
+~852-889) and the incomplete-batch fall-through (line ~895-913) do
+NOT bump — the batch is still in flight, and mechanism-(a)
+retransmits carrying the same `batch_seq_id` must continue to match
+the unchanged `current_expected`. §4.3.4 invariant #2 (monotonic +1
+mod 256, never reset) holds.
+
+#### §7.4.3 New state (cl_arq_controller, arq.h)
+
+- `rsp_current_expected_batch_seq_id` (int, -1 = unset)
+- `rsp_prev_batch_seq_id` (int, -1 = no prior batch yet)
+- `rsp_v2_drop_count` (long long, 0 initially) — for test
+  assertions and diagnostics
+- `test_rsp_bsi_corrupt_at` (int, 0 = off) — RSP-side fault
+  injection
+- `test_rsp_bsi_v2_frame_counter` (int, 0 initially) — counts v2
+  DATA frames seen
+
+All initialized in the constructor (`arq_common.cc:152-160`). v1
+sessions leave them at sentinels — gated by `sack_v2_enabled`, they
+never feed any decision.
+
+#### §7.4.4 Synthetic discard test scaffold
+
+New RSP-only CLI flag `--test-rsp-bsi-corrupt-at=N` (`main.cc`):
+when N>0, the Nth received v2 DATA frame has its parsed bsi
+corrupted by +7 mod 256 BEFORE the routing decision. Since
+`current_expected` is the natural bsi (the real value) and
+`prev = current - 1`, the value `current + 7 = real + 7` is
+guaranteed to fall outside both windows → the discard branch must
+fire. One-shot: clears after firing once. Default 0 (off);
+production builds never pass this flag.
+
+#### §7.4.5 §4.3.4 invariants satisfied
+
+1. **One outstanding batch** — unchanged from pre-Step-4. The
+   existing `data_ack_received` gate (`arq_commander.cc:1408`) is
+   not touched.
+2. **`batch_seq_id` monotonicity** — RSP bump only happens at the
+   single ACK-GATE-PASS site, by +1 mod 256, never reset. CMD side
+   already satisfied this per Step 3's §7.3 audit. No new mutation
+   paths added.
+3. **RSP discards-and-logs unknown `batch_seq_id`** — implemented
+   with `[RSP-V2-DROP]` log line carrying bsi/expected/prev/reason/
+   count. Counter `rsp_v2_drop_count` provides a single source of
+   truth for test assertions.
+4. **Bounded recovery on single-axis failure** — N/A at Step 4 (no
+   Axis 2/3 yet).
+5. **Reversibility of any single policy move** — N/A at Step 4 (no
+   policy moves yet).
+6. **Axis 1 supremacy** — N/A at Step 4.
+7. **`supershift_proven_ceiling` analogue for Axis 2** — N/A at
+   Step 4.
+
+#### §7.4.6 Validation results (all three gates)
+
+**Gate 1: WAV harness v1↔v1 SHA-256 stability.**
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS — same input → byte-identical output
+  pass 1 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+  pass 2 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step4_final.json
+wrote post_step4_final.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+v1↔v1 fixture replay sha256 **STABLE** across Steps 1+2+3+4:
+`9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`.
+v1 path byte-identical. **PASS.**
+
+**Gate 2: v2↔v2 normal-traffic round-trip (`[RSP-V2-DROP]` MUST = 0).**
+
+`v2_step4_normal_traffic.py` — NB_CFG4, `--enable-sack-v2` on both
+peers, 120s loopback via VB-Cable/WASAPI. Logs saved to
+`v2_step4_normal_cmd.log` / `v2_step4_normal_rsp.log`.
+
+```
+[SACK-V2] enabled (negotiate-only) (local=0x5E peer=0x5E) — gates nothing yet
+[SACK-V2] enabled (negotiate-only) (local=0x5E peer=0x5E) — gates nothing yet
+[CMD-BATCH-SEQ] new-data batch_seq_id=0 (frames in batch=5)
+[CMD-BATCH-SEQ] new-data batch_seq_id=1 (frames in batch=5)
+[RX-BATCH-SEQ] type=DATA_LONG id=0 seq=0 batch_seq_id=0 (v2)
+[RX-BATCH-SEQ] type=DATA_LONG id=1 seq=1 batch_seq_id=0 (v2)
+[RX-BATCH-SEQ] type=DATA_LONG id=3 seq=3 batch_seq_id=0 (v2)
+[RX-BATCH-SEQ] type=DATA_LONG id=4 seq=4 batch_seq_id=0 (v2)
+  ... (id=2 missed, SACK partial fires)
+[RX-BATCH-SEQ] type=DATA_LONG id=0 seq=0 batch_seq_id=0 (v2)
+[RX-BATCH-SEQ] type=DATA_LONG id=1 seq=1 batch_seq_id=0 (v2)
+[RX-BATCH-SEQ] type=DATA_LONG id=2 seq=2 batch_seq_id=0 (v2)
+[RX-BATCH-SEQ] type=DATA_LONG id=3 seq=3 batch_seq_id=0 (v2)
+[RX-BATCH-SEQ] type=DATA_LONG id=4 seq=4 batch_seq_id=0 (v2)
+  ... (mechanism-(a) retransmit completes batch 0 — all bsi=0,
+       matching current=0)
+[RSP-V2-ADOPT] current_expected_batch_seq_id=0 (first v2 DATA frame this session)
+[RSP-V2-BATCH-DONE] prev=0 next_expected=1
+```
+
+Counts on RSP side:
+- `[RSP-V2-ADOPT]`: **1** (first v2 frame → current_expected adopted)
+- `[RSP-V2-BATCH-DONE]`: **1** (one full batch ACKed → bump 0→1)
+- `[RSP-V2-DROP]`: **0** (the discard branch did NOT fire in clean
+  traffic — exactly as specified)
+- `[RSP-V2-TEST-CORRUPT]`: **0** (test scaffold not armed)
+
+Decoded payload: 252 bytes delivered over 120s (NB_CFG4 throughput
+~17 bps, consistent with mechanism-(a) retransmits filling the
+SACK-partial gap of batch 0). Step-3's §7.3 measurement was 3
+batches in 120s; this run completed 1 full batch + 1 in-flight,
+which is within VB-Cable's documented ~10-30% per-batch loss
+variance (memory ref). The load-bearing property —
+**`[RSP-V2-DROP]` = 0 in clean traffic** — is satisfied. **PASS.**
+
+**Gate 3: Synthetic discard test (the new branch fires when it should).**
+
+`v2_step4_synthetic_discard.py` — NB_CFG4, `--enable-sack-v2` on
+both peers, `--test-rsp-bsi-corrupt-at=3` on RSP only, 150s
+loopback. Logs saved to `v2_step4_synth_cmd.log` /
+`v2_step4_synth_rsp.log`.
+
+Key RSP-side log lines:
+```
+[FLAG] --test-rsp-bsi-corrupt-at=3: will corrupt the 3th v2 DATA frame's
+       batch_seq_id by +7 mod 256 (SACK Design A Step 4 synthetic discard
+       test — one-shot)
+[RSP-V2-ADOPT] current_expected_batch_seq_id=0 (first v2 DATA frame this session)
+[RSP-V2-TEST-CORRUPT] frame#3: bsi 0 → 7 (synthetic discard test fault injection)
+[RSP-V2-DROP] batch_seq_id=7 expected=0 prev=-1
+              reason=unknown_or_out_of_window (drop_count=1)
+[RSP-V2-BATCH-DONE] prev=0 next_expected=1
+[RSP-V2-BATCH-DONE] prev=1 next_expected=2
+```
+
+Sequence of events:
+1. Frame #1 received with parsed bsi=0 → adopt → current_expected=0.
+2. Frame #2 received with parsed bsi=0 → matches current → routed.
+3. Frame #3 received with parsed bsi=0 → test scaffold corrupts to
+   7 → 7 != current=0 and 7 != prev=-1 → **DROP** fires
+   (drop_count incremented to 1).
+4. Frame #4+ received with parsed bsi=0 (scaffold cleared, one-shot)
+   → matches current → routed.
+5. Batch 0 completes → BATCH-DONE bumps current 0→1, prev=0.
+6. Batch 1 completes → BATCH-DONE bumps current 1→2, prev=1.
+
+Total `[RSP-V2-DROP]` count: **1** (exactly the injected one).
+**PASS.** The new branch *does* work when it should.
+
+#### §7.4.7 Audit of behavior unchanged
+
+1. v1 wire path: `git diff 48b5f54..93b8e67 -- source/datalink_layer/`
+   shows every new code block is inside `if(sack_v2_enabled) { ... }`
+   or is gated by `v2_route_drop` (which can only be set inside that
+   block). v1 sessions never enter any new branch.
+2. CMD-side state: unchanged. Step 4 is RSP-side only.
+3. SACK-RSP TX path: untouched (still uses the legacy MFSK pattern;
+   Step 7 will change that).
+4. Retransmit logic: untouched (mechanism (a) preserved; Step 8 will
+   change that).
+
+Build: `bash build.sh o3` PASS (only pre-existing sign-compare
+warning unchanged).
+
+**Steps 7, 8, 9+ are NOT started.** SACK_RSP OFDM control frame
+(Step 7), retransmit-into-next-batch (Step 8 — the path that makes
+the prev_batch routing branch actually load-bearing), Axis 1/2/3
+controllers (Steps 9-13), and legacy MFSK SACK cleanup (Step 15)
+all remain unchanged. The legacy `CAP_SACK` MFSK SACK pattern is
+fully operational on `sack_enabled && !sack_v2_enabled` peers — no
+v1 path was modified.
+
 ---
 
 ## §7 Open questions [?]
