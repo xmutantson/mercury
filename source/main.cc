@@ -294,6 +294,7 @@ int main(int argc, char *argv[])
     int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 0 post-SACK_FIX_PLAN §7 step 3)
     bool no_sack_cli = false;          // --no-sack: force disable (no-op after B2 fix)
     bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
+    bool enable_sack_v2_cli = false;   // --enable-sack-v2: SACK Design A Step 6 (negotiate-only opt-in)
     bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
     int audio_buffer_ms_cli = 0;       // --alsa-buffer-ms=N (Linux only; 0 = use 30ms default)
     char log_file_path[512] = "";     // --log: tee stdout to file
@@ -535,6 +536,14 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--enable-sack") == 0)
         {
             enable_sack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--enable-sack-v2") == 0)
+        {
+            // SACK Design A Step 6: opt-in to CAP_SACK_V2 advertisement.
+            // Negotiate-only at this step — sack_v2_enabled gates nothing yet.
+            enable_sack_v2_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1253,6 +1262,19 @@ start_modem:
         if (no_sack_cli && enable_sack_cli) {
             fprintf(stderr, "ERROR: cannot pass both --no-sack and --enable-sack\n");
             exit(1);
+        }
+        if (enable_sack_v2_cli) {
+            // SACK Design A Step 6 scaffolding: opt-in to CAP_SACK_V2
+            // advertisement. Wire effect: byte 5 of TEST_CONNECTION carries
+            // the CAP_SACK_V2 bit ORed into local_capability. No other wire
+            // change — sack_v2_enabled is computed by both peers but gates
+            // nothing functional at this step. Default builds do NOT set
+            // this bit, preserving byte-for-byte TEST_CONNECTION shape on
+            // v1-only sessions.
+            ARQ.enable_sack_v2 = true;
+            ARQ.local_capability |= CAP_SACK_V2;
+            printf("[FLAG] --enable-sack-v2: CAP_SACK_V2 added to local_capability "
+                   "(negotiate-only; gates nothing yet — SACK Design A Step 6)\n");
         }
         if (test_sack_ldpc_fail_cli) {
             ARQ.force_sack_ldpc_fail = true;

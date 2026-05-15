@@ -126,6 +126,8 @@ cl_arq_controller::cl_arq_controller()
 
 	// SACK state initialization
 	sack_enabled=false;
+	sack_v2_enabled=false;   // Step 6 scaffolding (negotiate-only; gates nothing yet)
+	enable_sack_v2=false;    // Step 6 scaffolding (CLI opt-in; default off → byte 5 unchanged)
 	radio_batch_size=25;
 	crypto_batch_size=20;
 	retransmit_headroom=5;
@@ -178,6 +180,7 @@ cl_arq_controller::cl_arq_controller()
 	force_sack_ldpc_fail=false;  // CLI --test-sack-ldpc-fail repro toggle (off in production)
 	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;
 	if(disable_sack) local_capability &= ~CAP_SACK;
+	if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding (default-off opt-in)
 	peer_capability=0;
 	wb_upgrade_pending=false;
 	psk_mismatch_pending=false;
@@ -2339,6 +2342,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		commander_configured_nb=narrowband_enabled;
 		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
+		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2437,6 +2441,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		set_role(RESPONDER);
 		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
+		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2474,6 +2479,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		bandwidth_mode = BW_NB_ONLY;
 		local_capability = CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
+		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -2493,6 +2499,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		bandwidth_mode = BW_AUTO;
 		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
+		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2513,6 +2520,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		bandwidth_mode = BW_AUTO;
 		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
+		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif

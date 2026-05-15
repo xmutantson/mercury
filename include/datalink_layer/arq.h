@@ -411,6 +411,12 @@ public:
 
   // SACK: Selective ACK for partial batch retransmission
   bool sack_enabled;                   // Negotiated: both sides have CAP_SACK
+  bool sack_v2_enabled;                // SACK Design A scaffolding (Step 6): both sides have CAP_SACK_V2.
+                                       // NEGOTIATE-ONLY at this step — gates no behavior yet.
+  bool enable_sack_v2;                 // CLI opt-in to advertise CAP_SACK_V2 in local_capability.
+                                       // Persists across local_capability resets (CONNECT/LISTEN
+                                       // re-entry) so the negotiation survives mid-session resets.
+                                       // Default false — byte 5 of TEST_CONNECTION is unchanged.
   int radio_batch_size;                // Total frames per radio TX (e.g., 25)
   int crypto_batch_size;               // Frames per encryption unit (e.g., 20)
   int retransmit_headroom;             // radio_batch_size - crypto_batch_size (e.g., 5)

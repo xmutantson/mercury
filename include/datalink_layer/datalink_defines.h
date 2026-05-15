@@ -99,6 +99,13 @@
 #define CAP_ENCRYPTION   0x08   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
 #define CAP_STREAMING    0x10   // Supports streaming compression context (PPMd carry + zstd prefix)
 #define CAP_SACK         0x20   // Supports selective ACK (partial batch retransmission)
+#define CAP_SACK_V2      0x40   // SACK Design A (OFDM SACK_RSP + DATA batch_seq_id + multi-axis gearshift)
+                                // Phase: NEGOTIATE-ONLY. Setting this bit currently gates NO
+                                // behavior — the sack_v2_enabled flag is computed (both peers
+                                // must advertise it) and logged but does not change any wire
+                                // path. Opt-in via --enable-sack-v2 CLI flag; default builds
+                                // do NOT set it in local_capability, so byte 5 of
+                                // TEST_CONNECTION is bit-identical to pre-Step-6 by default.
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
