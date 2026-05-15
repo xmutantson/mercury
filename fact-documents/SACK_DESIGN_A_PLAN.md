@@ -763,6 +763,78 @@ are flagged.
   Revised order: 0, 5, 6 (negotiation only), 1+2+3 together (gated on
   sack_v2_enabled), 4, 7, 8, 9-13, 14, 15.
 
+### §7.0 RESULT — Step 0 (2026-05-15)
+
+Tool committed: workspace `monitor` `593aaf1` —
+`tools/sack_redesign_wav_ab.py` (691 LOC, single file).
+
+Reuse:
+- `tools/sack_lossy_ab.py:263` `parse_mercury_logs(cmd_text, rsp_text)` —
+  imported verbatim. Pure-text regex parser; deterministic given identical
+  inputs. This is what makes the harness's grading layer byte-stable.
+- `mercury/tools/mercury_benchmark.py:457` `MercurySession` — composed into
+  the optional `--live` mode for WASAPI+VB-Cable runs (acknowledged
+  non-deterministic at the audio layer; grading still deterministic).
+- `tools/analyze_sack_wav.py:14` `read_wav` pattern — re-implemented via
+  Python's stdlib `wave` module to drop the `numpy` dependency for the
+  hashing path (`tools/sack_redesign_wav_ab.py:181`).
+
+Verifying test (the Step 0 §7 row): PASS.
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] pass 1: building result from synthetic fixtures...
+[STEP0-SELFTEST] pass 2: rebuilding result from same fixtures...
+[STEP0-SELFTEST] pass 1 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+[STEP0-SELFTEST] pass 2 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+[STEP0-SELFTEST] pass 1 bytes : 4323
+[STEP0-SELFTEST] pass 2 bytes : 4323
+[STEP0-SELFTEST] PASS — same input → byte-identical output (and different input → different output, as expected).
+```
+
+Also verified PASS:
+1. Same harness run twice in two SEPARATE Python invocations (different
+   PIDs, different `PYTHONHASHSEED`) — identical exit codes, identical
+   internal hash.
+2. Replay-mode with bundled fixtures written to disk and consumed via
+   `--a-cmd-log/--a-rsp-log` flags across two separate `python` invocations
+   — sha256 of `--out` JSON identical (`957bfd9e…73c386e5`, 8897 bytes).
+
+Non-determinism caveats (mercury source, read-only audit):
+1. `source/datalink_layer/arq_responder.cc:1218`
+   `messages_control.data[1]=1+rand()%0xfe;` — connection_id is random per
+   session. Observable in logs (different conn_id byte per run). Affects
+   **mercury runs**, NOT the harness's grading of stored logs. Documented
+   as a caveat. Mitigation if later needed: add a `--connection-id <byte>`
+   CLI flag to mercury (Step 1+ territory; out of scope for Step 0).
+2. `source/physical_layer/awgn.cc:33-39` `cl_awgn::set_seed(long)` — AWGN
+   is seeded by `telecom_system.cc:4700` `awgn_channel.set_seed(rand())`.
+   The outer `rand()` is never explicitly `srand()`-ed in mercury source.
+   On both Linux and Windows libc, the implicit seed is 1, so it is
+   reproducible **per-process** — but this is a libc implementation detail
+   and not a guarantee. Affects only the `-Z` noise-injection path (PHY
+   tests); the ARQ-level grading harness operates on logs, not on raw
+   PHY samples, so this is not load-bearing for Step 0.
+3. `source/physical_layer/telecom_system.cc:3829, 3919; ofdm.cc:913` use
+   `__srandom()` (vendored glibc random from `os_interop.cc:379`) for
+   bit-energy-dispersal and OFDM scrambling, seeded with a fixed
+   `bit_energy_dispersal_seed`. **Deterministic.** No caveat.
+4. Real-time audio path (WASAPI shared-mode) adds buffer-scheduling jitter
+   (~5–15 ms/buffer), PTT-delay timers are clock-based, and TCP-data-port
+   sends are Nagle-batched at variable boundaries. These break byte-level
+   determinism on **any** live mercury run, which is why Step 0 separates
+   the "live run" (acknowledged non-deterministic) from the "grading"
+   (proven byte-deterministic by `--self-test`). The next 15 steps depend
+   on the **grading** being deterministic; they do not depend on the live
+   run being deterministic.
+
+Mercury source was **not modified** for Step 0, per the plan's "Step 0 only,
+workspace tooling only" constraint.
+
+Plan doc commit (this entry): mercury `monitor` (next commit on this branch).
+
+Step 1 is NOT started.
+
 ---
 
 ## §7 Open questions [?]
