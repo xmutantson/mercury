@@ -723,6 +723,12 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 			messages_tx[i].nResends=this->nResends;
 			messages_tx[i].ack_timeout=this->ack_timeout_data;
 			messages_tx[i].status=ADDED_TO_LIST;
+			// SACK Design A Step 3 — batch_seq_id is assigned by
+			// process_messages_tx_data() at the moment the frame is moved into
+			// the outgoing batch (so that the value matches the actual batch
+			// being keyed). Initialize to -1 (sentinel "unset") here so that
+			// a defensive read before assignment is visible in logs.
+			messages_tx[i].batch_seq_id=-1;
 			success=SUCCESSFUL;
 			break;
 		}
@@ -753,9 +759,24 @@ void cl_arq_controller::process_messages_tx_data()
 			// Do NOT set end-of-batch flag — RSP already has the expected count
 			// from the original batch's compression header or end-of-batch frame.
 			messages_batch_tx[message_batch_counter_tx].sequence_number = retransmit_frame_positions[r];
+			// SACK Design A Step 3 — retransmit frames carry their ORIGINAL
+			// batch_seq_id (the one the frame was first sent under). This
+			// preserves the §4.3.4 invariant 2 "retransmits carry original
+			// batch_seq_id, never current cmd_batch_seq_id". For v1 sessions
+			// (sack_v2_enabled=false) the field is unused (not on the wire).
+			messages_batch_tx[message_batch_counter_tx].batch_seq_id = retransmit_frame_batch_seq_ids[r];
 			message_batch_counter_tx++;
 			stats.nReSent_data++;
 			last_transmission_block_stats.nReSent_data++;
+		}
+		if(sack_v2_enabled)
+		{
+			printf("[CMD-RETX-V2] retransmit batch carries original batch_seq_ids:");
+			for(int r = 0; r < message_batch_counter_tx; r++)
+				printf(" %d", messages_batch_tx[r].batch_seq_id);
+			printf(" (current cmd_batch_seq_id=%d — NOT used for retransmits)\n",
+				cmd_batch_seq_id & 0xFF);
+			fflush(stdout);
 		}
 		retransmit_count = 0;  // Consumed
 
@@ -799,15 +820,28 @@ void cl_arq_controller::process_messages_tx_data()
 		return;
 	}
 
+	// SACK Design A Step 3 — batch_seq_id assignment on new-data batch build.
+	// New-data frames (ADDED_TO_LIST) get assigned cmd_batch_seq_id (the
+	// counter for the batch they're about to ride). Retransmit frames
+	// (ACK_TIMED_OUT) keep their existing batch_seq_id (set on first send) —
+	// retransmits MUST carry their ORIGINAL batch_seq_id per §4.3.4 invariant 2.
+	// The counter increments after the batch is dispatched, and only if at
+	// least one new-data frame was included (so a pure-resends-no-new-data
+	// batch in this mixed path does not bump the counter — that path is
+	// rare because the SACK retransmit-only path above handles the common case).
+	bool batch_includes_new_data = false;
 	for(int i=0;i<this->nMessages;i++)
 	{
 		if(messages_tx[i].status==ADDED_TO_LIST)
 		{
 			if(message_batch_counter_tx<data_batch_size)
 			{
+				// Assign the current new-data batch's batch_seq_id.
+				messages_tx[i].batch_seq_id = (cmd_batch_seq_id & 0xFF);
 				messages_batch_tx[message_batch_counter_tx]=messages_tx[i];
 				message_batch_counter_tx++;
 				messages_tx[i].status=ADDED_TO_BATCH_BUFFER;
+				batch_includes_new_data = true;
 				stats.nSent_data++;
 				last_transmission_block_stats.nSent_data++;
 			}
@@ -818,6 +852,8 @@ void cl_arq_controller::process_messages_tx_data()
 			{
 				if(message_batch_counter_tx<data_batch_size)
 				{
+					// Retransmit: keep existing batch_seq_id (original value
+					// from first send). Do not reassign.
 					messages_batch_tx[message_batch_counter_tx]=messages_tx[i];
 					message_batch_counter_tx++;
 					messages_tx[i].status=ADDED_TO_BATCH_BUFFER;
@@ -844,8 +880,22 @@ void cl_arq_controller::process_messages_tx_data()
 		pad_messages_batch_tx(data_batch_size);
 		mtl::log_event_kv("cmd_batch_tx_start", "batch=%lld nframes=%d cfg=%d",
 		                  stats.nBatches_sent + 1, data_batch_size, current_configuration);
+		if(sack_v2_enabled && batch_includes_new_data)
+		{
+			printf("[CMD-BATCH-SEQ] new-data batch_seq_id=%d (frames in batch=%d)\n",
+				cmd_batch_seq_id & 0xFF, message_batch_counter_tx);
+			fflush(stdout);
+		}
 		send_batch();
 		mtl::log_event_kv("cmd_batch_tx_done", "batch=%lld", stats.nBatches_sent + 1);
+		// SACK Design A Step 3 — increment cmd_batch_seq_id mod 256 only if
+		// this batch actually carried new-data frames. §4.3.4 invariant 2:
+		// the counter is independent of set_data_batch_size() — that function
+		// only mutates data_batch_size and never touches cmd_batch_seq_id.
+		if(batch_includes_new_data)
+		{
+			cmd_batch_seq_id = (cmd_batch_seq_id + 1) & 0xFF;
+		}
 		stats.nBatches_sent++;
 		last_transmission_block_stats.nBatches_sent++;
 
@@ -1475,6 +1525,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						retransmit_frame_lengths[retransmit_count] = len;
 						retransmit_frame_positions[retransmit_count] = i;
 						retransmit_frame_types[retransmit_count] = messages_tx[i].type;
+						// SACK Design A Step 3 — capture the ORIGINAL batch_seq_id this
+						// frame was first sent under. The retransmit-only batch (built
+						// at arq_commander.cc:727+) will resurrect this value rather
+						// than use the current cmd_batch_seq_id (which now points at
+						// the NEXT new-data batch).
+						retransmit_frame_batch_seq_ids[retransmit_count] = messages_tx[i].batch_seq_id;
 						retransmit_count++;
 						// Mark ACKED so cleanup() frees the slot (payload saved above)
 						messages_tx[i].status = ACKED;
