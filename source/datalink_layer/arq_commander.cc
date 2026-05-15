@@ -3134,6 +3134,29 @@ void cl_arq_controller::finalize_block_commander()
 		}
 		else if(gear_shift_algorithm==SUCCESS_BASED_LADDER)
 		{
+			// SACK Design A Step 9 — Multi-axis policy framework dispatch.
+			//
+			// v2 sessions route through the new policy framework entry point
+			// `policy_evaluate_axis1()`. The body is functionally identical to
+			// the v1 inline path below (same observable, same action, same
+			// hysteresis); the wrapper adds the §4.3.4 invariant-5
+			// `[POLICY-MOVE]` log line and the invariant-6 supremacy hook so
+			// when Axes 2/3 land (Steps 10/11) they can observe Axis-1 moves
+			// and the supremacy contract is already enforced.
+			//
+			// v1 sessions (sack_v2_enabled==false) take the inline path
+			// verbatim — no behavior change, no new log lines, byte-identical
+			// log surface (proven by WAV harness v1<->v1 sha256 stability).
+			//
+			// Per §3.8 "initiator controls flow": both branches are CMD-side
+			// only; RSP never participates in Axis 1 decision-making — it
+			// just executes the resulting SET_CONFIG.
+			if(sack_v2_enabled)
+			{
+				policy_evaluate_axis1();
+			}
+			else
+			{
 			gear_shift_blocked_for_nBlocks++;
 			// Reset downshift failure counter on any good block
 			if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
@@ -3236,12 +3259,246 @@ void cl_arq_controller::finalize_block_commander()
 				fflush(stdout);
 				this->connection_status=TRANSMITTING_DATA;
 			}
+			}  // end of v1 inline SUCCESS_BASED_LADDER branch
 		}
 	}
 	else
 	{
 		this->connection_status=TRANSMITTING_DATA;
 	}
+}
+
+// SACK Design A Step 9 — Multi-axis policy framework, Axis 1 entry point.
+//
+// Wraps the v1 SUCCESS_BASED_LADDER block above. Functionally identical
+// (same observable, action, hysteresis) — the body is a copy of the v1
+// inline path with two additions per §4.3.4:
+//
+//   - invariant #5: `[POLICY-MOVE] axis=1 from=Y to=Z reason=R` log on
+//     every modulation move (up, down). The pre-existing `[GEARSHIFT]`
+//     log lines are preserved alongside; external parsers are not broken.
+//
+//   - invariant #6: `policy_axis1_supremacy_on_move()` fires on every
+//     modulation move, naming the contract point that Steps 10/11 fill
+//     in (reset Axes 2/3 to safe state). At Step 9 the body is a
+//     logging stub — Axes 2/3 controllers do not exist yet.
+//
+// CMD-side only (§3.8 initiator-controls-flow): there is no RSP-side
+// Axis 1 controller; RSP just executes the SET_CONFIG handed to it.
+void cl_arq_controller::policy_evaluate_axis1()
+{
+	gear_shift_blocked_for_nBlocks++;
+	// Reset downshift failure counter on any good block
+	if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
+		gear_shift_down_consecutive_fails = 0;
+
+	if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage
+		&& gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total)
+	{
+		int proposed = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
+		// Respect proven ceiling — don't re-try configs that already failed during turboshift
+		bool ceiling_blocked = (supershift_proven_ceiling >= 0 &&
+			config_ladder_index(proposed) > config_ladder_index(supershift_proven_ceiling))
+			|| (max_config_override >= 0 && proposed > max_config_override);
+		if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
+		{
+			negotiated_configuration=proposed;
+			printf("[GEARSHIFT] LADDER UP: success=%.0f%% > %.0f%%, config %d -> %d\n",
+				last_transmission_block_stats.success_rate_data, gear_shift_up_success_rate_precentage,
+				current_configuration, negotiated_configuration);
+			// §4.3.4 invariant #5: every move emits a [POLICY-MOVE] line.
+			printf("[POLICY-MOVE] axis=1 from=%d to=%d reason=ladder_up "
+				"success=%.0f%% threshold=%.0f%% blocks_held=%d\n",
+				current_configuration, negotiated_configuration,
+				last_transmission_block_stats.success_rate_data,
+				gear_shift_up_success_rate_precentage,
+				gear_shift_blocked_for_nBlocks);
+			fflush(stdout);
+			// §4.3.4 invariant #6: supremacy hook — Axes 2/3 must yield.
+			policy_axis1_supremacy_on_move(current_configuration, negotiated_configuration, "ladder_up");
+			cleanup();
+			add_message_control(SET_CONFIG);
+		}
+		else
+		{
+			// Ceiling recovery: after N consecutive good blocks at ceiling, raise ceiling by 1.
+			// Use 20 blocks to avoid oscillation where ceiling raises and immediately fails.
+			if(ceiling_blocked)
+			{
+				ceiling_success_count++;
+				if(ceiling_success_count >= 20)
+				{
+					int old_ceiling = supershift_proven_ceiling;
+					supershift_proven_ceiling = proposed;  // raise ceiling to what we wanted to try
+					ceiling_success_count = 0;
+					printf("[GEARSHIFT] CEILING RECOVERY: %d -> %d after %d good blocks\n",
+						old_ceiling, supershift_proven_ceiling, 20);
+					fflush(stdout);
+					// Ceiling recovery is a STATE change (cap raised) but NOT a
+					// modulation move — current_configuration is unchanged. No
+					// [POLICY-MOVE] line here; the next block evaluation will
+					// emit [POLICY-MOVE] axis=1 reason=ladder_up if it then
+					// climbs.
+				}
+			}
+			else
+			{
+				ceiling_success_count = 0;
+			}
+			printf("[GEARSHIFT] LADDER: at top (config %d), success=%.0f%%%s\n",
+				current_configuration, last_transmission_block_stats.success_rate_data,
+				ceiling_blocked ? " [ceiling-limited]" : "");
+			fflush(stdout);
+			this->connection_status=TRANSMITTING_DATA;
+		}
+	}
+	else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage)
+	{
+		// Require 3 consecutive bad blocks before downshifting.
+		// A single ACK timeout on an otherwise good channel shouldn't
+		// trigger a config downshift (the retry will succeed).
+		gear_shift_down_consecutive_fails++;
+		if(gear_shift_down_consecutive_fails < 3)
+		{
+			printf("[GEARSHIFT] LADDER: poor block %d/3 (success=%.0f%%), holding config %d\n",
+				gear_shift_down_consecutive_fails, last_transmission_block_stats.success_rate_data,
+				current_configuration);
+			fflush(stdout);
+			this->connection_status=TRANSMITTING_DATA;
+		}
+		else if(!config_is_at_bottom(current_configuration, robust_enabled))
+		{
+			negotiated_configuration=config_ladder_down(current_configuration, robust_enabled);
+			// Lower ceiling to prevent immediate re-upshift to the failing config.
+			// Ceiling recovery (8 good blocks) will raise it if channel improves.
+			if(supershift_proven_ceiling < 0 ||
+			   config_ladder_index(current_configuration) <= config_ladder_index(supershift_proven_ceiling))
+			{
+				supershift_proven_ceiling = negotiated_configuration;
+				ceiling_success_count = 0;
+				printf("[GEARSHIFT] LADDER DOWN: ceiling lowered to %d\n", negotiated_configuration);
+				fflush(stdout);
+			}
+			printf("[GEARSHIFT] LADDER DOWN: success=%.0f%% < %.0f%%, config %d -> %d (batch=1)\n",
+				last_transmission_block_stats.success_rate_data, gear_shift_down_success_rate_precentage,
+				current_configuration, negotiated_configuration);
+			// §4.3.4 invariant #5: every move emits a [POLICY-MOVE] line.
+			printf("[POLICY-MOVE] axis=1 from=%d to=%d reason=ladder_down "
+				"success=%.0f%% threshold=%.0f%% consecutive_fails=%d\n",
+				current_configuration, negotiated_configuration,
+				last_transmission_block_stats.success_rate_data,
+				gear_shift_down_success_rate_precentage,
+				gear_shift_down_consecutive_fails);
+			fflush(stdout);
+			// §4.3.4 invariant #6: supremacy hook — Axes 2/3 must yield.
+			policy_axis1_supremacy_on_move(current_configuration, negotiated_configuration, "ladder_down");
+			cleanup();
+			add_message_control(SET_CONFIG);
+		}
+		else
+		{
+			printf("[GEARSHIFT] LADDER: at bottom (config %d), success=%.0f%%\n",
+				current_configuration, last_transmission_block_stats.success_rate_data);
+			fflush(stdout);
+			this->connection_status=TRANSMITTING_DATA;
+		}
+		gear_shift_blocked_for_nBlocks=0;
+	}
+	else
+	{
+		printf("[GEARSHIFT] LADDER: hold config %d, success=%.0f%%\n",
+			current_configuration, last_transmission_block_stats.success_rate_data);
+		fflush(stdout);
+		this->connection_status=TRANSMITTING_DATA;
+	}
+}
+
+// SACK Design A Step 9 — Axis 1 supremacy hook (§4.3.4 invariant #6).
+//
+// "If Axis 1 decides to move config (or BREAK to ROBUST_0), that decision
+//  overrides any in-flight Axis 2 / Axis 3 move."
+//
+// At Step 9 the body is a logging stub — Axes 2 (batch size) and 3 (SACK
+// mode) controllers do not yet exist. Steps 10/11 will fill in:
+//
+//   - reset `data_batch_size` to `radio_batch_size_floor = 10`
+//   - set Axis 3 sack_mode to PROBE
+//   - cancel in-flight Axes 2/3 timers / cooldowns
+//
+// The hook is named at Step 9 so the contract point is explicit and
+// Steps 10/11 have a stable insertion site. Naming it now also means
+// `[POLICY-SUPREMACY]` log events appear in v2 sessions from Step 9
+// forward — external policy-trace tooling can be wired up before the
+// downstream axes land.
+//
+// Called from policy_evaluate_axis1() on every ladder up/down move.
+// Steps 12+ will also call this from the emergency-BREAK code path.
+void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg, const char* reason)
+{
+	(void)from_cfg;  // unused at Step 9 — Axes 2/3 controllers consume in Steps 10/11
+	(void)to_cfg;
+	printf("[POLICY-SUPREMACY] axis=1 move reason=%s — "
+		"Axes 2/3 cooldown engaged (Step 9 stub: no Axes 2/3 controllers yet)\n",
+		reason);
+	fflush(stdout);
+}
+
+// SACK Design A Step 9 — synthetic Axis 1 fire (test-only entry point).
+//
+// CLI: --test-policy-axis1-fire=up|down. Primes the LADDER state with a
+// synthetic observable and the hysteresis counters at the move threshold,
+// then calls policy_evaluate_axis1() once. Demonstrates that the wrapper
+// is wired and that [POLICY-MOVE] + [POLICY-SUPREMACY] fire on a real
+// modulation move.
+//
+// Default builds never enter this function; production paths are
+// unaffected. Implemented inside cl_arq_controller so the priming touches
+// the private state members directly (last_transmission_block_stats,
+// gear_shift_blocked_for_nBlocks, etc.) without weakening encapsulation.
+void cl_arq_controller::test_fire_policy_axis1(int direction)
+{
+	// Force the v2-gated branch so policy_evaluate_axis1() is reached.
+	sack_v2_enabled = true;
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+	// Start mid-ladder so both directions are reachable.
+	current_configuration = 4;
+	negotiated_configuration = 4;
+	robust_enabled = NO;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	supershift_proven_ceiling = -1;
+	ceiling_success_count = 0;
+
+	if(direction == 1)
+	{
+		// LADDER UP synthetic: 100% success, block-counter at threshold.
+		last_transmission_block_stats.success_rate_data = 100.0f;
+		gear_shift_blocked_for_nBlocks = gear_shift_block_for_nBlocks_total;
+		gear_shift_down_consecutive_fails = 0;
+		printf("[TEST-AXIS1-FIRE] direction=up: success_rate=100%%, "
+			"blocked_for=%d (threshold=%d) → expect LADDER UP from %d\n",
+			gear_shift_blocked_for_nBlocks, gear_shift_block_for_nBlocks_total,
+			current_configuration);
+	}
+	else if(direction == 2)
+	{
+		// LADDER DOWN synthetic: 0% success, consecutive_fails primed to
+		// (threshold - 1) — the wrapper increments then compares against 3.
+		last_transmission_block_stats.success_rate_data = 0.0f;
+		gear_shift_blocked_for_nBlocks = 0;
+		gear_shift_down_consecutive_fails = 2;  // wrapper bumps to 3 → triggers move
+		printf("[TEST-AXIS1-FIRE] direction=down: success_rate=0%%, "
+			"consecutive_fails will bump 2→3 → expect LADDER DOWN from %d\n",
+			current_configuration);
+	}
+	else
+	{
+		printf("[TEST-AXIS1-FIRE] direction=%d not in {1=up, 2=down}; no-op\n", direction);
+		return;
+	}
+	fflush(stdout);
+	policy_evaluate_axis1();
 }
 
 void cl_arq_controller::process_buffer_data_commander()

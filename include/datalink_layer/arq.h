@@ -394,6 +394,50 @@ public:
   void process_buffer_data_commander();
   void finalize_block_commander();
 
+  // SACK Design A Step 9 — Multi-axis policy framework, Axis 1 entry point.
+  //
+  // policy_evaluate_axis1() wraps the existing SUCCESS_BASED_LADDER block from
+  // finalize_block_commander() (originally arq_commander.cc:3135-3239). It is
+  // the named entry point for Axis 1 (modulation) per §4.3.2 of
+  // SACK_DESIGN_A_PLAN.md. No behavior change vs the inline path — same
+  // observable (`last_transmission_block_stats.success_rate_data`), same
+  // action (`config_ladder_{up,down}()`), same hysteresis. New side-effects:
+  //
+  //   1. `[POLICY-MOVE] axis=1 from=Y to=Z reason=R` log line on every
+  //      modulation move (up / down). §4.3.4 invariant #5: "No move is silent."
+  //   2. `policy_axis1_supremacy_on_move()` hook fires on every move.
+  //      §4.3.4 invariant #6: Axis-1 moves override any in-flight Axes 2/3
+  //      decision. At Step 9 the hook is a logging stub (Axes 2/3 do not
+  //      exist yet); Steps 10/11 plug in the actual batch_size / sack_mode
+  //      reset. The hook is named here so the wire surface for Axes 2/3 is
+  //      already in place when those steps land.
+  //
+  // Gated on `sack_v2_enabled` at the call site in finalize_block_commander().
+  // v1 sessions take the original inline SUCCESS_BASED_LADDER path verbatim —
+  // no [POLICY-MOVE] emitted, no supremacy hook called, byte-identical
+  // log surface for v1<->v1 sessions (proven by WAV harness sha256).
+  void policy_evaluate_axis1();
+
+  // SACK Design A Step 9 — Axis 1 supremacy hook (§4.3.4 invariant #6).
+  // Called from policy_evaluate_axis1() on every modulation move, and (when
+  // Steps 10/11 land) from the BREAK path. At Step 9 the body is a logging
+  // stub — no Axes 2/3 controllers exist to reset. The hook is the explicit
+  // contract point that Steps 10/11 will fill in:
+  //   - reset batch_size to `radio_batch_size_floor = 10`
+  //   - set sack_mode to PROBE
+  //   - cancel in-flight Axes 2/3 moves
+  void policy_axis1_supremacy_on_move(int from_cfg, int to_cfg, const char* reason);
+
+  // SACK Design A Step 9 — synthetic Axis 1 fire (test-only).
+  // CLI: --test-policy-axis1-fire=up|down. Primes the LADDER state with a
+  // synthetic observable (success_rate=100% for up, 0% for down) and the
+  // hysteresis counters at the move threshold, then calls
+  // policy_evaluate_axis1() once. Demonstrates that the wrapper is wired
+  // and that [POLICY-MOVE] + [POLICY-SUPREMACY] fire on a real move.
+  // direction: 1=up, 2=down. No-op for any other value.
+  // Default builds never call this; production paths are unaffected.
+  void test_fire_policy_axis1(int direction);
+
 
   void process_messages_responder();
 	//! Adds the received data message to the buffer.
