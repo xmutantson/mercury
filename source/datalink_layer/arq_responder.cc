@@ -1369,6 +1369,19 @@ void cl_arq_controller::process_control_responder()
 					local_capability, peer_capability);
 			}
 		}
+
+		// SACK v2 negotiation (SACK_DESIGN_A_PLAN §4.2.4 Step 6).
+		// Mirrors the commander-side block. Negotiate-only at this step:
+		// sack_v2_enabled is computed and logged but gates NO functional
+		// behavior. TEST_CONNECTION wire shape is unchanged.
+		{
+			bool both_v2 = (local_capability & CAP_SACK_V2)
+				&& (peer_capability & CAP_SACK_V2);
+			sack_v2_enabled = both_v2;
+			printf("[SACK-V2] %s (local=0x%02X peer=0x%02X) — gates nothing yet\n",
+				sack_v2_enabled ? "enabled (negotiate-only)" : "not enabled",
+				local_capability, peer_capability);
+		}
 		fflush(stdout);
 
 		tmp_SNR.f_SNR=(float)measurements.SNR_downlink;

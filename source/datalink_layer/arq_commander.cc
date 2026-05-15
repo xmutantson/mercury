@@ -2126,6 +2126,21 @@ void cl_arq_controller::process_control_commander()
 						local_capability, peer_capability);
 				}
 			}
+
+			// SACK v2 negotiation (SACK_DESIGN_A_PLAN §4.2.4 Step 6).
+			// Negotiate-only at this step: sack_v2_enabled is computed and
+			// logged but gates NO functional behavior. TEST_CONNECTION wire
+			// shape is unchanged — local_capability is still written as a
+			// single byte at data[5], and CAP_SACK_V2 is only present when
+			// the opt-in --enable-sack-v2 CLI flag adds it.
+			{
+				bool both_v2 = (local_capability & CAP_SACK_V2)
+					&& (peer_capability & CAP_SACK_V2);
+				sack_v2_enabled = both_v2;
+				printf("[SACK-V2] %s (local=0x%02X peer=0x%02X) — gates nothing yet\n",
+					sack_v2_enabled ? "enabled (negotiate-only)" : "not enabled",
+					local_capability, peer_capability);
+			}
 			fflush(stdout);
 
 			switch_role_test_timer.stop();
