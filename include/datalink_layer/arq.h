@@ -178,6 +178,19 @@ struct st_message
 #define MAX_SACK_FRAME_SIZE  256  // Max frame payload size
 #define MAX_RETRANSMIT_HEADROOM 8 // Max retransmit slots per radio batch
 
+// SACK_FIX_PLAN §7 step 3 — geometry-derived CMD post-TX timeout.
+// See SACK_FIX_PLAN.md §4.1 for derivation and §11.1 for calibration:
+//   sack_arrival_ms = ptt_off_delay + RSP_DECODE_MARGIN_MS
+//                   + sack_pattern_ms(batch) + ptt_on_delay
+// SACK_ARRIVAL_MARGIN_MS covers scheduling jitter + LDPC decode tail
+// past the geometric estimate. Calibrated from post-Plan-A traces:
+// observed worst arrival 2102 ms vs geometric estimate 1768 ms; required
+// margin 334 ms + 500 ms safety floor = 834 ms; rounded up to 1000 ms.
+// The pre-fix two hardcoded 3000-ms adders are replaced by this single
+// margin (see SACK_FIX_PLAN.md §2.7 / §11.1).
+#define RSP_DECODE_MARGIN_MS   300  // one-frame RSP decode budget
+#define SACK_ARRIVAL_MARGIN_MS 1000 // jitter + LDPC decode tail safety
+
 struct st_crypto_batch_buffer {
 	int batch_id;           // crypto batch counter mod 8, or -1 if empty
 	int expected_frames;    // from crypto_batch_size or end-of-batch detection
