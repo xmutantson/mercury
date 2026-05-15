@@ -1081,21 +1081,45 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					// The v1 path is UNTOUCHED — Step 7 only adds the v2 branch.
 					if(sack_v2_enabled)
 					{
-						// batch_seq_id field anchors the bitmap to the
-						// outstanding CMD batch. RSP echoes whatever it
-						// adopted at Step 4 (rsp_current_expected_batch_seq_id).
-						// If still -1 (first-frame edge case where SACK
-						// fires before adopt), fall back to 0 — the CMD
-						// will compare against its cmd_batch_seq_id-1 (the
-						// in-flight batch's id).
-						unsigned char bsi = (unsigned char)
-							((rsp_current_expected_batch_seq_id >= 0)
-								? (rsp_current_expected_batch_seq_id & 0xFF)
-								: 0);
-						printf("[ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=%u, %d/%d received)\n",
-							(unsigned)bsi, rx_received, data_batch_size);
-						fflush(stdout);
-						send_sack_v2_frame(sack_bitmap, data_batch_size, bsi);
+						// SACK Design A Step 11 — Axis 3 SACK_MODE_OFF gate.
+						// CMD has signaled (via SET_LINK_PARAMS) that the
+						// reverse path is too unreliable for SACK_RSP to be
+						// worth the airtime. Suppress SACK_RSP TX entirely;
+						// CMD's ACK-timeout will drive a full-batch retransmit
+						// on this partial. PROBE behaves as ON here (RSP TX's
+						// SACK_RSP; CMD's decode outcome drives PROBE→ON or
+						// PROBE→OFF on its side).
+						if(axis3_sack_mode == SACK_MODE_OFF)
+						{
+							printf("[ACK-GATE-V2-OFF] sack_mode=OFF — suppressing "
+								"SACK_RSP TX on partial batch (%d/%d received); "
+								"CMD will rely on ACK-timeout + full-batch "
+								"retransmit (Axis-3 Step 11 fallback).\n",
+								rx_received, data_batch_size);
+							fflush(stdout);
+							// Keep partial state — CMD's retransmit will land
+							// new copies of missing frames, the existing rx loop
+							// will merge them. No SACK_RSP wire frame emitted.
+						}
+						else
+						{
+							// batch_seq_id field anchors the bitmap to the
+							// outstanding CMD batch. RSP echoes whatever it
+							// adopted at Step 4 (rsp_current_expected_batch_seq_id).
+							// If still -1 (first-frame edge case where SACK
+							// fires before adopt), fall back to 0 — the CMD
+							// will compare against its cmd_batch_seq_id-1 (the
+							// in-flight batch's id).
+							unsigned char bsi = (unsigned char)
+								((rsp_current_expected_batch_seq_id >= 0)
+									? (rsp_current_expected_batch_seq_id & 0xFF)
+									: 0);
+							printf("[ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=%u, %d/%d received, sack_mode=%s)\n",
+								(unsigned)bsi, rx_received, data_batch_size,
+								(axis3_sack_mode == SACK_MODE_PROBE) ? "PROBE" : "ON");
+							fflush(stdout);
+							send_sack_v2_frame(sack_bitmap, data_batch_size, bsi);
+						}
 					}
 					else
 					{
@@ -2135,10 +2159,25 @@ void cl_arq_controller::process_control_responder()
 				int old_batch = data_batch_size;
 				set_data_batch_size(target);
 				recalculate_ack_timeout_for_batch();
+
+				// SACK Design A Step 11 — apply sack_mode from CMD.
+				// Validate the byte is in {0=OFF, 1=ON, 2=PROBE}; anything
+				// else falls back to ON defensively (§4.3.4 invariant 3:
+				// no silent corruption — log + clamp). RSP-side state mirrors
+				// the CMD's authoritative decision (§3.8 initiator-controls-flow).
+				int old_mode = axis3_sack_mode;
+				int new_mode = new_sack_u8;
+				if(new_mode < 0 || new_mode > 2)
+				{
+					printf("[RSP-LINK-PARAMS-WARN] sack_mode=%d out of {0,1,2} — "
+						"defaulting to ON\n", new_sack_u8);
+					new_mode = SACK_MODE_ON;
+				}
+				axis3_sack_mode = new_mode;
 				rsp_set_link_params_rx_count++;
 				printf("[RSP-LINK-PARAMS] APPLIED batch %d -> %d sack_mode=%d "
-					"(crc8=0x%02x rx_count=%lld) — Step 11 will consume sack_mode\n",
-					old_batch, data_batch_size, new_sack_u8,
+					"(prev sack_mode=%d) (crc8=0x%02x rx_count=%lld)\n",
+					old_batch, data_batch_size, new_mode, old_mode,
 					rx_crc, rsp_set_link_params_rx_count);
 				fflush(stdout);
 				// ACK the control frame via the normal control-ACK path —

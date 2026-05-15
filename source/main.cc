@@ -298,6 +298,7 @@ int main(int argc, char *argv[])
     bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
     int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
     bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
+    int  test_rsp_sack_rsp_crc_corrupt_count_cli = 0; // --test-rsp-sack-rsp-crc-corrupt-count=N: SACK Design A Step 11 N-shot CRC8 fault injection
     int test_policy_axis1_fire_cli = 0; // --test-policy-axis1-fire=up|down: SACK Design A Step 9 — synthetic Axis-1 trigger.
                                         // 0=off, 1=up (success=100%), 2=down (success=0%). One-shot at startup, then exit.
                                         // Forces sack_v2_enabled=true so policy_evaluate_axis1() is taken.
@@ -307,6 +308,24 @@ int main(int argc, char *argv[])
     int test_policy_axis1_then_axis2_cli = 0; // --test-policy-axis1-then-axis2=up|down: SACK Design A Step 10 — fire Axis-1
                                         // (engages axis2_cooldown_batches=3) then attempt Axis-2 fire (should be SUPPRESSED).
                                         // 1=axis1=up then axis2=up; 2=axis1=down then axis2=down. One-shot at startup, then exit.
+    int test_policy_axis3_fire_cli = 0; // --test-policy-axis3-fire={ok,miss,walk}: SACK Design A Step 11 — synthetic Axis-3 trigger.
+                                        // 0=off, 1=single ok event, 2=single miss event, 3=composite walk demo
+                                        // (3 misses → ON→PROBE, 2 more → PROBE→OFF, 20 ticks → OFF→PROBE, ok → PROBE→ON).
+                                        // One-shot at startup, then exit. Forces sack_v2_enabled=true.
+    int test_policy_axis1_then_axis3_cli = 0; // --test-policy-axis1-then-axis3=miss: SACK Design A Step 11 — fire Axis-1
+                                        // supremacy then attempt Axis-3 fires (should be SUPPRESSED during the 3-batch cooldown).
+                                        // 1=axis1 supremacy + 3 attempted Axis-3 misses. One-shot at startup, then exit.
+    int test_policy_axis3_miss_burst_cli = 0; // --test-policy-axis3-miss-burst=N: SACK Design A Step 11 — fire N miss events
+                                        // directly into policy_evaluate_axis3 at startup, then exit. Used by Gate 3
+                                        // (drives ON→PROBE at N=3, PROBE→OFF at N=5) and Gate 6 (large N then tick to 20
+                                        // batches to drive OFF→PROBE).
+    int test_policy_axis3_recover_cli = 0; // --test-policy-axis3-recover=N: SACK Design A Step 11 — fire N misses then a single
+                                        // ok (Gate 5: PROBE→ON recovery demo).
+    int test_policy_axis3_offperiodic_cli = 0; // --test-policy-axis3-offperiodic=N: drive 5+ misses to OFF, then tick N batches
+                                        // (Gate 6: OFF→PROBE 20-batch periodic re-probe).
+    int test_force_sack_mode_cli = -1;  // --force-sack-mode={off,on,probe}: SACK Design A Step 11 — set Axis-3 mode at startup
+                                        // (after init, before CONNECTED). Used for Gate 4 (SACK_OFF graceful fallback in
+                                        // live session) and Gate 7 (SET_LINK_PARAMS sack_mode round-trip). -1 = unset.
     int audio_buffer_ms_cli = 0;       // --alsa-buffer-ms=N (Linux only; 0 = use 30ms default)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
@@ -592,6 +611,18 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strncmp(argv[i], "--test-rsp-sack-rsp-crc-corrupt-count=", 38) == 0)
+        {
+            // SACK Design A Step 11 — N-shot CRC8 fault injection. Corrupts
+            // the next N SACK_RSP frames the RSP transmits (vs the one-shot
+            // version above). Used by Gate 3 (drive 3 misses → ON→PROBE, then
+            // 2 more → PROBE→OFF) and Gate 5 (set to small N, then let SACK
+            // recover → PROBE→ON).
+            test_rsp_sack_rsp_crc_corrupt_count_cli = atoi(argv[i] + 38);
+            if (test_rsp_sack_rsp_crc_corrupt_count_cli < 0) test_rsp_sack_rsp_crc_corrupt_count_cli = 0;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strncmp(argv[i], "--test-policy-axis1-fire=", 25) == 0)
         {
             // SACK Design A Step 9 — synthetic Axis-1 trigger (one-shot at startup).
@@ -650,6 +681,58 @@ int main(int argc, char *argv[])
             if (strcmp(arg, "up") == 0)        test_policy_axis1_then_axis2_cli = 1;
             else if (strcmp(arg, "down") == 0) test_policy_axis1_then_axis2_cli = 2;
             else { fprintf(stderr, "--test-policy-axis1-then-axis2: expected 'up' or 'down'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-fire=", 25) == 0)
+        {
+            // SACK Design A Step 11 — synthetic Axis-3 fire (single event or walk).
+            const char* arg = argv[i] + 25;
+            if (strcmp(arg, "ok") == 0)        test_policy_axis3_fire_cli = 1;
+            else if (strcmp(arg, "miss") == 0) test_policy_axis3_fire_cli = 2;
+            else if (strcmp(arg, "walk") == 0) test_policy_axis3_fire_cli = 3;
+            else { fprintf(stderr, "--test-policy-axis3-fire: expected 'ok' or 'miss' or 'walk'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis1-then-axis3=", 31) == 0)
+        {
+            // SACK Design A Step 11 — composite synthetic fire demonstrating
+            // §4.3.4 invariant #6 (Axis-1 supremacy → Axis-3 cooldown).
+            const char* arg = argv[i] + 31;
+            if (strcmp(arg, "miss") == 0)      test_policy_axis1_then_axis3_cli = 1;
+            else { fprintf(stderr, "--test-policy-axis1-then-axis3: expected 'miss'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-miss-burst=", 31) == 0)
+        {
+            test_policy_axis3_miss_burst_cli = atoi(argv[i] + 31);
+            if (test_policy_axis3_miss_burst_cli < 1) test_policy_axis3_miss_burst_cli = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-recover=", 28) == 0)
+        {
+            test_policy_axis3_recover_cli = atoi(argv[i] + 28);
+            if (test_policy_axis3_recover_cli < 1) test_policy_axis3_recover_cli = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-offperiodic=", 32) == 0)
+        {
+            test_policy_axis3_offperiodic_cli = atoi(argv[i] + 32);
+            if (test_policy_axis3_offperiodic_cli < 1) test_policy_axis3_offperiodic_cli = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--force-sack-mode=", 18) == 0)
+        {
+            const char* arg = argv[i] + 18;
+            if (strcmp(arg, "off") == 0)        test_force_sack_mode_cli = 0;
+            else if (strcmp(arg, "on") == 0)    test_force_sack_mode_cli = 1;
+            else if (strcmp(arg, "probe") == 0) test_force_sack_mode_cli = 2;
+            else { fprintf(stderr, "--force-sack-mode: expected 'off'|'on'|'probe'\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1393,6 +1476,29 @@ start_modem:
                    "CRC8 XOR'd with 0xFF (SACK Design A Step 7 synthetic CRC8 fault "
                    "injection — one-shot)\n");
         }
+        if (test_force_sack_mode_cli >= 0) {
+            // SACK Design A Step 11 — pre-CONNECTED override of axis3_sack_mode.
+            // Used by Gates 4 (SACK_OFF graceful fallback) and 7 (SET_LINK_PARAMS
+            // sack_mode round-trip). When CMD's Axis-2 controller later fires
+            // a SET_LINK_PARAMS for any reason, the carried sack_mode will be
+            // this value (per the pending_link_params_sack_mode = axis3_sack_mode
+            // assignment in policy_evaluate_axis2). RSP applies it through
+            // the existing SET_LINK_PARAMS handler.
+            ARQ.axis3_sack_mode = test_force_sack_mode_cli;
+            printf("[FLAG] --force-sack-mode=%s: pre-CONNECTED Axis-3 mode override "
+                   "(SACK Design A Step 11 testing)\n",
+                   test_force_sack_mode_cli == 0 ? "OFF"
+                   : test_force_sack_mode_cli == 1 ? "ON"
+                   : "PROBE");
+        }
+        if (test_rsp_sack_rsp_crc_corrupt_count_cli > 0) {
+            ARQ.test_rsp_sack_rsp_crc_corrupt_count = test_rsp_sack_rsp_crc_corrupt_count_cli;
+            printf("[FLAG] --test-rsp-sack-rsp-crc-corrupt-count=%d: next %d SACK_RSP TXs "
+                   "will have CRC8 XOR'd with 0xFF (SACK Design A Step 11 N-shot CRC8 "
+                   "fault injection)\n",
+                   test_rsp_sack_rsp_crc_corrupt_count_cli,
+                   test_rsp_sack_rsp_crc_corrupt_count_cli);
+        }
         if (test_policy_axis1_fire_cli != 0) {
             // SACK Design A Step 9 — synthetic Axis-1 fire (one-shot, then exit).
             // Calls the public test helper on cl_arq_controller which primes
@@ -1497,6 +1603,147 @@ start_modem:
             fflush(stdout);
 
             printf("[FLAG] Composite fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_policy_axis3_fire_cli != 0) {
+            // SACK Design A Step 11 — synthetic Axis-3 fire (one-shot, then exit).
+            const char* kind_str =
+                (test_policy_axis3_fire_cli == 1) ? "ok"
+              : (test_policy_axis3_fire_cli == 2) ? "miss"
+              : (test_policy_axis3_fire_cli == 3) ? "walk" : "?";
+            printf("[FLAG] --test-policy-axis3-fire=%s: invoking synthetic Axis-3 fire\n",
+                   kind_str);
+            fflush(stdout);
+            ARQ.test_fire_policy_axis3(test_policy_axis3_fire_cli);
+            printf("[FLAG] Synthetic fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_policy_axis1_then_axis3_cli != 0) {
+            // SACK Design A Step 11 — Axis-1-then-Axis-3 supremacy demo (one-shot, exit).
+            // Fires Axis-1 supremacy hook directly (engages axis3_cooldown_batches=3)
+            // then attempts 3 Axis-3 fires that MUST be suppressed (cooldown 3→2→1→0).
+            printf("[FLAG] --test-policy-axis1-then-axis3=miss: invoking composite "
+                   "Axis-1-then-Axis-3 supremacy demo\n");
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            // Start in ON to make the supremacy hook transition observable.
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            printf("[DEMO-AXIS3-STEP-A] firing supremacy hook directly to engage "
+                   "Axis-3 cooldown ...\n");
+            fflush(stdout);
+            ARQ.policy_axis1_supremacy_on_move(4, 3, "ladder_down_synthetic");
+            // Three attempted Axis-3 misses while cooldown active.
+            for (int b = 1; b <= 3; b++) {
+                printf("[DEMO-AXIS3-STEP-B%d] attempt Axis-3 miss while cooldown "
+                       "active (expect SUPPRESSED, cooldown drains by 1 in "
+                       "batch_tick afterwards)...\n", b);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+                // The Axis-3 cooldown is decremented by axis3_batch_tick()
+                // (not by policy_evaluate_axis3 itself), so we tick once per
+                // attempt to mirror the per-batch drain pattern used in
+                // production.
+                ARQ.axis3_batch_tick();
+            }
+            printf("[DEMO-AXIS3-STEP-C] cooldown drained. Subsequent Axis-3 "
+                   "evaluations are free to move (skipped here to avoid the "
+                   "messages_control.data == NULL crash in pre-init synthetic "
+                   "mode; the suppression behavior is the load-bearing demo).\n");
+            fflush(stdout);
+            printf("[FLAG] Composite fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_policy_axis3_miss_burst_cli > 0) {
+            // SACK Design A Step 11 — drive N consecutive synthetic miss events
+            // into policy_evaluate_axis3() to demonstrate Gate 3 ON→PROBE→OFF.
+            printf("[FLAG] --test-policy-axis3-miss-burst=%d: driving %d consecutive miss events into Axis-3 controller\n",
+                   test_policy_axis3_miss_burst_cli, test_policy_axis3_miss_burst_cli);
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            for (int i = 1; i <= test_policy_axis3_miss_burst_cli; i++) {
+                printf("[TEST-AXIS3-BURST] miss #%d/%d (mode before=%s consec=%d)\n",
+                       i, test_policy_axis3_miss_burst_cli,
+                       (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                       : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                       ARQ.axis3_consecutive_sack_misses);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+            }
+            printf("[FLAG] miss-burst complete. final mode=%s consec=%d "
+                   "on_to_probe=%lld probe_to_off=%lld\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_consecutive_sack_misses,
+                   ARQ.axis3_move_on_to_probe_count,
+                   ARQ.axis3_move_probe_to_off_count);
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_policy_axis3_recover_cli > 0) {
+            // SACK Design A Step 11 — Gate 5: N misses then a single ok → PROBE→ON.
+            int n = test_policy_axis3_recover_cli;
+            printf("[FLAG] --test-policy-axis3-recover=%d: driving %d miss events then a single ok event (expect PROBE→ON on the ok)\n", n, n);
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            for (int i = 1; i <= n; i++) {
+                printf("[TEST-AXIS3-RECOVER] miss #%d/%d (mode before=%s consec=%d)\n",
+                       i, n,
+                       (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                       : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                       ARQ.axis3_consecutive_sack_misses);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+            }
+            printf("[TEST-AXIS3-RECOVER] feeding single ok event (mode before=%s consec=%d) — expect PROBE→ON if currently PROBE\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_consecutive_sack_misses);
+            fflush(stdout);
+            ARQ.policy_evaluate_axis3(true);
+            printf("[FLAG] recover demo complete. final mode=%s probe_to_on=%lld\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_move_probe_to_on_count);
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_policy_axis3_offperiodic_cli > 0) {
+            // SACK Design A Step 11 — Gate 6: drive to OFF then tick N batches
+            // (expect OFF→PROBE on the 20th tick).
+            int n = test_policy_axis3_offperiodic_cli;
+            printf("[FLAG] --test-policy-axis3-offperiodic=%d: driving 5 misses (to OFF) then ticking %d batches "
+                   "(OFF→PROBE expected on the 20th)\n", n, n);
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            for (int i = 1; i <= 5; i++) {
+                printf("[TEST-AXIS3-OFFP] miss #%d/5\n", i);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+            }
+            printf("[TEST-AXIS3-OFFP] now in mode=%s; ticking %d batches\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   n);
+            fflush(stdout);
+            for (int b = 1; b <= n; b++) {
+                printf("[TEST-AXIS3-OFFP] tick %d/%d (mode=%s batches_since_off=%d)\n",
+                       b, n,
+                       (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                       : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                       ARQ.axis3_batches_since_off);
+                fflush(stdout);
+                ARQ.axis3_batch_tick();
+            }
+            printf("[FLAG] offperiodic demo complete. final mode=%s off_to_probe=%lld\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_move_off_to_probe_count);
             fflush(stdout);
             exit(0);
         }

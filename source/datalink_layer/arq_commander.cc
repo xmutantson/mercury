@@ -516,8 +516,18 @@ int cl_arq_controller::add_message_control(char code)
 			// (--test-policy-axis2-fire=*) skips ARQ.init() — so guard.
 			if(messages_control.data == NULL)
 			{
+				// Pre-init synthetic test mode (messages_control.data not yet
+				// allocated). Print the values the controller staged so the
+				// test harness can verify the controller wired the right
+				// targets without needing a real wire frame.
+				int peek_batch = pending_link_params_batch_size;
+				if(peek_batch < 0) peek_batch = data_batch_size;
+				int peek_sack  = pending_link_params_sack_mode;
+				if(peek_sack < 0 || peek_sack > 2) peek_sack = 1;
 				printf("[CMD-LINK-PARAMS] SKIP TX: messages_control.data is NULL "
-					"(pre-init synthetic test mode; no real wire frame)\n");
+					"(pre-init synthetic test mode; no real wire frame). "
+					"WOULD HAVE SENT: batch=%d sack_mode=%d\n",
+					peek_batch, peek_sack);
 				fflush(stdout);
 				// Roll back the status set above so the caller treats this as
 				// no-op (don't leave the slot in ADDED_TO_LIST forever).
@@ -1699,43 +1709,67 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				memset(sack_bitmap, 0, sizeof(sack_bitmap));
 				if(sack_v2_enabled)
 				{
-					// SACK Design A Step 7 — OFDM SACK_RSP receive path.
-					// Instead of the MFSK SACK pattern correlator
-					// (receive_sack_pattern), demodulate any OFDM LDPC
-					// frame that landed. If it parses as SACK_RSP and the
-					// CRC8 validates, accept the bitmap. On CRC failure,
-					// the bitmap is DISCARDED (no fabrication per §9.4/A2)
-					// and we fall through to ACK-pattern detection /
-					// timeout-driven retransmit, exactly as if the
-					// control frame had been lost in the air.
-					this->receive();
-					if(messages_rx_buffer.status == RECEIVED
-					   && messages_rx_buffer.type == SACK_RSP)
+					// SACK Design A Step 11 — Axis 3 SACK_MODE_OFF gate.
+					// When Axis 3 has demoted SACK to OFF (reverse path too
+					// unreliable), CMD does NOT enter decode_sack_v2_frame().
+					// RSP is also suppressing SACK_RSP TX (see arq_responder.cc).
+					// Graceful degradation: receive_ack_pattern() below still
+					// runs; if the batch had losses, the ACK-timeout path at
+					// arq_commander.cc:~2010 forces PENDING_ACK→ACK_TIMED_OUT
+					// and process_messages_tx_data() resends the whole batch.
+					if(axis3_sack_mode == SACK_MODE_OFF)
 					{
-						unsigned char rx_bsi = 0;
-						if(decode_sack_v2_frame(sack_bitmap, data_batch_size, &rx_bsi))
-						{
-							sack_detected = true;
-							printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — applying to retransmit queue\n",
-								(unsigned)rx_bsi, cmd_batch_seq_id);
-							fflush(stdout);
-						}
-						// On CRC fail, decode_sack_v2_frame already logged
-						// [CMD-SACK-V2-CRC-FAIL]; we discard and continue.
-						messages_rx_buffer.status = FREE;
+						// No SACK_RSP decode attempt this cycle — fall through
+						// to receive_ack_pattern() check below.
 					}
 					else
 					{
-						// No SACK_RSP frame yet — keep the receive loop
-						// going (the existing ACK-pattern check below
-						// will run on this same poll).
-						if(messages_rx_buffer.status == RECEIVED)
+						// SACK Design A Step 7 — OFDM SACK_RSP receive path.
+						// Instead of the MFSK SACK pattern correlator
+						// (receive_sack_pattern), demodulate any OFDM LDPC
+						// frame that landed. If it parses as SACK_RSP and the
+						// CRC8 validates, accept the bitmap. On CRC failure,
+						// the bitmap is DISCARDED (no fabrication per §9.4/A2)
+						// and we fall through to ACK-pattern detection /
+						// timeout-driven retransmit, exactly as if the
+						// control frame had been lost in the air.
+						this->receive();
+						if(messages_rx_buffer.status == RECEIVED
+						   && messages_rx_buffer.type == SACK_RSP)
 						{
-							// Unexpected non-SACK_RSP frame arrived during
-							// the SACK window. Don't act on it here; leave
-							// it for the existing fallback dispatcher to
-							// process on the next iteration.
-							// (Keeping messages_rx_buffer.status as-is.)
+							unsigned char rx_bsi = 0;
+							if(decode_sack_v2_frame(sack_bitmap, data_batch_size, &rx_bsi))
+							{
+								sack_detected = true;
+								printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — applying to retransmit queue\n",
+									(unsigned)rx_bsi, cmd_batch_seq_id);
+								fflush(stdout);
+								// SACK Design A Step 11 — Axis 3 ok event.
+								policy_evaluate_axis3(true);
+							}
+							else
+							{
+								// CRC fail → decode_sack_v2_frame already
+								// emitted [CMD-SACK-V2-CRC-FAIL]; record as
+								// an Axis-3 miss event (§4.3.2 spec — miss
+								// includes CRC/LDPC failure).
+								policy_evaluate_axis3(false);
+							}
+							messages_rx_buffer.status = FREE;
+						}
+						else
+						{
+							// No SACK_RSP frame yet — keep the receive loop
+							// going (the existing ACK-pattern check below
+							// will run on this same poll).
+							if(messages_rx_buffer.status == RECEIVED)
+							{
+								// Unexpected non-SACK_RSP frame arrived during
+								// the SACK window. Don't act on it here; leave
+								// it for the existing fallback dispatcher to
+								// process on the next iteration.
+								// (Keeping messages_rx_buffer.status as-is.)
+							}
 						}
 					}
 				}
@@ -1812,6 +1846,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				if(sack_v2_enabled)
 				{
 					policy_evaluate_axis2(rx_count, data_batch_size);
+					// SACK Design A Step 11 — per-batch tick (Axis-3).
+					// Drains Axis-1 cooldown for Axis-3 and increments the
+					// OFF-state batches-counter for the 20-batch re-probe.
+					// Axis-3 ok event itself was already fired in the SACK
+					// decode-success branch above.
+					axis3_batch_tick();
 				}
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
@@ -1861,6 +1901,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				if(sack_v2_enabled)
 				{
 					policy_evaluate_axis2(data_batch_size, data_batch_size);
+					// SACK Design A Step 11 — per-batch tick (Axis-3).
+					// Clean full-ACK is NOT a SACK event (no partial batch → RSP
+					// never tried to send SACK_RSP). Only run the batch tick so
+					// the OFF-state re-probe timer and cooldown drain advance.
+					axis3_batch_tick();
 				}
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
@@ -2040,6 +2085,29 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			{
 				if(messages_tx[i].status == PENDING_ACK)
 					messages_tx[i].status = ACK_TIMED_OUT;
+			}
+			// SACK Design A Step 11 — Axis 3 per-batch tick on full ACK timeout.
+			//
+			// We do NOT count this path as a SACK miss event by default. The
+			// timeout fires for ANY batch where neither SACK_RSP nor ACK
+			// pattern was decoded — including full-batch losses (channel
+			// dropped every frame, so RSP never saw a partial batch and
+			// never sent SACK_RSP in the first place). Counting full-batch
+			// loss as a "reverse path SACK unreliability" event would false-
+			// positive Axis 3 on adverse forward-channel conditions and
+			// race against Axis 1 / emergency BREAK.
+			//
+			// The §4.3.2 spec's "no SACK heard within the window" case is
+			// preserved by the decode_sack_v2_frame() CRC-fail path (which
+			// IS specifically a SACK-LDPC/CRC fault) and by future plumbing
+			// of partial-batch detection. For Step 11, the cleaner and safer
+			// model is: only CRC8/LDPC fails on decoded SACK_RSP frames
+			// count as SACK misses. The batch_tick still runs so Axis-1
+			// supremacy cooldowns drain and the OFF→PROBE 20-batch timer
+			// advances correctly.
+			if(sack_v2_enabled)
+			{
+				axis3_batch_tick();
 			}
 		}
 		this->cleanup();
@@ -3529,6 +3597,11 @@ void cl_arq_controller::policy_evaluate_axis1()
 //
 // Called from policy_evaluate_axis1() on every ladder up/down move.
 // Steps 12+ will also call this from the emergency-BREAK code path.
+// Forward declaration — defined further down in this TU. Used by both
+// policy_axis1_supremacy_on_move() (for the Step-11 Axis-3 reset log) and
+// the Step-11 controllers themselves.
+static const char* axis3_mode_str(int m);
+
 void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg, const char* reason)
 {
 	(void)from_cfg;
@@ -3550,13 +3623,43 @@ void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg,
 	axis2_consecutive_good_batches=0;
 	axis2_consecutive_bad_batches=0;
 	axis2_cooldown_batches = AXIS2_CROSS_AXIS_COOLDOWN_BATCHES;
-	// Step 11 will additionally reset sack_mode to PROBE; that field does not
-	// yet exist. Logged via [POLICY-SUPREMACY] line.
+
+	// SACK Design A Step 11 — Axis 3 reset (§4.3.3 cross-axis cooldown).
+	//
+	// Axis 1's move invalidates the SACK-decode history on the old config.
+	// Clear the ring + consecutive_sack_misses counter, set a 3-batch
+	// cooldown that suppresses Axis-3 MOVES (observations still record).
+	// If we were in ON or OFF, transition to PROBE so the very next decoded
+	// SACK on the new config drives a meaningful re-evaluation. PROBE stays
+	// PROBE (already the "test" state).
+	for(int i=0;i<AXIS3_RING_DEPTH;i++) axis3_recent_sack_ok[i]=false;
+	axis3_recent_sack_ok_count=0;
+	axis3_recent_sack_ok_pos=0;
+	axis3_consecutive_sack_misses=0;
+	axis3_batches_since_off=0;
+	axis3_cooldown_batches = AXIS3_CROSS_AXIS_COOLDOWN_BATCHES;
+	int axis3_prev_mode = axis3_sack_mode;
+	if(axis3_sack_mode == SACK_MODE_ON || axis3_sack_mode == SACK_MODE_OFF)
+	{
+		axis3_sack_mode = SACK_MODE_PROBE;
+	}
+
 	printf("[POLICY-SUPREMACY] axis=1 move reason=%s — "
-		"Axis 2 reset (ring+counters cleared, cooldown=%d batches) "
-		"(Step 11 will add Axis 3 reset)\n",
-		reason, axis2_cooldown_batches);
+		"Axis 2 reset (ring+counters cleared, cooldown=%d batches); "
+		"Axis 3 reset (ring+misses cleared, cooldown=%d batches, "
+		"mode %s -> %s)\n",
+		reason, axis2_cooldown_batches, axis3_cooldown_batches,
+		axis3_mode_str(axis3_prev_mode), axis3_mode_str(axis3_sack_mode));
 	fflush(stdout);
+
+	// If Axis-1 moved us into PROBE (from ON or OFF), inform RSP via
+	// SET_LINK_PARAMS so RSP's SACK_RSP-TX behavior aligns. Guarded by
+	// the busy-check inside the helper — if the control channel is in use
+	// the EOB-self-correct safety net (§4.3.4 invariant 4) covers it.
+	if(axis3_prev_mode != axis3_sack_mode)
+	{
+		axis3_send_set_link_params(axis3_sack_mode, "axis1_supremacy_reset");
+	}
 }
 
 // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
@@ -3686,9 +3789,11 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 
 		// Stash the target so the SET_LINK_PARAMS encoder picks it up.
 		// add_message_control(SET_LINK_PARAMS) reads pending_link_params_*
-		// fields (see arq.h Step 10 state).
+		// fields (see arq.h Step 10 state). SACK Design A Step 11: carry the
+		// CURRENT Axis-3 sack_mode through so an unrelated Axis-2 move does
+		// not reset RSP's sack_mode to a stale value.
 		pending_link_params_batch_size = to;
-		pending_link_params_sack_mode  = 1;  // ON — Step 11 will adjust.
+		pending_link_params_sack_mode  = axis3_sack_mode;
 
 		// Apply locally NOW so the next batch builds with the new
 		// data_batch_size. RSP receives SET_LINK_PARAMS and applies in its
@@ -3872,6 +3977,328 @@ void cl_arq_controller::test_fire_policy_axis1(int direction)
 	}
 	fflush(stdout);
 	policy_evaluate_axis1();
+}
+
+// SACK Design A Step 11 — helper: stage and send a SET_LINK_PARAMS for a
+// new Axis-3 sack_mode value. Carries the CURRENT data_batch_size in the
+// batch field so the RSP-side controller (which already handles
+// SET_LINK_PARAMS for Axis-2 moves) does not inadvertently revert the
+// batch size when only the sack_mode changes. Returns true if the control
+// frame was queued; false if messages_control is busy (caller logs).
+static const char* axis3_mode_str(int m)
+{
+	switch(m)
+	{
+		case 0: return "OFF";
+		case 1: return "ON";
+		case 2: return "PROBE";
+		default: return "?";
+	}
+}
+
+void cl_arq_controller::axis3_send_set_link_params(int new_sack_mode, const char* reason_tag)
+{
+	pending_link_params_batch_size = data_batch_size; // do not change batch on a pure-Axis-3 move
+	pending_link_params_sack_mode  = new_sack_mode;
+	if(messages_control.status == FREE)
+	{
+		add_message_control(SET_LINK_PARAMS);
+	}
+	else
+	{
+		printf("[POLICY-AXIS3] WARNING: messages_control busy (status=%d) — "
+			"SET_LINK_PARAMS NOT sent this cycle for %s; RSP will adopt mode on "
+			"the next SET_LINK_PARAMS cycle (or via the EOB-self-correct safety "
+			"net for the data path). axis3_sack_mode=%s (CMD-side already applied).\n",
+			messages_control.status, reason_tag, axis3_mode_str(axis3_sack_mode));
+		fflush(stdout);
+	}
+}
+
+// SACK Design A Step 11 — Axis 3 controller (SACK mode adaptation).
+//
+// §4.3.2 per-SACK-event controller. Fires from:
+//   - process_messages_rx_acks_data() at the decode_sack_v2_frame() success
+//     branch (ok=true).
+//   - process_messages_rx_acks_data() at the decode_sack_v2_frame() CRC-fail
+//     branch (ok=false).
+//   - process_messages_rx_acks_data() ACK-timeout path when data_ack_received
+//     stayed NO (= "no SACK heard within the window") for sack_v2 sessions
+//     (ok=false).
+//
+// §4.3.2 hysteresis:
+//   ON   → PROBE on consecutive_sack_misses >= 3
+//   PROBE→ ON    on the next ok event (reset counter)
+//   PROBE→ OFF   on consecutive_sack_misses >= 5 (the counter is NOT
+//                reset on PROBE entry — 5 is total consecutive misses
+//                from the streak that took ON → PROBE)
+//   OFF  → PROBE every 20 batches (axis3_batch_tick(); not this function)
+//
+// §4.3.3 / §4.3.4 invariant #6: skip MOVES (not observation recording)
+// when axis3_cooldown_batches > 0 (set to 3 by Axis-1 supremacy hook).
+// Observations still flow into the ring so the controller has up-to-date
+// state when the cooldown drains; only the state transition + control
+// frame TX are suppressed.
+//
+// On state change: log [POLICY-MOVE] axis=3 from=X to=Y reason=... per
+// §4.3.4 invariant #5 AND fire SET_LINK_PARAMS to inform RSP.
+void cl_arq_controller::policy_evaluate_axis3(bool ok)
+{
+	axis3_evaluations++;
+
+	// Record the event into the ring + bump streak counter.
+	axis3_recent_sack_ok[axis3_recent_sack_ok_pos] = ok;
+	axis3_recent_sack_ok_pos = (axis3_recent_sack_ok_pos + 1) % AXIS3_RING_DEPTH;
+	if(axis3_recent_sack_ok_count < AXIS3_RING_DEPTH) axis3_recent_sack_ok_count++;
+	if(ok)
+	{
+		axis3_ok_events++;
+		axis3_consecutive_sack_misses = 0;
+	}
+	else
+	{
+		axis3_miss_events++;
+		axis3_consecutive_sack_misses++;
+	}
+
+	// Compute sack_ok_rate over the filled portion of the ring (diagnostic).
+	int ok_n = 0;
+	for(int i=0;i<axis3_recent_sack_ok_count;i++) if(axis3_recent_sack_ok[i]) ok_n++;
+	float sack_ok_rate = (axis3_recent_sack_ok_count > 0)
+		? (float)ok_n / (float)axis3_recent_sack_ok_count : 0.0f;
+
+	// Cooldown gate (Axis-1 supremacy): observations recorded above, MOVES skipped.
+	if(axis3_cooldown_batches > 0)
+	{
+		axis3_skipped_in_cooldown++;
+		printf("[POLICY-AXIS3] eval ok=%d consec_misses=%d/%d ok_rate=%.2f mode=%s "
+			"COOLDOWN_REMAINING=%d (no move)\n",
+			(int)ok, axis3_consecutive_sack_misses,
+			(axis3_sack_mode == SACK_MODE_ON ? AXIS3_ON_TO_PROBE_MISSES
+				: AXIS3_PROBE_TO_OFF_MISSES),
+			sack_ok_rate, axis3_mode_str(axis3_sack_mode),
+			axis3_cooldown_batches);
+		fflush(stdout);
+		return;
+	}
+
+	int from_mode = axis3_sack_mode;
+	int to_mode   = from_mode;
+	const char* reason = NULL;
+
+	if(from_mode == SACK_MODE_ON)
+	{
+		if(axis3_consecutive_sack_misses >= AXIS3_ON_TO_PROBE_MISSES)
+		{
+			to_mode = SACK_MODE_PROBE;
+			reason  = "consecutive_misses>=3";
+		}
+	}
+	else if(from_mode == SACK_MODE_PROBE)
+	{
+		if(ok)
+		{
+			to_mode = SACK_MODE_ON;
+			reason  = "probe_recovered";
+		}
+		else if(axis3_consecutive_sack_misses >= AXIS3_PROBE_TO_OFF_MISSES)
+		{
+			to_mode = SACK_MODE_OFF;
+			reason  = "consecutive_misses>=5";
+		}
+	}
+	else if(from_mode == SACK_MODE_OFF)
+	{
+		// While OFF, decode_sack_v2_frame is not even called → policy_evaluate_axis3
+		// is normally not invoked. If it IS (synthetic test fire), any ok event
+		// in OFF is an unambiguous signal that the reverse path recovered — the
+		// spec says "PROBE→ON: any successful SACK while in PROBE", not OFF;
+		// here we route OFF→PROBE so the next batch's outcome confirms.
+		// The periodic OFF→PROBE re-probe is driven by axis3_batch_tick().
+		// We do NOT transition on miss events while OFF (the controller
+		// already chose OFF; further misses don't change the verdict).
+		if(ok)
+		{
+			to_mode = SACK_MODE_PROBE;
+			reason  = "off_unexpected_ok";
+		}
+	}
+
+	if(to_mode == from_mode)
+	{
+		printf("[POLICY-AXIS3] eval ok=%d consec_misses=%d ok_rate=%.2f mode=%s "
+			"(no move)\n",
+			(int)ok, axis3_consecutive_sack_misses, sack_ok_rate,
+			axis3_mode_str(from_mode));
+		fflush(stdout);
+		return;
+	}
+
+	// State transition.
+	printf("[POLICY-MOVE] axis=3 from=%s to=%s reason=%s consec_misses=%d "
+		"ok_rate=%.2f ring_n=%d\n",
+		axis3_mode_str(from_mode), axis3_mode_str(to_mode), reason,
+		axis3_consecutive_sack_misses, sack_ok_rate, axis3_recent_sack_ok_count);
+	fflush(stdout);
+
+	axis3_sack_mode = to_mode;
+
+	// Reset counters appropriately. On PROBE→ON, reset consecutive_misses
+	// (the probe succeeded). On ON→PROBE, KEEP consecutive_misses (we need
+	// it to count up to 5 for PROBE→OFF). On OFF→PROBE, reset.
+	if(from_mode == SACK_MODE_ON && to_mode == SACK_MODE_PROBE)
+	{
+		// Keep consecutive_misses; ring stays so PROBE→OFF can fire on +2 more.
+		axis3_move_on_to_probe_count++;
+	}
+	else if(from_mode == SACK_MODE_PROBE && to_mode == SACK_MODE_ON)
+	{
+		axis3_consecutive_sack_misses = 0;
+		axis3_move_probe_to_on_count++;
+	}
+	else if(from_mode == SACK_MODE_PROBE && to_mode == SACK_MODE_OFF)
+	{
+		axis3_move_probe_to_off_count++;
+		axis3_batches_since_off = 0; // start counting 20 batches before re-probe
+	}
+	else if(from_mode == SACK_MODE_OFF && to_mode == SACK_MODE_PROBE)
+	{
+		axis3_consecutive_sack_misses = 0;
+		axis3_move_off_to_probe_count++;
+	}
+
+	// Inform RSP via SET_LINK_PARAMS (CMD-side flow control — §3.8).
+	axis3_send_set_link_params(to_mode, reason ? reason : "axis3_move");
+}
+
+// SACK Design A Step 11 — per-batch tick. Drives the OFF→PROBE periodic
+// re-probe (every 20 batches). Decrements the Axis-1 supremacy cooldown
+// (so 3 batches after an Axis-1 move, Axis-3 is free to move again).
+//
+// Called once per batch completion from process_messages_rx_acks_data()
+// regardless of whether a SACK event fired (covers OFF state too). Gated
+// on sack_v2_enabled at the call site; v1 sessions never call this.
+void cl_arq_controller::axis3_batch_tick()
+{
+	// Drain Axis-1 supremacy cooldown for Axis 3.
+	if(axis3_cooldown_batches > 0)
+	{
+		axis3_cooldown_batches--;
+	}
+
+	// OFF-state re-probe timer.
+	if(axis3_sack_mode != SACK_MODE_OFF) return;
+	axis3_batches_since_off++;
+	if(axis3_batches_since_off < AXIS3_OFF_TO_PROBE_BATCHES) return;
+
+	// Skip move if Axis-1 supremacy cooldown is active (consistent with
+	// policy_evaluate_axis3); we'll re-attempt next tick.
+	if(axis3_cooldown_batches > 0)
+	{
+		axis3_skipped_in_cooldown++;
+		return;
+	}
+
+	// 20 batches in OFF → fire OFF→PROBE.
+	printf("[POLICY-MOVE] axis=3 from=OFF to=PROBE reason=periodic_reprobe_20_batches "
+		"consec_misses=%d ring_n=%d\n",
+		axis3_consecutive_sack_misses, axis3_recent_sack_ok_count);
+	fflush(stdout);
+	axis3_sack_mode = SACK_MODE_PROBE;
+	axis3_consecutive_sack_misses = 0;
+	axis3_batches_since_off = 0;
+	axis3_move_off_to_probe_count++;
+	axis3_send_set_link_params(SACK_MODE_PROBE, "periodic_reprobe");
+}
+
+// SACK Design A Step 11 — synthetic Axis 3 fire (test-only).
+// CLI: --test-policy-axis3-fire=ok|miss → single event into
+// policy_evaluate_axis3.
+// CLI: --test-policy-axis3-walk → composite demo: drive 3 misses
+// (ON→PROBE), then 2 more (PROBE→OFF), then OFF→PROBE via batch_tick (20x).
+// Default builds never enter this; production paths unaffected.
+void cl_arq_controller::test_fire_policy_axis3(int kind)
+{
+	sack_v2_enabled = true;
+	if(kind == 1)
+	{
+		printf("[TEST-AXIS3-FIRE] kind=ok: feeding single ok event into "
+			"policy_evaluate_axis3 (starting mode=%s)\n",
+			axis3_mode_str(axis3_sack_mode));
+		fflush(stdout);
+		policy_evaluate_axis3(true);
+	}
+	else if(kind == 2)
+	{
+		printf("[TEST-AXIS3-FIRE] kind=miss: feeding single miss event into "
+			"policy_evaluate_axis3 (starting mode=%s)\n",
+			axis3_mode_str(axis3_sack_mode));
+		fflush(stdout);
+		policy_evaluate_axis3(false);
+	}
+	else if(kind == 3)
+	{
+		// Composite walk: ON → PROBE → OFF → PROBE.
+		// Note: SET_LINK_PARAMS TX is GUARDED by the messages_control.data NULL
+		// check in add_message_control(); in pre-init synthetic mode this fast-
+		// outs cleanly without crashing. We still observe the [POLICY-MOVE]
+		// log lines on every transition (the load-bearing evidence).
+		printf("[TEST-AXIS3-WALK] starting walk demo from mode=%s "
+			"(expect ON→PROBE on 3rd miss, PROBE→OFF on 5th miss, "
+			"OFF→PROBE on the 20-batch tick).\n",
+			axis3_mode_str(axis3_sack_mode));
+		fflush(stdout);
+
+		// Phase 1: 3 consecutive misses → ON→PROBE.
+		for(int i=1;i<=3;i++)
+		{
+			printf("[TEST-AXIS3-WALK] miss #%d (mode before=%s, consec=%d)\n",
+				i, axis3_mode_str(axis3_sack_mode),
+				axis3_consecutive_sack_misses);
+			fflush(stdout);
+			policy_evaluate_axis3(false);
+		}
+
+		// Phase 2: 2 more consecutive misses → PROBE→OFF (total 5 misses).
+		for(int i=4;i<=5;i++)
+		{
+			printf("[TEST-AXIS3-WALK] miss #%d (mode before=%s, consec=%d)\n",
+				i, axis3_mode_str(axis3_sack_mode),
+				axis3_consecutive_sack_misses);
+			fflush(stdout);
+			policy_evaluate_axis3(false);
+		}
+
+		// Phase 3: 20 batch ticks while OFF → OFF→PROBE periodic re-probe.
+		printf("[TEST-AXIS3-WALK] now in mode=%s; ticking %d batches to drive "
+			"periodic OFF→PROBE re-probe.\n",
+			axis3_mode_str(axis3_sack_mode), AXIS3_OFF_TO_PROBE_BATCHES);
+		fflush(stdout);
+		for(int b=1;b<=AXIS3_OFF_TO_PROBE_BATCHES;b++)
+		{
+			axis3_batch_tick();
+		}
+
+		// Phase 4: from PROBE, single ok event → PROBE→ON.
+		printf("[TEST-AXIS3-WALK] now in mode=%s; feeding single ok to "
+			"drive PROBE→ON.\n", axis3_mode_str(axis3_sack_mode));
+		fflush(stdout);
+		policy_evaluate_axis3(true);
+
+		printf("[TEST-AXIS3-WALK] composite walk complete. Final mode=%s. "
+			"Counters: on→probe=%lld, probe→on=%lld, probe→off=%lld, "
+			"off→probe=%lld.\n",
+			axis3_mode_str(axis3_sack_mode),
+			axis3_move_on_to_probe_count, axis3_move_probe_to_on_count,
+			axis3_move_probe_to_off_count, axis3_move_off_to_probe_count);
+		fflush(stdout);
+	}
+	else
+	{
+		printf("[TEST-AXIS3-FIRE] kind=%d not in {1=ok, 2=miss, 3=walk}; no-op\n",
+			kind);
+		fflush(stdout);
+	}
 }
 
 void cl_arq_controller::process_buffer_data_commander()

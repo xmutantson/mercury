@@ -171,6 +171,7 @@ cl_arq_controller::cl_arq_controller()
 	cmd_sack_v2_last_rx_batch_seq_id=-1;
 	test_rsp_sack_rsp_crc_corrupt=false;
 	test_rsp_sack_rsp_crc_corrupt_armed=false;
+	test_rsp_sack_rsp_crc_corrupt_count=0;
 	// SACK Design A Step 8a — RSP prev-batch parallel-storage bookkeeping.
 	// All gated on sack_v2_enabled; v1 path leaves these at their sentinels.
 	// `messages_rx_prev` itself is allocated in init_messages_buffers().
@@ -198,6 +199,27 @@ cl_arq_controller::cl_arq_controller()
 	rsp_set_link_params_crc_fail_count=0;
 	pending_link_params_batch_size=-1;
 	pending_link_params_sack_mode=-1;
+	// SACK Design A Step 11 — Axis 3 controller state (SACK mode ON↔PROBE↔OFF).
+	// Initial state = ON (per §4.3.2 spec). The mode is materially ON only on
+	// sack_v2_enabled sessions; on v1 sessions the field stays at its sentinel
+	// but no Axis-3 code path is reached (all sites gated on sack_v2_enabled).
+	axis3_sack_mode = SACK_MODE_ON;
+	for(int i=0;i<AXIS3_RING_DEPTH;i++) axis3_recent_sack_ok[i]=false;
+	axis3_recent_sack_ok_count=0;
+	axis3_recent_sack_ok_pos=0;
+	axis3_consecutive_sack_misses=0;
+	axis3_batches_since_off=0;
+	axis3_cooldown_batches=0;
+	axis3_evaluations=0;
+	axis3_ok_events=0;
+	axis3_miss_events=0;
+	axis3_move_on_to_probe_count=0;
+	axis3_move_probe_to_on_count=0;
+	axis3_move_probe_to_off_count=0;
+	axis3_move_off_to_probe_count=0;
+	axis3_skipped_in_cooldown=0;
+	test_policy_axis3_fire_armed=0;
+	test_policy_axis3_walk_armed=0;
 	crypto_buf[0].clear();
 	crypto_buf[1].clear();
 	message_transmission_time_ms=500;
@@ -4301,6 +4323,19 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 		fflush(stdout);
 		crc = corrupted;
 		test_rsp_sack_rsp_crc_corrupt_armed = false;
+	}
+	// SACK Design A Step 11 — N-shot CRC8 fault injection. Decrements per
+	// SACK_RSP TX. Used by Gate 3 (ON→PROBE→OFF) and Gate 5 (PROBE→ON).
+	else if(test_rsp_sack_rsp_crc_corrupt_count > 0)
+	{
+		unsigned char corrupted = (unsigned char)(crc ^ 0xFFu);
+		printf("[TX-SACK-V2-CRC-CORRUPT-N] frame: CRC8 0x%02x -> 0x%02x "
+			"(N-shot, %d remaining after this)\n",
+			(unsigned)crc, (unsigned)corrupted,
+			test_rsp_sack_rsp_crc_corrupt_count - 1);
+		fflush(stdout);
+		crc = corrupted;
+		test_rsp_sack_rsp_crc_corrupt_count--;
 	}
 	payload[1 + bitmap_bytes] = crc;
 

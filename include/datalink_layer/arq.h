@@ -487,6 +487,76 @@ public:
   // after any Axis 1 move." Pure-state, no logging.
   int axis2_cooldown_tick();
 
+  // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
+  //
+  // policy_evaluate_axis3() implements the per-SACK-event §4.3.2 controller.
+  //   - Observable: `sack_ok_rate = mean(recent_sack_ok)` over 10 most-recent
+  //     SACK events; AND `consecutive_sack_misses`.
+  //   - SACK event: every time CMD attempts a SACK_RSP decode at the
+  //     expected window (post Step-7 decode_sack_v2_frame() call) OR the
+  //     SACK window closes without ever receiving a SACK_RSP frame (= "no
+  //     SACK heard within the window").
+  //   - ok = LDPC/CRC decoded valid; miss = no SACK heard OR CRC8/LDPC failed.
+  //   - Cadence: per-SACK-event.
+  //   - Action: three-state {ON, PROBE, OFF}.
+  //   - Hysteresis (§4.3.2):
+  //       ON   → PROBE on consecutive_sack_misses >= 3
+  //       PROBE→ ON    on the very next ok event
+  //       PROBE→ OFF   on consecutive_sack_misses >= 5
+  //       OFF  → PROBE every 20 batches (periodic re-probe — driven by
+  //                    axis3_batch_tick(), not policy_evaluate_axis3())
+  //
+  // On state change: CMD writes pending_link_params_sack_mode and calls
+  // add_message_control(SET_LINK_PARAMS) carrying the new mode (subject
+  // to Axis-1 supremacy cooldown — see axis3_cooldown_batches). RSP applies
+  // via its existing SET_LINK_PARAMS handler.
+  //
+  // SACK_MODE_OFF effect:
+  //   CMD-side: do NOT enter decode_sack_v2_frame() (skip the SACK window
+  //             v2 branch). Falls back to the existing receive_ack_pattern()
+  //             full-batch ACK detection and, on timeout, the legacy
+  //             retransmit path that marks PENDING_ACK → ACK_TIMED_OUT for
+  //             process_messages_tx_data() to resend the whole batch. This
+  //             is graceful degradation, not a protocol break.
+  //   RSP-side: do NOT call send_sack_v2_frame() on partial batches. Lets
+  //             CMD's ACK-timeout drive a full-batch retransmit. No
+  //             NULL_SACK is sent; we simply skip the SACK window TX.
+  //
+  // SACK_MODE_PROBE behaves identically to ON for the next batch — RSP
+  // sends SACK_RSP, CMD attempts decode. The probe outcome determines the
+  // next transition (success → ON, miss → consecutive_sack_misses increments;
+  // reaching 5 → OFF).
+  //
+  // Gated on `sack_v2_enabled` at every call site; v1 sessions never call
+  // any Axis-3 function.
+  //
+  // ok parameter: true if decode_sack_v2_frame() returned true (CRC8 valid);
+  // false if CRC8 failed OR the SACK window closed without any SACK_RSP
+  // frame received.
+  void policy_evaluate_axis3(bool ok);
+
+  // SACK Design A Step 11 — helper used by policy_evaluate_axis3() and
+  // axis3_batch_tick() to stage and send a SET_LINK_PARAMS carrying the
+  // current data_batch_size + the new sack_mode. Private contract.
+  void axis3_send_set_link_params(int new_sack_mode, const char* reason_tag);
+
+  // SACK Design A Step 11 — per-batch tick for Axis 3.
+  // Called once per batch completion regardless of whether a SACK event
+  // fired (covers the OFF-state "every 20 batches re-probe" cadence and
+  // tracks total batches for diagnostics).
+  // Increments axis3_batches_since_off when sack_mode==OFF; on reaching
+  // AXIS3_OFF_TO_PROBE_BATCHES (20), transitions OFF → PROBE and emits a
+  // SET_LINK_PARAMS. Gated on sack_v2_enabled at call sites.
+  void axis3_batch_tick();
+
+  // SACK Design A Step 11 — synthetic Axis 3 fire (test-only).
+  // CLI: --test-policy-axis3-fire={ok,miss}. Feeds one synthetic SACK event
+  // into policy_evaluate_axis3(). Plus a composite flag fires 3 consecutive
+  // misses to drive ON→PROBE, then 2 more for PROBE→OFF, then a final ok
+  // to demonstrate would-be PROBE→ON (skipped due to SET_LINK_PARAMS init
+  // dependency, similar to the Axis-2 demo). Default off; CLI-gated.
+  void test_fire_policy_axis3(int kind);
+
   void process_messages_responder();
 	//! Adds the received data message to the buffer.
 	    /*!
@@ -690,6 +760,11 @@ public:
                                               // test_rsp_sack_rsp_crc_corrupt at
                                               // configure time; cleared when
                                               // the corruption fires).
+  // SACK Design A Step 11 — N-shot CRC8 fault injection. When >0, the next N
+  // SACK_RSP frames will have their CRC8 XOR'd with 0xFF; decrements per
+  // SACK_RSP TX. Independent of the one-shot armed flag above.
+  // CLI: --test-rsp-sack-rsp-crc-corrupt-count=N. Default 0 (no corruption).
+  int test_rsp_sack_rsp_crc_corrupt_count;
 
   // SACK Design A Step 8a — RSP-side prev-batch parallel storage.
   // ALL gated on sack_v2_enabled. v1 path never reads or writes any of these
@@ -834,6 +909,46 @@ public:
   // will substitute current data_batch_size / 1=ON).
   int pending_link_params_batch_size;
   int pending_link_params_sack_mode;
+
+  // SACK Design A Step 11 — Axis 3 controller state (SACK mode adaptation).
+  // BOTH peers track sack_mode (CMD decides, RSP obeys via SET_LINK_PARAMS).
+  // All ring/counter/diagnostic state is CMD-side only; RSP only needs the
+  // mode value itself (axis3_sack_mode) to gate send_sack_v2_frame().
+  //
+  // §4.3.1 sack_mode encoding (matches SET_LINK_PARAMS wire byte):
+  //   0 = SACK_MODE_OFF   (RSP suppresses SACK_RSP; CMD ignores SACK window)
+  //   1 = SACK_MODE_ON    (default when sack_v2_enabled negotiated)
+  //   2 = SACK_MODE_PROBE (next batch behaves as ON; outcome drives transition)
+  //
+  // §4.3.2 hysteresis thresholds + §4.3.3 cross-axis cooldown:
+  static const int SACK_MODE_OFF   = 0;
+  static const int SACK_MODE_ON    = 1;
+  static const int SACK_MODE_PROBE = 2;
+  static const int AXIS3_RING_DEPTH               = 10; // ring of 10 recent SACK events
+  static const int AXIS3_ON_TO_PROBE_MISSES       = 3;  // ON→PROBE on 3 consecutive misses
+  static const int AXIS3_PROBE_TO_OFF_MISSES      = 5;  // PROBE→OFF on 5 consecutive misses (since the ON→PROBE entry)
+  static const int AXIS3_OFF_TO_PROBE_BATCHES     = 20; // OFF→PROBE every 20 batches
+  static const int AXIS3_CROSS_AXIS_COOLDOWN_BATCHES = 3; // §4.3.3 Axis-1 supremacy cooldown — Axis-3
+
+  int  axis3_sack_mode;                  // current Axis-3 state (SACK_MODE_*)
+  bool axis3_recent_sack_ok[AXIS3_RING_DEPTH]; // ring of 10 most-recent events (true=ok, false=miss)
+  int  axis3_recent_sack_ok_count;       // [0..AXIS3_RING_DEPTH]; pre-fill before mean
+  int  axis3_recent_sack_ok_pos;         // ring write index
+  int  axis3_consecutive_sack_misses;    // streak counter (reset on any ok event)
+  int  axis3_batches_since_off;          // OFF→PROBE re-probe timer (counts batches in OFF)
+  int  axis3_cooldown_batches;           // §4.3.3 Axis-1 supremacy cooldown — Axis-3 skips
+                                         //      moves while >0; decremented per batch tick.
+  long long axis3_evaluations;           // count of policy_evaluate_axis3() calls
+  long long axis3_ok_events;             // count of ok events
+  long long axis3_miss_events;           // count of miss events
+  long long axis3_move_on_to_probe_count;
+  long long axis3_move_probe_to_on_count;
+  long long axis3_move_probe_to_off_count;
+  long long axis3_move_off_to_probe_count;
+  long long axis3_skipped_in_cooldown;   // moves suppressed by cross-axis cooldown
+  // Test-scaffold for synthetic Axis-3 fire.
+  int  test_policy_axis3_fire_armed;     // 0=off, 1=ok-event, 2=miss-event
+  int  test_policy_axis3_walk_armed;     // 0=off, 1=walk ON→PROBE→OFF→PROBE (composite demo)
 
   // Responder: double-buffered crypto batch storage
   st_crypto_batch_buffer crypto_buf[2]; // [0] = oldest pending, [1] = current
