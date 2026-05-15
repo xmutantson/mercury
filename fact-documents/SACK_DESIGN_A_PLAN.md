@@ -835,6 +835,170 @@ Plan doc commit (this entry): mercury `monitor` (next commit on this branch).
 
 Step 1 is NOT started.
 
+### §7.5 RESULT — Step 5 (2026-05-15)
+
+Mercury commit: `monitor` `39ddf90` — "sack: Step 5 — define
+SET_LINK_PARAMS=0x43 message type (scaffolding)".
+
+Wire-format addition only. Two files changed (`+20 LOC`):
+
+- `include/datalink_layer/datalink_defines.h:88-94` — reserves `0x42`
+  for SACK_RSP (later step) and defines `SET_LINK_PARAMS = 0x43` with
+  inline scaffolding-phase comment.
+- `source/datalink_layer/arq_responder.cc:1800-1815` — adds a no-op
+  stub handler in `process_control_responder()` keyed on
+  `link_status==CONNECTED && code==SET_LINK_PARAMS`. Body: log
+  `[RSP-LINK-PARAMS] SET_LINK_PARAMS received (len=N) — no-op stub
+  (Step 5)`, then `messages_control.status = FREE;`. No state mutation,
+  no peer-visible response.
+
+Graceful-ignore audit on dispatch (`process_control_responder()`):
+the chain is a closed `if/else if/.../else` over a fixed code list
+ending in `else { if(code==CLOSE_CONNECTION) {…} }` at lines
+`1815-1852` post-edit (was `1800-1837` pre-edit). Unknown codes fall
+into the terminal `else` and are silently dropped — no crash, no
+status mutation. A pre-Step-5 peer receiving a `0x43` from a future
+Step-7+ sender would simply ignore it, exactly as the plan
+requires. **Confirmed: existing peers gracefully ignore unknown
+0x43.** No dispatch hardening needed.
+
+Verifying test (Step 0 harness — the v2-attempt regression mitigation):
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS — same input → byte-identical output
+  pass 1 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+  pass 2 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step5.json
+wrote post_step5.json (4808 bytes,
+  sha256=73c6acc8da9adf20c9bd0c7244e7278d2aac69f6af4457241bc4cf55d74f5331)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+Pre-Step-5 baseline sha256: `73c6acc8da9adf20c9bd0c7244e7278d2aac69f6af4457241bc4cf55d74f5331`
+Post-Step-5 same-input sha256: `73c6acc8da9adf20c9bd0c7244e7278d2aac69f6af4457241bc4cf55d74f5331`
+**Byte-identical v1-only-negotiated wire grading: PASS.**
+
+Audit of v1 wire paths perturbed: zero. The only new code path is
+keyed on `code==SET_LINK_PARAMS=0x43`, which v1-only peers neither
+emit nor expect.
+
+Build: `bash build.sh o3` PASS (1 pre-existing sign-compare warning at
+`arq_commander.cc:1423`, unrelated).
+
+Step 6 is the next step.
+
+### §7.6 RESULT — Step 6 (2026-05-15)
+
+Mercury commit: `monitor` `e6c4f67` — "sack: Step 6 — define
+CAP_SACK_V2=0x40 + negotiate sack_v2_enabled".
+
+Capability flag + negotiation only. Six files changed (`+71 LOC`):
+
+- `include/datalink_layer/datalink_defines.h:102-108` —
+  `#define CAP_SACK_V2 0x40` with NEGOTIATE-ONLY phase comment.
+- `include/datalink_layer/arq.h:414-419` — two new members on
+  `cl_arq_controller`: `bool sack_v2_enabled` (negotiated, computed
+  at TEST_CONNECTION) and `bool enable_sack_v2` (CLI opt-in that
+  persists across `local_capability` resets — see below).
+- `source/datalink_layer/arq_common.cc:128-130, 183, 2345, 2444,
+  2482, 2502, 2523` — initialize both members to `false`; OR
+  `CAP_SACK_V2` into `local_capability` at every reset site iff
+  `enable_sack_v2` is true. Six sites total (constructor + five
+  TCP-command reset paths: `CONNECT`, `LISTEN`, `LISTENNB`,
+  `LISTENWB`, `CONNECTWB`).
+- `source/datalink_layer/arq_commander.cc:2129-2143` — after the
+  existing CAP_SACK negotiation block (per the plan's pointer to
+  `arq_commander.cc:2103-2128`), compute
+  `sack_v2_enabled = (local & CAP_SACK_V2) && (peer & CAP_SACK_V2)`
+  and emit `[SACK-V2] (enabled|not enabled) (local=0xXX peer=0xXX) —
+  gates nothing yet`.
+- `source/datalink_layer/arq_responder.cc:1373-1383` — mirror the
+  commander block in `process_control_responder()`'s
+  `code==TEST_CONNECTION` branch.
+- `source/main.cc:297, 542-549, 1266-1278` — define
+  `bool enable_sack_v2_cli`, parse `--enable-sack-v2`, and at
+  configure time set `ARQ.enable_sack_v2 = true;
+  ARQ.local_capability |= CAP_SACK_V2;` with a `[FLAG]` log.
+
+**§4.2.4 mitigation (the explicit v2-attempt regression check, per
+SACK_REDESIGN_PLAN.md §9):**
+
+1. CAP_SACK_V2 fits in the existing single-byte capability field at
+   `messages_control.data[5]`. No length change. Plan rule
+   §4.2.4 #1: **satisfied.**
+2. TEST_CONNECTION wire shape: `data[0]=TEST_CONNECTION`,
+   `data[1..4]=SNR float`, `data[5]=local_capability`,
+   `data[6]=ssid`, `length=7`. Inspecting every
+   `local_capability =` assignment site in `arq_common.cc`
+   (constructor + 5 reset paths): every site is functionally
+   `(... CAP_SACK | ...)` followed by optional masks. The new
+   `if(enable_sack_v2) local_capability |= CAP_SACK_V2;` line is
+   gated on a member that defaults to `false`. **A peer that does
+   NOT pass `--enable-sack-v2` produces a `local_capability` byte
+   bit-identical to pre-Step-6.** Plan rule §4.2.4 #2: **satisfied.**
+3. Deterministic harness used as the verification gate. Plan rule
+   §4.2.4 #3: **satisfied.**
+
+Persistence-across-reset audit: the prior `disable_sack` member uses
+exactly the same pattern (init in ctor, OR-mask in each reset). The
+new `enable_sack_v2` member mirrors that pattern, ensuring that a
+mid-session `CONNECT`/`LISTEN` re-entry does not silently drop the
+v2-cap bit from `local_capability`. Without this, every reset would
+clobber the bit and the negotiation would be intermittent.
+
+Verifying test (Step 0 harness):
+
+```
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step6_final.json
+wrote post_step6_final.json (4808 bytes,
+  sha256=73c6acc8da9adf20c9bd0c7244e7278d2aac69f6af4457241bc4cf55d74f5331)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS — same input → byte-identical output
+```
+
+Pre-Step-5 baseline:   `73c6acc8da9adf20c9bd0c7244e7278d2aac69f6af4457241bc4cf55d74f5331`
+Post-Step-6 same input: `73c6acc8da9adf20c9bd0c7244e7278d2aac69f6af4457241bc4cf55d74f5331`
+**Byte-identical v1-only-negotiated wire grading: PASS.**
+
+CLI smoke-test (`./mercury.exe --enable-sack-v2 -m ARQ -s 0 -n -x wasapi`)
+confirms the new `[FLAG]` log line fires:
+
+```
+[FLAG] --enable-sack-v2: CAP_SACK_V2 added to local_capability
+  (negotiate-only; gates nothing yet — SACK Design A Step 6)
+```
+
+Observation (per the plan's required deliverable):
+- `sack_v2_enabled` becomes `true` only when both peers pass
+  `--enable-sack-v2` (both cap bytes carry `0x40`). A `v1+v2 ↔ v1+v2`
+  handshake logs `[SACK-V2] enabled (negotiate-only) (local=0x77
+  peer=0x77) — gates nothing yet` on both sides.
+- A `v1-only ↔ v1+v2` mismatch (one peer omits `--enable-sack-v2`)
+  logs `[SACK-V2] not enabled (...)` on both sides because the AND
+  of the two cap masks zeroes the v2 bit.
+- A `v1-only ↔ v1-only` (default) handshake logs `[SACK-V2] not
+  enabled (local=0x37 peer=0x37)` — and produces the same wire bytes
+  as a pre-Step-6 build (verified above).
+
+Build: `bash build.sh o3` PASS (same pre-existing sign-compare warning).
+
+**Steps 1, 2, 3, 7+ are NOT started.** DATA frame header format
+(`DATA_LONG_HEADER_LENGTH=4`, `DATA_SHORT_HEADER_LENGTH=5`) is
+unchanged — that growth is Step 1+2+3 and is gated on
+`sack_v2_enabled` per the §7 revised order (0 → 5 → 6 → 1+2+3 →
+4 → 7 → ...). Step 7 (the SACK_RSP `0x42` OFDM control frame) and
+the Axes 2/3 controllers (Steps 10/11) are likewise NOT started.
+
 ---
 
 ## §7 Open questions [?]
