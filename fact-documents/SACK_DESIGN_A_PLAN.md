@@ -1868,6 +1868,399 @@ The legacy `CAP_SACK` MFSK SACK pattern is fully operational on
 in this commit, and Gate 1's `v1<->v1 SHA-256 stability` proves it
 at the byte level.
 
+### §7.8 RESULT — Step 8 (2026-05-15) — STOP-and-discuss
+
+**Status: STOP-and-discuss.** Per CLAUDE.md §"three consecutive
+structural fixes signals an architectural problem" and per the
+Step-8 prompt's own STOP gate ("Step 8 is structurally significant;
+a real failure here is a STOP-and-discuss signal, not a 'try harder'
+signal"), **no Mercury source-tree edits landed this session.**
+Mercury source remains at commit `9e50b39` (post-Step-7). This
+RESULT block documents the structural finding that triggered the
+STOP before any source-tree code edit.
+
+**Plan-doc commit (this entry):** mercury `monitor` — next commit
+on this branch; RESULT-block-only.
+
+**WAV-harness v1↔v1 SHA-256:** verified stable at
+`9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`
+(re-confirmed at session start before any analysis; identical to
+§7.7's post-Step-7 hash). No source edits attempted, so the hash
+is preserved trivially. v1↔v1 wire path byte-identical.
+**Gate 1: PASS.**
+
+#### §7.8.1 What the Step-8 prompt specified
+
+The Step-8 prompt's CMD-side instructions:
+
+1. Lift the `:2987-2990` (current `arq_commander.cc:3109-3112`)
+   block in `process_buffer_data_commander()` gated on
+   `sack_v2_enabled` — new-data staging proceeds in parallel with
+   a pending retransmit queue.
+2. Lift the `:730-793` (current `arq_commander.cc:741-820`)
+   early-return in `process_messages_tx_data()` gated on
+   `sack_v2_enabled` — fall through to the regular new-data fill
+   path.
+3. Build mixed batches as **retransmits-first** (carrying their
+   *original* `batch_seq_id` via Step 3's
+   `captured_batch_seq_id_for_retransmit`) then new-data (carrying
+   the *current* incremented `cmd_batch_seq_id`).
+
+The prompt's RSP-side claim was: "Step 4's routing decision is what
+makes this safe — retransmits hit the *match-prev* branch, new-data
+hits the *match-current* branch. **No new RSP code needed**; Step 4
+already handles this. Verify by inspection that Step 4's branch
+covers the case (it does per `arq_responder.cc` §7.4)."
+
+This RESULT challenges the second claim on two structural grounds.
+
+#### §7.8.2 Structural problem A — prev/current bump site missing in the partial-batch flow
+
+Step 4 (§7.4) added a single bump site at
+`arq_responder.cc:1029-1037`:
+
+```
+if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0) {
+    rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
+    rsp_current_expected_batch_seq_id =
+        (rsp_current_expected_batch_seq_id + 1) & 0xFF;
+    printf("[RSP-V2-BATCH-DONE] prev=%d next_expected=%d\n", ...);
+}
+```
+
+This bump fires **only at the ACK-GATE-PASS site** (= after a batch
+fully completes via all `data_batch_size` slots RECEIVED, not
+partial). The SACK-partial branch (`arq_responder.cc:914-975`)
+explicitly leaves both fields unchanged ("Keep partial messages_rx
+(DON'T free) - retransmit fills gaps", line 954).
+
+Trace through the Step 8 mixed-batch scenario CMD must produce:
+
+1. CMD sends batch N=0 (new-data). `cmd_batch_seq_id` advances
+   0→1 per the existing logic at `arq_commander.cc:895-898`.
+2. RSP receives slots {0,1,2,4}, missing slot 3. SACK_RSP
+   dispatched at `arq_responder.cc:946` (Step 7's
+   `send_sack_v2_frame`). RSP's state:
+   `rsp_current_expected_batch_seq_id = 0`,
+   `rsp_prev_batch_seq_id = -1` — **UNCHANGED** (no bump on the
+   SACK-partial path).
+3. CMD receives the SACK_RSP for batch_seq_id=0 with a bitmap
+   showing slot 3 missing. CMD has `retransmit_count = 1` and
+   `retransmit_frame_batch_seq_ids[0] = 0`. With Step 8 lifts
+   applied, CMD builds a mixed batch:
+   - retx frame: `batch_seq_id = 0` (captured original).
+   - new-data frames: `batch_seq_id = cmd_batch_seq_id = 1`
+     (already incremented after batch 0's `send_batch()`).
+4. RSP receives the mixed batch. Per Step 4 routing at
+   `arq_responder.cc:358-372`:
+   - retx (bsi=0): `match_current = (0 == 0) = true` → routed
+     (NOT match_prev — the retx matches *current*, not prev,
+     because RSP hasn't advanced).
+   - **new-data (bsi=1): `match_current = (1 == 0) = false`,
+     `match_prev = (-1 >= 0 && …) = false` → DROP** with
+     `[RSP-V2-DROP] batch_seq_id=1 expected=0 prev=-1 reason=
+     unknown_or_out_of_window`.
+
+The match-prev branch is dormant in this case; the new-data tail
+of the mixed batch is silently dropped. The prompt's "retransmits
+hit match-prev, new-data hits match-current" only works if RSP has
+already bumped `prev=N, current=N+1` by the time the mixed batch
+arrives. The natural site for that bump is **SACK_RSP send time**
+(when RSP commits "I've sealed feedback for batch N; CMD may now
+send for N+1"). That is a NEW bump site beyond what Step 4 built,
+contradicting the prompt's "no new RSP code needed" assertion.
+
+The bump itself is small (~5-10 LOC mirroring the existing site at
+`arq_responder.cc:1029-1037`). It IS feasible. But it is NOT free;
+Step 4 did not land it; and adding it without the storage piece
+below raises Structural Problem B.
+
+#### §7.8.3 Structural problem B — single-buffered `messages_rx[]` corrupts data in mixed batches
+
+Even with the §7.8.2 bump added (so retx routes match-prev and
+new-data routes match-current), the deeper problem is that the
+on-RSP receive buffer is a **single flat array** —
+`cl_arq_controller::messages_rx` (`arq.h:824`), allocated with
+`nMessages = 120` slots in `init_messages_buffers()`
+(`arq_common.cc:1383`). All frames are stored by their wire
+`sequence_number` (= `messages_rx_buffer.id`) at
+`arq_responder.cc:84,103`:
+
+```
+messages_rx[loc].status = RECEIVED;   // loc = messages_rx_buffer.id
+```
+
+The SACK-partial branch at `arq_responder.cc:954` deliberately
+keeps already-RECEIVED slots in `messages_rx[]` ("DON'T free")
+until retransmits fill the gaps. Then ACK-GATE-PASS delivers the
+whole batch via `copy_data_to_buffer()` at
+`arq_responder.cc:1076` — which itself only iterates
+`messages_rx[0..data_batch_size-1]`
+(`arq_common.cc:5714-5734`).
+
+Mercury's compression / encryption model is **whole-batch-or-
+nothing** — the compressed payload spans all `data_batch_size`
+frames; partial-batch delivery is impossible. Streaming
+compression (PPMd + zstd) requires the full batch's data to
+advance its context (`SACK_FIX_PLAN.md` §9, the never-built
+`crypto_batch_buffer` from
+`SACK_THROUGHPUT_INVESTIGATION.md` §16.3).
+
+In a mixed-batch scenario (batch_size=5, batch 0 partial with
+slot 3 missing, mixed-batch carrying 1 retx + 4 new-data):
+
+| Wire frame | sequence_number | bsi | What RSP does |
+|------------|-----------------|-----|---------------|
+| Retx for old slot 3 | 3 (preserved) | 0 | match_prev → `messages_rx[3]` ← retx (**fills gap** in batch 0) |
+| New-data frame 1 | 1 (`arq_common.cc:3037` assigns `i`) | 1 | match_current → `messages_rx[1]` ← **OVERWRITES batch 0 slot 1 RECEIVED data** with batch 1 |
+| New-data frame 2 | 2 | 1 | match_current → `messages_rx[2]` ← **OVERWRITES batch 0 slot 2 RECEIVED data** |
+| New-data frame 3 | 3 | 1 | match_current → `messages_rx[3]` ← **OVERWRITES the just-filled retx in slot 3** |
+| New-data frame 4 | 4 | 1 | match_current → `messages_rx[4]` ← **OVERWRITES batch 0 slot 4 RECEIVED data** |
+
+Result: when the timer next fires and ACK-GATE evaluates, slots
+0..4 hold a CORRUPTED MIX of batch-0 data (slot 0 only) and batch-1
+data (slots 1..4). `copy_data_to_buffer()` decompresses this
+garbage and delivers corrupted data to the application. **§4.3.4
+invariant #3 ("No silent corruption") is violated.**
+
+Alternative slot-number assignments do not fix this on the wire-
+addressing layer alone:
+
+- **New-data uses sequence_numbers ≥ data_batch_size (e.g. 5..9):**
+  avoids slot-position overlap with retx (which uses original
+  positions 0..4). But then `copy_data_to_buffer()` —
+  `arq_common.cc:5714` — iterates `messages_rx[0..data_batch_size-1]`
+  and never reaches slots 5..9. Batch 1's data sits unprocessed
+  in high slots. Fixing this requires per-batch slot offsets +
+  delivery-loop awareness — a moderate refactor that crosses into
+  the "double-buffer / per-batch storage" territory.
+- **Retx packed at the head + new-data at the tail of the slot
+  range:** retx at slot 0 (sequence_number reassigned to 0),
+  new-data at slots 1..4. But then RSP can't know which old-batch
+  slot the retx corresponds to (the original-slot information is
+  lost from the wire frame). Mis-slots batch 0's retx data.
+- **Reserve half the slot space for prev, half for current:**
+  Mercury's batch_size is up to 25; with nMessages=120 there is
+  physical headroom, but the addressing layer (sequence_number is
+  7 bits, 0..127) holds only ~5 batches. And the delivery loop's
+  "0..data_batch_size-1" bound is hard-coded; changing it is the
+  same refactor as the previous bullet.
+
+**No slot-number assignment scheme avoids cross-batch corruption
+without modifying `messages_rx[]`'s addressing or adding a parallel
+prev-batch storage buffer.**
+
+This is exactly what `SACK_RETRANSMIT_BATCHING_INVESTIGATION.md`
+§8.4 named on 2026-05-14 (verbatim):
+
+> Retransmit frames keep the *previous* batch's sequence numbers;
+> new frames use the *new* batch's. RSP must disambiguate which
+> batch a frame belongs to (the original design's `batch_seq_id`
+> idea from `SACK_REDESIGN_PLAN.md` §5.1, or a per-frame "this is
+> a retransmit" type bit). **This is the non-trivial part and is
+> why (a) was "simpler" — (a) sidesteps cross-batch sequence-space
+> collision entirely. Any (b) implementation must solve this first
+> or it will mis-slot frames.**
+
+And `SACK_THROUGHPUT_INVESTIGATION.md` §16.3:
+
+> **Double-buffer for crypto batches**: Plan (§4) specified
+> `crypto_batch_buffer` double-buffer. Implementation status: [?]
+> not verified.
+> — `crypto_batch_buffer` was **never built**.
+
+Step 3 added `batch_seq_id` to DATA frames (the disambiguation
+field on the wire). Step 4 added the routing-decision branches.
+**Step 8 needs the storage layer to actually go with them — and
+that is what is missing.**
+
+#### §7.8.4 What mechanism (b) actually needs (out of scope for current Step 8 framing)
+
+Minimal correct fix:
+
+1. **New parallel storage** in `cl_arq_controller`:
+   ```
+   struct st_message* messages_rx_prev;     // arq.h:824 sibling
+   ```
+   Allocated / deallocated in `init_messages_buffers()` /
+   `deinit_messages_buffers()` mirroring the existing
+   `messages_rx`. Size = `data_batch_size`. (`crypto_buf[2]` at
+   `arq.h:603` is allocated but **inert** today, per
+   `SACK_RETRANSMIT_BATCHING_INVESTIGATION.md` §4 — it could be
+   repurposed.)
+
+2. **Bump-and-flush at SACK_RSP send time** (the §7.8.2 missing
+   bump, plus the storage flush): in
+   `arq_responder.cc:914-975` SACK-partial branch, immediately
+   before calling `send_sack_v2_frame()`:
+   ```
+   if (sack_v2_enabled) {
+       // Flush current to prev:
+       memcpy(messages_rx_prev, messages_rx,
+              data_batch_size * sizeof(st_message));
+       for (int i = 0; i < data_batch_size; i++)
+           messages_rx[i].status = FREE;
+       // Bump routing window:
+       rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
+       rsp_current_expected_batch_seq_id =
+           (rsp_current_expected_batch_seq_id + 1) & 0xFF;
+   }
+   ```
+
+3. **Match-prev routes to prev storage**: at
+   `arq_responder.cc:375-482` in the v2 routing decision, when
+   `match_prev`, store into `messages_rx_prev[]` instead of
+   `messages_rx[]`. Requires either changing
+   `add_message_rx_data()` to take a target-buffer argument or
+   inlining the v2-prev store at the route-decision site.
+
+4. **Prev-batch completion + delivery**: after each frame is
+   stored into `messages_rx_prev[]`, check if all expected slots
+   for that batch are now RECEIVED. If yes, deliver the prev
+   batch via the same `copy_data_to_buffer()` path (with
+   `messages_rx_prev` substituted as the source), then mark
+   `rsp_prev_batch_seq_id = -1` to close the prev window.
+
+5. **Compression / crypto context ordering**: Mercury's
+   `compressor` (streaming PPMd + zstd, single context) and
+   `cipher_suite` (single counter) are session-level singletons.
+   Delivering prev then current requires the prev delivery to
+   finish BEFORE current is delivered (so the decompressor /
+   decryptor advances in TX order). That is the natural ordering
+   anyway; just needs an enforcement check at delivery.
+
+This is a ~80-120 LOC change spanning `arq.h`, `arq_common.cc`
+(init / deinit / delivery), `arq_responder.cc` (storage selection
++ delivery), and a likely refactor of `add_message_rx_data()` to
+accept a target buffer. It also needs a fault-injection scaffold
+(a way to deterministically force a per-frame drop pre-decode, so
+v2-loopback exercises the new path without VB-Cable variance) beyond
+what Step 4's `--test-rsp-bsi-corrupt-at=N` offers (which corrupts
+post-decode, not pre).
+
+This work exceeds Step 8's "lift two CMD-side blockers" scope and
+crosses into the "§4.2.3 cross-batch sequence-space fix" — which
+§4.2.3 NAMES but does not spec to the implementation-level needed.
+The §6 step table's Step 8 row reads "Replace `arq_commander.cc:
+727-794` retransmit-only `send_batch()` with the §4.2.3 'fold
+retransmits into next batch' pattern" — implementing §4.2.3's
+RSP storage side IS in scope of "the §4.2.3 pattern" but was not
+separately enumerated.
+
+#### §7.8.5 Why not a partial / unsafe implementation
+
+A purely-CMD-side implementation (lift the two blockers but make
+the mixed batch fall back to retx-only) would be safe but useless —
+it would not exercise the throughput lever the prompt names as
+Step 8's purpose. The throughput delta comes specifically from
+amortizing per-cycle ARQ overhead across new-data frames sent in
+the same TX as retransmits
+(`SACK_RETRANSMIT_BATCHING_INVESTIGATION.md` §7.2: "~50-75 % of
+each retx cycle is pure overhead"). Without actually mixing new-
+data into the batch on the wire, there is no lever to pull.
+
+A "lifts both blockers + adds bump at SACK_RSP send + omits the
+prev-batch storage" implementation would expose §7.8.3's silent
+corruption path in every v2 multi-batch session with any frame
+loss. Per CLAUDE.md "life-critical communication software ...
+robustness over speed", and per §4.3.4 invariant #3 "No silent
+corruption", shipping that is not an option.
+
+A "lifts blockers + bump + drops all new-data tail frames (the
+mixed-batch new-data is silently lost on RSP)" implementation
+preserves correctness at the cost of throughput: it would NOT
+mis-slot, but the new-data frames would be discarded and CMD would
+have to re-send them in the NEXT batch under normal new-data flow.
+Net throughput effect: roughly equivalent to today's standalone
+retx path (mechanism (a)) with the additional cost of wasted TX
+airtime on the now-discarded new-data tail. This is NEGATIVE-delta
+on throughput, not just zero.
+
+#### §7.8.6 Recommendation
+
+1. **Pause Step 8 as scoped** pending owner review of §7.8.4
+   (parallel prev-batch storage + bump-and-flush at SACK_RSP-send +
+   per-batch delivery loops).
+2. **Update §6 step table** to split current Step 8 into:
+   - **Step 8a** (new): add `messages_rx_prev[]` allocation +
+     bump-and-flush at SACK_RSP-send time + match-prev routes to
+     prev storage + prev-batch completion delivery. Behavior: a
+     v2 SACK-partial path now treats batch N's RECEIVED slots as
+     "moved to prev" and accepts retransmits into the prev
+     buffer. NEW-DATA staging is still BLOCKED (the
+     `arq_commander.cc:3109-3112` early-return remains unchanged
+     from today's mechanism (a)). Verifiable: inject one
+     synthetic frame via a new test scaffold and confirm it lands
+     in `messages_rx_prev`, not `messages_rx`.
+   - **Step 8b** (the prompt's current Step 8 scope): lift the two
+     CMD-side blockers. New-data fills the mixed batch alongside
+     retx. With Step 8a's storage in place, the new-data tail
+     safely routes to `messages_rx[]` (now empty of prev-batch
+     data) while retx routes to `messages_rx_prev[]`. This is
+     where the throughput lever actually engages.
+3. **OR alternative**: revisit whether Mercury's whole-batch-
+   compression model can support mechanism (b) at all without a
+   structural refactor of the storage / delivery loop.
+   `SACK_THROUGHPUT_INVESTIGATION.md` §16.3 flagged
+   `crypto_batch_buffer` as never-built; the prev-batch storage
+   here is the same architectural debt. If the answer is "not
+   without significant refactor", Design A's projected ~50 % per-
+   cycle savings on partial batches may need to come from a
+   different lever (e.g. the already-landed Step 7 OFDM SACK_RSP
+   already saves ~500-700 ms wall-clock per partial batch per
+   §7.7.4 Gate 3 — a meaningful fraction of the projected SACK
+   advantage, achieved without mechanism (b)).
+
+#### §7.8.7 Validation gates — status
+
+- **Gate 1 (WAV harness v1↔v1 SHA-256 stability):** PASS
+  trivially (no source edits). Hash =
+  `9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`.
+  Re-confirmed at session start before any analysis:
+  ```
+  $ python tools/sack_redesign_wav_ab.py \
+      --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+      --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+      --out pre_step8_baseline.json
+  wrote pre_step8_baseline.json (8912 bytes,
+    sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+  [A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+  ```
+- **Gate 2 (v2↔v2 normal traffic non-regression vs Step 7):** N/A
+  (no source edits, so Step 7 behavior is unchanged trivially).
+- **Gate 3 (v2↔v2 with-losses mixed-batch evidence):** **NOT
+  ATTEMPTED.** §7.8.2-§7.8.3 analysis shows the prompt-as-specified
+  path produces either silent corruption (if RSP bump is added but
+  storage is not) or new-data frame drops (if RSP bump is not
+  added) — neither satisfies the gate's "decoded RX delivers all
+  the original data (no corruption, no loss)" requirement. STOP
+  triggered before any honest attempt could pass.
+- **Gate 4 (cycle_ms throughput delta vs Step 7 standalone retx):**
+  **NOT ATTEMPTED** — contingent on Gate 3 passing.
+- **Gate 5 (compression accounting non-regression):** **NOT
+  ATTEMPTED** — contingent on Gate 3 passing.
+
+#### §7.8.8 What is NOT started
+
+- **Step 8 as scoped** — no source edits. Mercury source remains
+  at `9e50b39`.
+- **Steps 9-15** — untouched per the prompt's "DO NOT touch Steps
+  9-15."
+- **Legacy MFSK SACK paths** — `send_sack_pattern()`,
+  `receive_sack_pattern()`, `sack_ldpc`, `mfsk.cc`
+  `encode_sack_bitmap()` — fully unmodified.
+- **v1 retransmit-only path** — `arq_commander.cc:741-820`
+  standalone retx batch builder unchanged; v1 sessions continue
+  to take mechanism (a) with no behavior change.
+- The two CMD-side blocker sites (`:741-820` early-return,
+  `:3109-3112` new-data-staging block) — both unchanged.
+
+The next session should either approve §7.8.6's Step 8a + 8b
+split (adding the prev-batch storage on RSP first, then lifting
+the CMD-side blockers) or revisit whether mechanism (b) is the
+right lever for the Design A throughput campaign given the
+storage-refactor cost.
+
 ---
 
 ## §7 Open questions [?]
