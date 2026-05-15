@@ -159,6 +159,17 @@ cl_arq_controller::cl_arq_controller()
 	rsp_v2_drop_count=0;
 	test_rsp_bsi_corrupt_at=0;
 	test_rsp_bsi_v2_frame_counter=0;
+	// SACK Design A Step 7 — SACK_RSP OFDM control-frame counters.
+	// All start at 0 / -1 / false sentinels; only written when sack_v2_enabled.
+	rsp_sack_v2_tx_count=0;
+	cmd_sack_v2_rx_count=0;
+	cmd_sack_v2_crc_fail_count=0;
+	for(int i=0; i<(int)sizeof(cmd_sack_v2_last_rx_bitmap); i++)
+		cmd_sack_v2_last_rx_bitmap[i]=0;
+	cmd_sack_v2_last_rx_nbits=-1;
+	cmd_sack_v2_last_rx_batch_seq_id=-1;
+	test_rsp_sack_rsp_crc_corrupt=false;
+	test_rsp_sack_rsp_crc_corrupt_armed=false;
 	crypto_buf[0].clear();
 	crypto_buf[1].clear();
 	message_transmission_time_ms=500;
@@ -2874,6 +2885,18 @@ void cl_arq_controller::send(st_message* message, int message_location)
 		message_TxRx_byte_buffer[2]=message->sequence_number;
 		header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	}
+	else if (message->type==SACK_RSP)
+	{
+		// SACK Design A Step 7 — OFDM SACK_RSP control frame. Same 3-byte
+		// header as ACK_RANGE / ACK_MULTI / CONTROL: [type, conn_id, seq_num].
+		// The payload (set by the caller in message->data, length tells how
+		// many bytes total) is [batch_seq_id, bitmap..., CRC8]. We do NOT
+		// touch the payload here — only the header bytes.
+		message_TxRx_byte_buffer[0]=message->type;
+		message_TxRx_byte_buffer[1]=connection_id;
+		message_TxRx_byte_buffer[2]=message->sequence_number;
+		header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
+	}
 	else if (message->type==CONTROL || message->type==ACK_CONTROL)
 	{
 		message_TxRx_byte_buffer[0]=message->type;
@@ -3065,6 +3088,17 @@ void cl_arq_controller::send_batch()
 		}
 		else if (messages_batch_tx[i].type==ACK_RANGE || messages_batch_tx[i].type==ACK_MULTI)
 		{
+			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
+			message_TxRx_byte_buffer[1]=connection_id;
+			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
+			header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
+		}
+		else if (messages_batch_tx[i].type==SACK_RSP)
+		{
+			// SACK Design A Step 7 — OFDM SACK_RSP. 3-byte standard header;
+			// payload [batch_seq_id, bitmap..., CRC8] is carried in
+			// messages_batch_tx[i].data[..] verbatim. Symmetric with the send()
+			// branch above.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
 			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
@@ -4014,6 +4048,180 @@ bool cl_arq_controller::receive_sack_pattern(bool* out_bitmap, int nframes)
 	return false;
 }
 
+// ============================================================================
+// SACK Design A Step 7 — OFDM SACK_RSP control frame TX/RX helpers
+// ============================================================================
+// Replaces the ~1168 ms MFSK SACK pattern with a single OFDM LDPC control
+// frame (~390 ms at WB_CFG10). Wire layout AFTER the standard 3-byte msg
+// header [type=0x42, conn_id, seq_num=0]:
+//
+//   payload = [batch_seq_id : u8][bitmap : ceil(N/8) bytes][CRC8 : u8]
+//
+// where N = data_batch_size at TX time (both peers know N because
+// data_batch_size is negotiated at TEST_CONNECTION and never moves within a
+// Design A Step 7 session). CRC8 covers (batch_seq_id || bitmap_bytes); it
+// does NOT cover the standard msg header (whose integrity is already
+// guaranteed by the OFDM LDPC codeword's CRC16). Polynomial: POLY_CRC8
+// (=0xF4 in datalink_defines.h), matching the existing CRC8_calc() helper.
+//
+// v1 MFSK SACK path (send_sack_pattern / receive_sack_pattern) is NOT
+// modified by Step 7. Both code paths coexist; the v1 path is exercised when
+// (sack_enabled && !sack_v2_enabled), the v2 path when sack_v2_enabled.
+
+long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
+                                                unsigned char batch_seq_id)
+{
+	if(passive_monitor) return 0;
+	if(nframes <= 0 || nframes > MAX_SACK_BATCH_SIZE)
+	{
+		printf("[TX-SACK-V2] ERROR: nframes=%d out of range [1..%d]\n",
+			nframes, MAX_SACK_BATCH_SIZE);
+		fflush(stdout);
+		return 0;
+	}
+
+	int bitmap_bytes = (nframes + 7) / 8;
+	int payload_len  = 1 /*batch_seq_id*/ + bitmap_bytes + 1 /*CRC8*/;
+
+	// Build the payload directly into a scratch buffer first so we can
+	// CRC-cover the (batch_seq_id || bitmap) prefix before writing CRC8.
+	unsigned char payload[1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
+	payload[0] = batch_seq_id;
+	for(int b = 0; b < bitmap_bytes; b++) payload[1 + b] = 0;
+	for(int i = 0; i < nframes; i++)
+	{
+		if(bitmap[i])
+			payload[1 + (i / 8)] |= (unsigned char)(1u << (i % 8));
+	}
+	unsigned char crc = CRC8_calc((char*)payload, 1 + bitmap_bytes);
+
+	// Optional CRC8 fault injection (CLI --test-rsp-sack-rsp-crc-corrupt).
+	// One-shot: clears the armed flag after firing exactly once.
+	if(test_rsp_sack_rsp_crc_corrupt_armed)
+	{
+		unsigned char corrupted = (unsigned char)(crc ^ 0xFFu);
+		printf("[TX-SACK-V2-CRC-CORRUPT] frame: CRC8 0x%02x -> 0x%02x (synthetic fault injection)\n",
+			(unsigned)crc, (unsigned)corrupted);
+		fflush(stdout);
+		crc = corrupted;
+		test_rsp_sack_rsp_crc_corrupt_armed = false;
+	}
+	payload[1 + bitmap_bytes] = crc;
+
+	// Log the ground-truth TX bitmap byte-for-byte so the loopback test can
+	// assert byte-identity with the CMD-side decoded bitmap.
+	{
+		char hex[2 * sizeof(payload) + 1];
+		for(int b = 0; b < payload_len; b++)
+			snprintf(&hex[2*b], 3, "%02x", payload[b]);
+		hex[2*payload_len] = '\0';
+		printf("[TX-SACK-V2] batch_seq_id=%u nframes=%d bitmap_bytes=%d payload=%s crc8=0x%02x\n",
+			(unsigned)batch_seq_id, nframes, bitmap_bytes, hex, (unsigned)crc);
+		fflush(stdout);
+	}
+
+	// Stage as a single-frame OFDM batch via messages_batch_tx[0]. Use the
+	// existing send_batch() path so the OFDM TX is bit-identical to any other
+	// control-class frame's wire shape.
+	message_batch_counter_tx = 0;
+	messages_batch_tx[0].type = SACK_RSP;
+	messages_batch_tx[0].sequence_number = 0;
+	messages_batch_tx[0].id = 0;
+	messages_batch_tx[0].length = payload_len;
+	for(int b = 0; b < payload_len; b++)
+		messages_batch_tx[0].data[b] = (char)payload[b];
+	messages_batch_tx[0].status = ADDED_TO_BATCH_BUFFER;
+	messages_batch_tx[0].batch_seq_id = batch_seq_id;  // diagnostic mirror
+	message_batch_counter_tx = 1;
+
+	// Full-length OFDM frame on the data configuration (NOT the MFSK ack
+	// config — SACK_RSP carries real LDPC-coded payload).
+	telecom_system->set_mfsk_ctrl_mode(false);
+	pad_messages_batch_tx(control_batch_size);
+
+	auto t_start = std::chrono::steady_clock::now();
+	send_batch();
+	auto t_end = std::chrono::steady_clock::now();
+	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		t_end - t_start).count();
+
+	rsp_sack_v2_tx_count++;
+	printf("[TX-SACK-V2] send_batch() wire_ms=%lld ctrl_tx_time_ms=%d (legacy MFSK SACK ~1168 ms baseline)\n",
+		elapsed_ms, ctrl_transmission_time_ms);
+	fflush(stdout);
+	return elapsed_ms;
+}
+
+bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
+                                             unsigned char* out_batch_seq_id)
+{
+	// Caller has verified messages_rx_buffer.type == SACK_RSP and
+	// messages_rx_buffer.status == RECEIVED. Payload bytes live in
+	// messages_rx_buffer.data[0..]. Expected layout:
+	//   [batch_seq_id : u8][bitmap : ceil(N/8) bytes][CRC8 : u8]
+	if(nframes <= 0 || nframes > MAX_SACK_BATCH_SIZE)
+	{
+		printf("[CMD-SACK-V2-DECODE] ERROR: nframes=%d out of range\n", nframes);
+		fflush(stdout);
+		return false;
+	}
+	int bitmap_bytes = (nframes + 7) / 8;
+	int payload_len  = 1 + bitmap_bytes + 1;
+
+	unsigned char payload[1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
+	for(int b = 0; b < payload_len; b++)
+		payload[b] = (unsigned char)messages_rx_buffer.data[b];
+
+	unsigned char rx_crc       = payload[1 + bitmap_bytes];
+	unsigned char computed_crc = CRC8_calc((char*)payload, 1 + bitmap_bytes);
+
+	if(rx_crc != computed_crc)
+	{
+		cmd_sack_v2_crc_fail_count++;
+		// Compose a hex dump for forensic analysis (no fabrication —
+		// the bitmap is discarded; the caller falls back to existing
+		// retransmit-timeout logic, exactly as if the OFDM frame had
+		// been lost in the air per §9.4/A2).
+		char hex[2 * sizeof(payload) + 1];
+		for(int b = 0; b < payload_len; b++)
+			snprintf(&hex[2*b], 3, "%02x", payload[b]);
+		hex[2*payload_len] = '\0';
+		printf("[CMD-SACK-V2-CRC-FAIL] rx_crc=0x%02x computed=0x%02x nframes=%d payload=%s fail_count=%lld (discarding bitmap; no fabrication per §9.4/A2)\n",
+			(unsigned)rx_crc, (unsigned)computed_crc, nframes, hex,
+			cmd_sack_v2_crc_fail_count);
+		fflush(stdout);
+		return false;
+	}
+
+	// CRC pass — write out the bitmap.
+	*out_batch_seq_id = payload[0];
+	for(int i = 0; i < nframes; i++)
+	{
+		out_bitmap[i] = (payload[1 + (i / 8)] & (1u << (i % 8))) != 0;
+	}
+
+	// Update CMD-side observability state (for tests).
+	cmd_sack_v2_rx_count++;
+	cmd_sack_v2_last_rx_batch_seq_id = (int)payload[0];
+	cmd_sack_v2_last_rx_nbits = nframes;
+	int copy_n = bitmap_bytes;
+	if(copy_n > (int)sizeof(cmd_sack_v2_last_rx_bitmap))
+		copy_n = (int)sizeof(cmd_sack_v2_last_rx_bitmap);
+	for(int b = 0; b < copy_n; b++)
+		cmd_sack_v2_last_rx_bitmap[b] = payload[1 + b];
+
+	// Log decoded bitmap byte-for-byte for the v2<->v2 byte-identity test.
+	char hex[2 * sizeof(payload) + 1];
+	for(int b = 0; b < payload_len; b++)
+		snprintf(&hex[2*b], 3, "%02x", payload[b]);
+	hex[2*payload_len] = '\0';
+	printf("[CMD-SACK-V2] batch_seq_id=%u nframes=%d bitmap_bytes=%d payload=%s crc8_ok=0x%02x rx_count=%lld\n",
+		(unsigned)payload[0], nframes, bitmap_bytes, hex,
+		(unsigned)rx_crc, cmd_sack_v2_rx_count);
+	fflush(stdout);
+	return true;
+}
+
 // Transmit BREAK tone pattern — emergency "drop to ROBUST_0" signal
 void cl_arq_controller::send_break_pattern()
 {
@@ -4945,6 +5153,24 @@ void cl_arq_controller::receive()
 					{
 						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+ACK_MULTI_ACK_RANGE_HEADER_LENGTH];
 					}
+				}
+				else if(messages_rx_buffer.type==SACK_RSP)
+				{
+					// SACK Design A Step 7 — OFDM SACK_RSP. 3-byte header;
+					// payload bytes [batch_seq_id, bitmap..., CRC8] live in
+					// messages_rx_buffer.data[0..length-1]. Length is derived
+					// by the caller (decode_sack_v2_frame) from the negotiated
+					// data_batch_size. We DO NOT decode here — only copy.
+					int copy_len = max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
+					if(copy_len > alloc_size) copy_len = alloc_size;
+					for(int j=0;j<copy_len;j++)
+					{
+						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+ACK_MULTI_ACK_RANGE_HEADER_LENGTH];
+					}
+					// length field on messages_rx_buffer is not set by the wire
+					// for ACK-family frames (the LDPC codeword size implicitly
+					// bounds it). The caller will validate using
+					// data_batch_size + the CRC8 byte position.
 				}
 				else if(messages_rx_buffer.type==DATA_LONG)
 				{

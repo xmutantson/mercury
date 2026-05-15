@@ -923,8 +923,33 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
 						sack_bitmap[i] = (messages_rx[i].status == RECEIVED);
 
-					// Send SACK pattern with bitmap suffix
-					send_sack_pattern(sack_bitmap, data_batch_size);
+					// SACK Design A Step 7 — branch on sack_v2_enabled.
+					// v2: OFDM SACK_RSP control frame (~390 ms wire occupancy).
+					// v1: legacy MFSK SACK pattern (~1168 ms wire occupancy).
+					// The v1 path is UNTOUCHED — Step 7 only adds the v2 branch.
+					if(sack_v2_enabled)
+					{
+						// batch_seq_id field anchors the bitmap to the
+						// outstanding CMD batch. RSP echoes whatever it
+						// adopted at Step 4 (rsp_current_expected_batch_seq_id).
+						// If still -1 (first-frame edge case where SACK
+						// fires before adopt), fall back to 0 — the CMD
+						// will compare against its cmd_batch_seq_id-1 (the
+						// in-flight batch's id).
+						unsigned char bsi = (unsigned char)
+							((rsp_current_expected_batch_seq_id >= 0)
+								? (rsp_current_expected_batch_seq_id & 0xFF)
+								: 0);
+						printf("[ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=%u, %d/%d received)\n",
+							(unsigned)bsi, rx_received, data_batch_size);
+						fflush(stdout);
+						send_sack_v2_frame(sack_bitmap, data_batch_size, bsi);
+					}
+					else
+					{
+						// Send SACK pattern with bitmap suffix (legacy MFSK).
+						send_sack_pattern(sack_bitmap, data_batch_size);
+					}
 
 					// Keep partial messages_rx (DON'T free) - retransmit fills gaps
 					stats.nNAcked_data++;
