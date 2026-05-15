@@ -738,8 +738,18 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 
 void cl_arq_controller::process_messages_tx_data()
 {
-	// SACK retransmit path: send only the missing frames from last SACK
-	if(sack_enabled && retransmit_count > 0)
+	// SACK retransmit path (v1 only): send only the missing frames from last SACK
+	// as a standalone retransmit-only batch.
+	//
+	// SACK Design A Step 8b — this early-return is the first of the two
+	// CMD-side blockers identified by SACK_RETRANSMIT_BATCHING_INVESTIGATION.md
+	// (mechanism (a)). Gated on `!sack_v2_enabled` so v1 sessions take this
+	// path unchanged (v1 wire-byte-identical preserved per §5.1 gate #1).
+	// On v2 sessions, do NOT take this early-return; the mixed-batch builder
+	// below (§7.8b) prepends retx as the head of the next new-data batch,
+	// amortizing per-cycle ARQ overhead across retx + new-data on the wire
+	// (the throughput lever §7.8.4 named as the Step 8b goal).
+	if(sack_enabled && !sack_v2_enabled && retransmit_count > 0)
 	{
 		printf("[CMD-RETX] Sending %d retransmit frames\n", retransmit_count);
 		fflush(stdout);
@@ -820,6 +830,77 @@ void cl_arq_controller::process_messages_tx_data()
 		return;
 	}
 
+	// SACK Design A Step 8b — v2 mixed-batch retx prefix builder.
+	//
+	// On v2 sessions with a populated retransmit queue, prepend the retx
+	// frames as the head of the next batch (retransmits-first, then new-data).
+	// Each retx carries its ORIGINAL batch_seq_id (captured at Step 3 into
+	// retransmit_frame_batch_seq_ids[]) so RSP's match-prev branch routes them
+	// into messages_rx_prev[] (Step 8a's parallel storage). New-data follows
+	// with the current cmd_batch_seq_id and lands in messages_rx[] via
+	// match-current.
+	//
+	// The two CMD-side blockers identified by SACK_RETRANSMIT_BATCHING_INVESTIGATION.md
+	// (the v1 retransmit-only early-return above + the new-data staging
+	// gate in process_buffer_data_commander()) are now both lifted for v2.
+	// The mixed batch eliminates the per-cycle standalone-retransmit ARQ
+	// overhead (§7.8.4 / §7.2 of the investigation doc), which is the
+	// throughput lever Step 8b engages.
+	//
+	// §4.3.4 invariants honored:
+	//   #1 (one outstanding batch): connection_status state machine still
+	//      gates TX (TRANSMITTING_DATA → RECEIVING_ACKS_DATA → ack/sack →
+	//      TRANSMITTING_DATA); see arq_commander.cc:347-365. CMD does not
+	//      key N+2 before N+1 has been ACK/SACK'd. The mixed batch is one
+	//      TX containing "complete N (via retx) + start N+1 (via new-data)".
+	//   #2 (batch_seq_id monotonicity): retx carries original bsi (not
+	//      cmd_batch_seq_id); new-data fill loop below assigns current
+	//      cmd_batch_seq_id; cmd_batch_seq_id increment happens AFTER
+	//      send_batch only if batch_includes_new_data (unchanged).
+	//   #3 (no silent corruption): retx routes to messages_rx_prev[] via
+	//      Step 8a's match-prev path; new-data routes to messages_rx[]
+	//      via match-current. Different physical buffers — no cross-batch
+	//      slot collisions (§7.8.3's hazard structurally eliminated).
+	int v2_retx_prefix_count = 0;
+	bool v2_mixed_batch = false;
+	if(sack_v2_enabled && retransmit_count > 0)
+	{
+		v2_mixed_batch = true;
+		int R = retransmit_count;
+		if(R > data_batch_size) R = data_batch_size;
+		message_batch_counter_tx = 0;
+		for(int r = 0; r < R; r++)
+		{
+			messages_batch_tx[message_batch_counter_tx].type = retransmit_frame_types[r];
+			messages_batch_tx[message_batch_counter_tx].length = retransmit_frame_lengths[r];
+			memcpy(messages_batch_tx[message_batch_counter_tx].data,
+				retransmit_frames[r], retransmit_frame_lengths[r]);
+			// Retx: original slot in PREV batch as both id and sequence_number
+			// so RSP routes into messages_rx_prev[loc=original_position].
+			messages_batch_tx[message_batch_counter_tx].id = retransmit_frame_positions[r];
+			messages_batch_tx[message_batch_counter_tx].sequence_number = retransmit_frame_positions[r];
+			messages_batch_tx[message_batch_counter_tx].nResends = nResends;
+			messages_batch_tx[message_batch_counter_tx].ack_timeout = ack_timeout_data;
+			messages_batch_tx[message_batch_counter_tx].status = ADDED_TO_BATCH_BUFFER;
+			// Retransmits carry their ORIGINAL batch_seq_id (§4.3.4 invariant 2).
+			messages_batch_tx[message_batch_counter_tx].batch_seq_id = retransmit_frame_batch_seq_ids[r];
+			message_batch_counter_tx++;
+			stats.nReSent_data++;
+			last_transmission_block_stats.nReSent_data++;
+		}
+		v2_retx_prefix_count = R;
+		// Per-frame retx bsi log (for [CMD-V2-MIXBATCH] post-TX summary)
+		printf("[CMD-V2-MIXBATCH-RETX] R=%d (bsi=", R);
+		for(int r = 0; r < R; r++)
+			printf(" %d", messages_batch_tx[r].batch_seq_id);
+		printf(") of %d queued — remaining %d retx dropped (R > data_batch_size=%d)\n",
+			retransmit_count, retransmit_count - R, data_batch_size);
+		fflush(stdout);
+		retransmit_count = 0;  // Consumed (any retx beyond R is dropped — falls
+		                       // back to retx-mostly batch with no new-data
+		                       // safety: data_batch_size cap enforced).
+	}
+
 	// SACK Design A Step 3 — batch_seq_id assignment on new-data batch build.
 	// New-data frames (ADDED_TO_LIST) get assigned cmd_batch_seq_id (the
 	// counter for the batch they're about to ride). Retransmit frames
@@ -839,6 +920,23 @@ void cl_arq_controller::process_messages_tx_data()
 				// Assign the current new-data batch's batch_seq_id.
 				messages_tx[i].batch_seq_id = (cmd_batch_seq_id & 0xFF);
 				messages_batch_tx[message_batch_counter_tx]=messages_tx[i];
+				// SACK Design A Step 8b — for v2 mixed batches, new-data must
+				// occupy contiguous slots 0..ND-1 in the CURRENT batch's slot
+				// space (so RSP's messages_rx[loc=id] fills correctly and
+				// ACK-GATE infers expected count from EOB on slot ND-1).
+				// Override id + sequence_number with position-in-new-batch
+				// (= message_batch_counter_tx - v2_retx_prefix_count). For
+				// v2 non-mixed batches (retransmit_count was 0), this branch
+				// reduces to a no-op since v2_retx_prefix_count == 0 and
+				// the existing behavior (id = messages_tx slot index) is
+				// preserved by the copy above — but we keep the explicit
+				// assignment for clarity and to match wire semantics.
+				if(v2_mixed_batch)
+				{
+					int pos_in_new_batch = message_batch_counter_tx - v2_retx_prefix_count;
+					messages_batch_tx[message_batch_counter_tx].sequence_number = pos_in_new_batch;
+					messages_batch_tx[message_batch_counter_tx].id = pos_in_new_batch;
+				}
 				message_batch_counter_tx++;
 				messages_tx[i].status=ADDED_TO_BATCH_BUFFER;
 				batch_includes_new_data = true;
@@ -877,7 +975,33 @@ void cl_arq_controller::process_messages_tx_data()
 	if(message_batch_counter_tx<=data_batch_size && message_batch_counter_tx!=0)
 	{
 		telecom_system->set_mfsk_ctrl_mode(false);  // data TX (full-length frames)
-		pad_messages_batch_tx(data_batch_size);
+		// SACK Design A Step 8b — for v2 mixed batches, set EOB bit on the
+		// last new-data frame manually (since we use sack_retransmit_active=true
+		// below to suppress send_batch's renumbering loop, which is where the
+		// EOB bit is normally set). For retx-only fallback (R == data_batch_size,
+		// no new-data), no EOB bit — matches the v1 retransmit-only path
+		// (which also omits EOB; RSP infers prev batch size from the original
+		// batch's compression header or EOB on the original transmission).
+		if(v2_mixed_batch)
+		{
+			int last_idx = message_batch_counter_tx - 1;
+			if(last_idx >= v2_retx_prefix_count
+			   && (messages_batch_tx[last_idx].type == DATA_LONG
+			       || messages_batch_tx[last_idx].type == DATA_SHORT))
+			{
+				// Set EOB bit on the last NEW-DATA frame.
+				messages_batch_tx[last_idx].sequence_number |= 0x80;
+			}
+		}
+		else
+		{
+			// v1 / v2 non-mixed: pad to full data_batch_size. The v2 mixed
+			// path skips padding because sequence_numbers are pre-assigned
+			// explicitly and pad_messages_batch_tx duplicates frames with
+			// re-assigned ids — that would clobber the retx-id mapping
+			// (which must remain at the original prev-batch slot positions).
+			pad_messages_batch_tx(data_batch_size);
+		}
 		mtl::log_event_kv("cmd_batch_tx_start", "batch=%lld nframes=%d cfg=%d",
 		                  stats.nBatches_sent + 1, data_batch_size, current_configuration);
 		if(sack_v2_enabled && batch_includes_new_data)
@@ -886,7 +1010,32 @@ void cl_arq_controller::process_messages_tx_data()
 				cmd_batch_seq_id & 0xFF, message_batch_counter_tx);
 			fflush(stdout);
 		}
+		// SACK Design A Step 8b — v2 mixed batch summary log.
+		// Demonstrates the engaged lever: BOTH retx (with original bsi) AND
+		// new-data (with current bsi) in the same TX. Per the prompt's Gate 3:
+		// "TX batch: N retx bsi=X + M new bsi=Y" — log present means lever
+		// engaged; log absent on no-loss path (mixed-batch builder is not
+		// entered when retransmit_count == 0).
+		if(v2_mixed_batch)
+		{
+			int new_data_count = message_batch_counter_tx - v2_retx_prefix_count;
+			int retx_bsi = (v2_retx_prefix_count > 0) ? messages_batch_tx[0].batch_seq_id : -1;
+			printf("[CMD-V2-MIXBATCH] TX batch: %d retx bsi=%d + %d new bsi=%d = %d total "
+				"(data_batch_size=%d)\n",
+				v2_retx_prefix_count, retx_bsi,
+				new_data_count, cmd_batch_seq_id & 0xFF,
+				message_batch_counter_tx, data_batch_size);
+			fflush(stdout);
+			// Suppress send_batch's sequence_number renumbering (we've pre-
+			// assigned them). For pure-retx fallback (no new-data), this
+			// matches the v1 retransmit-only path's use of the same flag.
+			sack_retransmit_active = true;
+		}
 		send_batch();
+		if(v2_mixed_batch)
+		{
+			sack_retransmit_active = false;
+		}
 		mtl::log_event_kv("cmd_batch_tx_done", "batch=%lld", stats.nBatches_sent + 1);
 		// SACK Design A Step 3 — increment cmd_batch_seq_id mod 256 only if
 		// this batch actually carried new-data frames. §4.3.4 invariant 2:
@@ -3108,10 +3257,42 @@ void cl_arq_controller::process_buffer_data_commander()
 
 		// SACK retransmit pending: don't create new crypto batch from FIFO.
 		// process_messages_tx_data() will send retransmit-only batch.
-		if(sack_enabled && retransmit_count > 0)
+		//
+		// SACK Design A Step 8b — second of the two CMD-side blockers
+		// identified by SACK_RETRANSMIT_BATCHING_INVESTIGATION.md. Gated on
+		// `!sack_v2_enabled` so v1 sessions keep the early-return unchanged
+		// (preserves v1 mechanism (a) standalone retx; v1 wire-byte-identical).
+		// On v2 sessions, DO NOT short-circuit: allow new-data staging into
+		// messages_tx[] in parallel with the pending retransmit queue. The
+		// mixed-batch builder in process_messages_tx_data() (above) prepends
+		// retx as the head of the next new-data batch.
+		//
+		// Safety: §7.8.3's silent-corruption hazard is structurally
+		// eliminated by Step 8a's messages_rx_prev[] parallel storage —
+		// retx routes to the prev buffer, new-data routes to messages_rx[],
+		// no slot collision.
+		if(sack_enabled && !sack_v2_enabled && retransmit_count > 0)
 			return;
 
-		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && block_under_tx==NO)
+		// SACK Design A Step 8b — relaxed staging guard for v2 mixed batches.
+		//
+		// The block_under_tx==NO requirement is overly conservative for v2:
+		// after SACK detection, messages_tx[] has been fully drained by
+		// SACK processing + cleanup() (covered slots → ACKED → FREE;
+		// missing slots → queued in retransmit_count → ACKED → FREE).
+		// block_under_tx stays YES until finalize_block_commander() fires,
+		// which only happens on the next iteration via the else-if branch
+		// below — too late: process_messages_tx_data() runs first on the
+		// next iteration and builds the mixed batch with messages_tx[] empty.
+		//
+		// For v2 with retransmit_count > 0, the prev block is conceptually
+		// complete from CMD's perspective (retx is fire-and-forget via
+		// RSP's messages_rx_prev[] path). Relax the guard so new-data is
+		// staged in time for the next mixed batch. v1 path unchanged
+		// (block_under_tx==NO requirement preserved).
+		bool stage_ok = (block_under_tx == NO)
+		             || (sack_v2_enabled && retransmit_count > 0);
+		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && stage_ok)
 		{
 			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 			// payload budget. In v1 (default) identical to legacy macro; in v2
