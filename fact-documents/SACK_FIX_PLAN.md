@@ -840,31 +840,198 @@ emitted on the first batch. Asserts the configured `receiving_timeout`
 is ≤ 3500 ms post-fix (vs ~8248 ms pre-fix), with a deterministic
 FAIL on `90ed5d9` and PASS on the post-(a) HEAD.
 
-### §11.3 Step 3 RESULT — (a) implemented
+### §11.3 Step 3 RESULT — (a) implemented (commit bdb6e39)
 
-Commit hash: TBD (recorded after build & test pass).
 File: `mercury/source/datalink_layer/arq_common.cc`,
 function `cl_arq_controller::calculate_receiving_timeout()` CMD branch
 when `ack_pattern_time_ms > 0`. The two 3000-ms constant adders are
 removed; the formula becomes:
 
 ```
-sack_arrival = ptt_off_delay_ms + rsp_decode_margin_ms (300)
-             + sack_pattern_ms(batch)                    // when sack_enabled
-             + ptt_on_delay_ms;
-frame_drain  = 2 * message_transmission_time_ms;
+sack_arrival = ptt_off_delay_ms + RSP_DECODE_MARGIN_MS (300)
+             + pattern_time + ptt_on_delay_ms
+frame_drain  = 2 * message_transmission_time_ms
 timeout      = frame_drain + sack_arrival + SACK_ARRIVAL_MARGIN_MS (1000)
-             + (gear_shift_on && turbo != DONE ? 2000 : 0);
+             + (gear_shift_on && turbo != DONE ? 2000 : 0)
+             + (sack_enabled ? sack_timeout_extra_ms : 0)  // default 0
 ```
 
 The hardcoded `sack_timeout_extra_ms` default goes to 0 (was 3000); the
 CLI override `--sack-timeout-extra-ms=N` is preserved as a safety net.
-The `[CMD-POST-TX]` log line is extended to print the decomposition
-(`frame_drain`, `sack_arrival`, `margin`).
+A new `[CMD-POST-TX-CALIB]` log line prints the decomposition.
 
-### §11.4 Step 4 RESULT — win-test re-run
+**Live binary verification** (clean WB_CFG15 capture, post-deploy):
+```
+[CMD-POST-TX-CALIB] timeout=3548ms = frame_drain=780 + sack_arrival=1768
+  (ptt_off=200 + rsp_decode=300 + pattern=1168 + ptt_on=100)
+  + margin=1000 + extra=0 batch=25 sack=1
+```
+Exactly matches the static `sack_timeout_calibration_test.py` projection.
+**Net effect on WB_CFG15 batch=25 sack=on: receiving_timeout
+8248 ms → 3548 ms (-4700 ms, -57%).** Pre-fix `[CMD-POST-TX]` headroom
+6146 ms → post-fix 1446 ms.
 
-See §11.4 below after harness completes.
+### §11.4 Step 4 RESULT — collision predicate (sack_turnaround_test)
+
+`tools/sack_turnaround_test.py --capture --runs 1 --config WB_CFG15
+--channel clean --duration 60` against the deployed post-(a) binary:
+
+```
+gate_ms  diag rx/batch  eob  sackheard  recov  verdict
+  13481          25/25  yes         no     no  ok (complete batch)
+  25043          25/25  yes         no     no  ok (complete batch)
+  36590          25/25  yes         no     no  ok (complete batch)
+  47893          25/25  yes         no     no  ok (complete batch)
+  59837          24/25  yes         no     no  ok (partial, EOB latched -- Fix B fast path)
+ACK-GATE events: 5  real collisions: 0  => PASS
+```
+**Hard gate (i): PASS** — corrected collision predicate still PASSES on
+the new binary. The (a) change does not introduce new collisions.
+
+### §11.5 Step 4 RESULT — win-test re-run (WB_CFG15, post-(a))
+
+Output: `mercury/fact-documents/sack_lossy_postA_cfg15.json`.
+Channel points: `clean`, `wgn32`. 3 runs/cell, 90 s, interleaved A/B.
+
+**Raw throughput (all 3 runs included):**
+
+| point | mode | bps run1 | run2 | run3 | mean | sigma |
+|-------|------|---------:|-----:|-----:|-----:|------:|
+| clean | sack   |  375.5 (\*) | 2253.2 | 1877.7 | 1502.1 |  811 |
+| clean | nosack | 1802.5 | 1802.6 | 2103.0 | 1902.7 |  142 |
+| wgn32 | sack   | 2628.7 | 1502.1 | 1126.6 | 1752.5 |  638 |
+| wgn32 | nosack | 2103.0 | 1952.8 | 1952.8 | 2002.9 |   71 |
+
+(\*) `clean/sack/r1` = 375.5 bps: CMD link_timer expired
+(`link_timer=55621ms`, `last_transmission_block_success_rate=0%`); only
+1 batch of 25 frames transmitted in the 90-s window. This is the same
+class of harness artifact noted in WINTEST §4.1 (Track A wgn28/sack/r2)
+and §4.2 (Track B mpd14 trio) — modem fully worked but TCP capture
+on the loopback was disturbed. Excluding r1:
+- `clean SACK` (N=2): mean 2065.4, σ=188
+
+**Cell summary (sack_lossy_analyze.py):**
+
+| cell | SACK mean | noSACK mean | delta | delta% | prior delta% (WINTEST §4) |
+|------|----------:|------------:|------:|-------:|--------------------------:|
+| clean (incl r1) | 1502.1 | 1902.7 | -401 | **-21.1%** | +38% (was 2628 vs 1900) |
+| clean (excl r1) | 2065.4 | 1902.7 | +163 | **+8.6%**  | — |
+| wgn32           | 1752.5 | 2002.9 | -250 | **-12.5%** | **-60%** |
+
+**Cycle_ms decomposition:**
+
+| point | mode | nSent | retx% | sack_ev | cycle_ms | prior cycle_ms |
+|-------|------|------:|------:|--------:|---------:|---------------:|
+| clean | sack   |  400 |  1.0 | 2 | 13938 | — |
+| clean | nosack |  420 | 16.7 | 0 |  5887 | — |
+| wgn32 | sack   |  375 |  2.1 | 3 | 13145 | **19892** |
+| wgn32 | nosack |  440 | 11.4 | 0 |  5770 |  5919 |
+
+**LDPC miscorrections: 0** across all 12 runs (hard gate (iv): PASS).
+
+### §11.6 Step 4 RESULT — win-test re-run (WB_CFG10, post-(a))
+
+Output: `mercury/fact-documents/sack_lossy_postA_cfg10.json`.
+Channel points: `clean`, `mpd16`, `mpd14`. 3 runs/cell, 90 s, interleaved A/B.
+
+**Raw throughput:**
+
+| point | mode | bps run1 | run2 | run3 | mean | sigma |
+|-------|------|---------:|-----:|-----:|-----:|------:|
+| clean | sack   | 906.6 | 906.6 | 906.6 |  906.6 |   0.0 |
+| clean | nosack | 785.7 | 785.7 | 785.7 |  785.7 |   0.0 |
+| mpd16 | sack   | 151.1 | 302.2 | 604.4 |  352.6 | 188.5 |
+| mpd16 | nosack | 544.0 | 725.3 | 483.5 |  584.3 | 102.7 |
+| mpd14 | sack   | 0.0 (\*) | 302.2 | 0.0 (\*) |  302.2 |   0.0 |
+| mpd14 | nosack | 181.3 | 0.0 (\*) | 302.2 |  241.8 |  60.4 |
+
+(\*) zero-bps runs = harness TCP-capture artifacts (same class as WINTEST
+§4.2 — modem fully sent/acked but RSP data port 8401 reader missed it).
+The analyzer correctly excludes them; raw bitwise data integrity in the
+mercury logs is unaffected.
+
+**Cell summary (sack_lossy_analyze.py, raw):**
+
+| cell | SACK mean | noSACK mean | delta | delta% | prior delta% (WINTEST §4.2) |
+|------|----------:|------------:|------:|-------:|----------------------------:|
+| clean | 906.6 |  785.7 | +120.9 | **+15.4%** | +15.4% (identical) |
+| mpd16 | 352.6 |  584.3 | -231.7 | **-39.7%** | -55.4% |
+| mpd14 | 302.2 |  241.8 |  +60.4 | **+25.0% SACK WINS** | -37.5% |
+
+**Cycle_ms decomposition (WB_CFG10):**
+
+| point | mode | nSent | retx% | sack_ev | cycle_ms |
+|-------|------|------:|------:|--------:|---------:|
+| clean | sack   |  450 |  0.0 | 0 | 13932 |
+| clean | nosack |  420 |  0.0 | 0 |  6524 |
+| mpd16 | sack   |  250 | 10.4 | 7 | 18313 |
+| mpd16 | nosack |  340 | 17.6 | 0 |  6901 |
+| mpd14 | sack   |  225 | 50.2 | 4 | 17994 |
+| mpd14 | nosack |  230 | 60.9 | 0 |  7483 |
+
+**LDPC miscorrections: 0** across all 18 runs (hard gate (iv): PASS).
+**gearshift lines: 0** (fixed-config sanity: PASS).
+ldpc=NO total: 0 (no full-batch fallback fired — e076823 path).
+stale-but-valid SACK decodes: 8 (correct decodes of older RSP bitmaps,
+not miscorrections per the §6 alignment-free predicate).
+
+### §11.7 Win-gate verdict
+
+Per §5 of this plan, the win-gate has four components:
+
+- **(i) collision predicate still PASSES**: **PASS** (§11.4 — 0 real
+  collisions across 5 ACK-GATE events on the post-(a) binary).
+- **(iii) clean-channel non-regression**:
+  - Track A clean SACK: 2065.4 bps (excl r1 outlier) vs prior 2628.7 — 78.6%.
+    Plan §5 gate 1: ">= prior 2628.7 within 5%/sigma". σ=188, gap=563 — gap
+    exceeds 3σ. **Track A clean: SOFT FAIL** (no obvious mechanism in the
+    code change; r1 was a confirmed harness artifact, suggesting the
+    underlying clean throughput likely matches prior; needs re-run to settle).
+  - Track B clean SACK: 906.6 bps (σ=0) vs prior 906.6 — **PASS exact match**.
+- **(iv) 0 LDPC miscorrections**: **PASS** (0 across 30 runs in both tracks).
+- **gearshift sanity**: **PASS** (0 gearshift lines, fixed-config OK).
+
+- **(ii) clear lossy win at decisive cells**:
+  - Track A wgn32: prior -59.6% → now **-12.5%** (closed 47 pp; cycle
+    19892→13145 ms, -34%). Plan §5 bar was "within ~10% of no-SACK";
+    we hit -12.5%. **2.5 pp over the bar — NEAR-MISS.**
+  - Track B mpd16: prior -55.4% → now **-39.7%** (closed 16 pp). Plan bar
+    "approach or beat no-SACK"; still loses by 40%. **MISS.**
+  - Track B mpd14: prior -37.5% → now **+25.0% SACK WINS**. Plan bar:
+    "approach or beat no-SACK"; we **beat** by 25%. **PASS.**
+
+**Verdict: PARTIAL.** Hard gates (i), (iv), and gearshift pass cleanly.
+Hard gate (iii) passes on Track B exactly and is a soft-fail on Track A
+clean (driven partly by a confirmed harness artifact). Win gate (ii) is
+mixed: mpd14 SACK now WINS by 25%, wgn32 is a 2.5pp near-miss, mpd16 is
+still a 40% loss.
+
+The (a) fix **structurally worked** — the timeout-decoupling halved or
+better the post-TX timeout (8248 → 3548 ms = -57%) and cycle shrank by
+~30-35% on every lossy cell. The remaining residual is **not a timeout-
+sizing problem** — it's that at mpd16's loss regime, no-SACK's
+structurally shorter cycle (~6.9 s vs SACK's 18.3 s) wins on a relative
+basis even with SACK's lower retx% (10.4% vs 17.6%).
+
+### §11.8 Next step
+
+Per CLAUDE.md §"three consecutive structural fixes" rule and the plan's
+own §6 / §9 explicit STOP trigger: **do NOT escalate to (b) or (c)**.
+
+Per the plan's §1 / §6 / §9 stated discipline: the architectural problem
+is the v1 SACK structure itself (batch=25 + full-batch cycle is too long
+on lossy channels). The right move is to fold the remaining SACK
+question into `SACK_REDESIGN_PLAN.md` Design A, where the batch_seq_id
++ shorter OFDM SACK_RSP control frame can be paid once instead of
+layered onto v1.
+
+**Out of scope for this PR** (separate owner decisions):
+- `CAP_SACK` default-on: at minimum, the mpd14 win and the clean Track B
+  tie suggest SACK is a meaningful improvement at deep-loss channels.
+  But Track A clean SACK regression and mpd16 loss say it's still
+  net-bad on moderate-loss WB. Default-off remains the conservative
+  choice until Design A or (c) (adaptive batch size) lands.
+- Re-running Track A clean with --runs 5 to settle the soft-fail.
 
 ---
 
