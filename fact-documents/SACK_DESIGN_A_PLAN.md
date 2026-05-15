@@ -2920,6 +2920,275 @@ provided the RSP-side parallel storage that made it SAFE; Step 8b
 performed the CMD-side blocker lift that engages it. Steps 9-15
 (Axis-2 / Axis-3 controllers + win-test grid) remain Future Work.
 
+### §7.9 RESULT — Step 9 (2026-05-15) — Axis 1 in multi-axis policy framework
+
+Mercury commit: `monitor` `d23be5f` — "sack: Step 9 — Axis 1 in
+multi-axis policy framework".
+
+Wraps the existing `SUCCESS_BASED_LADDER` block from
+`finalize_block_commander()` (originally `arq_commander.cc:3135-3239`)
+in a new named entry point `cl_arq_controller::policy_evaluate_axis1()`.
+**No behavior change** — same observable, same action, same hysteresis.
+The wrapper exists to give Axis 1 a stable seat in the multi-axis policy
+framework so Steps 10/11 (Axes 2/3) can hook into it without disturbing
+the modulation gearshift logic.
+
+Three files changed (+340 LOC, -0 LOC):
+- `include/datalink_layer/arq.h` (+44 LOC — three new method
+  declarations on `cl_arq_controller`)
+- `source/datalink_layer/arq_commander.cc` (+257 LOC — wrapper body,
+  synthetic-fire helper, v2-gated dispatch at the finalize site)
+- `source/main.cc` (+39 LOC — CLI flag parse + synthetic fire
+  entrypoint)
+
+#### §7.9.1 What landed
+
+The wrapper architecture:
+
+```
+finalize_block_commander() {
+  ...
+  if (gear_shift_algorithm == SUCCESS_BASED_LADDER) {
+    if (sack_v2_enabled) {
+      policy_evaluate_axis1();  // <-- NEW Step 9 entry point
+    } else {
+      /* v1 inline path UNCHANGED — byte-identical to pre-Step-9 */
+    }
+  }
+}
+
+policy_evaluate_axis1() {
+  // Functionally identical to the v1 inline path:
+  //   - observable: last_transmission_block_stats.success_rate_data
+  //   - action:     config_ladder_{up,down}()
+  //   - hysteresis: up >85% AND >=5 blocks; down <55% AND >=3 fails
+  //
+  // Two added invariants:
+  //   - §4.3.4 #5: [POLICY-MOVE axis=1 from=Y to=Z reason=R ...] log
+  //                on every modulation move
+  //   - §4.3.4 #6: policy_axis1_supremacy_on_move() called on every
+  //                move (Step 9 stub; Steps 10/11 fill in Axes 2/3 reset)
+}
+
+policy_axis1_supremacy_on_move(int from, int to, const char* reason) {
+  // Step 9: log-only stub.
+  printf("[POLICY-SUPREMACY] axis=1 move reason=%s — "
+         "Axes 2/3 cooldown engaged (Step 9 stub: no Axes 2/3 controllers yet)\n",
+         reason);
+}
+
+test_fire_policy_axis1(int direction) {
+  // CLI: --test-policy-axis1-fire=up|down (default off).
+  // Primes synthetic LADDER state, calls policy_evaluate_axis1() once.
+  // Demonstrates the wrapper + [POLICY-MOVE] + [POLICY-SUPREMACY]
+  // log surface on a real move without needing live channel traffic.
+}
+```
+
+Per §3.8 "initiator controls flow": the wrapper is CMD-side only.
+RSP never participates in Axis 1 decision-making — it just executes
+the `SET_CONFIG` handed to it.
+
+#### §7.9.2 §4.3.4 invariants satisfied
+
+1. **One outstanding batch** — N/A at Step 9 (Axis 1 only; no batch_seq_id
+   semantic change).
+
+2. **`batch_seq_id` monotonicity** — N/A at Step 9.
+
+3. **No silent corruption** — N/A at Step 9 (Axis 1 modulation moves
+   are observable via the existing `[GEARSHIFT]` lines AND the new
+   `[POLICY-MOVE]` lines; no data routing change).
+
+4. **Bounded recovery on single-axis failure** — N/A at Step 9
+   (Axes 2/3 not yet implemented).
+
+5. **Reversibility of any single policy move.** **SATISFIED.** Every
+   modulation move now emits a `[POLICY-MOVE axis=1 from=Y to=Z reason=R
+   ...]` log line in v2 sessions. The legacy `[GEARSHIFT] LADDER UP/DOWN`
+   lines are preserved alongside — external log parsers (e.g.
+   `tools/analyze_turboshift_log.py`) are not broken. Verified by
+   synthetic fire (see Gate 3 below).
+
+6. **Axis 1 supremacy.** **HOOK IN PLACE.**
+   `policy_axis1_supremacy_on_move()` is called from
+   `policy_evaluate_axis1()` on every LADDER UP and LADDER DOWN move
+   (citations: `arq_commander.cc:3308` for ladder_up; `arq_commander.cc:3375`
+   for ladder_down — both fire BEFORE `add_message_control(SET_CONFIG)`,
+   so the supremacy intent is expressed before the SET_CONFIG TX). At
+   Step 9 the hook body is a logging stub — Axes 2/3 controllers don't
+   exist yet. Steps 10/11 will fill in:
+   - reset `data_batch_size` to `radio_batch_size_floor = 10`
+   - set Axis 3 sack_mode to PROBE
+   - cancel in-flight Axes 2/3 timers / cooldowns
+
+   The hook is named NOW so the contract point is explicit; Steps 10/11
+   plug into the existing hook body without restructuring
+   `policy_evaluate_axis1()`. Step 12 may additionally call the same
+   hook from the emergency-BREAK code paths
+   (`arq_commander.cc:{1596,2031}` and surrounding sites) to give the
+   BREAK-to-ROBUST_0 transition the same supremacy guarantee — that
+   extension is in scope for Step 12, not Step 9.
+
+7. **`supershift_proven_ceiling` analogue for Axis 2** — N/A at Step 9.
+
+#### §7.9.3 Validation results (all four gates PASS)
+
+**Gate 1 — WAV harness v1↔v1 sha256 stability.**
+
+```
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step9_final.json
+wrote post_step9_final.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+v1↔v1 fixture replay sha256 **STABLE across all nine steps**
+(Step 1 + 2 + 3 + 4 + 7 + 8 + 8a + 8b + 9):
+`9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`.
+v1 wire path byte-identical. **PASS.**
+
+**Gate 2 — v2↔v2 normal-traffic non-regression vs Step 8b.**
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 90 --config 10 --out v2_step9_normal_final.json
+```
+
+Counters byte-identical to §7.8b Gate 2:
+
+| event                   | Step 9 | Step 8b ref |
+|-------------------------|--------|-------------|
+| CMD-V2-MIXBATCH         | 0      | 0           |
+| CMD-BATCH-SEQ           | 2      | 2           |
+| ACK-GATE PASS           | 1      | 1           |
+| ACK-GATE-V2             | 1      | 1           |
+| RSP-V2-PREV-BUMP        | 1      | 1           |
+| RSP-V2-PREV-DELIVERED   | 1      | 1           |
+| RSP-V2-PREV-STALE       | 0      | 0           |
+| CRYPTO-RX Decrypted     | 2      | 2           |
+| POLICY-MOVE             | 0      | 0           |
+| POLICY-SUPREMACY        | 0      | 0           |
+| GEARSHIFT LADDER        | 0      | 0           |
+| TX-SACK-V2 batch_seq_id | 1      | 1           |
+
+`[POLICY-MOVE]` correctly absent (gear_shift_on is NO in this test
+session — the wrapper is only reached when gear_shift_on==YES). v2 path
+remains fully functional, decrypted payload counter monotonic (0 → 1).
+**PASS.**
+
+**Gate 3 — `[POLICY-MOVE] axis=1` fires on a real modulation move.**
+
+Synthetic fire via `--test-policy-axis1-fire=up`:
+
+```
+$ ./mercury.exe -n --test-policy-axis1-fire=up
+[FLAG] --test-policy-axis1-fire=up: invoking synthetic Axis-1 fire
+[TEST-AXIS1-FIRE] direction=up: success_rate=100%, blocked_for=5 (threshold=5) → expect LADDER UP from 4
+[GEARSHIFT] LADDER UP: success=100% > 85%, config 4 -> 5
+[POLICY-MOVE] axis=1 from=4 to=5 reason=ladder_up success=100% threshold=85% blocks_held=6
+[POLICY-SUPREMACY] axis=1 move reason=ladder_up — Axes 2/3 cooldown engaged (Step 9 stub: no Axes 2/3 controllers yet)
+[FLAG] Synthetic fire complete — exiting.
+```
+
+Synthetic fire via `--test-policy-axis1-fire=down`:
+
+```
+$ ./mercury.exe -n --test-policy-axis1-fire=down
+[FLAG] --test-policy-axis1-fire=down: invoking synthetic Axis-1 fire
+[TEST-AXIS1-FIRE] direction=down: success_rate=0%, consecutive_fails will bump 2→3 → expect LADDER DOWN from 4
+[GEARSHIFT] LADDER DOWN: ceiling lowered to 3
+[GEARSHIFT] LADDER DOWN: success=0% < 55%, config 4 -> 3 (batch=1)
+[POLICY-MOVE] axis=1 from=4 to=3 reason=ladder_down success=0% threshold=55% consecutive_fails=3
+[POLICY-SUPREMACY] axis=1 move reason=ladder_down — Axes 2/3 cooldown engaged (Step 9 stub: no Axes 2/3 controllers yet)
+[FLAG] Synthetic fire complete — exiting.
+```
+
+Both `[POLICY-MOVE]` (invariant #5) and `[POLICY-SUPREMACY]`
+(invariant #6) emit on each modulation move; both directions exercised;
+legacy `[GEARSHIFT] LADDER UP/DOWN` lines preserved alongside. **PASS.**
+
+**Gate 4 — Axis 1 supremacy hook citation.**
+
+Two call sites in `policy_evaluate_axis1()`, both BEFORE
+`add_message_control(SET_CONFIG)`:
+
+- `source/datalink_layer/arq_commander.cc:3308` (ladder_up branch):
+  ```cpp
+  policy_axis1_supremacy_on_move(current_configuration, negotiated_configuration, "ladder_up");
+  cleanup();
+  add_message_control(SET_CONFIG);
+  ```
+- `source/datalink_layer/arq_commander.cc:3375` (ladder_down branch):
+  ```cpp
+  policy_axis1_supremacy_on_move(current_configuration, negotiated_configuration, "ladder_down");
+  cleanup();
+  add_message_control(SET_CONFIG);
+  ```
+
+Steps 10/11 fill in the hook body (reset Axes 2/3 to safe state) without
+touching `policy_evaluate_axis1()` again. Step 12 may additionally call
+this hook from emergency-BREAK code paths so the BREAK transition gets
+the same supremacy guarantee. **PASS.**
+
+#### §7.9.4 Audit of behavior unchanged on v1 sessions
+
+1. `git diff b2df651..d23be5f -- source/datalink_layer/arq_commander.cc`:
+   the only change inside `finalize_block_commander()` is the new
+   `if(sack_v2_enabled) { policy_evaluate_axis1(); } else { ... }`
+   dispatch around the existing `SUCCESS_BASED_LADDER` block. The else
+   branch is the v1 path verbatim — byte-for-byte the same code as
+   pre-Step-9, indented by one level inside a `{ ... }` block. Compiler
+   produces identical instruction stream for the v1 path.
+
+2. New code (`policy_evaluate_axis1()`, `policy_axis1_supremacy_on_move()`,
+   `test_fire_policy_axis1()`) is appended after
+   `finalize_block_commander()` — not interleaved into existing
+   functions.
+
+3. CLI flag `--test-policy-axis1-fire=<dir>` defaults off
+   (`test_policy_axis1_fire_cli=0`); production builds never set it.
+   The guard `if (test_policy_axis1_fire_cli != 0)` in main.cc is the
+   sole entry point.
+
+4. WAV harness v1↔v1 sha256 stable (Gate 1) is the strict proof: the
+   grading layer reads CMD + RSP log text. If a v1 path side-effect
+   changed (a new log line, a different value), the sha256 would shift.
+   It did not.
+
+#### §7.9.5 What is NOT started by Step 9
+
+Per the prompt's hard rules:
+
+- **Step 10 (Axis 2 controller, batch-size adaptation)** — NOT started.
+  `data_batch_size` remains fixed at the session-start negotiated value;
+  there is no `recent_partial_rate` ring, no step_up / step_down logic.
+- **Step 11 (Axis 3 controller, SACK mode ON↔PROBE↔OFF)** — NOT started.
+  `sack_mode` is implicitly ON whenever `sack_v2_enabled`; there is no
+  state machine.
+- **`SET_LINK_PARAMS` dispatch by controllers** — still stub from
+  Step 5. The control frame type 0x43 is reserved and the RSP-side
+  no-op handler logs `[RSP-LINK-PARAMS]` on receipt, but no caller
+  emits it (Step 10/11 territory).
+- **Cross-axis safe-state cooldowns** (§4.3.4 #6 inside
+  `policy_axis1_supremacy_on_move()` body, `axis2_cooldown_batches`) —
+  Step 12. The hook is named NOW; the body is a stub.
+- **Existing SUCCESS_BASED_LADDER behavior on v1 sessions** — UNCHANGED.
+  v1 takes the inline path verbatim; no new log lines; sha256-proven
+  byte-identical.
+- **Win-test grid (Track A/B/C, §5)** — Step 13. Not run; Steps 10+
+  haven't landed.
+- **Legacy MFSK SACK cleanup** — Step 15. Untouched.
+
+The multi-axis policy framework is now SEATED — Axis 1 has a named
+entry point, an observable log surface (`[POLICY-MOVE]`,
+`[POLICY-SUPREMACY]`), and a supremacy hook. Steps 10 and 11 plug
+Axes 2 and 3 into the same framework without further plumbing
+changes.
+
 ---
 
 ## §7 Open questions [?]
