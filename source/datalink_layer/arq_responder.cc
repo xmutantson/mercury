@@ -1797,6 +1797,21 @@ void cl_arq_controller::process_control_responder()
 			connection_status=ACKNOWLEDGING_DATA;
 		}
 	}
+	else if(link_status==CONNECTED && code==SET_LINK_PARAMS)
+	{
+		// SACK Design A §4.3.2 / §4.4 scaffolding (Step 5).
+		// Pure wire-format addition: log receipt and free the control slot.
+		// No state mutation, no peer-visible response. CMD-side sender does
+		// not yet exist; this branch is exercised only by later steps.
+		// Existing peers that do not recognize 0x43 fall through to the
+		// final `else` block below and likewise ignore it — verified before
+		// landing this step (process_control_responder dispatch is closed
+		// over a fixed code list; unknown codes are silently dropped).
+		printf("[RSP-LINK-PARAMS] SET_LINK_PARAMS received (len=%d) — no-op stub (Step 5)\n",
+			messages_control.length);
+		fflush(stdout);
+		messages_control.status = FREE;
+	}
 	else
 	{
 		if(code==CLOSE_CONNECTION)

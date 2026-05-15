@@ -86,6 +86,11 @@
 #define KEY_EXCHANGE_2   0x3F   // ML-KEM encaps key (sent as data, 1184 bytes)
 #define KEY_EXCHANGE_3   0x40   // ML-KEM ciphertext (sent as data, 1088 bytes)
 #define KEY_ACTIVATE     0x41   // Encryption activated (both sides switch to encrypted data)
+// 0x42 reserved for SACK_RSP (Design A §4.2.2; not yet wired)
+#define SET_LINK_PARAMS  0x43   // SACK Design A Axes 2+3 policy update (batch, sack mode)
+                                // Phase: SCAFFOLDING — message type defined, RSP-side no-op
+                                // stub logs receipt only; no CMD-side sender; no state mutation.
+                                // Gated behavior arrives in later Design A steps.
 
 // Capability flags (embedded in TEST_CONNECTION byte 5)
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
