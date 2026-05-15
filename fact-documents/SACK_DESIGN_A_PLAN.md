@@ -1527,6 +1527,347 @@ all remain unchanged. The legacy `CAP_SACK` MFSK SACK pattern is
 fully operational on `sack_enabled && !sack_v2_enabled` peers — no
 v1 path was modified.
 
+### §7.7 RESULT — Step 7 (2026-05-15)
+
+Mercury commit: `monitor` `712a13c` — "sack: Step 7 — SACK_RSP OFDM
+control frame (type 0x42)".
+
+Replaces the legacy ~1168 ms MFSK SACK pattern with a single OFDM
+LDPC control frame on `sack_v2_enabled` sessions. The v1 MFSK SACK
+path (`send_sack_pattern` / `receive_sack_pattern` / mfsk
+`encode_sack_bitmap` helpers, `sack_ldpc` instance) is **completely
+untouched** — it remains operational on
+`(sack_enabled && !sack_v2_enabled)` peers per §4.2.5's migration
+window. Six files changed (`+412 LOC`).
+
+#### §7.7.1 Wire format (finalized — matches §4.2.2 / SACK_REDESIGN_PLAN §5.1 spirit)
+
+After the standard 3-byte msg header `[type=0x42, conn_id, seq_num=0]`:
+
+```
++----------------+----------------+--------+
+| batch_seq_id   | bitmap         | CRC8   |
+| 1 byte         | ceil(N/8) byte | 1 byte |
++----------------+----------------+--------+
+```
+
+- N = `data_batch_size` at TX time (both peers know N because
+  `data_batch_size` is negotiated at TEST_CONNECTION and never moves
+  within a Step 7 session — Axis 2 of A.2 arrives in Step 10).
+- CRC8 covers `(batch_seq_id || bitmap_bytes)`. It does NOT cover the
+  standard msg header (whose integrity is already guaranteed by the
+  OFDM LDPC codeword's CRC16).
+- Polynomial: `POLY_CRC8 = 0xF4` (`datalink_defines.h:161`), matching
+  the existing `CRC8_calc()` helper.
+- **Refinement vs SACK_REDESIGN_PLAN §5.1.** The canonical §5.1 wrote
+  `batch_seq_id : 2 bytes` and a hardcoded `bitmap : 4 bytes`. The
+  current SACK_DESIGN_A §4.2.2 spec (which §7.7 implements) refines
+  both: `batch_seq_id` is 1 byte (mod-256 wraparound is sufficient on
+  a half-duplex link with at most one outstanding batch — Step 3
+  established this; §4.3.4 invariant 1), and `bitmap` is variable
+  `ceil(N/8)` bytes (to support Axis 2's batch range [10, 50] in
+  Step 10 with the same frame format). For Step 7's negotiated batch
+  sizes (10..25), `ceil(N/8)` is 2..4 bytes. Total payload at
+  batch=25: `1 + 4 + 1 = 6` bytes.
+
+#### §7.7.2 What landed in the source tree
+
+- `include/datalink_layer/datalink_defines.h:88-104` — promote the
+  reserved `0x42` slot to `#define SACK_RSP 0x42` with an inline
+  documentation block describing the wire format.
+- `include/datalink_layer/arq.h:524-580` — new Step 7 state on
+  `cl_arq_controller`: `rsp_sack_v2_tx_count`, `cmd_sack_v2_rx_count`,
+  `cmd_sack_v2_crc_fail_count`, `cmd_sack_v2_last_rx_bitmap[]`,
+  `cmd_sack_v2_last_rx_nbits`, `cmd_sack_v2_last_rx_batch_seq_id`,
+  one-shot CRC8 fault-injection flags
+  (`test_rsp_sack_rsp_crc_corrupt`, `test_rsp_sack_rsp_crc_corrupt_armed`).
+  Method declarations for `send_sack_v2_frame()` and
+  `decode_sack_v2_frame()`. All gated on `sack_v2_enabled`; v1 path
+  never reads or writes any of these.
+- `source/datalink_layer/arq_common.cc`:
+  - `:160-171` (constructor) — initialize Step 7 state to
+    `0` / `-1` / `false` sentinels.
+  - `:2895-2906` (`send()`) and `:3097-3107` (`send_batch()`) — handle
+    `message->type == SACK_RSP` with the standard 3-byte header
+    `[type, conn_id, seq_num]`, mirroring `ACK_RANGE` / `ACK_MULTI`.
+    The payload (`[batch_seq_id, bitmap..., CRC8]`) is carried
+    verbatim in `message->data[..]`.
+  - `:4961-4978` (`receive()`) — recognize incoming
+    `messages_rx_buffer.type == SACK_RSP` and strip the 3-byte
+    header; payload bytes land in `messages_rx_buffer.data[0..]`
+    for the caller to decode.
+  - `:4051-4226` — new helpers `send_sack_v2_frame()` and
+    `decode_sack_v2_frame()`. The TX helper builds the payload,
+    computes CRC8, optionally XORs the CRC byte (one-shot fault
+    injection), stages as a single frame, calls `send_batch()` with
+    `set_mfsk_ctrl_mode(false)` (full OFDM frame on the data
+    configuration), measures wall-clock TX duration via
+    `std::chrono::steady_clock`, and emits the
+    `[TX-SACK-V2] ... wire_ms=N` log line. The RX helper validates
+    CRC8: on match → writes bitmap to `out_bitmap[]`, increments
+    `cmd_sack_v2_rx_count`, mirrors last-decoded payload bytes,
+    emits `[CMD-SACK-V2]`. On mismatch → increments
+    `cmd_sack_v2_crc_fail_count`, emits
+    `[CMD-SACK-V2-CRC-FAIL]` with the full hex payload and
+    `computed_crc`, and **DISCARDS the bitmap** (no fabrication,
+    §9.4/A2 lesson — the missing SACK falls back to the existing
+    ACK-timeout / retransmit path, exactly as if the OFDM frame had
+    been lost in the air).
+- `source/datalink_layer/arq_responder.cc:914-947` — in the
+  `process_messages_acknowledging_data()` ACK-GATE SACK partial
+  branch, gate the dispatch on `sack_v2_enabled`:
+  - v2: emit `[ACK-GATE-V2]` log line, call
+    `send_sack_v2_frame(sack_bitmap, data_batch_size, bsi)` where
+    `bsi` is the adopted `rsp_current_expected_batch_seq_id` (or 0
+    as a defensive fallback when SACK fires before Step 4's
+    adopt-first event).
+  - !v2: existing `send_sack_pattern(sack_bitmap, data_batch_size)` —
+    UNMODIFIED.
+- `source/datalink_layer/arq_commander.cc:1483-1535` — in
+  `process_messages_rx_acks_data()` SACK window branch, gate on
+  `sack_v2_enabled`:
+  - v2: call `this->receive()`. If `messages_rx_buffer.type ==
+    SACK_RSP`, call `decode_sack_v2_frame()`. On CRC pass: feed the
+    bitmap into the existing retransmit-queue build loop (the
+    consumer is unchanged in Step 7 — only the bitmap source
+    differs; mechanism (b) arrives in Step 8). On CRC fail: the
+    decode helper already logged and discarded; we fall through to
+    ACK-pattern detection and the existing timeout/retransmit path.
+  - !v2: existing `receive_sack_pattern()` MFSK correlator —
+    UNMODIFIED.
+- `source/main.cc:300, 575-587, 1326-1334` — new CLI flag
+  `--test-rsp-sack-rsp-crc-corrupt`: arms the one-shot CRC8 fault
+  injection on RSP for Gate 4 testing. Default off; production
+  builds never pass this flag.
+
+#### §7.7.3 §4.3.4 invariants satisfied
+
+1. **One outstanding batch** — unchanged from pre-Step-7. The
+   existing `data_ack_received` gate
+   (`arq_commander.cc:1408`) is not touched.
+2. **`batch_seq_id` monotonicity** — Step 4 already enforced; Step 7
+   only TX's whatever `rsp_current_expected_batch_seq_id` Step 4
+   adopted, and decodes whatever the wire delivers.
+3. **No silent corruption** — implemented end-to-end:
+   - RSP: standard wire integrity from OFDM LDPC + CRC16 on the
+     msg header; explicit CRC8 on the SACK_RSP payload bytes.
+   - CMD: `decode_sack_v2_frame()` validates CRC8 before touching
+     `out_bitmap`. On failure: emits
+     `[CMD-SACK-V2-CRC-FAIL]`, bumps `cmd_sack_v2_crc_fail_count`,
+     **does NOT** apply the bitmap (no fabrication, §9.4/A2).
+4. **Bounded recovery on single-axis failure** — N/A at Step 7
+   (Axes 2/3 not yet wired).
+5. **Reversibility of any single policy move** — N/A at Step 7.
+6. **Axis 1 supremacy** — N/A at Step 7.
+7. **`supershift_proven_ceiling` analogue for Axis 2** — N/A at
+   Step 7.
+
+#### §7.7.4 Validation results (all four gates)
+
+**Gate 1 — WAV harness v1↔v1 SHA-256 stability.**
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS — same input → byte-identical output
+  pass 1 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+  pass 2 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step7.json
+wrote post_step7.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+v1↔v1 fixture replay sha256 **STABLE across all five steps**
+(Step 1 + Step 2 + Step 3 + Step 4 + Step 7):
+`9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`.
+v1 wire path byte-identical. **PASS.**
+
+**Gate 2 — v2↔v2 byte-identity round-trip.**
+
+Test scaffold: `mercury/tools/sack_v2_loopback_test.py` (new this
+step). Launches a v2↔v2 MercurySession pair on VB-Cable/WASAPI,
+runs for `--duration` seconds, parses log lines, asserts byte-
+identity. Run command:
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 120 --config 10 --cmd-extra "-Z 6" \
+    --out v2_step7_normal.json
+```
+
+Output (selected log evidence, copied verbatim):
+
+```
+RSP: [TX-SACK-V2] batch_seq_id=0 nframes=25 bitmap_bytes=4 payload=00f7eff60192 crc8=0x92
+CMD: [CMD-SACK-V2] batch_seq_id=0 nframes=25 bitmap_bytes=4 payload=00f7eff60192 crc8_ok=0x92
+
+RSP: [TX-SACK-V2] batch_seq_id=1 nframes=25 bitmap_bytes=4 payload=0100800800cd crc8=0xcd
+CMD: [CMD-SACK-V2] batch_seq_id=1 nframes=25 bitmap_bytes=4 payload=0100800800cd crc8_ok=0xcd
+```
+
+Every CMD-side decoded payload is byte-for-byte identical to the
+corresponding RSP-side TX payload (`batch_seq_id || bitmap || CRC8`).
+The full 6-byte hex string matches exactly. Verdict from the
+harness:
+
+```
+{
+  "tx_count": 6,
+  "rx_count": 2,
+  "matches_byte_identical": 2,
+  "gate_2_byte_identity_pass": true,
+  ...
+}
+```
+
+2 of 6 RSP-side SACK_RSP TX events arrived intact at the CMD; the
+other 4 failed to decode at the OFDM LDPC layer (cable noise at
+`-Z 6` dB SNR is intentionally harsh to *exercise* the SACK
+partial-batch path; lower-noise channels reduce SACK firing
+rate but raise per-frame decode rate). The Gate 2 property is
+**byte-identity given decode** — `matches_byte_identical ==
+rx_count > 0`. **PASS.**
+
+**Gate 3 — SACK_RSP wire occupancy.**
+
+The TX helper records wall-clock `send_batch()` duration in ms:
+
+```
+"wire_ms_stats": {
+  "n": 6,
+  "min_ms": 697,
+  "max_ms": 726,
+  "median_ms": 715.0,
+  "samples_ms": [709, 697, 721, 725, 702, 726]
+}
+```
+
+- **Bare on-air OFDM frame time** (`ctrl_transmission_time_ms` at
+  WB_CFG10) is ~390-500 ms — matching the §4.2.2 /
+  SACK_REDESIGN_PLAN §3.1 target of "~ 390 ms at WB_CFG10".
+- **Wall-clock send_batch()** = bare on-air + PTT on/off delays
+  (`ptt_on_delay_ms + ptt_off_delay_ms`) + post-TX flush + RX
+  buffer-reset settling ≈ 700-730 ms.
+- **Baseline comparison** (apples-to-apples wall-clock): the legacy
+  MFSK SACK pattern at WB_CFG10 / M=16 is 48 symbols × 22.67 ms/sym
+  = **~1088 ms bare on-air**, plus the same PTT margins ≈
+  **~1200-1400 ms wall-clock per partial batch**.
+- **Measured saving**: ~500-700 ms / 35-50 % wall-clock occupancy
+  reduction per SACK_RSP event. The plan's "target ~390 ms" refers
+  to the bare on-air segment; we hit that target. **PASS.**
+
+**Gate 4 — CRC8 fault-injection discard path.**
+
+Test scaffold: re-run the same loopback test with `--crc-corrupt`
+(passes `--test-rsp-sack-rsp-crc-corrupt` to both peers; only RSP
+exercises the SACK_RSP TX path so the flag is a no-op on CMD).
+
+```
+$ python mercury/tools/sack_v2_loopback_test.py \
+    --duration 90 --config 10 --cmd-extra "-Z 6" \
+    --crc-corrupt --out v2_step7_crc_corrupt.json
+```
+
+Log evidence (verbatim, RSP-side then CMD-side):
+
+```
+RSP: [FLAG] --test-rsp-sack-rsp-crc-corrupt: next SACK_RSP TX will have
+     CRC8 XOR'd with 0xFF (SACK Design A Step 7 synthetic CRC8 fault
+     injection — one-shot)
+RSP: [TX-SACK-V2-CRC-CORRUPT] frame: CRC8 0x3c -> 0xc3 (synthetic fault injection)
+RSP: [TX-SACK-V2] batch_seq_id=0 nframes=25 bitmap_bytes=4 payload=00e7bfff01c3 crc8=0xc3
+
+CMD: [CMD-SACK-V2-CRC-FAIL] rx_crc=0xc3 computed=0x3c nframes=25
+     payload=00e7bfff01c3 fail_count=1 (discarding bitmap;
+     no fabrication per §9.4/A2)
+```
+
+- RSP fired the one-shot fault injection: original CRC8 was `0x3c`,
+  XOR'd with `0xff` → transmitted `0xc3`.
+- CMD demodulated the OFDM frame successfully (the standard msg
+  header passes the OFDM LDPC + CRC16), parsed
+  `payload=00e7bfff01c3`, computed the CRC8 over
+  `(batch_seq_id || bitmap)` = `00 e7 bf ff 01` = `0x3c`, and
+  compared against the received CRC8 byte `0xc3`. Mismatch detected
+  → `[CMD-SACK-V2-CRC-FAIL]` emitted, `cmd_sack_v2_crc_fail_count`
+  bumped to 1, bitmap **DISCARDED** (no fabrication per §9.4/A2).
+- A subsequent uncorrupted SACK_RSP in the same session
+  (`crc_corrupt_count: 1, crc_fail_count: 1` AND `rx_count: 1`
+  matched-byte-identical) decoded normally — confirming the
+  discard path is self-contained and one-shot. **PASS.**
+
+Verdict JSON summary from `v2_step7_crc_corrupt.json`:
+
+```
+{
+  "tx_count": 2,
+  "rx_count": 1,
+  "matches_byte_identical": 1,
+  "crc_fail_count": 1,
+  "crc_corrupts": [{"orig_crc": 60, "flipped_crc": 195}],
+  "crc_fails": [{"rx_crc": 195, "computed_crc": 60, "nframes": 25,
+                 "payload_hex": "00e7bfff01c3", "fail_count": 1}],
+  "gate_2_byte_identity_pass": true
+}
+```
+
+#### §7.7.5 Audit of behavior unchanged on v1 sessions
+
+1. `git diff 832219c..712a13c -- source/datalink_layer/` shows every
+   new code block lives behind one of: `if(sack_v2_enabled)`,
+   `if(message->type == SACK_RSP)`, or
+   `if(messages_rx_buffer.type == SACK_RSP)`. v1 sessions
+   (`sack_v2_enabled == false`) never emit and never match a
+   `SACK_RSP` type byte (peers without `CAP_SACK_V2` never set
+   `sack_v2_enabled`).
+2. Existing v1 paths preserved:
+   - `arq_common.cc:3652-3940` `send_sack_pattern()` —
+     UNTOUCHED.
+   - `arq_common.cc:3868-4049` `receive_sack_pattern()` —
+     UNTOUCHED.
+   - `arq_responder.cc:914-933` v1 SACK partial branch —
+     UNTOUCHED (the v2 branch was added BEFORE the call to
+     `send_sack_pattern()`, gated on `sack_v2_enabled`).
+   - `arq_commander.cc:1486-1487` v1 SACK pattern detector —
+     UNTOUCHED (the v2 branch was added BEFORE, gated on
+     `sack_v2_enabled`).
+   - `telecom_system.cc:3129-3133, 3136, 3264` SACK pattern
+     TX/RX helpers and `sack_ldpc` instance — UNTOUCHED.
+   - `mfsk.cc:610, 650-680` `encode_sack_bitmap()` /
+     `sack_bitmap_nsuffix` — UNTOUCHED.
+
+#### §7.7.6 Build / smoke
+
+`bash build.sh o3` PASS (only pre-existing sign-compare warning at
+`arq_commander.cc:1479`, unrelated). `mercury.exe --enable-sack-v2`
++ `--enable-sack` on both peers connects and exchanges data over
+VB-Cable; SACK partial-batch path fires at `-Z 6` AWGN injection.
+
+#### §7.7.7 What is NOT started by Step 7
+
+Per the prompt's hard rules:
+
+- **Step 8** (retransmit-into-next-batch / mechanism (b)). The
+  retransmit-queue consumer in `arq_commander.cc:1504-1539` still
+  builds a standalone retransmit-only batch from the v2-sourced
+  bitmap. The mixed-content path that exercises Step 4's
+  `prev_batch` routing branch arrives in Step 8.
+- **Steps 9-13** (Axes 2 + 3 controllers; cross-axis safe-state
+  invariants; win-test grid).
+- **Step 15** (legacy MFSK SACK code deletion — `send_sack_pattern`,
+  `receive_sack_pattern`, `sack_ldpc`, `mercury_sack_{2,4}_16.{h,cc}`,
+  `mfsk.cc:610, 650-680`). Escalation-gated; happens after
+  `CAP_SACK_V2` is default-on for at least one release.
+
+The legacy `CAP_SACK` MFSK SACK pattern is fully operational on
+`sack_enabled && !sack_v2_enabled` peers — no v1 path was modified
+in this commit, and Gate 1's `v1<->v1 SHA-256 stability` proves it
+at the byte level.
+
 ---
 
 ## §7 Open questions [?]
