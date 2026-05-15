@@ -140,7 +140,15 @@ cl_arq_controller::cl_arq_controller()
 		retransmit_frame_lengths[i]=0;
 		retransmit_frame_positions[i]=0;
 		retransmit_frame_types[i]=0;
+		retransmit_frame_batch_seq_ids[i]=-1;  // Step 3: unset until SACK populates
 	}
+	// SACK Design A Step 3 — batch_seq_id state (CMD counter, RSP store).
+	// cmd_batch_seq_id starts at 0; first new-data batch goes out under value 0.
+	// captured_batch_seq_id_for_retransmit is -1 (no SACK retransmit pending).
+	// last_received_batch_seq_id is -1 (no DATA frame parsed yet).
+	cmd_batch_seq_id=0;
+	captured_batch_seq_id_for_retransmit=-1;
+	last_received_batch_seq_id=-1;
 	crypto_buf[0].clear();
 	crypto_buf[1].clear();
 	message_transmission_time_ms=500;
@@ -1339,6 +1347,7 @@ int cl_arq_controller::init_messages_buffers()
 			this->messages_tx[i].status=FREE;
 			this->messages_tx[i].type=NONE;
 			this->messages_tx[i].data=NULL;
+			this->messages_tx[i].batch_seq_id=-1;  // Step 3: unset until TX path assigns
 
 			this->messages_tx[i].data=new char[alloc_size + CANARY_SIZE];
 			set_canary(this->messages_tx[i].data, alloc_size);
@@ -1367,6 +1376,7 @@ int cl_arq_controller::init_messages_buffers()
 			this->messages_rx[i].status=FREE;
 			this->messages_rx[i].type=NONE;
 			this->messages_rx[i].data=NULL;
+			this->messages_rx[i].batch_seq_id=-1;  // Step 3: unset until RX parses (v2)
 
 			this->messages_rx[i].data=new char[alloc_size + CANARY_SIZE];
 			set_canary(this->messages_rx[i].data, alloc_size);
@@ -1399,6 +1409,7 @@ int cl_arq_controller::init_messages_buffers()
 			this->messages_batch_tx[i].status=FREE;
 			this->messages_batch_tx[i].type=NONE;
 			this->messages_batch_tx[i].data=NULL;
+			this->messages_batch_tx[i].batch_seq_id=-1;  // Step 3: unset until build_batch assigns
 		}
 	}
 
@@ -1420,6 +1431,7 @@ int cl_arq_controller::init_messages_buffers()
 			this->messages_batch_ack[i].status=FREE;
 			this->messages_batch_ack[i].type=NONE;
 			this->messages_batch_ack[i].data=NULL;
+			this->messages_batch_ack[i].batch_seq_id=-1;  // Step 3: ACK frames never carry batch_seq_id
 
 			this->messages_batch_ack[i].data=new char[alloc_size + CANARY_SIZE];
 			set_canary(this->messages_batch_ack[i].data, alloc_size);
@@ -1433,6 +1445,7 @@ int cl_arq_controller::init_messages_buffers()
 
 	this->messages_last_ack_bu.status=FREE;
 	this->messages_last_ack_bu.data=NULL;
+	this->messages_last_ack_bu.batch_seq_id=-1;  // Step 3
 	this->messages_last_ack_bu.data=new char[alloc_size + CANARY_SIZE];
 	set_canary(this->messages_last_ack_bu.data, alloc_size);
 
@@ -1443,6 +1456,7 @@ int cl_arq_controller::init_messages_buffers()
 
 	this->messages_control.status=FREE;
 	this->messages_control.data=NULL;
+	this->messages_control.batch_seq_id=-1;  // Step 3: control frames never carry batch_seq_id
 	this->messages_control.data=new char[alloc_size + CANARY_SIZE];
 	set_canary(this->messages_control.data, alloc_size);
 
@@ -1453,6 +1467,7 @@ int cl_arq_controller::init_messages_buffers()
 
 	this->messages_rx_buffer.status=FREE;
 	this->messages_rx_buffer.data=NULL;
+	this->messages_rx_buffer.batch_seq_id=-1;  // Step 3: populated on v2 DATA RX
 	this->messages_rx_buffer.data=new char[alloc_size + CANARY_SIZE];
 	set_canary(this->messages_rx_buffer.data, alloc_size);
 
@@ -2798,16 +2813,19 @@ void cl_arq_controller::send(st_message* message, int message_location)
 	int header_length=0;
 	if(message->type==DATA_LONG)
 	{
-		// SACK Design A Step 1 — DATA_LONG header growth gated on sack_v2_enabled.
+		// SACK Design A Steps 1+3 — DATA_LONG header growth + batch_seq_id plumbing.
 		// v1 (default): 4 bytes [type, conn_id, seq(EOB bit7), id].
 		// v2: 5 bytes [type, conn_id, seq(EOB bit7), batch_seq_id, id].
-		// batch_seq_id is a placeholder (0) here; Step 3 wires the real counter.
+		// batch_seq_id source (v2 only): message->batch_seq_id field, masked mod 256.
+		// Sentinel -1 (unset, defensive — should not happen for v2 DATA TX) → 0.
 		message_TxRx_byte_buffer[0]=message->type;
 		message_TxRx_byte_buffer[1]=connection_id;
 		message_TxRx_byte_buffer[2]=message->sequence_number;
 		if(sack_v2_enabled)
 		{
-			message_TxRx_byte_buffer[3]=0;            // batch_seq_id placeholder (Step 3 plumbs)
+			int bsi = message->batch_seq_id;
+			if(bsi < 0) bsi = 0;  // defensive: caller should have assigned
+			message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 			message_TxRx_byte_buffer[4]=message->id;
 		}
 		else
@@ -2818,16 +2836,17 @@ void cl_arq_controller::send(st_message* message, int message_location)
 	}
 	else if (message->type==DATA_SHORT)
 	{
-		// SACK Design A Step 2 — DATA_SHORT header growth gated on sack_v2_enabled.
+		// SACK Design A Steps 2+3 — DATA_SHORT header growth + batch_seq_id plumbing.
 		// v1 (default): 5 bytes [type, conn_id, seq(EOB bit7), id, length].
 		// v2: 6 bytes [type, conn_id, seq(EOB bit7), batch_seq_id, id, length].
-		// batch_seq_id is a placeholder (0) here; Step 3 wires the real counter.
 		message_TxRx_byte_buffer[0]=message->type;
 		message_TxRx_byte_buffer[1]=connection_id;
 		message_TxRx_byte_buffer[2]=message->sequence_number;
 		if(sack_v2_enabled)
 		{
-			message_TxRx_byte_buffer[3]=0;            // batch_seq_id placeholder (Step 3 plumbs)
+			int bsi = message->batch_seq_id;
+			if(bsi < 0) bsi = 0;
+			message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 			message_TxRx_byte_buffer[4]=message->id;
 			message_TxRx_byte_buffer[5]=message->length;
 		}
@@ -2994,14 +3013,16 @@ void cl_arq_controller::send_batch()
 
 		if(messages_batch_tx[i].type==DATA_LONG)
 		{
-			// SACK Design A Step 1 — DATA_LONG header growth gated on sack_v2_enabled.
+			// SACK Design A Steps 1+3 — DATA_LONG header growth + batch_seq_id plumbing.
 			// See cl_arq_controller::send() for full format documentation.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
 			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
 			if(sack_v2_enabled)
 			{
-				message_TxRx_byte_buffer[3]=0;        // batch_seq_id placeholder (Step 3 plumbs)
+				int bsi = messages_batch_tx[i].batch_seq_id;
+				if(bsi < 0) bsi = 0;  // defensive
+				message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 				message_TxRx_byte_buffer[4]=messages_batch_tx[i].id;
 			}
 			else
@@ -3012,14 +3033,16 @@ void cl_arq_controller::send_batch()
 		}
 		else if (messages_batch_tx[i].type==DATA_SHORT)
 		{
-			// SACK Design A Step 2 — DATA_SHORT header growth gated on sack_v2_enabled.
+			// SACK Design A Steps 2+3 — DATA_SHORT header growth + batch_seq_id plumbing.
 			// See cl_arq_controller::send() for full format documentation.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
 			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
 			if(sack_v2_enabled)
 			{
-				message_TxRx_byte_buffer[3]=0;        // batch_seq_id placeholder (Step 3 plumbs)
+				int bsi = messages_batch_tx[i].batch_seq_id;
+				if(bsi < 0) bsi = 0;
+				message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 				message_TxRx_byte_buffer[4]=messages_batch_tx[i].id;
 				message_TxRx_byte_buffer[5]=messages_batch_tx[i].length;
 			}
@@ -4915,21 +4938,22 @@ void cl_arq_controller::receive()
 				}
 				else if(messages_rx_buffer.type==DATA_LONG)
 				{
-					// SACK Design A Step 1 — DATA_LONG header parse gated on sack_v2_enabled.
-					// v1 (default): byte[3] = id. v2: byte[3] = batch_seq_id (placeholder),
-					// byte[4] = id. Step 3 will plumb batch_seq_id into messages_rx_buffer
-					// for cross-batch routing — at Step 1 it is parsed but discarded (no
-					// decision keys off its value).
+					// SACK Design A Steps 1+3 — DATA_LONG header parse + batch_seq_id store.
+					// v1 (default): byte[3] = id. v2: byte[3] = batch_seq_id, byte[4] = id.
+					// batch_seq_id is stored on messages_rx_buffer and (for diagnostics)
+					// on last_received_batch_seq_id. NO routing/RX decision keys off it
+					// yet — pure scaffolding per Step 3 (decision is Step 4+).
 					int eff_hdr = effective_data_long_header_length(sack_v2_enabled);
 					if(sack_v2_enabled)
 					{
-						// batch_seq_id at offset 3 is currently a placeholder (0). Step 3
-						// will replace this comment with a proper RSP-side store + log.
-						(void)message_TxRx_byte_buffer[3];
+						int bsi = (unsigned char)message_TxRx_byte_buffer[3];
+						messages_rx_buffer.batch_seq_id = bsi;
+						last_received_batch_seq_id = bsi;
 						messages_rx_buffer.id=message_TxRx_byte_buffer[4];
 					}
 					else
 					{
+						messages_rx_buffer.batch_seq_id = -1;  // v1: field not on wire
 						messages_rx_buffer.id=message_TxRx_byte_buffer[3];
 					}
 					int copy_len = max_data_length+max_header_length-eff_hdr;
@@ -4939,26 +4963,34 @@ void cl_arq_controller::receive()
 					{
 						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+eff_hdr];
 					}
+					if(sack_v2_enabled)
+					{
+						printf("[RX-BATCH-SEQ] type=DATA_LONG id=%d seq=%d batch_seq_id=%d (v2)\n",
+							(unsigned char)messages_rx_buffer.id,
+							(unsigned char)messages_rx_buffer.sequence_number & 0x7F,
+							messages_rx_buffer.batch_seq_id);
+						fflush(stdout);
+					}
 
 				}
 				else if(messages_rx_buffer.type==DATA_SHORT)
 				{
-					// SACK Design A Step 2 — DATA_SHORT header parse gated on sack_v2_enabled.
+					// SACK Design A Steps 2+3 — DATA_SHORT header parse + batch_seq_id store.
 					// v1 (default): byte[3] = id, byte[4] = length.
-					// v2: byte[3] = batch_seq_id (placeholder), byte[4] = id, byte[5] = length.
-					// Step 3 will plumb batch_seq_id into messages_rx_buffer for cross-batch
-					// routing — at Step 2 it is parsed but discarded (no decision keys off it).
+					// v2: byte[3] = batch_seq_id, byte[4] = id, byte[5] = length.
+					// batch_seq_id is stored but no decision branches on it (Step 4+).
 					int eff_hdr = effective_data_short_header_length(sack_v2_enabled);
 					if(sack_v2_enabled)
 					{
-						// batch_seq_id at offset 3 is currently a placeholder (0). Step 3
-						// will replace this comment with a proper RSP-side store + log.
-						(void)message_TxRx_byte_buffer[3];
+						int bsi = (unsigned char)message_TxRx_byte_buffer[3];
+						messages_rx_buffer.batch_seq_id = bsi;
+						last_received_batch_seq_id = bsi;
 						messages_rx_buffer.id=message_TxRx_byte_buffer[4];
 						messages_rx_buffer.length=(unsigned char)message_TxRx_byte_buffer[5];
 					}
 					else
 					{
+						messages_rx_buffer.batch_seq_id = -1;  // v1: field not on wire
 						messages_rx_buffer.id=message_TxRx_byte_buffer[3];
 						messages_rx_buffer.length=(unsigned char)message_TxRx_byte_buffer[4];
 					}
@@ -4972,6 +5004,14 @@ void cl_arq_controller::receive()
 					for(int j=0;j<messages_rx_buffer.length;j++)
 					{
 						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+eff_hdr];
+					}
+					if(sack_v2_enabled)
+					{
+						printf("[RX-BATCH-SEQ] type=DATA_SHORT id=%d seq=%d batch_seq_id=%d (v2)\n",
+							(unsigned char)messages_rx_buffer.id,
+							(unsigned char)messages_rx_buffer.sequence_number & 0x7F,
+							messages_rx_buffer.batch_seq_id);
+						fflush(stdout);
 					}
 
 				}

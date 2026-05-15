@@ -169,6 +169,14 @@ struct st_message
 	char sequence_number;
 	int status;
 	cl_timer ack_timer;
+	// SACK Design A Step 3 — batch_seq_id field (mod 256 counter). On TX,
+	// carries the batch_seq_id this frame should advertise on the wire
+	// (set by the new-data-batch builder or by the retransmit-queue
+	// builder when re-sending a frame). On RX, populated from the wire
+	// when sack_v2_enabled. Sentinel value -1 means "unset" (v1 frame
+	// where the field is not on the wire). Pure scaffolding at Step 3:
+	// no decision branches on this value yet.
+	int batch_seq_id;
 };
 
 // SACK Design A Steps 1 + 2 — effective header length helpers.
@@ -450,6 +458,33 @@ public:
   int retransmit_frame_lengths[MAX_RETRANSMIT_HEADROOM];
   int retransmit_frame_positions[MAX_RETRANSMIT_HEADROOM]; // Original frame_pos within crypto batch
   int retransmit_frame_types[MAX_RETRANSMIT_HEADROOM];     // DATA_LONG or DATA_SHORT
+  int retransmit_frame_batch_seq_ids[MAX_RETRANSMIT_HEADROOM]; // SACK Design A Step 3 —
+                                                               // original batch_seq_id of the
+                                                               // batch this frame was first
+                                                               // sent under. Retransmits carry
+                                                               // their original value; never the
+                                                               // current cmd_batch_seq_id.
+
+  // SACK Design A Step 3 — batch_seq_id plumbing (TX side: CMD-only counter;
+  // RX side: diagnostic store; no decision branches on this value yet).
+  // §4.1 + §4.3.4 invariant 2: increments by 1 mod 256 per NEW-DATA batch.
+  // Retransmits use the captured original value (retransmit_frame_batch_seq_ids
+  // or, for retransmit-only batches built from messages_tx, the saved
+  // captured_batch_seq_id_for_retransmit). NOT reset on set_data_batch_size()
+  // moves (the field is independent of batch size, §4.3.4 invariant 2).
+  int cmd_batch_seq_id;                // CMD: counter for next NEW-DATA batch (mod 256).
+                                       //      First new-data batch sent under value 0;
+                                       //      subsequent batches under 1, 2, 3, ...
+  int captured_batch_seq_id_for_retransmit;
+                                       // CMD: snapshot of cmd_batch_seq_id at the moment a
+                                       //      SACK retransmit queue is populated. The
+                                       //      subsequent retransmit-only batch carries this
+                                       //      value (the ORIGINAL batch's id), never the
+                                       //      live cmd_batch_seq_id. -1 = unset.
+  int last_received_batch_seq_id;      // RSP / monitor: last batch_seq_id parsed off a
+                                       //      DATA_LONG/DATA_SHORT wire byte. Diagnostic
+                                       //      only; no decision branches on it at Step 3.
+                                       //      -1 = never received (v1 session, or no DATA yet).
 
   // Responder: double-buffered crypto batch storage
   st_crypto_batch_buffer crypto_buf[2]; // [0] = oldest pending, [1] = current
