@@ -298,6 +298,9 @@ int main(int argc, char *argv[])
     bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
     int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
     bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
+    int test_policy_axis1_fire_cli = 0; // --test-policy-axis1-fire=up|down: SACK Design A Step 9 — synthetic Axis-1 trigger.
+                                        // 0=off, 1=up (success=100%), 2=down (success=0%). One-shot at startup, then exit.
+                                        // Forces sack_v2_enabled=true so policy_evaluate_axis1() is taken.
     int audio_buffer_ms_cli = 0;       // --alsa-buffer-ms=N (Linux only; 0 = use 30ms default)
     char log_file_path[512] = "";     // --log: tee stdout to file
 
@@ -580,6 +583,28 @@ int main(int argc, char *argv[])
             // per §9.4/A2). Default off; production builds never pass this
             // flag. The corruption clears itself after firing exactly once.
             test_rsp_sack_rsp_crc_corrupt_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis1-fire=", 25) == 0)
+        {
+            // SACK Design A Step 9 — synthetic Axis-1 trigger (one-shot at startup).
+            //
+            // Primes the LADDER state and calls policy_evaluate_axis1() once,
+            // then exits. Demonstrates that the multi-axis-policy entry point
+            // is wired correctly and the [POLICY-MOVE] / [POLICY-SUPREMACY]
+            // log surface (§4.3.4 invariants 5/6) fires on a real Axis-1 move.
+            //
+            // Values:
+            //   up   — success_rate=100%, block-counter at threshold → LADDER UP
+            //   down — success_rate=0%, consecutive_fails forced to threshold → LADDER DOWN
+            //
+            // Default off; production builds never pass this flag. The mercury
+            // process exits with code 0 after the single synthetic evaluation.
+            const char* arg = argv[i] + 25;
+            if (strcmp(arg, "up") == 0)        test_policy_axis1_fire_cli = 1;
+            else if (strcmp(arg, "down") == 0) test_policy_axis1_fire_cli = 2;
+            else { fprintf(stderr, "--test-policy-axis1-fire: expected 'up' or 'down'\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1322,6 +1347,20 @@ start_modem:
             printf("[FLAG] --test-rsp-sack-rsp-crc-corrupt: next SACK_RSP TX will have "
                    "CRC8 XOR'd with 0xFF (SACK Design A Step 7 synthetic CRC8 fault "
                    "injection — one-shot)\n");
+        }
+        if (test_policy_axis1_fire_cli != 0) {
+            // SACK Design A Step 9 — synthetic Axis-1 fire (one-shot, then exit).
+            // Calls the public test helper on cl_arq_controller which primes
+            // the LADDER state with a synthetic observable + counters, then
+            // calls policy_evaluate_axis1() once. The [POLICY-MOVE] and
+            // [POLICY-SUPREMACY] log lines should appear on stdout.
+            printf("[FLAG] --test-policy-axis1-fire=%s: invoking synthetic Axis-1 fire\n",
+                   test_policy_axis1_fire_cli == 1 ? "up" : "down");
+            fflush(stdout);
+            ARQ.test_fire_policy_axis1(test_policy_axis1_fire_cli);
+            printf("[FLAG] Synthetic fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
         }
 
         // Monitor mode: force monitor on, disable TX
