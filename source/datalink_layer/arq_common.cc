@@ -179,6 +179,25 @@ cl_arq_controller::cl_arq_controller()
 	rsp_prev_batch_expected_count=0;
 	rsp_prev_batch_delivered_count=0;
 	rsp_prev_batch_stale_count=0;
+	// SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
+	// All CMD-side; gated on sack_v2_enabled at the call sites. Ring + counters
+	// + cooldown all start at zero. v1 sessions leave these untouched.
+	for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i]=0.0f;
+	axis2_partial_rate_count=0;
+	axis2_partial_rate_pos=0;
+	axis2_consecutive_good_batches=0;
+	axis2_consecutive_bad_batches=0;
+	axis2_cooldown_batches=0;
+	axis2_evaluations=0;
+	axis2_move_up_count=0;
+	axis2_move_down_count=0;
+	axis2_skipped_in_cooldown=0;
+	test_policy_axis2_fire_armed=0;
+	test_cmd_axis2_suppressed_after_axis1=0;
+	rsp_set_link_params_rx_count=0;
+	rsp_set_link_params_crc_fail_count=0;
+	pending_link_params_batch_size=-1;
+	pending_link_params_sack_mode=-1;
 	crypto_buf[0].clear();
 	crypto_buf[1].clear();
 	message_transmission_time_ms=500;

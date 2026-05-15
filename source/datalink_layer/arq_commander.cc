@@ -493,6 +493,70 @@ int cl_arq_controller::add_message_control(char code)
 			messages_control.id=0;
 			messages_control.nResends=1;
 		}
+		else if(code==SET_LINK_PARAMS)
+		{
+			// SACK Design A Step 10 — CMD-side SET_LINK_PARAMS encoder.
+			//
+			// Wire format (§4.4):
+			//   data[0] = SET_LINK_PARAMS (0x43)
+			//   data[1] = batch (u8, clamped [10, AXIS2_BATCH_CEIL])
+			//   data[2] = sack_mode (u8, 0=OFF, 1=ON, 2=PROBE) — Step 11 will
+			//             populate. Step 10 always writes 1 (ON) for v2 sessions.
+			//   data[3] = CRC8 over data[1..2] using POLY_CRC8 (matches existing
+			//             CRC8_calc(data, 2) usage).
+			//   length  = 4
+			//
+			// Reads pending_link_params_{batch_size,sack_mode} from the calling
+			// controller (set by policy_evaluate_axis2() / Step 11's Axis-3).
+			// Sentinels (-1) substitute current state.
+			//
+			// Defensive null-guard: messages_control.data is allocated lazily
+			// in init_messages_buffers(). In normal v2 sessions this has run
+			// before any Axis-2 move fires, but synthetic-fire test mode
+			// (--test-policy-axis2-fire=*) skips ARQ.init() — so guard.
+			if(messages_control.data == NULL)
+			{
+				printf("[CMD-LINK-PARAMS] SKIP TX: messages_control.data is NULL "
+					"(pre-init synthetic test mode; no real wire frame)\n");
+				fflush(stdout);
+				// Roll back the status set above so the caller treats this as
+				// no-op (don't leave the slot in ADDED_TO_LIST forever).
+				messages_control.status = FREE;
+				messages_control.type = NONE;
+				pending_link_params_batch_size = -1;
+				pending_link_params_sack_mode = -1;
+				return success;  // == ERROR_ from this fast-out path
+			}
+			int target_batch = pending_link_params_batch_size;
+			if(target_batch < 0) target_batch = data_batch_size;
+			if(target_batch < AXIS2_BATCH_FLOOR) target_batch = AXIS2_BATCH_FLOOR;
+			if(target_batch > AXIS2_BATCH_CEIL)  target_batch = AXIS2_BATCH_CEIL;
+
+			int target_sack = pending_link_params_sack_mode;
+			if(target_sack < 0 || target_sack > 2) target_sack = 1;  // default ON
+
+			messages_control.data[0] = code;
+			messages_control.data[1] = (char)(unsigned char)target_batch;
+			messages_control.data[2] = (char)(unsigned char)target_sack;
+			// CRC8 over the (batch, sack_mode) bytes only — NOT the type byte
+			// (whose integrity is already protected by the OFDM LDPC codeword's
+			// CRC16 on the msg header). Polynomial: POLY_CRC8 = 0xF4 per
+			// datalink_defines.h:175. Matches the SACK_RSP frame's CRC8
+			// coverage rule (§4.2.2 / Step 7's send_sack_v2_frame).
+			messages_control.data[3] = (char)CRC8_calc(
+				(char*)&messages_control.data[1], 2);
+			messages_control.length = 4;
+			messages_control.id = 0;
+
+			printf("[CMD-LINK-PARAMS] SET_LINK_PARAMS TX: batch=%d sack_mode=%d crc8=0x%02x\n",
+				target_batch, target_sack, (unsigned char)messages_control.data[3]);
+			fflush(stdout);
+
+			// Clear the staging so a subsequent (unrelated) add_message_control
+			// call cannot pick up stale targets.
+			pending_link_params_batch_size = -1;
+			pending_link_params_sack_mode = -1;
+		}
 		else
 		{
 			messages_control.length=1;
@@ -1740,6 +1804,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;
 
+				// SACK Design A Step 10 — Axis 2 evaluation on SACK_RSP receipt.
+				// partial_rate = (batch - rx_count) / batch derived from the
+				// SACK_RSP bitmap (= what fraction of frames the receiver
+				// reported missing). Gated on sack_v2_enabled — v1 SACK paths
+				// don't feed this controller.
+				if(sack_v2_enabled)
+				{
+					policy_evaluate_axis2(rx_count, data_batch_size);
+				}
+
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
 				   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
 				{
@@ -1777,6 +1851,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					{
 						register_ack(i);
 					}
+				}
+
+				// SACK Design A Step 10 — Axis 2 evaluation on clean full-batch ACK.
+				// A full-batch ACK (no SACK_RSP) means receiver got all frames →
+				// partial_rate = 0. Feeds a "good" observation into the ring +
+				// bumps the consecutive-good counter. Gated on sack_v2_enabled
+				// so v1 sessions don't accumulate Axis-2 state.
+				if(sack_v2_enabled)
+				{
+					policy_evaluate_axis2(data_batch_size, data_batch_size);
 				}
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
@@ -2703,6 +2787,18 @@ void cl_arq_controller::process_control_commander()
 				this->connection_status=TRANSMITTING_DATA;
 				std::cout<<"end of file acked"<<std::endl;
 			}
+			else if (messages_control.data[0]==SET_LINK_PARAMS)
+			{
+				// SACK Design A Step 10 — SET_LINK_PARAMS ACKed by RSP.
+				// CMD has already applied the new batch_size locally at decision
+				// time (see policy_evaluate_axis2). The ACK confirms RSP also
+				// applied. Both sides now agree on data_batch_size for the next
+				// batch — proceed with DATA TX.
+				printf("[CMD-LINK-PARAMS-ACKED] SET_LINK_PARAMS round-trip complete "
+					"(local batch=%d) — resuming data TX\n", data_batch_size);
+				fflush(stdout);
+				this->connection_status=TRANSMITTING_DATA;
+			}
 			// BLOCK_END eliminated — pattern ACK / silence is sole flow control.
 			// finalize_block_commander() called directly after data ACK.
 			else if (messages_control.data[0]==SWITCH_ROLE)
@@ -3435,12 +3531,289 @@ void cl_arq_controller::policy_evaluate_axis1()
 // Steps 12+ will also call this from the emergency-BREAK code path.
 void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg, const char* reason)
 {
-	(void)from_cfg;  // unused at Step 9 — Axes 2/3 controllers consume in Steps 10/11
+	(void)from_cfg;
 	(void)to_cfg;
+	// SACK Design A Step 10 — Axis 2 reset (§4.3.3 cross-axis cooldown).
+	//
+	// Axis 1's move changed the modulation, which invalidates the partial-rate
+	// history we accumulated on the old config. Wipe Axis 2's ring + counters
+	// and engage a 3-batch cooldown so Axis 2 cannot fire before re-observing
+	// loss on the new config. Per §4.3.3:
+	//   "If Axis 1 moves config down (channel got worse), Axis 2's partial-rate
+	//    window is invalidated (the loss pattern changes when config changes),
+	//    so Axis 2 enters a 3-batch cooldown before its next decision.
+	//    Implementation: axis2_cooldown_batches = 3 after any Axis 1 move;
+	//    ignore observations inside the cooldown."
+	for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i]=0.0f;
+	axis2_partial_rate_count=0;
+	axis2_partial_rate_pos=0;
+	axis2_consecutive_good_batches=0;
+	axis2_consecutive_bad_batches=0;
+	axis2_cooldown_batches = AXIS2_CROSS_AXIS_COOLDOWN_BATCHES;
+	// Step 11 will additionally reset sack_mode to PROBE; that field does not
+	// yet exist. Logged via [POLICY-SUPREMACY] line.
 	printf("[POLICY-SUPREMACY] axis=1 move reason=%s — "
-		"Axes 2/3 cooldown engaged (Step 9 stub: no Axes 2/3 controllers yet)\n",
-		reason);
+		"Axis 2 reset (ring+counters cleared, cooldown=%d batches) "
+		"(Step 11 will add Axis 3 reset)\n",
+		reason, axis2_cooldown_batches);
 	fflush(stdout);
+}
+
+// SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
+//
+// Per-batch §4.3.2 controller. Fires from process_messages_rx_acks_data()
+// after every SACK_RSP receipt (= partial batch) and after every clean
+// full-batch ACK. Both call sites are gated on sack_v2_enabled; v1 sessions
+// never enter this code.
+//
+// rx_count = frames the receiver successfully delivered for the just-completed
+// batch (= batch_size_observed for a clean ACK; < batch_size_observed when
+// the SACK_RSP bitmap reported missing slots). batch_size_observed is the
+// data_batch_size value at the time the batch was sent.
+//
+// §4.3.2: partial_rate = frames_lost / batch_size. Ring of 5. Hysteresis:
+//   - up: mean<0.05 AND >=8 consecutive good batches (partial_rate < 0.05).
+//   - down: mean>0.20 AND >=3 consecutive bad batches (partial_rate > 0.20).
+//   - reset counters on any move.
+//   - step ±5; clamp [10, AXIS2_BATCH_CEIL].
+//
+// §4.3.3 / §4.3.4 invariant #6: skip when axis2_cooldown_batches > 0
+// (set to 3 by policy_axis1_supremacy_on_move() on every Axis-1 move).
+// Cooldown decremented per evaluation call.
+//
+// On move: log [POLICY-MOVE] axis=2 ... per §4.3.4 invariant #5, send
+// SET_LINK_PARAMS to the peer, AND apply locally. The handshake gates
+// the next data TX in RECEIVING_ACKS_CONTROL — both sides update before
+// the next batch.
+void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_observed)
+{
+	axis2_evaluations++;
+	if(batch_size_observed <= 0) return;  // defensive — no observation
+	if(rx_count < 0) rx_count = 0;
+	if(rx_count > batch_size_observed) rx_count = batch_size_observed;
+
+	int frames_lost = batch_size_observed - rx_count;
+	float partial_rate = (float)frames_lost / (float)batch_size_observed;
+
+	// Update ring + counters BEFORE the cooldown gate so observations are
+	// recorded; the gate only suppresses MOVES. (Per §4.3.3 "ignore
+	// observations inside the cooldown" — but resetting the ring at the
+	// supremacy hook already clears history. Subsequent observations inside
+	// the cooldown DO go into the ring; this is a finer-grained read of the
+	// spec — the relevant prohibition is "no Axis 2 move inside the
+	// cooldown", which we enforce strictly below.)
+	axis2_partial_rate_ring[axis2_partial_rate_pos] = partial_rate;
+	axis2_partial_rate_pos = (axis2_partial_rate_pos + 1) % AXIS2_RING_DEPTH;
+	if(axis2_partial_rate_count < AXIS2_RING_DEPTH) axis2_partial_rate_count++;
+
+	// Hysteresis counters: "good" = partial<0.05, "bad" = partial>0.20.
+	// Any single bad observation resets the good-run counter, and vice versa.
+	bool is_good = (partial_rate < 0.05f);
+	bool is_bad  = (partial_rate > 0.20f);
+	if(is_good)
+	{
+		axis2_consecutive_good_batches++;
+		axis2_consecutive_bad_batches = 0;
+	}
+	else if(is_bad)
+	{
+		axis2_consecutive_bad_batches++;
+		axis2_consecutive_good_batches = 0;
+	}
+	else
+	{
+		// In the [0.05, 0.20] middle band: neither good nor bad. Reset BOTH
+		// counters — neither run is still "consecutive."
+		axis2_consecutive_good_batches = 0;
+		axis2_consecutive_bad_batches = 0;
+	}
+
+	// Cooldown: skip MOVE decision while the Axis-1 supremacy timer is active.
+	if(axis2_cooldown_batches > 0)
+	{
+		axis2_cooldown_batches--;
+		axis2_skipped_in_cooldown++;
+		printf("[POLICY-AXIS2] eval rx=%d/%d partial=%.3f good=%d bad=%d "
+			"COOLDOWN_REMAINING=%d (no move)\n",
+			rx_count, batch_size_observed, partial_rate,
+			axis2_consecutive_good_batches, axis2_consecutive_bad_batches,
+			axis2_cooldown_batches);
+		fflush(stdout);
+		return;
+	}
+
+	// Compute mean over the ring (only over filled slots — avoid skewing
+	// early-session decisions with zero-padded entries).
+	float sum = 0.0f;
+	for(int i=0;i<axis2_partial_rate_count;i++) sum += axis2_partial_rate_ring[i];
+	float mean_partial = (axis2_partial_rate_count > 0)
+		? sum / (float)axis2_partial_rate_count : 0.0f;
+
+	// Up-move test: requires both the ring mean AND the consecutive-good
+	// counter at threshold. Both thresholds are non-overlapping with the
+	// down-move thresholds (§4.3.3 "different thresholds for up-moves vs
+	// down-moves").
+	bool want_up   = (mean_partial < 0.05f)
+	                 && (axis2_consecutive_good_batches >= AXIS2_UP_GOOD_RUN)
+	                 && (data_batch_size + AXIS2_STEP <= AXIS2_BATCH_CEIL);
+	bool want_down = (mean_partial > 0.20f)
+	                 && (axis2_consecutive_bad_batches >= AXIS2_DOWN_BAD_RUN)
+	                 && (data_batch_size - AXIS2_STEP >= AXIS2_BATCH_FLOOR);
+
+	if(want_up || want_down)
+	{
+		int from = data_batch_size;
+		int to = want_up ? (from + AXIS2_STEP) : (from - AXIS2_STEP);
+		const char* reason = want_up ? "ring_clean" : "ring_lossy";
+		const char* dir    = want_up ? "up"          : "down";
+
+		printf("[POLICY-MOVE] axis=2 from=%d to=%d direction=%s reason=%s "
+			"mean_partial=%.3f good=%d bad=%d cooldown=%d\n",
+			from, to, dir, reason, mean_partial,
+			axis2_consecutive_good_batches, axis2_consecutive_bad_batches,
+			axis2_cooldown_batches);
+		fflush(stdout);
+
+		// Reset ring + counters on any move (§4.3.2 hysteresis rule).
+		// We keep the ring sized at AXIS2_RING_DEPTH; just clear contents +
+		// counts so the next 5 batches re-populate it under the new
+		// data_batch_size.
+		for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i]=0.0f;
+		axis2_partial_rate_count=0;
+		axis2_partial_rate_pos=0;
+		axis2_consecutive_good_batches=0;
+		axis2_consecutive_bad_batches=0;
+
+		// Stash the target so the SET_LINK_PARAMS encoder picks it up.
+		// add_message_control(SET_LINK_PARAMS) reads pending_link_params_*
+		// fields (see arq.h Step 10 state).
+		pending_link_params_batch_size = to;
+		pending_link_params_sack_mode  = 1;  // ON — Step 11 will adjust.
+
+		// Apply locally NOW so the next batch builds with the new
+		// data_batch_size. RSP receives SET_LINK_PARAMS and applies in its
+		// own handler (arq_responder.cc). The control-frame ACK handshake
+		// gates the next DATA TX in RECEIVING_ACKS_CONTROL, so the two
+		// sides converge before the next batch.
+		//
+		// set_data_batch_size() clamps to a max derived from
+		// (max_data_length + max_header_length - ACK_MULTI_ACK_RANGE_HEADER_LENGTH - 1)
+		// — that ceiling is in the hundreds, well above 32, so no
+		// additional clamping is needed for our [10, 32] range.
+		set_data_batch_size(to);
+		recalculate_ack_timeout_for_batch();
+
+		if(want_up) axis2_move_up_count++;
+		else        axis2_move_down_count++;
+
+		// Send SET_LINK_PARAMS to the peer. add_message_control() bails out
+		// when messages_control.status != FREE (a control frame is in flight);
+		// if that happens we miss this round's TX but the local batch size
+		// already changed. The Axis-1 EOB-derived recovery (§4.3.4 invariant 4)
+		// is the safety net: even if the peer's data_batch_size lags ours by
+		// one batch, EOB on the last DATA frame self-corrects the receiver.
+		if(messages_control.status == FREE)
+		{
+			add_message_control(SET_LINK_PARAMS);
+		}
+		else
+		{
+			printf("[POLICY-AXIS2] WARNING: messages_control busy (status=%d) — "
+				"SET_LINK_PARAMS NOT sent this cycle; relying on EOB self-correct "
+				"(§4.3.4 invariant 4).\n", messages_control.status);
+			fflush(stdout);
+		}
+	}
+	else
+	{
+		printf("[POLICY-AXIS2] eval rx=%d/%d partial=%.3f mean=%.3f "
+			"good=%d/%d bad=%d/%d batch=%d (no move)\n",
+			rx_count, batch_size_observed, partial_rate, mean_partial,
+			axis2_consecutive_good_batches, AXIS2_UP_GOOD_RUN,
+			axis2_consecutive_bad_batches, AXIS2_DOWN_BAD_RUN,
+			data_batch_size);
+		fflush(stdout);
+	}
+}
+
+// SACK Design A Step 10 — Axis-2 cooldown helper.
+// Decrement cooldown counter by one (clamped at zero) and return the
+// post-decrement value. Currently unused by the controller body (which
+// inlines its own decrement); kept as part of the public API for Step 11+
+// and for unit-test access.
+int cl_arq_controller::axis2_cooldown_tick()
+{
+	if(axis2_cooldown_batches > 0) axis2_cooldown_batches--;
+	return axis2_cooldown_batches;
+}
+
+// SACK Design A Step 10 — synthetic Axis 2 fire (test-only).
+//
+// CLI: --test-policy-axis2-fire=up|down. Primes the partial-rate ring and
+// hysteresis counters at the move threshold then calls
+// policy_evaluate_axis2() once with a synthetic (rx_count, batch) pair
+// consistent with the requested direction. Demonstrates that the controller
+// is wired and that [POLICY-MOVE] axis=2 + the SET_LINK_PARAMS TX fire.
+//
+// Default builds never enter this; production paths unaffected.
+void cl_arq_controller::test_fire_policy_axis2(int direction)
+{
+	sack_v2_enabled = true;
+	// Reset ring + counters to a deterministic starting state.
+	for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i]=0.0f;
+	axis2_partial_rate_count=0;
+	axis2_partial_rate_pos=0;
+	axis2_consecutive_good_batches=0;
+	axis2_consecutive_bad_batches=0;
+	axis2_cooldown_batches=0;
+
+	// Pick a deterministic starting batch size mid-range. Bypass
+	// set_data_batch_size()'s clamp (which depends on max_data_length +
+	// max_header_length having been initialized by a config load — the
+	// synthetic test runs before any config is loaded so those are 0 and
+	// the clamp produces a nonsense negative value).
+	int starting_batch = 25;
+	if(starting_batch < AXIS2_BATCH_FLOOR) starting_batch = AXIS2_BATCH_FLOOR;
+	if(starting_batch > AXIS2_BATCH_CEIL) starting_batch = AXIS2_BATCH_CEIL;
+	data_batch_size = starting_batch;
+
+	if(direction == 1)
+	{
+		// UP synthetic: prime ring with 5 zero-partial observations + good_run
+		// at AXIS2_UP_GOOD_RUN - 1. The single evaluate call will bump good
+		// run to AXIS2_UP_GOOD_RUN and trigger an up move.
+		for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.0f;
+		axis2_partial_rate_count = AXIS2_RING_DEPTH;
+		axis2_consecutive_good_batches = AXIS2_UP_GOOD_RUN - 1;
+		printf("[TEST-AXIS2-FIRE] direction=up: ring primed clean (mean=0), "
+			"good_run=%d/%d, batch=%d → expect UP\n",
+			axis2_consecutive_good_batches, AXIS2_UP_GOOD_RUN, data_batch_size);
+		fflush(stdout);
+		// Synthetic observation: full batch RX (rx_count == batch_size).
+		policy_evaluate_axis2(starting_batch, starting_batch);
+	}
+	else if(direction == 2)
+	{
+		// DOWN synthetic: prime ring with 5 high-partial observations + bad_run
+		// at AXIS2_DOWN_BAD_RUN - 1. The single evaluate call will bump bad
+		// run to AXIS2_DOWN_BAD_RUN and trigger a down move.
+		for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.4f;
+		axis2_partial_rate_count = AXIS2_RING_DEPTH;
+		axis2_consecutive_bad_batches = AXIS2_DOWN_BAD_RUN - 1;
+		printf("[TEST-AXIS2-FIRE] direction=down: ring primed lossy (mean=0.4), "
+			"bad_run=%d/%d, batch=%d → expect DOWN\n",
+			axis2_consecutive_bad_batches, AXIS2_DOWN_BAD_RUN, data_batch_size);
+		fflush(stdout);
+		// Synthetic observation: rx_count = batch * 0.6 → partial_rate = 0.4
+		int synth_rx = (int)(starting_batch * 0.6f);
+		policy_evaluate_axis2(synth_rx, starting_batch);
+	}
+	else
+	{
+		printf("[TEST-AXIS2-FIRE] direction=%d not in {1=up, 2=down}; no-op\n",
+			direction);
+		fflush(stdout);
+	}
 }
 
 // SACK Design A Step 9 — synthetic Axis 1 fire (test-only entry point).
