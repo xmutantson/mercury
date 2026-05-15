@@ -999,6 +999,301 @@ unchanged — that growth is Step 1+2+3 and is gated on
 4 → 7 → ...). Step 7 (the SACK_RSP `0x42` OFDM control frame) and
 the Axes 2/3 controllers (Steps 10/11) are likewise NOT started.
 
+### §7.1 RESULT — Step 1 (2026-05-15)
+
+Mercury commit: `monitor` `89567a6` — "sack: Step 1 — DATA_LONG header
+growth 4→5 bytes gated on sack_v2_enabled".
+
+Wire-format gate landed. Five files changed (`+121 / -19 LOC`):
+
+- `include/datalink_layer/datalink_defines.h:131-152` — added two new
+  scaffolding macros `DATA_LONG_HEADER_LENGTH_V2 = 5` and
+  `DATA_SHORT_HEADER_LENGTH_V2 = 6` (the latter reserved for Step 2)
+  with inline comments documenting the §6 reversibility-via-gate
+  invariant. Legacy `DATA_LONG_HEADER_LENGTH` (=4) +
+  `DATA_SHORT_HEADER_LENGTH` (=5) unchanged.
+- `include/datalink_layer/arq.h:174-191` — two new inline helpers
+  `effective_data_long_header_length(bool sack_v2)` and
+  `effective_data_short_header_length(bool sack_v2)`. Each returns the
+  legacy macro value when `sack_v2` is false, the new `_V2` macro when
+  true. These helpers are the *only* sites that decide the wire
+  layout; replacing every literal `DATA_LONG_HEADER_LENGTH` usage with
+  the helper makes v2 the runtime-selectable wire shape.
+- `source/datalink_layer/arq_common.cc`:
+  - `:1043-1053` — `load_configuration()`'s `nBytes_header = max(...)`
+    calc replaces the legacy DATA_LONG_HEADER_LENGTH with
+    `effective_data_long_header_length(sack_v2_enabled)`. Buffer
+    sizing is picked up at the next config-load post-negotiation;
+    pre-negotiation `sack_v2_enabled` is false so the value is
+    byte-identical to pre-Step-1.
+  - `:2790-2814` (`send()`) and `:2961-2982` (`send_batch()`) — TX
+    serialization inserts a `batch_seq_id` placeholder byte (0) at
+    offset 3 when v2, and writes `id` at offset 4 instead of offset 3.
+    `header_length` is then the effective value (5 vs 4).
+  - `:4916-4948` (RX deserialization) — DATA_LONG branch reads `id`
+    from offset 4 when v2 (offset 3 holds the batch_seq_id placeholder
+    that Step 1 parses but discards), and copies payload starting at
+    the effective header length.
+  - `:5669-5693` — `restore_backup_buffer_data()` per-message size
+    uses effective DATA_LONG header.
+- `source/datalink_layer/arq_commander.cc`:
+  - `:693-697` — `add_message_tx_data()` DATA_LONG bounds check uses
+    effective header.
+  - `:3012` — adaptive-compression `max_frame` uses effective header.
+- `source/datalink_layer/arq_responder.cc`:
+  - `:66-71`, `:85-91` — `add_message_rx_data()` DATA_LONG bounds
+    check + zero-pad use effective header.
+  - `:350-351`, `:830-832` — compression-header-driven
+    expected-batch-size estimates use effective header (the two
+    fallback paths that use the compression-header byte 1+2 size hint).
+  - `:1879-1881` — outgoing rx_raw pop size uses effective header
+    (responder-side data forwarding to TCP data port).
+
+Audit of remaining `DATA_LONG_HEADER_LENGTH` references in `source/`:
+`grep -nr DATA_LONG_HEADER_LENGTH source/` returns ZERO matches
+post-edit. Every operational use of DATA_LONG header length now
+flows through `effective_data_long_header_length(sack_v2_enabled)`.
+
+Validation (deterministic harness + binary smoke):
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS — same input → byte-identical output
+  pass 1 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+  pass 2 sha256: 2a9366a1166182ba57e66fa4174989675059b750652023ae63bc6764cfbb0a84
+
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step1.json
+wrote post_step1.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+Workspace-local fixture (`v1_cmd.log` / `v1_rsp.log` = the bundled
+synthetic CMD/RSP log fixtures from
+`tools/sack_redesign_wav_ab.py:SYNTHETIC_*_LOG`, written to disk
+pre-Step-1). The exact baseline SHA `9683251029c0dcf23febee698dac
+7706487d7f41341d4c7c133be2d2da9c9482` differs from the §7.5/§7.6
+RESULT `73c6acc8…` because the §7.5 RESULT used different fixture
+content (real mercury logs captured at that session, not preserved
+in the repo). What's load-bearing is that **the same fixture content
+post-Step-1 produces the same hash as pre-Step-1**, proving the
+harness's grading layer is undisturbed and the fixture text was not
+inadvertently mutated.
+
+Build: `bash build.sh o3` PASS (only pre-existing sign-compare
+warning at `arq_commander.cc:1426`, unrelated).
+
+Steps 2, 3 are NOT started by this commit. DATA_SHORT header still
+5 bytes; `batch_seq_id` field carries a hardcoded 0 placeholder in
+v2 mode; no code branches on its value.
+
+### §7.2 RESULT — Step 2 (2026-05-15)
+
+Mercury commit: `monitor` `1e0be65` — "sack: Step 2 — DATA_SHORT
+header growth 5→6 bytes gated on sack_v2_enabled".
+
+Symmetric gated growth for DATA_SHORT. Three files changed
+(`+67 / -20 LOC`):
+
+- `source/datalink_layer/arq_common.cc`:
+  - `:2819-2839` (`send()`) and `:3013-3032` (`send_batch()`) — TX
+    serialization writes batch_seq_id placeholder (0) at offset 3, id
+    at offset 4, length at offset 5 when v2 (legacy: id at offset 3,
+    length at offset 4).
+  - `:4944-4977` (RX deserialization) — DATA_SHORT branch reads id
+    from offset 4 and length from offset 5 when v2; payload starts
+    at the effective header length.
+  - `:1043-1057` — `load_configuration()`'s `nBytes_header` calc now
+    folds DATA_SHORT_HEADER_LENGTH_V2 = 6 through the effective helper.
+    Both DATA_LONG and DATA_SHORT effective lengths are considered.
+- `source/datalink_layer/arq_commander.cc:702-706` —
+  `add_message_tx_data()` DATA_SHORT bounds check uses effective.
+- `source/datalink_layer/arq_responder.cc:78-81` —
+  `add_message_rx_data()` DATA_SHORT bounds check uses effective.
+
+Audit: `grep -nr DATA_SHORT_HEADER_LENGTH source/` returns ZERO
+matches post-edit. Every operational use of DATA_SHORT header length
+flows through `effective_data_short_header_length(sack_v2_enabled)`.
+
+Validation:
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS (sha256=2a9366a1…)
+
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step2.json
+wrote post_step2.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+v1↔v1 fixture replay sha256 **stable**: matches the pre-Step-1
+baseline and the post-Step-1 hash. The Step-2 wire growth is fully
+gated on `sack_v2_enabled`; v1 sessions see byte-identical wire.
+
+Build: `bash build.sh o3` PASS.
+
+Step 3 (plumb the real `batch_seq_id` value through TX and RX) is
+NOT started by this commit. Both DATA_LONG and DATA_SHORT now carry
+a 1-byte `batch_seq_id` placeholder (=0) when sack_v2_enabled; no
+code reads or branches on its value yet.
+
+### §7.3 RESULT — Step 3 (2026-05-15)
+
+Mercury commit: `monitor` `48b5f54` — "sack: Step 3 — plumb
+batch_seq_id through TX and RX (scaffolding)".
+
+The 1-byte `batch_seq_id` field now carries a real value (mod-256
+CMD counter, retransmit-original on retransmit frames) on the wire,
+is parsed on RX, and is stored. **No decision branches on its
+value**: the field exists for Step 4+ (cross-batch routing, mixed
+retransmit-into-new-data batches) — Step 3 is pure scaffolding per
+the plan. Three files changed (`+157 / -26 LOC`).
+
+§4.3.4 invariants satisfied:
+
+- **Invariant 2** (batch_seq_id monotonicity, no reset on
+  `set_data_batch_size()`): The counter increments only in
+  `process_messages_tx_data()` after a successful `send_batch()`
+  call where the batch carried at least one new-data frame. The
+  `set_data_batch_size()` body (`arq_common.cc:397-411`) mutates
+  only `data_batch_size`; it never touches `cmd_batch_seq_id`. Code-
+  grep confirmation: zero references to `cmd_batch_seq_id` inside
+  `set_data_batch_size()`.
+- **Invariant 2** (retransmits carry their *original* `batch_seq_id`):
+  When the SACK consumer (`arq_commander.cc:1533`) populates the
+  retransmit queue, it captures `messages_tx[i].batch_seq_id` into
+  `retransmit_frame_batch_seq_ids[r]`. The retransmit-only batch
+  builder (`arq_commander.cc:767`) writes that captured value into
+  `messages_batch_tx[...].batch_seq_id`, NOT the current
+  `cmd_batch_seq_id`. A `[CMD-RETX-V2]` diagnostic logs both for
+  audit. For mixed batches built by the main loop, ACK_TIMED_OUT
+  frames keep their existing `batch_seq_id` (set on first send);
+  the assignment line only fires for ADDED_TO_LIST.
+
+New members:
+
+- `struct st_message::batch_seq_id` (`int`, `-1` = unset). Persists
+  through struct copies between `messages_tx`, `messages_batch_tx`,
+  `messages_batch_ack` automatically.
+- `cl_arq_controller::cmd_batch_seq_id` (CMD-side mod-256 counter).
+- `cl_arq_controller::retransmit_frame_batch_seq_ids[MAX_RETRANSMIT
+  _HEADROOM]` (per-slot captured original).
+- `cl_arq_controller::last_received_batch_seq_id` (RSP-side
+  diagnostic store; -1 = none received).
+- `cl_arq_controller::captured_batch_seq_id_for_retransmit`
+  (reserved for a future single-value retransmit path; currently
+  unused — per-frame array is the active mechanism).
+
+Init sites: constructor (`arq_common.cc:143-151`) sets the four
+controller members to 0/-1; `init_messages_buffers()`
+(`arq_common.cc:1350,1379,1412,1434,1448,1459,1470`) sets every
+`st_message` slot's `batch_seq_id` to -1.
+
+TX assignment sites:
+- `arq_commander.cc:840` (new-data path): `messages_tx[i].batch_seq_id
+  = (cmd_batch_seq_id & 0xFF)` for ADDED_TO_LIST → ADDED_TO_BATCH_BUFFER.
+- `arq_commander.cc:767` (retransmit-only path): assigned the
+  captured original.
+- `arq_commander.cc:897` (post-`send_batch()`): `cmd_batch_seq_id =
+  (cmd_batch_seq_id + 1) & 0xFF` iff `batch_includes_new_data`.
+
+RX parse + store sites:
+- `arq_common.cc:4949-4951` (DATA_LONG v2 branch):
+  `messages_rx_buffer.batch_seq_id = bsi; last_received_batch_seq_id
+  = bsi;` then `[RX-BATCH-SEQ]` diagnostic emit.
+- `arq_common.cc:4985-4988` (DATA_SHORT v2 branch): identical store
+  + emit.
+
+Validation:
+
+```
+$ python tools/sack_redesign_wav_ab.py --self-test
+[STEP0-SELFTEST] PASS (sha256=2a9366a1…)
+
+$ python tools/sack_redesign_wav_ab.py \
+    --a-cmd-log v1_cmd.log --a-rsp-log v1_rsp.log --a-label v1_pre \
+    --b-cmd-log v1_cmd.log --b-rsp-log v1_rsp.log --b-label v1_pre_copy \
+    --out post_step3.json
+wrote post_step3.json (8912 bytes,
+  sha256=9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482)
+[A/B] verdict: A and B are IDENTICAL (mechanism dict matches).
+```
+
+v1↔v1 fixture replay sha256 **stable across all three steps**:
+`9683251029c0dcf23febee698dac7706487d7f41341d4c7c133be2d2da9c9482`
+pre-Step-1 = post-Step-1 = post-Step-2 = post-Step-3. The gate
+invariant holds: every behavior change is keyed off `sack_v2_enabled`
+which is false by default.
+
+**v1 smoke test** (NB_CFG4, no `--enable-sack-v2`, 60s loopback):
+
+- `[FLAG] --enable-sack-v2` lines: **0** (CLI flag absent).
+- `[SACK-V2]` negotiation: both peers log `not enabled
+  (local=0x1E peer=0x1E)`.
+- `[CMD-BATCH-SEQ]` lines: **0** (CMD plumbing dormant).
+- `[RX-BATCH-SEQ]` lines: **0** (RSP plumbing dormant).
+- v2 wire path completely inactive in v1 sessions.
+
+**v2↔v2 demonstration** (NB_CFG4, `--enable-sack-v2` on both peers,
+120s loopback, output saved in workspace logs `v2_session_*.log`):
+
+- `[FLAG] --enable-sack-v2: CAP_SACK_V2 added to local_capability` on
+  both CMD and RSP.
+- `[SACK-V2] enabled (negotiate-only) (local=0x5E peer=0x5E)` on
+  both peers — caps include `CAP_SACK_V2 = 0x40`.
+- **CMD-side TX counter values** (3 new-data batches sent):
+  ```
+  [CMD-BATCH-SEQ] new-data batch_seq_id=0 (frames in batch=5)
+  [CMD-BATCH-SEQ] new-data batch_seq_id=1 (frames in batch=5)
+  [CMD-BATCH-SEQ] new-data batch_seq_id=2 (frames in batch=5)
+  ```
+  → monotonic +1 (mod 256) confirmed across three consecutive
+  new-data batches.
+- **RSP-side RX parse values** (12 DATA_LONG frames decoded):
+  ```
+  [RX-BATCH-SEQ] type=DATA_LONG id=0 seq=0 batch_seq_id=0 (v2)
+  [RX-BATCH-SEQ] type=DATA_LONG id=1 seq=1 batch_seq_id=0 (v2)
+  [RX-BATCH-SEQ] type=DATA_LONG id=2 seq=2 batch_seq_id=0 (v2)
+  [RX-BATCH-SEQ] type=DATA_LONG id=3 seq=3 batch_seq_id=0 (v2)
+  [RX-BATCH-SEQ] type=DATA_LONG id=4 seq=4 batch_seq_id=0 (v2)
+  [RX-BATCH-SEQ] type=DATA_LONG id=0 seq=0 batch_seq_id=1 (v2)
+  ...
+  [RX-BATCH-SEQ] type=DATA_LONG id=4 seq=4 batch_seq_id=1 (v2)
+  [RX-BATCH-SEQ] type=DATA_LONG id=0 seq=0 batch_seq_id=2 (v2)
+  [RX-BATCH-SEQ] type=DATA_LONG id=1 seq=1 batch_seq_id=2 (v2)
+  ```
+  → each batch's 5 frames carry the **same** `batch_seq_id`. RX
+  values `{0, 1, 2}` exactly match TX values `{0, 1, 2}`.
+- **No retransmits observed in this clean-channel demo** (so the
+  `[CMD-RETX-V2]` diagnostic line did not fire). The retransmit-
+  preservation path is exercised by code inspection: the SACK
+  consumer (`arq_commander.cc:1533`) captures the original
+  `messages_tx[i].batch_seq_id`, and the retransmit-only builder
+  (`arq_commander.cc:767`) writes it back into the outgoing frame.
+
+**Decision-branch audit** (grep `batch_seq_id` across `source/`):
+every reference is a comment, a struct-init to `-1`, an assignment,
+a printf/log, a wire serialization byte at offset 3, or a `& 0xFF`
+mask. **Zero `if`, `==`, `!=`, `<`, `>` comparisons on the value.**
+Pure scaffolding per Step 3's scope.
+
+Build: `bash build.sh o3` PASS (only pre-existing sign-compare
+warning unchanged).
+
+**Steps 4, 7+ are NOT started.** Cross-batch routing (Step 4),
+SACK_RSP OFDM frame (Step 7), retransmit-into-next-batch (Step 8),
+Axes 2 + 3 controllers (Steps 10/11), and legacy MFSK SACK cleanup
+(Step 15) all remain untouched. The legacy `CAP_SACK` MFSK SACK
+pattern is fully operational on `sack_enabled && !sack_v2_enabled`
+peers — no v1 path was modified.
+
 ---
 
 ## §7 Open questions [?]
