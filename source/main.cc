@@ -294,7 +294,8 @@ int main(int argc, char *argv[])
     int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 0 post-SACK_FIX_PLAN §7 step 3)
     bool no_sack_cli = false;          // --no-sack: force disable (no-op after B2 fix)
     bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
-    bool enable_sack_v2_cli = false;   // --enable-sack-v2: SACK Design A Step 6 (negotiate-only opt-in)
+    bool enable_sack_v2_cli = false;   // --enable-sack-v2: legacy opt-in (default-on now after Step 14; kept as no-op for harness compat)
+    bool disable_sack_v2_cli = false;  // --disable-sack-v2: SACK Design A Step 14 opt-out (forces CAP_SACK_V2 off)
     bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
     int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
     bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
@@ -421,6 +422,7 @@ int main(int argc, char *argv[])
         printf("  --gi [ms]         Guard interval in ms (1.0-8.0, default 3.0)\n");
         printf("  --radio-batch [n] Total frames per radio TX for SACK (default: 25)\n");
         printf("  --retransmit-headroom [n]  Max retransmit frames per batch (default: 5)\n");
+        printf("  --disable-sack-v2 Opt out of CAP_SACK_V2 (legacy v1 ACK behavior)\n");
 
         printf("\nTesting and debug:\n");
         printf("  -Z [snr_dB]       Inject AWGN noise at specified SNR\n");
@@ -577,9 +579,22 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "--enable-sack-v2") == 0)
         {
-            // SACK Design A Step 6: opt-in to CAP_SACK_V2 advertisement.
-            // Negotiate-only at this step — sack_v2_enabled gates nothing yet.
+            // SACK Design A Step 6 → Step 14: kept for harness compat
+            // (sack_lossy_ab.py et al. pass this verbatim). Default is now ON
+            // after Step 14, so this flag is effectively a no-op — left in
+            // place to avoid breaking scripted invocations.
             enable_sack_v2_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--disable-sack-v2") == 0)
+        {
+            // SACK Design A Step 14: opt-out of CAP_SACK_V2 advertisement.
+            // Forces CAP_SACK_V2 OFF in local_capability — TEST_CONNECTION
+            // byte-for-byte matches a pre-Step-14 v1-only build. Use this
+            // for v1/v2 interop testing or to roll back to v1 ACK behavior
+            // on a per-instance basis without rebuilding.
+            disable_sack_v2_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1477,17 +1492,17 @@ start_modem:
             exit(1);
         }
         if (enable_sack_v2_cli) {
-            // SACK Design A Step 6 scaffolding: opt-in to CAP_SACK_V2
-            // advertisement. Wire effect: byte 5 of TEST_CONNECTION carries
-            // the CAP_SACK_V2 bit ORed into local_capability. No other wire
-            // change — sack_v2_enabled is computed by both peers but gates
-            // nothing functional at this step. Default builds do NOT set
-            // this bit, preserving byte-for-byte TEST_CONNECTION shape on
-            // v1-only sessions.
-            ARQ.enable_sack_v2 = true;
-            ARQ.local_capability |= CAP_SACK_V2;
-            printf("[FLAG] --enable-sack-v2: CAP_SACK_V2 added to local_capability "
-                   "(negotiate-only; gates nothing yet — SACK Design A Step 6)\n");
+            // SACK Design A Step 14: default is now ON. This flag is a no-op
+            // kept for harness compatibility. The init in arq_common.cc:131
+            // already set ARQ.enable_sack_v2 = true.
+            printf("[FLAG] --enable-sack-v2: no-op (default ON since SACK Design A Step 14)\n");
+        }
+        if (disable_sack_v2_cli) {
+            // SACK Design A Step 14: opt out — force CAP_SACK_V2 off.
+            ARQ.enable_sack_v2 = false;
+            ARQ.local_capability &= ~CAP_SACK_V2;
+            printf("[FLAG] --disable-sack-v2: CAP_SACK_V2 removed from local_capability "
+                   "(v1-only ACK behavior — SACK Design A Step 14 opt-out)\n");
         }
         if (test_sack_ldpc_fail_cli) {
             ARQ.force_sack_ldpc_fail = true;
