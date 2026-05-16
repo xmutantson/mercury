@@ -4361,15 +4361,28 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	// Stage as a single-frame OFDM batch via messages_batch_tx[0]. Use the
 	// existing send_batch() path so the OFDM TX is bit-identical to any other
 	// control-class frame's wire shape.
-	message_batch_counter_tx = 0;
-	messages_batch_tx[0].type = SACK_RSP;
-	messages_batch_tx[0].sequence_number = 0;
-	messages_batch_tx[0].id = 0;
-	messages_batch_tx[0].length = payload_len;
+	//
+	// Bug B fix (iter 2, SACK_DESIGN_A_PLAN §7.13.5): messages_batch_tx[i].data
+	// starts NULL (arq_common.cc:1530). The design assumes slots are
+	// populated via struct-copy from a pre-allocated source (messages_tx[]
+	// has .data at arq_common.cc:1436; messages_control has .data at
+	// arq_common.cc:1579; messages_batch_ack[] has .data at
+	// arq_common.cc:1555). Writing directly into messages_batch_tx[0].data[..]
+	// without a prior struct-copy crashes RSP with a NULL-pointer deref
+	// (SIGSEGV, silent on Linux without core-dump enabled). RSP never
+	// stages data frames so its messages_batch_tx[0].data was permanently
+	// NULL before this fix. Same idiom: arq_responder.cc:720, 757.
+	messages_control.type = SACK_RSP;
+	messages_control.sequence_number = 0;
+	messages_control.id = 0;
+	messages_control.length = payload_len;
 	for(int b = 0; b < payload_len; b++)
-		messages_batch_tx[0].data[b] = (char)payload[b];
-	messages_batch_tx[0].status = ADDED_TO_BATCH_BUFFER;
-	messages_batch_tx[0].batch_seq_id = batch_seq_id;  // diagnostic mirror
+		messages_control.data[b] = (char)payload[b];
+	messages_control.status = ADDED_TO_BATCH_BUFFER;
+	messages_control.batch_seq_id = batch_seq_id;  // diagnostic mirror
+
+	message_batch_counter_tx = 0;
+	messages_batch_tx[0] = messages_control;  // struct-copy inherits valid .data
 	message_batch_counter_tx = 1;
 
 	// Full-length OFDM frame on the data configuration (NOT the MFSK ack
