@@ -6159,3 +6159,304 @@ Validation (sack_lossy_ab.py clean cell, sackv2 vs nosack, 2 runs each):
 Interop: pre-Step-14 v1-only peers fall through to ACK-timeout +
 full-batch retransmit when meeting a Step-15 node (CAP_SACK_V2
 negotiation failure path). Graceful degradation, no crash.
+
+### §7.13.13 RESULT — Axis-walk SNR sweep: BREAK failsafe investigation (2026-05-16)
+
+Followup to §7.13.11.5 ("validate that gearshift moves are stable AND
+helpful across the SNR range"). Built `tools/axis_walk_sweep.py` and
+observed three pathological walks (v1/v2/v3) where the link deadlocked
+at low SNR. Owner challenge:
+> "BREAK is supposed to fire and let it negotiate to a config which will
+> actually work. it's a failsafe. are you telling me break is not
+> functioning correctly?"
+
+Full investigation written up in
+`mercury/fact-documents/BREAK_FAILSAFE_INVESTIGATION.md` (§1–§12 + walk
+artifacts in `fact-documents/axis_walk_v5_robust/`).
+
+#### §7.13.13.1 Root cause of the v1/v2/v3 deadlocks
+
+The walk script passed `-s 10 -g -Q 0 -M auto` to mercury. `-s` flips
+`explicit_config = true` (`main.cc:962`), which **disables the implicit
+`robust_mode = 1` enable** at `main.cc:1941`:
+
+```
+if(gear_shift_mode != NO_GEAR_SHIFT && !explicit_config)
+    robust_mode = 1;
+```
+
+→ `ARQ.robust_enabled = NO` → `config_ladder_down_n(..., robust_enabled)`
+floors at **CONFIG_0** (OFDM BPSK 1/16), not ROBUST_0
+(`common_defines.h:137-146`). BREAK's coordination layer is also CONFIG_0
+when `robust_enabled = NO` (`arq_commander.cc:71`,
+`arq_responder.cc:242`). At WGN:38 with the IONOS channel's SNR
+translation, OFDM CONFIG_0 cannot reliably carry the SET_CONFIG/ACK
+round trip, so the BREAK→Phase-1→retry→re-BREAK loop runs forever.
+`cmd.log:5752` (v2): `[BREAK] ACK received! ... 15 -> 14 (robust_enabled=0)`.
+
+#### §7.13.13.2 Verdict: BREAK is functioning correctly
+
+When `-R` is added to both peers (v5_robust walk), BREAK successfully
+descends through the OFDM tiers and into ROBUST_0 as the failsafe floor:
+
+| Walk event | cmd.log line | observation |
+|------------|--------------|-------------|
+| First BREAK after CFG_15 fails  | 5007 | target=14, `robust_enabled=1` |
+| Coordination layer load         | 5008 | `load_configuration(100)` — **ROBUST_0** |
+| Recovery probe @ 13 succeeds    | 12334 | `Config 13 verified, resuming data exchange` |
+| Recovery probe @ 12 fails       | 24445 | `Config 12 failed probe, sending BREAK` |
+| Recovery probe @ 10 succeeds    | 25903 | `Config 10 verified, resuming data exchange` |
+| Recovery probe @ 9 succeeds     | 28747 | `Config 9 verified, resuming data exchange` |
+| Frame-gearshift UP failure 7→8  | 31341 | `FRAME UP FAILED ... BREAK to 7` |
+| Final exhausted at ROBUST_0     | 36498 | `assuming responder already at ROBUST_0` |
+
+Descent trajectory: **15 → 14 → 13 → 12 → 10 → 9 → 8 → 7 → ROBUST_0**.
+Every transition was BREAK-initiated, code-driven, with no manual help.
+
+#### §7.13.13.3 Per-bucket bps (v5_robust)
+
+| step | WGN | bps |
+|------|-----|-----|
+| settle | 40 | 1120.0 (90 s) |
+| 0 | 36 | 0.0 |
+| 1 | 30 | 0.0 |
+| 2 | 24 | 0.0 |
+| 3 | 20 | 0.0 |
+| 4 | 16 | 0.0 |
+| 5 | 14 | 0.0 |
+| 6 | 20 | 0.0 |
+| 7 | 28 | 0.0 |
+| 8 | 36 | 0.0 |
+
+All 0 bps. RSP-side `nReceived_data` plateaued at 74 frames very early.
+This is **not** a BREAK bug — see §7.13.13.4.
+
+#### §7.13.13.4 Why bps stays 0 even when BREAK is working
+
+Two compounding factors (BREAK_FAILSAFE_INVESTIGATION.md §11.2):
+
+1. **TX FIFO full and harness keeps pumping.** Mercury status block:
+   `TX buffer occupancy= 94.71 %`. Each BREAK saves the in-flight batch
+   back to FIFO (~127 KB queued). The harness's `sender_thread()` runs
+   uninterrupted, so once mercury's FIFO fills, no further TCP bytes
+   from the pump are acknowledged.
+2. **Channel at WGN:14..30 can't sustain CFG_7..13 data batches.** Each
+   "Config N verified" event is immediately followed by `[BREAK] Block
+   failure #1 at config N` — the SET_CONFIG control frame
+   (1-frame batch, very reliable) gets through, but a 25-frame data
+   batch loses ≥1 frame within seconds. This is the OFDM operating
+   limit, not a BREAK defect.
+
+#### §7.13.13.5 Correct flag set for axis_walk_sweep.py
+
+Tooling change: added `--with-robust` (passes `-R`) and `--wgn-sequence`
+(custom WGN walk) to `tools/axis_walk_sweep.py`. Default `--with-robust`
+remains OFF for back-compat with v1/v2/v3 baselines; new walks should
+opt-in.
+
+Recommended command for SNR-sweep validation:
+```
+python tools/axis_walk_sweep.py --with-robust --settle-snr 40 --settle-s 90 \
+    --wgn-sequence "36,30,24,20,16,14,20,28,36" --dwell-s 60 \
+    --config 10 --mode sackv2
+```
+
+#### §7.13.13.6 Open questions / follow-ups
+
+- [?] `emergency_previous_config` does not refresh on Phase 1 retry
+  (`arq_commander.cc:1318` comment: "Keep emergency_previous_config
+  unchanged"). With `robust_enabled = YES` this is benign because the
+  coordination layer is ROBUST_0 itself; with `robust_enabled = NO`
+  it's the root cause of the loop-forever pathology of v2. Worth a
+  separate review: should Phase 1 escalate `emergency_previous_config`
+  down a step on each retry? (Independent of the `-R` fix.)
+- [?] Throttled TX pump in `axis_walk_sweep.py` would produce non-zero
+  per-bucket bps and let the walk demonstrate the BREAK-descent
+  recovery curve cleanly. Today's results validate BREAK semantics but
+  do not yet quantify the throughput at each post-BREAK config.
+- [?] The v5_robust walk took ~16 minutes of wall time for 9 steps
+  because each BREAK-Phase1-Phase2 round at ROBUST_0 coordination takes
+  20-30 s (10.7 bps). At lower SNRs the BREAK loop dominates and few
+  data blocks fit in the dwell. Future walks should size `--dwell-s`
+  with this in mind (≥120 s when descending through ROBUST tier).
+
+#### §7.13.13.7 Artifacts
+
+- `mercury/fact-documents/BREAK_FAILSAFE_INVESTIGATION.md` — full
+  code-walk + cmd.log timeline.
+- `fact-documents/axis_walk_v2_desc_gearshift/` — v2 deadlock baseline
+  (robust_enabled=0). cmd.log lines 5752, 6320, 6825 demonstrate the
+  Phase-1-loop-forever pathology.
+- `fact-documents/axis_walk_v5_robust/` — fixed walk (robust_enabled=1).
+  cmd.log line 5007 onward demonstrates the proper BREAK descent into
+  ROBUST_0.
+
+### §7.13.14 RESULT — Post-BREAK stuck state: the REAL bug (2026-05-16)
+
+Followup to §7.13.13. Owner pushed back: "at WGN:38 config 0 should work
+just fine, this is madness that it doesn't." That challenge was correct.
+The prior subagent's "add `-R`" workaround sidesteps the real defect.
+
+Task 1 verification: pinned mercury `-s 0` (CFG_0 OFDM, no gearshift, no
+robust) at WGN:38 sustains **24 bps** for 90 s with clean HAIL +
+START_CONNECTION + DATA flow. **CFG_0 OFDM is healthy at WGN:38.** The
+v2 walk's deadlock therefore cannot be a CFG_0 physical-layer issue.
+
+Root cause: `arq_responder.cc:226-252` BREAK handler does NOT reset
+`messages_control.status`. If BREAK fires while the responder's control
+slot is in a non-FREE state (e.g., ACKED mid-`process_messages_acknowledging_control`),
+the post-BREAK SET_CONFIG arriving on CFG_0 is **silently dropped at the
+FREE gate** in `arq_responder.cc:262`. The dropped frame never reaches
+`process_control_responder()` (gate at line 287 fails because status is
+neither FREE nor RECEIVED). Every subsequent SET_CONFIG retry hits the
+same gate. Self-deadlock — only DISCONNECT or process restart escapes.
+
+v2 log signature: `rsp.log:15676 [RX] CONTROL ... code=59` arrives, but
+no `[RX-CTRL] Processing` follows. 30 such silent-discard events across
+21 000 lines, while CMD does 16 BREAK round trips and `walk.runner.log`
+shows bps=0 throughout.
+
+`-R` masks this latent bug because ROBUST_0 has ~17 dB more sensitivity
+margin and a 5× longer frame time — the timing race that lands status in
+ACKED across a BREAK boundary closes before BREAK fires.
+
+Full investigation: `mercury/fact-documents/POST_BREAK_STUCK_INVESTIGATION.md`
+(§1–§11). Proposed minimal fix in §8.1: add `messages_control.status = FREE`
+to the RSP BREAK handler (symmetric with CMD which already force-clears at
+`arq_commander.cc:113, 184`). Status: **proposed, not implemented** —
+pending owner approval. Reproducer attempts at WGN:36/30 succeeded
+(BREAK descent worked), so the race is intermittent; deterministic
+reproduction would need either replay of the original audio or an
+injected delay in the ACK-CTRL path.
+- `tools/axis_walk_sweep.py` — added `--with-robust` and
+  `--wgn-sequence` flags (uncommitted; left for parent review).
+
+### §7.13.14 RESULT — Bug D: RSP BREAK handler must reset messages_control.status (2026-05-16)
+
+#### §7.13.14.1 Symptom
+
+SNR-walk test (`tools/axis_walk_sweep.py --settle-snr 40 --start-snr 40
+--end-snr 14 --step-db 2 --dwell-s 60 --direction descending --config 10
+-g`, full gearshift enabled, no `-R`): mercury connects at WGN:40 and
+turboshifts to CFG_15 (~2240 bps). At WGN:38 CFG_15 fails decode and
+BREAK fires → CFG_15 → CFG_0 (OFDM BPSK 1/16 LDPC). CFG_0 OFDM has
+~10 dB SNR margin at WGN:38 — it should easily sustain data. Yet bps
+stays at 0 for the remaining ~12 minutes of test time.
+
+Owner's pointed question: "at WGN:38 config 0 should work just fine,
+this is madness that it doesn't."
+
+#### §7.13.14.2 Root-cause investigation
+
+Two-part subagent investigation:
+
+1. `BREAK_FAILSAFE_INVESTIGATION.md` — confirmed BREAK *fires* correctly.
+   The descent target ladder is right (with `-R`, BREAK reaches
+   ROBUST_0 MFSK; without, it floors at CFG_0 OFDM).
+
+2. `POST_BREAK_STUCK_INVESTIGATION.md` — the actual bug. Isolation
+   test: pinned `-s 0` mercury at WGN:38 with NO prior BREAK delivered
+   **24 bps sustained over 90 s, clean HAIL+CONNECT+DATA**. CFG_0
+   OFDM is healthy at WGN:38. So the failure is "post-BREAK
+   stuck-state in mercury," not a physical-layer issue.
+
+#### §7.13.14.3 Bug D root cause
+
+`arq_responder.cc:226-252` (the RSP BREAK handler) does NOT reset
+`messages_control.status = FREE`. When BREAK fires while RSP's
+control slot is in a non-FREE state (commonly ACKED, set at
+`arq_responder.cc:704` and not cleared until line 801), every
+post-BREAK SET_CONFIG frame from CMD is silently dropped at the
+FREE-gate at `arq_responder.cc:262`. `process_control_responder()`
+never runs. Mercury sits at the post-BREAK config never accepting
+commander instructions until something else (e.g. DISCONNECT)
+clears the slot.
+
+Direct log evidence from the pre-fix walk v2 (axis_walk_v2_desc_gearshift):
+30× `[RX] CONTROL message received on CONFIG_0, code=59 (SET_CONFIG)`
+events on RSP, **zero** corresponding `process_control_responder`
+invocations, while CMD does 16 BREAK round trips and bps=0 for 12 min.
+
+The CMD side already force-clears the symmetric slot at
+`arq_commander.cc:113, :184` (post-BREAK ACK handlers) — comment there
+says "cleanup() skips PENDING_ACK status". The RSP-side was missed.
+
+#### §7.13.14.4 The fix
+
+`arq_responder.cc`, in the BREAK handler after `break_detected = NO;`:
+
+```cpp
+// Bug fix (POST_BREAK_STUCK_INVESTIGATION.md §5.1 / §8.1,
+// SACK_DESIGN_A_PLAN §7.13.14): force-FREE the control slot.
+// BREAK is a hard reset signal — any in-flight control exchange
+// is moot, the commander is changing config and will re-issue.
+messages_control.status = FREE;
+```
+
+Plus a defensive `[RX-CTRL-DROP]` printf at the FREE-gate else-branch
+at `arq_responder.cc:262`, so any future stuck-state regression is
+visible immediately rather than silently dropping control frames.
+
+#### §7.13.14.5 Validation — walk v6 (post-fix, no -R)
+
+Same flags as the pre-fix walk v2 (no `-R`, the proof that the fix
+makes -R unnecessary):
+
+| WGN | walk v2 bps (pre-fix) | walk v6 bps (post-fix) |
+|-----|----------------------|------------------------|
+| 40  | 2240 (then 0)        | 1120 settle / **473** walk |
+| 38  | **0** ⬛              | **624** ✅             |
+| 36  | 0 ⬛                  | **223** ✅             |
+| 34  | 0 ⬛                  | **163** ✅             |
+| 32  | 0 ⬛                  | **132** ✅             |
+| 30  | 0 ⬛                  | **112** ✅             |
+| 28  | 0 ⬛                  | **87** ✅              |
+| 26  | 0 ⬛                  | **260** ✅             |
+| 24  | 0 ⬛                  | **174** ✅             |
+| 22  | 0 ⬛                  | **260** ✅             |
+| 20  | 0 ⬛                  | **87** ✅              |
+| 18  | 0 ⬛                  | **174** ✅             |
+| 16  | 0 ⬛                  | **87** ✅              |
+| 14  | 0 ⬛                  | 0 (channel limit)     |
+
+13 of 14 SNR buckets recovered to non-zero throughput; WGN:14 stays
+at 0 (the physical-layer limit for CFG_0 OFDM at that noise floor).
+Link stayed alive the entire walk. Total RX 44797 B across 14 min
+(vs ~0 pre-fix after the WGN:38 transition).
+
+Axis 1 timeline shows expected behaviour: CFG_10 → CFG_13 → CFG_15
+(turbo upshift), BREAK → CFG_0, re-climb → CFG_14, BREAK → CFG_0,
+re-climb → CFG_13, BREAK → CFG_0, re-climb → CFG_12. Gearshift is
+actively probing for the channel ceiling at every SNR level, with
+BREAK firing and recovering cleanly each time.
+
+`[RX-CTRL-DROP]` events post-fix: 3 across the run vs 9 BREAK events
+— all 3 are benign CMD retransmits of SET_CONFIG arriving after the
+first copy was already accepted (slot is now legitimately occupied
+by the just-received first frame). The first SET_CONFIG always
+lands because BREAK now correctly clears the slot first.
+
+#### §7.13.14.6 Throughput note
+
+Per-bucket bps is lower than what a pinned-config baseline would
+deliver at the same SNR (e.g. CFG_10 pinned at WGN:32 gets ~800 bps
+in the §7.13.8 win-test; walk v6 at WGN:32 gets 132). This is
+because the walk pushes channel changes faster than the gearshift
+can settle on each step, so mercury pays SET_CONFIG round-trip
+overhead at every dwell transition. The walk's value is proving
+BREAK-recovery works, not maximizing throughput. A real-world HF
+channel wouldn't shift 2 dB every 60 s; the SET_CONFIG overhead
+would amortize properly.
+
+#### §7.13.14.7 Open follow-ups
+
+- `emergency_previous_config` doesn't refresh on Phase-1 retry
+  (flagged in `BREAK_FAILSAFE_INVESTIGATION.md` §11.4). Was load-
+  bearing while Bug D existed (loop targeted same failing config
+  forever). With Bug D fixed it's optional polish — worth a second
+  look in a future session.
+- A deterministic unit test of the BREAK boundary would inject
+  `messages_control.status = ACKED` before triggering the handler
+  and verify post-BREAK it returns to FREE. The walk-based proof is
+  sufficient for now but the unit test would catch any future
+  regression instantly.
