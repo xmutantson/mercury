@@ -1786,11 +1786,64 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							ack_pat_hit = receive_ack_pattern();
 						if(ack_pat_hit)
 						{
-							v2_ack_pat_pre_detected = true;
-							printf("[CMD-SACK-V2-ACKPAT-FAST] legacy ACK pattern pre-detected in v2 SACK window — skipping this->receive() to preserve audio\n");
-							fflush(stdout);
-							// sack_detected stays false → fall straight through
-							// to the existing ACK-pattern handler at :1898+.
+							// Bug C fix (§7.13.10 SACK_DESIGN_A_PLAN): the
+							// receive_ack_pattern detector can false-fire on
+							// OFDM SACK_RSP audio's random spectral coincidence
+							// with MFSK ACK tone frequencies (see §7.13.9).
+							// Cross-check by giving this->receive() a chance
+							// to decode an OFDM SACK_RSP frame in the same
+							// audio window. If receive() finds a SACK_RSP, the
+							// OFDM preamble correlation has already validated
+							// that the in-flight signal is OFDM — override the
+							// MFSK ACK false-positive and process SACK_RSP.
+							// If receive() doesn't find SACK_RSP, the original
+							// ACK detection stands and FAST proceeds normally.
+							//
+							// Cost on clean cells: one extra this->receive()
+							// call per FAST-detected batch (~5-15 ms OFDM
+							// demod, no preamble found, returns quickly via
+							// anti-spin). Total clean-cell slowdown: <2 %.
+							//
+							// IMPORTANT: receive_ack_pattern() set
+							// frames_to_read=4 on its hit; receive() early-
+							// returns when frames_to_read != 0
+							// (arq_common.cc:5027). Force frames_to_read=0
+							// so receive() actually runs OFDM decode on the
+							// same audio tail we just classified as MFSK ACK.
+							MUTEX_LOCK(&capture_prep_mutex);
+							telecom_system->data_container.frames_to_read = 0;
+							MUTEX_UNLOCK(&capture_prep_mutex);
+							this->receive();
+							if(messages_rx_buffer.status == RECEIVED
+							   && messages_rx_buffer.type == SACK_RSP)
+							{
+								unsigned char rx_bsi = 0;
+								if(decode_sack_v2_frame(sack_bitmap, data_batch_size, &rx_bsi))
+								{
+									sack_detected = true;
+									ack_pat_hit = false;   // SACK_RSP wins
+									printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — OVERRIDES ACKPAT-FAST false positive\n",
+										(unsigned)rx_bsi, cmd_batch_seq_id);
+									fflush(stdout);
+									policy_evaluate_axis3(true);
+								}
+								else
+								{
+									// CRC fail — record Axis-3 miss event but
+									// fall through to original FAST behavior.
+									policy_evaluate_axis3(false);
+								}
+								messages_rx_buffer.status = FREE;
+							}
+
+							if(ack_pat_hit)
+							{
+								v2_ack_pat_pre_detected = true;
+								printf("[CMD-SACK-V2-ACKPAT-FAST] legacy ACK pattern pre-detected in v2 SACK window — skipping further this->receive() to preserve audio\n");
+								fflush(stdout);
+								// sack_detected stays false → fall straight through
+								// to the existing ACK-pattern handler at :1898+.
+							}
 						}
 						// Bug A fix (§7.13.1) defense-in-depth: even if the ACK
 						// pattern hasn't fully arrived yet (only partial match
