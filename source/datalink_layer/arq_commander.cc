@@ -1315,7 +1315,14 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					receiving_timer.stop();
 					receiving_timer.reset();
 					messages_control.status = FREE;
-					// Keep emergency_previous_config unchanged (still targeting original settle config)
+					// Keep emergency_previous_config unchanged. Phase-1 failure
+					// means RSP did not HEAR the SET_CONFIG on the coordination
+					// layer — the target was never disproved, only un-delivered.
+					// Retry the SAME plan. The descent mechanism lives in the
+					// Phase-2 exhaust path at the line ~1278 refresh (target
+					// disproved end-to-end → advance descent anchor) and the
+					// break_drop_step doubling at line 64. See
+					// EMERGENCY_PREVIOUS_CONFIG_INVESTIGATION.md §1, §3, §6.
 					emergency_break_active = 1;
 					emergency_break_retries = 1;
 					break_recovery_phase = 0;
