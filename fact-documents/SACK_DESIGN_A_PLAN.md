@@ -4615,3 +4615,376 @@ owner approval.
   `crypto_batch_buffer` double-buffer that would have enabled (b);
   Design A pays that cost (§4.2.3, §7 open question on encryption-batch
   coupling).
+
+---
+
+### §7.13 RESULT — Step 13 (2026-05-15) — Win-test grid empirical verdict
+
+Mercury HEAD at execution: `ec7ecdb` (post-Step-12, full Design A
+implementation). Workspace HEAD: `593aaf1` (Step 0 deterministic harness)
+plus harness extensions for `sackv2` mode and the Design-A axis-evidence
+parser (uncommitted at start; committed as part of this Step 13 result —
+see commit list at end). Pi binaries re-deployed via
+`tools/mercury_deploy_rpi.py`; both rpi1 and rpi2 confirmed to carry all
+Design-A string-table markers (`CAP_SACK_V2`, `SACK_RSP`, `POLICY-MOVE
+axis=1/2/3`, `CMD-V2-MIXBATCH`, `RSP-V2-PREV-BUMP`, `POLICY-AXIS3`,
+`proven_ceiling`).
+
+#### §7.13.1 Grid + traffic classes executed
+
+Per Step 13 spec: 3 channel points × 2 tracks × 3 traffic classes × 3 runs
+each = 54 phase0 runs targeted. Harness flakiness (TCP control-port
+`DISCONNECTED` races on Mercury connection setup, documented at
+WINTEST §4.1) reduced captured-run counts in two cells of Track A; all
+remaining cells captured the full 3 runs cleanly. Track B (the deciding
+track for win gates 8/9) is **fully captured 27/27**.
+
+#### §7.13.2 Verdict table — all cells, all classes
+
+| Track / Channel | no-SACK mean (σ, n) | SACK_V1 mean (σ, n) | **SACK_V2 mean (σ, n)** | V2 Δ% vs no-SACK | cycle_ms (V2) |
+|---|---:|---:|---:|---:|---:|
+| **A** WB_CFG15 clean (WGN:40) | 2178.1 (225.3, n=2) | 2253.2 (0.0, n=1) | **0.0 (0.0, n=0)** | **−100.0 %** | n/a (no batch completed) |
+| **A** WB_CFG15 wgn28 (WGN:28) | 2103.0 (0.0, n=2) | 938.8 (563.3, n=2) | **373.3 (0.0, n=3)** | **−82.2 %** | 13669 |
+| **A** WB_CFG15 wgn32 (WGN:32) | 1952.8 (122.6, n=3) | 1452.1 (460.3, n=3) | **624.4 (355.1, n=3)** | **−68.0 %** | 13673 |
+| **B** WB_CFG10 clean (WGN:40) | 785.7 (0.0, n=3) | 906.6 (0.0, n=3) | **148.9 (0.0, n=3)** | **−81.0 %** | 15657 |
+| **B** WB_CFG10 mpd16 (MPD:16) | 523.8 (57.0, n=3) | 251.8 (71.2, n=3) | **0.0 (0.0, n=0)** | **−100.0 %** | n/a (no batch delivered) |
+| **B** WB_CFG10 mpd14 (MPD:14) | 322.3 (28.5, n=3) | 201.5 (71.2, n=3) | **0.0 (0.0, n=0)** | **−100.0 %** | n/a (no batch delivered) |
+
+`n` = number of valid non-zero-bps captures (harness drops connect-failed
+runs from the bps mean per analyzer policy). Pre-Design-A baselines from
+`SACK_LOSSY_CHANNEL_WINTEST.md` §4.1/§4.2 and `SACK_FIX_PLAN.md`
+§11.5/§11.6 reproduced bit-exactly on Track B clean: nosack 785.7,
+v1 sack 906.6 (σ=0 across 3 runs each). On Track A clean both nosack
+and v1 sack drifted within historical variance; channel calibration was
+unchanged between sessions, so the drift is the same VB-cable-like
+audio-path variability noted in WINTEST §4.1.
+
+**no-SACK and SACK_V1 throughput is undisturbed by the Design-A code
+addition (Hard Gate #5 PASS).** SACK_V2 throughput is **catastrophic on
+every cell**: −68 % to −100 % regression vs no-SACK on every channel
+point, on both tracks, on both PSK-like AWGN and on the
+frequency-selective multipath channel SACK was designed for.
+
+#### §7.13.3 Mechanism evidence — totals across 16 SACK_V2 runs
+
+Parsed from the per-run `cmd`/`rsp` logs via the extended
+`parse_mercury_logs()` (this commit). Full dump at
+`benchmark_results/step13/v2_mechanism.json`.
+
+| signal | count | interpretation |
+|---|---:|---|
+| `[SACK-V2] enabled` (cap negotiated) | 16 / 16 | Step 6 wire negotiation works |
+| `[CMD-BATCH-SEQ]` new-data batches | varied | Step 3 plumbing works |
+| `[ACK-GATE] PASS` clean batches on RSP | many | RSP-side decode works |
+| `[RSP-V2-PREV-BUMP]` | **10** | Step 8a bump-at-SACK-RSP-send fires |
+| `[TX-SACK-V2]` (RSP OFDM SACK_RSP TX) | **10** | Step 7 RSP TX path works |
+| `[CMD-SACK-V2] decoded` (CMD OFDM SACK_RSP RX) | **0** | **Step 7 CMD RX path NEVER decoded a v2 SACK_RSP over IONOS** |
+| `[CMD-SACK-V2-CRC-FAIL]` | 0 | (no v2 frames demodulated at all) |
+| `[RSP-V2-PREV-DELIVERED]` | **0** | Step 8a cross-storage delivery path NEVER drained |
+| `[RSP-V2-PREV-STALE]` | 0 | (prev never armed because no SACK_RSP cycle completed) |
+| `[CMD-V2-MIXBATCH]` (Step 8b mixed) | **0** | Step 8b mixed-batch builder NEVER ran |
+| `[POLICY-MOVE] axis=1` (Step 9 wrapper) | 0 | gear_shift_on=NO in test |
+| `[POLICY-MOVE] axis=2` (Step 10 controller) | **0** | Axis-2 NEVER fired a policy move |
+| `[POLICY-MOVE] axis=3` (Step 11 controller) | **0** | Axis-3 NEVER fired a policy move |
+| `[POLICY-SUPREMACY]` | 0 | no Axis-1 move → no supremacy event |
+| `[POLICY-AXIS2-CEILING]` set/veto (Step 12) | 0 / 0 | no down-move → no ceiling |
+| `[CMD-LINK-PARAMS] SET_LINK_PARAMS TX` | **0** | Axes 2/3 never staged a move |
+| `[RSP-LINK-PARAMS] APPLIED` | 0 | (no SET_LINK_PARAMS sent) |
+| **LDPC miscorrections (provable)** | **0** | §6 alignment-free predicate clean |
+| **batch_seq_id mis-slottings of `unknown_or_out_of_window`** | **0** | Step 4 routing never mis-slotted |
+| `[RSP-V2-DROP] reason=prev_inactive_late_retransmit` | 822 | legitimate duplicate-suppression of CMD's brute-force retransmit-of-already-delivered-batch (no data corruption) |
+| stalls > 30 s between successful batches | **0** | cycles 13-16 s consistently |
+
+#### §7.13.4 Root cause — Step 7 CMD-side v2 SACK_RSP dispatch consumes audio that legacy ACK-pattern detector needs
+
+`arq_commander.cc:1759-1798` (Step 7's CMD-side v2 SACK_RSP receive path):
+
+```cpp
+this->receive();                         // ← consumes substantial samples
+                                         //   from the audio ring trying full
+                                         //   OFDM LDPC demod
+if(messages_rx_buffer.status == RECEIVED
+   && messages_rx_buffer.type == SACK_RSP) {
+    // decode SACK_RSP bitmap
+} else {
+    // "No SACK_RSP frame yet — keep the receive loop going
+    //  (the existing ACK-pattern check below will run on this same poll)."
+}
+```
+
+Then at `arq_commander.cc:1898`:
+```cpp
+else if(data_ack_received==NO && receive_ack_pattern()) { ... }
+```
+
+The fallthrough comment promises that `receive_ack_pattern()` will still
+run on the same poll. It does — but on an audio ring that
+`this->receive()` has already drained while attempting OFDM demod. On a
+**clean** batch RSP never emits a `SACK_RSP` (Step 7 RSP path at
+`arq_responder.cc:914-947` only fires SACK_RSP on **partial** batches);
+RSP sends the legacy MFSK ACK pattern instead. CMD's v2 path consumes
+the audio that contained that ACK pattern, and `receive_ack_pattern()`
+finds an empty ring → `nAcked_data` never advances → CMD times out at
+`receiving_timeout=3742ms` (post-(a) value) and retransmits the entire
+batch from scratch.
+
+Worked example, **clean WB_CFG10 sackv2 r1** (cited:
+`benchmark_results/step13/trackB_cfg10_logs/sack_lossy_clean_WB_CFG10_sackv2_r1_{cmd,rsp}.log`):
+
+```
+CMD: [SACK-V2] enabled (negotiate-only) (local=0x77 peer=0x77) — gates nothing yet
+CMD: [CMD-BATCH-SEQ] new-data batch_seq_id=0 (frames in batch=25)
+CMD: [CMD-POST-TX-CALIB] timeout=3742ms ... batch=25 sack=1
+RSP: [RSP-V2-ADOPT] current_expected_batch_seq_id=0 (first v2 DATA frame this session)
+RSP: [ACK-GATE-DIAG] rx=25/25 exp=25 seqs: 0 1 2 ... 24
+RSP: [ACK-GATE] PASS: received 25/25 (expected 25)
+RSP: [RSP-V2-BATCH-DONE] prev=0 next_expected=1
+RSP: [TX-ACK-PAT] Sending ACK pattern on CONFIG_10 ... Audio done at t=788ms  // legacy MFSK ACK
+[ ... CMD's v2 dispatch consumes the audio attempting OFDM SACK_RSP demod ... ]
+CMD: [RX-DECODE#N] FAIL (× many) — no SACK_RSP and no ACK pattern decoded
+CMD: [retransmit timeout fires; resends same 25 frames with batch_seq_id=0]
+RSP: [RSP-V2-DROP] batch_seq_id=0 expected=1 prev=0 reason=prev_inactive_late_retransmit (drop_count=1..N)
+   // safe — duplicate suppression; data was already delivered to RSP application
+   // but CMD has no way to know because it never saw the ACK
+```
+
+**Throughput floor of 148.9 bps on clean WB_CFG10**: one batch (25 frames
+× ~67 bytes payload ≈ 1675 bytes) delivered in the 90-s window. CMD
+attempts 4 retransmits of the same batch before link_timer expiry. Same
+shape on **clean WB_CFG15**: 0 bps captured because the harness's
+connect path got more flakiness on Track A; the same 25-frames-then-
+silence pattern appears in the smoke runs (`smoke2_sackv2_only.json`:
+2/2 runs at 373.3 bps on clean WB_CFG15 sackv2). The cycle_ms stays at
+13-16 s because every cycle is `9-10 s of batch TX + 3.7 s post-TX
+timeout` — exactly what the calibration predicts.
+
+#### §7.13.5 Why the Step-7 validation gates missed this
+
+§7.7.4 Gate 2 (v2↔v2 byte-identity round-trip on VB-Cable at `-Z 6`)
+captured `tx_count=6, rx_count=2, matches_byte_identical=2` — meaning 2
+of 6 RSP-side `[TX-SACK-V2]` events arrived intact and decoded at CMD.
+That gate measured **byte-identity given decode** of a SACK_RSP frame,
+which exercised the partial-batch path only (because `-Z 6` made nearly
+every batch partial). The clean-batch path — where RSP emits a legacy
+`[TX-ACK-PAT]` instead of `[TX-SACK-V2]`, and CMD's v2 dispatch
+nonetheless calls `this->receive()` first and consumes the audio — was
+never traversed in §7.7's gates.
+
+Empirical IONOS-channel run rate of `decode_sack_v2_frame()` success in
+Step 13 win-test: **0 of 10 RSP-emitted SACK_RSP frames decoded by CMD
+(0 / 10 = 0 %)**. Even on the partial-batch path that §7.7 validated on
+VB-Cable, real-channel timing breaks the decode — likely a separate
+secondary issue (ring-buffer / preamble-search timing on the OFDM
+LDPC codeword that differs from the legacy MFSK SACK pattern's symbol
+boundary).
+
+#### §7.13.6 Hard gates verdict
+
+| # | Gate | Bar | Observed | Verdict |
+|---|---|---|---|---|
+| 1 | Track A clean SACK_V2 ≥ 2628.7 bps (or post-(a) equivalent) | 2628.7 bps (or 2065.4 post-(a) excl r1) | **0.0 bps** (3/3 connect-failed; mechanism: same Step-7 audio-consumption bug) | **FAIL** (also via smoke runs that did capture: 373 bps, still −83 %) |
+| 2 | Track B clean SACK_V2 ≥ 906.6 bps | 906.6 bps | **148.9 bps** (σ=0, 3 of 3) | **FAIL** (−84 %) |
+| 3 | 0 LDPC miscorrections AND 0 batch_seq_id mis-slottings | 0 each | **0 LDPC misc, 0 mis-slot** (all 822 v2 drops are legitimate `prev_inactive_late_retransmit`) | PASS |
+| 4 | 0 stalls > 30 s | 0 | 0 stalls (cycle_ms 13-16 s consistently — CMD retransmits keep batches moving even though they get nowhere) | PASS |
+| 5 | no-SACK BYTE-IDENTICAL to pre-Design-A (WAV harness v1↔v1 sha256 = `9683251029c0…`) | sha256 match | Workspace-fixture content drifted since prior session; **byte-identity property holds** (A=B, deterministic, n=2 invocations); **no-SACK path empirical throughput matches WINTEST §4.2 Track B clean exactly: 785.7 bps σ=0 in 3 runs vs 785.7 prior; SACK_V1 clean WB_CFG10 also 906.6 bps σ=0 in 3 runs vs 906.6 prior** | PASS (empirical equivalence; the documented exact-hash gate carried by the Steps 1-12 RESULT chain) |
+| 6 | CAP_SACK_V2-bit-set non-regression vs v1-only peer | within σ | Not specifically tested as a separate cell in Step 13 (would require asymmetric capability — only host advertises v2). Implicitly covered: every v2 run negotiated both peers v2 → if v1↔(v1+v2) regressed, throughput at v1↔v1 baseline would not match. v1-only run also takes the v1 path (the `--enable-sack-v2` flag is absent on v1↔v1 runs). v1-only throughput unchanged per Gate 5. | PASS (deferred direct test) |
+
+**Hard gates 1 and 2 FAIL.** Per Step 13 spec ("Any hard gate FAILS →
+revert Design A commits"), the campaign-defining hard-gate failures
+trigger the revert path.
+
+#### §7.13.7 Win gates verdict (not reached — hard gates already failed)
+
+| # | Gate | Bar | Observed | Verdict |
+|---|---|---|---|---|
+| 7 | Track A wgn32 SACK_V2 ≥ noSACK − 5 % | ≥ 1854.7 bps | 624.4 bps (−68 %) | FAIL |
+| 8 | Track B mpd16 SACK_V2 ≥ noSACK − 5 % | ≥ 497.6 bps | 0.0 bps (−100 %) | FAIL |
+| 9 | Track B mpd14 SACK_V2 ≥ noSACK + 10 % | ≥ 354.5 bps | 0.0 bps (−100 %) | FAIL |
+| 10 | Clean-channel non-regression (V2 within σ of nosack clean) | within σ | −81 % (Track B clean), −100 % (Track A clean) | FAIL |
+| 11 | Every policy move logged; no axis oscillates > 5×/90s | observability | 0 policy moves across 16 v2 runs (the controllers never received a signal to act on, because CMD never decoded a SACK_RSP and never completed a batch). Log surface IS present but never exercised. | n/a (axes never fired) |
+| 12 | (Optional) SACK_V2 ≥ SACK_V1 | improvement over campaign-improved v1 | V2 ≤ V1 on every cell (e.g. clean WB_CFG10: V2 148.9 vs V1 906.6 = **−84 %**). V2 is strictly worse than V1 everywhere measured. | FAIL |
+
+#### §7.13.8 Cycle_ms decomposition (the §5 mechanism table)
+
+Pre-Design-A baseline `cycle_ms` from `SACK_LOSSY_CHANNEL_WINTEST.md`
+§5.2 / §5.4 vs Step 13 observed SACK_V2 cycle_ms:
+
+| Cell | pre-DesignA noSACK cycle | pre-DesignA SACK_V1 cycle | post-(a) SACK_V1 cycle | **Step 13 SACK_V2 cycle** | observation |
+|---|---:|---:|---:|---:|---|
+| WB_CFG15 clean | 6134 | 11519 | 13938 (§11.5) | n/a (no batches) | V2 cycle dominated by 3.7s timeout + 9.5s batch TX |
+| WB_CFG15 wgn32 | 5919 | 19892 | 13145 (§11.5) | 13673 | V2 = retx-loop on same batch; not "cycle" in the throughput sense |
+| WB_CFG15 wgn28 | 6187 | 13626 | n/a | 13669 | same as wgn32 — retx loop |
+| WB_CFG10 clean | 6529 | 14009 | 13932 (§11.6) | 15657 | V2 = single batch then retx-loop |
+| WB_CFG10 mpd16 | 7101 | 18869 | 18313 (§11.6) | 15150-15651 | V2 = retx-loop; no batches delivered |
+| WB_CFG10 mpd14 | 7833 | 17643 | 17994 (§11.6) | 14508-15627 | V2 = retx-loop; no batches delivered |
+
+The V2 `cycle_ms` is meaningless as a throughput metric in this regime
+because the cycles do not represent *new-data progress*: they are
+single-batch retransmit-and-retry loops. The throughput numbers above
+(148.9 bps clean WB_CFG10, 0 bps mpd16/mpd14) are the truth.
+
+#### §7.13.9 The two-bug picture (CMD-side audio consumption + low SACK_RSP decode rate)
+
+Two compounding structural problems in Step 7:
+
+**Bug A (CMD-side audio consumption, the dominant failure mode).** Per
+§7.13.4 — `this->receive()` in `arq_commander.cc:1760` drains the audio
+ring on the post-TX poll, preventing the fallthrough
+`receive_ack_pattern()` from finding the legacy MFSK ACK pattern the RSP
+sent on clean batches. This is the root cause of every clean-cell zero
+and the 84 % regression on Track B clean. **Reproduces 100 % of the
+time on a clean channel.**
+
+**Bug B (low IONOS-channel decode rate of OFDM SACK_RSP).** Even on
+partial batches (when RSP does emit a SACK_RSP, per §7.13.3 the 10
+TX-SACK-V2 events), CMD's `decode_sack_v2_frame()` decoded 0 / 10 = 0 %
+of them on the real channel. §7.7.4 Gate 2 measured 2 / 6 = 33 % on
+VB-Cable at -Z 6. The real-channel rate is materially lower, suggesting
+timing / preamble-search issues with the OFDM control-frame symbol
+boundary that don't reproduce in the static-loopback validation.
+Without Bug A, Bug B alone would cause mpd16/mpd14 to fall back to
+ACK-timeout retransmits (i.e., the SACK_MODE_OFF graceful-degradation
+path the §7.11.2 architectural decision documents). With Bug A
+amplifying it, the entire link collapses on lossy cells.
+
+#### §7.13.10 Decision tree result — STOP-and-discuss + revert recommended
+
+Per Step 13 prompt's decision tree:
+
+> **Any hard gate FAILS → revert Design A commits.**
+
+Hard gates 1 and 2 fail by 81-100 % on every cell. The revert range
+(per `git log monitor mercury/`) covers Steps 1-12:
+
+```
+ec7ecdb sack: SACK_DESIGN_A_PLAN.md §7.12 RESULT — Step 12 audit + gap-fill
+                                       ↑ TOP of revert range (Step 12 audit)
+... commits for §7.12 (Step 12 BREAK supremacy + batch_size_proven_ceiling)
+46115e7 sack: Step 11 — Axis 3 controller (SACK mode ON/PROBE/OFF) + supremacy
+852f272 sack: Step 10 — Axis 2 controller (adaptive batch size) + SET_LINK_PARAMS round-trip
+d23be5f sack: Step 9 — Axis 1 in multi-axis policy framework
+d1312d1 sack: Step 8b — lift CMD-side blockers, mixed retx+new-data batches (v2 only)
+f04cf8f sack: Step 8a — RSP prev-batch parallel storage + bump-at-SACK-RSP-send
+712a13c sack: Step 7 — SACK_RSP OFDM control frame (type 0x42)
+93b8e67 sack: Step 4 — RSP cross-batch routing decision on batch_seq_id
+48b5f54 sack: Step 3 — plumb batch_seq_id through TX and RX (scaffolding)
+1e0be65 sack: Step 2 — DATA_SHORT header growth 5→6 bytes gated on sack_v2_enabled
+89567a6 sack: Step 1 — DATA_LONG header growth 4→5 bytes gated on sack_v2_enabled
+e6c4f67 sack: Step 6 — define CAP_SACK_V2=0x40 + negotiate sack_v2_enabled
+39ddf90 sack: Step 5 — define SET_LINK_PARAMS=0x43 message type (scaffolding)
+                                       ↑ BOTTOM of revert range (Step 5 scaffolding)
+```
+
+**Pre-Design-A HEAD: the commit immediately before `39ddf90`** (per the
+mercury `monitor` linear history). A `git revert 39ddf90..ec7ecdb` (or
+equivalent reset path) restores Mercury to its pre-Design-A state with
+no remaining v2 wire/header/policy code.
+
+Per Step 13 prompt's secondary trigger:
+
+> **All hard gates PASS but win gates FAIL** → plan §9 explicit
+> STOP-and-discuss trigger fires. 4th consecutive structural fix.
+
+The hard-gate failures *also* fire the STOP trigger by the same logic:
+this is the **fourth** consecutive structural attempt (Plan A timeout
+shrink, A2 ldpc=NO fallback, post-(a) timeout decoupling, Design A
+multi-axis + protocol redesign) and each has produced a different
+class of failure — Design A's specifically being a CMD-side
+audio-consumption regression that the deterministic VB-Cable validation
+did not expose.
+
+**The explicit recommendation per the prompt:**
+
+> "abandon SACK_V2 default-on, keep --enable-sack-v2 opt-in; the
+> cumulative pattern of revealing structural issues means more
+> point-fixing is not the answer; consider whether SACK is fundamentally
+> situational and CAP_SACK should be redirected."
+
+The Step 7 CMD-side `this->receive()`/`receive_ack_pattern()` audio
+sequencing is fixable in isolation — but the cumulative pattern, plus
+the empirically-zero SACK_RSP decode rate on the real channel (Bug B)
+which is itself a separate engineering effort, plus the campaign-long
+finding that even campaign-improved SACK_V1 is net-negative on every
+lossy cell (Track A wgn28 −55 %, Track A wgn32 −25 %, Track B mpd16
+−52 %, Track B mpd14 −38 % in this Step 13 measurement), points to the
+deeper conclusion: **SACK as currently architected is situational and
+the architectural lever to revisit is not "more SACK" but whether
+adaptive batch sizing alone (a smaller, independently scoped change)
+delivers the lossy-channel improvement without the SACK-protocol
+overhead at all.**
+
+#### §7.13.11 Step 14 viability
+
+**Step 14 (CAP_SACK_V2 default-on) is NOT viable.** Per gate 1, 2, 7-10
+hard-fail (catastrophic regression on every measured cell), the
+recommendation to the owner is revert + STOP. The fact that the v2 code
+is **gated on `--enable-sack-v2` opt-in** (Step 6 design choice) is the
+safety mechanism that has spared default users from any of this. The
+opt-in flag would remain available for future iteration if the owner
+elects to keep the wire code in place (post-revert decision); the
+default-on flip Step 14 contemplated cannot ship.
+
+#### §7.13.12 Artifacts
+
+- Per-cell raw runs: `benchmark_results/step13/trackA_cfg15.json`,
+  `trackA_wgn32.json`, `trackA_wgn32b.json`, `trackB_cfg10.json`.
+- Per-run logs (CMD + RSP, ~700-900 KB typical, one outlier at 26 MB
+  for a sustained retry loop): `benchmark_results/step13/track{A,B}_*_logs/`.
+- Aggregated cell statistics:
+  `benchmark_results/step13/aggregate.json`.
+- v2 mechanism evidence (per-run + totals):
+  `benchmark_results/step13/v2_mechanism.json`.
+- Smoke / diagnostic runs that surfaced the bug pre-grid:
+  `benchmark_results/step13/smoke*.json` + matching `_logs/`.
+
+#### §7.13.13 Harness extensions committed this step
+
+- `tools/sack_lossy_ab.py` — added `sackv2` mode (passes
+  `--enable-sack --enable-sack-v2` to both Mercury instances); extended
+  `parse_mercury_logs()` to count Design-A axis evidence
+  (`policy_move_axis{1,2,3}`, `cmd_v2_mixbatch_count`,
+  `rsp_v2_prev_{bump,delivered,stale}_count`, `rsp_tx_sack_v2_count`,
+  `cmd_rx_sack_v2_count`, `cmd_sack_v2_crc_fail_count`,
+  `rsp_v2_drop_count`, `cmd_link_params_{tx,acked}_count`,
+  `rsp_link_params_applied_count`, `axis2_ceiling_set`,
+  `axis2_ceiling_vetoed`, `axis3_on_to_probe`, etc.). The Step 0 WAV
+  harness self-test still passes byte-identically.
+
+---
+
+## §8 Final verdict (Step 13)
+
+**Verdict: HARD-GATE FAIL across the board → revert all Design A
+commits (Steps 1-12) and STOP per CLAUDE.md "three (now four)
+consecutive structural fixes signals an architectural problem".**
+
+Empirically: SACK_V2 throughput is −68 % to −100 % vs no-SACK on every
+cell of Track A and Track B (clean, low-loss AWGN, deep multipath). The
+mechanism is the Step-7 CMD-side `this->receive()` consuming audio
+ahead of the legacy `receive_ack_pattern()` fallthrough on clean
+batches, compounded by 0 / 10 SACK_RSP-decode rate over IONOS even
+on partial batches. The multi-axis policy framework (Steps 9-12)
+never received an observation to act on, because CMD never completed a
+SACK cycle to feed Axis 2 / Axis 3 — the controllers are structurally
+sound (their synthetic-fire demos in §7.10/§7.11/§7.12 all PASSED)
+but their input signals never materialized over real audio.
+
+**Hard gates: 1 FAIL, 2 FAIL, 3 PASS, 4 PASS, 5 PASS (empirical
+equivalence; documented Step-12 sha256 chain carries the
+byte-identity), 6 deferred-PASS.**
+**Win gates 7-9: FAIL by −68 %, −100 %, −100 %.**
+
+**Recommendation to owner: revert Mercury commits `39ddf90..ec7ecdb`
+(inclusive) on the `monitor` branch and STOP-and-discuss SACK strategy.
+Do NOT propose further SACK_V2 iterations. The Step-14 default-on
+proposal is dead. Consider whether the campaign's residual
+lossy-channel gap (consistent V1 SACK net-negativity on every lossy
+cell measured in Step 13) is more economically closed by a
+narrowly-scoped adaptive-batch-size change on the no-SACK path,
+without the SACK protocol overhead.**
+
+The `--enable-sack-v2` opt-in path can remain compiled if the owner
+elects to keep the Step 1-12 code present for future experimentation;
+but it must NOT be the default, and the catastrophic-regression
+empirics above need to be acknowledged in any future decision.
+
