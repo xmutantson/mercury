@@ -5439,3 +5439,248 @@ candidate is speculation. We expect to find one of:
   architectural ceiling, fix-by-tuning will plateau; recommend
   redirect.
 
+### §7.13.3 RESULT — Bug B iter 1 SMOKING GUN (2026-05-15)
+
+#### §7.13.3.1 Verdict
+
+**None of (i)/(ii)/(iii) from §7.13.2.8.** New finding: mercury
+**crashes** the moment it dispatches the OFDM SACK_RSP frame.
+
+#### §7.13.3.2 Evidence
+
+Iter 1 added a per-PID liveness probe (`/proc/<pid>/status` + `ps`
+poll at ~1 Hz) that runs in parallel with the dispatch watcher. Logs
+under `fact-documents/bugb_iter1_logs/`.
+
+Run 1 (`bugb_iter1_cfg10_run1`, WGN:28, CFG10, RSP pid=3013860):
+- Pre-dispatch: 70 s of `S (sleeping)` / `hrtimer_nanosleep` (steady
+  RX, VmRSS ~36 MB) — mercury is alive and well.
+- 19:14:44 — dispatch detected. Last RSP-log line written:
+  `[TX-SACK-V2] batch_seq_id=3 nframes=25 bitmap_bytes=4 payload=03fffdff01c5 crc8=0xc5`
+- t=+0.07 s after dispatch: `PROCESS_GONE` on the liveness probe.
+  Sustained PROCESS_GONE for ~90 s of `[INT]` polling and 10 s of
+  `[post]` polling — mercury never reappeared.
+- `dmesg | tail` immediately after: empty (1 byte). No OOM, no
+  kernel-level fatal-signal print.
+
+Run 2 (`bugb_iter1_cfg10_run2`, fresh RSP pid=3021017, same channel):
+- 240 s alive, 17 clean batches, **0** partial batches, **0**
+  dispatches. Bug B's trigger (partial batch + RSP-side completion)
+  never fired in this run.
+
+**Therefore:** Bug B is not a hang, not slow, not a harness
+truncation. It is a hard mercury exit triggered by entry into the
+OFDM SACK_RSP TX path.
+
+#### §7.13.3.3 What the last log line tells us
+
+The `[TX-SACK-V2] ...` print sits inside `send_sack_v2_frame()` in
+`arq_common.cc`, IMMEDIATELY BEFORE handing the encoded SACK_RSP
+control frame to the OFDM modulator + TX pipeline. Two possibilities:
+
+1. **Crash inside the OFDM modulation of the SACK_RSP control
+   frame** — wrong frame-size assumption, out-of-bounds pad,
+   segfault inside the modulator/encoder for a control-class frame
+   that the existing pad path doesn't actually support at CFG10.
+2. **Crash inside the TX state-machine transition** — entering TX
+   from ACK-GATE while RSP rx loop is still mid-iteration; race on
+   audio thread; assert in the wrapper that sequences PTT/audio.
+
+Either way the crash is deterministic per "first SACK_RSP dispatch
+on the run" — Run 1 died on its first dispatch, Run 2 never
+dispatched. Bug B's "0/N decoded" stat in §7.13 was not measurement
+censorship after all; it was N dispatches × P(crash before TX
+completes) ≈ 100 %. The harness then SIGKILLs the (already-dead)
+process at the 240 s window end.
+
+#### §7.13.3.4 Why CMD-side never saw a SACK_RSP
+
+CMD waits for an OFDM SACK_RSP to land in its receive ring. If RSP
+dies between writing the trace line and pushing any modulated audio
+to the sound card, **no carrier ever hits the wire**. CMD's
+`cmd_decoded_count=0` is consistent with this.
+
+#### §7.13.3.5 Why VB-Cable / WAV-harness validation missed this
+
+The Step 7 / Step 12 WAV harness ran end-to-end on synthesized
+loopback audio and exercised `send_sack_v2_frame()` byte-identically
+(sha256 = `9683251029c0…`). Those runs MUST have completed without
+crash — the harness verifies byte output, and the byte stream is
+present. So the crash is NOT in the encoder / frame builder; it is
+in the **deployment of the encoded frame onto the live audio TX
+path on Linux/ALSA on the Pi**.
+
+Suspects ranked by likelihood:
+- (a) The OFDM modulator's per-frame buffer sizing path takes a
+  different branch for "control frame at CFG10 with batch=1" than
+  for "data frame at CFG10 with batch=25" — and that branch
+  out-of-bounds writes.
+- (b) An assert/abort triggers when the TX scheduler is asked to
+  enqueue a NEW frame while a finishing-TX flush from the
+  previous data batch is still draining.
+- (c) PTT/audio-thread race: the RSP control-flow enters
+  send_sack_v2_frame() from ACK-GATE without the
+  rx_mute / tx_arm sequencing the legacy MFSK SACK does.
+
+#### §7.13.3.6 Immediate next action — iter 2
+
+Iter 2 is a **debugger-driven RCA**, not a fix attempt:
+
+1. Add a `[TX-SACK-V2-POST]` line one statement after the existing
+   `[TX-SACK-V2]` print in `send_sack_v2_frame()` to confirm
+   whether the crash is in the trace line's continuation or in
+   subsequent calls.
+2. Add `[TX-SACK-V2-MOD-PRE]` / `[TX-SACK-V2-MOD-POST]` immediately
+   around the OFDM modulation call.
+3. Add `[TX-SACK-V2-ENQ-PRE]` / `[TX-SACK-V2-ENQ-POST]` around the
+   audio enqueue / PTT call.
+4. Build, deploy to RPi2, re-run the same WGN:28 / CFG10 cell, and
+   read the last 3-4 RSP-log lines. The deepest emitted line tells
+   us which call dies.
+5. If output still ends at `[TX-SACK-V2]` (i.e. **stdio buffering**
+   ate the new prints), insert `fflush(stdout)` after each new
+   trace line.
+
+The fix lands in iter 3 once iter 2 names the call.
+
+### §7.13.4 EXECUTION — Bug B iter 2 trace deployment (2026-05-15)
+
+#### §7.13.4.1 Code change
+
+`mercury/source/datalink_layer/arq_common.cc` inside
+`send_sack_v2_frame()` (after the existing `[TX-SACK-V2] batch_seq_id=`
+print) — added six bracketing trace points with explicit `fflush`:
+
+| Tag | Location |
+|---|---|
+| `[TX-SACK-V2-STAGE-PRE]`  | before `messages_batch_tx[0]` assignment |
+| `[TX-SACK-V2-STAGE-POST]` | after `message_batch_counter_tx = 1` |
+| `[TX-SACK-V2-MODE-PRE]`   | before `telecom_system->set_mfsk_ctrl_mode(false)` |
+| `[TX-SACK-V2-MODE-POST]`  | after the same call |
+| `[TX-SACK-V2-PAD-PRE]`    | before `pad_messages_batch_tx(control_batch_size)` |
+| `[TX-SACK-V2-PAD-POST]`   | after the same call |
+| `[TX-SACK-V2-SEND-PRE]`   | before `send_batch()` |
+| `[TX-SACK-V2-SEND-POST]`  | after `send_batch()` |
+
+Each line is followed by `fflush(stdout)` so the last surviving line
+in the RSP log names the deepest call entered before death.
+
+#### §7.13.4.2 Deployment
+
+- RPi1 (RSP role for this test): tarball → extract → `bash build.sh
+  o3` → `--test` smoke pass → binary at `~/mercury-dev/mercury` (20 MB,
+  build timestamp 19:27 local).
+- RPi2 (CMD role): unchanged from `9d6699d` post-Bug-A binary — CMD
+  does not enter `send_sack_v2_frame()`, no traces needed.
+
+#### §7.13.4.3 Test harness
+
+`tools/bug_b_sack_rsp_measure_iter2.py` (fork of iter1 with the only
+substantive change being log-dir / label renamed `iter1 → iter2`).
+Same channel and parameters as iter 1:
+- WGN:28, CFG10, batch=25, sack_v2 mode
+- 2 runs × 240 s, 25 s grace, 90 s intensive liveness window
+- Output: `fact-documents/bugb_iter2_logs/`
+
+#### §7.13.4.4 What we expect
+
+If hypothesis (a) (crash in OFDM modulation): last surviving line is
+`[TX-SACK-V2-SEND-PRE]`. If hypothesis (b) (assert in pad path):
+last is `[TX-SACK-V2-PAD-PRE]`. If hypothesis (c) (PTT/audio race
+during mode flip): last is `[TX-SACK-V2-MODE-PRE]`. Any other tail
+collapses the search further.
+
+#### §7.13.4.5 RESULT — iter 2 measurement (2026-05-15)
+
+Two 240 s runs, WGN:28 / CFG10. Run 1: 0 partial batches in
+window, so no SACK_RSP dispatch fired. Run 2: 1 partial batch,
+1 dispatch — `bugb_iter2_cfg10_run2_rsp.log` ends at line 34925
+with deepest surviving tag:
+
+```
+34922: [ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=16, 29/30 received, sack_mode=ON)
+34924: [TX-SACK-V2] batch_seq_id=16 nframes=30 bitmap_bytes=4 payload=10fdffff3f8d crc8=0x8d
+34925: [TX-SACK-V2-STAGE-PRE] entering stage block
+```
+
+`[TX-SACK-V2-STAGE-POST]` was never emitted. The crash is inside the
+stage block — none of hypotheses (a)/(b)/(c) was correct; the
+crash is shallower than `set_mfsk_ctrl_mode`, `pad_messages_batch_tx`,
+or `send_batch`.
+
+### §7.13.5 ROOT CAUSE — `messages_batch_tx[0].data` is NULL
+
+`struct st_message::data` is `char*` (arq.h:166). At allocation time
+(arq_common.cc:1530) every `messages_batch_tx[i].data` is
+explicitly set to NULL. The architectural assumption (verified by
+inspecting every other site that populates the array) is that slots
+in `messages_batch_tx[]` are filled via **struct-copy** from a
+pre-allocated source:
+
+- `messages_tx[i]` → has `.data = new char[N_MAX/8 + 16]` at
+  arq_common.cc:1436. Used by CMD `send()` path.
+- `messages_control` → has `.data = new char[…]` at arq_common.cc:1579.
+  Used by both CMD/RSP for control frames (responder.cc:720, 757).
+- `messages_batch_ack[i]` → has `.data = new char[…]` at
+  arq_common.cc:1555. Used by responder.cc:1340.
+
+The struct-copy inherits the source's `.data` pointer (borrowed view).
+**Step 7's `send_sack_v2_frame()` bypassed this idiom** — it wrote
+directly to `messages_batch_tx[0].data[b]` without first either
+allocating the buffer or struct-copying from a source that owned one.
+
+On the RSP side, no prior path on this controller had ever staged into
+`messages_batch_tx[0]` (RSP never sends data batches), so the slot
+was still in its post-construction state: `.data == NULL`. Writing
+`messages_batch_tx[0].data[b] = …` is a NULL deref → SIGSEGV →
+silent process exit (no core dump enabled, no kernel printk).
+
+The reason **the WAV / unit-test harness missed this** is that those
+tests ran on the CMD side, where `messages_batch_tx[0].data` had
+been populated by a previous DATA TX struct-copy and pointed at a
+valid `messages_tx[0].data` buffer. The harness happily wrote into
+that borrowed buffer and never crashed.
+
+This is also why **Step 13 win-test catastrophically failed**: every
+real SACK_RSP dispatch from RSP killed the modem mid-batch — RSP
+went silent and CMD ran out the timeout, halving throughput in clean
+cells and nearly zeroing it in WGN:32. Bug A masked some of this on
+the dispatch-ordering side, but Bug B was the actual carrier-killer.
+
+#### §7.13.5.1 Fix
+
+`mercury/source/datalink_layer/arq_common.cc` —
+`cl_arq_controller::send_sack_v2_frame()` now stages SACK_RSP through
+`messages_control` (which owns its `.data` buffer), then struct-copies
+into `messages_batch_tx[0]`:
+
+```cpp
+messages_control.type = SACK_RSP;
+messages_control.sequence_number = 0;
+messages_control.id = 0;
+messages_control.length = payload_len;
+for(int b = 0; b < payload_len; b++)
+    messages_control.data[b] = (char)payload[b];   // .data pre-allocated
+messages_control.status = ADDED_TO_BATCH_BUFFER;
+messages_control.batch_seq_id = batch_seq_id;
+
+message_batch_counter_tx = 0;
+messages_batch_tx[0] = messages_control;  // struct-copy carries .data
+message_batch_counter_tx = 1;
+```
+
+This matches the existing idiom at `arq_responder.cc:720, 757` for
+all other control-frame dispatches, and re-uses the
+already-validated `messages_control.data` buffer (alloc'd to
+`N_MAX/8 + CANARY_SIZE = 216 bytes`, ample for a 6-byte SACK_RSP
+payload).
+
+Latent corollary bug: the CMD-side retransmit paths at
+`arq_commander.cc:836, 951` `memcpy` into
+`messages_batch_tx[message_batch_counter_tx].data` and would also
+crash if invoked on a slot that has never been struct-copy-staged
+from `messages_tx[]`. Since CMD always stages through `send()` first
+(which struct-copies from `messages_tx[i]` whose `.data` is owned),
+the latent path is never reached in practice today — but it is the
+same class of bug and should be fixed in a follow-up.
+
