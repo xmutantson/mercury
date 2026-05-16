@@ -1113,6 +1113,18 @@ public:
   int ack_diag_poll_count;
   uint32_t ack_diag_peak_mask;  // bit i set = symbol i matched at peak detection
 
+  // Bug A fix (§7.13.1 SACK_DESIGN_A_PLAN): bounded defer counter for the v2
+  // SACK_RSP dispatch in process_messages_rx_acks_data(). When the v2 path
+  // probes legacy ACK pattern first (to avoid this->receive() destroying the
+  // MFSK ACK audio), a non-zero ack_diag_peak_matched can come from a real
+  // ACK pattern in progress OR from spectral coincidence on OFDM SACK_RSP
+  // audio at the MFSK ACK tone frequencies. To keep the partial-batch
+  // SACK_RSP decoder from being permanently starved, the defer is bounded
+  // to v2_ackpat_defer_count_this_window < 5 polls (~225 ms at WB symbol
+  // rate). Reset at TX-end (arq_commander.cc:891 / :1141) alongside the
+  // other per-window diag counters. v1 path never sets or reads this.
+  int v2_ackpat_defer_count_this_window;
+
   // SACK detection diagnostics (Plan A1) — same shape as ACK diag.
   int sack_diag_peak_matched;
   double sack_diag_peak_metric;

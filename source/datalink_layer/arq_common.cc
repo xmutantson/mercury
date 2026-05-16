@@ -316,6 +316,7 @@ cl_arq_controller::cl_arq_controller()
 	ack_diag_peak_metric=0.0;
 	ack_diag_poll_count=0;
 	ack_diag_peak_mask=0;
+	v2_ackpat_defer_count_this_window=0;  // Bug A fix (§7.13.1)
 	sack_diag_peak_matched=0;
 	sack_diag_peak_metric=0.0;
 	sack_diag_poll_count=0;
