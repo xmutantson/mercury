@@ -892,11 +892,6 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
-		sack_diag_peak_matched = 0;
-		sack_diag_peak_metric = 0.0;
-		sack_diag_poll_count = 0;
-		sack_diag_peak_max_e = 0.0;
-		sack_diag_peak_max_seg = -1;
 		calculate_receiving_timeout();
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
@@ -1143,11 +1138,6 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
-		sack_diag_peak_matched = 0;
-		sack_diag_peak_metric = 0.0;
-		sack_diag_poll_count = 0;
-		sack_diag_peak_max_e = 0.0;
-		sack_diag_peak_max_seg = -1;
 		// ACK pattern detection uses dedicated ack_mfsk — no config switch needed
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
@@ -1718,12 +1708,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		if(ack_pattern_time_ms > 0)
 		{
 			// Detection strategy: check SACK alongside ACK from the start.
-			// The ACK cross-check inside receive_sack_pattern() prevents
-			// false SACK triggers. We only require a short minimum delay
-			// (ack_pattern_time_ms) so the RSP has time to send its response.
-			// CRITICAL: the ring buffer is only ~3.4s (buffer_Nsymb=139 symbols).
-			// The old deferral of 2*msg_tx_time+ack_pat_time (8200ms for CONFIG_15)
-			// meant SACK audio was overwritten by silence before we ever looked.
+			// We only require a short minimum delay (ack_pattern_time_ms) so
+			// the RSP has time to send its response. Step 15: the legacy
+			// receive_sack_pattern() correlator is gone — SACK detection is
+			// now exclusively the OFDM SACK_RSP decode in the v2 branch below.
 			bool sack_window_open = sack_enabled && data_ack_received == NO
 				&& receiving_timer.get_elapsed_time_ms() > (unsigned int)(ack_pattern_time_ms);
 
@@ -1888,14 +1876,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						else
 						{
 							// SACK Design A Step 7 — OFDM SACK_RSP receive path.
-							// Instead of the MFSK SACK pattern correlator
-							// (receive_sack_pattern), demodulate any OFDM LDPC
-							// frame that landed. If it parses as SACK_RSP and the
-							// CRC8 validates, accept the bitmap. On CRC failure,
-							// the bitmap is DISCARDED (no fabrication per §9.4/A2)
-							// and we fall through to ACK-pattern detection /
-							// timeout-driven retransmit, exactly as if the
-							// control frame had been lost in the air.
+							// Demodulate any OFDM LDPC frame that landed. If it
+							// parses as SACK_RSP and the CRC8 validates, accept
+							// the bitmap. On CRC failure, the bitmap is DISCARDED
+							// (no fabrication per §9.4/A2) and we fall through to
+							// ACK-pattern detection / timeout-driven retransmit,
+							// exactly as if the control frame had been lost in
+							// the air.
 							this->receive();
 							if(messages_rx_buffer.status == RECEIVED
 							   && messages_rx_buffer.type == SACK_RSP)
@@ -1937,10 +1924,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						}
 					}
 				}
-				else
-				{
-					sack_detected = receive_sack_pattern(sack_bitmap, data_batch_size);
-				}
+				// Step 15: legacy MFSK SACK receive path deleted. When
+				// !sack_v2_enabled we simply don't attempt a partial-batch
+				// SACK decode — sack_detected stays false and CMD falls
+				// through to the timeout-driven full-batch retransmit path.
 			}
 
 			if(sack_detected)
@@ -2244,11 +2231,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				printf("[CMD-ACK-PAT] Timeout: no ACK detected, peak_matched=%d/%d peak_metric=%.1f polls=%d mask=%s\n",
 					ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold,
 					ack_diag_peak_metric, ack_diag_poll_count, mask_str);
-				// Plan A1: SACK diag — what did the SACK detector see during the same window?
-				printf("[CMD-SACK-DIAG] sack_peak_matched=%d/%d sack_peak_metric=%.2f polls=%d max_seg=%d max_e=%.6f\n",
-					sack_diag_peak_matched, telecom_system->ack_mfsk.sack_match_threshold,
-					sack_diag_peak_metric, sack_diag_poll_count,
-					sack_diag_peak_max_seg, sack_diag_peak_max_e);
+				// Step 15: legacy MFSK SACK detector diagnostic removed
+				// (sack_diag_* state no longer exists).
 				fflush(stdout);
 			}
 			stats.nNAcked_data++;

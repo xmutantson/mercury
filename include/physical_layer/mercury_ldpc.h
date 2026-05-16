@@ -37,8 +37,8 @@
 
 #include "mercury_met_2_16.h"
 
-#include "mercury_sack_4_16.h"
-#include "mercury_sack_2_16.h"
+// Step 15: legacy MFSK SACK LDPC tables (mercury_sack_*_16) removed
+// alongside the MFSK SACK bitmap path.
 
 #define MERCURY_NORMAL 1600
 

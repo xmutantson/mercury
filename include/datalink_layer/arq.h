@@ -361,8 +361,10 @@ public:
   void send_ack_pattern();   // Level 3: TX short tone pattern instead of LDPC ACK
   void send_ack_pattern_with_snr(float snr);  // TX ACK + 4 MFSK symbols encoding SNR
   bool receive_ack_pattern(); // Level 3: RX + detect ACK pattern, returns true if detected
-  void send_sack_pattern(const bool* received_bitmap, int nframes);  // SACK: partial batch ACK with bitmap
-  bool receive_sack_pattern(bool* out_bitmap, int nframes); // SACK: detect + decode bitmap
+  // Step 15: legacy MFSK SACK pattern (send_sack_pattern / receive_sack_pattern)
+  // has been deleted. OFDM SACK_RSP via send_sack_v2_frame is the only
+  // partial-batch SACK transport now.
+  //
   // SACK Design A Step 7 — OFDM SACK_RSP TX (RSP side). Builds the control
   // frame [batch_seq_id, bitmap_bytes, CRC8] and TX's it via send_batch() at
   // the data configuration. Returns the wall-clock TX duration in ms
@@ -370,8 +372,7 @@ public:
   // this is the wire-occupancy figure compared against the legacy MFSK
   // SACK pattern's ~1168 ms — see SACK_DESIGN_A_PLAN.md §7.7).
   // Pre-conditions: caller has verified sack_v2_enabled && nframes > 0.
-  // bitmap[i] = true iff frame i of the batch was RECEIVED (matches the
-  // existing send_sack_pattern() semantics).
+  // bitmap[i] = true iff frame i of the batch was RECEIVED.
   long long send_sack_v2_frame(const bool* bitmap, int nframes,
                                unsigned char batch_seq_id);
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
@@ -1125,12 +1126,8 @@ public:
   // other per-window diag counters. v1 path never sets or reads this.
   int v2_ackpat_defer_count_this_window;
 
-  // SACK detection diagnostics (Plan A1) — same shape as ACK diag.
-  int sack_diag_peak_matched;
-  double sack_diag_peak_metric;
-  int sack_diag_poll_count;
-  double sack_diag_peak_max_e;   // peak per-segment energy at best poll
-  int sack_diag_peak_max_seg;    // which of the 8 tail segments held the energy
+  // Step 15: legacy SACK pattern detection diagnostics (sack_diag_*) removed —
+  // the MFSK SACK correlator they tracked is gone.
 
   // Phase-2 validation flag: PHY reinit settle delay after SET_CONFIG ACK.
   // Default 300000 us (= 300 ms, HEAD behavior, b806b76 Bug #60). CLI:
@@ -1159,13 +1156,8 @@ public:
   //   --enable-sack   (forces enable; opt-in for users who want SACK)
   bool disable_sack;
 
-  // Fault-injection toggle (CLI --test-sack-ldpc-fail). When true,
-  // receive_sack_pattern() forces ldpc_ok=false for every SACK reception,
-  // deterministically exercising the ldpc=NO code path on an otherwise
-  // healthy SACK. Used by the SACK ldpc=NO hard-fallback repro test
-  // (fact-documents/SACK_LDPC_FALLBACK_INVESTIGATION.md §7 Step 1).
-  // Default false — no effect on production builds.
-  bool force_sack_ldpc_fail;
+  // Step 15: --test-sack-ldpc-fail / force_sack_ldpc_fail removed alongside
+  // the legacy MFSK SACK receive path.
 
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks

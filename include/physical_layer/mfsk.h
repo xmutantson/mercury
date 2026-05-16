@@ -53,18 +53,17 @@ public:
 	// WB (M>=16): 8 Welch-Costas tones × 2 reps = 16 symbols, with tone hopping.
 	// NB (M<=8): 32/48-element Sidelnikov sequences, no repetition, no hopping.
 	// ACK = data acknowledged, BREAK = emergency downshift, HAIL = "I am Mercury" beacon.
-	// SACK = selective ACK (partial batch received), followed by bitmap suffix.
+	// Step 15: legacy SACK pattern (selective-ACK with bitmap suffix) removed —
+	// OFDM SACK_RSP is the only SACK transport now.
 	static const int MAX_ACK_TONES = 48;  // Max for M=4 NB (48 symbols)
 	int ack_tones[MAX_ACK_TONES];
 	int break_tones[MAX_ACK_TONES];
 	int hail_tones[MAX_ACK_TONES];
-	int sack_tones[MAX_ACK_TONES];
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
 	int break_match_threshold; // Min matched symbols for BREAK detection
 	int hail_match_threshold;  // Min matched symbols for undirected HAIL detection
-	int sack_match_threshold;  // Min matched symbols for SACK detection
 	// Phase-2 validation: --wb-match-threshold-bias=N added to ack/break/hail
 	// match thresholds for M=16 and M=32 (the WB cases). Default 0 = HEAD.
 	// Pass +1 to revert b806b76+7076a4b's 8→7 reductions. Applied at end of
@@ -84,22 +83,10 @@ public:
 	void set_hail_target(const char* callsign, int len);
 	void clear_hail_target();
 
-	// SACK bitmap suffix: encodes which frames in a batch were received.
-	// Each MFSK symbol carries log2(M) bits. Bitmap packed LSB-first.
-	// WB: 2x repetition for reliability. NB: no repetition (Sidelnikov diversity).
-	static const int MAX_SACK_BITMAP_SYMBOLS = 32; // Max: LDPC N=128, M=16, 128/4=32 tones
-	int sack_bitmap_nsuffix(int nframes, cl_ldpc* sack_ldpc = nullptr) const;  // Total suffix symbols for given batch size
-	int sack_total_nsymb(int nframes, cl_ldpc* sack_ldpc = nullptr) const { return ack_pattern_nsymb + sack_bitmap_nsuffix(nframes, sack_ldpc); }
-	void encode_sack_bitmap(const bool* received, int nframes, int* out_tones, cl_ldpc* sack_ldpc = nullptr) const;
-	void decode_sack_bitmap(const int* suffix_tones, int nsuffix, int nframes, bool* out_received) const;
-
-	// Generate SACK pattern: base + bitmap suffix
-	void generate_sack_pattern(std::complex<double>* pattern_out);
-
-	// Generate SACK pattern with bitmap suffix appended
-	void generate_sack_bitmap_pattern(std::complex<double>* pattern_out,
-	                                   const bool* received, int nframes,
-	                                   cl_ldpc* sack_ldpc = nullptr);
+	// Step 15: legacy SACK bitmap-suffix helpers (sack_bitmap_nsuffix,
+	// sack_total_nsymb, encode_sack_bitmap, decode_sack_bitmap,
+	// generate_sack_pattern, generate_sack_bitmap_pattern, MAX_SACK_BITMAP_SYMBOLS)
+	// removed — OFDM SACK_RSP replaces this entire path.
 
 	// SNR suffix for turboshift ACK: 8 extra symbols encoding quantized SNR.
 	// WB (M=16): tone 0-15 → SNR = tone*2 - 5 dB (range -5 to +25 dB, 2 dB step)

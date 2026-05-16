@@ -119,7 +119,6 @@ public:
 	cl_error_rate passband_test_EsN0(float EsN0,int max_frame_no);
 	cl_error_rate baseband_test_EsN0(float EsN0,int max_frame_no);
 	cl_ldpc ldpc;
-	cl_ldpc sack_ldpc;  // Small LDPC for SACK bitmap (N=128, K=32, rate 1/4)
 	double sampling_frequency;
 	double carrier_frequency;
 	double carrier_amplitude;
@@ -132,8 +131,8 @@ public:
 	int test_puncture_nBits;  // > 0: zero out LLRs past this position (punctured LDPC BER test); 0: disabled
 
 	// Last coarse frequency offset from OFDM preamble detection.
-	// Persisted so ACK/SACK MFSK detectors use the same corrected carrier
-	// as OFDM data demodulation. Without this, USB audio clock mismatch
+	// Persisted so ACK MFSK detectors use the same corrected carrier as
+	// OFDM data demodulation. Without this, USB audio clock mismatch
 	// (~24 Hz on RPi CM108) puts MFSK tones at FFT half-bin boundary.
 	double last_coarse_freq_offset;
 
@@ -154,7 +153,6 @@ public:
 	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr);  // RX: returns metric
 	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	void ack_pattern_detection_test();  // SNR sweep + false alarm test
-	void sack_pattern_detection_test(); // SACK pattern roundtrip + bitmap test
 
 	// BREAK pattern: emergency "drop to ROBUST_0" signal (different tones from ACK)
 	int generate_break_pattern_passband(double* out);  // TX: returns samples written
@@ -164,12 +162,11 @@ public:
 	int generate_hail_pattern_passband(double* out);  // TX: returns samples written
 	double detect_hail_pattern_from_passband(double* data, int size, int* out_matched = nullptr, int suffix_start = 0, int* out_suffix_matched = nullptr);  // RX: returns metric
 
-	// SACK pattern: selective ACK with LDPC-encoded bitmap suffix
-	int generate_sack_bitmap_pattern_passband(double* out, const bool* received, int nframes);  // TX: SACK + LDPC bitmap, returns samples
-	int sack_pattern_passband_samples(int nframes) const;  // Duration in samples for given batch size
-	double detect_sack_pattern_from_passband(double* data, int size, int* out_matched = nullptr,
-	                                          int nframes = 0, int* out_suffix_tones = nullptr);  // RX: detect SACK + decode bitmap suffix
-	bool decode_sack_bitmap_ldpc(double* data, int size, int nframes, bool* out_bitmap);  // RX: soft LDPC decode of SACK bitmap
+	// Step 15: legacy MFSK SACK pattern (sack_pattern_passband_samples,
+	// generate_sack_bitmap_pattern_passband, detect_sack_pattern_from_passband,
+	// decode_sack_bitmap_ldpc, sack_pattern_detection_test) deleted —
+	// OFDM SACK_RSP (arq_common.cc send_sack_v2_frame / decode_sack_v2_frame)
+	// is now the only SACK transport.
 
 	st_receive_stats receive_stats;
 

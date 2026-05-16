@@ -296,7 +296,6 @@ int main(int argc, char *argv[])
     bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
     bool enable_sack_v2_cli = false;   // --enable-sack-v2: legacy opt-in (default-on now after Step 14; kept as no-op for harness compat)
     bool disable_sack_v2_cli = false;  // --disable-sack-v2: SACK Design A Step 14 opt-out (forces CAP_SACK_V2 off)
-    bool test_sack_ldpc_fail_cli = false; // --test-sack-ldpc-fail: fault-inject ldpc=NO (repro test)
     int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
     bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
     int  test_rsp_sack_rsp_crc_corrupt_count_cli = 0; // --test-rsp-sack-rsp-crc-corrupt-count=N: SACK Design A Step 11 N-shot CRC8 fault injection
@@ -595,14 +594,6 @@ int main(int argc, char *argv[])
             // for v1/v2 interop testing or to roll back to v1 ACK behavior
             // on a per-instance basis without rebuilding.
             disable_sack_v2_cli = true;
-            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-            argc--; i--;
-        }
-        else if (strcmp(argv[i], "--test-sack-ldpc-fail") == 0)
-        {
-            // Fault-injection repro toggle: forces ldpc_ok=false for every
-            // SACK reception (see SACK_LDPC_FALLBACK_INVESTIGATION.md §7 Step 1).
-            test_sack_ldpc_fail_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1503,11 +1494,6 @@ start_modem:
             ARQ.local_capability &= ~CAP_SACK_V2;
             printf("[FLAG] --disable-sack-v2: CAP_SACK_V2 removed from local_capability "
                    "(v1-only ACK behavior — SACK Design A Step 14 opt-out)\n");
-        }
-        if (test_sack_ldpc_fail_cli) {
-            ARQ.force_sack_ldpc_fail = true;
-            printf("[FLAG] --test-sack-ldpc-fail: forcing ldpc_ok=false on every "
-                   "SACK reception (repro test — SACK_LDPC_FALLBACK_INVESTIGATION.md)\n");
         }
         if (test_rsp_bsi_corrupt_at_cli > 0) {
             ARQ.test_rsp_bsi_corrupt_at = test_rsp_bsi_corrupt_at_cli;

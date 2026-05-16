@@ -317,8 +317,6 @@ source/physical_layer/mercury_normal_6_16.cc
 source/physical_layer/mercury_normal_8_16.cc
 source/physical_layer/mercury_normal_10_16.cc
 source/physical_layer/mercury_normal_12_16.cc
-source/physical_layer/mercury_sack_4_16.cc
-source/physical_layer/mercury_sack_2_16.cc
 source/physical_layer/misc.cc
 source/physical_layer/ofdm.cc
 source/physical_layer/physical_config.cc
