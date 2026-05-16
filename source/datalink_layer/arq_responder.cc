@@ -590,8 +590,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 						// estimate before SACKing. Use a short turnaround
 						// (ptt_on + ptt_off, ~300 ms) so the receiving timer
 						// expires just after the EOB frame and RSP SACKs the gaps
-						// immediately. send_sack_pattern()'s own guard supplies the
-						// precise CMD-drain margin. Only correct paired with Fix A:
+						// immediately. send_sack_v2_frame()'s own TX path supplies
+						// the precise CMD-drain margin. Only correct paired with Fix A:
 						// if the EOB frame itself is lost this branch never runs
 						// and Fix A's per-frame rx_timeout is the fallback.
 						rx_timeout = ptt_on_delay_ms + ptt_off_delay_ms;
@@ -1075,10 +1075,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
 						sack_bitmap[i] = (messages_rx[i].status == RECEIVED);
 
-					// SACK Design A Step 7 — branch on sack_v2_enabled.
-					// v2: OFDM SACK_RSP control frame (~390 ms wire occupancy).
-					// v1: legacy MFSK SACK pattern (~1168 ms wire occupancy).
-					// The v1 path is UNTOUCHED — Step 7 only adds the v2 branch.
+					// SACK Design A Step 7 — OFDM SACK_RSP control frame
+					// (~390 ms wire occupancy). Step 15: legacy MFSK SACK
+					// pattern branch has been deleted; only the v2 path
+					// remains. When sack_v2_enabled is false, no partial-batch
+					// SACK is sent — CMD falls through to ACK-timeout +
+					// full-batch retransmit.
 					if(sack_v2_enabled)
 					{
 						// SACK Design A Step 11 — Axis 3 SACK_MODE_OFF gate.
@@ -1101,6 +1103,18 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							// new copies of missing frames, the existing rx loop
 							// will merge them. No SACK_RSP wire frame emitted.
 						}
+						else if(data_batch_size <= 1)
+						{
+							// SACK Design A §7.13.12 / Step 15: SACK_RSP is
+							// meaningless on a single-frame batch (which is the
+							// default in MFSK / ROBUST modes per
+							// arq_common.cc:1163-1198). The EOB bit-7 on the lone
+							// DATA frame is the all-or-nothing receipt indicator.
+							// Suppress the dispatch entirely.
+							printf("[ACK-GATE-V2] SACK_RSP suppressed (data_batch_size=%d, multi-frame batches only)\n",
+								data_batch_size);
+							fflush(stdout);
+						}
 						else
 						{
 							// batch_seq_id field anchors the bitmap to the
@@ -1121,11 +1135,8 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							send_sack_v2_frame(sack_bitmap, data_batch_size, bsi);
 						}
 					}
-					else
-					{
-						// Send SACK pattern with bitmap suffix (legacy MFSK).
-						send_sack_pattern(sack_bitmap, data_batch_size);
-					}
+					// else: !sack_v2_enabled → no partial-batch SACK transport
+					// remains. CMD's ACK-timeout drives the full-batch retransmit.
 
 					// Keep partial messages_rx (DON'T free) - retransmit fills gaps
 					stats.nNAcked_data++;

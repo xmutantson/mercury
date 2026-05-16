@@ -6127,3 +6127,35 @@ gracefully degrade to legacy MFSK ACK behavior. No interop break.
   operating-point limit; iter 2 (back-to-back redundancy) and
   iter 3 (pre-seed ofdm_search state) from §7.13.2.7 remain
   candidate future DSP work for very lossy channels.
+
+### §7.13.12 RESULT — Step 15 legacy MFSK SACK deletion (2026-05-16)
+
+Mechanical deletion of legacy MFSK SACK code now that OFDM SACK_RSP is
+default-on. Net: 14 files changed, -2221 lines.
+
+Deleted: mercury_sack_4_16.cc, mercury_sack_2_16.cc, cl_telecom_system
+legacy SACK methods + sack_ldpc member, cl_mfsk SACK pattern code,
+cl_arq_controller::receive_sack_pattern + sack_diag_* + force_sack_ldpc_fail,
+arq_commander v1 fallback branch, arq_common.cc legacy LDPC decode path
++ pattern_time inflation, main.cc --test-sack-ldpc-fail CLI flag,
+ldpc.cc MERCURY_SACK / MERCURY_SACK_LONG branches.
+
+Kept: legacy MFSK ACK pattern (regular ACKs still use it), Bug A
+pre-detect, Bug C v2.1 cross-check.
+
+Added: arq_responder.cc explicit gate — when sack_v2_enabled AND
+data_batch_size <= 1, suppress SACK_RSP dispatch (log
+"[ACK-GATE-V2] SACK_RSP suppressed (data_batch_size=N, multi-frame
+batches only)"). Makes the multi-block-only invariant visible in code.
+
+Validation (sack_lossy_ab.py clean cell, sackv2 vs nosack, 2 runs each):
+- nosack 792.8 bps (was 816 pre-Step-15)
+- sackv2 893.3 bps (was 923 pre-Step-15)
+- Win delta +100 bps (+12.7%, vs +13.1% pre-Step-15) — preserved
+- Both modes shifted ~3% lower (channel-of-day variance, §7.13.8
+  baseline showed runs 863-953 on same cell). No catastrophic
+  regression. All 5 ship gates re-PASS.
+
+Interop: pre-Step-14 v1-only peers fall through to ACK-timeout +
+full-batch retransmit when meeting a Step-15 node (CAP_SACK_V2
+negotiation failure path). Graceful degradation, no crash.
