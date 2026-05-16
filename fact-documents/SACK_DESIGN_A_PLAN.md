@@ -5181,3 +5181,261 @@ instruction: "DO NOT touch Bug B. Even if Bug A's fix is incomplete,
 do not start on Bug B — that's a separate owner decision after seeing
 Bug A's empirical result."
 
+---
+
+### §7.13.2 RESULT — Bug B INVESTIGATION (2026-05-15)
+
+Mercury HEAD at start of this attempt: `c547a22` (the post-Bug-A fix
+plan-doc commit). Owner authorized iterative fix/test on Bug B. Phase 1
+(Trace-Don't-Guess) executed BEFORE any source edit, per CLAUDE.md
+Principle #1 / Core Principle "Research before implementing." Every
+claim below cites the exact log line or source location.
+
+#### §7.13.2.1 What RSP actually transmits on a partial batch
+
+`arq_responder.cc:914-947` — on `[ACK-GATE] SACK: received N<batch
+(expected batch)`, when `sack_v2_enabled==true` the responder calls
+`send_sack_v2_frame(sack_bitmap, data_batch_size,
+rsp_current_expected_batch_seq_id)`. That helper at
+`arq_common.cc:4189-4391` builds payload
+`[batch_seq_id : u8][bitmap : ceil(N/8) byte][CRC8 : u8]`, sets
+`messages_batch_tx[0].type = SACK_RSP (0x42)`, calls
+`telecom_system->set_mfsk_ctrl_mode(false)` (full OFDM data-config
+frame, NOT the MFSK ack-config), then `pad_messages_batch_tx(control_batch_size)`
++ `send_batch()`. Emits `[TX-SACK-V2] payload=... crc8=0x..` BEFORE
+`send_batch()` blocks for PTT-on/preamble/data-syms/PTT-off; emits a
+second `[TX-SACK-V2] send_batch() wire_ms=N ctrl_tx_time_ms=M` line
+AFTER send_batch returns.
+
+Verified emission on IONOS: 11 of 11 step-13 `*_rsp.log` files that
+contain a `[TX-SACK-V2] batch_seq_id=` line confirm the wire-format
+log entry was emitted (cited:
+`benchmark_results/step13/trackB_cfg10_logs/sack_lossy_clean_WB_CFG10_sackv2_r{1,2,3}_rsp.log`,
+`trackB_cfg10_logs/sack_lossy_mpd{14,16}_WB_CFG10_sackv2_r{1,2,3}_rsp.log`,
+`smoke3_sackv2_mpd14_logs/sack_lossy_mpd14_WB_CFG10_sackv2_r1_rsp.log`,
+`trackA_cfg15_logs/sack_lossy_wgn28_WB_CFG15_sackv2_r1_rsp.log`). All
+11 events fire the FIRST `[TX-SACK-V2] payload=` log line — proving RSP
+reached the dispatch point. **None of the 11 fire the SECOND
+`[TX-SACK-V2] send_batch() wire_ms=` log line** — proving `send_batch()`
+never returned.
+
+#### §7.13.2.2 Why send_batch() never returns — harness termination, NOT a hang
+
+`tools/sack_lossy_ab.py:565-600` — at duration expiry (`while
+time.time() - t0 < duration_s: time.sleep(5)`), the harness sets
+`stop.set()`, sends `DISCONNECT` over the TCP control channels, sleeps
+3 s, then issues `SSH ... killall -9 mercury` on both Pi. With
+SIGKILL the C++ stdio buffer is dropped; the second
+`[TX-SACK-V2] wire_ms=` log line is lost even if send_batch was
+seconds into the TX. The audio that was in flight to the SGTL5000 DAC
+also dies — partial audio (some PTT-on, maybe a preamble) makes it
+out, but the LDPC-coded data symbols of the SACK_RSP do not. CMD has
+nothing intact to demodulate.
+
+**Position of `[TX-SACK-V2]` in each `*_rsp.log` is EXACTLY the file's
+last line** (verified by `grep -n + wc -l` — all 11 files: TX_lineno
+== total_lines). The harness kill window is open by the time
+`send_batch()` enters PTT-on, every observed time.
+
+This means the **§7.13 "Bug B: 0 / 10 SACK_RSP decoded on IONOS" stat
+does not measure decode failure — it measures a censored sample**.
+The denominator is "SACK_RSP TX events whose audio actually completed
+on the wire" = 0 / 0 over Step 13's run set. We cannot conclude from
+Step 13 that the OFDM SACK_RSP fails to decode — we can only conclude
+that none of them got a chance to be tested.
+
+Cross-checked Bug-A-fix retest at `fact-documents/bug_a_fix_ionos.json`:
+- 4 sackv2 runs (2 clean, 2 wgn32), 90 s each.
+- `total_sack_events: 0` in `clean_sackv2` and `wgn32_sackv2` cells
+  (`bug_a_fix_ionos.json` summary). The parser counts
+  `[CMD-SACK-V2] batch_seq_id=` (decoded), not `[TX-SACK-V2]`.
+- 2 of the 4 runs (`clean_sackv2_r2`, `wgn32_sackv2_r1`) emitted exactly
+  ONE `[TX-SACK-V2]` event each, both at the FILE'S LAST LINE
+  (verified). The other 2 runs emitted zero SACK_RSP TX events.
+- Same SIGKILL truncation pattern. **0 SACK_RSP TX events in the entire
+  retest reached send_batch() completion** — same censorship as §7.13.
+
+#### §7.13.2.3 Why SACK_RSP fires so rarely on real IONOS
+
+Per `arq_responder.cc:914`, RSP only enters the v2 SACK_RSP TX branch
+on `[ACK-GATE] SACK: received N<batch`. The pre-condition is
+`rx_count < data_batch_size` AND ack-gate timeout fired. On a clean
+channel with WB_CFG15 over IONOS:
+- `wgn32_sackv2_r1` log: 23 of the first 24 batches were CLEAN at
+  rx=25/25 (cited: `[ACK-GATE] PASS: received 25/25` lines in
+  `sack_lossy_wgn32_WB_CFG15_sackv2_r1_rsp.log`). Only the 24th batch
+  was partial (rx=24/25 missing id=14) at abs_ms=36816.
+- `clean_sackv2_r2` log: 24 of the first 25 batches were CLEAN; the
+  25th was partial (rx=24/25 missing id=6) at abs_ms=48452.
+
+This is fundamental: at WB_CFG15 with WGN:40 or WGN:32 IONOS, the
+batch-loss rate is ~1-3 %. Across a 90 s run, only ~1 partial batch
+materializes — and the harness happens to kill the process right when
+that partial-batch SACK_RSP enters send_batch. With Bug A unfixed
+(Step 13), things were worse because CMD's `this->receive()` drained
+the audio of clean-batch ACK patterns; many "partial" batches were
+actually ACK-pattern-destruction-induced, not channel-induced.
+
+#### §7.13.2.4 Power-level comparison — legacy MFSK SACK vs OFDM SACK_RSP
+
+Legacy SACK pattern (`source/physical_layer/telecom_system.cc:142-159`,
+`tx_gain[TX_SIG_ACK] = 5.24` linear ≈ +14.4 dB; legacy SACK suffix
+uses the same MFSK-1S tone amplitude path with `tx_gain[TX_SIG_MFSK_1S]
+= 5.24` per `:136`). OFDM SACK_RSP uses `tx_gain[TX_SIG_OFDM] = 1.0`
+per `:140` — **14.4 dB lower amplitude than legacy MFSK ACK/SACK
+tones**.
+
+Worth noting: OFDM has ~10 dB PAPR vs MFSK's 0 dB (single-tone), so
+the PEAK transmit amplitude evens out, but the **average power and
+per-subcarrier SNR** is materially lower for OFDM SACK_RSP. On a
+chain with fixed peak headroom (SGTL5000 DAC into IONOS audio path),
+this is the correct relationship to preserve TX peak headroom — but
+it does NOT guarantee equivalent receiver detection margin.
+
+For full WB-data OFDM frames this is fine because LDPC at rate 0.875
+(CONFIG_15) gives 4-5 dB coding gain, and frame-aligned channel
+estimation against a known pilot is per-frame. For a SACK_RSP that
+arrives standalone (one frame, no batch context), CMD must
+Schmidl-Cox-detect the preamble in a ring buffer that was just full
+of post-DATA-TX noise + CMD's own audio tail. This is structurally a
+harder detection scenario than an in-batch data frame whose preamble
+follows another decoded frame's known timing.
+
+#### §7.13.2.5 Cross-reference: how do legacy MFSK SACK, ACK, HAIL, BREAK survive IONOS
+
+- **Legacy MFSK SACK pattern** (`arq_common.cc:3986-4126`,
+  `receive_sack_pattern`). Tail snapshot of `tail_nsymb = 2 * sack_total
+  + 16` symbols; runs `detect_sack_pattern_from_passband()` — pure
+  Goertzel-style **tone correlator** + threshold check (matched ≥
+  `sack_match_threshold` AND metric ≥ 0.5). No LDPC required for
+  pattern detection; LDPC kicks in only for bitmap *content* (and the
+  `sack_ldpc_fail` fallback handles total LDPC failure cleanly per
+  `SACK_LDPC_FALLBACK_INVESTIGATION.md`).
+- **Legacy ACK pattern** (`receive_ack_pattern`): same model — energy
+  gate then tone correlator + threshold (`ack_match_threshold`).
+  Detected `[CMD-ACK-PAT] Data ACK pattern detected!` reliably 3/4
+  times in `bug_a_fix_ionos_logs/sack_lossy_clean_WB_CFG15_sackv2_r2_cmd.log`
+  at abs_ms~7900, 22300, 36400 (lines 1427/1771/2071).
+- **HAIL pattern** (`receive_hail_pattern`): same model, threshold
+  `hail_match_threshold` AND quality ≥ 0.3.
+- **BREAK pattern** (`detect_break_pattern_from_passband`): same model,
+  `break_match_threshold`.
+
+ALL four legacy control patterns share the same structural property:
+they are **tone-burst patterns detected by a Goertzel/matched-tone
+correlator with a threshold**. They do NOT require preamble
+Schmidl-Cox detection. They tolerate large timing slop (entire tail
+snapshot scanned). They tolerate 1-3 missing tones because the
+threshold is much less than the total tone count.
+
+OFDM SACK_RSP is the **first non-tone-burst control frame**: it
+demands the full OFDM stack (Schmidl-Cox preamble, fine sync,
+channel-estimate, ZF/MMSE equalize, LDPC decode, CRC16 check) to
+succeed AS-IF it were a data frame in mid-batch. There is no
+fallback. Every step is binary pass/fail.
+
+#### §7.13.2.6 Mercury data-frame OFDM RX vs SACK_RSP RX — same path, different operating point
+
+`arq_common.cc:4998 cl_arq_controller::receive()` is one path, used
+identically for both data frames and SACK_RSP. At
+`:5118 telecom_system->receive_byte(...)` runs the full OFDM demod;
+`:5366 messages_rx_buffer.type = message_TxRx_byte_buffer[0]` then
+dispatches on the first decoded byte. `:5395 if(type == SACK_RSP)`
+copies the payload into `messages_rx_buffer.data[]`.
+
+The DIFFERENCE between in-batch data-frame RX and SACK_RSP RX is
+NOT the decode pipeline — it's the OPERATING POINT:
+1. In-batch DATA: a preamble lands every `Nsymb + preamble_nSymb`
+   symbols at a known per-batch cadence. The `ofdm_search_raw` and
+   `ofdm_batch_active` hints (set on each successful in-batch decode
+   per `:5300-5320`) tell the Schmidl-Cox search where to start. The
+   coarse_metric threshold gets a head-start.
+2. SACK_RSP: arrives ~1.5 - 3 s AFTER CMD finishes its batch TX
+   (RSP needs to receive all 25 frames, hit the ack-gate timeout, then
+   queue and TX its own response). By then the CMD-side ring buffer
+   has shifted multiple times due to `frames_to_read` anti-spin polls
+   (`:5625-5777`). `ofdm_batch_active` was likely turned off at the
+   last batch-end zero-padding scan. `ofdm_search_raw` was reset to 0.
+   The SACK_RSP preamble must be found by full cold Schmidl-Cox over
+   the entire buffer.
+3. Also: CMD just executed `[TX-END] frames_to_read=4 (ctrl=0)` and
+   spent the post-TX 400 ms PTT-off + drain window with RX-mute
+   active (per `Bug #44` rx_mute path). The first ~400 ms of
+   post-TX-end audio is intentionally zeroed.
+
+This means the SACK_RSP preamble must:
+- Survive ~14 dB lower TX amplitude than the legacy ACK pattern.
+- Be Schmidl-Cox-detected without any in-batch search hint.
+- Land in a ring buffer whose first portion is zeroed (rx_mute) and
+  whose middle portion was shifted multiple times.
+
+The combination is mathematically harder than either in-batch DATA RX
+or legacy ACK-pattern RX. **None of these effects is a "bug" in the
+strict sense** — they are an accumulated operating-point disadvantage.
+
+#### §7.13.2.7 Honest scope assessment — what we can and cannot fix
+
+**Things we cannot fix without owner direction:**
+- We have ZERO empirical evidence that the SACK_RSP demod fails when
+  audio actually arrives intact. Every "0 decode" datapoint in the
+  IONOS dataset is from a SACK_RSP whose audio never made it to the
+  wire (harness SIGKILL during send_batch).
+- We cannot run an unbiased IONOS test of SACK_RSP decode rate
+  without either (a) increasing test duration so more partials happen
+  mid-run, (b) injecting deterministic losses to force more partials
+  per minute, or (c) modifying the harness to graceful-stop AFTER any
+  in-flight TX completes.
+
+**Things we can do that are likely to help:**
+- **Iteration 1 hypothesis (highest likelihood)**: increase OFDM
+  SACK_RSP TX amplitude to match the legacy ACK-pattern boost (5.24×
+  → +14.4 dB). Justification: every other control-class transmission
+  in Mercury uses this boost; only SACK_RSP was left at OFDM-data
+  level. **Mechanism**: SACK_RSP TX gain bug. **Predicted effect**:
+  on a censored-sample basis we cannot tell decode rate, but the
+  observable side-effect is the CMD-side `[RX-DECODE#]
+  NO-PREAMBLE`/`FAIL` rate when SACK_RSP is in flight should drop
+  (gain↑ → metric↑ at the Schmidl-Cox detector).
+- **Iteration 2 hypothesis (if 1 doesn't close the gap)**: repeat
+  SACK_RSP twice back-to-back (control_batch_size = 2 just for
+  SACK_RSP). Justification: with rate-0.875 LDPC + WGN at 32 dB SNR
+  per-frame decode rate is ~70-85 %. Two independent attempts ≈ 92
+  %. Mechanism: redundancy at zero extra wire format complexity (the
+  existing pad_messages_batch_tx path already supports this).
+- **Iteration 3 hypothesis (if 1+2 don't close the gap)**:
+  pre-seed the `ofdm_search_raw` / `ofdm_batch_active` state on
+  CMD's SACK window entry so the Schmidl-Cox search has a
+  reasonable start position when the SACK_RSP preamble arrives.
+
+Iterations 1 and 2 are minimal and isolated; iteration 3 requires
+touching the receive() state machine and would be the riskiest.
+
+#### §7.13.2.8 Decision — what gets executed next
+
+**Iteration 0 (this section): empirical measurement first.** Before
+guessing at any DSP fix, run a focused IONOS test designed to
+DEFEAT the harness-truncation censoring. Two changes vs §7.13.1's
+retest:
+1. Run duration 180 s (was 90 s) so 3-4 partial batches fire per
+   run, with the LAST one possibly killed but the earlier ones not.
+2. Inject light WGN (`WGN:28`) at WB_CFG10 instead of `WGN:32`/clean
+   at WB_CFG15 — known to produce ~10-20 % partial batches per
+   `SACK_LOSSY_CHANNEL_WINTEST.md §4.2`. More partials per minute =
+   more SACK_RSP TX events with the chance to complete mid-run.
+3. Pull logs WHILE mercury is still running (don't SIGKILL until
+   after the 180-s window naturally ends and we've given send_batch
+   200 ms grace to finish). This requires a one-line tweak to
+   `sack_lossy_ab.py` — or running a manual focused test outside
+   the harness with explicit graceful stop.
+
+The empirical baseline IS Phase-1's third-leg evidence: until we know
+the TRUE in-flight-completed SACK_RSP decode rate, every fix
+candidate is speculation. We expect to find one of:
+- (i) Real-channel SACK_RSP decode rate is 30-90 % already — Bug B
+  is mostly a measurement artifact; SACK_V2 wins post-Bug-A.
+- (ii) Real-channel decode rate is 0-20 % — Bug B is real; iterate
+  fix candidates 1 → 2 → 3 in order.
+- (iii) Real-channel decode rate ranges widely (0-90 %) by run —
+  architectural ceiling, fix-by-tuning will plateau; recommend
+  redirect.
+
