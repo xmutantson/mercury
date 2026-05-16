@@ -6454,9 +6454,31 @@ would amortize properly.
   (flagged in `BREAK_FAILSAFE_INVESTIGATION.md` §11.4). Was load-
   bearing while Bug D existed (loop targeted same failing config
   forever). With Bug D fixed it's optional polish — worth a second
-  look in a future session.
+  look in a future session. **CLOSED in §7.13.16 below — verdict A,
+  never-refresh is correct by design.**
 - A deterministic unit test of the BREAK boundary would inject
   `messages_control.status = ACKED` before triggering the handler
   and verify post-BREAK it returns to FREE. The walk-based proof is
   sufficient for now but the unit test would catch any future
   regression instantly.
+
+### §7.13.16 RESULT — Phase-1 retry refresh-policy investigation (2026-05-16)
+
+Follow-up from §7.13.14.7 / `BREAK_FAILSAFE_INVESTIGATION.md` §11.4.
+Verdict: **A — never-refresh on Phase-1 retry is correct by design.**
+The asymmetry between `arq_commander.cc:1278` (Phase-2 exhaust →
+refresh `emergency_previous_config = current_configuration`) and
+`arq_commander.cc:1318` (Phase-1 exhaust → no refresh) is semantically
+required. Phase-2 failure means "target was disproved end-to-end" →
+anchor descent at the disproved target. Phase-1 failure means
+"coordination SET_CONFIG didn't reach RSP" → retry the *same* plan;
+the target was never disproved. Descent is driven by the
+`break_drop_step` doubling at line 64 and the Phase-2 refresh at line
+1278; combined they bound the descent path progressively (CFG_15 → 0
+in 5 BREAK rounds, worked example in fact doc §4). With Bug D fixed
+(commit `1acdb3c`), Phase 1 is reliable on both ROBUST_0 and CFG_0
+floors, so the historical pathology (Phase 1 wedged forever pre-Bug-D
+on no-`-R`) is no longer reachable. Action: ready-for-review
+comment-only diff at line 1318 documenting the WHY (the existing
+comment only documents the WHAT). No source edit applied. Full
+analysis in `EMERGENCY_PREVIOUS_CONFIG_INVESTIGATION.md`.
