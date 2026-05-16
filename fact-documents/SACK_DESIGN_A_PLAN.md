@@ -6069,3 +6069,61 @@ saves a full-batch retransmit, ~3000 ms at CFG10).
   expected < 2 %).
 - Step 14 (CAP_SACK_V2 default-on) is now gate-passed at all
   measured channel points and can ship.
+
+### §7.13.11 RESULT — Bug C v2.1 win-test re-validation + Step 14 shipped (2026-05-16)
+
+#### §7.13.11.1 Win-test re-run with Bug C v2.1 in the binary
+
+Same 12-run grid as §7.13.8 (3× sackv2 + 3× nosack at clean + WGN:32,
+180 s each), now with `ee6f285` (Bug C v2.1) deployed on both Pis:
+
+| cell    | nosack (sigma) | sackv2 (sigma) | Δ vs nosack | vs §7.13.8 |
+|---------|----------------|----------------|-------------|------------|
+| clean   | 816.0 (0.0)    | 923.0 (42.2)   | +13.1 %     | unchanged  |
+| WGN:32  | 816.0 (0.0)    | **952.8 (0.0)**| **+16.8 %** | **+30 bps** |
+
+Bug C v2.1's extra `this->receive()` call per FAST event is well
+under the noise floor — no clean-cell regression. WGN:32 actually
+tightened (all 3 runs hit 952.8 exactly, sigma 0.0). All 5 hard
+gates re-confirmed PASS.
+
+#### §7.13.11.2 Step 14 — CAP_SACK_V2 default-on shipped
+
+Code changes:
+- `mercury/source/datalink_layer/arq_common.cc` — `enable_sack_v2`
+  default flipped `false → true` at init (line 131).
+- `mercury/source/main.cc` — added `--disable-sack-v2` opt-out CLI
+  flag. Legacy `--enable-sack-v2` flag preserved as a no-op for
+  harness-compat (sack_lossy_ab.py etc. still pass it verbatim).
+- `--disable-sack-v2` documented in `-h` help output.
+
+#### §7.13.11.3 Validation
+
+Ran sack_lossy_ab.py with `--modes sack` (i.e. only `--enable-sack`,
+NOT `--enable-sack-v2`) at WGN:28 / CFG10 / 120 s:
+
+- mercury did NOT print `[FLAG] --enable-sack-v2` (flag absent)
+- mercury did NOT print `[FLAG] --disable-sack-v2` (opt-out absent)
+- harness reported `cap_sack_v2_negotiated=True`
+
+→ CAP_SACK_V2 is advertised by default, negotiation succeeds, the
+v2 code path is active without any opt-in. Step 14 ship gate
+passed.
+
+#### §7.13.11.4 Interop note (v1↔v2 mixed builds)
+
+`--disable-sack-v2` exists for per-instance opt-out. A pre-Step-14
+v1-only build does NOT carry the CAP_SACK_V2 capability bit and
+the two-way `(local & peer) & CAP_SACK_V2` check at
+arq_commander.cc:2728 falls to false — v1↔v2 mixed sessions
+gracefully degrade to legacy MFSK ACK behavior. No interop break.
+
+#### §7.13.11.5 Open follow-ups (post-ship)
+
+- Step 15 (legacy MFSK SACK pattern deletion) — only after Step 14
+  has been live for one release cycle and no regressions surface.
+- Bug C v2.1 helps but doesn't solve the WGN:16 cliff
+  (`receive()` finds preamble, LDPC fails) — that's the §7.13.2.6
+  operating-point limit; iter 2 (back-to-back redundancy) and
+  iter 3 (pre-seed ofdm_search state) from §7.13.2.7 remain
+  candidate future DSP work for very lossy channels.

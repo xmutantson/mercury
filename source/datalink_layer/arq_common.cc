@@ -127,8 +127,15 @@ cl_arq_controller::cl_arq_controller()
 
 	// SACK state initialization
 	sack_enabled=false;
-	sack_v2_enabled=false;   // Step 6 scaffolding (negotiate-only; gates nothing yet)
-	enable_sack_v2=false;    // Step 6 scaffolding (CLI opt-in; default off → byte 5 unchanged)
+	sack_v2_enabled=false;   // Negotiated true post-TEST_CONNECTION when both peers advertise CAP_SACK_V2.
+	// SACK Design A Step 14 (post-§7.13.8 win-test, post-§7.13.10 Bug-C fix):
+	// CAP_SACK_V2 is now advertised BY DEFAULT. Both win-test cells (clean +
+	// WGN:32) showed sackv2 ≥ +13.1% vs no-SACK with zero crashes / LDPC
+	// miscorrections; Bug C v2.1 (ee6f285) enables first-ever CMD-side
+	// SACK_RSP decodes on lossy channels. To opt OUT: pass --disable-sack-v2
+	// on the CLI. Legacy `--enable-sack-v2` flag still accepted (no-op now,
+	// kept for tool-harness compatibility — see tools/sack_lossy_ab.py).
+	enable_sack_v2=true;     // Step 14: default ON
 	radio_batch_size=25;
 	crypto_batch_size=20;
 	retransmit_headroom=5;
