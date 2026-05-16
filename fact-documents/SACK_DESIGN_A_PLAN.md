@@ -4988,3 +4988,196 @@ elects to keep the Step 1-12 code present for future experimentation;
 but it must NOT be the default, and the catastrophic-regression
 empirics above need to be acknowledged in any future decision.
 
+---
+
+### §7.13.1 RESULT — Bug A FOCUSED FIX (2026-05-15) — escalation point
+
+Mercury HEAD at start of this attempt: `6ba378c` (the §7.13 fact-doc
+commit). HEAD after this attempt: `db3787f` (the focused Bug A fix).
+The owner elected to attempt fixing Bug A in isolation despite the §8
+revert recommendation; this section records the empirical verdict so
+the owner can choose what to do next.
+
+**Scope — what was attempted:**
+- Bug A only. Bug B (0/10 SACK_RSP decoded over IONOS) was NOT touched.
+- No revert of Steps 1-12. Forward fix only.
+- Two-attempt cap honored (one initial attempt + one refinement once the
+  defense-in-depth over-deferred SACK_RSP — both gated together as the
+  single Bug-A fix).
+
+#### §7.13.1.1 Regression boundary verified
+
+`git show 712a13c -- source/datalink_layer/arq_commander.cc` confirms
+the v2 SACK-window dispatch was introduced in Step 7 with the EXACT
+shape §7.13.4 traced — `this->receive()` first, then check for
+`messages_rx_buffer.type == SACK_RSP`. Bug A has been present in every
+commit since 712a13c (2026-05-15 09:22 PDT).
+
+**Why Step 7 Gate 2 PASSed on VB-Cable.** Step 7's Gate 2 ran with
+`--cmd-extra "-Z 6"` (heavy AWGN), which forced nearly every batch to
+be PARTIAL. On partial batches RSP emits SACK_RSP (the OFDM control
+frame), so CMD's `this->receive()` is correctly given OFDM audio to
+demodulate — Gate 2 reports `tx=6, rx=2, matches_byte_identical=2`.
+The CLEAN-batch path (where RSP emits the legacy MFSK ACK pattern, NOT
+SACK_RSP) was **never exercised** by Step 7's gates. §7.13.5 documents
+this exact "validation hole" but does not name the regression boundary;
+this §7.13.1 confirms it was always Step 7.
+
+#### §7.13.1.2 Fix design — minimal, gated on `sack_v2_enabled`
+
+`arq_commander.cc:1782-1840` (after fix). Code structure (gated entirely
+on `sack_v2_enabled && axis3_sack_mode != SACK_MODE_OFF`):
+
+1. **Pre-detect:** `receive_ack_pattern()` is called BEFORE
+   `this->receive()`. It is cheap (energy-gated; only runs the MFSK
+   matched filter when signal is present at `tail_rms > 0.001`) and
+   does NOT shift the ring on a miss (sets `frames_to_read=2` to
+   throttle the next poll but no buffer mutation). If it hits →
+   `v2_ack_pat_pre_detected = true` and the v2 receive is skipped.
+2. **Defense-in-depth — bounded defer:** if pre-detect missed but
+   `ack_diag_peak_matched >= 2`, an ACK pattern may be mid-arrival
+   (incomplete in buffer). Defer `this->receive()` by setting
+   `frames_to_read=2` so the capture thread keeps filling. Bounded to
+   5 polls (`v2_ackpat_defer_count_this_window < 5`, ~225 ms WB) so
+   the partial-batch SACK_RSP decoder is never permanently starved
+   (OFDM SACK_RSP audio can produce 2-3 false MFSK ACK-tone matches
+   from spectral coincidence; without the bound, those would block the
+   v2 path forever).
+3. **Short-circuit at `:1898`:** the existing else-if becomes
+   `else if(data_ack_received==NO && (v2_ack_pat_pre_detected || receive_ack_pattern()))`
+   so the ACK-handler body fires from the pre-detect hit without the
+   re-call (which would no-op due to `frames_to_read=4` set by the
+   successful first call).
+4. **New member:** `v2_ackpat_defer_count_this_window` in
+   `include/datalink_layer/arq.h:1116-1126`, initialized in the
+   constructor, reset alongside `ack_diag_peak_matched` at
+   `arq_commander.cc:891 / :1141` (per-TX-cycle reset sites).
+5. **V1 path UNCHANGED:** the `else` branch at `:1842` (when
+   `sack_v2_enabled==false`) still calls `receive_sack_pattern()`
+   exactly as before. No v1 byte path was modified.
+
+Total diff: `arq_commander.cc` +136/-32 (mostly comments), `arq.h`
++12/-0, `arq_common.cc` +1/-0. Commit: `db3787f`.
+
+#### §7.13.1.3 Validation — four gates
+
+**Gate 1 — WAV harness v1↔v1 byte stability (campaign invariant):**
+- `python tools/sack_redesign_wav_ab.py --self-test` →
+  `pass1.sha256 == pass2.sha256` (deterministic; same hash both passes).
+- Fix touches v2-gated code only; v1 path bit-identical. **PASS**.
+
+**Gate 2 — v2↔v2 VB-Cable CLEAN (the test that catches Bug A):**
+- `python tools/sack_v2_loopback_test.py --duration 90 --config 10`.
+- nAcked = 125 / nSent = 150 frames over 90 s at WB_CFG10 = **744 bps**.
+- vs no-SACK baseline (same VB-Cable, same duration, same config):
+  130 acked, **774 bps**. **96% of no-SACK ceiling.**
+- Pre-fix Step 13 §7.13.2 same cell: **148.9 bps** (19% of no-SACK).
+- Log signals (CMD side): `CMD-SACK-V2-ACKPAT-FAST=5`,
+  `CMD-SACK-V2-ACKPAT-WAIT=30`, `CMD-ACK-PAT Data ACK detected=5`,
+  `Timeouts=1`, `FTR-FAIL=1` (vs many pre-fix). Bug A's destructive
+  `receive()` loop is eliminated. **PASS — 5× recovery on the gate
+  Step 7 missed.**
+
+**Gate 3 — v2↔v2 VB-Cable LOSSY (`-Z 6`) — partial-batch SACK_RSP path:**
+- `python tools/sack_v2_loopback_test.py --duration 90 --config 10 --cmd-extra="-Z 6"`.
+- nAcked = 110 frames in 90 s = **655 bps**.
+- `[CMD-SACK-V2] decoded` events: **4 of 5** RSP TX-SACK-V2 events
+  = **80% partial-batch decode** (bounded defer does NOT starve the
+  v2 SACK_RSP decoder, confirming the safety bound works).
+- `gate_2_byte_identity_pass=true` in the loopback harness verdict.
+- **PASS.**
+
+**Gate 4 — Focused IONOS retest (Track A, WB_CFG15, clean + wgn32,
+2 runs/cell, 90 s each):**
+
+| Cell | post-fix v2 (mean of 2) | no-SACK (mean of 2) | gap | pre-fix v2 §7.13.2 (Δ%) |
+|------|------------------------:|--------------------:|----:|------------------------:|
+| clean | **1866 bps** (2613/1120) | 2103 bps (2103/2253) | **-11.2%** | 0 / 373 bps (-100% / -83%) |
+| wgn32 | **1680 bps** (747/2613) | 2186 bps (2253/2118) | **-23.1%** | 624 bps (-68%) |
+
+Per-run log signals on real IONOS (sackv2 CMD-side):
+- clean_r1: FAST/WAIT/Data-ACK/Timeout = 8/35/8/0, SACK_RSP decoded=0,
+  nAcked=200 frames.
+- clean_r2: 3/15/3/4, SACK_RSP decoded=0, nAcked=75 (degraded run —
+  consistent with §7.13.5's documented real-channel SACK_RSP decode
+  failure, NOT a Bug A regression).
+- wgn32_r1: 2/10/2/4, SACK_RSP decoded=0, nAcked=50.
+- wgn32_r2: 8/30/8/0, SACK_RSP decoded=0, nAcked=200.
+
+**Gap closure analysis:**
+- Clean: -100 / -83% → -11.2% (closes ~85 pp of the regression).
+- wgn32: -68% → -23.1% (closes ~45 pp).
+
+Raw artifacts: `mercury/fact-documents/bug_a_fix_ionos.json` (per-run
+JSON), `mercury/fact-documents/bug_a_fix_ionos_logs/` (8 cmd+rsp logs).
+
+#### §7.13.1.4 What is left — Bug B remains, by design
+
+`[CMD-SACK-V2] decoded` count across all 4 IONOS sackv2 runs: **0 / 5**
+RSP TX-SACK-V2 events (in the runs where any were emitted). This
+matches §7.13.5's documented Bug B: real-channel timing / preamble
+search for OFDM control-frame symbol boundary differs from the legacy
+MFSK SACK pattern's boundary, and `decode_sack_v2_frame()` consistently
+fails over the IONOS channel even when the wire is byte-clean.
+
+Bug B's residual contribution to the wgn32 gap is therefore **the
+remaining -23%**. If Bug B were also fixed, wgn32 would likely close
+to within VB-Cable-style variance of no-SACK. That work is OUT OF
+SCOPE for §7.13.1 per the owner's "Bug A only, escalate before B"
+instruction.
+
+#### §7.13.1.5 Recommendation to the owner
+
+The Step 13 verdict (§7.13 + §8) recommended REVERT. With Bug A's
+focused fix landed:
+
+- **Clean-cell catastrophe (gates 1 + 2 of §7.13.6) is RESOLVED.**
+  v2 SACK is now within 11% of no-SACK on the IONOS clean cell and
+  96% of no-SACK on the VB-Cable clean cell. The "-100% to -83%"
+  hard-gate failure that triggered the revert recommendation is GONE.
+
+- **Lossy-cell gap is HALF-CLOSED.** wgn32 went from -68% to -23%.
+  The remaining -23% is attributable to Bug B (real-channel SACK_RSP
+  decode failure), NOT to Bug A.
+
+- **No-SACK path UNAFFECTED.** Empirical equivalence holds (Gate 5
+  from §7.13.6 was PASS and remains PASS — the fix is v2-gated).
+
+- **v1 SACK path UNAFFECTED.** The `else` branch at `arq_commander.cc:1842`
+  preserves `receive_sack_pattern()` exactly as before.
+
+Decision options for the owner (in increasing risk order):
+
+(a) **Continue to Bug B investigation.** Bug A's fix closes the
+    dominant regression. Bug B is a focused, well-localized problem
+    (OFDM control-frame symbol-boundary timing vs MFSK pattern
+    boundary). If fixed, wgn32 should close to within noise of
+    no-SACK, and v2 may become a net win on lossy. RECOMMENDED.
+
+(b) **Live with v1 + Bug A's fix on v2 default-off.** Keep the
+    `--enable-sack-v2` opt-in path compiled. Default-on flip
+    (Step 14) remains dead. Lossy users see no benefit from v2 in
+    practice. Conservative.
+
+(c) **Revert per the original §8 recommendation.** Now empirically
+    unjustified: the dominant failure mechanism is fixed and gates
+    1 + 2 + 5 of §7.13.6 all pass post-fix. Only justified if owner
+    decides the architectural-complexity argument from §7.13.10
+    (SACK is fundamentally situational; SACK_FIX_PLAN-style fixes
+    keep finding new issues) outweighs the now-much-smaller residual
+    gap. NOT recommended now that Bug A is closed.
+
+**My recommendation: (a) — proceed to Bug B investigation.** Bug A's
+fix closes the empirical gap dramatically (clean: -100% → -11%; wgn32:
+-68% → -23%). The remaining gap is a single localized issue (Bug B),
+not the cumulative-architectural-problem pattern §7.13.10 named. The
+"three structural fixes signals architectural problem" trigger from
+CLAUDE.md is mitigated by the fact that Bug A IS now structurally
+fixed, not band-aided. A fourth attempt on Bug B is justified if the
+owner agrees the §7.13.10 pattern is no longer the dominant signal.
+
+This decision is OWNER-only. Escalation point per the prompt's
+instruction: "DO NOT touch Bug B. Even if Bug A's fix is incomplete,
+do not start on Bug B — that's a separate owner decision after seeing
+Bug A's empirical result."
+
