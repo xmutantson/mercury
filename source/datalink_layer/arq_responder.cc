@@ -230,6 +230,25 @@ void cl_arq_controller::process_messages_rx_data_control()
 			fflush(stdout);
 			break_detected = NO;
 
+			// Bug fix (POST_BREAK_STUCK_INVESTIGATION.md §5.1 / §8.1,
+			// SACK_DESIGN_A_PLAN §7.13.14): force-FREE the control slot.
+			// BREAK is a hard reset signal — any in-flight control exchange
+			// is moot, the commander is changing config and will re-issue.
+			// Without this reset, a slot stuck at ACKED/RECEIVED/PENDING_ACK
+			// (e.g. from a control batch that just landed pre-BREAK) causes
+			// every post-BREAK SET_CONFIG to be silently dropped at the
+			// FREE gate at :262 below — process_control_responder() never
+			// runs, mercury sits at the post-BREAK config never accepting
+			// commander instructions. Symmetric with the CMD-side BREAK ACK
+			// handlers at arq_commander.cc:113, :184 which already
+			// force-FREE for the same reason ("cleanup() skips PENDING_ACK
+			// status"). The race window is widened by short frame time at
+			// higher OFDM configs; ROBUST_0's longer frames usually close
+			// it before the bug bites, which is why the prior
+			// BREAK_FAILSAFE_INVESTIGATION's -R workaround appeared to fix
+			// the deadlock without addressing this root cause.
+			messages_control.status = FREE;
+
 #ifdef MERCURY_GUI_ENABLED
 			if(passive_monitor)
 				gui_push_monitor_event("[BREAK -> ROBUST_0]", false);
@@ -275,6 +294,20 @@ void cl_arq_controller::process_messages_rx_data_control()
 					}
 				}
 					stats.nReceived_control++;
+				}
+				else
+				{
+					// POST_BREAK_STUCK_INVESTIGATION.md §8.2: silent
+					// discard at this gate hid the BREAK-leaves-slot-stuck
+					// bug for a long time. Log every drop so any future
+					// stuck-state regression surfaces immediately.
+					printf("[RX-CTRL-DROP] CONTROL frame dropped: messages_control.status=%d "
+						"(prev code=%d), incoming code=%d seq=%d/%d cfg=%d\n",
+						messages_control.status, (int)messages_control.data[0],
+						(int)messages_rx_buffer.data[0],
+						messages_rx_buffer.sequence_number,
+						control_batch_size, current_configuration);
+					fflush(stdout);
 				}
 				// BUG FIX: Process control message immediately when batch is complete
 				// instead of waiting for timer (which kept getting reset by retransmissions)
