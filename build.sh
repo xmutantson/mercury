@@ -143,9 +143,9 @@ check_deps() {
     fi
 }
 
-# Compiler settings
-CXX=g++
-CC=gcc
+# Compiler settings (overridable via env for cross-compilation)
+CXX="${CXX:-g++}"
+CC="${CC:-gcc}"
 # Optional: IDLE_GATE_TRACE=1 ./build.sh o3 — enables the idle-scan cadence
 # Step-0 instrumentation (idle-loop FIR-run rate + raw-passband RMS distribution,
 # diagnostic only, behind #ifdef IDLE_GATE_TRACE). Without the env var the
@@ -156,8 +156,8 @@ if [ "${IDLE_GATE_TRACE:-0}" = "1" ]; then
     echo "  (IDLE_GATE_TRACE instrumentation ENABLED)"
 fi
 
-CXXFLAGS="$OPT $DBG $EXTRA_CFLAGS $TRACE_CFLAGS -Wall -Wextra -Wno-format -Wno-unused -std=c++14 -I./include -I./source/audioio/ffaudio -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -DMERCURY_GUI_ENABLED -I./third_party/imgui -I./third_party/imgui/backends"
-CFLAGS="$OPT $DBG $EXTRA_CFLAGS -Wall -Wno-unused -I./source/audioio/ffbase/ -I./source/audioio/ffaudio/ -I./include -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -std=c17"
+CXXFLAGS="$OPT $DBG $EXTRA_CFLAGS $TRACE_CFLAGS -Wall -Wextra -Wno-format -Wno-unused -std=c++14 -I./include -I./source/audioio/ffaudio -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -DMERCURY_GUI_ENABLED -I./third_party/imgui -I./third_party/imgui/backends ${EXTRA_CFLAGS_ENV:-}"
+CFLAGS="$OPT $DBG $EXTRA_CFLAGS -Wall -Wno-unused -I./source/audioio/ffbase/ -I./source/audioio/ffaudio/ -I./include -I./source/compression -I./source/crypto -I./source/crypto/mlkem -pthread -std=c17 ${EXTRA_CFLAGS_ENV:-}"
 
 # Platform-specific flags
 if [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "mingw"* ]] || [[ "$OSTYPE" == "cygwin"* ]]; then
@@ -170,17 +170,48 @@ elif [[ "$OSTYPE" == "darwin"* ]]; then
     LDFLAGS="$(pkg-config --libs glfw3) -framework OpenGL -framework CoreFoundation -framework CoreAudio $EXTRA_LDFLAGS"
 else
     PLATFORM="linux"
-    CXXFLAGS="$CXXFLAGS $(pkg-config --cflags glfw3)"
-    LDFLAGS="$(pkg-config --libs glfw3) -lGL -lpulse -lasound -lpthread -lrt $EXTRA_LDFLAGS"
+    if [ "${MERCURY_CROSS_BUILD:-0}" = "1" ]; then
+        # Cross-compile: host's pkg-config doesn't know about the target sysroot.
+        # Caller supplies --sysroot=... via EXTRA_CFLAGS_ENV; derive SYSROOT here
+        # for the link step. If MERCURY_SYSROOT is set, prefer it; otherwise parse.
+        if [ -n "${MERCURY_SYSROOT:-}" ]; then
+            SYSROOT="$MERCURY_SYSROOT"
+        else
+            # Extract --sysroot=PATH from EXTRA_CFLAGS_ENV
+            SYSROOT=$(echo "${EXTRA_CFLAGS_ENV:-}" | sed -n 's/.*--sysroot=\([^ ]*\).*/\1/p')
+        fi
+        if [ -z "$SYSROOT" ]; then
+            echo "ERROR: MERCURY_CROSS_BUILD=1 but no sysroot found (set MERCURY_SYSROOT or --sysroot=... in EXTRA_CFLAGS_ENV)"
+            exit 1
+        fi
+        echo "  (cross-compile: sysroot=$SYSROOT)"
+        CXXFLAGS="$CXXFLAGS -I${SYSROOT}/usr/include"
+        # --as-needed: drop NEEDED entries for shared libs whose symbols Mercury
+        # doesn't actually reference (libpulse pulls in libdbus/libsndfile/etc
+        # transitively; we don't call them, so don't link them).
+        # --allow-shlib-undefined: tolerate unresolved symbols inside
+        # indirectly-pulled .so files when those libs themselves get dropped.
+        # --unresolved-symbols=ignore-in-shared-libs: belt-and-braces in case
+        # any indirect symbol survives the --as-needed pass.
+        LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/usr/lib/aarch64-linux-gnu -Wl,--as-needed -Wl,--allow-shlib-undefined -Wl,--unresolved-symbols=ignore-in-shared-libs -lglfw -lGL -lpulse -lasound -lpthread -lrt $EXTRA_LDFLAGS"
+    else
+        CXXFLAGS="$CXXFLAGS $(pkg-config --cflags glfw3)"
+        LDFLAGS="$(pkg-config --libs glfw3) -lGL -lpulse -lasound -lpthread -lrt $EXTRA_LDFLAGS"
+    fi
 fi
 
-# Check dependencies before build (skip on Windows — uses vendored libs)
-if [ "$PLATFORM" != "windows" ]; then
+# Check dependencies before build (skip on Windows — uses vendored libs).
+# Skip on cross-build too: the host won't have the target's dev libs natively;
+# they live in the sysroot only.
+if [ "$PLATFORM" != "windows" ] && [ "${MERCURY_CROSS_BUILD:-0}" != "1" ]; then
     check_deps "$PLATFORM"
 fi
 
 if [ "$PLATFORM" = "windows" ]; then
     OUTPUT="mercury${SUFFIX}.exe"
+elif [ "${MERCURY_CROSS_BUILD:-0}" = "1" ]; then
+    # Distinguish cross-built artifact from a host-native build sitting alongside it.
+    OUTPUT="mercury_aarch64${SUFFIX}"
 else
     OUTPUT="mercury${SUFFIX}"
 fi
