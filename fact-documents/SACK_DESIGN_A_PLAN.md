@@ -6854,3 +6854,220 @@ regression test (§7.13.18) still PASS 3/3.
   exists. Calibration requires the owner at the front panel until
   either an IONOS protocol extension or a scripted RECORD-side
   workaround is built.
+
+### §7.13.22 RESULT — IONOS calibration session attempt + environmental regression (2026-05-16)
+
+Partial progress on the calibration backlog (`ionos_audio_level_backlog.md`),
+plus discovery of an environmental regression that blocked the ACK half.
+
+#### §7.13.22.1 What worked
+
+OFDM TX level calibrated against the IONOS sweet spot using soundcard
+mixer adjustments only:
+
+| stage         | numid=10 (Lineout) | numid=1 (PCM) | OFDM peak |
+|---------------|-------------------:|--------------:|----------:|
+| baseline      |             24,24  |       180,180 | 480 mVp-p |
+| +Lineout max  |             31,31  |       180,180 | 700 mVp-p |
+| +PCM bump     |             31,31  |       186,186 | 1000 mVp-p (target) |
+
+Owner read peak mVp-p directly from the IONOS front panel
+(`WGN:40 / FADE 0 / OFFSET 0 / BANDWIDTH:3000`) while rpi2 ran
+`mercury -m TX_RAND -s 10 -n`. The Fe-Pi SGTL5000 Lineout Playback
+Volume control on the Pi (numid=10) has 0.5 dB/step, range 0..31
+with 31=0 dB (max output). Baseline 24 = -3.5 dB. PCM Playback Volume
+(numid=1) range 0..192, step undocumented in `amixer -c Audio cget`
+output but empirically ~0.5 dB/step (180→186 = +3.0 dB observed).
++6.4 dB total brings the line-out from 480 to 1000 mVp-p as predicted.
+
+These changes are **in-RAM only** — they revert on reboot or if the
+butler's `AUDIO_SETUP` is invoked (which re-applies the hardcoded
+24,24 / 180,180 values per `tools/ionos_butler.py:127-138`). For
+persistence, either run `alsactl store` on the Pi after applying, or
+update the butler's `AUDIO_SETUP` constants. **Not persisted in this
+session** — calibration was interrupted by §7.13.22.3.
+
+#### §7.13.22.2 What didn't work
+
+ACK calibration could not be completed because of §7.13.22.3 below.
+Theoretical mercury INI overrides (using the §7.13.21 hook) were
+computed as `ACK_WB = 5.24 × 0.686 = 3.59` and `ACK_NB = 11.72 × 0.686
+= 8.04` (the factor brings the post-soundcard ACK peak from ~1460 down
+to 1000 mVp-p) but never measured under live ACK transmission, so are
+unverified.
+
+#### §7.13.22.3 Environmental ARQ-CONNECT regression — open bug
+
+After the soundcard calibration succeeded on rpi2's TX path, an attempt
+to set up an ARQ session for ACK measurement failed: rpi2 sends 5 HAIL
+beacons, rpi1 receives one ~5 % of full-scale peak (real signal) but
+four others at noise floor (0.001 of FS). CMD logs `5 × PTT ON/PTT OFF`
+cycles then `CANCELPENDING + DISCONNECTED`. No HAIL is detected by RSP.
+
+Symptom holds with:
+
+- soundcard reverted to baseline (24,24 / 180,180) ✓ confirmed
+- mercury INI cleaned of [TxGain] section ✓ confirmed (defaults logged)
+- IONOS commanded back to `WGN:40 + flat + base gains + 3000 Hz BW` ✓
+- mercury binary rolled back to `eaba2c0` (= the binary that ran the
+  successful §7.13.17 win-test 1.5 h earlier) ✓ confirmed via redeploy
+
+Owner reports nothing physical has changed for many hours. The
+soundcard, IONOS settings, audio path, and now binary are all at the
+same state as during the §7.13.17 win-test that ran successfully. Yet
+HAIL detection has regressed from "5/5 beacons detected reliably,
++14.3 % sackv2 win" to "1/5 beacons detected, no CONNECT."
+
+What changed between the working state and the broken state (in
+order):
+
+1. Successful §7.13.17 wgn32 cell wrapped up (17:48 PDT).
+2. `b1fdfa4` Bug B guard committed; `eaba2c0` orphan sweep committed;
+   `eaba2c0` deployed to Pis (~18:00-18:15 PDT). Both no-op runtime.
+3. INI hook §7.13.21 coded + locally smoke-tested + `9294094`
+   committed + deployed (~18:18-18:48 PDT). No-op when [TxGain] absent.
+4. `mercury -m TX_RAND -s 10 -n` started on rpi2 for soundcard
+   calibration. Mercury cycled stop/start multiple times during owner
+   front-panel readings.
+5. Soundcard adjusted then reverted; mercury INI [TxGain] block
+   appended then stripped; mercury restarted ~6 times.
+6. ARQ session attempted — fails.
+7. Rollback test (eaba2c0 binary) — also fails.
+
+Working hypotheses (none verified):
+
+- **ALSA capture buffer wedge on rpi1**: many start/stop cycles can
+  leave the SGTL5000 capture chain in a state where it returns near-
+  silence even when the IONOS is feeding signal. Diagnostic: SSH
+  `aplay`/`arecord` loopback test, `dmesg | tail` for I2S/codec errors.
+  Fix: `sudo systemctl restart alsa-state` or full Pi reboot.
+- **IONOS internal routing/state drift**: IONOS commands return only
+  `OK` with no echo of current settings (`tools/ionos_butler.py:90-105`),
+  so we can't verify what's actually live. The owner can confirm by
+  reading the IONOS LCD vs what we told it. Possible the channel
+  routing went stale after many programming cycles.
+- **rpi2 TX path overdriven from earlier soundcard boost** leaving
+  some downstream stage saturated (despite reverting the mixer).
+  Less likely — mixer reset is supposed to be immediate.
+
+#### §7.13.22.4 Recommended next-session steps
+
+1. **First**: Pi reboot (`sudo reboot` via butler SSH on both rpi1 and
+   rpi2). Cheapest reset of everything Pi-side that could have drifted.
+2. After reboot, re-acquire butler lease, verify `aplay -l` lists
+   Fe-Pi, set IONOS `WGN:40 + flat`, run `sack_lossy_ab.py --runs 1
+   --duration 60 --modes nosack --points clean --config WB_CFG10` as
+   a regression check.
+3. If that PASSES → regression was Pi-state (ALSA wedge); proceed
+   with ACK calibration per §7.13.22.2.
+4. If that still FAILS → IONOS-side issue. Have owner power-cycle
+   IONOS and re-verify.
+5. Once ARQ baseline restored, complete ACK calibration with the §7.13.21
+   mercury INI hook (theoretical ACK_WB=3.59, ACK_NB=8.04 as starting
+   point), then verify with a fresh win-test re-run at the new levels
+   for the calibrated baseline going forward.
+
+#### §7.13.22.5 Artifacts
+
+- `mercury/fact-documents/postD_wintest_v2/deploy_9294094.log` —
+  successful 9294094 deploy
+- `mercury/fact-documents/postD_wintest_v2/deploy_eaba2c0_rollback.log` —
+  successful eaba2c0 rollback deploy (regression-diagnosis aid)
+- /tmp/ack_{cmd,rsp}.log on Pis — captured the failed CONNECT
+  attempts (will be lost on Pi reboot)
+
+#### §7.13.22.6 State at session end
+
+- Mercury source repo HEAD: `9294094` (INI hook committed and source
+  restored after rollback test)
+- Both Pis: binary at `eaba2c0` (one commit behind source — the
+  rollback deploy left them there; the runtime difference vs `9294094`
+  is purely the INI hook which is no-op when [TxGain] absent). A
+  re-deploy of `9294094` to align is a no-op-runtime change but should
+  happen for housekeeping in next session.
+- Butler: lease released, idle.
+- Pi mercury procs: killed.
+- IONOS: last commanded `WGN:40 / FADE 0 / OFFSET 0 / IN:1 / OUT:1 /
+  BANDWIDTH:3000` (state at IONOS end unverifiable — see §7.13.22.3).
+- Soundcard mixer on both Pis: at baseline (24,24 / 180,180) — the
+  calibration values (31,31 / 186,186) were not persisted.
+
+#### §7.13.22.7 Deep-dive update — root cause narrowed to mercury audio capture (rpi1 only)
+
+After §7.13.22.6 was written, owner power-cycled the IONOS, the Pis were
+rebooted, PulseAudio was killed (had spawned after reboot as a user service
+holding `/dev/snd/*`), and the butler `AUDIO_SETUP` was re-applied. None of
+these moved the symptom. A direction-isolated test produced the decisive
+evidence:
+
+- **rpi1 → IONOS → rpi2**: rpi2 CAP-PEAK = `0.043` FS (solid, expected). ✓
+- **rpi2 → IONOS → rpi1**: rpi1 CAP-PEAK = mostly `0.001` (noise floor),
+  one `~0.055` spike per session. ✗
+
+To rule out IONOS routing, captured a 3 s WAV on rpi1 with raw `arecord -D
+plughw:Audio -c 2 -r 48000 -f S16_LE` while rpi2 ran `TX_RAND`. Result on
+the recovered `diag_capture.wav`:
+
+| channel | peak (FS) | mean(abs) |
+|---------|----------:|----------:|
+| LEFT    |    0.0016 |       2.3 |
+| RIGHT   |   0.0558  |     371.7 |
+
+**The IONOS IS delivering a strong continuous signal on the RIGHT channel
+to rpi1's line-in.** The audio is there at the wire. Mercury's RX is on
+RIGHT (`--rx-channel 1`) so the channel selection is correct.
+
+But mercury's CAP-PEAK reports it *only once per HAIL session* (matching
+that single spike). The other ~4 of 5 beacon windows show `pk=0.001`
+despite the signal being continuously present at the wire. Mercury's
+audio capture is therefore **intermittently missing samples** — capturing
+~20 % of the windows correctly, returning near-silence the rest.
+
+Working hypotheses (none verified in-session):
+
+- ALSA capture-buffer xrun / overrun that the alsa back-end is silently
+  masking with zero-fill rather than reporting upstream (mercury logs
+  no `[CAP-XRUN]` or similar marker — would need to add one to test).
+- Sample-rate drift between Fe-Pi capture clock and mercury's
+  consumption rate after many start/stop cycles; restart-resistant
+  unless the codec is fully reinitialised.
+- Some kernel-level Fe-Pi I²S/codec state that survives `killall -9` and
+  isn't reset by butler `AUDIO_SETUP` (which only touches mixer numids,
+  not the lower-level codec state machine).
+
+The other-direction rpi1→rpi2 was deliberately not exercised the same way
+(arecord side-by-side with TX_RAND on the same Pi would need a separate
+capture device path), but the inferential evidence is that rpi2's capture
+path is fine because the win-test rpi2-RX path delivered 95+% block
+success an hour earlier.
+
+#### §7.13.22.8 Revised next-session steps
+
+1. Add an explicit `[CAP-XRUN]` log line in mercury's ALSA capture
+   callback whenever `snd_pcm_readi` returns `-EPIPE` or short reads. If
+   xrun is the cause, this will surface immediately and we'll know.
+2. Consider `snd_pcm_recover` after every short read on the rpi1 capture
+   path (the current code may be papering over xruns silently).
+3. **Power-cycle the Pis** (not just `sudo reboot` — full power off /
+   on) to reset Fe-Pi codec state below what software reboot touches.
+4. If powered-cycle Pi still shows the same arecord-vs-mercury
+   asymmetry, instrument mercury's capture path with sample-count
+   accounting per second to detect drift.
+5. Once mercury capture is healthy on rpi1 again, complete the ACK
+   calibration with the §7.13.21 INI hook as originally planned.
+
+#### §7.13.22.9 What did NOT regress
+
+- §7.13.21 INI hook code — verified by rolling back binary to `eaba2c0`;
+  same symptom with and without the hook.
+- IONOS pass-through — verified by `arecord` capturing the signal.
+- Butler / IONOS programming — `AUDIO_SETUP` and `WGN:40` etc. all
+  accepted.
+- Mercury TX path on rpi2 — owner confirmed 1000 mVp-p on IONOS panel
+  at calibrated soundcard levels; TX is fine.
+- Mercury RX path on rpi2 — solid `0.043 FS` CAP-PEAK in the direction
+  test (rpi1→rpi2).
+
+The narrowed root cause: **mercury's ALSA capture on rpi1 specifically,
+returning ~20 % of windows correctly and ~80 % near-silence, even though
+the audio is present at the wire.**
