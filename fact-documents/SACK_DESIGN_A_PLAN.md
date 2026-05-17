@@ -7183,3 +7183,234 @@ unchanged.
   and the §7.13.21 INI hook were all behaving correctly throughout.
 - `ionos_audio_level_backlog.md` (memory) — calibration backlog item is
   done.
+
+### §7.13.24 RESULT — Gearshift Axis-1 consecutive-fail decay (2026-05-17)
+
+Issue surfaced by `calibrated_battery_v1` test 3 (axis walk WGN:40→14
+descending, 14 buckets, 60 s dwell, `--with-robust`): only **3 policy-
+moves** recorded across the full walk (`[POLICY-MOVE] axis=2 ring_clean`
+×2 + `[POLICY-MOVE] axis=1 ladder_down 6→5` ×1). The link survived to
+CFG_5 but couldn't descend further; bps timeline collapsed to 0 at
+WGN:24 with sporadic 86 bps at WGN:22/20/18 (CFG_5 surviving one batch
+per ~70 s) then 0 at WGN:16/14. ROBUST_0 floor never reached.
+
+#### §7.13.24.1 Root cause
+
+`gear_shift_down_consecutive_fails` was strict-reset to 0 on every good
+block (`arq_commander.cc:3535-3536` v1 legacy ladder path; `:3665-3666`
+v2 `policy_evaluate_axis1` path). The descent trigger at the same site
+requires 3 STRICT consecutive bad blocks (`consecutive_fails >= 3` per
+the log `success=50% threshold=55% consecutive_fails=3`).
+
+On a marginal channel the success rate oscillates good/bad block to
+block (sometimes 100 %, sometimes 50 % — exactly the cliff regime where
+ladder_down should fire). Every intermittent good block wiped the
+fail counter, so the 3-consecutive threshold was never reached.
+Mercury stayed pinned at the marginal config until BREAK (a separate
+failsafe) eventually fired — but BREAK by design only triggers on
+3 consecutive control NACKs, which `:1274` also strict-resets on every
+ACKed control. Net: both descent paths are starved on noisy channels.
+
+#### §7.13.24.2 Fix
+
+Replace strict-reset with decay (counter--) at both sites:
+
+```cpp
+// before
+if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
+    gear_shift_down_consecutive_fails = 0;
+
+// after
+if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage
+    && gear_shift_down_consecutive_fails > 0)
+    gear_shift_down_consecutive_fails--;
+```
+
+Semantics: counter accumulates +1 per bad block, -1 per good block (floor
+at 0). Ladder_down still fires at counter >= 3 — but a marginal channel
+where bad outnumbers good by 3 over any window now triggers descent.
+Hysteretic / "net-3" rather than "strict-3 in a row".
+
+Comment in source cites §7.13.24 so future readers see the rationale.
+
+#### §7.13.24.3 Validation — MADE THINGS WORSE, REVERTED
+
+Re-ran the same axis_walk_sweep.py command from `calibrated_battery_v1`
+test 3 against the patched binary. Output: `mercury/fact-documents/
+fix_validation_v1/T1_axis_walk/results.json`.
+
+| metric                | pre-fix              | post-fix (this patch)  |
+|-----------------------|----------------------|------------------------|
+| `policy_moves_count`  | 3                    | 3 (same count, different mix) |
+| axis=1 ladder_down    | 1 event (CFG_6→5)    | 1 event (CFG_10→9)     |
+| axis=2 ring_clean     | 2 events             | 2 events               |
+| bps at WGN:28         | 163                  | 0                      |
+| bps at WGN:22-18      | 86 (3 buckets)       | 0                      |
+| lowest config reached | CFG_5                | CFG_9                  |
+
+The decay change triggered axis=1 ladder_down at the very top of the
+descent (CFG_10→9 around WGN:36-34) — earlier than pre-fix when axis=1
+never fired until the modem had already descended via BREAK to CFG_6.
+Once axis=1 fired, its cooldown
+(`gear_shift_block_for_nBlocks_total`) prevented further axis=1
+descent for the cooldown window. **Critically, the BREAK descent path
+that carried pre-fix from CFG_10 all the way to CFG_6 stopped firing
+post-fix.** Without BREAK driving the rest of the descent the modem
+got stuck at CFG_9 (one step lower than pre-fix CFG_10 start), then
+the channel kept degrading past what CFG_9 could hold (bps dropped to
+0 from WGN:28 onward and never recovered).
+
+Why BREAK stopped firing post-fix is unknown — the decay change
+shouldn't directly affect BREAK accounting. Possible explanations:
+- Some shared state (`gear_shift_blocked_for_nBlocks`, `emergency_*`)
+  is reset / advanced by axis=1 firing earlier than usual, blocking
+  BREAK escalation later.
+- The cooldown after axis=1 fires holds the modem at a marginal config
+  long enough that the channel drops past where BREAK can recover from.
+
+**Revert applied.** Both sites restored to the strict-reset behavior
+(`gear_shift_down_consecutive_fails = 0` on every good block). The
+revert is documented in-source at both `arq_commander.cc:3535-3536`
+and `:3665-3666` with comments citing this section so future work
+doesn't re-attempt the same patch without understanding the BREAK
+interaction.
+
+The §7.13.24 axis-1 responsiveness issue **remains open**. A future
+investigation needs to first understand why BREAK stopped firing
+post-decay before any retry. The original Agent 3 hypothesis (strict-
+reset prevents marginal-channel descent) is empirically wrong — pre-
+fix BREAK successfully drove the descent from CFG_10 to CFG_6 over
+the bucket sequence; the axis=1 strict-reset was actually the right
+policy as long as BREAK is also working.
+
+### §7.13.25 RESULT — SACK_RSP double-shot redundancy (DSP iter 2) (2026-05-17)
+
+Issue surfaced by `calibrated_battery_v1` tests 1 (CFG15 sackv2 -45.7 %
+at clean, retx_rate 0.57) + 4 (multipath sackv2 -50-67 %, retx 0.91 at
+mpm16). Both same root cause: single-frame SACK_RSP decode probability
+is too low on real channels.
+
+#### §7.13.25.1 Root cause (from §7.13.22 follow-up agent investigation)
+
+RSP transmits the OFDM SACK_RSP frame on the **active data-modulation
+config** (`arq_common.cc:4017-4023 send_sack_v2_frame`). The frame is
+a single-shot OFDM+LDPC payload with the same loss probability as a
+data frame. Cascade:
+
+1. Data batch loses 1+ frames → RSP triggers `[ACK-GATE] SACK: 24/25`
+2. RSP sends SACK_RSP at data config → frame drops with same probability
+   as data frames
+3. CMD's `[CMD-ACK-PAT]` MFSK ACK detector times out (no MFSK ACK was
+   sent; the OFDM SACK_RSP was the response and CMD never decoded it)
+4. CMD `[BREAK] Block failure` fires → retransmits the **entire 25-frame
+   batch** (worst case — way more frames than the original loss)
+5. RSP receives the retransmitted batch but its `prev_batch_seq_id`
+   pointer has already advanced → drops the retx as `prev_inactive_late`
+6. Cascade compounds: every batch loses some, every SACK_RSP also
+   drops, every recovery is a full-batch retx
+
+Failure conditions concentrate at:
+- **CFG15** (16QAM rate 14/16): per-frame loss ~4 % at calibrated SNR,
+  SACK_RSP decode also ~96 % → 23 % of SACK events cascade per batch
+- **Multipath** (MPM:16, MPP:18): single-frame SACK_RSP decode drops to
+  ~50 % → near every partial-batch cascades to full-batch retx
+- **CFG10 + CFG16** were unaffected in §7.13.22 because per-frame drop
+  rate was ~0 at calibrated SNR; SACK_RSP never exercised
+
+#### §7.13.25.2 Fix
+
+`arq_common.cc:4020` `pad_messages_batch_tx(control_batch_size)` →
+`pad_messages_batch_tx(2)`. Sends the SACK_RSP frame back-to-back
+twice. Each is an independent OFDM+LDPC attempt. CMD's polling loop
+runs `receive()` per ~45 ms WB poll; if the first SACK_RSP fails
+LDPC/CRC the second is still in the capture ring and gets a second
+decode attempt via the same `arq_commander.cc:1846` (Bug C v2.1
+cross-check path) or `:1928` (normal SACK_RSP receive path).
+
+Two independent decodes at per-frame probability p give effective
+success `1 - (1 - p)²`. For:
+
+- CFG15 clean p=0.96: 99.84 % effective decode (vs 96 % single)
+- MPM:16 p=0.50: 75 % effective decode (vs 50 % single)
+- MPP:18 p=0.65: 87.75 % effective decode (vs 65 % single)
+
+#### §7.13.25.3 Cost
+
+Doubles SACK_RSP wire time on the SACK path only:
+- CFG10: ~480 ms → ~960 ms per SACK_RSP send
+- CFG15: ~360 ms → ~720 ms
+- CFG16: ~280 ms → ~560 ms
+
+Clean cells (where SACK_RSP doesn't fire) pay zero cost. The CMD post-
+TX ACK timeout window from `[RSP-TIMEOUT]` logs in §7.13.22 cells is
+4970-7696 ms — well above the doubled SACK_RSP wire time, no risk of
+CMD timeout cutting the second frame off.
+
+#### §7.13.25.4 Why this is iter-2, not iter-1
+
+Per `SACK_DESIGN_A_PLAN §7.13.2.7`:
+- **Iter 1** = boost SACK_RSP TX gain to match ACK-class boost
+- **Iter 2** = back-to-back redundancy (this fix)
+- **Iter 3** = pre-seed OFDM_search state on SACK window entry
+
+Iter 1 was previously skipped because there's no per-frame-type gain
+mechanism for OFDM frames; only the per-signal `tx_gain[]` table, and
+SACK_RSP shares the OFDM gain entry with data frames. Adding a
+SACK_RSP-specific gain would require enum extension + receive path
+gain awareness — more architectural surface than this fix needs.
+
+Iter 2 (this fix) addresses the same problem (low SACK_RSP decode
+probability) via the orthogonal mechanism of independent retries,
+which works regardless of why the frame failed (SNR, multipath, ICI).
+And it's a single-line change with the existing `pad_messages_batch_tx`
+infrastructure.
+
+#### §7.13.25.5 Validation — partial closure, fix retained
+
+`mercury/fact-documents/fix_validation_v1/T2_cfg15_clean.json` +
+`T3_mpm16.json`. Measured:
+
+| cell                | metric        | pre-fix    | post-fix   | Δ              |
+|---------------------|---------------|------------|------------|----------------|
+| CFG15 clean sackv2  | `mean_bps`    | 1244.4     | **1847.7** | +49 %          |
+| CFG15 clean sackv2  | `retx_rate`   | 0.5714     | **0.3232** | -43 %          |
+| CFG15 clean sackv2  | nosack delta  | -45.7 %    | **-17.5 %** | gap closed 62 % |
+| MPM:16 sackv2       | `mean_bps`    | 259.1      | **406.4**  | +57 %          |
+| MPM:16 sackv2       | `retx_rate`   | 0.91       | **0.38**   | -58 %          |
+| MPM:16 sackv2       | nosack delta  | -67 %      | **-45.4 %** | gap closed 32 % |
+
+Doubling SACK_RSP transmission cut the retx_rate roughly in half in
+both cells (matches the math: `(1-p)² < (1-p)` for any p<1) and
+recovered ~50 % of the lost throughput at CFG15 clean. **Fix retained**
+in the deployed binary.
+
+Not full closure though — both cells still favor nosack. Two
+hypotheses on why iter-2 alone doesn't fully close:
+
+1. **CMD's polling cadence may not always pick up the second SACK_RSP
+   frame in time.** The two frames are sent back-to-back (~480 ms
+   each at CFG10) totalling ~960 ms. If CMD's `receive()` polling
+   happens to hit between the two frames, only the first is seen; if
+   the first fails LDPC, the second is processed on the next poll —
+   but by then the SACK window may have advanced or the ring may have
+   been shifted by an OFDM-FAIL anti-spin. Need direct measurement of
+   `[CMD-SACK-V2] decoded SACK_RSP` count per partial-batch event
+   pre- vs post-fix to confirm.
+
+2. **MPM:16 multipath fragility is fundamental, not amplitude.** Iter
+   2 only adds redundancy; it doesn't address the underlying single-
+   frame decode probability under multipath. Iter 3 (pre-seed
+   `ofdm_search_raw` on SACK window entry, per §7.13.2.7) is the next
+   architectural escalation if needed.
+
+For the calibrated benchmark this is a clear positive: ~50 % SACK_RSP
+recovery improvement everywhere SACK fires, no cost on clean cells
+where SACK_RSP doesn't fire. Open follow-up: investigate iter 3 if
+multipath remains the bottleneck after iter 2 is in shipping use.
+
+#### §7.13.25.6 Open follow-up
+
+If iter 2 doesn't close the gap fully at MPM:16, iter 3 (pre-seed
+`ofdm_search_raw` on SACK window entry, per §7.13.2.7) is the next
+escalation. It's riskier (touches the OFDM receive state machine) so
+deferring until empirical iter 2 results show whether more is needed.
