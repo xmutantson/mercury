@@ -831,6 +831,30 @@ void cl_arq_controller::process_messages_tx_data()
 		message_batch_counter_tx = 0;
 		for(int r = 0; r < retransmit_count; r++)
 		{
+			// Bug B latent corollary (SACK_DESIGN_A_PLAN §7.13.19,
+			// commit e73968a): messages_batch_tx[i].data is NULL at init
+			// (arq_common.cc:1525 — only batch slot that is not pre-
+			// allocated). In production today this site is unreachable
+			// with .data NULL because every code path that enters the
+			// retransmit loop has first gone through a struct-copy at
+			// arq_commander.cc:590 / :655 / :992 / :1025 which inherits
+			// the .data pointer from messages_control or messages_tx[i].
+			// Defensive guard: convert a potential SIGSEGV into a logged
+			// skip if that invariant is ever broken (e.g. a future code
+			// path enters retx-only before any prior batch has dispatched).
+			// Lazy-alloc was rejected because the next struct-copy after
+			// the lazy allocation overwrites the .data pointer and leaks
+			// the freshly-allocated buffer — the asymmetric allocation
+			// pattern is the root anti-pattern, not the missing buffer.
+			if(messages_batch_tx[message_batch_counter_tx].data == NULL)
+			{
+				printf("[CMD-LATENT-GUARD] retx slot %d/%d (site=v1-retx-only) "
+					".data is NULL — skipping; investigate as a regression of "
+					"the struct-copy-before-retx invariant (SACK_DESIGN_A_PLAN "
+					"§7.13.19)\n", r, retransmit_count);
+				fflush(stdout);
+				continue;
+			}
 			messages_batch_tx[message_batch_counter_tx].type = retransmit_frame_types[r];
 			messages_batch_tx[message_batch_counter_tx].length = retransmit_frame_lengths[r];
 			memcpy(messages_batch_tx[message_batch_counter_tx].data,
@@ -941,6 +965,17 @@ void cl_arq_controller::process_messages_tx_data()
 		message_batch_counter_tx = 0;
 		for(int r = 0; r < R; r++)
 		{
+			// Bug B latent corollary — see arq_commander.cc:832 above.
+			// Same defensive guard for the v2 mixbatch retx prefix.
+			if(messages_batch_tx[message_batch_counter_tx].data == NULL)
+			{
+				printf("[CMD-LATENT-GUARD] retx slot %d/%d (site=v2-mixbatch-retx) "
+					".data is NULL — skipping; investigate as a regression of "
+					"the struct-copy-before-retx invariant (SACK_DESIGN_A_PLAN "
+					"§7.13.19)\n", r, R);
+				fflush(stdout);
+				continue;
+			}
 			messages_batch_tx[message_batch_counter_tx].type = retransmit_frame_types[r];
 			messages_batch_tx[message_batch_counter_tx].length = retransmit_frame_lengths[r];
 			memcpy(messages_batch_tx[message_batch_counter_tx].data,
