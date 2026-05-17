@@ -6756,3 +6756,101 @@ for: `sack_pattern_passband_samples`, `generate_sack_bitmap_pattern_passband`,
 `sack_diag_*`, `--test-sack-ldpc-fail`, `MERCURY_SACK*`,
 `decode_suffix_tones_soft`. No live references remain. The only matches
 are intentional deletion-marker comments (catalogued above).
+
+### §7.13.21 RESULT — Per-signal-type tx_gain INI hook (2026-05-16)
+
+Prerequisite for the IONOS audio-level recalibration backlog
+(`ionos_audio_level_backlog.md`). Owner observed on the IONOS front
+panel: OFDM TX ~450 mVp-p, MFSK ACK ~700 mVp-p, both below the
+~1000 mVp-p sweet spot. Before this commit there was no way to override
+`cl_telecom_system::tx_gain[]` without recompiling — the table is
+hardcoded in `init_tx_gain_defaults()` at `telecom_system.cc:118-162`
+with no INI parameterisation. Per-iteration calibration would have
+been a 10-15 min cycle (edit → rebuild → redeploy tarball to Pi via
+butler → build on Pi → smoke test). With this hook in place, an
+iteration is a single line in `~/.config/mercury/mercury.ini` on the
+Pi followed by a mercury restart — sub-minute cycle.
+
+#### §7.13.21.1 Design
+
+INI section `[TxGain]` with 10 keys: `<SIG>_<MODE>` for the cartesian
+product of `{MFSK_1S, MFSK_2S, OFDM, ACK, BREAK}` × `{WB, NB}`. Absent
+key → NaN → no override → keep the code default. Present key → override
+both `tx_gain[sig][nb_mode][0]` and `[1]` (the cross-`nb_fir` axis is
+declared but `get_tx_gain` only reads the `[nb][nb]` diagonal — see
+`telecom_system.cc:167`). Each override logs a `[TX-GAIN-OVERRIDE]`
+line with old → new value so the calibration trail lives in the process
+log next to the `[TX-GAIN]` table dump.
+
+Example calibration INI fragment:
+
+```ini
+[TxGain]
+OFDM_WB = 1.5
+ACK_NB  = 12.0
+```
+
+#### §7.13.21.2 Files touched
+
+- `mercury/include/gui/ini_parser.h` — `tx_gain_override[5][2]` field on
+  `MercurySettings`; constants `TX_GAIN_NSIG`, `TX_GAIN_NMODE`.
+- `mercury/source/gui/ini_parser.cc` — `setDefaults()` initialises to
+  NaN; `load()` parses `[TxGain]` keys with NaN-default; `save()` only
+  serialises non-NaN entries (a fresh INI doesn't get polluted with
+  the 10 default values).
+- `mercury/include/physical_layer/telecom_system.h` — `set_tx_gain()`
+  setter declaration.
+- `mercury/source/physical_layer/telecom_system.cc` — `set_tx_gain()`
+  implementation; logs `[TX-GAIN-OVERRIDE]` with prev → new.
+- `mercury/source/main.cc` — application loop after `cl_telecom_system`
+  construction (between the CLI-flag block at `:1377-1391` and the
+  `list_modes` branch at `:1411`).
+
+#### §7.13.21.3 Smoke-test
+
+Local host run (`mercury -l -n`) with `OFDM_WB=1.5`, `ACK_NB=12.0`
+appended to `mercury.ini`:
+
+```
+Loaded settings from: C:\Users\kamer\AppData\Roaming\Mercury\mercury.ini
+[TX-GAIN-OVERRIDE] OFDM     WB  1.0000 -> 1.5000 (calibration override, plan §7.13.21)
+[TX-GAIN-OVERRIDE] ACK      NB  11.7170 -> 12.0000 (calibration override, plan §7.13.21)
+CONFIG_0 (62.531017 bps), frame_size: 10 Bytes / 84 bits / 4 non-byte-aligned bits
+```
+
+Both overrides applied; mercury continued to mode dispatch normally.
+`mercury.exe` 25 526 641 bytes (+31 008 vs §7.13.19 binary). BREAK
+regression test (§7.13.18) still PASS 3/3.
+
+#### §7.13.21.4 Calibration procedure (executed under §7.13.22)
+
+1. Deploy this build to both Pis (`tools/mercury_deploy_rpi.py`).
+2. LOCK butler, set IONOS `WGN:40` (cleanest channel; the level meter
+   should not be biased by injected noise).
+3. CMD on rpi2 transmits a fixed-config OFDM stream
+   (`-m TX_RAND -s 10 -n`). Owner reads peak mVp-p on IONOS front
+   panel.
+4. Compute scale: `new_gain = current_gain * (target_mVpp /
+   measured_mVpp)`. Target: ~700-800 mVp-p for OFDM (PAPR clipping
+   ceiling per the recon agent's analysis — not the literal 1000), and
+   ~900-1000 mVp-p for ACK MFSK (lower PAPR, ~3 dB).
+5. SSH-edit `~/.config/mercury/mercury.ini` on rpi2 to add
+   `OFDM_WB = <new_gain>` under `[TxGain]`. Restart mercury, re-read.
+6. Iterate to ±10 % of target while watching `[TX-CLIP]` counter
+   (`audioio.c:670-679` — clip is silently clamped, must check the
+   counter explicitly).
+7. Repeat for `ACK_NB` (the MFSK ACK that owner observed at ~700
+   mVp-p).
+8. Sanity: short win-test re-run at new levels; expect different
+   absolute throughput numbers — these become the new baseline.
+
+#### §7.13.21.5 Not in scope
+
+- TUNE-mode automation: no automated TX TUNE exists in mercury (only
+  the GUI "TUNE" button which emits a continuous 1500 Hz sine for radio
+  level setting by ear, and an Auto-Tune that adjusts `rx_gain` only).
+  Building a per-signal automated TUNE is a separate larger effort.
+- IONOS serial level-read: no documented IONOS verb for input mVp-p
+  exists. Calibration requires the owner at the front panel until
+  either an IONOS protocol extension or a scripted RECORD-side
+  workaround is built.

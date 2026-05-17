@@ -1390,6 +1390,24 @@ start_modem:
                telecom_system.ofdm_defer_overflow_enabled ? "on" : "off");
     }
 
+    // Apply per-signal tx_gain overrides from INI [TxGain] section (plan §7.13.21).
+    // Only non-NaN entries override; absent INI keys leave the code defaults from
+    // cl_telecom_system::init_tx_gain_defaults() unchanged. Logged per override
+    // so the calibration trail lives in the process log alongside [TX-GAIN].
+    {
+        // tx_signal_type enum is MFSK_1S=0, MFSK_2S=1, OFDM=2, ACK=3, BREAK=4
+        // (telecom_system.h:53-60) — matches MercurySettings::tx_gain_override
+        // [s][m] index order.
+        for (int s = 0; s < MercurySettings::TX_GAIN_NSIG; s++) {
+            for (int m = 0; m < MercurySettings::TX_GAIN_NMODE; m++) {
+                double v = g_settings.tx_gain_override[s][m];
+                if (!std::isnan(v)) {
+                    telecom_system.set_tx_gain((tx_signal_type)s, m, v);
+                }
+            }
+        }
+    }
+
     if (list_modes)
     {
         for (int i = 0; i < NUMBER_OF_CONFIGS; i++)
