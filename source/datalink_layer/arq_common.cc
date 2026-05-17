@@ -4017,7 +4017,25 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	// Full-length OFDM frame on the data configuration (NOT the MFSK ack
 	// config — SACK_RSP carries real LDPC-coded payload).
 	telecom_system->set_mfsk_ctrl_mode(false);
-	pad_messages_batch_tx(control_batch_size);
+	// SACK_DESIGN_A_PLAN §7.13.25 (DSP iter 2): send the SACK_RSP frame
+	// TWICE back-to-back. Each is an independent OFDM+LDPC attempt; if the
+	// first fails decode the CMD polling loop reads the second from the
+	// same audio window and re-attempts via the receive() / decode_sack_v2_frame()
+	// path at arq_commander.cc:1846 / :1928. Two independent attempts at
+	// per-frame decode probability p give 1-(1-p)^2 effective success.
+	//
+	// Motivation: §7.13.24 calibrated-battery measurements showed sackv2
+	// underperforming when SACK_RSP fails — CFG15 clean retx_rate=0.57
+	// (data drop ~1/25 -> SACK_RSP drop -> full-batch retx cascade),
+	// MPM:16 retx_rate=0.91 (multipath collapses single-frame SACK_RSP).
+	// Doubling the SACK_RSP frame only costs SACK_RSP wire time (no
+	// impact on clean cells where SACK_RSP doesn't fire) and gives
+	// the next-batch recovery path the redundancy it needs.
+	//
+	// Wire-time cost: ~480 ms -> ~960 ms at WB_CFG10. Within the CMD
+	// post-TX ACK timeout (sack_lossy_ab.py runs see 4970-7696 ms windows
+	// per [RSP-TIMEOUT] log line).
+	pad_messages_batch_tx(2);
 
 	auto t_start = std::chrono::steady_clock::now();
 	send_batch();

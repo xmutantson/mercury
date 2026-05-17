@@ -3532,6 +3532,16 @@ void cl_arq_controller::finalize_block_commander()
 			{
 			gear_shift_blocked_for_nBlocks++;
 			// Reset downshift failure counter on any good block
+			//
+			// SACK_DESIGN_A_PLAN §7.13.24: a decay variant (counter--) was tried
+			// and REVERTED — it triggered axis=1 ladder_down too early in an
+			// SNR descent, hit the axis-1 cooldown, and then BREAK (a separate
+			// failsafe that pre-fix carried the descent the rest of the way)
+			// stopped firing because some shared state was disturbed. Measured
+			// outcome: bps dropped to 0 at WGN:28 (vs WGN:24 pre-fix) and link
+			// never reached ROBUST_0 floor. The original strict-reset is the
+			// right policy until the interaction with BREAK descent is
+			// understood and the cooldown is rethought.
 			if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
 				gear_shift_down_consecutive_fails = 0;
 			if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage && gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total)
@@ -3661,7 +3671,10 @@ void cl_arq_controller::finalize_block_commander()
 void cl_arq_controller::policy_evaluate_axis1()
 {
 	gear_shift_blocked_for_nBlocks++;
-	// Reset downshift failure counter on any good block
+	// Reset downshift failure counter on any good block.
+	// SACK_DESIGN_A_PLAN §7.13.24 reverted — see comment on the parallel
+	// site in the legacy ladder above. Strict-reset is the right policy
+	// until the interaction with BREAK descent is understood.
 	if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
 		gear_shift_down_consecutive_fails = 0;
 
