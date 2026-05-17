@@ -1781,12 +1781,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				MUTEX_LOCK(&capture_prep_mutex);
 				telecom_system->data_container.frames_to_read = 0;
 				MUTEX_UNLOCK(&capture_prep_mutex);
-				// §7.13.27 Fix C — suppress OFDM-FAIL anti-spin during the
-				// SACK_RSP receive window so frame 2 of §7.13.25 double-shot
-				// survives if frame 1's LDPC decode fails inside receive().
-				in_sack_v2_window = true;
 				this->receive();
-				in_sack_v2_window = false;
 				if(messages_rx_buffer.status == RECEIVED
 				   && messages_rx_buffer.type == SACK_RSP)
 				{
@@ -1921,13 +1916,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							MUTEX_LOCK(&capture_prep_mutex);
 							telecom_system->data_container.frames_to_read = 0;
 							MUTEX_UNLOCK(&capture_prep_mutex);
-							// §7.13.27 Fix C — suppress OFDM-FAIL anti-spin during
-							// the SACK_RSP receive window so frame 2 of §7.13.25
-							// double-shot survives if frame 1's LDPC decode fails
-							// inside receive().
-							in_sack_v2_window = true;
 							this->receive();
-							in_sack_v2_window = false;
 							if(messages_rx_buffer.status == RECEIVED
 							   && messages_rx_buffer.type == SACK_RSP)
 							{
@@ -2033,13 +2022,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// ACK-pattern detection / timeout-driven retransmit,
 							// exactly as if the control frame had been lost in
 							// the air.
-							// §7.13.27 Fix C — suppress OFDM-FAIL anti-spin during
-							// the SACK_RSP receive window so frame 2 of §7.13.25
-							// double-shot survives if frame 1's LDPC decode fails
-							// inside receive().
-							in_sack_v2_window = true;
 							this->receive();
-							in_sack_v2_window = false;
 							if(messages_rx_buffer.status == RECEIVED
 							   && messages_rx_buffer.type == SACK_RSP)
 							{
