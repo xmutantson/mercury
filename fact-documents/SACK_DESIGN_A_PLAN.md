@@ -6460,7 +6460,12 @@ would amortize properly.
   `messages_control.status = ACKED` before triggering the handler
   and verify post-BREAK it returns to FREE. The walk-based proof is
   sufficient for now but the unit test would catch any future
-  regression instantly.
+  regression instantly. **CLOSED in §7.13.18 below — static-source
+  regression test added at `mercury/tools/test_break_handler_reset.py`.
+  A true runtime unit test would require extracting the one-line
+  reset into a standalone function purely for testability, which is
+  over-abstraction for the value gained; the static check covers the
+  actual regression vector (someone removing the line).**
 
 ### §7.13.16 RESULT — Phase-1 retry refresh-policy investigation (2026-05-16)
 
@@ -6482,3 +6487,228 @@ on no-`-R`) is no longer reachable. Action: ready-for-review
 comment-only diff at line 1318 documenting the WHY (the existing
 comment only documents the WHAT). No source edit applied. Full
 analysis in `EMERGENCY_PREVIOUS_CONFIG_INVESTIGATION.md`.
+
+### §7.13.17 RESULT — Post-Bug-D formal win-test re-run (2026-05-16)
+
+Follow-up from §7.13.14 (formal re-validation of ship gates after Bug D
+fix — the V6 walk proved BREAK recovery but the §7.13.11 12-run grid
+hadn't been re-run with Bug D in the binary). Pre-Bug-D §7.13.11
+win-test passed; this re-run confirms gates still pass with Bug D
+(`1acdb3c`) plus the post-D documentation/cleanup commits (`04a8438`,
+`e10b962`, both runtime-no-op) applied on top.
+
+#### §7.13.17.1 Re-run methodology
+
+Same 12-run grid as §7.13.11 (3 runs × 2 modes × 2 cells, WB_CFG10, 180 s
+each). First attempt flaked: stale butler lease (2307 s held) + Pi-side
+mercury holdover wedged the harness mid-grid. Clean `sackv2` r1 = 952.8
+bps succeeded; r2/r3 connect-failed; `wgn32` aborted with `BUSY` LOCK.
+Evidence preserved at `mercury/fact-documents/postD_wintest/`.
+
+To harden the re-run, added `tools/sack_lossy_ab_wrapper.py`:
+
+- **Pre-flight**: force-`UNLOCK` any stale butler lease, `killall -9 mercury`
+  on both Pis before each point.
+- **Per-point invocation**: one `sack_lossy_ab.py` subprocess per channel
+  point so a failure in `wgn32` doesn't lose `clean`.
+- **Retry-once**: if any cell has fewer than `--min-valid-per-cell` runs
+  with `bps>0`, re-run the whole point after fresh pre-flight (prior
+  attempt JSON archived to `*_attemptN.json`).
+- **In-process gate evaluation**: prints the 5 hard gates and exits
+  non-zero on any FAIL.
+
+Execution split (transient subagent-foreground regression mid-session):
+`clean` cell ran the bare harness directly (lease-clean baseline);
+`wgn32` cell ran through the new wrapper. Both cells used identical
+harness parameters; the methodological difference is mechanical (extra
+pre-flight + gate eval in the wgn32 path).
+
+#### §7.13.17.2 Results
+
+| point | mode   | n | mean (bps) | sigma | failures | retx_rate | ldpc_miscor |
+|-------|--------|---|-----------:|------:|---------:|----------:|------------:|
+| clean | sackv2 | 3 |      952.8 |   0.0 |        0 |       0.0 |           0 |
+| clean | nosack | 3 |      833.7 |   0.0 |        0 |       0.0 |           0 |
+| wgn32 | sackv2 | 3 |      952.8 |   0.0 |        0 |       0.0 |           0 |
+| wgn32 | nosack | 3 |      833.7 |   0.0 |        0 |       0.0 |           0 |
+
+Δ post-Bug-D: clean +119.1 bps (+14.3 %), wgn32 +119.1 bps (+14.3 %).
+σ = 0 bps across all 12 runs — the bitwise-determinism property of the
+Pi CPU-opts path (see `memory/pi_cpu_opts_and_cfg16.md`) continues to
+hold end-to-end.
+
+#### §7.13.17.3 Ship-gate verdict
+
+```
+[clean] G1 mean   : sackv2=952.8  nosack=833.7  Δ=+119.1 (+14.3%)  PASS
+[clean] G2 crashes: sackv2_failures=0                              PASS
+[clean] G3 miscor : sackv2_ldpc_miscorrections=0                   PASS
+[clean] G4 sigma  : sackv2_sigma=0.0 (0.0% of mean) thresh=10.0%   PASS
+[clean] G5 retx   : sackv2=0.0000 nosack=0.0000 Δ=+0.0000          PASS
+[wgn32] G1 mean   : sackv2=952.8  nosack=833.7  Δ=+119.1 (+14.3%)  PASS
+[wgn32] G2 crashes: sackv2_failures=0                              PASS
+[wgn32] G3 miscor : sackv2_ldpc_miscorrections=0                   PASS
+[wgn32] G4 sigma  : sackv2_sigma=0.0 (0.0% of mean) thresh=10.0%   PASS
+[wgn32] G5 retx   : sackv2=0.0000 nosack=0.0000 Δ=+0.0000          PASS
+
+VERDICT: PASS
+```
+
+Closes the post-Bug-D formal re-validation backlog item carried from
+§7.13.14. §7.13.14.7 #2 (BREAK-boundary deterministic unit test) remains
+open; it is a defense-in-depth regression catcher, not a re-validation
+gate.
+
+#### §7.13.17.4 Comparison to pre-Bug-D §7.13.11
+
+| cell  | pre-D sackv2 | post-D sackv2 | pre-D nosack | post-D nosack | pre-D Δ% | post-D Δ% |
+|-------|-------------:|--------------:|-------------:|--------------:|---------:|----------:|
+| clean |        923.0 |         952.8 |        816.0 |         833.7 |   +13.1% |    +14.3% |
+| wgn32 |        952.8 |         952.8 |        815.9 |         833.7 |   +16.8% |    +14.3% |
+
+- `wgn32 / sackv2` is bitwise-identical pre/post (952.8) — Bug D's RSP
+  BREAK fix has zero side effect on clean-channel sackv2 throughput, as
+  predicted (the fix only changes behavior when the RSP control slot is
+  non-FREE at the moment BREAK fires; in a healthy session that slot is
+  FREE between batches).
+- `nosack` improved in both cells (~17 bps). Within channel-of-day
+  variance; the nosack path doesn't touch the Bug D codepath.
+- Delta narrowed slightly on `wgn32` (+16.8 % → +14.3 %) — nosack
+  improved more than sackv2 in that cell. Still well above the +5 %
+  significance line.
+
+**Limitation**: WGN:32 at WB_CFG10 does not actually fire any SACK
+events (`n_cmd_sack_events = 0` across all 6 sackv2 runs). WB_CFG10 is
+robust enough that WGN:32 stays loss-free; the sackv2 win here comes
+from cycle-time differences (sackv2 cycles ≈ 15 s vs nosack ≈ 9 s but
+fewer batches/run when SACK is on — see `batch_cycle_ms_all` in run
+JSONs), not from SACK recovery. The actual BREAK recovery behavior is
+exercised by the SNR walk (§7.13.14.5, `axis_walk_v6_postfix_desc/`),
+not by this grid.
+
+#### §7.13.17.5 Artifacts
+
+- Merged results: `mercury/fact-documents/postD_wintest_v2/results_merged.json`
+- Per-point JSONs: `results_clean.json`, `results_wgn32.json`
+- Per-run logs: `results_clean_logs/`, `results_wgn32_logs/`
+- Runner logs: `runner.log` (clean), `runner_wgn32.log` (wgn32 + gate verdict)
+- Wrapper source: `tools/sack_lossy_ab_wrapper.py`
+- Prior flake evidence: `mercury/fact-documents/postD_wintest/`
+- Prior partial-wgn32 (5/6 runs from interrupted wrapper attempt):
+  `postD_wintest_v2/results_wgn32_partial.json`, `results_wgn32_partial_logs/`
+
+#### §7.13.17.6 Known wrapper rough edges (low-priority follow-ups)
+
+- `sack_lossy_ab.py:798` SUMMARY footer still uses the legacy `_sack`
+  key, so when `--modes sackv2,nosack` is used it prints `SACK 0.0` even
+  though the actual data lives under `_sackv2`. The wrapper's SHIP-GATES
+  block uses the correct key, so the verdict is unaffected — cosmetic.
+- Wrapper invokes the harness via `subprocess.run` with inherited
+  stdout; through a `tee` pipe this block-buffers, so a mid-grid crash
+  loses in-flight diagnostic output (the on-disk JSON is unaffected
+  because the harness `flush()`es every run). Mitigation: invoke the
+  wrapper with `python -u` or pass `flush=True` to wrapper prints. The
+  successful wgn32 wrapper run flushed normally at exit.
+
+### §7.13.18 RESULT — BREAK-boundary regression test added (2026-05-16)
+
+Closes §7.13.14.7 #2.
+
+`mercury/tools/test_break_handler_reset.py` is a static-source regression
+test that asserts:
+
+1. `arq_responder.cc` BREAK handler block contains the Bug-D fix
+   (`messages_control.status = FREE;`). Anchored on
+   `if(break_detected == YES && link_status == CONNECTED)` with a 40-line
+   window to span the printf + force-FREE + send_ack_pattern +
+   load_configuration without false-positive on neighbouring code.
+2. `arq_commander.cc` CMD-side BREAK-ACK handler #1 force-FREE is present
+   (anchored on the comment `cleanup() skips PENDING_ACK status`, 5-line
+   window).
+3. Same for CMD-side handler #2.
+
+The two CMD-side parallels are included not because they regressed (they
+have been in source for a long time) but because they establish the
+documented pattern — Bug D was the missing RSP-side mirror. Failing one
+of these would mean someone removed a load-bearing line on the commander
+side; failing #1 means Bug D itself was re-introduced.
+
+Design rationale (why static, not runtime): the BREAK reset is a single
+assignment statement inline in a private method (`process_messages_rx_data_control()`).
+Exercising it from a freestanding test main like
+`mercury/tools/test_idle_energy_gate.cc` would require either extracting
+the one line into a function purely for testability, or instantiating a
+full `cl_arq_controller` (which init()s telecom system, audio device,
+sockets, and large ringbuffers). The actual regression vector is
+deletion / accidental refactor of the line, which a presence-check
+captures more directly than a heavy mock would. The walk-based runtime
+evidence in §7.13.14.5 (`axis_walk_v6_postfix_desc/`) remains the
+behavioural proof; this test is a fast-feedback static guard.
+
+Verification: test runs locally and reports `3 passed, 0 failed`. Run:
+
+```
+python mercury/tools/test_break_handler_reset.py
+```
+
+Exits 0 on PASS, 1 on FAIL. No build required; no hardware required;
+no butler required. Suitable for pre-commit / CI.
+
+#### §7.13.18.1 Artifact
+
+- `mercury/tools/test_break_handler_reset.py` (130 lines)
+
+### §7.13.19 RESULT — Bug B latent corollary defensive guard (2026-05-16)
+
+Bug B (commit `e73968a`) called out a latent corollary at
+`arq_commander.cc:836` and `arq_commander.cc:951` (post-Step-15 they
+are at `arq_commander.cc:836` and `arq_commander.cc:970`): both `memcpy`
+into `messages_batch_tx[counter].data` assuming it is non-NULL. In
+production today this is never reached with `.data == NULL` because
+every code path entering the CMD retransmit loop has first executed a
+struct-copy at `arq_commander.cc:590` / `:655` / `:992` / `:1025` (one
+of `messages_batch_tx[i] = messages_control` or `= messages_tx[i]`)
+that inherits a valid `.data` pointer from the source slot. The
+asymmetry is real though: `messages_batch_tx[i].data` is the only
+batch-array `.data` that is NULL at init
+(`arq_common.cc:1525` vs `:1431`, `:1460`, `:1495`, `:1550`).
+
+Defensive guard added at both sites: if `.data` is NULL when entering
+the retx loop body, print a diagnostic `[CMD-LATENT-GUARD]` line citing
+this fact-doc section and `continue` (skip that retx slot rather than
+SIGSEGV). The skipped frame stays in the retransmit queue and is
+re-attempted on the next ack cycle.
+
+**Lazy-alloc rejected** as the defensive pattern. The natural lazy-
+alloc (`if NULL: data = new char[…]`) leaks the freshly-allocated
+buffer the next time a struct-copy at `:590` / `:655` / `:992` /
+`:1025` overwrites the `.data` pointer with the source slot's pointer.
+The underlying anti-pattern — `messages_batch_tx[i].data` is the sole
+batch-array slot with a NULL init that relies on struct-copy pointer
+inheritance — would require a wider refactor to fix cleanly (either
+pre-allocate at init and stop sharing pointers via struct-copy, or
+track buffer ownership per slot). That is out of scope for a defensive
+patch; the guard converts the SIGSEGV failure mode into a logged skip
+without changing any allocation semantics.
+
+Build: `bash build.sh o3` clean (`mercury.exe` 25 495 589 bytes,
+pre-existing sign-compare warning at `arq_commander.cc:1758` unchanged
+by this patch).
+
+Reproducibility note: the BREAK regression test (`§7.13.18`) still
+passes (3/3) after this edit — the guard sits upstream of the BREAK
+handler anchors so line numbers shift but the assertion windows are
+large enough to absorb the drift.
+
+#### §7.13.19.1 Open follow-ups (separate work)
+
+- Wider refactor of `messages_batch_tx[i].data` allocation. The
+  pointer-sharing-via-struct-copy idiom is fragile (every `memcpy` into
+  `messages_batch_tx[i].data` is also writing through the source slot's
+  buffer; correctness today relies on the implicit invariant that the
+  source slot's frame has been delivered and its buffer is reusable).
+  A clean fix is either (a) pre-allocate per-slot buffers in init and
+  switch struct-copies to field-by-field assignments that exclude
+  `.data`, or (b) track buffer ownership with an explicit flag. Not
+  doing either today — pure cleanup, no current bug, and either choice
+  needs a larger validation cycle than this guard.
