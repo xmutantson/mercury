@@ -7071,3 +7071,115 @@ success an hour earlier.
 The narrowed root cause: **mercury's ALSA capture on rpi1 specifically,
 returning ~20 % of windows correctly and ~80 % near-silence, even though
 the audio is present at the wire.**
+
+### §7.13.23 RESULT — Calibration completed, "regression" was a test-script bug (2026-05-17)
+
+Owner power-cycled the Pis and IONOS. Same `sack_lossy_ab.py --runs 1
+--duration 60 --modes nosack --points clean` regression check passed
+cleanly (`bps=714.6, conn=True, err=None`) → confirms IONOS, hardware,
+and shipped mercury were never broken.
+
+**The "regression" in §7.13.22 was a bug in the ad-hoc ARQ test script,
+not in any component.** Cross-referencing `tools/sack_lossy_ab.py:529-534`
+showed that the harness sends `MYCALL TESTB` + **`LISTEN ON`** on the
+responder control port BEFORE the commander's `MYCALL TESTA` +
+`CONNECT TESTA TESTB`. Without `LISTEN ON`, the responder sits in Idle
+state — not in `connection_status = LISTENING` — and never processes
+incoming HAIL beacons even though the audio capture is fine and the
+signal is present at the wire (as `arecord` confirmed in §7.13.22.7).
+
+Once `LISTEN ON` was added to the ad-hoc reproduction, CONNECT
+established in **5.9 s** (3 PTT cycles) at the same baseline that had
+been "failing" all evening. The `0.055 FS` periodic spike in §7.13.22.7
+was real HAIL energy being captured correctly — there was just nobody
+home on rpi1 to detect-and-respond to it.
+
+#### §7.13.23.1 Calibration completed
+
+With ARQ working, calibration proceeded per the owner's suggestion to
+use ROBUST_0 (config 100, pure MFSK) on `TX_RAND` rather than chasing
+ACK bursts inside an ARQ session. `tx_gain[TX_SIG_MFSK_1S]` shares the
+default 5.24 with `[TX_SIG_ACK]` and `[TX_SIG_BREAK]`, so calibrating
+MFSK_1S also calibrates ACK + HAIL + BREAK. Procedure:
+
+1. Soundcard boost on both Pis: `numid=10 24,24 → 31,31` (+3.5 dB
+   Lineout, all the headroom), `numid=1 180,180 → 186,186` (+~3 dB
+   PCM). Net +6.4 dB.
+2. `TX_RAND -s 10` on rpi2 → OFDM peak read on IONOS panel: **1000
+   mVp-p** ✓ (target hit; previously calibrated in §7.13.22.1).
+3. `TX_RAND -s 100` on rpi2 (ROBUST_0 / MFSK) → owner read **1450
+   mVp-p** = `5.24 × 2.083 (soundcard) × ~127 mVp-p/unit (calibration
+   constant)` — consistent with the 700 mVp-p baseline scaled by the
+   soundcard +6.4 dB.
+4. Scale needed: `1000 / 1450 = 0.690`. Apply via mercury `[TxGain]`
+   INI override (§7.13.21):
+
+   ```ini
+   [TxGain]
+   MFSK_1S_WB = 3.62      ; 5.24  × 0.690
+   MFSK_1S_NB = 8.09      ; 11.72 × 0.690
+   ACK_WB     = 3.62
+   ACK_NB     = 8.09
+   BREAK_WB   = 3.62
+   BREAK_NB   = 8.09
+   ```
+
+5. Restart `TX_RAND -s 100` → owner read **"right on"** ≈ 1000 mVp-p ✓.
+6. ARQ sanity at calibrated levels: CONNECT in 5.9 s, 50 data frames
+   sent on CMD, 66 received on RSP, 50 ACKs sent (60 s session).
+
+#### §7.13.23.2 Persistence
+
+INI files mirrored to both Pis at `~/.config/mercury/mercury.ini`. The
+INI persists across mercury restarts and Pi reboots (lives on rootfs).
+
+Soundcard settings persisted two ways:
+
+- `sudo alsactl store` run on both Pis — captures current state into
+  `/etc/alsa/state.conf` for restoration on boot.
+- `tools/ionos_butler.py` AUDIO_SETUP constants updated (lines 132-134):
+  `numid=1` baseline lifted 180→186, `numid=10` baseline lifted 24→31.
+  Future butler runs apply the calibrated values by default; the prior
+  baseline values are no longer the "blank slate" to revert to.
+
+Both Pi mercury binaries are at source HEAD (`9294094` deployed; source
+files at `9294094` state — the post-`9294094` commits `eaba2c0`/`507bb54`
+don't touch source/include, only fact-docs).
+
+#### §7.13.23.3 What the calibrated state is
+
+| signal       | mercury gain  | observed mVp-p |
+|--------------|---------------|---------------:|
+| OFDM (WB)    | 1.0           |          1000 |
+| MFSK_1S (WB) | 5.24 → 3.62   |          1000 |
+| ACK (WB)     | 5.24 → 3.62   |    same as MFSK |
+| HAIL         | 5.24 → 3.62   |    same as MFSK |
+| BREAK        | 5.24 → 3.62   |    same as MFSK |
+| MFSK_1S (NB) | 11.72 → 8.09  | not measured |
+| ACK (NB)     | 11.72 → 8.09  | not measured |
+
+NB row values are extrapolated by the same 0.690 scale; not directly
+measured in this session. If NB modes are exercised, verify on panel.
+
+Soundcard mixer (both Pis):
+- `numid=10` Lineout Playback Volume: **31,31** = 0 dB (max)
+- `numid=1` PCM Playback Volume: **186,186** ≈ +3 dB from 180 baseline
+
+#### §7.13.23.4 Sanity gate before next benchmark
+
+The §7.13.17 win-test results (clean sackv2 = 952.8 bps, wgn32 sackv2 =
+952.8 bps) were measured at the OLD soundcard baseline (24,24 / 180,180).
+**Those numbers are not directly comparable to anything measured at the
+new calibrated baseline.** A fresh win-test re-run at the calibrated
+levels would establish the new reference; the win-test methodology
+(`tools/sack_lossy_ab_wrapper.py` + `tools/sack_lossy_ab.py`) is
+unchanged.
+
+#### §7.13.23.5 Closes / supersedes
+
+- §7.13.22.3-9 — the "rpi1 capture intermittency" diagnosis is
+  superseded. There was no capture bug; the ad-hoc reproduction script
+  was missing `LISTEN ON` on the responder. Mercury, IONOS, hardware,
+  and the §7.13.21 INI hook were all behaving correctly throughout.
+- `ionos_audio_level_backlog.md` (memory) — calibration backlog item is
+  done.
