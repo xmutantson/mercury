@@ -1868,11 +1868,32 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 							if(ack_pat_hit)
 							{
-								v2_ack_pat_pre_detected = true;
-								printf("[CMD-SACK-V2-ACKPAT-FAST] legacy ACK pattern pre-detected in v2 SACK window — skipping further this->receive() to preserve audio\n");
+								// Fix A (§7.13.27 SACK_DESIGN_A_PLAN): the FAST
+								// cross-check above does exactly ONE this->receive()
+								// call. If the first SACK_RSP frame is not yet
+								// decodable (audio still being captured / partially
+								// in the ring), receive() returns no SACK_RSP and
+								// the old behavior here was to set
+								// v2_ack_pat_pre_detected=true — committing to the
+								// MFSK ACK detection as if it were real and burning
+								// frame 2 of the §7.13.25 SACK_RSP double-shot.
+								//
+								// Instead, defer: set frames_to_read=2 so the
+								// capture thread fills the ring with ~2 more
+								// symbols, and return so the outer poll loop
+								// re-enters sack_window_open on its next ~2ms
+								// cadence. The SLOW path at :1928 then gets a
+								// second chance with a fuller buffer that may
+								// contain SACK_RSP frame 1 OR frame 2.
+								//
+								// v2-only by construction: this entire block is
+								// inside if(sack_v2_enabled). v1 sessions never
+								// reach here (Step 15 deleted the v1 SACK path).
+								telecom_system->data_container.frames_to_read = 2;
+								telecom_system->data_container.nUnder_processing_events = 0;
+								printf("[CMD-SACK-V2-ACKPAT-FAST] legacy ACK pattern pre-detected but FAST cross-check found no SACK_RSP — deferring (frames_to_read=2) so outer loop can re-enter SACK window on next poll\n");
 								fflush(stdout);
-								// sack_detected stays false → fall straight through
-								// to the existing ACK-pattern handler at :1898+.
+								return;
 							}
 						}
 						// Bug A fix (§7.13.1) defense-in-depth: even if the ACK
