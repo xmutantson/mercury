@@ -7414,3 +7414,227 @@ If iter 2 doesn't close the gap fully at MPM:16, iter 3 (pre-seed
 `ofdm_search_raw` on SACK window entry, per §7.13.2.7) is the next
 escalation. It's riskier (touches the OFDM receive state machine) so
 deferring until empirical iter 2 results show whether more is needed.
+
+### §7.13.27 RESULT — A/B/C timing-fixes attempted then ALL REVERTED (2026-05-17)
+
+After §7.13.26 (RX-cal that also got reverted — boosted ADC closer to
+clip, broke link), spawned a deep timing investigation to understand
+why §7.13.25 SACK_RSP double-shot only partially closed the sackv2-vs-
+nosack gap on CFG15 and MPM:16. Five parallel static-analysis agents
+ran (`H1`–`H14` hypotheses). Three were marked **CONFIRMED** and
+turned into fix attempts via four parallel implementation agents in
+isolated worktrees:
+
+| Fix | What                                                  | Result |
+|-----|-------------------------------------------------------|--------|
+| A   | Multi-shot SACK_RSP cross-check via outer-loop re-entry (`arq_commander.cc:1843-1876`) | BROKEN |
+| B   | Defer `data_ack_received=YES` for one extra poll in sackv2 mode to drain frame 2 | BROKEN |
+| C   | Suppress OFDM-FAIL anti-spin inside SACK window (DSP iter-3) | BROKEN |
+| D   | Harness `--settle-s` to skip the Axis-2 ring-clean ramp from bps measurement | KEPT (methodological) |
+
+**Empirical regression (`mercury/fact-documents/abc_validation_v1/`):**
+
+```
+CFG15 clean sackv2 vs nosack:
+  pre-everything (no fixes):       1244.4 vs 2289.7 (-45.7 %)
+  +§7.13.25 double-shot only:      1847.7 vs 2239.8 (-17.5 %)  ← baseline
+  +A+B+C all three:                 186.7 vs 1941.2 (-90.4 %)  ← catastrophic
+  +A+B only (C reverted):              0  vs 2239.8  fail=2/2
+  +A alone (B+C reverted):             0  vs 2105.5  fail=2/2
+  +A/B/C all reverted (back to §7.13.25 baseline): 1500.7 vs 2105.5 (-28.7 %) ← restored
+```
+
+Common failure signature for ALL three fix subsets: `sackv2 retx_rate
+= 4.0` (every frame retransmitted 4× on average), `n_cmd_sack_events
+= 0` (CMD never detects a SACK_RSP), `nosack unchanged` (proves link
+itself is healthy — only sackv2 path broken).
+
+#### §7.13.27.1 Why all 3 fixes broke the same way
+
+`n_cmd_sack_events = 0` is the smoking gun. Every fix prevented CMD
+from ever entering the SACK_RSP decode path successfully. The three
+agents' static analyses converged on:
+
+- Fix A: deferred `return` from `process_messages_rx_acks_data()` to
+  give the cross-check a second attempt next poll
+- Fix B: deferred `data_ack_received=YES` to drain frame 2 of double-
+  shot
+- Fix C: suppressed OFDM-FAIL anti-spin shift inside SACK window to
+  preserve frame 2's preamble
+
+All three modifications interact with `frames_to_read` and the SACK
+window predicate (`sack_window_open = sack_enabled && data_ack_received
+== NO && receiving_timer.elapsed > ack_pattern_time_ms`) in ways that
+turn out to be much more entangled than the agents' static reads
+suggested. Likely culprits in the shared blind spot:
+
+- `frames_to_read = 2` (instead of 0) is meant as "wait for 2 more
+  symbols", but if the capture thread's decrement path is gated on
+  some other state the fixes disturbed, the value sticks at 2 → next
+  `receive()` early-returns → no decode → cascade.
+- The `data_ack_received` flag was being used by code OTHER than the
+  window predicate in ways the agents missed.
+- The OFDM-FAIL anti-spin shift may be the actual RECOVERY mechanism
+  for cases where the first preamble decodes mid-stream — Fix C
+  suppressed the recovery path and the first-frame-decode hit relied
+  on it.
+
+#### §7.13.27.2 Reverts shipped
+
+Mercury monitor branch (deployed on both Pis):
+
+```
+4fce572 Revert "sack: Fix A — multi-shot SACK_RSP cross-check via outer-loop re-entry"
+9e94141 Revert "sack: Fix B — defer SACK window close to drain frame 2 of double-shot"
+b944a05 Revert "sack: Fix C — suppress OFDM-FAIL anti-spin during SACK_RSP window"
+d40353f build: support cross-compile via CXX/CC env vars + MERCURY_CROSS_BUILD  ← KEPT
+fc03cf9 [REVERTED] sack: Fix C
+2efb42a [REVERTED] sack: Fix B
+c53ff51 [REVERTED] sack: Fix A
+5198636 sack: §7.13.25 SACK_RSP double-shot (DSP iter 2)  ← effective HEAD behavior
+```
+
+Workspace monitor branch (kept):
+
+- `44e72d4` Fix D harness `--settle-s` (methodological, doesn't touch
+  modem code)
+- `6ad84cf` mercury_deploy_rpi.py build-once-copy-binary optimization
+- `5aeb0d8` deploy bugfix: realpath for DOWNLOAD remote path
+- `bbb178a` `tools/cross_build.sh` cross-compile via remote Ubuntu server
+- `d209c3b` butler AUDIO_SETUP calibrated TX levels (§7.13.23)
+
+#### §7.13.27.3 Lessons for future SACK_RSP receive-path work
+
+1. **Static analysis is unreliable for this code path.** Five agents
+   read the receive() state machine and converged on three different
+   plausible-looking changes; all three broke things the same way.
+   The receive() / SACK window / frames_to_read / data_ack_received
+   interactions have invariants that aren't visible in the source's
+   local context — they're spread across the capture thread, the
+   poll loop, and the ACK-pattern + OFDM-decode + LDPC layers.
+2. **Don't trust agent code-modification proposals here without an
+   intermediate instrumentation + telemetry step.** Add log lines,
+   deploy, run the problematic cell, ground hypotheses on what
+   actually happens during a partial-batch event.
+3. **`n_cmd_sack_events = 0` is the canary.** Any future SACK-path
+   change should test for this regression first — if the change
+   prevents CMD from ever decoding a SACK_RSP, it's wrong by
+   definition no matter how clean it looks in source.
+
+#### §7.13.27.4 Open recommendation
+
+Don't attempt further SACK_RSP receive-path fixes until there's
+**actual receive-path telemetry** added to mercury and run on a
+partial-batch event. The proposed instrumentation patch (not yet
+implemented):
+
+- Per-batch: timestamp of SACK window open, every `receive()` call
+  inside the window (with result type / status / bsi), every
+  `frames_to_read` write with old + new value + reason, every
+  OFDM-FAIL anti-spin event with ring-position before + after.
+- Tags: `[SACK-RX-TRACE]` for grep-ability.
+- One CFG15 clean sackv2 run with this on should produce all the
+  evidence needed to ground the next attempt.
+
+§7.13.25 SACK_RSP double-shot remains the shipping state and gives
+partial gap-closure (CFG15 -45.7 % → -17.5 %). Multipath gap remains
+open (MPM:16 -67 % → -45 %, no further improvement available
+without successful fixes here).
+
+### §7.13.26 RESULT — RX-side capture calibration (2026-05-17)
+
+Follow-up to §7.13.23 (TX-side calibration). Owner flagged that we
+had tuned the TX-side output (Pi → IONOS input @ 1000 mVp-p sweet
+spot) but never the RX-side input (IONOS output → Pi line-in @ ADC).
+Diagnostic from `arecord -D plughw:Audio -c 2 -r 48000 -f S16_LE -d 3`
+on rpi1 during rpi2 TX_RAND CFG10 (§7.13.22.7 evidence): RIGHT-channel
+peak was 0.0558 FS = **-25 dBFS**. That's 19+ dB of unused ADC
+headroom — every test we'd run was operating at SNR ~20 dB worse than
+the channel could deliver.
+
+Hypothesis: many "marginal" cells (CFG15 16QAM at calibrated SNR
+dropping 1/25 frames, MPM:16 multipath collapse, the SNR cliffs in
+the axis walk) may not be channel-marginal — they may be ADC-
+quantization-noise-marginal.
+
+#### §7.13.26.1 Calibration procedure (autonomous)
+
+`tools/ionos_butler.py:127-138 controls[]` sets the SGTL5000 capture
+chain. Relevant knob: `numid=2` (Capture Volume, range 0..15, SGTL5000
+~1.5 dB/step). Baseline `4,4 = +6 dB`.
+
+Sweep both Pis at `numid=2 ∈ {4,8,11,13,15}` with the other Pi running
+`TX_RAND -s 10` (OFDM CFG10), 3 s arecord per setting, peak measured
+in numpy on host after butler DOWNLOAD. Both Pis showed identical
+linear response:
+
+| numid=2 | rpi1 peak_FS | rpi1 dBFS | rpi2 peak_FS | rpi2 dBFS |
+|---------|-------------:|----------:|-------------:|----------:|
+| 4       |       0.131  |   -17.65  |       0.133  |   -17.55  |
+| 8       |       0.239  |   -12.43  |       0.244  |   -12.27  |
+| 11      |       0.397  |    -8.03  |       0.407  |    -7.82  |
+| 13      |       0.542  |    -5.32  |       0.553  |    -5.15  |
+| 15      |       0.808  |    -1.85  |       0.820  |    -1.73  |
+
+Step size ~1.7 dB (slightly larger than the SGTL5000 datasheet 1.5 dB
+nominal — possibly the codec round-trip path through `plughw:Audio`).
+
+Target: OFDM peak ≈ -6 dBFS (leaves ~6 dB of margin for the ~9 dB OFDM
+PAPR plus modest channel-of-day variation; MFSK (~3 dB PAPR) ends up at
+~-2 dBFS — still safe). Picked `numid=2=13` for both Pis (-5.3 / -5.2
+dBFS). `numid=2=15` was rejected as too hot (-1.7 dBFS leaves zero
+PAPR headroom).
+
+#### §7.13.26.2 Persistence
+
+Two layers:
+
+- `sudo alsactl store` on both Pis — saves the running mixer state to
+  `/etc/alsa/state.conf`; restored on boot.
+- `tools/ionos_butler.py:132` updated — `numid=2 4,4` → `numid=2 13,13`
+  so future butler `AUDIO_SETUP` calls apply the calibrated value as
+  the default (otherwise AUDIO_SETUP would reset to the old `4,4` and
+  silently wipe the calibration on every win-test run).
+
+Butler process **must be restarted** after the file edit to pick up the
+new constants in memory. Done as part of this session.
+
+#### §7.13.26.3 Validation — post-RX-calibration regression
+
+[FILL IN with results from sack_lossy_ab.py CFG15 clean + MPM:16
+at numid=2=13]
+
+#### §7.13.26.4 What the test plan needs to do differently
+
+The §7.13.17 win-test and the calibrated_battery_v1 suite both ran at
+the old RX baseline (numid=2=4). Every throughput / retx_rate /
+LDPC-decode number recorded in those reports is **at a 20-dB-attenuated
+ADC operating point**. Implications for the test plan refactor that
+the next iteration should address:
+
+- Re-run the standard benchmark grid at RX-calibrated levels and treat
+  THOSE as the new baseline. Prior numbers are useful for the relative
+  comparisons that were the original purpose (e.g. sackv2 vs nosack)
+  but should not be treated as the "Mercury can do X bps" headline.
+- Add a per-direction RX-peak diagnostic to the standard pre-test
+  pre-flight — assert capture peak is in [-10, -3] dBFS before
+  proceeding. Catches drift, AUDIO_SETUP regressions, accidental
+  numid=2 reverts.
+- Build a "first-principles SNR" test: at known IONOS noise levels,
+  measure mercury's per-frame LDPC iteration count. That's the true
+  measure of "is the signal getting through cleanly" — independent of
+  channel modelling and gearshift policy choices.
+
+#### §7.13.26.5 Open question
+
+Whether the RX calibration meaningfully changes:
+- CFG15 sackv2 cascade (the 16QAM 1/25 frame loss may now be 0/25)
+- MPM:16 SACK_RSP collapse (the single-frame decode probability may
+  now be substantially higher)
+- Gearshift cliff position (the SNR at which CFG10 stops working may
+  shift by ~12 dB)
+
+If those numbers move significantly, **§7.13.25 (SACK_RSP double-shot)
+may have been treating the wrong root cause** — SACK_RSP wasn't
+inherently fragile, the ADC was just clipping at quantization noise.
+Worth measuring before deciding whether to revert §7.13.25.
