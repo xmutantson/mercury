@@ -646,6 +646,17 @@ public:
                                        // Persists across local_capability resets (CONNECT/LISTEN
                                        // re-entry) so the negotiation survives mid-session resets.
                                        // Default false — byte 5 of TEST_CONNECTION is unchanged.
+  // SACK Design A §7.13.27 Fix C — true ONLY while this->receive() is being
+  // called from inside the CMD-side SACK_RSP receive window (the sack_v2_enabled
+  // branches of process_messages_rx_acks_data). Read by the OFDM-FAIL anti-spin
+  // paths in arq_common.cc::receive() to suppress ring-buffer shifts and
+  // passband-zero on LDPC FAIL so that frame 2 of the §7.13.25 SACK_RSP
+  // double-shot survives long enough for the next poll to decode it.
+  // Set/cleared in arq_commander.cc::process_messages_rx_acks_data only.
+  // ALWAYS false outside the wrap-around-receive() scopes — gate at the read
+  // site is strict AND of (connection_status==RECEIVING_ACKS_DATA,
+  // in_sack_v2_window, sack_v2_enabled) so all three must be true to suppress.
+  bool in_sack_v2_window;
   int radio_batch_size;                // Total frames per radio TX (e.g., 25)
   int crypto_batch_size;               // Frames per encryption unit (e.g., 20)
   int retransmit_headroom;             // radio_batch_size - crypto_batch_size (e.g., 5)

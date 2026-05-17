@@ -136,6 +136,7 @@ cl_arq_controller::cl_arq_controller()
 	// on the CLI. Legacy `--enable-sack-v2` flag still accepted (no-op now,
 	// kept for tool-harness compatibility — see tools/sack_lossy_ab.py).
 	enable_sack_v2=true;     // Step 14: default ON
+	in_sack_v2_window=false; // §7.13.27 Fix C — set only inside CMD SACK_RSP receive window wrappers.
 	radio_batch_size=25;
 	crypto_batch_size=20;
 	retransmit_headroom=5;
@@ -5270,31 +5271,46 @@ void cl_arq_controller::receive()
 
 					if(received_message_stats.frame_data_missing)
 					{
-						// Preamble detected but data symbols are silence.
-						// Zero the stale preamble in the ring to prevent
-						// re-detection (shift_left would have slid it off).
+						// SACK Design A §7.13.27 Fix C — when this receive() is
+						// being driven from the CMD-side SACK_RSP window, the
+						// §7.13.25 double-shot means frame 2's preamble may
+						// already be queued in the ring behind frame 1. Zeroing
+						// frame 1's preamble + resetting ofdm_search_raw would
+						// corrupt the search state and lose frame 2 on the next
+						// poll. Suppress the destructive parts here; the small
+						// ftr throttle still applies so we don't spin.
+						bool fix_c_suppress = (connection_status == RECEIVING_ACKS_DATA
+							&& in_sack_v2_window
+							&& sack_v2_enabled);
+						if(!fix_c_suppress)
 						{
-							int sp = signal_period;
-							int pream_samples = telecom_system->data_container.preamble_nSymb * symbol_period;
-							int pream_ring_start = (rwi + received_message_stats.delay) % sp;
-
-							MUTEX_LOCK(&capture_prep_mutex);
-							for(int k = 0; k < pream_samples; k++)
+							// Preamble detected but data symbols are silence.
+							// Zero the stale preamble in the ring to prevent
+							// re-detection (shift_left would have slid it off).
 							{
-								int pos = (pream_ring_start + k) % sp;
-								telecom_system->data_container.passband_delayed_data[pos] = 0.0;
-								telecom_system->data_container.passband_delayed_data[pos + sp] = 0.0;
+								int sp = signal_period;
+								int pream_samples = telecom_system->data_container.preamble_nSymb * symbol_period;
+								int pream_ring_start = (rwi + received_message_stats.delay) % sp;
+
+								MUTEX_LOCK(&capture_prep_mutex);
+								for(int k = 0; k < pream_samples; k++)
+								{
+									int pos = (pream_ring_start + k) % sp;
+									telecom_system->data_container.passband_delayed_data[pos] = 0.0;
+									telecom_system->data_container.passband_delayed_data[pos + sp] = 0.0;
+								}
+								MUTEX_UNLOCK(&capture_prep_mutex);
 							}
-							MUTEX_UNLOCK(&capture_prep_mutex);
+							telecom_system->receive_stats.ofdm_search_raw = 0;
+							telecom_system->receive_stats.ofdm_batch_active = false;
 						}
 						// Quick retry — 8 symbols (~49ms WB) is enough to skip past
 						// the failed position without waiting a full frame.
 						ftr = 8;
-						telecom_system->receive_stats.ofdm_search_raw = 0;
-						telecom_system->receive_stats.ofdm_batch_active = false;
-						printf("[FTR-INCOMPLETE] pream=%d ftr=%d metric=%.3f\n",
+						printf("[FTR-INCOMPLETE] pream=%d ftr=%d metric=%.3f%s\n",
 							pream_symb, ftr,
-							telecom_system->receive_stats.coarse_metric);
+							telecom_system->receive_stats.coarse_metric,
+							fix_c_suppress ? " sackv2-suppress" : "");
 						fflush(stdout);
 					}
 					else if(pream_symb > upper)
@@ -5528,16 +5544,43 @@ void cl_arq_controller::receive()
 				&& telecom_system->data_container.frames_to_read == 0
 				&& received_message_stats.delay >= 0)
 			{
-				int rx_frame = telecom_system->get_active_nsymb()
-					+ telecom_system->data_container.preamble_nSymb;
-				telecom_system->data_container.frames_to_read = rx_frame;
-				telecom_system->data_container.nUnder_processing_events = 0;
-				int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
-				telecom_system->receive_stats.ofdm_search_raw = buf_nsymb - rx_frame;
-				if(telecom_system->receive_stats.ofdm_search_raw < 0)
+				// SACK Design A §7.13.27 Fix C — when this receive() is being
+				// driven from the CMD-side SACK_RSP window, the §7.13.25 double-
+				// shot means frame 2's preamble may already sit further back in
+				// the ring. The default anti-spin would set frames_to_read =
+				// rx_frame (~32-43 symbols WB) and rewind ofdm_search_raw to
+				// buf_nsymb - rx_frame, sliding the search start across frame 2
+				// and losing it. Suppress: leave frames_to_read at 0 (the
+				// process_messages_rx_acks_data poll loop is the natural
+				// throttle here — it returns to the outer loop every ~2 ms) and
+				// keep ofdm_search_raw / ofdm_batch_active untouched so the
+				// next receive() poll continues scanning forward and lands on
+				// frame 2's preamble.
+				bool fix_c_suppress = (connection_status == RECEIVING_ACKS_DATA
+					&& in_sack_v2_window
+					&& sack_v2_enabled);
+				if(fix_c_suppress)
 				{
-					telecom_system->receive_stats.ofdm_search_raw = 0;
-					telecom_system->receive_stats.ofdm_batch_active = false;
+					printf("[FTR-OFDM-FAIL-SACKV2-SUPPRESS] delay=%d metric=%.3f search_raw=%d batch=%d — preserving OFDM search state for §7.13.25 frame 2\n",
+						received_message_stats.delay,
+						telecom_system->receive_stats.coarse_metric,
+						telecom_system->receive_stats.ofdm_search_raw,
+						telecom_system->receive_stats.ofdm_batch_active ? 1 : 0);
+					fflush(stdout);
+				}
+				else
+				{
+					int rx_frame = telecom_system->get_active_nsymb()
+						+ telecom_system->data_container.preamble_nSymb;
+					telecom_system->data_container.frames_to_read = rx_frame;
+					telecom_system->data_container.nUnder_processing_events = 0;
+					int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
+					telecom_system->receive_stats.ofdm_search_raw = buf_nsymb - rx_frame;
+					if(telecom_system->receive_stats.ofdm_search_raw < 0)
+					{
+						telecom_system->receive_stats.ofdm_search_raw = 0;
+						telecom_system->receive_stats.ofdm_batch_active = false;
+					}
 				}
 			}
 			else if(telecom_system->M != MOD_MFSK && received_message_stats.delay >= 0)
