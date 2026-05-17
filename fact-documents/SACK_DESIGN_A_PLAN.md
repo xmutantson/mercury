@@ -6712,3 +6712,47 @@ large enough to absorb the drift.
   `.data`, or (b) track buffer ownership with an explicit flag. Not
   doing either today — pure cleanup, no current bug, and either choice
   needs a larger validation cycle than this guard.
+
+### §7.13.20 RESULT — Step-15 orphan sweep, round 2 (2026-05-16)
+
+Follow-up to §7.13.12.6 (commit `04a8438` swept the first round). One
+remaining actionable orphan found, three benign findings catalogued.
+
+#### §7.13.20.1 Removed
+
+- **`mercury/tools/sack_ldpc_fail_repro.py`** (commit `baa125f` was its
+  introduction). Repro harness for `SACK_LDPC_FALLBACK_INVESTIGATION.md`.
+  Pre-conditions: `--test-sack-ldpc-fail` CLI flag + the
+  `receive_sack_pattern()` codepath, both deleted in Step 15 (`ffa9d75`).
+  Tool would fail at runtime with an unrecognised-flag error from
+  `mercury.exe`. Only external reference is `SACK_LDPC_FALLBACK_INVESTIGATION.md:394,
+  :416`, which is a historical record of the investigation that motivated
+  the tool — those lines stay as archaeology; the tool itself is removed.
+
+#### §7.13.20.2 Catalogued but not removed (benign)
+
+- **`mercury/build/o3/source/physical_layer/mercury_sack_{2,4}_16.{o,d}`**
+  — stale build artifacts from the deleted .cc files. `build.sh` no
+  longer enumerates these sources, so rebuilds don't reference them.
+  Self-cleans on `bash build.sh clean`. Not worth a git operation.
+- **`mercury/source/physical_layer/telecom_system.cc:3938-3939`** —
+  comment in `BER_PLOT_passband_process_main()` noting the legacy SACK
+  pattern roundtrip test was removed alongside the MFSK SACK bitmap
+  path. Documentation only; aids future archaeology by explaining
+  *why* the BER_PLOT test set has a gap there. Keep.
+- **`mercury/include/physical_layer/ofdm.h:166-167`** — comment marker
+  for `decode_suffix_tones_soft` removal in §7.13.12 (commit `04a8438`).
+  Same rationale as above. Keep.
+
+#### §7.13.20.3 Verification
+
+`grep` swept all of `mercury/source/`, `mercury/include/`, `mercury/tools/`
+for: `sack_pattern_passband_samples`, `generate_sack_bitmap_pattern_passband`,
+`detect_sack_pattern_from_passband`, `decode_sack_bitmap_ldpc`,
+`sack_pattern_detection_test`, `sack_ldpc` (as identifier),
+`generate_sack_pattern`, `generate_sack_bitmap_pattern`, `sack_bitmap_nsuffix`,
+`encode_sack_bitmap`, `decode_sack_bitmap`, `sack_tones`,
+`sack_match_threshold`, `receive_sack_pattern`, `force_sack_ldpc_fail`,
+`sack_diag_*`, `--test-sack-ldpc-fail`, `MERCURY_SACK*`,
+`decode_suffix_tones_soft`. No live references remain. The only matches
+are intentional deletion-marker comments (catalogued above).
