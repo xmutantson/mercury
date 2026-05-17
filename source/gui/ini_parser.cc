@@ -4,6 +4,7 @@
  */
 
 #include "gui/ini_parser.h"
+#include <cmath>     // std::nan, std::isnan (tx_gain_override, plan §7.13.21)
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -239,7 +240,23 @@ void MercurySettings::setDefaults() {
 
     // Logging
     log_enabled = false;
+
+    // Per-signal-type tx_gain overrides — NaN = no override, use code default.
+    // See ini_parser.h comment + plan §7.13.21.
+    for (int s = 0; s < TX_GAIN_NSIG; s++)
+        for (int m = 0; m < TX_GAIN_NMODE; m++)
+            tx_gain_override[s][m] = std::nan("");
 }
+
+// Signal-type name strings shared between load/save. Must match the indices in
+// tx_signal_type (telecom_system.h:53-60) and the print_tx_gain_table() label
+// in telecom_system.cc:172-174.
+static const char* k_tx_gain_sig_names[MercurySettings::TX_GAIN_NSIG] = {
+    "MFSK_1S", "MFSK_2S", "OFDM", "ACK", "BREAK"
+};
+static const char* k_tx_gain_mode_names[MercurySettings::TX_GAIN_NMODE] = {
+    "WB", "NB"
+};
 
 bool MercurySettings::load(const std::string& filename) {
     IniParser ini;
@@ -305,6 +322,16 @@ bool MercurySettings::load(const std::string& filename) {
     // Logging
     log_enabled = ini.getBool("Logging", "LogEnabled", log_enabled);
 
+    // Per-signal-type tx_gain overrides (plan §7.13.21). Absent key => NaN
+    // => keep code default. INI section [TxGain] keys SIG_MODE, e.g. OFDM_WB.
+    for (int s = 0; s < TX_GAIN_NSIG; s++) {
+        for (int m = 0; m < TX_GAIN_NMODE; m++) {
+            std::string key = std::string(k_tx_gain_sig_names[s]) + "_"
+                + k_tx_gain_mode_names[m];
+            tx_gain_override[s][m] = ini.getDouble("TxGain", key, std::nan(""));
+        }
+    }
+
     return true;
 }
 
@@ -368,6 +395,19 @@ bool MercurySettings::save(const std::string& filename) {
 
     // Logging
     ini.setBool("Logging", "LogEnabled", log_enabled);
+
+    // Per-signal-type tx_gain overrides — only write entries that have been
+    // explicitly set (non-NaN), so a fresh INI doesn't get polluted with the
+    // 10 default values (calibration backlog, plan §7.13.21).
+    for (int s = 0; s < TX_GAIN_NSIG; s++) {
+        for (int m = 0; m < TX_GAIN_NMODE; m++) {
+            if (!std::isnan(tx_gain_override[s][m])) {
+                std::string key = std::string(k_tx_gain_sig_names[s]) + "_"
+                    + k_tx_gain_mode_names[m];
+                ini.setDouble("TxGain", key, tx_gain_override[s][m]);
+            }
+        }
+    }
 
     return ini.save(filename);
 }

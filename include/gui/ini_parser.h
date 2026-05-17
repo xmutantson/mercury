@@ -105,6 +105,16 @@ struct MercurySettings {
     // Logging
     bool log_enabled;      // Enable logging to <exe_dir>/logs/<timestamp>.log
 
+    // Per-signal-type tx_gain overrides (calibration backlog, plan §7.13.21).
+    // Indexed as tx_gain_override[signal_type][nb_mode] where signal_type matches
+    // tx_signal_type enum (MFSK_1S=0, MFSK_2S=1, OFDM=2, ACK=3, BREAK=4) and
+    // nb_mode is 0=WB, 1=NB. NaN sentinel means "use code default from
+    // cl_telecom_system::init_tx_gain_defaults()" — only non-NaN entries
+    // override. INI section [TxGain], keys like OFDM_WB, OFDM_NB, ACK_WB, etc.
+    static const int TX_GAIN_NSIG  = 5;
+    static const int TX_GAIN_NMODE = 2;
+    double tx_gain_override[TX_GAIN_NSIG][TX_GAIN_NMODE];
+
     MercurySettings();
     void setDefaults();
     bool load(const std::string& filename);

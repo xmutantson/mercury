@@ -276,6 +276,11 @@ public:
 	double get_tx_gain(tx_signal_type sig) const;
 	void init_tx_gain_defaults();
 	void print_tx_gain_table() const;
+	// Calibration override (plan §7.13.21). Sets both [sig][nb_mode][0] and
+	// [sig][nb_mode][1] (currently always paired — see get_tx_gain's [nb][nb]
+	// diagonal). Logs the override so the calibration audit trail is in the
+	// process log alongside [TX-GAIN] table dump.
+	void set_tx_gain(tx_signal_type sig, int nb_mode, double value);
 
 	st_reinit_subsystems reinit_subsystems;
 

@@ -167,6 +167,27 @@ double cl_telecom_system::get_tx_gain(tx_signal_type sig) const
 	return tx_gain[sig][nb][nb];  // mod and FIR always match currently
 }
 
+void cl_telecom_system::set_tx_gain(tx_signal_type sig, int nb_mode, double value)
+{
+	if(sig < 0 || sig >= TX_SIG_COUNT || nb_mode < 0 || nb_mode > 1)
+	{
+		printf("[TX-GAIN-OVERRIDE] invalid (sig=%d, nb_mode=%d) — skip\n",
+			(int)sig, nb_mode);
+		fflush(stdout);
+		return;
+	}
+	static const char* sig_names[TX_SIG_COUNT] = {
+		"MFSK_1S", "MFSK_2S", "OFDM   ", "ACK    ", "BREAK  "
+	};
+	static const char* mode_names[2] = { "WB", "NB" };
+	double prev = tx_gain[sig][nb_mode][nb_mode];
+	tx_gain[sig][nb_mode][0] = value;
+	tx_gain[sig][nb_mode][1] = value;  // mirror — get_tx_gain reads [nb][nb] diagonal
+	printf("[TX-GAIN-OVERRIDE] %s  %s  %.4f -> %.4f (calibration override, "
+		"plan §7.13.21)\n", sig_names[sig], mode_names[nb_mode], prev, value);
+	fflush(stdout);
+}
+
 void cl_telecom_system::print_tx_gain_table() const
 {
 	static const char* sig_names[TX_SIG_COUNT] = {
