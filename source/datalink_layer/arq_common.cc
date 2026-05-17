@@ -323,6 +323,7 @@ cl_arq_controller::cl_arq_controller()
 	ack_diag_poll_count=0;
 	ack_diag_peak_mask=0;
 	v2_ackpat_defer_count_this_window=0;  // Bug A fix (§7.13.1)
+	sack_v2_decode_drain_pending=false;   // Fix B (§7.13.27)
 
 	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
 	ack_metric_threshold=0.5;     // Phase-2 flag default = HEAD (7076a4b 3.0→0.5)
