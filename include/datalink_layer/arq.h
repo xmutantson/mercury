@@ -1126,6 +1126,21 @@ public:
   // other per-window diag counters. v1 path never sets or reads this.
   int v2_ackpat_defer_count_this_window;
 
+  // Fix B (§7.13.27 SACK_DESIGN_A_PLAN): defer-window-close drain flag for the
+  // §7.13.25 SACK_RSP double-shot. When sack_v2_enabled and CMD successfully
+  // decodes a SACK_RSP frame (either FAST cross-check path at arq_commander.cc
+  // ~:1843-1867 or SLOW path at ~:1949-1971), the retransmit-queue actions
+  // proceed immediately, but `data_ack_received` is held at NO for ONE additional
+  // poll so the sack_window_open predicate stays true. On the next poll, the
+  // drain handler at the top of process_messages_rx_acks_data() runs
+  // `this->receive()` once to consume frame 2 of the double-shot from the audio
+  // ring — preventing the second frame from being discarded by an immediate
+  // window close. After draining, the flag clears and data_ack_received=YES.
+  // Reset at TX-end (arq_commander.cc:891 / :1141) alongside the other per-
+  // window counters. Default false. v1 sessions never set this (the v2 SACK_RSP
+  // decode sites are gated on sack_v2_enabled — see §7.13.25).
+  bool sack_v2_decode_drain_pending;
+
   // Step 15: legacy SACK pattern detection diagnostics (sack_diag_*) removed —
   // the MFSK SACK correlator they tracked is gone.
 
