@@ -916,7 +916,6 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
-		sack_v2_decode_drain_pending = false;   // Fix B (§7.13.27)
 		calculate_receiving_timeout();
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
@@ -1174,7 +1173,6 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
-		sack_v2_decode_drain_pending = false;   // Fix B (§7.13.27)
 		// ACK pattern detection uses dedicated ack_mfsk — no config switch needed
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
@@ -1751,77 +1749,6 @@ void cl_arq_controller::process_messages_rx_acks_data()
 	{
 		if(ack_pattern_time_ms > 0)
 		{
-			// Fix B (§7.13.27 SACK_DESIGN_A_PLAN): SACK_RSP double-shot drain.
-			//
-			// On the prior poll, a SACK_RSP frame decoded successfully and the
-			// retransmit queue was applied — but `data_ack_received = YES` was
-			// deferred because RSP transmits TWO SACK_RSP frames back-to-back
-			// (§7.13.25 pad_messages_batch_tx(2)). The second frame's audio is
-			// still in the capture ring; if we closed the window immediately,
-			// frame 2 would either (a) be discarded by the next sack_window_open
-			// flipping to false, or (b) collide with subsequent control-frame
-			// audio when CMD starts the next batch. This handler drains frame 2
-			// from the ring with one explicit `this->receive()` call. If a second
-			// SACK_RSP is decoded, validate its bsi matches the prior one (log
-			// drift) and discard the bitmap — frame 1's retransmit queue was
-			// already applied and is authoritative. After draining (whether or
-			// not frame 2 was decodable), set data_ack_received=YES so the outer
-			// process_messages_tx_data() can advance to the retransmit batch.
-			//
-			// Strictly gated on sack_v2_enabled. v1 sessions never set the
-			// drain_pending flag (the only set sites are the v2 SACK_RSP decode
-			// success branches at ~:1859 and ~:1961), so this entire block is
-			// a no-op for v1.
-			if(sack_v2_enabled && sack_v2_decode_drain_pending)
-			{
-				// Capture frame-1's bsi BEFORE calling decode_sack_v2_frame() —
-				// decode_sack_v2_frame() overwrites cmd_sack_v2_last_rx_batch_seq_id
-				// with the freshly parsed value on success (arq_common.cc:4105).
-				int frame1_bsi = cmd_sack_v2_last_rx_batch_seq_id;
-				MUTEX_LOCK(&capture_prep_mutex);
-				telecom_system->data_container.frames_to_read = 0;
-				MUTEX_UNLOCK(&capture_prep_mutex);
-				this->receive();
-				if(messages_rx_buffer.status == RECEIVED
-				   && messages_rx_buffer.type == SACK_RSP)
-				{
-					bool dummy_bitmap[MAX_SACK_BATCH_SIZE];
-					memset(dummy_bitmap, 0, sizeof(dummy_bitmap));
-					unsigned char rx_bsi2 = 0;
-					if(decode_sack_v2_frame(dummy_bitmap, data_batch_size, &rx_bsi2))
-					{
-						if((int)rx_bsi2 == frame1_bsi)
-						{
-							printf("[CMD-SACK-V2-DRAIN] decoded frame 2 of SACK_RSP double-shot, bsi=%u matches frame 1 — discarding duplicate\n",
-								(unsigned)rx_bsi2);
-						}
-						else
-						{
-							printf("[CMD-SACK-V2-DRAIN] decoded frame 2 of SACK_RSP double-shot, bsi=%u DOES NOT match frame 1 bsi=%d — discarding\n",
-								(unsigned)rx_bsi2, frame1_bsi);
-						}
-						fflush(stdout);
-					}
-					else
-					{
-						printf("[CMD-SACK-V2-DRAIN] decoded frame 2 of SACK_RSP double-shot, CRC failed — discarding\n");
-						fflush(stdout);
-					}
-					messages_rx_buffer.status = FREE;
-				}
-				else
-				{
-					// Frame 2 not in ring (RSP only sent one in this case, or
-					// receive() couldn't pull it out before the next poll). Not
-					// a fault — we still close the window now.
-					printf("[CMD-SACK-V2-DRAIN] no frame 2 SACK_RSP decodable — closing window after frame 1\n");
-					fflush(stdout);
-				}
-				sack_v2_decode_drain_pending = false;
-				data_ack_received = YES;
-				return;
-			}
-
 			// Detection strategy: check SACK alongside ACK from the start.
 			// We only require a short minimum delay (ack_pattern_time_ms) so
 			// the RSP has time to send its response. Step 15: the legacy
@@ -1925,9 +1852,6 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								{
 									sack_detected = true;
 									ack_pat_hit = false;   // SACK_RSP wins
-									// Fix B (§7.13.27): defer window-close to drain
-									// frame 2 of the §7.13.25 double-shot.
-									sack_v2_decode_drain_pending = true;
 									printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — OVERRIDES ACKPAT-FAST false positive\n",
 										(unsigned)rx_bsi, cmd_batch_seq_id);
 									fflush(stdout);
@@ -2030,9 +1954,6 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								if(decode_sack_v2_frame(sack_bitmap, data_batch_size, &rx_bsi))
 								{
 									sack_detected = true;
-									// Fix B (§7.13.27): defer window-close to drain
-									// frame 2 of the §7.13.25 double-shot.
-									sack_v2_decode_drain_pending = true;
 									printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — applying to retransmit queue\n",
 										(unsigned)rx_bsi, cmd_batch_seq_id);
 									fflush(stdout);
@@ -2127,18 +2048,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					rx_count, data_batch_size, retransmit_count);
 				fflush(stdout);
 
-				// Fix B (§7.13.27 SACK_DESIGN_A_PLAN): defer window-close when
-				// sack_v2_decode_drain_pending was just set by the SACK_RSP
-				// decode site (FAST cross-check ~:1843-1867 or SLOW ~:1949-1971
-				// — both above). Holding `data_ack_received = NO` keeps
-				// sack_window_open true so the next poll's drain handler (at the
-				// top of this function) consumes frame 2 of RSP's §7.13.25
-				// double-shot before the window closes. v1 path is unaffected
-				// (drain_pending is never set in v1).
-				if(!sack_v2_decode_drain_pending)
-				{
-					data_ack_received = YES;
-				}
+				data_ack_received = YES;
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;
 
