@@ -927,21 +927,22 @@ public:
   static const int AXIS2_BATCH_CEIL  = 32;  // capped by MAX_SACK_BATCH_SIZE
   static const int AXIS2_STEP        = 5;
   static const int AXIS2_RING_DEPTH  = 5;
-  static const int AXIS2_UP_GOOD_RUN = 8;  // §4.3.2 hysteresis: up after N good
-                                           // batches. §7.13.31 attempted 8→4
-                                           // (v18+v19) to ramp faster but ran
-                                           // into a separate SET_LINK_PARAMS
-                                           // handshake bug — RSP fails to
-                                           // receive the CONTROL frame ~80%
-                                           // of the time when sent right after
-                                           // a batch ACK. v19 r3 confirmed it
-                                           // CAN work (mean 2210 bps when the
-                                           // handshake catches) but variance
-                                           // is too high (mean 1039, range
-                                           // 747-2210). Kept at 8 until the
-                                           // SET_LINK_PARAMS path is hardened
-                                           // — see SACK_DESIGN_A_PLAN §7.13.31
-                                           // for the open investigation.
+  static const int AXIS2_UP_GOOD_RUN = 4;  // §4.3.2 hysteresis: up after N good
+                                           // batches. §7.13.32 hardened the
+                                           // SET_LINK_PARAMS handshake (RSP
+                                           // now releases messages_control
+                                           // after every v2 OFDM control TX),
+                                           // so the 8→4 ramp is now safe.
+                                           // History: §7.13.31.1 first
+                                           // attempted the ramp at v18+v19
+                                           // and surfaced the RX-CTRL-DROP
+                                           // bug on RSP — root cause was
+                                           // messages_control left in
+                                           // ADDED_TO_BATCH_BUFFER state by
+                                           // send_ofdm_ack_clean() and
+                                           // send_sack_v2_frame(). Fixed in
+                                           // §7.13.32 (arq_common.cc).
+
   static const int AXIS2_DOWN_BAD_RUN = 3; // §4.3.2 hysteresis: down after this many bad batches
   static const int AXIS2_CROSS_AXIS_COOLDOWN_BATCHES = 3; // §4.3.3 set by Axis-1 supremacy hook
   // SACK Design A Step 12 — Axis-2 `batch_size_proven_ceiling` analogue
