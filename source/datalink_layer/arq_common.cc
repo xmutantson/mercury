@@ -4087,6 +4087,20 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		t_end - t_start).count();
 
+	// §7.13.32 — Release the staging slot AFTER the wire TX completes.
+	// send_batch() reads messages_control via messages_batch_tx[0] (the
+	// struct-copy at the top of this function); once it returns the wire
+	// is committed and the staging buffer is no longer needed. Leaving
+	// status==ADDED_TO_BATCH_BUFFER here was the latent bug that
+	// §7.13.31.1 surfaced: the next inbound CONTROL frame (e.g.,
+	// SET_LINK_PARAMS following a POLICY-MOVE) is decoded successfully
+	// by RX but then dropped at arq_responder.cc:281 because
+	// messages_control is "busy" — RSP never APPLIES the new params and
+	// CMD's 10x retransmits all bounce off the same gate, collapsing the
+	// link. Symmetric with the post-RX ACK path that already force-FREEs
+	// at arq_responder.cc:834.
+	messages_control.status = FREE;
+
 	rsp_sack_v2_tx_count++;
 	printf("[TX-SACK-V2] send_batch() wire_ms=%lld ctrl_tx_time_ms=%d (legacy MFSK SACK ~1168 ms baseline)\n",
 		elapsed_ms, ctrl_transmission_time_ms);
@@ -4139,6 +4153,15 @@ long long cl_arq_controller::send_ofdm_ack_clean(unsigned char batch_seq_id)
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		t_end - t_start).count();
+
+	// §7.13.32 — Release the staging slot AFTER the wire TX completes.
+	// See parallel comment in send_sack_v2_frame() above; the same
+	// root cause applies here (§7.13.31.1 SET_LINK_PARAMS handshake
+	// collapse). Without this clear, every inbound CONTROL frame
+	// arriving after a clean-batch OFDM ACK gets RX-CTRL-DROPped at
+	// arq_responder.cc:281 because messages_control is still marked
+	// ADDED_TO_BATCH_BUFFER from the TX staging.
+	messages_control.status = FREE;
 
 	printf("[TX-OFDM-ACK-CLEAN] send_batch() wire_ms=%lld\n", elapsed_ms);
 	fflush(stdout);
