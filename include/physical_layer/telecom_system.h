@@ -208,6 +208,23 @@ public:
 	// See PHASE2_FLAGS_DESIGN.md §3.6.
 	bool ofdm_defer_overflow_enabled;
 
+	// §7.13.29 — caller-set hint that the next receive() is a SACK_RSP cross
+	// check. When true, the OFDM-SYNC search uses stricter parameters:
+	//   • preamble_detect_threshold bumped (0.15 → 0.65 WB, 0.30 → 0.75 NB) so
+	//     Schmidl-Cox sub-peaks in OFDM body audio are rejected outright
+	//     instead of consuming Moose trial budget.
+	//   • time_sync_trials_max effective limit raised to 5 (vs default 2) so
+	//     if a sub-peak slips past the threshold and triggers a Moose-reject,
+	//     the search can still find the real preamble at a later position.
+	// The flag is read inside cl_telecom_system::receive_byte()/process_decoder
+	// and DOES NOT persist across calls — arq_commander sets it before the
+	// cross-check this->receive() and clears it immediately after.
+	// arq_commander may also set the existing ofdm_forced_delay to a stashed
+	// metric=1.0 position from a previous INCOMPLETE cross-check; OFDM-SYNC
+	// already bypasses search in that case (BER-test path), giving us a
+	// deterministic retry without re-running the Schmidl-Cox lottery.
+	bool sack_cross_check_mode = false;
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);

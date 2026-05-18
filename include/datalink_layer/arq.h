@@ -360,7 +360,30 @@ public:
   void send_batch();
   void send_ack_pattern();   // Level 3: TX short tone pattern instead of LDPC ACK
   void send_ack_pattern_with_snr(float snr);  // TX ACK + 4 MFSK symbols encoding SNR
-  bool receive_ack_pattern(); // Level 3: RX + detect ACK pattern, returns true if detected
+  // Level 3: RX + detect ACK pattern, returns true if detected.
+  //
+  // defer_audio_advance (§7.13.29): when true, a positive detection does NOT
+  // commit the usual frames_to_read=4 + search_raw resets. The audio in the
+  // ring is left UNCHANGED so a follow-up decoder pass (e.g. the v2 SACK_RSP
+  // cross-check in process_messages_rx_acks_data) sees pristine samples
+  // instead of audio the capture thread already advanced past. The caller
+  // MUST invoke commit_ack_pattern_consumed() once it has accepted the ACK
+  // outcome, otherwise the next poll re-detects the same pattern.
+  bool receive_ack_pattern(bool defer_audio_advance = false);
+
+  // §7.13.29 — apply the ftr=4 + search_raw resets that
+  // receive_ack_pattern(defer_audio_advance=true) skipped. Idempotent.
+  void commit_ack_pattern_consumed();
+
+  // §7.13.29 — null out the audio range in the ring buffer that the
+  // MFSK ACK matched filter scanned (the tail used by
+  // receive_ack_pattern). Called after a strict-threshold MFSK ACK is
+  // accepted so any subsequent OFDM Schmidl-Cox scan this poll cycle
+  // can't false-fire on the Welch-Costas pattern (which has periodic
+  // structure that looks like an OFDM preamble). Locks
+  // capture_prep_mutex while it zeros so capture-thread writes don't
+  // race. Cheap: just memset on tail_samples doubles.
+  void zero_mfsk_ack_audio_tail();
   // Step 15: legacy MFSK SACK pattern (send_sack_pattern / receive_sack_pattern)
   // has been deleted. OFDM SACK_RSP via send_sack_v2_frame is the only
   // partial-batch SACK transport now.
@@ -386,6 +409,19 @@ public:
   //     out_batch_seq_id, increments cmd_sack_v2_rx_count, returns true.
   bool decode_sack_v2_frame(bool* out_bitmap, int nframes,
                             unsigned char* out_batch_seq_id);
+
+  // §7.13.30 — OFDM-only clean-batch ACK. Replaces send_ack_pattern() on
+  // sack_v2_enabled sessions so the SACK window contains ONLY OFDM
+  // signals (no MFSK ACK to disambiguate from SACK_RSP). Wire payload
+  // [batch_seq_id : u8][CRC8 : u8]. Type = OFDM_ACK_CLEAN (0x44).
+  // Pre-conditions: caller has verified sack_v2_enabled.
+  long long send_ofdm_ack_clean(unsigned char batch_seq_id);
+  // §7.13.30 — Decode an OFDM_ACK_CLEAN frame. Called when receive()
+  // landed a frame with messages_rx_buffer.type == OFDM_ACK_CLEAN.
+  // Validates CRC8. On success: writes batch_seq_id to *out_batch_seq_id,
+  // returns true. On CRC fail: emits diagnostic, returns false.
+  bool decode_ofdm_ack_clean(unsigned char* out_batch_seq_id);
+
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
@@ -891,7 +927,21 @@ public:
   static const int AXIS2_BATCH_CEIL  = 32;  // capped by MAX_SACK_BATCH_SIZE
   static const int AXIS2_STEP        = 5;
   static const int AXIS2_RING_DEPTH  = 5;
-  static const int AXIS2_UP_GOOD_RUN = 8;  // §4.3.2 hysteresis: up after this many good batches
+  static const int AXIS2_UP_GOOD_RUN = 8;  // §4.3.2 hysteresis: up after N good
+                                           // batches. §7.13.31 attempted 8→4
+                                           // (v18+v19) to ramp faster but ran
+                                           // into a separate SET_LINK_PARAMS
+                                           // handshake bug — RSP fails to
+                                           // receive the CONTROL frame ~80%
+                                           // of the time when sent right after
+                                           // a batch ACK. v19 r3 confirmed it
+                                           // CAN work (mean 2210 bps when the
+                                           // handshake catches) but variance
+                                           // is too high (mean 1039, range
+                                           // 747-2210). Kept at 8 until the
+                                           // SET_LINK_PARAMS path is hardened
+                                           // — see SACK_DESIGN_A_PLAN §7.13.31
+                                           // for the open investigation.
   static const int AXIS2_DOWN_BAD_RUN = 3; // §4.3.2 hysteresis: down after this many bad batches
   static const int AXIS2_CROSS_AXIS_COOLDOWN_BATCHES = 3; // §4.3.3 set by Axis-1 supremacy hook
   // SACK Design A Step 12 — Axis-2 `batch_size_proven_ceiling` analogue
@@ -1125,6 +1175,40 @@ public:
   // rate). Reset at TX-end (arq_commander.cc:891 / :1141) alongside the
   // other per-window diag counters. v1 path never sets or reads this.
   int v2_ackpat_defer_count_this_window;
+
+  // §7.13.29 — last SACK_RSP bsi (mod 256) we applied to messages_tx[].
+  // Prevents duplicate apply if the same SACK_RSP preamble audio is
+  // still in the ring on a subsequent poll. -1 = no SACK_RSP applied
+  // yet this session. Init in init_messages_buffers.
+  int cmd_last_applied_sack_bsi;
+
+  // §7.13.30 — v2 OFDM dispatch new-audio throttle. The v2 SACK window
+  // no longer calls receive_ack_pattern() (which used to drive ftr
+  // implicitly). Instead we track ring_write_index advance ourselves
+  // and only call receive() when at least N OFDM symbols of new
+  // audio have accumulated. Without this throttle, receive() would
+  // either early-return forever on stale ftr (v14 r1 bug: 4208 calls,
+  // 0 decodes) or run every poll wasting CPU on identical audio.
+  // Value: last ring_write_index sample at which we ran receive().
+  // -1 = "no prior run this window" → first poll processes.
+  int v2_dispatch_last_rwi;
+
+  // §7.13.30 — how many OFDM symbols of new audio to require before
+  // the next receive() call. Default 1 (one symbol of progress per
+  // call). Bumped to (overflow + 4) after receive() returns INCOMPLETE
+  // so the next call has enough fresh audio to complete the frame —
+  // without this, each retry only adds 1 symbol and overflow drops by
+  // 1 per call, wasting ~12 polls on the same frame (v15 bug).
+  int v2_dispatch_min_advance_syms;
+
+  // §7.13.29 (Option 2) — self-calibrating SACK_RSP arrival predictor.
+  // Each successful SACK_RSP decode records the receiving_timer ms value
+  // at which the cross-check returned RECEIVED. Future use: hint OFDM
+  // search to the expected arrival time. Currently recording-only.
+  static const int SACK_ARRIVAL_HISTORY = 8;
+  int sack_arrival_history_ms[SACK_ARRIVAL_HISTORY];
+  int sack_arrival_history_count;     // 0..SACK_ARRIVAL_HISTORY
+  int sack_arrival_history_next_idx;  // 0..SACK_ARRIVAL_HISTORY-1 (ring)
 
   // Step 15: legacy SACK pattern detection diagnostics (sack_diag_*) removed —
   // the MFSK SACK correlator they tracked is gone.
