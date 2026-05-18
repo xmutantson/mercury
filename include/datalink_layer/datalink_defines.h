@@ -105,6 +105,18 @@
                                 // Phase: SCAFFOLDING — message type defined, RSP-side no-op
                                 // stub logs receipt only; no CMD-side sender; no state mutation.
                                 // Gated behavior arrives in later Design A steps.
+#define OFDM_ACK_CLEAN   0x44   // §7.13.30 — OFDM-only clean-batch ACK. Replaces the MFSK
+                                // ACK pattern for sack_v2_enabled sessions so CMD never
+                                // has to distinguish MFSK vs OFDM signals in the SACK
+                                // window (both ACK paths are now OFDM). Wire payload
+                                // (after the standard 3-byte msg header):
+                                //   [batch_seq_id : u8][CRC8 : u8]
+                                // CRC8 covers batch_seq_id only (the wire header is
+                                // already protected by the OFDM LDPC codeword's CRC16).
+                                // Sent in place of send_ack_pattern() when ACK-GATE PASS
+                                // fires on a v2 session (clean batch). Partial batches
+                                // still use SACK_RSP. v1 (non-v2) sessions still use
+                                // MFSK ACK — unchanged.
 
 // Capability flags (embedded in TEST_CONNECTION byte 5)
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection

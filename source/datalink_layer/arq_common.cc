@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstring>
 #include <chrono>
+#include <cstdlib>
 
 extern "C" {
     extern double noise_snr_db;
@@ -37,6 +38,25 @@ extern "C" {
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
+
+// SACK_RX_TRACE: env-gated diagnostic for the SACK_RSP receive path.
+// Mirror of the macro in arq_commander.cc. Enable via MERCURY_SACK_RX_TRACE=1.
+static inline bool sack_rx_trace_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_SACK_RX_TRACE");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+#define SACK_TRACE(fmt, ...) do { \
+	if(sack_rx_trace_enabled_common()) { \
+		printf("[SACK-RX-TRACE] " fmt "\n", ##__VA_ARGS__); \
+		fflush(stdout); \
+	} \
+} while(0)
 
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
@@ -323,6 +343,13 @@ cl_arq_controller::cl_arq_controller()
 	ack_diag_poll_count=0;
 	ack_diag_peak_mask=0;
 	v2_ackpat_defer_count_this_window=0;  // Bug A fix (§7.13.1)
+	// §7.13.29 init
+	cmd_last_applied_sack_bsi = -1;
+	sack_arrival_history_count = 0;
+	sack_arrival_history_next_idx = 0;
+	for(int i=0; i<SACK_ARRIVAL_HISTORY; i++) sack_arrival_history_ms[i] = 0;
+	v2_dispatch_last_rwi = -1;
+	v2_dispatch_min_advance_syms = 1;
 
 	phy_reinit_settle_us=300000;  // Phase-2 flag default = HEAD (b806b76 Bug #60)
 	ack_metric_threshold=0.5;     // Phase-2 flag default = HEAD (7076a4b 3.0→0.5)
@@ -3010,6 +3037,15 @@ void cl_arq_controller::send(st_message* message, int message_location)
 		message_TxRx_byte_buffer[2]=message->sequence_number;
 		header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	}
+	else if (message->type==OFDM_ACK_CLEAN)
+	{
+		// §7.13.30 — OFDM_ACK_CLEAN control frame. Same 3-byte header as
+		// SACK_RSP; payload [batch_seq_id, CRC8] in message->data.
+		message_TxRx_byte_buffer[0]=message->type;
+		message_TxRx_byte_buffer[1]=connection_id;
+		message_TxRx_byte_buffer[2]=message->sequence_number;
+		header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
+	}
 	else if (message->type==CONTROL || message->type==ACK_CONTROL)
 	{
 		message_TxRx_byte_buffer[0]=message->type;
@@ -3212,6 +3248,19 @@ void cl_arq_controller::send_batch()
 			// payload [batch_seq_id, bitmap..., CRC8] is carried in
 			// messages_batch_tx[i].data[..] verbatim. Symmetric with the send()
 			// branch above.
+			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
+			message_TxRx_byte_buffer[1]=connection_id;
+			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
+			header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
+		}
+		else if (messages_batch_tx[i].type==OFDM_ACK_CLEAN)
+		{
+			// §7.13.30 — OFDM_ACK_CLEAN. Same 3-byte standard header
+			// as SACK_RSP; payload [batch_seq_id, CRC8] is in
+			// messages_batch_tx[i].data[..] verbatim. Without this
+			// case, byte 0 (type) was never written to the wire and
+			// the RX side decoded a frame with type=0x00 — the v16
+			// silent-drop bug.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
 			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
@@ -4017,26 +4066,21 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	// Full-length OFDM frame on the data configuration (NOT the MFSK ack
 	// config — SACK_RSP carries real LDPC-coded payload).
 	telecom_system->set_mfsk_ctrl_mode(false);
-	// SACK_DESIGN_A_PLAN §7.13.25 (DSP iter 2): send the SACK_RSP frame
-	// TWICE back-to-back. Each is an independent OFDM+LDPC attempt; if the
-	// first fails decode the CMD polling loop reads the second from the
-	// same audio window and re-attempts via the receive() / decode_sack_v2_frame()
-	// path at arq_commander.cc:1846 / :1928. Two independent attempts at
-	// per-frame decode probability p give 1-(1-p)^2 effective success.
-	//
-	// Motivation: §7.13.24 calibrated-battery measurements showed sackv2
-	// underperforming when SACK_RSP fails — CFG15 clean retx_rate=0.57
-	// (data drop ~1/25 -> SACK_RSP drop -> full-batch retx cascade),
-	// MPM:16 retx_rate=0.91 (multipath collapses single-frame SACK_RSP).
-	// Doubling the SACK_RSP frame only costs SACK_RSP wire time (no
-	// impact on clean cells where SACK_RSP doesn't fire) and gives
-	// the next-batch recovery path the redundancy it needs.
-	//
-	// Wire-time cost: ~480 ms -> ~960 ms at WB_CFG10. Within the CMD
-	// post-TX ACK timeout (sack_lossy_ab.py runs see 4970-7696 ms windows
-	// per [RSP-TIMEOUT] log line).
-	pad_messages_batch_tx(2);
+	// SACK_DESIGN_A_PLAN §7.13.29 — REMOVED the §7.13.25 double-shot
+	// (`pad_messages_batch_tx(2)`). The trace data showed that BOTH copies
+	// were missed by CMD's cross-check for the same reason: the
+	// double-shot wire time (~1070 ms WB_CFG15) EXCEEDS the receive ring
+	// length (~834 ms). The preamble of the first shot scrolled off
+	// before CMD's MFSK ACK detector built up enough match-count to
+	// trigger the cross-check. Sending a second copy didn't help because
+	// the same scroll happens to it too. Single-shot SACK_RSP at
+	// WB_CFG15 is ~540 ms wire — its preamble stays in the ring for the
+	// full duration, giving the cross-check a chance to actually find it.
+	// If single-shot proves unreliable on lossy channels we can revisit
+	// with a robust-config SACK_RSP TX (CFG10/CFG4) rather than redundancy.
 
+	SACK_TRACE("RSP TX SACK_RSP: bsi=%u nframes=%d payload_len=%d crc8=0x%02x",
+		(unsigned)batch_seq_id, nframes, payload_len, (unsigned)crc);
 	auto t_start = std::chrono::steady_clock::now();
 	send_batch();
 	auto t_end = std::chrono::steady_clock::now();
@@ -4047,7 +4091,87 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	printf("[TX-SACK-V2] send_batch() wire_ms=%lld ctrl_tx_time_ms=%d (legacy MFSK SACK ~1168 ms baseline)\n",
 		elapsed_ms, ctrl_transmission_time_ms);
 	fflush(stdout);
+	SACK_TRACE("RSP TX SACK_RSP done: wire_ms=%lld tx_count=%lld", elapsed_ms, rsp_sack_v2_tx_count);
 	return elapsed_ms;
+}
+
+// §7.13.30 — OFDM-only clean-batch ACK. Wire layout AFTER the standard
+// 3-byte msg header [type=OFDM_ACK_CLEAN, conn_id, seq_num=0]:
+//   payload = [batch_seq_id : u8][CRC8 : u8]
+// CRC8 covers batch_seq_id only. The standard msg header is already
+// protected by the OFDM LDPC codeword's CRC16 so doesn't need its own CRC8.
+long long cl_arq_controller::send_ofdm_ack_clean(unsigned char batch_seq_id)
+{
+	if(passive_monitor) return 0;
+
+	unsigned char payload[2];
+	payload[0] = batch_seq_id;
+	payload[1] = CRC8_calc((char*)payload, 1);
+
+	printf("[TX-OFDM-ACK-CLEAN] batch_seq_id=%u crc8=0x%02x\n",
+		(unsigned)batch_seq_id, (unsigned)payload[1]);
+	fflush(stdout);
+
+	// Stage via messages_control (same pattern as send_sack_v2_frame).
+	// Bug B fix idiom (§7.13.5): struct-copy from messages_control which
+	// has a pre-allocated .data buffer, so messages_batch_tx[0].data is
+	// non-NULL when send_batch() reads it.
+	messages_control.type = OFDM_ACK_CLEAN;
+	messages_control.sequence_number = 0;
+	messages_control.id = 0;
+	messages_control.length = sizeof(payload);
+	messages_control.data[0] = (char)payload[0];
+	messages_control.data[1] = (char)payload[1];
+	messages_control.status = ADDED_TO_BATCH_BUFFER;
+	messages_control.batch_seq_id = batch_seq_id;
+
+	message_batch_counter_tx = 0;
+	messages_batch_tx[0] = messages_control;
+	message_batch_counter_tx = 1;
+
+	// OFDM frame on the data configuration (single-shot, same as SACK_RSP).
+	telecom_system->set_mfsk_ctrl_mode(false);
+
+	SACK_TRACE("RSP TX OFDM_ACK_CLEAN: bsi=%u crc8=0x%02x",
+		(unsigned)batch_seq_id, (unsigned)payload[1]);
+	auto t_start = std::chrono::steady_clock::now();
+	send_batch();
+	auto t_end = std::chrono::steady_clock::now();
+	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		t_end - t_start).count();
+
+	printf("[TX-OFDM-ACK-CLEAN] send_batch() wire_ms=%lld\n", elapsed_ms);
+	fflush(stdout);
+	SACK_TRACE("RSP TX OFDM_ACK_CLEAN done: wire_ms=%lld", elapsed_ms);
+	return elapsed_ms;
+}
+
+// §7.13.30 — Decode an OFDM_ACK_CLEAN frame. Caller has verified
+// messages_rx_buffer.type == OFDM_ACK_CLEAN and status == RECEIVED.
+// On CRC pass: writes batch_seq_id to *out_batch_seq_id, returns true.
+// On CRC fail: emits diagnostic, returns false (no fabrication).
+bool cl_arq_controller::decode_ofdm_ack_clean(unsigned char* out_batch_seq_id)
+{
+	unsigned char payload[2];
+	payload[0] = (unsigned char)messages_rx_buffer.data[0];
+	payload[1] = (unsigned char)messages_rx_buffer.data[1];
+
+	unsigned char rx_crc       = payload[1];
+	unsigned char computed_crc = CRC8_calc((char*)payload, 1);
+
+	if(rx_crc != computed_crc)
+	{
+		printf("[CMD-OFDM-ACK-CLEAN-CRC-FAIL] rx_crc=0x%02x computed=0x%02x bsi=0x%02x (discarding; no fabrication)\n",
+			(unsigned)rx_crc, (unsigned)computed_crc, (unsigned)payload[0]);
+		fflush(stdout);
+		return false;
+	}
+
+	*out_batch_seq_id = payload[0];
+	printf("[CMD-OFDM-ACK-CLEAN] decoded batch_seq_id=%u crc8_ok=0x%02x\n",
+		(unsigned)payload[0], (unsigned)rx_crc);
+	fflush(stdout);
+	return true;
 }
 
 bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
@@ -4409,7 +4533,59 @@ bool cl_arq_controller::receive_hail_pattern()
 // Buffer was zeroed after TX, so the tail contains only fresh audio.
 // Called frequently (every ~2 symbols / 45ms) to adapt to any round-trip latency.
 // When turbo_snr_ack_enabled, also decodes 8 SNR suffix symbols and stores in turbo_received_snr.
-bool cl_arq_controller::receive_ack_pattern()
+void cl_arq_controller::zero_mfsk_ack_audio_tail()
+{
+	// §7.13.29 — zero the tail-end of the ring buffer that
+	// receive_ack_pattern() just scanned. After a strict (matched>=12)
+	// MFSK ACK detection, this prevents the OFDM Schmidl-Cox scan from
+	// false-firing on the Welch-Costas tone pattern (which has periodic
+	// structure that looks like an OFDM preamble's repeated halves).
+	// Mirrors the tail-window math from receive_ack_pattern().
+	int ack_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int pattern_len = turbo_snr_ack_enabled
+		? telecom_system->ack_mfsk.ack_snr_pattern_nsymb()
+		: ack_nsymb;
+	const int tail_nsymb = ack_nsymb + pattern_len + 16;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+
+	MUTEX_LOCK(&capture_prep_mutex);
+	if(telecom_system->data_container.passband_delayed_data != NULL)
+	{
+		int rwi = telecom_system->data_container.ring_write_index;
+		int sp = signal_period;
+		int tail_offset = sp - tail_samples;
+		// Ring has 2× capacity layout (live + mirror) — zero both halves
+		// for each ring position so wrap-around reads see the zeros too.
+		for(int k = 0; k < tail_samples; k++)
+		{
+			int pos = (rwi + tail_offset + k) % sp;
+			telecom_system->data_container.passband_delayed_data[pos] = 0.0;
+			telecom_system->data_container.passband_delayed_data[pos + sp] = 0.0;
+		}
+	}
+	MUTEX_UNLOCK(&capture_prep_mutex);
+}
+
+void cl_arq_controller::commit_ack_pattern_consumed()
+{
+	// §7.13.29 — apply the audio-advance bookkeeping that
+	// receive_ack_pattern(defer_audio_advance=true) deferred. Caller invokes
+	// this once it has decided the ACK detection is legitimate (e.g. the v2
+	// SACK_RSP cross-check failed to find a SACK_RSP, so the MFSK ACK stands).
+	MUTEX_LOCK(&capture_prep_mutex);
+	telecom_system->data_container.frames_to_read = 4;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+}
+
+bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 {
 	// Tail must cover the entire fresh audio region (= initial guard).
 	// Tail = pattern length + margin + SNR suffix. Ensures ACKs arriving early are captured.
@@ -4515,13 +4691,25 @@ bool cl_arq_controller::receive_ack_pattern()
 #ifdef MERCURY_GUI_ENABLED
 					gui_push_monitor_event("[ACK+SNR]", false);
 #endif
-					MUTEX_LOCK(&capture_prep_mutex);
-					telecom_system->data_container.frames_to_read = 4;
-					telecom_system->data_container.nUnder_processing_events = 0;
-					telecom_system->receive_stats.mfsk_search_raw = 0;
-					telecom_system->receive_stats.ofdm_search_raw = 0;
-					telecom_system->receive_stats.ofdm_batch_active = false;
-					MUTEX_UNLOCK(&capture_prep_mutex);
+					if(defer_audio_advance)
+					{
+						// §7.13.29 — leave ring untouched for follow-up
+						// SACK_RSP cross-check; caller invokes
+						// commit_ack_pattern_consumed() if it accepts the ACK.
+						MUTEX_LOCK(&capture_prep_mutex);
+						telecom_system->data_container.frames_to_read = 0;
+						MUTEX_UNLOCK(&capture_prep_mutex);
+					}
+					else
+					{
+						MUTEX_LOCK(&capture_prep_mutex);
+						telecom_system->data_container.frames_to_read = 4;
+						telecom_system->data_container.nUnder_processing_events = 0;
+						telecom_system->receive_stats.mfsk_search_raw = 0;
+						telecom_system->receive_stats.ofdm_search_raw = 0;
+						telecom_system->receive_stats.ofdm_batch_active = false;
+						MUTEX_UNLOCK(&capture_prep_mutex);
+					}
 					return true;
 				}
 				else
@@ -4546,13 +4734,23 @@ bool cl_arq_controller::receive_ack_pattern()
 #ifdef MERCURY_GUI_ENABLED
 						gui_push_monitor_event("[ACK+SNR]", false);
 #endif
-						MUTEX_LOCK(&capture_prep_mutex);
-						telecom_system->data_container.frames_to_read = 4;
-						telecom_system->data_container.nUnder_processing_events = 0;
-						telecom_system->receive_stats.mfsk_search_raw = 0;
-						telecom_system->receive_stats.ofdm_search_raw = 0;
-						telecom_system->receive_stats.ofdm_batch_active = false;
-						MUTEX_UNLOCK(&capture_prep_mutex);
+						if(defer_audio_advance)
+						{
+							// §7.13.29 — defer the ring advance; caller commits.
+							MUTEX_LOCK(&capture_prep_mutex);
+							telecom_system->data_container.frames_to_read = 0;
+							MUTEX_UNLOCK(&capture_prep_mutex);
+						}
+						else
+						{
+							MUTEX_LOCK(&capture_prep_mutex);
+							telecom_system->data_container.frames_to_read = 4;
+							telecom_system->data_container.nUnder_processing_events = 0;
+							telecom_system->receive_stats.mfsk_search_raw = 0;
+							telecom_system->receive_stats.ofdm_search_raw = 0;
+							telecom_system->receive_stats.ofdm_batch_active = false;
+							MUTEX_UNLOCK(&capture_prep_mutex);
+						}
 						return true;
 					}
 					// else: keep polling, suffix not yet in buffer
@@ -4601,13 +4799,25 @@ bool cl_arq_controller::receive_ack_pattern()
 #ifdef MERCURY_GUI_ENABLED
 				gui_push_monitor_event("[ACK]", false);
 #endif
-				MUTEX_LOCK(&capture_prep_mutex);
-				telecom_system->data_container.frames_to_read = 4;
-				telecom_system->data_container.nUnder_processing_events = 0;
-				telecom_system->receive_stats.mfsk_search_raw = 0;
-				telecom_system->receive_stats.ofdm_search_raw = 0;
-				telecom_system->receive_stats.ofdm_batch_active = false;
-				MUTEX_UNLOCK(&capture_prep_mutex);
+				if(defer_audio_advance)
+				{
+					// §7.13.29 — leave ring untouched for follow-up SACK_RSP
+					// cross-check; caller invokes commit_ack_pattern_consumed()
+					// if it accepts the ACK.
+					MUTEX_LOCK(&capture_prep_mutex);
+					telecom_system->data_container.frames_to_read = 0;
+					MUTEX_UNLOCK(&capture_prep_mutex);
+				}
+				else
+				{
+					MUTEX_LOCK(&capture_prep_mutex);
+					telecom_system->data_container.frames_to_read = 4;
+					telecom_system->data_container.nUnder_processing_events = 0;
+					telecom_system->receive_stats.mfsk_search_raw = 0;
+					telecom_system->receive_stats.ofdm_search_raw = 0;
+					telecom_system->receive_stats.ofdm_batch_active = false;
+					MUTEX_UNLOCK(&capture_prep_mutex);
+				}
 				return true;
 			}
 		}
@@ -5022,13 +5232,20 @@ void cl_arq_controller::receive()
 						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+ACK_MULTI_ACK_RANGE_HEADER_LENGTH];
 					}
 				}
-				else if(messages_rx_buffer.type==SACK_RSP)
+				else if(messages_rx_buffer.type==SACK_RSP
+				        || messages_rx_buffer.type==OFDM_ACK_CLEAN)
 				{
-					// SACK Design A Step 7 — OFDM SACK_RSP. 3-byte header;
-					// payload bytes [batch_seq_id, bitmap..., CRC8] live in
-					// messages_rx_buffer.data[0..length-1]. Length is derived
-					// by the caller (decode_sack_v2_frame) from the negotiated
-					// data_batch_size. We DO NOT decode here — only copy.
+					SACK_TRACE("receive() parsed %s frame: seq=%d conn_id=0x%02x",
+						messages_rx_buffer.type==SACK_RSP ? "SACK_RSP" : "OFDM_ACK_CLEAN",
+						(int)messages_rx_buffer.sequence_number,
+						(unsigned char)message_TxRx_byte_buffer[1]);
+					// SACK Design A Step 7 / §7.13.30 — OFDM SACK_RSP and
+					// OFDM_ACK_CLEAN share the same wire shape (3-byte msg
+					// header + payload). Payload bytes live in
+					// messages_rx_buffer.data[0..]. Length is derived by the
+					// caller (decode_sack_v2_frame for SACK_RSP, or
+					// decode_ofdm_ack_clean for OFDM_ACK_CLEAN). We DO NOT
+					// decode here — only copy the payload bytes.
 					int copy_len = max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 					if(copy_len > alloc_size) copy_len = alloc_size;
 					for(int j=0;j<copy_len;j++)
@@ -5037,8 +5254,8 @@ void cl_arq_controller::receive()
 					}
 					// length field on messages_rx_buffer is not set by the wire
 					// for ACK-family frames (the LDPC codeword size implicitly
-					// bounds it). The caller will validate using
-					// data_batch_size + the CRC8 byte position.
+					// bounds it). The caller will validate using the type-
+					// specific payload layout.
 				}
 				else if(messages_rx_buffer.type==DATA_LONG)
 				{
@@ -5295,6 +5512,10 @@ void cl_arq_controller::receive()
 							pream_symb, ftr,
 							telecom_system->receive_stats.coarse_metric);
 						fflush(stdout);
+						SACK_TRACE("anti-spin INCOMPLETE: pream=%d ftr=%d metric=%.3f delay=%d — ring will shift by 8 syms",
+							pream_symb, ftr,
+							telecom_system->receive_stats.coarse_metric,
+							received_message_stats.delay);
 					}
 					else if(pream_symb > upper)
 					{
@@ -5538,6 +5759,9 @@ void cl_arq_controller::receive()
 					telecom_system->receive_stats.ofdm_search_raw = 0;
 					telecom_system->receive_stats.ofdm_batch_active = false;
 				}
+				SACK_TRACE("anti-spin OFDM-FAIL full-frame: ftr=%d delay=%d search_raw=%d — ring shifts by full frame",
+					rx_frame, received_message_stats.delay,
+					telecom_system->receive_stats.ofdm_search_raw);
 			}
 			else if(telecom_system->M != MOD_MFSK && received_message_stats.delay >= 0)
 			{

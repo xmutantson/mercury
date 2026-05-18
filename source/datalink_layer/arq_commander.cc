@@ -22,10 +22,31 @@
 
 #include "datalink_layer/arq.h"
 #include "common/timing_log.h"
+#include <cstdlib>
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
+
+// SACK_RX_TRACE: env-gated diagnostic for the SACK_RSP receive path.
+// Enable with MERCURY_SACK_RX_TRACE=1. No output when unset.
+// Cached on first call; one branch per macro hit when disabled.
+static inline bool sack_rx_trace_enabled()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_SACK_RX_TRACE");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+#define SACK_TRACE(fmt, ...) do { \
+	if(sack_rx_trace_enabled()) { \
+		printf("[SACK-RX-TRACE] " fmt "\n", ##__VA_ARGS__); \
+		fflush(stdout); \
+	} \
+} while(0)
 
 void cl_arq_controller::register_ack(int message_id)
 {
@@ -916,6 +937,8 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
+		v2_dispatch_last_rwi = -1;               // §7.13.30 v2 dispatch throttle
+		v2_dispatch_min_advance_syms = 1;        // §7.13.30 default throttle interval
 		calculate_receiving_timeout();
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
@@ -1173,6 +1196,8 @@ void cl_arq_controller::process_messages_tx_data()
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
+		v2_dispatch_last_rwi = -1;               // §7.13.30 v2 dispatch throttle
+		v2_dispatch_min_advance_syms = 1;        // §7.13.30 default throttle interval
 		// ACK pattern detection uses dedicated ack_mfsk — no config switch needed
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
@@ -1757,213 +1782,160 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			bool sack_window_open = sack_enabled && data_ack_received == NO
 				&& receiving_timer.get_elapsed_time_ms() > (unsigned int)(ack_pattern_time_ms);
 
+			SACK_TRACE("poll bsi=%d cfg=%d rx_t=%ums ack_t=%dms sack_en=%d v2_en=%d window=%d axis3=%d dar=%d peak_match=%d",
+				cmd_batch_seq_id, current_configuration,
+				receiving_timer.get_elapsed_time_ms(), ack_pattern_time_ms,
+				sack_enabled ? 1 : 0, sack_v2_enabled ? 1 : 0,
+				sack_window_open ? 1 : 0, (int)axis3_sack_mode,
+				(int)data_ack_received, ack_diag_peak_matched);
+
 			bool sack_detected = false;
 			bool sack_bitmap[MAX_SACK_BATCH_SIZE];
-			// Bug A fix (§7.13.1): v2 SACK_RSP dispatch must NOT drain the audio
-			// ring on a clean batch, because on clean batches RSP emits the
-			// legacy MFSK ACK pattern (not SACK_RSP — see arq_responder.cc
-			// process_messages_acknowledging_data, partial-batch branch is the
-			// only v2 SACK_RSP emit site). If we call this->receive() first,
-			// the OFDM demod fails on the MFSK audio and the FAIL anti-spin
-			// path at arq_common.cc:~5836 sets frames_to_read=8, which
-			// schedules the capture thread to shift the ring by 8 symbols —
-			// destroying part of the ~32-symbol ACK pattern. Within 3-4 polls
-			// the ACK pattern is gone, CMD times out, retransmits the entire
-			// batch, RSP correctly drops as prev_inactive_late_retransmit, and
-			// throughput collapses (§7.13.4 mechanism trace).
-			//
-			// Fix: probe for the legacy ACK pattern FIRST. receive_ack_pattern()
-			// is cheap (energy-gated; only runs the MFSK matched filter when
-			// signal is present) and does NOT shift the ring on a miss
-			// (sets frames_to_read=2 to throttle the next poll). If detected,
-			// short-circuit the v2 receive and let the existing ACK-handler at
-			// the :1898 else-if fire via the v2_ack_pat_pre_detected flag.
-			// Strictly gated on sack_v2_enabled — v1 path untouched.
+			// §7.13.29 — set true when the strict-threshold MFSK detector
+			// confirmed an ACK this poll. The fallthrough ACK_PAT handler
+			// reads this to accept the ACK without re-running receive_ack_pattern
+			// (which would use the default lenient threshold and risk a
+			// false-fire on OFDM SACK_RSP body audio).
 			bool v2_ack_pat_pre_detected = false;
 
 			if(sack_window_open)
 			{
 				memset(sack_bitmap, 0, sizeof(sack_bitmap));
-				if(sack_v2_enabled)
+				if(sack_v2_enabled && axis3_sack_mode != SACK_MODE_OFF)
 				{
-					// SACK Design A Step 11 — Axis 3 SACK_MODE_OFF gate.
-					// When Axis 3 has demoted SACK to OFF (reverse path too
-					// unreliable), CMD does NOT enter decode_sack_v2_frame().
-					// RSP is also suppressing SACK_RSP TX (see arq_responder.cc).
-					// Graceful degradation: receive_ack_pattern() below still
-					// runs; if the batch had losses, the ACK-timeout path at
-					// arq_commander.cc:~2010 forces PENDING_ACK→ACK_TIMED_OUT
-					// and process_messages_tx_data() resends the whole batch.
-					if(axis3_sack_mode == SACK_MODE_OFF)
+					// §7.13.30 — pure OFDM dispatch. v2 sessions never send
+					// MFSK ACK in the SACK window (RSP uses OFDM_ACK_CLEAN
+					// for clean batches and SACK_RSP for partial). CMD only
+					// runs OFDM decode; no MFSK detector to false-fire on
+					// SACK_RSP body audio, no OFDM Schmidl-Cox to false-fire
+					// on Welch-Costas pattern. Both ambiguities eliminated
+					// at the source.
+					//
+					// New-audio throttle: only call receive() when enough
+					// new audio has arrived since the last call.
+					//   - Normal case: 1 OFDM symbol of advance (~24 ms).
+					//   - After receive() returned INCOMPLETE (overflow):
+					//     wait for (overflow + 4) symbols of new audio
+					//     before retry. Without this, each retry would see
+					//     overflow that decreased by only 1 symbol per
+					//     poll — burning ~12 fruitless polls of
+					//     Schmidl-Cox scans (v15 bug, observed in R1+).
+					int rwi = telecom_system->data_container.ring_write_index;
+					int sym_samples =
+						telecom_system->data_container.Nofdm
+						* telecom_system->data_container.interpolation_rate;
+					int sp = sym_samples * telecom_system->data_container.buffer_Nsymb;
+					int advance = (v2_dispatch_last_rwi >= 0)
+						? ((rwi - v2_dispatch_last_rwi + sp) % sp)
+						: sym_samples * v2_dispatch_min_advance_syms;  // first poll → process
+
+					int needed_advance =
+						sym_samples * v2_dispatch_min_advance_syms;
+
+					if(advance < needed_advance)
 					{
-						// No SACK_RSP decode attempt this cycle — fall through
-						// to receive_ack_pattern() check below.
+						// Not enough new audio yet; skip this poll.
+						SACK_TRACE("v2 OFDM dispatch: skipping poll (advance=%d/%d, need=%d syms)",
+							advance, needed_advance, v2_dispatch_min_advance_syms);
 					}
 					else
 					{
-						// Bug A fix (§7.13.1): probe legacy ACK pattern first.
-						// On clean batches RSP emits the MFSK ACK pattern (not
-						// SACK_RSP). receive_ack_pattern() is cheap (energy-
-						// gated) and does NOT shift the ring on a miss; if it
-						// hits, we short-circuit and skip this->receive() so
-						// the OFDM-FAIL anti-spin path can't destroy the ACK
-						// audio. On a hit, we set v2_ack_pat_pre_detected so
-						// the :1898 else-if fires via short-circuit OR (it
-						// would otherwise no-op because receive_ack_pattern()
-						// already set frames_to_read=4).
-						bool ack_pat_hit = false;
-						if(data_ack_received == NO)
-							ack_pat_hit = receive_ack_pattern();
-						if(ack_pat_hit)
-						{
-							// Bug C fix (§7.13.10 SACK_DESIGN_A_PLAN): the
-							// receive_ack_pattern detector can false-fire on
-							// OFDM SACK_RSP audio's random spectral coincidence
-							// with MFSK ACK tone frequencies (see §7.13.9).
-							// Cross-check by giving this->receive() a chance
-							// to decode an OFDM SACK_RSP frame in the same
-							// audio window. If receive() finds a SACK_RSP, the
-							// OFDM preamble correlation has already validated
-							// that the in-flight signal is OFDM — override the
-							// MFSK ACK false-positive and process SACK_RSP.
-							// If receive() doesn't find SACK_RSP, the original
-							// ACK detection stands and FAST proceeds normally.
-							//
-							// Cost on clean cells: one extra this->receive()
-							// call per FAST-detected batch (~5-15 ms OFDM
-							// demod, no preamble found, returns quickly via
-							// anti-spin). Total clean-cell slowdown: <2 %.
-							//
-							// IMPORTANT: receive_ack_pattern() set
-							// frames_to_read=4 on its hit; receive() early-
-							// returns when frames_to_read != 0
-							// (arq_common.cc:5027). Force frames_to_read=0
-							// so receive() actually runs OFDM decode on the
-							// same audio tail we just classified as MFSK ACK.
-							MUTEX_LOCK(&capture_prep_mutex);
-							telecom_system->data_container.frames_to_read = 0;
-							MUTEX_UNLOCK(&capture_prep_mutex);
-							this->receive();
-							if(messages_rx_buffer.status == RECEIVED
-							   && messages_rx_buffer.type == SACK_RSP)
-							{
-								unsigned char rx_bsi = 0;
-								if(decode_sack_v2_frame(sack_bitmap, data_batch_size, &rx_bsi))
-								{
-									sack_detected = true;
-									ack_pat_hit = false;   // SACK_RSP wins
-									printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — OVERRIDES ACKPAT-FAST false positive\n",
-										(unsigned)rx_bsi, cmd_batch_seq_id);
-									fflush(stdout);
-									policy_evaluate_axis3(true);
-								}
-								else
-								{
-									// CRC fail — record Axis-3 miss event but
-									// fall through to original FAST behavior.
-									policy_evaluate_axis3(false);
-								}
-								messages_rx_buffer.status = FREE;
-							}
+						v2_dispatch_last_rwi = rwi;
+						MUTEX_LOCK(&capture_prep_mutex);
+						telecom_system->data_container.frames_to_read = 0;
+						MUTEX_UNLOCK(&capture_prep_mutex);
+						// §7.13.31 — sack_cross_check_mode REMOVED here. It
+						// raised the OFDM detection threshold to 0.65 which
+						// was useful when MFSK ACK could false-fire OFDM
+						// Schmidl-Cox; in the §7.13.30 pure-OFDM architecture
+						// there is no MFSK signal in the SACK window so the
+						// strict threshold is unnecessary AND was rejecting
+						// legitimate CONTROL frames (e.g., SET_LINK_PARAMS
+						// from policy_evaluate_axis2) whose preamble metric
+						// is below 0.65. v18 r1 showed CMD sending
+						// SET_LINK_PARAMS 10x with 0 ACKs — RSP couldn't
+						// decode because sack_cross_check_mode rejected it.
+						SACK_TRACE("v2 OFDM dispatch: calling receive() advance=%d need_syms=%d",
+							advance, v2_dispatch_min_advance_syms);
+						this->receive();
 
-							if(ack_pat_hit)
-							{
-								v2_ack_pat_pre_detected = true;
-								printf("[CMD-SACK-V2-ACKPAT-FAST] legacy ACK pattern pre-detected in v2 SACK window — skipping further this->receive() to preserve audio\n");
-								fflush(stdout);
-								// sack_detected stays false → fall straight through
-								// to the existing ACK-pattern handler at :1898+.
-							}
-						}
-						// Bug A fix (§7.13.1) defense-in-depth: even if the ACK
-						// pattern hasn't fully arrived yet (only partial match
-						// so far), an ACK pattern in flight means we should
-						// avoid calling this->receive() for a brief window —
-						// its OFDM-FAIL anti-spin would shift the ring buffer
-						// and destroy the remaining in-flight ACK symbols.
-						// ack_diag_peak_matched is the running peak across all
-						// polls in this receive window (reset at TX-end in
-						// arq_commander.cc:891 / :1141). A peak of >= 2 matched
-						// tones is mild evidence of ACK pattern in progress,
-						// but OFDM SACK_RSP audio can produce 2-3 matched tones
-						// from spectral coincidence on the MFSK ACK tone
-						// frequencies. Hence: BOUND the defer count. After
-						// v2_ackpat_defer_count_this_window reaches 5 (~225ms
-						// WB), give up and try this->receive() so OFDM SACK_RSP
-						// can decode in the partial-batch case. MFSK ACK
-						// pattern fully arrives in <~800ms; after the budget,
-						// if no ACK detection materialized, the audio is
-						// either SACK_RSP or noise — let receive() try.
-						// v2_ackpat_defer_count_this_window is reset alongside
-						// ack_diag_peak_matched at TX-end (arq_commander.cc:891
-						// / :1141 — see Bug A fix block there).
-						else if(ack_diag_peak_matched >= 2
-						        && v2_ackpat_defer_count_this_window < 5)
+						// After receive(): if INCOMPLETE-overflow fired,
+						// the next dispatch must wait for the missing
+						// tail to arrive. Reset throttle to 1 sym by
+						// default; bump to overflow+4 if we just hit one.
+						int overflow_syms =
+							telecom_system->receive_stats.frame_overflow_symbols;
+						if(overflow_syms > 0)
+							v2_dispatch_min_advance_syms = overflow_syms + 4;
+						else
+							v2_dispatch_min_advance_syms = 1;
+
+						SACK_TRACE("v2 OFDM dispatch done: status=%d type=%d overflow=%d next_advance=%d syms",
+							(int)messages_rx_buffer.status,
+							(int)messages_rx_buffer.type,
+							overflow_syms,
+							v2_dispatch_min_advance_syms);
+					}
+
+					if(messages_rx_buffer.status == RECEIVED
+					   && messages_rx_buffer.type == SACK_RSP)
+					{
+						// Partial-batch SACK_RSP path — decode the bitmap.
+						unsigned char rx_bsi = 0;
+						bool decoded = decode_sack_v2_frame(
+							sack_bitmap, data_batch_size, &rx_bsi);
+						SACK_TRACE("decode_sack_v2: ok=%d rx_bsi=%u cmd_bsi=%d",
+							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
+						if(decoded
+						   && (int)rx_bsi == cmd_last_applied_sack_bsi)
 						{
-							// Defer this->receive() — ACK pattern *might* be
-							// incoming. Throttle to next poll (~45ms WB) so
-							// the capture thread keeps filling without us
-							// shifting the ring. Budgeted to 5 polls so the
-							// v2 SACK_RSP partial-batch decode path is not
-							// permanently starved.
-							v2_ackpat_defer_count_this_window++;
-							telecom_system->data_container.frames_to_read = 2;
-							telecom_system->data_container.nUnder_processing_events = 0;
-							// Log every defer so the cap is observable.
-							printf("[CMD-SACK-V2-ACKPAT-WAIT] partial ACK seen (peak=%d/%d, defer=%d/5) — deferring this->receive() to preserve ring\n",
-								ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold,
-								v2_ackpat_defer_count_this_window);
+							printf("[CMD-SACK-V2-DUPLICATE] bsi=%u already applied — ignoring\n",
+								(unsigned)rx_bsi);
 							fflush(stdout);
+							decoded = false;
+						}
+						if(decoded)
+						{
+							sack_detected = true;
+							cmd_last_applied_sack_bsi = (int)rx_bsi;
+							int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+							sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
+							sack_arrival_history_next_idx =
+								(sack_arrival_history_next_idx + 1) % SACK_ARRIVAL_HISTORY;
+							if(sack_arrival_history_count < SACK_ARRIVAL_HISTORY)
+								sack_arrival_history_count++;
+							printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) arrival_ms=%d — applying to retransmit queue\n",
+								(unsigned)rx_bsi, cmd_batch_seq_id, arrival_ms);
+							fflush(stdout);
+							policy_evaluate_axis3(true);
 						}
 						else
 						{
-							// SACK Design A Step 7 — OFDM SACK_RSP receive path.
-							// Demodulate any OFDM LDPC frame that landed. If it
-							// parses as SACK_RSP and the CRC8 validates, accept
-							// the bitmap. On CRC failure, the bitmap is DISCARDED
-							// (no fabrication per §9.4/A2) and we fall through to
-							// ACK-pattern detection / timeout-driven retransmit,
-							// exactly as if the control frame had been lost in
-							// the air.
-							this->receive();
-							if(messages_rx_buffer.status == RECEIVED
-							   && messages_rx_buffer.type == SACK_RSP)
-							{
-								unsigned char rx_bsi = 0;
-								if(decode_sack_v2_frame(sack_bitmap, data_batch_size, &rx_bsi))
-								{
-									sack_detected = true;
-									printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) — applying to retransmit queue\n",
-										(unsigned)rx_bsi, cmd_batch_seq_id);
-									fflush(stdout);
-									// SACK Design A Step 11 — Axis 3 ok event.
-									policy_evaluate_axis3(true);
-								}
-								else
-								{
-									// CRC fail → decode_sack_v2_frame already
-									// emitted [CMD-SACK-V2-CRC-FAIL]; record as
-									// an Axis-3 miss event (§4.3.2 spec — miss
-									// includes CRC/LDPC failure).
-									policy_evaluate_axis3(false);
-								}
-								messages_rx_buffer.status = FREE;
-							}
-							else
-							{
-								// No SACK_RSP frame yet — keep the receive loop
-								// going (the existing ACK-pattern check below
-								// will run on this same poll).
-								if(messages_rx_buffer.status == RECEIVED)
-								{
-									// Unexpected non-SACK_RSP frame arrived during
-									// the SACK window. Don't act on it here; leave
-									// it for the existing fallback dispatcher to
-									// process on the next iteration.
-									// (Keeping messages_rx_buffer.status as-is.)
-								}
-							}
+							policy_evaluate_axis3(false);
 						}
+						messages_rx_buffer.status = FREE;
+					}
+					else if(messages_rx_buffer.status == RECEIVED
+					        && messages_rx_buffer.type == OFDM_ACK_CLEAN)
+					{
+						// §7.13.30 — clean-batch OFDM ACK. No bitmap; just
+						// validate CRC and accept as a full-batch ACK via the
+						// existing v2_ack_pat_pre_detected → ACK_PAT handler
+						// fallthrough (line ~2031). This replaces the MFSK
+						// ACK path that v2 sessions no longer use.
+						unsigned char rx_bsi = 0;
+						bool decoded = decode_ofdm_ack_clean(&rx_bsi);
+						SACK_TRACE("decode_ofdm_ack_clean: ok=%d rx_bsi=%u cmd_bsi=%d",
+							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
+						if(decoded)
+						{
+							v2_ack_pat_pre_detected = true;
+							int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+							printf("[CMD-OFDM-ACK-CLEAN] accepted batch_seq_id=%u (cmd_batch_seq_id=%d) arrival_ms=%d\n",
+								(unsigned)rx_bsi, cmd_batch_seq_id, arrival_ms);
+							fflush(stdout);
+						}
+						messages_rx_buffer.status = FREE;
 					}
 				}
 				// Step 15: legacy MFSK SACK receive path deleted. When
@@ -2027,6 +1999,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					rx_count, data_batch_size, retransmit_count);
 				fflush(stdout);
 
+				SACK_TRACE("dar=YES via SACK_RSP path rx_count=%d batch=%d retx=%d",
+					rx_count, data_batch_size, retransmit_count);
 				data_ack_received = YES;
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;
@@ -2071,7 +2045,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// flag so we don't re-call receive_ack_pattern() (which would now
 			// return false due to frames_to_read=4 throttle set by the
 			// successful first call).
-			else if(data_ack_received==NO && (v2_ack_pat_pre_detected || receive_ack_pattern()))
+			// §7.13.29 — fallthrough MFSK ACK handler. Accept if either:
+			// (a) the strict MFSK-first probe (threshold 12) already
+			//     confirmed this poll, recorded via v2_ack_pat_pre_detected;
+			// (b) we're OUTSIDE the SACK window — receive_ack_pattern() at
+			//     default threshold 7 is fine for non-data ACK paths.
+			// Inside the SACK window the lenient threshold is DELIBERATELY
+			// avoided: it false-fires on OFDM SACK_RSP body audio (the
+			// silent-drop bug). If strict missed but lenient would catch,
+			// we let timeout-driven retransmit handle it — better a retx
+			// than a silent drop.
+			else if(data_ack_received==NO
+			        && (v2_ack_pat_pre_detected
+			            || (!sack_window_open && receive_ack_pattern())))
 			{
 				printf("[CMD-ACK-PAT] Data ACK pattern detected!\n");
 				fflush(stdout);
@@ -2081,6 +2067,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				watchdog_timer.start();
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
+				SACK_TRACE("dar=YES via MFSK ACK_PAT path pre_detected=%d",
+					v2_ack_pat_pre_detected ? 1 : 0);
 				data_ack_received=YES;
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;

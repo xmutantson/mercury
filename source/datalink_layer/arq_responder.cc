@@ -1259,8 +1259,24 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		repeating_last_ack=NO;
 		messages_control.status=FREE;
 
-		// ACK pattern uses dedicated ack_mfsk (M=16, nStreams=1) — no config switch needed
-		send_ack_pattern();
+		// §7.13.30 — on v2 sessions, send OFDM_ACK_CLEAN instead of the
+		// legacy MFSK ACK pattern so the SACK window contains ONLY OFDM
+		// signals (eliminates the MFSK-vs-OFDM detector ambiguity that
+		// caused the silent-drop bug). bsi = the batch we just completed
+		// (rsp_prev_batch_seq_id after the +1 bump above). Non-v2 sessions
+		// stay on the legacy MFSK ACK pattern (unchanged).
+		if(sack_v2_enabled)
+		{
+			unsigned char ack_bsi = (unsigned char)(
+				rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
+			send_ofdm_ack_clean(ack_bsi);
+		}
+		else
+		{
+			// Legacy MFSK ACK (M=16, nStreams=1) — dedicated ack_mfsk
+			// path, no config switch needed.
+			send_ack_pattern();
+		}
 
 		if(passive_monitor)
 		{

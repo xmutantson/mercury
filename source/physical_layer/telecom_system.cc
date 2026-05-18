@@ -1081,7 +1081,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// instead of staying below 0.15. Raise threshold for NB to prevent
 			// false detections that waste decode time and push real preambles
 			// beyond the buffer boundary (causing NAcks).
-			double preamble_detect_threshold = narrowband_enabled ? 0.30 : 0.15;
+			// §7.13.29 (Proposal A) — cross-check pass uses stricter threshold.
+			double preamble_detect_threshold = sack_cross_check_mode
+				? (narrowband_enabled ? 0.75 : 0.65)
+				: (narrowband_enabled ? 0.30 : 0.15);
 
 			// BER test: known delay bypasses detection entirely (same as mfsk_fixed_delay).
 			// The forced delay positions the preamble exactly; no detection needed.
@@ -1408,7 +1411,15 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 	int lower_bound = data_container.preamble_nSymb;
 	int upper_bound = data_container.buffer_Nsymb-(data_container.Nsymb+data_container.preamble_nSymb);
-	double preamble_detect_threshold = narrowband_enabled ? 0.30 : 0.15;
+	// §7.13.29 (Proposal A) — SACK_RSP cross-check uses a stricter detection
+	// threshold so Schmidl-Cox sub-peaks in OFDM body audio (consistently
+	// metric≈0.555 in trace, vs ~0.9 for a real preamble) are rejected before
+	// burning the Moose trial budget. Default 0.15 (WB) / 0.30 (NB) stays for
+	// normal data RX where real preambles can have low metric under heavy
+	// fading and we cannot afford to drop them.
+	double preamble_detect_threshold = sack_cross_check_mode
+		? (narrowband_enabled ? 0.75 : 0.65)
+		: (narrowband_enabled ? 0.30 : 0.15);
 
 	if(M != MOD_MFSK)
 	{
@@ -1801,8 +1812,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		double mean_H = -1.0;
 		bool skip_h_recovery_attempted = false;
 		int consecutive_skip_var = 0;  // Phase-F stall fix: break trial loop if N+ SKIP-VAR in a row
+		// §7.13.29 (Proposal B) — SACK_RSP cross-check pays more trials so the
+		// search escapes Schmidl-Cox sub-peak false locks. Default 2 stays for
+		// normal data RX where extra trials waste CPU on real LDPC failures.
+		const int effective_trials_max = sack_cross_check_mode
+			? (time_sync_trials_max > 5 ? time_sync_trials_max : 5)
+			: time_sync_trials_max;
 skip_h_retry_point:
-		while (receive_stats.sync_trials<=time_sync_trials_max)
+		while (receive_stats.sync_trials<=effective_trials_max)
 		{
 			if(mfsk_fixed_delay >= 0)
 			{
@@ -2119,7 +2136,7 @@ skip_h_retry_point:
 				// BER test: true freq offset is 0, skip estimation
 				freq_offset_measured = 0;
 			}
-			else if(receive_stats.sync_trials==time_sync_trials_max && use_last_good_freq_offset==YES && receive_stats.freq_offset_of_last_decoded_message!=0)
+			else if(receive_stats.sync_trials==effective_trials_max && use_last_good_freq_offset==YES && receive_stats.freq_offset_of_last_decoded_message!=0)
 			{
 				freq_offset_measured=receive_stats.freq_offset_of_last_decoded_message;
 			}
@@ -2158,9 +2175,11 @@ skip_h_retry_point:
 				double moose_sanity_limit = subcarrier_spacing * 0.7;  // ~32.8 Hz for WB
 				if(g_verbose)
 					printf("[MOOSE-RAW] unclamped=%.4f Hz, sanity=%.1f Hz\n", freq_offset_measured, moose_sanity_limit);
-				if(fabs(freq_offset_measured) > moose_sanity_limit && receive_stats.sync_trials < time_sync_trials_max)
+				if(fabs(freq_offset_measured) > moose_sanity_limit && receive_stats.sync_trials < effective_trials_max)
 				{
-					printf("[MOOSE-REJECT] freq=%.1f Hz exceeds sanity limit — bad timing, advancing trial\n", freq_offset_measured);
+					printf("[MOOSE-REJECT] freq=%.1f Hz exceeds sanity limit — bad timing, advancing trial (sack_xcheck=%d trials=%d/%d)\n",
+						freq_offset_measured, sack_cross_check_mode ? 1 : 0,
+						receive_stats.sync_trials + 1, effective_trials_max);
 					fflush(stdout);
 					receive_stats.sync_trials++;
 					continue;
