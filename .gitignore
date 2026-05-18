@@ -56,3 +56,59 @@ tools/watchpoint_gdb.py
 
 # Windows short filename artifacts
 NDH6SA~M
+
+# Fact documents — investigation/design notes that live alongside code
+# for context but should NOT be pushed upstream. Local working memory,
+# not the canonical upstream record.
+fact-documents/
+
+# Test result JSONs at repo root (benchmark/loopback output, not source)
+/v2_*.json
+
+# Cross-built binaries
+/mercury_aarch64
+
+# Reference docs (large, not source)
+/Mercury_Mode_Reference.pdf
+
+# Python bytecode cache
+__pycache__/
+
+# Temp / scratch files
+*_tmp.txt
+
+# IONOS test result directories
+/ionos_results/
+
+# IONOS test harness — dev-machine-specific (refs internal build server IPs)
+/ionos_test.py
+
+# Dev-machine scripts in tools/ are not for upstream by default.
+# Whitelist (!) the ones that ARE source — currently tracked as of
+# this gitignore commit. New tools must be either added to the
+# whitelist OR named differently to be tracked.
+tools/*.py
+tools/*.sh
+!tools/analyze_turboshift_log.py
+!tools/arq_timing_diag.py
+!tools/awgn_turboshift_test.py
+!tools/compression_test.py
+!tools/dual_benchmark.py
+!tools/encryption_test.py
+!tools/generate_ldpc_10_16.py
+!tools/generate_ldpc_12_16.py
+!tools/mercury_benchmark.py
+!tools/nb_negotiation_test.py
+!tools/punctured_ber_test.py
+!tools/robust_loopback_test.py
+!tools/sack_v2_compression_coupling_test.py
+!tools/sack_v2_loopback_test.py
+!tools/sweep_configs.py
+!tools/test_autocompress.py
+!tools/test_break_handler_reset.py
+!tools/test_bw_neg.sh
+!tools/test_monitor_data.sh
+!tools/throughput_test.py
+!tools/timesync_trace_validate.py
+!tools/validate_ldpc_matrices.py
+!tools/wb_sweep_clean.py
