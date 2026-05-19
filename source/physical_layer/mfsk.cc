@@ -227,7 +227,17 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	{
 		const int tones[] = {6, 14, 2, 3, 10, 8, 11, 15};
 		for (int i = 0; i < 8; i++) break_tones[i] = tones[i];
-		break_match_threshold = 12;
+		// 10/16 (was 12). gearshift_v10 BREAK-PROBE distribution measured
+		// matched values clustering at 6 and 11 with rare 16 — and a
+		// natural gap at 9-10 — so the old threshold of 12 sat in the
+		// gap and missed BREAK ~95% of the time. Real BREAK reliably
+		// hits 11. Set at 10 for extra robustness in marginal audio
+		// conditions (a future quiet channel or low TX-BREAK boost may
+		// shave a tone off, making the threshold-11 case fragile).
+		// P(false|coarse_metric<0.30 gate active) ≈ 4.5e-9/poll which
+		// is bounded — the coarse_metric gate already excludes OFDM
+		// signal that aliases the tone bins.
+		break_match_threshold = 10;
 	}
 	else if (M == 8)
 	{

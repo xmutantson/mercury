@@ -3094,6 +3094,15 @@ double cl_telecom_system::detect_break_pattern_from_passband(double* data, int s
 		sampling_frequency, effective_carrier, carrier_amplitude,
 		M, &ofdm.FIR_rx_data);
 
+	// always_fine=true: BREAK is a one-shot single-burst (no polling loop),
+	// so the asynchronous arrival phase often lands mid-symbol. Without
+	// fine sample-rate refinement, FFT windows straddle two transmitted
+	// symbols and coarse-only match collapses well below the 12/16 BREAK
+	// threshold — manifested as 0 BREAK detections across 10 transmissions
+	// in gearshift_v9 smoke. ACK detector polls every ~2-3 ms with sliding
+	// tail snapshots so its alignment lottery eventually wins, but BREAK
+	// fires once per ~100 ms full RX-TIMING FAIL — one bad alignment per
+	// burst is the typical case.
 	double metric = ofdm.detect_ack_pattern(
 		data_container.baseband_data_interpolated, size / M,
 		1,
@@ -3101,7 +3110,10 @@ double cl_telecom_system::detect_break_pattern_from_passband(double* data, int s
 		ack_mfsk.break_tones, ack_mfsk.ack_pattern_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
-		out_matched);
+		out_matched,
+		/*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		/*out_best_offset=*/nullptr, /*reserve_after=*/0,
+		/*out_match_mask=*/nullptr, /*always_fine=*/true);
 
 	return metric;
 }
@@ -4877,7 +4889,9 @@ char cl_telecom_system::get_configuration(double SNR)
 {
 	char configuration;
 
-	if(SNR>11)
+	if(SNR>13)
+		configuration=CONFIG_16;
+	else if(SNR>11)
 		configuration=CONFIG_15;
 	else if(SNR>9)
 		configuration=CONFIG_14;

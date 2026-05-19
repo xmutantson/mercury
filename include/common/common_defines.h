@@ -73,20 +73,28 @@ inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 // sparse pilot grid (Nc=10, Dy=3) cannot provide with sufficient accuracy.
 #define NB_CONFIG_MAX CONFIG_14
 
-// WB mode cap — CONFIG_16 (32QAM) disabled: control frames decode at much lower
-// SNR than data frames, causing false turboshift ceilings. Data frames at CONFIG_16
-// show <12% success even at 20 dB SNR on real channels.
-#define WB_CONFIG_MAX CONFIG_15
+// WB mode cap — CONFIG_16 (32QAM) re-enabled with SACK Design A.
+// History: CONFIG_16 was disabled because control frames decode at much lower
+// SNR than data frames, causing false turboshift ceilings. Data frames at
+// CONFIG_16 showed <12% success even at 20 dB SNR on real channels.
+// SACK Design A (partial-batch SACK_RSP recovery) directly addresses this:
+// even at 12% per-frame success, the bitmap-driven retransmit recovers the
+// failed frames at one retransmit slot each instead of dropping the whole
+// config. The cliff effect that made CONFIG_16 "fragile" no longer applies
+// — the protocol is now resilient to per-frame loss. CONFIG_16 PHY 5665 bps
+// is +30% over CONFIG_15's 4361 bps; with text compression, application
+// throughput ceiling ≈ 13 kbps decompressed.
+#define WB_CONFIG_MAX CONFIG_16
 
 // Unified config ladder for gearshift (ROBUST → OFDM)
-// CONFIG_16 removed — unreliable on real channels (32QAM too fragile).
+// CONFIG_16 re-added (see WB_CONFIG_MAX comment above).
 static const int FULL_CONFIG_LADDER[] = {
 	ROBUST_0, ROBUST_1, ROBUST_2,
 	CONFIG_0, CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4, CONFIG_5, CONFIG_6,
 	CONFIG_7, CONFIG_8, CONFIG_9, CONFIG_10, CONFIG_11, CONFIG_12,
-	CONFIG_13, CONFIG_14, CONFIG_15
+	CONFIG_13, CONFIG_14, CONFIG_15, CONFIG_16
 };
-static const int FULL_CONFIG_LADDER_SIZE = 19;
+static const int FULL_CONFIG_LADDER_SIZE = 20;
 
 inline int config_ladder_index(int config) {
 	for (int i = 0; i < FULL_CONFIG_LADDER_SIZE; i++) {

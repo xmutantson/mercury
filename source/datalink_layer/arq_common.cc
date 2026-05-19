@@ -324,6 +324,7 @@ cl_arq_controller::cl_arq_controller()
 	consecutive_data_acks=0;
 	frame_shift_threshold=3;
 	frame_gearshift_just_applied=false;
+	frame_gearshift_retry_count=0;
 
 	turboshift_phase=TURBO_FORWARD;
 	turboshift_active=true;
@@ -1149,14 +1150,17 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	if (ACK_MULTI_ACK_RANGE_HEADER_LENGTH>nBytes_header) nBytes_header=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	if (CONTROL_ACK_CONTROL_HEADER_LENGTH>nBytes_header) nBytes_header=CONTROL_ACK_CONTROL_HEADER_LENGTH;
 	// SACK Design A Steps 1+2 — DATA_LONG header is 4 bytes (v1) or 5 bytes (v2);
-	// DATA_SHORT header is 5 bytes (v1) or 6 bytes (v2). Effective helpers gate
-	// buffer sizing on sack_v2_enabled — v1 path picks the legacy macro values
-	// (byte-identical wire to pre-Step-1/2), v2 path picks the grown values.
-	// Post-negotiation, the next load_configuration() call picks up v2 sizing.
+	// DATA_SHORT header is 5 bytes (v1) or 6 bytes (v2).
+	// §7.13.34 fix: size for the LARGER (v2) value unconditionally, not gated
+	// on sack_v2_enabled. The previous gating broke when SACK v2 capability was
+	// negotiated AFTER load_configuration() ran (no re-init triggered, so
+	// max_header_length stayed at v1 size, then the first v2 DATA_LONG frame
+	// blew past the buffer and exit(0) at line ~3286). Cost is one extra byte
+	// of header buffer per frame — negligible (≤0.7% of payload at CFG15).
 	{
-		int eff_long = effective_data_long_header_length(sack_v2_enabled);
+		int eff_long = effective_data_long_header_length(true);
 		if (eff_long>nBytes_header) nBytes_header=eff_long;
-		int eff_short = effective_data_short_header_length(sack_v2_enabled);
+		int eff_short = effective_data_short_header_length(true);
 		if (eff_short>nBytes_header) nBytes_header=eff_short;
 	}
 
@@ -3281,8 +3285,14 @@ void cl_arq_controller::send_batch()
 
 		if(header_length>max_header_length)
 		{
-			std::cout<<"header size is too big, adjust the configuration parameters"<<std::endl;
-			exit(0);
+			// §7.13.34 — was exit(0). Don't kill the whole modem on an
+			// unexpected header size; log loudly and skip this frame so
+			// the link can survive whatever miscalibrated the buffers.
+			printf("[ERR-HDR-OVERFLOW] header_length=%d > max_header_length=%d (type=%d, sack_v2=%d) — skipping frame\n",
+				header_length, max_header_length,
+				(int)messages_batch_tx[i].type, sack_v2_enabled?1:0);
+			fflush(stdout);
+			continue;
 		}
 
 		for(int j=0;j<(header_length+messages_batch_tx[i].length);j++)
@@ -5430,18 +5440,50 @@ void cl_arq_controller::receive()
 			// Commander never needs to detect BREAK (it sends BREAK, not receives).
 			// Without gearshift, BREAK has no purpose — disable to avoid false positives
 			// (matched=8/16 threshold too easy to hit on random MFSK data).
-			if(break_detected == NO && gear_shift_on && role == RESPONDER)
+			//
+			// OFDM-alias gate (gearshift_v1 finding): the BREAK Goertzel/FFT
+			// detector matches at perfect 16/16 on the OFDM CFG12+ preamble
+			// because the OFDM data carriers happen to land in the expected
+			// BREAK tone bins. Without this gate, every failed OFDM decode at
+			// high config wedged the link by forcing RSP to CFG0 on phantom
+			// BREAK. Real BREAK is MFSK only — its Schmidl-Cox correlation
+			// is low (~0.1-0.2); OFDM preamble Schmidl-Cox is high (~0.6-1.0).
+			// Gate: skip BREAK if Schmidl-Cox just matched — it's OFDM, not
+			// a real BREAK pattern.
+			// Also gate on link_status==CONNECTED: BREAK is a recovery
+			// signal for an in-progress session. Before CONNECT completes,
+			// CMD is sending HAIL/CONNECTION patterns (also M=16 MFSK)
+			// that can land matched=10/16 on the BREAK detector — false
+			// positive that wedges RSP at CFG0 during the handshake
+			// (gearshift_v14 finding). RSP doesn't need BREAK recovery
+			// while still in LISTENING.
+			if(break_detected == NO && gear_shift_on && role == RESPONDER
+			   && link_status == CONNECTED
+			   && telecom_system->receive_stats.coarse_metric < 0.30)
 			{
 				int matched = 0;
 				double metric = telecom_system->detect_break_pattern_from_passband(
 					telecom_system->data_container.ready_to_process_passband_delayed_data,
 					signal_period, &matched);
+				// Diagnostic: log every call when the OFDM-alias gate passes.
+				// matched < threshold means BREAK wasn't there (or alignment
+				// failed even with the always_fine refinement). Useful for
+				// surfacing future regressions silently.
+				if (g_verbose && matched > 0)
+				{
+					printf("[BREAK-PROBE] coarse=%.2f matched=%d/%d (thr=%d) metric=%.2f\n",
+						telecom_system->receive_stats.coarse_metric, matched,
+						telecom_system->ack_mfsk.ack_pattern_nsymb,
+						telecom_system->ack_mfsk.break_match_threshold, metric);
+					fflush(stdout);
+				}
 				// Require break_match_threshold (WB:12/16, NB M=8:24/32, NB M=4:40/48)
 				if(metric >= telecom_system->ack_pattern_detection_threshold
 				   && matched >= telecom_system->ack_mfsk.break_match_threshold)
 				{
-					printf("[BREAK] Emergency pattern detected! metric=%.2f matched=%d/%d\n",
-						metric, matched, telecom_system->ack_mfsk.ack_pattern_nsymb);
+					printf("[BREAK] Emergency pattern detected! metric=%.2f matched=%d/%d (coarse=%.2f)\n",
+						metric, matched, telecom_system->ack_mfsk.ack_pattern_nsymb,
+						telecom_system->receive_stats.coarse_metric);
 					fflush(stdout);
 #ifdef MERCURY_GUI_ENABLED
 					gui_push_monitor_event("[BREAK]", false);
@@ -5509,10 +5551,42 @@ void cl_arq_controller::receive()
 
 					if(received_message_stats.frame_data_missing)
 					{
-						// Preamble detected but data symbols are silence.
-						// Zero the stale preamble in the ring to prevent
-						// re-detection (shift_left would have slid it off).
+						// §7.13.36 — During a v2 SACK polling window, an
+						// in-flight SACK_RSP / OFDM_ACK_CLEAN may be
+						// detected preamble-first because the data symbols
+						// haven't fully arrived in the ring yet (sub-frame
+						// timing race amplified by compression CPU jitter
+						// or SACK_RSP TX-end / RX-window start overlap).
+						// The pre-§7.13.36 code zeroed the preamble in the
+						// ring to suppress re-detection of stale preambles
+						// after a successful decode — but during SACK
+						// polling, the still-arriving data needs the
+						// preamble intact for the NEXT dispatch to lock
+						// and decode the now-complete frame. Without this
+						// gate, the preamble gets zeroed before data
+						// finishes arriving → SACK_RSP never decoded →
+						// CMD wedges (gearshift_v22 finding).
+						//
+						// §7.13.36.1 — gate preservation on metric >= 0.5:
+						// weak preambles (metric 0.2-0.3) are usually
+						// autocorrelation false positives from CMD's TX
+						// residue or sustained noise, NOT real in-flight
+						// frames. Preserving them causes the detector to
+						// re-lock onto the same fake preamble for 100+
+						// dispatches and never advance (gearshift_v23
+						// finding: metric=0.283 stuck for 99 cycles).
+						// Real SACK_RSP preambles run metric >= 0.9 (v18
+						// working case showed 0.999).
+						bool in_v2_sack_dispatch = sack_v2_enabled
+							&& role == COMMANDER
+							&& data_ack_received == NO
+							&& telecom_system->receive_stats.coarse_metric >= 0.5;
+
+						if(!in_v2_sack_dispatch)
 						{
+							// Preamble detected but data symbols are silence.
+							// Zero the stale preamble in the ring to prevent
+							// re-detection (shift_left would have slid it off).
 							int sp = signal_period;
 							int pream_samples = telecom_system->data_container.preamble_nSymb * symbol_period;
 							int pream_ring_start = (rwi + received_message_stats.delay) % sp;
@@ -5528,17 +5602,22 @@ void cl_arq_controller::receive()
 						}
 						// Quick retry — 8 symbols (~49ms WB) is enough to skip past
 						// the failed position without waiting a full frame.
+						// In the v2 SACK case, the retry instead gives the in-flight
+						// data symbols time to arrive in the ring so the next dispatch
+						// can lock on the complete frame.
 						ftr = 8;
 						telecom_system->receive_stats.ofdm_search_raw = 0;
 						telecom_system->receive_stats.ofdm_batch_active = false;
-						printf("[FTR-INCOMPLETE] pream=%d ftr=%d metric=%.3f\n",
-							pream_symb, ftr,
-							telecom_system->receive_stats.coarse_metric);
-						fflush(stdout);
-						SACK_TRACE("anti-spin INCOMPLETE: pream=%d ftr=%d metric=%.3f delay=%d — ring will shift by 8 syms",
+						printf("[FTR-INCOMPLETE] pream=%d ftr=%d metric=%.3f v2_sack=%d\n",
 							pream_symb, ftr,
 							telecom_system->receive_stats.coarse_metric,
-							received_message_stats.delay);
+							in_v2_sack_dispatch ? 1 : 0);
+						fflush(stdout);
+						SACK_TRACE("anti-spin INCOMPLETE: pream=%d ftr=%d metric=%.3f delay=%d — ring will shift by 8 syms (preserve preamble=%d)",
+							pream_symb, ftr,
+							telecom_system->receive_stats.coarse_metric,
+							received_message_stats.delay,
+							in_v2_sack_dispatch ? 1 : 0);
 					}
 					else if(pream_symb > upper)
 					{
