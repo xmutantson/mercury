@@ -1255,14 +1255,14 @@ public:
   // the NB_CFG10 162→54 bps cliff at HEAD.
   int sack_timeout_extra_ms;
 
-  // CAP_SACK gating (production B2 fix, 2026-05-12, plan §15c).
-  // Default true: SACK is NOT negotiated by default. SACK enabled-by-default
-  // was confirmed as the root cause of both WB and NB regressions vs
-  // pre-IONOS (NB_CFG10: 84→151 bps, WB_CFG15: 1690→2353 bps, both with
-  // --no-sack). SACK is also alpha (v2 redesign attempted+reverted).
+  // CAP_SACK gating. Default false (SACK negotiated by default) after
+  // SACK Design A shipped (e73968a..1acdb3c on monitor, May 16-17 2026)
+  // and resolved the regressions that motivated the original B2 disable
+  // (2026-05-12). SACK is now load-bearing for the effective-rate
+  // optimizer's calibrated operating range (CFG6+).
   // CLI overrides:
-  //   --no-sack       (forces disable; no-op since default is now disabled)
-  //   --enable-sack   (forces enable; opt-in for users who want SACK)
+  //   --no-sack       (forces disable; opt-out)
+  //   --enable-sack   (forces enable; no-op since default is now enabled)
   bool disable_sack;
 
   // Step 15: --test-sack-ldpc-fail / force_sack_ldpc_fail removed alongside

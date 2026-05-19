@@ -220,6 +220,8 @@ cl_rate_optimizer::cl_rate_optimizer()
     , switch_cost_ms(1800)
     , cooldown_remaining(0)
     , eval_count(0)
+    , min_cfg_calibrated(-1)
+    , max_sack_calibrated(-1.0)
 {}
 
 bool cl_rate_optimizer::load(const char* path) {
@@ -228,6 +230,8 @@ bool cl_rate_optimizer::load(const char* path) {
     channel_axis.clear();
     n_configs_loaded = 0;
     n_channels_loaded = 0;
+    min_cfg_calibrated = -1;
+    max_sack_calibrated = -1.0;
 
     if (path == NULL || path[0] == '\0') {
         printf("[OPT] table not found, optimizer disabled (null path)\n");
@@ -320,7 +324,8 @@ bool cl_rate_optimizer::load(const char* path) {
 
     n_configs_loaded = (int)table.size();
     // Build channel_axis. Each entry = mean of sack_rate_mean across valid
-    // cells in that channel bucket.
+    // cells in that channel bucket. Kept for diagnostic/fallback only; the
+    // primary lookup is now per-config in identify_channel_label().
     for (std::map<std::string, std::pair<double, int> >::const_iterator
             it = channel_sack_accum.begin(); it != channel_sack_accum.end(); ++it) {
         if (it->second.second > 0) {
@@ -344,9 +349,32 @@ bool cl_rate_optimizer::load(const char* path) {
         return false;
     }
 
+    // Populate below-table-range gate inputs.
+    //  - min_cfg_calibrated: lowest cfg id with at least one valid cell.
+    //  - max_sack_calibrated: largest sack_rate_mean across all valid cells.
+    // Caller (opt_evaluate_batch_end in arq_common.cc) checks these against
+    // current state to decide whether the optimizer is in its operating region.
+    min_cfg_calibrated  = -1;
+    max_sack_calibrated = 0.0;
+    for (std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
+            cit = table.begin(); cit != table.end(); ++cit) {
+        bool any_valid = false;
+        for (std::map<std::string, st_rate_cell>::const_iterator
+                jt = cit->second.begin(); jt != cit->second.end(); ++jt) {
+            if (!jt->second.valid) continue;
+            any_valid = true;
+            if (jt->second.sack_rate_mean > max_sack_calibrated)
+                max_sack_calibrated = jt->second.sack_rate_mean;
+        }
+        if (any_valid && (min_cfg_calibrated < 0 || cit->first < min_cfg_calibrated))
+            min_cfg_calibrated = cit->first;
+    }
+
     enabled = true;
-    printf("[OPT] table loaded: %d configs x %d channels (valid_cells=%d, path=%s)\n",
-           n_configs_loaded, n_channels_loaded, valid_cells, path);
+    printf("[OPT] table loaded: %d configs x %d channels (valid_cells=%d, "
+           "min_cfg=%d, max_sack=%.3f, path=%s)\n",
+           n_configs_loaded, n_channels_loaded, valid_cells,
+           min_cfg_calibrated, max_sack_calibrated, path);
     fflush(stdout);
     return true;
 }
@@ -360,20 +388,6 @@ void cl_rate_optimizer::reset_session_state() {
     eval_count = 0;
 }
 
-std::string cl_rate_optimizer::channel_bucket_from_sack_rate(double sack_rate) const {
-    if (channel_axis.empty()) return "";
-    // Pick the calibrated bucket whose representative sack rate is closest
-    // to current. channel_axis is sorted by ascending sack_rate (clean
-    // smallest, wgn16 largest).
-    double best_d = 1e9;
-    std::string best;
-    for (size_t i = 0; i < channel_axis.size(); ++i) {
-        double d = std::fabs(channel_axis[i].second - sack_rate);
-        if (d < best_d) { best_d = d; best = channel_axis[i].first; }
-    }
-    return best;
-}
-
 const st_rate_cell* cl_rate_optimizer::get_cell(int cfg, const std::string& bucket) const {
     std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
         it = table.find(cfg);
@@ -384,20 +398,66 @@ const st_rate_cell* cl_rate_optimizer::get_cell(int cfg, const std::string& buck
     return &(jt->second);
 }
 
-double cl_rate_optimizer::predicted_sack_at_target(int current_cfg,
-                                                   int target_cfg,
-                                                   double current_sack_rate) const {
-    // §5.1 naive linear interpolation: each ladder step down halves the
-    // loss; each step up doubles it. Clamp to [0, 1].
-    int delta = target_cfg - current_cfg;
-    double scale;
-    if (delta == 0)       scale = 1.0;
-    else if (delta < 0)   scale = std::pow(0.5, (double)(-delta));   // downshift cuts loss
-    else                  scale = std::pow(2.0, (double)delta);      // upshift inflates loss
-    double s = current_sack_rate * scale;
-    if (s < 0.0) s = 0.0;
-    if (s > 1.0) s = 1.0;
-    return s;
+// Identify the channel label that best matches current observations AT THE
+// CURRENT CONFIG. Returns "" if table[current_cfg] is empty.
+//
+// Rationale: the table is a 2D measured surface — for each (config, label)
+// we know what (eff_bps, sack_rate) the link produces. To predict what
+// other configs would deliver on the SAME physical channel, we first
+// identify which calibrated channel-label our current observations match
+// AT OUR CURRENT CONFIG. Then evaluate every other config at the same
+// label (the table tells us directly — no ladder-distance scaling).
+//
+// Distance metric: sack_rate is the primary signal (well-defined for the
+// channel and the most direct measure of "how rough is this channel").
+// eff_bps_mean is a tiebreaker — sack_rate alone can be 0.0 for several
+// adjacent buckets (e.g. clean / wgn30 / wgn28 may all measure 0% loss
+// on a robust config), so eff_bps disambiguates which we're actually in.
+std::string cl_rate_optimizer::identify_channel_label(int current_cfg,
+                                                      double current_sack_rate,
+                                                      double current_eff_bps) const {
+    // H1: defensive — non-finite observations come from upstream bugs.
+    // Returning "" forces the channel_axis fallback in evaluate(), which is
+    // less precise but safe.
+    if (!std::isfinite(current_sack_rate) || !std::isfinite(current_eff_bps))
+        return "";
+
+    std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
+        cit = table.find(current_cfg);
+    if (cit == table.end()) return "";
+    const std::map<std::string, st_rate_cell>& row = cit->second;
+    if (row.empty()) return "";
+
+    // Normalize the two axes so they're comparable. SACK rate is in [0,1].
+    // eff_bps spans 0..several thousand. Use a soft normalization: divide
+    // eff_bps difference by current_eff_bps (or 1000 if current is 0).
+    double eff_norm = (current_eff_bps > 100.0) ? current_eff_bps : 1000.0;
+
+    double best_d = 1e9;
+    std::string best;
+    for (std::map<std::string, st_rate_cell>::const_iterator
+            jt = row.begin(); jt != row.end(); ++jt) {
+        if (!jt->second.valid) continue;
+        double ds = jt->second.sack_rate_mean - current_sack_rate;
+        double de = (jt->second.eff_bps_mean - current_eff_bps) / eff_norm;
+        // Weight sack_rate heavily (4x) — more direct channel signal.
+        // eff_bps acts as a tiebreaker / sanity check.
+        //
+        // M1: conservative tie-breaker. At saturated configs (e.g. CFG6
+        // where many "easy" labels collapse to sack=0/bps=ceiling), several
+        // labels produce identical primary distance. Without disambiguation,
+        // alphabetical map iteration would pick "clean" — the most
+        // optimistic — and the projection to higher configs uses tbl[high]
+        // ["clean"]=cliff-edge values, risking an upshift INTO a cliff.
+        // Subtract a tiny term scaled by sack_rate_mean so on ties the LARGER
+        // sack_rate (= worse calibrated channel = more conservative) wins.
+        // Magnitude 1e-6 is well below typical d values (~1e-2 to 1e-1) so
+        // this never overrides a real distance difference.
+        double d = 4.0 * ds * ds + de * de
+                 - 1e-6 * jt->second.sack_rate_mean;
+        if (d < best_d) { best_d = d; best = jt->first; }
+    }
+    return best;
 }
 
 int cl_rate_optimizer::evaluate(int current_cfg,
@@ -418,56 +478,73 @@ int cl_rate_optimizer::evaluate(int current_cfg,
 
     // Optimizer only operates on WB OFDM ladder. ROBUST_X (>=100) and any
     // out-of-range value short-circuits — gearshift owns those transitions.
-    // We deliberately don't try to up-shift OUT of robust here; the
-    // existing turboshift path handles ROBUST → CONFIG_X.
+    // (Caller also enforces this gate; double-check for safety.)
     if (current_cfg < 0 || current_cfg > wb_config_max) return current_cfg;
 
-    std::string current_bucket = channel_bucket_from_sack_rate(current_sack_rate);
-    if (current_bucket.empty()) return current_cfg;
-
-    // Score "stay". Prefer the table's eff_bps_mean at the channel bucket
-    // matching the *observed* sack rate — that's what we're calibrated to
-    // see right now. Fall back to current_eff_bps if the lookup misses.
-    const st_rate_cell* stay_cell = get_cell(current_cfg, current_bucket);
-    double stay_score;
-    if (stay_cell && stay_cell->valid) {
-        stay_score = stay_cell->eff_bps_mean;
-    } else {
-        // No table entry for our config at this channel → use the live
-        // measurement. Better than discarding the score entirely.
-        stay_score = current_eff_bps;
+    // Identify the channel label that matches our current observations at
+    // the current config. The table is a 2D surface (config × label);
+    // identifying the label collapses it to a 1D scan over candidate configs.
+    // If we have no calibration row at current_cfg (e.g. CFG7 in the gap),
+    // fall back to nearest channel bucket using config-agnostic axis.
+    std::string current_label = identify_channel_label(current_cfg,
+                                                       current_sack_rate,
+                                                       current_eff_bps);
+    if (current_label.empty()) {
+        // Fallback: nearest bucket on the cross-config mean axis. Less
+        // accurate but better than refusing to act.
+        if (channel_axis.empty()) return current_cfg;
+        double best_d = 1e9;
+        for (size_t i = 0; i < channel_axis.size(); ++i) {
+            double d = std::fabs(channel_axis[i].second - current_sack_rate);
+            if (d < best_d) { best_d = d; current_label = channel_axis[i].first; }
+        }
+        if (current_label.empty()) return current_cfg;
     }
 
-    // Switch cost amortized across one batch cycle. Use stay_score as the
-    // rate proxy → switch cost in BYTES = (cost_ms * stay_score / 8 / 1000).
-    // We subtract it directly from the candidate score (in bps) by scaling
-    // it to a per-batch wire window. A single batch at WB CONFIG_15 ~ 4500
-    // bps PHY takes ~1.6-2.0s; we use 1.8s as the typical wire window.
-    // The conservative model: amortize the cost across exactly one wire
-    // window of the size we're currently spending. That penalty is what
-    // separates "marginal" from "clearly better" alternative configs.
-    const double WIRE_MS_PER_BATCH = 1800.0;
-    double cost_penalty_bps = stay_score * ((double)switch_cost_ms / WIRE_MS_PER_BATCH);
+    // Score "stay". Use the table's measured value at (current_cfg, label)
+    // if available; otherwise use the live measurement.
+    const st_rate_cell* stay_cell = get_cell(current_cfg, current_label);
+    double stay_score = (stay_cell && stay_cell->valid)
+                       ? stay_cell->eff_bps_mean
+                       : current_eff_bps;
 
-    // Search the ±2 ladder neighborhood. We don't include ROBUST_X (those
-    // are <0 or >=100). We DO allow target_cfg == 0 → wb_config_max.
-    int best_cfg = current_cfg;
-    double best_score = stay_score;
-    int   best_target_seen = current_cfg;
+    // Switch cost amortized across the expected post-switch holding period.
+    // switch_cost_ms is paid ONCE per switch (one SET_CONFIG round trip).
+    // If we expect to hold the new config for AMORTIZE_BATCHES batches,
+    // the per-batch penalty is (switch_cost_ms / AMORTIZE_BATCHES) of one
+    // batch's worth of wire time.
+    //
+    // Original code amortized across one batch — i.e. assumed every batch
+    // would re-pay the cost — which made the penalty equal to stay_score
+    // and blocked nearly every upshift. With AMORTIZE_BATCHES=10 the
+    // penalty is ~10% of stay_score, and combined with the 15% hysteresis
+    // requires the candidate to beat stay by ~25% to trigger. That's a
+    // sane bar for "is the switch worth the SET_CONFIG round trip given
+    // we'll hold for at least ~10 batches."
+    const double WIRE_MS_PER_BATCH = 1800.0;
+    const double AMORTIZE_BATCHES  = 10.0;
+    double cost_penalty_bps = stay_score *
+                              ((double)switch_cost_ms /
+                               (WIRE_MS_PER_BATCH * AMORTIZE_BATCHES));
+
+    // SEARCH THE WHOLE TABLE — no ±2 limit. With per-config channel
+    // identification we look up tbl[cand][current_label] directly for every
+    // candidate; the table tells us what each config does on THIS channel
+    // (the one we just identified from our own measurements). No
+    // ladder-distance scaling, no half/double heuristic. If the table says
+    // a single jump CFG7→CFG16 is worth it, we make that jump.
+    int    best_cfg               = current_cfg;
+    double best_score             = stay_score;
+    int    best_target_seen       = current_cfg;
     double best_target_score_seen = stay_score;
 
-    for (int delta = -2; delta <= 2; ++delta) {
-        if (delta == 0) continue;
-        int cand = current_cfg + delta;
-        if (cand < 0) continue;
-        if (cand > wb_config_max) continue;
+    for (std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
+            cit = table.begin(); cit != table.end(); ++cit) {
+        int cand = cit->first;
+        if (cand == current_cfg) continue;
+        if (cand < 0 || cand > wb_config_max) continue;
 
-        // Predict the channel bucket at the target.
-        double pred_sack = predicted_sack_at_target(current_cfg, cand, current_sack_rate);
-        std::string cand_bucket = channel_bucket_from_sack_rate(pred_sack);
-        if (cand_bucket.empty()) continue;
-
-        const st_rate_cell* cand_cell = get_cell(cand, cand_bucket);
+        const st_rate_cell* cand_cell = get_cell(cand, current_label);
         if (!cand_cell || !cand_cell->valid) continue;
 
         double cand_score = cand_cell->eff_bps_mean - cost_penalty_bps;
@@ -496,9 +573,9 @@ int cl_rate_optimizer::evaluate(int current_cfg,
                 skip_reason = "below-hysteresis";
             }
         } else {
-            // stay_score is 0 — the channel is dead at current_cfg per the
-            // table. Switch IS warranted; the failure-recovery / BREAK
-            // path already runs in parallel.
+            // stay_score is 0 — channel is dead at current_cfg per the
+            // table. Switch IS warranted; failure-recovery / BREAK paths
+            // run in parallel.
             chosen_cfg = best_cfg;
             cooldown_remaining = cooldown_max;
             gain_pct = 100.0;
@@ -506,19 +583,19 @@ int cl_rate_optimizer::evaluate(int current_cfg,
     }
 
     // Diag — emit one line per fire. Include the best-candidate-seen even
-    // if we decided to stay, for offline tuning.
+    // if we decided to stay, for offline trace analysis.
     if (best_target_seen != current_cfg) {
         if (chosen_cfg != current_cfg) {
             printf("[OPT-EVAL] eff=%.0f sack=%.2f curr_cfg=%d -> recommend=%d "
-                   "(gain=%.1f%%) bucket=%s\n",
+                   "(gain=%.1f%%) label=%s\n",
                    current_eff_bps, current_sack_rate, current_cfg, chosen_cfg,
-                   gain_pct, current_bucket.c_str());
+                   gain_pct, current_label.c_str());
         } else {
             printf("[OPT-EVAL] eff=%.0f sack=%.2f curr_cfg=%d -> stay (best_cand=%d "
-                   "gain=%.1f%% skip=%s) bucket=%s\n",
+                   "gain=%.1f%% skip=%s) label=%s\n",
                    current_eff_bps, current_sack_rate, current_cfg, best_target_seen,
                    gain_pct, skip_reason ? skip_reason : "n/a",
-                   current_bucket.c_str());
+                   current_label.c_str());
         }
         fflush(stdout);
     }
