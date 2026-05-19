@@ -1141,6 +1141,7 @@ public:
   int consecutive_data_acks;       // Frame-level gearshift: consecutive successful data ACKs
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
+  int  frame_gearshift_retry_count;   // §7.13.33: retries on PHY-switched first batch before BREAK (rx_mute timing race)
 
   // Turboshift: bidirectional probing phase before data exchange
   enum TurboshiftPhase { TURBO_FORWARD, TURBO_REVERSE, TURBO_DONE };

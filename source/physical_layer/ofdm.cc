@@ -3295,7 +3295,8 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
                                    int* out_matched,
                                    int suffix_start, int* out_suffix_matched,
                                    int* out_best_offset, int reserve_after,
-                                   uint32_t* out_match_mask)
+                                   uint32_t* out_match_mask,
+                                   bool always_fine)
 {
 	int Nofdm = Nfft + Ngi;
 	int sym_period_interp = Nofdm * interpolation_rate;
@@ -3437,7 +3438,14 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	// error of ±136 samples far exceeds the GI tolerance → ICI → low metric.
 	// Search at base-rate (IR-step) resolution within ±Nofdm/2 of the coarse
 	// position. Only runs when Phase 1 found a decent candidate.
-	if (best_matched >= 6 && best_pos >= 0)
+	//
+	// always_fine: callers that fire one-shot (e.g., BREAK detector) need the
+	// fine pass even when coarse matched < 6, because the asynchronous arrival
+	// phase often lands mid-symbol → FFT windows straddle two transmitted
+	// symbols → coarse_matched collapses → BREAK never refines and never
+	// fires. Polled callers (ACK) don't need this because they slide the
+	// tail-snapshot every 2-3 ms and eventually hit alignment.
+	if ((always_fine || best_matched >= 6) && best_pos >= 0)
 	{
 		int coarse_offset = best_pos * sym_period_interp;
 		int search_half = sym_period_interp / 2;

@@ -591,10 +591,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 					}
 					else if(compression_enabled
 						&& !cipher_suite.is_active()
+						&& !compressor.is_streaming()  // §7.13.37 — same fix as line 1071 (which §7.13.35 guarded); this per-frame-timer copy was missed. With streaming, frame-0's compression header describes only the first compressed message in the batch (e.g., 3424 bytes → 21 frames) but CMD continues packing more messages into frames 22-24. Without the guard, effective_batch was being lowered to 21 here, causing batch_rx_frame_count >= effective_batch to be true at frame 20 → rx_timeout=ptt_on_delay_ms=100ms → RSP times out and ACKs early DURING CMD's still-active TX → ACK lost in CMD's mute window → bps=0 (gearshift_v22 finding; mediator missed this code path because exp=25 from the LATER ACK-GATE-DIAG calc fired AFTER this early timer had already triggered).
 						&& messages_rx[0].status == RECEIVED
 						&& messages_rx[0].length >= compressor.get_header_size())
 					{
-						// Fallback: compression header
+						// Fallback: compression header (non-streaming compression only).
 						const unsigned char* hdr = (const unsigned char*)messages_rx[0].data;
 						int hdr_comp = hdr[1] | (hdr[2] << 8);
 						int gate_hdr_size = compressor.get_header_size();
@@ -1070,11 +1071,15 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			}
 			else if(compression_enabled
 				&& !cipher_suite.is_active()  // Can't peek header when encrypted
+				&& !compressor.is_streaming()  // §7.13.35: streaming packs multiple messages per batch — frame-0 header describes only the first; falling through to here yields under-estimate, RSP ACKs early (gearshift_v19 finding)
 				&& messages_rx[0].status == RECEIVED
 				&& messages_rx[0].length >= compressor.get_header_size())
 			{
 				// Fallback: derive from compression header (old commanders
-				// without end-of-batch flag)
+				// without end-of-batch flag).
+				// Only safe for non-streaming compression where one batch =
+				// one compressed message. Streaming case waits for EOB or
+				// times out at data_batch_size (treated as full batch).
 				const unsigned char* hdr = (const unsigned char*)messages_rx[0].data;
 				int hdr_comp = hdr[1] | (hdr[2] << 8);
 				int gate_hdr_size = compressor.get_header_size();

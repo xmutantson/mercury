@@ -2181,6 +2181,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		if(frame_gearshift_just_applied)
 		{
 			frame_gearshift_just_applied = false;
+			frame_gearshift_retry_count = 0;
 			int working_config = config_ladder_down(data_configuration, robust_enabled);
 			frame_shift_threshold *= 2;
 
@@ -2306,10 +2307,33 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		{
 			consecutive_data_acks = 0;
 
-			// Frame gearshift just applied but data failed — BREAK immediately
-			if(frame_gearshift_just_applied && ack_pattern_time_ms > 0)
+			// Frame gearshift just applied but data failed — BREAK immediately.
+			// §7.13.33 — retry once before BREAK: on a CFG7→CFG15 PHY-switch,
+			// the FIRST batch can fail not because CFG15 is too aggressive
+			// but because RSP's OFDM_ACK_CLEAN lands inside CMD's still-muted
+			// post-TX window (audioio.c:1255-1258 zeros samples while rx_mute
+			// is set). The ACK preamble gets wiped before the decoder sees it,
+			// and CMD wrongly concludes the config is unworkable. Retrying
+			// the batch once gives RSP a chance to retransmit OFDM_ACK_CLEAN
+			// (mechanism-(a) dedup matches same batch_seq_id) at a time when
+			// CMD is fully in RX mode. If the retry also fails, BREAK as
+			// before — config really is too aggressive.
+			if(frame_gearshift_just_applied && ack_pattern_time_ms > 0
+			   && frame_gearshift_retry_count == 0)
+			{
+				frame_gearshift_retry_count = 1;
+				printf("[GEARSHIFT] First-batch ACK miss after PHY-switch on cfg %d — retrying batch once before BREAK (suspected rx_mute timing race)\n",
+					data_configuration);
+				fflush(stdout);
+				// Don't trigger BREAK or downshift here. Fall through to
+				// normal nack handling below which will retransmit the
+				// batch. frame_gearshift_just_applied stays TRUE so a
+				// second failure will hit the BREAK path below.
+			}
+			else if(frame_gearshift_just_applied && ack_pattern_time_ms > 0)
 			{
 				frame_gearshift_just_applied = false;
+				frame_gearshift_retry_count = 0;
 				int working_config = config_ladder_down(data_configuration, robust_enabled);
 				frame_shift_threshold *= 2;
 
@@ -2331,7 +2355,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				emergency_previous_config = working_config;
 				break_drop_step = 0;
 				emergency_break_active = 1;
-				emergency_break_retries = 1;
+				// Defense-in-depth: even with always_fine BREAK refinement on
+				// RSP, allow 3 BREAK transmissions before exhausted-recovery
+				// drops CMD to CFG0 unilaterally. The other-direction emergency
+				// path (around line ~2377) already uses higher retries; this
+				// brings the gearshift_data_failed_pat path in line.
+				emergency_break_retries = 3;
 				emergency_nack_count = 0;
 
 				// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
@@ -2393,6 +2422,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			break_drop_step = 1;
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
+			frame_gearshift_retry_count = 0;       // §7.13.33 reset
 		}
 
 		// Auto-arm compression after B2F SID is ACKed
@@ -2495,13 +2525,32 @@ void cl_arq_controller::finish_turbo_direction()
 		if(effective_snr > -90)
 			snr_config = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
 
-		// Start 2 configs below SNR prediction to account for fading channel
-		// degradation vs AWGN calibration table. Ladder climbs from here.
-		int start_config;
-		if(snr_config >= 0)
-			start_config = config_ladder_down_n(snr_config, 2, robust_enabled);
-		else
-			start_config = config_ladder_down_n(turboshift_last_good, 2, robust_enabled);
+		// Start at the SUPERSHIFT-verified config (turboshift_last_good).
+		// Rationale: the verification probe at line ~2483 just confirmed this
+		// config can pass a frame end-to-end. Picking a lower start config
+		// (former: snr_config - 2 ladder steps for fading margin) forces an
+		// UNNECESSARY PHY-switch to a lower config, which on the CMD side
+		// breaks OFDM_ACK_CLEAN detection on the first post-switch batch
+		// (gearshift_v11 finding: RSP gets 21/25 frames at CFG13, sends
+		// OFDM_ACK_CLEAN, CMD's poll never matches → FRAME UP DATA FAILED →
+		// BREAK chain pulls config down to 11). Cost on clean: 7-8× lower
+		// throughput vs v22 baseline (2535 vs 343 bps). Trust the probe; if
+		// production traffic fails, ladder will drop on its own.
+		//
+		// §7.13.38 — SAC-aware ceiling trust: when SACK Design A is
+		// negotiated, the channel can absorb partial-batch loss (SACK_RSP
+		// patches missing frames), so we trust the verified ceiling
+		// unconditionally. Without SACK, the SNR-derived snr_config caps
+		// us as a fading-margin safety net (legacy behavior). This lets
+		// CFG16 actually be reached on clean: measured SNR at the modem
+		// caps around 15 dB; SNR-3 = 12 → snr_config = CFG15, which
+		// would cap us below the verified CFG16 ceiling. With SACK on,
+		// just use the verified ceiling.
+		int start_config = turboshift_last_good;
+		if(!sack_v2_enabled && snr_config >= 0 && snr_config < start_config)
+			start_config = snr_config;
+		if(start_config < 0)
+			start_config = init_configuration;
 
 		// Enforce --max-config CLI ceiling
 		if(max_config_override >= 0 && start_config > max_config_override)
@@ -2520,12 +2569,18 @@ void cl_arq_controller::finish_turbo_direction()
 		data_configuration = start_config;
 		negotiated_configuration = start_config;
 		reverse_configuration = start_config;
-		if(start_config != current_configuration)
-			load_configuration(start_config, PHYSICAL_LAYER_ONLY, YES);
 
-		// Must send SET_CONFIG to inform responder of the new data config.
-		// Without this, RSP stays at the last turbo probe config and can't
-		// decode data frames (completely mismatched PHY parameters).
+		// CRITICAL: Do NOT load_configuration locally here. The SET_CONFIG
+		// ACK handler at line ~3155 is the canonical place that loads the
+		// new config — only AFTER RSP acks on the current (verified) PHY.
+		// Loading the new config locally first means the SET_CONFIG frame
+		// itself would be transmitted on the NEW PHY, which RSP can't
+		// decode (it's still at the verified probe config). RSP never
+		// hears the announcement, never switches, and CMD's data bounces
+		// off a peer at a different config — manifests as 100x audio
+		// underruns + LDPC iter=101 max-out on RSP (gearshift_v7 finding).
+		// See SUPERSHIFT path at line ~1444-1460 for the correct pattern
+		// (sets neg cfg, queues SET_CONFIG, never load_configuration locally).
 		cleanup();
 		add_message_control(SET_CONFIG);
 		connection_status = TRANSMITTING_CONTROL;
@@ -3380,7 +3435,10 @@ void cl_arq_controller::process_control_commander()
 					{
 						// Frame gearshift applied — if data fails immediately, BREAK
 						if(data_configuration != prev_configuration)
+						{
 							frame_gearshift_just_applied = true;
+							frame_gearshift_retry_count = 0;  // §7.13.33 fresh attempt
+						}
 						this->connection_status=TRANSMITTING_DATA;
 					}
 				}
