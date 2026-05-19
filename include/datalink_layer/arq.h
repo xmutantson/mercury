@@ -39,6 +39,7 @@
 #include <iomanip>
 #include <thread>
 #include <atomic>
+#include <chrono>
 
 union u_SNR {
   float f_SNR;
@@ -1312,6 +1313,107 @@ public:
   double get_snr_uplink() const { return measurements.SNR_uplink; }
   double get_snr_downlink() const { return measurements.SNR_downlink; }
 
+  // Phase 3a (Effective-Rate Optimizer) — measurement plumbing.
+  // Rolling window of last OPTIMIZER_WINDOW_SIZE batches' per-batch stats.
+  // CMD-side only; populated by arq_commander.cc. Decision logic (Phase 3c)
+  // reads via these public getters — no policy lives here.
+  //
+  // See: mercury/fact-documents/EFFECTIVE_RATE_OPTIMIZER_DESIGN.md §4.1
+  static const int OPTIMIZER_WINDOW_SIZE = 50;
+
+  double get_current_effective_rate_bps() const {
+      if (opt_window_count == 0) return 0.0;
+      unsigned long long total_bytes = 0;
+      unsigned long long total_ms = 0;
+      for (int i = 0; i < opt_window_count; i++) {
+          int idx = (opt_window_head - 1 - i + OPTIMIZER_WINDOW_SIZE) % OPTIMIZER_WINDOW_SIZE;
+          total_bytes += opt_batch_bytes_delivered[idx];
+          total_ms += opt_batch_wire_ms[idx];
+      }
+      if (total_ms == 0) return 0.0;
+      return (double)total_bytes * 8000.0 / (double)total_ms;
+  }
+  double get_current_sack_rate() const {
+      if (opt_window_count == 0) return 0.0;
+      int sack_count = 0;
+      for (int i = 0; i < opt_window_count; i++) {
+          int idx = (opt_window_head - 1 - i + OPTIMIZER_WINDOW_SIZE) % OPTIMIZER_WINDOW_SIZE;
+          sack_count += opt_batch_sack_count[idx];
+      }
+      return (double)sack_count / (double)opt_window_count;
+  }
+  int get_current_window_count() const { return opt_window_count; }
+
+  // Phase 3a helpers — invoked from CMD-side TX/ACK/BREAK sites in
+  // arq_commander.cc. Defined inline to avoid an extra .o churn for what is
+  // a thin instrumentation layer; no decision logic lives in any of them.
+  unsigned long long opt_now_ms() const {
+      return (unsigned long long)
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  // Called at the cmd_batch_tx_start instrumentation point. If a previous
+  // batch already published its slot, back-fill its wire_ms with the cycle
+  // delta. Always refresh opt_batch_tx_start_ms to the current wall-clock so
+  // the next batch can do the same.
+  void opt_on_batch_tx_start() {
+      unsigned long long now = opt_now_ms();
+      if (opt_batch_tx_start_ms != 0 && opt_window_count > 0) {
+          int prior = (opt_window_head - 1 + OPTIMIZER_WINDOW_SIZE) % OPTIMIZER_WINDOW_SIZE;
+          unsigned long long delta = now - opt_batch_tx_start_ms;
+          opt_batch_wire_ms[prior] = (unsigned int)delta;
+      }
+      opt_batch_tx_start_ms = now;
+  }
+  // Advance the ring head with one slot describing the just-finished batch.
+  // bytes_delivered is the number of payload bytes the receiver actually got
+  // (zero for failed batches). sack_used = 1 iff this batch closed via
+  // SACK_RSP (partial recovery), 0 if via OFDM_ACK_CLEAN / ACK_PAT / fallback
+  // ACK / failure. failed = 1 iff the batch dropped without any ACK / BREAK
+  // fired against it.
+  void opt_record_batch(unsigned int bytes_delivered,
+                        bool sack_used,
+                        bool failed) {
+      int slot = opt_window_head;
+      opt_batch_bytes_delivered[slot] = bytes_delivered;
+      // wire_ms is not known yet — the NEXT batch's tx_start back-fills it.
+      // Seed with 0 so a never-back-filled trailing slot contributes nothing
+      // to the rate sum (defensive: get_current_effective_rate_bps() also
+      // checks total_ms == 0).
+      opt_batch_wire_ms[slot] = 0;
+      opt_batch_sack_count[slot] = sack_used ? 1 : 0;
+      opt_batch_failed[slot] = failed ? 1 : 0;
+      opt_batch_config[slot] = (unsigned char)current_configuration;
+      opt_window_head = (opt_window_head + 1) % OPTIMIZER_WINDOW_SIZE;
+      if (opt_window_count < OPTIMIZER_WINDOW_SIZE) opt_window_count++;
+      opt_diag_emit_counter++;
+      if (opt_diag_emit_counter >= 10 && opt_window_count > 0) {
+          opt_diag_emit_counter = 0;
+          printf("[OPT-WINDOW] eff_bps=%.0f sack_rate=%.2f window_n=%d cfg=%d\n",
+              get_current_effective_rate_bps(),
+              get_current_sack_rate(),
+              opt_window_count,
+              current_configuration);
+          fflush(stdout);
+      }
+  }
+  // Zero the rolling window. Called from reset_session_state() on link
+  // disconnect — prior-session stats describe a different channel and would
+  // mislead the optimizer.
+  void opt_reset_window() {
+      for (int i = 0; i < OPTIMIZER_WINDOW_SIZE; i++) {
+          opt_batch_bytes_delivered[i] = 0;
+          opt_batch_wire_ms[i] = 0;
+          opt_batch_sack_count[i] = 0;
+          opt_batch_failed[i] = 0;
+          opt_batch_config[i] = 0;
+      }
+      opt_window_head = 0;
+      opt_window_count = 0;
+      opt_batch_tx_start_ms = 0;
+      opt_diag_emit_counter = 0;
+  }
+
 private:
   int nMessages;
   struct st_message* messages_tx;
@@ -1348,6 +1450,19 @@ private:
 
   int data_ack_received;
   int repeating_last_ack;
+
+  // Phase 3a (Effective-Rate Optimizer) — rolling-window storage. CMD-side
+  // only; RSP never touches these. Sized at OPTIMIZER_WINDOW_SIZE (=50).
+  // All values initialized in cl_arq_controller() / opt_reset_window().
+  unsigned int  opt_batch_bytes_delivered[OPTIMIZER_WINDOW_SIZE];
+  unsigned int  opt_batch_wire_ms[OPTIMIZER_WINDOW_SIZE];
+  unsigned char opt_batch_sack_count[OPTIMIZER_WINDOW_SIZE];
+  unsigned char opt_batch_failed[OPTIMIZER_WINDOW_SIZE];
+  unsigned char opt_batch_config[OPTIMIZER_WINDOW_SIZE];
+  int opt_window_head;
+  int opt_window_count;
+  unsigned long long opt_batch_tx_start_ms;
+  int opt_diag_emit_counter;
 
 };
 

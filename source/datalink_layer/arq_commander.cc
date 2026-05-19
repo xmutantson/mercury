@@ -1280,6 +1280,10 @@ void cl_arq_controller::process_messages_tx_data()
 		}
 		mtl::log_event_kv("cmd_batch_tx_start", "batch=%lld nframes=%d cfg=%d",
 		                  stats.nBatches_sent + 1, data_batch_size, current_configuration);
+		// Phase 3a (Effective-Rate Optimizer) — back-fill the prior batch slot's
+		// wire_ms with the cycle-time delta, and refresh the tx-start stamp for
+		// the batch about to leave. No decision logic here — pure measurement.
+		opt_on_batch_tx_start();
 		if(sack_v2_enabled && batch_includes_new_data)
 		{
 			printf("[CMD-BATCH-SEQ] new-data batch_seq_id=%d (frames in batch=%d)\n",
@@ -2175,6 +2179,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				int leftover_retx_at_capture = sack_v2_enabled ? retransmit_count : 0;
 				if(!sack_v2_enabled) retransmit_count = 0;
 				int rx_count = 0;
+				// Phase 3a — sum payload bytes of frames the receiver actually
+				// got (sack_bitmap[i] == true). Bytes saved into the retransmit
+				// queue are NOT delivered yet — exclude them.
+				unsigned long long opt_sack_bytes_delivered = 0;
 				for(int i = 0; i < nMessages; i++)
 				{
 					if(messages_tx[i].status != PENDING_ACK && messages_tx[i].status != ACK_TIMED_OUT)
@@ -2183,6 +2191,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					if(i < data_batch_size && sack_bitmap[i])
 					{
 						// Frame received by responder — mark ACKED
+						opt_sack_bytes_delivered += (unsigned)messages_tx[i].length;
 						messages_tx[i].status = ACKED;
 						stats.nAcked_data++;
 						rx_count++;
@@ -2251,6 +2260,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					axis3_batch_tick();
 				}
 
+				// Phase 3a — record this batch as a SACK-recovered partial.
+				// sack_used=true marks "had to spend a SACK_RSP cycle to close
+				// the batch"; bytes_delivered = sum of bytes the receiver
+				// actually got (the bitmap-true frames). Failed=false.
+				opt_record_batch((unsigned int)opt_sack_bytes_delivered,
+				                 /*sack_used=*/true,
+				                 /*failed=*/false);
+
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
 				   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
 				{
@@ -2303,13 +2320,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;
 
+				// Phase 3a — clean full-batch ACK: every PENDING_ACK / ACK_TIMED_OUT
+				// frame is about to be delivered. Sum lengths BEFORE register_ack
+				// mutates statuses.
+				unsigned long long opt_clean_bytes_delivered = 0;
 				for(int i=0; i<nMessages; i++)
 				{
 					if(messages_tx[i].status==PENDING_ACK || messages_tx[i].status==ACK_TIMED_OUT)
 					{
+						opt_clean_bytes_delivered += (unsigned)messages_tx[i].length;
 						register_ack(i);
 					}
 				}
+				// Record as clean (sack_used=false, failed=false). v2_ack_pat_pre_detected
+				// = 1 means we got here via OFDM_ACK_CLEAN; either way the batch
+				// closed with NO SACK_RSP cycle, so this is the "clean" bucket.
+				opt_record_batch((unsigned int)opt_clean_bytes_delivered,
+				                 /*sack_used=*/false,
+				                 /*failed=*/false);
 
 				// SACK Design A Step 10 — Axis 2 evaluation on clean full-batch ACK.
 				// A full-batch ACK (no SACK_RSP) means receiver got all frames →
@@ -2356,6 +2384,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				watchdog_timer.start();
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
+				// Phase 3a — accumulate delivered bytes across whichever fallback
+				// LDPC ACK type fires. Both ACK_RANGE and ACK_MULTI are clean
+				// (no SACK_RSP cycle), so sack_used=false.
+				unsigned long long opt_ldpc_bytes_delivered = 0;
+				bool opt_ldpc_ack_fired = false;
 				if(messages_rx_buffer.type==ACK_RANGE)
 				{
 					data_ack_received=YES;
@@ -2368,9 +2401,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					{
 						for(int i=start;i<=end;i++)
 						{
+							if(i >= 0 && i < nMessages
+							   && messages_tx[i].status == PENDING_ACK)
+								opt_ldpc_bytes_delivered += (unsigned)messages_tx[i].length;
 							register_ack(i);
 						}
 					}
+					opt_ldpc_ack_fired = true;
 				}
 				else if(messages_rx_buffer.type==ACK_MULTI)
 				{
@@ -2385,10 +2422,22 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					if(ack_count > max_acks) ack_count = max_acks;
 					for(int i=0;i<ack_count;i++)
 					{
-						register_ack((unsigned char)messages_rx_buffer.data[i+1]);
+						int msg_id = (unsigned char)messages_rx_buffer.data[i+1];
+						if(msg_id >= 0 && msg_id < nMessages
+						   && messages_tx[msg_id].status == PENDING_ACK)
+							opt_ldpc_bytes_delivered += (unsigned)messages_tx[msg_id].length;
+						register_ack(msg_id);
 					}
+					opt_ldpc_ack_fired = true;
 				}
 				messages_rx_buffer.status=FREE;
+
+				if(opt_ldpc_ack_fired)
+				{
+					opt_record_batch((unsigned int)opt_ldpc_bytes_delivered,
+					                 /*sack_used=*/false,
+					                 /*failed=*/false);
+				}
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK && messages_control.status==PENDING_ACK)
 				{
@@ -2536,6 +2585,17 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		if(data_ack_received == NO)
 		{
 			consecutive_data_acks = 0;
+
+			// Phase 3a — record this batch as failed (no ACK received before
+			// receiving_timeout). Whether or not BREAK fires below, the batch
+			// itself delivered no bytes; capture that here so each failed batch
+			// is recorded exactly once. Bytes delivered = 0, sack_used = false,
+			// failed = true. The wire_ms will be back-filled by the NEXT batch's
+			// opt_on_batch_tx_start() — or stay 0 if the link terminates here
+			// (in which case opt_reset_window() wipes the slot anyway).
+			opt_record_batch(/*bytes_delivered=*/0,
+			                 /*sack_used=*/false,
+			                 /*failed=*/true);
 
 			// Frame gearshift just applied but data failed — BREAK immediately.
 			// §7.13.33 — retry once before BREAK: on a CFG7→CFG15 PHY-switch,

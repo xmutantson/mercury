@@ -403,6 +403,21 @@ cl_arq_controller::cl_arq_controller()
 		exit(MEMORY_ERROR);
 	}
 
+	// Phase 3a (Effective-Rate Optimizer) — zero-init the rolling window.
+	// Same effect as opt_reset_window(), but called explicitly here so the
+	// invariant "ring arrays start zero" is enforced before any session.
+	for (int i = 0; i < OPTIMIZER_WINDOW_SIZE; i++) {
+		opt_batch_bytes_delivered[i] = 0;
+		opt_batch_wire_ms[i] = 0;
+		opt_batch_sack_count[i] = 0;
+		opt_batch_failed[i] = 0;
+		opt_batch_config[i] = 0;
+	}
+	opt_window_head = 0;
+	opt_window_count = 0;
+	opt_batch_tx_start_ms = 0;
+	opt_diag_emit_counter = 0;
+
 }
 
 
@@ -2933,6 +2948,11 @@ void cl_arq_controller::reset_session_state()
 	assigned_connection_id = 0;
 	connection_attempts = 0;
 	disconnect_requested = NO;
+
+	// Phase 3a (Effective-Rate Optimizer) — wipe the rolling window. Prior
+	// session's stats describe a different channel and would mislead the
+	// Phase-3c decision layer. See EFFECTIVE_RATE_OPTIMIZER_DESIGN.md §4.1.
+	opt_reset_window();
 }
 
 void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
