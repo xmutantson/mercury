@@ -169,6 +169,7 @@ cl_arq_controller::cl_arq_controller()
 		retransmit_frame_positions[i]=0;
 		retransmit_frame_types[i]=0;
 		retransmit_frame_batch_seq_ids[i]=-1;  // Step 3: unset until SACK populates
+		retransmit_frame_seq_with_eob[i]=0;    // §7.13.39 Fix 3: original seq+EOB byte
 	}
 	// SACK Design A Step 3 — batch_seq_id state (CMD counter, RSP store).
 	// cmd_batch_seq_id starts at 0; first new-data batch goes out under value 0.
