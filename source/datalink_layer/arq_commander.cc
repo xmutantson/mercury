@@ -381,6 +381,45 @@ void cl_arq_controller::process_messages_commander()
 		{
 			return;
 		}
+
+		// Phase 3c — consume any pending optimizer-recommended config
+		// switch BEFORE starting the next data batch. Re-verify all the
+		// hard gates: turboshift may have re-armed and BREAK may have
+		// fired since the recommendation was made. If still eligible,
+		// queue SET_CONFIG; the standard ACK handler then loads the new
+		// config (same pattern as SUPERSHIFT at line ~3193 + turbo path
+		// at line ~2785).
+		if (opt_pending_switch_cfg >= 0
+		    && opt_pending_switch_cfg != current_configuration
+		    && !turboshift_active
+		    && emergency_break_active == 0
+		    && link_status == CONNECTED
+		    && is_ofdm_config(current_configuration)
+		    && narrowband_enabled != YES
+		    && block_under_tx == NO
+		    && messages_control.status == FREE)
+		{
+			int target = opt_pending_switch_cfg;
+			// Clamp to WB ceiling + max-config override.
+			if (target > WB_CONFIG_MAX) target = WB_CONFIG_MAX;
+			if (max_config_override >= 0 && target > max_config_override)
+				target = max_config_override;
+			if (target != current_configuration && is_ofdm_config(target))
+			{
+				printf("[OPT] queue SET_CONFIG: %d -> %d (effective-rate optimizer)\n",
+				       current_configuration, target);
+				fflush(stdout);
+				negotiated_configuration = target;
+				cleanup();
+				add_message_control(SET_CONFIG);
+				connection_status = TRANSMITTING_CONTROL;
+				opt_pending_switch_cfg = -1;
+				return;
+			}
+			// Target became invalid between recording and dispatch — drop.
+			opt_pending_switch_cfg = -1;
+		}
+
 		print_stats();
 		process_messages_tx_data();
 	}
@@ -2267,6 +2306,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				opt_record_batch((unsigned int)opt_sack_bytes_delivered,
 				                 /*sack_used=*/true,
 				                 /*failed=*/false);
+				// Phase 3c — ask the optimizer whether to switch. Defers the
+				// queued SET_CONFIG to the next TRANSMITTING_DATA tick (clean
+				// dispatch site) instead of mid-receive to avoid stepping on
+				// the Axis-2/3 evaluations below.
+				{
+					int rec = current_configuration;
+					if (opt_evaluate_batch_end(&rec))
+						opt_pending_switch_cfg = rec;
+				}
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
 				   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
@@ -2338,6 +2386,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				opt_record_batch((unsigned int)opt_clean_bytes_delivered,
 				                 /*sack_used=*/false,
 				                 /*failed=*/false);
+				// Phase 3c — same deferred-switch protocol as the SACK path.
+				{
+					int rec = current_configuration;
+					if (opt_evaluate_batch_end(&rec))
+						opt_pending_switch_cfg = rec;
+				}
 
 				// SACK Design A Step 10 — Axis 2 evaluation on clean full-batch ACK.
 				// A full-batch ACK (no SACK_RSP) means receiver got all frames →
@@ -2437,6 +2491,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					opt_record_batch((unsigned int)opt_ldpc_bytes_delivered,
 					                 /*sack_used=*/false,
 					                 /*failed=*/false);
+					// Phase 3c — same deferred-switch protocol as the SACK +
+					// ACK_PAT paths above. Defers any optimizer-recommended
+					// SET_CONFIG to the next TRANSMITTING_DATA dispatch.
+					{
+						int rec = current_configuration;
+						if (opt_evaluate_batch_end(&rec))
+							opt_pending_switch_cfg = rec;
+					}
 				}
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK && messages_control.status==PENDING_ACK)
@@ -2596,6 +2658,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			opt_record_batch(/*bytes_delivered=*/0,
 			                 /*sack_used=*/false,
 			                 /*failed=*/true);
+			// Phase 3c — drain the optimizer's cooldown on failure too so it
+			// doesn't get stuck after a transient channel hiccup. We do NOT
+			// run evaluate() here: failed batches feed noisy zero-rate
+			// samples into the window and a switch in the middle of BREAK
+			// triage would compete with the recovery logic below.
+			rate_opt.notify_cooldown_tick();
+			// Cancel any stale pending switch — BREAK / NACK handling owns
+			// the next config transition.
+			opt_pending_switch_cfg = -1;
 
 			// Frame gearshift just applied but data failed — BREAK immediately.
 			// §7.13.33 — retry once before BREAK: on a CFG7→CFG15 PHY-switch,

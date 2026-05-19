@@ -35,6 +35,7 @@
 #include "audioio/audioio.h"
 #include "compression/mercury_compress.h"
 #include "datalink_layer/b2f_handler.h"
+#include "datalink_layer/rate_optimizer.h"
 #include "crypto/mercury_crypto.h"
 #include <iomanip>
 #include <thread>
@@ -1397,6 +1398,35 @@ public:
           fflush(stdout);
       }
   }
+  // Phase 3c (Effective-Rate Optimizer) — decision logic owner. The class
+  // is self-contained; cl_arq_controller holds it as a member and queries
+  // `evaluate()` once per batch-end on CMD. Inert until load() succeeds.
+  // See: include/datalink_layer/rate_optimizer.h
+  //      mercury/fact-documents/EFFECTIVE_RATE_OPTIMIZER_DESIGN.md §4.3
+  cl_rate_optimizer rate_opt;
+
+  // Called once at mercury startup (from main.cc / cl_arq_controller::init
+  // wherever capabilities are negotiated) to load the calibration table.
+  // Path is `mercury/effective_rate_table.json` relative to the working dir;
+  // override via MERCURY_RATE_TABLE env var. Optimizer auto-disables on miss.
+  void opt_load_rate_table();
+
+  // Called at every batch-end tick on CMD (from the three opt_record_batch
+  // success sites in arq_commander.cc). Runs the gate check + lookup; if
+  // the optimizer wants to switch, sets `*out_recommended_cfg` to the new
+  // config and returns true. Caller queues SET_CONFIG via the standard path.
+  // Returns false otherwise (and out param is left at current cfg).
+  //
+  // Gating (per §4.3 + spec):
+  //   - sack_v2_enabled must be true (caller may double-gate)
+  //   - turboshift_active must be false
+  //   - emergency_break_active must be 0
+  //   - link_status must be CONNECTED (caller's responsibility)
+  //
+  // Cooldown ticking happens HERE, regardless of decision — so the counter
+  // drains on every batch.
+  bool opt_evaluate_batch_end(int* out_recommended_cfg);
+
   // Zero the rolling window. Called from reset_session_state() on link
   // disconnect — prior-session stats describe a different channel and would
   // mislead the optimizer.
@@ -1463,6 +1493,15 @@ private:
   int opt_window_count;
   unsigned long long opt_batch_tx_start_ms;
   int opt_diag_emit_counter;
+
+  // Phase 3c — deferred optimizer-recommended config switch. Set by
+  // opt_evaluate_batch_end() at the SACK_RSP / clean-ACK / fallback-ACK
+  // success sites; consumed at the next TRANSMITTING_DATA dispatch tick
+  // which queues SET_CONFIG via the standard add_message_control() path.
+  // Sentinel value -1 means "no pending switch". Cleared after the switch
+  // request is enqueued OR if the link becomes ineligible (BREAK fires,
+  // turboshift resumes, session ends).
+  int opt_pending_switch_cfg;
 
 };
 

@@ -417,6 +417,7 @@ cl_arq_controller::cl_arq_controller()
 	opt_window_count = 0;
 	opt_batch_tx_start_ms = 0;
 	opt_diag_emit_counter = 0;
+	opt_pending_switch_cfg = -1;  // Phase 3c — no pending optimizer switch
 
 }
 
@@ -833,6 +834,10 @@ int cl_arq_controller::init(int tcp_base_port, int gear_shift_on, int initial_mo
 	load_configuration(ack_configuration,FULL,NO);
 	load_configuration(data_configuration,PHYSICAL_LAYER_ONLY,YES);
 
+	// Phase 3c (Effective-Rate Optimizer) — load calibration table once at
+	// init. Inert if missing; only enables on parse success. Path override
+	// via MERCURY_RATE_TABLE env var; defaults to relative path.
+	opt_load_rate_table();
 
 	print_stats_timer.start();
 
@@ -2953,6 +2958,61 @@ void cl_arq_controller::reset_session_state()
 	// session's stats describe a different channel and would mislead the
 	// Phase-3c decision layer. See EFFECTIVE_RATE_OPTIMIZER_DESIGN.md §4.1.
 	opt_reset_window();
+	// Phase 3c — also wipe cooldown / last-switch state so the optimizer
+	// starts each session fresh (channel may have changed since last
+	// session ended).
+	rate_opt.reset_session_state();
+	opt_pending_switch_cfg = -1;
+}
+
+void cl_arq_controller::opt_load_rate_table()
+{
+	// Path resolution chain (each tried until one yields a table with
+	// valid cells; load() prints its own diagnostic per attempt):
+	//   1. $MERCURY_RATE_TABLE  (env override)
+	//   2. mercury/effective_rate_table.json       (real calibration output)
+	//   3. effective_rate_table.json               (same, run from mercury/)
+	//   4. mercury/effective_rate_table.synthetic.json   (dev synthetic)
+	//   5. effective_rate_table.synthetic.json
+	const char* env = std::getenv("MERCURY_RATE_TABLE");
+	if (env && *env) {
+		if (rate_opt.load(env)) return;
+	}
+	if (rate_opt.load("mercury/effective_rate_table.json")) return;
+	if (rate_opt.load("effective_rate_table.json")) return;
+	if (rate_opt.load("mercury/effective_rate_table.synthetic.json")) return;
+	rate_opt.load("effective_rate_table.synthetic.json");
+}
+
+bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
+{
+	if (out_recommended_cfg) *out_recommended_cfg = current_configuration;
+	// Always drain the cooldown counter regardless of gate outcome so the
+	// counter reflects elapsed batches, not "batches the optimizer actually
+	// looked at".
+	rate_opt.notify_cooldown_tick();
+
+	// Hard gates — caller may add more.
+	if (!rate_opt.is_enabled())            return false;
+	if (!sack_v2_enabled)                  return false;
+	if (turboshift_active)                 return false;
+	if (emergency_break_active != 0)       return false;
+	if (link_status != CONNECTED)          return false;
+	if (role != COMMANDER)                 return false;
+	// Only fire on WB OFDM configs. NB is out-of-scope for v1 (no NB
+	// calibration data). ROBUST_X is owned by the gearshift / break path.
+	if (narrowband_enabled == YES)         return false;
+	if (!is_ofdm_config(current_configuration)) return false;
+
+	int target = rate_opt.evaluate(current_configuration,
+	                               get_current_effective_rate_bps(),
+	                               get_current_sack_rate(),
+	                               get_current_window_count(),
+	                               WB_CONFIG_MAX);
+
+	if (target == current_configuration) return false;
+	if (out_recommended_cfg) *out_recommended_cfg = target;
+	return true;
 }
 
 void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
