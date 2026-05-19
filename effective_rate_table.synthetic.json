@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "calibration_date": "SYNTHETIC-2026-05-18 (hand-tuned for Phase 3c dev — replace with real calibration output)",
+  "mercury_head": "ae7fdf8+phase3c",
+  "calibration_setup": {
+    "compress": true,
+    "sack": true,
+    "sack_v2": true,
+    "gearshift": false,
+    "payload": "pg84.txt",
+    "duration_s": 60,
+    "settle_s": 30,
+    "runs_per_cell": 1,
+    "audio_dev": "synthetic",
+    "synthetic": true,
+    "note": "Plausible values per MEMORY.md verified WB throughput + Mercury PHY rate table. CFG4 WB ~238 bps, CFG10 ~797 bps, CFG15 ~2479 bps observed; CFG14/16 interpolated from PHY rates 4361/5665 bps with ~55% efficiency. SACK rate axis: clean ~0, wgn30 ~0.05, wgn28 ~0.10, wgn26 ~0.15, wgn24 ~0.20, wgn22 ~0.30, wgn20 ~0.40, wgn18 ~0.50, wgn16 ~0.65. Effective bps tapers with SACK overhead; configs above the channel SNR threshold are marked failed=true. NOTE: this file is the SYNTHETIC fallback used while real calibration is in progress; mercury/effective_rate_table.json (real output of tools/effective_rate_calibrate.py) is checked first."
+  },
+  "configs_tested": [4, 6, 9, 10, 11, 12, 13, 14, 15, 16],
+  "channels_tested": [
+    "clean", "wgn30", "wgn28", "wgn26", "wgn24",
+    "wgn22", "wgn20", "wgn18", "wgn16"
+  ],
+  "channel_definitions": {
+    "clean":  ["WGN:40"],
+    "wgn30":  ["WGN:30"],
+    "wgn28":  ["WGN:28"],
+    "wgn26":  ["WGN:26"],
+    "wgn24":  ["WGN:24"],
+    "wgn22":  ["WGN:22"],
+    "wgn20":  ["WGN:20"],
+    "wgn18":  ["WGN:18"],
+    "wgn16":  ["WGN:16"]
+  },
+  "table": {
+    "4": {
+      "clean":  { "eff_bps_mean":  238.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean":  230.0, "sack_rate_mean": 0.03, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean":  225.0, "sack_rate_mean": 0.05, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean":  220.0, "sack_rate_mean": 0.08, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean":  214.0, "sack_rate_mean": 0.12, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean":  205.0, "sack_rate_mean": 0.18, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  195.0, "sack_rate_mean": 0.25, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":  180.0, "sack_rate_mean": 0.35, "n_runs": 3, "failed": false },
+      "wgn16":  { "eff_bps_mean":  160.0, "sack_rate_mean": 0.48, "n_runs": 3, "failed": false }
+    },
+    "6": {
+      "clean":  { "eff_bps_mean":  450.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean":  435.0, "sack_rate_mean": 0.04, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean":  420.0, "sack_rate_mean": 0.07, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean":  405.0, "sack_rate_mean": 0.11, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean":  385.0, "sack_rate_mean": 0.16, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean":  360.0, "sack_rate_mean": 0.22, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  325.0, "sack_rate_mean": 0.30, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":  275.0, "sack_rate_mean": 0.42, "n_runs": 3, "failed": false },
+      "wgn16":  { "eff_bps_mean":  200.0, "sack_rate_mean": 0.58, "n_runs": 3, "failed": false }
+    },
+    "9": {
+      "clean":  { "eff_bps_mean":  720.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean":  695.0, "sack_rate_mean": 0.05, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean":  670.0, "sack_rate_mean": 0.09, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean":  640.0, "sack_rate_mean": 0.14, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean":  600.0, "sack_rate_mean": 0.20, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean":  545.0, "sack_rate_mean": 0.28, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  470.0, "sack_rate_mean": 0.38, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":  365.0, "sack_rate_mean": 0.50, "n_runs": 3, "failed": false },
+      "wgn16":  { "eff_bps_mean":  220.0, "sack_rate_mean": 0.65, "n_runs": 3, "failed": false }
+    },
+    "10": {
+      "clean":  { "eff_bps_mean":  797.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean":  770.0, "sack_rate_mean": 0.05, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean":  745.0, "sack_rate_mean": 0.10, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean":  710.0, "sack_rate_mean": 0.15, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean":  660.0, "sack_rate_mean": 0.22, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean":  590.0, "sack_rate_mean": 0.30, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  490.0, "sack_rate_mean": 0.42, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":  340.0, "sack_rate_mean": 0.55, "n_runs": 3, "failed": false },
+      "wgn16":  { "eff_bps_mean":  140.0, "sack_rate_mean": 0.72, "n_runs": 3, "failed": false }
+    },
+    "11": {
+      "clean":  { "eff_bps_mean": 1100.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean": 1055.0, "sack_rate_mean": 0.05, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean": 1010.0, "sack_rate_mean": 0.11, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean":  955.0, "sack_rate_mean": 0.17, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean":  870.0, "sack_rate_mean": 0.24, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean":  765.0, "sack_rate_mean": 0.33, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  610.0, "sack_rate_mean": 0.45, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":  380.0, "sack_rate_mean": 0.60, "n_runs": 3, "failed": false },
+      "wgn16":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.80, "n_runs": 3, "failed": true, "break_fired": true }
+    },
+    "12": {
+      "clean":  { "eff_bps_mean": 1480.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean": 1410.0, "sack_rate_mean": 0.06, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean": 1335.0, "sack_rate_mean": 0.12, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean": 1245.0, "sack_rate_mean": 0.18, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean": 1125.0, "sack_rate_mean": 0.26, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean":  955.0, "sack_rate_mean": 0.36, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  720.0, "sack_rate_mean": 0.50, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":  400.0, "sack_rate_mean": 0.65, "n_runs": 3, "failed": false },
+      "wgn16":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.85, "n_runs": 3, "failed": true, "break_fired": true }
+    },
+    "13": {
+      "clean":  { "eff_bps_mean": 1900.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean": 1810.0, "sack_rate_mean": 0.07, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean": 1705.0, "sack_rate_mean": 0.13, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean": 1580.0, "sack_rate_mean": 0.20, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean": 1410.0, "sack_rate_mean": 0.29, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean": 1170.0, "sack_rate_mean": 0.40, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  830.0, "sack_rate_mean": 0.55, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.75, "n_runs": 3, "failed": true, "break_fired": true },
+      "wgn16":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.90, "n_runs": 3, "failed": true, "break_fired": true }
+    },
+    "14": {
+      "clean":  { "eff_bps_mean": 2350.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean": 2230.0, "sack_rate_mean": 0.07, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean": 2090.0, "sack_rate_mean": 0.14, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean": 1920.0, "sack_rate_mean": 0.22, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean": 1700.0, "sack_rate_mean": 0.31, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean": 1380.0, "sack_rate_mean": 0.43, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  920.0, "sack_rate_mean": 0.60, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.80, "n_runs": 3, "failed": true, "break_fired": true },
+      "wgn16":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.92, "n_runs": 3, "failed": true, "break_fired": true }
+    },
+    "15": {
+      "clean":  { "eff_bps_mean": 2479.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean": 2350.0, "sack_rate_mean": 0.08, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean": 2195.0, "sack_rate_mean": 0.16, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean": 1995.0, "sack_rate_mean": 0.24, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean": 1720.0, "sack_rate_mean": 0.34, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean": 1340.0, "sack_rate_mean": 0.47, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  830.0, "sack_rate_mean": 0.65, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.85, "n_runs": 3, "failed": true, "break_fired": true },
+      "wgn16":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.95, "n_runs": 3, "failed": true, "break_fired": true }
+    },
+    "16": {
+      "clean":  { "eff_bps_mean": 3210.0, "sack_rate_mean": 0.00, "n_runs": 3, "failed": false },
+      "wgn30":  { "eff_bps_mean": 3000.0, "sack_rate_mean": 0.09, "n_runs": 3, "failed": false },
+      "wgn28":  { "eff_bps_mean": 2745.0, "sack_rate_mean": 0.18, "n_runs": 3, "failed": false },
+      "wgn26":  { "eff_bps_mean": 2440.0, "sack_rate_mean": 0.27, "n_runs": 3, "failed": false },
+      "wgn24":  { "eff_bps_mean": 2050.0, "sack_rate_mean": 0.38, "n_runs": 3, "failed": false },
+      "wgn22":  { "eff_bps_mean": 1510.0, "sack_rate_mean": 0.52, "n_runs": 3, "failed": false },
+      "wgn20":  { "eff_bps_mean":  790.0, "sack_rate_mean": 0.70, "n_runs": 3, "failed": false },
+      "wgn18":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.88, "n_runs": 3, "failed": true, "break_fired": true },
+      "wgn16":  { "eff_bps_mean":    0.0, "sack_rate_mean": 0.97, "n_runs": 3, "failed": true, "break_fired": true }
+    }
+  }
+}
