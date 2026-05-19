@@ -289,10 +289,17 @@ cl_arq_controller::cl_arq_controller()
 	nb_probe_max=2;
 	session_narrowband=false;
 	bandwidth_mode=BW_AUTO;
-	disable_sack=true;  // B2 fix (2026-05-12): SACK off by default. See arq.h.
+	// SACK v1 + v2 ON by default. The historical B2 fix (2026-05-12) that
+	// turned SACK off was obsoleted by SACK Design A (5 commits e73968a..1acdb3c
+	// on monitor branch, May 16-17 2026), which solved the regressions that
+	// motivated the disable. SACK is now load-bearing for everything above
+	// CFG6 (the optimizer's calibrated floor) — turning it off forfeits
+	// partial-batch recovery, piggyback retx, and all of Design A's gains.
+	// Opt-out remains available via --no-sack / --disable-sack-v2.
+	disable_sack=false;
 	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;
 	if(disable_sack) local_capability &= ~CAP_SACK;
-	if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding (default-off opt-in)
+	if(enable_sack_v2) local_capability |= CAP_SACK_V2;
 	peer_capability=0;
 	wb_upgrade_pending=false;
 	psk_mismatch_pending=false;
@@ -2964,6 +2971,25 @@ void cl_arq_controller::reset_session_state()
 	// session ended).
 	rate_opt.reset_session_state();
 	opt_pending_switch_cfg = -1;
+
+	// SACK Design A — wipe axis-1/2/3 controller state. Prior session may
+	// have degraded into SACK_MODE_OFF or built up partial-rate-window
+	// history that would skew the new session's policy decisions. Mirror
+	// the constructor initialization at the top of this file (see ~line
+	// 215-260). Without this, a session that landed in SACK_MODE_OFF and
+	// then reconnected (potentially to a different peer / improved channel)
+	// would suppress SACK_RSP TX indefinitely. Previously masked when SACK
+	// was opt-in; now load-bearing since SACK is default-on.
+	axis2_consecutive_good_batches = 0;
+	axis2_consecutive_bad_batches  = 0;
+	axis2_partial_rate_count       = 0;
+	axis2_partial_rate_pos         = 0;
+	axis2_cooldown_batches         = 0;
+	axis3_sack_mode                = SACK_MODE_ON;
+	axis3_consecutive_sack_misses  = 0;
+	axis3_recent_sack_ok_count     = 0;
+	axis3_recent_sack_ok_pos       = 0;
+	axis3_batches_since_off        = 0;
 }
 
 void cl_arq_controller::opt_load_rate_table()
@@ -3017,6 +3043,18 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 	// calibration data). ROBUST_X is owned by the gearshift / break path.
 	if (narrowband_enabled == YES)         return false;
 	if (!is_ofdm_config(current_configuration)) return false;
+
+	// Below-table-range gate: when gearshift/BREAK has dropped us below
+	// where the calibration table has data, OR when the observed channel
+	// is worse than anything we calibrated for, the optimizer goes silent
+	// and lets the dumber-but-safer gearshift/turboshift/BREAK system own
+	// the link entirely. Re-engages automatically when both conditions
+	// return to the calibrated region. min_cfg / max_sack are populated
+	// at load() time from the actual table contents.
+	int    min_cfg  = rate_opt.min_calibrated_cfg();
+	double max_sack = rate_opt.max_calibrated_sack_rate();
+	if (min_cfg >= 0 && current_configuration < min_cfg) return false;
+	if (max_sack >= 0.0 && get_current_sack_rate() > max_sack) return false;
 
 	int target = rate_opt.evaluate(current_configuration,
 	                               get_current_effective_rate_bps(),
@@ -4379,6 +4417,22 @@ void cl_arq_controller::send_break_pattern()
 	printf("[TX-BREAK] Sending BREAK pattern on CONFIG_%d\n", current_configuration);
 	fflush(stdout);
 
+	// Window-stabilization cooldown after BREAK. The optimizer's 50-batch
+	// rolling window has stale "BREAK-era" failed batches in it that would
+	// poison the eff_bps / sack_rate means for several batches at the new
+	// (post-BREAK) config. 8 batches gives the window time to refill ~16%
+	// with fresh post-BREAK measurements before we let the optimizer act
+	// on them. At mid-tier configs (batch ~1.5s) this is ~10s; at low
+	// configs (batch ~12s, where BREAK often lands us) it's ~100s.
+	//
+	// Note: anti-thrashing is PRIMARILY handled by the below-table-range
+	// gate in opt_evaluate_batch_end() — if the channel is still bad
+	// post-BREAK, sack_rate > max_calibrated_sack_rate keeps the optimizer
+	// silent indefinitely without needing this cooldown. This cooldown
+	// only matters when the channel IMPROVED enough to clear the gate but
+	// the window mean is still skewed by old data.
+	rate_opt.force_cooldown(8);
+
 	ptt_on();
 
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
@@ -4624,6 +4678,28 @@ bool cl_arq_controller::receive_hail_pattern()
 		// Per-match quality: noise gives metric/matched ≈ 2/Nc (0.2 NB, 0.04 WB).
 		// Real signals give 0.5+. Gate at 0.3 to reject noise false alarms.
 		double quality = (matched_count > 0) ? metric / matched_count : 0.0;
+		// HAIL-POLL diagnostic: opt-in via MERCURY_HAIL_POLL=1 env var.
+		// Logs near-threshold polls only (≥40% base match OR metric ≥2.0 OR
+		// quality ≥0.2) to distinguish "no signal" (Pi state drift) from
+		// "signal present but degraded" without flooding logs. Cached on
+		// first call so we don't pay getenv() cost in the hot poll loop.
+		static int hail_poll_enabled = -1;
+		if(hail_poll_enabled < 0)
+			hail_poll_enabled = (getenv("MERCURY_HAIL_POLL") != nullptr) ? 1 : 0;
+		bool near_threshold = base_matched >= (telecom_system->ack_mfsk.hail_match_threshold * 4 / 10)
+		                   || metric >= 2.0
+		                   || quality >= 0.2;
+		if(hail_poll_enabled && near_threshold)
+		{
+			printf("[HAIL-POLL] base=%d/%d suffix=%d/%d metric=%.2f quality=%.2f%s%s%s\n",
+				base_matched, telecom_system->ack_mfsk.hail_match_threshold,
+				suffix_matched, telecom_system->ack_mfsk.HAIL_SUFFIX_LEN,
+				metric, quality,
+				base_ok ? " base_ok" : "",
+				suffix_ok ? " suffix_ok" : "",
+				telecom_system->ack_mfsk.hail_directed ? " (directed)" : "");
+			fflush(stdout);
+		}
 		if(base_ok && suffix_ok && metric >= 3.0 && quality >= 0.3)
 		{
 			printf("[HAIL] Detected: base=%d/%d suffix=%d/%d metric=%.1f quality=%.2f%s\n",

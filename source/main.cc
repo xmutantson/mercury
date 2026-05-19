@@ -293,9 +293,9 @@ int main(int argc, char *argv[])
     int ls_window_w_cli = -1, ls_window_h_cli = -1; // --ls-window=WxH (-1 = default 2x8)
     int ofdm_defer_overflow_cli = -1;  // --ofdm-defer-overflow=on|off (-1=default on)
     int sack_timeout_extra_ms_cli = -1; // --sack-timeout-extra-ms=N (-1=default 0 post-SACK_FIX_PLAN §7 step 3)
-    bool no_sack_cli = false;          // --no-sack: force disable (no-op after B2 fix)
-    bool enable_sack_cli = false;      // --enable-sack: opt-in to SACK (B2 fix: now off by default)
-    bool enable_sack_v2_cli = false;   // --enable-sack-v2: legacy opt-in (default-on now after Step 14; kept as no-op for harness compat)
+    bool no_sack_cli = false;          // --no-sack: opt-out (SACK is ON by default since Design A shipped)
+    bool enable_sack_cli = false;      // --enable-sack: no-op (kept for harness compat; SACK is ON by default)
+    bool enable_sack_v2_cli = false;   // --enable-sack-v2: no-op (default ON since SACK Design A Step 14)
     bool disable_sack_v2_cli = false;  // --disable-sack-v2: SACK Design A Step 14 opt-out (forces CAP_SACK_V2 off)
     int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
     bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
@@ -1504,14 +1504,18 @@ start_modem:
         }
         if (no_sack_cli) {
             ARQ.disable_sack = true;
-            ARQ.local_capability &= ~CAP_SACK;  // strip from current value too
-            printf("[FLAG] --no-sack: CAP_SACK masked from local_capability "
-                   "(no-op after B2 fix; default is now disabled)\n");
+            ARQ.enable_sack_v2 = false;
+            ARQ.local_capability &= ~CAP_SACK;
+            ARQ.local_capability &= ~CAP_SACK_V2;  // Bug 4: also strip v2
+                                                   // so --no-sack is a complete
+                                                   // opt-out (was leaking v2 on)
+            printf("[FLAG] --no-sack: CAP_SACK + CAP_SACK_V2 masked from "
+                   "local_capability (full opt-out; default is now ON)\n");
         }
         if (enable_sack_cli) {
             ARQ.disable_sack = false;
             ARQ.local_capability |= CAP_SACK;
-            printf("[FLAG] --enable-sack: opt-in SACK negotiation (default after B2 is OFF)\n");
+            printf("[FLAG] --enable-sack: no-op (SACK is ON by default since Design A)\n");
         }
         if (no_sack_cli && enable_sack_cli) {
             fprintf(stderr, "ERROR: cannot pass both --no-sack and --enable-sack\n");

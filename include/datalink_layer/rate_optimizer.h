@@ -98,6 +98,29 @@ public:
     void set_cooldown_batches(int n)    { cooldown_max = n; }
     void set_switch_cost_ms(int ms)     { switch_cost_ms = ms; }
 
+    // BREAK-driven cooldown — called from the BREAK handler in arq_common.cc
+    // when BREAK fires. Pins cooldown_remaining to N batches so the optimizer
+    // stays silent while gearshift/SUPERSHIFT/BREAK run the descent (and any
+    // subsequent reverse-probe up-climb). Without this the optimizer would
+    // immediately recommend going back to the config BREAK just bounced us
+    // out of, causing thrashing. Idempotent — only raises, never lowers.
+    void force_cooldown(int batches)
+    {
+        if (batches > cooldown_remaining) cooldown_remaining = batches;
+    }
+
+    // Below-table-range gate inputs. Populated at load(); used by
+    // cl_arq_controller::opt_evaluate_batch_end() to decide whether the
+    // optimizer is in its calibrated operating region.
+    //   - min_calibrated_cfg: lowest cfg id with a valid cell in the table.
+    //     Below this, gearshift/SUPERSHIFT/BREAK own the link entirely.
+    //   - max_calibrated_sack_rate: largest sack_rate_mean across all valid
+    //     cells. Above this we're observing a channel WORSE than anything
+    //     we calibrated for — no business recommending a switch.
+    // Both return -1 / -1.0 when the table never loaded (signals "ignore").
+    int    min_calibrated_cfg() const        { return min_cfg_calibrated; }
+    double max_calibrated_sack_rate() const  { return max_sack_calibrated; }
+
 private:
     bool enabled;
     int  n_configs_loaded;
@@ -128,21 +151,27 @@ private:
     // batches the optimizer was asked about even if no switch was made.
     int    eval_count;
 
-    // Map current SACK rate to the nearest calibrated channel bucket.
-    // Returns "" if channel_axis is empty (i.e. table never loaded).
-    std::string channel_bucket_from_sack_rate(double sack_rate) const;
+    // Below-table-range gate inputs — populated by load(). -1 / -1.0 when
+    // no table is loaded (signals "no gate active").
+    int    min_cfg_calibrated;
+    double max_sack_calibrated;
+
+    // Identify the channel label that best matches our current observations
+    // AT THE CURRENT CONFIG. Returns the channel-label key (e.g. "wgn22")
+    // for the cell in table[current_cfg] whose sack_rate_mean is closest to
+    // current_sack_rate, with eff_bps_mean as a tiebreaker. Returns "" if
+    // table[current_cfg] is empty (caller falls back to channel_axis).
+    // This replaces the old config-agnostic channel_bucket_from_sack_rate()
+    // + predicted_sack_at_target() heuristic. The channel label identified
+    // here is then used to look up EVERY candidate config in one shot
+    // (no ladder-distance scaling — the table already measured what each
+    // config does on this channel).
+    std::string identify_channel_label(int current_cfg,
+                                       double current_sack_rate,
+                                       double current_eff_bps) const;
 
     // Look up cell. Returns NULL if missing. Caller checks valid flag.
     const st_rate_cell* get_cell(int cfg, const std::string& bucket) const;
-
-    // Predict the loss-at-target heuristic per §5.1. Naive linear: a
-    // 1-step downshift gets ~half the loss; a 2-step downshift gets ~zero.
-    // (Conservative — only used to pick the channel bucket for the
-    // predicted_rate lookup at the target config.) Returns the SACK rate
-    // we'd expect at target_cfg given current channel conditions.
-    double predicted_sack_at_target(int current_cfg,
-                                    int target_cfg,
-                                    double current_sack_rate) const;
 };
 
 #endif // RATE_OPTIMIZER_H_
