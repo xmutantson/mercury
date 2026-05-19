@@ -336,6 +336,7 @@ cl_arq_controller::cl_arq_controller()
 	supershift_proven_ceiling=-1;
 	skip_turbo_reverse=false;
 	max_config_override=-1;
+	optimizer_disabled=false;
 	turbo_snr_ack_enabled=false;
 	turbo_received_snr=-99.0f;
 	turbo_best_snr=-99.0f;
@@ -2967,6 +2968,15 @@ void cl_arq_controller::reset_session_state()
 
 void cl_arq_controller::opt_load_rate_table()
 {
+	// --no-optimizer: skip table load entirely. opt_evaluate_batch_end()
+	// also early-exits, so the optimizer is fully inert. Used by
+	// tools/effective_rate_calibrate.py to keep the optimizer from
+	// switching configs mid-calibration.
+	if (optimizer_disabled) {
+		printf("[OPT] disabled via --no-optimizer, table not loaded\n");
+		fflush(stdout);
+		return;
+	}
 	// Path resolution chain (each tried until one yields a table with
 	// valid cells; load() prints its own diagnostic per attempt):
 	//   1. $MERCURY_RATE_TABLE  (env override)
@@ -2987,6 +2997,10 @@ void cl_arq_controller::opt_load_rate_table()
 bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 {
 	if (out_recommended_cfg) *out_recommended_cfg = current_configuration;
+	// --no-optimizer: hard short-circuit before any state mutation
+	// (including the cooldown tick) so the optimizer is fully inert under
+	// calibration. opt_load_rate_table() also no-ops when disabled.
+	if (optimizer_disabled)                return false;
 	// Always drain the cooldown counter regardless of gate outcome so the
 	// counter reflects elapsed batches, not "batches the optimizer actually
 	// looked at".

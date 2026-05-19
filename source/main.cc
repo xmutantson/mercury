@@ -275,6 +275,7 @@ int main(int argc, char *argv[])
     int tx_channel_cli = -1;          // -1 = use default; 0=LEFT, 1=RIGHT, 2=STEREO
     bool monitor_stdout = false;      // --stdout: output decoded plaintext to stdout
     bool skip_turbo_reverse = false;  // --skip-turbo-reverse: skip TURBO_REVERSE phase
+    bool no_optimizer_cli = false;    // --no-optimizer: disable Phase 3c effective-rate optimizer (calibration runs)
     int max_config_cli = -1;          // --max-config: hard ceiling on turboshift
     int ptt_delay_cli = -1;           // --ptt-delay: override both PTT on/off delays (ms)
     int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
@@ -390,6 +391,7 @@ int main(int argc, char *argv[])
 
         printf("  --skip-turbo-reverse  Skip TURBO_REVERSE phase (benchmark mode)\n");
         printf("  --max-config [N]      Hard ceiling on turboshift (0-15, default: no limit)\n");
+        printf("  --no-optimizer        Disable effective-rate optimizer (Phase 3c). For calibration runs only.\n");
         printf("  --ptt-delay [ms]  Override PTT on/off delay (0 for no-PTT setups)\n");
         printf("\nModulation and bandwidth:\n");
         printf("  -s [config]       Modulation: 0-16 (OFDM), 100-102 (ROBUST MFSK). Use -l to list.\n");
@@ -820,6 +822,21 @@ int main(int argc, char *argv[])
         {
             skip_turbo_reverse = true;
             printf("Turboshift: skipping REVERSE phase\n");
+            for (int j = i; j < argc - 1; j++)
+                argv[j] = argv[j + 1];
+            argc -= 1;
+            i--;
+        }
+        else if (strcmp(argv[i], "--no-optimizer") == 0)
+        {
+            // Phase 3c effective-rate optimizer kill switch. When set,
+            // cl_arq_controller::opt_load_rate_table() no-ops and
+            // opt_evaluate_batch_end() short-circuits before any state
+            // mutation. Used by tools/effective_rate_calibrate.py so
+            // calibration runs aren't disturbed by the optimizer trying
+            // to switch configs mid-sweep.
+            no_optimizer_cli = true;
+            printf("Phase 3c optimizer: DISABLED via --no-optimizer\n");
             for (int j = i; j < argc - 1; j++)
                 argv[j] = argv[j + 1];
             argc -= 1;
@@ -1978,6 +1995,7 @@ start_modem:
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
+        ARQ.set_optimizer_disabled(no_optimizer_cli);
         // Encryption: CLI -E overrides INI setting
         ARQ.encryption_mode = (encryption_mode_cli >= 0) ? encryption_mode_cli : g_settings.encryption_mode;
         if (ARQ.encryption_mode != ENCRYPT_OFF)
@@ -1998,6 +2016,7 @@ start_modem:
         ARQ.force_compress = (force_compress_cli == 1);
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
+        ARQ.set_optimizer_disabled(no_optimizer_cli);
         // Encryption: CLI -E flag
         ARQ.encryption_mode = (encryption_mode_cli >= 0) ? encryption_mode_cli : ENCRYPT_OFF;
         if (ARQ.encryption_mode != ENCRYPT_OFF)

@@ -1175,6 +1175,8 @@ public:
   int supershift_proven_ceiling;   // highest config that failed BREAK — caps all SUPERSHIFT targets (-1 = no ceiling)
   bool skip_turbo_reverse;         // CLI --skip-turbo-reverse: skip TURBO_REVERSE phase
   int max_config_override;         // CLI --max-config: hard ceiling on turboshift (-1 = use default)
+  bool optimizer_disabled;         // CLI --no-optimizer: disable Phase 3c effective-rate optimizer (calibration runs)
+  void set_optimizer_disabled(bool b) { optimizer_disabled = b; }
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
   float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
   float turbo_best_snr;            // Best SNR seen across entire turbo phase (-99 = none)
