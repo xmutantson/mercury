@@ -203,7 +203,19 @@ inline int effective_data_short_header_length(bool sack_v2)
 // via retransmits and the new one arriving in the same radio batch).
 #define MAX_SACK_BATCH_SIZE  32   // Max frames per crypto batch
 #define MAX_SACK_FRAME_SIZE  256  // Max frame payload size
-#define MAX_RETRANSMIT_HEADROOM 8 // Max retransmit slots per radio batch
+// §7.13.39 Fix 1 — must be at least 2*MAX_SACK_BATCH_SIZE so the
+// "channel collapse" safety net (retransmit_count > 2*data_batch_size →
+// trigger BREAK) actually has headroom to detect a runaway queue without
+// silently dropping retx beforehand. The v2 mixed-batch path now requeues
+// overflow rather than dropping, so the queue can legitimately exceed one
+// batch worth of slots during loss episodes.
+#define MAX_RETRANSMIT_HEADROOM (2 * MAX_SACK_BATCH_SIZE) // Was 8; see §7.13.39 Fix 1
+
+// §7.13.39 Fix 2 — sequence_number is a uint8 on the wire (low 7 bits = slot,
+// bit 7 = EOB). The collision check masks with 0x7F; batches larger than 128
+// would alias slots. Belt-and-braces compile-time guard.
+static_assert(MAX_SACK_BATCH_SIZE <= 128,
+	"§7.13.39 Fix 2: sequence_number low 7 bits cap batch size at 128");
 
 // SACK_FIX_PLAN §7 step 3 — geometry-derived CMD post-TX timeout.
 // See SACK_FIX_PLAN.md §4.1 for derivation and §11.1 for calibration:
@@ -702,6 +714,13 @@ public:
                                                                // sent under. Retransmits carry
                                                                // their original value; never the
                                                                // current cmd_batch_seq_id.
+  // §7.13.39 Fix 3 — preserve the ORIGINAL sequence_number byte (including
+  // bit 7 = EOB) at the moment the frame was captured into the retx queue.
+  // Without this, retx of a frame that was the last in its original batch
+  // loses the EOB marker, causing RSP to mis-size the batch on the retx path.
+  // Bit layout matches messages_tx[i].sequence_number: low 7 bits = original
+  // slot in the prev batch, bit 7 = EOB on that original transmission.
+  unsigned char retransmit_frame_seq_with_eob[MAX_RETRANSMIT_HEADROOM];
 
   // SACK Design A Step 3 — batch_seq_id plumbing (TX side: CMD-only counter;
   // RX side: diagnostic store; no decision branches on this value yet).

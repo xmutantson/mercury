@@ -980,9 +980,101 @@ void cl_arq_controller::process_messages_tx_data()
 	//      slot collisions (§7.8.3's hazard structurally eliminated).
 	int v2_retx_prefix_count = 0;
 	bool v2_mixed_batch = false;
+
+	// §7.13.39 Fix 2 — single source of truth for batch_tx slot identity.
+	// Both the retx prefix loop and the new-data fill loop must agree on the
+	// formula for (sequence_number, id, batch_seq_id) so a future edit to one
+	// can't drift out of sync with the other. The helper does NOT touch
+	// .data/.length/.type — those are loop-specific. See assertion sweep
+	// below send_batch() for the duplicate-tuple guard.
+	//
+	// Inputs:
+	//   batch_idx          — slot in messages_batch_tx[] being populated (0..data_batch_size-1)
+	//   is_retx            — true for retx prefix, false for new-data fill
+	//   original_seq_eob   — for retx: the captured ORIGINAL sequence_number byte
+	//                        (low 7 bits = original slot, bit 7 = EOB on first send).
+	//                        Ignored when is_retx=false.
+	//   slot_in_new_batch  — for new-data: position in the new batch (0..ND-1).
+	//                        Ignored when is_retx=true.
+	//   bsi                — batch_seq_id to assign (retx: original; new-data: current).
+	auto set_batch_tx_slot = [&](int batch_idx, bool is_retx,
+	                             unsigned char original_seq_eob,
+	                             int slot_in_new_batch, int bsi)
+	{
+		if(is_retx)
+		{
+			// Carry the original sequence_number byte verbatim — preserves both
+			// the original slot (low 7 bits) AND the EOB bit (bit 7) per
+			// §7.13.39 Fix 3. RSP routes via messages_rx_prev[loc=low7] and
+			// receives the EOB marker if it was set on first send.
+			messages_batch_tx[batch_idx].sequence_number = (int)original_seq_eob;
+			messages_batch_tx[batch_idx].id = (int)(original_seq_eob & 0x7F);
+		}
+		else
+		{
+			messages_batch_tx[batch_idx].sequence_number = slot_in_new_batch;
+			messages_batch_tx[batch_idx].id = slot_in_new_batch;
+		}
+		messages_batch_tx[batch_idx].batch_seq_id = bsi;
+	};
+
 	if(sack_v2_enabled && retransmit_count > 0)
 	{
+		// §7.13.39 Fix 1 safety net (PRE-POP check) — if the queue is already
+		// >= 2*data_batch_size BEFORE we even try to drain it via this batch,
+		// the channel has collapsed and trying to drain via mixed-batches will
+		// only widen the gap. The pre-pop check (rather than post-pop) lets us
+		// trigger BREAK even if MAX_RETRANSMIT_HEADROOM is exactly 2*batch:
+		// the queue can fill to the cap but the safety net still fires before
+		// silent dropping at the SACK_RSP capture site (where the bound check
+		// `retransmit_count < MAX_RETRANSMIT_HEADROOM` would otherwise hide
+		// the runaway). Comparison is >= so the equal-to-cap edge case
+		// triggers cleanly. Pattern follows the BREAK trigger at :~2370.
+		if(retransmit_count >= 2 * data_batch_size
+		   && !emergency_break_active
+		   && turboshift_phase == TURBO_DONE
+		   && gear_shift_on == YES)
+		{
+			printf("[BREAK] retx queue runaway (count=%d, threshold=2*batch=%d) — "
+				"channel collapsed, forcing BREAK\n",
+				retransmit_count, 2 * data_batch_size);
+			fflush(stdout);
+			int working_config = config_ladder_down(data_configuration, robust_enabled);
+			// Push pending payloads back to the FIFO for resend after BREAK
+			// recovery (parallels the gearshift BREAK path at :2344-2349).
+			for(int i=0; i<nMessages; i++)
+			{
+				if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+					fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
+				messages_tx[i].status = FREE;
+			}
+			fifo_buffer_backup.flush();
+			block_under_tx = NO;
+			// Clear the runaway queue — the BREAK path restarts at a working
+			// config; the retx queue's contents (encrypted under the old config's
+			// crypto batch) are no longer meaningful after BREAK.
+			retransmit_count = 0;
+			data_configuration = working_config;
+			negotiated_configuration = working_config;
+			emergency_previous_config = working_config;
+			break_drop_step = 0;
+			emergency_break_active = 1;
+			emergency_break_retries = 3;
+			emergency_nack_count = 0;
+			if(sack_v2_enabled)
+				policy_axis1_supremacy_on_move(current_configuration,
+					working_config, "retx_queue_runaway");
+			send_break_pattern();
+			telecom_system->data_container.frames_to_read = 4;
+			calculate_receiving_timeout();
+			receiving_timer.start();
+			return;
+		}
+
 		v2_mixed_batch = true;
+		// §7.13.39 Fix 1 — never drop. Fill R = min(count, batch_size) retx
+		// from the head of the queue; survivors at [R..count-1] shift down so
+		// the next batch consumes them first.
 		int R = retransmit_count;
 		if(R > data_batch_size) R = data_batch_size;
 		message_batch_counter_tx = 0;
@@ -1003,30 +1095,48 @@ void cl_arq_controller::process_messages_tx_data()
 			messages_batch_tx[message_batch_counter_tx].length = retransmit_frame_lengths[r];
 			memcpy(messages_batch_tx[message_batch_counter_tx].data,
 				retransmit_frames[r], retransmit_frame_lengths[r]);
-			// Retx: original slot in PREV batch as both id and sequence_number
-			// so RSP routes into messages_rx_prev[loc=original_position].
-			messages_batch_tx[message_batch_counter_tx].id = retransmit_frame_positions[r];
-			messages_batch_tx[message_batch_counter_tx].sequence_number = retransmit_frame_positions[r];
 			messages_batch_tx[message_batch_counter_tx].nResends = nResends;
 			messages_batch_tx[message_batch_counter_tx].ack_timeout = ack_timeout_data;
 			messages_batch_tx[message_batch_counter_tx].status = ADDED_TO_BATCH_BUFFER;
-			// Retransmits carry their ORIGINAL batch_seq_id (§4.3.4 invariant 2).
-			messages_batch_tx[message_batch_counter_tx].batch_seq_id = retransmit_frame_batch_seq_ids[r];
+			// §7.13.39 Fix 2 + Fix 3 — slot identity assigned via the helper.
+			// Carries the original sequence_number byte (preserves EOB bit 7
+			// per Fix 3) and the original batch_seq_id (§4.3.4 invariant 2).
+			set_batch_tx_slot(message_batch_counter_tx,
+				/*is_retx=*/true,
+				/*original_seq_eob=*/retransmit_frame_seq_with_eob[r],
+				/*slot_in_new_batch=*/0,  // unused for retx
+				/*bsi=*/retransmit_frame_batch_seq_ids[r]);
 			message_batch_counter_tx++;
 			stats.nReSent_data++;
 			last_transmission_block_stats.nReSent_data++;
 		}
 		v2_retx_prefix_count = R;
+
+		// §7.13.39 Fix 1 — shift survivors down. memmove on each parallel
+		// array. Leftover = retransmit_count - R; these stay at [0..leftover-1]
+		// and will be sent at the head of the NEXT batch (FIFO order
+		// preserved). The SACK_RSP capture site is APPEND-mode on v2 (see
+		// arq_commander.cc:~1962), so any new retx captured between now and
+		// the next batch is concatenated after these survivors.
+		int leftover = retransmit_count - R;
+		if(leftover > 0)
+		{
+			memmove(&retransmit_frames[0],            &retransmit_frames[R],            leftover * sizeof(retransmit_frames[0]));
+			memmove(&retransmit_frame_lengths[0],     &retransmit_frame_lengths[R],     leftover * sizeof(retransmit_frame_lengths[0]));
+			memmove(&retransmit_frame_positions[0],   &retransmit_frame_positions[R],   leftover * sizeof(retransmit_frame_positions[0]));
+			memmove(&retransmit_frame_types[0],       &retransmit_frame_types[R],       leftover * sizeof(retransmit_frame_types[0]));
+			memmove(&retransmit_frame_batch_seq_ids[0], &retransmit_frame_batch_seq_ids[R], leftover * sizeof(retransmit_frame_batch_seq_ids[0]));
+			memmove(&retransmit_frame_seq_with_eob[0], &retransmit_frame_seq_with_eob[R], leftover * sizeof(retransmit_frame_seq_with_eob[0]));
+		}
+		retransmit_count = leftover;
+
 		// Per-frame retx bsi log (for [CMD-V2-MIXBATCH] post-TX summary)
 		printf("[CMD-V2-MIXBATCH-RETX] R=%d (bsi=", R);
 		for(int r = 0; r < R; r++)
 			printf(" %d", messages_batch_tx[r].batch_seq_id);
-		printf(") of %d queued — remaining %d retx dropped (R > data_batch_size=%d)\n",
-			retransmit_count, retransmit_count - R, data_batch_size);
+		printf(") of %d total queued; %d requeued for next batch (data_batch_size=%d)\n",
+			R + leftover, leftover, data_batch_size);
 		fflush(stdout);
-		retransmit_count = 0;  // Consumed (any retx beyond R is dropped — falls
-		                       // back to retx-mostly batch with no new-data
-		                       // safety: data_batch_size cap enforced).
 	}
 
 	// SACK Design A Step 3 — batch_seq_id assignment on new-data batch build.
@@ -1039,6 +1149,7 @@ void cl_arq_controller::process_messages_tx_data()
 	// batch in this mixed path does not bump the counter — that path is
 	// rare because the SACK retransmit-only path above handles the common case).
 	bool batch_includes_new_data = false;
+	int last_new_data_messages_tx_idx = -1;  // §7.13.39 Fix 3 — for EOB mirror
 	for(int i=0;i<this->nMessages;i++)
 	{
 		if(messages_tx[i].status==ADDED_TO_LIST)
@@ -1048,22 +1159,41 @@ void cl_arq_controller::process_messages_tx_data()
 				// Assign the current new-data batch's batch_seq_id.
 				messages_tx[i].batch_seq_id = (cmd_batch_seq_id & 0xFF);
 				messages_batch_tx[message_batch_counter_tx]=messages_tx[i];
-				// SACK Design A Step 8b — for v2 mixed batches, new-data must
-				// occupy contiguous slots 0..ND-1 in the CURRENT batch's slot
-				// space (so RSP's messages_rx[loc=id] fills correctly and
-				// ACK-GATE infers expected count from EOB on slot ND-1).
-				// Override id + sequence_number with position-in-new-batch
-				// (= message_batch_counter_tx - v2_retx_prefix_count). For
-				// v2 non-mixed batches (retransmit_count was 0), this branch
-				// reduces to a no-op since v2_retx_prefix_count == 0 and
-				// the existing behavior (id = messages_tx slot index) is
-				// preserved by the copy above — but we keep the explicit
-				// assignment for clarity and to match wire semantics.
+				last_new_data_messages_tx_idx = i;  // track for EOB mirror
+				// §7.13.39 Fix 2 — on v2 mixed batches, route slot identity
+				// through the single helper so the formula matches the retx
+				// prefix loop above. The collision validation pass below
+				// send_batch() catches any drift. For v2 non-mixed batches
+				// (retransmit_count was 0), v2_retx_prefix_count == 0, so the
+				// helper assigns the same value the struct-copy already
+				// provided (id = messages_tx slot index = message_batch_counter_tx).
 				if(v2_mixed_batch)
 				{
 					int pos_in_new_batch = message_batch_counter_tx - v2_retx_prefix_count;
-					messages_batch_tx[message_batch_counter_tx].sequence_number = pos_in_new_batch;
-					messages_batch_tx[message_batch_counter_tx].id = pos_in_new_batch;
+					set_batch_tx_slot(message_batch_counter_tx,
+						/*is_retx=*/false,
+						/*original_seq_eob=*/0,  // unused for new-data
+						/*slot_in_new_batch=*/pos_in_new_batch,
+						/*bsi=*/(cmd_batch_seq_id & 0xFF));
+					// §7.13.39 Fix 3 — also write the slot/EOB byte BACK to
+					// messages_tx[i] so that if this frame is later listed in
+					// a SACK_RSP as missing, the capture site (~line 1962+) can
+					// read messages_tx[i].sequence_number and preserve the
+					// original byte (slot in low7 + EOB in bit 7) into the
+					// retx queue. Without this write-back, sequence_number on
+					// messages_tx[i] is uninitialized — losing the EOB info.
+					// EOB bit is applied later (line ~1230) on
+					// messages_batch_tx[last_idx]; mirror that here for the
+					// final new-data slot.
+					messages_tx[i].sequence_number = pos_in_new_batch;
+					messages_tx[i].id = pos_in_new_batch;
+				}
+				else if(sack_v2_enabled)
+				{
+					// v2 non-mixed: send_batch() will renumber sequence_number
+					// = message_batch_counter_tx and OR 0x80 on the last frame.
+					// Mirror that to messages_tx[i] for §7.13.39 Fix 3.
+					messages_tx[i].sequence_number = message_batch_counter_tx;
 				}
 				message_batch_counter_tx++;
 				messages_tx[i].status=ADDED_TO_BATCH_BUFFER;
@@ -1119,6 +1249,11 @@ void cl_arq_controller::process_messages_tx_data()
 			{
 				// Set EOB bit on the last NEW-DATA frame.
 				messages_batch_tx[last_idx].sequence_number |= 0x80;
+				// §7.13.39 Fix 3 — mirror the EOB bit to messages_tx so the
+				// SACK_RSP capture site can preserve it into the retx queue
+				// if this last-frame is later listed as missing.
+				if(last_new_data_messages_tx_idx >= 0)
+					messages_tx[last_new_data_messages_tx_idx].sequence_number |= 0x80;
 			}
 		}
 		else
@@ -1129,6 +1264,19 @@ void cl_arq_controller::process_messages_tx_data()
 			// re-assigned ids — that would clobber the retx-id mapping
 			// (which must remain at the original prev-batch slot positions).
 			pad_messages_batch_tx(data_batch_size);
+			// §7.13.39 Fix 3 — v2 non-mixed path: send_batch() will set EOB
+			// on messages_batch_tx[last_idx].sequence_number but won't touch
+			// messages_tx. Mirror the EOB bit to messages_tx[last_new_data]
+			// so a later SACK_RSP capture preserves the EOB marker.
+			if(sack_v2_enabled && last_new_data_messages_tx_idx >= 0)
+			{
+				int last_idx = message_batch_counter_tx - 1;
+				if((messages_batch_tx[last_idx].type == DATA_LONG
+				    || messages_batch_tx[last_idx].type == DATA_SHORT))
+				{
+					messages_tx[last_new_data_messages_tx_idx].sequence_number |= 0x80;
+				}
+			}
 		}
 		mtl::log_event_kv("cmd_batch_tx_start", "batch=%lld nframes=%d cfg=%d",
 		                  stats.nBatches_sent + 1, data_batch_size, current_configuration);
@@ -1158,6 +1306,60 @@ void cl_arq_controller::process_messages_tx_data()
 			// assigned them). For pure-retx fallback (no new-data), this
 			// matches the v1 retransmit-only path's use of the same flag.
 			sack_retransmit_active = true;
+
+			// §7.13.39 Fix 2 — duplicate (bsi, seq) tuple validation. Two
+			// frames in the same TX with identical (batch_seq_id, low-7-seq)
+			// would alias on RSP's match-prev/match-current routing and
+			// silently corrupt one of them. Sweep all populated slots; if any
+			// collision is found, ABORT the TX (skip send_batch). Better a
+			// missed batch than a corrupted one — the next SACK_RSP / timeout
+			// path will resync. The mask matches the wire format: bit 7 of
+			// sequence_number is the EOB flag, low 7 bits are the slot id.
+			bool collision_found = false;
+			for(int ii = 0; ii < message_batch_counter_tx && !collision_found; ii++)
+			{
+				for(int jj = ii + 1; jj < message_batch_counter_tx; jj++)
+				{
+					if(messages_batch_tx[ii].batch_seq_id == messages_batch_tx[jj].batch_seq_id
+					   && (messages_batch_tx[ii].sequence_number & 0x7F)
+					      == (messages_batch_tx[jj].sequence_number & 0x7F))
+					{
+						printf("[BATCH-SLOT-COLLISION] i=%d j=%d bsi=%d seq=%d — "
+							"aborting TX (§7.13.39 Fix 2)\n",
+							ii, jj,
+							messages_batch_tx[ii].batch_seq_id,
+							messages_batch_tx[ii].sequence_number & 0x7F);
+						fflush(stdout);
+						collision_found = true;
+						break;
+					}
+				}
+			}
+			if(collision_found)
+			{
+				printf("[BATCH-SLOT-COLLISION] WARNING — this indicates a "
+					"programming error in slot-id assignment (retx prefix vs "
+					"new-data fill drift). Skipping send_batch() to avoid "
+					"silent wire corruption. The retx prefix payloads consumed "
+					"this cycle are lost; the next SACK_RSP / timeout will "
+					"resync. File a bug against §7.13.39 Fix 2.\n");
+				fflush(stdout);
+				sack_retransmit_active = false;
+				// Roll back stats counters bumped during slot population so
+				// the bug doesn't masquerade as successful sends.
+				stats.nReSent_data -= v2_retx_prefix_count;
+				last_transmission_block_stats.nReSent_data -= v2_retx_prefix_count;
+				int new_data_in_batch = message_batch_counter_tx - v2_retx_prefix_count;
+				stats.nSent_data -= new_data_in_batch;
+				last_transmission_block_stats.nSent_data -= new_data_in_batch;
+				// Note: messages_tx[i].status entries flipped to
+				// ADDED_TO_BATCH_BUFFER are NOT rolled back; they will be
+				// cleaned up by the next process tick. This is intentional:
+				// resending a batch with a known slot collision would just
+				// re-trigger the assertion. The bug must be fixed in code.
+				message_batch_counter_tx = 0;
+				return;
+			}
 		}
 		send_batch();
 		if(v2_mixed_batch)
@@ -1958,8 +2160,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
 
-				// Build retransmit queue: save missing frames' encrypted payloads
-				retransmit_count = 0;
+				// Build retransmit queue: save missing frames' encrypted payloads.
+				//
+				// §7.13.39 Fix 1 — APPEND mode (v2 only). Do NOT reset retransmit_count
+				// here on v2 sessions: any survivors carried over from the previous
+				// batch's overflow shift-down (see §7.13.39 Fix 1 at the v2 mixbatch
+				// builder, ~line 1027) live at indices [0..retransmit_count-1] and
+				// MUST be preserved. The new SACK_RSP can only refer to frames in the
+				// just-sent batch (whose messages_tx[i] are still PENDING_ACK), which
+				// have no overlap with the older survivors (those were marked ACKED
+				// at their original capture). v1 path is untouched (sack_v2_enabled=false
+				// still resets — the v1 standalone-retx path consumes the queue fully
+				// on every cycle so there is never anything to preserve).
+				int leftover_retx_at_capture = sack_v2_enabled ? retransmit_count : 0;
+				if(!sack_v2_enabled) retransmit_count = 0;
 				int rx_count = 0;
 				for(int i = 0; i < nMessages; i++)
 				{
@@ -1988,11 +2202,27 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// than use the current cmd_batch_seq_id (which now points at
 						// the NEXT new-data batch).
 						retransmit_frame_batch_seq_ids[retransmit_count] = messages_tx[i].batch_seq_id;
+						// §7.13.39 Fix 3 — preserve the original sequence_number byte
+						// (low 7 bits = slot, bit 7 = EOB). If this frame was the last
+						// in its original batch, EOB must survive the retx so the RSP's
+						// match-prev path receives an end-of-batch marker on the retx
+						// slot. Without this, retransmitting the original last frame
+						// resurrects only the slot position and never the EOB bit.
+						retransmit_frame_seq_with_eob[retransmit_count] =
+							(unsigned char)messages_tx[i].sequence_number;
 						retransmit_count++;
 						// Mark ACKED so cleanup() frees the slot (payload saved above)
 						messages_tx[i].status = ACKED;
 						stats.nAcked_data++;
 					}
+				}
+				if(sack_v2_enabled && leftover_retx_at_capture > 0)
+				{
+					printf("[CMD-V2-MIXBATCH-RETX] SACK_RSP capture: appended %d new "
+						"to %d leftover; total queue=%d\n",
+						retransmit_count - leftover_retx_at_capture,
+						leftover_retx_at_capture, retransmit_count);
+					fflush(stdout);
 				}
 
 				printf("[CMD-SACK] %d/%d received, %d queued for retransmit\n",
