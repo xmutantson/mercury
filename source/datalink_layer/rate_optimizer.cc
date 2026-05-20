@@ -443,18 +443,21 @@ std::string cl_rate_optimizer::identify_channel_label(int current_cfg,
         // Weight sack_rate heavily (4x) — more direct channel signal.
         // eff_bps acts as a tiebreaker / sanity check.
         //
-        // M1: conservative tie-breaker. At saturated configs (e.g. CFG6
-        // where many "easy" labels collapse to sack=0/bps=ceiling), several
-        // labels produce identical primary distance. Without disambiguation,
-        // alphabetical map iteration would pick "clean" — the most
-        // optimistic — and the projection to higher configs uses tbl[high]
-        // ["clean"]=cliff-edge values, risking an upshift INTO a cliff.
-        // Subtract a tiny term scaled by sack_rate_mean so on ties the LARGER
-        // sack_rate (= worse calibrated channel = more conservative) wins.
-        // Magnitude 1e-6 is well below typical d values (~1e-2 to 1e-1) so
-        // this never overrides a real distance difference.
-        double d = 4.0 * ds * ds + de * de
-                 - 1e-6 * jt->second.sack_rate_mean;
+        // M1 (known limitation): at saturated configs (e.g. CFG6 where many
+        // labels collapse to sack=0/bps=ceiling), several labels produce
+        // identical primary distance AND identical sack_rate_mean, so a
+        // simple bias term can't break the tie. Iteration here uses
+        // alphabetical std::map order, so "clean" wins — the most
+        // optimistic label. The projection to higher configs may therefore
+        // recommend a config that's actually at its cliff, triggering BREAK
+        // which downshifts and rearms the optimizer cooldown — the system
+        // self-corrects but burns a BREAK cycle.
+        // Belt-and-suspenders mitigations active: max_calibrated_sack_rate
+        // gate + force_cooldown(8) on BREAK keep the failure mode bounded.
+        // If smoke testing surfaces real thrashing, swap this for a true
+        // severity-rank tiebreaker (parse label name → "wgn16 > wgn30 >
+        // clean" ordering + 1e-6 * rank term).
+        double d = 4.0 * ds * ds + de * de;
         if (d < best_d) { best_d = d; best = jt->first; }
     }
     return best;
