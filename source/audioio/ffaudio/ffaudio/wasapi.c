@@ -975,6 +975,19 @@ int ffwasapi_write(ffaudio_buf *b, const void *data, ffsize len)
 	if (b->event != NULL)
 		return wasapi_write_excl(b, data, len);
 
+	// Bound the shared-mode retry loop. Without this, if the kernel mixer
+	// reports GetCurrentPadding >= buf_frames continuously (which it CAN do
+	// — observed: 11.9 seconds blocked on real-time audio thread with 2
+	// mercury instances on VB-Cable), this function blocks indefinitely and
+	// the caller's audio thread starves. Return -FFAUDIO_ESYNC after the
+	// timeout so the caller treats the chunk as an underrun and continues
+	// processing — same handling path mercury already has for ALSA/aaudio
+	// underruns (audioio.c:739-742). Timeout = 200 ms (20 iterations at the
+	// default 10 ms period); long enough that occasional transient blocks
+	// don't drop samples, short enough that a wedged device doesn't stall
+	// the OFDM TX path beyond one batch interval.
+	const int MAX_RETRY_ITERS = 20;
+	int retries = 0;
 	for (;;) {
 		int r = wasapi_writeonce(b, data, len);
 		if (r > 0)
@@ -991,6 +1004,10 @@ int ffwasapi_write(ffaudio_buf *b, const void *data, ffsize len)
 		if (b->nonblock)
 			return 0;
 
+		if (++retries >= MAX_RETRY_ITERS) {
+			// Treat as underrun. Caller drops the chunk and resumes.
+			return -FFAUDIO_ESYNC;
+		}
 		Sleep(b->period_ms);
 	}
 }
