@@ -1663,9 +1663,12 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				receiving_timer.stop();
 				receiving_timer.reset();
 
-				// Start turboshift in NB
+				// Start turboshift in NB. Skip when already in the Q-table
+				// optimizer's band — the optimizer will pick the right config
+				// from current_configuration; no need to overshoot via SUPERSHIFT.
 				if(turboshift_active && gear_shift_on == YES &&
-					!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+					!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
+					!optimizer_is_in_control())
 				{
 					turboshift_initiator = true;
 					turboshift_phase = TURBO_FORWARD;
@@ -3232,8 +3235,11 @@ void cl_arq_controller::process_control_commander()
 					add_message_control(SWITCH_BANDWIDTH);
 					this->connection_status=TRANSMITTING_CONTROL;
 				}
-				// Turboshift: start probing instead of jumping to data
-				else if(turboshift_active && gear_shift_on==YES && !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+				// Turboshift: start probing instead of jumping to data. Skip
+				// when already in the Q-table optimizer's band (cfg ≥ handoff).
+				else if(turboshift_active && gear_shift_on==YES &&
+					!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
+					!optimizer_is_in_control())
 				{
 					turboshift_initiator = true;
 					turboshift_phase = TURBO_FORWARD;
@@ -3423,8 +3429,10 @@ void cl_arq_controller::process_control_commander()
 			wb_upgrade_pending = false;
 			switch_narrowband_mode(NO);
 
-			// Start turboshift in WB
-			if(turboshift_active && gear_shift_on==YES && !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+			// Start turboshift in WB. Skip when in Q-table optimizer band.
+			if(turboshift_active && gear_shift_on==YES &&
+				!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
+				!optimizer_is_in_control())
 			{
 				turboshift_initiator = true;
 				turboshift_phase = TURBO_FORWARD;
