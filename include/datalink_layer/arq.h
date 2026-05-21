@@ -1177,6 +1177,37 @@ public:
   int max_config_override;         // CLI --max-config: hard ceiling on turboshift (-1 = use default)
   bool optimizer_disabled;         // CLI --no-optimizer: disable Phase 3c effective-rate optimizer (calibration runs)
   void set_optimizer_disabled(bool b) { optimizer_disabled = b; }
+
+  // Gearshift ↔ Q-table optimizer handoff. Above the lowest calibrated
+  // config in the Q-table, the optimizer is the sole authority for upward
+  // config changes — gearshift's FRAME UP / LADDER UP must yield. Below
+  // that, the optimizer has no data and gearshift's SNR-based ladder runs.
+  // BREAK fallback (downward to ROBUST_0) stays available to both bands as
+  // the safety net. Returns false if optimizer is disabled, table is unloaded,
+  // or current_configuration is below the calibrated band.
+  bool optimizer_is_in_control() const {
+    if (optimizer_disabled || !rate_opt.is_enabled()) return false;
+    int handoff = rate_opt.min_calibrated_cfg(narrowband_enabled == YES);
+    if (handoff <= 0) return false;
+    return config_ladder_index(current_configuration) >= config_ladder_index(handoff);
+  }
+
+  // Cap a turboshift SNR-derived target at the handoff config so the
+  // turboshift probe stops where the optimizer takes over. Without this,
+  // turboshift overshoots to CFG14-16 and the optimizer immediately moves
+  // Mercury back down. The cap is a no-op when the optimizer is disabled
+  // or no calibrated cells exist.
+  void apply_optimizer_handoff_cap_to_target(int *snr_target) const {
+    if (optimizer_disabled || !rate_opt.is_enabled()) return;
+    int handoff = rate_opt.min_calibrated_cfg(narrowband_enabled == YES);
+    if (handoff <= 0) return;
+    if (*snr_target > handoff) {
+      printf("[TURBO] SNR target %d capped at handoff config %d (Q-table takes over)\n",
+        *snr_target, handoff);
+      fflush(stdout);
+      *snr_target = handoff;
+    }
+  }
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
   float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
   float turbo_best_snr;            // Best SNR seen across entire turbo phase (-99 = none)
@@ -1390,7 +1421,14 @@ public:
       opt_window_head = (opt_window_head + 1) % OPTIMIZER_WINDOW_SIZE;
       if (opt_window_count < OPTIMIZER_WINDOW_SIZE) opt_window_count++;
       opt_diag_emit_counter++;
-      if (opt_diag_emit_counter >= 10 && opt_window_count > 0) {
+      // Emit every 3 batches (was 10) so short or lossy sessions still produce
+      // wire-bps samples for downstream harnesses. The previous threshold of
+      // 10 meant sessions that hit BREAK or ended <10 batches in produced
+      // ZERO [OPT-WINDOW] lines, forcing the harness to fall back to TCP
+      // rx_bytes — which is the SAME counter the harness uses for the
+      // user-facing throughput field, making the wire-vs-user ratio always
+      // 1.00× by construction. See Phase 4 v1 wgn18/mpp18/mpm18 false-alarm.
+      if (opt_diag_emit_counter >= 3 && opt_window_count > 0) {
           opt_diag_emit_counter = 0;
           printf("[OPT-WINDOW] eff_bps=%.0f sack_rate=%.2f window_n=%d cfg=%d\n",
               get_current_effective_rate_bps(),
