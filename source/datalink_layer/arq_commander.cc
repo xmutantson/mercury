@@ -395,13 +395,14 @@ void cl_arq_controller::process_messages_commander()
 		    && emergency_break_active == 0
 		    && link_status == CONNECTED
 		    && is_ofdm_config(current_configuration)
-		    && narrowband_enabled != YES
 		    && block_under_tx == NO
 		    && messages_control.status == FREE)
 		{
 			int target = opt_pending_switch_cfg;
-			// Clamp to WB ceiling + max-config override.
-			if (target > WB_CONFIG_MAX) target = WB_CONFIG_MAX;
+			// Clamp to mode-appropriate ceiling + max-config override.
+			const int mode_ceiling =
+				(narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
+			if (target > mode_ceiling) target = mode_ceiling;
 			if (max_config_override >= 0 && target > max_config_override)
 				target = max_config_override;
 			if (target != current_configuration && is_ofdm_config(target))
@@ -1684,6 +1685,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 							snr_target = supershift_proven_ceiling;
 						if(max_config_override >= 0 && snr_target > max_config_override)
 							snr_target = max_config_override;
+						// Q-table handoff: turboshift stops where the optimizer takes over.
+						apply_optimizer_handoff_cap_to_target(&snr_target);
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
@@ -2822,10 +2825,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			bool frame_ceiling_blocked = (supershift_proven_ceiling >= 0 &&
 				config_ladder_index(proposed_frame) > config_ladder_index(supershift_proven_ceiling))
 				|| (max_config_override >= 0 && proposed_frame > max_config_override);
+		// Handoff: above the lowest calibrated Q-table cell, the optimizer
+		// is the sole authority for upward config changes. Gearshift's
+		// FRAME UP must yield. Downward moves (BREAK) remain available.
+		bool optimizer_owns_upward_frame = optimizer_is_in_control();
 		if(data_ack_received==YES && gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
 			messages_control.status==FREE &&
 			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
-			!frame_ceiling_blocked)
+			!frame_ceiling_blocked &&
+			!optimizer_owns_upward_frame)
 		{
 			consecutive_data_acks++;
 			if(consecutive_data_acks >= frame_shift_threshold)
@@ -3128,9 +3136,10 @@ void cl_arq_controller::process_control_commander()
 				sack_enabled = both_sack;
 				if(sack_enabled)
 				{
-					// Update batch size now that SACK is negotiated
+					// Update batch size now that SACK is negotiated. 30s target
+					// matches the formula in arq_common.cc batch sizing.
 					int max_batch = (message_transmission_time_ms > 0)
-						? (int)(12000.0 / message_transmission_time_ms + 0.5) : 31;
+						? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
 					if(max_batch < 5) max_batch = 5;
 					if(max_batch > nMessages) max_batch = nMessages;
 					int new_batch = radio_batch_size;
@@ -3244,6 +3253,8 @@ void cl_arq_controller::process_control_commander()
 							snr_target = supershift_proven_ceiling;
 						if(max_config_override >= 0 && snr_target > max_config_override)
 							snr_target = max_config_override;
+						// Q-table handoff: turboshift stops where the optimizer takes over.
+						apply_optimizer_handoff_cap_to_target(&snr_target);
 					}
 
 					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
@@ -3434,6 +3445,8 @@ void cl_arq_controller::process_control_commander()
 						snr_target = supershift_proven_ceiling;
 					if(max_config_override >= 0 && snr_target > max_config_override)
 						snr_target = max_config_override;
+					// Q-table handoff: turboshift stops where the optimizer takes over.
+					apply_optimizer_handoff_cap_to_target(&snr_target);
 				}
 
 				if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
@@ -3680,6 +3693,8 @@ void cl_arq_controller::process_control_commander()
 								snr_target = supershift_proven_ceiling;
 							if(max_config_override >= 0 && snr_target > max_config_override)
 								snr_target = max_config_override;
+							// Q-table handoff: turboshift stops where the optimizer takes over.
+							apply_optimizer_handoff_cap_to_target(&snr_target);
 						}
 
 						if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
@@ -3951,7 +3966,12 @@ void cl_arq_controller::finalize_block_commander()
 			// understood and the cooldown is rethought.
 			if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
 				gear_shift_down_consecutive_fails = 0;
-			if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage && gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total)
+			// Handoff: above the lowest calibrated Q-table cell, gearshift's
+			// LADDER UP must yield to the optimizer (which suggests targets
+			// via opt_pending_switch_cfg). Downward moves remain available.
+			if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage
+				&& gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total
+				&& !optimizer_is_in_control())
 			{
 				{
 					int proposed = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
@@ -4085,8 +4105,11 @@ void cl_arq_controller::policy_evaluate_axis1()
 	if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
 		gear_shift_down_consecutive_fails = 0;
 
+	// Handoff: above the lowest calibrated Q-table cell, gearshift's
+	// LADDER UP must yield to the optimizer. See optimizer_is_in_control().
 	if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage
-		&& gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total)
+		&& gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total
+		&& !optimizer_is_in_control())
 	{
 		int proposed = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled == YES);
 		// Respect proven ceiling — don't re-try configs that already failed during turboshift
