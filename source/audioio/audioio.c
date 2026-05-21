@@ -737,12 +737,23 @@ void *radio_playback_thread(void *device_ptr)
             r = audio->write(b, ((uint8_t *)buffer_internal_stereo) + total_written, n);
 
             if (r == -FFAUDIO_ESYNC) {
-                printf("detected underrun");
-                continue;
+                // Underrun. ALSA/aaudio recover via continue; WASAPI returns
+                // ESYNC after a bounded retry budget (wasapi.c:973+). In
+                // either case, retrying immediately inside the same producer
+                // iteration risks the same backpressure. Drop the remaining
+                // bytes for this chunk and break out so the producer thread
+                // moves on to the next iteration. The lost ~10 ms of audio
+                // shows up as a clock-drift glitch in [CLK-TX-GLITCH] but
+                // the thread stays real-time.
+                printf("detected underrun, dropping %lld samples (%.1fms)\n",
+                       (long long)n / (long long)frame_size,
+                       (double)(n / (frame_size > 0 ? frame_size : 1)) / 48.0);
+                break;
             }
             if (r < 0)
             {
                 printf("ffaudio.write: %s", audio->error(b));
+                break;
             }
 #if 0 // print time measurement
             else
@@ -920,8 +931,6 @@ void *radio_capture_thread(void *device_ptr)
     ffuint msec_bytes;
 
 	int32_t *buffer = NULL;
-
-
 
 	double *buffer_internal = NULL;
 
