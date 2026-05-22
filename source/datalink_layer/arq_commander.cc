@@ -2394,7 +2394,33 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					}
 					else if(retransmit_count < MAX_RETRANSMIT_HEADROOM)
 					{
-						// Frame missing — save encrypted payload for retransmit
+						// Frame missing — save encrypted payload for retransmit.
+						//
+						// PADDED-SLOT GUARD: pad_messages_batch_tx() at
+						// arq_common.cc:2282 sets messages_batch_tx[slot].id = slot
+						// for slots beyond ToSend_data (filling the batch out to
+						// data_batch_size with duplicates of earlier frames).
+						// send_batch() then flips messages_tx[slot].status =
+						// PENDING_ACK on those padded ids — but the corresponding
+						// messages_tx slot was never written by add_message_tx_data,
+						// so it holds init values (length=0, type=NONE, bsi=-1).
+						// If SACK_RSP reports the padded slot missing, enqueuing
+				                        // it produces a retx with bsi=-1 and zero-length payload,
+						// which makes frame 0 of the next mixbatch arrive at RSP
+						// as type=0/len=0/empty — RSP can't decompress; PPMd context
+						// resets; all subsequent batches cascade-fail. The padded
+						// frame's wire bytes are already present on the wire as a
+						// duplicate of an earlier (real) slot; if that earlier slot
+						// was received, the padded "loss" is meaningless. Mark
+						// ACKED and skip enqueue.
+						if(messages_tx[i].length == 0
+						   || messages_tx[i].batch_seq_id < 0
+						   || messages_tx[i].type == NONE)
+						{
+							messages_tx[i].status = ACKED;
+							stats.nAcked_data++;
+							continue;
+						}
 						int len = messages_tx[i].length;
 						if(len > MAX_SACK_FRAME_SIZE) len = MAX_SACK_FRAME_SIZE;
 						memcpy(retransmit_frames[retransmit_count], messages_tx[i].data, len);
