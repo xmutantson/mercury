@@ -1133,8 +1133,16 @@ void cl_arq_controller::process_messages_tx_data()
 			}
 			messages_batch_tx[message_batch_counter_tx].type = retransmit_frame_types[r];
 			messages_batch_tx[message_batch_counter_tx].length = retransmit_frame_lengths[r];
-			memcpy(messages_batch_tx[message_batch_counter_tx].data,
-				retransmit_frames[r], retransmit_frame_lengths[r]);
+			// BUFFER-ALIAS FIX: don't memcpy into messages_batch_tx[r].data —
+			// that pointer aliases messages_tx[r].data (from a prior cycle's
+			// struct-copy at line ~1225), and clobbering it would corrupt
+			// the new-data buffer that the upcoming new-data loop will struct-
+			// copy out of messages_tx[r] into messages_batch_tx[r+R]. Instead,
+			// memcpy into a dedicated per-instance scratch buffer and point
+			// messages_batch_tx[r].data at the scratch slot. Runtime-confirmed
+			// via [TX-ALIAS-CHECK-POST] = YES-BUG before this fix.
+			memcpy(retx_scratch[r], retransmit_frames[r], retransmit_frame_lengths[r]);
+			messages_batch_tx[message_batch_counter_tx].data = (char*)retx_scratch[r];
 			messages_batch_tx[message_batch_counter_tx].nResends = nResends;
 			messages_batch_tx[message_batch_counter_tx].ack_timeout = ack_timeout_data;
 			messages_batch_tx[message_batch_counter_tx].status = ADDED_TO_BATCH_BUFFER;

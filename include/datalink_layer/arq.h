@@ -744,6 +744,20 @@ public:
   int retransmit_count;                // Number of frames to retransmit
   int retransmit_batch_id;             // Crypto batch ID of frames being retransmitted
   unsigned char retransmit_frames[MAX_RETRANSMIT_HEADROOM][MAX_SACK_FRAME_SIZE];
+  // Per-instance scratch buffers for the v2 mixed-batch retx prefix.
+  // Each messages_batch_tx[i].data slot ALIASES messages_tx[i].data via the
+  // struct-copies at arq_commander.cc:1225/1277 (and other sites). If the
+  // retx-prefix loop memcpys retx bytes INTO messages_batch_tx[r].data
+  // directly, it clobbers the underlying messages_tx[r] buffer; then the
+  // new-data loop's struct-copy propagates the corrupted pointer onto
+  // messages_batch_tx[r+R].data, causing the first R "new-data" frames to
+  // carry byte-identical retx content on the wire. Fix: retx-prefix memcpys
+  // INTO this dedicated scratch buffer instead, then points
+  // messages_batch_tx[r].data at retx_scratch[r]. The original messages_tx
+  // buffer is never touched. Verified by runtime [TX-ALIAS-CHECK-POST]
+  // diagnostic firing identical=YES-BUG on the pre-fix binary, then no-bug
+  // on the fixed binary.
+  unsigned char retx_scratch[MAX_RETRANSMIT_HEADROOM][MAX_SACK_FRAME_SIZE];
   int retransmit_frame_lengths[MAX_RETRANSMIT_HEADROOM];
   int retransmit_frame_positions[MAX_RETRANSMIT_HEADROOM]; // Original frame_pos within crypto batch
   int retransmit_frame_types[MAX_RETRANSMIT_HEADROOM];     // DATA_LONG or DATA_SHORT
