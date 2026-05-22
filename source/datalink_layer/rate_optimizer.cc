@@ -227,6 +227,7 @@ cl_rate_optimizer::cl_rate_optimizer()
     , nb_enabled(false)
     , n_configs_loaded_nb(0)
     , n_channels_loaded_nb(0)
+    , label_streak_count(0)
 {}
 
 // Parse a "table" or "table_nb" section. Shared between WB and NB load
@@ -426,6 +427,8 @@ void cl_rate_optimizer::notify_cooldown_tick() {
 void cl_rate_optimizer::reset_session_state() {
     cooldown_remaining = 0;
     eval_count = 0;
+    label_streak_value.clear();
+    label_streak_count = 0;
 }
 
 const st_rate_cell* cl_rate_optimizer::get_cell(int cfg, const std::string& bucket,
@@ -558,6 +561,35 @@ int cl_rate_optimizer::evaluate(int current_cfg,
             if (d < best_d) { best_d = d; current_label = active_axis[i].first; }
         }
         if (current_label.empty()) return current_cfg;
+    }
+
+    // Label hysteresis: identify_channel_label() runs every batch and uses
+    // a single sack_rate sample weighted 4× over eff_bps. Normal random
+    // partial-batch clustering on a clean channel can briefly hit
+    // sack_rate≈0.25-0.30, which is enough to flip "clean" → "wgn30" and
+    // recommend an unwarranted CFG upshift. Require LABEL_STREAK_REQUIRED
+    // consecutive evals at the same label before promoting it to the
+    // switch-decision logic below.
+    //
+    // Reproducer that motivated this guard: post-§6g clean-channel r2 of
+    // 2026-05-22 phase4 benchmark — sack_rate spiked 0.25-0.29 for one
+    // eval, flipped label to wgn30, fired SET_CONFIG 15→16, forced a
+    // streaming PPMd+zstd reset, user_bps fell from ~6000 to 2304.
+    if (current_label == label_streak_value) {
+        if (label_streak_count < LABEL_STREAK_REQUIRED) ++label_streak_count;
+    } else {
+        label_streak_value = current_label;
+        label_streak_count = 1;
+    }
+    if (label_streak_count < LABEL_STREAK_REQUIRED) {
+        const char* bw_tag_early = is_nb ? " nb=1" : "";
+        printf("[OPT-EVAL] eff=%.0f sack=%.2f curr_cfg=%d -> stay "
+               "(skip=label-unstable streak=%d/%d) label=%s%s\n",
+               current_eff_bps, current_sack_rate, current_cfg,
+               label_streak_count, (int)LABEL_STREAK_REQUIRED,
+               current_label.c_str(), bw_tag_early);
+        fflush(stdout);
+        return current_cfg;
     }
 
     // Score "stay". Use the table's measured value at (current_cfg, label)

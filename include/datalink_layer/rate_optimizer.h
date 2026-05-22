@@ -168,6 +168,18 @@ private:
     // batches the optimizer was asked about even if no switch was made.
     int    eval_count;
 
+    // Label hysteresis. identify_channel_label() runs per batch and uses a
+    // single sack_rate sample as primary input (weighted 4× over eff_bps).
+    // Normal random partial-batch clustering on a clean channel can produce
+    // 1-2 evals at sack_rate≈0.25-0.30, which is enough to flip the label
+    // from "clean" to "wgn30" and recommend an unwarranted CFG upshift that
+    // destroys the streaming compression context. Require K consecutive
+    // evals at the same label before acting on it. ~K batches × 1.8s/batch
+    // ≈ K × 1.8s of label stability needed (K=4 → ~7 s).
+    std::string label_streak_value;
+    int         label_streak_count;
+    static const int LABEL_STREAK_REQUIRED = 4;
+
     // Below-table-range gate inputs — populated by load(). -1 / -1.0 when
     // no table is loaded (signals "no gate active"). Parallel WB / NB.
     int    min_cfg_calibrated;
