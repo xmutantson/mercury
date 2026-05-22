@@ -2307,6 +2307,28 @@ skip_h_retry_point:
 					}
 					if(h_count > 0) mean_H = h_sum / h_count;
 				}
+				// Schmidl-Cox sub-peak rejection (dual-condition gate).
+				// Sub-peaks INSIDE the OFDM data body produce saturating
+				// metric (≥0.97, often 1.000) but the resulting channel
+				// estimate collapses (mean|H| well below the real-preamble
+				// floor of ~0.74). Real preambles cap around metric≈0.92 in
+				// clean WB (see comment near telecom_system.cc:1416), so the
+				// (metric≥0.97 AND mean_H<0.5) combination is a strong
+				// sub-peak fingerprint that the looser SKIP-H mean_H<0.30
+				// threshold lets through. Rejecting these here saves the
+				// 101-iter LDPC burn and frees the trial budget for the real
+				// preamble. Counts toward skip_h_count so the existing
+				// SKIP-H recovery (line ~2622) scans forward after the
+				// budget is spent.
+				if(receive_stats.coarse_metric >= 0.97 && mean_H < 0.5)
+				{
+					printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
+						receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
+					fflush(stdout);
+					skip_h_count++;
+					receive_stats.sync_trials++;
+					continue;
+				}
 				{
 					// Timing-quality gate: if mean|H| < 0.30, the preamble timing
 				// is almost certainly wrong by 1+ OFDM symbols. Pilots land on
