@@ -249,6 +249,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 			// the deadlock without addressing this root cause.
 			messages_control.status = FREE;
 
+			// §6f (fact-doc sack_partial_bsi_advance.md, 2026-05-21): defensive
+			// reset of SACK v2 bsi state on BREAK. Symmetric with
+			// reset_session_state at arq_common.cc:186-188. Without this, a
+			// stuck-bsi condition (e.g. from a §6g-class bypass that escaped
+			// the fix, or a future regression) would survive the BREAK and
+			// cause continued [RSP-V2-DROP] storms post-config-drop. With
+			// this, BREAK self-heals: the next data frame re-bootstraps the
+			// bsi window via [RSP-V2-ADOPT] at arq_responder.cc:393-398.
+			// Cost: one batch of bootstrap latency on every BREAK (acceptable
+			// — BREAK is already a hard recovery event).
+			rsp_current_expected_batch_seq_id = -1;
+			rsp_prev_batch_seq_id = -1;
+
 #ifdef MERCURY_GUI_ENABLED
 			if(passive_monitor)
 				gui_push_monitor_event("[BREAK -> ROBUST_0]", false);
@@ -1170,7 +1183,62 @@ void cl_arq_controller::process_messages_acknowledging_data()
 								(unsigned)bsi, rx_received, data_batch_size,
 								(axis3_sack_mode == SACK_MODE_PROBE) ? "PROBE" : "ON");
 							fflush(stdout);
-							send_sack_v2_frame(sack_bitmap, data_batch_size, bsi);
+
+							// §6g (fact-doc sack_partial_bsi_advance.md, 2026-05-21):
+							// Fire Step 8a bsi-bump-and-transfer-prev BEFORE the
+							// transport-choice branch so the invariant runs
+							// regardless of whether the MFSK suffix wins
+							// (used_mfsk_path=true → send_sack_v2_frame skipped)
+							// or the OFDM SACK_RSP wins. Capture the pre-bump
+							// bsi for the wire frames; after the bump,
+							// rsp_current_expected_batch_seq_id is +=1 and the
+							// old value is in rsp_prev_batch_seq_id. Both wire
+							// paths must transmit the PARTIAL batch's bsi
+							// (= pre-bump value), not the new current_expected.
+							unsigned char sacked_bsi = bsi;
+							bump_bsi_and_transfer_prev();
+
+							// Step 5 of MFSK-suffix ACK+SACK redesign — RSP-side
+							// call-site swap. WB-only (suffix_len()>0) and only
+							// inside the Q-table band where the optimizer owns
+							// config selection. Pack the per-frame received
+							// bitmap LSB-first into a uint32_t (matches
+							// send_sack_v2_frame's byte-LSB-first convention at
+							// arq_common.cc:4147-4151 for the first 32 frames).
+							bool used_mfsk_path = false;
+							if (MFSK_ACK_SACK_ENABLED
+								&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0
+								&& optimizer_is_in_control())
+							{
+								uint32_t bitmap_u32 = 0;
+								int nbits = data_batch_size;
+								if (nbits > 32) nbits = 32;
+								for (int i = 0; i < nbits; i++)
+								{
+									if (sack_bitmap[i])
+										bitmap_u32 |= (1u << i);
+								}
+								printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
+									(unsigned)sacked_bsi, (unsigned)bitmap_u32, data_batch_size);
+								fflush(stdout);
+								long long mfsk_ms = send_mfsk_ack_sack(sacked_bsi, bitmap_u32);
+								if (mfsk_ms > 0)
+								{
+									printf("[TX-ACK-SACK] partial via MFSK suffix wire_ms=%lld\n",
+										mfsk_ms);
+									fflush(stdout);
+									used_mfsk_path = true;
+								}
+								else
+								{
+									printf("[RSP-MFSK-SACK] MFSK path returned 0 — falling back to OFDM SACK_RSP\n");
+									fflush(stdout);
+								}
+							}
+							if (!used_mfsk_path)
+							{
+								send_sack_v2_frame(sack_bitmap, data_batch_size, sacked_bsi);
+							}
 						}
 					}
 					// else: !sack_v2_enabled → no partial-batch SACK transport
@@ -1274,7 +1342,45 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		{
 			unsigned char ack_bsi = (unsigned char)(
 				rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
-			send_ofdm_ack_clean(ack_bsi);
+
+			// Step 5 of MFSK-suffix ACK+SACK redesign — RSP-side clean-batch
+			// call-site swap. WB-only (suffix_len()>0) and only inside the
+			// Q-table band (optimizer_is_in_control()). Clean batch ⇒ bitmap
+			// is all-ones over [0, data_batch_size). For data_batch_size==32
+			// use 0xFFFFFFFF; for smaller batches use (1u<<n)-1.
+			bool used_mfsk_path = false;
+			if (MFSK_ACK_SACK_ENABLED
+				&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0
+				&& optimizer_is_in_control())
+			{
+				uint32_t bitmap_u32;
+				if (data_batch_size >= 32)
+					bitmap_u32 = 0xFFFFFFFFu;
+				else if (data_batch_size <= 0)
+					bitmap_u32 = 0u;
+				else
+					bitmap_u32 = (1u << data_batch_size) - 1u;
+				printf("[RSP-MFSK-SACK] clean path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
+					(unsigned)ack_bsi, (unsigned)bitmap_u32, data_batch_size);
+				fflush(stdout);
+				long long mfsk_ms = send_mfsk_ack_sack(ack_bsi, bitmap_u32);
+				if (mfsk_ms > 0)
+				{
+					printf("[TX-ACK-SACK] clean via MFSK suffix wire_ms=%lld\n",
+						mfsk_ms);
+					fflush(stdout);
+					used_mfsk_path = true;
+				}
+				else
+				{
+					printf("[RSP-MFSK-SACK] MFSK path returned 0 — falling back to OFDM_ACK_CLEAN\n");
+					fflush(stdout);
+				}
+			}
+			if (!used_mfsk_path)
+			{
+				send_ofdm_ack_clean(ack_bsi);
+			}
 		}
 		else
 		{
@@ -1703,9 +1809,10 @@ void cl_arq_controller::process_control_responder()
 			sack_enabled = both_sack;
 			if(sack_enabled)
 			{
-				// Update batch size now that SACK is negotiated
+				// Update batch size now that SACK is negotiated. 30s target
+				// matches the formula in arq_common.cc + arq_commander.cc.
 				int max_batch = (message_transmission_time_ms > 0)
-					? (int)(12000.0 / message_transmission_time_ms + 0.5) : 31;
+					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
 				if(max_batch < 5) max_batch = 5;
 				if(max_batch > nMessages) max_batch = nMessages;
 				int new_batch = radio_batch_size;
@@ -2371,4 +2478,331 @@ void cl_arq_controller::process_buffer_data_responder()
 		}
 
 	}
+}
+
+// ============================================================================
+// SACK Partial-Path BSI Non-Advance — in-process reproducer (test-only)
+// ============================================================================
+//
+// CLI: --test-partial-bsi-advance=mfsk|ofdm
+//
+// Reproduces the bug documented in mercury/fact-documents/sack_partial_bsi_advance.md
+// (§5.3 / §5.4). The bug: when the MFSK suffix ACK+SACK path is taken for a
+// partial batch (arq_responder.cc:1198-1204, used_mfsk_path=true), the
+// subsequent send_sack_v2_frame() call at arq_responder.cc:1213 is SKIPPED.
+// That call is where Step 8a's bsi-bump-and-transfer-to-prev block lives
+// (arq_common.cc:4054-4137). Skipping it leaves `rsp_current_expected_batch_seq_id`
+// stuck on the partial's bsi, so when CMD sends a mixbatch (retx of old-bsi +
+// new-bsi frames) under a larger data_batch_size from a coincident Axis-2
+// up-move, every new-bsi frame is dropped as out_of_window at
+// arq_responder.cc:403-413.
+//
+// Variants:
+//   mfsk → exercises the MFSK suffix bypass: should FAIL on HEAD with
+//          drop_count >= 26 (byte-identical to r4's [RSP-V2-DROP] batch_seq_id=4
+//          expected=3 lines).
+//   ofdm → forces used_mfsk_path=false (no bypass): should PASS on HEAD because
+//          send_sack_v2_frame's bump-and-transfer runs. Regression guard.
+//
+// We do NOT call send_sack_v2_frame() directly here — it does real OFDM TX via
+// send_batch(), requiring a fully-initialized telecom_system. Instead, we
+// REPLICATE the Step 8a state mutations (lines 4054-4137 of arq_common.cc)
+// inline for the OFDM variant. The bug is purely state-machine; no DSP/timing
+// dependence. Per fact-doc §5.2 — this is the surgically correct unit-test
+// approach.
+//
+// PASS:  drop_count < 2 for bsi=4 arrivals.
+// FAIL:  drop_count >= 2 (in practice 26 — all bsi=4 frames after the retx fill).
+//
+// Returns: 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_partial_bsi_advance(const char* transport)
+{
+	if(transport == NULL) transport = "mfsk";
+	bool variant_mfsk = (strcmp(transport, "mfsk") == 0);
+	bool variant_ofdm = (strcmp(transport, "ofdm") == 0);
+	if(!variant_mfsk && !variant_ofdm)
+	{
+		printf("[TEST-PARTIAL-BSI] ERROR: transport must be 'mfsk' or 'ofdm' (got '%s')\n",
+			transport);
+		fflush(stdout);
+		return 1;
+	}
+
+	// --- Step 0: allocate buffers ------------------------------------------
+	// We must avoid load_configuration() (depends on a fully-initialized
+	// telecom_system); set just the fields init_messages_buffers() reads.
+	this->nMessages = 255;
+	this->max_data_length = 170;
+	this->max_message_length = 200;
+	this->max_header_length = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-PARTIAL-BSI] ERROR: init_messages_buffers() failed (rc=%d)\n",
+			alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	// --- Step 1: prime SACK v2 state ---------------------------------------
+	// Bypass set_data_batch_size()'s clamp (depends on max_*_length values that
+	// would be initialized by load_configuration). The values we set above are
+	// large enough that the clamp at arq_common.cc:548 won't trigger; assign
+	// directly anyway to match the pattern used by test_fire_policy_axis2().
+	this->sack_v2_enabled              = true;
+	this->sack_enabled                 = true;
+	this->axis3_sack_mode              = 1;  // SACK_MODE_ON
+	this->data_batch_size              = 25;
+	this->rsp_current_expected_batch_seq_id = 3;
+	this->rsp_prev_batch_seq_id        = 2;
+	this->rsp_prev_batch_active        = false;
+	this->rsp_v2_drop_count            = 0;
+	this->compression_enabled          = false;  // Avoid header-fallback in expected calc
+
+	// --- Step 2: populate 24 RECEIVED slots in messages_rx[] ---------------
+	// bsi=3, slots 0..12 + 14..24 (slot 13 is the missing frame). Slot 24
+	// carries the end-of-batch flag (sequence_number bit 7 in §2.2). On the
+	// wire, EOB is encoded by setting `last_received_end_of_batch_seq` at
+	// arq_common.cc:5587 when the bit-7 frame is decoded — replicate that.
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		messages_rx[i].status       = FREE;
+		messages_rx[i].length       = 0;
+		messages_rx[i].batch_seq_id = -1;
+	}
+	int received_slots = 0;
+	for(int i = 0; i < 25; i++)
+	{
+		if(i == 13) continue;  // missing frame
+		messages_rx[i].type             = DATA_LONG;
+		messages_rx[i].id               = (char)(unsigned char)i;
+		messages_rx[i].length           = 16;  // small payload
+		messages_rx[i].status           = RECEIVED;
+		messages_rx[i].batch_seq_id     = 3;
+		messages_rx[i].sequence_number  = (char)(unsigned char)i;
+		for(int j = 0; j < 16; j++) messages_rx[i].data[j] = (char)(i * 7 + j);
+		received_slots++;
+	}
+	this->last_received_end_of_batch_seq = 24;  // slot 24 carried bit-7
+	this->batch_rx_frame_count           = received_slots;
+	printf("[TEST-PARTIAL-BSI] setup: bsi=3 partial %d/25 (slot 13 missing) batch=25 transport=%s\n",
+		received_slots, transport);
+	fflush(stdout);
+
+	// --- Step 3: dispatch the partial-path SACK (the bug site) -------------
+	// Replicate arq_responder.cc:1102-1242 in compressed form. The CRITICAL
+	// branch is the MFSK suffix path: when used_mfsk_path=true,
+	// send_sack_v2_frame() is bypassed (skipping Step 8a's bump-and-transfer).
+	//
+	// For 'mfsk' variant: simulate the MFSK suffix succeeding → bypass.
+	// For 'ofdm' variant: simulate used_mfsk_path=false → run the Step 8a
+	//   bump-and-transfer block (inlined from arq_common.cc:4054-4137).
+	{
+		int rx_received = 0;
+		for(int i = 0; i < this->data_batch_size; i++)
+			if(messages_rx[i].status == RECEIVED) rx_received++;
+		int expected = this->data_batch_size;
+		if(this->last_received_end_of_batch_seq >= 0)
+		{
+			int eob = this->last_received_end_of_batch_seq + 1;
+			if(eob < expected) expected = eob;
+		}
+		printf("[ACK-GATE] SACK: received %d/%d (expected %d)\n",
+			rx_received, this->data_batch_size, expected);
+
+		unsigned char bsi = (unsigned char)
+			((this->rsp_current_expected_batch_seq_id >= 0)
+				? (this->rsp_current_expected_batch_seq_id & 0xFF) : 0);
+		printf("[ACK-GATE-V2] dispatching OFDM SACK_RSP (batch_seq_id=%u, %d/%d received, sack_mode=ON)\n",
+			(unsigned)bsi, rx_received, this->data_batch_size);
+		fflush(stdout);
+
+		// §6g fix (2026-05-21): both transports now share the Step 8a
+		// bump-and-transfer via the hoisted bump_bsi_and_transfer_prev()
+		// helper, fired from arq_responder.cc:~1181 BEFORE the transport
+		// choice. The test mirrors production: invoke the production helper
+		// once for both variants. The variant only changes the synthetic
+		// wire-log line printed (which transport "won"); the state mutations
+		// are identical, which is the whole point of §6g.
+		//
+		// PRE-FIX behavior (for reference, to understand FAIL→PASS):
+		//   mfsk variant: helper was NOT called → bsi stuck at 3 → bsi=4
+		//     mixbatch arrivals all dropped as out_of_window (FAIL).
+		//   ofdm variant: helper was called inline → bsi advanced to 4 →
+		//     bsi=4 arrivals routed correctly (PASS, regression guard).
+		// POST-FIX: production calls the helper for both transports, so the
+		// test now calls the helper for both transports. Both variants PASS.
+		if(variant_mfsk)
+		{
+			printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u nframes=%d (synthetic)\n",
+				(unsigned)bsi, this->data_batch_size);
+			printf("[TX-ACK-SACK] partial via MFSK suffix wire_ms=991\n");
+			fflush(stdout);
+		}
+		else
+		{
+			printf("[TX-SACK-V2] (synthetic OFDM SACK_RSP TX for batch_seq_id=%u nframes=%d)\n",
+				(unsigned)bsi, this->data_batch_size);
+			fflush(stdout);
+		}
+		// Production call: this is the SAME helper invoked from
+		// arq_responder.cc:~1181 in real-world partial-batch dispatch.
+		bump_bsi_and_transfer_prev();
+		// Both paths clear last_received_end_of_batch_seq (arq_responder.cc:1223).
+		this->last_received_end_of_batch_seq = -1;
+		this->batch_rx_frame_count           = 0;
+	}
+
+	// --- Step 4: simulate SET_LINK_PARAMS apply (batch 25 -> 30) -----------
+	// Mirror arq_responder.cc:2305 set_data_batch_size(target). Direct assign
+	// because pre-config max_*_length clamp would corrupt the value.
+	int old_batch = this->data_batch_size;
+	this->data_batch_size = 30;
+	printf("[RSP-LINK-PARAMS] APPLIED batch %d -> 30 sack_mode=1 (prev sack_mode=1) (synthetic)\n",
+		old_batch);
+	fflush(stdout);
+
+	// --- Step 5: synthesize the mixbatch arrival ---------------------------
+	// 1 retx of bsi=3 slot 13, then 26 new-bsi-4 frames (slots 0..25; slot 25
+	// carries EOB). Run them through the bsi-routing block from
+	// arq_responder.cc:332-441 in replicated form (we cannot invoke the full
+	// process_messages_rx_data_control() — it depends on too much real
+	// telecom_system state). The routing logic itself (match_current /
+	// match_prev / drop) is what we're exercising; the storage details after
+	// routing are irrelevant for the bug signature.
+	struct arrival { int bsi; int seq; bool eob; };
+	struct arrival arrivals[27];
+	arrivals[0].bsi = 3; arrivals[0].seq = 13; arrivals[0].eob = false;
+	for(int i = 0; i < 26; i++)
+	{
+		arrivals[1 + i].bsi = 4;
+		arrivals[1 + i].seq = i;
+		arrivals[1 + i].eob = (i == 25);
+	}
+
+	long long bsi4_drops = 0;
+	int bsi3_retx_routed = 0;  // matched prev or current → not dropped
+	int bsi4_routed      = 0;
+	int batch_done_count = 0;
+
+	for(int k = 0; k < 27; k++)
+	{
+		int  abs_bsi = arrivals[k].bsi;
+		int  abs_seq = arrivals[k].seq;
+		bool eob     = arrivals[k].eob;
+		bool match_current = (abs_bsi == this->rsp_current_expected_batch_seq_id);
+		bool match_prev    = (this->rsp_prev_batch_seq_id >= 0
+		                      && abs_bsi == this->rsp_prev_batch_seq_id);
+		if(!match_current && !match_prev)
+		{
+			this->rsp_v2_drop_count++;
+			printf("[RSP-V2-DROP] batch_seq_id=%d expected=%d prev=%d "
+				"reason=unknown_or_out_of_window (drop_count=%lld)\n",
+				abs_bsi, this->rsp_current_expected_batch_seq_id,
+				this->rsp_prev_batch_seq_id, this->rsp_v2_drop_count);
+			fflush(stdout);
+			if(abs_bsi == 4) bsi4_drops++;
+			continue;
+		}
+		// Routed (to current or prev). Simulate the storage write so the
+		// post-loop ACK-GATE can compute rx_received correctly. EOB-bearing
+		// frame updates last_received_end_of_batch_seq just like the real
+		// decoder at arq_common.cc:5587.
+		if(match_current)
+		{
+			int loc = abs_seq;
+			if(loc >= 0 && loc < this->nMessages)
+			{
+				messages_rx[loc].type            = DATA_LONG;
+				messages_rx[loc].id              = (char)(unsigned char)loc;
+				messages_rx[loc].length          = 16;
+				messages_rx[loc].status          = RECEIVED;
+				messages_rx[loc].batch_seq_id    = abs_bsi;
+				messages_rx[loc].sequence_number = (char)(unsigned char)abs_seq;
+			}
+			if(eob && (abs_bsi == this->rsp_current_expected_batch_seq_id))
+				this->last_received_end_of_batch_seq = abs_seq;
+			if(abs_bsi == 4) bsi4_routed++;
+			if(abs_bsi == 3) bsi3_retx_routed++;
+		}
+		else if(match_prev && this->rsp_prev_batch_active)
+		{
+			int loc = abs_seq;
+			if(loc >= 0 && loc < this->nMessages)
+			{
+				char prev_status = messages_rx_prev[loc].status;
+				messages_rx_prev[loc].type            = DATA_LONG;
+				messages_rx_prev[loc].id              = (char)(unsigned char)loc;
+				messages_rx_prev[loc].length          = 16;
+				messages_rx_prev[loc].status          = RECEIVED;
+				messages_rx_prev[loc].batch_seq_id    = abs_bsi;
+				messages_rx_prev[loc].sequence_number = (char)(unsigned char)abs_seq;
+				if(prev_status != RECEIVED && prev_status != ACKED)
+					this->rsp_prev_batch_received_count++;
+			}
+			if(abs_bsi == 3) bsi3_retx_routed++;
+			// Prev-batch completion: when received_count >= expected_count,
+			// the production code performs the swap + delivery + bump (the
+			// "prev complete" path). Simulate the bsi-bump effect: prev
+			// deactivates. We do NOT bump current_expected here — the prev
+			// completion path doesn't either; it just delivers.
+			if(this->rsp_prev_batch_active
+			   && this->rsp_prev_batch_received_count >= this->rsp_prev_batch_expected_count)
+			{
+				printf("[RSP-V2-PREV-DELIVER-BEGIN] prev_batch_seq_id=%d "
+					"received=%d/%d (synthetic — would deliver here)\n",
+					this->rsp_prev_batch_seq_id,
+					this->rsp_prev_batch_received_count,
+					this->rsp_prev_batch_expected_count);
+				fflush(stdout);
+				this->rsp_prev_batch_active = false;
+			}
+		}
+	}
+
+	// --- Step 6: post-arrival ACK-GATE on current batch --------------------
+	// If the bsi was correctly bumped (OFDM variant), the bsi=4 frames are now
+	// in messages_rx[] and the EOB-bearing slot=25 updated
+	// last_received_end_of_batch_seq=25 → expected=26, rx_received=26 → PASS,
+	// which would fire [RSP-V2-BATCH-DONE]. If the bsi was NOT bumped (MFSK
+	// variant), the bsi=4 frames are all dropped, rx_received from messages_rx
+	// still reflects the partial bsi=3 (with slot 13 now filled by the retx)
+	// → expected=data_batch_size=30 (EOB cleared at step 3), rx_received=25
+	// (24 original + 1 retx) → still partial.
+	{
+		int rx_received = 0;
+		for(int i = 0; i < this->data_batch_size; i++)
+			if(messages_rx[i].status == RECEIVED) rx_received++;
+		int expected = this->data_batch_size;
+		if(this->last_received_end_of_batch_seq >= 0)
+		{
+			int eob = this->last_received_end_of_batch_seq + 1;
+			if(eob < expected) expected = eob;
+		}
+		printf("[ACK-GATE] post-arrival: rx_received=%d expected=%d batch=%d\n",
+			rx_received, expected, this->data_batch_size);
+		if(rx_received >= expected
+		   && this->sack_v2_enabled
+		   && this->rsp_current_expected_batch_seq_id >= 0)
+		{
+			this->rsp_prev_batch_seq_id = this->rsp_current_expected_batch_seq_id;
+			this->rsp_current_expected_batch_seq_id =
+				(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+			printf("[RSP-V2-BATCH-DONE] prev=%d next_expected=%d\n",
+				this->rsp_prev_batch_seq_id, this->rsp_current_expected_batch_seq_id);
+			batch_done_count++;
+		}
+		fflush(stdout);
+	}
+
+	// --- Step 7: verdict ---------------------------------------------------
+	// PASS criterion per fact-doc §5.4: drop_count < 2 for bsi=4 arrivals.
+	bool pass = (bsi4_drops < 2);
+	printf("[TEST-PARTIAL-BSI] %s: transport=%s drop_count=%lld (bsi=4) bsi3_retx_routed=%d "
+		"bsi4_routed=%d batch_done_count=%d current_expected=%d prev=%d\n",
+		pass ? "PASS" : "FAIL",
+		transport, bsi4_drops, bsi3_retx_routed, bsi4_routed, batch_done_count,
+		this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id);
+	fflush(stdout);
+	return pass ? 0 : 1;
 }

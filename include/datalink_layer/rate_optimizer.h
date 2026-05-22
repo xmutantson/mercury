@@ -62,12 +62,17 @@ public:
     //   current_eff_bps   : `get_current_effective_rate_bps()` from arq.h
     //   current_sack_rate : `get_current_sack_rate()` from arq.h
     //   window_count      : `get_current_window_count()` (min 10 to fire)
-    //   wb_config_max     : ceiling for WB candidates (WB_CONFIG_MAX)
+    //   config_ceiling    : highest cfg the candidate loop may recommend
+    //                       (WB_CONFIG_MAX in WB sessions, NB_CONFIG_MAX in NB)
+    //   is_nb             : true when the current session is narrowband.
+    //                       Routes lookups to the NB calibration table; if
+    //                       no NB table was loaded, evaluate returns
+    //                       current_cfg (optimizer silent on NB).
     //
     // Returns:
-    //   target_cfg out-param. Caller checks `target_cfg != current_cfg` to
-    //   decide whether to queue a SET_CONFIG. Returned value is guaranteed
-    //   in [CONFIG_0, wb_config_max] (defensive — we never recommend
+    //   target_cfg. Caller checks `target_cfg != current_cfg` to decide
+    //   whether to queue a SET_CONFIG. Returned value is guaranteed in
+    //   [CONFIG_0, config_ceiling] (defensive — we never recommend
     //   ROBUST_X or beyond-ceiling configs).
     //
     // Cooldown:
@@ -82,7 +87,8 @@ public:
                  double current_eff_bps,
                  double current_sack_rate,
                  int window_count,
-                 int wb_config_max);
+                 int config_ceiling,
+                 bool is_nb = false);
 
     // Drain the cooldown counter once per batch-end (regardless of whether
     // evaluate() ran or short-circuited). Cheap; no-op when counter is 0.
@@ -117,9 +123,14 @@ public:
     //   - max_calibrated_sack_rate: largest sack_rate_mean across all valid
     //     cells. Above this we're observing a channel WORSE than anything
     //     we calibrated for — no business recommending a switch.
+    //   - is_nb: select NB calibration data instead of WB.
     // Both return -1 / -1.0 when the table never loaded (signals "ignore").
-    int    min_calibrated_cfg() const        { return min_cfg_calibrated; }
-    double max_calibrated_sack_rate() const  { return max_sack_calibrated; }
+    int    min_calibrated_cfg(bool is_nb = false) const {
+        return is_nb ? min_cfg_calibrated_nb : min_cfg_calibrated;
+    }
+    double max_calibrated_sack_rate(bool is_nb = false) const {
+        return is_nb ? max_sack_calibrated_nb : max_sack_calibrated;
+    }
 
 private:
     bool enabled;
@@ -129,7 +140,12 @@ private:
     // table[cfg][channel_bucket] -> cell.
     // cfg is the integer index (e.g. 15 for CONFIG_15). channel_bucket is
     // the JSON key string ("clean", "wgn30", "wgn28", ...).
+    // `table` holds WB cells; `table_nb` holds NB cells. They populate
+    // from the JSON keys "table" and "table_nb" respectively. The NB table
+    // is optional — when absent, NB sessions get silent-no-op optimizer
+    // behavior (correct fallback to gearshift/BREAK).
     std::map<int, std::map<std::string, st_rate_cell> > table;
+    std::map<int, std::map<std::string, st_rate_cell> > table_nb;
 
     // Ordered list of WGN channel buckets sorted by descending mean SACK
     // rate (i.e. wgn16 first, wgn30 last). Built once at load time so
@@ -138,6 +154,7 @@ private:
     // SACK rate is the mean across configs at that bucket (with valid > 0
     // cells only).
     std::vector<std::pair<std::string, double> > channel_axis;
+    std::vector<std::pair<std::string, double> > channel_axis_nb;
 
     // Decision constants — overridable for tests via set_*().
     double hysteresis_ratio;  // 1.15  (15% gain required to switch)
@@ -152,26 +169,45 @@ private:
     int    eval_count;
 
     // Below-table-range gate inputs — populated by load(). -1 / -1.0 when
-    // no table is loaded (signals "no gate active").
+    // no table is loaded (signals "no gate active"). Parallel WB / NB.
     int    min_cfg_calibrated;
     double max_sack_calibrated;
+    int    min_cfg_calibrated_nb;
+    double max_sack_calibrated_nb;
+
+    // True iff load() found a "table_nb" section with at least one valid
+    // cell. When false, evaluate() short-circuits to "stay" on NB sessions.
+    bool   nb_enabled;
+
+    // Counters per bandwidth mode (purely for [OPT] startup log clarity).
+    int    n_configs_loaded_nb;
+    int    n_channels_loaded_nb;
 
     // Identify the channel label that best matches our current observations
     // AT THE CURRENT CONFIG. Returns the channel-label key (e.g. "wgn22")
-    // for the cell in table[current_cfg] whose sack_rate_mean is closest to
+    // for the cell in the table whose sack_rate_mean is closest to
     // current_sack_rate, with eff_bps_mean as a tiebreaker. Returns "" if
-    // table[current_cfg] is empty (caller falls back to channel_axis).
-    // This replaces the old config-agnostic channel_bucket_from_sack_rate()
-    // + predicted_sack_at_target() heuristic. The channel label identified
-    // here is then used to look up EVERY candidate config in one shot
-    // (no ladder-distance scaling — the table already measured what each
-    // config does on this channel).
+    // the table[current_cfg] row is empty (caller falls back to channel_axis).
+    // is_nb selects WB (table) vs NB (table_nb).
     std::string identify_channel_label(int current_cfg,
                                        double current_sack_rate,
-                                       double current_eff_bps) const;
+                                       double current_eff_bps,
+                                       bool is_nb) const;
 
     // Look up cell. Returns NULL if missing. Caller checks valid flag.
-    const st_rate_cell* get_cell(int cfg, const std::string& bucket) const;
+    const st_rate_cell* get_cell(int cfg, const std::string& bucket,
+                                 bool is_nb) const;
+
+    // Parse one table section ("table" or "table_nb") into the given target
+    // maps. Returns count of valid cells parsed. Shared between WB+NB load.
+    int parse_table_section(const std::string& body,
+                            size_t section_pos,
+                            std::map<int, std::map<std::string, st_rate_cell> >& out_table,
+                            std::vector<std::pair<std::string, double> >& out_axis,
+                            int& out_min_cfg,
+                            double& out_max_sack,
+                            int& out_n_configs,
+                            int& out_n_channels);
 };
 
 #endif // RATE_OPTIMIZER_H_

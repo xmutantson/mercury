@@ -81,6 +81,7 @@ cl_telecom_system::cl_telecom_system()
 	coarse_freq_sync_enabled=false;
 	ack_pattern_passband_samples=0;
 	ack_snr_pattern_passband_samples=0;
+	ack_sack_pattern_passband_samples=0;
 	ack_pattern_detection_threshold=0.8;
 	operation_mode=BER_PLOT_baseband;
 	bit_interleaver_block_size=1;
@@ -2962,6 +2963,52 @@ int cl_telecom_system::generate_ack_snr_pattern_passband(double* out, float snr)
 	return ack_snr_pattern_passband_samples;
 }
 
+// TX: Generate ACK base + 10-symbol ACK+SACK suffix as passband audio.
+// Suffix carries [batch_seq_id:8 | bitmap:32] (40 bits, 4 bits/symbol on WB M=16).
+// Returns number of passband samples written, or 0 if unsupported (NB / M<16).
+// Mirrors generate_ack_snr_pattern_passband for shape — see Step 4 of the
+// MFSK-suffix ACK+SACK redesign.
+int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
+	uint8_t batch_seq_id, uint32_t bitmap)
+{
+	if(ack_sack_pattern_passband_samples <= 0) return 0;
+	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;  // NB unsupported
+
+	int nsymb = ack_mfsk.ack_sack_pattern_nsymb();
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	// Generate subcarrier-domain ACK+SACK pattern (nsymb * Nc complex values).
+	// ofdm_framed_data is sized for max(Nsymb, 48) symbols × Nc — 26 fits easily.
+	ack_mfsk.generate_ack_sack_pattern(data_container.ofdm_framed_data,
+		batch_seq_id, bitmap);
+
+	// IFFT each symbol to time domain
+	for(int i = 0; i < nsymb; i++)
+	{
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	}
+
+	// TX gain from calibration table (reuse ACK channel — same MFSK pattern family)
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	// Baseband to passband
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	// Peak clipping
+	ofdm.peak_clip(out, ack_sack_pattern_passband_samples, ofdm.data_papr_cut);
+
+	return ack_sack_pattern_passband_samples;
+}
+
 // RX: Detect ACK pattern and decode SNR suffix tones.
 // Returns decoded SNR (dB). Sets *out_snr_valid = true if suffix decoded reliably.
 float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
@@ -2996,15 +3043,46 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 		return -99.0f;
 
 	// Decode suffix tones at the detected position (decimated buffer, rate=1).
-	int suffix_tones[cl_mfsk::SNR_SUFFIX_LEN];
+	// SACK suffix is longer than SNR (10 vs 8 on WB), so capture the max
+	// available — decode_suffix_tones writes -1 for any symbol that runs
+	// past the buffer end, which is safe to ignore for the shorter SNR path.
+	int sack_suffix_len = ack_mfsk.ack_sack_suffix_len();
+	int capture_len = cl_mfsk::SNR_SUFFIX_LEN;
+	if (sack_suffix_len > capture_len) capture_len = sack_suffix_len;
+	if (capture_len > cl_mfsk::MAX_ACK_SACK_SUFFIX)
+		capture_len = cl_mfsk::MAX_ACK_SACK_SUFFIX;
+	int suffix_tones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
 	ofdm.decode_suffix_tones(
 		data_container.baseband_data_interpolated, dec_size,
 		1,
 		best_offset, ack_mfsk.ack_pattern_nsymb,
-		cl_mfsk::SNR_SUFFIX_LEN,
+		capture_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		suffix_tones);
+
+	// Hook for the ACK+SACK decode path (Step 3 of MFSK-suffix redesign):
+	// snapshot the first sack_suffix_len de-hopped payload tones into the
+	// mfsk object so decode_ack_sack_from_last_capture() can recover the
+	// 40-bit (bsi, bitmap) payload. We only populate when WB SACK is in
+	// scope (suffix_len > 0) AND every suffix symbol decoded (no -1's),
+	// since unpack expects a clean 40-bit packing. This runs unconditionally
+	// on any ACK match so the legacy SNR path keeps working — callers that
+	// don't care about SACK simply leave last_ack_sack_capture_valid alone.
+	if (sack_suffix_len > 0 && sack_suffix_len <= cl_mfsk::MAX_ACK_SACK_SUFFIX)
+	{
+		bool clean = true;
+		for (int i = 0; i < sack_suffix_len; i++) {
+			if (suffix_tones[i] < 0 || suffix_tones[i] >= ack_mfsk.M) {
+				clean = false;
+				break;
+			}
+			ack_mfsk.last_ack_sack_suffix_tones[i] = suffix_tones[i];
+		}
+		for (int i = sack_suffix_len; i < cl_mfsk::MAX_ACK_SACK_SUFFIX; i++)
+			ack_mfsk.last_ack_sack_suffix_tones[i] = -1;
+		ack_mfsk.last_ack_sack_capture_valid = clean;
+	}
 
 	// Majority vote: find most common tone among the 8 suffix symbols
 	int vote_counts[64] = {};  // M <= 64
@@ -3046,6 +3124,33 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	}
 
 	return -99.0f;
+}
+
+// RX: Detect ACK pattern and decode the 40-bit ACK+SACK suffix in one call.
+// This is the convenience entry point for the MFSK-suffix ACK+SACK redesign
+// (Steps 2+3). It runs the same detector pipeline as detect_ack_snr_from_passband
+// — which writes the de-hopped suffix tones into ack_mfsk.last_ack_sack_suffix_tones[]
+// — then invokes ack_mfsk.decode_ack_sack_from_last_capture() to recover
+// (batch_seq_id, bitmap). Returns false on unsupported M (NB), no detection,
+// or invalid capture; true on a clean decode.
+bool cl_telecom_system::decode_ack_sack_from_passband(double* data, int size,
+	uint8_t* out_bsi, uint32_t* out_bitmap, int* out_matched)
+{
+	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // NB / unsupported
+	if (out_bsi == nullptr || out_bitmap == nullptr) return false;
+
+	// Reuse the SNR detector pipeline — it already does base-pattern detection
+	// + suffix capture into ack_mfsk.last_ack_sack_suffix_tones[].
+	int matched = 0;
+	bool snr_valid_dummy = false;
+	(void)detect_ack_snr_from_passband(data, size, &matched, &snr_valid_dummy);
+	if (out_matched) *out_matched = matched;
+
+	if (!ack_mfsk.last_ack_sack_capture_valid) return false;
+	bool ok = ack_mfsk.decode_ack_sack_from_last_capture(out_bsi, out_bitmap);
+	// Consume the capture: caller gets a one-shot view of this match.
+	ack_mfsk.last_ack_sack_capture_valid = false;
+	return ok;
 }
 
 // TX: Generate BREAK pattern as passband audio (identical to ACK but with break_tones)
@@ -4849,6 +4954,11 @@ void cl_telecom_system::load_configuration(int configuration)
 
 	ack_pattern_passband_samples = ack_mfsk.ack_pattern_nsymb * data_container.Nofdm * frequency_interpolation_rate;
 	ack_snr_pattern_passband_samples = ack_mfsk.ack_snr_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
+	// ACK+SACK pattern (WB-only — NB has M=8 and ack_sack_suffix_len()=0,
+	// which makes ack_sack_pattern_nsymb() == ack_pattern_nsymb. Multiplying
+	// is still safe; downstream callers check ack_sack_suffix_len() > 0 before
+	// invoking the TX path so NB falls back to OFDM_ACK_CLEAN / SACK_RSP.)
+	ack_sack_pattern_passband_samples = ack_mfsk.ack_sack_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
 
 	// Per-mode detection threshold (all using ack_mfsk: M=16, nStreams=1):
 	// ROBUST_0 (-13 dB): low SNR, need conservative threshold

@@ -25,6 +25,7 @@
 
 #include <complex>
 #include <cmath>
+#include <cstdint>
 
 class cl_ldpc;
 
@@ -98,6 +99,48 @@ public:
 	void generate_ack_snr_pattern(std::complex<double>* pattern_out, float snr);
 	// Total symbols when SNR suffix is active
 	int ack_snr_pattern_nsymb() const { return ack_pattern_nsymb + SNR_SUFFIX_LEN; }
+
+	// ACK+SACK suffix: extra symbols carrying [batch_seq_id(8) | bitmap(32)]
+	// = 40 bits payload, replacing OFDM_ACK_CLEAN and SACK_RSP. Each symbol's
+	// tone position carries log2(M) bits. WB M=16 → 4 bits/symbol → 10 symbols
+	// for 40 bits. NB M=8 → 3 bits/symbol; deferred (NB uses OFDM path for now).
+	// Total pattern wall-clock: 16 base + 10 suffix = 26 symbols ≈ 631 ms (WB).
+	int ack_sack_suffix_len() const { return (M >= 16) ? 10 : 0; }  // 0 = unsupported
+	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
+	// Pack 40-bit payload [bsi:8|bitmap:32] into N tone values (each in 0..M-1).
+	// Returns number of tones written (= ack_sack_suffix_len). Caller provides
+	// out_tones[] of size >= ack_sack_suffix_len.
+	int pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, int* out_tones) const;
+	// Inverse of pack: reconstruct (bsi, bitmap) from N tones.
+	// Returns true on success, false if M unsupported.
+	bool unpack_ack_sack_payload(const int* in_tones, uint8_t* out_bsi, uint32_t* out_bitmap) const;
+	// Generate ACK pattern + ack_sack_suffix_len() suffix symbols.
+	void generate_ack_sack_pattern(std::complex<double>* pattern_out,
+	                               uint8_t bsi, uint32_t bitmap);
+
+	// RX-side capture buffer populated by the ACK detector hook
+	// (cl_telecom_system::detect_ack_snr_from_passband). Each entry is the
+	// de-hopped payload tone (0..M-1) for the corresponding SACK suffix
+	// symbol — i.e. the inverse of the (payload+abs_s*hop)%M mapping the
+	// transmitter applies in generate_ack_sack_pattern(). When the detector
+	// declares an ACK match it writes ack_sack_suffix_len() entries here
+	// (10 for WB M=16) and sets last_ack_sack_capture_valid=true. Size 16
+	// is the max possible suffix length.
+	static const int MAX_ACK_SACK_SUFFIX = 16;
+	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
+	bool last_ack_sack_capture_valid;
+
+	// Decode the most recently captured SACK suffix into (bsi, bitmap).
+	// Returns true on success — requires WB (M>=16) and a prior detector
+	// hit that populated last_ack_sack_suffix_tones[]. Caller is expected
+	// to clear last_ack_sack_capture_valid when consumed.
+	bool decode_ack_sack_from_last_capture(uint8_t* out_bsi, uint32_t* out_bitmap);
+
+	// Test-only: stuff payload tones directly into the capture buffer
+	// (bypasses the RF capture path). Used by symbol-domain round-trip
+	// tests so we can exercise decode_ack_sack_from_last_capture() without
+	// running passband_to_baseband + FFT. Not for production code paths.
+	void test_inject_ack_sack_capture(const int* tones, int count);
 
 	cl_mfsk();
 	~cl_mfsk();

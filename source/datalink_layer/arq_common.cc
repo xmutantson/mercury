@@ -1245,10 +1245,16 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// MFSK modes keep batch_size=1 for pattern ACK optimization.
 	// Batch sizing: with all-or-nothing MFSK ACK, P(batch success) = p_ofdm^N × p_ack.
 	// Start conservative (5 frames), adaptive growth finds optimal batch for link quality.
-	// nominal_batch_size = ceiling from 12s target — adaptive mechanism grows toward it.
+	// nominal_batch_size = ceiling from target_time_ms — adaptive mechanism grows toward it.
+	// 30 s target (was 12 s): longer batches amortize the ACK turnaround over
+	// more frames, raising wire efficiency. At target=30000 WB CFG6 reaches
+	// batch=25 (vs 10 previously); NB CFG7+ unblocks from the 5-frame floor.
+	// SACK bitmap cap is 32 frames (MAX_SACK_BATCH_SIZE), and radio_batch_size
+	// stays at 25 by default — fits comfortably. Synchronized CMD/RSP via the
+	// same formula in arq_commander.cc:3133 and arq_responder.cc:1708.
 	if(!is_robust_config(configuration) && message_transmission_time_ms > 0)
 	{
-		int target_time_ms = 12000;
+		int target_time_ms = 30000;
 		int max_batch = (int)((float)target_time_ms / message_transmission_time_ms + 0.5);
 		if(max_batch < 5) max_batch = 5;
 		if(max_batch > nMessages) max_batch = nMessages;
@@ -3039,10 +3045,12 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 	if (emergency_break_active != 0)       return false;
 	if (link_status != CONNECTED)          return false;
 	if (role != COMMANDER)                 return false;
-	// Only fire on WB OFDM configs. NB is out-of-scope for v1 (no NB
-	// calibration data). ROBUST_X is owned by the gearshift / break path.
-	if (narrowband_enabled == YES)         return false;
+	// ROBUST_X is owned by the gearshift / break path. NB sessions are
+	// supported when the loaded table has a "table_nb" section; otherwise
+	// rate_opt.evaluate() short-circuits cleanly on NB.
 	if (!is_ofdm_config(current_configuration)) return false;
+
+	const bool is_nb = (narrowband_enabled == YES);
 
 	// Below-table-range gate: when gearshift/BREAK has dropped us below
 	// where the calibration table has data, OR when the observed channel
@@ -3050,9 +3058,10 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 	// and lets the dumber-but-safer gearshift/turboshift/BREAK system own
 	// the link entirely. Re-engages automatically when both conditions
 	// return to the calibrated region. min_cfg / max_sack are populated
-	// at load() time from the actual table contents.
-	int    min_cfg  = rate_opt.min_calibrated_cfg();
-	double max_sack = rate_opt.max_calibrated_sack_rate();
+	// at load() time from the actual table contents. NB and WB have
+	// separate calibration ranges.
+	int    min_cfg  = rate_opt.min_calibrated_cfg(is_nb);
+	double max_sack = rate_opt.max_calibrated_sack_rate(is_nb);
 	if (min_cfg >= 0 && current_configuration < min_cfg) return false;
 	if (max_sack >= 0.0 && get_current_sack_rate() > max_sack) return false;
 
@@ -3060,7 +3069,8 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 	                               get_current_effective_rate_bps(),
 	                               get_current_sack_rate(),
 	                               get_current_window_count(),
-	                               WB_CONFIG_MAX);
+	                               is_nb ? NB_CONFIG_MAX : WB_CONFIG_MAX,
+	                               is_nb);
 
 	if (target == current_configuration) return false;
 	if (out_recommended_cfg) *out_recommended_cfg = target;
@@ -4007,6 +4017,118 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 // receive_sack_pattern, sack_ldpc, mercury_sack_*_16) has been deleted. v2
 // OFDM SACK_RSP is now the only SACK transport.
 
+// SACK Design A Step 8a — bsi-bump-and-prev-transfer helper.
+// Hoisted out of send_sack_v2_frame() per fact-documents/sack_partial_bsi_advance.md
+// §6g (2026-05-21). Callers must invoke this BEFORE choosing a SACK transport
+// (OFDM SACK_RSP via send_sack_v2_frame, or MFSK suffix via send_mfsk_ack_sack)
+// so the invariant fires regardless of which wire path carries the bitmap.
+// The original load-bearing bug: the MFSK suffix branch at arq_responder.cc:
+// 1198-1204 set used_mfsk_path=true and skipped send_sack_v2_frame(), which
+// transitively skipped this bump-and-transfer block — leaving
+// rsp_current_expected_batch_seq_id stuck on the partial's bsi and causing
+// subsequent mixbatch new-bsi frames to drop as out_of_window
+// (rsp:8019 of phase4_v2_benchmark_wgn18_mfsk_logs/sack_lossy_wgn18_WB_CFG15_sackv2_r4_rsp.log).
+//
+// Internally gated by (sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+// so callers can invoke unconditionally — no-op outside v2 sessions or before
+// the first frame adopts a bsi.
+//
+// Invariants honored (unchanged from the inlined version):
+//   • §4.3.4 #1: still one outstanding batch (data_ack_received gate
+//     unchanged); CMD must finish retransmits for batch N before next.
+//   • §4.3.4 #2: monotonic +1 mod 256, never reset.
+//   • §4.3.4 #3: no silent corruption — match-prev now routes to its OWN
+//     storage; the previous Step 4 path (which routed match-prev hits
+//     into `messages_rx[]` and would have overwritten current-batch
+//     slots in a future Step 8b mixed batch) is replaced.
+void cl_arq_controller::bump_bsi_and_transfer_prev()
+{
+	if(!(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0))
+		return;
+
+	// If a prev batch is still active when we bump again, it means CMD
+	// never finished filling the previous prev batch via retransmits.
+	// We must discard the stale prev to make room (it would otherwise
+	// corrupt subsequent prev-routing). Log + count for visibility.
+	if(rsp_prev_batch_active)
+	{
+		rsp_prev_batch_stale_count++;
+		printf("[RSP-V2-PREV-STALE] discarding incomplete prev batch_seq_id=%d "
+			"(received=%d/%d) — replacing with new prev_batch_seq_id=%d "
+			"(stale_count=%lld)\n",
+			rsp_prev_batch_seq_id, rsp_prev_batch_received_count,
+			rsp_prev_batch_expected_count,
+			rsp_current_expected_batch_seq_id, rsp_prev_batch_stale_count);
+		fflush(stdout);
+		// Clear stale prev slots before re-using the buffer.
+		for(int i=0; i<this->nMessages; i++)
+			messages_rx_prev[i].status = FREE;
+	}
+
+	// Determine expected count for the *new* prev (the batch we're
+	// about to seal). Mirror the EOB-or-data_batch_size inference used
+	// by `process_messages_acknowledging_data`'s rx_received counter.
+	int prev_expected = data_batch_size;
+	if(last_received_end_of_batch_seq >= 0)
+	{
+		int eob = last_received_end_of_batch_seq + 1;
+		if(eob < prev_expected) prev_expected = eob;
+	}
+	if(prev_expected < 1) prev_expected = 1;
+	if(prev_expected > this->nMessages) prev_expected = this->nMessages;
+
+	// Transfer (not copy) batch-N content from messages_rx → messages_rx_prev:
+	// memcpy the payload, copy the metadata, then free the source slot.
+	// We pre-count the post-transfer RECEIVED slots so prev-batch
+	// completion can detect "already complete on transfer" (which only
+	// happens if SACK fires at a moment where all expected slots happen
+	// to be RECEIVED but the ACK-GATE-PASS branch was preempted; under
+	// the normal SACK partial branch, rx_received < expected by
+	// construction, so received_count is strictly < expected_count here).
+	int xferred = 0;
+	int xferred_received = 0;
+	const int alloc_size = N_MAX / 8;
+	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+	{
+		messages_rx_prev[i].type   = messages_rx[i].type;
+		messages_rx_prev[i].id     = messages_rx[i].id;
+		messages_rx_prev[i].length = messages_rx[i].length;
+		messages_rx_prev[i].status = messages_rx[i].status;
+		messages_rx_prev[i].batch_seq_id = messages_rx[i].batch_seq_id;
+		if(messages_rx[i].length > 0 && messages_rx[i].length <= alloc_size)
+		{
+			memcpy(messages_rx_prev[i].data, messages_rx[i].data,
+				messages_rx[i].length);
+		}
+		if(messages_rx[i].status == RECEIVED) xferred_received++;
+		xferred++;
+		// Free the source slot so the current-batch (N+1) frames land
+		// into a clean messages_rx[].
+		messages_rx[i].status = FREE;
+		messages_rx[i].length = 0;
+		messages_rx[i].batch_seq_id = -1;
+	}
+	// Make sure prev slots beyond data_batch_size are FREE (defensive —
+	// they should already be).
+	for(int i=this->data_batch_size; i<this->nMessages; i++)
+	{
+		if(messages_rx_prev[i].status != FREE)
+			messages_rx_prev[i].status = FREE;
+	}
+
+	rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
+	rsp_current_expected_batch_seq_id =
+		(rsp_current_expected_batch_seq_id + 1) & 0xFF;
+	rsp_prev_batch_active            = true;
+	rsp_prev_batch_received_count    = xferred_received;
+	rsp_prev_batch_expected_count    = prev_expected;
+	printf("[RSP-V2-PREV-BUMP] prev_batch_seq_id=%d next_expected=%d "
+		"transferred=%d received_on_transfer=%d/%d (cross-storage routing armed)\n",
+		rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
+		xferred, rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
+	fflush(stdout);
+}
+
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
                                                 unsigned char batch_seq_id)
 {
@@ -4019,112 +4141,14 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 		return 0;
 	}
 
-	// SACK Design A Step 8a — bump-at-SACK-RSP-send: transfer the in-flight
-	// `messages_rx[]` content for the soon-to-be-prev batch into the parallel
-	// `messages_rx_prev[]` buffer, then bump the routing window so subsequent
-	// frames keyed with bsi=N+1 land in `messages_rx[]` (now empty) while
-	// retransmits keyed with bsi=N land in `messages_rx_prev[]` (just-loaded
-	// with the partial state). This is the NEW bump site §7.8.2 named as
-	// missing; the Step 4 ACK-GATE-PASS bump (`arq_responder.cc:1029-1037`)
-	// is preserved for the clean-batch (no-loss) case.
-	//
-	// Invariants honored:
-	//   • §4.3.4 #1: still one outstanding batch (data_ack_received gate
-	//     unchanged); CMD must finish retransmits for batch N before next.
-	//   • §4.3.4 #2: monotonic +1 mod 256, never reset.
-	//   • §4.3.4 #3: no silent corruption — match-prev now routes to its OWN
-	//     storage; the previous Step 4 path (which routed match-prev hits
-	//     into `messages_rx[]` and would have overwritten current-batch
-	//     slots in a future Step 8b mixed batch) is replaced.
-	//
-	// CMD remains mechanism (a) — standalone retransmit-only batches —
-	// throughout Step 8a. The new RSP storage path is exercised by those v2
-	// standalone retransmits (whose bsi will now match `prev`, not
-	// `current`, after this bump).
-	if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
-	{
-		// If a prev batch is still active when we bump again, it means CMD
-		// never finished filling the previous prev batch via retransmits.
-		// We must discard the stale prev to make room (it would otherwise
-		// corrupt subsequent prev-routing). Log + count for visibility.
-		if(rsp_prev_batch_active)
-		{
-			rsp_prev_batch_stale_count++;
-			printf("[RSP-V2-PREV-STALE] discarding incomplete prev batch_seq_id=%d "
-				"(received=%d/%d) — replacing with new prev_batch_seq_id=%d "
-				"(stale_count=%lld)\n",
-				rsp_prev_batch_seq_id, rsp_prev_batch_received_count,
-				rsp_prev_batch_expected_count,
-				rsp_current_expected_batch_seq_id, rsp_prev_batch_stale_count);
-			fflush(stdout);
-			// Clear stale prev slots before re-using the buffer.
-			for(int i=0; i<this->nMessages; i++)
-				messages_rx_prev[i].status = FREE;
-		}
-
-		// Determine expected count for the *new* prev (the batch we're
-		// about to seal). Mirror the EOB-or-data_batch_size inference used
-		// by `process_messages_acknowledging_data`'s rx_received counter.
-		int prev_expected = data_batch_size;
-		if(last_received_end_of_batch_seq >= 0)
-		{
-			int eob = last_received_end_of_batch_seq + 1;
-			if(eob < prev_expected) prev_expected = eob;
-		}
-		if(prev_expected < 1) prev_expected = 1;
-		if(prev_expected > this->nMessages) prev_expected = this->nMessages;
-
-		// Transfer (not copy) batch-N content from messages_rx → messages_rx_prev:
-		// memcpy the payload, copy the metadata, then free the source slot.
-		// We pre-count the post-transfer RECEIVED slots so prev-batch
-		// completion can detect "already complete on transfer" (which only
-		// happens if SACK fires at a moment where all expected slots happen
-		// to be RECEIVED but the ACK-GATE-PASS branch was preempted; under
-		// the normal SACK partial branch, rx_received < expected by
-		// construction, so received_count is strictly < expected_count here).
-		int xferred = 0;
-		int xferred_received = 0;
-		const int alloc_size = N_MAX / 8;
-		for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
-		{
-			messages_rx_prev[i].type   = messages_rx[i].type;
-			messages_rx_prev[i].id     = messages_rx[i].id;
-			messages_rx_prev[i].length = messages_rx[i].length;
-			messages_rx_prev[i].status = messages_rx[i].status;
-			messages_rx_prev[i].batch_seq_id = messages_rx[i].batch_seq_id;
-			if(messages_rx[i].length > 0 && messages_rx[i].length <= alloc_size)
-			{
-				memcpy(messages_rx_prev[i].data, messages_rx[i].data,
-					messages_rx[i].length);
-			}
-			if(messages_rx[i].status == RECEIVED) xferred_received++;
-			xferred++;
-			// Free the source slot so the current-batch (N+1) frames land
-			// into a clean messages_rx[].
-			messages_rx[i].status = FREE;
-			messages_rx[i].length = 0;
-			messages_rx[i].batch_seq_id = -1;
-		}
-		// Make sure prev slots beyond data_batch_size are FREE (defensive —
-		// they should already be).
-		for(int i=this->data_batch_size; i<this->nMessages; i++)
-		{
-			if(messages_rx_prev[i].status != FREE)
-				messages_rx_prev[i].status = FREE;
-		}
-
-		rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
-		rsp_current_expected_batch_seq_id =
-			(rsp_current_expected_batch_seq_id + 1) & 0xFF;
-		rsp_prev_batch_active            = true;
-		rsp_prev_batch_received_count    = xferred_received;
-		rsp_prev_batch_expected_count    = prev_expected;
-		printf("[RSP-V2-PREV-BUMP] prev_batch_seq_id=%d next_expected=%d "
-			"transferred=%d received_on_transfer=%d/%d (cross-storage routing armed)\n",
-			rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
-			xferred, rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
-		fflush(stdout);
-	}
+	// SACK Design A Step 8a — bsi-bump-and-prev-transfer was previously inlined
+	// here. As of fact-documents/sack_partial_bsi_advance.md §6g (2026-05-21),
+	// it has been hoisted into bump_bsi_and_transfer_prev() and is now invoked
+	// by callers BEFORE the transport-choice block at arq_responder.cc:~1181.
+	// This makes the invariant fire for the MFSK suffix branch too (which used
+	// to bypass send_sack_v2_frame() entirely via used_mfsk_path=true and
+	// thereby skip the bump-and-transfer). send_sack_v2_frame() is now a pure
+	// wire-transmit primitive — no bsi/prev side effects.
 
 	int bitmap_bytes = (nframes + 7) / 8;
 	int payload_len  = 1 /*batch_seq_id*/ + bitmap_bytes + 1 /*CRC8*/;
@@ -4310,6 +4334,168 @@ long long cl_arq_controller::send_ofdm_ack_clean(unsigned char batch_seq_id)
 	fflush(stdout);
 	SACK_TRACE("RSP TX OFDM_ACK_CLEAN done: wire_ms=%lld", elapsed_ms);
 	return elapsed_ms;
+}
+
+// Step 4 of MFSK-suffix ACK+SACK redesign — RSP-side TX wrapper.
+// Send the MFSK ACK+SACK pattern (16 base + 10 suffix = 26 symbols on WB)
+// carrying batch_seq_id and per-frame bitmap. Replaces OFDM_ACK_CLEAN
+// (clean batch: bitmap = all 1s) and SACK_RSP (partial batch: actual mask).
+//
+// Models send_ack_pattern_with_snr() for shape; uses the new
+// telecom_system->generate_ack_sack_pattern_passband() to produce the audio.
+//
+// WB-only — returns 0 if MFSK_ACK_SACK_ENABLED=0 at compile time, or if
+// the runtime mfsk M<16 (NB) so caller falls back to OFDM_ACK_CLEAN /
+// SACK_RSP. On WB, returns wall-clock TX time in ms.
+long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
+                                                uint32_t bitmap)
+{
+	if(passive_monitor) return 0;
+
+#if !MFSK_ACK_SACK_ENABLED
+	(void)batch_seq_id; (void)bitmap;
+	return 0;  // Feature compiled out — caller falls back to OFDM path.
+#else
+	// Runtime guard: NB session (M=8) has ack_sack_suffix_len()==0.
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+	int nsymb = telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
+	if(nsymb <= 0 || telecom_system->ack_sack_pattern_passband_samples <= 0)
+		return 0;
+
+	auto t_start = std::chrono::steady_clock::now();
+
+	printf("[TX-MFSK-ACK-SACK] batch_seq_id=%u bitmap=0x%08x nsymb=%d on CONFIG_%d\n",
+		(unsigned)batch_seq_id, (unsigned)bitmap, nsymb, current_configuration);
+	fflush(stdout);
+
+	// Guard delay for MFSK modes (same as send_ack_pattern_with_snr)
+	if(is_robust_config(current_configuration))
+	{
+		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
+		msleep(wait_ms);
+	}
+
+	ptt_on();
+
+	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
+	ptt_on_delay_timer.start();
+
+	int pattern_samples = telecom_system->ack_sack_pattern_passband_samples;
+	int symbol_period = telecom_system->data_container.Nofdm
+	                  * telecom_system->data_container.interpolation_rate;
+
+	// Allocate buffers: pattern + 1 symbol padding at each end for FIR filtering
+	int padded_size = pattern_samples + 2 * symbol_period;
+	double *raw_output = new double[padded_size];
+	double *filtered1  = new double[padded_size];
+	double *filtered2  = new double[padded_size];
+
+	if(!raw_output || !filtered1 || !filtered2) exit(-37);
+
+	memset(raw_output, 0, padded_size * sizeof(double));
+
+	// Generate ACK+SACK pattern passband into the middle section
+	telecom_system->generate_ack_sack_pattern_passband(&raw_output[symbol_period],
+		batch_seq_id, bitmap);
+
+	// Pad start and end with copies of first/last symbol for FIR boundary
+	memcpy(&raw_output[0], &raw_output[symbol_period],
+		symbol_period * sizeof(double));
+	memcpy(&raw_output[symbol_period + pattern_samples], &raw_output[pattern_samples],
+		symbol_period * sizeof(double));
+
+	// FIR filter chain (same as send_batch / send_ack_pattern_with_snr)
+	memset(filtered1, 0, padded_size * sizeof(double));
+	memset(filtered2, 0, padded_size * sizeof(double));
+	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
+	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
+
+	// Wait PTT on delay
+	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
+		msleep(1);
+
+	// Pilot tone (if enabled)
+	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
+	{
+		const double SAMPLE_RATE = 48000.0;
+		const double PILOT_FREQ  = (double)pilot_tone_hz;
+		const double PI = 3.14159265358979323846;
+		int pilot_samples = (int)(pilot_tone_ms * SAMPLE_RATE / 1000.0);
+		double* pilot_buffer = new double[pilot_samples];
+		for(int i = 0; i < pilot_samples; i++)
+		{
+			double t = (double)i / SAMPLE_RATE;
+			double envelope = 1.0;
+			int ramp_samples = (int)(SAMPLE_RATE * 0.005);
+			if(i < ramp_samples)
+				envelope = (double)i / ramp_samples;
+			else if(i > pilot_samples - ramp_samples)
+				envelope = (double)(pilot_samples - i) / ramp_samples;
+			pilot_buffer[i] = envelope * 0.5 * sin(2.0 * PI * PILOT_FREQ * t);
+		}
+		tx_transfer(pilot_buffer, pilot_samples);
+		delete[] pilot_buffer;
+	}
+
+	// Transmit the filtered ACK+SACK pattern (skip padding at start)
+	printf("[TX-MFSK-ACK-SACK] Audio start (%d samples)\n", pattern_samples);
+	fflush(stdout);
+	tx_transfer(&filtered2[symbol_period], pattern_samples);
+
+	// Wait for playback to drain
+	while(size_buffer(playback_buffer) > 0)
+		msleep(1);
+
+	printf("[TX-MFSK-ACK-SACK] Audio done\n");
+	fflush(stdout);
+
+	delete[] raw_output;
+	delete[] filtered1;
+	delete[] filtered2;
+
+	// Same flush sequence as send_ack_pattern / send_ack_pattern_with_snr
+	telecom_system->data_container.rx_mute = 1;
+	msleep(RX_MUTE_GUARD_MS);
+	circular_buf_reset(capture_buffer);
+	{
+		int buf_samples = telecom_system->data_container.Nofdm
+		                * telecom_system->data_container.buffer_Nsymb
+		                * telecom_system->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		memset(telecom_system->data_container.passband_delayed_data, 0,
+			2 * buf_samples * sizeof(double));
+		telecom_system->data_container.ring_write_index = 0;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+	telecom_system->data_container.rx_mute = 0;
+	telecom_system->data_container.rx_mute_samples = 0;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	{
+		int rx_frame = telecom_system->data_container.preamble_nSymb
+		             + telecom_system->data_container.Nsymb;
+		telecom_system->data_container.frames_to_read = rx_frame + 10;
+	}
+
+	printf("[TX-MFSK-ACK-SACK] Done, flushed capture buffer, ftr=%d\n",
+		telecom_system->data_container.frames_to_read.load());
+	fflush(stdout);
+
+	ptt_off_delay_timer.start();
+	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
+		msleep(1);
+
+	ptt_off();
+
+	auto t_end = std::chrono::steady_clock::now();
+	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		t_end - t_start).count();
+	return elapsed_ms;
+#endif  // MFSK_ACK_SACK_ENABLED
 }
 
 // §7.13.30 — Decode an OFDM_ACK_CLEAN frame. Caller has verified

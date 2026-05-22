@@ -306,6 +306,10 @@ int main(int argc, char *argv[])
     int test_policy_axis2_fire_cli = 0; // --test-policy-axis2-fire=up|down: SACK Design A Step 10 — synthetic Axis-2 trigger.
                                         // 0=off, 1=up (clean ring), 2=down (lossy ring). One-shot at startup, then exit.
                                         // Forces sack_v2_enabled=true so policy_evaluate_axis2() is taken.
+    const char* test_partial_bsi_advance_cli = NULL; // --test-partial-bsi-advance=mfsk|ofdm: SACK partial-path BSI non-advance reproducer.
+                                        // 'mfsk' should FAIL on HEAD (used_mfsk_path=true bypasses send_sack_v2_frame's Step 8a bump).
+                                        // 'ofdm' should PASS on HEAD (regression guard for the existing OFDM SACK_RSP path).
+                                        // One-shot at startup, then exit. See fact-documents/sack_partial_bsi_advance.md §5.
     int test_policy_axis1_then_axis2_cli = 0; // --test-policy-axis1-then-axis2=up|down: SACK Design A Step 10 — fire Axis-1
                                         // (engages axis2_cooldown_batches=3) then attempt Axis-2 fire (should be SUPPRESSED).
                                         // 1=axis1=up then axis2=up; 2=axis1=down then axis2=down. One-shot at startup, then exit.
@@ -679,6 +683,20 @@ int main(int argc, char *argv[])
             if (strcmp(arg, "up") == 0)        test_policy_axis2_fire_cli = 1;
             else if (strcmp(arg, "down") == 0) test_policy_axis2_fire_cli = 2;
             else { fprintf(stderr, "--test-policy-axis2-fire: expected 'up' or 'down'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-partial-bsi-advance=", 27) == 0)
+        {
+            // SACK partial-path BSI non-advance reproducer (one-shot at startup, then exit).
+            // See fact-documents/sack_partial_bsi_advance.md §5.3 / §5.4. The 'mfsk'
+            // variant exercises the bug (MFSK suffix bypass of send_sack_v2_frame's
+            // Step 8a bump); the 'ofdm' variant exercises the working OFDM path
+            // (regression guard).
+            const char* arg = argv[i] + 27;
+            if (strcmp(arg, "mfsk") == 0 || strcmp(arg, "ofdm") == 0)
+                test_partial_bsi_advance_cli = arg;
+            else { fprintf(stderr, "--test-partial-bsi-advance: expected 'mfsk' or 'ofdm'\n"); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1604,6 +1622,18 @@ start_modem:
             printf("[FLAG] Ceiling fire complete — exiting.\n");
             fflush(stdout);
             exit(0);
+        }
+        if (test_partial_bsi_advance_cli != NULL) {
+            // SACK partial-path BSI non-advance reproducer (one-shot, then exit).
+            // Returns 0 on PASS, 1 on FAIL. Exit code propagates so test
+            // harnesses can assert via shell.
+            printf("[FLAG] --test-partial-bsi-advance=%s: invoking synthetic "
+                   "partial-path BSI advance reproducer\n", test_partial_bsi_advance_cli);
+            fflush(stdout);
+            int rc = ARQ.test_partial_bsi_advance(test_partial_bsi_advance_cli);
+            printf("[FLAG] Partial-bsi-advance test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
         }
         if (test_policy_break_supremacy_cli != 0) {
             // SACK Design A Step 12 — synthetic BREAK supremacy fire (one-shot, then exit).

@@ -412,6 +412,18 @@ public:
   // bitmap[i] = true iff frame i of the batch was RECEIVED.
   long long send_sack_v2_frame(const bool* bitmap, int nframes,
                                unsigned char batch_seq_id);
+  // SACK Design A Step 8a — bsi-bump-and-transfer-prev helper, hoisted out of
+  // send_sack_v2_frame() so the invariant fires regardless of which transport
+  // (OFDM SACK_RSP or MFSK suffix ACK+SACK) carries the partial bitmap on the
+  // wire. Per fact-documents/sack_partial_bsi_advance.md §6g (verified
+  // 2026-05-21), the MFSK suffix branch at arq_responder.cc:1198-1204 used to
+  // set used_mfsk_path=true and bypass send_sack_v2_frame() entirely, leaving
+  // rsp_current_expected_batch_seq_id stuck on the partial's bsi. Callers must
+  // invoke this BEFORE choosing a transport so the bump runs unconditionally
+  // for any successful partial-SACK dispatch. Internally gated by
+  // (sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0); safe to call
+  // unconditionally.
+  void bump_bsi_and_transfer_prev();
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
   // receive() landed a frame with messages_rx_buffer.type == SACK_RSP. The
   // function:
@@ -435,6 +447,18 @@ public:
   // Validates CRC8. On success: writes batch_seq_id to *out_batch_seq_id,
   // returns true. On CRC fail: emits diagnostic, returns false.
   bool decode_ofdm_ack_clean(unsigned char* out_batch_seq_id);
+
+  // Step 4 of MFSK-suffix ACK+SACK redesign — RSP-side TX wrapper.
+  // Send the MFSK ACK+SACK pattern (16 base + 10 suffix = 26 symbols on WB)
+  // carrying batch_seq_id and per-frame bitmap. Replaces OFDM_ACK_CLEAN
+  // (clean batch: bitmap = all 1s) and SACK_RSP (partial batch: bitmap =
+  // actual mask). WB-only — caller must check ack_sack_suffix_len() > 0
+  // before calling (or this returns 0 and the caller should fall back to
+  // the OFDM path).
+  //
+  // Returns wall-clock TX time in ms, or 0 if the feature is unavailable
+  // (NB session, M < 16, or compile-time gate MFSK_ACK_SACK_ENABLED=0).
+  long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap);
 
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
@@ -554,6 +578,19 @@ public:
   // integration AND that 3 subsequent Axis-2 evaluations are suppressed.
   // Default builds never call this.
   void test_fire_policy_break_supremacy();
+
+  // SACK Partial-Path BSI Non-Advance — in-process reproducer (test-only).
+  // CLI: --test-partial-bsi-advance=mfsk|ofdm. Reproduces the bug in
+  // fact-documents/sack_partial_bsi_advance.md §5.3 / §5.4: the MFSK
+  // suffix ACK+SACK path bypasses send_sack_v2_frame() at
+  // arq_responder.cc:1213, skipping Step 8a's bsi-bump-and-transfer-to-prev
+  // block (arq_common.cc:4054-4137). When a mixbatch (retx-of-old-bsi +
+  // new-bsi frames at a larger data_batch_size) arrives next, every
+  // new-bsi frame is dropped as out_of_window.
+  // 'mfsk' variant: should FAIL on HEAD (drop_count >= 26 for bsi=4).
+  // 'ofdm' variant: should PASS on HEAD (regression guard).
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  int test_partial_bsi_advance(const char* transport);
 
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //

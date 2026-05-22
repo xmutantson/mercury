@@ -2054,6 +2054,148 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				memset(sack_bitmap, 0, sizeof(sack_bitmap));
 				if(sack_v2_enabled && axis3_sack_mode != SACK_MODE_OFF)
 				{
+					// Step 6 of MFSK-suffix ACK+SACK redesign — CMD-side MFSK probe.
+					// Before the OFDM dispatch below, sniff the passband tail for an
+					// MFSK ACK pattern + 10-symbol SACK suffix carrying (batch_seq_id,
+					// 32-bit bitmap). On a clean decode we short-circuit straight to
+					// the same downstream handlers that OFDM_ACK_CLEAN / SACK_RSP feed
+					// (v2_ack_pat_pre_detected flag for clean, sack_detected flag for
+					// partial). On miss we fall through to the existing OFDM path
+					// untouched. Gated on:
+					//   - MFSK_ACK_SACK_ENABLED  (compile-time master switch)
+					//   - ack_sack_suffix_len() > 0  (WB only; NB has M<16)
+					//   - optimizer_is_in_control()  (only inside the Q-table band so
+					//     we don't risk false-fires in the gearshift band where ACK
+					//     base-pattern margins haven't been characterized for the
+					//     +suffix capture path)
+					bool mfsk_handled_this_poll = false;
+#if MFSK_ACK_SACK_ENABLED
+					if(telecom_system->ack_mfsk.ack_sack_suffix_len() > 0
+					   && optimizer_is_in_control())
+					{
+						// Snapshot the passband tail — same window math as
+						// receive_ack_pattern() (arq_common.cc:4966-4983).
+						int ack_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
+						int pattern_len = telecom_system->ack_mfsk.ack_snr_pattern_nsymb();
+						// Suffix capture needs the longer of SNR vs SACK suffix tail.
+						int sack_suffix_len = telecom_system->ack_mfsk.ack_sack_suffix_len();
+						if(sack_suffix_len > pattern_len - ack_nsymb)
+							pattern_len = ack_nsymb + sack_suffix_len;
+						const int mfsk_tail_nsymb = ack_nsymb + pattern_len + 16;
+						int sym_samples = telecom_system->data_container.Nofdm
+						                * telecom_system->data_container.interpolation_rate;
+						int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+						int tail_samples = mfsk_tail_nsymb * sym_samples;
+						if(tail_samples > signal_period)
+							tail_samples = signal_period;
+						int tail_offset = signal_period - tail_samples;
+
+						// Take a read-only snapshot of the tail. We deliberately
+						// do NOT touch frames_to_read here — the v2 OFDM dispatch
+						// below owns audio-advance bookkeeping; the MFSK probe is
+						// a no-side-effect peek into the same ring window.
+						MUTEX_LOCK(&capture_prep_mutex);
+						int rwi_mfsk = telecom_system->data_container.ring_write_index;
+						memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+							&telecom_system->data_container.passband_delayed_data[rwi_mfsk + tail_offset],
+							tail_samples * sizeof(double));
+						MUTEX_UNLOCK(&capture_prep_mutex);
+
+						uint8_t  rx_bsi = 0;
+						uint32_t rx_bitmap = 0;
+						int      mfsk_matched = 0;
+						bool decoded = telecom_system->decode_ack_sack_from_passband(
+							telecom_system->data_container.ready_to_process_passband_delayed_data,
+							tail_samples, &rx_bsi, &rx_bitmap, &mfsk_matched);
+
+						if(decoded)
+						{
+							// Sanity 1: bsi must be the current or just-prior
+							// batch (mod 256). RSP only ACKs frames whose
+							// batch_seq_id matches one of those.
+							unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
+							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+							bool bsi_in_window =
+								((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+							// Sanity 2: bitmap=0 means "received nothing" — RSP
+							// never sends a SACK in that case (no batch_started),
+							// so treat as a false decode.
+							bool bitmap_ok = (rx_bitmap != 0u);
+							// Sanity 3: dedupe vs the last SACK we already applied
+							// (mirrors the OFDM SACK_RSP duplicate guard at ~2141).
+							bool duplicate = ((int)rx_bsi == cmd_last_applied_sack_bsi);
+
+							if(bsi_in_window && bitmap_ok && !duplicate)
+							{
+								uint32_t all_ones = (data_batch_size >= 32)
+									? 0xFFFFFFFFu
+									: ((1u << data_batch_size) - 1u);
+								if(rx_bitmap == all_ones)
+								{
+									// CLEAN BATCH — mirror OFDM_ACK_CLEAN handler
+									// (~line 2178). Only state change there is
+									// setting v2_ack_pat_pre_detected = true; the
+									// fallthrough ACK_PAT block at ~line 2359
+									// owns register_ack(), stats, opt_record_batch,
+									// policy_evaluate_axis2, axis3_batch_tick, etc.
+									v2_ack_pat_pre_detected = true;
+									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+									printf("[CMD-MFSK-ACK-SACK] CLEAN batch_seq_id=%u (cmd_batch_seq_id=%d) "
+										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
+										(unsigned)rx_bsi, cmd_batch_seq_id,
+										(unsigned)rx_bitmap, mfsk_matched, arrival_ms);
+									fflush(stdout);
+									mfsk_handled_this_poll = true;
+								}
+								else
+								{
+									// PARTIAL BATCH — mirror OFDM SACK_RSP handler
+									// (~line 2131). Populate sack_bitmap from the
+									// 32-bit bitmap, set sack_detected, record
+									// arrival history, dedupe state, axis3 ok event.
+									// The big block at ~line 2198 (if(sack_detected))
+									// handles retransmit queue / stats / Axis-2
+									// state from there.
+									for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
+										sack_bitmap[i] = ((rx_bitmap >> i) & 1u) ? true : false;
+									sack_detected = true;
+									cmd_last_applied_sack_bsi = (int)rx_bsi;
+									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+									sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
+									sack_arrival_history_next_idx =
+										(sack_arrival_history_next_idx + 1) % SACK_ARRIVAL_HISTORY;
+									if(sack_arrival_history_count < SACK_ARRIVAL_HISTORY)
+										sack_arrival_history_count++;
+									printf("[CMD-MFSK-ACK-SACK] PARTIAL batch_seq_id=%u (cmd_batch_seq_id=%d) "
+										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
+										(unsigned)rx_bsi, cmd_batch_seq_id,
+										(unsigned)rx_bitmap, mfsk_matched, arrival_ms);
+									fflush(stdout);
+									policy_evaluate_axis3(true);
+									mfsk_handled_this_poll = true;
+								}
+							}
+							else
+							{
+								// Decoded suffix bits but they failed sanity —
+								// log it and fall through to OFDM so we don't
+								// silently drop a real ACK arriving via the
+								// OFDM path on the same poll.
+								SACK_TRACE("MFSK-ACK-SACK decoded but rejected: "
+									"rx_bsi=%u cmd_bsi=%u prev_bsi=%u bitmap=0x%08x "
+									"in_window=%d bitmap_ok=%d duplicate=%d",
+									(unsigned)rx_bsi, cmd_bsi, prev_bsi,
+									(unsigned)rx_bitmap,
+									bsi_in_window ? 1 : 0,
+									bitmap_ok ? 1 : 0,
+									duplicate ? 1 : 0);
+							}
+						}
+					}
+#endif // MFSK_ACK_SACK_ENABLED
+
+					if(!mfsk_handled_this_poll)
+					{
 					// §7.13.30 — pure OFDM dispatch. v2 sessions never send
 					// MFSK ACK in the SACK window (RSP uses OFDM_ACK_CLEAN
 					// for clean batches and SACK_RSP for partial). CMD only
@@ -2188,6 +2330,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						}
 						messages_rx_buffer.status = FREE;
 					}
+					} // end if(!mfsk_handled_this_poll) — Step 6 MFSK probe gate
 				}
 				// Step 15: legacy MFSK SACK receive path deleted. When
 				// !sack_v2_enabled we simply don't attempt a partial-batch

@@ -222,58 +222,42 @@ cl_rate_optimizer::cl_rate_optimizer()
     , eval_count(0)
     , min_cfg_calibrated(-1)
     , max_sack_calibrated(-1.0)
+    , min_cfg_calibrated_nb(-1)
+    , max_sack_calibrated_nb(-1.0)
+    , nb_enabled(false)
+    , n_configs_loaded_nb(0)
+    , n_channels_loaded_nb(0)
 {}
 
-bool cl_rate_optimizer::load(const char* path) {
-    enabled = false;
-    table.clear();
-    channel_axis.clear();
-    n_configs_loaded = 0;
-    n_channels_loaded = 0;
-    min_cfg_calibrated = -1;
-    max_sack_calibrated = -1.0;
+// Parse a "table" or "table_nb" section. Shared between WB and NB load
+// so the per-section logic stays in one place. Returns count of valid
+// cells parsed.
+int cl_rate_optimizer::parse_table_section(
+        const std::string& body,
+        size_t section_pos,
+        std::map<int, std::map<std::string, st_rate_cell> >& out_table,
+        std::vector<std::pair<std::string, double> >& out_axis,
+        int& out_min_cfg,
+        double& out_max_sack,
+        int& out_n_configs,
+        int& out_n_channels)
+{
+    out_table.clear();
+    out_axis.clear();
+    out_min_cfg = -1;
+    out_max_sack = -1.0;
+    out_n_configs = 0;
+    out_n_channels = 0;
 
-    if (path == NULL || path[0] == '\0') {
-        printf("[OPT] table not found, optimizer disabled (null path)\n");
-        fflush(stdout);
-        return false;
-    }
-    std::ifstream f(path);
-    if (!f.is_open()) {
-        printf("[OPT] table not found, optimizer disabled (path=%s)\n", path);
-        fflush(stdout);
-        return false;
-    }
-    std::stringstream ss;
-    ss << f.rdbuf();
-    std::string raw = ss.str();
-    if (raw.empty()) {
-        printf("[OPT] table empty, optimizer disabled (path=%s)\n", path);
-        fflush(stdout);
-        return false;
-    }
-    std::string body = strip_comments(raw);
-
-    // Locate `"table"`.
-    size_t table_v = find_key_value_pos(body, 0, "table");
-    if (table_v == std::string::npos || table_v >= body.size() || body[table_v] != '{') {
-        printf("[OPT] table parse failed (no `table` object), optimizer disabled\n");
-        fflush(stdout);
-        return false;
-    }
-
-    // Track per-channel cumulative sack-rate sum + count for channel_axis.
     std::map<std::string, std::pair<double, int> > channel_sack_accum;
-
-    int parsed_cells = 0;
     int valid_cells = 0;
 
-    for_each_object_key(body, table_v, [&](const std::string& cfg_key, size_t cfg_v) {
+    for_each_object_key(body, section_pos, [&](const std::string& cfg_key, size_t cfg_v) {
         if (cfg_v >= body.size() || body[cfg_v] != '{') return;
         int cfg_id = std::atoi(cfg_key.c_str());
         if (cfg_id < 0) return;
 
-        std::map<std::string, st_rate_cell>& channels = table[cfg_id];
+        std::map<std::string, st_rate_cell>& channels = out_table[cfg_id];
 
         for_each_object_key(body, cfg_v, [&](const std::string& ch_key, size_t ch_v) {
             if (ch_v >= body.size() || body[ch_v] != '{') return;
@@ -298,18 +282,8 @@ bool cl_rate_optimizer::load(const char* path) {
                     size_t end;
                     break_flag = (parse_number_or_bool(body, field_v, &end) > 0.5);
                 }
-                // Ignore everything else (eff_bps_min/max/sigma/n_failed_runs/
-                // runs[], etc.) — forward-compatible.
             });
 
-            ++parsed_cells;
-
-            // A cell is valid iff:
-            //  - eff_bps_mean > 0
-            //  - failed != true
-            //  - break_fired != true
-            // n_runs == 0 is also disqualifying because eff_bps_mean is then
-            // necessarily 0; but we don't require n_runs explicitly.
             cell.valid = (cell.eff_bps_mean > 0.0)
                         && !failed_flag && !break_flag && (n_runs >= 0);
             channels[ch_key] = cell;
@@ -322,59 +296,125 @@ bool cl_rate_optimizer::load(const char* path) {
         });
     });
 
-    n_configs_loaded = (int)table.size();
-    // Build channel_axis. Each entry = mean of sack_rate_mean across valid
-    // cells in that channel bucket. Kept for diagnostic/fallback only; the
-    // primary lookup is now per-config in identify_channel_label().
+    out_n_configs = (int)out_table.size();
     for (std::map<std::string, std::pair<double, int> >::const_iterator
             it = channel_sack_accum.begin(); it != channel_sack_accum.end(); ++it) {
         if (it->second.second > 0) {
             double mean_sack = it->second.first / (double)it->second.second;
-            channel_axis.push_back(std::make_pair(it->first, mean_sack));
+            out_axis.push_back(std::make_pair(it->first, mean_sack));
         }
     }
-    // Sort by ascending sack_rate so we can pick the nearest bucket easily.
-    std::sort(channel_axis.begin(), channel_axis.end(),
+    std::sort(out_axis.begin(), out_axis.end(),
               [](const std::pair<std::string,double>& a,
                  const std::pair<std::string,double>& b){
                   return a.second < b.second;
               });
-    n_channels_loaded = (int)channel_axis.size();
+    out_n_channels = (int)out_axis.size();
 
-    if (valid_cells == 0 || n_configs_loaded == 0 || n_channels_loaded == 0) {
-        printf("[OPT] table parsed but no valid cells, optimizer disabled "
-               "(parsed=%d valid=%d configs=%d channels=%d)\n",
-               parsed_cells, valid_cells, n_configs_loaded, n_channels_loaded);
-        fflush(stdout);
-        return false;
-    }
-
-    // Populate below-table-range gate inputs.
-    //  - min_cfg_calibrated: lowest cfg id with at least one valid cell.
-    //  - max_sack_calibrated: largest sack_rate_mean across all valid cells.
-    // Caller (opt_evaluate_batch_end in arq_common.cc) checks these against
-    // current state to decide whether the optimizer is in its operating region.
-    min_cfg_calibrated  = -1;
-    max_sack_calibrated = 0.0;
+    // Min cfg + max sack across valid cells.
+    out_min_cfg = -1;
+    out_max_sack = 0.0;
     for (std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
-            cit = table.begin(); cit != table.end(); ++cit) {
+            cit = out_table.begin(); cit != out_table.end(); ++cit) {
         bool any_valid = false;
         for (std::map<std::string, st_rate_cell>::const_iterator
                 jt = cit->second.begin(); jt != cit->second.end(); ++jt) {
             if (!jt->second.valid) continue;
             any_valid = true;
-            if (jt->second.sack_rate_mean > max_sack_calibrated)
-                max_sack_calibrated = jt->second.sack_rate_mean;
+            if (jt->second.sack_rate_mean > out_max_sack)
+                out_max_sack = jt->second.sack_rate_mean;
         }
-        if (any_valid && (min_cfg_calibrated < 0 || cit->first < min_cfg_calibrated))
-            min_cfg_calibrated = cit->first;
+        if (any_valid && (out_min_cfg < 0 || cit->first < out_min_cfg))
+            out_min_cfg = cit->first;
+    }
+    return valid_cells;
+}
+
+bool cl_rate_optimizer::load(const char* path) {
+    enabled = false;
+    nb_enabled = false;
+    table.clear();
+    table_nb.clear();
+    channel_axis.clear();
+    channel_axis_nb.clear();
+    n_configs_loaded = 0;
+    n_channels_loaded = 0;
+    n_configs_loaded_nb = 0;
+    n_channels_loaded_nb = 0;
+    min_cfg_calibrated = -1;
+    max_sack_calibrated = -1.0;
+    min_cfg_calibrated_nb = -1;
+    max_sack_calibrated_nb = -1.0;
+
+    if (path == NULL || path[0] == '\0') {
+        printf("[OPT] table not found, optimizer disabled (null path)\n");
+        fflush(stdout);
+        return false;
+    }
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        printf("[OPT] table not found, optimizer disabled (path=%s)\n", path);
+        fflush(stdout);
+        return false;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string raw = ss.str();
+    if (raw.empty()) {
+        printf("[OPT] table empty, optimizer disabled (path=%s)\n", path);
+        fflush(stdout);
+        return false;
+    }
+    std::string body = strip_comments(raw);
+
+    // Parse WB section ("table").
+    size_t table_v = find_key_value_pos(body, 0, "table");
+    if (table_v == std::string::npos || table_v >= body.size() || body[table_v] != '{') {
+        printf("[OPT] table parse failed (no `table` object), optimizer disabled\n");
+        fflush(stdout);
+        return false;
+    }
+    int valid_wb = parse_table_section(body, table_v,
+                                       table, channel_axis,
+                                       min_cfg_calibrated, max_sack_calibrated,
+                                       n_configs_loaded, n_channels_loaded);
+
+    if (valid_wb == 0 || n_configs_loaded == 0 || n_channels_loaded == 0) {
+        printf("[OPT] table parsed but no valid cells, optimizer disabled "
+               "(WB valid=%d configs=%d channels=%d)\n",
+               valid_wb, n_configs_loaded, n_channels_loaded);
+        fflush(stdout);
+        return false;
+    }
+
+    // Parse optional NB section ("table_nb"). Absent is fine — NB sessions
+    // get silent-no-op optimizer behavior (correct fallback to gearshift).
+    int valid_nb = 0;
+    size_t table_nb_v = find_key_value_pos(body, 0, "table_nb");
+    if (table_nb_v != std::string::npos && table_nb_v < body.size()
+        && body[table_nb_v] == '{')
+    {
+        valid_nb = parse_table_section(body, table_nb_v,
+                                       table_nb, channel_axis_nb,
+                                       min_cfg_calibrated_nb, max_sack_calibrated_nb,
+                                       n_configs_loaded_nb, n_channels_loaded_nb);
+        nb_enabled = (valid_nb > 0 && n_configs_loaded_nb > 0
+                      && n_channels_loaded_nb > 0);
     }
 
     enabled = true;
-    printf("[OPT] table loaded: %d configs x %d channels (valid_cells=%d, "
+    printf("[OPT] WB table loaded: %d configs x %d channels (valid_cells=%d, "
            "min_cfg=%d, max_sack=%.3f, path=%s)\n",
-           n_configs_loaded, n_channels_loaded, valid_cells,
+           n_configs_loaded, n_channels_loaded, valid_wb,
            min_cfg_calibrated, max_sack_calibrated, path);
+    if (nb_enabled) {
+        printf("[OPT] NB table loaded: %d configs x %d channels (valid_cells=%d, "
+               "min_cfg=%d, max_sack=%.3f)\n",
+               n_configs_loaded_nb, n_channels_loaded_nb, valid_nb,
+               min_cfg_calibrated_nb, max_sack_calibrated_nb);
+    } else {
+        printf("[OPT] NB table absent — optimizer will be silent on NB sessions\n");
+    }
     fflush(stdout);
     return true;
 }
@@ -388,10 +428,13 @@ void cl_rate_optimizer::reset_session_state() {
     eval_count = 0;
 }
 
-const st_rate_cell* cl_rate_optimizer::get_cell(int cfg, const std::string& bucket) const {
+const st_rate_cell* cl_rate_optimizer::get_cell(int cfg, const std::string& bucket,
+                                                 bool is_nb) const {
+    const std::map<int, std::map<std::string, st_rate_cell> >& active_table =
+        is_nb ? table_nb : table;
     std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
-        it = table.find(cfg);
-    if (it == table.end()) return NULL;
+        it = active_table.find(cfg);
+    if (it == active_table.end()) return NULL;
     std::map<std::string, st_rate_cell>::const_iterator
         jt = it->second.find(bucket);
     if (jt == it->second.end()) return NULL;
@@ -415,16 +458,19 @@ const st_rate_cell* cl_rate_optimizer::get_cell(int cfg, const std::string& buck
 // on a robust config), so eff_bps disambiguates which we're actually in.
 std::string cl_rate_optimizer::identify_channel_label(int current_cfg,
                                                       double current_sack_rate,
-                                                      double current_eff_bps) const {
+                                                      double current_eff_bps,
+                                                      bool is_nb) const {
     // H1: defensive — non-finite observations come from upstream bugs.
     // Returning "" forces the channel_axis fallback in evaluate(), which is
     // less precise but safe.
     if (!std::isfinite(current_sack_rate) || !std::isfinite(current_eff_bps))
         return "";
 
+    const std::map<int, std::map<std::string, st_rate_cell> >& active_table =
+        is_nb ? table_nb : table;
     std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
-        cit = table.find(current_cfg);
-    if (cit == table.end()) return "";
+        cit = active_table.find(current_cfg);
+    if (cit == active_table.end()) return "";
     const std::map<std::string, st_rate_cell>& row = cit->second;
     if (row.empty()) return "";
 
@@ -467,11 +513,15 @@ int cl_rate_optimizer::evaluate(int current_cfg,
                                 double current_eff_bps,
                                 double current_sack_rate,
                                 int window_count,
-                                int wb_config_max) {
+                                int config_ceiling,
+                                bool is_nb) {
     ++eval_count;
 
     // Hard kill: table missing → caller stays put.
     if (!enabled) return current_cfg;
+    // NB session but no NB table → caller stays put (silent fallback to
+    // gearshift). WB session always has a valid table since enabled=true.
+    if (is_nb && !nb_enabled) return current_cfg;
     // Cooldown active → caller stays put. Don't even log to keep the
     // diagnostic stream sparse.
     if (cooldown_remaining > 0) return current_cfg;
@@ -479,10 +529,15 @@ int cl_rate_optimizer::evaluate(int current_cfg,
     // §4.3 statistical-confidence floor.
     if (window_count < 10) return current_cfg;
 
-    // Optimizer only operates on WB OFDM ladder. ROBUST_X (>=100) and any
+    // Optimizer only operates on OFDM ladder. ROBUST_X (>=100) and any
     // out-of-range value short-circuits — gearshift owns those transitions.
     // (Caller also enforces this gate; double-check for safety.)
-    if (current_cfg < 0 || current_cfg > wb_config_max) return current_cfg;
+    if (current_cfg < 0 || current_cfg > config_ceiling) return current_cfg;
+
+    // Pick the active channel_axis (used for fallback when current_cfg has
+    // no table row).
+    const std::vector<std::pair<std::string, double> >& active_axis =
+        is_nb ? channel_axis_nb : channel_axis;
 
     // Identify the channel label that matches our current observations at
     // the current config. The table is a 2D surface (config × label);
@@ -491,22 +546,23 @@ int cl_rate_optimizer::evaluate(int current_cfg,
     // fall back to nearest channel bucket using config-agnostic axis.
     std::string current_label = identify_channel_label(current_cfg,
                                                        current_sack_rate,
-                                                       current_eff_bps);
+                                                       current_eff_bps,
+                                                       is_nb);
     if (current_label.empty()) {
         // Fallback: nearest bucket on the cross-config mean axis. Less
         // accurate but better than refusing to act.
-        if (channel_axis.empty()) return current_cfg;
+        if (active_axis.empty()) return current_cfg;
         double best_d = 1e9;
-        for (size_t i = 0; i < channel_axis.size(); ++i) {
-            double d = std::fabs(channel_axis[i].second - current_sack_rate);
-            if (d < best_d) { best_d = d; current_label = channel_axis[i].first; }
+        for (size_t i = 0; i < active_axis.size(); ++i) {
+            double d = std::fabs(active_axis[i].second - current_sack_rate);
+            if (d < best_d) { best_d = d; current_label = active_axis[i].first; }
         }
         if (current_label.empty()) return current_cfg;
     }
 
     // Score "stay". Use the table's measured value at (current_cfg, label)
     // if available; otherwise use the live measurement.
-    const st_rate_cell* stay_cell = get_cell(current_cfg, current_label);
+    const st_rate_cell* stay_cell = get_cell(current_cfg, current_label, is_nb);
     double stay_score = (stay_cell && stay_cell->valid)
                        ? stay_cell->eff_bps_mean
                        : current_eff_bps;
@@ -541,13 +597,15 @@ int cl_rate_optimizer::evaluate(int current_cfg,
     int    best_target_seen       = current_cfg;
     double best_target_score_seen = stay_score;
 
+    const std::map<int, std::map<std::string, st_rate_cell> >& active_table =
+        is_nb ? table_nb : table;
     for (std::map<int, std::map<std::string, st_rate_cell> >::const_iterator
-            cit = table.begin(); cit != table.end(); ++cit) {
+            cit = active_table.begin(); cit != active_table.end(); ++cit) {
         int cand = cit->first;
         if (cand == current_cfg) continue;
-        if (cand < 0 || cand > wb_config_max) continue;
+        if (cand < 0 || cand > config_ceiling) continue;
 
-        const st_rate_cell* cand_cell = get_cell(cand, current_label);
+        const st_rate_cell* cand_cell = get_cell(cand, current_label, is_nb);
         if (!cand_cell || !cand_cell->valid) continue;
 
         double cand_score = cand_cell->eff_bps_mean - cost_penalty_bps;
@@ -586,19 +644,21 @@ int cl_rate_optimizer::evaluate(int current_cfg,
     }
 
     // Diag — emit one line per fire. Include the best-candidate-seen even
-    // if we decided to stay, for offline trace analysis.
+    // if we decided to stay, for offline trace analysis. nb flag included
+    // so post-hoc log analysis can distinguish WB vs NB decisions.
+    const char* bw_tag = is_nb ? " nb=1" : "";
     if (best_target_seen != current_cfg) {
         if (chosen_cfg != current_cfg) {
             printf("[OPT-EVAL] eff=%.0f sack=%.2f curr_cfg=%d -> recommend=%d "
-                   "(gain=%.1f%%) label=%s\n",
+                   "(gain=%.1f%%) label=%s%s\n",
                    current_eff_bps, current_sack_rate, current_cfg, chosen_cfg,
-                   gain_pct, current_label.c_str());
+                   gain_pct, current_label.c_str(), bw_tag);
         } else {
             printf("[OPT-EVAL] eff=%.0f sack=%.2f curr_cfg=%d -> stay (best_cand=%d "
-                   "gain=%.1f%% skip=%s) label=%s\n",
+                   "gain=%.1f%% skip=%s) label=%s%s\n",
                    current_eff_bps, current_sack_rate, current_cfg, best_target_seen,
                    gain_pct, skip_reason ? skip_reason : "n/a",
-                   current_label.c_str());
+                   current_label.c_str(), bw_tag);
         }
         fflush(stdout);
     }

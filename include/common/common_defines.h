@@ -25,6 +25,16 @@
 
 #define VERSION__ "0.4.2"
 
+// Compile-time gate for the MFSK-suffix ACK+SACK signaling (WB-only).
+// When 1, RSP sends ACK/SACK via extended MFSK pattern (40-bit suffix:
+// 8-bit batch_seq_id + 32-bit frame bitmap) and CMD listens for it.
+// When 0, falls back to OFDM_ACK_CLEAN / SACK_RSP (legacy path).
+// Both peers MUST agree (deployed together) since there's no runtime
+// capability negotiation yet. Set to 0 to disable without code rollback.
+#ifndef MFSK_ACK_SACK_ENABLED
+#define MFSK_ACK_SACK_ENABLED 1
+#endif
+
 // Verbose debug output (0=quiet, 1=debug prints enabled). Set via -v flag.
 extern int g_verbose;
 
@@ -278,8 +288,13 @@ CONFIG_16 (5664.7 bps).
 // #define NO_GEAR_SHIFT_SNR 3
 
 // SNR-based supershift margin: subtract this from measured SNR before config lookup.
-// Lands ~2 configs below the edge for reliable first probe; slow ladder closes the gap.
-#define SUPERSHIFT_MARGIN_DB 3.0
+// Lands ~2-3 configs below the edge so the effective-rate optimizer (Q-table)
+// has room to ratchet UP to the actual best config from a known-working start.
+// Was 3.0 dB (lands at the cliff edge) — caused SUPERSHIFT to plant us at
+// CFG16 in conditions where CFG16 reliably cliffs (e.g., wgn18-22), triggering
+// BREAK and a fall-back-then-climb cycle. The optimizer now corrects the
+// conservatism upward on the first batch close. Raised to 6.0 dB.
+#define SUPERSHIFT_MARGIN_DB 6.0
 
 // Re-trigger supershift if measured SNR suggests we're this many configs below optimal.
 // Checked after each ladder gearshift SET_CONFIG success (fresh OFDM SNR available).
