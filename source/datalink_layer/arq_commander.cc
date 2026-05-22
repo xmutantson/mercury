@@ -1304,23 +1304,45 @@ void cl_arq_controller::process_messages_tx_data()
 					messages_tx[last_new_data_messages_tx_idx].sequence_number |= 0x80;
 			}
 		}
+		else if(!sack_v2_enabled)
+		{
+			// v1 only: pad to full data_batch_size. The legacy ACK_MULTI
+			// bitmap path assumed every batch carries exactly data_batch_size
+			// frames. v2 uses the EOB bit on the last frame plus
+			// last_received_end_of_batch_seq on the RX side to derive the
+			// real effective batch size, so v2 does not need padding.
+			pad_messages_batch_tx(data_batch_size);
+		}
 		else
 		{
-			// v1 / v2 non-mixed: pad to full data_batch_size. The v2 mixed
-			// path skips padding because sequence_numbers are pre-assigned
-			// explicitly and pad_messages_batch_tx duplicates frames with
-			// re-assigned ids — that would clobber the retx-id mapping
-			// (which must remain at the original prev-batch slot positions).
-			pad_messages_batch_tx(data_batch_size);
-			// §7.13.39 Fix 3 — v2 non-mixed path: send_batch() will set EOB
-			// on messages_batch_tx[last_idx].sequence_number but won't touch
-			// messages_tx. Mirror the EOB bit to messages_tx[last_new_data]
-			// so a later SACK_RSP capture preserves the EOB marker.
-			if(sack_v2_enabled && last_new_data_messages_tx_idx >= 0)
+			// v2 non-mixed: do NOT pad. Padded frames are wire-duplicates of
+			// earlier slots with new (unique) slot ids — when a padded slot is
+			// lost on the wire, the SACK_RSP bitmap reports it missing, but
+			// messages_tx[padded_id] holds init values (length=0, bsi=-1) so
+			// retx capture can't recover real bytes. With the 76f6185 padded-
+			// slot guard the retx is skipped, but then prev_batch_received
+			// stays below expected forever — RX never decompresses the prev
+			// batch, the streaming PPMd model on RX falls one batch behind
+			// the TX model, and every subsequent batch's decompress fails.
+			// Skipping padding entirely fixes this by ensuring every
+			// transmitted slot maps to a real messages_tx entry.
+			//
+			// EOB / batch-size signalling: send_batch at arq_common.cc:3336-3338
+			// sets EOB bit on messages_batch_tx[message_batch_counter_tx - 1]
+			// (the actual last new-data frame), and last_received_end_of_batch_seq
+			// on the RX side resolves effective_batch from the EOB-bearing
+			// frame's sequence_number, not from data_batch_size. Verified
+			// safe via arq_responder.cc:599-604 + 1163-1170.
+			//
+			// §7.13.39 Fix 3 — mirror EOB bit to messages_tx so a later
+			// SACK_RSP capture preserves the EOB marker on the retx queue
+			// entry for this slot.
+			if(last_new_data_messages_tx_idx >= 0)
 			{
 				int last_idx = message_batch_counter_tx - 1;
-				if((messages_batch_tx[last_idx].type == DATA_LONG
-				    || messages_batch_tx[last_idx].type == DATA_SHORT))
+				if(last_idx >= 0
+				   && (messages_batch_tx[last_idx].type == DATA_LONG
+				       || messages_batch_tx[last_idx].type == DATA_SHORT))
 				{
 					messages_tx[last_new_data_messages_tx_idx].sequence_number |= 0x80;
 				}
