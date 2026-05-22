@@ -1813,6 +1813,18 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		double mean_H = -1.0;
 		bool skip_h_recovery_attempted = false;
 		int consecutive_skip_var = 0;  // Phase-F stall fix: break trial loop if N+ SKIP-VAR in a row
+		// v2 OFDM sub-peak recovery (additive to the v1 reject at ~line 2310-2331).
+		// v1 catches sub-peaks with mean_H<0.5. v2 catches the residual case where
+		// a sub-peak lands ~1 OFDM-symbol off the real preamble: enough real-preamble
+		// signal leaks into the channel estimate that mean_H~0.5-1.0 survives, but
+		// the decoded data is byte-misaligned and LDPC burns to the iter cap.
+		// Strategy: on LDPC fail with high coarse_metric AND high mean_H AND iter cap,
+		// rewind to the data-FIR entry point and re-decode at delay ± 1 OFDM symbol.
+		// State persists across trial-loop iterations so the recovery attempts are
+		// counted (max 2: +sym then -sym), not re-armed every trial.
+		int subpeak_recover_phase = 0;     // 0=not started, 1=tried +sym, 2=tried -sym
+		int subpeak_orig_delay = -1;       // delay at which v2 was first armed (full-rate samples)
+		bool subpeak_recover_in_flight = false; // true between goto-back and next LDPC verdict
 		// §7.13.29 (Proposal B) — SACK_RSP cross-check pays more trials so the
 		// search escapes Schmidl-Cox sub-peak false locks. Default 2 stays for
 		// normal data RX where extra trials waste CPU on real LDPC failures.
@@ -2089,6 +2101,7 @@ skip_h_retry_point:
 				}
 			}
 
+		ofdm_subpeak_retry_point:
 			// Use corrected carrier frequency if coarse sync applied
 			double effective_carrier_freq = carrier_frequency + coarse_freq_offset;
 
@@ -2548,6 +2561,44 @@ skip_h_retry_point:
 						mean_H, coarse_freq_offset, receive_stats.crc);
 					fflush(stdout);
 				}
+				// v2 OFDM sub-peak recovery: LDPC failed at the iteration cap
+				// despite coarse_metric saturating (sub-peak fingerprint) and
+				// mean_H surviving the v1 reject (≥ 0.5). Sub-peaks on Schmidl-
+				// Cox autocorrelation land at OFDM-symbol-aligned offsets, so
+				// probe ±1 OFDM symbol before giving up. Cheaper than letting
+				// the partial-batch SACK-retx round-trip stall PPMd+zstd
+				// streaming decompression on the receiver. One-shot per frame:
+				// max 2 retries (+sym then -sym), then fall through.
+				if(M != MOD_MFSK
+					&& receive_stats.coarse_metric >= 0.97
+					&& mean_H >= 0.5
+					&& receive_stats.iterations_done > (ldpc.nIteration_max-1)
+					&& subpeak_recover_phase < 2)
+				{
+					int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
+					int buf_size_full = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+					int frame_size_full = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
+					int max_delay = buf_size_full - frame_size_full;
+					if(subpeak_recover_phase == 0)
+						subpeak_orig_delay = receive_stats.delay;
+					int candidate = (subpeak_recover_phase == 0)
+						? (subpeak_orig_delay + sym_samples)
+						: (subpeak_orig_delay - sym_samples);
+					if(candidate >= 0 && candidate <= max_delay)
+					{
+						subpeak_recover_phase++;
+						subpeak_recover_in_flight = true;
+						printf("[SUBPEAK-PROBE] phase=%d orig_delay=%d new_delay=%d metric=%.3f mean_H=%.3f iter=%d — retry ±1 OFDM sym\n",
+							subpeak_recover_phase, subpeak_orig_delay, candidate,
+							receive_stats.coarse_metric, mean_H, receive_stats.iterations_done);
+						fflush(stdout);
+						receive_stats.delay = candidate;
+						// Do NOT increment sync_trials: this is a re-do of the
+						// same trial at a shifted position, not a new search.
+						goto ofdm_subpeak_retry_point;
+					}
+				}
+				subpeak_recover_in_flight = false;
 				receive_stats.sync_trials++;
 			}
 			else
@@ -2610,7 +2661,20 @@ skip_h_retry_point:
 						freq_offset_measured, variance, mean_H,
 						receive_stats.SNR, coarse_freq_offset);
 					fflush(stdout);
+					// v2 OFDM sub-peak recovery success: log the save so we can
+					// measure v2's contribution to sack_rate / compression yield
+					// in post-deploy benchmarks. Counts the frames that v1 would
+					// have lost but v2 reclaimed without an SACK round-trip.
+					if(subpeak_recover_in_flight)
+					{
+						printf("[SUBPEAK-RECOVER] phase=%d orig_delay=%d saved_delay=%d shift=%+d iter=%d — frame reclaimed (no SACK retx needed)\n",
+							subpeak_recover_phase, subpeak_orig_delay,
+							receive_stats.delay, receive_stats.delay - subpeak_orig_delay,
+							receive_stats.iterations_done);
+						fflush(stdout);
+					}
 				}
+				subpeak_recover_in_flight = false;
 
 #ifdef MERCURY_GUI_ENABLED
 				// Push fully-equalized data for visualization (tight clusters).
