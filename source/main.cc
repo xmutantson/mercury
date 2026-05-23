@@ -2033,7 +2033,8 @@ start_modem:
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
                              | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING
                              | (ARQ.disable_sack ? 0 : CAP_SACK)
-                             | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0);
+                             | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0)
+                             | CAP_HANDSHAKE_ECHO;  // v8 — always advertise; legacy peers ignore
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
@@ -2062,7 +2063,8 @@ start_modem:
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
                              | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING
                              | (ARQ.disable_sack ? 0 : CAP_SACK)
-                             | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0);
+                             | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0)
+                             | CAP_HANDSHAKE_ECHO;  // v8 — always advertise; legacy peers ignore
         ARQ.force_compress = (force_compress_cli == 1);
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
@@ -2183,7 +2185,8 @@ start_modem:
                                     | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING
                                     | (ARQ.disable_sack   ? 0 : CAP_SACK)
                                     | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0)
-                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0)
+                                    | CAP_HANDSHAKE_ECHO;  // v8 — always advertise; legacy peers ignore
                 // narrowband_enabled is set at startup (line ~728) based on -Q and -M flags.
                 // Do NOT override here — forcing NB on telecom_system while the actual
                 // config is WB causes get_tx_gain() to return NB gains (+7 dB overboosted).

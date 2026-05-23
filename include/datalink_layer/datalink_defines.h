@@ -105,6 +105,21 @@
                                 // Phase: SCAFFOLDING — message type defined, RSP-side no-op
                                 // stub logs receipt only; no CMD-side sender; no state mutation.
                                 // Gated behavior arrives in later Design A steps.
+#define TEST_CONNECTION_ACK 0x45  // v8 handshake echo (fact-doc handshake-capability-echo.md).
+                                // Wire payload after the standard 3-byte msg header:
+                                //   [echoed_peer_capability : u8][own_capability : u8][CRC8 : u8]
+                                // CRC8 over [echoed_peer_capability, own_capability] using
+                                // POLY_CRC8 (= 0xF4), matching SACK_RSP / OFDM_ACK_CLEAN.
+                                // RSP sends this immediately after receiving TEST_CONNECTION
+                                // when the peer advertises CAP_HANDSHAKE_ECHO (0x80).
+                                // CMD verifies that echoed_peer_capability == local_capability
+                                // before transitioning CONNECTION_ACCEPTED -> NEGOTIATING /
+                                // CONNECTED, catching silent capability-bit corruption that
+                                // would otherwise desync the v1/v2 wire-format parsing.
+                                // Pre-v8 peers without CAP_HANDSHAKE_ECHO use the legacy
+                                // single-frame TEST_CONNECTION handshake (no echo, no retry
+                                // on mismatch — original behavior preserved for forward
+                                // compatibility).
 #define OFDM_ACK_CLEAN   0x44   // §7.13.30 — OFDM-only clean-batch ACK. Replaces the MFSK
                                 // ACK pattern for sack_v2_enabled sessions so CMD never
                                 // has to distinguish MFSK vs OFDM signals in the SACK
@@ -125,6 +140,16 @@
 #define CAP_ENCRYPTION   0x08   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
 #define CAP_STREAMING    0x10   // Supports streaming compression context (PPMd carry + zstd prefix)
 #define CAP_SACK         0x20   // Supports selective ACK (partial batch retransmission)
+#define CAP_HANDSHAKE_ECHO 0x80 // v8 — peer supports TEST_CONNECTION_ACK echo handshake.
+                                // When both peers advertise this bit, RSP echoes CMD's
+                                // local_capability back via TEST_CONNECTION_ACK and CMD
+                                // gates its CONNECTION_ACCEPTED -> NEGOTIATING transition
+                                // on the echo matching. Catches silent capability-byte
+                                // corruption that would otherwise produce v1/v2 protocol
+                                // desync (CMD sends v2 frame layout, RSP parses as v1, all
+                                // data frames land in slot 0, 0 ACKs, 0 bps). See
+                                // mercury/fact-documents/handshake-capability-echo.md
+                                // for the bug story and protocol design.
 #define CAP_SACK_V2      0x40   // SACK Design A (OFDM SACK_RSP + DATA batch_seq_id + multi-axis gearshift)
                                 // Phase: NEGOTIATE-ONLY. Setting this bit currently gates NO
                                 // behavior — the sack_v2_enabled flag is computed (both peers

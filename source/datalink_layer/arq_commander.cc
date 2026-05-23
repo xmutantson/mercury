@@ -3397,6 +3397,75 @@ void cl_arq_controller::process_control_commander()
 			}
 			fflush(stdout);
 
+			// v8 handshake echo validation (fact-doc handshake-capability-echo.md).
+			// When both peers advertise CAP_HANDSHAKE_ECHO, RSP appends an
+			// echoed-capability byte + CRC8 to its TEST_CONNECTION reply.
+			// CMD verifies that the echoed byte matches local_capability,
+			// catching silent bit-corruption of CMD's TEST_CONNECTION data[5]
+			// that would otherwise produce v1/v2 wire-format desync. On
+			// mismatch, CMD stays in CONNECTION_ACCEPTED (skipping the
+			// transition to NEGOTIATING/CONNECTED below); the outer loop
+			// will re-send TEST_CONNECTION on next cycle. After
+			// MAX_HANDSHAKE_RETRIES failures, the connection is dropped.
+			bool handshake_ok = true;  // default true for legacy peers
+			if((local_capability & CAP_HANDSHAKE_ECHO)
+			   && (peer_capability & CAP_HANDSHAKE_ECHO))
+			{
+				// Both peers support echo. Verify CRC + echo byte.
+				unsigned char echoed_cap = (unsigned char)messages_control.data[7];
+				unsigned char rx_crc     = (unsigned char)messages_control.data[8];
+				unsigned char calc_crc   = (unsigned char)CRC8_calc(
+					(char*)&messages_control.data[5], 3);
+				if(rx_crc != calc_crc)
+				{
+					handshake_ok = false;
+					printf("[HANDSHAKE-ECHO] FAIL crc8 mismatch: rx=0x%02X calc=0x%02X "
+						"(retries_left=%d)\n",
+						rx_crc, calc_crc, handshake_retries_left);
+				}
+				else if(echoed_cap != (unsigned char)local_capability)
+				{
+					handshake_ok = false;
+					printf("[HANDSHAKE-ECHO] FAIL cap mismatch: echoed=0x%02X local=0x%02X "
+						"(corruption suspected; retries_left=%d)\n",
+						echoed_cap, (unsigned char)local_capability,
+						handshake_retries_left);
+				}
+				else
+				{
+					handshake_confirmed = true;
+					printf("[HANDSHAKE-ECHO] OK echoed_cap=0x%02X matches local; "
+						"handshake confirmed\n", echoed_cap);
+				}
+				fflush(stdout);
+			}
+			else
+			{
+				// Legacy peer (no CAP_HANDSHAKE_ECHO) — fall back to original
+				// trust-the-cap-byte behavior. Vulnerable to the documented
+				// silent desync bug but matches pre-v8 protocol.
+				handshake_confirmed = true;
+			}
+
+			if(!handshake_ok)
+			{
+				// Stay in CONNECTION_ACCEPTED; outer loop re-sends TEST_CONNECTION.
+				// Decrement retry counter; drop connection if exhausted.
+				if(handshake_retries_left > 0)
+				{
+					handshake_retries_left--;
+					messages_control.status = FREE;  // allow next TEST_CONNECTION cycle
+					return;
+				}
+				printf("[HANDSHAKE-ECHO] DROP connection: %d retries exhausted, "
+					"persistent capability corruption — peer cannot agree on "
+					"protocol bits.\n", MAX_HANDSHAKE_RETRIES);
+				fflush(stdout);
+				this->link_status = DROPPED;
+				reset_session_state();
+				return;
+			}
+
 			switch_role_test_timer.stop();
 			switch_role_test_timer.reset();
 
