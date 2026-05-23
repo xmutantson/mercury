@@ -473,6 +473,19 @@ int cl_arq_controller::add_message_control(char code)
 			messages_control.length=7;
 			messages_control.id=0;
 		}
+		else if(code==TEST_CONNECTION_ACK)
+		{
+			// v9 handshake echo. RSP-initiated LDPC reply to CMD's TEST_CONNECTION.
+			// Echoes back the cap byte RSP parsed from CMD's TEST_CONNECTION +
+			// RSP's own caps + CRC8. CMD verifies before completing handshake.
+			messages_control.data[0]=code;
+			messages_control.data[1]=(char)peer_capability;   // echo CMD's caps
+			messages_control.data[2]=(char)local_capability;  // RSP's own caps
+			messages_control.data[3]=(char)CRC8_calc(
+				(char*)&messages_control.data[1], 2);
+			messages_control.length=4;
+			messages_control.id=0;
+		}
 		else if(code==SWITCH_BANDWIDTH)
 		{
 			messages_control.data[0]=code;
@@ -1513,7 +1526,20 @@ void cl_arq_controller::process_messages_rx_acks_control()
 {
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
 	{
-		if(ack_pattern_time_ms > 0 && messages_control.data[0] != KEY_EXCHANGE_1)
+		// v9: when we sent TEST_CONNECTION and we advertise
+		// CAP_HANDSHAKE_ECHO, expect the responder to reply with LDPC
+		// TEST_CONNECTION_ACK on data_configuration instead of the MFSK
+		// ACK pattern. CMD must use the LDPC RX path to receive this —
+		// same exception pattern as KEY_EXCHANGE_1. peer_capability is
+		// not yet known on the first TEST_CONNECTION send, so we gate on
+		// local_capability only; a legacy peer won't send LDPC and we'll
+		// time out (existing retry logic handles).
+		bool v9_expects_ldpc_handshake_ack =
+			(messages_control.data[0] == TEST_CONNECTION)
+			&& (local_capability & CAP_HANDSHAKE_ECHO);
+		if(ack_pattern_time_ms > 0
+		   && messages_control.data[0] != KEY_EXCHANGE_1
+		   && !v9_expects_ldpc_handshake_ack)
 		{
 			// Detect ACK tone pattern instead of decoding LDPC frame.
 			// Keep checking until ACKED (not just PENDING_ACK): update_status()
@@ -1547,11 +1573,17 @@ void cl_arq_controller::process_messages_rx_acks_control()
 		else
 		{
 			// Decode LDPC ACK frame (also used for KEY_EXCHANGE_1 which
-			// carries the responder's pubkey in the ACK data payload).
+			// carries the responder's pubkey in the ACK data payload, and
+			// for v9 TEST_CONNECTION_ACK which carries the capability echo).
 			this->receive();
+			// v9: TEST_CONNECTION_ACK is a valid reply to TEST_CONNECTION
+			// (different data[0] but same control-frame ACK semantics).
+			bool data0_match = (messages_rx_buffer.data[0]==messages_control.data[0])
+				|| (messages_control.data[0]==TEST_CONNECTION
+				    && messages_rx_buffer.data[0]==TEST_CONNECTION_ACK);
 			if(messages_rx_buffer.status==RECEIVED && messages_rx_buffer.type==ACK_CONTROL)
 			{
-				if(messages_rx_buffer.data[0]==messages_control.data[0] && messages_control.status==PENDING_ACK)
+				if(data0_match && messages_control.status==PENDING_ACK)
 				{
 					// Flush old batch audio from playback buffer so responder
 					// doesn't demodulate stale frames before the new batch.
@@ -3242,22 +3274,83 @@ void cl_arq_controller::process_control_commander()
 				this->assigned_connection_id=messages_control.data[1];
 			}
 		}
-		else if((this->link_status==CONNECTION_ACCEPTED || this->link_status==CONNECTED) && messages_control.data[0]==TEST_CONNECTION)
+		else if((this->link_status==CONNECTION_ACCEPTED || this->link_status==CONNECTED)
+		        && (messages_control.data[0]==TEST_CONNECTION
+		            || messages_control.data[0]==TEST_CONNECTION_ACK))
 		{
-			u_SNR tmp_SNR;
-			for(int i=0;i<4;i++)
+			// v9 handshake: branch on incoming type.
+			// - TEST_CONNECTION_ACK: RSP-initiated LDPC frame carrying caps
+			//   echo + CRC8. Validate before transition.
+			// - TEST_CONNECTION: legacy ACK-pattern emulation. peer_capability
+			//   comes from data[5] = our own TX content (symmetric assumption).
+			bool is_ack = (messages_control.data[0]==TEST_CONNECTION_ACK);
+			if(is_ack)
 			{
-				tmp_SNR.char4_SNR[i]=messages_control.data[i+1];
-
+				unsigned char echoed_cap = (unsigned char)messages_control.data[1];
+				unsigned char rsp_own    = (unsigned char)messages_control.data[2];
+				unsigned char rx_crc     = (unsigned char)messages_control.data[3];
+				unsigned char calc_crc   = (unsigned char)CRC8_calc(
+					(char*)&messages_control.data[1], 2);
+				if(rx_crc != calc_crc)
+				{
+					printf("[HANDSHAKE-ECHO] FAIL crc8 mismatch: rx=0x%02X calc=0x%02X "
+						"(retries_left=%d)\n",
+						rx_crc, calc_crc, handshake_retries_left);
+					fflush(stdout);
+					if(handshake_retries_left > 0)
+					{
+						handshake_retries_left--;
+						messages_control.status = FREE;
+						return;
+					}
+					printf("[HANDSHAKE-ECHO] DROP: persistent CRC mismatch on echo\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				if(echoed_cap != (unsigned char)local_capability)
+				{
+					printf("[HANDSHAKE-ECHO] FAIL cap mismatch: echoed=0x%02X local=0x%02X "
+						"(silent corruption suspected; retries_left=%d)\n",
+						echoed_cap, (unsigned char)local_capability,
+						handshake_retries_left);
+					fflush(stdout);
+					if(handshake_retries_left > 0)
+					{
+						handshake_retries_left--;
+						messages_control.status = FREE;
+						return;
+					}
+					printf("[HANDSHAKE-ECHO] DROP: persistent capability echo mismatch\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				printf("[HANDSHAKE-ECHO] OK echoed_cap=0x%02X own=0x%02X — handshake confirmed\n",
+					echoed_cap, rsp_own);
+				fflush(stdout);
+				handshake_confirmed = true;
+				peer_capability = rsp_own;
+				// No SNR carried in TEST_CONNECTION_ACK — leave SNR unchanged.
 			}
-			measurements.SNR_downlink=tmp_SNR.f_SNR;
+			else
+			{
+				u_SNR tmp_SNR;
+				for(int i=0;i<4;i++)
+				{
+					tmp_SNR.char4_SNR[i]=messages_control.data[i+1];
+				}
+				measurements.SNR_downlink=tmp_SNR.f_SNR;
 
-			// Read responder's capability from byte 5.
-			// With LDPC ACK: this is the responder's reply (correct).
-			// With ACK pattern: no data payload, so this is our own TX data (assumes
-			// symmetric capability — works when both sides use same bandwidth_mode).
-			// Responder's SWITCH_BANDWIDTH handler rejects if nb_only as a safety net.
-			peer_capability = (uint8_t)messages_control.data[5];
+				// Read responder's capability from byte 5.
+				// With LDPC ACK: this is the responder's reply (correct).
+				// With ACK pattern: no data payload, so this is our own TX data (assumes
+				// symmetric capability — works when both sides use same bandwidth_mode).
+				// Responder's SWITCH_BANDWIDTH handler rejects if nb_only as a safety net.
+				peer_capability = (uint8_t)messages_control.data[5];
+			}
 			printf("[BW-NEG] Responder capability: 0x%02X (WB=%s, COMPRESS=%s, ENCRYPT=%s)\n",
 				peer_capability,
 				(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",

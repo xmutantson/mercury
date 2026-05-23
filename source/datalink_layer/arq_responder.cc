@@ -777,6 +777,22 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			pad_messages_batch_tx(control_batch_size);
 			send_batch();
 		}
+		else if(messages_control.data[0] == TEST_CONNECTION_ACK)
+		{
+			// v9 handshake echo. Send LDPC ACK on data_configuration (OFDM)
+			// — same pattern as KEY_EXCHANGE_1. CMD loads data_configuration
+			// to receive this (CMD's RX path at process_messages_rx_acks_
+			// control has a matching exception for TEST_CONNECTION when
+			// CAP_HANDSHAKE_ECHO is set on both sides).
+			printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on config %d\n",
+				data_configuration);
+			fflush(stdout);
+			telecom_system->set_mfsk_ctrl_mode(false);  // full OFDM frame
+			messages_batch_tx[message_batch_counter_tx]=messages_control;
+			message_batch_counter_tx++;
+			pad_messages_batch_tx(control_batch_size);
+			send_batch();
+		}
 		else if(ack_pattern_time_ms > 0)
 		{
 			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT
@@ -1901,6 +1917,27 @@ void cl_arq_controller::process_control_responder()
 			connection_status = RECEIVING;
 			calculate_receiving_timeout();
 			receiving_timer.start();
+		}
+		else if((peer_capability & CAP_HANDSHAKE_ECHO)
+		        && (local_capability & CAP_HANDSHAKE_ECHO))
+		{
+			// v9 handshake echo. Replace the legacy ACK pattern with an LDPC
+			// TEST_CONNECTION_ACK frame carrying caps echo + CRC8. CMD
+			// validates before transitioning out of CONNECTION_ACCEPTED.
+			// Mirrors the KEY_EXCHANGE_1 LDPC ACK pattern below.
+			messages_control.data[0] = TEST_CONNECTION_ACK;
+			messages_control.data[1] = (char)peer_capability;   // echo CMD's caps
+			messages_control.data[2] = (char)local_capability;  // RSP's own caps
+			messages_control.data[3] = (char)CRC8_calc(
+				(char*)&messages_control.data[1], 2);
+			messages_control.length = 4;
+			connection_status = ACKNOWLEDGING_CONTROL;
+			printf("[HANDSHAKE-ECHO] RSP queued TEST_CONNECTION_ACK: "
+				"echoed_cap=0x%02X own_cap=0x%02X crc8=0x%02X\n",
+				(unsigned char)peer_capability,
+				(unsigned char)local_capability,
+				(unsigned char)messages_control.data[3]);
+			fflush(stdout);
 		}
 		else
 		{

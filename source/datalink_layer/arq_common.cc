@@ -304,7 +304,10 @@ cl_arq_controller::cl_arq_controller()
 	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;
 	if(disable_sack) local_capability &= ~CAP_SACK;
 	if(enable_sack_v2) local_capability |= CAP_SACK_V2;
+	local_capability |= CAP_HANDSHAKE_ECHO;  // v9
 	peer_capability=0;
+	handshake_confirmed=false;
+	handshake_retries_left=MAX_HANDSHAKE_RETRIES;
 	wb_upgrade_pending=false;
 	psk_mismatch_pending=false;
 	compression_enabled=false;
@@ -2571,6 +2574,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
 		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
+		local_capability |= CAP_HANDSHAKE_ECHO;  // v9 — always advertise
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2670,6 +2674,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
 		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
+		local_capability |= CAP_HANDSHAKE_ECHO;  // v9 — always advertise
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2971,6 +2976,8 @@ void cl_arq_controller::reset_session_state()
 	session_narrowband = false;
 	peer_capability = 0;
 	wb_upgrade_pending = false;
+	handshake_confirmed = false;  // v9
+	handshake_retries_left = MAX_HANDSHAKE_RETRIES;  // v9
 
 	// Connection
 	connection_id = 0;

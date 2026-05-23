@@ -1184,6 +1184,14 @@ public:
   uint8_t local_capability;    // CAP_WB_CAPABLE | CAP_COMPRESSION
   uint8_t peer_capability;     // Received from peer via TEST_CONNECTION
   bool wb_upgrade_pending;     // True between SWITCH_BANDWIDTH send and ACK
+
+  // v9 handshake echo state. handshake_confirmed gates CMD's
+  // CONNECTION_ACCEPTED → NEGOTIATING/CONNECTED transition. retries_left
+  // counts failed echo validations before dropping with explicit error.
+  bool handshake_confirmed;
+  int  handshake_retries_left;
+  static const int MAX_HANDSHAKE_RETRIES = 5;
+
   cl_compressor compressor;           // Block compression (PPMd + zstd)
   bool compression_enabled;           // Negotiated: both sides have CAP_COMPRESSION
   bool force_compress;                // CLI -F on: always enable compression (skip B2F detection)
