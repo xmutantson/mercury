@@ -23,6 +23,10 @@
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
+#include <time.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include "common/timing_log.h"
 #include <algorithm>
 #include <cmath>
@@ -4882,6 +4886,42 @@ bool cl_arq_controller::receive_hail_pattern()
 		static int hail_poll_enabled = -1;
 		if(hail_poll_enabled < 0)
 			hail_poll_enabled = (getenv("MERCURY_HAIL_POLL") != nullptr) ? 1 : 0;
+		// DRIFT-INSTR: opt-in via MERCURY_DRIFT_INSTR=1. Logs the suspect
+		// state variables from fact-documents/pi-audio-drift-audit.md every
+		// 60 seconds at the HAIL poll site. Use during long soak tests to
+		// catch which value diverges at drift onset.
+		static int drift_instr_enabled = -1;
+		if(drift_instr_enabled < 0)
+			drift_instr_enabled = (getenv("MERCURY_DRIFT_INSTR") != nullptr) ? 1 : 0;
+		if(drift_instr_enabled)
+		{
+			static long long last_drift_log_ms = 0;
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			long long now_ms = (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
+			if(now_ms - last_drift_log_ms >= 60000LL)
+			{
+				last_drift_log_ms = now_ms;
+				size_t heap_uordblks = 0;
+#ifdef __GLIBC__
+				struct mallinfo2 mi = mallinfo2();
+				heap_uordblks = (size_t)mi.uordblks;
+#endif
+				int sp_now = telecom_system->data_container.Nofdm
+				           * (int)telecom_system->data_container.buffer_Nsymb
+				           * telecom_system->data_container.interpolation_rate;
+				printf("[DRIFT-INSTR] t=%lld lcfo=%.4f pss=%lu nv=%.4e rwi=%d sp=%d nupe=%d uordblks=%zu\n",
+					now_ms,
+					telecom_system->last_coarse_freq_offset,
+					telecom_system->ofdm.passband_start_sample,
+					telecom_system->ofdm.noise_variance_estimate,
+					(int)telecom_system->data_container.ring_write_index,
+					sp_now,
+					(int)telecom_system->data_container.nUnder_processing_events,
+					heap_uordblks);
+				fflush(stdout);
+			}
+		}
 		bool near_threshold = base_matched >= (telecom_system->ack_mfsk.hail_match_threshold * 4 / 10)
 		                   || metric >= 2.0
 		                   || quality >= 0.2;
