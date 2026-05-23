@@ -1861,34 +1861,6 @@ void cl_arq_controller::process_control_responder()
 		messages_control.data[6]=(char)callsign_get_ssid(my_call_sign);
 		messages_control.length=7;
 
-		// v8 handshake echo (fact-doc handshake-capability-echo.md). Append
-		// the capability byte we PARSED out of CMD's TEST_CONNECTION
-		// (peer_capability) plus a CRC8 covering [local_cap, ssid, echoed
-		// cap]. Catches silent bit-corruption of CMD's data[5] that would
-		// otherwise produce v1/v2 wire-format desync (CMD sends v2 frame
-		// layout, RSP parses as v1, all data frames land in messages_rx[0],
-		// 0 ACKs, 0 bps). CMD verifies echoed_cap == its own local_capability
-		// before transitioning out of CONNECTION_ACCEPTED; mismatch triggers
-		// a TEST_CONNECTION re-send (RSP's handler at line 1697 re-processes
-		// and re-sets sack_v2_enabled from the corrected peer_capability).
-		// Only emitted when BOTH peers advertise CAP_HANDSHAKE_ECHO (legacy
-		// peers without the bit get a length-7 frame, identical to pre-v8).
-		if((peer_capability & CAP_HANDSHAKE_ECHO)
-		   && (local_capability & CAP_HANDSHAKE_ECHO))
-		{
-			messages_control.data[7]=(char)peer_capability;  // echo what we parsed
-			// CRC8 over (own_cap, ssid, echoed_cap). POLY_CRC8 (= 0xF4) matches
-			// the SACK_RSP / OFDM_ACK_CLEAN / SET_LINK_PARAMS coverage pattern.
-			messages_control.data[8]=(char)CRC8_calc(
-				(char*)&messages_control.data[5], 3);
-			messages_control.length=9;
-			printf("[HANDSHAKE-ECHO] RSP reply: echoed_cap=0x%02X own_cap=0x%02X crc8=0x%02X\n",
-				(unsigned char)peer_capability,
-				(unsigned char)local_capability,
-				(unsigned char)messages_control.data[8]);
-			fflush(stdout);
-		}
-
 		if(this->link_status==CONNECTION_RECEIVED)
 		{
 			std::string str="CONNECTED "+this->destination_call_sign+" "+this->my_call_sign+" "+ std::to_string(telecom_system->bandwidth)+"\r";
