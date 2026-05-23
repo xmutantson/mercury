@@ -2957,6 +2957,12 @@ void cl_arq_controller::reset_session_state()
 	}
 	current_configuration = CONFIG_NONE;
 	telecom_system->current_configuration = CONFIG_NONE;
+	// v7 §2.3 (moved here from telecom_system::load_configuration): clear the
+	// Moose-measured carrier offset on session boundary so a new correspondent
+	// or post-drift session starts with a clean detector mixer. Earlier v7
+	// placement at load_configuration() wiped this every data<->ack PHY swap
+	// per batch, regressing cfg=6 throughput ~26%.
+	telecom_system->last_coarse_freq_offset = 0.0;
 	commander_configured_nb = -1;
 	session_narrowband = false;
 	peer_capability = 0;

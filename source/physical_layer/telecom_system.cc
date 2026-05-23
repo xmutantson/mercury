@@ -4268,8 +4268,6 @@ void cl_telecom_system::load_configuration(int configuration)
 	printf("[PHY] Loading configuration %d (was %d)\n", configuration, current_configuration);
 	fflush(stdout);
 
-	last_coarse_freq_offset = 0.0;
-
 	int _modulation = MOD_BPSK;
 	float _ldpc_rate = 1/16.0f;
 	int ofdm_preamble_configurator_Nsymb = 4;
