@@ -413,6 +413,8 @@ void cl_arq_controller::process_messages_commander()
 				negotiated_configuration = target;
 				cleanup();
 				add_message_control(SET_CONFIG);
+				opt_reset_window();
+				rate_opt.force_cooldown(5);
 				connection_status = TRANSMITTING_CONTROL;
 				opt_pending_switch_cfg = -1;
 				return;
@@ -483,6 +485,26 @@ int cl_arq_controller::add_message_control(char code)
 		}
 		else if(code==SET_CONFIG)
 		{
+			// Defensive null-guard for synthetic test mode (matches the
+			// SET_LINK_PARAMS pattern below). messages_control.data is
+			// allocated lazily in init_messages_buffers(); the synthetic
+			// --test-policy-axis1-fire entry point skips ARQ.init() so
+			// messages_control.data is still NULL when add_message_control
+			// is called from policy_evaluate_axis1's cleanup+SET_CONFIG path.
+			if(messages_control.data == NULL)
+			{
+				int peek_fwd = negotiated_configuration;
+				int peek_rev = (reverse_configuration == CONFIG_NONE)
+					? peek_fwd : reverse_configuration;
+				printf("[CMD-SET-CONFIG] SKIP TX: messages_control.data is NULL "
+					"(pre-init synthetic test mode; no real wire frame). "
+					"WOULD HAVE SENT: forward=%d reverse=%d\n",
+					peek_fwd, peek_rev);
+				fflush(stdout);
+				messages_control.status = FREE;
+				messages_control.type = NONE;
+				return success;
+			}
 			messages_control.data[0]=code;
 			messages_control.id=0;
 
@@ -4195,6 +4217,8 @@ void cl_arq_controller::finalize_block_commander()
 					fflush(stdout);
 					cleanup();
 					add_message_control(SET_CONFIG);
+					opt_reset_window();
+					rate_opt.force_cooldown(5);
 				}
 				else
 				{
@@ -4259,6 +4283,8 @@ void cl_arq_controller::finalize_block_commander()
 					fflush(stdout);
 					cleanup();
 					add_message_control(SET_CONFIG);
+					opt_reset_window();
+					rate_opt.force_cooldown(5);
 				}
 				else
 				{
@@ -4533,6 +4559,9 @@ void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg,
 	{
 		axis3_send_set_link_params(axis3_sack_mode, "axis1_supremacy_reset");
 	}
+
+	opt_reset_window();
+	rate_opt.force_cooldown(5);
 }
 
 // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).

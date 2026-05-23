@@ -1334,7 +1334,13 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 			}
 		}
 		if(noise_count > 0)
+		{
 			noise_variance_estimate = noise_sum / noise_count;
+		}
+		else
+		{
+			noise_variance_estimate = 0.01;
+		}
 		// Floor to prevent division instability at very high SNR
 		if(noise_variance_estimate < 1e-6)
 			noise_variance_estimate = 1e-6;
@@ -1492,7 +1498,13 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 			}
 		}
 		if(noise_count > 0)
+		{
 			noise_variance_estimate = noise_sum / noise_count;
+		}
+		else
+		{
+			noise_variance_estimate = 0.01;
+		}
 		if(noise_variance_estimate < 1e-6)
 			noise_variance_estimate = 1e-6;
 	}

@@ -113,6 +113,8 @@ public:
     void force_cooldown(int batches)
     {
         if (batches > cooldown_remaining) cooldown_remaining = batches;
+        label_streak_value.clear();
+        label_streak_count = 0;
     }
 
     // Below-table-range gate inputs. Populated at load(); used by

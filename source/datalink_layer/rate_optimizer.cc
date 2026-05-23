@@ -286,7 +286,7 @@ int cl_rate_optimizer::parse_table_section(
             });
 
             cell.valid = (cell.eff_bps_mean > 0.0)
-                        && !failed_flag && !break_flag && (n_runs >= 0);
+                        && !failed_flag && !break_flag && (n_runs >= 1);
             channels[ch_key] = cell;
             if (cell.valid) {
                 ++valid_cells;
@@ -662,6 +662,8 @@ int cl_rate_optimizer::evaluate(int current_cfg,
             if (ratio >= hysteresis_ratio) {
                 chosen_cfg = best_cfg;
                 cooldown_remaining = cooldown_max;
+                label_streak_value.clear();
+                label_streak_count = 0;
             } else {
                 skip_reason = "below-hysteresis";
             }
@@ -671,6 +673,8 @@ int cl_rate_optimizer::evaluate(int current_cfg,
             // run in parallel.
             chosen_cfg = best_cfg;
             cooldown_remaining = cooldown_max;
+            label_streak_value.clear();
+            label_streak_count = 0;
             gain_pct = 100.0;
         }
     }

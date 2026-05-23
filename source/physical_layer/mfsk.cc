@@ -72,6 +72,10 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	if (nStreams < 1) nStreams = 1;
 	if (nStreams > MAX_STREAMS) nStreams = MAX_STREAMS;
 
+	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
+		last_ack_sack_suffix_tones[i] = -1;
+	last_ack_sack_capture_valid = false;
+
 	// Calculate log2(M)
 	nBits = 0;
 	int temp = M;

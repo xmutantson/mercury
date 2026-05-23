@@ -807,6 +807,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.frame_data_missing=false;
 	receive_stats.frame_skip_var_aborted=false;
 	receive_stats.sync_trials=0;
+	receive_stats.iterations_done = -1;
+	receive_stats.crc = 0;
+	receive_stats.SNR = -99.9;
+	receive_stats.all_zeros = NO;
+	receive_stats.coarse_metric = 0.0;
 
 	// Timing breakdown
 	double timing_pb_tsync_ms = 0, timing_pb_data_ms = 0, timing_ldpc_ms = 0;
@@ -2785,6 +2790,10 @@ skip_h_retry_point:
 					receive_stats.sync_trials = 0;
 					skip_h_count = 0;
 					coarse_freq_offset = 0.0;
+					subpeak_recover_phase = 0;
+					subpeak_orig_delay = -1;
+					subpeak_recover_in_flight = false;
+					consecutive_skip_var = 0;
 					goto skip_h_retry_point;
 				}
 			}
@@ -4258,6 +4267,8 @@ void cl_telecom_system::load_configuration(int configuration)
 
 	printf("[PHY] Loading configuration %d (was %d)\n", configuration, current_configuration);
 	fflush(stdout);
+
+	last_coarse_freq_offset = 0.0;
 
 	int _modulation = MOD_BPSK;
 	float _ldpc_rate = 1/16.0f;

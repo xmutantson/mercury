@@ -51,9 +51,9 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 {
 	int success=ERROR_;
 	int loc=(int)((unsigned char)id);
-	if(loc>=nMessages || loc<0)
+	if(loc >= data_batch_size || loc < 0)
 	{
-		success=MESSAGE_ID_ERROR;
+		success = MESSAGE_ID_ERROR;
 		return success;
 	}
 
@@ -513,6 +513,14 @@ void cl_arq_controller::process_messages_rx_data_control()
 						if(rsp_prev_batch_active
 						   && rsp_prev_batch_received_count >= rsp_prev_batch_expected_count)
 						{
+							if(compressor.is_streaming() && batch_data_delivered) {
+								// V1 defense: out-of-order prev-batch delivery would desync the
+								// streaming PPMd model. Current batch already committed; prev-batch
+								// commit would be against an advanced model. Reset both sides via
+								// the bit-2 handshake — next TX batch will detect RX-cold and reset.
+								compressor.streaming_reset();
+								printf("[STREAMING] Reset: out-of-order prev-batch delivery (V1 defense)\n");
+							}
 							// Preserve current-batch state during the swap.
 							struct st_message* saved_rx     = messages_rx;
 							bool saved_data_delivered       = batch_data_delivered;

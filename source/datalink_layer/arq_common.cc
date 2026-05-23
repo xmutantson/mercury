@@ -3111,6 +3111,10 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 		current_configuration, telecom_system->ofdm.Nc,
 		telecom_system->ofdm.Nsymb, telecom_system->data_container.Nofdm);
 	fflush(stdout);
+
+	opt_reset_window();
+	rate_opt.reset_session_state();
+	opt_pending_switch_cfg = -1;
 }
 
 
