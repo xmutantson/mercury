@@ -36,6 +36,7 @@
 #include "compression/mercury_compress.h"
 #include "datalink_layer/b2f_handler.h"
 #include "datalink_layer/rate_optimizer.h"
+#include "datalink_layer/channel_state_lookup.h"
 #include "crypto/mercury_crypto.h"
 #include <iomanip>
 #include <thread>
@@ -1511,6 +1512,16 @@ public:
   // See: include/datalink_layer/rate_optimizer.h
   //      mercury/fact-documents/EFFECTIVE_RATE_OPTIMIZER_DESIGN.md §4.3
   cl_rate_optimizer rate_opt;
+
+  // Phase 2 Step 5 — 2D channel-state → optimal-config lookup. Held here so
+  // the commander's per-batch [CHANNEL-STATE] log site can also emit a
+  // [CHANNEL-LOOKUP] proposal line. CLI-opt-in via --channel-lookup <path>;
+  // when unloaded, lookup() returns SENTINEL_NO_DATA and the commander
+  // emits no [CHANNEL-LOOKUP] line. OBSERVATION ONLY in Step 5 — the
+  // proposal is never acted on.
+  // See: include/datalink_layer/channel_state_lookup.h
+  //      mercury/fact-documents/channel-state-2d-lookup.md §8 Step 5
+  cl_channel_state_lookup channel_lookup;
 
   // Called once at mercury startup (from main.cc / cl_arq_controller::init
   // wherever capabilities are negotiated) to load the calibration table.

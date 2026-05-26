@@ -276,6 +276,7 @@ int main(int argc, char *argv[])
     bool monitor_stdout = false;      // --stdout: output decoded plaintext to stdout
     bool skip_turbo_reverse = false;  // --skip-turbo-reverse: skip TURBO_REVERSE phase
     bool no_optimizer_cli = false;    // --no-optimizer: disable Phase 3c effective-rate optimizer (calibration runs)
+    const char* channel_lookup_path_cli = NULL; // --channel-lookup <path>: 2D channel-state lookup table (Phase 2 Step 5). NULL = OFF (default).
     int max_config_cli = -1;          // --max-config: hard ceiling on turboshift
     int ptt_delay_cli = -1;           // --ptt-delay: override both PTT on/off delays (ms)
     int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
@@ -396,6 +397,7 @@ int main(int argc, char *argv[])
         printf("  --skip-turbo-reverse  Skip TURBO_REVERSE phase (benchmark mode)\n");
         printf("  --max-config [N]      Hard ceiling on turboshift (0-15, default: no limit)\n");
         printf("  --no-optimizer        Disable effective-rate optimizer (Phase 3c). For calibration runs only.\n");
+        printf("  --channel-lookup <path>  Load 2D channel-state lookup table (observation only, Phase 2 Step 5).\n");
         printf("  --ptt-delay [ms]  Override PTT on/off delay (0 for no-PTT setups)\n");
         printf("\nModulation and bandwidth:\n");
         printf("  -s [config]       Modulation: 0-16 (OFDM), 100-102 (ROBUST MFSK). Use -l to list.\n");
@@ -858,6 +860,23 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++)
                 argv[j] = argv[j + 1];
             argc -= 1;
+            i--;
+        }
+        else if (strcmp(argv[i], "--channel-lookup") == 0 && i + 1 < argc)
+        {
+            // Phase 2 Step 5 — opt-in 2D channel-state lookup. The lookup
+            // is wired into the per-batch [CHANNEL-STATE] log site as
+            // OBSERVATION ONLY: it emits a [CHANNEL-LOOKUP] proposal line
+            // but the existing optimizer / gearshift remain in control.
+            // Unlike --no-optimizer the table is user-supplied, so a
+            // load failure is an error (typo / missing file) and we exit.
+            // See: mercury/fact-documents/channel-state-2d-lookup.md
+            channel_lookup_path_cli = argv[i + 1];
+            printf("Channel-state lookup table: %s (observation mode)\n",
+                   channel_lookup_path_cli);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         }
         else if (strcmp(argv[i], "--max-config") == 0 && i + 1 < argc)
@@ -2030,6 +2049,20 @@ start_modem:
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
         ARQ.set_optimizer_disabled(no_optimizer_cli);
+        // Phase 2 Step 5 — load 2D channel-state lookup table if --channel-lookup
+        // path was supplied. User-supplied path => load failure is fatal (typo
+        // / missing file). When the flag is unset the lookup stays in the
+        // "not loaded" state and the commander emits no [CHANNEL-LOOKUP] line.
+        if (channel_lookup_path_cli != NULL) {
+            if (!ARQ.channel_lookup.init_from_json(channel_lookup_path_cli)) {
+                fprintf(stderr, "ERROR: --channel-lookup load failed: %s (path=%s)\n",
+                        ARQ.channel_lookup.last_error(), channel_lookup_path_cli);
+                exit(1);
+            }
+            printf("[CHANNEL-LOOKUP] loaded %d cells from %s\n",
+                   ARQ.channel_lookup.n_cells(), channel_lookup_path_cli);
+            fflush(stdout);
+        }
         // Encryption: CLI -E overrides INI setting
         ARQ.encryption_mode = (encryption_mode_cli >= 0) ? encryption_mode_cli : g_settings.encryption_mode;
         if (ARQ.encryption_mode != ENCRYPT_OFF)
@@ -2057,6 +2090,18 @@ start_modem:
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
         ARQ.set_optimizer_disabled(no_optimizer_cli);
+        // Phase 2 Step 5 — load 2D channel-state lookup table if --channel-lookup
+        // path was supplied. See GUI branch above for rationale.
+        if (channel_lookup_path_cli != NULL) {
+            if (!ARQ.channel_lookup.init_from_json(channel_lookup_path_cli)) {
+                fprintf(stderr, "ERROR: --channel-lookup load failed: %s (path=%s)\n",
+                        ARQ.channel_lookup.last_error(), channel_lookup_path_cli);
+                exit(1);
+            }
+            printf("[CHANNEL-LOOKUP] loaded %d cells from %s\n",
+                   ARQ.channel_lookup.n_cells(), channel_lookup_path_cli);
+            fflush(stdout);
+        }
         // Encryption: CLI -E flag
         ARQ.encryption_mode = (encryption_mode_cli >= 0) ? encryption_mode_cli : ENCRYPT_OFF;
         if (ARQ.encryption_mode != ENCRYPT_OFF)

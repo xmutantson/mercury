@@ -4228,6 +4228,47 @@ void cl_arq_controller::finalize_block_commander()
 	}
 	else
 		last_transmission_block_stats.success_rate_data=100;
+
+	// 2D channel-state observability — see fact-doc channel-state-2d-lookup.md §8 Step 2.
+	// Step 5: when --channel-lookup loaded a table, also emit a [CHANNEL-LOOKUP]
+	// proposal line. OBSERVATION ONLY — proposal never acted on; existing
+	// gearshift / Q-table optimizer remain in control.
+	{
+		double cs_snr = telecom_system->get_correlator_snr_proxy();
+		double cs_sel = telecom_system->get_channel_selectivity();
+		bool snr_real = (cs_snr != -99.0);
+		bool sel_real = (cs_sel != -1.0);
+		if(snr_real || sel_real)
+		{
+			printf("[CHANNEL-STATE] snr_proxy=%+6.1f selectivity=%5.3f cfg=%d\n",
+				cs_snr, cs_sel, current_configuration);
+			fflush(stdout);
+		}
+		// Only consult the table when it loaded AND both axes are real
+		// measurements (one sentinel + one real would clamp into a bin
+		// that doesn't reflect the channel and emit a misleading proposal).
+		if(channel_lookup.is_loaded() && snr_real && sel_real)
+		{
+			int proposed = channel_lookup.lookup(cs_snr, cs_sel);
+			if(proposed == cl_channel_state_lookup::SENTINEL_NO_DATA)
+			{
+				printf("[CHANNEL-LOOKUP] proposed_cfg=-1 (NO_DATA) current=%d\n",
+					current_configuration);
+			}
+			else if(proposed == cl_channel_state_lookup::SENTINEL_DEAD)
+			{
+				printf("[CHANNEL-LOOKUP] proposed_cfg=-2 (DEAD) current=%d\n",
+					current_configuration);
+			}
+			else
+			{
+				printf("[CHANNEL-LOOKUP] proposed_cfg=%d (current=%d, delta=%+d)\n",
+					proposed, current_configuration, proposed - current_configuration);
+			}
+			fflush(stdout);
+		}
+	}
+
 	last_transmission_block_stats.nReSent_data=0;
 	last_transmission_block_stats.nSent_data=0;
 	last_transmission_block_stats.nBatches_sent=0;
