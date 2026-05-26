@@ -141,7 +141,6 @@ public:
 	void restore_channel_amplitude();
 	double carrier_sampling_frequency_sync(std::complex <double>*in, double carrier_freq_width, int preamble_nSymb, double sampling_frequency);
 	double carrier_frequency_sync_nb(std::complex<double>* in, double carrier_freq_width, int preamble_nSymb);
-	double frequency_sync_coarse(std::complex<double>* in, double subcarrier_spacing, int search_range_subcarriers = 0, int interpolation_rate = 1);
 	void channel_equalizer(std::complex <double>* in, std::complex <double>* out);
 	void channel_equalizer_without_amplitude_restoration(std::complex <double>* in,std::complex <double>* out);
 	void smooth_channel_estimate_dft();
@@ -208,8 +207,8 @@ public:
 	std::complex<double>* p2b_data_filtered;
 	int p2b_buffer_size;
 
-	// Pre-allocated Nfft-sized work buffers shared by frequency_sync_coarse,
-	// time_sync_mfsk, and detect_ack_pattern (never called concurrently)
+	// Pre-allocated Nfft-sized work buffers shared by time_sync_mfsk and
+	// detect_ack_pattern (never called concurrently)
 	std::complex<double>* work_buf_a;
 	std::complex<double>* work_buf_b;
 
