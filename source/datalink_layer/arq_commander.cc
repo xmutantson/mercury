@@ -910,6 +910,13 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 
 void cl_arq_controller::process_messages_tx_data()
 {
+	// Phase D timing — entry to the batch builder. The gap between
+	// cmd_ack_post_work_done and this marker is "state-machine idle"
+	// (one or more main-loop ticks that did NOT build a batch). The
+	// gap between this marker and cmd_batch_tx_start is the actual
+	// batch-prep work (retx prefix, compression of new-data frames,
+	// pad to size, etc.).
+	mtl::log_event("cmd_tx_data_entry");
 	// SACK retransmit path (v1 only): send only the missing frames from last SACK
 	// as a standalone retransmit-only batch.
 	//
@@ -1561,9 +1568,14 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					messages_control.status=ACKED;
 					stats.nAcked_control++;
 
-					// Guard delay: wait for responder to finish ACK TX + settle.
-					// ptt_off covers the radio TX→RX transition; +200ms margin.
-					int guard = ptt_off_delay_ms + 200;
+					// Guard delay: wait for the radio TX→RX transition to settle.
+					// v9.2: dropped the extra +200ms software margin. The control-ACK
+					// branch detected the ACK pattern the moment its trailing sample
+					// reached the demod; the only physical wait we still need is
+					// ptt_off_delay_ms (default 200ms), which covers PA tail/RX-mute
+					// release. The +200ms margin was an early-Mercury safety net
+					// added when ACK-edge detection was less precise.
+					int guard = ptt_off_delay_ms;
 					receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 				}
 			}
@@ -1601,11 +1613,15 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					messages_control.status=ACKED;
 					stats.nAcked_control++;
 
-					// Wait for responder to finish remaining ACK batch frames
+					// Wait for responder to finish remaining ACK batch frames.
+					// v9.2: dropped the +200ms software margin — the per-frame
+					// transmission time and ptt_off_delay_ms together already
+					// cover the audio drain, and the +200 was uniformly a
+					// no-op cushion in IONOS / VB-Cable measurement.
 					{
 						int drain = (int)receiving_timer.get_elapsed_time_ms()
 							+ (ack_batch_size - 1) * ctrl_transmission_time_ms
-							+ ptt_off_delay_ms + 200;
+							+ ptt_off_delay_ms;
 						if (drain < receiving_timeout)
 							receiving_timeout = drain;
 					}
@@ -2672,6 +2688,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// the OFF-state re-probe timer and cooldown drain advance.
 					axis3_batch_tick();
 				}
+				// Phase D timing — mark end of CMD's post-ACK bookkeeping (clean
+				// batch path). The gap between this and cmd_batch_tx_start is
+				// "prep + PTT-on + audio buffer fill" — i.e., what the user
+				// identified as the 407ms prep gap to drill into.
+				mtl::log_event("cmd_ack_post_work_done");
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
 				   (messages_control.status==PENDING_ACK || messages_control.status==ACK_TIMED_OUT))
@@ -2685,8 +2706,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					stats.nAcked_control++;
 				}
 
-				// Guard delay: wait for responder to finish full ACK TX + settle.
-				int guard = ptt_off_delay_ms + 200;
+				// Guard delay: wait for the radio TX→RX transition to settle.
+				// v9.2: dropped the +200ms software margin. Clean-batch ACK is
+				// now OFDM_ACK_CLEAN (v9.2 default; see arq_responder.cc:1396),
+				// detected the moment its trailing sample reaches the demod —
+				// the only physical wait we still need is ptt_off_delay_ms
+				// (default 200ms) for PA tail / RX-mute release. Combined with
+				// the MFSK-suffix → OFDM_ACK_CLEAN switch, this saves roughly
+				// 800ms + 200ms = ~1s of dead-air per clean batch at cfg=15 WB.
+				int guard = ptt_off_delay_ms;
 				receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 			}
 		}
@@ -5646,6 +5674,10 @@ void cl_arq_controller::process_buffer_data_commander()
 
 			if(compression_enabled)
 			{
+				// Phase D timing — bracket the compression+encrypt+frame-split
+				// work for this batch. Suspected to be the bulk of the 406ms
+				// prep gap on Pi (PPMd is CPU-intensive).
+				long long _comp_t0_ms = mtl::now_ms();
 				// --- Batch-level compression with adaptive sizing ---
 				// Pop raw data based on estimated compression ratio, compress,
 				// iteratively add more data until batch is 85%+ full.
@@ -5898,6 +5930,8 @@ void cl_arq_controller::process_buffer_data_commander()
 						100.0f * comp_size / batch_capacity);
 					fflush(stdout);
 				}
+				mtl::log_event_kv("cmd_tx_compress_done",
+					"cpu_ms=%lld", mtl::now_ms() - _comp_t0_ms);
 			}
 			else
 			{

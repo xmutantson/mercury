@@ -5103,9 +5103,16 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 		{
 			// Normal mode: just detect ACK pattern
 			uint32_t this_mask = 0;
+			// Phase D timing — instrument ACK FFT CPU cost. The
+			// detect_ack_pattern_from_passband call runs ~528 FFTs on the M=16
+			// MFSK pattern. Compare cumulative FFT CPU to the 774ms ACK dwell
+			// observed in wgn22 traces to tell wire-wait vs CPU dominance.
+			long long _fft_t0_ms = mtl::now_ms();
 			double metric = telecom_system->detect_ack_pattern_from_passband(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
 				tail_samples, &matched_count, &this_mask);
+			mtl::log_event_kv("cmd_ack_fft", "cpu_ms=%lld matched=%d metric=%.2f",
+				mtl::now_ms() - _fft_t0_ms, matched_count, metric);
 
 			// Track peak detection values for timeout diagnostic (no printf in hot loop)
 			if(matched_count > ack_diag_peak_matched)
