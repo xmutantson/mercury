@@ -783,18 +783,23 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 				E[m] = E_raw[actual];
 			}
 
-			// Compute LLRs for this stream's bits — max-log noncoherent FSK metric.
-			// F2 (log-sum-exp form) was attempted 2026-05-25 but empirically
-			// regressed the floor at low SNR by ~6 dB: F4-only floor was WGN:0,
-			// F4+F2 floor was WGN:6. Theory says log-sum-exp ≈ max-log for
-			// balanced Gray partitions (M=16 splits 8/8 per bit), so the only
-			// likely cause is smaller LLR magnitudes from the log-sum-exp form
-			// hitting the LDPC SPA's 100-iteration cap before convergence near
-			// the cliff. Reverted to max-log. To revisit F2 we'd need to either
-			// (a) bump nIteration_max for ROBUST configs, or (b) use the proper
-			// Bessel I_0 amplitude metric not the energy metric. Both are
-			// multi-day workstreams. See fact-documents/weak-signal-floor-
-			// investigation.md §4 (F2).
+			// Compute LLRs for this stream's bits — log-sum-exp noncoherent FSK
+			// metric (F2 retry on top of Q3). Per Proakis 5th ed §4.5.4 and
+			// Stark, IEEE TCOM 1985, the true bit LLR for noncoherent
+			// orthogonal FSK with Gray mapping is
+			//   LLR_k = log(sum_{m in S_0} exp(E_m/sigma^2))
+			//         - log(sum_{m in S_1} exp(E_m/sigma^2))
+			// max-log is the high-SNR limit (the largest exp dominates). At
+			// rate-1/16 LDPC the per-tone curvature near the cliff matters,
+			// so we use the full LSE form with the standard max-subtraction
+			// for numerical stability.
+			//
+			// First F2 attempt 2026-05-25 (reverted, see fact-document
+			// weak-signal-floor-investigation.md §4 (F2)): regressed the
+			// floor from WGN:0 to WGN:6. Hypothesis was that LSE produces
+			// smaller LLR magnitudes which need more SPA iterations to
+			// converge, and the global 100-iter cap was binding. Q3 (commit
+			// cb779d1) raised the ROBUST-tier iter cap to 200; retry on top.
 			int llr_offset = s * bps + st * nBits;
 			for (int k = 0; k < nBits; k++)
 			{
@@ -814,7 +819,29 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 					}
 				}
 
-				double llr = (max_E0 - max_E1) * llr_scale;
+				// Numerically-stable log-sum-exp over S_0 and S_1
+				// separately, using the per-set max as the pivot. Each set
+				// includes its own max (the exp(0)=1 term).
+				double sum0 = 0.0;
+				double sum1 = 0.0;
+				for (int m = 0; m < M; m++)
+				{
+					int gray_m = m ^ (m >> 1);
+					if (gray_m & mask)
+					{
+						sum1 += std::exp((E[m] - max_E1) * llr_scale);
+					}
+					else
+					{
+						sum0 += std::exp((E[m] - max_E0) * llr_scale);
+					}
+				}
+				// LSE(S_0) - LSE(S_1) where LSE is in LLR-domain (already
+				// scaled by 1/sigma^2). Note: max_E and llr_scale combine to
+				// (max_E0 - max_E1) * llr_scale as the dominant term, plus
+				// the log() correction that reduces to 0 at high SNR.
+				double llr = (max_E0 - max_E1) * llr_scale
+				           + std::log(sum0) - std::log(sum1);
 				if (!std::isfinite(llr)) llr = 0.0;
 				// LLR cap removed 2026-05-24. The previous ±5 clip was
 				// arbitrary defensive code with no rationale in the
