@@ -2197,7 +2197,7 @@ skip_h_retry_point:
 			// applying a wild correction that makes things worse.
 			{
 				double subcarrier_spacing = bandwidth / (double)data_container.Nc;
-				double moose_sanity_limit = subcarrier_spacing * 0.7;  // ~32.8 Hz for WB
+				double moose_sanity_limit = subcarrier_spacing * 2.0;  // ~93.75 Hz for WB (Moose nIS/2 capture range)
 				if(g_verbose)
 					printf("[MOOSE-RAW] unclamped=%.4f Hz, sanity=%.1f Hz\n", freq_offset_measured, moose_sanity_limit);
 				if(fabs(freq_offset_measured) > moose_sanity_limit && receive_stats.sync_trials < effective_trials_max)
