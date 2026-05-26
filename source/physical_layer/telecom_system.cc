@@ -2209,8 +2209,8 @@ skip_h_retry_point:
 					receive_stats.sync_trials++;
 					continue;
 				}
-				// Clamp to ±1 subcarrier spacing (covers real offsets up to ~47 Hz)
-				double max_correction = subcarrier_spacing;
+				// Clamp to ±2 subcarrier spacings (covers real offsets up to ~93.75 Hz, matches Moose nIS=4 capture range)
+				double max_correction = 2.0 * subcarrier_spacing;
 				if(freq_offset_measured > max_correction) freq_offset_measured = max_correction;
 				if(freq_offset_measured < -max_correction) freq_offset_measured = -max_correction;
 			}
