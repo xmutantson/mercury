@@ -769,19 +769,27 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 				E[m] = E_raw[actual];
 			}
 
-			// Compute LLRs for this stream's bits
+			// Compute LLRs for this stream's bits — max-log noncoherent FSK metric.
+			// F2 (log-sum-exp form) was attempted 2026-05-25 but empirically
+			// regressed the floor at low SNR by ~6 dB: F4-only floor was WGN:0,
+			// F4+F2 floor was WGN:6. Theory says log-sum-exp ≈ max-log for
+			// balanced Gray partitions (M=16 splits 8/8 per bit), so the only
+			// likely cause is smaller LLR magnitudes from the log-sum-exp form
+			// hitting the LDPC SPA's 100-iteration cap before convergence near
+			// the cliff. Reverted to max-log. To revisit F2 we'd need to either
+			// (a) bump nIteration_max for ROBUST configs, or (b) use the proper
+			// Bessel I_0 amplitude metric not the energy metric. Both are
+			// multi-day workstreams. See fact-documents/weak-signal-floor-
+			// investigation.md §4 (F2).
 			int llr_offset = s * bps + st * nBits;
 			for (int k = 0; k < nBits; k++)
 			{
 				int mask = 1 << (nBits - 1 - k);
 				double max_E1 = -1e30;
 				double max_E0 = -1e30;
-
 				for (int m = 0; m < M; m++)
 				{
-					// Convert m to Gray code to match TX mapping
 					int gray_m = m ^ (m >> 1);
-
 					if (gray_m & mask)
 					{
 						if (E[m] > max_E1) max_E1 = E[m];
@@ -794,8 +802,17 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 
 				double llr = (max_E0 - max_E1) * llr_scale;
 				if (!std::isfinite(llr)) llr = 0.0;
-				else if (llr > 5.0) llr = 5.0;
-				else if (llr < -5.0) llr = -5.0;
+				// LLR cap removed 2026-05-24. The previous ±5 clip was
+				// arbitrary defensive code with no rationale in the
+				// original commit (28d8204, "Add MFSK ROBUST modes"). At
+				// rate-1/16 LDPC (ROBUST_0), the SPA decoder needs the
+				// full magnitude of high-confidence tone observations to
+				// flip the ~94% parity-dominated codeword bits — clipping
+				// to ±5 kept the floor ~15 dB above the original commit's
+				// "-13 dB SNR" design target. The isfinite() guard above
+				// handles infinities (only possible if noise_variance==0);
+				// SPA's tanh/atanh internals naturally saturate, so
+				// unbounded float LLRs are safe.
 				llr_out[llr_offset + k] = (float)llr;
 			}
 		}
