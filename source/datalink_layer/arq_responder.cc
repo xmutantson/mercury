@@ -779,19 +779,39 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		}
 		else if(messages_control.data[0] == TEST_CONNECTION_ACK)
 		{
-			// v9 handshake echo. Send LDPC ACK on data_configuration (OFDM)
-			// — same pattern as KEY_EXCHANGE_1. CMD loads data_configuration
-			// to receive this (CMD's RX path at process_messages_rx_acks_
-			// control has a matching exception for TEST_CONNECTION when
-			// CAP_HANDSHAKE_ECHO is set on both sides).
-			printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on config %d\n",
-				data_configuration);
-			fflush(stdout);
-			telecom_system->set_mfsk_ctrl_mode(false);  // full OFDM frame
-			messages_batch_tx[message_batch_counter_tx]=messages_control;
-			message_batch_counter_tx++;
-			pad_messages_batch_tx(control_batch_size);
-			send_batch();
+			// v9 handshake echo — must use LDPC ACK to carry caps echo + CRC.
+			// Mirror the legacy ACK dichotomy:
+			//   ack_pattern_time_ms > 0  → OFDM ARQ session: send LDPC on
+			//                              data_configuration (same as
+			//                              KEY_EXCHANGE_1 path)
+			//   ack_pattern_time_ms == 0 → MFSK/ROBUST session: send LDPC on
+			//                              ack_configuration with mfsk_ctrl_mode
+			//                              (same as legacy LDPC fallback below).
+			//                              4-byte payload fits easily in either.
+			if(ack_pattern_time_ms > 0)
+			{
+				printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on data_config %d (OFDM)\n",
+					data_configuration);
+				fflush(stdout);
+				telecom_system->set_mfsk_ctrl_mode(false);  // full OFDM frame
+				messages_batch_tx[message_batch_counter_tx]=messages_control;
+				message_batch_counter_tx++;
+				pad_messages_batch_tx(control_batch_size);
+				send_batch();
+			}
+			else
+			{
+				printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on ack_config %d (MFSK)\n",
+					ack_configuration);
+				fflush(stdout);
+				load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY, NO);
+				telecom_system->set_mfsk_ctrl_mode(true);
+				messages_batch_tx[message_batch_counter_tx]=messages_control;
+				message_batch_counter_tx++;
+				pad_messages_batch_tx(ack_batch_size);
+				send_batch();
+				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+			}
 		}
 		else if(ack_pattern_time_ms > 0)
 		{
@@ -1719,10 +1739,9 @@ void cl_arq_controller::process_control_responder()
 		// Always present (LDPC decodes full block; unused bytes are zero-padded).
 		// Backwards-compatible: old firmware doesn't fill byte 5 → decodes as 0 = no WB.
 		peer_capability = (uint8_t)messages_control.data[5];
-		printf("[BW-NEG] Commander capability: 0x%02X (WB=%s, COMPRESS=%s, ENCRYPT=%s)\n",
+		printf("[BW-NEG] Commander capability: 0x%02X (WB=%s, ENCRYPT=%s)\n",
 			peer_capability,
 			(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",
-			(peer_capability & CAP_COMPRESSION) ? "yes" : "no",
 			(peer_capability & CAP_ENCRYPTION) ? "yes" : "no");
 		fflush(stdout);
 
@@ -1741,33 +1760,25 @@ void cl_arq_controller::process_control_responder()
 			fflush(stdout);
 		}
 
-		// Compression: defer unless force_compress CLI flag is set
+		// Compression is unconditional (CAP_COMPRESSION removed; -F off opts out).
+		if(force_compress)
 		{
-			bool both_support = (local_capability & CAP_COMPRESSION) &&
-			                    (peer_capability & CAP_COMPRESSION);
-			if(force_compress && both_support)
-			{
-				compression_enabled = true;
-				compressor.init();
-				printf("[COMPRESS] Force-enabled (--compress flag)\n");
-				fflush(stdout);
-			}
-			else if(both_support)
-			{
-				compressor.init();  // Pre-init contexts, arm later on B2F detection
-				printf("[COMPRESS] Deferred (waiting for B2F detection)\n");
-				fflush(stdout);
-			}
+			compression_enabled = true;
+			compressor.init();
+			printf("[COMPRESS] Force-enabled (--compress flag)\n");
+			fflush(stdout);
+		}
+		else
+		{
+			compressor.init();  // Pre-init contexts, arm later on B2F detection
+			printf("[COMPRESS] Deferred (waiting for B2F detection)\n");
+			fflush(stdout);
 		}
 
-		// B2F handler: init for Winlink LZHUF unroll/reroll
+		// B2F handler: init for Winlink LZHUF unroll/reroll.
+		// CAP_B2F_UNROLL removed — always on.
 		b2f_handler.init();
-		b2f_handler.unroll_enabled = (local_capability & CAP_B2F_UNROLL) &&
-		                             (peer_capability & CAP_B2F_UNROLL);
-		printf("[B2F] %s (local=0x%02X peer=0x%02X)\n",
-			b2f_handler.unroll_enabled ? "Unroll ENABLED" : "Unroll DISABLED (peer lacks capability)",
-			local_capability, peer_capability);
-		fflush(stdout);
+		b2f_handler.unroll_enabled = true;
 
 		// Encryption negotiation
 		{
@@ -1806,61 +1817,36 @@ void cl_arq_controller::process_control_responder()
 			}
 		}
 
-		// Streaming compression negotiation
+		// Streaming compression is unconditional (CAP_STREAMING removed).
+		// Still requires compression to be on; -F off disables both.
+		if(compression_enabled)
 		{
-			bool streaming_ok = (local_capability & CAP_STREAMING)
-				&& (peer_capability & CAP_STREAMING)
-				&& compression_enabled;
-			if(streaming_ok)
-			{
-				compressor.streaming_enable();
-			}
-			else
-			{
-				printf("[STREAMING] Not enabled (local=0x%02X peer=0x%02X compress=%d)\n",
-					local_capability, peer_capability, compression_enabled);
-			}
+			compressor.streaming_enable();
 		}
 
-		// SACK negotiation
+		// SACK / SACK_V2 are unconditional (CAP_SACK + CAP_SACK_V2 removed).
+		// --no-sack still flips disable_sack which takes sack_enabled offline.
+		sack_enabled = !disable_sack;
+		sack_v2_enabled = sack_enabled;
+		if(sack_enabled)
 		{
-			bool both_sack = (local_capability & CAP_SACK)
-				&& (peer_capability & CAP_SACK);
-			sack_enabled = both_sack;
-			if(sack_enabled)
-			{
-				// Update batch size now that SACK is negotiated. 30s target
-				// matches the formula in arq_common.cc + arq_commander.cc.
-				int max_batch = (message_transmission_time_ms > 0)
-					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-				if(max_batch < 5) max_batch = 5;
-				if(max_batch > nMessages) max_batch = nMessages;
-				int new_batch = radio_batch_size;
-				if(new_batch > max_batch) new_batch = max_batch;
-				set_data_batch_size(new_batch);
-				nominal_batch_size = new_batch;
-				recalculate_ack_timeout_for_batch();
-				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
-					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
-			}
-			else
-			{
-				printf("[SACK] Not enabled (local=0x%02X peer=0x%02X)\n",
-					local_capability, peer_capability);
-			}
+			// Update batch size now that SACK is negotiated. 30s target
+			// matches the formula in arq_common.cc + arq_commander.cc.
+			int max_batch = (message_transmission_time_ms > 0)
+				? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+			if(max_batch < 5) max_batch = 5;
+			if(max_batch > nMessages) max_batch = nMessages;
+			int new_batch = radio_batch_size;
+			if(new_batch > max_batch) new_batch = max_batch;
+			set_data_batch_size(new_batch);
+			nominal_batch_size = new_batch;
+			recalculate_ack_timeout_for_batch();
+			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
+				radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
 		}
-
-		// SACK v2 negotiation (SACK_DESIGN_A_PLAN §4.2.4 Step 6).
-		// Mirrors the commander-side block. Negotiate-only at this step:
-		// sack_v2_enabled is computed and logged but gates NO functional
-		// behavior. TEST_CONNECTION wire shape is unchanged.
+		else
 		{
-			bool both_v2 = (local_capability & CAP_SACK_V2)
-				&& (peer_capability & CAP_SACK_V2);
-			sack_v2_enabled = both_v2;
-			printf("[SACK-V2] %s (local=0x%02X peer=0x%02X) — gates nothing yet\n",
-				sack_v2_enabled ? "enabled (negotiate-only)" : "not enabled",
-				local_capability, peer_capability);
+			printf("[SACK] Disabled by --no-sack\n");
 		}
 		fflush(stdout);
 
@@ -1914,13 +1900,13 @@ void cl_arq_controller::process_control_responder()
 			calculate_receiving_timeout();
 			receiving_timer.start();
 		}
-		else if((peer_capability & CAP_HANDSHAKE_ECHO)
-		        && (local_capability & CAP_HANDSHAKE_ECHO))
+		else
 		{
-			// v9 handshake echo. Replace the legacy ACK pattern with an LDPC
-			// TEST_CONNECTION_ACK frame carrying caps echo + CRC8. CMD
-			// validates before transitioning out of CONNECTION_ACCEPTED.
-			// Mirrors the KEY_EXCHANGE_1 LDPC ACK pattern below.
+			// Handshake echo (formerly v9 CAP_HANDSHAKE_ECHO, now unconditional).
+			// Replace the legacy ACK pattern with an LDPC TEST_CONNECTION_ACK
+			// frame carrying caps echo + CRC8. CMD validates before transitioning
+			// out of CONNECTION_ACCEPTED. Mirrors the KEY_EXCHANGE_1 LDPC ACK
+			// pattern below.
 			messages_control.data[0] = TEST_CONNECTION_ACK;
 			messages_control.data[1] = (char)peer_capability;   // echo CMD's caps
 			messages_control.data[2] = (char)local_capability;  // RSP's own caps
@@ -1934,10 +1920,6 @@ void cl_arq_controller::process_control_responder()
 				(unsigned char)local_capability,
 				(unsigned char)messages_control.data[3]);
 			fflush(stdout);
-		}
-		else
-		{
-			connection_status=ACKNOWLEDGING_CONTROL;
 		}
 		watchdog_timer.start();
 		link_timer.start();
@@ -2474,21 +2456,14 @@ void cl_arq_controller::process_buffer_data_responder()
 						b2f_buf, sizeof(b2f_buf));
 
 					// Auto-arm compression when B2F detected on RX path
+					// (CAP_COMPRESSION removed — always unconditional).
 					if(!compression_enabled && !force_compress && b2f_handler.is_b2f_session())
 					{
-						bool both_support = (local_capability & CAP_COMPRESSION) &&
-						                    (peer_capability & CAP_COMPRESSION);
-						if(both_support)
-						{
-							compression_enabled = true;
-							printf("[COMPRESS] Armed by B2F detection (responder)\n");
-							fflush(stdout);
-							// Enable streaming if both sides support it
-							bool streaming_ok = (local_capability & CAP_STREAMING)
-								&& (peer_capability & CAP_STREAMING);
-							if(streaming_ok && !compressor.is_streaming())
-								compressor.streaming_enable();
-						}
+						compression_enabled = true;
+						printf("[COMPRESS] Armed by B2F detection (responder)\n");
+						fflush(stdout);
+						if(!compressor.is_streaming())
+							compressor.streaming_enable();
 					}
 
 					if(b2f_len > 0)

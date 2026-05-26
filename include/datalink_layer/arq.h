@@ -726,10 +726,10 @@ public:
   bool sack_enabled;                   // Negotiated: both sides have CAP_SACK
   bool sack_v2_enabled;                // SACK Design A scaffolding (Step 6): both sides have CAP_SACK_V2.
                                        // NEGOTIATE-ONLY at this step — gates no behavior yet.
-  bool enable_sack_v2;                 // CLI opt-in to advertise CAP_SACK_V2 in local_capability.
-                                       // Persists across local_capability resets (CONNECT/LISTEN
-                                       // re-entry) so the negotiation survives mid-session resets.
-                                       // Default false — byte 5 of TEST_CONNECTION is unchanged.
+  bool enable_sack_v2;                 // Harness-compat no-op since CAP_SACK_V2 was removed
+                                       // (2026-05-24). SACK v2 is unconditional; --enable-sack-v2
+                                       // and --disable-sack-v2 still toggle this for tools that
+                                       // read it, but no wire behavior depends on it.
   int radio_batch_size;                // Total frames per radio TX (e.g., 25)
   int crypto_batch_size;               // Frames per encryption unit (e.g., 20)
   int retransmit_headroom;             // radio_batch_size - crypto_batch_size (e.g., 5)

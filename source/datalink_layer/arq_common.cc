@@ -149,17 +149,14 @@ cl_arq_controller::cl_arq_controller()
 	batch_rx_frame_count=0;
 	batch_data_delivered=false;
 
-	// SACK state initialization
-	sack_enabled=false;
-	sack_v2_enabled=false;   // Negotiated true post-TEST_CONNECTION when both peers advertise CAP_SACK_V2.
-	// SACK Design A Step 14 (post-§7.13.8 win-test, post-§7.13.10 Bug-C fix):
-	// CAP_SACK_V2 is now advertised BY DEFAULT. Both win-test cells (clean +
-	// WGN:32) showed sackv2 ≥ +13.1% vs no-SACK with zero crashes / LDPC
-	// miscorrections; Bug C v2.1 (ee6f285) enables first-ever CMD-side
-	// SACK_RSP decodes on lossy channels. To opt OUT: pass --disable-sack-v2
-	// on the CLI. Legacy `--enable-sack-v2` flag still accepted (no-op now,
-	// kept for tool-harness compatibility — see tools/sack_lossy_ab.py).
-	enable_sack_v2=true;     // Step 14: default ON
+	// SACK / SACK_V2 are unconditional after CAP_SACK + CAP_SACK_V2 removal.
+	// --no-sack still lets the operator disable SACK locally via disable_sack;
+	// negotiation is computed once at TEST_CONNECTION time in arq_responder.cc
+	// / arq_commander.cc using only the local flag. enable_sack_v2 stays true
+	// for harness compat (--enable-sack-v2 / --disable-sack-v2 are no-ops now).
+	sack_enabled=false;       // Set at TEST_CONNECTION negotiation.
+	sack_v2_enabled=false;    // Set at TEST_CONNECTION negotiation.
+	enable_sack_v2=true;
 	radio_batch_size=25;
 	crypto_batch_size=20;
 	retransmit_headroom=5;
@@ -301,10 +298,7 @@ cl_arq_controller::cl_arq_controller()
 	// partial-batch recovery, piggyback retx, and all of Design A's gains.
 	// Opt-out remains available via --no-sack / --disable-sack-v2.
 	disable_sack=false;
-	local_capability=CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK;
-	if(disable_sack) local_capability &= ~CAP_SACK;
-	if(enable_sack_v2) local_capability |= CAP_SACK_V2;
-	local_capability |= CAP_HANDSHAKE_ECHO;  // v9
+	local_capability=0;  // CAP_WB_CAPABLE / CAP_ENCRYPTION set per-mode at LISTEN ON / CONNECT.
 	peer_capability=0;
 	handshake_confirmed=false;
 	handshake_retries_left=MAX_HANDSHAKE_RETRIES;
@@ -2396,18 +2390,14 @@ void cl_arq_controller::process_main()
 						tcp_socket_data.message->length,
 						b2f_buf, sizeof(b2f_buf));
 
-					// Auto-arm compression when B2F SID detected (Winlink traffic)
+					// Auto-arm compression when B2F SID detected (Winlink traffic).
+					// CAP_COMPRESSION removed — always unconditional.
 					if(!compression_enabled && !force_compress &&
 					   !b2f_compression_pending && b2f_handler.is_b2f_session())
 					{
-						bool both_support = (local_capability & CAP_COMPRESSION) &&
-						                    (peer_capability & CAP_COMPRESSION);
-						if(both_support)
-						{
-							b2f_compression_pending = true;
-							printf("[COMPRESS] B2F detected — will arm on next ACK\n");
-							fflush(stdout);
-						}
+						b2f_compression_pending = true;
+						printf("[COMPRESS] B2F detected — will arm on next ACK\n");
+						fflush(stdout);
 					}
 
 					if(b2f_len > 0)
@@ -2571,10 +2561,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
-		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
-		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
-		local_capability |= CAP_HANDSHAKE_ECHO;  // v9 — always advertise
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2671,10 +2658,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
-		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
-		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
-		local_capability |= CAP_HANDSHAKE_ECHO;  // v9 — always advertise
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2710,9 +2694,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
-		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
-		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
+		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -2730,9 +2712,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
-		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
-		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2751,9 +2731,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING | CAP_SACK | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
-		if(disable_sack) local_capability &= ~CAP_SACK;  // Phase-2 --no-sack
-		if(enable_sack_v2) local_capability |= CAP_SACK_V2;  // Step 6 scaffolding
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif

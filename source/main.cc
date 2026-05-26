@@ -1521,18 +1521,15 @@ start_modem:
             printf("[FLAG] --alsa-buffer-ms=%d (Linux only)\n", audio_buffer_ms_cli);
         }
         if (no_sack_cli) {
+            // CAP_SACK + CAP_SACK_V2 removed from wire — the flag now just
+            // sets the local disable_sack which the negotiation block in
+            // arq_responder.cc / arq_commander.cc reads to take SACK offline.
             ARQ.disable_sack = true;
             ARQ.enable_sack_v2 = false;
-            ARQ.local_capability &= ~CAP_SACK;
-            ARQ.local_capability &= ~CAP_SACK_V2;  // Bug 4: also strip v2
-                                                   // so --no-sack is a complete
-                                                   // opt-out (was leaking v2 on)
-            printf("[FLAG] --no-sack: CAP_SACK + CAP_SACK_V2 masked from "
-                   "local_capability (full opt-out; default is now ON)\n");
+            printf("[FLAG] --no-sack: SACK disabled locally\n");
         }
         if (enable_sack_cli) {
             ARQ.disable_sack = false;
-            ARQ.local_capability |= CAP_SACK;
             printf("[FLAG] --enable-sack: no-op (SACK is ON by default since Design A)\n");
         }
         if (no_sack_cli && enable_sack_cli) {
@@ -1540,17 +1537,14 @@ start_modem:
             exit(1);
         }
         if (enable_sack_v2_cli) {
-            // SACK Design A Step 14: default is now ON. This flag is a no-op
-            // kept for harness compatibility. The init in arq_common.cc:131
-            // already set ARQ.enable_sack_v2 = true.
-            printf("[FLAG] --enable-sack-v2: no-op (default ON since SACK Design A Step 14)\n");
+            printf("[FLAG] --enable-sack-v2: no-op (CAP_SACK_V2 removed; v2 always on)\n");
         }
         if (disable_sack_v2_cli) {
-            // SACK Design A Step 14: opt out — force CAP_SACK_V2 off.
+            // Wire CAP bit is gone — disabling v2 now means disabling SACK entirely.
             ARQ.enable_sack_v2 = false;
-            ARQ.local_capability &= ~CAP_SACK_V2;
-            printf("[FLAG] --disable-sack-v2: CAP_SACK_V2 removed from local_capability "
-                   "(v1-only ACK behavior — SACK Design A Step 14 opt-out)\n");
+            ARQ.disable_sack = true;
+            printf("[FLAG] --disable-sack-v2: SACK disabled locally "
+                   "(CAP_SACK_V2 removed; behaves like --no-sack)\n");
         }
         if (test_rsp_bsi_corrupt_at_cli > 0) {
             ARQ.test_rsp_bsi_corrupt_at = test_rsp_bsi_corrupt_at_cli;
@@ -2031,10 +2025,7 @@ start_modem:
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
-                             | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING
-                             | (ARQ.disable_sack ? 0 : CAP_SACK)
-                             | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0)
-                             | CAP_HANDSHAKE_ECHO;  // v9
+                             ;
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
@@ -2061,10 +2052,7 @@ start_modem:
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
-                             | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING
-                             | (ARQ.disable_sack ? 0 : CAP_SACK)
-                             | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0)
-                             | CAP_HANDSHAKE_ECHO;  // v9
+                             ;
         ARQ.force_compress = (force_compress_cli == 1);
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
@@ -2182,11 +2170,7 @@ start_modem:
                 ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;
                 ARQ.bandwidth_mode = g_gui_state.bandwidth_mode.load();
                 ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
-                                    | CAP_COMPRESSION | CAP_B2F_UNROLL | CAP_STREAMING
-                                    | (ARQ.disable_sack   ? 0 : CAP_SACK)
-                                    | (ARQ.enable_sack_v2 ? CAP_SACK_V2 : 0)
-                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0)
-                                    | CAP_HANDSHAKE_ECHO;  // v9
+                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
                 // narrowband_enabled is set at startup (line ~728) based on -Q and -M flags.
                 // Do NOT override here — forcing NB on telecom_system while the actual
                 // config is WB causes get_tx_gain() to return NB gains (+7 dB overboosted).

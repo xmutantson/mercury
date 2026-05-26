@@ -105,11 +105,10 @@
                                 // Phase: SCAFFOLDING — message type defined, RSP-side no-op
                                 // stub logs receipt only; no CMD-side sender; no state mutation.
                                 // Gated behavior arrives in later Design A steps.
-#define TEST_CONNECTION_ACK 0x45  // v9 handshake echo. RSP-initiated LDPC reply
-                                // to CMD's TEST_CONNECTION, sent in place of
-                                // the legacy ACK pattern when both peers have
-                                // CAP_HANDSHAKE_ECHO. Wire payload after the
-                                // 3-byte msg header:
+#define TEST_CONNECTION_ACK 0x45  // Handshake echo. RSP-initiated LDPC reply
+                                // to CMD's TEST_CONNECTION, always sent in
+                                // place of the legacy ACK pattern. Wire
+                                // payload after the 3-byte msg header:
                                 //   [echoed_peer_cap : u8]
                                 //   [own_capability : u8]
                                 //   [CRC8 : u8]
@@ -120,26 +119,12 @@
 // the MFSK ACK+SACK pattern carrying [bsi:8|bitmap:32|crc12:12] —
 // see mercury/fact-documents/mfsk-robust-ack.md).
 
-// Capability flags (embedded in TEST_CONNECTION byte 5)
+// Capability flags (embedded in TEST_CONNECTION byte 5).
+// Down to two bits after the 2026-05-24 capability cleanup: compression /
+// streaming / B2F unroll / SACK / SACK_v2 / handshake-echo were always-on or
+// CLI-only and are now unconditional in the codebase.
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
-#define CAP_COMPRESSION  0x02   // Supports block compression (PPMd/zstd)
-#define CAP_B2F_UNROLL   0x04   // Supports B2F LZHUF unroll/reroll (Winlink optimization)
-#define CAP_ENCRYPTION   0x08   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
-#define CAP_STREAMING    0x10   // Supports streaming compression context (PPMd carry + zstd prefix)
-#define CAP_SACK         0x20   // Supports selective ACK (partial batch retransmission)
-#define CAP_HANDSHAKE_ECHO 0x80 // v9 — peer supports TEST_CONNECTION_ACK LDPC echo.
-                                // When both peers advertise, RSP sends LDPC ACK
-                                // (instead of MFSK pattern) carrying caps echo;
-                                // CMD validates before completing handshake.
-                                // Catches silent capability-byte corruption
-                                // (cfg=6/wgn24 0-bps bug, 2026-05-23).
-#define CAP_SACK_V2      0x40   // SACK Design A (OFDM SACK_RSP + DATA batch_seq_id + multi-axis gearshift)
-                                // Phase: NEGOTIATE-ONLY. Setting this bit currently gates NO
-                                // behavior — the sack_v2_enabled flag is computed (both peers
-                                // must advertise it) and logged but does not change any wire
-                                // path. Opt-in via --enable-sack-v2 CLI flag; default builds
-                                // do NOT set it in local_capability, so byte 5 of
-                                // TEST_CONNECTION is bit-identical to pre-Step-6 by default.
+#define CAP_ENCRYPTION   0x02   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
