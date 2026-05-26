@@ -4684,6 +4684,11 @@ void cl_telecom_system::load_configuration(int configuration)
 	ldpc.decoding_algorithm=default_configurations_telecom_system.ldpc_decoding_algorithm;
 	ldpc.GBF_eta=default_configurations_telecom_system.ldpc_GBF_eta;
 	ldpc.nIteration_max=default_configurations_telecom_system.ldpc_nIteration_max;
+	// Q3: ROBUST tier (rate-1/16 LDPC) needs more SPA iterations to converge at
+	// the waterfall. OFDM configs are above the cliff and 100 iter is plenty.
+	// See mfsk-vara-parity-plan.md §2.1 Q3.
+	if(is_robust_config(configuration))
+		ldpc.nIteration_max = 200;
 	ldpc.print_nIteration=default_configurations_telecom_system.ldpc_print_nIteration;
 
 	outer_code=default_configurations_telecom_system.outer_code;
