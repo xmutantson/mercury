@@ -520,14 +520,18 @@ float cl_mfsk::tone_to_snr(int tone) const
 // MSB-first across the suffix. Each tone is in [0, M-1].
 //   WB M=16 → 4 bits/tone, 10 tones for 40 bits.
 //   NB M=8 currently returns 0 (deferred).
-int cl_mfsk::pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, int* out_tones) const
+int cl_mfsk::pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, uint16_t crc12,
+                                   int* out_tones) const
 {
 	int n = ack_sack_suffix_len();
 	if (n == 0 || M < 16) return 0;
 	int bits_per_tone = 0;
 	for (int m = M; m > 1; m >>= 1) bits_per_tone++;  // log2(M); 4 for M=16
-	uint64_t payload = ((uint64_t)bsi << 32) | (uint64_t)bitmap;  // [bsi(8) | bitmap(32)]
-	int total_bits = 8 + 32;
+	// 52-bit payload: [bsi(8) | bitmap(32) | crc12(12)], MSB-first.
+	uint64_t payload = ((uint64_t)bsi << 44)
+	                 | ((uint64_t)bitmap << 12)
+	                 | ((uint64_t)(crc12 & 0x0FFF));
+	int total_bits = 8 + 32 + 12;
 	int mask = M - 1;
 	for (int g = 0; g < n; g++) {
 		int shift = total_bits - bits_per_tone * (g + 1);
@@ -537,9 +541,11 @@ int cl_mfsk::pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, int* out_tones)
 	return n;
 }
 
-// Inverse of pack_ack_sack_payload. Reconstruct (bsi, bitmap) from N tones.
+// Inverse of pack_ack_sack_payload. Reconstruct (bsi, bitmap, crc12) from N tones.
+// Caller verifies crc12 separately by re-computing CRC12 over [bsi || bitmap].
 bool cl_mfsk::unpack_ack_sack_payload(const int* in_tones,
-                                      uint8_t* out_bsi, uint32_t* out_bitmap) const
+                                      uint8_t* out_bsi, uint32_t* out_bitmap,
+                                      uint16_t* out_crc12) const
 {
 	int n = ack_sack_suffix_len();
 	if (n == 0 || M < 16) return false;
@@ -550,8 +556,10 @@ bool cl_mfsk::unpack_ack_sack_payload(const int* in_tones,
 		uint64_t t = (uint64_t)(in_tones[g] & (M - 1));
 		payload = (payload << bits_per_tone) | t;
 	}
-	*out_bsi    = (uint8_t)((payload >> 32) & 0xFF);
-	*out_bitmap = (uint32_t)(payload & 0xFFFFFFFFULL);
+	// payload now holds 52 bits in its low bits: [bsi(8) | bitmap(32) | crc12(12)].
+	*out_crc12  = (uint16_t)(payload & 0x0FFF);
+	*out_bitmap = (uint32_t)((payload >> 12) & 0xFFFFFFFFULL);
+	*out_bsi    = (uint8_t)((payload >> 44) & 0xFF);
 	return true;
 }
 
@@ -568,12 +576,15 @@ bool cl_mfsk::unpack_ack_sack_payload(const int* in_tones,
 // — that inversion happens inside decode_suffix_tones; this function only
 // runs the bit-level unpack on the result.
 bool cl_mfsk::decode_ack_sack_from_last_capture(uint8_t* out_bsi,
-                                                uint32_t* out_bitmap)
+                                                uint32_t* out_bitmap,
+                                                uint16_t* out_crc12)
 {
 	if (ack_sack_suffix_len() == 0) return false;  // NB or unsupported
 	if (!last_ack_sack_capture_valid) return false;
-	if (out_bsi == nullptr || out_bitmap == nullptr) return false;
-	return unpack_ack_sack_payload(last_ack_sack_suffix_tones, out_bsi, out_bitmap);
+	if (out_bsi == nullptr || out_bitmap == nullptr || out_crc12 == nullptr)
+		return false;
+	return unpack_ack_sack_payload(last_ack_sack_suffix_tones,
+	                               out_bsi, out_bitmap, out_crc12);
 }
 
 // Test-only injection point: stuff de-hopped payload tones directly into
@@ -598,8 +609,11 @@ void cl_mfsk::test_inject_ack_sack_capture(const int* tones, int count)
 
 // Generate ACK pattern + ack_sack_suffix_len() ACK+SACK suffix symbols.
 // Suffix layout mirrors generate_ack_snr_pattern: same tone-hopping formula.
+// Caller computes crc12 over [bsi || bitmap] and passes it; we don't compute
+// it here because cl_mfsk has no access to the ARQ-layer CRC12_calc helper.
 void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
-                                        uint8_t bsi, uint32_t bitmap)
+                                        uint8_t bsi, uint32_t bitmap,
+                                        uint16_t crc12)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
 	int suffix_len = ack_sack_suffix_len();
@@ -608,9 +622,9 @@ void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
 	// First: generate the standard ACK base pattern (16 symbols WB)
 	generate_ack_pattern(pattern_out);
 
-	// Pack payload into per-symbol tones
-	int payload_tones[16];  // bounded by max suffix
-	pack_ack_sack_payload(bsi, bitmap, payload_tones);
+	// Pack [bsi:8 | bitmap:32 | crc12:12] = 52 bits into per-symbol tones.
+	int payload_tones[MAX_ACK_SACK_SUFFIX];
+	pack_ack_sack_payload(bsi, bitmap, crc12, payload_tones);
 
 	double amp = sqrt((double)Nc / nStreams);
 	for (int s = 0; s < suffix_len; s++) {

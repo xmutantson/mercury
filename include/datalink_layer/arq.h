@@ -323,6 +323,14 @@ public:
 
   uint8_t CRC8_calc(char* data_byte, int nItems);
 
+  // CRC-12 over `nBytes` bytes, MSB-first, returning a 12-bit value in the
+  // low 12 bits of the uint16_t. Polynomial = POLY_CRC12 = 0xF13
+  // (CRC-12-CDMA2000 forward), init = 0xFFF, no final XOR. Used to protect
+  // the 40-bit MFSK ACK+SACK payload (`bsi:8 | bitmap:32`) against false-
+  // accept after pattern correlator lock. See
+  // mercury/fact-documents/mfsk-robust-ack.md §3.2.
+  uint16_t CRC12_calc(const char* data_byte, int nBytes);
+
 	//! Updates timers values and check for timeouts.
 	    /*!
 	      \return None
@@ -436,28 +444,17 @@ public:
   bool decode_sack_v2_frame(bool* out_bitmap, int nframes,
                             unsigned char* out_batch_seq_id);
 
-  // §7.13.30 — OFDM-only clean-batch ACK. Replaces send_ack_pattern() on
-  // sack_v2_enabled sessions so the SACK window contains ONLY OFDM
-  // signals (no MFSK ACK to disambiguate from SACK_RSP). Wire payload
-  // [batch_seq_id : u8][CRC8 : u8]. Type = OFDM_ACK_CLEAN (0x44).
-  // Pre-conditions: caller has verified sack_v2_enabled.
-  long long send_ofdm_ack_clean(unsigned char batch_seq_id);
-  // §7.13.30 — Decode an OFDM_ACK_CLEAN frame. Called when receive()
-  // landed a frame with messages_rx_buffer.type == OFDM_ACK_CLEAN.
-  // Validates CRC8. On success: writes batch_seq_id to *out_batch_seq_id,
-  // returns true. On CRC fail: emits diagnostic, returns false.
-  bool decode_ofdm_ack_clean(unsigned char* out_batch_seq_id);
-
-  // Step 4 of MFSK-suffix ACK+SACK redesign — RSP-side TX wrapper.
-  // Send the MFSK ACK+SACK pattern (16 base + 10 suffix = 26 symbols on WB)
-  // carrying batch_seq_id and per-frame bitmap. Replaces OFDM_ACK_CLEAN
-  // (clean batch: bitmap = all 1s) and SACK_RSP (partial batch: bitmap =
-  // actual mask). WB-only — caller must check ack_sack_suffix_len() > 0
-  // before calling (or this returns 0 and the caller should fall back to
-  // the OFDM path).
+  // RSP-side TX wrapper. Send the MFSK ACK+SACK pattern (16 base +
+  // 13 suffix = 29 symbols on WB) carrying [bsi:8 | bitmap:32 | crc12:12].
+  // WB-only — caller must check ack_sack_suffix_len() > 0 before
+  // calling (or this returns 0 and the caller falls back to the
+  // legacy MFSK ACK pattern for NB / unsupported configurations).
+  // OFDM_ACK_CLEAN was removed 2026-05-24 — see mfsk-robust-ack.md.
   //
   // Returns wall-clock TX time in ms, or 0 if the feature is unavailable
   // (NB session, M < 16, or compile-time gate MFSK_ACK_SACK_ENABLED=0).
+  // Computes CRC12 over [bsi || bitmap] internally and emits the 16-symbol
+  // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:32 | crc12:12].
   long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap);
 
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern

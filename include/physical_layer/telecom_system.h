@@ -151,19 +151,22 @@ public:
 	double ack_pattern_detection_threshold;  // metric threshold for detection
 	int generate_ack_pattern_passband(double* out);  // TX: returns samples written
 	int generate_ack_snr_pattern_passband(double* out, float snr);  // TX: ACK + SNR suffix, returns samples
-	// TX: ACK base + 10-symbol ACK+SACK suffix carrying [bsi:8 | bitmap:32].
-	// Returns samples written, or 0 if unsupported (NB / M<16).
-	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap);
+	// TX: ACK base + 13-symbol ACK+SACK suffix carrying
+	// [bsi:8 | bitmap:32 | crc12:12]. Returns samples written, or 0 if
+	// unsupported (NB / M<16). Caller supplies the crc12.
+	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12);
 	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr);  // RX: returns metric
 	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	// RX: detect ACK pattern and decode the 40-bit ACK+SACK suffix (WB M>=16
 	// only). Runs detector + ofdm.decode_suffix_tones + unpack in one call —
 	// also useful as a unit-test entry point. Returns true on clean decode
-	// (bsi/bitmap reflect transmitted values); false on no detection or
-	// unsupported M. *out_matched (optional) gets the base-pattern match
-	// count for diagnostics.
+	// (bsi/bitmap/crc12 reflect transmitted values); false on no detection
+	// or unsupported M. *out_matched (optional) gets the base-pattern match
+	// count for diagnostics. Caller verifies crc12 by re-computing CRC12
+	// over [bsi || bitmap] (mismatch → treat as no-ACK).
 	bool decode_ack_sack_from_passband(double* data, int size,
 	                                   uint8_t* out_bsi, uint32_t* out_bitmap,
+	                                   uint16_t* out_crc12,
 	                                   int* out_matched = nullptr);
 	void ack_pattern_detection_test();  // SNR sweep + false alarm test
 

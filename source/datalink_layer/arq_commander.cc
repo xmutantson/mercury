@@ -2148,14 +2148,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// untouched. Gated on:
 					//   - MFSK_ACK_SACK_ENABLED  (compile-time master switch)
 					//   - ack_sack_suffix_len() > 0  (WB only; NB has M<16)
-					//   - optimizer_is_in_control()  (only inside the Q-table band so
-					//     we don't risk false-fires in the gearshift band where ACK
-					//     base-pattern margins haven't been characterized for the
-					//     +suffix capture path)
+					// (optimizer_is_in_control() gate dropped 2026-05-24 — the
+					//  pattern correlator floor + CRC12 false-accept guard make
+					//  this path safe below the Q-table band too, and we want
+					//  ROBUST_0-grade ACK survival precisely where the optimizer
+					//  isn't yet active. See mfsk-robust-ack.md §3 / §8 step 5.)
 					bool mfsk_handled_this_poll = false;
 #if MFSK_ACK_SACK_ENABLED
-					if(telecom_system->ack_mfsk.ack_sack_suffix_len() > 0
-					   && optimizer_is_in_control())
+					if(telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 					{
 						// Snapshot the passband tail — same window math as
 						// receive_ack_pattern() (arq_common.cc:4966-4983).
@@ -2187,10 +2187,37 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 						uint8_t  rx_bsi = 0;
 						uint32_t rx_bitmap = 0;
+						uint16_t rx_crc12 = 0;
 						int      mfsk_matched = 0;
 						bool decoded = telecom_system->decode_ack_sack_from_passband(
 							telecom_system->data_container.ready_to_process_passband_delayed_data,
-							tail_samples, &rx_bsi, &rx_bitmap, &mfsk_matched);
+							tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+
+						// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
+						// On mismatch, treat as no-ACK — the timeout-retransmit path
+						// is the safe fallback when a corrupted "looks like a clean
+						// ACK" frame could otherwise cause silent data loss.
+						if(decoded)
+						{
+							char crc_input[5];
+							crc_input[0] = (char)rx_bsi;
+							crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
+							crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
+							crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
+							crc_input[4] = (char)( rx_bitmap        & 0xFF);
+							uint16_t expected_crc12 = CRC12_calc(crc_input, 5);
+							if(rx_crc12 != expected_crc12)
+							{
+								printf("[CMD-MFSK-ACK-SACK] CRC12 fail "
+									"bsi=%u bitmap=0x%08x rx_crc=0x%03x expected=0x%03x "
+									"matched=%d — discarding\n",
+									(unsigned)rx_bsi, (unsigned)rx_bitmap,
+									(unsigned)rx_crc12, (unsigned)expected_crc12,
+									mfsk_matched);
+								fflush(stdout);
+								decoded = false;
+							}
+						}
 
 						if(decoded)
 						{
@@ -2392,28 +2419,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						}
 						messages_rx_buffer.status = FREE;
 					}
-					else if(messages_rx_buffer.status == RECEIVED
-					        && messages_rx_buffer.type == OFDM_ACK_CLEAN)
-					{
-						// §7.13.30 — clean-batch OFDM ACK. No bitmap; just
-						// validate CRC and accept as a full-batch ACK via the
-						// existing v2_ack_pat_pre_detected → ACK_PAT handler
-						// fallthrough (line ~2031). This replaces the MFSK
-						// ACK path that v2 sessions no longer use.
-						unsigned char rx_bsi = 0;
-						bool decoded = decode_ofdm_ack_clean(&rx_bsi);
-						SACK_TRACE("decode_ofdm_ack_clean: ok=%d rx_bsi=%u cmd_bsi=%d",
-							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
-						if(decoded)
-						{
-							v2_ack_pat_pre_detected = true;
-							int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
-							printf("[CMD-OFDM-ACK-CLEAN] accepted batch_seq_id=%u (cmd_batch_seq_id=%d) arrival_ms=%d\n",
-								(unsigned)rx_bsi, cmd_batch_seq_id, arrival_ms);
-							fflush(stdout);
-						}
-						messages_rx_buffer.status = FREE;
-					}
+					// OFDM_ACK_CLEAN dispatch removed 2026-05-24. Clean-batch
+					// ACKs now arrive via the MFSK ACK+SACK pattern handled
+					// above; no OFDM frame ever bears type==OFDM_ACK_CLEAN.
 					} // end if(!mfsk_handled_this_poll) — Step 6 MFSK probe gate
 				}
 				// Step 15: legacy MFSK SACK receive path deleted. When

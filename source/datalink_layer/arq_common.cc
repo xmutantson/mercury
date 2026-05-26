@@ -3205,15 +3205,6 @@ void cl_arq_controller::send(st_message* message, int message_location)
 		message_TxRx_byte_buffer[2]=message->sequence_number;
 		header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	}
-	else if (message->type==OFDM_ACK_CLEAN)
-	{
-		// §7.13.30 — OFDM_ACK_CLEAN control frame. Same 3-byte header as
-		// SACK_RSP; payload [batch_seq_id, CRC8] in message->data.
-		message_TxRx_byte_buffer[0]=message->type;
-		message_TxRx_byte_buffer[1]=connection_id;
-		message_TxRx_byte_buffer[2]=message->sequence_number;
-		header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
-	}
 	else if (message->type==CONTROL || message->type==ACK_CONTROL)
 	{
 		message_TxRx_byte_buffer[0]=message->type;
@@ -3416,19 +3407,6 @@ void cl_arq_controller::send_batch()
 			// payload [batch_seq_id, bitmap..., CRC8] is carried in
 			// messages_batch_tx[i].data[..] verbatim. Symmetric with the send()
 			// branch above.
-			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
-			message_TxRx_byte_buffer[1]=connection_id;
-			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
-			header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
-		}
-		else if (messages_batch_tx[i].type==OFDM_ACK_CLEAN)
-		{
-			// §7.13.30 — OFDM_ACK_CLEAN. Same 3-byte standard header
-			// as SACK_RSP; payload [batch_seq_id, CRC8] is in
-			// messages_batch_tx[i].data[..] verbatim. Without this
-			// case, byte 0 (type) was never written to the wire and
-			// the RX side decoded a frame with type=0x00 — the v16
-			// silent-drop bug.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
 			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
@@ -4297,77 +4275,20 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	return elapsed_ms;
 }
 
-// §7.13.30 — OFDM-only clean-batch ACK. Wire layout AFTER the standard
-// 3-byte msg header [type=OFDM_ACK_CLEAN, conn_id, seq_num=0]:
-//   payload = [batch_seq_id : u8][CRC8 : u8]
-// CRC8 covers batch_seq_id only. The standard msg header is already
-// protected by the OFDM LDPC codeword's CRC16 so doesn't need its own CRC8.
-long long cl_arq_controller::send_ofdm_ack_clean(unsigned char batch_seq_id)
-{
-	if(passive_monitor) return 0;
-
-	unsigned char payload[2];
-	payload[0] = batch_seq_id;
-	payload[1] = CRC8_calc((char*)payload, 1);
-
-	printf("[TX-OFDM-ACK-CLEAN] batch_seq_id=%u crc8=0x%02x\n",
-		(unsigned)batch_seq_id, (unsigned)payload[1]);
-	fflush(stdout);
-
-	// Stage via messages_control (same pattern as send_sack_v2_frame).
-	// Bug B fix idiom (§7.13.5): struct-copy from messages_control which
-	// has a pre-allocated .data buffer, so messages_batch_tx[0].data is
-	// non-NULL when send_batch() reads it.
-	messages_control.type = OFDM_ACK_CLEAN;
-	messages_control.sequence_number = 0;
-	messages_control.id = 0;
-	messages_control.length = sizeof(payload);
-	messages_control.data[0] = (char)payload[0];
-	messages_control.data[1] = (char)payload[1];
-	messages_control.status = ADDED_TO_BATCH_BUFFER;
-	messages_control.batch_seq_id = batch_seq_id;
-
-	message_batch_counter_tx = 0;
-	messages_batch_tx[0] = messages_control;
-	message_batch_counter_tx = 1;
-
-	// OFDM frame on the data configuration (single-shot, same as SACK_RSP).
-	telecom_system->set_mfsk_ctrl_mode(false);
-
-	SACK_TRACE("RSP TX OFDM_ACK_CLEAN: bsi=%u crc8=0x%02x",
-		(unsigned)batch_seq_id, (unsigned)payload[1]);
-	auto t_start = std::chrono::steady_clock::now();
-	send_batch();
-	auto t_end = std::chrono::steady_clock::now();
-	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-		t_end - t_start).count();
-
-	// §7.13.32 — Release the staging slot AFTER the wire TX completes.
-	// See parallel comment in send_sack_v2_frame() above; the same
-	// root cause applies here (§7.13.31.1 SET_LINK_PARAMS handshake
-	// collapse). Without this clear, every inbound CONTROL frame
-	// arriving after a clean-batch OFDM ACK gets RX-CTRL-DROPped at
-	// arq_responder.cc:281 because messages_control is still marked
-	// ADDED_TO_BATCH_BUFFER from the TX staging.
-	messages_control.status = FREE;
-
-	printf("[TX-OFDM-ACK-CLEAN] send_batch() wire_ms=%lld\n", elapsed_ms);
-	fflush(stdout);
-	SACK_TRACE("RSP TX OFDM_ACK_CLEAN done: wire_ms=%lld", elapsed_ms);
-	return elapsed_ms;
-}
-
-// Step 4 of MFSK-suffix ACK+SACK redesign — RSP-side TX wrapper.
-// Send the MFSK ACK+SACK pattern (16 base + 10 suffix = 26 symbols on WB)
-// carrying batch_seq_id and per-frame bitmap. Replaces OFDM_ACK_CLEAN
-// (clean batch: bitmap = all 1s) and SACK_RSP (partial batch: actual mask).
+// RSP-side TX wrapper: MFSK ACK+SACK pattern (16 base + 13 suffix = 29
+// symbols on WB) carrying [bsi:8 | bitmap:32 | crc12:12]. Replaces the
+// removed OFDM_ACK_CLEAN clean-batch path AND covers the partial-batch
+// case (bitmap = actual per-frame mask). See
+// mercury/fact-documents/mfsk-robust-ack.md for the design.
 //
-// Models send_ack_pattern_with_snr() for shape; uses the new
+// Models send_ack_pattern_with_snr() for shape; uses
 // telecom_system->generate_ack_sack_pattern_passband() to produce the audio.
 //
 // WB-only — returns 0 if MFSK_ACK_SACK_ENABLED=0 at compile time, or if
-// the runtime mfsk M<16 (NB) so caller falls back to OFDM_ACK_CLEAN /
-// SACK_RSP. On WB, returns wall-clock TX time in ms.
+// the runtime mfsk M<16 (NB). On the NB path the caller falls back to
+// the legacy MFSK ACK pattern (no SACK; NB never had the symbol-rate
+// budget for SACK and the receiver implicitly treats any pattern hit
+// as a clean ACK). On WB, returns wall-clock TX time in ms.
 long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
                                                 uint32_t bitmap)
 {
@@ -4386,8 +4307,19 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	auto t_start = std::chrono::steady_clock::now();
 
-	printf("[TX-MFSK-ACK-SACK] batch_seq_id=%u bitmap=0x%08x nsymb=%d on CONFIG_%d\n",
-		(unsigned)batch_seq_id, (unsigned)bitmap, nsymb, current_configuration);
+	// Compute CRC12 over the 40-bit [bsi || bitmap] payload (big-endian).
+	// CRC12 protects against false-accept after correlator lock — see
+	// mercury/fact-documents/mfsk-robust-ack.md §3.2.
+	char crc_input[5];
+	crc_input[0] = (char)batch_seq_id;
+	crc_input[1] = (char)((bitmap >> 24) & 0xFF);
+	crc_input[2] = (char)((bitmap >> 16) & 0xFF);
+	crc_input[3] = (char)((bitmap >>  8) & 0xFF);
+	crc_input[4] = (char)( bitmap        & 0xFF);
+	uint16_t crc12 = CRC12_calc(crc_input, 5);
+
+	printf("[TX-MFSK-ACK-SACK] batch_seq_id=%u bitmap=0x%08x crc12=0x%03x nsymb=%d on CONFIG_%d\n",
+		(unsigned)batch_seq_id, (unsigned)bitmap, (unsigned)crc12, nsymb, current_configuration);
 	fflush(stdout);
 
 	// Guard delay for MFSK modes (same as send_ack_pattern_with_snr)
@@ -4418,7 +4350,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	// Generate ACK+SACK pattern passband into the middle section
 	telecom_system->generate_ack_sack_pattern_passband(&raw_output[symbol_period],
-		batch_seq_id, bitmap);
+		batch_seq_id, bitmap, crc12);
 
 	// Pad start and end with copies of first/last symbol for FIR boundary
 	memcpy(&raw_output[0], &raw_output[symbol_period],
@@ -4517,34 +4449,6 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		t_end - t_start).count();
 	return elapsed_ms;
 #endif  // MFSK_ACK_SACK_ENABLED
-}
-
-// §7.13.30 — Decode an OFDM_ACK_CLEAN frame. Caller has verified
-// messages_rx_buffer.type == OFDM_ACK_CLEAN and status == RECEIVED.
-// On CRC pass: writes batch_seq_id to *out_batch_seq_id, returns true.
-// On CRC fail: emits diagnostic, returns false (no fabrication).
-bool cl_arq_controller::decode_ofdm_ack_clean(unsigned char* out_batch_seq_id)
-{
-	unsigned char payload[2];
-	payload[0] = (unsigned char)messages_rx_buffer.data[0];
-	payload[1] = (unsigned char)messages_rx_buffer.data[1];
-
-	unsigned char rx_crc       = payload[1];
-	unsigned char computed_crc = CRC8_calc((char*)payload, 1);
-
-	if(rx_crc != computed_crc)
-	{
-		printf("[CMD-OFDM-ACK-CLEAN-CRC-FAIL] rx_crc=0x%02x computed=0x%02x bsi=0x%02x (discarding; no fabrication)\n",
-			(unsigned)rx_crc, (unsigned)computed_crc, (unsigned)payload[0]);
-		fflush(stdout);
-		return false;
-	}
-
-	*out_batch_seq_id = payload[0];
-	printf("[CMD-OFDM-ACK-CLEAN] decoded batch_seq_id=%u crc8_ok=0x%02x\n",
-		(unsigned)payload[0], (unsigned)rx_crc);
-	fflush(stdout);
-	return true;
 }
 
 bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
@@ -5679,20 +5583,15 @@ void cl_arq_controller::receive()
 						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+ACK_MULTI_ACK_RANGE_HEADER_LENGTH];
 					}
 				}
-				else if(messages_rx_buffer.type==SACK_RSP
-				        || messages_rx_buffer.type==OFDM_ACK_CLEAN)
+				else if(messages_rx_buffer.type==SACK_RSP)
 				{
-					SACK_TRACE("receive() parsed %s frame: seq=%d conn_id=0x%02x",
-						messages_rx_buffer.type==SACK_RSP ? "SACK_RSP" : "OFDM_ACK_CLEAN",
+					SACK_TRACE("receive() parsed SACK_RSP frame: seq=%d conn_id=0x%02x",
 						(int)messages_rx_buffer.sequence_number,
 						(unsigned char)message_TxRx_byte_buffer[1]);
-					// SACK Design A Step 7 / §7.13.30 — OFDM SACK_RSP and
-					// OFDM_ACK_CLEAN share the same wire shape (3-byte msg
-					// header + payload). Payload bytes live in
-					// messages_rx_buffer.data[0..]. Length is derived by the
-					// caller (decode_sack_v2_frame for SACK_RSP, or
-					// decode_ofdm_ack_clean for OFDM_ACK_CLEAN). We DO NOT
-					// decode here — only copy the payload bytes.
+					// SACK Design A Step 7 — OFDM SACK_RSP wire shape:
+					// 3-byte msg header + payload in messages_rx_buffer.data[0..].
+					// Caller (decode_sack_v2_frame) derives length from the
+					// payload layout. We DO NOT decode here — only copy bytes.
 					int copy_len = max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 					if(copy_len > alloc_size) copy_len = alloc_size;
 					for(int j=0;j<copy_len;j++)
@@ -5966,7 +5865,7 @@ void cl_arq_controller::receive()
 					if(received_message_stats.frame_data_missing)
 					{
 						// §7.13.36 — During a v2 SACK polling window, an
-						// in-flight SACK_RSP / OFDM_ACK_CLEAN may be
+						// in-flight SACK_RSP (OFDM partial-batch ACK) may be
 						// detected preamble-first because the data symbols
 						// haven't fully arrived in the ring yet (sub-frame
 						// timing race amplified by compression CPU jitter
@@ -6870,6 +6769,27 @@ void cl_arq_controller::print_stats()
 	printf("RX buffer occupancy= %.2f %%\n", (float)(fifo_buffer_rx.get_size()-fifo_buffer_rx.get_free_size())*100.0f/(float)fifo_buffer_rx.get_size());
 	printf("Backup buffer occupancy= %.2f %%\n", (float)(fifo_buffer_backup.get_size()-fifo_buffer_backup.get_free_size())*100.0f/(float)fifo_buffer_backup.get_size());
 	fflush(stdout);
+}
+
+uint16_t cl_arq_controller::CRC12_calc(const char* data_byte, int nBytes)
+{
+	// MSB-first / forward CRC-12 with POLY_CRC12=0xF13 (CRC-12-CDMA2000),
+	// init 0xFFF, no final XOR. Distinct from CRC8_calc() which uses the
+	// reflected/right-shift variant for legacy compatibility.
+	uint16_t crc = 0xFFF;
+	for(int j=0; j < nBytes; j++)
+	{
+		crc ^= ((uint16_t)(uint8_t)data_byte[j]) << 4;
+		for (int i = 0; i < 8; i++)
+		{
+			if (crc & 0x800)
+				crc = (uint16_t)((crc << 1) ^ POLY_CRC12);
+			else
+				crc = (uint16_t)(crc << 1);
+		}
+		crc &= 0xFFF;
+	}
+	return crc;
 }
 
 uint8_t cl_arq_controller::CRC8_calc(char* data_byte, int nItems)

@@ -116,18 +116,9 @@
                                 // CRC8 over [echoed_peer_cap, own_cap], POLY=0xF4.
                                 // CMD validates echoed_peer_cap == local_capability
                                 // before transitioning out of CONNECTION_ACCEPTED.
-#define OFDM_ACK_CLEAN   0x44   // §7.13.30 — OFDM-only clean-batch ACK. Replaces the MFSK
-                                // ACK pattern for sack_v2_enabled sessions so CMD never
-                                // has to distinguish MFSK vs OFDM signals in the SACK
-                                // window (both ACK paths are now OFDM). Wire payload
-                                // (after the standard 3-byte msg header):
-                                //   [batch_seq_id : u8][CRC8 : u8]
-                                // CRC8 covers batch_seq_id only (the wire header is
-                                // already protected by the OFDM LDPC codeword's CRC16).
-                                // Sent in place of send_ack_pattern() when ACK-GATE PASS
-                                // fires on a v2 session (clean batch). Partial batches
-                                // still use SACK_RSP. v1 (non-v2) sessions still use
-                                // MFSK ACK — unchanged.
+// 0x44 reserved (was OFDM_ACK_CLEAN; removed 2026-05-24, replaced by
+// the MFSK ACK+SACK pattern carrying [bsi:8|bitmap:32|crc12:12] —
+// see mercury/fact-documents/mfsk-robust-ack.md).
 
 // Capability flags (embedded in TEST_CONNECTION byte 5)
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
@@ -202,5 +193,9 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 #define INFINITE_ -1
 
 #define POLY_CRC8 0xF4
+// CRC-12-CDMA2000 forward polynomial (x^12 + x^11 + x^10 + x^9 + x^8 + x^4 + x + 1).
+// Used by CRC12_calc() over the 40-bit MFSK ACK+SACK payload — see
+// mercury/fact-documents/mfsk-robust-ack.md §3.2.
+#define POLY_CRC12 0xF13
 
 #endif

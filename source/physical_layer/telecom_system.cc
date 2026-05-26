@@ -3060,13 +3060,14 @@ int cl_telecom_system::generate_ack_snr_pattern_passband(double* out, float snr)
 	return ack_snr_pattern_passband_samples;
 }
 
-// TX: Generate ACK base + 10-symbol ACK+SACK suffix as passband audio.
-// Suffix carries [batch_seq_id:8 | bitmap:32] (40 bits, 4 bits/symbol on WB M=16).
-// Returns number of passband samples written, or 0 if unsupported (NB / M<16).
-// Mirrors generate_ack_snr_pattern_passband for shape — see Step 4 of the
-// MFSK-suffix ACK+SACK redesign.
+// TX: Generate ACK base + 13-symbol ACK+SACK suffix as passband audio.
+// Suffix carries [batch_seq_id:8 | bitmap:32 | crc12:12] (52 bits,
+// 4 bits/symbol on WB M=16). Caller computes the crc12 over [bsi || bitmap]
+// using cl_arq_controller::CRC12_calc and passes it through. Returns number
+// of passband samples written, or 0 if unsupported (NB / M<16). See
+// mercury/fact-documents/mfsk-robust-ack.md §3.2.
 int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
-	uint8_t batch_seq_id, uint32_t bitmap)
+	uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12)
 {
 	if(ack_sack_pattern_passband_samples <= 0) return 0;
 	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;  // NB unsupported
@@ -3075,9 +3076,9 @@ int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	// Generate subcarrier-domain ACK+SACK pattern (nsymb * Nc complex values).
-	// ofdm_framed_data is sized for max(Nsymb, 48) symbols × Nc — 26 fits easily.
+	// ofdm_framed_data is sized for max(Nsymb, 48) symbols × Nc — 29 fits easily.
 	ack_mfsk.generate_ack_sack_pattern(data_container.ofdm_framed_data,
-		batch_seq_id, bitmap);
+		batch_seq_id, bitmap, crc12);
 
 	// IFFT each symbol to time domain
 	for(int i = 0; i < nsymb; i++)
@@ -3223,18 +3224,21 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	return -99.0f;
 }
 
-// RX: Detect ACK pattern and decode the 40-bit ACK+SACK suffix in one call.
-// This is the convenience entry point for the MFSK-suffix ACK+SACK redesign
-// (Steps 2+3). It runs the same detector pipeline as detect_ack_snr_from_passband
-// — which writes the de-hopped suffix tones into ack_mfsk.last_ack_sack_suffix_tones[]
+// RX: Detect ACK pattern and decode the 52-bit ACK+SACK suffix in one call.
+// Runs the same detector pipeline as detect_ack_snr_from_passband — which
+// writes the de-hopped suffix tones into ack_mfsk.last_ack_sack_suffix_tones[]
 // — then invokes ack_mfsk.decode_ack_sack_from_last_capture() to recover
-// (batch_seq_id, bitmap). Returns false on unsupported M (NB), no detection,
-// or invalid capture; true on a clean decode.
+// (batch_seq_id, bitmap, crc12). The caller is responsible for verifying
+// crc12 against a freshly-computed CRC12 over [bsi || bitmap]; on CRC
+// mismatch the caller should treat the result as "no ACK arrived" so the
+// existing timeout/retransmit logic handles it. Returns false on unsupported
+// M (NB), no detection, or invalid capture.
 bool cl_telecom_system::decode_ack_sack_from_passband(double* data, int size,
-	uint8_t* out_bsi, uint32_t* out_bitmap, int* out_matched)
+	uint8_t* out_bsi, uint32_t* out_bitmap, uint16_t* out_crc12, int* out_matched)
 {
 	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // NB / unsupported
-	if (out_bsi == nullptr || out_bitmap == nullptr) return false;
+	if (out_bsi == nullptr || out_bitmap == nullptr || out_crc12 == nullptr)
+		return false;
 
 	// Reuse the SNR detector pipeline — it already does base-pattern detection
 	// + suffix capture into ack_mfsk.last_ack_sack_suffix_tones[].
@@ -3244,7 +3248,7 @@ bool cl_telecom_system::decode_ack_sack_from_passband(double* data, int size,
 	if (out_matched) *out_matched = matched;
 
 	if (!ack_mfsk.last_ack_sack_capture_valid) return false;
-	bool ok = ack_mfsk.decode_ack_sack_from_last_capture(out_bsi, out_bitmap);
+	bool ok = ack_mfsk.decode_ack_sack_from_last_capture(out_bsi, out_bitmap, out_crc12);
 	// Consume the capture: caller gets a one-shot view of this match.
 	ack_mfsk.last_ack_sack_capture_valid = false;
 	return ok;

@@ -100,23 +100,34 @@ public:
 	// Total symbols when SNR suffix is active
 	int ack_snr_pattern_nsymb() const { return ack_pattern_nsymb + SNR_SUFFIX_LEN; }
 
-	// ACK+SACK suffix: extra symbols carrying [batch_seq_id(8) | bitmap(32)]
-	// = 40 bits payload, replacing OFDM_ACK_CLEAN and SACK_RSP. Each symbol's
-	// tone position carries log2(M) bits. WB M=16 → 4 bits/symbol → 10 symbols
-	// for 40 bits. NB M=8 → 3 bits/symbol; deferred (NB uses OFDM path for now).
-	// Total pattern wall-clock: 16 base + 10 suffix = 26 symbols ≈ 631 ms (WB).
-	int ack_sack_suffix_len() const { return (M >= 16) ? 10 : 0; }  // 0 = unsupported
+	// ACK+SACK suffix: extra symbols carrying
+	//   [batch_seq_id(8) | bitmap(32) | CRC12(12)] = 52 bits.
+	// CRC12 protects against false-accept after pattern correlator lock
+	// (see mercury/fact-documents/mfsk-robust-ack.md §3.2). Each symbol's
+	// tone position carries log2(M) bits. WB M=16 → 4 bits/symbol → 13
+	// symbols for 52 bits. NB M=8 → 3 bits/symbol; deferred (NB ACK
+	// stays on the legacy pattern, no SACK).
+	// Total pattern wall-clock: 16 base + 13 suffix = 29 symbols ≈ 705 ms (WB).
+	int ack_sack_suffix_len() const { return (M >= 16) ? 13 : 0; }  // 0 = unsupported
 	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
-	// Pack 40-bit payload [bsi:8|bitmap:32] into N tone values (each in 0..M-1).
-	// Returns number of tones written (= ack_sack_suffix_len). Caller provides
-	// out_tones[] of size >= ack_sack_suffix_len.
-	int pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, int* out_tones) const;
-	// Inverse of pack: reconstruct (bsi, bitmap) from N tones.
-	// Returns true on success, false if M unsupported.
-	bool unpack_ack_sack_payload(const int* in_tones, uint8_t* out_bsi, uint32_t* out_bitmap) const;
+	// Pack 52-bit payload [bsi:8|bitmap:32|crc12:12] into N tone values
+	// (each in 0..M-1). Caller passes a pre-computed crc12 (12 bits in the
+	// low bits of a uint16_t). Returns number of tones written
+	// (= ack_sack_suffix_len). Caller provides out_tones[] of size
+	// >= ack_sack_suffix_len.
+	int pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, uint16_t crc12,
+	                          int* out_tones) const;
+	// Inverse of pack: reconstruct (bsi, bitmap, crc12) from N tones.
+	// Caller is responsible for verifying the returned crc12 matches a
+	// freshly-computed CRC over [bsi || bitmap]; this function does the
+	// bit-level unpack only. Returns true on success, false if M unsupported.
+	bool unpack_ack_sack_payload(const int* in_tones, uint8_t* out_bsi,
+	                             uint32_t* out_bitmap, uint16_t* out_crc12) const;
 	// Generate ACK pattern + ack_sack_suffix_len() suffix symbols.
+	// Caller passes a pre-computed crc12 (12-bit CRC over [bsi || bitmap]).
 	void generate_ack_sack_pattern(std::complex<double>* pattern_out,
-	                               uint8_t bsi, uint32_t bitmap);
+	                               uint8_t bsi, uint32_t bitmap,
+	                               uint16_t crc12);
 
 	// RX-side capture buffer populated by the ACK detector hook
 	// (cl_telecom_system::detect_ack_snr_from_passband). Each entry is the
@@ -130,11 +141,14 @@ public:
 	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_ack_sack_capture_valid;
 
-	// Decode the most recently captured SACK suffix into (bsi, bitmap).
+	// Decode the most recently captured SACK suffix into (bsi, bitmap, crc12).
 	// Returns true on success — requires WB (M>=16) and a prior detector
 	// hit that populated last_ack_sack_suffix_tones[]. Caller is expected
-	// to clear last_ack_sack_capture_valid when consumed.
-	bool decode_ack_sack_from_last_capture(uint8_t* out_bsi, uint32_t* out_bitmap);
+	// to clear last_ack_sack_capture_valid when consumed AND to verify
+	// that the returned crc12 matches a freshly-computed CRC12 over
+	// [bsi || bitmap]; this function performs the bit-level unpack only.
+	bool decode_ack_sack_from_last_capture(uint8_t* out_bsi, uint32_t* out_bitmap,
+	                                       uint16_t* out_crc12);
 
 	// Test-only: stuff payload tones directly into the capture buffer
 	// (bypasses the RF capture path). Used by symbol-domain round-trip

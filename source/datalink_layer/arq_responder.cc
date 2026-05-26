@@ -1222,17 +1222,17 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							unsigned char sacked_bsi = bsi;
 							bump_bsi_and_transfer_prev();
 
-							// Step 5 of MFSK-suffix ACK+SACK redesign — RSP-side
-							// call-site swap. WB-only (suffix_len()>0) and only
-							// inside the Q-table band where the optimizer owns
-							// config selection. Pack the per-frame received
+							// MFSK-suffix ACK+SACK — WB-only (suffix_len()>0).
+							// No optimizer-territory gate: the pattern correlator
+							// gives this path ROBUST_0-grade detection at any
+							// config, which is exactly where partial-batch
+							// recovery matters most. Pack the per-frame received
 							// bitmap LSB-first into a uint32_t (matches
 							// send_sack_v2_frame's byte-LSB-first convention at
 							// arq_common.cc:4147-4151 for the first 32 frames).
 							bool used_mfsk_path = false;
 							if (MFSK_ACK_SACK_ENABLED
-								&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0
-								&& optimizer_is_in_control())
+								&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 							{
 								uint32_t bitmap_u32 = 0;
 								int nbits = data_batch_size;
@@ -1356,26 +1356,21 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		repeating_last_ack=NO;
 		messages_control.status=FREE;
 
-		// §7.13.30 — on v2 sessions, send OFDM_ACK_CLEAN instead of the
-		// legacy MFSK ACK pattern so the SACK window contains ONLY OFDM
-		// signals (eliminates the MFSK-vs-OFDM detector ambiguity that
-		// caused the silent-drop bug). bsi = the batch we just completed
-		// (rsp_prev_batch_seq_id after the +1 bump above). Non-v2 sessions
-		// stay on the legacy MFSK ACK pattern (unchanged).
+		// Clean-batch ACK transport. WB sessions use the MFSK-suffix
+		// ACK+SACK frame (16-symbol Welch-Costas pattern + 13 MFSK data
+		// symbols carrying [bsi:8 | bitmap:32 | crc12:12]). NB sessions
+		// (suffix_len==0) fall back to the legacy MFSK ACK pattern with
+		// no SACK payload — NB doesn't have the symbol-rate budget for
+		// SACK and the receiver implicitly treats any pattern hit as a
+		// clean ACK. See mercury/fact-documents/mfsk-robust-ack.md §3.4.
 		if(sack_v2_enabled)
 		{
 			unsigned char ack_bsi = (unsigned char)(
 				rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
 
-			// Step 5 of MFSK-suffix ACK+SACK redesign — RSP-side clean-batch
-			// call-site swap. WB-only (suffix_len()>0) and only inside the
-			// Q-table band (optimizer_is_in_control()). Clean batch ⇒ bitmap
-			// is all-ones over [0, data_batch_size). For data_batch_size==32
-			// use 0xFFFFFFFF; for smaller batches use (1u<<n)-1.
 			bool used_mfsk_path = false;
 			if (MFSK_ACK_SACK_ENABLED
-				&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0
-				&& optimizer_is_in_control())
+				&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 			{
 				uint32_t bitmap_u32;
 				if (data_batch_size >= 32)
@@ -1397,13 +1392,14 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				}
 				else
 				{
-					printf("[RSP-MFSK-SACK] MFSK path returned 0 — falling back to OFDM_ACK_CLEAN\n");
+					printf("[RSP-MFSK-SACK] MFSK suffix returned 0 — falling back to legacy MFSK ACK pattern\n");
 					fflush(stdout);
 				}
 			}
 			if (!used_mfsk_path)
 			{
-				send_ofdm_ack_clean(ack_bsi);
+				// NB or MFSK-suffix unavailable: legacy MFSK pattern.
+				send_ack_pattern();
 			}
 		}
 		else

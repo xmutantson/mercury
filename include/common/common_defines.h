@@ -25,12 +25,12 @@
 
 #define VERSION__ "0.4.2"
 
-// Compile-time gate for the MFSK-suffix ACK+SACK signaling (WB-only).
-// When 1, RSP sends ACK/SACK via extended MFSK pattern (40-bit suffix:
-// 8-bit batch_seq_id + 32-bit frame bitmap) and CMD listens for it.
-// When 0, falls back to OFDM_ACK_CLEAN / SACK_RSP (legacy path).
-// Both peers MUST agree (deployed together) since there's no runtime
-// capability negotiation yet. Set to 0 to disable without code rollback.
+// Compile-time gate for the MFSK ACK+SACK signaling (WB-only). RSP sends
+// ACK/SACK via the MFSK pattern + 52-bit suffix [bsi:8 | bitmap:32 |
+// crc12:12] and CMD listens for it. When 0, falls back to the legacy
+// MFSK ACK pattern (no SACK; receiver implicitly treats any hit as a
+// clean batch ACK). Both peers MUST agree (deployed together — no
+// runtime negotiation). See mercury/fact-documents/mfsk-robust-ack.md.
 #ifndef MFSK_ACK_SACK_ENABLED
 #define MFSK_ACK_SACK_ENABLED 1
 #endif
