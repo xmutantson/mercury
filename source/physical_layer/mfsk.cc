@@ -758,7 +758,7 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 	}
 	double noise_var = (noise_bins_all > 0) ? noise_sum_all / noise_bins_all : 1e-30;
 	if (noise_var < 1e-30) noise_var = 1e-30;
-	double llr_scale = 1.0 / (2.0 * noise_var);
+	double llr_scale = 1.0 / noise_var;
 
 	for (int s = 0; s < nSymbols; s++)
 	{
