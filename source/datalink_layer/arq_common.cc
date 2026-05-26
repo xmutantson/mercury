@@ -2413,15 +2413,29 @@ void cl_arq_controller::process_main()
 					fifo_buffer_tx.push(tcp_socket_data.message->buffer, tcp_socket_data.message->length);
 				}
 
-				std::string str="BUFFER ";
-				str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
-				str+='\r';
-				for(long unsigned int i=0;i<str.length();i++)
+				// Suppress unsolicited BUFFER advertisements while the link
+				// is not yet CONNECTED (or actively tearing down). During
+				// CONNECTING / NEGOTIATING / LISTENING / DROPPED the upstream
+				// is still mid-handshake (e.g. waiting on `CONNECTED\r`); if
+				// the client pre-pushes data (test harnesses do this), the
+				// resulting flood of BUFFER lines on the control socket can
+				// shadow or precede the CONNECT reply that the client is
+				// blocked on. The data is still accepted into fifo_buffer_tx
+				// — it will flow as soon as the link comes up. Once the
+				// session is CONNECTED or DISCONNECTING, flow-control
+				// advertisements resume normally.
+				if(link_status==CONNECTED || link_status==DISCONNECTING)
 				{
-					tcp_socket_control.message->buffer[i]=str[i];
+					std::string str="BUFFER ";
+					str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
+					str+='\r';
+					for(long unsigned int i=0;i<str.length();i++)
+					{
+						tcp_socket_control.message->buffer[i]=str[i];
+					}
+					tcp_socket_control.message->length=str.length();
+					tcp_socket_control.transmit();
 				}
-				tcp_socket_control.message->length=str.length();
-				tcp_socket_control.transmit();
 			}
 			else if(nBytes_received==0)
 			{
