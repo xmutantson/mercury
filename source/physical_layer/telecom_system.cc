@@ -2184,6 +2184,8 @@ skip_h_retry_point:
 					printf("[WB-FREQ] Moose=%.4f Hz\n", freq_offset_measured);
 			}
 
+			if(M == MOD_MFSK) freq_offset_measured = 0;
+
 			// Moose sanity check + clamp.
 			// Crystal oscillators on SGTL5000 boards typically differ by <20 Hz.
 			// A Moose estimate > 30 Hz almost certainly means the preamble timing
