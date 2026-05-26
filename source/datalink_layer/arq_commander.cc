@@ -2662,8 +2662,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					}
 				}
 				// Record as clean (sack_used=false, failed=false). v2_ack_pat_pre_detected
-				// = 1 means we got here via OFDM_ACK_CLEAN; either way the batch
-				// closed with NO SACK_RSP cycle, so this is the "clean" bucket.
+				// = 1 means we got here via the MFSK-suffix clean ACK; either way the
+				// batch closed with NO SACK_RSP cycle, so this is the "clean" bucket.
+				// (Historical: an OFDM_ACK_CLEAN frame type carried this signal before
+				// 2026-05-24; deleted in the mfsk-robust-ack ship — MFSK suffix now
+				// handles all clean-batch acknowledgements.)
 				opt_record_batch((unsigned int)opt_clean_bytes_delivered,
 				                 /*sack_used=*/false,
 				                 /*failed=*/false);
@@ -2708,12 +2711,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 				// Guard delay: wait for the radio TX→RX transition to settle.
 				// v9.2: dropped the +200ms software margin. Clean-batch ACK is
-				// now OFDM_ACK_CLEAN (v9.2 default; see arq_responder.cc:1396),
+				// now carried by the MFSK ACK suffix (post-2026-05-24 ship; the
+				// historical OFDM_ACK_CLEAN frame type was deleted entirely),
 				// detected the moment its trailing sample reaches the demod —
 				// the only physical wait we still need is ptt_off_delay_ms
 				// (default 200ms) for PA tail / RX-mute release. Combined with
-				// the MFSK-suffix → OFDM_ACK_CLEAN switch, this saves roughly
-				// 800ms + 200ms = ~1s of dead-air per clean batch at cfg=15 WB.
+				// the move to a pure MFSK suffix, this saves roughly 800ms +
+				// 200ms = ~1s of dead-air per clean batch at cfg=15 WB.
 				int guard = ptt_off_delay_ms;
 				receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
 			}
@@ -2964,14 +2968,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// Frame gearshift just applied but data failed — BREAK immediately.
 			// §7.13.33 — retry once before BREAK: on a CFG7→CFG15 PHY-switch,
 			// the FIRST batch can fail not because CFG15 is too aggressive
-			// but because RSP's OFDM_ACK_CLEAN lands inside CMD's still-muted
-			// post-TX window (audioio.c:1255-1258 zeros samples while rx_mute
-			// is set). The ACK preamble gets wiped before the decoder sees it,
-			// and CMD wrongly concludes the config is unworkable. Retrying
-			// the batch once gives RSP a chance to retransmit OFDM_ACK_CLEAN
-			// (mechanism-(a) dedup matches same batch_seq_id) at a time when
-			// CMD is fully in RX mode. If the retry also fails, BREAK as
-			// before — config really is too aggressive.
+			// but because RSP's clean-batch ACK (now an MFSK suffix; was the
+			// deleted OFDM_ACK_CLEAN frame pre-2026-05-24) lands inside CMD's
+			// still-muted post-TX window (audioio.c:1255-1258 zeros samples
+			// while rx_mute is set). The ACK preamble gets wiped before the
+			// decoder sees it, and CMD wrongly concludes the config is
+			// unworkable. Retrying the batch once gives RSP a chance to
+			// retransmit the clean ACK (mechanism-(a) dedup matches same
+			// batch_seq_id) at a time when CMD is fully in RX mode. If the
+			// retry also fails, BREAK as before — config really is too
+			// aggressive.
 			if(frame_gearshift_just_applied && ack_pattern_time_ms > 0
 			   && frame_gearshift_retry_count == 0)
 			{
@@ -3206,11 +3212,12 @@ void cl_arq_controller::finish_turbo_direction()
 		// config can pass a frame end-to-end. Picking a lower start config
 		// (former: snr_config - 2 ladder steps for fading margin) forces an
 		// UNNECESSARY PHY-switch to a lower config, which on the CMD side
-		// breaks OFDM_ACK_CLEAN detection on the first post-switch batch
-		// (gearshift_v11 finding: RSP gets 21/25 frames at CFG13, sends
-		// OFDM_ACK_CLEAN, CMD's poll never matches → FRAME UP DATA FAILED →
-		// BREAK chain pulls config down to 11). Cost on clean: 7-8× lower
-		// throughput vs v22 baseline (2535 vs 343 bps). Trust the probe; if
+		// breaks clean-batch ACK detection on the first post-switch batch
+		// (gearshift_v11 finding: RSP gets 21/25 frames at CFG13, sends a
+		// clean ACK — historically OFDM_ACK_CLEAN, now the MFSK suffix —
+		// CMD's poll never matches → FRAME UP DATA FAILED → BREAK chain
+		// pulls config down to 11). Cost on clean: 7-8× lower throughput
+		// vs v22 baseline (2535 vs 343 bps). Trust the probe; if
 		// production traffic fails, ladder will drop on its own.
 		//
 		// §7.13.38 — SAC-aware ceiling trust: when SACK Design A is

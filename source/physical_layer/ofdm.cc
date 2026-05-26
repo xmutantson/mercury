@@ -1129,7 +1129,12 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 	// smoother zeros ~82% of time-domain taps, which pulls H toward the
 	// pilot's own noise; computing residuals against the smoothed estimate
 	// double-counts that noise and biases noise_variance_estimate low by 3-5x,
-	// over-confidence the LDPC LLR scaling. See Edfors et al., VTC 1995, eq.(29).
+	// over-confidence the LDPC LLR scaling.
+	// (Pilot-residual σ² estimate — standard practice; see also van de Beek/
+	// Edfors et al., VTC 1995, "On Channel Estimation in OFDM Systems",
+	// §III for context on LS-then-DFT smoothing (NOT the residual estimator
+	// itself — earlier comments mis-cited eq.(29), which is the MSE of the
+	// smoother, not a derivation of the residual estimate).)
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;
@@ -1299,7 +1304,9 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 
 	// Estimate noise variance from pilot residuals (same as ZF estimator).
 	// MUST be computed against UNSMOOTHED H — see ZF_channel_estimator for
-	// the rationale. Edfors et al., VTC 1995, eq.(29).
+	// the rationale. (Standard pilot-residual σ² estimate; see also Edfors
+	// et al., VTC 1995, §III for LS-then-DFT smoothing context, not the
+	// residual estimator itself.)
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;

@@ -4117,7 +4117,15 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 	if (data_container.frames_to_read == 0)
 	{
 #ifdef MERCURY_GUI_ENABLED
-		// Apply live LDPC iteration limit from GUI
+		// Apply live LDPC iteration limit from GUI.
+		// GOTCHA (Q3 per-config override): this overwrite is unconditional and
+		// runs after load_configuration(), so a GUI update can clobber the
+		// per-config nIteration_max=200 that ROBUST tier configs (100/101/102)
+		// install in their load path. If you ever see ROBUST tier underperform
+		// at low SNR while the GUI is showing a smaller iteration cap, suspect
+		// this line. Safer fix (deferred — medium risk): guard with
+		// `!is_robust_config(current_configuration)` so the override only fires
+		// for OFDM configs.
 		int gui_ldpc_max = g_gui_state.ldpc_iterations_max.load();
 		if (gui_ldpc_max >= 5 && gui_ldpc_max <= 100)
 			ldpc.nIteration_max = gui_ldpc_max;
