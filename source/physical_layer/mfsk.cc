@@ -25,6 +25,76 @@
 #include <cstdint>
 #include <cstdio>
 
+namespace {
+
+// log I_0(x) lookup for noncoherent FSK ML demap (Proakis 5e §4.5.4 eq 4.5-46).
+// Per-tone metric = log I_0(2*sqrt(E_m/sigma^2)). The argument range spans
+// [0, ~30] for E/sigma^2 up to ~225 (well above any ROBUST-tier per-tone SNR;
+// large args fall through to asymptotic branch). 256 entries with linear
+// interpolation gives ~1e-4 relative error, well below SPA-quantization noise.
+//
+// I_0(x) computed via Abramowitz & Stegun 9.8.1 (x in [0, 3.75]) and 9.8.2
+// (x >= 3.75) at table-build time. Runtime lookup is two adds + one multiply
+// + one float load; LUT is ~2 KB and stays cache-resident.
+constexpr int   LOG_I0_LUT_N   = 256;
+constexpr double LOG_I0_LUT_XMAX = 30.0;
+
+struct LogI0Table {
+	double v[LOG_I0_LUT_N + 1]; // +1 sentinel for the interp upper-bin
+	LogI0Table() {
+		const double dx = LOG_I0_LUT_XMAX / LOG_I0_LUT_N;
+		for (int i = 0; i <= LOG_I0_LUT_N; i++) {
+			double x = i * dx;
+			double I0;
+			if (x < 3.75) {
+				// A&S 9.8.1: I_0(x) = sum c_k * (x/3.75)^(2k), x in [-3.75, 3.75]
+				double t = x / 3.75;
+				double t2 = t * t;
+				I0 = 1.0
+				   + t2 * (3.5156229
+				   + t2 * (3.0899424
+				   + t2 * (1.2067492
+				   + t2 * (0.2659732
+				   + t2 * (0.0360768
+				   + t2 *  0.0045813)))));
+				v[i] = std::log(I0);
+			} else {
+				// A&S 9.8.2: sqrt(x)*exp(-x)*I_0(x) = sum d_k * (3.75/x)^k
+				// => log I_0(x) = x - 0.5*log(x) + log(sum d_k * u^k), u=3.75/x
+				double u = 3.75 / x;
+				double poly = 0.39894228
+				            + u * ( 0.01328592
+				            + u * ( 0.00225319
+				            + u * (-0.00157565
+				            + u * ( 0.00916281
+				            + u * (-0.02057706
+				            + u * ( 0.02635537
+				            + u * (-0.01647633
+				            + u *   0.00392377))))))) ;
+				v[i] = x - 0.5 * std::log(x) + std::log(poly);
+			}
+		}
+	}
+};
+
+inline double log_I0_lut(double x) {
+	static const LogI0Table tbl;
+	if (x <= 0.0) return 0.0; // I_0(0) = 1, log = 0
+	if (x >= LOG_I0_LUT_XMAX) {
+		// Beyond table: asymptotic log I_0(x) ~ x - 0.5*log(2*pi*x)
+		// (A&S 9.7.1, leading term). Used for very-strong tones; no
+		// observed entries hit this in WGN sims but guard for safety.
+		return x - 0.5 * std::log(2.0 * 3.14159265358979323846 * x);
+	}
+	const double dx = LOG_I0_LUT_XMAX / LOG_I0_LUT_N;
+	double pos = x / dx;
+	int   idx  = (int)pos;
+	double frac = pos - idx;
+	return tbl.v[idx] + frac * (tbl.v[idx + 1] - tbl.v[idx]);
+}
+
+} // anonymous namespace
+
 cl_mfsk::cl_mfsk()
 {
 	M = 0;
@@ -783,39 +853,51 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 				E[m] = E_raw[actual];
 			}
 
-			// Compute LLRs for this stream's bits — log-sum-exp noncoherent FSK
-			// metric (F2 retry on top of Q3). Per Proakis 5th ed §4.5.4 and
-			// Stark, IEEE TCOM 1985, the true bit LLR for noncoherent
-			// orthogonal FSK with Gray mapping is
-			//   LLR_k = log(sum_{m in S_0} exp(E_m/sigma^2))
-			//         - log(sum_{m in S_1} exp(E_m/sigma^2))
-			// max-log is the high-SNR limit (the largest exp dominates). At
-			// rate-1/16 LDPC the per-tone curvature near the cliff matters,
-			// so we use the full LSE form with the standard max-subtraction
-			// for numerical stability.
+			// Compute LLRs for this stream's bits — Bessel-I_0 noncoherent ML
+			// (A.0.1 Phase A). Per Proakis 5th ed §4.5.4 eq 4.5-46, the
+			// optimal per-tone log-likelihood under noncoherent orthogonal
+			// FSK + Ricean/Rayleigh tone outputs is
+			//   L_m = log I_0(2*|y_m|/sigma) = log I_0(2*sqrt(E_m/sigma^2))
+			// and the bit LLR is the standard Gray-partition log-sum-exp:
+			//   LLR_k = log sum_{m in S_0} exp(L_m) - log sum_{m in S_1} exp(L_m).
 			//
-			// First F2 attempt 2026-05-25 (reverted, see fact-document
-			// weak-signal-floor-investigation.md §4 (F2)): regressed the
-			// floor from WGN:0 to WGN:6. Hypothesis was that LSE produces
-			// smaller LLR magnitudes which need more SPA iterations to
-			// converge, and the global 100-iter cap was binding. Q3 (commit
-			// cb779d1) raised the ROBUST-tier iter cap to 200; retry on top.
+			// The previous form (F2, commit 8d0ca2a) used L_m = E_m/sigma^2,
+			// which is the small-x Taylor expansion of log I_0 (log I_0(x)
+			// ~= x^2/4 = (2*sqrt(E_m/sigma^2))^2 / 4 = E_m/sigma^2). That's
+			// correct only at low SNR; at moderate / strong tones the LUT
+			// branch transitions to the linear-in-amplitude asymptote
+			// log I_0(x) ~= x - 0.5*log(2*pi*x), giving correct curvature
+			// across the full per-tone SNR range the SPA decoder sees.
+			// log_I0_lut() handles both regimes with one table lookup.
+			//
+			// Max-subtraction inside the LSE preserves the F2 numerical-
+			// stability framework — the LUT only changes the per-tone metric.
 			int llr_offset = s * bps + st * nBits;
+			// Per-tone metric L_m = log I_0(2*sqrt(E_m * llr_scale)). Computed
+			// once per (s, st) and reused across all nBits LLRs in this symbol.
+			// Zero-init silences -Wmaybe-uninitialized; the m<M loop overwrites
+			// every used entry (M <= 64) before the consumer loops below read.
+			double L[64] = {0.0}; // M <= 64
+			for (int m = 0; m < M; m++)
+			{
+				double arg = 2.0 * std::sqrt(E[m] * llr_scale);
+				L[m] = log_I0_lut(arg);
+			}
 			for (int k = 0; k < nBits; k++)
 			{
 				int mask = 1 << (nBits - 1 - k);
-				double max_E1 = -1e30;
-				double max_E0 = -1e30;
+				double max_L1 = -1e30;
+				double max_L0 = -1e30;
 				for (int m = 0; m < M; m++)
 				{
 					int gray_m = m ^ (m >> 1);
 					if (gray_m & mask)
 					{
-						if (E[m] > max_E1) max_E1 = E[m];
+						if (L[m] > max_L1) max_L1 = L[m];
 					}
 					else
 					{
-						if (E[m] > max_E0) max_E0 = E[m];
+						if (L[m] > max_L0) max_L0 = L[m];
 					}
 				}
 
@@ -829,18 +911,17 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 					int gray_m = m ^ (m >> 1);
 					if (gray_m & mask)
 					{
-						sum1 += std::exp((E[m] - max_E1) * llr_scale);
+						sum1 += std::exp(L[m] - max_L1);
 					}
 					else
 					{
-						sum0 += std::exp((E[m] - max_E0) * llr_scale);
+						sum0 += std::exp(L[m] - max_L0);
 					}
 				}
-				// LSE(S_0) - LSE(S_1) where LSE is in LLR-domain (already
-				// scaled by 1/sigma^2). Note: max_E and llr_scale combine to
-				// (max_E0 - max_E1) * llr_scale as the dominant term, plus
-				// the log() correction that reduces to 0 at high SNR.
-				double llr = (max_E0 - max_E1) * llr_scale
+				// LSE(S_0) - LSE(S_1) = (max_L0 - max_L1) + log(sum0) - log(sum1).
+				// The Bessel-I_0 metric has already absorbed 1/sigma^2 via the
+				// sqrt argument, so no extra llr_scale multiplier here.
+				double llr = (max_L0 - max_L1)
 				           + std::log(sum0) - std::log(sum1);
 				if (!std::isfinite(llr)) llr = 0.0;
 				// LLR cap removed 2026-05-24. The previous ±5 clip was
