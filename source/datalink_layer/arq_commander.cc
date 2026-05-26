@@ -4316,17 +4316,23 @@ void cl_arq_controller::finalize_block_commander()
 				else
 				{
 					// Ceiling recovery: after N consecutive good blocks at ceiling, raise ceiling by 1.
-					// Use 20 blocks to avoid oscillation where ceiling raises and immediately fails.
+					// Threshold reduced 20 → 5 (2026-05-24, band-aid for panic-stuck-at-floor):
+					// at ROBUST_0 with 1-3 bps, 20 good blocks takes 10+ min and a full
+					// ceiling-climb back to original takes 2+ hours. With 5 blocks the
+					// recovery window shrinks ~4x — still gives oscillation protection
+					// because each raise must accumulate fresh successes at the new
+					// ceiling. The proper fix is the 2D channel-measurement table; this
+					// is the band-aid until that's built.
 					if(ceiling_blocked)
 					{
 						ceiling_success_count++;
-						if(ceiling_success_count >= 20)
+						if(ceiling_success_count >= 5)
 						{
 							int old_ceiling = supershift_proven_ceiling;
 							supershift_proven_ceiling = proposed;  // raise ceiling to what we wanted to try
 							ceiling_success_count = 0;
 							printf("[GEARSHIFT] CEILING RECOVERY: %d -> %d after %d good blocks\n",
-								old_ceiling, supershift_proven_ceiling, 20);
+								old_ceiling, supershift_proven_ceiling, 5);
 							fflush(stdout);
 							// Don't shift up yet — let the next block's ladder evaluation do it
 						}
@@ -4463,18 +4469,18 @@ void cl_arq_controller::policy_evaluate_axis1()
 		}
 		else
 		{
-			// Ceiling recovery: after N consecutive good blocks at ceiling, raise ceiling by 1.
-			// Use 20 blocks to avoid oscillation where ceiling raises and immediately fails.
+			// Ceiling recovery: 20 → 5 blocks (see comment at first ceiling-recovery
+			// site, ~line 4346). Band-aid until 2D channel measurement lands.
 			if(ceiling_blocked)
 			{
 				ceiling_success_count++;
-				if(ceiling_success_count >= 20)
+				if(ceiling_success_count >= 5)
 				{
 					int old_ceiling = supershift_proven_ceiling;
 					supershift_proven_ceiling = proposed;  // raise ceiling to what we wanted to try
 					ceiling_success_count = 0;
 					printf("[GEARSHIFT] CEILING RECOVERY: %d -> %d after %d good blocks\n",
-						old_ceiling, supershift_proven_ceiling, 20);
+						old_ceiling, supershift_proven_ceiling, 5);
 					fflush(stdout);
 					// Ceiling recovery is a STATE change (cap raised) but NOT a
 					// modulation move — current_configuration is unchanged. No
