@@ -1306,15 +1306,16 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 		}
 	}
 
-	// DFT-based channel estimate smoothing: suppress estimation noise
-	// by windowing the time-domain impulse response. Applied before noise
-	// variance estimation so residuals reflect actual noise, not estimation error.
-	smooth_channel_estimate_dft();
-
 	// Estimate noise variance from pilot residuals for MMSE equalization.
 	// noise = received_pilot - H_interpolated * known_pilot_value
-	// This measures how well the (smoothed) channel estimate explains the
+	// This measures how well the (unsmoothed) channel estimate explains the
 	// actual received pilots — the residual is noise + residual estimation error.
+	//
+	// CRITICAL: residual MUST be computed against the UNSMOOTHED H. The DFT
+	// smoother zeros ~82% of time-domain taps, which pulls H toward the
+	// pilot's own noise; computing residuals against the smoothed estimate
+	// double-counts that noise and biases noise_variance_estimate low by 3-5x,
+	// over-confidence the LDPC LLR scaling. See Edfors et al., VTC 1995, eq.(29).
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;
@@ -1345,6 +1346,13 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 		if(noise_variance_estimate < 1e-6)
 			noise_variance_estimate = 1e-6;
 	}
+
+	// DFT-based channel estimate smoothing: suppress estimation noise
+	// by windowing the time-domain impulse response. Applied AFTER residual
+	// computation so noise_variance_estimate reflects honest pilot noise
+	// (smoother would otherwise collapse the residual by absorbing the noise
+	// into the H estimate). Downstream MMSE equalizer uses the smoothed H.
+	smooth_channel_estimate_dft();
 /*
  * Ref: R. Lucky, “The adaptive equalizer,” IEEE Signal Processing Magazine, vol. 23, no. 3, pp. 104–107, 2006.
  */
@@ -1475,10 +1483,9 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 
-	// DFT-based channel estimate smoothing (same as ZF estimator)
-	smooth_channel_estimate_dft();
-
-	// Estimate noise variance from pilot residuals (same as ZF estimator)
+	// Estimate noise variance from pilot residuals (same as ZF estimator).
+	// MUST be computed against UNSMOOTHED H — see ZF_channel_estimator for
+	// the rationale. Edfors et al., VTC 1995, eq.(29).
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;
@@ -1508,6 +1515,11 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		if(noise_variance_estimate < 1e-6)
 			noise_variance_estimate = 1e-6;
 	}
+
+	// DFT-based channel estimate smoothing (same as ZF estimator) — applied
+	// AFTER residual computation so noise_variance_estimate is unbiased.
+	// Downstream MMSE equalizer uses the smoothed H.
+	smooth_channel_estimate_dft();
 /*
  * Ref J. . -J. van de Beek, O. Edfors, M. Sandell, S. K. Wilson and P. O. Borjesson, "On channel estimation in OFDM systems," 1995 IEEE 45th Vehicular Technology Conference. Countdown to the Wireless Twenty-First Century, Chicago, IL, USA, 1995, pp. 815-819 vol.2, doi: 10.1109/VETEC.1995.504981.
  */
