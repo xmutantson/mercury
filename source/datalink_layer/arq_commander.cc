@@ -82,7 +82,9 @@ void cl_arq_controller::process_messages_commander()
 				printf("[BREAK] ACK received! Dropping %d step(s): config %d -> %d (robust_enabled=%d)\n",
 					break_drop_step, emergency_previous_config, target, robust_enabled);
 				fflush(stdout);
-				if(break_drop_step < 4) break_drop_step *= 2;
+				break_drop_step *= 2;  // 2026-05-24: uncapped doubling
+				                       // (was capped at 4). config_ladder_down_n
+				                       // clamps at ROBUST_0 / CONFIG_0.
 
 				emergency_break_active = 0;
 				emergency_nack_count = 0;
@@ -169,7 +171,7 @@ void cl_arq_controller::process_messages_commander()
 				printf("[BREAK] Dropping %d step(s): config %d -> %d\n",
 					break_drop_step, emergency_previous_config, target);
 				fflush(stdout);
-				if(break_drop_step < 4) break_drop_step *= 2;
+				break_drop_step *= 2;  // uncapped — see ACK-received site above
 
 				int robust_0 = robust_enabled ? ROBUST_0 : CONFIG_0;
 				messages_control_backup();
@@ -3014,6 +3016,23 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			   && turboshift_phase == TURBO_DONE
 			   && gear_shift_on == YES)
 			{
+				// Panic-mode jump: if a previous BREAK fired with no data success
+				// between, the channel cratered hard and the ladder isn't keeping
+				// up. Skip the doubling — set break_drop_step large so the
+				// recovery path (arq_commander.cc:81) lands directly on ROBUST_0
+				// (config_ladder_down_n clamps to the floor). The line 3074 data-
+				// success reset clears the counter; until then every consecutive
+				// BREAK bottoms out.
+				breaks_since_last_data_success++;
+				if(breaks_since_last_data_success >= 2)
+				{
+					printf("[BREAK-PANIC] %d BREAKs without data success — "
+						"forcing jump to ROBUST_0 (break_drop_step=100)\n",
+						breaks_since_last_data_success);
+					fflush(stdout);
+					break_drop_step = 100;  // clamp at floor of ladder
+				}
+
 				// Lower ceiling to prevent climbing back to failing config
 				int new_ceiling = config_ladder_down(current_configuration, robust_enabled);
 				if(supershift_proven_ceiling < 0 || new_ceiling < supershift_proven_ceiling)
@@ -3043,7 +3062,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		else
 		{
 			emergency_nack_count = 0;  // Reset on success
-			break_drop_step = 1;
+			break_drop_step = 2;       // Reset to initial aggression (2 steps).
+			breaks_since_last_data_success = 0;  // panic-mode counter resets on
+			                                     // real data flow (see arq.h).
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
 			frame_gearshift_retry_count = 0;       // §7.13.33 reset
@@ -3931,7 +3952,20 @@ void cl_arq_controller::process_control_commander()
 				else if(break_recovery_phase == 2)
 				{
 					break_recovery_phase = 0;
-					break_drop_step = 1;  // reset backoff on success
+					// 2026-05-24 fix: do NOT reset break_drop_step here. This site
+					// fires when the SET_CONFIG ACK at the new target config is
+					// received — i.e. the BREAK *handshake* succeeded — not when
+					// data actually flows. The real "success" reset is at
+					// arq_commander.cc:3074 in the data-ACK path (gated on
+					// data_ack_received != NO). Resetting here defeated the
+					// 1→2→4→4→4 escalation ladder: each consecutive BREAK was
+					// crawling down one config step at a time, taking ~30s/step,
+					// because the SET_CONFIG ACK between BREAKs always reset the
+					// ladder. Observed in axis_walk_robust_v2 (WGN:14→0 sweep):
+					// mercury walked cfg14→cfg6 in 8 single-step BREAKs over
+					// 4+ minutes and ran out of dwell time before reaching
+					// ROBUST_0. Now the ladder escalates across consecutive
+					// BREAKs and only resets after a clean data batch.
 
 					if(turboshift_phase != TURBO_DONE)
 					{

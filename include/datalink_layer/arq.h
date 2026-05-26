@@ -1361,7 +1361,18 @@ public:
   int emergency_break_active;     // 1 = BREAK sent, waiting for ACK
   int emergency_break_retries;    // retries left for current BREAK attempt
   int emergency_previous_config;  // config that was failing
-  int break_drop_step;            // ladder steps to drop (1,2,4,4,4...)
+  int break_drop_step;            // ladder steps to drop. Doubles on each BREAK
+                                  // (1,2,4,8,16,...); resets to 1 on data success
+                                  // (arq_commander.cc:3074). Uncapped 2026-05-24
+                                  // so the ladder reaches ROBUST_0 in 4-5 cycles
+                                  // regardless of starting config.
+  int breaks_since_last_data_success;  // BREAK panic-mode counter. Incremented on
+                                       // each BREAK trigger (arq_commander.cc:3039),
+                                       // reset to 0 on data success (line 3074).
+                                       // When >= 2 (second BREAK with no data
+                                       // between), break_drop_step is force-set
+                                       // high enough to jump straight to ROBUST_0
+                                       // instead of walking the ladder.
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)

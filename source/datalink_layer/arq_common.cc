@@ -376,7 +376,9 @@ cl_arq_controller::cl_arq_controller()
 	emergency_break_active=0;
 	emergency_break_retries=3;
 	emergency_previous_config=CONFIG_0;
-	break_drop_step=1;
+	break_drop_step=2;  // 2026-05-24: start aggressive (was 1) — first BREAK
+	                    // drops 2 configs, then doubles 4,8,16,32... uncapped.
+	breaks_since_last_data_success=0;
 	break_recovery_phase=0;
 	break_recovery_retries=0;
 	ceiling_success_count=0;
@@ -2885,7 +2887,8 @@ void cl_arq_controller::reset_session_state()
 	emergency_break_active = 0;
 	emergency_break_retries = 3;
 	emergency_previous_config = init_configuration;
-	break_drop_step = 1;
+	break_drop_step = 2;  // initial aggression — see ctor comment
+	breaks_since_last_data_success = 0;
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
 	ceiling_success_count = 0;
