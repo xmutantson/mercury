@@ -469,7 +469,20 @@ void cl_arq_controller::process_messages_rx_data_control()
 					if(messages_rx_buffer.type == DATA_SHORT
 					   && messages_rx_buffer.length > max_short) len_ok = false;
 					(void)eff_short;  // referenced via max_short above
-					if(loc < 0 || loc >= this->nMessages)         len_ok = false;
+					// R7 fix (data-flow-messages_rx_prev.md §5):
+					// Constrain loc to [0, data_batch_size) — NOT [0, nMessages).
+					// The prev-batch completion trigger at :513 fires when
+					// rsp_prev_batch_received_count >= rsp_prev_batch_expected_count,
+					// and expected_count is capped at data_batch_size by the bsi-bump
+					// path (arq_common.cc:4072). A bit-errored ID in the range
+					// [data_batch_size, nMessages) used to (a) write to a slot that
+					// is never read by the swap-and-deliver loop (arq_responder.cc:537
+					// iterates i<data_batch_size && i<nMessages) and (b) bump the
+					// received_count, prematurely triggering completion when real
+					// frames had not all arrived. Matches the new-data path bound
+					// at arq_responder.cc:54 which uses data_batch_size.
+					if(loc < 0 || loc >= this->data_batch_size)   len_ok = false;
+					if(loc >= this->nMessages)                    len_ok = false;
 					if(messages_rx_buffer.length < 0)             len_ok = false;
 					if(len_ok)
 					{
