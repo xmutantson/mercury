@@ -716,14 +716,19 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 	int bps = nBits * nStreams; // bits per symbol period
 	int nSymbols = total_bits / bps;
 
+	// Codeword-wide noise variance: average guard-bin energy over ALL symbols
+	// in this codeword instead of per-symbol. With ~18 guard bins/symbol
+	// (Nc=50 minus nStreams*M used by signal), per-symbol estimates carry
+	// ~33% RMS error which scrambles LLR magnitudes; rate-1/16 LDPC at
+	// ROBUST_0 is acutely sensitive to LLR-magnitude jitter. Pooling across
+	// ~240 symbols × ~18 bins drops the error below 2% RMS. See
+	// fact-documents/weak-signal-floor-investigation.md §4 (F4).
+	int band_start = stream_offsets[0];
+	int band_end = stream_offsets[nStreams - 1] + M;
+	double noise_sum_all = 0.0;
+	int noise_bins_all = 0;
 	for (int s = 0; s < nSymbols; s++)
 	{
-		// Estimate noise variance from bins outside all stream bands
-		int total_bins = nStreams * M;
-		int band_start = stream_offsets[0];
-		int band_end = stream_offsets[nStreams - 1] + M;
-		double noise_sum = 0.0;
-		int noise_bins = 0;
 		for (int k = 0; k < Nc; k++)
 		{
 			if (k < band_start || k >= band_end)
@@ -731,16 +736,18 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 				std::complex<double> val = fft_in[s * Nc + k];
 				double e = val.real() * val.real() + val.imag() * val.imag();
 				if (std::isfinite(e)) {
-					noise_sum += e;
-					noise_bins++;
+					noise_sum_all += e;
+					noise_bins_all++;
 				}
 			}
 		}
-		double noise_var = (noise_bins > 0) ? noise_sum / noise_bins : 1e-30;
-		if (noise_var < 1e-30) noise_var = 1e-30;
+	}
+	double noise_var = (noise_bins_all > 0) ? noise_sum_all / noise_bins_all : 1e-30;
+	if (noise_var < 1e-30) noise_var = 1e-30;
+	double llr_scale = 1.0 / (2.0 * noise_var);
 
-		double llr_scale = 1.0 / (2.0 * noise_var);
-
+	for (int s = 0; s < nSymbols; s++)
+	{
 		// Process each stream independently
 		for (int st = 0; st < nStreams; st++)
 		{
