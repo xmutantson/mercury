@@ -317,6 +317,32 @@ public:
 
 	st_reinit_subsystems reinit_subsystems;
 
+	// 2D channel-state lookup helpers (Step 1 of design — see
+	// mercury/fact-documents/channel-state-2d-lookup.md §3, §8).
+	// These accessors expose pre-decode channel-state metrics for a future
+	// (SNR_proxy, selectivity) → optimal-config lookup table. They are
+	// read-only and have no call sites yet (Step 5 wires them in). The
+	// underlying values are cached opportunistically wherever the existing
+	// DSP already computes them — no new computation paths are added.
+	//
+	// Sentinels:
+	//   correlator dB:  -99.0 → no ACK/HAIL detection attempted yet
+	//   selectivity:    -1.0  → no preamble channel estimate yet
+	//                          (selectivity is physically >= 0)
+	double last_correlator_metric_db;     // cached by detect_ack/hail_pattern_from_passband
+	double last_channel_selectivity;      // cached after preamble channel estimate
+
+	// Returns last ACK/HAIL correlator metric, normalized to dB:
+	//   metric_normalized = best_metric / ack_pattern_nsymb  ∈ [0, 1]
+	//   metric_db         = 10 * log10(metric_normalized)
+	// Higher = better channel. Sentinel -99.0 means no measurement yet.
+	double get_correlator_snr_proxy() const;
+
+	// Returns std(|H[k]|) / mean(|H[k]|) across OFDM DATA subcarriers from
+	// the most recent preamble channel estimate. Flat AWGN → ~0;
+	// selective multipath → > 0.3. Sentinel -1.0 means no estimate yet.
+	double get_channel_selectivity() const;
+
 };
 
 

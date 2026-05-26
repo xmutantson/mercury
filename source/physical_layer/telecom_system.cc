@@ -107,6 +107,10 @@ cl_telecom_system::cl_telecom_system()
 	bit_energy_dispersal_seed=0;
 	narrowband_enabled=NO;
 	pre_equalization_channel=NULL;
+	// 2D channel-state lookup helpers (see fact-doc channel-state-2d-lookup.md §8 Step 1).
+	// Sentinels until the first ACK/HAIL detection / preamble channel estimate runs.
+	last_correlator_metric_db = -99.0;
+	last_channel_selectivity  = -1.0;
 	init_tx_gain_defaults();
 }
 
@@ -2327,6 +2331,43 @@ skip_h_retry_point:
 					}
 					if(h_count > 0) mean_H = h_sum / h_count;
 				}
+				// Cache channel selectivity = std(|H[k]|) / mean(|H[k]|) over DATA
+				// subcarriers for the 2D channel-state lookup (§3.2 of fact-doc
+				// channel-state-2d-lookup.md). At this point estimated_channel[]
+				// has been smoothed by smooth_channel_estimate_dft() and the data
+				// bins carry interpolated |H| values (restore_channel_amplitude
+				// hasn't run yet — that would flatten all magnitudes to 1.0).
+				// Data bins are identified by ofdm_frame[].type == DATA, which
+				// skips pilots and guard/zero subcarriers.
+				{
+					double s_sum = 0.0, s_sumsq = 0.0;
+					int s_count = 0;
+					for(int i = 0; i < ofdm.Nsymb; i++)
+					{
+						for(int j = 0; j < ofdm.Nc; j++)
+						{
+							if((ofdm.ofdm_frame + i*ofdm.Nc + j)->type == DATA)
+							{
+								double mag = std::abs(ofdm.estimated_channel[i*ofdm.Nc + j].value);
+								s_sum   += mag;
+								s_sumsq += mag * mag;
+								s_count++;
+							}
+						}
+					}
+					if(s_count > 1)
+					{
+						double s_mean = s_sum / s_count;
+						double s_var  = (s_sumsq / s_count) - (s_mean * s_mean);
+						if(s_var < 0.0) s_var = 0.0;  // numerical guard
+						double s_std  = sqrt(s_var);
+						last_channel_selectivity = (s_mean > 1e-12) ? (s_std / s_mean) : -1.0;
+					}
+					else
+					{
+						last_channel_selectivity = -1.0;
+					}
+				}
 				// Schmidl-Cox sub-peak rejection (dual-condition gate).
 				// Sub-peaks INSIDE the OFDM data body produce saturating
 				// metric (≥0.97, often 1.000) but the resulting channel
@@ -3024,6 +3065,17 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		out_matched, 0, nullptr, nullptr, 0, out_match_mask);
 
+	// Cache correlator metric (normalized to dB) as the §3.1 SNR proxy for the
+	// 2D channel-state lookup (fact-doc channel-state-2d-lookup.md). detect_ack_pattern
+	// returns Σ(e_target/e_total) per matched symbol ∈ [0, ack_pattern_nsymb]; the
+	// normalized fraction ∈ [0,1] is what scales monotonically with SNR.
+	if(ack_mfsk.ack_pattern_nsymb > 0)
+	{
+		double frac = metric / (double)ack_mfsk.ack_pattern_nsymb;
+		if(frac < 1e-9) frac = 1e-9;  // floor to avoid log(0); -90 dB sentinel-ish
+		last_correlator_metric_db = 10.0 * log10(frac);
+	}
+
 	return metric;
 }
 
@@ -3379,6 +3431,16 @@ double cl_telecom_system::detect_hail_pattern_from_passband(double* data, int si
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		out_matched, suffix_start, out_suffix_matched);
+
+	// Cache correlator metric (normalized to dB) — see ACK detector above and
+	// fact-doc channel-state-2d-lookup.md §3.1. HAIL uses hail_detect_nsymb as
+	// the per-symbol score denominator.
+	if(ack_mfsk.hail_detect_nsymb > 0)
+	{
+		double frac = metric / (double)ack_mfsk.hail_detect_nsymb;
+		if(frac < 1e-9) frac = 1e-9;
+		last_correlator_metric_db = 10.0 * log10(frac);
+	}
 
 	return metric;
 }
@@ -5187,4 +5249,19 @@ void cl_telecom_system::get_pre_equalization_channel()
 		printf("[PRE-EQ] Nc=%d min_mag=%.4f max_mag=%.4f\n", data_container.Nc, min_mag, max_mag);
 		fflush(stdout);
 	}
+}
+
+// 2D channel-state lookup accessors. Read-only — see fact-doc
+// mercury/fact-documents/channel-state-2d-lookup.md §8 Step 1.
+// The cached values are updated opportunistically inside the existing
+// detect_ack/hail_pattern_from_passband() and the receive_byte() preamble
+// channel-estimate path; no new computation paths are introduced.
+double cl_telecom_system::get_correlator_snr_proxy() const
+{
+	return last_correlator_metric_db;
+}
+
+double cl_telecom_system::get_channel_selectivity() const
+{
+	return last_channel_selectivity;
 }
