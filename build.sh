@@ -323,6 +323,7 @@ source/datalink_layer/arq_commander.cc
 source/datalink_layer/arq_common.cc
 source/datalink_layer/arq_responder.cc
 source/datalink_layer/b2f_handler.cc
+source/datalink_layer/channel_state_lookup.cc
 source/datalink_layer/datalink_config.cc
 source/datalink_layer/fifo_buffer.cc
 source/datalink_layer/rate_optimizer.cc
