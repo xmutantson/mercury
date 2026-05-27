@@ -25,10 +25,48 @@
 
 #include "ldpc_decoder_GBF.h"
 #include "ldpc_decoder_SPA.h"
+#include "ldpc_decoder_BP_OSD.h"
 #include "mercury_ldpc.h"
 #include "physical_defines.h"
 #include <iostream>
 #include <atomic>
+
+
+// Unified LDPC decode failure check covering all algorithm return-code
+// conventions used in this codebase. Use this everywhere the caller would
+// otherwise hard-code `rc > cap-1` against `cl_ldpc::nIteration_max`.
+//
+// Return-code semantics by algorithm (see source files for details):
+//   GBF / SPA:
+//     - success         : 1..cap-1   (iter at which all parity checks passed)
+//     - failure (cap)   : == cap     (loop terminated normally without break)
+//                         actually iteration ends at `cap+1` for SPA's
+//                         for(iteration=1;iteration<=cap;) but historical
+//                         `> cap-1` check catches both >= cap and the cap+1
+//                         exit; we keep equivalent semantics here.
+//     - SPA abort       : < 0        (parallel monitor decode race won)
+//   BP_OSD (see ldpc_decoder_BP_OSD.h):
+//     - BP success      : 1..cap     (positive, below LDPC_BP_OSD_OSD_BASE)
+//     - OSD success     : LDPC_BP_OSD_OSD_BASE + order  (>= 1000)
+//     - failure         : LDPC_BP_OSD_FAIL  (-1)
+//     - abort           : LDPC_BP_OSD_ABORT (-2)
+//
+// Per Phase A.2 §7.5 / research doc §5.6: callers must treat OSD success as
+// a success even though the integer return is far above `cap`. This helper
+// returns true iff the decode failed.
+static inline bool ldpc_decode_failed(int rc, int algo, int cap)
+{
+    if (algo == BP_OSD)
+    {
+        // BP_OSD: any non-negative value below LDPC_BP_OSD_OSD_BASE is BP-success,
+        // values >= LDPC_BP_OSD_OSD_BASE are OSD-success, negatives are failure.
+        return rc < 0;
+    }
+    // GBF and SPA: failure is "iteration cap reached".
+    // (SPA also returns negative on abort_flag; treat that as failure.)
+    if (rc < 0) return true;
+    return rc > cap - 1;
+}
 
 class cl_ldpc
 {
