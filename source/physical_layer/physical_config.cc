@@ -72,6 +72,11 @@ cl_configuration_telecom_system::cl_configuration_telecom_system()
 	ldpc_decoding_algorithm=SPA;
 	ldpc_GBF_eta=0.5;
 	ldpc_nIteration_max=100;
+	// Phase A.2 §7.5 BP+OSD defaults (only consulted when
+	// ldpc_decoding_algorithm is set to BP_OSD per-config — see the ROBUST_0
+	// gate in telecom_system.cc).
+	ldpc_osd_norder=1;
+	ldpc_osd_maxosd=0;
 	ldpc_print_nIteration=NO;
 
 	outer_code=CRC16_MODBUS_RTU;

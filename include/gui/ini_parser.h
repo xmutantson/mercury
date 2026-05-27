@@ -79,6 +79,12 @@ struct MercurySettings {
     int initial_config;
     int ldpc_iterations_max;  // Max LDPC decoder iterations (5-50)
 
+    // Phase A.2 §7.5 BP+OSD knobs. -1 = unset (keep code default = 1 / 0).
+    // norder: -1 = OSD disabled (BP-only), 0..3 = OSD order.
+    // maxosd: -1 = unset, 0..2 = OSD call budget per failed BP decode.
+    int ldpc_osd_norder;
+    int ldpc_osd_maxosd;
+
     // OFDM settings
     double guard_interval_ms;  // Guard interval in ms (1.33-6.5, default 3.0)
 
