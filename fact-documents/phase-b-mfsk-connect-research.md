@@ -2245,4 +2245,150 @@ Each commit must:
    All five frames now on MFSK suffix path. End-to-end CONNECT should
    succeed wherever HAIL succeeds.
 
+### §14.1 Implementation log
+
+**Status:** Wave 3 code complete on `feat/b-mfsk-connect-v2`. 5 commits
+on top of the Wave 2 v2 implementation log (0ce7926).
+
+**Commits on branch `feat/b-mfsk-connect-v2` (Wave 3 only):**
+
+```
+2e89bc6 docs(phase-b): §14.0 Wave 3 plan (pre-code)
+c7df560 mfsk_ctrl_codec: §14 TEST_CONN payload pack/unpack helpers + unit test
+a680efa arq: §14 Site E — CMD TEST_CONNECTION PHY swap inside process_messages_tx_control
+24ae163 arq: §14 Site F — RSP MFSK TEST_CONN detector synthesizes messages_rx_buffer
+752a733 tests: §14 Wave 3 passband round-trip + SNR quantization regression
+```
+
+(A 6th commit — this implementation log — follows.)
+
+**Files modified (Wave 3 line counts):**
+
+| File | Lines changed | Purpose |
+|---|---|---|
+| `fact-documents/phase-b-mfsk-connect-research.md` | +359 (plan) + this log | §14.0 plan + §14.1 log |
+| `include/physical_layer/mfsk_ctrl_codec.h` | +24 | TEST_CONN payload helpers declarations |
+| `source/physical_layer/mfsk_ctrl_codec.cc` | +33 | TEST_CONN payload pack/unpack |
+| `include/datalink_layer/arq.h` | +15 | 2 new method declarations (send/receive_mfsk_test_conn_phy) |
+| `source/datalink_layer/arq_common.cc` | +44 | 2 PHY helpers (Site E TX core + Site F RX core) |
+| `source/datalink_layer/arq_commander.cc` | +52 (net) | Site E branch (TEST_CONNECTION) added to the existing Site A block at :765 |
+| `source/datalink_layer/arq_responder.cc` | +95 | Site F detector added beneath Site B in process_messages_rx_data_control() |
+| `source/physical_layer/mfsk_ctrl_codec_tests.cc` | +247 (net) | 3 new tests: unit + passband + quantization |
+
+**Code locations (canonical file:line):**
+
+| Element | File:line |
+|---|---|
+| `pack_test_conn_payload` declaration | `include/physical_layer/mfsk_ctrl_codec.h:134` |
+| `pack_test_conn_payload` implementation | `source/physical_layer/mfsk_ctrl_codec.cc:178` |
+| `unpack_test_conn_payload` implementation | `source/physical_layer/mfsk_ctrl_codec.cc:190` |
+| `send_mfsk_test_conn_phy` (Site E core) | `source/datalink_layer/arq_common.cc:5003` |
+| `receive_mfsk_test_conn_phy` (Site F core) | `source/datalink_layer/arq_common.cc:5023` |
+| **Site E** PHY swap branch | `source/datalink_layer/arq_commander.cc:782` |
+| **Site F** detector + synthesis | `source/datalink_layer/arq_responder.cc:312` |
+| `test_pack_unpack_test_conn_payload` | `source/physical_layer/mfsk_ctrl_codec_tests.cc:244` |
+| `test_v3_test_conn_passband_roundtrip_clean` | `source/physical_layer/mfsk_ctrl_codec_tests.cc:607` |
+| `test_v3_test_conn_snr_quantization_roundtrip` | `source/physical_layer/mfsk_ctrl_codec_tests.cc:724` |
+
+**Test results:** 15/15 pass on `mercury.exe --test`
+
+| Group | Tests | Status |
+|---|---|---|
+| §1 Codec primitives (incl. new TEST_CONN unit test) | 8 | 13 → 15 (after Wave 3 adds 3) |
+| §2 Passband round-trip + HAIL false-trigger | 2 | unchanged |
+| §3 Wave 2 v2 cross-layer regression | 3 | unchanged |
+| §4 Wave 3 (§14) TEST_CONN integration | 2 | new |
+
+**Discoveries during implementation:**
+
+1. **Wave 1 already wired `MFSK_CTRL_TEST_CONN` into `ctrl_suffix_roundtrip_all_types`**
+   (test 4). The type discriminator round-trips at the codec layer for
+   all four type codes since Wave 1 — only the type-specific payload
+   helpers needed adding in Wave 3. Codec layer required NO changes
+   beyond adding `pack_test_conn_payload` / `unpack_test_conn_payload`.
+
+2. **The Wave 2 v2 helper API generalized cleanly.**
+   `send_mfsk_ctrl_suffix_phy_core` and `receive_mfsk_ctrl_suffix_phy_core`
+   in `arq_common.cc` were designed to accept a type discriminator from
+   the start. Wave 3's new helpers are 6-line wrappers around the cores
+   — same pattern as Wave 2 v2's `send_mfsk_start_conn_phy` /
+   `send_mfsk_test_ack_phy`.
+
+3. **Site E composition lived inside Site A's block.**
+   The existing Site A block at `arq_commander.cc:765` already runs
+   inside the `messages_control.status==ADDED_TO_BATCH_BUFFER` guard
+   — exactly the right place for Site E. The Site A predicate was
+   `data[0]==START_CONNECTION`; Site E added a sibling predicate
+   `data[0]==TEST_CONNECTION` with its own post-TX bookkeeping (which
+   happens to be bit-identical to Site A's). The `mfsk_tx_done` flag
+   gates the legacy LDPC fallback uniformly for both sites.
+
+4. **Site F's link_status gate is `CONNECTION_RECEIVED || CONNECTED`.**
+   RSP enters CONNECTION_RECEIVED after START_CONN ACK is queued
+   (process_control_responder at :1858); transitions to CONNECTED at
+   :2025 after TEST_CONNECTION is consumed. Including CONNECTED in the
+   gate handles a retransmitted TEST_CONNECTION from a CMD whose ACK
+   was lost — the legacy LDPC path at :1880 also re-runs on this
+   state. Site F's `messages_rx_buffer.status != RECEIVED` gate
+   prevents a no-op double-fire when Site B fires on the same tick.
+
+5. **The SNR quantization roundtrip is a fixed-point invariant.**
+   `snr_to_tone(tone_to_snr(tone)) == tone` for every tone in 0..15
+   at M=16 — verified by test 4.2. Confirms the Site F SNR
+   reconstruction round-trips without drift. The Site F-reconstructed
+   float will differ from the CMD's original (continuous) float by
+   ≤ 1 dB (half-step), which is acceptable for the legacy
+   `measurements.SNR_uplink` consumer at `arq_responder.cc:1887`
+   (used by gearshift heuristics, not bit-precise calculations).
+
+6. **No new shared state introduced.** All Wave 3 mutations target
+   the SAME shared structures as Wave 2 v2 (`messages_rx_buffer`,
+   `messages_control`). The §13.9 audit applies bit-for-bit; the §14
+   audit (in §14.0 plan) extends the field-mapping table without
+   changing the producer/consumer sets.
+
+**Cross-layer audit verification (Site E + Site F end-to-end):**
+
+| Field | Producer (Site E TX) | Wire encoding | Consumer (Site F RX) |
+|---|---|---|---|
+| float SNR_uplink | `messages_control.data[1..4]` via u_SNR (set by legacy build at `arq_commander.cc:466-472`) | `snr_q:4` via `snr_to_tone` | `messages_rx_buffer.data[1..4]` via u_SNR, reconstructed via `tone_to_snr` |
+| local_capability | `messages_control.data[5]` (set at `:473`) | `local_cap:2` (masked to 2 bits) | `messages_rx_buffer.data[5]` |
+| SSID | `messages_control.data[6]` (set at `:474` via `callsign_get_ssid`) | `ssid:8` | `messages_rx_buffer.data[6]` |
+
+The legacy TEST_CONNECTION consumer at `arq_responder.cc:1880-2079`
+reads exactly these fields with no other dependencies on
+`messages_rx_buffer.data[...]` beyond `data[0..6]`. End-to-end the
+synthesized buffer is indistinguishable from a successful LDPC decode.
+
+**Cap-byte echo flow (Sites C+E+F end-to-end):** verified by reading
+the consumer at `arq_responder.cc:1892` reads `peer_capability = data[5]`,
+then at `:2062-2065` builds `data[1]=peer_capability` (echo), `data[2]=local_capability`
+for TEST_CONNECTION_ACK. Site C reads `data[1..2]`. Site D writes
+`data[1] = echoed_cap`, `data[2] = own_cap`, `data[5] = own_cap`. CMD's
+`process_control_commander` at `arq_commander.cc:3466+` validates
+`echoed_cap == local_capability`. All-MFSK path bit-correct.
+
+**SSID flow:** CMD's `callsign_get_ssid(my_call_sign)` → Site E's
+`ssid:8` field → Site F's `data[6]` → consumer at `:1901-1911` calls
+`callsign_format_ssid` if not SSID_NONE. Bit-correct.
+
+**What's NOT done in this branch (next steps for hardware operator):**
+
+1. **Hardware A/B at WGN:-6, -10, -12** for the TEST_CONNECTION
+   direction. Wave 1 sim-tests prove the codec works at sigma=0;
+   the WGN floor for MFSK TEST_CONN should match Sites A+B (shared
+   Welch-Costas base pattern). If TEST_CONN cliffs at the same SNR
+   as Sites A+B, Wave 3 delivered full handshake reach to the HAIL
+   floor (~WGN:-10).
+2. **Validation: does the full handshake reach the HAIL floor?**
+   With Sites A+B+C+D+E+F all on MFSK, the operational reach should
+   be set by HAIL's WGN:-10 floor. If hardware shows the handshake
+   still cliffs at WGN:-8 (the LDPC START_CONN floor), the cause is
+   likely elsewhere (ACK pattern threshold, HAIL self-detect race
+   in the new state buckets, or unforeseen sibling bug).
+3. **NB session regression check.** All Sites E+F gates include
+   `connect_pattern_nsymb > 0` which is false at M=8; NB sessions
+   still use LDPC TEST_CONNECTION. Verify a clean NB regression run
+   shows unchanged TEST_CONNECTION behavior.
+
 ---
