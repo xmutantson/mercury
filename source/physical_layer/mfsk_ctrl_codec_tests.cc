@@ -28,10 +28,11 @@
 //     1.1 pack_unpack_callsign_body_b36
 //     1.2 pack_unpack_start_conn_payload
 //     1.3 pack_unpack_test_ack_payload
-//     1.4 ctrl_suffix_roundtrip_all_types
-//     1.5 ctrl_suffix_crc12_corruption
-//     1.6 base_pattern_cross_correlation
-//     1.7 ack_sack_bitmap_30bit_cap
+//     1.4 pack_unpack_test_conn_payload         (§14 Wave 3)
+//     1.5 ctrl_suffix_roundtrip_all_types
+//     1.6 ctrl_suffix_crc12_corruption
+//     1.7 base_pattern_cross_correlation
+//     1.8 ack_sack_bitmap_30bit_cap
 //
 //   §2 Passband round-trip  (requires cl_telecom_system::load_configuration):
 //     2.1 mfsk_connect_passband_roundtrip_clean
@@ -220,6 +221,51 @@ static void test_pack_unpack_test_ack_payload() {
 					snprintf(buf, sizeof(buf),
 						"ec=%d oc=%d ssid=%u -> ok=%d out_ec=%u out_oc=%u out_ssid=%u",
 						ec, oc, (unsigned)ssid, ok, out_ec, out_oc, out_ssid);
+					test_fail(name, buf);
+					return;
+				}
+				trials++;
+			}
+		}
+	}
+	(void)trials;
+	test_pass(name);
+}
+
+static void test_pack_unpack_test_conn_payload() {
+	const char* name = "pack_unpack_test_conn_payload";
+	std::mt19937 rng(0x7E57);
+	// Cover full local_cap × representative SSIDs × full snr_q range.
+	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
+	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
+	int trials = 0;
+	for (int snr_q = 0; snr_q < 16; snr_q++) {
+		for (int lc = 0; lc < 4; lc++) {
+			for (int si = 0; si < nssids; si++) {
+				uint8_t ssid = ssids[si];
+				uint64_t p38 = (uint64_t)rng();  // pre-set garbage
+				pack_test_conn_payload(&p38, (uint8_t)snr_q,
+					(uint8_t)lc, ssid);
+				if (p38 & ~((1ULL << 38) - 1ULL)) {
+					test_fail(name, "payload overflows 38 bits");
+					return;
+				}
+				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
+					// reserved bits 23..0 must be zero on TX
+					test_fail(name, "reserved bits not zero on TX");
+					return;
+				}
+				uint8_t out_snr = 0xFF, out_lc = 0xFF, out_ssid = 0;
+				bool ok = unpack_test_conn_payload(p38, &out_snr,
+					&out_lc, &out_ssid);
+				if (!ok || out_snr != (uint8_t)snr_q ||
+				    out_lc != (uint8_t)lc || out_ssid != ssid) {
+					char buf[200];
+					snprintf(buf, sizeof(buf),
+						"snr=%d lc=%d ssid=%u -> ok=%d "
+						"out_snr=%u out_lc=%u out_ssid=%u",
+						snr_q, lc, (unsigned)ssid, ok,
+						out_snr, out_lc, out_ssid);
 					test_fail(name, buf);
 					return;
 				}
@@ -735,6 +781,7 @@ int run_mfsk_ctrl_codec_tests() {
 	test_pack_unpack_callsign_body_b36();
 	test_pack_unpack_start_conn_payload();
 	test_pack_unpack_test_ack_payload();
+	test_pack_unpack_test_conn_payload();  // §14 Wave 3
 	test_ctrl_suffix_roundtrip_all_types();
 	test_ctrl_suffix_crc12_corruption();
 	test_base_pattern_cross_correlation();

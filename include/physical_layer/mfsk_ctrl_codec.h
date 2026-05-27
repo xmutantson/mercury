@@ -113,4 +113,28 @@ void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
 bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
                               uint8_t* own_cap, uint8_t* ssid);
 
+// =============================================================================
+// MFSK_CTRL_TEST_CONN payload (38 bits)  — Wave 3 (§14)
+// =============================================================================
+//
+//   bits 37..34 : snr_q          (4)   SNR quantized via cl_mfsk::snr_to_tone
+//                                       at M=16 (0..15, 2 dB step, range
+//                                       -5..+25 dB per mfsk.cc:549-559)
+//   bits 33..32 : local_cap      (2)   sender's local_capability
+//                                       (CAP_WB_CAPABLE=0x01, CAP_ENCRYPTION=0x02)
+//   bits 31..24 : ssid           (8)   0-15 numeric, 16=L, 17=T, 18=R, 19=X,
+//                                       255 = SSID_NONE (matches
+//                                       `arq.h:60 #define SSID_NONE 0xFF`).
+//                                       Identical encoding to TEST_ACK.
+//   bits 23..0  : reserved       (24)  must be 0 on TX, ignored on RX
+//
+// Site F (RSP RX) reconstructs the legacy float SNR via
+// cl_mfsk::tone_to_snr(snr_q). 2 dB quantization step is documented in the
+// v3_test_conn_snr_quantization_roundtrip regression test.
+void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
+                             uint8_t local_cap, uint8_t ssid);
+
+bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
+                               uint8_t* local_cap, uint8_t* ssid);
+
 #endif // INC_MFSK_CTRL_CODEC_H_

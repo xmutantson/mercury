@@ -164,3 +164,36 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 	*ssid       = (uint8_t)((v >> 26) & 0xFF);
 	return true;
 }
+
+// =============================================================================
+// MFSK_CTRL_TEST_CONN (type=11) — 38-bit payload  (Wave 3, §14)
+// =============================================================================
+//
+//   bits 37..34 : snr_q          (4)
+//   bits 33..32 : local_cap      (2)
+//   bits 31..24 : ssid           (8)
+//   bits 23..0  : reserved       (24)
+//
+
+void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
+                             uint8_t local_cap, uint8_t ssid)
+{
+	if (!p38) return;
+	uint64_t v = 0;
+	v |= ((uint64_t)(snr_q     & 0xF))  << 34;
+	v |= ((uint64_t)(local_cap & 0x3))  << 32;
+	v |= ((uint64_t)(ssid      & 0xFF)) << 24;
+	// reserved (bits 23..0) MUST be zero on TX
+	*p38 = v & ((1ULL << 38) - 1ULL);
+}
+
+bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
+                               uint8_t* local_cap, uint8_t* ssid)
+{
+	if (!snr_q || !local_cap || !ssid) return false;
+	uint64_t v = p38 & ((1ULL << 38) - 1ULL);
+	*snr_q     = (uint8_t)((v >> 34) & 0xF);
+	*local_cap = (uint8_t)((v >> 32) & 0x3);
+	*ssid      = (uint8_t)((v >> 24) & 0xFF);
+	return true;
+}
