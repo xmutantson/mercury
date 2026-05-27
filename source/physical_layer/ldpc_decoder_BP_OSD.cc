@@ -21,6 +21,7 @@
  */
 
 #include "physical_layer/ldpc_decoder_BP_OSD.h"
+#include <cstddef>
 #include <vector>
 
 int decode_BP_OSD(
