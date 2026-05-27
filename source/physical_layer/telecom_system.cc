@@ -2695,7 +2695,7 @@ skip_h_retry_point:
 
 			if(receive_stats.all_zeros==YES ||
 			   (outer_code == CRC16_MODBUS_RTU && receive_stats.crc != 0) ||
-			   (outer_code != CRC16_MODBUS_RTU && receive_stats.iterations_done > (ldpc.nIteration_max-1)))
+			   (outer_code != CRC16_MODBUS_RTU && ldpc_decode_failed(receive_stats.iterations_done, ldpc.decoding_algorithm, ldpc.nIteration_max)))
 			{
 				receive_stats.SNR=-99.9;
 				receive_stats.message_decoded=NO;
@@ -2720,7 +2720,7 @@ skip_h_retry_point:
 				if(M != MOD_MFSK
 					&& receive_stats.coarse_metric >= 0.97
 					&& mean_H >= 0.5
-					&& receive_stats.iterations_done > (ldpc.nIteration_max-1)
+					&& ldpc_decode_failed(receive_stats.iterations_done, ldpc.decoding_algorithm, ldpc.nIteration_max)
 					&& subpeak_recover_phase < 2)
 				{
 					int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
@@ -5416,6 +5416,21 @@ void cl_telecom_system::load_configuration(int configuration)
 		// convergence-limited (more iters help) vs capability-limited (SPA stuck).
 		const char* itenv = getenv("MERCURY_ROBUST_ITER");
 		if(itenv) { int v = atoi(itenv); if(v > 0) ldpc.nIteration_max = v; }
+
+		// Phase A.2 §7.5: BP+OSD cascade. a26 gated this to ROBUST_0 only because
+		// the dense generator matrix was hardwired to rate 1/16. [robust3-feas]
+		// extends the dense-G builder to rate 8/16 (ldpc_generator.cc), so BP_OSD
+		// is now selectable on ROBUST_3 too. SIM A/B: env MERCURY_BPOSD=1 turns it
+		// on (default stays SPA for a clean baseline comparison). ROBUST_3 (rate
+		// 8/16) is the config where SPA is genuinely cap-binding at the cliff
+		// (iter_mean~173 @ channel-SNR -7), unlike ROBUST_0 (iter_mean~1) where
+		// OSD never fired — so this is where OSD reprocessing could buy dB.
+		const char* bposd_env = getenv("MERCURY_BPOSD");
+		if(bposd_env && bposd_env[0]=='1' &&
+		   (configuration == ROBUST_0 || configuration == ROBUST_3))
+		{
+			ldpc.decoding_algorithm = BP_OSD;
+		}
 	}
 	ldpc.print_nIteration=default_configurations_telecom_system.ldpc_print_nIteration;
 
