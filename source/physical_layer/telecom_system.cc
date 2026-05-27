@@ -2595,7 +2595,7 @@ skip_h_retry_point:
 
 			if(receive_stats.all_zeros==YES ||
 			   (outer_code == CRC16_MODBUS_RTU && receive_stats.crc != 0) ||
-			   (outer_code != CRC16_MODBUS_RTU && receive_stats.iterations_done > (ldpc.nIteration_max-1)))
+			   (outer_code != CRC16_MODBUS_RTU && ldpc_decode_failed(receive_stats.iterations_done, ldpc.decoding_algorithm, ldpc.nIteration_max)))
 			{
 				receive_stats.SNR=-99.9;
 				receive_stats.message_decoded=NO;
@@ -2620,7 +2620,7 @@ skip_h_retry_point:
 				if(M != MOD_MFSK
 					&& receive_stats.coarse_metric >= 0.97
 					&& mean_H >= 0.5
-					&& receive_stats.iterations_done > (ldpc.nIteration_max-1)
+					&& ldpc_decode_failed(receive_stats.iterations_done, ldpc.decoding_algorithm, ldpc.nIteration_max)
 					&& subpeak_recover_phase < 2)
 				{
 					int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
@@ -4697,6 +4697,25 @@ void cl_telecom_system::load_configuration(int configuration)
 	// See mfsk-vara-parity-plan.md §2.1 Q3.
 	if(is_robust_config(configuration))
 		ldpc.nIteration_max = 200;
+
+	// Phase A.2 §7.5 items 3+4: BP+OSD enabled for ROBUST_0 only on first ship.
+	//
+	// Rationale (fact doc phase-a2-bp-osd-research.md §3.5):
+	//   - Rate 1/16 is the only code we've ported a dense generator matrix for
+	//     (ldpc_generator_1_16.cc).
+	//   - ROBUST_0 is the cliff-pinned config where SPA's 200-iter cap is the
+	//     bottleneck; OSD-1 should add 0.5-1.25 dB at the waterfall (§9 of the
+	//     research doc).
+	//   - Keeping ROBUST_1 and OFDM configs on SPA gives us an A/B knob: pin
+	//     ROBUST_0 vs ROBUST_1 and compare BER curves.
+	//
+	// osd_norder/osd_maxosd defaults from cl_ldpc's constructor (norder=1,
+	// maxosd=0 — OSD-1 with a single OSD call) are kept unless overridden by
+	// the --ldpc-osd-norder / --ldpc-osd-maxosd CLI knobs (next commit).
+	if(configuration == ROBUST_0)
+	{
+		ldpc.decoding_algorithm = BP_OSD;
+	}
 	ldpc.print_nIteration=default_configurations_telecom_system.ldpc_print_nIteration;
 
 	outer_code=default_configurations_telecom_system.outer_code;
