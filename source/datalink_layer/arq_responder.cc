@@ -309,6 +309,101 @@ void cl_arq_controller::process_messages_rx_data_control()
 			}
 		}
 
+		// Phase B Wave 3 — PHY swap site F (fact-doc §14).
+		// Detect MFSK CONNECT TEST_CONN suffix BEFORE the legacy LDPC
+		// receive() runs. Mirror Site B but for TEST_CONNECTION (CMD→RSP):
+		// on a clean detection, synthesize messages_rx_buffer to look as
+		// if LDPC had decoded a TEST_CONNECTION frame, then fall through
+		// to the existing consumer at :380-430 (copies into messages_control
+		// and calls process_control_responder() — the legacy state mutations
+		// at :1880-2079 run UNCHANGED).
+		//
+		// Gates differ from Site B by link_status:
+		//  - link_status ∈ {CONNECTION_RECEIVED, CONNECTED}: we're either
+		//    waiting for the first TEST_CONNECTION (post-START_CONN ACK) or
+		//    repeating a previously-decoded one (legacy retry path).
+		//  - messages_rx_buffer.status != RECEIVED: Site B didn't already
+		//    synthesize a frame on this tick.
+		// Other gates (messages_control.status == FREE, !passive_monitor,
+		// connect_pattern_nsymb > 0) match Site B exactly.
+		if((link_status == CONNECTION_RECEIVED || link_status == CONNECTED)
+		   && messages_control.status == FREE
+		   && !passive_monitor
+		   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0
+		   && messages_rx_buffer.status != RECEIVED)
+		{
+			// ftr override — same rationale as Site B (fact-doc §13.4).
+			// Either the post-Site-C TX path or the post-Site-B fall-through
+			// can leave ftr large; the MFSK suffix detector at
+			// receive_mfsk_ctrl_suffix_phy_core requires ftr==0 to sample.
+			if(telecom_system->data_container.frames_to_read > 2)
+			{
+				MUTEX_LOCK(&capture_prep_mutex);
+				telecom_system->data_container.frames_to_read = 2;
+				MUTEX_UNLOCK(&capture_prep_mutex);
+			}
+
+			uint8_t rx_snr_q = 0, rx_local_cap = 0, rx_ssid = 0;
+			if(receive_mfsk_test_conn_phy(&rx_snr_q, &rx_local_cap, &rx_ssid))
+			{
+				// HAIL self-detect race delay — same shape as Site B.
+				int sym_ms = (telecom_system->data_container.Nofdm
+					* telecom_system->data_container.interpolation_rate * 1000) / 48000;
+				int remaining_syms =
+					telecom_system->ack_mfsk.connect_pattern_nsymb
+					+ telecom_system->ack_mfsk.ack_sack_suffix_len()
+					- telecom_system->ack_mfsk.connect_match_threshold;
+				if(remaining_syms < 0) remaining_syms = 0;
+				int delay_ms = remaining_syms * sym_ms + 200;
+				printf("[RSP-TEST-CONN-V3] Waiting %d ms (HAIL race delay) "
+					"before synthesizing messages_rx_buffer\n", delay_ms);
+				fflush(stdout);
+				msleep(delay_ms);
+
+				// Reconstruct float SNR from 4-bit quantization via the
+				// inverse of cl_mfsk::snr_to_tone(M=16).
+				float snr_uplink =
+					telecom_system->ack_mfsk.tone_to_snr((int)rx_snr_q);
+				u_SNR tmp_SNR;
+				tmp_SNR.f_SNR = snr_uplink;
+
+				// Synthesize messages_rx_buffer to match the LDPC
+				// TEST_CONNECTION layout the legacy CMD builds at
+				// arq_commander.cc:466-475:
+				//   data[0]   = TEST_CONNECTION
+				//   data[1..4]= u_SNR.char4_SNR (float SNR_uplink)
+				//   data[5]   = local_capability (peer's cap byte; gated to 2 bits)
+				//   data[6]   = peer SSID
+				//   length    = 7
+				//   sequence_number = control_batch_size - 1 so the consumer
+				//     at :420 calls process_control_responder() immediately
+				//     (audit finding §13.9 / §14).
+				messages_rx_buffer.type = CONTROL;
+				messages_rx_buffer.sequence_number = (char)(control_batch_size - 1);
+				messages_rx_buffer.length = 7;
+				messages_rx_buffer.data[0] = (char)TEST_CONNECTION;
+				for(int i = 0; i < 4; i++)
+					messages_rx_buffer.data[i+1] = tmp_SNR.char4_SNR[i];
+				messages_rx_buffer.data[5] = (char)rx_local_cap;
+				messages_rx_buffer.data[6] = (char)rx_ssid;
+				messages_rx_buffer.status = RECEIVED;
+				printf("[RSP-TEST-CONN-V3] Synthesized messages_rx_buffer: "
+					"snr=%.1f dB local_cap=0x%02X ssid=%u seq=%d/%d — "
+					"falling through to legacy consumer\n",
+					snr_uplink, (unsigned)rx_local_cap, (unsigned)rx_ssid,
+					(int)messages_rx_buffer.sequence_number, control_batch_size);
+				fflush(stdout);
+				// Fall through: legacy block at :380-430 copies into
+				// messages_control and calls process_control_responder()
+				// (arq_responder.cc:1880-2079 TEST_CONNECTION branch) which
+				// performs ALL state mutations bit-identically with the LDPC
+				// path: peer_capability, destination_call_sign SSID, SNR_uplink,
+				// compression/encryption/SACK setup, TCP CONNECTED message,
+				// link_status=CONNECTED, ACKNOWLEDGING_CONTROL with the
+				// TEST_CONNECTION_ACK queued for Site C TX.
+			}
+		}
+
 		this->receive();
 
 		// Emergency BREAK: commander signals "drop to ROBUST_0"
