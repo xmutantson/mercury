@@ -21,6 +21,7 @@
  */
 
 #include "physical_layer/ldpc.h"
+#include "physical_layer/ldpc_generator_1_16.h"
 #include "debug/canary_guard.h"
 
 cl_ldpc::cl_ldpc()
@@ -33,6 +34,9 @@ cl_ldpc::cl_ldpc()
 	eta_val=0;
 	nIteration_max_val=0;
 	print_nIteration_val=0;
+	osd_norder_val=1;
+	osd_maxosd_val=0;
+	dense_G_1_16=nullptr;
 	Cwidth=0;
 	r=0;
 	decoding_algorithm=0;
@@ -69,9 +73,35 @@ void cl_ldpc::init()
 	decoding_algorithm_val=decoding_algorithm;
 	eta_val=GBF_eta;
 	nIteration_max_val=nIteration_max;
+	osd_norder_val=osd_norder;
+	osd_maxosd_val=osd_maxosd;
 	print_nIteration_val= print_nIteration;
 	Cwidth=0;
 	update_code_parameters();
+
+	// Phase A.2 §7.5 item 5: amortize dense_G build outside the decode hot path.
+	// Only build for rate 1/16 — that's the only code BP_OSD currently targets
+	// (ROBUST_0/1). Idempotent via std::call_once inside the helper, so the
+	// per-rate cost is paid once per process regardless of how many cl_ldpc
+	// instances exist (e.g. parallel monitor decoders).
+	if (decoding_algorithm_val == BP_OSD)
+	{
+		if (K == K_RATE_1_16 && N == N_RATE_1_16)
+		{
+			dense_G_1_16 = ldpc_get_dense_G_1_16();
+		}
+		else
+		{
+			// Defensive: BP_OSD selected on a code rate we haven't ported a
+			// dense generator for. Decode() will fail-soft (decode_BP_OSD with
+			// G=NULL would crash inside OSD's MRB encode). Keep dense_G_1_16
+			// NULL and log; the gate in telecom_system.cc:4690 should prevent
+			// this from happening in production.
+			std::cout << "[BP-OSD] WARN dense_G not built for K=" << K
+			          << " N=" << N << " (BP_OSD only supports rate 1/16 today);"
+			          << " decode() will return LDPC_BP_OSD_FAIL." << std::endl;
+		}
+	}
 }
 
 void cl_ldpc::deinit()
@@ -83,7 +113,12 @@ void cl_ldpc::deinit()
 	decoding_algorithm_val=0;
 	eta_val=0;
 	nIteration_max_val=0;
+	osd_norder_val=1;
+	osd_maxosd_val=0;
 	print_nIteration_val=0;
+	// dense_G_1_16 points into a process-static buffer owned by
+	// ldpc_generator_1_16.cc — do NOT delete; just drop our handle.
+	dense_G_1_16=nullptr;
 	Cwidth=0;
 
 	Cwidth=0;
@@ -288,6 +323,37 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
  	else if(decoding_algorithm_val==SPA)
  	{
  		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort);
+ 	}
+ 	else if(decoding_algorithm_val==BP_OSD)
+ 	{
+ 		// Phase A.2 §7.5 item 2: BP+OSD cascade. nIteration_max_val is reused
+ 		// as the BP iter cap (per integration brief). OSD knobs come from the
+ 		// per-config osd_norder/osd_maxosd captured at init().
+ 		//
+ 		// dense_G_1_16 is built at init() above; if it's still NULL we lack
+ 		// a generator matrix for this rate — return LDPC_BP_OSD_FAIL which
+ 		// the helper ldpc_decode_failed() will classify as failure. The
+ 		// is_robust_config gate in telecom_system.cc keeps BP_OSD off of
+ 		// non-1/16 codes in production, so this path is purely defensive.
+ 		if (dense_G_1_16 == nullptr)
+ 		{
+ 			iterations_done = LDPC_BP_OSD_FAIL;
+ 		}
+ 		else
+ 		{
+ 			iterations_done = decode_BP_OSD(
+ 				data, decoded_data,
+ 				QCmatrixC, Cwidth, Cwidth,
+ 				QCmatrixV, Vwidth, Vwidth,
+ 				dense_G_1_16,
+ 				/*apmask=*/nullptr,
+ 				N, K, P,
+ 				nIteration_max_val,
+ 				osd_norder_val,
+ 				osd_maxosd_val,
+ 				decode_abort
+ 			);
+ 		}
  	}
  	return iterations_done;
  }
