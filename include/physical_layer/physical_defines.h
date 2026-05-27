@@ -41,6 +41,11 @@
 
 #define GBF 0
 #define SPA 1
+// BP_OSD = log-domain belief-propagation with order-statistics fallback,
+// ported from ft8mon (WSJT-X lineage). See ldpc_decoder_BP_OSD.h and the
+// fact document mercury/fact-documents/phase-a2-bp-osd-research.md.
+// Phase A.2 §7.5: gated to ROBUST_0 only on first ship.
+#define BP_OSD 2
 
 
 #define NOT_HEALTHY -1
