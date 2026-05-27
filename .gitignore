@@ -112,3 +112,6 @@ tools/*.sh
 !tools/timesync_trace_validate.py
 !tools/validate_ldpc_matrices.py
 !tools/wb_sweep_clean.py
+
+# Phase A.2 BP+OSD reference material (read-only, do not commit)
+.ft8mon-ref/

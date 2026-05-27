@@ -339,6 +339,11 @@ source/physical_layer/interpolator.cc
 source/physical_layer/ldpc.cc
 source/physical_layer/ldpc_decoder_GBF.cc
 source/physical_layer/ldpc_decoder_SPA.cc
+source/physical_layer/ldpc_decoder_BP.cc
+source/physical_layer/ldpc_decoder_OSD.cc
+source/physical_layer/ldpc_decoder_BP_OSD.cc
+source/physical_layer/ldpc_generator_1_16.cc
+source/physical_layer/ldpc_bp_osd_tests.cc
 source/physical_layer/mercury_met_2_16.cc
 source/physical_layer/mercury_normal_1_16.cc
 source/physical_layer/mercury_normal_14_16.cc
