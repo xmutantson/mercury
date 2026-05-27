@@ -1795,6 +1795,95 @@ The §13.9 audit finding above is the v2-specific tripwire. Fixed by setting
 
 ### §13.11 v2 implementation log
 
-(filled in as commits land; cleared on finalization)
+**Status:** Wave 2 v2 code complete on `feat/b-mfsk-connect-v2`. 6 commits
+on top of Wave 1 (30a0c70). Hardware A/B not yet run — that's the next
+parent-session step.
+
+**Commits on branch `feat/b-mfsk-connect-v2`:**
+
+```
+db651f8 docs(phase-b): §13 Wave 2 v2 implementation plan + cross-layer audit
+8942560 arq: B.11+ v2 — PHY-only helpers for MFSK CONNECT (no state machine touch)
+f327e4a arq: B.12 v2 — CMD START_CONNECTION PHY swap inside process_messages_tx_control
+e82c29a arq: B.13 v2 — RSP MFSK START_CONN detector synthesizes messages_rx_buffer
+1e64e38 arq: B.14 v2 — RSP TEST_CONNECTION_ACK PHY swap inside acknowledging_control
+7d18875 arq: B.14 v2 — CMD TEST_CONNECTION_ACK PHY swap inside rx_acks_control
+9867fc4 tests: v2 §3 cross-layer regression — CRC12 wireformat, no-refire, ftr override
+```
+
+**Files modified (line counts after the swap commits):**
+
+| File | Lines changed | Purpose |
+|---|---|---|
+| `fact-documents/phase-b-mfsk-connect-research.md` | +362 | §13 plan + this log |
+| `include/datalink_layer/arq.h` | +24 | 4 new method declarations |
+| `source/datalink_layer/arq_common.cc` | +355 | 4 PHY helpers + shared cores |
+| `source/datalink_layer/arq_commander.cc` | +130 | Site A + Site D |
+| `source/datalink_layer/arq_responder.cc` | +160 | Site B + Site C |
+| `source/physical_layer/mfsk_ctrl_codec_tests.cc` | +203 | §3 v2 tests + crc12_calc init fix |
+
+**Test results:** 12/12 pass on mercury.exe --test
+- 9 Wave 1 codec tests (preserved)
+- 3 new Wave 2 v2 cross-layer regression tests (§3.1/§3.2/§3.3)
+
+**Discoveries during implementation:**
+
+1. The Wave 1 `test_crc12_calc` helper had **the same init=0 bug** as v1's
+   inline RX-side CRC (commit a2dfc34 fixed the production-side; the test
+   helper was never touched). Fixed in commit 9867fc4. Without the fix,
+   the new §3.1 regression test would fail on its first random byte
+   sequence.
+2. AUDIT FINDING (originally §13.9 for messages_rx_buffer): the consumer
+   at arq_responder.cc:327 fires `process_control_responder()` only when
+   `sequence_number >= control_batch_size - 1`. Site B sets
+   `sequence_number = control_batch_size - 1` (a single-frame batch from
+   MFSK). Verified at commit time — without this, the consumer would
+   wait for a non-existent next frame and timeout.
+3. `callsign_pack` writes 5 bytes directly into the caller's buffer via
+   pointer (not heap-allocated, contrary to a brief misreading of the
+   v1 code). v2 calls it as `callsign_pack(rx_call, len, &buf[2], flags)`
+   — same shape as the legacy CMD-side build at arq_commander.cc:458.
+4. The CRC12 issue in v1 also affected Wave 2 v1's loopback test (per
+   commit a2dfc34's message). v2 sidesteps this by having both sides
+   call the production `cl_arq_controller::CRC12_calc` — no inline copies
+   anywhere. The §3.1 regression test enforces parity.
+
+**Pre-existing warning unchanged by v2:** `arq_commander.cc:2262` has a
+`-Wsign-compare` warning that predates this branch (commit 21e83946,
+2026-04-20). Not introduced by Wave 2 v2.
+
+**What's NOT done in this branch (next steps for hardware operator):**
+
+1. **Hardware A/B at WGN:-6, -10, -12** (§B.16). Reuse drive_a26.py
+   harness pattern. Expected: WGN:-6 = same behavior as baseline. WGN:-10
+   = MFSK arm succeeds, baseline fails. WGN:-12 = both fail.
+2. **Backward-compat regression at WGN:32** (§B.17). Confirm full ARQ
+   data flow + CFG15 throughput unchanged.
+3. **Validation: does CONNECT actually reach the HAIL floor?** Wave 1
+   passband tests pass at sigma=0; the WGN floor is unknown until
+   hardware A/B. If MFSK CONNECT cliff is no better than LDPC START_CONN
+   cliff (both at WGN:-8) then the v2 effort delivered no operational
+   reach — but Wave 1 base pattern is constructed identically to HAIL
+   (the proven floor reference) so this is unlikely.
+4. **TEST_CONNECTION (CMD→RSP) staying LDPC.** Per fact-doc §3.5, this
+   is acceptable Phase B scope: by the time CMD sends TEST_CONNECTION,
+   the link has already demonstrated viability via START_CONN ACK. If
+   hardware shows TEST_CONNECTION failing at lower SNR, a follow-up wave
+   can swap it via the same PHY-swap pattern (would be a 4th and 5th
+   swap site, symmetric to Site A and Site B).
+
+**v1 bug ledger (resolved by v2 design, not by patches):**
+
+| v1 bug | v1 commit | v2 mitigation |
+|---|---|---|
+| CRC12 init mismatch (init=0 vs init=0xFFF) | a2dfc34 | Both TX+RX call production CRC12_calc. §3.1 test enforces parity with the test helper. |
+| START_CONN re-fire every tick (no FREE-guard) | 71849d6 | Site A is INSIDE the legacy `messages_control.status==ADDED_TO_BATCH_BUFFER` guard. Status transitions to PENDING_ACK after swap; next tick skips. §3.2 test asserts the predicate. |
+| frames_to_read large after HAIL → detector never fires | 03b0a48 | Site B mirrors HAIL's own ftr override at arq_responder.cc:128-136. §3.3 test asserts the cap. |
+| Post-CONNECT TEST_CONNECTION never decoded (current/unfixed in v1) | — | v2 routes through the legacy state machine; `process_control_responder()` at arq_responder.cc:1657 runs UNCHANGED with v2-synthesized messages_rx_buffer, performing every state mutation bit-identically. The CMD's TEST_CONNECTION is then dispatched via the legacy `add_message_control(TEST_CONNECTION)` at arq_commander.cc:289, which still uses LDPC (intentionally — §13.2 scope). |
+
+The 4th bug never had a v1 commit because v1 was paused for architectural
+review (per `phase-a-to-b-workplan.md` §10 update on 2026-05-27) before a
+fix landed. v2's design eliminates the root cause by not bypassing
+`messages_control` in the first place.
 
 ---
