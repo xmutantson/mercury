@@ -885,38 +885,76 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		}
 		else if(messages_control.data[0] == TEST_CONNECTION_ACK)
 		{
-			// v9 handshake echo — must use LDPC ACK to carry caps echo + CRC.
-			// Mirror the legacy ACK dichotomy:
-			//   ack_pattern_time_ms > 0  → OFDM ARQ session: send LDPC on
-			//                              data_configuration (same as
-			//                              KEY_EXCHANGE_1 path)
-			//   ack_pattern_time_ms == 0 → MFSK/ROBUST session: send LDPC on
-			//                              ack_configuration with mfsk_ctrl_mode
-			//                              (same as legacy LDPC fallback below).
-			//                              4-byte payload fits easily in either.
-			if(ack_pattern_time_ms > 0)
+			// Phase B Wave 2 v2 — PHY swap site C (fact-doc §13.2).
+			// When WB and the MFSK codec is available, emit the MFSK
+			// TEST_ACK suffix instead of an LDPC TEST_CONNECTION_ACK frame.
+			// messages_control.data[1..2] were populated by the
+			// TEST_CONNECTION consumer at arq_responder.cc:1930-1934 with
+			// the echoed_cap / own_cap pair we need. SSID comes from
+			// my_call_sign's SSID. The CMD-side detector (Site D) will
+			// synthesize an LDPC-shaped messages_control on its end so the
+			// existing process_control_commander() runs unchanged.
+			bool mfsk_test_ack_path =
+				narrowband_enabled != YES
+				&& telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
+			bool mfsk_tx_done = false;
+			if(mfsk_test_ack_path)
 			{
-				printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on data_config %d (OFDM)\n",
-					data_configuration);
-				fflush(stdout);
-				telecom_system->set_mfsk_ctrl_mode(false);  // full OFDM frame
-				messages_batch_tx[message_batch_counter_tx]=messages_control;
-				message_batch_counter_tx++;
-				pad_messages_batch_tx(control_batch_size);
-				send_batch();
+				uint8_t echoed_cap = (uint8_t)messages_control.data[1];
+				uint8_t own_cap    = (uint8_t)messages_control.data[2];
+				uint8_t ssid       = (uint8_t)callsign_get_ssid(my_call_sign);
+				long long elapsed = send_mfsk_test_ack_phy(echoed_cap, own_cap, ssid);
+				if(elapsed > 0)
+				{
+					printf("[ACK-CTRL-V2] MFSK TEST_ACK sent (%lld ms) "
+						"echoed=0x%02X own=0x%02X ssid=%u\n",
+						elapsed, echoed_cap, own_cap, ssid);
+					fflush(stdout);
+					mfsk_tx_done = true;
+				}
+				else
+				{
+					printf("[ACK-CTRL-V2] MFSK TEST_ACK unavailable (codec guard "
+						"tripped) — falling back to LDPC TEST_CONNECTION_ACK\n");
+					fflush(stdout);
+				}
 			}
-			else
+
+			if(!mfsk_tx_done)
 			{
-				printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on ack_config %d (MFSK)\n",
-					ack_configuration);
-				fflush(stdout);
-				load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY, NO);
-				telecom_system->set_mfsk_ctrl_mode(true);
-				messages_batch_tx[message_batch_counter_tx]=messages_control;
-				message_batch_counter_tx++;
-				pad_messages_batch_tx(ack_batch_size);
-				send_batch();
-				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+				// Legacy LDPC TEST_CONNECTION_ACK: must use LDPC ACK to carry
+				// caps echo + CRC. Mirror the legacy ACK dichotomy:
+				//   ack_pattern_time_ms > 0  → OFDM ARQ session: send LDPC on
+				//                              data_configuration (same as
+				//                              KEY_EXCHANGE_1 path)
+				//   ack_pattern_time_ms == 0 → MFSK/ROBUST session: send LDPC on
+				//                              ack_configuration with mfsk_ctrl_mode
+				//                              (same as legacy LDPC fallback below).
+				//                              4-byte payload fits easily in either.
+				if(ack_pattern_time_ms > 0)
+				{
+					printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on data_config %d (OFDM)\n",
+						data_configuration);
+					fflush(stdout);
+					telecom_system->set_mfsk_ctrl_mode(false);  // full OFDM frame
+					messages_batch_tx[message_batch_counter_tx]=messages_control;
+					message_batch_counter_tx++;
+					pad_messages_batch_tx(control_batch_size);
+					send_batch();
+				}
+				else
+				{
+					printf("[ACK-CTRL] Sending LDPC TEST_CONNECTION_ACK on ack_config %d (MFSK)\n",
+						ack_configuration);
+					fflush(stdout);
+					load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY, NO);
+					telecom_system->set_mfsk_ctrl_mode(true);
+					messages_batch_tx[message_batch_counter_tx]=messages_control;
+					message_batch_counter_tx++;
+					pad_messages_batch_tx(ack_batch_size);
+					send_batch();
+					load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+				}
 			}
 		}
 		else if(ack_pattern_time_ms > 0)
