@@ -79,6 +79,12 @@ public:
 	int ldpc_nIteration_max;
 	int ldpc_print_nIteration;
 
+	// Phase A.2 §7.5 BP+OSD knobs. Plumbed onto cl_ldpc::osd_norder /
+	// cl_ldpc::osd_maxosd at load_configuration time (telecom_system.cc:~4694).
+	// Defaults match research §4.6 / cl_ldpc constructor defaults.
+	int ldpc_osd_norder;     // 0..3; -1 = OSD disabled (BP-only).
+	int ldpc_osd_maxosd;     // 0 = single OSD call on BP fail; >0 reserved.
+
 	int outer_code;
 
 	double bandwidth;

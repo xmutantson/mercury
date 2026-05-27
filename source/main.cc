@@ -298,6 +298,8 @@ int main(int argc, char *argv[])
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
     int rx_normalize_cli = -1;         // --rx-normalize=on|off: -1=default(on), 0=off, 1=on
     int csi_llr_cli = -1;              // --csi-llr=on|off: -1=default(on), 0=off, 1=on
+    int ldpc_osd_norder_cli = -999;    // --ldpc-osd-norder=N: -999=unset, -1=BP-only, 0..3=OSD order
+    int ldpc_osd_maxosd_cli = -999;    // --ldpc-osd-maxosd=N: -999=unset, -1..2=OSD call budget
     double ack_metric_threshold_cli = -1; // --ack-metric-threshold=F: <0 = default(0.5)
     int emergency_nack_cli = -1;       // --emergency-nack=N: -1=default(3), >=0=override
     int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
@@ -512,6 +514,33 @@ int main(int argc, char *argv[])
             if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) csi_llr_cli = 0;
             else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) csi_llr_cli = 1;
             else { fprintf(stderr, "--csi-llr: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ldpc-osd-norder=", 18) == 0)
+        {
+            // Phase A.2 §7.5 item 6. Range -1..3:
+            //   -1 = disable OSD entirely (BP-only fallback)
+            //    0 = OSD order-0 (just MRB encode of hard decisions)
+            //    1 = OSD-1 (default; single-bit MRB flips, ~100 TEPs)
+            //    2 = OSD-2 (double flips, ~5k TEPs — ~25 ms on Pi 5)
+            //    3 = OSD-3 (triple flips, ~162k TEPs — ~800 ms; offline analysis only)
+            ldpc_osd_norder_cli = atoi(argv[i] + 18);
+            if (ldpc_osd_norder_cli < -1) ldpc_osd_norder_cli = -1;
+            if (ldpc_osd_norder_cli > 3)  ldpc_osd_norder_cli = 3;
+            printf("[FLAG] --ldpc-osd-norder=%d\n", ldpc_osd_norder_cli);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ldpc-osd-maxosd=", 18) == 0)
+        {
+            // Phase A.2 §7.5 item 6. Range -1..2 per research §2.4 (`ndepth`
+            // mapping). 0 = single OSD call (current implementation); negative
+            // = ignored / unset.
+            ldpc_osd_maxosd_cli = atoi(argv[i] + 18);
+            if (ldpc_osd_maxosd_cli < -1) ldpc_osd_maxosd_cli = -1;
+            if (ldpc_osd_maxosd_cli > 2)  ldpc_osd_maxosd_cli = 2;
+            printf("[FLAG] --ldpc-osd-maxosd=%d\n", ldpc_osd_maxosd_cli);
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1426,6 +1455,17 @@ start_modem:
         printf("[FLAG] --csi-llr=%s\n",
                telecom_system.csi_llr_enabled ? "on" : "off");
     }
+    if (ldpc_osd_norder_cli != -999) {
+        // Apply BEFORE load_configuration so the value propagates through
+        // default_configurations_telecom_system into cl_ldpc::osd_norder at
+        // init time. (See telecom_system.cc ~4694 where the field is plumbed.)
+        telecom_system.default_configurations_telecom_system.ldpc_osd_norder = ldpc_osd_norder_cli;
+        printf("[FLAG] --ldpc-osd-norder=%d (applied to defaults)\n", ldpc_osd_norder_cli);
+    }
+    if (ldpc_osd_maxosd_cli != -999) {
+        telecom_system.default_configurations_telecom_system.ldpc_osd_maxosd = ldpc_osd_maxosd_cli;
+        printf("[FLAG] --ldpc-osd-maxosd=%d (applied to defaults)\n", ldpc_osd_maxosd_cli);
+    }
     if (wb_match_bias_cli != 0) {
         // Apply to both mfsk instances; cl_mfsk::init() will pick up the bias
         // at the end of each init() call.
@@ -1950,6 +1990,21 @@ start_modem:
         else if (g_settings.ldpc_iterations_max != 50)
             telecom_system.default_configurations_telecom_system.ldpc_nIteration_max = g_settings.ldpc_iterations_max;
         g_gui_state.ldpc_iterations_max.store(telecom_system.default_configurations_telecom_system.ldpc_nIteration_max);
+
+        // Phase A.2 §7.5 BP+OSD: CLI overrides INI, INI overrides default.
+        // (CLI was already applied earlier — see the ldpc_osd_norder_cli /
+        // ldpc_osd_maxosd_cli block above. Here we apply INI only if the user
+        // didn't set the CLI flag.)
+        if (ldpc_osd_norder_cli == -999 && g_settings.ldpc_osd_norder != -1)
+        {
+            telecom_system.default_configurations_telecom_system.ldpc_osd_norder = g_settings.ldpc_osd_norder;
+            printf("[INI] LDPC.OSDNorder=%d\n", g_settings.ldpc_osd_norder);
+        }
+        if (ldpc_osd_maxosd_cli == -999 && g_settings.ldpc_osd_maxosd != -1)
+        {
+            telecom_system.default_configurations_telecom_system.ldpc_osd_maxosd = g_settings.ldpc_osd_maxosd;
+            printf("[INI] LDPC.OSDMaxOsd=%d\n", g_settings.ldpc_osd_maxosd);
+        }
         telecom_system.coarse_freq_sync_enabled = g_settings.coarse_freq_sync_enabled;
         g_gui_state.coarse_freq_sync_enabled.store(g_settings.coarse_freq_sync_enabled);
         // Robust mode: CLI -R overrides INI setting

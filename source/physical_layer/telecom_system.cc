@@ -4692,6 +4692,11 @@ void cl_telecom_system::load_configuration(int configuration)
 	ldpc.decoding_algorithm=default_configurations_telecom_system.ldpc_decoding_algorithm;
 	ldpc.GBF_eta=default_configurations_telecom_system.ldpc_GBF_eta;
 	ldpc.nIteration_max=default_configurations_telecom_system.ldpc_nIteration_max;
+	// Phase A.2 §7.5 BP+OSD knobs. Plumbed from default_configurations so the
+	// CLI / INI override path that sets them on default_configurations_telecom_system
+	// (see main.cc and ini_parser) reaches the actual decoder.
+	ldpc.osd_norder=default_configurations_telecom_system.ldpc_osd_norder;
+	ldpc.osd_maxosd=default_configurations_telecom_system.ldpc_osd_maxosd;
 	// Q3: ROBUST tier (rate-1/16 LDPC) needs more SPA iterations to converge at
 	// the waterfall. OFDM configs are above the cliff and 100 iter is plenty.
 	// See mfsk-vara-parity-plan.md §2.1 Q3.

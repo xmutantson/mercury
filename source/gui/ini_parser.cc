@@ -215,6 +215,11 @@ void MercurySettings::setDefaults() {
     initial_config = 1;
     ldpc_iterations_max = 50;
 
+    // Phase A.2 §7.5: -1 = "INI key absent / unset" → main.cc keeps the
+    // physical_config.cc default (norder=1, maxosd=0).
+    ldpc_osd_norder = -1;
+    ldpc_osd_maxosd = -1;
+
     // OFDM
     guard_interval_ms = 3.0;  // Ngi=36 samples at 12kHz
 
@@ -296,6 +301,12 @@ bool MercurySettings::load(const std::string& filename) {
     initial_config = ini.getInt("GearShift", "InitialConfig", initial_config);
     ldpc_iterations_max = ini.getInt("GearShift", "LDPCIterationsMax", ldpc_iterations_max);
 
+    // Phase A.2 §7.5 BP+OSD knobs — section [LDPC] keys OSDNorder / OSDMaxOsd.
+    // -1 sentinel means key absent; main.cc only applies non-(-1) values so
+    // the physical_config.cc defaults aren't clobbered.
+    ldpc_osd_norder = ini.getInt("LDPC", "OSDNorder", ldpc_osd_norder);
+    ldpc_osd_maxosd = ini.getInt("LDPC", "OSDMaxOsd", ldpc_osd_maxosd);
+
     // OFDM
     guard_interval_ms = ini.getDouble("OFDM", "GuardIntervalMs", guard_interval_ms);
 
@@ -369,6 +380,13 @@ bool MercurySettings::save(const std::string& filename) {
     ini.setBool("GearShift", "Enabled", gear_shift_enabled);
     ini.setInt("GearShift", "InitialConfig", initial_config);
     ini.setInt("GearShift", "LDPCIterationsMax", ldpc_iterations_max);
+
+    // Phase A.2 §7.5 BP+OSD knobs. Only persist if set (non-(-1)) to keep
+    // INI files clean for users who never touched them.
+    if (ldpc_osd_norder != -1)
+        ini.setInt("LDPC", "OSDNorder", ldpc_osd_norder);
+    if (ldpc_osd_maxosd != -1)
+        ini.setInt("LDPC", "OSDMaxOsd", ldpc_osd_maxosd);
 
     // OFDM
     ini.setDouble("OFDM", "GuardIntervalMs", guard_interval_ms);
