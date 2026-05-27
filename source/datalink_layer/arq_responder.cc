@@ -1268,8 +1268,13 @@ void cl_arq_controller::process_messages_acknowledging_data()
 								&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 							{
 								uint32_t bitmap_u32 = 0;
+								// Phase B Wave 1 flag-day (fact-doc §11.2): MFSK
+								// ctrl-suffix bitmap is 30 bits (was 32). Cap nbits
+								// to 30 so we never set bits 30/31 — those would be
+								// silently dropped by pack_ack_sack_payload and the
+								// receiver would never see them.
 								int nbits = data_batch_size;
-								if (nbits > 32) nbits = 32;
+								if (nbits > 30) nbits = 30;
 								for (int i = 0; i < nbits; i++)
 								{
 									if (sack_bitmap[i])
@@ -1405,9 +1410,11 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			if (MFSK_ACK_SACK_ENABLED
 				&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 			{
+				// Phase B Wave 1 flag-day (fact-doc §11.2): bitmap is 30 bits
+				// (was 32). Producer side cap so we never set bits 30/31.
 				uint32_t bitmap_u32;
-				if (data_batch_size >= 32)
-					bitmap_u32 = 0xFFFFFFFFu;
+				if (data_batch_size >= 30)
+					bitmap_u32 = 0x3FFFFFFFu;
 				else if (data_batch_size <= 0)
 					bitmap_u32 = 0u;
 				else
