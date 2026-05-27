@@ -779,6 +779,16 @@ void cl_arq_controller::process_messages_tx_control()
 			messages_control.data[0] == START_CONNECTION
 			&& narrowband_enabled != YES
 			&& telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
+		// Phase B Wave 3 — PHY swap site E (fact-doc §14).
+		// TEST_CONNECTION (CMD→RSP) gets the same MFSK suffix treatment as
+		// START_CONNECTION. The legacy LDPC build at arq_commander.cc:463-477
+		// has already populated messages_control.data[1..6] with float SNR +
+		// local_capability + SSID; Site E reads those fields and emits the
+		// MFSK CONNECT suffix instead. RSP side: Site F (§14 / arq_responder.cc).
+		bool mfsk_test_conn_path =
+			messages_control.data[0] == TEST_CONNECTION
+			&& narrowband_enabled != YES
+			&& telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
 		bool mfsk_tx_done = false;
 		if(mfsk_connect_path)
 		{
@@ -818,8 +828,49 @@ void cl_arq_controller::process_messages_tx_control()
 				fflush(stdout);
 			}
 		}
+		else if(mfsk_test_conn_path)
+		{
+			// Site E: extract the legacy LDPC TEST_CONNECTION fields from
+			// messages_control.data (built at arq_commander.cc:466-475).
+			u_SNR tmp_SNR;
+			for(int i = 0; i < 4; i++)
+				tmp_SNR.char4_SNR[i] = messages_control.data[i+1];
+			float snr_uplink = tmp_SNR.f_SNR;
+			uint8_t local_cap = (uint8_t)messages_control.data[5];
+			uint8_t ssid      = (uint8_t)messages_control.data[6];
+			long long elapsed = send_mfsk_test_conn_phy(snr_uplink, local_cap, ssid);
+			if(elapsed > 0)
+			{
+				printf("[CMD-TEST-CONN-V3] MFSK TEST_CONN sent (%lld ms wall-clock) "
+					"snr=%.1f dB local_cap=0x%02X ssid=%u\n",
+					elapsed, snr_uplink, local_cap, ssid);
+				fflush(stdout);
+				// Same bookkeeping as Site A — messages_control transitions
+				// to PENDING_ACK; the post-TX state machine continues
+				// unchanged (Site D handles the TEST_CONNECTION_ACK echo).
+				messages_control.ack_timer.start();
+				messages_control.status = PENDING_ACK;
+				for(int i = 0; i < message_batch_counter_tx; i++)
+				{
+					messages_batch_tx[i].ack_timeout = 0;
+					messages_batch_tx[i].id          = 0;
+					messages_batch_tx[i].length      = 0;
+					messages_batch_tx[i].nResends    = 0;
+					messages_batch_tx[i].status      = FREE;
+					messages_batch_tx[i].type        = NONE;
+				}
+				message_batch_counter_tx = 0;
+				mfsk_tx_done = true;
+			}
+			else
+			{
+				printf("[CMD-TEST-CONN-V3] MFSK TEST_CONN unavailable (codec guard "
+					"tripped) — falling back to LDPC TEST_CONNECTION\n");
+				fflush(stdout);
+			}
+		}
 
-		// Legacy LDPC path: same as pre-v2 when mfsk_connect_path is false
+		// Legacy LDPC path: same as pre-v2 when neither MFSK path fired
 		// OR the MFSK send returned 0 (codec runtime guard tripped).
 		if(!mfsk_tx_done)
 		{

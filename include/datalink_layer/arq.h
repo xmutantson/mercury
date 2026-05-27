@@ -479,6 +479,21 @@ public:
                                   uint8_t* out_own_cap,
                                   uint8_t* out_ssid);
 
+  // Phase B Wave 3 (§14) — TEST_CONNECTION (CMD→RSP) PHY swap.
+  // Site E (TX): CMD encodes [snr_q:4 | local_cap:2 | ssid:8] via
+  //   pack_test_conn_payload (snr_q computed from
+  //   telecom_system->ack_mfsk.snr_to_tone(snr) at M=16, 4-bit).
+  // Site F (RX): RSP decodes; caller reconstructs float SNR via
+  //   tone_to_snr(snr_q) and synthesizes messages_rx_buffer to the
+  //   legacy LDPC TEST_CONNECTION layout (data[0]=TEST_CONNECTION,
+  //   data[1..4]=u_SNR.char4_SNR float bytes, data[5]=local_cap,
+  //   data[6]=ssid, length=7). See fact-doc §14.
+  long long send_mfsk_test_conn_phy(float snr, uint8_t local_cap,
+                                     uint8_t ssid);
+  bool receive_mfsk_test_conn_phy(uint8_t* out_snr_q,
+                                   uint8_t* out_local_cap,
+                                   uint8_t* out_ssid);
+
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected

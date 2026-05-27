@@ -4994,6 +4994,50 @@ bool cl_arq_controller::receive_mfsk_test_ack_phy(uint8_t* out_echoed_cap,
 	return true;
 }
 
+// CMD-side TX (Site E in §14): MFSK TEST_CONNECTION suffix carrying
+// [snr_q:4 | local_cap:2 | ssid:8 | reserved:24]. The legacy CMD-side
+// LDPC build at arq_commander.cc:466-475 populates messages_control.data
+// with float SNR + capability + SSID; Site E reads those fields, quantizes
+// SNR via cl_mfsk::snr_to_tone (M=16 → 4 bits, range -5..+25 dB step 2 dB),
+// packs and emits the suffix.
+long long cl_arq_controller::send_mfsk_test_conn_phy(float snr,
+                                                     uint8_t local_cap,
+                                                     uint8_t ssid)
+{
+	// snr_to_tone at M=16 is the canonical 4-bit SNR quantizer
+	// (mfsk.cc:549-559). Returns 0..15.
+	int snr_tone = telecom_system->ack_mfsk.snr_to_tone(snr);
+	uint8_t snr_q = (uint8_t)(snr_tone & 0xF);
+	uint64_t p38 = 0;
+	pack_test_conn_payload(&p38, snr_q, local_cap, ssid);
+	return send_mfsk_ctrl_suffix_phy_core(this, telecom_system,
+		MFSK_CTRL_TEST_CONN, p38, "CONNECT-TEST");
+}
+
+// RSP-side RX (Site F in §14): detect MFSK TEST_CONN, unpack snr_q + caps + SSID.
+// Returns true on a clean decode; caller (the new block in
+// process_messages_rx_data_control) reconstructs float SNR via
+// cl_mfsk::tone_to_snr and synthesizes messages_rx_buffer.data[] in the
+// LDPC TEST_CONNECTION layout the legacy consumer at arq_responder.cc:1880-2079
+// reads.
+bool cl_arq_controller::receive_mfsk_test_conn_phy(uint8_t* out_snr_q,
+                                                   uint8_t* out_local_cap,
+                                                   uint8_t* out_ssid)
+{
+	if(!out_snr_q || !out_local_cap || !out_ssid) return false;
+	uint64_t p38 = 0;
+	if(!receive_mfsk_ctrl_suffix_phy_core(this, telecom_system,
+			MFSK_CTRL_TEST_CONN, &p38, "CONNECT-TEST"))
+		return false;
+	if(!unpack_test_conn_payload(p38, out_snr_q, out_local_cap, out_ssid))
+		return false;
+	printf("[RX-MFSK-CTRL-CONNECT-TEST] snr_q=%u (=%.1f dB) local_cap=0x%02X ssid=%u\n",
+		*out_snr_q, telecom_system->ack_mfsk.tone_to_snr((int)*out_snr_q),
+		*out_local_cap, *out_ssid);
+	fflush(stdout);
+	return true;
+}
+
 // TX "I am Mercury" HAIL beacon — prefix + optional CRC suffix for directed hailing.
 void cl_arq_controller::send_hail_pattern()
 {
