@@ -30,6 +30,7 @@
 #include "physical_defines.h"
 #include <iostream>
 #include <atomic>
+#include <cstdint>
 
 
 // Unified LDPC decode failure check covering all algorithm return-code
@@ -94,6 +95,18 @@ private:
 	int nIteration_max_val;
 	int print_nIteration_val;
 
+	// BP+OSD internal mirrors of osd_norder / osd_maxosd, captured at init()
+	// for the same reason eta_val/nIteration_max_val mirror their public twins.
+	int osd_norder_val;
+	int osd_maxosd_val;
+
+	// Dense generator matrix pointer for OSD's MRB encode. Populated at init()
+	// when decoding_algorithm == BP_OSD (and only for the rate-1/16 code today;
+	// the BP_OSD path is gated to ROBUST configs at the telecom_system layer).
+	// Memory is owned by ldpc_generator_1_16.cc's static buffer; we just hold
+	// a non-owning const pointer. NULL when BP_OSD is not selected.
+	const uint8_t* dense_G_1_16{nullptr};
+
 
 
 	int update_code_parameters();
@@ -109,6 +122,14 @@ public:
 	float GBF_eta; //!< The GBF algorithms correction rate.
 	int nIteration_max; //!< The maximum number of LDPC decoding iterations allowed.
 	int print_nIteration;
+
+	// BP+OSD knobs — used only when decoding_algorithm == BP_OSD.
+	// See ldpc_decoder_BP_OSD.h for semantics. Defaults: OSD-1 (norder=1),
+	// single OSD call (maxosd=0). Set per-config from
+	// default_configurations_telecom_system_t in telecom_system.cc.
+	int osd_norder{1};
+	int osd_maxosd{0};
+
 	void init();
 	void deinit();
 
