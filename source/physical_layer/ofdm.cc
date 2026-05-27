@@ -1053,6 +1053,92 @@ void cl_preamble_configurator::print()
 	}
 }
 
+// A.1.4: cross-pilot differential noise variance estimator.
+//
+// Replaces the pilot-residual estimator that previously lived inline in
+// ZF_channel_estimator and LS_channel_estimator.
+//
+// Why the residual estimator was wrong:
+//   ZF estimator: estimated_channel[pilot].value = Y/X exactly, so
+//     residual = Y - (Y/X)*X = 0 identically (post-E1 commit 38f5c60).
+//     noise_variance_estimate collapsed to the 1e-6 floor and LLRs went
+//     ~1000x over-confident; only var_floor=0.001 in psk.cc papered over it.
+//   LS estimator: window-averaged H pulls toward the centre pilot, biasing
+//     residuals low by (N-1)/N. Smaller magnitude but still wrong.
+//
+// Why cross-pilot differential is right:
+//   For two adjacent in-column pilots at rows i_a, i_b = i_a + Dy:
+//     H_a_raw = Y_a / X_a = H_true_a + noise_a / X_a
+//     H_b_raw = Y_b / X_b = H_true_b + noise_b / X_b
+//   For Dy-separated pilots in the same column, H_true_a ≈ H_true_b (slow
+//   channel variation is the design assumption of pilot-based estimation;
+//   if it weren't true, the linear interpolation between them would already
+//   be broken). So:
+//     |H_a_raw - H_b_raw|^2 ≈ |noise_a/X_a - noise_b/X_b|^2
+//   E[|·|^2] = Var(noise_a)/|X_a|^2 + Var(noise_b)/|X_b|^2 = 2σ²/|X|^2
+//   (pilots have uniform amplitude). Divide by 2 to get an unbiased estimate
+//   of σ²/|X|^2 — same units the consumers (MMSE equalizer, psk LLR scale)
+//   already expect from the old residual estimator.
+//
+// The walk order is row-major (matches existing ZF/LS/CPE_correction loops)
+// to keep pilot_index aligned with pilot_configurator.sequence indexing.
+// Per-column state tracks the last pilot row and its raw H estimate; we
+// pair only when the row delta equals Dy exactly (mirrors CPE_correction's
+// guard at ofdm.cc:1384).
+//
+// Returns 0.01 (the previous default) if fewer than one valid pair was
+// found — handles Dy<=0 and degenerate frames consistently with the old
+// path's "noise_count==0" branch.
+//
+// Reference: Ozdemir & Arslan, "Channel Estimation for Wireless OFDM
+// Systems," IEEE Comm Surveys 2007, §IV-B (cross-pilot differential
+// noise estimation). Indexing pattern borrowed from CPE_correction
+// at ofdm.cc:1349.
+double cl_ofdm::estimate_noise_from_pilot_pairs(std::complex<double>* in)
+{
+	if (Nsymb <= 0 || Nc <= 0) return 0.01;
+	int Dy = pilot_configurator.Dy;
+	if (Dy <= 0) return 0.01;
+
+	// Per-column state: last pilot row and raw H = Y/X for that pilot.
+	int prev_row[Nc];                       // VLA, Nc <= 50
+	std::complex<double> prev_H[Nc];        // VLA
+	for (int j = 0; j < Nc; j++) prev_row[j] = -1;
+
+	double noise_sum = 0.0;
+	int noise_count = 0;
+
+	int pilot_index = 0;
+	for (int i = 0; i < Nsymb; i++)
+	{
+		for (int j = 0; j < Nc; j++)
+		{
+			if ((ofdm_frame + i*Nc + j)->type == PILOT)
+			{
+				std::complex<double> X = pilot_configurator.sequence[pilot_index];
+				std::complex<double> H_raw = *(in + i*Nc + j) / X;
+
+				if (prev_row[j] >= 0 && (i - prev_row[j]) == Dy)
+				{
+					std::complex<double> delta = H_raw - prev_H[j];
+					double mag2 = delta.real()*delta.real() + delta.imag()*delta.imag();
+					noise_sum += mag2 * 0.5;   // /2 accounts for noise on both pilots
+					noise_count++;
+				}
+
+				prev_row[j] = i;
+				prev_H[j] = H_raw;
+				pilot_index++;
+			}
+		}
+	}
+
+	if (noise_count <= 0) return 0.01;
+	double nv = noise_sum / noise_count;
+	if (nv < 1e-6) nv = 1e-6;   // prevent division instability at very high SNR
+	return nv;
+}
+
 void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 {
 	int pilot_index=0;
@@ -1120,21 +1206,25 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 		}
 	}
 
-	// Estimate noise variance from pilot residuals for MMSE equalization.
-	// noise = received_pilot - H_interpolated * known_pilot_value
-	// This measures how well the (unsmoothed) channel estimate explains the
-	// actual received pilots — the residual is noise + residual estimation error.
+	// Estimate noise variance for MMSE equalization.
 	//
-	// CRITICAL: residual MUST be computed against the UNSMOOTHED H. The DFT
-	// smoother zeros ~82% of time-domain taps, which pulls H toward the
-	// pilot's own noise; computing residuals against the smoothed estimate
-	// double-counts that noise and biases noise_variance_estimate low by 3-5x,
-	// over-confidence the LDPC LLR scaling.
-	// (Pilot-residual σ² estimate — standard practice; see also van de Beek/
-	// Edfors et al., VTC 1995, "On Channel Estimation in OFDM Systems",
-	// §III for context on LS-then-DFT smoothing (NOT the residual estimator
-	// itself — earlier comments mis-cited eq.(29), which is the MSE of the
-	// smoother, not a derivation of the residual estimate).)
+	// A.1.4 (this session): replaced pilot-residual estimator with cross-pilot
+	// differential. For ZF, residual = Y - (Y/X)*X = 0 identically, so the
+	// residual estimator collapsed to the 1e-6 floor and LLRs went ~1000x
+	// over-confident (only var_floor=0.001 in psk.cc papered over it).
+	// See estimate_noise_from_pilot_pairs() above for the new method and
+	// rationale.
+	//
+	// Original residual-based code preserved below under #if 0 for git-blame
+	// trail (DO NOT delete without updating fact-documents/data-flow- doc).
+	noise_variance_estimate = estimate_noise_from_pilot_pairs(in);
+#if 0
+	// LEGACY (A.1.4): pilot-residual σ² estimate. Broken for ZF estimator
+	// because estimated_channel[pilot].value = Y/X exactly, making the
+	// residual identically zero. Kept here for blame/historical context.
+	// (Standard practice citation; see also van de Beek/Edfors et al., VTC
+	// 1995, "On Channel Estimation in OFDM Systems", §III for context on
+	// LS-then-DFT smoothing — NOT the residual estimator itself.)
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;
@@ -1165,12 +1255,13 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 		if(noise_variance_estimate < 1e-6)
 			noise_variance_estimate = 1e-6;
 	}
+#endif
 
 	// DFT-based channel estimate smoothing: suppress estimation noise
-	// by windowing the time-domain impulse response. Applied AFTER residual
-	// computation so noise_variance_estimate reflects honest pilot noise
-	// (smoother would otherwise collapse the residual by absorbing the noise
-	// into the H estimate). Downstream MMSE equalizer uses the smoothed H.
+	// by windowing the time-domain impulse response. Applied AFTER noise
+	// variance estimation so noise_variance_estimate reflects honest pilot
+	// noise (smoother absorbs noise into H; downstream consumers use the
+	// smoothed H but expect noise_variance_estimate to track raw pilot SNR).
 	smooth_channel_estimate_dft();
 /*
  * Ref: R. Lucky, “The adaptive equalizer,” IEEE Signal Processing Magazine, vol. 23, no. 3, pp. 104–107, 2006.
@@ -1302,11 +1393,15 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 
-	// Estimate noise variance from pilot residuals (same as ZF estimator).
-	// MUST be computed against UNSMOOTHED H — see ZF_channel_estimator for
-	// the rationale. (Standard pilot-residual σ² estimate; see also Edfors
-	// et al., VTC 1995, §III for LS-then-DFT smoothing context, not the
-	// residual estimator itself.)
+	// Estimate noise variance via cross-pilot differential (same helper as ZF).
+	// A.1.4: LS's window-averaging biased the residual estimator low by
+	// (N-1)/N. See estimate_noise_from_pilot_pairs() above for the new
+	// method and rationale. Original residual code preserved under #if 0.
+	noise_variance_estimate = estimate_noise_from_pilot_pairs(in);
+#if 0
+	// LEGACY (A.1.4): pilot-residual σ² estimate. Biased low by (N-1)/N
+	// because LS H is window-averaged toward the centre pilot. Kept here
+	// for blame/historical context.
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;
@@ -1336,10 +1431,11 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		if(noise_variance_estimate < 1e-6)
 			noise_variance_estimate = 1e-6;
 	}
+#endif
 
 	// DFT-based channel estimate smoothing (same as ZF estimator) — applied
-	// AFTER residual computation so noise_variance_estimate is unbiased.
-	// Downstream MMSE equalizer uses the smoothed H.
+	// AFTER noise variance estimation. Downstream MMSE equalizer uses the
+	// smoothed H but noise_variance_estimate tracks raw pilot SNR.
 	smooth_channel_estimate_dft();
 /*
  * Ref J. . -J. van de Beek, O. Edfors, M. Sandell, S. K. Wilson and P. O. Borjesson, "On channel estimation in OFDM systems," 1995 IEEE 45th Vehicular Technology Conference. Countdown to the Wireless Twenty-First Century, Chicago, IL, USA, 1995, pp. 815-819 vol.2, doi: 10.1109/VETEC.1995.504981.

@@ -137,6 +137,16 @@ public:
 	void deframer(std::complex <double>* in, std::complex <double>* out);
 	void ZF_channel_estimator(std::complex <double>*in);
 	void LS_channel_estimator(std::complex <double>*in);
+	// A.1.4: cross-pilot differential noise variance estimator.
+	// Replaces pilot-residual estimator (which collapsed to 0 for ZF post-E1
+	// commit 38f5c60, biased low by (N-1)/N for LS). For adjacent pilot pairs
+	// in the same column (separated by Dy symbols), computes |H_a - H_b|^2/2.
+	// Adjacent column-pilots see ~the same slow-varying channel, so the delta
+	// is dominated by noise. Returns σ²/|X|² in baseband-bin units, or 0.01 if
+	// fewer than 1 valid pair (matches previous default).
+	// Reference: Ozdemir & Arslan, "Channel Estimation for Wireless OFDM
+	// Systems," IEEE Comm Surveys 2007, §IV-B.
+	double estimate_noise_from_pilot_pairs(std::complex<double>* in);
 	void CPE_correction(std::complex<double>* in);
 	void restore_channel_amplitude();
 	double carrier_sampling_frequency_sync(std::complex <double>*in, double carrier_freq_width, int preamble_nSymb, double sampling_frequency);
