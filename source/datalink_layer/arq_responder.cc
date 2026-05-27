@@ -216,6 +216,99 @@ void cl_arq_controller::process_messages_rx_data_control()
 
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
 	{
+		// Phase B Wave 2 v2 — PHY swap site B (fact-doc §13.2).
+		// Detect MFSK CONNECT START_CONN suffix BEFORE the legacy LDPC
+		// receive() runs. On a clean detection: synthesize messages_rx_buffer
+		// to look as if LDPC had just decoded a START_CONNECTION frame, then
+		// fall through to the existing consumer at :287-336 (which copies
+		// into messages_control and calls process_control_responder() —
+		// the legacy state mutations at :1657-1747 run UNCHANGED).
+		//
+		// Gates:
+		//  - link_status ∈ {LISTENING, CONNECTION_RECEIVED}: we're either
+		//    waiting for a fresh CONNECT or repeating a captured one.
+		//  - messages_control.status == FREE: defer if a control frame is
+		//    already in-flight (the next-tick FREE state will pick this up).
+		//  - messages_rx_buffer.status != RECEIVED: the consumer at :287
+		//    hasn't processed the prior buffer yet.
+		//  - !passive_monitor: monitor uses LDPC for full-frame visibility.
+		//  - connect_pattern_nsymb > 0: WB-only; NB falls back to LDPC.
+		if((link_status == LISTENING || link_status == CONNECTION_RECEIVED)
+		   && messages_control.status == FREE
+		   && !passive_monitor
+		   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0
+		   && messages_rx_buffer.status != RECEIVED)
+		{
+			// frames_to_read override (v1 bug #3 prevention, fact-doc §13.4).
+			// HAIL handler at :211 primes ftr = preamble_nSymb + Nsymb. The
+			// MFSK detector requires ftr==0. Cap at 2 — mirrors the HAIL
+			// detector's own override at :128-136. Audio buffer is filled
+			// continuously by the capture callback regardless of ftr.
+			if(telecom_system->data_container.frames_to_read > 2)
+			{
+				MUTEX_LOCK(&capture_prep_mutex);
+				telecom_system->data_container.frames_to_read = 2;
+				MUTEX_UNLOCK(&capture_prep_mutex);
+			}
+
+			char rx_call[7] = {};
+			int rx_call_len = 0;
+			bool rx_nb_flag = false;
+			if(receive_mfsk_start_conn_phy(rx_call, &rx_call_len, &rx_nb_flag))
+			{
+				// HAIL self-detect race delay (fact-doc §6.5). CONNECT
+				// pattern = connect_pattern_nsymb base + suffix_len suffix.
+				// Wait (pattern_len - threshold) symbols + 200 ms margin so
+				// CMD's trailing TX doesn't echo into our pattern ACK.
+				int sym_ms = (telecom_system->data_container.Nofdm
+					* telecom_system->data_container.interpolation_rate * 1000) / 48000;
+				int remaining_syms =
+					telecom_system->ack_mfsk.connect_pattern_nsymb
+					+ telecom_system->ack_mfsk.ack_sack_suffix_len()
+					- telecom_system->ack_mfsk.connect_match_threshold;
+				if(remaining_syms < 0) remaining_syms = 0;
+				int delay_ms = remaining_syms * sym_ms + 200;
+				printf("[RSP-CONNECT-V2] Waiting %d ms (HAIL race delay) "
+					"before synthesizing messages_rx_buffer\n", delay_ms);
+				fflush(stdout);
+				msleep(delay_ms);
+
+				// Synthesize messages_rx_buffer to match the LDPC
+				// START_CONNECTION layout the legacy code builds at
+				// arq_commander.cc:447-462:
+				//   data[0]   = START_CONNECTION
+				//   data[1]   = CRC8(my_call_sign)         (so the consumer
+				//               at :1659-1695 PASSES — we just confirmed via
+				//               MFSK CRC12, and the consumer's CRC8 check is
+				//               against MY callsign, not RX'd material)
+				//   data[2..6]= callsign_pack(sender, nb_flag)
+				//   length    = 7
+				//   sequence_number = control_batch_size - 1 so the
+				//                     consumer at :327 calls
+				//                     process_control_responder() immediately.
+				messages_rx_buffer.type = CONTROL;
+				messages_rx_buffer.sequence_number = (char)(control_batch_size - 1);
+				messages_rx_buffer.length = 7;
+				messages_rx_buffer.data[0] = (char)START_CONNECTION;
+				messages_rx_buffer.data[1] = (char)CRC8_calc(
+					(char*)my_call_sign.c_str(), my_call_sign.length());
+				int pack_flags = rx_nb_flag ? 0x01 : 0;
+				callsign_pack(rx_call, rx_call_len,
+					&messages_rx_buffer.data[2], pack_flags);
+				messages_rx_buffer.status = RECEIVED;
+				printf("[RSP-CONNECT-V2] Synthesized messages_rx_buffer: "
+					"sender='%s' (len=%d) nb=%d seq=%d/%d — falling through to "
+					"legacy consumer\n",
+					rx_call, rx_call_len, rx_nb_flag ? 1 : 0,
+					(int)messages_rx_buffer.sequence_number, control_batch_size);
+				fflush(stdout);
+				// Fall through: legacy block at :287-336 copies this into
+				// messages_control and calls process_control_responder()
+				// (arq_responder.cc:1657-1747) which performs ALL state
+				// mutations bit-identically with the LDPC path.
+			}
+		}
+
 		this->receive();
 
 		// Emergency BREAK: commander signals "drop to ROBUST_0"
