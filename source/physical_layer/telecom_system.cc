@@ -82,6 +82,8 @@ cl_telecom_system::cl_telecom_system()
 	ack_pattern_passband_samples=0;
 	ack_snr_pattern_passband_samples=0;
 	ack_sack_pattern_passband_samples=0;
+	connect_pattern_passband_samples=0;
+	ctrl_suffix_pattern_passband_samples=0;
 	ack_pattern_detection_threshold=0.8;
 	operation_mode=BER_PLOT_baseband;
 	bit_interleaver_block_size=1;
@@ -3306,6 +3308,133 @@ bool cl_telecom_system::decode_ack_sack_from_passband(double* data, int size,
 	return ok;
 }
 
+// =============================================================================
+// Phase B Wave 1: MFSK CONNECT base + 13-symbol ctrl-suffix
+// =============================================================================
+//
+// TX: emit CONNECT base pattern + ctrl-suffix as passband audio. Wraps
+// ack_mfsk.generate_ctrl_suffix_pattern + IFFT + baseband-to-passband
+// (same shape as generate_ack_sack_pattern_passband but uses the CONNECT
+// base pattern's tones for the first 16 symbols). Returns samples
+// written or 0 if unsupported (NB / M<16).
+int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
+	mfsk_ctrl_frame_type type, uint64_t payload38, uint16_t crc12)
+{
+	if(ctrl_suffix_pattern_passband_samples <= 0) return 0;
+	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;       // NB unsupported
+	if(ack_mfsk.connect_pattern_nsymb <= 0) return 0;
+
+	int nsymb = ack_mfsk.connect_pattern_nsymb + ack_mfsk.ack_sack_suffix_len();
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	ack_mfsk.generate_ctrl_suffix_pattern(data_container.ofdm_framed_data,
+		type, payload38, crc12);
+
+	for(int i = 0; i < nsymb; i++)
+	{
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	}
+
+	// Reuse the ACK gain channel — same MFSK pattern family on the wire.
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	ofdm.peak_clip(out, ctrl_suffix_pattern_passband_samples, ofdm.data_papr_cut);
+
+	return ctrl_suffix_pattern_passband_samples;
+}
+
+// RX: detect CONNECT base + decode the 52-bit ctrl-suffix.
+// Reuses ofdm.detect_ack_pattern parameterized on connect_tones, then
+// ofdm.decode_suffix_tones, then ack_mfsk.unpack_ctrl_suffix. Returns
+// true on a clean decode (out_type / out_payload38 / out_crc12 reflect
+// the transmitted values). Caller verifies crc12 separately.
+bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
+	mfsk_ctrl_frame_type* out_type, uint64_t* out_payload38,
+	uint16_t* out_crc12, int* out_matched)
+{
+	if (out_type) *out_type = MFSK_CTRL_ACK_SACK;
+	if (out_payload38) *out_payload38 = 0;
+	if (out_crc12) *out_crc12 = 0;
+	if (out_matched) *out_matched = 0;
+	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;       // NB
+	if (ack_mfsk.connect_pattern_nsymb <= 0) return false;
+	if (!out_type || !out_payload38 || !out_crc12) return false;
+
+	// Polyphase decimated path: mix + FIR + decimate fused (identical to
+	// detect_ack_snr_from_passband's preprocessing).
+	int M = data_container.interpolation_rate;
+	int dec_size = size / M;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		M, &ofdm.FIR_rx_data);
+
+	int matched = 0;
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		ack_mfsk.connect_pattern_nsymb,
+		ack_mfsk.connect_tones, /*base_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&best_offset, /*reserve_after=*/ack_mfsk.ack_sack_suffix_len(),
+		/*out_match_mask=*/nullptr);
+
+	if (out_matched) *out_matched = matched;
+
+	if (matched < ack_mfsk.connect_match_threshold || metric < 3.0 || best_offset < 0)
+		return false;
+
+	// Decode the 13-tone ctrl-suffix at the matched position.
+	int suffix_len = ack_mfsk.ack_sack_suffix_len();
+	if (suffix_len > cl_mfsk::MAX_ACK_SACK_SUFFIX)
+		suffix_len = cl_mfsk::MAX_ACK_SACK_SUFFIX;
+	int suffix_tones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	ofdm.decode_suffix_tones(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		best_offset, ack_mfsk.connect_pattern_nsymb,
+		suffix_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		suffix_tones);
+
+	// Snapshot into the CONNECT capture buffer (mirror of ACK+SACK hook).
+	bool clean = true;
+	for (int i = 0; i < suffix_len; i++) {
+		if (suffix_tones[i] < 0 || suffix_tones[i] >= ack_mfsk.M) {
+			clean = false;
+			break;
+		}
+		ack_mfsk.last_connect_suffix_tones[i] = suffix_tones[i];
+	}
+	for (int i = suffix_len; i < cl_mfsk::MAX_ACK_SACK_SUFFIX; i++)
+		ack_mfsk.last_connect_suffix_tones[i] = -1;
+	ack_mfsk.last_connect_capture_valid = clean;
+
+	if (!clean) return false;
+
+	bool ok = ack_mfsk.decode_ctrl_suffix_from_last_capture(
+		out_type, out_payload38, out_crc12);
+	// Consume the capture: caller gets a one-shot view of this match.
+	ack_mfsk.last_connect_capture_valid = false;
+	return ok;
+}
+
 // TX: Generate BREAK pattern as passband audio (identical to ACK but with break_tones)
 int cl_telecom_system::generate_break_pattern_passband(double* out)
 {
@@ -5135,6 +5264,12 @@ void cl_telecom_system::load_configuration(int configuration)
 	// is still safe; downstream callers check ack_sack_suffix_len() > 0 before
 	// invoking the TX path so NB falls back to OFDM_ACK_CLEAN / SACK_RSP.)
 	ack_sack_pattern_passband_samples = ack_mfsk.ack_sack_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
+	// Phase B Wave 1: CONNECT base + 13-symbol ctrl-suffix (WB only — NB
+	// has connect_pattern_nsymb=0 so this is also 0 on NB and downstream
+	// callers gate via that).
+	connect_pattern_passband_samples = ack_mfsk.connect_pattern_nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	ctrl_suffix_pattern_passband_samples =
+		(ack_mfsk.connect_pattern_nsymb + ack_mfsk.ack_sack_suffix_len()) * data_container.Nofdm * frequency_interpolation_rate;
 
 	// Per-mode detection threshold (all using ack_mfsk: M=16, nStreams=1):
 	// ROBUST_0 (-13 dB): low SNR, need conservative threshold

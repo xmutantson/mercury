@@ -178,6 +178,32 @@ public:
 	int generate_hail_pattern_passband(double* out);  // TX: returns samples written
 	double detect_hail_pattern_from_passband(double* data, int size, int* out_matched = nullptr, int suffix_start = 0, int* out_suffix_matched = nullptr);  // RX: returns metric
 
+	// Phase B Wave 1: CONNECT base + 13-symbol ctrl-suffix carrying
+	//   [type:2 | payload:38 | crc12:12]. Uses a distinct Welch-Costas
+	// base from ACK (g=3 vs g=5) so detectors can route by base correlation.
+	// See fact-documents/phase-b-mfsk-connect-research.md §11.4.
+	int connect_pattern_passband_samples;     // = connect_pattern_nsymb * Nofdm * freq_interp_rate
+	int ctrl_suffix_pattern_passband_samples; // = (connect_pattern_nsymb + ack_sack_suffix_len) * Nofdm * freq_interp_rate
+	// TX: emit CONNECT base + ctrl-suffix. Caller supplies (type, payload38,
+	// crc12 over [type:2|payload:38] packed as 5 bytes). Returns samples
+	// written, or 0 if unsupported (NB / M<16).
+	int generate_ctrl_suffix_pattern_passband(double* out,
+	                                          mfsk_ctrl_frame_type type,
+	                                          uint64_t payload38,
+	                                          uint16_t crc12);
+	// RX: detect CONNECT base + decode the 52-bit ctrl-suffix. Returns
+	// true on a clean decode (out_type/out_payload38/out_crc12 reflect the
+	// transmitted values). Caller verifies crc12 by recomputing
+	// CRC12 over [type:2|payload:38] packed as 5 bytes; on mismatch treat
+	// as "no CONNECT arrived" (the caller's timeout/retransmit logic
+	// handles it). *out_matched (optional) gets the base-pattern match
+	// count for diagnostics.
+	bool decode_ctrl_suffix_from_passband(double* data, int size,
+	                                       mfsk_ctrl_frame_type* out_type,
+	                                       uint64_t* out_payload38,
+	                                       uint16_t* out_crc12,
+	                                       int* out_matched = nullptr);
+
 	// Step 15: legacy MFSK SACK pattern (sack_pattern_passband_samples,
 	// generate_sack_bitmap_pattern_passband, detect_sack_pattern_from_passband,
 	// decode_sack_bitmap_ldpc, sack_pattern_detection_test) deleted —
