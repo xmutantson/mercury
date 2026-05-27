@@ -4636,6 +4636,364 @@ void cl_arq_controller::send_break_pattern()
 	ptt_off();
 }
 
+// =============================================================================
+// Phase B Wave 2 v2 — PHY-level helpers for MFSK CONNECT
+// =============================================================================
+//
+// These are deep PHY-only helpers. They emit / decode the CONNECT base + suffix
+// bits-on-the-wire. They DO NOT touch messages_control, messages_rx_buffer,
+// link_status, connection_status, or any timer state. The callers
+// (process_messages_tx_control on TX, process_messages_rx_data_control on RX,
+// etc.) handle all state-machine bookkeeping via the unchanged legacy paths.
+//
+// See fact-documents/phase-b-mfsk-connect-research.md §13 for the
+// architectural rationale (the bypass-and-replicate design of Wave 2 v1 was
+// abandoned after 4 serial sibling bugs; v2 routes through legacy).
+
+// Pack [type:2 | payload38:38] into 5 bytes MSB-first for CRC12.
+// The CRC12_calc helper expects forward-bit MSB-first input — same shape as
+// the existing ack_sack CRC12 input at arq_common.cc:4308-4313.
+static inline void pack_ctrl_typed40_msb_v2(uint8_t out_bytes[5],
+                                            mfsk_ctrl_frame_type type,
+                                            uint64_t payload38)
+{
+	uint64_t typed40 = ((uint64_t)(type & 0x3) << 38) | (payload38 & ((1ULL << 38) - 1ULL));
+	for(int b = 0; b < 5; b++)
+		out_bytes[b] = (uint8_t)((typed40 >> (8 * (4 - b))) & 0xFF);
+}
+
+// Shared TX core: emit CONNECT base + 13-symbol ctrl-suffix for `type` with
+// `payload38`. Returns wall-clock TX time in ms, 0 if unsupported.
+//
+// Modeled closely on send_mfsk_ack_sack() at arq_common.cc:4287. Same PTT /
+// FIR / pilot-tone / RX-mute / capture-flush sequence — the only PHY-level
+// differences are (a) the CONNECT base pattern uses g=3 tones (vs ACK's g=5),
+// and (b) the suffix carries the 2-bit type discriminator.
+static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
+                                                cl_telecom_system* telecom_system,
+                                                mfsk_ctrl_frame_type type,
+                                                uint64_t payload38,
+                                                const char* tag)
+{
+	if(self->passive_monitor) return 0;
+
+	// Runtime guard: NB session (M=8) has no CONNECT base pattern.
+	if(telecom_system->ack_mfsk.connect_pattern_nsymb <= 0) return 0;
+	if(telecom_system->ctrl_suffix_pattern_passband_samples <= 0) return 0;
+
+	auto t_start = std::chrono::steady_clock::now();
+
+	// CRC12 over the 5-byte [type:2|payload:38] big-endian field. Uses the
+	// production CRC12_calc helper (init=0xFFF) — never inline this (v1 bug
+	// #1 was an init=0 mismatch between sender and receiver inline copy).
+	uint8_t typed_bytes[5];
+	pack_ctrl_typed40_msb_v2(typed_bytes, type, payload38);
+	uint16_t crc12 = self->CRC12_calc((char*)typed_bytes, 5);
+
+	printf("[TX-MFSK-CTRL-%s] type=%d p38=0x%010llx crc12=0x%03x on CONFIG_%d\n",
+		tag, (int)type, (unsigned long long)payload38, (unsigned)crc12,
+		self->current_configuration);
+	fflush(stdout);
+
+	// Guard delay for MFSK modes (same as send_mfsk_ack_sack:4321-4325).
+	if(is_robust_config(self->current_configuration))
+	{
+		int wait_ms = self->ptt_off_delay_ms + self->ptt_on_delay_ms;
+		msleep(wait_ms);
+	}
+
+	self->ptt_on();
+
+	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
+	ptt_on_delay_timer.start();
+
+	int pattern_samples = telecom_system->ctrl_suffix_pattern_passband_samples;
+	int symbol_period = telecom_system->data_container.Nofdm
+	                  * telecom_system->data_container.interpolation_rate;
+
+	int padded_size = pattern_samples + 2 * symbol_period;
+	double *raw_output = new double[padded_size];
+	double *filtered1  = new double[padded_size];
+	double *filtered2  = new double[padded_size];
+	if(!raw_output || !filtered1 || !filtered2) exit(-37);
+	memset(raw_output, 0, padded_size * sizeof(double));
+
+	int written = telecom_system->generate_ctrl_suffix_pattern_passband(
+		&raw_output[symbol_period], type, payload38, crc12);
+	if(written != pattern_samples)
+	{
+		printf("[TX-MFSK-CTRL-%s] generate returned %d, expected %d — abort\n",
+			tag, written, pattern_samples);
+		fflush(stdout);
+		delete[] raw_output;
+		delete[] filtered1;
+		delete[] filtered2;
+		self->ptt_off();
+		return 0;
+	}
+
+	memcpy(&raw_output[0], &raw_output[symbol_period],
+		symbol_period * sizeof(double));
+	memcpy(&raw_output[symbol_period + pattern_samples], &raw_output[pattern_samples],
+		symbol_period * sizeof(double));
+
+	memset(filtered1, 0, padded_size * sizeof(double));
+	memset(filtered2, 0, padded_size * sizeof(double));
+	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
+	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
+
+	while(ptt_on_delay_timer.get_elapsed_time_ms() < self->ptt_on_delay_ms)
+		msleep(1);
+
+	// Pilot tone (same conditional shape as send_mfsk_ack_sack:4367-4387).
+	if(self->pilot_tone_ms > 0 && self->pilot_tone_hz > 0)
+	{
+		const double SAMPLE_RATE = 48000.0;
+		const double PILOT_FREQ  = (double)self->pilot_tone_hz;
+		const double PI = 3.14159265358979323846;
+		int pilot_samples = (int)(self->pilot_tone_ms * SAMPLE_RATE / 1000.0);
+		double* pilot_buffer = new double[pilot_samples];
+		for(int i = 0; i < pilot_samples; i++)
+		{
+			double t = (double)i / SAMPLE_RATE;
+			double envelope = 1.0;
+			int ramp_samples = (int)(SAMPLE_RATE * 0.005);
+			if(i < ramp_samples)
+				envelope = (double)i / ramp_samples;
+			else if(i > pilot_samples - ramp_samples)
+				envelope = (double)(pilot_samples - i) / ramp_samples;
+			pilot_buffer[i] = envelope * 0.5 * sin(2.0 * PI * PILOT_FREQ * t);
+		}
+		tx_transfer(pilot_buffer, pilot_samples);
+		delete[] pilot_buffer;
+	}
+
+	tx_transfer(&filtered2[symbol_period], pattern_samples);
+
+	while(size_buffer(playback_buffer) > 0)
+		msleep(1);
+
+	delete[] raw_output;
+	delete[] filtered1;
+	delete[] filtered2;
+
+	// Same capture-flush sequence as send_mfsk_ack_sack:4406-4429.
+	telecom_system->data_container.rx_mute = 1;
+	msleep(RX_MUTE_GUARD_MS);
+	circular_buf_reset(capture_buffer);
+	{
+		int buf_samples = telecom_system->data_container.Nofdm
+		                * telecom_system->data_container.buffer_Nsymb
+		                * telecom_system->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		memset(telecom_system->data_container.passband_delayed_data, 0,
+			2 * buf_samples * sizeof(double));
+		telecom_system->data_container.ring_write_index = 0;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+	telecom_system->data_container.rx_mute = 0;
+	telecom_system->data_container.rx_mute_samples = 0;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	// Short ftr (2 symbols) so the next poll cycle can run the MFSK
+	// suffix detector immediately. Same as send_hail_pattern's post-TX
+	// state (receive_hail_pattern at :4867 also leaves ftr=2 on no-detect).
+	// The legacy LDPC path overrides ftr to preamble+Nsymb later if needed.
+	telecom_system->data_container.frames_to_read = 2;
+
+	printf("[TX-MFSK-CTRL-%s] Done, flushed capture buffer, ftr=%d\n",
+		tag, telecom_system->data_container.frames_to_read.load());
+	fflush(stdout);
+
+	ptt_off_delay_timer.start();
+	while(ptt_off_delay_timer.get_elapsed_time_ms() < self->ptt_off_delay_ms)
+		msleep(1);
+
+	self->ptt_off();
+
+	auto t_end = std::chrono::steady_clock::now();
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+		t_end - t_start).count();
+}
+
+// CMD-side TX (Site A in §13.2): MFSK START_CONN suffix carrying
+// [nb_flag:1 | sender_pack:36 | reserved:1]. The sender callsign comes
+// from the existing messages_control build at arq_commander.cc:454 (base
+// callsign stripped of SSID), but the helper takes it as a parameter so
+// callers stay decoupled from messages_control.
+long long cl_arq_controller::send_mfsk_start_conn_phy(const std::string& sender_call)
+{
+	bool nb_flag = (narrowband_enabled == YES || commander_configured_nb == YES);
+	uint64_t p38 = 0;
+	pack_start_conn_payload(&p38, nb_flag, sender_call.c_str(),
+		(int)sender_call.length());
+	return send_mfsk_ctrl_suffix_phy_core(this, telecom_system,
+		MFSK_CTRL_START_CONN, p38, "CONNECT-START");
+}
+
+// RSP-side TX (Site C in §13.2): MFSK TEST_CONNECTION_ACK suffix carrying
+// [echoed_cap:2 | own_cap:2 | ssid:8 | reserved:26].
+long long cl_arq_controller::send_mfsk_test_ack_phy(uint8_t echoed_cap,
+                                                    uint8_t own_cap,
+                                                    uint8_t ssid)
+{
+	uint64_t p38 = 0;
+	pack_test_ack_payload(&p38, echoed_cap, own_cap, ssid);
+	return send_mfsk_ctrl_suffix_phy_core(this, telecom_system,
+		MFSK_CTRL_TEST_ACK, p38, "CONNECT-ACK");
+}
+
+// Shared RX core: snapshot the capture-buffer tail, run the CONNECT base
+// detector + suffix decode, verify CRC12 via the production CRC12_calc,
+// require the type discriminator to match `expected_type`. Returns true on
+// a clean type-matched CRC-validated decode; the caller unpacks `out_p38`.
+//
+// IMPORTANT: this is called from BEFORE the legacy LDPC receive() path runs,
+// so the gate at "if frames_to_read != 0" is the only place we sample the
+// buffer. The caller (Site B / Site D) overrides frames_to_read to 2 if it
+// finds a larger value (mirroring HAIL's override at arq_responder.cc:128-136)
+// — v1 bug #3 was the lack of this override.
+static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
+                                              cl_telecom_system* telecom_system,
+                                              mfsk_ctrl_frame_type expected_type,
+                                              uint64_t* out_p38,
+                                              const char* tag)
+{
+	int conn_nsymb = telecom_system->ack_mfsk.connect_pattern_nsymb;
+	int suffix_nsymb = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	if(conn_nsymb <= 0 || suffix_nsymb <= 0) return false;
+	const int tail_nsymb = conn_nsymb + suffix_nsymb + 16;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	int tail_offset = signal_period - tail_samples;
+
+	MUTEX_LOCK(&capture_prep_mutex);
+
+	if(telecom_system->data_container.frames_to_read != 0)
+	{
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		return false;
+	}
+
+	int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
+		tail_samples * sizeof(double));
+
+	telecom_system->data_container.data_ready = 0;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+
+	mfsk_ctrl_frame_type rx_type;
+	uint64_t rx_p38 = 0;
+	uint16_t rx_crc12 = 0;
+	int rx_matched = 0;
+	bool decoded = telecom_system->decode_ctrl_suffix_from_passband(
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+
+	if(!decoded)
+	{
+		telecom_system->data_container.frames_to_read = 2;
+		telecom_system->data_container.nUnder_processing_events = 0;
+		return false;
+	}
+
+	// Type-discriminator routing: drop mismatched types (might be a CONNECT
+	// suffix landing in the wrong receive window — e.g. RSP heard another
+	// CMD's TEST_ACK while it was waiting for a START_CONN).
+	if(rx_type != expected_type)
+	{
+		static int wrongtype_log = 0;
+		if((wrongtype_log++ & 0x3F) == 0)
+		{
+			printf("[RX-MFSK-CTRL-%s] wrong type rx=%d expected=%d matched=%d "
+				"(rate-limited log)\n",
+				tag, (int)rx_type, (int)expected_type, rx_matched);
+			fflush(stdout);
+		}
+		telecom_system->data_container.frames_to_read = 2;
+		telecom_system->data_container.nUnder_processing_events = 0;
+		return false;
+	}
+
+	// CRC12 validation via the production CRC12_calc helper (NEVER inline
+	// — v1 bug #1 was an init-mismatch between sender's CRC12_calc and an
+	// inlined RX-side copy that defaulted to init=0).
+	uint8_t typed_bytes[5];
+	pack_ctrl_typed40_msb_v2(typed_bytes, rx_type, rx_p38);
+	uint16_t expected = self->CRC12_calc((char*)typed_bytes, 5);
+	if(rx_crc12 != expected)
+	{
+		printf("[RX-MFSK-CTRL-%s] CRC12 fail type=%d p38=0x%010llx rx=0x%03x "
+			"exp=0x%03x matched=%d\n",
+			tag, (int)rx_type, (unsigned long long)rx_p38,
+			(unsigned)rx_crc12, (unsigned)expected, rx_matched);
+		fflush(stdout);
+		telecom_system->data_container.frames_to_read = 2;
+		telecom_system->data_container.nUnder_processing_events = 0;
+		return false;
+	}
+
+	*out_p38 = rx_p38;
+	// Flush the matched audio region — the next caller iteration must not
+	// re-detect this same frame. Mirror receive_hail_pattern at :4856-4863.
+	MUTEX_LOCK(&capture_prep_mutex);
+	telecom_system->data_container.frames_to_read =
+		telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+	return true;
+}
+
+// RSP-side RX (Site B in §13.2): detect MFSK START_CONN, unpack callsign +
+// NB flag. Returns true on a clean decode; caller (the new block in
+// process_messages_rx_data_control) synthesizes messages_rx_buffer.
+bool cl_arq_controller::receive_mfsk_start_conn_phy(char out_call[7],
+                                                    int* out_call_len,
+                                                    bool* out_nb_flag)
+{
+	if(!out_call || !out_call_len || !out_nb_flag) return false;
+	uint64_t p38 = 0;
+	if(!receive_mfsk_ctrl_suffix_phy_core(this, telecom_system,
+			MFSK_CTRL_START_CONN, &p38, "CONNECT-START"))
+		return false;
+	if(!unpack_start_conn_payload(p38, out_nb_flag, out_call, out_call_len))
+		return false;
+	printf("[RX-MFSK-CTRL-CONNECT-START] sender='%s' (len=%d) nb=%d\n",
+		out_call, *out_call_len, *out_nb_flag ? 1 : 0);
+	fflush(stdout);
+	return true;
+}
+
+// CMD-side RX (Site D in §13.2): detect MFSK TEST_ACK, unpack caps + SSID.
+// Returns true on a clean decode; caller (the new block in
+// process_messages_rx_acks_control) synthesizes messages_control.data[].
+bool cl_arq_controller::receive_mfsk_test_ack_phy(uint8_t* out_echoed_cap,
+                                                  uint8_t* out_own_cap,
+                                                  uint8_t* out_ssid)
+{
+	if(!out_echoed_cap || !out_own_cap || !out_ssid) return false;
+	uint64_t p38 = 0;
+	if(!receive_mfsk_ctrl_suffix_phy_core(this, telecom_system,
+			MFSK_CTRL_TEST_ACK, &p38, "CONNECT-ACK"))
+		return false;
+	if(!unpack_test_ack_payload(p38, out_echoed_cap, out_own_cap, out_ssid))
+		return false;
+	printf("[RX-MFSK-CTRL-CONNECT-ACK] echoed_cap=0x%02X own_cap=0x%02X ssid=%u\n",
+		*out_echoed_cap, *out_own_cap, *out_ssid);
+	fflush(stdout);
+	return true;
+}
+
 // TX "I am Mercury" HAIL beacon — prefix + optional CRC suffix for directed hailing.
 void cl_arq_controller::send_hail_pattern()
 {

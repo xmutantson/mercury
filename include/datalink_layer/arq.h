@@ -458,6 +458,27 @@ public:
   // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:32 | crc12:12].
   long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap);
 
+  // Phase B Wave 2 v2 — PHY-level helpers for MFSK CONNECT.
+  // These are called from inside the legacy state-machine dispatchers
+  // (process_messages_tx_control / process_messages_acknowledging_control on
+  // TX, process_messages_rx_data_control / process_messages_rx_acks_control
+  // on RX) at the moment the legacy code would otherwise emit/decode an
+  // LDPC frame. The legacy messages_control + messages_rx_buffer state flow
+  // is unchanged — only the bits on the wire differ. See fact-documents/
+  // phase-b-mfsk-connect-research.md §13 for the architectural pivot.
+  //
+  // All four return 0 / false when the codec is unavailable (NB session
+  // with M<8 / connect_pattern_nsymb<=0 / passive_monitor). Callers MUST
+  // fall back to the legacy LDPC path in that case.
+  long long send_mfsk_start_conn_phy(const std::string& sender_call);
+  long long send_mfsk_test_ack_phy(uint8_t echoed_cap, uint8_t own_cap,
+                                    uint8_t ssid);
+  bool receive_mfsk_start_conn_phy(char out_call[7], int* out_call_len,
+                                    bool* out_nb_flag);
+  bool receive_mfsk_test_ack_phy(uint8_t* out_echoed_cap,
+                                  uint8_t* out_own_cap,
+                                  uint8_t* out_ssid);
+
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
