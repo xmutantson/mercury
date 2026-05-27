@@ -32,6 +32,7 @@
 #include <iostream>
 #include <complex>
 #include "physical_layer/telecom_system.h"
+#include "physical_layer/mfsk_ctrl_codec_tests.h"
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 
@@ -237,6 +238,20 @@ int main(int argc, char *argv[])
 #endif
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    // --test : run built-in unit tests and exit. Phase B Wave 1 (this
+    // build) wires the MFSK ctrl-suffix codec suite (alphabet, payload
+    // pack/unpack, CRC12 corruption, base-pattern cross-correlation,
+    // bitmap-30 cap, passband round-trip, HAIL false-trigger). Additional
+    // test groups can be added by extending run_mfsk_ctrl_codec_tests's
+    // caller below. The flag must be checked before any audio/GUI/threading
+    // init so the test process stays minimal.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--test") == 0) {
+            int failed = run_mfsk_ctrl_codec_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+    }
 
     int cpu_nr = -1;
     bool list_modes = false;
