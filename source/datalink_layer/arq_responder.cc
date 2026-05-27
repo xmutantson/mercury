@@ -325,15 +325,22 @@ void cl_arq_controller::process_messages_rx_data_control()
 		// and calls process_control_responder() — the legacy state mutations
 		// at :1880-2079 run UNCHANGED).
 		//
-		// Gates differ from Site B by link_status:
-		//  - link_status ∈ {CONNECTION_RECEIVED, CONNECTED}: we're either
-		//    waiting for the first TEST_CONNECTION (post-START_CONN ACK) or
-		//    repeating a previously-decoded one (legacy retry path).
-		//  - messages_rx_buffer.status != RECEIVED: Site B didn't already
-		//    synthesize a frame on this tick.
+		// Gate is link_status == CONNECTION_RECEIVED ONLY. We deliberately
+		// do NOT include CONNECTED here — once the handshake completes,
+		// Site F's helper would keep polling forever and reset
+		// frames_to_read = 2 on every miss (arq_common.cc:4902/4920/4938),
+		// starving the LDPC data-RX path which needs ftr =
+		// preamble_nSymb + Nsymb. Hardware bug 2026-05-27: with CONNECTED
+		// in the gate, RSP reached "Connected to TESTA" but zero
+		// [RX-TIMING] events ever fired. Same shape as eec768e's Site B
+		// narrowing. Lost TEST_CONN_ACK retransmits are handled by the
+		// legacy connection_timeout watchdog tearing the session back to
+		// LISTENING.
+		//
 		// Other gates (messages_control.status == FREE, !passive_monitor,
-		// connect_pattern_nsymb > 0) match Site B exactly.
-		if((link_status == CONNECTION_RECEIVED || link_status == CONNECTED)
+		// connect_pattern_nsymb > 0, messages_rx_buffer.status != RECEIVED)
+		// match Site B exactly.
+		if(link_status == CONNECTION_RECEIVED
 		   && messages_control.status == FREE
 		   && !passive_monitor
 		   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0
