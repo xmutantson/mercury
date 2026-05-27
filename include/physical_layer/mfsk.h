@@ -27,6 +27,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include "physical_layer/mfsk_ctrl_codec.h"  // mfsk_ctrl_frame_type enum
+
 class cl_ldpc;
 
 #define MOD_MFSK 200
@@ -60,6 +62,15 @@ public:
 	int ack_tones[MAX_ACK_TONES];
 	int break_tones[MAX_ACK_TONES];
 	int hail_tones[MAX_ACK_TONES];
+	// CONNECT base pattern (Phase B Wave 1): Welch-Costas with primitive root
+	// g=3 (distinct from ACK g=5, BREAK g=7, HAIL g=6). 8 base tones × 2
+	// reps = 16 symbols (WB-only — NB CONNECT remains LDPC). The detector
+	// reuses `ofdm.detect_ack_pattern(connect_tones, ...)`; tone hopping +
+	// match threshold mirror ack_tones for shared decoder plumbing. See
+	// fact-documents/phase-b-mfsk-connect-research.md §11.4.
+	int connect_tones[MAX_ACK_TONES];
+	int connect_pattern_nsymb;
+	int connect_match_threshold;
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
@@ -100,34 +111,51 @@ public:
 	// Total symbols when SNR suffix is active
 	int ack_snr_pattern_nsymb() const { return ack_pattern_nsymb + SNR_SUFFIX_LEN; }
 
-	// ACK+SACK suffix: extra symbols carrying
-	//   [batch_seq_id(8) | bitmap(32) | CRC12(12)] = 52 bits.
-	// CRC12 protects against false-accept after pattern correlator lock
-	// (see mercury/fact-documents/mfsk-robust-ack.md §3.2). Each symbol's
-	// tone position carries log2(M) bits. WB M=16 → 4 bits/symbol → 13
-	// symbols for 52 bits. NB M=8 → 3 bits/symbol; deferred (NB ACK
-	// stays on the legacy pattern, no SACK).
-	// Total pattern wall-clock: 16 base + 13 suffix = 29 symbols ≈ 705 ms (WB).
+	// MFSK control suffix: 13-symbol suffix at M=16 carrying
+	//   [type:2 | payload:38 | crc12:12] = 52 bits.
+	// Phase B Wave 1 (fact-doc §11) added the 2-bit type field — flag-day
+	// break with pre-2026-05-26 deployed peers. Type values per
+	// `mfsk_ctrl_frame_type`. CRC12 protects against false-accept after
+	// pattern correlator lock (mercury/fact-documents/mfsk-robust-ack.md §3.2).
+	//
+	// Suffix length: NB M=8 returns 0 (deferred). WB M=16 → 4 bits/symbol
+	// → 13 symbols for 52 bits. Total ACK pattern wall-clock: 16 base +
+	// 13 suffix = 29 symbols ≈ 705 ms (WB).
 	int ack_sack_suffix_len() const { return (M >= 16) ? 13 : 0; }  // 0 = unsupported
 	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
-	// Pack 52-bit payload [bsi:8|bitmap:32|crc12:12] into N tone values
-	// (each in 0..M-1). Caller passes a pre-computed crc12 (12 bits in the
-	// low bits of a uint16_t). Returns number of tones written
-	// (= ack_sack_suffix_len). Caller provides out_tones[] of size
-	// >= ack_sack_suffix_len.
+	// Generic ctrl-suffix codec (52-bit [type:2|payload:38|crc12:12]):
+	int pack_ctrl_suffix(mfsk_ctrl_frame_type type, uint64_t payload38,
+	                     uint16_t crc12, int* out_tones) const;
+	bool unpack_ctrl_suffix(const int* in_tones,
+	                        mfsk_ctrl_frame_type* out_type,
+	                        uint64_t* out_payload38,
+	                        uint16_t* out_crc12) const;
+	// Backward-named ACK+SACK wrappers — delegate to pack/unpack_ctrl_suffix
+	// with type=MFSK_CTRL_ACK_SACK. The bitmap field is now 30 bits (down
+	// from 32 in pre-2026-05-26 deployments); bits 30/31 are silently
+	// dropped with a stderr warning. data_batch_size <= 30 is the new
+	// invariant — verified at the producer side in arq_responder.cc.
 	int pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, uint16_t crc12,
 	                          int* out_tones) const;
-	// Inverse of pack: reconstruct (bsi, bitmap, crc12) from N tones.
-	// Caller is responsible for verifying the returned crc12 matches a
-	// freshly-computed CRC over [bsi || bitmap]; this function does the
-	// bit-level unpack only. Returns true on success, false if M unsupported.
 	bool unpack_ack_sack_payload(const int* in_tones, uint8_t* out_bsi,
 	                             uint32_t* out_bitmap, uint16_t* out_crc12) const;
 	// Generate ACK pattern + ack_sack_suffix_len() suffix symbols.
-	// Caller passes a pre-computed crc12 (12-bit CRC over [bsi || bitmap]).
+	// Caller passes a pre-computed crc12 (12-bit CRC over [type|bsi||bitmap]
+	// packed as 5 bytes [type<<6|bsi>>2, (bsi<<6)|(bitmap>>24), ...]; or
+	// equivalently CRC12 over the full 40-bit [type:2|bsi:8|bitmap:30]
+	// big-endian MSB-justified). For compatibility with the existing
+	// Wave-1 ARQ callers (which compute CRC12 over [bsi||bitmap] = 5 bytes),
+	// see mercury/fact-documents/phase-b-mfsk-connect-research.md §11.3.
 	void generate_ack_sack_pattern(std::complex<double>* pattern_out,
 	                               uint8_t bsi, uint32_t bitmap,
 	                               uint16_t crc12);
+	// Generate CONNECT base pattern + 13-symbol ctrl-suffix carrying
+	// (type, payload, crc12). The base pattern uses connect_tones (NOT
+	// ack_tones) so the detector can distinguish CONNECT from ACK+SACK.
+	// Caller supplies crc12 (computed over the packed [type:2|payload:38]).
+	void generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
+	                                  mfsk_ctrl_frame_type type,
+	                                  uint64_t payload38, uint16_t crc12);
 
 	// RX-side capture buffer populated by the ACK detector hook
 	// (cl_telecom_system::detect_ack_snr_from_passband). Each entry is the
@@ -140,6 +168,24 @@ public:
 	static const int MAX_ACK_SACK_SUFFIX = 16;
 	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_ack_sack_capture_valid;
+
+	// CONNECT-suffix capture (separate from ACK+SACK so the two detector
+	// windows can coexist without aliasing).
+	int  last_connect_suffix_tones[MAX_ACK_SACK_SUFFIX];
+	bool last_connect_capture_valid;
+
+	// Decode the most-recent CONNECT-suffix capture into (type, payload,
+	// crc12). Returns true on success — requires WB (M>=16) and a prior
+	// CONNECT-pattern hit that populated last_connect_suffix_tones[].
+	// Caller verifies crc12 separately by recomputing CRC12 over
+	// [type:2|payload:38] packed as 5 bytes.
+	bool decode_ctrl_suffix_from_last_capture(mfsk_ctrl_frame_type* out_type,
+	                                          uint64_t* out_payload38,
+	                                          uint16_t* out_crc12);
+
+	// Test-only: stuff CONNECT-suffix payload tones directly into the
+	// capture buffer (bypasses RF). Mirror of test_inject_ack_sack_capture.
+	void test_inject_connect_capture(const int* tones, int count);
 
 	// Decode the most recently captured SACK suffix into (bsi, bitmap, crc12).
 	// Returns true on success — requires WB (M>=16) and a prior detector
@@ -178,6 +224,12 @@ public:
 
 	// Generate HAIL pattern: "I am Mercury" beacon, same structure as ACK but with hail_tones
 	void generate_hail_pattern(std::complex<double>* pattern_out);
+
+	// Generate CONNECT base pattern: same structure as ACK but with
+	// connect_tones (Phase B Wave 1). Only the base 16 symbols are
+	// written — the per-frame 13-tone ctrl-suffix is written by
+	// generate_ctrl_suffix_pattern() above.
+	void generate_connect_pattern(std::complex<double>* pattern_out);
 
 	// TX: Map bits to one-hot subcarrier vectors across all streams
 	// Consumes bits_per_symbol() bits per symbol period

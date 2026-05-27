@@ -41,6 +41,10 @@ cl_mfsk::cl_mfsk()
 		ack_tones[i] = 0;
 	for (int i = 0; i < MAX_ACK_TONES; i++)
 		break_tones[i] = 0;
+	for (int i = 0; i < MAX_ACK_TONES; i++)
+		connect_tones[i] = 0;
+	connect_pattern_nsymb = 0;
+	connect_match_threshold = 0;
 	for (int i = 0; i < HAIL_SUFFIX_LEN; i++)
 		hail_suffix[i] = 0;
 	for (int i = 0; i < MAX_ACK_TONES + HAIL_SUFFIX_LEN; i++)
@@ -57,6 +61,9 @@ cl_mfsk::cl_mfsk()
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_ack_sack_suffix_tones[i] = -1;
 	last_ack_sack_capture_valid = false;
+	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
+		last_connect_suffix_tones[i] = -1;
+	last_connect_capture_valid = false;
 }
 
 cl_mfsk::~cl_mfsk()
@@ -75,6 +82,9 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_ack_sack_suffix_tones[i] = -1;
 	last_ack_sack_capture_valid = false;
+	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
+		last_connect_suffix_tones[i] = -1;
+	last_connect_capture_valid = false;
 
 	// Calculate log2(M)
 	nBits = 0;
@@ -322,6 +332,44 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 			hail_tones[i] = (ack_tones[i] + M / 4) % M;
 	}
 
+	// CONNECT base pattern (Phase B Wave 1):
+	// Welch-Costas with primitive root g=3 — distinct from ACK (g=5),
+	// BREAK (g=7), HAIL (g=6) so the detectors can't ambiguate. Generated
+	// tones for M=16 are g^k mod 17, k=1..8 = {3,9,10,13,5,15,11,16}. The
+	// trailing 16 is out-of-range for M=16, so we substitute 8 (which is
+	// not used by ACK, BREAK, or HAIL at index 7 of any pattern). Result:
+	// {3, 9, 10, 13, 5, 15, 11, 8} — pairwise tone-Hamming distance vs
+	// ACK ≥ 6, vs BREAK ≥ 6, vs HAIL ≥ 6 (see
+	// fact-documents/phase-b-mfsk-connect-research.md §11.4; verified by
+	// the base_pattern_cross_correlation unit test).
+	//
+	// WB-only — NB CONNECT remains LDPC (per §6.6 of the research doc).
+	if (M == 32)
+	{
+		// 2× scaled M=16 CONNECT tones with the same 16→trailing-16-fix
+		// substitution: 2·{3,9,10,13,5,15,11,16} → {6,18,20,26,10,30,22,16}.
+		// The trailing 16 is fine at M=32 (no out-of-range). It's also
+		// distinct from ACK[6]=18, BREAK[6]=22, HAIL[6]=14 at this index.
+		connect_pattern_nsymb = 16;
+		connect_match_threshold = 7;
+		const int tones[] = {6, 18, 20, 26, 10, 30, 22, 16};
+		for (int i = 0; i < 8; i++) connect_tones[i] = tones[i];
+	}
+	else if (M == 16)
+	{
+		connect_pattern_nsymb = 16;
+		connect_match_threshold = 7;
+		const int tones[] = {3, 9, 10, 13, 5, 15, 11, 8};
+		for (int i = 0; i < 8; i++) connect_tones[i] = tones[i];
+	}
+	else
+	{
+		// NB: no CONNECT MFSK suffix (deferred). Detector will see
+		// connect_pattern_nsymb=0 and skip.
+		connect_pattern_nsymb = 0;
+		connect_match_threshold = 0;
+	}
+
 	// Step 15: legacy MFSK SACK tone tables removed — partial-batch SACK is
 	// now exclusively the OFDM SACK_RSP control frame (arq_common.cc Step 7).
 
@@ -336,6 +384,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		ack_match_threshold   += wb_match_threshold_bias;
 		break_match_threshold += wb_match_threshold_bias;
 		hail_match_threshold  += wb_match_threshold_bias;
+		connect_match_threshold += wb_match_threshold_bias;
 	}
 }
 
@@ -516,22 +565,26 @@ float cl_mfsk::tone_to_snr(int tone) const
 	return (float)tone * 2.0f - offset;
 }
 
-// Pack the 40-bit ACK+SACK payload [bsi:8 | bitmap:32] into N tone values,
-// MSB-first across the suffix. Each tone is in [0, M-1].
-//   WB M=16 → 4 bits/tone, 10 tones for 40 bits.
-//   NB M=8 currently returns 0 (deferred).
-int cl_mfsk::pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, uint16_t crc12,
-                                   int* out_tones) const
+// =============================================================================
+// Generic MFSK control-suffix codec
+// =============================================================================
+//
+// 52-bit field [type:2 | payload:38 | crc12:12], MSB-first. At M=16 the
+// 13-symbol suffix carries 4 bits/symbol. The 2-bit type field is the
+// flag-day break with pre-2026-05-26 deployed peers — see
+// fact-documents/phase-b-mfsk-connect-research.md §11.1. Returns number of
+// tones written (= ack_sack_suffix_len()).
+int cl_mfsk::pack_ctrl_suffix(mfsk_ctrl_frame_type type, uint64_t payload38,
+                              uint16_t crc12, int* out_tones) const
 {
 	int n = ack_sack_suffix_len();
 	if (n == 0 || M < 16) return 0;
 	int bits_per_tone = 0;
 	for (int m = M; m > 1; m >>= 1) bits_per_tone++;  // log2(M); 4 for M=16
-	// 52-bit payload: [bsi(8) | bitmap(32) | crc12(12)], MSB-first.
-	uint64_t payload = ((uint64_t)bsi << 44)
-	                 | ((uint64_t)bitmap << 12)
+	uint64_t payload = ((uint64_t)(type & 0x3) << 50)
+	                 | ((payload38 & ((1ULL << 38) - 1ULL)) << 12)
 	                 | ((uint64_t)(crc12 & 0x0FFF));
-	int total_bits = 8 + 32 + 12;
+	int total_bits = 2 + 38 + 12;  // 52
 	int mask = M - 1;
 	for (int g = 0; g < n; g++) {
 		int shift = total_bits - bits_per_tone * (g + 1);
@@ -541,12 +594,16 @@ int cl_mfsk::pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, uint16_t crc12,
 	return n;
 }
 
-// Inverse of pack_ack_sack_payload. Reconstruct (bsi, bitmap, crc12) from N tones.
-// Caller verifies crc12 separately by re-computing CRC12 over [bsi || bitmap].
-bool cl_mfsk::unpack_ack_sack_payload(const int* in_tones,
-                                      uint8_t* out_bsi, uint32_t* out_bitmap,
-                                      uint16_t* out_crc12) const
+// Inverse of pack_ctrl_suffix. Reconstruct (type, payload38, crc12) from N
+// tones. Caller is responsible for verifying crc12 against a freshly-computed
+// CRC12 over [type:2|payload:38] packed as 5 bytes — this function does the
+// bit-level unpack only.
+bool cl_mfsk::unpack_ctrl_suffix(const int* in_tones,
+                                 mfsk_ctrl_frame_type* out_type,
+                                 uint64_t* out_payload38,
+                                 uint16_t* out_crc12) const
 {
+	if (!in_tones || !out_type || !out_payload38 || !out_crc12) return false;
 	int n = ack_sack_suffix_len();
 	if (n == 0 || M < 16) return false;
 	int bits_per_tone = 0;
@@ -556,10 +613,57 @@ bool cl_mfsk::unpack_ack_sack_payload(const int* in_tones,
 		uint64_t t = (uint64_t)(in_tones[g] & (M - 1));
 		payload = (payload << bits_per_tone) | t;
 	}
-	// payload now holds 52 bits in its low bits: [bsi(8) | bitmap(32) | crc12(12)].
-	*out_crc12  = (uint16_t)(payload & 0x0FFF);
-	*out_bitmap = (uint32_t)((payload >> 12) & 0xFFFFFFFFULL);
-	*out_bsi    = (uint8_t)((payload >> 44) & 0xFF);
+	// payload now holds 52 bits in its low bits: [type:2|payload38:38|crc12:12].
+	*out_crc12     = (uint16_t)(payload & 0x0FFF);
+	*out_payload38 = (uint64_t)((payload >> 12) & ((1ULL << 38) - 1ULL));
+	*out_type      = (mfsk_ctrl_frame_type)((payload >> 50) & 0x3);
+	return true;
+}
+
+// =============================================================================
+// Backward-named ACK+SACK wrappers around pack/unpack_ctrl_suffix
+// =============================================================================
+//
+// payload38 = [bsi:8 | bitmap:30], total 38 bits. The bitmap shrank from 32
+// to 30 bits as part of the Phase B Wave 1 flag-day (the 2-bit type prefix
+// stole the high two bits). Bits 30/31 of an input bitmap are dropped with a
+// stderr warning — the producer in arq_responder.cc:1270/1408 caps at 30
+// before calling this helper (invariant: data_batch_size <= 30).
+int cl_mfsk::pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, uint16_t crc12,
+                                   int* out_tones) const
+{
+	if ((bitmap & 0xC0000000u) != 0) {
+		static bool warned = false;
+		if (!warned) {
+			fprintf(stderr,
+				"[MFSK] pack_ack_sack_payload: bitmap=0x%08x has bits "
+				"30/31 set — dropping (30-bit cap, fact-doc §11.2)\n",
+				(unsigned)bitmap);
+			warned = true;
+		}
+	}
+	uint32_t bitmap30 = bitmap & 0x3FFFFFFFu;
+	uint64_t payload38 = ((uint64_t)bsi << 30) | (uint64_t)bitmap30;
+	return pack_ctrl_suffix(MFSK_CTRL_ACK_SACK, payload38, crc12, out_tones);
+}
+
+bool cl_mfsk::unpack_ack_sack_payload(const int* in_tones,
+                                      uint8_t* out_bsi, uint32_t* out_bitmap,
+                                      uint16_t* out_crc12) const
+{
+	if (!out_bsi || !out_bitmap || !out_crc12) return false;
+	mfsk_ctrl_frame_type type = MFSK_CTRL_ACK_SACK;
+	uint64_t payload38 = 0;
+	if (!unpack_ctrl_suffix(in_tones, &type, &payload38, out_crc12))
+		return false;
+	// Type-discriminator mismatch is a CRC-equivalent failure — the caller
+	// already treats CRC mismatch as "no ACK arrived" so returning here
+	// would change behavior; pass the field through and let the caller
+	// re-check the type after CRC12 succeeds (Wave 2 producer path will
+	// pre-check it explicitly).
+	*out_bitmap = (uint32_t)(payload38 & 0x3FFFFFFFu);          // bits 29..0
+	*out_bsi    = (uint8_t)((payload38 >> 30) & 0xFFu);         // bits 37..30
+	(void)type;
 	return true;
 }
 
@@ -607,10 +711,44 @@ void cl_mfsk::test_inject_ack_sack_capture(const int* tones, int count)
 	last_ack_sack_capture_valid = (count == n);
 }
 
-// Generate ACK pattern + ack_sack_suffix_len() ACK+SACK suffix symbols.
+// Decode the most-recent CONNECT-suffix capture into (type, payload, crc12).
+// Mirror of decode_ack_sack_from_last_capture, but draws from
+// last_connect_suffix_tones[] (populated by the CONNECT-detector hook in
+// telecom_system.cc).
+bool cl_mfsk::decode_ctrl_suffix_from_last_capture(
+	mfsk_ctrl_frame_type* out_type, uint64_t* out_payload38,
+	uint16_t* out_crc12)
+{
+	if (ack_sack_suffix_len() == 0) return false;
+	if (!last_connect_capture_valid) return false;
+	if (!out_type || !out_payload38 || !out_crc12) return false;
+	return unpack_ctrl_suffix(last_connect_suffix_tones,
+	                          out_type, out_payload38, out_crc12);
+}
+
+// Test-only: stuff CONNECT-suffix payload tones directly into the capture
+// buffer (bypasses RF). Mirror of test_inject_ack_sack_capture.
+void cl_mfsk::test_inject_connect_capture(const int* tones, int count)
+{
+	int n = ack_sack_suffix_len();
+	if (n == 0 || tones == nullptr) {
+		last_connect_capture_valid = false;
+		return;
+	}
+	if (count > n) count = n;
+	if (count > MAX_ACK_SACK_SUFFIX) count = MAX_ACK_SACK_SUFFIX;
+	for (int i = 0; i < count; i++)
+		last_connect_suffix_tones[i] = tones[i] & (M - 1);
+	for (int i = count; i < MAX_ACK_SACK_SUFFIX; i++)
+		last_connect_suffix_tones[i] = -1;
+	last_connect_capture_valid = (count == n);
+}
+
+// Generate ACK base + ack_sack_suffix_len() ACK+SACK suffix symbols.
 // Suffix layout mirrors generate_ack_snr_pattern: same tone-hopping formula.
-// Caller computes crc12 over [bsi || bitmap] and passes it; we don't compute
-// it here because cl_mfsk has no access to the ARQ-layer CRC12_calc helper.
+// Caller computes crc12 over the packed [type:2|bsi:8|bitmap:30] (5 bytes
+// MSB-aligned) and passes it; we don't compute it here because cl_mfsk has
+// no access to the ARQ-layer CRC12_calc helper. See fact-doc §11.3.
 void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
                                         uint8_t bsi, uint32_t bitmap,
                                         uint16_t crc12)
@@ -622,7 +760,7 @@ void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
 	// First: generate the standard ACK base pattern (16 symbols WB)
 	generate_ack_pattern(pattern_out);
 
-	// Pack [bsi:8 | bitmap:32 | crc12:12] = 52 bits into per-symbol tones.
+	// Pack [type:2|bsi:8|bitmap:30|crc12:12] = 52 bits into per-symbol tones.
 	int payload_tones[MAX_ACK_SACK_SUFFIX];
 	pack_ack_sack_payload(bsi, bitmap, crc12, payload_tones);
 
@@ -633,6 +771,63 @@ void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
 			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
 
 		// Tone hopping consistent with ACK pattern + SNR suffix (same formula).
+		int actual_tone = (payload_tones[s] + abs_s * tone_hop_step) % M;
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
+	}
+}
+
+// Generate CONNECT base pattern: 16 symbols (WB) hopping over connect_tones.
+// Mirror of generate_ack_pattern but uses connect_tones instead.
+void cl_mfsk::generate_connect_pattern(std::complex<double>* pattern_out)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+	if (connect_pattern_nsymb <= 0) return;  // NB unsupported
+
+	double amp = sqrt((double)Nc / nStreams);
+
+	// CONNECT base uses an 8-tone base sequence × 2 reps = 16 symbols (WB),
+	// same shape as ACK; the base sequence is connect_tones[0..7].
+	const int base_len = 8;
+	for (int s = 0; s < connect_pattern_nsymb; s++)
+	{
+		for (int k = 0; k < Nc; k++)
+			pattern_out[s * Nc + k] = std::complex<double>(0.0, 0.0);
+
+		int tone_base = connect_tones[s % base_len];
+		int actual_tone = (tone_base + s * tone_hop_step) % M;
+
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[s * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
+	}
+}
+
+// Generate CONNECT base + 13-symbol ctrl-suffix carrying (type, payload, crc12).
+// Mirror of generate_ack_sack_pattern but uses the CONNECT base pattern so the
+// detector can route by base correlation. See fact-doc §11.4.
+void cl_mfsk::generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
+                                            mfsk_ctrl_frame_type type,
+                                            uint64_t payload38, uint16_t crc12)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+	int suffix_len = ack_sack_suffix_len();
+	if (suffix_len == 0) return;  // NB unsupported
+	if (connect_pattern_nsymb <= 0) return;
+
+	// First: CONNECT base pattern (16 symbols WB, NOT ack_tones).
+	generate_connect_pattern(pattern_out);
+
+	int payload_tones[MAX_ACK_SACK_SUFFIX];
+	pack_ctrl_suffix(type, payload38, crc12, payload_tones);
+
+	double amp = sqrt((double)Nc / nStreams);
+	for (int s = 0; s < suffix_len; s++) {
+		int abs_s = connect_pattern_nsymb + s;  // suffix index after base
+		for (int k = 0; k < Nc; k++)
+			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+
 		int actual_tone = (payload_tones[s] + abs_s * tone_hop_step) % M;
 		for (int st = 0; st < nStreams; st++)
 			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =

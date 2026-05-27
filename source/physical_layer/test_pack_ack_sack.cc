@@ -18,7 +18,9 @@ int main() {
 	int n_ok = 0, n_fail = 0;
 	for (int trial = 0; trial < 10000; trial++) {
 		uint8_t  bsi    = (uint8_t)(rng() & 0xFF);
-		uint32_t bitmap = (uint32_t)rng();
+		// Post Phase B Wave 1 (fact-doc §11.2): bitmap is 30 bits.
+		// Bits 30/31 are silently dropped by pack_ack_sack_payload.
+		uint32_t bitmap = (uint32_t)rng() & 0x3FFFFFFFu;
 		uint16_t crc12  = (uint16_t)(rng() & 0x0FFF);
 		int tones[16] = {0};
 		int wrote = m.pack_ack_sack_payload(bsi, bitmap, crc12, tones);
