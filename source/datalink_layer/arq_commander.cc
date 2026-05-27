@@ -764,10 +764,70 @@ void cl_arq_controller::process_messages_tx_control()
 
 	if(messages_control.status==ADDED_TO_BATCH_BUFFER)
 	{
-		// Commander CONTROL TX: full-length frames (responder can't predict frame type)
-		telecom_system->set_mfsk_ctrl_mode(false);
-		pad_messages_batch_tx(control_batch_size);
-		send_batch();
+		// Phase B Wave 2 v2 — PHY swap site A (fact-doc §13.2).
+		// When the queued control frame is START_CONNECTION AND the MFSK
+		// codec is available, emit the MFSK CONNECT suffix instead of an
+		// LDPC frame. The legacy state machine continues unchanged — this
+		// just swaps the bits on the wire. messages_control transitions
+		// from ADDED_TO_BATCH_BUFFER → PENDING_ACK exactly as the LDPC
+		// path would, via the post-send block below.
+		//
+		// NB sessions (M=8) fall back to LDPC because connect_pattern_nsymb<=0.
+		// passive_monitor never reaches here (it never builds CMD-side
+		// control frames).
+		bool mfsk_connect_path =
+			messages_control.data[0] == START_CONNECTION
+			&& narrowband_enabled != YES
+			&& telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
+		bool mfsk_tx_done = false;
+		if(mfsk_connect_path)
+		{
+			// Sender callsign as the legacy LDPC path builds it at
+			// arq_commander.cc:454 — strip SSID before packing.
+			std::string base_call = callsign_strip_ssid(my_call_sign);
+			long long elapsed = send_mfsk_start_conn_phy(base_call);
+			if(elapsed > 0)
+			{
+				printf("[CMD-CONNECT-V2] MFSK START_CONN sent (%lld ms wall-clock)\n",
+					elapsed);
+				fflush(stdout);
+				// Mirror the messages_control bookkeeping send_batch() performs
+				// for CONTROL frames at arq_common.cc:3668-3672 (post-batch
+				// loop), so the legacy state machine sees the same transition
+				// it would after an LDPC TX.
+				messages_control.ack_timer.start();
+				messages_control.status = PENDING_ACK;
+				// Clear the batch slot we filled at line :753 / :688 — the
+				// LDPC TX path resets it inside send_batch (arq_common.cc:3674-3679).
+				for(int i = 0; i < message_batch_counter_tx; i++)
+				{
+					messages_batch_tx[i].ack_timeout = 0;
+					messages_batch_tx[i].id          = 0;
+					messages_batch_tx[i].length      = 0;
+					messages_batch_tx[i].nResends    = 0;
+					messages_batch_tx[i].status      = FREE;
+					messages_batch_tx[i].type        = NONE;
+				}
+				message_batch_counter_tx = 0;
+				mfsk_tx_done = true;
+			}
+			else
+			{
+				printf("[CMD-CONNECT-V2] MFSK START_CONN unavailable (codec guard "
+					"tripped) — falling back to LDPC START_CONNECTION\n");
+				fflush(stdout);
+			}
+		}
+
+		// Legacy LDPC path: same as pre-v2 when mfsk_connect_path is false
+		// OR the MFSK send returned 0 (codec runtime guard tripped).
+		if(!mfsk_tx_done)
+		{
+			// Commander CONTROL TX: full-length frames (responder can't predict frame type)
+			telecom_system->set_mfsk_ctrl_mode(false);
+			pad_messages_batch_tx(control_batch_size);
+			send_batch();
+		}
 
 		// Post-TX flush handled inside send_batch() via rx_mute.
 
