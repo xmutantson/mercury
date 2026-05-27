@@ -1436,3 +1436,365 @@ two known producer sites.** That's the Wave 2 contract.
 9. `tests: B.11 codec + passband round-trip + HAIL/ACK collision`
 
 ---
+
+## §13. Wave 2 v2 — PHY swap routed through legacy state machine
+
+**Status:** PRE-CODE PLAN (this section). Wave 2 v1 (sibling worktree
+`feat/b-mfsk-connect`) bypassed `messages_control` and produced 4 serial
+sibling bugs in 24 hours, exactly as §6.7 predicted. v2 reworks the design
+to keep the legacy state machine intact and swap only the PHY-level encode /
+decode at the bottom of the TX/RX dispatchers.
+
+### §13.1 Architectural pivot vs Wave 2 v1
+
+| v1 (FAILED) | v2 (this plan) |
+|---|---|
+| `process_messages_commander()` calls `send_mfsk_start_conn(...)` directly, bypassing `messages_control`. State (`link_status`, timers, retries) driven via custom code paths inline. | `add_message_control(START_CONNECTION)` stays the entry point. `messages_control` flows normally through PENDING_ACK → ACK_TIMED_OUT → ACKED. PHY swap happens deep inside `process_messages_tx_control()` immediately before `send_batch()`. |
+| New RSP detector mutates `link_status = CONNECTION_RECEIVED` itself, replicating the §1.8 state list in custom code. | New RSP detector **synthesizes `messages_rx_buffer`** as if LDPC had decoded START_CONNECTION; legacy consumer at `process_control_responder()` arq_responder.cc:1657-1742 runs unchanged. Zero state replication. |
+| TEST_CONNECTION_ACK reception parsed by custom CMD-side handler in `process_messages_rx_acks_control()`. | TEST_CONNECTION_ACK reception synthesizes `messages_control.data[0..3]` to match the LDPC frame layout, then falls through to the existing `process_control_commander()` LDPC ACK handler at arq_commander.cc:3344-3392. |
+| `process_messages_acknowledging_control()` TEST_ACK branch deleted. | `process_messages_acknowledging_control()` TEST_ACK branch at arq_responder.cc:793-827 swaps its inner `send_batch()` for an MFSK suffix send. The branch + state mutations stay intact. |
+
+### §13.2 The four swap sites
+
+**Site A — CMD TX swap (START_CONNECTION):**
+`arq_commander.cc:765` — inside `process_messages_tx_control()`, when
+`messages_control.status==ADDED_TO_BATCH_BUFFER`. Branch BEFORE
+`pad_messages_batch_tx()` + `send_batch()`:
+
+```cpp
+bool mfsk_connect_path =
+    messages_control.data[0] == START_CONNECTION
+    && narrowband_enabled != YES
+    && telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
+if (mfsk_connect_path) {
+    // PHY swap: emit MFSK CONNECT suffix instead of LDPC frame.
+    // sender callsign + nb_flag come from messages_control.data[2..6]
+    // which the legacy code at arq_commander.cc:447-462 already populated
+    // via callsign_pack(my_call_sign, ...).
+    long long elapsed = send_mfsk_start_conn_phy(my_call_sign);
+    if (elapsed <= 0) {
+        // Codec runtime guard tripped (NB? M<16?). Fall through to LDPC.
+        goto legacy_send_batch;
+    }
+    // Skip send_batch() — MFSK send already happened.
+    // The post-send bookkeeping below (frames_to_read, connection_status,
+    // calculate_receiving_timeout, receiving_timer.start) stays the same.
+} else {
+legacy_send_batch:
+    pad_messages_batch_tx(control_batch_size);
+    send_batch();
+}
+// ... continue post-TX bookkeeping (frames_to_read, etc.) UNCHANGED.
+```
+
+This is the v2 cleanliness: `messages_control.status` is already
+ADDED_TO_BATCH_BUFFER from the existing flow; the existing
+`process_messages_tx_control()` continues to drive it. PENDING_ACK is set
+later via the existing `update_status()` machinery. ACK_TIMED_OUT retry
+re-enters `process_messages_tx_control()` and re-fires the MFSK swap on the
+next attempt — no custom retry path needed.
+
+**Site B — RSP RX swap (synthesize messages_rx_buffer for START_CONN):**
+`arq_responder.cc:217` (top of the LDPC receive block in
+`process_messages_rx_data_control()`). BEFORE `this->receive()`:
+
+```cpp
+// MFSK START_CONN suffix detector. Runs while we're waiting for an LDPC
+// START_CONNECTION frame. On hit: synthesize messages_rx_buffer as if
+// LDPC had decoded an LDPC START_CONNECTION (data[0..6] match the
+// callsign_pack output legacy expects), then let the existing
+// messages_rx_buffer.status==RECEIVED handler at :287-336 copy into
+// messages_control and call process_control_responder().
+if ((link_status == LISTENING || link_status == CONNECTION_RECEIVED)
+    && !passive_monitor
+    && telecom_system->ack_mfsk.connect_pattern_nsymb > 0
+    && messages_control.status == FREE
+    && messages_rx_buffer.status != RECEIVED)
+{
+    // §13.4 frames_to_read override (carbon-copy mitigation of v1 bug #3).
+    if (telecom_system->data_container.frames_to_read > 2) {
+        MUTEX_LOCK(&capture_prep_mutex);
+        telecom_system->data_container.frames_to_read = 2;
+        MUTEX_UNLOCK(&capture_prep_mutex);
+    }
+    char rx_call[7] = {};
+    int rx_call_len = 0;
+    bool rx_nb_flag = false;
+    if (receive_mfsk_start_conn_phy(rx_call, &rx_call_len, &rx_nb_flag)) {
+        // §6.5 HAIL self-detect race delay
+        int sym_ms = (telecom_system->data_container.Nofdm
+                      * telecom_system->data_container.interpolation_rate * 1000) / 48000;
+        int remaining_syms = telecom_system->ack_mfsk.connect_pattern_nsymb
+                             + telecom_system->ack_mfsk.ack_sack_suffix_len()
+                             - telecom_system->ack_mfsk.connect_match_threshold;
+        if (remaining_syms < 0) remaining_syms = 0;
+        msleep(remaining_syms * sym_ms + 200);
+
+        // Synthesize messages_rx_buffer as if LDPC had decoded
+        // START_CONNECTION. Layout matches arq_commander.cc:447-462
+        // (legacy CMD-side build): data[0]=START_CONNECTION,
+        // data[1]=CRC8(my_call_sign), data[2..6]=callsign_pack(rx_call).
+        messages_rx_buffer.type = CONTROL;
+        messages_rx_buffer.sequence_number = 0;
+        messages_rx_buffer.length = 7;
+        messages_rx_buffer.data[0] = (char)START_CONNECTION;
+        messages_rx_buffer.data[1] = (char)CRC8_calc(
+            (char*)my_call_sign.c_str(), my_call_sign.length());
+        char* packed = callsign_pack(rx_call, rx_call_len,
+                                     rx_nb_flag ? 0x01 : 0);
+        for (int i = 0; i < 5; i++) messages_rx_buffer.data[2+i] = packed[i];
+        delete[] packed;  // callsign_pack returns heap buffer
+        messages_rx_buffer.status = RECEIVED;
+        // Fall through — the existing block at :287-336 will copy into
+        // messages_control, set status=RECEIVED, and call
+        // process_control_responder() which performs ALL state mutations
+        // (link_status, destination_call_sign, session_narrowband, PENDING
+        // TCP, etc.) exactly as the legacy LDPC path does.
+    }
+}
+this->receive();  // legacy LDPC path still runs as fallback
+```
+
+**Site C — RSP TEST_ACK TX swap (replaces the LDPC frame in the existing
+TEST_CONNECTION_ACK dispatcher):**
+`arq_responder.cc:793-827` — inside `process_messages_acknowledging_control()`,
+the `TEST_CONNECTION_ACK` branch. Replace the LDPC `send_batch()` calls (lines
+806-813 OFDM-side, lines 815-827 MFSK-fallback side) with a single MFSK suffix
+send when WB. NB falls back to the legacy LDPC path:
+
+```cpp
+else if (messages_control.data[0] == TEST_CONNECTION_ACK)
+{
+    // v2: PHY swap when WB. messages_control.data[1..3] already populated
+    // by the TEST_CONNECTION consumer at arq_responder.cc:1930-1934 with
+    // [echoed_cap | own_cap | CRC8]. SSID comes from data[?] — see below.
+    bool mfsk_path =
+        narrowband_enabled != YES
+        && telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
+    if (mfsk_path) {
+        uint8_t echoed_cap = (uint8_t)messages_control.data[1];
+        uint8_t own_cap    = (uint8_t)messages_control.data[2];
+        // SSID: pulled from my_call_sign via callsign_get_ssid (matches
+        // what the TEST_CONNECTION consumer wrote into data[6] for the
+        // LDPC reverse path at arq_responder.cc:1879).
+        uint8_t ssid       = (uint8_t)callsign_get_ssid(my_call_sign);
+        long long elapsed = send_mfsk_test_ack_phy(echoed_cap, own_cap, ssid);
+        if (elapsed > 0) return;  // suffix sent — bypass send_batch()
+        // Codec runtime guard tripped — fall through to LDPC.
+    }
+    // Legacy LDPC TEST_CONNECTION_ACK fallback (unchanged).
+    ...
+}
+```
+
+**Site D — CMD TEST_ACK RX swap (synthesize messages_control for TEST_ACK):**
+`arq_commander.cc:1534` — inside `process_messages_rx_acks_control()`, the
+"expects_ldpc_handshake_ack" branch (currently lines 1583-1631). The current
+code calls `this->receive()` to decode an LDPC TEST_CONNECTION_ACK. v2
+inserts an MFSK suffix detector BEFORE `this->receive()`:
+
+```cpp
+bool expects_ldpc_handshake_ack =
+    (messages_control.data[0] == TEST_CONNECTION);
+if (expects_ldpc_handshake_ack
+    && telecom_system->ack_mfsk.connect_pattern_nsymb > 0
+    && messages_control.status != ACKED)
+{
+    uint8_t echoed_cap = 0, own_cap = 0, ssid = 0;
+    if (receive_mfsk_test_ack_phy(&echoed_cap, &own_cap, &ssid)) {
+        // Synthesize messages_control.data layout matching the LDPC
+        // TEST_CONNECTION_ACK frame the legacy consumer at
+        // arq_commander.cc:3344-3392 expects:
+        //   data[0] = TEST_CONNECTION_ACK
+        //   data[1] = echoed_cap, data[2] = own_cap
+        //   data[3] = CRC8(data[1..2])  — fresh-computed so the
+        //                                  consumer's CRC check passes
+        //   data[5] = own_cap  (also read at :3410 fallback)
+        //   data[6] = ssid     (read at :3420 SSID log)
+        messages_control.data[0] = (char)TEST_CONNECTION_ACK;
+        messages_control.data[1] = (char)echoed_cap;
+        messages_control.data[2] = (char)own_cap;
+        messages_control.data[3] = (char)CRC8_calc(
+            (char*)&messages_control.data[1], 2);
+        messages_control.data[4] = 0;
+        messages_control.data[5] = (char)own_cap;
+        messages_control.data[6] = (char)ssid;
+        messages_control.length = 7;
+        messages_control.type = ACK_CONTROL;
+        clear_buffer(playback_buffer);
+        link_timer.start();
+        watchdog_timer.start();
+        gear_shift_timer.stop(); gear_shift_timer.reset();
+        messages_control.status = ACKED;
+        stats.nAcked_control++;
+        int guard = ptt_off_delay_ms;
+        receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
+        // Falls through to the existing post-receive block which calls
+        // process_control_commander() (which runs the CRC-validated
+        // post-CONNECT setup at arq_commander.cc:3344-3625).
+    }
+    // If detector did not fire this poll, return and re-enter next tick.
+    // DO NOT fall through to the LDPC receive() — that would consume
+    // audio meant for the next MFSK detector poll.
+    else if (narrowband_enabled == YES) {
+        // NB session: no MFSK suffix possible — let LDPC RX run.
+        goto ldpc_handshake_ack_receive;
+    } else {
+        return;
+    }
+}
+ldpc_handshake_ack_receive:
+// legacy LDPC RX path unchanged
+```
+
+### §13.3 What stays unchanged (v2 contract)
+
+- `add_message_control(START_CONNECTION)` at `arq_commander.cc:285` — unchanged.
+- All `messages_control` state-machine transitions
+  (FREE → ADDED_TO_LIST → ADDED_TO_BATCH_BUFFER → PENDING_ACK → ACK_TIMED_OUT /
+  ACKED) — unchanged.
+- `update_status()` ack-timeout logic, `connection_attempts++` retry counter,
+  NB/WB auto-negotiation phase block at `arq_commander.cc:707-750` — unchanged.
+- `process_control_responder()` at `arq_responder.cc:1657-1747` — runs
+  bit-identically for both LDPC and MFSK paths. It reads the CRC8, unpacks the
+  callsign, performs every state mutation, fires the PENDING TCP message.
+- `process_control_commander()` at `arq_commander.cc:3344-3625` — runs
+  bit-identically for both LDPC and MFSK paths.
+- `process_messages_acknowledging_control()` outer dispatcher loop — only the
+  inner `send_batch()` for `TEST_CONNECTION_ACK` is swapped.
+- Capability negotiation, SACK setup, compression, B2F, encryption, TCP
+  "CONNECTED" messages — all driven by the legacy consumer, not by the new
+  MFSK code.
+
+### §13.4 frames_to_read mitigation (v1 bug #3 prevention)
+
+v1 bug #3 was: HAIL handler primes `frames_to_read = preamble_nSymb + Nsymb`
+(large LDPC-frame value) but MFSK suffix detector requires `frames_to_read==0`.
+Detector never fires.
+
+v2 places the MFSK detector EARLIER in `process_messages_rx_data_control()`,
+BEFORE `this->receive()` zeroes the counter at end-of-LDPC-frame. The
+detector itself overrides `frames_to_read=2` if >2 (mirror of HAIL detector
+at arq_responder.cc:128-136). This means:
+
+- If we just finished a HAIL detect (ftr large), the new MFSK detector caps
+  it to 2 and polls the suffix.
+- If `this->receive()` is currently mid-LDPC capture, ftr stays at whatever
+  receive() needs and the MFSK detector skips that pass (returns false from
+  `receive_mfsk_ctrl_suffix`'s `frames_to_read != 0` gate).
+
+This is the **same pattern HAIL uses** — proven on the production HAIL
+detector for 18 months. v1 missed it because the v1 detector was added AFTER
+receive() instead of before.
+
+### §13.5 CRC12 init mismatch prevention (v1 bug #1)
+
+v1 bug #1: receiver inlined CRC12 with init=0 but sender used `CRC12_calc()`
+init=0xFFF. v2 mandate: **NEVER inline CRC computation in the RX path.**
+Both TX and RX call the canonical `CRC12_calc()` helper in `arq_common.cc:7259`.
+
+The v2 regression test (§13.7 test 1) explicitly drives encode and decode
+through the production `CRC12_calc()` function — not a test helper. Wave 2
+v1's test helper had the same init=0 bug, so the test passed while production
+failed.
+
+### §13.6 FREE-guard via legacy state machine (v1 bug #2 auto-mitigation)
+
+v1 bug #2: MFSK START_CONN block re-fired every main-loop tick because no
+FREE guard existed. v2 doesn't need a separate FREE guard — the swap site is
+INSIDE the `messages_control.status==ADDED_TO_BATCH_BUFFER` branch of
+`process_messages_tx_control()`. That status transitions to RECEIVING_ACKS_CONTROL
+immediately after the send completes (see arq_commander.cc:802). The next
+main-loop tick finds status != ADDED_TO_BATCH_BUFFER and the swap is skipped.
+Legacy retry logic handles re-fire on ACK_TIMED_OUT.
+
+### §13.7 Cross-layer regression tests (CLAUDE.md §"Cross-layer regression tests")
+
+The Wave 2 v1 unit tests passed but hardware failed in 4 distinct ways. The
+tests didn't exercise the cross-layer state machine. v2 ADDS three integration
+tests in a new file `source/physical_layer/mfsk_ctrl_integration_tests.cc`
+(or appended to `mfsk_ctrl_codec_tests.cc`):
+
+1. **test_v2_crc12_wireformat_real_helper** — uses the **production**
+   `CRC12_calc()` (not a test helper). Round-trips a START_CONN payload
+   through CRC12 → tones → CRC12-validate. Would have caught v1 bug #1.
+2. **test_v2_cmd_loop_no_refire** — mocks a CMD-side `process_messages_commander()`
+   loop. Asserts that after one MFSK START_CONN send, the message stays in
+   PENDING_ACK and the swap site is NOT re-entered until ACK_TIMED_OUT.
+   Would have caught v1 bug #2.
+3. **test_v2_rsp_frames_to_read_override** — simulates the post-HAIL state
+   (`frames_to_read = preamble_nSymb + Nsymb`, large), feeds a synthesized
+   MFSK CONNECT capture, asserts the MFSK detector overrides ftr=2 and
+   fires. Would have caught v1 bug #3.
+
+These tests are wired into the existing `--test` runner at
+`source/main.cc` (extending the Wave 1 entry `run_mfsk_ctrl_codec_tests()`).
+
+### §13.8 Helper API (new public methods on cl_arq_controller)
+
+To keep `arq_commander.cc` / `arq_responder.cc` swap sites small and
+auditable, the per-direction PHY helpers live in `arq_common.cc`:
+
+```cpp
+// CMD-side TX (Site A): emits CONNECT base + START_CONN suffix.
+// Returns wall-clock TX time in ms, 0 if unsupported (NB/M<16).
+long long send_mfsk_start_conn_phy(const std::string& sender_call);
+
+// RSP-side TX (Site C): emits CONNECT base + TEST_ACK suffix.
+long long send_mfsk_test_ack_phy(uint8_t echoed_cap, uint8_t own_cap,
+                                  uint8_t ssid);
+
+// RSP-side RX (Site B): polls capture buffer, returns true on a clean
+// type=START_CONN+CRC12-validated decode.
+bool receive_mfsk_start_conn_phy(char out_call[7], int* out_len,
+                                  bool* out_nb_flag);
+
+// CMD-side RX (Site D): polls capture buffer, returns true on a clean
+// type=TEST_ACK+CRC12-validated decode.
+bool receive_mfsk_test_ack_phy(uint8_t* out_echoed_cap, uint8_t* out_own_cap,
+                                uint8_t* out_ssid);
+```
+
+The implementations are nearly bit-exact ports of v1's helpers (which were
+mostly correct — the bugs were in the wiring, not the helpers themselves).
+v1 bug #1 fix (CRC12_calc with init=0xFFF) ports over.
+
+### §13.9 Cross-layer data-flow audit (CLAUDE.md §"Cross-layer audits")
+
+**Shared state: `messages_control`** (5-step audit per CLAUDE.md).
+
+| Question | Answer |
+|---|---|
+| Producers | `add_message_control()` arq_common.cc:~5350; reset on FREE in `cleanup()`; mutations in `process_control_responder()` arq_responder.cc:1657-1742, in `process_control_commander()` arq_commander.cc:3301-3625, in `process_messages_acknowledging_control()` arq_responder.cc:763-, in BREAK handler arq_responder.cc:250, in `update_status()` (ack_timer expiry), and various ACK paths in arq_commander.cc:1568-1613. v2 adds: synthesize data[0..6] in Site D (CMD TEST_ACK RX) before falling through to the legacy consumer. |
+| Consumers | `process_control_responder()`, `process_control_commander()`, `process_messages_acknowledging_control()`, `process_messages_tx_control()`, `process_messages_rx_acks_control()`. v2 does not add new consumers. |
+| Valid states | FREE (init), ADDED_TO_LIST, ADDED_TO_BATCH_BUFFER, PENDING_ACK, ACK_TIMED_OUT, ACKED, RECEIVED, FAILED_. Default-init = FREE. |
+| Invariants | data[0..6] format depends on data[0]: START_CONNECTION uses CRC8 + callsign_pack at [1..6]; TEST_CONNECTION_ACK uses echoed_cap + own_cap + CRC8 at [1..3]. v2 Site D synthesizes the TEST_CONNECTION_ACK layout AND data[5..6] for the post-handshake-echo SSID block. |
+| What this fix changes | v2 does NOT alter messages_control producer or consumer set. Site A sees ADDED_TO_BATCH_BUFFER and does PHY swap; messages_control stays in that state until set_batch advances it (which still happens via the unchanged post-send code at arq_commander.cc:802). Site D writes the TEST_CONNECTION_ACK layout, sets status=ACKED, and falls through. |
+
+**Shared state: `messages_rx_buffer`** (5-step audit).
+
+| Question | Answer |
+|---|---|
+| Producers | `this->receive()` (the LDPC decoder) — sets status=RECEIVED + type + data[] on successful decode. Various other sites zero it. v2 adds: synthesize in Site B before `this->receive()` runs. |
+| Consumers | `process_messages_rx_data_control()` arq_responder.cc:287-336 (copies into messages_control on CONTROL frame and calls process_control_responder() if batch complete). Many DATA paths read it too. v2 does not add new consumers. |
+| Valid states | FREE, RECEIVED. Default-init = FREE per cleanup(). |
+| Invariants | When type==CONTROL: data[0]=control-code; data[1] for START_CONN is CRC8(dest_callsign), for TEST_CONNECTION_ACK is echoed_cap. data[2..6] callsign_pack output for START_CONN. sequence_number must be < control_batch_size (otherwise the consumer waits for more frames at arq_responder.cc:340). |
+| What this fix changes | v2 Site B writes a synthetic record with the START_CONNECTION layout. sequence_number=0, length=7. The consumer at :287 copies into messages_control, the inner check at :327 (`sequence_number >= control_batch_size - 1`) triggers immediate `process_control_responder()` — which means **v2 must set sequence_number = control_batch_size - 1 (single-frame batch from MFSK).** Or equivalently, signal end-of-batch. AUDIT FINDING: Need to set sequence_number = (char)(control_batch_size - 1) so the consumer's "batch complete" branch fires immediately. Without this, the consumer waits for more frames (timeout). |
+
+The §13.9 audit finding above is the v2-specific tripwire. Fixed by setting
+`messages_rx_buffer.sequence_number = control_batch_size - 1` in Site B.
+
+### §13.10 Commit list (planned)
+
+1. `docs(phase-b): §13 Wave 2 v2 implementation plan + cross-layer audit`
+2. `arq: B.12 v2 — CMD START_CONNECTION PHY swap inside process_messages_tx_control`
+3. `arq: B.13 v2 — RSP MFSK START_CONN detector synthesizes messages_rx_buffer`
+4. `arq: B.14 v2 — RSP TEST_CONNECTION_ACK PHY swap inside acknowledging_control`
+5. `arq: B.14 v2 — CMD TEST_CONNECTION_ACK PHY swap inside process_messages_rx_acks_control`
+6. `tests: v2 cross-layer regression — CRC12 wireformat, no-refire, ftr-override`
+
+### §13.11 v2 implementation log
+
+(filled in as commits land; cleared on finalization)
+
+---
