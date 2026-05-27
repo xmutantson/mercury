@@ -225,15 +225,22 @@ void cl_arq_controller::process_messages_rx_data_control()
 		// the legacy state mutations at :1657-1747 run UNCHANGED).
 		//
 		// Gates:
-		//  - link_status ∈ {LISTENING, CONNECTION_RECEIVED}: we're either
-		//    waiting for a fresh CONNECT or repeating a captured one.
+		//  - link_status == LISTENING: waiting for a fresh CONNECT. We
+		//    deliberately do NOT include CONNECTION_RECEIVED here — that's
+		//    Site F's bucket (TEST_CONN). If both gates accepted the same
+		//    state, Site B's helper would demod the TEST_CONN suffix,
+		//    reject the wire-type, and consume the audio before Site F got
+		//    a chance. (Hardware bug 2026-05-27: Wave 3 regressed every
+		//    cell because of this overlap.) CMD-retry of START_CONN during
+		//    CONNECTION_RECEIVED is handled by the legacy retry/timeout
+		//    path which can also push RSP back to LISTENING.
 		//  - messages_control.status == FREE: defer if a control frame is
 		//    already in-flight (the next-tick FREE state will pick this up).
 		//  - messages_rx_buffer.status != RECEIVED: the consumer at :287
 		//    hasn't processed the prior buffer yet.
 		//  - !passive_monitor: monitor uses LDPC for full-frame visibility.
 		//  - connect_pattern_nsymb > 0: WB-only; NB falls back to LDPC.
-		if((link_status == LISTENING || link_status == CONNECTION_RECEIVED)
+		if(link_status == LISTENING
 		   && messages_control.status == FREE
 		   && !passive_monitor
 		   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0
