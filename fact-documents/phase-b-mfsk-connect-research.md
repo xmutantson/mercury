@@ -1887,3 +1887,362 @@ fix landed. v2's design eliminates the root cause by not bypassing
 `messages_control` in the first place.
 
 ---
+
+## §14. Wave 3 (Sites E+F) implementation log
+
+Wave 2 v2 shipped Sites A/B/C/D and confirmed the proven PHY-swap pattern
+for START_CONNECTION (CMD→RSP) and TEST_CONNECTION_ACK (RSP→CMD). The
+TEST_CONNECTION direction (CMD→RSP) remained on LDPC and inherits the
+ROBUST_0 LDPC cliff at WGN:-4..-8, capping the operational reach of the
+v2 handshake to the same floor as baseline. Wave 3 closes that gap by
+mirroring Sites A+B for the TEST_CONNECTION direction:
+
+| Wave | Direction | TX site | RX site |
+|---|---|---|---|
+| 2 v2 | START_CONNECTION (CMD→RSP)    | Site A | Site B |
+| 2 v2 | TEST_CONNECTION_ACK (RSP→CMD) | Site C | Site D |
+| 3    | **TEST_CONNECTION (CMD→RSP)** | **Site E** | **Site F** |
+
+### §14.0 Wave 3 plan (pre-code)
+
+Per CLAUDE.md §1.4 ("Plan before coding"). The Wave 2 v1 disaster was rooted
+in skipping this step; v2 took the time to plan and shipped clean.
+
+**Worktree:** `x:/Storage/Documents/mercury-worktrees/b-mfsk-connect-v2`
+**Branch:** `feat/b-mfsk-connect-v2` (continuation, not a sibling worktree).
+**Scope:** TEST_CONNECTION (CMD→RSP) PHY swap. CMD encodes the 38-bit
+payload `[snr_q:4 | local_cap:2 | ssid:8 | reserved:24]` from the fields
+the legacy LDPC TEST_CONNECTION build at `arq_commander.cc:463-477`
+populates; RSP detector synthesizes `messages_rx_buffer` to match the
+LDPC layout the legacy consumer at `arq_responder.cc:1880-2078` reads.
+
+#### Codec extension
+
+`MFSK_CTRL_TEST_CONN` (type=0b11) is already a reserved enum value in
+`include/physical_layer/mfsk_ctrl_codec.h:41` and Wave 1 test 4
+(`ctrl_suffix_roundtrip_all_types`) already round-trips the type
+discriminator. Wave 3 adds the type-specific payload pack/unpack helpers:
+
+```cpp
+// Pack [snr_q:4 | local_cap:2 | ssid:8 | reserved:24] into a 38-bit field.
+// snr_q is 4 bits (0..15), local_cap is 2 bits (CAP_WB_CAPABLE|CAP_ENCRYPTION),
+// ssid is 8 bits (0-99 numeric, 16=L 17=T 18=R 19=X, 255 = SSID_NONE).
+void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
+                            uint8_t local_cap, uint8_t ssid);
+bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
+                              uint8_t* local_cap, uint8_t* ssid);
+```
+
+Bit layout (matches fact-doc §3.2):
+- bits 37..34 : snr_q       (4)
+- bits 33..32 : local_cap   (2)
+- bits 31..24 : ssid        (8)
+- bits 23..0  : reserved    (24)  must be 0 on TX, ignored on RX
+
+Files modified:
+- `include/physical_layer/mfsk_ctrl_codec.h` (+12 lines, declarations)
+- `source/physical_layer/mfsk_ctrl_codec.cc` (+30 lines, implementation)
+- `source/physical_layer/mfsk_ctrl_codec_tests.cc` (+45 lines, unit test
+  `pack_unpack_test_conn_payload` — exhaustive across cap pairs + SNR
+  levels + representative SSIDs)
+
+#### Site E — CMD TX swap for TEST_CONNECTION
+
+Mirrors Site A. Lives in the same `if(messages_control.status==ADDED_TO_BATCH_BUFFER)`
+block in `process_messages_tx_control` at `arq_commander.cc:765`. The
+existing block already discriminates on `messages_control.data[0]` —
+extend it to branch on `TEST_CONNECTION` in addition to `START_CONNECTION`.
+
+```cpp
+bool mfsk_test_conn_path =
+    messages_control.data[0] == TEST_CONNECTION
+    && narrowband_enabled != YES
+    && telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
+if(mfsk_test_conn_path)
+{
+    // Pull legacy build outputs from messages_control.data[]:
+    //   data[1..4] = float SNR_uplink (u_SNR union, populated at
+    //                arq_commander.cc:466-472)
+    //   data[5]    = local_capability (populated at :473)
+    //   data[6]    = SSID            (populated at :474)
+    u_SNR tmp_SNR;
+    for(int i=0;i<4;i++) tmp_SNR.char4_SNR[i] = messages_control.data[i+1];
+    uint8_t local_cap = (uint8_t)messages_control.data[5];
+    uint8_t ssid      = (uint8_t)messages_control.data[6];
+    long long elapsed = send_mfsk_test_conn_phy(tmp_SNR.f_SNR, local_cap, ssid);
+    if(elapsed > 0)
+    {
+        // Mirror the Site A messages_control bookkeeping
+        ...
+        mfsk_tx_done = true;
+    }
+}
+```
+
+The combined condition is `mfsk_start_conn_path || mfsk_test_conn_path` —
+the post-TX bookkeeping (PENDING_ACK transition, batch slot clear) is
+identical, so the existing block is hoisted to handle both.
+
+Helper added in `arq_common.cc`:
+```cpp
+long long cl_arq_controller::send_mfsk_test_conn_phy(float snr,
+                                                     uint8_t local_cap,
+                                                     uint8_t ssid)
+{
+    // SNR quantization: reuse cl_mfsk::snr_to_tone() at M=16 (4-bit, 16 levels).
+    int snr_tone = telecom_system->ack_mfsk.snr_to_tone(snr);  // 0..15 @ M=16
+    uint8_t snr_q = (uint8_t)(snr_tone & 0xF);
+    uint64_t p38 = 0;
+    pack_test_conn_payload(&p38, snr_q, local_cap, ssid);
+    return send_mfsk_ctrl_suffix_phy_core(this, telecom_system,
+        MFSK_CTRL_TEST_CONN, p38, "CONNECT-TEST");
+}
+```
+
+Files modified:
+- `include/datalink_layer/arq.h` (+1 method declaration)
+- `source/datalink_layer/arq_common.cc` (+18 lines, helper)
+- `source/datalink_layer/arq_commander.cc` (+~40 lines, Site E branch in
+  the existing Site A block; predicate broadens from
+  `data[0]==START_CONNECTION` to also include TEST_CONNECTION)
+
+#### Site F — RSP RX detector for MFSK TEST_CONN
+
+Mirrors Site B. Lives in `process_messages_rx_data_control()` at
+`arq_responder.cc:217+`. Site B currently runs only when `link_status ∈
+{LISTENING, CONNECTION_RECEIVED}` and only detects START_CONN.
+
+Wave 3 dispatch decision: use the **type discriminator on a single audio
+scan**, not state-based branching. The detector at
+`telecom_system->decode_ctrl_suffix_from_passband` reads the type field
+from the wire and routes the caller; we currently throw away non-matching
+types (see `receive_mfsk_ctrl_suffix_phy_core` at `arq_common.cc:4907-4923`).
+
+Two options were considered:
+
+**Option F1: Two helpers, gated by state.**
+Add a new `receive_mfsk_test_conn_phy()` helper that requests
+`MFSK_CTRL_TEST_CONN`. Call site B's `receive_mfsk_start_conn_phy()` if
+`link_status==LISTENING`; call the new helper if
+`link_status==CONNECTION_RECEIVED || link_status==CONNECTED`. Two audio
+scans per main-loop tick when the state could match either type.
+
+**Option F2: Dispatch on the wire type.**
+Refactor `receive_mfsk_ctrl_suffix_phy_core` to allow a caller-side
+type-router. One audio scan; the helper returns the type + payload, the
+caller routes by `link_status` AND the wire-type.
+
+**Chosen: Option F1** for surgical minimality. The two paths exercise
+disjoint state buckets in practice (LISTENING for START_CONN,
+CONNECTION_RECEIVED/CONNECTED for TEST_CONN — both never true
+simultaneously). Calling both helpers in sequence when both buckets
+apply is acceptable: the type-discriminator mismatch path returns false
+in <1 ms and the audio buffer is not consumed (just re-read). This
+matches v2's design philosophy of "tight, single-purpose helpers".
+
+The site B detector block extends to cover the CONNECTION_RECEIVED state
+for TEST_CONN as well as START_CONN, dispatching by state:
+
+```cpp
+if(messages_control.status == FREE
+   && !passive_monitor
+   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0
+   && messages_rx_buffer.status != RECEIVED)
+{
+    // ftr override (same as Site B).
+    if(telecom_system->data_container.frames_to_read > 2) { ... }
+
+    // State-routed dispatch.
+    if(link_status == LISTENING || link_status == CONNECTION_RECEIVED)
+    {
+        // Site B: try START_CONN first.
+        char rx_call[7]; int rx_len; bool rx_nb;
+        if(receive_mfsk_start_conn_phy(rx_call, &rx_len, &rx_nb))
+        { /* synthesize START_CONNECTION layout — unchanged Site B body */ }
+    }
+    if((link_status == CONNECTION_RECEIVED || link_status == CONNECTED)
+       && messages_rx_buffer.status != RECEIVED)
+    {
+        // Site F: try TEST_CONN if Site B didn't already synthesize.
+        uint8_t rx_snr_q=0, rx_cap=0, rx_ssid=0;
+        if(receive_mfsk_test_conn_phy(&rx_snr_q, &rx_cap, &rx_ssid))
+        { /* synthesize TEST_CONNECTION layout — new Site F body */ }
+    }
+}
+```
+
+`link_status == CONNECTION_RECEIVED` overlaps both buckets. On that state
+RSP just sent a START_CONN ACK and is waiting for TEST_CONNECTION; running
+the START_CONN scan is a no-op (audio doesn't contain another START_CONN)
+but costs one audio-scan ~1 ms. Acceptable. The wire-type discriminator
+in the core (arq_common.cc:4910) rejects type mismatches.
+
+Site F body — synthesizes `messages_rx_buffer` to match the LDPC
+TEST_CONNECTION layout the legacy consumer at `arq_responder.cc:1880-2079`
+reads:
+```cpp
+// HAIL self-detect race delay (same as Site B).
+msleep(delay_ms);
+
+// Reconstruct float SNR from 4-bit quantization.
+float snr = telecom_system->ack_mfsk.tone_to_snr((int)rx_snr_q);
+u_SNR tmp_SNR; tmp_SNR.f_SNR = snr;
+
+// Synthesize messages_rx_buffer matching arq_commander.cc:466-475
+// (legacy CMD-side LDPC TEST_CONNECTION layout).
+messages_rx_buffer.type = CONTROL;
+messages_rx_buffer.sequence_number = (char)(control_batch_size - 1);
+messages_rx_buffer.length = 7;
+messages_rx_buffer.data[0] = (char)TEST_CONNECTION;
+for(int i=0;i<4;i++) messages_rx_buffer.data[i+1] = tmp_SNR.char4_SNR[i];
+messages_rx_buffer.data[5] = (char)rx_cap;
+messages_rx_buffer.data[6] = (char)rx_ssid;
+messages_rx_buffer.status = RECEIVED;
+```
+
+Helper added in `arq_common.cc`:
+```cpp
+bool cl_arq_controller::receive_mfsk_test_conn_phy(uint8_t* out_snr_q,
+                                                   uint8_t* out_local_cap,
+                                                   uint8_t* out_ssid);
+```
+
+Files modified:
+- `include/datalink_layer/arq.h` (+1 method declaration)
+- `source/datalink_layer/arq_common.cc` (+15 lines, helper)
+- `source/datalink_layer/arq_responder.cc` (+~70 lines, Site F branch
+  added beneath Site B; `link_status==LISTENING` gate is relaxed to allow
+  Site F's CONNECTION_RECEIVED branch to fire in parallel.)
+
+#### Cross-layer audit per CLAUDE.md §5
+
+Two shared-state structures touched:
+
+**`messages_rx_buffer`** — same audit as v2 §13.9 (this doc). Site F adds
+a synthesis identical in shape to Site B but with the TEST_CONNECTION
+layout. The consumer at `arq_responder.cc:380-430` copies into
+`messages_control` and dispatches `process_control_responder()` which
+branches on `code` (data[0]) — Site B routes to START_CONNECTION branch,
+Site F routes to TEST_CONNECTION branch (already exists, line 1880).
+
+| Field | Site B (START_CONN) | Site F (TEST_CONN) | Legacy CMD producer |
+|---|---|---|---|
+| data[0] | START_CONNECTION (0x32) | TEST_CONNECTION (?, see arq.h) | arq_commander.cc:449 / :468 |
+| data[1..4] | CRC8 of dest_call (1) | float SNR (4 bytes) | :451 / :466-472 |
+| data[5] | (callsign_pack[3]) | local_capability | :458 / :473 |
+| data[6] | (callsign_pack[4]) | SSID | :458 / :474 |
+| length | 7 | 7 | both |
+| sequence_number | control_batch_size-1 | control_batch_size-1 | (v2 audit finding) |
+
+Site F's synthesized data[1..4] uses `u_SNR.char4_SNR[i]` packing
+identical to the legacy CMD side at :471, so the legacy consumer's
+unpack at :1882-1887 reads the SNR back via the same union — bit-exact.
+
+**`messages_control`** — Site E mutates the same way Site A does (status
+ADDED_TO_BATCH_BUFFER → PENDING_ACK; the swap is INSIDE the existing
+state-transition guard). No new producers; no new consumers.
+
+**Cap-byte echo flow (Sites C+E+F end-to-end audit):**
+- CMD's `local_capability` flows into TEST_CONNECTION via Site E
+  (data[5] → 2-bit `local_cap` payload field, via `pack_test_conn_payload`).
+- RSP's Site F unpacks payload back into `messages_rx_buffer.data[5]`,
+  the consumer at `arq_responder.cc:1892` reads `peer_capability = data[5]`.
+- RSP's `process_control_responder` at :2061-2065 builds TEST_CONNECTION_ACK
+  with `data[1] = peer_capability` (echo) and `data[2] = local_capability`.
+- RSP's Site C (existing) reads `data[1..2]` and emits MFSK TEST_ACK.
+- CMD's Site D (existing) writes `data[1] = echoed_cap`, `data[2] = own_cap`
+  into `messages_control`; `process_control_commander` validates the echo
+  matches CMD's `local_capability`.
+
+**Note:** the v2 payload format collapses an 8-bit cap byte to 2 bits
+(only CAP_WB_CAPABLE=0x01 + CAP_ENCRYPTION=0x02 are in use per the
+2026-05-24 capability collapse). Site E masks to `& 0x3` on TX; Site F
+unpack returns 0..3; the legacy consumer at :1893-1896 logs the higher
+bits but only acts on the masked pair. End-to-end bit-correct.
+
+**SSID flow (Site E + Site F end-to-end audit):**
+- CMD's `callsign_get_ssid(my_call_sign)` (arq.h:65) returns 0..99 numeric
+  or `SSID_NONE=0xFF`. The legacy LDPC build at :474 writes this into
+  data[6].
+- Site E reads data[6] and packs into the 8-bit `ssid` payload field —
+  full range supported (0..255).
+- Site F unpack returns ssid 0..255; synthesized data[6] holds the value.
+- Legacy consumer at `arq_responder.cc:1901-1911` reads peer_ssid =
+  (uint8_t)data[6]; if != SSID_NONE → `callsign_format_ssid` appends
+  to destination_call_sign. End-to-end bit-correct.
+
+#### Cross-layer regression test (CLAUDE.md mandate)
+
+Three new tests in `source/physical_layer/mfsk_ctrl_codec_tests.cc`:
+
+1. **`pack_unpack_test_conn_payload`** (codec unit test):
+   exhaustive across local_cap × representative ssids × snr_q range
+   (0..15). Asserts pack→unpack round-trips bit-exact and reserved
+   bits 23..0 are zero on TX.
+
+2. **`v3_test_conn_passband_roundtrip_clean`** (passband round-trip):
+   pack a known SNR + cap + ssid through `pack_test_conn_payload`,
+   compute CRC12 via `cl_arq_controller::CRC12_calc` (the production
+   helper, never inline — fact-doc §13.5), emit passband audio via
+   `ts.generate_ctrl_suffix_pattern_passband(...,MFSK_CTRL_TEST_CONN,...)`,
+   round-trip through `decode_ctrl_suffix_from_passband`, assert
+   payload + type + CRC bit-exact. Same template as Wave 1's
+   `mfsk_connect_passband_roundtrip_clean`.
+
+3. **`v3_test_conn_snr_quantization_roundtrip`**: for several test SNR
+   values across the M=16 range (-5..+25 dB), assert
+   `tone_to_snr(snr_to_tone(snr))` round-trips with the expected
+   ≤1 dB quantization step (2 dB nominal). Documents the lossy
+   reconstruction at Site F. Detects accidental quantizer drift.
+
+#### Commit list (planned, in execution order)
+
+1. `docs(phase-b): §14.0 Wave 3 plan (pre-code)` ← THIS COMMIT
+2. `mfsk_ctrl_codec: §14 TEST_CONN payload pack/unpack helpers + unit test`
+3. `arq: §14 Site E — CMD TEST_CONNECTION PHY swap inside process_messages_tx_control`
+4. `arq: §14 Site F — RSP MFSK TEST_CONN detector synthesizes messages_rx_buffer`
+5. `tests: §14 Wave 3 passband round-trip + SNR quantization regression`
+6. `docs(phase-b): §14 Wave 3 implementation log`
+
+Each commit must:
+- Build clean (`bash build.sh o3`).
+- Pass `mercury.exe --test` (12/12 v1+v2 → 15/15 v1+v2+v3).
+- Be minimal (one logical change per commit).
+
+#### What stays unchanged (Wave 3 contract)
+
+- `add_message_control(TEST_CONNECTION)` at `arq_commander.cc:289` — unchanged.
+- `messages_control` state-machine transitions — unchanged.
+- `process_control_responder()` TEST_CONNECTION branch at
+  `arq_responder.cc:1880-2079` — runs bit-identically for both LDPC
+  and MFSK paths (Site F synthesizes the LDPC-shaped buffer).
+- All capability negotiation, SACK setup, compression, B2F, encryption,
+  TCP CONNECTED messages — driven by the legacy consumer, untouched.
+- Site A, Site B, Site C, Site D from Wave 2 v2 — UNCHANGED. Site E
+  shares the same `if(...==ADDED_TO_BATCH_BUFFER)` block but in a new
+  branch keyed on `data[0]==TEST_CONNECTION`. Site F adds a new branch
+  beneath Site B in the same outer detector block.
+
+#### Open issues handed to hardware operator
+
+1. **WGN floor measurement.** Wave 1 sim-tests prove the codec works at
+   sigma=0; the WGN floor for MFSK TEST_CONN is unknown until hardware
+   A/B. The Welch-Costas base pattern is shared with Sites A+B (and
+   their hardware A/B established the pattern works at the HAIL floor
+   ~WGN:-10), so the expected floor is the same. If WGN:-10 TEST_CONN
+   reaches a sibling MFSK_CTRL_TEST_CONN decode at the responder, Wave 3
+   delivered the operational reach the brief required.
+2. **Symmetric NB session behavior.** NB sessions skip Sites E+F (codec
+   guard `connect_pattern_nsymb > 0` returns false at M=8). The LDPC
+   TEST_CONNECTION fallback continues to work for NB.
+3. **Three-way handshake timing.** TEST_CONNECTION is the *third* round
+   trip. If Site E+F operates correctly the full sequence is:
+   - HAIL → HAIL beacon detect (existing, robust to WGN:-10)
+   - START_CONNECTION → Site A (MFSK), Site B (MFSK)
+   - START_CONN ACK → existing MFSK ACK pattern (already at floor)
+   - TEST_CONNECTION → Site E (MFSK), Site F (MFSK)   ← Wave 3
+   - TEST_CONNECTION_ACK → Site C (MFSK), Site D (MFSK)
+   All five frames now on MFSK suffix path. End-to-end CONNECT should
+   succeed wherever HAIL succeeds.
+
+---
