@@ -1642,6 +1642,76 @@ void cl_arq_controller::process_messages_rx_acks_control()
 		}
 		else
 		{
+			// Phase B Wave 2 v2 — PHY swap site D (fact-doc §13.2).
+			// When we're waiting for the TEST_CONNECTION_ACK echo AND the
+			// MFSK codec is available, poll for the MFSK TEST_ACK suffix
+			// BEFORE the LDPC receive() runs. On detection, synthesize the
+			// messages_control fields the legacy consumer at :3344-3392
+			// expects so process_control_commander() runs unchanged.
+			//
+			// We don't fall through to receive() when MFSK fires — that
+			// would consume audio meant for the next poll. We don't fall
+			// through to receive() on a miss either — the next tick will
+			// re-poll the suffix. NB sessions skip the MFSK detector
+			// entirely (codec guard returns 0).
+			bool mfsk_test_ack_path =
+				expects_ldpc_handshake_ack
+				&& narrowband_enabled != YES
+				&& telecom_system->ack_mfsk.connect_pattern_nsymb > 0
+				&& messages_control.status != ACKED;
+			if(mfsk_test_ack_path)
+			{
+				uint8_t echoed_cap = 0, own_cap = 0, ssid = 0;
+				if(receive_mfsk_test_ack_phy(&echoed_cap, &own_cap, &ssid))
+				{
+					printf("[CMD-TEST-ACK-V2] MFSK echoed=0x%02X own=0x%02X ssid=%u\n",
+						echoed_cap, own_cap, ssid);
+					fflush(stdout);
+					// Synthesize messages_control.data[] to the LDPC
+					// TEST_CONNECTION_ACK layout the legacy consumer at
+					// arq_commander.cc:3344-3392 expects:
+					//   data[0] = TEST_CONNECTION_ACK
+					//   data[1] = echoed_cap   (CRC8 check at :3350-3352)
+					//   data[2] = own_cap
+					//   data[3] = CRC8(data[1..2])   — fresh-computed so
+					//                                  the consumer's check
+					//                                  passes; we just
+					//                                  validated via CRC12.
+					//   data[5] = own_cap            (read at :3410 as
+					//                                  peer_capability)
+					//   data[6] = ssid              (read at :3420 log)
+					messages_control.data[0] = (char)TEST_CONNECTION_ACK;
+					messages_control.data[1] = (char)echoed_cap;
+					messages_control.data[2] = (char)own_cap;
+					messages_control.data[3] = (char)CRC8_calc(
+						(char*)&messages_control.data[1], 2);
+					messages_control.data[4] = 0;
+					messages_control.data[5] = (char)own_cap;
+					messages_control.data[6] = (char)ssid;
+					messages_control.length = 7;
+					messages_control.type = ACK_CONTROL;
+
+					// Mirror the post-LDPC-decode bookkeeping at :1657-1687.
+					clear_buffer(playback_buffer);
+					link_timer.start();
+					watchdog_timer.start();
+					gear_shift_timer.stop();
+					gear_shift_timer.reset();
+					messages_control.status = ACKED;
+					stats.nAcked_control++;
+					int guard = ptt_off_delay_ms;
+					receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
+					return;
+				}
+				// MFSK didn't fire this poll. DON'T fall through to LDPC
+				// receive() — that would consume the audio. Re-enter on
+				// next tick. (NB note: this branch is only entered when
+				// codec is available, so this 'return' doesn't strand
+				// NB sessions — they skip the MFSK block above and run
+				// the legacy LDPC path below.)
+				return;
+			}
+
 			// Decode LDPC ACK frame (also used for KEY_EXCHANGE_1 which
 			// carries the responder's pubkey in the ACK data payload, and
 			// for v9 TEST_CONNECTION_ACK which carries the capability echo).
