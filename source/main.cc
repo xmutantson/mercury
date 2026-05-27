@@ -32,6 +32,7 @@
 #include <iostream>
 #include <complex>
 #include "physical_layer/telecom_system.h"
+#include "physical_layer/ldpc_bp_osd_tests.h"
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 
@@ -237,6 +238,18 @@ int main(int argc, char *argv[])
 #endif
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    // --test : run built-in unit tests and exit. Currently this exercises the
+    // BP+OSD LDPC decoder pair (Phase A.2). Additional test groups can be
+    // hooked into run_ldpc_bp_osd_tests()'s caller below as they're added.
+    // The flag must be checked before any audio/GUI/threading init so the
+    // test process stays minimal.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--test") == 0) {
+            int failed = run_ldpc_bp_osd_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+    }
 
     int cpu_nr = -1;
     bool list_modes = false;
