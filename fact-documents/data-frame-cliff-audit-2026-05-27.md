@@ -411,11 +411,17 @@ all three commits; useful as a control measurement regardless.
 
 ## §13. Matched-filter metric fix (pre-code, 2026-05-27)
 
-**Status:** plan committed before code. Builds on §H1 (preamble 4→16) and §H2
-(per_sym_floor 0.05→0.01) which already shipped on `fix/preamble-extend`
-(commits 6d7e9f9, 325efec). This fix addresses the deeper structural issue
-identified by the follow-up debug agent: extending the preamble buys nothing
-if the metric form itself doesn't reward longer integration.
+**Status:** WIP / BLOCKER. The follow-up debug agent identified that
+`time_sync_mfsk_corr`'s per-sym cosine² MEAN is length-invariant and
+proposed swapping to a SUM with length-scaled threshold (or a global-noise
+form). I implemented the SUM form (commit b9d9910), discovered it is
+mathematically equivalent to the OLD form for the threshold decision,
+and REVERTED (commit 2be7b02). The diagnosis-proposed global-noise form
+has a separate data-content false-trigger problem. See §13.9 below for
+the corrected analysis and the open question for the parent agent.
+
+Builds on §H1 (preamble 4→16) and §H2 (per_sym_floor 0.05→0.01) which
+already shipped on `fix/preamble-extend` (commits 6d7e9f9, 325efec).
 
 ### §13.1 The bug
 
@@ -590,6 +596,124 @@ loopback). At sigma=0:
 All clean-channel tests pass without modification. The metric output
 field in test diagnostics will change in magnitude but the pass/fail
 decisions are preserved.
+
+### §13.9 Post-implementation correction — the fix is a no-op (blocker)
+
+After implementing §13.2 in commit b9d9910, I realized the change is
+mathematically equivalent to the OLD form for the threshold decision.
+
+**The equivalence:**
+
+- OLD form: `metric_old = (Σ sym_metric_k) / N` , compared to threshold `T_old = 0.5`
+- NEW form: `metric_new = (Σ sym_metric_k)` , compared to threshold `T_new = 0.5 · N`
+
+The decision rule is:
+- OLD: `mean(sym_metric_k) ≥ 0.5`
+- NEW: `sum(sym_metric_k) ≥ 0.5 · N`  ↔  `mean(sym_metric_k) ≥ 0.5`
+
+**Identical decision.** The change in §13.2 cannot move the cliff. Reverted
+in commit 2be7b02.
+
+**Where my §13.3 derivation went wrong:**
+
+I argued the SUM form gives "+6 dB matched-filter detection-SNR" because
+noise stddev grows as √N (sum form) vs 1/√N (mean form). That's true
+*in absolute units*, but the threshold also scales with N (sum form),
+so the relative position of signal vs threshold vs noise is unchanged.
+The mean-form noise mean is at 1/Nofdm, signal mean is at γ/(γ+1) where
+γ = per-sym SNR; threshold 0.5 means we detect when γ/(γ+1) ≥ 0.5, i.e.,
+γ ≥ 1 (per-sample SNR ≥ 0 dB). N is irrelevant to this inequality.
+
+The √N gain from longer integration shows up only in detection VARIANCE
+(probability of detection at a given SNR, not the SNR floor itself).
+With more N, the probability of metric crossing the threshold at a given
+SNR tightens — but the 50% detection point stays at the same SNR.
+
+**What WOULD give a real cliff shift:**
+
+Option B — diagnosis's actual proposed form with GLOBAL noise reference:
+
+```
+num   = Σ_k |corr_k|²
+den   = E_template_total · σ²_est
+σ²_est ≈ Σ e_rx_k / (N · Nofdm)                  (signal-contaminated)
+metric = num · N · Nofdm / (E_template_total · Σ e_rx_k)
+```
+
+For signal at per-sample in-band SNR ρ: `E[metric] = (ρ·Nofdm + 1)/(ρ + 1)`.
+
+- ρ=0 (noise): metric → 1
+- ρ=Nofdm (per-sym SNR=Nofdm, per-sample SNR=0 dB): metric → Nofdm/2 ≈ 146
+- ρ=∞ (clean): metric → Nofdm = 292
+- ρ=0.158 (WGN:-8 cell): metric → (46+1)/1.158 ≈ 40.7
+
+With a threshold of, say, 5, this form detects signal at per-sample SNR
+~ -22 dB and below — well past the WGN:-8 cell. Length scaling: noise
+mean stays at 1 regardless of N; noise stddev shrinks as 1/√N, so a
+length-scaled threshold `T = 1 + k·/√N` gives a 3 dB improvement going
+from N=4 to N=16 (not 6 dB as the diagnosis claimed).
+
+**Why Option B is NOT a drop-in:**
+
+Data content at non-preamble position has `|corr_k|²` between 0 and
+0.44·e_t·e_rx (Bug #44 testimony). Plugging into Option B with worst-case
+α=0.44 uniformly across symbols:
+
+- metric_data ≤ α · Nofdm = 0.44 · 292 ≈ 128
+
+That's WAY above threshold 5 → DATA WILL FALSE-TRIGGER. The diagnosis's
+form does not include this safeguard.
+
+The data-content false-trigger is the reason the existing detector uses
+PER-SYMBOL normalized cosine² (which is bounded ≤1 per symbol → ≤ N
+total — natural ceiling). The old form trades dB-floor for data-content
+safety. Removing that trade reintroduces the false-trigger problem.
+
+**Possible fixes (require parent agent decision):**
+
+1. **Hybrid form**: keep per-symbol cosine² as a SHAPE GATE (require ≥K
+   symbols with cosine² ≥ shape_floor, similar to detect_ack_pattern's
+   count form), AND apply Option B's global metric as a CONFIDENCE score.
+   Requires careful K and shape_floor tuning, plus a fail-before-passes
+   test that runs through low-SNR WGN realizations.
+
+2. **Detect-ack-pattern port**: replace `time_sync_mfsk_corr` with a
+   variant of `detect_ack_pattern` (FFT-bin argmax matched count + total
+   metric gate). This is a multi-week port with its own validation needs.
+   Larger scope than the parent agent prompted.
+
+3. **Threshold-only adjustment**: lower the OLD threshold from 0.5 to,
+   say, 0.15 to operate the existing form at lower per-sample SNR. But
+   the audit explicitly warned against this (CLAUDE.md §1.2: "Never adjust
+   thresholds to mask a failure"). The 0.5 was calibrated against data
+   content at high SNR (cosine² up to 0.44); 0.15 risks false-trigger
+   at HIGH SNR even if it helps at low SNR.
+
+4. **Don't fix this layer**: accept the §H1 (preamble 4→16) and §H2
+   (per_sym_floor 0.01) wins as the gain on this branch. They do shift
+   the cliff modestly via reduced rejection rate, not via matched-filter
+   gain. If hardware A/B at WGN:-4..-8 shows the preamble extension alone
+   doesn't close the gap, escalate to Option 1 or 2.
+
+**Current state of `fix/preamble-extend` branch:**
+
+- 6d7e9f9: preamble extended 4→16 (real preamble TX/RX change, ships)
+- ce9d19f: regression test for preamble extension (ships)
+- 325efec: per_sym_floor 0.05→0.01 (real soft-rejection relaxation, ships)
+- d89fe31: §13 plan (this document) — RE-CHARACTERIZED to NO-OP/blocker
+- b9d9910: §13 implementation — REVERTED (no-op)
+- 2be7b02: revert of b9d9910
+
+The §13 metric form change is paused. Reverting also the plan commit
+d89fe31 would lose this analysis; keeping it with the §13.9 correction
+preserves the failure-mode record for future agents.
+
+**Recommendation to parent agent:** decide between Options 1-4 above.
+Each requires materially more design work than the parent prompt scoped
+("~3-line fix in ofdm.cc:3098-3115"). The diagnosis was directionally
+right that the OLD form is length-invariant for the threshold decision,
+but the ~3-line fix as described is mathematically equivalent and does
+not move the cliff.
 
 ## §7. Open questions [?]
 
