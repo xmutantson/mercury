@@ -2641,3 +2641,319 @@ Most likely root cause per §8.1 (the test the implementation agent flagged): si
 Plan: **§20 sign-flip A/B will disambiguate**. If sign-flip on data-preamble shows a clear win, the formula needs flipping everywhere and the ctrl-frame branch deserves a respin. If sign-flip on data-preamble is null/regressing, the ctrl-frame regression is something else (sample-window alignment? estimator window choice for short ctrl frames?) and the branch is dead for different reasons.
 
 Branch `feat/mini-moose-ctrl` dropped without merge.
+
+---
+
+## §23. Sign-flip experiment plan (pre-code, 2026-05-28)
+
+**Status:** PLAN — to be implemented on branch `fix/sign-flip` in worktree
+`mercury-worktrees/sign-flip`. Baseline `41e889f` (monitor HEAD after §22
+docs commit; 25/25 `mercury.exe --test` pass). The work item is a single-
+character change to the WB MFSK mini-Moose apply formula, motivated by
+the §22 control-frame regression and its sign-convention concern.
+
+### §23.1 The current apply site
+
+`source/physical_layer/telecom_system.cc:2274`:
+
+```cpp
+ofdm.passband_to_baseband_decimated(&data[pb_start], pb_size,
+    data_container.baseband_data_interpolated,
+    sampling_frequency,
+    effective_carrier_freq + freq_offset_measured,   // <-- this line
+    carrier_amplitude,
+    Mdec, &ofdm.FIR_rx_data, pb_start);
+```
+
+This re-mix runs whenever `fabs(freq_offset_measured) >
+ofdm.freq_offset_ignore_limit` (≈ 3 Hz). Post-§20 mini-Moose, the MFSK
+data preamble feeds a non-zero residual into this branch (was hard-zeroed
+pre-§20 and the re-mix never fired for MFSK).
+
+### §23.2 The proposed flipped formula
+
+```cpp
+ofdm.passband_to_baseband_decimated(&data[pb_start], pb_size,
+    data_container.baseband_data_interpolated,
+    sampling_frequency,
+    effective_carrier_freq - freq_offset_measured,   // <-- sign flipped
+    carrier_amplitude,
+    Mdec, &ofdm.FIR_rx_data, pb_start);
+```
+
+Only the sign on `freq_offset_measured` changes. Scope is intentionally
+minimal: the estimator (`carrier_frequency_sync_wb_mfsk` in `ofdm.cc`),
+the sanity clamp, the cache-write gate at `:2782`, and the OFDM/WB-Moose
+paths are all UNTOUCHED. The flip applies to BOTH OFDM and MFSK (the
+re-mix block isn't mode-gated post-§20), so the empirical effect couples
+OFDM behavior too — see §23.6 for the risk reasoning.
+
+### §23.3 Sign-convention math (NB vs WB MFSK disagreement)
+
+Reading the existing code carefully reveals an internal inconsistency:
+
+- `cl_ofdm::carrier_frequency_sync_nb` (`ofdm.cc:537-611`) computes
+  `C = Σ H_cur · conj(H_prev)` then `freq_offset = -arg(C) · ...`. The
+  derivation comment at `:603-608` justifies the leading minus:
+  > passband_to_baseband uses exp(+j·2πfc·t), so a carrier offset δ Hz
+  > produces baseband phase exp(-j·2πδ·t). Cross-symbol phase is -2πδ·T.
+  > Therefore: δ = -arg(C) / (2π · T_symbol)
+
+- `cl_ofdm::carrier_frequency_sync_wb_mfsk` (`ofdm.cc:613-804`) computes
+  `C = B · conj(A)` (same handedness: "later" · conj("earlier")) but
+  returns `freq_offset = +arg(C) · ...` at `:799` — NO leading minus.
+
+If the NB derivation is correct, the WB MFSK estimator is returning
+`-δ` instead of `+δ`. The apply formula `effective_carrier + (-δ)` =
+`effective_carrier - δ` would then UNDO a residual of `+δ` at baseband
+by mixing from passband at a frequency `δ` BELOW the true RF carrier —
+the WRONG direction, doubling the error to `+2δ` at baseband.
+
+Reading the §7 tests: the synth helper at
+`mfsk_ctrl_codec_tests.cc:1709-1721` injects CFO via baseband
+`× exp(+j·2π·cfo·t)`, i.e. shifts baseband by `+cfo` Hz. Test A asserts
+`|estimator_return - +7 Hz| < 1.5 Hz`. The test PASSES on monitor —
+which means the estimator IS in fact returning the SAME-sign value as
+the baseband shift. So one of two things is true:
+
+(a) The NB comment at `:603` is correct but the WB MFSK estimator was
+    written against a different convention (perhaps the de-rotation
+    `exp(-j·2π·f_tone·t)` flips the effective sign on the half-symbol
+    correlation) and the WB MFSK estimator is RIGHT. Then the apply
+    formula `+freq_offset_measured` is correct, and flipping it should
+    REGRESS the new apply-sign-invariance test (LLR magnitudes should
+    drop because residual CFO is doubled, not cancelled).
+(b) The WB MFSK estimator and the test are both wrong with cancelling
+    sign errors — estimator returns `-δ`, test expects `+δ`, the
+    injection direction matches the estimator's "wrong" sign so the
+    test passes anyway. Then the apply formula `+freq_offset_measured`
+    is also wrong, but the ALREADY-tested half-symbol math doesn't tell
+    us which side of the equation is upside-down.
+
+Either way, the **apply-sign-invariance test (§23.7)** drives the
+demodulator end-to-end with a known CFO and asserts the demap LLRs
+match a zero-CFO reference. That is the ground-truth check: it doesn't
+care whether the estimator returns +δ or -δ, only whether the chain
+"estimator + apply" undoes the injected CFO. Whichever sign in the
+apply formula makes the LLRs match the reference is the correct one.
+
+### §23.4 Hypotheses being disambiguated
+
+(H1) Monitor's `+freq_offset_measured` is mathematically wrong but the
+     IONOS CFO is small enough (< ~3 Hz) that the apply is mostly a
+     no-op (below `freq_offset_ignore_limit`). The §20 hardware win
+     came from some other side effect of the §20 commit. Flipping the
+     sign should give 1-2 dB more at low SNR where residual CFO grows.
+
+(H2) Monitor's `+freq_offset_measured` IS mathematically correct on
+     hardware. The §22 ctrl-frame agent's empirical evidence pointed
+     at `-` because their test setup had a different reference frame
+     (different injection direction, different estimator window). The
+     §22 regression was something OTHER than sign (sample-window
+     alignment, estimator window choice for short ctrl frames). Sign-
+     flip on §20 should REGRESS at the cells where §20 was a win.
+
+(H3) The §20 win was a side effect — the re-mix gate at `:2262-2279`
+     is now firing for MFSK where it wasn't before, and the *sign* of
+     the applied CFO is largely irrelevant because the mix is undone
+     by other code. Flipping the sign should be ~null delta. (This
+     hypothesis predicts the new apply-sign-invariance test ALSO sees
+     null delta when sign is flipped, which would itself be a finding —
+     the LLRs at +CFO with - apply should ≠ LLRs at 0 CFO unless the
+     re-mix is genuinely a no-op.)
+
+### §23.5 Existing §20 test compatibility (Test A/B/C)
+
+Tests A (`_recovers_cfo`) and B (`_zero_cfo_no_op`) at
+`mfsk_ctrl_codec_tests.cc:1734-1825` call the ESTIMATOR DIRECTLY:
+
+```cpp
+double est = ts.ofdm.carrier_frequency_sync_wb_mfsk(...);
+```
+
+They assert on the **estimator's return value** ("recovers +7 Hz CFO
+within ±1.5 Hz", "returns < 0.5 Hz on clean signal"). They do NOT call
+the apply path at `telecom_system.cc:2274`. The sign flip changes only
+the apply, not the estimator — so A and B MUST still pass with the
+sign flipped.
+
+Test C (`_pure_noise_safe`) at `:1839-1899` is a sanity-bound check
+(|est| ≤ 100 Hz on pure noise, no NaN/Inf). Also unaffected by the
+apply-formula flip.
+
+**Prediction:** A, B, C all pass post-flip. If any fails, the flip
+hit shared state we didn't expect — investigate before committing.
+
+### §23.6 Cross-layer impact — does flipping the sign affect OFDM?
+
+The apply block at `:2262-2279` is no longer mode-gated post-§20
+(§20.3 dropped the `if(M == MOD_MFSK) skip` guard). The flip therefore
+applies to BOTH OFDM and MFSK. Risk:
+
+- WB OFDM `carrier_sampling_frequency_sync` (Schmidl-Cox at
+  `ofdm.cc:474`) has its own sign convention. If WB OFDM was working
+  on monitor with `+freq_offset_measured`, the flip will regress it.
+  The OFDM Moose estimator is also documented to follow the
+  `exp(+j·2πfc·t)` convention (`ofdm.cc:603`-style derivation, in the
+  same file).
+
+- NB OFDM was always 0 (`:2168-2191` zeros for narrowband_enabled), so
+  no impact.
+
+- The cache write at `:2782` is OFDM-only (gated `if(M != MOD_MFSK)`).
+  If we flip the sign on WB OFDM's apply, the cache will store the
+  Moose-returned δ (which the cache path uses in the next-frame
+  `use_last_good_freq_offset` fallback at `:2164-2167`). That fallback
+  uses the cached δ directly in the same `effective_carrier + δ` re-mix
+  path. So flipping the sign affects both the immediate re-mix AND the
+  cached-fallback re-mix on the next frame, consistently.
+
+This means the experiment is NOT cleanly isolated to MFSK — OFDM is
+along for the ride. That's acceptable for this experiment because:
+
+(a) Both NB OFDM and "WB OFDM with zero residual" are unaffected
+    (re-mix gated by `freq_offset_ignore_limit ≈ 3 Hz`).
+(b) WB OFDM at cells where Moose returns > 3 Hz residuals is a SMALL
+    portion of typical traffic — fresh-channel-est OFDM Moose normally
+    converges to near zero. Hardware A/B at cells WGN ≥ -8 (where the
+    Moose estimator hasn't degenerated yet) should be dominated by
+    MFSK.
+(c) If the empirical result shows a clean MFSK win at robust cells AND
+    a clean OFDM regression at high-SNR data cells, that's a strong
+    signal that the WB OFDM Moose and WB MFSK mini-Moose disagree on
+    sign conventions and the correct fix is to flip only the WB MFSK
+    estimator. We'd surface that and either restrict the §20 apply to
+    MFSK with a mode-gate or fix the WB MFSK estimator's sign at the
+    source. That's a follow-up axis, not this experiment.
+
+### §23.7 Mandatory new regression test (apply-sign-invariance)
+
+`mfsk_data_preamble_mini_moose_apply_sign_invariance` — END-TO-END
+verification that the apply formula correctly undoes the injected CFO.
+Mirrors §7.1's CFO-injection harness but drives the full receive path.
+
+Algorithm:
+1. Synthesize a real WB ROBUST_0 frame (preamble + Nsymb data symbols
+   with known modulation) at passband. Add AWGN at a comfortable SNR
+   (in-band ≈ +10 dB, well above cliff).
+2. Run the full RX path TWICE:
+   - Reference: NO injected CFO. Capture the per-symbol FFT-domain
+     samples that the MFSK noncoherent demap reads, OR the LLRs the
+     demap emits. Store as `ref_llrs`.
+   - Test: inject a known CFO of +7 Hz at passband (multiply passband
+     by `cos(2π · 7 · t)` — a real-valued shift, mirrors actual hardware
+     LO mismatch). Run the same RX path; capture `test_llrs`.
+3. Assert `mean(|test_llrs - ref_llrs|) / mean(|ref_llrs|)` < threshold
+   (target ≤ 0.10 — within 10%, comfortable margin for noise).
+
+The test passes if the chain "mini-Moose estimate + apply formula"
+correctly undoes the injected CFO. It fails if the apply sign is wrong
+(LLR magnitudes drop because residual CFO at the demod's FFT shifts
+energy out of the expected bin).
+
+**FAIL-BEFORE verification:** with the sign-flipped formula in place,
+the test must PASS. With the OLD formula stashed back in (sign reverted
+to `+`), the test must... well, that's the empirical question. If the
+OLD formula was correct, the test FAILS post-flip. If the NEW formula
+is correct, the test FAILS pre-flip. The fail-before procedure is to:
+1. After implementing the flip, run the test → expect PASS.
+2. `git stash` the apply-formula edit → run the test → expect either
+   PASS (means the formula was a no-op — see H3) or FAIL (means the
+   sign genuinely affected the demod).
+3. Document both outcomes in §23.10.
+
+### §23.8 Cross-layer audit (CLAUDE.md §5)
+
+The data-flow audit doc `data-flow-freq_offset_measured.md` gets a new
+§11 covering:
+
+- Producer change: NONE. The estimator is unchanged. The flip moves
+  bits inside the apply consumer (§2.2 of the audit).
+- Consumer change: §2.2 re-mix now mixes from passband with
+  `effective_carrier_freq - freq_offset_measured` instead of `+`. For
+  MFSK with mini-Moose residual = +δ, the post-re-mix baseband signal
+  is at `+δ - (-δ) = +2δ` if the WB MFSK estimator's sign convention
+  is opposite of the apply formula's expectation (H1 case), OR at
+  `+δ - (+δ) = 0` if the estimator's sign matches the new apply
+  formula (H2 case inverted). The downstream consumers (§2.1 sanity,
+  §2.5 cache) are unchanged in shape — the cached value just has the
+  opposite sign to what the §1.3 reuse path expects on the next frame.
+- Invariant change: INV-1 ("OFDM behavior unchanged") is BROKEN by the
+  flip. The flip MUST be tested on OFDM data cells too. Acceptable
+  during this experiment because the goal is to disambiguate sign
+  conventions globally, but a follow-up commit will either narrow the
+  flip to MFSK only (mode-gate) or surface that OFDM needed flipping
+  all along.
+
+### §23.9 Hardware A/B regime
+
+Same axis as §20's verify run:
+
+- Tool: `tools/axis_walk_sweep.py --pin-config 100`
+- Cells: WGN ∈ {+14, +6, 0, -4, -8, -10, -12}
+- Dwell: 180 s/cell
+- Passes per arm: 3
+- Arms: `monitor (41e889f) baseline` vs `fix/sign-flip` HEAD
+- Decision criteria:
+  - **Clean win (H1):** sign-flip arm shows ≥ +1 dB cliff move
+    (cells WGN ≤ -8) or ≥ +20% total bytes at clean cells.
+  - **Null result (H3):** within ±10% total bytes at all cells. Sign
+    is irrelevant, §20 win came from re-mix gate alone. Surface that
+    a follow-up commit should look at WHY a no-op re-mix changes
+    behavior at all.
+  - **Regression (H2):** sign-flip arm loses ≥ -20% total bytes at any
+    cell where monitor was working. Monitor's `+` is empirically correct;
+    §22 ctrl-frame regression was something else. Revert this branch.
+
+### §23.10 Open issues for hardware operator
+
+[?]1 If the empirical result is H2 (regression), file an open issue
+     against the §22 ctrl-frame plan to revisit WHY their sign-flip test
+     diverged from data-preamble's. Probable candidates: different
+     injection convention (passband real-mix vs baseband complex-mult),
+     different correlation window (full symbol vs half symbol), short
+     ctrl frame producing lower estimator confidence, etc.
+[?]2 If the empirical result is H3 (null), the §20 hardware win
+     (+11.7% total bytes, +55% bps clean) needs an alternative
+     explanation. Candidates: the re-mix block triggering an FIR
+     warmup that suppresses a pre-existing transient (the OFDM path
+     was getting this for free), or the additional copy-loop at
+     `:2278` cleaning up a buffer issue.
+[?]3 The WB OFDM coupling (§23.6) — if hardware A/B shows OFDM
+     regression at high-SNR cells with sign-flipped MFSK improvement,
+     the correct production fix is to flip the WB MFSK estimator at
+     `ofdm.cc:799` (returning `-arg(C)*...`) so the WB OFDM apply path
+     stays mathematically consistent. That would let the apply formula
+     stay `+freq_offset_measured` for both modes.
+
+### §23.11 Commit list (planned)
+
+1. `docs(sign-flip): §23 plan — flip WB MFSK mini-Moose apply sign`
+   (this section; the new audit doc §11; CLAUDE.md §5 cross-layer
+   walkthrough).
+2. `phy(telecom_system): flip mini-Moose apply sign for WB MFSK`
+   (one-character change at `:2274`; comment update explaining the
+   §23 experiment, citing this plan).
+3. `test(mini-moose): apply-sign-invariance end-to-end LLR check`
+   (new Test D in §7, hooked into `mercury.exe --test`). Verify
+   fail-before-passes per §23.7.
+
+### §23.12 Cross-references
+
+- §20 — Mini-Moose implementation plan (the formula this experiment
+  flips).
+- §22 — Control-frame mini-Moose hardware regression (the §22
+  empirical evidence pointing at sign).
+- `data-flow-freq_offset_measured.md` §2.2 — the apply consumer.
+- `data-flow-freq_offset_measured.md` §11 (NEW) — sign-flip cross-
+  layer audit.
+- `mercury/source/physical_layer/ofdm.cc:537-611` — the NB
+  cross-symbol-phase estimator and its `-arg(C)` derivation comment
+  (the apparent ground-truth convention).
+- `mercury/source/physical_layer/ofdm.cc:613-804` — the WB MFSK
+  estimator with `+arg(C)` return (the apparent disagreement).
+- `mercury/source/physical_layer/telecom_system.cc:2274` — the
+  apply site this experiment flips.
+- `mercury/source/physical_layer/mfsk_ctrl_codec_tests.cc:1639-1899`
+  — the §7 mini-Moose regression suite (Tests A/B/C unchanged;
+  Test D added by this experiment).

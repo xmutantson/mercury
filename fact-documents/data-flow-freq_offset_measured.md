@@ -458,3 +458,135 @@ all 25 tests pass.
   the re-mix path MUST update §2.2 with the rationale.
 - **Drift check**: every change to `telecom_system.cc` near line 2193
   or 2220 should grep this file and update the line numbers.
+
+---
+
+## §11 Sign-flip experiment audit (2026-05-28, branch `fix/sign-flip`)
+
+See `data-preamble-port-research.md` §23 for the experimental rationale.
+This audit captures the cross-layer impact of flipping the sign on
+`freq_offset_measured` in the apply formula at `telecom_system.cc:2274`
+from `effective_carrier_freq + freq_offset_measured` to
+`effective_carrier_freq - freq_offset_measured`.
+
+### §11.1 Producers — unchanged
+
+§1.1 through §1.7 producers are all UNCHANGED. The estimator
+(`carrier_frequency_sync_wb_mfsk`) still returns the same value as
+pre-flip. The sanity clamp at `:2247-2250` still bounds the value to
+±subcarrier_spacing. NB-MFSK still writes 0. WB-OFDM Moose still writes
+its own Schmidl-Cox estimate.
+
+### §11.2 Consumer change — §2.2 re-mix only
+
+Only consumer §2.2 is structurally changed. The re-mix block at
+`:2262-2279` now passes `effective_carrier_freq - freq_offset_measured`
+to `passband_to_baseband_decimated`.
+
+| Mode | Pre-§20 (monitor before 233c8a1) | Post-§20 (monitor 41e889f) | Post-§23 (this branch) |
+|---|---|---|---|
+| NB-OFDM | freq=0 → no re-mix | freq=0 → no re-mix | freq=0 → no re-mix |
+| WB-OFDM | re-mix at `effective + δ_Moose` | re-mix at `effective + δ_Moose` | re-mix at `effective - δ_Moose` |
+| NB-MFSK | freq=0 → no re-mix (skipped) | freq=0 → no re-mix (gate) | freq=0 → no re-mix (gate) |
+| WB-MFSK | freq=0 → skip (mode-gated) | re-mix at `effective + δ_miniMoose` | re-mix at `effective - δ_miniMoose` |
+
+The MFSK skip at the old `:2220-2223` was already dropped in §20; the
+§23 flip applies to BOTH OFDM and MFSK because the gate is mode-agnostic.
+This means the experiment couples WB OFDM behavior — see §11.4.
+
+### §11.3 Consumer §2.5 cache write — unchanged shape, opposite values
+
+The cache write at `:2782` still gates `if(M != MOD_MFSK)`. MFSK
+residuals still don't enter the cache. But for WB-OFDM, the cache will
+now contain the SAME magnitude estimate as before (the estimator output
+is unchanged), even though the apply path uses the opposite sign. On the
+next-frame `use_last_good_freq_offset` fallback (§1.3), the cached value
+is read into `freq_offset_measured` then passed through the same flipped
+apply formula. So the cache-fallback re-mix flips too. Consistent
+behavior across single-frame and cache-fallback paths.
+
+### §11.4 INV-1 broken by this experiment
+
+Pre-§23 INV-1 stated: "OFDM behavior unchanged for every M != MOD_MFSK
+config." Post-§23 this is FALSE — WB-OFDM re-mix now uses the opposite
+sign too. The experiment intentionally couples OFDM along for the ride
+because the §22 ctrl-frame regression and the §20 win are both about
+the same `effective_carrier ± δ` arithmetic. A clean hardware A/B at
+both robust-MFSK cells AND high-SNR OFDM cells will disambiguate:
+
+- Clean OFDM + Clean MFSK gain at the flipped sign → original `+` was
+  the bug across both modes.
+- Clean OFDM unchanged + MFSK gain → only the WB MFSK estimator's
+  return sign was wrong; the correct production fix is to flip the
+  estimator at `ofdm.cc:799` instead of the apply formula. (This
+  branch then deserves a follow-up that narrows the apply change.)
+- Clean OFDM regression + MFSK gain → opposite-sign for the two
+  estimators is the correct production state. The clean production
+  fix is to flip the WB MFSK ESTIMATOR (not the apply), restoring
+  OFDM behavior and keeping MFSK improved.
+- Clean OFDM unchanged + MFSK unchanged → null result. The §20 win
+  came from something other than CFO correction (see §23 H3).
+- Clean OFDM regression + MFSK regression → original `+` was correct
+  for both. The §22 ctrl-frame regression was something other than
+  sign. Revert this branch.
+
+### §11.5 Invariants preserved
+
+INV-2 (NB-MFSK unchanged): YES, NB-MFSK still has freq=0 (no re-mix).
+INV-3 (cache gate preserved): YES, the `if(M != MOD_MFSK)` gate at
+`:2780` is not touched.
+INV-4 (mini-Moose output finite): YES, estimator unchanged.
+INV-5 (sanity clamp still bites): YES, clamp unchanged.
+INV-6 (re-mix buffer shape): YES, only the `fc` argument's sign on
+δ changes — buffer math, FIR, decimation rate, polyphase offset all
+identical.
+
+### §11.6 New regression test commitment
+
+`mfsk_data_preamble_mini_moose_apply_sign_invariance` (data-preamble-
+port-research.md §23.7) drives the full RX path with and without an
+injected CFO and asserts the LLR magnitudes match within 10%. This test
+catches the case where the apply formula doubles the CFO instead of
+cancelling it.
+
+The test is hooked into `mercury.exe --test` and must pass on this
+branch. On `monitor` HEAD with the OLD sign, the test's outcome is the
+fail-before-passes verification:
+
+- If OLD-sign passes the new test too → §23 H3 (sign is irrelevant,
+  re-mix is a no-op at the +7 Hz injection level used).
+- If OLD-sign fails the new test (LLR magnitudes off by >10%) → §23 H1
+  (the OLD sign was wrong; this branch's new sign is correct).
+
+§23.10 [?]2 captures the H3 outcome as an open issue requiring a
+distinct explanation for the §20 hardware win.
+
+### §11.7 Drift check post-experiment
+
+After hardware A/B resolution:
+- If H1 confirmed (sign-flip wins) → merge to monitor; this audit's §11
+  becomes the new authoritative description. Update §2.2 to make the
+  `-` formula the documented baseline.
+- If H2 confirmed (sign-flip regresses) → revert this branch; this §11
+  stays as a record of the experiment, with §11.4 amended noting the
+  empirical resolution.
+- If H3 confirmed (null) → revert this branch; this §11 stays as a
+  record; investigate the §20 win's actual mechanism.
+
+### §11.8 The §21.9 sign-convention concern — resolution status
+
+`data-preamble-port-research.md` §21.9 (the §22 ctrl-frame branch's
+sign-convention note, referenced from the §22 hardware verdict) raised
+a [?] about whether `+freq_offset_measured` was the correct apply
+direction for the half-symbol-baseline cross-correlation estimator.
+This experiment EXPERIMENTALLY DISAMBIGUATES that [?] via hardware A/B.
+
+Pre-experiment state of [?]: open. The §20 hardware A/B (+11.7% bytes,
++55% bps) could be explained by either H1 (sign was wrong but small
+δ at high SNR masked it) or H2 (sign was correct). The §22 hardware
+regression of the same formula on a different code path is consistent
+with both: H1 says ctrl-frame had large enough δ for the sign error to
+bite; H2 says ctrl-frame had a different sibling bug.
+
+Post-experiment state of [?]: will be set by hardware A/B per §11.4
+decision matrix.
