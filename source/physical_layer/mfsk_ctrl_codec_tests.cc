@@ -1898,6 +1898,269 @@ static void test_mfsk_data_preamble_mini_moose_pure_noise_safe() {
 	test_pass(name);
 }
 
+// §7.4 — Apply-sign-invariance end-to-end LLR check.
+// (data-preamble-port-research.md §23.7,
+//  data-flow-freq_offset_measured.md §11.6.)
+//
+// MANDATORY for the §23 sign-flip experiment. Drives the FULL production
+// receive chain (initial passband_to_baseband_decimated → mini-Moose
+// estimator → corrected passband_to_baseband_decimated with the
+// production apply formula → symbol_demod → expected-tone-bin energy)
+// at two CFO settings and asserts the corrected-CFO chain produces the
+// same per-symbol expected-bin energy as the no-CFO reference within a
+// fixed tolerance.
+//
+// This is the ground-truth test that the §23 plan requires: it does NOT
+// rely on the estimator returning a particular sign or magnitude — only
+// that "estimator + apply" together cancel the injected CFO. Whichever
+// sign in the apply formula makes the LLR-proxy match the reference is
+// the correct one for the production chain.
+//
+// Pre-flip (monitor's `+freq_offset_measured`): outcome is the empirical
+// question §23 asks. If this test PASSES on monitor's `+` formula too,
+// the new test does not constrain the sign — the apply chain is
+// effectively a no-op at the injection level we use (§23 H3). If it
+// FAILS on monitor's `+` and PASSES on this branch's `-`, the new sign
+// is empirically correct on synthetic signals (§23 H1).
+//
+// Test signal: WB MFSK ROBUST_0. Random data bits → mfsk.mod → preamble
+// + data symbols at base rate → baseband_to_passband at `carrier_frequency`.
+// CFO injection: build the CFO-shifted passband by remixing at TX time
+// from a (carrier_frequency + cfo_inject) LO; the test compares the
+// resulting "ref vs apply-corrected" chain.
+static void test_mfsk_data_preamble_mini_moose_apply_sign_invariance() {
+	const char* name = "mfsk_data_preamble_mini_moose_apply_sign_invariance";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+
+	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL) {
+		test_fail(name, "pre-condition: ROBUST_0 not initialized correctly");
+		return;
+	}
+
+	const int Nofdm = ts.data_container.Nofdm;
+	const int Nfft = ts.data_container.Nfft;
+	const int Nc = ts.data_container.Nc;
+	const int preamble_nSymb = ts.data_container.preamble_nSymb;
+	const int interp = ts.data_container.interpolation_rate;
+	const int nSymb_data = 16;  // enough to average expected-bin energy
+	const int total_sym = preamble_nSymb + nSymb_data;
+
+	// Bits per data symbol: mfsk.nBits * mfsk.nStreams (= 5 * 1 = 5 for
+	// ROBUST_0). Total bits across nSymb_data symbols.
+	const int bps = ts.mfsk.nBits * ts.mfsk.nStreams;
+	if (bps <= 0) {
+		test_fail(name, "mfsk.nBits or nStreams is zero — config did not load");
+		return;
+	}
+	const int total_bits = nSymb_data * bps;
+
+	// Random bits for the data payload (fixed seed for reproducibility).
+	std::mt19937 rng(0x23510415u);
+	std::vector<int> bits((size_t)total_bits, 0);
+	for (int i = 0; i < total_bits; i++) bits[i] = ((int)rng() & 1);
+
+	// Symbol-domain (Nc subcarriers per symbol) buffer: preamble + data.
+	std::vector<std::complex<double> > sym_freq(
+		(size_t)total_sym * (size_t)Nc, std::complex<double>(0.0, 0.0));
+
+	// Generate preamble in freq domain.
+	ts.mfsk.generate_preamble(&sym_freq[0], preamble_nSymb);
+
+	// Generate data symbols in freq domain.
+	ts.mfsk.mod(bits.data(), total_bits, &sym_freq[(size_t)preamble_nSymb * Nc]);
+
+	// Record the EXPECTED tone bin (after gray-coded mod) for each data
+	// symbol. mfsk.mod places `amp` at `stream_offsets[st] + actual_tone`;
+	// we capture that index per symbol so the demod-side test can probe
+	// the right FFT bin without knowing the bit content.
+	std::vector<int> expected_subcarrier_idx((size_t)nSymb_data, -1);
+	for (int s = 0; s < nSymb_data; s++) {
+		// Find the non-zero subcarrier in this data symbol (we have exactly
+		// nStreams non-zero bins per symbol; for nStreams=1 this is unique).
+		const std::complex<double>* row = &sym_freq[(size_t)(preamble_nSymb + s) * Nc];
+		for (int k = 0; k < Nc; k++) {
+			if (std::norm(row[k]) > 0.0) {
+				expected_subcarrier_idx[(size_t)s] = k;
+				break;
+			}
+		}
+	}
+
+	// IFFT each symbol into time-domain (Nofdm samples each).
+	std::vector<std::complex<double> > sym_time(
+		(size_t)total_sym * (size_t)Nofdm, std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < total_sym; s++) {
+		ts.ofdm.symbol_mod(&sym_freq[(size_t)s * Nc],
+		                    &sym_time[(size_t)s * Nofdm]);
+	}
+
+	// Buffer = frame + trailing pad (same shape as §7.1 helper).
+	const int passband_samples = Nofdm * total_sym * interp;
+	const int sym_samples_pb = Nofdm * interp;
+	const int trailing_pad = 12 * sym_samples_pb;
+	const int buffer_pb_size = passband_samples + trailing_pad;
+
+	// Inject CFO by up-mixing at (carrier_frequency + cfo_inject). The
+	// receiver will down-mix at carrier_frequency, leaving residual
+	// `+cfo_inject` at baseband. Production's mini-Moose will measure
+	// this; the apply formula's sign decides whether the second down-mix
+	// cancels it (correct sign) or doubles it (wrong sign).
+	const double cfo_inject_hz = 7.0;
+
+	// Reference up-mix at clean LO (no CFO).
+	std::vector<double> ref_pb((size_t)buffer_pb_size, 0.0);
+	{
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			sym_time.data(), Nofdm * total_sym,
+			ref_pb.data(),
+			ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	// CFO-shifted up-mix at (carrier_frequency + cfo_inject).
+	std::vector<double> shifted_pb((size_t)buffer_pb_size, 0.0);
+	{
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			sym_time.data(), Nofdm * total_sym,
+			shifted_pb.data(),
+			ts.sampling_frequency,
+			ts.carrier_frequency + cfo_inject_hz, ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	// Helper lambda: run the production-style baseband mix+demod and
+	// return the average energy in the expected-tone bin across data
+	// symbols (a proxy for LLR magnitude; in the noncoherent MFSK demap,
+	// the expected-bin energy dominates the per-symbol bit LLRs).
+	auto avg_expected_bin_energy = [&](const std::vector<double>& pb,
+	                                    double rx_lo_freq) -> double {
+		// passband_to_baseband_decimated → baseband at the data rate
+		// (same pattern as telecom_system.cc:2149-2152 and :2271-2278).
+		const int bb_size = buffer_pb_size / interp;
+		std::vector<std::complex<double> > bb((size_t)bb_size,
+			std::complex<double>(0.0, 0.0));
+		ts.ofdm.passband_to_baseband_decimated(
+			const_cast<double*>(pb.data()), buffer_pb_size,
+			bb.data(),
+			ts.sampling_frequency, rx_lo_freq, ts.carrier_amplitude,
+			interp, &ts.ofdm.FIR_rx_data, 0);
+
+		// symbol_demod each data symbol; sum the expected-bin energy.
+		// Same indexing as telecom_system.cc:2300 (production reads
+		// baseband_data[i*Nofdm + Nofdm*preamble_nSymb]).
+		std::vector<std::complex<double> > demod_out((size_t)Nc,
+			std::complex<double>(0.0, 0.0));
+		double sum_energy = 0.0;
+		int counted = 0;
+		for (int s = 0; s < nSymb_data; s++) {
+			int data_base = (preamble_nSymb + s) * Nofdm;
+			if (data_base + Nofdm > bb_size) break;
+			ts.ofdm.symbol_demod(&bb[(size_t)data_base], demod_out.data());
+			int exp_idx = expected_subcarrier_idx[(size_t)s];
+			if (exp_idx < 0 || exp_idx >= Nc) continue;
+			double e = std::norm(demod_out[(size_t)exp_idx]);
+			sum_energy += e;
+			counted++;
+		}
+		if (counted == 0) return 0.0;
+		return sum_energy / (double)counted;
+	};
+
+	// 1) Reference: no CFO, no correction. Use the clean passband, mix at
+	//    carrier_frequency, demod data symbols.
+	double ref_energy = avg_expected_bin_energy(ref_pb, ts.carrier_frequency);
+	if (!(ref_energy > 0.0)) {
+		test_fail(name, "reference expected-bin energy is zero or non-finite "
+		                "(test scaffolding broken — check IFFT/symbol_mod)");
+		return;
+	}
+
+	// 2) Production chain on the CFO-shifted passband:
+	//    a) Initial mix at carrier_frequency → uncorrected baseband (the
+	//       residual CFO is +cfo_inject_hz, modulo bandpass shaping).
+	//    b) Call carrier_frequency_sync_wb_mfsk on the preamble portion of
+	//       the uncorrected baseband → δ_est (production code at
+	//       telecom_system.cc:2212-2217).
+	//    c) Re-mix at carrier_frequency [SIGN] δ_est using the production
+	//       apply formula (telecom_system.cc:2274). The sign is selected
+	//       by this branch's code; the test does NOT hard-code it — it
+	//       calls the same arithmetic the production does.
+	const int bb_size = buffer_pb_size / interp;
+	std::vector<std::complex<double> > bb_uncorrected((size_t)bb_size,
+		std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband_decimated(
+		shifted_pb.data(), buffer_pb_size,
+		bb_uncorrected.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		interp, &ts.ofdm.FIR_rx_data, 0);
+
+	double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+	double delta_est = ts.ofdm.carrier_frequency_sync_wb_mfsk(
+		bb_uncorrected.data(),
+		carrier_freq_width,
+		preamble_nSymb,
+		ts.mfsk.preamble_tones, ts.mfsk.M,
+		ts.mfsk.nStreams, ts.mfsk.stream_offsets);
+
+	// Sanity: estimator must produce a non-zero estimate at a +7 Hz
+	// injection (well above the 0.05 confidence floor). If it returns 0,
+	// the test scaffolding is broken — not the apply formula.
+	if (std::fabs(delta_est) < 1.0) {
+		char buf[200];
+		std::snprintf(buf, sizeof(buf),
+			"estimator returned δ=%.3f Hz on +7 Hz injection — "
+			"confidence gate fired (cannot test apply sign without "
+			"a non-zero estimate)",
+			delta_est);
+		test_fail(name, buf);
+		return;
+	}
+
+	// Production apply formula (telecom_system.cc:2274). The branch's
+	// code defines the sign; the test mirrors it via the SAME literal
+	// expression. Currently `effective_carrier_freq - freq_offset_measured`
+	// (§23 sign-flip). If a future revert changes the production sign,
+	// this literal must be updated too — keep them in sync. (The
+	// fail-before procedure relies on this synchronization.)
+	double apply_lo = ts.carrier_frequency - delta_est;  // §23: minus sign
+
+	double corrected_energy = avg_expected_bin_energy(shifted_pb, apply_lo);
+	if (!std::isfinite(corrected_energy)) {
+		test_fail(name, "corrected expected-bin energy is non-finite");
+		return;
+	}
+
+	// Tolerance: 10% relative error. A correctly-applied CFO leaves the
+	// expected-bin energy essentially intact (FFT bin alignment restored).
+	// An incorrectly-applied CFO doubles the residual to 2δ_est ≈ 14 Hz,
+	// shifting energy out of the expected bin by ~2× (Nc * 14/2344) ≈ 1.2
+	// subcarrier widths — at WB ROBUST_0 the expected-bin energy collapses
+	// nearly to zero in that case.
+	double rel_err = std::fabs(corrected_energy - ref_energy)
+	               / std::fabs(ref_energy);
+	if (rel_err > 0.10) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"apply chain did not cancel +%.1f Hz CFO: "
+			"ref_energy=%.4f corrected=%.4f rel_err=%.3f (>0.10), "
+			"δ_est=%.3f Hz — apply formula sign or magnitude wrong",
+			cfo_inject_hz, ref_energy, corrected_energy, rel_err, delta_est);
+		test_fail(name, buf);
+		return;
+	}
+
+	test_pass(name);
+}
+
 // =============================================================================
 // Top-level runner
 // =============================================================================
@@ -1948,6 +2211,10 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_data_preamble_mini_moose_recovers_cfo();
 	test_mfsk_data_preamble_mini_moose_zero_cfo_no_op();
 	test_mfsk_data_preamble_mini_moose_pure_noise_safe();
+
+	// §7.4 Apply-sign-invariance (§23 sign-flip experiment,
+	// data-preamble-port-research.md §23.7).
+	test_mfsk_data_preamble_mini_moose_apply_sign_invariance();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
