@@ -1758,3 +1758,203 @@ Mirror-bin drop alone (without the T=6 push) STILL hurts at the cliff cells (-31
 - §15.8 §3 path is closed.
 - §15.8 §2 (mirror-bin tightening with instrumentation FIRST) could revisit if someone wants — but the hardware result here is strong evidence the mirror IS load-bearing, so the instrumentation would just confirm what we now know.
 - Further cliff push at the data-preamble layer probably needs Option B (hybrid metric, research §4) or a different angle (preamble alphabet redesign, mini-Moose before each frame).
+
+---
+
+## §18. Option B (hybrid metric) feasibility study (2026-05-28)
+
+**Status:** RESEARCH ONLY. **Recommendation: DROP Option B.** The hypothesis
+that motivated Option B ("discrete-match Phase-2 is coarser than the old
+cosine² Phase-2, so adding cosine² as a precision gate buys 0.5–1 dB at
+the cliff") is structurally false: the OLD and NEW detectors achieve
+identical sample-alignment precision. Option B has zero headroom.
+
+This section documents the audit so the decision sticks.
+
+### §18.1 Phase-2 step size — OLD cosine² vs NEW discrete-match
+
+Read the post-merge `time_sync_mfsk_corr` body
+(`source/physical_layer/ofdm.cc:3040-3266`):
+
+- **Phase-1 coarse scan** (`ofdm.cc:3077`): outer loop
+  `for (int s = s_start; s <= buffer_nsymb - preamble_n; s++)` — step =
+  1 symbol = `sym_period_interp` = `Nofdm * interpolation_rate` =
+  `292 * 4` = **1168 full-rate samples** per candidate.
+- **Phase-2 fine refinement** (`ofdm.cc:3180`):
+  `for (int d = coarse_offset - search_half; d <= coarse_offset + search_half; d += interpolation_rate)`
+  — step = `interpolation_rate` = 4 full-rate samples = **1 base-rate sample**.
+- Total Phase-2 window width: `2 * search_half = sym_period_interp` =
+  1168 full-rate samples (covers ± half-symbol around the coarse winner).
+- **Reported `delay` precision**: ±`interpolation_rate / 2` = ±2 full-rate
+  samples = ±0.5 base-rate samples.
+
+§1.1 of THIS document records the OLD `time_sync_mfsk_corr` body:
+> "Phase 2 — fine refinement at base-rate (`ofdm.cc:3159-3224`): For each
+> top-K candidate, search ±sym_period_interp at `interpolation_rate` step
+> (base-rate resolution)."
+
+The OLD cosine² Phase-2 step was ALSO `interpolation_rate`. **Both
+detectors achieve the same ±2 full-rate-sample alignment.** The only
+difference is Phase-1 — the OLD cosine² had P1_OVERSAMPLE=4 giving 4×
+finer coarse candidate selection (`sym_period_interp/4` = 292 full-rate
+samples). Phase 2's ±half-symbol window absorbs Phase-1 coarseness in
+both cases — Phase 1 only controls which Phase-2 window gets searched,
+not the final precision.
+
+**The premise of Option B is structurally wrong.** The OLD cosine²
+metric was NEVER giving sub-base-rate-sample precision; the
+`interpolation_rate` step was the floor for both detectors.
+
+### §18.2 Downstream alignment sensitivity (MFSK noncoherent FFT-energy demap)
+
+Sole consumer of the returned `delay`:
+`cl_telecom_system::receive_msg` at `telecom_system.cc:1037-1041` (writes
+`receive_stats.delay`). Frame extraction at lines 2120-2154 reads
+`extraction_delay = receive_stats.delay` and copies `frame_dec` samples
+into `baseband_data`. The MFSK data symbols are then demapped at
+exactly the delay position:
+
+- `telecom_system.cc:2249` — `ofdm.symbol_demod(&baseband_data[i*Nofdm + Nofdm*preamble_nSymb], …)`
+  reads symbol `i` from `baseband_data` at offset `(preamble_nSymb + i) *
+  Nofdm`. No per-symbol re-sync. `symbol_demod` is GI-strip → FFT →
+  zero-depad (`ofdm.cc:661-666`).
+- `mfsk.demod` at `mfsk.cc:965+` reads `fft_in[s * Nc + stream_offsets[st] + m]`
+  — single FFT bin per tone, noncoherent energy LLR. No channel estimate,
+  no phase reference, no per-symbol pilot.
+
+**Per-sample misalignment LLR-SNR cost:**
+
+For MFSK noncoherent FFT-energy demap with GI absorbing timing slop:
+- GI = Ngi = 36 baseband samples = `Ngi * interpolation_rate` = 144
+  full-rate samples (per Mercury memory `Default GI 3.0ms`).
+- Phase-2 worst-case misalignment after refinement: ±2 full-rate
+  samples = ±0.5 base-rate samples.
+- 0.5 base-rate samples / 36 baseband-sample GI = 1.4% of GI. The
+  symbol sits squarely inside the FFT window; no inter-symbol leakage.
+- Per-bin energy loss from windowed sinc misalignment:
+  `sinc²(Δ_base_rate / Nfft) = sinc²(0.5 / 256)` ≈ 1 − (π·0.5/256)² /3
+  ≈ 1 − 1.27×10⁻⁵ — **less than 0.0001 dB per FFT bin**.
+- The LLR magnitude depends on `E_target / noise_var`; both numerator and
+  denominator see the same misalignment → cancellation → loss approaches 0.
+
+**Bottom line: at the Phase-2 step-floor of ±2 full-rate samples, the
+MFSK LLR SNR penalty is < 0.001 dB.** Below any conceivable
+measurement.
+
+### §18.3 What Option B could theoretically buy
+
+To find an interesting "alignment gap" we'd need the new detector to be
+deliver MEASURABLY worse alignment than the old. As §18.1 establishes,
+they are equal. The only way Option B (adding cosine² as a precision
+gate) could deliver dB is if it interpolated between Phase-2 samples
+to get SUB-base-rate precision (parabolic peak fit). That's a
+different mechanism from raw cosine² scoring — call it Option B'.
+
+Option B' (parabolic fit on cosine² Phase-2 surface): would move the
+±2 full-rate misalignment to ~±0.5 full-rate samples. Per §18.2 math:
+LLR SNR penalty drops from <0.001 dB to <0.0001 dB. **Still nothing.**
+
+The MFSK demap chain is fundamentally insensitive to sub-symbol
+alignment as long as the symbol sits inside its GI-bounded window
+(it does: 2 full-rate samples << 144-sample GI).
+
+### §18.4 Hardware A/B noise floor vs Option B headroom
+
+Hardware A/B baseline variance from prior experiments:
+- §17.1/§17.2 mirror-bin A/B passes: per-cell variation ±20–50%
+  (e.g., baseline +14 mean was 2.0 in §17.1, 1.5 in §17.2 — the
+  SAME branch produced different absolute throughput on different
+  runs).
+- A.0.2 Moose clamp 2× hardware A/B (memory): "total bytes −28% and a
+  clean-cell CONNECT failure at WGN:14 that baseline didn't have."
+  Single-cell variance was ~±2 dB.
+
+Option B's theoretical headroom: <0.001 dB.
+Hardware A/B variance: ±2 dB per cell.
+
+**Headroom : noise floor ratio ≈ 1 : 2000.** Even an ideal Option B
+implementation would be 100% indistinguishable from noise in the IONOS
+hardware loop. We could ship Option B and never know if it helped or
+hurt — that's the definition of below-the-noise-floor work.
+
+### §18.5 Counterargument — could mirror-bin acceptance be a confound?
+
+§17 found mirror-bin acceptance is empirically load-bearing on IONOS
+WB. Could mirror-bin be hiding a deeper alignment problem that Option
+B would reveal? No, because:
+
+- Mirror-bin operates on a DIFFERENT axis (which bin to count, not
+  where in time to sample).
+- The mirror-bin hit rate depends on residual CFO and FIR image
+  rejection — both INDEPENDENT of time-alignment precision.
+- If we had a time-misalignment-sensitive demap, mirror-bin would not
+  rescue it (mirror is a frequency-domain phenomenon, not time-domain).
+
+The §17 result tells us about CFO/image leakage on the WB IONOS
+channel, NOT about timing precision. Option B cannot capture that
+either.
+
+### §18.6 What COULD move the cliff further
+
+Per §17.4, viable next axes (NOT Option B):
+- Preamble alphabet redesign (Costas-property optimized for IONOS
+  fading correlation structure).
+- Mini-Moose before each frame to suppress residual CFO that's
+  leaking into the mirror bin.
+- E3 LLR clip 20→40 (deferred per memory).
+- Different channel-coding (BP+OSD branch already shipped, NULL delta
+  — LDPC isn't the bottleneck).
+
+None of these are "Option B" by any of the §4 (a)/(b)/(c) definitions.
+
+### §18.7 Drop decision and rationale
+
+**DROP Option B.** The §4 §1.1 §1.2 facts establish:
+1. OLD cosine² and NEW discrete-match have **identical Phase-2 sample
+   precision** (`interpolation_rate` step, ±2 full-rate samples).
+2. MFSK noncoherent FFT-energy demap has < 0.001 dB sensitivity to
+   misalignment within the GI.
+3. Hardware A/B noise floor is ±2 dB per cell.
+4. Option B's theoretical ceiling is < 0.01 dB. Ratio to noise floor:
+   <1:200.
+
+Per the CLAUDE.md §1 prior-art mandate, the hypothesis would also
+need a citation — and there is no prior art for "noncoherent MFSK
+data demap is sub-symbol-alignment sensitive at base-rate
+resolution" because it isn't.
+
+No worktree, no branch, no commits. Hand back to operator for one of
+the §18.6 alternative axes.
+
+### §18.8 Cross-layer audit note (CLAUDE.md §5)
+
+No code change → no producers/consumers to audit. This section is the
+audit record. The §10 audit in `data-flow-preamble_nSymb.md` remains
+the authoritative producer/consumer walk for the data preamble path.
+
+### §18.9 Open questions [?]
+
+None for Option B itself. Two adjacent questions surface:
+1. **[?] Should P1_OVERSAMPLE be re-introduced into Option A?** Per
+   §18.1, the NEW Phase-1 step is 4× coarser than the OLD. The
+   ±half-symbol Phase-2 window absorbs this, but if a Phase-1
+   candidate is suppressed by FAR/threshold and the next coarse
+   candidate is a full symbol away, the second Phase-2 window won't
+   overlap the missed preamble center. Hardware A/B at WGN:-8 shows
+   Option A WORKS, so this isn't a practical bug. Skip unless cliff
+   pushes need it.
+2. **[?] Is sub-base-rate timing precision ever needed?** OFDM
+   configs (CONFIG_0..16) — possibly, since OFDM uses coherent
+   per-pilot channel estimation. But that path uses
+   `time_sync_preamble_halfsym` (Schmidl-Cox), not
+   `time_sync_mfsk_corr`. Out of scope here.
+
+### §18.10 Cross-references
+
+- §1.1, §1.2 — OLD detector body and NEW detector body, Phase-2 step.
+- §4 — original Option A/B/C ranking.
+- §14 — Option A ship log.
+- §17 — mirror-bin drop hardware verdict.
+- `data-flow-preamble_nSymb.md` §10 — discrete-match producer/consumer audit.
+- Memory `feedback_dsp_commit_patterns.md` — "magic numbers without
+  measurement basis" warning. Option B would have been one if shipped.
