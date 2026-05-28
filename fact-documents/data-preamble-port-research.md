@@ -2200,3 +2200,420 @@ point, the clean closeout is:
 - Memory `mfsk_vara_parity_audit_2026_05_25.md` — strategic context
   for which dB pushes are worth chasing.
 
+---
+
+## §20. Mini-Moose implementation plan (pre-code, 2026-05-28)
+
+**Status:** PLAN — to be implemented on branch `feat/mini-moose` in worktree
+`mercury-worktrees/mini-moose`. Baseline `a879e0e` (HEAD of monitor at start
+of this work, all 22 `mercury.exe --test` tests pass). The work item is the
+§19 recommendation: add a mini-Moose CFO refinement that runs AFTER
+`time_sync_mfsk_corr` returns a sample-level `delay`, BEFORE `mfsk.demod`
+consumes the audio. With the residual CFO removed, signal energy lives in
+the expected FFT bin and the §17 empirical "mirror-bin is load-bearing"
+finding (the direct hardware signature of zero MFSK CFO sync) should
+disappear.
+
+User-confirmed scope (per the autonomous-run rules):
+
+1. **Hard cutover** — no negotiation, no CAP bit. Matches Phase B / Option A.
+2. **MFSK data preamble only** — DON'T touch CONNECT / HAIL / ACK paths.
+   Those use `detect_ack_pattern` (a separate detector), have separate
+   per-call CFO behavior, and were proven on hardware down to WGN:-10.
+3. **Reuse the cross-symbol-phase math of `carrier_frequency_sync_nb`** —
+   adapt to WB Welch-Costas geometry as a NEW function
+   `carrier_frequency_sync_wb_mfsk` rather than parameterizing the
+   existing NB function (lower risk).
+4. **No new INI / CLI knobs** — fixed parameters baked in.
+
+### §20.1 Where the new estimator runs (call site)
+
+The MFSK RX hot path in `cl_telecom_system::receive_msg` runs in this order
+(`telecom_system.cc`):
+
+| Line | Action |
+|---|---|
+| 1037 | `time_sync_mfsk_corr` returns full-rate `delay` from the matched-bin detector |
+| 2120-2155 | Build `baseband_data` for the frame: `passband_to_baseband_decimated` mixes from passband to baseband using `carrier_frequency + coarse_freq_offset` and FIR-decimates. `baseband_data[0..(Nsymb+preamble_nSymb)*Nofdm-1]` now contains preamble + data at baseband, decimated rate. |
+| 2168-2193 | Frequency-sync block. WB-OFDM calls `carrier_sampling_frequency_sync` (Moose), NB stubs `freq_offset_measured = 0`. Line **2193**: `if (M == MOD_MFSK) freq_offset_measured = 0;` overrides any value left by the OFDM branches. |
+| 2195-2218 | Sanity clamp (±2 subcarrier spacings) + reject (continue to next sync trial). |
+| 2220-2244 | Apply correction: if `M == MOD_MFSK` skip (current behavior); else if `fabs(freq_offset_measured) > freq_offset_ignore_limit`, re-mix from passband with `effective_carrier_freq + freq_offset_measured`. This rewrites `baseband_data` with the CFO-corrected signal. |
+| 2247-2250 | Per-symbol `symbol_demod` (GI-strip → FFT → depad) for each of `get_active_nsymb()` data symbols, reading `baseband_data[i*Nofdm + Nofdm*preamble_nSymb]`. |
+| 2253-2257 | `mfsk.demod` reads the FFT-domain symbols and emits LLRs. |
+
+**Mini-Moose insertion site:** REPLACE the contents of the bare-statement
+`if (M == MOD_MFSK) freq_offset_measured = 0;` at line 2193. The new code
+estimates residual CFO from `baseband_data[0..preamble_nSymb*Nofdm-1]`
+(the preamble portion of the freshly-mixed frame) via the new
+`carrier_frequency_sync_wb_mfsk` and stores the result in
+`freq_offset_measured`. The existing sanity / clamp / re-mix block at
+2195-2244 already does the right thing as long as we let
+`freq_offset_measured` carry a value for MFSK:
+
+- §1: the ±2 subcarrier sanity clamp will reject any wild estimate (e.g.
+  a noise-driven artifact) and re-trigger `continue` to the next sync trial.
+  Identical safety net to the WB-OFDM Moose path.
+- §2: the `else if(fabs(freq_offset_measured) > ofdm.freq_offset_ignore_limit)`
+  branch currently has an `if(M == MOD_MFSK)` skip at 2220. We change that
+  block so MFSK ALSO re-mixes the frame from passband with the corrected
+  `effective_carrier_freq + freq_offset_measured`. This is the same fused-
+  polyphase code as the OFDM branch — just remove the MFSK skip.
+
+This keeps ALL invariants of the surrounding code identical: same clamp,
+same reject path, same re-mix entry-point, same per-symbol FFT consumer.
+The only behavioral change is "for MFSK the freq offset is no longer
+hard-zeroed".
+
+### §20.2 The estimator algorithm
+
+Mercury already has the cross-symbol-phase technique in
+`carrier_frequency_sync_nb` (`ofdm.cc:537+`). Per §19.3, the technique
+works on any pilot-rich symbol — including the M=32 Welch-Costas WB MFSK
+preamble. The adaptation needed:
+
+**NB OFDM preamble** has Nc=10 subcarriers, all loaded, with known
+modulation (`ofdm_preamble[sym*Nc+k].value`). The estimator:
+1. FFT each preamble symbol.
+2. Strip known modulation: `H[k] = X_recv[k] * conj(known[k])`.
+3. Cross-correlate adjacent symbols: `C += H_cur[k] * conj(H_prev[k])`.
+4. Phase of C corresponds to CFO * T_symbol. Solve for CFO.
+
+**WB MFSK preamble** has Nc=50 subcarriers; only `nStreams` of them
+carry the (single) Welch-Costas tone per symbol. The known-modulation
+amplitude is known (`amp = sqrt(Nc/nStreams)`, see `mfsk.cc:500`), the
+phase is +1 (real). Across the 16-symbol preamble, the tone position
+HOPS — symbol `s` puts power into bin `preamble_tones[s % preamble_nSymb]`
+within each stream's band. The cross-symbol-phase math still works, but
+we cannot correlate `H[k]` between adjacent symbols at the SAME bin k
+because the tone position moves.
+
+**The fix is per-bin cross-symbol correlation, evaluated at the bin
+that's "lit" in BOTH symbols.** When symbol s and symbol s-1 put energy
+into different bins, that pair contributes 0. When they put energy into
+the same bin (which happens every `preamble_nSymb / 8 = 2` symbols on
+average because the 8-tone Welch-Costas base repeats every 8 symbols,
+giving 7 same-bin neighbor pairs across the 16-symbol expansion), the
+phase difference encodes CFO.
+
+But a simpler equivalent that avoids enumerating same-bin pairs:
+
+**Cross-symbol correlation on the COMPLEX FFT-bin VALUE at each symbol's
+EXPECTED tone bin, regardless of the bin moving.** Define:
+  X[s] = (sum of FFT-bin values at the expected tone bin for symbol s,
+          summed across streams)
+Then:
+  C = sum over s = 1..preamble_nSymb-1 of  X[s] * conj(X[s-1])
+       * exp(j * 2π * (f_s - f_{s-1}) * (something))
+
+No — the bin-frequency shift between adjacent symbols contributes a
+deterministic phase that has nothing to do with CFO. We'd have to
+subtract it.
+
+**Cleaner design — REUSE the NB technique by treating each preamble
+symbol's expected-tone bin as a "pilot" and pre-multiplying by the
+KNOWN tone-frequency rotation.** Since each preamble symbol is a CW
+tone at a known frequency, the residual CFO manifests as a per-symbol
+phase rotation that's IDENTICAL for every symbol (CFO is constant
+across the preamble). The cross-symbol phase difference is:
+
+  arg(X[s] * conj(X[s-1])) = 2π * (CFO + f_tone[s] - f_tone[s-1]) * T_sym
+
+where f_tone[s] is the s-th preamble tone's baseband frequency
+(known). Subtracting the known-tone term gives:
+
+  CFO = (arg(X[s] * conj(X[s-1])) - 2π * (f_tone[s] - f_tone[s-1]) * T_sym) / (2π * T_sym)
+
+Equivalently, pre-de-rotate X[s] by exp(-j * 2π * f_tone[s] * T_sym * s)
+so all preamble symbols look "modulationless"; then the cross-symbol
+phase difference is purely CFO * T_sym, identical to the NB Moose math.
+
+Implementation:
+```
+for s = 0..preamble_nSymb-1:
+  symbol_bb = baseband_data[s * Nofdm .. s * Nofdm + Nfft - 1]  (skip Ngi)
+  fft(symbol_bb, fft_out)
+  bin = expected FFT bin for preamble_tones[s % preamble_nSymb]
+        across nStreams streams
+  X[s] = sum over streams of fft_out[bin]
+  X[s] *= exp(-j * 2π * tone_freq[s] * T_sym * s)  // de-rotate known modulation
+C = sum over s >= 1 of X[s] * conj(X[s-1])
+CFO_residual = arg(C) / (2π * T_sym)
+```
+
+Sanity: confidence gate identical to NB (`|C| / energy_total < 0.05`
+returns 0). Capture range: ±1/(2 * T_sym) = ±fs_base / (2*Nofdm).
+
+For WB ROBUST_0 (Nofdm = Nfft + Ngi = 256 + 36 = 292), fs_base =
+sampling_frequency / interpolation_rate = 12000/4 = 3000 Hz. Capture
+range = ±3000/(2*292) = **±5.14 Hz**. WAIT — too narrow.
+
+**This is the math problem of using NB-style cross-symbol phase on WB:
+the WB symbol period is longer (Nofdm = 292 vs ~Nfft+Ngi for NB), so the
+unambiguous phase per symbol corresponds to a smaller frequency range.**
+
+OK, so use a SHORTER baseline. Cross-correlate symbols that are 1 sym
+apart for high precision (±5 Hz capture), AND symbols that are 8 sym
+apart for sub-Hz precision. NO — we want the OPPOSITE: a wider capture
+range. Use HALF-symbol cross-correlation (every-2-symbol-period
+repetition):
+
+**Welch-Costas g=2 base has period 8 (8 distinct tones, then repeats).
+The 16-symbol expansion is base × 2 reps. So symbol s and symbol s+8
+have the SAME tone. The phase difference between X[s] and X[s+8]
+under constant CFO is:**
+
+  arg(X[s+8] * conj(X[s])) = 2π * CFO * 8 * T_sym
+
+Capture range: ±1/(2 * 8 * T_sym) = **±0.64 Hz**. Worse — longer
+baseline means tighter range. We need SHORTER baselines for wider
+capture.
+
+**Final design: cross-symbol-phase with baseline = 1 symbol, with the
+known-tone de-rotation that subtracts the per-symbol modulation phase.**
+Capture range = ±5.14 Hz. This is below the WB Moose ±2-subcarrier
+clamp (±93.75 Hz) but ABOVE the §6.7 expected residual CFO budget after
+the coarse-sync pre-mix:
+
+- §6.7 of `phase-b-mfsk-connect-research.md` notes that the coarse
+  carrier-freq search on the MFSK path produces an estimate at ±~3 Hz
+  granularity, and the residual is typically ≤5 Hz.
+- The memory entry "~11 Hz frequency offset between stations" refers
+  to the TOTAL frequency offset between SGTL5000 crystals — the
+  coarse-sync at `telecom_system.cc:2117` adds `coarse_freq_offset`
+  to the carrier before the data re-mix at :2149. After that, the
+  RESIDUAL CFO entering the mini-Moose is just whatever the coarse
+  sync missed.
+- For IONOS WGN cells we're targeting (WGN:-8 to -12), the coarse
+  sync metric degrades, residual CFO grows. A ±5 Hz capture range
+  may not be enough at the worst cells.
+
+**Wider-capture alternative:** use a HALF-SYMBOL baseline. Each WB MFSK
+preamble symbol is one CW tone for the full Nofdm samples. The CW tone's
+phase advances LINEARLY across the symbol. Take the FIRST half-Nfft of
+the symbol and the SECOND half, treating them as two "mini-symbols":
+
+  half_a[k] = FFT of bb[s*Nofdm + Ngi .. s*Nofdm + Ngi + Nfft/2 - 1] (padded to Nfft)
+  half_b[k] = FFT of bb[s*Nofdm + Ngi + Nfft/2 .. s*Nofdm + Ngi + Nfft - 1] (padded)
+
+phase(half_b * conj(half_a)) at the expected tone bin = 2π * CFO * T_half_sym
++ deterministic-known-tone-rotation. Subtract known, solve for CFO.
+
+T_half_sym = (Nfft/2) / fs_base = 128/3000 = 42.67 ms. Capture range
+= ±1/(2 * 0.04267) = **±11.7 Hz**. STILL might be too narrow for
+worst-case IONOS, but it's now > the §6.7 budget.
+
+**DECISION:** ship the half-symbol-baseline variant. Capture ±11.7 Hz,
+which covers crystal mismatch (~11 Hz per memory) PLUS the coarse-sync
+residual. If hardware A/B shows the cliff DOESN'T move at WGN:-10
+because CFO at the cliff exceeds ±12 Hz, that's a follow-up axis
+(go to a 3-baseline estimator combining halves + 1-sym + 2-sym for
+ambiguity resolution).
+
+Math reference: Moose 1994 (already cited at `ofdm.cc:532`), same
+half-symbol technique used for OFDM WB Moose at `ofdm.cc:474` —
+mini-Moose for MFSK is structurally the same algorithm, just adapted
+to the MFSK preamble's CW-tone shape instead of the WB preamble's
+every-other-subcarrier shape.
+
+### §20.3 How CFO is APPLIED
+
+Mercury already has the correction infrastructure. After the existing
+`passband_to_baseband_decimated` produces `baseband_data` at
+`effective_carrier_freq = carrier_frequency + coarse_freq_offset`, the
+OFDM-data path at `telecom_system.cc:2224-2244` re-mixes from passband
+with `effective_carrier_freq + freq_offset_measured` if Moose returned
+a nontrivial value:
+
+```cpp
+ofdm.passband_to_baseband_decimated(&data[pb_start], pb_size,
+    data_container.baseband_data_interpolated,
+    sampling_frequency,
+    effective_carrier_freq + freq_offset_measured,  // <-- corrected mix
+    carrier_amplitude,
+    Mdec, &ofdm.FIR_rx_data, pb_start);
+for(int i = 0; i < frame_dec; i++)
+    data_container.baseband_data[i] =
+        data_container.baseband_data_interpolated[margin_dec + i];
+```
+
+**The fix:** remove the `if(M == MOD_MFSK) {/* skip */}` guard at line
+2220. Both OFDM and MFSK now run the re-mix when
+`fabs(freq_offset_measured) > freq_offset_ignore_limit` (typically
+~3 Hz). For sub-threshold residuals, the re-mix is skipped and the
+existing `baseband_data` is used as-is (matches OFDM's behavior).
+
+This is structurally clean because the new estimator produces its
+result EARLIER (right at line 2193 where it replaces the hard-zero)
+and the existing apply-block at 2224-2244 already handles the rest.
+We touch exactly two sites: the estimator call (replacing the line
+2193 zero) and the re-mix guard (removing the MFSK skip at 2220-2223).
+
+### §20.4 Cross-layer state touched
+
+ONLY `freq_offset_measured` (a function-scope local in `receive_msg`,
+declared at `telecom_system.cc:810`). Let me audit:
+
+| Producer | Site | Behavior pre-fix | Behavior post-fix |
+|---|---|---|---|
+| `ofdm_forced_delay >= 0` (BER test) | :2162 | = 0 | = 0 (unchanged; mini-Moose not run when ofdm_forced_delay set) |
+| `use_last_good_freq_offset` cache hit | :2166 | from cache | from cache (unchanged) |
+| `narrowband_enabled` branch | :2177 | = 0 | = 0 (unchanged — NB MFSK out of scope) |
+| WB OFDM branch | :2188 | Moose nIS=4 | Moose nIS=4 (unchanged) |
+| MFSK override | :2193 | = 0 always | **= carrier_frequency_sync_wb_mfsk(...) residual** for WB MFSK; = 0 for NB MFSK (out-of-scope) |
+
+| Consumer | Site | Behavior pre-fix | Behavior post-fix |
+|---|---|---|---|
+| Sanity clamp + REJECT trial | :2195-2218 | clamp + reject when |freq| > ±2 subcarriers | Same. Now applies to MFSK too. The reject path advances `sync_trials++` and `continue`s — identical safety. |
+| Re-mix MFSK skip | :2220-2223 | skip — no re-mix for MFSK | **DROPPED** — MFSK now re-mixes when |freq_offset_measured| > limit |
+| Re-mix OFDM-fine | :2224-2244 | re-mix passband with offset | Same for OFDM; ALSO triggers for MFSK when above ignore_limit |
+| OFDM-OK log line | :2708-2712 | prints freq_offset_measured for OFDM only | OFDM only (MFSK doesn't reach this log path); no change |
+| Cache update | :2742-2745 | `freq_offset_of_last_decoded_message = freq_offset_measured` for non-MFSK ONLY | Unchanged — `if(M != MOD_MFSK)` guard preserves MFSK's no-cache behavior so the residual doesn't get applied to a subsequent OFDM gearshift |
+
+The cache-guard at :2742 is critical — without it, an MFSK residual CFO
+could leak into the OFDM `use_last_good_freq_offset` path (line 2164,
+applied on `sync_trials == max`). Preserved verbatim.
+
+### §20.5 Why CONNECT / HAIL / ACK paths are NOT touched
+
+- CONNECT / HAIL / ACK detection goes through `cl_ofdm::detect_ack_pattern`
+  (`ofdm.cc:3231+`), called from various per-pattern functions in
+  `arq_common.cc` and `arq_*.cc`. NONE of these call
+  `time_sync_mfsk_corr`. They have their own argmax-bin detection and
+  return their own delay metrics; no shared state.
+- The Phase B MFSK CONNECT suffix decode does NOT go through the
+  data-preamble path either — it's a SUFFIX appended to a pattern frame,
+  decoded by `decode_suffix_tones` (`ofdm.cc:3567+`). Mini-Moose for
+  the data preamble would NOT touch any of this.
+- BREAK detection is also `detect_ack_pattern`. Untouched.
+- The §17 hardware verdict that proved control-frame detection works
+  down to WGN:-10 used CURRENT (unrefined) CFO behavior — adding a
+  fine-CFO refinement to data preamble alone preserves that proven
+  behavior.
+
+### §20.6 The fail-before-passes regression test
+
+Following §19.4, adapted to the actual code structure:
+
+**Test A: `mfsk_data_preamble_mini_moose_recovers_cfo` (POSITIVE,
+FAIL-BEFORE-PASSES on monitor's pre-fix code).**
+
+```
+- load_configuration(ROBUST_0).
+- Synthesize preamble + AWGN at sigma_pb = 3 × preamble_rms (in-band
+  SNR ≈ -2 dB, comfortably above the §6.2 cliff).
+- BEFORE the preamble passes through passband_to_baseband, INJECT a
+  known CFO_in (e.g. +7 Hz) by multiplying the passband by cos(2π * CFO_in * t).
+- Run time_sync_mfsk_corr to locate the preamble (succeeds — the
+  detector accepts mirror-bin).
+- THEN call carrier_frequency_sync_wb_mfsk on the baseband-data slice
+  starting at delay.
+- Assert |estimated_CFO - CFO_in| < 1.5 Hz across 5 PRNG seeds.
+
+Pre-fix: the symbol does not exist (the function isn't written).
+Test FAILS at the link step or with a "symbol not found" error.
+After-fix: symbol exists, CFO recovered, test PASSES.
+```
+
+**Test B: `mfsk_data_preamble_mini_moose_zero_cfo_no_op` (POSITIVE,
+NO-REGRESSION guard).**
+
+```
+- load_configuration(ROBUST_0).
+- Synthesize preamble + AWGN at sigma_pb = 0 (clean channel, NO CFO).
+- Run carrier_frequency_sync_wb_mfsk.
+- Assert |estimated_CFO| < 0.5 Hz.
+- The full preamble + demod round-trip with mini-Moose enabled produces
+  IDENTICAL frame data to pre-fix (modulo numerical noise in the demod
+  output well within float epsilon).
+```
+
+**Test C: `mfsk_data_preamble_mini_moose_high_cfo_rejected` (NEGATIVE,
+sanity-clamp guard).**
+
+```
+- load_configuration(ROBUST_0).
+- Synthesize preamble; inject CFO = 200 Hz (way above the ±2-subcarrier
+  clamp of ±93.75 Hz, and above the mini-Moose capture range).
+- Run carrier_frequency_sync_wb_mfsk.
+- Assert either: returns 0 (low confidence gate triggers) OR returns a
+  bounded value that the receive_msg clamp will reject. Either way, the
+  detector NEVER returns a wild value > sanity_limit that would silently
+  corrupt the data path.
+```
+
+(Test C is the cross-layer regression guard required by CLAUDE.md §5.)
+
+All three tests hook into `mfsk_ctrl_codec_tests.cc`, run via
+`mercury.exe --test`. Fail-before-passes verified by stashing the new
+`ofdm.cc` and `telecom_system.cc` edits, rebuilding, running tests.
+
+### §20.7 No-regression argument
+
+At high SNR / clean signal, `carrier_frequency_sync_wb_mfsk` will see
+no measurable cross-symbol phase rotation. The cross-symbol-phase
+estimator integrates over 15 symbol-pairs × nStreams subcarriers ≈
+15 complex measurements. Per-measurement phase noise variance ~1/(2*SNR);
+estimator variance scales as 1/(N_pairs * SNR). At SNR = +30 dB,
+estimator std-dev is ≈ 0.001 rad, mapping to ≈ 0.01 Hz at T_half_sym.
+The `freq_offset_ignore_limit` (typically ~3 Hz) ensures sub-threshold
+residuals are skipped — re-mix doesn't run, `baseband_data` stays
+identical to pre-fix. Existing high-SNR tests
+(`mfsk_data_preamble_argmax_clean`, `_high_snr_no_regression`) will
+still report `matched = 16/16` because the data path is byte-identical.
+
+At cliff SNR (WGN:-8), residual CFO ≈ 3-7 Hz. The mini-Moose either:
+1. Estimates correctly → re-mix shifts energy out of mirror bin into
+   expected bin → §17 mirror-load-bearing effect disappears →
+   detection works without OR-accept of mirror bin → can revisit
+   T=7→6 push in a follow-up commit.
+2. Estimates badly (low confidence) → returns 0 → re-mix skipped →
+   behavior identical to today. Worst-case: no improvement, no
+   regression.
+3. Estimates wild (>±93.75 Hz) → sanity clamp rejects → next sync
+   trial. Worst-case: one wasted trial, same trials_max → same
+   number of overall retries → no regression.
+
+### §20.8 Commit list (planned)
+
+1. `docs(mini-moose): §20 plan — mini-Moose CFO refinement for MFSK
+   data preamble` (this section into the worktree fact-doc).
+2. `docs(data-flow): freq_offset_measured cross-layer audit`
+   (new `data-flow-freq_offset_measured.md`).
+3. `phy(ofdm): add carrier_frequency_sync_wb_mfsk half-symbol estimator`
+   (new function in `ofdm.cc`, declaration in `ofdm.h`).
+4. `phy(telecom_system): apply mini-Moose to MFSK data preamble`
+   (call new estimator at :2193, drop MFSK skip at :2220-2223).
+5. `test(mini-moose): cross-symbol-phase CFO regression suite`
+   (3 new tests in `mfsk_ctrl_codec_tests.cc` §7). Verify
+   fail-before-passes per §20.6.
+
+### §20.9 Operator backlog
+
+- Hardware A/B sweep at IONOS WGN ∈ {+14, +6, 0, -4, -8, -10, -12},
+  ROBUST_0, 180s dwell, 3 passes per arm vs baseline `a879e0e`.
+  Tool: `tools/axis_walk_sweep.py --pin-config 100`.
+- Expected: same or better total bytes at WGN ≥ -4; non-zero bytes
+  at WGN:-10 (current Option A baseline: 0 bytes).
+- Diagnostic to look for in logs: a new `[MFSK-MINI-MOOSE]` line
+  reporting the estimated residual CFO at each successful preamble
+  detection. If the value is consistently >0 at the cliff cells, the
+  estimator is doing useful work. If it's hovering at 0, residual is
+  below the threshold and the estimator path is a no-op.
+- Verify NB MFSK path is unaffected: NB ROBUST_0 throughput at
+  WGN:14 should match baseline.
+
+### §20.10 Cross-references
+
+- §14 — Option A ship log (the discrete-match detector this fix builds on).
+- §17 — mirror-bin verdict (the hardware evidence motivating mini-Moose).
+- §19 — Option C drop + next-axis selection (the contract for this work).
+- `data-flow-freq_offset_measured.md` — companion data-flow audit (next commit).
+- `mercury/source/physical_layer/ofdm.cc:474` — WB OFDM Moose (`carrier_sampling_frequency_sync`).
+- `mercury/source/physical_layer/ofdm.cc:537` — NB OFDM cross-symbol-phase
+  estimator (`carrier_frequency_sync_nb`) — algorithmic template.
+- `mercury/source/physical_layer/telecom_system.cc:2193` — the zero-out
+  line being replaced.
+- `mercury/source/physical_layer/telecom_system.cc:2220-2244` — the
+  re-mix block being extended to MFSK.
+- Memory `mfsk_vara_parity_audit_2026_05_25.md` — strategic dB context.
+
