@@ -1621,6 +1621,284 @@ static void test_mfsk_data_preamble_argmax_high_snr_no_regression() {
 }
 
 // =============================================================================
+// §7 Mini-Moose CFO refinement regression suite
+// (data-preamble-port-research.md §20, data-flow-freq_offset_measured.md §7)
+// =============================================================================
+
+// Synthesize a base-rate baseband preamble buffer with optional injected CFO.
+// Mirrors synth_preamble_buffer (§6 helper) but:
+//   1) Decimates the post-FIR full-rate output by ts.interpolation_rate to
+//      produce a buffer at base rate (matches what data_container.baseband_data
+//      holds in production after passband_to_baseband_decimated).
+//   2) Multiplies the decimated baseband by exp(j*2π*CFO*i/fs_base) so the
+//      detector sees a residual CFO of `cfo_hz` riding on the signal.
+//   3) Returns the buffer in `out_bb_base` with length `preamble_nSymb * Nofdm`.
+//
+// noise_sigma_pb is added at PASSBAND (real, Gaussian) like §6's helper, so
+// SNR semantics match the existing tests.
+static bool synth_preamble_buffer_base_with_cfo(
+	cl_telecom_system& ts,
+	double cfo_hz,
+	double noise_sigma_pb,
+	bool synthesize_preamble,
+	std::mt19937& rng,
+	std::vector<std::complex<double> >& out_bb_base,
+	int& out_preamble_nSymb,
+	int& out_Nofdm)
+{
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL)
+		return false;
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int preamble_nSymb = ts.data_container.preamble_nSymb;
+	int interp = ts.data_container.interpolation_rate;
+	int passband_samples = Nofdm * preamble_nSymb * interp;
+
+	out_preamble_nSymb = preamble_nSymb;
+	out_Nofdm = Nofdm;
+
+	std::vector<double> preamble_pb((size_t)passband_samples, 0.0);
+	if (synthesize_preamble) {
+		ts.mfsk.generate_preamble(ts.data_container.preamble_data, preamble_nSymb);
+		for (int i = 0; i < preamble_nSymb; i++) {
+			ts.ofdm.symbol_mod(
+				&ts.data_container.preamble_data[i * Nc],
+				&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+		}
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			ts.data_container.preamble_symbol_modulated_data,
+			Nofdm * preamble_nSymb,
+			preamble_pb.data(),
+			ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	// Pad with trailing silence so the detector's downstream Phase-2 window
+	// has room to refine (mirror of §6 helper's trailing_pad).
+	int trailing_pad = 12 * Nofdm * interp;
+	int buffer_pb_size = passband_samples + trailing_pad;
+	std::vector<double> buffer_pb((size_t)buffer_pb_size, 0.0);
+	if (synthesize_preamble) {
+		for (int i = 0; i < passband_samples && i < buffer_pb_size; i++)
+			buffer_pb[i] = preamble_pb[i];
+	}
+
+	if (noise_sigma_pb > 0.0) {
+		std::normal_distribution<double> nd(0.0, noise_sigma_pb);
+		for (int i = 0; i < buffer_pb_size; i++)
+			buffer_pb[i] += nd(rng);
+	}
+
+	// passband_to_baseband at full rate with decimation_rate=1.
+	std::vector<std::complex<double> > bb_full((size_t)buffer_pb_size,
+		std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(
+		buffer_pb.data(), buffer_pb_size, bb_full.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		1, &ts.ofdm.FIR_rx_time_sync);
+
+	// Decimate to base rate and inject CFO. fs_base = sampling_frequency / interp.
+	int base_samples = buffer_pb_size / interp;
+	double fs_base = ts.sampling_frequency / (double)interp;
+	double angle_step = 2.0 * M_PI * cfo_hz / fs_base;
+
+	out_bb_base.assign((size_t)base_samples, std::complex<double>(0.0, 0.0));
+	for (int i = 0; i < base_samples; i++) {
+		std::complex<double> v = bb_full[(size_t)i * interp];
+		// Multiply by exp(j*angle) — phase recurrence-free per-sample form
+		// (test code: clarity over speed).
+		double a = (double)i * angle_step;
+		double cr = std::cos(a);
+		double ci = std::sin(a);
+		std::complex<double> rot(cr, ci);
+		out_bb_base[(size_t)i] = v * rot;
+	}
+	return true;
+}
+
+// §7.1 — Recover injected CFO. POSITIVE, FAIL-BEFORE-PASSES.
+//
+// Inject +7 Hz residual CFO at the baseband-complex level, add AWGN at
+// the same noise level as §6.2 (passband sigma = 3 × preamble RMS, in-band
+// SNR ≈ +2 dB). Assert |estimated - 7 Hz| < 1.5 Hz across 5 seeds.
+//
+// Pre-fix the function `carrier_frequency_sync_wb_mfsk` did not exist
+// (link error). Post-fix this test passes — the estimator returns a
+// finite value tracking the injection within ±1.5 Hz.
+static void test_mfsk_data_preamble_mini_moose_recovers_cfo() {
+	const char* name = "mfsk_data_preamble_mini_moose_recovers_cfo";
+
+	// Measure preamble RMS using the existing helper so noise level matches
+	// §6.2 cliff conditions.
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	double sigma_pb = 3.0 * rms;
+	const double cfo_inject = 7.0; // Hz, comfortably inside capture range
+
+	int hits = 0;
+	double last_est = 0.0;
+	for (int seed = 1; seed <= 5; seed++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0x10550030u + seed));
+		std::vector<std::complex<double> > bb_base;
+		int preamble_nSymb_local = 0;
+		int Nofdm_local = 0;
+		if (!synth_preamble_buffer_base_with_cfo(ts, cfo_inject, sigma_pb, true,
+		                                          rng, bb_base,
+		                                          preamble_nSymb_local,
+		                                          Nofdm_local)) {
+			test_fail(name, "synth_preamble_buffer_base_with_cfo failed");
+			return;
+		}
+		double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+		double est = ts.ofdm.carrier_frequency_sync_wb_mfsk(
+			bb_base.data(),
+			carrier_freq_width,
+			preamble_nSymb_local,
+			ts.mfsk.preamble_tones, ts.mfsk.M,
+			ts.mfsk.nStreams, ts.mfsk.stream_offsets);
+		last_est = est;
+		if (std::fabs(est - cfo_inject) < 1.5) hits++;
+	}
+	if (hits < 4) {
+		char buf[200];
+		std::snprintf(buf, sizeof(buf),
+			"hits=%d/5 last_est=%.3f Hz expected≈%.1f Hz (±1.5)",
+			hits, last_est, cfo_inject);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §7.2 — Zero-CFO no-op / no-regression. POSITIVE.
+//
+// Clean preamble (sigma_pb = 0, CFO = 0). Estimator should return a value
+// near zero (|est| < 0.5 Hz). Catches over-correction at high SNR.
+static void test_mfsk_data_preamble_mini_moose_zero_cfo_no_op() {
+	const char* name = "mfsk_data_preamble_mini_moose_zero_cfo_no_op";
+	cl_telecom_system ts;
+	std::mt19937 rng(0x10551110u);
+	std::vector<std::complex<double> > bb_base;
+	int preamble_nSymb_local = 0;
+	int Nofdm_local = 0;
+	if (!synth_preamble_buffer_base_with_cfo(ts, /*cfo_hz=*/0.0,
+	                                          /*sigma_pb=*/0.0,
+	                                          /*synth=*/true, rng, bb_base,
+	                                          preamble_nSymb_local,
+	                                          Nofdm_local)) {
+		test_fail(name, "synth_preamble_buffer_base_with_cfo failed");
+		return;
+	}
+	double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+	double est = ts.ofdm.carrier_frequency_sync_wb_mfsk(
+		bb_base.data(),
+		carrier_freq_width,
+		preamble_nSymb_local,
+		ts.mfsk.preamble_tones, ts.mfsk.M,
+		ts.mfsk.nStreams, ts.mfsk.stream_offsets);
+	if (!std::isfinite(est)) {
+		test_fail(name, "estimator returned non-finite at zero CFO");
+		return;
+	}
+	if (std::fabs(est) >= 0.5) {
+		char buf[160];
+		std::snprintf(buf, sizeof(buf),
+			"clean-signal estimate=%.4f Hz, expected |est|<0.5 (over-correction guard)",
+			est);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §7.3 — Pure-noise safety. NEGATIVE / sanity-clamp guard.
+//
+// 50 random WGN buffers (no preamble). Assert estimator returns a finite
+// value bounded by |est| ≤ 100 Hz (the production sanity clamp is ±93.75 Hz;
+// 100 leaves a small margin for estimator alias artifacts). The
+// confidence gate `|C|/energy_total < 0.05` should fire on noise →
+// returns 0. Tested across 50 seeds to catch tail behaviors.
+//
+// This is the cross-layer regression guard required by CLAUDE.md §5: the
+// estimator MUST NOT produce wild values that would corrupt the
+// freq_offset_measured downstream consumers (sanity reject, re-mix,
+// cache). Returning 0 (no-op) on noise is the safe default.
+static void test_mfsk_data_preamble_mini_moose_pure_noise_safe() {
+	const char* name = "mfsk_data_preamble_mini_moose_pure_noise_safe";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	double sigma_pb = 2.0 * rms;  // strong noise, no preamble
+
+	int wild = 0;
+	int non_finite = 0;
+	double max_est_seen = 0.0;
+	for (int trial = 0; trial < 50; trial++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0x10557777u + trial));
+		std::vector<std::complex<double> > bb_base;
+		int preamble_nSymb_local = 0;
+		int Nofdm_local = 0;
+		if (!synth_preamble_buffer_base_with_cfo(ts,
+		                                          /*cfo_hz=*/0.0,
+		                                          sigma_pb,
+		                                          /*synth=*/false,
+		                                          rng, bb_base,
+		                                          preamble_nSymb_local,
+		                                          Nofdm_local)) {
+			test_fail(name, "synth_preamble_buffer_base_with_cfo failed");
+			return;
+		}
+		double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+		double est = ts.ofdm.carrier_frequency_sync_wb_mfsk(
+			bb_base.data(),
+			carrier_freq_width,
+			preamble_nSymb_local,
+			ts.mfsk.preamble_tones, ts.mfsk.M,
+			ts.mfsk.nStreams, ts.mfsk.stream_offsets);
+		if (!std::isfinite(est)) { non_finite++; continue; }
+		double ae = std::fabs(est);
+		if (ae > max_est_seen) max_est_seen = ae;
+		if (ae > 100.0) wild++;
+	}
+	if (non_finite > 0) {
+		char buf[160];
+		std::snprintf(buf, sizeof(buf),
+			"%d/50 trials returned non-finite (must never happen)",
+			non_finite);
+		test_fail(name, buf);
+		return;
+	}
+	if (wild > 0) {
+		char buf[200];
+		std::snprintf(buf, sizeof(buf),
+			"%d/50 trials produced |est|>100 Hz, max=%.3f (sanity-clamp guard)",
+			wild, max_est_seen);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -1664,6 +1942,12 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_data_preamble_argmax_pure_noise();
 	test_mfsk_data_preamble_argmax_data_content();
 	test_mfsk_data_preamble_argmax_high_snr_no_regression();
+
+	// §7 Mini-Moose CFO refinement regression suite
+	// (data-preamble-port-research.md §20, 2026-05-28).
+	test_mfsk_data_preamble_mini_moose_recovers_cfo();
+	test_mfsk_data_preamble_mini_moose_zero_cfo_no_op();
+	test_mfsk_data_preamble_mini_moose_pure_noise_safe();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
