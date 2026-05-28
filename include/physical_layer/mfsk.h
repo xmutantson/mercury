@@ -56,6 +56,13 @@ public:
 	static const int MAX_PREAMBLE_SYMB = 16;
 	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol
 	int preamble_nSymb;                     // Number of preamble symbols used
+	// Length-scaled detection threshold for the discrete-match preamble
+	// detector (`time_sync_mfsk_corr` ofdm.cc, post-2026-05-27 port per
+	// fact-documents/data-preamble-port-research.md §14). Number of
+	// per-symbol FFT-bin-argmax matches required to declare detection.
+	// Mirrors ack_match_threshold / connect_match_threshold.
+	// FAR ≈ 2.5e-7/poll at M=32 (7/16); ≈ 2.4e-5/poll at M=16.
+	int preamble_match_threshold;
 
 	// ACK/BREAK/HAIL/SACK pattern: known tone sequences for pattern-based signaling.
 	// WB (M>=16): 8 Welch-Costas tones × 2 reps = 16 symbols, with tone hopping.

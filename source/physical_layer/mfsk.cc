@@ -120,30 +120,43 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	// NB (M<=8): 8-symbol preamble for cross-correlation detection.
 	// WB (M>=16): 16-symbol preamble (raised from 4 on 2026-05-27 per
 	// data-frame-cliff-audit-2026-05-27.md §H1) for +6 dB matched-filter
-	// integration gain at the WGN:-8 cliff. The four canonical base tones
-	// are repeated 4 times with tone-hopping (preamble_tones[s] =
-	// (base[s%4] + s*tone_hop_step) % M) so the 16-symbol sequence
-	// traverses M distinct tones over its duration. The hopping schedule
-	// is the same one used by ACK/HAIL/CONNECT/BREAK detectors (see
-	// generate_ack_pattern at mfsk.cc:488-489); the data-preamble TX path
-	// (mfsk.cc:465 generate_preamble) does NOT apply tone_hop_step at
-	// emit time, so the hopping is baked into preamble_tones[] here.
-	// Cross-correlation against existing Welch-Costas patterns: expected
-	// false-match ~0.5/16, well below the 7/16 detector threshold
-	// (data-flow-preamble_nSymb.md §5.2).
+	// integration gain at the WGN:-8 cliff.
+	//
+	// 2026-05-27 (data-preamble-port-research.md §14): WB preamble tones
+	// are now a Welch-Costas sequence with primitive root g=2 (mod 17),
+	// distinct from ACK (g=5), BREAK (g=7), HAIL (g=6), CONNECT (g=3).
+	// 8 base tones × 2 reps fill the 16-symbol preamble. The data-preamble
+	// TX path (cl_mfsk::generate_preamble, mfsk.cc:467) reads
+	// preamble_tones[s % preamble_nSymb] DIRECTLY with no tone-hopping at
+	// emit time, so the array stores the full 16-symbol sequence here.
+	// The new RX detector (time_sync_mfsk_corr discrete-match port,
+	// ofdm.cc) reads the same array — symmetric.
+	//
+	// Cross-correlation against existing Welch-Costas patterns
+	// (8-base-tone Hamming distance): vs ACK 7/8, vs BREAK 8/8, vs HAIL
+	// 8/8, vs CONNECT 8/8 at both M=16 and M=32. All ≥ 6/8, the bar
+	// enforced by test_base_pattern_cross_correlation
+	// (mfsk_ctrl_codec_tests.cc:409). Expanded 16-symbol sequences
+	// ≥ 14/16 — well above the 7/16 detector threshold.
 	if (M == 32)
 	{
 		preamble_nSymb = 16;
-		const int base[4] = {4, 20, 12, 28};
+		// 2× scaled M=16 Welch-Costas g=2 sequence:
+		// (2^k mod 17 for k=1..8) × 2 mod 32, with the trailing 16→0
+		// substitution carried through: {4, 8, 16, 0, 30, 26, 18, 2}.
+		const int base[8] = {4, 8, 16, 0, 30, 26, 18, 2};
 		for (int s = 0; s < 16; s++)
-			preamble_tones[s] = (base[s % 4] + s * tone_hop_step) % M;
+			preamble_tones[s] = base[s % 8];
 	}
 	else if (M == 16)
 	{
 		preamble_nSymb = 16;
-		const int base[4] = {2, 10, 6, 14};
+		// Welch-Costas (p=17, g=2): 2^k mod 17, k=1..8 = {2,4,8,16,15,13,9,1}.
+		// Trailing 16 is out-of-range for M=16; substituted to 0 (free of
+		// CONNECT/ACK/BREAK/HAIL base-tone collisions at any index).
+		const int base[8] = {2, 4, 8, 0, 15, 13, 9, 1};
 		for (int s = 0; s < 16; s++)
-			preamble_tones[s] = (base[s % 4] + s * tone_hop_step) % M;
+			preamble_tones[s] = base[s % 8];
 	}
 	else if (M == 8)
 	{
@@ -178,6 +191,22 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		for (int i = 0; i < preamble_nSymb && i < MAX_PREAMBLE_SYMB; i++)
 			preamble_tones[i] = (i * M / preamble_nSymb + M / (2 * preamble_nSymb)) % M;
 	}
+
+	// Discrete-match preamble detection threshold (post-2026-05-27 port,
+	// fact-documents/data-preamble-port-research.md §14). Required count
+	// of per-symbol FFT-bin-argmax matches for the discrete-tone-match
+	// detector in cl_ofdm::time_sync_mfsk_corr to declare detection.
+	// Per-config threshold chosen to keep FAR ≤ ~10^-4/poll on pure
+	// noise (random p = 1/M per symbol):
+	//   WB M=32 N=16 → T=7  : FAR ≈ 2.5e-7/poll
+	//   WB M=16 N=16 → T=7  : FAR ≈ 2.4e-5/poll
+	//   NB M=8  N=8  → T=7  : FAR ≈ 3.4e-6/poll
+	//   NB M=4  N=8  → T=7  : FAR ≈ 3.8e-4/poll (tightest case;
+	//                          mitigated by the 2-stream all-match gate)
+	if (M >= 16)
+		preamble_match_threshold = 7;
+	else
+		preamble_match_threshold = 7;
 
 	// ACK pattern tones.
 	// WB (M>=16): Welch-Costas array (p=17, g=5), 8 base tones × 2 reps = 16 symbols.
