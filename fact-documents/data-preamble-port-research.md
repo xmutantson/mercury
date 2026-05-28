@@ -1011,17 +1011,28 @@ remains UNCHANGED. Return contract:
 Threshold: **`preamble_match_threshold = 7`** (out of 16). Mirrors
 CONNECT (`connect_match_threshold = 7` at `mfsk.cc:364, 371`).
 
-**FAR math (per §2.3):** For random data / pure noise at M=32, per-symbol
-FFT-bin argmax matches the expected preamble tone with probability
-`p_random = 1/M = 1/32`. Across N=16 symbols, K ~ Binomial(16, 1/32):
-- P(K ≥ 7) ≈ Σ_{k=7..16} C(16,k) · (1/32)^k · (31/32)^(16-k) ≈ 2.5·10⁻⁷.
+**FAR math (per §2.3):** ~~For random data / pure noise at M=32,
+per-symbol FFT-bin argmax matches the expected preamble tone with
+probability `p_random = 1/M = 1/32`. Across N=16 symbols,
+K ~ Binomial(16, 1/32): P(K ≥ 7) ≈ 2.5·10⁻⁷. For M=16 (ROBUST_1/2),
+p_random = 1/16: P(K ≥ 7) ≈ 2.4·10⁻⁵.~~
 
-For M=16 (ROBUST_1/2), p_random = 1/16:
-- P(K ≥ 7) ≈ 2.4·10⁻⁵.
+**CORRECTION (§15.8, 2026-05-28):** the formula above used
+`p_random = 1/M` but the detector accepts BOTH the expected bin AND
+the mirror bin (Bug #39 carrier-image recovery, ofdm.cc:3130, 3228),
+so the true random baseline is `p_random = 2/M`. Corrected:
+- M=32 T=7 FAR = **2.57×10⁻⁵/poll** (was claimed 2.5×10⁻⁷).
+- M=16 T=7 FAR = **1.94×10⁻³/poll** (was claimed 2.4×10⁻⁵).
 
-Operationally: ROBUST_0 sessions have ~10 polls/sec; expected one false
-alarm every ~46 days. Consequence per §6.4: spurious LDPC decode on
-noise → CRC fail → ~30 ms wasted compute. Bounded and acceptable.
+This is still operationally OK (the regression tests pass at T=7 by
+margin), but the headroom argument in §14.3 was overstated by ~100×.
+See §15.8 for the full corrected table and implications.
+
+Operationally: ROBUST_0 sessions have ~10 polls/sec; ~~expected one
+false alarm every ~46 days~~ **expected one false alarm every ~70
+minutes** at the corrected M=32 T=7 rate. Consequence per §6.4:
+spurious LDPC decode on noise → CRC fail → ~30 ms wasted compute.
+Bounded and acceptable.
 
 ### §14.4 Algorithm (mirrors detect_ack_pattern, body of time_sync_mfsk_corr)
 
@@ -1355,3 +1366,105 @@ needed.
   asserts the test bound holds, but the test buffer is 32 symbols;
   real sessions span 100s of symbols per second. Confirm zero
   detect events in IONOS captures.
+
+### §15.8 ESCALATION — T=6 ships UNSAFE; M=32 push deferred (2026-05-28)
+
+**Status:** PUSH DEFERRED. Threshold remains T=7 across all M.
+
+**What happened.** Implemented §15.3 (M=32 T=7→T=6), built clean, ran
+`mercury.exe --test`. **`mfsk_data_preamble_argmax_pure_noise`
+FAILED**: 4/100 false detections (bound: ≤1). Compare §15.5
+prediction: ≤1 expected by ~1000× margin.
+
+**Root cause.** The §15.1 FAR table used `p_random = 1/M` per symbol.
+The actual detector (`ofdm.cc:3130, 3228`) implements Bug #39
+**carrier-image recovery**: accepts `peak_bin == expected_bin OR
+peak_bin == mirror_bin`. Two bins out of M qualify per symbol. The
+true random-data baseline is **`p = 2/M`**, not `1/M`.
+
+**Corrected FAR table** (Binomial(N, 2/M)):
+
+| Modulation | N | T=7 | T=6 |
+|---|---|---|---|
+| WB M=32 N=16 | 16 | **2.57×10⁻⁵** | **2.76×10⁻⁴** (proposed; OVER gate) |
+| WB M=16 N=16 | 16 | 1.94×10⁻³     | 8.27×10⁻³ |
+| NB M=8  N=8  | 8  | 3.82×10⁻⁴     | — |
+| NB M=4  N=8  | 8  | 3.52×10⁻²     | — |
+
+M=32 T=6 FAR = 2.76×10⁻⁴/poll — **27× over the operator's `<1×10⁻⁵`
+escalation gate**. The §15 push as scoped CANNOT ship without
+addressing mirror-bin.
+
+**Per-call FAR (13 candidate windows union bound):**
+- M=32 T=6: 13 × 2.76×10⁻⁴ ≈ 3.6×10⁻³ per call.
+- Across 100 calls: ~0.36 expected false detects. Observed 4/100.
+  The ~10× gap vs union bound is consistent with correlated noise
+  driving multiple adjacent windows + Phase-2 fine refinement (more
+  trials per coarse winner).
+
+**Also discovered:** the OLD §14.3 FAR numbers in this doc and the
+shipped mfsk.cc comment (FAR 2.5e-7 for T=7 M=32) were ALSO wrong by
+the same 100× factor. The detector's effective M is ~M/2 due to
+mirror-bin, so:
+- True WB M=32 T=7 FAR = 2.57×10⁻⁵/poll (was claimed 2.5×10⁻⁷)
+- True WB M=16 T=7 FAR = 1.94×10⁻³/poll (was claimed 2.4×10⁻⁵)
+- NB unchanged-ish (mirror-bin collisions degenerate the formula at
+  small M anyway; M=4 N=8 T=7 was 3.8×10⁻⁴ at p=1/M, becomes 3.5×10⁻²
+  at p=2/M — but stream-product gate hides this; see below).
+
+The current operational FAR is fine — `mfsk_data_preamble_argmax_pure_noise`
+passes at T=7 (4/100 was at T=6; at T=7 it's 0/100 in practice
+because the binomial mass at K≥7 with p=2/32 is ~2.6×10⁻⁵ × 13 windows
+= 3.4×10⁻⁴ per call, ~0.034 over 100 calls). Just MORE TIGHT than
+documented.
+
+The NB cases sit at p=2/M = 0.25 (M=8) and 0.5 (M=4) — at face value
+the binomial is degenerate. The `streams_matched < mfsk_nStreams`
+gate at ofdm.cc:3134 multiplies the per-stream FAR by `(2/M)^nStreams`
+(NB uses 2 streams at M=4), so the EFFECTIVE per-symbol p at NB is
+`(2/M)^nStreams`. Need to recompute NB cases properly before any
+NB push — not in scope here, but flagged.
+
+**Three options for the operator:**
+
+1. **Drop the §15 push** — keep T=7 uniform, accept the +50% bps win
+   from §14 alone. ZERO regression risk. Hardware operator can pursue
+   other axes (E3 LLR clip, A.0.2 Moose retest, etc.).
+
+2. **Investigate mirror-bin tightening** (re-design):
+   - Option 2a: drop mirror-bin acceptance for DATA preamble (keep
+     for HAIL/ACK/BREAK where it was originally needed). DATA frames
+     follow tight CFO sync via the Moose probe — the mirror bin
+     should NOT carry signal if the receiver is locked. Verify by
+     instrumenting Phase 1 and counting how many `matched++`
+     decisions came from `peak_bin == mirror_bin` vs
+     `peak_bin == expected_bin` in IONOS captures. If mirror_bin
+     hits are essentially zero on real signal, we can drop it for
+     DATA without hurting detection; then T=6 with `p=1/M=1/32`
+     genuinely gives FAR 5.7×10⁻⁶ and ships.
+   - Option 2b: keep mirror-bin BUT scale threshold differently —
+     e.g., require `peak_bin == expected_bin` strictly for the
+     COUNT, but treat mirror_bin hits as a separate diagnostic.
+
+3. **Larger preamble** (N: 16→24 or 32) — keeps mirror-bin behavior
+   but uses √N gain for matched-filter integration. Touches frame
+   timing math and Bug #44 cross-correlation budget; multi-week
+   port. Out of scope.
+
+**Recommendation.** Option 1 (drop the push) for short-term safety
++ Option 2a investigation as next axis. The §14 cliff move
+WGN:-4 → WGN:-8 is real and worth banking; the additional 2 dB to
+HAIL floor needs a mirror-bin design pass, not a threshold
+adjustment.
+
+**Current branch state (`fix/preamble-thr6`):**
+- `5ed9eb1`: §15 plan (this doc — KEEPS as historical record + §15.8
+  correction).
+- `b328a4d` (parent): unchanged. Threshold remains T=7 everywhere.
+- This commit (planned): mfsk.cc comment rewritten to reflect
+  correct mirror-bin FAR + §15.8 deferral note. NO threshold change.
+- `mercury.exe --test`: 22/22 passing (verified after comment-only
+  change).
+
+**No further commits planned on this branch.** Hand back to operator
+for direction choice.

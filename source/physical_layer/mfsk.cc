@@ -196,13 +196,19 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	// fact-documents/data-preamble-port-research.md §14). Required count
 	// of per-symbol FFT-bin-argmax matches for the discrete-tone-match
 	// detector in cl_ofdm::time_sync_mfsk_corr to declare detection.
-	// Per-config threshold chosen to keep FAR ≤ ~10^-4/poll on pure
-	// noise (random p = 1/M per symbol):
-	//   WB M=32 N=16 → T=7  : FAR ≈ 2.5e-7/poll
-	//   WB M=16 N=16 → T=7  : FAR ≈ 2.4e-5/poll
-	//   NB M=8  N=8  → T=7  : FAR ≈ 3.4e-6/poll
-	//   NB M=4  N=8  → T=7  : FAR ≈ 3.8e-4/poll (tightest case;
-	//                          mitigated by the 2-stream all-match gate)
+	//
+	// Detector accepts expected_bin OR mirror_bin (Bug #39 carrier-image
+	// recovery, ofdm.cc:3130, 3228) so the random-data baseline is p=2/M
+	// per symbol, NOT 1/M. This makes M=32 FAR 100× tighter than M=16
+	// but does NOT support a one-notch relax of M=32 to T=6 (would give
+	// FAR 2.8e-4/poll, over the 1e-5 escalation bound — see §15 fact
+	// doc). Uniform T=7 retained; §15 push deferred pending design fix.
+	// FAR computed as P(K ≥ T) for K ~ Binomial(N, 2/M):
+	//   WB M=32 N=16 → T=7  : FAR = 2.57e-5/poll
+	//   WB M=16 N=16 → T=7  : FAR = 1.94e-3/poll
+	//   NB M=8  N=8  → T=7  : FAR = 3.82e-4/poll
+	//   NB M=4  N=8  → T=7  : FAR = 3.52e-2/poll (mirror collisions
+	//                          degenerate; mitigated by 2-stream all-match)
 	if (M >= 16)
 		preamble_match_threshold = 7;
 	else

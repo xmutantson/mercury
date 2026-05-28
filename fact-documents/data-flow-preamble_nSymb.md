@@ -582,10 +582,16 @@ the next OFDM-only run.
 #### INV-PORT-4: discrete-match threshold scaling
 
 `mfsk_preamble_match_threshold` MUST be in the range
-`(preamble_nSymb / M, preamble_nSymb]`. Below 1/M·N the random-data
-baseline overruns the threshold (FAR explodes). Above N is
+`(2·preamble_nSymb / M, preamble_nSymb]`.
+~~Below 1/M·N the random-data baseline overruns the threshold (FAR
+explodes).~~ **Corrected 2026-05-28 per
+`data-preamble-port-research.md` §15.8:** the detector accepts
+expected-bin OR mirror-bin (Bug #39 image recovery,
+`ofdm.cc:3130, 3228`), so the random-data baseline is `2/M`, not
+`1/M`. The lower bound moves to `2·preamble_nSymb / M`. Above N is
 unreachable. The init() values (7 for WB / NB, against N=16 / N=8
-respectively) sit comfortably in the band.
+respectively) sit at 7 vs `2·16/32 = 1` (WB M=32, OK) and
+`2·16/16 = 2` (WB M=16, OK).
 
 #### INV-PORT-5: deferred template lifecycle
 
