@@ -588,5 +588,40 @@ regression of the same formula on a different code path is consistent
 with both: H1 says ctrl-frame had large enough δ for the sign error to
 bite; H2 says ctrl-frame had a different sibling bug.
 
-Post-experiment state of [?]: will be set by hardware A/B per §11.4
-decision matrix.
+**Post-experiment state of [?] (PARTIAL RESOLUTION, synthetic layer
+only, 2026-05-28):** §11.8 SYNTHETIC verdict is **H1**. The new
+apply-sign-invariance test (mfsk_ctrl_codec_tests.cc §7.4) directly
+measures the chain "estimator + apply" against a no-CFO reference
+under a realistic real-passband CFO injection (up-mix at
+`carrier_frequency + 7 Hz`). With the OLD apply formula `+`, the
+corrected expected-tone-bin energy is 26% off reference (rel_err
+0.260 vs 0.10 threshold) — the chain DOUBLES the residual instead of
+cancelling it. With the NEW apply formula `-`, the rel_err is well
+under 0.10 — the chain correctly cancels the injected CFO.
+
+Mechanism: the test confirms the §23.3 sign-convention disagreement
+empirically. At +7 Hz passband CFO, the production estimator
+`carrier_frequency_sync_wb_mfsk` returns δ_est = **-6.998 Hz** — i.e.,
+the OPPOSITE sign of the true baseband residual. The apply formula
+must therefore use `effective_carrier - δ_est` to undo it (equivalent
+to `effective_carrier + δ_actual`). The existing §7.1 test
+(`_recovers_cfo`) passes only because it injects CFO via baseband
+complex multiplication `× exp(+j·2π·cfo·t)` which has the opposite
+baseband-residual sign relative to the realistic passband-up-mix model
+— both tests are self-consistent but probe different signs of CFO.
+
+**Hardware-pending state of [?]:** the synthetic finding is necessary
+but not sufficient. Real IONOS may include additional sign-relevant
+effects (channel-induced phase rotation, Doppler, etc.). Hardware A/B
+per §11.4 decision matrix still required to confirm the synthetic
+result reproduces on the real fading channel.
+
+**Production fix architecture (post-hardware confirmation):** if H1 is
+confirmed on hardware, the cleanest production state is to flip the
+estimator's RETURN sign at `ofdm.cc:799` (`freq_offset = -phase * ...`
+instead of `+phase * ...`) so the apply formula at `:2274` can stay
+`+freq_offset_measured` and remain consistent with the WB OFDM Moose
+path. The branch's apply-formula flip ships as the experiment
+arm; the follow-up production commit will move the negation to the
+estimator and restore the apply consistency. §11.4 decision matrix
+note "(option C)".

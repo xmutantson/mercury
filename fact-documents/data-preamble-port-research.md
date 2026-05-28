@@ -2938,6 +2938,39 @@ Same axis as §20's verify run:
    (new Test D in §7, hooked into `mercury.exe --test`). Verify
    fail-before-passes per §23.7.
 
+### §23.11.1 Implementation log + synthetic verdict (2026-05-28)
+
+Three commits shipped on `fix/sign-flip` per §23.11:
+
+| Commit | What |
+|---|---|
+| `9fa6385` | docs(sign-flip): §23 plan + §11 audit |
+| `d9bedcd` | phy(telecom_system): flip mini-Moose apply sign for WB MFSK |
+| `59c857e` | test(mini-moose): apply-sign-invariance end-to-end LLR check |
+
+Existing §7.1/§7.2/§7.3 tests STILL PASS with the sign flipped — they
+call the estimator directly and don't exercise the apply path, so they
+do not constrain the apply sign. This was predicted in §23.5 and is the
+biggest meta-finding: **the §7.1-§7.3 tests are NOT a guard against
+sign-flip mistakes in the apply formula.** §7.4 (the new test) is.
+
+New §7.4 test verdict on synthetic signal:
+- New apply formula `-` (§23 sign-flip): PASS, rel_err < 0.10.
+- Old apply formula `+` (monitor pre-flip): FAIL, rel_err = 0.260,
+  ref_energy=18.00 corrected=13.33, δ_est=-6.998 Hz at +7 Hz passband
+  injection.
+
+The estimator returns the **opposite sign** of the actual baseband
+residual under the realistic real-passband injection model (cosine at
+`carrier_frequency + 7 Hz`). The §7.1 test passes only because its
+injection model (baseband complex multiplication) flips the
+correspondence. Both tests are self-consistent but probe opposite-sign
+CFO. The §7.4 test is the empirically-correct model for real RF.
+
+§23 synthetic verdict: **H1 confirmed at the synthesis layer.**
+Hardware A/B per §23.9 still required to confirm the synthetic result
+reproduces on real IONOS / fading channel.
+
 ### §23.12 Cross-references
 
 - §20 — Mini-Moose implementation plan (the formula this experiment
