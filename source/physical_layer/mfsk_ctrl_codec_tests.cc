@@ -60,6 +60,8 @@
 #include "physical_layer/physical_defines.h"
 #include "datalink_layer/arq.h"           // §3 Wave 2 v2 cross-layer tests
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1214,6 +1216,411 @@ static void test_mfsk_data_preamble_passband_roundtrip_clean() {
 }
 
 // =============================================================================
+// §6. MFSK data-preamble DISCRETE-MATCH detector regression suite
+//     (data-preamble-port-research.md §14, ofdm.cc time_sync_mfsk_corr
+//     port from cosine²-mean to FFT-bin argmax matched count).
+//
+// All §6 tests fail-before-passes pattern: tests 6.2 (cliff) MUST fail on
+// the pre-port cosine²-mean detector and pass on the post-port discrete-
+// match detector. The fail-before-passes verification is run by stashing
+// the ofdm.cc body change and re-running `mercury.exe --test`.
+// =============================================================================
+
+// Shared synthesis helper: load ROBUST_0, generate preamble, round-trip
+// through TX→RX chain, return the full-rate interpolated baseband buffer
+// for the detector to consume. Caller may add AWGN at the passband level
+// BEFORE the FIR (which we control here via the noise_sigma_pb argument).
+//
+// Returns the full-rate interpolated baseband buffer in `out_bb` and the
+// expected preamble start offset in `out_expected_delay`.
+// If `synthesize_preamble=false`, the buffer contains only noise (no preamble).
+static bool synth_preamble_buffer(cl_telecom_system& ts,
+                                   double noise_sigma_pb,
+                                   bool synthesize_preamble,
+                                   std::mt19937& rng,
+                                   std::vector<std::complex<double> >& out_bb,
+                                   int& out_expected_delay,
+                                   int& out_sym_samples)
+{
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL)
+		return false;
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int preamble_nSymb = ts.data_container.preamble_nSymb;
+	int interp = ts.data_container.interpolation_rate;
+	out_sym_samples = Nofdm * interp;
+
+	int passband_samples = Nofdm * preamble_nSymb * interp;
+	std::vector<double> preamble_pb((size_t)passband_samples, 0.0);
+
+	if (synthesize_preamble) {
+		ts.mfsk.generate_preamble(ts.data_container.preamble_data, preamble_nSymb);
+		for (int i = 0; i < preamble_nSymb; i++) {
+			ts.ofdm.symbol_mod(
+				&ts.data_container.preamble_data[i * Nc],
+				&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+		}
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			ts.data_container.preamble_symbol_modulated_data,
+			Nofdm * preamble_nSymb,
+			preamble_pb.data(),
+			ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	// Buffer = preamble + trailing pad. Match the existing roundtrip test
+	// (no leading silence — preserves FIR transient compatibility with the
+	// template that load_configuration generated).
+	int trailing_pad = 12 * out_sym_samples;
+	int buffer_pb_size = passband_samples + trailing_pad;
+	int buffer_nsymb_pb = buffer_pb_size / out_sym_samples;
+	buffer_pb_size = buffer_nsymb_pb * out_sym_samples;
+	out_expected_delay = 0;
+
+	std::vector<double> buffer_pb((size_t)buffer_pb_size, 0.0);
+	if (synthesize_preamble) {
+		for (int i = 0; i < passband_samples && i < buffer_pb_size; i++)
+			buffer_pb[i] = preamble_pb[i];
+	}
+
+	// Add AWGN at the passband level. Gaussian, real-valued (passband is
+	// double). The FIR_rx_time_sync bandpass will reject out-of-band
+	// components, giving an in-band SNR ~= passband_SNR + 10·log10(fs/BW)
+	// (≈ +13 dB for fs=48k, BW=2343Hz).
+	if (noise_sigma_pb > 0.0) {
+		std::normal_distribution<double> nd(0.0, noise_sigma_pb);
+		for (int i = 0; i < buffer_pb_size; i++)
+			buffer_pb[i] += nd(rng);
+	}
+
+	out_bb.assign((size_t)buffer_pb_size, std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(
+		buffer_pb.data(), buffer_pb_size, out_bb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		1, &ts.ofdm.FIR_rx_time_sync);
+
+	return true;
+}
+
+// Compute passband RMS for the preamble waveform — used to set noise
+// stddev relative to signal level so tests are reproducible across
+// build flags.
+static double measure_preamble_rms_pb(cl_telecom_system& ts) {
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int preamble_nSymb = ts.data_container.preamble_nSymb;
+	int interp = ts.data_container.interpolation_rate;
+	int passband_samples = Nofdm * preamble_nSymb * interp;
+	std::vector<double> pb((size_t)passband_samples, 0.0);
+
+	ts.mfsk.generate_preamble(ts.data_container.preamble_data, preamble_nSymb);
+	for (int i = 0; i < preamble_nSymb; i++) {
+		ts.ofdm.symbol_mod(
+			&ts.data_container.preamble_data[i * Nc],
+			&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+	}
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		ts.data_container.preamble_symbol_modulated_data,
+		Nofdm * preamble_nSymb,
+		pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	double sum_sq = 0.0;
+	for (int i = 0; i < passband_samples; i++) sum_sq += pb[i] * pb[i];
+	return std::sqrt(sum_sq / (double)passband_samples);
+}
+
+// §6.1 — High-SNR clean: assert detector returns delay≥0 AND matched
+// count near maximum at sigma=0. Sanity baseline.
+static void test_mfsk_data_preamble_argmax_clean() {
+	const char* name = "mfsk_data_preamble_argmax_clean";
+	cl_telecom_system ts;
+	std::mt19937 rng(0xCAFEBABEu);
+	std::vector<std::complex<double> > bb;
+	int expected_delay = 0, sym_samples = 0;
+	if (!synth_preamble_buffer(ts, /*noise_sigma_pb=*/0.0, /*synthesize_preamble=*/true,
+	                            rng, bb, expected_delay, sym_samples)) {
+		test_fail(name, "synth_preamble_buffer failed (load_configuration?)");
+		return;
+	}
+
+	int interp = ts.data_container.interpolation_rate;
+	double sync_metric = 0.0;
+	int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+		bb.data(), (int)bb.size(), interp,
+		/*search_start_symb=*/0, &sync_metric);
+
+	if (detected_delay < 0) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"clean detect FAILED: delay=-1 metric=%.2f", sync_metric);
+		test_fail(name, buf);
+		return;
+	}
+	// Post-port: metric is discrete match count 0..16. Clean expected ~16.
+	if (sync_metric < 14.0) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"matched=%.0f < 14 (expected ≥14 on clean)", sync_metric);
+		test_fail(name, buf);
+		return;
+	}
+	int delay_err = std::abs(detected_delay - expected_delay);
+	if (delay_err > sym_samples) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"detected_delay=%d expected=%d err=%d > 1 sym (%d)",
+			detected_delay, expected_delay, delay_err, sym_samples);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §6.2 — Low-SNR cliff (FAIL-BEFORE-PASSES):
+// Add AWGN at the cliff level. The pre-port cosine²-mean detector
+// returns -1 with metric ≈ 0.15-0.30. The post-port discrete-match
+// detector finds matched ≥ 7/16 across the search window. Use 5
+// deterministic seeds; require ≥4 of 5 to detect.
+//
+// Noise level: passband sigma = 4× preamble RMS. This corresponds to a
+// passband SNR of ≈ -12 dB which, after the FIR bandpass (≈ +13 dB
+// bandwidth gain), gives in-band SNR ≈ +1 dB — close to the
+// WGN:-8 IONOS cell per data-preamble-port-research.md §2.4.
+static void test_mfsk_data_preamble_argmax_cliff() {
+	const char* name = "mfsk_data_preamble_argmax_cliff";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	double sigma_pb = 4.0 * rms;
+
+	int passes = 0;
+	int fails = 0;
+	int last_metric_int = 0;
+	int last_delay = 0;
+	for (int seed = 1; seed <= 5; seed++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0xC11FF000u + seed));
+		std::vector<std::complex<double> > bb;
+		int expected_delay = 0, sym_samples = 0;
+		if (!synth_preamble_buffer(ts, sigma_pb, /*synthesize_preamble=*/true,
+		                            rng, bb, expected_delay, sym_samples)) {
+			test_fail(name, "synth_preamble_buffer failed");
+			return;
+		}
+		int interp = ts.data_container.interpolation_rate;
+		double sync_metric = 0.0;
+		int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+			bb.data(), (int)bb.size(), interp,
+			/*search_start_symb=*/0, &sync_metric);
+		// Required: delay≥0 AND matched ≥ 7/16.
+		// (matched is reported via sync_metric on the new detector.)
+		if (detected_delay >= 0 && sync_metric >= (double)ts.mfsk.preamble_match_threshold) {
+			passes++;
+		} else {
+			fails++;
+		}
+		last_metric_int = (int)sync_metric;
+		last_delay = detected_delay;
+	}
+	if (passes < 4) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"cliff: only %d/5 seeds detected (need ≥4); last delay=%d matched=%d threshold=%d",
+			passes, last_delay, last_metric_int, ts_meas.mfsk.preamble_match_threshold);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §6.3 — Pure-noise false-alarm guard.
+// 100 random WGN buffers (no preamble). Pre-port detector with
+// per_sym_floor=0.01 has FAR > 10⁻³/poll on adversarial noise;
+// post-port discrete-match has FAR ≈ 2.5e-7/poll (M=32, 7/16).
+// Assert ≤ 1 false positive across 100 trials.
+static void test_mfsk_data_preamble_argmax_pure_noise() {
+	const char* name = "mfsk_data_preamble_argmax_pure_noise";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	double sigma_pb = 2.0 * rms;  // any non-zero noise level — preamble is absent
+
+	int false_positives = 0;
+	for (int trial = 0; trial < 100; trial++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0xD00DEADu + trial));
+		std::vector<std::complex<double> > bb;
+		int expected_delay = 0, sym_samples = 0;
+		if (!synth_preamble_buffer(ts, sigma_pb, /*synthesize_preamble=*/false,
+		                            rng, bb, expected_delay, sym_samples)) {
+			test_fail(name, "synth_preamble_buffer failed");
+			return;
+		}
+		int interp = ts.data_container.interpolation_rate;
+		double sync_metric = 0.0;
+		int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+			bb.data(), (int)bb.size(), interp, 0, &sync_metric);
+		if (detected_delay >= 0) false_positives++;
+	}
+	if (false_positives > 1) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"FAR too high: %d/100 false detections (expected ≤1)",
+			false_positives);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §6.4 — In-alphabet MFSK data content (Bug #44 regression guard).
+// Synthesize a buffer of random MFSK DATA-style symbols (one in-alphabet
+// tone per symbol, drawn uniformly), no preamble. The pre-port cosine²
+// metric may false-trigger because random data tones can sum to ~0.44
+// per-symbol cosine² (audit §13.9). The post-port FFT-bin argmax bounds
+// the random baseline to 1/M per symbol → E[K]=0.5 << 7.
+static void test_mfsk_data_preamble_argmax_data_content() {
+	const char* name = "mfsk_data_preamble_argmax_data_content";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL) {
+		test_fail(name, "pre-condition: ROBUST_0 not loaded with 16-sym preamble");
+		return;
+	}
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	int sym_samples = Nofdm * interp;
+	int M = ts.mfsk.M;
+	int nStreams = ts.mfsk.nStreams;
+	int nsymb_data = 32;  // 32 data symbols, no preamble
+
+	std::mt19937 rng(0xDA7AC0DEu);
+	std::uniform_int_distribution<int> tone_pick(0, M - 1);
+
+	// Build a frequency-domain frame of random tones (one tone per symbol
+	// in each stream's band), then run through the same TX→RX chain. Tones
+	// are drawn from the FULL data alphabet (0..M-1) including bins that
+	// happen to match preamble bins — this is the adversarial case.
+	std::vector<std::complex<double> > freq_data((size_t)(nsymb_data * Nc),
+	                                              std::complex<double>(0.0, 0.0));
+	double amp = std::sqrt((double)Nc / (double)nStreams);
+	for (int s = 0; s < nsymb_data; s++) {
+		for (int st = 0; st < nStreams; st++) {
+			int tone = tone_pick(rng);
+			freq_data[s * Nc + ts.mfsk.stream_offsets[st] + tone] =
+				std::complex<double>(amp, 0.0);
+		}
+	}
+
+	// symbol_mod each frame symbol
+	std::vector<std::complex<double> > bb_tx((size_t)(nsymb_data * Nofdm),
+	                                          std::complex<double>(0.0, 0.0));
+	for (int i = 0; i < nsymb_data; i++) {
+		ts.ofdm.symbol_mod(&freq_data[i * Nc], &bb_tx[i * Nofdm]);
+	}
+
+	int pb_len = nsymb_data * Nofdm * interp;
+	std::vector<double> pb_data((size_t)pb_len, 0.0);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		bb_tx.data(), nsymb_data * Nofdm, pb_data.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	std::vector<std::complex<double> > bb_rx((size_t)pb_len,
+	                                          std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(
+		pb_data.data(), pb_len, bb_rx.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		1, &ts.ofdm.FIR_rx_time_sync);
+
+	double sync_metric = 0.0;
+	int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+		bb_rx.data(), pb_len, interp, 0, &sync_metric);
+	if (detected_delay >= 0) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"FALSE-TRIGGER on random data: delay=%d matched=%.0f (threshold=%d)",
+			detected_delay, sync_metric, ts.mfsk.preamble_match_threshold);
+		test_fail(name, buf);
+		return;
+	}
+	(void)sym_samples;
+	test_pass(name);
+}
+
+// §6.5 — High-SNR no-regression: sigma=0, assert matched count is at
+// the maximum AND delay is within 1 symbol of injection. Catches any
+// algorithmic regression at the easy end of the SNR range.
+static void test_mfsk_data_preamble_argmax_high_snr_no_regression() {
+	const char* name = "mfsk_data_preamble_argmax_high_snr_no_regression";
+	cl_telecom_system ts;
+	std::mt19937 rng(0xFEEDFACEu);
+	std::vector<std::complex<double> > bb;
+	int expected_delay = 0, sym_samples = 0;
+	if (!synth_preamble_buffer(ts, 0.0, true, rng, bb, expected_delay, sym_samples)) {
+		test_fail(name, "synth_preamble_buffer failed");
+		return;
+	}
+
+	int interp = ts.data_container.interpolation_rate;
+	double sync_metric = 0.0;
+	int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+		bb.data(), (int)bb.size(), interp, 0, &sync_metric);
+	if (detected_delay < 0) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"high-SNR detect FAILED: delay=-1 matched=%.0f", sync_metric);
+		test_fail(name, buf);
+		return;
+	}
+	int preamble_n = ts.mfsk.preamble_nSymb;
+	if ((int)sync_metric < preamble_n) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"matched=%.0f < %d (expected full match at sigma=0)",
+			sync_metric, preamble_n);
+		test_fail(name, buf);
+		return;
+	}
+	int delay_err = std::abs(detected_delay - expected_delay);
+	if (delay_err > sym_samples) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"detected_delay=%d expected=%d err=%d > 1 sym",
+			detected_delay, expected_delay, delay_err);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -1249,6 +1656,14 @@ int run_mfsk_ctrl_codec_tests() {
 	// (data-flow-preamble_nSymb.md, 2026-05-27).
 	test_preamble_nSymb_wb_robust0_extended_to_16();
 	test_mfsk_data_preamble_passband_roundtrip_clean();
+
+	// §6 MFSK data-preamble discrete-match detector regression suite
+	// (data-preamble-port-research.md §14, 2026-05-27).
+	test_mfsk_data_preamble_argmax_clean();
+	test_mfsk_data_preamble_argmax_cliff();
+	test_mfsk_data_preamble_argmax_pure_noise();
+	test_mfsk_data_preamble_argmax_data_content();
+	test_mfsk_data_preamble_argmax_high_snr_no_regression();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
