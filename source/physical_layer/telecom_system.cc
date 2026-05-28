@@ -2259,6 +2259,19 @@ skip_h_retry_point:
 			// freq_offset_measured = 0 (set above), so the
 			// freq_offset_ignore_limit gate keeps it out of the re-mix
 			// path implicitly.
+			//
+			// §23 sign-flip experiment (data-preamble-port-research.md §23,
+			// data-flow-freq_offset_measured.md §11): apply uses
+			// `effective_carrier_freq - freq_offset_measured` instead of `+`.
+			// Motivated by §22 control-frame mini-Moose hardware regression
+			// (-40% total bytes) combined with the NB-vs-WB-MFSK estimator
+			// sign-convention disagreement (ofdm.cc:603 NB derivation uses
+			// `-arg(C)*...` while ofdm.cc:799 WB MFSK returns `+arg(C)*...`).
+			// The new apply-sign-invariance regression test
+			// (mfsk_data_preamble_mini_moose_apply_sign_invariance, §7.4 in
+			// mfsk_ctrl_codec_tests.cc) ground-truths the chain end-to-end.
+			// Hardware A/B at §20-verify cells will resolve which sign is
+			// correct on real IONOS / RF.
 			if(fabs(freq_offset_measured)>ofdm.freq_offset_ignore_limit)
 			{
 				// Apply fine correction on top of coarse correction (scoped to frame region)
@@ -2271,7 +2284,7 @@ skip_h_retry_point:
 					ofdm.passband_to_baseband_decimated(&data[pb_start], pb_size,
 						data_container.baseband_data_interpolated,
 						sampling_frequency,
-						effective_carrier_freq + freq_offset_measured,
+						effective_carrier_freq - freq_offset_measured,
 						carrier_amplitude,
 						Mdec, &ofdm.FIR_rx_data, pb_start);
 					for(int i = 0; i < frame_dec; i++)
