@@ -2190,7 +2190,40 @@ skip_h_retry_point:
 					printf("[WB-FREQ] Moose=%.4f Hz\n", freq_offset_measured);
 			}
 
-			if(M == MOD_MFSK) freq_offset_measured = 0;
+			// Mini-Moose CFO refinement for WB MFSK data preamble
+			// (data-preamble-port-research.md §20, §17 mirror-bin verdict).
+			// PRE-FIX behavior was `if(M == MOD_MFSK) freq_offset_measured = 0;`
+			// — the MFSK path discarded everything the OFDM branches above
+			// computed and shipped zero residual CFO to the demod. Real signal
+			// energy leaked into the mirror FFT bin, which the discrete-match
+			// detector accepted as load-bearing. The new estimator
+			// (ofdm.cc carrier_frequency_sync_wb_mfsk) measures the residual
+			// from the freshly mixed baseband preamble; the existing sanity
+			// clamp + re-mix block at lines 2195-2244 applies it (the MFSK
+			// skip at the old line 2220 is dropped, see below).
+			//
+			// NB-MFSK explicitly kept at 0 — different tone geometry, separate
+			// fix per §19.4 risk register. See data-flow-freq_offset_measured.md
+			// §1.6 (INV-2).
+			if(M == MOD_MFSK)
+			{
+				if(!narrowband_enabled)
+				{
+					double mini_moose = ofdm.carrier_frequency_sync_wb_mfsk(
+						&data_container.baseband_data[0],
+						bandwidth / (double)data_container.Nc,
+						data_container.preamble_nSymb,
+						mfsk.preamble_tones, mfsk.M,
+						mfsk.nStreams, mfsk.stream_offsets);
+					freq_offset_measured = mini_moose;
+					if(g_verbose)
+						printf("[MFSK-MINI-MOOSE] residual=%.4f Hz\n", freq_offset_measured);
+				}
+				else
+				{
+					freq_offset_measured = 0;
+				}
+			}
 
 			// Moose sanity check + clamp.
 			// Crystal oscillators on SGTL5000 boards typically differ by <20 Hz.
@@ -2217,11 +2250,16 @@ skip_h_retry_point:
 				if(freq_offset_measured < -max_correction) freq_offset_measured = -max_correction;
 			}
 
-			if(M == MOD_MFSK)
-			{
-				// MFSK: skip fine frequency correction (no channel estimation to compensate)
-			}
-			else if(fabs(freq_offset_measured)>ofdm.freq_offset_ignore_limit)
+			// Pre-fix this branch had `if(M == MOD_MFSK) { /* skip */ }`
+			// short-circuiting MFSK out of the fine re-mix. Mini-Moose
+			// (data-preamble-port-research.md §20) made MFSK eligible
+			// for the same re-mix as OFDM: the noncoherent FFT-energy
+			// demap benefits from CFO correction because in-bin energy
+			// concentration is its only signal axis. NB-MFSK still has
+			// freq_offset_measured = 0 (set above), so the
+			// freq_offset_ignore_limit gate keeps it out of the re-mix
+			// path implicitly.
+			if(fabs(freq_offset_measured)>ofdm.freq_offset_ignore_limit)
 			{
 				// Apply fine correction on top of coarse correction (scoped to frame region)
 				auto t6_pb = std::chrono::steady_clock::now();
