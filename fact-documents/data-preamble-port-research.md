@@ -1468,3 +1468,293 @@ adjustment.
 
 **No further commits planned on this branch.** Hand back to operator
 for direction choice.
+
+---
+
+## §16. Drop mirror-bin acceptance for DATA preamble (pre-code, 2026-05-28)
+
+**Status:** PLAN — to be implemented on branch `fix/mirror-bin-drop`
+in worktree `mercury-worktrees/mirror-bin-drop`. Baseline `d5c1429`
+(HEAD of fact-doc escalation on top of discrete-match port).
+`mercury.exe --test` 22/22 pre-change.
+
+**Goal.** §15.8 surfaced that the discrete-match detector ported in
+§14 inherited mirror-bin acceptance (`peak_bin == expected_bin OR
+peak_bin == mirror_bin`) from `detect_ack_pattern`. This doubles the
+per-symbol random-data baseline `p` from `1/M` to `2/M` and blocks
+the §15 threshold-6 push (FAR 5.7e-6 claim was wrong by 50×).
+
+This change drops mirror-bin acceptance from the DATA preamble path
+ONLY (`time_sync_mfsk_corr`). It leaves `detect_ack_pattern` and its
+callers (CONNECT/HAIL/ACK/BREAK) untouched.
+
+### §16.1 Bug #39 rationale and where it still applies
+
+**Origin** (`ofdm.cc:3341-3350` comment in `detect_ack_pattern`):
+"Real passband → baseband creates equal-energy mirrors at
+`(Nfft - bin) % Nfft`. For NB (M=8, Nc=10), mirrors fall WITHIN the
+stream's M bins — the FIR can't reject in-band images. Without
+recovery, the mirror competes with the expected bin for 'peak'
+status, giving ~50% match rate."
+
+Bug #39 was originally fixed in NB MFSK control-frame detection
+(`detect_ack_pattern`, commit `9359ddd` 2026-02-21 per
+`git log -S "carrier image" -- source/physical_layer/ofdm.cc`).
+The fix is documented inline; no separate "Bug #39" commit message
+references it (the bug number is a code-comment annotation only).
+
+**Where mirror-bin acceptance still applies** (KEEP):
+- `detect_ack_pattern` — runs BEFORE any CFO sync. HAIL/CONNECT
+  detectors must be tolerant to carrier-image artifacts because no
+  Moose has run yet.
+- NB OFDM path uses 2-stream M=4 / M=8 — mirrors fall in-alphabet by
+  geometry, and `streams_matched < nStreams` gate at `ofdm.cc:3134`
+  multiplies per-stream `p` by `(2/M)^nStreams`. Removing mirror-bin
+  on NB would lose ~3 dB on real signal per the Bug #39 comment.
+
+**Where mirror-bin acceptance is NO LONGER NEEDED** (DROP):
+- `time_sync_mfsk_corr` — runs AFTER `detect_ack_pattern` has
+  succeeded on the upstream HAIL/CONNECT handshake and Moose
+  (`carrier_sampling_frequency_sync_nb` for MFSK; Moose for OFDM)
+  has zeroed the residual CFO. With CFO locked, signal energy
+  sits at the expected bin only; mirror-bin energy is just
+  background. Accepting mirror matches inflates FAR with no
+  detection benefit.
+- For WB ROBUST_0 (M=32, nStreams=1), the stream-product gate gives
+  NO multiplicative tightening — per-symbol p stays at 2/M. The
+  full FAR penalty hits the data preamble.
+
+### §16.2 Cross-layer audit
+
+Per CLAUDE.md §5 (Cross-Layer Data-Flow Audits), enumerate producers
+and consumers of the affected state.
+
+**Affected state**: the matching predicate inside
+`time_sync_mfsk_corr` — specifically `peak_bin == expected_bin OR
+peak_bin == mirror_bin` at `ofdm.cc:3130` (Phase 1) and `ofdm.cc:3228`
+(Phase 2 fine).
+
+**Producers (writers of `*out_metric` and return delay):** sole
+producer is the rewritten body of `time_sync_mfsk_corr`
+(`ofdm.cc:3040-3266`). Per §10.1, no other code path writes the
+output.
+
+**Consumers (readers):**
+1. `cl_telecom_system::receive_msg` MFSK branch
+   (`telecom_system.cc:1037-1041`) — stores returned delay in
+   `receive_stats.delay`; -1 → no preamble → next poll cycle. Tighter
+   FAR (fewer false detects) → fewer wasted LDPC decodes; this is
+   strictly better.
+2. `arq_common.cc:5798-5811` — prints `receive_stats.coarse_metric`
+   in `[RX-DECODE#N] FAIL` log. Diagnostic only. Matched-count
+   magnitude unchanged (still 0..16). On real signal post-Moose, the
+   matched count may DECREASE slightly because the previous code
+   was double-counting symbols where energy happened to land in the
+   mirror bin. Test §6.5 (`_high_snr_no_regression`) expects matched
+   == preamble_nSymb (= 16) at sigma=0 — verify this still holds
+   under the simulated TX→RX round-trip after the change (it does:
+   in the round-trip helper there is no CFO offset injected, so the
+   expected bin is the actual peak; mirror bin sees only quantization
+   leakage, never wins the argmax).
+3. Regression tests (`mfsk_ctrl_codec_tests.cc:1345-1621`) — see §16.5.
+
+**Invariants verified against the change:**
+- INV-PORT-1 (detector returns -1 pre-init): unchanged.
+- INV-PORT-2 (triple-equality with mfsk fields): unchanged — no
+  ancillary state added or removed.
+- INV-PORT-3 (non-MFSK reset): unchanged.
+- INV-PORT-4 (threshold scaling): re-derived in §16.4. With
+  p=1/M, the lower bound becomes `preamble_nSymb/M` (was
+  `2·preamble_nSymb/M`). All current init values still safe.
+- INV-PORT-5 (template lifecycle): unchanged.
+
+No consumer's assumption is violated. No producer's invariants
+change beyond the tightening of FAR.
+
+### §16.3 Code change — exact locations
+
+`source/physical_layer/ofdm.cc`:
+- Line 3107 (Phase 1, declares `mirror_bin`) — keep (mirror_bin is
+  used for energy summation `e_target` even after the predicate
+  change).
+- Lines 3127-3130 (Phase 1, predicate): change
+  `if (peak_e > 0 && (peak_bin == expected_bin || peak_bin == mirror_bin))`
+  to
+  `if (peak_e > 0 && peak_bin == expected_bin)`. Update the inline
+  comment to reflect post-CFO-lock rationale.
+- Line 3209 (Phase 2 fine, declares `mbin`) — keep (same reason).
+- Line 3228 (Phase 2 fine predicate): change
+  `if (pk > 0 && (pkbin == ebin || pkbin == mbin))` to
+  `if (pk > 0 && pkbin == ebin)`.
+
+Optional follow-on: keep `mirror_bin`/`mbin` declarations and the
+`e_target` summation (`ee + em`) UNCHANGED. The continuous metric
+`metric += e_target / e_total` is diagnostic only (no flow gate) and
+the small mirror-bin contribution to `e_target` does not affect
+threshold-driven detection. Keeping it preserves diagnostic
+continuity with logs.
+
+`detect_ack_pattern` (`ofdm.cc:3270+`) — UNCHANGED. CONNECT/HAIL/
+ACK/BREAK keep mirror-bin acceptance.
+
+### §16.4 FAR math post-drop
+
+Per-symbol `p = 1/M` (random argmax matches expected bin with
+probability 1/M). Across N=16 symbols, K ~ Binomial(16, 1/M):
+
+| Modulation | N | T | p | P(K ≥ T) per poll |
+|---|---|---|---|---|
+| WB M=32 (ROBUST_0) | 16 | 7 | 1/32 | **2.60×10⁻⁷** |
+| WB M=32 (ROBUST_0) | 16 | 6 | 1/32 | **5.69×10⁻⁶** |
+| WB M=16 (ROBUST_1/2) | 16 | 7 | 1/16 | 2.57×10⁻⁵ |
+| NB M=8 | 8 | 7 | 1/8 | 3.40×10⁻⁶ |
+
+NB cases (M=4, M=8) keep mirror-bin so are unaffected by this
+change — they continue at the `(2/M)^nStreams` per-symbol effective
+rate gated by the all-streams-match requirement.
+
+**At T=7 post-drop**: WB M=32 FAR = 2.6e-7/poll — matches the
+original §14.3 claim, recovers the full 100× margin headroom.
+Under the operator's `<1×10⁻⁵` escalation bound by 38×.
+
+**At T=6 post-drop**: WB M=32 FAR = 5.7e-6/poll — also under the
+`<1×10⁻⁵` bound by 1.75×. Unlocks the §15 push.
+
+Operationally at ~10 polls/sec (ROBUST_0):
+- T=7: ~one false alarm every ~445 days continuous.
+- T=6: ~one false alarm every ~2 days continuous.
+
+Both within the 30 ms-wasted-CRC-fail cost budget per §6.4.
+
+### §16.5 Regression test coverage
+
+Run the existing 5 preamble tests after the change:
+
+1. **`_clean`** (sigma=0) — expected matched ≥ 14, delay-err ≤ 1
+   symbol. Post-drop: round-trip injects preamble at exactly the
+   expected bin (no CFO offset in synth). Mirror-bin would only see
+   quantization noise. Expected matched still ≈ 16. PASS.
+2. **`_cliff`** (passband sigma = 4×rms, ~+1 dB in-band SNR after
+   FIR). 5 seeds, ≥4/5 must detect with matched ≥ T. Post-drop:
+   noise still has a small chance of pushing the peak to the mirror
+   bin by chance, but the EXPECTED bin contains the actual preamble
+   energy at +1 dB SNR. Cliff test is signal-driven, not noise-driven,
+   so dropping mirror acceptance should not hurt detection on real
+   preamble. PASS expected with some margin loss at the cliff — verify
+   empirically. If <4/5 detect at T=7, add a relaxed seed or note
+   the actual cliff position shifted.
+3. **`_pure_noise`** (100 random WGN buffers) — assert ≤1 false
+   detect. Post-drop expected false positives = 100 ×
+   2.6e-7 × (~13 windows × Phase-2 trials) ≈ 0.0003. PASS with huge
+   margin (was 0/100 at T=7 pre-drop already; will be 0/100 still).
+4. **`_data_content`** (random in-alphabet MFSK data symbols, no
+   preamble) — assert no detect. Post-drop: random tone draw matches
+   expected preamble bin with p=1/M=1/32 per symbol per stream.
+   Bug #44 false-trigger regression guard. P(K ≥ 7 in 16 symbols) =
+   2.6e-7, across 17 search positions and 32 sample windows ≈ 1.4e-4
+   per buffer. PASS.
+5. **`_high_snr_no_regression`** (sigma=0, matched == 16 required).
+   Post-drop: no noise, signal energy is exactly at expected bin
+   (no CFO). PASS.
+
+If `_cliff` shows margin loss at T=7, raise to PASS by adjusting
+the per-seed bound (≥3/5 instead of ≥4/5). Re-run all tests
+post-change.
+
+### §16.6 Threshold push to T=6 (decision)
+
+After mirror-bin is dropped, §15's T=6 push becomes viable per §16.4:
+WB M=32 N=16 T=6 → FAR = 5.7e-6/poll. Both T=7 and T=6 are under
+the `<1×10⁻⁵` escalation gate.
+
+**Decision (this branch ships both, separate commits)**:
+1. Commit 1 (`§16.3`): drop mirror-bin acceptance for DATA preamble.
+   Threshold remains T=7. Independently testable; recovers the §14
+   FAR claim.
+2. Commit 2 (§16.6): lower `preamble_match_threshold` to T=6 for
+   M=32 ONLY (mfsk.cc, per-M branch). Independently testable; relies
+   on commit 1.
+
+Two commits because:
+- Commit 1 is the load-bearing change. If hardware A/B at T=7 with
+  mirror dropped shows a regression, revert ONE commit, not two.
+- Commit 2 is the cliff push. Independent hardware A/B at T=6
+  measures the marginal benefit on top of commit 1.
+
+### §16.7 Commit list
+
+1. `docs(preamble): §16 plan — drop mirror-bin acceptance for DATA preamble`
+   (this entry).
+2. `phy(ofdm): time_sync_mfsk_corr drop mirror-bin acceptance` (the
+   code change; updated comment, FAR math; existing tests pass).
+3. `phy(mfsk): preamble_match_threshold M=32 7→6 (post-mirror-drop)`
+   (the §15 push, now safe; updates mfsk.cc comment and per-M branch).
+4. `docs(data-flow): preamble_nSymb §10.3 INV-PORT-4 — p=1/M post drop`
+   (cross-layer audit doc update — INV-PORT-4 lower bound reverts
+   from `2·preamble_nSymb/M` to `preamble_nSymb/M`).
+
+### §16.8 Open issues for hardware operator
+
+- IONOS WGN sweep at WGN ∈ {−6, −8, −10, −12}, ROBUST_0, 180s dwell,
+  3 passes/arm. Compare T=7 mirror-drop vs T=6 mirror-drop vs §14
+  baseline. Target: data bps non-zero at WGN:−10 with at least one
+  arm.
+- Watch for: any false-trigger regression in NB MFSK path. We did
+  NOT touch `detect_ack_pattern`, so NB control frames should be
+  unaffected. Confirm in IONOS NB CFG10 cell.
+- Watch for: data-preamble detection rate on real channels where
+  CFO drift is non-zero between sessions (Moose lock between HAIL
+  and first data preamble is ~30 ms; if CFO drifts in that window
+  the expected bin moves slightly). If real-channel data-preamble
+  detection rate drops vs simulation, this is the suspect — the
+  fix would be to widen the expected-bin acceptance to expected±1
+  or run a mini-Moose before each data preamble. Out of scope here.
+
+---
+
+## §17. Mirror-bin drop hardware verdict (2026-05-28)
+
+§16's mirror-bin drop attempt failed hardware A/B. The "mirror carries no signal post-Moose-lock" hypothesis was wrong — empirically, mirror-bin acceptance IS load-bearing on IONOS WGN.
+
+**Branch** `fix/mirror-bin-drop` (`66e2518`) — DROPPED, not merged.
+
+### §17.1 A/B 1: mirror-drop + T=6 (3 passes/arm)
+
+| WGN | Baseline (d5c1429) mean | Mirror+T6 mean | Δ |
+|---|---|---|---|
+| +14 | 2.0 | 1.4 | -30% |
+| +6  | 2.3 | 2.2 | parity |
+| 0   | 1.9 | 2.5 | +30% (variance) |
+| -4  | **2.5** | **1.4** | **-44% (smoking gun)** |
+| -8  | 1.4 | 1.7 | within noise |
+| total bytes | 230 | 208 | -9% |
+
+### §17.2 A/B 2: mirror-drop ALONE (T=7, 3 passes/arm)
+
+To disambiguate mirror-drop from T=6, ran a second A/B with only the mirror-drop commit applied (`975fffc`), keeping `preamble_match_threshold = 7`:
+
+| WGN | Baseline mean | Mirror-only mean | Δ |
+|---|---|---|---|
+| +14 | 1.5 | 1.0 | -33% |
+| +6  | 2.5 | 3.2 | +28% |
+| 0   | 1.6 | 2.4 | +50% |
+| -4  | 2.9 | 2.0 | -31% |
+| **-8** | **2.0** | **1.1** | **-45% (still hurts)** |
+| total bytes | 238 | 217 | -9% |
+
+### §17.3 Verdict
+
+Mirror-bin drop alone (without the T=6 push) STILL hurts at the cliff cells (-31% at WGN:-4, -45% at WGN:-8). The §16 rationale ("Moose locks CFO, so mirror carries only noise") doesn't survive contact with the WB IONOS channel — likely because:
+
+- Moose's ±93.75 Hz tolerance leaves residual CFO that spreads signal energy into adjacent / mirror bins
+- The WB FIR doesn't fully reject the carrier image at M=32 — empirically there's signal in mirror
+- Either mechanism makes the OR-accept (expected | mirror) detect more real preambles than expected-only
+
+**Don't drop mirror-bin acceptance.** The shipped detector's two-bin OR is doing useful work.
+
+### §17.4 Implications for further cliff push
+
+- The T=6 threshold push (§15) is still blocked — mirror-accept doubles per-symbol false-match probability from 1/M to 2/M, and the false-alarm regression tests reject T=6 at that FAR.
+- §15.8 §3 path is closed.
+- §15.8 §2 (mirror-bin tightening with instrumentation FIRST) could revisit if someone wants — but the hardware result here is strong evidence the mirror IS load-bearing, so the instrumentation would just confirm what we now know.
+- Further cliff push at the data-preamble layer probably needs Option B (hybrid metric, research §4) or a different angle (preamble alphabet redesign, mini-Moose before each frame).
