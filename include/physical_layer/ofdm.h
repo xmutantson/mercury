@@ -151,6 +151,17 @@ public:
 	void restore_channel_amplitude();
 	double carrier_sampling_frequency_sync(std::complex <double>*in, double carrier_freq_width, int preamble_nSymb, double sampling_frequency);
 	double carrier_frequency_sync_nb(std::complex<double>* in, double carrier_freq_width, int preamble_nSymb);
+	// Mini-Moose CFO refinement for WB MFSK data preamble. Cross-half-symbol
+	// phase estimator using known CW preamble tones. Capture range
+	// ±carrier_freq_width Hz (≈ ±46.875 Hz at WB ROBUST_0). Confidence gate
+	// returns 0 when |C|/energy < 0.05. See data-preamble-port-research.md §20.
+	double carrier_frequency_sync_wb_mfsk(std::complex<double>* in,
+	                                      double carrier_freq_width,
+	                                      int preamble_nSymb,
+	                                      const int* preamble_tones,
+	                                      int M_tones,
+	                                      int nStreams,
+	                                      const int* stream_offsets);
 	void channel_equalizer(std::complex <double>* in, std::complex <double>* out);
 	void channel_equalizer_without_amplitude_restoration(std::complex <double>* in,std::complex <double>* out);
 	void smooth_channel_estimate_dft();

@@ -610,6 +610,199 @@ double cl_ofdm::carrier_frequency_sync_nb(std::complex<double>* in, double carri
 	return freq_offset;
 }
 
+double cl_ofdm::carrier_frequency_sync_wb_mfsk(std::complex<double>* in,
+                                               double carrier_freq_width,
+                                               int preamble_nSymb,
+                                               const int* preamble_tones,
+                                               int M_tones,
+                                               int nStreams,
+                                               const int* stream_offsets)
+{
+	/*
+	 * Mini-Moose CFO refinement for WB MFSK data preamble.
+	 *
+	 * Background: mercury's MFSK RX path previously had NO fine CFO sync;
+	 * the line `if(M == MOD_MFSK) freq_offset_measured = 0;` in
+	 * cl_telecom_system::receive_msg discarded whatever the OFDM Moose
+	 * estimators left behind. Per fact-documents/data-preamble-port-research.md
+	 * §17, this caused real signal energy to leak into the mirror bin (which
+	 * the discrete-match detector accepted as load-bearing). Refining the
+	 * residual CFO at the start of every MFSK frame brings the energy back
+	 * to the expected bin.
+	 *
+	 * Algorithm (cross-half-symbol phase, mirror of carrier_sampling_frequency_sync's
+	 * WB-OFDM Moose):
+	 *   1. For each preamble symbol s, expected CW tone at baseband freq
+	 *      f_s = bin_index * fs_base / Nfft, where bin_index is the centered
+	 *      FFT bin for stream_offsets[st] + preamble_tones[s].
+	 *   2. De-rotate the received symbol by exp(-j*2π*f_s*t) so a residual
+	 *      CFO produces a slow linear phase ramp.
+	 *   3. Sum the de-rotated samples in the FIRST half (skip Ngi prefix) and
+	 *      the SECOND half of the Nfft window.
+	 *   4. C_st_s = (B - half-sum) * conj(A - half-sum).
+	 *   5. Accumulate C across all streams and all symbols.
+	 *   6. arg(C) / (2π × T_half_sym) = residual CFO in Hz.
+	 *
+	 * Capture range: ±fs_base / (2 × Nfft/2) = ±carrier_freq_width Hz.
+	 *   WB ROBUST_0 (Nfft=256, Ngi=36, fs_base=3000 Hz): ±46.875 Hz.
+	 *   Capture is wide enough for crystal mismatch (~11 Hz typical per
+	 *   mercury memory) + coarse-sync residual (≤5 Hz per
+	 *   phase-b-mfsk-connect-research §6.7) → ~16 Hz worst case, well
+	 *   inside the capture range.
+	 *
+	 * Confidence gate: returns 0 if |C| / energy_total < 0.05 (mirror of
+	 * carrier_frequency_sync_nb's gate).
+	 *
+	 * Inputs:
+	 *   in              : baseband_data starting at the preamble (decimated rate).
+	 *                     in[s*Nofdm + Ngi + i] is the i-th Nfft-window sample
+	 *                     of preamble symbol s, for i in 0..Nfft-1.
+	 *   carrier_freq_width: subcarrier spacing in Hz = fs_base / Nfft.
+	 *   preamble_nSymb  : number of preamble symbols available (typically 16
+	 *                     for WB ROBUST_0/1/2 post-§14).
+	 *   preamble_tones  : array of tone indices, one per preamble symbol.
+	 *                     Same layout as cl_mfsk::preamble_tones[].
+	 *   M_tones         : MFSK alphabet size (used only for sanity guards).
+	 *   nStreams        : number of MFSK streams (typically 1 for WB ROBUST_0).
+	 *   stream_offsets  : array of stream-band starting subcarriers, one per
+	 *                     stream. Same layout as cl_mfsk::stream_offsets[].
+	 *
+	 * Returns: residual CFO in Hz, or 0.0 on low confidence / invalid input.
+	 *
+	 * Sanity guards: returns 0 if any of preamble_nSymb / M_tones / nStreams
+	 * is ≤ 0, mirroring the pre-init guard in time_sync_mfsk_corr.
+	 *
+	 * Reference: P. H. Moose, "A technique for orthogonal frequency division
+	 * multiplexing frequency offset correction," IEEE TCOM 1994 (same as
+	 * carrier_sampling_frequency_sync's cite). The half-symbol-baseline
+	 * cross-correlation technique is the same; only the modulation it acts
+	 * on differs (CW tones with known frequency offsets vs every-other-SC
+	 * Schmidl-Cox repetition).
+	 */
+
+	if (preamble_nSymb <= 0 || M_tones <= 0 || nStreams <= 0) return 0.0;
+	if (preamble_tones == NULL || stream_offsets == NULL) return 0.0;
+	if (Nfft <= 0) return 0.0;
+	int half = Nfft / 2;
+	if (half <= 0) return 0.0;
+
+	// fs_base (the decimated/base sample rate the caller's buffer is at):
+	// carrier_freq_width = fs_base / Nfft, so fs_base = carrier_freq_width * Nfft.
+	double fs_base = carrier_freq_width * (double)Nfft;
+	if (fs_base <= 0.0) return 0.0;
+
+	// Stream-bin geometry mirrors time_sync_mfsk_corr (ofdm.cc:3105-3107):
+	//   sub = stream_offsets[st] + tone
+	//   bin = (sub < Nc/2) ? (Nfft - Nc/2 + sub) : (start_shift + (sub - Nc/2))
+	// The "centered" subcarrier index relative to FFT DC is:
+	//   k_centered = bin if bin < Nfft/2 else bin - Nfft
+	// which corresponds to baseband freq k_centered * fs_base / Nfft.
+	int Nc_half = Nc / 2;
+
+	int Nofdm = Nfft + Ngi;
+
+	std::complex<double> C(0.0, 0.0);
+	double energy_total = 0.0;
+
+	for (int s = 0; s < preamble_nSymb; s++)
+	{
+		int tone = preamble_tones[s];
+		if (tone < 0 || tone >= M_tones) continue;
+
+		for (int st = 0; st < nStreams; st++)
+		{
+			int sub = stream_offsets[st] + tone;
+			int expected_bin = (sub < Nc_half)
+				? (Nfft - Nc_half + sub)
+				: (start_shift + (sub - Nc_half));
+			// Map FFT bin to a centered/signed bin index in (-Nfft/2, Nfft/2].
+			int k_centered = (expected_bin < Nfft / 2)
+				? expected_bin
+				: expected_bin - Nfft;
+			double f_tone = (double)k_centered * fs_base / (double)Nfft;
+
+			// De-rotate the received symbol by exp(-j*2π*f_tone*t) so the
+			// expected tone collapses to DC; residual CFO becomes the only
+			// remaining phase rotation. Sum within each half-Nfft slot
+			// (post-Ngi). The two half-sums correlate to extract the
+			// cross-half phase.
+			//
+			// The de-rotation phase advances by 2π*f_tone/fs_base per
+			// sample; build it incrementally to avoid sincos in the inner
+			// loop.
+			double angle_step = -2.0 * M_PI * f_tone / fs_base;
+			double pr_init = 1.0;
+			double pi_init = 0.0;
+			double sr = std::cos(angle_step);
+			double si = std::sin(angle_step);
+
+			std::complex<double> A(0.0, 0.0);
+			std::complex<double> B(0.0, 0.0);
+			double pr = pr_init;
+			double pi = pi_init;
+
+			int base_idx = s * Nofdm + Ngi;
+
+			for (int i = 0; i < half; i++)
+			{
+				double sample_r = in[base_idx + i].real();
+				double sample_i = in[base_idx + i].imag();
+				// Multiply (sample) * (pr + j*pi) = de-rotated sample
+				double dr = sample_r * pr - sample_i * pi;
+				double di = sample_r * pi + sample_i * pr;
+				A.real(A.real() + dr);
+				A.imag(A.imag() + di);
+				// Advance phase recurrence.
+				double npr = pr * sr - pi * si;
+				double npi = pr * si + pi * sr;
+				pr = npr;
+				pi = npi;
+			}
+			for (int i = half; i < Nfft; i++)
+			{
+				double sample_r = in[base_idx + i].real();
+				double sample_i = in[base_idx + i].imag();
+				double dr = sample_r * pr - sample_i * pi;
+				double di = sample_r * pi + sample_i * pr;
+				B.real(B.real() + dr);
+				B.imag(B.imag() + di);
+				double npr = pr * sr - pi * si;
+				double npi = pr * si + pi * sr;
+				pr = npr;
+				pi = npi;
+			}
+
+			std::complex<double> contrib = B * std::conj(A);
+			C += contrib;
+			energy_total += std::norm(A) + std::norm(B);
+		}
+	}
+
+	if (!std::isfinite(C.real()) || !std::isfinite(C.imag())) return 0.0;
+	if (!std::isfinite(energy_total) || energy_total <= 0.0) return 0.0;
+
+	// Confidence gate: low |C|/energy ratio means the tones are not present
+	// or the channel is noise-dominated. Mirrors carrier_frequency_sync_nb
+	// (ofdm.cc:600). 0.05 chosen identical to the NB estimator's threshold.
+	double C_mag = std::abs(C);
+	if (C_mag / energy_total < 0.05) return 0.0;
+
+	// arg(C) = 2π * CFO * T_half_sym, where T_half_sym = half / fs_base.
+	// → CFO = arg(C) * fs_base / (2π * half).
+	// Equivalent rewrite using carrier_freq_width and Nfft (matches the
+	// units pattern used in carrier_frequency_sync_nb and
+	// carrier_sampling_frequency_sync):
+	//   CFO = arg(C) * carrier_freq_width * Nfft / (2π * half)
+	//       = arg(C) * carrier_freq_width * Nfft / (π * Nfft)
+	//       = arg(C) * carrier_freq_width / π
+	double phase = std::arg(C);
+	double freq_offset = phase * carrier_freq_width * (double)Nfft
+	                   / (2.0 * M_PI * (double)half);
+
+	if (!std::isfinite(freq_offset)) return 0.0;
+	return freq_offset;
+}
+
 void cl_ofdm::framer(std::complex <double>* in, std::complex <double>* out)
 {
 	int data_index=0;
