@@ -955,6 +955,265 @@ static void test_v2_rsp_frames_to_read_override() {
 }
 
 // =============================================================================
+// §5 MFSK WB data-preamble extension (2026-05-27)
+//
+// Cross-layer regression tests for the 4 -> 16 preamble extension on
+// WB MFSK ROBUST_0/1/2 (data-flow-preamble_nSymb.md). One pure-state
+// invariant test, one full passband round-trip test. Both fail before
+// the fix and pass after.
+// =============================================================================
+
+// §5.1 — Invariant: after loading a WB MFSK config (ROBUST_0), all four
+//   "preamble length" authorities must equal 16, and the corr-template
+//   per-symbol energy cache must be populated for indices 0..15.
+//
+// Pre-fix behavior (would fail):
+//   - mfsk.preamble_nSymb == 4 (set at mfsk.cc:124)
+//   - data_container.preamble_nSymb == 4 (copied from preamble_configurator)
+//   - ofdm.preamble_configurator.Nsymb == 4 (per-config table)
+//   - mfsk_corr_template_nsymb == 4 (set at telecom_system.cc:4988)
+//   - mfsk_corr_template_sym_energy[4..7] == 0 (only indices 0..3 written)
+static void test_preamble_nSymb_wb_robust0_extended_to_16() {
+	const char* name = "preamble_nSymb_wb_robust0_extended_to_16";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+
+	if (ts.mfsk.preamble_nSymb != 16) {
+		char buf[128];
+		snprintf(buf, sizeof(buf),
+			"mfsk.preamble_nSymb=%d (expected 16)",
+			ts.mfsk.preamble_nSymb);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.data_container.preamble_nSymb != 16) {
+		char buf[128];
+		snprintf(buf, sizeof(buf),
+			"data_container.preamble_nSymb=%d (expected 16)",
+			ts.data_container.preamble_nSymb);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.ofdm.preamble_configurator.Nsymb != 16) {
+		char buf[128];
+		snprintf(buf, sizeof(buf),
+			"ofdm.preamble_configurator.Nsymb=%d (expected 16)",
+			ts.ofdm.preamble_configurator.Nsymb);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.ofdm.mfsk_corr_template_nsymb != 16) {
+		char buf[128];
+		snprintf(buf, sizeof(buf),
+			"ofdm.mfsk_corr_template_nsymb=%d (expected 16)",
+			ts.ofdm.mfsk_corr_template_nsymb);
+		test_fail(name, buf);
+		return;
+	}
+
+	// Per-symbol energies must be non-zero for ALL 16 indices. Pre-fix
+	// the precompute loop at telecom_system.cc:4995 was `k < 8`, so
+	// indices 8..15 would be left at the constructor default (0.0).
+	for (int k = 0; k < 16; k++) {
+		if (ts.ofdm.mfsk_corr_template_sym_energy[k] <= 0.0) {
+			char buf[160];
+			snprintf(buf, sizeof(buf),
+				"mfsk_corr_template_sym_energy[%d]=%.6f (expected > 0)",
+				k, ts.ofdm.mfsk_corr_template_sym_energy[k]);
+			test_fail(name, buf);
+			return;
+		}
+	}
+
+	// preamble_tones[] must be filled out for all 16 symbols. Pre-fix
+	// only entries 0..3 were written; entries 4..15 stayed at whatever
+	// the constructor / previous-config left behind (often 0).
+	// A degenerate run could leave all of 4..15 == 0; the post-fix code
+	// computes (base[s%4] + s*tone_hop_step) % M which traverses M tones
+	// for the WB hop steps (13 for M=32, 7 for M=16), so we expect at
+	// least 8 DISTINCT values across the 16 entries (the cyclic hop
+	// guarantees this for any base[] of size 4 with coprime hop step).
+	int distinct = 0;
+	bool seen[64] = {};
+	for (int s = 0; s < 16; s++) {
+		int t = ts.mfsk.preamble_tones[s];
+		if (t < 0 || t >= ts.mfsk.M) {
+			char buf[128];
+			snprintf(buf, sizeof(buf),
+				"preamble_tones[%d]=%d out-of-range for M=%d",
+				s, t, ts.mfsk.M);
+			test_fail(name, buf);
+			return;
+		}
+		if (t < 64 && !seen[t]) { seen[t] = true; distinct++; }
+	}
+	if (distinct < 8) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"preamble_tones[] only spans %d distinct tones across 16 symbols "
+			"(expected >= 8 via tone_hop_step)", distinct);
+		test_fail(name, buf);
+		return;
+	}
+
+	test_pass(name);
+}
+
+// §5.2 — End-to-end passband round-trip exercising the extended preamble
+//   through the full TX→RX chain: generate_preamble → symbol_mod →
+//   baseband_to_passband → passband_to_baseband(FIR_rx_time_sync) →
+//   time_sync_mfsk_corr. Asserts the corr metric exceeds the production
+//   0.5 threshold and the detected delay is within ±1 symbol of the
+//   injection point.
+//
+// Pre-fix behavior (would fail): with `mfsk_corr_template_sym_energy[k]
+// == 0` for k in 8..15, the per-symbol normalization in
+// time_sync_mfsk_corr (denom = sym_energy[k] * e_rx_sym) sets denom to 0
+// for those symbols. The `denom > 1e-30` guard makes the loop SILENTLY
+// skip them — but valid_syms only counts indices 0..7, so metric is
+// dominated by the first 8 symbols. The template length on RX side
+// was 4 pre-fix (mfsk.preamble_nSymb=4), so the corr would still find
+// the (shorter) preamble. The cliff failure is a low-SNR phenomenon —
+// at sigma=0 the corr metric is ~1.0 for both 4 and 16 sym preambles.
+//
+// Therefore this round-trip test is primarily a SHAPE check: with the
+// fix in place, `template_nsymb` is 16, and we verify the corr metric
+// crosses the production threshold AND the detected delay is correct.
+// Combined with §5.1 (which asserts template_nsymb==16 and all 16
+// sym_energy entries populated), this test guards against silent
+// shape regressions where preamble_nSymb is bumped without the
+// template-energy array being resized accordingly — exactly the
+// Phase B Wave 2 v1 class of sibling bug.
+static void test_mfsk_data_preamble_passband_roundtrip_clean() {
+	const char* name = "mfsk_data_preamble_passband_roundtrip_clean";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);  // WB MFSK M=32
+
+	if (ts.mfsk.preamble_nSymb != 16 ||
+	    ts.data_container.preamble_nSymb != 16) {
+		test_fail(name, "pre-condition: preamble_nSymb != 16 after load_configuration");
+		return;
+	}
+	if (ts.ofdm.mfsk_corr_template == NULL) {
+		test_fail(name, "mfsk_corr_template not generated by load_configuration");
+		return;
+	}
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int preamble_nSymb = ts.data_container.preamble_nSymb;
+	int interp = ts.data_container.interpolation_rate;
+	int sym_samples = Nofdm * interp;
+
+	// Step 1: generate preamble symbols in frequency domain (mfsk.cc:450).
+	// load_configuration already did this for the template, but we
+	// re-run to populate preamble_data freshly for the TX side.
+	// Use ts.mfsk (the data MFSK, M=32 for ROBUST_0), NOT ts.ack_mfsk
+	// (which is the universal M=16 ACK-pattern MFSK with its own preamble).
+	ts.mfsk.generate_preamble(ts.data_container.preamble_data, preamble_nSymb);
+
+	// Step 2: symbol_mod each preamble symbol into the time-domain
+	// modulated data array (telecom_system.cc:627-630).
+	for (int i = 0; i < preamble_nSymb; i++) {
+		ts.ofdm.symbol_mod(
+			&ts.data_container.preamble_data[i * Nc],
+			&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+	}
+
+	// Step 3: skip power normalization. The corr template was generated
+	// by load_configuration without normalization (telecom_system.cc:
+	// 4977 calls baseband_to_passband directly on raw IFFT output);
+	// time_sync_mfsk_corr's metric is amplitude-invariant (normalized
+	// cosine-similarity squared), so the only requirement is that the
+	// preamble waveform spectral shape matches the template.
+
+	// Step 4: baseband -> passband (telecom_system.cc:669). Writes
+	// `Nofdm * preamble_nSymb * interp_rate` passband samples.
+	int passband_samples = Nofdm * preamble_nSymb * interp;
+	std::vector<double> preamble_pb((size_t)passband_samples, 0.0);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		ts.data_container.preamble_symbol_modulated_data,
+		Nofdm * preamble_nSymb,
+		preamble_pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	// Step 5: build a buffer = preamble + trailing silence. We deliberately
+	// avoid a LEADING silence pad here: the corr template generated by
+	// load_configuration was built by feeding the preamble baseband DIRECTLY
+	// into baseband_to_passband and then passband_to_baseband(FIR_rx_time_sync)
+	// (telecom_system.cc:4988-4998), so the template's first symbol absorbs
+	// the FIR transient that grows from the leading edge. To make the RX
+	// waveform match the template's spectral content, we put the preamble
+	// at sample 0 (no leading silence to pollute the FIR transient state).
+	// Trailing silence gives the detector room to scan beyond the true
+	// position without hitting the end-of-buffer bound.
+	int trailing_pad = 12 * sym_samples;
+	int buffer_pb_size = passband_samples + trailing_pad;
+	int buffer_nsymb_pb = buffer_pb_size / sym_samples;
+	// Snap buffer to whole symbols
+	buffer_pb_size = buffer_nsymb_pb * sym_samples;
+	int expected_delay_pb = 0;  // preamble starts at sample 0
+
+	std::vector<double> buffer_pb((size_t)buffer_pb_size, 0.0);
+	for (int i = 0; i < passband_samples && i < buffer_pb_size; i++) {
+		buffer_pb[i] = preamble_pb[i];
+	}
+
+	// Step 6: passband -> baseband_interpolated via FIR_rx_time_sync
+	// (telecom_system.cc:953 pattern). Output is full-rate interpolated
+	// baseband — the same input format time_sync_mfsk_corr expects.
+	std::vector<std::complex<double>> baseband_interp((size_t)buffer_pb_size,
+		std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(
+		buffer_pb.data(), buffer_pb_size, baseband_interp.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		1, &ts.ofdm.FIR_rx_time_sync);
+
+	// Step 7: invoke the production preamble detector.
+	double sync_metric = 0.0;
+	int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+		baseband_interp.data(), buffer_pb_size, interp,
+		/*search_start_symb=*/0, &sync_metric);
+
+	if (detected_delay < 0) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"time_sync_mfsk_corr returned -1 (no preamble found), metric=%.4f",
+			sync_metric);
+		test_fail(name, buf);
+		return;
+	}
+	// Production threshold is 0.5 (ofdm.cc:3217). Clean round-trip
+	// typically yields metric ~0.9-1.0.
+	if (sync_metric < 0.5) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"sync_metric=%.4f below production threshold 0.5",
+			sync_metric);
+		test_fail(name, buf);
+		return;
+	}
+	// Delay tolerance: ±1 symbol (interp-rate units).
+	int delay_err = std::abs(detected_delay - expected_delay_pb);
+	if (delay_err > sym_samples) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"detected_delay=%d expected=%d err=%d > %d (1 sym)",
+			detected_delay, expected_delay_pb, delay_err, sym_samples);
+		test_fail(name, buf);
+		return;
+	}
+
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -985,6 +1244,11 @@ int run_mfsk_ctrl_codec_tests() {
 	// §4 Wave 3 (§14) TEST_CONN integration tests
 	test_v3_test_conn_passband_roundtrip_clean();
 	test_v3_test_conn_snr_quantization_roundtrip();
+
+	// §5 MFSK WB data-preamble 4 -> 16 cross-layer regression
+	// (data-flow-preamble_nSymb.md, 2026-05-27).
+	test_preamble_nSymb_wb_robust0_extended_to_16();
+	test_mfsk_data_preamble_passband_roundtrip_clean();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
