@@ -238,11 +238,30 @@ public:
 	// (data-flow-preamble_nSymb.md §H1). NB still uses 8 symbols; entries
 	// 8..15 stay zero on NB and the time_sync_mfsk_corr loop reads
 	// `template_nsymb` (= mfsk.preamble_nSymb) so unused slots are skipped.
+	//
+	// 2026-05-27 (data-preamble-port-research.md §14): `time_sync_mfsk_corr`
+	// is now a discrete FFT-bin-argmax matcher (mirror of detect_ack_pattern).
+	// The template waveform is kept here as DEAD STATE for revert safety;
+	// the new detector reads `mfsk_preamble_*` fields below for tone bins.
+	// (Template cleanup deferred to a follow-up commit per §8.4.)
 	std::complex<double>* mfsk_corr_template;
 	int mfsk_corr_template_len;
 	double mfsk_corr_template_energy;
 	int mfsk_corr_template_nsymb;
 	double mfsk_corr_template_sym_energy[16]; // per-symbol energy for per-symbol correlation
+
+	// MFSK preamble parameters consumed by `time_sync_mfsk_corr` (post-2026-05-27
+	// discrete-match port). Populated by load_configuration alongside the
+	// template (telecom_system.cc:4956+). Mirror of `cl_mfsk::M`,
+	// `cl_mfsk::nStreams`, `cl_mfsk::stream_offsets[]`, `cl_mfsk::preamble_tones[]`,
+	// `cl_mfsk::preamble_nSymb`, `cl_mfsk::preamble_match_threshold`.
+	int mfsk_M;
+	int mfsk_nStreams;
+	int mfsk_stream_offsets[4]; // matches cl_mfsk::MAX_STREAMS
+	int mfsk_preamble_tones[16]; // matches MAX_PREAMBLE_SYMB
+	int mfsk_preamble_nsymb;
+	int mfsk_preamble_match_threshold;
+
 	int time_sync_mfsk_corr(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int search_start_symb, double* out_metric);
 
 	// OFDM matched-filter preamble template (replaces FFT-based detection)

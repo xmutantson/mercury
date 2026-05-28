@@ -114,6 +114,13 @@ cl_ofdm::cl_ofdm()
 	mfsk_corr_template_energy=0.0;
 	mfsk_corr_template_nsymb=0;
 	for(int i=0;i<16;i++) mfsk_corr_template_sym_energy[i]=0.0;
+	// MFSK preamble parameters (discrete-match port, §14).
+	mfsk_M=0;
+	mfsk_nStreams=0;
+	mfsk_preamble_nsymb=0;
+	mfsk_preamble_match_threshold=0;
+	for(int i=0;i<16;i++) mfsk_preamble_tones[i]=0;
+	for(int i=0;i<4;i++) mfsk_stream_offsets[i]=0;
 	// OFDM matched-filter template
 	ofdm_corr_template=NULL;
 	ofdm_corr_template_len=0;
@@ -3019,224 +3026,243 @@ int cl_ofdm::time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_si
 // avoids the destructive interference that occurs when correlating multi-tone
 // templates coherently (different tones rotate at different rates).
 //
+// 2026-05-27 (data-preamble-port-research.md §14): body replaced with a
+// discrete FFT-bin-argmax matcher mirroring `detect_ack_pattern`. The
+// metric is now a COUNT of per-symbol matches (range 0..preamble_nSymb)
+// — length-scaled by construction. The threshold `preamble_match_threshold`
+// (mfsk.cc) gates detection.
+//
+// Function signature is preserved: returns full-rate sample offset on
+// detect, -1 on no-detect. `*out_metric` now reports the matched count
+// (not cosine²-mean). Diagnostic-only — no flow-control code reads it.
+//
 // Returns delay in interpolated samples, or -1 if no preamble found.
 int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
                                   int buffer_size_interp, int interpolation_rate,
                                   int search_start_symb, double* out_metric)
 {
-	if (mfsk_corr_template == NULL || mfsk_corr_template_len <= 0 || mfsk_corr_template_nsymb <= 0)
+	if (out_metric) *out_metric = 0.0;
+
+	if (mfsk_M <= 0 || mfsk_nStreams <= 0 || mfsk_preamble_nsymb <= 0)
+		return -1;
+	if (mfsk_preamble_match_threshold <= 0)
+		return -1;
+	if (work_buf_a == NULL || work_buf_b == NULL || Nfft <= 0)
 		return -1;
 
 	int Nofdm = Nfft + Ngi;
 	int sym_period_interp = Nofdm * interpolation_rate;
+	if (sym_period_interp <= 0) return -1;
 	int buffer_nsymb = buffer_size_interp / sym_period_interp;
-	int template_nsymb = mfsk_corr_template_nsymb;
+	int preamble_n = mfsk_preamble_nsymb;
+	if (buffer_nsymb < preamble_n) return -1;
 
-	int p1_start_interp = (search_start_symb > 0) ? search_start_symb * sym_period_interp : 0;
-	int p1_end_interp = (buffer_nsymb - template_nsymb) * sym_period_interp;
-
-	// Phase 1 oversampling: search at sub-symbol resolution to catch preambles
-	// that fall between symbol boundaries. With M=4 NB, the preamble metric at
-	// half-symbol misalignment drops to ~0.25 — comparable to data content false
-	// peaks (~0.22). At 4× oversampling, max misalignment is 12.5% of a symbol,
-	// keeping preamble metric > 0.76 — well above data content. (Bug #44)
-	static const int P1_OVERSAMPLE = 4;
-	int p1_step = sym_period_interp / P1_OVERSAMPLE;
-
-	// Collect top-K Phase 1 candidates for multi-candidate Phase 2 evaluation.
-	static const int P1_TOP_K = 8;
-	struct { int pos_interp; double metric; } p1_candidates[P1_TOP_K];
-	int n_candidates = 0;
-
-	double best_p1_metric = -1.0;
-	int best_p1_pos = -1;
-
-	for (int base_interp = p1_start_interp; base_interp <= p1_end_interp; base_interp += p1_step)
-	{
-		// Check bounds: need all template symbols
-		if (base_interp + (template_nsymb * Nofdm - 1) * interpolation_rate >= buffer_size_interp)
-			break;
-
-		double total_metric = 0.0;
-		int valid_syms = 0;
-		bool rejected = false;
-		// Per-symbol floor relaxed 0.05 -> 0.01 on 2026-05-27 per
-		// data-frame-cliff-audit-2026-05-27.md §H2. The 0.05 floor
-		// rejected any candidate where ONE preamble symbol scored below
-		// it — a hard cliff. At WGN:-4 to -8 a single momentarily-faded
-		// symbol kills the whole detection (the audit traces 90% of
-		// WGN:-8 NO-PREAMBLE failures to per-symbol rejection). 0.01 is
-		// still ~10x the expected pure-noise cosine-similarity floor
-		// (~1/(2*Nofdm) ~ 0.0017 for Nofdm=292), so false-accept margin
-		// remains. Independent of the preamble-length fix (mfsk.cc:122);
-		// each contributes ~+1-2 dB. Kept in a separate commit so
-		// hardware A/B can disambiguate the dB contributions.
-		double per_sym_floor = 0.01;
-
-		for (int k = 0; k < template_nsymb && !rejected; k++)
-		{
-			int tmpl_offset = k * Nofdm;
-			int rx_offset = base_interp + k * sym_period_interp;
-
-			double corr_re = 0.0, corr_im = 0.0;
-			double e_rx_sym = 0.0;
-
-			for (int n = 0; n < Nofdm; n++)
-			{
-				std::complex<double> rx = baseband_interp[rx_offset + n * interpolation_rate];
-				double t_re = mfsk_corr_template[tmpl_offset + n].real();
-				double t_im = mfsk_corr_template[tmpl_offset + n].imag();
-				double r_re = rx.real();
-				double r_im = rx.imag();
-
-				corr_re += t_re * r_re + t_im * r_im;
-				corr_im += t_im * r_re - t_re * r_im;
-
-				e_rx_sym += r_re * r_re + r_im * r_im;
-			}
-
-			double corr_mag_sq = corr_re * corr_re + corr_im * corr_im;
-			double denom = mfsk_corr_template_sym_energy[k] * e_rx_sym;
-			if (denom > 1e-30)
-			{
-				double sym_metric = corr_mag_sq / denom;
-				if (sym_metric < per_sym_floor)
-				{
-					rejected = true;
-					break;
-				}
-				total_metric += sym_metric;
-				valid_syms++;
-			}
-		}
-
-		if (rejected) continue;
-
-		double metric = (valid_syms > 0) ? total_metric / valid_syms : 0.0;
-
-		// Insert into top-K sorted array (descending by metric)
-		if (n_candidates < P1_TOP_K || metric > p1_candidates[n_candidates - 1].metric)
-		{
-			int insert_at = n_candidates < P1_TOP_K ? n_candidates : P1_TOP_K - 1;
-			for (int t = 0; t < n_candidates && t < P1_TOP_K; t++)
-			{
-				if (metric > p1_candidates[t].metric)
-				{
-					insert_at = t;
-					break;
-				}
-			}
-			// Shift down
-			int end = (n_candidates < P1_TOP_K) ? n_candidates : P1_TOP_K - 1;
-			for (int u = end; u > insert_at; u--)
-				p1_candidates[u] = p1_candidates[u - 1];
-			p1_candidates[insert_at] = {base_interp, metric};
-			if (n_candidates < P1_TOP_K) n_candidates++;
-		}
-
-		if (metric > best_p1_metric)
-		{
-			best_p1_metric = metric;
-			best_p1_pos = base_interp;
-		}
-		// Early exit on first strong preamble: prefer the earliest detection
-		// to avoid finding a commander resend whose frame overflows the buffer
-		// while an earlier copy's frame fits. Real preambles score ~1.0,
-		// noise ~0.004, so 0.5 has huge margin and won't false-trigger.
-		if (metric > 0.5)
-			break;
-	}
-
-	// Phase 1 must have found at least one non-rejected candidate for Phase 2
-	// to have something to refine. If Phase 1 found nothing (all positions
-	// rejected by per_sym_floor or empty buffer), skip Phase 2.
-	if (best_p1_pos < 0)
-	{
-		if (out_metric) *out_metric = best_p1_metric;
+	int s_start = (search_start_symb > 0) ? search_start_symb : 0;
+	if (s_start > buffer_nsymb - preamble_n) {
+		// Nothing to search.
 		return -1;
 	}
 
-	// Phase 2: Fine timing refinement at base-rate resolution.
-	// Run on ALL top-K Phase 1 candidates. With 4× oversampled Phase 1, the
-	// preamble should be in top-K (metric > 0.76 vs data content ~0.22).
-	// Phase 2 refines to exact sample position within ±1 symbol of each candidate.
-	int search_half = sym_period_interp;
-	int best_fine = best_p1_pos;
-	double best_fine_metric = -1.0;
-	int best_fine_cand = 0;
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+	int half = Nc / 2;
 
-	for (int ci = 0; ci < n_candidates; ci++)
+	// Phase 1: coarse symbol-grid scan. For each candidate start s, count
+	// the number of preamble symbols whose FFT-bin argmax (per stream)
+	// matches the expected preamble tone bin. Track best (matched, metric).
+	int best_pos = -1;
+	int best_matched = -1;
+	double best_metric = -1.0;
+
+	for (int s = s_start; s <= buffer_nsymb - preamble_n; s++)
 	{
-		int coarse = p1_candidates[ci].pos_interp;
+		int matched = 0;
+		double metric = 0.0;
 
-		for (int d = coarse - search_half; d <= coarse + search_half; d += interpolation_rate)
+		for (int p = 0; p < preamble_n; p++)
 		{
-			if (d < 0) continue;
+			int sym_idx = s + p;
+			int offset = sym_idx * sym_period_interp + Ngi * interpolation_rate;
+			if (offset + Nfft * interpolation_rate > buffer_size_interp)
+				break;
 
-			double total_metric = 0.0;
-			int valid_syms = 0;
-			bool out_of_bounds = false;
+			// Decimate at stride `interpolation_rate` (full-rate input) and FFT.
+			for (int i = 0; i < Nfft; i++)
+				decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+			fft(decimated_sym, fft_out, Nfft);
 
-			for (int k = 0; k < template_nsymb && !out_of_bounds; k++)
+			// Expected tone for this symbol. No hopping at emit time —
+			// preamble_tones[] stores the full sequence directly
+			// (mfsk.cc generate_preamble:467 reads preamble_tones[s % nsymb]).
+			int actual_tone = mfsk_preamble_tones[p % 16];
+			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
+
+			int streams_matched = 0;
+			double e_target = 0.0;
+			for (int st = 0; st < mfsk_nStreams; st++)
 			{
-				int tmpl_off = k * Nofdm;
-				int rx_base = d + k * sym_period_interp;
+				int sub = mfsk_stream_offsets[st] + actual_tone;
+				int expected_bin = (sub < half) ? (Nfft - half + sub)
+				                                 : (start_shift + (sub - half));
+				int mirror_bin = (Nfft - expected_bin) % Nfft;
 
-				if (rx_base + (Nofdm - 1) * interpolation_rate >= buffer_size_interp)
-				{
-					out_of_bounds = true;
-					break;
-				}
+				double ee = fft_out[expected_bin].real() * fft_out[expected_bin].real()
+				          + fft_out[expected_bin].imag() * fft_out[expected_bin].imag();
+				double em = fft_out[mirror_bin].real() * fft_out[mirror_bin].real()
+				          + fft_out[mirror_bin].imag() * fft_out[mirror_bin].imag();
+				e_target += ee + em;
 
-				double cr = 0.0, ci2 = 0.0, erx = 0.0;
-				for (int n = 0; n < Nofdm; n++)
+				// Find peak bin among this stream's M tones (argmax).
+				double peak_e = -1.0;
+				int peak_bin = -1;
+				for (int t = 0; t < mfsk_M; t++)
 				{
-					std::complex<double> rx = baseband_interp[rx_base + n * interpolation_rate];
-					double t_re = mfsk_corr_template[tmpl_off + n].real();
-					double t_im = mfsk_corr_template[tmpl_off + n].imag();
-					cr += t_re * rx.real() + t_im * rx.imag();
-					ci2 += t_im * rx.real() - t_re * rx.imag();
-					erx += rx.real() * rx.real() + rx.imag() * rx.imag();
+					int tsub = mfsk_stream_offsets[st] + t;
+					int b = (tsub < half) ? (Nfft - half + tsub)
+					                       : (start_shift + (tsub - half));
+					double e = fft_out[b].real() * fft_out[b].real()
+					         + fft_out[b].imag() * fft_out[b].imag();
+					if (e > peak_e) { peak_e = e; peak_bin = b; }
 				}
-
-				double denom = mfsk_corr_template_sym_energy[k] * erx;
-				if (denom > 1e-30)
-				{
-					total_metric += (cr * cr + ci2 * ci2) / denom;
-					valid_syms++;
-				}
+				// Carrier-image recovery (Bug #39 pattern in detect_ack_pattern):
+				// accept expected OR mirror as peak. Energy gate prevents 0==0
+				// match on silence.
+				if (peak_e > 0 && (peak_bin == expected_bin || peak_bin == mirror_bin))
+					streams_matched++;
 			}
 
-			if (out_of_bounds) continue;
-			double metric = (valid_syms > 0) ? total_metric / valid_syms : 0.0;
-			if (metric > best_fine_metric)
+			if (streams_matched < mfsk_nStreams)
+				continue;
+			matched++;
+
+			// Continuous secondary metric: energy in target bins / total energy
+			// across the Nc occupied subcarriers. Diagnostic / tie-breaker only.
+			double e_total = 0.0;
+			for (int k = 0; k < Nc; k++)
 			{
-				best_fine_metric = metric;
-				best_fine = d;
-				best_fine_cand = ci;
+				int bk = (k < half) ? (Nfft - half + k)
+				                    : (start_shift + (k - half));
+				double e = fft_out[bk].real() * fft_out[bk].real()
+				         + fft_out[bk].imag() * fft_out[bk].imag();
+				e_total += e;
 			}
+			if (e_total > 0.0) metric += e_target / e_total;
 		}
 
-		// Early exit: if this candidate already passed threshold, no need to
-		// check lower-ranked candidates
-		if (best_fine_metric > 0.5)
-			break;
+		// Pick winner by (matched DESC, metric DESC) — matched is the
+		// length-scaled detection statistic.
+		if (matched > best_matched ||
+		    (matched == best_matched && metric > best_metric))
+		{
+			best_matched = matched;
+			best_metric = metric;
+			best_pos = s;
+		}
 	}
 
-	// Threshold: apply to Phase 2 refined metric (not Phase 1 coarse metric).
-	// Real preamble after Phase 2 refinement: metric ≈ 1.0.
-	// Random MFSK data at Phase 2 best: up to ~0.44 for M=4 (NB ROBUST_1).
-	// Noise: ~0.004. Threshold 0.5 cleanly separates. (Bug #34, Bug #40, Bug #44)
-	double threshold = 0.5;
-
-	if (best_fine_metric < threshold)
+	if (best_pos < 0)
 	{
-		if (out_metric) *out_metric = best_fine_metric;
+		if (out_metric) *out_metric = 0.0;
 		return -1;
 	}
 
-	if (out_metric) *out_metric = best_fine_metric;
-	return best_fine;
+	// Phase 2: fine refinement at base-rate resolution within ±sym_period/2
+	// of the coarse position. always_fine=true semantics — data symbols
+	// downstream need sample-precise alignment, so we ALWAYS refine even
+	// when coarse_matched < threshold (matches detect_ack_pattern's
+	// always_fine=true branch).
+	int coarse_offset = best_pos * sym_period_interp;
+	int search_half = sym_period_interp / 2;
+	int fine_best_matched = best_matched;
+	double fine_best_metric = best_metric;
+	int fine_best_offset = coarse_offset;
+
+	for (int d = coarse_offset - search_half; d <= coarse_offset + search_half; d += interpolation_rate)
+	{
+		if (d < 0) continue;
+		// Ensure all preamble symbols fit.
+		if (d + preamble_n * sym_period_interp > buffer_size_interp) continue;
+
+		int matched_f = 0;
+		double metric_f = 0.0;
+		bool oob = false;
+
+		for (int p = 0; p < preamble_n && !oob; p++)
+		{
+			int offset = d + p * sym_period_interp + Ngi * interpolation_rate;
+			if (offset + Nfft * interpolation_rate > buffer_size_interp) { oob = true; break; }
+
+			for (int i = 0; i < Nfft; i++)
+				decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+			fft(decimated_sym, fft_out, Nfft);
+
+			int actual_tone = mfsk_preamble_tones[p % 16];
+			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
+
+			int streams_ok = 0;
+			double e_targ = 0.0;
+			for (int st = 0; st < mfsk_nStreams; st++)
+			{
+				int sub = mfsk_stream_offsets[st] + actual_tone;
+				int ebin = (sub < half) ? (Nfft - half + sub)
+				                        : (start_shift + (sub - half));
+				int mbin = (Nfft - ebin) % Nfft;
+
+				double ee = fft_out[ebin].real() * fft_out[ebin].real()
+				          + fft_out[ebin].imag() * fft_out[ebin].imag();
+				double em = fft_out[mbin].real() * fft_out[mbin].real()
+				          + fft_out[mbin].imag() * fft_out[mbin].imag();
+				e_targ += ee + em;
+
+				double pk = -1.0;
+				int pkbin = -1;
+				for (int t = 0; t < mfsk_M; t++)
+				{
+					int tsub = mfsk_stream_offsets[st] + t;
+					int b = (tsub < half) ? (Nfft - half + tsub)
+					                       : (start_shift + (tsub - half));
+					double e = fft_out[b].real() * fft_out[b].real()
+					         + fft_out[b].imag() * fft_out[b].imag();
+					if (e > pk) { pk = e; pkbin = b; }
+				}
+				if (pk > 0 && (pkbin == ebin || pkbin == mbin))
+					streams_ok++;
+			}
+
+			if (streams_ok < mfsk_nStreams) continue;
+			matched_f++;
+
+			double e_tot = 0.0;
+			for (int k = 0; k < Nc; k++)
+			{
+				int bk = (k < half) ? (Nfft - half + k)
+				                    : (start_shift + (k - half));
+				double e = fft_out[bk].real() * fft_out[bk].real()
+				         + fft_out[bk].imag() * fft_out[bk].imag();
+				e_tot += e;
+			}
+			if (e_tot > 0.0) metric_f += e_targ / e_tot;
+		}
+
+		if (oob) continue;
+		if (matched_f > fine_best_matched ||
+		    (matched_f == fine_best_matched && metric_f > fine_best_metric))
+		{
+			fine_best_matched = matched_f;
+			fine_best_metric = metric_f;
+			fine_best_offset = d;
+		}
+	}
+
+	// Detection gate: length-scaled discrete match count.
+	if (fine_best_matched < mfsk_preamble_match_threshold)
+	{
+		if (out_metric) *out_metric = (double)fine_best_matched;
+		return -1;
+	}
+
+	if (out_metric) *out_metric = (double)fine_best_matched;
+	return fine_best_offset;
 }
 
 // ACK pattern detection: slide window across buffer, accumulate E_target/E_total

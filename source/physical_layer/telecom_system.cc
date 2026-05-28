@@ -5027,6 +5027,18 @@ void cl_telecom_system::load_configuration(int configuration)
 		printf("[PHY] MFSK corr template: %d symbols, %d samples, energy=%.3f (per-sym corr, FIR round-tripped)\n",
 			template_nsymb, bb_len, ofdm.mfsk_corr_template_energy);
 		fflush(stdout);
+
+		// Populate MFSK preamble parameters consumed by the discrete-match
+		// `time_sync_mfsk_corr` detector (post-2026-05-27 port per
+		// data-preamble-port-research.md §14). Mirror of cl_mfsk fields.
+		ofdm.mfsk_M = mfsk.M;
+		ofdm.mfsk_nStreams = mfsk.nStreams;
+		for(int st = 0; st < 4; st++)
+			ofdm.mfsk_stream_offsets[st] = (st < cl_mfsk::MAX_STREAMS) ? mfsk.stream_offsets[st] : 0;
+		ofdm.mfsk_preamble_nsymb = mfsk.preamble_nSymb;
+		for(int s = 0; s < 16; s++)
+			ofdm.mfsk_preamble_tones[s] = (s < cl_mfsk::MAX_PREAMBLE_SYMB) ? mfsk.preamble_tones[s] : 0;
+		ofdm.mfsk_preamble_match_threshold = mfsk.preamble_match_threshold;
 	}
 	else
 	{
@@ -5034,6 +5046,14 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm.mfsk_corr_template_len = 0;
 		ofdm.mfsk_corr_template_energy = 0.0;
 		ofdm.mfsk_corr_template_nsymb = 0;
+
+		// Reset MFSK preamble params on non-MFSK configs.
+		ofdm.mfsk_M = 0;
+		ofdm.mfsk_nStreams = 0;
+		ofdm.mfsk_preamble_nsymb = 0;
+		ofdm.mfsk_preamble_match_threshold = 0;
+		for(int s = 0; s < 16; s++) ofdm.mfsk_preamble_tones[s] = 0;
+		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
 
 #if 0 // Template generation disabled: using Schmidl-Cox autocorrelation
 		// Generate OFDM matched-filter template for preamble detection.
