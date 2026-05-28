@@ -1224,3 +1224,134 @@ Document the actual pre-fix metric values produced.
   follow each other tightly). §6.2/§6.3 argue this is bounded but
   hardware should empirically confirm zero detect events between
   HAIL and CMD frames in IONOS captures.
+
+---
+
+## §15. preamble_match_threshold push (pre-code, 2026-05-28)
+
+**Status:** PLAN — to be implemented on branch `fix/preamble-thr6` in the
+worktree `mercury-worktrees/preamble-thr6`. Baseline `b328a4d` (HEAD of
+discrete-match port). `mercury.exe --test` 22/22 passing pre-change.
+
+**Goal.** The discrete-match port (§14) shipped with a uniform threshold
+of 7/16 on WB and 7/8 on NB. Hardware A/B confirmed the cliff moved
+WGN:−4 → WGN:−8 (mean +50% total bytes across 3 passes/arm). HAIL
+detection floor is ~WGN:−10 — there are ~2 dB of headroom in the data
+preamble detector before we hit the HAIL detector's own floor.
+
+The §14.3 FAR table identified M=32 as the *tightest* random-data
+baseline (`p_random = 1/M = 1/32`), so lowering ONLY the M=32 case to
+T=6 captures the headroom at WB ROBUST_0 (data config) without
+sacrificing safety at M=16 (where p_random is 2× larger and would not
+support the same drop).
+
+### §15.1 Per-modulation FAR table
+
+Recomputed via `P(K ≥ T)` for `K ~ Binomial(N, 1/M)` (CLAUDE.md §1.4
+plan-before-code; numbers cross-checked against `scipy.stats.binom.sf`):
+
+| Modulation | N | T (proposed) | p = 1/M | P(K ≥ T) per poll |
+|---|---|---|---|---|
+| **WB M=32** (ROBUST_0)            | 16 | **6**  | 1/32 | **5.69×10⁻⁶** |
+| WB M=32 (current, for comparison) | 16 | 7      | 1/32 | 2.60×10⁻⁷ |
+| WB M=16 (ROBUST_1/2, ctrl frames) | 16 | 7      | 1/16 | 2.57×10⁻⁵ |
+| NB M=8                            | 8  | 7      | 1/8  | 3.40×10⁻⁶ |
+| NB M=4                            | 8  | 7      | 1/4  | 3.82×10⁻⁴ |
+
+**Escalation gate:** the operator brief required `< 1×10⁻⁵/poll` for
+the new M=32 threshold or the change must NOT ship. **5.69×10⁻⁶ is
+under the bound by 1.8×.** OK to proceed.
+
+(The operator brief estimated `~8×10⁻⁶`; the exact value is `5.69×10⁻⁶`
+— slightly tighter. Confirms direction.)
+
+At ROBUST_0 polling rates (~10 polls/sec), one expected false alarm
+every ~2 days continuous. Consequence per §6.4: spurious LDPC decode
+on noise → CRC fail → ~30 ms wasted compute. Bounded.
+
+### §15.2 Why ONLY M=32
+
+- M=16: T=6 would give P(K≥6) = 2.76×10⁻⁴ — 11× looser than the
+  current 7/16 figure and ~50× looser than the M=32 proposed value.
+  Above the `< 1×10⁻⁵` gate. **Do not lower.**
+- M=8 / M=4: NB sessions, control frames, the M=4 case is already at
+  3.8×10⁻⁴/poll which is the operational ceiling. **Do not lower.**
+- M=32: the safest place to push. The random-data baseline `p=1/32`
+  gives 100× margin over M=16 at the same threshold, so going T=7→T=6
+  on M=32 alone stays safer than M=16 at T=7 (5.7×10⁻⁶ vs 2.6×10⁻⁵).
+
+### §15.3 Per-modulation threshold table (replaces uniform T=7)
+
+```cpp
+// source/physical_layer/mfsk.cc:206-209
+if (M == 32)
+    preamble_match_threshold = 6;   // WB M=32 (ROBUST_0); FAR 5.7e-6/poll
+else if (M >= 16)
+    preamble_match_threshold = 7;   // WB M=16 (ctrl-frame data PHY); FAR 2.6e-5/poll
+else
+    preamble_match_threshold = 7;   // NB M=8/M=4; tightest case M=4 FAR 3.8e-4
+```
+
+### §15.4 Cross-layer audit — unchanged structurally
+
+The §10 audit in `data-flow-preamble_nSymb.md` enumerated the
+consumer surface for `preamble_match_threshold`:
+- Single producer: `cl_mfsk::cl_mfsk` init, mirrored into
+  `cl_ofdm::mfsk_preamble_match_threshold` at
+  `telecom_system.cc:5041`.
+- Single consumer: `cl_ofdm::time_sync_mfsk_corr` at
+  `ofdm.cc:3258` — gate `fine_best_matched < mfsk_preamble_match_threshold`.
+
+This change only moves the VALUE for one M-branch. No producers
+added, no consumers added. INV-PORT-4
+(`preamble_match_threshold ∈ (preamble_nSymb/M, preamble_nSymb]`)
+still holds at T=6 for M=32: `6 > 16/32 = 0.5`. **No data-flow audit
+update required**; this §15 entry is the audit record.
+
+### §15.5 Existing false-alarm tests — survival check
+
+The discrete-match port shipped two false-alarm regression tests in
+`mfsk_ctrl_codec_tests.cc`:
+
+1. **`mfsk_data_preamble_argmax_pure_noise`** (line 1457). 100 random
+   WGN buffers (no preamble), ROBUST_0 (M=32). Assert ≤1 false detect.
+   At T=6: expected false positives over 100 trials = 100 ×
+   5.69×10⁻⁶ ≈ 5.7×10⁻⁴. The "≤1" bound passes with margin of ~1800×.
+
+2. **`mfsk_data_preamble_argmax_data_content`** (line 1503). Random
+   in-alphabet MFSK data symbols (no preamble), ROBUST_0. Assert
+   no detect across the buffer. The argmax-on-random-data baseline is
+   1/M = 1/32 per symbol. P(K ≥ 6 in 16-symbol window) = 5.69×10⁻⁶.
+   The buffer has 32 symbols (~16 starting positions); aggregate
+   expected false positives ≈ 9×10⁻⁵ per buffer. **Passes with margin.**
+
+Conclusion: existing tests still pass at T=6 by a comfortable
+~1000× margin. No test strengthening required for the M=32-only push.
+
+If we ever wanted to push M=16 to T=6 (NOT this change), the FAR rises
+to 2.8×10⁻⁴/poll; a stronger test (1000+ trials at M=16) would be
+needed.
+
+### §15.6 Commit list
+
+1. `docs(preamble): §15 plan — relax M=32 preamble_match_threshold 7→6`
+   (this entry, before code).
+2. `phy(mfsk): preamble_match_threshold 7→6 for M=32 only`
+   (mfsk.cc:206-209 + per-M branching + updated FAR comment block).
+3. (no separate audit-doc commit — §15.4 declares no structural
+   change to `data-flow-preamble_nSymb.md` §10; this fact-doc IS
+   the audit.)
+
+### §15.7 Open issues for hardware operator
+
+- Re-run IONOS WGN sweep at WGN ∈ {−6, −8, −10, −12}, ROBUST_0,
+  180s dwell, 3 passes/arm. Compare against §14.11 baseline (WGN:−8
+  cliff post-port). Target: data bps non-zero at WGN:−10.
+- Watch for: false detects on the WGN:+14 high-SNR baseline cell
+  (no preamble present in random in-session noise gaps). Expected
+  rate ≪ 1 per 24h session; if observed materially more, escalate.
+- Watch for: Bug #44 regression — false-trigger between HAIL and CMD
+  frames where data symbols pass through the detector window. §15.5
+  asserts the test bound holds, but the test buffer is 32 symbols;
+  real sessions span 100s of symbols per second. Confirm zero
+  detect events in IONOS captures.
