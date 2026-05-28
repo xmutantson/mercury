@@ -47,8 +47,13 @@ public:
 	static const int MAX_STREAMS = 4;
 	int stream_offsets[MAX_STREAMS]; // Starting subcarrier bin for each stream
 
-	// MFSK preamble: known tone indices for time sync
-	static const int MAX_PREAMBLE_SYMB = 8;
+	// MFSK preamble: known tone indices for time sync.
+	// WB data preamble extended 4 -> 16 symbols on 2026-05-27 (data-flow-
+	// preamble_nSymb.md §H1) for +6 dB matched-filter integration gain at
+	// the WGN:-8 cliff. NB preamble (M=8 / M=4) stays at 8 symbols.
+	// MAX_PREAMBLE_SYMB must be >= max(preamble_nSymb across all configs)
+	// and >= mfsk_corr_template_sym_energy[] size in ofdm.h.
+	static const int MAX_PREAMBLE_SYMB = 16;
 	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol
 	int preamble_nSymb;                     // Number of preamble symbols used
 

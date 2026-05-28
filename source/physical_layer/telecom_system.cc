@@ -4747,9 +4747,20 @@ void cl_telecom_system::load_configuration(int configuration)
 	M=_modulation;
 	ldpc.rate=_ldpc_rate;
 	ofdm.preamble_configurator.Nsymb=ofdm_preamble_configurator_Nsymb;
-	// NB MFSK: 8-symbol preamble for cross-correlation detection
-	if(narrowband_enabled && M == MOD_MFSK)
-		ofdm.preamble_configurator.Nsymb = 8;
+	// NB MFSK: 8-symbol preamble for cross-correlation detection.
+	// WB MFSK: 16-symbol preamble (raised from 4 on 2026-05-27 per
+	// data-frame-cliff-audit-2026-05-27.md §H1) for +6 dB matched-filter
+	// integration gain at the WGN:-8 cliff. The cl_mfsk::init() path
+	// (mfsk.cc:122-137) sets mfsk.preamble_nSymb=16 for M=32 and M=16
+	// alphabets; this override mirrors that into the data_container size
+	// authority (cl_telecom_system.cc:3872 passes
+	// ofdm.preamble_configurator.Nsymb into data_container::set_size).
+	// All four authorities (mfsk.preamble_nSymb, data_container.
+	// preamble_nSymb, ofdm.preamble_configurator.Nsymb,
+	// mfsk_corr_template_nsymb) end up == 16 — see data-flow-preamble_nSymb.md
+	// §4 INV-PROD-1.
+	if(M == MOD_MFSK)
+		ofdm.preamble_configurator.Nsymb = narrowband_enabled ? 8 : 16;
 	// NB estimator: blanket ZF for all NB configs.
 	// ZF (per-pilot H=Y/P) is immune to inter-symbol phase jitter that makes
 	// LS cross-pilot averaging destructive on VB-Cable/HF. With Nc=10 and only
@@ -4990,9 +5001,12 @@ void cl_telecom_system::load_configuration(int configuration)
 		for(int i = 0; i < bb_len; i++)
 			ofdm.mfsk_corr_template[i] = filtered[i * interp];
 
-		// Precompute total and per-symbol template energies for normalization
+		// Precompute total and per-symbol template energies for normalization.
+		// Cap raised 8 -> 16 on 2026-05-27 (data-flow-preamble_nSymb.md §H1):
+		// WB MFSK now uses a 16-symbol preamble. NB still uses 8 (loop body
+		// executes 8 times); template_nsymb is the runtime authority.
 		ofdm.mfsk_corr_template_energy = 0.0;
-		for(int k = 0; k < template_nsymb && k < 8; k++)
+		for(int k = 0; k < template_nsymb && k < 16; k++)
 		{
 			double sym_energy = 0.0;
 			for(int n = 0; n < Nofdm; n++)
@@ -5191,7 +5205,8 @@ void cl_telecom_system::load_configuration(int configuration)
 	}
 
 	// Invalidate cached sync state from previous config - frame timing differs
-	// between configs (preamble_nSymb varies 1-4), so old values would be wrong
+	// between configs (preamble_nSymb varies 4 OFDM / 8 NB MFSK / 16 WB MFSK),
+	// so old values would be wrong
 	receive_stats.delay_of_last_decoded_message = -1;
 	receive_stats.freq_offset_of_last_decoded_message = 0;
 	receive_stats.mfsk_search_raw = 0;

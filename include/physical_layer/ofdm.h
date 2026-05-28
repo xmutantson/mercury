@@ -233,12 +233,16 @@ public:
 	std::complex<double>* b2p_data_interpolated;
 	int b2p_buffer_size;
 
-	// MFSK cross-correlation preamble template (NB only)
+	// MFSK cross-correlation preamble template (NB + WB).
+	// Array sized 16 to support the WB ROBUST_0/1/2 16-symbol preamble
+	// (data-flow-preamble_nSymb.md §H1). NB still uses 8 symbols; entries
+	// 8..15 stay zero on NB and the time_sync_mfsk_corr loop reads
+	// `template_nsymb` (= mfsk.preamble_nSymb) so unused slots are skipped.
 	std::complex<double>* mfsk_corr_template;
 	int mfsk_corr_template_len;
 	double mfsk_corr_template_energy;
 	int mfsk_corr_template_nsymb;
-	double mfsk_corr_template_sym_energy[8]; // per-symbol energy for per-symbol correlation
+	double mfsk_corr_template_sym_energy[16]; // per-symbol energy for per-symbol correlation
 	int time_sync_mfsk_corr(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int search_start_symb, double* out_metric);
 
 	// OFDM matched-filter preamble template (replaces FFT-based detection)

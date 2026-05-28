@@ -115,25 +115,35 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	for (int k = 0; k < nStreams; k++)
 		stream_offsets[k] = global_offset + k * M;
 
-	// MFSK preamble: known tone sequence spread across each stream's band
-	// Same tone index used in all streams simultaneously
-	// NB (M<=8): 8-symbol preamble for cross-correlation detection
-	// WB (M>=16): 4-symbol preamble for FFT energy detection
+	// MFSK preamble: known tone sequence spread across each stream's band.
+	// Same tone index used in all streams simultaneously.
+	// NB (M<=8): 8-symbol preamble for cross-correlation detection.
+	// WB (M>=16): 16-symbol preamble (raised from 4 on 2026-05-27 per
+	// data-frame-cliff-audit-2026-05-27.md §H1) for +6 dB matched-filter
+	// integration gain at the WGN:-8 cliff. The four canonical base tones
+	// are repeated 4 times with tone-hopping (preamble_tones[s] =
+	// (base[s%4] + s*tone_hop_step) % M) so the 16-symbol sequence
+	// traverses M distinct tones over its duration. The hopping schedule
+	// is the same one used by ACK/HAIL/CONNECT/BREAK detectors (see
+	// generate_ack_pattern at mfsk.cc:488-489); the data-preamble TX path
+	// (mfsk.cc:465 generate_preamble) does NOT apply tone_hop_step at
+	// emit time, so the hopping is baked into preamble_tones[] here.
+	// Cross-correlation against existing Welch-Costas patterns: expected
+	// false-match ~0.5/16, well below the 7/16 detector threshold
+	// (data-flow-preamble_nSymb.md §5.2).
 	if (M == 32)
 	{
-		preamble_nSymb = 4;
-		preamble_tones[0] = 4;
-		preamble_tones[1] = 20;
-		preamble_tones[2] = 12;
-		preamble_tones[3] = 28;
+		preamble_nSymb = 16;
+		const int base[4] = {4, 20, 12, 28};
+		for (int s = 0; s < 16; s++)
+			preamble_tones[s] = (base[s % 4] + s * tone_hop_step) % M;
 	}
 	else if (M == 16)
 	{
-		preamble_nSymb = 4;
-		preamble_tones[0] = 2;
-		preamble_tones[1] = 10;
-		preamble_tones[2] = 6;
-		preamble_tones[3] = 14;
+		preamble_nSymb = 16;
+		const int base[4] = {2, 10, 6, 14};
+		for (int s = 0; s < 16; s++)
+			preamble_tones[s] = (base[s % 4] + s * tone_hop_step) % M;
 	}
 	else if (M == 8)
 	{

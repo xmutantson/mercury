@@ -106,12 +106,14 @@ cl_ofdm::cl_ofdm()
 	// Pre-allocated baseband_to_passband buffer (Group C)
 	b2p_data_interpolated=NULL;
 	b2p_buffer_size=0;
-	// MFSK cross-correlation template (NB only)
+	// MFSK cross-correlation template (NB + WB).
+	// sym_energy array sized 16 to cover the WB 16-symbol preamble
+	// (data-flow-preamble_nSymb.md §H1).
 	mfsk_corr_template=NULL;
 	mfsk_corr_template_len=0;
 	mfsk_corr_template_energy=0.0;
 	mfsk_corr_template_nsymb=0;
-	for(int i=0;i<8;i++) mfsk_corr_template_sym_energy[i]=0.0;
+	for(int i=0;i<16;i++) mfsk_corr_template_sym_energy[i]=0.0;
 	// OFDM matched-filter template
 	ofdm_corr_template=NULL;
 	ofdm_corr_template_len=0;
@@ -231,7 +233,7 @@ void cl_ofdm::deinit()
 	mfsk_corr_template_len=0;
 	mfsk_corr_template_energy=0.0;
 	mfsk_corr_template_nsymb=0;
-	for(int i=0;i<8;i++) mfsk_corr_template_sym_energy[i]=0.0;
+	for(int i=0;i<16;i++) mfsk_corr_template_sym_energy[i]=0.0;
 	CDELETE(ofdm_corr_template);
 	ofdm_corr_template_len=0;
 	ofdm_corr_template_nsymb=0;
