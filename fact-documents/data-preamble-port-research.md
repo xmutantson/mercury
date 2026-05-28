@@ -2617,3 +2617,27 @@ At cliff SNR (WGN:-8), residual CFO ≈ 3-7 Hz. The mini-Moose either:
   re-mix block being extended to MFSK.
 - Memory `mfsk_vara_parity_audit_2026_05_25.md` — strategic dB context.
 
+
+---
+
+## §22. Control-frame mini-Moose hardware verdict (2026-05-28)
+
+`feat/mini-moose-ctrl` (`eca7667`) ran 3-pass-per-arm hardware A/B at cells `14, -8, -10, -11, -12, -13`. **REGRESSION** at the working SNR cells:
+
+| WGN | Baseline mean | Ctrl mean | Δ |
+|---|---|---|---|
+| +14 | 1.3 | 1.5 | parity (variance) |
+| −8 | 2.2 | 1.6 | −27% |
+| −10 | 2.5 | 0.9 | **−64%** |
+| −11 | 2.3 | 0.6 | **−74%** |
+| −12 | 0 | 0.4 | 1/3 passes (tantalizing) |
+| −13 | 0 | 0 | both fail |
+| total bytes | 187 | 112 | **−40%** |
+
+The cell-pattern shows the regression: ctrl-arm produces zeros where baseline was reliably 2-3 bps. The flash at WGN:−12 (one pass at 1.1 bps where baseline got 0/3) suggests the underlying CFO-refinement idea could work — but the regression at −10/−11 swamps any cliff-edge unlock.
+
+Most likely root cause per §8.1 (the test the implementation agent flagged): sign convention. The ctrl-frame apply formula uses `effective_carrier + residual` but agent's empirical evidence pointed at `−`. The data-preamble path (§20) shipped with `+` and still delivered +11.7% on hardware — so the §22 result on its own is ambiguous about whether it's a sign bug or a different sibling bug.
+
+Plan: **§20 sign-flip A/B will disambiguate**. If sign-flip on data-preamble shows a clear win, the formula needs flipping everywhere and the ctrl-frame branch deserves a respin. If sign-flip on data-preamble is null/regressing, the ctrl-frame regression is something else (sample-window alignment? estimator window choice for short ctrl frames?) and the branch is dead for different reasons.
+
+Branch `feat/mini-moose-ctrl` dropped without merge.
