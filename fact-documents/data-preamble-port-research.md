@@ -1958,3 +1958,245 @@ None for Option B itself. Two adjacent questions surface:
 - `data-flow-preamble_nSymb.md` §10 — discrete-match producer/consumer audit.
 - Memory `feedback_dsp_commit_patterns.md` — "magic numbers without
   measurement basis" warning. Option B would have been one if shipped.
+
+---
+
+## §19. Option C verdict + next-axis selection (2026-05-28)
+
+**Status:** RESEARCH ONLY. **Recommendation: DROP Option C as a cliff-push
+candidate** — it's pure architectural cleanup with 0 dB headroom by
+§4's own framing. **Pivot to "mini-Moose before each MFSK data preamble"**
+as the next cliff-push axis. The hardware finding in §17 (mirror-bin
+empirically load-bearing → residual CFO is leaking signal energy into
+the mirror) becomes a structural fix opportunity once §19.3 below is
+factored in: the MFSK path explicitly *zeros* its frequency-offset
+estimate (`telecom_system.cc:2193`), so there is currently NO residual-CFO
+correction at all on the data-preamble path.
+
+### §19.1 Option C honest re-read
+
+§4.C verbatim: *"Introduce a new top-level `detect_preamble_pattern`
+function that owns both MFSK preamble and CONNECT/ACK/HAIL/BREAK
+detection via a unified parameter set. Move `detect_ack_pattern` to call
+this. Delete `time_sync_mfsk_corr` body entirely."* — explicitly framed
+as Phase-2 cleanup, not a new detector.
+
+**Cited dB analysis (none provided in §4.C).** §4.D recommended Option A
+and "schedule Option C as Phase-2 cleanup". The user's autonomous-run
+loop already shipped Option A (+50% bps mean, cliff WGN:−4 → WGN:−8).
+Option C's deliverable is: same detection math reached through one entry
+point instead of two.
+
+**What Option C does NOT do:**
+- It does NOT expose a new signal that Option A doesn't already use.
+  Option A already clones `detect_ack_pattern`'s discrete-match algorithm
+  verbatim (`ofdm.cc:3040-3266` is structurally `detect_ack_pattern` with
+  search_start_symb added). Consolidating them into a single function
+  doesn't surface any new bin, FFT, or correlation.
+- It does NOT enable a "combined detector" mode (dual-path FFT bins +
+  matched filter). §18 already ruled that out — the two metrics measure
+  the same thing at this layer.
+- It does NOT change the Phase-2 step floor (`interpolation_rate` = 4
+  full-rate samples — §18.1).
+- It does NOT change mirror-bin acceptance (§17 proved that's load-bearing
+  on real WB IONOS).
+
+**Math walk:** Each structural change Option C would introduce:
+1. Single entry point `detect_preamble_pattern(...)` taking pattern enum
+   {DATA_PREAMBLE, CONNECT, ACK, BREAK, HAIL}: 0 dB. Pure dispatch.
+2. Shared FFT-bin argmax inner loop: 0 dB. Algorithm is already shared
+   by construction (Option A is a copy).
+3. Unified threshold parameter table: 0 dB. Per-pattern thresholds
+   already exist in `mfsk.cc` (`connect_match_threshold`, `ack_match_threshold`,
+   `preamble_match_threshold`, etc.).
+4. Delete `mfsk_corr_template` infrastructure: 0 dB. Already dead code
+   per §14 — the cosine²-template buffer is allocated and populated
+   but never read.
+
+**Total cliff dB delta for Option C as defined: 0.000 dB.** Below the
+±2 dB hardware A/B noise floor by >2000:1, same problem Option B had.
+
+**Risk:** Option C touches CONNECT/HAIL/ACK/BREAK callers (the stable
+WB control plane). Per §4.C, "breaks fix-narrow rule (CLAUDE.md §5);
+cross-layer regression test matrix expands". Effort 10-15 days. The
+risk:reward ratio is ∞:0 for a cliff push.
+
+**Verdict:** DROP for cliff purposes. Keep on a backlog as voluntary
+Phase-2 consolidation work if/when the codebase needs a maintenance pass
+— but NOT as a route to more dB.
+
+### §19.2 §18.6 axes — dB-ranked
+
+| Axis | Predicted Δ at cliff | Effort | Risk | Math limit? |
+|---|---|---|---|---|
+| **Mini-Moose before each MFSK data preamble** | **~1–3 dB** (recovers mirror-bin energy by reducing residual CFO; depends on per-frame CFO drift) | **2–4 days** | Med (touches MFSK rx pipeline, ARQ timing) | No structural ceiling. CFO suppression directly tightens FFT-bin energy concentration. |
+| Preamble alphabet redesign (Costas optimized for IONOS fading) | <0.5 dB | 4–6 days | Low (single-file change, hard cutover) | YES — already at Welch-Costas g=2; further optimization is below noise floor for AWGN, marginal for fading |
+| E3 LLR clip 20→40 retest | **0 dB — moot** | n/a | n/a | LLR cap REMOVED entirely 2026-05-24 (`mfsk.cc:1086` comment "LLR cap removed"). There is no clip to relax. |
+| Preamble N=16 → 24/32 extension | ~1.5–3 dB (√N gain: N=16→24 = +1.8 dB; N=16→32 = +3.0 dB) | 5–10 days | Med-High (frame timing, Bug #44 cross-correlation budget, ARQ poll math) | YES — once N ≥ ~32 the matched-filter gain saturates against per-symbol SNR; beyond that LDPC takes over |
+
+**E3 axis is dead** — verified at `mercury/source/physical_layer/mfsk.cc:1086`.
+The 2026-05-24 commit message in the code comment states the cap was
+removed because "at rate-1/16 LDPC (ROBUST_0), the SPA decoder needs
+the full magnitude of high-confidence tone observations to flip the
+~94% parity-dominated codeword bits". Memory's "E3 LLR clip 20→40
+deferred" entry is stale — there is no clip to push.
+
+### §19.3 Why mini-Moose ranks #1 — and is bigger than memory thinks
+
+§16.1 of THIS doc claimed Moose runs on MFSK pre-data-preamble via
+`carrier_sampling_frequency_sync_nb`. **That claim is wrong.**
+
+`source/physical_layer/telecom_system.cc:2193` reads:
+```cpp
+if(M == MOD_MFSK) freq_offset_measured = 0;
+```
+
+This explicit zero runs AFTER the WB Moose / NB cross-pilot estimator
+on lines 2182–2191 — for MFSK, whatever the estimator returned is
+discarded. Searching the file confirms `freq_offset_of_last_decoded_message`
+is never updated for MFSK either (the only writes are inside OFDM
+branches). The MFSK data preamble runs on whatever coarse-sync the
+prescan / HAIL detect left behind, with NO fine refinement, EVER.
+
+§17's finding ("mirror carries empirically load-bearing signal on
+WB IONOS — likely residual CFO + WB FIR image leakage") is therefore
+a direct consequence of zero CFO sync, not a small effect. The mirror
+bin is carrying signal because **the carrier IS offset and Mercury MFSK
+never corrects it.**
+
+Adding a mini-Moose between MFSK preamble detect and data decode:
+- Reuses `carrier_sampling_frequency_sync` (already implemented) on the
+  16-symbol detected preamble window. Same algorithm WB OFDM uses.
+- Mercury WB preamble is M=32 Welch-Costas; not nIS-periodic at half-
+  symbol, but Moose's underlying technique (cross-symbol phase rotation
+  of known tones) works on any pilot-rich symbol — Mercury already has
+  `carrier_frequency_sync_nb` (`ofdm.cc:537`) which does exactly this
+  cross-symbol-phase approach (capture ±22 Hz for NB; mirror-aware
+  formula for WB Welch-Costas needs derivation).
+- Apply the estimate as a baseband frequency shift to the data symbol
+  buffer before the per-symbol FFT in `mfsk.demod`. Single multiplier
+  per sample. ~50 LoC change.
+- Cliff push hypothesis: if residual CFO is ~2-5 Hz typical (worst
+  case ~15 Hz per memory "~11 Hz frequency offset between stations"),
+  correcting it concentrates signal energy back into the expected bin.
+  At M=32 over N=16 symbols, recovering even 1 dB of in-bin energy
+  shifts the per-symbol p (probability-of-correct argmax) by ~5–8%
+  absolute, which moves the matched-count cliff by ~1–3 dB.
+
+### §19.4 Recommended hardware-test-ready next step
+
+**Axis:** mini-Moose before MFSK data preamble decode.
+
+**Hypothesis:** at WGN:−10 IONOS WB ROBUST_0, mean total bytes
+non-zero across 3 passes (current §17.4 result: 0 bytes at WGN:−10).
+Predicted Δ vs current Option A shipped baseline: +1 to +3 dB cliff
+shift (WGN:−8 cliff → WGN:−10 to −11).
+
+**Fail-before regression test** (in `mfsk_ctrl_codec_tests.cc` next to
+the §14.8 suite):
+
+```
+mfsk_data_preamble_argmax_cfo_offset (POSITIVE, FAIL-BEFORE):
+  load_configuration(ROBUST_0). Generate preamble. Round-trip through
+  baseband_to_passband → passband_to_baseband, but INJECT a 7-Hz CFO
+  via complex multiply on the passband signal. Add AWGN at in-band
+  SNR ≈ −2 dB (between cliff and pre-cliff).
+  5 PRNG seeds.
+  Assert: at least 4/5 return delay ≥ 0 AND matched ≥ 7.
+  Pre-fix: cosine-residual CFO at 7 Hz over 16-symbol window rotates
+  the in-bin energy by ~360° (sym time ≈ 24 ms; 7 Hz × 384 ms ≈ 2.7 rev
+  across N=16), pushing argmax to mirror or random bin for ~50% of
+  symbols. Detector reports matched ≈ 4-6 (below T=7).
+  Post-fix (mini-Moose applied): residual CFO ≤ 1 Hz, in-bin energy
+  preserved, matched ≈ 13-16.
+```
+
+This test has the same shape as §14.8 `_cliff` test but adds a
+deterministic CFO injection, exercising the failure path §17 found
+empirically.
+
+**Hard cutover policy.** No CAP bit. Both endpoints apply mini-Moose
+unconditionally (matches Phase B / Option A precedent: no negotiation,
+TX and RX implementations move together, no flag-day code to ever remove).
+
+**Cross-layer audit obligation (CLAUDE.md §5):**
+- Producer of `freq_offset_measured` for MFSK: new code in `receive_msg`
+  MFSK branch, between `time_sync_mfsk_corr` return and `mfsk.demod`
+  call (~`telecom_system.cc:1037-2249` block).
+- Consumers: solely `mfsk.demod` per-symbol FFT input. Stream context
+  unchanged. ARQ timing math (Nofdm × Nsymb) unchanged because Mercury
+  measures frequency, not timing — symbol grid does not shift.
+- Required new fact-doc: `data-flow-mfsk-cfo-sync.md` covering the new
+  producer, the demap consumer, the test-mode pre-init reset, and the
+  BREAK / SWITCH_ROLE invariants (MFSK is the control PHY post-Phase-B,
+  so CFO state must reset cleanly on every state-machine transition).
+
+**Effort:** 2–4 days code + tests; +1–2 days IONOS A/B at WGN:−8/−10/−12.
+
+**Risk register:**
+- Could regress Option A if mini-Moose mis-estimates and applies a
+  wild correction. Mitigation: identical sanity-clamp to WB Moose
+  (`±2 subcarrier spacings`), same `[MOOSE-REJECT]` path
+  (`telecom_system.cc:2205`).
+- The NB MFSK path (§17.1 implication) needs the same fix but on
+  different tone geometry. Scope this commit to WB-only; NB as a
+  follow-up.
+- Mercury's existing `carrier_frequency_sync_nb` already computes the
+  cross-symbol phase estimate on any known-modulation symbols — could
+  be reused directly with the preamble_tones array instead of writing
+  new code.
+
+### §19.5 If mini-Moose proves too risky / slow
+
+Fallback: **preamble N=16 → 24 extension.** +1.8 dB via √N. Same
+cliff-push math the §14 plan used. Larger change footprint (frame
+timing, Bug #44 budget, ARQ poll cadence) but well-understood; no
+new DSP intuition required. Effort 5-10 days.
+
+The preamble alphabet redesign and Option B-style refinement are NOT
+recommended — neither has a math story that beats the ±2 dB noise floor.
+
+### §19.6 If the user is tired — SHIP A AND STOP
+
+The +50% bps mean and WGN:−4 → WGN:−8 cliff push from Option A is
+the biggest available win in this work area. Subsequent options:
+- Option B: dropped (§18, below noise floor).
+- Option C: dropped (this §19, 0 dB delta).
+- Mirror-bin drop: dropped (§17, hardware A/B regressed).
+- T=6 threshold push: deferred (§15.8, FAR over operator gate).
+- E3 LLR clip: moot (clip already removed 2026-05-24).
+
+Remaining cliff axes are **all ≥ 2-day commitments** (mini-Moose at the
+minimum) and **require fresh hardware A/B runs to validate** — neither
+fits "one more quick push before stopping". If the user is at a stopping
+point, the clean closeout is:
+1. Confirm Option A is the merged shipped state on `monitor`.
+2. Update memory entry to reflect §17/§18/§19 verdicts (mirror-drop
+   tried & dropped; Option B dropped; Option C dropped).
+3. Park the autonomous-run loop. The next session can pick up mini-Moose
+   as a fresh axis with full context from §19.3.
+
+**Author recommendation in priority order:**
+1. If continuing autonomous-run: **mini-Moose for MFSK** (§19.3-4),
+   2-4 days, predicted +1-3 dB cliff.
+2. If stopping autonomous-run cleanly: §19.6 closeout. Option A's
+   +50% is banked; the cliff has moved 4 dB; mercury is in a good place.
+
+### §19.7 Cross-references
+
+- §4 — original Option A/B/C ranking.
+- §14 — Option A ship log (the win being banked).
+- §17 — mirror-bin verdict (the empirical evidence that CFO is the
+  next bottleneck).
+- §18 — Option B drop (sets the precedent that "below noise floor =
+  don't ship").
+- `mercury/source/physical_layer/telecom_system.cc:2193` — the
+  load-bearing line: `if(M == MOD_MFSK) freq_offset_measured = 0;`.
+- `mercury/source/physical_layer/ofdm.cc:537+` —
+  `carrier_frequency_sync_nb` (the cross-symbol-phase estimator that
+  would back the mini-Moose for WB MFSK Welch-Costas).
+- `mercury/source/physical_layer/mfsk.cc:1086` — LLR cap removal
+  comment (killing the E3 axis).
+- Memory `mfsk_vara_parity_audit_2026_05_25.md` — strategic context
+  for which dB pushes are worth chasing.
+
