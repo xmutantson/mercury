@@ -3060,7 +3060,18 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 		double total_metric = 0.0;
 		int valid_syms = 0;
 		bool rejected = false;
-		double per_sym_floor = 0.05;
+		// Per-symbol floor relaxed 0.05 -> 0.01 on 2026-05-27 per
+		// data-frame-cliff-audit-2026-05-27.md §H2. The 0.05 floor
+		// rejected any candidate where ONE preamble symbol scored below
+		// it — a hard cliff. At WGN:-4 to -8 a single momentarily-faded
+		// symbol kills the whole detection (the audit traces 90% of
+		// WGN:-8 NO-PREAMBLE failures to per-symbol rejection). 0.01 is
+		// still ~10x the expected pure-noise cosine-similarity floor
+		// (~1/(2*Nofdm) ~ 0.0017 for Nofdm=292), so false-accept margin
+		// remains. Independent of the preamble-length fix (mfsk.cc:122);
+		// each contributes ~+1-2 dB. Kept in a separate commit so
+		// hardware A/B can disambiguate the dB contributions.
+		double per_sym_floor = 0.01;
 
 		for (int k = 0; k < template_nsymb && !rejected; k++)
 		{
