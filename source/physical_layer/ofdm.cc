@@ -3112,7 +3112,15 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 
 		if (rejected) continue;
 
-		double metric = (valid_syms > 0) ? total_metric / valid_syms : 0.0;
+		// §13: matched-filter form — SUM per-symbol cosine² across symbols
+		// (not mean). For pure noise, E[per-sym cosine²] ≈ 1/Nofdm regardless
+		// of N — averaging cannot improve mean-SNR. Summing keeps the
+		// per-sym data-content bound (cosine² ≤ 1 → sum ≤ N) while giving
+		// √N detection-SNR gain over noise (sum_noise stddev ≈ √N/Nofdm,
+		// signal mean ≈ N for clean match). Threshold scales as
+		// 0.5 · template_nsymb so the signal-vs-threshold margin
+		// stays at 2× regardless of N. (data-frame-cliff-audit §13)
+		double metric = total_metric;
 
 		// Insert into top-K sorted array (descending by metric)
 		if (n_candidates < P1_TOP_K || metric > p1_candidates[n_candidates - 1].metric)
@@ -3141,9 +3149,12 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 		}
 		// Early exit on first strong preamble: prefer the earliest detection
 		// to avoid finding a commander resend whose frame overflows the buffer
-		// while an earlier copy's frame fits. Real preambles score ~1.0,
-		// noise ~0.004, so 0.5 has huge margin and won't false-trigger.
-		if (metric > 0.5)
+		// while an earlier copy's frame fits. Real preambles score ≈ N (sum
+		// of per-sym cosine² ≈ 1.0 each); noise sums to ~N/Nofdm. Cutoff at
+		// template_nsymb (= 16 for WB MFSK) is 2× the final threshold
+		// (0.5·template_nsymb) — same relative cutoff the prior mean-form
+		// used (>0.5 absolute, 2× the 0.25 noise floor at WGN:-8). (§13)
+		if (metric > (double)template_nsymb)
 			break;
 	}
 
@@ -3208,7 +3219,8 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 			}
 
 			if (out_of_bounds) continue;
-			double metric = (valid_syms > 0) ? total_metric / valid_syms : 0.0;
+			// §13: matched-filter SUM, same form as Phase 1.
+			double metric = total_metric;
 			if (metric > best_fine_metric)
 			{
 				best_fine_metric = metric;
@@ -3218,16 +3230,24 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 		}
 
 		// Early exit: if this candidate already passed threshold, no need to
-		// check lower-ranked candidates
-		if (best_fine_metric > 0.5)
+		// check lower-ranked candidates. Real preamble after refinement sums
+		// to ~template_nsymb; cutoff at template_nsymb is 2× the threshold.
+		if (best_fine_metric > (double)template_nsymb)
 			break;
 	}
 
-	// Threshold: apply to Phase 2 refined metric (not Phase 1 coarse metric).
-	// Real preamble after Phase 2 refinement: metric ≈ 1.0.
-	// Random MFSK data at Phase 2 best: up to ~0.44 for M=4 (NB ROBUST_1).
-	// Noise: ~0.004. Threshold 0.5 cleanly separates. (Bug #34, Bug #40, Bug #44)
-	double threshold = 0.5;
+	// Threshold scales with integration length: each preamble symbol
+	// contributes ~1.0 to the sum for a clean match, ~1/Nofdm for noise,
+	// up to ~0.44 for worst-case in-alphabet data content (Bug #44
+	// testimony). Per-sym cosine² ≤ 1 guarantees sum ≤ N for any signal
+	// of N symbols. Threshold 0.5·N keeps signal-vs-data margin at 2×
+	// (signal sums to ≈ N, data sums to ≈ 0.44·N worst-case) AND keeps
+	// signal-vs-noise margin growing as √N (noise sums to N/Nofdm with
+	// stddev √N/Nofdm). At template_nsymb=4 this gives threshold=2.0
+	// (same separation as old 0.5 mean form); at template_nsymb=16 this
+	// gives threshold=8.0 with 2× better detection-SNR vs noise.
+	// (§13, data-frame-cliff-audit-2026-05-27.md)
+	double threshold = 0.5 * (double)template_nsymb;
 
 	if (best_fine_metric < threshold)
 	{
