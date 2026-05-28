@@ -489,3 +489,169 @@ energy-normalized denominator going through zero). Both pass AFTER.
   site).
 - `mercury/include/physical_layer/ofdm.h:241` —
   `mfsk_corr_template_sym_energy[8]` (fix site).
+
+---
+
+## §10 Discrete-match port — new metric-form invariants (2026-05-27)
+
+**Driving work item**: `data-preamble-port-research.md` §14. The
+`time_sync_mfsk_corr` body was replaced with a FFT-bin argmax matched-
+count detector (mirror of `detect_ack_pattern`). This section extends
+the audit with the producer/consumer walk for the NEW metric.
+
+### §10.1 Producers — preamble-detection metric
+
+**New producer:** the rewritten body of `cl_ofdm::time_sync_mfsk_corr`
+(`source/physical_layer/ofdm.cc`). The function signature is unchanged
+— writes:
+- Return value: full-rate interpolated sample offset of the detected
+  preamble start, or -1 on no-detect. Contract unchanged from pre-port.
+- `*out_metric`: NOW the discrete match count (0..preamble_nSymb).
+  Was cosine²-mean (range 0..1).
+
+**New ancillary state on `cl_ofdm`** (mirror of `cl_mfsk` fields,
+populated by `load_configuration` at `telecom_system.cc:4956+`
+alongside the template):
+
+| Field | Type | Source | Purpose |
+|---|---|---|---|
+| `mfsk_M` | int | mirror of mfsk.M | FFT bin search range |
+| `mfsk_nStreams` | int | mirror of mfsk.nStreams | per-stream argmax |
+| `mfsk_stream_offsets[4]` | int[] | mirror of mfsk.stream_offsets | bin offset per stream |
+| `mfsk_preamble_tones[16]` | int[] | mirror of mfsk.preamble_tones | expected tone at each preamble symbol |
+| `mfsk_preamble_nsymb` | int | mirror of mfsk.preamble_nSymb | scan length |
+| `mfsk_preamble_match_threshold` | int | mirror of mfsk.preamble_match_threshold | detection gate |
+
+Constructor-default (cl_ofdm::cl_ofdm at ofdm.cc:62) sets all to 0.
+Function `time_sync_mfsk_corr` returns -1 (no detect) when
+`mfsk_M <= 0 || mfsk_nStreams <= 0 || mfsk_preamble_nsymb <= 0 ||
+mfsk_preamble_match_threshold <= 0`. This protects against pre-init
+calls.
+
+### §10.2 Consumers of `*out_metric` post-port
+
+| Site | file:line | What it does | Magnitude change OK? |
+|---|---|---|---|
+| `cl_telecom_system::receive_msg` MFSK branch | `telecom_system.cc:1037-1041` | stores in local `mfsk_sync_metric` | Yes — local variable, not used for flow control |
+| `[RX-DECODE#N] FAIL` log line | `arq_common.cc:5798-5811` | prints `receive_stats.coarse_metric` | Yes — log magnitude changes from 0..1 to 0..16. Diagnostic only. |
+| Existing test `mfsk_data_preamble_passband_roundtrip_clean` | `mfsk_ctrl_codec_tests.cc:1194` | asserts `sync_metric >= 0.5` | Yes — post-port matched ≈ 16 at sigma=0 ≫ 0.5 |
+| New §6 tests | `mfsk_ctrl_codec_tests.cc:1339+` | assert specific match counts | Created against the NEW metric form |
+
+Grep confirmation:
+- `mfsk_sync_metric` consumers: only the local store + the RX-DECODE
+  log printf. No Q-table, gearshift, or ARQ state-machine reads.
+- `receive_stats.coarse_metric` consumers: arq_common.cc:5798-5811
+  (log only). Not read elsewhere as a flow-control gate.
+
+### §10.3 Invariants (post-port)
+
+#### INV-PORT-1: detector returns -1 unless `mfsk_M > 0`
+
+The detector is initialized lazily by `load_configuration`. If a
+test or test-mode path calls `time_sync_mfsk_corr` before
+`load_configuration`, the pre-init state (`mfsk_M = 0`) is observed
+and the function returns -1 immediately. This matches the pre-port
+behavior under `mfsk_corr_template == NULL`. Verified by inspection
+of `ofdm.cc:time_sync_mfsk_corr` head.
+
+#### INV-PORT-2: triple-equality with mfsk fields after load_configuration
+
+After `M==MOD_MFSK` `load_configuration` succeeds:
+```
+ofdm.mfsk_M                          == mfsk.M
+ofdm.mfsk_nStreams                   == mfsk.nStreams
+ofdm.mfsk_stream_offsets[0..nStreams-1] == mfsk.stream_offsets[0..nStreams-1]
+ofdm.mfsk_preamble_tones[0..nsymb-1] == mfsk.preamble_tones[0..nsymb-1]
+ofdm.mfsk_preamble_nsymb             == mfsk.preamble_nSymb
+ofdm.mfsk_preamble_match_threshold   == mfsk.preamble_match_threshold
+```
+
+Producer site: `telecom_system.cc:5022-5031` (added in the discrete-
+match port commit). Walks each cl_mfsk field after the template is
+generated, before the [PHY] log line. The copy loops bound by
+`cl_mfsk::MAX_PREAMBLE_SYMB` (=16) and `cl_mfsk::MAX_STREAMS` (=4) so
+no out-of-bounds writes are possible.
+
+#### INV-PORT-3: non-MFSK reset
+
+On OFDM configs (M != MOD_MFSK), the `else` branch at
+`telecom_system.cc:5033+` resets the ofdm.mfsk_* mirror to zeros.
+This prevents stale state from a previous MFSK config leaking into
+the next OFDM-only run.
+
+#### INV-PORT-4: discrete-match threshold scaling
+
+`mfsk_preamble_match_threshold` MUST be in the range
+`(preamble_nSymb / M, preamble_nSymb]`. Below 1/M·N the random-data
+baseline overruns the threshold (FAR explodes). Above N is
+unreachable. The init() values (7 for WB / NB, against N=16 / N=8
+respectively) sit comfortably in the band.
+
+#### INV-PORT-5: deferred template lifecycle
+
+`mfsk_corr_template` (and `mfsk_corr_template_*_energy` arrays) are
+populated by load_configuration but NEVER read by the post-port
+`time_sync_mfsk_corr`. They are kept alive for revert safety and
+cleanup in a follow-up commit per `data-preamble-port-research.md`
+§8.4. The production caller's gate
+`if(ofdm.mfsk_corr_template != NULL)` at `telecom_system.cc:1034`
+stays satisfied because the template generator at lines 4962-5021
+still runs unconditionally for MFSK configs.
+
+### §10.4 Regression test coverage (§6 in mfsk_ctrl_codec_tests.cc)
+
+Five new tests added to `mercury.exe --test`:
+
+1. `mfsk_data_preamble_argmax_clean` — sanity at sigma=0.
+2. `mfsk_data_preamble_argmax_cliff` — fail-before-passes at
+   passband SNR ≈ -12 dB (in-band ≈ +1 dB after FIR). 5 seeds, ≥4/5
+   must detect.
+3. `mfsk_data_preamble_argmax_pure_noise` — 100 random WGN buffers,
+   ≤1 false detect.
+4. `mfsk_data_preamble_argmax_data_content` — Bug #44 regression
+   guard: random in-alphabet MFSK data, assert no detect.
+5. `mfsk_data_preamble_argmax_high_snr_no_regression` — sigma=0,
+   assert matched == preamble_nSymb.
+
+Fail-before-passes verification was run by reverting just the
+`ofdm.cc` body and re-running tests. Result on pre-port code:
+- Test #2 (cliff): FAIL (0/5 detect; matched=0 at threshold=7).
+  Detector returns -1 because cosine²-mean at this SNR falls below
+  the 0.5 absolute threshold.
+- Tests #1 and #5: FAIL (sync_metric is cosine²-mean ≈ 1.0, cast to
+  int = 1; assertion ≥ 14 / == 16 fails). These tests are written
+  against the NEW metric semantics.
+- Tests #3 and #4: PASS (the OLD detector also rejects these; the
+  tests document structural safety properties, not the cliff fix).
+Post-port: all 5 pass.
+
+### §10.5 Operator backlog
+
+- IONOS hardware A/B at WGN ∈ {+14, +6, 0, -4, -8, -10, -12},
+  ROBUST_0, 180s dwell. Tool: `tools/axis_walk_sweep.py --pin-config 100`.
+- Compare matched-count histograms at the IONOS WGN cliff cells
+  against the §14.3 binomial prediction.
+- Watch for: false detect events between HAIL and CMD frames in
+  IONOS captures (Bug #44 regression).
+- Watch for: any flow-control script that may have parsed the old
+  cosine²-mean magnitude from RX-DECODE log lines. Update
+  `tools/analyze_turboshift_log.py` parsing if it depends on a
+  threshold of 0.5.
+
+### §10.6 Phase-2 cleanup followups (deferred)
+
+Per `data-preamble-port-research.md` §8.4:
+- Delete `mfsk_corr_template`, `mfsk_corr_template_len`,
+  `mfsk_corr_template_energy`, `mfsk_corr_template_nsymb`,
+  `mfsk_corr_template_sym_energy[]` from `cl_ofdm`.
+- Delete the `mfsk_corr_template != NULL` gate at
+  `telecom_system.cc:1034` (always use the new detector).
+- Delete the `time_sync_mfsk` cosine²-energy fallback (it was the
+  pre-Bug#44 path; now superseded by the discrete-match detector).
+- Delete the template-generation block at
+  `telecom_system.cc:4956-5021`.
+
+Each cleanup commit needs its own audit against §10.1-§10.3
+invariants — the deletion would require flipping the caller gate
+to unconditional. Schedule after hardware A/B validates the cliff
+shift.
