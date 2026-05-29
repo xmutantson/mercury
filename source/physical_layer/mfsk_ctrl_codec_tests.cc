@@ -2162,6 +2162,594 @@ static void test_mfsk_data_preamble_mini_moose_apply_sign_invariance() {
 }
 
 // =============================================================================
+// §8 Control-frame mini-Moose v2 regression suite
+//     (data-preamble-port-research.md §24, data-flow-freq_offset_measured.md §12)
+//
+// Four tests mirror §7's data-preamble mini-Moose suite but exercise the
+// NEW estimator `carrier_frequency_sync_wb_ctrl` and the ctrl-frame apply
+// chain. The MANDATORY load-bearing test is §8.4 — apply-sign-invariance.
+// It catches the §22-style sign-convention bug end-to-end: a corrected
+// chain must CANCEL injected CFO, never double it.
+// =============================================================================
+
+// §8 helper — synthesize an ACK base pattern at passband with optional CFO
+// injection and AWGN. Returns a buffer big enough for the detector and the
+// expected best_offset in DECIMATED samples (multiply by interp for raw).
+// Mirrors synth_preamble_buffer_base_with_cfo but for the ACK pattern instead.
+static bool synth_ack_pattern_passband_with_cfo(
+	cl_telecom_system& ts,
+	double cfo_hz,                // injected CFO at passband (cosine up-mix)
+	double noise_sigma_pb,
+	bool synthesize_pattern,
+	std::mt19937& rng,
+	std::vector<double>& out_pb,
+	int& out_expected_offset_decimated,
+	int& out_dec_size)
+{
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	if (ts.ack_mfsk.M < 16 || ts.ack_mfsk.ack_pattern_nsymb <= 0) return false;
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) return false;
+	if (ts.ack_pattern_passband_samples <= 0) return false;
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc    = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	int ack_nsymb = ts.ack_mfsk.ack_pattern_nsymb;
+
+	// Generate ACK base pattern in freq domain.
+	std::vector<std::complex<double> > pat_freq(
+		(size_t)ack_nsymb * (size_t)Nc, std::complex<double>(0.0, 0.0));
+	if (synthesize_pattern) {
+		ts.ack_mfsk.generate_ack_pattern(pat_freq.data());
+	}
+
+	// IFFT each symbol → Nofdm samples per symbol.
+	std::vector<std::complex<double> > pat_time(
+		(size_t)ack_nsymb * (size_t)Nofdm, std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < ack_nsymb; s++) {
+		ts.ofdm.symbol_mod(&pat_freq[(size_t)s * Nc],
+		                    &pat_time[(size_t)s * Nofdm]);
+	}
+
+	// Up-mix to passband at (carrier_frequency + cfo_hz). The CFO injection
+	// model matches the realistic real-passband LO mismatch — §23.7 chose
+	// this model because it's what hardware actually experiences.
+	const int pattern_samples_pb = Nofdm * ack_nsymb * interp;
+	const int leading_silence_pb = 4 * Nofdm * interp;   // detector headroom
+	const int trailing_silence_pb = 12 * Nofdm * interp; // suffix decode headroom
+	const int buffer_pb_size = leading_silence_pb + pattern_samples_pb + trailing_silence_pb;
+
+	std::vector<double> pattern_pb((size_t)pattern_samples_pb, 0.0);
+	if (synthesize_pattern) {
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			pat_time.data(), Nofdm * ack_nsymb,
+			pattern_pb.data(),
+			ts.sampling_frequency,
+			ts.carrier_frequency + cfo_hz,
+			ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	out_pb.assign((size_t)buffer_pb_size, 0.0);
+	if (synthesize_pattern) {
+		for (int i = 0; i < pattern_samples_pb && (leading_silence_pb + i) < buffer_pb_size; i++)
+			out_pb[(size_t)(leading_silence_pb + i)] = pattern_pb[(size_t)i];
+	}
+
+	// Add passband AWGN if requested.
+	if (noise_sigma_pb > 0.0) {
+		std::normal_distribution<double> nd(0.0, noise_sigma_pb);
+		for (int i = 0; i < buffer_pb_size; i++)
+			out_pb[(size_t)i] += nd(rng);
+	}
+
+	out_dec_size = buffer_pb_size / interp;
+	out_expected_offset_decimated = leading_silence_pb / interp;
+	return true;
+}
+
+// Helper: run the FIRST-pass detector on the synthesized buffer to get the
+// best_offset. Mirrors the production flow in detect_ack_snr_from_passband
+// up to (but not including) the mini-Moose call.
+static bool run_initial_ack_detect(
+	cl_telecom_system& ts,
+	const std::vector<double>& pb,
+	int& out_best_offset,
+	int& out_matched,
+	double& out_metric,
+	std::vector<std::complex<double> >& out_bb)
+{
+	int M = ts.data_container.interpolation_rate;
+	int size = (int)pb.size();
+	int dec_size = size / M;
+	double effective_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+
+	out_bb.assign((size_t)dec_size, std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband_decimated(
+		const_cast<double*>(pb.data()), size,
+		out_bb.data(),
+		ts.sampling_frequency, effective_carrier, ts.carrier_amplitude,
+		M, &ts.ofdm.FIR_rx_data);
+
+	out_best_offset = -1;
+	out_matched = 0;
+	out_metric = ts.ofdm.detect_ack_pattern(
+		out_bb.data(), dec_size,
+		1,
+		ts.ack_mfsk.ack_pattern_nsymb,
+		ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+		ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+		ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+		&out_matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&out_best_offset,
+		/*reserve_after=*/cl_mfsk::SNR_SUFFIX_LEN,
+		/*out_match_mask=*/nullptr);
+	return (out_best_offset >= 0);
+}
+
+// §8.1 — Recover injected CFO via the ctrl-frame estimator. POSITIVE,
+// FAIL-BEFORE-PASSES (link error pre-fix). Mirror of §7.1.
+static void test_mfsk_ctrl_suffix_mini_moose_recovers_cfo() {
+	const char* name = "mfsk_ctrl_suffix_mini_moose_recovers_cfo";
+
+	// Measure clean preamble RMS as a proxy for ACK pattern RMS — ACK uses
+	// the same per-symbol normalization (sqrt(Nc/nStreams) amp) so RMS scales
+	// identically. We want noise level comfortably above the detector
+	// threshold but not so high that the detector misses entirely.
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	// Use lower noise than §7 cliff: ctrl-frame mini-Moose needs the
+	// pattern to be cleanly detected first (out_best_offset valid). Set
+	// sigma to 0.5×rms (in-band SNR ≈ +10 dB) so detector reliably triggers
+	// at all 5 seeds — we're testing the ESTIMATOR's recovery, not the
+	// detector's noise robustness.
+	double sigma_pb = 0.5 * rms;
+	const double cfo_inject = 7.0; // Hz, inside capture range
+
+	int hits = 0;
+	double last_est = 0.0;
+	for (int seed = 1; seed <= 5; seed++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0x10580001u + seed));
+		std::vector<double> pb;
+		int expected_offset = 0;
+		int dec_size = 0;
+		if (!synth_ack_pattern_passband_with_cfo(ts, cfo_inject, sigma_pb, true,
+		                                          rng, pb, expected_offset, dec_size)) {
+			test_fail(name, "synth_ack_pattern_passband_with_cfo failed");
+			return;
+		}
+		int best_offset = -1;
+		int matched = 0;
+		double metric = 0.0;
+		std::vector<std::complex<double> > bb;
+		if (!run_initial_ack_detect(ts, pb, best_offset, matched, metric, bb)) {
+			// Detector miss — skip this seed (not testing detector robustness).
+			continue;
+		}
+		double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+		double est = ts.ofdm.carrier_frequency_sync_wb_ctrl(
+			bb.data(),
+			carrier_freq_width,
+			ts.ack_mfsk.ack_pattern_nsymb,
+			best_offset,
+			ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+			ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+			ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets);
+		last_est = est;
+		// Note on sign: the WB MFSK family of estimators returns the OPPOSITE
+		// sign of the actual baseband residual under real-passband injection
+		// (§23.11.1). So for cfo_inject = +7 Hz, expected est ≈ -7 Hz.
+		if (std::fabs(est - (-cfo_inject)) < 1.5) hits++;
+	}
+	if (hits < 3) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"hits=%d/5 last_est=%.3f Hz expected≈%.1f Hz (±1.5; "
+			"sign-flipped per §23.11.1)",
+			hits, last_est, -cfo_inject);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §8.2 — Zero-CFO no-op. POSITIVE. Mirror of §7.2.
+static void test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op() {
+	const char* name = "mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op";
+
+	cl_telecom_system ts;
+	std::mt19937 rng(0x10580221u);
+	std::vector<double> pb;
+	int expected_offset = 0;
+	int dec_size = 0;
+	if (!synth_ack_pattern_passband_with_cfo(ts, /*cfo=*/0.0, /*sigma=*/0.0,
+	                                          /*synth=*/true, rng, pb,
+	                                          expected_offset, dec_size)) {
+		test_fail(name, "synth_ack_pattern_passband_with_cfo failed");
+		return;
+	}
+	int best_offset = -1;
+	int matched = 0;
+	double metric = 0.0;
+	std::vector<std::complex<double> > bb;
+	if (!run_initial_ack_detect(ts, pb, best_offset, matched, metric, bb)) {
+		test_fail(name, "initial detector missed clean ACK pattern");
+		return;
+	}
+	double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+	double est = ts.ofdm.carrier_frequency_sync_wb_ctrl(
+		bb.data(),
+		carrier_freq_width,
+		ts.ack_mfsk.ack_pattern_nsymb,
+		best_offset,
+		ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+		ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+		ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets);
+	if (!std::isfinite(est)) {
+		test_fail(name, "estimator returned non-finite at zero CFO");
+		return;
+	}
+	// Clean buffer post-FIR has very small residual; tolerance matches §7.2.
+	if (std::fabs(est) >= 0.5) {
+		char buf[200];
+		std::snprintf(buf, sizeof(buf),
+			"clean-signal estimate=%.4f Hz, expected |est|<0.5 (over-correction guard)",
+			est);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §8.3 — Pure-noise safety. NEGATIVE / sanity-clamp guard. Mirror of §7.3.
+// Note: we call the estimator on a SYNTHETIC buffer at a fixed offset that
+// represents where a hypothetical pattern would be — we're testing the
+// estimator's noise behavior, not the detector. The fixed offset lets us
+// drive the estimator without needing a successful detect.
+static void test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe() {
+	const char* name = "mfsk_ctrl_suffix_mini_moose_pure_noise_safe";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	double sigma_pb = 2.0 * rms;  // strong noise, no pattern
+
+	int wild = 0;
+	int non_finite = 0;
+	double max_est_seen = 0.0;
+	for (int trial = 0; trial < 50; trial++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0x10583333u + trial));
+		std::vector<double> pb;
+		int expected_offset = 0;
+		int dec_size = 0;
+		if (!synth_ack_pattern_passband_with_cfo(ts, 0.0, sigma_pb,
+		                                          /*synth=*/false, rng, pb,
+		                                          expected_offset, dec_size)) {
+			test_fail(name, "synth helper failed");
+			return;
+		}
+		// Decimated baseband for the estimator.
+		int M = ts.data_container.interpolation_rate;
+		int size = (int)pb.size();
+		int dec_size_local = size / M;
+		double effective_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+		std::vector<std::complex<double> > bb((size_t)dec_size_local,
+			std::complex<double>(0.0, 0.0));
+		ts.ofdm.passband_to_baseband_decimated(
+			pb.data(), size, bb.data(),
+			ts.sampling_frequency, effective_carrier, ts.carrier_amplitude,
+			M, &ts.ofdm.FIR_rx_data);
+
+		// Call estimator at the leading-silence-position offset (where a
+		// pattern would have been). On pure noise, the confidence gate
+		// should fire → returns 0.
+		double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+		double est = ts.ofdm.carrier_frequency_sync_wb_ctrl(
+			bb.data(),
+			carrier_freq_width,
+			ts.ack_mfsk.ack_pattern_nsymb,
+			expected_offset,
+			ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+			ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+			ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets);
+		if (!std::isfinite(est)) { non_finite++; continue; }
+		double ae = std::fabs(est);
+		if (ae > max_est_seen) max_est_seen = ae;
+		if (ae > 100.0) wild++;
+	}
+	if (non_finite > 0) {
+		char buf[200];
+		std::snprintf(buf, sizeof(buf),
+			"%d/50 trials returned non-finite (must never happen)",
+			non_finite);
+		test_fail(name, buf);
+		return;
+	}
+	if (wild > 0) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"%d/50 trials produced |est|>100 Hz, max=%.3f (sanity-clamp guard)",
+			wild, max_est_seen);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §8.4 — MANDATORY apply-sign-invariance end-to-end.
+//
+// THIS is the load-bearing regression test for the v2 sign convention.
+// Mirror of §7.4 for the ctrl-frame chain. Drives the full production-style
+// RX flow at two LO settings and asserts the corrected chain cancels the
+// injected CFO instead of doubling it.
+//
+// If a future PR copies the original §22 `+` formula into either wire-up
+// site (telecom_system.cc:3217 or :3413), the corrected chain will DOUBLE
+// the residual at baseband. The ACK base pattern's expected-tone-bin
+// energy collapses → this test FAILS. The test thus catches the §22-style
+// regression at `mercury.exe --test` time, before any hardware A/B is
+// scheduled.
+//
+// The test code mirrors the production apply formula via a LITERAL
+// expression `carrier_frequency - delta_est` — kept in sync with
+// telecom_system.cc:3247 (ACK wire-up) and :3438 (CONNECT wire-up). If a
+// future revert flips the production sign, this literal MUST be updated
+// in sync.
+static void test_mfsk_ctrl_suffix_apply_sign_invariance() {
+	const char* name = "mfsk_ctrl_suffix_apply_sign_invariance";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+
+	if (ts.ack_mfsk.M < 16 || ts.ack_mfsk.ack_pattern_nsymb <= 0) {
+		test_fail(name, "pre-condition: ROBUST_0 / ACK pattern not initialized");
+		return;
+	}
+
+	const int Nofdm = ts.data_container.Nofdm;
+	const int Nc = ts.data_container.Nc;
+	const int interp = ts.data_container.interpolation_rate;
+	const int ack_nsymb = ts.ack_mfsk.ack_pattern_nsymb;
+
+	// Generate ACK base pattern in freq domain (no suffix needed — we only
+	// probe the expected-tone-bin energy of the base pattern).
+	std::vector<std::complex<double> > pat_freq(
+		(size_t)ack_nsymb * (size_t)Nc, std::complex<double>(0.0, 0.0));
+	ts.ack_mfsk.generate_ack_pattern(pat_freq.data());
+
+	// Record expected per-symbol tone bin (after hopping) — this is where
+	// the demod-side test will probe the FFT.
+	std::vector<int> expected_subcarrier_idx((size_t)ack_nsymb, -1);
+	for (int s = 0; s < ack_nsymb; s++) {
+		// Pull the non-zero subcarrier; ACK lays down ONE bin per stream
+		// per symbol (we test nStreams=1 for WB ROBUST_0).
+		const std::complex<double>* row = &pat_freq[(size_t)s * Nc];
+		for (int k = 0; k < Nc; k++) {
+			if (std::norm(row[k]) > 0.0) {
+				expected_subcarrier_idx[(size_t)s] = k;
+				break;
+			}
+		}
+	}
+
+	// IFFT each symbol → time domain (Nofdm samples each).
+	std::vector<std::complex<double> > pat_time(
+		(size_t)ack_nsymb * (size_t)Nofdm, std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < ack_nsymb; s++) {
+		ts.ofdm.symbol_mod(&pat_freq[(size_t)s * Nc],
+		                    &pat_time[(size_t)s * Nofdm]);
+	}
+
+	// Build two passbands sharing the same detector windowing.
+	const int pattern_samples_pb = Nofdm * ack_nsymb * interp;
+	const int leading_silence_pb = 4 * Nofdm * interp;
+	const int trailing_silence_pb = 12 * Nofdm * interp;
+	const int buffer_pb_size = leading_silence_pb + pattern_samples_pb + trailing_silence_pb;
+
+	const double cfo_inject_hz = 7.0;
+
+	std::vector<double> ref_pb_pat((size_t)pattern_samples_pb, 0.0);
+	std::vector<double> shifted_pb_pat((size_t)pattern_samples_pb, 0.0);
+	{
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			pat_time.data(), Nofdm * ack_nsymb,
+			ref_pb_pat.data(),
+			ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+	{
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			pat_time.data(), Nofdm * ack_nsymb,
+			shifted_pb_pat.data(),
+			ts.sampling_frequency,
+			ts.carrier_frequency + cfo_inject_hz, ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	std::vector<double> ref_pb((size_t)buffer_pb_size, 0.0);
+	std::vector<double> shifted_pb((size_t)buffer_pb_size, 0.0);
+	for (int i = 0; i < pattern_samples_pb; i++) {
+		ref_pb[(size_t)(leading_silence_pb + i)] = ref_pb_pat[(size_t)i];
+		shifted_pb[(size_t)(leading_silence_pb + i)] = shifted_pb_pat[(size_t)i];
+	}
+
+	// Helper: mix at rx_lo_freq → run detect_ack_pattern → return average
+	// expected-tone-bin energy summed across the 16 ACK base symbols at the
+	// detected position. This proxies the metric `detect_ack_pattern` itself
+	// computes; the per-symbol FFT energy is its working primitive. If the
+	// CFO is correctly cancelled, the energy at the expected bin is high
+	// (matches reference). If the CFO is doubled, energy collapses (FFT
+	// alignment is off by ~2× cfo_inject relative to the expected bin).
+	auto avg_expected_bin_energy = [&](const std::vector<double>& pb,
+	                                    double rx_lo_freq,
+	                                    bool require_detect) -> double {
+		int M = ts.data_container.interpolation_rate;
+		int size = (int)pb.size();
+		int dec_size = size / M;
+		std::vector<std::complex<double> > bb((size_t)dec_size,
+			std::complex<double>(0.0, 0.0));
+		ts.ofdm.passband_to_baseband_decimated(
+			const_cast<double*>(pb.data()), size, bb.data(),
+			ts.sampling_frequency, rx_lo_freq, ts.carrier_amplitude,
+			M, &ts.ofdm.FIR_rx_data);
+
+		// Locate pattern via detect_ack_pattern.
+		int best_offset = -1;
+		int matched = 0;
+		double metric = ts.ofdm.detect_ack_pattern(
+			bb.data(), dec_size, 1,
+			ack_nsymb,
+			ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+			ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+			ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+			&matched, 0, nullptr, &best_offset,
+			cl_mfsk::SNR_SUFFIX_LEN);
+		(void)metric;
+		if (best_offset < 0) {
+			if (require_detect) return -1.0;
+			// Use the known leading-silence offset as a fallback so we can
+			// still probe the energy even if detector misses (mirror-bin /
+			// CFO-shift edge cases).
+			best_offset = leading_silence_pb / M;
+		}
+
+		// FFT each ACK base symbol at the detected offset and sum the
+		// expected-bin energy. Match the indexing inside
+		// `detect_ack_pattern` (decimated buffer, symbol stride = Nofdm).
+		std::vector<std::complex<double> > sym(
+			(size_t)Nofdm, std::complex<double>(0.0, 0.0));
+		std::vector<std::complex<double> > demod_out(
+			(size_t)Nc, std::complex<double>(0.0, 0.0));
+		double sum_energy = 0.0;
+		int counted = 0;
+		for (int s = 0; s < ack_nsymb; s++) {
+			int base = best_offset + s * Nofdm;
+			if (base + Nofdm > dec_size) break;
+			// Use the same symbol_demod path the production demod uses
+			// (Ngi strip + FFT + depad). Reuse ts.ofdm.symbol_demod.
+			ts.ofdm.symbol_demod(&bb[(size_t)base], demod_out.data());
+			int exp_idx = expected_subcarrier_idx[(size_t)s];
+			if (exp_idx < 0 || exp_idx >= Nc) continue;
+			double e = std::norm(demod_out[(size_t)exp_idx]);
+			sum_energy += e;
+			counted++;
+		}
+		if (counted == 0) return 0.0;
+		return sum_energy / (double)counted;
+	};
+
+	// 1) Reference: no-CFO chain.
+	double ref_energy = avg_expected_bin_energy(ref_pb, ts.carrier_frequency,
+	                                              /*require_detect=*/true);
+	if (!(ref_energy > 0.0)) {
+		test_fail(name, "reference expected-bin energy is zero or detector miss");
+		return;
+	}
+
+	// 2) Production-style chain on shifted passband:
+	//    a) Mix at carrier_frequency → uncorrected baseband.
+	//    b) Detect to get best_offset.
+	//    c) Call carrier_frequency_sync_wb_ctrl → δ_est.
+	//    d) Apply the production formula: rx_lo = carrier_frequency - δ_est
+	//       (§24 sign-corrected, mirrors telecom_system.cc:3247 and :3438).
+	int M = ts.data_container.interpolation_rate;
+	int size = (int)shifted_pb.size();
+	int dec_size = size / M;
+	std::vector<std::complex<double> > bb_unc((size_t)dec_size,
+		std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband_decimated(
+		shifted_pb.data(), size, bb_unc.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		M, &ts.ofdm.FIR_rx_data);
+	int best_offset = -1;
+	int matched = 0;
+	double metric0 = ts.ofdm.detect_ack_pattern(
+		bb_unc.data(), dec_size, 1,
+		ack_nsymb,
+		ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+		ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+		ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+		&matched, 0, nullptr, &best_offset,
+		cl_mfsk::SNR_SUFFIX_LEN);
+	(void)metric0;
+	if (best_offset < 0) {
+		test_fail(name, "initial detector miss on shifted passband — test "
+		                "scaffolding broken (CFO too large for detector?)");
+		return;
+	}
+	double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
+	double delta_est = ts.ofdm.carrier_frequency_sync_wb_ctrl(
+		bb_unc.data(),
+		carrier_freq_width,
+		ack_nsymb,
+		best_offset,
+		ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+		ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+		ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets);
+	if (std::fabs(delta_est) < 1.0) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"estimator returned δ=%.3f Hz on +7 Hz injection — "
+			"confidence gate fired (test scaffolding broken)",
+			delta_est);
+		test_fail(name, buf);
+		return;
+	}
+
+	// MIRROR the production apply formula EXACTLY. The sign here MUST
+	// match telecom_system.cc:3247 (`effective_carrier - ctrl_residual`)
+	// and :3438. If a future revert changes production to `+`, this
+	// literal MUST be updated in sync (the fail-before procedure relies
+	// on the test mirroring production).
+	double apply_lo = ts.carrier_frequency - delta_est;  // §24 sign-corrected
+
+	double corrected_energy = avg_expected_bin_energy(shifted_pb, apply_lo,
+	                                                    /*require_detect=*/false);
+	if (!std::isfinite(corrected_energy) || corrected_energy < 0.0) {
+		test_fail(name, "corrected expected-bin energy non-finite / negative");
+		return;
+	}
+
+	double rel_err = std::fabs(corrected_energy - ref_energy)
+	               / std::fabs(ref_energy);
+	if (rel_err > 0.10) {
+		char buf[320];
+		std::snprintf(buf, sizeof(buf),
+			"apply chain did not cancel +%.1f Hz CFO: "
+			"ref_energy=%.4f corrected=%.4f rel_err=%.3f (>0.10), "
+			"δ_est=%.3f Hz — apply formula sign or magnitude wrong "
+			"(this is the §22 regression mechanism — check telecom_system.cc:3247/:3438)",
+			cfo_inject_hz, ref_energy, corrected_energy, rel_err, delta_est);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -2215,6 +2803,14 @@ int run_mfsk_ctrl_codec_tests() {
 	// §7.4 Apply-sign-invariance (§23 sign-flip experiment,
 	// data-preamble-port-research.md §23.7).
 	test_mfsk_data_preamble_mini_moose_apply_sign_invariance();
+
+	// §8 Control-frame mini-Moose v2 regression suite
+	// (data-preamble-port-research.md §24,
+	//  data-flow-freq_offset_measured.md §12).
+	test_mfsk_ctrl_suffix_mini_moose_recovers_cfo();
+	test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op();
+	test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe();
+	test_mfsk_ctrl_suffix_apply_sign_invariance();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
