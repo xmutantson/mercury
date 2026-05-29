@@ -1076,3 +1076,78 @@ Cosmetic, not load-bearing.
 - The 4.76% additional preamble time pushes ROBUST_0 message timing
   to ~7.62 s — still under all ARQ timeouts (next-message-window is
   60s, batch-cycle is ~15s). If observed timing failures, escalate.
+
+### §11.17 Post-implementation verification (2026-05-28)
+
+**Status**: SHIPPED. Three commits on `monitor`:
+
+| Commit | Subject |
+|---|---|
+| `baa5c5b` | docs(preamble): §11 plan — extend WB MFSK data preamble 16 → 32 (pre-code) |
+| `0ab258b` | phy(mfsk+ofdm): extend WB MFSK data preamble 16 → 32 |
+| `f6aeb4e` | test(preamble): N=32 cross-layer + cliff regression suite |
+
+**Build**: `bash build.sh o3` clean (one pre-existing unrelated
+warning in arq_commander.cc:2313 sign-compare).
+
+**Test suite**: 32/32 pass with N=32 (29 pre-existing tests + 3 new).
+
+**Build-log diagnostic confirmation** (from `--test` startup,
+ROBUST_0 load):
+```
+[PHY] MFSK corr template: 32 symbols, 9920 samples,
+       energy=404377.854 (per-sym corr, FIR round-tripped)
+```
+Confirms `mfsk_corr_template_nsymb == 32` and template energy is
+populated across all 32 indices (energy ≈ 4× pre-N=32 baseline,
+consistent with 4× more symbols at the same per-symbol energy).
+
+**Fail-before-passes verified**: with the source changes stashed
+(N=16 baseline restored) and the new tests kept in place:
+- 13 tests fail: `preamble_nSymb_wb_robust0_extended_to_32`
+  (`MAX_PREAMBLE_SYMB=16 (expected 32)`),
+  `mfsk_data_preamble_passband_roundtrip_clean_n32`
+  (synth precondition fails: preamble_nSymb=16),
+  `mfsk_data_preamble_argmax_cliff_n32` (same),
+  plus all the existing argmax/mini_moose tests whose preconditions
+  check `!= 32` now (they were 16 in the stashed state).
+- After `git stash pop` + rebuild: 32/32 pass again.
+
+The pre-existing `time_sync_preamble_fft` dead-code arrays still
+hardcode `[16]` — documented in §11.3, out of scope for this change.
+
+### §11.18 §3 / §4 post-verification — invariants confirmed
+
+§3 Valid States row "MFSK WB loaded (post-N=32)" — VERIFIED:
+- mfsk.preamble_nSymb == 32 (test §5.1 asserts)
+- data_container.preamble_nSymb == 32 (test §5.1 asserts)
+- ofdm.preamble_configurator.Nsymb == 32 (test §5.1 asserts)
+- ofdm.mfsk_corr_template_nsymb == 32 (test §5.1 asserts)
+- mfsk_corr_template_sym_energy[0..31] > 0 (test §5.1 asserts)
+- ofdm.mfsk_preamble_tones[0..31] == mfsk.preamble_tones[0..31]
+  (test §5.1 asserts INV-PORT-2 mirror)
+- ofdm.mfsk_preamble_match_threshold == mfsk.preamble_match_threshold == 14
+  (test §5.1 asserts)
+
+§4 invariants — VERIFIED:
+- INV-PROD-1 (triple-equality at N=32): test §5.1 covers all four
+  authorities including the mfsk_corr_template mirror.
+- INV-PROD-2 (template energy array size >= 32): bumped to [32]
+  at ofdm.h:280.
+- INV-PROD-3 (MAX_PREAMBLE_SYMB >= 32): bumped to 32 at mfsk.h:56.
+- INV-CONS-1 (receive_msg upper_bound > 0): math in §11.11 holds;
+  buffer_Nsymb at ROBUST_0 = 836 per build log, upper_bound = 484.
+  Implicitly verified by all existing tests passing.
+- INV-CONS-2 (NB preamble unchanged): NB MFSK init() M=8/M=4
+  branches untouched; preamble_configurator override at
+  telecom_system.cc:4923 keeps NB at 8 via `narrowband_enabled ? 8 : 32`.
+- INV-CONS-3 (OFDM unchanged): all OFDM tests pass; no OFDM source
+  modified beyond the §11.9 sites which are all gated on M=MOD_MFSK.
+- INV-CONS-4 (CONNECT/HAIL/ACK/BREAK independence):
+  test_base_pattern_cross_correlation still passes (base tones
+  unchanged); test_mfsk_connect_no_hail_false_trigger still passes;
+  test_mfsk_connect_passband_roundtrip_clean still passes.
+- INV-PORT-4 (discrete-match threshold range): At N=32, M=32 lower
+  bound is 2*32/32 = 2; T=14 well above. At M=16 bound is 4; T=14
+  well above. Upper bound 32; T=14 below. Verified by test §5.1
+  (asserts preamble_match_threshold == 14) and binomial FAR math.
