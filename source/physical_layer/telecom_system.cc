@@ -3245,6 +3245,72 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	if(*out_matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
 		return -99.0f;
 
+	// Control-frame mini-Moose v2 (data-preamble-port-research.md §24,
+	// data-flow-freq_offset_measured.md §12). Refine residual CFO using the
+	// 16-symbol ACK base pattern at the detected position, then re-mix
+	// from passband with the SIGN-CORRECTED apply formula
+	// `effective_carrier - residual` (§23.11.1 sign verdict). v1
+	// (feat/mini-moose-ctrl, dropped) used `+` and regressed -40% bytes
+	// on hardware A/B at WGN ≤ -8 because the WB MFSK estimator returns
+	// the OPPOSITE sign of the actual baseband residual under the real-
+	// passband injection model. v2 cancels (not doubles) the residual.
+	//
+	// Fail-safes:
+	//   - estimator's 0.05 confidence gate returns 0 on pure-noise input.
+	//   - freq_offset_ignore_limit (≈ 3 Hz) skips re-mix for sub-threshold
+	//     residuals → buffer used as-is, identical to pre-v2 behavior.
+	//   - if the second detect_ack_pattern doesn't improve (matched drops
+	//     or shifts off the original best_offset's symbol grid), the
+	//     downstream decode_suffix_tones still runs at the updated
+	//     best_offset because the corrected baseband always represents
+	//     the same audio window — just with a different mix LO.
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		ack_mfsk.ack_pattern_nsymb,
+		best_offset,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		// Re-mix at the SIGN-CORRECTED LO (§24.2.b). Identical buffer math
+		// to the initial mix above — same M, same size, same FIR. Only the
+		// mix frequency argument changes.
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency,
+			effective_carrier - ctrl_residual,
+			carrier_amplitude,
+			M, &ofdm.FIR_rx_data);
+
+		// Re-run detection on the corrected baseband. The matched count
+		// typically increases when CFO is corrected; best_offset may shift
+		// by 0-1 symbols. If the new detection drops below threshold for
+		// any reason, fall back to the corrected baseband at the original
+		// best_offset (the corrected mix is still better-aligned than the
+		// uncorrected one for the suffix decode).
+		int rematched = 0;
+		int rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size,
+			1,
+			ack_mfsk.ack_pattern_nsymb,
+			ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, 0, nullptr, &rebest_offset,
+			cl_mfsk::SNR_SUFFIX_LEN);
+		if (rematched >= ack_mfsk.ack_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		{
+			*out_matched = rematched;
+			best_offset = rebest_offset;
+		}
+		// else: keep the original best_offset; corrected baseband still
+		// used for the downstream suffix decode.
+	}
+
 	// Decode suffix tones at the detected position (decimated buffer, rate=1).
 	// SACK suffix is longer than SNR (10 vs 8 on WB), so capture the max
 	// available — decode_suffix_tones writes -1 for any symbol that runs
@@ -3449,6 +3515,49 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 
 	if (matched < ack_mfsk.connect_match_threshold || metric < 3.0 || best_offset < 0)
 		return false;
+
+	// Control-frame mini-Moose v2 (data-preamble-port-research.md §24.2.c,
+	// data-flow-freq_offset_measured.md §12). Mirror of the
+	// detect_ack_snr_from_passband wire-up but for the CONNECT base pattern.
+	// Same SIGN-CORRECTED apply formula `effective_carrier - residual`
+	// (§23.11.1). Same fail-safes.
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		ack_mfsk.connect_pattern_nsymb,
+		best_offset,
+		ack_mfsk.connect_tones, /*pattern_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency,
+			effective_carrier - ctrl_residual,
+			carrier_amplitude,
+			M, &ofdm.FIR_rx_data);
+
+		int rematched = 0;
+		int rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size,
+			1,
+			ack_mfsk.connect_pattern_nsymb,
+			ack_mfsk.connect_tones, /*base_len=*/8,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+			&rebest_offset, /*reserve_after=*/ack_mfsk.ack_sack_suffix_len(),
+			/*out_match_mask=*/nullptr);
+		if (rematched >= ack_mfsk.connect_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		{
+			matched = rematched;
+			best_offset = rebest_offset;
+			if (out_matched) *out_matched = matched;
+		}
+	}
 
 	// Decode the 13-tone ctrl-suffix at the matched position.
 	int suffix_len = ack_mfsk.ack_sack_suffix_len();
