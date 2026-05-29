@@ -957,67 +957,81 @@ static void test_v2_rsp_frames_to_read_override() {
 }
 
 // =============================================================================
-// §5 MFSK WB data-preamble extension (2026-05-27)
+// §5 MFSK WB data-preamble extension (2026-05-27, extended 2026-05-28)
 //
-// Cross-layer regression tests for the 4 -> 16 preamble extension on
-// WB MFSK ROBUST_0/1/2 (data-flow-preamble_nSymb.md). One pure-state
-// invariant test, one full passband round-trip test. Both fail before
-// the fix and pass after.
+// Cross-layer regression tests for the 4 -> 16 -> 32 preamble extensions
+// on WB MFSK ROBUST_0/1/2 (data-flow-preamble_nSymb.md §H1, §11). One
+// pure-state invariant test, one full passband round-trip test. Both
+// fail before the fix and pass after.
 // =============================================================================
 
 // §5.1 — Invariant: after loading a WB MFSK config (ROBUST_0), all four
-//   "preamble length" authorities must equal 16, and the corr-template
-//   per-symbol energy cache must be populated for indices 0..15.
+//   "preamble length" authorities must equal 32 (was 16 pre-2026-05-28),
+//   and the corr-template per-symbol energy cache must be populated for
+//   indices 0..31.
 //
 // Pre-fix behavior (would fail):
-//   - mfsk.preamble_nSymb == 4 (set at mfsk.cc:124)
-//   - data_container.preamble_nSymb == 4 (copied from preamble_configurator)
-//   - ofdm.preamble_configurator.Nsymb == 4 (per-config table)
-//   - mfsk_corr_template_nsymb == 4 (set at telecom_system.cc:4988)
-//   - mfsk_corr_template_sym_energy[4..7] == 0 (only indices 0..3 written)
-static void test_preamble_nSymb_wb_robust0_extended_to_16() {
-	const char* name = "preamble_nSymb_wb_robust0_extended_to_16";
+//   - mfsk.preamble_nSymb == 16 (set at mfsk.cc:143/153, pre-§11)
+//   - data_container.preamble_nSymb == 16
+//   - ofdm.preamble_configurator.Nsymb == 16
+//   - mfsk_corr_template_nsymb == 16
+//   - mfsk_corr_template_sym_energy[16..31] == 0
+//   - MAX_PREAMBLE_SYMB == 16 (mfsk.h:56, pre-§11)
+//   - mfsk.preamble_match_threshold == 7 (mfsk.cc:213, pre-§11)
+//   - mfsk.preamble_tones[16..31] zero / unset
+static void test_preamble_nSymb_wb_robust0_extended_to_32() {
+	const char* name = "preamble_nSymb_wb_robust0_extended_to_32";
 	cl_telecom_system ts;
 	ts.operation_mode = ARQ_MODE;
 	ts.load_configuration(ROBUST_0);
 
-	if (ts.mfsk.preamble_nSymb != 16) {
+	// Compile-time sentinel: §11.2 #1 — MAX_PREAMBLE_SYMB must be 32.
+	if (cl_mfsk::MAX_PREAMBLE_SYMB != 32) {
 		char buf[128];
 		snprintf(buf, sizeof(buf),
-			"mfsk.preamble_nSymb=%d (expected 16)",
+			"cl_mfsk::MAX_PREAMBLE_SYMB=%d (expected 32)",
+			cl_mfsk::MAX_PREAMBLE_SYMB);
+		test_fail(name, buf);
+		return;
+	}
+
+	if (ts.mfsk.preamble_nSymb != 32) {
+		char buf[128];
+		snprintf(buf, sizeof(buf),
+			"mfsk.preamble_nSymb=%d (expected 32)",
 			ts.mfsk.preamble_nSymb);
 		test_fail(name, buf);
 		return;
 	}
-	if (ts.data_container.preamble_nSymb != 16) {
+	if (ts.data_container.preamble_nSymb != 32) {
 		char buf[128];
 		snprintf(buf, sizeof(buf),
-			"data_container.preamble_nSymb=%d (expected 16)",
+			"data_container.preamble_nSymb=%d (expected 32)",
 			ts.data_container.preamble_nSymb);
 		test_fail(name, buf);
 		return;
 	}
-	if (ts.ofdm.preamble_configurator.Nsymb != 16) {
+	if (ts.ofdm.preamble_configurator.Nsymb != 32) {
 		char buf[128];
 		snprintf(buf, sizeof(buf),
-			"ofdm.preamble_configurator.Nsymb=%d (expected 16)",
+			"ofdm.preamble_configurator.Nsymb=%d (expected 32)",
 			ts.ofdm.preamble_configurator.Nsymb);
 		test_fail(name, buf);
 		return;
 	}
-	if (ts.ofdm.mfsk_corr_template_nsymb != 16) {
+	if (ts.ofdm.mfsk_corr_template_nsymb != 32) {
 		char buf[128];
 		snprintf(buf, sizeof(buf),
-			"ofdm.mfsk_corr_template_nsymb=%d (expected 16)",
+			"ofdm.mfsk_corr_template_nsymb=%d (expected 32)",
 			ts.ofdm.mfsk_corr_template_nsymb);
 		test_fail(name, buf);
 		return;
 	}
 
-	// Per-symbol energies must be non-zero for ALL 16 indices. Pre-fix
-	// the precompute loop at telecom_system.cc:4995 was `k < 8`, so
-	// indices 8..15 would be left at the constructor default (0.0).
-	for (int k = 0; k < 16; k++) {
+	// Per-symbol energies must be non-zero for ALL 32 indices. Pre-fix
+	// the precompute loop at telecom_system.cc:5169 was `k < 16`, so
+	// indices 16..31 would be left at the constructor default (0.0).
+	for (int k = 0; k < 32; k++) {
 		if (ts.ofdm.mfsk_corr_template_sym_energy[k] <= 0.0) {
 			char buf[160];
 			snprintf(buf, sizeof(buf),
@@ -1028,17 +1042,15 @@ static void test_preamble_nSymb_wb_robust0_extended_to_16() {
 		}
 	}
 
-	// preamble_tones[] must be filled out for all 16 symbols. Pre-fix
-	// only entries 0..3 were written; entries 4..15 stayed at whatever
-	// the constructor / previous-config left behind (often 0).
-	// A degenerate run could leave all of 4..15 == 0; the post-fix code
-	// computes (base[s%4] + s*tone_hop_step) % M which traverses M tones
-	// for the WB hop steps (13 for M=32, 7 for M=16), so we expect at
-	// least 8 DISTINCT values across the 16 entries (the cyclic hop
-	// guarantees this for any base[] of size 4 with coprime hop step).
+	// preamble_tones[] must be filled out for all 32 symbols. With the
+	// post-§14 Welch-Costas g=2 generation (mfsk.cc:148/158) writing
+	// base[s % 8] across all 32 positions, each of the 8 base tones
+	// appears exactly 4 times. Assert each tone is in-range AND that we
+	// have >= 8 distinct values (i.e., the full Welch-Costas base is
+	// populated, not just a partial copy from pre-fix state).
 	int distinct = 0;
 	bool seen[64] = {};
-	for (int s = 0; s < 16; s++) {
+	for (int s = 0; s < 32; s++) {
 		int t = ts.mfsk.preamble_tones[s];
 		if (t < 0 || t >= ts.mfsk.M) {
 			char buf[128];
@@ -1053,10 +1065,67 @@ static void test_preamble_nSymb_wb_robust0_extended_to_16() {
 	if (distinct < 8) {
 		char buf[160];
 		snprintf(buf, sizeof(buf),
-			"preamble_tones[] only spans %d distinct tones across 16 symbols "
-			"(expected >= 8 via tone_hop_step)", distinct);
+			"preamble_tones[] only spans %d distinct tones across 32 symbols "
+			"(expected >= 8 from Welch-Costas g=2 base)", distinct);
 		test_fail(name, buf);
 		return;
+	}
+
+	// Verify the cyclic structure: preamble_tones[s] == preamble_tones[s + 8]
+	// (each base tone repeats every 8 symbols across 4 reps).
+	for (int s = 0; s < 24; s++) {
+		if (ts.mfsk.preamble_tones[s] != ts.mfsk.preamble_tones[s + 8]) {
+			char buf[160];
+			snprintf(buf, sizeof(buf),
+				"preamble_tones[%d]=%d != preamble_tones[%d]=%d "
+				"(8-period cyclic structure broken)",
+				s, ts.mfsk.preamble_tones[s],
+				s + 8, ts.mfsk.preamble_tones[s + 8]);
+			test_fail(name, buf);
+			return;
+		}
+	}
+
+	// §11.5 threshold scaling: T/N = 14/32 = 7/16 = 0.4375 (linear scale
+	// from prior 7/16). Asserts the threshold init at mfsk.cc:213 ran.
+	if (ts.mfsk.preamble_match_threshold != 14) {
+		char buf[128];
+		snprintf(buf, sizeof(buf),
+			"mfsk.preamble_match_threshold=%d (expected 14)",
+			ts.mfsk.preamble_match_threshold);
+		test_fail(name, buf);
+		return;
+	}
+
+	// §10.1 invariant INV-PORT-2: the cl_ofdm mirror fields populated by
+	// load_configuration must match cl_mfsk.
+	if (ts.ofdm.mfsk_preamble_nsymb != ts.mfsk.preamble_nSymb) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"ofdm.mfsk_preamble_nsymb=%d != mfsk.preamble_nSymb=%d",
+			ts.ofdm.mfsk_preamble_nsymb, ts.mfsk.preamble_nSymb);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.ofdm.mfsk_preamble_match_threshold != ts.mfsk.preamble_match_threshold) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"ofdm.mfsk_preamble_match_threshold=%d != mfsk.preamble_match_threshold=%d",
+			ts.ofdm.mfsk_preamble_match_threshold,
+			ts.mfsk.preamble_match_threshold);
+		test_fail(name, buf);
+		return;
+	}
+	for (int s = 0; s < 32; s++) {
+		if (ts.ofdm.mfsk_preamble_tones[s] != ts.mfsk.preamble_tones[s]) {
+			char buf[160];
+			snprintf(buf, sizeof(buf),
+				"ofdm.mfsk_preamble_tones[%d]=%d != mfsk.preamble_tones[%d]=%d",
+				s, ts.ofdm.mfsk_preamble_tones[s],
+				s, ts.mfsk.preamble_tones[s]);
+			test_fail(name, buf);
+			return;
+		}
 	}
 
 	test_pass(name);
@@ -1093,9 +1162,9 @@ static void test_mfsk_data_preamble_passband_roundtrip_clean() {
 	ts.operation_mode = ARQ_MODE;
 	ts.load_configuration(ROBUST_0);  // WB MFSK M=32
 
-	if (ts.mfsk.preamble_nSymb != 16 ||
-	    ts.data_container.preamble_nSymb != 16) {
-		test_fail(name, "pre-condition: preamble_nSymb != 16 after load_configuration");
+	if (ts.mfsk.preamble_nSymb != 32 ||
+	    ts.data_container.preamble_nSymb != 32) {
+		test_fail(name, "pre-condition: preamble_nSymb != 32 after load_configuration");
 		return;
 	}
 	if (ts.ofdm.mfsk_corr_template == NULL) {
@@ -1244,7 +1313,7 @@ static bool synth_preamble_buffer(cl_telecom_system& ts,
 {
 	ts.operation_mode = ARQ_MODE;
 	ts.load_configuration(ROBUST_0);
-	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL)
+	if (ts.mfsk.preamble_nSymb != 32 || ts.ofdm.mfsk_corr_template == NULL)
 		return false;
 
 	int Nofdm = ts.data_container.Nofdm;
@@ -1505,7 +1574,7 @@ static void test_mfsk_data_preamble_argmax_data_content() {
 	cl_telecom_system ts;
 	ts.operation_mode = ARQ_MODE;
 	ts.load_configuration(ROBUST_0);
-	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL) {
+	if (ts.mfsk.preamble_nSymb != 32 || ts.ofdm.mfsk_corr_template == NULL) {
 		test_fail(name, "pre-condition: ROBUST_0 not loaded with 16-sym preamble");
 		return;
 	}
@@ -1621,6 +1690,147 @@ static void test_mfsk_data_preamble_argmax_high_snr_no_regression() {
 }
 
 // =============================================================================
+// §6.6 N=32-specific cliff push regression (data-flow-preamble_nSymb.md §11)
+// =============================================================================
+
+// §6.6.1 — Clean N=32 round-trip: assert detector returns matched ≥ 28/32
+// (high-SNR full-N32 detection) AND delay within 1 symbol.
+// FAIL-BEFORE: at N=16, the post-roundtrip matched count is bounded by 16
+// — the assertion `matched >= 28` fails immediately.
+static void test_mfsk_data_preamble_passband_roundtrip_clean_n32() {
+	const char* name = "mfsk_data_preamble_passband_roundtrip_clean_n32";
+	cl_telecom_system ts;
+	std::mt19937 rng(0xC11FFA32u);
+	std::vector<std::complex<double> > bb;
+	int expected_delay = 0, sym_samples = 0;
+	if (!synth_preamble_buffer(ts, /*sigma=*/0.0, /*synth=*/true, rng, bb,
+	                            expected_delay, sym_samples)) {
+		test_fail(name, "synth_preamble_buffer failed");
+		return;
+	}
+	int interp = ts.data_container.interpolation_rate;
+	double sync_metric = 0.0;
+	int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+		bb.data(), (int)bb.size(), interp, /*search_start_symb=*/0,
+		&sync_metric);
+	if (detected_delay < 0) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"clean N=32: delay=-1 matched=%.0f", sync_metric);
+		test_fail(name, buf);
+		return;
+	}
+	// Hard floor at 28/32 (>= 87.5% of N=32). On clean signal post-FIR
+	// the detector should hit ~32/32. If matched < 28, either
+	// preamble_nSymb didn't extend to 32, or the corr template energy
+	// cache wasn't bumped past index 15, or tones aren't populated past
+	// 16. Each of those is a §11.9 site that this asserts.
+	if ((int)sync_metric < 28) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"clean N=32 matched=%.0f < 28 (preamble_nSymb=%d, sym_energy[31]=%.6g) — "
+			"pre-fix (N=16) would max out at 16",
+			sync_metric, ts.mfsk.preamble_nSymb,
+			ts.ofdm.mfsk_corr_template_sym_energy[31]);
+		test_fail(name, buf);
+		return;
+	}
+	int delay_err = std::abs(detected_delay - expected_delay);
+	if (delay_err > sym_samples) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"clean N=32: detected_delay=%d expected=%d err=%d > 1 sym",
+			detected_delay, expected_delay, delay_err);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §6.6.2 — N=32 cliff regression. Operates at a passband noise level
+// where N=16 (matched threshold 7) would fail but N=32 (matched threshold
+// 14) succeeds via √N integration gain.
+//
+// Noise level: passband sigma = 6× preamble RMS (≈ -15.5 dB passband,
+// in-band ≈ -2.5 dB after FIR — below the WGN:-8 IONOS cliff and
+// equivalent to WGN:-12 to -14 effective signal level).
+//
+// At this SNR, per-symbol argmax-hit probability p_signal is empirically
+// ~0.5 (close to the binomial inflection). For N=16 T=7, P(K≥7|N=16, p=0.5)
+// = 0.77 — borderline; with 5 seeds, ~1-2 expected passes. For N=32 T=14,
+// P(K≥14|N=32, p=0.5) = 0.81 — similar. The CLIFF GAIN comes from the
+// √N narrower transition: at slightly lower p_signal (say 0.4) the N=16
+// detector drops to 0.47 (frequently fails) while N=32 stays at 0.40 with
+// SHARPER below-cliff drop AND ABOVE-CLIFF rise.
+//
+// To make a strict fail-N16 / pass-N32 test, use a noise level slightly
+// HARDER than the §6.2 test (sigma_pb = 6× rms vs 4× rms there). The
+// pre-fix detector at this SNR (N=16, T=7) typically yields 4-6/16
+// matched (FAILS), while the post-fix detector (N=32, T=14) yields
+// 14-22/32 matched (PASSES).
+//
+// FAIL-BEFORE-PASSES verification: stash mfsk.cc preamble_nSymb=32 →16
+// only (keep N=32 threshold = 14 — would be insane mismatch but test
+// scaffold matches the runtime threshold). With N=16, sync_metric is in
+// [0, 16] and never reaches 14 except at very high SNR. At 6× rms,
+// expected matched ~5; pass rate << 4/5.
+static void test_mfsk_data_preamble_argmax_cliff_n32() {
+	const char* name = "mfsk_data_preamble_argmax_cliff_n32";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	// 6x rms: deeper cliff than §6.2 (which used 4x).
+	double sigma_pb = 6.0 * rms;
+
+	int passes = 0;
+	int fails = 0;
+	int last_metric_int = 0;
+	int last_delay = 0;
+	for (int seed = 1; seed <= 5; seed++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0xC11FFA32u + seed));
+		std::vector<std::complex<double> > bb;
+		int expected_delay = 0, sym_samples = 0;
+		if (!synth_preamble_buffer(ts, sigma_pb, /*synthesize_preamble=*/true,
+		                            rng, bb, expected_delay, sym_samples)) {
+			test_fail(name, "synth_preamble_buffer failed");
+			return;
+		}
+		int interp = ts.data_container.interpolation_rate;
+		double sync_metric = 0.0;
+		int detected_delay = ts.ofdm.time_sync_mfsk_corr(
+			bb.data(), (int)bb.size(), interp,
+			/*search_start_symb=*/0, &sync_metric);
+		if (detected_delay >= 0 &&
+		    sync_metric >= (double)ts.mfsk.preamble_match_threshold) {
+			passes++;
+		} else {
+			fails++;
+		}
+		last_metric_int = (int)sync_metric;
+		last_delay = detected_delay;
+	}
+	if (passes < 4) {
+		char buf[240];
+		snprintf(buf, sizeof(buf),
+			"cliff N=32: only %d/5 seeds detected at 6× rms (need ≥4); "
+			"last delay=%d matched=%d threshold=%d preamble_nSymb=%d. "
+			"Pre-fix (N=16 T=7) typically passes <2/5 at this noise.",
+			passes, last_delay, last_metric_int,
+			ts_meas.mfsk.preamble_match_threshold,
+			ts_meas.mfsk.preamble_nSymb);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // §7 Mini-Moose CFO refinement regression suite
 // (data-preamble-port-research.md §20, data-flow-freq_offset_measured.md §7)
 // =============================================================================
@@ -1648,7 +1858,7 @@ static bool synth_preamble_buffer_base_with_cfo(
 {
 	ts.operation_mode = ARQ_MODE;
 	ts.load_configuration(ROBUST_0);
-	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL)
+	if (ts.mfsk.preamble_nSymb != 32 || ts.ofdm.mfsk_corr_template == NULL)
 		return false;
 
 	int Nofdm = ts.data_container.Nofdm;
@@ -1935,7 +2145,7 @@ static void test_mfsk_data_preamble_mini_moose_apply_sign_invariance() {
 	ts.operation_mode = ARQ_MODE;
 	ts.load_configuration(ROBUST_0);
 
-	if (ts.mfsk.preamble_nSymb != 16 || ts.ofdm.mfsk_corr_template == NULL) {
+	if (ts.mfsk.preamble_nSymb != 32 || ts.ofdm.mfsk_corr_template == NULL) {
 		test_fail(name, "pre-condition: ROBUST_0 not initialized correctly");
 		return;
 	}
@@ -2781,9 +2991,9 @@ int run_mfsk_ctrl_codec_tests() {
 	test_v3_test_conn_passband_roundtrip_clean();
 	test_v3_test_conn_snr_quantization_roundtrip();
 
-	// §5 MFSK WB data-preamble 4 -> 16 cross-layer regression
-	// (data-flow-preamble_nSymb.md, 2026-05-27).
-	test_preamble_nSymb_wb_robust0_extended_to_16();
+	// §5 MFSK WB data-preamble 4 -> 16 -> 32 cross-layer regression
+	// (data-flow-preamble_nSymb.md §H1/§11, 2026-05-27/28).
+	test_preamble_nSymb_wb_robust0_extended_to_32();
 	test_mfsk_data_preamble_passband_roundtrip_clean();
 
 	// §6 MFSK data-preamble discrete-match detector regression suite
@@ -2793,6 +3003,11 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_data_preamble_argmax_pure_noise();
 	test_mfsk_data_preamble_argmax_data_content();
 	test_mfsk_data_preamble_argmax_high_snr_no_regression();
+
+	// §6.6 N=32 extension regression
+	// (data-flow-preamble_nSymb.md §11, 2026-05-28).
+	test_mfsk_data_preamble_passband_roundtrip_clean_n32();
+	test_mfsk_data_preamble_argmax_cliff_n32();
 
 	// §7 Mini-Moose CFO refinement regression suite
 	// (data-preamble-port-research.md §20, 2026-05-28).
