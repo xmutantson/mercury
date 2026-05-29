@@ -118,44 +118,45 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	// MFSK preamble: known tone sequence spread across each stream's band.
 	// Same tone index used in all streams simultaneously.
 	// NB (M<=8): 8-symbol preamble for cross-correlation detection.
-	// WB (M>=16): 16-symbol preamble (raised from 4 on 2026-05-27 per
-	// data-frame-cliff-audit-2026-05-27.md §H1) for +6 dB matched-filter
-	// integration gain at the WGN:-8 cliff.
+	// WB (M>=16): 32-symbol preamble (raised from 4 on 2026-05-27, then
+	// 16 → 32 on 2026-05-28 per data-flow-preamble_nSymb.md §11) for
+	// +1.5-3 dB additional cliff push via √N matched-filter integration
+	// gain at the WGN:-10/-12 cliff.
 	//
 	// 2026-05-27 (data-preamble-port-research.md §14): WB preamble tones
 	// are now a Welch-Costas sequence with primitive root g=2 (mod 17),
 	// distinct from ACK (g=5), BREAK (g=7), HAIL (g=6), CONNECT (g=3).
-	// 8 base tones × 2 reps fill the 16-symbol preamble. The data-preamble
-	// TX path (cl_mfsk::generate_preamble, mfsk.cc:467) reads
-	// preamble_tones[s % preamble_nSymb] DIRECTLY with no tone-hopping at
-	// emit time, so the array stores the full 16-symbol sequence here.
-	// The new RX detector (time_sync_mfsk_corr discrete-match port,
-	// ofdm.cc) reads the same array — symmetric.
+	// 8 base tones × 4 reps fill the 32-symbol preamble (was × 2 for the
+	// 16-symbol form). The data-preamble TX path (cl_mfsk::generate_preamble,
+	// mfsk.cc:495) reads preamble_tones[s % preamble_nSymb] DIRECTLY with
+	// no tone-hopping at emit time, so the array stores the full 32-symbol
+	// sequence here. The new RX detector (time_sync_mfsk_corr discrete-match
+	// port, ofdm.cc) reads the same array — symmetric.
 	//
 	// Cross-correlation against existing Welch-Costas patterns
 	// (8-base-tone Hamming distance): vs ACK 7/8, vs BREAK 8/8, vs HAIL
 	// 8/8, vs CONNECT 8/8 at both M=16 and M=32. All ≥ 6/8, the bar
 	// enforced by test_base_pattern_cross_correlation
-	// (mfsk_ctrl_codec_tests.cc:409). Expanded 16-symbol sequences
-	// ≥ 14/16 — well above the 7/16 detector threshold.
+	// (mfsk_ctrl_codec_tests.cc:411). Expanded 32-symbol sequences
+	// ≥ 28/32 — well above the 14/32 detector threshold.
 	if (M == 32)
 	{
-		preamble_nSymb = 16;
+		preamble_nSymb = 32;
 		// 2× scaled M=16 Welch-Costas g=2 sequence:
 		// (2^k mod 17 for k=1..8) × 2 mod 32, with the trailing 16→0
 		// substitution carried through: {4, 8, 16, 0, 30, 26, 18, 2}.
 		const int base[8] = {4, 8, 16, 0, 30, 26, 18, 2};
-		for (int s = 0; s < 16; s++)
+		for (int s = 0; s < 32; s++)
 			preamble_tones[s] = base[s % 8];
 	}
 	else if (M == 16)
 	{
-		preamble_nSymb = 16;
+		preamble_nSymb = 32;
 		// Welch-Costas (p=17, g=2): 2^k mod 17, k=1..8 = {2,4,8,16,15,13,9,1}.
 		// Trailing 16 is out-of-range for M=16; substituted to 0 (free of
 		// CONNECT/ACK/BREAK/HAIL base-tone collisions at any index).
 		const int base[8] = {2, 4, 8, 0, 15, 13, 9, 1};
-		for (int s = 0; s < 16; s++)
+		for (int s = 0; s < 32; s++)
 			preamble_tones[s] = base[s % 8];
 	}
 	else if (M == 8)
@@ -199,18 +200,22 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	//
 	// Detector accepts expected_bin OR mirror_bin (Bug #39 carrier-image
 	// recovery, ofdm.cc:3130, 3228) so the random-data baseline is p=2/M
-	// per symbol, NOT 1/M. This makes M=32 FAR 100× tighter than M=16
-	// but does NOT support a one-notch relax of M=32 to T=6 (would give
-	// FAR 2.8e-4/poll, over the 1e-5 escalation bound — see §15 fact
-	// doc). Uniform T=7 retained; §15 push deferred pending design fix.
+	// per symbol, NOT 1/M.
+	//
+	// 2026-05-28 (data-flow-preamble_nSymb.md §11): WB N=16 → N=32, T 7
+	// → 14 (linear scale at the same T/N fraction 0.4375). This preserves
+	// the binomial detector's operating-point p_signal while sharpening
+	// the cliff via √N variance reduction (+1.5-3 dB cliff push). FAR
+	// drops across the board because the detector tolerance also tightens
+	// at the new threshold.
 	// FAR computed as P(K ≥ T) for K ~ Binomial(N, 2/M):
-	//   WB M=32 N=16 → T=7  : FAR = 2.57e-5/poll
-	//   WB M=16 N=16 → T=7  : FAR = 1.94e-3/poll
-	//   NB M=8  N=8  → T=7  : FAR = 3.82e-4/poll
+	//   WB M=32 N=32 → T=14 : FAR = 2.22e-9/poll  (was 2.57e-5 at N=16 T=7)
+	//   WB M=16 N=32 → T=14 : FAR = 1.16e-5/poll  (was 1.94e-3 at N=16 T=7)
+	//   NB M=8  N=8  → T=7  : FAR = 3.82e-4/poll  (unchanged; NB stays at N=8)
 	//   NB M=4  N=8  → T=7  : FAR = 3.52e-2/poll (mirror collisions
 	//                          degenerate; mitigated by 2-stream all-match)
 	if (M >= 16)
-		preamble_match_threshold = 7;
+		preamble_match_threshold = 14;
 	else
 		preamble_match_threshold = 7;
 

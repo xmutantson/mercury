@@ -50,10 +50,13 @@ public:
 	// MFSK preamble: known tone indices for time sync.
 	// WB data preamble extended 4 -> 16 symbols on 2026-05-27 (data-flow-
 	// preamble_nSymb.md §H1) for +6 dB matched-filter integration gain at
-	// the WGN:-8 cliff. NB preamble (M=8 / M=4) stays at 8 symbols.
-	// MAX_PREAMBLE_SYMB must be >= max(preamble_nSymb across all configs)
-	// and >= mfsk_corr_template_sym_energy[] size in ofdm.h.
-	static const int MAX_PREAMBLE_SYMB = 16;
+	// the WGN:-8 cliff. WB further extended 16 -> 32 symbols on 2026-05-28
+	// (data-flow-preamble_nSymb.md §11) for +1.5-3 dB additional cliff push
+	// via doubled matched-filter integration length. NB preamble (M=8 / M=4)
+	// stays at 8 symbols. MAX_PREAMBLE_SYMB must be >= max(preamble_nSymb
+	// across all configs) and >= mfsk_corr_template_sym_energy[] size in
+	// ofdm.h and >= mfsk_preamble_tones[] mirror in ofdm.h.
+	static const int MAX_PREAMBLE_SYMB = 32;
 	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol
 	int preamble_nSymb;                     // Number of preamble symbols used
 	// Length-scaled detection threshold for the discrete-match preamble
@@ -61,7 +64,8 @@ public:
 	// fact-documents/data-preamble-port-research.md §14). Number of
 	// per-symbol FFT-bin-argmax matches required to declare detection.
 	// Mirrors ack_match_threshold / connect_match_threshold.
-	// FAR ≈ 2.5e-7/poll at M=32 (7/16); ≈ 2.4e-5/poll at M=16.
+	// FAR at WB N=32 T=14 (mirror-bin baseline p=2/M):
+	//   M=32: 2.22e-9/poll, M=16: 1.16e-5/poll. See §11.5.
 	int preamble_match_threshold;
 
 	// ACK/BREAK/HAIL/SACK pattern: known tone sequences for pattern-based signaling.

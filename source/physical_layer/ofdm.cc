@@ -107,19 +107,19 @@ cl_ofdm::cl_ofdm()
 	b2p_data_interpolated=NULL;
 	b2p_buffer_size=0;
 	// MFSK cross-correlation template (NB + WB).
-	// sym_energy array sized 16 to cover the WB 16-symbol preamble
-	// (data-flow-preamble_nSymb.md §H1).
+	// sym_energy array sized 32 to cover the WB 32-symbol preamble
+	// (data-flow-preamble_nSymb.md §11, 2026-05-28 — extended from 16).
 	mfsk_corr_template=NULL;
 	mfsk_corr_template_len=0;
 	mfsk_corr_template_energy=0.0;
 	mfsk_corr_template_nsymb=0;
-	for(int i=0;i<16;i++) mfsk_corr_template_sym_energy[i]=0.0;
+	for(int i=0;i<32;i++) mfsk_corr_template_sym_energy[i]=0.0;
 	// MFSK preamble parameters (discrete-match port, §14).
 	mfsk_M=0;
 	mfsk_nStreams=0;
 	mfsk_preamble_nsymb=0;
 	mfsk_preamble_match_threshold=0;
-	for(int i=0;i<16;i++) mfsk_preamble_tones[i]=0;
+	for(int i=0;i<32;i++) mfsk_preamble_tones[i]=0;
 	for(int i=0;i<4;i++) mfsk_stream_offsets[i]=0;
 	// OFDM matched-filter template
 	ofdm_corr_template=NULL;
@@ -240,7 +240,7 @@ void cl_ofdm::deinit()
 	mfsk_corr_template_len=0;
 	mfsk_corr_template_energy=0.0;
 	mfsk_corr_template_nsymb=0;
-	for(int i=0;i<16;i++) mfsk_corr_template_sym_energy[i]=0.0;
+	for(int i=0;i<32;i++) mfsk_corr_template_sym_energy[i]=0.0;
 	CDELETE(ofdm_corr_template);
 	ofdm_corr_template_len=0;
 	ofdm_corr_template_nsymb=0;
@@ -3459,8 +3459,9 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 
 			// Expected tone for this symbol. No hopping at emit time —
 			// preamble_tones[] stores the full sequence directly
-			// (mfsk.cc generate_preamble:467 reads preamble_tones[s % nsymb]).
-			int actual_tone = mfsk_preamble_tones[p % 16];
+			// (mfsk.cc generate_preamble:495 reads preamble_tones[s % nsymb]).
+			// Mirror sized 32 (data-flow-preamble_nSymb.md §11, 2026-05-28).
+			int actual_tone = mfsk_preamble_tones[p % 32];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
 			int streams_matched = 0;
@@ -3562,7 +3563,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 			fft(decimated_sym, fft_out, Nfft);
 
-			int actual_tone = mfsk_preamble_tones[p % 16];
+			int actual_tone = mfsk_preamble_tones[p % 32];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
 			int streams_ok = 0;
