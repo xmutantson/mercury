@@ -2990,3 +2990,403 @@ reproduces on real IONOS / fading channel.
 - `mercury/source/physical_layer/mfsk_ctrl_codec_tests.cc:1639-1899`
   — the §7 mini-Moose regression suite (Tests A/B/C unchanged;
   Test D added by this experiment).
+
+---
+
+## §24. Control-frame mini-Moose v2 — sign-corrected plan (2026-05-28)
+
+**Status:** PLAN — to be implemented on branch `feat/mini-moose-ctrl-v2`
+in worktree `mercury-worktrees/mini-moose-ctrl-v2`. Baseline `345f8b7`
+(monitor HEAD after the §23 sign-flip merge; 26/26 `mercury.exe --test`
+pass). The work item re-ports the control-frame mini-Moose scope from
+the abandoned `feat/mini-moose-ctrl` branch (§22), but with the
+`effective_carrier - residual` sign baked in from the start rather than
+the `+` formula that drove the §22 hardware regression.
+
+### §24.1 Why the original §22 ship regressed
+
+`feat/mini-moose-ctrl` (`eca7667`, dropped) wired the data-preamble
+mini-Moose estimator (`carrier_frequency_sync_wb_mfsk`) into the
+control-frame RX path at `telecom_system.cc:3204`
+(`detect_ack_snr_from_passband`) and `:3400`
+(`decode_ctrl_suffix_from_passband`). The apply formula in both
+wire-ups used `effective_carrier + residual` — matching the data-
+preamble apply formula at the time. Hardware A/B at WGN ∈ {14, -8,
+-10, -11, -12, -13}, 3 passes per arm:
+
+| WGN | Baseline mean | Ctrl mean | Δ |
+|---|---|---|---|
+| +14 | 1.3 | 1.5 | parity (variance) |
+| −8 | 2.2 | 1.6 | −27% |
+| −10 | 2.5 | 0.9 | **−64%** |
+| −11 | 2.3 | 0.6 | **−74%** |
+| −12 | 0 | 0.4 | 1/3 passes (tantalizing) |
+| total bytes | 187 | 112 | **−40%** |
+
+§23 then ran the analogous experiment on the data-preamble apply site
+(`:2274`) — flipping `+` → `-` for that one site — and synthetic A/B
+verified the `-` formula correctly cancels the injected CFO (rel_err
+0.06 vs 0.26 at +7 Hz injection). The sign-flip merged to monitor as
+`d9bedcd` and the documented mechanism is identical for the
+control-frame apply sites: the WB MFSK estimator (`ofdm.cc:799`)
+returns `+arg(C) * ...` while the NB OFDM estimator (`ofdm.cc:603`)
+documents the convention as `-arg(C) * ...`. The WB MFSK estimator's
+return is the OPPOSITE sign of the actual baseband residual under the
+realistic real-passband CFO injection model.
+
+The §22 ctrl-frame regression is therefore consistent with a sign-
+convention bug: the chain `estimator + apply` with `+` actually
+DOUBLES the residual at the demodulator's FFT bin rather than
+cancelling it. Doubling the residual at the demod is exactly the
+mechanism that turns a working −10 dB cell into 0 bytes.
+
+The hypothesis this v2 branch tests is therefore: **the original
+§22 ctrl-frame mini-Moose plan was structurally correct, but the
+apply-formula sign was inverted. With `-` from the start, the
+control-frame chain will not regress and may deliver a similar
+throughput win to the data-preamble side.**
+
+### §24.2 Exact apply sites — the v2 wire-ups
+
+Both wire-ups are the SAME shape as the data-preamble pattern: after
+the initial `passband_to_baseband_decimated` produces the uncorrected
+baseband at `effective_carrier`, run the WB MFSK mini-Moose estimator
+on the preamble portion of the freshly mixed baseband, then re-mix
+the same passband window at `effective_carrier - residual` (with the
+sign already corrected) and re-run the detector chain on the corrected
+baseband.
+
+The two sites:
+
+| Site | File:line | Detector | Preamble symbols |
+|---|---|---|---|
+| ACK + SACK | `telecom_system.cc:3217-3330` (`detect_ack_snr_from_passband`) | `ofdm.detect_ack_pattern(ack_tones, ...)` then `decode_suffix_tones` | first `ack_pattern_nsymb` (= 16 WB) ACK symbols at `best_offset` |
+| CONNECT ctrl-suffix | `telecom_system.cc:3413-3487` (`decode_ctrl_suffix_from_passband`) | `ofdm.detect_ack_pattern(connect_tones, ...)` then `decode_suffix_tones` | first `connect_pattern_nsymb` (= 16 WB) CONNECT symbols at `best_offset` |
+
+The estimator `carrier_frequency_sync_wb_mfsk` already accepts a
+`preamble_tones` / `M_tones` / `nStreams` / `stream_offsets` quadruple;
+it can be reused for ctrl-frames by passing the ACK or CONNECT pattern
+tones in place of the preamble tones. The half-symbol cross-correlation
+math is mode-agnostic — it only needs to know which FFT bin to de-rotate
+toward.
+
+However there is a structural subtlety: `carrier_frequency_sync_wb_mfsk`
+de-rotates each preamble symbol by exp(-j·2π·f_tone·t) where f_tone is
+computed from `preamble_tones[s]` directly. The ctrl-frame patterns use
+**tone hopping**: actual_tone = (ack_tones[s % len] + s × hop_step) % M.
+A NEW estimator function that takes hop_step + pattern_len and rebuilds
+the per-symbol expected tone is needed. This is a small adapter — the
+half-symbol correlation math is identical.
+
+To avoid risk of breaking the data-preamble estimator (already shipping
+on monitor with a hardware win), the new function is a separate
+function `carrier_frequency_sync_wb_ctrl`. Same algorithm, ctrl-pattern
+adapter in front. The data-preamble estimator stays exactly as it is.
+
+#### §24.2.a New estimator: `carrier_frequency_sync_wb_ctrl`
+
+Declaration in `include/physical_layer/ofdm.h`, definition in
+`source/physical_layer/ofdm.cc`. Signature:
+
+```cpp
+double carrier_frequency_sync_wb_ctrl(std::complex<double>* in,
+                                       double carrier_freq_width,
+                                       int pattern_nsymb,
+                                       int sym_start_offset_samples,
+                                       const int* pattern_tones,
+                                       int pattern_len,
+                                       int tone_hop_step,
+                                       int M_tones,
+                                       int nStreams,
+                                       const int* stream_offsets);
+```
+
+Differences from `carrier_frequency_sync_wb_mfsk`:
+- Reads `pattern_nsymb` symbols starting at `sym_start_offset_samples`
+  (in decimated samples — the buffer is at base rate, so this is
+  `best_offset` from `detect_ack_pattern` for ctrl-frame use). The
+  data-preamble estimator implicitly starts at offset 0.
+- Computes actual_tone via the standard hopping formula:
+  `actual_tone = (pattern_tones[s % pattern_len] + s * tone_hop_step)
+                 % M_tones`.
+- Otherwise identical: same half-symbol Hadamard sums, same de-rotation
+  recurrence, same C accumulator, same 0.05 confidence gate, same
+  `phase * carrier_freq_width * Nfft / (2π × half)` formula, same
+  `sym_start_offset_samples + s * Nofdm + Ngi + i` base index, same NaN
+  guards, same `Nfft <= 0` early return.
+- Confidence gate threshold left at 0.05 to match the data-preamble
+  estimator. Capture range is the same ±carrier_freq_width Hz
+  (≈ ±46.875 Hz at WB ROBUST_0).
+
+The 16-symbol ACK / CONNECT patterns provide the same integration
+length as the data preamble (also 16 symbols post-§14 port), so the
+estimator's variance characteristic is comparable.
+
+#### §24.2.b ACK + SACK wire-up (`detect_ack_snr_from_passband`)
+
+The site at `:3217-3330` currently performs:
+1. Mix at `effective_carrier = carrier_frequency + last_coarse_freq_offset`.
+2. `detect_ack_pattern` to find `best_offset`.
+3. `decode_suffix_tones` at `best_offset`.
+
+Insert the mini-Moose between (1) and (3). The flow becomes:
+1. Mix at `effective_carrier` → `baseband_data_interpolated` (unchanged).
+2. `detect_ack_pattern` → `best_offset`, `matched`, `metric` (unchanged).
+3. **NEW**: if `matched >= ack_match_threshold && metric >= 3.0 &&
+   best_offset >= 0`, compute residual via
+   `ofdm.carrier_frequency_sync_wb_ctrl(baseband_data_interpolated,
+   bandwidth/Nc, ack_pattern_nsymb, best_offset, ack_tones,
+   ack_pattern_len, tone_hop_step, ack_mfsk.M, nStreams,
+   stream_offsets)`. If |residual| > `freq_offset_ignore_limit`, re-mix
+   from passband at `effective_carrier - residual` (the SIGN-CORRECTED
+   apply formula), overwriting `baseband_data_interpolated`.
+4. **NEW**: re-run `detect_ack_pattern` on the corrected baseband to
+   get the updated `best_offset` (the matched count typically increases
+   when CFO is corrected — best_offset may shift by 0-1 symbols too).
+5. Continue with `decode_suffix_tones` at the (possibly updated)
+   `best_offset` (unchanged code from here on).
+
+The fail-safe in step 3 is critical: if the threshold isn't met or the
+estimator's confidence gate returns 0, the corrected re-mix doesn't
+happen and the existing baseband_data_interpolated is used as-is. This
+keeps the worst-case behavior IDENTICAL to monitor pre-fix.
+
+#### §24.2.c CONNECT wire-up (`decode_ctrl_suffix_from_passband`)
+
+The site at `:3413-3487` is structurally identical to §24.2.b but uses
+`connect_tones` and `connect_pattern_nsymb` instead of ACK. Same five-
+step flow. Same fail-safe semantics. Same `effective_carrier - residual`
+sign.
+
+The two wire-ups share enough code that they could be factored into a
+helper. Defer the refactor — landing the v2 fix with minimal scope is
+the priority; refactor as a follow-up after hardware validates.
+
+### §24.3 Why the original v1 regression resolves under v2
+
+Mechanism of v1's `+` regression: WB MFSK estimator returns
+`-δ_actual` for a true baseband CFO of `+δ_actual` (§23.11.1 verdict).
+The apply formula `effective_carrier + (-δ_actual)` =
+`effective_carrier - δ_actual`. The second `passband_to_baseband` mixes
+at `effective_carrier - δ_actual`, which produces baseband at
+`+2·δ_actual` instead of 0 — DOUBLING the residual at the FFT bin.
+
+For a control-frame ACK with `δ_actual ≈ 11 Hz` (crystal mismatch) on
+IONOS, the corrected baseband has `+22 Hz` residual. At WB ROBUST_0
+that's ~0.5 subcarrier widths of misalignment, dragging the expected-
+tone-bin energy down by ~6 dB (sinc rolloff). The ACK detector requires
+matched ≥ 7/16 (threshold = 7), so cutting energy by 6 dB pushes the
+detector below threshold at the cells that were marginal (WGN -10/-11).
+Bytes drop to near-zero at those cells, hence −64% / −74%.
+
+Under v2's `-` formula, the apply becomes `effective_carrier -
+(-δ_actual)` = `effective_carrier + δ_actual`, which correctly mixes
+the residual back to 0 at baseband. The ctrl-frame detector sees the
+intended cleaned signal and the match rate should improve at low-SNR
+cells where it previously failed.
+
+### §24.4 Cross-layer audit (mirror of §11/§23.8, updated for ctrl-frame)
+
+The data-flow document `data-flow-freq_offset_measured.md` gets a new
+§12 covering ctrl-frame use. The state being touched is NOT
+`freq_offset_measured` per se — that's a `receive_msg`-scope local. The
+ctrl-frame sites compute their own local residual variable (call it
+`ctrl_residual`). The shared state being touched is the
+`data_container.baseband_data_interpolated` buffer.
+
+Producers of `baseband_data_interpolated` in `detect_ack_snr_from_passband`:
+1. `:3227` Initial `passband_to_baseband_decimated` at
+   `effective_carrier`. Pre-fix and post-fix.
+2. **NEW**: §24.2.b step 3 corrected `passband_to_baseband_decimated`
+   at `effective_carrier - ctrl_residual` (overwrites #1 when the
+   estimator's confidence gate is satisfied).
+
+Consumers of `baseband_data_interpolated` in
+`detect_ack_snr_from_passband`:
+1. `:3235` `detect_ack_pattern` (first call).
+2. `:3258` `decode_suffix_tones` at `best_offset`.
+3. **NEW**: §24.2.b step 4 second `detect_ack_pattern` on corrected
+   baseband.
+
+Invariants the consumers assume:
+- Buffer is at decimated rate `M = interpolation_rate`.
+- Buffer size is `size / M` complex samples.
+- Symbol stride is `Nofdm` complex samples (i.e. `Nofdm * 1` with
+  `interp=1` since this is post-decimation). This matches both the
+  initial mix and the corrected re-mix (same `M`, same `pb_size`).
+- `best_offset` points to the start-of-frame in decimated samples.
+
+What the v2 fix changes:
+- The buffer can be overwritten between the first `detect_ack_pattern`
+  call and the `decode_suffix_tones` call. The overwrite is in-place
+  at the SAME buffer pointer, same size, same Nofdm grid alignment.
+  `best_offset` from the first detect_ack_pattern is reset by the
+  second detect_ack_pattern on the corrected buffer.
+- No other consumer reads `baseband_data_interpolated` during this
+  call. The function-scope ownership is unambiguous.
+
+The ctrl-residual is NEVER written into `freq_offset_measured`,
+`freq_offset_of_last_decoded_message`, or any cross-message state. Each
+ctrl-frame call computes a fresh residual, applies it locally, and
+discards the residual on function return. This means:
+
+- **INV (ctrl-resid local-only)**: ctrl-frame mini-Moose does NOT touch
+  `receive_stats.freq_offset_of_last_decoded_message`. The
+  `use_last_good_freq_offset` fallback in `receive_msg` remains exactly
+  what it was — only OFDM-decoded Moose values can enter the cache (the
+  §2.5 gate in the data-flow audit was the protection mechanism; we
+  preserve it by not touching the cache from the ctrl-frame path).
+- **INV (no NB MFSK regression)**: NB MFSK has
+  `ack_sack_suffix_len() == 0` (the function returns 0 unless
+  `M >= 16`). The NEW wire-up sites SHORT-CIRCUIT at the existing NB
+  guards (`if (ack_pattern_passband_samples <= 0) return -99.0f;` at
+  `:3221` etc.) so NB MFSK never even reaches the estimator.
+- **INV (no OFDM regression)**: WB OFDM does NOT call
+  `detect_ack_snr_from_passband` or `decode_ctrl_suffix_from_passband`
+  — those are MFSK-only. OFDM ACK uses the separate `detect_ack_pattern`
+  on the data-preamble RX path via `receive_msg`. Already audited under
+  §11. No coupling.
+- **INV (estimator confidence gate preserved)**: same 0.05 threshold
+  as the data-preamble estimator. Pure-noise input → returns 0 →
+  ignore_limit branch skipped → no re-mix. Worst case is exactly today's
+  behavior.
+
+### §24.5 Mandatory regression tests
+
+Four new tests in `mfsk_ctrl_codec_tests.cc` §8 (a new section after
+§7). Hooked into `run_mfsk_ctrl_codec_tests` at the end.
+
+#### §24.5.a `mfsk_ctrl_suffix_mini_moose_recovers_cfo` (positive)
+
+Mirror of §7.1 but for the ctrl-frame path. Synthesize an ACK pattern
+at passband (already done by `cl_telecom_system::generate_ack_pattern_passband`
+or test helper), up-mix at `carrier_frequency + cfo_inject`, run the
+new `carrier_frequency_sync_wb_ctrl` estimator after `detect_ack_pattern`
+locates the pattern, assert estimator returns a finite value tracking
+the injection.
+
+Tolerance: ±1.5 Hz at +7 Hz injection over 5 seeds, hits >= 4.
+
+#### §24.5.b `mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op` (positive)
+
+Mirror of §7.2 for the ctrl-frame estimator. Clean passband, zero CFO,
+assert `|est| < 0.5 Hz`.
+
+#### §24.5.c `mfsk_ctrl_suffix_mini_moose_pure_noise_safe` (negative)
+
+Mirror of §7.3. 50-seed pure-noise sweep, assert estimator never
+returns non-finite values and `|est| <= 100 Hz` always (production
+sanity bound).
+
+#### §24.5.d `mfsk_ctrl_suffix_apply_sign_invariance` (mandatory, sign-invariant)
+
+THIS is the test that catches a sign-flip mistake. Mirror of §7.4 but
+for the ctrl-frame chain:
+
+1. Synthesize an ACK pattern (with 13-symbol ctrl-suffix) at passband
+   with random suffix tones.
+2. Build TWO passbands:
+   - Reference: up-mixed at `carrier_frequency` (no CFO).
+   - Shifted: up-mixed at `carrier_frequency + cfo_inject`
+     (+7 Hz residual at baseband).
+3. For reference passband, run the production-style RX chain (mix at
+   `carrier_frequency`, `detect_ack_pattern`, `decode_suffix_tones`),
+   capture the average suffix-tone energy at the expected (de-hopped)
+   bins.
+4. For shifted passband, run the v2 corrected chain:
+   - mix at `carrier_frequency` (uncorrected).
+   - run `detect_ack_pattern` to get `best_offset`.
+   - call `carrier_frequency_sync_wb_ctrl` on the uncorrected baseband
+     at `best_offset` → `δ_est`.
+   - re-mix at `carrier_frequency - δ_est` (the production apply
+     formula in this branch).
+   - run `detect_ack_pattern` again on the corrected baseband.
+   - capture suffix-tone energy at the expected bins.
+5. Assert `rel_err(corrected, reference) < 0.10`.
+
+The test exactly mirrors the data-preamble §7.4 contract: it asserts
+the chain `estimator + apply` cancels (not doubles) the CFO. With the
+WRONG sign (`+`), the chain doubles the CFO → suffix-tone energy
+collapses → rel_err blows past 0.10 → test FAILS. With the RIGHT sign
+(`-`), the chain cancels → rel_err < 0.10 → test PASSES.
+
+**This is the load-bearing regression test for the v2 sign
+convention.** Mirror of §7.4's role on the data-preamble side.
+
+### §24.6 Fail-before-passes verification
+
+The verification has three checkpoints:
+
+| Checkpoint | Pre-fix (no v2 code) | Post-fix (v2 shipped) |
+|---|---|---|
+| Existing 26 tests | PASS | PASS |
+| §24.5.a `_recovers_cfo` | FAIL (link error: function does not exist) | PASS |
+| §24.5.b `_zero_cfo_no_op` | FAIL (link error) | PASS |
+| §24.5.c `_pure_noise_safe` | FAIL (link error) | PASS |
+| §24.5.d `_apply_sign_invariance` | FAIL (link error) | PASS |
+
+The fail-before-passes protocol: after implementing the v2 changes,
+`git stash` ONLY the apply-formula sign edit and the new estimator,
+keeping the test code in place. Rebuild — tests should fail at link
+time (estimator missing). `git stash pop` to restore — all 30 tests
+should pass.
+
+If §24.5.d passes with the `+` sign during a sanity check (which the
+test code MUST mirror via a literal `-δ_est` expression that matches
+production), the test scaffolding is wrong — investigate before
+committing.
+
+### §24.7 Commit list (planned)
+
+1. `docs(ctrl-mini-moose): §24 plan + §12 audit — control-frame
+   mini-Moose v2 with correct sign` (this section + §12 in the audit
+   doc).
+2. `phy(ofdm): add carrier_frequency_sync_wb_ctrl estimator` (new
+   function in `ofdm.cc`, declaration in `ofdm.h`).
+3. `phy(telecom_system): wire control-frame mini-Moose with `-` apply
+   formula` (the two wire-ups at `:3217` and `:3413`).
+4. `test(ctrl-mini-moose): sign-invariance + recovers-cfo + zero-cfo +
+   pure-noise tests` (§8 in `mfsk_ctrl_codec_tests.cc`). Verify
+   fail-before-passes.
+
+### §24.8 Operator backlog
+
+- Hardware A/B sweep at IONOS WGN ∈ {+14, +6, 0, -4, -8, -10, -11, -12,
+  -13}, ROBUST_0, 180s dwell, 3 passes per arm vs baseline `345f8b7`.
+  Tool: `tools/axis_walk_sweep.py --pin-config 100 --with-robust`.
+  Expected: NO regression at any cell where monitor was working
+  (vs §22's -64% at -10 and -74% at -11). Potentially: throughput
+  improvement at low-SNR cells where ctrl-frame match-rate was the
+  bottleneck.
+- Diagnostic to look for in logs: a new `[CTRL-MINI-MOOSE]` line
+  reporting estimated residual CFO per successful ACK / CONNECT
+  detection. Compare to the existing `[MFSK-MINI-MOOSE]` line for the
+  data-preamble path — both should report comparable residuals on the
+  same RF channel since they're measuring the same physical thing.
+- Verify NB MFSK ctrl-frame paths are untouched: NB ACK / CONNECT
+  match-rate at known-good cells should be unchanged.
+- If the hardware A/B is a clean win, refactor §24.2.b and §24.2.c
+  into a shared helper (likely
+  `cl_telecom_system::ctrl_frame_apply_mini_moose(...)`) to reduce
+  code duplication; track as separate cleanup commit.
+
+### §24.9 Cross-references
+
+- §11 — v1 ctrl-frame implementation plan (the original §21-but-actually-
+  §11-numbered plan; abandoned).
+- §22 — v1 hardware regression verdict (-40% bytes, motivates this v2).
+- §23 — data-preamble sign-flip experiment (the synthetic and
+  hardware evidence that `-` is the correct sign).
+- `data-flow-freq_offset_measured.md` §11 — sign-flip cross-layer audit
+  for data preamble.
+- `data-flow-freq_offset_measured.md` §12 (NEW) — ctrl-frame mini-Moose
+  cross-layer audit added by this v2.
+- `mercury/source/physical_layer/ofdm.cc:613-804` — data-preamble
+  estimator `carrier_frequency_sync_wb_mfsk` (algorithmic template
+  reused).
+- `mercury/source/physical_layer/telecom_system.cc:3217-3330` — first
+  v2 wire-up site (`detect_ack_snr_from_passband`).
+- `mercury/source/physical_layer/telecom_system.cc:3413-3487` — second
+  v2 wire-up site (`decode_ctrl_suffix_from_passband`).
+- `mercury/source/physical_layer/mfsk_ctrl_codec_tests.cc` §8 (NEW) —
+  v2 regression suite added.

@@ -625,3 +625,174 @@ path. The branch's apply-formula flip ships as the experiment
 arm; the follow-up production commit will move the negation to the
 estimator and restore the apply consistency. §11.4 decision matrix
 note "(option C)".
+
+---
+
+## §12 Control-frame mini-Moose v2 audit (2026-05-28, branch `feat/mini-moose-ctrl-v2`)
+
+See `data-preamble-port-research.md` §24 for the experimental rationale.
+This audit captures the cross-layer impact of adding a new mini-Moose
+refinement at the two control-frame RX sites
+(`detect_ack_snr_from_passband` at `telecom_system.cc:3217-3330` and
+`decode_ctrl_suffix_from_passband` at `:3413-3487`), with the
+sign-corrected apply formula `effective_carrier - residual` baked in
+from the start.
+
+### §12.1 Scope distinction from §11
+
+§11 audited the SHARED state `freq_offset_measured` (a
+`receive_msg`-scope local) and the `:2274` apply site. The
+control-frame v2 work touches DIFFERENT functions
+(`detect_ack_snr_from_passband` and `decode_ctrl_suffix_from_passband`)
+that have their OWN function-scope baseband buffer
+(`baseband_data_interpolated`) and their own local residual variable.
+The two paths do NOT share `freq_offset_measured` — control-frame
+detectors are called from ARQ-layer code outside `receive_msg`.
+
+So this audit is structurally separate: same algorithm (mini-Moose
+half-symbol cross-correlation), same sign convention (`-`), but
+different state variable and different consumer chain.
+
+### §12.2 Producers of `ctrl_residual` (the new local variable)
+
+`ctrl_residual` is a function-scope local in each of
+`detect_ack_snr_from_passband` and `decode_ctrl_suffix_from_passband`.
+Lifetime: one call to the function. State does not persist across calls.
+No global / class-member variable is added.
+
+Producers (per call):
+
+| Site | File:line | Conditions | Behavior |
+|---|---|---|---|
+| §12.2.a | `telecom_system.cc:~3247` (ACK) — after `detect_ack_pattern` returns with `matched >= ack_match_threshold && metric >= 3.0 && best_offset >= 0` | initial detection threshold satisfied | `ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(...)` |
+| §12.2.b | `telecom_system.cc:~3452` (CONNECT) — after `detect_ack_pattern(connect_tones, ...)` returns with `matched >= connect_match_threshold && metric >= 3.0 && best_offset >= 0` | initial detection threshold satisfied | `ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(...)` |
+
+Both producers are gated by the existing detector-threshold checks —
+if `detect_ack_pattern` doesn't find a pattern, the estimator is not
+even called. The estimator's own confidence gate (|C|/energy < 0.05)
+returns 0 on low-confidence input. So worst-case behavior is exactly
+the pre-fix baseband_data_interpolated being used as-is.
+
+### §12.3 Consumers of `ctrl_residual`
+
+The only consumer is the SAME function's own re-mix block, immediately
+after the producer. The re-mix block does:
+
+```cpp
+if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit) {
+    ofdm.passband_to_baseband_decimated(
+        data, size,
+        data_container.baseband_data_interpolated,
+        sampling_frequency,
+        effective_carrier - ctrl_residual,   // §24 sign-corrected
+        carrier_amplitude,
+        M, &ofdm.FIR_rx_data);
+    // Re-run detect_ack_pattern to update best_offset / matched
+    // on the corrected baseband.
+}
+```
+
+The residual is then DISCARDED on function return. No cross-message
+state, no cache write, no GUI push. The local variable's lifetime is
+strictly the function body.
+
+### §12.4 Consumers of `baseband_data_interpolated` in ctrl-frame paths
+
+This buffer is the cross-cutting one. Producers + consumers in
+`detect_ack_snr_from_passband` post-v2:
+
+| Stage | File:line | Role | Touched by v2? |
+|---|---|---|---|
+| Producer (initial) | `:3227` | `passband_to_baseband_decimated` at `effective_carrier` | YES (unchanged) |
+| Consumer (initial detect) | `:3235` | `detect_ack_pattern` → `best_offset`, `matched`, `metric` | YES (unchanged) |
+| Producer (corrected) | NEW | `passband_to_baseband_decimated` at `effective_carrier - ctrl_residual` (overwrites #1) | NEW |
+| Consumer (second detect) | NEW | `detect_ack_pattern` on corrected buffer → updated `best_offset`, `matched` | NEW |
+| Consumer (suffix decode) | `:3258` | `decode_suffix_tones` at `best_offset` | YES (best_offset may have shifted by 0-1 symbols vs initial) |
+
+Invariants the existing `decode_suffix_tones` consumer assumes:
+- Buffer is at decimated rate. ✅ Same `M` for corrected re-mix.
+- `best_offset` is in decimated samples. ✅ Returned by second
+  `detect_ack_pattern` on the same buffer at the same rate.
+- Buffer size is `dec_size = size / M`. ✅ Same `M`, same `size`.
+- The suffix starts at `best_offset + pattern_nsymb * Nofdm` (decimated
+  samples). ✅ Same Nofdm grid alignment.
+
+The same invariant analysis applies to `decode_ctrl_suffix_from_passband`
+at the CONNECT site with `connect_tones` / `connect_pattern_nsymb` /
+`connect_match_threshold` substituted. Buffer math identical.
+
+### §12.5 Cross-mode safety (NB MFSK, OFDM)
+
+- **NB MFSK**: both wire-up functions return early on
+  `ack_sack_suffix_len() <= 0` (which is true for NB M < 16). The
+  estimator is NEVER called. NB MFSK ctrl-frame paths IDENTICAL to
+  pre-v2.
+- **OFDM**: `detect_ack_snr_from_passband` and
+  `decode_ctrl_suffix_from_passband` are called only from MFSK-aware
+  ARQ paths. OFDM data RX uses `receive_msg` (§11 audit). No coupling.
+- **`freq_offset_measured` cache**: NOT TOUCHED by ctrl-frame v2. The
+  `:2782` `if (M != MOD_MFSK)` gate is unchanged. The ctrl-frame's
+  local `ctrl_residual` never enters
+  `receive_stats.freq_offset_of_last_decoded_message`. The §1.3
+  use_last_good_freq_offset fallback remains safe.
+
+### §12.6 Invariants
+
+INV-7 (ctrl-residual local-only): `ctrl_residual` is a function-scope
+local. NO global / class-member / cross-call state is added. Each
+ctrl-frame detection computes a fresh residual and discards it.
+
+INV-8 (ctrl-residual does NOT touch the OFDM/MFSK gearshift cache):
+`receive_stats.freq_offset_of_last_decoded_message` is NOT written
+from the ctrl-frame paths. The §11 cache write gate at `:2782` is
+the only writer; it stays MFSK-excluded.
+
+INV-9 (corrected baseband buffer math identical to initial buffer):
+The corrected `passband_to_baseband_decimated` uses the SAME `M`, the
+SAME `size`, the SAME FIR filter (`ofdm.FIR_rx_data`), and the SAME
+output buffer (`baseband_data_interpolated`). Only the
+mixing-LO-frequency argument changes (`effective_carrier - residual`
+vs `effective_carrier`). Buffer shape, symbol-period stride, and FIR
+warm-up are identical.
+
+INV-10 (sign convention consistent with data preamble): The apply
+formula at the two new sites uses `effective_carrier - ctrl_residual`,
+matching the §23 data-preamble apply at `:2287`. The same sign
+applies across all sites that consume the WB MFSK mini-Moose
+estimator's output. (NB MFSK is unaffected because it's gated out
+of the estimator's call path entirely.)
+
+INV-11 (fail-safe on low confidence / below ignore_limit): The
+estimator's 0.05 confidence gate and the
+`fabs(ctrl_residual) > freq_offset_ignore_limit` apply gate together
+guarantee that pure-noise or sub-threshold residuals do NOT trigger
+the re-mix. The buffer is then used as-is — exactly the pre-v2
+behavior.
+
+### §12.7 Regression test commitment
+
+Four new tests in `mfsk_ctrl_codec_tests.cc` §8 (data-preamble-
+port-research.md §24.5):
+- `mfsk_ctrl_suffix_mini_moose_recovers_cfo` (§24.5.a)
+- `mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op` (§24.5.b)
+- `mfsk_ctrl_suffix_mini_moose_pure_noise_safe` (§24.5.c)
+- `mfsk_ctrl_suffix_apply_sign_invariance` (§24.5.d) — the
+  load-bearing sign-invariance test.
+
+§24.5.d is the test that catches a sign-flip mistake — mirror of §7.4
+for the ctrl-frame chain. If a future PR reverts the v2 sign or copies
+the `+` formula from the v1 abandoned branch, this test FAILS at
+`mercury.exe --test` link / CI time.
+
+### §12.8 Drift check post-merge
+
+After hardware A/B resolution:
+- If clean hardware win → merge to monitor; §12 becomes the new
+  authoritative description for ctrl-frame mini-Moose. The next
+  follow-up commit factors the duplicated wire-up logic in §24.2.b /
+  §24.2.c into a shared helper.
+- If null result → keep the v2 commit but mark §24.7 backlog open for
+  diagnostic deep-dive (why does the chain work synthetically but
+  not on hardware?).
+- If regression → revert this branch; §12 stays as a record; document
+  the actual mechanism in §24.10 (TBD).
