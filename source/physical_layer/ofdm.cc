@@ -803,6 +803,179 @@ double cl_ofdm::carrier_frequency_sync_wb_mfsk(std::complex<double>* in,
 	return freq_offset;
 }
 
+double cl_ofdm::carrier_frequency_sync_wb_ctrl(std::complex<double>* in,
+                                               double carrier_freq_width,
+                                               int pattern_nsymb,
+                                               int sym_start_offset_samples,
+                                               const int* pattern_tones,
+                                               int pattern_len,
+                                               int tone_hop_step,
+                                               int M_tones,
+                                               int nStreams,
+                                               const int* stream_offsets)
+{
+	/*
+	 * Mini-Moose CFO refinement for WB MFSK control-frame patterns.
+	 *
+	 * Background: the data-preamble mini-Moose (carrier_frequency_sync_wb_mfsk
+	 * at ofdm.cc:613) refines residual CFO using the 16-symbol data preamble.
+	 * The same half-symbol cross-correlation math works on any pattern of
+	 * known CW tones — including the 16-symbol ACK / CONNECT base patterns
+	 * used by `detect_ack_pattern`. Refining residual CFO before the ctrl-
+	 * suffix is decoded lets the suffix-FFT-bin demap operate on
+	 * energy-aligned signals — the same mechanism that produces the §17 data-
+	 * preamble win.
+	 *
+	 * v1 of this work (feat/mini-moose-ctrl, dropped) used the apply formula
+	 * `effective_carrier + residual` and regressed -40% on hardware (§22).
+	 * The WB MFSK estimator returns the OPPOSITE sign of the actual baseband
+	 * residual under the realistic real-passband injection model (§23.11.1);
+	 * the apply formula must be `effective_carrier - residual` to cancel
+	 * (not double) the residual. The caller of this function MUST use the
+	 * `-` sign in its `passband_to_baseband_decimated` re-mix.
+	 *
+	 * Algorithm (identical to carrier_frequency_sync_wb_mfsk, two diffs):
+	 *   diff (a): the pattern starts at sym_start_offset_samples in the input
+	 *             buffer (best_offset from detect_ack_pattern), not at sample 0.
+	 *   diff (b): per-symbol expected tone uses pattern hopping:
+	 *             actual_tone = (pattern_tones[s % pattern_len]
+	 *                            + s * tone_hop_step) % M_tones.
+	 * Everything else (half-symbol Hadamard sums, de-rotation recurrence,
+	 * C = B·conj(A), 0.05 confidence gate, phase-to-Hz conversion, NaN
+	 * guards) is identical to the data-preamble estimator. The capture
+	 * range is the same ±carrier_freq_width Hz (≈ ±46.875 Hz at WB ROBUST_0).
+	 *
+	 * Inputs:
+	 *   in                       : baseband buffer at decimated rate, the
+	 *                              same buffer detect_ack_pattern read.
+	 *   carrier_freq_width       : subcarrier spacing in Hz = fs_base / Nfft.
+	 *   pattern_nsymb            : number of pattern symbols to integrate
+	 *                              over (16 for WB ACK / CONNECT).
+	 *   sym_start_offset_samples : start-of-pattern offset in decimated
+	 *                              samples (best_offset from
+	 *                              detect_ack_pattern).
+	 *   pattern_tones            : base tone sequence (ack_tones,
+	 *                              connect_tones, etc.).
+	 *   pattern_len              : length of the base tone sequence (8 for
+	 *                              WB Welch-Costas).
+	 *   tone_hop_step            : per-symbol tone-hop step (coprime with M).
+	 *   M_tones                  : MFSK alphabet size (16 for WB ACK / CONNECT).
+	 *   nStreams                 : number of MFSK streams (1 for WB).
+	 *   stream_offsets           : array of stream-band starting subcarriers.
+	 *
+	 * Returns: residual CFO in Hz, or 0.0 on low confidence / invalid input.
+	 *
+	 * Reference: P. H. Moose, "A technique for orthogonal frequency division
+	 * multiplexing frequency offset correction," IEEE TCOM 1994. Same as
+	 * carrier_frequency_sync_wb_mfsk; only the modulation-known-pattern
+	 * differs.
+	 */
+
+	if (pattern_nsymb <= 0 || M_tones <= 0 || nStreams <= 0) return 0.0;
+	if (pattern_tones == NULL || stream_offsets == NULL) return 0.0;
+	if (pattern_len <= 0) return 0.0;
+	if (Nfft <= 0) return 0.0;
+	int half = Nfft / 2;
+	if (half <= 0) return 0.0;
+	if (sym_start_offset_samples < 0) return 0.0;
+
+	// fs_base (decimated/base sample rate the caller's buffer is at):
+	// carrier_freq_width = fs_base / Nfft, so fs_base = carrier_freq_width * Nfft.
+	double fs_base = carrier_freq_width * (double)Nfft;
+	if (fs_base <= 0.0) return 0.0;
+
+	int Nc_half = Nc / 2;
+	int Nofdm = Nfft + Ngi;
+
+	std::complex<double> C(0.0, 0.0);
+	double energy_total = 0.0;
+
+	for (int s = 0; s < pattern_nsymb; s++)
+	{
+		// Tone hopping: the actually transmitted tone at symbol s.
+		// Mirrors the ACK pattern generator and detect_ack_pattern's
+		// expected_tone computation.
+		int tone_base = pattern_tones[s % pattern_len];
+		if (tone_base < 0) continue;
+		int actual_tone = (tone_base + s * tone_hop_step) % M_tones;
+		if (actual_tone < 0 || actual_tone >= M_tones) continue;
+
+		for (int st = 0; st < nStreams; st++)
+		{
+			int sub = stream_offsets[st] + actual_tone;
+			int expected_bin = (sub < Nc_half)
+				? (Nfft - Nc_half + sub)
+				: (start_shift + (sub - Nc_half));
+			// Map FFT bin to a centered/signed bin index in (-Nfft/2, Nfft/2].
+			int k_centered = (expected_bin < Nfft / 2)
+				? expected_bin
+				: expected_bin - Nfft;
+			double f_tone = (double)k_centered * fs_base / (double)Nfft;
+
+			// De-rotation phase recurrence: exp(-j*2π*f_tone*t).
+			double angle_step = -2.0 * M_PI * f_tone / fs_base;
+			double sr = std::cos(angle_step);
+			double si = std::sin(angle_step);
+
+			std::complex<double> A(0.0, 0.0);
+			std::complex<double> B(0.0, 0.0);
+			double pr = 1.0;
+			double pi = 0.0;
+
+			int base_idx = sym_start_offset_samples + s * Nofdm + Ngi;
+
+			for (int i = 0; i < half; i++)
+			{
+				double sample_r = in[base_idx + i].real();
+				double sample_i = in[base_idx + i].imag();
+				double dr = sample_r * pr - sample_i * pi;
+				double di = sample_r * pi + sample_i * pr;
+				A.real(A.real() + dr);
+				A.imag(A.imag() + di);
+				double npr = pr * sr - pi * si;
+				double npi = pr * si + pi * sr;
+				pr = npr;
+				pi = npi;
+			}
+			for (int i = half; i < Nfft; i++)
+			{
+				double sample_r = in[base_idx + i].real();
+				double sample_i = in[base_idx + i].imag();
+				double dr = sample_r * pr - sample_i * pi;
+				double di = sample_r * pi + sample_i * pr;
+				B.real(B.real() + dr);
+				B.imag(B.imag() + di);
+				double npr = pr * sr - pi * si;
+				double npi = pr * si + pi * sr;
+				pr = npr;
+				pi = npi;
+			}
+
+			std::complex<double> contrib = B * std::conj(A);
+			C += contrib;
+			energy_total += std::norm(A) + std::norm(B);
+		}
+	}
+
+	if (!std::isfinite(C.real()) || !std::isfinite(C.imag())) return 0.0;
+	if (!std::isfinite(energy_total) || energy_total <= 0.0) return 0.0;
+
+	// Confidence gate: low |C|/energy ratio means the tones are not present
+	// or the channel is noise-dominated. Mirror of carrier_frequency_sync_wb_mfsk
+	// and carrier_frequency_sync_nb.
+	double C_mag = std::abs(C);
+	if (C_mag / energy_total < 0.05) return 0.0;
+
+	// arg(C) = 2π * CFO * T_half_sym, T_half_sym = half / fs_base
+	// → CFO = arg(C) * carrier_freq_width * Nfft / (2π * half)
+	double phase = std::arg(C);
+	double freq_offset = phase * carrier_freq_width * (double)Nfft
+	                   / (2.0 * M_PI * (double)half);
+
+	if (!std::isfinite(freq_offset)) return 0.0;
+	return freq_offset;
+}
+
 void cl_ofdm::framer(std::complex <double>* in, std::complex <double>* out)
 {
 	int data_index=0;

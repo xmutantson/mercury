@@ -162,6 +162,24 @@ public:
 	                                      int M_tones,
 	                                      int nStreams,
 	                                      const int* stream_offsets);
+	// Mini-Moose CFO refinement for WB MFSK control-frame patterns (ACK,
+	// CONNECT, BREAK, HAIL). Mirror of carrier_frequency_sync_wb_mfsk with
+	// (a) a starting sample offset (best_offset from detect_ack_pattern),
+	// and (b) ctrl-pattern tone hopping
+	// (actual_tone = (pattern_tones[s % pattern_len] + s*tone_hop_step) % M).
+	// Same half-symbol cross-correlation math, same 0.05 confidence gate,
+	// same capture range ±carrier_freq_width Hz.
+	// See data-preamble-port-research.md §24.2.a.
+	double carrier_frequency_sync_wb_ctrl(std::complex<double>* in,
+	                                      double carrier_freq_width,
+	                                      int pattern_nsymb,
+	                                      int sym_start_offset_samples,
+	                                      const int* pattern_tones,
+	                                      int pattern_len,
+	                                      int tone_hop_step,
+	                                      int M_tones,
+	                                      int nStreams,
+	                                      const int* stream_offsets);
 	void channel_equalizer(std::complex <double>* in, std::complex <double>* out);
 	void channel_equalizer_without_amplitude_restoration(std::complex <double>* in,std::complex <double>* out);
 	void smooth_channel_estimate_dft();
