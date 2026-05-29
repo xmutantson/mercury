@@ -263,9 +263,9 @@ public:
 	int b2p_buffer_size;
 
 	// MFSK cross-correlation preamble template (NB + WB).
-	// Array sized 32 to support the WB ROBUST_0/1/2 32-symbol preamble
-	// (data-flow-preamble_nSymb.md §11, 2026-05-28). NB still uses 8 symbols;
-	// entries 8..31 stay zero on NB and the time_sync_mfsk_corr loop reads
+	// Array sized 16 to support the WB ROBUST_0/1/2 16-symbol preamble
+	// (data-flow-preamble_nSymb.md §H1). NB still uses 8 symbols; entries
+	// 8..15 stay zero on NB and the time_sync_mfsk_corr loop reads
 	// `template_nsymb` (= mfsk.preamble_nSymb) so unused slots are skipped.
 	//
 	// 2026-05-27 (data-preamble-port-research.md §14): `time_sync_mfsk_corr`
@@ -277,7 +277,7 @@ public:
 	int mfsk_corr_template_len;
 	double mfsk_corr_template_energy;
 	int mfsk_corr_template_nsymb;
-	double mfsk_corr_template_sym_energy[32]; // per-symbol energy for per-symbol correlation
+	double mfsk_corr_template_sym_energy[16]; // per-symbol energy for per-symbol correlation
 
 	// MFSK preamble parameters consumed by `time_sync_mfsk_corr` (post-2026-05-27
 	// discrete-match port). Populated by load_configuration alongside the
@@ -287,7 +287,7 @@ public:
 	int mfsk_M;
 	int mfsk_nStreams;
 	int mfsk_stream_offsets[4]; // matches cl_mfsk::MAX_STREAMS
-	int mfsk_preamble_tones[32]; // matches MAX_PREAMBLE_SYMB (2026-05-28 bump 16->32)
+	int mfsk_preamble_tones[16]; // matches MAX_PREAMBLE_SYMB
 	int mfsk_preamble_nsymb;
 	int mfsk_preamble_match_threshold;
 

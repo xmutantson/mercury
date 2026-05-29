@@ -4908,19 +4908,19 @@ void cl_telecom_system::load_configuration(int configuration)
 	ldpc.rate=_ldpc_rate;
 	ofdm.preamble_configurator.Nsymb=ofdm_preamble_configurator_Nsymb;
 	// NB MFSK: 8-symbol preamble for cross-correlation detection.
-	// WB MFSK: 32-symbol preamble (raised from 4 on 2026-05-27, then
-	// 16 → 32 on 2026-05-28 per data-flow-preamble_nSymb.md §11) for
-	// +1.5-3 dB additional cliff push via doubled matched-filter
-	// integration length. The cl_mfsk::init() path (mfsk.cc:122-160)
-	// sets mfsk.preamble_nSymb=32 for M=32 and M=16 alphabets; this
-	// override mirrors that into the data_container size authority
-	// (cl_telecom_system.cc:3872 passes ofdm.preamble_configurator.Nsymb
-	// into data_container::set_size). All four authorities
-	// (mfsk.preamble_nSymb, data_container.preamble_nSymb,
-	// ofdm.preamble_configurator.Nsymb, mfsk_corr_template_nsymb) end up
-	// == 32 — see data-flow-preamble_nSymb.md §4 / §11.11 INV-PROD-1.
+	// WB MFSK: 16-symbol preamble (raised from 4 on 2026-05-27 per
+	// data-frame-cliff-audit-2026-05-27.md §H1) for +6 dB matched-filter
+	// integration gain at the WGN:-8 cliff. The cl_mfsk::init() path
+	// (mfsk.cc:122-137) sets mfsk.preamble_nSymb=16 for M=32 and M=16
+	// alphabets; this override mirrors that into the data_container size
+	// authority (cl_telecom_system.cc:3872 passes
+	// ofdm.preamble_configurator.Nsymb into data_container::set_size).
+	// All four authorities (mfsk.preamble_nSymb, data_container.
+	// preamble_nSymb, ofdm.preamble_configurator.Nsymb,
+	// mfsk_corr_template_nsymb) end up == 16 — see data-flow-preamble_nSymb.md
+	// §4 INV-PROD-1.
 	if(M == MOD_MFSK)
-		ofdm.preamble_configurator.Nsymb = narrowband_enabled ? 8 : 32;
+		ofdm.preamble_configurator.Nsymb = narrowband_enabled ? 8 : 16;
 	// NB estimator: blanket ZF for all NB configs.
 	// ZF (per-pilot H=Y/P) is immune to inter-symbol phase jitter that makes
 	// LS cross-pilot averaging destructive on VB-Cable/HF. With Nc=10 and only
@@ -5162,12 +5162,11 @@ void cl_telecom_system::load_configuration(int configuration)
 			ofdm.mfsk_corr_template[i] = filtered[i * interp];
 
 		// Precompute total and per-symbol template energies for normalization.
-		// Cap raised 8 -> 16 on 2026-05-27, then 16 -> 32 on 2026-05-28
-		// (data-flow-preamble_nSymb.md §11): WB MFSK uses a 32-symbol
-		// preamble. NB still uses 8 (loop body executes 8 times);
-		// template_nsymb is the runtime authority.
+		// Cap raised 8 -> 16 on 2026-05-27 (data-flow-preamble_nSymb.md §H1):
+		// WB MFSK now uses a 16-symbol preamble. NB still uses 8 (loop body
+		// executes 8 times); template_nsymb is the runtime authority.
 		ofdm.mfsk_corr_template_energy = 0.0;
-		for(int k = 0; k < template_nsymb && k < 32; k++)
+		for(int k = 0; k < template_nsymb && k < 16; k++)
 		{
 			double sym_energy = 0.0;
 			for(int n = 0; n < Nofdm; n++)
@@ -5197,10 +5196,7 @@ void cl_telecom_system::load_configuration(int configuration)
 		for(int st = 0; st < 4; st++)
 			ofdm.mfsk_stream_offsets[st] = (st < cl_mfsk::MAX_STREAMS) ? mfsk.stream_offsets[st] : 0;
 		ofdm.mfsk_preamble_nsymb = mfsk.preamble_nSymb;
-		// Mirror loop cap raised 16 -> 32 on 2026-05-28
-		// (data-flow-preamble_nSymb.md §11): mfsk_preamble_tones[]
-		// sized [32] in ofdm.h.
-		for(int s = 0; s < 32; s++)
+		for(int s = 0; s < 16; s++)
 			ofdm.mfsk_preamble_tones[s] = (s < cl_mfsk::MAX_PREAMBLE_SYMB) ? mfsk.preamble_tones[s] : 0;
 		ofdm.mfsk_preamble_match_threshold = mfsk.preamble_match_threshold;
 	}
@@ -5216,7 +5212,7 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm.mfsk_nStreams = 0;
 		ofdm.mfsk_preamble_nsymb = 0;
 		ofdm.mfsk_preamble_match_threshold = 0;
-		for(int s = 0; s < 32; s++) ofdm.mfsk_preamble_tones[s] = 0;
+		for(int s = 0; s < 16; s++) ofdm.mfsk_preamble_tones[s] = 0;
 		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
 
 #if 0 // Template generation disabled: using Schmidl-Cox autocorrelation
