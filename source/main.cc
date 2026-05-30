@@ -300,6 +300,13 @@ int main(int argc, char *argv[])
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
     int rx_normalize_cli = -1;         // --rx-normalize=on|off: -1=default(on), 0=off, 1=on
     int csi_llr_cli = -1;              // --csi-llr=on|off: -1=default(on), 0=off, 1=on
+    int ls_nv_debug_cli = -1;          // --ls-nv-debug=on|off: -1=default(off), 0=off, 1=on (fix/cfg16-nv-restore)
+    int ls_crosspilot_cli = -1;        // --ls-crosspilot-nv=on|off: -1=default(off=fix), 1=baseline A.1.4 cross-pilot
+    int fsel_test_cli = -1;            // --fsel-test=on|off: -1=default(off), 0=off, 1=on (fix/cfg16-nv-restore BER freq-selective channel)
+    float ber_esn0_cli = -999.0f;      // --ber-esn0=<dB>: single-point BER override (<=-900 = full sweep)
+    int ber_frames_cli = 0;            // --ber-frames=<N>: frames for single-point BER (0 = default)
+    double fsel_amp_cli = -1.0;        // --fsel-amp=<lin>: override 2-ray amplitude (<0 = default 0.6)
+    int fsel_delay_cli = -1;           // --fsel-delay=<samples>: override 2-ray delay (<0 = default 128)
     double ack_metric_threshold_cli = -1; // --ack-metric-threshold=F: <0 = default(0.5)
     int emergency_nack_cli = -1;       // --emergency-nack=N: -1=default(3), >=0=override
     int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
@@ -530,6 +537,57 @@ int main(int argc, char *argv[])
             if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) csi_llr_cli = 0;
             else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) csi_llr_cli = 1;
             else { fprintf(stderr, "--csi-llr: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ls-nv-debug=", 14) == 0)
+        {
+            const char* val = argv[i] + 14;
+            if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) ls_nv_debug_cli = 0;
+            else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) ls_nv_debug_cli = 1;
+            else { fprintf(stderr, "--ls-nv-debug: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ls-crosspilot-nv=", 19) == 0)
+        {
+            const char* val = argv[i] + 19;
+            if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) ls_crosspilot_cli = 0;
+            else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) ls_crosspilot_cli = 1;
+            else { fprintf(stderr, "--ls-crosspilot-nv: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--fsel-test=", 12) == 0)
+        {
+            const char* val = argv[i] + 12;
+            if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) fsel_test_cli = 0;
+            else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) fsel_test_cli = 1;
+            else { fprintf(stderr, "--fsel-test: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ber-esn0=", 11) == 0)
+        {
+            ber_esn0_cli = atof(argv[i] + 11);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--ber-frames=", 13) == 0)
+        {
+            ber_frames_cli = atoi(argv[i] + 13);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--fsel-amp=", 11) == 0)
+        {
+            fsel_amp_cli = atof(argv[i] + 11);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--fsel-delay=", 13) == 0)
+        {
+            fsel_delay_cli = atoi(argv[i] + 13);
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1470,6 +1528,32 @@ start_modem:
         telecom_system.csi_llr_enabled = (csi_llr_cli == 1);
         printf("[FLAG] --csi-llr=%s\n",
                telecom_system.csi_llr_enabled ? "on" : "off");
+    }
+    if (ls_nv_debug_cli != -1) {
+        // fix/cfg16-nv-restore: ofdm is a plain member of telecom_system and is
+        // never reconstructed on config switch, so this persists across PHY
+        // reinit. Prints [LS-NV-DBG] residual_nv vs cross-pilot_nv per LS frame.
+        telecom_system.ofdm.ls_nv_debug_enabled = (ls_nv_debug_cli == 1);
+        printf("[FLAG] --ls-nv-debug=%s\n",
+               telecom_system.ofdm.ls_nv_debug_enabled ? "on" : "off");
+    }
+    if (ls_crosspilot_cli != -1) {
+        telecom_system.ofdm.ls_use_crosspilot_nv = (ls_crosspilot_cli == 1);
+        printf("[FLAG] --ls-crosspilot-nv=%s (on = pre-fix A.1.4 baseline arm)\n",
+               telecom_system.ofdm.ls_use_crosspilot_nv ? "on" : "off");
+    }
+    if (fsel_amp_cli >= 0.0) telecom_system.fsel_amp = fsel_amp_cli;
+    if (fsel_delay_cli >= 0) telecom_system.fsel_delay = fsel_delay_cli;
+    if (fsel_test_cli != -1) {
+        telecom_system.fsel_test_enabled = (fsel_test_cli == 1);
+        printf("[FLAG] --fsel-test=%s (amp=%.2f delay=%d)\n",
+               telecom_system.fsel_test_enabled ? "on" : "off",
+               telecom_system.fsel_amp, telecom_system.fsel_delay);
+    }
+    if (ber_esn0_cli > -900.0f) {
+        telecom_system.ber_single_esn0 = ber_esn0_cli;
+        telecom_system.ber_frames_override = ber_frames_cli;
+        printf("[FLAG] --ber-esn0=%.2f --ber-frames=%d\n", ber_esn0_cli, ber_frames_cli);
     }
     if (wb_match_bias_cli != 0) {
         // Apply to both mfsk instances; cl_mfsk::init() will pick up the bias

@@ -241,6 +241,17 @@ public:
 	// Set by ZF/LS channel estimator, used by channel_equalizer
 	double noise_variance_estimate;
 
+	// fix/cfg16-nv-restore validation knob: when true, LS_channel_estimator
+	// prints [LS-NV-DBG] comparing the restored pilot-residual nv with the
+	// A.1.4 cross-pilot value on the same frame. Default false (production
+	// path unchanged). Toggled in main.cc via --ls-nv-debug for loopback BER.
+	bool ls_nv_debug_enabled;
+
+	// fix/cfg16-nv-restore A/B toggle: when true, the LS path reverts to A.1.4's
+	// cross-pilot nv (pre-fix/monitor behavior) so one binary runs both arms.
+	// Default false = the fix (restored pilot residual). --ls-crosspilot-nv=on.
+	bool ls_use_crosspilot_nv;
+
 	// Pre-allocated buffers for passband_to_baseband (avoids new/delete per call)
 	std::complex<double>* p2b_l_data;
 	std::complex<double>* p2b_data_filtered;

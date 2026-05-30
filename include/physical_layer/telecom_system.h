@@ -231,6 +231,25 @@ public:
 	// CSI weighting helps or hurts on flat channels. See PHASE2_FLAGS_DESIGN.md §2.6.
 	bool csi_llr_enabled;
 
+	// fix/cfg16-nv-restore validation hook (--fsel-test=on, default off): inject a
+	// static 2-ray frequency-selective channel into the PLOT_PASSBAND BER path
+	// (passband_test_EsN0) BEFORE the AWGN add. A flat AWGN loopback cannot
+	// reproduce the LS-path nv collapse because the cross-pilot differential and
+	// the pilot residual agree on a flat channel; a freq-selective channel forces
+	// the estimator to interpolate/smooth, exposing the residual EVM the QAM
+	// demapper actually suffers. Second ray: amp fsel_amp at delay fsel_delay
+	// passband samples (within the cyclic prefix → no ISI, pure freq-selectivity).
+	// Production paths never set this; default false.
+	bool fsel_test_enabled;
+	double fsel_amp;     // second-ray amplitude (linear), default 0.6
+	int    fsel_delay;   // second-ray delay in passband samples, default 128
+
+	// fix/cfg16-nv-restore: fast single-point BER override for PLOT_PASSBAND.
+	// ber_single_esn0 <= -900 (default) = normal full sweep. Otherwise evaluate
+	// one Es/N0 point with ber_frames_override frames and return.
+	float ber_single_esn0;
+	int   ber_frames_override;
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.

@@ -85,6 +85,8 @@ cl_ofdm::cl_ofdm()
 	LS_window_hight=0;
 	channel_estimator_amplitude_restoration=NO;
 	noise_variance_estimate=0.01; // Safe default (SNR ~20dB)
+	ls_nv_debug_enabled=false; // fix/cfg16-nv-restore: opt-in [LS-NV-DBG] logging
+	ls_use_crosspilot_nv=false; // fix/cfg16-nv-restore: default = the fix (residual nv)
 	// Optimized FFT tables
 	fft_twiddle=NULL;
 	fft_scratch=NULL;
@@ -1768,15 +1770,48 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 
-	// Estimate noise variance via cross-pilot differential (same helper as ZF).
-	// A.1.4: LS's window-averaging biased the residual estimator low by
-	// (N-1)/N. See estimate_noise_from_pilot_pairs() above for the new
-	// method and rationale. Original residual code preserved under #if 0.
-	noise_variance_estimate = estimate_noise_from_pilot_pairs(in);
-#if 0
-	// LEGACY (A.1.4): pilot-residual σ² estimate. Biased low by (N-1)/N
-	// because LS H is window-averaged toward the centre pilot. Kept here
-	// for blame/historical context.
+	// DFT-based channel estimate smoothing (same as ZF estimator). For the LS
+	// path this runs BEFORE the noise-variance estimate (restored pre-E1 order,
+	// reverting commit 38f5c60 for THIS estimator only) so the residual is
+	// measured against the SAME final smoothed+interpolated H that the data
+	// carriers are equalized with. See fix/cfg16-nv-restore rationale below.
+	smooth_channel_estimate_dft();
+
+	// CFG16 32-QAM clean-channel regression fix (fix/cfg16-nv-restore,
+	// fact-documents/data-flow-noise_variance_estimate.md).
+	//
+	// Restore the PRE-E1/PRE-A.1.4 LS pilot-residual noise estimator for the LS
+	// path ONLY. A.1.4 (commit 9c3fc40) replaced this with the cross-pilot
+	// differential helper estimate_noise_from_pilot_pairs(), which is correct
+	// for the ZF estimator (where the residual Y-(Y/X)*X is identically zero)
+	// but WRONG for LS:
+	//   - cross-pilot measures only the PRE-equalization thermal floor
+	//     σ²/|X|² between two raw same-column pilots (≈1.7e-4 on a clean/
+	//     slowly-varying channel);
+	//   - the Euclidean QAM demapper (psk.cc:325, LLR=ΔD/variance) operates on
+	//     the EQUALIZED+SMOOTHED constellation, whose effective per-symbol noise
+	//     is the residual EVM of the FINAL interpolated/smoothed channel
+	//     estimate against the pilots — a LARGER quantity (~0.035) that does NOT
+	//     vanish at high SNR.
+	// Feeding 1.7e-4 to psk.demod scaled LLRs ~200× over-confident → 32-QAM
+	// inner-point bit-sign flips → BP hit the iter cap (101) → CRC fail → 0 bps.
+	// CFG15 16-QAM (larger min-distance) tolerated the wrong magnitude.
+	//
+	// Unlike LS, the ZF estimator's pre-E1 residual was identically zero, so ZF
+	// (all NB configs + the unused WB-ROBUST mapping) KEEPS A.1.4's cross-pilot
+	// estimator above — A.1.4's NB recovery is provably untouched (this code is
+	// LS-only; MFSK never reaches any channel estimator — telecom_system.cc:2304
+	// branches to mfsk.demod() with its own guard-bin noise, mfsk.cc:999).
+	//
+	// This is the literal restoration of the estimate that historically decoded
+	// CFG16 (pre-A.1.4 4dd8ffb: nv≈0.035, iter≈2, 3182 bps) — a measured pilot
+	// residual, NOT a tuned constant and NOT measure_variance() (the post-EQ
+	// |Y/H−X|² mvar≈0.18 reads anomalously high on this bench and breaks CFG15;
+	// see the abandoned fix/cfg16-noisevar-floor / commit 2d540d9 dead end).
+	//
+	// Ref J. -J. van de Beek, O. Edfors, M. Sandell, S. K. Wilson and
+	// P. O. Borjesson, "On channel estimation in OFDM systems," IEEE VTC 1995,
+	// §III (LS estimate + DFT smoothing; residual σ² from pilot reconstruction).
 	{
 		double noise_sum = 0.0;
 		int noise_count = 0;
@@ -1803,15 +1838,35 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		{
 			noise_variance_estimate = 0.01;
 		}
+		// Floor to prevent division instability at very high SNR.
 		if(noise_variance_estimate < 1e-6)
 			noise_variance_estimate = 1e-6;
 	}
-#endif
 
-	// DFT-based channel estimate smoothing (same as ZF estimator) — applied
-	// AFTER noise variance estimation. Downstream MMSE equalizer uses the
-	// smoothed H but noise_variance_estimate tracks raw pilot SNR.
-	smooth_channel_estimate_dft();
+	// fix/cfg16-nv-restore A/B toggle (validation only, default false). When set,
+	// the LS path reverts to A.1.4's cross-pilot estimator — i.e. the pre-fix
+	// (monitor) behavior — so a SINGLE binary can run both arms under controlled
+	// conditions. estimate_noise_from_pilot_pairs(in) reads only raw received
+	// pilots (not estimated_channel), so it is invariant to the smoother order
+	// above; this toggle isolates the exact quantity that changed. Production
+	// path keeps the restored residual (this flag default false).
+	if(ls_use_crosspilot_nv)
+		noise_variance_estimate = estimate_noise_from_pilot_pairs(in);
+
+	// [LS-NV-DBG] Validation instrumentation (fix/cfg16-nv-restore): log the
+	// restored pilot-residual nv alongside what the A.1.4 cross-pilot estimator
+	// would have produced on the SAME frame, to confirm the ~200× collapse and
+	// its restoration on a frequency-selective channel. Cheap (one extra walk);
+	// gated so it can be left in or trivially removed. Remove before merge if
+	// log volume is a concern.
+	if(ls_nv_debug_enabled)
+	{
+		double crosspilot_nv = estimate_noise_from_pilot_pairs(in);
+		printf("[LS-NV-DBG] residual_nv=%.6e crosspilot_nv=%.6e Nc=%d Nsymb=%d ratio=%.1f\n",
+			noise_variance_estimate, crosspilot_nv, Nc, Nsymb,
+			(crosspilot_nv > 0 ? noise_variance_estimate / crosspilot_nv : -1.0));
+		fflush(stdout);
+	}
 /*
  * Ref J. . -J. van de Beek, O. Edfors, M. Sandell, S. K. Wilson and P. O. Borjesson, "On channel estimation in OFDM systems," 1995 IEEE 45th Vehicular Technology Conference. Countdown to the Wireless Twenty-First Century, Chicago, IL, USA, 1995, pp. 815-819 vol.2, doi: 10.1109/VETEC.1995.504981.
  */

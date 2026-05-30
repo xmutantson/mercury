@@ -44,6 +44,11 @@ cl_telecom_system::cl_telecom_system()
 	skip_var_gate_enabled = true;  // default = HEAD behavior; CLI --skip-var-gate=off disables
 	rx_normalize_enabled  = true;  // default = HEAD behavior; CLI --rx-normalize=off disables
 	csi_llr_enabled       = true;  // default = HEAD behavior; CLI --csi-llr=off disables
+	fsel_test_enabled     = false; // fix/cfg16-nv-restore: --fsel-test=on enables (BER loopback only)
+	fsel_amp              = 0.6;   // second-ray amplitude (linear)
+	fsel_delay            = 128;   // second-ray delay in passband samples (~Nfft/8 @ interp=4, within GI)
+	ber_single_esn0       = -999.0f; // fix/cfg16-nv-restore: <=-900 = normal full sweep
+	ber_frames_override   = 0;     // 0 = use sweep default frame count
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
@@ -401,6 +406,20 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			double f_nyquist = sampling_frequency / 2.0;
 			sigma = (float)sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, EsN0 / 10.0) * bandwidth));
 			sigma_calibrated = true;
+		}
+
+		// fix/cfg16-nv-restore: optional static 2-ray frequency-selective channel,
+		// applied to the TX passband BEFORE AWGN. Off by default (production BER
+		// unchanged). y[n] = x[n] + fsel_amp * x[n-fsel_delay]; iterate backward so
+		// the in-place tap reads only unmodified earlier samples. This is the
+		// condition the LS-path nv bug needs (flat AWGN cannot reproduce it).
+		if(fsel_test_enabled && M != MOD_MFSK && fsel_delay > 0)
+		{
+			int nSamp = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb)) * this->frequency_interpolation_rate;
+			for(int n = nSamp - 1; n >= fsel_delay; n--)
+			{
+				data_container.passband_data[n] += fsel_amp * data_container.passband_data[n - fsel_delay];
+			}
 		}
 
 		awgn_channel.apply_with_delay(data_container.passband_data,data_container.passband_delayed_data,sigma,(data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*this->frequency_interpolation_rate,((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate);
@@ -4568,6 +4587,19 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 	output_power_Watt=1;
 	float start_location = (M == MOD_MFSK) ? -25.0f : -10.0f;
 	float step_size = (M == MOD_MFSK) ? 1.0f : 0.5f;
+
+	// fix/cfg16-nv-restore: fast single-point / windowed BER override for
+	// validation (e.g. high-SNR clean-channel nv measurement). When
+	// ber_single_esn0 > -900, evaluate one Es/N0 point and return immediately.
+	// Production sweep behavior is unchanged when the override is unset.
+	if(ber_single_esn0 > -900.0f)
+	{
+		int nf = (ber_frames_override > 0) ? ber_frames_override : nFrames_per_point;
+		float b = passband_test_EsN0(ber_single_esn0, nf).BER;
+		std::cout<<ber_single_esn0<<";"<<b<<std::endl;
+		BER_plot.close();
+		return;
+	}
 
 	for(int ind=0;ind<nPoints;ind++)
 	{
