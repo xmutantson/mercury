@@ -291,26 +291,6 @@ public:
 	int mfsk_preamble_nsymb;
 	int mfsk_preamble_match_threshold;
 
-	// Absolute signal-presence floor on the per-symbol band-peak energy
-	// (`peak_e`, the argmax energy among a stream's M tone bins) used by the
-	// MFSK discrete-match detectors `detect_ack_pattern` and
-	// `time_sync_mfsk_corr`. The RX baseband fed to those detectors is
-	// normalized to +/-1.0 full-scale and then scaled by a fixed-per-session
-	// rx_gain, so an absolute energy floor is well-defined and stable for the
-	// duration of a session. Gates `peak_e` (NOT e_expected/e_target) so the
-	// NB carrier-image mirror (Bug #39) is preserved.
-	//
-	// Phantom-ACK fix (fact-documents/gearshift-start-and-recovery.md Bug 3):
-	// the old gate `peak_e > 0` rejects only EXACTLY-zero buffers, not the
-	// ~1e-8 structured near-silence (rx-mute residual / render-queue echo,
-	// logged "e=0.00") that produced phantom ACK matches at deep SNR. An
-	// absolute floor rejects near-silence while a relative/CFAR floor (being
-	// scale-invariant) would not.
-	//
-	// 0.0 == legacy behavior (gate disabled). See cl_ofdm::cl_ofdm() for the
-	// calibrated default.
-	double mfsk_detect_min_peak_energy;
-
 	int time_sync_mfsk_corr(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int search_start_symb, double* out_metric);
 
 	// OFDM matched-filter preamble template (replaces FFT-based detection)
