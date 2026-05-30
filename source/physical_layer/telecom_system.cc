@@ -2585,8 +2585,8 @@ skip_h_retry_point:
 					for(int bi = 0; bi < nBps; bi++)
 					{
 						float llr = data_container.demodulated_data[si * nBps + bi] * w;
-						if(llr > 40.0f) llr = 40.0f;
-						else if(llr < -40.0f) llr = -40.0f;
+						if(llr > 20.0f) llr = 20.0f;
+						else if(llr < -20.0f) llr = -20.0f;
 						data_container.demodulated_data[si * nBps + bi] = llr;
 					}
 				}
