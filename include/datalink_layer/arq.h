@@ -1559,6 +1559,24 @@ public:
   int parallel_monitor_decode(double* audio, int audio_len,
                               st_receive_stats& out_stats);
 
+  // qtable-Q3 — dedicated robust-config SACK_RSP side-decoder. When the live
+  // data config is fragile (sack_rsp_needs_robust_downshift), the RSP transmits
+  // the fallback SACK_RSP on SACK_RSP_FALLBACK_CONFIG (CONFIG_4). The primary
+  // decoder cannot be switched to CONFIG_4 to receive it because
+  // load_configuration() memsets the live ring (data_container.cc:158), which
+  // would zero the in-flight SACK_RSP audio. This dedicated decoder snapshots
+  // the live ring READ-ONLY (no memset) and runs receive_byte at CONFIG_4 — the
+  // same no-side-effect side-decode pattern as parallel_monitor_decode().
+  // Lazily allocated on first use; shares the primary's narrowband_enabled and
+  // is sized to the largest config's buffer_Nsymb so it can read the full ring.
+  // On a successful SACK_RSP decode it populates messages_rx_buffer (type +
+  // payload) exactly as receive() would, so the existing SACK_RSP handler runs
+  // unchanged. Returns true iff a SACK_RSP frame for this connection decoded.
+  // See fact-documents/data-flow-sack-rsp-config.md.
+  cl_telecom_system* sack_rsp_robust_decoder{nullptr};
+  bool ensure_sack_rsp_robust_decoder();   // lazy alloc; false if unavailable
+  bool sack_rsp_robust_decode();           // snapshot ring, decode at CONFIG_4
+
   // GUI measurement getters
   double get_snr_uplink() const { return measurements.SNR_uplink; }
   double get_snr_downlink() const { return measurements.SNR_downlink; }

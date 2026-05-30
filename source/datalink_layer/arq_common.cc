@@ -451,6 +451,12 @@ cl_arq_controller::~cl_arq_controller()
 	{
 		delete[] messages_control_bu.data;
 	}
+	// qtable-Q3 — free the dedicated robust-config SACK_RSP side-decoder.
+	if(sack_rsp_robust_decoder != nullptr)
+	{
+		delete sack_rsp_robust_decoder;
+		sack_rsp_robust_decoder = nullptr;
+	}
 	this->deinit_messages_buffers();
 }
 
@@ -1110,6 +1116,126 @@ int cl_arq_controller::parallel_monitor_decode(double* audio, int audio_len,
 	out_stats.message_decoded = NO;
 	out_stats.delay = -1;
 	return -1;
+}
+
+// qtable-Q3 — lazily allocate the dedicated robust-config SACK_RSP decoder.
+// Sized so its ring window is at least as large as the primary's current ring
+// (so a full-ring snapshot fits). Returns false if allocation/init failed.
+bool cl_arq_controller::ensure_sack_rsp_robust_decoder()
+{
+	if(sack_rsp_robust_decoder != nullptr
+	   && sack_rsp_robust_decoder->current_configuration == SACK_RSP_FALLBACK_CONFIG
+	   && sack_rsp_robust_decoder->narrowband_enabled == telecom_system->narrowband_enabled)
+		return true;
+
+	// (Re)create when absent or when the bandwidth mode changed (NB<->WB).
+	if(sack_rsp_robust_decoder != nullptr)
+	{
+		delete sack_rsp_robust_decoder;
+		sack_rsp_robust_decoder = nullptr;
+	}
+
+	sack_rsp_robust_decoder = new cl_telecom_system();
+	if(sack_rsp_robust_decoder == nullptr) return false;
+	sack_rsp_robust_decoder->narrowband_enabled = telecom_system->narrowband_enabled;
+	// Match the primary ring size so we can copy the whole live ring window in.
+	int prim_buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
+	if(prim_buf_nsymb > 0)
+		sack_rsp_robust_decoder->data_container.buffer_Nsymb_min = prim_buf_nsymb;
+	sack_rsp_robust_decoder->load_configuration(SACK_RSP_FALLBACK_CONFIG);
+	if(sack_rsp_robust_decoder->data_container.Nofdm == 0
+	   || sack_rsp_robust_decoder->data_container.buffer_Nsymb == 0)
+	{
+		printf("[CMD-SACK-V2-ROBUST] decoder init failed (Nofdm=0)\n");
+		fflush(stdout);
+		delete sack_rsp_robust_decoder;
+		sack_rsp_robust_decoder = nullptr;
+		return false;
+	}
+	printf("[CMD-SACK-V2-ROBUST] dedicated CONFIG_%d decoder ready (Nsymb=%d buffer_Nsymb=%d nb=%d)\n",
+		SACK_RSP_FALLBACK_CONFIG,
+		sack_rsp_robust_decoder->data_container.Nsymb,
+		sack_rsp_robust_decoder->data_container.buffer_Nsymb.load(),
+		sack_rsp_robust_decoder->narrowband_enabled);
+	fflush(stdout);
+	return true;
+}
+
+// qtable-Q3 — decode a fallback SACK_RSP that the RSP transmitted on
+// SACK_RSP_FALLBACK_CONFIG. Snapshots the live primary ring READ-ONLY (does NOT
+// touch the primary's config or memset its ring — load_configuration() would
+// zero the in-flight SACK_RSP audio, see data_container.cc:158), runs
+// receive_byte() at CONFIG_4, and on a SACK_RSP for this connection populates
+// messages_rx_buffer (type + payload) exactly as receive() would so the
+// existing SACK_RSP handler runs unchanged. Returns true iff such a frame
+// decoded. Mirrors the no-side-effect snapshot pattern of the CMD MFSK probe
+// (arq_commander.cc) and parallel_monitor_decode().
+bool cl_arq_controller::sack_rsp_robust_decode()
+{
+	if(passive_monitor) return false;  // monitor uses parallel_monitor_decode
+	if(!ensure_sack_rsp_robust_decoder()) return false;
+
+	cl_telecom_system* dec = sack_rsp_robust_decoder;
+	int dec_signal_period = dec->data_container.Nofdm
+		* dec->data_container.buffer_Nsymb.load()
+		* dec->data_container.interpolation_rate;
+	int prim_signal_period = telecom_system->data_container.Nofdm
+		* telecom_system->data_container.buffer_Nsymb.load()
+		* telecom_system->data_container.interpolation_rate;
+	if(dec_signal_period <= 0 || prim_signal_period <= 0) return false;
+
+	// Read-only snapshot of the live ring (same locking as the MFSK probe).
+	int copy_len = (prim_signal_period < dec_signal_period)
+		? prim_signal_period : dec_signal_period;
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(dec->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi],
+		copy_len * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+	if(copy_len < dec_signal_period)
+		memset(&dec->data_container.ready_to_process_passband_delayed_data[copy_len],
+			0, (dec_signal_period - copy_len) * sizeof(double));
+
+	st_receive_stats stats = dec->receive_byte(
+		dec->data_container.ready_to_process_passband_delayed_data,
+		dec->data_container.data_byte);
+	if(stats.message_decoded != YES)
+		return false;
+
+	// Parse the decoded frame the same way receive() does (arq_common.cc:6020+).
+	int frame_type = dec->data_container.data_byte[0] & 0xFF;
+	int frame_conn = dec->data_container.data_byte[1] & 0xFF;
+	if(frame_type != SACK_RSP)
+	{
+		SACK_TRACE("robust SACK_RSP decode: got type=%d (not SACK_RSP) — ignoring", frame_type);
+		return false;
+	}
+	if(!(frame_conn == (this->connection_id & 0xFF) || frame_conn == BROADCAST_ID))
+	{
+		SACK_TRACE("robust SACK_RSP decode: conn_id 0x%02x != session 0x%02x — ignoring",
+			frame_conn, (unsigned)(this->connection_id & 0xFF));
+		return false;
+	}
+
+	// Populate messages_rx_buffer identically to receive()'s SACK_RSP branch:
+	// 3-byte msg header (ACK_MULTI_ACK_RANGE_HEADER_LENGTH) then payload bytes.
+	const int alloc_size = N_MAX / 8;
+	int payload_copy_len = max_data_length + max_header_length
+		- ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
+	if(payload_copy_len > alloc_size) payload_copy_len = alloc_size;
+	if(payload_copy_len < 0) payload_copy_len = 0;
+	for(int j = 0; j < payload_copy_len; j++)
+		messages_rx_buffer.data[j] =
+			(char)dec->data_container.data_byte[j + ACK_MULTI_ACK_RANGE_HEADER_LENGTH];
+	messages_rx_buffer.type = SACK_RSP;
+	messages_rx_buffer.sequence_number = dec->data_container.data_byte[2] & 0x7F;
+	messages_rx_buffer.status = RECEIVED;
+
+	printf("[CMD-SACK-V2-ROBUST] decoded SACK_RSP on CONFIG_%d (SNR=%.1f iter=%d conn=0x%02x)\n",
+		SACK_RSP_FALLBACK_CONFIG, stats.SNR, stats.iterations_done, frame_conn);
+	fflush(stdout);
+	return true;
 }
 
 char cl_arq_controller::get_configuration(double SNR)
@@ -4242,8 +4368,8 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	messages_batch_tx[0] = messages_control;  // struct-copy inherits valid .data
 	message_batch_counter_tx = 1;
 
-	// Full-length OFDM frame on the data configuration (NOT the MFSK ack
-	// config — SACK_RSP carries real LDPC-coded payload).
+	// Full-length OFDM frame (NOT the MFSK ack config — SACK_RSP carries real
+	// LDPC-coded payload).
 	telecom_system->set_mfsk_ctrl_mode(false);
 	// SACK_DESIGN_A_PLAN §7.13.29 — REMOVED the §7.13.25 double-shot
 	// (`pad_messages_batch_tx(2)`). The trace data showed that BOTH copies
@@ -4255,16 +4381,55 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	// the same scroll happens to it too. Single-shot SACK_RSP at
 	// WB_CFG15 is ~540 ms wire — its preamble stays in the ring for the
 	// full duration, giving the cross-check a chance to actually find it.
-	// If single-shot proves unreliable on lossy channels we can revisit
-	// with a robust-config SACK_RSP TX (CFG10/CFG4) rather than redundancy.
+	//
+	// qtable-Q3 — implements the robust-config SACK_RSP TX the line above
+	// anticipated. When the live config is a fragile high OFDM config, transmit
+	// this fallback SACK_RSP on SACK_RSP_FALLBACK_CONFIG (CONFIG_4, robust BPSK)
+	// so the reverse SACK does not inherit the forward data-PHY fragility (the
+	// CFG16 n_cmd_sack_events=0 failure). The CMD decode site
+	// (arq_commander.cc process_messages_rx_acks_data) switches in lockstep via
+	// the same sack_rsp_needs_robust_downshift() predicate. Uses the proven
+	// load_configuration switch/restore idiom from the legacy LDPC-ACK fallback
+	// at arq_responder.cc:1100-1106. PHYSICAL_LAYER_ONLY does not deinit message
+	// buffers (arq_common.cc:1135-1142), so messages_control (staged above) and
+	// the retx queues survive the switch. See
+	// fact-documents/data-flow-sack-rsp-config.md.
+	const int sack_rsp_saved_config = current_configuration;
+	const bool sack_rsp_downshift =
+		sack_rsp_needs_robust_downshift(sack_rsp_saved_config);
+	if(sack_rsp_downshift)
+	{
+		printf("[TX-SACK-V2] robust-config downshift: %d -> %d for SACK_RSP TX\n",
+			sack_rsp_saved_config, SACK_RSP_FALLBACK_CONFIG);
+		fflush(stdout);
+		// backup_configuration=NO on BOTH the switch and the restore: this is a
+		// transient round-trip that must leave last_data_configuration exactly
+		// as it was (it drives BREAK recovery / config-toggle). With YES the
+		// restore would set last_data_configuration=CONFIG_4 (arq_common.cc:1272
+		// stores the OLD current at switch time), corrupting it. current_
+		// configuration is restored explicitly to sack_rsp_saved_config below,
+		// so the NO flag costs nothing on the restore.
+		load_configuration(SACK_RSP_FALLBACK_CONFIG, PHYSICAL_LAYER_ONLY, NO);
+	}
 
-	SACK_TRACE("RSP TX SACK_RSP: bsi=%u nframes=%d payload_len=%d crc8=0x%02x",
-		(unsigned)batch_seq_id, nframes, payload_len, (unsigned)crc);
+	SACK_TRACE("RSP TX SACK_RSP: bsi=%u nframes=%d payload_len=%d crc8=0x%02x cfg=%d",
+		(unsigned)batch_seq_id, nframes, payload_len, (unsigned)crc,
+		current_configuration);
 	auto t_start = std::chrono::steady_clock::now();
 	send_batch();
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		t_end - t_start).count();
+
+	if(sack_rsp_downshift)
+	{
+		// Restore the data config so the next inbound retransmit DATA batch
+		// decodes at the data config. NO (not YES) — see the switch above.
+		load_configuration(sack_rsp_saved_config, PHYSICAL_LAYER_ONLY, NO);
+		printf("[TX-SACK-V2] robust-config restore: %d -> %d after SACK_RSP TX\n",
+			SACK_RSP_FALLBACK_CONFIG, sack_rsp_saved_config);
+		fflush(stdout);
+	}
 
 	// §7.13.32 — Release the staging slot AFTER the wire TX completes.
 	// send_batch() reads messages_control via messages_batch_tx[0] (the

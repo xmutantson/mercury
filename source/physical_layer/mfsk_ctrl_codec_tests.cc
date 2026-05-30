@@ -2750,6 +2750,157 @@ static void test_mfsk_ctrl_suffix_apply_sign_invariance() {
 }
 
 // =============================================================================
+// §9 qtable-Q3 — robust-config SACK_RSP transport
+// (fact-documents/data-flow-sack-rsp-config.md)
+// =============================================================================
+
+// §9.1 — SACK_RSP payload codec round-trip. Mirrors the EXACT byte layout of
+//   the producer (cl_arq_controller::send_sack_v2_frame, arq_common.cc:4290+)
+//   and consumer (decode_sack_v2_frame, arq_common.cc:4625+):
+//     payload = [batch_seq_id : u8][bitmap : ceil(N/8) bytes (LSB-first)][CRC8]
+//   The PHY config under which these bytes travel does NOT change the codec —
+//   that is the whole point: the fix re-homes the *carriage* to a robust config
+//   while the payload contract is identical. We use the PRODUCTION CRC8_calc
+//   (arq.CRC8_calc) — never a private copy — to avoid the "both helpers
+//   regressed the same way" trap the §3.1 CRC12 test documents. Asserts:
+//     (a) decode recovers the exact bitmap + bsi the encoder packed, and
+//     (b) a single-bit CRC corruption is rejected (decode returns CRC-fail).
+static void test_sack_rsp_robust_config_roundtrip() {
+	const char* name = "sack_rsp_robust_config_roundtrip";
+	cl_arq_controller arq;  // No init() needed — CRC8_calc is pure.
+	std::mt19937 rng(0x5ACC);
+
+	for (int trial = 0; trial < 4000; trial++) {
+		int nframes = 1 + (int)(rng() % MAX_SACK_BATCH_SIZE);  // 1..32
+		int bitmap_bytes = (nframes + 7) / 8;
+		uint8_t bsi = (uint8_t)(rng() & 0xFF);
+		bool tx_bitmap[MAX_SACK_BATCH_SIZE];
+		for (int i = 0; i < nframes; i++) tx_bitmap[i] = (rng() & 1) != 0;
+
+		// ---- Encode (mirror send_sack_v2_frame:4296-4304) ----
+		uint8_t payload[1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
+		payload[0] = bsi;
+		for (int b = 0; b < bitmap_bytes; b++) payload[1 + b] = 0;
+		for (int i = 0; i < nframes; i++)
+			if (tx_bitmap[i])
+				payload[1 + (i / 8)] |= (uint8_t)(1u << (i % 8));
+		uint8_t crc = arq.CRC8_calc((char*)payload, 1 + bitmap_bytes);
+		payload[1 + bitmap_bytes] = crc;
+
+		// ---- Decode (mirror decode_sack_v2_frame:4642-4654) ----
+		int payload_len = 1 + bitmap_bytes + 1;
+		uint8_t rx_crc       = payload[1 + bitmap_bytes];
+		uint8_t computed_crc = arq.CRC8_calc((char*)payload, 1 + bitmap_bytes);
+		if (rx_crc != computed_crc) {
+			char msg[160];
+			snprintf(msg, sizeof(msg),
+				"trial %d clean CRC8 mismatch rx=0x%02x computed=0x%02x nframes=%d",
+				trial, rx_crc, computed_crc, nframes);
+			test_fail(name, msg);
+			return;
+		}
+		uint8_t rx_bsi = payload[0];
+		bool rx_bitmap[MAX_SACK_BATCH_SIZE];
+		for (int i = 0; i < nframes; i++)
+			rx_bitmap[i] = (payload[1 + (i / 8)] & (1u << (i % 8))) != 0;
+
+		if (rx_bsi != bsi) {
+			char msg[128];
+			snprintf(msg, sizeof(msg), "trial %d bsi mismatch tx=%u rx=%u",
+				trial, (unsigned)bsi, (unsigned)rx_bsi);
+			test_fail(name, msg);
+			return;
+		}
+		for (int i = 0; i < nframes; i++) {
+			if (rx_bitmap[i] != tx_bitmap[i]) {
+				char msg[128];
+				snprintf(msg, sizeof(msg),
+					"trial %d bitmap[%d] mismatch tx=%d rx=%d nframes=%d",
+					trial, i, (int)tx_bitmap[i], (int)rx_bitmap[i], nframes);
+				test_fail(name, msg);
+				return;
+			}
+		}
+
+		// ---- CRC corruption must be rejected ----
+		int flip_byte = (int)(rng() % payload_len);
+		int flip_bit  = (int)(rng() % 8);
+		uint8_t corrupted[1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
+		memcpy(corrupted, payload, payload_len);
+		corrupted[flip_byte] ^= (uint8_t)(1u << flip_bit);
+		uint8_t corr_rx_crc       = corrupted[1 + bitmap_bytes];
+		uint8_t corr_computed_crc = arq.CRC8_calc((char*)corrupted, 1 + bitmap_bytes);
+		if (corr_rx_crc == corr_computed_crc) {
+			// A flip in the trailing CRC byte that lands on a bit not covered by
+			// the recomputation is impossible (CRC byte is index 1+bitmap_bytes,
+			// which is excluded from the CRC range), so this MUST be a genuine
+			// undetected error. CRC8 detects all single-bit errors, so a clean
+			// pass here is a real regression.
+			char msg[160];
+			snprintf(msg, sizeof(msg),
+				"trial %d single-bit corruption (byte %d bit %d) NOT detected "
+				"rx_crc=0x%02x computed=0x%02x nframes=%d",
+				trial, flip_byte, flip_bit, corr_rx_crc, corr_computed_crc, nframes);
+			test_fail(name, msg);
+			return;
+		}
+	}
+	test_pass(name);
+}
+
+// §9.2 — cross-layer config-agreement invariant. The fix's correctness hinges
+//   on the RSP SACK_RSP-TX site and the CMD SACK_RSP-decode site choosing the
+//   SAME config. Both call the single shared predicate
+//   sack_rsp_needs_robust_downshift() on their own live config and both resolve
+//   to SACK_RSP_FALLBACK_CONFIG. This test pins that contract:
+//     - fragile high OFDM configs downshift (CONFIG_16/15/10/5);
+//     - the fallback itself and lower configs do NOT (no pointless switch);
+//     - MFSK ROBUST_* configs do NOT (send_batch already runs the robust PHY);
+//     - the fallback constant is a valid, robust OFDM config (<= CONFIG_4).
+//   If anyone changes the constant or the predicate on one side only, the
+//   build still links but THIS test fails — the cross-layer guard.
+static void test_sack_rsp_config_agreement_invariant() {
+	const char* name = "sack_rsp_config_agreement_invariant";
+
+	// Fallback constant must be a robust OFDM config (not MFSK, not fragile).
+	if (!is_ofdm_config(SACK_RSP_FALLBACK_CONFIG)
+	    || SACK_RSP_FALLBACK_CONFIG > CONFIG_4
+	    || SACK_RSP_FALLBACK_CONFIG < CONFIG_0) {
+		char msg[128];
+		snprintf(msg, sizeof(msg),
+			"SACK_RSP_FALLBACK_CONFIG=%d is not a robust OFDM config in [CONFIG_0..CONFIG_4]",
+			SACK_RSP_FALLBACK_CONFIG);
+		test_fail(name, msg);
+		return;
+	}
+
+	struct { int cfg; bool expect; const char* tag; } cases[] = {
+		{ CONFIG_16, true,  "CONFIG_16 (32-QAM, fragile)" },
+		{ CONFIG_15, true,  "CONFIG_15" },
+		{ CONFIG_10, true,  "CONFIG_10 (8PSK)" },
+		{ CONFIG_5,  true,  "CONFIG_5 (just above fallback)" },
+		{ SACK_RSP_FALLBACK_CONFIG, false, "fallback config itself" },
+		{ CONFIG_4,  false, "CONFIG_4" },
+		{ CONFIG_0,  false, "CONFIG_0 (most robust OFDM)" },
+		{ ROBUST_0,  false, "ROBUST_0 (MFSK — already robust PHY)" },
+		{ ROBUST_2,  false, "ROBUST_2 (MFSK)" },
+		{ CONFIG_NONE, false, "CONFIG_NONE" },
+	};
+	for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+		bool got = sack_rsp_needs_robust_downshift(cases[i].cfg);
+		if (got != cases[i].expect) {
+			char msg[160];
+			snprintf(msg, sizeof(msg),
+				"sack_rsp_needs_robust_downshift(%s=%d)=%d, expected %d",
+				cases[i].tag, cases[i].cfg, (int)got, (int)cases[i].expect);
+			test_fail(name, msg);
+			return;
+		}
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -2811,6 +2962,11 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op();
 	test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe();
 	test_mfsk_ctrl_suffix_apply_sign_invariance();
+
+	// §9 qtable-Q3 robust-config SACK_RSP transport
+	// (fact-documents/data-flow-sack-rsp-config.md).
+	test_sack_rsp_robust_config_roundtrip();
+	test_sack_rsp_config_agreement_invariant();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

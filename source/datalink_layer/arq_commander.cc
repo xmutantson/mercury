@@ -2631,8 +2631,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// is below 0.65. v18 r1 showed CMD sending
 						// SET_LINK_PARAMS 10x with 0 ACKs — RSP couldn't
 						// decode because sack_cross_check_mode rejected it.
-						SACK_TRACE("v2 OFDM dispatch: calling receive() advance=%d need_syms=%d",
-							advance, v2_dispatch_min_advance_syms);
+						//
+						// qtable-Q3 — the robust-config SACK_RSP decode does NOT
+						// happen by switching this primary decoder's config:
+						// load_configuration() memsets passband_delayed_data
+						// (data_container.cc:158), which would zero the very
+						// SACK_RSP audio the capture thread accumulated in the
+						// ring. Instead a dedicated CONFIG_4 side-decoder
+						// (sack_rsp_robust_decode) snapshots the ring tail
+						// read-only and runs immediately AFTER this primary
+						// receive() returns without a SACK_RSP, mirroring the
+						// no-side-effect MFSK-probe pattern above. See
+						// fact-documents/data-flow-sack-rsp-config.md §3.
+						SACK_TRACE("v2 OFDM dispatch: calling receive() advance=%d need_syms=%d cfg=%d",
+							advance, v2_dispatch_min_advance_syms, current_configuration);
 						this->receive();
 
 						// After receive(): if INCOMPLETE-overflow fired,
@@ -2651,6 +2663,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							(int)messages_rx_buffer.type,
 							overflow_syms,
 							v2_dispatch_min_advance_syms);
+
+						// qtable-Q3 — if the primary (data-config) receive() did
+						// not produce a SACK_RSP and the live config is fragile,
+						// the RSP transmitted the fallback SACK_RSP on
+						// SACK_RSP_FALLBACK_CONFIG. Try the dedicated CONFIG_4
+						// side-decoder on a read-only ring snapshot. On success it
+						// populates messages_rx_buffer (type=SACK_RSP + payload),
+						// so the existing handler below runs unchanged. The
+						// primary attempt is kept first so a non-downshifted
+						// SACK_RSP (clean low config) still works exactly as before.
+						if(!(messages_rx_buffer.status == RECEIVED
+						     && messages_rx_buffer.type == SACK_RSP)
+						   && sack_rsp_needs_robust_downshift(current_configuration))
+						{
+							if(sack_rsp_robust_decode())
+								SACK_TRACE("v2 OFDM dispatch: robust CONFIG_%d side-decoder recovered SACK_RSP",
+									SACK_RSP_FALLBACK_CONFIG);
+						}
 					}
 
 					if(messages_rx_buffer.status == RECEIVED

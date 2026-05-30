@@ -78,6 +78,29 @@ extern int g_verbose;
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
+// qtable-Q3 — robust OFDM config for the fallback partial-batch SACK_RSP frame.
+// The reverse SACK_RSP (cl_arq_controller::send_sack_v2_frame, the fallback
+// taken when the robust MFSK ACK+SACK suffix did not fire — WB misfire / all
+// NB partial batches) was transmitted on the *data* config, so at high configs
+// (e.g. CONFIG_16 32-QAM) the reverse SACK inherited the forward data-PHY
+// fragility and the commander could not decode it (n_cmd_sack_events=0), the
+// batch was never confirmed → retransmit → timeout. CONFIG_4 (BPSK, LDPC 5/16)
+// is robust BPSK like CONFIG_0 but a much shorter frame, so it stays inside the
+// receive ring window (avoids the scroll-off failure at arq_common.cc:4248-4259).
+// See fact-documents/data-flow-sack-rsp-config.md for the full §5 audit.
+#define SACK_RSP_FALLBACK_CONFIG CONFIG_4
+
+// Single source of truth for the cross-layer agreement: BOTH the RSP SACK_RSP
+// TX site (arq_common.cc:send_sack_v2_frame) and the CMD SACK_RSP decode site
+// (arq_commander.cc:process_messages_rx_acks_data) call this predicate on their
+// own live config, so they switch to SACK_RSP_FALLBACK_CONFIG in lockstep and
+// only when the live config is *more fragile* than the fallback. When false,
+// the pre-fix code path is preserved bit-for-bit (no switch).
+inline bool sack_rsp_needs_robust_downshift(int config)
+{
+	return is_ofdm_config(config) && config > SACK_RSP_FALLBACK_CONFIG;
+}
+
 // NB mode cap — CONFIG_14 (8PSK, LDPC 14/16) is the highest feasible NB config.
 // 16QAM/32QAM (CONFIG_15+) require accurate amplitude equalization that NB's
 // sparse pilot grid (Nc=10, Dy=3) cannot provide with sufficient accuracy.
