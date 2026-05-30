@@ -119,6 +119,21 @@ cl_ofdm::cl_ofdm()
 	mfsk_nStreams=0;
 	mfsk_preamble_nsymb=0;
 	mfsk_preamble_match_threshold=0;
+	// Absolute band-peak-energy floor for the MFSK discrete-match detectors
+	// (phantom-ACK fix; see ofdm.h decl + gearshift-start-and-recovery.md Bug 3).
+	// PROVISIONAL value, IONOS-CALIBRATION PENDING: synthetic amplitudes may
+	// differ from real IONOS render levels, so refine this from real captures
+	// (look at the [calib] lines printed by test_detect_ack_pattern_* and at
+	// real "e=0.00" near-silence captures). Measured separation at ROBUST_0 WB
+	// ACK (test_detect_ack_pattern_rejects_near_silence / _keeps_weak_signal):
+	//   clean ACK    peak_e ~1.86e+01 .. 2.02e+01
+	//   weak ACK     peak_e min among detected hits ~1.16e+01 (sigma=2.0*rms)
+	//   near-silence peak_e ~1.86e-05 .. 2.02e-05 (clean ACK * 1e-3 amplitude)
+	// 1.0e-3 sits ~50x above the synthetic near-silence ceiling (rejects it)
+	// and ~1.1e4x below the weakest real ACK peak (keeps real weak ACKs). The
+	// gap is ~5.8e5x in energy, so the exact value is non-critical; 0.0 restores
+	// legacy behavior.
+	mfsk_detect_min_peak_energy=1.0e-3; // PROVISIONAL — IONOS-calibration pending
 	for(int i=0;i<16;i++) mfsk_preamble_tones[i]=0;
 	for(int i=0;i<4;i++) mfsk_stream_offsets[i]=0;
 	// OFDM matched-filter template
@@ -3491,9 +3506,14 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 					if (e > peak_e) { peak_e = e; peak_bin = b; }
 				}
 				// Carrier-image recovery (Bug #39 pattern in detect_ack_pattern):
-				// accept expected OR mirror as peak. Energy gate prevents 0==0
-				// match on silence.
-				if (peak_e > 0 && (peak_bin == expected_bin || peak_bin == mirror_bin))
+				// accept expected OR mirror as peak. Absolute band-peak-energy
+				// floor (phantom-ACK fix sibling, Bug 3) rejects structured
+				// near-silence, not just exactly-zero buffers; gates `peak_e`
+				// (band ARGMAX) so the NB mirror is preserved. This is the data
+				// PREAMBLE detector with a tuned weak-signal cliff (shipped
+				// preamble-discrete-match) — keep the floor conservative so it
+				// does not regress the preamble argmax cliff tests.
+				if (peak_e > mfsk_detect_min_peak_energy && (peak_bin == expected_bin || peak_bin == mirror_bin))
 					streams_matched++;
 			}
 
@@ -3591,7 +3611,10 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 					         + fft_out[b].imag() * fft_out[b].imag();
 					if (e > pk) { pk = e; pkbin = b; }
 				}
-				if (pk > 0 && (pkbin == ebin || pkbin == mbin))
+				// Same absolute peak-energy floor as the coarse gate above
+				// (preamble-detector fine pass; Bug 3 sibling). Conservative floor
+				// to avoid regressing the preamble argmax cliff tests.
+				if (pk > mfsk_detect_min_peak_energy && (pkbin == ebin || pkbin == mbin))
 					streams_ok++;
 			}
 
@@ -3735,10 +3758,19 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 						peak_bin = b;
 					}
 				}
-				// Energy gate + carrier image: accept expected OR mirror as peak.
-				// In silence (zeroed buffer), all bins have e=0 — energy gate
-				// prevents 0>=0 false match.
-				if (peak_e > 0 && (peak_bin == expected_bin || peak_bin == mirror_bin))
+				// Absolute signal-presence gate + carrier image: accept expected
+				// OR mirror as peak (Bug #39 NB mirror preserved — we gate the
+				// band-peak energy `peak_e`, NOT e_expected/e_target, so the
+				// mirror still counts as a valid peak bin). The floor is an
+				// ABSOLUTE energy threshold (NOT relative/CFAR, which would be
+				// scale-invariant and could NOT reject near-silence): the RX
+				// baseband is +/-1.0 full-scale × fixed-per-session rx_gain, so
+				// peak_e has a stable scale. Phantom-ACK fix
+				// (fact-documents/gearshift-start-and-recovery.md Bug 3): the old
+				// `peak_e > 0` gate caught only EXACTLY-zero buffers; structured
+				// near-silence (rx-mute residual / render-queue echo, peak_e
+				// ~1e-8..1e-5, logged "e=0.00") still matched here and faked ACKs.
+				if (peak_e > mfsk_detect_min_peak_energy && (peak_bin == expected_bin || peak_bin == mirror_bin))
 					streams_matched++;
 			}
 
@@ -3856,7 +3888,11 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 						           fft_out[b].imag() * fft_out[b].imag();
 						if (e > pk) { pk = e; pkbin = b; }
 					}
-					if (pk > 0 && (pkbin == ebin || pkbin == mbin))
+					// Same absolute peak-energy floor as the coarse gate above:
+					// the Phase-2 fine pass re-scores every symbol, so it must
+					// reject near-silence too or the phantom returns via the fine
+					// path (Bug 3). Band-peak gate preserves the NB mirror (#39).
+					if (pk > mfsk_detect_min_peak_energy && (pkbin == ebin || pkbin == mbin))
 						streams_ok++;
 				}
 

@@ -60,6 +60,7 @@
 #include "physical_layer/physical_defines.h"
 #include "datalink_layer/arq.h"           // §3 Wave 2 v2 cross-layer tests
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -2750,6 +2751,221 @@ static void test_mfsk_ctrl_suffix_apply_sign_invariance() {
 }
 
 // =============================================================================
+// §9 — Phantom-ACK absolute peak-energy floor regression suite
+// (fact-documents/gearshift-start-and-recovery.md Bug 3, 2026-05-29).
+//
+// detect_ack_pattern's per-symbol match gate was `peak_e > 0`, which rejects
+// only EXACTLY-zero buffers. Structured near-silence (rx-mute residual /
+// render-queue echo, FFT bin energies ~1e-8) still produced phantom ACK
+// matches at deep SNR, faking data_ack_received=YES and starving the BREAK
+// safety counter. Fix: gate `peak_e` against an ABSOLUTE floor
+// (cl_ofdm::mfsk_detect_min_peak_energy). These tests pin the behavior:
+//   §9.0 (helper)  measure_ack_min_peak_e — replicate the detector's band-peak
+//                  energy math at the detected offset for calibration.
+//   §9.1 rejects_near_silence  FAIL-BEFORE-PASSES: clean ACK matches, the same
+//                  buffer scaled ~1e-3 (peak_e ~1e6x lower) must NOT match.
+//   §9.2 keeps_weak_signal     real ACK + AWGN at the §8.3 sigma still matches
+//                  with the floor armed (guards against rejecting real weak ACKs).
+// =============================================================================
+
+// §9.0 — Compute, at the detector's chosen best_offset, the per-symbol
+// band-peak energy `peak_e` (max energy among stream 0's M tone bins) for each
+// ACK symbol, exactly mirroring detect_ack_pattern's coarse-scan bin math
+// (ofdm.cc:3719-3737). Returns the MIN, MEDIAN and MAX over the ACK symbols.
+// Ngi is private on cl_ofdm, so we derive it from the public Nofdm and Nfft:
+// Ngi = Nofdm - Nfft. The decimated baseband is at interpolation_rate=1 (the
+// helper already decimated), matching run_initial_ack_detect's call.
+static void measure_ack_peak_e(
+	cl_telecom_system& ts,
+	const std::vector<std::complex<double> >& bb,
+	int best_offset,
+	double& out_min, double& out_median, double& out_max)
+{
+	out_min = 0.0; out_median = 0.0; out_max = 0.0;
+	int Nfft   = ts.ofdm.Nfft;
+	int Nc     = ts.ofdm.Nc;
+	int Nofdm  = ts.data_container.Nofdm;
+	int Ngi    = Nofdm - Nfft;                 // private member derived from publics
+	int half   = Nc / 2;
+	int M      = ts.ack_mfsk.M;
+	int nsymb  = ts.ack_mfsk.ack_pattern_nsymb;
+	const int* stream_offsets = ts.ack_mfsk.stream_offsets;
+	int dec_size = (int)bb.size();
+	if (best_offset < 0 || Nfft <= 0 || M <= 0) return;
+
+	std::vector<std::complex<double> > sym(Nfft), fft_out(Nfft);
+	std::vector<double> peaks;
+	peaks.reserve(nsymb);
+	for (int p = 0; p < nsymb; p++) {
+		int offset = best_offset + p * Nofdm + Ngi;  // interpolation_rate == 1
+		if (offset < 0 || offset + Nfft > dec_size) break;
+		for (int i = 0; i < Nfft; i++) sym[i] = bb[(size_t)(offset + i)];
+		ts.ofdm.fft(sym.data(), fft_out.data(), Nfft);
+		// Band-peak energy among stream 0's M tone bins (the `peak_e` the gate
+		// thresholds). start_shift is public on cl_ofdm.
+		double peak_e = -1.0;
+		for (int t = 0; t < M; t++) {
+			int sub = stream_offsets[0] + t;
+			int b = (sub < half) ? (Nfft - half + sub)
+			                     : (ts.ofdm.start_shift + (sub - half));
+			if (b < 0 || b >= Nfft) continue;
+			double e = fft_out[b].real() * fft_out[b].real()
+			         + fft_out[b].imag() * fft_out[b].imag();
+			if (e > peak_e) peak_e = e;
+		}
+		if (peak_e >= 0.0) peaks.push_back(peak_e);
+	}
+	if (peaks.empty()) return;
+	std::sort(peaks.begin(), peaks.end());
+	out_min    = peaks.front();
+	out_max    = peaks.back();
+	out_median = peaks[peaks.size() / 2];
+}
+
+// §9.1 — Phantom-ACK rejection. FAIL-BEFORE-PASSES with the floor at 0.0.
+// Build a CLEAN ACK passband, confirm it detects (matched >= ack_match_threshold).
+// Then scale every passband sample by 1e-3 (peak_e drops ~1e6x → structured
+// near-silence) and confirm the detector now reports matched WELL BELOW the
+// threshold (ideally 0). With mfsk_detect_min_peak_energy == 0.0 the legacy
+// `peak_e > 0` gate accepts the ~1e-8 near-silence bins → matched stays high
+// → this test FAILS. After arming the floor it PASSES.
+static void test_detect_ack_pattern_rejects_near_silence() {
+	const char* name = "detect_ack_pattern_rejects_near_silence";
+
+	cl_telecom_system ts;
+	std::mt19937 rng(0x9A57F100u);
+	std::vector<double> pb;
+	int expected_offset = 0, dec_size = 0;
+	if (!synth_ack_pattern_passband_with_cfo(ts, /*cfo=*/0.0, /*sigma=*/0.0,
+	                                          /*synth=*/true, rng, pb,
+	                                          expected_offset, dec_size)) {
+		test_fail(name, "synth_ack_pattern_passband_with_cfo failed");
+		return;
+	}
+	int thr = ts.ack_mfsk.ack_match_threshold;
+
+	// --- Clean: must match. ---
+	int clean_off = -1, clean_matched = 0;
+	double clean_metric = 0.0;
+	std::vector<std::complex<double> > bb_clean;
+	run_initial_ack_detect(ts, pb, clean_off, clean_matched, clean_metric, bb_clean);
+	double cmin = 0, cmed = 0, cmax = 0;
+	measure_ack_peak_e(ts, bb_clean, clean_off, cmin, cmed, cmax);
+	if (clean_matched < thr) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"clean ACK did not detect: matched=%d < thr=%d "
+			"(peak_e min=%.3e med=%.3e max=%.3e) — synth/detector broken",
+			clean_matched, thr, cmin, cmed, cmax);
+		test_fail(name, buf);
+		return;
+	}
+
+	// --- Near-silence: scale every passband sample by 1e-3. ---
+	std::vector<double> pb_quiet(pb);
+	for (size_t i = 0; i < pb_quiet.size(); i++) pb_quiet[i] *= 1.0e-3;
+	int q_off = -1, q_matched = 0;
+	double q_metric = 0.0;
+	std::vector<std::complex<double> > bb_quiet;
+	run_initial_ack_detect(ts, pb_quiet, q_off, q_matched, q_metric, bb_quiet);
+	double qmin = 0, qmed = 0, qmax = 0;
+	// Reuse the clean best_offset region for an apples-to-apples peak_e read
+	// (the quiet detector may report a different/garbage offset; we want the
+	// energy where the pattern WAS).
+	int q_meas_off = (q_off >= 0) ? q_off : clean_off;
+	measure_ack_peak_e(ts, bb_quiet, q_meas_off, qmin, qmed, qmax);
+
+	// Always print the calibration numbers so the constant can be set/refined.
+	printf("    [calib] %s: clean matched=%d peak_e[min=%.3e med=%.3e max=%.3e] | "
+	       "near-silence matched=%d peak_e[min=%.3e med=%.3e max=%.3e] | "
+	       "floor=%.3e thr=%d\n",
+	       name, clean_matched, cmin, cmed, cmax,
+	       q_matched, qmin, qmed, qmax,
+	       ts.ofdm.mfsk_detect_min_peak_energy, thr);
+
+	// The phantom: near-silence must NOT reach the ACK acceptance threshold.
+	// Require it strictly below threshold (ideally 0).
+	if (q_matched >= thr) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"PHANTOM: near-silence matched=%d >= thr=%d "
+			"(near-silence peak_e max=%.3e; floor=%.3e). Absolute peak-energy "
+			"floor too low/disabled — Bug 3 not fixed.",
+			q_matched, thr, qmax, ts.ofdm.mfsk_detect_min_peak_energy);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §9.2 — Weak-signal retention guard. Real ACK + AWGN at the SAME passband
+// sigma the §8.3 pure-noise test uses (2.0×preamble RMS), but WITH the pattern
+// present. The armed floor must NOT reject this real (if noisy) ACK. Averaged
+// over several seeds (single-seed noise can drop matched below threshold even
+// in the legacy detector); require the majority to still detect.
+static void test_detect_ack_pattern_keeps_weak_signal() {
+	const char* name = "detect_ack_pattern_keeps_weak_signal";
+
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) {
+		test_fail(name, "preamble RMS measurement failed");
+		return;
+	}
+	double sigma_pb = 2.0 * rms;  // matches test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe
+
+	int thr = ts_meas.ack_mfsk.ack_match_threshold;
+	int hits = 0;
+	int trials = 8;
+	int best_matched_seen = 0;
+	double min_peak_among_hits = 0.0;
+	for (int seed = 1; seed <= trials; seed++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0x9A57F200u + seed));
+		std::vector<double> pb;
+		int expected_offset = 0, dec_size = 0;
+		if (!synth_ack_pattern_passband_with_cfo(ts, /*cfo=*/0.0, sigma_pb,
+		                                          /*synth=*/true, rng, pb,
+		                                          expected_offset, dec_size)) {
+			test_fail(name, "synth_ack_pattern_passband_with_cfo failed");
+			return;
+		}
+		int off = -1, matched = 0;
+		double metric = 0.0;
+		std::vector<std::complex<double> > bb;
+		run_initial_ack_detect(ts, pb, off, matched, metric, bb);
+		if (matched > best_matched_seen) best_matched_seen = matched;
+		if (matched >= thr) {
+			hits++;
+			double pmin = 0, pmed = 0, pmax = 0;
+			measure_ack_peak_e(ts, bb, off, pmin, pmed, pmax);
+			if (min_peak_among_hits == 0.0 || pmin < min_peak_among_hits)
+				min_peak_among_hits = pmin;
+		}
+	}
+	printf("    [calib] %s: weak ACK (sigma=2.0*rms) hits=%d/%d best_matched=%d "
+	       "min_peak_e_among_hits=%.3e floor=%.3e thr=%d\n",
+	       name, hits, trials, best_matched_seen, min_peak_among_hits,
+	       ts_meas.ofdm.mfsk_detect_min_peak_energy, thr);
+
+	// Majority of weak-but-present ACKs must survive the floor.
+	if (hits < (trials / 2)) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"weak ACK over-rejected: only %d/%d detected (>= %d required). "
+			"best_matched=%d, min_peak_e_among_hits=%.3e, floor=%.3e — "
+			"absolute floor too HIGH, clobbering real weak ACKs.",
+			hits, trials, trials / 2, best_matched_seen,
+			min_peak_among_hits, ts_meas.ofdm.mfsk_detect_min_peak_energy);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -2811,6 +3027,11 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op();
 	test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe();
 	test_mfsk_ctrl_suffix_apply_sign_invariance();
+
+	// §9 Phantom-ACK absolute peak-energy floor regression suite
+	// (gearshift-start-and-recovery.md Bug 3, 2026-05-29).
+	test_detect_ack_pattern_rejects_near_silence();
+	test_detect_ack_pattern_keeps_weak_signal();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
