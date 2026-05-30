@@ -337,6 +337,11 @@ int main(int argc, char *argv[])
                                         // data_ack_received NO, does not raise last_data_viable_config / reset the BREAK
                                         // panic counter, and BREAK still reaches ROBUST_0. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §8.
+    bool test_clean_batch_viability_cli = false; // --test-clean-batch-viability: CLEAN-BATCH VIABILITY regression (§9).
+                                        // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
+                                        // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
+                                        // up-promotion gate; a CLEAN all-ones batch does all of those; and that BREAK can
+                                        // still reach ROBUST_0 after a partial-only run. One-shot, exits rc. See §9.
     int test_policy_axis1_then_axis2_cli = 0; // --test-policy-axis1-then-axis2=up|down: SACK Design A Step 10 — fire Axis-1
                                         // (engages axis2_cooldown_batches=3) then attempt Axis-2 fire (should be SUPPRESSED).
                                         // 1=axis1=up then axis2=up; 2=axis1=down then axis2=down. One-shot at startup, then exit.
@@ -743,6 +748,15 @@ int main(int argc, char *argv[])
             // exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §8.
             test_phantom_ack_gate_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-clean-batch-viability") == 0)
+        {
+            // CLEAN-BATCH VIABILITY regression (§9) — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/gearshift-start-and-recovery.md §9.8.
+            test_clean_batch_viability_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1714,6 +1728,19 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_phantom_ack_gate();
             printf("[FLAG] Phantom-ack-gate test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_clean_batch_viability_cli) {
+            // CLEAN-BATCH VIABILITY regression (one-shot, then exit rc). Drives the
+            // pure promotion predicate + replays the four gated gearshift consumers
+            // for a partial vs a clean batch. See
+            // fact-documents/gearshift-start-and-recovery.md §9.8.
+            printf("[FLAG] --test-clean-batch-viability: invoking CLEAN-BATCH "
+                   "VIABILITY regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_clean_batch_viability();
+            printf("[FLAG] Clean-batch-viability test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

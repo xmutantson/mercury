@@ -1056,6 +1056,7 @@ void cl_arq_controller::process_messages_tx_control()
 				// Reset batch stats so gearshift evaluation only reflects new config
 				last_transmission_block_stats.nBatches_sent = 0;
 				last_transmission_block_stats.nBatches_acked = 0;
+				last_transmission_block_stats.nBatches_fully_acked = 0;  // CLEAN-BATCH VIABILITY (§9)
 				last_transmission_block_stats.nReSent_data = 0;
 				last_transmission_block_stats.nSent_data = 0;
 			}
@@ -1242,6 +1243,7 @@ void cl_arq_controller::process_messages_tx_data()
 		if(ack_pattern_time_ms > 0)
 			telecom_system->data_container.frames_to_read = 4;
 		data_ack_received = NO;
+		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
 		connection_status = RECEIVING_ACKS_DATA;
 		ack_diag_peak_matched = 0;
 		ack_diag_peak_metric = 0.0;
@@ -1737,6 +1739,7 @@ void cl_arq_controller::process_messages_tx_data()
 				telecom_system->data_container.preamble_nSymb + telecom_system->get_active_nsymb();
 		}
 		data_ack_received=NO;
+		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
 		connection_status=RECEIVING_ACKS_DATA;
 		ack_diag_peak_matched = 0;
 		ack_diag_peak_metric = 0.0;
@@ -2816,6 +2819,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				SACK_TRACE("dar=YES via SACK_RSP path rx_count=%d batch=%d retx=%d",
 					rx_count, data_batch_size, retransmit_count);
 				data_ack_received = YES;
+				// CLEAN-BATCH VIABILITY (§9): a PARTIAL SACK keeps the link alive and
+				// drives retransmit of the missing frames (above), but the batch was
+				// NOT fully delivered — it must NOT promote the rung. Leave the
+				// promotion-gating flag FALSE (explicit; the per-batch TX-start reset
+				// already cleared it) and do NOT bump nBatches_fully_acked. nBatches_acked
+				// is still bumped below for its existing (stats) meaning — unchanged.
+				last_batch_fully_acked = false;
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;
 
@@ -2933,8 +2943,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				SACK_TRACE("dar=YES via MFSK ACK_PAT path pre_detected=%d",
 					v2_ack_pat_pre_detected ? 1 : 0);
 				data_ack_received=YES;
+				// CLEAN-BATCH VIABILITY (§9): this is the CLEAN (all-ones) ACK funnel
+				// — the MFSK all-ones suffix (v2_ack_pat_pre_detected, set at the
+				// rx_bitmap==all_ones branch ~:2521) and the bare-pattern data-ACK arm
+				// (WB CRC-gated by §8) both land here. The whole batch is delivered,
+				// so this batch MAY drive the four gearshift promotion consumers.
+				last_batch_fully_acked = true;
 				stats.nBatches_acked++;
+				stats.nBatches_fully_acked++;
 				last_transmission_block_stats.nBatches_acked++;
+				last_transmission_block_stats.nBatches_fully_acked++;
 
 				// Phase 3a — clean full-batch ACK: every PENDING_ACK / ACK_TIMED_OUT
 				// frame is about to be delivered. Sum lengths BEFORE register_ack
@@ -3030,8 +3048,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				if(messages_rx_buffer.type==ACK_RANGE)
 				{
 					data_ack_received=YES;
+					// CLEAN-BATCH VIABILITY (§9): LDPC full-batch range ACK — clean
+					// (no SACK cycle), so this batch may drive promotion.
+					last_batch_fully_acked = true;
 					stats.nBatches_acked++;
+					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
+					last_transmission_block_stats.nBatches_fully_acked++;
 					int start=(unsigned char)messages_rx_buffer.data[0];
 					int end=(unsigned char)messages_rx_buffer.data[1];
 					// Guard: start > end under garbage frames wraps unsigned char → infinite loop
@@ -3050,8 +3073,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				else if(messages_rx_buffer.type==ACK_MULTI)
 				{
 					data_ack_received=YES;
+					// CLEAN-BATCH VIABILITY (§9): LDPC full-batch multi ACK — clean
+					// (no SACK cycle), so this batch may drive promotion.
+					last_batch_fully_acked = true;
 					stats.nBatches_acked++;
+					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
+					last_transmission_block_stats.nBatches_fully_acked++;
 					// Clamp count to buffer bounds — garbage frames can have data[0]=255,
 					// reading past the 200-byte messages_rx_buffer.data (Bug #15)
 					int ack_count = (unsigned char)messages_rx_buffer.data[0];
@@ -3382,18 +3410,34 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		}
 		else
 		{
+			// data_ack_received==YES (clean OR partial). emergency_nack_count tracks
+			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
+			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
-			break_drop_step = 2;       // Reset to initial aggression (2 steps).
-			breaks_since_last_data_success = 0;  // panic-mode counter resets on
-			                                     // real data flow (see arq.h).
-			// Option B (data-anchored promotion): a DATA batch was confirmed
-			// delivered at this config. Record it as the highest data-viable
-			// rung — anchors BREAK recovery (arq_commander.cc:81) and the
-			// up-shifter gates. SOLE on-delivery producer. A failed probe never
-			// reaches here. See fact-documents/gearshift-start-and-recovery.md §6/§7.
-			if(config_ladder_index(current_configuration) >
-			   config_ladder_index(last_data_viable_config))
-				last_data_viable_config = current_configuration;
+
+			// CLEAN-BATCH VIABILITY (§9): the panic/aggression resets AND the
+			// data-viable anchor-raise are PROMOTION decisions — they must fire ONLY
+			// on a CLEAN, fully-delivered batch. A genuine PARTIAL SACK keeps the link
+			// alive (retransmit is unchanged) but must NOT (a) clear the BREAK panic
+			// counter — otherwise a marginal CONFIG_0 that passes 1/25 frames forever
+			// prevents BREAK from ever latching to ROBUST_0 — nor (b) raise
+			// last_data_viable_config, which would pin the BREAK floor + re-probe
+			// target at the marginal rung (the CONFIG_0 ↔ ROBUST_0 oscillation at the
+			// WGN:-10 cliff). See gearshift-start-and-recovery.md §9.
+			if(promotion_allowed_on_batch(last_batch_fully_acked))
+			{
+				break_drop_step = 2;       // Reset to initial aggression (2 steps).
+				breaks_since_last_data_success = 0;  // panic-mode counter resets on
+				                                     // CLEAN data flow (see arq.h / §9).
+				// Option B (data-anchored promotion): a DATA batch was confirmed
+				// FULLY delivered at this config. Record it as the highest data-viable
+				// rung — anchors BREAK recovery (arq_commander.cc:81) and the
+				// up-shifter gates. SOLE on-delivery producer. A failed probe / partial
+				// batch never reaches here. See gearshift-start-and-recovery.md §6/§7/§9.
+				if(config_ladder_index(current_configuration) >
+				   config_ladder_index(last_data_viable_config))
+					last_data_viable_config = current_configuration;
+			}
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
 			frame_gearshift_retry_count = 0;       // §7.13.33 reset
@@ -3445,7 +3489,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// is the sole authority for upward config changes. Gearshift's
 		// FRAME UP must yield. Downward moves (BREAK) remain available.
 		bool optimizer_owns_upward_frame = optimizer_is_in_control();
-		if(data_ack_received==YES && gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
+		// CLEAN-BATCH VIABILITY (§9): only a CLEAN, fully-delivered batch counts
+		// toward the FRAME-UP climb. A partial SACK (data_ack_received==YES but
+		// last_batch_fully_acked==false) neither advances nor resets
+		// consecutive_data_acks — it is link-keepalive, not proof the rung carries
+		// full data. Without this gate a string of partials at a marginal rung
+		// climbs into a config that can't pass data. See §9.
+		if(data_ack_received==YES && promotion_allowed_on_batch(last_batch_fully_acked) &&
+			gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
 			messages_control.status==FREE &&
 			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
 			!frame_ceiling_blocked &&
@@ -4490,10 +4541,25 @@ void cl_arq_controller::finalize_block_commander()
 	// Success rate: use batch-level metric for pattern ACK (all-or-nothing ACK).
 	// Frame-level nReSent/nSent is poisoned by ACK-loss retransmissions that aren't
 	// real OFDM failures. Batch-level = % of batches that got ACKed.
+	//
+	// success_rate_data counts BOTH clean and partial-SACK-recovered batches
+	// (nBatches_acked) — UNCHANGED. It drives the DOWN-shift trigger / reset
+	// (:4667/:4736 + axis1 twin) and all [GEARSHIFT] logging; a partial SACK is a
+	// genuine delivery for those, so its semantics must not change.
+	//
+	// CLEAN-BATCH VIABILITY (§9): the UP-promotion gate uses a SEPARATE clean-only
+	// rate (success_rate_data_clean, from nBatches_fully_acked). A partial-only run
+	// at a marginal rung would otherwise read success_rate_data=100% (every batch
+	// "acked" via a partial SACK) and clear the 85% LADDER-UP gate, climbing into a
+	// config that can't pass full data. The clean rate makes such a run read ~0% so
+	// the up-gate holds, WITHOUT perturbing the down-shift/logging path. See §9.
 	if(ack_pattern_time_ms > 0 && last_transmission_block_stats.nBatches_sent > 0)
 	{
 		last_transmission_block_stats.success_rate_data = 100.0 *
 			last_transmission_block_stats.nBatches_acked /
+			last_transmission_block_stats.nBatches_sent;
+		success_rate_data_clean = 100.0 *
+			last_transmission_block_stats.nBatches_fully_acked /
 			last_transmission_block_stats.nBatches_sent;
 	}
 	else if(last_transmission_block_stats.nSent_data > 0)
@@ -4501,9 +4567,15 @@ void cl_arq_controller::finalize_block_commander()
 		last_transmission_block_stats.success_rate_data=100*(1-((float)last_transmission_block_stats.nReSent_data/(float)last_transmission_block_stats.nSent_data));
 		if(last_transmission_block_stats.success_rate_data < 0)
 			last_transmission_block_stats.success_rate_data = 0;
+		// CLEAN-BATCH VIABILITY (§9): non-pattern-ACK (frame-level) path has no
+		// batch clean/partial distinction — the clean rate tracks the same metric.
+		success_rate_data_clean = last_transmission_block_stats.success_rate_data;
 	}
 	else
+	{
 		last_transmission_block_stats.success_rate_data=100;
+		success_rate_data_clean = 100.0;  // CLEAN-BATCH VIABILITY (§9) — no data sent
+	}
 
 	// 2D channel-state observability — see fact-doc channel-state-2d-lookup.md §8 Step 2.
 	// Step 5: when --channel-lookup loaded a table, also emit a [CHANNEL-LOOKUP]
@@ -4549,6 +4621,7 @@ void cl_arq_controller::finalize_block_commander()
 	last_transmission_block_stats.nSent_data=0;
 	last_transmission_block_stats.nBatches_sent=0;
 	last_transmission_block_stats.nBatches_acked=0;
+	last_transmission_block_stats.nBatches_fully_acked=0;  // CLEAN-BATCH VIABILITY (§9)
 	std::string str="BUFFER ";
 	str+=std::to_string(fifo_buffer_tx.get_size()-fifo_buffer_tx.get_free_size());
 	str+='\r';
@@ -4608,7 +4681,10 @@ void cl_arq_controller::finalize_block_commander()
 			// Handoff: above the lowest calibrated Q-table cell, gearshift's
 			// LADDER UP must yield to the optimizer (which suggests targets
 			// via opt_pending_switch_cfg). Downward moves remain available.
-			if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage
+			// CLEAN-BATCH VIABILITY (§9): the UP gate uses the CLEAN-only rate so a
+			// partial-only run (success_rate_data may read 100% from SACK recoveries)
+			// does NOT clear the 85% threshold and climb into a non-viable config.
+			if(success_rate_data_clean>gear_shift_up_success_rate_precentage
 				&& gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total
 				&& !optimizer_is_in_control())
 			{
@@ -4762,7 +4838,9 @@ void cl_arq_controller::policy_evaluate_axis1()
 
 	// Handoff: above the lowest calibrated Q-table cell, gearshift's
 	// LADDER UP must yield to the optimizer. See optimizer_is_in_control().
-	if(last_transmission_block_stats.success_rate_data>gear_shift_up_success_rate_precentage
+	// CLEAN-BATCH VIABILITY (§9): UP gate uses the CLEAN-only rate (see the legacy
+	// ladder twin in finalize_block_commander) so partial-only runs don't promote.
+	if(success_rate_data_clean>gear_shift_up_success_rate_precentage
 		&& gear_shift_blocked_for_nBlocks>= gear_shift_block_for_nBlocks_total
 		&& !optimizer_is_in_control())
 	{
@@ -5530,6 +5608,8 @@ void cl_arq_controller::test_fire_policy_axis1(int direction)
 	{
 		// LADDER UP synthetic: 100% success, block-counter at threshold.
 		last_transmission_block_stats.success_rate_data = 100.0f;
+		// CLEAN-BATCH VIABILITY (§9): the UP gate now reads the clean rate — prime it.
+		success_rate_data_clean = 100.0;
 		gear_shift_blocked_for_nBlocks = gear_shift_block_for_nBlocks_total;
 		gear_shift_down_consecutive_fails = 0;
 		printf("[TEST-AXIS1-FIRE] direction=up: success_rate=100%%, "
@@ -5542,6 +5622,7 @@ void cl_arq_controller::test_fire_policy_axis1(int direction)
 		// LADDER DOWN synthetic: 0% success, consecutive_fails primed to
 		// (threshold - 1) — the wrapper increments then compares against 3.
 		last_transmission_block_stats.success_rate_data = 0.0f;
+		success_rate_data_clean = 0.0;  // CLEAN-BATCH VIABILITY (§9) — keep consistent
 		gear_shift_blocked_for_nBlocks = 0;
 		gear_shift_down_consecutive_fails = 2;  // wrapper bumps to 3 → triggers move
 		printf("[TEST-AXIS1-FIRE] direction=down: success_rate=0%%, "
@@ -5616,6 +5697,9 @@ int cl_arq_controller::test_data_anchored_promote()
 	gear_shift_algorithm = SUCCESS_BASED_LADDER;
 	// Prime the LADDER-UP precondition: 100% success, block-counter at threshold.
 	last_transmission_block_stats.success_rate_data = 100.0f;
+	// CLEAN-BATCH VIABILITY (§9): the UP gate now reads the clean rate — prime it so
+	// this Option-B anchor-gate test still exercises the promote path.
+	success_rate_data_clean = 100.0;
 	gear_shift_down_consecutive_fails = 0;
 	messages_control.status = FREE;
 
@@ -5773,6 +5857,179 @@ int cl_arq_controller::test_phantom_ack_gate()
 	breaks_since_last_data_success = 0;            // restore
 
 	printf("[TEST-PHANTOM-ACK] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// CLEAN-BATCH VIABILITY synthetic-fire test (CLI --test-clean-batch-viability).
+// Captures the deep-SNR-cliff disease (gearshift-start-and-recovery.md §9): a
+// GENUINE, CRC-valid PARTIAL-bitmap SACK at a marginal rung was laundered into
+// "this rung is data-viable" and promoted it via FOUR consumers — anchor-raise
+// (:3437), panic reset (:3430), break_drop_step reset (:3429), FRAME-UP counter
+// (:3505) — plus the up-promotion success-rate (:4546). A partial SACK keeps the
+// link ALIVE (retransmit of the missing frames is unchanged) but must NOT promote.
+//
+// The fix: each promotion consumer is gated on promotion_allowed_on_batch(
+// last_batch_fully_acked), TRUE only on a CLEAN all-ones batch. This test drives
+// that PURE predicate AND replays the EXACT gated consumer logic for a partial vs
+// a clean batch. The PARTIAL cell MUST NOT promote — the assertions that FAIL on
+// the pre-fix code (force promotion_allowed_on_batch to `return true` → partial
+// treated as clean) and PASS after the gate.
+//
+// Part A: partial batch (last_batch_fully_acked=false) — NO consumer fires.
+// Part B: clean batch  (last_batch_fully_acked=true)  — ALL consumers fire.
+// Part C: after a partial-only run the BREAK panic counter can still latch and
+//         reach ROBUST_0 (the safety net the partial previously defeated).
+// Returns 0 on pass, 1 on fail. Default builds never call this.
+int cl_arq_controller::test_clean_batch_viability()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-CLEAN-BATCH] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-CLEAN-BATCH] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Common priming: -R gearshift session at a MARGINAL rung (CONFIG_0) with the
+	// data-viable anchor still at the floor (ROBUST_0) — i.e. CONFIG_0 has never
+	// carried a full batch. This is the WGN:-10 cliff state.
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	current_configuration = CONFIG_0;
+
+	// ---- Part 0: pure predicate ----
+	check(promotion_allowed_on_batch(false) == false,
+		"P0a partial batch NOT promotion-eligible",
+		promotion_allowed_on_batch(false) ? 1 : 0, 0);
+	check(promotion_allowed_on_batch(true) == true,
+		"P0b clean batch IS promotion-eligible",
+		promotion_allowed_on_batch(true) ? 1 : 0, 1);
+
+	// Helper that replays the EXACT gated consumer logic from the data-success
+	// branch (arq_commander.cc:3411 else) + the FRAME-UP gate (:3498) + the
+	// up-promotion success-rate (:4546), for a batch whose clean/partial state is
+	// `fully_acked`. Mutates the real member state so the assertions read it back.
+	auto run_consumers = [&](bool fully_acked) {
+		last_batch_fully_acked = fully_acked;
+		// data_ack_received==YES on BOTH clean and partial (liveness) — unchanged.
+		data_ack_received = YES;
+		// emergency_nack_count resets UNGATED on any delivery (§9.7) — not asserted
+		// here (it's not a promotion consumer); set it so we can confirm it's left
+		// alone implicitly.
+		emergency_nack_count = 0;
+		// --- consumers 1, 2a, 2b (the :3411-else gate) ---
+		if(promotion_allowed_on_batch(last_batch_fully_acked))
+		{
+			break_drop_step = 2;
+			breaks_since_last_data_success = 0;
+			if(config_ladder_index(current_configuration) >
+			   config_ladder_index(last_data_viable_config))
+				last_data_viable_config = current_configuration;
+		}
+		// --- consumer 3 (FRAME-UP counter) ---
+		// Mirror the :3498 gate (only the clean predicate matters for this test;
+		// the other terms are held true by priming below).
+		if(data_ack_received==YES && promotion_allowed_on_batch(last_batch_fully_acked))
+			consecutive_data_acks++;
+		// --- consumer 4 (up-promotion success rate) ---
+		// One batch sent. nBatches_acked is bumped on BOTH partial and clean (its
+		// existing meaning, :2821/:2953/:3055/:3080) — feeds the UNCHANGED
+		// success_rate_data (down-shift/logging). nBatches_fully_acked is bumped ONLY
+		// when the batch is promotion-eligible (clean) — exactly the production
+		// clean-producer set (:2953/:3055/:3080) vs the partial path (:2821 leaves it)
+		// — feeds success_rate_data_clean, which the UP gate reads (:4684/:4841).
+		// Routing the bump through promotion_allowed_on_batch() ties this assertion to
+		// the SAME predicate the other consumers gate on, so forcing the predicate to
+		// the pre-fix always-true behavior makes the partial batch count toward the
+		// clean rate (→ 100%, A5 FAILS) — the genuine fail-before/pass-after for c4.
+		last_transmission_block_stats.nBatches_sent = 1;
+		last_transmission_block_stats.nBatches_acked = 1;   // partial OR clean both ack
+		last_transmission_block_stats.nBatches_fully_acked =
+			promotion_allowed_on_batch(last_batch_fully_acked) ? 1 : 0;
+		// success_rate_data (unchanged semantics) reads ~100% on partial too —
+		// confirms we did NOT break the down-shift/logging signal.
+		last_transmission_block_stats.success_rate_data = 100.0f *
+			last_transmission_block_stats.nBatches_acked /
+			last_transmission_block_stats.nBatches_sent;
+		// success_rate_data_clean (the UP-gate input) — production formula
+		// (arq_commander.cc:4555-4557), numerator = nBatches_fully_acked.
+		success_rate_data_clean = 100.0 *
+			last_transmission_block_stats.nBatches_fully_acked /
+			last_transmission_block_stats.nBatches_sent;
+	};
+
+	// ---- Part A: PARTIAL batch — NO promotion ----
+	last_data_viable_config = ROBUST_0;
+	breaks_since_last_data_success = 1;     // one prior BREAK pending; partial must NOT clear it
+	break_drop_step = 8;                    // mid-descent aggression; partial must NOT reset to 2
+	consecutive_data_acks = 1;              // one prior clean climb step; partial must NOT advance it
+	run_consumers(/*fully_acked=*/false);
+	check(last_data_viable_config == ROBUST_0,
+		"A1 partial does NOT raise last_data_viable_config",
+		last_data_viable_config, ROBUST_0);
+	check(breaks_since_last_data_success == 1,
+		"A2 partial does NOT reset BREAK panic counter",
+		breaks_since_last_data_success, 1);
+	check(break_drop_step == 8,
+		"A3 partial does NOT reset break_drop_step aggression",
+		break_drop_step, 8);
+	check(consecutive_data_acks == 1,
+		"A4 partial does NOT advance FRAME-UP counter",
+		consecutive_data_acks, 1);
+	check((int)success_rate_data_clean == 0,
+		"A5 partial-only UP-gate success rate is 0% (does NOT clear 85% gate)",
+		(int)success_rate_data_clean, 0);
+	// The UNCHANGED down-shift/logging signal still reads the partial as a delivery
+	// (100%) — confirms §9 did NOT perturb the down-shift path / logging.
+	check((int)last_transmission_block_stats.success_rate_data == 100,
+		"A6 partial DOWN-shift/log success rate UNCHANGED at 100% (delivery counted)",
+		(int)last_transmission_block_stats.success_rate_data, 100);
+
+	// ---- Part B: CLEAN batch — promotion fires ----
+	last_data_viable_config = ROBUST_0;
+	breaks_since_last_data_success = 1;
+	break_drop_step = 8;
+	consecutive_data_acks = 1;
+	run_consumers(/*fully_acked=*/true);
+	check(last_data_viable_config == CONFIG_0,
+		"B1 clean DOES raise last_data_viable_config to current rung",
+		last_data_viable_config, CONFIG_0);
+	check(breaks_since_last_data_success == 0,
+		"B2 clean DOES reset BREAK panic counter",
+		breaks_since_last_data_success, 0);
+	check(break_drop_step == 2,
+		"B3 clean DOES reset break_drop_step to initial aggression",
+		break_drop_step, 2);
+	check(consecutive_data_acks == 2,
+		"B4 clean DOES advance FRAME-UP counter",
+		consecutive_data_acks, 2);
+	check((int)success_rate_data_clean == 100,
+		"B5 clean UP-gate success rate is 100%",
+		(int)success_rate_data_clean, 100);
+
+	// ---- Part C: after a partial-only run, BREAK panic can still reach ROBUST_0 ----
+	// Anchor stuck at ROBUST_0 (no clean batch above it). Two real BREAKs with no
+	// CLEAN data success between push breaks_since_last_data_success to the panic
+	// threshold (>=2) — which it could NOT reach if a partial had reset it (Part A).
+	// break_target_with_anchor() must then BYPASS the anchor floor and reach ROBUST_0.
+	last_data_viable_config = ROBUST_0;
+	breaks_since_last_data_success = 2;            // partials never reset it (Part A)
+	emergency_previous_config = ROBUST_2;
+	break_drop_step = 100;                         // config_ladder_down_n → ROBUST_0
+	int raw_target = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
+	int got_target = break_target_with_anchor(raw_target);
+	check(raw_target == ROBUST_0, "C1 precondition: raw BREAK target is ROBUST_0",
+		raw_target, ROBUST_0);
+	check(got_target == ROBUST_0, "C2 BREAK reaches ROBUST_0 under panic (partial-only run)",
+		got_target, ROBUST_0);
+	breaks_since_last_data_success = 0;            // restore
+
+	printf("[TEST-CLEAN-BATCH] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

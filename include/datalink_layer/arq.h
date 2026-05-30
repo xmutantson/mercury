@@ -264,7 +264,14 @@ struct st_stats
 	  int nAcks_sent_data;
 	  int nNAcked_data;
 	  int nBatches_sent;      // total data batches transmitted
-	  int nBatches_acked;     // data batches that received ACK
+	  int nBatches_acked;     // data batches that received ACK (clean OR partial)
+	  int nBatches_fully_acked; // CLEAN-BATCH VIABILITY (§9): batches confirmed
+	                            // FULLY delivered (all-ones bitmap) — the only
+	                            // signal that may drive up-promotion. A partial
+	                            // SACK bumps nBatches_acked but NOT this. The
+	                            // LADDER-UP success_rate_data is computed from
+	                            // this counter so a partial-only run reads 0%, not
+	                            // 100%. See gearshift-start-and-recovery.md §9.
 
 	  int nSent_control;
 	  int nAcked_control;
@@ -602,6 +609,27 @@ public:
   // ROBUST_0. Returns 0 on pass, 1 on fail. Default builds never call this.
   // See fact-documents/gearshift-start-and-recovery.md §8.
   int test_phantom_ack_gate();
+
+  // CLEAN-BATCH VIABILITY (§9, 2026-05-29) — PURE policy predicate. A batch may
+  // drive the four gearshift promotion consumers (anchor-raise, panic reset,
+  // break_drop_step reset, FRAME-UP) ONLY if it was confirmed FULLY delivered
+  // (all-ones bitmap). A PARTIAL SACK keeps the link alive (retransmit of the
+  // missing frames is UNCHANGED) but must NOT promote the rung — otherwise a
+  // single CRC-valid partial at a marginal config pins the BREAK floor there and
+  // the link oscillates at the deep-SNR cliff (CONFIG_0 ↔ ROBUST_0). This is the
+  // predicate the consumers gate on and the unit test drives. See §9.
+  bool promotion_allowed_on_batch(bool batch_fully_acked) const
+  { return batch_fully_acked; }
+
+  // CLEAN-BATCH VIABILITY synthetic-fire test (CLI --test-clean-batch-viability).
+  // Drives the PURE promotion predicate AND the real gearshift consumer logic:
+  // asserts a PARTIAL batch does NOT raise last_data_viable_config, does NOT reset
+  // breaks_since_last_data_success, does NOT advance the FRAME-UP counter, and
+  // reads 0% up-promotion success (nBatches_fully_acked/nBatches_sent); a CLEAN
+  // batch does all of those; and that after a partial-only run BREAK can still
+  // reach ROBUST_0 (panic latches). Returns 0 on pass, 1 on fail. Default builds
+  // never call this. See gearshift-start-and-recovery.md §9.8.
+  int test_clean_batch_viability();
 
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
@@ -1307,6 +1335,15 @@ public:
   int gear_shift_block_for_nBlocks_total;
   int gear_shift_blocked_for_nBlocks;
   int gear_shift_down_consecutive_fails;  // Consecutive bad blocks before downshift
+  // CLEAN-BATCH VIABILITY (§9): the UP-promotion success rate, computed from
+  // nBatches_fully_acked (CLEAN, all-ones batches) — distinct from
+  // last_transmission_block_stats.success_rate_data (nBatches_acked, counts
+  // partial-SACK recoveries too). The two LADDER-UP gates read THIS so a
+  // partial-only run reads ~0% and does NOT climb; the DOWN-shift trigger /
+  // logging keep reading success_rate_data (partial is a real delivery there).
+  // Recomputed every finalize_block_commander() alongside success_rate_data.
+  // See fact-documents/gearshift-start-and-recovery.md §9.
+  double success_rate_data_clean;
   int consecutive_data_acks;       // Frame-level gearshift: consecutive successful data ACKs
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
@@ -1331,6 +1368,16 @@ public:
   // no upward move may exceed index+1 unless optimizer_is_in_control(). A FAILED
   // probe never raises it. See fact-documents/gearshift-start-and-recovery.md §6/§7.
   int last_data_viable_config;
+  // CLEAN-BATCH VIABILITY (§9, 2026-05-29): TRUE iff the batch that set
+  // data_ack_received=YES this epoch was confirmed FULLY delivered (all-ones
+  // bitmap clean ACK / LDPC ACK_RANGE/ACK_MULTI). FALSE on a PARTIAL SACK (which
+  // still keeps the link alive + drives retransmit, but must NOT promote the
+  // rung). Same lifecycle as data_ack_received: reset FALSE at each batch-TX
+  // start (arq_commander.cc:1244/1739), ctor, and reset_session_state; set TRUE
+  // ONLY at the clean acceptance sites (:2935 ACK_PAT, :3032 ACK_RANGE, :3052
+  // ACK_MULTI). Gates the four promotion consumers (anchor-raise :3394, panic
+  // reset :3387, break_drop_step :3386, FRAME-UP :3454). See §9.
+  bool last_batch_fully_acked;
   bool skip_turbo_reverse;         // CLI --skip-turbo-reverse: skip TURBO_REVERSE phase
   int max_config_override;         // CLI --max-config: hard ceiling on turboshift (-1 = use default)
   bool optimizer_disabled;         // CLI --no-optimizer: disable Phase 3c effective-rate optimizer (calibration runs)

@@ -105,6 +105,7 @@ cl_arq_controller::cl_arq_controller()
 	stats.nAcks_sent_data=0;
 	stats.nBatches_sent=0;
 	stats.nBatches_acked=0;
+	stats.nBatches_fully_acked=0;  // CLEAN-BATCH VIABILITY (§9)
 	stats.nNAcked_data=0;
 
 	stats.nSent_control=0;
@@ -125,6 +126,7 @@ cl_arq_controller::cl_arq_controller()
 	last_transmission_block_stats.nAcks_sent_data=0;
 	last_transmission_block_stats.nBatches_sent=0;
 	last_transmission_block_stats.nBatches_acked=0;
+	last_transmission_block_stats.nBatches_fully_acked=0;  // CLEAN-BATCH VIABILITY (§9)
 	last_transmission_block_stats.nNAcked_data=0;
 
 	last_transmission_block_stats.nSent_control=0;
@@ -330,6 +332,7 @@ cl_arq_controller::cl_arq_controller()
 	gear_shift_block_for_nBlocks_total=5;
 	gear_shift_blocked_for_nBlocks=0;
 	gear_shift_down_consecutive_fails=0;
+	success_rate_data_clean=100.0;  // CLEAN-BATCH VIABILITY (§9) — neutral until first block
 	consecutive_data_acks=0;
 	frame_shift_threshold=3;
 	frame_gearshift_just_applied=false;
@@ -347,6 +350,9 @@ cl_arq_controller::cl_arq_controller()
 	// per-session value is set in reset_session_state once init_configuration
 	// reflects the requested start mode (ROBUST_0 for -R gearshift sessions).
 	last_data_viable_config=init_configuration;
+	// CLEAN-BATCH VIABILITY (§9): no batch delivered yet — promotion-gating flag
+	// starts FALSE. Re-set per batch at TX start (arq_commander.cc:1244/1739).
+	last_batch_fully_acked=false;
 	skip_turbo_reverse=false;
 	max_config_override=-1;
 	optimizer_disabled=false;
@@ -2945,8 +2951,10 @@ void cl_arq_controller::reset_session_state()
 	// Data exchange
 	block_under_tx = NO;
 	consecutive_data_acks = 0;
+	success_rate_data_clean = 100.0;  // CLEAN-BATCH VIABILITY (§9) — neutral per session
 	frame_gearshift_just_applied = false;
 	data_ack_received = NO;
+	last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — clear per session
 	repeating_last_ack = NO;
 
 	// Message tracking
