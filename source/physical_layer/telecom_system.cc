@@ -2585,8 +2585,18 @@ skip_h_retry_point:
 					for(int bi = 0; bi < nBps; bi++)
 					{
 						float llr = data_container.demodulated_data[si * nBps + bi] * w;
-						if(llr > 40.0f) llr = 40.0f;
-						else if(llr < -40.0f) llr = -40.0f;
+						// Q1 (qtable-Q2, 2026-05-30): revert E3 (commit 0d70ad6) ±40 → ±20.
+						// E3 raised the clip on the hypothesis that post-E1 the ±20 clip
+						// became binding near the cliff. Local AWGN profiling of CONFIG_16
+						// (Es/N0 +8..+13.5, 60 frames/pt) shows the post-CSI-weighted LLR is
+						// NOT clip-binding here: clip=20 vs clip=40 give bit-identical /
+						// within-Monte-Carlo-noise BER across the whole cliff, and the
+						// cross-pilot σ²ₙ (A.1.4, commit 9c3fc40) already keeps BP converging
+						// in 0–2 iterations at clean (no over-confidence to soften). Reverting
+						// to the long-standing pre-E3 ±20 removes a speculative, never-measured
+						// constant. See fact-documents/data-flow-noise_variance_estimate.md §5–§7.
+						if(llr > 20.0f) llr = 20.0f;
+						else if(llr < -20.0f) llr = -20.0f;
 						data_container.demodulated_data[si * nBps + bi] = llr;
 					}
 				}
