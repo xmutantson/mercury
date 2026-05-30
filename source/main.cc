@@ -2034,7 +2034,13 @@ start_modem:
                 robust_mode = 1;
         }
 #endif
-        // CLI gearshift with no explicit -s: default to ROBUST_0 and enable robust mode
+        // CLI/headless gearshift with no explicit -s: default to ROBUST_0 and enable
+        // robust mode. GUI builds intentionally do NOT force ROBUST_0 here — the GUI
+        // block above sets mod_config from g_settings.initial_config so GUI users can
+        // configure their own start config. That INI default is ROBUST_0
+        // (ini_parser.cc) so a GUI user who hasn't changed it still starts at the
+        // floor. Do NOT remove the #ifndef — it is the GUI-configurability seam.
+        // See fact-documents/gearshift-start-and-recovery.md §2 Bug 1.
         if(gear_shift_mode != NO_GEAR_SHIFT && !explicit_config)
         {
 #ifndef MERCURY_GUI_ENABLED

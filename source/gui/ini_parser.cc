@@ -4,6 +4,7 @@
  */
 
 #include "gui/ini_parser.h"
+#include "common/common_defines.h"   // ROBUST_0 (Gear Shift InitialConfig default)
 #include <cmath>     // std::nan, std::isnan (tx_gain_override, plan §7.13.21)
 #include <fstream>
 #include <sstream>
@@ -212,7 +213,10 @@ void MercurySettings::setDefaults() {
 
     // Gear Shift
     gear_shift_enabled = false;
-    initial_config = 1;
+    initial_config = ROBUST_0;   // start at the floor; gearshift probes up from here.
+                                 // GUI-configurable — user can raise it for fixed-config
+                                 // / known-good channels. (Was CONFIG_1; see
+                                 // fact-documents/gearshift-start-and-recovery.md §2 Bug 1.)
     ldpc_iterations_max = 50;
 
     // OFDM

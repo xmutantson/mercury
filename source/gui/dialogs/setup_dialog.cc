@@ -67,7 +67,7 @@ SetupDialog::SetupDialog()
     , pilot_tone_ms_(0)
     , pilot_tone_hz_(250)
     , gear_shift_enabled_(true)
-    , initial_config_(4)
+    , initial_config_(ROBUST_0)   // overwritten from g_settings on open; kept consistent with the INI default
     , ldpc_iterations_max_(50)
     , coarse_freq_sync_enabled_(false)
     , robust_mode_enabled_(false)
