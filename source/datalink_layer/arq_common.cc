@@ -341,7 +341,12 @@ cl_arq_controller::cl_arq_controller()
 	turboshift_initiator=false;
 	turboshift_retries=1;
 	turbo_settle_pending=false;
+	turbo_supershift_announce_pending=false;
 	supershift_proven_ceiling=-1;
+	// Option B (data-anchored promotion): see arq.h. Ctor default; the real
+	// per-session value is set in reset_session_state once init_configuration
+	// reflects the requested start mode (ROBUST_0 for -R gearshift sessions).
+	last_data_viable_config=init_configuration;
 	skip_turbo_reverse=false;
 	max_config_override=-1;
 	optimizer_disabled=false;
@@ -1944,6 +1949,7 @@ void cl_arq_controller::update_status()
 			turboshift_phase = TURBO_DONE;
 			turboshift_last_good = -1;
 			turbo_settle_pending = false;
+			turbo_supershift_announce_pending = false;
 			supershift_proven_ceiling = -1;
 			turbo_snr_ack_enabled = false;
 			turbo_received_snr = -99.0f;
@@ -2892,6 +2898,10 @@ void cl_arq_controller::reset_session_state()
 	turboshift_initiator = false;
 	turboshift_retries = 1;
 	supershift_proven_ceiling = -1;
+	// Option B (data-anchored promotion): reset to the session start config.
+	// Nothing has carried data yet, so BREAK floors at and probes climb one rung
+	// above init_configuration (= ROBUST_0 for -R gearshift). See arq.h / §6.
+	last_data_viable_config = init_configuration;
 	turbo_snr_ack_enabled = false;
 	turbo_received_snr = -99.0f;
 	turbo_switch_role_retries = 0;

@@ -326,6 +326,17 @@ int main(int argc, char *argv[])
                                         // 'mfsk' should FAIL on HEAD (used_mfsk_path=true bypasses send_sack_v2_frame's Step 8a bump).
                                         // 'ofdm' should PASS on HEAD (regression guard for the existing OFDM SACK_RSP path).
                                         // One-shot at startup, then exit. See fact-documents/sack_partial_bsi_advance.md §5.
+    bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
+                                        // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
+                                        // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
+                                        // up-shifter promotes only one rung past it. One-shot, exits rc. See
+                                        // fact-documents/gearshift-start-and-recovery.md §6.4.
+    bool test_phantom_ack_gate_cli = false; // --test-phantom-ack-gate: phantom-ACK content-gate regression.
+                                        // Drives data_ack_bare_pattern_acceptable() across WB/NB x CRC-valid/CRC-absent
+                                        // (the WB-no-CRC phantom cell must be REJECTED) + asserts a rejected phantom leaves
+                                        // data_ack_received NO, does not raise last_data_viable_config / reset the BREAK
+                                        // panic counter, and BREAK still reaches ROBUST_0. One-shot, exits rc. See
+                                        // fact-documents/gearshift-start-and-recovery.md §8.
     int test_policy_axis1_then_axis2_cli = 0; // --test-policy-axis1-then-axis2=up|down: SACK Design A Step 10 — fire Axis-1
                                         // (engages axis2_cooldown_batches=3) then attempt Axis-2 fire (should be SUPPRESSED).
                                         // 1=axis1=up then axis2=up; 2=axis1=down then axis2=down. One-shot at startup, then exit.
@@ -714,6 +725,24 @@ int main(int argc, char *argv[])
             if (strcmp(arg, "mfsk") == 0 || strcmp(arg, "ofdm") == 0)
                 test_partial_bsi_advance_cli = arg;
             else { fprintf(stderr, "--test-partial-bsi-advance: expected 'mfsk' or 'ofdm'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-data-anchored-promote") == 0)
+        {
+            // Option B (data-anchored gearshift promotion) regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/gearshift-start-and-recovery.md §6.4.
+            test_data_anchored_promote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-phantom-ack-gate") == 0)
+        {
+            // Phantom-ACK content-gate regression — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/gearshift-start-and-recovery.md §8.
+            test_phantom_ack_gate_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1660,6 +1689,31 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_partial_bsi_advance(test_partial_bsi_advance_cli);
             printf("[FLAG] Partial-bsi-advance test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_data_anchored_promote_cli) {
+            // Option B (data-anchored gearshift promotion) regression (one-shot,
+            // then exit rc). Drives break_target_with_anchor() + the real
+            // policy_evaluate_axis1() up-shifter with last_data_viable_config
+            // primed. See fact-documents/gearshift-start-and-recovery.md §6.4.
+            printf("[FLAG] --test-data-anchored-promote: invoking Option B "
+                   "promotion/recovery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_data_anchored_promote();
+            printf("[FLAG] Data-anchored-promote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_phantom_ack_gate_cli) {
+            // Phantom-ACK content-gate regression (one-shot, then exit rc).
+            // Drives the pure acceptance policy + the cross-layer anchor/panic/
+            // BREAK invariant. See fact-documents/gearshift-start-and-recovery.md §8.
+            printf("[FLAG] --test-phantom-ack-gate: invoking phantom-ACK "
+                   "content-gate regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_phantom_ack_gate();
+            printf("[FLAG] Phantom-ack-gate test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

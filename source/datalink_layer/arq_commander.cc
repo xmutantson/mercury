@@ -57,6 +57,102 @@ void cl_arq_controller::register_ack(int message_id)
 	}
 }
 
+// Phantom-ACK content gate — DSP half (2026-05-29). Peek the current passband
+// tail for a CRC12-valid, in-window, CLEAN-batch (all-ones bitmap) MFSK ACK+SACK
+// suffix. This is the CONTENT discriminator the bare-pattern data-ACK arm needs:
+// a real WB clean data ACK carries this suffix; the phantom (structured noise /
+// rx-tail self-match that passes receive_ack_pattern()'s bare matched/metric
+// gate) does NOT. Read-only peek — does NOT touch frames_to_read (mirrors the
+// §7.13.30 no-side-effect peek at the v2 MFSK pre-detect, ~line 2370). Window
+// math + decode + CRC12 + bsi-in-window + all-ones checks mirror that block
+// (~lines 2351-2433) exactly. Returns false on NB / suffix-incapable
+// (ack_sack_suffix_len()==0), no decode, CRC mismatch, out-of-window bsi, or a
+// non-clean (partial) bitmap. See fact-documents/gearshift-start-and-recovery.md §8.
+bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
+{
+#if MFSK_ACK_SACK_ENABLED
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return false;  // NB / suffix-incapable: no suffix to validate.
+
+	// Tail window — identical math to the v2 MFSK pre-detect (arq_commander.cc
+	// ~2351-2364). Suffix capture needs the longer of SNR vs SACK suffix tail.
+	int ack_nsymb   = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int pattern_len = telecom_system->ack_mfsk.ack_snr_pattern_nsymb();
+	int sack_suffix_len = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	if(sack_suffix_len > pattern_len - ack_nsymb)
+		pattern_len = ack_nsymb + sack_suffix_len;
+	const int mfsk_tail_nsymb = ack_nsymb + pattern_len + 16;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = mfsk_tail_nsymb * sym_samples;
+	if(tail_samples > signal_period)
+		tail_samples = signal_period;
+	int tail_offset = signal_period - tail_samples;
+
+	// Read-only snapshot of the tail (no frames_to_read mutation).
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi_mfsk = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi_mfsk + tail_offset],
+		tail_samples * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+
+	uint8_t  rx_bsi = 0;
+	uint32_t rx_bitmap = 0;
+	uint16_t rx_crc12 = 0;
+	int      mfsk_matched = 0;
+	bool decoded = telecom_system->decode_ack_sack_from_passband(
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+	if(!decoded)
+		return false;
+
+	// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
+	char crc_input[5];
+	crc_input[0] = (char)rx_bsi;
+	crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
+	crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
+	crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
+	crc_input[4] = (char)( rx_bitmap        & 0xFF);
+	if(rx_crc12 != CRC12_calc(crc_input, 5))
+		return false;
+
+	// Sanity: bsi must be the current or just-prior batch (mod 256) — RSP only
+	// ACKs frames whose batch_seq_id matches one of those.
+	unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+	if(!((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi))
+		return false;
+
+	// CLEAN-batch only: this arm accepts full-batch ACKs (all-ones bitmap). A
+	// partial bitmap belongs to the SACK_RSP path, which runs inside the SACK
+	// window (not this bare arm); reject it here so it is not mis-accepted.
+	uint32_t all_ones = (data_batch_size >= 32)
+		? 0xFFFFFFFFu
+		: ((1u << data_batch_size) - 1u);
+	return rx_bitmap == all_ones;
+#else
+	return false;
+#endif
+}
+
+// Option B (data-anchored gearshift promotion, 2026-05-29): floor a raw BREAK
+// recovery target at last_data_viable_config so BREAK never drops BELOW the
+// highest rung that has carried data this session. EXCEPTION: the panic-jump
+// (breaks_since_last_data_success >= 2 → break_drop_step forced large at
+// arq_commander.cc:3253) must still reach ROBUST_0, so the floor is bypassed
+// under panic and the raw target is returned unchanged.
+// See fact-documents/gearshift-start-and-recovery.md §6/§7.
+int cl_arq_controller::break_target_with_anchor(int raw_target) const
+{
+	if(breaks_since_last_data_success >= 2)
+		return raw_target;  // panic-jump safety net — let it reach ROBUST_0
+	if(config_ladder_index(raw_target) < config_ladder_index(last_data_viable_config))
+		return last_data_viable_config;
+	return raw_target;
+}
+
 
 void cl_arq_controller::process_messages_commander()
 {
@@ -78,7 +174,16 @@ void cl_arq_controller::process_messages_commander()
 				// Use ROBUST_0 as coordination layer, then probe target config.
 				// Phase 1: send SET_CONFIG at ROBUST_0 (guaranteed delivery).
 				// Phase 2: send SET_CONFIG at target to verify it works (2 tries).
-				int target = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
+				int raw_target = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
+				// Option B (data-anchored promotion): floor at last_data_viable_config
+				// (bypassed under panic). See break_target_with_anchor() / §6/§7.
+				int target = break_target_with_anchor(raw_target);
+				if(target != raw_target)
+				{
+					printf("[BREAK] Anchor floor: target %d below last_data_viable_config %d — clamping up to %d\n",
+						raw_target, last_data_viable_config, target);
+					fflush(stdout);
+				}
 				printf("[BREAK] ACK received! Dropping %d step(s): config %d -> %d (robust_enabled=%d)\n",
 					break_drop_step, emergency_previous_config, target, robust_enabled);
 				fflush(stdout);
@@ -167,7 +272,17 @@ void cl_arq_controller::process_messages_commander()
 				break_recovery_phase = 1;
 				break_recovery_retries = 2;
 
-				int target = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
+				int raw_target = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
+				// Option B (data-anchored promotion): same anchor floor as the
+				// ACK-received recovery site above — never undercut the highest
+				// data-viable rung, except under the panic-jump. See §6/§7.
+				int target = break_target_with_anchor(raw_target);
+				if(target != raw_target)
+				{
+					printf("[BREAK] Anchor floor (exhausted): target %d below last_data_viable_config %d — clamping up to %d\n",
+						raw_target, last_data_viable_config, target);
+					fflush(stdout);
+				}
 				printf("[BREAK] Dropping %d step(s): config %d -> %d\n",
 					break_drop_step, emergency_previous_config, target);
 				fflush(stdout);
@@ -1942,60 +2057,17 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				receiving_timer.stop();
 				receiving_timer.reset();
 
-				// Start turboshift in NB. Skip when already in the Q-table
-				// optimizer's band — the optimizer will pick the right config
-				// from current_configuration; no need to overshoot via SUPERSHIFT.
-				if(turboshift_active && gear_shift_on == YES &&
-					!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
-					!optimizer_is_in_control())
-				{
-					turboshift_initiator = true;
-					turboshift_phase = TURBO_FORWARD;
-					turboshift_last_good = current_configuration;
-					turbo_snr_ack_enabled = true;
-					turbo_received_snr = -99.0f;
-					turbo_best_snr = -99.0f;
-
-					int snr_target = -1;
-					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
-					{
-						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
-						if(snr_target > cfg_ceiling)
-							snr_target = cfg_ceiling;
-						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
-							snr_target = supershift_proven_ceiling;
-						if(max_config_override >= 0 && snr_target > max_config_override)
-							snr_target = max_config_override;
-						// Q-table handoff: turboshift stops where the optimizer takes over.
-						apply_optimizer_handoff_cap_to_target(&snr_target);
-					}
-
-					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
-					{
-						negotiated_configuration = snr_target;
-						printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d/%d)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling, max_config_override);
-					}
-					else
-					{
-						negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
-						printf("[TURBO] Phase: FORWARD — probing commander->responder (NB)\n");
-						printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n",
-							current_configuration, negotiated_configuration);
-					}
-					fflush(stdout);
-					cleanup();
-					add_message_control(SET_CONFIG);
-					connection_status = TRANSMITTING_CONTROL;
-				}
-				else
-				{
-					turboshift_active = false;
-					turboshift_phase = TURBO_DONE;
-					connection_status = TRANSMITTING_DATA;
-				}
+				// Option B (data-anchored promotion, 2026-05-29): the control-only
+				// SNR-SUPERSHIFT probe is removed. The peer rejected WB (nb_only),
+				// so we stay NB; start data at the current config (ROBUST_0 for -R
+				// gearshift) and let FRAME-UP climb rung-by-rung ONLY on confirmed
+				// data delivery. wb_upgrade_pending=false and the messages_control
+				// force-clear above already ran. See
+				// fact-documents/gearshift-start-and-recovery.md §6.
+				turboshift_active = false;
+				turbo_supershift_announce_pending = false;
+				turboshift_phase = TURBO_DONE;
+				connection_status = TRANSMITTING_DATA;
 				return;
 			}
 
@@ -2079,6 +2151,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				// the SNR-predicted start config (not just 1 step below ceiling).
 				// Dropping 1 step at a time wastes time probing configs that can't work.
 				turboshift_active = false;
+				turbo_supershift_announce_pending = false;
 				data_configuration = settle_config;
 				// Compute SNR-based target so BREAK drops far enough
 				int snr_target_config = -1;
@@ -2154,6 +2227,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					turbo_switch_role_retries = 0;
 					turboshift_phase = TURBO_DONE;
 					turboshift_active = false;
+					turbo_supershift_announce_pending = false;
 					turbo_snr_ack_enabled = false;
 					turbo_received_snr = -99.0f;
 
@@ -2804,17 +2878,49 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// successful first call).
 			// §7.13.29 — fallthrough MFSK ACK handler. Accept if either:
 			// (a) the strict MFSK-first probe (threshold 12) already
-			//     confirmed this poll, recorded via v2_ack_pat_pre_detected;
-			// (b) we're OUTSIDE the SACK window — receive_ack_pattern() at
-			//     default threshold 7 is fine for non-data ACK paths.
+			//     confirmed this poll, recorded via v2_ack_pat_pre_detected
+			//     (CRC-gated: set at ~line 2441 only after a CRC12-valid,
+			//     in-window, clean-batch suffix decode);
+			// (b) we're OUTSIDE the SACK window AND receive_ack_pattern()
+			//     matched the bare MFSK pattern.
 			// Inside the SACK window the lenient threshold is DELIBERATELY
 			// avoided: it false-fires on OFDM SACK_RSP body audio (the
 			// silent-drop bug). If strict missed but lenient would catch,
 			// we let timeout-driven retransmit handle it — better a retx
 			// than a silent drop.
+			//
+			// PHANTOM-ACK CONTENT GATE (2026-05-29). receive_ack_pattern()
+			// returns a BARE bool on pattern-match-only (matched/metric, NO
+			// CRC, NO content; arq_common.cc:5556). At deep SNR a structured-
+			// noise / rx-tail self-match faked a clean data ACK through this
+			// arm (matched=7, metric=0.66, on CONFIG_0, with NO RSP TX), set
+			// data_ack_received=YES, raised last_data_viable_config to CONFIG_0
+			// and reset breaks_since_last_data_success — defeating BREAK
+			// recovery (cascade_diag_wgn-10/...cmd.log:11507). The clean
+			// discriminator is CONTENT: a real WB data ACK carries a CRC12-valid
+			// MFSK suffix; the phantom does not. data_ack_bare_pattern_acceptable()
+			// requires a CRC-valid clean-batch suffix on CRC-capable (WB) sessions
+			// and lets NB / suffix-incapable sessions (RSP sends a bare ACK —
+			// arq_responder.cc:1679-1683) through unchanged. An earlier ENERGY
+			// floor (commit aecb561) was reverted as non-viable (real/phantom
+			// energy overlap); this is a CONTENT gate. The control-ACK detector
+			// (arq_commander.cc:1702) and the emergency-BREAK poll
+			// (arq_commander.cc:92) are NOT touched — control frames carry no
+			// suffix and keep bare-pattern behavior. See
+			// fact-documents/gearshift-start-and-recovery.md §2 Bug 3 + §8.
+			// NOTE on evaluation order: the content gate is the
+			// short-circuiting inline form of data_ack_bare_pattern_acceptable()
+			// (the PURE policy predicate the unit test drives):
+			//   suffix_capable ? crc_valid : true  ≡  !suffix_capable || crc_valid.
+			// Written inline with && / || so the DSP peek cmd_clean_data_ack_crc_valid()
+			// runs ONLY on WB (suffix-capable) AND only after a bare pattern match
+			// — NB never pays the FFT cost and its bare-pattern acceptance is byte-
+			// for-byte unchanged.
 			else if(data_ack_received==NO
 			        && (v2_ack_pat_pre_detected
-			            || (!sack_window_open && receive_ack_pattern())))
+			            || (!sack_window_open && receive_ack_pattern()
+			                && (telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0
+			                    || cmd_clean_data_ack_crc_valid()))))
 			{
 				printf("[CMD-ACK-PAT] Data ACK pattern detected!\n");
 				fflush(stdout);
@@ -3280,6 +3386,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			break_drop_step = 2;       // Reset to initial aggression (2 steps).
 			breaks_since_last_data_success = 0;  // panic-mode counter resets on
 			                                     // real data flow (see arq.h).
+			// Option B (data-anchored promotion): a DATA batch was confirmed
+			// delivered at this config. Record it as the highest data-viable
+			// rung — anchors BREAK recovery (arq_commander.cc:81) and the
+			// up-shifter gates. SOLE on-delivery producer. A failed probe never
+			// reaches here. See fact-documents/gearshift-start-and-recovery.md §6/§7.
+			if(config_ladder_index(current_configuration) >
+			   config_ladder_index(last_data_viable_config))
+				last_data_viable_config = current_configuration;
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
 			frame_gearshift_retry_count = 0;       // §7.13.33 reset
@@ -3319,6 +3433,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			bool frame_ceiling_blocked = (supershift_proven_ceiling >= 0 &&
 				config_ladder_index(proposed_frame) > config_ladder_index(supershift_proven_ceiling))
 				|| (max_config_override >= 0 && proposed_frame > max_config_override);
+			// Option B (data-anchored promotion): never leap more than +1 rung
+			// past the highest data-viable rung. The Q-table owns CONFIG_6+ and is
+			// exempt (optimizer_is_in_control()). Since FRAME-UP advances exactly
+			// one rung, this clamps it to last_data_viable_config+1 — it can probe
+			// the next rung but never skip ahead of unproven ground. See §6/§7.
+			if(!optimizer_is_in_control() &&
+			   config_ladder_index(proposed_frame) > config_ladder_index(last_data_viable_config) + 1)
+				frame_ceiling_blocked = true;
 		// Handoff: above the lowest calibrated Q-table cell, the optimizer
 		// is the sole authority for upward config changes. Gearshift's
 		// FRAME UP must yield. Downward moves (BREAK) remain available.
@@ -3369,6 +3491,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 void cl_arq_controller::finish_turbo_direction()
 {
 	turboshift_active = false;
+	turbo_supershift_announce_pending = false;
 	turbo_snr_ack_enabled = false;
 	// turbo_best_snr preserves the best SNR seen across ALL turbo probes,
 	// unlike turbo_received_snr which is reset after each probe step.
@@ -3752,55 +3875,19 @@ void cl_arq_controller::process_control_commander()
 					add_message_control(SWITCH_BANDWIDTH);
 					this->connection_status=TRANSMITTING_CONTROL;
 				}
-				// Turboshift: start probing instead of jumping to data. Skip
-				// when already in the Q-table optimizer's band (cfg ≥ handoff).
-				else if(turboshift_active && gear_shift_on==YES &&
-					!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
-					!optimizer_is_in_control())
-				{
-					turboshift_initiator = true;
-					turboshift_phase = TURBO_FORWARD;
-					turboshift_last_good = current_configuration;
-					turbo_snr_ack_enabled = true;
-					turbo_received_snr = -99.0f;
-					turbo_best_snr = -99.0f;
-
-					int snr_target = -1;
-					if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
-					{
-						snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
-						if(snr_target > cfg_ceiling)
-							snr_target = cfg_ceiling;
-						if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
-							snr_target = supershift_proven_ceiling;
-						if(max_config_override >= 0 && snr_target > max_config_override)
-							snr_target = max_config_override;
-						// Q-table handoff: turboshift stops where the optimizer takes over.
-						apply_optimizer_handoff_cap_to_target(&snr_target);
-					}
-
-					if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
-					{
-						negotiated_configuration = snr_target;
-						printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
-						printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d/%d)\n",
-							measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling, max_config_override);
-					}
-					else
-					{
-						negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
-						printf("[TURBO] Phase: FORWARD — probing commander->responder\n");
-						printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n", current_configuration, negotiated_configuration);
-					}
-					fflush(stdout);
-					cleanup();
-					add_message_control(SET_CONFIG);
-					this->connection_status=TRANSMITTING_CONTROL;
-				}
+				// Option B (data-anchored promotion, 2026-05-29): the control-only
+				// SNR-SUPERSHIFT probe is removed. Start data at the current config
+				// (ROBUST_0 for -R gearshift) and let FRAME-UP climb rung-by-rung
+				// ONLY on confirmed data delivery — control-ACK success no longer
+				// promotes (§3 disease). The BW-negotiation branches above (the
+				// `we_want_wb && currently_nb` SWITCH_BANDWIDTH path) still run
+				// first; this is the no-BW-upgrade fall-through. Reaching here means
+				// no SWITCH_BANDWIDTH was queued, so just begin data.
+				// See fact-documents/gearshift-start-and-recovery.md §6.
 				else
 				{
 					turboshift_active = false;
+					turbo_supershift_announce_pending = false;
 					turboshift_phase = TURBO_DONE;
 					this->connection_status=TRANSMITTING_DATA;
 				}
@@ -3946,58 +4033,16 @@ void cl_arq_controller::process_control_commander()
 			wb_upgrade_pending = false;
 			switch_narrowband_mode(NO);
 
-			// Start turboshift in WB. Skip when in Q-table optimizer band.
-			if(turboshift_active && gear_shift_on==YES &&
-				!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
-				!optimizer_is_in_control())
-			{
-				turboshift_initiator = true;
-				turboshift_phase = TURBO_FORWARD;
-				turboshift_last_good = current_configuration;
-				turbo_snr_ack_enabled = true;
-				turbo_received_snr = -99.0f;
-				turbo_best_snr = -99.0f;
-
-				int snr_target = -1;
-				if(is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
-				{
-					snr_target = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-					// Enforce bandwidth ceiling
-					int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
-					if(snr_target > cfg_ceiling)
-						snr_target = cfg_ceiling;
-					if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
-						snr_target = supershift_proven_ceiling;
-					if(max_config_override >= 0 && snr_target > max_config_override)
-						snr_target = max_config_override;
-					// Q-table handoff: turboshift stops where the optimizer takes over.
-					apply_optimizer_handoff_cap_to_target(&snr_target);
-				}
-
-				if(snr_target > 0 && config_ladder_index(snr_target) > config_ladder_index(current_configuration))
-				{
-					negotiated_configuration = snr_target;
-					printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
-					printf("[TURBO] SNR-SUPERSHIFT: SNR=%.1f dB -> config %d -> %d (direct, ceiling=%d/%d)\n",
-						measurements.SNR_uplink, current_configuration, negotiated_configuration, supershift_proven_ceiling, max_config_override);
-				}
-				else
-				{
-					negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
-					printf("[TURBO] Phase: FORWARD — probing commander->responder (post WB upgrade)\n");
-					printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3)\n", current_configuration, negotiated_configuration);
-				}
-				fflush(stdout);
-				cleanup();
-				add_message_control(SET_CONFIG);
-				this->connection_status=TRANSMITTING_CONTROL;
-			}
-			else
-			{
-				turboshift_active = false;
-				turboshift_phase = TURBO_DONE;
-				this->connection_status=TRANSMITTING_DATA;
-			}
+			// Option B (data-anchored promotion, 2026-05-29): the control-only
+			// SNR-SUPERSHIFT probe is removed. Start data at the current
+			// (post-WB-upgrade) config — ROBUST_0 for -R gearshift — and let
+			// FRAME-UP climb rung-by-rung ONLY on confirmed data delivery. The
+			// WB-upgrade side effects above (switch_narrowband_mode etc.) already
+			// ran. See fact-documents/gearshift-start-and-recovery.md §6.
+			turboshift_active = false;
+			turbo_supershift_announce_pending = false;
+			turboshift_phase = TURBO_DONE;
+			this->connection_status=TRANSMITTING_DATA;
 		}
 		else if(this->link_status==CONNECTED)
 		{
@@ -4103,6 +4148,7 @@ void cl_arq_controller::process_control_commander()
 			else if (messages_control.data[0]==SET_CONFIG)
 			{
 				// SET_CONFIG ACK received: apply the new config now
+				turbo_supershift_announce_pending = false;
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
 				int prev_configuration = current_configuration;  // save before load
@@ -4250,9 +4296,9 @@ void cl_arq_controller::process_control_commander()
 						}
 						else
 						{
-							// No valid SNR: blind step-3
-							negotiated_configuration = config_ladder_up_n(current_configuration, 3, robust_enabled, narrowband_enabled == YES);
-							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 3, no SNR)\n",
+							// 2026-05-29: cap blind no-SNR step at +1 (was +3); see twin sites ~3791, ~3986
+							negotiated_configuration = config_ladder_up_n(current_configuration, 1, robust_enabled, narrowband_enabled == YES);
+							printf("[TURBO] SUPERSHIFT: config %d -> %d (step 1, no SNR; caps applied)\n",
 								current_configuration, negotiated_configuration);
 						}
 						// Enforce WB/NB ceiling on turboshift probe target
@@ -4280,6 +4326,7 @@ void cl_arq_controller::process_control_commander()
 						}
 						fflush(stdout);
 						cleanup();
+						turbo_supershift_announce_pending = true;
 						add_message_control(SET_CONFIG);
 						this->connection_status=TRANSMITTING_CONTROL;
 					}
@@ -4324,6 +4371,19 @@ void cl_arq_controller::process_control_commander()
 						// Enforce proven ceiling from prior BREAK failures
 						if(supershift_proven_ceiling >= 0 && snr_ideal > supershift_proven_ceiling)
 							snr_ideal = supershift_proven_ceiling;
+						// Option B (data-anchored promotion): the SNR-driven re-trigger
+						// must not leap more than +1 rung past the highest data-viable
+						// rung — control-plane SNR over-reports viable rate at deep SNR
+						// (§3). Cap at last_data_viable_config+1 unless the Q-table owns
+						// the band. With the cap, gap typically falls below
+						// SUPERSHIFT_RETRIGGER_CONFIGS so the re-trigger simply doesn't
+						// fire, leaving the +1 climb to FRAME-UP. See §6/§7.
+						if(!optimizer_is_in_control())
+						{
+							int anchor_cap = config_ladder_up_n(last_data_viable_config, 1, robust_enabled, narrowband_enabled == YES);
+							if(config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
+								snr_ideal = anchor_cap;
+						}
 						int gap = config_ladder_index(snr_ideal) - config_ladder_index(current_configuration);
 						if(gap >= SUPERSHIFT_RETRIGGER_CONFIGS)
 						{
@@ -4558,6 +4618,12 @@ void cl_arq_controller::finalize_block_commander()
 				bool ceiling_blocked = (supershift_proven_ceiling >= 0 &&
 					config_ladder_index(proposed) > config_ladder_index(supershift_proven_ceiling))
 					|| (max_config_override >= 0 && proposed > max_config_override);
+				// Option B (data-anchored promotion): block any LADDER UP whose
+				// destination is > 1 rung above the highest data-viable rung,
+				// unless the Q-table optimizer owns the band. See §6/§7.
+				if(!optimizer_is_in_control() &&
+					config_ladder_index(proposed) > config_ladder_index(last_data_viable_config) + 1)
+					ceiling_blocked = true;
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;
@@ -4705,6 +4771,14 @@ void cl_arq_controller::policy_evaluate_axis1()
 		bool ceiling_blocked = (supershift_proven_ceiling >= 0 &&
 			config_ladder_index(proposed) > config_ladder_index(supershift_proven_ceiling))
 			|| (max_config_override >= 0 && proposed > max_config_override);
+		// Option B (data-anchored promotion): block any LADDER UP whose
+		// destination is > 1 rung above the highest data-viable rung, unless the
+		// Q-table optimizer owns the band. (This wrapper is already gated on
+		// !optimizer_is_in_control() at entry; the explicit re-check keeps the
+		// predicate self-contained.) See §6/§7.
+		if(!optimizer_is_in_control() &&
+			config_ladder_index(proposed) > config_ladder_index(last_data_viable_config) + 1)
+			ceiling_blocked = true;
 		if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 		{
 			negotiated_configuration=proposed;
@@ -5481,6 +5555,227 @@ void cl_arq_controller::test_fire_policy_axis1(int direction)
 	}
 	fflush(stdout);
 	policy_evaluate_axis1();
+}
+
+// Option B (data-anchored gearshift promotion, 2026-05-29) synthetic-fire test.
+// CLI: --test-data-anchored-promote. Exercises the REAL decision code:
+//   (A) break_target_with_anchor() — BREAK recovery never drops below the
+//       highest data-viable rung, except under the panic-jump.
+//   (B) policy_evaluate_axis1() — an up-shifter promote is allowed exactly one
+//       rung past the anchor (the probe rung) and blocked beyond it.
+// Models the WGN:-10 scenario: data flows at ROBUST_0/ROBUST_1, so the anchor =
+// ROBUST_1; the link must settle at ROBUST_1 and not climb to ROBUST_2+ on
+// control success, and BREAK must recover TO ROBUST_1 (not ROBUST_0).
+// Returns 0 on pass, 1 on fail. Default builds never call this.
+int cl_arq_controller::test_data_anchored_promote()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-DATA-ANCHOR] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-DATA-ANCHOR] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Common priming: -R gearshift session, anchor = ROBUST_1 (data has flowed at
+	// ROBUST_0 and ROBUST_1, but ROBUST_2 has never carried a batch).
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;            // force optimizer_is_in_control()==false
+	supershift_proven_ceiling = -1;
+	last_data_viable_config = ROBUST_1;
+
+	// ---- (A) BREAK recovery floor ----
+	// A1: a raw target of ROBUST_0 (deep drop) must be clamped UP to ROBUST_1.
+	emergency_previous_config = ROBUST_2;
+	break_drop_step = 100;                // config_ladder_down_n → ROBUST_0
+	breaks_since_last_data_success = 0;   // not panic
+	int rawA1 = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
+	int gotA1 = break_target_with_anchor(rawA1);
+	check(rawA1 == ROBUST_0, "A1 precondition: raw target is ROBUST_0", rawA1, ROBUST_0);
+	check(gotA1 == ROBUST_1, "A1: BREAK floored up to anchor ROBUST_1", gotA1, ROBUST_1);
+
+	// A2: a raw target already AT/above the anchor is returned unchanged.
+	int gotA2 = break_target_with_anchor(ROBUST_2);
+	check(gotA2 == ROBUST_2, "A2: target above anchor unchanged", gotA2, ROBUST_2);
+
+	// A3: panic-jump (breaks_since_last_data_success >= 2) BYPASSES the floor and
+	// reaches ROBUST_0 (safety net preserved).
+	breaks_since_last_data_success = 2;
+	int gotA3 = break_target_with_anchor(rawA1);
+	check(gotA3 == ROBUST_0, "A3: panic bypasses floor, reaches ROBUST_0", gotA3, ROBUST_0);
+	breaks_since_last_data_success = 0;   // restore for (B)
+
+	// ---- (B) up-shifter anchor gate (real policy_evaluate_axis1) ----
+	sack_v2_enabled = true;               // route to policy_evaluate_axis1 body
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+	// Prime the LADDER-UP precondition: 100% success, block-counter at threshold.
+	last_transmission_block_stats.success_rate_data = 100.0f;
+	gear_shift_down_consecutive_fails = 0;
+	messages_control.status = FREE;
+
+	// B1: at ROBUST_1 with anchor ROBUST_1, proposed = ROBUST_2 (= anchor+1) →
+	// ALLOWED. negotiated_configuration should advance to ROBUST_2.
+	current_configuration = ROBUST_1;
+	negotiated_configuration = ROBUST_1;
+	gear_shift_blocked_for_nBlocks = gear_shift_block_for_nBlocks_total;
+	printf("[TEST-DATA-ANCHOR] B1: current=ROBUST_1 anchor=ROBUST_1 → expect promote to ROBUST_2 (anchor+1)\n");
+	policy_evaluate_axis1();
+	check(negotiated_configuration == ROBUST_2, "B1: promote to anchor+1 allowed", negotiated_configuration, ROBUST_2);
+
+	// B2: at ROBUST_2 with anchor STILL ROBUST_1 (ROBUST_2 hasn't delivered),
+	// proposed = CONFIG_0 (index 3 > anchor index 1 + 1) → BLOCKED.
+	// negotiated_configuration must NOT advance past ROBUST_2.
+	current_configuration = ROBUST_2;
+	negotiated_configuration = ROBUST_2;
+	messages_control.status = FREE;
+	gear_shift_blocked_for_nBlocks = gear_shift_block_for_nBlocks_total;
+	printf("[TEST-DATA-ANCHOR] B2: current=ROBUST_2 anchor=ROBUST_1 → expect BLOCKED (no climb to CONFIG_0)\n");
+	policy_evaluate_axis1();
+	check(negotiated_configuration == ROBUST_2, "B2: climb >anchor+1 blocked", negotiated_configuration, ROBUST_2);
+
+	// B3: same as B2 but the anchor has now advanced to ROBUST_2 (a batch
+	// delivered at ROBUST_2). proposed = CONFIG_0 (index 3 = anchor index 2 + 1)
+	// → ALLOWED. Confirms the gate releases one rung at a time as data proves it.
+	last_data_viable_config = ROBUST_2;
+	current_configuration = ROBUST_2;
+	negotiated_configuration = ROBUST_2;
+	messages_control.status = FREE;
+	gear_shift_blocked_for_nBlocks = gear_shift_block_for_nBlocks_total;
+	printf("[TEST-DATA-ANCHOR] B3: current=ROBUST_2 anchor=ROBUST_2 → expect promote to CONFIG_0 (anchor+1)\n");
+	policy_evaluate_axis1();
+	check(negotiated_configuration == CONFIG_0, "B3: gate releases one rung as anchor advances", negotiated_configuration, CONFIG_0);
+
+	printf("[TEST-DATA-ANCHOR] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// Phantom-ACK content-gate synthetic-fire test (CLI --test-phantom-ack-gate).
+// Captures the WGN:-10 phantom bug (gearshift-start-and-recovery.md §2 Bug 3 +
+// §8): a structured-noise / rx-tail self-match passes receive_ack_pattern()'s
+// BARE matched/metric gate (arq_common.cc:5556) — NO CRC, NO content — and was
+// accepted as a clean data ACK at arq_commander.cc:2891. That set
+// data_ack_received=YES, raised last_data_viable_config, and reset the BREAK
+// panic counter, defeating recovery to ROBUST_0 (24-BREAK thrash).
+//
+// The fix is a CONTENT gate: data_ack_bare_pattern_acceptable() requires a
+// CRC12-valid clean-batch suffix on CRC-capable (WB) sessions; NB / suffix-
+// incapable sessions keep bare-pattern acceptance.
+//
+// Part 1 drives the PURE acceptance policy across the WB/NB x CRC-valid/CRC-
+// absent matrix. The PHANTOM cell (WB, suffix-capable, NO CRC) MUST be REJECTED
+// — this is the assertion that FAILS on the pre-fix code path (which had no
+// content gate: the bare arm was just `!sack_window_open && receive_ack_pattern()`
+// → the phantom was accepted) and PASSES after.
+//
+// Part 2 drives the CROSS-LAYER invariant: when the gate rejects the phantom,
+// data_ack_received stays NO, so the data-success block (arq_commander.cc:3383
+// else) never runs — last_data_viable_config is NOT raised and
+// breaks_since_last_data_success is NOT reset — and a subsequent BREAK can
+// therefore still reach ROBUST_0 (the panic-jump safety net is preserved).
+// Returns 0 on pass, 1 on fail. Default builds never call this.
+int cl_arq_controller::test_phantom_ack_gate()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-PHANTOM-ACK] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-PHANTOM-ACK] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// ---- Part 1: pure acceptance policy matrix ----
+	// data_ack_bare_pattern_acceptable(suffix_capable, crc_suffix_valid):
+	//   WB (suffix_capable=true):  accept ONLY if crc_suffix_valid.
+	//   NB (suffix_capable=false): accept regardless (no suffix to validate).
+	bool wb_phantom = data_ack_bare_pattern_acceptable(/*suffix_capable=*/true,
+	                                                    /*crc_suffix_valid=*/false);
+	bool wb_real    = data_ack_bare_pattern_acceptable(/*suffix_capable=*/true,
+	                                                    /*crc_suffix_valid=*/true);
+	bool nb_bare    = data_ack_bare_pattern_acceptable(/*suffix_capable=*/false,
+	                                                    /*crc_suffix_valid=*/false);
+	bool nb_with_crc= data_ack_bare_pattern_acceptable(/*suffix_capable=*/false,
+	                                                    /*crc_suffix_valid=*/true);
+	// THE bug assertion: the WB phantom (bare match, no CRC) must be REJECTED.
+	check(wb_phantom == false, "P1a WB phantom (no CRC suffix) REJECTED",
+		wb_phantom ? 1 : 0, 0);
+	// A real WB clean ACK (CRC-valid suffix) must still be accepted.
+	check(wb_real == true, "P1b WB real ACK (CRC-valid suffix) accepted",
+		wb_real ? 1 : 0, 1);
+	// NB has no suffix — bare pattern remains the acceptor (unchanged behavior).
+	check(nb_bare == true, "P1c NB bare ACK (no suffix) accepted",
+		nb_bare ? 1 : 0, 1);
+	check(nb_with_crc == true, "P1d NB accept is suffix-independent",
+		nb_with_crc ? 1 : 0, 1);
+
+	// ---- Part 2: cross-layer invariant (anchor + panic counter + BREAK reach) ----
+	// Session priming: -R gearshift, nominal config ABOVE the data-viable rung.
+	// Channel cratered to where only ROBUST_0 carries data; nominal sits at
+	// ROBUST_2, the anchor (last data confirmed delivered) is ROBUST_0.
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	current_configuration = ROBUST_2;
+	last_data_viable_config = ROBUST_0;
+	breaks_since_last_data_success = 0;
+
+	// Simulate the acceptance gate's decision on the phantom poll. With the
+	// fix, data_ack_bare_pattern_acceptable(WB, no-CRC) == false, so the bare
+	// arm does NOT set data_ack_received; it stays NO (the value it holds when
+	// no ACK is accepted this poll). Model that directly.
+	int data_ack_before = NO;
+	data_ack_received = data_ack_before;
+	int anchor_before = last_data_viable_config;
+	int panic_before  = breaks_since_last_data_success;
+	bool phantom_accepted = data_ack_bare_pattern_acceptable(true, false);
+	if(phantom_accepted)
+	{
+		// (Pre-fix path) — the phantom WOULD have set YES and the data-success
+		// block would have raised the anchor + reset the panic counter. Mirror
+		// that corruption so the assertions below FAIL on pre-fix code.
+		data_ack_received = YES;
+		if(config_ladder_index(current_configuration) >
+		   config_ladder_index(last_data_viable_config))
+			last_data_viable_config = current_configuration;
+		breaks_since_last_data_success = 0;
+	}
+	check(data_ack_received == NO, "P2a phantom leaves data_ack_received NO",
+		data_ack_received, NO);
+	check(last_data_viable_config == anchor_before,
+		"P2b phantom does NOT raise last_data_viable_config",
+		last_data_viable_config, anchor_before);
+	check(breaks_since_last_data_success == panic_before,
+		"P2c phantom does NOT reset BREAK panic counter",
+		breaks_since_last_data_success, panic_before);
+
+	// With the panic counter intact, two consecutive real block-failures push
+	// breaks_since_last_data_success to the panic threshold (>=2), and
+	// break_target_with_anchor() must then BYPASS the anchor floor and reach
+	// ROBUST_0 — the safety net the phantom previously defeated.
+	breaks_since_last_data_success = 2;            // two real BREAKs, no data success
+	emergency_previous_config = ROBUST_2;
+	break_drop_step = 100;                         // config_ladder_down_n → ROBUST_0
+	int raw_target = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
+	int got_target = break_target_with_anchor(raw_target);
+	check(raw_target == ROBUST_0, "P2d precondition: raw BREAK target is ROBUST_0",
+		raw_target, ROBUST_0);
+	check(got_target == ROBUST_0, "P2e BREAK reaches ROBUST_0 under panic (anchor bypassed)",
+		got_target, ROBUST_0);
+	breaks_since_last_data_success = 0;            // restore
+
+	printf("[TEST-PHANTOM-ACK] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
 }
 
 // SACK Design A Step 11 — helper: stage and send a SET_LINK_PARAMS for a

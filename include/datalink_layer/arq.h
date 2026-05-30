@@ -548,6 +548,61 @@ public:
   // Default builds never call this; production paths are unaffected.
   void test_fire_policy_axis1(int direction);
 
+  // Option B (data-anchored promotion, 2026-05-29): apply the
+  // last_data_viable_config recovery floor to a raw BREAK target. Returns the
+  // raw target unchanged under the panic-jump (breaks_since_last_data_success
+  // >= 2); otherwise never returns a config below last_data_viable_config (by
+  // ladder index). Used by both BREAK recovery sites (arq_commander.cc:81 and
+  // the retries-exhausted path) and the synthetic-fire test. See §6/§7.
+  int break_target_with_anchor(int raw_target) const;
+
+  // Option B synthetic-fire test (CLI --test-data-anchored-promote). Drives the
+  // real BREAK-floor helper and the real policy_evaluate_axis1() up-shifter with
+  // last_data_viable_config primed, asserting the link parks at the anchor rung
+  // instead of climbing/falling past it. Returns 0 on pass, 1 on fail. Default
+  // builds never call this. See fact-documents/gearshift-start-and-recovery.md §6.4.
+  int test_data_anchored_promote();
+
+  // Phantom-ACK content gate (2026-05-29). PURE policy predicate for the
+  // clean-batch DATA-ACK bare-pattern acceptance at arq_commander.cc:2809.
+  // receive_ack_pattern() returns a BARE bool on pattern-match-only (matched
+  // >= ack_match_threshold && metric >= ack_metric_threshold; arq_common.cc:5556)
+  // with NO CRC and NO content check, so structured noise / an rx-tail self-match
+  // can fake a data ACK. The clean discriminator is CONTENT: a real WB data ACK
+  // carries a CRC12-valid MFSK suffix. This predicate gates the bare-pattern arm:
+  //   suffix_capable  = ack_sack_suffix_len() > 0 (WB; M>=16 carries a CRC suffix).
+  //   crc_suffix_valid= a CRC12-valid, in-window, clean-batch (all-ones) suffix
+  //                     was decoded from the current passband tail.
+  // On CRC-capable (WB) sessions a bare match is accepted ONLY with a CRC-valid
+  // suffix (rejects the phantom; the timeout-retransmit path is the safe fallback).
+  // On NB / suffix-incapable sessions there is no suffix to validate (the RSP
+  // sends a bare ACK pattern — arq_responder.cc:1679-1683), so the bare pattern
+  // stays the acceptor. Control-ACK detection (arq_commander.cc:1702) and the
+  // emergency-BREAK poll (arq_commander.cc:92) do NOT use this gate — control
+  // frames carry no suffix and must keep bare-pattern behavior unchanged.
+  // See fact-documents/gearshift-start-and-recovery.md §2 Bug 3 + §8.
+  bool data_ack_bare_pattern_acceptable(bool suffix_capable,
+                                        bool crc_suffix_valid) const
+  { return suffix_capable ? crc_suffix_valid : true; }
+
+  // Phantom-ACK content gate — DSP half. Peek the current passband tail for a
+  // CRC12-valid, in-window, clean-batch (all-ones bitmap) MFSK ACK+SACK suffix.
+  // Read-only (no frames_to_read mutation — mirrors the §7.13.30 no-side-effect
+  // peek at arq_commander.cc:2366-2375). Returns false on NB / suffix-incapable
+  // (ack_sack_suffix_len()==0), no decode, CRC mismatch, out-of-window bsi, or a
+  // non-clean (partial) bitmap. Used by the bare-pattern data-ACK arm only.
+  bool cmd_clean_data_ack_crc_valid();
+
+  // Phantom-ACK content-gate synthetic-fire test (CLI --test-phantom-ack-gate).
+  // Drives the PURE acceptance policy (data_ack_bare_pattern_acceptable) across
+  // the WB/NB x CRC-valid/CRC-absent matrix AND asserts the cross-layer invariant
+  // that a phantom (bare match, NO CRC suffix, WB) leaves data_ack_received NO,
+  // does NOT raise last_data_viable_config, does NOT reset the BREAK panic counter
+  // (breaks_since_last_data_success), and that BREAK can therefore still reach
+  // ROBUST_0. Returns 0 on pass, 1 on fail. Default builds never call this.
+  // See fact-documents/gearshift-start-and-recovery.md §8.
+  int test_phantom_ack_gate();
+
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
   // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:
@@ -1265,7 +1320,17 @@ public:
   bool turboshift_initiator;       // true = I started turboshift (original commander)
   int turboshift_retries;          // retries left at current config (0 = ceiling)
   bool turbo_settle_pending;       // waiting for settle SET_CONFIG ACK before finish
+  bool turbo_supershift_announce_pending; // SUPERSHIFT entry queued SET_CONFIG; gates re-entry until ACK lands or BREAK clears turboshift_active. Without this, the entry block fired up to 50× within ~50ms on tight state-machine ticks, blindly walking the ladder past what the channel can hold (observed at WGN:-10 2026-05-29).
   int supershift_proven_ceiling;   // highest config that failed BREAK — caps all SUPERSHIFT targets (-1 = no ceiling)
+  // Option B (data-anchored gearshift promotion, 2026-05-29): highest ladder
+  // rung (by config_ladder_index) at which a DATA batch was CONFIRMED delivered
+  // this session. Init = init_configuration (ctor + reset_session_state); raised
+  // ONLY at the data-success path (arq_commander.cc:3284, data_ack_received==YES).
+  // Consumers: BREAK target floor (arq_commander.cc:81, gated off under panic),
+  // up-shifter anchor gate (legacy ladder :4583, axis1 :4731, retrigger :4344) —
+  // no upward move may exceed index+1 unless optimizer_is_in_control(). A FAILED
+  // probe never raises it. See fact-documents/gearshift-start-and-recovery.md §6/§7.
+  int last_data_viable_config;
   bool skip_turbo_reverse;         // CLI --skip-turbo-reverse: skip TURBO_REVERSE phase
   int max_config_override;         // CLI --max-config: hard ceiling on turboshift (-1 = use default)
   bool optimizer_disabled;         // CLI --no-optimizer: disable Phase 3c effective-rate optimizer (calibration runs)
