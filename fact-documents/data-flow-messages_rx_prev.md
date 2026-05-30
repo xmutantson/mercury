@@ -354,6 +354,118 @@ mfsk-vara-parity-plan.md §3 R7.
 
 ---
 
+## §10 climb-C1 — Delivery-anchored promotion (2026-05-30)
+
+Branch `fix/climb-delivery-anchored`. Cross-layer fix: the prev-storage
+delivery path delivered a recovered batch to the application but emitted
+**no ACK frame**, so the SACK-v2 climb could never promote a rung whose
+data actually got through.
+
+### §10.1 The bug (cross-layer, ARQ ↔ gearshift)
+
+When a batch loses a frame on first pass under SACK-v2:
+
+1. **CMD** sends batch under `cmd_batch_seq_id = N`; the counter bumps to
+   `N+1` (`arq_commander.cc:1722`, gated on `batch_includes_new_data`).
+   The subsequent retransmit-only batch does **NOT** bump it, so while
+   awaiting the completion ACK the window is `{cmd=N+1, prev=N}`.
+2. **RSP** ACK-GATE fails → SACK-partial path → `bump_bsi_and_transfer_prev()`
+   (`arq_common.cc:4056`) sets `rsp_prev_batch_seq_id=N`, arms the prev
+   buffer, and TXes a PARTIAL SACK for `sacked_bsi=N`
+   (`arq_responder.cc:1526`).
+3. **CMD** accepts the partial (bsi=N == `prev_bsi`), sets
+   `cmd_last_applied_sack_bsi=N`, queues the retransmit (original bsi=N).
+4. **RSP** receives the retransmitted frame, routes to prev-storage, the
+   completion gate fires (consumer §2.1), delivers via
+   `copy_data_to_buffer()`, logs `[RSP-V2-PREV-DELIVERED]`
+   (`arq_responder.cc:770`) — **and sent nothing back.**
+5. **CMD** never sees a clean ACK for batch N. `last_batch_fully_acked`
+   stays FALSE → the four gearshift promotion consumers
+   (`arq_commander.cc:3427`/`3437`/`3429`/`3498`) never fire → the rung is
+   treated as non-data-viable forever even though all 25 frames were
+   delivered. At the deep-SNR cliff this blocks the climb entirely.
+
+### §10.2 The fix
+
+**(a) RSP producer** (`arq_responder.cc`, right after
+`[RSP-V2-PREV-DELIVERED]`): emit a CLEAN all-ones MFSK ACK+SACK for
+`rsp_prev_batch_seq_id` (=N), reusing the exact clean-funnel machinery the
+no-loss path uses (`arq_responder.cc:1646-1683`): `send_mfsk_ack_sack(N,
+all_ones)`, falling back to `send_ack_pattern()` on NB / suffix-incapable.
+This is a NEW producer of an ACK frame, NOT a new producer of
+`messages_rx_prev[]` — the buffer is already drained and FREE at this
+point (consumer §2.1 ran, slots back to FREE at `arq_responder.cc:765`).
+
+**(b) CMD consumer** (`arq_commander.cc:~2533`): the all-ones confirmation
+carries bsi=N == `cmd_last_applied_sack_bsi`, so the existing dedupe
+(Sanity-3) would reject it as a duplicate of the step-3 partial. Fix:
+factor the Sanity-1/2/3 gate into the shared pure predicate
+`sack_clean_confirmation_accepted()` (`arq.h`) and **exempt the all-ones
+(completion) bitmap from the dedupe**. The clean branch then sets
+`v2_ack_pat_pre_detected`, and the existing ACK_PAT funnel
+(`arq_commander.cc:2951`) sets `last_batch_fully_acked=true` + bumps
+`nBatches_fully_acked` — the SAME TRUE-setter region as the no-loss clean
+path. No new TRUE-setter was added.
+
+The `+1` anchor clamp (`arq_commander.cc:3485-3487`),
+`promotion_allowed_on_batch()`, and the partial-SACK dedupe are
+**UNCHANGED** — promotion still requires FULL delivery, so a rung that
+never completes a batch (Part B of the test) still cannot promote and the
+deep-SNR over-climb cannot return.
+
+### §10.3 Audit — `last_batch_fully_acked` (the shared state the fix flips)
+
+- **Producers (TRUE)**: `arq_commander.cc:2951` (MFSK/bare clean ACK
+  funnel — the one this fix now reaches via the dedupe exemption),
+  `:3053` (LDPC ACK_RANGE), `:3078` (LDPC ACK_MULTI). The fix adds NO new
+  producer — it only widens which wire frames reach `:2951`.
+- **Producers (FALSE)**: per-batch TX-start reset `arq_commander.cc:1246`
+  / `:1742`, ctor `arq_common.cc:355`, `reset_session_state`
+  `arq_common.cc:2957`, and the explicit partial-SACK FALSE at
+  `arq_commander.cc:2828`.
+- **Consumers**: the four promotion gates `arq_commander.cc:3427`,
+  `:3437` (anchor raise), `:3429` (panic reset + break_drop_step), `:3498`
+  (FRAME-UP). All read it through `promotion_allowed_on_batch()`.
+- **No double-count**: the clean branch sets a *flag*
+  (`v2_ack_pat_pre_detected`); the actual mutation happens once in the
+  fallthrough ACK_PAT block guarded by `data_ack_received==NO`
+  (`arq_commander.cc:2920`). A repeated clean ACK in the same epoch is
+  swallowed by that guard, and after a clean ACK the CMD leaves
+  `RECEIVING_ACKS_DATA` (no second batch is sent while awaiting the ACK),
+  so cross-poll re-entry is bounded by the state machine. `nBatches_*`
+  therefore bump exactly once per completed batch.
+- **No false-clean on a still-partial batch**: the exemption fires ONLY
+  when `rx_bitmap == all_ones`. A partial bitmap keeps its dedupe
+  (verified by test P0b) and never sets `last_batch_fully_acked`
+  (test B1/B6). The RSP only emits the all-ones confirmation from inside
+  the completion gate (`rsp_prev_batch_received_count >=
+  rsp_prev_batch_expected_count`), i.e. after every expected frame
+  arrived — so a still-partial batch produces no confirmation at all.
+
+### §10.4 bsi-window correctness
+
+The confirmation's bsi=N is accepted because the retransmit-only batch
+that closed the gap did **not** bump `cmd_batch_seq_id` (still N+1), so
+`prev_bsi = N` matches. If a future change makes a retransmit bump
+`cmd_batch_seq_id`, this window would shift and the confirmation would
+fall out of `{cmd, prev}` — that invariant is now load-bearing and is
+asserted indirectly by test P0c (out-of-window rejection).
+
+### §10.5 Regression test
+
+`test_delivery_anchored_promotion()` (`arq_commander.cc`, CLI
+`--test-delivery-anchored-promotion`). Drives the shared
+`sack_clean_confirmation_accepted()` predicate + replays the all-ones
+funnel and the gated promotion consumers. Part A: prev-delivered clean
+confirmation for an already-partialed bsi is accepted → promotes + raises
+anchor + bumps `nBatches_fully_acked`. Part B: still-incomplete batch
+(partial only) does not promote. Part C: the FULL-delivery guard is
+unchanged. **Verified FAIL-before** (7 failures with the
+`&& !is_clean_bitmap` term removed) / **PASS-after** (17/17). Full suite
+stays 30/30.
+
+---
+
 ## §9 Related fact documents
 
 - `data-flow-retx-queue.md` — TX-side retx queue (sibling state; same

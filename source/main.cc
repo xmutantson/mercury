@@ -342,6 +342,11 @@ int main(int argc, char *argv[])
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
                                         // up-promotion gate; a CLEAN all-ones batch does all of those; and that BREAK can
                                         // still reach ROBUST_0 after a partial-only run. One-shot, exits rc. See §9.
+    bool test_delivery_anchored_promotion_cli = false; // --test-delivery-anchored-promotion: climb-C1 regression.
+                                        // Asserts a batch COMPLETED via the prev-storage/retransmit path (CLEAN all-ones ACK
+                                        // for a bsi the CMD already saw a PARTIAL for) is ACCEPTED → sets last_batch_fully_acked
+                                        // TRUE, bumps nBatches_fully_acked, allows promotion + anchor rise; and a still-
+                                        // INCOMPLETE batch does NOT promote. One-shot, exits rc. See data-flow-messages_rx_prev.md §10.
     int test_policy_axis1_then_axis2_cli = 0; // --test-policy-axis1-then-axis2=up|down: SACK Design A Step 10 — fire Axis-1
                                         // (engages axis2_cooldown_batches=3) then attempt Axis-2 fire (should be SUPPRESSED).
                                         // 1=axis1=up then axis2=up; 2=axis1=down then axis2=down. One-shot at startup, then exit.
@@ -757,6 +762,15 @@ int main(int argc, char *argv[])
             // exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §9.8.
             test_clean_batch_viability_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-delivery-anchored-promotion") == 0)
+        {
+            // climb-C1 DELIVERY-ANCHORED PROMOTION regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-messages_rx_prev.md §10.
+            test_delivery_anchored_promotion_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1741,6 +1755,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_clean_batch_viability();
             printf("[FLAG] Clean-batch-viability test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_delivery_anchored_promotion_cli) {
+            // climb-C1 DELIVERY-ANCHORED PROMOTION regression (one-shot, then exit
+            // rc). Asserts a batch completed via the prev-storage/retransmit path
+            // (CLEAN all-ones ACK for an already-partialed bsi) is accepted and
+            // promotes; a still-incomplete batch does not. See
+            // fact-documents/data-flow-messages_rx_prev.md §10.
+            printf("[FLAG] --test-delivery-anchored-promotion: invoking "
+                   "DELIVERY-ANCHORED PROMOTION regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_delivery_anchored_promotion();
+            printf("[FLAG] Delivery-anchored-promotion test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

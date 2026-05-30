@@ -621,6 +621,50 @@ public:
   bool promotion_allowed_on_batch(bool batch_fully_acked) const
   { return batch_fully_acked; }
 
+  // climb-C1 (DELIVERY-ANCHORED PROMOTION, 2026-05-30) — PURE predicate that
+  // decides whether an MFSK ACK+SACK suffix decoded off the wire is a FRESH
+  // confirmation the CMD must act on, or a duplicate to drop. Encapsulates the
+  // Sanity-1/2/3 gate at arq_commander.cc:~2536 so the production decode AND the
+  // synthetic-fire test (test_delivery_anchored_promotion) share one source of
+  // truth. The all-ones CLEAN bitmap is EXEMPT from the dedupe: when a batch
+  // loses a frame first-pass, the CMD applies a PARTIAL SACK for bsi=N (setting
+  // cmd_last_applied_sack_bsi=N) then the RSP completes that batch via the
+  // prev-storage path and sends a CLEAN all-ones ACK for the SAME bsi=N
+  // (arq_responder.cc:~775). Treating that completion confirmation as a duplicate
+  // of the earlier partial would leave last_batch_fully_acked FALSE forever and
+  // block the climb. A clean all-ones bitmap is a completion signal, not a
+  // partial-retransmit request, and applying it is idempotent (the clean branch
+  // only sets v2_ack_pat_pre_detected, consumed once under the
+  // data_ack_received==NO guard). PARTIAL SACKs keep their dedupe. Returns true
+  // iff the decoded suffix should be acted upon. See
+  // fact-documents/data-flow-messages_rx_prev.md §10.
+  static bool sack_clean_confirmation_accepted(int rx_bsi, uint32_t rx_bitmap,
+                                               int batch_size,
+                                               int cmd_bsi, int prev_bsi,
+                                               int last_applied_sack_bsi)
+  {
+    bool bsi_in_window = (rx_bsi == cmd_bsi || rx_bsi == prev_bsi);
+    bool bitmap_ok = (rx_bitmap != 0u);
+    uint32_t all_ones = (batch_size >= 32)
+      ? 0xFFFFFFFFu : ((1u << batch_size) - 1u);
+    bool is_clean_bitmap = (rx_bitmap == all_ones);
+    bool duplicate = (rx_bsi == last_applied_sack_bsi) && !is_clean_bitmap;
+    return bsi_in_window && bitmap_ok && !duplicate;
+  }
+
+  // climb-C1 (DELIVERY-ANCHORED PROMOTION) synthetic-fire test
+  // (CLI --test-delivery-anchored-promotion). Asserts a batch completed via the
+  // prev-storage/retransmit path (CLEAN all-ones ACK for a bsi the CMD already
+  // saw a PARTIAL for) is ACCEPTED — sets last_batch_fully_acked TRUE, bumps
+  // nBatches_fully_acked, and allows promotion + anchor rise — while a still-
+  // INCOMPLETE batch (only a PARTIAL bitmap, no completion confirmation) does
+  // NOT promote and leaves the anchor at the floor. Drives the shared
+  // sack_clean_confirmation_accepted() predicate AND replays the all-ones funnel
+  // + the gated promotion consumers. FAILS on the pre-fix code (dedupe with no
+  // all-ones exemption rejects the confirmation). Returns 0 on pass, 1 on fail.
+  // Default builds never call this. See data-flow-messages_rx_prev.md §10.
+  int test_delivery_anchored_promotion();
+
   // CLEAN-BATCH VIABILITY synthetic-fire test (CLI --test-clean-batch-viability).
   // Drives the PURE promotion predicate AND the real gearshift consumer logic:
   // asserts a PARTIAL batch does NOT raise last_data_viable_config, does NOT reset

@@ -772,6 +772,73 @@ void cl_arq_controller::process_messages_rx_data_control()
 								"current-batch storage untouched)\n",
 								rsp_prev_batch_seq_id, rsp_prev_batch_delivered_count);
 							fflush(stdout);
+
+							// climb-C1 (DELIVERY-ANCHORED PROMOTION) — emit a
+							// CLEAN (all-ones) ACK for the prev batch we just
+							// fully delivered. The prev-storage/retransmit path
+							// delivers to the app (copy_data_to_buffer above) but
+							// historically sent NO ACK frame, so the CMD never saw
+							// a clean ACK for this batch: last_batch_fully_acked
+							// stayed FALSE forever and the gearshift climb was
+							// blocked (the rung that recovered a frame via SACK
+							// could never promote). Reuse the SAME clean-ACK
+							// machinery the no-loss path uses
+							// (arq_responder.cc:~1646 clean funnel): an all-ones
+							// SACK bitmap for prev_batch_seq_id tells the CMD the
+							// batch is complete. The CMD-side all-ones funnel
+							// (arq_commander.cc:~2520 → :2951) then sets
+							// last_batch_fully_acked=true and bumps
+							// nBatches_fully_acked. promotion still REQUIRES full
+							// delivery — a rung that never completes a batch never
+							// reaches this block, so the deep-SNR over-climb guard
+							// (promotion_allowed_on_batch + the +1 anchor clamp) is
+							// unchanged. See fact-documents/data-flow-messages_rx_prev.md §10.
+							unsigned char prev_ack_bsi =
+								(unsigned char)(rsp_prev_batch_seq_id >= 0
+									? rsp_prev_batch_seq_id : 0);
+							bool prev_used_mfsk_path = false;
+							if (MFSK_ACK_SACK_ENABLED
+								&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
+							{
+								// Phase B Wave 1 flag-day (fact-doc §11.2): bitmap
+								// is 30 bits (was 32). Mirror the clean funnel's
+								// cap so we never set bits 30/31.
+								uint32_t bitmap_u32;
+								if (data_batch_size >= 30)
+									bitmap_u32 = 0x3FFFFFFFu;
+								else if (data_batch_size <= 0)
+									bitmap_u32 = 0u;
+								else
+									bitmap_u32 = (1u << data_batch_size) - 1u;
+								printf("[RSP-MFSK-SACK] prev-delivered path: "
+									"batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
+									(unsigned)prev_ack_bsi, (unsigned)bitmap_u32,
+									data_batch_size);
+								fflush(stdout);
+								long long mfsk_ms =
+									send_mfsk_ack_sack(prev_ack_bsi, bitmap_u32);
+								if (mfsk_ms > 0)
+								{
+									printf("[TX-ACK-SACK] prev-delivered via MFSK "
+										"suffix wire_ms=%lld\n", mfsk_ms);
+									fflush(stdout);
+									prev_used_mfsk_path = true;
+								}
+								else
+								{
+									printf("[RSP-MFSK-SACK] MFSK suffix returned 0 "
+										"on prev-delivered — falling back to legacy "
+										"MFSK ACK pattern\n");
+									fflush(stdout);
+								}
+							}
+							if (!prev_used_mfsk_path)
+							{
+								// NB or MFSK-suffix unavailable: legacy MFSK ACK
+								// pattern (receiver treats any pattern hit as a
+								// clean ACK — same as the clean funnel's fallback).
+								send_ack_pattern();
+							}
 						}
 					}
 					else

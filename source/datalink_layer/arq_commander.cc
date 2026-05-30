@@ -2503,17 +2503,44 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// Sanity 2: bitmap=0 means "received nothing" — RSP
 							// never sends a SACK in that case (no batch_started),
 							// so treat as a false decode.
+							uint32_t all_ones = (data_batch_size >= 32)
+								? 0xFFFFFFFFu
+								: ((1u << data_batch_size) - 1u);
+							bool is_clean_bitmap = (rx_bitmap == all_ones);
+							// Diagnostic decompositions for the rejection trace
+							// below — mirror the predicate's internal terms.
 							bool bitmap_ok = (rx_bitmap != 0u);
-							// Sanity 3: dedupe vs the last SACK we already applied
-							// (mirrors the OFDM SACK_RSP duplicate guard at ~2141).
-							bool duplicate = ((int)rx_bsi == cmd_last_applied_sack_bsi);
-
-							if(bsi_in_window && bitmap_ok && !duplicate)
+							bool duplicate = ((int)rx_bsi == cmd_last_applied_sack_bsi)
+								&& !is_clean_bitmap;
+							// Sanity 1/2/3 gate, factored into the shared pure
+							// predicate so this decode and the synthetic-fire test
+							// (test_delivery_anchored_promotion) cannot drift.
+							// climb-C1 (DELIVERY-ANCHORED PROMOTION): the all-ones
+							// CLEAN bitmap is EXEMPT from the dedupe inside the
+							// predicate. When a batch loses a frame first-pass, the
+							// CMD applies a PARTIAL SACK for bsi=N (setting
+							// cmd_last_applied_sack_bsi=N) and queues the
+							// retransmit. The RSP later completes that batch via the
+							// prev-storage path and sends a CLEAN all-ones ACK for
+							// the SAME bsi=N (arq_responder.cc:~775). Without the
+							// exemption the completion confirmation is rejected as a
+							// duplicate of the earlier partial and the climb stays
+							// blocked (last_batch_fully_acked never set). A clean
+							// all-ones bitmap is a completion signal, not a
+							// partial-retransmit request, and applying it is
+							// idempotent: the clean branch only sets
+							// v2_ack_pat_pre_detected, consumed EXACTLY ONCE by the
+							// fallthrough ACK_PAT block (~:2920) under its
+							// data_ack_received==NO guard. PARTIAL SACKs keep their
+							// dedupe so a repeated partial never re-populates the
+							// retransmit queue. See
+							// fact-documents/data-flow-messages_rx_prev.md §10.
+							if(sack_clean_confirmation_accepted(
+									(int)rx_bsi, rx_bitmap, data_batch_size,
+									(int)cmd_bsi, (int)prev_bsi,
+									cmd_last_applied_sack_bsi))
 							{
-								uint32_t all_ones = (data_batch_size >= 32)
-									? 0xFFFFFFFFu
-									: ((1u << data_batch_size) - 1u);
-								if(rx_bitmap == all_ones)
+								if(is_clean_bitmap)
 								{
 									// CLEAN BATCH — mirror OFDM_ACK_CLEAN handler
 									// (~line 2178). Only state change there is
@@ -5857,6 +5884,224 @@ int cl_arq_controller::test_phantom_ack_gate()
 	breaks_since_last_data_success = 0;            // restore
 
 	printf("[TEST-PHANTOM-ACK] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// DELIVERY-ANCHORED PROMOTION synthetic-fire test (CLI
+// --test-delivery-anchored-promotion). climb-C1, 2026-05-30.
+//
+// Captures the SACK-v2 climb-blocking disease (data-flow-messages_rx_prev.md
+// §10): a batch that loses a frame first-pass is recovered via the prev-storage
+// path (arq_responder.cc:~728), which DELIVERS to the app but historically sent
+// NO ACK frame. The CMD therefore never saw a clean ACK for that batch, so
+// last_batch_fully_acked stayed FALSE forever and the gearshift climb was
+// blocked even though every byte was delivered — a non-viable-looking rung that
+// is actually viable could never promote.
+//
+// The fix is cross-layer: (a) the RSP emits a CLEAN all-ones ACK for the
+// completed prev batch (same bsi the earlier PARTIAL used); (b) the CMD accepts
+// that all-ones confirmation even though it already applied a PARTIAL for the
+// same bsi — the dedupe is EXEMPT for an all-ones (completion) bitmap. The
+// shared predicate sack_clean_confirmation_accepted() owns that decision; the
+// existing all-ones funnel (arq_commander.cc:~2538 → :2951) then sets
+// last_batch_fully_acked=true + bumps nBatches_fully_acked.
+//
+// Part A: a CLEAN all-ones confirmation for a bsi the CMD ALREADY saw a PARTIAL
+//         for is ACCEPTED (the pre-fix dedupe rejected it) → drives the all-ones
+//         funnel → last_batch_fully_acked TRUE, promotion fires, anchor rises.
+// Part B: a still-INCOMPLETE batch (only a PARTIAL bitmap arrives, no completion
+//         confirmation) is NOT a clean confirmation → last_batch_fully_acked
+//         stays FALSE, no promotion, anchor stays at the floor.
+// Part C: the +1 anchor clamp + promotion_allowed_on_batch guards are UNCHANGED
+//         — a confirmation accepted by Part A only promotes via the FULL-delivery
+//         predicate, so a partial (Part B) still cannot.
+//
+// The fail-before/pass-after pivot is the all-ones dedupe exemption inside
+// sack_clean_confirmation_accepted(): reverting the `&& !is_clean_bitmap` term
+// makes Part A's confirmation read as a duplicate → A1/A2/... FAIL. Returns 0 on
+// pass, 1 on fail. Default builds never call this.
+int cl_arq_controller::test_delivery_anchored_promotion()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-DELIV-ANCHOR] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-DELIV-ANCHOR] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Common priming: -R gearshift session at a MARGINAL rung (CONFIG_0) whose
+	// data-viable anchor is still at the floor (ROBUST_0) — i.e. CONFIG_0 has
+	// never been confirmed to carry a full batch. This is the WGN:-10 cliff
+	// state, exactly where SACK recovery matters most.
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	current_configuration = CONFIG_0;
+
+	const int BATCH = 25;                 // SACK-v2 negotiated batch size.
+	const int N = 7;                      // the in-flight batch's bsi.
+	// CMD finished TX of batch N → cmd_batch_seq_id advanced to N+1; the
+	// retransmit-only batch that follows does NOT bump it (batch_includes_new_data
+	// false). So while awaiting the completion ACK the window is {cmd=N+1, prev=N}.
+	const int cmd_bsi  = (N + 1) & 0xFF;
+	const int prev_bsi = N & 0xFF;
+	// The CMD already applied a PARTIAL SACK for bsi=N (one frame was lost
+	// first-pass), so the dedupe state points at N.
+	const int last_applied = N;
+	// Bitmaps as the wire carries them (LSB-first per-frame mask, cap 30 bits).
+	const uint32_t all_ones_25 = (1u << BATCH) - 1u;     // 25 frames all received
+	const uint32_t partial_24  = all_ones_25 & ~(1u << 5); // frame 5 still missing
+
+	// ---- Part 0: the shared decode predicate (pure) ----
+	// A CLEAN all-ones confirmation for the bsi we already partial-ACKed MUST be
+	// accepted (the dedupe exemption). This is the exact term the fix adds.
+	check(sack_clean_confirmation_accepted(N, all_ones_25, BATCH,
+			cmd_bsi, prev_bsi, last_applied) == true,
+		"P0a CLEAN all-ones confirmation for already-partialed bsi ACCEPTED",
+		sack_clean_confirmation_accepted(N, all_ones_25, BATCH,
+			cmd_bsi, prev_bsi, last_applied) ? 1 : 0, 1);
+	// A repeated PARTIAL for the same bsi is still a duplicate (dedupe intact —
+	// we did NOT loosen the partial-retransmit path).
+	check(sack_clean_confirmation_accepted(N, partial_24, BATCH,
+			cmd_bsi, prev_bsi, last_applied) == false,
+		"P0b repeated PARTIAL for already-applied bsi still DEDUPED",
+		sack_clean_confirmation_accepted(N, partial_24, BATCH,
+			cmd_bsi, prev_bsi, last_applied) ? 1 : 0, 0);
+	// A confirmation for a bsi OUTSIDE the {cmd,prev} window is rejected.
+	check(sack_clean_confirmation_accepted((N - 2) & 0xFF, all_ones_25, BATCH,
+			cmd_bsi, prev_bsi, last_applied) == false,
+		"P0c CLEAN confirmation for out-of-window bsi REJECTED",
+		sack_clean_confirmation_accepted((N - 2) & 0xFF, all_ones_25, BATCH,
+			cmd_bsi, prev_bsi, last_applied) ? 1 : 0, 0);
+
+	// Helper replaying the production all-ones funnel + the gated promotion
+	// consumers for an incoming MFSK ACK+SACK suffix with bitmap `rx_bitmap` and
+	// bsi `rx_bsi`. Mirrors:
+	//   - decode gate  : arq_commander.cc:~2533 (sack_clean_confirmation_accepted)
+	//   - all-ones set : arq_commander.cc:~2950 (last_batch_fully_acked=true,
+	//                     nBatches_fully_acked++) reached only via the clean branch
+	//   - consumers    : the :3411-else gate (anchor/panic/break_drop_step) +
+	//                     the :3498 FRAME-UP gate, both gated on
+	//                     promotion_allowed_on_batch(last_batch_fully_acked).
+	// Returns nothing; mutates the real member state so assertions read it back.
+	data_batch_size = BATCH;
+	auto run_incoming = [&](int rx_bsi, uint32_t rx_bitmap) {
+		// Each new batch-TX epoch resets these (arq_commander.cc:1742).
+		last_batch_fully_acked = false;
+		data_ack_received = NO;
+		bool accepted = sack_clean_confirmation_accepted(
+			rx_bsi, rx_bitmap, data_batch_size, cmd_bsi, prev_bsi, last_applied);
+		uint32_t all_ones = (data_batch_size >= 32)
+			? 0xFFFFFFFFu : ((1u << data_batch_size) - 1u);
+		bool is_clean = (rx_bitmap == all_ones);
+		if(accepted)
+		{
+			// Liveness on BOTH clean and partial — unchanged.
+			data_ack_received = YES;
+			if(is_clean)
+			{
+				// CLEAN branch → v2_ack_pat_pre_detected → the ACK_PAT funnel
+				// (arq_commander.cc:2950): the ONLY producer of these.
+				last_batch_fully_acked = true;
+				stats.nBatches_fully_acked++;
+				last_transmission_block_stats.nBatches_fully_acked++;
+			}
+			// nBatches_acked bumps on BOTH (existing meaning) — not asserted here.
+		}
+		// --- promotion consumers (the :3411-else gate) ---
+		if(data_ack_received==YES && promotion_allowed_on_batch(last_batch_fully_acked))
+		{
+			break_drop_step = 2;
+			breaks_since_last_data_success = 0;
+			if(config_ladder_index(current_configuration) >
+			   config_ladder_index(last_data_viable_config))
+				last_data_viable_config = current_configuration;
+		}
+		// --- FRAME-UP counter (the :3498 gate; clean predicate is the term we test) ---
+		if(data_ack_received==YES && promotion_allowed_on_batch(last_batch_fully_acked))
+			consecutive_data_acks++;
+	};
+
+	// ---- Part A: batch COMPLETED via prev-storage → CLEAN confirmation ----
+	// RSP delivered the recovered batch and sent an all-ones ACK for bsi=N.
+	last_data_viable_config = ROBUST_0;
+	breaks_since_last_data_success = 1;   // a prior BREAK pending
+	break_drop_step = 8;                  // mid-descent aggression
+	consecutive_data_acks = 1;            // one prior clean climb step
+	stats.nBatches_fully_acked = 0;
+	last_transmission_block_stats.nBatches_fully_acked = 0;
+	run_incoming(N, all_ones_25);
+	check(last_batch_fully_acked == true,
+		"A1 prev-delivered CLEAN confirmation sets last_batch_fully_acked TRUE",
+		last_batch_fully_acked ? 1 : 0, 1);
+	check(last_data_viable_config == CONFIG_0,
+		"A2 prev-delivered confirmation RAISES anchor to current rung",
+		last_data_viable_config, CONFIG_0);
+	check(breaks_since_last_data_success == 0,
+		"A3 prev-delivered confirmation resets BREAK panic counter",
+		breaks_since_last_data_success, 0);
+	check(break_drop_step == 2,
+		"A4 prev-delivered confirmation resets break_drop_step aggression",
+		break_drop_step, 2);
+	check(consecutive_data_acks == 2,
+		"A5 prev-delivered confirmation advances FRAME-UP counter",
+		consecutive_data_acks, 2);
+	check((int)stats.nBatches_fully_acked == 1,
+		"A6 prev-delivered confirmation bumps nBatches_fully_acked",
+		(int)stats.nBatches_fully_acked, 1);
+
+	// ---- Part B: batch still INCOMPLETE → only a PARTIAL arrives ----
+	// The RSP never reached the prev-delivery success block (a frame is still
+	// missing), so no completion ACK is sent — the CMD only ever sees the partial
+	// bitmap. It must NOT promote.
+	last_data_viable_config = ROBUST_0;
+	breaks_since_last_data_success = 1;
+	break_drop_step = 8;
+	consecutive_data_acks = 1;
+	stats.nBatches_fully_acked = 0;
+	last_transmission_block_stats.nBatches_fully_acked = 0;
+	// Use a FRESH bsi for the partial so the dedupe doesn't mask the test intent;
+	// the point is "partial bitmap → no promotion", independent of dedupe.
+	{
+		int fresh_partial_bsi = N;        // in-window (prev_bsi), not yet applied here
+		int saved_applied = last_applied; (void)saved_applied;
+		run_incoming(fresh_partial_bsi, partial_24);
+	}
+	check(last_batch_fully_acked == false,
+		"B1 still-incomplete batch leaves last_batch_fully_acked FALSE",
+		last_batch_fully_acked ? 1 : 0, 0);
+	check(last_data_viable_config == ROBUST_0,
+		"B2 still-incomplete batch does NOT raise anchor",
+		last_data_viable_config, ROBUST_0);
+	check(breaks_since_last_data_success == 1,
+		"B3 still-incomplete batch does NOT reset BREAK panic counter",
+		breaks_since_last_data_success, 1);
+	check(break_drop_step == 8,
+		"B4 still-incomplete batch does NOT reset break_drop_step",
+		break_drop_step, 8);
+	check(consecutive_data_acks == 1,
+		"B5 still-incomplete batch does NOT advance FRAME-UP counter",
+		consecutive_data_acks, 1);
+	check((int)stats.nBatches_fully_acked == 0,
+		"B6 still-incomplete batch does NOT bump nBatches_fully_acked",
+		(int)stats.nBatches_fully_acked, 0);
+
+	// ---- Part C: the +1 anchor clamp / FULL-delivery guard is UNCHANGED ----
+	// promotion_allowed_on_batch is still the sole promotion gate, so a partial
+	// (Part B) can never promote regardless of the new confirmation path.
+	check(promotion_allowed_on_batch(false) == false,
+		"C1 partial still NOT promotion-eligible (guard unchanged)",
+		promotion_allowed_on_batch(false) ? 1 : 0, 0);
+	check(promotion_allowed_on_batch(true) == true,
+		"C2 clean IS promotion-eligible (guard unchanged)",
+		promotion_allowed_on_batch(true) ? 1 : 0, 1);
+
+	printf("[TEST-DELIV-ANCHOR] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
