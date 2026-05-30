@@ -2531,9 +2531,40 @@ skip_h_retry_point:
 				// CSI from DFT-smoothed estimated_channel gives per-subcarrier |H|²,
 				// normalized by mean to prevent LLR saturation.
 				variance = ofdm.noise_variance_estimate;
-				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f Nsymb=%d amprest=%d\n",
+
+				// CFG16 32-QAM clean-channel regression fix
+				// (fact-documents/data-flow-noise_variance_estimate.md §4/§5).
+				//
+				// noise_variance_estimate (cross-pilot differential, A.1.4 commit 9c3fc40) measures
+				// the PRE-equalization channel noise σ²/|X|² in raw bins. The demapper below operates
+				// on the EQUALIZED constellation (Y/H), whose per-symbol noise is σ²·E[1/|H|²] — a
+				// larger quantity that also carries DFT-smoothing leakage and pilot interpolation
+				// error. On a flat clean channel the cross-pilot delta → ~0 (correct AS a pre-EQ
+				// noise estimate) while the real equalized EVM stays ~0.2. Feeding the collapsed
+				// value to psk.demod scaled LLRs ~1000× over-confident; psk.cc var_floor=0.001 still
+				// left them ~200× hot, flipping inner 32-QAM bit signs → BP hit the iter cap → CRC
+				// fail → 0 bps. 16-QAM tolerated the wrong magnitude (link alive); 32-QAM did not.
+				//
+				// Root fix: scale the demap by demap_variance = max(noise_variance_estimate,
+				// measure_var). measure_var (telecom_system.cc:2525 = ofdm.measure_variance, the mean
+				// post-EQ pilot residual |Y_pilot/H − X|²) IS the noise variance on the equalized
+				// constellation the Euclidean demapper needs (psk.cc:325 LLR = ΔD/variance) — a
+				// measured quantity, not a tuned constant. max() keeps the cross-pilot estimate where
+				// it is legitimately larger (fast-varying channel / very low SNR).
+				//
+				// Scope (CLAUDE.md §5 — see fact-doc §5): demap_variance feeds ONLY psk.demod. The
+				// original `variance` is left UNCHANGED so (a) the LS-path SNR report at
+				// telecom_system.cc:2739 and the gearshift that consumes it are byte-identical to
+				// before, and (b) noise_variance_estimate itself is untouched, so the MMSE-ZF erasure
+				// (ofdm.cc:2144) and the noise sync gate (telecom_system.cc:2495) are unchanged. MFSK
+				// never reaches this branch (it demods via mfsk.cc with its own guard-bin noise
+				// estimate, mfsk.cc:973-1001), so A.1.4's low-SNR ROBUST recovery is unaffected.
+				double demap_variance = (measure_var > ofdm.noise_variance_estimate)
+					? measure_var : ofdm.noise_variance_estimate;
+
+				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f demap_var=%.6e Nsymb=%d amprest=%d\n",
 					receive_stats.sync_trials, current_configuration,
-					ofdm.noise_variance_estimate, measure_var, ofdm.Nsymb,
+					ofdm.noise_variance_estimate, measure_var, demap_variance, ofdm.Nsymb,
 					ofdm.channel_estimator_amplitude_restoration);
 				fflush(stdout);
 
@@ -2562,7 +2593,7 @@ skip_h_retry_point:
 
 				ofdm.deframer(data_container.equalized_data,data_container.ofdm_deframed_data);
 				deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
-				psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
+				psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,(float)demap_variance);
 
 				// Normalize CSI weights by mean → average weight = 1.0.
 				// This preserves relative per-subcarrier quality (tells LDPC which
@@ -2595,7 +2626,7 @@ skip_h_retry_point:
 					// Phase-2: --csi-llr=off — uniform LLR path (pre-IONOS behavior).
 					ofdm.deframer(data_container.equalized_data,data_container.ofdm_deframed_data);
 					deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
-					psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
+					psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,(float)demap_variance);
 				}
 			}
 
