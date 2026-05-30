@@ -2504,16 +2504,37 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// never sends a SACK in that case (no batch_started),
 							// so treat as a false decode.
 							bool bitmap_ok = (rx_bitmap != 0u);
-							// Sanity 3: dedupe vs the last SACK we already applied
+							// Classify CLEAN (all-ones) vs PARTIAL before the dedup
+							// decision (CLIMB C1). all_ones is sized from the current
+							// negotiated data_batch_size — the RSP sends the same size
+							// (arq_responder.cc:1656 clean path, :and the prev-clean path).
+							uint32_t all_ones = (data_batch_size >= 32)
+								? 0xFFFFFFFFu
+								: ((1u << data_batch_size) - 1u);
+							bool is_clean_confirm = (rx_bitmap == all_ones);
+							// Sanity 3: dedupe vs the last event we already applied
 							// (mirrors the OFDM SACK_RSP duplicate guard at ~2141).
-							bool duplicate = ((int)rx_bsi == cmd_last_applied_sack_bsi);
+							// CLIMB C1 — split the dedup by event class:
+							//   • A repeated PARTIAL SACK for a bsi we already applied
+							//     a partial for re-queues no new retransmits → drop it.
+							//     (cmd_last_applied_sack_bsi, unchanged semantics.)
+							//   • A CLEAN (all-ones) confirmation is a TERMINAL
+							//     "batch fully delivered" state-transition. It must NOT
+							//     be deduped against a prior PARTIAL on the same bsi —
+							//     that is exactly the RSP prev-path delivery confirmation
+							//     (the retransmit just completed the batch the partial
+							//     SACK opened), and dropping it leaves last_batch_fully_acked
+							//     false forever → the rung never promotes (the climb stall).
+							//     We dedup a clean confirmation only against a prior CLEAN
+							//     for the same bsi (cmd_last_applied_clean_bsi), so the RSP
+							//     re-emitting it cannot double-count nBatches_fully_acked.
+							bool duplicate = is_clean_confirm
+								? ((int)rx_bsi == cmd_last_applied_clean_bsi)
+								: ((int)rx_bsi == cmd_last_applied_sack_bsi);
 
 							if(bsi_in_window && bitmap_ok && !duplicate)
 							{
-								uint32_t all_ones = (data_batch_size >= 32)
-									? 0xFFFFFFFFu
-									: ((1u << data_batch_size) - 1u);
-								if(rx_bitmap == all_ones)
+								if(is_clean_confirm)
 								{
 									// CLEAN BATCH — mirror OFDM_ACK_CLEAN handler
 									// (~line 2178). Only state change there is
@@ -2522,6 +2543,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// owns register_ack(), stats, opt_record_batch,
 									// policy_evaluate_axis2, axis3_batch_tick, etc.
 									v2_ack_pat_pre_detected = true;
+									// CLIMB C1 — remember the bsi so a re-emitted clean
+									// confirmation for the same batch is deduped (above)
+									// and never double-bumps nBatches_fully_acked.
+									cmd_last_applied_clean_bsi = (int)rx_bsi;
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									printf("[CMD-MFSK-ACK-SACK] CLEAN batch_seq_id=%u (cmd_batch_seq_id=%d) "
 										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
@@ -3847,19 +3872,47 @@ void cl_arq_controller::process_control_commander()
 			sack_v2_enabled = sack_enabled;
 			if(sack_enabled)
 			{
-				// Update batch size now that SACK is negotiated. 30s target
-				// matches the formula in arq_common.cc batch sizing.
-				int max_batch = (message_transmission_time_ms > 0)
-					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-				if(max_batch < 5) max_batch = 5;
-				if(max_batch > nMessages) max_batch = nMessages;
-				int new_batch = radio_batch_size;
-				if(new_batch > max_batch) new_batch = max_batch;
-				set_data_batch_size(new_batch);
-				nominal_batch_size = new_batch;
-				recalculate_ack_timeout_for_batch();
-				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
-					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
+				// CLIMB C2 — the SACK-negotiation batch recompute is for OFDM
+				// (WB / NB-OFDM) configs ONLY. ROBUST_0/1/2 (MFSK) deliberately run
+				// batch=1: set_configuration already set data_batch_size=1 for robust
+				// (arq_common.cc:1229-1234), and the matching OFDM batch-scaling at
+				// arq_common.cc:1269 is itself gated `!is_robust_config` for the same
+				// reason — MFSK's all-or-nothing pattern ACK makes P(batch)=p^N, so any
+				// batch>1 at the ROBUST cliff turns one bad frame into a whole-batch
+				// loss and the link can't climb off the floor. Pre-C2 this block re-ran
+				// the 30s formula UNCONDITIONALLY (floored at 5) and CLOBBERED robust's
+				// batch=1 back up to 5+ — the config path had correctly left it at 1,
+				// then this overrode it the moment SACK negotiated. Gate the WHOLE
+				// recompute on !is_robust_config so robust keeps the batch=1 that
+				// set_configuration installed; OFDM behavior is byte-for-byte unchanged.
+				// See data-flow-messages_rx_prev.md §4.4 / gearshift §9.
+				if(!is_robust_config(current_configuration))
+				{
+					// Update batch size now that SACK is negotiated. 30s target
+					// matches the formula in arq_common.cc batch sizing.
+					int max_batch = (message_transmission_time_ms > 0)
+						? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+					if(max_batch < 5) max_batch = 5;
+					if(max_batch > nMessages) max_batch = nMessages;
+					int new_batch = radio_batch_size;
+					if(new_batch > max_batch) new_batch = max_batch;
+					set_data_batch_size(new_batch);
+					nominal_batch_size = new_batch;
+					recalculate_ack_timeout_for_batch();
+				}
+				else
+				{
+					// Robust: leave data_batch_size at the 1 set_configuration set.
+					// Still refresh the ACK timeout (set_data_batch_size is the only
+					// other caller of recalculate_ack_timeout_for_batch on this path;
+					// keeping it ensures the timeout reflects the just-negotiated SACK
+					// state even though the batch size itself did not move).
+					nominal_batch_size = data_batch_size;
+					recalculate_ack_timeout_for_batch();
+				}
+				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+					radio_batch_size, crypto_batch_size, retransmit_headroom,
+					data_batch_size, is_robust_config(current_configuration) ? 1 : 0);
 			}
 			else
 			{
@@ -6030,6 +6083,234 @@ int cl_arq_controller::test_clean_batch_viability()
 	breaks_since_last_data_success = 0;            // restore
 
 	printf("[TEST-CLEAN-BATCH] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// CLIMB C1+C2 combined synthetic-fire test (CLI --test-climb-combined).
+//
+// Captures the climb stall two ways (belt-and-suspenders):
+//
+//   C1 — retransmit-completed → clean. When a marginal rung loses a frame, the
+//   RSP sends a PARTIAL SACK (CMD: last_batch_fully_acked stays false), the CMD
+//   retransmits, and the RSP's prev-path (Step 8a) delivers the completed batch
+//   LOCALLY. Pre-C1 the prev-path sent NOTHING back and the CMD's MFSK-ACK-SACK
+//   dedup keyed only on cmd_last_applied_sack_bsi — so even when the prev-path
+//   DID emit a clean confirmation it was dropped as a "duplicate" of the partial
+//   SACK for the same bsi. Result: last_batch_fully_acked never flips true, the
+//   batch that fully delivered never counts toward promotion, the rung is stuck.
+//   The fix splits the dedup: a CLEAN (all-ones) confirmation is exempt from the
+//   PARTIAL tracker and deduped only against cmd_last_applied_clean_bsi. This
+//   test replays the EXACT dedup decision from arq_commander.cc:2509-2533.
+//
+//   C2 — robust keeps batch=1. The SACK-negotiation batch recompute used a hard
+//   5-frame floor for ALL configs, clobbering ROBUST_0/1/2's batch=1 (which
+//   set_configuration installs and the OFDM batch-scaling at arq_common.cc:1269
+//   already protects with the same !is_robust_config gate). At the MFSK cliff a
+//   5-frame batch is P(success)=p^5 — one bad frame loses the whole batch and the
+//   link can't climb. The fix gates the WHOLE recompute on !is_robust_config.
+//   This test exercises the REAL set_data_batch_size() decision for a robust vs
+//   an OFDM config.
+//
+// Returns 0 on pass, 1 on fail. Default builds never call this.
+int cl_arq_controller::test_climb_combined()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-CLIMB] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-CLIMB] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// ============================================================
+	// C1 — CMD MFSK-ACK-SACK dedup: clean prev-path confirmation must
+	//      survive a prior PARTIAL SACK for the SAME bsi.
+	// ============================================================
+	// Replays the dedup decision verbatim from arq_commander.cc:2509-2533.
+	// `apply_mfsk_ack_sack` returns the production triplet:
+	//   accepted   — passed (bsi_in_window && bitmap_ok && !duplicate)
+	//   is_clean   — classified all-ones (would set the production per-poll
+	//                v2_ack_pat_pre_detected local → clean funnel :2929-2956 →
+	//                last_batch_fully_acked=true + nBatches_fully_acked++)
+	// and mutates the SAME dedup state the production code mutates. The local
+	// `clean_funnel_fired` mirrors the production-local v2_ack_pat_pre_detected
+	// (which is a per-poll local in process_messages_rx_acks_data:2406, not a
+	// member — so the test owns its own copy).
+	data_batch_size = 25;             // multi-frame OFDM batch (all_ones = 0x01FFFFFF)
+	cmd_batch_seq_id = 8;             // new-data batch advanced cmd_batch_seq_id to 8;
+	                                  // the in-flight (prev) batch carried bsi = 7.
+	cmd_last_applied_sack_bsi  = -1;  // session start (matches ctor init)
+	cmd_last_applied_clean_bsi = -1;
+	bool clean_funnel_fired = false;
+
+	auto apply_mfsk_ack_sack = [&](unsigned char rx_bsi, uint32_t rx_bitmap,
+	                               bool* out_accepted, bool* out_is_clean) {
+		// --- verbatim mirror of arq_commander.cc:2496-2533 ---
+		unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
+		unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+		bool bsi_in_window =
+			((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+		bool bitmap_ok = (rx_bitmap != 0u);
+		uint32_t all_ones = (data_batch_size >= 32)
+			? 0xFFFFFFFFu
+			: ((1u << data_batch_size) - 1u);
+		bool is_clean_confirm = (rx_bitmap == all_ones);
+		bool duplicate = is_clean_confirm
+			? ((int)rx_bsi == cmd_last_applied_clean_bsi)
+			: ((int)rx_bsi == cmd_last_applied_sack_bsi);
+		bool accepted = (bsi_in_window && bitmap_ok && !duplicate);
+		if(accepted)
+		{
+			if(is_clean_confirm)
+			{
+				clean_funnel_fired = true;
+				cmd_last_applied_clean_bsi = (int)rx_bsi;
+			}
+			else
+			{
+				cmd_last_applied_sack_bsi = (int)rx_bsi;
+			}
+		}
+		*out_accepted = accepted;
+		*out_is_clean = is_clean_confirm;
+	};
+
+	uint32_t all_ones_25 = (1u << 25) - 1u;        // clean bitmap for batch=25
+	uint32_t partial_bm  = all_ones_25 & ~(1u << 3); // frame 3 missing → PARTIAL
+
+	bool acc = false, cln = false;
+
+	// Step 1: PARTIAL SACK for the in-flight batch (bsi=7). Accepted as a
+	// retransmit decision; sets cmd_last_applied_sack_bsi=7; NOT clean.
+	apply_mfsk_ack_sack(7, partial_bm, &acc, &cln);
+	check(acc, "C1.1 partial SACK (bsi=7) accepted", acc ? 1 : 0, 1);
+	check(!cln, "C1.2 partial SACK classified PARTIAL (not clean)", cln ? 1 : 0, 0);
+	check(cmd_last_applied_sack_bsi == 7,
+		"C1.3 partial SACK recorded in cmd_last_applied_sack_bsi",
+		cmd_last_applied_sack_bsi, 7);
+	check(!clean_funnel_fired,
+		"C1.4 partial SACK does NOT set the clean pre-detect flag",
+		clean_funnel_fired ? 1 : 0, 0);
+
+	// Step 2: the RSP prev-path completes the retransmit and emits a CLEAN
+	// (all-ones) confirmation for the SAME bsi=7. THE BUG: pre-C1 this was
+	// deduped against cmd_last_applied_sack_bsi(=7) and DROPPED. Post-fix it
+	// must be ACCEPTED + classified CLEAN → drives last_batch_fully_acked=true.
+	clean_funnel_fired = false;  // CMD clears the per-poll local before the decode
+	apply_mfsk_ack_sack(7, all_ones_25, &acc, &cln);
+	check(acc, "C1.5 CLEAN prev-path confirmation (bsi=7) ACCEPTED despite prior partial "
+		"(FAIL-BEFORE: pre-C1 deduped against cmd_last_applied_sack_bsi)",
+		acc ? 1 : 0, 1);
+	check(cln, "C1.6 confirmation classified CLEAN (all-ones)", cln ? 1 : 0, 1);
+	check(clean_funnel_fired,
+		"C1.7 clean confirmation fires the clean funnel (→ :2929-2956 sets "
+		"last_batch_fully_acked=true + nBatches_fully_acked++)",
+		clean_funnel_fired ? 1 : 0, 1);
+	check(cmd_last_applied_clean_bsi == 7,
+		"C1.8 clean confirmation recorded in cmd_last_applied_clean_bsi",
+		cmd_last_applied_clean_bsi, 7);
+
+	// Step 3: a REPEATED clean confirmation for bsi=7 (RSP re-emit / ring echo)
+	// MUST be deduped — otherwise nBatches_fully_acked double-counts.
+	clean_funnel_fired = false;
+	apply_mfsk_ack_sack(7, all_ones_25, &acc, &cln);
+	check(!acc, "C1.9 REPEATED clean confirmation (bsi=7) deduped (no double-count)",
+		acc ? 1 : 0, 0);
+	check(!clean_funnel_fired,
+		"C1.10 repeated clean does NOT re-fire the clean funnel",
+		clean_funnel_fired ? 1 : 0, 0);
+
+	// Step 4: bitmap=0 is never a real confirmation (no batch_started) — rejected
+	// on both event classes (regression guard for the bitmap_ok sanity).
+	apply_mfsk_ack_sack(7, 0u, &acc, &cln);
+	check(!acc, "C1.11 bitmap=0 rejected (bitmap_ok sanity intact)", acc ? 1 : 0, 0);
+
+	// ============================================================
+	// C2 — SACK-negotiation batch recompute: robust keeps batch=1,
+	//      OFDM grows to the 5-frame floor.
+	// ============================================================
+	// Exercises the REAL set_data_batch_size() path. Set valid buffer lengths so
+	// set_data_batch_size()'s clamp (arq_common.cc:564) is benign.
+	max_data_length   = 200;
+	max_header_length = 7;
+	radio_batch_size  = 25;
+
+	// Local replay of the gated recompute (verbatim mirror of
+	// arq_commander.cc / arq_responder.cc CLIMB C2 block). Drives the SAME
+	// !is_robust_config branch + the SAME set_data_batch_size() helper.
+	auto sack_negotiate_batch = [&]() {
+		if(!is_robust_config(current_configuration))
+		{
+			int max_batch = (message_transmission_time_ms > 0)
+				? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+			if(max_batch < 5) max_batch = 5;
+			if(max_batch > nMessages) max_batch = nMessages;
+			int new_batch = radio_batch_size;
+			if(new_batch > max_batch) new_batch = max_batch;
+			set_data_batch_size(new_batch);
+			nominal_batch_size = new_batch;
+		}
+		else
+		{
+			nominal_batch_size = data_batch_size;
+		}
+	};
+
+	// --- C2a: ROBUST_0, long MFSK frame time. set_configuration installed
+	// batch=1; the gate must LEAVE it at 1. Pre-C2 the unconditional floor
+	// would have produced max(5, 30000/5000=6)=6 → batch=6 (FAIL-BEFORE). ---
+	current_configuration = ROBUST_0;
+	message_transmission_time_ms = 5000;   // MFSK frame ~5s → formula → 6 (>1)
+	nMessages = 120;
+	data_batch_size = 1;                   // as set_configuration set for robust
+	nominal_batch_size = 1;
+	sack_negotiate_batch();
+	check(data_batch_size == 1,
+		"C2a ROBUST_0 keeps batch=1 after SACK negotiation "
+		"(FAIL-BEFORE: unconditional 5-frame floor forced >=5)",
+		data_batch_size, 1);
+	check(nominal_batch_size == 1,
+		"C2b ROBUST_0 nominal_batch_size stays 1", nominal_batch_size, 1);
+
+	// --- C2c: ROBUST_2 same invariant (whole robust band) ---
+	current_configuration = ROBUST_2;
+	data_batch_size = 1;
+	nominal_batch_size = 1;
+	sack_negotiate_batch();
+	check(data_batch_size == 1, "C2c ROBUST_2 keeps batch=1", data_batch_size, 1);
+
+	// --- C2d: OFDM config (CONFIG_0) UNCHANGED — still grows to >=5. With
+	// message_transmission_time_ms=400 the formula → 75, clamped to
+	// radio_batch_size=25. Confirms the gate did NOT perturb the OFDM path. ---
+	current_configuration = CONFIG_0;
+	message_transmission_time_ms = 400;    // WB-ish frame time
+	data_batch_size = 1;                   // pretend it started low
+	nominal_batch_size = 1;
+	sack_negotiate_batch();
+	check(data_batch_size >= 5,
+		"C2d OFDM CONFIG_0 batch grows to >=5 floor (OFDM path unchanged)",
+		data_batch_size, 25);
+	check(data_batch_size == 25,
+		"C2e OFDM CONFIG_0 batch = min(radio_batch_size, formula) = 25",
+		data_batch_size, 25);
+
+	// --- C2f: OFDM config with a SLOW frame time hits the 5-frame floor (the
+	// floor itself is intact for OFDM). 30000/8000=3.75→4, floored to 5. ---
+	current_configuration = CONFIG_0;
+	message_transmission_time_ms = 8000;
+	data_batch_size = 1;
+	nominal_batch_size = 1;
+	sack_negotiate_batch();
+	check(data_batch_size == 5,
+		"C2f OFDM slow-frame batch floored to 5 (floor preserved for OFDM)",
+		data_batch_size, 5);
+
+	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

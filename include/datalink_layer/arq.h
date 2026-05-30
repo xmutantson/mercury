@@ -631,6 +631,19 @@ public:
   // never call this. See gearshift-start-and-recovery.md §9.8.
   int test_clean_batch_viability();
 
+  // CLIMB C1+C2 combined synthetic-fire test (CLI --test-climb-combined).
+  // C1: replays the CMD MFSK-ACK-SACK dedup decision (arq_commander.cc:2509-2533)
+  //     — a CLEAN (all-ones) prev-path delivery confirmation for a bsi a PARTIAL
+  //     SACK already touched is NOT deduped (so last_batch_fully_acked flips true
+  //     and nBatches_fully_acked bumps → the retransmit-completed batch promotes),
+  //     while a REPEATED clean for the same bsi IS deduped (no double-count). The
+  //     pre-fix single-tracker dedup dropped the clean confirmation → fail-before.
+  // C2: replays the SACK-negotiation batch recompute (arq_commander.cc / responder)
+  //     — a ROBUST config keeps batch=1; an OFDM config grows to the 5-frame floor.
+  //     The pre-fix unconditional floor forced robust to 5 → fail-before.
+  // Returns 0 on pass, 1 on fail. Default builds never call this.
+  int test_climb_combined();
+
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
   // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:
@@ -1442,6 +1455,20 @@ public:
   // still in the ring on a subsequent poll. -1 = no SACK_RSP applied
   // yet this session. Init in init_messages_buffers.
   int cmd_last_applied_sack_bsi;
+
+  // CLIMB C1 — last bsi (mod 256) we accepted a CLEAN (all-ones) MFSK
+  // ACK+SACK confirmation for. Distinct from cmd_last_applied_sack_bsi
+  // (which dedups PARTIAL retransmit decisions). A clean confirmation is
+  // a terminal "batch fully delivered" state-transition that SUPERSEDES a
+  // prior partial SACK for the same bsi — so it must NOT be deduped against
+  // cmd_last_applied_sack_bsi (else the RSP prev-path delivery confirmation,
+  // which carries the prev batch's bsi that a partial SACK already touched,
+  // would be silently dropped and the rung would never promote). This
+  // separate tracker dedups a REPEATED clean confirmation for the same bsi
+  // (e.g. the RSP re-emitting it) without blocking the partial→clean
+  // transition. -1 = no clean confirmation applied yet this session.
+  // Init in init_messages_buffers. See data-flow-messages_rx_prev.md §2.6.
+  int cmd_last_applied_clean_bsi;
 
   // §7.13.30 — v2 OFDM dispatch new-audio throttle. The v2 SACK window
   // no longer calls receive_ack_pattern() (which used to drive ftr

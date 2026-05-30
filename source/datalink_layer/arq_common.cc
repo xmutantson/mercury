@@ -367,6 +367,8 @@ cl_arq_controller::cl_arq_controller()
 	v2_ackpat_defer_count_this_window=0;  // Bug A fix (§7.13.1)
 	// §7.13.29 init
 	cmd_last_applied_sack_bsi = -1;
+	// CLIMB C1 init — no clean confirmation applied yet this session.
+	cmd_last_applied_clean_bsi = -1;
 	sack_arrival_history_count = 0;
 	sack_arrival_history_next_idx = 0;
 	for(int i=0; i<SACK_ARRIVAL_HISTORY; i++) sack_arrival_history_ms[i] = 0;

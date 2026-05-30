@@ -763,15 +763,80 @@ void cl_arq_controller::process_messages_rx_data_control()
 							// double-ensure safety).
 							for(int i=0; i<this->nMessages; i++)
 								messages_rx_prev[i].status = FREE;
+							int prev_delivered_expected      = rsp_prev_batch_expected_count;
 							rsp_prev_batch_active            = false;
 							rsp_prev_batch_received_count    = 0;
 							rsp_prev_batch_expected_count    = 0;
 							rsp_prev_batch_delivered_count++;
 							printf("[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=%d "
-								"deliveries_total=%lld (cross-storage path drained; "
-								"current-batch storage untouched)\n",
-								rsp_prev_batch_seq_id, rsp_prev_batch_delivered_count);
+								"deliveries_total=%lld expected=%d (cross-storage path "
+								"drained; current-batch storage untouched)\n",
+								rsp_prev_batch_seq_id, rsp_prev_batch_delivered_count,
+								prev_delivered_expected);
 							fflush(stdout);
+
+							// CLIMB C1 — emit an all-ones CLEAN delivery confirmation for
+							// the just-completed prev batch. The prev path (Step 8a) drains
+							// retransmitted frames into messages_rx_prev[] and delivers them
+							// LOCALLY, but pre-C1 it sent NOTHING back: the CMD's original
+							// partial SACK left last_batch_fully_acked=false, and no later
+							// signal flipped it true once the retransmit completed the batch
+							// — so a marginal rung that only ever closed via retransmit never
+							// promoted (the climb stall; see gearshift §9 + memory "climb").
+							// The fix mirrors the clean-batch ACK transport at the ACK-GATE
+							// (arq_responder.cc:1644-1690): send the MFSK ACK+SACK suffix with
+							// the PREV batch's bsi and an all-ones bitmap. On the CMD side this
+							// decodes to rx_bitmap==all_ones at arq_commander.cc:2516 and funnels
+							// (via v2_ack_pat_pre_detected) into the clean-ACK handler at
+							// :2929-2956, which sets last_batch_fully_acked=true and bumps
+							// nBatches_fully_acked — the SAME promotion-eligible producer set as
+							// a first-pass clean batch. WB-only (suffix_len()>0); NB (no suffix)
+							// keeps batch=1 and never routes a multi-frame retransmit through
+							// this prev path, so the bare-pattern fallback is intentionally NOT
+							// used here (a bare ACK pattern would be ambiguous with the
+							// current-batch ACK detector). Bitmap is sized from the CURRENT
+							// data_batch_size so it matches the CMD's all_ones computation at
+							// :2513 (CMD and RSP carry the same negotiated batch size); the
+							// dedicated ack_mfsk codec is config/mode-independent
+							// (telecom_system.cc:3063), so no set_mfsk_ctrl_mode() toggle is
+							// needed. See data-flow-messages_rx_prev.md §2.6 / §4.4.
+							if(sack_v2_enabled
+							   && MFSK_ACK_SACK_ENABLED
+							   && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
+							{
+								unsigned char prev_ack_bsi = (unsigned char)(
+									rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
+								// 30-bit cap (Phase B Wave 1 flag-day, fact-doc §11.2):
+								// never set bits 30/31 — they are silently dropped by
+								// pack_ack_sack_payload. Mirrors the clean path at :1656-1661.
+								uint32_t prev_bitmap;
+								if(data_batch_size >= 30)
+									prev_bitmap = 0x3FFFFFFFu;
+								else if(data_batch_size <= 0)
+									prev_bitmap = 0u;
+								else
+									prev_bitmap = (1u << data_batch_size) - 1u;
+								printf("[RSP-MFSK-SACK] prev-clean path: batch_seq_id=%u "
+									"bitmap=0x%08x nframes=%d\n",
+									(unsigned)prev_ack_bsi, (unsigned)prev_bitmap,
+									data_batch_size);
+								fflush(stdout);
+								long long mfsk_ms = send_mfsk_ack_sack(prev_ack_bsi, prev_bitmap);
+								if(mfsk_ms > 0)
+								{
+									printf("[TX-ACK-SACK] prev-clean via MFSK suffix "
+										"wire_ms=%lld bsi=%u\n",
+										mfsk_ms, (unsigned)prev_ack_bsi);
+									fflush(stdout);
+								}
+								else
+								{
+									printf("[RSP-MFSK-SACK] prev-clean MFSK suffix returned 0 "
+										"— no confirmation emitted (CMD will rely on timeout/"
+										"next-batch ACK; rung promotion deferred)\n");
+									fflush(stdout);
+								}
+							}
 						}
 					}
 					else
@@ -2090,19 +2155,37 @@ void cl_arq_controller::process_control_responder()
 		sack_v2_enabled = sack_enabled;
 		if(sack_enabled)
 		{
-			// Update batch size now that SACK is negotiated. 30s target
-			// matches the formula in arq_common.cc + arq_commander.cc.
-			int max_batch = (message_transmission_time_ms > 0)
-				? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-			if(max_batch < 5) max_batch = 5;
-			if(max_batch > nMessages) max_batch = nMessages;
-			int new_batch = radio_batch_size;
-			if(new_batch > max_batch) new_batch = max_batch;
-			set_data_batch_size(new_batch);
-			nominal_batch_size = new_batch;
-			recalculate_ack_timeout_for_batch();
-			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
-				radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
+			// CLIMB C2 (responder side — MUST mirror the commander gate at
+			// arq_commander.cc to keep CMD/RSP batch sizes synchronized; an
+			// asymmetric override was Bug #9 "RSP batch size not updated after SACK
+			// negotiation"). ROBUST_0/1/2 (MFSK) run batch=1 (set_configuration set
+			// it at arq_common.cc:1229-1234; the OFDM batch-scaling at :1269 is gated
+			// `!is_robust_config`). Pre-C2 this block re-ran the 30s formula
+			// UNCONDITIONALLY and clobbered robust's batch=1 to 5+. Gate the WHOLE
+			// recompute on !is_robust_config so robust keeps batch=1 on BOTH sides;
+			// OFDM behavior is byte-for-byte unchanged. See gearshift §9.
+			if(!is_robust_config(current_configuration))
+			{
+				// Update batch size now that SACK is negotiated. 30s target
+				// matches the formula in arq_common.cc + arq_commander.cc.
+				int max_batch = (message_transmission_time_ms > 0)
+					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+				if(max_batch < 5) max_batch = 5;
+				if(max_batch > nMessages) max_batch = nMessages;
+				int new_batch = radio_batch_size;
+				if(new_batch > max_batch) new_batch = max_batch;
+				set_data_batch_size(new_batch);
+				nominal_batch_size = new_batch;
+				recalculate_ack_timeout_for_batch();
+			}
+			else
+			{
+				nominal_batch_size = data_batch_size;
+				recalculate_ack_timeout_for_batch();
+			}
+			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+				radio_batch_size, crypto_batch_size, retransmit_headroom,
+				data_batch_size, is_robust_config(current_configuration) ? 1 : 0);
 		}
 		else
 		{

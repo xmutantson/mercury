@@ -363,4 +363,111 @@ mfsk-vara-parity-plan.md §3 R7.
 - `data-flow-optimizer.md` — Axis 2 controller (consumer of
   `data_batch_size`; its dynamic-resize behavior is referenced in §6
   vigilance note and §8 open question).
+
+---
+
+## §10 CLIMB C1 + C2 — prev-path delivery confirmation + robust batch=1
+
+**Status**: shipped on `fix/climb-combined` (worktree off `monitor` 3b1726a),
+2026-05-30. Paired regression: `mercury.exe --test-climb-combined` (C1.1–C1.11 +
+C2a–C2f, all-inline replay of the production dedup + batch-recompute decisions;
+fail-before verified by reverting both predicates to their pre-fix form →
+C1.5/C1.7/C1.8 + C2a/C2b/C2c FAIL).
+
+### The disease (the "climb stall")
+
+At a marginal rung a batch loses ≥1 frame → RSP sends a PARTIAL SACK → CMD sets
+`last_batch_fully_acked=false` (correct: §9 CLEAN-BATCH VIABILITY — a partial
+must NOT promote) and retransmits the gaps. The retransmitted frames carry the
+ORIGINAL bsi (`arq_commander.cc:1207/1466`; `cmd_batch_seq_id` only advances on a
+new-data batch, `:1722`), so on the RSP they match `rsp_prev_batch_seq_id` and
+route to `messages_rx_prev[]` (§1.3). When they complete the prev batch, the
+completion gate (§2.1) delivers it LOCALLY and logs `[RSP-V2-PREV-DELIVERED]`.
+
+**Pre-C1 the prev path emitted NOTHING back.** So the batch that just FULLY
+delivered never produced a clean confirmation on the CMD — `last_batch_fully_acked`
+stayed false forever, `nBatches_fully_acked` never incremented, and the rung
+never satisfied the promotion gate (`promotion_allowed_on_batch`,
+`arq_commander.cc:3427/3498`; success-rate_data_clean, `:4555-4557`). The link
+stayed alive (keepalive) but could not climb. This is distinct from — and
+downstream of — the §9 partial-must-not-promote rule: §9 correctly blocks the
+partial; C1 supplies the MISSING clean signal once the retransmit finishes.
+
+### C1 fix — two halves
+
+**Producer (new, RSP side)** — `arq_responder.cc`, inside the
+`[RSP-V2-PREV-DELIVERED]` block (after the prev-batch completion gate §2.1):
+emit an MFSK ACK+SACK with `bsi = rsp_prev_batch_seq_id` and an all-ones bitmap
+sized from the CURRENT `data_batch_size`. This mirrors the clean-batch ACK
+transport at the ACK-GATE (`arq_responder.cc:1644-1690`). WB-only
+(`ack_sack_suffix_len() > 0`); the dedicated `ack_mfsk` codec is config/mode-
+independent (`telecom_system.cc:3063`) so no `set_mfsk_ctrl_mode()` toggle is
+needed. NB (suffix_len==0) keeps batch=1 (C2) and never routes a multi-frame
+retransmit through the prev path, so the bare-pattern fallback is intentionally
+NOT used (it would be ambiguous with the current-batch ACK detector).
+
+**Consumer (CMD side)** — the existing MFSK-ACK-SACK handler
+(`arq_commander.cc:2496-2533`) decodes the all-ones bitmap → classifies CLEAN →
+sets the per-poll `v2_ack_pat_pre_detected` local → funnels through the clean-ACK
+handler (`:2929-2956`) which sets `last_batch_fully_acked=true` and bumps
+`nBatches_fully_acked` (the SAME producer set as a first-pass clean batch).
+`promotion_allowed_on_batch` and the FRAME-UP +1 anchor clamp (`:3480-3487`)
+are UNCHANGED — C1 only supplies the input they were already waiting for.
+
+**The dedup hazard C1 had to fix** — the handler keyed duplicate suppression on
+a single `cmd_last_applied_sack_bsi` (`:2509`). The original partial SACK set it
+to the prev bsi (`:2545`), so the all-ones confirmation for the SAME bsi was
+dropped as a "duplicate" and the fix would have been inert. C1 splits the dedup
+by event class: a CLEAN (all-ones) confirmation is exempt from the PARTIAL
+tracker and deduped only against a NEW member `cmd_last_applied_clean_bsi`
+(`arq.h`, init -1 in the ctor, `arq_common.cc`). Rationale: a partial SACK is a
+RETRANSMIT decision (re-applying re-queues nothing → suppress repeats); a clean
+confirmation is a TERMINAL batch-complete STATE TRANSITION that supersedes the
+partial. The clean tracker still dedups a REPEATED clean (RSP re-emit / ring
+echo) so `nBatches_fully_acked` cannot double-count (test C1.9/C1.10).
+
+### C2 fix — robust keeps batch=1
+
+`set_configuration` installs `data_batch_size=1` for ROBUST_0/1/2
+(`arq_common.cc:1229-1234`), and the OFDM batch-scaling at `:1269` is itself
+gated `!is_robust_config` for the same reason. But the SACK-NEGOTIATION batch
+recompute (CMD `arq_commander.cc` TEST_CONNECTION handler; RSP `arq_responder.cc`
+`process_control_responder`) re-ran the 30 s formula UNCONDITIONALLY with a hard
+`if(max_batch<5) max_batch=5` floor — clobbering robust's batch=1 up to 5+ the
+moment SACK negotiated. At the MFSK cliff P(batch)=p^N, so a 5-frame batch turns
+one bad frame into a whole-batch loss and the link cannot climb off ROBUST_0.
+C2 gates the WHOLE recompute on `!is_robust_config(current_configuration)` on
+BOTH sides (the symmetry is mandatory — an asymmetric override was the original
+Bug #9 "RSP batch size not updated after SACK negotiation"). OFDM behavior is
+byte-for-byte unchanged (test C2d/C2e/C2f).
+
+### §2.6 New consumer of the prev-batch counters/seq (C1 producer)
+
+`arq_responder.cc` `[RSP-V2-PREV-DELIVERED]` block — reads `rsp_prev_batch_seq_id`
+(still valid; only `_active`/`_received_count`/`_expected_count` are zeroed at the
+top of the block, NOT `_seq_id`) to address the all-ones confirmation. Read-only
+w.r.t. `messages_rx_prev[]` slots (those are already FREE by this point, §2.1).
+
+### §4.4 New invariant
+
+**INV-C1-1**: the all-ones confirmation bitmap is sized from the CURRENT
+`data_batch_size`, which MUST equal the CMD's `data_batch_size` at decode time
+(it does — CMD/RSP carry the same negotiated value, and C2 keeps robust=1 on
+both sides). If they ever diverged, the CMD's `all_ones` (`:2513`) would not
+match `rx_bitmap`, the confirmation would be classified PARTIAL or rejected, and
+the batch would simply not promote (graceful degradation to the pre-C1 behavior —
+no corruption, no double-delivery).
+
+**INV-C1-2**: the prev-path confirmation TX is safe mid-DATA-processing because
+the prev batch only completes via a retransmit-only batch (the "one outstanding
+batch" rule, `arq_responder.cc` tail comment near the prev block), so no
+concurrent new-data frames are clipped by the confirmation's `rx_mute` flush
+(the same flush every ACK TX performs).
+
+### §6 addendum — new vigilance
+
+Add to the §6 checklist: the `[RSP-V2-PREV-DELIVERED]` confirmation TX (C1
+producer) and the CMD clean/partial dedup split (`cmd_last_applied_clean_bsi` vs
+`cmd_last_applied_sack_bsi`). Any change to batch-size negotiation must preserve
+CMD/RSP symmetry (C2) or the all-ones sizing breaks (INV-C1-1).
 - `mfsk-vara-parity-plan.md` §3 R7 — the bug report that drove this fix.

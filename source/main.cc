@@ -342,6 +342,11 @@ int main(int argc, char *argv[])
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
                                         // up-promotion gate; a CLEAN all-ones batch does all of those; and that BREAK can
                                         // still reach ROBUST_0 after a partial-only run. One-shot, exits rc. See §9.
+    bool test_climb_combined_cli = false; // --test-climb-combined: CLIMB C1+C2 regression. C1 — a CLEAN (all-ones) RSP
+                                        // prev-path delivery confirmation for a bsi a PARTIAL SACK already touched is NOT
+                                        // deduped (last_batch_fully_acked flips true → rung promotes), while a repeated clean
+                                        // IS deduped. C2 — a ROBUST config keeps batch=1 through SACK negotiation; OFDM grows
+                                        // to the 5-frame floor. One-shot at startup, exits rc.
     int test_policy_axis1_then_axis2_cli = 0; // --test-policy-axis1-then-axis2=up|down: SACK Design A Step 10 — fire Axis-1
                                         // (engages axis2_cooldown_batches=3) then attempt Axis-2 fire (should be SUPPRESSED).
                                         // 1=axis1=up then axis2=up; 2=axis1=down then axis2=down. One-shot at startup, then exit.
@@ -757,6 +762,13 @@ int main(int argc, char *argv[])
             // exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §9.8.
             test_clean_batch_viability_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-climb-combined") == 0)
+        {
+            // CLIMB C1+C2 regression — one-shot at startup, then exit with rc.
+            test_climb_combined_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1741,6 +1753,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_clean_batch_viability();
             printf("[FLAG] Clean-batch-viability test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_climb_combined_cli) {
+            // CLIMB C1+C2 regression (one-shot, then exit rc). C1 replays the CMD
+            // MFSK-ACK-SACK dedup (clean prev-path confirmation survives a prior
+            // partial SACK for the same bsi); C2 exercises set_data_batch_size()
+            // for a robust (keeps batch=1) vs an OFDM (grows to 5-frame floor) config.
+            printf("[FLAG] --test-climb-combined: invoking CLIMB C1+C2 regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_climb_combined();
+            printf("[FLAG] Climb-combined test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
