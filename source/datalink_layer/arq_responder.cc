@@ -2092,17 +2092,30 @@ void cl_arq_controller::process_control_responder()
 		{
 			// Update batch size now that SACK is negotiated. 30s target
 			// matches the formula in arq_common.cc + arq_commander.cc.
-			int max_batch = (message_transmission_time_ms > 0)
-				? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-			if(max_batch < 5) max_batch = 5;
-			if(max_batch > nMessages) max_batch = nMessages;
-			int new_batch = radio_batch_size;
-			if(new_batch > max_batch) new_batch = max_batch;
-			set_data_batch_size(new_batch);
-			nominal_batch_size = new_batch;
+			//
+			// ROBUST/MFSK configs are EXCLUDED from the >=5 floor — must mirror the
+			// commander gate (arq_commander.cc SACK block) so CMD and RSP agree on
+			// data_batch_size for the negotiated config. load_configuration()
+			// (arq_common.cc:1229-1234) sets data_batch_size=1 for robust configs;
+			// re-applying the floor here would force RSP to batch>=5 while CMD stays
+			// at 1, a CMD/RSP batch mismatch. The responder gates on current_configuration
+			// (the established connect config at TEST_CONNECTION time, == ROBUST_0 for a
+			// robust connect, < 100 for OFDM). OFDM keeps the >=5 floor unchanged.
+			if(!is_robust_config(current_configuration))
+			{
+				int max_batch = (message_transmission_time_ms > 0)
+					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+				if(max_batch < 5) max_batch = 5;
+				if(max_batch > nMessages) max_batch = nMessages;
+				int new_batch = radio_batch_size;
+				if(new_batch > max_batch) new_batch = max_batch;
+				set_data_batch_size(new_batch);
+				nominal_batch_size = new_batch;
+			}
 			recalculate_ack_timeout_for_batch();
-			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
-				radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
+			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+				radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
+				is_robust_config(current_configuration) ? 1 : 0);
 		}
 		else
 		{

@@ -3849,17 +3849,33 @@ void cl_arq_controller::process_control_commander()
 			{
 				// Update batch size now that SACK is negotiated. 30s target
 				// matches the formula in arq_common.cc batch sizing.
-				int max_batch = (message_transmission_time_ms > 0)
-					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-				if(max_batch < 5) max_batch = 5;
-				if(max_batch > nMessages) max_batch = nMessages;
-				int new_batch = radio_batch_size;
-				if(new_batch > max_batch) new_batch = max_batch;
-				set_data_batch_size(new_batch);
-				nominal_batch_size = new_batch;
+				//
+				// ROBUST/MFSK configs are EXCLUDED from the >=5 floor: load_configuration()
+				// (arq_common.cc:1229-1234) deliberately sets data_batch_size=1 for robust
+				// configs, and its batch-scaling path (arq_common.cc:1269) is already gated
+				// on !is_robust_config(). Re-applying the unconditional SACK floor here
+				// would override that and force batch back to >=5 at ROBUST_0, where a clean
+				// all-ones MFSK ACK requires all 5 frames to survive first-pass (it never
+				// does) so the gearshift climb can never fire. At batch=1 every delivered
+				// MFSK data frame is itself an all-ones batch -> clean ACKs accumulate ->
+				// climb fires. OFDM (CONFIG_0..16) is unaffected and keeps the >=5 floor.
+				// (This was an unintended regression of SACK-default-on, which made
+				// sack_enabled always true so this branch began running on robust links.)
+				if(!is_robust_config(negotiated_configuration))
+				{
+					int max_batch = (message_transmission_time_ms > 0)
+						? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+					if(max_batch < 5) max_batch = 5;
+					if(max_batch > nMessages) max_batch = nMessages;
+					int new_batch = radio_batch_size;
+					if(new_batch > max_batch) new_batch = max_batch;
+					set_data_batch_size(new_batch);
+					nominal_batch_size = new_batch;
+				}
 				recalculate_ack_timeout_for_batch();
-				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
-					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
+				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
+					is_robust_config(negotiated_configuration) ? 1 : 0);
 			}
 			else
 			{
@@ -5100,6 +5116,15 @@ void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg,
 // the next batch.
 void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_observed)
 {
+	// ROBUST/MFSK configs pin data_batch_size=1 by design (arq_common.cc:1229-1234,
+	// "MFSK modes keep batch_size=1 for pattern ACK optimization"). Axis-2 grows
+	// the batch after AXIS2_UP_GOOD_RUN clean batches (floor 10, step 5) — at batch=1
+	// a clean MFSK delivery is partial_rate=0 ("good"), so without this guard the
+	// climb-batch1-robust fix would be silently undone: every clean ROBUST_0 batch
+	// would feed a good observation and, after 4 of them, step batch 1->6->11. Skip
+	// the whole controller on robust links so batch stays 1 and clean MFSK ACKs keep
+	// accumulating to drive the gearshift climb. (OFDM is unchanged — Axis-2 runs.)
+	if(is_robust_config(current_configuration)) return;
 	axis2_evaluations++;
 	if(batch_size_observed <= 0) return;  // defensive — no observation
 	if(rx_count < 0) rx_count = 0;
