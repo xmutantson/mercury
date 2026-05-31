@@ -250,6 +250,16 @@ public:
 	float ber_single_esn0;
 	int   ber_frames_override;
 
+	// ber_inband_snr (--ber-inband): when true, the swept BER axis is treated as
+	// IN-BAND SNR (dB, in the occupied bandwidth) for OFDM configs too — sigma is
+	// calibrated from measured signal power exactly like the MFSK path
+	// (passband_test_EsN0). This makes the OFDM BER cliff directly comparable to
+	// the MFSK floor and to VARA, and lets the coherent-tier (ROBUST_3) BER
+	// reproduce the prototype's SNR(3k) axis: SNR(3k) = SNR_inband +
+	// 10*log10(bw/3000). Default false => production OFDM keeps the raw Es/N0
+	// formula. (robust3-phase1-plan.md §6; supersedes the throwaway proto env-var.)
+	bool  ber_inband_snr;
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.

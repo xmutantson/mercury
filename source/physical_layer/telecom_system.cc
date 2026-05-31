@@ -49,6 +49,7 @@ cl_telecom_system::cl_telecom_system()
 	fsel_delay            = 128;   // second-ray delay in passband samples (~Nfft/8 @ interp=4, within GI)
 	ber_single_esn0       = -999.0f; // fix/cfg16-nv-restore: <=-900 = normal full sweep
 	ber_frames_override   = 0;     // 0 = use sweep default frame count
+	ber_inband_snr        = false; // --ber-inband: in-band-SNR axis for OFDM BER (default off => raw Es/N0)
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
@@ -357,8 +358,13 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 	// Sigma is calibrated by measuring actual transmitted signal power so that
 	// SNR = P_signal / P_noise = P_signal / (sigma^2/2).
 	float sigma = 0;
-	bool sigma_calibrated = (M != MOD_MFSK);
-	if(M != MOD_MFSK)
+	// --ber-inband: force the in-band-SNR sigma calibration (measured signal
+	// power, like MFSK) for OFDM too, so the swept axis is SNR in the occupied
+	// bandwidth instead of raw Es/N0 (robust3-phase1-plan.md §6). Default off =>
+	// OFDM keeps the standard Es/N0 formula (production-unchanged).
+	bool inband_cal = ber_inband_snr && (M != MOD_MFSK);
+	bool sigma_calibrated = (M != MOD_MFSK) && !inband_cal;
+	if(M != MOD_MFSK && !inband_cal)
 	{
 		sigma = 1.0f / sqrt(pow(10.0f, (EsN0 / 10.0f)));
 	}
@@ -4595,8 +4601,19 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 	if(ber_single_esn0 > -900.0f)
 	{
 		int nf = (ber_frames_override > 0) ? ber_frames_override : nFrames_per_point;
-		float b = passband_test_EsN0(ber_single_esn0, nf).BER;
-		std::cout<<ber_single_esn0<<";"<<b<<std::endl;
+		cl_error_rate er = passband_test_EsN0(ber_single_esn0, nf);
+		// Legacy single-line output (kept for existing callers): axis;BER
+		std::cout<<ber_single_esn0<<";"<<er.BER<<std::endl;
+		// Rich line: FER is the coded packet-error-rate the coherent-tier success
+		// criterion targets (error_rate.cc). When --ber-inband, the swept value IS
+		// in-band SNR; convert to SNR(3k) via +10*log10(bw/3000) so the cliff is
+		// directly comparable to the MFSK floor / VARA (robust3-phase1-plan.md §6).
+		double snr3k = ber_inband_snr ? (ber_single_esn0 + 10.0*log10(bandwidth/3000.0)) : -999.0;
+		printf("[BER-PT] axis=%s value=%.2f snr3k=%.2f frames=%d errframes=%d FER=%.4f BER=%.6f\n",
+			ber_inband_snr ? "INBAND" : "EsN0",
+			ber_single_esn0, snr3k,
+			(int)er.Frames_total, (int)er.Error_frames_total, er.FER, er.BER);
+		fflush(stdout);
 		BER_plot.close();
 		return;
 	}
@@ -4650,7 +4667,7 @@ void cl_telecom_system::load_configuration(int configuration)
 		return;
 	}
 
-	if(configuration<0 || (configuration>=NUMBER_OF_CONFIGS && !is_robust_config(configuration)))
+	if(configuration<0 || (configuration>=NUMBER_OF_CONFIGS && !is_robust_config(configuration) && !is_coherent_tier(configuration)))
 	{
 		return;
 	}
@@ -4809,6 +4826,22 @@ void cl_telecom_system::load_configuration(int configuration)
 		_ldpc_rate=4/16.0;  // Rate 1/4: 4x throughput vs ROBUST_1, waterfall at -8 dB
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
+	}
+	else if(configuration==ROBUST_3)
+	{
+		// COHERENT weak-signal OFDM tier (phase4-coherent-tier-design.md §7.3,
+		// robust3-phase1-plan.md §3). Re-tunes the OFDM PHY to the DATAC4 recipe:
+		// QPSK, rate-1/4 LDPC, 16-symbol preamble. The Nc=5 + 6 ms-CP + explicit
+		// Nsymb=240 overrides are applied in the per-config geometry block below
+		// (after the default reset). LS estimator + MMSE-ZF kept (design §3.3).
+		// Prototype-validated decode floor: ~ -7.5 dB SNR(3k) AWGN (Nc=5).
+		// WB-ONLY: the NB path (Nc=10, sparse pilots) is a different geometry and
+		// is clamped to NB_CONFIG_MAX before reaching here; ROBUST_3 is never
+		// loaded under narrowband_enabled (the geometry override is NB-gated too).
+		_modulation=MOD_QPSK;       // design §7.3 "QPSK"; all DATAC = QPSK
+		_ldpc_rate=4/16.0;          // design §7.3 "rate-1/4"; reuses existing N=1600/K=400 matrix
+		ofdm_preamble_configurator_Nsymb=16; // design §7.3 "16-symbol preamble"; Phase-2 acquisition seam
+		ofdm_channel_estimator=LEAST_SQUARE; // design §2.1/§3.3
 	}
 
 	// Amplitude restoration disabled for all modes: full ZF equalization
@@ -4973,6 +5006,25 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.gi=default_configurations_telecom_system.ofdm_gi;
 	ofdm.Nsymb=default_configurations_telecom_system.ofdm_Nsymb;
 
+	// COHERENT weak-signal tier (ROBUST_3) per-config frame geometry.
+	// robust3-phase1-plan.md §2.3/§3: the AUTO Nc (50/10 at init():3850) and AUTO
+	// Nsymb (24*floor(50/Nc) at init():3926) cannot land the DATAC4-recipe carrier
+	// count, so plumb EXPLICIT per-config values here — AFTER the default reset
+	// above (§5.A valid-states: the reset would otherwise clobber them), BEFORE
+	// init() (so init() sees a NON-AUTO Nc and skips the AUTO branch). init() then
+	// recomputes bandwidth/FIRs/nIdentical_sections and data_container.set_size
+	// derives nData/nBits from these. Chosen so nData==800 -> nBits==ldpc.N==1600
+	// (full codeword, no shortening -> matches the prototype-validated floor):
+	//   Nc=5, Nsymb=240 (Dy=3) -> nData=800 -> QPSK nBits=1600. bw=234.4 Hz (~DATAC4
+	//   250 Hz). gi=72/256 = 6 ms CP. See §3.1 for why Nc=5 (validated) not Nc=4.
+	// WB-only: NB has a different (sparse-pilot) geometry and never reaches here.
+	if(is_coherent_tier(configuration) && !narrowband_enabled)
+	{
+		ofdm.Nc    = 5;            // design §7.3 (DATAC4-style few carriers); +10 dB/carrier vs Nc=50
+		ofdm.Nsymb = 240;          // §2.2: Nc=5 -> nData=800 -> nBits=1600=N (full rate-1/4 codeword)
+		ofdm.gi    = 72.0/256.0;   // 6 ms CP @ 12 kHz baseband (design §7.3; DATAC4 tcp=6 ms)
+	}
+
 	ofdm.pilot_configurator.Dx=default_configurations_telecom_system.ofdm_pilot_configurator_Dx;
 	ofdm.pilot_configurator.Dy=default_configurations_telecom_system.ofdm_pilot_configurator_Dy;
 	ofdm.pilot_configurator.first_row=default_configurations_telecom_system.ofdm_pilot_configurator_first_row;
@@ -5027,7 +5079,10 @@ void cl_telecom_system::load_configuration(int configuration)
 	// Q3: ROBUST tier (rate-1/16 LDPC) needs more SPA iterations to converge at
 	// the waterfall. OFDM configs are above the cliff and 100 iter is plenty.
 	// See mfsk-vara-parity-plan.md §2.1 Q3.
-	if(is_robust_config(configuration))
+	// COHERENT tier (ROBUST_3, rate-1/4 LDPC) ALSO operates at the waterfall
+	// (~-7.5 dB AWGN) where the SPA needs the extra iterations to converge —
+	// matches the ROBUST_2 rate-1/4 budget. (robust3-phase1-plan.md §3.2.)
+	if(is_robust_config(configuration) || is_coherent_tier(configuration))
 		ldpc.nIteration_max = 200;
 	ldpc.print_nIteration=default_configurations_telecom_system.ldpc_print_nIteration;
 
@@ -5429,6 +5484,32 @@ void cl_telecom_system::load_configuration(int configuration)
 	printf("[PHY] Config %d active: M=%.0f LDPC_rate=%.3f BW=%.0fHz Nc=%d Nsymb=%d nBits=%d\n",
 		current_configuration, M, ldpc.rate, bandwidth,
 		data_container.Nc, data_container.Nsymb, data_container.nBits);
+
+	// COHERENT tier (ROBUST_3) frame-geometry invariant (robust3-phase1-plan.md
+	// §2.1/§2.3 INV-4). The DATAC4-recipe floor was validated with the FULL
+	// rate-1/4 codeword (nBits == ldpc.N == 1600, no shortening). A future edit
+	// to Nc / Nsymb / Dy / modulation could silently mis-size the grid into a
+	// shortened (nBits < N) or overflowing (nBits > N_MAX) codeword — a shortened
+	// code is a DIFFERENT code with a worse waterfall, so the floor would diverge
+	// from the prototype WITHOUT any crash. Fail LOUDLY at load so the geometry
+	// bug is caught at config-switch time, not by a mysterious BER regression.
+	if(is_coherent_tier(current_configuration))
+	{
+		if(data_container.nBits != ldpc.N)
+		{
+			printf("[PHY-FATAL] ROBUST_3 frame-geometry mismatch: nBits=%d but ldpc.N=%d "
+				"(Nc=%d Nsymb=%d M=%.0f). The coherent tier requires the FULL codeword "
+				"(nBits==N); fix the per-config Nc/Nsymb so nData*log2(M)==N. "
+				"Refusing to operate with a mis-sized codeword.\n",
+				data_container.nBits, ldpc.N, data_container.Nc,
+				data_container.Nsymb, M);
+			fflush(stdout);
+			exit(1);
+		}
+		printf("[PHY] ROBUST_3 coherent tier: nBits=%d == ldpc.N=%d FRAME-OK (full rate-1/4 codeword, bw=%.1fHz)\n",
+			data_container.nBits, ldpc.N, bandwidth);
+		fflush(stdout);
+	}
 	if(M == MOD_MFSK)
 	{
 		const double _max_Nc = 50.0;

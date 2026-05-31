@@ -75,7 +75,19 @@ extern int g_verbose;
 #define ROBUST_1 101  // 16-MFSK x2, LDPC rate 1/16, ~22 bps
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
 
+// COHERENT weak-signal tier (Phase 4 design, phase4-coherent-tier-design.md).
+// ROBUST_3 is a *coherent OFDM* mode (QPSK, rate-1/4 LDPC, Nc=5, 6 ms CP,
+// 16-symbol preamble) — NOT MFSK like ROBUST_0/1/2. It uses the SAME OFDM
+// modulator/demod/equalizer/LDPC as CONFIG_0+; it merely sits below CONFIG_0
+// in the ladder and operates at the weak-signal floor (~-7.5 dB AWGN decode,
+// prototype-validated). It is therefore deliberately EXCLUDED from
+// is_robust_config() (which gates MFSK-specific batch=1 / ACK-pattern /
+// guard-delay behavior that would be WRONG for an OFDM mode) and is classified
+// by its own predicate is_coherent_tier().
+#define ROBUST_3 103  // coherent OFDM: QPSK, LDPC rate 1/4, Nc=5, ~ -7.5 dB AWGN floor
+
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
+inline bool is_coherent_tier(int config) { return config == ROBUST_3; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
 // NB mode cap — CONFIG_14 (8PSK, LDPC 14/16) is the highest feasible NB config.
@@ -96,15 +108,20 @@ inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 // throughput ceiling ≈ 13 kbps decompressed.
 #define WB_CONFIG_MAX CONFIG_16
 
-// Unified config ladder for gearshift (ROBUST → OFDM)
+// Unified config ladder for gearshift (ROBUST → COHERENT → OFDM)
 // CONFIG_16 re-added (see WB_CONFIG_MAX comment above).
+// ROBUST_3 (coherent OFDM weak-signal tier) inserted between ROBUST_2 and
+// CONFIG_0: deeper than CONFIG_0's ~+2 dB cliff, hands off to CONFIG_0/1 on the
+// high end (phase4-coherent-tier-design.md §5.1). The gearshift MUST only route
+// to ROBUST_3 when both peers advertise CAP_COHERENT_TIER — see the
+// coherent_tier_ok guard in config_ladder_up/up_n below.
 static const int FULL_CONFIG_LADDER[] = {
-	ROBUST_0, ROBUST_1, ROBUST_2,
+	ROBUST_0, ROBUST_1, ROBUST_2, ROBUST_3,
 	CONFIG_0, CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4, CONFIG_5, CONFIG_6,
 	CONFIG_7, CONFIG_8, CONFIG_9, CONFIG_10, CONFIG_11, CONFIG_12,
 	CONFIG_13, CONFIG_14, CONFIG_15, CONFIG_16
 };
-static const int FULL_CONFIG_LADDER_SIZE = 20;
+static const int FULL_CONFIG_LADDER_SIZE = 21;
 
 inline int config_ladder_index(int config) {
 	for (int i = 0; i < FULL_CONFIG_LADDER_SIZE; i++) {
@@ -113,7 +130,15 @@ inline int config_ladder_index(int config) {
 	return -1;
 }
 
-inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = false) {
+// coherent_tier_ok: gate for the ROBUST_3 coherent-OFDM rung. The gearshift
+// MUST NOT route to ROBUST_3 unless BOTH peers advertise CAP_COHERENT_TIER
+// (phase4-coherent-tier-design.md §5.3). When false (the DEFAULT — old-peer-safe),
+// the ROBUST_3 rung is skipped: walking up from ROBUST_2 lands directly on
+// CONFIG_0, exactly as on the pre-coherent-tier ladder. Callers pass
+// (peer_cap & CAP_COHERENT_TIER) && (local_cap & CAP_COHERENT_TIER). Down-cascade
+// is never gated — if somehow seated at ROBUST_3 we must always be able to descend.
+inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = false,
+                            bool coherent_tier_ok = false) {
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled) {
 		return (config < ceiling) ? config + 1 : config;
@@ -121,13 +146,19 @@ inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = f
 	int idx = config_ladder_index(config);
 	if (idx < 0) return config;
 	int next_idx = idx + 1;
+	// Skip the ROBUST_3 rung when the coherent tier is not negotiated.
+	if (next_idx < FULL_CONFIG_LADDER_SIZE
+	    && is_coherent_tier(FULL_CONFIG_LADDER[next_idx]) && !coherent_tier_ok) {
+		next_idx++;
+	}
 	if (next_idx >= FULL_CONFIG_LADDER_SIZE) return config;
 	int next = FULL_CONFIG_LADDER[next_idx];
 	if (is_ofdm_config(next) && next > ceiling) return config;
 	return next;
 }
 
-inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool narrowband = false) {
+inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool narrowband = false,
+                              bool coherent_tier_ok = false) {
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled) {
 		int target = config + steps;
@@ -136,6 +167,13 @@ inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool n
 	int idx = config_ladder_index(config);
 	if (idx < 0) return config;
 	int next_idx = idx + steps;
+	// Skip the ROBUST_3 rung when the coherent tier is not negotiated: if the
+	// multi-rung jump would LAND on ROBUST_3, step past it (consistent with the
+	// single-step skip — never seat an un-negotiated coherent config).
+	if (next_idx < FULL_CONFIG_LADDER_SIZE
+	    && is_coherent_tier(FULL_CONFIG_LADDER[next_idx]) && !coherent_tier_ok) {
+		next_idx++;
+	}
 	if (next_idx >= FULL_CONFIG_LADDER_SIZE) next_idx = FULL_CONFIG_LADDER_SIZE - 1;
 	int next = FULL_CONFIG_LADDER[next_idx];
 	if (is_ofdm_config(next) && next > ceiling)
@@ -143,16 +181,25 @@ inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool n
 	return next;
 }
 
-inline int config_ladder_down(int config, bool robust_enabled) {
+inline int config_ladder_down(int config, bool robust_enabled,
+                              bool coherent_tier_ok = false) {
 	if (!robust_enabled) {
 		return (config > CONFIG_0) ? config - 1 : config;
 	}
 	int idx = config_ladder_index(config);
-	if (idx > 0) return FULL_CONFIG_LADDER[idx - 1];
-	return config;
+	if (idx <= 0) return config;
+	int next_idx = idx - 1;
+	// Skip the ROBUST_3 rung on the way DOWN when the coherent tier is not
+	// negotiated (e.g. CONFIG_0 dropping in a non-coherent session must land on
+	// ROBUST_2, not the un-negotiated ROBUST_3).
+	if (is_coherent_tier(FULL_CONFIG_LADDER[next_idx]) && !coherent_tier_ok && next_idx > 0) {
+		next_idx--;
+	}
+	return FULL_CONFIG_LADDER[next_idx];
 }
 
-inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
+inline int config_ladder_down_n(int config, int steps, bool robust_enabled,
+                                bool coherent_tier_ok = false) {
 	if (!robust_enabled) {
 		int target = config - steps;
 		return (target > CONFIG_0) ? target : CONFIG_0;
@@ -160,6 +207,10 @@ inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
 	int idx = config_ladder_index(config);
 	idx -= steps;
 	if (idx < 0) idx = 0;
+	// Skip the ROBUST_3 rung when not negotiated (land on ROBUST_2 below it).
+	if (is_coherent_tier(FULL_CONFIG_LADDER[idx]) && !coherent_tier_ok && idx > 0) {
+		idx--;
+	}
 	return FULL_CONFIG_LADDER[idx];
 }
 

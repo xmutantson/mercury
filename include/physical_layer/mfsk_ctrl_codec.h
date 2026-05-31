@@ -97,16 +97,19 @@ bool unpack_start_conn_payload(uint64_t p38, bool* out_nb_flag,
 // MFSK_CTRL_TEST_ACK payload (38 bits)
 // =============================================================================
 //
-//   bits 37..36 : echoed_cap     (2)   peer's cap echoed back
-//   bits 35..34 : own_cap        (2)   responder's local_capability
-//   bits 33..26 : ssid           (8)   0-15 numeric, 16=L, 17=T, 18=R, 19=X,
+//   bits 37..35 : echoed_cap     (3)   peer's cap echoed back
+//   bits 34..32 : own_cap        (3)   responder's local_capability
+//   bits 31..24 : ssid           (8)   0-15 numeric, 16=L, 17=T, 18=R, 19=X,
 //                                       255 = SSID_NONE (matches
 //                                       `arq.h:60 #define SSID_NONE 0xFF`)
-//   bits 25..0  : reserved       (26)  must be 0 on TX, ignored on RX
+//   bits 23..0  : reserved       (24)  must be 0 on TX, ignored on RX
 //
-// echoed_cap / own_cap are the 2 valid bits after the 2026-05-24 cap-byte
-// collapse: CAP_WB_CAPABLE (0x01), CAP_ENCRYPTION (0x02). Higher bits are
-// masked off.
+// echoed_cap / own_cap carry the 3 valid cap bits: CAP_WB_CAPABLE (0x01),
+// CAP_ENCRYPTION (0x02), CAP_COHERENT_TIER (0x04). The fields were WIDENED 2->3
+// bits in Phase 4 (phase4-coherent-tier-design.md) to carry CAP_COHERENT_TIER,
+// each stealing one bit from the formerly-26-bit reserved field. Higher bits are
+// masked off (& 0x7). Old peers send 0x04's position as reserved-must-be-0 ->
+// additive, old<->new safe.
 void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
                             uint8_t own_cap, uint8_t ssid);
 
@@ -120,13 +123,15 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 //   bits 37..34 : snr_q          (4)   SNR quantized via cl_mfsk::snr_to_tone
 //                                       at M=16 (0..15, 2 dB step, range
 //                                       -5..+25 dB per mfsk.cc:549-559)
-//   bits 33..32 : local_cap      (2)   sender's local_capability
-//                                       (CAP_WB_CAPABLE=0x01, CAP_ENCRYPTION=0x02)
-//   bits 31..24 : ssid           (8)   0-15 numeric, 16=L, 17=T, 18=R, 19=X,
+//   bits 33..31 : local_cap      (3)   sender's local_capability (CAP_WB_CAPABLE
+//                                       =0x01, CAP_ENCRYPTION=0x02,
+//                                       CAP_COHERENT_TIER=0x04). WIDENED 2->3
+//                                       bits in Phase 4 (steals one reserved bit).
+//   bits 30..23 : ssid           (8)   0-15 numeric, 16=L, 17=T, 18=R, 19=X,
 //                                       255 = SSID_NONE (matches
 //                                       `arq.h:60 #define SSID_NONE 0xFF`).
 //                                       Identical encoding to TEST_ACK.
-//   bits 23..0  : reserved       (24)  must be 0 on TX, ignored on RX
+//   bits 22..0  : reserved       (23)  must be 0 on TX, ignored on RX
 //
 // Site F (RSP RX) reconstructs the legacy float SNR via
 // cl_mfsk::tone_to_snr(snr_q). 2 dB quantization step is documented in the

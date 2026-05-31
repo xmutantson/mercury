@@ -305,6 +305,7 @@ int main(int argc, char *argv[])
     int fsel_test_cli = -1;            // --fsel-test=on|off: -1=default(off), 0=off, 1=on (fix/cfg16-nv-restore BER freq-selective channel)
     float ber_esn0_cli = -999.0f;      // --ber-esn0=<dB>: single-point BER override (<=-900 = full sweep)
     int ber_frames_cli = 0;            // --ber-frames=<N>: frames for single-point BER (0 = default)
+    bool ber_inband_cli = false;       // --ber-inband: in-band-SNR axis for OFDM BER (coherent-tier sanity)
     double fsel_amp_cli = -1.0;        // --fsel-amp=<lin>: override 2-ray amplitude (<0 = default 0.6)
     int fsel_delay_cli = -1;           // --fsel-delay=<samples>: override 2-ray delay (<0 = default 128)
     double ack_metric_threshold_cli = -1; // --ack-metric-threshold=F: <0 = default(0.5)
@@ -577,6 +578,14 @@ int main(int argc, char *argv[])
         else if (strncmp(argv[i], "--ber-frames=", 13) == 0)
         {
             ber_frames_cli = atoi(argv[i] + 13);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--ber-inband") == 0)
+        {
+            // In-band-SNR axis for OFDM BER (robust3-phase1-plan.md §6): makes the
+            // swept value SNR in the occupied bandwidth, comparable to MFSK/VARA.
+            ber_inband_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1559,6 +1568,10 @@ start_modem:
                telecom_system.fsel_test_enabled ? "on" : "off",
                telecom_system.fsel_amp, telecom_system.fsel_delay);
     }
+    if (ber_inband_cli) {
+        telecom_system.ber_inband_snr = true;
+        printf("[FLAG] --ber-inband=on (OFDM BER axis = in-band SNR)\n");
+    }
     if (ber_esn0_cli > -900.0f) {
         telecom_system.ber_single_esn0 = ber_esn0_cli;
         telecom_system.ber_frames_override = ber_frames_cli;
@@ -1626,7 +1639,7 @@ start_modem:
     }
 
 
-    if ((mod_config >= NUMBER_OF_CONFIGS && !is_robust_config(mod_config)) || (mod_config < 0))
+    if ((mod_config >= NUMBER_OF_CONFIGS && !is_robust_config(mod_config) && !is_coherent_tier(mod_config)) || (mod_config < 0))
     {
         printf("Wrong modulation config %d\n", mod_config);
         exit(EXIT_FAILURE);
@@ -2255,7 +2268,7 @@ start_modem:
         // bits the constructor (arq_common.cc:299-302) just set. SACK / v2
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
-        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
+        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? (CAP_WB_CAPABLE | CAP_COHERENT_TIER) : 0)
                              ;
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
@@ -2296,7 +2309,7 @@ start_modem:
         // bits the constructor (arq_common.cc:299-302) just set. SACK / v2
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
-        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
+        ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? (CAP_WB_CAPABLE | CAP_COHERENT_TIER) : 0)
                              ;
         ARQ.force_compress = (force_compress_cli == 1);
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
@@ -2332,7 +2345,7 @@ start_modem:
             // Monitor must always be BW_AUTO to follow WB upgrades
             ARQ.bandwidth_mode = BW_AUTO;
             ARQ.narrowband_enabled = YES;  // Start NB, follow upgrade
-            ARQ.local_capability |= CAP_WB_CAPABLE;
+            ARQ.local_capability |= CAP_WB_CAPABLE | CAP_COHERENT_TIER;
 #ifdef MERCURY_GUI_ENABLED
             g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2426,7 +2439,7 @@ start_modem:
                 // Sync robust mode and bandwidth mode from GUI to ARQ
                 ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;
                 ARQ.bandwidth_mode = g_gui_state.bandwidth_mode.load();
-                ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
+                ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? (CAP_WB_CAPABLE | CAP_COHERENT_TIER) : 0)
                                     | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
                 // narrowband_enabled is set at startup (line ~728) based on -Q and -M flags.
                 // Do NOT override here — forcing NB on telecom_system while the actual

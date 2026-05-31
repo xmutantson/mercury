@@ -206,11 +206,14 @@ static void test_pack_unpack_test_ack_payload() {
 	const char* name = "pack_unpack_test_ack_payload";
 	std::mt19937 rng(0xC0DE);
 	// Cover full echoed_cap × own_cap × representative SSID set.
+	// Phase 4: cap fields WIDENED 2->3 bits for CAP_COHERENT_TIER (0x04). Loop
+	// 0..7 (was 0..3) so the 0x04 bit (e.g. own_cap = CAP_WB_CAPABLE|CAP_COHERENT
+	// _TIER = 0x05) round-trips; reserved field shrank 26->24 bits.
 	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
-	for (int ec = 0; ec < 4; ec++) {
-		for (int oc = 0; oc < 4; oc++) {
+	for (int ec = 0; ec < 8; ec++) {
+		for (int oc = 0; oc < 8; oc++) {
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();
@@ -219,8 +222,8 @@ static void test_pack_unpack_test_ack_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				if ((p38 & ((1ULL << 26) - 1ULL)) != 0) {
-					// reserved bits must be zero on TX
+				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
+					// reserved bits 23..0 must be zero on TX (was 25..0)
 					test_fail(name, "reserved bits not zero on TX");
 					return;
 				}
@@ -247,11 +250,14 @@ static void test_pack_unpack_test_conn_payload() {
 	const char* name = "pack_unpack_test_conn_payload";
 	std::mt19937 rng(0x7E57);
 	// Cover full local_cap × representative SSIDs × full snr_q range.
+	// Phase 4: local_cap WIDENED 2->3 bits for CAP_COHERENT_TIER (0x04). Loop
+	// 0..7 so 0x05/0x07 round-trip; reserved field shrank 24->23 bits; snr_q
+	// [37:34] is UNCHANGED (this test also guards that the widen didn't disturb it).
 	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
 	for (int snr_q = 0; snr_q < 16; snr_q++) {
-		for (int lc = 0; lc < 4; lc++) {
+		for (int lc = 0; lc < 8; lc++) {
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();  // pre-set garbage
@@ -261,8 +267,8 @@ static void test_pack_unpack_test_conn_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
-					// reserved bits 23..0 must be zero on TX
+				if ((p38 & ((1ULL << 23) - 1ULL)) != 0) {
+					// reserved bits 22..0 must be zero on TX (was 23..0)
 					test_fail(name, "reserved bits not zero on TX");
 					return;
 				}
@@ -2750,6 +2756,144 @@ static void test_mfsk_ctrl_suffix_apply_sign_invariance() {
 }
 
 // =============================================================================
+// §9 ROBUST_3 coherent weak-signal tier — frame geometry + cap negotiation
+//     (phase4-coherent-tier-design.md / robust3-phase1-plan.md §5.D)
+// =============================================================================
+
+// §9.1 Frame-geometry invariants + full encode->interleave->deinterleave->decode
+// round-trip at the new Nc. This is the regression that the N_MAX=1600
+// frame-geometry fix (per-config Nc/Nsymb so nBits==ldpc.N for arbitrary Nc)
+// must make pass. Before the fix, ROBUST_3 either does not exist or AUTO-sizes
+// to nBits=1536 (shortened) / overflows; after the fix it lands the FULL
+// rate-1/4 codeword (nBits==ldpc.N==1600) and round-trips bit-exact.
+static void test_robust3_frame_geometry_roundtrip() {
+	const char* name = "robust3_frame_geometry_roundtrip";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.narrowband_enabled = NO;   // ROBUST_3 is WB-only
+	ts.load_configuration(ROBUST_3);
+
+	// --- (a) geometry invariants (robust3-phase1-plan.md §3) ---
+	if (!is_coherent_tier(ROBUST_3)) {
+		test_fail(name, "is_coherent_tier(ROBUST_3) is false");
+		return;
+	}
+	if (ts.data_container.nBits != ts.ldpc.N) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"FRAME-SHORT/OVERFLOW: nBits=%d != ldpc.N=%d (the geometry fix is the point of this test)",
+			ts.data_container.nBits, ts.ldpc.N);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.ldpc.N != 1600 || ts.ldpc.K != 400) {
+		char buf[128];
+		snprintf(buf, sizeof(buf), "expected rate-1/4 N=1600 K=400, got N=%d K=%d",
+			ts.ldpc.N, ts.ldpc.K);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.data_container.nData != 800) {
+		char buf[96];
+		snprintf(buf, sizeof(buf), "nData=%d (expected 800 for QPSK full codeword)",
+			ts.data_container.nData);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.ofdm.Nc != 5) { test_fail(name, "ofdm.Nc != 5"); return; }
+	if ((int)ts.M != (int)MOD_QPSK) { test_fail(name, "M != MOD_QPSK"); return; }
+	if (ts.ofdm.preamble_configurator.Nsymb != 16) {
+		test_fail(name, "preamble Nsymb != 16"); return;
+	}
+	// 6 ms CP = 72/256 samples.
+	if (std::fabs(ts.ofdm.gi - 72.0/256.0) > 1e-6) {
+		test_fail(name, "gi != 72/256 (6 ms CP)"); return;
+	}
+
+	// --- (b) full shortening encode/decode round-trip (mirrors transmit_bit
+	// telecom_system.cc:519-542 + the RX inverse at :317-328). For ROBUST_3
+	// nVirtual=0 (full codeword), but the path is exercised generically. ---
+	const int N = ts.ldpc.N, K = ts.ldpc.K, P = ts.ldpc.P, nBits = ts.data_container.nBits;
+	const int nVirtual = N - nBits;          // 0 for the full codeword
+	const int nReal    = nBits - P;           // 400 - ... ; = K - nVirtual
+	const int bisz     = nBits / 10;          // bit_interleaver_block_size (set_size:5xxx)
+	std::vector<int> info(N, 0), enc(N, 0), tx(N, 0), il(N, 0);
+	std::mt19937 rng(0xC0FFEE03);
+	for (int i = 0; i < nReal; i++) info[i] = (int)(rng() & 1);
+	// virtual bits = repeat of the first nVirtual real bits (telecom:530-533)
+	for (int i = 0; i < nVirtual; i++) info[nReal + i] = info[i];
+	ts.ldpc.encode(info.data(), enc.data());     // enc[0..K)=info, enc[K..N)=parity
+	// repack: transmitted codeword = [nReal info][P parity] = nBits bits (:537-540)
+	for (int i = 0; i < nReal; i++) tx[i] = enc[i];
+	for (int i = 0; i < P; i++)     tx[nReal + i] = enc[K + i];
+	// bit interleave over nBits (telecom:542)
+	interleaver(tx.data(), il.data(), nBits, bisz);
+
+	// noiseless soft demod: LLR>0 => bit0, LLR<0 => bit1 (psk.cc:325 / SPA:59)
+	std::vector<float> llr_il(N, 0.0f), llr_de(N, 0.0f);
+	for (int i = 0; i < nBits; i++) llr_il[i] = il[i] ? -20.0f : +20.0f;
+	// bit deinterleave (telecom:314)
+	deinterleaver(llr_il.data(), llr_de.data(), nBits, bisz);
+	// inverse shortening repack (telecom:317-325): move P parity LLRs to [K..N),
+	// reconstruct nVirtual repeated-info LLRs.
+	for (int i = P - 1; i >= 0; i--) llr_de[i + nReal + nVirtual] = llr_de[i + nReal];
+	for (int i = 0; i < nVirtual; i++) llr_de[nReal + i] = llr_de[i];
+	std::vector<int> dec(N, 0);
+	ts.ldpc.decode(llr_de.data(), dec.data());
+	for (int i = 0; i < nReal; i++) {
+		if (dec[i] != info[i]) {
+			char buf[128];
+			snprintf(buf, sizeof(buf),
+				"round-trip bit mismatch at %d: got %d want %d (nReal=%d nVirtual=%d)",
+				i, dec[i], info[i], nReal, nVirtual);
+			test_fail(name, buf);
+			return;
+		}
+	}
+	test_pass(name);
+}
+
+// §9.2 Gearshift old-peer guard on the ROBUST_3 rung (robust3-phase1-plan.md
+// §4.2). The coherent_tier_ok=false (old-peer) walk MUST skip ROBUST_3 in BOTH
+// directions; coherent_tier_ok=true MUST be able to seat it.
+static void test_robust3_gearshift_old_peer_guard() {
+	const char* name = "robust3_gearshift_old_peer_guard";
+	const bool R = true;  // robust_enabled
+	// Old peer (coherent_tier_ok=false): ROBUST_2 climbs straight to CONFIG_0,
+	// CONFIG_0 drops straight to ROBUST_2 — ROBUST_3 is invisible.
+	if (config_ladder_up(ROBUST_2, R, false, /*coherent_ok=*/false) != CONFIG_0) {
+		test_fail(name, "old peer: up(ROBUST_2) should skip to CONFIG_0"); return;
+	}
+	if (config_ladder_down(CONFIG_0, R, /*coherent_ok=*/false) != ROBUST_2) {
+		test_fail(name, "old peer: down(CONFIG_0) should skip to ROBUST_2"); return;
+	}
+	if (config_ladder_up_n(ROBUST_2, 1, R, false, /*coherent_ok=*/false) != CONFIG_0) {
+		test_fail(name, "old peer: up_n(ROBUST_2,1) should skip ROBUST_3"); return;
+	}
+	if (config_ladder_down_n(CONFIG_0, 1, R, /*coherent_ok=*/false) != ROBUST_2) {
+		test_fail(name, "old peer: down_n(CONFIG_0,1) should skip ROBUST_3"); return;
+	}
+	// New peer (coherent_tier_ok=true): ROBUST_3 is reachable.
+	if (config_ladder_up(ROBUST_2, R, false, /*coherent_ok=*/true) != ROBUST_3) {
+		test_fail(name, "new peer: up(ROBUST_2) should land on ROBUST_3"); return;
+	}
+	if (config_ladder_up(ROBUST_3, R, false, /*coherent_ok=*/true) != CONFIG_0) {
+		test_fail(name, "new peer: up(ROBUST_3) should land on CONFIG_0"); return;
+	}
+	if (config_ladder_down(CONFIG_0, R, /*coherent_ok=*/true) != ROBUST_3) {
+		test_fail(name, "new peer: down(CONFIG_0) should land on ROBUST_3"); return;
+	}
+	// Ladder integrity: ROBUST_0 still the floor; CONFIG_16 still the top.
+	if (!config_is_at_bottom(ROBUST_0, R)) {
+		test_fail(name, "ROBUST_0 no longer ladder bottom"); return;
+	}
+	if (!config_is_at_top(CONFIG_16, R, false)) {
+		test_fail(name, "CONFIG_16 no longer ladder top"); return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -2811,6 +2955,11 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op();
 	test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe();
 	test_mfsk_ctrl_suffix_apply_sign_invariance();
+
+	// §9 ROBUST_3 coherent weak-signal tier — frame geometry + gearshift guard
+	// (phase4-coherent-tier-design.md / robust3-phase1-plan.md §5.D).
+	test_robust3_frame_geometry_roundtrip();
+	test_robust3_gearshift_old_peer_guard();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

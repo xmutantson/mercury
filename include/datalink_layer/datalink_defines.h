@@ -125,6 +125,15 @@
 // CLI-only and are now unconditional in the codebase.
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
 #define CAP_ENCRYPTION   0x02   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
+#define CAP_COHERENT_TIER 0x04  // Supports the ROBUST_3 coherent weak-signal OFDM tier
+                                // (phase4-coherent-tier-design.md). Gates gearshift
+                                // routing to ROBUST_3: the tier is selectable ONLY when
+                                // BOTH peers advertise this bit. Additive — an old peer
+                                // sends it as 0 (it was a reserved-must-be-0 bit in both
+                                // the LDPC TEST_CONNECTION byte-5 path and the MFSK
+                                // CONNECT handshake cap field), so old<->new links simply
+                                // never enter the coherent tier. The MFSK cap field was
+                                // widened 2->3 bits to carry it (mfsk_ctrl_codec.cc).
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };

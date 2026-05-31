@@ -2692,7 +2692,10 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		// CAP_COHERENT_TIER (ROBUST_3 coherent OFDM tier) is WB-only — advertise it
+		// whenever WB is capable (BW_AUTO). The gearshift only routes to ROBUST_3
+		// when BOTH peers advertise it (config_ladder_up coherent_tier_ok guard).
+		local_capability = ((bandwidth_mode == BW_AUTO) ? (CAP_WB_CAPABLE | CAP_COHERENT_TIER) : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2789,7 +2792,10 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		// CAP_COHERENT_TIER (ROBUST_3 coherent OFDM tier) is WB-only — advertise it
+		// whenever WB is capable (BW_AUTO). The gearshift only routes to ROBUST_3
+		// when BOTH peers advertise it (config_ladder_up coherent_tier_ok guard).
+		local_capability = ((bandwidth_mode == BW_AUTO) ? (CAP_WB_CAPABLE | CAP_COHERENT_TIER) : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2843,7 +2849,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | CAP_COHERENT_TIER | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2862,7 +2868,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | CAP_COHERENT_TIER | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif

@@ -136,21 +136,27 @@ bool unpack_start_conn_payload(uint64_t p38, bool* out_nb_flag,
 // MFSK_CTRL_TEST_ACK (type=10) — 38-bit payload
 // =============================================================================
 //
-//   bits 37..36 : echoed_cap     (2)
-//   bits 35..34 : own_cap        (2)
-//   bits 33..26 : ssid           (8)
-//   bits 25..0  : reserved       (26)
+//   bits 37..35 : echoed_cap     (3)   WIDENED 2->3 for CAP_COHERENT_TIER (0x04)
+//   bits 34..32 : own_cap        (3)   WIDENED 2->3 for CAP_COHERENT_TIER (0x04)
+//   bits 31..24 : ssid           (8)
+//   bits 23..0  : reserved       (24)
 //
+// Phase 4 (phase4-coherent-tier-design.md / robust3-phase1-plan.md §4.1): the
+// cap fields were widened from 2 to 3 bits, each stealing one bit from the
+// (formerly 26-bit) reserved field. CAP_COHERENT_TIER=0x04 needs the 3rd bit.
+// Backward-compat: an OLD peer left bit 0x04's position as reserved-must-be-0,
+// so it reads as "no coherent tier" on a new RX, and never sets it on TX — the
+// widening is additive and old<->new safe in both directions.
 
 void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
                             uint8_t own_cap, uint8_t ssid)
 {
 	if (!p38) return;
 	uint64_t v = 0;
-	v |= ((uint64_t)(echoed_cap & 0x3)) << 36;
-	v |= ((uint64_t)(own_cap    & 0x3)) << 34;
-	v |= ((uint64_t)(ssid       & 0xFF)) << 26;
-	// reserved (bits 25..0) MUST be zero on TX
+	v |= ((uint64_t)(echoed_cap & 0x7)) << 35;
+	v |= ((uint64_t)(own_cap    & 0x7)) << 32;
+	v |= ((uint64_t)(ssid       & 0xFF)) << 24;
+	// reserved (bits 23..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -159,9 +165,9 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 {
 	if (!echoed_cap || !own_cap || !ssid) return false;
 	uint64_t v = p38 & ((1ULL << 38) - 1ULL);
-	*echoed_cap = (uint8_t)((v >> 36) & 0x3);
-	*own_cap    = (uint8_t)((v >> 34) & 0x3);
-	*ssid       = (uint8_t)((v >> 26) & 0xFF);
+	*echoed_cap = (uint8_t)((v >> 35) & 0x7);
+	*own_cap    = (uint8_t)((v >> 32) & 0x7);
+	*ssid       = (uint8_t)((v >> 24) & 0xFF);
 	return true;
 }
 
@@ -170,10 +176,13 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 // =============================================================================
 //
 //   bits 37..34 : snr_q          (4)
-//   bits 33..32 : local_cap      (2)
-//   bits 31..24 : ssid           (8)
-//   bits 23..0  : reserved       (24)
+//   bits 33..31 : local_cap      (3)   WIDENED 2->3 for CAP_COHERENT_TIER (0x04)
+//   bits 30..23 : ssid           (8)
+//   bits 22..0  : reserved       (23)
 //
+// Phase 4: local_cap widened 2->3 bits (steals one reserved bit) for
+// CAP_COHERENT_TIER=0x04. snr_q [37:34] is UNCHANGED. See TEST_ACK note above
+// and robust3-phase1-plan.md §4.1 for the backward-compat reasoning.
 
 void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
                              uint8_t local_cap, uint8_t ssid)
@@ -181,9 +190,9 @@ void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
 	if (!p38) return;
 	uint64_t v = 0;
 	v |= ((uint64_t)(snr_q     & 0xF))  << 34;
-	v |= ((uint64_t)(local_cap & 0x3))  << 32;
-	v |= ((uint64_t)(ssid      & 0xFF)) << 24;
-	// reserved (bits 23..0) MUST be zero on TX
+	v |= ((uint64_t)(local_cap & 0x7))  << 31;
+	v |= ((uint64_t)(ssid      & 0xFF)) << 23;
+	// reserved (bits 22..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -193,7 +202,7 @@ bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
 	if (!snr_q || !local_cap || !ssid) return false;
 	uint64_t v = p38 & ((1ULL << 38) - 1ULL);
 	*snr_q     = (uint8_t)((v >> 34) & 0xF);
-	*local_cap = (uint8_t)((v >> 32) & 0x3);
-	*ssid      = (uint8_t)((v >> 24) & 0xFF);
+	*local_cap = (uint8_t)((v >> 31) & 0x7);
+	*ssid      = (uint8_t)((v >> 23) & 0xFF);
 	return true;
 }

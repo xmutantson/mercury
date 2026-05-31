@@ -1763,6 +1763,19 @@ public:
   uint8_t peer_capability;     // Received from peer via TEST_CONNECTION
   bool wb_upgrade_pending;     // True between SWITCH_BANDWIDTH send and ACK
 
+  // Gearshift coherent-tier gate (ROBUST_3). The single source of truth for
+  // "may the gearshift route to ROBUST_3 in this session": TRUE only when BOTH
+  // ends advertise CAP_COHERENT_TIER. Pass this as the coherent_tier_ok arg to
+  // config_ladder_up/up_n/down/down_n so the ROBUST_3 rung is reachable for a
+  // coherent-capable pair and SKIPPED against an old peer (which never sets the
+  // bit). phase4-coherent-tier-design.md §5.3, robust3-phase1-plan.md §4.2.
+  // (Phase 1 wires the gate + the ladder skip; the live-cascade call sites are
+  // opted in during the Phase-3 gearshift integration + its cross-layer test.)
+  inline bool gearshift_coherent_ok() const {
+    return (local_capability & CAP_COHERENT_TIER)
+        && (peer_capability  & CAP_COHERENT_TIER);
+  }
+
   // v9 handshake echo state. handshake_confirmed gates CMD's
   // CONNECTION_ACCEPTED → NEGOTIATING/CONNECTED transition. retries_left
   // counts failed echo validations before dropping with explicit error.
