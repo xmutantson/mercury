@@ -3144,6 +3144,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 	else if (data_ack_received==NO && ack_pattern_time_ms <= 0 && !(last_message_sent_type==CONTROL && last_message_sent_code==REPEAT_LAST_ACK))
 	{
 		consecutive_data_acks = 0;  // Reset on failure
+		// SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11): a failed block
+		// breaks the consecutive-clean run at this rung — the next clean must
+		// re-accumulate from 1 before it can raise the anchor. (The BREAK trigger
+		// at :3390 is downstream of this and the :3276 sibling, so the demotion
+		// path also sees a reset clean-streak.)
+		clean_batches_at_current_config = 0;
 
 		// Frame gearshift just applied but data failed — BREAK immediately, no retry
 		if(frame_gearshift_just_applied)
@@ -3274,6 +3280,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		if(data_ack_received == NO)
 		{
 			consecutive_data_acks = 0;
+			// SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11): a failed block
+			// breaks the consecutive-clean run at this rung. This reset is UPSTREAM
+			// of the BREAK trigger (:3390) — so when a BREAK fires, the clean-streak
+			// is already 0 and the next clean re-accumulates from 1.
+			clean_batches_at_current_config = 0;
 
 			// Phase 3a — record this batch as failed (no ACK received before
 			// receiving_timeout). Whether or not BREAK fires below, the batch
@@ -3397,6 +3408,59 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					break_drop_step = 100;  // clamp at floor of ladder
 				}
 
+				// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10) — anchor
+				// DEMOTION, the SECOND escape complementary to the breaks>=2 panic.
+				// At the WGN:-10 cliff a slow retransmit-rescued batch at the anchor
+				// rung emits an all-ones completion ACK (arq_responder.cc prev-path)
+				// → CMD raises the anchor AND resets breaks_since_last_data_success
+				// to 0 (:3445). So the panic counter oscillates 1→0→1→0 and NEVER
+				// reaches 2; break_target_with_anchor (:147) then clamps every BREAK
+				// recovery UP to the anchor rung → infinite CONFIG_0↔ROBUST_0 thrash.
+				// This counter is independent of that reset: it increments ONLY when
+				// the BREAK fires WHILE current_configuration == last_data_viable_config
+				// (the anchor rung itself is breaking), and after K consecutive such
+				// failures it LOWERS the anchor one rung. break_target_with_anchor
+				// then permits the drop on the next BREAK and the link escapes toward
+				// ROBUST_0 — even though the slow completions keep resetting the panic
+				// counter. Demotion ONLY lowers the anchor (config_ladder_down), so the
+				// +1 up-clamp gets STRICTER, never looser (no af14a9e over-climb regression).
+				if(current_configuration == last_data_viable_config)
+				{
+					anchor_consec_break_fails++;
+					if(anchor_consec_break_fails >= ANCHOR_DEMOTE_BREAK_FAILS)
+					{
+						// PURE decision shared with --test-climb-engine Part E.
+						int demoted = anchor_demote_target(last_data_viable_config,
+							anchor_consec_break_fails, robust_enabled);
+						if(demoted != last_data_viable_config)
+						{
+							printf("[BREAK] Anchor DEMOTE: %d consecutive BREAKs at anchor rung %d — "
+								"lowering anchor %d -> %d (escapes the deep-SNR thrash)\n",
+								anchor_consec_break_fails, current_configuration,
+								last_data_viable_config, demoted);
+							fflush(stdout);
+							last_data_viable_config = demoted;
+						}
+						else
+						{
+							// Already at the ladder floor (ROBUST_0 / CONFIG_0) — nothing
+							// lower to demote to. The panic-jump bypass owns the escape here.
+							printf("[BREAK] Anchor DEMOTE: anchor already at floor %d — "
+								"panic-jump owns the escape\n", last_data_viable_config);
+							fflush(stdout);
+						}
+						anchor_consec_break_fails = 0;
+					}
+					else
+					{
+						printf("[BREAK] Anchor-rung BREAK %d/%d at config %d (anchor=%d) — "
+							"demote pending\n",
+							anchor_consec_break_fails, ANCHOR_DEMOTE_BREAK_FAILS,
+							current_configuration, last_data_viable_config);
+						fflush(stdout);
+					}
+				}
+
 				// Lower ceiling to prevent climbing back to failing config
 				int new_ceiling = config_ladder_down(current_configuration, robust_enabled);
 				if(supershift_proven_ceiling < 0 || new_ceiling < supershift_proven_ceiling)
@@ -3444,12 +3508,44 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				break_drop_step = 2;       // Reset to initial aggression (2 steps).
 				breaks_since_last_data_success = 0;  // panic-mode counter resets on
 				                                     // CLEAN data flow (see arq.h / §9).
+				// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10): a CLEAN
+				// batch proves the anchor rung recovered, so clear the anchor-rung
+				// BREAK streak (piece A's reset producer). This is what makes the
+				// demotion require K *consecutive* anchor-rung BREAKs with NO clean
+				// in between — a rung that recovers between failures is not demoted.
+				anchor_consec_break_fails = 0;
+				// SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11): track the run
+				// of CONSECUTIVE clean batches AT THIS RUNG. A clean at a NEW rung
+				// (config != the streak's rung) starts the count fresh at 1; otherwise
+				// it extends. This is the input the anchor-raise gate below consumes.
+				if(current_configuration != clean_batches_config)
+				{
+					clean_batches_config = current_configuration;
+					clean_batches_at_current_config = 1;
+				}
+				else if(clean_batches_at_current_config < 1000000)  // saturate, no overflow
+				{
+					clean_batches_at_current_config++;
+				}
 				// Option B (data-anchored promotion): a DATA batch was confirmed
 				// FULLY delivered at this config. Record it as the highest data-viable
 				// rung — anchors BREAK recovery (arq_commander.cc:81) and the
 				// up-shifter gates. SOLE on-delivery producer. A failed probe / partial
 				// batch never reaches here. See gearshift-start-and-recovery.md §6/§7/§9.
-				if(config_ladder_index(current_configuration) >
+				//
+				// SUSTAINED-ANCHOR GATE (§11): close the WGN:-10 thrash leak at its
+				// source. The anchor RAISE is now gated on N CONSECUTIVE clean batches
+				// at this rung — robust=1 (one clean MFSK frame is strong proof; keep
+				// the off-ROBUST_0 climb fast), OFDM=2 (a single SACK-retransmit-
+				// rescued batch can't anchor a non-sustainable rung — that single
+				// prev-path completion ACK is exactly what raised the CONFIG_0 anchor
+				// and started the thrash). A rung that REPEATEDLY delivers clean still
+				// promotes (the count crosses the threshold on the 2nd clean). We do
+				// NOT neuter the prev-path completion ACK itself — it keeps the link
+				// alive on a genuinely-good-but-lossy channel; "retransmit-rescued ≠
+				// viable" is encoded HERE in the CMD anchor gate.
+				if(clean_batches_at_current_config >= sustained_anchor_threshold(current_configuration) &&
+				   config_ladder_index(current_configuration) >
 				   config_ladder_index(last_data_viable_config))
 					last_data_viable_config = current_configuration;
 			}
@@ -6089,9 +6185,15 @@ int cl_arq_controller::test_clean_batch_viability()
 	return failed == 0 ? 0 : 1;
 }
 
-// climb-engine integrated 3-bug regression (CLI --test-climb-engine).
-// See fact-documents/gearshift-climb-engine.md §7. Three parts, each
-// fail-before / pass-after the integrated fix. Returns 0 on pass, 1 on fail.
+// climb-engine integrated regression (CLI --test-climb-engine).
+// See fact-documents/gearshift-climb-engine.md §7 (Parts A-D) + §10/§11
+// (Parts E-F, the deep-SNR down-hysteresis follow-up #2). Each part is
+// fail-before / pass-after its fix. Returns 0 on pass, 1 on fail.
+//   E — anchor DEMOTION: K consecutive anchor-rung BREAKs lower the anchor →
+//       break_target_with_anchor permits a sub-anchor recovery → the WGN:-10
+//       CONFIG_0↔ROBUST_0 thrash escapes (the missing demotion producer). §10.
+//   F — SUSTAINED-ANCHOR GATE: a single retransmit-rescued OFDM clean does NOT
+//       raise the anchor (N=2); robust raises on one clean (N=1). §11.
 //
 // IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
 // NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
@@ -6412,6 +6514,229 @@ int cl_arq_controller::test_climb_engine()
 	check(ofdm_batch >= 5,
 		"D5 OFDM (CONFIG_10) recompute scales batch to SACK floor >=5 (fix is robust-only)",
 		ofdm_batch, 5);
+
+	// ================================================================
+	// Part E — DEEP-SNR DOWN-HYSTERESIS, anchor DEMOTION (gearshift-climb-engine.md
+	// §10). THE climb follow-up #2 bug: the WGN:-10 CONFIG_0↔ROBUST_0 thrash. A slow
+	// retransmit-rescued batch at CONFIG_0 emits an all-ones completion ACK → CMD
+	// raised the anchor to CONFIG_0 AND reset breaks_since_last_data_success to 0;
+	// CONFIG_0 data then failed → BREAK → break_target_with_anchor clamped recovery
+	// UP to CONFIG_0; the breaks>=2 panic NEVER latched (every slow completion reset
+	// it 1→0→1→0) → infinite thrash (15 BREAKs on hardware). The FIX is the missing
+	// anchor-DEMOTION producer: after K=ANCHOR_DEMOTE_BREAK_FAILS consecutive BREAKs
+	// AT the anchor rung, lower the anchor one rung → break_target_with_anchor then
+	// permits the drop. This part replays the REAL BREAK-fire demotion expressions
+	// (anchor_demote_target — the SAME pure helper production calls at :3390) + the
+	// REAL break_target_with_anchor. FAIL-BEFORE: on 57f938f there is no demotion
+	// producer at all; revert anchor_demote_target to `return anchor;` (the pre-fix
+	// no-op) and E1/E2 FAIL (anchor stuck at CONFIG_0; break floor still CONFIG_0).
+	// ================================================================
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;
+
+	// E0 — prime the thrash: anchor raised to CONFIG_0 by a prior retransmit
+	// completion; panic counter NOT latched (the oscillation keeps it < 2); link is
+	// AT the anchor rung (current == anchor) trying to push CONFIG_0 data.
+	last_data_viable_config       = CONFIG_0;
+	current_configuration         = CONFIG_0;
+	breaks_since_last_data_success = 0;      // the slow-completion-reset state
+	anchor_consec_break_fails      = 0;
+
+	// Replay the REAL :3390 demotion block once per BREAK-fire. Returns true if a
+	// demotion fired this BREAK. Increments ONLY when current == anchor (an
+	// anchor-rung BREAK), then applies the shared pure helper at K.
+	auto break_fire_at_anchor = [&]() -> bool {
+		bool demoted_now = false;
+		if(current_configuration == last_data_viable_config)
+		{
+			anchor_consec_break_fails++;
+			int demoted = anchor_demote_target(last_data_viable_config,
+				anchor_consec_break_fails, robust_enabled);
+			if(anchor_consec_break_fails >= ANCHOR_DEMOTE_BREAK_FAILS)
+			{
+				if(demoted != last_data_viable_config)
+				{
+					last_data_viable_config = demoted;
+					demoted_now = true;
+				}
+				anchor_consec_break_fails = 0;   // reset after the demote decision
+			}
+		}
+		return demoted_now;
+	};
+
+	// E-pre: the first K-1 anchor-rung BREAKs must NOT demote (sub-threshold).
+	bool e_demote1 = break_fire_at_anchor();   // 1/3
+	bool e_demote2 = break_fire_at_anchor();   // 2/3
+	check(!e_demote1 && !e_demote2 && last_data_viable_config == CONFIG_0,
+		"E0 first K-1 anchor-rung BREAKs hold the anchor (sub-threshold, no thrash-break)",
+		last_data_viable_config, CONFIG_0);
+
+	// E1 — the K-th consecutive anchor-rung BREAK DEMOTES the anchor below CONFIG_0.
+	// config_ladder_down(CONFIG_0) == ROBUST_2 (ladder idx 3 -> 2). Pre-fix
+	// (anchor_demote_target a no-op): stays CONFIG_0 -> FAIL.
+	bool e_demote3 = break_fire_at_anchor();   // 3/3 -> demote
+	check(e_demote3 && last_data_viable_config == ROBUST_2,
+		"E1 K-th anchor-rung BREAK DEMOTES anchor CONFIG_0 -> ROBUST_2 (below CONFIG_0)",
+		last_data_viable_config, ROBUST_2);
+	check(config_ladder_index(last_data_viable_config) < config_ladder_index(CONFIG_0),
+		"E1b demoted anchor is strictly below CONFIG_0 by ladder index",
+		config_ladder_index(last_data_viable_config), config_ladder_index(CONFIG_0));
+
+	// E2 — break_target_with_anchor now permits a sub-CONFIG_0 recovery. A raw
+	// target of ROBUST_0 (deep drop) is floored only up to the NEW anchor ROBUST_2,
+	// which is BELOW CONFIG_0 — so the BREAK escapes toward ROBUST_0 (no thrash).
+	// Pre-fix the anchor was still CONFIG_0 and break_target_with_anchor floored the
+	// raw ROBUST_0 UP to CONFIG_0 (the trap). breaks_since_last_data_success is < 2
+	// here, so this is the DEMOTION escape, NOT the panic bypass.
+	breaks_since_last_data_success = 0;        // ensure panic bypass is NOT what fires
+	int e_break_target = break_target_with_anchor(ROBUST_0);
+	check(config_ladder_index(e_break_target) < config_ladder_index(CONFIG_0),
+		"E2 break_target_with_anchor returns a sub-CONFIG_0 target after demote (thrash escaped)",
+		config_ladder_index(e_break_target), config_ladder_index(CONFIG_0));
+	check(e_break_target == ROBUST_2,
+		"E2b break target floored to the DEMOTED anchor (ROBUST_2), not the old CONFIG_0",
+		e_break_target, ROBUST_2);
+
+	// E3 — a CLEAN confirmation between anchor-rung BREAKs RESETS the streak, so the
+	// demotion requires K CONSECUTIVE anchor-rung BREAKs (a rung that recovers is not
+	// demoted). Model the :3493 credit-block reset directly.
+	last_data_viable_config       = CONFIG_0;
+	current_configuration         = CONFIG_0;
+	anchor_consec_break_fails     = 0;
+	break_fire_at_anchor();                    // 1/3
+	break_fire_at_anchor();                    // 2/3
+	anchor_consec_break_fails = 0;             // <-- a clean confirmation cleared it (:3493)
+	bool e_demote_after_clean = break_fire_at_anchor();   // now only 1/3 again
+	check(!e_demote_after_clean && last_data_viable_config == CONFIG_0,
+		"E3 a clean confirmation resets the anchor-break streak (demote needs K consecutive)",
+		last_data_viable_config, CONFIG_0);
+
+	// E4 — the panic-jump bypass is PRESERVED and COMPLEMENTARY: with
+	// breaks_since_last_data_success >= 2, break_target_with_anchor returns the raw
+	// ROBUST_0 unchanged (reaches the floor immediately) regardless of the anchor.
+	last_data_viable_config        = CONFIG_0;
+	breaks_since_last_data_success = 2;
+	int e_panic_target = break_target_with_anchor(ROBUST_0);
+	check(e_panic_target == ROBUST_0,
+		"E4 panic-jump (breaks>=2) still bypasses the anchor floor (complementary escape intact)",
+		e_panic_target, ROBUST_0);
+	breaks_since_last_data_success = 0;
+
+	// E5 — demotion ONLY ever LOWERS the anchor: anchor_demote_target never returns a
+	// HIGHER rung than its input (the +1 up-clamp can only get stricter — no
+	// af14a9e/3b1726a over-climb regression). Sweep the ladder.
+	bool e_only_lowers = true;
+	for(int li=0; li<FULL_CONFIG_LADDER_SIZE; li++)
+	{
+		int cfg = FULL_CONFIG_LADDER[li];
+		int after = anchor_demote_target(cfg, ANCHOR_DEMOTE_BREAK_FAILS, robust_enabled);
+		if(config_ladder_index(after) > config_ladder_index(cfg)) e_only_lowers = false;
+	}
+	check(e_only_lowers, "E5 anchor_demote_target NEVER raises the anchor (clamp only tightens)",
+		e_only_lowers ? 1 : 0, 1);
+
+	// ================================================================
+	// Part F — SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11). Closes the
+	// thrash leak at the source: the anchor-RAISE (:3493 credit block) credited ANY
+	// clean confirmation, including the single prev-path all-ones completion ACK a
+	// SACK-retransmit-rescued OFDM batch emits ("retransmit-rescued ≠ sustainably
+	// viable"). The gate now requires N CONSECUTIVE clean batches at the rung:
+	// robust=1 (one clean MFSK frame is strong proof — keep the climb fast),
+	// OFDM=2. This replays the REAL credit-block raise expression (the SAME
+	// sustained_anchor_threshold helper + clean_batches_* update production runs at
+	// :3493). FAIL-BEFORE: drop the `clean_batches_at_current_config >= threshold`
+	// conjunct (the pre-fix raise) and F1/F4 FAIL (a single OFDM clean raises the
+	// anchor).
+	// ================================================================
+	// Replay the REAL :3493 clean-credit anchor-raise on ONE clean batch at
+	// current_configuration. Mirrors production exactly: update the per-rung clean
+	// streak, then raise the anchor only if the streak has reached the per-tier
+	// threshold AND the rung is above the current anchor.
+	auto credit_clean_batch = [&]() {
+		if(current_configuration != clean_batches_config)
+		{
+			clean_batches_config = current_configuration;
+			clean_batches_at_current_config = 1;
+		}
+		else
+		{
+			clean_batches_at_current_config++;
+		}
+		if(clean_batches_at_current_config >= sustained_anchor_threshold(current_configuration) &&
+		   config_ladder_index(current_configuration) >
+		   config_ladder_index(last_data_viable_config))
+			last_data_viable_config = current_configuration;
+	};
+	// A failed block at the current rung (the :3276 reset).
+	auto fail_block = [&]() { clean_batches_at_current_config = 0; };
+
+	// F-pre: confirm the per-tier thresholds are the documented values (TUNABLE).
+	check(sustained_anchor_threshold(ROBUST_1) == 1,
+		"F0a robust sustained-anchor threshold N=1", sustained_anchor_threshold(ROBUST_1), 1);
+	check(sustained_anchor_threshold(CONFIG_10) == 2,
+		"F0b OFDM sustained-anchor threshold N=2", sustained_anchor_threshold(CONFIG_10), 2);
+
+	// F1 — OFDM, N=2: a SINGLE retransmit-rescued clean batch at CONFIG_10 must NOT
+	// raise the anchor (this is the exact event that started the thrash). Anchor
+	// starts at ROBUST_2 (below). Pre-fix (no streak gate): the first clean raises
+	// it -> FAIL.
+	last_data_viable_config         = ROBUST_2;
+	current_configuration           = CONFIG_10;
+	clean_batches_config            = CONFIG_NONE;
+	clean_batches_at_current_config = 0;
+	credit_clean_batch();                      // 1 clean at CONFIG_10
+	check(last_data_viable_config == ROBUST_2,
+		"F1 single retransmit-rescued OFDM clean does NOT raise the anchor (N=2 not met)",
+		config_ladder_index(last_data_viable_config), config_ladder_index(ROBUST_2));
+
+	// F2 — a SECOND consecutive clean at CONFIG_10 reaches N=2 -> anchor rises.
+	credit_clean_batch();                      // 2nd consecutive clean
+	check(last_data_viable_config == CONFIG_10,
+		"F2 two consecutive OFDM cleans DO raise the anchor (a repeatedly-clean rung promotes)",
+		config_ladder_index(last_data_viable_config), config_ladder_index(CONFIG_10));
+
+	// F3 — robust, N=1: a SINGLE clean MFSK frame at ROBUST_1 raises the anchor
+	// immediately (the off-ROBUST_0 climb stays fast — one clean is strong proof).
+	last_data_viable_config         = ROBUST_0;
+	current_configuration           = ROBUST_1;
+	clean_batches_config            = CONFIG_NONE;
+	clean_batches_at_current_config = 0;
+	credit_clean_batch();                      // 1 clean at ROBUST_1
+	check(last_data_viable_config == ROBUST_1,
+		"F3 single robust clean raises the anchor (N=1 — climb stays fast off ROBUST_0)",
+		config_ladder_index(last_data_viable_config), config_ladder_index(ROBUST_1));
+
+	// F4 — a FAILED block between two OFDM cleans RESETS the streak: clean -> fail ->
+	// clean leaves the count at 1, so the anchor does NOT rise on the post-failure
+	// clean (the run must be CONSECUTIVE). Pre-fix: the post-failure clean raises it
+	// -> FAIL.
+	last_data_viable_config         = ROBUST_2;
+	current_configuration           = CONFIG_10;
+	clean_batches_config            = CONFIG_NONE;
+	clean_batches_at_current_config = 0;
+	credit_clean_batch();                      // clean #1 (count=1)
+	fail_block();                              // failed block resets the streak
+	credit_clean_batch();                      // clean again (count back to 1)
+	check(last_data_viable_config == ROBUST_2,
+		"F4 a failed block between OFDM cleans resets the streak (anchor not raised, count=1)",
+		config_ladder_index(last_data_viable_config), config_ladder_index(ROBUST_2));
+
+	// F5 — a clean at a DIFFERENT rung restarts the streak at 1 (the
+	// clean_batches_config tracker): two cleans at DIFFERENT OFDM rungs do NOT
+	// satisfy N=2 for either. Anchor stays at ROBUST_2.
+	last_data_viable_config         = ROBUST_2;
+	current_configuration           = CONFIG_10;
+	clean_batches_config            = CONFIG_NONE;
+	clean_batches_at_current_config = 0;
+	credit_clean_batch();                      // 1 clean at CONFIG_10 (count=1)
+	current_configuration           = CONFIG_11;   // rung changed (a promotion happened)
+	credit_clean_batch();                      // 1 clean at CONFIG_11 (count resets to 1)
+	check(last_data_viable_config == ROBUST_2 && clean_batches_at_current_config == 1,
+		"F5 clean at a new rung restarts the streak (per-rung consecutiveness)",
+		clean_batches_at_current_config, 1);
 
 	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

@@ -4,12 +4,19 @@
 `fix/cfg16-nv-restore` @ 05012a9). Investigation of the "unpinned cascade can't
 climb off ROBUST_0 into the OFDM tier" failure. Supersedes the per-single
 analyses on `fix/climb-delivery-anchored` (C1), `fix/climb-batch1-robust` (C2),
-`fix/climb-combined` (C3) — all three FAILED on the IONOS wire.
+`fix/climb-combined` (C3) — all three FAILED on the IONOS wire. **§10/§11
+(2026-05-30, stacks on 57f938f)**: the deep-SNR down-hysteresis fix (climb
+follow-up #2) — the WGN:-10 CONFIG_0↔ROBUST_0 thrash. The climb now works at
+clean (Parts A-D verified) but thrashed at WGN:-10; §10 adds the missing anchor
+DEMOTION producer + §11 the sustained-anchor RAISE gate. In-process verified
+(Parts E/F); wire confirmation is the parent's pause-cal hardware test @WGN:-10.
 
 This doc owns the producer/consumer/invariant facts for the CLIMB promotion
 state shared CMD↔RSP: `last_data_viable_config`, `consecutive_data_acks`,
 `gear_shift_blocked_for_nBlocks`, `last_batch_fully_acked`, `data_batch_size`
-at robust configs, and the SACK bsi window during promotion.
+at robust configs, the SACK bsi window during promotion, and (§10/§11) the new
+anchor-hysteresis counters `anchor_consec_break_fails`,
+`clean_batches_at_current_config` / `clean_batches_config`.
 
 ---
 
@@ -307,8 +314,9 @@ and the clamp holds — the over-climb protection is intact.
 
 ## §7 Regression tests (this doc's paired tests)
 
-`--test-climb-engine` (`test_climb_engine`, `arq_commander.cc`). Three parts,
-each fail-before / pass-after:
+`--test-climb-engine` (`test_climb_engine`, `arq_commander.cc`). Parts A-D (the
+original 3-bug climb fix) + Parts E-F (the §10/§11 deep-SNR down-hysteresis),
+each fail-before / pass-after (Parts E/F detailed in §10.4 / §11.4):
 
 - **(a) in-window clean credit (Bug 1)**: replay a PARTIAL SACK for bsi=B
   (sets `cmd_last_applied_sack_bsi=B`) then an all-ones CLEAN confirmation for
@@ -373,6 +381,223 @@ failed the wire. Part (d) closes the connect-path default-init gap specifically;
 - **[?]** Does the corrected SNR (14.6) change which OFDM config the climb
   settles at once it reaches the tier (vs the old 38)? Expected yes (more
   conservative), but the parent's quick-cascade-check @clean will show it.
+
+---
+
+## §10 DEEP-SNR DOWN-HYSTERESIS — the missing anchor DEMOTION producer (climb follow-up #2)
+
+**Status**: SHIPPED 2026-05-30 on `fix/climb-engine`, stacks on 57f938f. Fixes
+the WGN:-10 `CONFIG_0 ↔ ROBUST_0` thrash that appeared AFTER the §1-§9 climb fix
+made the clean-channel climb work. In-process verified (Part E); wire
+confirmation is the parent's pause-cal hardware test @WGN:-10.
+
+### §10.1 The confirmed root cause (do NOT re-investigate — this is the record)
+
+The climb works at clean but thrashes at WGN:-10. Mechanism:
+
+1. At CONFIG_0/-10, a batch completes ONLY after several SACK-retransmit rounds;
+   the §4 prev-path then emits an all-ones CRC-valid completion ACK
+   (`arq_responder.cc:~777-805`, `[RSP-V2-PREV-DELIVERED]` → `send_mfsk_ack_sack`).
+2. CMD credits it clean → the anchor-raise producer (`arq_commander.cc:3503-3505`)
+   sets `last_data_viable_config = CONFIG_0`, AND `breaks_since_last_data_success`
+   resets to 0 (`arq_commander.cc:3496`).
+3. CONFIG_0 data then fails → BREAK → `break_target_with_anchor()`
+   (`arq_commander.cc:147-153`) clamps the recovery target UP to the anchor
+   (CONFIG_0) unless `breaks_since_last_data_success >= 2` (panic bypass).
+4. The panic escape NEVER latches: every slow retransmit-completion at CONFIG_0
+   resets `breaks_since_last_data_success` to 0, so it oscillates 1→0→1→0, never
+   reaching 2 → the anchor-floor is never bypassed → infinite CONFIG_0↔ROBUST_0
+   thrash (15 BREAKs on hardware).
+5. THE FLAW: there is NO demotion producer for `last_data_viable_config` — it only
+   ever rises (anchor-raise + ctor/reset init). "Retransmit-completed ≠
+   sustainably viable", but the anchor treated it as viable forever.
+
+### §10.2 The fix (piece A) — anchor demotion
+
+Add `anchor_consec_break_fails` (`arq.h`, ctor + reset_session_state init 0). It
+increments at the BREAK trigger (`arq_commander.cc:~3390`, co-located with
+`breaks_since_last_data_success++`) ONLY when
+`current_configuration == last_data_viable_config` (the BREAK is firing AT the
+anchor rung — i.e. the anchor rung itself is breaking). When it reaches
+`K = ANCHOR_DEMOTE_BREAK_FAILS = 3` (matches the existing
+`gear_shift_down_consecutive_fails < 3` house pattern at `:4793`/`:4954`), the
+anchor is DEMOTED one rung via the PURE helper
+`anchor_demote_target(anchor, fails, robust)` (`arq.h`,
+`= config_ladder_down(anchor, robust)` once `fails >= K`), and the counter
+resets. The reset producer is the clean-credit block (`arq_commander.cc:~3496`):
+ANY clean confirmation clears `anchor_consec_break_fails` to 0, so the demotion
+requires K *consecutive* anchor-rung BREAKs with no clean between.
+
+Result: after K=3 anchor-rung BREAKs, `last_data_viable_config` drops CONFIG_0 →
+ROBUST_2; `break_target_with_anchor` then floors only to ROBUST_2 (below CONFIG_0)
+→ the next BREAK escapes toward ROBUST_0. If ROBUST_2 also can't carry data the
+demotion walks the anchor down one rung per K failures until it reaches a viable
+rung (ROBUST_0). This is the down-hysteresis. **K=3 and the per-tier sustained-N
+(§11) are TUNABLE.**
+
+`anchor_demote_target` ONLY ever LOWERS the anchor (or holds at the ladder floor)
+— never raises — so the +1 up-clamp (§1) gets STRICTER, never looser → no
+af14a9e/3b1726a over-climb regression (asserted by Part E5, a full-ladder sweep).
+
+It is COMPLEMENTARY to the breaks>=2 panic-jump, not a replacement: if the panic
+counter ever does reach 2 (two BREAKs with genuinely no clean between) it still
+jumps straight to ROBUST_0 (Part E4). The demotion is the slower escape for when
+slow completions keep resetting the panic counter — exactly the WGN:-10 case.
+
+### §10.3 Producers / consumers of `anchor_consec_break_fails`
+
+- **Producers**: `++` at the BREAK trigger (`arq_commander.cc:~3390`) gated on
+  `current_configuration == last_data_viable_config`; reset to 0 at the demote
+  site (after the decision) and on ANY clean confirmation in the credit block
+  (`arq_commander.cc:~3496`); init 0 in ctor (`arq_common.cc:~352`) +
+  reset_session_state (`arq_common.cc:~2987`).
+- **Consumer**: the demote decision itself (`anchor_demote_target` at the BREAK
+  trigger) — the SOLE consumer.
+- **Valid states**: 0 (no anchor-rung BREAK streak — the steady state and the
+  post-clean / post-demote state) through K-1 (demote pending). Never observed
+  >= K (the demote+reset is atomic with reaching K).
+- **Invariant the consumer assumes**: the count reflects CONSECUTIVE anchor-rung
+  BREAKs with no intervening clean. Maintained: the clean-credit reset clears it,
+  and the gate only counts BREAKs where current==anchor. A BREAK at a
+  NON-anchor rung does not increment it (correct — only the anchor rung's own
+  failure should demote the anchor).
+
+### §10.4 Part E (`--test-climb-engine`) — fail-before / pass-after
+
+Replays the REAL `:3390` demotion block (the SAME `anchor_demote_target` pure
+helper production calls) + the REAL `break_target_with_anchor`:
+- **E0**: the first K-1 anchor-rung BREAKs hold the anchor (sub-threshold).
+- **E1/E1b**: the K-th consecutive anchor-rung BREAK DEMOTES CONFIG_0 → ROBUST_2
+  (strictly below CONFIG_0 by ladder index).
+- **E2/E2b**: `break_target_with_anchor(ROBUST_0)` now returns ROBUST_2 (sub-
+  CONFIG_0) → the thrash escapes (breaks counter < 2, so this is the DEMOTION
+  escape, not the panic bypass).
+- **E3**: a clean confirmation resets the streak (demote needs K consecutive).
+- **E4**: the panic-jump (breaks>=2) still bypasses the floor (complementary).
+- **E5**: full-ladder sweep — `anchor_demote_target` NEVER raises the anchor.
+
+**FAIL-BEFORE** (verified 2026-05-30 by temporarily reverting `anchor_demote_target`
+to the pre-fix no-op `return anchor;`): E1/E1b/E2/E2b FAIL (anchor stuck at
+CONFIG_0, break floor still CONFIG_0); E3/E4/E5 correctly stay PASS (they are
+invariants independent of the demotion). **PASS-AFTER**: all PASS. The temp
+revert was reverted; the shipped helper does the demotion.
+
+---
+
+## §11 SUSTAINED-ANCHOR GATE — close the leak at the source (piece B)
+
+**Status**: SHIPPED 2026-05-30 with §10. Gates the anchor-RAISE so a single
+retransmit-rescued batch cannot anchor a non-sustainable rung.
+
+### §11.1 The leak
+
+§1.1's anchor-raise (`arq_commander.cc:3503-3505`) credited ANY clean
+confirmation, including the single §4 prev-path all-ones completion ACK a
+SACK-retransmit-rescued OFDM batch emits. That single completion ACK is exactly
+what raised the CONFIG_0 anchor in §10.1 step 2 and seeded the thrash.
+"Retransmit-rescued ≠ sustainably viable."
+
+### §11.2 The fix (piece B) — N consecutive cleans per rung
+
+Add `clean_batches_at_current_config` + `clean_batches_config` (`arq.h`, ctor +
+reset init 0 / CONFIG_NONE). In the clean-credit block (`arq_commander.cc:~3493`):
+a clean at a config != `clean_batches_config` starts the streak fresh at 1 (new
+rung); otherwise it extends. The anchor-RAISE now additionally requires
+`clean_batches_at_current_config >= sustained_anchor_threshold(current_configuration)`
+(PURE helper, `arq.h`): robust (batch=1) **N=1** (one clean MFSK frame is strong
+proof — keep the off-ROBUST_0 climb FAST), OFDM **N=2** (a single SACK-rescued
+batch can't anchor a non-sustainable rung). Reset to 0 on ANY failed block
+(`arq_commander.cc:~3146` and `:~3276`, co-located with `consecutive_data_acks=0`;
+the `:~3276` reset is upstream of the BREAK trigger so the demotion path also sees
+a reset streak).
+
+We do NOT neuter the prev-path completion ACK itself (`arq_responder.cc:~805`) —
+it keeps the link alive on a genuinely-good-but-lossy channel (its purpose since
+§4). "Retransmit-rescued ≠ viable" is encoded HERE in the CMD anchor gate, which
+still lets a rung that REPEATEDLY delivers clean promote (the count crosses N on
+the 2nd consecutive clean — Part F2). The per-rung `clean_batches_config` tracker
+makes the streak self-reset on rung change without touching `load_configuration`
+(which toggles `current_configuration` on every data/ack PHY swap — see §11.3).
+
+### §11.3 Producers / consumers of `clean_batches_at_current_config` / `clean_batches_config`
+
+- **Producers**: the clean-credit block (`arq_commander.cc:~3493`) — increments
+  (or restarts at 1 on rung change); reset to 0 at the two failure sites
+  (`:~3146`, `:~3276`); init 0 / CONFIG_NONE in ctor + reset_session_state.
+- **Consumer**: the anchor-RAISE gate (`arq_commander.cc:~3505`) — SOLE consumer.
+- **Valid states**: count 0 (no clean streak — fresh session / post-failure)
+  through any positive run length; `clean_batches_config` = CONFIG_NONE (no streak
+  yet) or the rung the streak belongs to.
+- **Invariant the consumer assumes**: the count is the number of CONSECUTIVE
+  cleans AT `clean_batches_config`, and `clean_batches_config == current_configuration`
+  whenever the count > 0. Maintained: every increment first re-syncs
+  `clean_batches_config` to `current_configuration` on a mismatch. **The data/ack
+  PHY-swap subtlety**: `load_configuration(ack_configuration, ...)` per-batch
+  (`arq_commander.cc:1023/1752`) toggles `current_configuration` to the ACK config
+  and back, so `load_configuration`'s `current_configuration=` write (`arq_common.cc:1242`)
+  is NOT a safe rung-change signal. We deliberately do NOT reset there; instead the
+  credit block runs only when `data_ack_received==YES` with a data-batch result, at
+  which point `current_configuration` is the DATA config (the swap has reverted).
+  This is why the counter lives in the credit path, mirroring `consecutive_data_acks`.
+
+### §11.4 Part F (`--test-climb-engine`) — fail-before / pass-after
+
+Replays the REAL `:3493` clean-credit anchor-raise (the SAME
+`sustained_anchor_threshold` helper + `clean_batches_*` update):
+- **F0a/F0b**: thresholds are robust N=1 / OFDM N=2 (documents the TUNABLEs).
+- **F1**: a SINGLE retransmit-rescued OFDM clean at CONFIG_10 does NOT raise the
+  anchor (N=2 not met) — the exact thrash-seeding event is now inert.
+- **F2**: a SECOND consecutive OFDM clean DOES raise it (repeatedly-clean promotes).
+- **F3**: a SINGLE robust clean raises immediately (N=1 — climb stays fast).
+- **F4**: a failed block between two OFDM cleans resets the streak (the post-
+  failure clean leaves count=1 → anchor not raised; consecutiveness enforced).
+- **F5**: a clean at a DIFFERENT rung restarts the streak at 1 (per-rung).
+
+**FAIL-BEFORE** (verified 2026-05-30 by temporarily setting OFDM N=1, modelling
+the pre-fix unconditional raise): F1/F4 FAIL (a single OFDM clean raises the
+anchor; F0b also flips since the threshold changed). **PASS-AFTER**: all PASS.
+
+### §11.5 Cross-layer audit (CLAUDE.md §5) — §10/§11 fix
+
+Shared state changed: `last_data_viable_config` (NEW demotion producer) + the two
+new hysteresis counters. `last_data_viable_config` + `breaks_since_last_data_success`
+are CMD anchor state consumed by `break_target_with_anchor` (BOTH BREAK sites
+`:180` / `:279`) and the +1-anchor up-clamp (FRAME-UP `:3501` / LADDER-UP `:4737`
+inline + `:4894` policy_evaluate_axis1). Producers/consumers walked:
+
+- **`last_data_viable_config`** — Producers: the §1.1 anchor-RAISE
+  (`arq_commander.cc:~3505`, now ALSO gated on the §11 sustained-N), the NEW §10
+  DEMOTE (`arq_commander.cc:~3420`, lowers one rung at K anchor-rung BREAKs), ctor
+  + reset_session_state init. Consumers: `break_target_with_anchor` (both BREAK
+  sites), the +1 up-clamp (FRAME-UP / both LADDER-UP twins). Unchanged consumers.
+- **`anchor_consec_break_fails`** — see §10.3. **`clean_batches_*`** — see §11.3.
+
+Three required invariants verified:
+
+1. **The clean-SNR multi-rung climb is UNAFFECTED.** On clean: the anchor only
+   ever RISES (no anchor-rung BREAKs fire, so `anchor_consec_break_fails` stays 0
+   and never demotes); the sustained-N is met quickly (robust N=1 on the first
+   clean MFSK frame; OFDM N=2 on the 2nd consecutive clean — a clean channel
+   delivers consecutive cleans trivially). **Part C (the multi-rung clean climb,
+   ROBUST_0→CONFIG_0) STILL PASSES** unchanged — confirmed in the PASS-after run
+   (C1/C2/C3 all PASS alongside E/F). The robust rungs use N=1 so the climb off
+   ROBUST_0 is exactly as fast as before; only the OFDM tier requires the 2nd
+   clean, which a clean channel supplies immediately.
+2. **The af14a9e/3b1726a over-climb protection is PRESERVED.** The demotion ONLY
+   lowers the anchor (Part E5 full-ladder sweep), so the +1 up-clamp gets stricter,
+   never looser. The §11 gate only makes the RAISE harder (more cleans required),
+   never easier. Neither can let the climb leap past a rung that hasn't proven
+   sustainably clean. The +1 clamp expressions themselves are UNTOUCHED.
+3. **The panic-jump is not broken; the demotion is a COMPLEMENTARY escape.** The
+   breaks>=2 bypass in `break_target_with_anchor` (`:149`) is UNTOUCHED (Part E4).
+   The two escapes are independent: panic fires when breaks reaches 2 (fast path);
+   demotion fires when K=3 consecutive anchor-rung BREAKs accumulate (the slow
+   path for when slow completions keep resetting the panic counter). At the
+   WGN:-10 cliff the panic path is defeated by the reset, so the demotion path
+   carries the escape — exactly its design intent.
+
+No consumer assumption is violated; the fix adds a missing INPUT (a way to LOWER
+the anchor + a stricter RAISE) without weakening any existing gate.
 
 ---
 

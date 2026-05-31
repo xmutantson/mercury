@@ -350,6 +350,13 @@ cl_arq_controller::cl_arq_controller()
 	// per-session value is set in reset_session_state once init_configuration
 	// reflects the requested start mode (ROBUST_0 for -R gearshift sessions).
 	last_data_viable_config=init_configuration;
+	// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10/§11): no BREAK has
+	// fired and no clean streak exists yet. anchor_consec_break_fails counts
+	// consecutive BREAKs AT the anchor rung (→ demote at K); the sustained-anchor
+	// counters gate the anchor-RAISE on N consecutive clean batches per rung.
+	anchor_consec_break_fails=0;
+	clean_batches_at_current_config=0;
+	clean_batches_config=CONFIG_NONE;
 	// CLEAN-BATCH VIABILITY (§9): no batch delivered yet — promotion-gating flag
 	// starts FALSE. Re-set per batch at TX start (arq_commander.cc:1244/1739).
 	last_batch_fully_acked=false;
@@ -2985,6 +2992,11 @@ void cl_arq_controller::reset_session_state()
 	// Nothing has carried data yet, so BREAK floors at and probes climb one rung
 	// above init_configuration (= ROBUST_0 for -R gearshift). See arq.h / §6.
 	last_data_viable_config = init_configuration;
+	// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10/§11): fresh session —
+	// no anchor-rung BREAK streak and no clean streak yet.
+	anchor_consec_break_fails = 0;
+	clean_batches_at_current_config = 0;
+	clean_batches_config = CONFIG_NONE;
 	turbo_snr_ack_enabled = false;
 	turbo_received_snr = -99.0f;
 	turbo_switch_role_retries = 0;

@@ -571,6 +571,22 @@ public:
   // the retries-exhausted path) and the synthetic-fire test. See §6/§7.
   int break_target_with_anchor(int raw_target) const;
 
+  // DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10) — PURE anchor-DEMOTION
+  // decision. Given the current anchor, the consecutive anchor-rung BREAK-fail
+  // count, and robust_enabled, return the anchor AFTER this BREAK: if the count has
+  // reached K (ANCHOR_DEMOTE_BREAK_FAILS) lower the anchor one rung
+  // (config_ladder_down); otherwise return it unchanged. ONLY ever lowers (or holds
+  // at the ladder floor) — never raises — so the +1 up-clamp gets stricter, never
+  // looser. No side effects (the caller resets the counter); the unit test drives
+  // this directly to prove fail-before/pass-after. See §10.
+  int anchor_demote_target(int anchor, int consec_anchor_break_fails,
+                           bool robust_en) const
+  {
+    if(consec_anchor_break_fails >= ANCHOR_DEMOTE_BREAK_FAILS)
+      return config_ladder_down(anchor, robust_en);
+    return anchor;
+  }
+
   // Option B synthetic-fire test (CLI --test-data-anchored-promote). Drives the
   // real BREAK-floor helper and the real policy_evaluate_axis1() up-shifter with
   // last_data_viable_config primed, asserting the link parks at the anchor rung
@@ -628,6 +644,17 @@ public:
   // predicate the consumers gate on and the unit test drives. See §9.
   bool promotion_allowed_on_batch(bool batch_fully_acked) const
   { return batch_fully_acked; }
+
+  // SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11) — the number of
+  // CONSECUTIVE clean batches a rung must deliver before it may RAISE the anchor.
+  // Robust (batch=1): one clean MFSK frame is strong proof (keep the off-ROBUST_0
+  // climb fast). OFDM: two — a single SACK-retransmit-rescued batch can't anchor a
+  // non-sustainable rung (this is the WGN:-10 thrash leak). PURE predicate (no
+  // side effects) so the unit test can drive it directly. config is the rung being
+  // evaluated (current_configuration in production).
+  static int sustained_anchor_threshold(int config)
+  { return is_robust_config(config) ? SUSTAINED_ANCHOR_N_ROBUST
+                                     : SUSTAINED_ANCHOR_N_OFDM; }
 
   // climb-engine Bug 1 (gearshift-climb-engine.md §4) — split SACK dedupe by
   // event class. The CMD MFSK ACK+SACK decode used a SINGLE tracker
@@ -1422,6 +1449,55 @@ public:
   // no upward move may exceed index+1 unless optimizer_is_in_control(). A FAILED
   // probe never raises it. See fact-documents/gearshift-start-and-recovery.md §6/§7.
   int last_data_viable_config;
+  // DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10/§11, 2026-05-30) —
+  // the MISSING anchor DEMOTION producer. last_data_viable_config (above) only
+  // ever RISES (anchor-raise :3454 + ctor/reset init); there was no path to lower
+  // it. At the WGN:-10 cliff a slow retransmit-rescued ROBUST/CONFIG_0 batch emits
+  // an all-ones completion ACK (arq_responder.cc:~805 prev-path) → CMD raises the
+  // anchor to CONFIG_0; CONFIG_0 data then fails → BREAK → break_target_with_anchor
+  // (:147) clamps recovery UP to the CONFIG_0 anchor. The breaks>=2 panic bypass
+  // NEVER latches because every slow completion resets breaks_since_last_data_
+  // success to 0 (:3445) → the counter oscillates 1→0→1→0 → infinite
+  // CONFIG_0↔ROBUST_0 thrash (15 BREAKs on hardware). This counter is the SECOND,
+  // complementary escape: it counts consecutive BREAKs that fire WHILE
+  // current_configuration == last_data_viable_config (i.e. the anchor rung itself
+  // is breaking). At K=ANCHOR_DEMOTE_BREAK_FAILS the anchor is DEMOTED one rung
+  // (config_ladder_down) and the counter resets — so break_target_with_anchor
+  // permits the drop on the next BREAK and the link escapes toward ROBUST_0.
+  // Demotion ONLY ever LOWERS the anchor → the +1 up-clamp gets STRICTER, never
+  // looser (no af14a9e/3b1726a over-climb regression). Producers: ++ at the BREAK
+  // trigger (:3390) when current==anchor; reset to 0 on ANY clean confirmation /
+  // anchor-raise (:3445 block). Consumer: the demotion site itself. See §10.
+  int anchor_consec_break_fails;
+  // K threshold for anchor demotion — matches the existing
+  // gear_shift_down_consecutive_fails < 3 house pattern (arq_commander.cc:4793/
+  // 4954): require 3 consecutive anchor-rung BREAK failures before demoting, so a
+  // single transient anchor-rung failure does not lower a genuinely-viable anchor.
+  // TUNABLE.
+  static const int ANCHOR_DEMOTE_BREAK_FAILS = 3;
+  // SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11, 2026-05-30) — closes the
+  // leak at the source. The anchor-RAISE (:3454) credited ANY clean confirmation,
+  // including the prev-path all-ones completion ACK that fires AFTER a batch is
+  // rescued by SACK retransmit ("retransmit-rescued ≠ sustainably viable"). This
+  // counts CONSECUTIVE clean confirmations AT THE SAME RUNG; the anchor-raise now
+  // requires >= the per-tier threshold (robust=1, OFDM=2). clean_batches_config
+  // tracks which rung the streak belongs to: when a clean is credited at a config
+  // != clean_batches_config the streak resets to 1 (new rung). Reset to 0 on ANY
+  // failed block / BREAK (:3146, :3276 — co-located with consecutive_data_acks=0),
+  // which also covers the BREAK trigger downstream of :3276. We do NOT neuter the
+  // prev-path completion ACK itself (it keeps the link alive on a genuinely-good-
+  // but-lossy channel) — "retransmit-rescued ≠ viable" is encoded HERE in the CMD
+  // anchor gate, which still lets a rung that REPEATEDLY delivers clean promote.
+  // Producers: incremented in the clean-credit block (:3442); reset at the failure
+  // sites + on rung change. Consumer: the anchor-raise gate (:3454). See §11.
+  int clean_batches_at_current_config;
+  int clean_batches_config;  // the rung clean_batches_at_current_config counts for
+  // Per-tier sustained-anchor thresholds. Robust (batch=1): ONE clean MFSK frame
+  // is strong proof the rung carries data — keep the climb fast off ROBUST_0. OFDM
+  // tier: a single retransmit-rescued batch can't anchor a non-sustainable rung —
+  // require TWO consecutive clean batches. Both TUNABLE.
+  static const int SUSTAINED_ANCHOR_N_ROBUST = 1;
+  static const int SUSTAINED_ANCHOR_N_OFDM   = 2;
   // CLEAN-BATCH VIABILITY (§9, 2026-05-29): TRUE iff the batch that set
   // data_ack_received=YES this epoch was confirmed FULLY delivered (all-ones
   // bitmap clean ACK / LDPC ACK_RANGE/ACK_MULTI). FALSE on a PARTIAL SACK (which
