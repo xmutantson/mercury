@@ -7657,6 +7657,149 @@ int cl_arq_controller::test_climb_engine()
 				last_data_viable_config, CONFIG_0);
 		}
 
+		// ================================================================
+		// Part J'' — DEEP-SNR OVER-CLIMB REGRESSION fix (gearshift-climb-engine.md
+		// §15). ROOT CAUSE (diagnosed): A1 populates measurements.SNR_uplink from the
+		// CONTROL-plane MFSK ACK suffix, which decodes at ~1.0 dB even when OFDM DATA
+		// cannot at WGN:-10. The pre-§15 high_confidence_jump predicate ("snr_uplink >
+		// -90 AND snr_ideal > anchor+1") then BYPASSED the af14a9e +1 clamp from a
+		// ROBUST anchor and jumped CFG_0->CFG_4 (then ratcheted to CFG_9) on phantom
+		// ACK matches with NO real OFDM data and NO BREAK. §15 re-asserts the
+		// data-anchor: high_confidence_jump now ALSO requires is_ofdm_config(anchor)
+		// (the channel has PROVEN it carries OFDM data), and a licensed jump is
+		// bounded to anchor + RETRIGGER_MAX_LEAP. Both apply at the SHARED chokepoint
+		// supershift_retrigger_target(), so both elevator sites are covered.
+		// `retrigger_target_v15` models FAIL-BEFORE as the VERBATIM pre-§15 helper body
+		// (94e80a6: NO is_ofdm_config gate, NO MAX_LEAP cap) and PASS-AFTER as the REAL
+		// shipped supershift_retrigger_target(). Both arms apply the SAME caller-side
+		// ceiling caps (NB + proven) the helper expects, exactly as production.
+		// ================================================================
+		robust_enabled = NO;            // restored by frameup_target side effects above; set below per-case
+		narrowband_enabled = NO;
+		max_config_override = -1;
+		gear_shift_on = YES;
+		optimizer_disabled = true;      // optimizer_is_in_control()==false (un-clamp path)
+		supershift_proven_ceiling = -1;
+
+		auto retrigger_target_v15 = [&](double snr_uplink, int anchor, int proven,
+			                              bool robust_en, bool nb, bool adaptive) -> int {
+			// Caller-side ceiling caps, EXACTLY as production / elevator_target_from_snr()
+			// (arq_commander.cc:176-181): the helper expects an already-capped snr_ideal.
+			int snr_ideal = get_configuration(snr_uplink - SUPERSHIFT_MARGIN_DB);
+			if(nb && snr_ideal > NB_CONFIG_MAX)
+				snr_ideal = NB_CONFIG_MAX;
+			if(proven >= 0 && snr_ideal > proven)
+				snr_ideal = proven;
+			if(adaptive) {
+				// PASS-AFTER: the REAL shipped §15 helper. optimizer_owns=false.
+				return supershift_retrigger_target(snr_ideal, snr_uplink, anchor,
+					/*optimizer_owns=*/false, robust_en, nb);
+			} else {
+				// FAIL-BEFORE: the VERBATIM pre-§15 (94e80a6) helper body — NO
+				// is_ofdm_config(anchor) conjunct and NO MAX_LEAP cap.
+				int anchor_cap = config_ladder_up_n(anchor, 1, robust_en, nb);
+				bool high_confidence_jump = (snr_uplink > -90) &&
+					config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap);
+				if(!high_confidence_jump &&
+				   config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
+					snr_ideal = anchor_cap;
+				return snr_ideal;
+			}
+		};
+
+		// JJ1 — DEEP-SNR ROBUST-anchor (THE regression). anchor=ROBUST_2 (a ROBUST
+		// config), SNR_uplink = snr_uplink_from_suffix(1.0) (the control-plane SNR at
+		// WGN:-10), current=CONFIG_0, proposed_frame = CONFIG_0's +1 = CONFIG_1.
+		// snr_ideal = get_configuration(1.0-6.0=-5.0) = CONFIG_4 (idx7); anchor_cap =
+		// config_ladder_up_n(ROBUST_2,1,robust) = CONFIG_0 (idx3). robust_en=true
+		// (the unpinned `-R` cascade keeps robust_enabled=YES at the cliff — required
+		// for config_ladder_up_n to walk the FULL ladder off a ROBUST anchor).
+		{
+			double snr = snr_uplink_from_suffix(1.0f);   // the REAL producer value at WGN:-10
+			int proposed_frame = config_ladder_up(CONFIG_0, true, false);  // the +1 (CONFIG_1)
+			int snr_ideal_raw  = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+			int anchor_cap     = config_ladder_up_n(ROBUST_2, 1, true, false);
+			int t_after  = retrigger_target_v15(snr, ROBUST_2, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
+			int t_before = retrigger_target_v15(snr, ROBUST_2, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/false);
+			// premise: the control-plane SNR maps to an OFDM config (CONFIG_4) that is
+			// MULTI-rung above the ROBUST anchor's +1 (CONFIG_0) — the over-climb temptation.
+			check(snr_ideal_raw == CONFIG_4 && anchor_cap == CONFIG_0 &&
+			      config_ladder_index(snr_ideal_raw) > config_ladder_index(anchor_cap),
+				"JJ1a premise: control-SNR 1.0 -> CONFIG_4, multi-rung above the ROBUST anchor's +1 (CONFIG_0)",
+				config_ladder_index(snr_ideal_raw), config_ladder_index(anchor_cap));
+			// FAIL-BEFORE proof: the pre-§15 body jumps to CONFIG_4 (the over-climb) —
+			// a ROBUST anchor does NOT block it.
+			check(t_before == CONFIG_4,
+				"JJ1b FAIL-BEFORE proof: pre-§15 predicate over-climbs ROBUST-anchor -> CONFIG_4 (the regression)",
+				t_before, CONFIG_4);
+			// PASS-AFTER: is_ofdm_config(ROBUST_2)=false -> high_confidence_jump=false ->
+			// the af14a9e +1 clamp re-applies -> returns anchor_cap (CONFIG_0), which is
+			// <= proposed_frame (the +1 ladder) -> NO multi-rung jump.
+			check(t_after == anchor_cap && t_after == CONFIG_0,
+				"JJ1c PASS-AFTER: §15 ROBUST-anchor gate clamps to anchor+1 (CONFIG_0), af14a9e restored",
+				t_after, CONFIG_0);
+			check(config_ladder_index(t_after) <= config_ladder_index(proposed_frame),
+				"JJ1d PASS-AFTER: §15 target <= the +1 proposed (NO multi-rung jump at the cliff)",
+				config_ladder_index(t_after), config_ladder_index(proposed_frame));
+			check(t_after != t_before,
+				"JJ1e the §15 target DIFFERS from the pre-§15 over-climb (the fix bites)",
+				(t_after != t_before) ? 1 : 0, 1);
+		}
+
+		// JJ2 — HIGH-SNR OFDM-anchor (jump PRESERVED, MAX_LEAP cap BINDS). anchor=CONFIG_0
+		// (an OFDM rung — #2's sustained gate raised it after clean OFDM batches),
+		// SNR_uplink = snr_uplink_from_suffix(20.0) -> get_configuration(14)=CONFIG_16
+		// (idx19), proposed_frame=CONFIG_1, proven=-1. leap_cap =
+		// config_ladder_up_n(CONFIG_0,13)=CONFIG_13 (idx16). robust_en=true (unpinned).
+		{
+			double snr = snr_uplink_from_suffix(20.0f);
+			int proposed_frame = config_ladder_up(CONFIG_0, true, false);  // CONFIG_1
+			int snr_ideal_raw  = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+			int leap_cap       = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
+			int t_after  = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
+			int t_before = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/false);
+			// premise: the SNR-ideal (CONFIG_16) is ABOVE the MAX_LEAP cap (CONFIG_13)
+			// from a CONFIG_0 anchor — the cap has something to bind.
+			check(snr_ideal_raw == CONFIG_16 && leap_cap == CONFIG_13 &&
+			      config_ladder_index(snr_ideal_raw) > config_ladder_index(leap_cap),
+				"JJ2a premise: SNR-ideal CONFIG_16 exceeds the anchor+MAX_LEAP cap (CONFIG_13)",
+				config_ladder_index(snr_ideal_raw), config_ladder_index(leap_cap));
+			// PASS-AFTER: OFDM anchor -> jump LICENSED, but BOUNDED to leap_cap (CONFIG_13)
+			// — still a multi-rung jump above the +1 (CONFIG_1).
+			check(t_after == CONFIG_13,
+				"JJ2b PASS-AFTER: §15 OFDM-anchor jump PRESERVED but bounded to anchor+MAX_LEAP (CONFIG_13)",
+				t_after, CONFIG_13);
+			check(config_ladder_index(t_after) > config_ladder_index(proposed_frame) &&
+			      config_ladder_index(t_after) <= config_ladder_index(leap_cap),
+				"JJ2c PASS-AFTER: §15 target is a multi-rung jump (> +1) AND <= the MAX_LEAP cap",
+				config_ladder_index(t_after), config_ladder_index(leap_cap));
+			// FAIL-BEFORE: also jumps (so §15 did NOT break the high-SNR jump) but UNCAPPED
+			// to CONFIG_16 — the §15 cap is the ONLY difference here.
+			check(t_before == CONFIG_16,
+				"JJ2d FAIL-BEFORE: pre-§15 OFDM-anchor jump is UNCAPPED (CONFIG_16) — §15 only bounds it",
+				t_before, CONFIG_16);
+			check(config_ladder_index(t_after) > config_ladder_index(proposed_frame),
+				"JJ2e PASS-AFTER: the high-SNR multi-rung jump is NOT broken by §15 (still > +1)",
+				config_ladder_index(t_after), config_ladder_index(proposed_frame));
+		}
+
+		// JJ3 — sanity: a CONFIG_0 OFDM anchor at a gap == MAX_LEAP is UNCAPPED (the
+		// WGN:30 fast climb is materially unchanged at gaps <= 13). SNR_uplink =
+		// snr_uplink_from_suffix(14.6) -> get_configuration(8.6)=CONFIG_13 (idx16);
+		// leap_cap=CONFIG_13 -> NOT capped (identical to FP-J2b's un-capped target).
+		{
+			double snr = snr_uplink_from_suffix(14.6f);
+			int snr_ideal_raw = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+			int leap_cap      = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
+			int t_after = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
+			check(snr_ideal_raw == CONFIG_13 && leap_cap == CONFIG_13,
+				"JJ3a premise: SNR-ideal (CONFIG_13) sits exactly AT the anchor+MAX_LEAP cap (gap==13)",
+				config_ladder_index(snr_ideal_raw), config_ladder_index(leap_cap));
+			check(t_after == CONFIG_13,
+				"JJ3b PASS-AFTER: gap==MAX_LEAP is UNCAPPED (CONFIG_13) — WGN:30 fast climb unchanged at gaps<=13",
+				t_after, CONFIG_13);
+		}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);

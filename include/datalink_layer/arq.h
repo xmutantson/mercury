@@ -709,18 +709,26 @@ public:
   //   anchor         = last_data_viable_config (the af14a9e anchor).
   //   optimizer_owns = optimizer_is_in_control() -- when the Q-table owns the
   //                    band the anchor clamp does not apply (return snr_ideal).
-  // HIGH-CONFIDENCE-SNR predicate: SNR valid (> -90) AND the ceiling-capped
-  // snr_ideal genuinely lands MORE than +1 rung past the anchor (else there is no
-  // multi-rung jump to make -- fall through to the conservative +1 clamp, which is
-  // a NO-OP there). DEEP-SNR INERT: at the sentinel / low SNR the predicate is
-  // FALSE and this returns EXACTLY anchor+1 (or the lower snr_ideal) -- BYTE-
-  // IDENTICAL to the pre-(1) clamp. The landing is SPECULATIVE: this helper READS
+  // HIGH-CONFIDENCE-SNR predicate (§15 hardened): SNR valid (> -90) AND the anchor
+  // is a PROVEN OFDM rung (is_ofdm_config(anchor)) AND the ceiling-capped snr_ideal
+  // genuinely lands MORE than +1 rung past the anchor (else there is no multi-rung
+  // jump to make -- fall through to the conservative +1 clamp, which is a NO-OP
+  // there). The `is_ofdm_config(anchor)` conjunct is the §15 DEEP-SNR over-climb
+  // fix: a CONTROL-plane MFSK-suffix SNR over-reports the OFDM-DATA-viable rate at
+  // deep SNR (it decodes when OFDM data cannot), so `snr_uplink > -90` ALONE is a
+  // FALSE premise for "safe to jump". The data-viable anchor reaching the OFDM tier
+  // is the correct discriminator -- it has PROVEN the channel carries OFDM data.
+  // DEEP-SNR / ROBUST-ANCHOR INERT: at the sentinel / low SNR / a ROBUST anchor the
+  // predicate is FALSE and this returns EXACTLY anchor+1 (or the lower snr_ideal) --
+  // BYTE-IDENTICAL to the af14a9e clamp. When the jump IS licensed it is BOUNDED to
+  // anchor + RETRIGGER_MAX_LEAP (§15 secondary) so a marginal-OFDM channel cannot
+  // overshoot the ladder in one shot. The landing is SPECULATIVE: this helper READS
   // the anchor but NEVER raises it (SAFETY #3 -- the anchor follows CONFIRMED clean
   // delivery only, sec 1.1 + sec 11; a failed jump -> BREAK ->
   // break_target_with_anchor recovers to the still-low anchor, sec 10 demotion
   // backstops repeated overshoot). FRAME-UP / LADDER-UP keep their own strict +1
   // clamps (config_ladder_up is inherently +1) -- UNTOUCHED (SAFETY #1). PURE (no
-  // side effects); Part J replays it directly. See sec 13.
+  // side effects); Part J / J'' replays it directly. See sec 13 / sec 15.
   int supershift_retrigger_target(int snr_ideal, double snr_uplink, int anchor,
                                   bool optimizer_owns, bool robust_en,
                                   bool narrowband) const
@@ -728,11 +736,42 @@ public:
     if(optimizer_owns)
       return snr_ideal;            // Q-table owns the band -- no anchor clamp
     int anchor_cap = config_ladder_up_n(anchor, 1, robust_en, narrowband);
+    // §15 DEEP-SNR over-climb regression fix (re-assert the af14a9e data-anchor at
+    // the elevator chokepoint). The pre-§15 predicate ("snr_uplink > -90 =>
+    // safe to jump") admits a FALSE high-confidence jump at the deep-SNR cliff: A1
+    // populates SNR_uplink from the CONTROL-plane MFSK ACK suffix, which decodes at
+    // ~1 dB even when OFDM DATA cannot, so the >-90 half is satisfied AND
+    // get_configuration(1.0-6.0) -> CONFIG_4 lands several rungs above a ROBUST
+    // anchor's anchor_cap (CONFIG_0) -> the af14a9e +1 clamp is BYPASSED and the
+    // modem jumps CFG_0->CFG_4 (then ratchets to CFG_9) on PHANTOM ACK matches with
+    // NO real OFDM data and NO BREAK. The true discriminator is whether the channel
+    // has PROVEN it can carry OFDM DATA -- i.e. whether the data-viable anchor has
+    // reached the OFDM tier. Add `is_ofdm_config(anchor)`: at the WGN:-10 cliff the
+    // anchor stays ROBUST (OFDM never delivers) -> high_confidence_jump=false -> the
+    // +1 clamp re-applies -> no jump -> the data-fail BREAK path re-engages and falls
+    // back to ROBUST_0 (af14a9e restored). At WGN:30 the anchor reaches CONFIG_0 once
+    // clean OFDM batches deliver (§1.1 sustained-gate) -> the jump is permitted (the
+    // fast multi-rung climb preserved, at most a small confirm-at-CFG_0 delay).
     bool high_confidence_jump = (snr_uplink > -90) &&
+        is_ofdm_config(anchor) &&
         config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap);
+    if(high_confidence_jump)
+    {
+      // §15 SECONDARY (defense-in-depth): even once the anchor is a proven OFDM
+      // rung, BOUND a single jump to anchor + RETRIGGER_MAX_LEAP so a marginal-OFDM
+      // channel (CONFIG_0 holds but CONFIG_13 does not) cannot overshoot the whole
+      // ladder in one shot. It leaps in bounded steps as the anchor ratchets up; the
+      // proven-ceiling cap (applied by the caller) + the §10 anchor-demotion backstop
+      // any residual overshoot. NEVER lowers snr_ideal below anchor_cap (it is still
+      // at least a +1 move). TUNABLE via RETRIGGER_MAX_LEAP (common_defines.h).
+      int leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP, robust_en, narrowband);
+      if(config_ladder_index(snr_ideal) > config_ladder_index(leap_cap))
+        snr_ideal = leap_cap;
+    }
     // Keep the conservative +1 clamp UNLESS the high-SNR predicate licenses the
-    // multi-rung jump. (At low/invalid SNR the predicate is false and this clamp
-    // is the ORIGINAL no-op -> DEEP-SNR INERT.)
+    // (now MAX_LEAP-bounded) multi-rung jump. (At low/invalid SNR, or a ROBUST
+    // anchor, the predicate is false and this clamp is the ORIGINAL af14a9e clamp
+    // -> DEEP-SNR / ROBUST-ANCHOR INERT.)
     if(!high_confidence_jump &&
        config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
       snr_ideal = anchor_cap;

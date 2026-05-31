@@ -1350,6 +1350,260 @@ multi-rung SET_CONFIG landing (post-jump rx-mute) are not exercised in-process.
 
 ---
 
+## §15 DEEP-SNR over-climb REGRESSION — re-assert the data-anchor at the chokepoint (fast-probe follow-up)
+
+**SHIPPED on `fix/fast-probe` (this commit, stacked on 94e80a6).** The §13/§14
+controlled elevator, as shipped on 94e80a6, REGRESSED the af14a9e over-climb guard
+at the deep-SNR cliff. This section is the record of the root cause (DIAGNOSED, not
+re-investigated) and the fix.
+
+### §15.1 The regression (DIAGNOSED — the record)
+
+At WGN:-10 the unpinned cascade (`-Q 0 -M auto -g -R`) over-climbed to CONFIG_9, 0
+bytes, 0 BREAKs, where the #2 baseline (446887c) had SETTLED at ROBUST_0. Mechanism:
+
+1. **A1 populates `measurements.SNR_uplink` from the CONTROL-plane MFSK ACK suffix.**
+   The §14 (A1) arm-asymmetry repair (`turbo_snr_ack_armed_for_gearshift`,
+   `arq_commander.cc`) arms the CMD's SNR-suffix decode on gearshift SET_CONFIG ACKs.
+   The RSP measures the CMD's signal and suffixes the SNR; the MFSK control suffix
+   decodes at ~1.0 dB **even when OFDM DATA frames at the same SNR cannot decode at
+   all.** So `SNR_uplink` leaves the −99.9 ctor sentinel and reads ~1.0.
+2. **The −99.9 sentinel used to lock out the re-trigger** (`arq_commander.cc:4667-4668`
+   enclosing gate `… && measurements.SNR_uplink > -90`). Once A1 populates it to ~1.0,
+   that gate is CLEARED.
+3. **`supershift_retrigger_target()` (pre-§15, `arq.h:724-740`) then licensed a
+   multi-rung jump** because `high_confidence_jump = (snr_uplink > -90) &&
+   idx(snr_ideal) > idx(anchor_cap)` was TRUE: `snr_ideal =
+   get_configuration(1.0 − SUPERSHIFT_MARGIN_DB=6.0) = get_configuration(−5.0) =
+   CONFIG_4` (telecom_system.cc:5562; −5.0 is NOT > −5, falls to > −6 ⇒ CONFIG_4,
+   idx 7), and the anchor was a ROBUST rung (anchor_cap = `config_ladder_up_n(ROBUST_2,
+   1, …) = CONFIG_0`, idx 3). `idx7 > idx3` ⇒ the af14a9e +1 clamp was BYPASSED ⇒
+   jump CFG_0 → CFG_4.
+4. **Then CFG_4 → CFG_9 via the SNR-capped step-1 turbo branch**
+   (`arq_commander.cc:4592-4598`) on PHANTOM ACK-pattern matches — the RSP never
+   decoded the CFG_4-9 SET_CONFIG data probes (no OFDM data at WGN:-10), and the
+   data-fail BREAK path NEVER engaged (the modem was cycling CONTROL probes, never in
+   the data-TX-then-fail path).
+
+**The false premise**: "`SNR_uplink > -90` ⇒ safe to jump." **The truth**: an MFSK
+control-suffix SNR over-reports the OFDM-DATA-viable rate at deep SNR. The correct
+discriminator is whether the channel has PROVEN it can carry OFDM DATA — i.e.
+whether the data-viable anchor (`last_data_viable_config`) has reached the OFDM tier.
+
+> **Why "max-leap-from-anchor" ALONE cannot fix this** (the investigation's first
+> idea): the LEGIT high-SNR jump is ALSO a large leap from a low anchor (e.g.
+> CFG_0 → CFG_13 at WGN:30, before the anchor has ratcheted). A pure leap-size bound
+> cannot separate "ROBUST anchor at WGN:-10 leaping to CFG_4" from "OFDM anchor at
+> WGN:30 leaping to CFG_13". The **OFDM-vs-ROBUST anchor distinction IS** the
+> discriminator; the leap bound is only defense-in-depth on top of it.
+
+### §15.2 The fix — at the SHARED chokepoint `supershift_retrigger_target()`
+
+Both elevator sites (the re-trigger `arq_commander.cc:4682` AND the FRAME-UP
+elevator `arq_commander.cc:3733`) reach the clamp via the shared
+`elevator_target_from_snr()` → `supershift_retrigger_target()` (`arq.h`). Applying
+the fix at the helper covers BOTH with no drift (the documented DSP-commit
+anti-pattern).
+
+**PRIMARY (required)** — add `is_ofdm_config(anchor)` to the `high_confidence_jump`
+predicate (`arq.h`, `is_ofdm_config` from `common/common_defines.h:79`,
+`config>=0 && config<=16`, so ROBUST 100-102 ⇒ false):
+
+```diff
+-    bool high_confidence_jump = (snr_uplink > -90) &&
+-        config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap);
++    bool high_confidence_jump = (snr_uplink > -90) &&
++        is_ofdm_config(anchor) &&
++        config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap);
+```
+
+- **WGN:-10**: the anchor stays ROBUST (OFDM data never delivers, so §1.1's
+  confirmed-delivery anchor-raise never fires past the robust rungs) ⇒
+  `is_ofdm_config(anchor)=false` ⇒ `high_confidence_jump=false` ⇒ the inner
+  `if(idx(snr_ideal) > idx(anchor_cap))` is TRUE ⇒ `snr_ideal = anchor_cap` (the
+  af14a9e +1 clamp re-applies) ⇒ NO multi-rung jump ⇒ the modem stays at the
+  OFDM-entry rung, the data-fail BREAK path re-engages, and it falls back to ROBUST_0
+  (af14a9e behavior RESTORED).
+- **WGN:30**: as #2's sustained-clean gate (§11) delivers clean OFDM batches, §1.1
+  raises the anchor to CONFIG_0 (the first OFDM rung). `is_ofdm_config(CONFIG_0)=true`
+  ⇒ the jump is permitted (the fast multi-rung climb PRESERVED). The fix adds at most
+  a small confirm-at-CONFIG_0 delay before the big jump (the anchor must reach an
+  OFDM rung first), which is acceptable.
+
+**SECONDARY (defense-in-depth)** — bound a licensed jump to `anchor +
+RETRIGGER_MAX_LEAP` (a new tunable, `common_defines.h`, `#define RETRIGGER_MAX_LEAP
+13`):
+
+```diff
++    if(high_confidence_jump)
++    {
++      int leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP, robust_en, narrowband);
++      if(config_ladder_index(snr_ideal) > config_ladder_index(leap_cap))
++        snr_ideal = leap_cap;
++    }
+```
+
+Even once the anchor is OFDM, a marginal-OFDM channel (CONFIG_0 holds but CONFIG_13
+does not) cannot overshoot the whole ladder in one shot — it leaps in bounded steps
+as the anchor ratchets up, with the proven-ceiling cap (caller, `:4591-4592`) + the
+§10 anchor-demotion backstopping any residual overshoot. The leap-cap NEVER lowers
+`snr_ideal` below `anchor_cap` (it is still ≥ a +1 move).
+
+**RETRIGGER_MAX_LEAP = 13 (TUNABLE) — chosen value & rationale.** 13 is the smallest
+value that preserves the existing high-SNR multi-rung climb assertions so the WGN:30
+fast climb is materially unchanged: a CONFIG_4 anchor still reaches CONFIG_16 in one
+leap (idx 7 + 12 = idx 19, gap 12 ≤ 13 ⇒ uncapped — Part J's J1b), and a CONFIG_0
+anchor still reaches CONFIG_13 (idx 3 + 13 = idx 16, gap 13 ≤ 13 ⇒ uncapped —
+Part J's FP-J2b). For a realistic LOW OFDM anchor the bound still bites: a CONFIG_0
+anchor with SNR mapping to CONFIG_16 (gap 16 > 13) is capped at CONFIG_13 (Part J''
+high-SNR case) — a genuine bound, leaving the proven-ceiling cap + §10 demotion as
+the PRIMARY overshoot backstops and MAX_LEAP as a coarse outer fence. The WGN:30
+climb takes at most 2 bounded leaps from a low OFDM anchor (e.g. CONFIG_0 → CONFIG_13
+→ CONFIG_16) instead of 1 giant jump — not material.
+
+### §15.3 §5 cross-layer audit (CLAUDE.md §5)
+
+The fix changes the `high_confidence_jump` predicate — over-climb-critical CMD
+state. It READS `last_data_viable_config` (the anchor); it adds NO new write.
+
+**Consumers of `high_confidence_jump`** (it is a LOCAL in
+`supershift_retrigger_target`; its EFFECT — the multi-rung-vs-+1 target — flows to
+the two elevator sites that call the helper through `elevator_target_from_snr()`):
+
+1. **SUPERSHIFT re-trigger** (`arq_commander.cc:4682`, `int snr_ideal =
+   elevator_target_from_snr();` then `gap >= SUPERSHIFT_RETRIGGER_CONFIGS` →
+   SET_CONFIG to `snr_ideal`). After §15, at a ROBUST anchor `snr_ideal` is clamped
+   to anchor+1 ⇒ `gap` from `current_configuration` is small ⇒ the re-trigger
+   usually does not even fire (and if it does, it lands +1, not multi-rung).
+2. **FRAME-UP elevator** (`arq_commander.cc:3733`, `int snr_ideal =
+   elevator_target_from_snr();` then `if(idx(snr_ideal) > idx(proposed_frame))
+   negotiated = snr_ideal;`). After §15, at a ROBUST anchor `snr_ideal ≤ anchor+1 ≤
+   proposed_frame` (proposed_frame is the +1) ⇒ the `>` is false ⇒ `negotiated`
+   stays the +1 (`proposed_frame`) ⇒ BYTE-IDENTICAL to the pre-elevator +1 ladder at
+   the cliff.
+
+Both consumers reach the helper through the ONE shared `elevator_target_from_snr()`
+(`arq_commander.cc:174-186`), so the fix cannot drift between them.
+
+**Producers / valid states of `last_data_viable_config` (the anchor — the READ
+input):**
+- **RAISE producer (sole)**: §1.1 `arq_commander.cc:3437-3439`, gated by
+  `promotion_allowed_on_batch` + the §11 sustained-N — a CONFIRMED clean batch at
+  the landing config. §15 adds NO raise. Valid states: ROBUST_0/1/2 (the robust
+  rungs, where it sits until an OFDM batch is confirmed) or CONFIG_0..CONFIG_16.
+- **DEMOTE producer**: §10 `anchor_demote_target` (`anchor_consec_break_fails` ≥
+  K=3). §15 adds NO demote.
+- **Default-init**: the anchor begins at the init/robust config. BEFORE any OFDM
+  batch is confirmed it is a ROBUST rung — exactly the state the §15 primary gate
+  keys on. This is the WGN:-10 state: the anchor never leaves ROBUST because OFDM
+  never delivers, so `is_ofdm_config(anchor)` is false for the whole session ⇒ the
+  jump is never licensed.
+
+**The five required verifications:**
+
+1. **WGN:-10 holds ROBUST_0 (af14a9e RESTORED).** Anchor stays ROBUST ⇒
+   `high_confidence_jump=false` ⇒ +1 clamp ⇒ no jump ⇒ both elevator consumers keep
+   the +1/dormant result ⇒ data-fail BREAK re-engages ⇒ `break_target_with_anchor`
+   floors to the still-ROBUST anchor and the breaks≥2 panic-jump (`:149`) escapes to
+   ROBUST_0. ✓ (Part J'' deep-SNR case asserts the helper returns ≤ proposed_frame.)
+2. **WGN:30 jump PRESERVED.** Once §1.1 raises the anchor to CONFIG_0 (OFDM),
+   `is_ofdm_config(anchor)=true` ⇒ the multi-rung jump fires (bounded by MAX_LEAP +
+   proven-ceiling). ✓ (Part J'' high-SNR case asserts a capped multi-rung jump;
+   existing J1b/FP-J2b assert the un-capped jumps at gaps ≤ 13.) **Verified premise**:
+   does the WGN:30 anchor actually reach an OFDM config when the elevator should
+   fire? YES — #2's sustained-clean gate (§11) raises it to CONFIG_0 after the first
+   clean OFDM batches deliver; the fix therefore adds at most a confirm-at-CONFIG_0
+   delay, not a permanent block.
+3. **FRAME-UP / LADDER-UP +1 logic, the SACK path, and #2's anti-thrash are
+   UNTOUCHED.** §15 edits ONLY `high_confidence_jump` inside
+   `supershift_retrigger_target`. The other three +1-clamp consumers
+   (`arq_commander.cc:3617` FRAME-UP ceiling, `:4869` / `:5026` LADDER-UP) build
+   their target with `config_ladder_up` (structurally +1) and are byte-unchanged
+   (§13.3 consumer list (1)). The §14 (A1) arm widening, the SACK suffix decode
+   routing (H2/H2b/H3 invariants), and #2's §10 demotion / §11 sustained-N are
+   untouched. ✓
+4. **Moderate-SNR overshoot is bounded by MAX_LEAP + #2 demotion.** A marginal-OFDM
+   channel (anchor reaches CONFIG_0 but CONFIG_13 cliffs) leaps at most +13 per
+   re-trigger; if CONFIG_13 then breaks, BREAK lowers `supershift_proven_ceiling`
+   (tightening the caller's cap on the NEXT jump) and, if the anchor rung itself
+   keeps breaking, §10 demotes the anchor. ✓
+5. **No new anchor raise / no new re-entry (SAFETY #3/#5 preserved).** The helper is
+   `const`, returns an `int`; the caller assigns it to `snr_ideal`/`negotiated`, not
+   to `last_data_viable_config`. The re-entry guards (`turboshift_phase==TURBO_DONE`,
+   `turbo_supershift_announce_pending`) are untouched. ✓
+
+**Net**: §15 supplies the MISSING half of the high-confidence premise (the anchor
+must have PROVEN the OFDM tier) at the ONE chokepoint both elevators share, plus a
+bounded outer fence. Every af14a9e/3b1726a over-climb protection is intact, and the
+WGN:-10 over-climb is closed at its true root (the control-plane SNR over-report)
+rather than by a threshold band-aid.
+
+### §15.4 Producers / consumers — what §15 changes
+
+- **`high_confidence_jump`** (local): §15 ADDS the `is_ofdm_config(anchor)` conjunct
+  (PRIMARY) and the MAX_LEAP cap inside its TRUE branch (SECONDARY). No other code
+  reads this local.
+- **`last_data_viable_config`** (anchor): §15 adds NO producer; it adds a READ
+  (`is_ofdm_config(anchor)`) — the same value `anchor_cap` already read. Unchanged
+  producers: §1.1 raise, §10 demote.
+- **`RETRIGGER_MAX_LEAP`** (new `#define`, common_defines.h): consumed ONLY by
+  `supershift_retrigger_target`. Tunable.
+
+### §15.5 Part J'' (`--test-climb-engine`) — fail-before / pass-after
+
+Appended after Part J' (in `test_climb_engine`). Reuses the Part J scaffolding (real
+`get_configuration` / `config_ladder_*` / `SUPERSHIFT_MARGIN_DB` /
+`snr_uplink_from_suffix`). A `retrigger_target_v15` lambda models FAIL-BEFORE as the
+VERBATIM pre-§15 helper body (the 94e80a6 `high_confidence_jump` WITHOUT
+`is_ofdm_config` and WITHOUT the MAX_LEAP cap) and PASS-AFTER as the REAL shipped
+`supershift_retrigger_target()`.
+
+- **JJ1 — DEEP-SNR ROBUST-anchor (the regression)**: anchor=ROBUST_2 (a ROBUST
+  config), SNR_uplink=`snr_uplink_from_suffix(1.0f)` (the control-plane SNR at
+  WGN:-10), current=CONFIG_0, proposed_frame=CONFIG_0's +1 = CONFIG_1, proven=−1.
+  `snr_ideal = get_configuration(1.0−6.0=−5.0) = CONFIG_4` (idx 7); anchor_cap =
+  `config_ladder_up_n(ROBUST_2,1,robust,wb) = CONFIG_0` (idx 3).
+  - **FAIL-BEFORE (pre-§15 body)**: `high_confidence_jump = (1>−90) && (idx7 > idx3)
+    = true` ⇒ returns `snr_ideal = CONFIG_4` (the over-climb). Asserted directly.
+  - **PASS-AFTER (real helper)**: `is_ofdm_config(ROBUST_2)=false` ⇒
+    `high_confidence_jump=false` ⇒ inner clamp ⇒ returns `anchor_cap = CONFIG_0`
+    (≤ proposed_frame, the +1 ladder; NO multi-rung jump).
+  - Asserts: PASS-AFTER ≤ proposed_frame AND == anchor_cap (CONFIG_0); FAIL-BEFORE ==
+    CONFIG_4; the two DIFFER (the fix bites).
+- **JJ2 — HIGH-SNR OFDM-anchor (jump PRESERVED + MAX_LEAP cap)**: anchor=CONFIG_0
+  (OFDM), SNR_uplink=`snr_uplink_from_suffix(20.0f)`, current=CONFIG_0,
+  proposed_frame=CONFIG_1, proven=−1. `snr_ideal = get_configuration(20−6=14) =
+  CONFIG_16` (idx 19). `is_ofdm_config(CONFIG_0)=true` ⇒ jump licensed; leap_cap =
+  `config_ladder_up_n(CONFIG_0,13,…) = CONFIG_13` (idx 16) ⇒ capped to CONFIG_13.
+  - **PASS-AFTER (real helper)**: returns CONFIG_13 — a multi-rung jump (> CONFIG_1)
+    bounded by MAX_LEAP (< CONFIG_16). Asserts > proposed_frame AND == CONFIG_13 AND
+    ≤ leap_cap.
+  - **FAIL-BEFORE (pre-§15 body)**: also jumps, but UNCAPPED to CONFIG_16 — so this
+    case ALSO asserts the fix did not BREAK the high-SNR jump (both jump; §15 only
+    bounds it). Asserts FAIL-BEFORE == CONFIG_16 and PASS-AFTER == CONFIG_13.
+- **JJ3 — sanity: a CONFIG_0 anchor with a small gap is UNCAPPED (climb not slowed)**:
+  anchor=CONFIG_0, SNR_uplink=`snr_uplink_from_suffix(14.6f)` ⇒ snr_ideal=CONFIG_13
+  (idx 16, gap 13 == MAX_LEAP) ⇒ NOT capped (leap_cap=CONFIG_13). PASS-AFTER ==
+  CONFIG_13 (identical to FP-J2b's un-capped target) — documents that the WGN:30
+  fast climb is materially unchanged at gaps ≤ 13.
+
+**FAIL-BEFORE evidence**: JJ1 asserts the pre-§15 body returns CONFIG_4 (the
+over-climb) side-by-side with the §15 helper returning CONFIG_0 (the +1 clamp) — the
+same side-by-side pattern Parts D-J use. Reverting the §15 helper body to the
+94e80a6 predicate makes JJ1's PASS-AFTER assertion (helper returns CONFIG_0) FAIL.
+
+**PASS-AFTER**: JJ1/JJ2/JJ3 PASS; Parts A-I + the existing J0-J7 + Part J' (FP-J1..4)
++ H2/H2b/H3 stay PASS (§15 is additive — it only TIGHTENS the jump predicate at a
+ROBUST anchor and BOUNDS it at an OFDM anchor; every existing high-SNR assertion uses
+an OFDM anchor at a gap ≤ 13, so it is unaffected).
+
+**HONEST scope** (§8 applies): in-process Part J'' proves the jump is BLOCKED at a
+ROBUST anchor (regression closed) and PRESERVED-but-bounded at an OFDM anchor. The
+WIRE proofs — WGN:-10 actually holding ROBUST_0 (anchor never leaves ROBUST on the
+IONOS) and WGN:30 keeping the fast ~3k climb — are the parent's HARDWARE re-test.
+
+---
+
 ## §9 Related fact documents
 
 - `data-flow-messages_rx_prev.md` — the prev-storage state Bug 1 touches (RSP

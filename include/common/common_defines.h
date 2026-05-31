@@ -300,6 +300,20 @@ CONFIG_16 (5664.7 bps).
 // Checked after each ladder gearshift SET_CONFIG success (fresh OFDM SNR available).
 #define SUPERSHIFT_RETRIGGER_CONFIGS 3
 
+// Controlled-elevator multi-rung jump BOUND (gearshift-climb-engine.md §15, the
+// DEEP-SNR over-climb regression fix). Even once the data-viable anchor has PROVEN
+// the OFDM tier (the §15 primary gate `is_ofdm_config(anchor)`), a single SNR-driven
+// re-trigger jump is capped at `config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP, …)` so
+// a marginal-OFDM channel (CONFIG_0 holds but CONFIG_13 does not) cannot overshoot the
+// whole ladder in one shot — it leaps in bounded steps as the anchor ratchets up, with
+// the proven-ceiling cap (arq_commander.cc:4591-4592 / elevator_target_from_snr) and
+// the §10 anchor-demotion backstopping any residual overshoot. TUNABLE: chosen as the
+// smallest value that preserves the existing high-SNR multi-rung climb (a CONFIG_4
+// anchor still reaches CONFIG_16 in one leap = gap 12; a CONFIG_0 anchor still reaches
+// CONFIG_13 = gap 13), so the WGN:30 fast climb is materially unchanged (≤2 bounded
+// leaps from a low OFDM anchor) while a pathological jump is bounded.
+#define RETRIGGER_MAX_LEAP 13
+
 #define YES 1
 #define NO 0
 
