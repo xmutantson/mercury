@@ -3634,6 +3634,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				last_data_viable_config = data_anchor_raise_target(
 					clean_batches_config, current_configuration,
 					last_data_viable_config, clean_batches_at_current_config);
+				// [ANCHOR-DBG] WRITE site (arq_commander.cc anchor-raise). Logs the
+				// anchor value JUST written plus the inputs that decided it.
+				// current_configuration is (int)-cast defensively (it is now `int`
+				// after the config-member retype; the cast keeps the print honest if
+				// the type ever regresses to char). Compared against the [ANCHOR-DBG]
+				// READ print at the SUPERSHIFT re-trigger, this pins the WGN:-10
+				// write/read contradiction: write=ROBUST_2 / read=CONFIG_0 => memory
+				// corruption between the two; write already=CONFIG_0 => a
+				// producer-ordering bug at the ROBUST->OFDM boundary.
+				printf("[ANCHOR-DBG] WRITE last_data_viable_config=%d "
+					"clean_batches_config=%d current_configuration=%d "
+					"clean_batches_at_current_config=%d\n",
+					last_data_viable_config, clean_batches_config,
+					(int)current_configuration, clean_batches_at_current_config);
+				fflush(stdout);
 			}
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
@@ -4389,7 +4404,7 @@ void cl_arq_controller::process_control_commander()
 				// Asymmetric gearshift: swap forward/reverse for the return path
 				if(forward_configuration != CONFIG_NONE && reverse_configuration != CONFIG_NONE)
 				{
-					char tmp = forward_configuration;
+					int tmp = forward_configuration;
 					forward_configuration = reverse_configuration;
 					reverse_configuration = tmp;
 
@@ -4720,6 +4735,21 @@ void cl_arq_controller::process_control_commander()
 						// the +1 clamp at LOW/INVALID SNR (DEEP-SNR INERT) and relaxes it only at
 						// clearly-high SNR, capped at min(supershift_proven_ceiling, WB/NB ceiling),
 						// READING but never RAISING the anchor. See arq.h + sec 6/7/13/14.
+						// [ANCHOR-DBG] READ site (SUPERSHIFT re-trigger). Logs the anchor
+						// (last_data_viable_config) and current_configuration JUST BEFORE
+						// elevator_target_from_snr() consumes the anchor in
+						// supershift_retrigger_target(). At WGN:-10 the re-trigger only
+						// fires with gap>=4 if the anchor reads as an OFDM rung (the
+						// is_ofdm_config(anchor) gate). current_configuration is (int)-cast defensively
+						// (now `int` after the config-member retype). Compare to the
+						// [ANCHOR-DBG] WRITE print: if WRITE logged ROBUST_2 but this logs
+						// the anchor as CONFIG_0, the value was corrupted between writer
+						// and reader (memory/char); if it already reads CONFIG_0 here, a
+						// producer seated an OFDM anchor before this read.
+						printf("[ANCHOR-DBG] READ last_data_viable_config=%d "
+							"current_configuration=%d\n",
+							last_data_viable_config, (int)current_configuration);
+						fflush(stdout);
 						int snr_ideal = elevator_target_from_snr();
 						int gap = config_ladder_index(snr_ideal) - config_ladder_index(current_configuration);
 						if(gap >= SUPERSHIFT_RETRIGGER_CONFIGS)
@@ -8048,6 +8078,64 @@ int cl_arq_controller::test_climb_engine()
 			check(t == config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false),
 				"K''4 the preserved jump is bounded to anchor+MAX_LEAP (CONFIG_13)",
 				t, config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false));
+		}
+
+		// ================================================================
+		// Part L — CHAR-SIGNEDNESS REGRESSION (the config members must be SIGNED).
+		// The config-holding members (current/forward/reverse/negotiated/..._
+		// configuration) were `char`, which is UNSIGNED on ARM (the Pi testbed).
+		// A stored CONFIG_NONE (-1) then read back as 255, silently inverting every
+		// `== CONFIG_NONE` / `!= CONFIG_NONE` guard on ARM (arq_commander.cc:239/331/
+		// 659/683/4405, arq_common.cc:1217/7057, arq_responder.cc:1252-1253) AND
+		// letting a 255 sentinel reach the SET_CONFIG wire. These assertions store
+		// CONFIG_NONE THROUGH the real members and read the comparison back through
+		// them, so the test depends on the member STORAGE TYPE: it FAILS when the
+		// members are unsigned char compiled with -funsigned-char (255 != -1), and
+		// PASSES once they are `int`. (Unlike the rest of this suite, which exercises
+		// pure int helpers and therefore cannot observe the storage-type bug — which
+		// is exactly why x86 unit-test confidence was invalid for the char bug.)
+		// Pure local state, no wire/PHY. See arq.h config-member retype.
+		{
+			current_configuration = CONFIG_NONE;
+			check((current_configuration == CONFIG_NONE),
+				"L1 current_configuration stores CONFIG_NONE and == CONFIG_NONE is TRUE (signed)",
+				(current_configuration == CONFIG_NONE) ? 1 : 0, 1);
+			// load_configuration's first-init guard: `current_configuration != CONFIG_NONE`
+			// must be FALSE on a fresh CONFIG_NONE so the safe first-init branch runs
+			// (arq_common.cc:1217). On unsigned char this was wrongly TRUE on ARM.
+			check(!(current_configuration != CONFIG_NONE),
+				"L2 fresh current_configuration: (!= CONFIG_NONE) is FALSE (first-init branch taken)",
+				(current_configuration != CONFIG_NONE) ? 1 : 0, 0);
+
+			reverse_configuration = CONFIG_NONE;
+			check((reverse_configuration == CONFIG_NONE),
+				"L3 reverse_configuration stores CONFIG_NONE and == CONFIG_NONE is TRUE (SET_CONFIG seed guard)",
+				(reverse_configuration == CONFIG_NONE) ? 1 : 0, 1);
+
+			// The forward/reverse both-present guard (arq_commander.cc:4405,
+			// arq_responder.cc:1252-1253): with reverse_configuration==CONFIG_NONE the
+			// AND must be FALSE (the swap must NOT run). Unsigned char broke this.
+			forward_configuration = CONFIG_10;
+			bool both_present = (forward_configuration != CONFIG_NONE &&
+				reverse_configuration != CONFIG_NONE);
+			check(both_present == false,
+				"L4 (fwd!=NONE && rev!=NONE) is FALSE when reverse==CONFIG_NONE (no spurious swap)",
+				both_present ? 1 : 0, 0);
+
+			// And once seeded with a real config, the guard flips TRUE — and a valid
+			// config round-trips unchanged through the member (no 255 wrap).
+			reverse_configuration = CONFIG_4;
+			bool both_now = (forward_configuration != CONFIG_NONE &&
+				reverse_configuration != CONFIG_NONE);
+			check(both_now == true && reverse_configuration == CONFIG_4,
+				"L5 both-present TRUE after seeding reverse=CONFIG_4 (valid config preserved)",
+				(both_now && reverse_configuration == CONFIG_4) ? 1 : 0, 1);
+			// Restore CONFIG_NONE so a later --test-climb-engine pass / teardown sees a
+			// clean sentinel (these members are not otherwise consumed past here).
+			current_configuration = CONFIG_NONE;
+			negotiated_configuration = CONFIG_NONE;
+			forward_configuration = CONFIG_NONE;
+			reverse_configuration = CONFIG_NONE;
 		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",

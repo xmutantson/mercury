@@ -1261,7 +1261,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			if(has_asymmetric)
 			{
 				// Asymmetric gearshift: swap forward/reverse for the return path
-				char tmp = forward_configuration;
+				int tmp = forward_configuration;
 				forward_configuration = reverse_configuration;
 				reverse_configuration = tmp;
 

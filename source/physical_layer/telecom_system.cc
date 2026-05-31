@@ -5533,9 +5533,9 @@ void cl_telecom_system::return_to_last_configuration()
 // BER waterfalls (100 frames, passband, EsN0):
 //   C0:-14 C1:-11 C2:-10 C3:-9 C4:-8 C5:-7 C6:-6 C7:-5
 //   C8:-4  C9:-2  C10:-1 C11:+1 C12:+2 C13:+4 C14:+7 C15:+9 C16:+12
-char cl_telecom_system::get_configuration(double SNR)
+int cl_telecom_system::get_configuration(double SNR)
 {
-	char configuration;
+	int configuration;
 
 	if(SNR>13)
 		configuration=CONFIG_16;

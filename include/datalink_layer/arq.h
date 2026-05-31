@@ -1698,14 +1698,29 @@ public:
 
   cl_telecom_system* telecom_system;
 
-  char data_configuration;
-  char init_configuration;
-  char last_data_configuration;
-  char current_configuration;
-  char ack_configuration;
-  char negotiated_configuration;
-  char forward_configuration;   // Commander→Responder TX speed (asymmetric gearshift)
-  char reverse_configuration;   // Responder→Commander TX speed (after SWITCH_ROLE)
+  // CONFIG-HOLDING MEMBERS — MUST be a SIGNED type. These hold config IDs in the
+  // ranges CONFIG_0..CONFIG_16 (0..16), ROBUST_0..2 (100..102) AND the sentinel
+  // CONFIG_NONE = -1 (common_defines.h:53). They were `char`, which is UNSIGNED on
+  // ARM (the Pi testbed) but SIGNED on x86. With unsigned char, a stored
+  // CONFIG_NONE reads back as 255, so every `== CONFIG_NONE` / `!= CONFIG_NONE`
+  // comparison (arq_commander.cc:239/331/659/683/4405, arq_common.cc:1217/7057,
+  // arq_responder.cc:1252-1253) silently inverted on ARM (255 != -1 is TRUE),
+  // and a 255 sentinel could be written onto the SET_CONFIG wire (data[2] =
+  // reverse_configuration). x86 unit tests pass because signed char compares
+  // correctly. Widened to `int` (the type EVERY consumer already takes:
+  // config_ladder_index/up/down(int), is_ofdm_config/is_robust_config(int),
+  // load_configuration(int,...), and the int CONFIG_* macros) so the sentinel
+  // round-trips identically on both ABIs. No memcpy/sizeof/address-of/wire-struct
+  // layout depends on the width (audited — scalar by-value use only). See the
+  // -Wtype-limits warnings these comparisons used to emit.
+  int data_configuration;
+  int init_configuration;
+  int last_data_configuration;
+  int current_configuration;
+  int ack_configuration;
+  int negotiated_configuration;
+  int forward_configuration;   // Commander→Responder TX speed (asymmetric gearshift)
+  int reverse_configuration;   // Responder→Commander TX speed (after SWITCH_ROLE)
 
   int gear_shift_on;
   int robust_enabled;
@@ -2201,7 +2216,7 @@ private:
 
   int nResends;
 
-  char get_configuration(double SNR);
+  int get_configuration(double SNR);  // returns CONFIG_0..16 (never CONFIG_NONE); int for type-consistency with the config members it feeds
   void load_configuration(int configuration, int level, int backup_configuration);
   void switch_narrowband_mode(int nb_enabled);
   void return_to_last_configuration();

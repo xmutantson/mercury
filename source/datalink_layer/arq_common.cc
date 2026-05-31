@@ -1196,9 +1196,9 @@ int cl_arq_controller::parallel_monitor_decode(double* audio, int audio_len,
 	return -1;
 }
 
-char cl_arq_controller::get_configuration(double SNR)
+int cl_arq_controller::get_configuration(double SNR)
 {
-	char configuration;
+	int configuration;
 	configuration =telecom_system->get_configuration(SNR);
 	return configuration;
 }

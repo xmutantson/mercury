@@ -331,7 +331,7 @@ public:
 	int last_configuration;
 	int current_configuration;
 	void return_to_last_configuration();
-	char get_configuration(double SNR);
+	int get_configuration(double SNR);  // returns CONFIG_0..16 (never CONFIG_NONE)
 
 	int get_frame_size_bytes();
 	int get_frame_size_bits();

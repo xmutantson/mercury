@@ -46,8 +46,8 @@ public:
 	long int tcp_socket_data_timeout_ms;
 
 
-	char init_configuration;
-	char ack_configuration;
+	int init_configuration;   // config ID (CONFIG_0..16); int to match cl_arq_controller's signed config members
+	int ack_configuration;
 
 	int gear_shift_on;
 	int gear_shift_algorithm;

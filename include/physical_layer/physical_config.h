@@ -37,7 +37,7 @@ public:
 	cl_configuration_telecom_system();
 	~cl_configuration_telecom_system();
 
-	char init_configuration;
+	int init_configuration;   // config ID (CONFIG_0..16); int for type-consistency with the signed config members it feeds
 
 	int ofdm_Nc;
 	int ofdm_Nfft;
