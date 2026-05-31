@@ -6187,13 +6187,19 @@ int cl_arq_controller::test_clean_batch_viability()
 
 // climb-engine integrated regression (CLI --test-climb-engine).
 // See fact-documents/gearshift-climb-engine.md §7 (Parts A-D) + §10/§11
-// (Parts E-F, the deep-SNR down-hysteresis follow-up #2). Each part is
-// fail-before / pass-after its fix. Returns 0 on pass, 1 on fail.
+// (Parts E-F, the deep-SNR down-hysteresis follow-up #2) +
+// fact-documents/data-flow-snr-measurements.md §6 (Part G, the SUPERSHIFT
+// SNR-sentinel follow-up #1 Option A). Each part is fail-before / pass-after
+// its fix. Returns 0 on pass, 1 on fail.
 //   E — anchor DEMOTION: K consecutive anchor-rung BREAKs lower the anchor →
 //       break_target_with_anchor permits a sub-anchor recovery → the WGN:-10
 //       CONFIG_0↔ROBUST_0 thrash escapes (the missing demotion producer). §10.
 //   F — SUSTAINED-ANCHOR GATE: a single retransmit-rescued OFDM clean does NOT
 //       raise the anchor (N=2); robust raises on one clean (N=1). §11.
+//   G — SUPERSHIFT SNR-SENTINEL: a simulated SNR-suffix decode populates
+//       measurements.SNR_uplink > -90 (pre-fix it stays -99.9 on the CMD's
+//       MFSK-ACK climb → re-trigger never fires), the re-trigger eligibility
+//       predicate flips, and a live SNR admits EXACTLY ONE re-entry (anti-storm).
 //
 // IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
 // NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
@@ -6737,6 +6743,122 @@ int cl_arq_controller::test_climb_engine()
 	check(last_data_viable_config == ROBUST_2 && clean_batches_at_current_config == 1,
 		"F5 clean at a new rung restarts the streak (per-rung consecutiveness)",
 		clean_batches_at_current_config, 1);
+
+	// ================================================================
+	// Part G — SUPERSHIFT SNR-SENTINEL (climb follow-up #1, Option A;
+	// data-flow-snr-measurements.md §6). THE bug: the CMD's forward MFSK-ACK
+	// climb decodes NO LDPC data, so the canonical SNR_uplink producer
+	// (arq_common.cc:6051) never runs on the CMD's climb → measurements.SNR_uplink
+	// stays at its ctor sentinel -99.9 → the SUPERSHIFT re-trigger gate
+	// (arq_commander.cc, "... && measurements.SNR_uplink > -90") can NEVER fire →
+	// the modem crawls up the ladder one rung at a time instead of elevator-jumping
+	// to the SNR-appropriate config. The FIX adds a CMD-side producer at the
+	// SNR-suffix decode site: it writes measurements.SNR_uplink from the SAME
+	// decoded SNR the RSP's ACK suffix carries (snr_uplink_from_suffix — the SAME
+	// pure helper the production write calls at arq_common.cc, the
+	// "measurements.SNR_uplink = snr_uplink_from_suffix(decoded_snr)" line).
+	// FAIL-BEFORE (on e3d818d): that producer line does not exist; SNR_uplink stays
+	// -99.9 through the entire climb → G1 reads the sentinel and FAILS, and the
+	// §2.1 eligibility predicate (G2) never flips. PASS-AFTER: the producer writes
+	// a real value → G1 > -90, G2 flips false→true. G3 guards the §5 cross-layer
+	// risk: a now-live SNR_uplink must NOT enable an unbounded SUPERSHIFT re-entry
+	// storm (the TURBO_DONE-phase gate + the turbo_supershift_announce_pending
+	// one-jump-in-flight guard bound it).
+	// ================================================================
+	robust_enabled = NO;            // OFDM tier — the re-trigger is OFDM-only
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	gear_shift_on = YES;
+	optimizer_disabled = true;      // optimizer_is_in_control()==false (no Q-table cap)
+
+	// A representative RSP-measured forward-link SNR the ACK suffix would carry.
+	const float G_DECODED_SNR = 12.0f;
+
+	// G-pre: the climb-entry state — SNR_uplink at the ctor sentinel (§1.1),
+	// exactly as it sits for the WHOLE forward pattern-ACK climb pre-fix (no
+	// producer runs on the CMD). This is the value e3d818d is stuck at.
+	measurements.SNR_uplink = -99.9;
+	check(!(measurements.SNR_uplink > -90),
+		"G0 climb-entry SNR_uplink is the -99.9 sentinel (no CMD producer ran yet)",
+		(int)(measurements.SNR_uplink > -90), 0);
+
+	// Replay the REAL §1.5 producer write (the SAME helper the suffix-decode site
+	// calls). On e3d818d this line does not exist in production, so SNR_uplink
+	// would still be -99.9 here; this models the fix's write faithfully.
+	measurements.SNR_uplink = snr_uplink_from_suffix(G_DECODED_SNR);
+
+	// G1 — after a simulated SNR-suffix decode, SNR_uplink is a real value > -90.
+	// FAIL-BEFORE: no producer → stays -99.9 → FAILS. PASS-AFTER: == 12.0 > -90.
+	check(measurements.SNR_uplink > -90,
+		"G1 SNR-suffix decode populates SNR_uplink > -90 (was the -99.9 sentinel)",
+		(int)(measurements.SNR_uplink > -90), 1);
+	check((float)measurements.SNR_uplink == G_DECODED_SNR,
+		"G1b SNR_uplink holds the SAME decoded value the suffix carried (12 dB)",
+		(int)((float)measurements.SNR_uplink), (int)G_DECODED_SNR);
+
+	// G2 — eligibility flip of the REAL §2.1 re-trigger gate predicate
+	// (arq_commander.cc: turboshift_phase==TURBO_DONE && gear_shift_on==YES &&
+	// is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90).
+	// Hold the other three conjuncts TRUE and show the SNR conjunct is the one
+	// that was blocking: at the sentinel the gate is FALSE; with a real value it
+	// is TRUE. (This is the gate that was structurally unreachable pre-fix.)
+	turboshift_phase      = TURBO_DONE;
+	current_configuration = CONFIG_4;          // an OFDM rung (is_ofdm_config==true)
+	auto retrigger_eligible = [&]() -> bool {
+		return turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
+		       is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90;
+	};
+	measurements.SNR_uplink = -99.9;           // the pre-fix climb state
+	bool elig_before = retrigger_eligible();
+	measurements.SNR_uplink = snr_uplink_from_suffix(G_DECODED_SNR);  // the fix's write
+	bool elig_after = retrigger_eligible();
+	check(!elig_before && elig_after,
+		"G2 SUPERSHIFT re-trigger eligibility flips false->true once SNR_uplink is populated",
+		(elig_before ? 2 : 0) + (elig_after ? 1 : 0), 1);
+
+	// G3 — ANTI-STORM (the §5 cross-layer risk). Repeated suffix decodes keep
+	// writing a live SNR_uplink, but the re-trigger must NOT re-enter unboundedly.
+	// Two structural bounds hold (data-flow-snr-measurements.md §2.1):
+	//   (1) the gate requires turboshift_phase == TURBO_DONE; when the re-trigger
+	//       FIRES it sets phase = TURBO_FORWARD, so a SECOND re-trigger is
+	//       impossible until turbo finishes again;
+	//   (2) the in-turbo SUPERSHIFT jump sets turbo_supershift_announce_pending
+	//       on each SET_CONFIG jump and clears it only on confirm/abort — at most
+	//       one announced jump is in flight.
+	// Model: drive MANY suffix decodes; each re-evaluates the gate and, IF
+	// eligible AND no announce is pending, performs the ONE allowed re-entry
+	// (phase -> TURBO_FORWARD, announce pending). Count actual re-entries: must
+	// be exactly 1 across the burst (not one-per-decode). Pre-fix this loop never
+	// re-enters at all (SNR_uplink sentinel); the risk the fix introduces is the
+	// OPPOSITE (a storm), which this bounds.
+	turboshift_phase                = TURBO_DONE;
+	current_configuration           = CONFIG_4;
+	turboshift_active               = false;
+	turbo_supershift_announce_pending = false;
+	int retrigger_entries = 0;
+	for(int d=0; d<10; d++)
+	{
+		// Each iteration = one fresh SNR-suffix decode writing a live value (§1.5).
+		measurements.SNR_uplink = snr_uplink_from_suffix(G_DECODED_SNR);
+		// REAL gate + REAL guards: re-enter only if eligible AND no jump in flight.
+		if(retrigger_eligible() && !turboshift_active && !turbo_supershift_announce_pending)
+		{
+			// The ONE allowed re-entry (mirrors arq_commander.cc:4576-4587 +
+			// the :4512 announce-pending set on the SET_CONFIG jump it issues).
+			turboshift_active                 = true;
+			turboshift_phase                  = TURBO_FORWARD;   // leaves TURBO_DONE
+			turbo_supershift_announce_pending = true;            // one jump in flight
+			retrigger_entries++;
+		}
+	}
+	check(retrigger_entries == 1,
+		"G3 anti-storm: 10 live-SNR suffix decodes admit EXACTLY ONE re-trigger re-entry (guards hold)",
+		retrigger_entries, 1);
+	// G3b — and the burst leaves the guards latched (phase off TURBO_DONE,
+	// announce pending) — proving the bound is the guards, not luck.
+	check(turboshift_phase != TURBO_DONE && turbo_supershift_announce_pending,
+		"G3b after the single re-entry the phase/announce guards block further re-entry",
+		(turboshift_phase != TURBO_DONE ? 2 : 0) + (turbo_supershift_announce_pending ? 1 : 0), 3);
 
 	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

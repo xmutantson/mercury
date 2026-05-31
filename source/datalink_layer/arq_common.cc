@@ -5538,6 +5538,21 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 					turbo_received_snr = decoded_snr;
 					if(decoded_snr > turbo_best_snr)
 						turbo_best_snr = decoded_snr;
+					// SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
+					// data-flow-snr-measurements.md §1.5). ALSO populate
+					// measurements.SNR_uplink so the SUPERSHIFT re-trigger gate
+					// (arq_commander.cc, "measurements.SNR_uplink > -90") becomes
+					// eligible mid-climb. The canonical producer (:6051) writes
+					// SNR_uplink for ALL roles from a decoded LDPC frame, but the
+					// CMD decodes NO LDPC data on the forward pattern-ACK climb, so
+					// SNR_uplink would otherwise stay at the ctor sentinel -99.9 and
+					// the elevator could never engage (slow one-rung ladder climb).
+					// This path is CMD-only (receive_ack_pattern is CMD-only), so we
+					// write SNR_uplink only — matching :6051's CMD-role semantics
+					// (SNR_downlink is RESPONDER-only there). Same decoded value the
+					// suffix carries. Accepted tradeoff: the value goes stale after
+					// turbo (Option B's steady-state ACK suffix is NOT done here).
+					measurements.SNR_uplink = snr_uplink_from_suffix(decoded_snr);
 					turbo_snr_defer_timer.reset();
 					printf("[CMD-ACK-SNR] ACK detected with SNR=%.1f dB (matched=%d)\n",
 						decoded_snr, matched_count);

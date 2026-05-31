@@ -656,6 +656,23 @@ public:
   { return is_robust_config(config) ? SUSTAINED_ANCHOR_N_ROBUST
                                      : SUSTAINED_ANCHOR_N_OFDM; }
 
+  // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
+  // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
+  // decodes NO LDPC data, so the canonical SNR_uplink producer
+  // (arq_common.cc:6051) never runs on the CMD's climb → SNR_uplink stays at
+  // its ctor sentinel -99.9 → the SUPERSHIFT re-trigger gate
+  // (measurements.SNR_uplink > -90) can never fire → the modem crawls up the
+  // ladder one rung at a time. The RSP encodes its measured SNR of the CMD's
+  // signal in the ACK suffix; the CMD decodes it (stored in
+  // turbo_received_snr). This PURE helper is the value the new producer writes
+  // into measurements.SNR_uplink at the suffix-decode site — the SAME decoded
+  // value, as a double, matching the canonical producer's field (SNR_uplink is
+  // written for ALL roles by :6051; SNR_downlink only on RESPONDER, so the
+  // CMD-only suffix path writes SNR_uplink only). No side effects so the
+  // unit test (Part G) replays the identical expression. See §1.5 / §6.
+  static double snr_uplink_from_suffix(float decoded_snr)
+  { return (double)decoded_snr; }
+
   // climb-engine Bug 1 (gearshift-climb-engine.md §4) — split SACK dedupe by
   // event class. The CMD MFSK ACK+SACK decode used a SINGLE tracker
   // (cmd_last_applied_sack_bsi): a PARTIAL SACK for bsi=B set it, then the later
@@ -697,7 +714,8 @@ public:
   // never call this. See gearshift-start-and-recovery.md §9.8.
   int test_clean_batch_viability();
 
-  // climb-engine integrated 3-bug regression (CLI --test-climb-engine).
+  // climb-engine integrated regression (CLI --test-climb-engine). Parts A-G,
+  // each fail-before / pass-after its fix:
   // (a) Bug 1: sack_clean_confirmation_accepted() split-dedupe — an all-ones
   //     CLEAN confirmation for a bsi whose PARTIAL was already applied is
   //     ACCEPTED (pre-fix: dropped as duplicate); a repeated clean is rejected.
@@ -709,6 +727,15 @@ public:
   //     Axis-2 — promotes ROBUST_0 -> ROBUST_1 -> ROBUST_2 -> CONFIG_0, NOT
   //     stuck one rung up. Pre-fix (Axis-2 grows robust batch -> no clean
   //     credit) the anchor freezes at ROBUST_0 and the climb stalls.
+  // (d) climb follow-up #2 (Parts D-F): the connect-path CMD/RSP batch
+  //     invariant, deep-SNR anchor DEMOTION (the WGN:-10 CONFIG_0<->ROBUST_0
+  //     thrash escape), and the SUSTAINED-ANCHOR gate.
+  // (e) climb follow-up #1, Option A (Part G): the SUPERSHIFT SNR-sentinel —
+  //     a simulated SNR-suffix decode (snr_uplink_from_suffix) populates
+  //     measurements.SNR_uplink > -90 so the re-trigger gate becomes eligible
+  //     (pre-fix it stays at the -99.9 sentinel on the CMD's MFSK-ACK climb),
+  //     plus the anti-storm bound (a live SNR admits exactly one re-entry).
+  //     See data-flow-snr-measurements.md §6.
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
 
