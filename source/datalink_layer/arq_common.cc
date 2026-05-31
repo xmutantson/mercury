@@ -346,10 +346,15 @@ cl_arq_controller::cl_arq_controller()
 	turbo_settle_pending=false;
 	turbo_supershift_announce_pending=false;
 	supershift_proven_ceiling=-1;
-	// Option B (data-anchored promotion): see arq.h. Ctor default; the real
-	// per-session value is set in reset_session_state once init_configuration
-	// reflects the requested start mode (ROBUST_0 for -R gearshift sessions).
-	last_data_viable_config=init_configuration;
+	// Option B (data-anchored promotion): see arq.h. Ctor PRE-INIT placeholder —
+	// robust_enabled is still NO (set just above) and init_configuration is still
+	// CONFIG_0 here, so session_floor_anchor() returns CONFIG_0; this is overwritten
+	// by the AUTHORITATIVE seat in init() (arq_common.cc, after the robust/non-robust
+	// branch resolves init_configuration). Routed through the helper for consistency
+	// with the other two seats. See gearshift-climb-engine.md §17 (the anchor was
+	// poisoned to CONFIG_0 here because CONNECT skips reset_session_state, so the
+	// ctor value was the value the first session climbed from).
+	last_data_viable_config=session_floor_anchor(robust_enabled, init_configuration);
 	// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10/§11): no BREAK has
 	// fired and no clean streak exists yet. anchor_consec_break_fails counts
 	// consecutive BREAKs AT the anchor rung (→ demote at K); the sustained-anchor
@@ -930,6 +935,20 @@ int cl_arq_controller::init(int tcp_base_port, int gear_shift_on, int initial_mo
 		data_configuration = initial_mode;
 		ack_configuration=default_configuration_ARQ.ack_configuration;
 	}
+
+	// AUTHORITATIVE data-viability anchor seat (gearshift-climb-engine.md §17).
+	// The ctor seated CONFIG_0 (robust_enabled / init_configuration were not yet
+	// set there), and the CONNECT command handler (process_user_command) does NOT
+	// call reset_session_state — so on the FIRST connect the anchor would otherwise
+	// hold the ctor's CONFIG_0 while load_configuration() drives current_configuration
+	// to the real start (ROBUST_0 on a -R session). That divergence
+	// (anchor=CONFIG_0=OFDM, live=ROBUST_0) opened the §15 SUPERSHIFT re-trigger gate
+	// is_ofdm_config(anchor) at t=0 and rocketed the climb to CONFIG_9 at WGN:-10.
+	// Seat it HERE, after the robust/non-robust branch has resolved init_configuration
+	// and AFTER robust_enabled is known (main.cc sets ARQ.robust_enabled before
+	// init()): session_floor_anchor() returns ROBUST_0 on a -R session (gate CLOSED at
+	// t=0) and init_configuration (the start/pinned config) otherwise.
+	last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
 
 	if(tcp_socket_data.init()!=SUCCESS || tcp_socket_control.init()!=SUCCESS )
 	{
@@ -2988,10 +3007,12 @@ void cl_arq_controller::reset_session_state()
 	turboshift_initiator = false;
 	turboshift_retries = 1;
 	supershift_proven_ceiling = -1;
-	// Option B (data-anchored promotion): reset to the session start config.
-	// Nothing has carried data yet, so BREAK floors at and probes climb one rung
-	// above init_configuration (= ROBUST_0 for -R gearshift). See arq.h / §6.
-	last_data_viable_config = init_configuration;
+	// Option B (data-anchored promotion): reset to the session FLOOR (NOT the raw
+	// init_configuration, which is CONFIG_0 on a GUI build whose initial_config isn't
+	// robust — see gearshift-climb-engine.md §17). Nothing has carried data yet, so
+	// BREAK floors at and probes climb one rung above the floor (ROBUST_0 for a -R
+	// gearshift session, init_configuration/pinned config otherwise). See arq.h / §6.
+	last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
 	// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10/§11): fresh session —
 	// no anchor-rung BREAK streak and no clean streak yet.
 	anchor_consec_break_fails = 0;

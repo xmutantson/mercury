@@ -1877,6 +1877,231 @@ IONOS) and WGN:30 keeping the fast ~3k climb — are the parent's HARDWARE re-te
 
 ---
 
+## §17 THE ANCHOR IS POISONED AT INIT — seat it at the session FLOOR, not CONFIG_0
+
+**SHIPPED on `fix/fast-probe` (this commit, stacked on 1e7bdba).** §13–§16 each
+guarded the anchor's RISE during the climb (the elevator gate §15, the raise
+producer + turbo clamp §16). They were NECESSARY but ALL ASSUMED the anchor STARTS
+at a ROBUST rung on a `-R` session — the `is_ofdm_config(anchor)` gate (§15) and the
+ROBUST→OFDM tier gate (§16 ROOT-1) are both keyed on that premise. The `[ANCHOR-DBG]`
+instrumentation added at 1e7bdba PROVED the premise FALSE: the anchor is CONFIG_0
+(an OFDM config) from t=0 on a `-R` session, so every downstream gate that keys on
+`is_ofdm_config(anchor)` is OPEN before a single OFDM batch has been proven. This is
+why the four prior fixes did not stop the WGN:-10 over-climb — they bounded the RISE
+of an anchor that was already in the OFDM tier at INIT.
+
+### §17.1 ROOT CAUSE (PROVEN by the [ANCHOR-DBG] arbiter — not re-investigated)
+
+At WGN:-10 on `-Q 0 -M auto -g -R`:
+`[ANCHOR-DBG] WRITE last_data_viable_config=0 clean_batches_config=100 current_configuration=100`
+— the anchor is ALREADY CONFIG_0 (0) while the live config is ROBUST_0 (100). The
+WRITE logged 0 because `data_anchor_raise_target(streak_config=ROBUST_0(idx 0), …,
+current_anchor=CONFIG_0(idx 3), …)` correctly NEVER LOWERS (Rule 1: ROBUST_0 idx 0 <
+CONFIG_0 idx 3 ⇒ no-op) — so the helper FAITHFULLY kept the poisoned init value. The
+[ANCHOR-DBG] READ at the re-trigger then returns 0, `is_ofdm_config(0)=true`, the §15
+elevator gate OPENS at t=0, and the turbo rockets ROBUST_0 → CONFIG_4 → CONFIG_9.
+**No corruption between writer and reader; the anchor is poisoned AT INIT.**
+
+The init chain (CITED):
+- **Ctor** (`arq_common.cc:279`) `init_configuration=CONFIG_0`, then
+  (`arq_common.cc:352`) `last_data_viable_config=init_configuration` ⇒ CONFIG_0. The
+  ctor runs in member-init order BEFORE `init()`; at this point `robust_enabled` is
+  still NO (`:289`) and `init_configuration` is still CONFIG_0.
+- **`init()`** (`arq_common.cc:919/923/929`) sets `init_configuration = initial_mode`
+  (ROBUST_0 on a non-GUI `-R` session; on a GUI build it is `g_settings.initial_config`
+  via `main.cc:2223`, which is CONFIG_0 unless the INI sets it robust). **`init()`
+  does NOT touch `last_data_viable_config`** — so after `init()` the anchor is STILL
+  the ctor's CONFIG_0.
+- **`reset_session_state()`** (`arq_common.cc:2994`) `last_data_viable_config =
+  init_configuration` — WOULD seat ROBUST_0 (init_configuration is ROBUST_0 by now on
+  the non-GUI path) — **BUT the `CONNECT` command handler
+  (`arq_common.cc:2670-2708`) does NOT call `reset_session_state()`** (it calls only
+  `reset_all_timers()` + `messages_control.status=FREE`). So on the FIRST connect
+  after process start — the exact IONOS test pattern (launch → MYCALL → CONNECT) —
+  `reset_session_state()` has NOT run, and the anchor holds the ctor's CONFIG_0 while
+  `load_configuration(ROBUST_0)` (`arq_common.cc:1249`) sets `current_configuration`
+  to ROBUST_0. The two diverge: live=ROBUST_0, anchor=CONFIG_0. **This is the live
+  mechanism.** (The GUI-build path where `init_configuration` itself stays CONFIG_0 is
+  a SECOND, independent way to poison the anchor; the fix below closes BOTH because it
+  does not depend on `init_configuration` carrying the robust floor.)
+
+PRE-EXISTING latency: the #2 baseline (446887c) had the SAME init bug but no A1 SNR
+sentinel → `measurements.SNR_uplink` stayed at the −99.9 ctor sentinel → the
+re-trigger eligibility gate (`… && SNR_uplink > -90`) NEVER opened → the poisoned
+OFDM anchor was harmless (the elevator never consulted it). The §14 (A1) arm
+populated `SNR_uplink` from the control-suffix, which opened the gate and made the
+latent init poison a LIVE over-climb. **A pre-existing bug exposed by A1, not an A1
+bug** (same shape as §16's pre-existing-bug-exposed-by-fast-probe note).
+
+### §17.2 The fix — seat the anchor at the actual session FLOOR
+
+The anchor means "highest config with CONFIRMED data delivery." At session start
+NOTHING above the floor is proven, so it MUST init to the session's actual floor/
+start config — NOT the stale `init_configuration`-defaults-to-CONFIG_0 value:
+- robust/`-R` session (`robust_enabled==YES`): the ladder floor `FULL_CONFIG_LADDER[0]`
+  = ROBUST_0 (id 100, idx 0). `is_ofdm_config(ROBUST_0)=false` ⇒ the §15 gate is
+  CLOSED at t=0 (no jump until OFDM is proven). This holds REGARDLESS of whether
+  `init_configuration` happens to be CONFIG_0 (GUI build) — the floor is computed
+  from `robust_enabled`, not from `init_configuration`.
+- non-robust session: the operating/start config = `init_configuration` (CONFIG_0 for
+  a normal start, or a pinned CONFIG_N). `is_ofdm_config(CONFIG_N)=true` — correct, a
+  pinned/normal OFDM session legitimately starts in the OFDM tier and BREAK must floor
+  there.
+
+**The PURE helper** `session_floor_anchor(bool robust_enabled, int start_config)`
+(`arq.h`, immediately after `data_anchor_raise_target`):
+```cpp
+inline int session_floor_anchor(bool robust_enabled, int start_config) {
+    if (robust_enabled) return FULL_CONFIG_LADDER[0];  // ROBUST_0 — ladder floor
+    return start_config;                               // CONFIG_0 normal / CONFIG_N pinned
+}
+```
+
+**Applied at THREE sites** (the ordering fix is the new `init()` seat):
+1. **Ctor** (`arq_common.cc:352`): `last_data_viable_config = session_floor_anchor(
+   robust_enabled, init_configuration);` — at ctor time this still yields CONFIG_0
+   (robust_enabled=NO, init_configuration=CONFIG_0); a consistent pre-init placeholder,
+   overwritten by site 2.
+2. **`init()`** (`arq_common.cc`, NEW line after the robust/non-robust branch resolves
+   `init_configuration`, `:932`): `last_data_viable_config = session_floor_anchor(
+   robust_enabled, init_configuration);`. **THIS is the ordering fix and the
+   authoritative seat for the connect-then-climb path** — `robust_enabled` (set at
+   `main.cc:2245/2286` BEFORE `init()` at `:2323`) and `init_configuration` (just set
+   at `:923/929`) are BOTH correct here, and CONNECT does not reset, so this is the
+   value the first session climbs from. On a `-R` session it seats ROBUST_0; the
+   `[ANCHOR-DBG]` arbiter will now log ROBUST_0 from t=0.
+3. **`reset_session_state()`** (`arq_common.cc:2994`): routed through the same helper
+   so a DISCONNECT→reconnect re-init also seats the floor (not the live anchor or a
+   stale CONFIG_0).
+
+### §17.3 §5 cross-layer audit (CLAUDE.md §5) — the anchor's full producer/consumer set
+
+Shared state changed: **`last_data_viable_config`** (the anchor) — ONLY its INIT
+value changes. No raise/demote/consumer logic is touched.
+
+**Producers of `last_data_viable_config`** (the complete set):
+- **INIT (the THREE sites this fix edits)**: ctor `:352`, NEW `init()` seat (`:933`),
+  `reset_session_state` `:2994`. BEFORE: all read `init_configuration` (CONFIG_0 at
+  ctor; ROBUST_0-or-CONFIG_0 later). AFTER: all route through `session_floor_anchor`
+  ⇒ ROBUST_0 on `-R`, `init_configuration` otherwise.
+- **RAISE (sole on-delivery)**: §16 `data_anchor_raise_target` (`arq_commander.cc:3634`).
+  UNTOUCHED — still keyed on `clean_batches_config`, still never lowers, still gated
+  by the §11 sustained-N + §16 tier gate.
+- **DEMOTE**: §10 `anchor_demote_target` (`arq_commander.cc:3503`). UNTOUCHED.
+
+**Consumers of `last_data_viable_config`** (UNCHANGED set — the fix only changes the
+VALUE they read at t=0):
+1. **`break_target_with_anchor`** (`arq_commander.cc:147-154`): floors a BREAK
+   recovery target at the anchor, bypassed under the breaks≥2 panic-jump. With
+   anchor=ROBUST_0 the floor IS ROBUST_0 — **CORRECT for deep SNR**: BREAK can reach
+   the floor (pre-fix anchor=CONFIG_0 would have FLOORED RECOVERY AT CONFIG_0, the
+   exact `break_target_with_anchor` poison §16's narrative flagged). The panic bypass
+   still reaches ROBUST_0 regardless.
+2. **The +1 up-clamp** (FRAME-UP `:3667`, LADDER-UP `:4869`/`:5026`, re-trigger via
+   `supershift_retrigger_target`): allows a probe to `anchor+1`. With anchor=ROBUST_0
+   the clamp permits ROBUST_0+1=ROBUST_1 — **CORRECT**: probe exactly one rung above
+   the floor (pre-fix permitted CONFIG_0+1=CONFIG_1, two OFDM rungs above the floor,
+   with no OFDM proof).
+3. **The SUPERSHIFT re-trigger gate `is_ofdm_config(anchor)`** (§15, inside
+   `supershift_retrigger_target`, reached via `elevator_target_from_snr()`
+   `arq_commander.cc:182-184`): `is_ofdm_config(ROBUST_0)=false` ⇒ the
+   `high_confidence_jump` predicate is FALSE ⇒ the +1 clamp re-applies ⇒ NO multi-rung
+   jump — **CORRECT, this is THE fix**: the gate is now CLOSED at t=0 (pre-fix
+   `is_ofdm_config(CONFIG_0)=true` opened it at t=0).
+4. **§16 ROOT-2 turbo-ladder clamp** (`arq_commander.cc:4631`, same helper): at a
+   ROBUST anchor clamps the turbo target to `anchor+1` — **CORRECT**: with the honest
+   ROBUST_0 anchor the turbo cannot ratchet the OFDM tier (pre-fix the CONFIG_0 anchor
+   bounded the turbo to anchor+MAX_LEAP, licensing the CONFIG_4→9 ratchet).
+
+**Valid states (before any RAISE/DEMOTE writes):** the anchor sits at its INIT value.
+BEFORE the fix that default was CONFIG_0 (an OFDM config) on EVERY session — the
+default-init-value-bites class CLAUDE.md §5.3 warns about. AFTER the fix the default
+on a `-R` session is ROBUST_0 (a robust config), matching the live `current_configuration`
+start and the premise §15/§16 already ASSUMED.
+
+**The five required verifications (the cases the fix must NOT break):**
+1. **`-R` deep-SNR (WGN:-10) — THE fix.** anchor inits ROBUST_0 ⇒
+   `is_ofdm_config(anchor)=false` ⇒ §15 gate CLOSED + §16 turbo clamp to anchor+1 ⇒ no
+   jump ⇒ data-fail BREAK re-engages ⇒ `break_target_with_anchor` floors to ROBUST_0 +
+   the breaks≥2 panic reaches ROBUST_0. The over-climb is dead at its root. ✓
+2. **Normal non-`-R` start at CONFIG_0.** `robust_enabled=NO` ⇒
+   `session_floor_anchor` returns `init_configuration=CONFIG_0` — UNCHANGED from
+   pre-fix. A normal OFDM session legitimately starts in the OFDM tier; BREAK floors at
+   CONFIG_0 (correct — there is no robust tier below it in a non-robust session). ✓
+3. **PINNED session at CONFIG_N** (e.g. the calibrator `-s N` / `max_config_override`).
+   `robust_enabled` follows the pin (a non-robust pin ⇒ `session_floor_anchor` returns
+   `init_configuration=CONFIG_N`). The anchor = the pinned config ⇒
+   `break_target_with_anchor` will NOT drop the recovery below the pinned config and
+   the optimizer works at the pin. (Pre-fix the ctor seated CONFIG_0; for a pin >
+   CONFIG_0 the anchor was TOO LOW until a clean batch raised it — the fix seats the
+   pin immediately, strictly an improvement; for a CONFIG_0 pin it is identical.) ✓
+4. **WGN:30 fast climb PRESERVED.** anchor inits ROBUST_0 (`-R`) ⇒ gate closed at
+   start; as real OFDM batches deliver, §16 `data_anchor_raise_target` raises the
+   anchor to CONFIG_0 (the 2nd clean, N_OFDM=2) ⇒ `is_ofdm_config(anchor)=true` ⇒ the
+   §15 elevator gate OPENS ⇒ the multi-rung jump fires (bounded to anchor+MAX_LEAP).
+   The fix adds at most the same confirm-at-CONFIG_0 delay §15/§16 already documented —
+   it does NOT block the climb; it only makes the START honest. ✓
+5. **No new WRITE site / no consumer logic changed.** The three edited sites are the
+   EXISTING init writes (their RHS changes from `init_configuration` to the helper).
+   The RAISE (§16) and DEMOTE (§10) producers and all four consumers are byte-unchanged
+   — only the t=0 value they observe changes. ✓
+
+### §17.4 Producers / consumers — what §17 changes
+
+- **`last_data_viable_config`** (anchor): the THREE INIT producers' RHS changes from
+  `init_configuration` to `session_floor_anchor(robust_enabled, init_configuration)`.
+  No raise/demote/consumer is touched. The `init()` seat is NEW (closes the
+  CONNECT-skips-reset ordering hole); the ctor + reset_session_state seats are
+  re-pointed through the helper.
+- **`session_floor_anchor`** (new PURE helper, `arq.h`): consumed ONLY by the three
+  init sites + Part M (unit test).
+- The `[ANCHOR-DBG]` WRITE/READ instrumentation (1e7bdba) is KEPT verbatim — it is the
+  parent's hardware arbiter (WRITE/READ must now log ROBUST_0 from t=0).
+
+### §17.5 Part M (`--test-climb-engine`) — fail-before / pass-after
+
+Appended after Part L. Drives the REAL `session_floor_anchor()` (the SAME function
+the three init sites call) side-by-side with the VERBATIM pre-§17 init expression
+(`last_data_viable_config = init_configuration`), the §16.5 documented pattern.
+- **M1 (`-R` floor)**: `session_floor_anchor(robust_enabled=true, start=CONFIG_0)` ==
+  ROBUST_0 — the anchor inits to the FLOOR, not the CONFIG_0 default. PASS-after.
+- **M1a (FAIL-BEFORE arm)**: the pre-§17 value (the raw `start_config`=CONFIG_0, what
+  `last_data_viable_config = init_configuration` seated) != ROBUST_0 — the two DIFFER
+  (the fix bites). Asserts the pre-fix expression seated CONFIG_0.
+- **M2 (gate CLOSED at t=0 on `-R`)**: `is_ofdm_config(session_floor_anchor(true,
+  CONFIG_0))` == false — the §15 re-trigger gate is CLOSED at start. **This is the
+  headline regression assertion.**
+- **M2a (FAIL-BEFORE arm)**: `is_ofdm_config(CONFIG_0)` == true — the pre-§17 init
+  OPENED the gate at t=0 (the root cause).
+- **M3 (pinned/normal preserved)**: `session_floor_anchor(false, CONFIG_10)` ==
+  CONFIG_10 and `session_floor_anchor(false, CONFIG_0)` == CONFIG_0 — a non-robust
+  session inits to its start config (unchanged). `is_ofdm_config` true for both
+  (correct — the OFDM-tier start legitimately has the gate open).
+- **M4 (`-R` within-robust floor is the BOTTOM rung)**:
+  `config_ladder_index(session_floor_anchor(true, ROBUST_2))` == 0 — even if a `-R`
+  session's `init_configuration` were a higher robust rung, the anchor seats the ladder
+  FLOOR (ROBUST_0), so BREAK can always reach the bottom. (Models the robust-floor
+  invariant independent of `init_configuration`.)
+
+**FAIL-BEFORE evidence**: (a) the M1a/M2a side-by-side arms assert the pre-§17
+expression's outcome (CONFIG_0 / gate-open) live in the suite; (b) on 1e7bdba the
+helper does not exist (compile error) — the documented method (§16.5) is to
+temporarily restore the pre-fix init (`last_data_viable_config = init_configuration`)
+and observe the [ANCHOR-DBG] WRITE log CONFIG_0 at WGN:-10 (the parent's wire
+arbiter). **PASS-AFTER**: M1–M4 PASS; Parts A–L stay PASS (§17 is additive — it
+changes only the anchor's INIT value, which every prior Part SETS EXPLICITLY before
+asserting, so none observe the init change). `--test` 30/30, both ABIs.
+
+**HONEST scope** (§8 applies): in-process Part M proves `session_floor_anchor` returns
+ROBUST_0 on `-R` (gate `is_ofdm_config` closed at t=0) and the start config otherwise.
+The WIRE proof is the parent's re-test: the `[ANCHOR-DBG] WRITE` line at WGN:-10 must
+now show `last_data_viable_config=100` (ROBUST_0) from the FIRST batch (was 0), the
+CFG_4→9 over-climb GONE, the link HOLDING ROBUST_0; AND WGN:30 keeping the fast ~3k
+climb (anchor inits ROBUST_0, rises to CONFIG_0 on real OFDM delivery, gate then opens
++ the jump fires).
+
+---
+
 ## §9 Related fact documents
 
 - `data-flow-messages_rx_prev.md` — the prev-storage state Bug 1 touches (RSP

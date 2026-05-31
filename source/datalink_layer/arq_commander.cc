@@ -6399,6 +6399,13 @@ int cl_arq_controller::test_clean_batch_viability()
 //       SNR; under MARGINAL / post-failure delivery it stays at the conservative
 //       (possibly AARF-doubled) base so #2's WGN:-10 anti-thrash is preserved.
 //       Read-time only (the member is untouched → never fights the ×2 back-off).
+//   M — ANCHOR INIT POISON (gearshift-climb-engine.md §17): the data-viability
+//       anchor (last_data_viable_config) was init'd to init_configuration = CONFIG_0
+//       (an OFDM config) at ctor time, and CONNECT skips reset_session_state, so on a
+//       -R session the anchor was CONFIG_0 from t=0 → is_ofdm_config(anchor)=true →
+//       the §15 re-trigger gate was OPEN at t=0 → WGN:-10 over-climb. The fix seats it
+//       at the session FLOOR (session_floor_anchor: ROBUST_0 on -R, the start/pinned
+//       config otherwise). Drives the REAL helper vs the pre-fix init expression.
 //
 // IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
 // NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
@@ -8136,6 +8143,74 @@ int cl_arq_controller::test_climb_engine()
 			negotiated_configuration = CONFIG_NONE;
 			forward_configuration = CONFIG_NONE;
 			reverse_configuration = CONFIG_NONE;
+		}
+
+		// ================================================================
+		// Part M — ANCHOR INIT POISON (gearshift-climb-engine.md §17). The
+		// data-viability anchor (last_data_viable_config) was initialized to
+		// init_configuration, which is CONFIG_0 (an OFDM config) at ctor time (before
+		// init() resolves the start mode) AND the CONNECT handler skips
+		// reset_session_state — so on a -R session the anchor sat at CONFIG_0 from t=0
+		// while the live config was ROBUST_0. is_ofdm_config(CONFIG_0)=true then OPENED
+		// the §15 SUPERSHIFT re-trigger gate at t=0 → the WGN:-10 rocket to CONFIG_9.
+		// The fix seats the anchor at the session FLOOR via the PURE session_floor_anchor()
+		// helper (ROBUST_0 on -R, the start/pinned config otherwise). These assertions
+		// drive the REAL helper (the SAME one the three init sites call) side-by-side
+		// with the VERBATIM pre-§17 init expression (last_data_viable_config =
+		// init_configuration), so the FAIL-BEFORE arm asserts the old outcome live.
+		// Pure helper; no wire/PHY.
+		// ================================================================
+		{
+			// M1: on a -R (robust) session the anchor inits to the LADDER FLOOR
+			// (ROBUST_0), NOT the CONFIG_0 init_configuration default.
+			int m_floor = session_floor_anchor(/*robust_enabled=*/true, /*start=*/CONFIG_0);
+			check(m_floor == ROBUST_0,
+				"M1 -R session anchor inits to ROBUST_0 (the floor), not the CONFIG_0 default",
+				m_floor, ROBUST_0);
+			// M1a (FAIL-BEFORE arm): the pre-§17 init seated the raw start_config
+			// (= init_configuration = CONFIG_0). The fixed value DIFFERS from it (the
+			// fix bites). got = pre-fix CONFIG_0; want != that.
+			int m_prefix = CONFIG_0;  // VERBATIM pre-§17: last_data_viable_config = init_configuration
+			check(m_floor != m_prefix,
+				"M1a fixed anchor (ROBUST_0) DIFFERS from the pre-fix init_configuration value (CONFIG_0)",
+				m_floor, m_prefix);
+
+			// M2 (THE headline regression assertion): on a -R session the SUPERSHIFT
+			// re-trigger gate is_ofdm_config(anchor) is CLOSED at t=0 (no multi-rung
+			// jump until an OFDM batch is PROVEN).
+			bool m_gate_after = is_ofdm_config(session_floor_anchor(true, CONFIG_0));
+			check(m_gate_after == false,
+				"M2 -R anchor: is_ofdm_config(anchor)=FALSE at t=0 (§15 re-trigger gate CLOSED)",
+				m_gate_after ? 1 : 0, 0);
+			// M2a (FAIL-BEFORE arm): the pre-§17 init (CONFIG_0) left the gate OPEN at
+			// t=0 — the exact root cause the [ANCHOR-DBG] arbiter captured at WGN:-10.
+			bool m_gate_before = is_ofdm_config(CONFIG_0);  // pre-§17 anchor=init_configuration=CONFIG_0
+			check(m_gate_before == true,
+				"M2a pre-fix anchor CONFIG_0: is_ofdm_config=TRUE (the gate was OPEN at t=0 — root cause)",
+				m_gate_before ? 1 : 0, 1);
+
+			// M3: a NON-robust (pinned/normal) session inits the anchor to its START
+			// config (UNCHANGED from pre-fix) — the fix must not lower a pinned/normal
+			// start. A CONFIG_10 pin seats CONFIG_10; a normal CONFIG_0 start seats
+			// CONFIG_0. is_ofdm_config is true for both (correct — the OFDM-tier start
+			// legitimately has the gate open).
+			int m_pin = session_floor_anchor(/*robust_enabled=*/false, /*start=*/CONFIG_10);
+			check(m_pin == CONFIG_10,
+				"M3 non-robust pinned session: anchor inits to the start config CONFIG_10 (not lowered)",
+				m_pin, CONFIG_10);
+			int m_normal = session_floor_anchor(/*robust_enabled=*/false, /*start=*/CONFIG_0);
+			check(m_normal == CONFIG_0,
+				"M3b non-robust normal session: anchor inits to CONFIG_0 (unchanged)",
+				m_normal, CONFIG_0);
+
+			// M4: even if a -R session's init_configuration were a HIGHER robust rung,
+			// the anchor seats the ladder FLOOR (index 0 = ROBUST_0) — so
+			// break_target_with_anchor can always floor recovery to the bottom rung at
+			// deep SNR. The floor is computed from robust_enabled, NOT init_configuration.
+			int m_floor_idx = config_ladder_index(session_floor_anchor(true, ROBUST_2));
+			check(m_floor_idx == 0,
+				"M4 -R anchor floor is the BOTTOM ladder rung (idx 0 = ROBUST_0), independent of init_configuration",
+				m_floor_idx, 0);
 		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",

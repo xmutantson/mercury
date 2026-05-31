@@ -177,6 +177,31 @@ inline bool config_is_at_bottom(int config, bool robust_enabled) {
 	return config_ladder_index(config) == 0;
 }
 
+// SESSION-START value of the data-viability anchor (last_data_viable_config).
+// gearshift-climb-engine.md §17 — the anchor means "highest config with CONFIRMED
+// data delivery"; at session start NOTHING above the floor is proven, so it must
+// init to the session's actual FLOOR/start config, NOT the stale
+// init_configuration-defaults-to-CONFIG_0 value (which is CONFIG_0 at ctor time —
+// before init() resolves init_configuration — and on a GUI build whose
+// g_settings.initial_config is not robust). Computing the floor from robust_enabled
+// (NOT from init_configuration) closes BOTH poison mechanisms (the ctor-ordering
+// hole AND the GUI-build init_configuration==CONFIG_0 path):
+//   - robust/-R session  -> the ladder FLOOR (ROBUST_0 = FULL_CONFIG_LADDER[0]).
+//     is_ofdm_config(ROBUST_0)=false, so the §15 SUPERSHIFT re-trigger gate is
+//     CLOSED at t=0 (no multi-rung jump until an OFDM batch is PROVEN) and
+//     break_target_with_anchor can floor recovery all the way to ROBUST_0.
+//   - non-robust session -> the operating/start config (init_configuration:
+//     CONFIG_0 for a normal start, or a pinned CONFIG_N). is_ofdm_config(CONFIG_N)
+//     is true — correct: a pinned/normal OFDM session legitimately starts in the
+//     OFDM tier and BREAK must floor there, not below it.
+// PURE; no side effects. Production calls it at the three init sites (ctor,
+// init(), reset_session_state — arq_common.cc); the unit test (Part M) replays it
+// directly.
+inline int session_floor_anchor(bool robust_enabled, int start_config) {
+	if (robust_enabled) return FULL_CONFIG_LADDER[0];  // ROBUST_0 — ladder floor
+	return start_config;
+}
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).
