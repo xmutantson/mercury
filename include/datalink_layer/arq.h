@@ -739,6 +739,25 @@ public:
     return snr_ideal;
   }
 
+  // REAL FAST-PROBE piece (B) — the SHARED elevator-target method
+  // (gearshift-climb-engine.md §14). Computes the SNR-ideal config the controlled
+  // elevator (§13) should target, applying the SAME ceiling cap-chain and the SAME
+  // supershift_retrigger_target() high-confidence-SNR gate the SUPERSHIFT
+  // re-trigger already used (arq_commander.cc:4587-4608), extracted VERBATIM into
+  // ONE place so the two call sites cannot drift (the documented DSP-commit
+  // anti-pattern). Reads members: measurements.SNR_uplink, narrowband_enabled,
+  // supershift_proven_ceiling, last_data_viable_config, robust_enabled, and calls
+  // get_configuration()/optimizer_is_in_control()/supershift_retrigger_target().
+  // NON-const (get_configuration is non-const). The caller GATES this on
+  // `gear_shift_on==YES && is_ofdm_config(current_configuration) &&
+  // measurements.SNR_uplink > -90` (the re-trigger's own enclosing gate); inside,
+  // supershift_retrigger_target keeps the conservative +1 result unless the
+  // high-SNR predicate licenses a multi-rung jump, so at deep/invalid SNR this
+  // returns the +1-clamped value (DEEP-SNR INERT). READS the anchor but never
+  // RAISES it (SAFETY #3). Defined in arq_commander.cc next to both call sites.
+  // See §14.
+  int elevator_target_from_snr();
+
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
   // decodes NO LDPC data, so the canonical SNR_uplink producer
@@ -800,6 +819,56 @@ public:
                                                 int phase,
                                                 int control_code)
   { return (turbo_active || phase != TURBO_DONE) && control_code == SET_CONFIG; }
+
+  // REAL FAST-PROBE piece (A1) — repair the CMD arm asymmetry
+  // (gearshift-climb-engine.md §14). ROOT CAUSE (diagnosed, not re-investigated):
+  // the forward-link SNR is ALREADY on the wire — the RSP suffixes the measured
+  // SNR onto its SET_CONFIG ACKs whenever `(turboshift_active || turboshift_phase
+  // != TURBO_DONE) && data[0]==SET_CONFIG && SNR_uplink > -90`
+  // (arq_responder.cc:1122-1124). But on the unpinned data-anchored +1 ladder the
+  // RSP's `turboshift_phase` stays at its init TURBO_FORWARD (0 SWITCH_ROLE
+  // swaps), so the RSP KEEPS suffixing; meanwhile the CMD's own phase is
+  // TURBO_DONE in steady state, so turbo_snr_ack_expected_on_control() (above)
+  // returns FALSE → turbo_snr_ack_enabled stays false → receive_ack_pattern()
+  // takes the bare-ACK else branch (arq_common.cc:5640) instead of the SNR branch
+  // (:5516) → the producer (arq_common.cc:5555,
+  // measurements.SNR_uplink = snr_uplink_from_suffix(...)) NEVER runs → SNR_uplink
+  // stays at the -99.9 ctor sentinel → the §13 elevator's `SNR_uplink > -90` gate
+  // can never fire. The send/arm predicates are ASYMMETRIC on `turboshift_phase`.
+  //
+  // THE FIX (no wire change — the RSP already sends): widen the CMD arm with an OR
+  // clause so it ALSO arms for the gearshift-ladder SET_CONFIG ACKs the RSP
+  // already suffixes — a ladder promotion in steady state (gear_shift_on==YES,
+  // the SET_CONFIG raises the config index). `config_up` is the caller's
+  // up-decision (config_ladder_index(negotiated) > config_ladder_index(current)),
+  // computed at the SET_CONFIG-TX→wait transition (arq_commander.cc:1085).
+  //
+  // §5 SACK-PRESERVATION CRUX (must NOT leak onto data ACKs): like the existing
+  // helper, the new disjunct REQUIRES `control_code == SET_CONFIG`. A DATA ACK
+  // (which carries the SACK suffix, decoded by the SEPARATE
+  // process_messages_rx_acks_data() path) is NOT a control frame → can NEVER
+  // satisfy either disjunct → its SACK suffix is never routed to the SNR decoder.
+  // This is structurally enforced THREE ways: (1) the `control_code==SET_CONFIG`
+  // gate here; (2) the arm is written only inside the `data[0]==SET_CONFIG`
+  // control-TX block (arq_commander.cc:1050); (3) finish_turbo_direction()
+  // unconditionally CLEARS turbo_snr_ack_enabled (arq_commander.cc:3693) before
+  // any TRANSMITTING_DATA transition, so the flag is provably false on every data
+  // ACK wait. The widening adds NO path that arms on a non-SET_CONFIG code — the
+  // existing Part H tests H2/H2b/H3 (DATA ACK / SWITCH_ROLE / non-turbo-non-up
+  // SET_CONFIG do NOT arm) stay green by construction. PURE (no side effects) so
+  // Part J' (FP-J1) replays the identical expression. See §14.
+  static bool turbo_snr_ack_armed_for_gearshift(bool turbo_active,
+                                                int phase,
+                                                int control_code,
+                                                bool gear_shift_enabled,
+                                                bool config_up)
+  {
+    if(turbo_snr_ack_expected_on_control(turbo_active, phase, control_code))
+      return true;                                   // the existing turbo arm
+    // The gearshift-ladder disjunct: a steady-state +1 (or elevator) promotion.
+    // `control_code == SET_CONFIG` keeps it OFF data ACKs (SACK preserved).
+    return gear_shift_enabled && control_code == SET_CONFIG && config_up;
+  }
 
   // climb-engine Bug 1 (gearshift-climb-engine.md §4) — split SACK dedupe by
   // event class. The CMD MFSK ACK+SACK decode used a SINGLE tracker

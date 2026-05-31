@@ -153,6 +153,38 @@ int cl_arq_controller::break_target_with_anchor(int raw_target) const
 	return raw_target;
 }
 
+// REAL FAST-PROBE piece (B) — the SHARED elevator-target computation
+// (gearshift-climb-engine.md §14). Extracted VERBATIM from the SUPERSHIFT
+// re-trigger (formerly inline at arq_commander.cc:4587-4608) so that site AND the
+// FRAME-UP elevator share ONE copy of the cap-chain + the high-confidence-SNR
+// gate — no comment/code drift. The sequence is byte-equivalent to the pre-extract
+// re-trigger:
+//   1. snr_ideal = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB)
+//   2. NB cap:               if NB && snr_ideal > NB_CONFIG_MAX -> NB_CONFIG_MAX
+//   3. proven-ceiling cap:   if proven>=0 && snr_ideal > proven -> proven
+//   4. the §13 helper supershift_retrigger_target() — keeps the conservative +1
+//      result unless the high-confidence-SNR predicate (SNR>-90 AND the
+//      ceiling-capped snr_ideal lands > anchor+1) licenses a multi-rung jump.
+// The result NEVER exceeds proven-safe (step 2/3), and the helper READS but never
+// RAISES last_data_viable_config (SAFETY #2/#3). The CALLER gates this on
+// gear_shift_on==YES && is_ofdm_config(current_configuration) &&
+// measurements.SNR_uplink > -90, so at the deep-SNR cliff the >-90 gate is unmet
+// and the elevator never fires (DEEP-SNR INERT). Non-const (get_configuration is
+// non-const). See §13/§14.
+int cl_arq_controller::elevator_target_from_snr()
+{
+	int snr_ideal = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+	if(narrowband_enabled == YES && snr_ideal > NB_CONFIG_MAX)
+		snr_ideal = NB_CONFIG_MAX;
+	// Enforce proven ceiling from prior BREAK failures.
+	if(supershift_proven_ceiling >= 0 && snr_ideal > supershift_proven_ceiling)
+		snr_ideal = supershift_proven_ceiling;
+	snr_ideal = supershift_retrigger_target(snr_ideal, measurements.SNR_uplink,
+		last_data_viable_config, optimizer_is_in_control(),
+		robust_enabled, narrowband_enabled == YES);
+	return snr_ideal;
+}
+
 
 void cl_arq_controller::process_messages_commander()
 {
@@ -1082,8 +1114,26 @@ void cl_arq_controller::process_messages_tx_control()
 			// ACK's SACK suffix is NEVER routed to the SNR decoder (§7 collision
 			// audit). Mirrors the re-trigger's own true-write; no clobber (the
 			// re-trigger sets turboshift_active before queueing this SET_CONFIG).
-			turbo_snr_ack_enabled = turbo_snr_ack_expected_on_control(
-				turboshift_active, turboshift_phase, messages_control.data[0]);
+			//
+			// REAL FAST-PROBE (A1, gearshift-climb-engine.md sec 14): the bare
+			// turbo predicate is ASYMMETRIC with the RSP send-gate — the RSP keeps
+			// suffixing the SNR on gearshift-ladder SET_CONFIG ACKs (its phase
+			// stays TURBO_FORWARD) while the CMD's phase is TURBO_DONE in steady
+			// state, so the CMD never armed -> SNR_uplink stuck at -99.9 -> the
+			// sec 13 elevator's `SNR_uplink > -90` gate never fired. Widen the arm
+			// with an OR clause (in the pure helper, unit-testable) so it ALSO
+			// arms for an UPWARD gearshift SET_CONFIG (gear_shift_on==YES,
+			// negotiated index > current index). The `data[0]==SET_CONFIG`
+			// enclosing block + the helper's own `control_code==SET_CONFIG`
+			// conjunct keep this OFF every DATA ACK (the SACK-suffix decode is
+			// never routed to the SNR decoder). CMD-only decode-enable: NO wire
+			// change (the RSP already sends the suffix).
+			bool fastprobe_config_up =
+				config_ladder_index(negotiated_configuration) >
+				config_ladder_index(current_configuration);
+			turbo_snr_ack_enabled = turbo_snr_ack_armed_for_gearshift(
+				turboshift_active, turboshift_phase, messages_control.data[0],
+				gear_shift_on == YES, fastprobe_config_up);
 		}
 
 		if(messages_control.data[0]==REPEAT_LAST_ACK)
@@ -3651,7 +3701,40 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				clean_batches_at_current_config);
 			if(consecutive_data_acks >= eff_frame_shift_threshold)
 			{
-				negotiated_configuration = proposed_frame;
+				// CONTROLLED ELEVATOR from the data-anchored FRAME-UP path
+				// (REAL FAST-PROBE piece B, gearshift-climb-engine.md §14). The
+				// SUPERSHIFT re-trigger (:4587) is the only OTHER elevator site,
+				// but on the unpinned +1 ladder turbo is TURBO_DONE and the
+				// re-trigger's gap>=3 self-suppression often keeps it dormant. So
+				// also fire the elevator HERE, INSIDE the clean-batch-CONFIRMED
+				// branch (promotion_allowed_on_batch already gated this block):
+				// instead of the unconditional +1 (proposed_frame), target the
+				// SNR-ideal config when a high-confidence forward SNR is available.
+				// REUSES ①'s machinery VERBATIM via the shared
+				// elevator_target_from_snr() (same cap-chain + the
+				// supershift_retrigger_target high-SNR gate). Gated on the SAME
+				// preconditions as the re-trigger: gear_shift_on==YES, the live
+				// config is OFDM, and SNR_uplink is populated (> -90). At deep SNR
+				// (the WGN:-10 cliff) the >-90 gate is unmet OR the helper keeps
+				// the conservative +1 -> BYTE-IDENTICAL to the current +1 ladder
+				// (SAFETY #1). The elevator only RAISES the target above
+				// proposed_frame; it never lowers below the +1 (it is an
+				// elevator-OR-+1 max). The anchor is NOT raised here (the §1.1
+				// confirmed-delivery producer is the sole anchor-raise; SAFETY #3),
+				// and this path does NOT enter turbo (no SUPERSHIFT storm; SAFETY
+				// #5). The rest of the FRAME-UP block (FIFO restore, the
+				// add_message_control(SET_CONFIG), the state transition) is
+				// UNCHANGED — the elevator just sets a higher negotiated_configuration
+				// before the SAME SET_CONFIG goes out. See §13/§14.
+				negotiated_configuration = proposed_frame;     // the +1 default
+				if(gear_shift_on==YES && is_ofdm_config(current_configuration) &&
+				   measurements.SNR_uplink > -90)
+				{
+					int snr_ideal = elevator_target_from_snr();
+					if(config_ladder_index(snr_ideal) >
+					   config_ladder_index(proposed_frame))
+						negotiated_configuration = snr_ideal;  // multi-rung jump
+				}
 				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs (eff_thresh %d, base %d, clean-streak %d), config %d -> %d\n",
 					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
 					clean_batches_at_current_config, current_configuration, negotiated_configuration);
@@ -4584,28 +4667,19 @@ void cl_arq_controller::process_control_commander()
 					if(turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
 						is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
-						int snr_ideal = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
-						if(narrowband_enabled == YES && snr_ideal > NB_CONFIG_MAX)
-							snr_ideal = NB_CONFIG_MAX;
-						// Enforce proven ceiling from prior BREAK failures
-						if(supershift_proven_ceiling >= 0 && snr_ideal > supershift_proven_ceiling)
-							snr_ideal = supershift_proven_ceiling;
-						// CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13): the
-						// SNR-driven re-trigger MAY jump multiple rungs toward the SNR-ideal config
-						// in ONE shot -- but ONLY here, and ONLY under the high-confidence-SNR
-						// predicate inside the PURE supershift_retrigger_target() helper (arq.h).
-						// Pre-(1) (af14a9e) this path was HARD-CLAMPED to last_data_viable_config+1,
-						// which (with SUPERSHIFT_RETRIGGER_CONFIGS=3) made the re-trigger a no-op and
-						// left the unpinned climb wall-clock-bound to the +1 FRAME-UP ladder. The
-						// helper keeps the +1 clamp at LOW/INVALID SNR (DEEP-SNR INERT, byte-identical
-						// to the pre-(1) path) and relaxes it only at clearly-high SNR. snr_ideal is
-						// ALREADY capped at min(supershift_proven_ceiling, WB/NB ceiling) above, so the
-						// jump can never exceed proven-safe; the helper READS but never RAISES the
-						// anchor (it follows confirmed delivery only, sec 1.1 + sec 11). FRAME-UP /
-						// LADDER-UP keep their own strict +1 clamps (UNTOUCHED). See arq.h + sec 6/7/13.
-						snr_ideal = supershift_retrigger_target(snr_ideal, measurements.SNR_uplink,
-							last_data_viable_config, optimizer_is_in_control(),
-							robust_enabled, narrowband_enabled == YES);
+						// CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13/14):
+						// the SNR-driven re-trigger MAY jump multiple rungs toward the SNR-ideal
+						// config in ONE shot -- but ONLY under the high-confidence-SNR predicate
+						// inside supershift_retrigger_target(). The cap-chain
+						// (get_configuration -> NB cap -> supershift_proven_ceiling cap -> the
+						// helper) is now extracted VERBATIM into the SHARED
+						// elevator_target_from_snr() method so this site and the FRAME-UP elevator
+						// (piece B) cannot drift. Pre-(1) (af14a9e) this path was HARD-CLAMPED to
+						// last_data_viable_config+1, making the re-trigger a no-op; the helper keeps
+						// the +1 clamp at LOW/INVALID SNR (DEEP-SNR INERT) and relaxes it only at
+						// clearly-high SNR, capped at min(supershift_proven_ceiling, WB/NB ceiling),
+						// READING but never RAISING the anchor. See arq.h + sec 6/7/13/14.
+						int snr_ideal = elevator_target_from_snr();
 						int gap = config_ladder_index(snr_ideal) - config_ladder_index(current_configuration);
 						if(gap >= SUPERSHIFT_RETRIGGER_CONFIGS)
 						{
@@ -7390,7 +7464,199 @@ int cl_arq_controller::test_climb_engine()
 				"J7c FRAME-UP/LADDER-UP +1 clamp still BLOCKS >anchor+1 (af14a9e clamp intact off-path)",
 				blocked2 ? 1 : 0, 1);
 		}
-		
+
+		// ================================================================
+		// Part J' — REAL FAST-PROBE (gearshift-climb-engine.md §14): (A1) the CMD
+		// arm-asymmetry repair + (B) the FRAME-UP-anchored controlled elevator.
+		// ROOT CAUSE (diagnosed): the RSP already suffixes the forward SNR on
+		// gearshift SET_CONFIG ACKs, but the CMD's arm predicate is asymmetric
+		// (turbo_snr_ack_expected_on_control returns FALSE in TURBO_DONE steady
+		// state) so the producer never runs → SNR_uplink stuck at -99.9 → the §13
+		// elevator never fires. (A1) widens the CMD arm with a gearshift-ladder-up
+		// disjunct (turbo_snr_ack_armed_for_gearshift); (B) fires the §13 elevator
+		// from the data-anchored FRAME-UP path via the SHARED
+		// elevator_target_from_snr(). Both replay the REAL shipped helpers; the
+		// `armed`/elevator arms model PASS-AFTER, the narrow-helper / unconditional-+1
+		// arms model FAIL-BEFORE.
+		// ================================================================
+		robust_enabled = NO;            // OFDM tier
+		narrowband_enabled = NO;
+		max_config_override = -1;
+		gear_shift_on = YES;
+		optimizer_disabled = true;      // optimizer_is_in_control()==false (un-clamp path)
+		supershift_proven_ceiling = -1;
+
+		// FP-J1 — (A1) the widened CMD arm. The RSP keeps suffixing the SNR on a
+		// gearshift-ladder SET_CONFIG ACK (its phase stays TURBO_FORWARD); the CMD
+		// must ARM its decoder for that wait even though the CMD's own
+		// turboshift_phase is TURBO_DONE and turbo is inactive in steady state.
+		// PASS-AFTER (turbo_snr_ack_armed_for_gearshift) → TRUE; FAIL-BEFORE (the
+		// narrow turbo_snr_ack_expected_on_control) → FALSE on this ladder case.
+		// §5 SACK-PRESERVATION: the SAME widened arm must stay FALSE for a DATA ACK
+		// and for a non-gearshift / non-up SET_CONFIG (H2/H2b/H3 invariants).
+		{
+			// The steady-state gearshift SET_CONFIG-ACK wait: turbo INACTIVE,
+			// phase TURBO_DONE, gear_shift_on==YES, the SET_CONFIG raises the
+			// config (config_up). FAIL-BEFORE: the narrow helper.
+			bool narrow_on_ladder = turbo_snr_ack_expected_on_control(
+				/*turbo_active=*/false, /*phase=*/TURBO_DONE, /*control_code=*/SET_CONFIG);
+			check(narrow_on_ladder == false,
+				"FP-J1a FAIL-BEFORE proof: narrow turbo arm is FALSE on a TURBO_DONE gearshift SET_CONFIG (the bug)",
+				narrow_on_ladder ? 1 : 0, 0);
+			// PASS-AFTER: the widened helper arms on the gearshift-ladder disjunct.
+			bool armed_on_ladder = turbo_snr_ack_armed_for_gearshift(
+				/*turbo_active=*/false, /*phase=*/TURBO_DONE, /*control_code=*/SET_CONFIG,
+				/*gear_shift_enabled=*/true, /*config_up=*/true);
+			check(armed_on_ladder == true,
+				"FP-J1b PASS-AFTER: widened arm TRUE on a TURBO_DONE upward gearshift SET_CONFIG (asymmetry repaired)",
+				armed_on_ladder ? 1 : 0, 1);
+			// §5 CRUX: a DATA ACK (non-SET_CONFIG control_code) must NEVER arm the
+			// widened helper either — the SACK suffix decode is never routed to the
+			// SNR decoder. (Mirrors H2: ACK_RANGE is a data-ACK frame type.)
+			bool armed_on_data_ack = turbo_snr_ack_armed_for_gearshift(
+				/*turbo_active=*/false, /*phase=*/TURBO_DONE, /*control_code=*/ACK_RANGE,
+				/*gear_shift_enabled=*/true, /*config_up=*/true);
+			check(armed_on_data_ack == false,
+				"FP-J1c §5 SACK preserved: widened arm FALSE for a DATA ACK (ACK_RANGE) even with gearshift up (no leak)",
+				armed_on_data_ack ? 1 : 0, 0);
+			// And a SET_CONFIG that is NOT moving up (config_up=false) does NOT arm
+			// via the gearshift disjunct (only UPWARD ladder SET_CONFIGs are
+			// suffixed; a same/down SET_CONFIG is not the climb). Mirrors H3.
+			bool armed_on_nonup = turbo_snr_ack_armed_for_gearshift(
+				/*turbo_active=*/false, /*phase=*/TURBO_DONE, /*control_code=*/SET_CONFIG,
+				/*gear_shift_enabled=*/true, /*config_up=*/false);
+			check(armed_on_nonup == false,
+				"FP-J1d widened arm FALSE for a non-upward SET_CONFIG (scoped to the climb; matches RSP)",
+				armed_on_nonup ? 1 : 0, 0);
+			// And with gear_shift_on==NO (gearshift disabled) the disjunct is dead —
+			// only the turbo arm could fire, which here is FALSE.
+			bool armed_gearshift_off = turbo_snr_ack_armed_for_gearshift(
+				/*turbo_active=*/false, /*phase=*/TURBO_DONE, /*control_code=*/SET_CONFIG,
+				/*gear_shift_enabled=*/false, /*config_up=*/true);
+			check(armed_gearshift_off == false,
+				"FP-J1e widened arm FALSE when gear_shift_on==NO (disjunct dead; turbo arm still governs)",
+				armed_gearshift_off ? 1 : 0, 0);
+			// SUPERSET PROOF: the widening NEVER removes a true the narrow helper
+			// produced — when turbo IS active the widened arm is still TRUE (H1/H4
+			// region preserved). So H1/H2/H2b/H3/H4 all hold under the widened arm.
+			bool widened_turbo_active = turbo_snr_ack_armed_for_gearshift(
+				/*turbo_active=*/true, /*phase=*/TURBO_FORWARD, /*control_code=*/SET_CONFIG,
+				/*gear_shift_enabled=*/false, /*config_up=*/false);
+			check(widened_turbo_active == true,
+				"FP-J1f widened arm is a SUPERSET of the turbo arm (turbo-active SET_CONFIG still arms)",
+				widened_turbo_active ? 1 : 0, 1);
+		}
+
+		// A faithful replay of the REAL FRAME-UP elevator-or-+1 decision
+		// (arq_commander.cc:3729-3737): set the members elevator_target_from_snr()
+		// reads, then run the SAME decision body. `adaptive=true` is PASS-AFTER (the
+		// shipped elevator); `adaptive=false` is FAIL-BEFORE (the pre-fix
+		// unconditional +1). Returns the resulting negotiated_configuration.
+		auto frameup_target = [&](double snr_uplink, int cur, int anchor,
+			                        int proposed_frame, int proven, bool adaptive) -> int {
+			// Members read by the REAL elevator decision + elevator_target_from_snr().
+			current_configuration    = cur;
+			last_data_viable_config  = anchor;
+			supershift_proven_ceiling = proven;
+			measurements.SNR_uplink  = snr_uplink;
+			int negotiated = proposed_frame;                 // the +1 default (:3729)
+			if(adaptive) {
+				// the REAL :3730-3737 gate + shared method + elevator-or-+1 max.
+				if(gear_shift_on==YES && is_ofdm_config(current_configuration) &&
+				   measurements.SNR_uplink > -90)
+				{
+					int snr_ideal = elevator_target_from_snr();  // the REAL shared method
+					if(config_ladder_index(snr_ideal) >
+					   config_ladder_index(proposed_frame))
+						negotiated = snr_ideal;                  // multi-rung jump
+				}
+			}
+			return negotiated;
+		};
+
+		// FP-J2 — (B) THE multi-rung-jump assertion from the FRAME-UP path.
+		// current=CONFIG_0, anchor=CONFIG_0, proposed_frame=CONFIG_1 (the +1),
+		// SNR_uplink = snr_uplink_from_suffix(14.6) (the real relayed value from the
+		// §5 example), no proven-ceiling cap. get_configuration(14.6-6.0) lands
+		// MANY rungs above CONFIG_1. PASS-AFTER: the FRAME-UP target == the SNR-ideal
+		// (multi-rung). FAIL-BEFORE (unconditional +1): CONFIG_1.
+		{
+			double snr = snr_uplink_from_suffix(14.6f);   // the REAL producer value
+			// expected from the SAME value the shared method uses (avoid float/double
+			// bucket drift): get_configuration(snr - SUPERSHIFT_MARGIN_DB).
+			int expected_ideal = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+			int t_after  = frameup_target(snr, CONFIG_0, CONFIG_0, CONFIG_1, -1, /*adaptive=*/true);
+			int t_before = frameup_target(snr, CONFIG_0, CONFIG_0, CONFIG_1, -1, /*adaptive=*/false);
+			// sanity: the SNR-ideal really is multi-rung above the +1 (CONFIG_1).
+			check(config_ladder_index(expected_ideal) > config_ladder_index(CONFIG_1),
+				"FP-J2a SNR=14.6 -> snr_ideal is MULTI-rung above the +1 proposed CONFIG_1",
+				config_ladder_index(expected_ideal), config_ladder_index(CONFIG_1));
+			check(t_after == expected_ideal &&
+			      config_ladder_index(t_after) > config_ladder_index(CONFIG_1),
+				"FP-J2b PASS-AFTER: FRAME-UP elevator jumps to get_configuration(14.6-6.0) (multi-rung, not +1)",
+				config_ladder_index(t_after), config_ladder_index(expected_ideal));
+			check(t_before == CONFIG_1,
+				"FP-J2c FAIL-BEFORE proof: the pre-fix unconditional +1 yields CONFIG_1 (no jump)",
+				t_before, CONFIG_1);
+			check(t_after != t_before,
+				"FP-J2d the FRAME-UP elevator DIFFERS from the +1 ladder (the fix bites)",
+				(t_after != t_before) ? 1 : 0, 1);
+		}
+
+		// FP-J3 — (B) DEEP-SNR INERT (the WGN:-10 anti-thrash, in-process). Two
+		// independent guarantees:
+		//  (a) At the -99.9 ctor sentinel the SNR>-90 gate is unmet → the elevator
+		//      never fires → target == proposed_frame (+1), regardless of adaptive.
+		//  (b) At a marginal-but-valid SNR where get_configuration(SNR-6.0) lands at
+		//      or below the +1 proposed config, the elevator-or-+1 max keeps the +1
+		//      (no spurious jump). For SNR=2.0, get_configuration(2.0-6.0=-4.0) ->
+		//      CONFIG_5 (telecom_system.cc:5562, -4.0 is NOT > -4 → falls to >-5).
+		//      So model the climb at current=CONFIG_4 (proposed +1 = CONFIG_5):
+		//      snr_ideal == proposed_frame == CONFIG_5 → idx not strictly greater →
+		//      no jump → target stays CONFIG_5 (the +1). Byte-identical to the +1
+		//      ladder — exactly the cliff behavior #2's anti-thrash relies on.
+		{
+			// (a) sentinel: SNR<=-90 → gate unmet → +1 (current=CONFIG_0 → +1=CONFIG_1).
+			int t_sentinel = frameup_target(-99.9, CONFIG_0, CONFIG_0, CONFIG_1, -1, /*adaptive=*/true);
+			check(t_sentinel == CONFIG_1,
+				"FP-J3a DEEP-SNR INERT (sentinel -99.9): elevator gate unmet -> +1 ladder (CONFIG_1)",
+				t_sentinel, CONFIG_1);
+			// (b) marginal valid SNR=2.0 -> snr_ideal == the +1 proposed (CONFIG_5) ->
+			// no jump. Confirm the premise, then the result.
+			int ideal_marginal = get_configuration(2.0 - SUPERSHIFT_MARGIN_DB);
+			check(config_ladder_index(ideal_marginal) <= config_ladder_index(CONFIG_5),
+				"FP-J3b premise: marginal SNR=2.0 -> snr_ideal (CONFIG_5) is at/below the +1 proposed (CONFIG_5)",
+				config_ladder_index(ideal_marginal), config_ladder_index(CONFIG_5));
+			int t_marginal = frameup_target(2.0, CONFIG_4, CONFIG_4, CONFIG_5, -1, /*adaptive=*/true);
+			check(t_marginal == CONFIG_5,
+				"FP-J3c marginal SNR=2.0: elevator-or-+1 keeps the +1 (CONFIG_5), no spurious jump above proposed",
+				t_marginal, CONFIG_5);
+		}
+
+		// FP-J4 — (B) the ceiling cap binds (SAFETY #2). High SNR (14.6 -> a high
+		// config) but a prior BREAK proved CONFIG_2 the ceiling. The FRAME-UP
+		// elevator target must be CAPPED at CONFIG_2 (never above proven-safe) — and
+		// since CONFIG_2 (a robust rung, idx 2) is BELOW the +1 (CONFIG_1, idx 4)…
+		// wait: CONFIG_2 the OFDM config has ladder index 5 (FULL_CONFIG_LADDER), so
+		// it IS above CONFIG_1 (idx 4) — a capped-but-still-multi-rung jump (idx 5 >
+		// idx 4). Assert the target lands exactly at the proven ceiling.
+		{
+			double snr = snr_uplink_from_suffix(14.6f);
+			int t = frameup_target(snr, CONFIG_0, CONFIG_0, CONFIG_1, /*proven=*/CONFIG_2, /*adaptive=*/true);
+			check(t == CONFIG_2,
+				"FP-J4a FRAME-UP elevator CAPPED at supershift_proven_ceiling (CONFIG_2, not the higher SNR-ideal)",
+				t, CONFIG_2);
+			check(config_ladder_index(t) <= config_ladder_index(CONFIG_2),
+				"FP-J4b the FRAME-UP elevator target never exceeds the proven ceiling",
+				config_ladder_index(t), config_ladder_index(CONFIG_2));
+			// And the anchor (last_data_viable_config) was READ but not RAISED by the
+			// FRAME-UP elevator decision (SAFETY #3) — frameup_target set it to the
+			// CONFIG_0 anchor arg and the decision must leave it there.
+			check(last_data_viable_config == CONFIG_0,
+				"FP-J4c the FRAME-UP elevator does NOT raise the anchor (still CONFIG_0; follows delivery)",
+				last_data_viable_config, CONFIG_0);
+		}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);

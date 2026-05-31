@@ -27,6 +27,16 @@ WB/NB ceiling), instead of crawling +1/rung. PURE helper
 clamps; the jump never raises the anchor; provably INERT at deep/invalid SNR.
 In-process verified (Part J, fail-before/pass-after); the over-climb safety
 (@WGN:-10) + the fast-jump (@WGN:30) are the parent's HARDWARE verification.
+**§14 (2026-05-31, NEW worktree `fix/fast-probe` off 540779c)**: the REAL
+FAST-PROBE — (A1) repairs the CMD arm asymmetry that left `SNR_uplink` stuck at
+−99.9 on the unpinned ladder (the RSP already suffixes the SNR; the CMD's
+TURBO_DONE arm-gate diverged from the RSP's TURBO_FORWARD send-gate), and (B)
+fires the §13 elevator from the data-anchored FRAME-UP path (which runs every
+clean batch, unlike the dormant SUPERSHIFT re-trigger) via a SHARED
+`elevator_target_from_snr()` extracted from §13's cap-chain. No wire change (A1);
+no anchor raise / no turbo storm (B). In-process verified (Part J',
+fail-before/pass-after); the wire proofs (SNR_uplink leaving −99.9; @WGN:-10
+no-thrash; @WGN:30 multi-rung jump) are the parent's HARDWARE verification.
 
 This doc owns the producer/consumer/invariant facts for the CLIMB promotion
 state shared CMD↔RSP: `last_data_viable_config`, `consecutive_data_acks`,
@@ -1039,6 +1049,302 @@ structurally untouched. The over-climb SAFETY (WGN:-10 no-thrash) and the
 fast-jump SPEEDUP (WGN:30 multi-rung in one shot) are the parent's HARDWARE
 verification — the integration-path timing of a multi-rung SET_CONFIG landing
 (post-jump rx-mute, the new config's first-batch ACK) is not exercised in-process.
+
+---
+
+## §14 REAL FAST-PROBE — (A1) CMD arm-asymmetry repair + (B) FRAME-UP-anchored elevator
+
+**Status**: SHIPPED 2026-05-31 on `fix/fast-probe` (NEW worktree branched off
+`fix/climb-engine` @ 540779c, the §13 fork-① HEAD). This is the "real fast-probe":
+the §13 elevator only fires from the SUPERSHIFT re-trigger, which on the unpinned
+`-Q 0 -M auto -g -R` ladder is dormant because (i) the CMD never decodes the
+forward SNR so the re-trigger's `SNR_uplink > -90` gate never fires (the §14 (A1)
+deadlock), and (ii) even with SNR populated the re-trigger's `gap >=
+SUPERSHIFT_RETRIGGER_CONFIGS` self-suppression + the TURBO_DONE phase keep it
+quiet on the steady-state +1 ladder. §14 supplies the missing INPUT (A1: arm the
+CMD's SNR decode on gearshift SET_CONFIG ACKs) and the missing TRIGGER (B: fire
+the §13 elevator from the data-anchored FRAME-UP path, which runs every clean
+batch). In-process verified (Part J', fail-before/pass-after); the wire proofs
+(WGN:-10 no-thrash; WGN:30 multi-rung jump; SNR_uplink leaving −99.9) are the
+parent's HARDWARE verification.
+
+### §14.1 (A1) The CMD arm asymmetry — ROOT CAUSE (diagnosed, not re-investigated)
+
+The forward-link SNR is ALREADY on the wire. The RSP suffixes its measured SNR
+onto SET_CONFIG ACKs whenever its SEND gate (`arq_responder.cc:1122-1124`) holds:
+```
+(turboshift_active || turboshift_phase != TURBO_DONE)
+  && data[0] == SET_CONFIG && SNR_uplink > -90
+```
+On the unpinned data-anchored ladder the RSP's `turboshift_phase` stays at its
+init `TURBO_FORWARD` (0 SWITCH_ROLE swaps occur), so the RSP KEEPS suffixing the
+SNR on every gearshift SET_CONFIG ACK (14× in the logs, incl. a real 14.6 dB at
+OFDM CONFIG_0/1/2/3).
+
+The CMD never decodes it. The CMD's arm at `arq_commander.cc:1085` was
+`turbo_snr_ack_enabled = turbo_snr_ack_expected_on_control(turboshift_active,
+turboshift_phase, data[0])` (`arq.h:799-802`):
+```
+(turbo_active || phase != TURBO_DONE) && control_code == SET_CONFIG
+```
+The CMD's own `turboshift_phase` is `TURBO_DONE` in steady state and
+`turboshift_active` is false, so BOTH disjuncts fail → the predicate returns
+FALSE → `turbo_snr_ack_enabled` stays false → `receive_ack_pattern()` takes the
+bare-ACK else branch (`arq_common.cc:5640`) instead of the SNR branch (`:5516`) →
+the producer `arq_common.cc:5555` (`measurements.SNR_uplink =
+snr_uplink_from_suffix(...)`) NEVER runs → `SNR_uplink` stays at the −99.9 ctor
+sentinel. The send-gate and arm-gate DIVERGE on `turboshift_phase`. AND the §13
+re-trigger (`arq_commander.cc:4584-4585`) is gated on `SNR_uplink > -90` (plus
+TURBO_DONE, is_ofdm, gear_shift_on) — only the SNR term is unmet, so §13's helper
+is never reached.
+
+**The fix (no wire change — the RSP already sends):** widen the CMD arm with an
+OR clause for the gearshift-ladder SET_CONFIG ACKs the RSP already suffixes. New
+PURE helper `turbo_snr_ack_armed_for_gearshift(turbo_active, phase, control_code,
+gear_shift_enabled, config_up)` (`arq.h:860`, immediately after the existing
+helper):
+```cpp
+if(turbo_snr_ack_expected_on_control(turbo_active, phase, control_code))
+  return true;                                   // the existing turbo arm
+return gear_shift_enabled && control_code == SET_CONFIG && config_up;
+```
+The call site `arq_commander.cc:1085` (inside the `if(data[0]==SET_CONFIG)` block)
+computes `config_up = config_ladder_index(negotiated_configuration) >
+config_ladder_index(current_configuration)` and passes `gear_shift_on == YES`.
+
+### §14.2 (B) The FRAME-UP-anchored controlled elevator
+
+The §13 elevator (`supershift_retrigger_target` + the cap-chain) was extracted
+VERBATIM into ONE shared non-const member `elevator_target_from_snr()`
+(`arq_commander.cc:156-187`, declared `arq.h:759`), called by BOTH the SUPERSHIFT
+re-trigger (`arq_commander.cc:4587`, formerly the inline cap-chain) AND the new
+FRAME-UP site — eliminating the comment/code drift the DSP-commit anti-pattern
+warns about. The body is byte-equivalent to the pre-extract re-trigger:
+`get_configuration(SNR − SUPERSHIFT_MARGIN_DB)` → NB cap → `supershift_proven_ceiling`
+cap → `supershift_retrigger_target(...)`.
+
+At the FRAME-UP clean-batch-CONFIRMED branch (`arq_commander.cc:3702-3737`, inside
+`data_ack_received==YES && promotion_allowed_on_batch(last_batch_fully_acked) &&
+… && !frame_ceiling_blocked && !optimizer_owns_upward_frame`), the unconditional
+`negotiated_configuration = proposed_frame;` (the +1) is replaced by an
+ELEVATOR-OR-+1 decision:
+```cpp
+negotiated_configuration = proposed_frame;            // the +1 default
+if(gear_shift_on==YES && is_ofdm_config(current_configuration) &&
+   measurements.SNR_uplink > -90)
+{
+  int snr_ideal = elevator_target_from_snr();
+  if(config_ladder_index(snr_ideal) > config_ladder_index(proposed_frame))
+    negotiated_configuration = snr_ideal;             // multi-rung jump
+}
+```
+The rest of the FRAME-UP block (FIFO restore, `add_message_control(SET_CONFIG)`,
+the `TRANSMITTING_CONTROL` transition) is UNCHANGED — the elevator just sets a
+higher `negotiated_configuration` before the SAME SET_CONFIG goes out.
+
+### §14.3 §5 cross-layer audit (CLAUDE.md §5) — the shared state §14 touches
+
+§14 touches three shared-state structures: `turbo_snr_ack_enabled` (the arm,
+widened by A1), `measurements.SNR_uplink` (now populated per-rung as a consequence
+of A1), and `last_data_viable_config` + the SACK suffix (the elevator reads/leaves
+untouched). Enumerated per the five mandated questions:
+
+#### §14.3.1 `turbo_snr_ack_enabled` (A1 widens the arm) — the NO-DATA-ACK-LEAK proof
+
+- **Producers**: (1) the SET_CONFIG control-TX→wait arm `arq_commander.cc:1085`
+  (NOW via `turbo_snr_ack_armed_for_gearshift`, widened); (2) the §13 re-trigger
+  true-write `arq_commander.cc:4618`; (3) the turbo-finish false-writes
+  `arq_commander.cc:2254` (NAck teardown) and `finish_turbo_direction()`
+  `arq_commander.cc:3693` (unconditional clear before any TRANSMITTING_DATA); (4)
+  ctor + reset_session_state init false.
+- **Consumer (the ONLY one)**: `receive_ack_pattern()` (`arq_common.cc:5516`) — the
+  `if(turbo_snr_ack_enabled)` branch routes the ACK suffix to the SNR decoder
+  (`detect_ack_snr_from_passband` → the `:5555` producer); the else branch
+  (`:5640`) treats it as a bare/SACK ACK.
+- **Valid states**: false (steady state on a bare-ACK / data-ACK wait — the
+  default, and the post-`finish_turbo_direction` state before data flows) ; true
+  (a SET_CONFIG control-ACK wait during turbo OR — NEW — during an upward
+  gearshift). Default-init: false (ctor/reset) — so before any producer writes, a
+  spurious early ACK decode is impossible.
+- **Invariant the consumer assumes**: the flag is true ONLY while awaiting a
+  SET_CONFIG **control** ACK (never a DATA ACK), so the SNR decoder is never fed a
+  SACK-suffixed data ACK. **§5 CRUX — preserved THREE structurally-independent
+  ways:**
+  1. **`control_code == SET_CONFIG` in BOTH disjuncts.** A DATA ACK is decoded by
+     the SEPARATE function `process_messages_rx_acks_data()`; control ACKs are
+     awaited in `process_messages_rx_acks_control()`. A data ACK's frame type
+     (ACK_RANGE / ACK_MULTI / the SACK-v2 suffix) is NOT `SET_CONFIG`, so neither
+     disjunct of `turbo_snr_ack_armed_for_gearshift` can be true for it. The
+     widening adds `gear_shift_enabled && control_code == SET_CONFIG && config_up`
+     — the `control_code == SET_CONFIG` conjunct is INSIDE the new disjunct, so the
+     widening introduces NO non-SET_CONFIG arming path.
+  2. **The arm is WRITTEN only inside the `if(messages_control.data[0]==SET_CONFIG)`
+     block** (`arq_commander.cc:1050`) — a control-TX path. It is never written on
+     a data-TX path.
+  3. **`finish_turbo_direction()` (`:3693`) unconditionally clears it to false**
+     before any `TRANSMITTING_DATA` transition, so even a stale true from a prior
+     control wait cannot survive into a data-ACK wait.
+  **Walk of the widening on a data ACK**: `turbo_snr_ack_armed_for_gearshift(*, *,
+  ACK_RANGE, gear_shift_enabled=true, config_up=true)` → the inner
+  `turbo_snr_ack_expected_on_control(*, *, ACK_RANGE)` is false (control_code !=
+  SET_CONFIG) AND the new disjunct `… && control_code==SET_CONFIG && …` is false
+  (control_code != SET_CONFIG) → returns false. **No leak.** (Part J' FP-J1c asserts
+  this with the REAL helper; H2/H2b stay green — H2 drives the SAME ACK_RANGE
+  through the *narrow* helper, which §14 does not modify.)
+- **What my fix changes**: the arm is now ALSO true on an upward gearshift
+  SET_CONFIG control wait (gear_shift_on==YES, config index rising). The SOLE
+  consumer then routes THAT control ACK's suffix to the SNR decoder — which is
+  exactly the RSP-suffixed SNR the producer needs. No data-ACK consumer is
+  affected (the flag remains false on every data-ACK wait, by the three guards).
+  H2/H2b/H3 (the narrow-helper assertions) are untouched because they exercise the
+  narrow helper, which is byte-identical; FP-J1 adds the widened-helper assertions
+  (TRUE on the ladder, FALSE on a data ACK / non-up / gearshift-off).
+
+#### §14.3.2 `measurements.SNR_uplink` (now populated per-rung by the A1 unblock)
+
+- **Producers**: the canonical all-roles producer `arq_common.cc:6051` (LDPC decode
+  path — does NOT run on the CMD's MFSK-suffix climb); the §G/OptA suffix-decode
+  producer `arq_common.cc:5555` (`snr_uplink_from_suffix`) — which, PRE-§14, was
+  dead on the steady-state ladder because the arm was never set (the §14.1
+  deadlock). §14 (A1) revives this producer on every upward gearshift SET_CONFIG
+  ACK. NO new producer is added by §14 — it only ENABLES the existing `:5555` one.
+- **Consumers**: the §13 re-trigger (`arq_commander.cc:4585` gate + `:4587`
+  cap-chain via `elevator_target_from_snr`), and NOW the §14 (B) FRAME-UP elevator
+  (`arq_commander.cc:3731` gate + `:3733` `elevator_target_from_snr`), plus
+  diagnostics (`get_snr_uplink()`).
+- **Valid states**: −99.9 (ctor sentinel, "no producer has run") through any
+  decoded SNR. Default-init −99.9 — and BOTH elevator consumers gate on
+  `SNR_uplink > -90`, so at the sentinel NEITHER fires (DEEP-SNR INERT). This is
+  why §14 is byte-identical to the +1 ladder until the producer lifts SNR_uplink
+  off the sentinel.
+- **Invariant the consumers assume**: a value > −90 is a genuine, recent decode of
+  the forward link. Maintained: the only producer that can write it on this path
+  (`:5555`) runs ONLY inside the `turbo_snr_ack_enabled` branch, which A1 arms ONLY
+  on a SET_CONFIG control-ACK wait — i.e. the value reflects the RSP's measurement
+  of the CMD's signal at the rung just ACKed. (Staleness across rungs is a known
+  [?] for the wire — see §8 — but it cannot be a SACK/data-ACK value, by §14.3.1.)
+- **What my fix changes**: SNR_uplink transitions from "permanently −99.9 on the
+  unpinned ladder" to "populated per upward-rung". This is the precondition §13
+  was built for (§13.1: "OptA … now populates measurements.SNR_uplink during the
+  climb … the precondition that makes this relaxation safe"). Both elevator
+  consumers already existed; §14 (A1) just stops starving them, and §14 (B) adds
+  the FRAME-UP consumer that fires far more often than the dormant re-trigger.
+
+#### §14.3.3 `last_data_viable_config` (the anchor) — elevator READS, never RAISES
+
+- **Producers** (UNCHANGED by §14): the §1.1 anchor-RAISE (`arq_commander.cc:3437`,
+  gated by `promotion_allowed_on_batch` + the §11 sustained-N — a CONFIRMED clean
+  batch at the landing config), the §10 DEMOTE (`anchor_demote_target` at the BREAK
+  trigger), ctor + reset_session_state init. **§14 adds NO anchor producer.**
+- **Consumers** (UNCHANGED set): the four +1-clamp sites (FRAME-UP `:3617`,
+  LADDER-UP twin `:4869`, `policy_evaluate_axis1` `:5026`) + `break_target_with_anchor`
+  (both BREAK sites). The §13 re-trigger and the §14 (B) FRAME-UP elevator both
+  READ it (via `elevator_target_from_snr` → `supershift_retrigger_target`'s
+  `anchor_cap` computation) but neither WRITES it — `elevator_target_from_snr()`
+  returns an `int` assigned to `negotiated_configuration` / `snr_ideal`, never to
+  `last_data_viable_config`.
+- **Invariant the consumers assume**: the anchor reflects the highest rung with a
+  CONFIRMED clean delivery this session; the +1 clamp and the BREAK floor depend on
+  it not being raised speculatively. Maintained: §14 (B) fires the elevator INSIDE
+  the clean-batch-confirmed FRAME-UP branch but does NOT touch the §1.1 producer —
+  the anchor still rises only on confirmed delivery, and a speculative multi-rung
+  landing leaves the anchor at its proven (lower) value. **Part J' FP-J4c asserts
+  the FRAME-UP elevator leaves `last_data_viable_config` unchanged.**
+- **What my fix changes**: nothing about the anchor's value lifecycle. The elevator
+  sets a higher TARGET (`negotiated_configuration`); the anchor follows only when
+  that target's first clean batch is confirmed. A failed/overshot jump → BREAK →
+  `break_target_with_anchor` recovers UP to the still-low anchor (§10 demotion
+  backstops repeated overshoot). This is identical to the §13 re-trigger's
+  speculative-landing semantics (§13.3 SAFETY #2/#3), now also on the FRAME-UP path.
+
+#### §14.3.4 The SACK suffix — UNTOUCHED (confirmed)
+
+§14 does not touch the SACK suffix format, CRC, encode/decode, or the
+`process_messages_rx_acks_data()` path. The (A1) arm-widening cannot route a SACK
+suffix to the SNR decoder (§14.3.1, the three guards). The (B) elevator runs in the
+FRAME-UP decision (post-ACK, control-TX side) and only changes
+`negotiated_configuration`; the SACK bsi window, `cmd_last_applied_sack_bsi` /
+`cmd_last_applied_clean_bsi` dedupe (§4), and the all-ones bitmap width are all
+unchanged. **No SACK state is read or written by §14.**
+
+### §14.4 The five safety guards (§13.3) — each PRESERVED by construction
+
+1. **DEEP-SNR INERT (af14a9e):** the (B) elevator block is gated on
+   `measurements.SNR_uplink > -90`, and `supershift_retrigger_target` (via the
+   shared `elevator_target_from_snr`) keeps the conservative +1 unless its
+   high-confidence predicate holds. At WGN:-10 the relayed SNR is low/sentinel →
+   no jump → byte-identical to the +1 ladder (Part J' FP-J3a sentinel + FP-J3c
+   marginal). The (A1) arm at deep SNR simply never receives a decodable suffix,
+   so SNR_uplink stays at the sentinel and the gate stays shut — no behavior
+   change at the cliff.
+2. **Ceiling cap BEFORE the helper:** `elevator_target_from_snr()` applies the NB
+   cap then `min(supershift_proven_ceiling, …)` BEFORE calling
+   `supershift_retrigger_target` — VERBATIM from the §13 re-trigger. The FRAME-UP
+   elevator inherits it (same method). Part J' FP-J4a/FP-J4b assert the
+   proven-ceiling cap binds (target capped at CONFIG_2, not the higher SNR-ideal).
+3. **Anchor NOT raised speculatively:** the elevator READS but never WRITES
+   `last_data_viable_config` (§14.3.3); the §1.1 confirmed-delivery producer is the
+   sole anchor-raise; the (B) elevator fires INSIDE the clean-batch-confirmed
+   branch but the anchor still rises only on confirmed delivery. Part J' FP-J4c.
+4. **#2 anchor-demotion backstop (e3d818d) UNTOUCHED:** a failed/overshot jump →
+   BREAK → `break_target_with_anchor` floors UP to the still-low anchor; repeated
+   overshoot → §10 `anchor_consec_break_fails` reaches K=3 → `anchor_demote_target`
+   lowers the anchor (Parts E). §14 adds no anchor-raise, so it cannot defeat
+   either backstop. (Parts E unchanged, still PASS.)
+5. **NO SUPERSHIFT storm:** the (B) FRAME-UP path does NOT set `turboshift_active`
+   nor re-enter turbo — it only sets `negotiated_configuration` and queues the
+   SAME SET_CONFIG the +1 ladder would. This is CLEANER than the §13 re-trigger
+   (which does re-enter turbo); §14 (B) adds zero turbo re-entry. The (A1) arm
+   touches only the decode-enable flag, not the turbo state machine.
+
+### §14.5 Part J' (`--test-climb-engine`) — fail-before / pass-after
+
+Appended after the existing Part J (J0-J7, which test the §13 re-trigger helper in
+isolation). Part J' drives the NEW §14 pieces; it reuses the Part J scaffolding
+(real `get_configuration` / `config_ladder_*` / `SUPERSHIFT_MARGIN_DB`) and adds a
+`frameup_target` lambda that replays the REAL FRAME-UP elevator-or-+1 decision body
+calling the REAL shared `elevator_target_from_snr()`:
+
+- **FP-J1 (A1 arm fix)**: FP-J1a FAIL-BEFORE proof — the narrow
+  `turbo_snr_ack_expected_on_control` is FALSE on a TURBO_DONE gearshift SET_CONFIG
+  (the bug). FP-J1b PASS-AFTER — the widened `turbo_snr_ack_armed_for_gearshift` is
+  TRUE on a TURBO_DONE upward gearshift SET_CONFIG (gear_shift_on, config_up).
+  FP-J1c §5 — FALSE for a DATA ACK (ACK_RANGE) even with gearshift up (SACK
+  preserved, no leak). FP-J1d — FALSE for a non-upward SET_CONFIG. FP-J1e — FALSE
+  when gear_shift_on==NO. FP-J1f — SUPERSET proof: the widened arm is still TRUE
+  when turbo IS active (so H1/H2/H2b/H3/H4 all hold under it).
+- **FP-J2 (B elevator multi-rung)**: current=CONFIG_0, SNR_uplink =
+  `snr_uplink_from_suffix(14.6f)`, anchor=CONFIG_0, proposed_frame=CONFIG_1,
+  optimizer disabled, no proven cap. FP-J2a sanity: snr_ideal
+  (=get_configuration(14.6−6.0)=CONFIG_13) is multi-rung above CONFIG_1. FP-J2b
+  PASS-AFTER: the FRAME-UP target == CONFIG_13 (multi-rung). FP-J2c FAIL-BEFORE: the
+  unconditional +1 yields CONFIG_1. FP-J2d: the elevator differs from the +1 ladder.
+- **FP-J3 (B deep-SNR inert)**: FP-J3a sentinel −99.9 → gate unmet → +1 (CONFIG_1).
+  FP-J3b/FP-J3c marginal SNR=2.0 (get_configuration(−4.0)=CONFIG_5) modeled at
+  current=CONFIG_4/proposed=CONFIG_5: snr_ideal == proposed → no jump → CONFIG_5.
+  The WGN:-10 anti-thrash assertion in-process.
+- **FP-J4 (B ceiling/anchor cap)**: proven_ceiling=CONFIG_2 + SNR=14.6 → target
+  CAPPED at CONFIG_2 (FP-J4a/FP-J4b); the FRAME-UP elevator does NOT raise the
+  anchor (FP-J4c, still CONFIG_0).
+
+**FAIL-BEFORE evidence**: FP-J1a (narrow helper false on the ladder) and FP-J2c
+(unconditional +1 yields CONFIG_1) ARE the pre-fix outcomes, asserted directly
+side-by-side with the PASS-AFTER results (FP-J1b TRUE, FP-J2b CONFIG_13) — the same
+side-by-side pattern Parts D/E/F/I/J use. The narrow helper and the
+unconditional-+1 path STILL EXIST in the code (the narrow helper is used by the
+*turbo* arm; the +1 is the elevator's default), so the fail-before arms are live,
+not reverted. **PASS-AFTER**: all Part J' PASS; Parts A-I + the existing J0-J7 +
+H2/H2b/H3 stay PASS (§14 is additive — A1 widens a helper into a superset, B adds
+an elevator-OR-+1 max that only ever raises the target).
+
+**HONEST scope** (§8 applies): in-process Part J' proves (A1) the widened arm fires
+on the ladder case and stays off data ACKs, and (B) the FRAME-UP elevator jumps at
+high SNR / is inert at deep SNR / is capped at proven-safe / does not raise the
+anchor. The WIRE proofs — SNR_uplink actually leaving −99.9 on the IONOS, the
+WGN:-10 no-thrash gate, and the WGN:30 multi-rung jump in one SET_CONFIG — are the
+parent's HARDWARE verification. The integration-path timing of the A1-armed decode
+(does the RSP suffix survive the CMD's post-TX flush at this rung?) and the
+multi-rung SET_CONFIG landing (post-jump rx-mute) are not exercised in-process.
 
 ---
 
