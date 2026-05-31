@@ -1064,6 +1064,26 @@ void cl_arq_controller::process_messages_tx_control()
 			// Previously jumped to TRANSMITTING_DATA when negotiated==current,
 			// causing collision after BREAK (commander sent data before responder
 			// finished processing SET_CONFIG).
+
+			// SUPERSHIFT SNR-sentinel ENABLEMENT (climb follow-up #1b, Option 1;
+			// data-flow-snr-measurements.md §1.7 / §7). We are committing a
+			// SET_CONFIG and entering RECEIVING_ACKS_CONTROL. If turboshift is
+			// active (or mid-direction-switch), the RSP will reply with the
+			// ACK+SNR suffix (its SEND gate, arq_responder.cc:1122-1124, on the
+			// SYMMETRIC `data[0]==SET_CONFIG` condition). Arm the CMD's SNR-suffix
+			// DECODE so the producer at arq_common.cc:5555 can prime
+			// measurements.SNR_uplink mid-climb — BREAKING the deadlock that kept
+			// turbo_snr_ack_enabled false (it was set TRUE only by the re-trigger
+			// at :4579, itself gated on SNR_uplink > -90, which only the producer
+			// supplies). For a NON-turbo SET_CONFIG (e.g. break-recovery at
+			// TURBO_DONE) this evaluates FALSE — symmetric with the RSP, which
+			// also sends a bare ACK (no suffix) there. The flag is cleared by
+			// finish_turbo_direction() (:3657) before any data flows, so a data
+			// ACK's SACK suffix is NEVER routed to the SNR decoder (§7 collision
+			// audit). Mirrors the re-trigger's own true-write; no clobber (the
+			// re-trigger sets turboshift_active before queueing this SET_CONFIG).
+			turbo_snr_ack_enabled = turbo_snr_ack_expected_on_control(
+				turboshift_active, turboshift_phase, messages_control.data[0]);
 		}
 
 		if(messages_control.data[0]==REPEAT_LAST_ACK)
@@ -6189,17 +6209,26 @@ int cl_arq_controller::test_clean_batch_viability()
 // See fact-documents/gearshift-climb-engine.md §7 (Parts A-D) + §10/§11
 // (Parts E-F, the deep-SNR down-hysteresis follow-up #2) +
 // fact-documents/data-flow-snr-measurements.md §6 (Part G, the SUPERSHIFT
-// SNR-sentinel follow-up #1 Option A). Each part is fail-before / pass-after
-// its fix. Returns 0 on pass, 1 on fail.
+// SNR-sentinel follow-up #1 Option A) + §7 (Part H, the ENABLEMENT that breaks
+// the bootstrap deadlock — follow-up #1b Option 1). Each part is fail-before /
+// pass-after its fix. Returns 0 on pass, 1 on fail.
 //   E — anchor DEMOTION: K consecutive anchor-rung BREAKs lower the anchor →
 //       break_target_with_anchor permits a sub-anchor recovery → the WGN:-10
 //       CONFIG_0↔ROBUST_0 thrash escapes (the missing demotion producer). §10.
 //   F — SUSTAINED-ANCHOR GATE: a single retransmit-rescued OFDM clean does NOT
 //       raise the anchor (N=2); robust raises on one clean (N=1). §11.
-//   G — SUPERSHIFT SNR-SENTINEL: a simulated SNR-suffix decode populates
-//       measurements.SNR_uplink > -90 (pre-fix it stays -99.9 on the CMD's
-//       MFSK-ACK climb → re-trigger never fires), the re-trigger eligibility
-//       predicate flips, and a live SNR admits EXACTLY ONE re-entry (anti-storm).
+//   G — SUPERSHIFT SNR-SENTINEL (producer): a simulated SNR-suffix decode
+//       populates measurements.SNR_uplink > -90 (pre-fix it stays -99.9 on the
+//       CMD's MFSK-ACK climb → re-trigger never fires), the re-trigger
+//       eligibility predicate flips, and a live SNR admits EXACTLY ONE re-entry.
+//   H — SNR-SENTINEL ENABLEMENT (the bootstrap-deadlock fix): the REAL
+//       turbo_snr_ack_expected_on_control() ARMS the CMD's SNR decode on a turbo
+//       SET_CONFIG control-TX WITHOUT first requiring SNR_uplink>-90 — so the G
+//       producer can finally run on the forward climb (pre-fix the flag stayed
+//       false → producer never ran → SNR_uplink stuck at -99.9). The §7
+//       SACK-vs-SNR collision guard: a DATA ACK / SWITCH_ROLE / non-turbo
+//       SET_CONFIG does NOT arm, so a data ACK's SACK suffix is never routed to
+//       the SNR decoder.
 //
 // IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
 // NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
@@ -6859,6 +6888,116 @@ int cl_arq_controller::test_climb_engine()
 	check(turboshift_phase != TURBO_DONE && turbo_supershift_announce_pending,
 		"G3b after the single re-entry the phase/announce guards block further re-entry",
 		(turboshift_phase != TURBO_DONE ? 2 : 0) + (turbo_supershift_announce_pending ? 1 : 0), 3);
+
+	// ================================================================
+	// Part H — SUPERSHIFT SNR-sentinel ENABLEMENT (climb follow-up #1b, Option 1;
+	// data-flow-snr-measurements.md §1.7 / §7). Part G proved the PRODUCER and the
+	// re-trigger gate; H proves the DEADLOCK that kept the producer from ever
+	// running is broken. THE bug: the producer (arq_common.cc:5555) runs only
+	// inside receive_ack_pattern()'s `if(turbo_snr_ack_enabled)` branch, and on the
+	// CMD turbo_snr_ack_enabled was set TRUE in exactly ONE place — the SUPERSHIFT
+	// re-trigger (arq_commander.cc:4596) — itself gated on
+	// `measurements.SNR_uplink > -90`. So the producer (the only CMD writer of
+	// SNR_uplink on a pattern-ACK climb) could not run until SNR_uplink > -90,
+	// which only it provides → forever false → 0× [CMD-ACK-SNR], 0× [TURBO].
+	// The FIX commits turbo_snr_ack_enabled at the SET_CONFIG control-TX→wait
+	// transition (arq_commander.cc:1050) via the REAL pure helper
+	// turbo_snr_ack_expected_on_control() — the symmetric counterpart to the RSP's
+	// SEND gate (arq_responder.cc:1122-1124).
+	//
+	// FAIL-BEFORE (on 446887c, verified by temporarily reverting the helper body
+	// to `return false;` — the pre-fix behavior where nothing armed the decode on
+	// the forward climb): H1/H1b/H4 FAIL (the flag stays false through the climb →
+	// the producer never runs → SNR_uplink never leaves -99.9). H2/H3 stay PASS
+	// (they assert the data-ACK path is NOT armed and the SNR-independence of the
+	// enable, both of which hold even in the no-op). PASS-AFTER: all PASS.
+	// ================================================================
+	robust_enabled = NO;
+	narrowband_enabled = NO;
+	gear_shift_on = YES;
+
+	// H-pre: the climb-entry state EXACTLY as reset_session_state leaves it
+	// (arq_common.cc:2038-2044) — turbo climbing, but the SNR decode disarmed and
+	// SNR_uplink at its sentinel. This is the deadlocked state on 446887c.
+	turboshift_active        = true;          // climbing the ladder (default at connect)
+	turboshift_phase         = TURBO_DONE;     // reset_session_state's initial phase
+	turbo_snr_ack_enabled    = false;          // armed by NOTHING on the fwd climb (the bug)
+	measurements.SNR_uplink  = -99.9;          // ctor sentinel — no CMD producer ran yet
+	check(turbo_snr_ack_enabled == false && !(measurements.SNR_uplink > -90),
+		"H0 climb-entry: SNR decode DISARMED + SNR_uplink at -99.9 sentinel (the deadlock)",
+		(turbo_snr_ack_enabled ? 2 : 0) + (measurements.SNR_uplink > -90 ? 1 : 0), 0);
+
+	// H1 — the CMD commits a turbo SET_CONFIG and enters RECEIVING_ACKS_CONTROL.
+	// Replay the REAL production assignment at arq_commander.cc:1050 (the SAME
+	// helper expression). The decode MUST now be armed — WITHOUT first requiring
+	// SNR_uplink > -90 (note SNR_uplink is still -99.9 here). This is the deadlock
+	// break: the enable does not depend on the value the producer would supply.
+	// FAIL-BEFORE (helper reverted to `return false`): turbo_snr_ack_enabled stays
+	// false → FAIL.
+	turbo_snr_ack_enabled = turbo_snr_ack_expected_on_control(
+		turboshift_active, turboshift_phase, SET_CONFIG);
+	check(turbo_snr_ack_enabled == true,
+		"H1 turbo SET_CONFIG control-TX ARMS the SNR decode (deadlock broken)",
+		turbo_snr_ack_enabled ? 1 : 0, 1);
+	check(!(measurements.SNR_uplink > -90) && turbo_snr_ack_enabled == true,
+		"H1b decode armed while SNR_uplink STILL -99.9 (enable is NOT gated on SNR>-90)",
+		(measurements.SNR_uplink > -90 ? 2 : 0) + (turbo_snr_ack_enabled ? 1 : 0), 1);
+
+	// H1c — with the decode now armed, the producer (Part G's snr_uplink_from_suffix)
+	// can prime SNR_uplink mid-climb, which then makes the re-trigger gate eligible.
+	// This is the full deadlock-break chain end-to-end: ARM → DECODE → re-trigger
+	// eligible — none of which could happen pre-fix.
+	if(turbo_snr_ack_enabled)                          // the armed branch in receive_ack_pattern()
+		measurements.SNR_uplink = snr_uplink_from_suffix(12.0f);  // the producer fires
+	turboshift_phase      = TURBO_DONE;                // the re-trigger's phase precondition
+	current_configuration = CONFIG_4;                  // an OFDM rung
+	bool h_retrigger_eligible = turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
+	                            is_ofdm_config(current_configuration) &&
+	                            measurements.SNR_uplink > -90;
+	check(h_retrigger_eligible,
+		"H1c armed decode -> producer primes SNR_uplink -> re-trigger now eligible (full chain)",
+		h_retrigger_eligible ? 1 : 0, 1);
+
+	// H2 — THE §7 SACK-vs-SNR COLLISION GUARD. A DATA ACK is NOT a SET_CONFIG (it
+	// is handled by the separate process_messages_rx_acks_data() path and carries
+	// the SACK suffix, not the SNR suffix). The enable predicate MUST be false for
+	// any non-SET_CONFIG control_code even while turbo is active, so a data ACK's
+	// SACK suffix is NEVER routed to detect_ack_snr_from_passband. Drive the REAL
+	// helper with a non-SET_CONFIG code (ACK_RANGE, a data-ACK frame type) while
+	// turbo is active.
+	bool data_ack_arms = turbo_snr_ack_expected_on_control(
+		/*turbo_active=*/true, /*phase=*/TURBO_FORWARD, /*control_code=*/ACK_RANGE);
+	check(data_ack_arms == false,
+		"H2 a DATA ACK (non-SET_CONFIG) does NOT arm the SNR decode (SACK path preserved)",
+		data_ack_arms ? 1 : 0, 0);
+	// H2b — and a SWITCH_ROLE (a non-SET_CONFIG control frame the RSP also does
+	// NOT suffix) likewise does not arm — symmetric with the RSP send gate.
+	bool switch_role_arms = turbo_snr_ack_expected_on_control(
+		/*turbo_active=*/true, /*phase=*/TURBO_REVERSE, /*control_code=*/SWITCH_ROLE);
+	check(switch_role_arms == false,
+		"H2b a SWITCH_ROLE control frame does NOT arm the SNR decode (symmetric w/ RSP)",
+		switch_role_arms ? 1 : 0, 0);
+
+	// H3 — a NON-turbo SET_CONFIG (turbo finished: active=false AND phase==TURBO_DONE,
+	// e.g. a break-recovery settle SET_CONFIG) does NOT arm — symmetric with the
+	// RSP, which also sends a BARE ACK (no suffix) there. This keeps the enable
+	// SCOPED to the turbo climb and prevents a stale arm leaking past
+	// finish_turbo_direction() (which sets active=false + clears the flag at :3657).
+	bool nonturbo_setconfig_arms = turbo_snr_ack_expected_on_control(
+		/*turbo_active=*/false, /*phase=*/TURBO_DONE, /*control_code=*/SET_CONFIG);
+	check(nonturbo_setconfig_arms == false,
+		"H3 a NON-turbo SET_CONFIG does NOT arm (scoped to turbo; matches RSP bare-ACK)",
+		nonturbo_setconfig_arms ? 1 : 0, 0);
+
+	// H4 — mid-direction-switch SET_CONFIG (active toggled false by a phase change
+	// but phase != TURBO_DONE, e.g. TURBO_REVERSE) STILL arms — the RSP's
+	// `phase != TURBO_DONE` disjunct keeps the loop symmetric across the role swap.
+	// FAIL-BEFORE (helper `return false`): FAIL.
+	bool reverse_setconfig_arms = turbo_snr_ack_expected_on_control(
+		/*turbo_active=*/false, /*phase=*/TURBO_REVERSE, /*control_code=*/SET_CONFIG);
+	check(reverse_setconfig_arms == true,
+		"H4 mid-switch (phase!=TURBO_DONE) SET_CONFIG arms via the disjunct (loop symmetric)",
+		reverse_setconfig_arms ? 1 : 0, 1);
 
 	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

@@ -1,9 +1,27 @@
 # Data-Flow Audit: `measurements.SNR_uplink` / `measurements.SNR_downlink`
 
-**Status**: Authoritative as of 2026-05-30, written BEFORE the SUPERSHIFT
-SNR-sentinel fix (climb follow-up #1, "Option A") lands on
-`fix/climb-engine` (stacks on `e3d818d`). Every future change that writes
-or reads either field MUST update this document.
+**Status**: Authoritative as of 2026-05-30. §1–§6 cover the SUPERSHIFT
+SNR-sentinel PRODUCER fix (climb follow-up #1, "Option A", shipped on
+`fix/climb-engine` @ `446887c`). **§1.7 + §7 cover the ENABLEMENT fix
+(climb follow-up #1b, "Option 1") that lands ON TOP of `446887c`** — it
+breaks the bootstrap deadlock that kept the §1.5 producer from EVER running
+on the CMD's forward pattern-ACK climb. Every future change that writes or
+reads either field — OR that touches `turbo_snr_ack_enabled` (the decode-
+branch selector that gates the §1.5 producer) — MUST update this document.
+
+**The bootstrap deadlock (follow-up #1b, the §1.5 producer never ran)**: the
+§1.5 producer at `arq_common.cc:5555` runs ONLY inside
+`receive_ack_pattern()`'s `if(turbo_snr_ack_enabled)` branch
+(`arq_common.cc:5516`). On the CMD, `turbo_snr_ack_enabled` was set TRUE in
+EXACTLY ONE place — the SUPERSHIFT re-trigger (`arq_commander.cc:4596`,
+was `:4579` pre-edit) — itself gated by `measurements.SNR_uplink > -90`
+(`arq_commander.cc:4548-4549`). DEADLOCK: the §1.5 producer is the only thing
+that lifts `SNR_uplink` off the `-99.9` sentinel on the CMD during a forward
+pattern-ACK climb, but it cannot run until `SNR_uplink > -90`, which only it
+provides. Proof (hardware): 0× `[CMD-ACK-SNR]`, 0× `[TURBO]` in cmd.log;
+`SNR_uplink` stayed `-99.9`; SUPERSHIFT never armed. **So Option A shipped a
+producer that, on the CMD's forward climb, was unreachable.** §1.7 adds the
+missing enablement.
 
 **Driving work item**: climb follow-up #1 — slow ladder climb because the
 SNR sentinel is never populated during the CMD's forward MFSK-ACK climb.
@@ -111,6 +129,42 @@ session). `SNR_uplink` / `SNR_downlink` are `double`. Ctor-init `-99.9`
   `reset_session_state()` → load init config). `SNR_uplink` /
   `SNR_downlink` return to `-99.9`. The fix does not add or remove any
   reset; a new session starts at the sentinel exactly as before.
+
+### §1.7 NEW ENABLEMENT (follow-up #1b) — CMD arms the §1.5 producer's branch
+- **File:line**: `arq_commander.cc:1050` (inside the
+  `if(messages_control.data[0]==SET_CONFIG)` block in
+  `process_messages_tx_control()`, at the control-TX → `RECEIVING_ACKS_CONTROL`
+  transition).
+- **Write**: `turbo_snr_ack_enabled = turbo_snr_ack_expected_on_control(
+  turboshift_active, turboshift_phase, messages_control.data[0]);`
+- **The pure helper** (`arq.h`, static, no side effects so Part H replays the
+  identical expression):
+  `(turbo_active || phase != TURBO_DONE) && control_code == SET_CONFIG`.
+- **What it changes**: `turbo_snr_ack_enabled` is the BRANCH SELECTOR consumed
+  by `receive_ack_pattern()` (`arq_common.cc:5452/5516`) — true ⇒ the SNR-suffix
+  branch (`detect_ack_snr_from_passband`, which runs the §1.5 producer); false ⇒
+  the normal-mode ACK branch (`detect_ack_pattern_from_passband`, no SNR decode).
+  Pre-#1b the CMD had no producer of `turbo_snr_ack_enabled=true` on the forward
+  climb (the only setter, the re-trigger `:4596`, was deadlocked — see the
+  status block). This write ARMS the decode at every turbo SET_CONFIG-ACK wait,
+  so the §1.5 producer finally runs mid-climb and lifts `SNR_uplink` off `-99.9`.
+- **Symmetry**: this is the EXACT counterpart of the RSP's SNR-suffix SEND gate
+  (`arq_responder.cc:1122-1124`:
+  `(turboshift_active || turboshift_phase != TURBO_DONE) && data[0]==SET_CONFIG
+  && SNR_uplink > -90`), MINUS the `SNR_uplink > -90` conjunct. That conjunct is
+  the RSP's "do I HAVE a measured SNR to encode" check (RSP gets `SNR_uplink`
+  from decoding the SET_CONFIG LDPC frame, `arq_responder.cc:2046`). The CMD is
+  the opposite end of the loop — it only needs the DECODER armed to RECEIVE the
+  suffix; gating the CMD on `SNR_uplink > -90` would re-create the very deadlock
+  (the CMD has no `SNR_uplink` yet — that is what the suffix is FOR).
+- **Field choice**: does NOT touch `SNR_uplink` / `SNR_downlink` directly — it
+  enables the BRANCH whose producer (§1.5) writes `SNR_uplink`. Lifecycle of the
+  flag is bounded by turbo: set here on each turbo SET_CONFIG; cleared by
+  `finish_turbo_direction()` (`arq_commander.cc:3657`) before any
+  `TRANSMITTING_DATA` transition (§7.3). So the flag is provably FALSE on every
+  DATA-ACK wait — the SACK-suffix path is never routed to the SNR decoder (§7.1).
+- **Touched by #1b?** YES — this IS the #1b fix. The §1.5 producer line is
+  UNCHANGED (it shipped at `446887c`); #1b only makes its branch reachable.
 
 ---
 
@@ -309,3 +363,161 @@ replays the REAL §1.5 write expression via the shared helper
 They do NOT prove the climb-SPEED win — that is hardware-confirmable only
 (does the CMD reach e.g. CONFIG_6 via SUPERSHIFT jumps faster than the slow
 one-rung ladder at clean/moderate SNR?). The parent tests that on the wire.
+
+---
+
+## §7 ENABLEMENT cross-layer audit (CLAUDE.md §5) — follow-up #1b
+
+The §1.7 enablement writes `turbo_snr_ack_enabled` — the BRANCH SELECTOR that
+gates the §1.5 producer AND chooses which detector `receive_ack_pattern()` runs.
+`turbo_snr_ack_enabled` is shared across the PHY-decode layer (which detector)
+and the ARQ layer (which producer). Walk every producer/consumer.
+
+### §7.0 Producers / consumers of `turbo_snr_ack_enabled`
+
+- **Producers (CMD)**: ctor init false (`arq_common.cc:366`); reset_session_state
+  init false (`arq_common.cc:2044`, `:3000`); SUPERSHIFT re-trigger sets TRUE
+  (`arq_commander.cc:4596`); `finish_turbo_direction()` clears FALSE
+  (`arq_commander.cc:3657`); SWITCH_ROLE-BREAK clears FALSE
+  (`arq_commander.cc:2234`); **NEW §1.7: set to the helper value at the turbo
+  SET_CONFIG control-TX (`arq_commander.cc:1050`)**.
+- **Producers (RSP)**: ctor/reset false; SWITCH_ROLE reverse-probe sets TRUE
+  (`arq_responder.cc:1315`); skip-reverse / role-return clear FALSE
+  (`arq_responder.cc:1302/1334`). **The §1.7 write is in `process_messages_tx_control`,
+  a CMD function (the RSP TX path is `acknowledging_*`), so #1b never executes on
+  the RSP** — the RSP's flag lifecycle is byte-identical to today.
+- **Consumers**: `receive_ack_pattern()` tail-window sizing + branch selection
+  (`arq_common.cc:5400/5452/5516`); `zero_mfsk_ack_audio_tail()` tail-window
+  (`arq_common.cc:5400`). Both are CMD-only (`receive_ack_pattern` is CMD-only,
+  §4). No ARQ control decision reads the flag directly except through these.
+
+### §7.1 CHECK 2 (the crux) — NO SACK-vs-SNR suffix collision
+
+**Verdict: collision is STRUCTURALLY IMPOSSIBLE; the SACK path is untouched.**
+
+Two distinct ACK suffixes exist:
+- **SNR suffix** — on SET_CONFIG ACKs during turbo. Decoded by
+  `detect_ack_snr_from_passband` (`telecom_system.cc:3236`), reached ONLY via
+  `receive_ack_pattern()`'s `if(turbo_snr_ack_enabled)` branch (`arq_common.cc:5516`).
+- **SACK suffix** — on DATA ACKs. Decoded by the SEPARATE SACK-v2 cross-check
+  (`decode_sack_v2_frame` / `decode_suffix_tones`, `arq_commander.cc:1789-1840`,
+  `ofdm.cc:3986`) in the DATA-ACK path `process_messages_rx_acks_data()`
+  (`arq_commander.cc:2378`, callsite `:2946`).
+
+Three independent reasons they cannot cross:
+
+1. **Different functions, selected by `connection_status`.** SET_CONFIG ACKs are
+   awaited in `process_messages_rx_acks_control()` (`:1763`, callsite `:1785`),
+   entered at `RECEIVING_ACKS_CONTROL`. DATA ACKs are awaited in
+   `process_messages_rx_acks_data()` (`:2378`, callsite `:2946`), entered at
+   `RECEIVING_ACKS_DATA`. They never run in the same tick.
+
+2. **The enablement is gated `control_code == SET_CONFIG`** (§1.7 helper). A DATA
+   ACK is not a control frame at all — the helper is never even evaluated on the
+   data path (it lives in the SET_CONFIG control-TX block). Part H2/H2b/H3 assert
+   a DATA ACK (`ACK_RANGE`), a `SWITCH_ROLE`, and a non-turbo `SET_CONFIG` all
+   return FALSE from the helper.
+
+3. **The flag is provably FALSE on every DATA-ACK wait** (§7.3): turbo always
+   ends (the flag cleared) before `TRANSMITTING_DATA`. So even the
+   `receive_ack_pattern()` call inside `process_messages_rx_acks_data` (`:2946`)
+   takes the `else` (normal-mode) branch (`arq_common.cc:5640`) — it never calls
+   `detect_ack_snr_from_passband`. The data ACK's SACK suffix is fed to the SACK
+   decoder only, exactly as before #1b.
+
+The test campaign confirmed the SACK path was working (9× CLEAN data ACKs);
+#1b touches neither the SACK decoder nor the data-ACK branch — it only flips a
+flag that is already false on that path.
+
+### §7.2 CHECK 1 — the CMD still correctly DETECTS the ACK pattern
+
+**Verdict: ACK detection is UNCHANGED on the armed branch.**
+`detect_ack_snr_from_passband` (`telecom_system.cc:3236`) detects the base ACK
+with the SAME `ofdm.detect_ack_pattern()` call, the SAME `ack_tones` /
+`ack_pattern_len` / `ack_match_threshold`, and the SAME `metric >= 3.0` gate
+(`:3264`) as the normal-mode `detect_ack_pattern_from_passband`. The ONLY delta
+is that it additionally reserves + decodes `SNR_SUFFIX_LEN` symbols. ACK
+ACCEPTANCE keys off `matched_count >= ack_match_threshold` (`arq_common.cc:5529`),
+NOT off suffix validity: if the suffix is garbled, the `else` defer path
+(`:5586`) waits ≤500 ms then accepts the ACK anyway (`:5595-5624`, returns true).
+So enabling the SNR branch for a SET_CONFIG ACK cannot cause a MISSED control
+ACK. (This is the SAME branch the re-trigger `:4596` already used post-turbo;
+#1b only makes it reachable on the forward climb too.) The ≤500 ms suffix-wait
+is bounded and is the existing, intended turbo SET_CONFIG-ACK behavior, not a
+new latency path.
+
+### §7.3 CHECK 3 — SUPERSHIFT still bounded; no storm; flag never leaks to data
+
+**Verdict: storm guards intact; flag lifecycle bounded by turbo.**
+
+- The §1.7 write does NOT touch the re-trigger's own guards. The re-trigger
+  (`arq_commander.cc:4548-4596`) still requires `turboshift_phase == TURBO_DONE`,
+  still applies `supershift_proven_ceiling`, the `anchor_cap`
+  (`last_data_viable_config + 1` unless the optimizer owns the band), and the
+  `gap >= SUPERSHIFT_RETRIGGER_CONFIGS` gate. #1b only PRIMES the `SNR_uplink`
+  input the gate reads (via §1.5) — Part G3/G3b already prove a live `SNR_uplink`
+  admits exactly ONE re-entry (the `TURBO_DONE`-phase gate +
+  `turbo_supershift_announce_pending` one-jump-in-flight guard).
+- **Flag never leaks to a data-ACK wait** (the §7.1 reason 3 proof): every path
+  to `TRANSMITTING_DATA` either runs `finish_turbo_direction()` first (which sets
+  `turbo_snr_ack_enabled=false` at `arq_commander.cc:3657` BEFORE any of its
+  branches, including its own `:3763` data fallback) or occurs when turbo was
+  already `TURBO_DONE` + inactive (e.g. break-recovery `:4430`, where the flag
+  was already cleared). Walked exits of the turbo SET_CONFIG-ACK handler
+  (`arq_commander.cc:4434+`): each either re-queues a SET_CONFIG (control path,
+  flag re-affirmed true — no leak) or calls `finish_turbo_direction()` (cleared).
+- **No clobber of the re-trigger.** The re-trigger sets the flag TRUE then queues
+  a SET_CONFIG; on the next tick `process_messages_tx_control` reaches `:1050`
+  with `turboshift_active==true` (set at `:4576`) → the helper returns true →
+  re-affirms, never clobbers.
+- **For a NON-turbo SET_CONFIG** the helper returns FALSE, so #1b sets the flag
+  false — which is CORRECT and SYMMETRIC: the RSP also sends a bare ACK (no SNR
+  suffix) there (its send gate is also false), so the CMD must decode in
+  normal mode. This also prevents a stale TRUE from a prior turbo leaking into a
+  later non-turbo SET_CONFIG wait. (Part H3.)
+
+### §7.4 Part H (`--test-climb-engine`) — fail-before / pass-after
+
+Replays the REAL §1.7 helper `turbo_snr_ack_expected_on_control()` (the SAME
+expression the production `:1050` assignment uses) + the REAL §1.5 producer
+helper + the REAL §2.1 gate:
+
+- **H0** — climb-entry state: decode DISARMED + `SNR_uplink` at `-99.9` (the
+  deadlock, exactly as `reset_session_state` `:2038-2044` leaves it).
+- **H1 / H1b** — a turbo SET_CONFIG control-TX ARMS the decode WITHOUT first
+  requiring `SNR_uplink > -90` (the deadlock break: the enable is independent of
+  the value the producer would supply).
+- **H1c** — full chain: armed decode → §1.5 producer primes `SNR_uplink` → §2.1
+  re-trigger becomes eligible. None of this could happen pre-#1b.
+- **H2 / H2b** — the §7.1 collision guard: a DATA ACK (`ACK_RANGE`) and a
+  `SWITCH_ROLE` do NOT arm the SNR decode (SACK suffix never routed to it).
+- **H3** — a NON-turbo SET_CONFIG does NOT arm (scoped to turbo; matches the RSP
+  bare-ACK).
+- **H4** — a mid-direction-switch SET_CONFIG (`phase != TURBO_DONE`,
+  `active==false`) STILL arms via the disjunct (loop stays symmetric across the
+  role swap).
+
+**FAIL-BEFORE** (verified 2026-05-30 by temporarily reverting the helper body to
+`return false;` — modelling `446887c`, where nothing armed the decode on the
+forward climb): **H1 / H1b / H1c / H4 FAIL** (flag stays false → producer never
+runs → `SNR_uplink` never leaves `-99.9` → re-trigger never eligible);
+**H0 / H2 / H2b / H3 stay PASS** (they assert the disarmed-entry state and the
+collision guard, which hold even in the no-op — confirming Part H is not
+trivially all-or-nothing). **PASS-AFTER**: all PASS; the temp revert was
+reverted; the shipped helper does the enablement.
+
+**Honest scope**: H proves the DEADLOCK IS BROKEN (the producer's branch is now
+reachable on the forward climb) and the SACK path is PRESERVED — in-process.
+It does NOT prove the climb-SPEED win. That is hardware-only: the parent will
+high-SNR (WGN:30/40) test that `[CMD-ACK-SNR]` now appears, `SNR_uplink` leaves
+`-99.9`, `[TURBO]` re-trigger fires, and the CMD elevator-jumps instead of
+crawling one rung at a time.
+
+### §7.5 Related fact documents
+
+- `gearshift-climb-engine.md` — the climb engine #1b unblocks (the SUPERSHIFT
+  elevator is the fast path off the one-rung FRAME-UP/LADDER-UP ladder).
+- `data-flow-batch-size.md` §4/§6 — the connect-path default-init trap (the 4th
+  wire failure); a reminder that "the connect-path state is not what the steady-
+  state code assumes" — checked here for `turbo_snr_ack_enabled` (ctor/reset
+  init false; §1.7 is the first forward-climb producer of true on the CMD).

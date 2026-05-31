@@ -673,6 +673,51 @@ public:
   static double snr_uplink_from_suffix(float decoded_snr)
   { return (double)decoded_snr; }
 
+  // SUPERSHIFT SNR-sentinel ENABLEMENT (climb follow-up #1b, Option 1;
+  // data-flow-snr-measurements.md §1.7 / §7). snr_uplink_from_suffix() (above)
+  // shipped the PRODUCER, but it only runs inside receive_ack_pattern()'s
+  // `if(turbo_snr_ack_enabled)` branch (arq_common.cc:5516) — and on the CMD
+  // turbo_snr_ack_enabled is set TRUE in exactly ONE place: the SUPERSHIFT
+  // re-trigger (arq_commander.cc:4579), itself gated by
+  // `measurements.SNR_uplink > -90` (:4548). DEADLOCK: the producer is the only
+  // thing that lifts SNR_uplink off the -99.9 sentinel on the CMD's forward
+  // pattern-ACK climb, but it cannot run until SNR_uplink > -90, which only it
+  // provides. Result on hardware: 0× [CMD-ACK-SNR], 0× [TURBO], SNR_uplink stuck
+  // at -99.9, SUPERSHIFT never armed (the modem crawls one rung at a time).
+  //
+  // The FIX enables the CMD's SNR-suffix decode when it EXPECTS a SET_CONFIG ACK
+  // during turboshift — the SYMMETRIC counterpart to the RSP's SNR-suffix SEND
+  // gate (arq_responder.cc:1122-1124:
+  //   (turboshift_active || turboshift_phase != TURBO_DONE)
+  //     && messages_control.data[0] == SET_CONFIG && SNR_uplink > -90).
+  // We drop the RSP's `SNR_uplink > -90` conjunct: that term is the RSP's "do I
+  // HAVE a measured SNR to PUT in the suffix" check (the RSP gets SNR_uplink from
+  // decoding the SET_CONFIG LDPC frame, arq_responder.cc:2046). The CMD side is
+  // the opposite end of the loop — it just needs the DECODER armed to RECEIVE
+  // whatever the RSP sends; gating CMD enablement on SNR_uplink > -90 would
+  // re-introduce the very deadlock (the CMD has no SNR_uplink yet — that is what
+  // the suffix is FOR). So the CMD predicate is the RSP gate MINUS that conjunct.
+  //
+  // NARROW BY DESIGN (the §5 SACK-vs-SNR collision crux): the `control_code ==
+  // SET_CONFIG` conjunct restricts enablement to a SET_CONFIG ACK wait. A DATA
+  // ACK (which carries the SACK suffix, decoded by the separate
+  // process_messages_rx_acks_data() path) NEVER satisfies this — it is not a
+  // control frame — so a data ACK's SACK suffix is never fed to the SNR decoder
+  // (and vice-versa). The flag is committed at the SET_CONFIG control-TX→wait
+  // transition (arq_commander.cc:1050) and is unconditionally CLEARED by
+  // finish_turbo_direction() (arq_commander.cc:3657) before any TRANSMITTING_DATA
+  // transition, so it is provably false on every data-ACK wait. PURE (no side
+  // effects) so Part H replays the identical expression. See §1.7 / §7.
+  // phase is taken as int (not the TurboshiftPhase enum) because this inline
+  // helper precedes the enum's declaration in the class; the enumerator
+  // TURBO_DONE is visible in the BODY (complete-class context) but a named
+  // parameter TYPE is not. TurboshiftPhase implicitly converts to int at the
+  // call site (arq_commander.cc:1050 passes turboshift_phase directly).
+  static bool turbo_snr_ack_expected_on_control(bool turbo_active,
+                                                int phase,
+                                                int control_code)
+  { return (turbo_active || phase != TURBO_DONE) && control_code == SET_CONFIG; }
+
   // climb-engine Bug 1 (gearshift-climb-engine.md §4) — split SACK dedupe by
   // event class. The CMD MFSK ACK+SACK decode used a SINGLE tracker
   // (cmd_last_applied_sack_bsi): a PARTIAL SACK for bsi=B set it, then the later
@@ -714,7 +759,7 @@ public:
   // never call this. See gearshift-start-and-recovery.md §9.8.
   int test_clean_batch_viability();
 
-  // climb-engine integrated regression (CLI --test-climb-engine). Parts A-G,
+  // climb-engine integrated regression (CLI --test-climb-engine). Parts A-H,
   // each fail-before / pass-after its fix:
   // (a) Bug 1: sack_clean_confirmation_accepted() split-dedupe — an all-ones
   //     CLEAN confirmation for a bsi whose PARTIAL was already applied is
@@ -736,6 +781,13 @@ public:
   //     (pre-fix it stays at the -99.9 sentinel on the CMD's MFSK-ACK climb),
   //     plus the anti-storm bound (a live SNR admits exactly one re-entry).
   //     See data-flow-snr-measurements.md §6.
+  // (f) climb follow-up #1b, Option 1 (Part H): the SNR-sentinel ENABLEMENT —
+  //     the REAL turbo_snr_ack_expected_on_control() arms the CMD's SNR decode
+  //     on a turbo SET_CONFIG control-TX WITHOUT first requiring SNR_uplink>-90
+  //     (breaking the bootstrap deadlock that kept turbo_snr_ack_enabled false
+  //     on the forward climb so the §1.5 producer never ran), and the §7
+  //     SACK-vs-SNR collision guard (a DATA ACK / SWITCH_ROLE / non-turbo
+  //     SET_CONFIG does NOT arm). See data-flow-snr-measurements.md §1.7 / §7.
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
 
