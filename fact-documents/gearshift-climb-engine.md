@@ -155,11 +155,23 @@ at the floor SNR — which essentially never happens — so the climb never gets
 single clean batch to start with. (This is the upstream block that prevents even
 the FIRST rung; Bug 3 is the block on subsequent rungs.)
 
-**Fix**: gate BOTH blocks on `!is_robust_config(...)`. CMD gates on
+**Fix**: gate BOTH blocks on `!is_robust_config(...)`. ~~CMD gates on
 `negotiated_configuration`, RSP on `current_configuration`; at TEST_CONNECTION
-time both equal the established connect config, so they agree (symmetry
-mandatory — an asymmetric override was historical Bug #9). This is the standalone
-C2 batch-floor fix, verbatim.
+time both equal the established connect config, so they agree~~ **[WRONG — struck
+2026-05-30, this was the 4th wire failure's root cause. See
+`data-flow-batch-size.md` §4: on a fresh unpinned `-g -R` connect,
+`negotiated_configuration` is its CTOR DEFAULT `CONFIG_0` (`arq_common.cc:281`),
+NOT the connect config — the connect path never writes it (only teardown
+`:443` / BREAK `:205,:297` / optimizer `:530` / turboshift `:3623` do). So
+`is_robust_config(negotiated_configuration)=false` at ROBUST_0 connect → CMD
+recompute RAN → CMD batch=5 while RSP (gated on `current_configuration=ROBUST_0`)
+correctly stayed batch=1 → CMD/RSP mismatch → first ROBUST_0 block fails →
+climb never starts. CORRECTED FIX: gate the CMD block on
+`current_configuration` too (== ROBUST_0 at connect, the SAME var the RSP block
+and the Axis-2 guard read), and enforce robust⇒batch=1 at the
+`set_data_batch_size()` chokepoint (`arq_common.cc`) so no path can diverge.]**
+(symmetry mandatory — an asymmetric override was historical Bug #9). This is the
+standalone C2 batch-floor fix, verbatim.
 
 Note: §2 (Axis-2 guard) and §3 (batch-floor guard) are the TWO halves of the
 "keep batch=1 at robust" invariant. C3 shipped §3 but dropped §2 — that omission
@@ -236,8 +248,12 @@ dedupe + prev-path ACK (§4). Walk producers/consumers:
 - **Producers**: `load_configuration` (`arq_common.cc:1231`, pins 1 at robust),
   OFDM batch-scaling (`:1269`, `!is_robust_config`-gated — untouched), the SACK
   TEST_CONNECTION recompute (CMD `:3858` / RSP `:2101` — NOW `!is_robust_config`-
-  gated by §3), `policy_evaluate_axis2` (CMD `:5263` via SET_LINK_PARAMS — NOW
-  `return`s early at robust by §2), RSP SET_LINK_PARAMS apply
+  gated by §3 **on `current_configuration` for BOTH sides as of the 2026-05-30
+  fix; the original §3 plan's `negotiated_configuration` for CMD was the 4th
+  wire-failure bug — see `data-flow-batch-size.md` §4**), `policy_evaluate_axis2`
+  (CMD `:5263` via SET_LINK_PARAMS — NOW `return`s early at robust by §2),
+  **`set_data_batch_size()` itself (`arq_common.cc:561`) NOW the single chokepoint:
+  clamps any robust write to 1**, RSP SET_LINK_PARAMS apply
   (`arq_responder.cc:2615`, driven only by CMD Axis-2; since CMD no longer moves
   batch at robust, RSP never receives a robust SET_LINK_PARAMS).
 - **Consumers**: ACK-GATE expected-count (`arq_responder.cc:1373/1380`), the
@@ -312,10 +328,24 @@ each fail-before / pass-after:
   dormancy blocked) → assert clamp now permits ROBUST_2. Repeat through ROBUST_2
   → CONFIG_0. Assert the climb reaches CONFIG_0 (≥3 rungs), NOT stuck at ROBUST_1.
   Pre-fix (with Axis-2 growing batch): anchor never advances past ROBUST_0 → FAIL.
+- **(d) CONNECT-PATH CMD/RSP batch symmetry (the 4th wire failure; added
+  2026-05-30, see `data-flow-batch-size.md` §6)**: set the two config members to
+  the REAL unpinned-connect state that parts (a)–(c) never modeled —
+  `current_configuration=ROBUST_0` (live PHY) but `negotiated_configuration=
+  CONFIG_0` (its CTOR DEFAULT; the connect path never writes it). Drive the REAL
+  production recompute `sack_negotiated_recompute_batch` (the single shared body
+  both the CMD and RSP handlers now call) and assert CMD batch == RSP batch == 1
+  (D1/D2/D3), the chokepoint clamps a direct robust over-request (D4), and OFDM
+  at CONFIG_10 still scales to ≥5 (D5). **Fail-before** (86d39b4: CMD gate on
+  `negotiated_configuration`=CONFIG_0 → recompute ran → batch=5≠1): D1/D3/D4
+  FAIL — verified by reverting ONLY the helper predicate to
+  `negotiated_configuration` + disabling the chokepoint (got=25 want=1).
+  **Pass-after**: gate on `current_configuration`=ROBUST_0 → batch stays 1 →
+  PASS. This is the assertion all four wire failures slipped past.
 
 Local tests are NECESSARY but NOT SUFFICIENT — the singles passed local and
-failed the wire. §8 flags the integration-path assumptions that still need
-hardware.
+failed the wire. Part (d) closes the connect-path default-init gap specifically;
+§8 flags the integration-path assumptions that still need hardware.
 
 ---
 

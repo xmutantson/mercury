@@ -560,6 +560,39 @@ void cl_arq_controller::set_ack_batch_size(int ack_batch_size)
 
 void cl_arq_controller::set_data_batch_size(int data_batch_size)
 {
+	// CHOKEPOINT: robust => batch 1 (the single enforcement point).
+	// At any robust/MFSK config the batch MUST be 1 (all-or-nothing pattern ACK;
+	// a clean all-ones batch == one delivered MFSK frame). The CMD and RSP
+	// compute their clean-ACK target as (1<<data_batch_size)-1 independently
+	// (arq_commander.cc:131/2518, arq_responder.cc:801/1711); if the two sides
+	// ever hold different robust batch sizes the targets never match, no clean
+	// credit fires, and the gearshift climb cannot start or advance. Four
+	// successive wire failures of the climb-fix family were all this same class
+	// (CMD/RSP robust-batch mismatch via a different producer each time:
+	// SACK-recompute predicate skew, Axis-2 growth, SET_LINK_PARAMS clamp). Per
+	// the data-flow-batch-size.md audit (CLAUDE.md §5) we stop guarding each
+	// producer in isolation and enforce the invariant HERE, at the sole setter,
+	// so no current OR future producer can bypass it.
+	//
+	// current_configuration is the authoritative live-PHY config: set in
+	// load_configuration() (arq_common.cc:1168) BEFORE its own batch sizing runs,
+	// and it is the SAME variable the Axis-2 robust guard (policy_evaluate_axis2)
+	// and the RSP SACK recompute already key off. NOTE: the SACK-test direct
+	// assigns (this->data_batch_size = 25/30, arq_responder.cc:2895/3000)
+	// deliberately bypass this setter and are unaffected (OFDM-batch SACK tests).
+	if(is_robust_config(current_configuration) && data_batch_size != 1)
+	{
+		if(this->data_batch_size != 1)
+		{
+			printf("[BATCH-CHOKEPOINT] robust config %d: clamped requested batch %d -> 1 "
+				"(robust => batch 1 invariant; CMD/RSP must agree)\n",
+				current_configuration, data_batch_size);
+			fflush(stdout);
+		}
+		this->data_batch_size = 1;
+		return;
+	}
+
 	if (data_batch_size>0)
 	{
 		if(data_batch_size<(max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1))
@@ -676,6 +709,47 @@ void cl_arq_controller::recalculate_ack_timeout_for_batch()
 	}
 	else
 		set_ack_timeout_data((data_batch_size+1)*message_transmission_time_ms+control_batch_size*message_transmission_time_ms+2*ack_batch_size*ctrl_transmission_time_ms+time_left_to_send_last_frame+4*ptt_on_delay_ms+4*ptt_off_delay_ms);
+}
+
+// SACK-negotiation batch recompute — the single shared body for the CMD
+// (TEST_CONNECTION_ACK, arq_commander.cc) and RSP (TEST_CONNECTION,
+// arq_responder.cc) handlers. Extracting it makes the two sides run IDENTICAL
+// code so they CANNOT diverge on data_batch_size — the root failure mode of the
+// climb-fix family (4 wire failures, all CMD/RSP robust-batch mismatch). See
+// data-flow-batch-size.md §4/§5.
+//
+// Gates on current_configuration (the live-PHY config). On a robust connect this
+// is ROBUST_0 (set by the startup load_configuration(data_configuration=ROBUST_0)
+// and every robust control-frame TX); on an OFDM connect it is the OFDM config.
+// negotiated_configuration is NOT usable here: on a fresh unpinned `-g -R`
+// connect it is still its ctor-default CONFIG_0 (the connect path never writes
+// it), which made the old CMD gate (is_robust_config(negotiated_configuration))
+// falsely recompute at ROBUST_0 -> CMD batch=5 vs RSP batch=1 -> climb never
+// started. The set_data_batch_size() chokepoint backstops robust => batch 1.
+void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
+{
+	// ROBUST/MFSK configs are EXCLUDED from the >=5 floor: load_configuration()
+	// (arq_common.cc:1229-1234) pins data_batch_size=1 for robust and its OFDM
+	// batch-scaling (:1269) is already !is_robust_config-gated. Re-applying the
+	// SACK floor at robust would clobber the pin and force batch>=5, where a
+	// clean all-ones MFSK ACK requires every frame to survive first-pass at the
+	// floor SNR (it never does). At batch=1 every delivered MFSK frame is itself
+	// an all-ones batch -> clean ACKs accumulate and the climb advances.
+	if(!is_robust_config(current_configuration))
+	{
+		int max_batch = (message_transmission_time_ms > 0)
+			? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+		if(max_batch < 5) max_batch = 5;
+		if(max_batch > nMessages) max_batch = nMessages;
+		int new_batch = radio_batch_size;
+		if(new_batch > max_batch) new_batch = max_batch;
+		set_data_batch_size(new_batch);
+		nominal_batch_size = new_batch;
+	}
+	recalculate_ack_timeout_for_batch();
+	printf("[SACK] %s Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+		who ? who : "?", radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
+		is_robust_config(current_configuration) ? 1 : 0);
 }
 
 void cl_arq_controller::set_call_sign(std::string call_sign)

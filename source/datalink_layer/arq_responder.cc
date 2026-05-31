@@ -2152,21 +2152,11 @@ void cl_arq_controller::process_control_responder()
 			// batch mismatch. The responder gates on current_configuration (== the
 			// established connect config at TEST_CONNECTION time, == ROBUST_0 for a
 			// robust connect, < 100 for OFDM). OFDM keeps the >=5 floor unchanged.
-			if(!is_robust_config(current_configuration))
-			{
-				int max_batch = (message_transmission_time_ms > 0)
-					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-				if(max_batch < 5) max_batch = 5;
-				if(max_batch > nMessages) max_batch = nMessages;
-				int new_batch = radio_batch_size;
-				if(new_batch > max_batch) new_batch = max_batch;
-				set_data_batch_size(new_batch);
-				nominal_batch_size = new_batch;
-			}
-			recalculate_ack_timeout_for_batch();
-			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
-				radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
-				is_robust_config(current_configuration) ? 1 : 0);
+			// Shared with the CMD TEST_CONNECTION_ACK handler so both sides run
+			// IDENTICAL code and cannot diverge on data_batch_size (the 4-time
+			// wire-failure mode). Gates on current_configuration. See
+			// data-flow-batch-size.md §5 and the helper in arq_common.cc.
+			sack_negotiated_recompute_batch("RSP");
 		}
 		else
 		{

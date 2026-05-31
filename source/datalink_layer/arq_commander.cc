@@ -3865,36 +3865,37 @@ void cl_arq_controller::process_control_commander()
 				// Update batch size now that SACK is negotiated. 30s target
 				// matches the formula in arq_common.cc batch sizing.
 				//
-				// climb-engine Bug 2 (gearshift-climb-engine.md §3): ROBUST/MFSK
-				// configs are EXCLUDED from the >=5 floor. load_configuration()
-				// (arq_common.cc:1229-1234) deliberately sets data_batch_size=1 for
-				// robust, and its batch-scaling path (arq_common.cc:1269) is already
-				// !is_robust_config-gated. Re-applying the unconditional SACK floor
-				// here clobbers that and forces batch back to >=5 at ROBUST_0, where
-				// a clean all-ones MFSK ACK requires all 5 frames to survive
-				// first-pass at the floor SNR (it never does) — so the climb never
-				// gets a single clean batch to START with. At batch=1 every delivered
-				// MFSK frame is itself an all-ones batch -> clean ACKs accumulate.
-				// CMD gates on negotiated_configuration, RSP on current_configuration
-				// (arq_responder.cc) — equal at TEST_CONNECTION time, so CMD and RSP
-				// agree on data_batch_size (an asymmetric override was Bug #9). OFDM
-				// (CONFIG_0..16) keeps the >=5 floor unchanged. Likely an unintended
-				// regression of SACK-default-on (sack_enabled always true).
-				if(!is_robust_config(negotiated_configuration))
-				{
-					int max_batch = (message_transmission_time_ms > 0)
-						? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-					if(max_batch < 5) max_batch = 5;
-					if(max_batch > nMessages) max_batch = nMessages;
-					int new_batch = radio_batch_size;
-					if(new_batch > max_batch) new_batch = max_batch;
-					set_data_batch_size(new_batch);
-					nominal_batch_size = new_batch;
-				}
-				recalculate_ack_timeout_for_batch();
-				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
-					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
-					is_robust_config(negotiated_configuration) ? 1 : 0);
+				// climb-engine Bug 2 (gearshift-climb-engine.md §3 / data-flow-
+				// batch-size.md): ROBUST/MFSK configs are EXCLUDED from the >=5
+				// floor. load_configuration() (arq_common.cc:1229-1234) deliberately
+				// sets data_batch_size=1 for robust, and its batch-scaling path
+				// (arq_common.cc:1269) is already !is_robust_config-gated. Re-applying
+				// the unconditional SACK floor here clobbers that and forces batch
+				// back to >=5 at ROBUST_0, where a clean all-ones MFSK ACK requires
+				// all 5 frames to survive first-pass at the floor SNR (it never does)
+				// — so the climb never gets a single clean batch to START with. At
+				// batch=1 every delivered MFSK frame is itself an all-ones batch ->
+				// clean ACKs accumulate.
+				//
+				// 4th-wire-failure ROOT CAUSE (data-flow-batch-size.md §4, this fix):
+				// the gate previously read negotiated_configuration, which on a fresh
+				// unpinned `-g -R` connect is still its CTOR DEFAULT CONFIG_0
+				// (arq_common.cc:281) — reset_session_state() only writes it on the
+				// teardown branch (arq_commander.cc:443) and the other writes
+				// (205/297/530) are BREAK-recovery / OFDM-optimizer only, never the
+				// connect path. So is_robust_config(CONFIG_0)=false -> guard bypassed
+				// -> CMD batch=5 while the RSP (current_configuration=ROBUST_0)
+				// correctly kept batch=1 -> first ROBUST_0 block fails the clean-ACK
+				// match -> LINK-TIMEOUT -> climb never starts. FIX: gate on
+				// current_configuration — the live-PHY config, == ROBUST_0 here (set
+				// by the startup load_configuration(data_configuration=ROBUST_0)) and
+				// the EXACT SAME variable+predicate the RSP recompute (arq_responder.cc)
+				// and the Axis-2 robust guard use. Now CMD and RSP read the same var
+				// with the same predicate and CANNOT diverge (an asymmetric override
+				// was historical Bug #9). The set_data_batch_size() chokepoint
+				// (arq_common.cc) is the belt-and-suspenders backstop. OFDM
+				// (CONFIG_0..16) keeps the >=5 floor unchanged.
+				sack_negotiated_recompute_batch("CMD");
 			}
 			else
 			{
@@ -6331,6 +6332,86 @@ int cl_arq_controller::test_climb_engine()
 	// C3: at least 3 promotions fired (ROBUST_0->1, 1->2, 2->CONFIG_0).
 	check(promotions >= 3, "C3 at least 3 consecutive rung promotions fired",
 		promotions, 3);
+
+	// ================================================================
+	// Part D — THE connect-path assertion the FOUR wire failures slipped past
+	// (data-flow-batch-size.md §4/§6). The prior tests hand-set state and never
+	// modeled the REAL unpinned `-g -R` connect, where the two config members
+	// DISAGREE: current_configuration == ROBUST_0 (the live PHY, set by the
+	// startup load_configuration(data_configuration=ROBUST_0) + every robust
+	// control-frame TX) while negotiated_configuration is still its CTOR DEFAULT
+	// CONFIG_0 (arq_common.cc:281 — the connect path NEVER writes it). The 4th
+	// failure was the CMD SACK recompute gating on negotiated_configuration:
+	// is_robust_config(CONFIG_0)=false -> CMD recompute ran -> CMD batch=5, while
+	// the RSP (gating on current_configuration=ROBUST_0) kept batch=1 -> CMD/RSP
+	// mismatch -> the clean all-ones target (1<<batch)-1 never matched (CMD 0x1F
+	// vs RSP 0x1) -> no clean credit -> LINK-TIMEOUT -> climb never started.
+	//
+	// This part drives the REAL production recompute (sack_negotiated_recompute_
+	// batch — the single body BOTH the CMD TEST_CONNECTION_ACK and RSP
+	// TEST_CONNECTION handlers now call) under that exact split state and asserts
+	// CMD batch == RSP batch == 1. FAIL-BEFORE: on 86d39b4 the CMD inline gate
+	// read negotiated_configuration(=CONFIG_0) -> recompute ran -> CMD batch=5 !=
+	// 1 -> D1 FAILS. PASS-AFTER: the gate reads current_configuration(=ROBUST_0)
+	// -> recompute skipped -> batch stays 1 -> D1 PASSES. (Verified by reverting
+	// ONLY the helper predicate to negotiated_configuration: D1 then fails.)
+	// ================================================================
+	sack_enabled    = true;
+	sack_v2_enabled = true;
+	radio_batch_size = 25;          // production default (arq_common.cc:162)
+	nMessages       = 120;          // realistic buffer count (> any batch we test)
+	message_transmission_time_ms = 1000;  // sane non-zero so OFDM scaling is deterministic
+	nominal_batch_size = 1;
+
+	// D1 — CMD side at the connect: current=ROBUST_0 (live PHY), negotiated=
+	// CONFIG_0 (CTOR DEFAULT, the connect-path state). Drive the production CMD
+	// recompute. Robust => batch MUST stay 1.
+	current_configuration    = ROBUST_0;
+	negotiated_configuration = CONFIG_0;   // ctor default — the connect-path value
+	set_data_batch_size(1);                // load_configuration's robust pin
+	sack_negotiated_recompute_batch("CMD");
+	int cmd_robust_batch = data_batch_size;
+	check(cmd_robust_batch == 1,
+		"D1 CMD recompute keeps batch=1 at ROBUST_0 connect (negotiated=CONFIG_0 ctor-default)",
+		cmd_robust_batch, 1);
+
+	// D2 — RSP side, identical connect state. Robust => batch MUST stay 1.
+	current_configuration    = ROBUST_0;
+	negotiated_configuration = CONFIG_0;
+	set_data_batch_size(1);
+	sack_negotiated_recompute_batch("RSP");
+	int rsp_robust_batch = data_batch_size;
+	check(rsp_robust_batch == 1,
+		"D2 RSP recompute keeps batch=1 at ROBUST_0 connect",
+		rsp_robust_batch, 1);
+
+	// D3 — THE invariant: CMD batch == RSP batch == 1 at the robust connect.
+	// This is what the four wire failures violated (CMD=5, RSP=1).
+	check(cmd_robust_batch == rsp_robust_batch && cmd_robust_batch == 1,
+		"D3 CMD batch == RSP batch == 1 at robust connect (the 4-failure invariant)",
+		cmd_robust_batch, rsp_robust_batch);
+
+	// D4 — the chokepoint backstop: even a DIRECT robust over-request (modeling a
+	// future/buggy producer calling the setter) is clamped to 1 by
+	// set_data_batch_size() while current_configuration is robust. This is the
+	// "no current OR future path can bypass" guarantee.
+	current_configuration = ROBUST_0;
+	set_data_batch_size(1);
+	set_data_batch_size(25);   // a rogue robust over-request
+	check(data_batch_size == 1,
+		"D4 chokepoint clamps a direct robust over-request (25) back to 1",
+		data_batch_size, 1);
+
+	// D5 — OFDM connect is UNCHANGED: at CONFIG_10 the recompute scales batch to
+	// the SACK floor (>=5) on both sides. Confirms the fix is robust-only.
+	current_configuration    = CONFIG_10;
+	negotiated_configuration = CONFIG_10;
+	set_data_batch_size(1);
+	sack_negotiated_recompute_batch("CMD");
+	int ofdm_batch = data_batch_size;
+	check(ofdm_batch >= 5,
+		"D5 OFDM (CONFIG_10) recompute scales batch to SACK floor >=5 (fix is robust-only)",
+		ofdm_batch, 5);
 
 	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

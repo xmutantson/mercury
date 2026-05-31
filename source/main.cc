@@ -1838,13 +1838,16 @@ start_modem:
             exit(rc);
         }
         if (test_climb_engine_cli) {
-            // Integrated 3-bug climb regression (one-shot, then exit rc). Drives
-            // the split SACK dedupe (Bug 1), the REAL Axis-2 robust guard
-            // (Bug 2/3), and the end-to-end multi-rung climb (Bug 3 — the
-            // assertion the C1/C2/C3 singles lacked). See
-            // fact-documents/gearshift-climb-engine.md §7.
-            printf("[FLAG] --test-climb-engine: invoking integrated 3-bug climb "
-                   "regression\n");
+            // Integrated climb regression (one-shot, then exit rc). Drives the
+            // split SACK dedupe (Bug 1, Part A), the REAL Axis-2 robust guard
+            // (Bug 2/3, Part B), the end-to-end multi-rung climb (Bug 3, Part C —
+            // the assertion the C1/C2/C3 singles lacked), and the connect-path
+            // CMD/RSP batch symmetry (the 4th wire failure, Part D — the
+            // negotiated_configuration-vs-current_configuration default-init).
+            // See fact-documents/gearshift-climb-engine.md §7 +
+            // data-flow-batch-size.md §6.
+            printf("[FLAG] --test-climb-engine: invoking integrated climb "
+                   "regression (Parts A-D)\n");
             fflush(stdout);
             int rc = ARQ.test_climb_engine();
             printf("[FLAG] Climb-engine test complete (rc=%d) — exiting.\n", rc);

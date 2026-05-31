@@ -314,6 +314,14 @@ public:
   void set_role(int role);
   void calculate_receiving_timeout();
   void recalculate_ack_timeout_for_batch();
+  // SACK-negotiation batch recompute, shared by the CMD (TEST_CONNECTION_ACK)
+  // and RSP (TEST_CONNECTION) handlers so the two sides run IDENTICAL code and
+  // cannot diverge on data_batch_size. Gates on current_configuration (the
+  // live-PHY config — ROBUST_0 on a robust connect, an OFDM config otherwise);
+  // robust ⇒ leave batch at the pinned 1, OFDM ⇒ scale to the 30s/radio_batch
+  // floor. The set_data_batch_size() chokepoint backstops the invariant.
+  // See data-flow-batch-size.md §5. `who` is "CMD"/"RSP" for the log line only.
+  void sack_negotiated_recompute_batch(const char* who);
   void set_call_sign(std::string call_sign);
 
   int get_nOccupied_messages();
