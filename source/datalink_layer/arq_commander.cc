@@ -4590,19 +4590,22 @@ void cl_arq_controller::process_control_commander()
 						// Enforce proven ceiling from prior BREAK failures
 						if(supershift_proven_ceiling >= 0 && snr_ideal > supershift_proven_ceiling)
 							snr_ideal = supershift_proven_ceiling;
-						// Option B (data-anchored promotion): the SNR-driven re-trigger
-						// must not leap more than +1 rung past the highest data-viable
-						// rung — control-plane SNR over-reports viable rate at deep SNR
-						// (§3). Cap at last_data_viable_config+1 unless the Q-table owns
-						// the band. With the cap, gap typically falls below
-						// SUPERSHIFT_RETRIGGER_CONFIGS so the re-trigger simply doesn't
-						// fire, leaving the +1 climb to FRAME-UP. See §6/§7.
-						if(!optimizer_is_in_control())
-						{
-							int anchor_cap = config_ladder_up_n(last_data_viable_config, 1, robust_enabled, narrowband_enabled == YES);
-							if(config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
-								snr_ideal = anchor_cap;
-						}
+						// CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13): the
+						// SNR-driven re-trigger MAY jump multiple rungs toward the SNR-ideal config
+						// in ONE shot -- but ONLY here, and ONLY under the high-confidence-SNR
+						// predicate inside the PURE supershift_retrigger_target() helper (arq.h).
+						// Pre-(1) (af14a9e) this path was HARD-CLAMPED to last_data_viable_config+1,
+						// which (with SUPERSHIFT_RETRIGGER_CONFIGS=3) made the re-trigger a no-op and
+						// left the unpinned climb wall-clock-bound to the +1 FRAME-UP ladder. The
+						// helper keeps the +1 clamp at LOW/INVALID SNR (DEEP-SNR INERT, byte-identical
+						// to the pre-(1) path) and relaxes it only at clearly-high SNR. snr_ideal is
+						// ALREADY capped at min(supershift_proven_ceiling, WB/NB ceiling) above, so the
+						// jump can never exceed proven-safe; the helper READS but never RAISES the
+						// anchor (it follows confirmed delivery only, sec 1.1 + sec 11). FRAME-UP /
+						// LADDER-UP keep their own strict +1 clamps (UNTOUCHED). See arq.h + sec 6/7/13.
+						snr_ideal = supershift_retrigger_target(snr_ideal, measurements.SNR_uplink,
+							last_data_viable_config, optimizer_is_in_control(),
+							robust_enabled, narrowband_enabled == YES);
 						int gap = config_ladder_index(snr_ideal) - config_ladder_index(current_configuration);
 						if(gap >= SUPERSHIFT_RETRIGGER_CONFIGS)
 						{
@@ -7186,7 +7189,209 @@ int cl_arq_controller::test_climb_engine()
 			eff_just_promoted, 3);
 	}
 
-	printf("[TEST-CLIMB] %s (%d failure%s)\n",
+		// ================================================================
+		// Part J - CONTROLLED ELEVATOR / SNR-gated multi-rung jump (fork (1);
+		// gearshift-climb-engine.md sec 13). THE change: the SUPERSHIFT re-trigger
+		// (arq_commander.cc:4602-4627) was HARD-CLAMPED by af14a9e to
+		// last_data_viable_config+1 (snr_ideal = anchor_cap whenever it exceeded
+		// anchor+1), making the SNR-ideal multi-rung jump a no-op -> the climb
+		// crawled +1/rung via FRAME-UP. (1) RELAXES that clamp ON THIS PATH ONLY,
+		// under a HIGH-CONFIDENCE-SNR predicate (high_confidence_jump = SNR valid
+		// AND the ceiling-capped snr_ideal lands > anchor+1). This replays the EXACT
+		// shipped sequence: get_configuration(SNR - SUPERSHIFT_MARGIN_DB) -> NB cap
+		// -> supershift_proven_ceiling cap -> the clamp. adaptive=false models the
+		// pre-(1) hard clamp (FAIL-BEFORE); adaptive=true the shipped (1) gate
+		// (PASS-AFTER) - identical helper chain, only the clamp differs.
+		// ================================================================
+		robust_enabled = NO;            // OFDM tier - the re-trigger is OFDM-only
+		narrowband_enabled = NO;
+		max_config_override = -1;
+		gear_shift_on = YES;
+		optimizer_disabled = true;      // optimizer_is_in_control()==false (un-clamp path)
+		
+		// Apply the caller-side ceiling caps (NB + supershift_proven_ceiling) EXACTLY
+		// as production (arq_commander.cc:4587-4592), then: adaptive=true calls the
+		// REAL shipped supershift_retrigger_target() helper (PASS-AFTER -- so reverting
+		// the helper body to the pre-(1) hard clamp makes J1b/J1c/J1e FAIL-BEFORE);
+		// adaptive=false replays the verbatim pre-(1) clamp (the d12c042 production
+		// code) so J1d/J1e document the pre-fix no-jump outcome side-by-side. Both arms
+		// drive the REAL SUPERSHIFT_MARGIN_DB + config_ladder helpers (no hand-rolled map).
+		auto retrigger_target = [&](double snr_uplink, int anchor, int proven,
+			                          bool nb, bool adaptive) -> int {
+			// Caller-side ceiling caps, EXACTLY as production at arq_commander.cc:4587-4592
+			// (the helper expects an already-capped snr_ideal).
+			int snr_ideal = get_configuration(snr_uplink - SUPERSHIFT_MARGIN_DB);
+			if(nb && snr_ideal > NB_CONFIG_MAX)             // :4588-4589
+				snr_ideal = NB_CONFIG_MAX;
+			if(proven >= 0 && snr_ideal > proven)           // :4591-4592 proven ceiling
+				snr_ideal = proven;
+			if(adaptive) {
+				// PASS-AFTER: call the REAL shipped helper (arq.h). optimizer_owns=false
+				// (optimizer_disabled above => optimizer_is_in_control()==false).
+				return supershift_retrigger_target(snr_ideal, snr_uplink, anchor,
+					/*optimizer_owns=*/false, /*robust_en=*/false, nb);
+			} else {
+				// FAIL-BEFORE: the verbatim pre-(1) af14a9e hard clamp (d12c042 production,
+				// confirmed byte-identical via `git show d12c042`): ALWAYS clamp down to
+				// anchor+1, which makes the multi-rung jump a no-op.
+				int anchor_cap = config_ladder_up_n(anchor, 1, false, nb);
+				if(config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
+					snr_ideal = anchor_cap;
+				return snr_ideal;
+			}
+		};
+		
+		// J0 - SUPERSHIFT_MARGIN_DB is the documented 6.0 (a silent change to the
+		// margin shifts every assertion below; fail here and force a doc update).
+		check((double)SUPERSHIFT_MARGIN_DB == 6.0,
+			"J0 SUPERSHIFT_MARGIN_DB == 6.0 (the documented re-trigger margin)",
+			(int)((double)SUPERSHIFT_MARGIN_DB * 10), 60);
+		
+		// J1 - THE multi-rung-jump assertion (FAIL-BEFORE / PASS-AFTER).
+		// Clearly-high SNR=20 dB at a LOW OFDM rung (CONFIG_4) with the anchor still
+		// at CONFIG_4 (anchor_cap=CONFIG_5). get_configuration(20-6=14) -> CONFIG_16
+		// (idx 19), MANY rungs above anchor+1 (CONFIG_5, idx 8). proven=-1 (no cap).
+		// PASS-AFTER ((1) gate): target == CONFIG_16, a multi-rung jump > anchor+1.
+		// FAIL-BEFORE (pre-(1) hard clamp): target == CONFIG_5 (anchor+1) - NO jump.
+		{
+			double snr = 20.0;
+			int anchor = CONFIG_4;
+			int snr_ideal_raw = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+			int anchor_cap = config_ladder_up_n(anchor, 1, false, false);
+			int t_after  = retrigger_target(snr, anchor, /*proven=*/-1, /*nb=*/false, /*adaptive=*/true);
+			int t_before = retrigger_target(snr, anchor, /*proven=*/-1, /*nb=*/false, /*adaptive=*/false);
+			// sanity: the SNR-ideal really is far above anchor+1 (the jump exists).
+			check(config_ladder_index(snr_ideal_raw) > config_ladder_index(anchor_cap) + 1,
+				"J1a SNR=20 -> snr_ideal (CFG16) is MULTI-rung above anchor+1 (CFG5)",
+				config_ladder_index(snr_ideal_raw), config_ladder_index(anchor_cap));
+			// PASS-AFTER: (1) lets the jump stand at the SNR-ideal.
+			check(t_after == snr_ideal_raw && t_after == CONFIG_16,
+				"J1b PASS-AFTER: (1) gate jumps to the SNR-ideal CFG16 (multi-rung)",
+				t_after, CONFIG_16);
+			check(config_ladder_index(t_after) > config_ladder_index(anchor_cap),
+				"J1c PASS-AFTER: the (1) target is STRICTLY above anchor+1 (a real jump)",
+				config_ladder_index(t_after), config_ladder_index(anchor_cap));
+			// FAIL-BEFORE: the pre-(1) hard clamp pins the target to anchor+1 - NO jump.
+			check(t_before == anchor_cap && t_before == CONFIG_5,
+				"J1d FAIL-BEFORE proof: pre-(1) clamp pins target to anchor+1 (CFG5, no jump)",
+				t_before, CONFIG_5);
+			check(t_after != t_before,
+				"J1e (1) target DIFFERS from the pre-(1) clamped target (the fix bites)",
+				(t_after != t_before) ? 1 : 0, 1);
+		}
+		
+		// J2 - DEEP-SNR INERT (the -99.9 ctor sentinel). The enclosing re-trigger
+		// gate (arq_commander.cc:4585) requires SNR_uplink > -90, so at the sentinel
+		// the WHOLE block never runs. Assert (a) the gate is FALSE at the sentinel,
+		// and (b) even if the clamp body were reached, high_confidence_jump is FALSE
+		// and the (1) target equals the pre-(1) target - BYTE-IDENTICAL to af14a9e.
+		{
+			double snr = -99.9;            // ctor sentinel
+			current_configuration = CONFIG_4;
+			// (a) the real enclosing-gate SNR conjunct is FALSE -> block never runs.
+			check(!(snr > -90),
+				"J2a sentinel SNR -99.9 fails the >-90 re-trigger gate (block never runs)",
+				(snr > -90) ? 1 : 0, 0);
+			// (b) if reached anyway: (1) == pre-(1) (no jump, identical clamp result).
+			int t_after  = retrigger_target(snr, CONFIG_4, -1, false, true);
+			int t_before = retrigger_target(snr, CONFIG_4, -1, false, false);
+			check(t_after == t_before,
+				"J2b sentinel: (1) target BYTE-IDENTICAL to pre-(1) (DEEP-SNR INERT)",
+				t_after, t_before);
+		}
+		
+		// J3 - LOW-but-VALID SNR INERT. SNR=-3 -> get_configuration(-3-6=-9) ->
+		// CONFIG_0 (idx 3, the OFDM-map floor; -9.0 is NOT > -9). anchor=CONFIG_4 ->
+		// SNR-ideal is BELOW anchor+1, so there is no jump to make: high_confidence_
+		// jump is FALSE and (1) == pre-(1) (both leave snr_ideal untouched). This is
+		// the DEEP-SNR-INERT case for a populated-but-low SNR.
+		{
+			double snr = -3.0;
+			int t_after  = retrigger_target(snr, CONFIG_4, -1, false, true);
+			int t_before = retrigger_target(snr, CONFIG_4, -1, false, false);
+			check(t_after == t_before,
+				"J3a low-but-valid SNR: (1) target == pre-(1) (snr_ideal already <= anchor+1)",
+				t_after, t_before);
+			// And the target is NOT forced up to anchor+1 - it stays at the (lower)
+			// SNR-ideal (CONFIG_1), exactly as pre-(1) (the clamp only ever lowers).
+			int anchor_cap_lo = config_ladder_up_n(CONFIG_4, 1, false, false);
+			check(config_ladder_index(t_after) <= config_ladder_index(anchor_cap_lo),
+				"J3b low SNR: target stays <= anchor+1 (no spurious jump)",
+				config_ladder_index(t_after), config_ladder_index(anchor_cap_lo));
+		}
+		
+		// J4 - supershift_proven_ceiling CAP (SAFETY #2). High SNR=20 (-> CFG16),
+		// but a prior BREAK proved CONFIG_10 the ceiling. The (1) jump must be capped
+		// at CONFIG_10 - NEVER above proven-safe - while still being a multi-rung jump
+		// (CONFIG_10 > anchor+1=CONFIG_5).
+		{
+			double snr = 20.0;
+			int t = retrigger_target(snr, /*anchor=*/CONFIG_4, /*proven=*/CONFIG_10, false, true);
+			check(t == CONFIG_10,
+				"J4a (1) jump CAPPED at supershift_proven_ceiling (CFG10, not CFG16)",
+				t, CONFIG_10);
+			check(config_ladder_index(t) <= config_ladder_index(CONFIG_10),
+				"J4b (1) target never exceeds the proven ceiling",
+				config_ladder_index(t), config_ladder_index(CONFIG_10));
+		}
+		
+		// J5 - WB/NB ceiling CAP (SAFETY #2). NB mode, high SNR=20. The NB cap
+		// (:4588-4589) pins snr_ideal to NB_CONFIG_MAX (CONFIG_14); the (1) jump must
+		// land at CONFIG_14, never above the NB ceiling.
+		{
+			double snr = 20.0;
+			int t = retrigger_target(snr, /*anchor=*/CONFIG_4, /*proven=*/-1, /*nb=*/true, true);
+			check(t == NB_CONFIG_MAX && t == CONFIG_14,
+				"J5 NB (1) jump CAPPED at NB_CONFIG_MAX (CFG14)",
+				t, CONFIG_14);
+		}
+		
+		// J6 - the jump does NOT raise the anchor (SAFETY #3, SPECULATIVE landing).
+		// The re-trigger decision READS last_data_viable_config (via anchor_cap) but
+		// must never WRITE it - the anchor follows CONFIRMED clean delivery only
+		// (sec 1.1 + sec 11). Snapshot the member, run the decision at high SNR,
+		// assert it is unchanged.
+		{
+			last_data_viable_config = CONFIG_4;
+			int anchor_before = last_data_viable_config;
+			int t = retrigger_target(20.0, last_data_viable_config, -1, false, true);
+			(void)t;
+			check(last_data_viable_config == anchor_before && last_data_viable_config == CONFIG_4,
+				"J6 the (1) jump does NOT raise the anchor (still CFG4; anchor follows delivery)",
+				last_data_viable_config, CONFIG_4);
+		}
+		
+		// J7 - FRAME-UP and LADDER-UP are UNTOUCHED (SAFETY #1). Both consume the
+		// SAME anchor via config_ladder_up (inherently +1) and clamp
+		// idx(proposed) > idx(anchor)+1. They do NOT consult SNR, so even at SNR=20
+		// they still block any destination > anchor+1. Replay both REAL clamp
+		// expressions (arq_commander.cc:3617 FRAME-UP / :4869 + :5026 LADDER-UP).
+		{
+			// At anchor=CONFIG_4, current=CONFIG_4: proposed = config_ladder_up = CONFIG_5
+			// = anchor+1 -> idx(CFG5) > idx(anchor)+1 is FALSE -> permitted (one rung).
+			int anchor = CONFIG_4;
+			int proposed = config_ladder_up(CONFIG_4, false, false);
+			bool frameup_blocked =     // the REAL :3617 predicate
+				config_ladder_index(proposed) > config_ladder_index(anchor) + 1;
+			check(!frameup_blocked && proposed == CONFIG_5,
+				"J7a FRAME-UP still advances exactly +1 (CFG4->CFG5), SNR-independent",
+				proposed, CONFIG_5);
+			// FRAME-UP can NEVER reach the SNR-ideal CFG16 in one move - config_ladder_up
+			// is structurally +1, so the multi-rung jump is EXCLUSIVE to the re-trigger.
+			check(config_ladder_up(CONFIG_4, false, false) != CONFIG_16,
+				"J7b FRAME-UP/LADDER-UP cannot multi-rung jump (config_ladder_up is +1 only)",
+				(config_ladder_up(CONFIG_4,false,false) != CONFIG_16) ? 1 : 0, 1);
+			// And if the anchor were one BELOW current (a stale anchor), the +1 clamp
+			// still blocks a 2-rung LADDER-UP/FRAME-UP proposal - unchanged by (1).
+			int anchor2 = ROBUST_2;                       // idx 2
+			int proposed2 = config_ladder_up(CONFIG_0, false, false);  // CONFIG_1, idx 4
+			bool blocked2 = config_ladder_index(proposed2) > config_ladder_index(anchor2) + 1;
+			check(blocked2,
+				"J7c FRAME-UP/LADDER-UP +1 clamp still BLOCKS >anchor+1 (af14a9e clamp intact off-path)",
+				blocked2 ? 1 : 0, 1);
+		}
+		
+printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

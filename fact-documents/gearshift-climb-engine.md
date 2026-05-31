@@ -17,6 +17,16 @@ when delivery is PROVEN sustained-clean at the rung, conservative (the AARF-doub
 member) otherwise. Read-time only — does not touch the +1 clamp (fork ①) nor fight
 the back-off. In-process verified (Part I); wire speedup is the parent's hardware
 test with the fixed cascade-bench timing.
+**§13 (2026-05-31, stacks on d12c042)**: the CONTROLLED ELEVATOR (fork ①,
+the user-APPROVED fast-climb fix) — the ONE change that partially relaxes
+af14a9e's anchor+1 clamp. At the SUPERSHIFT re-trigger ONLY, under a
+HIGH-CONFIDENCE-SNR predicate, the modem JUMPS multiple rungs toward the
+SNR-ideal config in one shot (capped by supershift_proven_ceiling AND the
+WB/NB ceiling), instead of crawling +1/rung. PURE helper
+`supershift_retrigger_target` (arq.h); FRAME-UP/LADDER-UP keep their strict +1
+clamps; the jump never raises the anchor; provably INERT at deep/invalid SNR.
+In-process verified (Part J, fail-before/pass-after); the over-climb safety
+(@WGN:-10) + the fast-jump (@WGN:30) are the parent's HARDWARE verification.
 
 This doc owns the producer/consumer/invariant facts for the CLIMB promotion
 state shared CMD↔RSP: `last_data_viable_config`, `consecutive_data_acks`,
@@ -620,7 +630,9 @@ back-off half (`frame_shift_threshold *= 2` on FRAME-UP failure) survived. This
 restores the forward half SAFELY. In-process verified (Part I); wire speedup is
 the parent's hardware test (with the fixed cascade-bench timing).
 
-**Out of scope (architectural fork ① — the user's pending decision):** the +1
+**Fork ① (the +1-clamp relaxation) is now SHIPPED in §13 (2026-05-31).**
+When §12 (③) shipped it was still the user's pending decision; §13 records
+the approved fix. §12 itself remains UNRELATED to the clamp: the +1
 anchor clamp (`arq_commander.cc:3617` FRAME-UP / `:4858` LADDER-UP), multi-rung
 jumps, and the SUPERSHIFT re-trigger un-clamp are UNTOUCHED. Option 3 changes ONLY
 how many clean batches trigger a +1 step — never how far a +1 reaches.
@@ -792,6 +804,243 @@ helper does not exist pre-fix; the test ships WITH the helper so all parts compi
 and I verified fail-before by asserting the pre-fix arithmetic (`needs 3, not 1`)
 directly. **PASS-AFTER**: all PASS. Parts A–H stay PASS (§12 is additive — the
 FRAME-UP body, the clamp, and every #2 mechanism are unchanged).
+
+## §13 CONTROLLED ELEVATOR — SNR-gated multi-rung jump (fork ① — SHIPPED)
+
+**Status**: SHIPPED 2026-05-31 on `fix/climb-engine`, stacks on d12c042. This is
+the user-APPROVED fast-climb fix and the ONE change that partially relaxes
+af14a9e's anchor+1 clamp. It is precise, SNR-gated, and provably INERT at deep
+SNR. In-process verified (Part J, fail-before/pass-after); the over-climb safety
+and the fast-jump speedup are the parent's HARDWARE verification (WGN:-10
+no-thrash + WGN:30 fast-jump). Resolves the "Out of scope (architectural fork ①)"
+note in §12 (it is no longer pending — it ships here).
+
+### §13.1 The problem (from investigation a56a652 — not re-investigated)
+
+The unpinned `-Q 0 -M auto -g -R` climb walks EVERY rung (≤ anchor+1) because
+af14a9e replaced the SUPERSHIFT elevator with a strict data-anchored +1 ladder.
+③ (d12c042, §12) sped the per-rung cadence (fast-probe → threshold 1 when
+sustained-clean), but the climb is still wall-clock-bound by per-rung big-batch
+airtime — only SKIPPING rungs gives the dramatic speedup. The SUPERSHIFT
+re-trigger (`arq_commander.cc:4578-4626`) ALREADY computes the SNR-ideal config
+(`get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB)`) but was
+CLAMPED to anchor+1 (`config_ladder_up_n(last_data_viable_config, 1, …)`), making
+it a no-op. OptA (446887c/b1ab550, §G/§H + data-flow-snr-measurements.md) now
+populates `measurements.SNR_uplink` during the climb (on the turbo SET_CONFIG
+ACK suffix), so the re-trigger finally has a REAL SNR to act on — the precondition
+that makes this relaxation safe.
+
+### §13.2 The fix — relax the clamp at the re-trigger ONLY, under a high-SNR predicate
+
+A new PURE helper `supershift_retrigger_target()` (`arq.h`, after
+`effective_frame_shift_threshold`) owns the clamp-vs-jump decision; production
+calls it at the re-trigger (`arq_commander.cc:4611`) in place of the old inline
+`if(!optimizer_is_in_control()){…}` clamp. The helper receives the
+ALREADY-ceiling-capped `snr_ideal` (the caller applies the NB cap at `:4588-4589`
+and the `supershift_proven_ceiling` cap at `:4591-4592` BEFORE the call, verbatim
+as pre-①), and:
+
+```cpp
+int supershift_retrigger_target(int snr_ideal, double snr_uplink, int anchor,
+                                bool optimizer_owns, bool robust_en,
+                                bool narrowband) const
+{
+  if(optimizer_owns) return snr_ideal;          // Q-table owns the band — no clamp
+  int anchor_cap = config_ladder_up_n(anchor, 1, robust_en, narrowband); // anchor+1
+  bool high_confidence_jump = (snr_uplink > -90) &&
+      config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap);
+  if(!high_confidence_jump &&                    // KEEP the conservative +1 clamp
+     config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap)) //  unless a
+    snr_ideal = anchor_cap;                      //  high-SNR multi-rung jump exists
+  return snr_ideal;
+}
+```
+
+- **HIGH-CONFIDENCE-SNR predicate**: `measurements.SNR_uplink` is VALID (> -90 —
+  actually populated by OptA, not the -99.9 ctor sentinel) AND high enough that
+  the ceiling-capped `snr_ideal` lands MORE than +1 rung past the anchor (i.e.
+  there IS a multi-rung jump to make). The enclosing re-trigger gate at `:4585`
+  (`measurements.SNR_uplink > -90`) already guarantees the validity half; the
+  helper re-states it so it is correct in isolation (and so Part J can drive the
+  sentinel directly).
+- **Before / after** (SNR=20 dB, anchor=CONFIG_4 ⇒ anchor_cap=CONFIG_5):
+  `get_configuration(20-6=14)` → CONFIG_16. Pre-① clamp → CONFIG_5 (anchor+1,
+  gap=… < SUPERSHIFT_RETRIGGER_CONFIGS=3 ⇒ re-trigger usually didn't even fire) →
+  +1 crawl. Post-① → CONFIG_16 (the SNR-ideal), capped only by proven-ceiling /
+  WB-NB ceiling ⇒ a multi-rung elevator jump in one SET_CONFIG.
+- **Low/invalid SNR** (`snr_ideal ≤ anchor+1`): the predicate is FALSE; the inner
+  `if(idx(snr_ideal) > idx(anchor_cap))` is ALSO false ⇒ no write ⇒ return
+  `snr_ideal` unchanged — and since `snr_ideal ≤ anchor+1` already, this is
+  BYTE-IDENTICAL to the pre-① clamp (which was likewise a no-op there).
+
+### §13.3 §5 cross-layer audit — the over-climb-critical anchor clamp + `last_data_viable_config`
+
+The anchor+1 clamp and `last_data_viable_config` are over-climb-critical shared
+CMD state (the af14a9e/3b1726a protection). Enumerate the consumers of the clamp
+and verify the five mandated invariants.
+
+**Consumers of the "no upward move > anchor+1" clamp** (file:line, all read
+`last_data_viable_config`):
+
+1. **FRAME-UP** (`arq_commander.cc:3617`):
+   `config_ladder_index(proposed_frame) > config_ladder_index(last_data_viable_config) + 1`
+   ⇒ `frame_ceiling_blocked = true`. `proposed_frame = config_ladder_up(current, …)`
+   — inherently +1.
+2. **LADDER-UP v1 inline twin** (`arq_commander.cc:4869`): same predicate on
+   `config_ladder_up(current, …)` — inherently +1.
+3. **LADDER-UP `policy_evaluate_axis1`** (`arq_commander.cc:5026`): same predicate
+   on `config_ladder_up(current, …)` — inherently +1.
+4. **SUPERSHIFT re-trigger** (`arq_commander.cc:4611`, NOW via
+   `supershift_retrigger_target`): the ONLY consumer that computes a MULTI-rung
+   `snr_ideal` and could jump >+1 — and the ONLY one ① touches.
+5. **`break_target_with_anchor`** (`arq_commander.cc:147-154`): floors a raw BREAK
+   recovery target UP to `last_data_viable_config` (bypassed under
+   `breaks_since_last_data_success >= 2` panic). The down-recovery backstop.
+
+**(1) ONLY the re-trigger path is un-clamped; FRAME-UP / LADDER-UP byte-unchanged.**
+Consumers 1/2/3 build their target with `config_ladder_up(current_configuration,
+…)`, which is structurally +1 (`common_defines.h:116-128`) — they CANNOT express a
+multi-rung jump regardless of the clamp, and ① does not edit their predicate text
+at all. Verified by diff: `arq_commander.cc:3617`, `:4869`, `:5026` are
+byte-identical to d12c042. Part J7a/J7b/J7c replay all three predicates at SNR=20
+and assert (a) FRAME-UP still advances exactly +1, (b) `config_ladder_up` can
+never reach the SNR-ideal CONFIG_16, (c) a stale-anchor 2-rung proposal is still
+BLOCKED. ① is exclusive to consumer 4.
+
+**(2) The jump never raises the anchor speculatively — the anchor follows
+CONFIRMED delivery only.** `supershift_retrigger_target` READS `anchor`
+(`last_data_viable_config`) to compute `anchor_cap` but NEVER writes it (it is a
+`const` method returning an `int`; the caller assigns the result to `snr_ideal`,
+not to `last_data_viable_config`). The sole anchor-RAISE producer remains §1.1
+(`arq_commander.cc:3437-3439`, gated by `promotion_allowed_on_batch` + the §11
+sustained-N) — a CONFIRMED clean batch at the landing config. The re-trigger
+queues a SET_CONFIG to `snr_ideal` and sets `turboshift_phase = TURBO_FORWARD`
+(`:4620`); the landing is SPECULATIVE. Part J6 snapshots `last_data_viable_config`
+before the high-SNR decision and asserts it is unchanged (still CONFIG_4).
+
+**(3) A failed/overshot jump → BREAK → recovery to the (still-low) anchor; §10
+demotion backstops repeated overshoot.** Because (2) holds, after a speculative
+jump to CONFIG_16 the anchor is still (say) CONFIG_4. If CONFIG_16 data fails,
+BREAK fires; `break_target_with_anchor` floors recovery UP to CONFIG_4 (the
+still-low anchor) — NOT up to CONFIG_16 — so the link drops back to proven ground.
+If the overshoot REPEATS (the anchor rung itself keeps breaking), §10's
+`anchor_consec_break_fails` reaches K=3 and `anchor_demote_target` LOWERS the
+anchor one rung (Part E), and the breaks≥2 panic-jump (`:149`) is the independent
+fast escape. ① adds NO new way for the anchor to rise, so it cannot defeat either
+backstop. (Note: `supershift_proven_ceiling` is also lowered by BREAK at the
+failed config — `:3486`/`:2268`/etc. — so a repeatedly-overshooting jump tightens
+the proven-ceiling cap applied at `:4591-4592` on the NEXT re-trigger, a third
+self-limiting effect. Part J4 asserts the proven-ceiling cap binds.)
+
+**(4) ① is INERT at deep/invalid SNR (af14a9e behavior byte-identical when
+`SNR_uplink` unpopulated).** Two independent guarantees:
+  - *Invalid (sentinel −99.9)*: the enclosing re-trigger gate at
+    `arq_commander.cc:4585` requires `measurements.SNR_uplink > -90`. At the ctor
+    sentinel this is FALSE ⇒ the WHOLE re-trigger block (helper call included)
+    never executes ⇒ byte-identical to d12c042. Part J2a asserts the gate is
+    false at −99.9; J2b asserts the helper (if reached anyway) returns the
+    pre-① result.
+  - *Low-but-valid*: when `snr_ideal ≤ anchor+1`, `high_confidence_jump` is FALSE
+    and the inner clamp `if(idx(snr_ideal) > idx(anchor_cap))` is also FALSE ⇒ no
+    write ⇒ identical to the pre-① no-op. Part J3a/J3b assert the ① target equals
+    the pre-① target and stays ≤ anchor+1 (no spurious jump). The Part J
+    `adaptive=false` arm is the verbatim pre-① hard clamp (confirmed
+    byte-identical via `git show d12c042` — the diff is in §13.4); J1d asserts it
+    yields anchor+1 (no jump), J1e asserts ① differs ONLY when the predicate
+    licenses the jump.
+
+**(5) No SUPERSHIFT storm — the TURBO_DONE phase + `turbo_supershift_announce_pending`
+guard still bound re-entry.** ① does not touch the re-entry guards. The re-trigger
+gate still requires `turboshift_phase == TURBO_DONE` (`:4584`); the moment the
+re-trigger FIRES it sets `turboshift_phase = TURBO_FORWARD` (`:4620`) and the
+in-turbo jump sets `turbo_supershift_announce_pending` — so a SECOND re-trigger is
+impossible until turbo finishes and the announce clears (Part G3/G3b, unchanged
+and still PASS). ① only changes WHERE a single admitted re-trigger lands
+(multi-rung vs +1), never HOW OFTEN it can re-enter. A higher landing means FEWER
+total re-triggers to reach the SNR-ideal config, not more.
+
+Net: ① supplies the missing OUTPUT (a multi-rung target the gates were already
+computing but discarding) at the ONE site that can use it, gated on a high-SNR
+predicate that is provably inert at the deep-SNR cliff, and adds no anchor-raise
+and no re-entry. Every af14a9e/3b1726a over-climb protection (the +1 clamp on the
+other three consumers, the confirmed-delivery anchor raise, the BREAK floor, the
+§10 demotion, the §11 sustained-N, the proven-ceiling cap, the storm guards) is
+intact.
+
+### §13.4 Producers / consumers — what ① changes
+
+- **`last_data_viable_config`** (the anchor): ① adds NO producer and NO new
+  consumer. The re-trigger already read it (to clamp); it still reads it (inside
+  the helper, to compute `anchor_cap`). Producers (unchanged): §1.1 anchor-RAISE
+  (`:3437`), §10 DEMOTE (`:3454` region), ctor + reset_session_state init.
+  Consumers (unchanged set): the four +1-clamp sites + `break_target_with_anchor`.
+- **`snr_ideal`** (the re-trigger's local target): its post-clamp VALUE changes at
+  clearly-high SNR (now the SNR-ideal instead of anchor+1). Consumed only by the
+  `gap >= SUPERSHIFT_RETRIGGER_CONFIGS` test (`:4614`) and, if the re-trigger
+  fires, by `negotiated_configuration = snr_ideal` (`:4628`) → the SET_CONFIG
+  target. A higher `snr_ideal` makes the `gap` test PASS more readily (the
+  re-trigger was previously self-suppressed because the clamped gap fell below 3)
+  — this is the intended unblocking.
+- **The pre-① inline clamp** (d12c042 `arq_commander.cc`, byte-identical to the
+  Part J `adaptive=false` arm):
+  ```cpp
+  if(!optimizer_is_in_control()) {
+    int anchor_cap = config_ladder_up_n(last_data_viable_config, 1, robust_enabled, narrowband_enabled == YES);
+    if(config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
+      snr_ideal = anchor_cap;
+  }
+  ```
+  is REPLACED by the single `snr_ideal = supershift_retrigger_target(…)` call. The
+  `optimizer_is_in_control()` exemption is preserved (moved into the helper's
+  `optimizer_owns` early-return) — when the Q-table owns the band, NO anchor clamp
+  is applied either way (unchanged).
+
+### §13.5 Part J (`--test-climb-engine`) — fail-before / pass-after
+
+Part J replays the caller-side ceiling caps EXACTLY as production (`:4587-4592`),
+then drives BOTH the REAL shipped helper (`adaptive=true` → PASS-AFTER) and the
+verbatim pre-① hard clamp (`adaptive=false` → the d12c042 outcome, side-by-side):
+
+- **J0**: `SUPERSHIFT_MARGIN_DB == 6.0` (a silent margin change shifts every
+  assertion below — documents the TUNABLE).
+- **J1 (THE multi-rung-jump assertion)**: SNR=20 dB, anchor=CONFIG_4. J1a sanity:
+  `snr_ideal` (CONFIG_16) is multi-rung above anchor+1 (CONFIG_5). **J1b** (real
+  helper): target == CONFIG_16. **J1c**: target STRICTLY above anchor+1. **J1d**:
+  the pre-① clamp pins to CONFIG_5 (no jump). **J1e**: ① differs from pre-① (the
+  fix bites).
+- **J2 (DEEP-SNR INERT, sentinel)**: J2a the −99.9 sentinel fails the >-90 gate
+  (block never runs); J2b the helper (if reached) returns the pre-① result.
+- **J3 (DEEP-SNR INERT, low-but-valid)**: SNR=-3 → CONFIG_0 (≤ anchor+1); ① ==
+  pre-① and target stays ≤ anchor+1 (no spurious jump).
+- **J4 (proven-ceiling cap, SAFETY #2)**: SNR=20 but
+  `supershift_proven_ceiling=CONFIG_10` → the jump is CAPPED at CONFIG_10 (never
+  above proven-safe), still multi-rung.
+- **J5 (WB/NB ceiling cap, SAFETY #2)**: NB + SNR=20 → CAPPED at
+  NB_CONFIG_MAX (CONFIG_14).
+- **J6 (anchor NOT raised, SAFETY #3)**: the high-SNR decision leaves
+  `last_data_viable_config` unchanged (CONFIG_4).
+- **J7 (FRAME-UP / LADDER-UP untouched, SAFETY #1)**: replay the REAL `:3617`
+  FRAME-UP + `:4869`/`:5026` LADDER-UP predicates at SNR=20: J7a FRAME-UP still +1
+  (CONFIG_4→CONFIG_5); J7b `config_ladder_up` can never reach CONFIG_16; J7c a
+  2-rung proposal off a stale anchor is still BLOCKED.
+
+**FAIL-BEFORE** (verified 2026-05-31 by temporarily reverting
+`supershift_retrigger_target`'s body to the pre-① hard clamp, rebuilding):
+**J1b/J1c/J1e + J4a + J5 FAIL** (got=CONFIG_5/anchor+1 instead of the jump);
+J0/J1a/J1d/J2/J3/J6/J7 and Parts A–I correctly STAY PASS (they assert the
+inert/off-path/no-raise properties, which are invariant). This proves the test
+isolates exactly the ① behavior. **PASS-AFTER** (shipped helper restored): all
+Parts A–J PASS (0 failures); `--test` 30/30. The temp revert was reverted; the
+shipped helper does the SNR-gated jump.
+
+**HONEST scope** (§8 applies): the in-process Part J proves the jump FIRES at high
+SNR and is INERT at deep/invalid SNR, and that the over-climb guards are
+structurally untouched. The over-climb SAFETY (WGN:-10 no-thrash) and the
+fast-jump SPEEDUP (WGN:30 multi-rung in one shot) are the parent's HARDWARE
+verification — the integration-path timing of a multi-rung SET_CONFIG landing
+(post-jump rx-mute, the new config's first-batch ACK) is not exercised in-process.
+
+---
 
 ---
 

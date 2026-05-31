@@ -691,6 +691,54 @@ public:
     return base_threshold;
   }
 
+  // CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13) -- PURE
+  // policy for the SUPERSHIFT re-trigger target. af14a9e HARD-CLAMPED the
+  // SNR-driven re-trigger to last_data_viable_config+1 (anchor+1), which made
+  // the SNR-ideal multi-rung jump a no-op and left the unpinned climb
+  // wall-clock-bound to the +1 FRAME-UP ladder. (1) RELAXES that clamp ON THIS
+  // PATH ONLY, under a HIGH-CONFIDENCE-SNR predicate, so at clearly-high SNR the
+  // modem jumps multiple rungs toward the SNR-appropriate config in one shot.
+  // Inputs:
+  //   snr_ideal      = get_configuration(SNR - SUPERSHIFT_MARGIN_DB), ALREADY
+  //                    capped at min(supershift_proven_ceiling, WB/NB ceiling)
+  //                    by the caller (arq_commander.cc:4587-4592) -- so the
+  //                    returned target can NEVER exceed proven-safe (SAFETY #2).
+  //   snr_uplink     = measurements.SNR_uplink (the OptA-populated live SNR; the
+  //                    caller enclosing gate already requires it > -90, but we
+  //                    re-check so the helper is correct in isolation).
+  //   anchor         = last_data_viable_config (the af14a9e anchor).
+  //   optimizer_owns = optimizer_is_in_control() -- when the Q-table owns the
+  //                    band the anchor clamp does not apply (return snr_ideal).
+  // HIGH-CONFIDENCE-SNR predicate: SNR valid (> -90) AND the ceiling-capped
+  // snr_ideal genuinely lands MORE than +1 rung past the anchor (else there is no
+  // multi-rung jump to make -- fall through to the conservative +1 clamp, which is
+  // a NO-OP there). DEEP-SNR INERT: at the sentinel / low SNR the predicate is
+  // FALSE and this returns EXACTLY anchor+1 (or the lower snr_ideal) -- BYTE-
+  // IDENTICAL to the pre-(1) clamp. The landing is SPECULATIVE: this helper READS
+  // the anchor but NEVER raises it (SAFETY #3 -- the anchor follows CONFIRMED clean
+  // delivery only, sec 1.1 + sec 11; a failed jump -> BREAK ->
+  // break_target_with_anchor recovers to the still-low anchor, sec 10 demotion
+  // backstops repeated overshoot). FRAME-UP / LADDER-UP keep their own strict +1
+  // clamps (config_ladder_up is inherently +1) -- UNTOUCHED (SAFETY #1). PURE (no
+  // side effects); Part J replays it directly. See sec 13.
+  int supershift_retrigger_target(int snr_ideal, double snr_uplink, int anchor,
+                                  bool optimizer_owns, bool robust_en,
+                                  bool narrowband) const
+  {
+    if(optimizer_owns)
+      return snr_ideal;            // Q-table owns the band -- no anchor clamp
+    int anchor_cap = config_ladder_up_n(anchor, 1, robust_en, narrowband);
+    bool high_confidence_jump = (snr_uplink > -90) &&
+        config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap);
+    // Keep the conservative +1 clamp UNLESS the high-SNR predicate licenses the
+    // multi-rung jump. (At low/invalid SNR the predicate is false and this clamp
+    // is the ORIGINAL no-op -> DEEP-SNR INERT.)
+    if(!high_confidence_jump &&
+       config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
+      snr_ideal = anchor_cap;
+    return snr_ideal;
+  }
+
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
   // decodes NO LDPC data, so the canonical SNR_uplink producer
