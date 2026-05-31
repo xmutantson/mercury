@@ -310,6 +310,7 @@ int main(int argc, char *argv[])
     double ack_metric_threshold_cli = -1; // --ack-metric-threshold=F: <0 = default(0.5)
     int emergency_nack_cli = -1;       // --emergency-nack=N: -1=default(3), >=0=override
     int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
+    int mfsk_demap_cli = -1;           // --mfsk-demap=linear|bessel: -1=default(bessel), 0=linear, 1=bessel-I0
     double mean_h_gate_cli = -1;       // --mean-h-gate=F: <0=default(0.30), 0..=override
     double psk_var_floor_cli = -1;     // --psk-var-floor=F: <0=default(0.001), 0..=override
     double energy_gate_floor_cli = -1; // --energy-gate-floor=F: <0=default(1e-12), 0..=override
@@ -609,6 +610,18 @@ int main(int argc, char *argv[])
         else if (strncmp(argv[i], "--wb-match-threshold-bias=", 26) == 0)
         {
             wb_match_bias_cli = atoi(argv[i] + 26);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--mfsk-demap=", 13) == 0)
+        {
+            // A.0.1 Phase A: noncoherent-FSK soft-demap metric selector.
+            // bessel (default) = log I0(2*sqrt(E/sigma^2)) exact ML metric;
+            // linear = E/sigma^2 (bit-exact with pre-fix monitor demod).
+            const char* val = argv[i] + 13;
+            if (strcmp(val, "linear") == 0)      mfsk_demap_cli = 0;
+            else if (strcmp(val, "bessel") == 0) mfsk_demap_cli = 1;
+            else { fprintf(stderr, "--mfsk-demap: expected linear|bessel, got %s\n", val); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1570,6 +1583,16 @@ start_modem:
         telecom_system.mfsk.wb_match_threshold_bias = wb_match_bias_cli;
         telecom_system.ack_mfsk.wb_match_threshold_bias = wb_match_bias_cli;
         printf("[FLAG] --wb-match-threshold-bias=%d\n", wb_match_bias_cli);
+    }
+    if (mfsk_demap_cli >= 0) {
+        // A.0.1: select the MFSK soft-demap metric. demap_mode is read live
+        // by demod() (no init() coupling), so a single post-construction
+        // assignment is sticky across config switches. Apply to both mfsk
+        // instances for symmetry (ack_mfsk is the M=16 ctrl-pattern modem;
+        // its demod() shares the same metric path).
+        telecom_system.mfsk.demap_mode = mfsk_demap_cli;
+        telecom_system.ack_mfsk.demap_mode = mfsk_demap_cli;
+        printf("[FLAG] --mfsk-demap=%s\n", mfsk_demap_cli == 0 ? "linear" : "bessel");
     }
     if (mean_h_gate_cli >= 0) {
         telecom_system.mean_h_gate_threshold = mean_h_gate_cli;

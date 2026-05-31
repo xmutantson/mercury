@@ -2750,6 +2750,319 @@ static void test_mfsk_ctrl_suffix_apply_sign_invariance() {
 }
 
 // =============================================================================
+// §9 Bessel-I0 noncoherent-FSK ML demap regression suite
+//   (A.0.1 Phase A, resurrected from commit 06f35b5 onto the F2/Q2 monitor
+//    demod). The lever: replace the per-tone linear energy metric
+//    L_m = E_m/sigma^2 (the small-x Taylor expansion of the exact ML metric)
+//    with L_m = log I0(2*sqrt(E_m/sigma^2)) (Proakis 5e §4.5.4 eq 4.5-46;
+//    A&S 9.8.1/9.8.2). cl_mfsk::demap_mode selects the path; the LSE bit
+//    partition is shared, so MFSK_DEMAP_LINEAR is bit-exact with the pre-fix
+//    monitor demod.
+//
+//   §9.1 — log_i0_metric() numerics vs an independent series reference.
+//   §9.2 — small-x equivalence (I0 metric -> linear metric as arg->0) AND
+//          moderate-SNR divergence (I0 metric < linear metric, curvature
+//          recovery). FAIL-BEFORE for the divergence half (the linear path
+//          has no curvature).
+//   §9.3 — end-to-end demod() in BOTH modes: high-SNR clean one-hot tones
+//          must decode to the transmitted Gray bits with finite LLRs under
+//          either metric (high-SNR max-log limit sanity), and at low SNR the
+//          two metrics must produce measurably different LLR magnitudes.
+// =============================================================================
+
+// Independent reference: log I0(x) via the ascending power series
+//   I0(x) = sum_{k>=0} ((x/2)^2 / (k!)^2)  ... actually (x^2/4)^k / (k!)^2.
+// Converges fast for the arg range the demap sees; NOT the A&S polynomial
+// the LUT uses, so agreement validates the LUT rather than tautologically
+// re-deriving it.
+static double ref_log_i0(double x) {
+	if (x <= 0.0) return 0.0;
+	double term = 1.0;        // k=0 term
+	double sum  = 1.0;
+	double xq   = (x * x) / 4.0;
+	for (int k = 1; k < 200; k++) {
+		term *= xq / ((double)k * (double)k);
+		sum  += term;
+		if (term < 1e-18 * sum) break;
+	}
+	return std::log(sum);
+}
+
+static void test_mfsk_demap_i0_lut_numerics() {
+	const char* name = "mfsk_demap_i0_lut_numerics";
+
+	// Sweep the in-table range plus the asymptotic branch. Max interp+approx
+	// error of the 256-entry LUT is ~9e-4 (verified offline); use a 3e-3
+	// absolute tolerance to leave margin and still catch a coefficient typo
+	// or a wrong table size, which would blow the error up by orders of
+	// magnitude.
+	double worst = 0.0; double worst_x = 0.0;
+	for (double x = 0.0; x <= 35.0; x += 0.01) {
+		double got = cl_mfsk::log_i0_metric(x);
+		if (!std::isfinite(got)) {
+			char buf[96];
+			snprintf(buf, sizeof(buf), "log_i0_metric(%.3f) not finite", x);
+			test_fail(name, buf);
+			return;
+		}
+		double ref = ref_log_i0(x);
+		double err = std::fabs(got - ref);
+		if (err > worst) { worst = err; worst_x = x; }
+	}
+	if (worst > 3e-3) {
+		char buf[128];
+		snprintf(buf, sizeof(buf),
+			"LUT max error %.3e at x=%.3f exceeds 3e-3 (coefficient/size regression?)",
+			worst, worst_x);
+		test_fail(name, buf);
+		return;
+	}
+
+	// Monotonic non-decreasing (log I0 is strictly increasing for x>0).
+	double prev = -1e30;
+	for (double x = 0.0; x <= 30.0; x += 0.05) {
+		double v = cl_mfsk::log_i0_metric(x);
+		if (v + 1e-9 < prev) {
+			char buf[96];
+			snprintf(buf, sizeof(buf), "log_i0_metric non-monotone near x=%.3f", x);
+			test_fail(name, buf);
+			return;
+		}
+		prev = v;
+	}
+
+	// Hand-verify point from the 06f35b5 commit message: log I0(4) = 2.425.
+	double v4 = cl_mfsk::log_i0_metric(4.0);
+	if (std::fabs(v4 - 2.425) > 5e-3) {
+		char buf[96];
+		snprintf(buf, sizeof(buf), "log_i0_metric(4)=%.5f, expected ~2.425", v4);
+		test_fail(name, buf);
+		return;
+	}
+	// I0(0)=1 -> log=0.
+	if (std::fabs(cl_mfsk::log_i0_metric(0.0)) > 1e-12) {
+		test_fail(name, "log_i0_metric(0) != 0");
+		return;
+	}
+	test_pass(name);
+}
+
+static void test_mfsk_demap_i0_smallx_and_divergence() {
+	const char* name = "mfsk_demap_i0_smallx_and_divergence";
+
+	// The per-tone metrics, as functions of the per-tone SNR s = E_m/sigma^2:
+	//   linear:  L = s
+	//   I0:      L = log I0(2*sqrt(s))
+	// Small-x equivalence: log I0(x) ~ x^2/4, with x = 2*sqrt(s) => x^2/4 = s.
+	// So at small s the I0 metric -> the linear metric.
+	{
+		double s = 0.02;  // low per-tone SNR
+		double linear = s;
+		double i0 = cl_mfsk::log_i0_metric(2.0 * std::sqrt(s));
+		double rel = std::fabs(i0 - linear) / linear;
+		if (rel > 0.05) {
+			char buf[128];
+			snprintf(buf, sizeof(buf),
+				"small-x: I0=%.5f linear=%.5f rel_err=%.3f (>0.05) — Taylor "
+				"limit broken", i0, linear, rel);
+			test_fail(name, buf);
+			return;
+		}
+	}
+
+	// Moderate-SNR divergence (the whole point of the fix): at s ~ O(1) the
+	// I0 metric is strictly BELOW the linear metric (log I0 grows ~linearly
+	// in amplitude, i.e. ~sqrt(s), not in power s). The linear path cannot
+	// reproduce this — this assertion FAILS against the pre-fix linear metric
+	// and PASSES for the I0 metric.
+	{
+		double s = 4.0;  // moderate per-tone SNR
+		double linear = s;                                  // = 4.0
+		double i0 = cl_mfsk::log_i0_metric(2.0 * std::sqrt(s)); // = log I0(4) ~ 2.425
+		if (!(i0 < linear - 0.5)) {
+			char buf[128];
+			snprintf(buf, sizeof(buf),
+				"divergence: I0=%.5f not sufficiently below linear=%.5f — "
+				"curvature term missing", i0, linear);
+			test_fail(name, buf);
+			return;
+		}
+		// And the gap must WIDEN with SNR (monotone divergence).
+		double s2 = 16.0;
+		double i0_2 = cl_mfsk::log_i0_metric(2.0 * std::sqrt(s2));
+		double gap1 = linear - i0;          // at s=4
+		double gap2 = s2 - i0_2;            // at s=16
+		if (!(gap2 > gap1)) {
+			char buf[128];
+			snprintf(buf, sizeof(buf),
+				"divergence not monotone: gap(s=4)=%.4f gap(s=16)=%.4f",
+				gap1, gap2);
+			test_fail(name, buf);
+			return;
+		}
+	}
+	test_pass(name);
+}
+
+// Helper: run cl_mfsk::demod() on a synthetic frame of clean one-hot tones at
+// a controlled per-tone SNR, in a given demap_mode. Writes hard-decision bits
+// into `decoded_bits` (sign of LLR: >0 => bit 0) and the raw LLRs into
+// `llrs`. Returns the transmitted bit pattern in `tx_bits`.
+//
+// demod()'s noise estimate pools over the guard bins (k outside the signal
+// band). We seed every guard bin with a constant-magnitude tone so noise_var
+// is deterministic = guard_mag^2, and place signal energy = snr * noise_var
+// in each symbol's transmitted tone. M=16, Nc=50, 1 stream.
+static void run_demod_onehot(int demap_mode, double per_tone_snr,
+                             int* tx_bits, float* llrs, int* decoded_bits,
+                             int* out_nSymbols, int* out_bps) {
+	cl_mfsk m;
+	m.init(16, 50, 1);
+	m.demap_mode = demap_mode;
+
+	int M = m.M;                 // 16
+	int Nc = m.Nc;               // 50
+	int nBits = m.nBits;         // 4
+	int bps = m.bits_per_symbol(); // 4 (1 stream)
+	int nSymbols = 8;
+	int total_bits = nSymbols * bps;
+	*out_nSymbols = nSymbols;
+	*out_bps = bps;
+
+	double noise_var = 1.0;                 // target sigma^2
+	double guard_mag = std::sqrt(noise_var);
+	double sig_E = per_tone_snr * noise_var; // E_m so that E_m/sigma^2 = snr
+	double sig_mag = std::sqrt(sig_E);
+
+	std::vector<std::complex<double> > fft_in((size_t)(nSymbols * Nc),
+	                                           std::complex<double>(0.0, 0.0));
+	int band_start = m.stream_offsets[0];
+	int band_end   = m.stream_offsets[0] + M;
+
+	std::mt19937 rng(0x1505u);
+	std::uniform_int_distribution<int> tone_pick(0, M - 1);
+
+	for (int s = 0; s < nSymbols; s++) {
+		// Fill guard bins with a constant-magnitude carrier so the pooled
+		// noise estimate is exactly noise_var (real-valued; |val|^2=noise_var).
+		for (int k = 0; k < Nc; k++) {
+			if (k < band_start || k >= band_end) {
+				fft_in[s * Nc + k] = std::complex<double>(guard_mag, 0.0);
+			}
+		}
+		// Choose a transmitted tone; its Gray code gives the bits. NOTE the
+		// production demod REVERSES tone hopping internally (E[m]=E_raw[(m+hop)
+		// %M]); to land signal energy in DATA tone `dt` we must place it in
+		// RAW bin (dt + hop) % M, where hop = (s*tone_hop_step) % M.
+		int dt = tone_pick(rng);
+		int hop = (s * m.tone_hop_step) % M;
+		int raw = (dt + hop) % M;
+		fft_in[s * Nc + band_start + raw] +=
+			std::complex<double>(sig_mag, 0.0);
+
+		// Record the transmitted bits for this symbol (Gray code of dt,
+		// MSB-first, matching demod()'s mask = 1<<(nBits-1-k)).
+		int gray = dt ^ (dt >> 1);
+		for (int k = 0; k < nBits; k++) {
+			int mask = 1 << (nBits - 1 - k);
+			tx_bits[s * bps + k] = (gray & mask) ? 1 : 0;
+		}
+	}
+
+	for (int i = 0; i < total_bits; i++) llrs[i] = 0.0f;
+	m.demod(fft_in.data(), total_bits, llrs);
+
+	// Hard decision: demod() defines LLR = LSE(S_0) - LSE(S_1), so LLR > 0
+	// favors bit 0.
+	for (int i = 0; i < total_bits; i++)
+		decoded_bits[i] = (llrs[i] > 0.0f) ? 0 : 1;
+}
+
+static void test_mfsk_demod_both_modes_highsnr_decode() {
+	const char* name = "mfsk_demod_both_modes_highsnr_decode";
+
+	const int MAXB = 8 * 4;  // nSymbols=8 * bps=4
+	int tx[MAXB]; float llr[MAXB]; int dec[MAXB];
+	int nSymbols = 0, bps = 0;
+
+	// High per-tone SNR: BOTH metrics must recover the transmitted Gray bits
+	// exactly and emit finite LLRs (high-SNR max-log limit sanity — the I0
+	// path must not break the easy case the linear path already handles).
+	for (int mode = 0; mode <= 1; mode++) {
+		run_demod_onehot(mode, /*snr=*/50.0, tx, llr, dec, &nSymbols, &bps);
+		int total_bits = nSymbols * bps;
+		for (int i = 0; i < total_bits; i++) {
+			if (!std::isfinite(llr[i])) {
+				char buf[96];
+				snprintf(buf, sizeof(buf), "mode=%d LLR[%d] not finite", mode, i);
+				test_fail(name, buf);
+				return;
+			}
+			if (dec[i] != tx[i]) {
+				char buf[160];
+				snprintf(buf, sizeof(buf),
+					"mode=%d bit %d decoded %d != tx %d (LLR=%.3f) — high-SNR "
+					"decode failed", mode, i, dec[i], tx[i], llr[i]);
+				test_fail(name, buf);
+				return;
+			}
+		}
+	}
+	test_pass(name);
+}
+
+static void test_mfsk_demod_modes_differ_at_lowsnr() {
+	const char* name = "mfsk_demod_modes_differ_at_lowsnr";
+
+	const int MAXB = 8 * 4;
+	int tx_lin[MAXB], tx_i0[MAXB], dec[MAXB];
+	float llr_lin[MAXB], llr_i0[MAXB];
+	int nSymbols = 0, bps = 0;
+
+	// Same synthetic frame (same RNG seed inside the helper => same tones),
+	// moderate per-tone SNR. The two metrics must produce measurably
+	// different LLR magnitudes — proves the demap_mode switch actually
+	// reaches the production demod path and that the I0 curvature is active
+	// (NOT a no-op). If someone wires demap_mode but forgets to branch in
+	// demod(), this FAILS.
+	run_demod_onehot(cl_mfsk::MFSK_DEMAP_LINEAR, 3.0,
+	                 tx_lin, llr_lin, dec, &nSymbols, &bps);
+	run_demod_onehot(cl_mfsk::MFSK_DEMAP_BESSEL_I0, 3.0,
+	                 tx_i0, llr_i0, dec, &nSymbols, &bps);
+	int total_bits = nSymbols * bps;
+
+	double max_abs_diff = 0.0;
+	bool any_nonfinite = false;
+	for (int i = 0; i < total_bits; i++) {
+		if (!std::isfinite(llr_lin[i]) || !std::isfinite(llr_i0[i]))
+			any_nonfinite = true;
+		double d = std::fabs((double)llr_lin[i] - (double)llr_i0[i]);
+		if (d > max_abs_diff) max_abs_diff = d;
+		// Sanity: the two frames must encode the same tones (same seed).
+		if (tx_lin[i] != tx_i0[i]) {
+			test_fail(name, "tx bit mismatch between runs (RNG/seed drift)");
+			return;
+		}
+	}
+	if (any_nonfinite) {
+		test_fail(name, "non-finite LLR at moderate SNR");
+		return;
+	}
+	// The linear metric over-weights moderate tones (power) vs the I0 metric
+	// (amplitude); at snr=3 over 8 symbols the per-bit LLRs must differ by a
+	// clearly non-zero margin. A no-op switch yields max_abs_diff ~0.
+	if (max_abs_diff < 0.1) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"linear vs I0 LLRs nearly identical at snr=3 (max|Δ|=%.4f) — "
+			"demap_mode branch may be a no-op", max_abs_diff);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -2811,6 +3124,13 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op();
 	test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe();
 	test_mfsk_ctrl_suffix_apply_sign_invariance();
+
+	// §9 Bessel-I0 noncoherent-FSK ML demap regression suite
+	// (A.0.1 Phase A, resurrected from commit 06f35b5).
+	test_mfsk_demap_i0_lut_numerics();
+	test_mfsk_demap_i0_smallx_and_divergence();
+	test_mfsk_demod_both_modes_highsnr_decode();
+	test_mfsk_demod_modes_differ_at_lowsnr();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

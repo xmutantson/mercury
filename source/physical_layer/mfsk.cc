@@ -25,6 +25,102 @@
 #include <cstdint>
 #include <cstdio>
 
+namespace {
+
+// log I0(x) lookup for the noncoherent-FSK ML demap (Proakis 5e §4.5.4
+// eq 4.5-46; resurrected from commit 06f35b5). The per-tone metric is
+// log I0(2*sqrt(E_m/sigma^2)); its argument spans [0, ~30] for per-tone
+// E/sigma^2 up to ~225 (far above any ROBUST-tier per-tone SNR — larger
+// args fall through to the asymptotic branch). 256 entries with linear
+// interpolation gives ~1e-4 max error, well below SPA-quantization noise.
+//
+// I0(x) is computed at table-build time via Abramowitz & Stegun 9.8.1
+// (x ∈ [0, 3.75)) and 9.8.2 (x ≥ 3.75), ~1e-7 polynomial error. The same
+// 9.8.2 form serves the beyond-table (x ≥ 30) lookups, so the metric is
+// continuous across the table edge (max error ~9e-4 everywhere). Runtime
+// lookup is two adds + one multiply + one float load; LUT is ~2 KB and
+// stays cache-resident. The LUT is file-local; cl_mfsk::log_i0_metric()
+// (below) is the public wrapper used by demod() and the §9 regression test.
+constexpr int    LOG_I0_LUT_N    = 256;
+constexpr double LOG_I0_LUT_XMAX = 30.0;
+
+struct LogI0Table {
+	double v[LOG_I0_LUT_N + 1]; // +1 sentinel for the interp upper-bin
+	LogI0Table() {
+		const double dx = LOG_I0_LUT_XMAX / LOG_I0_LUT_N;
+		for (int i = 0; i <= LOG_I0_LUT_N; i++) {
+			double x = i * dx;
+			double I0;
+			if (x < 3.75) {
+				// A&S 9.8.1: I0(x) = sum c_k * (x/3.75)^(2k), x ∈ [-3.75, 3.75]
+				double t = x / 3.75;
+				double t2 = t * t;
+				I0 = 1.0
+				   + t2 * (3.5156229
+				   + t2 * (3.0899424
+				   + t2 * (1.2067492
+				   + t2 * (0.2659732
+				   + t2 * (0.0360768
+				   + t2 *  0.0045813)))));
+				v[i] = std::log(I0);
+			} else {
+				// A&S 9.8.2: sqrt(x)*exp(-x)*I0(x) = sum d_k * (3.75/x)^k
+				// => log I0(x) = x - 0.5*log(x) + log(sum d_k * u^k), u=3.75/x
+				double u = 3.75 / x;
+				double poly = 0.39894228
+				            + u * ( 0.01328592
+				            + u * ( 0.00225319
+				            + u * (-0.00157565
+				            + u * ( 0.00916281
+				            + u * (-0.02057706
+				            + u * ( 0.02635537
+				            + u * (-0.01647633
+				            + u *   0.00392377))))))) ;
+				v[i] = x - 0.5 * std::log(x) + std::log(poly);
+			}
+		}
+	}
+};
+
+inline double log_I0_lut(double x) {
+	static const LogI0Table tbl;
+	if (x <= 0.0) return 0.0; // I0(0) = 1, log = 0
+	if (x >= LOG_I0_LUT_XMAX) {
+		// Beyond table: A&S 9.8.2 is valid for ALL x >= 3.75 (no upper
+		// bound), so reuse the exact table-build formula rather than the
+		// cruder leading-order asymptotic x - 0.5*log(2*pi*x) that 06f35b5
+		// used here. The latter left a ~4e-3 discontinuity at the x=30
+		// boundary (table entry was 9.8.2-accurate, the branch was not);
+		// matching the formula makes log_I0_lut continuous across XMAX and
+		// holds the ~9e-4 accuracy out to arbitrarily strong tones. Used
+		// only for very-strong tones (per-tone SNR > 225); no WGN-sim entry
+		// hits this branch, but it must not introduce a seam in the metric.
+		double u = 3.75 / x;
+		double poly = 0.39894228
+		            + u * ( 0.01328592
+		            + u * ( 0.00225319
+		            + u * (-0.00157565
+		            + u * ( 0.00916281
+		            + u * (-0.02057706
+		            + u * ( 0.02635537
+		            + u * (-0.01647633
+		            + u *   0.00392377))))))) ;
+		return x - 0.5 * std::log(x) + std::log(poly);
+	}
+	const double dx = LOG_I0_LUT_XMAX / LOG_I0_LUT_N;
+	double pos  = x / dx;
+	int    idx  = (int)pos;
+	double frac = pos - idx;
+	return tbl.v[idx] + frac * (tbl.v[idx + 1] - tbl.v[idx]);
+}
+
+} // anonymous namespace
+
+double cl_mfsk::log_i0_metric(double arg)
+{
+	return log_I0_lut(arg);
+}
+
 cl_mfsk::cl_mfsk()
 {
 	M = 0;
@@ -58,6 +154,7 @@ cl_mfsk::cl_mfsk()
 	break_match_threshold = 0;
 	hail_match_threshold = 0;
 	wb_match_threshold_bias = 0;  // Phase-2 flag default = HEAD
+	demap_mode = MFSK_DEMAP_BESSEL_I0;  // A.0.1: Bessel-I0 ML demap ON by default
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_ack_sack_suffix_tones[i] = -1;
 	last_ack_sack_capture_valid = false;
@@ -1024,38 +1121,72 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 			}
 
 			// Compute LLRs for this stream's bits — log-sum-exp noncoherent FSK
-			// metric (F2 retry on top of Q3). Per Proakis 5th ed §4.5.4 and
-			// Stark, IEEE TCOM 1985, the true bit LLR for noncoherent
+			// metric (F2 framework, on top of Q3). Per Proakis 5th ed §4.5.4
+			// and Stark, IEEE TCOM 1985, the true bit LLR for noncoherent
 			// orthogonal FSK with Gray mapping is
-			//   LLR_k = log(sum_{m in S_0} exp(E_m/sigma^2))
-			//         - log(sum_{m in S_1} exp(E_m/sigma^2))
-			// max-log is the high-SNR limit (the largest exp dominates). At
-			// rate-1/16 LDPC the per-tone curvature near the cliff matters,
-			// so we use the full LSE form with the standard max-subtraction
-			// for numerical stability.
+			//   LLR_k = log(sum_{m in S_0} exp(L_m)) - log(sum_{m in S_1} exp(L_m))
+			// where L_m is the per-tone log-likelihood. max-log is the high-SNR
+			// limit (the largest exp dominates). At rate-1/16 LDPC the per-tone
+			// curvature near the cliff matters, so we use the full LSE form with
+			// the standard max-subtraction for numerical stability.
 			//
-			// First F2 attempt 2026-05-25 (reverted, see fact-document
-			// weak-signal-floor-investigation.md §4 (F2)): regressed the
-			// floor from WGN:0 to WGN:6. Hypothesis was that LSE produces
-			// smaller LLR magnitudes which need more SPA iterations to
-			// converge, and the global 100-iter cap was binding. Q3 (commit
-			// cb779d1) raised the ROBUST-tier iter cap to 200; retry on top.
+			// Two per-tone metrics are selectable via demap_mode (A.0.1 Phase A,
+			// resurrected from commit 06f35b5):
+			//
+			//   MFSK_DEMAP_LINEAR    L_m = E_m/sigma^2 = E[m]*llr_scale. This
+			//     is the metric the F2/Q2 monitor demod shipped — but it is the
+			//     low-SNR Taylor expansion of the exact ML metric: log I0(x) ≈
+			//     x^2/4, with x = 2*sqrt(E_m/sigma^2), gives x^2/4 = E_m/sigma^2.
+			//     Correct only at low per-tone SNR; under-weights the moderate-
+			//     SNR tones the SPA decoder relies on at the ROBUST_0 floor.
+			//
+			//   MFSK_DEMAP_BESSEL_I0 L_m = log I0(2*sqrt(E_m/sigma^2)), the exact
+			//     noncoherent orthogonal-FSK per-tone log-likelihood (Proakis 5e
+			//     eq 4.5-46). The 1/sigma^2 scale is folded into the sqrt
+			//     argument; log_i0_metric() (A&S 9.8.1 for small x, 9.8.2 for
+			//     large x) supplies the full per-tone SNR range with one table
+			//     lookup. Recovers ~0.3-0.7 dB AWGN at the ROBUST_0 cliff.
+			//
+			// The two paths share an IDENTICAL log-sum-exp partition below; only
+			// the per-tone metric L[m] differs, so MFSK_DEMAP_LINEAR is bit-exact
+			// with the pre-fix monitor demod (the (E-max)*llr_scale form factors
+			// exactly to (L-maxL) when L = E*llr_scale, since llr_scale > 0).
+			//
+			// History: a first F2 attempt 2026-05-25 (reverted, fact-document
+			// weak-signal-floor-investigation.md §4 (F2)) regressed the floor
+			// WGN:0 -> WGN:6 under a binding 100-iter SPA cap; Q3 (commit
+			// cb779d1) raised the ROBUST-tier cap to 200, after which LSE shipped.
 			int llr_offset = s * bps + st * nBits;
+			// Per-tone metric L_m, computed once per (s, st) and reused across
+			// all nBits LLRs in this symbol. Zero-init silences
+			// -Wmaybe-uninitialized; the m<M loop overwrites every used entry
+			// (M <= 64) before the consumer loops below read it.
+			double L[64] = {0.0}; // M <= 64
+			if (demap_mode == MFSK_DEMAP_BESSEL_I0)
+			{
+				for (int m = 0; m < M; m++)
+					L[m] = log_I0_lut(2.0 * std::sqrt(E[m] * llr_scale));
+			}
+			else
+			{
+				for (int m = 0; m < M; m++)
+					L[m] = E[m] * llr_scale;
+			}
 			for (int k = 0; k < nBits; k++)
 			{
 				int mask = 1 << (nBits - 1 - k);
-				double max_E1 = -1e30;
-				double max_E0 = -1e30;
+				double max_L1 = -1e30;
+				double max_L0 = -1e30;
 				for (int m = 0; m < M; m++)
 				{
 					int gray_m = m ^ (m >> 1);
 					if (gray_m & mask)
 					{
-						if (E[m] > max_E1) max_E1 = E[m];
+						if (L[m] > max_L1) max_L1 = L[m];
 					}
 					else
 					{
-						if (E[m] > max_E0) max_E0 = E[m];
+						if (L[m] > max_L0) max_L0 = L[m];
 					}
 				}
 
@@ -1069,18 +1200,19 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 					int gray_m = m ^ (m >> 1);
 					if (gray_m & mask)
 					{
-						sum1 += std::exp((E[m] - max_E1) * llr_scale);
+						sum1 += std::exp(L[m] - max_L1);
 					}
 					else
 					{
-						sum0 += std::exp((E[m] - max_E0) * llr_scale);
+						sum0 += std::exp(L[m] - max_L0);
 					}
 				}
-				// LSE(S_0) - LSE(S_1) where LSE is in LLR-domain (already
-				// scaled by 1/sigma^2). Note: max_E and llr_scale combine to
-				// (max_E0 - max_E1) * llr_scale as the dominant term, plus
-				// the log() correction that reduces to 0 at high SNR.
-				double llr = (max_E0 - max_E1) * llr_scale
+				// LSE(S_0) - LSE(S_1) = (max_L0 - max_L1) + log(sum0) - log(sum1).
+				// L_m already carries 1/sigma^2 (either as the linear *llr_scale
+				// factor or folded into the I0 sqrt argument), so there is no
+				// extra llr_scale multiplier here. The log() correction reduces
+				// to 0 at high SNR (the dominant tone wins).
+				double llr = (max_L0 - max_L1)
 				           + std::log(sum0) - std::log(sum1);
 				if (!std::isfinite(llr)) llr = 0.0;
 				// LLR cap removed 2026-05-24. The previous ±5 clip was

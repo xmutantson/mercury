@@ -94,6 +94,33 @@ public:
 	// cl_mfsk::init() so it stacks with the computed defaults.
 	int wb_match_threshold_bias;
 
+	// Noncoherent-FSK soft-demap metric selector (A.0.1 Phase A,
+	// resurrected from commit 06f35b5). Read live by demod() — set once
+	// after construction (no init() coupling), sticky across config
+	// switches. Default = MFSK_DEMAP_BESSEL_I0 (the intended fix). Set to
+	// MFSK_DEMAP_LINEAR via --mfsk-demap=linear for hardware A/B; that path
+	// is bit-exact with the pre-fix monitor demod (E_m/sigma^2 metric).
+	//   MFSK_DEMAP_LINEAR     = E_m/sigma^2 per-tone metric. This is the
+	//                           low-SNR Taylor expansion of the true ML
+	//                           metric (log I0(x) ≈ x^2/4 for small x).
+	//   MFSK_DEMAP_BESSEL_I0  = log I0(2*sqrt(E_m/sigma^2)), the exact
+	//                           noncoherent orthogonal-FSK per-tone log-
+	//                           likelihood (Proakis 5e §4.5.4 eq 4.5-46;
+	//                           Stark, IEEE TCOM 33-11, 1985). Recovers the
+	//                           moderate-SNR curvature the linear form drops
+	//                           (~0.3-0.7 dB AWGN at the ROBUST_0 cliff).
+	static const int MFSK_DEMAP_LINEAR    = 0;
+	static const int MFSK_DEMAP_BESSEL_I0 = 1;
+	int demap_mode;
+
+	// Per-tone noncoherent-FSK ML metric L_m = log I0(arg), where
+	// arg = 2*sqrt(E_m/sigma^2). LUT-interpolated (256 entries over
+	// arg ∈ [0,30], A&S 9.8.1 small-x / 9.8.2 large-x; ~9e-4 max error);
+	// arg ≥ 30 falls through to the same A&S 9.8.2 form (continuous, no
+	// seam). Exposed for the §9 demod regression test (the LUT itself
+	// stays file-local in mfsk.cc).
+	static double log_i0_metric(double arg);
+
 	// Directed HAIL: 4-tone CRC suffix appended after the "I am Mercury" prefix.
 	// Derived from FNV-1a hash of the target callsign (including SSID).
 	// Only stations matching the suffix respond, preventing multi-station collisions.
