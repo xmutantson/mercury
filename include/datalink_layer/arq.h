@@ -621,6 +621,37 @@ public:
   bool promotion_allowed_on_batch(bool batch_fully_acked) const
   { return batch_fully_acked; }
 
+  // climb-engine Bug 1 (gearshift-climb-engine.md §4) — split SACK dedupe by
+  // event class. The CMD MFSK ACK+SACK decode used a SINGLE tracker
+  // (cmd_last_applied_sack_bsi): a PARTIAL SACK for bsi=B set it, then the later
+  // all-ones CLEAN confirmation for the SAME bsi=B (emitted by the RSP
+  // prev-delivered path after a retransmit completes the batch) was dropped as a
+  // "duplicate" before it could reach the clean funnel — so a batch that DID
+  // fully deliver (via retransmit) was never credited, last_batch_fully_acked
+  // stayed false, and the rung never promoted. This PURE predicate is the decode
+  // gate: a CLEAN (all-ones) confirmation supersedes the partial and is deduped
+  // ONLY against cmd_last_applied_clean_bsi; a PARTIAL is deduped against
+  // cmd_last_applied_sack_bsi as before. A repeated clean for the same bsi is
+  // still rejected (no double-count of nBatches_fully_acked). It does NOT relax
+  // the clean requirement — all-ones means "every frame delivered", which IS the
+  // definition of clean; a batch that never completes never emits all-ones.
+  // last_applied_clean_bsi / last_applied_sack_bsi are passed in (the test drives
+  // them; production reads the members). Returns true iff the frame should be
+  // accepted (not deduped).
+  static bool sack_clean_confirmation_accepted(int rx_bsi, bool is_all_ones,
+                                               int last_applied_clean_bsi,
+                                               int last_applied_sack_bsi)
+  {
+    if(is_all_ones)
+      return rx_bsi != last_applied_clean_bsi;   // clean: dedupe vs clean tracker
+    return rx_bsi != last_applied_sack_bsi;      // partial: dedupe vs partial tracker
+  }
+  // CLEAN-confirmation dedupe tracker (climb Bug 1). Ctor-init -1. Distinct from
+  // cmd_last_applied_sack_bsi (the partial tracker) so a clean confirmation for a
+  // bsi whose partial was already applied is NOT dropped. Set when an all-ones
+  // CLEAN MFSK ACK+SACK is accepted at arq_commander.cc (the :2516 funnel).
+  int cmd_last_applied_clean_bsi;
+
   // CLEAN-BATCH VIABILITY synthetic-fire test (CLI --test-clean-batch-viability).
   // Drives the PURE promotion predicate AND the real gearshift consumer logic:
   // asserts a PARTIAL batch does NOT raise last_data_viable_config, does NOT reset
@@ -630,6 +661,21 @@ public:
   // reach ROBUST_0 (panic latches). Returns 0 on pass, 1 on fail. Default builds
   // never call this. See gearshift-start-and-recovery.md §9.8.
   int test_clean_batch_viability();
+
+  // climb-engine integrated 3-bug regression (CLI --test-climb-engine).
+  // (a) Bug 1: sack_clean_confirmation_accepted() split-dedupe — an all-ones
+  //     CLEAN confirmation for a bsi whose PARTIAL was already applied is
+  //     ACCEPTED (pre-fix: dropped as duplicate); a repeated clean is rejected.
+  // (b) Bug 2/3: the REAL policy_evaluate_axis2() + the batch-floor predicate
+  //     keep data_batch_size==1 at robust configs across 6 good batches
+  //     (pre-fix: Axis-2 steps 1->6); OFDM grows.
+  // (c) Bug 3 (the assertion the singles lacked): an end-to-end multi-rung
+  //     climb — the REAL anchor-advance gate + the REAL +1 clamp + the REAL
+  //     Axis-2 — promotes ROBUST_0 -> ROBUST_1 -> ROBUST_2 -> CONFIG_0, NOT
+  //     stuck one rung up. Pre-fix (Axis-2 grows robust batch -> no clean
+  //     credit) the anchor freezes at ROBUST_0 and the climb stalls.
+  // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
+  int test_climb_engine();
 
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //

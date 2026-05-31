@@ -2506,14 +2506,26 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							bool bitmap_ok = (rx_bitmap != 0u);
 							// Sanity 3: dedupe vs the last SACK we already applied
 							// (mirrors the OFDM SACK_RSP duplicate guard at ~2141).
-							bool duplicate = ((int)rx_bsi == cmd_last_applied_sack_bsi);
-
-							if(bsi_in_window && bitmap_ok && !duplicate)
-							{
+							// climb-engine Bug 1 (gearshift-climb-engine.md §4): SPLIT the dedupe by
+								// event class. A CLEAN (all-ones) confirmation SUPERSEDES the
+								// partial for the same bsi; deduping it vs the partial tracker
+								// (cmd_last_applied_sack_bsi) dropped the RSP prev-delivered clean
+								// ACK confirming a retransmit-completed batch -> the delivered
+								// rung never promoted. all_ones computed here so the dedupe can
+								// branch clean-vs-partial; CLEAN dedupes vs cmd_last_applied_clean_bsi,
+								// PARTIAL vs cmd_last_applied_sack_bsi (a repeated clean for the
+								// same bsi is still rejected -> no double-count).
 								uint32_t all_ones = (data_batch_size >= 32)
 									? 0xFFFFFFFFu
 									: ((1u << data_batch_size) - 1u);
-								if(rx_bitmap == all_ones)
+								bool is_clean_confirmation = (rx_bitmap == all_ones);
+								bool duplicate = !sack_clean_confirmation_accepted(
+									(int)rx_bsi, is_clean_confirmation,
+									cmd_last_applied_clean_bsi, cmd_last_applied_sack_bsi);
+
+							if(bsi_in_window && bitmap_ok && !duplicate)
+							{
+								if(is_clean_confirmation)
 								{
 									// CLEAN BATCH — mirror OFDM_ACK_CLEAN handler
 									// (~line 2178). Only state change there is
@@ -2522,6 +2534,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// owns register_ack(), stats, opt_record_batch,
 									// policy_evaluate_axis2, axis3_batch_tick, etc.
 									v2_ack_pat_pre_detected = true;
+									// climb-engine Bug 1: record this clean batch bsi so a REPEATED clean for
+									// the same bsi is deduped (no double-count of nBatches_fully_acked).
+									cmd_last_applied_clean_bsi = (int)rx_bsi;
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									printf("[CMD-MFSK-ACK-SACK] CLEAN batch_seq_id=%u (cmd_batch_seq_id=%d) "
 										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
@@ -3849,17 +3864,37 @@ void cl_arq_controller::process_control_commander()
 			{
 				// Update batch size now that SACK is negotiated. 30s target
 				// matches the formula in arq_common.cc batch sizing.
-				int max_batch = (message_transmission_time_ms > 0)
-					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-				if(max_batch < 5) max_batch = 5;
-				if(max_batch > nMessages) max_batch = nMessages;
-				int new_batch = radio_batch_size;
-				if(new_batch > max_batch) new_batch = max_batch;
-				set_data_batch_size(new_batch);
-				nominal_batch_size = new_batch;
+				//
+				// climb-engine Bug 2 (gearshift-climb-engine.md §3): ROBUST/MFSK
+				// configs are EXCLUDED from the >=5 floor. load_configuration()
+				// (arq_common.cc:1229-1234) deliberately sets data_batch_size=1 for
+				// robust, and its batch-scaling path (arq_common.cc:1269) is already
+				// !is_robust_config-gated. Re-applying the unconditional SACK floor
+				// here clobbers that and forces batch back to >=5 at ROBUST_0, where
+				// a clean all-ones MFSK ACK requires all 5 frames to survive
+				// first-pass at the floor SNR (it never does) — so the climb never
+				// gets a single clean batch to START with. At batch=1 every delivered
+				// MFSK frame is itself an all-ones batch -> clean ACKs accumulate.
+				// CMD gates on negotiated_configuration, RSP on current_configuration
+				// (arq_responder.cc) — equal at TEST_CONNECTION time, so CMD and RSP
+				// agree on data_batch_size (an asymmetric override was Bug #9). OFDM
+				// (CONFIG_0..16) keeps the >=5 floor unchanged. Likely an unintended
+				// regression of SACK-default-on (sack_enabled always true).
+				if(!is_robust_config(negotiated_configuration))
+				{
+					int max_batch = (message_transmission_time_ms > 0)
+						? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+					if(max_batch < 5) max_batch = 5;
+					if(max_batch > nMessages) max_batch = nMessages;
+					int new_batch = radio_batch_size;
+					if(new_batch > max_batch) new_batch = max_batch;
+					set_data_batch_size(new_batch);
+					nominal_batch_size = new_batch;
+				}
 				recalculate_ack_timeout_for_batch();
-				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
-					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
+				printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+					radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
+					is_robust_config(negotiated_configuration) ? 1 : 0);
 			}
 			else
 			{
@@ -5100,6 +5135,24 @@ void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg,
 // the next batch.
 void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_observed)
 {
+	// climb-engine Bug 3 root cause (gearshift-climb-engine.md §2): ROBUST/MFSK
+	// configs pin data_batch_size=1 by design (arq_common.cc:1229-1234, "MFSK
+	// modes keep batch_size=1 for pattern-ACK optimization"; the OFDM batch-
+	// scaling at arq_common.cc:1269 is already !is_robust_config-gated). Axis-2
+	// grows the batch after AXIS2_UP_GOOD_RUN clean batches (floor 10, step 5).
+	// At batch=1 a clean MFSK delivery is partial_rate=0 ("good"), so without
+	// this guard, after the climb promotes ROBUST_0->ROBUST_1 (FRAME-UP, which
+	// does NOT call the Axis-1 supremacy hook that would reset the good-run),
+	// the carried-over good-run trips Axis-2 at the new rung and steps batch
+	// 1->6. The RSP clamps SET_LINK_PARAMS to [AXIS2_BATCH_FLOOR=10, 32] -> CMD=6
+	// / RSP=10 MISMATCH -> p^N clean-batch collapse -> no clean credit at
+	// ROBUST_1 -> last_data_viable_config frozen at ROBUST_0 -> the +1 anchor
+	// clamp blocks ROBUST_2 -> the promotion engine goes DORMANT (climbs exactly
+	// one rung). Skip the whole controller on robust links so batch stays 1 at
+	// EVERY robust rung and clean MFSK ACKs keep accumulating to drive the climb.
+	// (This is the standalone-C2 sibling fix that the combined C3 dropped — that
+	// omission IS the dormancy. OFDM CONFIG_0..16 is unchanged: Axis-2 runs.)
+	if(is_robust_config(current_configuration)) return;
 	axis2_evaluations++;
 	if(batch_size_observed <= 0) return;  // defensive — no observation
 	if(rx_count < 0) rx_count = 0;
@@ -6030,6 +6083,256 @@ int cl_arq_controller::test_clean_batch_viability()
 	breaks_since_last_data_success = 0;            // restore
 
 	printf("[TEST-CLEAN-BATCH] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// climb-engine integrated 3-bug regression (CLI --test-climb-engine).
+// See fact-documents/gearshift-climb-engine.md §7. Three parts, each
+// fail-before / pass-after the integrated fix. Returns 0 on pass, 1 on fail.
+//
+// IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
+// NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
+// and FAILED on the IONOS wire. The integration-path assumptions (post-SET_CONFIG
+// rx-mute timing at the new robust rung, prev-path clean-ACK TX collision on the
+// OFDM tier) still need hardware. Part (c) is the multi-rung assertion the old
+// tests LACKED — it drives the real anchor-advance gate + real +1 clamp + real
+// Axis-2 across multiple rungs, which is where the dormancy lived.
+int cl_arq_controller::test_climb_engine()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-CLIMB] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-CLIMB] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;        // optimizer_is_in_control()==false on robust
+	supershift_proven_ceiling = -1;
+	// Synthetic-fire priming: no load_configuration() ran, so set_data_batch_size()'s
+	// clamp ceiling (max_data_length + max_header_length - ACK_MULTI_ACK_RANGE_HEADER_LENGTH
+	// - 1) would be negative and clamp every batch to a garbage value. Prime the two
+	// length members to realistic values so the ceiling (~203) sits well above our
+	// [1, 32] working range — set_data_batch_size() then behaves as in production.
+	max_data_length = 200;
+	max_header_length = 7;
+
+	// ================================================================
+	// Part A — Bug 1: split SACK dedupe (sack_clean_confirmation_accepted).
+	// The PARTIAL for bsi=B was already applied (last_applied_sack_bsi=B). The
+	// later all-ones CLEAN confirmation for the SAME bsi=B must be ACCEPTED, not
+	// dropped. Pre-fix (single tracker), the clean was deduped vs the partial
+	// tracker -> rejected -> the retransmit-completed batch was never credited.
+	// ================================================================
+	const int B = 7;
+	// A1: clean confirmation for bsi=B, partial-for-B already applied, NO clean
+	// yet -> ACCEPTED. This is THE bug-1 assertion (pre-fix would dedupe vs the
+	// partial tracker and reject).
+	bool a1 = sack_clean_confirmation_accepted(/*rx_bsi=*/B, /*is_all_ones=*/true,
+	             /*last_applied_clean_bsi=*/-1, /*last_applied_sack_bsi=*/B);
+	check(a1 == true, "A1 clean confirm for bsi w/ partial-applied ACCEPTED (in-window credit)",
+		a1 ? 1 : 0, 1);
+	// A2: a REPEATED clean for bsi=B (clean tracker now == B) -> REJECTED
+	// (no double-count of nBatches_fully_acked).
+	bool a2 = sack_clean_confirmation_accepted(B, true,
+	             /*last_applied_clean_bsi=*/B, /*last_applied_sack_bsi=*/B);
+	check(a2 == false, "A2 repeated clean for same bsi REJECTED (no double-count)",
+		a2 ? 1 : 0, 0);
+	// A3: a PARTIAL for bsi=B with the partial tracker already == B -> REJECTED
+	// (partial dedupe unchanged — a repeated partial must not re-populate retx).
+	bool a3 = sack_clean_confirmation_accepted(B, /*is_all_ones=*/false,
+	             /*last_applied_clean_bsi=*/-1, /*last_applied_sack_bsi=*/B);
+	check(a3 == false, "A3 repeated partial for same bsi still deduped (unchanged)",
+		a3 ? 1 : 0, 0);
+	// A4: a CLEAN for a NEW bsi (not yet clean-applied) -> ACCEPTED.
+	bool a4 = sack_clean_confirmation_accepted(/*rx_bsi=*/B+1, true,
+	             /*last_applied_clean_bsi=*/B, /*last_applied_sack_bsi=*/B);
+	check(a4 == true, "A4 clean for a new bsi ACCEPTED", a4 ? 1 : 0, 1);
+
+	// ================================================================
+	// Part B — Bug 2/3: keep batch=1 at robust. Drive the REAL
+	// policy_evaluate_axis2() (the controller that grew robust batch and caused
+	// the CMD/RSP mismatch) at a robust config and at an OFDM config. Robust must
+	// stay batch=1 across MORE than AXIS2_UP_GOOD_RUN good batches; OFDM grows.
+	// ================================================================
+	sack_v2_enabled = true;
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+
+	// Reset Axis-2 state to a clean baseline (no cooldown, empty ring).
+	auto reset_axis2 = [&]() {
+		axis2_consecutive_good_batches = 0;
+		axis2_consecutive_bad_batches = 0;
+		axis2_cooldown_batches = 0;
+		axis2_partial_rate_count = 0;
+		axis2_partial_rate_pos = 0;
+		for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.0f;
+		batch_size_proven_ceiling = -1;
+		batch_size_ceiling_recovery_batches = 0;
+	};
+
+	// B1: ROBUST_1, batch pinned at 1. Feed 6 clean (all-frames-received) batches
+	// through the REAL Axis-2. With the robust guard, Axis-2 returns early and
+	// data_batch_size stays 1. Pre-fix: after 4 good it steps 1 -> 6.
+	current_configuration = ROBUST_1;
+	set_data_batch_size(1);
+	reset_axis2();
+	for(int k=0;k<6;k++)
+		policy_evaluate_axis2(/*rx_count=*/data_batch_size, /*batch_size_observed=*/data_batch_size);
+	check(data_batch_size == 1, "B1 robust batch STAYS 1 after 6 good Axis-2 batches",
+		data_batch_size, 1);
+
+	// B2: ROBUST_0, same — robust guard holds at every robust rung.
+	current_configuration = ROBUST_0;
+	set_data_batch_size(1);
+	reset_axis2();
+	for(int k=0;k<6;k++)
+		policy_evaluate_axis2(data_batch_size, data_batch_size);
+	check(data_batch_size == 1, "B2 robust ROBUST_0 batch STAYS 1 (guard at every rung)",
+		data_batch_size, 1);
+
+	// B3: OFDM (CONFIG_10) — Axis-2 is NOT guarded; a run of good batches grows
+	// the batch (floor 10, step 5). Confirms the guard is robust-ONLY (OFDM
+	// behavior unchanged). Start at AXIS2_BATCH_FLOOR so the up-step is in range.
+	current_configuration = CONFIG_10;
+	set_data_batch_size(AXIS2_BATCH_FLOOR);   // 10
+	reset_axis2();
+	for(int k=0;k<6;k++)
+		policy_evaluate_axis2(data_batch_size, data_batch_size);
+	check(data_batch_size > AXIS2_BATCH_FLOOR, "B3 OFDM batch DOES grow (guard is robust-only)",
+		data_batch_size, AXIS2_BATCH_FLOOR + AXIS2_STEP);
+
+	// ================================================================
+	// Part C — Bug 3 (THE assertion the singles lacked): end-to-end MULTI-rung
+	// climb. The anchor must ADVANCE one rung per clean-credited rung, and the
+	// real +1 clamp must release the next rung as it does. This replays the REAL
+	// anchor-advance gate (arq_commander.cc:3437-3439) + the REAL FRAME-UP +1
+	// clamp (:3485-3487) + the REAL Axis-2, in a loop. Deliverability is coupled
+	// to the batch invariant exactly as on the wire: at a robust rung a batch is
+	// CLEAN iff batch stayed 1 (a grown batch -> CMD/RSP mismatch -> p^N collapse
+	// -> no clean credit). So if Axis-2 grows the robust batch (pre-fix), the
+	// rung is NOT credited, the anchor freezes, and the climb stalls — which is
+	// precisely the dormancy. Post-fix Axis-2 keeps batch=1 -> clean -> anchor
+	// advances -> climb proceeds.
+	// ================================================================
+	frame_shift_threshold = 3;
+	last_data_viable_config = ROBUST_0;       // anchor at the floor
+	current_configuration   = ROBUST_0;
+	negotiated_configuration= ROBUST_0;
+	consecutive_data_acks = 0;
+	reset_axis2();
+	// load_configuration() pins batch=1 when a robust config is LOADED — i.e. on
+	// the SET_CONFIG that a promotion issues, NOT on every batch. So the pin
+	// happens on config CHANGE only; within a rung the batch is whatever Axis-2
+	// last set it to. Model that with a "previous config" tracker: re-pin to 1
+	// only when we (re-)enter a robust rung. Seed with the starting config so the
+	// first ROBUST_0 cycle is pinned once.
+	int prev_cycle_config = -999;
+	set_data_batch_size(1);
+
+	// One simulated batch cycle at the current rung. Returns true if a promotion
+	// (config change) fired this cycle. Uses ONLY real production predicates.
+	auto climb_cycle = [&]() -> bool {
+		// Config-change pin: load_configuration(robust) sets batch=1 exactly once
+		// per config switch. Between switches (multiple batches at the same rung)
+		// the batch persists — so Axis-2's growth ACCUMULATES across batches at a
+		// rung, which is exactly how it breaks delivery on the wire.
+		if(current_configuration != prev_cycle_config)
+		{
+			if(is_robust_config(current_configuration))
+				set_data_batch_size(1);
+			prev_cycle_config = current_configuration;
+		}
+		// REAL Axis-2 — the only thing that can move robust batch off 1 (pre-fix).
+		policy_evaluate_axis2(data_batch_size, data_batch_size);
+
+		// Deliverability model (wire-faithful): clean iff CMD batch == the size
+		// the RSP holds. At robust the RSP is pinned to 1, so clean iff our batch
+		// is still 1 (a grown CMD batch -> CMD/RSP mismatch -> p^N collapse -> no
+		// clean credit). At OFDM both follow the same scaling, so clean.
+		bool clean = is_robust_config(current_configuration)
+			? (data_batch_size == 1)
+			: true;
+
+		// --- REAL anchor-advance gate (arq_commander.cc:3427-3439) ---
+		last_batch_fully_acked = clean;
+		data_ack_received = YES;
+		if(promotion_allowed_on_batch(last_batch_fully_acked))
+		{
+			break_drop_step = 2;
+			breaks_since_last_data_success = 0;
+			if(config_ladder_index(current_configuration) >
+			   config_ladder_index(last_data_viable_config))
+				last_data_viable_config = current_configuration;
+		}
+
+		// --- REAL FRAME-UP gate + +1 clamp (arq_commander.cc:3476-3534) ---
+		int proposed_frame = config_ladder_up(current_configuration, robust_enabled,
+			narrowband_enabled == YES);
+		bool frame_ceiling_blocked = (supershift_proven_ceiling >= 0 &&
+			config_ladder_index(proposed_frame) > config_ladder_index(supershift_proven_ceiling))
+			|| (max_config_override >= 0 && proposed_frame > max_config_override);
+		if(!optimizer_is_in_control() &&
+		   config_ladder_index(proposed_frame) > config_ladder_index(last_data_viable_config) + 1)
+			frame_ceiling_blocked = true;
+		bool optimizer_owns_upward_frame = optimizer_is_in_control();
+
+		if(data_ack_received==YES && promotion_allowed_on_batch(last_batch_fully_acked) &&
+			gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
+			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
+			!frame_ceiling_blocked && !optimizer_owns_upward_frame)
+		{
+			consecutive_data_acks++;
+			if(consecutive_data_acks >= frame_shift_threshold)
+			{
+				consecutive_data_acks = 0;
+				// FRAME-UP fires: adopt the new config (the SET_CONFIG the CMD
+				// would send). current_configuration follows once the RSP ACKs;
+				// model the post-handshake settled state directly.
+				negotiated_configuration = proposed_frame;
+				current_configuration   = proposed_frame;
+				return true;
+			}
+		}
+		return false;
+	};
+
+	// Drive enough cycles to climb 3 rungs (ROBUST_0->1->2->CONFIG_0). At 3 ACKs
+	// per rung + a credit cycle, ~30 iterations is ample. Stop early if we reach
+	// CONFIG_0. Track the highest config reached.
+	int promotions = 0;
+	int highest_idx = config_ladder_index(current_configuration);
+	for(int iter=0; iter<40 && current_configuration != CONFIG_0; iter++)
+	{
+		if(climb_cycle()) promotions++;
+		int idx = config_ladder_index(current_configuration);
+		if(idx > highest_idx) highest_idx = idx;
+	}
+
+	// C1: the climb must REACH CONFIG_0 (≥3 rungs off ROBUST_0). Pre-fix the
+	// anchor freezes at ROBUST_0 after the first promotion (Axis-2 grows the
+	// ROBUST_1 batch -> not clean -> anchor stuck), so current never passes
+	// ROBUST_1 -> this FAILS.
+	check(current_configuration == CONFIG_0, "C1 climb reaches CONFIG_0 (multi-rung, not stuck)",
+		current_configuration, CONFIG_0);
+	// C2: the anchor advanced past ROBUST_1 (the dormancy point). Pre-fix it
+	// stays at ROBUST_0 (idx 0).
+	check(config_ladder_index(last_data_viable_config) >= config_ladder_index(ROBUST_2),
+		"C2 anchor advanced to >= ROBUST_2 (past the dormancy rung)",
+		config_ladder_index(last_data_viable_config), config_ladder_index(ROBUST_2));
+	// C3: at least 3 promotions fired (ROBUST_0->1, 1->2, 2->CONFIG_0).
+	check(promotions >= 3, "C3 at least 3 consecutive rung promotions fired",
+		promotions, 3);
+
+	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

@@ -772,6 +772,56 @@ void cl_arq_controller::process_messages_rx_data_control()
 								"current-batch storage untouched)\n",
 								rsp_prev_batch_seq_id, rsp_prev_batch_delivered_count);
 							fflush(stdout);
+
+							// climb-engine Bug 1 (gearshift-climb-engine.md §4): emit a CLEAN
+							// (all-ones) MFSK ACK+SACK for the prev batch we just FULLY delivered
+							// via the retransmit/prev-storage path. Historically this path delivered
+							// to the app (copy_data_to_buffer above) but sent NO ACK, so the CMD never
+							// saw a clean ACK for the batch: last_batch_fully_acked stayed FALSE and the
+							// rung that recovered a frame via SACK could never promote. Reuse the SAME
+							// clean-ACK transport as the no-loss ACK-GATE funnel (arq_responder.cc:1644).
+							// The CMD-side split dedupe (sack_clean_confirmation_accepted) now accepts
+							// this all-ones confirmation even though a PARTIAL for the same bsi was
+							// already applied. Promotion still REQUIRES full delivery: a rung that never
+							// completes a batch never reaches this block, so the +1 anchor clamp +
+							// clean-batch-viability guard are unchanged (no deep-SNR over-climb). This
+							// path runs only at batch>=5 (OFDM tier); robust is batch=1 and never uses
+							// the prev path.
+							{
+								unsigned char prev_ack_bsi = (unsigned char)(
+									rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
+								bool prev_used_mfsk_path = false;
+								if (MFSK_ACK_SACK_ENABLED
+									&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
+								{
+									// Phase B Wave 1 flag-day (fact-doc §11.2): bitmap is 30 bits (was 32).
+									uint32_t bitmap_u32;
+									if (data_batch_size >= 30)      bitmap_u32 = 0x3FFFFFFFu;
+									else if (data_batch_size <= 0)  bitmap_u32 = 0u;
+									else                            bitmap_u32 = (1u << data_batch_size) - 1u;
+									printf("[RSP-MFSK-SACK] prev-delivered path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
+										(unsigned)prev_ack_bsi, (unsigned)bitmap_u32, data_batch_size);
+									fflush(stdout);
+									long long mfsk_ms = send_mfsk_ack_sack(prev_ack_bsi, bitmap_u32);
+									if (mfsk_ms > 0)
+									{
+										printf("[TX-ACK-SACK] prev-delivered via MFSK suffix wire_ms=%lld\n", mfsk_ms);
+										fflush(stdout);
+										prev_used_mfsk_path = true;
+									}
+									else
+									{
+										printf("[RSP-MFSK-SACK] MFSK suffix returned 0 on prev-delivered -- falling back to legacy MFSK ACK pattern\n");
+										fflush(stdout);
+									}
+								}
+								if (!prev_used_mfsk_path)
+								{
+									// NB or MFSK-suffix unavailable: legacy MFSK ACK pattern (receiver
+									// treats any pattern hit as a clean ACK -- same as the clean funnel).
+									send_ack_pattern();
+								}
+							}
 						}
 					}
 					else
@@ -2092,17 +2142,31 @@ void cl_arq_controller::process_control_responder()
 		{
 			// Update batch size now that SACK is negotiated. 30s target
 			// matches the formula in arq_common.cc + arq_commander.cc.
-			int max_batch = (message_transmission_time_ms > 0)
-				? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
-			if(max_batch < 5) max_batch = 5;
-			if(max_batch > nMessages) max_batch = nMessages;
-			int new_batch = radio_batch_size;
-			if(new_batch > max_batch) new_batch = max_batch;
-			set_data_batch_size(new_batch);
-			nominal_batch_size = new_batch;
+			//
+			// climb-engine Bug 2 (gearshift-climb-engine.md §3): MUST mirror the
+			// commander gate (arq_commander.cc SACK block) so CMD and RSP agree on
+			// data_batch_size for the negotiated config. ROBUST/MFSK configs are
+			// EXCLUDED from the >=5 floor — load_configuration() (arq_common.cc:
+			// 1229-1234) pins data_batch_size=1 for robust; re-applying the floor
+			// here would force RSP to batch>=5 while CMD stays at 1, a CMD/RSP
+			// batch mismatch. The responder gates on current_configuration (== the
+			// established connect config at TEST_CONNECTION time, == ROBUST_0 for a
+			// robust connect, < 100 for OFDM). OFDM keeps the >=5 floor unchanged.
+			if(!is_robust_config(current_configuration))
+			{
+				int max_batch = (message_transmission_time_ms > 0)
+					? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+				if(max_batch < 5) max_batch = 5;
+				if(max_batch > nMessages) max_batch = nMessages;
+				int new_batch = radio_batch_size;
+				if(new_batch > max_batch) new_batch = max_batch;
+				set_data_batch_size(new_batch);
+				nominal_batch_size = new_batch;
+			}
 			recalculate_ack_timeout_for_batch();
-			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d)\n",
-				radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size);
+			printf("[SACK] Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+				radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
+				is_robust_config(current_configuration) ? 1 : 0);
 		}
 		else
 		{

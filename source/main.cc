@@ -345,6 +345,7 @@ int main(int argc, char *argv[])
                                         // panic counter, and BREAK still reaches ROBUST_0. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §8.
     bool test_clean_batch_viability_cli = false; // --test-clean-batch-viability: CLEAN-BATCH VIABILITY regression (§9).
+    bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
                                         // up-promotion gate; a CLEAN all-ones batch does all of those; and that BREAK can
@@ -815,6 +816,14 @@ int main(int argc, char *argv[])
             // exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §9.8.
             test_clean_batch_viability_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-climb-engine") == 0)
+        {
+            // Integrated 3-bug climb regression — one-shot at startup, then exit
+            // with the test's rc. See fact-documents/gearshift-climb-engine.md §7.
+            test_climb_engine_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1825,6 +1834,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_clean_batch_viability();
             printf("[FLAG] Clean-batch-viability test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_climb_engine_cli) {
+            // Integrated 3-bug climb regression (one-shot, then exit rc). Drives
+            // the split SACK dedupe (Bug 1), the REAL Axis-2 robust guard
+            // (Bug 2/3), and the end-to-end multi-rung climb (Bug 3 — the
+            // assertion the C1/C2/C3 singles lacked). See
+            // fact-documents/gearshift-climb-engine.md §7.
+            printf("[FLAG] --test-climb-engine: invoking integrated 3-bug climb "
+                   "regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_climb_engine();
+            printf("[FLAG] Climb-engine test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
