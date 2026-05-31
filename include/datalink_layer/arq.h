@@ -359,6 +359,28 @@ public:
   void cleanup();
   void finish_turbo_direction();
 
+  // REAL FAST-PROBE follow-up (gearshift-climb-engine.md §18) — the SNR-decode
+  // arm MUST be FALSE on every data-ACK wait. §14 (A1) widened the arm
+  // (turbo_snr_ack_armed_for_gearshift) to fire on a steady-state +1 gearshift
+  // SET_CONFIG; on the common +1 step the SET_CONFIG-ACK apply takes the
+  // steady-state re-trigger `else` branch (arq_commander.cc:4702), the
+  // re-trigger does NOT fire (gap<3), and connection_status=TRANSMITTING_DATA
+  // (:4753) WITHOUT clearing the flag — so the next DATA ACK was decoded with the
+  // arm stale-true and a SACK-suffixed data ACK polluted measurements.SNR_uplink.
+  // finish_turbo_direction() (:3792, the only non-init clearer) is NOT on the
+  // steady-state FRAME-UP path, so the original "guard (3)" no longer holds for
+  // the widened arm. This single chokepoint restores the invariant: it clears the
+  // arm at EVERY entry into a data-ACK wait. All three RECEIVING_ACKS_DATA entries
+  // call it (the data-TX setups arq_commander.cc:~1317 / :~1813 and the
+  // REPEAT_LAST_ACK re-wait :~1148); every TRANSMITTING_DATA transition funnels
+  // through process_messages_tx_data() before any data-ACK wait, so the data-TX
+  // setups cover them all, and the REPEAT_LAST_ACK site covers the one direct
+  // entry that bypasses process_messages_tx_data(). Called AFTER the control-ACK
+  // suffix is already decoded in process_messages_rx_acks_control() (:1855), so
+  // A1's mid-climb SNR decode is PRESERVED — only the post-control, pre-data clear
+  // is added. Part N drives this exact method. See §18.
+  void clear_snr_arm_for_data_ack_wait() { turbo_snr_ack_enabled = false; }
+
 	//! registers the ack of a data message.
 	    /*!
 	      \param message_id is the id of the received message (its location in the buffer).
@@ -954,10 +976,18 @@ public:
   // satisfy either disjunct → its SACK suffix is never routed to the SNR decoder.
   // This is structurally enforced THREE ways: (1) the `control_code==SET_CONFIG`
   // gate here; (2) the arm is written only inside the `data[0]==SET_CONFIG`
-  // control-TX block (arq_commander.cc:1050); (3) finish_turbo_direction()
-  // unconditionally CLEARS turbo_snr_ack_enabled (arq_commander.cc:3693) before
-  // any TRANSMITTING_DATA transition, so the flag is provably false on every data
-  // ACK wait. The widening adds NO path that arms on a non-SET_CONFIG code — the
+  // control-TX block (arq_commander.cc:1082); (3) clear_snr_arm_for_data_ack_wait()
+  // clears turbo_snr_ack_enabled at EVERY entry into a data-ACK wait (the three
+  // RECEIVING_ACKS_DATA sites), so the flag is provably false on every data ACK
+  // wait. [CORRECTED 2026-05-31, gearshift-climb-engine.md §18: guard (3) USED to
+  // cite finish_turbo_direction() (arq_commander.cc:3792), which clears the arm on
+  // every TURBO teardown. That held for the ORIGINAL turbo-only arm, but A1 widened
+  // the arm to fire on a steady-state +1 gearshift SET_CONFIG — a path that takes
+  // the re-trigger `else` branch (:4702→:4753) and NEVER calls
+  // finish_turbo_direction(). The widened arm therefore LEAKED into the next data
+  // ACK (a §5 sibling bug an adversarial review caught). The dedicated
+  // data-ACK-wait clear is the correct guard (3) for the widened arm.] The widening
+  // adds NO path that arms on a non-SET_CONFIG code — the
   // existing Part H tests H2/H2b/H3 (DATA ACK / SWITCH_ROLE / non-turbo-non-up
   // SET_CONFIG do NOT arm) stay green by construction. PURE (no side effects) so
   // Part J' (FP-J1) replays the identical expression. See §14.

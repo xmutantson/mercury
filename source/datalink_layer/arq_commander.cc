@@ -1110,7 +1110,13 @@ void cl_arq_controller::process_messages_tx_control()
 			// supplies). For a NON-turbo SET_CONFIG (e.g. break-recovery at
 			// TURBO_DONE) this evaluates FALSE — symmetric with the RSP, which
 			// also sends a bare ACK (no suffix) there. The flag is cleared by
-			// finish_turbo_direction() (:3657) before any data flows, so a data
+			// clear_snr_arm_for_data_ack_wait() at every data-ACK-wait entry (sec
+			// 18) before any data flows. [CORRECTED 2026-05-31: previously cited
+			// finish_turbo_direction() (:3792) as the clearer -- true for the
+			// turbo-only arm, but the A1 widening (below) arms on a steady-state +1
+			// gearshift SET_CONFIG whose ACK-apply (:4702->:4753) never calls
+			// finish_turbo_direction(); the dedicated data-ACK-wait clear is the
+			// correct guard. See sec 18.] So a data
 			// ACK's SACK suffix is NEVER routed to the SNR decoder (§7 collision
 			// audit). Mirrors the re-trigger's own true-write; no clobber (the
 			// re-trigger sets turboshift_active before queueing this SET_CONFIG).
@@ -1145,6 +1151,12 @@ void cl_arq_controller::process_messages_tx_control()
 			messages_control.status=FREE;
 			messages_control.type=NONE;
 
+			// §18: this is the ONE RECEIVING_ACKS_DATA entry that bypasses
+			// process_messages_tx_data() (the data-TX setups at :~1317/:~1813 clear
+			// the arm for every TRANSMITTING_DATA→data-wait route). Clear here too so
+			// the arm is provably false on EVERY data-ACK wait without any transitive
+			// "a data-TX always preceded this" assumption (CLAUDE.md §5).
+			clear_snr_arm_for_data_ack_wait();
 			connection_status=RECEIVING_ACKS_DATA;
 		}
 	}
@@ -1314,6 +1326,7 @@ void cl_arq_controller::process_messages_tx_data()
 			telecom_system->data_container.frames_to_read = 4;
 		data_ack_received = NO;
 		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
+		clear_snr_arm_for_data_ack_wait(); // §18: arm MUST be false on every data-ACK wait
 		connection_status = RECEIVING_ACKS_DATA;
 		ack_diag_peak_matched = 0;
 		ack_diag_peak_metric = 0.0;
@@ -1810,6 +1823,7 @@ void cl_arq_controller::process_messages_tx_data()
 		}
 		data_ack_received=NO;
 		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
+		clear_snr_arm_for_data_ack_wait(); // §18: arm MUST be false on every data-ACK wait
 		connection_status=RECEIVING_ACKS_DATA;
 		ack_diag_peak_matched = 0;
 		ack_diag_peak_metric = 0.0;
@@ -8181,6 +8195,133 @@ int cl_arq_controller::test_climb_engine()
 			check(m_floor_idx == 0,
 				"M4 -R anchor floor is the BOTTOM ladder rung (idx 0 = ROBUST_0), independent of init_configuration",
 				m_floor_idx, 0);
+		}
+
+		// ================================================================
+		// Part N — SNR-ARM LEAK INTO THE DATA-ACK WAIT (gearshift-climb-engine.md
+		// §18). The §5 sibling bug an adversarial review caught: §14 (A1) widened the
+		// CMD's SNR-decode arm (turbo_snr_ack_armed_for_gearshift) to fire on a
+		// steady-state +1 gearshift SET_CONFIG. On the COMMON +1 step the SET_CONFIG
+		// ACK applies (arq_commander.cc:4466), takes the steady-state re-trigger
+		// `else` branch (:4702), the re-trigger does NOT fire (gap=1 <
+		// SUPERSHIFT_RETRIGGER_CONFIGS=3 → retriggered=false), and the
+		// `if(!retriggered)` block sets connection_status=TRANSMITTING_DATA (:4753)
+		// WITHOUT clearing turbo_snr_ack_enabled. finish_turbo_direction() (:3792, the
+		// only non-init clearer) is NOT on this path. So the NEXT DATA ACK was decoded
+		// with the arm STALE-TRUE → receive_ack_pattern() took the SNR-suffix branch
+		// (arq_common.cc:5421/5473 longer pattern_len, :5537 decode) → a BOGUS
+		// measurements.SNR_uplink from the data-ACK tail (:5576), perturbing the §13/§14
+		// elevator and the first post-promotion data-ACK detection. Pre-A1 the arm was
+		// never set for a steady-state SET_CONFIG, so the invariant "turbo_snr_ack_enabled
+		// is FALSE on every data-ACK wait" held; A1 broke it.
+		//
+		// THE GAP THIS PART CLOSES: the existing Part H drives only the PURE arm helper
+		// in isolation; NO test drove the SEQUENCE (arm via A1 → a non-re-triggering
+		// SET_CONFIG ACK → assert the arm is FALSE before the data-ACK wait). Part N
+		// drives that sequence at member granularity (the Part L idiom — real `this->`
+		// members + the REAL production method clear_snr_arm_for_data_ack_wait() that
+		// all three RECEIVING_ACKS_DATA entries call). FAIL-BEFORE: a LIVE side-by-side
+		// arm replays the pre-fix `if(!retriggered)` path (the clear absent) and asserts
+		// the arm would STILL be true entering the data-ACK wait — the leak. PASS-AFTER:
+		// the real clear forces it false. Pure local state, no wire/PHY.
+		// ================================================================
+		{
+			robust_enabled = NO;          // an OFDM-tier steady-state ladder climb
+			narrowband_enabled = NO;
+			gear_shift_on = YES;
+			optimizer_disabled = true;
+
+			// N0 — the leak precondition: a STEADY-STATE (TURBO_DONE) modem, turbo
+			// inactive, on the common +1 gearshift step (the SET_CONFIG raises the
+			// config index by exactly one rung). This is the un-tested path: NOT a
+			// turbo SET_CONFIG (Part H), NOT a re-trigger (gap<3 so the elevator never
+			// fires), NOT a break-recovery settle.
+			turboshift_active = false;
+			turboshift_phase  = TURBO_DONE;
+			current_configuration    = CONFIG_4;          // live rung
+			negotiated_configuration = CONFIG_5;          // the +1 promotion target
+			bool n_config_up = config_ladder_index(negotiated_configuration) >
+			                   config_ladder_index(current_configuration);
+			check(n_config_up == true,
+				"N0 leak precondition: steady-state TURBO_DONE upward +1 gearshift SET_CONFIG",
+				n_config_up ? 1 : 0, 1);
+
+			// N1 — A1 ARMS the SNR decode on this steady-state gearshift SET_CONFIG.
+			// Replay the REAL production assignment at arq_commander.cc:1134 (the SAME
+			// helper, the SAME args the call site computes). This is the arm that MUST
+			// be true when the SET_CONFIG-ACK suffix is decoded in
+			// process_messages_rx_acks_control() (:1855) — A1's whole purpose.
+			turbo_snr_ack_enabled = turbo_snr_ack_armed_for_gearshift(
+				turboshift_active, turboshift_phase, SET_CONFIG,
+				/*gear_shift_enabled=*/gear_shift_on == YES, /*config_up=*/n_config_up);
+			check(turbo_snr_ack_enabled == true,
+				"N1 A1 arms the SNR decode on the steady-state +1 gearshift SET_CONFIG (intended use)",
+				turbo_snr_ack_enabled ? 1 : 0, 1);
+
+			// --- model the SET_CONFIG-ACK apply taking the NON-re-trigger else branch
+			// (arq_commander.cc:4702): gap = idx(snr_ideal) - idx(current). On a +1
+			// step the elevator's snr_ideal is at most current+1 here (deep/no SNR), so
+			// gap < SUPERSHIFT_RETRIGGER_CONFIGS=3 → the re-trigger does NOT fire.
+			int n_snr_ideal = config_ladder_up_n(current_configuration, 1, robust_enabled, narrowband_enabled == YES);
+			int n_gap = config_ladder_index(n_snr_ideal) - config_ladder_index(current_configuration);
+			bool n_retriggered = (n_gap >= SUPERSHIFT_RETRIGGER_CONFIGS);  // false (gap=1)
+			check(n_retriggered == false,
+				"N1b the +1 SET_CONFIG ACK does NOT re-trigger (gap=1 < SUPERSHIFT_RETRIGGER_CONFIGS=3)",
+				n_retriggered ? 1 : 0, 0);
+
+			// N2a (FAIL-BEFORE arm, LIVE) — replay the PRE-FIX `if(!retriggered)` body
+			// VERBATIM: it set frame_gearshift_just_applied + connection_status=
+			// TRANSMITTING_DATA but did NOT clear the arm. So the arm is STILL true
+			// when the modem next enters the data-ACK wait — THE LEAK. (No clear call.)
+			bool n_arm_prefix = turbo_snr_ack_enabled;   // pre-fix: untouched by the else branch
+			if(!n_retriggered)
+			{
+				// frame_gearshift_just_applied = true; connection_status=TRANSMITTING_DATA;
+				// (the pre-fix statements — neither touches turbo_snr_ack_enabled)
+			}
+			check(n_arm_prefix == true,
+				"N2a FAIL-BEFORE: pre-fix steady-state SET_CONFIG-ACK else branch LEAVES the arm TRUE entering the data wait (the leak)",
+				n_arm_prefix ? 1 : 0, 1);
+
+			// N2 (THE PASS-AFTER assertion) — the data-TX setup (process_messages_tx_data,
+			// arq_commander.cc:~1317/~1813) runs on the next tick before any data-ACK
+			// wait and calls the REAL clear. Drive the SAME production method. The arm
+			// MUST now be false on the data-ACK wait — the invariant restored.
+			clear_snr_arm_for_data_ack_wait();
+			check(turbo_snr_ack_enabled == false,
+				"N2 PASS-AFTER: clear_snr_arm_for_data_ack_wait() forces the arm FALSE before the data-ACK wait (invariant restored)",
+				turbo_snr_ack_enabled ? 1 : 0, 0);
+
+			// N3 — A1 PRESERVED. The clear is AFTER the control-ACK decode, not before:
+			// the arm helper STILL returns true for the gearshift SET_CONFIG, so the
+			// SNR suffix is still decoded in the control path (:1855). Re-evaluate the
+			// REAL helper to prove the widening is intact (the fix only ADDS a later
+			// clear; it does not narrow the arm).
+			bool n_a1_intact = turbo_snr_ack_armed_for_gearshift(
+				false, TURBO_DONE, SET_CONFIG, /*gear_shift_enabled=*/true, /*config_up=*/true);
+			check(n_a1_intact == true,
+				"N3 A1 PRESERVED: the arm helper still returns TRUE for the gearshift SET_CONFIG (clear is AFTER the control-ACK decode)",
+				n_a1_intact ? 1 : 0, 1);
+
+			// N4 — the REPEAT_LAST_ACK re-wait (arq_commander.cc:~1148) is the ONE
+			// RECEIVING_ACKS_DATA entry that bypasses process_messages_tx_data(); it
+			// calls the SAME clear. Re-arm, then drive the clear again → false.
+			turbo_snr_ack_enabled = true;                  // a stale arm leaked this far (hypothetically)
+			clear_snr_arm_for_data_ack_wait();             // the :1148 site's call
+			check(turbo_snr_ack_enabled == false,
+				"N4 REPEAT_LAST_ACK re-wait also clears the arm (covers the one process_messages_tx_data bypass)",
+				turbo_snr_ack_enabled ? 1 : 0, 0);
+
+			// N5 — §5 SACK-PRESERVATION: even if the arm were stale-true entering a
+			// data-ACK wait, the clear forces it false BEFORE receive_ack_pattern()
+			// reads it for the data ACK, so a SACK-suffixed data ACK is NEVER routed
+			// to the SNR decoder (the bug's downstream symptom). And the arm helper
+			// itself is false for a DATA ACK frame type (ACK_RANGE) — defense-in-depth.
+			bool n_dataack_arms = turbo_snr_ack_armed_for_gearshift(
+				false, TURBO_DONE, ACK_RANGE, /*gear_shift_enabled=*/true, /*config_up=*/true);
+			check(n_dataack_arms == false && turbo_snr_ack_enabled == false,
+				"N5 SACK preserved: arm is false for a DATA ACK (ACK_RANGE) AND cleared before the data-ACK wait",
+				(n_dataack_arms ? 2 : 0) + (turbo_snr_ack_enabled ? 1 : 0), 0);
 		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
