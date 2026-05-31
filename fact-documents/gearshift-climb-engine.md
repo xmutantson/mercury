@@ -37,6 +37,28 @@ clean batch, unlike the dormant SUPERSHIFT re-trigger) via a SHARED
 no anchor raise / no turbo storm (B). In-process verified (Part J',
 fail-before/pass-after); the wire proofs (SNR_uplink leaving −99.9; @WGN:-10
 no-thrash; @WGN:30 multi-rung jump) are the parent's HARDWARE verification.
+**§15 (2026-05-31, stacks on 94e80a6)**: §14 REGRESSED the af14a9e over-climb guard
+at WGN:-10 (control-plane MFSK-suffix SNR over-reports OFDM-data viability → the
+elevator jumped CFG_0→4→9 from a ROBUST anchor). §15 re-asserted the data-anchor
+INSIDE `supershift_retrigger_target` (`is_ofdm_config(anchor)` on
+`high_confidence_jump` + a `RETRIGGER_MAX_LEAP` bound). In-process verified (Part
+J''); necessary-but-INSUFFICIENT — it gated ONLY the elevator helper.
+**§16 (2026-05-31, stacks on edb8600)**: ANCHOR-TIER-CORRUPTION — the two siblings
+§15's elevator-only gate did not cover. ROOT-1: the anchor-raise producer
+(`arq_commander.cc:3617`) credited the LIVE `current_configuration`, which races
+ahead of the delivered batch once a FRAME-UP/turbo SET_CONFIG is queued — a
+ROBUST-tier clean ACK could poison the anchor into the OFDM tier, opening the §15
+gate. Fix: a PURE `data_anchor_raise_target()` credits `clean_batches_config` (the
+streak's HOME, the authoritative delivered config) and refuses a ROBUST→OFDM cross
+whose live tier disagrees. ROOT-2: the turbo-forward ladder
+(`arq_commander.cc:4602-4621`) had NO `last_data_viable_config` clamp (SNR-SUPERSHIFT
+/ step-1 ratcheted CFG_4→9 unbounded); fix routes its target through the SAME shared
+`supershift_retrigger_target` chokepoint (anchor+1 at a robust anchor, anchor+MAX_LEAP
+at an OFDM anchor). PRE-EXISTING bug exposed by the ③ fast-probe (446887c climbed too
+slowly to reach the rocket). In-process verified (Parts K/K'/K'', fail-before/
+pass-after — incl. a temp-revert proving the production helper is load-bearing); the
+wire proofs (WGN:-10 holds ROBUST_0 + no CFG_4→9 ratchet; WGN:30 keeps the fast ~3k
+climb) are the parent's HARDWARE re-test.
 
 This doc owns the producer/consumer/invariant facts for the CLIMB promotion
 state shared CMD↔RSP: `last_data_viable_config`, `consecutive_data_acks`,
@@ -1600,6 +1622,257 @@ an OFDM anchor at a gap ≤ 13, so it is unaffected).
 **HONEST scope** (§8 applies): in-process Part J'' proves the jump is BLOCKED at a
 ROBUST anchor (regression closed) and PRESERVED-but-bounded at an OFDM anchor. The
 WIRE proofs — WGN:-10 actually holding ROBUST_0 (anchor never leaves ROBUST on the
+IONOS) and WGN:30 keeping the fast ~3k climb — are the parent's HARDWARE re-test.
+
+---
+
+## §16 ANCHOR-TIER-CORRUPTION — credit the delivered config + clamp the turbo ladder
+
+**SHIPPED on `fix/fast-probe` (this commit, stacked on edb8600).** §15 (edb8600)
+re-asserted the data-anchor INSIDE the elevator helper (`is_ofdm_config(anchor)` on
+`high_confidence_jump`) — necessary, but it only gated the ONE elevator chokepoint.
+It was NECESSARY-but-INSUFFICIENT: it moved the breach. Two siblings the §15
+elevator-only gate did not cover:
+
+1. **The anchor-raise producer itself could be POISONED into the OFDM tier on
+   robust evidence** (ROOT-1). Once the anchor reaches an OFDM config,
+   `is_ofdm_config(anchor)=true` and the §15 elevator gate OPENS, the SNR
+   re-trigger fires (cmd.log:4829 `current 0`), and the turbo launches.
+2. **The turbo-forward ladder has NO anchor clamp** (ROOT-2). The SNR-SUPERSHIFT /
+   SNR-capped-step-1 / blind targets (`arq_commander.cc:4602-4621`) are bounded only
+   by the proven-ceiling + WB/NB ceiling — NOT by `last_data_viable_config`. So a
+   launched turbo ratchets CONFIG_4 → CONFIG_9 on phantom ACK matches with no anchor
+   bound. The §15 fix never touched this path.
+
+PRE-EXISTING: baseline 446887c also corrupted the anchor to CONFIG_0, but
+`frame_shift_threshold=3` climbed slowly enough that BREAK/demote caught it
+pre-rocket. The adaptive fast-probe (③, threshold→1) climbs past the catch point,
+so the latent corruption became a live over-climb. **This is a PRE-EXISTING bug
+exposed by the fast-probe, not a fast-probe bug.**
+
+### §16.0 STEP 0 — the EXACT anchor-raise ordering (cited; the precise hole)
+
+The diagnosis hypothesised a same-pass ordering bug ("the 3rd ROBUST ACK is credited
+AFTER the FRAME-UP SET_CONFIG advanced the config to CONFIG_0"). Reading the code
+PINS the exact ordering — and the literal same-pass hypothesis does NOT hold; the
+real hole is subtler:
+
+- **Anchor-raise (the credit)**: `arq_commander.cc:3617-3636`, inside the
+  `data_ack_received==YES` branch (the DATA-ACK pass). PRE-§16 it set
+  `last_data_viable_config = current_configuration` (the **live** config), gated by
+  `clean_batches_at_current_config >= sustained_anchor_threshold(current_configuration)`.
+- **FRAME-UP config-advance**: the FRAME-UP block (`arq_commander.cc:3654-3764`)
+  sets `negotiated_configuration = proposed_frame` (`:3729`) — it does **NOT** write
+  `current_configuration`. It queues a SET_CONFIG and `return`s (`:3763`).
+- **`current_configuration` actually advances in a SEPARATE pass** at the
+  SET_CONFIG-ACK apply site `arq_commander.cc:4456-4460`
+  (`prev_configuration = current_configuration; load_configuration(data_configuration,…)`).
+  AND `data_configuration` is advanced even earlier, at SET_CONFIG **TX** time
+  (`arq_commander.cc:1082-1086`, `data_configuration = negotiated_configuration` when
+  the promotion frame is queued) — BEFORE the RSP ACKs and before any data delivers
+  at the new rung.
+
+**Conclusion (cited)**: on the STEADY-STATE data path the credit at `:3617` sees the
+delivered `current_configuration` — there is no literal same-pass mis-credit. The
+hole is that the producer credited the **LIVE** `current_configuration`, which (a)
+both `current_configuration` AND `data_configuration` race ahead of the delivered
+batch once a FRAME-UP/turbo SET_CONFIG is queued/applied, and (b) `clean_batches_*`
+(the only state that records WHERE the cleans actually landed) is the authoritative
+"delivered config", not the live config. A robust-fragment clean credit that fires
+while the live config has crossed to CONFIG_0 (a late/duplicate robust ACK, or two
+phantom all-ones matches counted "at" CONFIG_0) seats the anchor at CONFIG_0 on
+robust evidence. The fix is to credit `clean_batches_config` (the streak's HOME) and
+to refuse a ROBUST→OFDM crossing whose live tier disagrees with the streak's claim —
+i.e. "capture the delivered config before the advance," exactly as the diagnosis
+prescribed, just expressed via the streak-home rather than a same-pass capture.
+
+### §16.1 ROOT-1 — the anchor reflects PROVEN delivery PER TIER
+
+**The PURE helper** `data_anchor_raise_target(streak_config, live_config,
+current_anchor, clean_streak)` (`arq.h`, immediately after
+`sustained_anchor_threshold`) is now the SOLE on-delivery anchor-raise decision:
+
+- **Before (edb8600, `arq_commander.cc:3617-3620`)**:
+  ```cpp
+  if(clean_batches_at_current_config >= sustained_anchor_threshold(current_configuration) &&
+     config_ladder_index(current_configuration) > config_ladder_index(last_data_viable_config))
+      last_data_viable_config = current_configuration;     // credits the LIVE config
+  ```
+- **After (`arq_commander.cc:3634-3636`)**:
+  ```cpp
+  last_data_viable_config = data_anchor_raise_target(
+      clean_batches_config, current_configuration,
+      last_data_viable_config, clean_batches_at_current_config);
+  ```
+
+The helper: (Rule 2) requires `clean_streak >= sustained_anchor_threshold(streak_config)`
+(§11 — robust N=1, OFDM N=2); (Rule 1) never lowers; (TIER GATE) credits
+`streak_config` (the cleans' HOME — survives the live-config advance) and refuses a
+`is_robust(current_anchor) && is_ofdm(streak_config)` crossing when
+`!is_ofdm_config(live_config)` (the corruption signature: the streak claims OFDM but
+the live tier is robust). Because a ROBUST-tier delivery has a ROBUST `streak_config`,
+it can only ever seat a ROBUST anchor — a ROBUST fragment-ACK can NEVER push the
+anchor past the top ROBUST rung. A within-ROBUST advance (ROBUST_1→ROBUST_2) is
+UNAFFECTED (there `streak_config` is robust ⇒ the cross condition is false). A genuine
+OFDM delivery (`streak_config`=CONFIG_0, N_OFDM=2 cleans AT CONFIG_0) raises the
+anchor to CONFIG_0 unimpeded — WGN:30 preserved (§16.3 below).
+
+On the steady-state data path `clean_batches_config == current_configuration` (§11
+pins them on the same clean), so the change is a NO-OP there; it BITES only when the
+live config has advanced ahead of the streak — the corruption scenario.
+
+### §16.2 ROOT-2 — clamp the unanchored turbo-forward ladder
+
+The turbo target (`negotiated_configuration` after the three SNR branches +
+the WB/NB ceiling, `arq_commander.cc:4602-4629`) is now routed through the SAME
+shared chokepoint the §13/§14/§15 elevator uses (`arq_commander.cc:4631-4635`):
+
+```cpp
+negotiated_configuration = supershift_retrigger_target(
+    negotiated_configuration, effective_snr,
+    last_data_viable_config, optimizer_is_in_control(),
+    robust_enabled, narrowband_enabled == YES);
+```
+
+`supershift_retrigger_target` (the §15-hardened helper): at a ROBUST anchor
+(`is_ofdm_config(anchor)=false`) it clamps the target to `anchor+1`; at an OFDM
+anchor it bounds the jump to `anchor + RETRIGGER_MAX_LEAP (=13)`; when the optimizer
+owns the band it returns the target unchanged (Q-table authority preserved). It only
+ever LOWERS the target (never raises), READS but never RAISES the anchor.
+
+- **WGN:-10** (anchor stays ROBUST by ROOT-1): a turbo launched at the OFDM-entry
+  rung is clamped to ROBUST_2+1=CONFIG_0 — it CANNOT ratchet up the OFDM tier. The
+  target falls to/below `current_configuration`, the data-fail BREAK re-engages, and
+  the link falls back to ROBUST_0 (af14a9e restored on the turbo path too). The
+  CONFIG_4→9 ratchet is dead.
+- **WGN:30** (anchor reaches CONFIG_0 legitimately): the turbo from CONFIG_0 at high
+  SNR is bounded to CONFIG_13 (anchor+MAX_LEAP) — a big multi-rung jump, PRESERVED.
+  As the anchor ratchets CONFIG_13→CONFIG_16 the climb reaches the top in ≤2 bounded
+  leaps (§15.2's documented behavior).
+
+**With ROOT-1 keeping the anchor at ROBUST at WGN:-10, ROOT-2 clamps the turbo to
+ROBUST → no OFDM ratchet.** The two fixes are complementary: ROOT-1 makes the anchor
+honest; ROOT-2 bounds every turbo/elevator target by that honest anchor.
+
+### §16.3 §5 cross-layer audit (CLAUDE.md §5)
+
+Shared state touched: `last_data_viable_config` (the anchor — ROOT-1 changes the
+RAISE producer's INPUT config; ROOT-2 adds a READ at the turbo chokepoint) and
+`negotiated_configuration` (ROOT-2 lowers the turbo target). NO new anchor WRITER is
+added — both fixes are read-time discipline.
+
+**Producers of `last_data_viable_config`** (UNCHANGED set):
+- RAISE (sole on-delivery): §1.1/§11 → NOW the `data_anchor_raise_target()` helper
+  (`arq_commander.cc:3634`), keyed on `clean_batches_config`. Still the ONLY
+  on-delivery raise; still gated by `promotion_allowed_on_batch` + §11 sustained-N.
+- DEMOTE: §10 `anchor_demote_target` (`arq_commander.cc:3503`). UNTOUCHED.
+- ctor + reset_session_state init. UNTOUCHED.
+
+**Consumers of `last_data_viable_config`** (UNCHANGED set): the four +1-clamp sites
+(FRAME-UP `:3667`, LADDER-UP twin `:4869`/`:5026`), `break_target_with_anchor` (both
+BREAK sites), and the elevator chokepoint `supershift_retrigger_target` (re-trigger
+`:4682` + FRAME-UP elevator `:3733`) — and NOW ALSO the ROOT-2 turbo-ladder clamp
+(`:4631`, the SAME helper). ROOT-2 adds ONE consumer (the turbo clamp) that READS the
+anchor; it adds no producer.
+
+**The five required verifications:**
+
+1. **WGN:30 PRESERVED (ROOT-1 does NOT delay/block a real OFDM delivery).** At high
+   SNR the OFDM tier delivers REAL full batches, so the ROBUST→OFDM boundary
+   qualifier is satisfied immediately: two consecutive clean CONFIG_0 batches
+   (N_OFDM=2) seat `clean_batches_config=CONFIG_0, streak=2`; `data_anchor_raise_target`
+   then returns CONFIG_0 (the cross is `is_ofdm(streak_config=CONFIG_0)=true`, and
+   `live_config=CONFIG_0` is OFDM so the belt-and-suspenders guard does NOT fire).
+   The anchor reaches CONFIG_0 LEGITIMATELY, `is_ofdm_config(anchor)=true`, and §15 +
+   ROOT-2-capped turbo still do the multi-rung jump (bounded to anchor+MAX_LEAP).
+   The fix adds at most a confirm-at-CONFIG_0 delay (the 2nd clean), NOT a permanent
+   block. **Part K''2/K''3 assert exactly this** (2nd CONFIG_0 clean raises the
+   anchor; the elevator then jumps multi-rung from the OFDM anchor). ✓
+2. **#2 anti-thrash PRESERVED/STRENGTHENED.** ROOT-1 makes the anchor HARDER to raise
+   (it must reflect the streak's home tier), which STRENGTHENS the BREAK-to-ROBUST_0
+   path (`break_target_with_anchor` floors to a LOWER, honest anchor). ROOT-2 only
+   LOWERS turbo targets (never raises), so no new thrash is introduced. The §10
+   anchor-demotion and §11 sustained-raise are UNTOUCHED. `break_target_with_anchor`
+   (`arq_commander.cc:147-154`) is byte-unchanged — it still floors to
+   `last_data_viable_config` (now honest) and bypasses under the breaks≥2 panic. ✓
+3. **No NEW producer of `last_data_viable_config`.** Both fixes are read-time
+   clamps/qualifiers. ROOT-1 changes which config the EXISTING raise credits (a
+   read-time choice between `clean_batches_config` and the live config); ROOT-2 adds a
+   READ at the turbo clamp. Neither adds a write site. ✓
+4. **The +1-clamp / LADDER-UP / SACK paths are UNTOUCHED.** ROOT-1 edits only the
+   anchor-raise producer; ROOT-2 edits only the turbo-ladder target. The FRAME-UP +1
+   clamp (`:3667`), the LADDER-UP twins, the SACK suffix decode, and the §14 (A1) arm
+   are byte-unchanged. ✓
+5. **optimizer (Q-table) authority PRESERVED.** ROOT-2's clamp passes
+   `optimizer_is_in_control()` to `supershift_retrigger_target`, which returns the
+   target unchanged when the Q-table owns the band — the same exemption the elevator
+   and the +1 clamp already honor. ✓
+
+### §16.4 Producers / consumers — what §16 changes
+
+- **`last_data_viable_config`** (anchor): ROOT-1 changes the RAISE producer's input
+  config (now `clean_batches_config`, the streak home) via the new helper; ROOT-2
+  adds a READ at the turbo clamp. No new write site.
+- **`negotiated_configuration`** (turbo target): ROOT-2 routes it through
+  `supershift_retrigger_target` after the ceiling caps — the post-clamp value is
+  LOWERED at a robust anchor / bounded at an OFDM anchor; unchanged when ≤ anchor+1
+  or when the optimizer owns.
+- **`data_anchor_raise_target`** (new PURE helper, `arq.h`): consumed ONLY by the
+  anchor-raise producer (`:3634`) and Part K (unit test).
+
+### §16.5 Part K / K' / K'' (`--test-climb-engine`) — fail-before / pass-after
+
+Appended after Part J''. Drives the ACTUAL production decisions (the SAME helpers
+production calls), not just the elevator helper in isolation — the gap that gave the
+earlier Part J''/JJ1 FALSE confidence (elevator modeled in isolation, PASSED while
+HW FAILED).
+
+- **Part K (ROOT-1, FRAME-UP boundary)**: `anchor_raise_v16` replays the REAL
+  `data_anchor_raise_target()` (PASS-AFTER, `adaptive=true`) side-by-side with the
+  VERBATIM pre-§16 producer body (credit the LIVE config, FAIL-BEFORE,
+  `adaptive=false`). **K1**: a robust streak (home ROBUST_2, streak=2) credited while
+  live=CONFIG_0 → FAIL-BEFORE credits the LIVE CONFIG_0 (anchor poisoned into OFDM);
+  PASS-AFTER credits the home ROBUST_2 (stays ROBUST, ≤ ROBUST_2); the two DIFFER
+  (the fix bites). **K2**: the tier-gate belt-and-suspenders (streak claims OFDM but
+  live tier robust) is REFUSED. **K3**: a within-ROBUST advance (ROBUST_1→ROBUST_2,
+  N_ROBUST=1) is PRESERVED. **K4**: a single CONFIG_0 clean (N_OFDM=2 unmet) does NOT
+  raise the anchor.
+- **Part K' (ROOT-2, turbo-forward clamp)**: `turbo_clamp_v16` replays the EXACT
+  production turbo-clamp call (`supershift_retrigger_target(neg_config, effective_snr,
+  anchor, false, robust_en, nb)`, the call at `:4631`) — PASS-AFTER (`adaptive=true`)
+  vs the pre-§16 unclamped path (`adaptive=false`). **K'1**: anchor=ROBUST_2, a turbo
+  wanting CONFIG_9 at the control-plane SNR → FAIL-BEFORE ratchets to CONFIG_9
+  (unbounded); PASS-AFTER clamps to anchor+1=CONFIG_0 (≤ `config_ladder_up_n(ROBUST_2,
+  MAX_LEAP)`, strictly below CONFIG_9). **K'2**: OFDM anchor=CONFIG_0 at high SNR →
+  PRESERVED but bounded to CONFIG_13. **K'3**: a step at anchor+1 is UNCHANGED (the
+  clamp never raises).
+- **Part K'' (WGN:30 preserved, end-to-end)**: drives the REAL
+  `data_anchor_raise_target()` + the REAL `supershift_retrigger_target()`. **K''1/2**:
+  one CONFIG_0 clean does NOT raise the anchor; the 2nd consecutive CONFIG_0 clean
+  RAISES it to CONFIG_0 (genuine OFDM delivery). **K''3/4**: from the now-OFDM anchor
+  the elevator jump STILL fires (multi-rung, bounded to CONFIG_13). Proves ROOT-1 does
+  not block the legit OFDM climb.
+
+**FAIL-BEFORE evidence**: (a) each Part has a live side-by-side `adaptive=false` arm
+asserting the pre-§16 outcome (K1a credits CONFIG_0; K'1a ratchets to CONFIG_9) — the
+same documented pattern as Parts D/E/F/I/J/J''; (b) ADDITIONALLY verified 2026-05-31
+by temporarily reverting the REAL shipped `data_anchor_raise_target()` body to the
+pre-§16 "credit the live config" form and the ROOT-2 turbo call to a no-op,
+rebuilding: **K1b/K1c/K1d/K2 FAIL** (the production helper returns CONFIG_0 / the
+poisoned OFDM anchor instead of ROBUST_2/ROBUST_1); K3/K4/K''1/K''2/K''3/K''4
+correctly STAY PASS (within-tier + genuine-OFDM cases are invariant; K''3 calls the
+un-reverted elevator helper). The temp revert was reverted; the shipped helpers do
+the discipline. **PASS-AFTER**: all Part K/K'/K'' PASS; Parts A–J + J'/J'' +
+H2/H2b/H3 stay PASS (§16 is additive — ROOT-1 changes only WHICH config the raise
+credits, ROOT-2 only LOWERS the turbo target). `--test` 30/30.
+
+**HONEST scope** (§8 applies): in-process Part K/K'/K'' proves the anchor HOLDS
+ROBUST on robust deliveries (ROOT-1), the turbo target is CLAMPED at a robust anchor
+(ROOT-2), and the WGN:30 multi-rung jump is PRESERVED from a genuine OFDM anchor. The
+turbo-clamp test replays the production call's exact args (the SAME helper, the SAME
+chokepoint) — but the full in-process drive of `process_messages_commander()`'s
+turbo branch is NOT exercised (the §15.5 limitation). The WIRE proofs — WGN:-10
+actually holding ROBUST_0 (anchor never leaves ROBUST + no CFG_4→9 ratchet on the
 IONOS) and WGN:30 keeping the fast ~3k climb — are the parent's HARDWARE re-test.
 
 ---

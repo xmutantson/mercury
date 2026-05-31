@@ -656,6 +656,71 @@ public:
   { return is_robust_config(config) ? SUSTAINED_ANCHOR_N_ROBUST
                                      : SUSTAINED_ANCHOR_N_OFDM; }
 
+  // ANCHOR-TIER-CROSSING DISCIPLINE (gearshift-climb-engine.md §16) — the PURE
+  // policy that decides the new value of last_data_viable_config from a CONFIRMED
+  // clean batch. It is the SOLE on-delivery anchor-raise decision (production calls
+  // it at arq_commander.cc:3617; the unit test replays it directly). ROOT-1 of the
+  // anchor-tier-corruption fix: the anchor must reflect delivery PROVEN PER TIER, and
+  // it must be credited to the config the batch was ACTUALLY DELIVERED at — NOT a
+  // config the same-pass / cross-pass machinery has since advanced to.
+  //   streak_config    = clean_batches_config — the config at which the clean STREAK
+  //                      accumulated (the SOLE authoritative "delivered config"; §11
+  //                      pins it to current_configuration WHEN the cleans land, so it
+  //                      survives a later config advance even if current_configuration
+  //                      has moved on). Using THIS, not the live current_configuration,
+  //                      is the "capture the delivered config before the advance" fix.
+  //   current_anchor   = last_data_viable_config (the af14a9e anchor).
+  //   clean_streak     = clean_batches_at_current_config (consecutive cleans AT
+  //                      streak_config; §11 producer).
+  // Returns the (possibly raised) anchor. RULES:
+  //   1. Never LOWERS the anchor (a candidate not strictly higher is a no-op —
+  //      demotion is §10's separate producer).
+  //   2. A higher streak_config needs >= sustained_anchor_threshold(streak_config)
+  //      consecutive cleans (§11 — robust N=1, OFDM N=2).
+  //   3. THE TIER GATE (§16 ROOT-1): the anchor may CROSS from a ROBUST anchor into
+  //      the OFDM tier ONLY when the clean STREAK accumulated AT an OFDM config
+  //      (is_ofdm_config(streak_config)). A ROBUST fragment-ACK can advance the anchor
+  //      WITHIN robust (ROBUST_0->1->2) but can NEVER push it past the top ROBUST rung
+  //      into CONFIG_0+. This makes the producer STRUCTURALLY incapable of seating an
+  //      OFDM anchor on robust evidence — closing the deep-SNR over-climb at its root
+  //      (a ROBUST-tier clean ACK can no longer poison the anchor into the OFDM tier,
+  //      which is what unlocked the §15 elevator gate + the §16 ROOT-2 turbo ladder at
+  //      WGN:-10). PURE; no side effects.
+  static int data_anchor_raise_target(int streak_config, int live_config,
+                                      int current_anchor, int clean_streak)
+  {
+    // Rule 2: enough consecutive cleans AT the streak's home rung (§11).
+    if(clean_streak < sustained_anchor_threshold(streak_config))
+      return current_anchor;
+    // Rule 1: only ever RAISE — a candidate at or below the anchor is a no-op
+    // (demotion is §10's separate producer).
+    if(config_ladder_index(streak_config) <= config_ladder_index(current_anchor))
+      return current_anchor;
+    // THE §16 ROOT-1 TIER GATE: the anchor may CROSS from a ROBUST anchor into the
+    // OFDM tier ONLY when the clean streak was earned AT an OFDM config. We credit
+    // streak_config (the cleans' HOME — the authoritative "delivered config"), NOT
+    // the live current_configuration. The pre-§16 producer credited the LIVE config:
+    // if a ROBUST-tier batch's clean credit fired while current_configuration had
+    // already crossed to CONFIG_0 (e.g. a late/duplicate robust ACK arriving after
+    // the FRAME-UP SET_CONFIG advanced the live config), the anchor was poisoned to
+    // CONFIG_0 on robust evidence — which then unlocked the §15 elevator gate AND the
+    // §16 ROOT-2 turbo ladder. Crediting streak_config closes that: a ROBUST-tier
+    // delivery has a ROBUST streak_config, so streak_config can only seat a ROBUST
+    // anchor and NEVER crosses the boundary. The is_robust(current_anchor) &&
+    // is_ofdm(streak_config) crossing therefore requires a genuine OFDM streak_config
+    // (N_OFDM cleans AT that OFDM config via Rule 2). The explicit assertion below is
+    // belt-and-suspenders: if a caller ever passed a streak_config that DISAGREES with
+    // the live tier on a ROBUST->OFDM cross (the corruption signature), refuse it.
+    // It does NOT block a within-ROBUST advance (ROBUST_1->ROBUST_2): there
+    // streak_config is robust, is_ofdm_config(streak_config) is false, so the cross
+    // condition is false and the advance proceeds.
+    bool crossing_robust_to_ofdm =
+      is_robust_config(current_anchor) && is_ofdm_config(streak_config);
+    if(crossing_robust_to_ofdm && !is_ofdm_config(live_config))
+      return current_anchor;   // live tier disagrees with the streak's OFDM claim
+    return streak_config;
+  }
+
   // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, Option 3, climb
   // follow-up ③) — the clean-streak evidence bar that ARMS fast-probing at a rung.
   // Reuses the SAME viability bar §11 uses to ANCHOR a rung

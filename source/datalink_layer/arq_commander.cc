@@ -3614,10 +3614,26 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// NOT neuter the prev-path completion ACK itself — it keeps the link
 				// alive on a genuinely-good-but-lossy channel; "retransmit-rescued ≠
 				// viable" is encoded HERE in the CMD anchor gate.
-				if(clean_batches_at_current_config >= sustained_anchor_threshold(current_configuration) &&
-				   config_ladder_index(current_configuration) >
-				   config_ladder_index(last_data_viable_config))
-					last_data_viable_config = current_configuration;
+				//
+				// ANCHOR-TIER-CROSSING DISCIPLINE (gearshift-climb-engine.md §16,
+				// ROOT-1): the raise now goes through the PURE
+				// data_anchor_raise_target() helper keyed on clean_batches_config (the
+				// config the clean STREAK accumulated at — the authoritative "delivered
+				// config"), NOT the live current_configuration. The helper (a) keeps the
+				// §11 sustained-N gate, (b) only ever raises, and (c) ADDS the §16 TIER
+				// GATE: a ROBUST-anchor -> OFDM-tier crossing is licensed ONLY when the
+				// streak accumulated at an OFDM config. A ROBUST-tier clean ACK therefore
+				// can NEVER poison the anchor into the OFDM tier — even if a same-/cross-
+				// pass advance had moved current_configuration to CONFIG_0 before this
+				// robust credit fired (the pre-§16 hole that unlocked the §15 elevator +
+				// the §16 ROOT-2 turbo ladder at WGN:-10). clean_batches_config == the
+				// streak's home; §11 pins it to current_configuration on the same clean
+				// that updated the streak just above, so on the steady-state data path it
+				// equals current_configuration — the change BITES only when the live
+				// config has advanced ahead of the streak (the corruption scenario).
+				last_data_viable_config = data_anchor_raise_target(
+					clean_batches_config, current_configuration,
+					last_data_viable_config, clean_batches_at_current_config);
 			}
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
@@ -4611,6 +4627,31 @@ void cl_arq_controller::process_control_commander()
 							if(max_config_override >= 0 && negotiated_configuration > max_config_override)
 								negotiated_configuration = max_config_override;
 						}
+						// ANCHOR-TIER-CROSSING DISCIPLINE (gearshift-climb-engine.md §16,
+						// ROOT-2): the SNR-SUPERSHIFT / SNR-capped-step-1 / blind-step
+						// targets above had NO last_data_viable_config clamp — only the
+						// proven-ceiling + WB/NB ceiling. So once a turbo was launched at the
+						// OFDM-entry rung on a CONTROL-plane SNR over-report (the §15 deep-SNR
+						// mechanism), it ratcheted CONFIG_4 -> 9 on PHANTOM ACK matches with
+						// no anchor bound — the residual breach edb8600's §15 elevator-only
+						// gate did not cover. Route the turbo target through the SAME shared
+						// chokepoint the §13/§14/§15 elevator uses (supershift_retrigger_target):
+						//   - ROBUST anchor (WGN:-10): is_ofdm_config(anchor)=false ->
+						//     high_confidence_jump=false -> the target is clamped to anchor+1,
+						//     so a turbo launched at the OFDM boundary CANNOT ratchet up the
+						//     OFDM tier; the data-fail BREAK path re-engages and falls back to
+						//     ROBUST_0 (af14a9e restored on the turbo path too).
+						//   - OFDM anchor (WGN:30): clamped to anchor + RETRIGGER_MAX_LEAP, so
+						//     the fast multi-rung climb is PRESERVED (bounded), never past the
+						//     proven anchor + MAX_LEAP.
+						//   - optimizer_is_in_control(): returns the target unchanged (Q-table
+						//     authority preserved — same exemption the elevator has).
+						// The helper only ever LOWERS the target (never raises), so no new
+						// over-climb is introduced; it READS but never RAISES the anchor.
+						negotiated_configuration = supershift_retrigger_target(
+							negotiated_configuration, effective_snr,
+							last_data_viable_config, optimizer_is_in_control(),
+							robust_enabled, narrowband_enabled == YES);
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
 						if(effective_snr > -90)
@@ -7798,6 +7839,215 @@ int cl_arq_controller::test_climb_engine()
 			check(t_after == CONFIG_13,
 				"JJ3b PASS-AFTER: gap==MAX_LEAP is UNCAPPED (CONFIG_13) — WGN:30 fast climb unchanged at gaps<=13",
 				t_after, CONFIG_13);
+		}
+
+		// ================================================================
+		// Part K — ANCHOR-TIER-CROSSING DISCIPLINE, ROOT-1 (gearshift-climb-engine.md
+		// §16). The §15 elevator gate (is_ofdm_config(anchor)) was necessary-but-
+		// INSUFFICIENT: it gated the ELEVATOR jump but did NOT stop a ROBUST-tier clean
+		// ACK from POISONING the anchor itself into the OFDM tier. The pre-§16 producer
+		// (arq_commander.cc:3617) raised last_data_viable_config to the LIVE
+		// current_configuration; if a robust-fragment clean credit fired while the live
+		// config had already crossed to CONFIG_0 (the FRAME-UP SET_CONFIG advances both
+		// current_configuration at :4460 AND data_configuration at :1086 ahead of the
+		// streak), the anchor was seated at CONFIG_0 on robust evidence — and once
+		// is_ofdm_config(anchor) is true the §15 elevator + the §16 ROOT-2 turbo ladder
+		// unlock. ROOT-1 credits the anchor to clean_batches_config (the streak's HOME —
+		// the authoritative delivered config that survives the advance), via the PURE
+		// data_anchor_raise_target() helper, and refuses a ROBUST->OFDM cross whose live
+		// tier disagrees with the streak's OFDM claim. `anchor_raise_v16` models
+		// FAIL-BEFORE as the VERBATIM pre-§16 producer (raise to the LIVE config, §11-gated
+		// on the LIVE config) and PASS-AFTER as the REAL shipped helper. These parts drive
+		// the ACTUAL anchor-raise chokepoint, not just a model (the helper IS the producer's
+		// decision — see :3617).
+		// ================================================================
+		{
+			optimizer_disabled = true;
+			auto anchor_raise_v16 = [&](int streak_config, int live_config, int anchor,
+				                          int streak, bool adaptive) -> int {
+				if(adaptive) {
+					// PASS-AFTER: the REAL shipped §16 helper (the production chokepoint).
+					return data_anchor_raise_target(streak_config, live_config, anchor, streak);
+				} else {
+					// FAIL-BEFORE: the VERBATIM pre-§16 producer body (edb8600 :3617-3620) —
+					// credit the LIVE current_configuration, §11-gated on the LIVE config.
+					if(streak >= sustained_anchor_threshold(live_config) &&
+					   config_ladder_index(live_config) > config_ladder_index(anchor))
+						return live_config;
+					return anchor;
+				}
+			};
+
+			// K1 — THE regression (robust credit fires after the live config crossed to
+			// CONFIG_0). streak earned at ROBUST_2 (home), but live=CONFIG_0 and streak=2.
+			{
+				int t_before = anchor_raise_v16(/*streak_config=*/ROBUST_2, /*live=*/CONFIG_0,
+					/*anchor=*/ROBUST_2, /*streak=*/2, /*adaptive=*/false);
+				int t_after  = anchor_raise_v16(/*streak_config=*/ROBUST_2, /*live=*/CONFIG_0,
+					/*anchor=*/ROBUST_2, /*streak=*/2, /*adaptive=*/true);
+				// FAIL-BEFORE: pre-§16 credits the LIVE CONFIG_0 (N_OFDM=2 met by the
+				// mis-attributed streak) -> anchor poisoned into the OFDM tier.
+				check(t_before == CONFIG_0,
+					"K1a FAIL-BEFORE proof: pre-§16 producer credits the LIVE config -> anchor poisoned to CONFIG_0 (OFDM)",
+					t_before, CONFIG_0);
+				// PASS-AFTER: credits the streak HOME (ROBUST_2) -> anchor stays ROBUST,
+				// never crosses into OFDM on robust evidence.
+				check(t_after == ROBUST_2,
+					"K1b PASS-AFTER: §16 credits the streak home -> anchor stays ROBUST_2 (no OFDM crossing)",
+					t_after, ROBUST_2);
+				check(!is_ofdm_config(t_after) && config_ladder_index(t_after) <= config_ladder_index(ROBUST_2),
+					"K1c PASS-AFTER: the anchor is a ROBUST rung <= ROBUST_2 (the config-advance crossing did NOT raise it)",
+					config_ladder_index(t_after), config_ladder_index(ROBUST_2));
+				check(t_after != t_before,
+					"K1d the §16 anchor decision DIFFERS from the pre-§16 over-credit (the fix bites)",
+					(t_after != t_before) ? 1 : 0, 1);
+			}
+
+			// K2 — the tier-gate belt-and-suspenders: a streak that CLAIMS OFDM
+			// (streak_config=CONFIG_0, streak>=N_OFDM) but whose LIVE tier is robust
+			// (the corruption signature) is REFUSED the crossing.
+			{
+				int t = data_anchor_raise_target(/*streak_config=*/CONFIG_0, /*live=*/ROBUST_2,
+					/*anchor=*/ROBUST_1, /*streak=*/2);
+				check(t == ROBUST_1,
+					"K2 tier gate: a ROBUST->OFDM cross whose LIVE tier disagrees with the streak's OFDM claim is REFUSED",
+					t, ROBUST_1);
+			}
+
+			// K3 — within-ROBUST advance is PRESERVED (the gate must NOT block
+			// ROBUST_1 -> ROBUST_2 on a genuine robust delivery; N_ROBUST=1).
+			{
+				int t = data_anchor_raise_target(/*streak_config=*/ROBUST_2, /*live=*/ROBUST_2,
+					/*anchor=*/ROBUST_1, /*streak=*/1);
+				check(t == ROBUST_2,
+					"K3 within-ROBUST advance PRESERVED: a clean ROBUST_2 delivery raises ROBUST_1 -> ROBUST_2 (N_ROBUST=1)",
+					t, ROBUST_2);
+			}
+
+			// K4 — a single robust-fragment credit at a crossed live config does NOT
+			// raise the anchor (the §11 streak reset on the live-config rung change
+			// leaves streak=1 < N_OFDM=2 — the FIRST line of defense). Models the
+			// post-FRAME-UP single late ACK directly.
+			{
+				int t = data_anchor_raise_target(/*streak_config=*/CONFIG_0, /*live=*/CONFIG_0,
+					/*anchor=*/ROBUST_2, /*streak=*/1);
+				check(t == ROBUST_2,
+					"K4 a SINGLE clean at CONFIG_0 does NOT raise the anchor (N_OFDM=2 unmet) — stays ROBUST_2",
+					t, ROBUST_2);
+			}
+		}
+
+		// ================================================================
+		// Part K' — TURBO-FORWARD LADDER ANCHOR CLAMP, ROOT-2 (gearshift-climb-engine.md
+		// §16). The turbo-forward SNR-SUPERSHIFT / SNR-capped-step-1 / blind targets
+		// (arq_commander.cc:4602-4621) had NO last_data_viable_config clamp — only the
+		// proven-ceiling + WB/NB ceiling. So once a turbo was launched at the OFDM-entry
+		// rung (the §15 deep-SNR mechanism), it ratcheted CONFIG_4 -> CONFIG_9 on phantom
+		// ACK matches with no anchor bound. ROOT-2 routes the turbo target through the
+		// SAME shared chokepoint the §13/§14/§15 elevator uses
+		// (supershift_retrigger_target). `turbo_clamp_v16` models FAIL-BEFORE as the
+		// pre-§16 path (target unchanged after the WB/NB ceiling) and PASS-AFTER as the
+		// REAL shipped supershift_retrigger_target() — the exact call production now makes
+		// at :4631.
+		// ================================================================
+		{
+			optimizer_disabled = true;
+			auto turbo_clamp_v16 = [&](int raw_target, double snr, int anchor,
+				                         bool robust_en, bool nb, bool adaptive) -> int {
+				if(adaptive)
+					return supershift_retrigger_target(raw_target, snr, anchor,
+						/*optimizer_owns=*/false, robust_en, nb);
+				return raw_target;   // FAIL-BEFORE: no anchor clamp on the turbo ladder
+			};
+
+			// K'1 — THE regression: a turbo launched at CONFIG_4 (current) wants to
+			// SNR-SUPERSHIFT/step toward CONFIG_9 with the anchor STILL ROBUST_2
+			// (WGN:-10: OFDM never delivered, so §16 ROOT-1 kept the anchor robust).
+			{
+				int raw_target = CONFIG_9;   // the unclamped turbo ratchet target
+				double snr = snr_uplink_from_suffix(1.0f);  // the control-plane SNR at WGN:-10
+				int leap_cap = config_ladder_up_n(ROBUST_2, RETRIGGER_MAX_LEAP, true, false);
+				int anchor_cap = config_ladder_up_n(ROBUST_2, 1, true, false);  // CONFIG_0
+				int t_before = turbo_clamp_v16(raw_target, snr, ROBUST_2, true, false, /*adaptive=*/false);
+				int t_after  = turbo_clamp_v16(raw_target, snr, ROBUST_2, true, false, /*adaptive=*/true);
+				// FAIL-BEFORE: the turbo ladder ratchets to CONFIG_9 unbounded.
+				check(t_before == CONFIG_9,
+					"K'1a FAIL-BEFORE proof: the unclamped turbo ladder ratchets to CONFIG_9 (no anchor bound)",
+					t_before, CONFIG_9);
+				// PASS-AFTER: ROBUST anchor -> is_ofdm_config(anchor)=false ->
+				// high_confidence_jump=false -> clamped to anchor+1 (CONFIG_0). The turbo
+				// CANNOT ratchet up the OFDM tier from a robust anchor.
+				check(t_after == anchor_cap && t_after == CONFIG_0,
+					"K'1b PASS-AFTER: turbo target clamped to anchor+1 (CONFIG_0) at a ROBUST anchor — no OFDM ratchet",
+					t_after, CONFIG_0);
+				check(config_ladder_index(t_after) <= config_ladder_index(leap_cap),
+					"K'1c PASS-AFTER: turbo target <= config_ladder_up_n(ROBUST_2, MAX_LEAP) (cannot reach CONFIG_9)",
+					config_ladder_index(t_after), config_ladder_index(leap_cap));
+				check(config_ladder_index(t_after) < config_ladder_index(CONFIG_9),
+					"K'1d PASS-AFTER: turbo target STRICTLY below the pre-fix CONFIG_9 ratchet",
+					config_ladder_index(t_after), config_ladder_index(CONFIG_9));
+			}
+
+			// K'2 — OFDM anchor (WGN:30 legit): a turbo from a CONFIG_0 anchor at high
+			// SNR is PRESERVED but bounded to anchor + MAX_LEAP (CONFIG_13), not lobotomized.
+			{
+				int raw_target = CONFIG_16;   // SNR-SUPERSHIFT wants the top
+				double snr = snr_uplink_from_suffix(20.0f);
+				int leap_cap = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);  // CONFIG_13
+				int t_after = turbo_clamp_v16(raw_target, snr, CONFIG_0, true, false, /*adaptive=*/true);
+				check(t_after == CONFIG_13,
+					"K'2a PASS-AFTER: OFDM-anchor turbo PRESERVED but bounded to anchor+MAX_LEAP (CONFIG_13)",
+					t_after, CONFIG_13);
+				check(config_ladder_index(t_after) > config_ladder_index(CONFIG_0),
+					"K'2b PASS-AFTER: the high-SNR turbo climb is NOT broken (still a multi-rung jump above the anchor)",
+					config_ladder_index(t_after), config_ladder_index(CONFIG_0));
+			}
+
+			// K'3 — a turbo step at/below anchor+1 is UNCHANGED (the clamp never raises;
+			// a within-bound step is byte-identical to the pre-fix path).
+			{
+				double snr = snr_uplink_from_suffix(20.0f);
+				int raw_target = config_ladder_up_n(CONFIG_4, 1, true, false);  // CONFIG_5, anchor=CONFIG_4
+				int t_after  = turbo_clamp_v16(raw_target, snr, CONFIG_4, true, false, /*adaptive=*/true);
+				int t_before = turbo_clamp_v16(raw_target, snr, CONFIG_4, true, false, /*adaptive=*/false);
+				check(t_after == t_before && t_after == CONFIG_5,
+					"K'3 a turbo step at anchor+1 (CONFIG_5 off CONFIG_4) is UNCHANGED by the clamp (never raises)",
+					t_after, CONFIG_5);
+			}
+		}
+
+		// ================================================================
+		// Part K'' — WGN:30 PRESERVED (the §16 §5-audit headline). A clean batch
+		// delivered AT CONFIG_0 (an OFDM config) meeting N_OFDM must (1) raise the anchor
+		// to CONFIG_0 through the REAL §16 helper (ROOT-1 does NOT block a genuine OFDM
+		// delivery) AND (2) the elevator jump must STILL fire from that OFDM anchor (the
+		// fast multi-rung climb is preserved). Drives the REAL data_anchor_raise_target()
+		// + the REAL elevator helper end-to-end.
+		// ================================================================
+		{
+			optimizer_disabled = true;
+			// (1) two consecutive clean CONFIG_0 batches (streak home = CONFIG_0, N_OFDM=2)
+			// raise the anchor to CONFIG_0 — ROOT-1 permits the GENUINE OFDM delivery.
+			int anchor = ROBUST_2;
+			anchor = data_anchor_raise_target(/*streak_config=*/CONFIG_0, /*live=*/CONFIG_0, anchor, /*streak=*/1);
+			check(anchor == ROBUST_2,
+				"K''1 one clean CONFIG_0 batch does NOT yet raise the anchor (N_OFDM=2 unmet)",
+				anchor, ROBUST_2);
+			anchor = data_anchor_raise_target(/*streak_config=*/CONFIG_0, /*live=*/CONFIG_0, anchor, /*streak=*/2);
+			check(anchor == CONFIG_0,
+				"K''2 the SECOND consecutive clean CONFIG_0 batch RAISES the anchor to CONFIG_0 (genuine OFDM delivery)",
+				anchor, CONFIG_0);
+			// (2) from the now-OFDM anchor (CONFIG_0) at high SNR, the elevator jump fires
+			// (bounded to anchor+MAX_LEAP) — the fast climb is preserved, not blocked.
+			int t = supershift_retrigger_target(/*snr_ideal=*/CONFIG_16,
+				/*snr_uplink=*/snr_uplink_from_suffix(20.0f), /*anchor=*/anchor,
+				/*optimizer_owns=*/false, /*robust_en=*/true, /*nb=*/false);
+			check(config_ladder_index(t) > config_ladder_index(CONFIG_0),
+				"K''3 from the OFDM anchor the elevator jump STILL fires (multi-rung, WGN:30 climb preserved)",
+				config_ladder_index(t), config_ladder_index(CONFIG_0));
+			check(t == config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false),
+				"K''4 the preserved jump is bounded to anchor+MAX_LEAP (CONFIG_13)",
+				t, config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false));
 		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
