@@ -656,6 +656,41 @@ public:
   { return is_robust_config(config) ? SUSTAINED_ANCHOR_N_ROBUST
                                      : SUSTAINED_ANCHOR_N_OFDM; }
 
+  // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, Option 3, climb
+  // follow-up ③) — the clean-streak evidence bar that ARMS fast-probing at a rung.
+  // Reuses the SAME viability bar §11 uses to ANCHOR a rung
+  // (sustained_anchor_threshold): fast-stepping may fire ONLY at a rung already
+  // proven viable enough to anchor — so a marginal / deep-SNR-cliff rung (where
+  // every failed block resets clean_batches_at_current_config to 0) NEVER goes
+  // fast, preserving #2's (e3d818d) WGN:-10 anti-thrash. PURE; the unit test (Part
+  // I) replays it directly. config = current_configuration. TUNABLE (it IS the
+  // anchor bar today; split the constant if the two bars ever need to differ).
+  static int fast_probe_clean_streak(int config)
+  { return sustained_anchor_threshold(config); }
+
+  // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12) — the EFFECTIVE
+  // threshold the FRAME-UP comparison (arq_commander.cc:3637) uses, computed at
+  // READ time so it NEVER mutates / caps the frame_shift_threshold member (which
+  // the AARF back-off DOUBLES on FRAME-UP failure at :2302/:3180/:3359 and the
+  // logs print). When the rung has PROVEN sustained-clean delivery
+  // (clean_streak_at_config >= fast_probe_clean_streak(config)) return the FAST
+  // value (FRAME_SHIFT_FAST=1 → step on the next clean batch); OTHERWISE return the
+  // base_threshold member UNCHANGED (the conservative 3, or the AARF-doubled 6/12/…
+  // — so the reduction does NOT fight the back-off). The back-off and this read are
+  // mutually exclusive per process_main() pass (back-off is on the data_ack==NO
+  // failure paths; this read is on the data_ack==YES+clean path) and a failure
+  // resets clean_streak to 0 in the SAME handler, so the very next read returns the
+  // freshly-doubled member, not FAST. base_threshold = frame_shift_threshold,
+  // config = current_configuration, clean_streak = clean_batches_at_current_config.
+  // PURE (no side effects); the unit test replays it directly. See §12.1/§12.3.
+  int effective_frame_shift_threshold(int base_threshold, int config,
+                                      int clean_streak_at_config) const
+  {
+    if(clean_streak_at_config >= fast_probe_clean_streak(config))
+      return FRAME_SHIFT_FAST;
+    return base_threshold;
+  }
+
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
   // decodes NO LDPC data, so the canonical SNR_uplink producer
@@ -1577,6 +1612,14 @@ public:
   // require TWO consecutive clean batches. Both TUNABLE.
   static const int SUSTAINED_ANCHOR_N_ROBUST = 1;
   static const int SUSTAINED_ANCHOR_N_OFDM   = 2;
+  // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, 2026-05-30) — the
+  // FAST-probe target for frame_shift_threshold once a rung is PROVEN sustained-
+  // clean. 1 = step up on the very next clean batch (the forward-AARF half af14a9e
+  // deleted). The back-off half still DOUBLES the member on FRAME-UP failure
+  // (:2302/:3180/:3359); effective_frame_shift_threshold() returns this value ONLY
+  // when fast_probe_clean_streak() is met, else the (possibly doubled) member —
+  // so the climb is fast when clean and conservative when marginal. TUNABLE.
+  static const int FRAME_SHIFT_FAST = 1;
   // CLEAN-BATCH VIABILITY (§9, 2026-05-29): TRUE iff the batch that set
   // data_ack_received=YES this epoch was confirmed FULLY delivered (all-ones
   // bitmap clean ACK / LDPC ACK_RANGE/ACK_MULTI). FALSE on a PARTIAL SACK (which

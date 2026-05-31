@@ -10,6 +10,13 @@ follow-up #2) — the WGN:-10 CONFIG_0↔ROBUST_0 thrash. The climb now works at
 clean (Parts A-D verified) but thrashed at WGN:-10; §10 adds the missing anchor
 DEMOTION producer + §11 the sustained-anchor RAISE gate. In-process verified
 (Parts E/F); wire confirmation is the parent's pause-cal hardware test @WGN:-10.
+**§12 (2026-05-30, stacks on b1ab550)**: the ADAPTIVE FRAME-UP threshold (climb
+follow-up ③) — the climb is correct but SLOW at high SNR (uniform 3 clean
+batches/rung). §12 restores the deleted forward-AARF half: fast-probe (threshold→1)
+when delivery is PROVEN sustained-clean at the rung, conservative (the AARF-doubled
+member) otherwise. Read-time only — does not touch the +1 clamp (fork ①) nor fight
+the back-off. In-process verified (Part I); wire speedup is the parent's hardware
+test with the fixed cascade-bench timing.
 
 This doc owns the producer/consumer/invariant facts for the CLIMB promotion
 state shared CMD↔RSP: `last_data_viable_config`, `consecutive_data_acks`,
@@ -598,6 +605,193 @@ Three required invariants verified:
 
 No consumer assumption is violated; the fix adds a missing INPUT (a way to LOWER
 the anchor + a stricter RAISE) without weakening any existing gate.
+
+---
+
+## §12 ADAPTIVE FRAME-UP THRESHOLD — fast-probe when sustained-clean (Option 3, climb follow-up ③)
+
+**Status**: SHIPPED 2026-05-30 on `fix/climb-engine`, stacks on b1ab550. Fixes
+the "the climb is correct but SLOW at high SNR" problem: the unpinned
+`-Q 0 -M auto -g -R` climb advances exactly +1 rung per `frame_shift_threshold=3`
+CONSECUTIVE clean batches, UNIFORMLY at every SNR. At high SNR the ×3 multiplier ×
+per-frame airtime dominates (~30–95 s/rung; ~300 s just to reach CONFIG_6). The
+forward AARF half (probe-up-faster-when-winning) was deleted by af14a9e; only the
+back-off half (`frame_shift_threshold *= 2` on FRAME-UP failure) survived. This
+restores the forward half SAFELY. In-process verified (Part I); wire speedup is
+the parent's hardware test (with the fixed cascade-bench timing).
+
+**Out of scope (architectural fork ① — the user's pending decision):** the +1
+anchor clamp (`arq_commander.cc:3617` FRAME-UP / `:4858` LADDER-UP), multi-rung
+jumps, and the SUPERSHIFT re-trigger un-clamp are UNTOUCHED. Option 3 changes ONLY
+how many clean batches trigger a +1 step — never how far a +1 reaches.
+
+### §12.1 The fix — an EFFECTIVE (read-time) threshold, member untouched by the reduction
+
+The reduction is a READ-TIME decision at the FRAME-UP comparison
+(`arq_commander.cc:3637`), NOT a mutation of the `frame_shift_threshold` member.
+Rationale (the AARF-compat constraint): the member is what the back-off half
+DOUBLES (`:2302/:3180/:3359`, 3→6→12…) and what the `[GEARSHIFT]` logs print; if
+the reduction mutated it, a `min(member, base)` cap would silently UNDO an
+AARF-doubled value whenever delivery was merely non-clean (not the intent — AARF
+doubling means "be EXTRA conservative here"). Instead, a PURE helper picks between
+the FAST value and the (possibly AARF-doubled) member:
+
+```cpp
+// arq.h — PURE, no side effects (unit test replays it directly).
+int effective_frame_shift_threshold(int base_threshold, int config,
+                                     int clean_streak_at_config) const
+{
+  // FAST probe (== FRAME_SHIFT_FAST = 1) ONLY once the channel has PROVEN
+  // sustained-clean delivery at THIS rung — the SAME viability bar §11 uses to
+  // ANCHOR the rung (sustained_anchor_threshold). Below that bar the conservative,
+  // possibly AARF-doubled `base_threshold` member stands UNCHANGED (does NOT fight
+  // the back-off). config = current_configuration; clean_streak =
+  // clean_batches_at_current_config.
+  if(clean_streak_at_config >= fast_probe_clean_streak(config))
+    return FRAME_SHIFT_FAST;            // 1 — step on the next clean batch
+  return base_threshold;                // the member: base 3, or AARF-doubled 6/12/…
+}
+
+// fast_probe_clean_streak(config) = sustained_anchor_threshold(config):
+//   robust  -> SUSTAINED_ANCHOR_N_ROBUST (1)  — one clean MFSK frame proves it
+//   OFDM    -> SUSTAINED_ANCHOR_N_OFDM  (2)    — a single SACK-rescued batch can't
+// Tying the fast-probe bar to the anchor bar guarantees fast-stepping can fire
+// ONLY at a rung already proven viable enough to anchor — a marginal / cliff rung
+// (where every failure resets clean_streak to 0) NEVER goes fast.
+```
+
+The FRAME-UP comparison (`arq_commander.cc:3637`) becomes:
+```cpp
+int eff_thresh = effective_frame_shift_threshold(frame_shift_threshold,
+                    current_configuration, clean_batches_at_current_config);
+if(consecutive_data_acks >= eff_thresh) { /* +1 step (unchanged body) */ }
+```
+
+**Constants** (`arq.h`, both TUNABLE): `FRAME_SHIFT_FAST = 1` (the fast-probe
+target). `fast_probe_clean_streak` reuses `SUSTAINED_ANCHOR_N_ROBUST/OFDM`.
+
+**Before / after** (clean channel, p≈1):
+- Robust ROBUST_0: clean_streak hits N=1 on the 1st clean batch → eff_thresh=1 →
+  steps after 1 clean (was 3). Off-ROBUST_0 climb ~3× faster.
+- OFDM CONFIG_k: clean_streak hits N=2 on the 2nd clean batch → eff_thresh=1 →
+  3rd clean batch steps (consecutive_data_acks=1 ≥ 1). Net ≈1 clean batch/rung in
+  steady state once the rung is proven, vs 3.
+- Marginal / cliff: a failure resets clean_streak to 0 (`:3172/:3307`); eff_thresh
+  reverts to the (AARF-doubled) member → conservative, exactly as today.
+
+### §12.2 Producers / consumers — what §12 changes
+
+`frame_shift_threshold` (the member) — UNCHANGED producer/consumer set:
+- **Producers**: base init `arq_common.cc:337` (=3) + reset_session_state init;
+  the AARF back-off `*= 2` at `arq_commander.cc:2302` (turbo SET_CONFIG NAck),
+  `:3180` (FRAME-UP DATA FAILED, no-ACK path), `:3359` (FRAME-UP DATA FAILED, pat
+  path); test reset `:6364`. §12 adds NO producer of the member — the reduction is
+  read-time only, so the member retains its AARF state verbatim.
+- **Consumer (the ONLY one)**: the FRAME-UP comparison `arq_commander.cc:3637`,
+  now reading it THROUGH `effective_frame_shift_threshold(...)`. No other site
+  reads the member.
+
+`clean_batches_at_current_config` (the gating signal) — §12 adds ONE consumer:
+- **Producers** (unchanged, owned by §11): increment in the clean-credit block
+  (`arq_commander.cc:3548`), restart at 1 on rung change (`:3544`), reset to 0 at
+  the two failure sites (`:3172`, `:3307`), init 0 / CONFIG_NONE in ctor +
+  reset_session_state.
+- **Consumers**: the §11 anchor-RAISE gate (`:3567`) AND NOW the §12 fast-probe
+  read (`:3637`, via the helper). Both are READS — §12 does not write the counter.
+  Ordering: the credit block (`:3510-3575`) runs BEFORE the FRAME-UP block
+  (`:3604-3667`) in the same `process_main()` pass, so the FRAME-UP read sees the
+  current-pass-updated streak.
+
+### §12.3 Cross-layer audit (CLAUDE.md §5) — the four required verifications
+
+**(1) Deep-SNR / marginal delivery stays conservative → #2 (e3d818d) anti-thrash
+INTACT (no WGN:-10 CONFIG_0↔ROBUST_0 thrash re-introduced).**
+At the WGN:-10 cliff, batches FAIL → `clean_batches_at_current_config` is reset to
+0 on EVERY failed block (`:3172`, `:3307`, both upstream of the BREAK trigger). A
+streak of 0 < `fast_probe_clean_streak(config)` ⇒ `effective_frame_shift_threshold`
+returns the conservative member (3, or AARF-doubled). So FRAME-UP CANNOT step fast
+at the cliff — it requires the SAME `consecutive_data_acks >= 3` (or more) it does
+today. Moreover §12 touches ONLY the step CADENCE; the +1 anchor clamp (`:3617`),
+the `promotion_allowed_on_batch` clean gate, the §10 anchor DEMOTION, and the §11
+sustained-anchor RAISE gate are ALL untouched. Even in the impossible event the
+streak briefly armed fast-probe, a +1 step still reaches only anchor+1, and the
+anchor is independently governed by §10/§11. The thrash mechanism (slow
+retransmit-completion resetting the panic counter) is unrelated to FRAME-UP
+cadence and is cured by §10/§11, which §12 does not modify. **No re-introduction.**
+
+**(2) The AARF back-off on failure still RAISES the member (the reduction does not
+fight the back-off).**
+The reduction is read-time and never writes the member, so `*= 2` at
+`:2302/:3180/:3359` is fully preserved (3→6→12…). Critically, the back-off and the
+reduction are MUTUALLY EXCLUSIVE per `process_main()` pass: the `*= 2` sites are on
+the `data_ack_received==NO` failure paths; the credit-block streak update + the
+FRAME-UP read are on the `data_ack_received==YES` + clean path. They never run in
+the same cycle. After a failure: AARF doubles the member AND
+`clean_batches_at_current_config` is reset to 0 in the SAME failure handler ⇒ the
+next FRAME-UP read sees streak=0 ⇒ returns the freshly-DOUBLED member (not FAST).
+The fast-probe can only re-arm after a NEW sustained-clean streak rebuilds at the
+rung — i.e. the channel actually recovered. This IS the missing forward-AARF
+recovery half, and it is strictly gated behind proven re-cleanliness. ✓
+
+**(3) Interaction with #2's anchor demotion + sustained-raise gate is benign.**
+Both #2 mechanisms key off the SAME `clean_batches_at_current_config` /
+`last_data_viable_config` / `anchor_consec_break_fails` state that §12 only READS
+(§12 writes none of it). The fast-probe bar is set EQUAL to the anchor-raise bar
+(`fast_probe_clean_streak == sustained_anchor_threshold`), so fast-stepping arms at
+exactly the streak length that also (re-)arms the anchor at that rung — the two are
+consistent by construction. After a FRAME-UP promotion `current_configuration`
+changes; the credit block then sets streak=1 at the NEW rung (`:3544`), which is
+< OFDM N=2 ⇒ fast-probe does NOT carry over a promotion — each rung must re-prove.
+Anchor demotion only LOWERS the anchor (§10, Part E5), tightening the +1 clamp;
+§12 cannot widen it. ✓
+
+**(4) The consecutive-clean counter is not corrupted by retuning the threshold
+mid-run.**
+`consecutive_data_acks` and `clean_batches_at_current_config` are independent
+members; §12 reads both and writes NEITHER from the helper. The FRAME-UP body's
+existing `consecutive_data_acks = 0` on promotion (`:3643`) and the failure-site
+resets (`:3166/:3302`) are unchanged. Changing the comparison RHS from a constant
+to a read-time value does not touch the LHS counter or its lifecycle. A lower
+eff_thresh simply makes the existing `>=` fire sooner; it cannot make
+`consecutive_data_acks` skip, double-count, or go negative. ✓
+
+**Net**: §12 supplies the missing forward-AARF input (fast-step when the rung is
+PROVEN sustained-clean) by reusing the §11 clean-streak signal as a read-time gate,
+with the fast-probe bar pinned to the anchor-viability bar. It weakens no gate,
+mutates no shared state, and is provably inert at the deep-SNR cliff where #2's
+anti-thrash lives.
+
+### §12.4 Part I (`--test-climb-engine`) — fail-before / pass-after
+
+Replays the REAL FRAME-UP cadence (the SAME `effective_frame_shift_threshold` +
+`fast_probe_clean_streak` helpers + the real `consecutive_data_acks >= eff_thresh`
+comparison) under sustained-clean vs marginal/post-failure delivery:
+- **I0a/I0b**: documents the TUNABLEs — `FRAME_SHIFT_FAST == 1`;
+  `fast_probe_clean_streak` == robust 1 / OFDM 2.
+- **I1 (THE fast assertion)**: at a robust rung with a SUSTAINED-CLEAN streak,
+  `effective_frame_shift_threshold(base=3, …)` returns 1 → FRAME-UP fires after
+  ONE clean batch. **FAIL-BEFORE** (member fixed at 3, no helper): needs 3.
+- **I2 (multi-rung speedup)**: end-to-end sustained-clean climb — drive the real
+  FRAME-UP loop with the adaptive threshold and assert it reaches a high config in
+  FAR fewer batches than 3/rung. Compared against the fixed-3 count (computed in
+  the same test) to prove a strict reduction.
+- **I3 (marginal stays conservative)**: with clean_streak BELOW the bar (the
+  cliff / post-failure state), `effective_frame_shift_threshold` returns the base
+  3 (NOT 1) — fast-probe does NOT arm. Anti-thrash preservation, asserted directly.
+- **I4 (AARF-doubling compat)**: with an AARF-DOUBLED member (=12) AND
+  clean_streak below the bar, the helper returns 12 (does NOT cap to base / 1) —
+  the back-off is preserved. With a high streak it returns 1 (recovery). Proves the
+  reduction never fights nor erases the doubling.
+- **I5 (no carry-over across a promotion)**: immediately after a +1 step the new
+  rung's streak is 1; at an OFDM rung (N=2) the helper returns the conservative
+  base, so the rung must re-prove before fast-stepping again.
+
+**FAIL-BEFORE** (on b1ab550: FRAME-UP reads the bare member, no helper): I1/I2
+FAIL (1 clean batch does not step; the climb needs 3/rung). I0/I3/I4/I5 — the
+helper does not exist pre-fix; the test ships WITH the helper so all parts compile,
+and I verified fail-before by asserting the pre-fix arithmetic (`needs 3, not 1`)
+directly. **PASS-AFTER**: all PASS. Parts A–H stay PASS (§12 is additive — the
+FRAME-UP body, the clamp, and every #2 mechanism are unchanged).
 
 ---
 

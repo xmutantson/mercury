@@ -3634,11 +3634,27 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			!optimizer_owns_upward_frame)
 		{
 			consecutive_data_acks++;
-			if(consecutive_data_acks >= frame_shift_threshold)
+			// ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, Option 3,
+			// climb follow-up ③): step up FASTER when the channel is PROVEN
+			// sustained-clean at this rung, conservative when marginal. The EFFECTIVE
+			// threshold is read-time only — it never mutates frame_shift_threshold,
+			// so the AARF back-off (:3180/:3359/:2302, ×2 on FRAME-UP failure) is
+			// preserved and the reduction can't fight it. fast-probe (→1) arms ONLY
+			// once clean_batches_at_current_config crosses the rung's anchor-viability
+			// bar (fast_probe_clean_streak); a failed block resets that streak to 0
+			// (:3172/:3307), so at the deep-SNR cliff this stays at the conservative
+			// (possibly doubled) member → #2's WGN:-10 anti-thrash (e3d818d) intact.
+			// This changes only HOW MANY clean batches trigger a +1 — never how far a
+			// +1 reaches (the +1 anchor clamp above is untouched). See §12.1/§12.3.
+			int eff_frame_shift_threshold = effective_frame_shift_threshold(
+				frame_shift_threshold, current_configuration,
+				clean_batches_at_current_config);
+			if(consecutive_data_acks >= eff_frame_shift_threshold)
 			{
 				negotiated_configuration = proposed_frame;
-				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs, config %d -> %d\n",
-					consecutive_data_acks, current_configuration, negotiated_configuration);
+				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs (eff_thresh %d, base %d, clean-streak %d), config %d -> %d\n",
+					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
+					clean_batches_at_current_config, current_configuration, negotiated_configuration);
 				fflush(stdout);
 				consecutive_data_acks = 0;
 
@@ -6229,6 +6245,12 @@ int cl_arq_controller::test_clean_batch_viability()
 //       SACK-vs-SNR collision guard: a DATA ACK / SWITCH_ROLE / non-turbo
 //       SET_CONFIG does NOT arm, so a data ACK's SACK suffix is never routed to
 //       the SNR decoder.
+//   I — ADAPTIVE FRAME-UP THRESHOLD (climb follow-up ③, Option 3; §12): under
+//       SUSTAINED-CLEAN delivery the effective FRAME-UP threshold drops to 1 (fast
+//       probe → step on the next clean batch) so the climb is ~3× faster at high
+//       SNR; under MARGINAL / post-failure delivery it stays at the conservative
+//       (possibly AARF-doubled) base so #2's WGN:-10 anti-thrash is preserved.
+//       Read-time only (the member is untouched → never fights the ×2 back-off).
 //
 // IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
 // NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
@@ -6998,6 +7020,171 @@ int cl_arq_controller::test_climb_engine()
 	check(reverse_setconfig_arms == true,
 		"H4 mid-switch (phase!=TURBO_DONE) SET_CONFIG arms via the disjunct (loop symmetric)",
 		reverse_setconfig_arms ? 1 : 0, 1);
+
+	// ================================================================
+	// Part I — ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, Option 3,
+	// climb follow-up ③). THE bug: the unpinned `-Q 0 -M auto -g -R` climb advances
+	// +1 rung per frame_shift_threshold=3 CONSECUTIVE clean batches, UNIFORMLY at
+	// every SNR → ~3× too slow at high SNR (~300 s just to reach CONFIG_6). The
+	// forward-AARF half (probe up faster when winning) was deleted by af14a9e; only
+	// the back-off half (×2 on FRAME-UP failure) survived. The FIX:
+	// effective_frame_shift_threshold() returns FRAME_SHIFT_FAST=1 once the rung is
+	// PROVEN sustained-clean (clean_batches_at_current_config >=
+	// fast_probe_clean_streak), else the conservative (possibly AARF-doubled) member.
+	// Read-time only (the member is untouched), so it never fights the back-off and
+	// is inert at the deep-SNR cliff (a failed block resets the streak to 0 → the
+	// member stands → #2's WGN:-10 anti-thrash intact). This part replays the REAL
+	// effective_frame_shift_threshold + fast_probe_clean_streak helpers and the REAL
+	// `consecutive_data_acks >= eff_thresh` cadence. FAIL-BEFORE (b1ab550: FRAME-UP
+	// reads the bare member, no helper): I1/I2 FAIL (1 clean batch does not step;
+	// the climb needs 3/rung — asserted via the pre-fix arithmetic `needs 3 not 1`).
+	// ================================================================
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;
+	supershift_proven_ceiling = -1;
+
+	// I0a/I0b — the TUNABLEs (document them; a silent change to either should fail
+	// these and force a doc update).
+	check(FRAME_SHIFT_FAST == 1,
+		"I0a FRAME_SHIFT_FAST fast-probe target == 1 (step on next clean batch)",
+		FRAME_SHIFT_FAST, 1);
+	check(fast_probe_clean_streak(ROBUST_1) == 1 && fast_probe_clean_streak(CONFIG_10) == 2,
+		"I0b fast-probe clean-streak bar == anchor bar (robust 1 / OFDM 2)",
+		fast_probe_clean_streak(ROBUST_1) * 10 + fast_probe_clean_streak(CONFIG_10), 12);
+
+	// I1 — THE fast assertion. At a robust rung with a SUSTAINED-CLEAN streak (>=
+	// the bar), the EFFECTIVE threshold drops to 1 even though the base member is 3.
+	// So FRAME-UP (consecutive_data_acks >= eff_thresh) fires after ONE clean batch.
+	// FAIL-BEFORE: with no helper the comparison reads the bare member (3) → one
+	// clean ACK (consecutive_data_acks==1) does NOT satisfy >=3 → no step.
+	{
+		int base = 3;
+		current_configuration = ROBUST_1;
+		// One clean batch at this rung: production credit block sets clean-streak to
+		// >=1 (robust N=1 met) and consecutive_data_acks to 1.
+		clean_batches_at_current_config = 1;       // robust bar met on the 1st clean
+		consecutive_data_acks           = 1;       // one clean ACK so far
+		int eff = effective_frame_shift_threshold(base, current_configuration,
+		             clean_batches_at_current_config);
+		check(eff == 1, "I1a robust sustained-clean -> effective threshold == 1 (fast, base=3)",
+			eff, 1);
+		check(consecutive_data_acks >= eff,
+			"I1b FRAME-UP fires after ONE clean batch when sustained-clean (eff=1)",
+			consecutive_data_acks, eff);
+		// The pre-fix arithmetic the bare member would have required (fail-before
+		// proof): one clean ACK does NOT meet the fixed-3 threshold.
+		check(!(consecutive_data_acks >= base),
+			"I1c FAIL-BEFORE proof: one clean ACK does NOT meet the fixed base=3 (needs 3)",
+			consecutive_data_acks, base);
+	}
+
+	// A self-contained FRAME-UP cadence model: drives the REAL helper + the REAL
+	// `consecutive_data_acks >= eff_thresh` comparison + a faithful clean-streak
+	// update mirroring the production credit block (arq_commander.cc:3541-3548).
+	// `adaptive` selects the §12 helper vs the pre-fix bare member, so I2 can
+	// compare batch counts on the SAME ladder. Returns #clean batches consumed to
+	// climb from `start` up to (not past) `target_idx`. Robust rungs deliver clean
+	// at batch=1 (always here); OFDM clean too (clean channel). +1 clamp + anchor
+	// advance modeled exactly as Part C.
+	auto batches_to_climb = [&](int start, int target_idx, bool adaptive) -> int {
+		int cfg = start;
+		int anchor = start;
+		int streak = 0, streak_cfg = -999;
+		int cons = 0;
+		int base = 3;               // frame_shift_threshold base (no AARF doubling here)
+		int batches = 0;
+		for(int guard=0; guard<2000 && config_ladder_index(cfg) < target_idx; guard++)
+		{
+			batches++;
+			// --- production credit block (clean batch) ---
+			// clean-streak: restart at 1 on rung change, else ++ (mirrors :3541-3548)
+			if(cfg != streak_cfg) { streak_cfg = cfg; streak = 1; }
+			else                  { streak++; }
+			// anchor RAISE gated on the §11 sustained-N (mirrors :3567)
+			if(streak >= sustained_anchor_threshold(cfg) &&
+			   config_ladder_index(cfg) > config_ladder_index(anchor))
+				anchor = cfg;
+			// --- FRAME-UP cadence (mirrors :3636-3643) ---
+			int proposed = config_ladder_up(cfg, robust_enabled, false);
+			bool clamp_blocked =
+				config_ladder_index(proposed) > config_ladder_index(anchor) + 1;
+			cons++;
+			int eff = adaptive
+				? effective_frame_shift_threshold(base, cfg, streak)
+				: base;
+			if(!clamp_blocked && cons >= eff)
+			{
+				cons = 0;
+				cfg = proposed;     // +1 step (current follows the SET_CONFIG)
+			}
+		}
+		return batches;
+	};
+
+	// I2 — multi-rung speedup: under SUSTAINED-CLEAN delivery the adaptive climb
+	// reaches a high config (CONFIG_4, idx 7) in STRICTLY FEWER clean batches than
+	// the fixed-3 cadence. FAIL-BEFORE: with `adaptive=false` BOTH counts are the
+	// fixed-3 cadence → not fewer → I2 FAILS. (Both runs share the identical ladder
+	// + clamp + anchor logic; only the threshold differs.)
+	int target = config_ladder_index(CONFIG_4);
+	int batches_fixed    = batches_to_climb(ROBUST_0, target, /*adaptive=*/false);
+	int batches_adaptive = batches_to_climb(ROBUST_0, target, /*adaptive=*/true);
+	check(batches_adaptive < batches_fixed,
+		"I2a adaptive climb reaches CONFIG_4 in FEWER clean batches than fixed-3",
+		batches_adaptive, batches_fixed);
+	// And the fixed cadence really is ~3/rung (sanity on the model): 7 rungs * 3 =
+	// well above the adaptive count. Assert the adaptive count is at most ~1.5/rung.
+	check(batches_adaptive <= target + (target / 2) + 2,
+		"I2b adaptive climb is near ~1 clean batch/rung (fast-probe steady state)",
+		batches_adaptive, target + (target / 2) + 2);
+
+	// I3 — MARGINAL / post-failure stays CONSERVATIVE (the anti-thrash preservation,
+	// asserted directly). With the clean-streak BELOW the bar (a failed block reset
+	// it to 0, or it is still rebuilding), the EFFECTIVE threshold is the base 3,
+	// NOT 1 — fast-probe does NOT arm. This is the WGN:-10 cliff state.
+	{
+		current_configuration = ROBUST_1;
+		int eff_robust_marginal = effective_frame_shift_threshold(3, ROBUST_1, /*streak=*/0);
+		check(eff_robust_marginal == 3,
+			"I3a robust streak=0 (post-failure) -> effective threshold == base 3 (conservative)",
+			eff_robust_marginal, 3);
+		// OFDM with streak=1 (< N=2): still conservative.
+		int eff_ofdm_marginal = effective_frame_shift_threshold(3, CONFIG_10, /*streak=*/1);
+		check(eff_ofdm_marginal == 3,
+			"I3b OFDM streak=1 (< N=2) -> effective threshold == base 3 (not yet proven)",
+			eff_ofdm_marginal, 3);
+	}
+
+	// I4 — AARF-DOUBLING COMPATIBILITY (the reduction must not fight nor erase the
+	// back-off). With an AARF-DOUBLED member (=12) AND the streak BELOW the bar, the
+	// helper returns 12 (the doubled value stands — NOT capped to base or 1). With a
+	// PROVEN streak it returns 1 (the recovery half). This proves §12 is read-time
+	// and orthogonal to the ×2 back-off.
+	{
+		int doubled = 12;        // member after two AARF doublings (3->6->12)
+		int eff_marginal = effective_frame_shift_threshold(doubled, CONFIG_10, /*streak=*/1);
+		check(eff_marginal == doubled,
+			"I4a AARF-doubled member (12) + streak below bar -> returns 12 (back-off preserved)",
+			eff_marginal, doubled);
+		int eff_recovered = effective_frame_shift_threshold(doubled, CONFIG_10, /*streak=*/2);
+		check(eff_recovered == 1,
+			"I4b AARF-doubled member (12) + PROVEN streak (>=2) -> returns 1 (recovery half)",
+			eff_recovered, 1);
+	}
+
+	// I5 — NO CARRY-OVER ACROSS A PROMOTION. Immediately after a +1 step the new
+	// rung's clean-streak is 1 (the credit block restarts it at 1 on rung change).
+	// At an OFDM rung (N=2) the helper returns the conservative base — the rung must
+	// re-prove (a 2nd consecutive clean) before fast-stepping off it. So fast-probe
+	// cannot runaway-cascade rung-to-rung on a single clean each.
+	{
+		int eff_just_promoted = effective_frame_shift_threshold(3, CONFIG_11, /*streak=*/1);
+		check(eff_just_promoted == 3,
+			"I5 just-promoted OFDM rung (streak=1) -> conservative base 3 (must re-prove, no cascade)",
+			eff_just_promoted, 3);
+	}
 
 	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
