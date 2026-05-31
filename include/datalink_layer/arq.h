@@ -1920,6 +1920,20 @@ public:
   // turboshift overshoots to CFG14-16 and the optimizer immediately moves
   // Mercury back down. The cap is a no-op when the optimizer is disabled
   // or no calibrated cells exist.
+  //
+  // CLIMB-SPEED LEVER (b) — NO LONGER CALLED ON THE SUPERSHIFT ELEVATOR PATH
+  // (gearshift-climb-engine.md §19, 2026-05-31). The sole former call site
+  // (arq_commander.cc:4613) was removed: clamping the SNR-ideal target down to
+  // the handoff config (CONFIG_6) forced the fast elevator to stop there and
+  // then crawl the top half at the optimizer's 10-batch cadence. The cap was
+  // redundant — every real over-climb guard (proven-ceiling above,
+  // supershift_retrigger_target()'s OFDM-anchor gate + RETRIGGER_MAX_LEAP, and
+  // the SNR-capability guard) is applied AFTER it and is independent of it; the
+  // optimizer is still in control at CONFIG_6+ (optimizer_is_in_control()) and
+  // fine-tunes from the higher landing. The premise this method was built on
+  // (turbo "overshoots" past the optimizer) was false: the downstream guards
+  // already bound the leap. Method retained as documentation + drop-in for any
+  // future site that genuinely needs a handoff ceiling; not invoked anywhere now.
   void apply_optimizer_handoff_cap_to_target(int *snr_target) const {
     if (optimizer_disabled || !rate_opt.is_enabled()) return;
     int handoff = rate_opt.min_calibrated_cfg(narrowband_enabled == YES);

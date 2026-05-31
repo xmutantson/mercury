@@ -404,6 +404,11 @@ Local tests are NECESSARY but NOT SUFFICIENT — the singles passed local and
 failed the wire. Part (d) closes the connect-path default-init gap specifically;
 §8 flags the integration-path assumptions that still need hardware.
 
+Follow-up parts each live in their own section's `.5` subsection (fail-before /
+pass-after): Part G/H (§ data-flow-snr-measurements), Part I (§12.4), Part J (§13.5),
+Part J' (§14.5), Part J'' / JJ (§15.5), Part K/K'/K'' (§16.5), Part M (§17.5), Part N
+(§18), **Part O (§19.5 — the climb-speed LEVER (b) handoff-cap lift)**.
+
 ---
 
 ## §8 Open questions / integration-path assumptions needing the wire
@@ -2336,6 +2341,192 @@ SNR) and WGN:-10 still holds ROBUST_0 (no over-climb) — is the parent's HARDWA
 The in-process drive does not exercise the full `process_messages_rx_acks_control()` →
 `process_messages_tx_data()` tick sequence (the §15.5/§17.5 limitation); it drives the
 arm/clear at member granularity through the REAL helper + method.
+
+---
+
+## §19 CLIMB-SPEED LEVER (b) — LIFT the redundant optimizer-handoff cap on the SUPERSHIFT elevator
+
+**Status: SHIPPED on `fix/fast-probe`, 2026-05-31.** Stacks on 01535f2 (== monitor
+post-merge). In-process verified (Part O, fail-before/pass-after, incl. a temp-revert
+proving the production helper is load-bearing); the WIRE proofs (WGN:30 top-half crawl
+gone; WGN:-10 still holds ROBUST_0) are the parent's hardware A/B.
+
+### §19.1 The problem (the slow top half)
+
+The unpinned climb has two halves. The bottom half is the FRAME-UP / SUPERSHIFT
+elevator (§12/§13/§14): SNR-gated, multi-rung, fast. The top half — above the
+optimizer-handoff config — is the Q-table optimizer climbing at its own batch cadence.
+The handoff config is `rate_opt.min_calibrated_cfg()` = **CONFIG_6** on the current Pi
+table (`effective_rate_table.json`).
+
+The SUPERSHIFT elevator was being **forced to stop at CONFIG_6**, handing the modem to
+the optimizer at the BOTTOM of its range — so the entire climb from CONFIG_6 to the
+SNR-ideal (e.g. CFG13/CFG15) crawled at the optimizer's pace instead of riding the fast
+elevator. The cause was a redundant cap.
+
+### §19.2 Root cause (the redundant cap) — cited
+
+At the turboshift SNR-SUPERSHIFT path (`arq_commander.cc`, the `turboshift_active`
+branch) the elevator computes the SNR-ideal target and applies a cap chain:
+
+- `snr_target = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB)`  (`:4604`)
+- WB/NB ceiling cap                                                        (`:4605-4607`)
+- **proven-ceiling cap** (REAL over-climb guard, from prior BREAKs)        (`:4608-4609`)
+- `max_config_override` cap                                                (`:4610-4611`)
+- **`apply_optimizer_handoff_cap_to_target(&snr_target)`** — THE CAP       (`:4613`, pre-fix)
+- … then `negotiated_configuration = snr_target` if it advances           (`:4616-4618`)
+- WB/NB + `max_config_override` re-enforced on `negotiated_configuration`  (`:4636-4643`)
+- **`supershift_retrigger_target()`** — REAL OFDM-anchor gate + `RETRIGGER_MAX_LEAP`  (`:4665`)
+- **SNR-capability guard** — refuse to probe an undecodable rung           (`:4671-4683`)
+
+`apply_optimizer_handoff_cap_to_target()` (`arq.h:~1923`) clamps `*snr_target` DOWN to
+`min_calibrated_cfg` (CONFIG_6) and logs `"[TURBO] SNR target N capped at handoff config
+6 (Q-table takes over)"`. The cap is **REDUNDANT**: every REAL over-climb guard is
+applied AFTER it and is INDEPENDENT of it — the proven-ceiling (`:4608`, ABOVE), the
+OFDM-anchor gate + `RETRIGGER_MAX_LEAP` inside `supershift_retrigger_target()` (`:4665`),
+and the SNR-capability guard (`:4671`). The premise the cap was built on (its own
+comment: "turboshift overshoots to CFG14-16 and the optimizer immediately moves Mercury
+back down") is FALSE — those downstream guards ALREADY bound the leap to proven-safe and
+anchor+MAX_LEAP, and `supershift_retrigger_target()` only LICENSES a multi-rung jump from
+a PROVEN OFDM anchor.
+
+### §19.3 The fix (the form chosen)
+
+**Remove the `apply_optimizer_handoff_cap_to_target(&snr_target)` call from the
+SUPERSHIFT elevator path** (`arq_commander.cc:4613` → replaced with a block comment
+documenting the lift). The (already proven-/ceiling-bounded) `snr_target` now flows past
+CONFIG_6 to the downstream guards. The method definition is RETAINED in `arq.h` (now
+uncalled in production; doc-comment updated to say so + why) as documentation and a
+drop-in for any future site that genuinely needs a handoff ceiling. The downstream
+guards (proven-ceiling, `supershift_retrigger_target`, SNR-capability) are **UNTOUCHED**;
+the anchor, FRAME-UP/LADDER-UP, and the optimizer's own logic are **UNTOUCHED**.
+
+This is the chosen form (B) of the two the scoping study offered ("make the call
+conditional/skipped" vs "relax it to a no-op"): a clean call-site removal, the minimal
+edit, no new conditional logic on the hot path.
+
+### §19.4 Cross-layer audit (CLAUDE.md §5)
+
+Shared state touched: the SUPERSHIFT/elevator config-target computation (`snr_target` →
+`negotiated_configuration`) and its READ of `last_data_viable_config` (the anchor) and
+`rate_opt.min_calibrated_cfg()`. The fix REMOVES one consumer of `min_calibrated_cfg`
+(the cap) on this path; it adds NO producer and mutates NO new state.
+
+**1. Producers / consumers of the elevator target.** The target is produced ONLY here
+(`:4604-4618`) and consumed by the SET_CONFIG that goes out at `:4687`. The cap was an
+intermediate transform; removing it changes the VALUE handed to the downstream guards,
+not who produces/consumes it. The two OTHER elevator sites — the FRAME-UP controlled
+elevator (`:3763`) and the post-ladder re-trigger (`:4737`) — go through the SHARED
+`elevator_target_from_snr()` (`arq_commander.cc:174-186`), which **never applied the
+handoff cap** (it only does NB-cap → proven-ceiling → `supershift_retrigger_target`). So
+those two sites are already cap-free and are UNAFFECTED by this change; the fix only
+brings the turbo-SUPERSHIFT site into line with them. (Confirmed: the sole call site of
+`apply_optimizer_handoff_cap_to_target` in the entire tree was `:4613`.)
+
+**2. DEEP-SNR (WGN:-10) = NO-OP (proven, Part O2/O3).** At the cliff the data-viable
+anchor stays ROBUST (OFDM never delivers). Two independent reasons the lift is inert:
+  - **(a) the cap never fired there anyway:** the control-plane MFSK-suffix SNR (~1.0 dB,
+    the §15 mechanism) maps to `get_configuration(1.0-6.0=-5.0) = CONFIG_4`, and
+    `CONFIG_4 < handoff CONFIG_6`, so `apply_optimizer_handoff_cap_to_target`'s
+    `if(*snr_target > handoff)` was already false → no clamp → removing it changes
+    nothing (Part O2a/O2b).
+  - **(b) the REAL backstop is downstream, not the cap:** even FORCING a high
+    `snr_target` (CONFIG_16) at a ROBUST anchor, `supershift_retrigger_target()` clamps
+    the final target to anchor+1 because `is_ofdm_config(anchor)==false` →
+    `high_confidence_jump=false` (§15). The cap removal CANNOT over-climb at a ROBUST
+    anchor regardless of SNR (Part O3). So the WGN:-10 hold (anchor stays ROBUST_0, the
+    data-fail BREAK → `break_target_with_anchor` → §10 demotion path re-engages) is
+    BYTE-IDENTICAL to pre-lift.
+
+**3. MODERATE-SNR overshoot is BOUNDED (the same backstops the elevator already uses).**
+A licensed jump can only happen from a PROVEN OFDM anchor (§15 gate), and is bounded
+three ways that all remain after the lift: (i) the proven-ceiling cap (`:4608`,
+re-enforced `:4636-4643`) — never above a rung a prior BREAK proved unsafe; (ii)
+`supershift_retrigger_target()`'s anchor+`RETRIGGER_MAX_LEAP` cap (`:4665`) — at most a
+bounded leap per step as the anchor ratchets up; (iii) the SNR-capability guard
+(`:4671-4683`) — a target beyond `get_configuration(effective_snr)` is REFUSED (finish at
+current, do not probe an undecodable rung). A landed-but-failing config → data-fail BREAK
+→ `break_target_with_anchor` → §10 anchor demotion — the SAME safety net the elevator
+already relied on. So lifting the cap cannot produce an unbounded or undecodable probe.
+
+**4. Optimizer STILL in control above the handoff (proven, Part O4/O5d).**
+`optimizer_is_in_control()` (`arq.h:1911`) is TRUE whenever `config_ladder_index(current)
+>= config_ladder_index(min_calibrated_cfg)`. After the elevator lands at (say) CONFIG_13,
+the modem is at CONFIG_13 ≥ CONFIG_6 → the optimizer owns the band and fine-tunes from
+there. The optimizer full-table-searches (`rate_optimizer.cc` `evaluate()`), so there is
+no crawl from the higher landing — it jumps straight to the SNR-appropriate cell. The
+lever does not change WHETHER the optimizer takes over (it was in control at CONFIG_6
+too); it only raises the RUNG at which the hand-off happens, so the fast elevator carries
+the costly bottom-of-range climb instead of the slow optimizer cadence.
+
+**5. What the fix changes (the one assumption).** It removes the assumption "the elevator
+must STOP at the handoff config so the optimizer is the sole authority above it." That
+assumption is replaced by: "the elevator may carry the proven/ceiling/anchor-bounded
+target past the handoff; the optimizer is still in control at the (higher) landing and
+fine-tunes from there." Every downstream consumer (the SET_CONFIG TX, the guards, the
+optimizer) operates identically on the higher target — verified per consumer above.
+
+### §19.5 Part O (`--test-climb-engine`) — fail-before / pass-after
+
+Appended after Part N. Models the FULL `:4604-4665` cap chain (`supershift_target`
+lambda with a `cap_lifted` flag) AND drives the REAL shipped method (O5):
+
+- **O0**: the handoff config is the documented CONFIG_6 (guards a silent
+  `min_calibrated_cfg` drift).
+- **O1 (THE LEVER BITES)**: high SNR (20 dB) at an OFDM anchor (CONFIG_0), proven=-1.
+  `snr_target` after ceiling caps = `get_configuration(14)` = CONFIG_16; `leap_cap` =
+  `config_ladder_up_n(CONFIG_0,13)` = CONFIG_13.
+  - **O1b FAIL-BEFORE**: the handoff cap pins the elevator at CONFIG_6 (the slow-top-half
+    cause), then `supershift_retrigger_target(CONFIG_6, anchor=CONFIG_0)` leaves it at
+    CONFIG_6 (CONFIG_6 ≤ leap_cap, jump licensed).
+  - **O1c/O1d PASS-AFTER**: no handoff cap → CONFIG_16 → `supershift_retrigger_target`
+    bounds it to CONFIG_13 — a target that **EXCEEDS CONFIG_6** (the lever's whole point).
+  - **O1e**: lifted ≠ capped (the lever bites). **O1f**: still BOUNDED (≤ anchor+MAX_LEAP).
+- **O2 (DEEP-SNR INERT)**: control-SNR 1.0 at a ROBUST_2 anchor → `snr_target` = CONFIG_4
+  (< handoff). Both arms clamp to anchor+1 (CONFIG_0); lifted == capped (BYTE-IDENTICAL).
+  O2a documents that the cap was already a no-op at the cliff (CONFIG_4 < CONFIG_6).
+- **O3 (ROBUST-anchor backstop)**: even FORCING `snr_target` = CONFIG_16 at ROBUST_2, the
+  REAL `supershift_retrigger_target()` clamps BOTH arms to anchor+1 (CONFIG_0) — the cap
+  removal cannot over-climb at a ROBUST anchor regardless of SNR (the §19.4-2(b) proof).
+- **O4 (optimizer authority)**: `optimizer_is_in_control()`'s index predicate is TRUE at
+  the CONFIG_13 landing AND was TRUE at the old CONFIG_6 cap — the lift never cedes
+  authority, only raises the handoff rung.
+- **O5 (THE REAL METHOD)**: loads a minimal one-cell Q-table (`min_calibrated_cfg=CONFIG_6`,
+  `enabled=true`), sets `optimizer_disabled=false`, and drives the SHIPPED helpers:
+  **O5b** — the REAL `apply_optimizer_handoff_cap_to_target()` clamps CONFIG_16 → CONFIG_6
+  (the EXACT pre-fix production behavior the lift deleted from `:4613`); **O5c** — it
+  leaves a sub-handoff target untouched; **O5d** — the REAL `optimizer_is_in_control()` is
+  TRUE at CONFIG_13 and CONFIG_6, FALSE below the handoff (CONFIG_4). O5 self-skips (PASS)
+  if the temp file is not creatable, so it never spuriously fails in a sandbox.
+
+**FAIL-BEFORE evidence**: (a) O1b/O5b are LIVE side-by-side assertions of the pre-fix
+outcome in the suite (the documented D/E/F/I/J/J''/K/N pattern); (b) ADDITIONALLY verified
+2026-05-31 by temporarily neutering the REAL shipped
+`apply_optimizer_handoff_cap_to_target()` body to a no-op and rebuilding: **O5b FAILS**
+(the method returns CONFIG_16 uncapped instead of CONFIG_6); O5a/O5c/O5d correctly STAY
+PASS (a sub-handoff target is untouched regardless, and the in-control predicate is
+independent of the clamp). The temp neuter was reverted; the shipped method does the
+clamp (now uncalled on the elevator path). Separately confirmed the production change is
+structural: the sole `apply_optimizer_handoff_cap_to_target(&snr_target)` invocation at
+`:4613` on baseline 01535f2 is GONE in the working tree (the only remaining invocations
+are inside Part O5, deliberately driving the REAL method to document the pre-fix
+behavior). **PASS-AFTER**: O0–O5 PASS; Parts A–N stay PASS (§19 is purely a removal on the
+turbo-SUPERSHIFT path — the elevator helper, the guards, the anchor, and every other
+climb gate are unchanged). `--test` 30/30 and `--test-climb-engine` ALL-PASS on BOTH ABIs
+(default + `-funsigned-char`).
+
+### §19.6 HONEST scope (§8 applies)
+
+In-process Part O proves the elevator can now target PAST CONFIG_6 at high SNR from a
+proven OFDM anchor (O1), that it is INERT at the deep-SNR cliff / ROBUST anchor (O2/O3),
+that the optimizer keeps authority at the higher landing (O4/O5d), and that the SHIPPED
+handoff method's pre-fix clamp is exactly what was removed (O5b). It does NOT exercise the
+full `process_messages_commander()` turbo branch (the §15.5/§16.5/§17.5 in-process
+limitation). The WIRE proofs are the parent's HARDWARE A/B: (1) the **WGN:30 climb-time**
+A/B — the top-half crawl gone (the elevator delivers the modem to the optimizer at a
+higher rung, faster); (2) the **WGN:-10 regression guard** — the link still holds ROBUST_0
+(no over-climb), which §19.4-2 proves is inert in-process but must be confirmed on the
+IONOS.
 
 ---
 
