@@ -142,6 +142,10 @@ cl_arq_controller::cl_arq_controller()
 	measurements.SNR_downlink=-99.9;
 	measurements.signal_stregth_dbm=-99.9;
 	measurements.frequency_offset=-99.9;
+	// SNR-suffix true-OFDM-SNR relay (data-flow-snr-measurements.md §8, Plan A):
+	// sentinel = "no OFDM data frame decoded yet". Written ONLY off an OFDM decode
+	// (M != MOD_MFSK) at arq_common.cc:6087; re-armed each session in reset_session_state().
+	last_ofdm_data_snr=-99.9;
 
 	data_batch_size=1;
 	nominal_batch_size=1;
@@ -3020,6 +3024,11 @@ void cl_arq_controller::reset_session_state()
 	clean_batches_config = CONFIG_NONE;
 	turbo_snr_ack_enabled = false;
 	turbo_received_snr = -99.0f;
+	// SNR-suffix true-OFDM-SNR relay (data-flow-snr-measurements.md §8, Plan A): a
+	// fresh session has decoded NO OFDM data yet, so the RSP control-ACK suffix must
+	// fall back to the legacy SNR_uplink value (§15 DEEP-SNR over-climb guard stays
+	// inert until an OFDM batch is actually decoded). Mirror the ctor sentinel.
+	last_ofdm_data_snr = -99.9f;
 	turbo_switch_role_retries = 0;
 
 	// BREAK / recovery
@@ -6088,6 +6097,23 @@ void cl_arq_controller::receive()
 			if(this->role == RESPONDER)
 			{
 				measurements.SNR_downlink = received_message_stats.SNR;
+			}
+			// SNR-suffix true-OFDM-SNR relay (data-flow-snr-measurements.md §8, Plan A).
+			// Capture the TRUE OFDM data-frame SNR for the RSP control-ACK suffix —
+			// but ONLY when the frame just decoded was genuinely OFDM. MFSK has NO real
+			// SNR estimator (telecom_system.cc:2730 hardcodes received_message_stats.SNR
+			// = 0.0 for M==MOD_MFSK), so writing this off an MFSK/robust decode would let
+			// the §15 WGN:-10 over-climb re-open (a spurious "high" SNR from a robust
+			// frame). telecom_system->M is the just-decoded frame's modulation here (the
+			// 6038-block above branches on the SAME flag for MFSK-vs-OFDM anti-re-decode,
+			// and no config reload runs between there and this line), so M != MOD_MFSK is
+			// exactly "this decoded frame was OFDM". This is the single most important
+			// property of the change — it must NEVER fire on MFSK. The value persists
+			// across the next MFSK SET_CONFIG-ACK so the suffix relays it at the
+			// ROBUST→OFDM boundary; reset to the -99.9 sentinel only on session reset.
+			if(telecom_system->M != MOD_MFSK)
+			{
+				last_ofdm_data_snr = (float)received_message_stats.SNR;
 			}
 
 			{

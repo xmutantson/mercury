@@ -1118,16 +1118,30 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		}
 		else if(ack_pattern_time_ms > 0)
 		{
-			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT
+			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT.
+			// SNR-suffix true-OFDM-SNR relay (data-flow-snr-measurements.md §8, Plan A):
+			// prefer the TRUE OFDM data-frame SNR (last_ofdm_data_snr, captured ONLY off
+			// an OFDM decode at arq_common.cc:6087) when it is valid. At the ROBUST→OFDM
+			// boundary the SET_CONFIG the RSP just decoded was MFSK, so SNR_uplink reflects
+			// the MFSK placeholder (0.0→round-trips to ~1.0 on the CMD); relaying the last
+			// OFDM batch's true SNR (~15) instead lets the CMD's elevator JUMP at CONFIG_0
+			// once the anchor has reached the OFDM tier. At ROBUST (no OFDM data decoded
+			// yet) last_ofdm_data_snr is still -99.9 → fall back to SNR_uplink unchanged →
+			// §15 over-climb guard stays byte-identical (the value-correction is inert
+			// until OFDM is proven; the elevator's is_ofdm_config(anchor) gate is the
+			// backstop, see §8.3).
+			bool have_ofdm_snr = (last_ofdm_data_snr > -90);
+			float suffix_snr = have_ofdm_snr ? last_ofdm_data_snr
+			                                 : (float)measurements.SNR_uplink;
 			bool is_turbo_setconfig = (turboshift_active || turboshift_phase != TURBO_DONE) &&
 				messages_control.data[0] == SET_CONFIG &&
-				measurements.SNR_uplink > -90;
+				(measurements.SNR_uplink > -90 || have_ofdm_snr);
 			if(is_turbo_setconfig)
 			{
-				printf("[ACK-CTRL] Sending ACK+SNR pattern (SNR=%.1f dB)\n",
-					measurements.SNR_uplink);
+				printf("[ACK-CTRL] Sending ACK+SNR pattern (SNR=%.1f dB%s)\n",
+					suffix_snr, have_ofdm_snr ? ", true-OFDM" : "");
 				fflush(stdout);
-				send_ack_pattern_with_snr((float)measurements.SNR_uplink);
+				send_ack_pattern_with_snr(suffix_snr);
 			}
 			else
 			{

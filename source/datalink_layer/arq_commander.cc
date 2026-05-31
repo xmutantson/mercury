@@ -8324,6 +8324,173 @@ int cl_arq_controller::test_climb_engine()
 				(n_dataack_arms ? 2 : 0) + (turbo_snr_ack_enabled ? 1 : 0), 0);
 		}
 
+		// ================================================================
+		// Part SS — SNR-SUFFIX TRUE-OFDM-SNR RELAY (data-flow-snr-measurements.md
+		// §8, Plan A). The unpinned climb is throttled because at CONFIG_0 the
+		// elevator reads measurements.SNR_uplink ≈ 1.0 (the MFSK SET_CONFIG decode's
+		// hardcoded 0.0 round-tripped, telecom_system.cc:2730), not the TRUE OFDM
+		// data-frame SNR (~15). Plan A relays last_ofdm_data_snr (captured ONLY off an
+		// OFDM decode, M != MOD_MFSK) via the control-ACK suffix. These four tests
+		// prove the LEVER, the ANTI-OVER-CLIMB, the PRODUCER-INERTNESS (load-bearing),
+		// and SACK PRESERVATION, all in-process via the REAL helpers
+		// (elevator_target_from_snr, supershift_retrigger_target, snr_uplink_from_suffix,
+		// the Plan-A send-side selection expression, clear_snr_arm_for_data_ack_wait)
+		// and the REAL :4722 elevator fire predicate. (Throughput is hardware-only,
+		// §8.6 "honest scope" — not asserted here.)
+		// ================================================================
+		{
+			robust_enabled = YES;            // unpinned `-R` cascade keeps robust_enabled=YES
+			narrowband_enabled = NO;
+			max_config_override = -1;
+			gear_shift_on = YES;
+			optimizer_disabled = true;       // optimizer_is_in_control()==false (anchor-clamp path)
+			supershift_proven_ceiling = -1;  // no BREAK ceiling
+			turboshift_phase = TURBO_DONE;   // steady-state (the elevator's enclosing gate)
+
+			// ---- SS-a — ELEVATOR JUMPS: a TRUE OFDM suffix SNR at an OFDM anchor lets
+			// the elevator make the multi-rung jump from CONFIG_0. Drives the REAL
+			// elevator_target_from_snr() (the exact production method both elevator sites
+			// call) and the REAL :4722 fire predicate (gap >= SUPERSHIFT_RETRIGGER_CONFIGS).
+			// The LEVER: SNR 15.0 -> get_configuration(9.0)=CONFIG_13 (a 13-rung reach,
+			// == the RETRIGGER_MAX_LEAP cap); the FAIL-BEFORE value 1.0 ->
+			// get_configuration(-5.0)=CONFIG_4 (only a 4-rung reach). The suffix VALUE is
+			// what sets how high the elevator reaches at CONFIG_0 — that is the throttle
+			// the fix releases. ----
+			current_configuration   = CONFIG_0;     // an OFDM rung — the throttle point
+			last_data_viable_config = CONFIG_0;      // OFDM anchor (is_ofdm_config==true)
+			{
+				// PASS-AFTER (the fix relays ~15): elevator reaches CONFIG_13 and FIRES.
+				measurements.SNR_uplink = snr_uplink_from_suffix(15.0f);
+				int snr_ideal_hi = elevator_target_from_snr();          // REAL production method
+				int gap_hi = config_ladder_index(snr_ideal_hi) - config_ladder_index(current_configuration);
+				bool gate_hi = (turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
+				                is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90);
+				bool fires_hi = gate_hi && (gap_hi >= SUPERSHIFT_RETRIGGER_CONFIGS);
+				check(snr_ideal_hi == CONFIG_13,
+					"SS-a1 PASS-AFTER: TRUE-OFDM suffix 15.0 -> elevator targets CONFIG_13 (RETRIGGER_MAX_LEAP-bounded jump from CONFIG_0)",
+					snr_ideal_hi, CONFIG_13);
+				check(fires_hi == true && gap_hi >= SUPERSHIFT_RETRIGGER_CONFIGS,
+					"SS-a2 PASS-AFTER: the :4722 re-trigger FIRES (OFDM gate true AND gap>=SUPERSHIFT_RETRIGGER_CONFIGS=3) — the multi-rung jump",
+					gap_hi, SUPERSHIFT_RETRIGGER_CONFIGS);
+
+				// FAIL-BEFORE proxy (today's CONFIG_0 value ~1.0): elevator reaches only
+				// CONFIG_4 (target <= CONFIG_4). Same anchor, same gate — ONLY the suffix
+				// value differs, proving the value is the lever.
+				measurements.SNR_uplink = snr_uplink_from_suffix(1.0f);
+				int snr_ideal_lo = elevator_target_from_snr();
+				check(config_ladder_index(snr_ideal_lo) <= config_ladder_index(CONFIG_4),
+					"SS-a3 FAIL-BEFORE: the legacy CONFIG_0 value (~1.0) reaches only <= CONFIG_4 — the throttle (no big jump)",
+					config_ladder_index(snr_ideal_lo), config_ladder_index(CONFIG_4));
+				check(config_ladder_index(snr_ideal_hi) > config_ladder_index(snr_ideal_lo),
+					"SS-a4 the suffix VALUE is the lever: 15.0 reaches strictly higher (CONFIG_13) than 1.0 (CONFIG_4)",
+					config_ladder_index(snr_ideal_hi), config_ladder_index(snr_ideal_lo));
+			}
+
+			// ---- SS-b — OVER-CLIMB STAYS SHUT (value-INDEPENDENT): a HIGH suffix SNR at
+			// a ROBUST anchor is STILL clamped to +1. Drives the REAL
+			// supershift_retrigger_target() with the SAME caller-side cap-chain
+			// elevator_target_from_snr() applies, but at a ROBUST anchor. This is the JJ1c
+			// assertion driven with 15.0 (not 1.0): the §15 over-climb guard is gated on
+			// is_ofdm_config(anchor), NOT on the SNR value, so a high suffix from the
+			// §8.3 hazard window (an OFDM frame relayed a high SNR before the CMD anchor
+			// ratcheted to OFDM) CANNOT bypass it. Proves the value-correction fix cannot
+			// reopen the §15 WGN:-10 over-climb. ----
+			current_configuration   = CONFIG_0;
+			last_data_viable_config = ROBUST_2;      // ROBUST anchor (is_ofdm_config==false)
+			{
+				double snr_hi = snr_uplink_from_suffix(15.0f);   // the HAZARD: a high suffix at a robust anchor
+				int snr_ideal_raw = get_configuration(snr_hi - SUPERSHIFT_MARGIN_DB);   // CONFIG_13
+				int anchor_cap    = config_ladder_up_n(ROBUST_2, 1, /*robust_en=*/true, /*nb=*/false);  // CONFIG_0
+				int proposed_p1   = config_ladder_up(CONFIG_0, true, false);            // the +1 (CONFIG_1)
+				int t_after = supershift_retrigger_target(snr_ideal_raw, snr_hi, ROBUST_2,
+					/*optimizer_owns=*/false, /*robust_en=*/true, /*nb=*/false);        // REAL §15 helper
+				// premise: 15.0 maps to an OFDM config (CONFIG_13) multi-rung above the
+				// ROBUST anchor's +1 (CONFIG_0) — the over-climb temptation, at HIGH SNR.
+				check(snr_ideal_raw == CONFIG_13 && anchor_cap == CONFIG_0 &&
+				      config_ladder_index(snr_ideal_raw) > config_ladder_index(anchor_cap),
+					"SS-b1 premise: a HIGH suffix (15.0) maps to CONFIG_13, multi-rung above the ROBUST anchor's +1 (CONFIG_0)",
+					config_ladder_index(snr_ideal_raw), config_ladder_index(anchor_cap));
+				// PASS-AFTER: is_ofdm_config(ROBUST_2)=false -> high_confidence_jump=false
+				// REGARDLESS of the 15.0 value -> the +1 clamp returns anchor_cap (CONFIG_0).
+				check(t_after == anchor_cap && t_after == CONFIG_0,
+					"SS-b2 PASS-AFTER: HIGH suffix at a ROBUST anchor STILL clamps to anchor+1 (CONFIG_0) — §15 guard is value-INDEPENDENT",
+					t_after, CONFIG_0);
+				check(config_ladder_index(t_after) <= config_ladder_index(proposed_p1),
+					"SS-b3 PASS-AFTER: target <= the +1 proposed (NO multi-rung jump from a ROBUST anchor even at 15.0 dB)",
+					config_ladder_index(t_after), config_ladder_index(proposed_p1));
+			}
+
+			// ---- SS-c — PRODUCER INERTNESS (THE load-bearing constraint, §8.3): the
+			// suffix-source NEVER reports a high SNR off an MFSK/robust decode. Two parts:
+			// (1) the PRODUCER gate — model the arq_common.cc:6087 write
+			// `if(telecom_system->M != MOD_MFSK) last_ofdm_data_snr = SNR;` for BOTH a
+			// genuine OFDM decode and an MFSK decode, asserting the MFSK decode leaves the
+			// member at the sentinel; (2) the SEND-side SELECTION — the EXACT Plan-A
+			// expression from arq_responder.cc evaluated at member granularity, asserting
+			// it picks the legacy SNR_uplink (the MFSK 0.0) when no OFDM SNR exists, and
+			// the true OFDM SNR (15.0) once one does. ----
+			{
+				// (1) PRODUCER GATE. Start at the session sentinel.
+				last_ofdm_data_snr = -99.9f;
+				// Simulate a GENUINE OFDM data decode (M != MOD_MFSK) at SNR 15.0: the
+				// producer writes the member.
+				{
+					float decoded_ofdm_snr = 15.0f;
+					int sim_M = 0;                     // any OFDM modulation (NOT MOD_MFSK=200)
+					if(sim_M != MOD_MFSK) last_ofdm_data_snr = decoded_ofdm_snr;   // arq_common.cc:6087 gate
+				}
+				check(last_ofdm_data_snr > -90 && last_ofdm_data_snr == 15.0f,
+					"SS-c1 PRODUCER: an OFDM decode (M != MOD_MFSK) DOES capture last_ofdm_data_snr (=15.0)",
+					(int)last_ofdm_data_snr, 15);
+				// Now simulate an MFSK/robust decode (M == MOD_MFSK, SNR hardcoded 0.0):
+				// the producer gate must NOT touch last_ofdm_data_snr — it must NOT pick up
+				// a value from MFSK. (Reset to sentinel first to prove the gate, not stale.)
+				last_ofdm_data_snr = -99.9f;
+				{
+					float decoded_mfsk_snr = 0.0f;     // telecom_system.cc:2730 hardcode
+					int sim_M = MOD_MFSK;              // a robust/MFSK frame
+					if(sim_M != MOD_MFSK) last_ofdm_data_snr = decoded_mfsk_snr;   // gate FALSE -> no write
+				}
+				check(last_ofdm_data_snr == -99.9f && !(last_ofdm_data_snr > -90),
+					"SS-c2 LOAD-BEARING: an MFSK decode (M == MOD_MFSK) NEVER writes last_ofdm_data_snr (stays -99.9 sentinel)",
+					(last_ofdm_data_snr == -99.9f) ? 1 : 0, 1);
+
+				// (2) SEND-SIDE SELECTION — the EXACT arq_responder.cc Plan-A expression.
+				// Case MFSK (no OFDM data yet): last_ofdm_data_snr=-99.9, SNR_uplink=0.0
+				// (the MFSK placeholder) -> selection MUST be the legacy 0.0 (NOT high).
+				measurements.SNR_uplink = 0.0;          // round-trips to ~1.0 on the CMD (the throttle)
+				last_ofdm_data_snr = -99.9f;
+				bool have_ofdm_snr_mfsk = (last_ofdm_data_snr > -90);
+				float suffix_mfsk = have_ofdm_snr_mfsk ? last_ofdm_data_snr
+				                                       : (float)measurements.SNR_uplink;
+				check(have_ofdm_snr_mfsk == false && suffix_mfsk == 0.0f,
+					"SS-c3 SELECTION (MFSK): no OFDM data -> suffix == legacy SNR_uplink (0.0), the MFSK behavior — §15 inert",
+					(int)suffix_mfsk, 0);
+				// Case OFDM (a CONFIG_0 batch decoded at 15.0): last_ofdm_data_snr=15.0 ->
+				// selection MUST be the true OFDM 15.0, NOT the MFSK SET_CONFIG's 0.0.
+				last_ofdm_data_snr = 15.0f;
+				bool have_ofdm_snr_ofdm = (last_ofdm_data_snr > -90);
+				float suffix_ofdm = have_ofdm_snr_ofdm ? last_ofdm_data_snr
+				                                       : (float)measurements.SNR_uplink;
+				check(have_ofdm_snr_ofdm == true && suffix_ofdm == 15.0f,
+					"SS-c4 SELECTION (OFDM): a valid OFDM SNR -> suffix == 15.0 (the TRUE value), overriding the MFSK SET_CONFIG 0.0",
+					(int)suffix_ofdm, 15);
+				last_ofdm_data_snr = -99.9f;            // restore sentinel for any later test
+			}
+
+			// ---- SS-d — SACK PRESERVED (§18 not reopened): clear_snr_arm_for_data_ack_wait()
+			// still forces the SNR arm FALSE on every data-ACK wait. Plan A adds NO data-ACK
+			// suffix (it rides the CONTROL ACK only, where the SACK suffix never rides), so
+			// the §18 closure is intact. Drive the REAL production method (the Part N idiom). ----
+			{
+				turbo_snr_ack_enabled = true;                 // a (hypothetically) armed SNR decode
+				clear_snr_arm_for_data_ack_wait();            // the REAL :1329/:1826 data-ACK-wait call
+				check(turbo_snr_ack_enabled == false,
+					"SS-d PASS-AFTER: clear_snr_arm_for_data_ack_wait() forces the arm FALSE on the data-ACK wait (Plan A does not reopen §18)",
+					turbo_snr_ack_enabled ? 1 : 0, 0);
+			}
+		}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);

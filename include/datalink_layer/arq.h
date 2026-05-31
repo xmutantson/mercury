@@ -1829,6 +1829,20 @@ public:
   // no upward move may exceed index+1 unless optimizer_is_in_control(). A FAILED
   // probe never raises it. See fact-documents/gearshift-start-and-recovery.md §6/§7.
   int last_data_viable_config;
+  // SNR-SUFFIX TRUE-OFDM-SNR RELAY (data-flow-snr-measurements.md §8, Plan A,
+  // 2026-05-31). The RSP's most recent OFDM DATA-frame SNR (received_message_stats.SNR,
+  // the canonical producer arq_common.cc:6087), captured ONLY when the decoded frame was
+  // genuinely OFDM (telecom_system->M != MOD_MFSK). Init / session-reset = -99.9 (the
+  // "no OFDM data decoded yet" sentinel, mirrors SNR_uplink's -99.9). The RSP's
+  // control-ACK suffix send (arq_responder.cc:~1124-1130) prefers this over
+  // measurements.SNR_uplink when it is valid (> -90), so the SET_CONFIG-ACK suffix relays
+  // the TRUE OFDM SNR (~15 at CONFIG_0+) to the CMD's elevator instead of the MFSK
+  // SET_CONFIG decode's hardcoded 0.0→1.0 (telecom_system.cc:2730). At ROBUST (no OFDM
+  // data decoded yet) this stays -99.9 → the suffix falls back to the legacy SNR_uplink
+  // value → §15 DEEP-SNR over-climb guard stays BYTE-IDENTICAL (see §8.3). LOAD-BEARING:
+  // this member must NEVER be written off an MFSK/robust decode (the M!=MOD_MFSK gate at
+  // the producer is the single most important property of the change).
+  float last_ofdm_data_snr;
   // DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10/§11, 2026-05-30) —
   // the MISSING anchor DEMOTION producer. last_data_viable_config (above) only
   // ever RISES (anchor-raise :3454 + ctor/reset init); there was no path to lower
