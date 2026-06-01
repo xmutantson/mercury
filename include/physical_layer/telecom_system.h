@@ -204,6 +204,35 @@ public:
 	                                       uint16_t* out_crc12,
 	                                       int* out_matched = nullptr);
 
+	// ---- Suffix FEC (connect-suffix-fec-research.md) — MEASURED PROTOTYPE ----
+	// CRC-aided SOFT list decode of the 13-symbol ctrl-suffix. ZERO airtime
+	// (Tier 1): no wire-format change, the suffix bytes are byte-identical to
+	// baseline. These run the same base-pattern detector + mini-Moose as the
+	// hard decode, then cl_ofdm::decode_suffix_candidates + the CRC-gated
+	// best-first search (soft_list_decode_ctrl_suffix) to correct a few
+	// wrong-argmax symbols. The caller passes the production CRC-12 (NEVER
+	// inline; v1 bug #1). out_flips = #symbols that differ from the hard
+	// argmax (0 ⇒ hard decode would also have passed).
+	//
+	// suffix_fec_mode gates production wiring (0 = baseline hard path only;
+	// the *_soft entry points are always available for direct measurement).
+	int  suffix_fec_mode;       // 0 = off (baseline). 1 = soft list decode.
+	int  suffix_fec_K;          // top-K candidates per symbol (default 4).
+	int  suffix_fec_max_trials; // CRC-trial cap (bounds runtime; default 4000).
+	int  suffix_fec_max_flips;  // Hamming-ball radius (primary FAR lever; default 3).
+
+	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
+	                                            mfsk_ctrl_frame_type expected_type,
+	                                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+	                                            uint64_t* out_payload38,
+	                                            int* out_matched = nullptr,
+	                                            int* out_flips = nullptr);
+	bool decode_ack_sack_from_passband_soft(double* data, int size,
+	                                         ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+	                                         uint8_t* out_bsi, uint32_t* out_bitmap,
+	                                         int* out_matched = nullptr,
+	                                         int* out_flips = nullptr);
+
 	// Step 15: legacy MFSK SACK pattern (sack_pattern_passband_samples,
 	// generate_sack_bitmap_pattern_passband, detect_sack_pattern_from_passband,
 	// decode_sack_bitmap_ldpc, sack_pattern_detection_test) deleted —
