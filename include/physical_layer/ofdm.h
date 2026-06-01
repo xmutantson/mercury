@@ -208,6 +208,12 @@ public:
 	// out_cand / out_cost are suffix_len*K arrays; cand[s*K+0] == the hard
 	// decode_suffix_tones result for symbol s. Zero added airtime.
 	void decode_suffix_candidates(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int pattern_offset, int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int K, int* out_cand, double* out_cost);
+	// decode_suffix_energies: full per-tone energy matrix E[s*mfsk_M + t] for the
+	// soft GF(16) RA decoder (tier2-suffix-fec-gf16-spike.md). Same FFT + de-hop
+	// math as decode_suffix_candidates, but emits ALL M energies per symbol
+	// (de-hopped to data-tone index, combined across streams) rather than the
+	// top-K + cost. Slots for symbols past the buffer end are set to 0.
+	void decode_suffix_energies(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int pattern_offset, int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, double* out_energies);
 	int symbol_sync(std::complex <double>*, int size, int interpolation_rate, int location_to_return);
 	void rational_resampler(std::complex <double>* in, int in_size , std::complex <double>* out, int rate, int interpolation_decimation);
 	void baseband_to_passband(std::complex <double>* in, int in_size, double* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int interpolation_rate);

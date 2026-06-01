@@ -190,4 +190,88 @@ bool soft_list_decode_ctrl_suffix(const int* cand, const double* cost,
                                   ctrl_crc12_fn crc12_fn, void* crc12_ctx,
                                   uint64_t* out_payload38, int* out_flips);
 
+// =============================================================================
+// Tier-2 candidate A: soft GF(16) rate-~1/2 RA code (Q65/QRA lineage)
+// =============================================================================
+//
+// fact-documents/tier2-suffix-fec-gf16-spike.md. A symbol-matched (GF(16))
+// repeat-accumulate FEC for the M=16 noncoherent-FSK control suffix, decoded by
+// Q-ary belief propagation directly from the per-tone ENERGIES (Bessel-I0
+// intrinsic metric) — no hard argmax, no bit-LLR marginalization loss. Ported
+// from the qracodes algorithm (IV3NWV, GPLv3→AGPLv3): WHT check-node
+// convolution + permutation weights + EXIT-chart convergence. Q65 carries the
+// CRC as PROTECTED info symbols (QRATYPE_CRC), which this code mirrors so the
+// CRC accept-gate is FEC-reliable at the floor.
+//
+// Code: GF(16), N=20 symbols = K=13 info (10 message + 3 CRC) + 7 RA parity,
+// rate 13/20. The 40-bit message [type:2|payload:38] occupies the first 10 info
+// symbols (4 bits/symbol, MSB-first — identical bit order to pack_ctrl_suffix);
+// the production CRC12 occupies the next 3 info symbols. SIM SPIKE only:
+// measurement-only, gated behind cl_telecom_system::suffix_fec_mode==3.
+
+namespace gf16ra {
+
+static const int GF16RA_M       = 16;  // symbol alphabet (M-FSK order)
+static const int GF16RA_m       = 4;   // bits/symbol = log2(M)
+static const int GF16RA_K_MSG   = 10;  // info symbols carrying the 40-bit message
+static const int GF16RA_K_CRC   = 3;   // info symbols carrying the 12-bit CRC
+static const int GF16RA_K       = 13;  // total info symbols (message + CRC)
+static const int GF16RA_MAX_N   = 64;  // buffer ceiling for out_tones / energies
+
+// TRUE Q-ary RA structure (matches qracodes / Q65): the parity is a length-NC
+// GF(16) accumulator chain, each stage folding in EXACTLY ONE interleaved info
+// replica (check degree 3: prev-parity, this-parity, one info edge). NC = total
+// info replicas = repfact * K. The transmitted codeword is systematic
+// [13 info | NC parity], so N = K + NC and rate R = K/N. repfact is the only
+// knob: repfact=1 -> N=26 (R=0.50), repfact=2 -> N=39 (R=0.33),
+// repfact=3 -> N=52 (R=0.25, the Q65 operating class). A degree-3 sparse graph
+// is the ONLY structure where Q-ary BP delivers multi-symbol correction (a
+// high-rate/few-parity code collapses to ~1-symbol correction — measured, see
+// tier2-suffix-fec-gf16-spike.md §8). The CRC is carried as PROTECTED info
+// (Q65 QRATYPE_CRC) so the recompute-and-compare accept gate is FEC-reliable.
+
+// Configure the code repeat factor (must be called before init()/the first
+// encode/decode, or after a reconfigure). Default repfact = 2 (N=39, R=1/3).
+// Returns the resulting codeword length N (= K + repfact*K).
+int  configure(int repfact);
+int  codeword_len();   // current N (= K + NC); valid after configure()/init()
+int  parity_len();     // current NC (= repfact*K)
+
+// One-time construction of the GF(16) field tables and the RA graph for the
+// current repfact (interleaver, accumulator weights). Idempotent until the next
+// configure(). Returns true.
+bool init();
+
+// Encode: 40-bit message [type:2|payload38:38] + 12-bit crc12 -> N GF(16)
+// codeword tones (0..15). out_tones must have room for codeword_len() (<=
+// GF16RA_MAX_N). The 10 message symbols + 3 CRC symbols are systematic (appear
+// verbatim as the first 13 tones); the remaining NC are RA parity. Bit order in
+// the message symbols is MSB-first, matching cl_mfsk::pack_ctrl_suffix.
+void encode(uint8_t type, uint64_t payload38, uint16_t crc12, int* out_tones);
+
+// Soft decode from the per-tone ENERGY matrix.
+//
+//   energies : N*M row-major (N = codeword_len()); energies[s*M + t] = received
+//              energy of tone t in codeword symbol s. These are exactly the
+//              per-tone energies cl_ofdm::decode_suffix_energies emits (same FFT
+//              + de-hop math as decode_suffix_candidates, but the full vector).
+//   maxiter  : BP iteration cap (50 is ample).
+//   esno_metric : assumed Es/No for the Bessel intrinsic (qra_mfskbesselmetric;
+//                 a fixed design point since true Es/No is unknown at ~20 sym).
+//   expected_type : required 2-bit type discriminator (reject others).
+//   crc12_fn / crc12_ctx : production CRC-12 over the 5-byte [type:2|payload38]
+//                 field (NEVER inline — same callback convention as Tier-1).
+//
+// Decodes the 13 info symbols by Q-ary BP + MAP argmax, reassembles
+// [type|payload38] + the decoded 12-bit CRC, recomputes CRC12, and accepts iff
+// (a) the recomputed CRC matches the decoded CRC AND (b) type == expected_type.
+// On success writes *out_payload38 and (if non-null) *out_iters (BP iterations
+// used; -1 if it ran to the cap) and returns true.
+bool soft_decode(const double* energies, int maxiter, double esno_metric,
+                 uint8_t expected_type,
+                 ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                 uint64_t* out_payload38, int* out_iters);
+
+} // namespace gf16ra
+
 #endif // INC_MFSK_CTRL_CODEC_H_

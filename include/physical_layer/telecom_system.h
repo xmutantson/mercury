@@ -216,7 +216,11 @@ public:
 	//
 	// suffix_fec_mode gates production wiring (0 = baseline hard path only;
 	// the *_soft entry points are always available for direct measurement).
-	int  suffix_fec_mode;       // 0 = off (baseline). 1 = soft list decode.
+	// Tier-2 sim spikes reserve distinct mode IDs so a later combined wire can
+	// carry both: 2 = Golay(24,12) soft-ML (parallel spike), 3 = GF(16) RA
+	// (tier2-suffix-fec-gf16-spike.md; measurement-only — the gf16ra codec has
+	// no production caller, exercised via the §10 cliff-sweep harness).
+	int  suffix_fec_mode;       // 0 = off (baseline). 1 = soft list decode. 2/3 = Tier-2 spikes.
 	int  suffix_fec_K;          // top-K candidates per symbol (default 4).
 	int  suffix_fec_max_trials; // CRC-trial cap (bounds runtime; default 4000).
 	int  suffix_fec_max_flips;  // Hamming-ball radius (primary FAR lever; default 3).

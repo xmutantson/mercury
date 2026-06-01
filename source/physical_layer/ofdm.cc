@@ -4161,6 +4161,56 @@ void cl_ofdm::decode_suffix_candidates(std::complex<double>* baseband_interp,
 	}
 }
 
+// Full per-tone energy matrix for the soft GF(16) RA decoder
+// (tier2-suffix-fec-gf16-spike.md). Same FFT + stream-combine + de-hop math as
+// decode_suffix_candidates, but writes ALL mfsk_M de-hopped per-tone energies
+// per symbol into out_energies[s*mfsk_M + data_tone]. Symbols past the buffer
+// end leave their M energy slots at 0 (uniform -> uninformative intrinsic).
+void cl_ofdm::decode_suffix_energies(std::complex<double>* baseband_interp,
+	int buffer_size_interp, int interpolation_rate, int pattern_offset,
+	int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M,
+	int nStreams, const int* stream_offsets, double* out_energies)
+{
+	int Nofdm_local = Nfft + Ngi;
+	int sym_period_interp = Nofdm_local * interpolation_rate;
+	int half = Nc / 2;
+
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+
+	for (int s = 0; s < suffix_len; s++)
+	{
+		for (int t = 0; t < mfsk_M; t++) out_energies[s * mfsk_M + t] = 0.0;
+
+		int abs_s = pattern_nsymb + s;
+		int offset = pattern_offset + abs_s * sym_period_interp + Ngi * interpolation_rate;
+		if (offset + Nfft * interpolation_rate > buffer_size_interp)
+			continue;  // symbol past buffer end -> all-zero (uniform) energies
+
+		for (int i = 0; i < Nfft; i++)
+			decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+		fft(decimated_sym, fft_out, Nfft);
+
+		int hop = (abs_s * tone_hop_step) % mfsk_M;
+		for (int t = 0; t < mfsk_M; t++)
+		{
+			double e_combined = 0;
+			for (int st = 0; st < nStreams; st++)
+			{
+				int sub = stream_offsets[st] + t;
+				int b = (sub < half) ? Nfft - half + sub
+				                     : start_shift + (sub - half);
+				double e = fft_out[b].real() * fft_out[b].real() +
+				           fft_out[b].imag() * fft_out[b].imag();
+				e_combined += e;
+			}
+			// de-hop: received bin t corresponds to data tone (t - hop) mod M.
+			int data_tone = (t - hop + mfsk_M * 256) % mfsk_M;
+			out_energies[s * mfsk_M + data_tone] = e_combined;
+		}
+	}
+}
+
 int cl_ofdm::symbol_sync(std::complex <double>*in, int size, int interpolation_rate, int location_to_return)
 {
 
