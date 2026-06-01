@@ -50,6 +50,7 @@ cl_telecom_system::cl_telecom_system()
 	fsel_delay            = 128;   // second-ray delay in passband samples (~Nfft/8 @ interp=4, within GI)
 	ber_single_esn0       = -999.0f; // fix/cfg16-nv-restore: <=-900 = normal full sweep
 	ber_frames_override   = 0;     // 0 = use sweep default frame count
+	baud_mult             = 1;     // P0 baud-scaling spike: 1 = off (default)
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
@@ -417,7 +418,16 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			}
 			P_sig /= nSamples;
 			double f_nyquist = sampling_frequency / 2.0;
-			sigma = (float)sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, EsN0 / 10.0) * bandwidth));
+			// P0 baud-scaling spike (baud-scaling-spike.md §2): when ofdm.Nfft is
+			// scaled by baud_mult, `bandwidth` (=48000*Nc/Nfft/interp,
+			// telecom_system.cc:4217) shrinks by the SAME factor. If the noise
+			// reference tracked that, the +3 dB/2x coherent gain would be exactly
+			// cancelled in the reported EsN0 (the measurement trap). Pin the
+			// reference to the K=1 bandwidth (multiply back by baud_mult) so the
+			// swept SNR axis is a FIXED ~3 kHz reference (WSJT-X Table 7 / SNR3k
+			// convention) and the cliff moves by the TRUE baud-scaling gain.
+			double ref_bandwidth = bandwidth * (double)baud_mult;
+			sigma = (float)sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, EsN0 / 10.0) * ref_bandwidth));
 			sigma_calibrated = true;
 		}
 
@@ -5328,6 +5338,36 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.Nfft=default_configurations_telecom_system.ofdm_Nfft;
 	ofdm.gi=default_configurations_telecom_system.ofdm_gi;
 	ofdm.Nsymb=default_configurations_telecom_system.ofdm_Nsymb;
+
+	// === P0 BAUD-SCALING SPIKE (SIM ONLY, env-gated) =======================
+	// baud-scaling-spike.md §3: a genuine 2x/4x LONGER coherent MFSK symbol is
+	// produced by enlarging the per-symbol FFT window (the symbol = exactly one
+	// Nfft FFT window, §1). Scale ofdm.Nfft by MERCURY_BAUD_MULT (K=1/2/4) for
+	// MFSK/robust configs only. Ngi=Nfft*gi, Nofdm, all buffers, the cached FFT
+	// plan, and the tone grid (M tones on Nc bins) follow automatically. Tone
+	// spacing narrows to 12000/(K*256) Hz, symbol period grows K*. Default (env
+	// unset) => K=1 => byte-identical to production for EVERY config.
+	baud_mult = 1;
+	if(is_robust_config(configuration))
+	{
+		const char* bm = getenv("MERCURY_BAUD_MULT");
+		if(bm != NULL)
+		{
+			int k = atoi(bm);
+			if(k == 2 || k == 4 || k == 8) baud_mult = k;
+		}
+		if(baud_mult > 1)
+		{
+			ofdm.Nfft = default_configurations_telecom_system.ofdm_Nfft * baud_mult;
+			printf("[BAUD-SPIKE] MERCURY_BAUD_MULT=%d -> Nfft %d->%d (symbol %dx longer, "
+			       "tone spacing %.2f Hz)\n",
+			       baud_mult, default_configurations_telecom_system.ofdm_Nfft, ofdm.Nfft,
+			       baud_mult,
+			       48000.0/frequency_interpolation_rate/(double)ofdm.Nfft);
+			fflush(stdout);
+		}
+	}
+	// =======================================================================
 
 	ofdm.pilot_configurator.Dx=default_configurations_telecom_system.ofdm_pilot_configurator_Dx;
 	ofdm.pilot_configurator.Dy=default_configurations_telecom_system.ofdm_pilot_configurator_Dy;

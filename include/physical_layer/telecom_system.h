@@ -312,6 +312,13 @@ public:
 	float ber_single_esn0;
 	int   ber_frames_override;
 
+	// P0 baud-scaling spike (baud-scaling-spike.md). Set in load_configuration
+	// from env MERCURY_BAUD_MULT for MFSK/robust configs only; 1 = off (default,
+	// byte-identical). When >1, ofdm.Nfft is scaled by this factor (longer
+	// coherent symbol) and the BER-harness noise reference is pinned to the K=1
+	// bandwidth so the SNR axis stays a fixed reference (§2 measurement trap).
+	int   baud_mult;
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.
