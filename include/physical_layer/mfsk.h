@@ -214,7 +214,7 @@ public:
 	// silently coded the data ACK to 52 tones while the ACK generator emitted only
 	// 13 → garbled ACK at every OFDM SNR). Default false = byte-identical ACK. The
 	// ARQ layer sets it per-batch ONLY when ack_suffix_fec_eligible() (robust tier
-	// + CAP negotiated); held off this increment (§21.3) → always 13-tone uncoded.
+	// — a throughput gate, not a negotiation); held off (§21.3) → always 13-tone uncoded.
 	bool ack_suffix_fec_coded;   // default false (set in init())
 	int ctrl_suffix_len() const {
 		if (ack_sack_suffix_len() <= 0) return 0;          // NB: unsupported either way

@@ -35,9 +35,10 @@
 #define MFSK_ACK_SACK_ENABLED 1
 #endif
 
-// §21 (tier2-suffix-fec-design.md §21.3): MASTER ENABLE for the adaptive
+// §21 (tier2-suffix-fec-design.md §21.3): MASTER ENABLE for the
 // robust-tier ACK FEC. The per-batch ACK enhanced-suffix is gated on
-// ack_suffix_fec_eligible() (robust tier + CAP_SUFFIX_FEC negotiated), but the
+// ack_suffix_fec_eligible() (robust tier — a throughput gate, not a capability
+// negotiation; CAP_SUFFIX_FEC was removed in cleanup/drop-suffix-fec-cap), but the
 // actual TX/RX ENABLE is held OFF here so the data ACK is byte-identical in 100%
 // of cases (the hard throughput-neutrality constraint), not just at CONFIG_6+.
 // Rationale: (a) the §20.9 HW result shows the ACK was never the establishment

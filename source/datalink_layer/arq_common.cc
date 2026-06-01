@@ -1501,13 +1501,13 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// switch (the set_* hooks re-derive that member at the current Nofdm).
 	//
 	// The enhanced ctrl-suffix (GF(16) RA FEC §19 + base-pattern combining §20) is
-	// the unified CAP_SUFFIX_FEC feature. PRODUCTION TRIGGER = LOCAL robust tier
-	// (§21.3): when the session is at ROBUST_0/1/2 the CONNECT suffix is enhanced
-	// (FEC R¼ + combining R=4) — once/session, airtime-cheap (§4: +2% of a 7.9 s
-	// ROBUST frame). The CONNECT enable does NOT gate on CAP negotiation because
-	// the floor-binding START_CONN is PRE-CAP (§21.3 chicken-and-egg); a legacy RX
-	// simply fails the enhanced frame and the LDPC-fallback / handshake-retry path
-	// recovers (and the upgraded RX runs try-both, §21.5). At OFDM configs
+	// the UNCONDITIONAL DEFAULT at the robust tier — it is NOT capability-negotiated
+	// (Mercury shipped no version → no legacy peers; the GF(16) RA codeword is
+	// systematic, backward-compatible by construction). PRODUCTION TRIGGER = LOCAL
+	// robust tier (§21.3): when the session is at ROBUST_0/1/2 the CONNECT suffix is
+	// enhanced (FEC R¼ + combining R=4) — once/session, airtime-cheap (§4: +2% of a
+	// 7.9 s ROBUST frame). The RX runs the try-both decode (uncoded-13-first, then
+	// the GF(16) soft decode) gated on its OWN robust tier, §21.5. At OFDM configs
 	// (CONFIG_6+) the enhanced state is turned OFF → the CONNECT suffix is
 	// byte-identical (and CONNECT establishment normally happens at the robust
 	// floor anyway). Re-applied on EVERY config switch so a turboshift up to OFDM
@@ -2748,7 +2748,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | ((bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0);  // §21: advertise enhanced ctrl-suffix when WB-capable
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2845,7 +2845,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | ((bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0);  // §21: advertise enhanced ctrl-suffix when WB-capable
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2899,7 +2899,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | CAP_SUFFIX_FEC;  // §21: WB → advertise enhanced ctrl-suffix
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2918,7 +2918,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | CAP_SUFFIX_FEC;  // §21: WB → advertise enhanced ctrl-suffix
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -4481,21 +4481,23 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
 		return 0;
 
-	// §21.3 per-batch ACK ADAPTIVE gate: the enhanced (GF(16) FEC) ACK suffix is
-	// eligible ONLY at the robust tier AND when CAP_SUFFIX_FEC is mutually
-	// negotiated — CONFIG_6+ or cap-absent → uncoded → byte-identical (the hard
-	// throughput-neutrality constraint). The ENABLE is held off (ARQ_ACK_SUFFIX_
-	// FEC_ENABLE=0, §21.3) pending the ACK coded-window sizing work, so this stays
-	// false in 100% of cases this increment — the predicate is wired + observable
-	// so flipping the master enable is a one-line follow-on. We set the per-call
-	// flag from the gate and clear it after TX so it can never leak to a later
-	// non-eligible ACK (the §21.1-class shared-state discipline).
+	// §21.3 per-batch ACK gate: the enhanced (GF(16) FEC) ACK suffix is eligible
+	// ONLY at the robust tier — CONFIG_6+ → uncoded → byte-identical (the hard
+	// throughput-neutrality constraint). This is a THROUGHPUT gate, not a
+	// capability negotiation (the enhanced ctrl-suffix is the unconditional
+	// default at the robust tier; the CAP_SUFFIX_FEC negotiation was removed in
+	// cleanup/drop-suffix-fec-cap). The ENABLE is held off (ARQ_ACK_SUFFIX_FEC_
+	// ENABLE=0, §21.3) pending the ACK coded-window sizing work, so this stays
+	// false in 100% of cases — the predicate is wired + observable so flipping the
+	// master enable is a one-line follow-on. We set the per-call flag from the gate
+	// and clear it after TX so it can never leak to a later non-eligible ACK (the
+	// §21.1-class shared-state discipline).
 	bool ack_fec_eligible = ack_suffix_fec_eligible();
 	telecom_system->ack_mfsk.ack_suffix_fec_coded =
 		(ARQ_ACK_SUFFIX_FEC_ENABLE != 0) && ack_fec_eligible;
 	if(g_verbose && ack_fec_eligible)
 	{
-		printf("[TX-MFSK-ACK-SACK] enhanced-ACK eligible (robust tier + CAP_SUFFIX_FEC); "
+		printf("[TX-MFSK-ACK-SACK] enhanced-ACK eligible (robust tier); "
 			"enable=%d coded=%d\n", (int)(ARQ_ACK_SUFFIX_FEC_ENABLE != 0),
 			(int)telecom_system->ack_mfsk.ack_suffix_fec_coded);
 		fflush(stdout);

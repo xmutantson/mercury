@@ -1352,3 +1352,64 @@ upgraded↔upgraded enhanced stack (FEC+combining at the robust tier) is the unc
 @R≥2) — this increment only changed the TRIGGER (tier vs env), not the PHY, so the cliff is preserved
 (verified: both sweeps still report −13.89 on this binary). SIM ONLY — the production-config HW
 re-validate folds into the bundle merge.
+
+### §22 — CAP_SUFFIX_FEC negotiation REMOVED (branch cleanup/drop-suffix-fec-cap, off monitor @177dc31, 2026-06-01)
+
+The §21 `CAP_SUFFIX_FEC` capability negotiation + the legacy-RX interop machinery were dead weight:
+Mercury shipped NO version, so there are no legacy peers to negotiate against, and §21.6 proved the
+enhanced ctrl-suffix is BACKWARD-COMPATIBLE BY CONSTRUCTION (systematic GF(16) RA codeword + identical
+base-rep combining). The negotiation was also already VESTIGIAL: CONNECT runs the enhanced suffix
+UNCONDITIONALLY at the robust tier (`is_robust_config`, NOT gated on the negotiated bit — §21.6 design
+simplification), and the only functional consumer of the negotiated bit — the per-batch ACK gate
+`ack_suffix_fec_eligible()` — is AND-ed with `ARQ_ACK_SUFFIX_FEC_ENABLE` which is **0**, so the ACK
+enhanced path is held off in 100% of cases regardless. ⇒ NO-BEHAVIOR-CHANGE simplification.
+
+**Removed:**
+- `CAP_SUFFIX_FEC` (0x04) define + its doc block (`datalink_defines.h`); `CAP_NEGOTIABLE_MASK` shrunk
+  `0x07 → 0x03` (the MFSK wire now carries only the 2 negotiable bits WB_CAPABLE | ENCRYPTION).
+- The 7 `local_capability |= CAP_SUFFIX_FEC` advertise sites: `main.cc:2259/2301/2433`,
+  `arq_common.cc:2751/2848/2902/2921`.
+- The cap-field 2→3-bit wire widening in `mfsk_ctrl_codec.cc` (TEST_ACK bits 25/24, TEST_CONN bit 23) +
+  the matching header docs — pack/unpack are back to 2-bit cap (reserved restored to bits 25..0 /
+  23..0). Low 2 cap bits (WB/ENCRYPTION) unchanged at their original positions.
+- `cl_arq_controller::suffix_fec_negotiated()` (`arq.h`); the `suffix_fec_negotiated()` CONJUNCT on
+  `ack_suffix_fec_eligible()` (now `is_robust_config(current_configuration)` alone — a THROUGHPUT gate).
+- Tests: `test_suffix_fec_cap_negotiation_matrix` (negotiation predicate matrix) and
+  `test_suffix_fec_interop_legacy_rx` + helper `interop_legacy_rx_decodes` (legacy-RX interop matrix).
+  The negotiation-matrix slot is replaced by `test_ack_suffix_eligible_robust_tier_only` (asserts the
+  kept gate: eligible at ROBUST_0/2, ineligible at CONFIG_0/10). The `pack_unpack_test_ack/conn_payload`
+  loops are back to 2-bit (`<4`) with the legacy-2-bit sub-loops replaced by a high-bit-mask assertion.
+
+**KEPT (the robust-tier trigger — NOT negotiation):**
+- The CONNECT enhanced-suffix enable at the robust tier (`arq_common.cc:1539-1551`,
+  `is_robust_config(configuration)` → `set_suffix_fec(true,3)` + `set_connect_preamble_reps(4)`); the
+  `MERCURY_SUFFIX_FEC` / `MERCURY_CONNECT_REPS` test overrides.
+- The CONNECT RX try-both decode (`telecom_system.cc:3651+`, gated on `ack_mfsk.suffix_fec_coded` = the
+  LOCAL tier trigger, never on negotiation). The uncoded-13-first probe is a cheap-first decode
+  strategy, NOT negotiation — it stays; `production_enhanced_connect_decodes` exercises it end-to-end.
+- The ACK gate on `is_robust_config()` (throughput gate) + the held-off `ARQ_ACK_SUFFIX_FEC_ENABLE=0`.
+
+**§5 CROSS-LAYER DATA-FLOW AUDIT — the removed cap bit + `suffix_fec_negotiated()`:**
+1. **Producers of the bit in `local_capability`**: the 7 advertise sites above. All now build a 2-bit
+   cap. The constructor (`arq_common.cc:303`) inits `local_capability=0` (bit-2 never set there).
+2. **Wire producer/consumer**: `pack_/unpack_test_ack_payload`, `pack_/unpack_test_conn_payload`
+   (`mfsk_ctrl_codec.cc`) — collapsed to 2-bit; high cap bits masked off on TX.
+3. **Consumers of `suffix_fec_negotiated()`**: exactly ONE — `ack_suffix_fec_eligible()` (`arq.h`).
+   Simplified to `is_robust_config(current_configuration)`. Its consumer (`arq_common.cc:4493-4495`)
+   computes `ack_suffix_fec_coded = (ARQ_ACK_SUFFIX_FEC_ENABLE(0) && eligible)` = always false →
+   IDENTICAL result before/after (was `0 && (robust && negotiated)`, now `0 && robust`). No behavior
+   change on the ACK path.
+4. **HANDSHAKE-ECHO equality (`arq_commander.cc:3985`, `echoed_cap != local_capability`)**: the
+   §5 dangling-consumer concern. SELF-CONSISTENT after removal — `local_capability` no longer sets
+   bit 2 AND the wire carries only 2 bits, so the echoed 2-bit value round-trips and the equality holds.
+   (Had we removed the advertise but kept a wire that drops bit 2, or vice-versa, this check would have
+   broken the handshake — both halves removed together.) Encryption negotiation (`CAP_ENCRYPTION`,
+   bit 1) round-trips unchanged through the 2-bit field.
+5. **What the fix changes**: removes the negotiated bit + its single (already-no-op) consumer. The
+   CONNECT enhanced path was never a consumer (gated on tier). Verified: every reader of
+   `local_capability`/`peer_capability`/`echoed_cap` (arq_commander.cc, arq_responder.cc) only inspects
+   bits 0/1 (`CAP_WB_CAPABLE`, `CAP_ENCRYPTION`) — none read bit 2. No consumer left dangling.
+
+**VERIFY (gates) — see build/test run below.** Byte-identical-at-OFDM (`ack_suffix_throughput_neutral`,
+`connect_suffix_byte_identical_when_off`) and establishment (`production_enhanced_connect_decodes`,
+the −13.89 cliff sweeps) must be UNCHANGED — they were keyed on the tier trigger, which is untouched.
