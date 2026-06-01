@@ -3139,6 +3139,22 @@ bool g_gf16_skip_moose = true;
 // = production gate (cliffs ~-8.7, the binding constraint Tier-1 also hits).
 // true = FEC-reach measurement (base matched-count only, which reaches -14.68).
 bool g_gf16_relax_metric_gate = false;
+// Candidate ctrl-sync FIX selector for the masking investigation (NEW,
+// ctrl-sync-floor sim). Only consulted when g_gf16_skip_moose==false (i.e. the
+// production-scaffolding "moose ON" path). Values:
+//   0 = CURRENT production behavior (estimate + unconditional re-mix, no clamp).
+//   1 = CLAMP+SANITY: reject |residual| > 2*subcarrier_spacing (advance/skip),
+//       clamp the applied residual to +/- subcarrier_spacing — mirrors the
+//       DATA-path mini-Moose guards (telecom_system.cc:2270-2282) the ctrl
+//       path is MISSING.
+//   2 = SKIP-REMIX: never re-mix; decode the suffix energies from the SAME
+//       baseband the detector validated (the energies-direct path that gives
+//       P=1.0 in gf16_diag_energy), i.e. trust the coarse LO at the floor
+//       (Q65-style: no per-frame fine AFC at deep SNR).
+//   3 = AVG-then-CLAMP: same estimator but applied only if it survives clamp;
+//       reserved/identical to 1 for the WB single-instance case (kept for
+//       symmetry with the report's lever naming).
+int g_gf16_ctrl_fix = 0;
 
 // Build CONNECT base + the GF(16)-RA coded suffix (codeword_len() symbols) into
 // a fresh passband buffer. Mirrors generate_ctrl_suffix_pattern's tone-hop +
@@ -3249,6 +3265,7 @@ static bool decode_gf16ra_from_passband(cl_telecom_system& ts, double* data, int
 	// both: ON (default) = the code's intrinsic reach; OFF = the Moose-limited
 	// end-to-end cliff (apples-to-apples with the current Tier-1/hard scaffolding).
 	extern bool g_gf16_skip_moose;
+	extern int g_gf16_ctrl_fix;
 	if (!g_gf16_skip_moose) {
 		double ctrl_residual = ts.ofdm.carrier_frequency_sync_wb_ctrl(
 			ts.data_container.baseband_data_interpolated,
@@ -3256,7 +3273,31 @@ static bool decode_gf16ra_from_passband(cl_telecom_system& ts, double* data, int
 			m.connect_pattern_nsymb, best_offset,
 			m.connect_tones, /*pattern_len=*/8, m.tone_hop_step, m.M,
 			m.nStreams, m.stream_offsets);
-		if (fabs(ctrl_residual) > ts.ofdm.freq_offset_ignore_limit) {
+
+		// FIX selector (ctrl-sync-floor sim). The DATA-path mini-Moose
+		// (telecom_system.cc:2270-2282) rejects |residual| > 2*subcarrier and
+		// clamps to +/- 1 subcarrier; the ctrl path here has NEITHER guard and
+		// re-mixes unconditionally above a 0.1 Hz floor — so a noisy low-SNR
+		// residual re-mixes the whole baseband at a wrong LO and corrupts the
+		// suffix energies.
+		double subcarrier = ts.bandwidth / (double)ts.data_container.Nc;
+		bool do_remix = (fabs(ctrl_residual) > ts.ofdm.freq_offset_ignore_limit);
+
+		if (g_gf16_ctrl_fix == 2) {
+			// SKIP-REMIX: trust the coarse LO at the floor (Q65: no per-frame
+			// fine AFC at deep SNR). Decode from the detector-validated baseband.
+			do_remix = false;
+		} else if (g_gf16_ctrl_fix == 1 || g_gf16_ctrl_fix == 3) {
+			// CLAMP+SANITY: reject wild estimates, clamp the rest.
+			if (fabs(ctrl_residual) > 2.0 * subcarrier) {
+				do_remix = false;  // garbage — leave coarse baseband as-is
+			} else {
+				if (ctrl_residual >  subcarrier) ctrl_residual =  subcarrier;
+				if (ctrl_residual < -subcarrier) ctrl_residual = -subcarrier;
+			}
+		}
+
+		if (do_remix) {
 			ts.ofdm.passband_to_baseband_decimated(data, size,
 				ts.data_container.baseband_data_interpolated,
 				ts.sampling_frequency, eff_carrier - ctrl_residual, ts.carrier_amplitude,
@@ -3322,6 +3363,77 @@ static void gf16_diag_energy(double sigma) {
 		sigma, det, T, det?(double)errsum/det:-1, N, det?snr_sum/det:-1);
 	for(int q=0;q<6;q++)printf("%.2f ",(double)em_ok[q]/T);
 	printf("| full-path-P=%.2f\n",(double)em_ok2/T);
+}
+
+// CTRL-SYNC-FLOOR DIAGNOSTIC (NEW): for a fixed sigma, characterize the ctrl
+// mini-Moose residual the production path applies, and compare full-path decode
+// P across the 3 candidate fix modes against the energies-direct baseline.
+// PROVES the masker is the unclamped re-mix on a noisy estimate, and measures
+// the recovery from each fix. Deterministic seed.
+static void gf16_ctrl_residual_diag(double sigma) {
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq; gf16ra::configure(2); gf16ra::init();
+	cl_mfsk& m = ts.ack_mfsk;
+	int N = gf16ra::codeword_len();
+	double subcarrier = ts.bandwidth / (double)ts.data_container.Nc;
+	std::mt19937 rng(0xC7121A6);
+	const int T = 120;
+	// residual stats (only over detected trials)
+	double r_sum=0, r_abs_sum=0, r_sq=0, r_max=0; int det=0; int n_wild=0;
+	int p_direct=0, p_fix0=0, p_fix1=0, p_fix2=0, p_relaxgate=0;
+	double met_sum=0, met_min=1e9, met_max=0; int n_below3=0;  // detect-metric stats
+	for (int t=0;t<T;t++) {
+		uint64_t p38=(((uint64_t)rng()<<6)^rng())&((1ULL<<38)-1ULL);
+		int act=0; std::vector<double> audio=build_gf16ra_suffix_audio(ts,MFSK_CTRL_START_CONN,p38,arq,act);
+		std::normal_distribution<double> nd(0.0,sigma);
+		for(size_t i=0;i<audio.size();i++) audio[i]+=nd(rng);
+		int M=ts.data_container.interpolation_rate, dec=(int)audio.size()/M;
+		ts.ofdm.passband_to_baseband_decimated(audio.data(),(int)audio.size(),ts.data_container.baseband_data_interpolated,ts.sampling_frequency,ts.carrier_frequency+ts.last_coarse_freq_offset,ts.carrier_amplitude,M,&ts.ofdm.FIR_rx_data);
+		int sm=0,bo=-1;
+		double met=ts.ofdm.detect_ack_pattern(ts.data_container.baseband_data_interpolated,dec,1,m.connect_pattern_nsymb,m.connect_tones,8,m.tone_hop_step,m.M,m.nStreams,m.stream_offsets,&sm,0,nullptr,&bo,N,nullptr);
+		if(sm<m.connect_match_threshold||bo<0) continue;
+		det++;
+		met_sum+=met; if(met<met_min)met_min=met; if(met>met_max)met_max=met;
+		if(met<3.0) n_below3++;
+		// residual the production estimator would compute on this baseband
+		double res = ts.ofdm.carrier_frequency_sync_wb_ctrl(
+			ts.data_container.baseband_data_interpolated, subcarrier,
+			m.connect_pattern_nsymb, bo, m.connect_tones, 8,
+			m.tone_hop_step, m.M, m.nStreams, m.stream_offsets);
+		r_sum+=res; r_abs_sum+=fabs(res); r_sq+=res*res; if(fabs(res)>r_max)r_max=fabs(res);
+		if(fabs(res)>2.0*subcarrier) n_wild++;
+		// energies-direct (no re-mix at all) on THIS detected baseband
+		std::vector<double> e((size_t)N*m.M);
+		ts.ofdm.decode_suffix_energies(ts.data_container.baseband_data_interpolated,dec,1,bo,m.connect_pattern_nsymb,N,m.tone_hop_step,m.M,m.nStreams,m.stream_offsets,e.data());
+		{uint64_t rp=0;int it=-2; if(gf16ra::soft_decode(e.data(),GF16RA_BP_MAXITER,GF16RA_ESNO_METRIC,(uint8_t)MFSK_CTRL_START_CONN,prod_crc12_cb,&arq,&rp,&it)&&rp==p38)p_direct++;}
+		// full path under each fix mode
+		extern bool g_gf16_skip_moose; extern int g_gf16_ctrl_fix; extern bool g_gf16_relax_metric_gate;
+		g_gf16_skip_moose=false;
+		for(int fm=0; fm<3; fm++){
+			g_gf16_ctrl_fix=fm;
+			uint64_t rp=0;int it=-2;
+			bool ok=decode_gf16ra_from_passband(ts,audio.data(),(int)audio.size(),MFSK_CTRL_START_CONN,arq,&rp,&it)&&rp==p38;
+			if(ok){ if(fm==0)p_fix0++; else if(fm==1)p_fix1++; else p_fix2++; }
+		}
+		g_gf16_ctrl_fix=0;
+		// ISOLATION: full path, mini-Moose ON, but metric gate RELAXED (only the
+		// base matched-count gates). If THIS recovers to ~direct while skip-remix
+		// did not, the metric>=3.0 gate is the masker, not the mini-Moose.
+		{
+			bool save=g_gf16_relax_metric_gate; g_gf16_relax_metric_gate=true;
+			uint64_t rp=0;int it=-2;
+			if(decode_gf16ra_from_passband(ts,audio.data(),(int)audio.size(),MFSK_CTRL_START_CONN,arq,&rp,&it)&&rp==p38) p_relaxgate++;
+			g_gf16_relax_metric_gate=save;
+		}
+	}
+	double rmean=det?r_sum/det:0, rabs=det?r_abs_sum/det:0;
+	double rstd=det? sqrt(r_sq/det - rmean*rmean) : 0;
+	printf("    [CTRL-RESID sigma=%.2f] det=%d/%d | residual(Hz): mean=%+.2f |mean|=%.2f std=%.2f max=%.2f wild(>%.0fHz)=%d/%d (subcarrier=%.2f Hz)\n",
+		sigma, det, T, rmean, rabs, rstd, r_max, 2.0*subcarrier, n_wild, det, subcarrier);
+	printf("    [CTRL-METRIC sigma=%.2f] detect metric: mean=%.2f min=%.2f max=%.2f | below 3.0 gate=%d/%d (=%.0f%% of detected frames MASKED)\n",
+		sigma, det?met_sum/det:0, det?met_min:0, met_max, n_below3, det, det?100.0*n_below3/det:0);
+	printf("    [CTRL-FIX  sigma=%.2f] P_energies_direct=%.2f | P_fix0(current)=%.2f  P_fix1(clamp)=%.2f  P_fix2(skip-remix)=%.2f  P_relaxMETRICgate=%.2f\n",
+		sigma, det?(double)p_direct/det:0, det?(double)p_fix0/det:0, det?(double)p_fix1/det:0, det?(double)p_fix2/det:0, det?(double)p_relaxgate/det:0);
 }
 
 // §10.1 — codec round-trip on synthetic ZERO-noise energies (each symbol's true
@@ -3578,6 +3690,65 @@ static void test_gf16_ra_cliff_sweep() {
 	printf("    --- (B) FEC reach (base matched-count detect, no Moose, no metric gate) ---\n");
 	g_gf16_skip_moose = true; g_gf16_relax_metric_gate = true;
 	gf16ra_cliff_one(1); gf16ra_cliff_one(2); gf16ra_cliff_one(3);
+
+	// (C) CTRL-SYNC FIX measurement (NEW, ctrl-sync-floor sim). Same production
+	// scaffolding as (A) (mini-Moose ON + metric gate) but with the candidate
+	// ctrl-sync fix engaged. Quantifies how much each fix recovers the masked
+	// FEC reach. fix1 = clamp+sanity (mirror data-path guards); fix2 = skip the
+	// re-mix (Q65: no per-frame fine AFC at the floor).
+	printf("    --- (C) ctrl-sync FIX through production scaffolding (metric gate ON) ---\n");
+	g_gf16_skip_moose = false; g_gf16_relax_metric_gate = false;
+	printf("    [C.0] residual statistics + per-fix decode-P at the cliff knee:\n");
+	g_gf16_ctrl_fix = 0;
+	gf16_ctrl_residual_diag(2.8); gf16_ctrl_residual_diag(3.2); gf16_ctrl_residual_diag(3.6);
+	// Deeper points: what detect-metric floor is needed to reach the -14 region?
+	gf16_ctrl_residual_diag(4.0); gf16_ctrl_residual_diag(4.8); gf16_ctrl_residual_diag(5.2);
+	printf("    [C.1] clamp+sanity fix, r=2:\n");
+	g_gf16_ctrl_fix = 1; gf16ra_cliff_one(2);
+	printf("    [C.2] skip-remix fix, r=2:\n");
+	g_gf16_ctrl_fix = 2; gf16ra_cliff_one(2);
+	printf("    [C.3] skip-remix fix, r=3 (does it reach -14 through prod scaffolding?):\n");
+	g_gf16_ctrl_fix = 2; gf16ra_cliff_one(3);
+
+	// (D) THE REAL FIX: mini-Moose ON (unchanged), metric>=3.0 detection gate
+	// RELAXED. The C.0 isolation showed the metric gate is the entire masker
+	// (skip-remix == current; relax-gate == energies-direct). This measures the
+	// dB recovered through the otherwise-unchanged production path.
+	printf("    --- (D) metric-gate RELAX (mini-Moose ON, gate OFF) = the real unmask ---\n");
+	g_gf16_ctrl_fix = 0;
+	g_gf16_skip_moose = false; g_gf16_relax_metric_gate = true;
+	printf("    [D.2] r=2:\n"); gf16ra_cliff_one(2);
+	printf("    [D.3] r=3 (reaches -14 through prod path w/ Moose ON?):\n"); gf16ra_cliff_one(3);
+
+	// (D.FAR) FAR cost of relaxing the metric gate. Run pure noise through the
+	// FULL detect+decode path (base match >=7/16 AND GF16 CRC12+type accept),
+	// gate ON (3.0) vs OFF. This is the FAR the gate currently suppresses; the
+	// GF16 codec's CRC12+2-bit-type accept is the backstop once the gate is gone.
+	{
+		gf16ra::configure(3); gf16ra::init();  // worst case (most BP trials)
+		cl_telecom_system tsn; tsn.operation_mode=ARQ_MODE; tsn.load_configuration(CONFIG_0);
+		cl_arq_controller arqn; cl_mfsk& mn=tsn.ack_mfsk;
+		int act=0; std::vector<double> ref=build_gf16ra_suffix_audio(tsn,MFSK_CTRL_START_CONN,0x0,arqn,act);
+		int aud_len=(int)ref.size();
+		std::mt19937 rng(0xFA9C0DE);
+		const int NF=4000; double sig=3.2;  // floor-representative noise level
+		int acc_gate_on=0, acc_gate_off=0;
+		for(int t=0;t<NF;t++){
+			std::vector<double> audio(aud_len,0.0);
+			std::normal_distribution<double> nd(0.0,sig);
+			for(int i=0;i<aud_len;i++) audio[i]=nd(rng);
+			uint64_t rp; int it;
+			g_gf16_relax_metric_gate=false; rp=0; it=-2;
+			if(decode_gf16ra_from_passband(tsn,audio.data(),aud_len,MFSK_CTRL_START_CONN,arqn,&rp,&it)) acc_gate_on++;
+			g_gf16_relax_metric_gate=true;  rp=0; it=-2;
+			if(decode_gf16ra_from_passband(tsn,audio.data(),aud_len,MFSK_CTRL_START_CONN,arqn,&rp,&it)) acc_gate_off++;
+		}
+		printf("    [D.FAR] pure-noise full-path false-accepts over %d trials (r=3): gate_ON(3.0)=%d (%.2e)  gate_OFF=%d (%.2e)\n",
+			NF, acc_gate_on, (double)acc_gate_on/NF, acc_gate_off, (double)acc_gate_off/NF);
+		g_gf16_relax_metric_gate=false;
+	}
+
+	g_gf16_ctrl_fix = 0;
 	g_gf16_skip_moose = true; g_gf16_relax_metric_gate = false;
 	gf16ra::configure(2);  // restore default
 	test_pass(name);  // infra ran; dB verdict is in the log
