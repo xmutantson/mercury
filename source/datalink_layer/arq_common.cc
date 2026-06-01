@@ -5311,8 +5311,14 @@ bool cl_arq_controller::receive_hail_pattern()
 		bool base_ok = base_matched >= telecom_system->ack_mfsk.hail_match_threshold;
 		bool suffix_ok = !telecom_system->ack_mfsk.hail_directed
 		              || suffix_matched >= (telecom_system->ack_mfsk.HAIL_SUFFIX_LEN - 1);
-		// Per-match quality: noise gives metric/matched ≈ 2/Nc (0.2 NB, 0.04 WB).
-		// Real signals give 0.5+. Gate at 0.3 to reject noise false alarms.
+		// Per-match quality (diagnostic only now — see HAIL-detection-floor
+		// fact-doc §9/§10): noise gives metric/matched ≈ 2/Nc (0.2 NB, 0.04 WB).
+		// This value is NO LONGER a gate: the old quality>=0.3 gate sat ~8 dB
+		// above the matched-count floor (at matched=16 it implied metric>=4.8,
+		// stricter than the metric gate) and contributed ≈0 FAR — the base_ok
+		// count gate (8/16 WB, 24-40 NB) is the load-bearing FAR defense
+		// (measured 0/5000, fact-doc §4). Retained only for [HAIL-POLL] /
+		// [HAIL] Detected diagnostics below.
 		double quality = (matched_count > 0) ? metric / matched_count : 0.0;
 		// HAIL-POLL diagnostic: opt-in via MERCURY_HAIL_POLL=1 env var.
 		// Logs near-threshold polls only (≥40% base match OR metric ≥2.0 OR
@@ -5372,7 +5378,14 @@ bool cl_arq_controller::receive_hail_pattern()
 				telecom_system->ack_mfsk.hail_directed ? " (directed)" : "");
 			fflush(stdout);
 		}
-		if(base_ok && suffix_ok && metric >= 3.0 && quality >= 0.3)
+		// Gate = base count (FAR defense) + directed-suffix count + the
+		// config-tuned detection metric floor. Aligned with the sibling HAIL
+		// receive() site (arq_common.cc:6373) and the ACK/BREAK/CONNECT
+		// consumers, which all use ack_pattern_detection_threshold (0.65 at
+		// ROBUST_0, telecom_system.cc:5505-5510) — NOT the old hardcoded 3.0.
+		// The old metric>=3.0 && quality>=0.3 soft gates cost ~8 dB of
+		// establishment reach for ≈0 FAR benefit (HAIL-detection-floor §4/§5/§9).
+		if(base_ok && suffix_ok && metric >= telecom_system->ack_pattern_detection_threshold)
 		{
 			printf("[HAIL] Detected: base=%d/%d suffix=%d/%d metric=%.1f quality=%.2f%s\n",
 				base_matched, telecom_system->ack_mfsk.hail_match_threshold,

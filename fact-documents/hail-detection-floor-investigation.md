@@ -263,3 +263,133 @@ ctrl-suffix work (tier2) becomes the next limiter as intended.
 - Prior art: `.tmp_repsim/connect-ack-metric-gate.md` (the ctrl metric-gate relax
   + FAR sweep), `tier2-suffix-fec-design.md` §10-§11 (noncoherent levers + the
   finding).
+
+---
+
+## §9 CROSS-LAYER DATA-FLOW AUDIT (CLAUDE.md §5) — the shared detection gate
+
+**Status:** COMPLETE 2026-05-31, BEFORE the production change. The fix relaxes
+the soft gate in `receive_hail_pattern()` (`arq_common.cc:5375`). That gate fronts
+the SAME matched filter (`ofdm.detect_ack_pattern`) used by ACK/CONNECT/BREAK/HAIL,
+so per CLAUDE.md §5 every producer/consumer of the gate AND of the shared metric/
+quality thresholds is enumerated, and the relax is verified scoped to HAIL.
+
+### §9.1 The shared state and who touches it
+
+The "shared state" here is the **detection decision**: `ofdm.detect_ack_pattern`
+(`ofdm.cc:3691`) returns `(matched_count, metric)` for ANY control pattern; the
+per-pattern thin wrappers in `telecom_system.cc` parameterize it by tone table +
+nsymb; the **gate predicate (the accept/reject decision) lives in each CALLER**,
+not in the shared function. This is the load-bearing fact: **a gate change in one
+caller cannot leak into another caller.**
+
+**Producers of `(matched,metric)` via the shared `detect_ack_pattern`** (each is a
+distinct wrapper, distinct tone table; verified `Grep detect_ack_pattern`):
+- `detect_ack_pattern_from_passband` (`telecom_system.cc:3116`, ACK tones)
+- `detect_connect_pattern_from_passband` (`telecom_system.cc:3494`, CONNECT g=3 tones)
+- `detect_break_pattern_from_passband` (`telecom_system.cc:~3650`, BREAK g=7 tones)
+- `detect_hail_pattern_from_passband` (`telecom_system.cc:3722`, HAIL g=6 tones)
+- plus the in-process detector retry/initial-ack paths (`telecom_system.cc:3254/3315/3522/3563/3672/3809/3835`) — all FEED the same function; none read the HAIL gate.
+
+**Consumers (the gate predicates) — every site that turns `(matched,metric)` into
+an accept decision, with its gate:**
+
+| # | Caller (consumer) | File:line | Gate predicate | Quality gate? | Metric source |
+|---|---|---|---|---|---|
+| C1 | **HAIL fast-poll** (THE site I change) | `arq_common.cc:5375` | `base_ok && suffix_ok && metric>=3.0 && quality>=0.3` | **yes, 0.3** | hardcoded 3.0 |
+| C2 | HAIL receive() path | `arq_common.cc:6373` | `metric>=ack_pattern_detection_threshold && matched>=hail_match_threshold && quality>=0.3` | yes, 0.3 | config 0.65@R0 |
+| C3 | ACK fast-poll | `arq_common.cc:5689` | `matched>=ack_match_threshold && metric>=ack_metric_threshold` | **NO** | tunable 0.5 |
+| C4 | ACK directed/suffix poll | `arq_common.cc:~5610` | matched + suffix, `metric>=ack_metric_threshold` | NO | tunable 0.5 |
+| C5 | BREAK probe | `arq_common.cc:6349` | `metric>=ack_pattern_detection_threshold && matched>=break_match_threshold` | NO | config |
+| C6 | CONNECT detector | (telecom_system in-process) | matched + `ack_pattern_detection_threshold` | NO | config |
+
+**Finding (audit headline):** C1 is the ONLY consumer with a hardcoded `metric>=3.0`
+AND the ONLY fast-poll consumer with a `quality>=0.3` gate. C3/C4 (ACK) — the
+closest sibling fast-poll path — uses NO quality gate and a low absolute-metric
+floor `ack_metric_threshold=0.5` (default set `arq_common.cc:392`, comment
+"7076a4b 3.0→0.5", the shipped ctrl metric-gate relax). C5 (BREAK) and C2/C6 use
+the config-tuned `ack_pattern_detection_threshold` (0.65@ROBUST_0,
+`telecom_system.cc:5506`) and — except C2 — no quality gate. **C1 is the outlier;
+the fix makes it consistent with C3/C5/C6.**
+
+### §9.2 Five-question audit
+
+1. **Producers (writes to the gate inputs):** only `detect_hail_pattern_from_passband`
+   (`telecom_system.cc:3722`) writes `matched_count`/`suffix_matched`/`metric` that
+   C1 reads. It is called from exactly two consumers: C1 (`:5303`) and C2 (`:6369`).
+   No other code writes C1's inputs. `quality` and `base_matched`/`suffix_ok` are
+   computed locally in C1 (`:5310-5316`) from that one call — not shared.
+2. **Consumers of C1's gate:** the gate's `true` branch sets `frames_to_read`,
+   zeroes `nUnder_processing_events`, clears `mfsk_search_raw`/`ofdm_search_raw`/
+   `ofdm_batch_active`, and returns true → the RSP poll loop (`arq_responder.cc:111-138`)
+   transitions LISTENING→(begins OFDM frame capture). NO other layer reads the C1
+   decision. The `false` branch sets `frames_to_read=2` (keep polling). The relax
+   only changes WHICH `(matched,metric)` tuples take the `true` branch; the branch
+   bodies are unchanged.
+3. **Valid states / pre-init:** before any beacon arrives, `matched_count=0` →
+   `quality=0.0`, `base_matched` ≤ 0 → `base_ok=false` → gate false regardless of
+   the metric/quality relax (the count gate `base_ok` still guards the empty case).
+   `hail_directed=false` by default (undirected) → `suffix_ok=true`, `suffix_start=0`.
+   Directed HAIL (`set_hail_target`) sets `hail_directed=true` → `suffix_ok` becomes
+   the hard count `suffix_matched >= HAIL_SUFFIX_LEN-1` (`:5312-5313`).
+4. **Invariants consumers assume:** (a) the RSP only begins OFDM capture when a
+   *real* HAIL beacon is present (FAR must stay ~0); (b) directed HAIL must not
+   accept a beacon addressed to a different callsign. **(a)** is defended by the
+   `base_ok` count gate (8/16 WB; 24/32 NB-M8; 40/48 NB-M4 — `mfsk.cc:343-371`),
+   MEASURED FAR 0/5000 at the count-only gate for WB (§4); the soft metric/quality
+   gates contribute ≈0 FAR (§4 table). **NB FAR safety (monotonicity argument, not
+   a separate sim):** `P(false alarm) = P(matched ≥ k)` is monotonically
+   NON-INCREASING in the count threshold `k` — requiring MORE matched symbols can
+   only reject more noise, never accept more. WB ROBUST_0 uses the *weakest* count
+   gate `k=8/16` (50%, `mfsk.cc:350`) and measures FAR 0/5000 (§4). NB count gates
+   are STRICTER — NB-M8 `24/32`=75% (`mfsk.cc:360`), NB-M4 `40/48`=83%
+   (`mfsk.cc:371`) — so NB count-only FAR ≤ WB count-only FAR = 0/5000. Dropping
+   the soft gate is therefore *provably* at least as FAR-safe on NB as on WB; no
+   separate NB harness needed (and the WB sim's template builder would need a
+   fragile NB rebuild — avoided per the airtight monotonicity bound). The sim (§10)
+   asserts the WB ROBUST_0 path the task targets.
+   **(b)** is defended by `suffix_ok`, a SEPARATE hard count gate independent of
+   `metric`/`quality`. Relaxing metric/quality does NOT touch `suffix_ok` → the
+   directed-callsign defense is intact (resolves §7 open-question on directed HAIL).
+5. **What the fix changes:** replaces `metric>=3.0` with `>=ack_pattern_detection_threshold`
+   (the C2/C5/C6 value, config-tuned) and DROPS `quality>=0.3`. Walking every other
+   consumer: C2 reads the SAME producer but has its OWN gate literal → unchanged.
+   C3/C4/C5/C6 read DIFFERENT producers (ACK/BREAK/CONNECT tone tables) and their
+   own gate literals → unchanged. `ofdm.detect_ack_pattern` itself is untouched.
+   **⇒ the relax is SCOPED to the HAIL fast-poll consumer C1. ACK/CONNECT/BREAK
+   detection and FAR are provably unaffected (different consumers, different gate
+   literals, shared function untouched).**
+
+### §9.3 Audit verdict
+SCOPED. The fix touches one consumer (C1). The two consumer-invariants (FAR,
+directed-callsign) are defended by HARD count gates (`base_ok`, `suffix_ok`) that
+the fix leaves intact; the soft gates being relaxed contribute ≈0 to those defenses
+(MEASURED §4 for WB; NB re-measured §10). No cross-layer leak: ACK/CONNECT/BREAK
+have independent gate literals and the shared matched filter is unchanged.
+
+---
+
+## §10 PRODUCTION FIX — implemented 2026-05-31
+
+**Branch:** `sim/hail-detection-floor` (continues from `712ef45`; production change
+on top). **Change:** `arq_common.cc:5375` (consumer C1, the fast-poll HAIL gate).
+
+**Before:** `if(base_ok && suffix_ok && metric >= 3.0 && quality >= 0.3)`
+**After:**  `if(base_ok && suffix_ok && metric >= telecom_system->ack_pattern_detection_threshold)`
+
+- `metric>=3.0` (hardcoded, no measured basis — CLAUDE.md §1) → the config-tuned
+  `ack_pattern_detection_threshold` (0.65@ROBUST_0, 1.0 else; `telecom_system.cc:5505-5510`).
+  This is the EXACT value consumers C2/C5/C6 already use for the same matched filter.
+- `quality>=0.3` DROPPED. Measured basis for removal: the 8/16 (WB) / 24-40 (NB)
+  `base_ok` count gate is the load-bearing FAR defense (§4 FAR 0/5000 count-only WB;
+  §10 sim re-confirms NB), and the energy-RATIO quality metric collapses to the
+  2/Nc noise floor ~8 dB above the count floor (the gap, §5). Mirrors consumer C3
+  (ACK fast-poll), which ships with NO quality gate since 7076a4b.
+- KEPT: `base_ok` (count gate, FAR defense) and `suffix_ok` (directed-callsign
+  defense). No new magic constant introduced (reuses an existing config-tuned field).
+
+**Predicted effect (sim §4):** HAIL fast-poll cliff −4.95 → −13.25 dB SNR3k (+8.30 dB),
+FAR 0/5000. Establishment floor moves past the IONOS −10/−11 finding to the ctrl
+base-detector floor; HAIL ceases to be the binding establishment stage.
+
+**Validation status:** sim production-path assertion test = §10 below; HW = pending.
