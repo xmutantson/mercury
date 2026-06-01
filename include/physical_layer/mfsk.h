@@ -96,7 +96,10 @@ public:
 	// combine_reps=1 and never read this). The base now occupies
 	// connect_base_total_nsymb()=R*connect_pattern_nsymb symbols on the wire; the
 	// suffix follows at that offset (the I4 length accessor for the base, §20.3).
-	static const int MAX_CONNECT_PREAMBLE_REPS = 4;
+	// ULTRA spike (lever B): raised 4 -> 32 so ULTRA_2's R=32 base combining fits.
+	// data_container.cc CTRL_SUFFIX_FEC_MAX_NSYMB raised in lockstep
+	// (MAX_REPS*16 + GF16RA_MAX_N = 32*16 + 128 = 640).
+	static const int MAX_CONNECT_PREAMBLE_REPS = 32;
 	int connect_preamble_reps;   // default 1 (set in init())
 	int connect_base_total_nsymb() const {
 		int r = connect_preamble_reps;
@@ -265,12 +268,13 @@ public:
 	// transmitter applies in generate_ack_sack_pattern(). When the detector
 	// declares an ACK match it writes ack_sack_suffix_len() entries here
 	// (10 for WB M=16) and sets last_ack_sack_capture_valid=true.
-	// Sized to the Tier-2 FEC ceiling (gf16ra::GF16RA_MAX_N = 64 ≥ the R=1/4
-	// coded length 52, tier2-suffix-fec-design.md §19.4 C7) so the
-	// last_*_suffix_tones[] / suffix_tones[] / payload_tones[] buffers that
-	// derive their size from this constant are safe whether the uncoded (13)
-	// or coded (52) ctrl-suffix path runs. Was 16 (uncoded-only).
-	static const int MAX_ACK_SACK_SUFFIX = 64;
+	// Sized to the Tier-2 FEC ceiling so the last_*_suffix_tones[] /
+	// suffix_tones[] / payload_tones[] buffers that derive their size from this
+	// constant are safe whether the uncoded (13) or coded ctrl-suffix path runs
+	// (tier2-suffix-fec-design.md §19.4 C7). ULTRA spike (lever A): raised 64→128
+	// in lockstep with gf16ra::GF16RA_MAX_N (the lowest rate repfact=8 at K=13
+	// gives N=117 ≤ 128). Was 16 (uncoded-only), then 64 (R¼ coded length 52).
+	static const int MAX_ACK_SACK_SUFFIX = 128;
 	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_ack_sack_capture_valid;
 

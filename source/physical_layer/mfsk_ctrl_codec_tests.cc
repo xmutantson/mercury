@@ -4758,6 +4758,247 @@ static void test_connect_preamble_combining_cliff_sweep() {
 }
 
 // =============================================================================
+// ULTRA TIER FEASIBILITY SPIKE — stacked deep-SNR establishment cliff (ultra-
+// tier-design.md §2/§4/§6 INCR-0). SIM ONLY. Measures whether the FOUR levers
+// COMPOUND to a real establishment-cliff move toward −20 (ULTRA_0) / −24
+// (ULTRA_2) SNR3k, or whether the stack saturates short. This is the go/no-go.
+//
+// Levers (all extend the merged codec/combining — NO new DSP):
+//   A: lower-rate GF(16) RA  (repfact ↑  → R 1/5..1/9)        [gf16ra::configure_k]
+//   B: deeper base combining (R = reps   → 16/32)             [set_connect_preamble_reps]
+//   C: minimal establish msg (K ↓        → 8/5 info symbols)  [gf16ra::configure_k]
+//   D: handshake-frame repetition (R_frame → 2/3/4)           [modeled: P_est = 1-(1-p)^Rf]
+//
+// The per-frame establishment cliff = the production decode_ctrl_suffix_from_
+// passband (real base-detect[combine] → 1.2 metric gate → decode_suffix_energies
+// → gf16ra::soft_decode), the SAME path §19/§20 deploy on HW. Lever D is a
+// CHOREOGRAPHY lever (repeat the whole frame); in the single-shot sim it is the
+// noncoherent frame-level retry P_est = 1-(1-p_frame)^R_frame at each SNR cell
+// (independent AWGN realizations — the optimistic bound; on a fading path the
+// reps decorrelate, between this and 1× — flagged §3 design).
+// =============================================================================
+
+// Configure the codec + combining for an ULTRA operating point, synthesize the
+// PRODUCTION CONNECT passband (base[R reps]+coded suffix), sweep AWGN, drive the
+// PRODUCTION decode, and report the per-frame decode cliff (P=0.5) plus the
+// R_frame-modeled establishment cliff. Returns the per-frame cliff SNR3k (1e9 if
+// the frame never reaches P=0.5 on the grid) via *out_frame_cliff and the
+// establishment cliff via *out_est_cliff.
+static void ultra_cliff_one(const char* label, int repfact, int K, int R, int R_frame,
+                            double* out_frame_cliff, double* out_est_cliff)
+{
+	*out_frame_cliff = 1e9; *out_est_cliff = 1e9;
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) { printf("    [%s] no CONNECT pattern, skip\n", label); return; }
+
+	// Bring up the coded path, THEN override the codec K/repfact (lever A+C), THEN
+	// set reps (lever B). set_suffix_fec(true,repfact) configures K=13; configure_k
+	// re-sets the true (repfact,K); set_connect_preamble_reps re-derives the
+	// passband sample count off the now-correct ctrl_suffix_len()=codeword_len().
+	ts.set_suffix_fec(true, repfact);
+	int N = gf16ra::configure_k(repfact, K);
+	gf16ra::init();
+	ts.set_connect_preamble_reps(R);
+	const int base_total = ts.ack_mfsk.connect_base_total_nsymb();
+	const int coded_len  = ts.ack_mfsk.ctrl_suffix_len();
+	if (coded_len != N) { printf("    [%s] ctrl_suffix_len(%d) != codeword_len(%d)\n", label, coded_len, N); return; }
+	const int total_sym  = base_total + coded_len;
+	const double Rrate   = (double)K / N;
+	const int msg_bits   = gf16ra::msg_bits();           // 4*(K-3)
+	// airtime: total symbols at 24.33 ms/sym, ×R_frame for the choreography lever.
+	const double frame_ms = total_sym * 24.33;
+	const double air_ms   = frame_ms * R_frame;
+
+	const double fs   = ts.sampling_frequency;
+	const int    Mdec = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	const int    conn_thr = ts.ack_mfsk.connect_match_threshold;
+
+	// Payload masked to the message capacity (CRC must be over the actually-
+	// transmitted field — for K<13 the high payload bits are dropped by the codec).
+	uint64_t pl_mask = (msg_bits - 2 >= 64) ? ~0ULL : ((1ULL << (msg_bits - 2)) - 1ULL);
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	p38 &= pl_mask;
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead = 4096; const int total_pb = n_sig + 2*lead;
+	std::vector<double> clean((size_t)total_pb, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+	if (written != n_sig) { printf("    [%s] generate size mismatch (%d vs %d)\n", label, written, n_sig); return; }
+	double psum = 0.0; for (int i=0;i<n_sig;i++){ double v=clean[(size_t)(lead+i)]; psum+=v*v; }
+	const double p_sig = psum / n_sig; const double sig_rms = std::sqrt(p_sig);
+	if (!(sig_rms > 0.0)) { printf("    [%s] signal RMS=0\n", label); return; }
+
+	// SNR axis: bracket −10..−26 dB (ULTRA target). sigma = mult × sig_rms.
+	const double mults[] = { 8.0, 11.0, 14.0, 18.0, 22.0, 28.0, 34.0, 42.0, 52.0, 64.0, 80.0, 100.0, 125.0 };
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 60;
+	std::vector<double> work((size_t)total_pb, 0.0);
+	printf("    [%s] R=%.3f(repfact=%d) K=%d N=%d | combine R=%d (base=%d sym) | R_frame=%d | msg=%d bits | frame %.1fs air %.1fs\n",
+		label, Rrate, repfact, K, N, R, base_total, R_frame, msg_bits, frame_ms/1000.0, air_ms/1000.0);
+	printf("      (sigma/rms : SNR3k_dB : P_baseMatched>=%d : P_frameDecode : P_est[Rf=%d])\n", conn_thr, R_frame);
+
+	double frame_cliff = 1e9, est_cliff = 1e9;
+	for (int si = 0; si < NS; si++) {
+		const double sigma = mults[si] * sig_rms;
+		std::mt19937 rng((uint32_t)(0x017A0000u ^ (repfact*7919) ^ (K*131) ^ (R*17) ^ si));
+		std::normal_distribution<double> nd(0.0, sigma);
+		int base_ok = 0, decoded_ok = 0;
+		for (int t = 0; t < NT; t++) {
+			for (int i=0;i<total_pb;i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+			// base-pattern matched-count with combining (diagnostic).
+			int dec_size = total_pb / Mdec;
+			std::vector<std::complex<double> > bb((size_t)dec_size, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(work.data(), total_pb, bb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+			int rm = 0, rbo = -1;
+			ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+				ts.ack_mfsk.connect_pattern_nsymb, ts.ack_mfsk.connect_tones, 8,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+				ts.ack_mfsk.stream_offsets, &rm, 0, nullptr, &rbo,
+				/*reserve_after=*/ts.ack_mfsk.ctrl_suffix_len(), nullptr,
+				/*always_fine=*/false, /*combine_reps=*/R);
+			if (rm >= conn_thr) base_ok++;
+			// full production establishment decode (base detect[combine] + FEC).
+			mfsk_ctrl_frame_type rx_type; uint64_t rx_p38=0; uint16_t rx_crc12=0; int rx_matched=0;
+			bool ok = ts.decode_ctrl_suffix_from_passband(
+				work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+				prod_crc12_cb, &arq);
+			if (ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38) decoded_ok++;
+		}
+		double Pb = (double)base_ok / NT;
+		double Pf = (double)decoded_ok / NT;
+		double Pest = 1.0 - std::pow(1.0 - Pf, (double)R_frame);   // lever D frame retry
+		double snr = snr3k_db(p_sig, sigma, fs);
+		printf("      %6.1f : %7.2f : %.2f : %.2f : %.2f\n", mults[si], snr, Pb, Pf, Pest);
+		if (Pf  >= 0.5 && snr < frame_cliff) frame_cliff = snr;
+		if (Pest>= 0.5 && snr < est_cliff)   est_cliff   = snr;
+	}
+	printf("    [%s] ==> per-frame decode cliff = %.2f dB SNR3k | establishment cliff (R_frame=%d) = %.2f dB | airtime %.1fs\n",
+		label, frame_cliff, R_frame, est_cliff, air_ms/1000.0);
+	*out_frame_cliff = frame_cliff; *out_est_cliff = est_cliff;
+
+	// restore process-global codec + ts state for later tests
+	ts.set_connect_preamble_reps(1);
+	ts.set_suffix_fec(false);
+	gf16ra::configure(2);
+}
+
+// THE feasibility measurement: per-lever breakdown + the stacked ULTRA_0/ULTRA_2
+// establishment cliffs. ASSERTS only that the infrastructure ran and the stacked
+// frame cliff is no shallower than the merged baseline (the dB verdict is in the
+// log — this is a measurement spike, not a regression gate).
+static void test_ultra_stacked_establishment_cliff_sweep() {
+	const char* name = "ultra_stacked_establishment_cliff_sweep";
+	printf("  [MEASURE] ULTRA tier feasibility spike — stacked deep-SNR establishment cliff (INCR-0):\n");
+	printf("    Reference: merged acquisition stack establishment cliff ~−13.9 dB sim (§19/§20), HW ~−16/−18.\n");
+	printf("    Targets: ULTRA_0 ~−20, ULTRA_2 ~−24 dB SNR3k. Question: do the 4 levers COMPOUND or SATURATE?\n");
+
+	double fc, ec;
+	double base_fc=0, base_ec=0;
+	double a_fc=0, b_fc=0, c_fc=0;  // per-lever frame cliffs
+	double u0_fc=0, u0_ec=0, u2_fc=0, u2_ec=0;
+
+	printf("    --- BASELINE (merged stack: repfact=3 R¼, K=13, combine R=4, R_frame=1) ---\n");
+	ultra_cliff_one("BASE", /*repfact=*/3, /*K=*/13, /*R=*/4, /*R_frame=*/1, &base_fc, &base_ec);
+
+	printf("    --- LEVER A alone (lower rate: repfact 3→8 / R¼→R⅑, K=13, R=4, R_frame=1) ---\n");
+	ultra_cliff_one("A:r8",  /*repfact=*/8,  /*K=*/13, /*R=*/4,  /*R_frame=*/1, &a_fc, &ec);
+
+	printf("    --- LEVER C alone (fewer info bits: K 13→8 then →5, repfact=3, R=4, R_frame=1) ---\n");
+	ultra_cliff_one("C:K8",  /*repfact=*/3,  /*K=*/8,  /*R=*/4,  /*R_frame=*/1, &c_fc, &ec);
+	ultra_cliff_one("C:K5",  /*repfact=*/3,  /*K=*/5,  /*R=*/4,  /*R_frame=*/1, &fc, &ec);
+
+	printf("    --- LEVER B alone (deeper combining: R 4→16 then →32, repfact=3, K=13, R_frame=1) ---\n");
+	ultra_cliff_one("B:R16", /*repfact=*/3,  /*K=*/13, /*R=*/16, /*R_frame=*/1, &b_fc, &ec);
+	ultra_cliff_one("B:R32", /*repfact=*/3,  /*K=*/13, /*R=*/32, /*R_frame=*/1, &fc, &ec);
+
+	printf("    --- STACKED ULTRA_0 (B:R16 + A:repfact6/R⅐ + C:K8 + D:R_frame2) → target −20 ---\n");
+	ultra_cliff_one("ULTRA_0", /*repfact=*/6, /*K=*/8, /*R=*/16, /*R_frame=*/2, &u0_fc, &u0_ec);
+
+	printf("    --- STACKED ULTRA_2 (B:R32 + A:repfact8/R⅑ + C:K5 + D:R_frame4) → target −24 ---\n");
+	ultra_cliff_one("ULTRA_2", /*repfact=*/8, /*K=*/5, /*R=*/32, /*R_frame=*/4, &u2_fc, &u2_ec);
+
+	// FAR on pure noise through the WORST-CASE ULTRA_2 production path (R=32 reps =
+	// most candidate offsets, R⅑ lowest rate, K=5 smallest message). The count gate
+	// (7/16) + CRC12 (2⁻¹²) + 2-bit type are the FAR backstop, unchanged by depth.
+	int far_accepts = 0; const int FT = 4000;
+	{
+		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+		cl_arq_controller arq;
+		ts.set_suffix_fec(true, 8);
+		int N = gf16ra::configure_k(8, 5); gf16ra::init();
+		ts.set_connect_preamble_reps(32);
+		const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+		const int lead = 4096; const int total_pb = n_sig + 2*lead;
+		// reference RMS for a −24-ish noise level
+		uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+		p38 &= ((1ULL << (gf16ra::msg_bits()-2)) - 1ULL);
+		uint8_t by[5]; pack_ctrl_typed40_msb(by, (uint8_t)MFSK_CTRL_START_CONN, p38);
+		uint16_t crc12 = arq.CRC12_calc((char*)by,5)&0x0FFF;
+		std::vector<double> c((size_t)total_pb, 0.0);
+		ts.generate_ctrl_suffix_pattern_passband(c.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+		double psum=0.0; for(int i=0;i<n_sig;i++){double v=c[(size_t)(lead+i)];psum+=v*v;}
+		double sig_rms = std::sqrt(psum/n_sig);
+		double far_sigma = 64.0 * sig_rms;   // ~−24 dB band
+		std::mt19937 frng(0xFAC0DE32u);
+		std::normal_distribution<double> fnd(0.0, far_sigma);
+		std::vector<double> w((size_t)total_pb, 0.0);
+		for (int t=0;t<FT;t++) {
+			for (int i=0;i<total_pb;i++) w[(size_t)i]=fnd(frng);
+			mfsk_ctrl_frame_type rt; uint64_t rp=0; uint16_t rc=0; int rmm=0;
+			if (ts.decode_ctrl_suffix_from_passband(w.data(), total_pb, &rt,&rp,&rc,&rmm, prod_crc12_cb, &arq))
+				far_accepts++;
+		}
+		(void)N;
+		ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2);
+	}
+	printf("    --- FAR (pure noise, %d trials, ULTRA_2 R=32/R⅑/K=5 production path) : %d/%d false CONNECT accepts ---\n",
+		FT, far_accepts, FT);
+
+	printf("    ========================= ULTRA FEASIBILITY SUMMARY =========================\n");
+	printf("    per-frame decode cliffs (SNR3k dB, deeper=better):\n");
+	printf("      BASELINE (merged)            : %.2f\n", base_fc);
+	printf("      +A alone (R⅑, K=13)          : %.2f  (%+.2f vs base)\n", a_fc, base_fc - a_fc);
+	printf("      +C alone (K=8, R¼)           : %.2f  (%+.2f vs base)\n", c_fc, base_fc - c_fc);
+	printf("      +B alone (R=16, R¼ K=13)     : %.2f  (%+.2f vs base)\n", b_fc, base_fc - b_fc);
+	printf("    stacked establishment cliffs (with lever-D frame repetition):\n");
+	printf("      ULTRA_0 frame=%.2f  establish=%.2f  (target −20)  reaches −20? %s\n",
+		u0_fc, u0_ec, (u0_ec <= -20.0) ? "YES" : "no");
+	printf("      ULTRA_2 frame=%.2f  establish=%.2f  (target −24)  reaches −24? %s\n",
+		u2_fc, u2_ec, (u2_ec <= -24.0) ? "YES" : "no");
+	double sum_iso = (base_fc-a_fc) + (base_fc-c_fc) + (base_fc-b_fc);
+	double stacked = base_fc - u0_fc;
+	printf("    COMPOUNDING CHECK: sum of isolated per-frame gains (A+C+B vs base) = %+.2f dB;\n", sum_iso);
+	printf("      stacked ULTRA_0 per-frame gain vs base = %+.2f dB (lever D adds on top via frames).\n", stacked);
+	printf("      => levers %s (stacked ~%.0f%% of summed isolated gains; <70%% = saturation flag).\n",
+		(sum_iso > 0.1 && stacked >= 0.7*sum_iso) ? "COMPOUND" : "SATURATE/sublinear",
+		(sum_iso > 0.1) ? 100.0*stacked/sum_iso : 0.0);
+	printf("      FAR (ULTRA_2 worst-case path): %d/%d false accepts (count gate + CRC12 + type).\n", far_accepts, FT);
+	printf("    =============================================================================\n");
+
+	// Infra-ran + no-regression gate: the stacked ULTRA_0 per-frame cliff must be
+	// no shallower than the merged baseline (levers must not HURT) AND FAR clean.
+	// dB verdict = the log above (this is a measurement spike, not a tuned gate).
+	if (!(base_fc < 1e8 && u0_fc < 1e8 && u2_fc < 1e8)) {
+		test_fail(name, "a cliff never reached P=0.5 on the grid (widen SNR axis?)"); return;
+	}
+	if (u0_fc > base_fc + 0.5) {
+		char b[200]; snprintf(b,sizeof(b),
+			"ULTRA_0 per-frame cliff %.2f is SHALLOWER than baseline %.2f — levers regressed", u0_fc, base_fc);
+		test_fail(name, b); return;
+	}
+	if (far_accepts > 0) {
+		char b[160]; snprintf(b,sizeof(b),"ULTRA_2 FAR %d/%d > 0 — combining depth broke the FAR backstop", far_accepts, FT);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // §21 PRODUCTION CAP/adaptive wiring — gate tests (tier2-suffix-fec-design.md §21)
 // =============================================================================
 //
@@ -5129,6 +5370,13 @@ int run_mfsk_ctrl_codec_tests() {
 	// R=4 deepens the matched-count materially vs R=1, byte-identical-when-off,
 	// FAR=0 on the combined path.
 	test_connect_preamble_combining_cliff_sweep();
+
+	// ULTRA TIER FEASIBILITY SPIKE (ultra-tier-design.md §2/§6 INCR-0): stack the
+	// FOUR deep-SNR levers (A lower-rate RA + B deeper combining + C minimal msg +
+	// D frame repetition) and MEASURE whether they COMPOUND to a real
+	// establishment-cliff move toward −20 (ULTRA_0) / −24 (ULTRA_2) SNR3k, with
+	// per-lever breakdown + a saturation flag + FAR. The go/no-go for the full tier.
+	test_ultra_stacked_establishment_cliff_sweep();
 
 	// §21 PRODUCTION CAP/adaptive wiring (tier2-suffix-fec-design.md §21):
 	// the merge-prerequisite. Interop matrix, ACK throughput-neutrality

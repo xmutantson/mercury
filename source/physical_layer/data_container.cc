@@ -118,12 +118,13 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	// configs (ROBUST_0 Nsymb < 48) → would overflow ofdm_framed_data /
 	// ofdm_symbol_modulated_data. (Uncoded path unaffected — 16+13=29<48.)
 	// §20 (§20.3 C2): base-pattern combining emits the 16-sym base block up to
-	// MAX_CONNECT_PREAMBLE_REPS=4 times → R×16 + coded suffix(≤64) = 4*16+64=128
-	// symbols. Floor at 128 so the combined+coded CONNECT pattern always fits
-	// regardless of repfact and reps. (Kept as a literal — data_container does not
-	// include mfsk.h/mfsk_ctrl_codec.h; the two constants are MAX_CONNECT_PREAMBLE
-	// _REPS=4 and GF16RA_MAX_N=64. If either grows, raise this in lockstep.)
-	const int CTRL_SUFFIX_FEC_MAX_NSYMB = 128;  // 4×16 WB connect base reps + 64 GF16RA_MAX_N
+	// MAX_CONNECT_PREAMBLE_REPS times → R×16 + coded suffix(≤GF16RA_MAX_N).
+	// ULTRA spike (levers A+B): MAX_CONNECT_PREAMBLE_REPS raised 4→32 and
+	// GF16RA_MAX_N raised 64→128 → R×16 + suffix(≤128) = 32*16+128 = 640 symbols.
+	// Floor at 640 so the combined+coded CONNECT pattern always fits regardless of
+	// repfact and reps. (Kept as a literal — data_container does not include
+	// mfsk.h/mfsk_ctrl_codec.h; if either constant grows, raise this in lockstep.)
+	const int CTRL_SUFFIX_FEC_MAX_NSYMB = 640;  // 32×16 WB connect base reps + 128 GF16RA_MAX_N
 	int alloc_Nsymb = (Nsymb > 48) ? Nsymb : 48;
 	if (alloc_Nsymb < CTRL_SUFFIX_FEC_MAX_NSYMB) alloc_Nsymb = CTRL_SUFFIX_FEC_MAX_NSYMB;
 	this->ofdm_framed_data=CNEW(std::complex<double>, alloc_Nsymb*Nc, "dc.ofdm_framed_data");

@@ -218,10 +218,16 @@ namespace gf16ra {
 
 static const int GF16RA_M       = 16;  // symbol alphabet (M-FSK order)
 static const int GF16RA_m       = 4;   // bits/symbol = log2(M)
-static const int GF16RA_K_MSG   = 10;  // info symbols carrying the 40-bit message
-static const int GF16RA_K_CRC   = 3;   // info symbols carrying the 12-bit CRC
-static const int GF16RA_K       = 13;  // total info symbols (message + CRC)
-static const int GF16RA_MAX_N   = 64;  // buffer ceiling for out_tones / energies
+static const int GF16RA_K_MSG   = 10;  // DEFAULT info symbols carrying the 40-bit message
+static const int GF16RA_K_CRC   = 3;   // info symbols carrying the 12-bit CRC (FIXED)
+static const int GF16RA_K       = 13;  // DEFAULT total info symbols (message + CRC)
+// ULTRA spike (lever A + C): the codeword length N and the info-symbol count K
+// are now RUNTIME knobs (configure(repfact,K)). MAX_N raised 64->128 so the
+// lowest rates fit: at K=13, repfact=8 -> N = K(1+8) = 117 <= 128 (R 1/9);
+// at K=8, repfact=8 -> N = 72; etc. GF16RA_MAX_K caps the info stack arrays /
+// the runtime K (the production default K=13 is the maximum useful message).
+static const int GF16RA_MAX_K   = 13;  // ceiling for the runtime info-symbol count
+static const int GF16RA_MAX_N   = 128; // buffer ceiling for out_tones / energies (lever A: was 64)
 
 // TRUE Q-ary RA structure (matches qracodes / Q65): the parity is a length-NC
 // GF(16) accumulator chain, each stage folding in EXACTLY ONE interleaved info
@@ -236,11 +242,24 @@ static const int GF16RA_MAX_N   = 64;  // buffer ceiling for out_tones / energie
 // (Q65 QRATYPE_CRC) so the recompute-and-compare accept gate is FEC-reliable.
 
 // Configure the code repeat factor (must be called before init()/the first
-// encode/decode, or after a reconfigure). Default repfact = 2 (N=39, R=1/3).
-// Returns the resulting codeword length N (= K + repfact*K).
+// encode/decode, or after a reconfigure). Default repfact = 2 (N=39, R=1/3),
+// K = GF16RA_K = 13 info symbols. Returns the resulting codeword length N
+// (= K + repfact*K). Capped so N <= GF16RA_MAX_N (repfact backs off if needed).
 int  configure(int repfact);
+
+// ULTRA spike (lever C): configure with an explicit total info-symbol count
+// K_total (message + 3 CRC), 4 <= K_total <= GF16RA_MAX_K(13). The message
+// occupies (K_total - 3) systematic symbols = 4*(K_total-3) bits; the CRC stays
+// 3 symbols (12 bits, the FAR gate). Fewer info symbols => fewer info bits to
+// recover in the same airtime => deeper FEC reach (the +3 dB/halving lever).
+// Returns N (= K_total + repfact*K_total). Default configure(repfact) ==
+// configure_k(repfact, 13).
+int  configure_k(int repfact, int K_total);
+
 int  codeword_len();   // current N (= K + NC); valid after configure()/init()
 int  parity_len();     // current NC (= repfact*K)
+int  info_len();       // current K (total info symbols, message + 3 CRC)
+int  msg_bits();       // current message-bit capacity = 4*(K-3)
 
 // One-time construction of the GF(16) field tables and the RA graph for the
 // current repfact (interleaver, accumulator weights). Idempotent until the next
