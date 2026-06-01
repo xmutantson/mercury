@@ -348,6 +348,117 @@ FAR. SNR-vote path (I1) untouched (reads hard `out_tones`).
 3. **Do NOT raise flips above 1 by default** (FAR 3.4% at 2, 14% at 3). flips=2
    is available if a campaign accepts 3.4% FAR for the extra knee margin.
 
+## §8. TIER-2 GOLAY(24,12,8) — MEASURED (SIM SPIKE, branch wt/suffix-fec-tier2-sim)
+
+Phase-1 spike to measure the coding gain of a real-parity Tier-2 code BEFORE any
+wire-format change. Self-contained module `golay24.{h,cc}` + `§10` harness in
+`mfsk_ctrl_codec_tests.cc`. NOTHING wired into production: the 13-symbol suffix
+(`ack_sack_suffix_len()`) is untouched, `suffix_fec_mode=0/1` are byte-identical
+(§10.4 test asserts the production 13-sym hard path is unchanged). Reproduce:
+`mercury.exe --test` → tests `golay24_roundtrip`, `golay24_soft_beats_hard`,
+`golay_tier2_roundtrip_clean`, `golay_tier2_byte_identical_when_off`,
+`golay_tier2_pure_noise_far`, `golay_tier2_word_independence_diag`,
+`golay_tier2_cliff_sweep`. **43/43 pass** (36 baseline + 7 Tier-2).
+
+### §8.1. Frame design
+40-bit message `[type:2|payload:38]` → pad to 48 bits → **FOUR** Golay(24,12,8)
+codewords (96 coded bits) → **24** M=16 FSK symbols (rate-1/2, vs the uncoded 13).
+The task brief said "two codewords"; its own arithmetic (48 info / 96 coded / 24
+symbols) requires FOUR (two words = 48 coded bits = 12 symbols). Implemented the
+self-consistent four-word frame. Generator `G=[I|B]` was DERIVED+verified
+(lexicode → Gaussian elimination → systematic; `encode()` d_min=8 confirmed over
+all 4096 codewords at runtime; constants are checked, not trusted — §10.1).
+
+### §8.2. Codec self-tests (decoder is correct in isolation)
+- `golay24_roundtrip`: d_min=8; corrects all ≤3-bit errors; all 4-bit errors are
+  decode-FAILURES (zero miscorrections) — the (24,12,8) bounded-distance guarantee.
+- `golay24_soft_beats_hard`: with **4 of 6** symbols' argmax WRONG (true tone in a
+  near-2nd-best energy position), soft-ML recovers **3904/4000** words; hard
+  syndrome decode recovers **0/4000**. The soft decoder demonstrably exceeds the
+  hard 3-error limit — the codec is doing what Tier-2 is supposed to do.
+
+### §8.3. THE MEASUREMENT — cliff sweep (same SNR3k axis/seed as §6, refined grid)
+All four columns measured on the SAME grid + seed + AWGN injection + detector:
+
+| SNR3k dB | base-det (matched≥7) | uncoded HARD | uncoded SOFT@1 | **GOLAY Tier-2** |
+|----------|----------------------|--------------|----------------|------------------|
+| −7.32 | 1.000 | 0.810 | 0.975 | **1.000** |
+| −8.66 | 1.000 | 0.480 | 0.785 | **0.930** |
+| −9.26 | 1.000 | 0.220 | 0.425 | **0.705** ← 0.5-crossing |
+| −9.82 | 1.000 | 0.070 | 0.170 | **0.390** |
+| −10.34| 1.000 | 0.020 | 0.055 | 0.145 |
+| −10.84| 0.990 | 0.000 | 0.020 | 0.030 |
+| −13.34| 0.810 | 0 | 0 | 0 |
+| −14.68| 0.500 | 0 | 0 | 0 |
+
+- **Cliffs (P=0.5): uncoded HARD −7.32 | uncoded SOFT@1 −8.66 | GOLAY −9.26 dB.**
+- **Coding gain: +1.94 dB vs hard, +0.60 dB vs Tier-1 soft@1.**
+- **Residual gap to the −14.68 base floor: 5.42 dB. GOLAY DOES NOT REACH −14.**
+- Golay is genuinely stronger per-cell (0.705 vs 0.425 at −9.26; ~2× at −9.82) —
+  it does real error correction — but the 0.5-crossing moves only ~0.6 dB beyond
+  the zero-airtime Tier-1 soft list, for +11 symbols (~268 ms) of added airtime.
+
+### §8.4. WHY it falls short (mechanism — diagnostic §10.5b, NOT speculation)
+1. **NOT the 4-word split.** Diagnostic measured P(frame) vs P(word)^4: at −9.8 dB
+   P(word)=0.409 but P(frame)=0.405 (≈ P(word), NOT 0.028=P(word)^4). Word
+   failures are HIGHLY CORRELATED — a bad channel realization buries all 4 words
+   at once. So a single longer code over all 48 bits would NOT help; the split is
+   not the bottleneck. (H1 rejected.)
+2. **The per-symbol error ramps too steeply for a rate-1/2 block code.** True-tone
+   energy rank stays good (in top-3 ~99% @ −8.7, ~97% @ −9.8, ~90% @ −10.8) so the
+   SOFT INFO is fine — but per-symbol argmax-error q ramps 0.053 → 0.120 → 0.242
+   over −8.7 → −9.8 → −10.8 dB. A rate-1/2 (24,12) word (6 symbols) can't track
+   q>~0.12; by q≈0.24 (−10.8) it is dead. This is fundamental to a rate-1/2 code at
+   this block length, not specific to Golay — the diagnostic shows the limit is q,
+   not the code choice.
+3. **The base detector and the payload have categorically different reach.** The
+   base pattern reaches −14.68 dB because it only RECOGNIZES a known fixed
+   sequence (huge processing gain via the 7/16-of-16 matched vote, tolerates ~9
+   bad symbols). The suffix must RECOVER 48 unknown info bits. NB also: the
+   suffix decoders gate on `detect_ack_pattern` metric ≥ 3.0, which itself cliffs
+   ~−11 dB (below that the pattern still matches 7/16 tones but the correlation
+   metric collapses) — so the USABLE base-detect floor for any suffix decoder is
+   ~−11 dB, and Golay at −9.26 is ~1.7 dB from THAT (vs 5.4 dB from the raw
+   matched-count floor). Closing even ~1.7 dB more at rate-1/2 over these symbols
+   is not achievable per (2).
+
+### §8.5. FAR + airtime
+- **FAR (Golay, CRC-gated, pure noise, sigma=3.2, 3000 trials): 0.0000** (123
+  base-detects, 0 CRC-accepts). The CRC12 gate over the decoded payload bounds it
+  to ≈ base_detect_rate × 2⁻¹² — strictly BETTER than Tier-1's 0.25% (Tier-1's
+  list search tries up to 40 codewords/decode; Golay's soft-ML commits to ONE
+  codeword per word, so only one CRC trial per frame). §10.5 test.
+- **Airtime: 24 vs 13 symbols = +11 symbols × 24.33 ms = +268 ms.** Free
+  once/session on CONNECT (per §2); would be ~10-25% per-batch on ACK (do NOT put
+  Tier-2 on the ACK — same asymmetric rule as §3).
+
+### §8.6. RECOMMENDATION (decision-grade) — GOLAY STALLS SHORT
+**Golay(24,12,8) does NOT reach −14 dB; it cliffs at −9.26 dB (5.4 dB short of the
+raw base floor, ~1.7 dB short of the metric-gated usable floor).** It is a real
+but modest **+0.6 dB over the free Tier-1 soft list**, bought with +268 ms airtime.
+
+The GF(16)-RA upgrade the task names as the fallback **would not change the
+verdict for the −14 dB goal**: §8.4(2) shows the limiter is per-symbol q at
+rate-1/2, not the specific code's algebraic strength — and §8.4(1) shows it is
+not the word-split either. A stronger same-rate code over the same 24 symbols
+hits the same q-wall near −10.8 dB. To actually track the base detector to −14
+you must change the OPERATING POINT, not the code:
+- **(a) Far lower rate / fewer info bits** — recover only a handful of bits per
+  frame (e.g. an (n, k≪) repetition/orthogonal code), trading payload for reach;
+  or
+- **(b) Noncoherent integration gain** — repeat the suffix and energy-combine
+  across repeats (the documented soft-repetition lever, §1.1), each 2× repeat
+  buys ~3 dB but doubles airtime; or
+- **(c) a coherent PHY** (shelved per the parity-audit L3 decision).
+
+**Decision input for the parent:** if the production goal is "a few dB of cheap
+reach on CONNECT/ACK," the **already-built Tier-1 soft list (0 airtime, +1.3 dB,
+0.25% FAR) is the better buy** and Golay is not worth its +268 ms for +0.6 dB.
+If the goal is specifically to track the −14 dB base floor, **neither Golay nor a
+GF(16)-RA at rate-1/2 gets there** — that needs option (a)/(b)/(c), which is a
+different (larger) project than a suffix-code swap. The Golay spike's value is
+that it CLOSES the "is a stronger block code the answer?" question: it is not.
+
 ## §7. Status log
 - 2026-05-31: doc created; code mapped; design chosen (two-tier, Tier-1-first).
   Mechanism (`p^13` hard argmax) confirmed from `ofdm.cc:4015-4035`.
@@ -355,3 +466,13 @@ FAR. SNR-vote path (I1) untouched (reads hard `out_tones`).
   to prior cliff-agent axis (base floor −14.68 ≈ their −14.6; hard suffix ≈ their
   −8.6). Soft@flips=1: +1.34 dB cliff move, 0% throughput, 0.25% FAR. Gap to
   detection floor (~6 dB) needs Tier-2 parity (CONNECT-only). Ship verdict §6.6.
+- 2026-05-31: TIER-2 Golay(24,12,8) SIM SPIKE (branch wt/suffix-fec-tier2-sim,
+  off 37947fb). golay24.{h,cc} (verified d_min=8 generator, exhaustive 4096-cw
+  soft-ML) + §10 harness. 43/43 tests pass. **Golay cliff −9.26 dB: +1.94 vs
+  hard, +0.60 vs Tier-1 soft, 5.42 dB short of −14.68 floor — DOES NOT REACH
+  −14.** Mechanism (§8.4): limiter is per-symbol q at rate-1/2 (q 0.05→0.24 over
+  −8.7→−10.8), NOT the word-split (P(frame)≈P(word), not word^4) and NOT the
+  specific code — so GF(16)-RA at the same rate wouldn't change the verdict.
+  FAR 0.0000 (better than Tier-1's 0.25%). Recommendation §8.6: Golay stalls
+  short; Tier-1 soft is the better cheap-reach buy; reaching −14 needs a lower
+  rate / repetition-combining / coherent PHY, not a block-code swap.

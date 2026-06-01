@@ -55,6 +55,7 @@
 
 #include "physical_layer/mfsk_ctrl_codec_tests.h"
 #include "physical_layer/mfsk_ctrl_codec.h"
+#include "physical_layer/golay24.h"          // §10 Tier-2 Golay suffix FEC (SIM SPIKE)
 #include "physical_layer/mfsk.h"
 #include "physical_layer/telecom_system.h"
 #include "physical_layer/physical_defines.h"
@@ -3109,6 +3110,598 @@ static void test_suffix_fec_cliff_sweep() {
 }
 
 // =============================================================================
+// §10 Tier-2 Golay(24,12,8) suffix FEC — SIM SPIKE (connect-suffix-fec-research.md §3 Tier 2)
+// =============================================================================
+//
+// Tier 1 (soft list decode, ZERO airtime) moved the suffix cliff only ~1.3 dB
+// (−7.3 → −8.7 dB) — it recovers near-misses but has no redundancy to correct
+// the deep-error regime, so it dies ~6 dB short of the −14.68 dB base-detector
+// floor. Tier 2 ADDS REAL PARITY: the 40-bit message [type:2|payload:38] is
+// padded to 48 bits, encoded as FOUR Golay(24,12,8) codewords (96 coded bits),
+// and sent as 24 M=16 FSK symbols (vs the uncoded 13). RX soft-ML-decodes each
+// codeword over the per-tone ENERGIES (cl_ofdm::decode_suffix_candidates with
+// K=M, the same soft information Tier 1 uses) — NOT the hard argmax.
+//
+// NOTE on word count: the task brief said "two Golay(24,12) codewords"; the
+// arithmetic it also states (48 info → 96 coded → 24 symbols) requires FOUR
+// codewords (2 words = 48 coded bits = 12 symbols). We implement the
+// self-consistent FOUR-word / 48-info / 24-symbol / rate-1/2 frame.
+//
+// This is a SIM SPIKE: NOTHING here is wired into a production TX/RX path. The
+// production 13-symbol suffix (ack_sack_suffix_len()) is untouched, so mode=0
+// (and mode=1 Tier-1) remain byte-identical. The harness reuses the production
+// OFDM/MFSK modulation + detector + FFT-energy extractor; only the suffix
+// symbol count (24) and the codec (Golay) differ from the Tier-1 measurement,
+// keeping the SNR3k axis directly comparable.
+
+static const int GOLAY_TIER2_NSYM   = 24;  // 96 coded bits / 4 bits-per-tone (M=16)
+static const int GOLAY_TIER2_NWORDS = 4;   // 48 info bits / 12 per Golay word
+static const int GOLAY_TIER2_WORD_NSYM = 6; // 24 coded bits / 4 bpt per word
+
+// Pack a 40-bit message [type:2|payload38:38] into 24 de-hopped data tones
+// (4 bits/tone, M=16) via 4 Golay(24,12,8) codewords. Layout:
+//   msg40  = (type<<38)|payload38   (40 bits)
+//   pad48  = msg40 << 8             (low 8 bits zero-padded; MSB-first words)
+//   word w = bits [48-12*(w+1) .. ] (12 info bits) -> golay24_encode -> 24 bits
+//   24 coded bits -> 6 tones (MSB-first), appended in word order.
+static void golay_tier2_pack_tones(mfsk_ctrl_frame_type type, uint64_t payload38,
+                                   int M, int* out_tones /*[24]*/)
+{
+	int bpt = 0; for (int m = M; m > 1; m >>= 1) bpt++;   // 4 at M=16
+	int tone_mask = M - 1;
+	uint64_t msg40 = ((uint64_t)(type & 0x3) << 38) | (payload38 & ((1ULL << 38) - 1ULL));
+	uint64_t pad48 = msg40 << 8;                          // 48-bit, MSB-first
+	int ti = 0;
+	for (int w = 0; w < GOLAY_TIER2_NWORDS; w++) {
+		int shift = 48 - 12 * (w + 1);
+		uint16_t info12 = (uint16_t)((pad48 >> shift) & 0x0FFFu);
+		uint32_t cw = golay24_encode(info12);             // 24 coded bits
+		for (int s = 0; s < GOLAY_TIER2_WORD_NSYM; s++) {
+			int csh = 24 - bpt * (s + 1);
+			out_tones[ti++] = (int)((cw >> csh) & (uint32_t)tone_mask);
+		}
+	}
+}
+
+// Inverse: reassemble the 40-bit message from the 4 soft-decoded 12-bit words.
+static void golay_tier2_unpack_words(const uint16_t words[4],
+                                     mfsk_ctrl_frame_type* out_type,
+                                     uint64_t* out_payload38)
+{
+	uint64_t pad48 = 0;
+	for (int w = 0; w < GOLAY_TIER2_NWORDS; w++)
+		pad48 = (pad48 << 12) | (uint64_t)(words[w] & 0x0FFFu);
+	uint64_t msg40 = pad48 >> 8;                          // strip the 8-bit pad
+	if (out_payload38) *out_payload38 = msg40 & ((1ULL << 38) - 1ULL);
+	if (out_type) *out_type = (mfsk_ctrl_frame_type)((msg40 >> 38) & 0x3);
+}
+
+// TX: build CONNECT base (connect_pattern_nsymb symbols) + 24 Golay suffix
+// symbols as passband audio at offset 4096. Mirrors
+// cl_telecom_system::generate_ctrl_suffix_pattern_passband EXACTLY (same
+// symbol_mod, same power_normalization, same ACK tx-gain channel, same
+// baseband_to_passband + peak_clip), differing only in the suffix: 24
+// Golay-coded symbols instead of the 13 uncoded ones. Returns the active
+// passband sample count (out_active_samples) and the audio buffer.
+static std::vector<double> build_golay_suffix_audio(cl_telecom_system& ts,
+	mfsk_ctrl_frame_type type, uint64_t payload38, int& out_active_samples)
+{
+	cl_ofdm& ofdm = ts.ofdm;
+	cl_mfsk& mf = ts.ack_mfsk;
+	cl_data_container& dc = ts.data_container;
+	int base_nsymb = mf.connect_pattern_nsymb;            // 16 WB
+	int nsymb = base_nsymb + GOLAY_TIER2_NSYM;            // 16 + 24 = 40
+	int Nc = dc.Nc, Nofdm = dc.Nofdm;
+	int fir = ts.frequency_interpolation_rate;
+
+	// 1) CONNECT base pattern into ofdm_framed_data[0..base_nsymb-1].
+	mf.generate_connect_pattern(dc.ofdm_framed_data);
+
+	// 2) Golay suffix tones (de-hopped) -> hopped active tone per symbol,
+	//    appended after the base. Same hop formula as generate_ctrl_suffix_pattern.
+	int data_tones[GOLAY_TIER2_NSYM];
+	golay_tier2_pack_tones(type, payload38, mf.M, data_tones);
+	double amp = sqrt((double)Nc / mf.nStreams);
+	for (int s = 0; s < GOLAY_TIER2_NSYM; s++) {
+		int abs_s = base_nsymb + s;
+		for (int k = 0; k < Nc; k++)
+			dc.ofdm_framed_data[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+		int actual_tone = (data_tones[s] + abs_s * mf.tone_hop_step) % mf.M;
+		for (int st = 0; st < mf.nStreams; st++)
+			dc.ofdm_framed_data[abs_s * Nc + mf.stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
+	}
+
+	// 3) Modulate every symbol (base + suffix), same normalization/gain as the
+	//    production ctrl-suffix passband generator.
+	for (int i = 0; i < nsymb; i++)
+		ofdm.symbol_mod(&dc.ofdm_framed_data[i * Nc],
+		                &dc.ofdm_symbol_modulated_data[i * Nofdm]);
+	float power_normalization = sqrt((double)(ofdm.Nfft * fir));
+	double ack_boost = ts.get_tx_gain(TX_SIG_ACK);
+	for (int j = 0; j < Nofdm * nsymb; j++) {
+		dc.ofdm_symbol_modulated_data[j] /= power_normalization;
+		dc.ofdm_symbol_modulated_data[j] *= sqrt(ts.output_power_Watt) * ack_boost;
+	}
+
+	int active = nsymb * Nofdm * fir;
+	out_active_samples = active;
+	std::vector<double> audio((size_t)active + 8192, 0.0);
+	ofdm.baseband_to_passband(dc.ofdm_symbol_modulated_data, Nofdm * nsymb,
+		audio.data() + 4096, ts.sampling_frequency, ts.carrier_frequency,
+		ts.carrier_amplitude, fir);
+	ofdm.peak_clip(audio.data() + 4096, active, ofdm.data_papr_cut);
+	return audio;
+}
+
+// RX: detect the CONNECT base, extract per-tone soft costs over the 24 suffix
+// symbols (decode_suffix_candidates with K=M = a FULL per-tone energy-gap
+// profile), Golay soft-ML-decode the 4 words, reassemble the 40-bit message,
+// and apply the SAME production accept gate (type match + CRC12 over the 5-byte
+// [type|payload38] field). Returns true iff type matches AND CRC12 passes.
+// `crc12_fn`/`ctx` = production cl_arq_controller::CRC12_calc (never inline).
+static bool golay_tier2_decode_from_passband(cl_telecom_system& ts, double* data,
+	int size, mfsk_ctrl_frame_type expected_type, ctrl_crc12_fn crc12_fn,
+	void* crc12_ctx, uint64_t* out_payload38, int* out_matched)
+{
+	if (out_payload38) *out_payload38 = 0;
+	if (out_matched) *out_matched = 0;
+	cl_ofdm& ofdm = ts.ofdm;
+	cl_mfsk& mf = ts.ack_mfsk;
+	cl_data_container& dc = ts.data_container;
+	if (mf.connect_pattern_nsymb <= 0) return false;
+
+	int interp = dc.interpolation_rate;
+	int dec_size = size / interp;
+	double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		dc.baseband_data_interpolated, ts.sampling_frequency, eff_carrier,
+		ts.carrier_amplitude, interp, &ofdm.FIR_rx_data);
+
+	int matched = 0, best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		dc.baseband_data_interpolated, dec_size, 1,
+		mf.connect_pattern_nsymb, mf.connect_tones, /*base_len=*/8,
+		mf.tone_hop_step, mf.M, mf.nStreams, mf.stream_offsets,
+		&matched, 0, nullptr, &best_offset,
+		/*reserve_after=*/GOLAY_TIER2_NSYM, nullptr);
+	if (out_matched) *out_matched = matched;
+	if (matched < mf.connect_match_threshold || metric < 3.0 || best_offset < 0)
+		return false;
+
+	// Control-frame mini-Moose v2 (identical to the production soft path).
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		dc.baseband_data_interpolated, ts.bandwidth / (double)dc.Nc,
+		mf.connect_pattern_nsymb, best_offset, mf.connect_tones, 8,
+		mf.tone_hop_step, mf.M, mf.nStreams, mf.stream_offsets);
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit) {
+		ofdm.passband_to_baseband_decimated(data, size,
+			dc.baseband_data_interpolated, ts.sampling_frequency,
+			eff_carrier - ctrl_residual, ts.carrier_amplitude, interp, &ofdm.FIR_rx_data);
+		int rm = 0, rbo = -1;
+		double rmet = ofdm.detect_ack_pattern(dc.baseband_data_interpolated,
+			dec_size, 1, mf.connect_pattern_nsymb, mf.connect_tones, 8,
+			mf.tone_hop_step, mf.M, mf.nStreams, mf.stream_offsets,
+			&rm, 0, nullptr, &rbo, GOLAY_TIER2_NSYM, nullptr);
+		if (rm >= mf.connect_match_threshold && rmet >= 3.0 && rbo >= 0) {
+			matched = rm; best_offset = rbo;
+			if (out_matched) *out_matched = matched;
+		}
+	}
+
+	// Full per-tone soft costs over the 24 suffix symbols (K=M -> every tone
+	// ranked, cost = normalized energy gap, 0 for the argmax). This is the same
+	// energy-domain soft info Tier-1 consumes — just the full profile.
+	int M = mf.M;
+	std::vector<int> cand((size_t)GOLAY_TIER2_NSYM * M);
+	std::vector<double> cost((size_t)GOLAY_TIER2_NSYM * M);
+	ofdm.decode_suffix_candidates(dc.baseband_data_interpolated, dec_size, 1,
+		best_offset, mf.connect_pattern_nsymb, GOLAY_TIER2_NSYM,
+		mf.tone_hop_step, M, mf.nStreams, mf.stream_offsets,
+		/*K=*/M, cand.data(), cost.data());
+
+	// Reorder cand/cost into a dense tone_cost[symbol*M + tone] indexed by the
+	// DE-HOPPED data tone (decode_suffix_candidates returns candidates ranked by
+	// energy with their de-hopped tone id in cand[]). A symbol that ran past the
+	// buffer leaves cand[k0]<0 -> treat as erasure (flat cost) so the soft
+	// decoder degrades gracefully instead of spuriously accepting.
+	int bpt = 0; for (int m = M; m > 1; m >>= 1) bpt++;
+	std::vector<double> tone_cost((size_t)GOLAY_TIER2_NSYM * M, 0.0);
+	for (int s = 0; s < GOLAY_TIER2_NSYM; s++) {
+		if (cand[s * M + 0] < 0) { for (int t = 0; t < M; t++) tone_cost[s*M+t] = 0.0; continue; }
+		for (int k = 0; k < M; k++) {
+			int tone = cand[s * M + k];
+			if (tone < 0) continue;
+			tone_cost[s * M + (tone & (M - 1))] = cost[s * M + k];
+		}
+	}
+
+	// Soft-ML decode each of the 4 Golay words over its 6 symbols' tone costs.
+	uint16_t words[GOLAY_TIER2_NWORDS];
+	for (int w = 0; w < GOLAY_TIER2_NWORDS; w++) {
+		const double* wc = &tone_cost[(size_t)w * GOLAY_TIER2_WORD_NSYM * M];
+		words[w] = golay24_soft_decode(wc, M, bpt, GOLAY_TIER2_WORD_NSYM, nullptr);
+	}
+
+	mfsk_ctrl_frame_type rx_type; uint64_t rx_p38;
+	golay_tier2_unpack_words(words, &rx_type, &rx_p38);
+	if (rx_type != expected_type) return false;          // type gate (unchanged)
+
+	// This spike's Golay frame carries [type:2|payload:38] only (no separate CRC
+	// field on the wire — the 4 Golay parity nibbles ARE the redundancy). So
+	// this function returns the soft-ML-decoded (type, payload). Two accept
+	// criteria are layered on top by callers:
+	//   - cliff sweep: payload-equality (rp == tx p38) = the coding-gain metric;
+	//   - FAR / production-equivalent: an embedded CRC12 in the low 12 bits of
+	//     payload38 (golay_tier2_decode_crcgated), exercising the real CRC gate
+	//     so FAR is comparable to Tier-1's CRC12 FAR.
+	if (out_payload38) *out_payload38 = rx_p38;
+	return true;
+}
+
+// CRC-gated variant used for the FAR measurement and the production-equivalent
+// accept test: the 40-bit message is [type:2 | crc-protected payload]. To get a
+// true CRC accept gate (so FAR is comparable to Tier-1's CRC12 FAR) we carry a
+// CRC12 INSIDE the payload: payload38 = [info26 | crc12], CRC over the 5-byte
+// [type:2|info26|<12 zero pad>]... but that shrinks usable info. For the SPIKE
+// the cleanest apples-to-apples FAR test is: decode, then require the recomputed
+// CRC12 over [type|payload38] to equal a CRC12 the TX embedded in the LOW 12
+// bits of payload38. golay_tier2_decode_crcgated implements exactly that.
+static bool golay_tier2_decode_crcgated(cl_telecom_system& ts, double* data,
+	int size, mfsk_ctrl_frame_type expected_type, ctrl_crc12_fn crc12_fn,
+	void* crc12_ctx, uint64_t* out_payload38, int* out_matched)
+{
+	uint64_t p38 = 0;
+	if (!golay_tier2_decode_from_passband(ts, data, size, expected_type,
+		crc12_fn, crc12_ctx, &p38, out_matched))
+		return false;
+	// Embedded-CRC convention (TX side mirrors this): the low 12 bits of
+	// payload38 hold a CRC12 over the 5-byte [type | (payload38 with low 12
+	// bits zeroed)]. Accept iff it matches.
+	uint64_t info_part = p38 & ~0xFFFULL;
+	uint16_t embedded = (uint16_t)(p38 & 0x0FFFu);
+	unsigned char typed[5];
+	pack_ctrl_typed40_msb(typed, (uint8_t)expected_type, info_part);
+	uint16_t calc = crc12_fn(crc12_ctx, typed, 5) & 0x0FFF;
+	if (calc != embedded) return false;
+	if (out_payload38) *out_payload38 = p38;
+	return true;
+}
+
+// §10.1 — Golay codec self-test: d_min=8, encode/hard-decode round-trip,
+// corrects all <=3-bit errors, and detects >=4-bit errors as decode-failure
+// (NO miscorrection). This is the "constants are CHECKED, not trusted" gate.
+static void test_golay24_roundtrip() {
+	const char* name = "golay24_roundtrip";
+	// d_min over all 4096 nonzero codewords must be exactly 8.
+	int dmin = 99;
+	auto pc = [](uint32_t x){ int c=0; while(x){x&=x-1;c++;} return c; };
+	for (uint32_t i = 1; i < 4096u; i++) {
+		int w = pc(golay24_encode((uint16_t)i));
+		if (w < dmin) dmin = w;
+	}
+	if (dmin != 8) { char b[64]; snprintf(b,sizeof(b),"d_min=%d (expected 8)",dmin); test_fail(name,b); return; }
+
+	// Round-trip + bounded-distance correction (deterministic).
+	std::mt19937 rng(0x60147);
+	for (int t = 0; t < 50000; t++) {
+		uint16_t info = (uint16_t)(rng() & 0x0FFF);
+		uint32_t cw = golay24_encode(info);
+		int ne = (int)(rng() % 5);            // 0..4 injected bit errors
+		uint32_t r = cw; int bits[24]; for (int b=0;b<24;b++) bits[b]=b;
+		for (int e = 0; e < ne; e++) {
+			int idx = (int)(rng() % (24 - e));
+			r ^= (1u << bits[idx]); bits[idx] = bits[24 - 1 - e];
+		}
+		uint16_t out = 0xFFFF; int nc = golay24_decode_hard(r, &out);
+		if (ne <= 3) {
+			if (nc < 0 || out != info) { test_fail(name, "failed to correct <=3 errors"); return; }
+		} else { // ne==4
+			if (nc >= 0 && out != info) { test_fail(name, "4-error MISCORRECTION (should be detect-only)"); return; }
+		}
+	}
+	test_pass(name);
+}
+
+// §10.2 — Golay soft-ML decode over crafted tone costs: when up to 4 of the 6
+// symbols in a word have a WRONG argmax (true tone is a near-2nd-best), the
+// soft-ML decoder must still recover the word (hard 3-error decode could not).
+static void test_golay24_soft_beats_hard() {
+	const char* name = "golay24_soft_beats_hard";
+	const int M = 16, bpt = 4, wn = GOLAY_TIER2_WORD_NSYM;
+	std::mt19937 rng(0x50F7);
+	int soft_ok = 0, hard_ok = 0, trials = 4000;
+	for (int t = 0; t < trials; t++) {
+		uint16_t info = (uint16_t)(rng() & 0x0FFF);
+		uint32_t cw = golay24_encode(info);
+		int tt[GOLAY_TIER2_WORD_NSYM];
+		for (int s = 0; s < wn; s++) tt[s] = (int)((cw >> (24 - bpt*(s+1))) & 0xF);
+		std::vector<double> tc((size_t)wn * M);
+		for (int s = 0; s < wn; s++)
+			for (int m = 0; m < M; m++) tc[s*M+m] = 0.5 + (double)(rng()%100)/200.0;
+		for (int s = 0; s < wn; s++) tc[s*M + tt[s]] = 0.0;   // true tone strongest
+		// Corrupt 4 symbols: a wrong tone becomes argmax (cost 0), true tone 2nd.
+		uint32_t hard_word = 0;
+		for (int s = 0; s < wn; s++) {
+			int argmax_tone = tt[s];
+			if (s < 4) {
+				int wrong = (tt[s] + 1 + (int)(rng()%15)) & 0xF;
+				if (wrong == tt[s]) wrong = (wrong + 1) & 0xF;
+				tc[s*M + wrong] = 0.0; tc[s*M + tt[s]] = 0.2;
+				argmax_tone = wrong;
+			}
+			hard_word = (hard_word << bpt) | (uint32_t)argmax_tone;
+		}
+		double bc; uint16_t sout = golay24_soft_decode(tc.data(), M, bpt, wn, &bc);
+		if (sout == info) soft_ok++;
+		uint16_t hout = 0xFFFF; int nc = golay24_decode_hard(hard_word, &hout);
+		if (nc >= 0 && hout == info) hard_ok++;
+	}
+	printf("    [golay-soft] 4-of-6 corrupted-argmax: soft recovered %d/%d, hard %d/%d\n",
+		soft_ok, trials, hard_ok, trials);
+	if (soft_ok <= hard_ok) { test_fail(name, "soft did not beat hard on 4-corrupt words"); return; }
+	if (soft_ok < (int)(0.80 * trials)) { test_fail(name, "soft recovery < 80% (expected high)"); return; }
+	test_pass(name);
+}
+
+// §10.3 — clean passband round-trip: TX 24-symbol Golay suffix, RX detect +
+// soft-ML decode, payload must match exactly at sigma=0.
+static void test_golay_tier2_roundtrip_clean() {
+	const char* name = "golay_tier2_roundtrip_clean";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) { test_fail(name, "connect_pattern_nsymb=0"); return; }
+
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	int active = 0;
+	std::vector<double> audio = build_golay_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, active);
+
+	uint64_t rx_p38 = 0; int matched = 0;
+	bool ok = golay_tier2_decode_from_passband(ts, audio.data(), (int)audio.size(),
+		MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rx_p38, &matched);
+	if (!ok) { test_fail(name, "Golay Tier-2 decode miss on clean"); return; }
+	if (rx_p38 != p38) {
+		char b[160]; snprintf(b,sizeof(b),"payload mismatch tx=0x%010llx rx=0x%010llx",
+			(unsigned long long)p38,(unsigned long long)rx_p38); test_fail(name,b); return;
+	}
+	test_pass(name);
+}
+
+// §10.4 — BYTE-IDENTICAL-WHEN-OFF: with suffix_fec_mode=0 the production
+// 13-symbol hard suffix path must be bit-identical to today (Tier-2 adds no
+// production wire change). We assert that (a) the Golay module is never invoked
+// by the production hard/soft suffix path, and (b) the production hard decode
+// of the legacy 13-symbol frame is unchanged. We verify (b) directly: encode a
+// START_CONN via the PRODUCTION 13-symbol generator and confirm the production
+// hard decode reproduces it byte-for-byte (the Tier-2 code path is separate and
+// only reached by the §10 harness, never by production with mode 0/1).
+static void test_golay_tier2_byte_identical_when_off() {
+	const char* name = "golay_tier2_byte_identical_when_off";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	if (ts.suffix_fec_mode != 0) { test_fail(name, "default suffix_fec_mode != 0"); return; }
+	if (ts.ack_mfsk.ack_sack_suffix_len() != 13) { test_fail(name, "production suffix_len != 13 (Tier-2 altered the wire!)"); return; }
+
+	// Production 13-symbol suffix round-trip is untouched by Tier-2.
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, true, "W1AW", 4);
+	uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+	uint8_t bytes[5]; for (int b=0;b<5;b++) bytes[b]=(uint8_t)((typed40>>(8*(4-b)))&0xFF);
+	uint16_t crc12 = test_crc12_calc(bytes, 5);
+	int n_samples = ts.ctrl_suffix_pattern_passband_samples;
+	std::vector<double> audio((size_t)n_samples + 8192, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(audio.data()+4096, MFSK_CTRL_START_CONN, p38, crc12);
+	if (written != n_samples) { test_fail(name, "production 13-sym generator changed length"); return; }
+	mfsk_ctrl_frame_type t; uint64_t rp=0; uint16_t rc=0; int m=0;
+	bool ok = ts.decode_ctrl_suffix_from_passband(audio.data(), (int)audio.size(), &t, &rp, &rc, &m);
+	if (!ok || t != MFSK_CTRL_START_CONN || rp != p38 || rc != crc12) {
+		test_fail(name, "production 13-sym hard suffix path regressed"); return;
+	}
+	test_pass(name);
+}
+
+// §10.5 — FAR on pure noise: feed pure-AWGN passband (no signal) to the
+// CRC-gated Golay decoder and count spurious accepts. Comparable to Tier-1's
+// 0.25% (max_flips=1) FAR. The accept gate = base-pattern detect (>=threshold)
+// AND type match AND CRC12 over the embedded-CRC payload — so a noise frame
+// must (1) trip the base detector, then (2) the soft-ML-decoded payload's
+// recomputed CRC12 must match its own embedded 12 bits (prob ~2^-12 per detect).
+static void test_golay_tier2_pure_noise_far() {
+	const char* name = "golay_tier2_pure_noise_far";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) { test_fail(name, "connect_pattern_nsymb=0"); return; }
+
+	// Use a reference frame only to size the buffer + measure signal power for
+	// the SNR context; the FAR run itself feeds pure noise.
+	int active = 0;
+	std::vector<double> ref = build_golay_suffix_audio(ts, MFSK_CTRL_START_CONN, 0x0, active);
+	(void)ref;
+
+	const int trials = 3000;
+	// Pick a noise sigma in the cliff regime (the base detector still fires at a
+	// meaningful rate, so the CRC gate is actually exercised). sigma=3.2 is mid-
+	// cliff per the Tier-1 sweep. Also report base-detect rate for context.
+	double sigma = 3.2;
+	std::mt19937 rng(0x6047FA2);
+	std::normal_distribution<double> nd(0.0, sigma);
+	int accepts = 0, base_detects = 0;
+	for (int it = 0; it < trials; it++) {
+		std::vector<double> audio((size_t)active + 8192, 0.0);
+		for (size_t i = 0; i < audio.size(); i++) audio[i] = nd(rng);
+		uint64_t rp = 0; int m = 0;
+		if (golay_tier2_decode_crcgated(ts, audio.data(), (int)audio.size(),
+			MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rp, &m))
+			accepts++;
+		if (m >= ts.ack_mfsk.connect_match_threshold) base_detects++;
+	}
+	double far_rate = (double)accepts / trials;
+	printf("    [golay-FAR] pure-noise (sigma=%.1f, %d trials): base-detects=%d, CRC-accepts=%d, FAR=%.4f\n",
+		sigma, trials, base_detects, accepts, far_rate);
+	// CRC12 gate => expected FAR ~ base_detect_rate * 2^-12. Assert < 1% (a
+	// broken gate would accept on every base-detect).
+	if (far_rate > 0.01) { char b[120]; snprintf(b,sizeof(b),"FAR %.4f > 0.01 (CRC gate not bounding)",far_rate); test_fail(name,b); return; }
+	test_pass(name);
+}
+
+// §10.5b — MECHANISM DIAGNOSTIC: why does the 24-symbol Golay frame cliff at
+// −8.66 dB despite the codec correcting 4-of-6 corrupted symbols per word in
+// isolation? Two hypotheses: (H1) the frame is FOUR independent (24,12) words
+// and needs ALL 4 correct → P(frame)=P(word)^4, a new multiplicative AND; or
+// (H2) the per-symbol soft info itself degrades (noncoherent floor) so even
+// soft-ML can't find the true tone. We measure, at two cliff sigmas, the
+// per-WORD decode rate and the whole-FRAME rate; if frame ≈ word^4, H1 is
+// confirmed (the split is the bottleneck, not the codec). Deterministic.
+static void test_golay_tier2_word_independence_diag() {
+	const char* name = "golay_tier2_word_independence_diag";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	cl_ofdm& ofdm = ts.ofdm; cl_mfsk& mf = ts.ack_mfsk; cl_data_container& dc = ts.data_container;
+	if (mf.connect_pattern_nsymb <= 0) { test_pass(name); return; }
+	int M = mf.M, bpt = 0; for (int m = M; m > 1; m >>= 1) bpt++;
+	int interp = dc.interpolation_rate;
+	const double sigmas[] = {2.8, 3.2, 3.6, 4.0, 4.8, 5.6};
+	printf("    [golay-diag] per-word vs whole-frame decode (4 independent (24,12) words):\n");
+	for (double sigma : sigmas) {
+		std::mt19937 rng(0xD1A9);
+		std::normal_distribution<double> nd(0.0, sigma);
+		const int N = 400;
+		int word_ok = 0, frame_ok = 0; long sym_err = 0, sym_tot = 0;
+		long in_top1 = 0, in_top2 = 0, in_top3 = 0;  // true-tone rank survival
+		for (int it = 0; it < N; it++) {
+			uint64_t p38 = (((uint64_t)rng() << 6) ^ rng()) & ((1ULL<<38)-1ULL);
+			int active = 0;
+			std::vector<double> audio = build_golay_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, active);
+			for (size_t i = 0; i < audio.size(); i++) audio[i] += nd(rng);
+			// TX tones (ground truth).
+			int tx_tones[GOLAY_TIER2_NSYM];
+			golay_tier2_pack_tones(MFSK_CTRL_START_CONN, p38, M, tx_tones);
+			uint16_t tx_words[GOLAY_TIER2_NWORDS];
+			{ mfsk_ctrl_frame_type tt; uint64_t pp; (void)tt;(void)pp;
+			  // re-derive tx words from p38 the same way the packer did
+			  uint64_t pad48 = (((uint64_t)MFSK_CTRL_START_CONN<<38)|p38) << 8;
+			  for (int w=0;w<GOLAY_TIER2_NWORDS;w++) tx_words[w]=(uint16_t)((pad48>>(48-12*(w+1)))&0xFFF); }
+			// Detect + extract tone_cost (same path as the decoder).
+			int dec_size = (int)audio.size() / interp;
+			double eff = ts.carrier_frequency + ts.last_coarse_freq_offset;
+			ofdm.passband_to_baseband_decimated(audio.data(), (int)audio.size(),
+				dc.baseband_data_interpolated, ts.sampling_frequency, eff, ts.carrier_amplitude, interp, &ofdm.FIR_rx_data);
+			int matched=0, best_offset=-1;
+			double metric = ofdm.detect_ack_pattern(dc.baseband_data_interpolated, dec_size, 1,
+				mf.connect_pattern_nsymb, mf.connect_tones, 8, mf.tone_hop_step, M, mf.nStreams, mf.stream_offsets,
+				&matched, 0, nullptr, &best_offset, GOLAY_TIER2_NSYM, nullptr);
+			if (matched < mf.connect_match_threshold || metric < 3.0 || best_offset < 0) continue;
+			std::vector<int> cand((size_t)GOLAY_TIER2_NSYM*M); std::vector<double> cost((size_t)GOLAY_TIER2_NSYM*M);
+			ofdm.decode_suffix_candidates(dc.baseband_data_interpolated, dec_size, 1, best_offset,
+				mf.connect_pattern_nsymb, GOLAY_TIER2_NSYM, mf.tone_hop_step, M, mf.nStreams, mf.stream_offsets, M, cand.data(), cost.data());
+			std::vector<double> tc((size_t)GOLAY_TIER2_NSYM*M, 0.0);
+			for (int s=0;s<GOLAY_TIER2_NSYM;s++){ if(cand[s*M]<0)continue; int rank=-1; for(int k=0;k<M;k++){int tn=cand[s*M+k]; if(tn<0)continue; tc[s*M+(tn&(M-1))]=cost[s*M+k]; if((tn&(M-1))==tx_tones[s]) rank=k;}
+				// per-symbol argmax error + true-tone energy rank survival vs TX
+				if(cand[s*M]>=0){ sym_tot++; if((cand[s*M]&(M-1))!=tx_tones[s]) sym_err++;
+					if(rank==0) in_top1++; if(rank>=0&&rank<2) in_top2++; if(rank>=0&&rank<3) in_top3++; } }
+			// Per-word decode.
+			bool all=true;
+			for (int w=0; w<GOLAY_TIER2_NWORDS; w++){
+				uint16_t dec = golay24_soft_decode(&tc[(size_t)w*GOLAY_TIER2_WORD_NSYM*M], M, bpt, GOLAY_TIER2_WORD_NSYM, nullptr);
+				if (dec==tx_words[w]) word_ok++; else all=false;
+			}
+			if (all) frame_ok++;
+		}
+		double pw = (double)word_ok/(N*GOLAY_TIER2_NWORDS), pf=(double)frame_ok/N;
+		double q = sym_tot? (double)sym_err/sym_tot : 0.0;
+		double t1 = sym_tot?(double)in_top1/sym_tot:0, t2=sym_tot?(double)in_top2/sym_tot:0, t3=sym_tot?(double)in_top3/sym_tot:0;
+		double snr = snr3k_db(0.1335, sigma, ts.sampling_frequency);
+		printf("      sigma=%.1f (SNR3k=%.1f) : P(word)=%.3f P(frame)=%.3f P(word)^4=%.3f | q=%.3f truetone in top1=%.3f top2=%.3f top3=%.3f\n",
+			sigma, snr, pw, pf, pw*pw*pw*pw, q, t1, t2, t3);
+	}
+	test_pass(name);  // diagnostic; verdict is in the log
+}
+
+// §10.6 — THE MEASUREMENT: Golay Tier-2 cliff (P(decode)=0.5 in SNR3k) vs the
+// Tier-1 baseline (−7.3 hard / −8.7 soft) and the base-detect floor (−14.68).
+// Same AWGN injection, same SNR3k axis, same detector as the Tier-1 sweep — the
+// ONLY differences are 24 vs 13 suffix symbols and the Golay soft-ML decode.
+// Prints the headline coding gain and whether it reaches the floor.
+static void test_golay_tier2_cliff_sweep() {
+	const char* name = "golay_tier2_cliff_sweep";
+	printf("  [MEASURE] Tier-2 Golay(24,12,8) suffix-FEC acquisition cliff:\n");
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) { printf("    connect_pattern_nsymb=0, skip\n"); test_pass(name); return; }
+
+	double fs = ts.sampling_frequency;
+	int active = 0;
+	std::vector<double> refa = build_golay_suffix_audio(ts, MFSK_CTRL_START_CONN, 0x0, active);
+	// p_sig over the SUFFIX region only (symbols connect_nsymb..end) so it is
+	// directly comparable to the Tier-1 p_sig (which also measures the active
+	// suffix waveform). Use the same suffix_pb_power helper window convention:
+	// the full active region here is base+suffix; per-symbol power is uniform
+	// (one active tone/symbol at the same amp), so mean-square over the whole
+	// active region equals the per-symbol suffix power. Measure the whole region.
+	double p_sig = 0.0; { int n=0; for (int i=4096;i<4096+active && i<(int)refa.size();i++){p_sig+=refa[i]*refa[i];n++;} p_sig=(n>0)?p_sig/n:0.0; }
+
+	// SAME sigma grid as the Tier-1 sweep (suffix_cliff_one), REFINED between
+	// 2.8 and 3.6 (the −8.7..−10.8 dB knee) so the 0.5-crossing resolves finely
+	// enough to separate Golay from Tier-1 (the coarse grid bins both at −8.66).
+	const double sigmas[] = {1.4, 2.0, 2.4, 2.8, 3.0, 3.2, 3.4, 3.6, 4.0, 4.8, 5.6, 6.6};
+	const int NS = (int)(sizeof(sigmas)/sizeof(sigmas[0]));
+	const int N = 200;  // tighter P estimates near the knee
+	int base_thr = ts.ack_mfsk.connect_match_threshold;
+	std::mt19937 rng(0xC1FF7E5);  // same seed family as Tier-1
+
+	double base_cliff_snr=999, golay_cliff_snr=999, hard_cliff_snr=999, soft1_cliff_snr=999;
+	double base_cliff_s=0, golay_cliff_s=0, hard_cliff_s=0, soft1_cliff_s=0;
+	printf("    [cliff GOLAY] p_sig=%.4g base_thr=%d Golay_nsym=%d (uncoded ref=13)\n", p_sig, base_thr, GOLAY_TIER2_NSYM);
+	printf("      (sigma : SNR3k_dB : P_baseDet : P_uncodedHARD : P_uncodedSOFT@1 : P_GOLAY)\n");
+	for (int si = 0; si < NS; si++) {
+		double sigma = sigmas[si];
+		int golay_ok = 0, base_ok = 0, hard_ok = 0, soft1_ok = 0;
+		for (int it = 0; it < N; it++) {
+			uint64_t p38 = (((uint64_t)rng() << 6) ^ rng()) & ((1ULL<<38)-1ULL);
+			std::normal_distribution<double> ndist(0.0, sigma);
+			// --- Golay Tier-2 (24-symbol coded) frame ---
+			int act = 0;
+			std::vector<double> ga = build_golay_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, act);
+			for (size_t i = 0; i < ga.size(); i++) ga[i] += ndist(rng);
+			uint64_t rp = 0; int m = 0;
+			if (golay_tier2_decode_from_passband(ts, ga.data(), (int)ga.size(),
+				MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rp, &m) && rp == p38) golay_ok++;
+			if (m >= base_thr) base_ok++;
+			// --- Uncoded 13-symbol (Tier-0/1) frame on the SAME trial/SNR ---
+			int uact = 0;
+			std::vector<double> ua = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, uact);
+			for (size_t i = 0; i < ua.size(); i++) ua[i] += ndist(rng);
+			mfsk_ctrl_frame_type t2; uint64_t hp=0; uint16_t hc=0; int hm=0;
+			if (ts.decode_ctrl_suffix_from_passband(ua.data(), (int)ua.size(), &t2, &hp, &hc, &hm)) {
+				uint8_t hb[5]; pack_ctrl_typed40_msb(hb, (uint8_t)t2, hp);
+				if ((arq.CRC12_calc((char*)hb,5)&0xFFF)==hc && t2==MFSK_CTRL_START_CONN) hard_ok++;
+			}
+			uint64_t sp=0; int fl=0;
+			ts.suffix_fec_max_flips = 1;
+			if (ts.decode_ctrl_suffix_from_passband_soft(ua.data(), (int)ua.size(),
+				MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &sp, nullptr, &fl) && sp == p38) soft1_ok++;
+		}
+		double pb=(double)base_ok/N, pg=(double)golay_ok/N, ph=(double)hard_ok/N, ps=(double)soft1_ok/N;
+		double snr = snr3k_db(p_sig, sigma, fs);
+		printf("      %.3f : %7.2f : %.3f : %.3f : %.3f : %.3f\n", sigma, snr, pb, ph, ps, pg);
+		if (pb >= 0.5 && sigma > base_cliff_s)  { base_cliff_s = sigma;  base_cliff_snr = snr; }
+		if (ph >= 0.5 && sigma > hard_cliff_s)  { hard_cliff_s = sigma;  hard_cliff_snr = snr; }
+		if (ps >= 0.5 && sigma > soft1_cliff_s) { soft1_cliff_s = sigma; soft1_cliff_snr = snr; }
+		if (pg >= 0.5 && sigma > golay_cliff_s) { golay_cliff_s = sigma; golay_cliff_snr = snr; }
+	}
+	ts.suffix_fec_max_flips = 1;
+	const double BASE_FLOOR = -14.68;
+	double gain_vs_hard  = (golay_cliff_snr < 900 && hard_cliff_snr < 900)  ? (hard_cliff_snr  - golay_cliff_snr) : 0.0;
+	double gain_vs_soft1 = (golay_cliff_snr < 900 && soft1_cliff_snr < 900) ? (soft1_cliff_snr - golay_cliff_snr) : 0.0;
+	double gap_to_floor  = (golay_cliff_snr < 900) ? (golay_cliff_snr - BASE_FLOOR) : 999.0;
+	printf("    [cliff GOLAY] BASE floor: %.2f dB | uncoded HARD: %.2f | uncoded SOFT@1: %.2f | GOLAY Tier-2: %.2f dB (all same grid/seed)\n",
+		base_cliff_snr, hard_cliff_snr, soft1_cliff_snr, golay_cliff_snr);
+	printf("    [cliff GOLAY] ==> coding gain vs Tier-1 HARD = %.2f dB | vs Tier-1 SOFT@1 = %.2f dB | residual gap to -14.68 floor = %.2f dB\n",
+		gain_vs_hard, gain_vs_soft1, gap_to_floor);
+	printf("    [cliff GOLAY] ==> REACHES ~-14 dB FLOOR? %s (golay cliff %.2f dB vs floor %.2f dB)\n",
+		(gap_to_floor <= 1.0 ? "YES" : "NO"), golay_cliff_snr, BASE_FLOOR);
+	test_pass(name);  // infra ran; dB verdict is in the log
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -3178,6 +3771,15 @@ int run_mfsk_ctrl_codec_tests() {
 	test_suffix_soft_pure_noise_far();
 	test_suffix_soft_nb_unsupported();
 	test_suffix_fec_cliff_sweep();   // [MEASURE] prints the acquisition-gain dB
+
+	// §10 Tier-2 Golay(24,12,8) suffix FEC — SIM SPIKE (connect-suffix-fec-research.md §3 Tier 2)
+	test_golay24_roundtrip();              // codec self-test (d_min=8, corrects <=3)
+	test_golay24_soft_beats_hard();        // soft-ML beats hard on 4-corrupt words
+	test_golay_tier2_roundtrip_clean();    // 24-sym passband round-trip @ sigma=0
+	test_golay_tier2_byte_identical_when_off();  // production 13-sym path untouched
+	test_golay_tier2_pure_noise_far();     // FAR vs Tier-1's 0.25%
+	test_golay_tier2_word_independence_diag();  // mechanism: P(frame) vs P(word)^4
+	test_golay_tier2_cliff_sweep();        // [MEASURE] prints Golay coding-gain dB
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
