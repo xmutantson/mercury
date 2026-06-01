@@ -124,7 +124,14 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	// Floor at 640 so the combined+coded CONNECT pattern always fits regardless of
 	// repfact and reps. (Kept as a literal — data_container does not include
 	// mfsk.h/mfsk_ctrl_codec.h; if either constant grows, raise this in lockstep.)
-	const int CTRL_SUFFIX_FEC_MAX_NSYMB = 640;  // 32×16 WB connect base reps + 128 GF16RA_MAX_N
+	// ULTRA reframe spike (Change 2 — SUFFIX combining): the suffix is now emitted
+	// R_suffix (≤ MAX_CONNECT_SUFFIX_REPS=16) times after the base, so the framed
+	// pattern is R_base×16 + R_suffix×N. Sized to 1024 to hold the spike's deepest
+	// combined CONNECT pattern (e.g. R_base=16→256 + R_suffix=8×N≤117→936 < 1024).
+	// (The RX interpolated buffer (baseband_data_interpolated, ~804 sym for ROBUST_0)
+	// is the tighter ceiling — the spike test keeps total symbols under it.) Kept a
+	// literal — data_container does not include mfsk.h/mfsk_ctrl_codec.h.
+	const int CTRL_SUFFIX_FEC_MAX_NSYMB = 1024;
 	int alloc_Nsymb = (Nsymb > 48) ? Nsymb : 48;
 	if (alloc_Nsymb < CTRL_SUFFIX_FEC_MAX_NSYMB) alloc_Nsymb = CTRL_SUFFIX_FEC_MAX_NSYMB;
 	this->ofdm_framed_data=CNEW(std::complex<double>, alloc_Nsymb*Nc, "dc.ofdm_framed_data");

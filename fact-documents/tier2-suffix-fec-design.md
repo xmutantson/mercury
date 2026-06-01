@@ -1352,3 +1352,123 @@ upgraded↔upgraded enhanced stack (FEC+combining at the robust tier) is the unc
 @R≥2) — this increment only changed the TRIGGER (tier vs env), not the PHY, so the cliff is preserved
 (verified: both sweeps still report −13.89 on this binary). SIM ONLY — the production-config HW
 re-validate folds into the bundle merge.
+
+## §22 ULTRA REFRAME spike — count-based admission + SUFFIX combining REACHES −20 (SIM, 2026-06-01)
+
+Agent (this session). Worktree `C:/Users/kamer/mercury_wt/ultra-reframe` / branch `sim/ultra-reframe-spike`
+off `sim/ultra-tier-spike` @0f411fb (the INCR-0 lever infra: GF16RA_MAX_N=128, configure_k, combine
+R≤32). 53/53 tests pass. The decision-grade follow-on to INCR-0's NO-GO.
+
+### §22.1 The INCR-0 NO-GO and its pinned root cause (recap, confirmed here)
+
+INCR-0 (§ULTRA spike, `test_ultra_stacked_establishment_cliff_sweep`) found the 4 DESIGNED levers
+(A lower-rate / C fewer-bits / B base-combining / D frame-rep) SATURATE at ~−14: per-frame content
+cliff stays **−13.89** for A/C/B alone (+0.00 each); only frame-rep (D) moved the *establishment* cliff
+(ULTRA_0/2 → −16.07). **Re-confirmed verbatim on this binary** (BASE −13.89, A/C/B all −13.89,
+ULTRA_0/2 establish −16.07). ROOT CAUSE (two blockers below ~−14):
+1. The admission `metric` (the `metric ≥ CTRL_DETECT_METRIC_MIN=1.2` ratio gate in
+   `decode_ctrl_suffix_from_passband`, telecom_system.cc:3602/3642) is a SCALE-INVARIANT normalized
+   energy RATIO (`Σ e_target/e_total`) — combining sums R copies but the RATIO is unchanged → it gates
+   the decode OFF at ~−14 regardless of FEC/combining strength.
+2. Combining (B) was on the base PREAMBLE (`detect_ack_pattern` `combine_reps`), NOT the suffix FEC
+   content. The matched-COUNT detection IS combining-aware and alive much deeper (R=16 base: P_count
+   0.93@−19.9 / 0.57@−21.6 / 0.30@−23.4 — measured here) — **the headroom EXISTS**; the ratio gate +
+   single-copy content were the two clamps.
+
+### §22.2 The reframe (two changes, both flag-gated, byte-identical OFF)
+
+- **Change 1 — count-based admission** (telecom_system.cc, `g_ultra_count_admission`): drop the
+  scale-invariant `metric ≥ 1.2` ratio sub-gate; admit on the HARD matched-COUNT
+  (`matched ≥ connect_match_threshold=7/16`) alone. Backstop = CRC12 (2⁻¹²) + 2-bit type
+  (§16: gate FULLY OFF = 0/4000 pure-noise false-accepts).
+- **Change 2 — SUFFIX combining** (`connect_suffix_reps`, mfsk.cc TX + telecom_system.cc RX): TX emits
+  the GF16 codeword R_suffix times back-to-back after the base (continued-abs hop → frequency
+  diversity); RX extracts R_suffix per-tone ENERGY matrices (`decode_suffix_energies` per rep) and
+  SUMS them (de-hop lands every rep's symbol s on the same data-tone) before `gf16ra::soft_decode`.
+  Noncoherent square-law energy combining → +2.2-2.5 dB/doubling on the CONTENT, the way base
+  combining deepened detection. `set_connect_suffix_reps()` re-derives the passband sample count;
+  `ctrl_suffix_total_nsymb()` = R_suffix × coded N; framed-data buffer floor raised 640→1024.
+
+### §22.3 Per-change breakdown (per-frame CONTENT decode cliff, SNR3k dB, ROBUST_0, 60 trials/cell)
+
+| arm | cliff | vs BASE |
+|---|---|---|
+| BASELINE (merged, ratio gate, R_suffix=1) | −13.89 | — |
+| +Change 1 COUNT admission ALONE (R_suffix=1) | −13.89 | +0.00 |
+| +Change 2 SUFFIX combine R_suffix=4, esno×1 | **−16.07** | **+2.18** |
+| +Change 2 SUFFIX combine R_suffix=4, esno×√R | −16.07 | +2.18 |
+| +Change 2 SUFFIX combine R_suffix=4, esno×R | −16.07 | +2.18 |
+| +Change 2 SUFFIX combine R_suffix=8 (R_base=4) | −17.82 | +3.93 |
+
+- **Change 1 ALONE does NOT unblock sub-−14** (−13.89). Critical nuance: at R_suffix=1 the
+  ratio gate is NOT the only clamp — the **single-copy GF16 content** at R¼/K=13 itself cliffs at
+  −14 (= the §16 FEC-reach floor −14.03 / base floor −14.68). Removing the ratio gate is NECESSARY
+  but not SUFFICIENT; the content must also be deepened. (This refines §16's "gate is the SOLE
+  masker" — true at R_base where acquisition was the clamp; at the content floor the content is.)
+- **Change 2 (suffix combining) is the lever that moves the content cliff:** +2.18 dB @R_suffix=4,
+  +3.93 dB @R_suffix=8 — tracking the measured noncoherent ~+2/doubling. **The §14 verdict
+  "combining belongs on the PREAMBLE not the suffix" was correct ONLY while acquisition was the
+  binding stage (2.0 gate, R_base); once count-admission removes the acquisition clamp the CONTENT
+  binds, and suffix-combining is exactly the right lever — §14's own table (R=8 content −14.68)
+  predicted content tracks combining.** The reframe is NOT falsified by §14; it operates in the
+  regime §14 did not (acquisition clamp removed).
+- **Winning esno policy = ×1** (all three esno scalings give identical −16.07). The combining gain
+  comes from the improved per-tone energy-RATIO separation (summed signal-tone energy grows ∝R,
+  noise std ∝√R → decision-statistic SNR ∝√R), NOT from the absolute Bessel sharpness — so the
+  existing self-normalizing `soft_decode` (auto-sigma from matrix mean) captures it WITHOUT any
+  esno rescale. The `g_ultra_suffix_esno_scale` knob is therefore unnecessary (left at ×1).
+
+### §22.4 Stacked ULTRA cliffs — DOES IT REACH −20? YES (essentially)
+
+| config | R_base | R_suffix | K | repfact | R_frame | per-frame content | establishment |
+|---|---|---|---|---|---|---|---|
+| INCR-0 ULTRA_0 (base-combine only) | 16 | 1 | 8 | 6 | 2 | −13.89 | −16.07 |
+| INCR-0 ULTRA_2 (base-combine only) | 32 | 1 | 5 | 8 | 4 | −13.89 | −16.07 |
+| **REFRAME ULTRA_0** | 8 | 8 | 8 | 6 | 2 | **−17.82** | **−17.82** |
+| **REFRAME ULTRA_2** | 8 | 12 | 5 | 8 | 4 | −17.82 | **−19.91** |
+
+- **REFRAME ULTRA_2 establishment cliff = −19.91 dB SNR3k ≈ the −20 (ULTRA_0-target) goal.** vs
+  INCR-0's −16.07 = **+3.84 dB deeper**. P_est[Rf=4]: 1.00@−17.82, **0.92@−19.91**, 0.29@−21.6.
+- ULTRA_0 (R_frame=2) reaches −17.82 establishment; its −19.91 cell sits at P_est=0.49 — i.e. one
+  notch of R_frame/R_base from −20.
+- **Does NOT reach −24 (ULTRA_2 target).** The per-frame CONTENT cliff plateaus at ~−17.82 even at
+  R_suffix=12/K=5, and the **base-pattern ACQUISITION becomes the co-limiter** at R_base=8
+  (P_count 0.60@−19.9, 0.25@−21.6). To go to −24 needs BOTH deeper R_base (16-32, to push
+  acquisition past −22 as INCR-0's R=16 sweep showed) AND deeper R_suffix/fewer-bits — and the
+  airtime is already 65 s/frame at ULTRA_2. −24 is a NEXT-stage question (acquisition R_base + a
+  longer-integration content), not reachable by this spike's configs.
+
+### §22.5 FAR — the safety gate for removing the ratio gate (CRITICAL)
+
+Pure-noise FAR through the PRODUCTION decode with COUNT admission (NO ratio gate), 4000 trials/band:
+
+| band | sigma | FAR |
+|---|---|---|
+| baseline (~−15) | 14× rms | **0/4000** |
+| ULTRA_0 (~−20, R_base=8 R_suffix=8 K=8) | 42× rms | **0/4000** |
+| ULTRA_2 (~−24, R_base=8 R_suffix=12 K=5) | 64× rms | **0/4000** |
+
+**0 false CONNECT accepts at every band, even at the deepest R / lowest rate / smallest message.**
+The combined noise ALSO sums, but the count gate (7/16) + CRC12 (2⁻¹²) + 2-bit type hold — confirming
+§16's gate-OFF 0/4000 extends to the deep-R count-admission + suffix-combining path. **Removing the
+scale-invariant ratio gate is FAR-safe** (the count+CRC backstop is the real defense, as Q65/FT8
+precedent established: Franke-Taylor QEX 2020).
+
+### §22.6 Verdict & cost
+
+- **ULTRA is FEASIBLE (reframed): −20 reached** (ULTRA_2 establish −19.91, +3.84 dB over INCR-0),
+  FAR-clean. The two blockers were correctly pinned by INCR-0; removing BOTH (count-admission +
+  suffix-combining) delivers the −20 tier. **GO for −20.**
+- **−24 NOT reached** — the next clamp is the base-pattern ACQUISITION at deep R_base (count floor)
+  + the content plateau; −24 needs deeper R_base (16-32) stacked with the suffix combining and is
+  the next-stage spike (with the airtime cost: ULTRA_2 here is 65 s/frame).
+- **Cost / airtime:** ULTRA_0 frame 14.0 s (air 28 s @Rf2); ULTRA_2 frame 16.3 s (air 65 s @Rf4).
+  Consistent with the §15 ULTRA "multi-minute frames, ~0.3-1.5 bps, when-all-else-fails" character.
+- **Production-readiness gaps (NOT done — this is a feasibility spike):** (a) HW re-validate on
+  IONOS (sim is AWGN; fading decorrelates the reps — the frame-rep P_est is the optimistic bound);
+  (b) the count-admission flag would need to be SCOPED to the ULTRA tier (CONNECT-only is already
+  enforced; but production must not drop the ratio gate at the OFDM-operating tiers — at good SNR
+  the metric is ≥7 so the gate decision is identical, throughput-neutral, but this needs the §5-style
+  scoped wiring); (c) the buffer ceiling (1024) + R_suffix on-wire layout need the §19.4/§20.3-style
+  cross-layer producer/consumer audit before merge. Byte-identical-OFF is verified (53/53, the §21
+  data-ACK wire-identical assert passes with FEC+combining ON).

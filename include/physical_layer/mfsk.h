@@ -107,6 +107,31 @@ public:
 		if (r > MAX_CONNECT_PREAMBLE_REPS) r = MAX_CONNECT_PREAMBLE_REPS;
 		return r * connect_pattern_nsymb;
 	}
+	// ULTRA reframe spike (Change 2 — SUFFIX combining). The INCR-0 finding was
+	// that base-pattern combining (connect_preamble_reps) deepens ACQUISITION to
+	// −20/−23 but NOT the FEC CONTENT (which the scale-invariant ratio gate masked
+	// at ~−14). §14 had concluded "combining belongs on the PREAMBLE not the suffix"
+	// — but that was while ACQUISITION was the clamp (2.0 gate, content already
+	// solved to −14.68 at R=1). Once count-based admission (Change 1) removes the
+	// ratio clamp, the CONTENT becomes the binding stage again, and §14's own table
+	// shows content tracks combining (R=8 content −14.68). This knob emits the FEC
+	// codeword connect_suffix_reps times consecutively AFTER all base reps; the RX
+	// noncoherently sums the per-tone ENERGY of each suffix rep before the GF16 BP
+	// soft-decode, deepening the content reach ~+2.2-2.5 dB/doubling (the same
+	// noncoherent square-law integration the base combining gets). reps=1 (default)
+	// → byte-identical to the merged §20 path. CONNECT-only.
+	static const int MAX_CONNECT_SUFFIX_REPS = 16;
+	int connect_suffix_reps;   // default 1 (set in init())
+	// On-wire suffix symbol count = R_suffix × ctrl_suffix_len() (the coded N when
+	// FEC is on). Each rep carries the SAME codeword; the per-rep-LOCAL hop index
+	// (s within the codeword, NOT a continued abs index) keeps every rep's symbol s
+	// on the SAME expected bin so the RX can sum rep-r symbol s onto rep-0 symbol s.
+	int ctrl_suffix_total_nsymb() const {
+		int r = connect_suffix_reps;
+		if (r < 1) r = 1;
+		if (r > MAX_CONNECT_SUFFIX_REPS) r = MAX_CONNECT_SUFFIX_REPS;
+		return r * ctrl_suffix_len();
+	}
 	// Soft energy-ratio sub-gate for CONNECT-handshake / ACK-SNR MFSK suffix
 	// decode (telecom_system.cc decode_ctrl_suffix_from_passband +
 	// detect_ack_snr_from_passband). ofdm.detect_ack_pattern returns

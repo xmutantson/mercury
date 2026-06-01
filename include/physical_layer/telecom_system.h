@@ -254,6 +254,16 @@ public:
 	// count (connect_base_total_nsymb()).
 	int  set_connect_preamble_reps(int reps);
 
+	// ULTRA reframe spike (Change 2 — SUFFIX combining): set the CONNECT
+	// suffix-combining factor R_suffix. R_suffix>1 → ack_mfsk.connect_suffix_reps=R
+	// (TX emits the FEC codeword R times back-to-back after all base reps; RX sums
+	// the per-tone ENERGY across the R reps before the GF16 BP soft-decode) and
+	// re-derive ctrl_suffix_pattern_passband_samples. MUST be called AFTER
+	// load_configuration AND after set_suffix_fec (the suffix length depends on FEC).
+	// R clamped to [1, cl_mfsk::MAX_CONNECT_SUFFIX_REPS]. R=1 = byte-identical (off).
+	// Returns the on-wire suffix symbol count (ctrl_suffix_total_nsymb()).
+	int  set_connect_suffix_reps(int reps);
+
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,
 	                                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,

@@ -4999,6 +4999,305 @@ static void test_ultra_stacked_establishment_cliff_sweep() {
 }
 
 // =============================================================================
+// ULTRA REFRAME FEASIBILITY SPIKE — count-based admission + SUFFIX combining.
+// SIM ONLY. INCR-0 found the 4 designed levers SATURATE at ~−14 (the per-frame
+// content cliff stays −13.89 for A/B/C alone) because (1) the admission `metric`
+// is a SCALE-INVARIANT energy RATIO (combining can't lift it → it gates the
+// decode off at ~−14 regardless of FEC/combining strength) and (2) combining was
+// on the base PREAMBLE, not the suffix FEC content. The matched-COUNT detection
+// (combining-aware) is alive to −20 (R=16) / −23 (R=32) — the headroom EXISTS.
+//
+// This reframe measures whether removing BOTH blockers reaches −20 (ULTRA_0):
+//   Change 1 — COUNT-BASED ADMISSION: drop the scale-invariant ratio sub-gate,
+//     admit on the hard matched-count (7/16) + CRC12 + 2-bit type FAR backstop.
+//   Change 2 — SUFFIX COMBINING: emit the FEC codeword R_suffix times, SUM the
+//     per-tone energies across reps before the GF16 BP soft-decode (so the FEC
+//     content reach deepens with R_suffix, the way base combining deepened
+//     detection — +2.2-2.5 dB/doubling).
+//
+// Drives the PRODUCTION decode_ctrl_suffix_from_passband (real base-detect →
+// count/ratio admission → decode_suffix_energies[×R_suffix sum] → gf16ra::
+// soft_decode) — the SAME path §19/§20 deploy on HW. Lever D (frame repetition)
+// is modeled P_est = 1-(1-p_frame)^R_frame as in INCR-0.
+// =============================================================================
+
+// Spike control hooks (defined in telecom_system.cc; SIM-only, default OFF →
+// byte-identical merged §16/§20 behavior).
+extern void cl_telecom_system_set_ultra_count_admission(bool on);
+extern void cl_telecom_system_set_ultra_suffix_esno_scale(double s);
+
+// Configure an ULTRA-reframe operating point and measure the per-frame content
+// cliff (P=0.5 on the production decode) + the combining-aware count-detection
+// floor (P_baseMatched>=thr) over an AWGN SNR3k sweep. count_admission toggles
+// Change 1; R_suffix>1 + esno_scale toggle Change 2 (esno_scale = the Es/No
+// multiplier the combiner passes the Bessel intrinsic; the test sweeps it). The
+// per-frame content cliff is returned via *out_frame_cliff (1e9 if P=0.5 is never
+// reached on the grid); the establishment cliff (lever-D modeled) via *out_est_cliff.
+static void ultra_reframe_one(const char* label, int repfact, int K,
+                              int R_base, int R_suffix, double esno_scale,
+                              bool count_admission, int R_frame,
+                              double* out_frame_cliff, double* out_est_cliff)
+{
+	if (out_frame_cliff) *out_frame_cliff = 1e9;
+	if (out_est_cliff)   *out_est_cliff   = 1e9;
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) { printf("    [%s] no CONNECT pattern, skip\n", label); return; }
+
+	// Bring up coded path, set (repfact,K) [levers A+C], base reps [combine R_base],
+	// THEN suffix reps [Change 2] — order matters: set_connect_suffix_reps reads the
+	// coded ctrl_suffix_len() so it must follow set_suffix_fec + configure_k.
+	ts.set_suffix_fec(true, repfact);
+	int N = gf16ra::configure_k(repfact, K);
+	gf16ra::init();
+	ts.set_connect_preamble_reps(R_base);
+	ts.set_connect_suffix_reps(R_suffix);
+	const int coded_len = ts.ack_mfsk.ctrl_suffix_len();
+	if (coded_len != N) { printf("    [%s] ctrl_suffix_len(%d) != N(%d)\n", label, coded_len, N); return; }
+	const int base_total  = ts.ack_mfsk.connect_base_total_nsymb();
+	const int suffix_total= ts.ack_mfsk.ctrl_suffix_total_nsymb();
+	const int total_sym   = base_total + suffix_total;
+	const double Rrate    = (double)K / N;
+	const int msg_bits    = gf16ra::msg_bits();
+	const double frame_ms = total_sym * 24.33;
+	const double air_ms   = frame_ms * R_frame;
+
+	const double fs   = ts.sampling_frequency;
+	const int    Mdec = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	const int    conn_thr = ts.ack_mfsk.connect_match_threshold;
+
+	// Engage the spike levers for the decode (Change 1 + the Change-2 esno lift).
+	cl_telecom_system_set_ultra_count_admission(count_admission);
+	cl_telecom_system_set_ultra_suffix_esno_scale(esno_scale);
+
+	// Payload masked to the message capacity (K<13 drops the high payload bits).
+	uint64_t pl_mask = (msg_bits - 2 >= 64) ? ~0ULL : ((1ULL << (msg_bits - 2)) - 1ULL);
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	p38 &= pl_mask;
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead = 4096; const int total_pb = n_sig + 2*lead;
+	std::vector<double> clean((size_t)total_pb, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+	if (written != n_sig) {
+		printf("    [%s] generate size mismatch (%d vs %d) — buffer ceiling? total_sym=%d\n",
+			label, written, n_sig, total_sym);
+		cl_telecom_system_set_ultra_count_admission(false);
+		cl_telecom_system_set_ultra_suffix_esno_scale(1.0);
+		ts.set_connect_suffix_reps(1); ts.set_connect_preamble_reps(1);
+		ts.set_suffix_fec(false); gf16ra::configure(2);
+		return;
+	}
+	double psum = 0.0; for (int i=0;i<n_sig;i++){ double v=clean[(size_t)(lead+i)]; psum+=v*v; }
+	const double p_sig = psum / n_sig; const double sig_rms = std::sqrt(p_sig);
+	if (!(sig_rms > 0.0)) { printf("    [%s] signal RMS=0\n", label); return; }
+
+	const double mults[] = { 8.0, 11.0, 14.0, 18.0, 22.0, 28.0, 34.0, 42.0, 52.0, 64.0, 80.0 };
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 60;
+	std::vector<double> work((size_t)total_pb, 0.0);
+	printf("    [%s] R=%.3f(repfact=%d) K=%d N=%d | R_base=%d(base=%dsym) R_suffix=%d(suffix=%dsym) esno×%.2f | admit=%s | R_frame=%d | msg=%dbits | frame %.1fs air %.1fs | total=%dsym\n",
+		label, Rrate, repfact, K, N, R_base, base_total, R_suffix, suffix_total, esno_scale,
+		count_admission?"COUNT":"ratio", R_frame, msg_bits, frame_ms/1000.0, air_ms/1000.0, total_sym);
+	printf("      (sigma/rms : SNR3k_dB : P_baseMatched>=%d : P_frameContentDecode : P_est[Rf=%d])\n", conn_thr, R_frame);
+
+	double frame_cliff = 1e9, est_cliff = 1e9;
+	for (int si = 0; si < NS; si++) {
+		const double sigma = mults[si] * sig_rms;
+		std::mt19937 rng((uint32_t)(0x0DEF0000u ^ (repfact*7919) ^ (K*131) ^ (R_base*17) ^ (R_suffix*53) ^ si));
+		std::normal_distribution<double> nd(0.0, sigma);
+		int base_ok = 0, decoded_ok = 0;
+		for (int t = 0; t < NT; t++) {
+			for (int i=0;i<total_pb;i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+			// combining-aware base matched-count (diagnostic — the acquisition statistic).
+			int dec_size = total_pb / Mdec;
+			std::vector<std::complex<double> > bb((size_t)dec_size, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(work.data(), total_pb, bb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+			int rm = 0, rbo = -1;
+			ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+				ts.ack_mfsk.connect_pattern_nsymb, ts.ack_mfsk.connect_tones, 8,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+				ts.ack_mfsk.stream_offsets, &rm, 0, nullptr, &rbo,
+				/*reserve_after=*/ts.ack_mfsk.ctrl_suffix_total_nsymb(), nullptr,
+				/*always_fine=*/false, /*combine_reps=*/R_base);
+			if (rm >= conn_thr) base_ok++;
+			// full production establishment decode (base detect[combine] + count/ratio
+			// admission + suffix-combined FEC content soft-decode).
+			mfsk_ctrl_frame_type rx_type; uint64_t rx_p38=0; uint16_t rx_crc12=0; int rx_matched=0;
+			bool ok = ts.decode_ctrl_suffix_from_passband(
+				work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+				prod_crc12_cb, &arq);
+			if (ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38) decoded_ok++;
+		}
+		double Pb = (double)base_ok / NT;
+		double Pf = (double)decoded_ok / NT;
+		double Pest = 1.0 - std::pow(1.0 - Pf, (double)R_frame);
+		double snr = snr3k_db(p_sig, sigma, fs);
+		printf("      %6.1f : %7.2f : %.2f : %.2f : %.2f\n", mults[si], snr, Pb, Pf, Pest);
+		if (Pf  >= 0.5 && snr < frame_cliff) frame_cliff = snr;
+		if (Pest>= 0.5 && snr < est_cliff)   est_cliff   = snr;
+	}
+	printf("    [%s] ==> per-frame content cliff = %.2f dB SNR3k | establishment cliff (R_frame=%d) = %.2f dB | airtime %.1fs\n",
+		label, frame_cliff, R_frame, est_cliff, air_ms/1000.0);
+	if (out_frame_cliff) *out_frame_cliff = frame_cliff;
+	if (out_est_cliff)   *out_est_cliff   = est_cliff;
+
+	// restore process-global state (levers OFF, codec default) for later tests.
+	cl_telecom_system_set_ultra_count_admission(false);
+	cl_telecom_system_set_ultra_suffix_esno_scale(1.0);
+	ts.set_connect_suffix_reps(1);
+	ts.set_connect_preamble_reps(1);
+	ts.set_suffix_fec(false);
+	gf16ra::configure(2);
+}
+
+// FAR on pure noise through a given reframed operating point's PRODUCTION decode
+// with COUNT-based admission (no ratio gate). Verifies the count gate (7/16) +
+// CRC12 + 2-bit type still hold (0 false CONNECT accepts) at deep R, where the
+// combined noise also sums. Returns false-accept count over FT trials.
+static int ultra_reframe_far(int repfact, int K, int R_base, int R_suffix,
+                             double esno_scale, double far_sigma_mult, int FT)
+{
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	ts.set_suffix_fec(true, repfact);
+	gf16ra::configure_k(repfact, K); gf16ra::init();
+	ts.set_connect_preamble_reps(R_base);
+	ts.set_connect_suffix_reps(R_suffix);
+	cl_telecom_system_set_ultra_count_admission(true);
+	cl_telecom_system_set_ultra_suffix_esno_scale(esno_scale);
+
+	const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead = 4096; const int total_pb = n_sig + 2*lead;
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	p38 &= ((1ULL << (gf16ra::msg_bits()-2)) - 1ULL);
+	uint8_t by[5]; pack_ctrl_typed40_msb(by, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)by,5)&0x0FFF;
+	std::vector<double> c((size_t)total_pb, 0.0);
+	int wr = ts.generate_ctrl_suffix_pattern_passband(c.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+	int far_accepts = 0;
+	if (wr == n_sig) {
+		double psum=0.0; for(int i=0;i<n_sig;i++){double v=c[(size_t)(lead+i)];psum+=v*v;}
+		double sig_rms = std::sqrt(psum/n_sig);
+		double far_sigma = far_sigma_mult * sig_rms;
+		std::mt19937 frng(0xFADEC0DEu ^ (uint32_t)(R_base*31 + R_suffix*7 + K));
+		std::normal_distribution<double> fnd(0.0, far_sigma);
+		std::vector<double> w((size_t)total_pb, 0.0);
+		for (int t=0;t<FT;t++) {
+			for (int i=0;i<total_pb;i++) w[(size_t)i]=fnd(frng);
+			mfsk_ctrl_frame_type rt; uint64_t rp=0; uint16_t rc=0; int rmm=0;
+			if (ts.decode_ctrl_suffix_from_passband(w.data(), total_pb, &rt,&rp,&rc,&rmm, prod_crc12_cb, &arq))
+				far_accepts++;
+		}
+	} else {
+		far_accepts = -1;  // generate failed (buffer); flag for the caller
+	}
+	cl_telecom_system_set_ultra_count_admission(false);
+	cl_telecom_system_set_ultra_suffix_esno_scale(1.0);
+	ts.set_connect_suffix_reps(1); ts.set_connect_preamble_reps(1);
+	ts.set_suffix_fec(false); gf16ra::configure(2);
+	return far_accepts;
+}
+
+// THE reframe feasibility measurement: per-change breakdown + stacked ULTRA_0/2.
+static void test_ultra_reframe_establishment_cliff_sweep() {
+	const char* name = "ultra_reframe_establishment_cliff_sweep";
+	printf("  [MEASURE] ULTRA REFRAME feasibility spike — count-admission + SUFFIX combining:\n");
+	printf("    INCR-0 saturated at ~−14 (scale-invariant ratio gate + base-only combining). Does the reframe reach −20?\n");
+
+	double fc, ec;
+	double base_fc=0, base_ec=0;
+	double ca_fc=0;                         // count-admission alone
+	double sc1_fc=0, scR_fc=0, scS_fc=0;    // suffix-combining esno-scale variants
+	double u0_fc=0, u0_ec=0, u2_fc=0, u2_ec=0;
+
+	// --- BASELINE: merged stack, ratio gate ON, no suffix combining (= INCR-0 BASE). ---
+	printf("    --- BASELINE (merged: repfact=3 R¼, K=13, R_base=4, ratio gate, R_suffix=1) ---\n");
+	ultra_reframe_one("BASE", 3, 13, 4, 1, 1.0, /*count_admission=*/false, 1, &base_fc, &base_ec);
+
+	// --- Change 1 alone: COUNT admission (drop the ratio gate), everything else baseline. ---
+	printf("    --- CHANGE 1 alone (COUNT admission, repfact=3 K=13 R_base=4, R_suffix=1) — does it UNBLOCK sub-−14? ---\n");
+	ultra_reframe_one("C1:count", 3, 13, 4, 1, 1.0, /*count_admission=*/true, 1, &ca_fc, &ec);
+
+	// --- Change 2 alone: SUFFIX combining R=4, count admission on, sweep esno-scale. ---
+	printf("    --- CHANGE 2 alone (SUFFIX combining R_suffix=4 + COUNT admission, repfact=3 K=13 R_base=4) — esno-scale sweep ---\n");
+	ultra_reframe_one("C2:R4 esno×1",  3, 13, 4, 4, 1.0,          true, 1, &sc1_fc, &ec);
+	ultra_reframe_one("C2:R4 esno×√R", 3, 13, 4, 4, std::sqrt(4.0), true, 1, &scS_fc, &ec);
+	ultra_reframe_one("C2:R4 esno×R",  3, 13, 4, 4, 4.0,          true, 1, &scR_fc, &ec);
+	// pick the best (deepest) esno-scale for the deeper-R points + stack.
+	double best_scale = 1.0; double best_fc = sc1_fc;
+	if (scS_fc < best_fc) { best_fc = scS_fc; best_scale = std::sqrt(4.0)/2.0; } // = √R per doubling ⇒ used as R_suffix-relative below
+	if (scR_fc < best_fc) { best_fc = scR_fc; best_scale = 1.0; }
+	// (best_scale is interpreted per-config below as esno = base 4.0 × f(R_suffix); we
+	//  carry the WINNING POLICY as a label and recompute the multiplier per R_suffix.)
+	int esno_policy = 0; // 0=×1, 1=×√R, 2=×R
+	{ double m1=sc1_fc, ms=scS_fc, mr=scR_fc; double mn=m1; esno_policy=0;
+	  if (ms<mn){mn=ms;esno_policy=1;} if (mr<mn){mn=mr;esno_policy=2;} }
+	auto esno_for = [&](int Rs)->double {
+		if (esno_policy==2) return (double)Rs;
+		if (esno_policy==1) return std::sqrt((double)Rs);
+		return 1.0;
+	};
+	printf("    --- CHANGE 2 deeper (SUFFIX combining R_suffix=8, winning esno policy=%s, count admit, repfact=3 K=13 R_base=4) ---\n",
+		esno_policy==2?"×R":(esno_policy==1?"×√R":"×1"));
+	ultra_reframe_one("C2:R8", 3, 13, 4, 8, esno_for(8), true, 1, &fc, &ec);
+
+	// --- STACKED ULTRA_0: count + suffix-combine + lower-rate + fewer-bits + R_frame. ---
+	// Keep total symbols under the RX buffer ceiling (~780): R_base=8(128) + R_suffix=8×N.
+	printf("    --- STACKED ULTRA_0 (COUNT + R_suffix=8 + A:repfact6/R⅐ + C:K8 + B:R_base=8 + D:R_frame2) → target −20 ---\n");
+	ultra_reframe_one("ULTRA_0", /*repfact=*/6, /*K=*/8, /*R_base=*/8, /*R_suffix=*/8, esno_for(8), true, 2, &u0_fc, &u0_ec);
+
+	printf("    --- STACKED ULTRA_2 (COUNT + R_suffix=12 + A:repfact8/R⅑ + C:K5 + B:R_base=8 + D:R_frame4) → target −24 ---\n");
+	ultra_reframe_one("ULTRA_2", /*repfact=*/8, /*K=*/5, /*R_base=*/8, /*R_suffix=*/12, esno_for(12), true, 4, &u2_fc, &u2_ec);
+
+	// --- FAR on pure noise through the count-admission path at deep R (the safety gate). ---
+	const int FT = 4000;
+	int far_base  = ultra_reframe_far(3, 13, 4, 1,  1.0,        14.0, FT);  // baseline-ish noise band
+	int far_u0    = ultra_reframe_far(6,  8, 8, 8,  esno_for(8), 42.0, FT); // ULTRA_0 deep band (~−20)
+	int far_u2    = ultra_reframe_far(8,  5, 8, 12, esno_for(12),64.0, FT); // ULTRA_2 deep band (~−24)
+
+	printf("    ========================= ULTRA REFRAME FEASIBILITY SUMMARY =========================\n");
+	printf("    per-frame CONTENT decode cliffs (SNR3k dB, deeper=better):\n");
+	printf("      BASELINE (merged, ratio gate)          : %.2f\n", base_fc);
+	printf("      +Change1 COUNT admission alone          : %.2f  (%+.2f vs base)  [unblocks sub-−14? %s]\n",
+		ca_fc, base_fc - ca_fc, (ca_fc < base_fc - 0.4) ? "YES" : "no");
+	printf("      +Change2 SUFFIX combine R=4 esno×1      : %.2f  (%+.2f vs base)\n", sc1_fc, base_fc - sc1_fc);
+	printf("      +Change2 SUFFIX combine R=4 esno×√R     : %.2f  (%+.2f vs base)\n", scS_fc, base_fc - scS_fc);
+	printf("      +Change2 SUFFIX combine R=4 esno×R      : %.2f  (%+.2f vs base)\n", scR_fc, base_fc - scR_fc);
+	printf("      winning esno policy = %s\n", esno_policy==2?"×R":(esno_policy==1?"×√R":"×1"));
+	printf("    stacked establishment cliffs (with lever-D frame repetition):\n");
+	printf("      ULTRA_0 content=%.2f  establish=%.2f  (target −20)  reaches −20? %s\n",
+		u0_fc, u0_ec, (u0_ec <= -20.0) ? "YES" : "no");
+	printf("      ULTRA_2 content=%.2f  establish=%.2f  (target −24)  reaches −24? %s\n",
+		u2_fc, u2_ec, (u2_ec <= -24.0) ? "YES" : "no");
+	printf("    FAR (pure noise, %d trials, count-admission path, NO ratio gate):\n", FT);
+	printf("      baseline band   : %s\n", far_base<0?"(gen fail)":(far_base==0?"0 false accepts":"NONZERO"));
+	printf("      ULTRA_0 ~−20 band: %d/%d false CONNECT accepts\n", far_u0<0?0:far_u0, FT);
+	printf("      ULTRA_2 ~−24 band: %d/%d false CONNECT accepts\n", far_u2<0?0:far_u2, FT);
+	if (far_base>=0) printf("      baseline band   : %d/%d false CONNECT accepts\n", far_base, FT);
+	printf("    =====================================================================================\n");
+
+	// Infra-ran gate + FAR safety gate (the dB verdict is the log — this is a
+	// measurement spike). Require: BASELINE + ULTRA_0 reached P=0.5 on the grid,
+	// AND count-admission FAR clean at every measured band (the safety gate for
+	// removing the scale-invariant ratio gate).
+	if (!(base_fc < 1e8 && u0_fc < 1e8)) {
+		test_fail(name, "BASELINE or ULTRA_0 content never reached P=0.5 on the grid (widen SNR axis / buffer ceiling?)"); return;
+	}
+	if (far_u0 > 0 || far_u2 > 0 || far_base > 0) {
+		char b[200]; snprintf(b,sizeof(b),
+			"count-admission FAR nonzero (base %d, U0 %d, U2 %d / %d) — count+CRC backstop broke at deep R",
+			far_base<0?0:far_base, far_u0<0?0:far_u0, far_u2<0?0:far_u2, FT);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // §21 PRODUCTION CAP/adaptive wiring — gate tests (tier2-suffix-fec-design.md §21)
 // =============================================================================
 //
@@ -5377,6 +5676,16 @@ int run_mfsk_ctrl_codec_tests() {
 	// establishment-cliff move toward −20 (ULTRA_0) / −24 (ULTRA_2) SNR3k, with
 	// per-lever breakdown + a saturation flag + FAR. The go/no-go for the full tier.
 	test_ultra_stacked_establishment_cliff_sweep();
+
+	// ULTRA REFRAME feasibility spike (count-based admission + SUFFIX combining):
+	// INCR-0 found the 4 designed levers SATURATE at ~−14 because the admission
+	// metric is a scale-invariant RATIO (combining can't lift it) and combining was
+	// on the base preamble, not the suffix FEC content. This test drives the
+	// PRODUCTION decode with Change 1 (count-based admission, drop the ratio gate)
+	// + Change 2 (suffix-energy combining across R_suffix reps) and measures whether
+	// the reframe reaches −20 (ULTRA_0) / −24 (ULTRA_2), with a per-change breakdown
+	// and a deep-R count-admission FAR safety gate.
+	test_ultra_reframe_establishment_cliff_sweep();
 
 	// §21 PRODUCTION CAP/adaptive wiring (tier2-suffix-fec-design.md §21):
 	// the merge-prerequisite. Interop matrix, ACK throughput-neutrality
