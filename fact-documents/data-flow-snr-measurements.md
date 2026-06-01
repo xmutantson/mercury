@@ -1,13 +1,15 @@
 # Data-Flow Audit: `measurements.SNR_uplink` / `measurements.SNR_downlink`
 
-**Status**: Authoritative as of 2026-05-30. §1–§6 cover the SUPERSHIFT
+**Status**: Authoritative as of 2026-05-31. §1–§6 cover the SUPERSHIFT
 SNR-sentinel PRODUCER fix (climb follow-up #1, "Option A", shipped on
 `fix/climb-engine` @ `446887c`). **§1.7 + §7 cover the ENABLEMENT fix
 (climb follow-up #1b, "Option 1") that lands ON TOP of `446887c`** — it
 breaks the bootstrap deadlock that kept the §1.5 producer from EVER running
-on the CMD's forward pattern-ACK climb. Every future change that writes or
-reads either field — OR that touches `turbo_snr_ack_enabled` (the decode-
-branch selector that gates the §1.5 producer) — MUST update this document.
+on the CMD's forward pattern-ACK climb. **§8 (2026-05-31, READ+PLAN ONLY, NO
+code shipped) audits the PROPOSED "suffix the TRUE OFDM SNR" climb-throttle fix
+and finds the literal swap INFEASIBLE — see §8 verdict.** Every future change
+that writes or reads either field — OR that touches `turbo_snr_ack_enabled` (the
+decode-branch selector that gates the §1.5 producer) — MUST update this document.
 
 **The bootstrap deadlock (follow-up #1b, the §1.5 producer never ran)**: the
 §1.5 producer at `arq_common.cc:5555` runs ONLY inside
@@ -521,3 +523,323 @@ crawling one rung at a time.
   wire failure); a reminder that "the connect-path state is not what the steady-
   state code assumes" — checked here for `turbo_snr_ack_enabled` (ctor/reset
   init false; §1.7 is the first forward-climb producer of true on the CMD).
+
+---
+
+## §8 PROPOSED "suffix the TRUE OFDM SNR" fix — AUDIT + FEASIBILITY (2026-05-31, read+plan only, NO code shipped)
+
+**Driving work item**: the unpinned climb is throttled because the elevator
+(`supershift_retrigger_target` via the re-trigger gate, `arq_commander.cc:4722-4757`)
+at CONFIG_0 computes `get_configuration(measurements.SNR_uplink − SUPERSHIFT_MARGIN_DB)`,
+and on a *fixed* channel `SNR_uplink` reads only **~1.0 dB at CONFIG_0** but **~15.0 dB
+at CONFIG_4**. The proposed fix (as handed to this audit): make the RSP suffix the TRUE
+OFDM data-frame SNR (`received_message_stats.SNR`, the canonical producer
+`arq_common.cc:6087`) when it has just decoded OFDM data, so SNR_uplink reads ~15 at
+CONFIG_0 and the elevator jumps CONFIG_0→CONFIG_13 (bounded by RETRIGGER_MAX_LEAP=13).
+
+**THIS SECTION'S VERDICT (up front): the literal "swap the suffix source" fix is
+INFEASIBLE at the one boundary that matters (ROBUST→CONFIG_0), because at that boundary
+there is NO OFDM SNR for the RSP to suffix. The 1.0-vs-15.0 split is NOT a
+control-vs-OFDM *estimator* choice made at one site — it is a TRANSITION-ORDERING
+artifact: the SET_CONFIG that PROMOTES to CONFIG_0 is decoded by the RSP while it is
+still on the OLD (ROBUST = MFSK) config, whose SNR estimator is a hardcoded `0.0`. The
+real fix is larger than a suffix-source swap; §8.5 describes what it actually requires.**
+
+### §8.1 EXACT production of `measurements.SNR_uplink` at the elevator (answer to task #1)
+
+The elevator consumer is the SUPERSHIFT re-trigger, `arq_commander.cc:4722-4723`:
+`turboshift_phase == TURBO_DONE && gear_shift_on == YES && is_ofdm_config(current_configuration)
+&& measurements.SNR_uplink > -90`, body `int snr_ideal = elevator_target_from_snr();`
+(`:4737`). It runs at the TAIL of `process_messages_rx_acks_data()` (the data-ACK pass).
+
+**On the CMD, `measurements.SNR_uplink` has exactly ONE live producer on the climb:**
+the SNR-suffix decode site `arq_common.cc:5576`
+(`measurements.SNR_uplink = snr_uplink_from_suffix(decoded_snr);`), inside
+`receive_ack_pattern()`'s `if(turbo_snr_ack_enabled)` branch (`:5537`). The canonical
+LDPC-decode producer `arq_common.cc:6087` does NOT run on the CMD during the climb (the
+CMD decodes no LDPC data while climbing — §1.2 note). So whatever the CMD reads at the
+elevator is the value `decoded_snr` carried by the LAST SET_CONFIG-ACK suffix it decoded.
+
+**`decoded_snr` = the RSP's `measurements.SNR_uplink` at the moment the RSP built that
+suffix** (`arq_responder.cc:1130`, `send_ack_pattern_with_snr((float)measurements.SNR_uplink)`),
+**quantized** through the MFSK suffix codec (round-trip `snr_to_tone`→`tone_to_snr`,
+`mfsk.cc:594-611`). And the RSP's `SNR_uplink` is set by the SAME canonical producer
+`arq_common.cc:6087` (`measurements.SNR_uplink = received_message_stats.SNR;`) — which on
+the RSP DOES run, on EVERY decoded frame (the block is gated only by
+`received_message_stats.message_decoded==YES`, `arq_common.cc:5959` — NOT by data-vs-control
+nor by modulation). So the RSP's `SNR_uplink` = `received_message_stats.SNR` of **the last
+frame the RSP decoded**.
+
+**`received_message_stats.SNR` is set in `telecom_system.cc` and is a GENUINELY DIFFERENT
+estimator per modulation** (answer (a), confirmed by code — NOT a propagation lag (b)):
+- **`telecom_system.cc:2730`**: `if(M == MOD_MFSK) receive_stats.SNR = 0.0;` — a HARDCODED
+  PLACEHOLDER with the comment `// TODO: estimate SNR from peak tone energy vs noise
+  energy`. **MFSK has NO real SNR estimator.** Round-tripped through the WB suffix codec,
+  `0.0` → `snr_to_tone((0+5)/2+0.5)=3` → `tone_to_snr(3)=3*2−5 = 1.0`. **THAT is the 1.0.**
+- **`telecom_system.cc:2738` (LS) / `:2766`/`:2770` (ZF, via `ofdm.measure_SNR`,
+  `ofdm.cc:2111-2124`, `SNR=−10·log10(EVM_variance)`)**: the REAL OFDM data-frame SNR
+  (~15 at a clean/moderate channel). THAT is the 15.0.
+- ROBUST_0/1/2 are MFSK (`telecom_system.cc:4876-4877` set `new_mfsk_M`=32/16;
+  `is_robust_config` ⇒ MFSK), so a robust-config decode ALWAYS yields `SNR=0.0`.
+
+**WHY 1.0 at CONFIG_0 but 15.0 at CONFIG_4 on a FIXED channel — the transition-ordering
+artifact (the crux)**: the gearshift SET_CONFIG is sent by the CMD on the OLD
+(`current_configuration`) config — the legacy LDPC control-TX path
+`arq_commander.cc:1022-1028` (`set_mfsk_ctrl_mode(false); send_batch();`) emits a full
+frame on the CURRENT config (SET_CONFIG is NOT in the MFSK-suffix PHY-swap list, which
+covers only START_CONNECTION `:925` and TEST_CONNECTION `:935`). The RSP decodes that
+SET_CONFIG on the OLD config and ACKs on the OLD config (it loads the NEW
+`data_configuration` only AFTER sending the ACK — `arq_responder.cc:1140-1143`, and the
+SET_CONFIG handler defers the load to `acknowledging_control`, `:2503-2507`). Therefore:
+- The promotion **ROBUST_2 → CONFIG_0** SET_CONFIG is decoded by the RSP while on
+  **ROBUST_2 (MFSK)** ⇒ `received_message_stats.SNR = 0.0` ⇒ RSP `SNR_uplink = 0.0` ⇒
+  suffix `0.0` ⇒ round-trips to **~1.0** on the CMD. The CMD then runs the elevator at
+  `current_configuration == CONFIG_0` reading **SNR_uplink ≈ 1.0**. ← the throttle.
+- The promotion **CONFIG_0 → CONFIG_1** (any OFDM→OFDM) SET_CONFIG is decoded by the RSP
+  while on **CONFIG_0 (OFDM)** ⇒ `received_message_stats.SNR ≈ 15` ⇒ suffix ~15 ⇒ CMD
+  reads ~15 and the elevator at CONFIG_1+ sees the true SNR. ← "15 at CONFIG_4".
+
+So `SNR_uplink` reads the SNR of the config the modem was on **one rung ago**, and at the
+ROBUST→OFDM boundary "one rung ago" is MFSK (estimator = 0.0). It is BOTH a different
+estimator (a) AND an ordering effect — the estimator difference only bites because the
+promotion frame is carried on the old (robust/MFSK) rung.
+
+**Does `received_message_stats.SNR` (the OFDM value) feed `SNR_uplink`?** Yes, but only
+via the canonical producer `:6087`, which on the CMD does not run on the climb, and on the
+RSP runs for the LAST decode (which at the critical boundary is the MFSK SET_CONFIG, not an
+OFDM frame). The OFDM data-frame SNR the RSP measures while decoding a CONFIG_0 DATA batch
+is NOT relayed to the CMD: the RSP's DATA-ACK send path (`arq_responder.cc:1864-1868`) emits
+a PLAIN MFSK ACK (`set_mfsk_ctrl_mode(true); send_batch();`) with NO SNR suffix
+(`send_ack_pattern_with_snr` is called ONLY on the control SET_CONFIG-ACK path `:1130`,
+never on the data-ACK path). Routing the data-ACK through the SNR decoder was tried (the
+A1 widening) and CAUSED A BUG — §18 / Part N: the widened arm leaked onto the data-ACK
+wait, writing a bogus `SNR_uplink` from the data-ACK tail (`arq_common.cc:5576`); the fix
+`clear_snr_arm_for_data_ack_wait()` deliberately CLOSED that path. So today the OFDM
+data-frame SNR has NO channel back to the CMD's `SNR_uplink` at all.
+
+### §8.2 §5 audit — the FIVE questions for the PROPOSED fix
+
+**Q1 Producers of `measurements.SNR_uplink`** (extends §1; unchanged today):
+- `arq_common.cc:141` ctor sentinel `-99.9` (§1.1).
+- `arq_common.cc:6087` canonical LDPC-decode producer, ALL roles (§1.2). On the RSP this
+  is ALSO the producer of the value the RSP suffixes (it sets RSP `SNR_uplink`).
+- `arq_common.cc:5576` CMD SNR-suffix decode (§1.5) — the only CMD climb producer.
+- `arq_responder.cc:2046` RSP TEST_CONNECTION decode (§1.3); `arq_commander.cc:3869`
+  CMD SET_CONFIG SNR_BASED (§1.4, `SNR_downlink`).
+- **The proposed fix adds NO new producer of `SNR_uplink`. It changes the ARGUMENT to the
+  RSP's existing suffix SEND** (`arq_responder.cc:1130`) — i.e. it changes what
+  `decoded_snr` the CMD's §1.5 producer receives. The producer SITE `:5576` is unchanged.
+
+**Q2 Consumers of `SNR_uplink`** (the fix raises the CONFIG_0 value from ~1.0 to ~15 —
+walk each; consumers enumerated in §2, plus the §15/§16 sites that post-date §2):
+1. **Elevator re-trigger gate** `arq_commander.cc:4722-4757` (the INTENDED consumer; §2.1)
+   — eligibility gate `SNR_uplink > -90` already passes at 1.0; the value feeds
+   `elevator_target_from_snr()` → `get_configuration(SNR_uplink−6)`. Fix EFFECT: target
+   rises from `get_configuration(1−6)=CONFIG_4`-but-clamped to `get_configuration(15−6=9)≈CONFIG_13`,
+   so `gap ≥ SUPERSHIFT_RETRIGGER_CONFIGS` and the elevator JUMPS. **This is the goal.**
+2. **`elevator_target_from_snr()` + `supershift_retrigger_target()`**
+   (`arq_commander.cc:174-186`, `arq.h:819-866`) — the §15/§16 chokepoint both elevator
+   sites share. Reads `SNR_uplink` as `snr_uplink`. **CRITICAL: the §15 `is_ofdm_config(anchor)`
+   conjunct (`arq.h:842-844`) gates the multi-rung jump on the ANCHOR being OFDM, NOT on the
+   SNR value.** A higher CONFIG_0 SNR does NOT bypass this — see §8.3.
+3. **FRAME-UP elevator** `arq_commander.cc:3733` (`elevator_target_from_snr()`; §15.3
+   consumer 2) — same chokepoint, same `is_ofdm_config(anchor)` gate.
+4. **In-turbo SUPERSHIFT jump fallback** `arq_commander.cc:4598` (§2.2) — reached only when
+   `turbo_received_snr ≤ -90`; uses `SNR_uplink` for `effective_snr`, then routed through
+   the §16 ROOT-2 clamp (`arq_commander.cc:4631-4635`, the SAME `supershift_retrigger_target`).
+5. **`finish_turbo_direction` finish/start pick** `arq_commander.cc:3820` (§2.3) — fallback
+   after `turbo_best_snr`; one-shot, picks a sane finish config. Higher value = better pick.
+6. **CMD SET_CONFIG SNR_BASED config selection** `arq_commander.cc:676` (§2.4) — DEAD under
+   the shipped `SUCCESS_BASED_LADDER` default (`arq_common.cc:328`); improvement under
+   SNR_BASED.
+7. **CMD TEST_CONNECTION frame pack** `arq_commander.cc:613` (§2.5) — handshake-time, before
+   any suffix; still sentinel → no change.
+8. **link_status / GEARSHIFT telemetry** `arq_commander.cc:694`, diag dump
+   `arq_common.cc:7177` (§2.6) — logging only.
+9. **RSP turbo ACK+SNR SEND gate** `arq_responder.cc:1122-1124` (§2.7) — this is the SEND
+   gate the fix would MODIFY (see §8.4). It currently reads RSP `SNR_uplink > -90` to decide
+   whether to suffix at all, and passes `(float)SNR_uplink` as the value.
+10. **RSP reverse-SNR pack** `arq_responder.cc:2167` (`SNR_downlink`; §2.8) — unaffected.
+
+**Q3 Valid states (esp. BEFORE the first OFDM decode)**:
+- `-99.9` ctor sentinel (§1.1) / `-99.0` post-turbo reset of `turbo_received_snr` (NOT
+  `SNR_uplink`; `arq_commander.cc:3660`-class). Both `≤ -90` ⇒ "no measurement".
+- `~1.0` — the round-trip of the MFSK placeholder `0.0`. **This is a VALID state the consumers
+  currently see at CONFIG_0** and is the value the elevator is (correctly, per §15) NOT
+  allowed to jump on from a ROBUST anchor. **THE KEY HAZARD STATE: a value that LOOKS like a
+  real measurement (`> -90`) but encodes "MFSK, no real estimate".** `0.0`/`1.0` is
+  indistinguishable from a genuine 0–1 dB OFDM channel by value alone.
+- `~15` — a real OFDM measurement at CONFIG_0+.
+
+**Q4 Invariants each consumer assumes**:
+- Elevator/chokepoint (consumers 1-4): "`SNR_uplink > -90` ⇒ a usable forward-link SNR,"
+  AND (post-§15) "a multi-rung jump additionally requires `is_ofdm_config(anchor)`." The
+  §15 conjunct exists PRECISELY because the value-only invariant was FALSE at deep SNR (the
+  1.0 over-report). **The fix must not weaken the anchor conjunct.**
+- RSP SEND gate (consumer 9): "I only suffix a value I actually measured (`SNR_uplink > -90`)."
+
+**Q5 What the fix changes for each consumer**: the fix raises the value the CMD reads at
+CONFIG_0 from ~1.0 to ~15 *when the underlying frame was genuinely OFDM*. For consumer 1/2/3
+this FLIPS `get_configuration(SNR−6)` from a low config to ~CONFIG_13, which — **only if
+`is_ofdm_config(anchor)` is already true** — licenses the bounded multi-rung jump (the goal).
+For 4/5 it improves a fallback pick. For 6 it improves a dead branch. 7/8/10 unaffected. The
+DANGER consumer is 1/2/3 at a ROBUST anchor — covered in §8.3.
+
+### §8.3 SAFETY — the §15 WGN:-10 over-climb must NOT reopen (answer to task #3)
+
+**VERDICT: a correctly-scoped fix is SAFE — the §15 guard is anchor-gated, not value-gated,
+so raising the CONFIG_0 SNR value cannot reopen the over-climb PROVIDED the fix never makes
+the RSP suffix a high SNR while the decoded frame was a robust/MFSK frame.**
+
+Mechanism, from code:
+- The §15 over-climb is blocked by `is_ofdm_config(anchor)` in `high_confidence_jump`
+  (`arq.h:842-844`), where `anchor == last_data_viable_config`. At WGN:-10 the anchor stays
+  ROBUST (OFDM data never DELIVERS, so §16's `data_anchor_raise_target` `arq.h:740-741` REFUSES
+  the ROBUST→OFDM anchor crossing). With `is_ofdm_config(anchor)==false`,
+  `high_confidence_jump` is FALSE **regardless of the SNR value** — the af14a9e +1 clamp
+  re-applies (`arq.h:862-864`). **A higher SNR value cannot bypass this; the gate ignores the
+  value once the anchor is robust.** (Verified by JJ1, `arq_commander.cc:7779-7809`: even with
+  `snr_uplink_from_suffix(1.0)`→CONFIG_4-ideal, a ROBUST_2 anchor clamps to CONFIG_0.)
+- **Is the fix inert at deep SNR?** At ROBUST_0/1/2 the RSP decodes the SET_CONFIG as MFSK
+  (`telecom_system.cc:2730` ⇒ `received_message_stats.SNR = 0.0`). A correctly-scoped fix
+  substitutes the OFDM SNR ONLY when the last decode was genuinely OFDM at an OFDM config — at
+  ROBUST that condition is FALSE, so the suffix is UNCHANGED (still 0.0→1.0). **The fix must be
+  gated `M != MOD_MFSK && message_decoded==YES` at the RSP suffix-build (or, equivalently,
+  `is_ofdm_config(current_configuration)` at the moment of the decode being relayed).** With
+  that gate, §15's behavior at the cliff is byte-identical.
+- **Can the fix EVER make the suffix report a high SNR while the anchor is still robust?**
+  Only if the RSP decodes a genuine OFDM frame (real SNR ~15) at a moment when the CMD's
+  `last_data_viable_config` is still robust. That window EXISTS (the first OFDM batch at
+  CONFIG_0 decodes, raising the RSP-relayed SNR, before the CMD's anchor has ratcheted to
+  CONFIG_0). **But that high SNR alone cannot over-climb**: the elevator STILL requires
+  `is_ofdm_config(anchor)` (anchor = CMD's `last_data_viable_config`), which is still robust
+  until §16's `data_anchor_raise_target` credits a CONFIG_0 OFDM delivery. So a high suffix +
+  robust anchor ⇒ `high_confidence_jump=false` ⇒ +1 clamp ⇒ NO jump. The §16 anchor-tier gate
+  is the backstop that makes the value-raise safe. **The fix does NOT touch
+  `is_ofdm_config(anchor)`, RETRIGGER_MAX_LEAP, `supershift_proven_ceiling`, or the §16 ROOT-2
+  ladder clamp — all four high-SNR bounds remain.** (RETRIGGER_MAX_LEAP=13 + proven-ceiling
+  still bound the CONFIG_0→CONFIG_13 jump; `arq.h:854-856`, JJ2 `arq_commander.cc:7816-7846`.)
+- **Distinction from §15**: §15 SUPPRESSED climbing on the under-reporting 1.0 by gating on the
+  anchor. The proposed fix CORRECTS the value (~15) at OFDM configs so the elevator works as
+  designed AFTER the anchor reaches OFDM. The two are complementary and BOTH gate on the same
+  `is_ofdm_config(anchor)`; the value-correction is inert until the anchor is OFDM.
+
+### §8.4 Minimal implementation plan (answer to task #4) — and why it is NOT a one-line swap
+
+**The literal "swap the suffix source" (RSP suffixes `received_message_stats.SNR` instead of
+`measurements.SNR_uplink`) does NOT solve the throttle**, for the reason in §8.1: at the
+ROBUST_2→CONFIG_0 promotion, the RSP's most recent decode is the SET_CONFIG **on ROBUST_2
+(MFSK)**, so `received_message_stats.SNR == 0.0` there too — there is NO OFDM SNR at that
+instant. Both the current source (`measurements.SNR_uplink`) and the proposed source
+(`received_message_stats.SNR`) equal `0.0`→`1.0` at the boundary. The estimator is identical
+because the FRAME is the same MFSK SET_CONFIG. Swapping the source is a no-op at the exact
+boundary the task wants to fix.
+
+**What is actually required** (smallest CORRECT change; touches ≥2 layers ⇒ this audit + a
+plan + approval per CLAUDE.md §4 before any code):
+
+The OFDM data-frame SNR the RSP measures at CONFIG_0 must reach the CMD's `SNR_uplink` on a
+path that is (a) NOT the under-reporting MFSK control decode, and (b) is *gated OFDM* so §15
+stays shut. Two candidate shapes, both larger than a suffix-source swap:
+
+- **Plan A — relay the last OFDM data-frame SNR via the SET_CONFIG-ACK suffix.** Add a RSP
+  member `last_ofdm_data_snr` (init `-99.9`) written at the canonical producer
+  `arq_common.cc:6087` ONLY when `telecom_system->M != MOD_MFSK` (i.e. an OFDM data decode).
+  At the RSP suffix SEND (`arq_responder.cc:1122-1130`), when the SESSION has a valid OFDM
+  data SNR (`last_ofdm_data_snr > -90`) suffix THAT instead of `measurements.SNR_uplink`
+  (which is the MFSK SET_CONFIG's 0.0). Consistency across CONFIG_0..16: the suffix carries the
+  most recent OFDM data SNR uniformly at every config; at ROBUST (no OFDM data decoded yet)
+  `last_ofdm_data_snr` is still `-99.9` ⇒ falls back to the current behavior ⇒ §15 inert.
+  - **Layer reach**: PHY/decode (write `last_ofdm_data_snr` at the OFDM-only producer) → ARQ
+    (RSP suffix send) → ARQ (CMD §1.5 decode, unchanged) → elevator. The CMD side
+    (`arq_common.cc:5576`) is UNCHANGED; only the VALUE it receives changes.
+  - **Quantization caveat**: the WB suffix codec saturates at +25 dB (`mfsk.cc:597`,
+    `(SNR+5)/2`, M=16 ⇒ max tone 15 ⇒ `tone_to_snr(15)=25`). A ~15 dB OFDM SNR encodes cleanly
+    (tone 10). No new range work needed for the CONFIG_0..13 climb.
+  - **Timing caveat (the real subtlety)**: at the FIRST ROBUST_2→CONFIG_0 promotion the RSP
+    has not yet decoded ANY OFDM data (the promotion ACK precedes the first CONFIG_0 batch),
+    so `last_ofdm_data_snr` is still `-99.9` and the elevator does NOT fire on the very first
+    CONFIG_0 entry. It fires on the NEXT SET_CONFIG-ACK after the first clean CONFIG_0 batch —
+    which is ALSO exactly when §16 has credited the OFDM anchor, so `is_ofdm_config(anchor)`
+    is true and the jump is licensed. This is the CORRECT ordering (jump only after OFDM is
+    proven), and it means the win is "one rung then a big jump," not "instant jump from
+    ROBUST." Whether that satisfies the throughput goal is a HARDWARE question (§8.6).
+
+- **Plan B — re-enable the data-ACK SNR suffix, OFDM-gated.** Reverse the §18 closure narrowly:
+  let the RSP DATA-ACK carry the OFDM SNR suffix and the CMD decode it on the data-ACK wait.
+  **REJECTED for now**: §18 / Part N shows this is exactly the path that leaked a bogus
+  `SNR_uplink` and required `clear_snr_arm_for_data_ack_wait()`. Re-opening it re-introduces the
+  SACK-vs-SNR suffix collision risk on the data-ACK (the §7.1 crux). Plan A keeps the SNR on the
+  CONTROL ACK (where the SACK suffix never rides) and is strictly safer.
+
+**Side effects of the higher CONFIG_0 value on OTHER consumers**: §8.2 consumers 4/5 (turbo
+fallbacks) would size correctly instead of blindly — desirable. Consumer 6 (SNR_BASED) is dead.
+No consumer is harmed by a TRUE ~15 at CONFIG_0; the only consumer that could be harmed by a
+SPURIOUS high value (the elevator) is protected by the unchanged `is_ofdm_config(anchor)` gate
+(§8.3). **NO threshold/margin is touched (CLAUDE.md §2).**
+
+### §8.5 If the fix is more invasive than "swap the suffix source" — IT IS (explicit, task #4)
+
+Stated plainly per the task's instruction: **the fix is NOT "swap the suffix source." The RSP
+has no clean OFDM SNR at the ROBUST→CONFIG_0 suffix point** (the SET_CONFIG it just decoded was
+MFSK, SNR=0.0). The minimal CORRECT fix (Plan A) requires: (1) a NEW RSP member
+`last_ofdm_data_snr`; (2) a write at the OFDM-only branch of the canonical producer
+(`arq_common.cc:6087`, gated `M != MOD_MFSK`); (3) a change to the RSP suffix SEND value
+selection (`arq_responder.cc:1122-1130`) to prefer `last_ofdm_data_snr` when valid; (4) a
+reset of the new member on session teardown (mirror §1.6). The CMD §1.5 producer and the
+elevator are UNCHANGED. This is a cross-layer change (PHY-decode → ARQ-send → ARQ-decode →
+elevator) and per CLAUDE.md §4 needs the plan approved before code.
+
+### §8.6 Regression-test design (answer to task #5; in-process, the Part G/J''/N idiom)
+
+Add to `--test-climb-engine` (`arq_commander.cc::test_climb_engine`), replaying REAL helpers
+(`snr_uplink_from_suffix`, `supershift_retrigger_target`, `is_ofdm_config`,
+`config_ladder_*`) and the REAL `:4722` gate predicate. Tests assert at MEMBER granularity
+(the Part L/N idiom) so they exercise the real selection logic, not a paraphrase.
+
+- **(a) FIX-WORKS — elevator jumps from CONFIG_0 on a TRUE OFDM SNR.** Setup: OFDM anchor
+  (`last_data_viable_config = CONFIG_0`, `is_ofdm_config==true`), `current_configuration =
+  CONFIG_0`, `turboshift_phase = TURBO_DONE`, `gear_shift_on = YES`, optimizer off,
+  `supershift_proven_ceiling = -1`. Drive `measurements.SNR_uplink =
+  snr_uplink_from_suffix(15.0f)` (the relayed OFDM value). ASSERT: the `:4722` eligibility
+  predicate is TRUE; `elevator_target_from_snr()` returns `min(get_configuration(15−6=9),
+  CONFIG_0+RETRIGGER_MAX_LEAP)` = CONFIG_13 (idx 16); `gap = idx(CONFIG_13) − idx(CONFIG_0) =
+  13 ≥ SUPERSHIFT_RETRIGGER_CONFIGS` ⇒ the re-trigger WOULD fire (multi-rung jump).
+  FAIL-BEFORE proxy: with `snr_uplink_from_suffix(1.0f)` (today's CONFIG_0 value) the target
+  is the +1-clamped CONFIG_0/CONFIG_1 (gap<3) ⇒ no jump — proving the throttle and that the
+  value is the lever. (This mirrors JJ2's PASS arm but asserts the FULL re-trigger fire
+  condition, not just the helper return.)
+- **(b) OVER-CLIMB STAYS SHUT — a high suffix at a ROBUST anchor does NOT jump.** Setup:
+  ROBUST anchor (`last_data_viable_config = ROBUST_2`, `is_ofdm_config==false`),
+  `current_configuration = CONFIG_0`, same flags. Drive `measurements.SNR_uplink =
+  snr_uplink_from_suffix(15.0f)` (model the WINDOW where an OFDM frame relayed a high SNR but
+  the anchor is still robust — the §8.3 hazard). ASSERT: `supershift_retrigger_target(...)`
+  returns `anchor_cap` (the +1 clamp) because `is_ofdm_config(ROBUST_2)==false` ⇒
+  `high_confidence_jump==false` (`arq.h:842-844`); the elevator target ≤ +1 ⇒ NO multi-rung
+  jump. This is the SAME assertion as JJ1c but driven with a HIGH (not 1.0) SNR, proving the
+  guard is value-INDEPENDENT and the value-correction fix cannot reopen §15.
+- **(c) SUFFIX-SOURCE INERT AT ROBUST/MFSK — no spurious high SNR is ever produced.** Drive
+  the Plan-A SEND-side selection helper (to be added, pure): with a robust/MFSK last decode
+  (`last_ofdm_data_snr = -99.9`, `received_message_stats.SNR = 0.0`) ASSERT the suffix value
+  selected == the MFSK value (0.0/round-trip 1.0), NOT a high SNR; with a valid OFDM last
+  decode (`last_ofdm_data_snr = 15.0`) ASSERT the suffix value == 15.0. This pins the §8.3
+  "fix only substitutes when the last decode was genuinely OFDM" invariant at the producer.
+- **(d) SACK PRESERVATION (regression guard).** Re-assert (Part N idiom) that
+  `clear_snr_arm_for_data_ack_wait()` still forces `turbo_snr_ack_enabled=false` on every
+  data-ACK wait, so Plan A (control-ACK only) does NOT route any suffix to the SNR decoder on
+  the data path. (Plan A adds no data-ACK suffix; this guards against drift if someone later
+  reaches for Plan B.)
+
+**Honest scope**: (a)-(d) prove the ELEVATOR LEVER, the ANTI-OVER-CLIMB, the PRODUCER-INERTNESS,
+and SACK preservation in-process. They do NOT prove the throughput win — that is hardware-only
+(WGN:30 IONOS: does the CMD reach ~CONFIG_13 via the elevator after the first clean CONFIG_0
+batch, and does total bps rise toward the ~3k goal?), and they do NOT prove the §8.4 timing
+caveat is acceptable (the "one rung then jump" ordering). The parent must wire-test on IONOS.
+
+### §8.7 Related fact documents
+
+- `gearshift-climb-engine.md` §15 (the over-climb guard this fix must not reopen — anchor-gated,
+  `arq.h:842-844`), §16 (the anchor-tier gate that makes the value-raise safe,
+  `arq.h:740-741`), §18 / Part N (the data-ACK SNR-leak bug — why Plan B is rejected).
+- This doc §1.5/§1.7/§7 (the existing CMD-side §1.5 producer + §1.7 enablement the fix builds
+  on; the fix changes only the VALUE that arrives at `arq_common.cc:5576`, not the site).
