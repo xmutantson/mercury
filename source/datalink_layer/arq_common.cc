@@ -1493,6 +1493,42 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		printf("[CFG] init_messages_buffers done\n");
 		fflush(stdout);
 	}
+
+	// §19/§20 A/B knobs (env-gated, OFF by default → production byte-identical).
+	// telecom_system->load_configuration() (just above) recomputed
+	// ctrl_suffix_pattern_passband_samples at the UNCODED 13-tone / single-base
+	// length, so the FEC + combining state must be RE-APPLIED on every config
+	// switch (the set_* hooks re-derive that member at the current Nofdm).
+	//   MERCURY_SUFFIX_FEC=1   → GF(16) RA FEC on the CONNECT ctrl-suffix (§19).
+	//   MERCURY_CONNECT_REPS=N → base-pattern combining, N reps (§20; 1=off).
+	// Cached on first call (no getenv() in the hot config-switch path on Pi).
+	{
+		static int  fec_env_cached   = 0;
+		static int  fec_env_on        = 0;
+		static int  reps_env_cached   = 0;
+		static int  reps_env_val      = 1;
+		if(!fec_env_cached)
+		{
+			const char* e = std::getenv("MERCURY_SUFFIX_FEC");
+			fec_env_on = (e != nullptr && e[0] == '1') ? 1 : 0;
+			fec_env_cached = 1;
+			if(fec_env_on) { printf("[CFG] MERCURY_SUFFIX_FEC=1 — GF(16) RA FEC ON (CONNECT ctrl-suffix)\n"); fflush(stdout); }
+		}
+		if(!reps_env_cached)
+		{
+			const char* e = std::getenv("MERCURY_CONNECT_REPS");
+			reps_env_val = (e != nullptr) ? atoi(e) : 1;
+			if(reps_env_val < 1) reps_env_val = 1;
+			reps_env_cached = 1;
+			if(reps_env_val > 1) { printf("[CFG] MERCURY_CONNECT_REPS=%d — base-pattern combining ON\n", reps_env_val); fflush(stdout); }
+		}
+		// Re-apply after each load_configuration (idempotent; WB-only — NB has
+		// connect_pattern_nsymb=0 so the set_* hooks no-op the passband member).
+		if(fec_env_on)
+			telecom_system->set_suffix_fec(true, 3);
+		if(reps_env_val > 1)
+			telecom_system->set_connect_preamble_reps(reps_env_val);
+	}
 }
 
 void cl_arq_controller::return_to_last_configuration()
@@ -5006,10 +5042,13 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	// the captured passband tail actually CONTAINS the full coded suffix plus
 	// the existing 16-symbol margin. tail_samples is clamped to signal_period
 	// below (the ring), which is hundreds of symbols at the robust configs, so
-	// the larger coded window fits.
+	// the larger coded window fits. §20.3 C6: the base now occupies
+	// connect_base_total_nsymb() (R×16 when combining) — the capture tail must
+	// hold all R base reps + the suffix + margin (R=1 → conn_nsymb, byte-identical).
+	int base_total_nsymb = telecom_system->ack_mfsk.connect_base_total_nsymb();
 	int suffix_nsymb = telecom_system->ack_mfsk.ctrl_suffix_len();
 	if(conn_nsymb <= 0 || suffix_nsymb <= 0) return false;
-	const int tail_nsymb = conn_nsymb + suffix_nsymb + 16;
+	const int tail_nsymb = base_total_nsymb + suffix_nsymb + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
 	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;

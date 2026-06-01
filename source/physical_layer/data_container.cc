@@ -116,9 +116,14 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	// is connect_base(16 WB) + coded ctrl-suffix (up to gf16ra GF16RA_MAX_N=64)
 	// = up to 80 symbols, which EXCEEDS the old 48 floor on short-frame robust
 	// configs (ROBUST_0 Nsymb < 48) → would overflow ofdm_framed_data /
-	// ofdm_symbol_modulated_data. Floor at 80 so the coded ctrl-suffix pattern
-	// always fits regardless of repfact. (Uncoded path unaffected — 16+13=29<48.)
-	const int CTRL_SUFFIX_FEC_MAX_NSYMB = 80;   // 16 WB connect base + 64 GF16RA_MAX_N
+	// ofdm_symbol_modulated_data. (Uncoded path unaffected — 16+13=29<48.)
+	// §20 (§20.3 C2): base-pattern combining emits the 16-sym base block up to
+	// MAX_CONNECT_PREAMBLE_REPS=4 times → R×16 + coded suffix(≤64) = 4*16+64=128
+	// symbols. Floor at 128 so the combined+coded CONNECT pattern always fits
+	// regardless of repfact and reps. (Kept as a literal — data_container does not
+	// include mfsk.h/mfsk_ctrl_codec.h; the two constants are MAX_CONNECT_PREAMBLE
+	// _REPS=4 and GF16RA_MAX_N=64. If either grows, raise this in lockstep.)
+	const int CTRL_SUFFIX_FEC_MAX_NSYMB = 128;  // 4×16 WB connect base reps + 64 GF16RA_MAX_N
 	int alloc_Nsymb = (Nsymb > 48) ? Nsymb : 48;
 	if (alloc_Nsymb < CTRL_SUFFIX_FEC_MAX_NSYMB) alloc_Nsymb = CTRL_SUFFIX_FEC_MAX_NSYMB;
 	this->ofdm_framed_data=CNEW(std::complex<double>, alloc_Nsymb*Nc, "dc.ofdm_framed_data");

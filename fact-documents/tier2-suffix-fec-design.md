@@ -867,3 +867,146 @@ latent hygiene).
   longer window, energy-extraction offset for symbols 13..51) clamp it higher? This is exactly the
   integration risk this increment de-risks (the standalone codec hit −14 on a synthetic passband; the
   full production path may surface an offset/window bug).
+
+## §20 INCREMENT 2 — base-pattern noncoherent COMBINING on the CONNECT handshake (PLAN + SIM + HW) (2026-06-01)
+
+Agent (this session). Branch `sim/connect-preamble-combining` off `sim/suffix-fec-integration` @deb1ecf
+(HAIL gate fix 060fc40 + ctrl-gate 1.2 88e6bb1 + GF16 FEC INCREMENT-1 deb1ecf). The handoff from the
+FEC-arm HW run (§19.7, recorded verbally, not yet in §19.7 prose): with the GF(16) R¼ FEC forced on,
+the IONOS establishment floor moved −10 → **−16** WGN; at the FEC arm's FINAL floor (−18/−20) the
+failure is **BASE-PATTERN MATCHED-COUNT COLLAPSE** (`detect_ack_pattern` matched 16→13→10, drops
+below `connect_match_threshold=7`), **NOT CRC** — i.e. the FEC solved the content, and now the
+**CONNECT base-pattern DETECTION** (the same matched-count limiter HAIL had) is the binding stage.
+This increment adds the §13/§14-measured lever — **noncoherent energy-combining of the base-pattern
+matched-filter across R repeated base patterns** — to the CONNECT handshake.
+
+### §20.1 The lever (measured prior art, NOT a guess)
+
+The base pattern = `connect_pattern_nsymb=16` symbols (Welch-Costas, 8 tones ×2, hop
+`(connect_tones[s%8]+s*tone_hop_step)%M`, `mfsk.cc:843-865`); detected by `detect_ack_pattern`
+(`ofdm.cc:3691`) which per candidate start `s` sums a per-symbol matched-count (expected tone is the
+all-streams argmax peak) + a soft metric `Σ e_target/e_total`. The matched-COUNT statistic is what
+collapses at the deep floor (§19.7 HW). §4 of `hail-detection-floor-investigation.md` (the
+structurally-identical HAIL base pattern) MEASURED, on this exact detector: noncoherent combining of
+the per-tone energy matrix `E[s][m]` across R aligned reps BEFORE argmax deepens the matched-COUNT
+cliff **R=2 +1.80 dB, R=5 +3.74 dB** (vs 10log10 ideal +3.0/+7.0 — the realistic M=16 noncoherent
+gain at q≈0.1-0.24). §14 (repetition sim, CONNECT base) independently MEASURED **+2.2 to +2.5
+dB/doubling** (R=2 +2.18, R=4 +2.50) — the LOW end (Tier-1 soft-list already harvests near-miss
+energy at R=1). Prior art: WSJT-X Q65 noncoherent integration ~2.6-3.0 dB/doubling (matches). **⇒
+expected: ~+2.2-2.5 dB per doubling on the base-pattern matched-count floor.**
+
+Why combining works on the COUNT but NOT on the current normalized-RATIO metric (§4 / §13): the
+metric `e_target/e_total` is scale-invariant — summing R copies cancels in the ratio. So combining
+must feed the **argmax/count** (the matched-count is the limiter here per §19.7, and the metric gate
+is already relaxed to 1.2 so it is non-binding at the floor: §17.4 HW showed matched=15-16 clearing
+the 1.2 gate). The combined energies also feed the metric (deeper, but the count is what we need).
+
+### §20.2 The design (ONE change, flag-gated, R=1 byte-identical)
+
+New flag `cl_mfsk::connect_preamble_reps` (default **1** = byte-identical to today). When R>1:
+
+- **TX** (`generate_ctrl_suffix_pattern` / `generate_connect_pattern`): emit the 16-symbol base
+  pattern **R times** (identical block — rep r symbol s carries the SAME tone as rep 0 symbol s, i.e.
+  per-rep-LOCAL hop indexing `(connect_tones[s%8]+s*hop)%M`, NOT continued `abs_s` hop), THEN the
+  suffix once at `abs_s = R*16 + s`. Total symbols `R*16 + ctrl_suffix_len()`.
+- **RX** (`detect_ack_pattern`, new `combine_reps` param): for each candidate start offset, accumulate
+  the per-symbol FFT energy of base-symbol s SUMMED over the R reps (offsets `s, 16+s, 32+s, …`)
+  before the argmax/count/metric. The base pattern occupies `R*16` symbols; the suffix follows at
+  `best_offset + R*16` (the suffix is NOT repeated — only the base/preamble is combined, exactly the
+  §14 finding "combining belongs on the PREAMBLE, not the suffix"). `reserve_after` becomes
+  `ctrl_suffix_len()` still (the suffix length), and the base window is `R*16`.
+- **Count gate (FAR defense) KEPT**: the matched-count threshold `connect_match_threshold=7` is the
+  load-bearing FAR defense (§4 HAIL: count-only FAR 0/5000); combining feeds it deeper energy but the
+  7/16 gate still guards. We do NOT relax the count gate.
+
+### §20.3 §5 CROSS-LAYER DATA-FLOW AUDIT — the base-pattern symbol-count (extends §19.4 I4)
+
+Shared state: **the CONNECT base-pattern symbol count** (was `connect_pattern_nsymb=16`; the
+on-wire base now occupies `connect_base_total_nsymb() = R*16` when combining). Crosses PHY (TX symbol
+gen, RX matched filter + suffix-offset), the sample-count layer (passband buffers), ARQ (capture
+window). Reuses the §19.4 producer/consumer skeleton; the DELTA vs §19.4 is that the BASE count
+(not just the suffix count) now scales.
+
+**Producers:**
+1. `cl_mfsk::connect_pattern_nsymb` (16) — UNCHANGED (one base block).
+2. `cl_mfsk::connect_base_total_nsymb()` (NEW) = `connect_preamble_reps * connect_pattern_nsymb`.
+   Single source of truth for the on-wire base symbol count.
+3. `cl_telecom_system::ctrl_suffix_coded_len()`/`ack_mfsk.ctrl_suffix_len()` — UNCHANGED (suffix only).
+
+**Consumers (every one audited; ⊕ = newly affected by R, vs §19.4 where only the suffix scaled):**
+- ⊕ C2 TX `generate_ctrl_suffix_pattern` (mfsk.cc:870): loops `R*16` base one-hot symbols (R blocks)
+  then `suffix_len` at `abs_s=R*16+s`. **Buffer `ofdm_framed_data`/`ofdm_symbol_modulated_data`
+  floor**: was 80 (16+64). With R=4: 64+52=116 > 80 → RAISE the floor to cover
+  `MAX_REPS*16 + GF16RA_MAX_N` (MAX_REPS=4 → 64+64=128). **Load-bearing — without it, R=4 overflows
+  the heap on short-frame robust configs (same class as §19.4 C2).**
+- ⊕ C3/C4 TX `generate_ctrl_suffix_pattern_passband` (telecom_system.cc:3494) + member
+  `ctrl_suffix_pattern_passband_samples` (set 5790 + re-derived in `set_suffix_fec` 3479): `nsymb`
+  becomes `connect_base_total_nsymb() + ctrl_suffix_len()`. All TX sample counts derive from the
+  member → fix the two derivation sites, flows through `send_mfsk_ctrl_suffix_phy_core` (4849-4862).
+- ⊕ C5 RX `decode_ctrl_suffix_from_passband` (telecom_system.cc:3564): `detect_ack_pattern` is called
+  with `ack_nsymb = connect_pattern_nsymb` today; with combining it must scan `R` reps → pass
+  `combine_reps=R` and the base block length 16. `reserve_after` stays `ctrl_suffix_len()`. Suffix
+  energy/tone extraction offset `connect_pattern_nsymb` → `connect_base_total_nsymb()` (the suffix is
+  after ALL R base reps). mini-Moose runs on the FIRST base rep (offset best_offset, 16 sym) — CFO is
+  common across reps, one estimate suffices (§16 ctrl-Moose is clean/tiny anyway).
+- ⊕ C6 RX capture window `receive_mfsk_ctrl_suffix_phy_core` (arq_common.cc:5004-5018):
+  `tail_nsymb = conn_nsymb + suffix_nsymb + 16` → `connect_base_total_nsymb() + suffix_nsymb + 16`.
+  Clamped to `signal_period` (ring = `buffer_Nsymb*sym_samples`). **VERIFY** `buffer_Nsymb ≥
+  4*16+52+16 = 132` at ROBUST_0 (open check §20.6 — the ring is min_buf ≈ frame+turnaround+frame+
+  margin, hundreds of symbols at ROBUST_0, so 132 fits; MUST confirm at build).
+- C1 TX `pack_ctrl_suffix` (mfsk.cc:627): SUFFIX field packing — independent of base reps. UNCHANGED.
+- C7 RX hard-tone buffers `last_connect_suffix_tones[MAX_ACK_SACK_SUFFIX=64]`: suffix-only, NOT base.
+  UNCHANGED (the suffix is still ≤52). The hard path is FEC-gated off anyway.
+- C8 `decode_suffix_energies` out buffer (N*M, N=suffix len): suffix-only. UNCHANGED.
+- C9 ACK / SACK-ACK paths: do NOT use the CONNECT base pattern or `connect_preamble_reps`. The
+  combining is **CONNECT-only** (the establishment handshake), exactly as the FEC is CONNECT-only
+  this increment. **ACK path byte-identical.**
+
+**Valid-states / default-init:** `connect_preamble_reps` default 1 → `connect_base_total_nsymb()=16`
+→ every consumer behaves EXACTLY as today (byte-identical-when-off — the regression gate). The
+`detect_ack_pattern` `combine_reps` param defaults to 1 (no behavior change for ACK/BREAK/HAIL
+callers, which pass 1).
+
+**Invariant consumers assume:** "the ctrl-suffix occupies exactly `<suffix_len>` symbols immediately
+after the base, one-hot per symbol." With combining the base is `R*16` symbols (R identical blocks)
+and the suffix starts at `R*16`. Every consumer that derives a base length or suffix offset is
+enumerated above and switched to `connect_base_total_nsymb()`; the suffix-internal layout is
+untouched.
+
+**§5 verdict:** SCOPED to the CONNECT TX/RX base-pattern path (2 TX gen sites + member + 1 RX detect
+site + capture window + buffer floors). ACK/BREAK/HAIL detection unaffected (`combine_reps=1` default,
+they don't read `connect_preamble_reps`). FAR defended by the unchanged count gate (`connect_match_
+threshold=7`) + the CRC12/type backstop on the suffix. The combining is energy-additive into the
+SAME argmax the count gate already trusts.
+
+### §20.4 What changes vs leaves
+
+CHANGES: `connect_preamble_reps` flag + `connect_base_total_nsymb()` accessor (mfsk); `combine_reps`
+param on `detect_ack_pattern` (ofdm) summing base-rep energies before argmax; TX base-rep loop in
+`generate_connect_pattern`/`generate_ctrl_suffix_pattern`; `ctrl_suffix_pattern_passband_samples`
+derivations (2 sites); RX detect call + suffix offset + capture window; buffer floor 80→128.
+LEAVES: the suffix FEC (INCREMENT-1, unchanged — combining is on the BASE, orthogonal); the 1.2
+metric gate; HAIL fix; ACK/SACK-ACK; CAP negotiation + try-both (the combining R, like the FEC, is
+FORCE-on for this increment via the same enable hook; CAP-gated adaptive-R is a later increment).
+
+### §20.5 Sim test (the gate, BEFORE HW)
+
+New regression test `test_connect_preamble_combining_cliff_sweep` (`mfsk_ctrl_codec_tests.cc`):
+synthesize the production CONNECT base+suffix passband at R=1/2/4 (real TX path
+`generate_ctrl_suffix_pattern_passband`), AWGN across SNR3k, run the production RX detector
+(`detect_ack_pattern` with `combine_reps=R`), measure (a) the base-pattern matched-count cliff
+(P(matched≥7)=0.5) per R — does it deepen ~+2.2-2.5/doubling? (b) the full establishment decode
+(base detect + FEC) floor per R — does it go deeper? (c) FAR on pure noise (combining + count gate),
+(d) byte-identical-when-off (R=1 TX bytes == pre-change). Build FOREGROUND `bash build.sh o3`,
+`mercury --test` passes. **GATE: if no base-pattern floor gain in sim, STOP + report (don't waste
+bench).**
+
+### §20.6 Open checks [?]
+- [?] C6 ring `buffer_Nsymb ≥ 132` at ROBUST_0 (R=4 window). Confirm at build (printed by init).
+- [?] Does the combined base-pattern cliff track the §4/§14 +2.2-2.5/doubling, and does the FULL
+  establishment floor (FEC behind the base) move deeper on HW past −16?
+- [?] Combining-rep ALIGNMENT: the R base blocks are contiguous in one TX blob (no PTT gap, unlike
+  HAIL's separate beacons), so rep alignment is exact (sample-locked) — BETTER than HAIL's
+  poll-to-poll combining. The detector sums at fixed `s, 16+s, 32+s…` offsets from the single
+  best_offset. Confirm no per-rep CFO walk over R*16 symbols degrades the sum (ctrl-Moose residual
+  ~1.5 Hz over 64 symbols ≈ negligible phase walk for a NONcoherent energy sum).

@@ -83,6 +83,27 @@ public:
 	int connect_tones[MAX_ACK_TONES];
 	int connect_pattern_nsymb;
 	int connect_match_threshold;
+	// Tier-2 base-pattern noncoherent COMBINING (tier2-suffix-fec-design.md §20,
+	// INCREMENT 2). When connect_preamble_reps>1 the CONNECT handshake emits the
+	// connect_pattern_nsymb base block R times (identical, per-rep-LOCAL hop) and
+	// the RX detector (ofdm.detect_ack_pattern, combine_reps param) noncoherently
+	// sums the per-symbol FFT energy across the R aligned reps BEFORE the
+	// argmax/matched-count — deepening the base-pattern detection floor
+	// ~+2.2-2.5 dB/doubling (measured: hail-detection-floor-investigation.md §4,
+	// repetition sim §14). The suffix is NOT repeated (combining is on the
+	// PREAMBLE/base, §14). connect_preamble_reps=1 (default) → R*16=16 → every
+	// consumer byte-identical to pre-§20. CONNECT-only (ACK/BREAK/HAIL pass
+	// combine_reps=1 and never read this). The base now occupies
+	// connect_base_total_nsymb()=R*connect_pattern_nsymb symbols on the wire; the
+	// suffix follows at that offset (the I4 length accessor for the base, §20.3).
+	static const int MAX_CONNECT_PREAMBLE_REPS = 4;
+	int connect_preamble_reps;   // default 1 (set in init())
+	int connect_base_total_nsymb() const {
+		int r = connect_preamble_reps;
+		if (r < 1) r = 1;
+		if (r > MAX_CONNECT_PREAMBLE_REPS) r = MAX_CONNECT_PREAMBLE_REPS;
+		return r * connect_pattern_nsymb;
+	}
 	// Soft energy-ratio sub-gate for CONNECT-handshake / ACK-SNR MFSK suffix
 	// decode (telecom_system.cc decode_ctrl_suffix_from_passband +
 	// detect_ack_snr_from_passband). ofdm.detect_ack_pattern returns

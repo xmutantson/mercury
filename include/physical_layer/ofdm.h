@@ -199,7 +199,16 @@ public:
 	TimeSyncResult time_sync_preamble_fft(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb);
 	TimeSyncResult time_sync_preamble_fft_fine(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int coarse_pos, int search_half_window);
 	int time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, const int* preamble_tones, int mfsk_M, int nStreams, const int* stream_offsets, int search_start_symb = 0, double* out_metric = nullptr);
-	double detect_ack_pattern(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int ack_nsymb, const int* ack_tones, int ack_pattern_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int* out_matched = nullptr, int suffix_start = 0, int* out_suffix_matched = nullptr, int* out_best_offset = nullptr, int reserve_after = 0, uint32_t* out_match_mask = nullptr, bool always_fine = false);
+	// combine_reps (§20, tier2-suffix-fec-design.md): noncoherent base-pattern
+	// combining. When >1, the matcher treats ack_nsymb as ONE base block repeated
+	// combine_reps times (R*ack_nsymb symbols on the wire) and SUMS the per-symbol
+	// FFT energy across the R aligned reps (rep r symbol p at buffer symbol
+	// s+r*ack_nsymb+p) BEFORE the per-symbol argmax / matched-count / metric — i.e.
+	// square-law noncoherent integration on the matched filter. matched/metric are
+	// still over ack_nsymb (one block's worth of decisions, now energy-combined).
+	// combine_reps=1 (default) is byte-identical to the pre-§20 single-block path.
+	// CONNECT base-pattern only; ACK/BREAK/HAIL callers pass 1.
+	double detect_ack_pattern(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int ack_nsymb, const int* ack_tones, int ack_pattern_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int* out_matched = nullptr, int suffix_start = 0, int* out_suffix_matched = nullptr, int* out_best_offset = nullptr, int reserve_after = 0, uint32_t* out_match_mask = nullptr, bool always_fine = false, int combine_reps = 1);
 	void decode_suffix_tones(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int pattern_offset, int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int* out_tones);
 	// decode_suffix_tones_soft removed in §7.13.12 (only caller was the
 	// deleted decode_sack_bitmap_ldpc in the legacy MFSK SACK path).

@@ -3475,11 +3475,29 @@ int cl_telecom_system::set_suffix_fec(bool on, int repfact)
 	// Re-derive the CONNECT-suffix passband sample count for the (now possibly
 	// coded) ctrl_suffix_len(). load_configuration computed it at the uncoded
 	// length; the coded length differs (52 vs 13) so every TX consumer that
-	// reads this member must see the updated value (§19.4 C4).
+	// reads this member must see the updated value (§19.4 C4). §20: the base now
+	// occupies connect_base_total_nsymb() (R×16 when combining) — use the accessor
+	// so both FEC and combining flow through the same member.
 	ctrl_suffix_pattern_passband_samples =
-		(ack_mfsk.connect_pattern_nsymb + ack_mfsk.ctrl_suffix_len())
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
 		* data_container.Nofdm * frequency_interpolation_rate;
 	return ack_mfsk.ctrl_suffix_len();
+}
+
+// §20 (INCREMENT 2): set the CONNECT base-pattern combining factor R. See
+// telecom_system.h. Must be called AFTER load_configuration. R=1 = off
+// (byte-identical). Re-derives the passband sample count so every TX consumer
+// sees the R×16 base length (the I4 invariant, §20.3 C3/C4).
+int cl_telecom_system::set_connect_preamble_reps(int reps)
+{
+	if (reps < 1) reps = 1;
+	if (reps > cl_mfsk::MAX_CONNECT_PREAMBLE_REPS)
+		reps = cl_mfsk::MAX_CONNECT_PREAMBLE_REPS;
+	ack_mfsk.connect_preamble_reps = reps;
+	ctrl_suffix_pattern_passband_samples =
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
+		* data_container.Nofdm * frequency_interpolation_rate;
+	return ack_mfsk.connect_base_total_nsymb();
 }
 
 // =============================================================================
@@ -3498,10 +3516,12 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;       // NB unsupported
 	if(ack_mfsk.connect_pattern_nsymb <= 0) return 0;
 
-	// §19: coded suffix length (52 with FEC, 13 uncoded). The member
-	// ctrl_suffix_pattern_passband_samples is computed from the same coded
-	// length at init (5704), so the returned sample count stays consistent.
-	int nsymb = ack_mfsk.connect_pattern_nsymb + ack_mfsk.ctrl_suffix_len();
+	// §19: coded suffix length (52 with FEC, 13 uncoded). §20: base occupies
+	// connect_base_total_nsymb() (R×16 when combining). The member
+	// ctrl_suffix_pattern_passband_samples is computed from the same base+suffix
+	// total (set_suffix_fec / set_connect_preamble_reps re-derive it), so the
+	// returned sample count stays consistent.
+	int nsymb = ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len();
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	ack_mfsk.generate_ctrl_suffix_pattern(data_container.ofdm_framed_data,
@@ -3561,6 +3581,10 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 
 	int matched = 0;
 	int best_offset = -1;
+	// §20: base-pattern combining — ack_nsymb is ONE base block
+	// (connect_pattern_nsymb); combine_reps=connect_preamble_reps tells the
+	// detector to sum the per-symbol energy across the R aligned reps before the
+	// matched-count. reps=1 → byte-identical single-block detection.
 	double metric = ofdm.detect_ack_pattern(
 		data_container.baseband_data_interpolated, dec_size,
 		1,
@@ -3570,7 +3594,8 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
 		&best_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_len(),
-		/*out_match_mask=*/nullptr);
+		/*out_match_mask=*/nullptr, /*always_fine=*/false,
+		/*combine_reps=*/ack_mfsk.connect_preamble_reps);
 
 	if (out_matched) *out_matched = matched;
 
@@ -3612,7 +3637,8 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
 			&rebest_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_len(),
-			/*out_match_mask=*/nullptr);
+			/*out_match_mask=*/nullptr, /*always_fine=*/false,
+			/*combine_reps=*/ack_mfsk.connect_preamble_reps);
 		if (rematched >= ack_mfsk.connect_match_threshold &&
 		    remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
 		{
@@ -3638,10 +3664,13 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		int N = ack_mfsk.ctrl_suffix_len();   // = gf16ra::codeword_len()
 		if (N <= 0 || N > gf16ra::GF16RA_MAX_N) return false;
 		std::vector<double> energies((size_t)N * ack_mfsk.M, 0.0);
+		// §20: the suffix follows ALL R base reps. pattern_nsymb =
+		// connect_base_total_nsymb() (R×16) is BOTH the symbol offset to the suffix
+		// and the hop base — must match the TX abs_s in generate_ctrl_suffix_pattern.
 		ofdm.decode_suffix_energies(
 			data_container.baseband_data_interpolated, dec_size,
 			1,
-			best_offset, ack_mfsk.connect_pattern_nsymb,
+			best_offset, ack_mfsk.connect_base_total_nsymb(),
 			N,
 			ack_mfsk.tone_hop_step, ack_mfsk.M,
 			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
@@ -3681,10 +3710,12 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 	if (suffix_len > cl_mfsk::MAX_ACK_SACK_SUFFIX)
 		suffix_len = cl_mfsk::MAX_ACK_SACK_SUFFIX;
 	int suffix_tones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	// §20: suffix offset = connect_base_total_nsymb() (R×16) so the hop base and
+	// buffer position match the TX layout when combining (=16 when reps=1).
 	ofdm.decode_suffix_tones(
 		data_container.baseband_data_interpolated, dec_size,
 		1,
-		best_offset, ack_mfsk.connect_pattern_nsymb,
+		best_offset, ack_mfsk.connect_base_total_nsymb(),
 		suffix_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
@@ -5787,8 +5818,12 @@ void cl_telecom_system::load_configuration(int configuration)
 	// BEFORE load_configuration recomputes this, OR re-enabled after — the
 	// session FEC-enable path re-derives this member (telecom enable hook §19).
 	connect_pattern_passband_samples = ack_mfsk.connect_pattern_nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	// §20: base-pattern combining — the on-wire base is connect_base_total_nsymb()
+	// (R×16 when combining, 16 when reps=1 → byte-identical). The session
+	// combining-enable hook (set_connect_preamble_reps) re-derives this member, as
+	// set_suffix_fec does for the coded suffix length.
 	ctrl_suffix_pattern_passband_samples =
-		(ack_mfsk.connect_pattern_nsymb + ack_mfsk.ctrl_suffix_len()) * data_container.Nofdm * frequency_interpolation_rate;
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len()) * data_container.Nofdm * frequency_interpolation_rate;
 
 	// Per-mode detection threshold (all using ack_mfsk: M=16, nStreams=1):
 	// ROBUST_0 (-13 dB): low SNR, need conservative threshold

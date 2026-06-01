@@ -65,6 +65,7 @@ cl_mfsk::cl_mfsk()
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
 	suffix_fec_coded = false;  // Tier-2 FEC off by default (§19)
+	connect_preamble_reps = 1; // Tier-2 base-pattern combining off by default (§20)
 }
 
 cl_mfsk::~cl_mfsk()
@@ -850,16 +851,24 @@ void cl_mfsk::generate_connect_pattern(std::complex<double>* pattern_out)
 	// CONNECT base uses an 8-tone base sequence × 2 reps = 16 symbols (WB),
 	// same shape as ACK; the base sequence is connect_tones[0..7].
 	const int base_len = 8;
-	for (int s = 0; s < connect_pattern_nsymb; s++)
+	// §20: noncoherent base-pattern combining. Emit the connect_pattern_nsymb
+	// base block connect_preamble_reps times. Each rep is IDENTICAL — symbol s
+	// of every rep carries the SAME tone (per-rep-LOCAL hop index s, NOT a
+	// continued abs index), so the RX detector can sum the energy of rep-r
+	// symbol s onto rep-0 symbol s (same expected bin). reps=1 → exactly the
+	// pre-§20 single 16-symbol block (byte-identical).
+	int total_base = connect_base_total_nsymb();   // reps * connect_pattern_nsymb
+	for (int abs_b = 0; abs_b < total_base; abs_b++)
 	{
+		int s = abs_b % connect_pattern_nsymb;   // index WITHIN the base block
 		for (int k = 0; k < Nc; k++)
-			pattern_out[s * Nc + k] = std::complex<double>(0.0, 0.0);
+			pattern_out[abs_b * Nc + k] = std::complex<double>(0.0, 0.0);
 
 		int tone_base = connect_tones[s % base_len];
 		int actual_tone = (tone_base + s * tone_hop_step) % M;
 
 		for (int st = 0; st < nStreams; st++)
-			pattern_out[s * Nc + stream_offsets[st] + actual_tone] =
+			pattern_out[abs_b * Nc + stream_offsets[st] + actual_tone] =
 				std::complex<double>(amp, 0.0);
 	}
 }
@@ -878,15 +887,21 @@ void cl_mfsk::generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
 	if (suffix_len == 0) return;  // NB unsupported
 	if (connect_pattern_nsymb <= 0) return;
 
-	// First: CONNECT base pattern (16 symbols WB, NOT ack_tones).
+	// First: CONNECT base pattern (R×16 symbols WB when combining, NOT ack_tones).
 	generate_connect_pattern(pattern_out);
 
 	int payload_tones[MAX_ACK_SACK_SUFFIX];
 	pack_ctrl_suffix(type, payload38, crc12, payload_tones);
 
+	// §20: the suffix follows ALL R base reps (combining is on the base, not the
+	// suffix). connect_base_total_nsymb() = R*connect_pattern_nsymb (=16 when
+	// reps=1, byte-identical). The hop index abs_s uses this same base total so
+	// TX and the RX suffix-decode offset (which is passed connect_base_total_nsymb)
+	// stay phase-consistent (§20.3 C5).
+	int base_total = connect_base_total_nsymb();
 	double amp = sqrt((double)Nc / nStreams);
 	for (int s = 0; s < suffix_len; s++) {
-		int abs_s = connect_pattern_nsymb + s;  // suffix index after base
+		int abs_s = base_total + s;  // suffix index after ALL base reps
 		for (int k = 0; k < Nc; k++)
 			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
 

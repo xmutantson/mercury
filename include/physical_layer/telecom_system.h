@@ -244,6 +244,16 @@ public:
 	// FORCE-on for this increment (no CAP negotiation yet). Returns the coded N.
 	int  set_suffix_fec(bool on, int repfact = 3);
 
+	// §20 (INCREMENT 2): set the CONNECT base-pattern noncoherent combining factor
+	// R. R>1 → ack_mfsk.connect_preamble_reps=R (TX emits the base block R times,
+	// RX sums per-symbol energy across the R aligned reps before the matched-count)
+	// and RE-DERIVE ctrl_suffix_pattern_passband_samples (the on-wire base grew to
+	// R×16). MUST be called AFTER load_configuration. R clamped to
+	// [1, cl_mfsk::MAX_CONNECT_PREAMBLE_REPS]. R=1 = byte-identical (off). FORCE-on
+	// for this increment (no CAP negotiation yet). Returns the on-wire base symbol
+	// count (connect_base_total_nsymb()).
+	int  set_connect_preamble_reps(int reps);
+
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,
 	                                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,

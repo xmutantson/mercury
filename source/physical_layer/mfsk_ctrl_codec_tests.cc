@@ -4497,6 +4497,232 @@ static void test_ctrl_suffix_metric_gate_cliff_sweep() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §20 (INCREMENT 2) — THE GATE FOR THIS INCREMENT: noncoherent base-pattern
+// COMBINING on the CONNECT handshake deepens the base-pattern matched-count
+// detection floor ~+2.2-2.5 dB/doubling (measured: hail-detection-floor §4,
+// repetition sim §14), past the §19.7-HW limiter (base-pattern matched-count
+// COLLAPSE — matched 16→13→10 below the connect_match_threshold). Drives the
+// ACTUAL production functions at R=1/2/4:
+//   TX:  generate_ctrl_suffix_pattern_passband (R base reps + suffix; sized by
+//        ctrl_suffix_pattern_passband_samples via set_connect_preamble_reps).
+//   RX:  detect_ack_pattern(combine_reps=R) — sums per-symbol FFT energy across
+//        the R aligned reps BEFORE the matched-count (the §20 lever); AND the
+//        full production decode_ctrl_suffix_from_passband (base detect + FEC).
+// Asserts: (a) the base-pattern matched-count cliff at R=4 is MATERIALLY deeper
+// than R=1 (fail-before on the pre-§20 binary where combine_reps is ignored);
+// (b) byte-identical-when-off — R=1 TX bytes == the no-combining TX bytes;
+// (c) FAR (combining + count gate) on pure noise = 0.
+// SNR3k axis bit-identical to the §17/§19 sweeps (snr3k_db) → directly
+// comparable to the −14.68 base floor.
+static void test_connect_preamble_combining_cliff_sweep() {
+	const char* name = "connect_preamble_combining_cliff_sweep";
+	printf("  [MEASURE] base-pattern noncoherent COMBINING on the production CONNECT detector (§20 INCREMENT 2):\n");
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);   // WB ROBUST-class — brings up ack_mfsk/connect
+	cl_arq_controller arq;             // production CRC12 callback
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) {
+		test_fail(name, "CONNECT ctrl-suffix config not loaded (M<16?)"); return;
+	}
+	const double fs = ts.sampling_frequency;
+	const int conn_thr = ts.ack_mfsk.connect_match_threshold;   // matched-count gate (FAR defense)
+	const int Mdec = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+
+	// Enable the GF(16) RA FEC (the §19 content fix) for the FULL-establishment
+	// part of the sweep — combining is on the BASE, FEC on the suffix; together
+	// they are the establishment stack the HW A/B deploys. The base-pattern
+	// matched-count measurement (the headline) is FEC-independent (it only looks
+	// at the connect base symbols), so it is valid either way.
+	int N = ts.set_suffix_fec(true, 3);
+	if (N <= 13 || !ts.ack_mfsk.suffix_fec_coded) {
+		test_fail(name, "set_suffix_fec(true,3) did not bring up the coded path"); return;
+	}
+
+	// Reusable: build the clean coded CONNECT passband at the CURRENT reps, return
+	// (signal, p_sig, n_sig, lead). Caller varies reps via set_connect_preamble_reps.
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+	uint8_t bytes[5]; for (int b=0;b<5;b++) bytes[b]=(uint8_t)((typed40>>(8*(4-b)))&0xFF);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	// Noise axis (sigma/rms). Bracket −5..−20 dB so the combined base-pattern
+	// cliff (R=4 should reach well past −13) resolves.
+	const double mults[] = { 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0 };
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 60;
+	const int reps_list[] = { 1, 2, 4 };
+	double base_cliff[3] = { 1e9, 1e9, 1e9 };   // deepest SNR3k with P(matched>=thr)>=0.5
+	double est_cliff[3]  = { 1e9, 1e9, 1e9 };   // deepest SNR3k with P(full decode)>=0.5
+
+	std::vector<double> clean, work;
+	std::vector<std::complex<double> > bb;
+
+	for (int ri = 0; ri < 3; ri++) {
+		int R = reps_list[ri];
+		ts.set_connect_preamble_reps(R);
+		const int base_total = ts.ack_mfsk.connect_base_total_nsymb();
+		if (base_total != R * ts.ack_mfsk.connect_pattern_nsymb) {
+			test_fail(name, "connect_base_total_nsymb() != R*connect_pattern_nsymb"); return;
+		}
+		const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+		const int lead = 4096; const int total_pb = n_sig + 2 * lead;
+		clean.assign((size_t)total_pb, 0.0);
+		int written = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+		if (written != n_sig) { test_fail(name, "coded+combined generate size mismatch"); return; }
+		double psum = 0.0; for (int i=0;i<n_sig;i++){ double v=clean[(size_t)(lead+i)]; psum+=v*v; }
+		const double p_sig = psum / n_sig;
+		const double sig_rms = std::sqrt(p_sig);
+		if (!(sig_rms > 0.0)) { test_fail(name, "combined signal RMS=0"); return; }
+
+		printf("    --- R=%d (base on wire = %d sym, %d total sym, %d samples) ---\n",
+			R, base_total, base_total + N, n_sig);
+		printf("    (sigma/rms : SNR3k_dB : P_base_matched>=%d : mean_matched : P_full_decode)\n", conn_thr);
+		work.assign((size_t)total_pb, 0.0);
+		for (int si = 0; si < NS; si++) {
+			const double sigma = mults[si] * sig_rms;
+			std::mt19937 rng((uint32_t)(0x20C0DE00u + ri*131 + si));
+			std::normal_distribution<double> nd(0.0, sigma);
+			int base_ok = 0, decoded_ok = 0, matched_sum = 0;
+			for (int t = 0; t < NT; t++) {
+				for (int i=0;i<total_pb;i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+				// (i) base-pattern matched-count with combining (the headline lever).
+				int dec_size = total_pb / Mdec;
+				bb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+				ts.ofdm.passband_to_baseband_decimated(work.data(), total_pb, bb.data(),
+					fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+				int rm = 0, rbo = -1;
+				ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+					ts.ack_mfsk.connect_pattern_nsymb, ts.ack_mfsk.connect_tones, 8,
+					ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+					ts.ack_mfsk.stream_offsets, &rm, 0, nullptr, &rbo,
+					/*reserve_after=*/ts.ack_mfsk.ctrl_suffix_len(), nullptr,
+					/*always_fine=*/false, /*combine_reps=*/R);
+				matched_sum += rm;
+				if (rm >= conn_thr) base_ok++;
+				// (ii) full production establishment decode (base detect[combine] + FEC).
+				mfsk_ctrl_frame_type rx_type; uint64_t rx_p38=0; uint16_t rx_crc12=0; int rx_matched=0;
+				bool ok = ts.decode_ctrl_suffix_from_passband(
+					work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+					prod_crc12_cb, &arq);
+				if (ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38) decoded_ok++;
+			}
+			double Pb = (double)base_ok / NT;
+			double Pd = (double)decoded_ok / NT;
+			double snr = snr3k_db(p_sig, sigma, fs);
+			printf("    %6.1f : %7.2f : %.2f : %6.2f : %.2f\n", mults[si], snr, Pb, (double)matched_sum/NT, Pd);
+			if (Pb >= 0.5 && snr < base_cliff[ri]) base_cliff[ri] = snr;
+			if (Pd >= 0.5 && snr < est_cliff[ri])  est_cliff[ri]  = snr;
+		}
+	}
+
+	printf("    --- base-pattern matched-count cliff (P=0.5, SNR3k dB; deeper=better) ---\n");
+	printf("    R=1: %.2f   R=2: %.2f (%+.2f)   R=4: %.2f (%+.2f vs R1)\n",
+		base_cliff[0], base_cliff[1], base_cliff[1]-base_cliff[0],
+		base_cliff[2], base_cliff[2]-base_cliff[0]);
+	printf("    --- full establishment (base[combine]+FEC) cliff (P=0.5, SNR3k dB) ---\n");
+	printf("    R=1: %.2f   R=2: %.2f   R=4: %.2f   (base floor -14.68)\n",
+		est_cliff[0], est_cliff[1], est_cliff[2]);
+	printf("    expected per §4/§14: ~+2.2-2.5 dB/doubling on the matched-count → R=4 ~+4-5 dB vs R=1\n");
+
+	// --- byte-identical-when-off: R=1 TX symbol layout == the pre-§20 single base
+	// block, EXACTLY. The invariant §20 touches is the FRAMED tone placement (the
+	// rep loop), so assert it on the deterministic integer-indexed framed data
+	// (data_container.ofdm_framed_data), NOT the post-FFT passband (which carries
+	// ~1e-11 cross-instance round-off independent of this change). For R=1,
+	// generate_connect_pattern must reproduce the original formula
+	// tone=(connect_tones[s%8]+s*hop)%M for s in [0,16) and nothing beyond. ---
+	{
+		ts.set_connect_preamble_reps(1);
+		const int Nc = ts.data_container.Nc;
+		const int conn_n = ts.ack_mfsk.connect_pattern_nsymb;
+		const int M = ts.ack_mfsk.M;
+		const int hop = ts.ack_mfsk.tone_hop_step;
+		const double amp = std::sqrt((double)Nc / ts.ack_mfsk.nStreams);
+		// Generate the framed CONNECT base+suffix at R=1 into the shared framed buf.
+		ts.ack_mfsk.generate_ctrl_suffix_pattern(ts.data_container.ofdm_framed_data,
+			MFSK_CTRL_START_CONN, p38, crc12);
+		// Verify the base block (first conn_n symbols) is EXACTLY the original layout.
+		bool layout_ok = true; double maxabs = 0.0;
+		for (int s = 0; s < conn_n && layout_ok; s++) {
+			int tone_base = ts.ack_mfsk.connect_tones[s % 8];
+			int actual_tone = (tone_base + s * hop) % M;
+			for (int k = 0; k < Nc; k++) {
+				std::complex<double> got = ts.data_container.ofdm_framed_data[s*Nc + k];
+				std::complex<double> exp(0.0, 0.0);
+				for (int st = 0; st < ts.ack_mfsk.nStreams; st++)
+					if (k == ts.ack_mfsk.stream_offsets[st] + actual_tone) exp = std::complex<double>(amp, 0.0);
+				double d = std::abs(got - exp);
+				if (d > maxabs) maxabs = d;
+				if (d > 1e-12) { layout_ok = false; break; }
+			}
+		}
+		if (!layout_ok) {
+			char b[160]; snprintf(b,sizeof(b),
+				"R=1 base framed layout != original single-block formula (max|diff|=%.3e)", maxabs);
+			test_fail(name, b); return;
+		}
+		printf("    [OFF] R=1 base framed layout EXACTLY matches the pre-§20 single-block formula (max|diff|=%.1e)\n", maxabs);
+	}
+
+	// --- FAR: pure noise through the COMBINED (R=4) production decode ----------
+	ts.set_connect_preamble_reps(4);
+	const int n_sig4 = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead4 = 4096; const int total4 = n_sig4 + 2*lead4;
+	// recompute sig_rms at R=4 for the far_sigma reference
+	{
+		std::vector<double> c4((size_t)total4, 0.0);
+		ts.generate_ctrl_suffix_pattern_passband(c4.data()+lead4, MFSK_CTRL_START_CONN, p38, crc12);
+		double psum=0.0; for(int i=0;i<n_sig4;i++){double v=c4[(size_t)(lead4+i)];psum+=v*v;}
+		const double sig_rms4 = std::sqrt(psum/n_sig4);
+		const int FT = 4000;
+		const double far_sigma = 14.0 * sig_rms4;
+		int false_accepts = 0;
+		std::mt19937 frng(0xFA20C0DEu);
+		std::normal_distribution<double> fnd(0.0, far_sigma);
+		std::vector<double> w4((size_t)total4, 0.0);
+		for (int t=0;t<FT;t++) {
+			for (int i=0;i<total4;i++) w4[(size_t)i]=fnd(frng);
+			mfsk_ctrl_frame_type rt; uint64_t rp=0; uint16_t rc=0; int rmm=0;
+			if (ts.decode_ctrl_suffix_from_passband(w4.data(), total4, &rt,&rp,&rc,&rmm, prod_crc12_cb, &arq))
+				false_accepts++;
+		}
+		printf("    --- FAR (pure noise, sigma=14×rms, %d trials, R=4 combined+FEC path) ---\n", FT);
+		printf("    combined CONNECT decode : %d/%d false accepts (count gate %d/%d + CRC12 + 2-bit type)\n",
+			false_accepts, FT, conn_thr, ts.ack_mfsk.connect_pattern_nsymb);
+
+		// restore defaults for later tests (process-global gf16ra)
+		ts.set_connect_preamble_reps(1);
+		ts.set_suffix_fec(false);
+		gf16ra::configure(2);
+
+		// --- ASSERT 1 (HEADLINE / FAIL-BEFORE-PASSES): R=4 base-pattern matched-count
+		// cliff materially deeper than R=1. On the pre-§20 binary combine_reps is
+		// ignored → all three cliffs equal → this FAILS. Threshold +1.5 dB is
+		// conservative vs the measured +4-5 dB (§4 R=5 +3.74; §14 R=4 +2.50). ---
+		double base_gain = base_cliff[0] - base_cliff[2];   // positive = deeper at R=4
+		if (!(base_cliff[0] < 1e8 && base_cliff[2] < 1e8 && base_gain >= 1.5)) {
+			char b[256]; snprintf(b,sizeof(b),
+				"base-pattern combining gain R1->R4 = %.2f dB (R1=%.2f R4=%.2f) did NOT reach the "
+				"+1.5 dB floor — combining not deepening the matched-count (combine_reps ignored?)",
+				base_gain, base_cliff[0], base_cliff[2]);
+			test_fail(name, b); return;
+		}
+		// ASSERT 2: FAR clean on the combined path.
+		if (false_accepts > 0) {
+			char b[200]; snprintf(b,sizeof(b),
+				"FAR = %d/%d false CONNECT accepts on pure noise through the combined path", false_accepts, FT);
+			test_fail(name, b); return;
+		}
+		printf("    [ASSERT OK] base-pattern combining deepens the matched-count cliff %+.2f dB (R1->R4); "
+			"full establishment cliff R1=%.2f -> R4=%.2f; FAR %d/%d; byte-identical-when-off confirmed.\n",
+			base_gain, est_cliff[0], est_cliff[2], false_accepts, FT);
+	}
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -4586,6 +4812,13 @@ int run_mfsk_ctrl_codec_tests() {
 	// metric band (fail-before on the 3.0 binary), decode-cliff depth, and
 	// pure-noise FAR on the uncoded CONNECT path.
 	test_ctrl_suffix_metric_gate_cliff_sweep();
+
+	// §20 INCREMENT 2: noncoherent base-pattern COMBINING on the CONNECT
+	// handshake. MEASURE the base-pattern matched-count cliff at R=1/2/4
+	// (+2.2-2.5 dB/doubling expected) + the full establishment cliff; ASSERT
+	// R=4 deepens the matched-count materially vs R=1, byte-identical-when-off,
+	// FAR=0 on the combined path.
+	test_connect_preamble_combining_cliff_sweep();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
