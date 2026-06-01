@@ -306,6 +306,25 @@ public:
 	double fsel_amp;     // second-ray amplitude (linear), default 0.6
 	int    fsel_delay;   // second-ray delay in passband samples, default 128
 
+	// === Watterson FADING spike (baud-fading-spike.md, SIM ONLY) ===========
+	// The make-or-break (c) coherence-time gate: P0 proved baud-scaling buys
+	// +3.5 dB/2x in AWGN by lengthening the coherent MFSK symbol (Nfft). But a
+	// longer symbol is more fading-sensitive — if the channel decorrelates
+	// within the longer FFT window (T_coherence < symbol duration) the coherent
+	// integration degrades and the gain evaporates (the FST4 coherence wall).
+	// The shipped sim has ONLY AWGN + a STATIC 2-ray tap (fsel, no Doppler), so
+	// it cannot test this. apply_watterson_fading adds a time-varying ITU-R
+	// F.1487 / Watterson 2-path channel (PathSim AE4JY algorithm: per-path
+	// complex-Gaussian tap gain through a Gaussian-shaped LPF whose 2-sigma BW =
+	// Doppler spread, applied to the analytic signal). Env-gated, MFSK-only,
+	// applied in passband_test_EsN0 BEFORE AWGN. Off by default => byte-identical.
+	//   MERCURY_FADING=1            enable
+	//   MERCURY_FADING_DOPPLER=<Hz> Doppler spread f_d (default 1.0)
+	//   MERCURY_FADING_DELAY_MS=<ms> 2nd-path delay  (default 1.0)
+	//   MERCURY_FADING_SEED=<n>     RNG seed for the tap process (default 12345)
+	// No production path reads these — pure measurement instrument.
+	void apply_watterson_fading(double* passband, int nSamp);
+
 	// fix/cfg16-nv-restore: fast single-point BER override for PLOT_PASSBAND.
 	// ber_single_esn0 <= -900 (default) = normal full sweep. Otherwise evaluate
 	// one Es/N0 point with ber_frames_override frames and return.
