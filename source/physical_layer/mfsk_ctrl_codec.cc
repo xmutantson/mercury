@@ -140,21 +140,31 @@ bool unpack_start_conn_payload(uint64_t p38, bool* out_nb_flag,
 // MFSK_CTRL_TEST_ACK (type=10) — 38-bit payload
 // =============================================================================
 //
-//   bits 37..36 : echoed_cap     (2)
-//   bits 35..34 : own_cap        (2)
-//   bits 33..26 : ssid           (8)
-//   bits 25..0  : reserved       (26)
+//   bits 37..36 : echoed_cap[1:0] (2)
+//   bits 35..34 : own_cap[1:0]    (2)
+//   bits 33..26 : ssid            (8)
+//   bit  25     : echoed_cap[2]   (1)   CAP_SUFFIX_FEC of echoed peer cap (§21)
+//   bit  24     : own_cap[2]      (1)   CAP_SUFFIX_FEC of responder's own cap (§21)
+//   bits 23..0  : reserved        (24)
 //
+// §21 (tier2-suffix-fec-design.md): the cap fields widen 2→3 bits to carry
+// CAP_SUFFIX_FEC (0x04). The 3rd bit lives in what was reserved-zero space
+// (bits 25/24), so a legacy peer — which packs the whole reserved block as 0
+// and ignores it on RX — negotiates CAP_SUFFIX_FEC=0 and falls back to the
+// uncoded suffix. The low 2 cap bits stay at their original positions so a
+// legacy RX still reads WB_CAPABLE/ENCRYPTION correctly. No flag-day.
 
 void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
                             uint8_t own_cap, uint8_t ssid)
 {
 	if (!p38) return;
 	uint64_t v = 0;
-	v |= ((uint64_t)(echoed_cap & 0x3)) << 36;
+	v |= ((uint64_t)(echoed_cap & 0x3)) << 36;   // low 2 bits (legacy position)
 	v |= ((uint64_t)(own_cap    & 0x3)) << 34;
 	v |= ((uint64_t)(ssid       & 0xFF)) << 26;
-	// reserved (bits 25..0) MUST be zero on TX
+	v |= ((uint64_t)((echoed_cap >> 2) & 0x1)) << 25;  // CAP_SUFFIX_FEC (§21)
+	v |= ((uint64_t)((own_cap    >> 2) & 0x1)) << 24;
+	// reserved (bits 23..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -163,8 +173,8 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 {
 	if (!echoed_cap || !own_cap || !ssid) return false;
 	uint64_t v = p38 & ((1ULL << 38) - 1ULL);
-	*echoed_cap = (uint8_t)((v >> 36) & 0x3);
-	*own_cap    = (uint8_t)((v >> 34) & 0x3);
+	*echoed_cap = (uint8_t)(((v >> 36) & 0x3) | (((v >> 25) & 0x1) << 2));
+	*own_cap    = (uint8_t)(((v >> 34) & 0x3) | (((v >> 24) & 0x1) << 2));
 	*ssid       = (uint8_t)((v >> 26) & 0xFF);
 	return true;
 }
@@ -174,10 +184,13 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 // =============================================================================
 //
 //   bits 37..34 : snr_q          (4)
-//   bits 33..32 : local_cap      (2)
+//   bits 33..32 : local_cap[1:0] (2)
 //   bits 31..24 : ssid           (8)
-//   bits 23..0  : reserved       (24)
+//   bit  23     : local_cap[2]   (1)   CAP_SUFFIX_FEC of sender's own cap (§21)
+//   bits 22..0  : reserved       (23)
 //
+// §21: same 2→3-bit cap widening as TEST_ACK — the 3rd bit (CAP_SUFFIX_FEC)
+// sits in former-reserved bit 23, legacy-safe (legacy packs 0, ignores on RX).
 
 void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
                              uint8_t local_cap, uint8_t ssid)
@@ -185,9 +198,10 @@ void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
 	if (!p38) return;
 	uint64_t v = 0;
 	v |= ((uint64_t)(snr_q     & 0xF))  << 34;
-	v |= ((uint64_t)(local_cap & 0x3))  << 32;
+	v |= ((uint64_t)(local_cap & 0x3))  << 32;   // low 2 bits (legacy position)
 	v |= ((uint64_t)(ssid      & 0xFF)) << 24;
-	// reserved (bits 23..0) MUST be zero on TX
+	v |= ((uint64_t)((local_cap >> 2) & 0x1)) << 23;  // CAP_SUFFIX_FEC (§21)
+	// reserved (bits 22..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -197,7 +211,7 @@ bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
 	if (!snr_q || !local_cap || !ssid) return false;
 	uint64_t v = p38 & ((1ULL << 38) - 1ULL);
 	*snr_q     = (uint8_t)((v >> 34) & 0xF);
-	*local_cap = (uint8_t)((v >> 32) & 0x3);
+	*local_cap = (uint8_t)(((v >> 32) & 0x3) | (((v >> 23) & 0x1) << 2));
 	*ssid      = (uint8_t)((v >> 24) & 0xFF);
 	return true;
 }

@@ -1763,6 +1763,28 @@ public:
   uint8_t peer_capability;     // Received from peer via TEST_CONNECTION
   bool wb_upgrade_pending;     // True between SWITCH_BANDWIDTH send and ACK
 
+  // §21 (tier2-suffix-fec-design.md): the enhanced ctrl-suffix (GF(16) RA FEC +
+  // base-pattern combining) is NEGOTIATED via CAP_SUFFIX_FEC. Both sides must
+  // advertise it (WB-capable). peer_capability is valid only after the caps are
+  // exchanged (CMD: after TEST_ACK; RSP: after TEST_CONN) — before that it is 0,
+  // so this returns false (uncoded) during the chicken-and-egg window. The
+  // CONNECT establishment does NOT gate on this (it gates on local robust-tier +
+  // RX try-both, §21.3) because the floor-binding START_CONN is pre-cap; only
+  // the per-batch ACK enhanced path consults it.
+  bool suffix_fec_negotiated() const {
+    return (local_capability & peer_capability & CAP_SUFFIX_FEC) != 0;
+  }
+  // The per-batch ACK enhanced-suffix gate (§4 / §21.3): enhanced ONLY at the
+  // robust tier (the deep-floor proxy, reusing the gearshift config — no new
+  // state) AND only when CAP_SUFFIX_FEC is mutually negotiated. At CONFIG_6+ OR
+  // cap-absent this is false → the ACK is byte-identical uncoded (the hard
+  // throughput-neutrality constraint). NOTE: this is the GATE PREDICATE; the
+  // enhanced-ACK TX ENABLE is held off this increment (§21.3) so the ACK is
+  // byte-identical in 100% of cases — flip the enable behind its own HW test.
+  bool ack_suffix_fec_eligible() const {
+    return is_robust_config(current_configuration) && suffix_fec_negotiated();
+  }
+
   // v9 handshake echo state. handshake_confirmed gates CMD's
   // CONNECTION_ACCEPTED → NEGOTIATING/CONNECTED transition. retries_left
   // counts failed echo validations before dropping with explicit error.

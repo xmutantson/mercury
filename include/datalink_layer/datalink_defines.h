@@ -125,6 +125,17 @@
 // CLI-only and are now unconditional in the codebase.
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
 #define CAP_ENCRYPTION   0x02   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
+#define CAP_SUFFIX_FEC   0x04   // Supports the enhanced ctrl-suffix (GF(16) RA FEC
+                                // + base-pattern combining) on the MFSK CONNECT/ACK
+                                // handshake (tier2-suffix-fec-design.md §21). Lives
+                                // in the 3rd cap bit (was reserved-zero) — legacy
+                                // peers pack 0 here and ignore it, so a mixed pair
+                                // negotiates it OFF and falls back to the uncoded
+                                // 13-tone suffix. No flag-day.
+// Bits 0..2 are the negotiable cap bits carried in the 3-bit MFSK ctrl-suffix cap
+// fields (TEST_ACK echoed_cap/own_cap, TEST_CONN local_cap). Packers/unpackers
+// mask to this; higher bits are not on the MFSK wire.
+#define CAP_NEGOTIABLE_MASK 0x07
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };

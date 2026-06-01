@@ -1494,40 +1494,60 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		fflush(stdout);
 	}
 
-	// §19/§20 A/B knobs (env-gated, OFF by default → production byte-identical).
+	// §21 (tier2-suffix-fec-design.md): PRODUCTION enhanced-CONNECT enable.
 	// telecom_system->load_configuration() (just above) recomputed
 	// ctrl_suffix_pattern_passband_samples at the UNCODED 13-tone / single-base
 	// length, so the FEC + combining state must be RE-APPLIED on every config
 	// switch (the set_* hooks re-derive that member at the current Nofdm).
-	//   MERCURY_SUFFIX_FEC=1   → GF(16) RA FEC on the CONNECT ctrl-suffix (§19).
-	//   MERCURY_CONNECT_REPS=N → base-pattern combining, N reps (§20; 1=off).
-	// Cached on first call (no getenv() in the hot config-switch path on Pi).
+	//
+	// The enhanced ctrl-suffix (GF(16) RA FEC §19 + base-pattern combining §20) is
+	// the unified CAP_SUFFIX_FEC feature. PRODUCTION TRIGGER = LOCAL robust tier
+	// (§21.3): when the session is at ROBUST_0/1/2 the CONNECT suffix is enhanced
+	// (FEC R¼ + combining R=4) — once/session, airtime-cheap (§4: +2% of a 7.9 s
+	// ROBUST frame). The CONNECT enable does NOT gate on CAP negotiation because
+	// the floor-binding START_CONN is PRE-CAP (§21.3 chicken-and-egg); a legacy RX
+	// simply fails the enhanced frame and the LDPC-fallback / handshake-retry path
+	// recovers (and the upgraded RX runs try-both, §21.5). At OFDM configs
+	// (CONFIG_6+) the enhanced state is turned OFF → the CONNECT suffix is
+	// byte-identical (and CONNECT establishment normally happens at the robust
+	// floor anyway). Re-applied on EVERY config switch so a turboshift up to OFDM
+	// disables it and a fall back to robust re-enables it.
+	//
+	// TEST OVERRIDE: MERCURY_SUFFIX_FEC=1 / MERCURY_CONNECT_REPS=N force the state
+	// regardless of tier (for pinned-config sim/HW A/B). The env knob, when set,
+	// WINS over the tier trigger. Cached on first call (no getenv() in the hot
+	// config-switch path on Pi).
 	{
 		static int  fec_env_cached   = 0;
-		static int  fec_env_on        = 0;
+		static int  fec_env_force     = -1;   // -1 = unset, 0/1 = forced value
 		static int  reps_env_cached   = 0;
-		static int  reps_env_val      = 1;
+		static int  reps_env_force     = -1;   // -1 = unset, >=1 = forced reps
 		if(!fec_env_cached)
 		{
 			const char* e = std::getenv("MERCURY_SUFFIX_FEC");
-			fec_env_on = (e != nullptr && e[0] == '1') ? 1 : 0;
+			if(e != nullptr) { fec_env_force = (e[0] == '1') ? 1 : 0;
+				printf("[CFG] MERCURY_SUFFIX_FEC override = %d (test)\n", fec_env_force); fflush(stdout); }
 			fec_env_cached = 1;
-			if(fec_env_on) { printf("[CFG] MERCURY_SUFFIX_FEC=1 — GF(16) RA FEC ON (CONNECT ctrl-suffix)\n"); fflush(stdout); }
 		}
 		if(!reps_env_cached)
 		{
 			const char* e = std::getenv("MERCURY_CONNECT_REPS");
-			reps_env_val = (e != nullptr) ? atoi(e) : 1;
-			if(reps_env_val < 1) reps_env_val = 1;
+			if(e != nullptr) { reps_env_force = atoi(e); if(reps_env_force < 1) reps_env_force = 1;
+				printf("[CFG] MERCURY_CONNECT_REPS override = %d (test)\n", reps_env_force); fflush(stdout); }
 			reps_env_cached = 1;
-			if(reps_env_val > 1) { printf("[CFG] MERCURY_CONNECT_REPS=%d — base-pattern combining ON\n", reps_env_val); fflush(stdout); }
 		}
-		// Re-apply after each load_configuration (idempotent; WB-only — NB has
-		// connect_pattern_nsymb=0 so the set_* hooks no-op the passband member).
-		if(fec_env_on)
-			telecom_system->set_suffix_fec(true, 3);
-		if(reps_env_val > 1)
-			telecom_system->set_connect_preamble_reps(reps_env_val);
+		// Production trigger: enhanced CONNECT at the robust tier.
+		bool robust_tier = is_robust_config(configuration);
+		bool fec_on  = (fec_env_force >= 0) ? (fec_env_force == 1) : robust_tier;
+		int  reps    = (reps_env_force >= 0) ? reps_env_force
+		                                     : (robust_tier ? CONNECT_PREAMBLE_REPS_PROD : 1);
+		// Apply (idempotent; WB-only — NB has connect_pattern_nsymb=0 so the set_*
+		// hooks no-op the passband member). DISABLE at OFDM so the CONNECT suffix
+		// is byte-identical there. set_connect_preamble_reps must be called AFTER
+		// set_suffix_fec (both re-derive ctrl_suffix_pattern_passband_samples from
+		// the CURRENT coded-suffix length × base reps; reps last = correct member).
+		telecom_system->set_suffix_fec(fec_on, 3);
+		telecom_system->set_connect_preamble_reps(reps);
 	}
 }
 
@@ -2728,7 +2748,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | ((bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0);  // §21: advertise enhanced ctrl-suffix when WB-capable
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2825,7 +2845,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | ((bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0);  // §21: advertise enhanced ctrl-suffix when WB-capable
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2879,7 +2899,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | CAP_SUFFIX_FEC;  // §21: WB → advertise enhanced ctrl-suffix
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2898,7 +2918,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | CAP_SUFFIX_FEC;  // §21: WB → advertise enhanced ctrl-suffix
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -4460,9 +4480,33 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	// Runtime guard: NB session (M=8) has ack_sack_suffix_len()==0.
 	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
 		return 0;
+
+	// §21.3 per-batch ACK ADAPTIVE gate: the enhanced (GF(16) FEC) ACK suffix is
+	// eligible ONLY at the robust tier AND when CAP_SUFFIX_FEC is mutually
+	// negotiated — CONFIG_6+ or cap-absent → uncoded → byte-identical (the hard
+	// throughput-neutrality constraint). The ENABLE is held off (ARQ_ACK_SUFFIX_
+	// FEC_ENABLE=0, §21.3) pending the ACK coded-window sizing work, so this stays
+	// false in 100% of cases this increment — the predicate is wired + observable
+	// so flipping the master enable is a one-line follow-on. We set the per-call
+	// flag from the gate and clear it after TX so it can never leak to a later
+	// non-eligible ACK (the §21.1-class shared-state discipline).
+	bool ack_fec_eligible = ack_suffix_fec_eligible();
+	telecom_system->ack_mfsk.ack_suffix_fec_coded =
+		(ARQ_ACK_SUFFIX_FEC_ENABLE != 0) && ack_fec_eligible;
+	if(g_verbose && ack_fec_eligible)
+	{
+		printf("[TX-MFSK-ACK-SACK] enhanced-ACK eligible (robust tier + CAP_SUFFIX_FEC); "
+			"enable=%d coded=%d\n", (int)(ARQ_ACK_SUFFIX_FEC_ENABLE != 0),
+			(int)telecom_system->ack_mfsk.ack_suffix_fec_coded);
+		fflush(stdout);
+	}
+
 	int nsymb = telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
 	if(nsymb <= 0 || telecom_system->ack_sack_pattern_passband_samples <= 0)
+	{
+		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 		return 0;
+	}
 
 	auto t_start = std::chrono::steady_clock::now();
 
@@ -4602,6 +4646,11 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		msleep(1);
 
 	ptt_off();
+
+	// §21.3: clear the per-call ACK FEC flag so it can NEVER leak to a later,
+	// non-eligible ACK (e.g. after a turboshift to an OFDM config). The CONNECT
+	// suffix_fec_coded is untouched — this is the ACK-only flag.
+	telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

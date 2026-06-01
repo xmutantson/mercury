@@ -205,12 +205,13 @@ static void test_pack_unpack_start_conn_payload() {
 static void test_pack_unpack_test_ack_payload() {
 	const char* name = "pack_unpack_test_ack_payload";
 	std::mt19937 rng(0xC0DE);
-	// Cover full echoed_cap × own_cap × representative SSID set.
+	// §21: cap fields are now 3 bits (CAP_NEGOTIABLE_MASK=0x07: WB|ENCRYPTION|
+	// SUFFIX_FEC). Cover the full 3-bit echoed_cap × own_cap × representative SSID.
 	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
-	for (int ec = 0; ec < 4; ec++) {
-		for (int oc = 0; oc < 4; oc++) {
+	for (int ec = 0; ec < 8; ec++) {
+		for (int oc = 0; oc < 8; oc++) {
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();
@@ -219,9 +220,9 @@ static void test_pack_unpack_test_ack_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				if ((p38 & ((1ULL << 26) - 1ULL)) != 0) {
-					// reserved bits must be zero on TX
-					test_fail(name, "reserved bits not zero on TX");
+				// reserved is now bits 23..0 (cap bit-2 moved into 25/24).
+				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (23..0) not zero on TX");
 					return;
 				}
 				uint8_t out_ec = 0xFF, out_oc = 0xFF, out_ssid = 0;
@@ -239,6 +240,24 @@ static void test_pack_unpack_test_ack_payload() {
 			}
 		}
 	}
+	// §21 legacy-compat: a LEGACY peer packs only the low 2 cap bits (bit-2 stays
+	// in reserved-zero). Decode such a wire value → CAP_SUFFIX_FEC must read 0,
+	// and the low 2 bits must survive intact (so WB/ENCRYPTION still negotiate).
+	for (int ec2 = 0; ec2 < 4; ec2++) {
+		for (int oc2 = 0; oc2 < 4; oc2++) {
+			uint64_t legacy = 0;
+			legacy |= ((uint64_t)(ec2 & 0x3)) << 36;
+			legacy |= ((uint64_t)(oc2 & 0x3)) << 34;
+			legacy |= ((uint64_t)42u) << 26;   // arbitrary ssid; bits 25..0 = 0 (legacy reserved)
+			uint8_t lec = 0xFF, loc = 0xFF, lss = 0;
+			bool ok = unpack_test_ack_payload(legacy, &lec, &loc, &lss);
+			if (!ok || lec != (uint8_t)ec2 || loc != (uint8_t)oc2 ||
+			    (lec & CAP_SUFFIX_FEC) || (loc & CAP_SUFFIX_FEC) || lss != 42u) {
+				test_fail(name, "legacy 2-bit cap wire decoded with SUFFIX_FEC set or low bits lost");
+				return;
+			}
+		}
+	}
 	(void)trials;
 	test_pass(name);
 }
@@ -251,7 +270,7 @@ static void test_pack_unpack_test_conn_payload() {
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
 	for (int snr_q = 0; snr_q < 16; snr_q++) {
-		for (int lc = 0; lc < 4; lc++) {
+		for (int lc = 0; lc < 8; lc++) {   // §21: local_cap now 3 bits
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();  // pre-set garbage
@@ -261,9 +280,9 @@ static void test_pack_unpack_test_conn_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
-					// reserved bits 23..0 must be zero on TX
-					test_fail(name, "reserved bits not zero on TX");
+				// reserved is now bits 22..0 (cap bit-2 moved into bit 23).
+				if ((p38 & ((1ULL << 23) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (22..0) not zero on TX");
 					return;
 				}
 				uint8_t out_snr = 0xFF, out_lc = 0xFF, out_ssid = 0;
@@ -282,6 +301,21 @@ static void test_pack_unpack_test_conn_payload() {
 				}
 				trials++;
 			}
+		}
+	}
+	// §21 legacy-compat: legacy peer packs 2-bit local_cap, bit-2 stays in
+	// reserved-zero. Decode → CAP_SUFFIX_FEC=0, low 2 bits + ssid intact.
+	for (int lc2 = 0; lc2 < 4; lc2++) {
+		uint64_t legacy = 0;
+		legacy |= ((uint64_t)9u) << 34;            // arbitrary snr_q
+		legacy |= ((uint64_t)(lc2 & 0x3)) << 32;
+		legacy |= ((uint64_t)55u) << 24;           // arbitrary ssid; bits 23..0 = 0
+		uint8_t lsnr = 0xFF, llc = 0xFF, lss = 0;
+		bool ok = unpack_test_conn_payload(legacy, &lsnr, &llc, &lss);
+		if (!ok || llc != (uint8_t)lc2 || (llc & CAP_SUFFIX_FEC) ||
+		    lsnr != 9u || lss != 55u) {
+			test_fail(name, "legacy 2-bit local_cap wire decoded with SUFFIX_FEC set or fields lost");
+			return;
 		}
 	}
 	(void)trials;
@@ -308,7 +342,7 @@ static void test_ctrl_suffix_roundtrip_all_types() {
 			uint16_t crc12 = (uint16_t)(rng() & 0x0FFF);
 
 			int tones[16] = {0};
-			int n = m.pack_ctrl_suffix(types[ti], payload38, crc12, tones);
+			int n = m.pack_ctrl_suffix(types[ti], payload38, crc12, tones, /*fec=*/false);
 			if (n != 13) {
 				test_fail(name, "pack_ctrl_suffix did not write 13 tones");
 				return;
@@ -358,7 +392,7 @@ static void test_ctrl_suffix_crc12_corruption() {
 		uint16_t crc12 = test_crc12_calc(bytes, 5);
 
 		int tones[16];
-		m.pack_ctrl_suffix(type, payload38, crc12, tones);
+		m.pack_ctrl_suffix(type, payload38, crc12, tones, /*fec=*/false);
 
 		// Flip one random bit somewhere in the type+payload region (bits
 		// 51..12 of the 52-bit field). The CRC field sits in the low 12
@@ -4723,6 +4757,282 @@ static void test_connect_preamble_combining_cliff_sweep() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §21 PRODUCTION CAP/adaptive wiring — gate tests (tier2-suffix-fec-design.md §21)
+// =============================================================================
+//
+//   21.1 suffix_fec_cap_negotiation_matrix       — interop: upgraded/mixed/legacy
+//   21.2 ack_suffix_throughput_neutral           — ACK byte-identical regardless of
+//                                                   the CONNECT FEC state (the §21.1 fix)
+//   21.3 connect_suffix_byte_identical_when_off   — CONNECT suffix byte-identical
+//                                                   when FEC/combining off (CAP absent)
+//   21.4 production_enhanced_connect_decodes      — the production set-hook enable
+//                                                   (robust tier) yields a decodable
+//                                                   enhanced CONNECT (try-both RX)
+
+// §21.1 — INTEROP MATRIX. CAP_SUFFIX_FEC negotiates ON only when BOTH peers
+// advertise it; mixed / legacy pairs negotiate OFF. Also verifies the bit
+// survives the TEST_ACK / TEST_CONN cap-field wire round-trip (the 3-bit widening)
+// AND that ack_suffix_fec_eligible() additionally requires the robust tier.
+static void test_suffix_fec_cap_negotiation_matrix() {
+	const char* name = "suffix_fec_cap_negotiation_matrix";
+	// --- wire round-trip: CAP_SUFFIX_FEC survives the 3-bit TEST_ACK/TEST_CONN field ---
+	for (uint8_t cap = 0; cap <= CAP_NEGOTIABLE_MASK; cap++) {
+		uint64_t pa = 0; pack_test_ack_payload(&pa, cap, cap, 7);
+		uint8_t ea = 0xFF, oa = 0xFF, sa = 0;
+		if (!unpack_test_ack_payload(pa, &ea, &oa, &sa) ||
+		    ea != cap || oa != cap ||
+		    ((ea & CAP_SUFFIX_FEC) != (cap & CAP_SUFFIX_FEC))) {
+			test_fail(name, "TEST_ACK cap field did not round-trip CAP_SUFFIX_FEC"); return;
+		}
+		uint64_t pc = 0; pack_test_conn_payload(&pc, 5, cap, 9);
+		uint8_t sc = 0xFF, lc = 0xFF, ssc = 0;
+		if (!unpack_test_conn_payload(pc, &sc, &lc, &ssc) ||
+		    lc != cap || ((lc & CAP_SUFFIX_FEC) != (cap & CAP_SUFFIX_FEC))) {
+			test_fail(name, "TEST_CONN cap field did not round-trip CAP_SUFFIX_FEC"); return;
+		}
+	}
+	// --- negotiation predicate: ON iff BOTH sides advertise the bit ---
+	cl_arq_controller arq;
+	struct { uint8_t loc, peer; bool exp; const char* label; } cases[] = {
+		{ CAP_WB_CAPABLE|CAP_SUFFIX_FEC, CAP_WB_CAPABLE|CAP_SUFFIX_FEC, true,  "upgraded<->upgraded" },
+		{ CAP_WB_CAPABLE|CAP_SUFFIX_FEC, CAP_WB_CAPABLE,                false, "upgraded<->legacy"   },
+		{ CAP_WB_CAPABLE,                CAP_WB_CAPABLE|CAP_SUFFIX_FEC, false, "legacy<->upgraded"   },
+		{ CAP_WB_CAPABLE,                CAP_WB_CAPABLE,                false, "legacy<->legacy"     },
+		{ CAP_WB_CAPABLE|CAP_SUFFIX_FEC, 0,                            false, "upgraded<->unknown(0)"},
+	};
+	for (auto& c : cases) {
+		arq.local_capability = c.loc;
+		arq.peer_capability  = c.peer;
+		if (arq.suffix_fec_negotiated() != c.exp) {
+			char b[160]; snprintf(b, sizeof(b),
+				"%s: suffix_fec_negotiated()=%d expected=%d (loc=0x%02X peer=0x%02X)",
+				c.label, (int)arq.suffix_fec_negotiated(), (int)c.exp, c.loc, c.peer);
+			test_fail(name, b); return;
+		}
+	}
+	// --- adaptive ACK gate: negotiated AND robust tier ---
+	arq.local_capability = CAP_WB_CAPABLE|CAP_SUFFIX_FEC;
+	arq.peer_capability  = CAP_WB_CAPABLE|CAP_SUFFIX_FEC;
+	arq.current_configuration = ROBUST_0;
+	if (!arq.ack_suffix_fec_eligible()) { test_fail(name, "ack gate should be eligible at ROBUST_0 + negotiated"); return; }
+	arq.current_configuration = CONFIG_10;   // OFDM
+	if (arq.ack_suffix_fec_eligible())  { test_fail(name, "ack gate must be INELIGIBLE at CONFIG_10 (throughput-neutral)"); return; }
+	arq.current_configuration = ROBUST_0;
+	arq.peer_capability = CAP_WB_CAPABLE;    // cap absent
+	if (arq.ack_suffix_fec_eligible())  { test_fail(name, "ack gate must be INELIGIBLE when CAP not negotiated"); return; }
+	test_pass(name);
+}
+
+// §21.2 — THROUGHPUT-NEUTRALITY (the user's HARD constraint). The data-ACK
+// suffix WIRE CONTENT (the per-symbol tones + symbol count) MUST be byte-identical
+// regardless of the CONNECT FEC/combining state. This is the §21.1 fix:
+// pack_ctrl_suffix no longer reads a global, so an FEC-on CONNECT session can
+// NEVER code the ACK. We pack the ACK suffix tones twice — once with the CONNECT
+// FEC + combining FORCED ON (set_suffix_fec(true,3) + reps=4), once fully OFF —
+// and assert the emitted tone vector + symbol count are byte-identical. (Pre-§21
+// this FAILS: pack_ack_sack_payload inherited suffix_fec_coded and emitted a
+// 52-tone GF(16) codeword instead of the 13-tone hard pack.) We assert on the
+// TONES (the deterministic wire content), NOT the modulated passband doubles —
+// build_ack_sack_audio's passband has pre-existing run-to-run modulation
+// nondeterminism (a shared OFDM scratch buffer at the symbol boundary, ~0.7
+// magnitude, present even with NOTHING changed between two builds — orthogonal to
+// this increment; each real TX zeroes its buffers in the send path). ALSO assert
+// the ACK passband SAMPLE COUNT is unchanged (the airtime — what "no bloat" means).
+// ack_suffix_fec_coded stays false (the enable is held off, §21.3) so the ACK is
+// byte-identical in 100% of cases.
+static void test_ack_suffix_throughput_neutral() {
+	const char* name = "ack_suffix_throughput_neutral";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	if (ts.ack_mfsk.ack_sack_suffix_len() != 13) { test_fail(name, "expected 13-tone ACK suffix at M=16"); return; }
+
+	uint8_t bsi = 0x5A; uint32_t bitmap = 0x0AAAAAAAu; uint16_t crc12 = 0x123;
+	int samps_off = ts.ack_sack_pattern_passband_samples;
+	int t_off[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	int n_off = ts.ack_mfsk.pack_ack_sack_payload(bsi, bitmap, crc12, t_off);
+
+	// Force the CONNECT enhanced state ON (exactly what load_configuration does at
+	// the robust tier). The ACK wire content + airtime must be UNAFFECTED.
+	ts.set_suffix_fec(true, 3);
+	ts.set_connect_preamble_reps(4);
+	if (!ts.ack_mfsk.suffix_fec_coded) { test_fail(name, "set_suffix_fec(true) did not enable CONNECT FEC"); return; }
+	if (ts.ack_mfsk.ack_suffix_fec_coded) { test_fail(name, "ACK FEC flag must NOT follow the CONNECT enable (§21.1)"); return; }
+	int samps_on = ts.ack_sack_pattern_passband_samples;
+	int t_on[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	int n_on = ts.ack_mfsk.pack_ack_sack_payload(bsi, bitmap, crc12, t_on);
+
+	ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2);  // restore
+
+	// (a) airtime: ACK passband sample count unchanged (no FEC bloat on the ACK).
+	if (samps_off != samps_on) {
+		char b[160]; snprintf(b, sizeof(b),
+			"ACK airtime changed with CONNECT FEC on: %d -> %d samples (FEC bloat on the ACK!)",
+			samps_off, samps_on);
+		test_fail(name, b); return;
+	}
+	// (b) wire content: identical tone count (13, NOT the 52-tone GF(16) codeword).
+	if (n_off != 13 || n_on != 13) {
+		char b[160]; snprintf(b, sizeof(b),
+			"ACK suffix tone COUNT changed: off=%d on=%d (expected 13 both — the §21.1 ACK-inherits-FEC bug)",
+			n_off, n_on);
+		test_fail(name, b); return;
+	}
+	// (c) wire content: identical tone VALUES.
+	for (int i = 0; i < 13; i++) {
+		if (t_off[i] != t_on[i]) {
+			char b[160]; snprintf(b, sizeof(b),
+				"ACK suffix tone[%d] changed: off=%d on=%d (ACK inheriting CONNECT FEC — §21.1)",
+				i, t_off[i], t_on[i]);
+			test_fail(name, b); return;
+		}
+	}
+	printf("    [ASSERT OK] data-ACK wire byte-identical with CONNECT FEC+combining ON vs OFF "
+		"(13 tones unchanged, %d passband samples unchanged); throughput-neutral.\n", samps_off);
+	test_pass(name);
+}
+
+// §21.3 — CONNECT suffix byte-identical when the enhanced state is OFF (the
+// CAP-absent / OFDM case). Decode the uncoded production path with FEC off and
+// confirm it matches a known START_CONN — i.e. turning the feature off restores
+// the exact pre-§19 wire. (Complements test_gf16_ra_byte_identical_when_off by
+// exercising it through the set_suffix_fec(false) production toggle.)
+static void test_connect_suffix_byte_identical_when_off() {
+	const char* name = "connect_suffix_byte_identical_when_off";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	// Toggle FEC on then OFF — must leave the uncoded 13-tone wire intact.
+	ts.set_suffix_fec(true, 3); ts.set_connect_preamble_reps(4);
+	ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2);
+	if (ts.ack_mfsk.suffix_fec_coded || ts.ack_mfsk.ctrl_suffix_len() != 13 ||
+	    ts.ack_mfsk.connect_base_total_nsymb() != ts.ack_mfsk.connect_pattern_nsymb) {
+		test_fail(name, "set_suffix_fec(false)/reps(1) did not restore the uncoded single-base state"); return;
+	}
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "N0CALL", 6);
+	int active = 0;
+	std::vector<double> audio = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, active);
+	mfsk_ctrl_frame_type t; uint64_t rp = 0; uint16_t rc = 0; int mm = 0;
+	// crc12_fn=nullptr → forces the pure uncoded path (FEC needs the callback).
+	bool ok = ts.decode_ctrl_suffix_from_passband(audio.data(), (int)audio.size(),
+		&t, &rp, &rc, &mm, nullptr, nullptr);
+	if (!ok || t != MFSK_CTRL_START_CONN || rp != p38) {
+		test_fail(name, "uncoded production CONNECT decode broken after FEC toggle-off"); return;
+	}
+	test_pass(name);
+}
+
+// §21.4 — the PRODUCTION enhanced CONNECT (FEC + combining via the set hooks, as
+// load_configuration applies at the robust tier) produces a passband that the
+// production try-both RX decodes on a clean channel. This is the integration
+// check that the CAP/adaptive wiring did not break the §19/§20 enhanced path
+// (the deep-floor cliff itself is the existing test_gf16_ra_production_path /
+// test_connect_preamble_combining sweeps; here we confirm the production-config
+// CONNECT encodes+decodes through the try-both decoder end to end).
+static void test_production_enhanced_connect_decodes() {
+	const char* name = "production_enhanced_connect_decodes";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	// Apply the production robust-tier enable (FEC R¼ + combining R=4).
+	ts.set_suffix_fec(true, 3);
+	ts.set_connect_preamble_reps(CONNECT_PREAMBLE_REPS_PROD);
+	int N = ts.ack_mfsk.ctrl_suffix_len();
+	if (N != gf16ra::codeword_len() || N <= 13) { test_fail(name, "FEC not active (ctrl_suffix_len!=N)"); ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2); return; }
+
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "W1AW", 4);
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	int n_samples = ts.ctrl_suffix_pattern_passband_samples;
+	std::vector<double> audio((size_t)n_samples + 8192, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(audio.data() + 4096,
+		MFSK_CTRL_START_CONN, p38, crc12);
+	bool gen_ok = (written == n_samples && n_samples > 0);
+
+	mfsk_ctrl_frame_type rt; uint64_t rp = 0; uint16_t rc = 0; int mm = 0;
+	bool dec_ok = ts.decode_ctrl_suffix_from_passband(audio.data(), n_samples + 4096,
+		&rt, &rp, &rc, &mm, prod_crc12_cb, &arq);
+
+	ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2);  // restore
+
+	if (!gen_ok) { test_fail(name, "production enhanced CONNECT TX (generate) failed"); return; }
+	if (!dec_ok || rt != MFSK_CTRL_START_CONN || rp != p38) {
+		char b[200]; snprintf(b, sizeof(b),
+			"production enhanced CONNECT did not decode clean (ok=%d type=%d p38 tx=0x%llx rx=0x%llx matched=%d)",
+			(int)dec_ok, (int)rt, (unsigned long long)p38, (unsigned long long)rp, mm);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] production enhanced CONNECT (FEC R1/4 + combining R=%d, N=%d) "
+		"encodes + try-both-decodes clean.\n", CONNECT_PREAMBLE_REPS_PROD, N);
+	test_pass(name);
+}
+
+// §21.5 — INTEROP: a LEGACY RX (uncoded, reps=1 detector) decoding an UPGRADED
+// CONNECT. This is the decisive measurement for the combining-vs-FEC interop
+// split (§21.3). It generates the production enhanced CONNECT on a tx-side
+// telecom_system at the requested (fec,reps), and decodes it on a SEPARATE legacy
+// rx-side telecom_system (FEC off, reps=1 — the detector a legacy peer runs).
+// Returns true iff the legacy RX cleanly decodes the START_CONN. (Clean channel.)
+static bool interop_legacy_rx_decodes(bool tx_fec, int tx_reps, uint64_t p38,
+                                      cl_arq_controller& arq) {
+	cl_telecom_system tx; tx.operation_mode = ARQ_MODE; tx.load_configuration(ROBUST_0);
+	tx.set_suffix_fec(tx_fec, 3);
+	tx.set_connect_preamble_reps(tx_reps);
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+	int n = tx.ctrl_suffix_pattern_passband_samples;
+	std::vector<double> audio((size_t)n + 8192, 0.0);
+	int written = tx.generate_ctrl_suffix_pattern_passband(audio.data() + 4096,
+		MFSK_CTRL_START_CONN, p38, crc12);
+	tx.set_connect_preamble_reps(1); tx.set_suffix_fec(false); gf16ra::configure(2);
+	if (written != n || n <= 0) return false;
+
+	// Legacy RX: a stock telecom_system, FEC off, reps=1 (the default after load).
+	cl_telecom_system rx; rx.operation_mode = ARQ_MODE; rx.load_configuration(ROBUST_0);
+	// (do NOT enable FEC/combining on rx — this is the legacy detector)
+	mfsk_ctrl_frame_type rt; uint64_t rp = 0; uint16_t rc = 0; int mm = 0;
+	bool ok = rx.decode_ctrl_suffix_from_passband(audio.data(), n + 4096,
+		&rt, &rp, &rc, &mm, /*crc12_fn=*/nullptr, /*ctx=*/nullptr);
+	// Legacy RX has no FEC → uncoded path. Verify it produced the right frame.
+	bool good = ok && rt == MFSK_CTRL_START_CONN && rp == p38;
+	if (g_verbose)
+		printf("    interop legacy-RX <- tx(fec=%d,reps=%d): decoded=%d type=%d match=%d matched=%d\n",
+			(int)tx_fec, tx_reps, (int)ok, (int)rt, (int)(rp == p38), mm);
+	return good;
+}
+
+// §21.5 — INTEROP MATRIX (clean channel). The enhanced ctrl-suffix is BACKWARD-
+// COMPATIBLE with a legacy RX by construction: (a) the GF(16) RA codeword is
+// SYSTEMATIC — its first 13 tones ARE the hard [type|p38|crc12] pack (MSB-first,
+// matching cl_mfsk::pack_ctrl_suffix), so a legacy hard-argmax RX reads the
+// payload from the systematic prefix and ignores the RA parity; (b) base-pattern
+// combining repeats the IDENTICAL 16-symbol base, and detect_ack_pattern locks on
+// the base rep that leaves room for the suffix (reserve_after), so the suffix is
+// found regardless of reps. We assert a legacy RX cleanly decodes an upgraded TX
+// at every (fec, reps) combo — i.e. an upgraded↔legacy pair establishes. (The
+// upgraded↔upgraded deep-floor reach is the §19/§20 cliff sweeps; the negotiation
+// predicate is test_suffix_fec_cap_negotiation_matrix.)
+static void test_suffix_fec_interop_legacy_rx() {
+	const char* name = "suffix_fec_interop_legacy_rx";
+	cl_arq_controller arq;
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KX9ZZ", 5);
+	struct { bool fec; int reps; const char* label; } arms[] = {
+		{ false, 1, "uncoded/reps1 (today's wire)" },
+		{ true,  1, "FEC/reps1 (systematic prefix)" },
+		{ true,  4, "FEC+combining/reps4 (full enhanced)" },
+		{ false, 4, "combining-only/reps4" },
+	};
+	for (auto& a : arms) {
+		if (!interop_legacy_rx_decodes(a.fec, a.reps, p38, arq)) {
+			char b[200]; snprintf(b, sizeof(b),
+				"legacy RX FAILED to decode upgraded TX [%s] — enhanced suffix NOT backward-compatible",
+				a.label);
+			test_fail(name, b); return;
+		}
+	}
+	printf("    [ASSERT OK] legacy RX decodes upgraded TX at uncoded/FEC/FEC+combining/combining "
+		"(systematic GF(16) prefix + base-rep offset search) — upgraded<->legacy interop holds.\n");
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -4819,6 +5129,16 @@ int run_mfsk_ctrl_codec_tests() {
 	// R=4 deepens the matched-count materially vs R=1, byte-identical-when-off,
 	// FAR=0 on the combined path.
 	test_connect_preamble_combining_cliff_sweep();
+
+	// §21 PRODUCTION CAP/adaptive wiring (tier2-suffix-fec-design.md §21):
+	// the merge-prerequisite. Interop matrix, ACK throughput-neutrality
+	// (byte-identical), CONNECT byte-identical when off, production enhanced
+	// CONNECT encode+try-both-decode.
+	test_suffix_fec_cap_negotiation_matrix();
+	test_suffix_fec_interop_legacy_rx();
+	test_ack_suffix_throughput_neutral();
+	test_connect_suffix_byte_identical_when_off();
+	test_production_enhanced_connect_decodes();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

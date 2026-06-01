@@ -3648,19 +3648,57 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		}
 	}
 
-	// §19 (INCREMENT 1): Tier-2 GF(16) RA FEC decode path. Base detection +
-	// mini-Moose + the 1.2 metric gate above are UNCHANGED — they admit the
-	// decode. When FEC is on we extract the FULL per-tone ENERGY matrix over the
-	// coded suffix (N=ctrl_suffix_len() symbols) and run the soft Q-ary BP
-	// decoder, which carries its own CRC12+2-bit-type accept gate (the FAR
-	// backstop, §16/§17.2). This replaces the hard-argmax decode_suffix_tones +
-	// unpack_ctrl_suffix; the standalone harness decode_gf16ra_from_passband
-	// (mfsk_ctrl_codec_tests.cc) is the proven template. The hard-tone capture
-	// (last_connect_suffix_tones[]) is NOT written on this path — it is the
-	// uncoded path's snapshot and is unused by the CONNECT production caller.
+	// §19 (INCREMENT 1) + §21.5 (TRY-BOTH): Tier-2 GF(16) RA FEC decode path. Base
+	// detection + mini-Moose + the 1.2 metric gate above are UNCHANGED — they admit
+	// the decode. When FEC is on (this RX is at the robust tier, so its capture
+	// window is coded-sized) we FIRST try the cheap uncoded 13-tone decode (so a
+	// legacy peer's uncoded CONNECT still decodes), then — on miss — extract the
+	// FULL per-tone ENERGY matrix over the coded suffix (N=ctrl_suffix_len()
+	// symbols) and run the soft Q-ary BP decoder, which carries its own
+	// CRC12+2-bit-type accept gate (the FAR backstop, §16/§17.2). The hard-tone
+	// capture (last_connect_suffix_tones[]) is NOT written on this path — it is the
+	// uncoded-only path's snapshot and is unused by the CONNECT production caller.
 	if (ack_mfsk.suffix_fec_coded)
 	{
 		if (!crc12_fn) return false;   // FEC needs the production CRC12 callback
+
+		// §21.5 TRY-BOTH: run the UNCODED 13-tone decode FIRST (cost ~0 — a single
+		// argmax read + bit unpack at the same matched offset). This lets an
+		// upgraded robust-tier RX (whose capture window is coded-sized because its
+		// OWN tier gate enabled FEC) still decode a LEGACY peer's uncoded 13-tone
+		// CONNECT suffix. Verify CRC + a valid 2-bit type inline; on success return
+		// the uncoded result. On miss (the usual case when the peer sent the 52-tone
+		// GF(16) codeword — the first 13 of which are NOT the hard bit-pack), fall
+		// through to the FEC decode below. The uncoded read is a strict sub-window
+		// of the coded capture (§21.4 C6), so it is always in-bounds.
+		{
+			int ulen = ack_mfsk.ack_sack_suffix_len();   // 13 at M=16
+			if (ulen > 0 && ulen <= cl_mfsk::MAX_ACK_SACK_SUFFIX) {
+				int utones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+				ofdm.decode_suffix_tones(
+					data_container.baseband_data_interpolated, dec_size, 1,
+					best_offset, ack_mfsk.connect_base_total_nsymb(), ulen,
+					ack_mfsk.tone_hop_step, ack_mfsk.M,
+					ack_mfsk.nStreams, ack_mfsk.stream_offsets, utones);
+				bool uclean = true;
+				for (int i = 0; i < ulen; i++)
+					if (utones[i] < 0 || utones[i] >= ack_mfsk.M) { uclean = false; break; }
+				if (uclean) {
+					mfsk_ctrl_frame_type ut; uint64_t up38 = 0; uint16_t uc = 0;
+					if (ack_mfsk.unpack_ctrl_suffix(utones, &ut, &up38, &uc)) {
+						unsigned char typed[5];
+						pack_ctrl_typed40_msb(typed, (uint8_t)ut, up38);
+						uint16_t exp = crc12_fn(crc12_ctx, typed, 5) & 0x0FFF;
+						if (exp == (uc & 0x0FFF)) {
+							// Uncoded (legacy-compatible) decode validated.
+							*out_type = ut; *out_payload38 = up38; *out_crc12 = uc;
+							return true;
+						}
+					}
+				}
+			}
+		}
+
 		int N = ack_mfsk.ctrl_suffix_len();   // = gf16ra::codeword_len()
 		if (N <= 0 || N > gf16ra::GF16RA_MAX_N) return false;
 		std::vector<double> energies((size_t)N * ack_mfsk.M, 0.0);

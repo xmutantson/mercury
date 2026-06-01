@@ -205,14 +205,28 @@ public:
 	// default) → returns the uncoded 13 → byte-identical-when-off. NB (M<16)
 	// always returns 0 (FEC deferred there). gf16ra owns the active N (it is
 	// configured once at FEC enable); ctrl_suffix_len() never configures.
-	bool suffix_fec_coded;   // default false (set in init())
+	bool suffix_fec_coded;   // default false (set in init()) — the CONNECT-suffix
+	                          // FEC enable (CONNECT-path-LOCAL: ctrl_suffix_len() +
+	                          // generate_ctrl_suffix_pattern + the CONNECT RX decode).
+	// §21: the ACK-suffix FEC enable is SEPARATE from the CONNECT one so the data
+	// ACK can NEVER inherit the CONNECT FEC state (the §21.1 bug — pack_ctrl_suffix
+	// used to read the single global suffix_fec_coded, so an FEC-on CONNECT session
+	// silently coded the data ACK to 52 tones while the ACK generator emitted only
+	// 13 → garbled ACK at every OFDM SNR). Default false = byte-identical ACK. The
+	// ARQ layer sets it per-batch ONLY when ack_suffix_fec_eligible() (robust tier
+	// + CAP negotiated); held off this increment (§21.3) → always 13-tone uncoded.
+	bool ack_suffix_fec_coded;   // default false (set in init())
 	int ctrl_suffix_len() const {
 		if (ack_sack_suffix_len() <= 0) return 0;          // NB: unsupported either way
 		return suffix_fec_coded ? gf16ra::codeword_len() : ack_sack_suffix_len();
 	}
-	// Generic ctrl-suffix codec (52-bit [type:2|payload:38|crc12:12]):
+	// Generic ctrl-suffix codec (52-bit [type:2|payload:38|crc12:12]). §21: `fec`
+	// is an EXPLICIT per-call argument (no longer the global suffix_fec_coded) so
+	// each caller decides independently — CONNECT TX passes suffix_fec_coded, the
+	// ACK packer passes ack_suffix_fec_coded. fec=true emits the GF(16) RA codeword
+	// (gf16ra::codeword_len() tones); fec=false emits the 13-symbol hard bit-pack.
 	int pack_ctrl_suffix(mfsk_ctrl_frame_type type, uint64_t payload38,
-	                     uint16_t crc12, int* out_tones) const;
+	                     uint16_t crc12, int* out_tones, bool fec) const;
 	bool unpack_ctrl_suffix(const int* in_tones,
 	                        mfsk_ctrl_frame_type* out_type,
 	                        uint64_t* out_payload38,

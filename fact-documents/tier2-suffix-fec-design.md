@@ -1135,3 +1135,220 @@ NOT the establishment-floor mover at −18 — the next lever is START_CONN fram
 listen-window timing at the deep floor (a handshake-choreography increment, INCREMENT 3).** This is
 the same "fix isn't at the bottleneck" lesson as §11/§17.4 (BP+OSD, free stack, ctrl-gate) — the SIM
 gate passing is necessary but the HW bottleneck is one stage further down each time.
+
+## §21 PRODUCTION CAP/adaptive wiring — CAP_SUFFIX_FEC + adaptive gating (the merge-prerequisite) (2026-06-01)
+
+Agent (this session). Branch `sim/suffix-fec-production` off `sim/connect-preamble-combining` @9708b08.
+SIM / IN-PROCESS only (HW re-validate of the production config folds into the bundle merge). Goal:
+take the FORCE-ON acquisition stack (§19 GF16 FEC + §20 combining, enabled by the env knobs
+`MERCURY_SUFFIX_FEC=1` / `MERCURY_CONNECT_REPS=4`) and make it the **PRODUCTION-negotiated,
+throughput-neutral** config: `CAP_SUFFIX_FEC` capability, CONNECT always-on-when-applicable, per-batch
+ACK adaptive (robust-tier-only), try-both RX fallback.
+
+### §21.1 The load-bearing pre-existing bug the FORCE-ON config hid (decision-critical)
+
+`cl_mfsk::pack_ctrl_suffix` (mfsk.cc:628) reads the **GLOBAL** `suffix_fec_coded` flag (set 13-tone
+uncoded → 52-tone GF16). **The ACK packer `pack_ack_sack_payload` (mfsk.cc:693) delegates to
+`pack_ctrl_suffix`** → so when `suffix_fec_coded` is globally true (the FORCE-ON config), the ACK
+suffix ALSO becomes a 52-tone GF16 codeword. BUT the ACK generator `generate_ack_sack_pattern`
+(mfsk.cc:813) loops only `ack_sack_suffix_len()`=**13** symbols (line 829) and the ACK RX
+`decode_ack_sack_from_passband` reads **13** uncoded tones throughout (telecom_system.cc:3441, C9).
+**⇒ With FEC globally on, the data ACK transmits the FIRST 13 symbols of a GF16 codeword, RX reads them
+as a hard 13-tone pack → CRC fail → no ACK → retransmit storm at every OFDM operating point.** The
+FORCE-ON HW runs (§17.4/§19.7/§20.9) only ever ran *pinned ROBUST_0 CONNECT establishment* (no data
+ACKs), so this never fired. It is a **throughput-neutrality violation by construction** — the exact
+hard constraint this increment exists to honour. **Root-cause fix (not a band-aid): the FEC decision
+must be PER-CALL, never a global mode that the ACK packer inherits.**
+
+### §21.2 The design as built — FEC is a per-call argument, never a global the ACK inherits
+
+- **`pack_ctrl_suffix` gains an explicit `bool fec` argument** (default `false`). It NO LONGER reads
+  `suffix_fec_coded`. Callers pass the FEC decision explicitly:
+  - CONNECT TX (`generate_ctrl_suffix_pattern`, mfsk.cc:879) passes `suffix_fec_coded` (the CONNECT
+    session enable — CONNECT-path-local).
+  - ACK TX (`pack_ack_sack_payload` → `generate_ack_sack_pattern`) passes a NEW
+    `cl_mfsk::ack_suffix_fec_coded` flag — **independent** of the CONNECT `suffix_fec_coded`. Default
+    `false` → the ACK is **byte-identical** unless the ARQ layer explicitly turns it on for a robust
+    -tier batch. (This increment leaves `ack_suffix_fec_coded` OFF in all paths — see §21.3 ACK
+    decision — so the ACK is byte-identical in 100% of cases; the flag is the plumbing for a future
+    robust-tier ACK FEC, wired and tested but not enabled, so the hard constraint is unconditional.)
+- **`ctrl_suffix_len()` / `connect_base_total_nsymb()` stay CONNECT-only accessors** (the ACK length
+  is `ack_sack_suffix_len()`=13 + `ack_pattern_nsymb`=16, never the coded/combined length — verified
+  C9/§19.4, unchanged). So the CONNECT global enable (`suffix_fec_coded`, `connect_preamble_reps`)
+  physically cannot change the ACK wire length: the ACK generators don't call those accessors.
+- **`CAP_SUFFIX_FEC = 0x04`** (next free cap bit; 0x01 WB, 0x02 ENCRYPTION). Carried in the existing
+  3 ctrl-suffix cap fields — BUT those fields are only 2 bits wide (`pack_test_ack_payload` echoed_cap
+  /own_cap, `pack_test_conn_payload` local_cap). **Widen each cap field 2→3 bits** (steal 1 reserved
+  bit each: TEST_ACK 26→24 reserved, TEST_CONN 24→23 reserved; both have ≥24 spare). Mask
+  `CAP_NEGOTIABLE_MASK = 0x07`. The packers/unpackers mask to 3 bits. Legacy peers (pre-this-commit)
+  pack only the low 2 bits and zero bit-2 on TX, and ignore reserved bits on RX → a legacy↔upgraded
+  pair simply sees `CAP_SUFFIX_FEC=0` from the legacy side → falls back to uncoded. No flag-day (the
+  bit lives in previously-reserved-zero space; §5).
+
+### §21.3 The adaptive gating + chicken-and-egg resolution (decided + justified)
+
+**Cap-knowledge timeline (code-grounded):** START_CONN (CMD→RSP) carries NO cap field
+(`[nb_flag:1|sender:36|reserved:1]`, mfsk_ctrl_codec.h:80). CMD learns RSP caps at TEST_ACK decode
+(`peer_capability = rsp_own`, arq_commander.cc:4008). RSP learns CMD caps at TEST_CONN decode
+(`peer_capability = data[5]`, arq_responder.cc:2051). **⇒ CAP_SUFFIX_FEC is mutually known only AFTER
+stage 3 (TEST_CONN). START_CONN — the FIRST and hardest-to-decode handshake frame, the §19.7/§20.9
+HW establishment limiter — is fundamentally PRE-CAP.**
+
+**CONNECT decision = gate on LOCAL robust-tier + RX try-both (NOT on negotiation).** Justification:
+the entire establishment-floor benefit of the FEC (the −10→−16 WGN move, §19.7) is on the START_CONN
+frame, which is pre-cap. Gating CONNECT-enhanced on negotiation would defeat the whole purpose (the
+benefit frame can never be enhanced). Instead: a station emits the enhanced CONNECT suffix whenever
+**its own** session is at the robust tier (the deep-floor proxy, `is_robust_config(current_configuration)`
+— the §4 gearshift-config gate, reused, no new state). The RX side runs **try-both** (uncoded decode
+first — cost 0, byte-identical to today; on miss + local-robust-tier, attempt the enhanced decode of
+the longer window). A legacy RX has no enhanced decoder → it simply fails the enhanced frame and the
+legacy LDPC-fallback / handshake-retry path recovers (the same failsafe the whole Phase-B suffix
+relies on). CONNECT is once/session + airtime-cheap (§4: +2.0% of a 7.9 s ROBUST_0 frame, <0.1% of a
+multi-min session), so always-on at the robust tier costs nothing measurable and needs no negotiation.
+This is the §5/§19.7 "OR gate on local robust-tier flag + RX try-both" branch of the chicken-and-egg
+note, chosen over "enhanced only after caps" because the latter cannot help START_CONN.
+
+**Per-batch ACK decision = enhanced ONLY at robust tier AND only when CAP_SUFFIX_FEC negotiated;
+ELSE byte-identical uncoded (§4).** The ACK is on the throughput hot path, so the gate is strict:
+`enhanced_ack = is_robust_config(current_configuration) && (local_capability & peer_capability &
+CAP_SUFFIX_FEC)`. At CONFIG_6+ (every throughput-relevant config) OR cap-absent → uncoded → **0%
+overhead, byte-identical** (the hard constraint). **This increment WIRES the gate + the
+`ack_suffix_fec_coded` plumbing + the try-both ACK decode, but leaves the enhanced-ACK ENABLE OFF**
+(the gate currently evaluates the predicate and, even when true, the TX stays uncoded) — rationale:
+(a) the §20.9 HW result shows the ACK was never the establishment limiter, so robust-tier ACK FEC
+buys nothing on the validated bottleneck yet; (b) keeping it OFF makes the throughput-neutrality
+guarantee UNCONDITIONAL (the ACK is byte-identical in 100% of cases, not just CONFIG_6+); (c) the
+plumbing + test prove the adaptive path is correct and ready for the ULTRA tier (§15) / a future
+robust-tier ACK-FEC increment to flip one flag. The gate predicate + the robust-tier branch are the
+deliverable; the enable is a one-line follow-on gated behind its own HW validation.
+
+### §21.4 §5 CROSS-LAYER DATA-FLOW AUDIT — the cap field, the gearshift-config gate, try-both
+
+**Shared state #1: the cap fields (TEST_ACK echoed_cap/own_cap, TEST_CONN local_cap; the wire
+negotiation of CAP_SUFFIX_FEC).**
+- Producers: `pack_test_ack_payload` (mfsk_ctrl_codec.cc), `pack_test_conn_payload`; the cap VALUES
+  come from `local_capability` (arq_common.cc:2731/2828/2882/2901, main.cc:2258 — all set
+  `CAP_WB_CAPABLE|CAP_ENCRYPTION`; this increment ORs in `CAP_SUFFIX_FEC` at each).
+- Consumers: `unpack_test_ack_payload`/`unpack_test_conn_payload` → `peer_capability`
+  (arq_commander.cc:4008/4025, arq_responder.cc:2051). Then the legacy cap consumers: encryption
+  negotiation `both_support = local&peer&CAP_ENCRYPTION` (arq_commander.cc:4062, arq_responder.cc:2095)
+  and WB-upgrade `peer_capability & CAP_WB_CAPABLE` (arq_commander.cc:4029). **Invariant the legacy
+  consumers assume: only bits 0/1 are meaningful.** Adding bit-2 does NOT break them — they mask their
+  own bit. Verified: every existing read is `& CAP_WB_CAPABLE` or `& CAP_ENCRYPTION`, never a bare
+  equality on the whole byte EXCEPT the CMD echo check `echoed_cap != local_capability`
+  (arq_commander.cc:3985) on the LEGACY-LDPC TEST_CONNECTION path — that path round-trips the full
+  byte both ways so a 3-bit value echoes consistently (both sides this-commit); a legacy peer there
+  zeroes bit-2 on TX so the echo still matches its own 2-bit local_capability. **The MFSK TEST_ACK
+  echo (Site D) does NOT do that equality check (arq_commander.cc:4008 just assigns rsp_own)** → safe.
+- Default-init: `local_capability=0`, `peer_capability=0` (arq_common.cc:303) → CAP_SUFFIX_FEC=0 until
+  set → uncoded → byte-identical. ✓
+
+**Shared state #2: the gearshift config `current_configuration` (the ACK + CONNECT adaptive gate).**
+- This is the EXISTING gearshift/turboshift config (datalink_defines ROBUST_0/1/2=100-102). The gate
+  READS it via `is_robust_config(current_configuration)` (the pure inline, common_defines.h:78). It is
+  a READ-ONLY consumer — the gate adds NO writer, NO new state. The same predicate is already read at
+  telecom_system.cc:5505 (the §4-cited ROBUST_0 branch) and arq_commander.cc:2222. No producer/consumer
+  invariant changes (we only add a reader). ✓ The §4 claim "reuses the gearshift config, no new state"
+  is verified.
+
+**Shared state #3: `suffix_fec_coded` / `connect_preamble_reps` (the CONNECT-path enable) — does the
+ACK inherit them?** BEFORE this increment: YES, via `pack_ctrl_suffix` reading the global (the §21.1
+bug). AFTER: NO — `pack_ctrl_suffix` takes an explicit `fec` arg; the ACK packer passes the SEPARATE
+`ack_suffix_fec_coded` (default false). Producers of `suffix_fec_coded`: `set_suffix_fec`
+(telecom_system.cc:3469) + the env hook (arq_common.cc:1528). Consumers AFTER: ONLY the CONNECT TX
+generator (`generate_ctrl_suffix_pattern`, passes it to pack) + the CONNECT RX decode branch
+(`decode_ctrl_suffix_from_passband`, telecom_system.cc:3661) + the CONNECT length accessor
+(`ctrl_suffix_len`, mfsk.h:209). The ACK generators (`generate_ack_sack_pattern`,
+`generate_ack_snr_pattern`, `generate_ack_sack_pattern_passband`) are NO LONGER consumers. **The ACK
+wire length + content are now provably independent of the CONNECT FEC enable.** ✓ (This is the fix.)
+
+**Shared state #4: try-both RX (CONNECT decode + ACK decode).** The CONNECT try-both reuses the same
+`decode_ctrl_suffix_from_passband` capture window. The window is sized by `ctrl_suffix_len()` +
+`connect_base_total_nsymb()` (C6, §19.4/§20.3) — i.e. sized for the CODED+COMBINED length whenever the
+CONNECT enable is on. Try-both for CONNECT: the uncoded decode reads the FIRST 13 suffix symbols of
+that (longer) window; the enhanced decode reads all 52. Both fit in the captured tail (the tail holds
+the coded length + 16 margin). **Invariant: the capture window must be sized for the LARGER of the two
+decode attempts.** Since the CONNECT enable already sizes it for the coded length, the uncoded attempt
+is a strict sub-window → safe. The ACK try-both reads the SAME 13-tone capture both attempts (the ACK
+window is never coded-sized this increment, ACK FEC enable OFF) → the enhanced ACK attempt would need
+a 52-tone window, which is why enabling robust-tier ACK FEC is gated behind its own window-sizing work
+(noted as the follow-on). FAR backstop on both try-both paths: the GF16 soft_decode's internal
+CRC12+2-bit-type gate (§16, 0/4000 noise) + the count gate (7/16) — try-both adds at most one extra
+CRC trial per poll (×2 trials → FAR doubles from ~2^-12 to ~2^-11, still ≫ below the count gate). ✓
+
+**Verdict:** the increment ADDS one cap bit (in reserved-zero space, legacy-safe), ADDS read-only gate
+predicates on the existing gearshift config, and REMOVES the ACK's accidental inheritance of the
+CONNECT FEC flag (the §21.1 root-cause fix). No producer invariant on existing shared state is
+altered; the one behavioural change (ACK no longer garbled when CONNECT-FEC on) is strictly a fix.
+
+### §21.5 What changes vs leaves
+CHANGES: `CAP_SUFFIX_FEC` define + `CAP_NEGOTIABLE_MASK`; cap fields 2→3 bits in the 3 pack/unpack ctrl
+payloads; `local_capability |= CAP_SUFFIX_FEC` at the 5 set sites; `pack_ctrl_suffix(...,bool fec)`
+explicit arg (drops the global read); `cl_mfsk::ack_suffix_fec_coded` flag (default false) + ACK packer
+passes it; CONNECT TX gates `suffix_fec_coded`/`connect_preamble_reps` enable on local robust-tier (the
+adaptive enable, replacing the env force-on as the production trigger — env knobs kept as a test
+override); CONNECT RX try-both (uncoded → enhanced on miss+robust-tier); per-batch ACK gate predicate
+`enhanced_ack = robust-tier && (local&peer&CAP_SUFFIX_FEC)` + try-both ACK decode plumbing. LEAVES: the
+GF16 codec; the §20 combining math; the 1.2 metric gate; HAIL fix; the env knobs (now a TEST override
+on top of the production CAP path); the enhanced-ACK ENABLE (predicate wired, enable off — §21.3).
+
+### §21.6 SIM RESULT + the decisive interop finding — the enhanced suffix is BACKWARD-COMPATIBLE (2026-06-01)
+
+Branch `sim/suffix-fec-production` (off `sim/connect-preamble-combining` @9708b08). Build FOREGROUND
+`bash build.sh o3`; `mercury --test` **51/51 pass** (was 46 + the 5 §21 gate tests; the GF16 §19
+production-path cliff still −13.89, the §20 combining cliff unchanged, throughput-neutral).
+
+**THE decisive finding (corrects the §21.3 chicken-and-egg worry):** a fresh sim measurement
+(`test_suffix_fec_interop_legacy_rx`) shows a LEGACY RX (FEC off, reps=1 detector — a stock
+`decode_ctrl_suffix_from_passband` with no CRC callback) **cleanly decodes an UPGRADED TX at EVERY
+(fec,reps) combo** — uncoded/reps1, FEC/reps1, FEC+combining/reps4, combining-only/reps4 — all with
+`matched=16` (full base lock) and the correct START_CONN payload. The enhanced suffix is BACKWARD-
+COMPATIBLE BY CONSTRUCTION, for two independent reasons:
+1. **FEC: the GF(16) RA codeword is SYSTEMATIC.** Its first 13 tones ARE the hard
+   `[type:2|p38:38|crc12:12]` pack (MSB-first, matching `cl_mfsk::pack_ctrl_suffix` — mfsk_ctrl_codec.h
+   :249). A legacy hard-argmax RX reads the payload straight from the systematic prefix and silently
+   ignores the RA-parity tail. (This also means a legacy RX gets NO FEC benefit — it decodes the
+   uncoded prefix, so it cliffs at the uncoded −7.87, not −14. The deep-floor reach needs an upgraded
+   RX. But the LINK still ESTABLISHES at good SNR with a legacy peer — the interop requirement.)
+2. **Combining: the R base reps are IDENTICAL 16-symbol blocks**, and `detect_ack_pattern` (reps=1)
+   scans for the base pattern with `reserve_after=ctrl_suffix_len()`, locking on whichever base rep
+   leaves room for the suffix — so the suffix is found regardless of how many reps precede it. The
+   repeated base does not confuse a single-block detector; it just gives it more lock candidates.
+
+**⇒ Design simplification (supersedes the §21.3 "gate combining on negotiation" leaning):** because
+BOTH FEC and combining are RX-backward-compatible, the CONNECT enhanced path gates ONLY on the LOCAL
+robust tier (option (b)) — NO negotiation gate is needed for CONNECT, and the RX try-both makes an
+upgraded RX decode both legacy and enhanced peers. This is exactly the validated
+`sim/connect-preamble-combining` stack, now production-TRIGGERED by `is_robust_config(current)` instead
+of env-forced. `CAP_SUFFIX_FEC` negotiation is therefore used for the ADAPTIVE PER-BATCH ACK gate
+(`ack_suffix_fec_eligible()`), where the enable is held off this increment (§21.3); the CONNECT path
+does not consult it (the chicken-and-egg is moot — there is no compat hazard to avoid).
+
+**Gate results (all PASS):**
+- `suffix_fec_cap_negotiation_matrix`: CAP_SUFFIX_FEC round-trips the 3-bit TEST_ACK/TEST_CONN fields;
+  `suffix_fec_negotiated()` true only upgraded↔upgraded, false on mixed/legacy/unknown(0);
+  `ack_suffix_fec_eligible()` true only at ROBUST_0 + negotiated, false at CONFIG_10 (OFDM) and when
+  cap absent (the throughput-neutral gate).
+- `suffix_fec_interop_legacy_rx`: legacy RX decodes upgraded TX at all 4 (fec,reps) arms.
+- `ack_suffix_throughput_neutral`: with CONNECT FEC+combining FORCED ON, the data-ACK suffix is
+  **byte-identical** — 13 tones unchanged, 35960 passband samples unchanged (the §21.1 fix; the
+  HARD throughput-neutrality constraint, asserted on the deterministic WIRE content — tones + airtime
+  — not the modulated doubles, which carry pre-existing run-to-run modulation nondeterminism: a
+  ~0.7-magnitude shared-OFDM-scratch diff present even between two NO-CHANGE builds, orthogonal to this
+  increment, harmless because each real TX zeroes its buffers in the send path. **Latent finding logged
+  for a future hygiene pass: `build_ack_sack_audio`/the ACK passband generator's first symbol depends
+  on prior scratch-buffer contents.**)
+- `connect_suffix_byte_identical_when_off`: toggling FEC on→off restores the exact uncoded 13-tone
+  single-base wire; the uncoded production decode round-trips.
+- `production_enhanced_connect_decodes`: the production robust-tier enable (FEC R¼ + combining R=4,
+  N=52) encodes + try-both-decodes clean end to end.
+
+**Throughput-neutrality at OFDM SNRs CONFIRMED:** at CONFIG_6+ the production trigger turns the CONNECT
+enhanced state OFF (reps=1, FEC off → byte-identical CONNECT suffix) AND the per-batch ACK is uncoded
+(gate ineligible off the robust tier + enable held off) → zero FEC/combining bytes on any
+throughput-relevant config. **Establishment still reaches −13.89 sim with caps negotiated:** the
+upgraded↔upgraded enhanced stack (FEC+combining at the robust tier) is the unchanged §19/§20 path
+(`test_gf16_ra_production_path_cliff_sweep` −13.89; `test_connect_preamble_combining_cliff_sweep` −13.89
+@R≥2) — this increment only changed the TRIGGER (tier vs env), not the PHY, so the cliff is preserved
+(verified: both sweeps still report −13.89 on this binary). SIM ONLY — the production-config HW
+re-validate folds into the bundle merge.
