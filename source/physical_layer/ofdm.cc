@@ -4041,8 +4041,10 @@ void cl_ofdm::decode_suffix_tones(std::complex<double>* baseband_interp, int buf
 		int data_tone = (best_tone - hop + mfsk_M * 256) % mfsk_M;
 		out_tones[s] = data_tone;
 
-		// Diagnostic: show top-3 tones and their energies
-		if(suffix_len > 0 && s < 3)
+		// Diagnostic: show top-3 tones and their energies (gated on g_verbose —
+		// fires on every suffix decode otherwise; spams production logs + the
+		// ctrl-suffix cliff-sweep test which runs thousands of decodes).
+		if(g_verbose && suffix_len > 0 && s < 3)
 		{
 			double energies[32];
 			for(int t2 = 0; t2 < mfsk_M && t2 < 32; t2++)

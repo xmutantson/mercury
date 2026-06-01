@@ -83,6 +83,43 @@ public:
 	int connect_tones[MAX_ACK_TONES];
 	int connect_pattern_nsymb;
 	int connect_match_threshold;
+	// Soft energy-ratio sub-gate for CONNECT-handshake / ACK-SNR MFSK suffix
+	// decode (telecom_system.cc decode_ctrl_suffix_from_passband +
+	// detect_ack_snr_from_passband). ofdm.detect_ack_pattern returns
+	// metric = Σ(e_target/e_total) over matched symbols ∈ [0, pattern_nsymb];
+	// this is the MINIMUM that metric must reach (in addition to the HARD
+	// count gate matched>=*_match_threshold) for a detection to be admitted to
+	// the ctrl-suffix decode.
+	//
+	// The HARD count gate (7/16, FAR≈2.4e-5..2.5e-7/poll, mfsk.cc:230-406) is
+	// the load-bearing false-alarm defense; the downstream CRC12 (P≈2^-12) +
+	// 2-bit type discriminator (×¼) on the CONNECT path, and the SNR-suffix
+	// 3/8 majority + 2-vote-margin gate on the ACK-SNR path
+	// (telecom_system.cc:3408), are the correctness defenses. This metric is
+	// only a cheap pre-filter to skip the suffix decode on obvious noise.
+	//
+	// Was a hardcoded 3.0 at 4 sites. The metric falls monotonically with SNR
+	// and crosses 3.0 at the −8.65 dB SNR3k cliff while decode_suffix_energies
+	// (and the CRC-aided soft list) deliver P≈1.0 down to −14 — i.e. the gate,
+	// NOT the content, was the SOLE ctrl-suffix masker (isolation sim, agent
+	// a1fe962c, fact-documents/tier2-suffix-fec-design.md §16). The 3.0 gate
+	// masks 59%/97%/100% of perfectly-decodable suffixes at −9.8/−10.8/−11.8.
+	//
+	// §16 cliff table (FEC-reach with the gate relaxed; base detector floor
+	// −14.68): 2.0 reaches only −11.75; ~1.0–1.5 is needed to feed the floor.
+	// Set to 1.2 = mid of the §16 [1.0,1.5] window with ~0.2 of FAR headroom
+	// over the count gate's worst measured noise metric (1.207 past the 7/16
+	// count gate, connect-ack-metric-gate.md §6). FAR-safe: §16 measured the
+	// gate FULLY OFF = 0/4000 pure-noise false-accepts on the CRC-backstopped
+	// path (Q65/FT8 precedent — the CRC, not a pre-decode energy threshold, is
+	// the floor's FAR gate; Franke-Taylor QEX 2020), so 1.2 (> off) is strictly
+	// safer than the measured-clean OFF case. §5 audit: ctrl-suffix-LOCAL — the
+	// data OFDM demod uses a SEPARATE Schmidl-Cox/coarse detector
+	// (ofdm.cc time_sync_preamble*, receive_stats.coarse_metric), so relaxing
+	// this cannot affect data DEMOD; and in the good-SNR band where data flows
+	// the metric stays ≥7 → gate decision identical to the old 3.0 (0
+	// divergences) → THROUGHPUT-NEUTRAL. See §17.
+	static constexpr double CTRL_DETECT_METRIC_MIN = 1.2;
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
