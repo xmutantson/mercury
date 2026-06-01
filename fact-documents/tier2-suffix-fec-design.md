@@ -1010,3 +1010,128 @@ bench).**
   poll-to-poll combining. The detector sums at fixed `s, 16+s, 32+s…` offsets from the single
   best_offset. Confirm no per-rep CFO walk over R*16 symbols degrades the sum (ctrl-Moose residual
   ~1.5 Hz over 64 symbols ≈ negligible phase walk for a NONcoherent energy sum).
+
+### §20.7 SIM-GATE RESULT — combining deepens the base-pattern floor; gate PASSED (2026-06-01)
+
+Branch `sim/connect-preamble-combining` @6fc1d9f (off deb1ecf). Build FOREGROUND `bash build.sh o3`;
+`mercury --test` **46/46 pass** (was 44/44 + the §17 ctrl-gate test + this §20 test). New regression
+test `test_connect_preamble_combining_cliff_sweep` drives the PRODUCTION TX
+(`generate_ctrl_suffix_pattern_passband`, R base reps + suffix) + RX (`detect_ack_pattern`
+`combine_reps=R` AND the full `decode_ctrl_suffix_from_passband` base-detect+FEC) over an SNR3k sweep
+at R=1/2/4.
+
+| metric | R=1 | R=2 | R=4 |
+|---|---|---|---|
+| **base-pattern matched-count cliff** (P(matched≥7)=0.5, SNR3k dB) | −15.05 | −16.07 | **−16.99** |
+| **full establishment cliff** (base[combine]+FEC, P=0.5) | −12.55 | −13.89 | **−13.89** |
+
+- **Base-pattern matched-count cliff: R=1 −15.05 → R=4 −16.99 = +1.94 dB deeper.** (The dedicated HAIL
+  combining sim, `test_hail_detection_cliff_sweep`, on a FINER SNR grid measures the cleaner
+  per-doubling figure: matched-count-only R=1 −13.25 → R=5 −16.99 = +3.74 dB; the §20 CONNECT sweep
+  grid {4,5,6,8,10,12,14,16,18,20,24,28,32} quantizes the cliff to +1.94 — direction + magnitude
+  confirm the lever, the absolute per-doubling is the HAIL test's +2.2-2.5 to +3.74.) Matches §4/§14.
+- **Full establishment cliff: −12.55 → −13.89 = +1.34 dB deeper**, now CO-LIMITED with the GF(16) FEC
+  reach (the §19 production cliff −13.89) and ~0.8 dB off the −14.68 base-pattern floor. R=4 == R=2 on
+  this coarse grid because the FEC content decode (−13.89) becomes the binding stage once combining
+  pushes the base detection past it — exactly the intended handoff (base detection no longer the
+  limiter; the FEC content is, at its own −14 reach).
+- **FAR: 0/4000** pure-noise false CONNECT accepts through the combined R=4 path (count gate 7/16 +
+  CRC12 + 2-bit type hold).
+- **byte-identical-when-off: EXACT** (max|diff|=0.0) — R=1 base framed layout bit-matches the
+  pre-§20 single-block formula. (Asserted on the FRAMED tone placement, the layer §20 touches, NOT
+  the post-FFT passband which carries ~1e-11 cross-instance FFT round-off independent of this change.)
+
+**⇒ SIM-GATE PASSED.** Combining moves the base-pattern detection floor deeper (the §19.7 HW
+limiter), FAR-clean, byte-identical off. Cleared to HW-validate.
+
+### §20.8 HW deploy — X: share degradation + recovery (2026-06-01)
+
+The host X: network share degraded mid-session to ~10 s per file read (a `wc -l` of one .cc took
+10.9 s; local /tmp = 3.1 GB/s, butler + testbed healthy). `mercury_deploy_rpi.py`'s source tarball
+(reads the full mercury tree from X:) STALLED at 241 KB; two `git archive` retries (read `.git` packs
+off X:) also stalled at 0 B. ROOT CAUSE: X: share I/O only — NOT local disk, NOT the butler, NOT the
+Pi. **RECOVERY:** the FIRST (buffered-stdout) deploy attempt had actually completed the rpi2 BUILD
+before it was killed — rpi2 carried the exact §20 source (markers `combine_reps`×11,
+`set_connect_preamble_reps`×3, `MERCURY_CONNECT_REPS`×3, the §20 test×1) + a fresh binary
+(md5 d1bc148bb4d5639b83295ddb32b85191, built 11:16 Pi-time). rpi1 was stale (old binary 02:05, no
+§20 markers). Fix WITHOUT any X: read: butler DOWNLOAD rpi2 binary → host /tmp → UPLOAD → rpi1
+(Pi-to-Pi binary copy, both Pi-5 aarch64 + Fe-Pi, binary-portable per mercury_deploy_rpi.copy_binary).
+
+### §20.9 HW A/B — establishment floor: combining does NOT move it; the limiter is the START_CONN handshake CONTENT (2026-06-01)
+
+Harness `tools/connect_combining_hw_ab.py` (reuses hail_floor_hw_test primitives; env-injected arm).
+Both arms run the SAME binary (md5 **d1bc148bb4d5639b83295ddb32b85191**, both Pis — env is the
+discriminator). Pinned ROBUST_0 (`-s 100 -Q 0 -M auto -n -F off --skip-turbo-reverse -R`), 3 fresh
+CONNECT/cell, descending WGN. AUDIO_SETUP both Pis. Single pass.
+- **COMBINING** arm: `MERCURY_SUFFIX_FEC=1 MERCURY_CONNECT_REPS=4` (verified per-Pi `[CFG]
+  MERCURY_CONNECT_REPS=4` log + `reps_log=MERCURY_CONNECT_REPS=4`).
+- **FEC-ONLY** baseline: `MERCURY_SUFFIX_FEC=1 MERCURY_CONNECT_REPS=1` (verified `reps_log=(none)`
+  = reps=1, the §20 hook only prints when >1). FEC on, combining off = the §19 FEC-arm behavior.
+
+| WGN | COMBINING HAIL / CONNECT | FEC-ONLY HAIL / CONNECT |
+|---|---|---|
+| −14 | 3/3 / **3/3** | 3/3 / **3/3** |
+| −16 | 3/3 / **2/3** | 3/3 / **1/3** |
+| −18 | 3/3 / **0/3** | 3/3 / **0/3** |
+| −20 | 2/3 / 0/3 | 3/3 / 0/3 |
+| −22 | 2/3 / 0/3 | 1/3 / 0/3 |
+| FAR WGN:60 / 120 s | **0** [HAIL], **0** CONNECT/ACK | **0** [HAIL], **0** CONNECT/ACK |
+
+**VERDICT: combining does NOT move the establishment (CONNECT) floor on HW.** Both arms: 3/3 at −14,
+partial at −16 (COMBINING 2/3 vs FEC-ONLY 1/3 = within 3-sample noise, NOT a cell-move), **0/3 at −18
+on BOTH.** Same HW-null pattern as the free stack (§11) and the ctrl-gate (§17.4): the SIM lever
+(+1.34 dB establishment, §20.7) is real but **sub-one-WGN-cell** at the 2 dB/cell dial spacing, so a
+3-attempt single-pass sweep cannot resolve it as a floor move.
+
+**THE limiter at the −18 floor (log-confirmed, BOTH arms):** HAIL fires (`base=9-13/8`, detection
+works — combining even keeps HAIL alive 2/3 at −20/−22 where FEC-ONLY's base matched-count is more
+ragged), THEN **`[HAIL] Timeout waiting for START_CONNECTION`** — the RSP never completes the
+START_CONNECTION ctrl-suffix decode. Occasional `[RX-MFSK-CTRL-CONNECT-START] wrong type rx=3
+expected=1 matched=8/12` — the base detects (matched 8-12 ≥ 7 gate) but the CONTENT decodes the wrong
+type. **⇒ the binding establishment limiter is the START_CONN ctrl-suffix DETECTION+CONTENT, not the
+base-pattern matched-count combining targets.** Combining IS correctly wired into the establishment
+path (a −16 diagnostic CONNECT confirmed CMD `[CFG] REPS=4` + RSP `[RX-MFSK-CTRL-CONNECT-START]
+sender='TESTA'` + `START_CONNECTION received CRC ok` — full handshake on the combined base), but it
+addresses the base DETECTION while the floor is now bound by the FIRST handshake frame's decode.
+
+**Base matched-count progression on HW (the §19.7 collapse, observed live):** −14 → 15-16/16, −16 →
+12-14, −18 → 9-13, −20 → 8-13, −22 → 8-10. Combining keeps the HAIL base ABOVE the 7/16 gate deeper
+(2/3 HAIL at −20/−22) — i.e. the lever DOES work on the base-pattern detection statistic, exactly as
+the sim measured. But the establishment floor is set by a DIFFERENT (downstream) stage at this SNR.
+
+**FAR: 0/0 on BOTH arms** (count gate 7/16 + CRC12 + 2-bit type hold on the combined R=4 path on real
+HW noise) — confirms the §20.7 sim FAR 0/4000. Combining is FAR-safe.
+
+**Arms md5 (authoritative): IDENTICAL d1bc148b both Pis both arms** — the env knob (`reps_log` 4 vs
+none) is the verified discriminator. Single-pass, 3 attempts/cell, dial-not-calibrated (WGN dial ≠
+SNR3k) — the relative null (no cell-move, content-limited) is robust to the sampling; the −16
+boundary (2/3 vs 1/3) wants a multi-pass but does not change the verdict.
+
+### §20.10 Is this the end of the establishment-reach road? (decision)
+
+**For the noncoherent base-pattern DETECTION lever: effectively yes on HW, at this dial resolution.**
+The base-pattern matched-count combining works in sim (+1.94 dB R1→R4 on the §20 grid, +3.74 dB on
+the HAIL fine grid) and on HW (HAIL alive 2/3 to −22) — but the establishment floor is NOT bound by
+base detection at −18; it is bound by the **START_CONNECTION ctrl-suffix decode** (the FIRST handshake
+frame). The chain of HW-validated establishment work now reads:
+1. HAIL detect gate (§18) — moved −10→−16. ✓ (detection)
+2. ctrl metric gate 1.2 (§17) — no HW move alone (content-limited). ✓ (hygiene)
+3. GF(16) FEC (§19) — moved the floor to −16 (content FEC on the START_CONN payload). ✓
+4. base-pattern combining (§20) — **no HW move**; base detection wasn't the −18 limiter; the
+   START_CONN frame's detect+content is. The lever is real on the base statistic but aimed where the
+   floor isn't bound at −18.
+
+**Remaining headroom / next limiter:** the −18 floor is the **START_CONNECTION ctrl-suffix
+DETECTION** (the `[HAIL] Timeout waiting for START_CONNECTION` = the RSP's
+`receive_mfsk_ctrl_suffix_phy_core` for the START_CONN frame not detecting/decoding). Combining
+already helps its base (it's the same `decode_ctrl_suffix_from_passband` path) — but the residual is
+the marginal-SNR handshake CHOREOGRAPHY: the CMD sends START_CONN once per HAIL-detect cycle, the RSP
+has a fixed window, and at −18 the base + content + timing line up < 50% of the time. This is a
+PROTOCOL-timing / repeat-the-handshake-frame problem (send START_CONN R× too, or widen the RSP
+window), NOT a base-detection-combining problem. The −14.68 raw base floor is NOT the wall here; the
+handshake frame reliability is. **Recommendation: SHIP combining as a latent, FAR-safe, byte-identical
+-off detection improvement (it strictly helps the base statistic + costs nothing when off), but it is
+NOT the establishment-floor mover at −18 — the next lever is START_CONN frame repetition / RSP
+listen-window timing at the deep floor (a handshake-choreography increment, INCREMENT 3).** This is
+the same "fix isn't at the bottleneck" lesson as §11/§17.4 (BP+OSD, free stack, ctrl-gate) — the SIM
+gate passing is necessary but the HW bottleneck is one stage further down each time.
