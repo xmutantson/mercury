@@ -3583,6 +3583,210 @@ static void test_gf16_ra_cliff_sweep() {
 	test_pass(name);  // infra ran; dB verdict is in the log
 }
 
+// §19 (INCREMENT 1) — THE GATE FOR THIS INCREMENT: the PRODUCTION CONNECT decode
+// path, with the GF(16) RA FEC wired in (suffix_fec_mode=3 via set_suffix_fec),
+// reaches ~−14 dB SNR3k — i.e. it now tracks the §12 FEC-reach (−14.03), NOT the
+// uncoded −7.87 content cliff (test_ctrl_suffix_metric_gate_cliff_sweep, §17.3).
+//
+// This is the END-TO-END proof, distinct from gf16_ra_cliff_sweep (which decodes
+// energies via the test helper decode_gf16ra_from_passband with the Moose/gate
+// confound flagged off). HERE we drive the ACTUAL production functions:
+//   TX:  cl_telecom_system::generate_ctrl_suffix_pattern_passband (FEC on → 52-sym
+//        coded passband, sized by ctrl_suffix_pattern_passband_samples).
+//   RX:  cl_telecom_system::decode_ctrl_suffix_from_passband (FEC branch:
+//        real base-detect → real mini-Moose → real 1.2 metric gate →
+//        decode_suffix_energies → gf16ra::soft_decode, prod CRC12 callback).
+// So this measures the FEC reach THROUGH the production sync/gate scaffolding —
+// the integration risk §12 flagged ("GF16's −14 reach is MASKED in production by
+// the sync/gate scaffolding"). With the gate relaxed to 1.2 (§16/§17) and the
+// Moose exonerated (§16), it is EXPECTED to reach ~−14. SNR3k axis is bit-exact
+// to the §17 uncoded sweep (hail_snr3k_db, same p_sig/sigma convention) so the
+// FEC cliff is directly comparable to the −7.87 uncoded number. (snr3k_db is
+// bit-identical to the §17 sweep's hail_snr3k_db; used here as it is in scope.)
+//
+// Also asserts: (a) byte-identical-when-off — set_suffix_fec(false) restores
+// ctrl_suffix_len()==13 and a clean uncoded decode still passes; (b) FAR on pure
+// noise through the FEC path (CRC12 + 2-bit-type backstop, §17.2) = 0.
+static void test_gf16_ra_production_path_cliff_sweep() {
+	const char* name = "gf16_ra_production_path_cliff_sweep";
+	printf("  [MEASURE] PRODUCTION CONNECT decode with GF(16) RA FEC wired in (§19 INCREMENT 1):\n");
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);   // WB ROBUST-class — brings up ack_mfsk/connect
+	cl_arq_controller arq;             // for the production CRC12 callback
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) {
+		test_fail(name, "CONNECT ctrl-suffix config not loaded (M<16?)"); return;
+	}
+
+	// --- (0) byte-identical-when-off check FIRST (before enabling FEC) -------
+	// suffix_fec_mode defaults to 0 → ctrl_suffix_len()==13, production decode is
+	// the uncoded hard path. A clean START_CONN must decode (proves the wiring is
+	// inert when off, complementing the existing-tests' 44/44).
+	if (ts.suffix_fec_mode != 0 || ts.ack_mfsk.suffix_fec_coded ||
+	    ts.ack_mfsk.ctrl_suffix_len() != 13) {
+		test_fail(name, "default state is not OFF (suffix_fec_mode!=0 or coded len!=13)"); return;
+	}
+	{
+		uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+		uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+		uint8_t bytes[5]; for (int b=0;b<5;b++) bytes[b]=(uint8_t)((typed40>>(8*(4-b)))&0xFF);
+		uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+		int nsig = ts.ctrl_suffix_pattern_passband_samples;
+		const int lead = 4096; int total = nsig + 2*lead;
+		std::vector<double> clean((size_t)total, 0.0);
+		int w = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+		mfsk_ctrl_frame_type rt; uint64_t rp=0; uint16_t rc=0; int rm=0;
+		bool ok = ts.decode_ctrl_suffix_from_passband(clean.data(), total, &rt, &rp, &rc, &rm);
+		if (w != nsig || !ok || rt != MFSK_CTRL_START_CONN || rp != p38) {
+			test_fail(name, "OFF-path clean START_CONN decode failed (byte-identical-when-off broken)"); return;
+		}
+		printf("    [OFF] uncoded len=13, clean START_CONN decode OK (byte-identical-when-off confirmed)\n");
+	}
+
+	// --- (1) enable the GF(16) RA FEC (FORCE-on, repfact=3 = R1/4, N=52) ------
+	int N = ts.set_suffix_fec(true, 3);
+	if (N != gf16ra::codeword_len() || N <= 13 || !ts.ack_mfsk.suffix_fec_coded ||
+	    ts.suffix_fec_mode != 3 || ts.ack_mfsk.ctrl_suffix_len() != N) {
+		test_fail(name, "set_suffix_fec(true,3) did not bring up the coded path"); return;
+	}
+	const double fs = ts.sampling_frequency;
+	const int conn_thr = ts.ack_mfsk.connect_match_threshold;
+	printf("    CONNECT config: M=%d conn_nsymb=%d conn_thr=%d coded_N=%d (R=%.2f) gate metric>=%.2f; "
+		"backstop=CRC12 + 2-bit type + count %d/%d\n",
+		ts.ack_mfsk.M, ts.ack_mfsk.connect_pattern_nsymb, conn_thr, N,
+		(double)gf16ra::GF16RA_K / N, (double)cl_mfsk::CTRL_DETECT_METRIC_MIN,
+		conn_thr, ts.ack_mfsk.connect_pattern_nsymb);
+
+	// Build a clean coded START_CONN passband ONCE (KE7TST). ctrl_suffix_pattern_
+	// passband_samples is now the CODED size (set_suffix_fec re-derived it).
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+	uint8_t bytes[5]; for (int b=0;b<5;b++) bytes[b]=(uint8_t)((typed40>>(8*(4-b)))&0xFF);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead = 4096; const int total_pb = n_sig + 2 * lead;
+	std::vector<double> clean((size_t)total_pb, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+	if (written != n_sig) { test_fail(name, "coded generate_ctrl_suffix_pattern_passband size mismatch"); return; }
+
+	double psum = 0.0;
+	for (int i = 0; i < n_sig; i++) { double v = clean[(size_t)(lead+i)]; psum += v*v; }
+	const double p_sig = psum / n_sig;
+	const double sig_rms = std::sqrt(p_sig);
+	if (!(sig_rms > 0.0)) { test_fail(name, "coded signal RMS = 0"); return; }
+
+	// Noise axis (mult = sigma/rms): bracket the −7..−17 dB band so the FEC cliff
+	// (expected ~−14, deeper than the uncoded −7.87) resolves. The base-pattern
+	// matched-count floor is ~−14.68, so the FEC decode cannot beat that (the
+	// base must detect for the suffix window to be located); the sweep must reach
+	// past it to find P<0.5.
+	const double mults[] = {
+		4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0,
+		14.0, 15.0, 16.0, 18.0, 20.0, 24.0
+	};
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 60;
+	double cliff_fec = 1e9;   // deepest SNR3k with P(decode)>=0.5
+	long iters_sum = 0, iters_cnt = 0;
+
+	printf("    (sigma/rms : SNR3k_dB : P_decode_FEC : mean_matched : mean_metric)\n");
+	std::vector<double> work((size_t)total_pb);
+	std::vector<std::complex<double> > bb;
+	const int Mdec = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	for (int si = 0; si < NS; si++) {
+		const double sigma = mults[si] * sig_rms;
+		std::mt19937 rng((uint32_t)(0x6F16C0DEu + si));
+		std::normal_distribution<double> nd(0.0, sigma);
+		int decoded_ok = 0; double metric_sum = 0.0; int matched_sum = 0;
+		for (int t = 0; t < NT; t++) {
+			for (int i = 0; i < total_pb; i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+			// Production FEC decode (real Moose + 1.2 gate + soft_decode).
+			mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+			bool ok = ts.decode_ctrl_suffix_from_passband(
+				work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+				prod_crc12_cb, &arq);
+			bool content_ok = ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38;
+			if (content_ok) decoded_ok++;
+			// raw base metric on the same buffer (for the log; same pre-gate detect)
+			int dec_size = total_pb / Mdec;
+			bb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(work.data(), total_pb, bb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+			int rm = 0, rbo = -1;
+			double metric = ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+				ts.ack_mfsk.connect_pattern_nsymb, ts.ack_mfsk.connect_tones, 8,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+				ts.ack_mfsk.stream_offsets, &rm, 0, nullptr, &rbo,
+				/*reserve_after=*/ts.ack_mfsk.ctrl_suffix_len(), nullptr);
+			metric_sum += metric; matched_sum += rm;
+		}
+		double Pd = (double)decoded_ok / NT;
+		double snr = snr3k_db(p_sig, sigma, fs);   // bit-identical to hail_snr3k_db
+		printf("    %6.1f : %7.2f : %.2f : %6.2f : %8.2f\n",
+			mults[si], snr, Pd, (double)matched_sum/NT, metric_sum/NT);
+		if (Pd >= 0.5 && snr < cliff_fec) cliff_fec = snr;
+	}
+	(void)iters_sum; (void)iters_cnt;
+
+	printf("    --- PRODUCTION CONNECT decode cliff WITH GF(16) RA FEC (P=0.5, SNR3k dB) ---\n");
+	printf("    FEC production cliff = %.2f dB | uncoded production cliff (§17.3) = -7.87 dB | "
+		"standalone FEC-reach (§12) = -14.03 dB | base floor = -14.68 dB\n", cliff_fec);
+	printf("    ==> vs uncoded(-7.87): %+.2f dB | vs base floor(-14.68): %+.2f dB | reaches ~-14? %s\n",
+		cliff_fec - (-7.87), cliff_fec - (-14.68), (cliff_fec <= -13.0) ? "YES" : "no");
+
+	// --- FAR: pure passband noise through the PRODUCTION FEC decode ----------
+	// sigma at the deep-floor operating region (~14×rms ≈ −14 dB SNR3k, signal
+	// absent) — where the FEC actually runs, so the FAR is measured under the
+	// relevant noise level, not a shallow one.
+	const int FT = 4000;
+	const double far_sigma = 14.0 * sig_rms;
+	int false_accepts = 0;
+	std::mt19937 frng(0xFA16FECu);
+	std::normal_distribution<double> fnd(0.0, far_sigma);
+	for (int t = 0; t < FT; t++) {
+		for (int i = 0; i < total_pb; i++) work[(size_t)i] = fnd(frng);
+		mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+		if (ts.decode_ctrl_suffix_from_passband(work.data(), total_pb,
+			&rx_type, &rx_p38, &rx_crc12, &rx_matched, prod_crc12_cb, &arq))
+			false_accepts++;
+	}
+	printf("    --- FAR (pure noise, sigma=%.1f×rms, %d trials, FEC path) ---\n", 14.0, FT);
+	printf("    production FEC CONNECT decode : %d/%d false accepts (CRC12 + 2-bit type backstop)\n",
+		false_accepts, FT);
+
+	// --- ASSERT 1 (THE HEADLINE / FAIL-BEFORE-PASSES): the FEC production decode
+	// must reach materially past the uncoded −7.87 content cliff and approach the
+	// −14 FEC-reach. Threshold −13.0 dB: it must clear the uncoded cliff by ≥5 dB
+	// and sit within ~1.7 dB of the −14.68 base floor (parity-class). Before this
+	// increment, the production CONNECT decode (uncoded) cliffs at −7.87 → this
+	// assert FAILS on the pre-wiring binary. ---
+	if (!(cliff_fec <= -13.0)) {
+		char b[256]; snprintf(b, sizeof(b),
+			"FEC production cliff %.2f dB did NOT reach ~-14 (need <=-13.0) — the production "
+			"sync/gate scaffolding is still masking the FEC reach (§12 risk realized)", cliff_fec);
+		test_fail(name, b); return;
+	}
+	// ASSERT 2: FAR clean on the FEC path.
+	if (false_accepts > 0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"FAR = %d/%d false CONNECT accepts on pure noise through the FEC path "
+			"(CRC12+type backstop breached)", false_accepts, FT);
+		test_fail(name, b); return;
+	}
+	// Restore default state for any later test sharing process globals (gf16ra is
+	// a process-global codec config).
+	ts.set_suffix_fec(false);
+	gf16ra::configure(2);
+	printf("    [ASSERT OK] PRODUCTION CONNECT decode reaches %.2f dB with GF(16) RA FEC "
+		"(+%.2f dB past the uncoded -7.87 cliff, within %.2f dB of the -14.68 base floor); "
+		"FAR %d/%d; byte-identical-when-off confirmed.\n",
+		cliff_fec, cliff_fec - (-7.87), cliff_fec - (-14.68), false_accepts, FT);
+	test_pass(name);
+}
+
 // =============================================================================
 // Top-level runner
 // =============================================================================
@@ -4368,6 +4572,8 @@ int run_mfsk_ctrl_codec_tests() {
 	test_gf16_ra_passband_roundtrip_clean();
 	test_gf16_ra_pure_noise_far();
 	test_gf16_ra_cliff_sweep();      // [MEASURE] prints the GF(16) cliff + gain dB
+	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
+	test_gf16_ra_production_path_cliff_sweep();
 
 	// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation,
 	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the

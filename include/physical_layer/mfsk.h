@@ -172,6 +172,23 @@ public:
 	// 13 suffix = 29 symbols ≈ 705 ms (WB).
 	int ack_sack_suffix_len() const { return (M >= 16) ? 13 : 0; }  // 0 = unsupported
 	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
+
+	// Tier-2 suffix FEC (tier2-suffix-fec-design.md §19, INCREMENT 1). When
+	// suffix_fec_coded is set (by the telecom layer after gf16ra::configure(3)+
+	// init()), the CONNECT ctrl-suffix is encoded with the GF(16) RA code:
+	// pack_ctrl_suffix emits gf16ra::codeword_len() (N, default 52 @ R=1/4)
+	// tones instead of the 13-symbol hard pack, and RX decodes the per-tone
+	// ENERGY matrix via gf16ra::soft_decode (decode-from-passband path only).
+	// ctrl_suffix_len() is THE coded symbol count — the I4 length accessor every
+	// CONNECT TX/RX site routes through (§19.4). suffix_fec_coded=false (the
+	// default) → returns the uncoded 13 → byte-identical-when-off. NB (M<16)
+	// always returns 0 (FEC deferred there). gf16ra owns the active N (it is
+	// configured once at FEC enable); ctrl_suffix_len() never configures.
+	bool suffix_fec_coded;   // default false (set in init())
+	int ctrl_suffix_len() const {
+		if (ack_sack_suffix_len() <= 0) return 0;          // NB: unsupported either way
+		return suffix_fec_coded ? gf16ra::codeword_len() : ack_sack_suffix_len();
+	}
 	// Generic ctrl-suffix codec (52-bit [type:2|payload:38|crc12:12]):
 	int pack_ctrl_suffix(mfsk_ctrl_frame_type type, uint64_t payload38,
 	                     uint16_t crc12, int* out_tones) const;
@@ -212,9 +229,13 @@ public:
 	// symbol — i.e. the inverse of the (payload+abs_s*hop)%M mapping the
 	// transmitter applies in generate_ack_sack_pattern(). When the detector
 	// declares an ACK match it writes ack_sack_suffix_len() entries here
-	// (10 for WB M=16) and sets last_ack_sack_capture_valid=true. Size 16
-	// is the max possible suffix length.
-	static const int MAX_ACK_SACK_SUFFIX = 16;
+	// (10 for WB M=16) and sets last_ack_sack_capture_valid=true.
+	// Sized to the Tier-2 FEC ceiling (gf16ra::GF16RA_MAX_N = 64 ≥ the R=1/4
+	// coded length 52, tier2-suffix-fec-design.md §19.4 C7) so the
+	// last_*_suffix_tones[] / suffix_tones[] / payload_tones[] buffers that
+	// derive their size from this constant are safe whether the uncoded (13)
+	// or coded (52) ctrl-suffix path runs. Was 16 (uncoded-only).
+	static const int MAX_ACK_SACK_SUFFIX = 64;
 	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_ack_sack_capture_valid;
 

@@ -198,11 +198,21 @@ public:
 	// as "no CONNECT arrived" (the caller's timeout/retransmit logic
 	// handles it). *out_matched (optional) gets the base-pattern match
 	// count for diagnostics.
+	// crc12_fn/crc12_ctx (§19, INCREMENT 1): the production CRC-12 callback
+	// (cl_arq_controller::CRC12_calc, init=0xFFF — NEVER inline, v1 bug #1).
+	// Required ONLY when suffix_fec_mode selects the GF(16) FEC decode (the
+	// soft_decode CRC accept gate needs it); the uncoded hard path ignores it
+	// (it returns the unpacked crc12 for the caller to re-check). When the FEC
+	// path runs, *out_crc12 is set to CRC12_calc([type|payload38]) so the
+	// caller's outer CRC re-check passes by construction (consistent because
+	// soft_decode only succeeds when the decoded CRC equalled that recompute).
 	bool decode_ctrl_suffix_from_passband(double* data, int size,
 	                                       mfsk_ctrl_frame_type* out_type,
 	                                       uint64_t* out_payload38,
 	                                       uint16_t* out_crc12,
-	                                       int* out_matched = nullptr);
+	                                       int* out_matched = nullptr,
+	                                       ctrl_crc12_fn crc12_fn = nullptr,
+	                                       void* crc12_ctx = nullptr);
 
 	// ---- Suffix FEC (connect-suffix-fec-research.md) — MEASURED PROTOTYPE ----
 	// CRC-aided SOFT list decode of the 13-symbol ctrl-suffix. ZERO airtime
@@ -224,6 +234,15 @@ public:
 	int  suffix_fec_K;          // top-K candidates per symbol (default 4).
 	int  suffix_fec_max_trials; // CRC-trial cap (bounds runtime; default 4000).
 	int  suffix_fec_max_flips;  // Hamming-ball radius (primary FAR lever; default 3).
+
+	// §19 (INCREMENT 1): enable/disable the Tier-2 GF(16) RA FEC on the CONNECT
+	// ctrl-suffix. on=true → gf16ra::configure(repfact)+init(), set
+	// ack_mfsk.suffix_fec_coded=true, set suffix_fec_mode=3, and RE-DERIVE
+	// ctrl_suffix_pattern_passband_samples (the coded length changed). MUST be
+	// called AFTER load_configuration (which computes that member at the uncoded
+	// length). repfact 3 = R=1/4 (N=52, the −14.03 reach, §12). Idempotent.
+	// FORCE-on for this increment (no CAP negotiation yet). Returns the coded N.
+	int  set_suffix_fec(bool on, int repfact = 3);
 
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,

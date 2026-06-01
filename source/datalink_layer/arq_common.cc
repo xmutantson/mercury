@@ -4790,6 +4790,17 @@ static inline void pack_ctrl_typed40_msb_v2(uint8_t out_bytes[5],
 		out_bytes[b] = (uint8_t)((typed40 >> (8 * (4 - b))) & 0xFF);
 }
 
+// §19 (INCREMENT 1): CRC-12 callback wrapping the PRODUCTION
+// cl_arq_controller::CRC12_calc (init=0xFFF) for the GF(16) RA suffix decoder's
+// CRC accept gate. ctx = cl_arq_controller*. Matches ctrl_crc12_fn. NEVER
+// inline the CRC (v1 bug #1 was an init mismatch between TX CRC12_calc and an
+// inlined RX copy). Identical convention to the test harness prod_crc12_cb.
+static uint16_t arq_ctrl_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
+	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
 // Shared TX core: emit CONNECT base + 13-symbol ctrl-suffix for `type` with
 // `payload38`. Returns wall-clock TX time in ms, 0 if unsupported.
 //
@@ -4991,7 +5002,12 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
                                               const char* tag)
 {
 	int conn_nsymb = telecom_system->ack_mfsk.connect_pattern_nsymb;
-	int suffix_nsymb = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	// §19.4 C6: use the CODED suffix length (52 with Tier-2 FEC, 13 uncoded) so
+	// the captured passband tail actually CONTAINS the full coded suffix plus
+	// the existing 16-symbol margin. tail_samples is clamped to signal_period
+	// below (the ring), which is hundreds of symbols at the robust configs, so
+	// the larger coded window fits.
+	int suffix_nsymb = telecom_system->ack_mfsk.ctrl_suffix_len();
 	if(conn_nsymb <= 0 || suffix_nsymb <= 0) return false;
 	const int tail_nsymb = conn_nsymb + suffix_nsymb + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
@@ -5021,9 +5037,13 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	uint64_t rx_p38 = 0;
 	uint16_t rx_crc12 = 0;
 	int rx_matched = 0;
+	// §19: pass the production CRC12 callback so the GF(16) FEC decode path can
+	// run its CRC accept gate (no-op for the uncoded path, which returns the
+	// unpacked crc12 for the outer re-check below).
 	bool decoded = telecom_system->decode_ctrl_suffix_from_passband(
 		telecom_system->data_container.ready_to_process_passband_delayed_data,
-		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+		arq_ctrl_crc12_cb, self);
 
 	if(!decoded)
 	{

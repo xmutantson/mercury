@@ -64,6 +64,7 @@ cl_mfsk::cl_mfsk()
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
+	suffix_fec_coded = false;  // Tier-2 FEC off by default (§19)
 }
 
 cl_mfsk::~cl_mfsk()
@@ -85,6 +86,10 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
+	// NOTE: suffix_fec_coded is NOT reset here — it is owned by the telecom
+	// layer (set after gf16ra::configure(3)+init() when FEC is enabled) and
+	// init() is called once at load_configuration before that. Resetting it
+	// here would clobber a FEC-enable that ran first. Constructor sets it false.
 
 	// Calculate log2(M)
 	nBits = 0;
@@ -624,6 +629,16 @@ int cl_mfsk::pack_ctrl_suffix(mfsk_ctrl_frame_type type, uint64_t payload38,
 {
 	int n = ack_sack_suffix_len();
 	if (n == 0 || M < 16) return 0;
+	// Tier-2 FEC (§19): emit the GF(16) RA codeword (N=codeword_len() tones,
+	// each 0..15) instead of the 13-symbol hard bit-pack. The codeword carries
+	// [type:2|payload38:38] in 10 systematic GF(16) info symbols + the 12-bit
+	// CRC in 3 protected info symbols + RA parity; the tone values are 0..M-1
+	// exactly like the hard pack, so the one-hot mapping downstream is identical.
+	// gf16ra is configured (repfact)/inited once at FEC enable.
+	if (suffix_fec_coded) {
+		gf16ra::encode(type, payload38, crc12, out_tones);
+		return gf16ra::codeword_len();
+	}
 	int bits_per_tone = 0;
 	for (int m = M; m > 1; m >>= 1) bits_per_tone++;  // log2(M); 4 for M=16
 	uint64_t payload = ((uint64_t)(type & 0x3) << 50)
@@ -857,7 +872,9 @@ void cl_mfsk::generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
                                             uint64_t payload38, uint16_t crc12)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
-	int suffix_len = ack_sack_suffix_len();
+	// §19: coded length (52 with FEC, 13 uncoded). pack_ctrl_suffix below
+	// returns the same count; we loop over it for the one-hot tone placement.
+	int suffix_len = ctrl_suffix_len();
 	if (suffix_len == 0) return;  // NB unsupported
 	if (connect_pattern_nsymb <= 0) return;
 

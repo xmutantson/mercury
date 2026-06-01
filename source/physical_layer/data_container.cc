@@ -112,7 +112,15 @@ void cl_data_container::set_size(int nData, int Nc, int M, int Nfft , int Nofdm,
 	// ACK pattern generation reuses ofdm_framed_data and ofdm_symbol_modulated_data.
 	// NB Sidelnikov ACK uses up to 48 symbols (M=4), WB Welch-Costas uses 16.
 	// For high-order modulations (16QAM+), Nsymb < 48, so allocate for the max.
+	// §19 (tier2-suffix-fec-design.md §19.4 C2): the Tier-2 FEC CONNECT pattern
+	// is connect_base(16 WB) + coded ctrl-suffix (up to gf16ra GF16RA_MAX_N=64)
+	// = up to 80 symbols, which EXCEEDS the old 48 floor on short-frame robust
+	// configs (ROBUST_0 Nsymb < 48) → would overflow ofdm_framed_data /
+	// ofdm_symbol_modulated_data. Floor at 80 so the coded ctrl-suffix pattern
+	// always fits regardless of repfact. (Uncoded path unaffected — 16+13=29<48.)
+	const int CTRL_SUFFIX_FEC_MAX_NSYMB = 80;   // 16 WB connect base + 64 GF16RA_MAX_N
 	int alloc_Nsymb = (Nsymb > 48) ? Nsymb : 48;
+	if (alloc_Nsymb < CTRL_SUFFIX_FEC_MAX_NSYMB) alloc_Nsymb = CTRL_SUFFIX_FEC_MAX_NSYMB;
 	this->ofdm_framed_data=CNEW(std::complex<double>, alloc_Nsymb*Nc, "dc.ofdm_framed_data");
 	this->ofdm_time_freq_interleaved_data=CNEW(std::complex<double>, Nsymb*Nc, "dc.ofdm_time_freq_interleaved_data");
 	this->ofdm_time_freq_deinterleaved_data=CNEW(std::complex<double>, Nsymb*Nc, "dc.ofdm_time_freq_deinterleaved_data");
