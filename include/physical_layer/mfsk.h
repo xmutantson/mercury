@@ -83,6 +83,32 @@ public:
 	int connect_tones[MAX_ACK_TONES];
 	int connect_pattern_nsymb;
 	int connect_match_threshold;
+	// Soft energy-ratio sub-gate for CONNECT/ACK MFSK detection
+	// (telecom_system.cc detect_ack_snr_from_passband + decode_ctrl_suffix_from_passband).
+	// detect_ack_pattern returns metric = Σ(e_target/e_total) over matched
+	// symbols ∈ [0, pattern_nsymb]; this is the MINIMUM that metric must reach
+	// (in addition to the HARD count gate matched>=*_match_threshold) for a
+	// detection to be admitted to the suffix decode. The count gate (7/16,
+	// FAR≈2.4e-5..2.5e-7/poll) is the load-bearing false-alarm defense; the
+	// downstream CRC12 (P≈2^-12) + type/BSI/bitmap checks are the
+	// correctness defense. This metric is only a cheap pre-filter to avoid
+	// running the suffix decode on obvious noise — see
+	// fact-documents/connect-ack-metric-gate.md §1/§5.
+	//
+	// Was a hardcoded 3.0 (acquisition diagnosis: caps base detection at
+	// ~-9.7 dB SNR3k; at the -10 cliff the count is ~14/16 ≫ 7, so frames are
+	// rejected PURELY on this ratio). Relaxed to 2.0 per the noise-only FAR
+	// sweep in §6: at 2.0, 0 false detections over 5000 noise-only trials per
+	// pattern (both ACK and CONNECT; worst noise metric past the count gate =
+	// 1.207, so ~0.8 margin), while 2.0 deepens the detection cliff +2.5 dB
+	// (§7, ACK and CONNECT). 2.0 is the SAFE choice — the diagnosis measured
+	// FAR only exploding at 0.5 (359/500), with 2.0/1.5 both ~0 FAR; we lean
+	// to 2.0 rather than 1.5 because the marginal acquisition gain past 2.0 is
+	// not worth halving the FAR margin (1.5 → 0.29) when throughput is the hard
+	// constraint. The already-shipped normal-mode ACK gate (ack_metric_threshold)
+	// sits at 0.5 (commit 7076a4b) as corroborating prior art that a sub-3.0
+	// gate is FAR-safe.
+	static constexpr double CTRL_DETECT_METRIC_MIN = 2.0;
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
