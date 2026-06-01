@@ -50,6 +50,7 @@ cl_telecom_system::cl_telecom_system()
 	fsel_delay            = 128;   // second-ray delay in passband samples (~Nfft/8 @ interp=4, within GI)
 	ber_single_esn0       = -999.0f; // fix/cfg16-nv-restore: <=-900 = normal full sweep
 	ber_frames_override   = 0;     // 0 = use sweep default frame count
+	baud_mult             = 1;     // P0 baud-scaling spike: 1 = off (default)
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
@@ -362,6 +363,220 @@ cl_error_rate cl_telecom_system::baseband_test_EsN0(float EsN0,int max_frame_no)
 	return lerror_rate;
 }
 
+// ===========================================================================
+// Watterson FADING spike (baud-fading-spike.md) — SIM ONLY, env-gated.
+//
+// The (c) coherence-time gate. P0 (baud-scaling-spike.md) proved that
+// lengthening the coherent MFSK symbol (Nfft *= K) deepens the AWGN cliff
+// +3.5 dB/2x. But a longer symbol is more fading-sensitive: if the channel
+// decorrelates WITHIN the longer FFT window (T_coherence < symbol duration),
+// the per-symbol coherent integration smears and the gain evaporates — the
+// FST4 coherence-time wall. The shipped BER harness has ONLY AWGN + a STATIC
+// 2-ray tap (fsel, zero Doppler), which cannot reproduce this. This method
+// adds a time-varying ITU-R F.1487 / Watterson 2-path fading channel to the
+// real TX passband, so the same baud cliff sweep can be re-run under fading.
+//
+// Model (PathSim, Moe Wheatley AE4JY, https://github.com/bubnikv/pathsim,
+// Path.cpp Rayleigh::sample/Path::calc_path; ITU-R F.1487 §Annex-3 simplified
+// 2-path test channel; WSJT-X FST4 quick-start "freq spread = 2*std-dev of the
+// Gaussian Doppler spectrum"):
+//   * Two equal-power independently-fading paths at delays {0, tau}.
+//   * Each path's complex tap gain g_p[n] = white complex-Gaussian filtered by a
+//     Gaussian-shaped LPF whose 2-sigma BW = the Doppler spread f_d. A Gaussian
+//     time kernel exp(-0.5(t/sigma_t)^2) gives a Gaussian Doppler PSD with std
+//     sigma_f; with f_d = 2*sigma_f => sigma_t = 1/(pi*f_d) seconds.
+//   * The complex gain must rotate the carrier phase (Doppler), so it is applied
+//     to the ANALYTIC signal xa = x + j*hilbert(x): y = Re{ sum_p g_p[n]*xa[n-tau_p] }.
+//     An amplitude-only (real-gain) model would understate the damage because it
+//     would not spread the tone across FFT bins. The Hilbert FIR is a 65-tap
+//     windowed Type-III; the signal is narrowband at carrier 1500 Hz so this is
+//     accurate well inside the band.
+//   * Tap gains normalized to unit average power per path => total channel power
+//     ~= 1 => NO mean-SNR shift vs AWGN-only (apples-to-apples cliff comparison).
+//
+// Env (read here; no production path reads them):
+//   MERCURY_FADING=1            enable (default off => byte-identical no-op)
+//   MERCURY_FADING_DOPPLER=<Hz> Doppler spread f_d (default 1.0)
+//   MERCURY_FADING_DELAY_MS=<ms> 2nd-path delay   (default 1.0)
+//   MERCURY_FADING_SEED=<n>     tap-process RNG seed (default 12345; per-frame
+//                               advanced so successive frames see fresh fading)
+// ===========================================================================
+void cl_telecom_system::apply_watterson_fading(double* passband, int nSamp)
+{
+	const char* en = getenv("MERCURY_FADING");
+	if(en == NULL || atoi(en) == 0) return;   // default OFF => byte-identical
+	if(nSamp <= 0) return;
+
+	double f_d   = 1.0;   // Doppler spread (Hz)
+	double tau_ms = 1.0;  // 2nd-path delay (ms)
+	{
+		const char* d = getenv("MERCURY_FADING_DOPPLER");
+		if(d != NULL) { double v = atof(d); if(v >= 0.0 && v <= 30.0) f_d = v; }
+		const char* t = getenv("MERCURY_FADING_DELAY_MS");
+		if(t != NULL) { double v = atof(t); if(v >= 0.0 && v <= 10.0) tau_ms = v; }
+	}
+
+	// Passband sample rate. sampling_frequency = interp*(bandwidth/Nc)*Nfft
+	// (telecom_system.cc:3299) ALREADY includes the interpolation factor, i.e. it
+	// IS the passband rate (48000 Hz for the K=1 WB engine; halves with Nfft under
+	// baud-scaling since bandwidth=48000*Nc/Nfft/interp). passband_data is sampled
+	// at exactly this rate, so do NOT multiply by interp again.
+	double fs = sampling_frequency;
+	int tau = (int)llround(tau_ms * 1e-3 * fs);   // 2nd-path delay in passband samples
+	if(tau < 1) tau = 1;
+	if(tau >= nSamp) tau = nSamp - 1;
+
+	// --- Per-call RNG (independent of srand-based AWGN; reproducible) -----
+	static unsigned long s_call = 0;
+	unsigned long seed = 12345UL;
+	{ const char* sv = getenv("MERCURY_FADING_SEED"); if(sv != NULL) seed = (unsigned long)strtoul(sv, NULL, 10); }
+	unsigned long rngstate = seed + 2654435761UL * (++s_call);  // advance per frame
+	auto urand = [&rngstate]() -> double {                       // xorshift -> [0,1)
+		rngstate ^= rngstate << 13; rngstate ^= rngstate >> 17; rngstate ^= rngstate << 5;
+		return (double)(rngstate & 0xFFFFFFFFUL) / 4294967296.0;
+	};
+	auto gauss = [&urand]() -> double {                          // Box-Muller, one normal
+		double u1 = urand(); if(u1 < 1e-12) u1 = 1e-12; double u2 = urand();
+		return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+	};
+
+	// --- Hilbert FIR (65-tap, Hamming-windowed Type-III) ------------------
+	// h[k] = (2/(pi*k))*sin^2(pi*k/2) for k!=0, 0 for k=0; windowed.
+	const int HN = 65;          // odd
+	const int HC = HN / 2;      // center index (=32)
+	static double hilb[65];
+	static bool hilb_ready = false;
+	if(!hilb_ready)
+	{
+		for(int i = 0; i < HN; i++)
+		{
+			int k = i - HC;
+			double h;
+			if(k == 0) h = 0.0;
+			else if((k & 1) == 0) h = 0.0;     // even taps are zero
+			else h = 2.0 / (M_PI * (double)k);
+			double w = 0.54 - 0.46 * cos(2.0 * M_PI * (double)i / (double)(HN - 1)); // Hamming
+			hilb[i] = h * w;
+		}
+		hilb_ready = true;
+	}
+
+	// --- Tap-gain process: low-rate Gaussian-filtered noise + interpolation -
+	// Generating the tap gain at the full passband rate would need a Gaussian
+	// kernel ~fs/f_d wide (>100k taps at f_d=0.5 Hz) => O(nSamp^2). PathSim
+	// avoids this by generating the fading at a low rate (12.8-320 Hz) and
+	// upsampling. We do the same: generate complex-Gaussian samples at fs_tap,
+	// Gaussian-LPF them (short kernel there), then LINEARLY interpolate the tap
+	// gain up to the passband rate. fs_tap is chosen >> f_d (>= 50x and >= 100 Hz)
+	// so the interpolation is far above the Doppler bandwidth (no aliasing of the
+	// few-Hz process). The fading varies smoothly across the frame; what matters
+	// for the coherence-time test is how much it changes across ONE Nfft window,
+	// which interpolation preserves exactly (the process is band-limited to f_d).
+	double fd_eff = (f_d < 0.05) ? 0.05 : f_d;     // floor: ~static (T_coh >> frame)
+	double fs_tap = 50.0 * fd_eff; if(fs_tap < 100.0) fs_tap = 100.0;
+	// Gaussian kernel at the LOW rate: sigma_t = fs_tap/(pi*f_d) low-rate samples.
+	double sigma_lt = fs_tap / (M_PI * fd_eff);
+	int GK = (int)llround(4.0 * sigma_lt); if(GK < 1) GK = 1; if(GK > 4096) GK = 4096;
+	int GN = 2 * GK + 1;
+	std::vector<double> gk(GN);
+	double gnorm = 0.0;
+	for(int i = 0; i < GN; i++)
+	{
+		double x = (double)(i - GK) / sigma_lt;
+		double v = exp(-0.5 * x * x);
+		gk[i] = v; gnorm += v * v;
+	}
+	gnorm = sqrt(gnorm);
+	for(int i = 0; i < GN; i++) gk[i] /= gnorm;     // L2-normalize => filtered noise has unit variance
+
+	// Number of low-rate tap samples spanning the frame (+ kernel margin so the
+	// centered convolution is stationary across the whole frame).
+	double frame_s = (double)nSamp / fs;
+	int nLow = (int)ceil(frame_s * fs_tap) + 2 * GK + 4;
+	const int NPATH = 2;
+	std::vector<double> gI[NPATH], gQ[NPATH];        // low-rate filtered tap gains
+	for(int p = 0; p < NPATH; p++)
+	{
+		std::vector<double> wI(nLow + 2 * GK), wQ(nLow + 2 * GK);
+		for(int n = 0; n < (int)wI.size(); n++) { wI[n] = gauss(); wQ[n] = gauss(); }
+		gI[p].assign(nLow, 0.0); gQ[p].assign(nLow, 0.0);
+		for(int n = 0; n < nLow; n++)
+		{
+			double aI = 0.0, aQ = 0.0;
+			for(int k = 0; k < GN; k++)
+			{
+				int idx = n + k;                     // wI is offset by +GK (margin)
+				aI += gk[k] * wI[idx];
+				aQ += gk[k] * wQ[idx];
+			}
+			gI[p][n] = aI; gQ[p][n] = aQ;
+		}
+	}
+	// Linear-interpolation lookup from passband index n -> low-rate tap gain.
+	double tap_step = fs_tap / fs;                   // low-rate samples per passband sample
+	auto tap = [&](int p, int n, double& outI, double& outQ) {
+		double pos = (double)n * tap_step + (double)GK; // +GK: center within margin
+		int i0 = (int)pos; double fr = pos - (double)i0;
+		int i1 = i0 + 1;
+		if(i0 < 0) { i0 = 0; i1 = 0; fr = 0.0; }
+		if(i1 >= nLow) { i1 = nLow - 1; if(i0 >= nLow) i0 = nLow - 1; }
+		outI = gI[p][i0] * (1.0 - fr) + gI[p][i1] * fr;
+		outQ = gQ[p][i0] * (1.0 - fr) + gQ[p][i1] * fr;
+	};
+
+	// --- Apply: y = Re{ sum_p g_p[n] * xa[n - tau_p] }, tau_0=0, tau_1=tau ---
+	// xa[m] = x[m] + j*xhat[m], xhat = (hilb * x). Build the analytic signal
+	// once. Equal-power paths => scale by 1/sqrt(NPATH).
+	std::vector<double> xhat(nSamp, 0.0);
+	for(int n = 0; n < nSamp; n++)
+	{
+		double acc = 0.0;
+		for(int i = 0; i < HN; i++)
+		{
+			int idx = n - (i - HC);
+			if(idx < 0 || idx >= nSamp) continue;
+			acc += hilb[i] * passband[idx];
+		}
+		xhat[n] = acc;
+	}
+	double pscale = 1.0 / sqrt((double)NPATH);
+	int taus[NPATH] = {0, tau};
+	std::vector<double> y(nSamp, 0.0);
+	double pin = 0.0, pout = 0.0;
+	for(int n = 0; n < nSamp; n++)
+	{
+		double out = 0.0;
+		for(int p = 0; p < NPATH; p++)
+		{
+			int m = n - taus[p];
+			if(m < 0) continue;
+			double gi, gq; tap(p, n, gi, gq);
+			// Re{ (gI + j gQ) * (x + j xhat) } = gI*x - gQ*xhat
+			out += pscale * (gi * passband[m] - gq * xhat[m]);
+		}
+		y[n] = out;
+		pin  += passband[n] * passband[n];
+		pout += out * out;
+	}
+	// Hold the FRAME-AVERAGE power fixed (zero mean-SNR shift vs AWGN-only): the
+	// fading must redistribute energy across the symbol (coherence change) without
+	// changing the average channel SNR, else the cliff comparison is not apples-to
+	// -apples. This renormalizes out any residual gain from the |g|^2 bookkeeping /
+	// the random tap realization for this frame.
+	double prenorm = (pout > 1e-30) ? sqrt(pin / pout) : 1.0;
+	for(int n = 0; n < nSamp; n++) passband[n] = y[n] * prenorm;
+
+	static int banner_done = -1;
+	if(banner_done != current_configuration)
+	{
+		banner_done = current_configuration;
+		printf("[FADING] Watterson 2-path: f_d=%.2f Hz (fs_tap=%.0f Hz, sigma_lt=%.1f, "
+		       "kernel=%d), delay=%.2f ms (%d samp), fs=%.0f, Nfft=%d\n",
+		       f_d, fs_tap, sigma_lt, GN, tau_ms, tau, fs, ofdm.Nfft);
+		fflush(stdout);
+	}
+}
+
 cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 {
 	cl_error_rate lerror_rate;
@@ -417,7 +632,16 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			}
 			P_sig /= nSamples;
 			double f_nyquist = sampling_frequency / 2.0;
-			sigma = (float)sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, EsN0 / 10.0) * bandwidth));
+			// P0 baud-scaling spike (baud-scaling-spike.md §2): when ofdm.Nfft is
+			// scaled by baud_mult, `bandwidth` (=48000*Nc/Nfft/interp,
+			// telecom_system.cc:4217) shrinks by the SAME factor. If the noise
+			// reference tracked that, the +3 dB/2x coherent gain would be exactly
+			// cancelled in the reported EsN0 (the measurement trap). Pin the
+			// reference to the K=1 bandwidth (multiply back by baud_mult) so the
+			// swept SNR axis is a FIXED ~3 kHz reference (WSJT-X Table 7 / SNR3k
+			// convention) and the cliff moves by the TRUE baud-scaling gain.
+			double ref_bandwidth = bandwidth * (double)baud_mult;
+			sigma = (float)sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, EsN0 / 10.0) * ref_bandwidth));
 			sigma_calibrated = true;
 		}
 
@@ -433,6 +657,20 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			{
 				data_container.passband_data[n] += fsel_amp * data_container.passband_data[n - fsel_delay];
 			}
+		}
+
+		// Watterson FADING spike (baud-fading-spike.md): time-varying ITU-R
+		// F.1487 / Watterson 2-path channel, applied to the TX passband BEFORE
+		// AWGN. Env-gated (MERCURY_FADING=1), MFSK-only, off by default =>
+		// production BER byte-identical. This is the only model in the harness
+		// with a non-zero Doppler spread, so it is the only one that can test the
+		// coherence-time wall on the baud-scaled (longer-symbol) rungs. (Internal
+		// MERCURY_FADING gate => no-op when unset, so calling it for every MFSK
+		// frame is free in the default/AWGN sweep.)
+		if(M == MOD_MFSK)
+		{
+			int nSamp = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb)) * this->frequency_interpolation_rate;
+			apply_watterson_fading(data_container.passband_data, nSamp);
 		}
 
 		awgn_channel.apply_with_delay(data_container.passband_data,data_container.passband_delayed_data,sigma,(data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*this->frequency_interpolation_rate,((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate);
@@ -5480,6 +5718,36 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.Nfft=default_configurations_telecom_system.ofdm_Nfft;
 	ofdm.gi=default_configurations_telecom_system.ofdm_gi;
 	ofdm.Nsymb=default_configurations_telecom_system.ofdm_Nsymb;
+
+	// === P0 BAUD-SCALING SPIKE (SIM ONLY, env-gated) =======================
+	// baud-scaling-spike.md §3: a genuine 2x/4x LONGER coherent MFSK symbol is
+	// produced by enlarging the per-symbol FFT window (the symbol = exactly one
+	// Nfft FFT window, §1). Scale ofdm.Nfft by MERCURY_BAUD_MULT (K=1/2/4) for
+	// MFSK/robust configs only. Ngi=Nfft*gi, Nofdm, all buffers, the cached FFT
+	// plan, and the tone grid (M tones on Nc bins) follow automatically. Tone
+	// spacing narrows to 12000/(K*256) Hz, symbol period grows K*. Default (env
+	// unset) => K=1 => byte-identical to production for EVERY config.
+	baud_mult = 1;
+	if(is_robust_config(configuration))
+	{
+		const char* bm = getenv("MERCURY_BAUD_MULT");
+		if(bm != NULL)
+		{
+			int k = atoi(bm);
+			if(k == 2 || k == 4 || k == 8) baud_mult = k;
+		}
+		if(baud_mult > 1)
+		{
+			ofdm.Nfft = default_configurations_telecom_system.ofdm_Nfft * baud_mult;
+			printf("[BAUD-SPIKE] MERCURY_BAUD_MULT=%d -> Nfft %d->%d (symbol %dx longer, "
+			       "tone spacing %.2f Hz)\n",
+			       baud_mult, default_configurations_telecom_system.ofdm_Nfft, ofdm.Nfft,
+			       baud_mult,
+			       48000.0/frequency_interpolation_rate/(double)ofdm.Nfft);
+			fflush(stdout);
+		}
+	}
+	// =======================================================================
 
 	ofdm.pilot_configurator.Dx=default_configurations_telecom_system.ofdm_pilot_configurator_Dx;
 	ofdm.pilot_configurator.Dy=default_configurations_telecom_system.ofdm_pilot_configurator_Dy;
