@@ -3587,6 +3587,450 @@ static void test_gf16_ra_cliff_sweep() {
 // Top-level runner
 // =============================================================================
 
+// =============================================================================
+// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation, 2026-05-31)
+//
+// Investigates why HAIL beacon detection (the binding constraint on ROBUST_0
+// link ESTABLISHMENT) dies at ~-10/-11 dB SNR3k while the structurally-identical
+// ctrl base-pattern matched-count detector reaches -14.68 dB.
+//
+// Code facts (no assumptions — all cited):
+//   - HAIL base pattern = ack_pattern_nsymb (16 sym for WB) Welch-Costas tones,
+//     hail_match_threshold=7/16 (mfsk.cc:341-343). IDENTICAL length+threshold
+//     to the ctrl/ACK base pattern (mfsk.cc:229-230,398-399).
+//   - Detector is the SAME function (ofdm.cc:3691 detect_ack_pattern) the ctrl
+//     base detector uses. So the -14.68 floor IS HAIL's matched-count floor.
+//   - HAIL production gate (fast LISTENING poll, arq_common.cc:5375) ANDs in a
+//     HARDCODED `metric >= 3.0 && quality >= 0.3` on top of base_matched>=7.
+//     The -14.68 figure is the matched-count gate ALONE (no metric gate). So the
+//     ~4 dB gap is the metric gate, NOT the pattern/threshold/detector.
+//   - The sibling HAIL site (receive() path, arq_common.cc:6373) instead uses the
+//     config-tuned `ack_pattern_detection_threshold` = 0.65 at ROBUST_0
+//     (telecom_system.cc:5506) — the fast-poll 3.0 is INCONSISTENT with the
+//     codebase's own ROBUST_0 tuning.
+//   - N HAIL beacons are sent per CONNECT (arq_commander.cc:407 in a retry loop)
+//     but detected INDEPENDENTLY: receive_hail_pattern (arq_common.cc:5276) snaps
+//     the buffer tail and resets the capture ring between beacons (:5247). NO
+//     noncoherent integration across beacons.
+//
+// This sweep MEASURES (sim, AWGN + realistic CFO/jitter, mirrors the ctrl
+// metric-gate acquisition-gain harness connect-ack-metric-gate.md §7):
+//   (a) the HAIL cliff under the current 3.0 gate (confirm ~-10/-11),
+//   (b) gain from relaxing the metric gate 3.0 -> 2.0 -> 0.65,
+//   (c) gain from noncoherent energy-combining R=2/3/5 beacons (sum E[s][m]
+//       BEFORE argmax — square-law, not hard majority),
+//   (d) the base-matched-only floor (the -14.68 target),
+//   (e) FAR on pure noise for each (metric_thr, R).
+// =============================================================================
+
+// SNR3k (3 kHz-noise-bandwidth SNR), copied bit-exact from the suffix-cliff
+// harness (connect-suffix-fec-research.md §6.1 calibration; .tmp_repsim
+// harness_simbranch.cc:2818) so this axis is directly comparable to the
+// -14.68 dB base-detector figure measured there.
+static double hail_snr3k_db(double p_sig, double sigma, double fs) {
+	double n3k = sigma * sigma * 3000.0 / (fs / 2.0);
+	if (n3k <= 0.0) return 999.0;
+	return 10.0 * std::log10(p_sig / n3k);
+}
+
+// Build a CLEAN (noiseless) HAIL beacon passband template on an ALREADY-LOADED
+// ts (caller did load_configuration(ROBUST_0) once — avoids per-trial reload,
+// the runtime hotspot). Mirrors synth_ack_pattern_passband_with_cfo (§8) but
+// calls generate_hail_pattern + hail_detect_nsymb/tones, reproducing the
+// production TX path (telecom_system.cc:3688 generate_hail_pattern_passband)
+// modulo TX gain/clip (irrelevant to a relative-SNR cliff). out_pb = leading
+// silence + pattern + trailing silence; signal starts at out_sig_offset_dec
+// (decimated). out_p_sig = passband signal power for SNR3k.
+static bool build_hail_template(
+	cl_telecom_system& ts,
+	double cfo_hz,
+	std::vector<double>& out_pb,
+	int& out_sig_offset_dec,
+	double& out_p_sig)
+{
+	if (ts.ack_mfsk.M < 16 || ts.ack_mfsk.hail_detect_nsymb <= 0) return false;
+	if (ts.ack_pattern_passband_samples <= 0) return false;
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc    = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	int nsymb  = ts.ack_mfsk.hail_detect_nsymb;  // undirected = 16 for WB
+
+	std::vector<std::complex<double> > pat_freq(
+		(size_t)nsymb * (size_t)Nc, std::complex<double>(0.0, 0.0));
+	ts.ack_mfsk.generate_hail_pattern(pat_freq.data());
+
+	std::vector<std::complex<double> > pat_time(
+		(size_t)nsymb * (size_t)Nofdm, std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < nsymb; s++)
+		ts.ofdm.symbol_mod(&pat_freq[(size_t)s * Nc], &pat_time[(size_t)s * Nofdm]);
+
+	const int pattern_samples_pb = Nofdm * nsymb * interp;
+	const int leading_silence_pb = 4 * Nofdm * interp;
+	const int trailing_silence_pb = 4 * Nofdm * interp;
+	const int buffer_pb_size = leading_silence_pb + pattern_samples_pb + trailing_silence_pb;
+
+	std::vector<double> pattern_pb((size_t)pattern_samples_pb, 0.0);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		pat_time.data(), Nofdm * nsymb, pattern_pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency + cfo_hz,
+		ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	double psum = 0.0;
+	for (int i = 0; i < pattern_samples_pb; i++) psum += pattern_pb[(size_t)i] * pattern_pb[(size_t)i];
+	out_p_sig = (pattern_samples_pb > 0) ? psum / (double)pattern_samples_pb : 0.0;
+
+	out_pb.assign((size_t)buffer_pb_size, 0.0);
+	for (int i = 0; i < pattern_samples_pb && (leading_silence_pb + i) < buffer_pb_size; i++)
+		out_pb[(size_t)(leading_silence_pb + i)] = pattern_pb[(size_t)i];
+
+	out_sig_offset_dec = leading_silence_pb / interp;
+	return true;
+}
+
+// Fixed-offset noncoherent energy-combining scorer for the HAIL base pattern.
+// FAITHFUL replica of detect_ack_pattern's per-symbol bin logic (ofdm.cc:3726-
+// 3823) — same expected/mirror-bin mapping (Bug #39 carrier-image recovery),
+// same all-streams-argmax match rule, same metric = e_target/e_total — but
+// (1) evaluated at a KNOWN symbol-grid offset (isolates energy-combining gain
+// from the timing search), and (2) SUMS the per-bin energies across R aligned
+// baseband realizations BEFORE the argmax/metric (square-law noncoherent
+// integration; NOT hard majority, NOT coherent). R=1 reproduces the production
+// fixed-offset detector (asserted by the R=1-vs-production check in the test).
+// Returns matched count; *out_metric = summed e_target/e_total over matches.
+static int hail_score_combined(
+	cl_ofdm& ofdm,
+	int Nofdm,                 // decimated symbol period (= data_container.Nofdm)
+	const std::vector<std::vector<std::complex<double> > >& bb_reps, // R decimated buffers
+	int sig_offset_dec,        // symbol-grid start (decimated samples)
+	int nsymb,
+	const int* tones,          // hail_detect_tones (flat, no modulo applied yet)
+	int M,
+	int nStreams,
+	const int* stream_offsets,
+	int tone_hop_step,
+	double* out_metric)
+{
+	int Nfft = ofdm.Nfft;
+	int Nc   = ofdm.Nc;
+	int half = Nc / 2;
+	int ss   = ofdm.start_shift;
+	int R    = (int)bb_reps.size();
+	if (out_metric) *out_metric = 0.0;
+	if (R <= 0) return 0;
+
+	// The bb is already decimated; production detect_ack_pattern runs it with
+	// interpolation_rate=1 (ofdm.cc:3702-3703), so the decimated symbol period =
+	// Nofdm and the FFT window skips Ngi = Nofdm - Nfft (ofdm.cc:3729).
+	int Ngi = Nofdm - Nfft;
+	int sym_period = Nofdm;  // decimated
+
+	std::vector<std::complex<double> > sym((size_t)Nfft), spec((size_t)Nfft);
+	int matched = 0;
+	double metric = 0.0;
+
+	for (int p = 0; p < nsymb; p++) {
+		int tone_base = tones[p];
+		int actual_tone = (tone_base + p * tone_hop_step) % M;
+
+		// Accumulate per-bin energy across the R reps for this symbol.
+		std::vector<double> e_bin((size_t)Nfft, 0.0);
+		bool oob = false;
+		for (int r = 0; r < R; r++) {
+			const std::vector<std::complex<double> >& bb = bb_reps[(size_t)r];
+			int offset = sig_offset_dec + p * sym_period + Ngi;
+			if (offset < 0 || offset + Nfft > (int)bb.size()) { oob = true; break; }
+			for (int i = 0; i < Nfft; i++) sym[(size_t)i] = bb[(size_t)(offset + i)];
+			ofdm.fft(sym.data(), spec.data(), Nfft);
+			for (int b = 0; b < Nfft; b++)
+				e_bin[(size_t)b] += spec[(size_t)b].real() * spec[(size_t)b].real()
+				                  + spec[(size_t)b].imag() * spec[(size_t)b].imag();
+		}
+		if (oob) continue;
+
+		// Per-stream: expected bin (+ carrier-image mirror), all-streams argmax match.
+		int streams_matched = 0;
+		double e_target = 0.0;
+		for (int st = 0; st < nStreams; st++) {
+			int esub = stream_offsets[st] + actual_tone;
+			int ebin = (esub < half) ? (Nfft - half + esub) : (ss + (esub - half));
+			int mbin = (Nfft - ebin) % Nfft;
+			e_target += e_bin[(size_t)ebin] + e_bin[(size_t)mbin];
+
+			double peak_e = -1.0; int peak_bin = -1;
+			for (int t = 0; t < M; t++) {
+				int tsub = stream_offsets[st] + t;
+				int b = (tsub < half) ? (Nfft - half + tsub) : (ss + (tsub - half));
+				if (e_bin[(size_t)b] > peak_e) { peak_e = e_bin[(size_t)b]; peak_bin = b; }
+			}
+			if (peak_e > 0 && (peak_bin == ebin || peak_bin == mbin)) streams_matched++;
+		}
+		if (streams_matched < nStreams) continue;
+		matched++;
+
+		double e_total = 0.0;
+		for (int k = 0; k < Nc; k++) {
+			int bk = (k < half) ? (Nfft - half + k) : (ss + (k - half));
+			e_total += e_bin[(size_t)bk];
+		}
+		if (e_total > 0.0) metric += e_target / e_total;
+	}
+
+	if (out_metric) *out_metric = metric;
+	return matched;
+}
+
+// Decimate a passband buffer to baseband (mirrors run_initial_ack_detect /
+// detect_hail_pattern_from_passband, telecom_system.cc:3729). interp = the
+// interpolation_rate; out buffer has size_in/interp complex samples.
+static void hail_decimate(cl_telecom_system& ts, const std::vector<double>& pb,
+                          std::vector<std::complex<double> >& out_bb) {
+	int M = ts.data_container.interpolation_rate;
+	int size = (int)pb.size();
+	int dec_size = size / M;
+	double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	out_bb.assign((size_t)dec_size, std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband_decimated(
+		const_cast<double*>(pb.data()), size, out_bb.data(),
+		ts.sampling_frequency, eff_carrier, ts.carrier_amplitude,
+		M, &ts.ofdm.FIR_rx_data);
+}
+
+// §11 — THE MEASUREMENT: HAIL beacon-detection cliff (P(detect) vs SNR3k) under
+// the current 3.0 metric gate, the relaxed 2.0/0.65 gates, and R=1/2/3/5
+// noncoherent beacon energy-combining. Also reports the base-matched-only floor
+// (the -14.68 target) and FAR on pure noise. Deterministic seed. MEASURE-only —
+// always test_pass (the dB verdict is in the log).
+static void test_hail_detection_cliff_sweep() {
+	const char* name = "hail_detection_cliff_sweep";
+	printf("  [MEASURE] HAIL beacon-detection floor (metric-gate relax + noncoherent beacon combining):\n");
+
+	// One persistent ts: load_configuration(ROBUST_0) ONCE (the runtime hotspot).
+	// All per-trial work reuses its FIRs / ack_mfsk / ofdm.
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	ts.ack_mfsk.clear_hail_target();  // undirected HAIL (base only, 16 sym WB)
+
+	int M           = ts.ack_mfsk.M;
+	int nsymb       = ts.ack_mfsk.hail_detect_nsymb;
+	int base_thr    = ts.ack_mfsk.hail_match_threshold;
+	int nStreams    = ts.ack_mfsk.nStreams;
+	int tone_hop    = ts.ack_mfsk.tone_hop_step;
+	int Nofdm       = ts.data_container.Nofdm;
+	const int* tones = ts.ack_mfsk.hail_detect_tones;
+	const int* soff  = ts.ack_mfsk.stream_offsets;
+	double fs        = ts.sampling_frequency;
+	if (M < 16 || nsymb <= 0) { test_fail(name, "HAIL config not WB/loaded"); return; }
+	printf("    HAIL config: M=%d nsymb=%d base_thr=%d/%d nStreams=%d tone_hop=%d Nofdm=%d (ROBUST_0 WB)\n",
+		M, nsymb, base_thr, nsymb, nStreams, tone_hop, Nofdm);
+	printf("    Gates: production fast-poll HAIL = base>=%d && metric>=3.0 && quality>=0.3 (arq_common.cc:5375)\n", base_thr);
+	printf("           ROBUST_0 ack_pattern_detection_threshold = 0.65 (telecom_system.cc:5506) — what the sibling site uses\n");
+
+	const double cfo_hz = 12.0;  // realistic CFO inside Moose range (matches ctrl gate harness §7)
+
+	// Pre-build clean passband templates ONCE: +cfo and -cfo (CFO sign alternates
+	// per beacon to model independent TX events; CFO does not shift timing so reps
+	// stay grid-aligned, which is required for a fair noncoherent combine).
+	std::vector<double> tmpl_pos, tmpl_neg;
+	int sig_off0 = 0; double p_sig = 0.0;
+	if (!build_hail_template(ts, +cfo_hz, tmpl_pos, sig_off0, p_sig) ||
+	    !build_hail_template(ts, -cfo_hz, tmpl_neg, sig_off0, p_sig)) {
+		test_fail(name, "build_hail_template failed"); return;
+	}
+	const int PB = (int)tmpl_pos.size();
+
+	// --- R=1 fidelity check vs the production fixed-offset detector path. ---
+	// hail_score_combined at R=1 must reproduce detect_hail_pattern_from_passband's
+	// matched count on a clean buffer (anchors the scorer's bin-mapping correctness).
+	{
+		std::vector<std::complex<double> > bb; hail_decimate(ts, tmpl_pos, bb);
+		std::vector<std::vector<std::complex<double> > > reps(1, bb);
+		double m1 = 0.0;
+		int mc1 = hail_score_combined(ts.ofdm, Nofdm, reps, sig_off0, nsymb,
+			tones, M, nStreams, soff, tone_hop, &m1);
+		int prod_matched = 0, prod_suffix = 0;
+		double prod_metric = ts.detect_hail_pattern_from_passband(tmpl_pos.data(), PB,
+			&prod_matched, 0, &prod_suffix);
+		printf("    [R=1 fidelity] fixed-offset scorer: matched=%d metric=%.2f | production(sliding): matched=%d metric=%.2f\n",
+			mc1, m1, prod_matched, prod_metric);
+		if (mc1 < nsymb - 1) {  // clean buffer should match ~all symbols
+			char b[160]; snprintf(b, sizeof(b),
+				"R=1 scorer matched=%d on clean (expected >=%d) — bin mapping diverges from production",
+				mc1, nsymb - 1);
+			test_fail(name, b); return;
+		}
+	}
+
+	// --- Cliff sweep. Noise sigma is set RELATIVE to the passband signal RMS
+	// (sigma = mult * sig_rms) so the axis is calibration-robust; SNR3k is then
+	// reported for the absolute anchor. Larger mult = lower SNR. The mult range
+	// brackets the base matched-count floor (empirically ~14-22x rms = the
+	// -14 dB region for this 16-sym Welch-Costas pattern). CFO is the channel
+	// impairment (matches the ctrl gate harness §7); NO timing jitter — the
+	// production detector does a fine timing search, so a fixed-offset scorer
+	// with injected jitter would mismodel an effect the real RX corrects. ---
+	const double sig_rms = std::sqrt(p_sig);
+	// Fine grid (~0.4-0.8 dB steps) across the metric-gate cliff region (mult
+	// 4-8 ≈ -3..-9 dB) so the 3.0-vs-2.0-vs-0.65 gate separation resolves
+	// (the ctrl harness §7 found it in a ~2.5 dB band), then coarser down to
+	// the base matched-count floor (~mult 14 ≈ -14 dB).
+	const double mults[] = {
+		3.0, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0,
+		10.0, 11.0, 12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0
+	};
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 120;                 // trials per sigma (tighter P estimate at the cliff)
+	const int Rs[] = {1, 2, 3, 5};
+	const int NR = (int)(sizeof(Rs)/sizeof(Rs[0]));
+	// Three named SOFT-gate variants (metric_thr, quality_thr) on top of the
+	// base>=base_thr count gate. CRITICAL: HAIL's quality>=0.3 gate
+	// (arq_common.cc:5375) means metric/matched>=0.3 → with matched=16 that's
+	// metric>=4.8, STRICTER than the metric>=3.0 gate. So the quality gate
+	// dominates at the floor. We measure the metric relax alone (ctrl §7 style)
+	// AND the both-relaxed (quality off) case to expose that.
+	const char* gate_name[3] = {"CURRENT(m>=3.0,q>=0.3)", "METRIC-RELAX(m>=2.0,q>=0.3)", "BOTH-RELAX(m>=0.65,q>=0.0)"};
+	const double gate_metric[3]  = {3.0, 2.0, 0.65};
+	const double gate_quality[3] = {0.3, 0.3, 0.0};
+	const int NM = 3;
+	const int RMAX = Rs[NR-1];
+
+	// cliff[r][m] = deepest SNR3k (most-negative dB) where P(detect) still >= 0.5.
+	double cliff_snr[4][3]; double cliff_sig[4][3];
+	double mcount_cliff_snr[4]; double mcount_cliff_sig[4];  // matched-count-only, per R
+	double base_cliff_snr = 999.0, base_cliff_sig = 0.0;
+	for (int r = 0; r < NR; r++) {
+		mcount_cliff_snr[r] = 999.0; mcount_cliff_sig[r] = 0.0;
+		for (int m = 0; m < NM; m++) { cliff_snr[r][m] = 999.0; cliff_sig[r][m] = 0.0; }
+	}
+
+	printf("    Sweep: %d trials/mult, sig_rms=%.3f p_sig=%.3f, CFO=+-%.0f Hz, AWGN (no timing jitter; RX searches timing).\n",
+		NT, sig_rms, p_sig, cfo_hz);
+	printf("    count[..] = P(combined matched>=%d), no soft gate (combining SHOULD help this).\n", base_thr);
+	printf("    Gate G0=%s  G1=%s  G2=%s\n", gate_name[0], gate_name[1], gate_name[2]);
+	printf("    (sigma/rms : SNR3k_dB : count[R1 R2 R3 R5] : R1[G0 G1 G2] R2[G0 G1 G2] R5[G0 G1 G2])\n");
+
+	std::mt19937 rng(0x4A115EEDu);
+	std::vector<double> noisy((size_t)PB);
+	for (int si = 0; si < NS; si++) {
+		double sigma = mults[si] * sig_rms;
+		std::normal_distribution<double> nd(0.0, sigma);
+		int base_hits = 0;                     // R=1 matched-count-only floor
+		int mcount_hits[4]; memset(mcount_hits, 0, sizeof(mcount_hits)); // matched-count-only per R (combining gain on the COUNT statistic)
+		int det_hits[4][3]; memset(det_hits, 0, sizeof(det_hits));       // full production gate per (R, metric_thr)
+
+		for (int it = 0; it < NT; it++) {
+			int sig_off = sig_off0;  // perfect grid alignment (RX fine-search proxy)
+
+			// Build RMAX aligned noisy reps (copy clean template + AWGN + decimate).
+			std::vector<std::vector<std::complex<double> > > reps((size_t)RMAX);
+			for (int r = 0; r < RMAX; r++) {
+				const std::vector<double>& tmpl = (((it + r) & 1) ? tmpl_neg : tmpl_pos);
+				for (int i = 0; i < PB; i++) noisy[(size_t)i] = tmpl[(size_t)i] + nd(rng);
+				std::vector<std::complex<double> > bb; hail_decimate(ts, noisy, bb);
+				reps[(size_t)r] = bb;
+			}
+
+			// For each R: combine the first R reps, score once. Record BOTH
+			// (a) matched-count-only (base_thr) — combining SHOULD help this, and
+			// (b) the full production gate (base && metric>=thr && quality>=0.3) —
+			// the energy-RATIO metric is scale-invariant to combining (sum cancels
+			// in the ratio), so combining should NOT move the full gate.
+			for (int r = 0; r < NR; r++) {
+				int R = Rs[r];
+				std::vector<std::vector<std::complex<double> > > sub(reps.begin(), reps.begin() + R);
+				double mm = 0.0;
+				int mc = hail_score_combined(ts.ofdm, Nofdm, sub, sig_off, nsymb,
+					tones, M, nStreams, soff, tone_hop, &mm);
+				double quality = (mc > 0) ? mm / mc : 0.0;
+				bool base_ok = (mc >= base_thr);
+				if (base_ok) mcount_hits[r]++;
+				if (r == 0 && base_ok) base_hits++;
+				for (int m = 0; m < NM; m++)
+					if (base_ok && mm >= gate_metric[m] && quality >= gate_quality[m]) det_hits[r][m]++;
+			}
+		}
+
+		double snr = hail_snr3k_db(p_sig, sigma, fs);
+		double pbase = (double)base_hits / NT;
+		printf("      %5.1f : %7.2f : count[R1=%.2f R2=%.2f R3=%.2f R5=%.2f] : full R1[%.2f %.2f %.2f] R2[%.2f %.2f %.2f] R5[%.2f %.2f %.2f]\n",
+			mults[si], snr,
+			(double)mcount_hits[0]/NT, (double)mcount_hits[1]/NT, (double)mcount_hits[2]/NT, (double)mcount_hits[3]/NT,
+			(double)det_hits[0][0]/NT, (double)det_hits[0][1]/NT, (double)det_hits[0][2]/NT,
+			(double)det_hits[1][0]/NT, (double)det_hits[1][1]/NT, (double)det_hits[1][2]/NT,
+			(double)det_hits[3][0]/NT, (double)det_hits[3][1]/NT, (double)det_hits[3][2]/NT);
+
+		if (pbase >= 0.5 && sigma > base_cliff_sig) { base_cliff_sig = sigma; base_cliff_snr = snr; }
+		for (int r = 0; r < NR; r++) {
+			double pc = (double)mcount_hits[r] / NT;
+			if (pc >= 0.5 && sigma > mcount_cliff_sig[r]) { mcount_cliff_sig[r] = sigma; mcount_cliff_snr[r] = snr; }
+			for (int m = 0; m < NM; m++) {
+				double p = (double)det_hits[r][m] / NT;
+				if (p >= 0.5 && sigma > cliff_sig[r][m]) { cliff_sig[r][m] = sigma; cliff_snr[r][m] = snr; }
+			}
+		}
+	}
+
+	printf("    --- HAIL detection cliffs (P=0.5, SNR3k dB; more negative = deeper/better) ---\n");
+	printf("    BASE matched-count floor (the -14.68 target, R=1, no soft gate): %.2f dB\n", base_cliff_snr);
+	printf("    Matched-count-only cliff vs combining R:  R=1: %.2f | R=2: %.2f | R=3: %.2f | R=5: %.2f dB\n",
+		mcount_cliff_snr[0], mcount_cliff_snr[1], mcount_cliff_snr[2], mcount_cliff_snr[3]);
+	for (int m = 0; m < NM; m++) {
+		printf("    gate %-28s:  R=1: %.2f | R=2: %.2f | R=3: %.2f | R=5: %.2f dB\n",
+			gate_name[m], cliff_snr[0][m], cliff_snr[1][m], cliff_snr[2][m], cliff_snr[3][m]);
+	}
+	double d_mrelax = cliff_snr[0][1] - cliff_snr[0][0];        // metric 3.0->2.0 (quality still 0.3), R=1
+	double d_both   = cliff_snr[0][2] - cliff_snr[0][0];        // both soft gates off, R=1
+	double d_cR2    = mcount_cliff_snr[1] - mcount_cliff_snr[0];// R=2 vs R=1, count-only
+	double d_cR5    = mcount_cliff_snr[3] - mcount_cliff_snr[0];// R=5 vs R=1, count-only
+	double d_g2R5   = cliff_snr[3][2] - cliff_snr[0][2];        // R=5 vs R=1, BOTH-RELAX gate
+	printf("    ==> metric-thr relax 3.0->2.0 ALONE (quality>=0.3 kept), R=1: %+.2f dB  <-- quality gate masks it\n", d_mrelax);
+	printf("    ==> BOTH soft gates relaxed (metric+quality off), R=1: %+.2f dB toward the count floor\n", d_both);
+	printf("    ==> combining on matched-COUNT: R=2 %+.2f dB | R=5 %+.2f dB (10log10 ideal +3.0/+7.0; measured M=16 @ q~0.1-0.24)\n", d_cR2, d_cR5);
+	printf("    ==> combining + BOTH-relax gate: R=5 %+.2f dB vs R=1 (combining helps ONLY once the ratio gate is off)\n", d_g2R5);
+
+	// --- FAR on pure noise (no signal), per (gate, R). 5000 trials. ---
+	// Noise level = the deep-floor level (mult=16 * sig_rms ~ -15 dB), where the
+	// relaxed gates + combining would operate — the worst case for false alarms.
+	const int FT = 5000;
+	double fsig = 16.0 * sig_rms;
+	printf("    --- FAR (pure noise, sigma=%.2f = 16x rms ~ -15 dB SNR3k, %d trials/cell) ---\n", fsig, FT);
+	{
+		int fa[4][3]; memset(fa, 0, sizeof(fa));
+		std::mt19937 frng(0xFA15E000u);
+		std::normal_distribution<double> fnd(0.0, fsig);
+		std::vector<double> npb((size_t)PB);
+		for (int it = 0; it < FT; it++) {
+			std::vector<std::vector<std::complex<double> > > reps((size_t)RMAX);
+			for (int r = 0; r < RMAX; r++) {
+				for (int i = 0; i < PB; i++) npb[(size_t)i] = fnd(frng);  // pure noise
+				std::vector<std::complex<double> > bb; hail_decimate(ts, npb, bb);
+				reps[(size_t)r] = bb;
+			}
+			for (int r = 0; r < NR; r++) {
+				int R = Rs[r];
+				std::vector<std::vector<std::complex<double> > > sub(reps.begin(), reps.begin() + R);
+				double mm = 0.0;
+				int mc = hail_score_combined(ts.ofdm, Nofdm, sub, sig_off0, nsymb,
+					tones, M, nStreams, soff, tone_hop, &mm);
+				double quality = (mc > 0) ? mm / mc : 0.0;
+				bool base_ok = (mc >= base_thr);
+				for (int m = 0; m < NM; m++)
+					if (base_ok && mm >= gate_metric[m] && quality >= gate_quality[m]) fa[r][m]++;
+			}
+		}
+		for (int m = 0; m < NM; m++) {
+			printf("    gate %-28s: FAR R=1 %d/%d | R=2 %d/%d | R=3 %d/%d | R=5 %d/%d\n",
+				gate_name[m], fa[0][m], FT, fa[1][m], FT, fa[2][m], FT, fa[3][m], FT);
+		}
+	}
+
+	test_pass(name);  // MEASURE infra ran; the dB/FAR verdict is in the log
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -3662,6 +4106,11 @@ int run_mfsk_ctrl_codec_tests() {
 	test_gf16_ra_passband_roundtrip_clean();
 	test_gf16_ra_pure_noise_far();
 	test_gf16_ra_cliff_sweep();      // [MEASURE] prints the GF(16) cliff + gain dB
+
+	// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation,
+	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the
+	// noncoherent beacon-combining dB, the base-matched floor, and FAR.
+	test_hail_detection_cliff_sweep();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
