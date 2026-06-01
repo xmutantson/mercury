@@ -4069,6 +4069,98 @@ void cl_ofdm::decode_suffix_tones(std::complex<double>* baseband_interp, int buf
 	}
 }
 
+// Soft variant of decode_suffix_tones: instead of keeping only the per-symbol
+// argmax, return the top-K de-hopped candidate tones ranked by energy plus a
+// per-candidate soft cost. Used by the CRC-aided soft list decoder
+// (connect-suffix-fec-research.md §3 Tier 1) — a zero-airtime upgrade that
+// recovers suffix decodes where the correct tone landed in 2nd/3rd place.
+//
+// For noncoherent M-FSK the natural soft metric is the per-tone energy
+// (Proakis Ch.8; see fact-doc §1.1). The cost we emit is the NORMALIZED energy
+// gap to the strongest tone:  cost_k = (E_best - E_k) / (E_best + eps), so the
+// argmax candidate always has cost 0 and weaker tones have cost in (0,1]. This
+// is monotone in the per-symbol log-likelihood gap and needs no tuned constant.
+//
+// out_cand[s*K + k] = k-th most-likely de-hopped tone for symbol s (0..M-1),
+//                     or -1 if the symbol ran past the buffer end / k>=valid.
+// out_cost[s*K + k] = corresponding soft cost (>=0); +INF for invalid slots.
+// The hard decode is exactly out_cand[s*K + 0] (bit-identical to
+// decode_suffix_tones), so callers can fall back to baseline trivially.
+void cl_ofdm::decode_suffix_candidates(std::complex<double>* baseband_interp,
+	int buffer_size_interp, int interpolation_rate, int pattern_offset,
+	int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M,
+	int nStreams, const int* stream_offsets, int K, int* out_cand,
+	double* out_cost)
+{
+	int Nofdm_local = Nfft + Ngi;
+	int sym_period_interp = Nofdm_local * interpolation_rate;
+	int half = Nc / 2;
+	if (K < 1) K = 1;
+	if (K > mfsk_M) K = mfsk_M;
+
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+
+	for (int s = 0; s < suffix_len; s++)
+	{
+		for (int k = 0; k < K; k++) {
+			out_cand[s * K + k] = -1;
+			out_cost[s * K + k] = 1.0e300;  // sentinel: invalid
+		}
+
+		int abs_s = pattern_nsymb + s;
+		int offset = pattern_offset + abs_s * sym_period_interp + Ngi * interpolation_rate;
+		if (offset + Nfft * interpolation_rate > buffer_size_interp)
+			continue;  // symbol past buffer end -> all slots stay invalid
+
+		for (int i = 0; i < Nfft; i++)
+			decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+		fft(decimated_sym, fft_out, Nfft);
+
+		// Combined per-tone energy across all streams (same bin math as the
+		// hard path so the argmax candidate is identical).
+		double e_tone[64];  // mfsk_M <= 64 (M=16 in production WB ctrl path)
+		double best_energy = -1.0;
+		for (int t = 0; t < mfsk_M; t++)
+		{
+			double e_combined = 0;
+			for (int st = 0; st < nStreams; st++)
+			{
+				int sub = stream_offsets[st] + t;
+				int b = (sub < half) ? Nfft - half + sub
+				                     : start_shift + (sub - half);
+				double e = fft_out[b].real() * fft_out[b].real() +
+				           fft_out[b].imag() * fft_out[b].imag();
+				e_combined += e;
+			}
+			e_tone[t] = e_combined;
+			if (e_combined > best_energy) best_energy = e_combined;
+		}
+
+		// Partial selection: pick the K strongest tones (M is tiny, K<=M<=16,
+		// so an O(K*M) selection is cheaper and simpler than a heap).
+		bool taken[64] = {};
+		int hop = (abs_s * tone_hop_step) % mfsk_M;
+		double inv = 1.0 / (best_energy + 1.0e-12);
+		for (int k = 0; k < K; k++)
+		{
+			int best_t = -1;
+			double best_e = -1.0;
+			for (int t = 0; t < mfsk_M; t++)
+			{
+				if (taken[t]) continue;
+				if (e_tone[t] > best_e) { best_e = e_tone[t]; best_t = t; }
+			}
+			if (best_t < 0) break;
+			taken[best_t] = true;
+			// Reverse the same tone hopping the hard path uses.
+			int data_tone = (best_t - hop + mfsk_M * 256) % mfsk_M;
+			out_cand[s * K + k] = data_tone;
+			out_cost[s * K + k] = (best_energy - best_e) * inv;  // 0 for k=0
+		}
+	}
+}
+
 int cl_ofdm::symbol_sync(std::complex <double>*in, int size, int interpolation_rate, int location_to_return)
 {
 

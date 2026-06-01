@@ -137,4 +137,57 @@ void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
 bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
                                uint8_t* local_cap, uint8_t* ssid);
 
+// =============================================================================
+// CRC-aided soft list decode of the 13-symbol ctrl-suffix (Tier 1, ZERO airtime)
+// =============================================================================
+//
+// connect-suffix-fec-research.md §3. The uncoded suffix decode passes only if
+// ALL n symbol argmax decisions are correct (P ~= (1-q)^n — the cliff). This
+// decoder uses the per-symbol top-K candidate tones (ranked by energy, from
+// cl_ofdm::decode_suffix_candidates) and the existing 12-bit CRC to CORRECT a
+// few wrong symbols by bounded best-first search: it enumerates one-tone-per-
+// symbol assignments in increasing total soft-cost order and accepts the first
+// whose recomputed CRC12 matches the embedded crc12 AND whose type matches
+// `expected_type`. No wire-format change; the all-best assignment (tried first)
+// reproduces the hard decode exactly.
+//
+// CRC is NOT inlined here (v1 bug #1, fact-doc §13.5): the caller passes
+// `crc12_fn` wrapping the production cl_arq_controller::CRC12_calc over the
+// 5-byte MSB-first [type:2|payload38:38] field.
+//
+//   cand[s*K + k] / cost[s*K + k] : k-th candidate tone (0..M-1, -1 invalid)
+//                                   and its soft cost (>=0) for symbol s.
+//   n          : suffix symbol count (= ack_sack_suffix_len(), 13 at M=16)
+//   bits_per_tone : log2(M) (4 at M=16)
+//   expected_type : required type discriminator (drop other types)
+//   max_trials : hard cap on CRC checks (bounds runtime; upper-bounds FAR)
+//   max_flips  : reject any assignment that deviates from the per-symbol argmax
+//                in more than this many symbols (Hamming radius). This is the
+//                PRIMARY false-accept-rate lever: it limits the search to a
+//                small ball around the hard decode so a pure-noise input can
+//                only reach a tiny number of candidate codewords. 0 = hard only
+//                (baseline); a small value (1-3) captures the cliff regime
+//                (where only a few symbols are wrong) while keeping FAR low.
+//                <0 = unlimited (bounded only by max_trials).
+//   crc12_fn / crc12_ctx : production CRC-12 over (data,5) bytes.
+//
+// On success writes *out_payload38 and *out_flips (number of symbols that
+// differ from the hard argmax — 0 means the hard decode would have passed) and
+// returns true. Returns false if no CRC-valid type-matched assignment found
+// within the (max_trials, max_flips) budget.
+typedef uint16_t (*ctrl_crc12_fn)(void* ctx, const unsigned char* data, int n);
+
+// Pack [type:2|payload38:38] into 5 bytes MSB-first (CRC input). Mirrors
+// arq_common.cc:pack_ctrl_typed40_msb_v2 — exposed so the soft decoder and the
+// ARQ layer can share one definition / cross-check.
+void pack_ctrl_typed40_msb(unsigned char out_bytes[5], uint8_t type,
+                           uint64_t payload38);
+
+bool soft_list_decode_ctrl_suffix(const int* cand, const double* cost,
+                                  int n, int K, int bits_per_tone,
+                                  uint8_t expected_type, int max_trials,
+                                  int max_flips,
+                                  ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                                  uint64_t* out_payload38, int* out_flips);
+
 #endif // INC_MFSK_CTRL_CODEC_H_
