@@ -392,4 +392,62 @@ on top). **Change:** `arq_common.cc:5375` (consumer C1, the fast-poll HAIL gate)
 FAR 0/5000. Establishment floor moves past the IONOS −10/−11 finding to the ctrl
 base-detector floor; HAIL ceases to be the binding establishment stage.
 
-**Validation status:** sim production-path assertion test = §10 below; HW = pending.
+**Validation status:** sim production-path assertion test (above) PASSES; HW A/B = §11.
+
+---
+
+## §11 HW VALIDATION (IONOS, pinned ROBUST_0, A/B, 2026-05-31)
+
+Harness `tools/hail_floor_hw_test.py`: per-cell fresh CONNECT, RSP-side `[HAIL]
+Detected` grep + live-socket CONNECTED, FAR cell (pure noise). Both Pis run the
+SAME arm (CMD rpi2 + RSP rpi1). Pinned ROBUST_0 (`-s 100 -Q 0 -M auto -R
+--skip-turbo-reverse`, gearshift off, no `-v`). Single pass, 3 attempts/cell,
+40 s dwell. JSONs: `hail_floor_hw_FIXED.json`, `hail_floor_hw_BASELINE.json`.
+
+**Arm verification (binary md5 = authoritative):**
+- FIXED = `9d4ea03b1e87629a91cc1dfb246ce5ed` (both Pis, built from sim `060fc40`).
+- BASELINE = `bb00c823b2b6ce81efc0cbc951e2e749` (both Pis, built from `01535f2`).
+- **md5s DIFFER** ⇒ genuinely distinct binaries. Post-deploy `mercury --test`:
+  FIXED **31/31** (incl. the PROD-FIX `hail_detection_cliff_sweep` assertion —
+  the gate fix is compiled into the deployed aarch64); BASELINE **30/30** (lacks
+  that test — the test-count delta is itself an arm discriminator). [The harness
+  source-grep fingerprint mis-read 0 on both via paramiko's non-login shell — a
+  harness diagnostic bug, NOT an arm-identity issue; the md5 + test-count are the
+  ground truth.]
+
+### §11.1 A/B result — HAIL detection floor (3 attempts/cell)
+
+| WGN dial | FIXED HAIL | FIXED CONNECT | BASELINE HAIL | BASELINE CONNECT |
+|---|---|---|---|---|
+| −8  | 3/3 | 3/3 | 3/3 | 3/3 |
+| −10 | 3/3 | 3/3 | 3/3 | 3/3 |
+| −12 | **3/3** | **3/3** | **2/3** | **0/3** |
+| −14 | **3/3** | 0/3 | **0/3** | 0/3 |
+| −16 | **3/3** | 0/3 | **0/3** | 0/3 |
+| FAR WGN:60, 120 s | **0** | — | **0** | — |
+
+**The floor-move is real and attributable to the gate.** BASELINE HAIL detection
+cliffs at −12 (2/3, then 0/3 at −14/−16) — the old `metric>=3.0 && quality>=0.3`
+gate. FIXED detects **3/3 at every cell −8 → −16.** Per-attempt metrics prove the
+mechanism: at −12/−14/−16 FIXED's accepted beacons carried **metric 1.5–5.4,
+quality 0.14–0.27** — i.e. BELOW the old 3.0/0.3 gate (the exact reject-vs-accept
+boundary the fix moves). The one BASELINE −12 hit had quality 0.31 (just above the
+old 0.3 gate); its misses were below it — baseline straddles the cliff at −12.
+**FAR clean on BOTH arms (0/120 s pure noise)** ⇒ relaxing the soft gate cost ZERO
+false alarms on real HW (the count gate holds), matching the §4 sim (0/5000).
+
+### §11.2 The NEW binding stage (revealed by the fix)
+FIXED CONNECT: 3/3 through −12, then **0/3 at −14/−16 despite HAIL 3/3.** With HAIL
+no longer the limiter below ~−12, the binding establishment stage is now the
+**control handshake / START_CONNECTION decode** (the CMD→RSP CONNECT exchange) —
+the predicted next stage (mini-Moose CFO sync / ctrl-suffix FEC). Log signature at
+−14/−16: RSP logs `[HAIL] Detected` but no `START_CONNECTION received` and no
+`CONNECTED`. This is the intended handoff to the tier-2 ctrl-suffix work.
+
+### §11.3 Net
+HW HAIL-detection floor moved from baseline's ~−12 dial cliff to ≥ −16 dial
+(≥ ~4 dB on this testbed axis; the sim's absolute figure is +8.30 dB SNR3k). FAR
+0 on both arms. The fix does exactly what §5 predicted; the next-stage failure it
+exposes (CONNECT handshake) is the correct downstream target. Single-pass A/B
+(3 attempts/cell) — solid 3/3-vs-0/3 separation at −14/−16 makes the conclusion
+robust to the single pass, but a multi-pass re-run would tighten the −12 boundary.
