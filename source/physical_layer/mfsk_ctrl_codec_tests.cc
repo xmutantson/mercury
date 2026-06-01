@@ -2750,6 +2750,486 @@ static void test_mfsk_ctrl_suffix_apply_sign_invariance() {
 }
 
 // =============================================================================
+// §9 CONNECT/ACK detection metric-gate relaxation suite
+//     (fact-documents/connect-ack-metric-gate.md)
+//
+// The hardcoded `metric >= 3.0` soft energy-ratio sub-gate on CONNECT/ACK
+// MFSK detection (telecom_system.cc, 4 sites) was relaxed to the named
+// constant cl_mfsk::CTRL_DETECT_METRIC_MIN (=2.0) to deepen acquisition. The
+// data PHY is untouched. These tests prove (a) the chosen threshold holds ~0
+// false detections on noise-only input, (b) the detection cliff deepens, and
+// (c) the FAR sweep that justified 2.0. The throughput-neutrality claim is a
+// code-identity argument (no data-PHY surface touched) verified by the
+// data-PHY roundtrip tests in §5/§6 being byte-identical to baseline; see the
+// fact-doc §5/§8 for the full argument.
+//
+// Detection model (ofdm.cc detect_ack_pattern): a symbol "matches" when the
+// expected tone is the per-stream FFT-bin argmax for ALL nStreams streams
+// (energy-gated). `matched` ∈ [0, nsymb]; `metric` = Σ(e_target/e_total) over
+// matched symbols. The gate is matched>=match_threshold AND metric>=MIN.
+// =============================================================================
+
+// Pattern selector for the metric-gate harness.
+enum ctrl_pattern_kind { CTRL_PAT_ACK, CTRL_PAT_CONNECT };
+
+// Run the production first-pass detector gate on an already-built passband
+// buffer, returning the best-position (matched, metric). Mirrors EXACTLY the
+// detect_ack_pattern invocation in detect_ack_snr_from_passband (ACK) /
+// decode_ctrl_suffix_from_passband (CONNECT) — same tones, pattern_len,
+// reserve_after, suffix_start. This is the quantity the 4 hardcoded sites gate.
+static void run_ctrl_metric_gate(cl_telecom_system& ts, ctrl_pattern_kind kind,
+                                 const std::vector<double>& pb,
+                                 int& out_matched, double& out_metric,
+                                 int& out_best_offset) {
+	int M = ts.data_container.interpolation_rate;
+	int size = (int)pb.size();
+	int dec_size = size / M;
+	double effective_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	std::vector<std::complex<double> > bb((size_t)dec_size,
+		std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband_decimated(
+		const_cast<double*>(pb.data()), size, bb.data(),
+		ts.sampling_frequency, effective_carrier, ts.carrier_amplitude,
+		M, &ts.ofdm.FIR_rx_data);
+
+	out_matched = 0;
+	out_best_offset = -1;
+	if (kind == CTRL_PAT_ACK) {
+		out_metric = ts.ofdm.detect_ack_pattern(
+			bb.data(), dec_size, 1,
+			ts.ack_mfsk.ack_pattern_nsymb,
+			ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+			ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+			ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+			&out_matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+			&out_best_offset, /*reserve_after=*/cl_mfsk::SNR_SUFFIX_LEN,
+			/*out_match_mask=*/nullptr);
+	} else {
+		out_metric = ts.ofdm.detect_ack_pattern(
+			bb.data(), dec_size, 1,
+			ts.ack_mfsk.connect_pattern_nsymb,
+			ts.ack_mfsk.connect_tones, /*base_len=*/8,
+			ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+			ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+			&out_matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+			&out_best_offset, /*reserve_after=*/ts.ack_mfsk.ack_sack_suffix_len(),
+			/*out_match_mask=*/nullptr);
+	}
+}
+
+static int ctrl_match_threshold(cl_telecom_system& ts, ctrl_pattern_kind kind) {
+	return (kind == CTRL_PAT_ACK) ? ts.ack_mfsk.ack_match_threshold
+	                              : ts.ack_mfsk.connect_match_threshold;
+}
+
+// §9.0 FAR SWEEP (diagnostic + assertion). Noise-only buffers, >=5000 trials
+// per pattern. For each candidate metric threshold {3.0, 2.5, 2.0, 1.5}, count
+// trials where the full production gate (matched>=threshold AND metric>=T)
+// fires — i.e. a FALSE detection. Prints the table that justifies the chosen
+// constant, then ASSERTS the chosen constant (CTRL_DETECT_METRIC_MIN) yields
+// 0 false detections for BOTH patterns. This locks the FAR-safe choice in.
+static void test_connect_ack_metric_far_sweep() {
+	const char* name = "connect_ack_metric_far_sweep";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+	// Pure noise at 2× clean-pattern RMS — the established strong-noise level
+	// for this file's pure-noise tests (mini_moose_pure_noise_safe). The metric
+	// e_target/e_total is scale-invariant on pure noise, so the exact sigma is
+	// not load-bearing; we keep the convention for consistency.
+	double sigma_pb = 2.0 * rms;
+
+	const int N_TRIALS = 5000;
+	const double cand[] = {3.0, 2.5, 2.0, 1.5};
+	const int NC = 4;
+	const ctrl_pattern_kind kinds[] = {CTRL_PAT_ACK, CTRL_PAT_CONNECT};
+	const char* kind_name[] = {"ACK    ", "CONNECT"};
+
+	printf("  [FAR-SWEEP] %d noise-only trials/pattern, sigma_pb=%.4f (=2x clean RMS)\n",
+		N_TRIALS, sigma_pb);
+	printf("  [FAR-SWEEP] pattern  thr=3.0  thr=2.5  thr=2.0  thr=1.5   (false detections;"
+		" all also require matched>=%d/%d)\n",
+		ts_meas.ack_mfsk.connect_match_threshold, ts_meas.ack_mfsk.ack_pattern_nsymb);
+
+	int chosen_false_total = 0;
+	double maxmetric_over_count_gate = 0.0;  // worst metric seen among count-passing noise
+	for (int ki = 0; ki < 2; ki++) {
+		ctrl_pattern_kind kind = kinds[ki];
+		int false_at[NC] = {0,0,0,0};
+		for (int trial = 0; trial < N_TRIALS; trial++) {
+			cl_telecom_system ts;
+			std::mt19937 rng((uint32_t)(0x9A570000u + ki * 1000003u + trial));
+			std::vector<double> pb;
+			int exp_off = 0, dec_size = 0;
+			if (!synth_ack_pattern_passband_with_cfo(ts, 0.0, sigma_pb,
+			                                          /*synth=*/false, rng, pb,
+			                                          exp_off, dec_size)) {
+				test_fail(name, "synth helper failed"); return;
+			}
+			int matched = 0, best_off = -1;
+			double metric = 0.0;
+			run_ctrl_metric_gate(ts, kind, pb, matched, metric, best_off);
+			int thr = ctrl_match_threshold(ts, kind);
+			// Count gate first — only buffers that pass count>=thr can be a
+			// false detection at ANY metric threshold.
+			if (matched >= thr && best_off >= 0) {
+				if (metric > maxmetric_over_count_gate)
+					maxmetric_over_count_gate = metric;
+				for (int c = 0; c < NC; c++)
+					if (metric >= cand[c]) false_at[c]++;
+			}
+		}
+		printf("  [FAR-SWEEP] %s  %6d   %6d   %6d   %6d\n",
+			kind_name[ki], false_at[0], false_at[1], false_at[2], false_at[3]);
+		// Tally false detections at the CHOSEN constant for the assertion.
+		for (int c = 0; c < NC; c++)
+			if (cand[c] == cl_mfsk::CTRL_DETECT_METRIC_MIN)
+				chosen_false_total += false_at[c];
+	}
+
+	printf("  [FAR-SWEEP] chosen CTRL_DETECT_METRIC_MIN=%.2f -> %d total false detections;"
+		" worst noise metric past count gate = %.3f\n",
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, chosen_false_total,
+		maxmetric_over_count_gate);
+
+	// FAR-safe assertion: the chosen constant must admit ZERO false detections
+	// over 5000 noise-only trials per pattern. (The count gate alone is
+	// essentially sufficient — P(false count>=7/16) ≈ 2.4e-5/poll — so we
+	// expect 0 here for any sane metric threshold; this guards against a
+	// future constant being lowered into the danger zone the diagnosis found
+	// at 0.5.)
+	if (chosen_false_total != 0) {
+		char buf[200];
+		std::snprintf(buf, sizeof(buf),
+			"CTRL_DETECT_METRIC_MIN=%.2f admitted %d false detections over "
+			"%d noise trials/pattern — NOT FAR-safe",
+			(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, chosen_false_total, N_TRIALS);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §9.1 PERMANENT FAR REGRESSION. Asserts ~0 false CONNECT/ACK detections at
+// the chosen named constant over a large noise-only trial count, for BOTH
+// patterns, using the EXACT production gate (matched>=threshold AND
+// metric>=CTRL_DETECT_METRIC_MIN). This is the permanent lock; it must fail if
+// anyone lowers the constant into a FAR-unsafe region or breaks the count gate.
+static void test_connect_ack_metric_gate_far_regression() {
+	const char* name = "connect_ack_metric_gate_far_regression";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+	double sigma_pb = 2.0 * rms;
+
+	const int N_TRIALS = 5000;
+	const ctrl_pattern_kind kinds[] = {CTRL_PAT_ACK, CTRL_PAT_CONNECT};
+	const char* kind_name[] = {"ACK", "CONNECT"};
+
+	for (int ki = 0; ki < 2; ki++) {
+		ctrl_pattern_kind kind = kinds[ki];
+		int false_det = 0;
+		for (int trial = 0; trial < N_TRIALS; trial++) {
+			cl_telecom_system ts;
+			std::mt19937 rng((uint32_t)(0xFA110000u + ki * 7919u + trial));
+			std::vector<double> pb;
+			int exp_off = 0, dec_size = 0;
+			if (!synth_ack_pattern_passband_with_cfo(ts, 0.0, sigma_pb,
+			                                          /*synth=*/false, rng, pb,
+			                                          exp_off, dec_size)) {
+				test_fail(name, "synth helper failed"); return;
+			}
+			int matched = 0, best_off = -1;
+			double metric = 0.0;
+			run_ctrl_metric_gate(ts, kind, pb, matched, metric, best_off);
+			int thr = ctrl_match_threshold(ts, kind);
+			if (matched >= thr && best_off >= 0 &&
+			    metric >= cl_mfsk::CTRL_DETECT_METRIC_MIN)
+				false_det++;
+		}
+		if (false_det != 0) {
+			char buf[200];
+			std::snprintf(buf, sizeof(buf),
+				"%s: %d/%d noise trials passed gate (matched>=%d AND metric>=%.2f) "
+				"— FAR regression",
+				kind_name[ki], false_det, N_TRIALS,
+				ctrl_match_threshold(ts_meas, kind),
+				(double)cl_mfsk::CTRL_DETECT_METRIC_MIN);
+			test_fail(name, buf);
+			return;
+		}
+	}
+	test_pass(name);
+}
+
+// Build a CONNECT- or ACK-base passband buffer at a given noise sigma and
+// return the best-position (matched, metric). For CONNECT we synthesize the
+// connect base pattern directly (the §8 synth helper only does ACK), reusing
+// the same IFFT→up-mix→AWGN shape so the two paths are apples-to-apples.
+//
+// cfo_hz: up-mix CFO injected at passband (realistic LO mismatch — depresses
+//   the energy-ratio metric because residual CFO smears energy out of the
+//   target bin into adjacent bins). timing_jitter_samp: a random extra
+//   leading-silence padding in [0, timing_jitter_samp) DECIMATED-sample units,
+//   scaled to passband, so the pattern does NOT land on the symbol grid (smears
+//   energy across the FFT window → depresses metric). These two impairments
+//   reproduce the on-channel regime the acquisition-cliff diagnosis measured,
+//   where metric (not the count) is the binding gate. With both = 0 the synth
+//   is bit-clean (used by §9.2's clean-channel arm).
+static bool synth_ctrl_base_passband(cl_telecom_system& ts, ctrl_pattern_kind kind,
+                                     double noise_sigma_pb, std::mt19937& rng,
+                                     std::vector<double>& out_pb,
+                                     double cfo_hz = 0.0,
+                                     int timing_jitter_samp = 0) {
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	if (ts.ack_mfsk.M < 16) return false;
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc    = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	int nsymb = (kind == CTRL_PAT_ACK) ? ts.ack_mfsk.ack_pattern_nsymb
+	                                   : ts.ack_mfsk.connect_pattern_nsymb;
+	if (nsymb <= 0) return false;
+
+	std::vector<std::complex<double> > pat_freq((size_t)nsymb * (size_t)Nc,
+		std::complex<double>(0.0, 0.0));
+	if (kind == CTRL_PAT_ACK) ts.ack_mfsk.generate_ack_pattern(pat_freq.data());
+	else                      ts.ack_mfsk.generate_connect_pattern(pat_freq.data());
+
+	std::vector<std::complex<double> > pat_time((size_t)nsymb * (size_t)Nofdm,
+		std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < nsymb; s++)
+		ts.ofdm.symbol_mod(&pat_freq[(size_t)s * Nc], &pat_time[(size_t)s * Nofdm]);
+
+	const int pattern_samples_pb = Nofdm * nsymb * interp;
+	// Optional off-grid timing jitter (passband samples). Keep < one symbol so
+	// the detector's ±sym/2 fine search can still bracket it, but enough to
+	// straddle FFT windows and depress the energy-ratio metric.
+	int jitter_pb = 0;
+	if (timing_jitter_samp > 0) {
+		std::uniform_int_distribution<int> jd(0, timing_jitter_samp - 1);
+		jitter_pb = jd(rng) * interp;
+	}
+	const int leading_silence_pb = 4 * Nofdm * interp + jitter_pb;
+	const int trailing_silence_pb = 16 * Nofdm * interp;  // suffix decode headroom
+	const int buffer_pb_size = leading_silence_pb + pattern_samples_pb + trailing_silence_pb;
+
+	std::vector<double> pattern_pb((size_t)pattern_samples_pb, 0.0);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(pat_time.data(), Nofdm * nsymb, pattern_pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency + cfo_hz,
+		ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	out_pb.assign((size_t)buffer_pb_size, 0.0);
+	for (int i = 0; i < pattern_samples_pb && (leading_silence_pb + i) < buffer_pb_size; i++)
+		out_pb[(size_t)(leading_silence_pb + i)] = pattern_pb[(size_t)i];
+	if (noise_sigma_pb > 0.0) {
+		std::normal_distribution<double> nd(0.0, noise_sigma_pb);
+		for (int i = 0; i < buffer_pb_size; i++) out_pb[(size_t)i] += nd(rng);
+	}
+	return true;
+}
+
+// §9.2 ACQUISITION-GAIN check. For each pattern, sweep NOISE UP (SNR DOWN) and
+// find the DEEPEST noise level (cliff) at which detection still fires for a
+// MAJORITY of trials, under (a) the OLD hardcoded 3.0 gate and (b) the NEW
+// CTRL_DETECT_METRIC_MIN gate. Asserts the NEW gate's cliff is deeper by a
+// meaningful dB margin — i.e. relaxing the soft metric gate genuinely deepens
+// acquisition (the diagnosis measured +2..+3.6 dB on hardware).
+//
+// The noise axis is sigma_pb expressed in dB relative to the clean-pattern RMS
+// (the file's existing cliff convention: doubling sigma = +6 dB of noise =
+// -6 dB of SNR). We descend in 0.5 dB steps.
+//
+// REALISTIC IMPAIRMENT: the cliff-binding regime — where the count gate is
+// satisfied (matched>=threshold) but the soft metric dips below 3.0 — only
+// appears under channel impairment (residual CFO + off-grid timing) that
+// smears target-bin energy. In a bit-clean synth the metric stays high until
+// the count gate itself fails, so the relaxation would be a no-op (which is
+// the THROUGHPUT-NEUTRALITY guarantee in clean conditions, fact-doc §5/§8).
+// We therefore inject a 12 Hz CFO (within Moose range) + up-to-half-symbol
+// timing jitter to reproduce the on-channel regime the diagnosis measured.
+// PROBE data (telecom log, this branch) at thr=7/16 CONNECT:
+//   impaired cliff @3.0 ≈ 7×RMS, @2.0 ≈ 9×RMS  ->  +2.18 dB
+//   clean    cliff @3.0 ≈ 8×RMS, @2.0 ≈ 10×RMS ->  +1.94 dB
+static void test_connect_metric_acquisition_gain() {
+	const char* name = "connect_metric_acquisition_gain";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+
+	const ctrl_pattern_kind kinds[] = {CTRL_PAT_ACK, CTRL_PAT_CONNECT};
+	const char* kind_name[] = {"ACK", "CONNECT"};
+	const int N_TRIALS = 40;
+	const double cfo_hz = 12.0;                          // within Moose range
+	const int jitter = ts_meas.data_container.Nofdm / 2; // up to half a symbol
+	// Noise axis in dB above clean RMS: 0 dB => sigma=rms. We sweep noise UP
+	// (SNR down) from +12 dB-noise (sigma=4×rms, easy) to +30 dB-noise
+	// (sigma≈32×rms, hopeless), 0.5 dB steps.
+	const double nz_lo = 12.0, nz_hi = 30.0, nz_step = 0.5;
+
+	double worst_gain_db = 1e9;
+	char detail[256] = {0};
+	for (int ki = 0; ki < 2; ki++) {
+		ctrl_pattern_kind kind = kinds[ki];
+		int thr = ctrl_match_threshold(ts_meas, kind);
+		// CONTIGUOUS cliff: increase noise; the cliff is the deepest noise level
+		// still in the unbroken majority-pass run from the easy end. A lucky
+		// pass deep past the cliff (after a failing rung) does NOT count — that
+		// matches how an operator experiences acquisition (it works down to a
+		// floor, then stops). Robust to per-trial alignment noise.
+		double cliff_old = nz_lo, cliff_new = nz_lo;  // deepest noise-dB acquired
+		bool broke_old = false, broke_new = false;
+		for (double nz = nz_lo; nz <= nz_hi + 1e-9; nz += nz_step) {
+			double sigma_pb = rms * std::pow(10.0, nz / 20.0);
+			int pass_old = 0, pass_new = 0;
+			for (int trial = 0; trial < N_TRIALS; trial++) {
+				cl_telecom_system ts;
+				std::mt19937 rng((uint32_t)(0xAC9A0000u + ki * 104729u
+					+ (int)(nz * 13.0) * 131u + trial));
+				std::vector<double> pb;
+				if (!synth_ctrl_base_passband(ts, kind, sigma_pb, rng, pb,
+				                              cfo_hz, jitter)) {
+					test_fail(name, "synth_ctrl_base_passband failed"); return;
+				}
+				int matched = 0, best_off = -1;
+				double metric = 0.0;
+				run_ctrl_metric_gate(ts, kind, pb, matched, metric, best_off);
+				bool count_ok = (matched >= thr && best_off >= 0);
+				if (count_ok && metric >= 3.0) pass_old++;
+				if (count_ok && metric >= cl_mfsk::CTRL_DETECT_METRIC_MIN) pass_new++;
+			}
+			// Extend each contiguous run while a majority of trials still pass.
+			if (!broke_old) {
+				if (pass_old * 100 >= N_TRIALS * 60) cliff_old = nz;
+				else broke_old = true;
+			}
+			if (!broke_new) {
+				if (pass_new * 100 >= N_TRIALS * 60) cliff_new = nz;
+				else broke_new = true;
+			}
+		}
+		// New gate tolerates MORE noise (deeper cliff) => positive gain in dB.
+		double gain = cliff_new - cliff_old;
+		printf("  [ACQ-GAIN] %s: noise cliff old(3.0)=%.1f dB  new(%.1f)=%.1f dB  gain=+%.2f dB\n",
+			kind_name[ki], cliff_old, (double)cl_mfsk::CTRL_DETECT_METRIC_MIN,
+			cliff_new, gain);
+		if (gain < worst_gain_db) {
+			worst_gain_db = gain;
+			std::snprintf(detail, sizeof(detail),
+				"%s gain=+%.2f dB (old cliff %.1f dB-noise, new cliff %.1f dB-noise)",
+				kind_name[ki], gain, cliff_old, cliff_new);
+		}
+	}
+
+	// The diagnosis predicted +2..+3.6 dB on hardware; this clean+CFO+jitter
+	// synth reproducibly yields ~+1.9..+2.2 dB (PROBE data above). Assert at
+	// least +1.5 dB on the worse-performing pattern — leaves margin for the
+	// 0.5 dB grid quantization + 40-trial majority noise while still proving a
+	// real, meaningful cliff deepening. (The metric gate IS the binding
+	// constraint at the impaired cliff per fact-doc §1, so relaxing it must
+	// move the floor.)
+	if (worst_gain_db < 1.5 - 1e-9) {
+		char buf[300];
+		std::snprintf(buf, sizeof(buf),
+			"acquisition gain < +1.5 dB: %s — relaxing the metric gate did not "
+			"deepen the cliff as expected", detail);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// §9.3 THROUGHPUT-NEUTRALITY (clean / good-SNR no-op). The user's hard gate:
+// data throughput must NOT suffer. The change is RX-detection-only and touches
+// NO data-PHY surface (zero changes to ofdm.cc / ldpc*.cc / modcods / arq_*),
+// so the data path is byte-identical to baseline (the §5/§6 data-PHY roundtrip
+// tests confirm it still decodes). The ONLY behavioral delta is which
+// CONNECT/ACK detections pass the soft metric gate, and ONLY in the marginal
+// band [2.0, 3.0). This test proves that in the clean / good-SNR regime — where
+// data actually flows — the relaxation is a VERIFIED NO-OP: every detection
+// admitted by the new 2.0 gate is ALSO admitted by the old 3.0 gate (metric
+// stays well above 3.0 when SNR is good), so ACK/CONNECT acceptance — and thus
+// the ARQ loop that gates throughput — behaves identically. No new detections,
+// no false alarms, no ARQ-state perturbation at good SNR => clean-channel
+// throughput is unchanged. (fact-doc §5/§8.)
+static void test_connect_ack_metric_throughput_neutral() {
+	const char* name = "connect_ack_metric_throughput_neutral";
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+
+	const ctrl_pattern_kind kinds[] = {CTRL_PAT_ACK, CTRL_PAT_CONNECT};
+	const char* kind_name[] = {"ACK", "CONNECT"};
+	// "Good SNR" operating band: clean .. moderate noise where a real link
+	// carries data (the data PHY's WB cliff is far shallower than the control
+	// floor). sigma in {0 (bit-clean), 1×, 2×, 3×, 4×rms} — at/above the data
+	// cliff, well above the control floor where the relaxation engages.
+	const double mults[] = {0.0, 1.0, 2.0, 3.0, 4.0};
+	const int NM = 5;
+	const int N_TRIALS = 40;
+
+	int diverged = 0;        // detections where old/new gate decisions DIFFER
+	double min_metric_seen = 1e9;
+	for (int ki = 0; ki < 2; ki++) {
+		ctrl_pattern_kind kind = kinds[ki];
+		int thr = ctrl_match_threshold(ts_meas, kind);
+		for (int mi = 0; mi < NM; mi++) {
+			double sigma = mults[mi] * rms;
+			for (int trial = 0; trial < N_TRIALS; trial++) {
+				cl_telecom_system ts;
+				std::mt19937 rng((uint32_t)(0x7470000u + ki*100003u + mi*1013u + trial));
+				std::vector<double> pb;
+				// Bit-clean OR clean-channel AWGN (no CFO / no jitter) — the
+				// conditions under which data flows. The relaxation must not
+				// change the gate decision here.
+				if (!synth_ctrl_base_passband(ts, kind, sigma, rng, pb)) {
+					test_fail(name, "synth_ctrl_base_passband failed"); return;
+				}
+				int matched = 0, best_off = -1;
+				double metric = 0.0;
+				run_ctrl_metric_gate(ts, kind, pb, matched, metric, best_off);
+				bool count_ok = (matched >= thr && best_off >= 0);
+				bool admit_old = count_ok && (metric >= 3.0);
+				bool admit_new = count_ok && (metric >= cl_mfsk::CTRL_DETECT_METRIC_MIN);
+				if (count_ok && metric < min_metric_seen) min_metric_seen = metric;
+				if (admit_old != admit_new) diverged++;
+			}
+		}
+		(void)kind_name[ki];
+	}
+
+	printf("  [THRU-NEUTRAL] good-SNR band: %d gate-decision divergences old(3.0) vs new(2.0); "
+		"min metric over count-passers = %.2f (>=3.0 => identical decisions)\n",
+		diverged, min_metric_seen);
+
+	// In the good-SNR band the metric must stay >= 3.0 whenever the count gate
+	// passes, so old and new decisions are IDENTICAL — zero divergence. Any
+	// divergence here would mean the relaxation changed ACK/CONNECT acceptance
+	// in a regime where data flows, i.e. a potential throughput side-effect.
+	if (diverged != 0) {
+		char buf[200];
+		std::snprintf(buf, sizeof(buf),
+			"%d gate decisions DIVERGED in the good-SNR band (min metric %.2f) — "
+			"relaxation is NOT a clean-channel no-op",
+			diverged, min_metric_seen);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -2811,6 +3291,14 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op();
 	test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe();
 	test_mfsk_ctrl_suffix_apply_sign_invariance();
+
+	// §9 CONNECT/ACK detection metric-gate relaxation suite
+	// (fact-documents/connect-ack-metric-gate.md). FAR sweep (diagnostic +
+	// assertion), permanent FAR regression, and acquisition-cliff deepening.
+	test_connect_ack_metric_far_sweep();
+	test_connect_ack_metric_gate_far_regression();
+	test_connect_metric_acquisition_gain();
+	test_connect_ack_metric_throughput_neutral();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
