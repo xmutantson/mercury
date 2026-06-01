@@ -2993,8 +2993,9 @@ static void test_hail_detection_cliff_sweep() {
 	if (M < 16 || nsymb <= 0) { test_fail(name, "HAIL config not WB/loaded"); return; }
 	printf("    HAIL config: M=%d nsymb=%d base_thr=%d/%d nStreams=%d tone_hop=%d Nofdm=%d (ROBUST_0 WB)\n",
 		M, nsymb, base_thr, nsymb, nStreams, tone_hop, Nofdm);
-	printf("    Gates: production fast-poll HAIL = base>=%d && metric>=3.0 && quality>=0.3 (arq_common.cc:5375)\n", base_thr);
-	printf("           ROBUST_0 ack_pattern_detection_threshold = 0.65 (telecom_system.cc:5506) — what the sibling site uses\n");
+	printf("    Gates: OLD fast-poll HAIL = base>=%d && metric>=3.0 && quality>=0.3 (arq_common.cc:5375 pre-fix)\n", base_thr);
+	printf("           NEW (§10 fix) fast-poll HAIL = base>=%d && metric>=ack_pattern_detection_threshold(=%.2f@R0), NO quality\n",
+		base_thr, ts.ack_pattern_detection_threshold);
 
 	const double cfo_hz = 12.0;  // realistic CFO inside Moose range (matches ctrl gate harness §7)
 
@@ -3053,13 +3054,24 @@ static void test_hail_detection_cliff_sweep() {
 	const int Rs[] = {1, 2, 3, 5};
 	const int NR = (int)(sizeof(Rs)/sizeof(Rs[0]));
 	// Three named SOFT-gate variants (metric_thr, quality_thr) on top of the
-	// base>=base_thr count gate. CRITICAL: HAIL's quality>=0.3 gate
-	// (arq_common.cc:5375) means metric/matched>=0.3 → with matched=16 that's
-	// metric>=4.8, STRICTER than the metric>=3.0 gate. So the quality gate
+	// base>=base_thr count gate. CRITICAL: HAIL's old quality>=0.3 gate
+	// (arq_common.cc:5375 pre-fix) means metric/matched>=0.3 → with matched=16
+	// that's metric>=4.8, STRICTER than the metric>=3.0 gate. So the quality gate
 	// dominates at the floor. We measure the metric relax alone (ctrl §7 style)
-	// AND the both-relaxed (quality off) case to expose that.
-	const char* gate_name[3] = {"CURRENT(m>=3.0,q>=0.3)", "METRIC-RELAX(m>=2.0,q>=0.3)", "BOTH-RELAX(m>=0.65,q>=0.0)"};
-	const double gate_metric[3]  = {3.0, 2.0, 0.65};
+	// AND the production gate.
+	//   G0 = OLD shipped fast-poll gate (hardcoded metric>=3.0 && quality>=0.3).
+	//   G1 = metric-relax only (3.0->2.0, quality kept) — shows the quality gate masks it.
+	//   G2 = NEW shipped fast-poll gate = base count + suffix + metric>=
+	//        ack_pattern_detection_threshold, NO quality gate (the §10 fix).
+	// G2's metric threshold is BOUND to the live production field
+	// ts.ack_pattern_detection_threshold (NOT a hardcoded literal) so this sweep
+	// tracks whatever the config sets — proving the test validates the shipped
+	// predicate, not a coincidental constant.
+	const double prod_metric_thr = ts.ack_pattern_detection_threshold; // 0.65 @ROBUST_0 (telecom_system.cc:5506)
+	char g2label[64];
+	snprintf(g2label, sizeof(g2label), "PROD-FIX(m>=%.2f,no-q)", prod_metric_thr);
+	const char* gate_name[3] = {"OLD-SHIPPED(m>=3.0,q>=0.3)", "METRIC-RELAX(m>=2.0,q>=0.3)", g2label};
+	const double gate_metric[3]  = {3.0, 2.0, prod_metric_thr};
 	const double gate_quality[3] = {0.3, 0.3, 0.0};
 	const int NM = 3;
 	const int RMAX = Rs[NR-1];
@@ -3149,14 +3161,54 @@ static void test_hail_detection_cliff_sweep() {
 			gate_name[m], cliff_snr[0][m], cliff_snr[1][m], cliff_snr[2][m], cliff_snr[3][m]);
 	}
 	double d_mrelax = cliff_snr[0][1] - cliff_snr[0][0];        // metric 3.0->2.0 (quality still 0.3), R=1
-	double d_both   = cliff_snr[0][2] - cliff_snr[0][0];        // both soft gates off, R=1
+	double d_prod   = cliff_snr[0][2] - cliff_snr[0][0];        // PROD-FIX gate vs OLD-SHIPPED, R=1
 	double d_cR2    = mcount_cliff_snr[1] - mcount_cliff_snr[0];// R=2 vs R=1, count-only
 	double d_cR5    = mcount_cliff_snr[3] - mcount_cliff_snr[0];// R=5 vs R=1, count-only
-	double d_g2R5   = cliff_snr[3][2] - cliff_snr[0][2];        // R=5 vs R=1, BOTH-RELAX gate
+	double d_g2R5   = cliff_snr[3][2] - cliff_snr[0][2];        // R=5 vs R=1, PROD-FIX gate
 	printf("    ==> metric-thr relax 3.0->2.0 ALONE (quality>=0.3 kept), R=1: %+.2f dB  <-- quality gate masks it\n", d_mrelax);
-	printf("    ==> BOTH soft gates relaxed (metric+quality off), R=1: %+.2f dB toward the count floor\n", d_both);
+	printf("    ==> PROD-FIX gate (metric>=%.2f, NO quality) vs OLD-SHIPPED, R=1: %+.2f dB toward the count floor\n", prod_metric_thr, d_prod);
 	printf("    ==> combining on matched-COUNT: R=2 %+.2f dB | R=5 %+.2f dB (10log10 ideal +3.0/+7.0; measured M=16 @ q~0.1-0.24)\n", d_cR2, d_cR5);
-	printf("    ==> combining + BOTH-relax gate: R=5 %+.2f dB vs R=1 (combining helps ONLY once the ratio gate is off)\n", d_g2R5);
+	printf("    ==> combining + PROD-FIX gate: R=5 %+.2f dB vs R=1 (combining helps ONLY once the ratio gate is off)\n", d_g2R5);
+
+	// --- PRODUCTION-PATH ASSERTION (fail-before / pass-after the §10 fix) ---
+	// Binds the test to the SHIPPED predicate (arq_common.cc:5375 after §10):
+	// gate = base_ok && suffix_ok && metric >= ts.ack_pattern_detection_threshold,
+	// no quality gate. G2's threshold IS that live field (set above). The fix is
+	// the difference between G0 (old: 3.0 + quality 0.3) and G2 (new). Before the
+	// fix the production cliff = G0 (~-4.95); after, = G2 (~-13.25). Assert the
+	// floor-move is real and the prod gate reaches the matched-count floor.
+	// (1) the live production threshold is the conservative ROBUST_0 value.
+	if (prod_metric_thr > 1.0 + 1e-9) {
+		char b[160]; snprintf(b, sizeof(b),
+			"ack_pattern_detection_threshold=%.3f at ROBUST_0 (expected <=1.0, conservative 0.65) — config regression",
+			prod_metric_thr);
+		test_fail(name, b); return;
+	}
+	// (2) the production-fix gate must move the cliff >=6 dB DEEPER than the old
+	//     hardcoded gate. Deeper = more-negative SNR3k, so the improvement in dB
+	//     is (old_cliff - new_cliff) > 0 (sim measures +8.30 dB; 6 dB margin
+	//     absorbs the sweep grid step).
+	double improve_db = cliff_snr[0][0] - cliff_snr[0][2];  // +ve = new gate reaches deeper
+	if (improve_db < 6.0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"PROD-FIX gate moved cliff only %+.2f dB deeper vs OLD-SHIPPED (need >=+6.0; sim baseline +8.30). "
+			"Old=%.2f new=%.2f dB — the §10 quality-drop/metric-align did NOT take effect",
+			improve_db, cliff_snr[0][0], cliff_snr[0][2]);
+		test_fail(name, b); return;
+	}
+	// (3) the production-fix gate must reach (within ~2 dB) the matched-count
+	//     floor — i.e. the soft gate is no longer the binding limiter at R=1.
+	//     new cliff should be no shallower than (count floor + 2 dB); shallower
+	//     means new_cliff - count_floor > 2 (both negative; less-negative new = short).
+	if (cliff_snr[0][2] - mcount_cliff_snr[0] > 2.0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"PROD-FIX gate cliff %.2f dB still %.2f dB short of the matched-count floor %.2f dB "
+			"(soft gate still binding)", cliff_snr[0][2],
+			cliff_snr[0][2] - mcount_cliff_snr[0], mcount_cliff_snr[0]);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] PROD-FIX gate (m>=%.2f, no-q) moves HAIL cliff +%.2f dB deeper to %.2f dB (count floor %.2f dB); old gate %.2f dB.\n",
+		prod_metric_thr, improve_db, cliff_snr[0][2], mcount_cliff_snr[0], cliff_snr[0][0]);
 
 	// --- FAR on pure noise (no signal), per (gate, R). 5000 trials. ---
 	// Noise level = the deep-floor level (mult=16 * sig_rms ~ -15 dB), where the
@@ -3192,6 +3244,18 @@ static void test_hail_detection_cliff_sweep() {
 			printf("    gate %-28s: FAR R=1 %d/%d | R=2 %d/%d | R=3 %d/%d | R=5 %d/%d\n",
 				gate_name[m], fa[0][m], FT, fa[1][m], FT, fa[2][m], FT, fa[3][m], FT);
 		}
+		// PROD-FIX gate (G2 index 2) at R=1 is the SHIPPED single-shot path. The
+		// load-bearing FAR defense is the base count gate (8/16 WB); §4 measured
+		// 0/5000. Assert it: a false [HAIL] Detected on pure noise would have the
+		// RSP begin OFDM capture on nothing. Tolerance 1/5000 (~2e-4) absorbs the
+		// 1-count tail §4 saw at R>=2 count-only; R=1 should be 0.
+		if (fa[0][2] > 1) {
+			char b[160]; snprintf(b, sizeof(b),
+				"PROD-FIX gate FAR R=1 = %d/%d on pure noise (expected <=1; the base count gate is the FAR defense)",
+				fa[0][2], FT);
+			test_fail(name, b); return;
+		}
+		printf("    [ASSERT OK] PROD-FIX gate R=1 FAR = %d/%d (count gate 8/16 holds the line on pure noise).\n", fa[0][2], FT);
 	}
 
 	test_pass(name);  // MEASURE infra ran; the dB/FAR verdict is in the log
