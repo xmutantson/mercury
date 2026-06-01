@@ -90,10 +90,14 @@ cl_telecom_system::cl_telecom_system()
 	ack_sack_pattern_passband_samples=0;
 	connect_pattern_passband_samples=0;
 	ctrl_suffix_pattern_passband_samples=0;
-	// Suffix FEC prototype (connect-suffix-fec-research.md). Default OFF so the
-	// baseline hard decode path is byte-identical; the *_soft entry points are
-	// always callable for direct measurement.
-	suffix_fec_mode=0;
+	// Suffix FEC prototype (connect-suffix-fec-research.md).
+	// COMBINED "free stack" build (wt/connect-combined): Tier-1 soft list decode
+	// is ENABLED by default (mode=1) so the production CONNECT/ACK decode paths
+	// dispatch to the *_soft variant. flips=1 (FAR 0.25%) is the measured-safe
+	// operating point. Stacks with the metric-gate relaxation (the soft path's
+	// base-detect gate also uses cl_mfsk::CTRL_DETECT_METRIC_MIN). Set to 0 to
+	// fall back to the byte-identical baseline hard decode.
+	suffix_fec_mode=1;
 	suffix_fec_K=4;
 	suffix_fec_max_trials=4000;
 	// Default Hamming-ball radius = 1: measured pure-noise FAR 0.25% (vs 3.4% at

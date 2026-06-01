@@ -4974,6 +4974,16 @@ long long cl_arq_controller::send_mfsk_test_ack_phy(uint8_t echoed_cap,
 		MFSK_CTRL_TEST_ACK, p38, "CONNECT-ACK");
 }
 
+// CRC-12 callback for the suffix-FEC soft decoder (connect-suffix-fec-research.md).
+// Wraps the PRODUCTION cl_arq_controller::CRC12_calc (NEVER inline — v1 bug #1
+// was an init-mismatch between the sender's CRC12_calc and an inlined RX copy).
+// ctx = the cl_arq_controller*. Matches ctrl_crc12_fn.
+static uint16_t arq_ctrl_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
+	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
 // Shared RX core: snapshot the capture-buffer tail, run the CONNECT base
 // detector + suffix decode, verify CRC12 via the production CRC12_calc,
 // require the type discriminator to match `expected_type`. Returns true on
@@ -5017,55 +5027,80 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	telecom_system->data_container.data_ready = 0;
 	MUTEX_UNLOCK(&capture_prep_mutex);
 
-	mfsk_ctrl_frame_type rx_type;
 	uint64_t rx_p38 = 0;
-	uint16_t rx_crc12 = 0;
 	int rx_matched = 0;
-	bool decoded = telecom_system->decode_ctrl_suffix_from_passband(
-		telecom_system->data_container.ready_to_process_passband_delayed_data,
-		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
 
-	if(!decoded)
+	if(telecom_system->suffix_fec_mode != 0)
 	{
-		telecom_system->data_container.frames_to_read = 2;
-		telecom_system->data_container.nUnder_processing_events = 0;
-		return false;
-	}
-
-	// Type-discriminator routing: drop mismatched types (might be a CONNECT
-	// suffix landing in the wrong receive window — e.g. RSP heard another
-	// CMD's TEST_ACK while it was waiting for a START_CONN).
-	if(rx_type != expected_type)
-	{
-		static int wrongtype_log = 0;
-		if((wrongtype_log++ & 0x3F) == 0)
+		// SUFFIX-FEC TIER 1 (connect-suffix-fec-research.md): CRC-aided soft
+		// list decode. The soft path runs the SAME base detector + control
+		// mini-Moose as the hard path, then pins expected_type and runs a
+		// CRC-gated best-first search over per-symbol top-K candidates (cand[0]
+		// == the hard argmax). It returns true ONLY on a type-matched,
+		// CRC-valid assignment, so the hard path's separate type/CRC gates are
+		// already enforced inside it (no recheck needed). ZERO airtime.
+		int soft_flips = -1;
+		bool soft_ok = telecom_system->decode_ctrl_suffix_from_passband_soft(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, expected_type, arq_ctrl_crc12_cb, self,
+			&rx_p38, &rx_matched, &soft_flips);
+		if(!soft_ok)
 		{
-			printf("[RX-MFSK-CTRL-%s] wrong type rx=%d expected=%d matched=%d "
-				"(rate-limited log)\n",
-				tag, (int)rx_type, (int)expected_type, rx_matched);
-			fflush(stdout);
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			return false;
 		}
-		telecom_system->data_container.frames_to_read = 2;
-		telecom_system->data_container.nUnder_processing_events = 0;
-		return false;
 	}
-
-	// CRC12 validation via the production CRC12_calc helper (NEVER inline
-	// — v1 bug #1 was an init-mismatch between sender's CRC12_calc and an
-	// inlined RX-side copy that defaulted to init=0).
-	uint8_t typed_bytes[5];
-	pack_ctrl_typed40_msb_v2(typed_bytes, rx_type, rx_p38);
-	uint16_t expected = self->CRC12_calc((char*)typed_bytes, 5);
-	if(rx_crc12 != expected)
+	else
 	{
-		printf("[RX-MFSK-CTRL-%s] CRC12 fail type=%d p38=0x%010llx rx=0x%03x "
-			"exp=0x%03x matched=%d\n",
-			tag, (int)rx_type, (unsigned long long)rx_p38,
-			(unsigned)rx_crc12, (unsigned)expected, rx_matched);
-		fflush(stdout);
-		telecom_system->data_container.frames_to_read = 2;
-		telecom_system->data_container.nUnder_processing_events = 0;
-		return false;
+		mfsk_ctrl_frame_type rx_type;
+		uint16_t rx_crc12 = 0;
+		bool decoded = telecom_system->decode_ctrl_suffix_from_passband(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+
+		if(!decoded)
+		{
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			return false;
+		}
+
+		// Type-discriminator routing: drop mismatched types (might be a CONNECT
+		// suffix landing in the wrong receive window — e.g. RSP heard another
+		// CMD's TEST_ACK while it was waiting for a START_CONN).
+		if(rx_type != expected_type)
+		{
+			static int wrongtype_log = 0;
+			if((wrongtype_log++ & 0x3F) == 0)
+			{
+				printf("[RX-MFSK-CTRL-%s] wrong type rx=%d expected=%d matched=%d "
+					"(rate-limited log)\n",
+					tag, (int)rx_type, (int)expected_type, rx_matched);
+				fflush(stdout);
+			}
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			return false;
+		}
+
+		// CRC12 validation via the production CRC12_calc helper (NEVER inline
+		// — v1 bug #1 was an init-mismatch between sender's CRC12_calc and an
+		// inlined RX-side copy that defaulted to init=0).
+		uint8_t typed_bytes[5];
+		pack_ctrl_typed40_msb_v2(typed_bytes, rx_type, rx_p38);
+		uint16_t expected = self->CRC12_calc((char*)typed_bytes, 5);
+		if(rx_crc12 != expected)
+		{
+			printf("[RX-MFSK-CTRL-%s] CRC12 fail type=%d p38=0x%010llx rx=0x%03x "
+				"exp=0x%03x matched=%d\n",
+				tag, (int)rx_type, (unsigned long long)rx_p38,
+				(unsigned)rx_crc12, (unsigned)expected, rx_matched);
+			fflush(stdout);
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			return false;
+		}
 	}
 
 	*out_p38 = rx_p38;

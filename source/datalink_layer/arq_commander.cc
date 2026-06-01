@@ -48,6 +48,15 @@ static inline bool sack_rx_trace_enabled()
 	} \
 } while(0)
 
+// CRC-12 callback for the suffix-FEC soft ACK+SACK decoder
+// (connect-suffix-fec-research.md). Wraps the PRODUCTION CRC12_calc (NEVER
+// inline — v1 bug #1). ctx = the cl_arq_controller*. Matches ctrl_crc12_fn.
+static uint16_t cmd_ack_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
+	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
 void cl_arq_controller::register_ack(int message_id)
 {
 	if(message_id>=0 && message_id<this->nMessages && messages_tx[message_id].status==PENDING_ACK)
@@ -102,21 +111,41 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	uint32_t rx_bitmap = 0;
 	uint16_t rx_crc12 = 0;
 	int      mfsk_matched = 0;
-	bool decoded = telecom_system->decode_ack_sack_from_passband(
-		telecom_system->data_container.ready_to_process_passband_delayed_data,
-		tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
-	if(!decoded)
-		return false;
 
-	// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
-	char crc_input[5];
-	crc_input[0] = (char)rx_bsi;
-	crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
-	crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
-	crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
-	crc_input[4] = (char)( rx_bitmap        & 0xFF);
-	if(rx_crc12 != CRC12_calc(crc_input, 5))
-		return false;
+	if(telecom_system->suffix_fec_mode != 0)
+	{
+		// SUFFIX-FEC TIER 1: CRC-aided soft list decode of the ACK+SACK suffix.
+		// Same base detect + control mini-Moose as the hard path, then a
+		// CRC-gated best-first search (cand[0] == hard argmax). Returns true
+		// ONLY on a CRC-valid assignment, so the manual CRC recheck below is
+		// already enforced inside it. ZERO airtime. The bsi-window / all-ones
+		// sanity gates downstream are unchanged.
+		int soft_flips = -1;
+		bool soft_ok = telecom_system->decode_ack_sack_from_passband_soft(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, cmd_ack_crc12_cb, this,
+			&rx_bsi, &rx_bitmap, &mfsk_matched, &soft_flips);
+		if(!soft_ok)
+			return false;
+	}
+	else
+	{
+		bool decoded = telecom_system->decode_ack_sack_from_passband(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+		if(!decoded)
+			return false;
+
+		// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
+		char crc_input[5];
+		crc_input[0] = (char)rx_bsi;
+		crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
+		crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
+		crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
+		crc_input[4] = (char)( rx_bitmap        & 0xFF);
+		if(rx_crc12 != CRC12_calc(crc_input, 5))
+			return false;
+	}
 
 	// Sanity: bsi must be the current or just-prior batch (mod 256) — RSP only
 	// ACKs frames whose batch_seq_id matches one of those.
@@ -2545,33 +2574,51 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						uint32_t rx_bitmap = 0;
 						uint16_t rx_crc12 = 0;
 						int      mfsk_matched = 0;
-						bool decoded = telecom_system->decode_ack_sack_from_passband(
-							telecom_system->data_container.ready_to_process_passband_delayed_data,
-							tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+						bool decoded;
 
-						// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
-						// On mismatch, treat as no-ACK — the timeout-retransmit path
-						// is the safe fallback when a corrupted "looks like a clean
-						// ACK" frame could otherwise cause silent data loss.
-						if(decoded)
+						if(telecom_system->suffix_fec_mode != 0)
 						{
-							char crc_input[5];
-							crc_input[0] = (char)rx_bsi;
-							crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
-							crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
-							crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
-							crc_input[4] = (char)( rx_bitmap        & 0xFF);
-							uint16_t expected_crc12 = CRC12_calc(crc_input, 5);
-							if(rx_crc12 != expected_crc12)
+							// SUFFIX-FEC TIER 1: CRC-aided soft list decode of the
+							// ACK+SACK suffix (SACK window — partial bitmaps OK).
+							// Returns true ONLY on a CRC-valid assignment, so the
+							// manual CRC recheck is already enforced inside it.
+							// Downstream bsi/bitmap/dedupe gates are unchanged.
+							int soft_flips = -1;
+							decoded = telecom_system->decode_ack_sack_from_passband_soft(
+								telecom_system->data_container.ready_to_process_passband_delayed_data,
+								tail_samples, cmd_ack_crc12_cb, this,
+								&rx_bsi, &rx_bitmap, &mfsk_matched, &soft_flips);
+						}
+						else
+						{
+							decoded = telecom_system->decode_ack_sack_from_passband(
+								telecom_system->data_container.ready_to_process_passband_delayed_data,
+								tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+
+							// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
+							// On mismatch, treat as no-ACK — the timeout-retransmit path
+							// is the safe fallback when a corrupted "looks like a clean
+							// ACK" frame could otherwise cause silent data loss.
+							if(decoded)
 							{
-								printf("[CMD-MFSK-ACK-SACK] CRC12 fail "
-									"bsi=%u bitmap=0x%08x rx_crc=0x%03x expected=0x%03x "
-									"matched=%d — discarding\n",
-									(unsigned)rx_bsi, (unsigned)rx_bitmap,
-									(unsigned)rx_crc12, (unsigned)expected_crc12,
-									mfsk_matched);
-								fflush(stdout);
-								decoded = false;
+								char crc_input[5];
+								crc_input[0] = (char)rx_bsi;
+								crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
+								crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
+								crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
+								crc_input[4] = (char)( rx_bitmap        & 0xFF);
+								uint16_t expected_crc12 = CRC12_calc(crc_input, 5);
+								if(rx_crc12 != expected_crc12)
+								{
+									printf("[CMD-MFSK-ACK-SACK] CRC12 fail "
+										"bsi=%u bitmap=0x%08x rx_crc=0x%03x expected=0x%03x "
+										"matched=%d — discarding\n",
+										(unsigned)rx_bsi, (unsigned)rx_bitmap,
+										(unsigned)rx_crc12, (unsigned)expected_crc12,
+										mfsk_matched);
+									fflush(stdout);
+									decoded = false;
+								}
 							}
 						}
 
