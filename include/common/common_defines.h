@@ -93,6 +93,24 @@ extern int g_verbose;
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
 
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
+
+// ULTRA (deep-SNR "survival") configurations - values 200+ (ULTRA tier, the
+// road DOWN from ROBUST is more noncoherent, ultra-tier-design.md §4.1). The
+// ULTRA tier reuses the ROBUST_0-class MFSK data PHY (M=32 WB / M=8 NB, single
+// stream) but pushes the CONNECT ctrl-suffix establishment FAR deeper via the
+// reframe levers (count-based admission + low-rate GF(16) RA + suffix-energy
+// combining), validated in sim to ~-20 dB SNR3k (tier2-suffix-fec-design.md §22).
+// The per-tier suffix params (R_base, R_suffix, K, repfact) are applied by the
+// ULTRA enable hook (arq_common.cc); see cl_telecom_system::ultra_tier_suffix_params.
+// SELECTABLE this increment via -s 200/201/202 (pin); full gearshift entry +
+// sticky-hysteresis is a later increment. NO CAP_ULTRA / no negotiation (the
+// enhanced suffix is backward-compatible by construction, §21.6 / §22).
+#define NUMBER_OF_ULTRA_CONFIGS 3
+#define ULTRA_0 200   // R_base=8 R_suffix=8  K=8 repfact=6 -> establishment ~-17.8 dB SNR3k
+#define ULTRA_1 201   // R_base=8 R_suffix=10 K=6 repfact=7 -> establishment ~-18.x dB (interpolated)
+#define ULTRA_2 202   // R_base=8 R_suffix=12 K=5 repfact=8 R_frame=4 -> establishment ~-19.9 dB
+
+inline bool is_ultra_config(int config) { return config >= 200 && config <= 202; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor

@@ -362,10 +362,15 @@ static bool g_field_inited = false;
 
 // ---- RA graph (rebuilt by configure()) --------------------------------------
 static int  g_repfact = 2;            // replicas per info symbol (default)
+// ULTRA spike (lever C): K is a runtime knob. g_K = total info symbols (msg +
+// 3 CRC), g_K_msg = message symbols = g_K - GF16RA_K_CRC. Default g_K = 13.
+static int  g_K     = GF16RA_K;       // total info symbols (runtime)
+static int  g_K_msg = GF16RA_K_MSG;   // message info symbols = g_K - 3
 static int  g_NC = GF16RA_K * 2;      // parity symbols = repfact*K
 static int  g_N  = GF16RA_K * 3;      // codeword length = K + NC
 static bool g_graph_inited = false;
 static int  g_built_repfact = -1;
+static int  g_built_K       = -1;
 
 // Accumulator interleaver + weights: stage j (0..NC-1) folds info symbol
 // g_acc_idx[j] with GF weight alpha^g_acc_wlog[j]. Built so each of the K info
@@ -424,25 +429,33 @@ static void build_field()
 	g_field_inited = true;
 }
 
-int configure(int repfact)
+int configure_k(int repfact, int K_total)
 {
 	if (repfact < 1) repfact = 1;
+	if (K_total < 4) K_total = 4;                 // need >=3 CRC + >=1 message symbol
+	if (K_total > GF16RA_MAX_K) K_total = GF16RA_MAX_K;
 	// cap so K + repfact*K <= GF16RA_MAX_N
-	while (GF16RA_K + repfact * GF16RA_K > GF16RA_MAX_N && repfact > 1) repfact--;
+	while (K_total + repfact * K_total > GF16RA_MAX_N && repfact > 1) repfact--;
 	g_repfact = repfact;
-	g_NC = repfact * GF16RA_K;
-	g_N  = GF16RA_K + g_NC;
+	g_K     = K_total;
+	g_K_msg = K_total - GF16RA_K_CRC;             // message symbols (>=1)
+	g_NC    = repfact * g_K;
+	g_N     = g_K + g_NC;
 	g_graph_inited = false;   // force rebuild
 	return g_N;
 }
 
+int configure(int repfact) { return configure_k(repfact, GF16RA_K); }
+
 int codeword_len() { return g_N; }
 int parity_len()   { return g_NC; }
+int info_len()     { return g_K; }
+int msg_bits()     { return g_K_msg * GF16RA_m; }   // 4 bits/symbol
 
 bool init()
 {
 	build_field();
-	if (g_graph_inited && g_built_repfact == g_repfact) return true;
+	if (g_graph_inited && g_built_repfact == g_repfact && g_built_K == g_K) return true;
 
 	// ---- Build the accumulator interleaver + weights ----
 	// Stage assignment: lay the K*repfact replicas across the NC stages by a
@@ -454,7 +467,7 @@ bool init()
 	// info symbol force its replica weights to XOR-sum to 0 so the accumulator
 	// terminates to 0 (the EXIT-convergence aid; the real CRC gate is the
 	// correctness check).
-	const int K = GF16RA_K;
+	const int K = g_K;   // runtime info-symbol count (lever C)
 	// position each replica deterministically; the stage list is then a
 	// permutation of [0,NC). Use stride coprime with NC where possible.
 	int stride = 1;
@@ -470,7 +483,7 @@ bool init()
 	for (int j = 0; j < g_NC; j++) { tmp_idx[j] = -1; }
 	// per-info running weight accumulator to close XOR-to-0
 	int info_wvals[GF16RA_MAX_N];      // last partial value per info (indexed 0..K-1)
-	int info_count[GF16RA_K];
+	int info_count[GF16RA_MAX_K];
 	for (int i = 0; i < K; i++) { info_count[i] = 0; info_wvals[i] = 0; }
 
 	for (int i = 0; i < K; i++) {
@@ -515,6 +528,7 @@ bool init()
 
 	g_graph_inited = true;
 	g_built_repfact = g_repfact;
+	g_built_K       = g_K;
 	return true;
 }
 
@@ -524,38 +538,49 @@ static inline int gf_mul(int a, int b)
 	return g_gfexp[(g_gflog[a] + g_gflog[b]) % 15];
 }
 
-// 40-bit message + 12-bit CRC -> 13 systematic GF(16) info symbols (MSB-first).
+// message (g_K_msg symbols = 4*g_K_msg bits, field = [type:2|payload:rest]) +
+// 12-bit CRC -> g_K systematic GF(16) info symbols (MSB-first). At the default
+// g_K_msg=10 this is the 40-bit [type:2|payload38] field exactly as before; for
+// lever C (fewer info symbols) the field is 4*g_K_msg bits wide and the low
+// (4*g_K_msg-2) payload bits are carried (the high payload bits are dropped —
+// the ULTRA establish message is small by design).
 static inline void msg_to_info(uint8_t type, uint64_t payload38, uint16_t crc12, int* info)
 {
-	uint64_t field40 = ((uint64_t)(type & 0x3) << 38) | (payload38 & ((1ULL << 38) - 1ULL));
-	for (int s = 0; s < GF16RA_K_MSG; s++) info[s] = (int)((field40 >> (40 - 4 * (s + 1))) & 0xF);
+	const int msg_bits = 4 * g_K_msg;                         // field width
+	const int pl_bits  = msg_bits - 2;                        // payload bits in the field
+	uint64_t pl_mask   = (pl_bits >= 64) ? ~0ULL : ((1ULL << pl_bits) - 1ULL);
+	uint64_t field     = ((uint64_t)(type & 0x3) << pl_bits) | (payload38 & pl_mask);
+	for (int s = 0; s < g_K_msg; s++) info[s] = (int)((field >> (msg_bits - 4 * (s + 1))) & 0xF);
 	uint16_t c = (uint16_t)(crc12 & 0x0FFF);
-	for (int s = 0; s < GF16RA_K_CRC; s++) info[GF16RA_K_MSG + s] = (int)((c >> (12 - 4 * (s + 1))) & 0xF);
+	for (int s = 0; s < GF16RA_K_CRC; s++) info[g_K_msg + s] = (int)((c >> (12 - 4 * (s + 1))) & 0xF);
 }
 
 static inline void info_to_msg(const int* info, uint8_t* type, uint64_t* payload38, uint16_t* crc12)
 {
-	uint64_t field40 = 0;
-	for (int s = 0; s < GF16RA_K_MSG; s++) field40 = (field40 << 4) | (uint64_t)(info[s] & 0xF);
-	*type = (uint8_t)((field40 >> 38) & 0x3);
-	*payload38 = field40 & ((1ULL << 38) - 1ULL);
+	const int msg_bits = 4 * g_K_msg;
+	const int pl_bits  = msg_bits - 2;
+	uint64_t pl_mask   = (pl_bits >= 64) ? ~0ULL : ((1ULL << pl_bits) - 1ULL);
+	uint64_t field = 0;
+	for (int s = 0; s < g_K_msg; s++) field = (field << 4) | (uint64_t)(info[s] & 0xF);
+	*type = (uint8_t)((field >> pl_bits) & 0x3);
+	*payload38 = field & pl_mask;
 	uint16_t c = 0;
-	for (int s = 0; s < GF16RA_K_CRC; s++) c = (uint16_t)((c << 4) | (info[GF16RA_K_MSG + s] & 0xF));
+	for (int s = 0; s < GF16RA_K_CRC; s++) c = (uint16_t)((c << 4) | (info[g_K_msg + s] & 0xF));
 	*crc12 = (uint16_t)(c & 0x0FFF);
 }
 
 void encode(uint8_t type, uint64_t payload38, uint16_t crc12, int* out_tones)
 {
 	init();
-	int info[GF16RA_K];
+	int info[GF16RA_MAX_K];
 	msg_to_info(type, payload38, crc12, info);
-	for (int s = 0; s < GF16RA_K; s++) out_tones[s] = info[s] & 0xF;
+	for (int s = 0; s < g_K; s++) out_tones[s] = info[s] & 0xF;
 	// RA accumulator chain: one info edge folded per stage.
 	int prev = 0;
 	for (int j = 0; j < g_NC; j++) {
 		int w = g_gfexp[g_acc_wlog[j]];
 		int acc = prev ^ gf_mul(w, info[g_acc_idx[j]]);
-		out_tones[GF16RA_K + j] = acc & 0xF;
+		out_tones[g_K + j] = acc & 0xF;
 		prev = acc;
 	}
 }
@@ -576,7 +601,7 @@ bool soft_decode(const double* energies, int maxiter, double esno_metric,
 	if (!energies || !crc12_fn || !out_payload38) return false;
 	init();
 	if (out_iters) *out_iters = -1;
-	const int N = g_N, M = GF16RA_M, K = GF16RA_K, nfac = g_NC;
+	const int N = g_N, M = GF16RA_M, K = g_K, nfac = g_NC;
 
 	// ---- intrinsic (channel) probabilities pix[s][16] (Bessel metric) ----
 	std::vector<double> pix((size_t)N * M);
@@ -680,7 +705,7 @@ bool soft_decode(const double* energies, int maxiter, double esno_metric,
 			double* ap = &app[(size_t)v * M];
 			for (int t = 0; t < M; t++) ap[t] *= m[t];
 		}
-	int info[GF16RA_K];
+	int info[GF16RA_MAX_K];
 	for (int s = 0; s < K; s++) {
 		const double* ap = &app[(size_t)s * M];
 		int best = 0; double bv = -1.0;

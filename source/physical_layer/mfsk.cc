@@ -68,6 +68,7 @@ cl_mfsk::cl_mfsk()
 	ack_suffix_fec_coded = false; // §21: ACK-suffix FEC off by default (separate
 	                              // from the CONNECT flag; held off this increment)
 	connect_preamble_reps = 1; // Tier-2 base-pattern combining off by default (§20)
+	connect_suffix_reps   = 1; // ULTRA reframe: suffix-energy combining off by default
 }
 
 cl_mfsk::~cl_mfsk()
@@ -908,17 +909,31 @@ void cl_mfsk::generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
 	// reps=1, byte-identical). The hop index abs_s uses this same base total so
 	// TX and the RX suffix-decode offset (which is passed connect_base_total_nsymb)
 	// stay phase-consistent (§20.3 C5).
+	//
+	// ULTRA reframe (Change 2 — SUFFIX combining): emit the suffix codeword
+	// connect_suffix_reps times, back-to-back, AFTER all base reps. Rep r occupies
+	// absolute symbols [base_total + r*suffix_len .. +suffix_len). The tone-hop uses
+	// the CONTINUED absolute index abs_s = base_total + r*suffix_len + s (NOT a
+	// per-rep-local index), so each rep's symbol s lands on a DIFFERENT wire bin
+	// (frequency diversity across reps). The RX de-hops each rep back to the data
+	// tone (t - hop) mod M before summing — identical de-hop math in
+	// decode_suffix_energies — so the per-tone energy of rep-r symbol s accumulates
+	// onto the SAME data-tone slot. reps=1 → exactly the §20 single-codeword suffix.
 	int base_total = connect_base_total_nsymb();
+	int reps = connect_suffix_reps; if (reps < 1) reps = 1;
+	if (reps > MAX_CONNECT_SUFFIX_REPS) reps = MAX_CONNECT_SUFFIX_REPS;
 	double amp = sqrt((double)Nc / nStreams);
-	for (int s = 0; s < suffix_len; s++) {
-		int abs_s = base_total + s;  // suffix index after ALL base reps
-		for (int k = 0; k < Nc; k++)
-			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+	for (int r = 0; r < reps; r++) {
+		for (int s = 0; s < suffix_len; s++) {
+			int abs_s = base_total + r * suffix_len + s;  // continued abs index
+			for (int k = 0; k < Nc; k++)
+				pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
 
-		int actual_tone = (payload_tones[s] + abs_s * tone_hop_step) % M;
-		for (int st = 0; st < nStreams; st++)
-			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
-				std::complex<double>(amp, 0.0);
+			int actual_tone = (payload_tones[s] + abs_s * tone_hop_step) % M;
+			for (int st = 0; st < nStreams; st++)
+				pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+					std::complex<double>(amp, 0.0);
+		}
 	}
 }
 

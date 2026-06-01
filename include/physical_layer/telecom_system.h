@@ -254,6 +254,30 @@ public:
 	// count (connect_base_total_nsymb()).
 	int  set_connect_preamble_reps(int reps);
 
+	// ULTRA reframe spike (Change 2 — SUFFIX combining): set the CONNECT
+	// suffix-combining factor R_suffix. R_suffix>1 → ack_mfsk.connect_suffix_reps=R
+	// (TX emits the FEC codeword R times back-to-back after all base reps; RX sums
+	// the per-tone ENERGY across the R reps before the GF16 BP soft-decode) and
+	// re-derive ctrl_suffix_pattern_passband_samples. MUST be called AFTER
+	// load_configuration AND after set_suffix_fec (the suffix length depends on FEC).
+	// R clamped to [1, cl_mfsk::MAX_CONNECT_SUFFIX_REPS]. R=1 = byte-identical (off).
+	// Returns the on-wire suffix symbol count (ctrl_suffix_total_nsymb()).
+	int  set_connect_suffix_reps(int reps);
+
+	// ULTRA tier (tier2-suffix-fec-design.md §22 / ultra-tier-design.md §4.1): the
+	// per-tier CONNECT ctrl-suffix establishment parameters. Returns the (repfact,
+	// K, R_base, R_suffix) for ULTRA_0/1/2 (the §22.4 stacked table). repfact = GF16
+	// RA replicas/info-symbol (lower rate); K = total GF16 info symbols incl 3 CRC
+	// (fewer info bits = deeper, lever C); R_base = base-pattern combining reps;
+	// R_suffix = suffix-energy combining reps (the §22 Change-2 content lever).
+	// These are applied by the ULTRA enable hook (arq_common.cc) when the session is
+	// at an ULTRA config. Returns true and fills the out params for an ULTRA config;
+	// returns false (leaves out params untouched) for any non-ULTRA config — the
+	// SOLE entry point that knows the ULTRA PHY numbers, so non-ULTRA tiers cannot
+	// accidentally inherit them.
+	static bool ultra_tier_suffix_params(int config, int& repfact, int& K,
+	                                     int& R_base, int& R_suffix);
+
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,
 	                                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,

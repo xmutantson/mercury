@@ -1626,7 +1626,11 @@ start_modem:
     }
 
 
-    if ((mod_config >= NUMBER_OF_CONFIGS && !is_robust_config(mod_config)) || (mod_config < 0))
+    // ULTRA tier (tier2-suffix-fec-design.md §23): -s 200/201/202 pins an ULTRA
+    // config (selectable this increment). is_ultra_config admits 200-202 alongside
+    // the OFDM (0..16) and ROBUST (100-102) ranges.
+    if ((mod_config >= NUMBER_OF_CONFIGS && !is_robust_config(mod_config)
+                                         && !is_ultra_config(mod_config)) || (mod_config < 0))
     {
         printf("Wrong modulation config %d\n", mod_config);
         exit(EXIT_FAILURE);

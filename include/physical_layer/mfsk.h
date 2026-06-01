@@ -96,13 +96,41 @@ public:
 	// combine_reps=1 and never read this). The base now occupies
 	// connect_base_total_nsymb()=R*connect_pattern_nsymb symbols on the wire; the
 	// suffix follows at that offset (the I4 length accessor for the base, §20.3).
-	static const int MAX_CONNECT_PREAMBLE_REPS = 4;
+	// ULTRA spike (lever B): raised 4 -> 32 so ULTRA_2's R=32 base combining fits.
+	// data_container.cc CTRL_SUFFIX_FEC_MAX_NSYMB raised in lockstep
+	// (MAX_REPS*16 + GF16RA_MAX_N = 32*16 + 128 = 640).
+	static const int MAX_CONNECT_PREAMBLE_REPS = 32;
 	int connect_preamble_reps;   // default 1 (set in init())
 	int connect_base_total_nsymb() const {
 		int r = connect_preamble_reps;
 		if (r < 1) r = 1;
 		if (r > MAX_CONNECT_PREAMBLE_REPS) r = MAX_CONNECT_PREAMBLE_REPS;
 		return r * connect_pattern_nsymb;
+	}
+	// ULTRA reframe spike (Change 2 — SUFFIX combining). The INCR-0 finding was
+	// that base-pattern combining (connect_preamble_reps) deepens ACQUISITION to
+	// −20/−23 but NOT the FEC CONTENT (which the scale-invariant ratio gate masked
+	// at ~−14). §14 had concluded "combining belongs on the PREAMBLE not the suffix"
+	// — but that was while ACQUISITION was the clamp (2.0 gate, content already
+	// solved to −14.68 at R=1). Once count-based admission (Change 1) removes the
+	// ratio clamp, the CONTENT becomes the binding stage again, and §14's own table
+	// shows content tracks combining (R=8 content −14.68). This knob emits the FEC
+	// codeword connect_suffix_reps times consecutively AFTER all base reps; the RX
+	// noncoherently sums the per-tone ENERGY of each suffix rep before the GF16 BP
+	// soft-decode, deepening the content reach ~+2.2-2.5 dB/doubling (the same
+	// noncoherent square-law integration the base combining gets). reps=1 (default)
+	// → byte-identical to the merged §20 path. CONNECT-only.
+	static const int MAX_CONNECT_SUFFIX_REPS = 16;
+	int connect_suffix_reps;   // default 1 (set in init())
+	// On-wire suffix symbol count = R_suffix × ctrl_suffix_len() (the coded N when
+	// FEC is on). Each rep carries the SAME codeword; the per-rep-LOCAL hop index
+	// (s within the codeword, NOT a continued abs index) keeps every rep's symbol s
+	// on the SAME expected bin so the RX can sum rep-r symbol s onto rep-0 symbol s.
+	int ctrl_suffix_total_nsymb() const {
+		int r = connect_suffix_reps;
+		if (r < 1) r = 1;
+		if (r > MAX_CONNECT_SUFFIX_REPS) r = MAX_CONNECT_SUFFIX_REPS;
+		return r * ctrl_suffix_len();
 	}
 	// Soft energy-ratio sub-gate for CONNECT-handshake / ACK-SNR MFSK suffix
 	// decode (telecom_system.cc decode_ctrl_suffix_from_passband +
@@ -265,12 +293,13 @@ public:
 	// transmitter applies in generate_ack_sack_pattern(). When the detector
 	// declares an ACK match it writes ack_sack_suffix_len() entries here
 	// (10 for WB M=16) and sets last_ack_sack_capture_valid=true.
-	// Sized to the Tier-2 FEC ceiling (gf16ra::GF16RA_MAX_N = 64 ≥ the R=1/4
-	// coded length 52, tier2-suffix-fec-design.md §19.4 C7) so the
-	// last_*_suffix_tones[] / suffix_tones[] / payload_tones[] buffers that
-	// derive their size from this constant are safe whether the uncoded (13)
-	// or coded (52) ctrl-suffix path runs. Was 16 (uncoded-only).
-	static const int MAX_ACK_SACK_SUFFIX = 64;
+	// Sized to the Tier-2 FEC ceiling so the last_*_suffix_tones[] /
+	// suffix_tones[] / payload_tones[] buffers that derive their size from this
+	// constant are safe whether the uncoded (13) or coded ctrl-suffix path runs
+	// (tier2-suffix-fec-design.md §19.4 C7). ULTRA spike (lever A): raised 64→128
+	// in lockstep with gf16ra::GF16RA_MAX_N (the lowest rate repfact=8 at K=13
+	// gives N=117 ≤ 128). Was 16 (uncoded-only), then 64 (R¼ coded length 52).
+	static const int MAX_ACK_SACK_SUFFIX = 128;
 	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_ack_sack_capture_valid;
 

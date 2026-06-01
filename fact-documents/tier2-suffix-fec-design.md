@@ -1413,3 +1413,175 @@ enhanced path is held off in 100% of cases regardless. ⇒ NO-BEHAVIOR-CHANGE si
 **VERIFY (gates) — see build/test run below.** Byte-identical-at-OFDM (`ack_suffix_throughput_neutral`,
 `connect_suffix_byte_identical_when_off`) and establishment (`production_enhanced_connect_decodes`,
 the −13.89 cliff sweeps) must be UNCHANGED — they were keyed on the tier trigger, which is untouched.
+
+## §23 ULTRA tier BUILD — INCR-1: production PHY + tier (count-admission tier-gated + suffix combining) (SIM, 2026-06-01)
+
+Agent (this session). Worktree `C:/Users/kamer/mercury_wt/ultra-build-incr1` / branch
+`sim/ultra-build-incr1` off **monitor @fef293f** (the cleanup'd production base — NOT the spike branch,
+which predates the CAP-negotiation cleanup). SIM / IN-PROCESS ONLY. Productionizes the §22 reframe spike
+(branch `sim/ultra-reframe-spike` @71cfeb9, which reached −19.91 dB via two GLOBAL test flags) as a
+PRODUCTION-correct ULTRA TIER. The §22 spike's two production gaps are closed here: (#1) the lever infra
++ the 2 PHY changes are ported by hand onto the cleanup'd base; (#2) count-admission is GATED to the
+ULTRA tier ONLY (the spike's global flag would have changed merged acquisition + throughput behavior if
+it leaked to OFDM/ROBUST).
+
+### §23.1 What was ported (the 2 PHY changes + the lever infra), code-grounded
+
+Ported by hand-applying the spike source diffs (177dc31→71cfeb9, source/include only) onto fef293f —
+they applied cleanly because the CAP-removal (§22) and the INCR-0/reframe hunks are in disjoint regions.
+
+- **Lever infra (INCR-0 0f411fb):** `gf16ra::GF16RA_MAX_N` 64→128, `GF16RA_MAX_K=13`, the runtime K knob
+  `gf16ra::configure_k(repfact, K)` + `g_K`/`g_K_msg` + runtime msg↔info packing (`msg_to_info`/
+  `info_to_msg` field width = 4·K_msg bits), `info_len()`/`msg_bits()`; `MAX_CONNECT_PREAMBLE_REPS`
+  4→32; `MAX_ACK_SACK_SUFFIX` 64→128; `data_container.cc CTRL_SUFFIX_FEC_MAX_NSYMB` 128→640. Default
+  `configure(repfact)==configure_k(repfact,13)` → byte-identical for the merged §19/§20 path.
+- **Change 2 — SUFFIX combining (reframe 71cfeb9):** `cl_mfsk::connect_suffix_reps` (default 1),
+  `MAX_CONNECT_SUFFIX_REPS=16`, `ctrl_suffix_total_nsymb()=R_suffix×ctrl_suffix_len()`;
+  `generate_ctrl_suffix_pattern` emits the GF16 codeword R_suffix times back-to-back after all base
+  reps with the CONTINUED-abs hop index (frequency diversity); RX `decode_ctrl_suffix_from_passband`
+  extracts the per-rep N×M energy matrix per rep (`decode_suffix_energies` at offset
+  `base_total + r·N`, the de-hop lands every rep's symbol s on the same data-tone) and SUMS them before
+  `gf16ra::soft_decode` (noncoherent square-law content combining, ~+2.2-2.5 dB/doubling, §22.3).
+  `set_connect_suffix_reps()` re-derives `ctrl_suffix_pattern_passband_samples`; `data_container.cc`
+  floor 640→1024. R_suffix=1 → byte-identical to the §20 single-codeword suffix.
+- **Change 1 — COUNT-based admission (reframe 71cfeb9), PRODUCTIONIZED:** the scale-invariant
+  `metric ≥ CTRL_DETECT_METRIC_MIN` ratio sub-gate is dropped (admit on the hard matched-COUNT 7/16 +
+  CRC12 + 2-bit type backstop) — but ONLY at the ULTRA tier (see §23.3).
+- **DROPPED from the spike:** the `g_ultra_suffix_esno_scale` knob. §22.3 measured esno ×1 / ×√R / ×R
+  all give the IDENTICAL −16.07 content cliff (the self-normalizing `soft_decode` captures the combining
+  gain from the per-tone energy-RATIO separation: summed signal ∝R, noise std ∝√R → decision SNR ∝√R).
+  So `esno_metric` stays 4.0 and the scale-invariance trap the spike flagged is avoided by construction.
+  (`telecom_system.cc` decode path.)
+
+### §23.2 The ULTRA tier (config IDs 200-202, is_ultra_config, per-tier PHY params, -s selectable)
+
+- **`ULTRA_0/1/2 = 200/201/202`** + **`is_ultra_config(c) = (c>=200 && c<=202)`** (`common_defines.h`,
+  mirrors `is_robust_config`). `NUMBER_OF_ULTRA_CONFIGS=3`.
+- **`load_configuration` accepts ULTRA** (the validity guard `telecom_system.cc:5101` extended with
+  `!is_ultra_config(configuration)`) and maps ULTRA → the ROBUST_0-class single-stream MFSK DATA PHY
+  (M=32 WB / M=8 NB, LDPC 1/16 — the MFSK reinit block `:5321` takes the ROBUST_0 branch for ULTRA).
+  ULTRA's reach is NOT in the data modcod; it is in the CONNECT ctrl-suffix establishment.
+- **Per-tier PHY params** = the SOLE owner `cl_telecom_system::ultra_tier_suffix_params(config, repfact,
+  K, R_base, R_suffix)` (the §22.4 stacked table): ULTRA_0 {6,8,8,8}→est ~−17.8; ULTRA_1 {7,6,8,10}
+  (interpolated); ULTRA_2 {8,5,8,12}→est ~−19.9. Returns false for non-ULTRA → the robust/OFDM tiers
+  cannot inherit ULTRA's deep settings (the no-leak entry point).
+- **SELECTABLE via -s 200/201/202 (pin):** the arq enable hook (`arq_common.cc:1539+`) checks
+  `ultra_tier_suffix_params(configuration,…)` FIRST; on an ULTRA config it applies the ordered sequence
+  `set_suffix_fec(true,repfact) → gf16ra::configure_k(repfact,K) → gf16ra::init() →
+  set_connect_preamble_reps(R_base) → set_connect_suffix_reps(R_suffix)`; else the existing robust-tier
+  enhanced CONNECT (FEC R¼/K13/R_base4, R_suffix=1) / OFDM-off branch (now also forces R_suffix=1 so a
+  fall-back from ULTRA restores the single-codeword suffix). **NO CAP_ULTRA / no negotiation** (per the
+  no-negotiation-pre-ship principle; the enhanced suffix is backward-compatible by construction, §21.6).
+  Full gearshift entry + sticky-hysteresis is a LATER increment (this increment is the -s/pin path).
+
+### §23.3 §5 CROSS-LAYER DATA-FLOW AUDIT (REQUIRED — the load-bearing safety)
+
+**Shared state #1 — the ctrl-suffix DECODE-ADMISSION decision (count vs ratio gate). THE no-leak
+audit (production gap #2).**
+- Producer of `metric`: `ofdm.detect_ack_pattern` (`ofdm.cc:3691`) — the scale-invariant
+  `Σ e_target/e_total` energy RATIO (combining sums R copies → ratio unchanged → gates the decode off at
+  ~−14 regardless of FEC/combining strength).
+- The admission decision lives at the TWO gate sites in `decode_ctrl_suffix_from_passband`
+  (`telecom_system.cc` ~3669 + ~3716, the post-CFO-remix retry). Each was `metric < CTRL_DETECT_METRIC_MIN`.
+- **What the fix changes:** the decision is now `count_admit ? (count gate alone) : (count gate AND ratio
+  gate)`, with `count_admit` = `(override==FOLLOW_TIER) ? is_ultra_config(current_configuration) :
+  (override==1)`. `current_configuration` is the `cl_telecom_system` member set by `load_configuration`.
+  Override default = FOLLOW_TIER (production); the test-only setter
+  `cl_telecom_system_set_ultra_count_admission_override` drives the §22 isolation arms.
+- **Consumers / no-leak proof:** the SOLE producer of an ULTRA `current_configuration` is
+  `load_configuration(200..202)` — reachable only by `-s 200/201/202` (pin) this increment. Every other
+  caller (every existing session, every existing test) loads OFDM/ROBUST → `is_ultra_config==false` →
+  the ratio gate is ANDed exactly as before → **byte-identical decode admission at OFDM/ROBUST**. This is
+  verified two ways: (1) the full existing suite is 50/50 unchanged (no decode-admission divergence on
+  any non-ULTRA test); (2) the dedicated `test_ultra_count_admission_tier_gated_no_leak` decodes the SAME
+  deep ULTRA_2 wire through an ULTRA_2 RX (count admits) vs a ROBUST_0 RX (ratio gate intact, gated down)
+  — the fractions diverge (ΔP≥0.15), the spike's global-flag design would make them EQUAL (fail-before).
+  **Invariant the OFDM/ROBUST consumers assume — "decode admission requires the ratio gate" — is
+  preserved for every non-ULTRA config.** The count gate (7/16) + CRC12 (2⁻¹²) + 2-bit type FAR backstop
+  is unchanged and is the real FAR defense at the ULTRA tier (§22.5 / §16 gate-OFF 0/4000).
+
+**Shared state #2 — the suffix-combining on-wire layout + buffer floors (R_suffix energy matrices).**
+- Producer of the on-wire suffix symbol count: `ack_mfsk.ctrl_suffix_total_nsymb() = R_suffix ×
+  ctrl_suffix_len()`. Producers of the passband sample count: `set_suffix_fec` /
+  `set_connect_preamble_reps` / `set_connect_suffix_reps` / `load_configuration` (all four re-derive
+  `ctrl_suffix_pattern_passband_samples = (connect_base_total_nsymb() + ctrl_suffix_total_nsymb()) ×
+  Nofdm × interp` — single formula, four sites, verified consistent).
+- Consumers / buffer floors (every one audited):
+  - TX framed buffer `ofdm_framed_data`/`ofdm_symbol_modulated_data` (`data_container.cc`): floor 1024.
+    Deepest ULTRA on-wire framed = ULTRA_2 R_base=8 (128 base) + R_suffix=12 × N(K5,repfact8 → N=45) =
+    128 + 540 = **668 sym < 1024**. ULTRA_0 = 128 + 8×56 = 576 < 1024. ✓ (Floor holds; literal kept,
+    data_container doesn't include mfsk.h — comment notes the lockstep.)
+  - RX `decode_suffix_energies` combine loop: allocates `std::vector` `rep_e`/`energies` sized `N×M`
+    (per-codeword, N≤56 for ULTRA), NOT the fixed `MAX_ACK_SACK_SUFFIX` buffer → no fixed-buffer overflow
+    from R_suffix. The hard-tone buffers `last_*_suffix_tones[MAX_ACK_SACK_SUFFIX=128]` are suffix-LOCAL
+    (one codeword, N≤56≤128) — UNCHANGED, and the hard path is FEC-gated off at the ULTRA tier anyway. ✓
+  - RX interpolated buffer `baseband_data_interpolated` (`Nofdm·buffer_Nsymb·interp`): the tighter
+    ceiling (~804 sym at ROBUST_0). ULTRA total 668 < 804. ✓ (The test's `generate…_passband` size-match
+    guard + the −19.9 decode succeeding empirically confirm the window fits.)
+  - RX detect/suffix offsets (`detect_ack_pattern` `reserve_after = ctrl_suffix_total_nsymb()`; the
+    suffix energy extraction at `base_total + r·N`): all derive from the accessors above → consistent
+    with the TX abs-hop. ✓
+- **Invariant consumers assume — "the suffix occupies exactly `ctrl_suffix_total_nsymb()` symbols after
+  the base, R_suffix identical codewords, de-hopped to the same data tone":** maintained by the
+  continued-abs TX hop + the matching RX de-hop offset. R_suffix=1 → `ctrl_suffix_total_nsymb()=
+  ctrl_suffix_len()` → byte-identical to §20. ✓
+
+**Shared state #3 — `is_ultra_config` consumers.** Producers of the predicate's INPUT
+(`current_configuration` / `configuration`): `load_configuration` (telecom + arq). Consumers of
+`is_ultra_config`: (a) `load_configuration` validity guard + the MFSK M/nStreams branch
+(`telecom_system.cc`); (b) the decode-admission gate (shared state #1); (c) the arq enable hook
+(`arq_common.cc`); (d) `ultra_tier_suffix_params` (the param table); (e) the test. All READ-ONLY of an
+existing config value — no new writer, no new state-machine state. The gearshift ladder
+(`FULL_CONFIG_LADDER`) is UNCHANGED (ULTRA not added to it this increment — pin-only, so the cascade
+cannot reach 200-202 yet → no down-cascade thrash risk this increment; the sticky-entry policy is the
+later gearshift increment). ✓
+
+**§5 verdict:** count-admission is provably ULTRA-tier-LOCAL (no leak — the sole ULTRA-config producer is
+the -s pin); the suffix-combining buffers are floored for the deepest ULTRA_2 config with margin; the
+ratio gate + FAR backstop are intact at every OFDM/ROBUST config (byte-identical decode admission).
+
+### §23.4 SIM RESULT — the gates PASS (2026-06-01)
+
+Build FOREGROUND `bash build.sh o3` (EXIT 0). `mercury --test` → **52 passed, 0 failed** (was 50
+baseline + the 2 new ULTRA tests). New regression tests `test_ultra_tier_establishment_cliff_sweep`
+(gates a + c) and `test_ultra_count_admission_tier_gated_no_leak` (gate b), registered in
+`run_mfsk_ctrl_codec_tests`. Both drive the PRODUCTION `decode_ctrl_suffix_from_passband` on a session
+loaded to the ULTRA config (count-admission via the real tier gate), AWGN, SNR3k axis bit-identical to
+§17/§19/§20 (`snr3k_db`). The ULTRA-build production path REPRODUCES the §22 spike numbers exactly.
+
+- **GATE (a) — production ULTRA reaches ~−20: PASS.**
+
+  | config | R_base | R_suffix | K | repfact | N | content cliff (P=0.5) | establishment cliff (P_est) |
+  |---|---|---|---|---|---|---|---|
+  | ULTRA_0 (200) | 8 | 8 | 8 | 6 | 56 | **−17.82** | **−19.91** (R_frame=2, P_est 0.61@−19.91) |
+  | ULTRA_2 (202) | 8 | 12 | 5 | 8 | 45 | **−19.91** | **−19.91** (R_frame=4, P_est 0.97@−19.91) |
+
+  ULTRA_2 establishment **−19.91 dB SNR3k ≈ the −20 goal**, == the §22.4 spike's −19.91 (the production
+  tier-gated path reproduces the spike's GLOBAL-flag result). ULTRA_0 content **−17.82** == §22.4. Below
+  −21.6 the base-pattern matched-count itself drops (P_baseMatched 0.67→0.33→0.21 at −19.91/−21.6/−23.4
+  for ULTRA_2) — the §22.4 acquisition co-limit at R_base=8; −24 needs deeper R_base (next increment).
+- **GATE (b) — NON-ULTRA byte-identical / ratio gate INTACT (no leak): PASS.** Decoding the IDENTICAL
+  deep ULTRA_2 wire (same bytes, same noise seed) through two RX tiers: **ULTRA_2-RX decode fraction
+  0.483** (count-admission active via the tier gate) vs **ROBUST_0-RX 0.000** (the scale-invariant ratio
+  gate intact → gates the whole deep band off). ΔP = 0.483 ≫ the 0.15 gate. **Count-admission is
+  provably ULTRA-tier-ONLY; the spike's global-flag design would have made these EQUAL (fail-before).**
+  Corroborated by the full suite being **byte-identical 50/50 unchanged** (no decode-admission divergence
+  on any non-ULTRA test). Production gap #2 closed.
+- **GATE (c) — FAR on the ULTRA count-admission path: PASS.** **0/300** false CONNECT accepts on the
+  ULTRA_2 deep band (sigma 64×rms, count-admission, NO ratio gate) — the count gate (7/16) + CRC12 +
+  2-bit type backstop holds. (§22.5 is the authoritative deep-FAR: 0/4000; the in-suite check is 0/N at
+  the production tier path. FAR is monotone in trials → 0 at any N.)
+
+**⇒ ALL THREE GATES PASS.** Production ULTRA (sim) reaches −19.91 (≈ −20, ULTRA_2) / −17.82 content
+(ULTRA_0); non-ULTRA is byte-identical with the ratio gate intact (no count-admission leak); FAR-clean
+on the ULTRA path. The −19.91 production cliff == the §22 spike — the productionization (tier-gating +
+the dropped esno knob) preserved the reach.
+
+### §23.5 What this increment is NOT (later increments)
+- Protocol: stop-and-wait / timeouts / framing / per-unit ARQ (§4.2-4.4) — the ULTRA tier here is the
+  PHY + the establishment ctrl-suffix path; the data-unit protocol is a later increment.
+- Gearshift down-cascade + STICKY ULTRA entry (§4.5 / INCR-5) — pin-only this increment.
+- HW validation on IONOS (§6 INCR-7) — preempts v13; the sim is AWGN (fading decorrelates the reps → the
+  frame-rep P_est is the optimistic bound, §22.6).
+- −24 (ULTRA_2 target) — §22.4: the per-frame content plateaus ~−17.82 and base-pattern acquisition
+  co-limits at R_base=8; −24 needs deeper R_base (16-32), a next-stage spike.

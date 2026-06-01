@@ -1536,18 +1536,48 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 				printf("[CFG] MERCURY_CONNECT_REPS override = %d (test)\n", reps_env_force); fflush(stdout); }
 			reps_env_cached = 1;
 		}
-		// Production trigger: enhanced CONNECT at the robust tier.
-		bool robust_tier = is_robust_config(configuration);
-		bool fec_on  = (fec_env_force >= 0) ? (fec_env_force == 1) : robust_tier;
-		int  reps    = (reps_env_force >= 0) ? reps_env_force
-		                                     : (robust_tier ? CONNECT_PREAMBLE_REPS_PROD : 1);
-		// Apply (idempotent; WB-only — NB has connect_pattern_nsymb=0 so the set_*
-		// hooks no-op the passband member). DISABLE at OFDM so the CONNECT suffix
-		// is byte-identical there. set_connect_preamble_reps must be called AFTER
-		// set_suffix_fec (both re-derive ctrl_suffix_pattern_passband_samples from
-		// the CURRENT coded-suffix length × base reps; reps last = correct member).
-		telecom_system->set_suffix_fec(fec_on, 3);
-		telecom_system->set_connect_preamble_reps(reps);
+		// ULTRA tier (tier2-suffix-fec-design.md §22): when the session is pinned to
+		// an ULTRA config (200-202; -s 200/201/202 this increment), apply the deep
+		// per-tier CONNECT ctrl-suffix params (low-rate GF(16) RA + fewer info
+		// symbols + base-combining + SUFFIX-energy combining) instead of the robust
+		// defaults. Count-based admission auto-activates at the decode gate (it reads
+		// is_ultra_config(current_configuration) — production gap #2, tier-gated, NOT
+		// a global, so OFDM/ROBUST keep the scale-invariant ratio gate intact). The
+		// ULTRA per-tier params are authoritative here (the MERCURY_SUFFIX_FEC /
+		// MERCURY_CONNECT_REPS env overrides apply only to the non-ULTRA robust branch
+		// below). Order matters: set_suffix_fec configures (repfact,K=13); configure_k
+		// re-sets the true (repfact,K); then the base/suffix rep hooks re-derive
+		// ctrl_suffix_pattern_passband_samples from the CURRENT coded N (R_base then
+		// R_suffix last = the correct final passband-sample member).
+		int u_repfact, u_K, u_Rbase, u_Rsuffix;
+		if (cl_telecom_system::ultra_tier_suffix_params(configuration,
+		                                                u_repfact, u_K, u_Rbase, u_Rsuffix))
+		{
+			telecom_system->set_suffix_fec(true, u_repfact);
+			gf16ra::configure_k(u_repfact, u_K);
+			gf16ra::init();
+			telecom_system->set_connect_preamble_reps(u_Rbase);
+			telecom_system->set_connect_suffix_reps(u_Rsuffix);
+		}
+		else
+		{
+			// Robust tier: the §19/§20 enhanced CONNECT (FEC R¼/K=13 + base-combining
+			// R=4, suffix combining off). OFDM: everything off → byte-identical.
+			bool robust_tier = is_robust_config(configuration);
+			bool fec_on  = (fec_env_force >= 0) ? (fec_env_force == 1) : robust_tier;
+			int  reps    = (reps_env_force >= 0) ? reps_env_force
+			                                     : (robust_tier ? CONNECT_PREAMBLE_REPS_PROD : 1);
+			// Apply (idempotent; WB-only — NB has connect_pattern_nsymb=0 so the set_*
+			// hooks no-op the passband member). set_connect_preamble_reps must be
+			// called AFTER set_suffix_fec (both re-derive
+			// ctrl_suffix_pattern_passband_samples from the CURRENT coded-suffix
+			// length × base reps; reps last = correct member). set_connect_suffix_reps
+			// forced to 1 (off) so a fall-back from ULTRA to robust/OFDM restores the
+			// single-codeword suffix (byte-identical at OFDM).
+			telecom_system->set_suffix_fec(fec_on, 3);
+			telecom_system->set_connect_preamble_reps(reps);
+			telecom_system->set_connect_suffix_reps(1);
+		}
 	}
 }
 

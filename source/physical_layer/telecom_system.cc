@@ -3479,9 +3479,43 @@ int cl_telecom_system::set_suffix_fec(bool on, int repfact)
 	// occupies connect_base_total_nsymb() (R×16 when combining) — use the accessor
 	// so both FEC and combining flow through the same member.
 	ctrl_suffix_pattern_passband_samples =
-		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_total_nsymb())
 		* data_container.Nofdm * frequency_interpolation_rate;
 	return ack_mfsk.ctrl_suffix_len();
+}
+
+// ULTRA reframe (Change 2): set the CONNECT suffix-combining factor R_suffix. Must
+// be called AFTER load_configuration (and after set_suffix_fec, since the suffix
+// length depends on whether FEC is on). R_suffix=1 = off (byte-identical to §20).
+// Re-derives the passband sample count so every TX consumer sees the
+// base + R_suffix×suffix length. CONNECT-only.
+int cl_telecom_system::set_connect_suffix_reps(int reps)
+{
+	if (reps < 1) reps = 1;
+	if (reps > cl_mfsk::MAX_CONNECT_SUFFIX_REPS)
+		reps = cl_mfsk::MAX_CONNECT_SUFFIX_REPS;
+	ack_mfsk.connect_suffix_reps = reps;
+	ctrl_suffix_pattern_passband_samples =
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_total_nsymb())
+		* data_container.Nofdm * frequency_interpolation_rate;
+	return ack_mfsk.ctrl_suffix_total_nsymb();
+}
+
+// ULTRA tier per-tier CONNECT ctrl-suffix params (the §22.4 stacked table). SOLE
+// owner of the ULTRA PHY numbers. Returns false for non-ULTRA configs (out params
+// untouched) so the robust/OFDM tiers can never inherit ULTRA's deep settings.
+bool cl_telecom_system::ultra_tier_suffix_params(int config, int& repfact, int& K,
+                                                 int& R_base, int& R_suffix)
+{
+	// §22.4 measured/interpolated stacked configs (per-frame content + base-combine
+	// co-limit): ULTRA_0 establishment ~−17.8, ULTRA_2 ~−19.9 dB SNR3k (sim, AWGN).
+	switch (config)
+	{
+		case ULTRA_0: repfact = 6; K = 8; R_base = 8; R_suffix = 8;  return true;
+		case ULTRA_1: repfact = 7; K = 6; R_base = 8; R_suffix = 10; return true; // interpolated
+		case ULTRA_2: repfact = 8; K = 5; R_base = 8; R_suffix = 12; return true;
+		default: return false;
+	}
 }
 
 // §20 (INCREMENT 2): set the CONNECT base-pattern combining factor R. See
@@ -3495,7 +3529,7 @@ int cl_telecom_system::set_connect_preamble_reps(int reps)
 		reps = cl_mfsk::MAX_CONNECT_PREAMBLE_REPS;
 	ack_mfsk.connect_preamble_reps = reps;
 	ctrl_suffix_pattern_passband_samples =
-		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_total_nsymb())
 		* data_container.Nofdm * frequency_interpolation_rate;
 	return ack_mfsk.connect_base_total_nsymb();
 }
@@ -3521,7 +3555,8 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 	// ctrl_suffix_pattern_passband_samples is computed from the same base+suffix
 	// total (set_suffix_fec / set_connect_preamble_reps re-derive it), so the
 	// returned sample count stays consistent.
-	int nsymb = ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len();
+	// ULTRA reframe (Change 2): suffix on-wire length is R_suffix × coded N.
+	int nsymb = ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_total_nsymb();
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	ack_mfsk.generate_ctrl_suffix_pattern(data_container.ofdm_framed_data,
@@ -3549,6 +3584,50 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 	ofdm.peak_clip(out, ctrl_suffix_pattern_passband_samples, ofdm.data_papr_cut);
 
 	return ctrl_suffix_pattern_passband_samples;
+}
+
+// =============================================================================
+// ULTRA tier — count-based ctrl-suffix admission (tier2-suffix-fec-design.md §22).
+// =============================================================================
+// INCR-0 found two blockers below ~−14 dB SNR3k on the CONNECT establishment
+// path: (1) the scale-invariant `metric >= CTRL_DETECT_METRIC_MIN` ratio gate
+// (combining sums R copies but the RATIO is unchanged → it gates the decode off
+// at ~−14 regardless of FEC/combining strength), and (2) combining was on the
+// PREAMBLE/base only, not the suffix FEC content. The §22 reframe removes BOTH:
+// suffix-energy combining (cl_mfsk::connect_suffix_reps, always-on plumbing,
+// applied at the ULTRA tier) + COUNT-BASED ADMISSION (this gate).
+//
+// COUNT-BASED ADMISSION: the ctrl-suffix decode admits on the HARD matched-COUNT
+//   gate alone (matched >= connect_match_threshold), DROPPING the scale-invariant
+//   metric-ratio sub-gate. The count gate (7/16) is the combining-aware
+//   acquisition statistic (alive to −20 R=16 / −23 R=32, §22.1); CRC12 (2⁻¹²) +
+//   2-bit type are the FAR backstop (§22.5: count-admission FAR 0/4000 pure-noise
+//   even at the deepest ULTRA_2 R/rate). The §16 isolation already proved the
+//   gate fully OFF is FAR-safe on the CRC-backstopped FEC path.
+//
+// PRODUCTION GAP #2 — TIER-GATED, NEVER A GLOBAL: the spike used a process-global
+//   test flag, which would change merged acquisition + throughput behavior if it
+//   leaked to the OFDM (CONFIG_0..16) / ROBUST tiers. Count-admission is therefore
+//   active ONLY when the RX session is at an ULTRA config (is_ultra_config(
+//   current_configuration)). At OFDM/ROBUST the scale-invariant ratio gate stays
+//   FULLY INTACT (byte-identical decode admission, no throughput/no-regression
+//   impact). The decision is `ultra_count_admission_active()`:
+//     override == FOLLOW_TIER (default) → is_ultra_config(current_configuration);
+//     override == 0/1 → forced off/on (TEST-ONLY isolation A/B, e.g. the §22
+//                       per-change breakdown — production never sets it).
+// The esno-scale knob the spike carried is DROPPED: §22.3 measured esno ×1 / ×√R
+// / ×R all give the identical −16.07 cliff (the self-normalizing soft_decode
+// captures the combining gain from the energy-RATIO separation), so esno stays
+// 4.0 and the scale-invariance trap is avoided by construction.
+namespace {
+	enum { ULTRA_ADMIT_FOLLOW_TIER = -1 };
+	int g_ultra_count_admission_override = ULTRA_ADMIT_FOLLOW_TIER;  // TEST-only
+}
+// TEST-only override for the §22 per-change isolation arms. -1 = follow the tier
+// gate (production). 0/1 = force off/on. Production code never calls this.
+void cl_telecom_system_set_ultra_count_admission_override(int v)
+{
+	g_ultra_count_admission_override = (v < 0) ? ULTRA_ADMIT_FOLLOW_TIER : (v ? 1 : 0);
 }
 
 // RX: detect CONNECT base + decode the 52-bit ctrl-suffix.
@@ -3593,14 +3672,26 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
-		&best_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_len(),
+		&best_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_total_nsymb(),
 		/*out_match_mask=*/nullptr, /*always_fine=*/false,
 		/*combine_reps=*/ack_mfsk.connect_preamble_reps);
 
 	if (out_matched) *out_matched = matched;
 
+	// ULTRA tier (Change 1 — count-based admission, §22): the metric-ratio sub-gate
+	// is scale-invariant (combining can't lift it), so below ~−14 it gates the
+	// decode off even though the combining-aware matched-COUNT is still alive (to
+	// −20/−23). At the ULTRA tier ONLY (production gap #2: NEVER at OFDM/ROBUST —
+	// there the ratio gate stays fully intact, byte-identical admission) we admit on
+	// the HARD count gate alone and let CRC12 + 2-bit type be the FAR backstop
+	// (§22.5: 0/4000 false-accepts even at the deepest ULTRA_2 R/rate).
+	const bool count_admit =
+		(g_ultra_count_admission_override == ULTRA_ADMIT_FOLLOW_TIER)
+			? is_ultra_config(current_configuration)
+			: (g_ultra_count_admission_override == 1);
 	if (matched < ack_mfsk.connect_match_threshold ||
-	    metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
+	    (!count_admit && metric < cl_mfsk::CTRL_DETECT_METRIC_MIN) ||
+	    best_offset < 0)
 		return false;
 
 	// Control-frame mini-Moose v2 (data-preamble-port-research.md §24.2.c,
@@ -3636,11 +3727,12 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 			ack_mfsk.tone_hop_step, ack_mfsk.M,
 			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
-			&rebest_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_len(),
+			&rebest_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_total_nsymb(),
 			/*out_match_mask=*/nullptr, /*always_fine=*/false,
 			/*combine_reps=*/ack_mfsk.connect_preamble_reps);
 		if (rematched >= ack_mfsk.connect_match_threshold &&
-		    remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
+		    (count_admit || remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN) &&
+		    rebest_offset >= 0)
 		{
 			matched = rematched;
 			best_offset = rebest_offset;
@@ -3705,14 +3797,42 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		// §20: the suffix follows ALL R base reps. pattern_nsymb =
 		// connect_base_total_nsymb() (R×16) is BOTH the symbol offset to the suffix
 		// and the hop base — must match the TX abs_s in generate_ctrl_suffix_pattern.
-		ofdm.decode_suffix_energies(
-			data_container.baseband_data_interpolated, dec_size,
-			1,
-			best_offset, ack_mfsk.connect_base_total_nsymb(),
-			N,
-			ack_mfsk.tone_hop_step, ack_mfsk.M,
-			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
-			energies.data());
+		//
+		// ULTRA reframe (Change 2 — SUFFIX combining): the TX emits the N-symbol
+		// codeword connect_suffix_reps times back-to-back after the base. Rep r sits
+		// at symbol offset connect_base_total_nsymb() + r*N; its tone-hop used the
+		// continued abs index (base_total + r*N + s), which is EXACTLY the abs_s
+		// decode_suffix_energies computes when passed pattern_nsymb = base_total + r*N.
+		// So we extract rep r's N×M energy matrix and ADD it into `energies` — the
+		// de-hop lands every rep's symbol s on the same data-tone slot, so this is a
+		// per-tone noncoherent energy SUM across reps (square-law combining,
+		// +2.2-2.5 dB/doubling). reps=1 → exactly the §20 single-codeword extraction.
+		const int R_suffix = ack_mfsk.connect_suffix_reps >= 1 ? ack_mfsk.connect_suffix_reps : 1;
+		const int base_total = ack_mfsk.connect_base_total_nsymb();
+		if (R_suffix <= 1) {
+			ofdm.decode_suffix_energies(
+				data_container.baseband_data_interpolated, dec_size,
+				1,
+				best_offset, base_total,
+				N,
+				ack_mfsk.tone_hop_step, ack_mfsk.M,
+				ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+				energies.data());
+		} else {
+			std::vector<double> rep_e((size_t)N * ack_mfsk.M, 0.0);
+			for (int r = 0; r < R_suffix; r++) {
+				ofdm.decode_suffix_energies(
+					data_container.baseband_data_interpolated, dec_size,
+					1,
+					best_offset, base_total + r * N,
+					N,
+					ack_mfsk.tone_hop_step, ack_mfsk.M,
+					ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+					rep_e.data());
+				for (size_t i = 0; i < (size_t)N * ack_mfsk.M; i++)
+					energies[i] += rep_e[i];
+			}
+		}
 
 		// soft_decode requires a 2-bit expected type. The production caller
 		// (receive_mfsk_ctrl_suffix_phy_core) already routes by type AFTER this
@@ -3721,11 +3841,21 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		// internal CRC over [type|payload38] matches the decoded CRC, so each
 		// type attempt is CRC-backstopped (FAR per type ≈ 2^-12; ×4 types still
 		// ≈ 2^-10, far below the count-gate FAR). First CRC-valid type wins.
+		//
+		// ULTRA Change 2 (suffix combining): the COMBINED energy matrix (summed over
+		// R_suffix reps) has R_suffix× the per-rep Es/No, but soft_decode auto-
+		// estimates sigma from the matrix MEAN, which self-normalizes. §22.3 measured
+		// that esno ×1 / ×√R / ×R all give the IDENTICAL −16.07 cliff — the combining
+		// gain comes from the improved per-tone energy-RATIO separation (summed signal
+		// ∝R, noise std ∝√R → decision SNR ∝√R), which the self-normalizing decode
+		// already captures. So esno stays 4.0 (no rescale knob — dropped to avoid the
+		// scale-invariance trap the §22 spike noted).
+		const double esno_metric = 4.0;
 		uint64_t p38 = 0;
 		int iters = -1;
 		for (int t = 0; t < 4; t++) {
 			if (gf16ra::soft_decode(energies.data(),
-				/*maxiter=*/50, /*esno_metric=*/4.0,
+				/*maxiter=*/50, /*esno_metric=*/esno_metric,
 				(uint8_t)t, crc12_fn, crc12_ctx, &p38, &iters))
 			{
 				*out_type = (mfsk_ctrl_frame_type)t;
@@ -5006,7 +5136,8 @@ void cl_telecom_system::load_configuration(int configuration)
 		return;
 	}
 
-	if(configuration<0 || (configuration>=NUMBER_OF_CONFIGS && !is_robust_config(configuration)))
+	if(configuration<0 || (configuration>=NUMBER_OF_CONFIGS && !is_robust_config(configuration)
+	                        && !is_ultra_config(configuration)))
 	{
 		return;
 	}
@@ -5166,6 +5297,21 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
+	else if(is_ultra_config(configuration))
+	{
+		// ULTRA tier (ultra-tier-design.md §4.1 / tier2 §22): the deep-SNR survival
+		// tier reuses the ROBUST_0-class MFSK DATA PHY (single-stream, M=32 WB / M=8
+		// NB, LDPC 1/16 — the deepest robust data modcod). ULTRA's reach is NOT in
+		// the data modcod; it is in the CONNECT ctrl-suffix establishment, pushed
+		// deeper by the ULTRA enable hook (count-admission + low-rate GF(16) RA +
+		// suffix combining, applied via ultra_tier_suffix_params()). So the PHY load
+		// here is identical to ROBUST_0; the tier-distinguishing behavior is layered
+		// on at the ctrl-suffix path. M/nStreams set in the MFSK reinit block below.
+		_modulation=MOD_MFSK;
+		_ldpc_rate=1/16.0;
+		ofdm_preamble_configurator_Nsymb=4;
+		ofdm_channel_estimator=LEAST_SQUARE;
+	}
 
 	// Amplitude restoration disabled for all modes: full ZF equalization
 	// preserves |H| for MMSE erasure and CSI weighting on frequency-selective channels.
@@ -5229,7 +5375,10 @@ void cl_telecom_system::load_configuration(int configuration)
 	if(_modulation==MOD_MFSK && M==MOD_MFSK)
 	{
 		int new_mfsk_M, new_nStreams;
-		if(configuration == ROBUST_0) { new_mfsk_M = narrowband_enabled ? 8 : 32; new_nStreams = 1; }
+		// ULTRA configs reuse the ROBUST_0 single-stream MFSK data PHY (M=32 WB /
+		// M=8 NB) — see the is_ultra_config load block above.
+		if(configuration == ROBUST_0 || is_ultra_config(configuration))
+		                              { new_mfsk_M = narrowband_enabled ? 8 : 32; new_nStreams = 1; }
 		else { new_mfsk_M = narrowband_enabled ? 4 : 16; new_nStreams = 2; } // ROBUST_1, ROBUST_2
 		if(new_mfsk_M != mfsk.M || new_nStreams != mfsk.nStreams)
 		{
@@ -5860,8 +6009,10 @@ void cl_telecom_system::load_configuration(int configuration)
 	// (R×16 when combining, 16 when reps=1 → byte-identical). The session
 	// combining-enable hook (set_connect_preamble_reps) re-derives this member, as
 	// set_suffix_fec does for the coded suffix length.
+	// ULTRA reframe (Change 2): ctrl_suffix_total_nsymb() = R_suffix × coded N
+	// (= ctrl_suffix_len() when R_suffix=1 → byte-identical to §20).
 	ctrl_suffix_pattern_passband_samples =
-		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len()) * data_container.Nofdm * frequency_interpolation_rate;
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_total_nsymb()) * data_container.Nofdm * frequency_interpolation_rate;
 
 	// Per-mode detection threshold (all using ack_mfsk: M=16, nStreams=1):
 	// ROBUST_0 (-13 dB): low SNR, need conservative threshold
