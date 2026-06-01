@@ -5050,6 +5050,11 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 			telecom_system->data_container.nUnder_processing_events = 0;
 			return false;
 		}
+		// Live tell that Tier-1 soft decode is engaged (flips=0 => hard
+		// assignment was already CRC-valid; flips>0 => soft correction fired).
+		printf("[SUFFIX-FEC-%s] soft CONNECT decode OK matched=%d flips=%d\n",
+			tag, rx_matched, soft_flips);
+		fflush(stdout);
 	}
 	else
 	{
