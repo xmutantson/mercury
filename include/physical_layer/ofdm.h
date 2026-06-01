@@ -208,6 +208,19 @@ public:
 	// out_cand / out_cost are suffix_len*K arrays; cand[s*K+0] == the hard
 	// decode_suffix_tones result for symbol s. Zero added airtime.
 	void decode_suffix_candidates(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int pattern_offset, int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, int K, int* out_cand, double* out_cost);
+	// decode_suffix_energies: the RAW per-symbol, per-tone (de-hopped) noncoherent
+	// energy matrix E[s][m] for the suffix window — the soft information BEFORE the
+	// per-symbol normalization that decode_suffix_candidates applies. Emitting the
+	// raw |FFT|^2 energies lets a caller NONCOHERENTLY combine R repeated frames by
+	// square-law summation (E_sum[s][m] = sum_r E_r[s][m]) before the argmax /
+	// CRC-aided soft list decode. out_energy is suffix_len*mfsk_M, indexed by the
+	// DE-HOPPED data tone (so matrices from different reps align without re-hopping);
+	// symbols past the buffer end are set to -1.0 (erasure marker). The argmax of
+	// out_energy[s][.] equals the hard decode_suffix_tones result for symbol s, so
+	// R=1 is byte-identical to the baseline. (Repetition energy-combining is a
+	// SIM-only acquisition lever — connect-suffix-fec-research.md §8.6(b); not wired
+	// into any production decode path.)
+	void decode_suffix_energies(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int pattern_offset, int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M, int nStreams, const int* stream_offsets, double* out_energy);
 	int symbol_sync(std::complex <double>*, int size, int interpolation_rate, int location_to_return);
 	void rational_resampler(std::complex <double>* in, int in_size , std::complex <double>* out, int rate, int interpolation_decimation);
 	void baseband_to_passband(std::complex <double>* in, int in_size, double* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int interpolation_rate);

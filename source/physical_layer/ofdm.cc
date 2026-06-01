@@ -4041,8 +4041,12 @@ void cl_ofdm::decode_suffix_tones(std::complex<double>* baseband_interp, int buf
 		int data_tone = (best_tone - hop + mfsk_M * 256) % mfsk_M;
 		out_tones[s] = data_tone;
 
-		// Diagnostic: show top-3 tones and their energies
-		if(suffix_len > 0 && s < 3)
+		// Diagnostic: show top-3 tones and their energies.
+		// SILENCED on wt/repetition-sim: the per-symbol [SUFFIX-FFT] printf fires
+		// thousands of times in the §9/§10/§11 cliff sweeps, inflating the --test
+		// log to >300k lines and dominating runtime. Compile-time disabled here
+		// (this is a SIM-only worktree, never merged); restore for HW debugging.
+		if(false && suffix_len > 0 && s < 3)
 		{
 			double energies[32];
 			for(int t2 = 0; t2 < mfsk_M && t2 < 32; t2++)
@@ -4157,6 +4161,63 @@ void cl_ofdm::decode_suffix_candidates(std::complex<double>* baseband_interp,
 			int data_tone = (best_t - hop + mfsk_M * 256) % mfsk_M;
 			out_cand[s * K + k] = data_tone;
 			out_cost[s * K + k] = (best_energy - best_e) * inv;  // 0 for k=0
+		}
+	}
+}
+
+// Raw per-symbol, per-tone (de-hopped) noncoherent energy matrix for the suffix
+// window — the soft information BEFORE per-symbol normalization. Bin math is
+// IDENTICAL to decode_suffix_candidates / decode_suffix_tones (same stream sum,
+// same de-hop), so argmax_m out_energy[s*M+m] == the hard decode_suffix_tones
+// result for symbol s. Emitting raw |FFT|^2 lets callers square-law combine R
+// repeated frames: E_sum[s][m] = sum_r E_r[s][m]. Symbols past the buffer end
+// are flagged with out_energy[s*M+0]=-1.0 (erasure). SIM-only acquisition lever
+// (connect-suffix-fec-research.md §8.6(b)); not in any production decode path.
+void cl_ofdm::decode_suffix_energies(std::complex<double>* baseband_interp,
+	int buffer_size_interp, int interpolation_rate, int pattern_offset,
+	int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M,
+	int nStreams, const int* stream_offsets, double* out_energy)
+{
+	int Nofdm_local = Nfft + Ngi;
+	int sym_period_interp = Nofdm_local * interpolation_rate;
+	int half = Nc / 2;
+
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+
+	for (int s = 0; s < suffix_len; s++)
+	{
+		for (int t = 0; t < mfsk_M; t++) out_energy[s * mfsk_M + t] = 0.0;
+
+		int abs_s = pattern_nsymb + s;
+		int offset = pattern_offset + abs_s * sym_period_interp + Ngi * interpolation_rate;
+		if (offset + Nfft * interpolation_rate > buffer_size_interp) {
+			out_energy[s * mfsk_M + 0] = -1.0;  // erasure: symbol past buffer end
+			continue;
+		}
+
+		for (int i = 0; i < Nfft; i++)
+			decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+		fft(decimated_sym, fft_out, Nfft);
+
+		// De-hop offset for this symbol so the matrix is indexed by the DATA tone
+		// (matrices from different reps then align directly for energy summation).
+		int hop = (abs_s * tone_hop_step) % mfsk_M;
+		for (int t = 0; t < mfsk_M; t++)
+		{
+			double e_combined = 0;
+			for (int st = 0; st < nStreams; st++)
+			{
+				int sub = stream_offsets[st] + t;
+				int b = (sub < half) ? Nfft - half + sub
+				                     : start_shift + (sub - half);
+				double e = fft_out[b].real() * fft_out[b].real() +
+				           fft_out[b].imag() * fft_out[b].imag();
+				e_combined += e;
+			}
+			// t is the PHYSICAL tone; store under the de-hopped DATA tone.
+			int data_tone = (t - hop + mfsk_M * 256) % mfsk_M;
+			out_energy[s * mfsk_M + data_tone] = e_combined;
 		}
 	}
 }

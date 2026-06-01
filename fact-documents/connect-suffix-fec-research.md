@@ -348,6 +348,108 @@ FAR. SNR-vote path (I1) untouched (reads hard `out_tones`).
 3. **Do NOT raise flips above 1 by default** (FAR 3.4% at 2, 14% at 3). flips=2
    is available if a campaign accepts 3.4% FAR for the extra knee margin.
 
+## §9. NONCOHERENT REPETITION ENERGY-COMBINING — MEASURED (SIM, branch `wt/repetition-sim`)
+
+Golay (sibling doc §8 / tier2-suffix-fec-design.md §9) STALLED at −9.26 dB: a
+rate-½ block code cannot track the per-symbol argmax-error q once q>~0.12. The
+limiter is the OPERATING POINT, not the code. This section measures the lever the
+parity-audit named (§8.6(b); tier2-suffix-fec-design.md §9 lever 3): **send the
+control frame R times and noncoherently (square-law) sum the per-tone energy
+matrix E[s][m] across the R reps BEFORE the argmax / CRC-aided soft list decode.**
+
+**Branch/base:** `wt/repetition-sim` off `wt/connect-combined` @86a806c — the FREE
+STACK already assembled (metric-relax 2.0 @526e800 + Tier-1 soft list @690bec6/
+432bf97). `CTRL_DETECT_METRIC_MIN==2.0` confirmed active. All cliffs below are
+under the RELAXED 2.0 gate (the re-baseline the task asked for).
+
+**Implementation (SIM-ONLY, no wire change, R=1 byte-identical):**
+- `cl_ofdm::decode_suffix_energies` (`ofdm.cc`, new) — emits the RAW de-hopped
+  per-tone energy matrix E[s][m] (|FFT|², stream-summed) BEFORE the per-symbol
+  normalization `decode_suffix_candidates` applies. Bin math identical to the hard
+  path → argmax(E[s][·]) == `decode_suffix_tones`. Not wired into production.
+- Harness §11 (`mfsk_ctrl_codec_tests.cc`): build R independent-noise copies of the
+  CONNECT frame, per-rep detect (relaxed 2.0 gate) + control-frame mini-Moose,
+  `decode_suffix_energies`, **E_sum[s][m] = Σ_r E_r[s][m]**, then decode the combined
+  matrix with the PRODUCTION K=4 / max_flips=1 (`soft_list_decode_ctrl_suffix`,
+  same CRC12 + 2-bit type accept gate). `ctrl_rep_factor`≡R; R=1 reproduces the
+  single-frame Tier-1 path EXACTLY (test `rep_r1_byte_identical`, shared-buffer A/B).
+
+### §9.1 Re-baseline under the relaxed 2.0 gate (open [?] resolved)
+`suffix_fec_cliff_sweep` on this branch (same grid/seed/AWGN/detector as §6):
+
+| | base-detect (matched≥7/16) | uncoded HARD | Tier-1 SOFT@1 | Tier-1 SOFT@2 |
+|---|---|---|---|---|
+| CONNECT | −14.68 dB | −7.32 | **−8.66** | −9.82 |
+| ACK | −14.68 dB | −7.32 | **−8.66** | −9.81 |
+
+**The 2.0 gate did NOT move the Tier-1 content cliff (−8.66, unchanged from §6.3).**
+The metric relax helps ACQUISITION (the base-pattern detect gate), not the suffix
+*content* recovery, which at −8.66 dB is content-limited (q too high), not gated.
+
+### §9.2 THE MEASUREMENT — two cliffs (test `rep_cliff_sweep`, N=120/sigma)
+Reported separately because acquisition and content are SEPARABLE limiters:
+- **CONTENT** (oracle offset: acquire once on a clean frame, combine R noisy reps'
+  energies at that offset) = the PURE noncoherent suffix-energy combining gain.
+- **END-TO-END** (realistic: per-rep base-detect gated at 2.0, OR-of-R acquisition)
+  = the link-establishment floor a real R-repeat delivers.
+
+| R | CONTENT SOFT cliff | gain/doubling | END-TO-END SOFT | base-detect-any (acq) |
+|---|---|---|---|---|
+| 1 | −8.66 dB | — | −8.66 dB | −11.75 dB |
+| 2 | −10.84 dB | **+2.18 dB** | −10.84 dB | −11.75 dB |
+| 4 | **−13.34 dB** | **+2.50 dB** | **−11.75 dB** | −11.75 dB |
+| 8 | **−14.68 dB** | +1.34 dB | −11.75 dB | −11.75 dB |
+
+### §9.3 THE DECISIVE NUMBERS (the [?] the task posed)
+1. **Measured M=16 noncoherent combining gain ≈ +2.2 to +2.5 dB per doubling**
+   (R=2→R=4 the strongest at +2.50; R=8 tails to +1.34 as the content cliff hits the
+   −14.68 base floor). This is the LOW end of the assumed band — NOT the +4.7-5.4 dB
+   (R=4) the textbook extrapolation claimed, and below the +3 dB/2× rule of thumb.
+   Reason: Tier-1 soft-list ALREADY harvests the near-miss energy at R=1, so each
+   doubling buys the incremental noncoherent integration gain (~+2.3 dB, the classic
+   square-law-combining figure at this M and operating q), not the full diversity.
+2. **CONTENT reaches the floor**: R=4 → −13.34 dB (≈ −14, within 1.3 dB);
+   **R=8 → −14.68 dB = the base matched-count floor.** Suffix content recovery FULLY
+   tracks the base detector by R=8. **The suffix is NO LONGER the binding stage** —
+   this is the result Golay could not achieve (Golay maxed at −9.26).
+3. **BUT the realistic END-TO-END floor is CLAMPED at −11.75 dB for R≥4**, set by
+   the **per-rep base-pattern acquisition** (base-detect-any −11.75), NOT by content.
+   The base-detect-any floor barely moves with R because the single-rep base-detect
+   probability collapses steeply below −11.75 (R=4 P(any)=0.25 at −13.34) and the
+   metric≥2.0 sub-gate is the binder (the raw matched-count floor is −14.68; the
+   2.0-gated acquisition floor is −11.75 → the 2.0 gate still costs ~2.9 dB of
+   acquisition reach).
+4. **FAR at R=4, metric=2.0, pure noise (2× RMS, 4000 trials) = 0.00000**
+   (base-detect-any=0, CRC12+type accepts=0). The count gate (7/16) + CRC12 + 2-bit
+   type hold perfectly; combining R noise frames raises all tones uniformly → argmax
+   stays ~uniform → CRC12·type·(flip-1 ball) ≈ 0. `rep_pure_noise_far` test.
+
+### §9.4 Airtime
+R reps of the 29-symbol CONNECT frame (16 base + 13 suffix) = R × 0.706 s =
+**R × 8.9% of one 7.9 s ROBUST_0 data frame.** R=4 = 2.82 s, R=8 = 5.65 s. CONNECT
+fires ONCE PER SESSION → negligible vs a multi-minute session. The same lever is
+NOT put on the per-batch ACK (§3 asymmetric rule).
+
+### §9.5 VERDICT — repetition closes the CONTENT gap; ACQUISITION is the new limiter
+**Free stack + R=4 repetition does NOT reach a usable −14 dB end-to-end (it clamps
+at −11.75), but it MOVES THE BINDING LIMITER off the suffix content.** Headline:
+- Content combining works as predicted-low (~+2.3 dB/2×); R=8 content tracks the
+  −14.68 floor. The suffix-code question (Tier-1 vs Golay vs repetition) is now
+  CLOSED: repetition is the content lever that reaches the floor.
+- The remaining gap to −14 is entirely **base-pattern acquisition** (−11.75 at the
+  2.0 gate). To reach −14 end-to-end the next lever is **base-pattern / preamble
+  energy-combining** (apply the SAME square-law sum to the matched-count detector
+  across the R repeated preambles) and/or a further metric-gate relax bounded by
+  FAR — a SEPARATE change from suffix energy-combining, in the acquisition path
+  (`detect_ack_pattern` + the metric sub-gate), not the suffix decode.
+- If integrated, the suffix-side change is the cheap part (R=1 byte-identical,
+  gated, 0 FAR). The decision-relevant follow-up is whether to also combine the
+  preamble (closes the −11.75→−14.68 acquisition gap) before integration.
+
+Reproduce: `wt/repetition-sim` HEAD, `mercury.exe --test` → `rep_r1_byte_identical`,
+`rep_pure_noise_far`, `rep_cliff_sweep` (the [MEASURE] log carries the dB table).
+43/43 tests pass.
+
 ## §7. Status log
 - 2026-05-31: doc created; code mapped; design chosen (two-tier, Tier-1-first).
   Mechanism (`p^13` hard argmax) confirmed from `ofdm.cc:4015-4035`.
@@ -355,3 +457,14 @@ FAR. SNR-vote path (I1) untouched (reads hard `out_tones`).
   to prior cliff-agent axis (base floor −14.68 ≈ their −14.6; hard suffix ≈ their
   −8.6). Soft@flips=1: +1.34 dB cliff move, 0% throughput, 0.25% FAR. Gap to
   detection floor (~6 dB) needs Tier-2 parity (CONNECT-only). Ship verdict §6.6.
+- 2026-05-31: §9 NONCOHERENT REPETITION ENERGY-COMBINING measured (branch
+  `wt/repetition-sim` off `wt/connect-combined` @86a806c = the free stack, relaxed
+  2.0 gate). New `decode_suffix_energies` (raw E[s][m]) + §11 harness; R=1
+  byte-identical (test PASS), FAR R=4 = 0.00000, 43/43 tests pass. **Measured M=16
+  combining gain ≈ +2.2-2.5 dB/doubling (NOT the assumed +4.7-5.4).** CONTENT cliff:
+  R=4 −13.34, R=8 −14.68 (tracks the base floor → suffix content NO LONGER the
+  limiter; closes the Golay question). **END-TO-END clamps at −11.75 for R≥4 — the
+  binding limiter is now PER-REP BASE-PATTERN ACQUISITION (2.0-gated acq floor
+  −11.75 vs raw matched-count −14.68).** Verdict §9.5: free stack + R=4 does NOT
+  reach usable −14 e2e; next lever = base-pattern/preamble energy-combining (acq
+  path), separate from the suffix change. SIM-only, no production wire change.

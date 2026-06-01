@@ -3589,6 +3589,460 @@ static void test_suffix_fec_cliff_sweep() {
 }
 
 // =============================================================================
+// §11 NONCOHERENT REPETITION ENERGY-COMBINING (connect-suffix-fec-research.md
+//     §8.6(b); tier2-suffix-fec-design.md §9 lever 3) — SIM SPIKE, NO WIRE CHANGE
+// =============================================================================
+//
+// Golay (§8) STALLED at −9.26 dB: a rate-½ block code can't track the per-symbol
+// argmax-error q once q>~0.12 (≈−9.8 dB). The limiter is the OPERATING POINT, not
+// the code. Repetition attacks q directly: send the full control frame (CONNECT
+// base + 13-symbol uncoded suffix) R times and NONCOHERENTLY (square-law) sum the
+// per-tone energy matrix E[s][m] across the R reps BEFORE the argmax / CRC-aided
+// soft list decode. Each doubling of R doubles the noncoherent integration time;
+// the textbook M-FSK noncoherent combining gain is ~+3 dB/2× minus a small
+// combining loss — THIS HARNESS MEASURES THE ACTUAL gain at the operating q.
+//
+// Decode of the COMBINED matrix reuses the EXACT Tier-1 machinery: top-K tones by
+// combined energy + normalized energy-gap cost -> soft_list_decode_ctrl_suffix
+// (same CRC12 + 2-bit type accept gate, same max_flips FAR lever). R=1 is
+// byte-identical to the single-frame Tier-1 path (asserted, §11.1). Detection
+// runs under the RELAXED CTRL_DETECT_METRIC_MIN=2.0 (this branch's free stack),
+// so the floor measured here is the post-metric-relax floor the task asked for.
+//
+// AIRTIME: R reps of the 29-symbol control frame (16 base + 13 suffix). A single
+// ROBUST_0 *data* frame is ~7.9 s; one 29-symbol control frame = 29×24.33 ms =
+// 0.706 s, so R reps = R×0.706 s = R×8.9% of one ROBUST_0 data frame. CONNECT
+// fires once/session, so this airtime is paid once (negligible vs a multi-min
+// session); the same lever is NOT put on the per-batch ACK (§4 asymmetric rule).
+
+// Suffix field layout (mirrors pack_ctrl_suffix / arq_common): the 13 de-hopped
+// data tones encode [type:2|payload38:38|crc12:12] MSB-first, 4 bits/tone.
+static void rep_tones_from_field(mfsk_ctrl_frame_type type, uint64_t p38,
+                                 uint16_t crc12, int n, int bpt, int* out_tones) {
+	uint64_t field = ((uint64_t)(type & 0x3) << 50) | ((p38 & ((1ULL<<38)-1ULL)) << 12)
+	               | (uint64_t)(crc12 & 0xFFF);
+	for (int g = 0; g < n; g++) {
+		int shift = 52 - bpt * (g + 1); if (shift < 0) shift = 0;
+		out_tones[g] = (int)((field >> shift) & ((1 << bpt) - 1));
+	}
+}
+
+// Decode the COMBINED 13-symbol energy matrix E_sum[s*M+m] (de-hopped data-tone
+// indexed). HARD = per-symbol argmax -> field unpack -> CRC12+type gate. SOFT =
+// build top-K cand/cost (same convention as decode_suffix_candidates: cost =
+// (E_best-E_k)/(E_best+eps), 0 for argmax) -> soft_list_decode_ctrl_suffix.
+// Returns hard_ok / soft_ok for a known tx (type,p38). n_erasure = symbols whose
+// energy was unavailable in EVERY rep (E_sum still 0 / flagged).
+static void rep_decode_combined(const double* Esum, int n, int M,
+	cl_arq_controller& arq, mfsk_ctrl_frame_type expected_type, uint64_t tx_p38,
+	int Ktop, int max_flips, bool* hard_ok, bool* soft_ok)
+{
+	int bpt = 0; for (int m = M; m > 1; m >>= 1) bpt++;
+	*hard_ok = false; *soft_ok = false;
+
+	// --- HARD: argmax per symbol on the combined energies ---
+	int hard_tones[64];
+	for (int s = 0; s < n; s++) {
+		int best_t = 0; double best_e = -1.0;
+		for (int t = 0; t < M; t++) {
+			double e = Esum[s*M + t];
+			if (e > best_e) { best_e = e; best_t = t; }
+		}
+		hard_tones[s] = best_t;
+	}
+	// Reassemble [type:2|p38:38|crc12:12] from the hard tones (MSB-first).
+	{
+		uint64_t field = 0;
+		for (int g = 0; g < n; g++) field = (field << bpt) | (uint64_t)(hard_tones[g] & ((1<<bpt)-1));
+		// n*bpt may exceed 52 (13*4=52 exactly at M=16); keep low 52 bits.
+		field &= (1ULL << 52) - 1ULL;
+		mfsk_ctrl_frame_type rtype = (mfsk_ctrl_frame_type)((field >> 50) & 0x3);
+		uint64_t rp38 = (field >> 12) & ((1ULL<<38)-1ULL);
+		uint16_t rcrc = (uint16_t)(field & 0xFFF);
+		uint8_t hb[5]; pack_ctrl_typed40_msb(hb, (uint8_t)rtype, rp38);
+		if (rtype == expected_type && (arq.CRC12_calc((char*)hb,5)&0xFFF) == rcrc && rp38 == tx_p38)
+			*hard_ok = true;
+	}
+
+	// --- SOFT: top-K cand/cost from combined energies, then CRC-gated search ---
+	// K = production suffix_fec_K (4) so R=1 reproduces the production soft@1 path
+	// EXACTLY (byte-identical-when-off, §11.1). The energy COMBINING uses the full
+	// E[s][m] matrix; only the candidate-list extraction for the search is top-K,
+	// identical to decode_suffix_candidates.
+	int K = Ktop; if (K < 1) K = 1; if (K > M) K = M;
+	std::vector<int> cand((size_t)n * K);
+	std::vector<double> cost((size_t)n * K);
+	for (int s = 0; s < n; s++) {
+		double best_e = -1.0;
+		for (int t = 0; t < M; t++) if (Esum[s*M+t] > best_e) best_e = Esum[s*M+t];
+		double inv = 1.0 / (best_e + 1.0e-12);
+		bool taken[64] = {};
+		for (int k = 0; k < K; k++) {
+			int bt = -1; double be = -1.0;
+			for (int t = 0; t < M; t++) { if (taken[t]) continue; if (Esum[s*M+t] > be) { be = Esum[s*M+t]; bt = t; } }
+			if (bt < 0) { cand[s*K+k] = -1; cost[s*K+k] = 1.0e300; continue; }
+			taken[bt] = true;
+			cand[s*K+k] = bt;                       // already de-hopped data tone
+			cost[s*K+k] = (best_e - be) * inv;      // 0 for k=0
+		}
+	}
+	uint64_t sp = 0; int fl = -1;
+	bool ok = soft_list_decode_ctrl_suffix(cand.data(), cost.data(), n, K, bpt,
+		(uint8_t)expected_type, /*max_trials=*/4000, max_flips,
+		prod_crc12_cb, &arq, &sp, &fl);
+	if (ok && sp == tx_p38) *soft_ok = true;
+}
+
+// Per-rep base detect (RELAXED 2.0 gate) + control-frame mini-Moose v2, EXACTLY
+// as the production decode_ctrl_suffix_from_passband_soft. Leaves the (possibly
+// mini-Moose-corrected) baseband in dc.baseband_data_interpolated and returns the
+// best_offset (>=0) and whether the relaxed acquisition gate passed. Returns
+// best_offset<0 only if there is no correlation peak at all.
+static int rep_detect_one(cl_telecom_system& ts, double* audio, int audio_len,
+                          bool* acquired)
+{
+	cl_ofdm& ofdm = ts.ofdm; cl_mfsk& mf = ts.ack_mfsk; cl_data_container& dc = ts.data_container;
+	int M = mf.M, n = mf.ack_sack_suffix_len(), interp = dc.interpolation_rate;
+	int dec_size = audio_len / interp;
+	double eff = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(audio, audio_len, dc.baseband_data_interpolated,
+		ts.sampling_frequency, eff, ts.carrier_amplitude, interp, &ofdm.FIR_rx_data);
+	int matched = 0, best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(dc.baseband_data_interpolated, dec_size, 1,
+		mf.connect_pattern_nsymb, mf.connect_tones, 8, mf.tone_hop_step, M,
+		mf.nStreams, mf.stream_offsets, &matched, 0, nullptr, &best_offset,
+		/*reserve_after=*/n, nullptr);
+	*acquired = false;
+	if (best_offset < 0) return -1;
+	*acquired = (matched >= mf.connect_match_threshold && metric >= cl_mfsk::CTRL_DETECT_METRIC_MIN);
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		dc.baseband_data_interpolated, ts.bandwidth / (double)dc.Nc,
+		mf.connect_pattern_nsymb, best_offset, mf.connect_tones, 8,
+		mf.tone_hop_step, M, mf.nStreams, mf.stream_offsets);
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit) {
+		ofdm.passband_to_baseband_decimated(audio, audio_len, dc.baseband_data_interpolated,
+			ts.sampling_frequency, eff - ctrl_residual, ts.carrier_amplitude, interp, &ofdm.FIR_rx_data);
+		int rm = 0, rbo = -1;
+		double rmet = ofdm.detect_ack_pattern(dc.baseband_data_interpolated, dec_size, 1,
+			mf.connect_pattern_nsymb, mf.connect_tones, 8, mf.tone_hop_step, M,
+			mf.nStreams, mf.stream_offsets, &rm, 0, nullptr, &rbo, n, nullptr);
+		if (rm >= mf.connect_match_threshold && rmet >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rbo >= 0)
+			best_offset = rbo;
+	}
+	return best_offset;
+}
+
+// One trial. `audios` = R pre-built, already-noisy copies of the CONNECT frame
+// (same payload p38). Two modes:
+//   oracle_offset=false  REALISTIC: per-rep detect (relaxed 2.0 gate) + mini-Moose;
+//     base_any = OR over reps of the acquisition gate; decode attempted only if
+//     base_any (mirrors production: metric<gate => no decode). At R=1 this is
+//     byte-identical to decode_ctrl_suffix_from_passband[_soft] on the same audio.
+//   oracle_offset=true   CONTENT-ISOLATED: acquire the offset ONCE on a clean
+//     (noise-free) frame (reliable), reuse it for ALL reps' energy extraction. This
+//     removes per-rep acquisition luck so the cliff measures the PURE noncoherent
+//     suffix-energy combining gain (task #4) — what a real R-repeat with combined-
+//     preamble acquisition would deliver on the content.
+// Energies from every contributing rep are square-law (|FFT|^2) SUMMED before the
+// argmax / CRC-aided soft list decode of the combined matrix (production K=4).
+static void rep_trial_audios(cl_telecom_system& ts, cl_arq_controller& arq,
+	uint64_t p38, std::vector<std::vector<double>>& audios, bool oracle_offset,
+	int max_flips, bool* base_any, bool* hard_ok, bool* soft_ok)
+{
+	cl_ofdm& ofdm = ts.ofdm; cl_mfsk& mf = ts.ack_mfsk; cl_data_container& dc = ts.data_container;
+	int M = mf.M, n = mf.ack_sack_suffix_len(), interp = dc.interpolation_rate;
+	int R = (int)audios.size();
+	std::vector<double> Esum((size_t)n * M, 0.0);
+	*base_any = false;
+
+	// Oracle offset: detect once on a CLEAN frame (no noise) for reliable acquisition.
+	int oracle_off = -1;
+	if (oracle_offset) {
+		int act = 0;
+		std::vector<double> clean = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, act);
+		bool acq = false;
+		oracle_off = rep_detect_one(ts, clean.data(), (int)clean.size(), &acq);
+		if (oracle_off >= 0) *base_any = true;   // acquisition is guaranteed on clean
+	}
+
+	for (int r = 0; r < R; r++) {
+		double* audio = audios[r].data();
+		int alen = (int)audios[r].size();
+		int dec_size = alen / interp;
+		int best_offset;
+		if (oracle_offset) {
+			// Re-derive the noisy rep's baseband at the oracle offset (no re-detect).
+			double eff = ts.carrier_frequency + ts.last_coarse_freq_offset;
+			ofdm.passband_to_baseband_decimated(audio, alen, dc.baseband_data_interpolated,
+				ts.sampling_frequency, eff, ts.carrier_amplitude, interp, &ofdm.FIR_rx_data);
+			best_offset = oracle_off;
+		} else {
+			bool acq = false;
+			best_offset = rep_detect_one(ts, audio, alen, &acq);   // leaves baseband ready
+			if (best_offset < 0) continue;
+			if (acq) *base_any = true;
+		}
+		std::vector<double> Er((size_t)n * M, 0.0);
+		ofdm.decode_suffix_energies(dc.baseband_data_interpolated, dec_size, 1,
+			best_offset, mf.connect_pattern_nsymb, n, mf.tone_hop_step, M,
+			mf.nStreams, mf.stream_offsets, Er.data());
+		for (int s = 0; s < n; s++) {
+			if (Er[s*M + 0] < 0.0) continue;       // erasure: symbol past buffer in this rep
+			for (int t = 0; t < M; t++) Esum[s*M + t] += Er[s*M + t];
+		}
+	}
+
+	// Require acquisition before attempting decode — mirrors production.
+	if (!*base_any) { *hard_ok = false; *soft_ok = false; return; }
+	// Symbols unavailable in EVERY rep stay all-zero -> argmax picks tone 0; the CRC
+	// gate then rejects (graceful degrade, never a spurious accept).
+	// Decode the combined matrix with the PRODUCTION K (suffix_fec_K=4) so R=1
+	// reproduces today's soft@1 path exactly (§11.1 byte-identical-when-off).
+	rep_decode_combined(Esum.data(), n, M, arq, MFSK_CTRL_START_CONN, p38,
+		ts.suffix_fec_K, max_flips, hard_ok, soft_ok);
+}
+
+// Convenience: build R independent-noise copies of the CONNECT frame (payload p38,
+// per-sample AWGN sigma) and run rep_trial_audios. Draws all noise from `rng`.
+static void rep_trial(cl_telecom_system& ts, cl_arq_controller& arq,
+	uint64_t p38, int R, double sigma, std::mt19937& rng, bool oracle_offset,
+	int max_flips, bool* base_any, bool* hard_ok, bool* soft_ok)
+{
+	std::vector<std::vector<double>> audios((size_t)R);
+	std::normal_distribution<double> nd(0.0, sigma);
+	for (int r = 0; r < R; r++) {
+		int act = 0;
+		audios[r] = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, act);
+		for (size_t i = 0; i < audios[r].size(); i++) audios[r][i] += nd(rng);
+	}
+	rep_trial_audios(ts, arq, p38, audios, oracle_offset, max_flips, base_any, hard_ok, soft_ok);
+}
+
+// §11.1 — INVARIANT: R=1 repetition-combine == single-frame Tier-1 decode
+// (byte-identical when the lever is "off"). Same audio, same seed: the combined
+// matrix is one rep's raw energies, so the argmax (hard) and the top-K soft list
+// must match the production single-frame hard / soft@1 decode exactly.
+static void test_rep_r1_byte_identical() {
+	const char* name = "rep_r1_byte_identical";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	int n = ts.ack_mfsk.ack_sack_suffix_len();
+	if (n <= 0) { test_pass(name); return; }   // NB: no suffix, vacuously identical
+
+	// A moderate-noise level where decodes sometimes pass, sometimes fail — so the
+	// equality is exercised on both outcomes. The SAME noisy buffer is fed to the
+	// production decode AND the R=1 rep path (realistic mode) so there is no RNG
+	// ambiguity: any divergence is a genuine decode-logic difference.
+	std::mt19937 master(0x5EE1);
+	const double sigma = 3.0;
+	int checked = 0, mism = 0;
+	ts.suffix_fec_max_flips = 1;
+	std::normal_distribution<double> nd(0.0, sigma);
+	for (int it = 0; it < 80; it++) {
+		uint64_t p38 = (((uint64_t)master() << 6) ^ master()) & ((1ULL<<38)-1ULL);
+
+		// ONE noisy frame, shared by both paths.
+		int act = 0;
+		std::vector<double> audio = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, act);
+		for (size_t i = 0; i < audio.size(); i++) audio[i] += nd(master);
+
+		// --- production single-frame reference ---
+		mfsk_ctrl_frame_type t2; uint64_t hp=0; uint16_t hc=0; int hm=0;
+		bool ref_hard = ts.decode_ctrl_suffix_from_passband(audio.data(), (int)audio.size(), &t2, &hp, &hc, &hm);
+		uint8_t ref_hb[5]; pack_ctrl_typed40_msb(ref_hb, (uint8_t)t2, hp);
+		bool ref_hard_pass = ref_hard && t2==MFSK_CTRL_START_CONN && hp==p38 &&
+			((arq.CRC12_calc((char*)ref_hb,5)&0xFFF)==hc);
+		uint64_t sp=0; int fl=0;
+		bool ref_soft = ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(),
+			MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &sp, nullptr, &fl) && sp==p38;
+
+		// --- R=1 rep path on the EXACT SAME buffer (realistic mode) ---
+		std::vector<std::vector<double>> one(1); one[0] = audio;
+		bool base_any=false, rh=false, rs=false;
+		rep_trial_audios(ts, arq, p38, one, /*oracle_offset=*/false, /*max_flips=*/1, &base_any, &rh, &rs);
+
+		checked++;
+		if (rh != ref_hard_pass || rs != ref_soft) mism++;
+	}
+	if (mism != 0) {
+		char b[120]; snprintf(b,sizeof(b),"R=1 != single-frame on %d/%d trials (lever not byte-identical when off)", mism, checked);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// §11.2 — THE MEASUREMENT. Two cliffs at R=1,2,4,8 on the same SNR3k axis / seed /
+// AWGN / detector (relaxed 2.0 gate) as §9.6:
+//   CONTENT cliff (oracle_offset=true): pure noncoherent suffix-energy combining
+//     gain with acquisition removed as a limiter — the decisive task-#4 number.
+//   END-TO-END floor (oracle_offset=false): realistic, per-rep acquisition gated;
+//     base-detect-any is the OR-of-R acquisition floor that clamps the link.
+// Returns the SOFT cliff for each mode + the acquisition (base-any) floor.
+static void rep_cliff_one(int R, double p_sig, double fs,
+	double* out_content_soft_snr, double* out_e2e_soft_snr,
+	double* out_e2e_hard_snr, double* out_base_any_snr)
+{
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+
+	// Sweep deeper than §9.6 (the content cliff moves well below −10 at R>=4).
+	const double sigmas[] = {2.4, 2.8, 3.2, 3.6, 4.0, 4.8, 5.6, 6.6, 7.8, 9.2, 11.0, 13.0, 15.5};
+	const int NS = (int)(sizeof(sigmas)/sizeof(sigmas[0]));
+	const int N = 120;  // trials per sigma
+
+	double cont_s=0, e2e_soft_s=0, e2e_hard_s=0, base_s=0;
+	double cont_snr=999, e2e_soft_snr=999, e2e_hard_snr=999, base_snr=999;
+	printf("    [rep R=%d] (sigma:SNR3k | CONTENT: P_hard P_soft@1 | E2E(gated): P_baseAny P_hard P_soft@1)\n", R);
+	for (int si = 0; si < NS; si++) {
+		double sigma = sigmas[si];
+		int c_hard=0, c_soft=0, e_base=0, e_hard=0, e_soft=0;
+		// CONTENT (oracle offset) and E2E (gated) use INDEPENDENT rng streams so
+		// each is internally consistent; both seeded from the §9.6 seed family.
+		std::mt19937 rng_c(0xC1FF7E5 + R), rng_e(0xE2E0000 + R);
+		for (int it = 0; it < N; it++) {
+			uint64_t p38c = (((uint64_t)rng_c() << 6) ^ rng_c()) & ((1ULL<<38)-1ULL);
+			bool ba=false, h=false, s=false;
+			rep_trial(ts, arq, p38c, R, sigma, rng_c, /*oracle_offset=*/true, 1, &ba, &h, &s);
+			if (h) c_hard++; if (s) c_soft++;
+
+			uint64_t p38e = (((uint64_t)rng_e() << 6) ^ rng_e()) & ((1ULL<<38)-1ULL);
+			bool ba2=false, h2=false, s2=false;
+			rep_trial(ts, arq, p38e, R, sigma, rng_e, /*oracle_offset=*/false, 1, &ba2, &h2, &s2);
+			if (ba2) e_base++; if (h2) e_hard++; if (s2) e_soft++;
+		}
+		double pch=(double)c_hard/N, pcs=(double)c_soft/N;
+		double peb=(double)e_base/N, peh=(double)e_hard/N, pes=(double)e_soft/N;
+		double snr = snr3k_db(p_sig, sigma, fs);
+		printf("      %.3f : %7.2f | %.3f %.3f | %.3f %.3f %.3f\n", sigma, snr, pch, pcs, peb, peh, pes);
+		if (pcs >= 0.5 && sigma > cont_s)     { cont_s = sigma;     cont_snr = snr; }
+		if (pes >= 0.5 && sigma > e2e_soft_s) { e2e_soft_s = sigma; e2e_soft_snr = snr; }
+		if (peh >= 0.5 && sigma > e2e_hard_s) { e2e_hard_s = sigma; e2e_hard_snr = snr; }
+		if (peb >= 0.5 && sigma > base_s)     { base_s = sigma;     base_snr = snr; }
+	}
+	ts.suffix_fec_max_flips = 1;
+	*out_content_soft_snr = cont_snr;
+	*out_e2e_soft_snr = e2e_soft_snr;
+	*out_e2e_hard_snr = e2e_hard_snr;
+	*out_base_any_snr = base_snr;
+	printf("    [rep R=%d] CONTENT SOFT cliff: %.2f dB | E2E SOFT: %.2f dB | E2E HARD: %.2f dB | base-detect-any: %.2f dB\n",
+		R, cont_snr, e2e_soft_snr, e2e_hard_snr, base_snr);
+}
+
+static void test_rep_cliff_sweep() {
+	const char* name = "rep_cliff_sweep";
+	printf("  [MEASURE] noncoherent repetition energy-combining (CONNECT, relaxed 2.0 gate):\n");
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	if (ts.ack_mfsk.ack_sack_suffix_len() <= 0) { printf("    suffix_len=0, skip\n"); test_pass(name); return; }
+	double fs = ts.sampling_frequency;
+	int active = 0;
+	std::vector<double> ref = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, 0x0, active);
+	double p_sig = suffix_pb_power(ref, active);
+
+	const int Rs[] = {1, 2, 4, 8};
+	double cont[4], e2e_soft[4], e2e_hard[4], base[4];
+	const double FLOOR = -14.68, USABLE_TARGET = -14.0;
+	for (int i = 0; i < 4; i++)
+		rep_cliff_one(Rs[i], p_sig, fs, &cont[i], &e2e_soft[i], &e2e_hard[i], &base[i]);
+
+	printf("    [rep SUMMARY] base-pattern matched-count floor (R=1 ref) = %.2f dB ; -14 dB target\n", FLOOR);
+	printf("    [rep SUMMARY] CONTENT SOFT cliff (acquisition removed = pure energy-combining gain):\n");
+	for (int i = 0; i < 4; i++) {
+		double g1 = (cont[i] < 900 && cont[0] < 900) ? (cont[0] - cont[i]) : 0.0;
+		double pd = (i>0 && cont[i] < 900 && cont[i-1] < 900) ? (cont[i-1] - cont[i]) : 0.0;
+		printf("      R=%d : %.2f dB | gain vs R=1 = %+.2f dB | %+.2f dB/doubling\n", Rs[i], cont[i], g1, pd);
+	}
+	printf("    [rep SUMMARY] END-TO-END SOFT floor (realistic, per-rep acquisition gated) + base-any:\n");
+	for (int i = 0; i < 4; i++)
+		printf("      R=%d : E2E %.2f dB | base-detect-any %.2f dB (acquisition is the binding limiter)\n",
+			Rs[i], e2e_soft[i], base[i]);
+
+	bool c4 = (cont[2] < 900) && (cont[2] <= USABLE_TARGET + 0.6);
+	bool e4 = (e2e_soft[2] < 900) && (e2e_soft[2] <= USABLE_TARGET + 0.6);
+	printf("    [rep VERDICT] R=4 CONTENT cliff %.2f dB reaches ~-14 (<=-13.4)? %s | R=4 END-TO-END %.2f dB reaches ~-14? %s\n",
+		cont[2], c4?"YES":"NO", e2e_soft[2], e4?"YES":"NO");
+	printf("    [rep VERDICT] R=8 CONTENT %.2f dB | END-TO-END %.2f dB | base-any(R=8) %.2f dB\n",
+		cont[3], e2e_soft[3], base[3]);
+	printf("    [rep AIRTIME] R reps of the 29-sym CONNECT frame = R x 0.706 s = R x 8.9%% of one 7.9 s ROBUST_0 data frame (CONNECT: once/session).\n");
+	printf("    [rep NOTE] If CONTENT << END-TO-END, the binding limiter is PER-REP ACQUISITION (base-pattern detect), not suffix content recovery — the lever to close that gap is preamble/base-pattern combining, separate from suffix energy-combining.\n");
+	test_pass(name);  // infra ran; dB verdict is in the log
+}
+
+// §11.3 — FAR at R=4, relaxed 2.0 gate, PURE NOISE. The CRC12 + 2-bit type gate
+// (max_flips=1) must hold the spurious-accept rate ~0. Combining R noise frames
+// raises every tone's energy uniformly, so the argmax is still ~uniform-random
+// over tones -> CRC12 (2^-12) x type (1/4) per decode, x the small flip-1 ball.
+// We feed R independent pure-noise frames through the SAME detect+combine+decode
+// pipeline as the cliff sweep and count CRC-passing accepts.
+static void test_rep_pure_noise_far() {
+	const char* name = "rep_pure_noise_far";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	cl_ofdm& ofdm = ts.ofdm; cl_mfsk& mf = ts.ack_mfsk; cl_data_container& dc = ts.data_container;
+	int n = mf.ack_sack_suffix_len(), M = mf.M;
+	if (n <= 0) { test_pass(name); return; }
+	int interp = dc.interpolation_rate;
+
+	int active = 0;
+	std::vector<double> ref = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, 0x0, active);
+	double rms = std::sqrt(suffix_pb_power(ref, active));
+	int frame_len = active + 8192;
+
+	const int R = 4, trials = 4000;
+	std::mt19937 rng(0x5EED4FA8);
+	std::normal_distribution<double> nd(0.0, 2.0 * rms);  // 2x clean RMS, as §6 FAR
+	int base_any_cnt = 0, accepts = 0;
+	for (int it = 0; it < trials; it++) {
+		std::vector<double> Esum((size_t)n * M, 0.0);
+		bool base_any = false;
+		for (int r = 0; r < R; r++) {
+			std::vector<double> audio((size_t)frame_len, 0.0);
+			for (int i = 0; i < frame_len; i++) audio[i] = nd(rng);
+			int dec_size = (int)audio.size() / interp;
+			double eff = ts.carrier_frequency + ts.last_coarse_freq_offset;
+			ofdm.passband_to_baseband_decimated(audio.data(), (int)audio.size(),
+				dc.baseband_data_interpolated, ts.sampling_frequency, eff,
+				ts.carrier_amplitude, interp, &ofdm.FIR_rx_data);
+			int matched=0, best_offset=-1;
+			double metric = ofdm.detect_ack_pattern(dc.baseband_data_interpolated, dec_size, 1,
+				mf.connect_pattern_nsymb, mf.connect_tones, 8, mf.tone_hop_step, M,
+				mf.nStreams, mf.stream_offsets, &matched, 0, nullptr, &best_offset, n, nullptr);
+			if (matched < mf.connect_match_threshold ||
+			    metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0) continue;
+			base_any = true;
+			std::vector<double> Er((size_t)n * M, 0.0);
+			ofdm.decode_suffix_energies(dc.baseband_data_interpolated, dec_size, 1,
+				best_offset, mf.connect_pattern_nsymb, n, mf.tone_hop_step, M,
+				mf.nStreams, mf.stream_offsets, Er.data());
+			for (int s = 0; s < n; s++) { if (Er[s*M]<0.0) continue; for (int t=0;t<M;t++) Esum[s*M+t]+=Er[s*M+t]; }
+		}
+		if (base_any) base_any_cnt++;
+		// Decode against a FIXED expected payload is meaningless for FAR; instead
+		// count ANY CRC12+type-passing soft decode (the production accept gate).
+		bool hard_ok=false, soft_ok=false;
+		// rep_decode_combined checks rp38==tx; for FAR we want "any CRC pass", so
+		// run the soft search directly and accept if it returns true (CRC+type ok).
+		int bpt = 0; for (int m = M; m > 1; m >>= 1) bpt++;
+		std::vector<int> cand((size_t)n * M); std::vector<double> cost((size_t)n * M);
+		for (int s = 0; s < n; s++) {
+			double best_e=-1.0; for (int t=0;t<M;t++) if (Esum[s*M+t]>best_e) best_e=Esum[s*M+t];
+			double inv = 1.0/(best_e+1e-12); bool taken[64]={};
+			for (int k=0;k<M;k++){int bt=-1;double be=-1.0;for(int t=0;t<M;t++){if(taken[t])continue;if(Esum[s*M+t]>be){be=Esum[s*M+t];bt=t;}}
+				if(bt<0){cand[s*M+k]=-1;cost[s*M+k]=1e300;continue;} taken[bt]=true; cand[s*M+k]=bt; cost[s*M+k]=(best_e-be)*inv; }
+		}
+		uint64_t sp=0; int fl=-1;
+		if (soft_list_decode_ctrl_suffix(cand.data(), cost.data(), n, M, bpt,
+			(uint8_t)MFSK_CTRL_START_CONN, 4000, /*max_flips=*/1, prod_crc12_cb, &arq, &sp, &fl))
+			accepts++;
+		(void)hard_ok; (void)soft_ok;
+	}
+	double far_rate = (double)accepts / trials;
+	printf("    [rep-FAR] R=%d, metric>=2.0, pure noise (2x RMS), %d trials: base-detect-any=%d, CRC12+type accepts=%d -> FAR=%.5f\n",
+		R, trials, base_any_cnt, accepts, far_rate);
+	if (far_rate > 0.01) { char b[120]; snprintf(b,sizeof(b),"R=4 FAR %.5f > 0.01 (CRC12+type gate not bounding combined-noise accepts)", far_rate); test_fail(name, b); return; }
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
 
@@ -3666,6 +4120,12 @@ int run_mfsk_ctrl_codec_tests() {
 	test_suffix_soft_pure_noise_far();
 	test_suffix_soft_nb_unsupported();
 	test_suffix_fec_cliff_sweep();   // [MEASURE] prints the acquisition-gain dB
+
+	// §11 Noncoherent repetition energy-combining (connect-suffix-fec-research.md
+	// §8.6(b); tier2-suffix-fec-design.md §9 lever 3). SIM SPIKE, no wire change.
+	test_rep_r1_byte_identical();    // R=1 == single-frame Tier-1 (byte-identical when off)
+	test_rep_pure_noise_far();       // [MEASURE] FAR at R=4, relaxed 2.0 gate
+	test_rep_cliff_sweep();          // [MEASURE] content cliff + combining gain at R=1,2,4,8
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
