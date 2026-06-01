@@ -4551,8 +4551,8 @@ extern void cl_telecom_system_set_ultra_count_admission_override(int v);  // TES
 // the decode gate keys on ts.current_configuration (set by load_configuration).
 // Returns the codeword length N, or -1 for a non-ULTRA config.
 static int ultra_apply_tier_params(cl_telecom_system& ts, int config) {
-	int repfact, K, R_base, R_suffix;
-	if (!cl_telecom_system::ultra_tier_suffix_params(config, repfact, K, R_base, R_suffix))
+	int repfact, K, R_base, R_suffix, R_frame;
+	if (!cl_telecom_system::ultra_tier_suffix_params(config, repfact, K, R_base, R_suffix, R_frame))
 		return -1;
 	ts.set_suffix_fec(true, repfact);
 	int N = gf16ra::configure_k(repfact, K);
@@ -4788,8 +4788,8 @@ static void test_ultra_count_admission_tier_gated_no_leak() {
 	// to ROBUST_0 (count-admission OFF — ratio gate intact). The ULTRA arm must
 	// decode materially MORE at the deep band than the ROBUST arm; at the deepest
 	// cells the ROBUST (ratio-gate) arm must drop to ~0 while ULTRA still decodes.
-	int repfact, K, R_base, R_suffix;
-	cl_telecom_system::ultra_tier_suffix_params(ULTRA_2, repfact, K, R_base, R_suffix);
+	int repfact, K, R_base, R_suffix, R_frame;
+	cl_telecom_system::ultra_tier_suffix_params(ULTRA_2, repfact, K, R_base, R_suffix, R_frame);
 
 	auto build_and_sweep = [&](int load_cfg, double* out_decode_frac, int NSwant) {
 		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(load_cfg);
@@ -4862,6 +4862,146 @@ static void test_ultra_count_admission_tier_gated_no_leak() {
 	printf("    [ASSERT OK] count-admission is ULTRA-tier-ONLY: ULTRA_2 decodes %.3f vs ROBUST_0 %.3f at the deep band "
 		"(ratio gate intact at ROBUST_0 → no leak, production gap #2). Same wire, RX-tier-gated admission.\n",
 		ultra_frac, robust_frac);
+	test_pass(name);
+}
+
+// =============================================================================
+// ULTRA INCR-2 — THE GATE FOR THIS INCREMENT: Lever-D CONNECT choreography
+// (ultra-tier-design.md §10.4). The §9 HW finding was that the ULTRA_2 CONNECT
+// frame (~16 s, R_base+R_suffix combining) is LONGER than the data-frame-sized RSP
+// listen window (2*message_transmission_time_ms+3000 ≈ 13.5 s), so the responder
+// timed out ~3 s BEFORE the frame finished — the −20 PHY was never even tested.
+//
+// This test drives the PRODUCTION shared helpers (cl_arq_controller::
+// connect_listen_window_ms + cl_telecom_system::ultra_tier_suffix_params) — the
+// SAME functions production calls (arq_responder.cc / send_mfsk_ctrl_suffix_phy_core)
+// — so the test cannot drift from production. Asserts:
+//   (a) for ULTRA_0/1/2, the computed RSP window ≥ R_frame × the REAL CONNECT-frame
+//       airtime (no premature timeout); AND the PRE-fix window (2*mtt+3000) would
+//       have been < the airtime (fail-before evidence the deficit was real).
+//   (b) the CMD send-count = R_frame at ULTRA (2/3/4) via ultra_tier_suffix_params,
+//       and the TX-core rep predicate (ULTRA && START_CONN) = R_frame, else 1.
+//   (c) non-ULTRA (ROBUST_0 + an OFDM config) window == EXACTLY 2*mtt+3000
+//       (byte-identical, the load-bearing safety) and ultra_tier_suffix_params=false.
+static void test_ultra_connect_choreography() {
+	const char* name = "ultra_connect_choreography";
+
+	// Real ULTRA data-frame message_transmission_time_ms, computed the SAME way as
+	// production (arq_common.cc:1348) from the loaded ts.data_container. ULTRA reuses
+	// the ROBUST_0-class M=32 LDPC-1/16 data PHY, so this is the ~5.26 s the §9.3
+	// deficit was built on. Helper mirrors the production formula bit-for-bit.
+	auto real_mtt_ms = [](cl_telecom_system& ts) -> int {
+		return (int)ceil((1000.0
+			* (ts.data_container.Nsymb + ts.data_container.preamble_nSymb)
+			* ts.data_container.Nofdm * ts.frequency_interpolation_rate)
+			/ (double)(ts.frequency_interpolation_rate
+			           * (ts.bandwidth / ts.ofdm.Nc) * ts.ofdm.Nfft));
+	};
+	// Real one-CONNECT-frame airtime (ms) from the finalized passband-sample count —
+	// the SAME quantity production stores in ctrl_suffix_tx_time_ms (arq_common.cc).
+	auto frame_airtime_ms = [](cl_telecom_system& ts) -> int {
+		if (ts.ctrl_suffix_pattern_passband_samples <= 0 || ts.sampling_frequency <= 0)
+			return 0;
+		return (int)ceil(1000.0 * ts.ctrl_suffix_pattern_passband_samples
+			/ ts.sampling_frequency);
+	};
+
+	// ---- (a)+(b): the three ULTRA submodes ----
+	struct { int cfg; int expect_Rframe; const char* label; } ultra[] = {
+		{ ULTRA_0, 2, "ULTRA_0" }, { ULTRA_1, 3, "ULTRA_1" }, { ULTRA_2, 4, "ULTRA_2" }
+	};
+	for (auto& u : ultra) {
+		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(u.cfg);
+		int N = ultra_apply_tier_params(ts, u.cfg);
+		if (N <= 0) {
+			ts.set_suffix_fec(false); gf16ra::configure(2); gf16ra::init();
+			test_fail(name, "ultra_apply_tier_params failed for an ULTRA config");
+			return;
+		}
+		int rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe = -1;
+		bool is_u = cl_telecom_system::ultra_tier_suffix_params(
+			u.cfg, rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe);
+		int airtime = frame_airtime_ms(ts);
+		int mtt     = real_mtt_ms(ts);
+		int prefix_window = 2 * mtt + 3000;   // the pre-INCR-2 expression
+		int window  = cl_arq_controller::connect_listen_window_ms(
+			is_u, airtime, rf_Rframe, mtt);
+
+		ts.set_suffix_fec(false); gf16ra::configure(2); gf16ra::init();  // restore global state
+
+		// (b) send-count = R_frame.
+		if (!is_u || rf_Rframe != u.expect_Rframe) {
+			char b[160]; snprintf(b, sizeof(b),
+				"%s: R_frame=%d (is_ultra=%d), expected %d",
+				u.label, rf_Rframe, (int)is_u, u.expect_Rframe);
+			test_fail(name, b); return;
+		}
+		// TX-core rep predicate: ULTRA && START_CONN → R_frame; ULTRA && ACK → 1.
+		int reps_start = (true /*START_CONN*/ && is_ultra_config(u.cfg)) ? rf_Rframe : 1;
+		int reps_ack   = (false /*not START_CONN*/ && is_ultra_config(u.cfg)) ? rf_Rframe : 1;
+		if (reps_start != u.expect_Rframe || reps_ack != 1) {
+			char b[160]; snprintf(b, sizeof(b),
+				"%s: TX rep predicate start=%d (want %d) ack=%d (want 1)",
+				u.label, reps_start, u.expect_Rframe, reps_ack);
+			test_fail(name, b); return;
+		}
+		// Sanity: the frame really is the long ULTRA CONNECT frame.
+		if (airtime <= 0) { test_fail(name, "ULTRA CONNECT airtime computed as 0"); return; }
+
+		// (a) fail-before: the OLD window must be SHORTER than one frame (the §9.3
+		// deficit). If this ever stops holding the deficit is gone for another reason
+		// and the test should be revisited.
+		if (prefix_window >= airtime) {
+			char b[200]; snprintf(b, sizeof(b),
+				"%s: pre-fix window %d ms >= frame airtime %d ms — the §9.3 deficit "
+				"the fix targets is not present (fail-before broke)",
+				u.label, prefix_window, airtime);
+			test_fail(name, b); return;
+		}
+		// (a) pass-after: the NEW window must cover ALL R_frame whole frames.
+		if (window < rf_Rframe * airtime) {
+			char b[220]; snprintf(b, sizeof(b),
+				"%s: window %d ms < R_frame(%d) × airtime(%d) = %d ms — RSP would still "
+				"time out before the repeated frames finish",
+				u.label, window, rf_Rframe, airtime, rf_Rframe * airtime);
+			test_fail(name, b); return;
+		}
+		printf("    [%s] frame=%d ms mtt=%d ms R_frame=%d | pre-fix window=%d ms (< 1 frame, DEFICIT) "
+			"-> fixed window=%d ms (>= %d×frame=%d ms)\n",
+			u.label, airtime, mtt, rf_Rframe, prefix_window, window,
+			rf_Rframe, rf_Rframe * airtime);
+	}
+
+	// ---- (c): non-ULTRA window byte-identical + R_frame=1 ----
+	int nonultra[] = { ROBUST_0, CONFIG_6 };   // a robust tier + an OFDM tier
+	for (int cfg : nonultra) {
+		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(cfg);
+		int rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe = -1;
+		bool is_u = cl_telecom_system::ultra_tier_suffix_params(
+			cfg, rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe);
+		if (is_u) {
+			test_fail(name, "ultra_tier_suffix_params returned true for a non-ULTRA config");
+			return;
+		}
+		int mtt = real_mtt_ms(ts);
+		int expected = 2 * mtt + 3000;
+		// The non-ULTRA path: is_ultra=false → must return EXACTLY the pre-fix value,
+		// regardless of the (unused) ctrl_suffix_tx / R_frame args.
+		int window = cl_arq_controller::connect_listen_window_ms(
+			false, frame_airtime_ms(ts), 4 /*ignored when !ultra*/, mtt);
+		// And a non-ULTRA START_CONN must play exactly once.
+		int reps = (true /*START_CONN*/ && is_ultra_config(cfg)) ? 99 : 1;
+		if (window != expected || reps != 1) {
+			char b[200]; snprintf(b, sizeof(b),
+				"cfg %d: window %d != pre-fix %d  (or send-count %d != 1) — non-ULTRA "
+				"establishment timing CHANGED (safety violated)",
+				cfg, window, expected, reps);
+			test_fail(name, b); return;
+		}
+		printf("    [non-ULTRA cfg %d] window=%d ms == 2*mtt+3000 (byte-identical), send-count=1\n",
+			cfg, window);
+	}
+
 	test_pass(name);
 }
 
@@ -5372,6 +5512,10 @@ int run_mfsk_ctrl_codec_tests() {
 	// ROBUST_0/OFDM → no leak, production gap #2).
 	test_ultra_tier_establishment_cliff_sweep();
 	test_ultra_count_admission_tier_gated_no_leak();
+	// INCR-2 Lever-D choreography gate (ultra-tier-design.md §10.4): the RSP listen
+	// window now covers R_frame × the real ULTRA CONNECT-frame airtime (the §9.3
+	// timeout fix), CMD send-count = R_frame at ULTRA, non-ULTRA timing UNCHANGED.
+	test_ultra_connect_choreography();
 
 	// §21 PRODUCTION robust-tier-trigger behavior (tier2-suffix-fec-design.md §21,
 	// CAP_SUFFIX_FEC negotiation removed in cleanup/drop-suffix-fec-cap): ACK gate

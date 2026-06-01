@@ -199,9 +199,23 @@ void cl_arq_controller::process_messages_rx_data_control()
 
 			// Prepare for START_CONNECTION (generous timeout for commander turnaround)
 			// Monitor needs extra time: must wait for real responder's HAIL + commander processing
+			//
+			// ULTRA INCR-2 (Lever D, ultra-tier-design.md §10.2 Change A): at an ULTRA
+			// config the CONNECT ctrl-suffix frame is ~16 s (R_base + R_suffix combining)
+			// and the CMD emits it R_frame× — far longer than the data-frame-sized
+			// 2*message_transmission_time_ms+3000 window (~13.5 s), which timed out ~3 s
+			// BEFORE the frame finished on HW (§9.3). connect_listen_window_ms scales the
+			// window to R_frame whole CONNECT frames (ctrl_suffix_tx_time_ms each) + the
+			// turnaround margin. TIER-AWARE: non-ULTRA returns the byte-identical
+			// 2*mtt+3000 (passive_monitor path unchanged below). The shared helper is the
+			// SAME one the regression test asserts against (no test/production drift).
+			int u_rf_rep, u_rf_K, u_rf_Rb, u_rf_Rs, u_rf_Rframe = 1;
+			bool ultra_now = cl_telecom_system::ultra_tier_suffix_params(
+				current_configuration, u_rf_rep, u_rf_K, u_rf_Rb, u_rf_Rs, u_rf_Rframe);
 			int hail_timeout = passive_monitor
 				? 3 * message_transmission_time_ms + 10000
-				: 2 * message_transmission_time_ms + 3000;
+				: connect_listen_window_ms(ultra_now, ctrl_suffix_tx_time_ms,
+				                           u_rf_Rframe, message_transmission_time_ms);
 			set_receiving_timeout(hail_timeout);
 			receiving_timer.start();
 			connection_status = RECEIVING;

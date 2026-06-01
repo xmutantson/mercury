@@ -266,17 +266,20 @@ public:
 
 	// ULTRA tier (tier2-suffix-fec-design.md §22 / ultra-tier-design.md §4.1): the
 	// per-tier CONNECT ctrl-suffix establishment parameters. Returns the (repfact,
-	// K, R_base, R_suffix) for ULTRA_0/1/2 (the §22.4 stacked table). repfact = GF16
-	// RA replicas/info-symbol (lower rate); K = total GF16 info symbols incl 3 CRC
-	// (fewer info bits = deeper, lever C); R_base = base-pattern combining reps;
-	// R_suffix = suffix-energy combining reps (the §22 Change-2 content lever).
-	// These are applied by the ULTRA enable hook (arq_common.cc) when the session is
-	// at an ULTRA config. Returns true and fills the out params for an ULTRA config;
-	// returns false (leaves out params untouched) for any non-ULTRA config — the
-	// SOLE entry point that knows the ULTRA PHY numbers, so non-ULTRA tiers cannot
-	// accidentally inherit them.
+	// K, R_base, R_suffix, R_frame) for ULTRA_0/1/2 (the §22.4 stacked table).
+	// repfact = GF16 RA replicas/info-symbol (lower rate); K = total GF16 info
+	// symbols incl 3 CRC (fewer info bits = deeper, lever C); R_base = base-pattern
+	// combining reps; R_suffix = suffix-energy combining reps (the §22 Change-2
+	// content lever); R_frame = whole-CONNECT-frame repetition count (ultra-tier-
+	// design.md §2.5/§4.1 Lever D — the CMD emits START_CONN R_frame× back-to-back
+	// per HAIL cycle and the RSP listen window covers all reps; INCR-2 choreography
+	// fix). These are applied by the ULTRA enable hook (arq_common.cc) when the
+	// session is at an ULTRA config. Returns true and fills the out params for an
+	// ULTRA config; returns false (leaves out params untouched) for any non-ULTRA
+	// config — the SOLE entry point that knows the ULTRA PHY numbers, so non-ULTRA
+	// tiers cannot accidentally inherit them.
 	static bool ultra_tier_suffix_params(int config, int& repfact, int& K,
-	                                     int& R_base, int& R_suffix);
+	                                     int& R_base, int& R_suffix, int& R_frame);
 
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,

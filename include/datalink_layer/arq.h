@@ -516,6 +516,18 @@ public:
                                   uint8_t* out_own_cap,
                                   uint8_t* out_ssid);
 
+  // ULTRA INCR-2 (Lever D, ultra-tier-design.md §10.2 Change A): the SHARED,
+  // tier-aware RSP START_CONNECTION listen-window formula. Production
+  // (arq_responder.cc) AND the regression test both call this — so the test
+  // cannot drift from production (the §13.5 v1-bug-#1 lesson). For ULTRA the
+  // window covers R_frame whole CONNECT frames (ctrl_suffix_tx_ms each) PLUS the
+  // existing 2*mtt+3000 turnaround/PTT/margin term that non-ULTRA uses. For
+  // non-ULTRA (or when ctrl_suffix_tx_ms<=0, e.g. NB/OFDM) it returns EXACTLY the
+  // pre-fix 2*message_tx_ms+3000 — byte-identical, so OFDM/ROBUST establishment
+  // is unchanged (load-bearing safety: do not slow non-ULTRA establishment).
+  static int connect_listen_window_ms(bool is_ultra, int ctrl_suffix_tx_ms,
+                                       int R_frame, int message_tx_ms);
+
   // Phase B Wave 3 (§14) — TEST_CONNECTION (CMD→RSP) PHY swap.
   // Site E (TX): CMD encodes [snr_q:4 | local_cap:2 | ssid:8] via
   //   pack_test_conn_payload (snr_q computed from
@@ -1277,6 +1289,14 @@ public:
 
   int message_transmission_time_ms;
   int ctrl_transmission_time_ms;
+  // ULTRA INCR-2 (Lever D, ultra-tier-design.md §10): TX wall-clock duration (ms)
+  // of ONE MFSK CONNECT ctrl-suffix frame (base + R_suffix×coded-suffix), computed
+  // from telecom_system->ctrl_suffix_pattern_passband_samples / sampling_frequency
+  // in load_configuration (after the ULTRA enable hook finalizes the passband-sample
+  // count). At ULTRA configs this is the ~16 s ULTRA CONNECT airtime that the RSP
+  // listen window must outlast (§9.3). 0 when no MFSK CONNECT path (NB / OFDM where
+  // it's unused). Feeds ONLY connect_listen_window_ms(). NOT a data/ACK timer.
+  int ctrl_suffix_tx_time_ms;
   int ack_pattern_time_ms;  // Level 3: ACK pattern TX duration (ms)
   int data_batch_size;
   int nominal_batch_size;   // Max batch size for current config (12s target ceiling)

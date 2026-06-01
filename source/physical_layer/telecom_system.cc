@@ -3505,15 +3505,18 @@ int cl_telecom_system::set_connect_suffix_reps(int reps)
 // owner of the ULTRA PHY numbers. Returns false for non-ULTRA configs (out params
 // untouched) so the robust/OFDM tiers can never inherit ULTRA's deep settings.
 bool cl_telecom_system::ultra_tier_suffix_params(int config, int& repfact, int& K,
-                                                 int& R_base, int& R_suffix)
+                                                 int& R_base, int& R_suffix, int& R_frame)
 {
 	// §22.4 measured/interpolated stacked configs (per-frame content + base-combine
 	// co-limit): ULTRA_0 establishment ~−17.8, ULTRA_2 ~−19.9 dB SNR3k (sim, AWGN).
+	// R_frame = whole-CONNECT-frame repetition (Lever D, §2.5/§4.1): the CMD emits
+	// START_CONN R_frame× back-to-back per HAIL cycle; the RSP window covers all
+	// reps (INCR-2 choreography fix for the §9 HW timeout). ULTRA_0=2 / 1=3 / 2=4.
 	switch (config)
 	{
-		case ULTRA_0: repfact = 6; K = 8; R_base = 8; R_suffix = 8;  return true;
-		case ULTRA_1: repfact = 7; K = 6; R_base = 8; R_suffix = 10; return true; // interpolated
-		case ULTRA_2: repfact = 8; K = 5; R_base = 8; R_suffix = 12; return true;
+		case ULTRA_0: repfact = 6; K = 8; R_base = 8; R_suffix = 8;  R_frame = 2; return true;
+		case ULTRA_1: repfact = 7; K = 6; R_base = 8; R_suffix = 10; R_frame = 3; return true; // interpolated
+		case ULTRA_2: repfact = 8; K = 5; R_base = 8; R_suffix = 12; R_frame = 4; return true;
 		default: return false;
 	}
 }

@@ -261,6 +261,7 @@ cl_arq_controller::cl_arq_controller()
 	crypto_buf[1].clear();
 	message_transmission_time_ms=500;
 	ctrl_transmission_time_ms=500;
+	ctrl_suffix_tx_time_ms=0;  // ULTRA INCR-2: set in load_configuration; 0-safe until then
 	ack_pattern_time_ms=0;
 	role=RESPONDER;
 	original_role=RESPONDER;
@@ -1549,9 +1550,9 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		// re-sets the true (repfact,K); then the base/suffix rep hooks re-derive
 		// ctrl_suffix_pattern_passband_samples from the CURRENT coded N (R_base then
 		// R_suffix last = the correct final passband-sample member).
-		int u_repfact, u_K, u_Rbase, u_Rsuffix;
+		int u_repfact, u_K, u_Rbase, u_Rsuffix, u_Rframe;
 		if (cl_telecom_system::ultra_tier_suffix_params(configuration,
-		                                                u_repfact, u_K, u_Rbase, u_Rsuffix))
+		                                                u_repfact, u_K, u_Rbase, u_Rsuffix, u_Rframe))
 		{
 			telecom_system->set_suffix_fec(true, u_repfact);
 			gf16ra::configure_k(u_repfact, u_K);
@@ -1577,6 +1578,26 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 			telecom_system->set_suffix_fec(fec_on, 3);
 			telecom_system->set_connect_preamble_reps(reps);
 			telecom_system->set_connect_suffix_reps(1);
+		}
+
+		// ULTRA INCR-2 (Lever D, §10.2 Change A): derive the ONE-CONNECT-frame TX
+		// wall-clock time from the NOW-FINAL ctrl_suffix_pattern_passband_samples
+		// (the set_* hooks above re-derived it for the current base/suffix reps).
+		// Same form as the ack_pattern_time_ms computation at :1397. The RSP
+		// START_CONNECTION listen window scales with this (connect_listen_window_ms)
+		// so it outlasts the ~16 s ULTRA CONNECT frame (§9.3). 0 when no MFSK
+		// CONNECT path (NB / connect_pattern_nsymb<=0) → the window helper falls
+		// back to the non-ULTRA expression.
+		if(telecom_system->ctrl_suffix_pattern_passband_samples > 0
+		   && telecom_system->sampling_frequency > 0)
+		{
+			ctrl_suffix_tx_time_ms = (int)ceil(1000.0
+				* telecom_system->ctrl_suffix_pattern_passband_samples
+				/ telecom_system->sampling_frequency);
+		}
+		else
+		{
+			ctrl_suffix_tx_time_ms = 0;
 		}
 	}
 }
@@ -5024,10 +5045,37 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 		delete[] pilot_buffer;
 	}
 
-	tx_transfer(&filtered2[symbol_period], pattern_samples);
-
-	while(size_buffer(playback_buffer) > 0)
-		msleep(1);
+	// ULTRA INCR-2 (Lever D, ultra-tier-design.md §10.2 Change B): repeat the WHOLE
+	// CONNECT frame R_frame× back-to-back WITHIN this single PTT window (one key-up /
+	// key-down — PTT discipline + Bug #55 race handling unchanged). ONLY for the
+	// ULTRA-tier START_CONNECTION establish frame; every other ctrl frame
+	// (ACK / TEST_CONN / non-ULTRA START) plays exactly once → byte-identical. The
+	// RSP decodes from the buffer tail (the LAST complete rep); the reps give its
+	// single poll R_frame chances to overlap a whole frame, and the RSP listen
+	// window (connect_listen_window_ms) is sized to outlast all R_frame reps.
+	int n_frame_reps = 1;
+	if(type == MFSK_CTRL_START_CONN
+	   && is_ultra_config(self->current_configuration))
+	{
+		int u_rep, u_K, u_Rb, u_Rs, u_Rframe = 1;
+		if(cl_telecom_system::ultra_tier_suffix_params(self->current_configuration,
+		                                               u_rep, u_K, u_Rb, u_Rs, u_Rframe))
+			n_frame_reps = (u_Rframe >= 1) ? u_Rframe : 1;
+	}
+	for(int rep = 0; rep < n_frame_reps; rep++)
+	{
+		if(n_frame_reps > 1)
+		{
+			printf("[TX-MFSK-CTRL-%s] frame rep %d/%d (ULTRA Lever D)\n",
+				tag, rep + 1, n_frame_reps);
+			fflush(stdout);
+		}
+		tx_transfer(&filtered2[symbol_period], pattern_samples);
+		// Drain after each rep so the playback buffer doesn't accumulate; reps are
+		// contiguous on the wire (each carries the FIR-settled pattern_samples).
+		while(size_buffer(playback_buffer) > 0)
+			msleep(1);
+	}
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -5080,6 +5128,26 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 // from the existing messages_control build at arq_commander.cc:454 (base
 // callsign stripped of SSID), but the helper takes it as a parameter so
 // callers stay decoupled from messages_control.
+// ULTRA INCR-2 (Lever D, ultra-tier-design.md §10.2 Change A): the SHARED tier-aware
+// RSP START_CONNECTION listen-window formula. See arq.h for the contract. Production
+// (arq_responder.cc) and the regression test (mfsk_ctrl_codec_tests.cc) BOTH call
+// this so the test cannot drift from production.
+int cl_arq_controller::connect_listen_window_ms(bool is_ultra, int ctrl_suffix_tx_ms,
+                                                 int R_frame, int message_tx_ms)
+{
+	// The non-ULTRA window (the pre-INCR-2 expression — BYTE-IDENTICAL). Also the
+	// fallback when there is no MFSK CONNECT airtime to size against (NB / OFDM).
+	int base_window = 2 * message_tx_ms + 3000;
+	if (!is_ultra || ctrl_suffix_tx_ms <= 0)
+		return base_window;
+	if (R_frame < 1) R_frame = 1;
+	// ULTRA: the dominant term is R_frame whole CONNECT frames (~16 s each at
+	// ULTRA_2); base_window stays as the turnaround/PTT/margin (CMD must detect the
+	// RSP beacon + turn around before the first frame, §9.3). Additive → the window
+	// outlasts all R_frame reps with margin.
+	return R_frame * ctrl_suffix_tx_ms + base_window;
+}
+
 long long cl_arq_controller::send_mfsk_start_conn_phy(const std::string& sender_call)
 {
 	bool nb_flag = (narrowband_enabled == YES || commander_configured_nb == YES);
