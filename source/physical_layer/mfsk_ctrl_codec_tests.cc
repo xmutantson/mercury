@@ -4095,6 +4095,204 @@ static void test_hail_detection_cliff_sweep() {
 	test_pass(name);  // MEASURE infra ran; the dB/FAR verdict is in the log
 }
 
+// §17 — CONNECT ctrl-suffix detection cliff under the relaxed CTRL_DETECT_METRIC_MIN
+// (tier2-suffix-fec-design.md §16/§17, 2026-05-31). Drives the PRODUCTION
+// decode_ctrl_suffix_from_passband (which now bakes in CTRL_DETECT_METRIC_MIN=1.2)
+// across an SNR3k axis on a real START_CONN passband + AWGN, and in parallel
+// measures the raw detect_ack_pattern `metric` per cell so the gate-crossing is
+// visible. The §16 isolation sim proved the metric gate is the SOLE ctrl-suffix
+// masker (content P≈1.0 to −14 when relaxed); this test confirms on THIS branch
+// that (1) the 1.2 gate ADMITS CRC-valid decodes in the metric∈[1.2,3.0) band
+// the old 3.0 gate rejected (FAIL-BEFORE on the pre-change 3.0 binary: the
+// rescued-band assert below trips because production returns false there), and
+// (2) pure noise yields ZERO false CONNECT accepts (CRC12 + 2-bit type + count
+// gate backstop — the uncoded-path FAR question from §17.2).
+//
+// Channel: clean passband + AWGN (NO injected CFO — §16 exonerated the ctrl
+// mini-Moose, removing it = 0 dB; absolute cliff is therefore slightly
+// optimistic vs a CFO-impaired channel, but the RELATIVE 1.2-vs-3.0 admission
+// gap and the FAR verdict are CFO-independent, which is what this asserts).
+static void test_ctrl_suffix_metric_gate_cliff_sweep() {
+	const char* name = "ctrl_suffix_metric_gate_cliff_sweep";
+	printf("  [MEASURE] CONNECT ctrl-suffix detection floor under CTRL_DETECT_METRIC_MIN=%.2f:\n",
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN);
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);  // WB ROBUST-class brings ack_mfsk/connect up
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0 || ts.ctrl_suffix_pattern_passband_samples <= 0) {
+		test_fail(name, "CONNECT ctrl-suffix config not loaded (M<16?)"); return;
+	}
+	const int conn_thr = ts.ack_mfsk.connect_match_threshold;
+	const double fs = ts.sampling_frequency;
+	printf("    CONNECT config: M=%d conn_nsymb=%d conn_thr=%d nStreams=%d (ROBUST_0 WB); "
+		"old gate metric>=3.0, new gate metric>=%.2f; backstop=count %d/%d + CRC12 + 2-bit type\n",
+		ts.ack_mfsk.M, ts.ack_mfsk.connect_pattern_nsymb, conn_thr, ts.ack_mfsk.nStreams,
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, conn_thr, ts.ack_mfsk.connect_pattern_nsymb);
+
+	// Build a clean START_CONN passband ONCE (KE7TST). Production codec packers.
+	uint64_t p38 = 0;
+	pack_start_conn_payload(&p38, /*nb_flag=*/false, "KE7TST", 6);
+	uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+	uint8_t bytes[5];
+	for (int b = 0; b < 5; b++) bytes[b] = (uint8_t)((typed40 >> (8 * (4 - b))) & 0xFF);
+	uint16_t crc12 = test_crc12_calc(bytes, 5);
+
+	const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead = 4096;          // leading silence so the detector has headroom
+	const int total_pb = n_sig + 2 * lead;
+	std::vector<double> clean((size_t)total_pb, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(
+		clean.data() + lead, MFSK_CTRL_START_CONN, p38, crc12);
+	if (written != n_sig) { test_fail(name, "generate_ctrl_suffix_pattern_passband size mismatch"); return; }
+
+	// Signal power over the actual pattern span (for SNR3k anchor) + RMS for the
+	// relative noise axis.
+	double psum = 0.0;
+	for (int i = 0; i < n_sig; i++) { double v = clean[(size_t)(lead + i)]; psum += v * v; }
+	const double p_sig = psum / n_sig;
+	const double sig_rms = std::sqrt(p_sig);
+	if (!(sig_rms > 0.0)) { test_fail(name, "signal RMS = 0"); return; }
+
+	// Noise axis: sigma = mult * sig_rms. Range brackets the metric-gate cliff
+	// (mult ~3-9 ≈ the −8..−12 dB band where metric crosses 3.0 then 1.2) down
+	// to the count-gate floor.
+	const double mults[] = { 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 10.0, 12.0 };
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 80;
+
+	const int M = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+
+	double cliff_decode = 1e9;     // deepest (most-negative) SNR3k with P(decode)>=0.5
+	double crossing_3p0 = 1e9;     // deepest SNR3k where mean raw metric still >= 3.0
+	int rescued_total = 0;         // trials with 1.2 <= metric < 3.0 AND production decoded OK
+	int rescued_cells = 0;
+
+	printf("    (sigma/rms : SNR3k_dB : P_decode@1.2 : mean_metric : mean_matched : rescued[1.2<=m<3.0 & decoded])\n");
+	std::vector<double> work((size_t)total_pb);
+	std::vector<std::complex<double> > bb;
+	for (int si = 0; si < NS; si++) {
+		const double sigma = mults[si] * sig_rms;
+		std::mt19937 rng((uint32_t)(0x5C0FF1u + si));
+		std::normal_distribution<double> nd(0.0, sigma);
+		int decoded_ok = 0, rescued = 0;
+		double metric_sum = 0.0; int matched_sum = 0;
+		for (int t = 0; t < NT; t++) {
+			for (int i = 0; i < total_pb; i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+
+			// (a) Production decode verdict (CTRL_DETECT_METRIC_MIN baked in).
+			mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+			bool ok = ts.decode_ctrl_suffix_from_passband(
+				work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+			bool content_ok = ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38 && rx_crc12 == crc12;
+			if (content_ok) decoded_ok++;
+
+			// (b) Raw metric on the same buffer (mirrors the production pre-gate
+			// detect at telecom_system.cc:3522) — shows where the 3.0 gate sits.
+			int dec_size = total_pb / M;
+			bb.assign((size_t)dec_size, std::complex<double>(0.0, 0.0));
+			ts.ofdm.passband_to_baseband_decimated(
+				work.data(), total_pb, bb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, M, &ts.ofdm.FIR_rx_data);
+			int rm = 0, rbo = -1;
+			double metric = ts.ofdm.detect_ack_pattern(
+				bb.data(), dec_size, 1,
+				ts.ack_mfsk.connect_pattern_nsymb,
+				ts.ack_mfsk.connect_tones, /*base_len=*/8,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+				ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+				&rm, 0, nullptr, &rbo,
+				/*reserve_after=*/ts.ack_mfsk.ack_sack_suffix_len(), nullptr);
+			metric_sum += metric; matched_sum += rm;
+
+			// "Rescued" = the old 3.0 gate would have rejected (metric<3.0) but
+			// the relaxed gate admits (metric>=1.2) AND the content decodes clean.
+			if (metric >= (double)cl_mfsk::CTRL_DETECT_METRIC_MIN && metric < 3.0 && content_ok)
+				rescued++;
+		}
+		double Pd = (double)decoded_ok / NT;
+		double mm = metric_sum / NT;
+		double snr = hail_snr3k_db(p_sig, sigma, fs);
+		printf("    %6.1f : %7.2f : %.2f : %8.2f : %6.2f : %d/%d\n",
+			mults[si], snr, Pd, mm, (double)matched_sum / NT, rescued, NT);
+		if (Pd >= 0.5 && snr < cliff_decode) cliff_decode = snr;
+		if (mm >= 3.0 && snr < crossing_3p0) crossing_3p0 = snr;
+		rescued_total += rescued;
+		if (rescued > 0) rescued_cells++;
+	}
+
+	printf("    --- CONNECT ctrl-suffix cliffs (P=0.5, SNR3k dB; more negative = deeper) ---\n");
+	printf("    UNCODED production decode @ metric>=%.2f : %.2f dB | mean-metric crosses 3.0 (old gate) at : %.2f dB\n",
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, cliff_decode, crossing_3p0);
+	printf("    ==> relaxed gate RESCUED %d CRC-valid decodes across %d SNR cells in the metric∈[%.2f,3.0) band\n",
+		rescued_total, rescued_cells, (double)cl_mfsk::CTRL_DETECT_METRIC_MIN);
+	// DECISION-CRITICAL MEASURE (tier2-suffix-fec-design.md §16/§17): on the
+	// UNCODED production path (hard argmax decode_suffix_tones + CRC12, NO GF16
+	// FEC), the suffix CONTENT — not the metric gate — is the binding cliff. The
+	// decode dies ABOVE the 3.0-crossing (content gives out first), so the gate
+	// relax 3.0→1.2 is harmless + slightly helpful but does NOT reach −14. §16's
+	// "gate is the sole masker, P≈1.0 to −14" was measured on decode_suffix_ENERGIES
+	// (the GF16 soft path); the uncoded path confirms here that closing the rest of
+	// the gap to −14 requires the GF(16) RA FEC integration (Phase 2), not a deeper
+	// gate. Logged as the lead, NOT asserted (content-limited is the EXPECTED result).
+	if (cliff_decode > crossing_3p0 + 0.01)
+		printf("    ==> CONTENT-LIMITED: uncoded suffix dies (%.2f dB) ABOVE the gate crossing (%.2f dB) "
+			"→ gate is NOT the production limiter; GF(16) FEC needed for −14 (§17 next phase).\n",
+			cliff_decode, crossing_3p0);
+	else
+		printf("    ==> GATE-LIMITED: uncoded suffix decode tracks the gate crossing → relax deepened the floor.\n");
+
+	// ASSERT 1 (FAIL-BEFORE-PASSES): on the pre-change 3.0 binary, production
+	// returns false whenever metric<3.0 → rescued_total==0 (the rescued cells
+	// require metric∈[1.2,3.0)). The relax admits ≥1 real CRC-valid decode the
+	// 3.0 gate blocked. This is the behavioral delta the relax buys on the
+	// uncoded path (small, because content is the dominant limiter — see MEASURE).
+	if (rescued_total <= 0) {
+		test_fail(name, "no CRC-valid decodes rescued in the metric∈[1.2,3.0) band "
+			"(the relax bought no reach on the uncoded path — or the gate is still 3.0)");
+		return;
+	}
+	// ASSERT 2 (NO REGRESSION): clean/high-SNR decode must be perfect — the relax
+	// must not perturb the good-SNR band (throughput-neutral by construction).
+	if (cliff_decode > 0.0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"decode cliff %.2f dB is positive — clean-SNR decode regressed (expected P=1.0 well below 0 dB)",
+			cliff_decode);
+		test_fail(name, b); return;
+	}
+
+	// --- FAR: pure passband noise through the PRODUCTION decode (uncoded path;
+	// CRC12 + 2-bit type + count gate are the only backstops). §17.2 / §16
+	// measured gate-fully-OFF = 0/4000; at 1.2 (> off) it must stay 0. ---
+	const int FT = 4000;
+	const double far_sigma = 8.0 * sig_rms;   // ~-12 dB SNR3k region, signal absent
+	int false_accepts = 0;
+	std::mt19937 frng(0xFA12C0DEu);
+	std::normal_distribution<double> fnd(0.0, far_sigma);
+	for (int t = 0; t < FT; t++) {
+		for (int i = 0; i < total_pb; i++) work[(size_t)i] = fnd(frng);
+		mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+		bool ok = ts.decode_ctrl_suffix_from_passband(
+			work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+		if (ok) false_accepts++;   // ANY clean decode (passes count+metric+CRC12+type) on pure noise
+	}
+	printf("    --- FAR (pure noise, sigma=%.1f×rms, %d trials) ---\n", 8.0, FT);
+	printf("    production CONNECT decode @ metric>=%.2f : %d/%d false accepts\n",
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, false_accepts, FT);
+	if (false_accepts > 0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"FAR = %d/%d false CONNECT accepts on pure noise at metric>=%.2f "
+			"(uncoded path; CRC12+type+count backstop breached)",
+			false_accepts, FT, (double)cl_mfsk::CTRL_DETECT_METRIC_MIN);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] relax rescued %d CRC-valid decodes (0 on the 3.0 binary); clean decode P=1.0; "
+		"FAR %d/%d on the uncoded path. Production cliff %.2f dB is CONTENT-limited (see MEASURE above).\n",
+		rescued_total, false_accepts, FT, cliff_decode);
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -4175,6 +4373,13 @@ int run_mfsk_ctrl_codec_tests() {
 	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the
 	// noncoherent beacon-combining dB, the base-matched floor, and FAR.
 	test_hail_detection_cliff_sweep();
+
+	// §17 CONNECT ctrl-suffix detection cliff + FAR under the relaxed
+	// CTRL_DETECT_METRIC_MIN=1.2 (tier2-suffix-fec-design.md §16/§17,
+	// 2026-05-31). MEASURE + ASSERT: rescued-decode count in the [1.2,3.0)
+	// metric band (fail-before on the 3.0 binary), decode-cliff depth, and
+	// pure-noise FAR on the uncoded CONNECT path.
+	test_ctrl_suffix_metric_gate_cliff_sweep();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

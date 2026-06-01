@@ -3274,7 +3274,8 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 		out_matched, 0, nullptr, &best_offset,
 		cl_mfsk::SNR_SUFFIX_LEN);
 
-	if(*out_matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
+	if(*out_matched < ack_mfsk.ack_match_threshold ||
+	   metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
 		return -99.0f;
 
 	// Control-frame mini-Moose v2 (data-preamble-port-research.md §24,
@@ -3334,7 +3335,8 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 			&rematched, 0, nullptr, &rebest_offset,
 			cl_mfsk::SNR_SUFFIX_LEN);
-		if (rematched >= ack_mfsk.ack_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		if (rematched >= ack_mfsk.ack_match_threshold &&
+		    remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
 		{
 			*out_matched = rematched;
 			best_offset = rebest_offset;
@@ -3545,7 +3547,8 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 
 	if (out_matched) *out_matched = matched;
 
-	if (matched < ack_mfsk.connect_match_threshold || metric < 3.0 || best_offset < 0)
+	if (matched < ack_mfsk.connect_match_threshold ||
+	    metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
 		return false;
 
 	// Control-frame mini-Moose v2 (data-preamble-port-research.md §24.2.c,
@@ -3583,7 +3586,8 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
 			&rebest_offset, /*reserve_after=*/ack_mfsk.ack_sack_suffix_len(),
 			/*out_match_mask=*/nullptr);
-		if (rematched >= ack_mfsk.connect_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		if (rematched >= ack_mfsk.connect_match_threshold &&
+		    remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
 		{
 			matched = rematched;
 			best_offset = rebest_offset;
