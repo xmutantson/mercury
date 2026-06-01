@@ -1065,6 +1065,40 @@ void cl_arq_controller::process_messages_tx_control()
 		receiving_timer.start();
 		if(g_verbose) { printf("[CMD-RX] Entering receive mode: ack_cfg=%d recv_timeout=%d msg_tx_time=%d ctrl_tx_time=%d ack_batch=%d ftr=%d\n", ack_configuration, receiving_timeout, message_transmission_time_ms, ctrl_transmission_time_ms, ack_batch_size, telecom_system->data_container.frames_to_read.load()); fflush(stdout); }
 
+		// ULTRA INCR-4 (Lever D, ultra-tier-design.md §11/§12): binder #3 — the CMD's
+		// OWN receive window (the symmetric counterpart to the §10 RSP window). When
+		// the CMD sends TEST_CONNECTION at an ULTRA config, the RSP replies with a
+		// WHOLE ULTRA TEST_CONNECTION_ACK MFSK ctrl-suffix frame (~16.25 s for ULTRA_2;
+		// Site C, arq_responder.cc:1079 → send_mfsk_test_ack_phy). The CMD's Site D
+		// detector (process_messages_rx_acks_control:1849) only polls while
+		// receiving_timer < receiving_timeout, but calculate_receiving_timeout() sized
+		// receiving_timeout from the DATA frame (~13.5 s) — shorter than the ACK frame,
+		// so the CMD would STOP polling before the TEST_CONNECTION_ACK finished arriving
+		// (the same wrong-frame-airtime bug §9.3 found on the RSP). Floor at ONE ULTRA
+		// ctrl-suffix frame + turnaround via the SHARED connect_listen_window_ms
+		// (R_frame=1: the ACK is a single frame). Applies ONLY to the ULTRA
+		// TEST_CONNECTION leg (the START_CONNECTION reply is a SHORT ack pattern, not a
+		// long frame, so it needs no widening). Non-ULTRA: guarded out → byte-identical.
+		// Mirrors the SWITCH_BANDWIDTH receiving_timeout override directly below.
+		if(messages_control.data[0] == TEST_CONNECTION)
+		{
+			int u_rep, u_K, u_Rb, u_Rs, u_Rframe = 1;
+			bool is_ultra = cl_telecom_system::ultra_tier_suffix_params(
+				current_configuration, u_rep, u_K, u_Rb, u_Rs, u_Rframe);
+			if(is_ultra && ctrl_suffix_tx_time_ms > 0)
+			{
+				int ack_win = connect_listen_window_ms(true, ctrl_suffix_tx_time_ms,
+					1, message_transmission_time_ms);
+				if(receiving_timeout < ack_win)
+				{
+					receiving_timeout = ack_win;
+					printf("[ULTRA-INCR4] CMD TEST_CONN_ACK recv window floored to %dms "
+						"(ctrl_suffix_tx=%dms)\n", receiving_timeout, ctrl_suffix_tx_time_ms);
+					fflush(stdout);
+				}
+			}
+		}
+
 		if(messages_control.data[0]==SWITCH_BANDWIDTH)
 		{
 			// Responder must fill its RX buffer before it can decode the

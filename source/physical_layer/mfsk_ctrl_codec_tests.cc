@@ -5006,6 +5006,205 @@ static void test_ultra_connect_choreography() {
 }
 
 // =============================================================================
+// ULTRA INCR-4 (Lever D, ultra-tier-design.md §11/§12) — THE GATE for the
+// COMPREHENSIVE establishment-timer fix. The §11 HW re-test found a THIRD timer
+// bug: after §10 scaled the RSP listen window, the CMD's per-attempt abort timer
+// (connection_timeout, arq_common.cc:1454) STILL FIRES DURING the CMD's own
+// blocking R_frame×ULTRA-CONNECT-frame TX (~65.5 s for ULTRA_2) because it was
+// left on the DATA-frame formula (~26 s). The §5 mandate: fix the ENTIRE
+// establishment timer set in ONE pass. This test asserts the fix's guarantee for
+// every deep-mode establishment timer that is floored to the SHARED
+// connect_listen_window_ms() helper (the SAME function production uses in
+// load_configuration / process_messages_rx_acks_control — no test/production
+// drift, §13.5):
+//
+//   BINDER #1 connection_timeout       floored to connect_listen_window_ms(R_frame)
+//   BINDER #2 ack_timeout_control      floored to connect_listen_window_ms(1)
+//   BINDER #3 CMD receiving_timeout    floored to connect_listen_window_ms(1)
+//             (for the long ULTRA TEST_CONNECTION_ACK leg)
+//             link_timeout             floored to connect_listen_window_ms(R_frame)
+//
+// Asserts, for ULTRA_0/1/2:
+//   (a) connection_timeout / link_timeout floor = connect_listen_window_ms(true,
+//       airtime, R_frame, mtt) ≥ R_frame × airtime — the CMD cannot abort during
+//       its own R_frame START_CONN TX (the §11.2 mid-TX abort is gone). AND the
+//       PRE-fix data-frame connection_timeout (the exact :1454 min_ct formula,
+//       cited) is < R_frame × airtime — fail-before evidence the §11.2 deficit was
+//       real (~26 s vs ~65.5 s).
+//   (b) ack_timeout_control / CMD receiving_timeout floor = connect_listen_window_ms
+//       (true, airtime, 1, mtt) ≥ airtime — the CMD waits long enough for ONE whole
+//       ULTRA-ACK / TEST_CONNECTION_ACK frame. AND the pre-fix data-frame
+//       ack_timeout_control (the :1420 formula, cited) is < airtime — fail-before.
+//   (c) non-ULTRA (ROBUST_0 + an OFDM config): connect_listen_window_ms(false,..)
+//       == EXACTLY 2*mtt+3000 and the is_ultra guard skips ALL floors → the
+//       establishment timers are byte-identical to pre-fix (the load-bearing safety
+//       gate — do NOT slow OFDM/ROBUST establishment, §10.4(c)).
+static void test_ultra_establishment_timers() {
+	const char* name = "ultra_establishment_timers";
+
+	// Production data-frame message_transmission_time_ms (arq_common.cc:1349 formula,
+	// bit-for-bit) — the basis of EVERY pre-fix establishment timer (~5.26 s for ULTRA).
+	auto real_mtt_ms = [](cl_telecom_system& ts) -> int {
+		return (int)ceil((1000.0
+			* (ts.data_container.Nsymb + ts.data_container.preamble_nSymb)
+			* ts.data_container.Nofdm * ts.frequency_interpolation_rate)
+			/ (double)(ts.frequency_interpolation_rate
+			           * (ts.bandwidth / ts.ofdm.Nc) * ts.ofdm.Nfft));
+	};
+	// One-CONNECT-frame airtime (ms) — the quantity production stores in
+	// ctrl_suffix_tx_time_ms (arq_common.cc:1600). ~16.25 s for ULTRA_2.
+	auto frame_airtime_ms = [](cl_telecom_system& ts) -> int {
+		if (ts.ctrl_suffix_pattern_passband_samples <= 0 || ts.sampling_frequency <= 0)
+			return 0;
+		return (int)ceil(1000.0 * ts.ctrl_suffix_pattern_passband_samples
+			/ ts.sampling_frequency);
+	};
+	// Real ack_pattern_time_ms (arq_common.cc:1398 formula) — the SHORT ACK-tone TX
+	// duration (~413 ms at 16 sym WB). It is the `ack_time` term in the pre-fix
+	// connection_timeout / ack_timeout_control formulas on the MFSK ctrl path
+	// (ack_pattern_time_ms > 0). Using the REAL value (not an mtt over-bound) makes the
+	// fail-before EXACT — the binder-#2 deficit for ULTRA_0 is only ~1 s, so a loose
+	// bound masks it.
+	auto ack_pattern_ms = [](cl_telecom_system& ts) -> int {
+		if (ts.ack_pattern_passband_samples <= 0 || ts.sampling_frequency <= 0)
+			return 0;
+		return (int)ceil(1000.0 * ts.ack_pattern_passband_samples / ts.sampling_frequency);
+	};
+	// Default ARQ constants used by the pre-fix formulas (datalink_config.cc:60-61;
+	// is_robust_config → batch sizes 1, arq_common.cc:1333-1338).
+	const int PTT_ON = 100, PTT_OFF = 200;   // datalink_config.cc:60-61
+	const int CTRL_BATCH = 1;                // robust tier (arq_common.cc:1333-1338)
+
+	struct { int cfg; int expect_Rframe; const char* label; } ultra[] = {
+		{ ULTRA_0, 2, "ULTRA_0" }, { ULTRA_1, 3, "ULTRA_1" }, { ULTRA_2, 4, "ULTRA_2" }
+	};
+	// Binder #2 (ack_timeout_control) presence tracker. The deficit's MAGNITUDE grows
+	// with the ULTRA submode: ULTRA_0's ACK frame (~14.9 s) is ≈ the pre-fix
+	// ack_timeout_control (~15.2 s) so it is NOT a binder at ULTRA_0 (margin ~+0.3 s);
+	// it IS a binder at ULTRA_1/ULTRA_2 (ACK frame 15.7/17.3 s > 15.2 s). We REQUIRE the
+	// deepest tier (ULTRA_2 — the §11-measured case) to exhibit the deficit, proving
+	// binder #2 is real; the fix floors all three safely (a harmless +margin at ULTRA_0).
+	bool ultra2_ackto_deficit_seen = false;
+	for (auto& u : ultra) {
+		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(u.cfg);
+		int N = ultra_apply_tier_params(ts, u.cfg);
+		if (N <= 0) {
+			ts.set_suffix_fec(false); gf16ra::configure(2); gf16ra::init();
+			test_fail(name, "ultra_apply_tier_params failed for an ULTRA config");
+			return;
+		}
+		int rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe = -1;
+		bool is_u = cl_telecom_system::ultra_tier_suffix_params(
+			u.cfg, rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe);
+		int airtime = frame_airtime_ms(ts);
+		int mtt     = real_mtt_ms(ts);
+		int ack_pat = ack_pattern_ms(ts);
+
+		ts.set_suffix_fec(false); gf16ra::configure(2); gf16ra::init();  // restore global state
+
+		if (!is_u || rf_Rframe != u.expect_Rframe) {
+			char b[160]; snprintf(b, sizeof(b),
+				"%s: R_frame=%d (is_ultra=%d), expected %d",
+				u.label, rf_Rframe, (int)is_u, u.expect_Rframe);
+			test_fail(name, b); return;
+		}
+		if (airtime <= 0) { test_fail(name, "ULTRA CONNECT airtime computed as 0"); return; }
+
+		// --- The fix's flooring quantities (the SAME calls production makes) ---
+		// connection_timeout & link_timeout floor (BINDER #1 / link): R_frame frames.
+		int ct_floor  = cl_arq_controller::connect_listen_window_ms(true, airtime, rf_Rframe, mtt);
+		// ack_timeout_control & CMD receiving_timeout floor (BINDER #2/#3): 1 ACK frame.
+		int ack_floor = cl_arq_controller::connect_listen_window_ms(true, airtime, 1, mtt);
+
+		// --- (a) connection_timeout: pass-after ≥ R_frame×airtime (no mid-TX abort) ---
+		int cmd_tx_airtime = rf_Rframe * airtime;   // the CMD's blocking START_CONN TX
+		if (ct_floor < cmd_tx_airtime) {
+			char b[220]; snprintf(b, sizeof(b),
+				"%s: connection_timeout floor %d ms < R_frame(%d)×frame(%d)=%d ms — the "
+				"connection_attempt_timer would STILL fire during the CMD's own TX (§11.2)",
+				u.label, ct_floor, rf_Rframe, airtime, cmd_tx_airtime);
+			test_fail(name, b); return;
+		}
+		// (a) fail-before: the PRE-fix data-frame connection_timeout, EXACTLY the
+		//   arq_common.cc:1454 formula on the MFSK ctrl path (ack_time = ack_pattern_ms):
+		//   min_ct = 2*(control_batch_size*mtt + ack_pat) + 4*ptt_on + 4*ptt_off + 5000.
+		int prefix_ct = 2 * (CTRL_BATCH * mtt + ack_pat) + 4 * PTT_ON + 4 * PTT_OFF + 5000;
+		if (prefix_ct >= cmd_tx_airtime) {
+			char b[240]; snprintf(b, sizeof(b),
+				"%s: pre-fix connection_timeout %d ms >= CMD TX %d ms — the §11.2 mid-TX-"
+				"abort deficit is not present (fail-before broke)",
+				u.label, prefix_ct, cmd_tx_airtime);
+			test_fail(name, b); return;
+		}
+
+		// --- (b) ack_timeout_control & CMD receiving_timeout: pass-after ≥ 1 frame ---
+		if (ack_floor < airtime) {
+			char b[200]; snprintf(b, sizeof(b),
+				"%s: ack/recv floor %d ms < one ULTRA-ACK frame %d ms — the CMD would abort "
+				"the wait before the TEST_CONNECTION_ACK arrived (§11.4(b) binder #2/#3)",
+				u.label, ack_floor, airtime);
+			test_fail(name, b); return;
+		}
+		// (b) fail-before (per-submode): pre-fix data-frame ack_timeout_control, EXACTLY
+		//   arq_common.cc:1420: (control_batch_size+1)*mtt + ack_pat + 2*ptt_on
+		//   + 2*ptt_off + 3000. For the DEEP submodes the ACK FRAME alone (15.7/17.3 s)
+		//   exceeds this (~15.2 s) → binder. ULTRA_0 (14.9 s) is just UNDER it → not a
+		//   binder there (the fix's floor is a harmless +margin). We don't assert the
+		//   deficit for every submode (it genuinely isn't one at ULTRA_0); we REQUIRE it
+		//   at ULTRA_2 below (the §11-measured worst case) to prove binder #2 is real.
+		int prefix_ackto = (CTRL_BATCH + 1) * mtt + ack_pat + 2 * PTT_ON + 2 * PTT_OFF + 3000;
+		bool ackto_deficit = (prefix_ackto < airtime);
+		if (u.cfg == ULTRA_2) ultra2_ackto_deficit_seen = ackto_deficit;
+
+		printf("    [%s] frame=%d ms mtt=%d ms ack_pat=%d ms R_frame=%d | conn_to floor=%d ms "
+			"(>= CMD TX %d ms; pre-fix=%d, DEFICIT) | ack/recv floor=%d ms (>= 1 frame %d ms; "
+			"pre-fix ackto=%d, binder#2=%s)\n",
+			u.label, airtime, mtt, ack_pat, rf_Rframe, ct_floor, cmd_tx_airtime, prefix_ct,
+			ack_floor, airtime, prefix_ackto, ackto_deficit ? "yes" : "no(margin)");
+	}
+	// Binder #2 must be REAL at the deepest tier (the §11 HW case): the pre-fix
+	// ack_timeout_control is shorter than one ULTRA_2 ACK frame. If this ever stops
+	// holding, the ACK-leg deficit is gone for another reason — revisit the fix.
+	if (!ultra2_ackto_deficit_seen) {
+		test_fail(name, "ULTRA_2: pre-fix ack_timeout_control already covers one ACK frame "
+			"— binder #2 (the §11.4(b) TEST_CONNECTION_ACK-leg deficit) fail-before broke");
+		return;
+	}
+
+	// ---- (c) non-ULTRA: ALL establishment-timer floors guarded out (byte-identical) ----
+	int nonultra[] = { ROBUST_0, CONFIG_6 };
+	for (int cfg : nonultra) {
+		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(cfg);
+		int rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe = -1;
+		bool is_u = cl_telecom_system::ultra_tier_suffix_params(
+			cfg, rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe);
+		if (is_u) {
+			test_fail(name, "ultra_tier_suffix_params returned true for a non-ULTRA config");
+			return;
+		}
+		int mtt = real_mtt_ms(ts);
+		int expected = 2 * mtt + 3000;   // the only thing connect_listen_window_ms returns when !ultra
+		// is_ultra=false → connect_listen_window_ms ignores ctrl_suffix_tx/R_frame and
+		// returns 2*mtt+3000. The production floors are ALL guarded by `is_ultra &&
+		// ctrl_suffix_tx_time_ms>0`, so for non-ULTRA NONE of connection_timeout /
+		// link_timeout / ack_timeout_control / receiving_timeout is touched by the fix.
+		int win_rframe = cl_arq_controller::connect_listen_window_ms(false, frame_airtime_ms(ts), 4, mtt);
+		int win_one    = cl_arq_controller::connect_listen_window_ms(false, frame_airtime_ms(ts), 1, mtt);
+		if (win_rframe != expected || win_one != expected) {
+			char b[220]; snprintf(b, sizeof(b),
+				"cfg %d: non-ULTRA window R_frame=%d / one=%d != pre-fix %d — OFDM/ROBUST "
+				"establishment timing CHANGED (load-bearing safety violated)",
+				cfg, win_rframe, win_one, expected);
+			test_fail(name, b); return;
+		}
+		printf("    [non-ULTRA cfg %d] connect_listen_window_ms == 2*mtt+3000 = %d ms "
+			"(byte-identical; all timer floors guarded out)\n", cfg, expected);
+	}
+
+	test_pass(name);
+}
+
+// =============================================================================
 // §20 (INCREMENT 2) — THE GATE FOR THIS INCREMENT: noncoherent base-pattern
 // COMBINING on the CONNECT handshake deepens the base-pattern matched-count
 // detection floor ~+2.2-2.5 dB/doubling (measured: hail-detection-floor §4,
@@ -5516,6 +5715,13 @@ int run_mfsk_ctrl_codec_tests() {
 	// window now covers R_frame × the real ULTRA CONNECT-frame airtime (the §9.3
 	// timeout fix), CMD send-count = R_frame at ULTRA, non-ULTRA timing UNCHANGED.
 	test_ultra_connect_choreography();
+	// INCR-4 COMPREHENSIVE establishment-timer gate (ultra-tier-design.md §11/§12):
+	// the §5 one-pass fix for the symmetric siblings of the §10 RSP window — the CMD
+	// connection_timeout (§11.2 mid-TX abort), ack_timeout_control + CMD receiving_timeout
+	// (the long TEST_CONNECTION_ACK leg), and link_timeout are ALL floored to the shared
+	// connect_listen_window_ms so no establishment timer fires before the deep ULTRA
+	// CONNECT frame completes; non-ULTRA byte-identical.
+	test_ultra_establishment_timers();
 
 	// §21 PRODUCTION robust-tier-trigger behavior (tier2-suffix-fec-design.md §21,
 	// CAP_SUFFIX_FEC negotiation removed in cleanup/drop-suffix-fec-cap): ACK gate

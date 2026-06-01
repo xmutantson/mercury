@@ -1462,6 +1462,12 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		if (link_timeout < min_lt)
 			link_timeout = min_lt;
 	}
+	// NOTE (ULTRA INCR-4): the ULTRA establishment-timer floors (connection_timeout,
+	// link_timeout, ack_timeout_control, and the timers derived from them) are applied
+	// LATER — at the END of the §21/§22 ULTRA enable hook below — because they depend on
+	// ctrl_suffix_tx_time_ms, which the enable hook computes only AFTER the set_suffix_fec
+	// / set_connect_*_reps calls finalize ctrl_suffix_pattern_passband_samples. Flooring
+	// here would read a stale/zero ctrl_suffix_tx_time_ms (§12 ordering fact).
 
 	calculate_receiving_timeout();
 
@@ -1598,6 +1604,91 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		else
 		{
 			ctrl_suffix_tx_time_ms = 0;
+		}
+
+		// ============================================================================
+		// ULTRA INCR-4 (Lever D, ultra-tier-design.md §11/§12): COMPREHENSIVE
+		// establishment-timer floor — the §5 one-pass fix for the symmetric siblings
+		// of the §10 RSP-window scaling.
+		//
+		// THE ROOT CAUSE (one quantity, three+ consumers): an ULTRA CONNECT frame is
+		// MUCH longer than a data frame. The CMD's BLOCKING START_CONN TX is
+		// R_frame × ctrl_suffix_tx_time_ms (~65.5 s for ULTRA_2, R_frame=4), but every
+		// CMD-side establishment timer is computed from the DATA-frame
+		// message_transmission_time_ms (~5.26 s). §9/§10 fixed the RSP listen window;
+		// §11 HW found connection_timeout (~26 s) STILL fires DURING the 65.5 s TX
+		// (connection_attempt_timer runs from connect() :2817 through the blocking
+		// send; checked :2009-2013) → mid-frame abort → CANCELPENDING → the RSP never
+		// receives a clean frame. §5 mandates fixing the ENTIRE set in ONE pass.
+		//
+		// Placed HERE (end of the ULTRA enable hook) — NOT in the :1449 timer block —
+		// because ctrl_suffix_tx_time_ms is finalized only above (after set_suffix_fec
+		// / set_connect_*_reps re-derive ctrl_suffix_pattern_passband_samples). The
+		// :1449 block runs BEFORE this and would read a stale/zero value (§12 ordering).
+		//
+		// THE ONE TIER-AWARE QUANTITY: connect_listen_window_ms() — the SAME shared
+		// helper the RSP window uses (no test/production drift, §13.5). For non-ULTRA
+		// it returns the byte-identical 2*mtt+3000, AND the is_ultra guard skips every
+		// assignment below for OFDM/ROBUST → bit-identical establishment timing (the
+		// load-bearing safety gate, §10.4(c)). The §12 audit verified link_timer /
+		// watchdog_timer / gear_shift_timer / switch_role_timer are STOPPED (read 0)
+		// during CONNECTING and cannot abort establishment; only connection_timeout
+		// (the running connection_attempt_timer) and the post-TX ack_timeout_control
+		// gate it. link_timeout is floored too for robustness/symmetry. The watchdog /
+		// gearshift / switch_role timeouts derive from ack_timeout_* and grow with them.
+		int t_rep, t_K, t_Rb, t_Rs, t_Rframe = 1;
+		bool is_ultra_tier = cl_telecom_system::ultra_tier_suffix_params(
+			current_configuration, t_rep, t_K, t_Rb, t_Rs, t_Rframe);
+		if(is_ultra_tier && ctrl_suffix_tx_time_ms > 0)
+		{
+			// BINDER #1 — connection_timeout (the §11.2 mid-TX abort). The whole
+			// attempt = CMD's R_frame START_CONN TX + RSP turnaround + ULTRA-ACK leg.
+			// Floor at R_frame whole CONNECT frames + turnaround so the per-attempt
+			// connection_attempt_timer outlasts the blocking send AND the ACK leg.
+			int ct_floor = connect_listen_window_ms(true, ctrl_suffix_tx_time_ms,
+				t_Rframe, message_transmission_time_ms);
+			if(connection_timeout < ct_floor)
+				connection_timeout = ct_floor;
+
+			// link_timeout — NOT a binder during CONNECTING (link_timer STOPPED until
+			// CONNECTED, §12), floored to the same window for robustness/symmetry: any
+			// future change that starts link_timer earlier must still outlast the TX.
+			if(link_timeout < ct_floor)
+				link_timeout = ct_floor;
+
+			// BINDER #2 — ack_timeout_control (the §11.4(b) downstream limiter). After
+			// the CMD sends START_CONN it is PENDING_ACK (ack_timer started
+			// arq_commander.cc:955) and waits ack_timeout_control for the RSP's
+			// ULTRA-ACK (update_status :2002). The RSP transmits ONE whole ULTRA-ACK
+			// ctrl-suffix frame (~16.25 s = one ctrl_suffix_tx_time_ms; the ACK plays
+			// once — R_frame is START_CONN-only, :5057) + turnaround. The data-frame
+			// ack_timeout_control (~13.5 s) is shorter than the ACK frame ALONE → it
+			// would abort the wait before the ACK could arrive. Floor at ONE ACK frame
+			// + turnaround = connect_listen_window_ms(R_frame=1). COMMANDER-only (only
+			// the CMD waits for the START_CONN ACK); the :1480 min_ack guard already
+			// ran, so re-floor here after ctrl_suffix_tx_time_ms is known.
+			if(this->role == COMMANDER)
+			{
+				int ack_leg_floor = connect_listen_window_ms(true, ctrl_suffix_tx_time_ms,
+					1, message_transmission_time_ms);
+				if(ack_timeout_control < ack_leg_floor)
+					set_ack_timeout_control(ack_leg_floor);
+			}
+
+			// Re-derive the ack_timeout_*-scaled establishment/recovery timers so they
+			// track the floored values (these timers do NOT run during CONNECTING —
+			// §12 — but keep the derivation self-consistent for the data/recovery phase
+			// at the ULTRA tier; identical formulas to :1445-1447, recomputed).
+			switch_role_test_timeout = (nResends/3) * ack_timeout_control;
+			watchdog_timeout         = (nResends/3) * ack_timeout_data;
+			gearshift_timeout        = (nResends/3) * ack_timeout_data;
+
+			printf("[ULTRA-INCR4] establishment timers floored: cfg=%d R_frame=%d "
+				"ctrl_suffix_tx=%dms connection_timeout=%dms link_timeout=%dms "
+				"ack_timeout_control=%dms\n",
+				current_configuration, t_Rframe, ctrl_suffix_tx_time_ms,
+				connection_timeout, link_timeout, ack_timeout_control);
+			fflush(stdout);
 		}
 	}
 }
