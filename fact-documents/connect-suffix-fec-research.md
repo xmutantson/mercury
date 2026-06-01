@@ -355,3 +355,57 @@ FAR. SNR-vote path (I1) untouched (reads hard `out_tones`).
   to prior cliff-agent axis (base floor −14.68 ≈ their −14.6; hard suffix ≈ their
   −8.6). Soft@flips=1: +1.34 dB cliff move, 0% throughput, 0.25% FAR. Gap to
   detection floor (~6 dB) needs Tier-2 parity (CONNECT-only). Ship verdict §6.6.
+
+## §8. Combined "free stack" — production wiring + IONOS HW validation (2026-05-31)
+Branch `wt/connect-combined` (off monitor 01535f2): cherry-picked metric gate
+(6b2cb54) + suffix FEC (37947fb), then WIRED the prototype into production.
+
+§8.1 Wiring (the prototype shipped with NO production caller — `*_soft` was
+test-only). Three dispatch sites now call the soft decoder when
+`suffix_fec_mode != 0` (default flipped to 1 for this build):
+  - arq_common.cc receive_mfsk_ctrl_suffix_phy_core (CONNECT/TEST_CONN/TEST_ACK)
+  - arq_commander.cc receive_full_ack_phy (clean full-batch ACK)
+  - arq_commander.cc SACK-window decode (partial-bitmap ACK+SACK)
+Each via a file-local `ctrl_crc12_fn` thunk over the production CRC12_calc.
+
+§8.2 STACKING FIX (cross-layer, CLAUDE.md §5): the suffix-FEC `*_soft` functions
+copied the base-detect gate with a HARDCODED `metric < 3.0`, predating the metric
+gate. Since soft is now the production path, that 3.0 would silently undo the
+metric gate's +2.5 dB. Replaced all 4 soft-path literals with
+`cl_mfsk::CTRL_DETECT_METRIC_MIN`. WITHOUT this the gains would NOT stack.
+
+§8.3 Sim (local --test): 40/40 pass. Gains STACK to +3.84 dB:
+metric gate +2.50 dB (ACK & CONNECT base-detect) + suffix FEC SOFT@1 +1.34 dB
+(suffix cliff −7.32 → −8.66 dB). Throughput-neutral (0 gate divergences,
+min metric over count-passers = 7.05).
+
+§8.4 IONOS HW A/B (pinned ROBUST_0, WB; baseline md5 bb00c823… vs combined
+94eb31fb…, md5s differ, build-Pi source markers present/absent as expected;
+`[SUFFIX-FEC]` tell fired 27× on combined CONNECTs confirming Tier-1 live):
+  - **Establishment floor IDENTICAL**: both arms CONNECT 3/3 at WGN −6/−8/−10,
+    0/3 at −12/−14. **NO floor movement** (sim predicted +3.8 dB).
+  - **Throughput-neutral CONFIRMED**: WB_CFG10 clean = 290.1 bps / 5440 B
+    BYTE-IDENTICAL on both arms.
+  - **FAR CLEAN** (both arms): 0 false CONNECT/START_CONNECTION on 120 s pure
+    noise (WGN:60). Soft 0.25% sim-FAR produced 0 HW false accepts.
+
+§8.5 ROOT CAUSE of the HW null (logs): at the failing cells (−12/−14) the RSP
+shows ONLY `[CAP-PEAK]`/PHY-reinit — the **HAIL beacon detector never fires**
+(`[HAIL] Detected: base=N/8` absent). At −10 (pass) HAIL fires (metric=7.6,
+base=16/8) THEN START_CONNECTION + suffix decode run. The establishment floor
+at ROBUST_0 is gated by **HAIL preamble detection** (dies −10→−12), a SEPARATE
+detector (telecom_system.cc:3722 `detect_hail_pattern_from_passband`,
+`hail_match_threshold`) — NOT the CONNECT/ACK metric (relaxed by the gate) and
+NOT the ctrl-suffix (improved by the FEC). Both fixes live STRICTLY DOWNSTREAM
+of HAIL. At −10 where the suffix path IS exercised, the HARD decode already gets
+matched=16/flips=0 → zero margin for either fix to act. Mirrors the BP+OSD null
+(MEMORY: "LDPC isn't the cliff bottleneck… kept for when the cliff moves").
+
+§8.6 MERGE VERDICT: SHIP-SAFE but NO HW floor gain at the current bottleneck.
+The stack is correct, throughput-neutral (byte-identical), FAR-clean, 40/40
+tests. It costs nothing and is a latent win that activates once the HAIL
+detection floor is pushed deeper. RECOMMENDATION: ship with `suffix_fec_mode`
+DEFAULT 0 (keep the byte-identical baseline as production default; the wiring +
+stacking fix + tests merge as dormant capability), OR default 1 if the team
+wants Tier-1 always-on (HW-proven harmless). The next high-leverage target is
+HAIL preamble detection at ROBUST_0, not the ctrl-suffix.
