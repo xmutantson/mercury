@@ -64,6 +64,10 @@ cl_mfsk::cl_mfsk()
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
+	suffix_fec_coded = false;  // Tier-2 FEC off by default (§19) — CONNECT suffix
+	ack_suffix_fec_coded = false; // §21: ACK-suffix FEC off by default (separate
+	                              // from the CONNECT flag; held off this increment)
+	connect_preamble_reps = 1; // Tier-2 base-pattern combining off by default (§20)
 }
 
 cl_mfsk::~cl_mfsk()
@@ -85,6 +89,10 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
+	// NOTE: suffix_fec_coded is NOT reset here — it is owned by the telecom
+	// layer (set after gf16ra::configure(3)+init() when FEC is enabled) and
+	// init() is called once at load_configuration before that. Resetting it
+	// here would clobber a FEC-enable that ran first. Constructor sets it false.
 
 	// Calculate log2(M)
 	nBits = 0;
@@ -620,10 +628,22 @@ float cl_mfsk::tone_to_snr(int tone) const
 // fact-documents/phase-b-mfsk-connect-research.md §11.1. Returns number of
 // tones written (= ack_sack_suffix_len()).
 int cl_mfsk::pack_ctrl_suffix(mfsk_ctrl_frame_type type, uint64_t payload38,
-                              uint16_t crc12, int* out_tones) const
+                              uint16_t crc12, int* out_tones, bool fec) const
 {
 	int n = ack_sack_suffix_len();
 	if (n == 0 || M < 16) return 0;
+	// Tier-2 FEC (§19): emit the GF(16) RA codeword (N=codeword_len() tones,
+	// each 0..15) instead of the 13-symbol hard bit-pack. The codeword carries
+	// [type:2|payload38:38] in 10 systematic GF(16) info symbols + the 12-bit
+	// CRC in 3 protected info symbols + RA parity; the tone values are 0..M-1
+	// exactly like the hard pack, so the one-hot mapping downstream is identical.
+	// gf16ra is configured (repfact)/inited once at FEC enable. §21: `fec` is the
+	// EXPLICIT per-call decision (CONNECT passes suffix_fec_coded, ACK passes
+	// ack_suffix_fec_coded) — pack_ctrl_suffix no longer reads any global.
+	if (fec) {
+		gf16ra::encode(type, payload38, crc12, out_tones);
+		return gf16ra::codeword_len();
+	}
 	int bits_per_tone = 0;
 	for (int m = M; m > 1; m >>= 1) bits_per_tone++;  // log2(M); 4 for M=16
 	uint64_t payload = ((uint64_t)(type & 0x3) << 50)
@@ -689,7 +709,11 @@ int cl_mfsk::pack_ack_sack_payload(uint8_t bsi, uint32_t bitmap, uint16_t crc12,
 	}
 	uint32_t bitmap30 = bitmap & 0x3FFFFFFFu;
 	uint64_t payload38 = ((uint64_t)bsi << 30) | (uint64_t)bitmap30;
-	return pack_ctrl_suffix(MFSK_CTRL_ACK_SACK, payload38, crc12, out_tones);
+	// §21: ACK uses its OWN fec flag (ack_suffix_fec_coded), NEVER the CONNECT
+	// suffix_fec_coded — so an FEC-on CONNECT session cannot garble the data ACK
+	// (the §21.1 fix). Default false → byte-identical 13-tone ACK suffix.
+	return pack_ctrl_suffix(MFSK_CTRL_ACK_SACK, payload38, crc12, out_tones,
+	                        ack_suffix_fec_coded);
 }
 
 bool cl_mfsk::unpack_ack_sack_payload(const int* in_tones,
@@ -835,16 +859,24 @@ void cl_mfsk::generate_connect_pattern(std::complex<double>* pattern_out)
 	// CONNECT base uses an 8-tone base sequence × 2 reps = 16 symbols (WB),
 	// same shape as ACK; the base sequence is connect_tones[0..7].
 	const int base_len = 8;
-	for (int s = 0; s < connect_pattern_nsymb; s++)
+	// §20: noncoherent base-pattern combining. Emit the connect_pattern_nsymb
+	// base block connect_preamble_reps times. Each rep is IDENTICAL — symbol s
+	// of every rep carries the SAME tone (per-rep-LOCAL hop index s, NOT a
+	// continued abs index), so the RX detector can sum the energy of rep-r
+	// symbol s onto rep-0 symbol s (same expected bin). reps=1 → exactly the
+	// pre-§20 single 16-symbol block (byte-identical).
+	int total_base = connect_base_total_nsymb();   // reps * connect_pattern_nsymb
+	for (int abs_b = 0; abs_b < total_base; abs_b++)
 	{
+		int s = abs_b % connect_pattern_nsymb;   // index WITHIN the base block
 		for (int k = 0; k < Nc; k++)
-			pattern_out[s * Nc + k] = std::complex<double>(0.0, 0.0);
+			pattern_out[abs_b * Nc + k] = std::complex<double>(0.0, 0.0);
 
 		int tone_base = connect_tones[s % base_len];
 		int actual_tone = (tone_base + s * tone_hop_step) % M;
 
 		for (int st = 0; st < nStreams; st++)
-			pattern_out[s * Nc + stream_offsets[st] + actual_tone] =
+			pattern_out[abs_b * Nc + stream_offsets[st] + actual_tone] =
 				std::complex<double>(amp, 0.0);
 	}
 }
@@ -857,19 +889,29 @@ void cl_mfsk::generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
                                             uint64_t payload38, uint16_t crc12)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
-	int suffix_len = ack_sack_suffix_len();
+	// §19: coded length (52 with FEC, 13 uncoded). pack_ctrl_suffix below
+	// returns the same count; we loop over it for the one-hot tone placement.
+	int suffix_len = ctrl_suffix_len();
 	if (suffix_len == 0) return;  // NB unsupported
 	if (connect_pattern_nsymb <= 0) return;
 
-	// First: CONNECT base pattern (16 symbols WB, NOT ack_tones).
+	// First: CONNECT base pattern (R×16 symbols WB when combining, NOT ack_tones).
 	generate_connect_pattern(pattern_out);
 
 	int payload_tones[MAX_ACK_SACK_SUFFIX];
-	pack_ctrl_suffix(type, payload38, crc12, payload_tones);
+	// §21: CONNECT passes its own suffix_fec_coded (the loop bound ctrl_suffix_len()
+	// reads the same flag → consistent N). pack emits 13 (uncoded) or N (FEC).
+	pack_ctrl_suffix(type, payload38, crc12, payload_tones, suffix_fec_coded);
 
+	// §20: the suffix follows ALL R base reps (combining is on the base, not the
+	// suffix). connect_base_total_nsymb() = R*connect_pattern_nsymb (=16 when
+	// reps=1, byte-identical). The hop index abs_s uses this same base total so
+	// TX and the RX suffix-decode offset (which is passed connect_base_total_nsymb)
+	// stay phase-consistent (§20.3 C5).
+	int base_total = connect_base_total_nsymb();
 	double amp = sqrt((double)Nc / nStreams);
 	for (int s = 0; s < suffix_len; s++) {
-		int abs_s = connect_pattern_nsymb + s;  // suffix index after base
+		int abs_s = base_total + s;  // suffix index after ALL base reps
 		for (int k = 0; k < Nc; k++)
 			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
 

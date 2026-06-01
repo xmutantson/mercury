@@ -198,11 +198,73 @@ public:
 	// as "no CONNECT arrived" (the caller's timeout/retransmit logic
 	// handles it). *out_matched (optional) gets the base-pattern match
 	// count for diagnostics.
+	// crc12_fn/crc12_ctx (§19, INCREMENT 1): the production CRC-12 callback
+	// (cl_arq_controller::CRC12_calc, init=0xFFF — NEVER inline, v1 bug #1).
+	// Required ONLY when suffix_fec_mode selects the GF(16) FEC decode (the
+	// soft_decode CRC accept gate needs it); the uncoded hard path ignores it
+	// (it returns the unpacked crc12 for the caller to re-check). When the FEC
+	// path runs, *out_crc12 is set to CRC12_calc([type|payload38]) so the
+	// caller's outer CRC re-check passes by construction (consistent because
+	// soft_decode only succeeds when the decoded CRC equalled that recompute).
 	bool decode_ctrl_suffix_from_passband(double* data, int size,
 	                                       mfsk_ctrl_frame_type* out_type,
 	                                       uint64_t* out_payload38,
 	                                       uint16_t* out_crc12,
-	                                       int* out_matched = nullptr);
+	                                       int* out_matched = nullptr,
+	                                       ctrl_crc12_fn crc12_fn = nullptr,
+	                                       void* crc12_ctx = nullptr);
+
+	// ---- Suffix FEC (connect-suffix-fec-research.md) — MEASURED PROTOTYPE ----
+	// CRC-aided SOFT list decode of the 13-symbol ctrl-suffix. ZERO airtime
+	// (Tier 1): no wire-format change, the suffix bytes are byte-identical to
+	// baseline. These run the same base-pattern detector + mini-Moose as the
+	// hard decode, then cl_ofdm::decode_suffix_candidates + the CRC-gated
+	// best-first search (soft_list_decode_ctrl_suffix) to correct a few
+	// wrong-argmax symbols. The caller passes the production CRC-12 (NEVER
+	// inline; v1 bug #1). out_flips = #symbols that differ from the hard
+	// argmax (0 ⇒ hard decode would also have passed).
+	//
+	// suffix_fec_mode gates production wiring (0 = baseline hard path only;
+	// the *_soft entry points are always available for direct measurement).
+	// Tier-2 sim spikes reserve distinct mode IDs so a later combined wire can
+	// carry both: 2 = Golay(24,12) soft-ML (parallel spike), 3 = GF(16) RA
+	// (tier2-suffix-fec-gf16-spike.md; measurement-only — the gf16ra codec has
+	// no production caller, exercised via the §10 cliff-sweep harness).
+	int  suffix_fec_mode;       // 0 = off (baseline). 1 = soft list decode. 2/3 = Tier-2 spikes.
+	int  suffix_fec_K;          // top-K candidates per symbol (default 4).
+	int  suffix_fec_max_trials; // CRC-trial cap (bounds runtime; default 4000).
+	int  suffix_fec_max_flips;  // Hamming-ball radius (primary FAR lever; default 3).
+
+	// §19 (INCREMENT 1): enable/disable the Tier-2 GF(16) RA FEC on the CONNECT
+	// ctrl-suffix. on=true → gf16ra::configure(repfact)+init(), set
+	// ack_mfsk.suffix_fec_coded=true, set suffix_fec_mode=3, and RE-DERIVE
+	// ctrl_suffix_pattern_passband_samples (the coded length changed). MUST be
+	// called AFTER load_configuration (which computes that member at the uncoded
+	// length). repfact 3 = R=1/4 (N=52, the −14.03 reach, §12). Idempotent.
+	// FORCE-on for this increment (no CAP negotiation yet). Returns the coded N.
+	int  set_suffix_fec(bool on, int repfact = 3);
+
+	// §20 (INCREMENT 2): set the CONNECT base-pattern noncoherent combining factor
+	// R. R>1 → ack_mfsk.connect_preamble_reps=R (TX emits the base block R times,
+	// RX sums per-symbol energy across the R aligned reps before the matched-count)
+	// and RE-DERIVE ctrl_suffix_pattern_passband_samples (the on-wire base grew to
+	// R×16). MUST be called AFTER load_configuration. R clamped to
+	// [1, cl_mfsk::MAX_CONNECT_PREAMBLE_REPS]. R=1 = byte-identical (off). FORCE-on
+	// for this increment (no CAP negotiation yet). Returns the on-wire base symbol
+	// count (connect_base_total_nsymb()).
+	int  set_connect_preamble_reps(int reps);
+
+	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
+	                                            mfsk_ctrl_frame_type expected_type,
+	                                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+	                                            uint64_t* out_payload38,
+	                                            int* out_matched = nullptr,
+	                                            int* out_flips = nullptr);
+	bool decode_ack_sack_from_passband_soft(double* data, int size,
+	                                         ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+	                                         uint8_t* out_bsi, uint32_t* out_bitmap,
+	                                         int* out_matched = nullptr,
+	                                         int* out_flips = nullptr);
 
 	// Step 15: legacy MFSK SACK pattern (sack_pattern_passband_samples,
 	// generate_sack_bitmap_pattern_passband, detect_sack_pattern_from_passband,

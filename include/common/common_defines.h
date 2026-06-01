@@ -35,6 +35,22 @@
 #define MFSK_ACK_SACK_ENABLED 1
 #endif
 
+// §21 (tier2-suffix-fec-design.md §21.3): MASTER ENABLE for the adaptive
+// robust-tier ACK FEC. The per-batch ACK enhanced-suffix is gated on
+// ack_suffix_fec_eligible() (robust tier + CAP_SUFFIX_FEC negotiated), but the
+// actual TX/RX ENABLE is held OFF here so the data ACK is byte-identical in 100%
+// of cases (the hard throughput-neutrality constraint), not just at CONFIG_6+.
+// Rationale: (a) the §20.9 HW result shows the ACK was never the establishment
+// limiter, so robust-tier ACK FEC buys nothing on the validated bottleneck yet;
+// (b) enabling it requires the ACK TX/RX window to be sized for the 52-tone coded
+// suffix (today decode_ack_sack_from_passband reads 13 — §21.4 audit defers this
+// ACK-sizing work). Flip to 1 ONLY after the ACK coded-window sizing lands AND a
+// dedicated HW A/B. The gate predicate + plumbing are wired + tested so this is a
+// one-flag follow-on.
+#ifndef ARQ_ACK_SUFFIX_FEC_ENABLE
+#define ARQ_ACK_SUFFIX_FEC_ENABLE 0
+#endif
+
 // Verbose debug output (0=quiet, 1=debug prints enabled). Set via -v flag.
 extern int g_verbose;
 
@@ -77,6 +93,13 @@ extern int g_verbose;
 
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
+
+// §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor
+// for the PRODUCTION enhanced CONNECT suffix at the robust tier. R=4 is the §20
+// sim/HW-validated operating point (= cl_mfsk::MAX_CONNECT_PREAMBLE_REPS); R=1
+// would be combining-off. CONNECT is once/session so the +26.8% airtime of R=4 is
+// negligible (§4). Only applied when is_robust_config(current) — OFDM stays R=1.
+#define CONNECT_PREAMBLE_REPS_PROD 4
 
 // NB mode cap — CONFIG_14 (8PSK, LDPC 14/16) is the highest feasible NB config.
 // 16QAM/32QAM (CONFIG_15+) require accurate amplitude equalization that NB's

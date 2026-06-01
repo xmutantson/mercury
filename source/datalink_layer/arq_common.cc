@@ -1493,6 +1493,62 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		printf("[CFG] init_messages_buffers done\n");
 		fflush(stdout);
 	}
+
+	// §21 (tier2-suffix-fec-design.md): PRODUCTION enhanced-CONNECT enable.
+	// telecom_system->load_configuration() (just above) recomputed
+	// ctrl_suffix_pattern_passband_samples at the UNCODED 13-tone / single-base
+	// length, so the FEC + combining state must be RE-APPLIED on every config
+	// switch (the set_* hooks re-derive that member at the current Nofdm).
+	//
+	// The enhanced ctrl-suffix (GF(16) RA FEC §19 + base-pattern combining §20) is
+	// the unified CAP_SUFFIX_FEC feature. PRODUCTION TRIGGER = LOCAL robust tier
+	// (§21.3): when the session is at ROBUST_0/1/2 the CONNECT suffix is enhanced
+	// (FEC R¼ + combining R=4) — once/session, airtime-cheap (§4: +2% of a 7.9 s
+	// ROBUST frame). The CONNECT enable does NOT gate on CAP negotiation because
+	// the floor-binding START_CONN is PRE-CAP (§21.3 chicken-and-egg); a legacy RX
+	// simply fails the enhanced frame and the LDPC-fallback / handshake-retry path
+	// recovers (and the upgraded RX runs try-both, §21.5). At OFDM configs
+	// (CONFIG_6+) the enhanced state is turned OFF → the CONNECT suffix is
+	// byte-identical (and CONNECT establishment normally happens at the robust
+	// floor anyway). Re-applied on EVERY config switch so a turboshift up to OFDM
+	// disables it and a fall back to robust re-enables it.
+	//
+	// TEST OVERRIDE: MERCURY_SUFFIX_FEC=1 / MERCURY_CONNECT_REPS=N force the state
+	// regardless of tier (for pinned-config sim/HW A/B). The env knob, when set,
+	// WINS over the tier trigger. Cached on first call (no getenv() in the hot
+	// config-switch path on Pi).
+	{
+		static int  fec_env_cached   = 0;
+		static int  fec_env_force     = -1;   // -1 = unset, 0/1 = forced value
+		static int  reps_env_cached   = 0;
+		static int  reps_env_force     = -1;   // -1 = unset, >=1 = forced reps
+		if(!fec_env_cached)
+		{
+			const char* e = std::getenv("MERCURY_SUFFIX_FEC");
+			if(e != nullptr) { fec_env_force = (e[0] == '1') ? 1 : 0;
+				printf("[CFG] MERCURY_SUFFIX_FEC override = %d (test)\n", fec_env_force); fflush(stdout); }
+			fec_env_cached = 1;
+		}
+		if(!reps_env_cached)
+		{
+			const char* e = std::getenv("MERCURY_CONNECT_REPS");
+			if(e != nullptr) { reps_env_force = atoi(e); if(reps_env_force < 1) reps_env_force = 1;
+				printf("[CFG] MERCURY_CONNECT_REPS override = %d (test)\n", reps_env_force); fflush(stdout); }
+			reps_env_cached = 1;
+		}
+		// Production trigger: enhanced CONNECT at the robust tier.
+		bool robust_tier = is_robust_config(configuration);
+		bool fec_on  = (fec_env_force >= 0) ? (fec_env_force == 1) : robust_tier;
+		int  reps    = (reps_env_force >= 0) ? reps_env_force
+		                                     : (robust_tier ? CONNECT_PREAMBLE_REPS_PROD : 1);
+		// Apply (idempotent; WB-only — NB has connect_pattern_nsymb=0 so the set_*
+		// hooks no-op the passband member). DISABLE at OFDM so the CONNECT suffix
+		// is byte-identical there. set_connect_preamble_reps must be called AFTER
+		// set_suffix_fec (both re-derive ctrl_suffix_pattern_passband_samples from
+		// the CURRENT coded-suffix length × base reps; reps last = correct member).
+		telecom_system->set_suffix_fec(fec_on, 3);
+		telecom_system->set_connect_preamble_reps(reps);
+	}
 }
 
 void cl_arq_controller::return_to_last_configuration()
@@ -2692,7 +2748,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | ((bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0);  // §21: advertise enhanced ctrl-suffix when WB-capable
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2789,7 +2845,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | ((bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0);  // §21: advertise enhanced ctrl-suffix when WB-capable
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -2843,7 +2899,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | CAP_SUFFIX_FEC;  // §21: WB → advertise enhanced ctrl-suffix
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -2862,7 +2918,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | CAP_SUFFIX_FEC;  // §21: WB → advertise enhanced ctrl-suffix
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -4424,9 +4480,33 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	// Runtime guard: NB session (M=8) has ack_sack_suffix_len()==0.
 	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
 		return 0;
+
+	// §21.3 per-batch ACK ADAPTIVE gate: the enhanced (GF(16) FEC) ACK suffix is
+	// eligible ONLY at the robust tier AND when CAP_SUFFIX_FEC is mutually
+	// negotiated — CONFIG_6+ or cap-absent → uncoded → byte-identical (the hard
+	// throughput-neutrality constraint). The ENABLE is held off (ARQ_ACK_SUFFIX_
+	// FEC_ENABLE=0, §21.3) pending the ACK coded-window sizing work, so this stays
+	// false in 100% of cases this increment — the predicate is wired + observable
+	// so flipping the master enable is a one-line follow-on. We set the per-call
+	// flag from the gate and clear it after TX so it can never leak to a later
+	// non-eligible ACK (the §21.1-class shared-state discipline).
+	bool ack_fec_eligible = ack_suffix_fec_eligible();
+	telecom_system->ack_mfsk.ack_suffix_fec_coded =
+		(ARQ_ACK_SUFFIX_FEC_ENABLE != 0) && ack_fec_eligible;
+	if(g_verbose && ack_fec_eligible)
+	{
+		printf("[TX-MFSK-ACK-SACK] enhanced-ACK eligible (robust tier + CAP_SUFFIX_FEC); "
+			"enable=%d coded=%d\n", (int)(ARQ_ACK_SUFFIX_FEC_ENABLE != 0),
+			(int)telecom_system->ack_mfsk.ack_suffix_fec_coded);
+		fflush(stdout);
+	}
+
 	int nsymb = telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
 	if(nsymb <= 0 || telecom_system->ack_sack_pattern_passband_samples <= 0)
+	{
+		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 		return 0;
+	}
 
 	auto t_start = std::chrono::steady_clock::now();
 
@@ -4566,6 +4646,11 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		msleep(1);
 
 	ptt_off();
+
+	// §21.3: clear the per-call ACK FEC flag so it can NEVER leak to a later,
+	// non-eligible ACK (e.g. after a turboshift to an OFDM config). The CONNECT
+	// suffix_fec_coded is untouched — this is the ACK-only flag.
+	telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4790,6 +4875,17 @@ static inline void pack_ctrl_typed40_msb_v2(uint8_t out_bytes[5],
 		out_bytes[b] = (uint8_t)((typed40 >> (8 * (4 - b))) & 0xFF);
 }
 
+// §19 (INCREMENT 1): CRC-12 callback wrapping the PRODUCTION
+// cl_arq_controller::CRC12_calc (init=0xFFF) for the GF(16) RA suffix decoder's
+// CRC accept gate. ctx = cl_arq_controller*. Matches ctrl_crc12_fn. NEVER
+// inline the CRC (v1 bug #1 was an init mismatch between TX CRC12_calc and an
+// inlined RX copy). Identical convention to the test harness prod_crc12_cb.
+static uint16_t arq_ctrl_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
+	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
 // Shared TX core: emit CONNECT base + 13-symbol ctrl-suffix for `type` with
 // `payload38`. Returns wall-clock TX time in ms, 0 if unsupported.
 //
@@ -4991,9 +5087,17 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
                                               const char* tag)
 {
 	int conn_nsymb = telecom_system->ack_mfsk.connect_pattern_nsymb;
-	int suffix_nsymb = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	// §19.4 C6: use the CODED suffix length (52 with Tier-2 FEC, 13 uncoded) so
+	// the captured passband tail actually CONTAINS the full coded suffix plus
+	// the existing 16-symbol margin. tail_samples is clamped to signal_period
+	// below (the ring), which is hundreds of symbols at the robust configs, so
+	// the larger coded window fits. §20.3 C6: the base now occupies
+	// connect_base_total_nsymb() (R×16 when combining) — the capture tail must
+	// hold all R base reps + the suffix + margin (R=1 → conn_nsymb, byte-identical).
+	int base_total_nsymb = telecom_system->ack_mfsk.connect_base_total_nsymb();
+	int suffix_nsymb = telecom_system->ack_mfsk.ctrl_suffix_len();
 	if(conn_nsymb <= 0 || suffix_nsymb <= 0) return false;
-	const int tail_nsymb = conn_nsymb + suffix_nsymb + 16;
+	const int tail_nsymb = base_total_nsymb + suffix_nsymb + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
 	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
@@ -5021,9 +5125,13 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	uint64_t rx_p38 = 0;
 	uint16_t rx_crc12 = 0;
 	int rx_matched = 0;
+	// §19: pass the production CRC12 callback so the GF(16) FEC decode path can
+	// run its CRC accept gate (no-op for the uncoded path, which returns the
+	// unpacked crc12 for the outer re-check below).
 	bool decoded = telecom_system->decode_ctrl_suffix_from_passband(
 		telecom_system->data_container.ready_to_process_passband_delayed_data,
-		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+		arq_ctrl_crc12_cb, self);
 
 	if(!decoded)
 	{
@@ -5311,8 +5419,14 @@ bool cl_arq_controller::receive_hail_pattern()
 		bool base_ok = base_matched >= telecom_system->ack_mfsk.hail_match_threshold;
 		bool suffix_ok = !telecom_system->ack_mfsk.hail_directed
 		              || suffix_matched >= (telecom_system->ack_mfsk.HAIL_SUFFIX_LEN - 1);
-		// Per-match quality: noise gives metric/matched ≈ 2/Nc (0.2 NB, 0.04 WB).
-		// Real signals give 0.5+. Gate at 0.3 to reject noise false alarms.
+		// Per-match quality (diagnostic only now — see HAIL-detection-floor
+		// fact-doc §9/§10): noise gives metric/matched ≈ 2/Nc (0.2 NB, 0.04 WB).
+		// This value is NO LONGER a gate: the old quality>=0.3 gate sat ~8 dB
+		// above the matched-count floor (at matched=16 it implied metric>=4.8,
+		// stricter than the metric gate) and contributed ≈0 FAR — the base_ok
+		// count gate (8/16 WB, 24-40 NB) is the load-bearing FAR defense
+		// (measured 0/5000, fact-doc §4). Retained only for [HAIL-POLL] /
+		// [HAIL] Detected diagnostics below.
 		double quality = (matched_count > 0) ? metric / matched_count : 0.0;
 		// HAIL-POLL diagnostic: opt-in via MERCURY_HAIL_POLL=1 env var.
 		// Logs near-threshold polls only (≥40% base match OR metric ≥2.0 OR
@@ -5372,7 +5486,14 @@ bool cl_arq_controller::receive_hail_pattern()
 				telecom_system->ack_mfsk.hail_directed ? " (directed)" : "");
 			fflush(stdout);
 		}
-		if(base_ok && suffix_ok && metric >= 3.0 && quality >= 0.3)
+		// Gate = base count (FAR defense) + directed-suffix count + the
+		// config-tuned detection metric floor. Aligned with the sibling HAIL
+		// receive() site (arq_common.cc:6373) and the ACK/BREAK/CONNECT
+		// consumers, which all use ack_pattern_detection_threshold (0.65 at
+		// ROBUST_0, telecom_system.cc:5505-5510) — NOT the old hardcoded 3.0.
+		// The old metric>=3.0 && quality>=0.3 soft gates cost ~8 dB of
+		// establishment reach for ≈0 FAR benefit (HAIL-detection-floor §4/§5/§9).
+		if(base_ok && suffix_ok && metric >= telecom_system->ack_pattern_detection_threshold)
 		{
 			printf("[HAIL] Detected: base=%d/%d suffix=%d/%d metric=%.1f quality=%.2f%s\n",
 				base_matched, telecom_system->ack_mfsk.hail_match_threshold,

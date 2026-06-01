@@ -83,6 +83,64 @@ public:
 	int connect_tones[MAX_ACK_TONES];
 	int connect_pattern_nsymb;
 	int connect_match_threshold;
+	// Tier-2 base-pattern noncoherent COMBINING (tier2-suffix-fec-design.md §20,
+	// INCREMENT 2). When connect_preamble_reps>1 the CONNECT handshake emits the
+	// connect_pattern_nsymb base block R times (identical, per-rep-LOCAL hop) and
+	// the RX detector (ofdm.detect_ack_pattern, combine_reps param) noncoherently
+	// sums the per-symbol FFT energy across the R aligned reps BEFORE the
+	// argmax/matched-count — deepening the base-pattern detection floor
+	// ~+2.2-2.5 dB/doubling (measured: hail-detection-floor-investigation.md §4,
+	// repetition sim §14). The suffix is NOT repeated (combining is on the
+	// PREAMBLE/base, §14). connect_preamble_reps=1 (default) → R*16=16 → every
+	// consumer byte-identical to pre-§20. CONNECT-only (ACK/BREAK/HAIL pass
+	// combine_reps=1 and never read this). The base now occupies
+	// connect_base_total_nsymb()=R*connect_pattern_nsymb symbols on the wire; the
+	// suffix follows at that offset (the I4 length accessor for the base, §20.3).
+	static const int MAX_CONNECT_PREAMBLE_REPS = 4;
+	int connect_preamble_reps;   // default 1 (set in init())
+	int connect_base_total_nsymb() const {
+		int r = connect_preamble_reps;
+		if (r < 1) r = 1;
+		if (r > MAX_CONNECT_PREAMBLE_REPS) r = MAX_CONNECT_PREAMBLE_REPS;
+		return r * connect_pattern_nsymb;
+	}
+	// Soft energy-ratio sub-gate for CONNECT-handshake / ACK-SNR MFSK suffix
+	// decode (telecom_system.cc decode_ctrl_suffix_from_passband +
+	// detect_ack_snr_from_passband). ofdm.detect_ack_pattern returns
+	// metric = Σ(e_target/e_total) over matched symbols ∈ [0, pattern_nsymb];
+	// this is the MINIMUM that metric must reach (in addition to the HARD
+	// count gate matched>=*_match_threshold) for a detection to be admitted to
+	// the ctrl-suffix decode.
+	//
+	// The HARD count gate (7/16, FAR≈2.4e-5..2.5e-7/poll, mfsk.cc:230-406) is
+	// the load-bearing false-alarm defense; the downstream CRC12 (P≈2^-12) +
+	// 2-bit type discriminator (×¼) on the CONNECT path, and the SNR-suffix
+	// 3/8 majority + 2-vote-margin gate on the ACK-SNR path
+	// (telecom_system.cc:3408), are the correctness defenses. This metric is
+	// only a cheap pre-filter to skip the suffix decode on obvious noise.
+	//
+	// Was a hardcoded 3.0 at 4 sites. The metric falls monotonically with SNR
+	// and crosses 3.0 at the −8.65 dB SNR3k cliff while decode_suffix_energies
+	// (and the CRC-aided soft list) deliver P≈1.0 down to −14 — i.e. the gate,
+	// NOT the content, was the SOLE ctrl-suffix masker (isolation sim, agent
+	// a1fe962c, fact-documents/tier2-suffix-fec-design.md §16). The 3.0 gate
+	// masks 59%/97%/100% of perfectly-decodable suffixes at −9.8/−10.8/−11.8.
+	//
+	// §16 cliff table (FEC-reach with the gate relaxed; base detector floor
+	// −14.68): 2.0 reaches only −11.75; ~1.0–1.5 is needed to feed the floor.
+	// Set to 1.2 = mid of the §16 [1.0,1.5] window with ~0.2 of FAR headroom
+	// over the count gate's worst measured noise metric (1.207 past the 7/16
+	// count gate, connect-ack-metric-gate.md §6). FAR-safe: §16 measured the
+	// gate FULLY OFF = 0/4000 pure-noise false-accepts on the CRC-backstopped
+	// path (Q65/FT8 precedent — the CRC, not a pre-decode energy threshold, is
+	// the floor's FAR gate; Franke-Taylor QEX 2020), so 1.2 (> off) is strictly
+	// safer than the measured-clean OFF case. §5 audit: ctrl-suffix-LOCAL — the
+	// data OFDM demod uses a SEPARATE Schmidl-Cox/coarse detector
+	// (ofdm.cc time_sync_preamble*, receive_stats.coarse_metric), so relaxing
+	// this cannot affect data DEMOD; and in the good-SNR band where data flows
+	// the metric stays ≥7 → gate decision identical to the old 3.0 (0
+	// divergences) → THROUGHPUT-NEUTRAL. See §17.
+	static constexpr double CTRL_DETECT_METRIC_MIN = 1.2;
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
@@ -135,9 +193,40 @@ public:
 	// 13 suffix = 29 symbols ≈ 705 ms (WB).
 	int ack_sack_suffix_len() const { return (M >= 16) ? 13 : 0; }  // 0 = unsupported
 	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
-	// Generic ctrl-suffix codec (52-bit [type:2|payload:38|crc12:12]):
+
+	// Tier-2 suffix FEC (tier2-suffix-fec-design.md §19, INCREMENT 1). When
+	// suffix_fec_coded is set (by the telecom layer after gf16ra::configure(3)+
+	// init()), the CONNECT ctrl-suffix is encoded with the GF(16) RA code:
+	// pack_ctrl_suffix emits gf16ra::codeword_len() (N, default 52 @ R=1/4)
+	// tones instead of the 13-symbol hard pack, and RX decodes the per-tone
+	// ENERGY matrix via gf16ra::soft_decode (decode-from-passband path only).
+	// ctrl_suffix_len() is THE coded symbol count — the I4 length accessor every
+	// CONNECT TX/RX site routes through (§19.4). suffix_fec_coded=false (the
+	// default) → returns the uncoded 13 → byte-identical-when-off. NB (M<16)
+	// always returns 0 (FEC deferred there). gf16ra owns the active N (it is
+	// configured once at FEC enable); ctrl_suffix_len() never configures.
+	bool suffix_fec_coded;   // default false (set in init()) — the CONNECT-suffix
+	                          // FEC enable (CONNECT-path-LOCAL: ctrl_suffix_len() +
+	                          // generate_ctrl_suffix_pattern + the CONNECT RX decode).
+	// §21: the ACK-suffix FEC enable is SEPARATE from the CONNECT one so the data
+	// ACK can NEVER inherit the CONNECT FEC state (the §21.1 bug — pack_ctrl_suffix
+	// used to read the single global suffix_fec_coded, so an FEC-on CONNECT session
+	// silently coded the data ACK to 52 tones while the ACK generator emitted only
+	// 13 → garbled ACK at every OFDM SNR). Default false = byte-identical ACK. The
+	// ARQ layer sets it per-batch ONLY when ack_suffix_fec_eligible() (robust tier
+	// + CAP negotiated); held off this increment (§21.3) → always 13-tone uncoded.
+	bool ack_suffix_fec_coded;   // default false (set in init())
+	int ctrl_suffix_len() const {
+		if (ack_sack_suffix_len() <= 0) return 0;          // NB: unsupported either way
+		return suffix_fec_coded ? gf16ra::codeword_len() : ack_sack_suffix_len();
+	}
+	// Generic ctrl-suffix codec (52-bit [type:2|payload:38|crc12:12]). §21: `fec`
+	// is an EXPLICIT per-call argument (no longer the global suffix_fec_coded) so
+	// each caller decides independently — CONNECT TX passes suffix_fec_coded, the
+	// ACK packer passes ack_suffix_fec_coded. fec=true emits the GF(16) RA codeword
+	// (gf16ra::codeword_len() tones); fec=false emits the 13-symbol hard bit-pack.
 	int pack_ctrl_suffix(mfsk_ctrl_frame_type type, uint64_t payload38,
-	                     uint16_t crc12, int* out_tones) const;
+	                     uint16_t crc12, int* out_tones, bool fec) const;
 	bool unpack_ctrl_suffix(const int* in_tones,
 	                        mfsk_ctrl_frame_type* out_type,
 	                        uint64_t* out_payload38,
@@ -175,9 +264,13 @@ public:
 	// symbol — i.e. the inverse of the (payload+abs_s*hop)%M mapping the
 	// transmitter applies in generate_ack_sack_pattern(). When the detector
 	// declares an ACK match it writes ack_sack_suffix_len() entries here
-	// (10 for WB M=16) and sets last_ack_sack_capture_valid=true. Size 16
-	// is the max possible suffix length.
-	static const int MAX_ACK_SACK_SUFFIX = 16;
+	// (10 for WB M=16) and sets last_ack_sack_capture_valid=true.
+	// Sized to the Tier-2 FEC ceiling (gf16ra::GF16RA_MAX_N = 64 ≥ the R=1/4
+	// coded length 52, tier2-suffix-fec-design.md §19.4 C7) so the
+	// last_*_suffix_tones[] / suffix_tones[] / payload_tones[] buffers that
+	// derive their size from this constant are safe whether the uncoded (13)
+	// or coded (52) ctrl-suffix path runs. Was 16 (uncoded-only).
+	static const int MAX_ACK_SACK_SUFFIX = 64;
 	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_ack_sack_capture_valid;
 

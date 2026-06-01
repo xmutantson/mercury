@@ -31,6 +31,7 @@
 #include "physical_layer/pocketfft_hdronly.h"
 
 #include <map>
+#include <vector>  // §20: per-bin power accumulator for base-pattern combining
 
 namespace {
 // FFT plan cache. pocketfft's c2c() builds a new plan on every call, allocating
@@ -3697,17 +3698,52 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
                                    int suffix_start, int* out_suffix_matched,
                                    int* out_best_offset, int reserve_after,
                                    uint32_t* out_match_mask,
-                                   bool always_fine)
+                                   bool always_fine, int combine_reps)
 {
 	int Nofdm = Nfft + Ngi;
 	int sym_period_interp = Nofdm * interpolation_rate;
 	int buffer_nsymb = buffer_size_interp / sym_period_interp;
 
-	int total_needed = ack_nsymb + reserve_after;
+	// §20: noncoherent base-pattern combining. The base block is ack_nsymb
+	// symbols repeated `combine_reps` times on the wire; the matched filter sums
+	// the per-symbol FFT power across the R aligned reps before argmax/count.
+	// reps=1 is the byte-identical single-block path. The window must hold all R
+	// reps + reserve_after.
+	if (combine_reps < 1) combine_reps = 1;
+	int rep_stride_sym = ack_nsymb;                 // one base block, in symbols
+	int total_needed = combine_reps * ack_nsymb + reserve_after;
 	if (buffer_nsymb < total_needed) return 0.0;
 
 	std::complex<double>* decimated_sym = work_buf_a;
 	std::complex<double>* fft_out = work_buf_b;
+
+	// Per-bin power accumulator (summed over reps). Only used when combining;
+	// for reps=1 the per-symbol path reads fft_out directly (no extra heap on the
+	// hot ACK/HAIL poll). Sized Nfft, allocated once per call (poll cadence, not
+	// audio-rate).
+	std::vector<double> pow_accum;
+	if (combine_reps > 1) pow_accum.assign((size_t)Nfft, 0.0);
+
+	// Fill `pow` (size Nfft) with Σ_rep |FFT(symbol p of rep r)|² for the symbol
+	// whose REP-0 interpolated sample offset is `base_offset`. Returns false if
+	// any rep runs off the buffer (caller skips the symbol / candidate). When
+	// combine_reps==1 this is one FFT (identical math to the legacy inline path).
+	auto accumulate_sym_power = [&](int base_offset, double* pow) -> bool {
+		for (int b = 0; b < Nfft; b++) pow[b] = 0.0;
+		for (int r = 0; r < combine_reps; r++)
+		{
+			int off = base_offset + r * rep_stride_sym * sym_period_interp;
+			if (off < 0 || off + Nfft * interpolation_rate > buffer_size_interp)
+				return false;
+			for (int i = 0; i < Nfft; i++)
+				decimated_sym[i] = baseband_interp[off + i * interpolation_rate];
+			fft(decimated_sym, fft_out, Nfft);
+			for (int b = 0; b < Nfft; b++)
+				pow[b] += fft_out[b].real() * fft_out[b].real() +
+				          fft_out[b].imag() * fft_out[b].imag();
+		}
+		return true;
+	};
 
 	int half = Nc / 2;
 	double best_metric = 0.0;
@@ -3730,12 +3766,26 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			if (offset + Nfft * interpolation_rate > buffer_size_interp)
 				break;
 
-			// Decimate and FFT
-			for (int i = 0; i < Nfft; i++)
+			// §20: per-bin power for symbol p. reps>1 sums |FFT|² across the R
+			// aligned base reps (noncoherent integration); reps==1 reads the single
+			// FFT directly (byte-identical to the legacy path). `psp(b)` returns the
+			// combined power at bin b.
+			if (combine_reps > 1)
 			{
-				decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+				if (!accumulate_sym_power(offset, pow_accum.data()))
+					break;   // a rep ran off the buffer
 			}
-			fft(decimated_sym, fft_out, Nfft);
+			else
+			{
+				for (int i = 0; i < Nfft; i++)
+					decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+				fft(decimated_sym, fft_out, Nfft);
+			}
+			auto psp = [&](int b) -> double {
+				if (combine_reps > 1) return pow_accum[b];
+				return fft_out[b].real() * fft_out[b].real() +
+				       fft_out[b].imag() * fft_out[b].imag();
+			};
 
 			// Which tone is expected at symbol p?
 			int tone_base = ack_tones[p % ack_pattern_len];
@@ -3756,8 +3806,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 					expected_bin = Nfft - half + expected_subcarrier;
 				else
 					expected_bin = start_shift + (expected_subcarrier - half);
-				double e_expected = fft_out[expected_bin].real() * fft_out[expected_bin].real() +
-				                    fft_out[expected_bin].imag() * fft_out[expected_bin].imag();
+				double e_expected = psp(expected_bin);
 
 				// Carrier image recovery (Bug #39): real passband → baseband
 				// creates equal-energy mirrors at (Nfft - bin) % Nfft. For NB
@@ -3767,8 +3816,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 				// match rate. Fix: accept expected OR mirror as the peak bin.
 				// Metric uses max(expected, mirror) to avoid inflating noise.
 				int mirror_bin = (Nfft - expected_bin) % Nfft;
-				double e_mirror = fft_out[mirror_bin].real() * fft_out[mirror_bin].real() +
-				                  fft_out[mirror_bin].imag() * fft_out[mirror_bin].imag();
+				double e_mirror = psp(mirror_bin);
 				e_target += e_expected + e_mirror;
 
 				// Find peak bin (individual, not combined) among stream's M bins
@@ -3782,8 +3830,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 						b = Nfft - half + sub;
 					else
 						b = start_shift + (sub - half);
-					double e = fft_out[b].real() * fft_out[b].real() +
-					           fft_out[b].imag() * fft_out[b].imag();
+					double e = psp(b);
 					if (e > peak_e)
 					{
 						peak_e = e;
@@ -3814,9 +3861,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 					bk = Nfft - half + k;
 				else
 					bk = start_shift + (k - half);
-				double e = fft_out[bk].real() * fft_out[bk].real() +
-				           fft_out[bk].imag() * fft_out[bk].imag();
-				e_total += e;
+				e_total += psp(bk);
 			}
 
 			if (e_total > 0)
@@ -3879,9 +3924,23 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 					break;
 				}
 
-				for (int i = 0; i < Nfft; i++)
-					decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
-				fft(decimated_sym, fft_out, Nfft);
+				// §20: same per-bin combining as Phase 1 (psp reads combined power).
+				if (combine_reps > 1)
+				{
+					if (!accumulate_sym_power(offset, pow_accum.data()))
+					{ oob = true; break; }
+				}
+				else
+				{
+					for (int i = 0; i < Nfft; i++)
+						decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+					fft(decimated_sym, fft_out, Nfft);
+				}
+				auto psp = [&](int b) -> double {
+					if (combine_reps > 1) return pow_accum[b];
+					return fft_out[b].real() * fft_out[b].real() +
+					       fft_out[b].imag() * fft_out[b].imag();
+				};
 
 				int tone_base = ack_tones[p % ack_pattern_len];
 				int actual_tone = (tone_base + p * tone_hop_step) % mfsk_M;
@@ -3893,11 +3952,9 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 					int esub = stream_offsets[st] + actual_tone;
 					int ebin = (esub < half) ? Nfft - half + esub
 					                         : start_shift + (esub - half);
-					double ee = fft_out[ebin].real() * fft_out[ebin].real() +
-					            fft_out[ebin].imag() * fft_out[ebin].imag();
+					double ee = psp(ebin);
 					int mbin = (Nfft - ebin) % Nfft;
-					double em = fft_out[mbin].real() * fft_out[mbin].real() +
-					            fft_out[mbin].imag() * fft_out[mbin].imag();
+					double em = psp(mbin);
 					e_targ += ee + em;
 
 					double pk = -1.0;
@@ -3907,8 +3964,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 						int sub = stream_offsets[st] + t;
 						int b = (sub < half) ? Nfft - half + sub
 						                     : start_shift + (sub - half);
-						double e = fft_out[b].real() * fft_out[b].real() +
-						           fft_out[b].imag() * fft_out[b].imag();
+						double e = psp(b);
 						if (e > pk) { pk = e; pkbin = b; }
 					}
 					if (pk > 0 && (pkbin == ebin || pkbin == mbin))
@@ -3926,9 +3982,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 				{
 					int bk = (k < half) ? Nfft - half + k
 					                    : start_shift + (k - half);
-					double e = fft_out[bk].real() * fft_out[bk].real() +
-					           fft_out[bk].imag() * fft_out[bk].imag();
-					e_tot += e;
+					e_tot += psp(bk);
 				}
 				if (e_tot > 0)
 					metric_f += e_targ / e_tot;
@@ -4041,8 +4095,10 @@ void cl_ofdm::decode_suffix_tones(std::complex<double>* baseband_interp, int buf
 		int data_tone = (best_tone - hop + mfsk_M * 256) % mfsk_M;
 		out_tones[s] = data_tone;
 
-		// Diagnostic: show top-3 tones and their energies
-		if(suffix_len > 0 && s < 3)
+		// Diagnostic: show top-3 tones and their energies (gated on g_verbose —
+		// fires on every suffix decode otherwise; spams production logs + the
+		// ctrl-suffix cliff-sweep test which runs thousands of decodes).
+		if(g_verbose && suffix_len > 0 && s < 3)
 		{
 			double energies[32];
 			for(int t2 = 0; t2 < mfsk_M && t2 < 32; t2++)
@@ -4065,6 +4121,148 @@ void cl_ofdm::decode_suffix_tones(std::complex<double>* baseband_interp, int buf
 			for(int t2 = 0; t2 < mfsk_M && t2 < 16; t2++)
 				printf(" %d:%.1f", t2, energies[t2]);
 			printf("\n"); fflush(stdout);
+		}
+	}
+}
+
+// Soft variant of decode_suffix_tones: instead of keeping only the per-symbol
+// argmax, return the top-K de-hopped candidate tones ranked by energy plus a
+// per-candidate soft cost. Used by the CRC-aided soft list decoder
+// (connect-suffix-fec-research.md §3 Tier 1) — a zero-airtime upgrade that
+// recovers suffix decodes where the correct tone landed in 2nd/3rd place.
+//
+// For noncoherent M-FSK the natural soft metric is the per-tone energy
+// (Proakis Ch.8; see fact-doc §1.1). The cost we emit is the NORMALIZED energy
+// gap to the strongest tone:  cost_k = (E_best - E_k) / (E_best + eps), so the
+// argmax candidate always has cost 0 and weaker tones have cost in (0,1]. This
+// is monotone in the per-symbol log-likelihood gap and needs no tuned constant.
+//
+// out_cand[s*K + k] = k-th most-likely de-hopped tone for symbol s (0..M-1),
+//                     or -1 if the symbol ran past the buffer end / k>=valid.
+// out_cost[s*K + k] = corresponding soft cost (>=0); +INF for invalid slots.
+// The hard decode is exactly out_cand[s*K + 0] (bit-identical to
+// decode_suffix_tones), so callers can fall back to baseline trivially.
+void cl_ofdm::decode_suffix_candidates(std::complex<double>* baseband_interp,
+	int buffer_size_interp, int interpolation_rate, int pattern_offset,
+	int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M,
+	int nStreams, const int* stream_offsets, int K, int* out_cand,
+	double* out_cost)
+{
+	int Nofdm_local = Nfft + Ngi;
+	int sym_period_interp = Nofdm_local * interpolation_rate;
+	int half = Nc / 2;
+	if (K < 1) K = 1;
+	if (K > mfsk_M) K = mfsk_M;
+
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+
+	for (int s = 0; s < suffix_len; s++)
+	{
+		for (int k = 0; k < K; k++) {
+			out_cand[s * K + k] = -1;
+			out_cost[s * K + k] = 1.0e300;  // sentinel: invalid
+		}
+
+		int abs_s = pattern_nsymb + s;
+		int offset = pattern_offset + abs_s * sym_period_interp + Ngi * interpolation_rate;
+		if (offset + Nfft * interpolation_rate > buffer_size_interp)
+			continue;  // symbol past buffer end -> all slots stay invalid
+
+		for (int i = 0; i < Nfft; i++)
+			decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+		fft(decimated_sym, fft_out, Nfft);
+
+		// Combined per-tone energy across all streams (same bin math as the
+		// hard path so the argmax candidate is identical).
+		double e_tone[64];  // mfsk_M <= 64 (M=16 in production WB ctrl path)
+		double best_energy = -1.0;
+		for (int t = 0; t < mfsk_M; t++)
+		{
+			double e_combined = 0;
+			for (int st = 0; st < nStreams; st++)
+			{
+				int sub = stream_offsets[st] + t;
+				int b = (sub < half) ? Nfft - half + sub
+				                     : start_shift + (sub - half);
+				double e = fft_out[b].real() * fft_out[b].real() +
+				           fft_out[b].imag() * fft_out[b].imag();
+				e_combined += e;
+			}
+			e_tone[t] = e_combined;
+			if (e_combined > best_energy) best_energy = e_combined;
+		}
+
+		// Partial selection: pick the K strongest tones (M is tiny, K<=M<=16,
+		// so an O(K*M) selection is cheaper and simpler than a heap).
+		bool taken[64] = {};
+		int hop = (abs_s * tone_hop_step) % mfsk_M;
+		double inv = 1.0 / (best_energy + 1.0e-12);
+		for (int k = 0; k < K; k++)
+		{
+			int best_t = -1;
+			double best_e = -1.0;
+			for (int t = 0; t < mfsk_M; t++)
+			{
+				if (taken[t]) continue;
+				if (e_tone[t] > best_e) { best_e = e_tone[t]; best_t = t; }
+			}
+			if (best_t < 0) break;
+			taken[best_t] = true;
+			// Reverse the same tone hopping the hard path uses.
+			int data_tone = (best_t - hop + mfsk_M * 256) % mfsk_M;
+			out_cand[s * K + k] = data_tone;
+			out_cost[s * K + k] = (best_energy - best_e) * inv;  // 0 for k=0
+		}
+	}
+}
+
+// Full per-tone energy matrix for the soft GF(16) RA decoder
+// (tier2-suffix-fec-gf16-spike.md). Same FFT + stream-combine + de-hop math as
+// decode_suffix_candidates, but writes ALL mfsk_M de-hopped per-tone energies
+// per symbol into out_energies[s*mfsk_M + data_tone]. Symbols past the buffer
+// end leave their M energy slots at 0 (uniform -> uninformative intrinsic).
+void cl_ofdm::decode_suffix_energies(std::complex<double>* baseband_interp,
+	int buffer_size_interp, int interpolation_rate, int pattern_offset,
+	int pattern_nsymb, int suffix_len, int tone_hop_step, int mfsk_M,
+	int nStreams, const int* stream_offsets, double* out_energies)
+{
+	int Nofdm_local = Nfft + Ngi;
+	int sym_period_interp = Nofdm_local * interpolation_rate;
+	int half = Nc / 2;
+
+	std::complex<double>* decimated_sym = work_buf_a;
+	std::complex<double>* fft_out = work_buf_b;
+
+	for (int s = 0; s < suffix_len; s++)
+	{
+		for (int t = 0; t < mfsk_M; t++) out_energies[s * mfsk_M + t] = 0.0;
+
+		int abs_s = pattern_nsymb + s;
+		int offset = pattern_offset + abs_s * sym_period_interp + Ngi * interpolation_rate;
+		if (offset + Nfft * interpolation_rate > buffer_size_interp)
+			continue;  // symbol past buffer end -> all-zero (uniform) energies
+
+		for (int i = 0; i < Nfft; i++)
+			decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
+		fft(decimated_sym, fft_out, Nfft);
+
+		int hop = (abs_s * tone_hop_step) % mfsk_M;
+		for (int t = 0; t < mfsk_M; t++)
+		{
+			double e_combined = 0;
+			for (int st = 0; st < nStreams; st++)
+			{
+				int sub = stream_offsets[st] + t;
+				int b = (sub < half) ? Nfft - half + sub
+				                     : start_shift + (sub - half);
+				double e = fft_out[b].real() * fft_out[b].real() +
+				           fft_out[b].imag() * fft_out[b].imag();
+				e_combined += e;
+			}
+			// de-hop: received bin t corresponds to data tone (t - hop) mod M.
+			int data_tone = (t - hop + mfsk_M * 256) % mfsk_M;
+			out_energies[s * mfsk_M + data_tone] = e_combined;
 		}
 	}
 }

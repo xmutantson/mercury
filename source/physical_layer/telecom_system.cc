@@ -24,6 +24,7 @@
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
 #include <chrono>
+#include <vector>  // suffix-FEC soft decode candidate buffers
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
@@ -89,6 +90,18 @@ cl_telecom_system::cl_telecom_system()
 	ack_sack_pattern_passband_samples=0;
 	connect_pattern_passband_samples=0;
 	ctrl_suffix_pattern_passband_samples=0;
+	// Suffix FEC prototype (connect-suffix-fec-research.md). Default OFF so the
+	// baseline hard decode path is byte-identical; the *_soft entry points are
+	// always callable for direct measurement.
+	suffix_fec_mode=0;
+	suffix_fec_K=4;
+	suffix_fec_max_trials=4000;
+	// Default Hamming-ball radius = 1: measured pure-noise FAR 0.25% (vs 3.4% at
+	// 2, 13.9% at 3 — see test_suffix_soft_pure_noise_far / fact-doc §6). This
+	// is the safe per-decode operating point; the type field + ARQ retransmit
+	// are additional backstops. Captures the dominant cliff regime (1 wrong
+	// symbol). Raise to 2 only if a higher FAR is acceptable for more reach.
+	suffix_fec_max_flips=1;
 	ack_pattern_detection_threshold=0.8;
 	operation_mode=BER_PLOT_baseband;
 	bit_interleaver_block_size=1;
@@ -3261,7 +3274,8 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 		out_matched, 0, nullptr, &best_offset,
 		cl_mfsk::SNR_SUFFIX_LEN);
 
-	if(*out_matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
+	if(*out_matched < ack_mfsk.ack_match_threshold ||
+	   metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
 		return -99.0f;
 
 	// Control-frame mini-Moose v2 (data-preamble-port-research.md §24,
@@ -3321,7 +3335,8 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 			&rematched, 0, nullptr, &rebest_offset,
 			cl_mfsk::SNR_SUFFIX_LEN);
-		if (rematched >= ack_mfsk.ack_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		if (rematched >= ack_mfsk.ack_match_threshold &&
+		    remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
 		{
 			*out_matched = rematched;
 			best_offset = rebest_offset;
@@ -3444,8 +3459,49 @@ bool cl_telecom_system::decode_ack_sack_from_passband(double* data, int size,
 	return ok;
 }
 
+// §19 (INCREMENT 1): enable/disable the Tier-2 GF(16) RA FEC on the CONNECT
+// ctrl-suffix. See telecom_system.h. Must be called AFTER load_configuration.
+int cl_telecom_system::set_suffix_fec(bool on, int repfact)
+{
+	if (on) {
+		gf16ra::configure(repfact);
+		gf16ra::init();
+		ack_mfsk.suffix_fec_coded = true;
+		suffix_fec_mode = 3;          // GF(16) RA production path
+	} else {
+		ack_mfsk.suffix_fec_coded = false;
+		suffix_fec_mode = 0;
+	}
+	// Re-derive the CONNECT-suffix passband sample count for the (now possibly
+	// coded) ctrl_suffix_len(). load_configuration computed it at the uncoded
+	// length; the coded length differs (52 vs 13) so every TX consumer that
+	// reads this member must see the updated value (§19.4 C4). §20: the base now
+	// occupies connect_base_total_nsymb() (R×16 when combining) — use the accessor
+	// so both FEC and combining flow through the same member.
+	ctrl_suffix_pattern_passband_samples =
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
+		* data_container.Nofdm * frequency_interpolation_rate;
+	return ack_mfsk.ctrl_suffix_len();
+}
+
+// §20 (INCREMENT 2): set the CONNECT base-pattern combining factor R. See
+// telecom_system.h. Must be called AFTER load_configuration. R=1 = off
+// (byte-identical). Re-derives the passband sample count so every TX consumer
+// sees the R×16 base length (the I4 invariant, §20.3 C3/C4).
+int cl_telecom_system::set_connect_preamble_reps(int reps)
+{
+	if (reps < 1) reps = 1;
+	if (reps > cl_mfsk::MAX_CONNECT_PREAMBLE_REPS)
+		reps = cl_mfsk::MAX_CONNECT_PREAMBLE_REPS;
+	ack_mfsk.connect_preamble_reps = reps;
+	ctrl_suffix_pattern_passband_samples =
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
+		* data_container.Nofdm * frequency_interpolation_rate;
+	return ack_mfsk.connect_base_total_nsymb();
+}
+
 // =============================================================================
-// Phase B Wave 1: MFSK CONNECT base + 13-symbol ctrl-suffix
+// Phase B Wave 1: MFSK CONNECT base + ctrl-suffix
 // =============================================================================
 //
 // TX: emit CONNECT base pattern + ctrl-suffix as passband audio. Wraps
@@ -3460,7 +3516,12 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;       // NB unsupported
 	if(ack_mfsk.connect_pattern_nsymb <= 0) return 0;
 
-	int nsymb = ack_mfsk.connect_pattern_nsymb + ack_mfsk.ack_sack_suffix_len();
+	// §19: coded suffix length (52 with FEC, 13 uncoded). §20: base occupies
+	// connect_base_total_nsymb() (R×16 when combining). The member
+	// ctrl_suffix_pattern_passband_samples is computed from the same base+suffix
+	// total (set_suffix_fec / set_connect_preamble_reps re-derive it), so the
+	// returned sample count stays consistent.
+	int nsymb = ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len();
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	ack_mfsk.generate_ctrl_suffix_pattern(data_container.ofdm_framed_data,
@@ -3497,7 +3558,8 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 // the transmitted values). Caller verifies crc12 separately.
 bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 	mfsk_ctrl_frame_type* out_type, uint64_t* out_payload38,
-	uint16_t* out_crc12, int* out_matched)
+	uint16_t* out_crc12, int* out_matched,
+	ctrl_crc12_fn crc12_fn, void* crc12_ctx)
 {
 	if (out_type) *out_type = MFSK_CTRL_ACK_SACK;
 	if (out_payload38) *out_payload38 = 0;
@@ -3519,6 +3581,10 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 
 	int matched = 0;
 	int best_offset = -1;
+	// §20: base-pattern combining — ack_nsymb is ONE base block
+	// (connect_pattern_nsymb); combine_reps=connect_preamble_reps tells the
+	// detector to sum the per-symbol energy across the R aligned reps before the
+	// matched-count. reps=1 → byte-identical single-block detection.
 	double metric = ofdm.detect_ack_pattern(
 		data_container.baseband_data_interpolated, dec_size,
 		1,
@@ -3527,12 +3593,14 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
-		&best_offset, /*reserve_after=*/ack_mfsk.ack_sack_suffix_len(),
-		/*out_match_mask=*/nullptr);
+		&best_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_len(),
+		/*out_match_mask=*/nullptr, /*always_fine=*/false,
+		/*combine_reps=*/ack_mfsk.connect_preamble_reps);
 
 	if (out_matched) *out_matched = matched;
 
-	if (matched < ack_mfsk.connect_match_threshold || metric < 3.0 || best_offset < 0)
+	if (matched < ack_mfsk.connect_match_threshold ||
+	    metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
 		return false;
 
 	// Control-frame mini-Moose v2 (data-preamble-port-research.md §24.2.c,
@@ -3568,9 +3636,11 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 			ack_mfsk.tone_hop_step, ack_mfsk.M,
 			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
-			&rebest_offset, /*reserve_after=*/ack_mfsk.ack_sack_suffix_len(),
-			/*out_match_mask=*/nullptr);
-		if (rematched >= ack_mfsk.connect_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+			&rebest_offset, /*reserve_after=*/ack_mfsk.ctrl_suffix_len(),
+			/*out_match_mask=*/nullptr, /*always_fine=*/false,
+			/*combine_reps=*/ack_mfsk.connect_preamble_reps);
+		if (rematched >= ack_mfsk.connect_match_threshold &&
+		    remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
 		{
 			matched = rematched;
 			best_offset = rebest_offset;
@@ -3578,15 +3648,112 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 		}
 	}
 
+	// §19 (INCREMENT 1) + §21.5 (TRY-BOTH): Tier-2 GF(16) RA FEC decode path. Base
+	// detection + mini-Moose + the 1.2 metric gate above are UNCHANGED — they admit
+	// the decode. When FEC is on (this RX is at the robust tier, so its capture
+	// window is coded-sized) we FIRST try the cheap uncoded 13-tone decode (so a
+	// legacy peer's uncoded CONNECT still decodes), then — on miss — extract the
+	// FULL per-tone ENERGY matrix over the coded suffix (N=ctrl_suffix_len()
+	// symbols) and run the soft Q-ary BP decoder, which carries its own
+	// CRC12+2-bit-type accept gate (the FAR backstop, §16/§17.2). The hard-tone
+	// capture (last_connect_suffix_tones[]) is NOT written on this path — it is the
+	// uncoded-only path's snapshot and is unused by the CONNECT production caller.
+	if (ack_mfsk.suffix_fec_coded)
+	{
+		if (!crc12_fn) return false;   // FEC needs the production CRC12 callback
+
+		// §21.5 TRY-BOTH: run the UNCODED 13-tone decode FIRST (cost ~0 — a single
+		// argmax read + bit unpack at the same matched offset). This lets an
+		// upgraded robust-tier RX (whose capture window is coded-sized because its
+		// OWN tier gate enabled FEC) still decode a LEGACY peer's uncoded 13-tone
+		// CONNECT suffix. Verify CRC + a valid 2-bit type inline; on success return
+		// the uncoded result. On miss (the usual case when the peer sent the 52-tone
+		// GF(16) codeword — the first 13 of which are NOT the hard bit-pack), fall
+		// through to the FEC decode below. The uncoded read is a strict sub-window
+		// of the coded capture (§21.4 C6), so it is always in-bounds.
+		{
+			int ulen = ack_mfsk.ack_sack_suffix_len();   // 13 at M=16
+			if (ulen > 0 && ulen <= cl_mfsk::MAX_ACK_SACK_SUFFIX) {
+				int utones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+				ofdm.decode_suffix_tones(
+					data_container.baseband_data_interpolated, dec_size, 1,
+					best_offset, ack_mfsk.connect_base_total_nsymb(), ulen,
+					ack_mfsk.tone_hop_step, ack_mfsk.M,
+					ack_mfsk.nStreams, ack_mfsk.stream_offsets, utones);
+				bool uclean = true;
+				for (int i = 0; i < ulen; i++)
+					if (utones[i] < 0 || utones[i] >= ack_mfsk.M) { uclean = false; break; }
+				if (uclean) {
+					mfsk_ctrl_frame_type ut; uint64_t up38 = 0; uint16_t uc = 0;
+					if (ack_mfsk.unpack_ctrl_suffix(utones, &ut, &up38, &uc)) {
+						unsigned char typed[5];
+						pack_ctrl_typed40_msb(typed, (uint8_t)ut, up38);
+						uint16_t exp = crc12_fn(crc12_ctx, typed, 5) & 0x0FFF;
+						if (exp == (uc & 0x0FFF)) {
+							// Uncoded (legacy-compatible) decode validated.
+							*out_type = ut; *out_payload38 = up38; *out_crc12 = uc;
+							return true;
+						}
+					}
+				}
+			}
+		}
+
+		int N = ack_mfsk.ctrl_suffix_len();   // = gf16ra::codeword_len()
+		if (N <= 0 || N > gf16ra::GF16RA_MAX_N) return false;
+		std::vector<double> energies((size_t)N * ack_mfsk.M, 0.0);
+		// §20: the suffix follows ALL R base reps. pattern_nsymb =
+		// connect_base_total_nsymb() (R×16) is BOTH the symbol offset to the suffix
+		// and the hop base — must match the TX abs_s in generate_ctrl_suffix_pattern.
+		ofdm.decode_suffix_energies(
+			data_container.baseband_data_interpolated, dec_size,
+			1,
+			best_offset, ack_mfsk.connect_base_total_nsymb(),
+			N,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			energies.data());
+
+		// soft_decode requires a 2-bit expected type. The production caller
+		// (receive_mfsk_ctrl_suffix_phy_core) already routes by type AFTER this
+		// returns; to preserve that flow we accept ANY of the 4 types here, then
+		// hand the decoded type up. soft_decode itself only accepts when its
+		// internal CRC over [type|payload38] matches the decoded CRC, so each
+		// type attempt is CRC-backstopped (FAR per type ≈ 2^-12; ×4 types still
+		// ≈ 2^-10, far below the count-gate FAR). First CRC-valid type wins.
+		uint64_t p38 = 0;
+		int iters = -1;
+		for (int t = 0; t < 4; t++) {
+			if (gf16ra::soft_decode(energies.data(),
+				/*maxiter=*/50, /*esno_metric=*/4.0,
+				(uint8_t)t, crc12_fn, crc12_ctx, &p38, &iters))
+			{
+				*out_type = (mfsk_ctrl_frame_type)t;
+				*out_payload38 = p38;
+				// Recompute the CRC over the decoded field so the caller's outer
+				// CRC re-check (arq_common.cc) passes by construction — soft_decode
+				// already proved decoded_crc == CRC12_calc([type|p38]).
+				unsigned char typed[5];
+				pack_ctrl_typed40_msb(typed, (uint8_t)t, p38);
+				*out_crc12 = crc12_fn(crc12_ctx, typed, 5) & 0x0FFF;
+				return true;
+			}
+		}
+		return false;   // no CRC-valid type within the FEC decode
+	}
+
+	// ---- Uncoded (baseline) hard path: byte-identical to before §19. ----
 	// Decode the 13-tone ctrl-suffix at the matched position.
 	int suffix_len = ack_mfsk.ack_sack_suffix_len();
 	if (suffix_len > cl_mfsk::MAX_ACK_SACK_SUFFIX)
 		suffix_len = cl_mfsk::MAX_ACK_SACK_SUFFIX;
 	int suffix_tones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	// §20: suffix offset = connect_base_total_nsymb() (R×16) so the hop base and
+	// buffer position match the TX layout when combining (=16 when reps=1).
 	ofdm.decode_suffix_tones(
 		data_container.baseband_data_interpolated, dec_size,
 		1,
-		best_offset, ack_mfsk.connect_pattern_nsymb,
+		best_offset, ack_mfsk.connect_base_total_nsymb(),
 		suffix_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
@@ -3612,6 +3779,195 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 	// Consume the capture: caller gets a one-shot view of this match.
 	ack_mfsk.last_connect_capture_valid = false;
 	return ok;
+}
+
+// =============================================================================
+// Suffix FEC — CRC-aided SOFT list decode (connect-suffix-fec-research.md §3)
+// =============================================================================
+//
+// RX: detect CONNECT base + SOFT-decode the 52-bit ctrl-suffix. Same detector
+// pipeline as decode_ctrl_suffix_from_passband (passband→baseband, base-pattern
+// detect, control mini-Moose v2), but the suffix is decoded with
+// ofdm.decode_suffix_candidates (top-K per symbol) + soft_list_decode_ctrl_suffix
+// (CRC-gated best-first search) instead of a single hard argmax per symbol.
+// Returns true iff a type-matched, CRC-valid assignment is found. ZERO airtime
+// (the suffix bytes on the wire are byte-identical to baseline). The CRC check
+// uses the caller-supplied production CRC-12 (NEVER inline — v1 bug #1).
+bool cl_telecom_system::decode_ctrl_suffix_from_passband_soft(double* data, int size,
+	mfsk_ctrl_frame_type expected_type, ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+	uint64_t* out_payload38, int* out_matched, int* out_flips)
+{
+	if (out_payload38) *out_payload38 = 0;
+	if (out_matched) *out_matched = 0;
+	if (out_flips) *out_flips = -1;
+	if (!out_payload38 || !crc12_fn) return false;
+	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;       // NB
+	if (ack_mfsk.connect_pattern_nsymb <= 0) return false;
+
+	int M = data_container.interpolation_rate;
+	int dec_size = size / M;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		M, &ofdm.FIR_rx_data);
+
+	int matched = 0;
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		ack_mfsk.connect_pattern_nsymb,
+		ack_mfsk.connect_tones, /*base_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&best_offset, /*reserve_after=*/ack_mfsk.ack_sack_suffix_len(),
+		/*out_match_mask=*/nullptr);
+
+	if (out_matched) *out_matched = matched;
+	if (matched < ack_mfsk.connect_match_threshold || metric < 3.0 || best_offset < 0)
+		return false;
+
+	// Control-frame mini-Moose v2 (identical to the hard path).
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		ack_mfsk.connect_pattern_nsymb, best_offset,
+		ack_mfsk.connect_tones, /*pattern_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency, effective_carrier - ctrl_residual,
+			carrier_amplitude, M, &ofdm.FIR_rx_data);
+		int rematched = 0, rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			ack_mfsk.connect_pattern_nsymb,
+			ack_mfsk.connect_tones, /*base_len=*/8,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, 0, nullptr, &rebest_offset,
+			ack_mfsk.ack_sack_suffix_len(), nullptr);
+		if (rematched >= ack_mfsk.connect_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		{
+			matched = rematched; best_offset = rebest_offset;
+			if (out_matched) *out_matched = matched;
+		}
+	}
+
+	// SOFT suffix decode: top-K candidates per symbol, then CRC-gated search.
+	int n = ack_mfsk.ack_sack_suffix_len();
+	int K = suffix_fec_K; if (K < 1) K = 1; if (K > ack_mfsk.M) K = ack_mfsk.M;
+	int bits_per_tone = 0; for (int m = ack_mfsk.M; m > 1; m >>= 1) bits_per_tone++;
+	std::vector<int> cand((size_t)n * K);
+	std::vector<double> cost((size_t)n * K);
+	ofdm.decode_suffix_candidates(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		best_offset, ack_mfsk.connect_pattern_nsymb, n,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		K, cand.data(), cost.data());
+
+	return soft_list_decode_ctrl_suffix(cand.data(), cost.data(), n, K,
+		bits_per_tone, (uint8_t)expected_type, suffix_fec_max_trials,
+		suffix_fec_max_flips, crc12_fn, crc12_ctx, out_payload38, out_flips);
+}
+
+// RX: detect ACK base + SOFT-decode the 52-bit ACK+SACK suffix. Mirror of
+// decode_ctrl_suffix_from_passband_soft but on the ACK base pattern + SNR-path
+// preprocessing (reuses detect_ack_snr_from_passband, which already runs the
+// base detect + mini-Moose and leaves the corrected baseband at best_offset).
+// Because ACK_SACK uses type=0 the search pins expected_type=MFSK_CTRL_ACK_SACK.
+bool cl_telecom_system::decode_ack_sack_from_passband_soft(double* data, int size,
+	ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+	uint8_t* out_bsi, uint32_t* out_bitmap, int* out_matched, int* out_flips)
+{
+	if (out_bsi) *out_bsi = 0;
+	if (out_bitmap) *out_bitmap = 0;
+	if (out_matched) *out_matched = 0;
+	if (out_flips) *out_flips = -1;
+	if (!out_bsi || !out_bitmap || !crc12_fn) return false;
+	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;       // NB
+
+	int M = data_container.interpolation_rate;
+	int dec_size = size / M;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		M, &ofdm.FIR_rx_data);
+
+	int matched = 0;
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		ack_mfsk.ack_pattern_nsymb,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&best_offset, /*reserve_after=*/ack_mfsk.ack_sack_suffix_len(),
+		/*out_match_mask=*/nullptr);
+
+	if (out_matched) *out_matched = matched;
+	if (matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
+		return false;
+
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		ack_mfsk.ack_pattern_nsymb, best_offset,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency, effective_carrier - ctrl_residual,
+			carrier_amplitude, M, &ofdm.FIR_rx_data);
+		int rematched = 0, rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			ack_mfsk.ack_pattern_nsymb,
+			ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, 0, nullptr, &rebest_offset,
+			ack_mfsk.ack_sack_suffix_len(), nullptr);
+		if (rematched >= ack_mfsk.ack_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		{
+			matched = rematched; best_offset = rebest_offset;
+			if (out_matched) *out_matched = matched;
+		}
+	}
+
+	int n = ack_mfsk.ack_sack_suffix_len();
+	int K = suffix_fec_K; if (K < 1) K = 1; if (K > ack_mfsk.M) K = ack_mfsk.M;
+	int bits_per_tone = 0; for (int m = ack_mfsk.M; m > 1; m >>= 1) bits_per_tone++;
+	std::vector<int> cand((size_t)n * K);
+	std::vector<double> cost((size_t)n * K);
+	ofdm.decode_suffix_candidates(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		best_offset, ack_mfsk.ack_pattern_nsymb, n,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		K, cand.data(), cost.data());
+
+	uint64_t p38 = 0;
+	bool ok = soft_list_decode_ctrl_suffix(cand.data(), cost.data(), n, K,
+		bits_per_tone, (uint8_t)MFSK_CTRL_ACK_SACK, suffix_fec_max_trials,
+		suffix_fec_max_flips, crc12_fn, crc12_ctx, &p38, out_flips);
+	if (!ok) return false;
+	// payload38 = [bsi:8 | bitmap:30] (mfsk.cc:691 pack_ack_sack_payload).
+	*out_bitmap = (uint32_t)(p38 & 0x3FFFFFFFu);
+	*out_bsi    = (uint8_t)((p38 >> 30) & 0xFFu);
+	return true;
 }
 
 // TX: Generate BREAK pattern as passband audio (identical to ACK but with break_tones)
@@ -5491,12 +5847,21 @@ void cl_telecom_system::load_configuration(int configuration)
 	// is still safe; downstream callers check ack_sack_suffix_len() > 0 before
 	// invoking the TX path so NB falls back to OFDM_ACK_CLEAN / SACK_RSP.)
 	ack_sack_pattern_passband_samples = ack_mfsk.ack_sack_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
-	// Phase B Wave 1: CONNECT base + 13-symbol ctrl-suffix (WB only — NB
-	// has connect_pattern_nsymb=0 so this is also 0 on NB and downstream
-	// callers gate via that).
+	// Phase B Wave 1: CONNECT base + ctrl-suffix (WB only — NB has
+	// connect_pattern_nsymb=0 so this is also 0 on NB and downstream callers
+	// gate via that). §19: ctrl_suffix_len() is the CODED length (52 with the
+	// Tier-2 GF(16) FEC, 13 uncoded) — so this precomputed sample count, and
+	// every TX consumer derived from it, sizes for the coded suffix when FEC is
+	// on. FEC must be enabled (gf16ra::configure+init, ack_mfsk.suffix_fec_coded)
+	// BEFORE load_configuration recomputes this, OR re-enabled after — the
+	// session FEC-enable path re-derives this member (telecom enable hook §19).
 	connect_pattern_passband_samples = ack_mfsk.connect_pattern_nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	// §20: base-pattern combining — the on-wire base is connect_base_total_nsymb()
+	// (R×16 when combining, 16 when reps=1 → byte-identical). The session
+	// combining-enable hook (set_connect_preamble_reps) re-derives this member, as
+	// set_suffix_fec does for the coded suffix length.
 	ctrl_suffix_pattern_passband_samples =
-		(ack_mfsk.connect_pattern_nsymb + ack_mfsk.ack_sack_suffix_len()) * data_container.Nofdm * frequency_interpolation_rate;
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len()) * data_container.Nofdm * frequency_interpolation_rate;
 
 	// Per-mode detection threshold (all using ack_mfsk: M=16, nStreams=1):
 	// ROBUST_0 (-13 dB): low SNR, need conservative threshold

@@ -2256,6 +2256,7 @@ start_modem:
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
+                             | ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0)  // §21
                              ;
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
@@ -2297,6 +2298,7 @@ start_modem:
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
+                             | ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0)  // §21
                              ;
         ARQ.force_compress = (force_compress_cli == 1);
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
@@ -2427,7 +2429,8 @@ start_modem:
                 ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;
                 ARQ.bandwidth_mode = g_gui_state.bandwidth_mode.load();
                 ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
-                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0)
+                                    | ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_SUFFIX_FEC : 0);  // §21
                 // narrowband_enabled is set at startup (line ~728) based on -Q and -M flags.
                 // Do NOT override here — forcing NB on telecom_system while the actual
                 // config is WB causes get_tx_gain() to return NB gains (+7 dB overboosted).

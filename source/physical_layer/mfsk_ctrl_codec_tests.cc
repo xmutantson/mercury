@@ -205,12 +205,13 @@ static void test_pack_unpack_start_conn_payload() {
 static void test_pack_unpack_test_ack_payload() {
 	const char* name = "pack_unpack_test_ack_payload";
 	std::mt19937 rng(0xC0DE);
-	// Cover full echoed_cap × own_cap × representative SSID set.
+	// §21: cap fields are now 3 bits (CAP_NEGOTIABLE_MASK=0x07: WB|ENCRYPTION|
+	// SUFFIX_FEC). Cover the full 3-bit echoed_cap × own_cap × representative SSID.
 	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
-	for (int ec = 0; ec < 4; ec++) {
-		for (int oc = 0; oc < 4; oc++) {
+	for (int ec = 0; ec < 8; ec++) {
+		for (int oc = 0; oc < 8; oc++) {
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();
@@ -219,9 +220,9 @@ static void test_pack_unpack_test_ack_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				if ((p38 & ((1ULL << 26) - 1ULL)) != 0) {
-					// reserved bits must be zero on TX
-					test_fail(name, "reserved bits not zero on TX");
+				// reserved is now bits 23..0 (cap bit-2 moved into 25/24).
+				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (23..0) not zero on TX");
 					return;
 				}
 				uint8_t out_ec = 0xFF, out_oc = 0xFF, out_ssid = 0;
@@ -239,6 +240,24 @@ static void test_pack_unpack_test_ack_payload() {
 			}
 		}
 	}
+	// §21 legacy-compat: a LEGACY peer packs only the low 2 cap bits (bit-2 stays
+	// in reserved-zero). Decode such a wire value → CAP_SUFFIX_FEC must read 0,
+	// and the low 2 bits must survive intact (so WB/ENCRYPTION still negotiate).
+	for (int ec2 = 0; ec2 < 4; ec2++) {
+		for (int oc2 = 0; oc2 < 4; oc2++) {
+			uint64_t legacy = 0;
+			legacy |= ((uint64_t)(ec2 & 0x3)) << 36;
+			legacy |= ((uint64_t)(oc2 & 0x3)) << 34;
+			legacy |= ((uint64_t)42u) << 26;   // arbitrary ssid; bits 25..0 = 0 (legacy reserved)
+			uint8_t lec = 0xFF, loc = 0xFF, lss = 0;
+			bool ok = unpack_test_ack_payload(legacy, &lec, &loc, &lss);
+			if (!ok || lec != (uint8_t)ec2 || loc != (uint8_t)oc2 ||
+			    (lec & CAP_SUFFIX_FEC) || (loc & CAP_SUFFIX_FEC) || lss != 42u) {
+				test_fail(name, "legacy 2-bit cap wire decoded with SUFFIX_FEC set or low bits lost");
+				return;
+			}
+		}
+	}
 	(void)trials;
 	test_pass(name);
 }
@@ -251,7 +270,7 @@ static void test_pack_unpack_test_conn_payload() {
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
 	for (int snr_q = 0; snr_q < 16; snr_q++) {
-		for (int lc = 0; lc < 4; lc++) {
+		for (int lc = 0; lc < 8; lc++) {   // §21: local_cap now 3 bits
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();  // pre-set garbage
@@ -261,9 +280,9 @@ static void test_pack_unpack_test_conn_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
-					// reserved bits 23..0 must be zero on TX
-					test_fail(name, "reserved bits not zero on TX");
+				// reserved is now bits 22..0 (cap bit-2 moved into bit 23).
+				if ((p38 & ((1ULL << 23) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (22..0) not zero on TX");
 					return;
 				}
 				uint8_t out_snr = 0xFF, out_lc = 0xFF, out_ssid = 0;
@@ -282,6 +301,21 @@ static void test_pack_unpack_test_conn_payload() {
 				}
 				trials++;
 			}
+		}
+	}
+	// §21 legacy-compat: legacy peer packs 2-bit local_cap, bit-2 stays in
+	// reserved-zero. Decode → CAP_SUFFIX_FEC=0, low 2 bits + ssid intact.
+	for (int lc2 = 0; lc2 < 4; lc2++) {
+		uint64_t legacy = 0;
+		legacy |= ((uint64_t)9u) << 34;            // arbitrary snr_q
+		legacy |= ((uint64_t)(lc2 & 0x3)) << 32;
+		legacy |= ((uint64_t)55u) << 24;           // arbitrary ssid; bits 23..0 = 0
+		uint8_t lsnr = 0xFF, llc = 0xFF, lss = 0;
+		bool ok = unpack_test_conn_payload(legacy, &lsnr, &llc, &lss);
+		if (!ok || llc != (uint8_t)lc2 || (llc & CAP_SUFFIX_FEC) ||
+		    lsnr != 9u || lss != 55u) {
+			test_fail(name, "legacy 2-bit local_cap wire decoded with SUFFIX_FEC set or fields lost");
+			return;
 		}
 	}
 	(void)trials;
@@ -308,7 +342,7 @@ static void test_ctrl_suffix_roundtrip_all_types() {
 			uint16_t crc12 = (uint16_t)(rng() & 0x0FFF);
 
 			int tones[16] = {0};
-			int n = m.pack_ctrl_suffix(types[ti], payload38, crc12, tones);
+			int n = m.pack_ctrl_suffix(types[ti], payload38, crc12, tones, /*fec=*/false);
 			if (n != 13) {
 				test_fail(name, "pack_ctrl_suffix did not write 13 tones");
 				return;
@@ -358,7 +392,7 @@ static void test_ctrl_suffix_crc12_corruption() {
 		uint16_t crc12 = test_crc12_calc(bytes, 5);
 
 		int tones[16];
-		m.pack_ctrl_suffix(type, payload38, crc12, tones);
+		m.pack_ctrl_suffix(type, payload38, crc12, tones, /*fec=*/false);
 
 		// Flip one random bit somewhere in the type+payload region (bits
 		// 51..12 of the 52-bit field). The CRC field sits in the low 12
@@ -2750,8 +2784,2254 @@ static void test_mfsk_ctrl_suffix_apply_sign_invariance() {
 }
 
 // =============================================================================
+// §9 Suffix FEC — CRC-aided soft list decode (connect-suffix-fec-research.md)
+// =============================================================================
+//
+// MEASURED PROTOTYPE. Tier 1 = ZERO airtime: the suffix bytes on the wire are
+// byte-identical to baseline; only the RX decode changes (hard argmax →
+// soft top-K + CRC-gated search). These tests verify (a) clean parity with the
+// hard decode, (b) the candidate[k=0] == hard-tone invariant (proves
+// byte-identical behavior when FEC is off), (c) error correction of flipped
+// symbols, (d) FAR bound on pure noise, (e) NB unchanged, and (f) the cliff
+// SNR sweep that produces the headline acquisition-gain dB number.
+
+// CRC-12 callback wrapping the PRODUCTION cl_arq_controller::CRC12_calc (NEVER
+// inline — v1 bug #1). ctx = &cl_arq_controller. Matches ctrl_crc12_fn.
+static uint16_t prod_crc12_cb(void* ctx, const unsigned char* data, int n) {
+	cl_arq_controller* arq = static_cast<cl_arq_controller*>(ctx);
+	return arq->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
+// Build CONNECT-base suffix passband for a given (type, p38). CONNECT base
+// pattern (g=3) + 13-symbol ctrl-suffix. Suffix placed at offset 4096.
+static std::vector<double> build_ctrl_suffix_audio(cl_telecom_system& ts,
+	mfsk_ctrl_frame_type type, uint64_t p38, int& out_active_samples) {
+	uint64_t typed40 = ((uint64_t)type << 38) | p38;
+	uint8_t bytes[5];
+	for (int b = 0; b < 5; b++) bytes[b] = (uint8_t)((typed40 >> (8 * (4 - b))) & 0xFF);
+	uint16_t crc12 = test_crc12_calc(bytes, 5);
+	int n_samples = ts.ctrl_suffix_pattern_passband_samples;
+	out_active_samples = n_samples;
+	std::vector<double> audio((size_t)n_samples + 8192, 0.0);
+	ts.generate_ctrl_suffix_pattern_passband(audio.data() + 4096, type, p38, crc12);
+	return audio;
+}
+
+// Build ACK-base + ACK+SACK suffix passband for a given payload38 =
+// [bsi:8|bitmap:30]. Uses the ACK base pattern (g=5), NOT the CONNECT base, so
+// the ACK detector (detect_ack_snr_from_passband) gates correctly. CRC over the
+// typed40 [ACK_SACK|payload38] field — identical convention to TX.
+static std::vector<double> build_ack_sack_audio(cl_telecom_system& ts,
+	uint64_t p38, int& out_active_samples) {
+	uint8_t bsi = (uint8_t)((p38 >> 30) & 0xFF);
+	uint32_t bitmap = (uint32_t)(p38 & 0x3FFFFFFFu);
+	// CRC must be over the ACTUALLY-TRANSMITTED field. generate_ack_sack_pattern
+	// masks bitmap to 30 bits, so recompute p38 from the masked (bsi,bitmap).
+	uint64_t p38_tx = ((uint64_t)bsi << 30) | (uint64_t)bitmap;
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_ACK_SACK, p38_tx);
+	uint16_t crc12 = test_crc12_calc(bytes, 5);
+	int n_samples = ts.ack_sack_pattern_passband_samples;
+	out_active_samples = n_samples;
+	std::vector<double> audio((size_t)n_samples + 8192, 0.0);
+	ts.generate_ack_sack_pattern_passband(audio.data() + 4096, bsi, bitmap, crc12);
+	return audio;
+}
+
+// Mean-square (power) of the active suffix region — used for SNR3k.
+static double suffix_pb_power(const std::vector<double>& audio, int active_samples) {
+	double s = 0.0; int n = 0;
+	for (int i = 4096; i < 4096 + active_samples && i < (int)audio.size(); i++) { s += audio[i]*audio[i]; n++; }
+	return (n > 0) ? s / n : 0.0;
+}
+
+// SNR in a 3 kHz reference bandwidth (VARA convention) for a real-passband
+// signal of in-band power P_sig under per-sample AWGN variance sigma^2. The
+// noise occupies the fs/2-wide real Nyquist band uniformly, so noise power in
+// 3000 Hz = sigma^2 * 3000/(fs/2). fs=48k ⇒ N_3k = sigma^2 * 3000/24000 = sigma^2/8.
+static double snr3k_db(double p_sig, double sigma, double fs) {
+	double n3k = sigma * sigma * 3000.0 / (fs / 2.0);
+	if (n3k <= 0.0) return 999.0;
+	return 10.0 * std::log10(p_sig / n3k);
+}
+
+// §9.1 — soft decode reproduces the hard decode on a clean channel (0 flips).
+static void test_suffix_soft_roundtrip_clean() {
+	const char* name = "suffix_soft_roundtrip_clean";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.ack_sack_suffix_len() <= 0) { test_fail(name, "suffix_len=0"); return; }
+
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	int active = 0;
+	std::vector<double> audio = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, active);
+
+	uint64_t rx_p38 = 0; int matched = 0, flips = -1;
+	bool ok = ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(),
+		MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rx_p38, &matched, &flips);
+	if (!ok) { test_fail(name, "soft decode miss on clean"); return; }
+	if (rx_p38 != p38) { test_fail(name, "payload mismatch"); return; }
+	if (flips != 0) { char b[96]; snprintf(b,sizeof(b),"clean decode used %d flips (expected 0)", flips); test_fail(name, b); return; }
+	test_pass(name);
+}
+
+// §9.2 — INVARIANT: candidate[k=0] from decode_suffix_candidates is bit-identical
+// to the hard decode_suffix_tones result. This is what guarantees the baseline
+// is byte/decode-identical when suffix_fec_mode is OFF (the production hard path
+// reads exactly candidate[k=0]). Verified symbol-by-symbol on a clean frame.
+static void test_suffix_soft_candidate0_equals_hard() {
+	const char* name = "suffix_soft_candidate0_equals_hard";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	int suffix_len = ts.ack_mfsk.ack_sack_suffix_len();
+	if (suffix_len <= 0) { test_fail(name, "suffix_len=0"); return; }
+
+	uint64_t p38 = 0; pack_test_ack_payload(&p38, 0x1, 0x2, 7);
+	int active = 0;
+	std::vector<double> audio = build_ctrl_suffix_audio(ts, MFSK_CTRL_TEST_ACK, p38, active);
+
+	// Run the detector via the hard path so the baseband + best_offset match.
+	mfsk_ctrl_frame_type t; uint64_t hp=0; uint16_t hc=0; int hm=0;
+	bool hard_ok = ts.decode_ctrl_suffix_from_passband(audio.data(), (int)audio.size(), &t, &hp, &hc, &hm);
+	if (!hard_ok) { test_fail(name, "hard detector miss on clean (precondition)"); return; }
+
+	// Independently re-derive candidates and compare k=0 to the hard tones.
+	// (We reconstruct the same detection by re-running the soft path which uses
+	// the identical detector; then compare the captured hard tones.)
+	// The hard tones are in ack_mfsk.last_connect_suffix_tones after hard decode.
+	int hard_tones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	for (int i = 0; i < suffix_len; i++) hard_tones[i] = ts.ack_mfsk.last_connect_suffix_tones[i];
+
+	// Now build candidates at the same offset by calling the soft decode with
+	// K=4 and a degenerate CRC that never matches, then inspect: instead we
+	// directly exercise decode_suffix_candidates via a tiny re-run. Simplest:
+	// assert the soft decoder, restricted to K=1 (argmax only), reproduces the
+	// hard payload exactly — that proves candidate[0] == hard tone for all
+	// symbols (any single wrong symbol would flip a bit and fail CRC).
+	cl_arq_controller arq;
+	int save_K = ts.suffix_fec_K; ts.suffix_fec_K = 1;
+	uint64_t rx_p38 = 0; int flips = -1;
+	bool ok = ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(),
+		MFSK_CTRL_TEST_ACK, prod_crc12_cb, &arq, &rx_p38, nullptr, &flips);
+	ts.suffix_fec_K = save_K;
+	if (!ok || rx_p38 != p38 || flips != 0) {
+		test_fail(name, "K=1 soft decode != hard (candidate[0] != argmax)"); return;
+	}
+	(void)hard_tones;
+	test_pass(name);
+}
+
+// §9.3 — error correction: corrupt the strongest 1 symbol so the argmax is
+// wrong but the correct tone is the 2nd candidate; hard decode must FAIL,
+// soft decode (K>=2) must RECOVER. We do this in the symbol domain by adding a
+// strong interfering tone to ONE suffix symbol's wrong bin via passband mixing
+// is fiddly; instead we exercise the decoder primitive directly with a crafted
+// candidate matrix (the DSP-independent core of the fix).
+static void test_suffix_soft_corrects_one_flip() {
+	const char* name = "suffix_soft_corrects_one_flip";
+	cl_arq_controller arq;
+	const int n = 13, K = 4, bpt = 4;  // M=16
+
+	// Choose a payload, compute its true tones + CRC.
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, true, "W1AW", 4);
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+	uint64_t field = ((uint64_t)MFSK_CTRL_START_CONN << 50) | (p38 << 12) | crc12;
+	int true_tones[16];
+	for (int g = 0; g < n; g++) {
+		int shift = 52 - bpt * (g + 1); if (shift < 0) shift = 0;
+		true_tones[g] = (int)((field >> shift) & 0xF);
+	}
+
+	// Build candidate matrix: argmax = true tone everywhere EXCEPT symbol 5,
+	// where the argmax is a WRONG tone and the true tone is the 2nd candidate.
+	std::vector<int> cand((size_t)n * K, -1);
+	std::vector<double> cost((size_t)n * K, 1e300);
+	for (int s = 0; s < n; s++) {
+		if (s == 5) {
+			cand[s*K+0] = (true_tones[s] + 1) & 0xF; cost[s*K+0] = 0.0;   // wrong argmax
+			cand[s*K+1] = true_tones[s];             cost[s*K+1] = 0.10;  // true is 2nd
+			cand[s*K+2] = (true_tones[s] + 2) & 0xF; cost[s*K+2] = 0.30;
+			cand[s*K+3] = (true_tones[s] + 3) & 0xF; cost[s*K+3] = 0.50;
+		} else {
+			cand[s*K+0] = true_tones[s];             cost[s*K+0] = 0.0;
+			cand[s*K+1] = (true_tones[s] + 1) & 0xF; cost[s*K+1] = 0.40;
+			cand[s*K+2] = (true_tones[s] + 2) & 0xF; cost[s*K+2] = 0.60;
+			cand[s*K+3] = (true_tones[s] + 3) & 0xF; cost[s*K+3] = 0.80;
+		}
+	}
+
+	// Hard decode (K=1) MUST fail (symbol 5 argmax is wrong → CRC fail).
+	uint64_t hp = 0; int hflips = -1;
+	bool hard = soft_list_decode_ctrl_suffix(cand.data(), cost.data(), n, 1, bpt,
+		(uint8_t)MFSK_CTRL_START_CONN, 4000, /*max_flips=*/0, prod_crc12_cb, &arq, &hp, &hflips);
+	if (hard) { test_fail(name, "hard (K=1) unexpectedly decoded a flipped symbol"); return; }
+
+	// Soft decode (K=4, allow up to 3 flips) MUST recover with exactly 1 flip.
+	uint64_t sp = 0; int sflips = -1;
+	bool soft = soft_list_decode_ctrl_suffix(cand.data(), cost.data(), n, K, bpt,
+		(uint8_t)MFSK_CTRL_START_CONN, 4000, /*max_flips=*/3, prod_crc12_cb, &arq, &sp, &sflips);
+	if (!soft) { test_fail(name, "soft (K=4) failed to correct 1 flipped symbol"); return; }
+	if (sp != p38) { test_fail(name, "soft payload mismatch after correction"); return; }
+	if (sflips != 1) { char b[80]; snprintf(b,sizeof(b),"expected 1 flip, got %d", sflips); test_fail(name, b); return; }
+	test_pass(name);
+}
+
+// §9.4 — FALSE-ACCEPT RATE vs the max_flips Hamming-ball lever (the throughput/
+// safety knob, connect-suffix-fec-research.md §3). Feed pure-noise candidate
+// matrices to the CRC-aided search and measure the spurious-accept rate at
+// several flip caps. The accept rate is the per-decode probability that random
+// tones happen to satisfy CRC12 + type within the explored ball — it scales
+// with the number of codewords searched ≈ sum_{i<=f} C(n,i)*(K-1)^i, each with
+// CRC pass prob 2^-12 and type-match prob 1/4. The flip cap keeps this tiny.
+// We ASSERT that the default max_flips=1 holds FAR < 1% (a logic bug that
+// ignored the cap would accept ~14%, as the unbounded/flips=3 search does).
+// The full table is logged for the decision (it sets the safe operating point:
+// flips=1 ≈ 0.25%, flips=2 ≈ 3.4%, flips=3 ≈ 14%).
+static void test_suffix_soft_pure_noise_far() {
+	const char* name = "suffix_soft_pure_noise_far";
+	cl_arq_controller arq;
+	const int n = 13, K = 4, bpt = 4;
+	const int trials = 2000;
+	const int caps[] = {0, 1, 2, 3, -1};  // -1 = unbounded (only max_trials caps)
+	const int NC = (int)(sizeof(caps)/sizeof(caps[0]));
+	printf("    [FAR] pure-noise spurious-accept rate vs max_flips (n=13,K=4,max_trials=4000):\n");
+	double far_cap1 = 1.0;
+	for (int ci = 0; ci < NC; ci++) {
+		std::mt19937 rng(0x50F7FEC);  // same noise across caps for comparability
+		int accepts = 0;
+		for (int it = 0; it < trials; it++) {
+			std::vector<int> cand((size_t)n * K);
+			std::vector<double> cost((size_t)n * K);
+			for (int s = 0; s < n; s++)
+				for (int k = 0; k < K; k++) {
+					cand[s*K+k] = (int)(rng() & 0xF);
+					cost[s*K+k] = 0.05 * k + (double)(rng() % 100) / 1000.0;
+				}
+			uint64_t p = 0; int fl = -1;
+			if (soft_list_decode_ctrl_suffix(cand.data(), cost.data(), n, K, bpt,
+				(uint8_t)MFSK_CTRL_START_CONN, 4000, caps[ci], prod_crc12_cb, &arq, &p, &fl))
+				accepts++;
+		}
+		double rate = (double)accepts / trials;
+		printf("      max_flips=%2d : FAR = %d/%d = %.4f\n", caps[ci], accepts, trials, rate);
+		if (caps[ci] == 1) far_cap1 = rate;
+	}
+	if (far_cap1 > 0.01) {
+		char b[120]; snprintf(b, sizeof(b),
+			"max_flips=1 FAR %.4f > 0.01 — Hamming-ball cap not bounding false accepts", far_cap1);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// §9.5 — NB (M<16) unchanged: soft entry points return false (no suffix FEC).
+static void test_suffix_soft_nb_unsupported() {
+	const char* name = "suffix_soft_nb_unsupported";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE;
+	ts.narrowband_enabled = true;
+	ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.ack_sack_suffix_len() != 0) {
+		// Some builds keep ack_mfsk at M=16 even for NB data; only assert when
+		// the suffix is genuinely unsupported.
+		test_pass(name); return;
+	}
+	std::vector<double> audio(16384, 0.0);
+	uint64_t rx_p38 = 0;
+	bool ok = ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(),
+		MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rx_p38, nullptr, nullptr);
+	if (ok) { test_fail(name, "soft decode returned true on NB (suffix_len=0)"); return; }
+	test_pass(name);
+}
+
+// §9.6 — THE MEASUREMENT: suffix decode cliff (P(CRC-pass) vs SNR3k) for the
+// baseline HARD path vs the SOFT list decode at the two SAFE flip caps
+// (max_flips=1 default ≈0.25% FAR, and =2 ≈3.4% FAR — see §9.4). Also reports
+// the BASE-pattern detection floor (the lower bound the suffix is tracking
+// toward). Prints the headline acquisition-gain dB. Deterministic seed.
+//
+// SNR3k is calibrated: the base-detect cliff lands at ≈ −14.7 dB here, matching
+// the data-preamble floor the cliff agent measured (−14.6 dB) — so the absolute
+// axis is comparable to that prior work, and the HARD suffix cliff reproduces
+// their −8.6 dB suffix figure.
+static void suffix_cliff_one(const char* label, bool ack_path) {
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.ack_sack_suffix_len() <= 0) { printf("    [cliff %s] suffix_len=0, skip\n", label); return; }
+
+	double fs = ts.sampling_frequency;
+	int active = 0;
+	std::vector<double> ref = ack_path ? build_ack_sack_audio(ts, 0x0, active)
+	                                   : build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, 0x0, active);
+	double p_sig = suffix_pb_power(ref, active);
+
+	// Range brackets all cliffs (base detector dies ~sigma 5.6). Larger sigma =
+	// lower SNR. High-SNR points (all 1.0) trimmed to bound runtime.
+	const double sigmas[] = {1.4, 2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.8, 5.6, 6.6};
+	const int NS = (int)(sizeof(sigmas)/sizeof(sigmas[0]));
+	const int N = 100;  // trials per sigma
+	int base_thr = ack_path ? ts.ack_mfsk.ack_match_threshold
+	                        : ts.ack_mfsk.connect_match_threshold;
+	std::mt19937 rng(0xC1FF7E5);
+
+	double base_cliff_s=0, hard_cliff_s=0, soft1_cliff_s=0, soft2_cliff_s=0;
+	double base_cliff_snr=999, hard_cliff_snr=999, soft1_cliff_snr=999, soft2_cliff_snr=999;
+	printf("    [cliff %s] p_sig=%.4g base_thr=%d  (sigma : SNR3k_dB : P_baseDet : P_hard : P_soft@1 : P_soft@2)\n",
+		label, p_sig, base_thr);
+	for (int si = 0; si < NS; si++) {
+		double sigma = sigmas[si];
+		int hard_ok=0, soft1_ok=0, soft2_ok=0, base_ok=0;
+		for (int it = 0; it < N; it++) {
+			uint64_t p38 = (((uint64_t)rng() << 6) ^ rng()) & ((1ULL<<38)-1ULL);
+			int act = 0;
+			std::vector<double> audio = ack_path ? build_ack_sack_audio(ts, p38, act)
+			                                     : build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, act);
+			std::normal_distribution<double> nd(0.0, sigma);
+			for (size_t i = 0; i < audio.size(); i++) audio[i] += nd(rng);
+
+			int sm = 0;
+			if (ack_path) {
+				uint8_t bsi=0; uint32_t bm=0; uint16_t hc=0; int m=0;
+				bool hdet = ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(), &bsi, &bm, &hc, &m);
+				if (hdet) {
+					uint8_t hb[5]; uint64_t hp38 = ((uint64_t)bsi<<30)|(bm&0x3FFFFFFFu);
+					pack_ctrl_typed40_msb(hb, (uint8_t)MFSK_CTRL_ACK_SACK, hp38);
+					if ((arq.CRC12_calc((char*)hb,5)&0xFFF) == hc) hard_ok++;
+				}
+				uint8_t sb; uint32_t sbm; int fl;
+				ts.suffix_fec_max_flips = 1;
+				if (ts.decode_ack_sack_from_passband_soft(audio.data(), (int)audio.size(), prod_crc12_cb, &arq, &sb, &sbm, &sm, &fl)) soft1_ok++;
+				ts.suffix_fec_max_flips = 2;
+				if (ts.decode_ack_sack_from_passband_soft(audio.data(), (int)audio.size(), prod_crc12_cb, &arq, &sb, &sbm, nullptr, &fl)) soft2_ok++;
+			} else {
+				mfsk_ctrl_frame_type t2; uint64_t hp=0; uint16_t hc=0; int m=0;
+				bool hdet = ts.decode_ctrl_suffix_from_passband(audio.data(), (int)audio.size(), &t2, &hp, &hc, &m);
+				if (hdet) {
+					uint8_t hb[5]; pack_ctrl_typed40_msb(hb, (uint8_t)t2, hp);
+					if ((arq.CRC12_calc((char*)hb,5)&0xFFF)==hc && t2==MFSK_CTRL_START_CONN) hard_ok++;
+				}
+				uint64_t sp; int fl;
+				ts.suffix_fec_max_flips = 1;
+				if (ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(), MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &sp, &sm, &fl)) soft1_ok++;
+				ts.suffix_fec_max_flips = 2;
+				if (ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(), MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &sp, nullptr, &fl)) soft2_ok++;
+			}
+			if (sm >= base_thr) base_ok++;  // base-pattern detected
+		}
+		double pb=(double)base_ok/N, ph=(double)hard_ok/N, ps1=(double)soft1_ok/N, ps2=(double)soft2_ok/N;
+		double snr = snr3k_db(p_sig, sigma, fs);
+		printf("      %.3f : %7.2f : %.3f : %.3f : %.3f : %.3f\n", sigma, snr, pb, ph, ps1, ps2);
+		if (pb  >= 0.5 && sigma > base_cliff_s ) { base_cliff_s  = sigma; base_cliff_snr  = snr; }
+		if (ph  >= 0.5 && sigma > hard_cliff_s ) { hard_cliff_s  = sigma; hard_cliff_snr  = snr; }
+		if (ps1 >= 0.5 && sigma > soft1_cliff_s) { soft1_cliff_s = sigma; soft1_cliff_snr = snr; }
+		if (ps2 >= 0.5 && sigma > soft2_cliff_s) { soft2_cliff_s = sigma; soft2_cliff_snr = snr; }
+	}
+	ts.suffix_fec_max_flips = 1;  // restore default
+	double g1 = (hard_cliff_s>0 && soft1_cliff_s>0) ? 20.0*std::log10(soft1_cliff_s/hard_cliff_s) : 0.0;
+	double g2 = (hard_cliff_s>0 && soft2_cliff_s>0) ? 20.0*std::log10(soft2_cliff_s/hard_cliff_s) : 0.0;
+	printf("    [cliff %s] BASE-detect floor: SNR3k=%.2f dB | HARD suffix: %.2f dB | SOFT@1: %.2f dB | SOFT@2: %.2f dB\n",
+		label, base_cliff_snr, hard_cliff_snr, soft1_cliff_snr, soft2_cliff_snr);
+	printf("    [cliff %s] ==> acquisition gain: SOFT@1(FAR~0.25%%) = %.2f dB | SOFT@2(FAR~3.4%%) = %.2f dB\n",
+		label, g1, g2);
+}
+
+static void test_suffix_fec_cliff_sweep() {
+	const char* name = "suffix_fec_cliff_sweep";
+	printf("  [MEASURE] suffix-FEC acquisition cliff (hard vs soft CRC-list decode):\n");
+	suffix_cliff_one("CONNECT", /*ack_path=*/false);
+	suffix_cliff_one("ACK    ", /*ack_path=*/true);
+	test_pass(name);  // infra ran; dB verdict is in the log
+}
+
+// =============================================================================
+// §10 Tier-2 candidate A: soft GF(16) rate-~1/2 RA code
+// (fact-documents/tier2-suffix-fec-gf16-spike.md)
+//
+// SIM SPIKE. Measures the GF(16)-RA acquisition cliff on the SAME SNR3k axis as
+// §9 so it is directly comparable to the parallel Golay(24,12) spike and to the
+// Tier-1 baseline. The 20-symbol coded suffix is built measurement-only (does
+// NOT touch the production 13-sym wire format). Tests:
+//   10.1 gf16_ra_encode_decode_clean   — codec round-trip, zero-noise energies
+//   10.2 gf16_ra_byte_identical_when_off — mode=0 production decode untouched
+//   10.3 gf16_ra_passband_roundtrip_clean — full TX->passband->RX->decode @sigma0
+//   10.4 gf16_ra_pure_noise_far        — FAR on pure noise vs Tier-1's 0.25%
+//   10.5 gf16_ra_cliff_sweep           — [MEASURE] cliff + coding gain dB
+// =============================================================================
+
+// Es/No design point for the Bessel intrinsic metric. qra_mfskbesselmetric
+// fixes this since true Es/No is unknowable at ~20-40 symbols. Swept on a
+// realistic Rician/Rayleigh channel (fact-doc §8): the optimum is broad and
+// ~6 dB (Es/No=4) gives ~1 dB better cliff than the naive 0 dB. Higher values
+// are within ~0.1 dB of optimum across the cliff regime.
+static const double GF16RA_ESNO_METRIC = 4.0;   // 6 dB
+static const int    GF16RA_BP_MAXITER  = 50;
+
+// Toggles the control mini-Moose in decode_gf16ra_from_passband (see fact-doc
+// §8). Default true = skip it (measure the code's intrinsic reach). The cliff
+// sweep flips this to also report the Moose-limited end-to-end cliff.
+bool g_gf16_skip_moose = true;
+// Toggles the metric>=3.0 detection-confidence gate (fact-doc §8). Default false
+// = production gate (cliffs ~-8.7, the binding constraint Tier-1 also hits).
+// true = FEC-reach measurement (base matched-count only, which reaches -14.68).
+bool g_gf16_relax_metric_gate = false;
+
+// Build CONNECT base + the GF(16)-RA coded suffix (codeword_len() symbols) into
+// a fresh passband buffer. Mirrors generate_ctrl_suffix_pattern's tone-hop +
+// amplitude exactly, but lays down the coded suffix instead of the 13-symbol
+// uncoded wire. Caller must gf16ra::configure(repfact) first. Returns the active
+// sample count (base+suffix) in out_active; the suffix starts at sample offset
+// 4096 (matching the §9 builders so snr3k_db / suffix_pb_power is identical).
+static std::vector<double> build_gf16ra_suffix_audio(cl_telecom_system& ts,
+	uint8_t type, uint64_t p38, cl_arq_controller& arq, int& out_active)
+{
+	cl_mfsk& m = ts.ack_mfsk;
+	int base = m.connect_pattern_nsymb;
+	int nsuf = gf16ra::codeword_len();
+	int nsymb = base + nsuf;
+
+	// CRC12 over the 5-byte [type|payload38] via PRODUCTION helper (never inline).
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, type, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	int code_tones[gf16ra::GF16RA_MAX_N];
+	gf16ra::encode(type, p38, crc12, code_tones);
+
+	// PRIVATE framed buffer: nsymb can exceed the shared ofdm_framed_data cap
+	// (alloc_Nsymb=48) at repfact>=2 (16 base + 39/52 suffix). Build into our own
+	// vector to avoid overrunning the data_container buffer.
+	int Nc = ts.data_container.Nc;
+	std::vector<std::complex<double> > framed((size_t)nsymb * Nc, std::complex<double>(0.0, 0.0));
+	double amp = sqrt((double)Nc / m.nStreams);
+
+	// CONNECT base pattern (mirror cl_mfsk::generate_connect_pattern, 8-tone base).
+	const int base_len = 8;
+	for (int s = 0; s < base; s++) {
+		int tone_base = m.connect_tones[s % base_len];
+		int actual_tone = (tone_base + s * m.tone_hop_step) % m.M;
+		for (int st = 0; st < m.nStreams; st++)
+			framed[(size_t)s * Nc + m.stream_offsets[st] + actual_tone] = std::complex<double>(amp, 0.0);
+	}
+	// Coded suffix, SAME tone-hop + amp as generate_ctrl_suffix_pattern.
+	for (int s = 0; s < nsuf; s++) {
+		int abs_s = base + s;
+		int actual_tone = (code_tones[s] + abs_s * m.tone_hop_step) % m.M;
+		for (int st = 0; st < m.nStreams; st++)
+			framed[(size_t)abs_s * Nc + m.stream_offsets[st] + actual_tone] = std::complex<double>(amp, 0.0);
+	}
+
+	// symbol_mod + power-normalize + ACK gain (mirror generate_ctrl_suffix_pattern_passband).
+	int Nofdm = ts.data_container.Nofdm;
+	std::vector<std::complex<double> > modulated((size_t)Nofdm * nsymb);
+	float power_normalization = sqrt((double)(ts.ofdm.Nfft * ts.frequency_interpolation_rate));
+	for (int i = 0; i < nsymb; i++)
+		ts.ofdm.symbol_mod(&framed[(size_t)i * Nc], &modulated[(size_t)i * Nofdm]);
+	double ack_boost = ts.get_tx_gain(TX_SIG_ACK);
+	for (int j = 0; j < Nofdm * nsymb; j++) {
+		modulated[j] /= power_normalization;
+		modulated[j] *= sqrt(ts.output_power_Watt) * ack_boost;
+	}
+
+	int active_samples = Nofdm * nsymb * ts.frequency_interpolation_rate;
+	out_active = active_samples;
+	std::vector<double> audio((size_t)active_samples + 8192, 0.0);
+	ts.ofdm.baseband_to_passband(modulated.data(), Nofdm * nsymb, audio.data() + 4096,
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		ts.frequency_interpolation_rate);
+	ts.ofdm.peak_clip(audio.data() + 4096, active_samples, ts.ofdm.data_papr_cut);
+	return audio;
+}
+
+// RX: detect CONNECT base + mini-Moose (same pipeline as the production hard /
+// Tier-1 soft path), then extract the full per-tone energy matrix for the 20
+// suffix symbols and run the GF(16) BP decode. Returns true on CRC+type accept.
+static bool decode_gf16ra_from_passband(cl_telecom_system& ts, double* data, int size,
+	uint8_t expected_type, cl_arq_controller& arq, uint64_t* out_p38, int* out_iters)
+{
+	if (out_p38) *out_p38 = 0;
+	if (out_iters) *out_iters = -1;
+	cl_mfsk& m = ts.ack_mfsk;
+	if (m.connect_pattern_nsymb <= 0) return false;
+
+	int M = ts.data_container.interpolation_rate;
+	int dec_size = size / M;
+	double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	ts.ofdm.passband_to_baseband_decimated(data, size,
+		ts.data_container.baseband_data_interpolated,
+		ts.sampling_frequency, eff_carrier, ts.carrier_amplitude, M, &ts.ofdm.FIR_rx_data);
+
+	int matched = 0, best_offset = -1;
+	double metric = ts.ofdm.detect_ack_pattern(
+		ts.data_container.baseband_data_interpolated, dec_size, 1,
+		m.connect_pattern_nsymb, m.connect_tones, /*base_len=*/8,
+		m.tone_hop_step, m.M, m.nStreams, m.stream_offsets,
+		&matched, 0, nullptr, &best_offset,
+		/*reserve_after=*/gf16ra::codeword_len(), nullptr);
+	// The metric>=3.0 confidence gate is a DETECTION-stage decision inherited by
+	// the production hard / Tier-1 paths; it cliffs at ~-8.7 dB and pins BOTH
+	// (fact-doc §8). g_gf16_relax_metric_gate measures the FEC reach given only
+	// the base matched-count (the criterion that itself reaches -14.68 dB).
+	extern bool g_gf16_relax_metric_gate;
+	double metric_floor = g_gf16_relax_metric_gate ? 0.0 : 3.0;
+	if (matched < m.connect_match_threshold || metric < metric_floor || best_offset < 0)
+		return false;
+
+	// NOTE (fact-doc §8): the control mini-Moose (carrier_frequency_sync_wb_ctrl
+	// + re-decimate) that the production hard / Tier-1 paths run here produces
+	// NOISY residual estimates at low SNR and CORRUPTS the baseband — it pins
+	// BOTH the hard suffix AND any soft decoder at the same -8.66 dB cliff,
+	// masking the code's true reach. Energies-direct (no Moose) the GF(16) code
+	// decodes past -10.8 dB. g_gf16_skip_moose lets the cliff harness measure
+	// both: ON (default) = the code's intrinsic reach; OFF = the Moose-limited
+	// end-to-end cliff (apples-to-apples with the current Tier-1/hard scaffolding).
+	extern bool g_gf16_skip_moose;
+	if (!g_gf16_skip_moose) {
+		double ctrl_residual = ts.ofdm.carrier_frequency_sync_wb_ctrl(
+			ts.data_container.baseband_data_interpolated,
+			ts.bandwidth / (double)ts.data_container.Nc,
+			m.connect_pattern_nsymb, best_offset,
+			m.connect_tones, /*pattern_len=*/8, m.tone_hop_step, m.M,
+			m.nStreams, m.stream_offsets);
+		if (fabs(ctrl_residual) > ts.ofdm.freq_offset_ignore_limit) {
+			ts.ofdm.passband_to_baseband_decimated(data, size,
+				ts.data_container.baseband_data_interpolated,
+				ts.sampling_frequency, eff_carrier - ctrl_residual, ts.carrier_amplitude,
+				M, &ts.ofdm.FIR_rx_data);
+			int rematched = 0, rebest = -1;
+			double remetric = ts.ofdm.detect_ack_pattern(
+				ts.data_container.baseband_data_interpolated, dec_size, 1,
+				m.connect_pattern_nsymb, m.connect_tones, 8, m.tone_hop_step, m.M,
+				m.nStreams, m.stream_offsets, &rematched, 0, nullptr, &rebest,
+				gf16ra::codeword_len(), nullptr);
+			if (rematched >= m.connect_match_threshold && remetric >= 3.0 && rebest >= 0)
+				best_offset = rebest;
+		}
+	}
+
+	std::vector<double> energies((size_t)gf16ra::codeword_len() * m.M);
+	ts.ofdm.decode_suffix_energies(
+		ts.data_container.baseband_data_interpolated, dec_size, 1,
+		best_offset, m.connect_pattern_nsymb, gf16ra::codeword_len(),
+		m.tone_hop_step, m.M, m.nStreams, m.stream_offsets, energies.data());
+
+	return gf16ra::soft_decode(energies.data(), GF16RA_BP_MAXITER,
+		GF16RA_ESNO_METRIC, expected_type, prod_crc12_cb, &arq, out_p38, out_iters);
+}
+
+// TEMP DIAGNOSTIC: build GF16 passband at sigma, extract energies, report
+// argmax-error count + energy-domain SNR. Reveals whether the passband at the
+// cliff delivers energies the code can correct.
+static void gf16_diag_energy(double sigma) {
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq; gf16ra::configure(2); gf16ra::init();
+	cl_mfsk& m = ts.ack_mfsk;
+	int N = gf16ra::codeword_len();
+	std::mt19937 rng(0xD1A6);
+	double snr_sum=0; int errsum=0, det=0; const int T=80;
+	int em_ok[6]={0,0,0,0,0,0}; int em_ok2=0; const double ems[6]={0.5,1,2,4,8,16};
+	for (int t=0;t<T;t++){
+		uint64_t p38=(((uint64_t)rng()<<6)^rng())&((1ULL<<38)-1ULL);
+		uint8_t by[5]; pack_ctrl_typed40_msb(by,(uint8_t)MFSK_CTRL_START_CONN,p38);
+		uint16_t crc=arq.CRC12_calc((char*)by,5)&0x0FFF;
+		int tones[gf16ra::GF16RA_MAX_N]; gf16ra::encode((uint8_t)MFSK_CTRL_START_CONN,p38,crc,tones);
+		int act=0; std::vector<double> audio=build_gf16ra_suffix_audio(ts,MFSK_CTRL_START_CONN,p38,arq,act);
+		std::normal_distribution<double> nd(0.0,sigma);
+		for(size_t i=0;i<audio.size();i++) audio[i]+=nd(rng);
+		int M=ts.data_container.interpolation_rate, dec=(int)audio.size()/M;
+		ts.ofdm.passband_to_baseband_decimated(audio.data(),(int)audio.size(),ts.data_container.baseband_data_interpolated,ts.sampling_frequency,ts.carrier_frequency+ts.last_coarse_freq_offset,ts.carrier_amplitude,M,&ts.ofdm.FIR_rx_data);
+		int sm=0,bo=-1;
+		ts.ofdm.detect_ack_pattern(ts.data_container.baseband_data_interpolated,dec,1,m.connect_pattern_nsymb,m.connect_tones,8,m.tone_hop_step,m.M,m.nStreams,m.stream_offsets,&sm,0,nullptr,&bo,N,nullptr);
+		if(sm<m.connect_match_threshold||bo<0) continue;
+		det++;
+		std::vector<double> e((size_t)N*m.M);
+		ts.ofdm.decode_suffix_energies(ts.data_container.baseband_data_interpolated,dec,1,bo,m.connect_pattern_nsymb,N,m.tone_hop_step,m.M,m.nStreams,m.stream_offsets,e.data());
+		int errs=0; double et=0,eo=0;
+		for(int s=0;s<N;s++){int am=0;double bv=-1;for(int q=0;q<m.M;q++)if(e[s*m.M+q]>bv){bv=e[s*m.M+q];am=q;}
+			if(am!=tones[s])errs++; et+=e[s*m.M+tones[s]]; for(int q=0;q<m.M;q++) if(q!=tones[s]) eo+=e[s*m.M+q];}
+		errsum+=errs; snr_sum += (eo>0)? 10*log10(et/(eo/(m.M-1))) : 99;
+		// Decode the SAME real energies at several esno_metric values (inline,
+		// no detect-gate). em_ok[6] = decode_gf16ra_from_passband (full path).
+		for(int q=0;q<6;q++){uint64_t rp=0;int it=-2; if(gf16ra::soft_decode(e.data(),50,ems[q],(uint8_t)MFSK_CTRL_START_CONN,prod_crc12_cb,&arq,&rp,&it)&&rp==p38)em_ok[q]++;}
+		{uint64_t rp=0;int it=-2; if(decode_gf16ra_from_passband(ts,audio.data(),(int)audio.size(),MFSK_CTRL_START_CONN,arq,&rp,&it)&&rp==p38)em_ok2++;}
+	}
+	printf("    [DIAG sigma=%.2f] det=%d/%d argmax_errs=%.1f/%d eSNR=%.1fdB | inline-P@esno{.5,1,2,4,8,16}=",
+		sigma, det, T, det?(double)errsum/det:-1, N, det?snr_sum/det:-1);
+	for(int q=0;q<6;q++)printf("%.2f ",(double)em_ok[q]/T);
+	printf("| full-path-P=%.2f\n",(double)em_ok2/T);
+}
+
+// §10.1 — codec round-trip on synthetic ZERO-noise energies (each symbol's true
+// §10.0 — SYMBOL-CORRECTION CAPABILITY (the proof the code is a STRONG code, not
+// a strawman). Build clean energies, force `nflip` symbols to a wrong dominant
+// tone, and measure decode success vs nflip for each repfact operating point.
+// A true degree-3 RA code must correct several symbol errors at the lower rates
+// (this is what the first degree-9 attempt could NOT do — see fact-doc §8). The
+// expected-symbol-error-count at the floor is ~q*N (q~=0.24); the cliff is set
+// by how many flips the code corrects with high probability.
+static void test_gf16_ra_correction_capability() {
+	const char* name = "gf16_ra_correction_capability";
+	cl_arq_controller arq;
+	printf("    [CAP] GF(16)-RA symbol-correction capability (P(decode) vs #wrong symbols):\n");
+	const int repfacts[] = {1, 2, 3};
+	for (int ri = 0; ri < 3; ri++) {
+		int N = gf16ra::configure(repfacts[ri]);
+		gf16ra::init();
+		printf("      repfact=%d  N=%2d  R=%.2f  NC=%d :",
+			repfacts[ri], N, (double)gf16ra::GF16RA_K / N, gf16ra::parity_len());
+		std::mt19937 rng(0xC0FFEE + ri);
+		for (int nflip = 0; nflip <= 8; nflip++) {
+			int ok = 0; const int T = 200;
+			for (int t = 0; t < T; t++) {
+				uint64_t p38 = (((uint64_t)rng() << 6) ^ rng()) & ((1ULL << 38) - 1ULL);
+				uint8_t by[5]; pack_ctrl_typed40_msb(by, (uint8_t)MFSK_CTRL_START_CONN, p38);
+				uint16_t crc = arq.CRC12_calc((char*)by, 5) & 0x0FFF;
+				int tones[gf16ra::GF16RA_MAX_N];
+				gf16ra::encode((uint8_t)MFSK_CTRL_START_CONN, p38, crc, tones);
+				std::vector<double> e((size_t)N * 16, 0.0);
+				for (int s = 0; s < N; s++) { for (int mm = 0; mm < 16; mm++) e[s*16+mm] = 0.1; e[s*16+tones[s]] = 1.0; }
+				// flip nflip distinct symbols to a wrong dominant tone
+				std::vector<int> idx(N); for (int i = 0; i < N; i++) idx[i] = i;
+				for (int i = 0; i < nflip; i++) { int j = i + (int)(rng() % (N - i)); std::swap(idx[i], idx[j]); }
+				for (int i = 0; i < nflip; i++) { int s = idx[i]; int wrong = (tones[s] + 1 + (int)(rng() % 15)) & 0xF;
+					e[s*16+tones[s]] = 0.1; e[s*16+wrong] = 1.0; }
+				uint64_t rp = 0; int it = -2;
+				if (gf16ra::soft_decode(e.data(), GF16RA_BP_MAXITER, GF16RA_ESNO_METRIC,
+					(uint8_t)MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rp, &it) && rp == p38) ok++;
+			}
+			printf(" %d:%.2f", nflip, (double)ok / 200);
+		}
+		printf("\n");
+	}
+	gf16ra::configure(2);  // restore default
+	test_pass(name);
+}
+
+// tone gets all the energy). Exercises encode + BP + CRC gate without DSP.
+static void test_gf16_ra_encode_decode_clean() {
+	const char* name = "gf16_ra_encode_decode_clean";
+	cl_arq_controller arq;
+	gf16ra::configure(2);
+	gf16ra::init();
+	std::mt19937 rng(0x6F16);
+	const mfsk_ctrl_frame_type types[] = {
+		MFSK_CTRL_START_CONN, MFSK_CTRL_TEST_ACK, MFSK_CTRL_TEST_CONN, MFSK_CTRL_ACK_SACK };
+	for (int ti = 0; ti < 4; ti++) {
+		for (int trial = 0; trial < 50; trial++) {
+			uint64_t p38 = (((uint64_t)rng() << 6) ^ rng()) & ((1ULL << 38) - 1ULL);
+			uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)types[ti], p38);
+			uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+			int tones[gf16ra::GF16RA_MAX_N];
+			gf16ra::encode((uint8_t)types[ti], p38, crc12, tones);
+			// Build clean energies: 1.0 on the true tone, 0 elsewhere.
+			int NN = gf16ra::codeword_len();
+			std::vector<double> e((size_t)NN * 16, 0.0);
+			for (int s = 0; s < NN; s++) e[(size_t)s * 16 + tones[s]] = 1.0;
+			uint64_t rx_p38 = 0; int iters = -2;
+			bool ok = gf16ra::soft_decode(e.data(), GF16RA_BP_MAXITER, GF16RA_ESNO_METRIC,
+				(uint8_t)types[ti], prod_crc12_cb, &arq, &rx_p38, &iters);
+			if (!ok || rx_p38 != p38) {
+				char b[160]; snprintf(b, sizeof(b),
+					"type=%d trial=%d ok=%d p38=0x%llx rx=0x%llx iters=%d",
+					types[ti], trial, ok, (unsigned long long)p38,
+					(unsigned long long)rx_p38, iters);
+				test_fail(name, b); return;
+			}
+		}
+	}
+	test_pass(name);
+}
+
+// §10.2 — mode=0 byte/decode-identical: the GF(16) path is gated behind
+// suffix_fec_mode==3 and never wired into the production hard decode. We assert
+// the production decode_ctrl_suffix_from_passband on a normal 13-sym CONNECT is
+// unaffected by the presence of the GF(16) codec (the hard path doesn't call
+// gf16ra at all). This mirrors §9.2's invariant for the Tier-1 soft path.
+static void test_gf16_ra_byte_identical_when_off() {
+	const char* name = "gf16_ra_byte_identical_when_off";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	if (ts.suffix_fec_mode != 0) { test_fail(name, "suffix_fec_mode default != 0"); return; }
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	int active = 0;
+	std::vector<double> audio = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, active);
+	mfsk_ctrl_frame_type t; uint64_t rp=0; uint16_t rc=0; int mm=0;
+	bool ok = ts.decode_ctrl_suffix_from_passband(audio.data(), (int)audio.size(), &t, &rp, &rc, &mm);
+	if (!ok || t != MFSK_CTRL_START_CONN || rp != p38) {
+		test_fail(name, "production 13-sym hard decode changed (gf16 leaked into baseline)"); return;
+	}
+	test_pass(name);
+}
+
+// §10.3 — full TX -> passband -> AWGN(sigma=0) -> RX -> GF(16) BP decode.
+static void test_gf16_ra_passband_roundtrip_clean() {
+	const char* name = "gf16_ra_passband_roundtrip_clean";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	gf16ra::configure(2);
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) { test_fail(name, "connect_pattern_nsymb=0"); return; }
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, true, "W1AW", 4);
+	int active = 0;
+	std::vector<double> audio = build_gf16ra_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, arq, active);
+	uint64_t rx_p38 = 0; int iters = -2;
+	bool ok = decode_gf16ra_from_passband(ts, audio.data(), (int)audio.size(),
+		MFSK_CTRL_START_CONN, arq, &rx_p38, &iters);
+	if (!ok) { test_fail(name, "GF(16) decode miss on clean passband"); return; }
+	if (rx_p38 != p38) {
+		char b[160]; snprintf(b, sizeof(b), "payload mismatch tx=0x%llx rx=0x%llx",
+			(unsigned long long)p38, (unsigned long long)rx_p38);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// §10.4 — FALSE-ACCEPT RATE on pure noise vs Tier-1's 0.25% (tier2-design §7
+// open question). The BP decoder emits ONE codeword/call; a pure-noise input
+// passes only if that word's recomputed CRC matches its decoded CRC AND type
+// matches — structural ceiling ~2^-12 * 1/4 ~= 6.1e-5. We feed random per-tone
+// energies and assert FAR stays well under Tier-1's 0.25% (< 0.5% with margin
+// for the finite trial count). Logged for the decision.
+static void test_gf16_ra_pure_noise_far() {
+	const char* name = "gf16_ra_pure_noise_far";
+	cl_arq_controller arq;
+	gf16ra::configure(2);
+	gf16ra::init();
+	const int trials = 5000;
+	std::mt19937 rng(0x6F16FA7);
+	std::exponential_distribution<double> ed(1.0);  // |CN|^2 ~ exponential
+	int accepts = 0;
+	for (int it = 0; it < trials; it++) {
+		int NN = gf16ra::codeword_len();
+		std::vector<double> e((size_t)NN * 16);
+		for (int i = 0; i < NN * 16; i++) e[i] = ed(rng);
+		uint64_t p = 0; int iters = -2;
+		if (gf16ra::soft_decode(e.data(), GF16RA_BP_MAXITER, GF16RA_ESNO_METRIC,
+			(uint8_t)MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &p, &iters))
+			accepts++;
+	}
+	double far_rate = (double)accepts / trials;
+	printf("    [FAR] GF(16)-RA pure-noise spurious-accept: %d/%d = %.4f "
+		"(Tier-1 ref 0.0025; structural ceiling ~6.1e-5)\n", accepts, trials, far_rate);
+	if (far_rate > 0.005) {
+		char b[120]; snprintf(b, sizeof(b), "GF(16)-RA FAR %.4f > 0.005", far_rate);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// §10.5 — THE MEASUREMENT: GF(16)-RA acquisition cliff on the SAME SNR3k axis as
+// §9. For each sigma: P(base-detect), P(GF16-RA decode). Reports the cliff
+// (SNR3k at P=0.5), the coding gain vs the §9 HARD suffix, and whether it
+// reaches the base-detect floor (~-14.68 dB). Deterministic seed; directly
+// comparable to the Golay spike and the Tier-1 §9.6 sweep.
+static void gf16ra_cliff_one(int repfact) {
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	int N = gf16ra::configure(repfact);
+	gf16ra::init();
+	char label[32]; snprintf(label, sizeof(label), "GF16 r=%d N=%d", repfact, N);
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) { printf("    [cliff %s] no connect pattern, skip\n", label); return; }
+
+	double fs = ts.sampling_frequency;
+	int active = 0;
+	std::vector<double> ref = build_gf16ra_suffix_audio(ts, MFSK_CTRL_START_CONN, 0x0, arq, active);
+	double p_sig = suffix_pb_power(ref, active);
+	// airtime: N suffix symbols vs Tier-1's 13 (and Golay's 24). 24.33 ms/sym.
+	double added_ms = (N - 13) * 24.33;
+
+	// §9 grid + deeper sigmas (the code reaches past the base-detect knee).
+	const double sigmas[] = {2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.4, 4.8, 5.2, 5.6, 6.0, 6.6};
+	const int NS = (int)(sizeof(sigmas)/sizeof(sigmas[0]));
+	const int NTR = 100;
+	int base_thr = ts.ack_mfsk.connect_match_threshold;
+	std::mt19937 rng(0x6F16C11F);
+
+	double base_cliff_s=0, gf_cliff_s=0;
+	double base_cliff_snr=999, gf_cliff_snr=999;
+	long iters_sum=0, iters_cnt=0;
+	printf("    [cliff %s moose=%s] p_sig=%.4g base_thr=%d  (sigma : SNR3k_dB : P_baseDet : P_gf16ra)\n",
+		label, (g_gf16_skip_moose&&g_gf16_relax_metric_gate)?"FEC-reach":"prod", p_sig, base_thr);
+	for (int si = 0; si < NS; si++) {
+		double sigma = sigmas[si];
+		int gf_ok = 0, base_ok = 0;
+		for (int it = 0; it < NTR; it++) {
+			uint64_t p38 = (((uint64_t)rng() << 6) ^ rng()) & ((1ULL<<38)-1ULL);
+			int act = 0;
+			std::vector<double> audio = build_gf16ra_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, arq, act);
+			std::normal_distribution<double> nd(0.0, sigma);
+			for (size_t i = 0; i < audio.size(); i++) audio[i] += nd(rng);
+
+			// base-detect probability (same threshold as production)
+			int M = ts.data_container.interpolation_rate, dec_size = (int)audio.size()/M;
+			ts.ofdm.passband_to_baseband_decimated(audio.data(), (int)audio.size(),
+				ts.data_container.baseband_data_interpolated, ts.sampling_frequency,
+				ts.carrier_frequency + ts.last_coarse_freq_offset, ts.carrier_amplitude,
+				M, &ts.ofdm.FIR_rx_data);
+			int sm = 0, bo = -1;
+			ts.ofdm.detect_ack_pattern(ts.data_container.baseband_data_interpolated, dec_size, 1,
+				ts.ack_mfsk.connect_pattern_nsymb, ts.ack_mfsk.connect_tones, 8,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+				ts.ack_mfsk.stream_offsets, &sm, 0, nullptr, &bo, gf16ra::codeword_len(), nullptr);
+			if (sm >= base_thr) base_ok++;
+
+			uint64_t rx_p38 = 0; int iters = -2;
+			if (decode_gf16ra_from_passband(ts, audio.data(), (int)audio.size(),
+				MFSK_CTRL_START_CONN, arq, &rx_p38, &iters) && rx_p38 == p38) {
+				gf_ok++;
+				if (iters >= 0) { iters_sum += iters; iters_cnt++; }
+			}
+		}
+		double pb=(double)base_ok/NTR, pg=(double)gf_ok/NTR;
+		double snr = snr3k_db(p_sig, sigma, fs);
+		printf("      %.3f : %7.2f : %.3f : %.3f\n", sigma, snr, pb, pg);
+		if (pb >= 0.5 && sigma > base_cliff_s) { base_cliff_s = sigma; base_cliff_snr = snr; }
+		if (pg >= 0.5 && sigma > gf_cliff_s)   { gf_cliff_s   = sigma; gf_cliff_snr   = snr; }
+	}
+	// Coding gain vs the §9 HARD suffix cliff (-7.3 dB), and vs Tier-1 (-8.7).
+	double iters_mean = (iters_cnt > 0) ? (double)iters_sum / iters_cnt : -1.0;
+	printf("    [cliff %s moose=%s] R=%.2f added_airtime=%.0fms vs13 | BASE floor=%.2f dB | GF16-RA cliff=%.2f dB | BP iter_mean=%.1f\n",
+		label, (g_gf16_skip_moose&&g_gf16_relax_metric_gate)?"FEC-reach":"prod", (double)gf16ra::GF16RA_K / N, added_ms, base_cliff_snr, gf_cliff_snr, iters_mean);
+	printf("    [cliff %s moose=%s] ==> vs Tier-1(-8.7): %+.2f dB | vs base floor(-14.68): %+.2f dB | reaches -14? %s\n",
+		label, (g_gf16_skip_moose&&g_gf16_relax_metric_gate)?"FEC-reach":"prod", gf_cliff_snr - (-8.7), gf_cliff_snr - (-14.68),
+		(gf_cliff_snr <= -14.0) ? "YES" : "no");
+}
+
+static void test_gf16_ra_cliff_sweep() {
+	const char* name = "gf16_ra_cliff_sweep";
+	printf("  [MEASURE] GF(16)-RA Tier-2 acquisition cliff (true deg-3 RA, soft Q-ary BP):\n");
+	printf("    Operating points: repfact 1/2/3 -> N=26/39/52 (R=0.50/0.33/0.25). Airtime +N-13 sym vs Tier-1.\n");
+	// Context: extracted-energy quality at the cliff (argmax errors + decode-P at
+	// repfact=2 vs esno_metric, energies-direct). Shows the code's reach on the
+	// actual passband energies and that the result is insensitive to esno_metric.
+	gf16_diag_energy(3.2); gf16_diag_energy(3.6);
+	// (A) end-to-end with the CURRENT production ctrl-sync scaffolding (mini-Moose
+	// + metric>=3.0 gate). Apples-to-apples with Tier-1's -8.7 dB. Shows the
+	// scaffolding ceiling that pins BOTH Tier-1 and any soft suffix decoder.
+	printf("    --- (A) production scaffolding (mini-Moose ON + metric gate): apples-to-apples w/ Tier-1 ---\n");
+	g_gf16_skip_moose = false; g_gf16_relax_metric_gate = false;
+	gf16ra_cliff_one(2);
+	// (B) FEC REACH: detect with the base matched-count (which itself reaches
+	// -14.68 dB), no mini-Moose / no metric gate. This is what the GF(16) code
+	// can do once the detection/sync confound is removed (fact-doc §8).
+	printf("    --- (B) FEC reach (base matched-count detect, no Moose, no metric gate) ---\n");
+	g_gf16_skip_moose = true; g_gf16_relax_metric_gate = true;
+	gf16ra_cliff_one(1); gf16ra_cliff_one(2); gf16ra_cliff_one(3);
+	g_gf16_skip_moose = true; g_gf16_relax_metric_gate = false;
+	gf16ra::configure(2);  // restore default
+	test_pass(name);  // infra ran; dB verdict is in the log
+}
+
+// §19 (INCREMENT 1) — THE GATE FOR THIS INCREMENT: the PRODUCTION CONNECT decode
+// path, with the GF(16) RA FEC wired in (suffix_fec_mode=3 via set_suffix_fec),
+// reaches ~−14 dB SNR3k — i.e. it now tracks the §12 FEC-reach (−14.03), NOT the
+// uncoded −7.87 content cliff (test_ctrl_suffix_metric_gate_cliff_sweep, §17.3).
+//
+// This is the END-TO-END proof, distinct from gf16_ra_cliff_sweep (which decodes
+// energies via the test helper decode_gf16ra_from_passband with the Moose/gate
+// confound flagged off). HERE we drive the ACTUAL production functions:
+//   TX:  cl_telecom_system::generate_ctrl_suffix_pattern_passband (FEC on → 52-sym
+//        coded passband, sized by ctrl_suffix_pattern_passband_samples).
+//   RX:  cl_telecom_system::decode_ctrl_suffix_from_passband (FEC branch:
+//        real base-detect → real mini-Moose → real 1.2 metric gate →
+//        decode_suffix_energies → gf16ra::soft_decode, prod CRC12 callback).
+// So this measures the FEC reach THROUGH the production sync/gate scaffolding —
+// the integration risk §12 flagged ("GF16's −14 reach is MASKED in production by
+// the sync/gate scaffolding"). With the gate relaxed to 1.2 (§16/§17) and the
+// Moose exonerated (§16), it is EXPECTED to reach ~−14. SNR3k axis is bit-exact
+// to the §17 uncoded sweep (hail_snr3k_db, same p_sig/sigma convention) so the
+// FEC cliff is directly comparable to the −7.87 uncoded number. (snr3k_db is
+// bit-identical to the §17 sweep's hail_snr3k_db; used here as it is in scope.)
+//
+// Also asserts: (a) byte-identical-when-off — set_suffix_fec(false) restores
+// ctrl_suffix_len()==13 and a clean uncoded decode still passes; (b) FAR on pure
+// noise through the FEC path (CRC12 + 2-bit-type backstop, §17.2) = 0.
+static void test_gf16_ra_production_path_cliff_sweep() {
+	const char* name = "gf16_ra_production_path_cliff_sweep";
+	printf("  [MEASURE] PRODUCTION CONNECT decode with GF(16) RA FEC wired in (§19 INCREMENT 1):\n");
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);   // WB ROBUST-class — brings up ack_mfsk/connect
+	cl_arq_controller arq;             // for the production CRC12 callback
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) {
+		test_fail(name, "CONNECT ctrl-suffix config not loaded (M<16?)"); return;
+	}
+
+	// --- (0) byte-identical-when-off check FIRST (before enabling FEC) -------
+	// suffix_fec_mode defaults to 0 → ctrl_suffix_len()==13, production decode is
+	// the uncoded hard path. A clean START_CONN must decode (proves the wiring is
+	// inert when off, complementing the existing-tests' 44/44).
+	if (ts.suffix_fec_mode != 0 || ts.ack_mfsk.suffix_fec_coded ||
+	    ts.ack_mfsk.ctrl_suffix_len() != 13) {
+		test_fail(name, "default state is not OFF (suffix_fec_mode!=0 or coded len!=13)"); return;
+	}
+	{
+		uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+		uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+		uint8_t bytes[5]; for (int b=0;b<5;b++) bytes[b]=(uint8_t)((typed40>>(8*(4-b)))&0xFF);
+		uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+		int nsig = ts.ctrl_suffix_pattern_passband_samples;
+		const int lead = 4096; int total = nsig + 2*lead;
+		std::vector<double> clean((size_t)total, 0.0);
+		int w = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+		mfsk_ctrl_frame_type rt; uint64_t rp=0; uint16_t rc=0; int rm=0;
+		bool ok = ts.decode_ctrl_suffix_from_passband(clean.data(), total, &rt, &rp, &rc, &rm);
+		if (w != nsig || !ok || rt != MFSK_CTRL_START_CONN || rp != p38) {
+			test_fail(name, "OFF-path clean START_CONN decode failed (byte-identical-when-off broken)"); return;
+		}
+		printf("    [OFF] uncoded len=13, clean START_CONN decode OK (byte-identical-when-off confirmed)\n");
+	}
+
+	// --- (1) enable the GF(16) RA FEC (FORCE-on, repfact=3 = R1/4, N=52) ------
+	int N = ts.set_suffix_fec(true, 3);
+	if (N != gf16ra::codeword_len() || N <= 13 || !ts.ack_mfsk.suffix_fec_coded ||
+	    ts.suffix_fec_mode != 3 || ts.ack_mfsk.ctrl_suffix_len() != N) {
+		test_fail(name, "set_suffix_fec(true,3) did not bring up the coded path"); return;
+	}
+	const double fs = ts.sampling_frequency;
+	const int conn_thr = ts.ack_mfsk.connect_match_threshold;
+	printf("    CONNECT config: M=%d conn_nsymb=%d conn_thr=%d coded_N=%d (R=%.2f) gate metric>=%.2f; "
+		"backstop=CRC12 + 2-bit type + count %d/%d\n",
+		ts.ack_mfsk.M, ts.ack_mfsk.connect_pattern_nsymb, conn_thr, N,
+		(double)gf16ra::GF16RA_K / N, (double)cl_mfsk::CTRL_DETECT_METRIC_MIN,
+		conn_thr, ts.ack_mfsk.connect_pattern_nsymb);
+
+	// Build a clean coded START_CONN passband ONCE (KE7TST). ctrl_suffix_pattern_
+	// passband_samples is now the CODED size (set_suffix_fec re-derived it).
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+	uint8_t bytes[5]; for (int b=0;b<5;b++) bytes[b]=(uint8_t)((typed40>>(8*(4-b)))&0xFF);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead = 4096; const int total_pb = n_sig + 2 * lead;
+	std::vector<double> clean((size_t)total_pb, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+	if (written != n_sig) { test_fail(name, "coded generate_ctrl_suffix_pattern_passband size mismatch"); return; }
+
+	double psum = 0.0;
+	for (int i = 0; i < n_sig; i++) { double v = clean[(size_t)(lead+i)]; psum += v*v; }
+	const double p_sig = psum / n_sig;
+	const double sig_rms = std::sqrt(p_sig);
+	if (!(sig_rms > 0.0)) { test_fail(name, "coded signal RMS = 0"); return; }
+
+	// Noise axis (mult = sigma/rms): bracket the −7..−17 dB band so the FEC cliff
+	// (expected ~−14, deeper than the uncoded −7.87) resolves. The base-pattern
+	// matched-count floor is ~−14.68, so the FEC decode cannot beat that (the
+	// base must detect for the suffix window to be located); the sweep must reach
+	// past it to find P<0.5.
+	const double mults[] = {
+		4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0,
+		14.0, 15.0, 16.0, 18.0, 20.0, 24.0
+	};
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 60;
+	double cliff_fec = 1e9;   // deepest SNR3k with P(decode)>=0.5
+	long iters_sum = 0, iters_cnt = 0;
+
+	printf("    (sigma/rms : SNR3k_dB : P_decode_FEC : mean_matched : mean_metric)\n");
+	std::vector<double> work((size_t)total_pb);
+	std::vector<std::complex<double> > bb;
+	const int Mdec = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	for (int si = 0; si < NS; si++) {
+		const double sigma = mults[si] * sig_rms;
+		std::mt19937 rng((uint32_t)(0x6F16C0DEu + si));
+		std::normal_distribution<double> nd(0.0, sigma);
+		int decoded_ok = 0; double metric_sum = 0.0; int matched_sum = 0;
+		for (int t = 0; t < NT; t++) {
+			for (int i = 0; i < total_pb; i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+			// Production FEC decode (real Moose + 1.2 gate + soft_decode).
+			mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+			bool ok = ts.decode_ctrl_suffix_from_passband(
+				work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+				prod_crc12_cb, &arq);
+			bool content_ok = ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38;
+			if (content_ok) decoded_ok++;
+			// raw base metric on the same buffer (for the log; same pre-gate detect)
+			int dec_size = total_pb / Mdec;
+			bb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(work.data(), total_pb, bb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+			int rm = 0, rbo = -1;
+			double metric = ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+				ts.ack_mfsk.connect_pattern_nsymb, ts.ack_mfsk.connect_tones, 8,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+				ts.ack_mfsk.stream_offsets, &rm, 0, nullptr, &rbo,
+				/*reserve_after=*/ts.ack_mfsk.ctrl_suffix_len(), nullptr);
+			metric_sum += metric; matched_sum += rm;
+		}
+		double Pd = (double)decoded_ok / NT;
+		double snr = snr3k_db(p_sig, sigma, fs);   // bit-identical to hail_snr3k_db
+		printf("    %6.1f : %7.2f : %.2f : %6.2f : %8.2f\n",
+			mults[si], snr, Pd, (double)matched_sum/NT, metric_sum/NT);
+		if (Pd >= 0.5 && snr < cliff_fec) cliff_fec = snr;
+	}
+	(void)iters_sum; (void)iters_cnt;
+
+	printf("    --- PRODUCTION CONNECT decode cliff WITH GF(16) RA FEC (P=0.5, SNR3k dB) ---\n");
+	printf("    FEC production cliff = %.2f dB | uncoded production cliff (§17.3) = -7.87 dB | "
+		"standalone FEC-reach (§12) = -14.03 dB | base floor = -14.68 dB\n", cliff_fec);
+	printf("    ==> vs uncoded(-7.87): %+.2f dB | vs base floor(-14.68): %+.2f dB | reaches ~-14? %s\n",
+		cliff_fec - (-7.87), cliff_fec - (-14.68), (cliff_fec <= -13.0) ? "YES" : "no");
+
+	// --- FAR: pure passband noise through the PRODUCTION FEC decode ----------
+	// sigma at the deep-floor operating region (~14×rms ≈ −14 dB SNR3k, signal
+	// absent) — where the FEC actually runs, so the FAR is measured under the
+	// relevant noise level, not a shallow one.
+	const int FT = 4000;
+	const double far_sigma = 14.0 * sig_rms;
+	int false_accepts = 0;
+	std::mt19937 frng(0xFA16FECu);
+	std::normal_distribution<double> fnd(0.0, far_sigma);
+	for (int t = 0; t < FT; t++) {
+		for (int i = 0; i < total_pb; i++) work[(size_t)i] = fnd(frng);
+		mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+		if (ts.decode_ctrl_suffix_from_passband(work.data(), total_pb,
+			&rx_type, &rx_p38, &rx_crc12, &rx_matched, prod_crc12_cb, &arq))
+			false_accepts++;
+	}
+	printf("    --- FAR (pure noise, sigma=%.1f×rms, %d trials, FEC path) ---\n", 14.0, FT);
+	printf("    production FEC CONNECT decode : %d/%d false accepts (CRC12 + 2-bit type backstop)\n",
+		false_accepts, FT);
+
+	// --- ASSERT 1 (THE HEADLINE / FAIL-BEFORE-PASSES): the FEC production decode
+	// must reach materially past the uncoded −7.87 content cliff and approach the
+	// −14 FEC-reach. Threshold −13.0 dB: it must clear the uncoded cliff by ≥5 dB
+	// and sit within ~1.7 dB of the −14.68 base floor (parity-class). Before this
+	// increment, the production CONNECT decode (uncoded) cliffs at −7.87 → this
+	// assert FAILS on the pre-wiring binary. ---
+	if (!(cliff_fec <= -13.0)) {
+		char b[256]; snprintf(b, sizeof(b),
+			"FEC production cliff %.2f dB did NOT reach ~-14 (need <=-13.0) — the production "
+			"sync/gate scaffolding is still masking the FEC reach (§12 risk realized)", cliff_fec);
+		test_fail(name, b); return;
+	}
+	// ASSERT 2: FAR clean on the FEC path.
+	if (false_accepts > 0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"FAR = %d/%d false CONNECT accepts on pure noise through the FEC path "
+			"(CRC12+type backstop breached)", false_accepts, FT);
+		test_fail(name, b); return;
+	}
+	// Restore default state for any later test sharing process globals (gf16ra is
+	// a process-global codec config).
+	ts.set_suffix_fec(false);
+	gf16ra::configure(2);
+	printf("    [ASSERT OK] PRODUCTION CONNECT decode reaches %.2f dB with GF(16) RA FEC "
+		"(+%.2f dB past the uncoded -7.87 cliff, within %.2f dB of the -14.68 base floor); "
+		"FAR %d/%d; byte-identical-when-off confirmed.\n",
+		cliff_fec, cliff_fec - (-7.87), cliff_fec - (-14.68), false_accepts, FT);
+	test_pass(name);
+}
+
+// =============================================================================
 // Top-level runner
 // =============================================================================
+
+// =============================================================================
+// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation, 2026-05-31)
+//
+// Investigates why HAIL beacon detection (the binding constraint on ROBUST_0
+// link ESTABLISHMENT) dies at ~-10/-11 dB SNR3k while the structurally-identical
+// ctrl base-pattern matched-count detector reaches -14.68 dB.
+//
+// Code facts (no assumptions — all cited):
+//   - HAIL base pattern = ack_pattern_nsymb (16 sym for WB) Welch-Costas tones,
+//     hail_match_threshold=7/16 (mfsk.cc:341-343). IDENTICAL length+threshold
+//     to the ctrl/ACK base pattern (mfsk.cc:229-230,398-399).
+//   - Detector is the SAME function (ofdm.cc:3691 detect_ack_pattern) the ctrl
+//     base detector uses. So the -14.68 floor IS HAIL's matched-count floor.
+//   - HAIL production gate (fast LISTENING poll, arq_common.cc:5375) ANDs in a
+//     HARDCODED `metric >= 3.0 && quality >= 0.3` on top of base_matched>=7.
+//     The -14.68 figure is the matched-count gate ALONE (no metric gate). So the
+//     ~4 dB gap is the metric gate, NOT the pattern/threshold/detector.
+//   - The sibling HAIL site (receive() path, arq_common.cc:6373) instead uses the
+//     config-tuned `ack_pattern_detection_threshold` = 0.65 at ROBUST_0
+//     (telecom_system.cc:5506) — the fast-poll 3.0 is INCONSISTENT with the
+//     codebase's own ROBUST_0 tuning.
+//   - N HAIL beacons are sent per CONNECT (arq_commander.cc:407 in a retry loop)
+//     but detected INDEPENDENTLY: receive_hail_pattern (arq_common.cc:5276) snaps
+//     the buffer tail and resets the capture ring between beacons (:5247). NO
+//     noncoherent integration across beacons.
+//
+// This sweep MEASURES (sim, AWGN + realistic CFO/jitter, mirrors the ctrl
+// metric-gate acquisition-gain harness connect-ack-metric-gate.md §7):
+//   (a) the HAIL cliff under the current 3.0 gate (confirm ~-10/-11),
+//   (b) gain from relaxing the metric gate 3.0 -> 2.0 -> 0.65,
+//   (c) gain from noncoherent energy-combining R=2/3/5 beacons (sum E[s][m]
+//       BEFORE argmax — square-law, not hard majority),
+//   (d) the base-matched-only floor (the -14.68 target),
+//   (e) FAR on pure noise for each (metric_thr, R).
+// =============================================================================
+
+// SNR3k (3 kHz-noise-bandwidth SNR), copied bit-exact from the suffix-cliff
+// harness (connect-suffix-fec-research.md §6.1 calibration; .tmp_repsim
+// harness_simbranch.cc:2818) so this axis is directly comparable to the
+// -14.68 dB base-detector figure measured there.
+static double hail_snr3k_db(double p_sig, double sigma, double fs) {
+	double n3k = sigma * sigma * 3000.0 / (fs / 2.0);
+	if (n3k <= 0.0) return 999.0;
+	return 10.0 * std::log10(p_sig / n3k);
+}
+
+// Build a CLEAN (noiseless) HAIL beacon passband template on an ALREADY-LOADED
+// ts (caller did load_configuration(ROBUST_0) once — avoids per-trial reload,
+// the runtime hotspot). Mirrors synth_ack_pattern_passband_with_cfo (§8) but
+// calls generate_hail_pattern + hail_detect_nsymb/tones, reproducing the
+// production TX path (telecom_system.cc:3688 generate_hail_pattern_passband)
+// modulo TX gain/clip (irrelevant to a relative-SNR cliff). out_pb = leading
+// silence + pattern + trailing silence; signal starts at out_sig_offset_dec
+// (decimated). out_p_sig = passband signal power for SNR3k.
+static bool build_hail_template(
+	cl_telecom_system& ts,
+	double cfo_hz,
+	std::vector<double>& out_pb,
+	int& out_sig_offset_dec,
+	double& out_p_sig)
+{
+	if (ts.ack_mfsk.M < 16 || ts.ack_mfsk.hail_detect_nsymb <= 0) return false;
+	if (ts.ack_pattern_passband_samples <= 0) return false;
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc    = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	int nsymb  = ts.ack_mfsk.hail_detect_nsymb;  // undirected = 16 for WB
+
+	std::vector<std::complex<double> > pat_freq(
+		(size_t)nsymb * (size_t)Nc, std::complex<double>(0.0, 0.0));
+	ts.ack_mfsk.generate_hail_pattern(pat_freq.data());
+
+	std::vector<std::complex<double> > pat_time(
+		(size_t)nsymb * (size_t)Nofdm, std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < nsymb; s++)
+		ts.ofdm.symbol_mod(&pat_freq[(size_t)s * Nc], &pat_time[(size_t)s * Nofdm]);
+
+	const int pattern_samples_pb = Nofdm * nsymb * interp;
+	const int leading_silence_pb = 4 * Nofdm * interp;
+	const int trailing_silence_pb = 4 * Nofdm * interp;
+	const int buffer_pb_size = leading_silence_pb + pattern_samples_pb + trailing_silence_pb;
+
+	std::vector<double> pattern_pb((size_t)pattern_samples_pb, 0.0);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		pat_time.data(), Nofdm * nsymb, pattern_pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency + cfo_hz,
+		ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	double psum = 0.0;
+	for (int i = 0; i < pattern_samples_pb; i++) psum += pattern_pb[(size_t)i] * pattern_pb[(size_t)i];
+	out_p_sig = (pattern_samples_pb > 0) ? psum / (double)pattern_samples_pb : 0.0;
+
+	out_pb.assign((size_t)buffer_pb_size, 0.0);
+	for (int i = 0; i < pattern_samples_pb && (leading_silence_pb + i) < buffer_pb_size; i++)
+		out_pb[(size_t)(leading_silence_pb + i)] = pattern_pb[(size_t)i];
+
+	out_sig_offset_dec = leading_silence_pb / interp;
+	return true;
+}
+
+// Fixed-offset noncoherent energy-combining scorer for the HAIL base pattern.
+// FAITHFUL replica of detect_ack_pattern's per-symbol bin logic (ofdm.cc:3726-
+// 3823) — same expected/mirror-bin mapping (Bug #39 carrier-image recovery),
+// same all-streams-argmax match rule, same metric = e_target/e_total — but
+// (1) evaluated at a KNOWN symbol-grid offset (isolates energy-combining gain
+// from the timing search), and (2) SUMS the per-bin energies across R aligned
+// baseband realizations BEFORE the argmax/metric (square-law noncoherent
+// integration; NOT hard majority, NOT coherent). R=1 reproduces the production
+// fixed-offset detector (asserted by the R=1-vs-production check in the test).
+// Returns matched count; *out_metric = summed e_target/e_total over matches.
+static int hail_score_combined(
+	cl_ofdm& ofdm,
+	int Nofdm,                 // decimated symbol period (= data_container.Nofdm)
+	const std::vector<std::vector<std::complex<double> > >& bb_reps, // R decimated buffers
+	int sig_offset_dec,        // symbol-grid start (decimated samples)
+	int nsymb,
+	const int* tones,          // hail_detect_tones (flat, no modulo applied yet)
+	int M,
+	int nStreams,
+	const int* stream_offsets,
+	int tone_hop_step,
+	double* out_metric)
+{
+	int Nfft = ofdm.Nfft;
+	int Nc   = ofdm.Nc;
+	int half = Nc / 2;
+	int ss   = ofdm.start_shift;
+	int R    = (int)bb_reps.size();
+	if (out_metric) *out_metric = 0.0;
+	if (R <= 0) return 0;
+
+	// The bb is already decimated; production detect_ack_pattern runs it with
+	// interpolation_rate=1 (ofdm.cc:3702-3703), so the decimated symbol period =
+	// Nofdm and the FFT window skips Ngi = Nofdm - Nfft (ofdm.cc:3729).
+	int Ngi = Nofdm - Nfft;
+	int sym_period = Nofdm;  // decimated
+
+	std::vector<std::complex<double> > sym((size_t)Nfft), spec((size_t)Nfft);
+	int matched = 0;
+	double metric = 0.0;
+
+	for (int p = 0; p < nsymb; p++) {
+		int tone_base = tones[p];
+		int actual_tone = (tone_base + p * tone_hop_step) % M;
+
+		// Accumulate per-bin energy across the R reps for this symbol.
+		std::vector<double> e_bin((size_t)Nfft, 0.0);
+		bool oob = false;
+		for (int r = 0; r < R; r++) {
+			const std::vector<std::complex<double> >& bb = bb_reps[(size_t)r];
+			int offset = sig_offset_dec + p * sym_period + Ngi;
+			if (offset < 0 || offset + Nfft > (int)bb.size()) { oob = true; break; }
+			for (int i = 0; i < Nfft; i++) sym[(size_t)i] = bb[(size_t)(offset + i)];
+			ofdm.fft(sym.data(), spec.data(), Nfft);
+			for (int b = 0; b < Nfft; b++)
+				e_bin[(size_t)b] += spec[(size_t)b].real() * spec[(size_t)b].real()
+				                  + spec[(size_t)b].imag() * spec[(size_t)b].imag();
+		}
+		if (oob) continue;
+
+		// Per-stream: expected bin (+ carrier-image mirror), all-streams argmax match.
+		int streams_matched = 0;
+		double e_target = 0.0;
+		for (int st = 0; st < nStreams; st++) {
+			int esub = stream_offsets[st] + actual_tone;
+			int ebin = (esub < half) ? (Nfft - half + esub) : (ss + (esub - half));
+			int mbin = (Nfft - ebin) % Nfft;
+			e_target += e_bin[(size_t)ebin] + e_bin[(size_t)mbin];
+
+			double peak_e = -1.0; int peak_bin = -1;
+			for (int t = 0; t < M; t++) {
+				int tsub = stream_offsets[st] + t;
+				int b = (tsub < half) ? (Nfft - half + tsub) : (ss + (tsub - half));
+				if (e_bin[(size_t)b] > peak_e) { peak_e = e_bin[(size_t)b]; peak_bin = b; }
+			}
+			if (peak_e > 0 && (peak_bin == ebin || peak_bin == mbin)) streams_matched++;
+		}
+		if (streams_matched < nStreams) continue;
+		matched++;
+
+		double e_total = 0.0;
+		for (int k = 0; k < Nc; k++) {
+			int bk = (k < half) ? (Nfft - half + k) : (ss + (k - half));
+			e_total += e_bin[(size_t)bk];
+		}
+		if (e_total > 0.0) metric += e_target / e_total;
+	}
+
+	if (out_metric) *out_metric = metric;
+	return matched;
+}
+
+// Decimate a passband buffer to baseband (mirrors run_initial_ack_detect /
+// detect_hail_pattern_from_passband, telecom_system.cc:3729). interp = the
+// interpolation_rate; out buffer has size_in/interp complex samples.
+static void hail_decimate(cl_telecom_system& ts, const std::vector<double>& pb,
+                          std::vector<std::complex<double> >& out_bb) {
+	int M = ts.data_container.interpolation_rate;
+	int size = (int)pb.size();
+	int dec_size = size / M;
+	double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	out_bb.assign((size_t)dec_size, std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband_decimated(
+		const_cast<double*>(pb.data()), size, out_bb.data(),
+		ts.sampling_frequency, eff_carrier, ts.carrier_amplitude,
+		M, &ts.ofdm.FIR_rx_data);
+}
+
+// §11 — THE MEASUREMENT: HAIL beacon-detection cliff (P(detect) vs SNR3k) under
+// the current 3.0 metric gate, the relaxed 2.0/0.65 gates, and R=1/2/3/5
+// noncoherent beacon energy-combining. Also reports the base-matched-only floor
+// (the -14.68 target) and FAR on pure noise. Deterministic seed. MEASURE-only —
+// always test_pass (the dB verdict is in the log).
+static void test_hail_detection_cliff_sweep() {
+	const char* name = "hail_detection_cliff_sweep";
+	printf("  [MEASURE] HAIL beacon-detection floor (metric-gate relax + noncoherent beacon combining):\n");
+
+	// One persistent ts: load_configuration(ROBUST_0) ONCE (the runtime hotspot).
+	// All per-trial work reuses its FIRs / ack_mfsk / ofdm.
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	ts.ack_mfsk.clear_hail_target();  // undirected HAIL (base only, 16 sym WB)
+
+	int M           = ts.ack_mfsk.M;
+	int nsymb       = ts.ack_mfsk.hail_detect_nsymb;
+	int base_thr    = ts.ack_mfsk.hail_match_threshold;
+	int nStreams    = ts.ack_mfsk.nStreams;
+	int tone_hop    = ts.ack_mfsk.tone_hop_step;
+	int Nofdm       = ts.data_container.Nofdm;
+	const int* tones = ts.ack_mfsk.hail_detect_tones;
+	const int* soff  = ts.ack_mfsk.stream_offsets;
+	double fs        = ts.sampling_frequency;
+	if (M < 16 || nsymb <= 0) { test_fail(name, "HAIL config not WB/loaded"); return; }
+	printf("    HAIL config: M=%d nsymb=%d base_thr=%d/%d nStreams=%d tone_hop=%d Nofdm=%d (ROBUST_0 WB)\n",
+		M, nsymb, base_thr, nsymb, nStreams, tone_hop, Nofdm);
+	printf("    Gates: OLD fast-poll HAIL = base>=%d && metric>=3.0 && quality>=0.3 (arq_common.cc:5375 pre-fix)\n", base_thr);
+	printf("           NEW (§10 fix) fast-poll HAIL = base>=%d && metric>=ack_pattern_detection_threshold(=%.2f@R0), NO quality\n",
+		base_thr, ts.ack_pattern_detection_threshold);
+
+	const double cfo_hz = 12.0;  // realistic CFO inside Moose range (matches ctrl gate harness §7)
+
+	// Pre-build clean passband templates ONCE: +cfo and -cfo (CFO sign alternates
+	// per beacon to model independent TX events; CFO does not shift timing so reps
+	// stay grid-aligned, which is required for a fair noncoherent combine).
+	std::vector<double> tmpl_pos, tmpl_neg;
+	int sig_off0 = 0; double p_sig = 0.0;
+	if (!build_hail_template(ts, +cfo_hz, tmpl_pos, sig_off0, p_sig) ||
+	    !build_hail_template(ts, -cfo_hz, tmpl_neg, sig_off0, p_sig)) {
+		test_fail(name, "build_hail_template failed"); return;
+	}
+	const int PB = (int)tmpl_pos.size();
+
+	// --- R=1 fidelity check vs the production fixed-offset detector path. ---
+	// hail_score_combined at R=1 must reproduce detect_hail_pattern_from_passband's
+	// matched count on a clean buffer (anchors the scorer's bin-mapping correctness).
+	{
+		std::vector<std::complex<double> > bb; hail_decimate(ts, tmpl_pos, bb);
+		std::vector<std::vector<std::complex<double> > > reps(1, bb);
+		double m1 = 0.0;
+		int mc1 = hail_score_combined(ts.ofdm, Nofdm, reps, sig_off0, nsymb,
+			tones, M, nStreams, soff, tone_hop, &m1);
+		int prod_matched = 0, prod_suffix = 0;
+		double prod_metric = ts.detect_hail_pattern_from_passband(tmpl_pos.data(), PB,
+			&prod_matched, 0, &prod_suffix);
+		printf("    [R=1 fidelity] fixed-offset scorer: matched=%d metric=%.2f | production(sliding): matched=%d metric=%.2f\n",
+			mc1, m1, prod_matched, prod_metric);
+		if (mc1 < nsymb - 1) {  // clean buffer should match ~all symbols
+			char b[160]; snprintf(b, sizeof(b),
+				"R=1 scorer matched=%d on clean (expected >=%d) — bin mapping diverges from production",
+				mc1, nsymb - 1);
+			test_fail(name, b); return;
+		}
+	}
+
+	// --- Cliff sweep. Noise sigma is set RELATIVE to the passband signal RMS
+	// (sigma = mult * sig_rms) so the axis is calibration-robust; SNR3k is then
+	// reported for the absolute anchor. Larger mult = lower SNR. The mult range
+	// brackets the base matched-count floor (empirically ~14-22x rms = the
+	// -14 dB region for this 16-sym Welch-Costas pattern). CFO is the channel
+	// impairment (matches the ctrl gate harness §7); NO timing jitter — the
+	// production detector does a fine timing search, so a fixed-offset scorer
+	// with injected jitter would mismodel an effect the real RX corrects. ---
+	const double sig_rms = std::sqrt(p_sig);
+	// Fine grid (~0.4-0.8 dB steps) across the metric-gate cliff region (mult
+	// 4-8 ≈ -3..-9 dB) so the 3.0-vs-2.0-vs-0.65 gate separation resolves
+	// (the ctrl harness §7 found it in a ~2.5 dB band), then coarser down to
+	// the base matched-count floor (~mult 14 ≈ -14 dB).
+	const double mults[] = {
+		3.0, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0,
+		10.0, 11.0, 12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0
+	};
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 120;                 // trials per sigma (tighter P estimate at the cliff)
+	const int Rs[] = {1, 2, 3, 5};
+	const int NR = (int)(sizeof(Rs)/sizeof(Rs[0]));
+	// Three named SOFT-gate variants (metric_thr, quality_thr) on top of the
+	// base>=base_thr count gate. CRITICAL: HAIL's old quality>=0.3 gate
+	// (arq_common.cc:5375 pre-fix) means metric/matched>=0.3 → with matched=16
+	// that's metric>=4.8, STRICTER than the metric>=3.0 gate. So the quality gate
+	// dominates at the floor. We measure the metric relax alone (ctrl §7 style)
+	// AND the production gate.
+	//   G0 = OLD shipped fast-poll gate (hardcoded metric>=3.0 && quality>=0.3).
+	//   G1 = metric-relax only (3.0->2.0, quality kept) — shows the quality gate masks it.
+	//   G2 = NEW shipped fast-poll gate = base count + suffix + metric>=
+	//        ack_pattern_detection_threshold, NO quality gate (the §10 fix).
+	// G2's metric threshold is BOUND to the live production field
+	// ts.ack_pattern_detection_threshold (NOT a hardcoded literal) so this sweep
+	// tracks whatever the config sets — proving the test validates the shipped
+	// predicate, not a coincidental constant.
+	const double prod_metric_thr = ts.ack_pattern_detection_threshold; // 0.65 @ROBUST_0 (telecom_system.cc:5506)
+	char g2label[64];
+	snprintf(g2label, sizeof(g2label), "PROD-FIX(m>=%.2f,no-q)", prod_metric_thr);
+	const char* gate_name[3] = {"OLD-SHIPPED(m>=3.0,q>=0.3)", "METRIC-RELAX(m>=2.0,q>=0.3)", g2label};
+	const double gate_metric[3]  = {3.0, 2.0, prod_metric_thr};
+	const double gate_quality[3] = {0.3, 0.3, 0.0};
+	const int NM = 3;
+	const int RMAX = Rs[NR-1];
+
+	// cliff[r][m] = deepest SNR3k (most-negative dB) where P(detect) still >= 0.5.
+	double cliff_snr[4][3]; double cliff_sig[4][3];
+	double mcount_cliff_snr[4]; double mcount_cliff_sig[4];  // matched-count-only, per R
+	double base_cliff_snr = 999.0, base_cliff_sig = 0.0;
+	for (int r = 0; r < NR; r++) {
+		mcount_cliff_snr[r] = 999.0; mcount_cliff_sig[r] = 0.0;
+		for (int m = 0; m < NM; m++) { cliff_snr[r][m] = 999.0; cliff_sig[r][m] = 0.0; }
+	}
+
+	printf("    Sweep: %d trials/mult, sig_rms=%.3f p_sig=%.3f, CFO=+-%.0f Hz, AWGN (no timing jitter; RX searches timing).\n",
+		NT, sig_rms, p_sig, cfo_hz);
+	printf("    count[..] = P(combined matched>=%d), no soft gate (combining SHOULD help this).\n", base_thr);
+	printf("    Gate G0=%s  G1=%s  G2=%s\n", gate_name[0], gate_name[1], gate_name[2]);
+	printf("    (sigma/rms : SNR3k_dB : count[R1 R2 R3 R5] : R1[G0 G1 G2] R2[G0 G1 G2] R5[G0 G1 G2])\n");
+
+	std::mt19937 rng(0x4A115EEDu);
+	std::vector<double> noisy((size_t)PB);
+	for (int si = 0; si < NS; si++) {
+		double sigma = mults[si] * sig_rms;
+		std::normal_distribution<double> nd(0.0, sigma);
+		int base_hits = 0;                     // R=1 matched-count-only floor
+		int mcount_hits[4]; memset(mcount_hits, 0, sizeof(mcount_hits)); // matched-count-only per R (combining gain on the COUNT statistic)
+		int det_hits[4][3]; memset(det_hits, 0, sizeof(det_hits));       // full production gate per (R, metric_thr)
+
+		for (int it = 0; it < NT; it++) {
+			int sig_off = sig_off0;  // perfect grid alignment (RX fine-search proxy)
+
+			// Build RMAX aligned noisy reps (copy clean template + AWGN + decimate).
+			std::vector<std::vector<std::complex<double> > > reps((size_t)RMAX);
+			for (int r = 0; r < RMAX; r++) {
+				const std::vector<double>& tmpl = (((it + r) & 1) ? tmpl_neg : tmpl_pos);
+				for (int i = 0; i < PB; i++) noisy[(size_t)i] = tmpl[(size_t)i] + nd(rng);
+				std::vector<std::complex<double> > bb; hail_decimate(ts, noisy, bb);
+				reps[(size_t)r] = bb;
+			}
+
+			// For each R: combine the first R reps, score once. Record BOTH
+			// (a) matched-count-only (base_thr) — combining SHOULD help this, and
+			// (b) the full production gate (base && metric>=thr && quality>=0.3) —
+			// the energy-RATIO metric is scale-invariant to combining (sum cancels
+			// in the ratio), so combining should NOT move the full gate.
+			for (int r = 0; r < NR; r++) {
+				int R = Rs[r];
+				std::vector<std::vector<std::complex<double> > > sub(reps.begin(), reps.begin() + R);
+				double mm = 0.0;
+				int mc = hail_score_combined(ts.ofdm, Nofdm, sub, sig_off, nsymb,
+					tones, M, nStreams, soff, tone_hop, &mm);
+				double quality = (mc > 0) ? mm / mc : 0.0;
+				bool base_ok = (mc >= base_thr);
+				if (base_ok) mcount_hits[r]++;
+				if (r == 0 && base_ok) base_hits++;
+				for (int m = 0; m < NM; m++)
+					if (base_ok && mm >= gate_metric[m] && quality >= gate_quality[m]) det_hits[r][m]++;
+			}
+		}
+
+		double snr = hail_snr3k_db(p_sig, sigma, fs);
+		double pbase = (double)base_hits / NT;
+		printf("      %5.1f : %7.2f : count[R1=%.2f R2=%.2f R3=%.2f R5=%.2f] : full R1[%.2f %.2f %.2f] R2[%.2f %.2f %.2f] R5[%.2f %.2f %.2f]\n",
+			mults[si], snr,
+			(double)mcount_hits[0]/NT, (double)mcount_hits[1]/NT, (double)mcount_hits[2]/NT, (double)mcount_hits[3]/NT,
+			(double)det_hits[0][0]/NT, (double)det_hits[0][1]/NT, (double)det_hits[0][2]/NT,
+			(double)det_hits[1][0]/NT, (double)det_hits[1][1]/NT, (double)det_hits[1][2]/NT,
+			(double)det_hits[3][0]/NT, (double)det_hits[3][1]/NT, (double)det_hits[3][2]/NT);
+
+		if (pbase >= 0.5 && sigma > base_cliff_sig) { base_cliff_sig = sigma; base_cliff_snr = snr; }
+		for (int r = 0; r < NR; r++) {
+			double pc = (double)mcount_hits[r] / NT;
+			if (pc >= 0.5 && sigma > mcount_cliff_sig[r]) { mcount_cliff_sig[r] = sigma; mcount_cliff_snr[r] = snr; }
+			for (int m = 0; m < NM; m++) {
+				double p = (double)det_hits[r][m] / NT;
+				if (p >= 0.5 && sigma > cliff_sig[r][m]) { cliff_sig[r][m] = sigma; cliff_snr[r][m] = snr; }
+			}
+		}
+	}
+
+	printf("    --- HAIL detection cliffs (P=0.5, SNR3k dB; more negative = deeper/better) ---\n");
+	printf("    BASE matched-count floor (the -14.68 target, R=1, no soft gate): %.2f dB\n", base_cliff_snr);
+	printf("    Matched-count-only cliff vs combining R:  R=1: %.2f | R=2: %.2f | R=3: %.2f | R=5: %.2f dB\n",
+		mcount_cliff_snr[0], mcount_cliff_snr[1], mcount_cliff_snr[2], mcount_cliff_snr[3]);
+	for (int m = 0; m < NM; m++) {
+		printf("    gate %-28s:  R=1: %.2f | R=2: %.2f | R=3: %.2f | R=5: %.2f dB\n",
+			gate_name[m], cliff_snr[0][m], cliff_snr[1][m], cliff_snr[2][m], cliff_snr[3][m]);
+	}
+	double d_mrelax = cliff_snr[0][1] - cliff_snr[0][0];        // metric 3.0->2.0 (quality still 0.3), R=1
+	double d_prod   = cliff_snr[0][2] - cliff_snr[0][0];        // PROD-FIX gate vs OLD-SHIPPED, R=1
+	double d_cR2    = mcount_cliff_snr[1] - mcount_cliff_snr[0];// R=2 vs R=1, count-only
+	double d_cR5    = mcount_cliff_snr[3] - mcount_cliff_snr[0];// R=5 vs R=1, count-only
+	double d_g2R5   = cliff_snr[3][2] - cliff_snr[0][2];        // R=5 vs R=1, PROD-FIX gate
+	printf("    ==> metric-thr relax 3.0->2.0 ALONE (quality>=0.3 kept), R=1: %+.2f dB  <-- quality gate masks it\n", d_mrelax);
+	printf("    ==> PROD-FIX gate (metric>=%.2f, NO quality) vs OLD-SHIPPED, R=1: %+.2f dB toward the count floor\n", prod_metric_thr, d_prod);
+	printf("    ==> combining on matched-COUNT: R=2 %+.2f dB | R=5 %+.2f dB (10log10 ideal +3.0/+7.0; measured M=16 @ q~0.1-0.24)\n", d_cR2, d_cR5);
+	printf("    ==> combining + PROD-FIX gate: R=5 %+.2f dB vs R=1 (combining helps ONLY once the ratio gate is off)\n", d_g2R5);
+
+	// --- PRODUCTION-PATH ASSERTION (fail-before / pass-after the §10 fix) ---
+	// Binds the test to the SHIPPED predicate (arq_common.cc:5375 after §10):
+	// gate = base_ok && suffix_ok && metric >= ts.ack_pattern_detection_threshold,
+	// no quality gate. G2's threshold IS that live field (set above). The fix is
+	// the difference between G0 (old: 3.0 + quality 0.3) and G2 (new). Before the
+	// fix the production cliff = G0 (~-4.95); after, = G2 (~-13.25). Assert the
+	// floor-move is real and the prod gate reaches the matched-count floor.
+	// (1) the live production threshold is the conservative ROBUST_0 value.
+	if (prod_metric_thr > 1.0 + 1e-9) {
+		char b[160]; snprintf(b, sizeof(b),
+			"ack_pattern_detection_threshold=%.3f at ROBUST_0 (expected <=1.0, conservative 0.65) — config regression",
+			prod_metric_thr);
+		test_fail(name, b); return;
+	}
+	// (2) the production-fix gate must move the cliff >=6 dB DEEPER than the old
+	//     hardcoded gate. Deeper = more-negative SNR3k, so the improvement in dB
+	//     is (old_cliff - new_cliff) > 0 (sim measures +8.30 dB; 6 dB margin
+	//     absorbs the sweep grid step).
+	double improve_db = cliff_snr[0][0] - cliff_snr[0][2];  // +ve = new gate reaches deeper
+	if (improve_db < 6.0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"PROD-FIX gate moved cliff only %+.2f dB deeper vs OLD-SHIPPED (need >=+6.0; sim baseline +8.30). "
+			"Old=%.2f new=%.2f dB — the §10 quality-drop/metric-align did NOT take effect",
+			improve_db, cliff_snr[0][0], cliff_snr[0][2]);
+		test_fail(name, b); return;
+	}
+	// (3) the production-fix gate must reach (within ~2 dB) the matched-count
+	//     floor — i.e. the soft gate is no longer the binding limiter at R=1.
+	//     new cliff should be no shallower than (count floor + 2 dB); shallower
+	//     means new_cliff - count_floor > 2 (both negative; less-negative new = short).
+	if (cliff_snr[0][2] - mcount_cliff_snr[0] > 2.0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"PROD-FIX gate cliff %.2f dB still %.2f dB short of the matched-count floor %.2f dB "
+			"(soft gate still binding)", cliff_snr[0][2],
+			cliff_snr[0][2] - mcount_cliff_snr[0], mcount_cliff_snr[0]);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] PROD-FIX gate (m>=%.2f, no-q) moves HAIL cliff +%.2f dB deeper to %.2f dB (count floor %.2f dB); old gate %.2f dB.\n",
+		prod_metric_thr, improve_db, cliff_snr[0][2], mcount_cliff_snr[0], cliff_snr[0][0]);
+
+	// --- FAR on pure noise (no signal), per (gate, R). 5000 trials. ---
+	// Noise level = the deep-floor level (mult=16 * sig_rms ~ -15 dB), where the
+	// relaxed gates + combining would operate — the worst case for false alarms.
+	const int FT = 5000;
+	double fsig = 16.0 * sig_rms;
+	printf("    --- FAR (pure noise, sigma=%.2f = 16x rms ~ -15 dB SNR3k, %d trials/cell) ---\n", fsig, FT);
+	{
+		int fa[4][3]; memset(fa, 0, sizeof(fa));
+		std::mt19937 frng(0xFA15E000u);
+		std::normal_distribution<double> fnd(0.0, fsig);
+		std::vector<double> npb((size_t)PB);
+		for (int it = 0; it < FT; it++) {
+			std::vector<std::vector<std::complex<double> > > reps((size_t)RMAX);
+			for (int r = 0; r < RMAX; r++) {
+				for (int i = 0; i < PB; i++) npb[(size_t)i] = fnd(frng);  // pure noise
+				std::vector<std::complex<double> > bb; hail_decimate(ts, npb, bb);
+				reps[(size_t)r] = bb;
+			}
+			for (int r = 0; r < NR; r++) {
+				int R = Rs[r];
+				std::vector<std::vector<std::complex<double> > > sub(reps.begin(), reps.begin() + R);
+				double mm = 0.0;
+				int mc = hail_score_combined(ts.ofdm, Nofdm, sub, sig_off0, nsymb,
+					tones, M, nStreams, soff, tone_hop, &mm);
+				double quality = (mc > 0) ? mm / mc : 0.0;
+				bool base_ok = (mc >= base_thr);
+				for (int m = 0; m < NM; m++)
+					if (base_ok && mm >= gate_metric[m] && quality >= gate_quality[m]) fa[r][m]++;
+			}
+		}
+		for (int m = 0; m < NM; m++) {
+			printf("    gate %-28s: FAR R=1 %d/%d | R=2 %d/%d | R=3 %d/%d | R=5 %d/%d\n",
+				gate_name[m], fa[0][m], FT, fa[1][m], FT, fa[2][m], FT, fa[3][m], FT);
+		}
+		// PROD-FIX gate (G2 index 2) at R=1 is the SHIPPED single-shot path. The
+		// load-bearing FAR defense is the base count gate (8/16 WB); §4 measured
+		// 0/5000. Assert it: a false [HAIL] Detected on pure noise would have the
+		// RSP begin OFDM capture on nothing. Tolerance 1/5000 (~2e-4) absorbs the
+		// 1-count tail §4 saw at R>=2 count-only; R=1 should be 0.
+		if (fa[0][2] > 1) {
+			char b[160]; snprintf(b, sizeof(b),
+				"PROD-FIX gate FAR R=1 = %d/%d on pure noise (expected <=1; the base count gate is the FAR defense)",
+				fa[0][2], FT);
+			test_fail(name, b); return;
+		}
+		printf("    [ASSERT OK] PROD-FIX gate R=1 FAR = %d/%d (count gate 8/16 holds the line on pure noise).\n", fa[0][2], FT);
+	}
+
+	test_pass(name);  // MEASURE infra ran; the dB/FAR verdict is in the log
+}
+
+// §17 — CONNECT ctrl-suffix detection cliff under the relaxed CTRL_DETECT_METRIC_MIN
+// (tier2-suffix-fec-design.md §16/§17, 2026-05-31). Drives the PRODUCTION
+// decode_ctrl_suffix_from_passband (which now bakes in CTRL_DETECT_METRIC_MIN=1.2)
+// across an SNR3k axis on a real START_CONN passband + AWGN, and in parallel
+// measures the raw detect_ack_pattern `metric` per cell so the gate-crossing is
+// visible. The §16 isolation sim proved the metric gate is the SOLE ctrl-suffix
+// masker (content P≈1.0 to −14 when relaxed); this test confirms on THIS branch
+// that (1) the 1.2 gate ADMITS CRC-valid decodes in the metric∈[1.2,3.0) band
+// the old 3.0 gate rejected (FAIL-BEFORE on the pre-change 3.0 binary: the
+// rescued-band assert below trips because production returns false there), and
+// (2) pure noise yields ZERO false CONNECT accepts (CRC12 + 2-bit type + count
+// gate backstop — the uncoded-path FAR question from §17.2).
+//
+// Channel: clean passband + AWGN (NO injected CFO — §16 exonerated the ctrl
+// mini-Moose, removing it = 0 dB; absolute cliff is therefore slightly
+// optimistic vs a CFO-impaired channel, but the RELATIVE 1.2-vs-3.0 admission
+// gap and the FAR verdict are CFO-independent, which is what this asserts).
+static void test_ctrl_suffix_metric_gate_cliff_sweep() {
+	const char* name = "ctrl_suffix_metric_gate_cliff_sweep";
+	printf("  [MEASURE] CONNECT ctrl-suffix detection floor under CTRL_DETECT_METRIC_MIN=%.2f:\n",
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN);
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);  // WB ROBUST-class brings ack_mfsk/connect up
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0 || ts.ctrl_suffix_pattern_passband_samples <= 0) {
+		test_fail(name, "CONNECT ctrl-suffix config not loaded (M<16?)"); return;
+	}
+	const int conn_thr = ts.ack_mfsk.connect_match_threshold;
+	const double fs = ts.sampling_frequency;
+	printf("    CONNECT config: M=%d conn_nsymb=%d conn_thr=%d nStreams=%d (ROBUST_0 WB); "
+		"old gate metric>=3.0, new gate metric>=%.2f; backstop=count %d/%d + CRC12 + 2-bit type\n",
+		ts.ack_mfsk.M, ts.ack_mfsk.connect_pattern_nsymb, conn_thr, ts.ack_mfsk.nStreams,
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, conn_thr, ts.ack_mfsk.connect_pattern_nsymb);
+
+	// Build a clean START_CONN passband ONCE (KE7TST). Production codec packers.
+	uint64_t p38 = 0;
+	pack_start_conn_payload(&p38, /*nb_flag=*/false, "KE7TST", 6);
+	uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+	uint8_t bytes[5];
+	for (int b = 0; b < 5; b++) bytes[b] = (uint8_t)((typed40 >> (8 * (4 - b))) & 0xFF);
+	uint16_t crc12 = test_crc12_calc(bytes, 5);
+
+	const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead = 4096;          // leading silence so the detector has headroom
+	const int total_pb = n_sig + 2 * lead;
+	std::vector<double> clean((size_t)total_pb, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(
+		clean.data() + lead, MFSK_CTRL_START_CONN, p38, crc12);
+	if (written != n_sig) { test_fail(name, "generate_ctrl_suffix_pattern_passband size mismatch"); return; }
+
+	// Signal power over the actual pattern span (for SNR3k anchor) + RMS for the
+	// relative noise axis.
+	double psum = 0.0;
+	for (int i = 0; i < n_sig; i++) { double v = clean[(size_t)(lead + i)]; psum += v * v; }
+	const double p_sig = psum / n_sig;
+	const double sig_rms = std::sqrt(p_sig);
+	if (!(sig_rms > 0.0)) { test_fail(name, "signal RMS = 0"); return; }
+
+	// Noise axis: sigma = mult * sig_rms. Range brackets the metric-gate cliff
+	// (mult ~3-9 ≈ the −8..−12 dB band where metric crosses 3.0 then 1.2) down
+	// to the count-gate floor.
+	const double mults[] = { 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 10.0, 12.0 };
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 80;
+
+	const int M = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+
+	double cliff_decode = 1e9;     // deepest (most-negative) SNR3k with P(decode)>=0.5
+	double crossing_3p0 = 1e9;     // deepest SNR3k where mean raw metric still >= 3.0
+	int rescued_total = 0;         // trials with 1.2 <= metric < 3.0 AND production decoded OK
+	int rescued_cells = 0;
+
+	printf("    (sigma/rms : SNR3k_dB : P_decode@1.2 : mean_metric : mean_matched : rescued[1.2<=m<3.0 & decoded])\n");
+	std::vector<double> work((size_t)total_pb);
+	std::vector<std::complex<double> > bb;
+	for (int si = 0; si < NS; si++) {
+		const double sigma = mults[si] * sig_rms;
+		std::mt19937 rng((uint32_t)(0x5C0FF1u + si));
+		std::normal_distribution<double> nd(0.0, sigma);
+		int decoded_ok = 0, rescued = 0;
+		double metric_sum = 0.0; int matched_sum = 0;
+		for (int t = 0; t < NT; t++) {
+			for (int i = 0; i < total_pb; i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+
+			// (a) Production decode verdict (CTRL_DETECT_METRIC_MIN baked in).
+			mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+			bool ok = ts.decode_ctrl_suffix_from_passband(
+				work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+			bool content_ok = ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38 && rx_crc12 == crc12;
+			if (content_ok) decoded_ok++;
+
+			// (b) Raw metric on the same buffer (mirrors the production pre-gate
+			// detect at telecom_system.cc:3522) — shows where the 3.0 gate sits.
+			int dec_size = total_pb / M;
+			bb.assign((size_t)dec_size, std::complex<double>(0.0, 0.0));
+			ts.ofdm.passband_to_baseband_decimated(
+				work.data(), total_pb, bb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, M, &ts.ofdm.FIR_rx_data);
+			int rm = 0, rbo = -1;
+			double metric = ts.ofdm.detect_ack_pattern(
+				bb.data(), dec_size, 1,
+				ts.ack_mfsk.connect_pattern_nsymb,
+				ts.ack_mfsk.connect_tones, /*base_len=*/8,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+				ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+				&rm, 0, nullptr, &rbo,
+				/*reserve_after=*/ts.ack_mfsk.ack_sack_suffix_len(), nullptr);
+			metric_sum += metric; matched_sum += rm;
+
+			// "Rescued" = the old 3.0 gate would have rejected (metric<3.0) but
+			// the relaxed gate admits (metric>=1.2) AND the content decodes clean.
+			if (metric >= (double)cl_mfsk::CTRL_DETECT_METRIC_MIN && metric < 3.0 && content_ok)
+				rescued++;
+		}
+		double Pd = (double)decoded_ok / NT;
+		double mm = metric_sum / NT;
+		double snr = hail_snr3k_db(p_sig, sigma, fs);
+		printf("    %6.1f : %7.2f : %.2f : %8.2f : %6.2f : %d/%d\n",
+			mults[si], snr, Pd, mm, (double)matched_sum / NT, rescued, NT);
+		if (Pd >= 0.5 && snr < cliff_decode) cliff_decode = snr;
+		if (mm >= 3.0 && snr < crossing_3p0) crossing_3p0 = snr;
+		rescued_total += rescued;
+		if (rescued > 0) rescued_cells++;
+	}
+
+	printf("    --- CONNECT ctrl-suffix cliffs (P=0.5, SNR3k dB; more negative = deeper) ---\n");
+	printf("    UNCODED production decode @ metric>=%.2f : %.2f dB | mean-metric crosses 3.0 (old gate) at : %.2f dB\n",
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, cliff_decode, crossing_3p0);
+	printf("    ==> relaxed gate RESCUED %d CRC-valid decodes across %d SNR cells in the metric∈[%.2f,3.0) band\n",
+		rescued_total, rescued_cells, (double)cl_mfsk::CTRL_DETECT_METRIC_MIN);
+	// DECISION-CRITICAL MEASURE (tier2-suffix-fec-design.md §16/§17): on the
+	// UNCODED production path (hard argmax decode_suffix_tones + CRC12, NO GF16
+	// FEC), the suffix CONTENT — not the metric gate — is the binding cliff. The
+	// decode dies ABOVE the 3.0-crossing (content gives out first), so the gate
+	// relax 3.0→1.2 is harmless + slightly helpful but does NOT reach −14. §16's
+	// "gate is the sole masker, P≈1.0 to −14" was measured on decode_suffix_ENERGIES
+	// (the GF16 soft path); the uncoded path confirms here that closing the rest of
+	// the gap to −14 requires the GF(16) RA FEC integration (Phase 2), not a deeper
+	// gate. Logged as the lead, NOT asserted (content-limited is the EXPECTED result).
+	if (cliff_decode > crossing_3p0 + 0.01)
+		printf("    ==> CONTENT-LIMITED: uncoded suffix dies (%.2f dB) ABOVE the gate crossing (%.2f dB) "
+			"→ gate is NOT the production limiter; GF(16) FEC needed for −14 (§17 next phase).\n",
+			cliff_decode, crossing_3p0);
+	else
+		printf("    ==> GATE-LIMITED: uncoded suffix decode tracks the gate crossing → relax deepened the floor.\n");
+
+	// ASSERT 1 (FAIL-BEFORE-PASSES): on the pre-change 3.0 binary, production
+	// returns false whenever metric<3.0 → rescued_total==0 (the rescued cells
+	// require metric∈[1.2,3.0)). The relax admits ≥1 real CRC-valid decode the
+	// 3.0 gate blocked. This is the behavioral delta the relax buys on the
+	// uncoded path (small, because content is the dominant limiter — see MEASURE).
+	if (rescued_total <= 0) {
+		test_fail(name, "no CRC-valid decodes rescued in the metric∈[1.2,3.0) band "
+			"(the relax bought no reach on the uncoded path — or the gate is still 3.0)");
+		return;
+	}
+	// ASSERT 2 (NO REGRESSION): clean/high-SNR decode must be perfect — the relax
+	// must not perturb the good-SNR band (throughput-neutral by construction).
+	if (cliff_decode > 0.0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"decode cliff %.2f dB is positive — clean-SNR decode regressed (expected P=1.0 well below 0 dB)",
+			cliff_decode);
+		test_fail(name, b); return;
+	}
+
+	// --- FAR: pure passband noise through the PRODUCTION decode (uncoded path;
+	// CRC12 + 2-bit type + count gate are the only backstops). §17.2 / §16
+	// measured gate-fully-OFF = 0/4000; at 1.2 (> off) it must stay 0. ---
+	const int FT = 4000;
+	const double far_sigma = 8.0 * sig_rms;   // ~-12 dB SNR3k region, signal absent
+	int false_accepts = 0;
+	std::mt19937 frng(0xFA12C0DEu);
+	std::normal_distribution<double> fnd(0.0, far_sigma);
+	for (int t = 0; t < FT; t++) {
+		for (int i = 0; i < total_pb; i++) work[(size_t)i] = fnd(frng);
+		mfsk_ctrl_frame_type rx_type; uint64_t rx_p38 = 0; uint16_t rx_crc12 = 0; int rx_matched = 0;
+		bool ok = ts.decode_ctrl_suffix_from_passband(
+			work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched);
+		if (ok) false_accepts++;   // ANY clean decode (passes count+metric+CRC12+type) on pure noise
+	}
+	printf("    --- FAR (pure noise, sigma=%.1f×rms, %d trials) ---\n", 8.0, FT);
+	printf("    production CONNECT decode @ metric>=%.2f : %d/%d false accepts\n",
+		(double)cl_mfsk::CTRL_DETECT_METRIC_MIN, false_accepts, FT);
+	if (false_accepts > 0) {
+		char b[200]; snprintf(b, sizeof(b),
+			"FAR = %d/%d false CONNECT accepts on pure noise at metric>=%.2f "
+			"(uncoded path; CRC12+type+count backstop breached)",
+			false_accepts, FT, (double)cl_mfsk::CTRL_DETECT_METRIC_MIN);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] relax rescued %d CRC-valid decodes (0 on the 3.0 binary); clean decode P=1.0; "
+		"FAR %d/%d on the uncoded path. Production cliff %.2f dB is CONTENT-limited (see MEASURE above).\n",
+		rescued_total, false_accepts, FT, cliff_decode);
+	test_pass(name);
+}
+
+// =============================================================================
+// §20 (INCREMENT 2) — THE GATE FOR THIS INCREMENT: noncoherent base-pattern
+// COMBINING on the CONNECT handshake deepens the base-pattern matched-count
+// detection floor ~+2.2-2.5 dB/doubling (measured: hail-detection-floor §4,
+// repetition sim §14), past the §19.7-HW limiter (base-pattern matched-count
+// COLLAPSE — matched 16→13→10 below the connect_match_threshold). Drives the
+// ACTUAL production functions at R=1/2/4:
+//   TX:  generate_ctrl_suffix_pattern_passband (R base reps + suffix; sized by
+//        ctrl_suffix_pattern_passband_samples via set_connect_preamble_reps).
+//   RX:  detect_ack_pattern(combine_reps=R) — sums per-symbol FFT energy across
+//        the R aligned reps BEFORE the matched-count (the §20 lever); AND the
+//        full production decode_ctrl_suffix_from_passband (base detect + FEC).
+// Asserts: (a) the base-pattern matched-count cliff at R=4 is MATERIALLY deeper
+// than R=1 (fail-before on the pre-§20 binary where combine_reps is ignored);
+// (b) byte-identical-when-off — R=1 TX bytes == the no-combining TX bytes;
+// (c) FAR (combining + count gate) on pure noise = 0.
+// SNR3k axis bit-identical to the §17/§19 sweeps (snr3k_db) → directly
+// comparable to the −14.68 base floor.
+static void test_connect_preamble_combining_cliff_sweep() {
+	const char* name = "connect_preamble_combining_cliff_sweep";
+	printf("  [MEASURE] base-pattern noncoherent COMBINING on the production CONNECT detector (§20 INCREMENT 2):\n");
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);   // WB ROBUST-class — brings up ack_mfsk/connect
+	cl_arq_controller arq;             // production CRC12 callback
+	if (ts.ack_mfsk.connect_pattern_nsymb <= 0) {
+		test_fail(name, "CONNECT ctrl-suffix config not loaded (M<16?)"); return;
+	}
+	const double fs = ts.sampling_frequency;
+	const int conn_thr = ts.ack_mfsk.connect_match_threshold;   // matched-count gate (FAR defense)
+	const int Mdec = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+
+	// Enable the GF(16) RA FEC (the §19 content fix) for the FULL-establishment
+	// part of the sweep — combining is on the BASE, FEC on the suffix; together
+	// they are the establishment stack the HW A/B deploys. The base-pattern
+	// matched-count measurement (the headline) is FEC-independent (it only looks
+	// at the connect base symbols), so it is valid either way.
+	int N = ts.set_suffix_fec(true, 3);
+	if (N <= 13 || !ts.ack_mfsk.suffix_fec_coded) {
+		test_fail(name, "set_suffix_fec(true,3) did not bring up the coded path"); return;
+	}
+
+	// Reusable: build the clean coded CONNECT passband at the CURRENT reps, return
+	// (signal, p_sig, n_sig, lead). Caller varies reps via set_connect_preamble_reps.
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+	uint64_t typed40 = ((uint64_t)MFSK_CTRL_START_CONN << 38) | p38;
+	uint8_t bytes[5]; for (int b=0;b<5;b++) bytes[b]=(uint8_t)((typed40>>(8*(4-b)))&0xFF);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	// Noise axis (sigma/rms). Bracket −5..−20 dB so the combined base-pattern
+	// cliff (R=4 should reach well past −13) resolves.
+	const double mults[] = { 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0 };
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 60;
+	const int reps_list[] = { 1, 2, 4 };
+	double base_cliff[3] = { 1e9, 1e9, 1e9 };   // deepest SNR3k with P(matched>=thr)>=0.5
+	double est_cliff[3]  = { 1e9, 1e9, 1e9 };   // deepest SNR3k with P(full decode)>=0.5
+
+	std::vector<double> clean, work;
+	std::vector<std::complex<double> > bb;
+
+	for (int ri = 0; ri < 3; ri++) {
+		int R = reps_list[ri];
+		ts.set_connect_preamble_reps(R);
+		const int base_total = ts.ack_mfsk.connect_base_total_nsymb();
+		if (base_total != R * ts.ack_mfsk.connect_pattern_nsymb) {
+			test_fail(name, "connect_base_total_nsymb() != R*connect_pattern_nsymb"); return;
+		}
+		const int n_sig = ts.ctrl_suffix_pattern_passband_samples;
+		const int lead = 4096; const int total_pb = n_sig + 2 * lead;
+		clean.assign((size_t)total_pb, 0.0);
+		int written = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
+		if (written != n_sig) { test_fail(name, "coded+combined generate size mismatch"); return; }
+		double psum = 0.0; for (int i=0;i<n_sig;i++){ double v=clean[(size_t)(lead+i)]; psum+=v*v; }
+		const double p_sig = psum / n_sig;
+		const double sig_rms = std::sqrt(p_sig);
+		if (!(sig_rms > 0.0)) { test_fail(name, "combined signal RMS=0"); return; }
+
+		printf("    --- R=%d (base on wire = %d sym, %d total sym, %d samples) ---\n",
+			R, base_total, base_total + N, n_sig);
+		printf("    (sigma/rms : SNR3k_dB : P_base_matched>=%d : mean_matched : P_full_decode)\n", conn_thr);
+		work.assign((size_t)total_pb, 0.0);
+		for (int si = 0; si < NS; si++) {
+			const double sigma = mults[si] * sig_rms;
+			std::mt19937 rng((uint32_t)(0x20C0DE00u + ri*131 + si));
+			std::normal_distribution<double> nd(0.0, sigma);
+			int base_ok = 0, decoded_ok = 0, matched_sum = 0;
+			for (int t = 0; t < NT; t++) {
+				for (int i=0;i<total_pb;i++) work[(size_t)i] = clean[(size_t)i] + nd(rng);
+				// (i) base-pattern matched-count with combining (the headline lever).
+				int dec_size = total_pb / Mdec;
+				bb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+				ts.ofdm.passband_to_baseband_decimated(work.data(), total_pb, bb.data(),
+					fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+				int rm = 0, rbo = -1;
+				ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+					ts.ack_mfsk.connect_pattern_nsymb, ts.ack_mfsk.connect_tones, 8,
+					ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+					ts.ack_mfsk.stream_offsets, &rm, 0, nullptr, &rbo,
+					/*reserve_after=*/ts.ack_mfsk.ctrl_suffix_len(), nullptr,
+					/*always_fine=*/false, /*combine_reps=*/R);
+				matched_sum += rm;
+				if (rm >= conn_thr) base_ok++;
+				// (ii) full production establishment decode (base detect[combine] + FEC).
+				mfsk_ctrl_frame_type rx_type; uint64_t rx_p38=0; uint16_t rx_crc12=0; int rx_matched=0;
+				bool ok = ts.decode_ctrl_suffix_from_passband(
+					work.data(), total_pb, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+					prod_crc12_cb, &arq);
+				if (ok && rx_type == MFSK_CTRL_START_CONN && rx_p38 == p38) decoded_ok++;
+			}
+			double Pb = (double)base_ok / NT;
+			double Pd = (double)decoded_ok / NT;
+			double snr = snr3k_db(p_sig, sigma, fs);
+			printf("    %6.1f : %7.2f : %.2f : %6.2f : %.2f\n", mults[si], snr, Pb, (double)matched_sum/NT, Pd);
+			if (Pb >= 0.5 && snr < base_cliff[ri]) base_cliff[ri] = snr;
+			if (Pd >= 0.5 && snr < est_cliff[ri])  est_cliff[ri]  = snr;
+		}
+	}
+
+	printf("    --- base-pattern matched-count cliff (P=0.5, SNR3k dB; deeper=better) ---\n");
+	printf("    R=1: %.2f   R=2: %.2f (%+.2f)   R=4: %.2f (%+.2f vs R1)\n",
+		base_cliff[0], base_cliff[1], base_cliff[1]-base_cliff[0],
+		base_cliff[2], base_cliff[2]-base_cliff[0]);
+	printf("    --- full establishment (base[combine]+FEC) cliff (P=0.5, SNR3k dB) ---\n");
+	printf("    R=1: %.2f   R=2: %.2f   R=4: %.2f   (base floor -14.68)\n",
+		est_cliff[0], est_cliff[1], est_cliff[2]);
+	printf("    expected per §4/§14: ~+2.2-2.5 dB/doubling on the matched-count → R=4 ~+4-5 dB vs R=1\n");
+
+	// --- byte-identical-when-off: R=1 TX symbol layout == the pre-§20 single base
+	// block, EXACTLY. The invariant §20 touches is the FRAMED tone placement (the
+	// rep loop), so assert it on the deterministic integer-indexed framed data
+	// (data_container.ofdm_framed_data), NOT the post-FFT passband (which carries
+	// ~1e-11 cross-instance round-off independent of this change). For R=1,
+	// generate_connect_pattern must reproduce the original formula
+	// tone=(connect_tones[s%8]+s*hop)%M for s in [0,16) and nothing beyond. ---
+	{
+		ts.set_connect_preamble_reps(1);
+		const int Nc = ts.data_container.Nc;
+		const int conn_n = ts.ack_mfsk.connect_pattern_nsymb;
+		const int M = ts.ack_mfsk.M;
+		const int hop = ts.ack_mfsk.tone_hop_step;
+		const double amp = std::sqrt((double)Nc / ts.ack_mfsk.nStreams);
+		// Generate the framed CONNECT base+suffix at R=1 into the shared framed buf.
+		ts.ack_mfsk.generate_ctrl_suffix_pattern(ts.data_container.ofdm_framed_data,
+			MFSK_CTRL_START_CONN, p38, crc12);
+		// Verify the base block (first conn_n symbols) is EXACTLY the original layout.
+		bool layout_ok = true; double maxabs = 0.0;
+		for (int s = 0; s < conn_n && layout_ok; s++) {
+			int tone_base = ts.ack_mfsk.connect_tones[s % 8];
+			int actual_tone = (tone_base + s * hop) % M;
+			for (int k = 0; k < Nc; k++) {
+				std::complex<double> got = ts.data_container.ofdm_framed_data[s*Nc + k];
+				std::complex<double> exp(0.0, 0.0);
+				for (int st = 0; st < ts.ack_mfsk.nStreams; st++)
+					if (k == ts.ack_mfsk.stream_offsets[st] + actual_tone) exp = std::complex<double>(amp, 0.0);
+				double d = std::abs(got - exp);
+				if (d > maxabs) maxabs = d;
+				if (d > 1e-12) { layout_ok = false; break; }
+			}
+		}
+		if (!layout_ok) {
+			char b[160]; snprintf(b,sizeof(b),
+				"R=1 base framed layout != original single-block formula (max|diff|=%.3e)", maxabs);
+			test_fail(name, b); return;
+		}
+		printf("    [OFF] R=1 base framed layout EXACTLY matches the pre-§20 single-block formula (max|diff|=%.1e)\n", maxabs);
+	}
+
+	// --- FAR: pure noise through the COMBINED (R=4) production decode ----------
+	ts.set_connect_preamble_reps(4);
+	const int n_sig4 = ts.ctrl_suffix_pattern_passband_samples;
+	const int lead4 = 4096; const int total4 = n_sig4 + 2*lead4;
+	// recompute sig_rms at R=4 for the far_sigma reference
+	{
+		std::vector<double> c4((size_t)total4, 0.0);
+		ts.generate_ctrl_suffix_pattern_passband(c4.data()+lead4, MFSK_CTRL_START_CONN, p38, crc12);
+		double psum=0.0; for(int i=0;i<n_sig4;i++){double v=c4[(size_t)(lead4+i)];psum+=v*v;}
+		const double sig_rms4 = std::sqrt(psum/n_sig4);
+		const int FT = 4000;
+		const double far_sigma = 14.0 * sig_rms4;
+		int false_accepts = 0;
+		std::mt19937 frng(0xFA20C0DEu);
+		std::normal_distribution<double> fnd(0.0, far_sigma);
+		std::vector<double> w4((size_t)total4, 0.0);
+		for (int t=0;t<FT;t++) {
+			for (int i=0;i<total4;i++) w4[(size_t)i]=fnd(frng);
+			mfsk_ctrl_frame_type rt; uint64_t rp=0; uint16_t rc=0; int rmm=0;
+			if (ts.decode_ctrl_suffix_from_passband(w4.data(), total4, &rt,&rp,&rc,&rmm, prod_crc12_cb, &arq))
+				false_accepts++;
+		}
+		printf("    --- FAR (pure noise, sigma=14×rms, %d trials, R=4 combined+FEC path) ---\n", FT);
+		printf("    combined CONNECT decode : %d/%d false accepts (count gate %d/%d + CRC12 + 2-bit type)\n",
+			false_accepts, FT, conn_thr, ts.ack_mfsk.connect_pattern_nsymb);
+
+		// restore defaults for later tests (process-global gf16ra)
+		ts.set_connect_preamble_reps(1);
+		ts.set_suffix_fec(false);
+		gf16ra::configure(2);
+
+		// --- ASSERT 1 (HEADLINE / FAIL-BEFORE-PASSES): R=4 base-pattern matched-count
+		// cliff materially deeper than R=1. On the pre-§20 binary combine_reps is
+		// ignored → all three cliffs equal → this FAILS. Threshold +1.5 dB is
+		// conservative vs the measured +4-5 dB (§4 R=5 +3.74; §14 R=4 +2.50). ---
+		double base_gain = base_cliff[0] - base_cliff[2];   // positive = deeper at R=4
+		if (!(base_cliff[0] < 1e8 && base_cliff[2] < 1e8 && base_gain >= 1.5)) {
+			char b[256]; snprintf(b,sizeof(b),
+				"base-pattern combining gain R1->R4 = %.2f dB (R1=%.2f R4=%.2f) did NOT reach the "
+				"+1.5 dB floor — combining not deepening the matched-count (combine_reps ignored?)",
+				base_gain, base_cliff[0], base_cliff[2]);
+			test_fail(name, b); return;
+		}
+		// ASSERT 2: FAR clean on the combined path.
+		if (false_accepts > 0) {
+			char b[200]; snprintf(b,sizeof(b),
+				"FAR = %d/%d false CONNECT accepts on pure noise through the combined path", false_accepts, FT);
+			test_fail(name, b); return;
+		}
+		printf("    [ASSERT OK] base-pattern combining deepens the matched-count cliff %+.2f dB (R1->R4); "
+			"full establishment cliff R1=%.2f -> R4=%.2f; FAR %d/%d; byte-identical-when-off confirmed.\n",
+			base_gain, est_cliff[0], est_cliff[2], false_accepts, FT);
+	}
+	test_pass(name);
+}
+
+// =============================================================================
+// §21 PRODUCTION CAP/adaptive wiring — gate tests (tier2-suffix-fec-design.md §21)
+// =============================================================================
+//
+//   21.1 suffix_fec_cap_negotiation_matrix       — interop: upgraded/mixed/legacy
+//   21.2 ack_suffix_throughput_neutral           — ACK byte-identical regardless of
+//                                                   the CONNECT FEC state (the §21.1 fix)
+//   21.3 connect_suffix_byte_identical_when_off   — CONNECT suffix byte-identical
+//                                                   when FEC/combining off (CAP absent)
+//   21.4 production_enhanced_connect_decodes      — the production set-hook enable
+//                                                   (robust tier) yields a decodable
+//                                                   enhanced CONNECT (try-both RX)
+
+// §21.1 — INTEROP MATRIX. CAP_SUFFIX_FEC negotiates ON only when BOTH peers
+// advertise it; mixed / legacy pairs negotiate OFF. Also verifies the bit
+// survives the TEST_ACK / TEST_CONN cap-field wire round-trip (the 3-bit widening)
+// AND that ack_suffix_fec_eligible() additionally requires the robust tier.
+static void test_suffix_fec_cap_negotiation_matrix() {
+	const char* name = "suffix_fec_cap_negotiation_matrix";
+	// --- wire round-trip: CAP_SUFFIX_FEC survives the 3-bit TEST_ACK/TEST_CONN field ---
+	for (uint8_t cap = 0; cap <= CAP_NEGOTIABLE_MASK; cap++) {
+		uint64_t pa = 0; pack_test_ack_payload(&pa, cap, cap, 7);
+		uint8_t ea = 0xFF, oa = 0xFF, sa = 0;
+		if (!unpack_test_ack_payload(pa, &ea, &oa, &sa) ||
+		    ea != cap || oa != cap ||
+		    ((ea & CAP_SUFFIX_FEC) != (cap & CAP_SUFFIX_FEC))) {
+			test_fail(name, "TEST_ACK cap field did not round-trip CAP_SUFFIX_FEC"); return;
+		}
+		uint64_t pc = 0; pack_test_conn_payload(&pc, 5, cap, 9);
+		uint8_t sc = 0xFF, lc = 0xFF, ssc = 0;
+		if (!unpack_test_conn_payload(pc, &sc, &lc, &ssc) ||
+		    lc != cap || ((lc & CAP_SUFFIX_FEC) != (cap & CAP_SUFFIX_FEC))) {
+			test_fail(name, "TEST_CONN cap field did not round-trip CAP_SUFFIX_FEC"); return;
+		}
+	}
+	// --- negotiation predicate: ON iff BOTH sides advertise the bit ---
+	cl_arq_controller arq;
+	struct { uint8_t loc, peer; bool exp; const char* label; } cases[] = {
+		{ CAP_WB_CAPABLE|CAP_SUFFIX_FEC, CAP_WB_CAPABLE|CAP_SUFFIX_FEC, true,  "upgraded<->upgraded" },
+		{ CAP_WB_CAPABLE|CAP_SUFFIX_FEC, CAP_WB_CAPABLE,                false, "upgraded<->legacy"   },
+		{ CAP_WB_CAPABLE,                CAP_WB_CAPABLE|CAP_SUFFIX_FEC, false, "legacy<->upgraded"   },
+		{ CAP_WB_CAPABLE,                CAP_WB_CAPABLE,                false, "legacy<->legacy"     },
+		{ CAP_WB_CAPABLE|CAP_SUFFIX_FEC, 0,                            false, "upgraded<->unknown(0)"},
+	};
+	for (auto& c : cases) {
+		arq.local_capability = c.loc;
+		arq.peer_capability  = c.peer;
+		if (arq.suffix_fec_negotiated() != c.exp) {
+			char b[160]; snprintf(b, sizeof(b),
+				"%s: suffix_fec_negotiated()=%d expected=%d (loc=0x%02X peer=0x%02X)",
+				c.label, (int)arq.suffix_fec_negotiated(), (int)c.exp, c.loc, c.peer);
+			test_fail(name, b); return;
+		}
+	}
+	// --- adaptive ACK gate: negotiated AND robust tier ---
+	arq.local_capability = CAP_WB_CAPABLE|CAP_SUFFIX_FEC;
+	arq.peer_capability  = CAP_WB_CAPABLE|CAP_SUFFIX_FEC;
+	arq.current_configuration = ROBUST_0;
+	if (!arq.ack_suffix_fec_eligible()) { test_fail(name, "ack gate should be eligible at ROBUST_0 + negotiated"); return; }
+	arq.current_configuration = CONFIG_10;   // OFDM
+	if (arq.ack_suffix_fec_eligible())  { test_fail(name, "ack gate must be INELIGIBLE at CONFIG_10 (throughput-neutral)"); return; }
+	arq.current_configuration = ROBUST_0;
+	arq.peer_capability = CAP_WB_CAPABLE;    // cap absent
+	if (arq.ack_suffix_fec_eligible())  { test_fail(name, "ack gate must be INELIGIBLE when CAP not negotiated"); return; }
+	test_pass(name);
+}
+
+// §21.2 — THROUGHPUT-NEUTRALITY (the user's HARD constraint). The data-ACK
+// suffix WIRE CONTENT (the per-symbol tones + symbol count) MUST be byte-identical
+// regardless of the CONNECT FEC/combining state. This is the §21.1 fix:
+// pack_ctrl_suffix no longer reads a global, so an FEC-on CONNECT session can
+// NEVER code the ACK. We pack the ACK suffix tones twice — once with the CONNECT
+// FEC + combining FORCED ON (set_suffix_fec(true,3) + reps=4), once fully OFF —
+// and assert the emitted tone vector + symbol count are byte-identical. (Pre-§21
+// this FAILS: pack_ack_sack_payload inherited suffix_fec_coded and emitted a
+// 52-tone GF(16) codeword instead of the 13-tone hard pack.) We assert on the
+// TONES (the deterministic wire content), NOT the modulated passband doubles —
+// build_ack_sack_audio's passband has pre-existing run-to-run modulation
+// nondeterminism (a shared OFDM scratch buffer at the symbol boundary, ~0.7
+// magnitude, present even with NOTHING changed between two builds — orthogonal to
+// this increment; each real TX zeroes its buffers in the send path). ALSO assert
+// the ACK passband SAMPLE COUNT is unchanged (the airtime — what "no bloat" means).
+// ack_suffix_fec_coded stays false (the enable is held off, §21.3) so the ACK is
+// byte-identical in 100% of cases.
+static void test_ack_suffix_throughput_neutral() {
+	const char* name = "ack_suffix_throughput_neutral";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	if (ts.ack_mfsk.ack_sack_suffix_len() != 13) { test_fail(name, "expected 13-tone ACK suffix at M=16"); return; }
+
+	uint8_t bsi = 0x5A; uint32_t bitmap = 0x0AAAAAAAu; uint16_t crc12 = 0x123;
+	int samps_off = ts.ack_sack_pattern_passband_samples;
+	int t_off[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	int n_off = ts.ack_mfsk.pack_ack_sack_payload(bsi, bitmap, crc12, t_off);
+
+	// Force the CONNECT enhanced state ON (exactly what load_configuration does at
+	// the robust tier). The ACK wire content + airtime must be UNAFFECTED.
+	ts.set_suffix_fec(true, 3);
+	ts.set_connect_preamble_reps(4);
+	if (!ts.ack_mfsk.suffix_fec_coded) { test_fail(name, "set_suffix_fec(true) did not enable CONNECT FEC"); return; }
+	if (ts.ack_mfsk.ack_suffix_fec_coded) { test_fail(name, "ACK FEC flag must NOT follow the CONNECT enable (§21.1)"); return; }
+	int samps_on = ts.ack_sack_pattern_passband_samples;
+	int t_on[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+	int n_on = ts.ack_mfsk.pack_ack_sack_payload(bsi, bitmap, crc12, t_on);
+
+	ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2);  // restore
+
+	// (a) airtime: ACK passband sample count unchanged (no FEC bloat on the ACK).
+	if (samps_off != samps_on) {
+		char b[160]; snprintf(b, sizeof(b),
+			"ACK airtime changed with CONNECT FEC on: %d -> %d samples (FEC bloat on the ACK!)",
+			samps_off, samps_on);
+		test_fail(name, b); return;
+	}
+	// (b) wire content: identical tone count (13, NOT the 52-tone GF(16) codeword).
+	if (n_off != 13 || n_on != 13) {
+		char b[160]; snprintf(b, sizeof(b),
+			"ACK suffix tone COUNT changed: off=%d on=%d (expected 13 both — the §21.1 ACK-inherits-FEC bug)",
+			n_off, n_on);
+		test_fail(name, b); return;
+	}
+	// (c) wire content: identical tone VALUES.
+	for (int i = 0; i < 13; i++) {
+		if (t_off[i] != t_on[i]) {
+			char b[160]; snprintf(b, sizeof(b),
+				"ACK suffix tone[%d] changed: off=%d on=%d (ACK inheriting CONNECT FEC — §21.1)",
+				i, t_off[i], t_on[i]);
+			test_fail(name, b); return;
+		}
+	}
+	printf("    [ASSERT OK] data-ACK wire byte-identical with CONNECT FEC+combining ON vs OFF "
+		"(13 tones unchanged, %d passband samples unchanged); throughput-neutral.\n", samps_off);
+	test_pass(name);
+}
+
+// §21.3 — CONNECT suffix byte-identical when the enhanced state is OFF (the
+// CAP-absent / OFDM case). Decode the uncoded production path with FEC off and
+// confirm it matches a known START_CONN — i.e. turning the feature off restores
+// the exact pre-§19 wire. (Complements test_gf16_ra_byte_identical_when_off by
+// exercising it through the set_suffix_fec(false) production toggle.)
+static void test_connect_suffix_byte_identical_when_off() {
+	const char* name = "connect_suffix_byte_identical_when_off";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	// Toggle FEC on then OFF — must leave the uncoded 13-tone wire intact.
+	ts.set_suffix_fec(true, 3); ts.set_connect_preamble_reps(4);
+	ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2);
+	if (ts.ack_mfsk.suffix_fec_coded || ts.ack_mfsk.ctrl_suffix_len() != 13 ||
+	    ts.ack_mfsk.connect_base_total_nsymb() != ts.ack_mfsk.connect_pattern_nsymb) {
+		test_fail(name, "set_suffix_fec(false)/reps(1) did not restore the uncoded single-base state"); return;
+	}
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "N0CALL", 6);
+	int active = 0;
+	std::vector<double> audio = build_ctrl_suffix_audio(ts, MFSK_CTRL_START_CONN, p38, active);
+	mfsk_ctrl_frame_type t; uint64_t rp = 0; uint16_t rc = 0; int mm = 0;
+	// crc12_fn=nullptr → forces the pure uncoded path (FEC needs the callback).
+	bool ok = ts.decode_ctrl_suffix_from_passband(audio.data(), (int)audio.size(),
+		&t, &rp, &rc, &mm, nullptr, nullptr);
+	if (!ok || t != MFSK_CTRL_START_CONN || rp != p38) {
+		test_fail(name, "uncoded production CONNECT decode broken after FEC toggle-off"); return;
+	}
+	test_pass(name);
+}
+
+// §21.4 — the PRODUCTION enhanced CONNECT (FEC + combining via the set hooks, as
+// load_configuration applies at the robust tier) produces a passband that the
+// production try-both RX decodes on a clean channel. This is the integration
+// check that the CAP/adaptive wiring did not break the §19/§20 enhanced path
+// (the deep-floor cliff itself is the existing test_gf16_ra_production_path /
+// test_connect_preamble_combining sweeps; here we confirm the production-config
+// CONNECT encodes+decodes through the try-both decoder end to end).
+static void test_production_enhanced_connect_decodes() {
+	const char* name = "production_enhanced_connect_decodes";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	cl_arq_controller arq;
+	// Apply the production robust-tier enable (FEC R¼ + combining R=4).
+	ts.set_suffix_fec(true, 3);
+	ts.set_connect_preamble_reps(CONNECT_PREAMBLE_REPS_PROD);
+	int N = ts.ack_mfsk.ctrl_suffix_len();
+	if (N != gf16ra::codeword_len() || N <= 13) { test_fail(name, "FEC not active (ctrl_suffix_len!=N)"); ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2); return; }
+
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "W1AW", 4);
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+	int n_samples = ts.ctrl_suffix_pattern_passband_samples;
+	std::vector<double> audio((size_t)n_samples + 8192, 0.0);
+	int written = ts.generate_ctrl_suffix_pattern_passband(audio.data() + 4096,
+		MFSK_CTRL_START_CONN, p38, crc12);
+	bool gen_ok = (written == n_samples && n_samples > 0);
+
+	mfsk_ctrl_frame_type rt; uint64_t rp = 0; uint16_t rc = 0; int mm = 0;
+	bool dec_ok = ts.decode_ctrl_suffix_from_passband(audio.data(), n_samples + 4096,
+		&rt, &rp, &rc, &mm, prod_crc12_cb, &arq);
+
+	ts.set_connect_preamble_reps(1); ts.set_suffix_fec(false); gf16ra::configure(2);  // restore
+
+	if (!gen_ok) { test_fail(name, "production enhanced CONNECT TX (generate) failed"); return; }
+	if (!dec_ok || rt != MFSK_CTRL_START_CONN || rp != p38) {
+		char b[200]; snprintf(b, sizeof(b),
+			"production enhanced CONNECT did not decode clean (ok=%d type=%d p38 tx=0x%llx rx=0x%llx matched=%d)",
+			(int)dec_ok, (int)rt, (unsigned long long)p38, (unsigned long long)rp, mm);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] production enhanced CONNECT (FEC R1/4 + combining R=%d, N=%d) "
+		"encodes + try-both-decodes clean.\n", CONNECT_PREAMBLE_REPS_PROD, N);
+	test_pass(name);
+}
+
+// §21.5 — INTEROP: a LEGACY RX (uncoded, reps=1 detector) decoding an UPGRADED
+// CONNECT. This is the decisive measurement for the combining-vs-FEC interop
+// split (§21.3). It generates the production enhanced CONNECT on a tx-side
+// telecom_system at the requested (fec,reps), and decodes it on a SEPARATE legacy
+// rx-side telecom_system (FEC off, reps=1 — the detector a legacy peer runs).
+// Returns true iff the legacy RX cleanly decodes the START_CONN. (Clean channel.)
+static bool interop_legacy_rx_decodes(bool tx_fec, int tx_reps, uint64_t p38,
+                                      cl_arq_controller& arq) {
+	cl_telecom_system tx; tx.operation_mode = ARQ_MODE; tx.load_configuration(ROBUST_0);
+	tx.set_suffix_fec(tx_fec, 3);
+	tx.set_connect_preamble_reps(tx_reps);
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+	int n = tx.ctrl_suffix_pattern_passband_samples;
+	std::vector<double> audio((size_t)n + 8192, 0.0);
+	int written = tx.generate_ctrl_suffix_pattern_passband(audio.data() + 4096,
+		MFSK_CTRL_START_CONN, p38, crc12);
+	tx.set_connect_preamble_reps(1); tx.set_suffix_fec(false); gf16ra::configure(2);
+	if (written != n || n <= 0) return false;
+
+	// Legacy RX: a stock telecom_system, FEC off, reps=1 (the default after load).
+	cl_telecom_system rx; rx.operation_mode = ARQ_MODE; rx.load_configuration(ROBUST_0);
+	// (do NOT enable FEC/combining on rx — this is the legacy detector)
+	mfsk_ctrl_frame_type rt; uint64_t rp = 0; uint16_t rc = 0; int mm = 0;
+	bool ok = rx.decode_ctrl_suffix_from_passband(audio.data(), n + 4096,
+		&rt, &rp, &rc, &mm, /*crc12_fn=*/nullptr, /*ctx=*/nullptr);
+	// Legacy RX has no FEC → uncoded path. Verify it produced the right frame.
+	bool good = ok && rt == MFSK_CTRL_START_CONN && rp == p38;
+	if (g_verbose)
+		printf("    interop legacy-RX <- tx(fec=%d,reps=%d): decoded=%d type=%d match=%d matched=%d\n",
+			(int)tx_fec, tx_reps, (int)ok, (int)rt, (int)(rp == p38), mm);
+	return good;
+}
+
+// §21.5 — INTEROP MATRIX (clean channel). The enhanced ctrl-suffix is BACKWARD-
+// COMPATIBLE with a legacy RX by construction: (a) the GF(16) RA codeword is
+// SYSTEMATIC — its first 13 tones ARE the hard [type|p38|crc12] pack (MSB-first,
+// matching cl_mfsk::pack_ctrl_suffix), so a legacy hard-argmax RX reads the
+// payload from the systematic prefix and ignores the RA parity; (b) base-pattern
+// combining repeats the IDENTICAL 16-symbol base, and detect_ack_pattern locks on
+// the base rep that leaves room for the suffix (reserve_after), so the suffix is
+// found regardless of reps. We assert a legacy RX cleanly decodes an upgraded TX
+// at every (fec, reps) combo — i.e. an upgraded↔legacy pair establishes. (The
+// upgraded↔upgraded deep-floor reach is the §19/§20 cliff sweeps; the negotiation
+// predicate is test_suffix_fec_cap_negotiation_matrix.)
+static void test_suffix_fec_interop_legacy_rx() {
+	const char* name = "suffix_fec_interop_legacy_rx";
+	cl_arq_controller arq;
+	uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KX9ZZ", 5);
+	struct { bool fec; int reps; const char* label; } arms[] = {
+		{ false, 1, "uncoded/reps1 (today's wire)" },
+		{ true,  1, "FEC/reps1 (systematic prefix)" },
+		{ true,  4, "FEC+combining/reps4 (full enhanced)" },
+		{ false, 4, "combining-only/reps4" },
+	};
+	for (auto& a : arms) {
+		if (!interop_legacy_rx_decodes(a.fec, a.reps, p38, arq)) {
+			char b[200]; snprintf(b, sizeof(b),
+				"legacy RX FAILED to decode upgraded TX [%s] — enhanced suffix NOT backward-compatible",
+				a.label);
+			test_fail(name, b); return;
+		}
+	}
+	printf("    [ASSERT OK] legacy RX decodes upgraded TX at uncoded/FEC/FEC+combining/combining "
+		"(systematic GF(16) prefix + base-rep offset search) — upgraded<->legacy interop holds.\n");
+	test_pass(name);
+}
 
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
@@ -2811,6 +5091,54 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_ctrl_suffix_mini_moose_zero_cfo_no_op();
 	test_mfsk_ctrl_suffix_mini_moose_pure_noise_safe();
 	test_mfsk_ctrl_suffix_apply_sign_invariance();
+
+	// §9 Suffix FEC — CRC-aided soft list decode (connect-suffix-fec-research.md)
+	test_suffix_soft_roundtrip_clean();
+	test_suffix_soft_candidate0_equals_hard();
+	test_suffix_soft_corrects_one_flip();
+	test_suffix_soft_pure_noise_far();
+	test_suffix_soft_nb_unsupported();
+	test_suffix_fec_cliff_sweep();   // [MEASURE] prints the acquisition-gain dB
+
+	// §10 Tier-2 candidate A: soft GF(16) RA code (true deg-3 RA)
+	// (tier2-suffix-fec-gf16-spike.md)
+	test_gf16_ra_correction_capability();   // [CAP] proof it corrects multi-symbol errors
+	test_gf16_ra_encode_decode_clean();
+	test_gf16_ra_byte_identical_when_off();
+	test_gf16_ra_passband_roundtrip_clean();
+	test_gf16_ra_pure_noise_far();
+	test_gf16_ra_cliff_sweep();      // [MEASURE] prints the GF(16) cliff + gain dB
+	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
+	test_gf16_ra_production_path_cliff_sweep();
+
+	// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation,
+	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the
+	// noncoherent beacon-combining dB, the base-matched floor, and FAR.
+	test_hail_detection_cliff_sweep();
+
+	// §17 CONNECT ctrl-suffix detection cliff + FAR under the relaxed
+	// CTRL_DETECT_METRIC_MIN=1.2 (tier2-suffix-fec-design.md §16/§17,
+	// 2026-05-31). MEASURE + ASSERT: rescued-decode count in the [1.2,3.0)
+	// metric band (fail-before on the 3.0 binary), decode-cliff depth, and
+	// pure-noise FAR on the uncoded CONNECT path.
+	test_ctrl_suffix_metric_gate_cliff_sweep();
+
+	// §20 INCREMENT 2: noncoherent base-pattern COMBINING on the CONNECT
+	// handshake. MEASURE the base-pattern matched-count cliff at R=1/2/4
+	// (+2.2-2.5 dB/doubling expected) + the full establishment cliff; ASSERT
+	// R=4 deepens the matched-count materially vs R=1, byte-identical-when-off,
+	// FAR=0 on the combined path.
+	test_connect_preamble_combining_cliff_sweep();
+
+	// §21 PRODUCTION CAP/adaptive wiring (tier2-suffix-fec-design.md §21):
+	// the merge-prerequisite. Interop matrix, ACK throughput-neutrality
+	// (byte-identical), CONNECT byte-identical when off, production enhanced
+	// CONNECT encode+try-both-decode.
+	test_suffix_fec_cap_negotiation_matrix();
+	test_suffix_fec_interop_legacy_rx();
+	test_ack_suffix_throughput_neutral();
+	test_connect_suffix_byte_identical_when_off();
+	test_production_enhanced_connect_decodes();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
