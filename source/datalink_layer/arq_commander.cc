@@ -8324,6 +8324,67 @@ int cl_arq_controller::test_climb_engine()
 				(n_dataack_arms ? 2 : 0) + (turbo_snr_ack_enabled ? 1 : 0), 0);
 		}
 
+		// ================================================================
+		// Part P — ROBUST-TIER LADDER vs robust_enabled MISMATCH
+		// (gearshift-climb-engine.md §19). THE production "stuck at ROBUST_0,
+		// config 100->100" bug. A session can run with current_configuration in
+		// the ROBUST tier while robust_enabled==NO:
+		//   - GUI build: the per-loop sync (main.cc:2430) writes
+		//     robust_enabled = g_gui_state.robust_mode_enabled (the "Enable Robust
+		//     Mode" checkbox, default UNCHECKED in ini_parser.cc:227), CLOBBERING
+		//     the YES that startup set for an initial_config=ROBUST_0 session.
+		//   - Bench / explicit pin: `-s 100` (explicit_config) WITHOUT `-R` skips
+		//     the main.cc:2238 auto-enable (gated on !explicit_config) → robust_enabled=NO.
+		// In that state the FRAME-UP target config_ladder_up(current, robust_enabled,
+		// nb) took the !robust_enabled OFDM-only branch, which for config=ROBUST_0
+		// (100 >= WB ceiling 16) returns 100 UNCHANGED → FRAME-UP logs "config
+		// 100 -> 100" → the link NEVER climbs off ROBUST_0 at ANY SNR (even clean).
+		// config_ladder_down on a robust config returned GARBAGE (100->99) on the
+		// same branch, and config_is_at_top mis-evaluated. The fix makes the ladder
+		// primitives key the robust ladder off is_robust_config(config) too — a
+		// robust LIVE config implies the robust ladder regardless of the
+		// (intent-derived) flag. These assertions drive the REAL production
+		// primitives (config_ladder_up / _down / _is_at_top) — the SAME calls the
+		// FRAME-UP block (arq_commander.cc:3687/3712) and the BREAK floor make.
+		// FAIL-BEFORE: up==100, down==99, at_top mis-set. PASS-AFTER: up==ROBUST_1,
+		// down==ROBUST_0 (floor), at_top==false.
+		{
+			robust_enabled = NO;            // the GUI-loop / explicit-pin state
+			narrowband_enabled = NO;
+			// P1: the FRAME-UP +1 target MUST advance ROBUST_0 -> ROBUST_1 even
+			// though robust_enabled==NO (the live config is robust).
+			int p_up = config_ladder_up(ROBUST_0, robust_enabled, narrowband_enabled == YES);
+			check(p_up == ROBUST_1,
+				"P1 FRAME-UP target advances ROBUST_0->ROBUST_1 with robust_enabled=NO (the stuck-at-100 bug)",
+				p_up, ROBUST_1);
+			// P1b: the next rung too (ROBUST_1 -> ROBUST_2).
+			int p_up2 = config_ladder_up(ROBUST_1, robust_enabled, narrowband_enabled == YES);
+			check(p_up2 == ROBUST_2, "P1b ROBUST_1->ROBUST_2 with robust_enabled=NO",
+				p_up2, ROBUST_2);
+			// P1c: the tier crossing ROBUST_2 -> CONFIG_0 still works.
+			int p_up3 = config_ladder_up(ROBUST_2, robust_enabled, narrowband_enabled == YES);
+			check(p_up3 == CONFIG_0, "P1c ROBUST_2->CONFIG_0 (tier crossing) with robust_enabled=NO",
+				p_up3, CONFIG_0);
+			// P2: config_is_at_top(ROBUST_0) MUST be false (FRAME-UP gate) — a
+			// robust config is never "at the WB ceiling".
+			bool p_top = config_is_at_top(ROBUST_0, robust_enabled, narrowband_enabled == YES);
+			check(p_top == false, "P2 config_is_at_top(ROBUST_0) is FALSE with robust_enabled=NO (FRAME-UP gate open)",
+				p_top ? 1 : 0, 0);
+			// P3: config_ladder_down(ROBUST_0) MUST floor at ROBUST_0, NOT return
+			// garbage (pre-fix the !robust branch did 100-1=99).
+			int p_dn = config_ladder_down(ROBUST_0, robust_enabled);
+			check(p_dn == ROBUST_0, "P3 config_ladder_down(ROBUST_0) floors at ROBUST_0 (not 99 garbage) with robust_enabled=NO",
+				p_dn, ROBUST_0);
+			// P4: REGRESSION GUARD — a true OFDM-tier config with robust_enabled=NO
+			// is UNCHANGED (the OFDM ladder still applies; the fix is robust-config-only).
+			int p_ofdm_up = config_ladder_up(CONFIG_4, robust_enabled, narrowband_enabled == YES);
+			check(p_ofdm_up == CONFIG_5, "P4 OFDM CONFIG_4->CONFIG_5 UNCHANGED with robust_enabled=NO (fix is robust-config-scoped)",
+				p_ofdm_up, CONFIG_5);
+			int p_ofdm_dn = config_ladder_down(CONFIG_0, robust_enabled);
+			check(p_ofdm_dn == CONFIG_0, "P4b OFDM floor CONFIG_0 UNCHANGED with robust_enabled=NO (non-robust stays out of robust tier)",
+				p_ofdm_dn, CONFIG_0);
+		}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
