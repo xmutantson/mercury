@@ -236,6 +236,41 @@ void cl_telecom_system::print_tx_gain_table() const
 	}
 }
 
+double cl_telecom_system::skip_var_threshold() const
+{
+	// OFDM-data acquisition fix (Change B, plan §6/§11.7). Per-config SKIP-VAR
+	// threshold. Values for the WB low-rate configs are the MEASURED
+	// decode-boundary nv (mfsk_ctrl_codec_tests §23.0, FER<1 onset with skip-var
+	// OFF) × 1.3 safety margin — NOT hand-picked (CLAUDE.md §1):
+	//   CONFIG_0 (r1/16): boundary nv 1.43 → 1.86
+	//   CONFIG_1 (r2/16): boundary nv 1.23 → 1.60
+	//   CONFIG_2 (r3/16): boundary nv 1.12 → 1.45
+	//   CONFIG_3 (r4/16): boundary nv 1.05 → 1.37
+	// These are exactly the configs whose decode boundary (1.05-1.43) sits ABOVE
+	// the old fixed 0.5 gate, so 0.5 re-walled the cliff Change A opens.
+	// All other configs keep the historical 0.5 (CONFIG_10 measured boundary
+	// 0.35 < 0.5 confirms 0.5 is correct for mid/high rate; CONFIG_4-9 operate
+	// well above the floor where acquisition isn't the bottleneck — conservative).
+	// A hard cap is applied at the call site: nv>5 always skips regardless of
+	// config (no config decodes there), bounding the relaxation.
+	//
+	// SCOPED TO WB: the relaxation pairs with Change A's WB-only coherent
+	// acquisition. NB OFDM acquisition is unchanged (Schmidl-Cox), so NB cannot
+	// acquire at the deep SNR the relaxed nv targets — relaxing NB would only
+	// change behavior with no benefit and the measurement was WB-only. NB keeps
+	// the historical 0.5 (non-WB-OFDM path byte-identical, per the spec).
+	if(narrowband_enabled)
+		return 0.5;
+	switch(current_configuration)
+	{
+		case CONFIG_0: return 1.86;
+		case CONFIG_1: return 1.60;
+		case CONFIG_2: return 1.45;
+		case CONFIG_3: return 1.37;
+		default:       return 0.5;   // historical mid/high-rate gate
+	}
+}
+
 cl_error_rate cl_telecom_system::baseband_test_EsN0(float EsN0,int max_frame_no)
 {
 	cl_error_rate lerror_rate;
@@ -1179,6 +1214,27 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 								(selftest.correlation < preamble_detect_threshold
 								 || abs(detected_delay - ofdm_forced_delay) > gi_interp_st)
 								? "WARN-lowSNR" : "OK");
+
+							// OFDM-data acquisition fix (Step 1) integration probe:
+							// run the COHERENT FFT detector on the SAME decimated
+							// buffer + window, so tools/ofdm_acq_cliff_sweep.py can
+							// compare its OK-cliff vs the Schmidl-Cox baseline above.
+							// WB only (the FFT detector is wired WB-only). This is a
+							// diagnostic print; it does not change acquisition here
+							// (forced-delay BER bypasses detection).
+							if(!narrowband_enabled)
+							{
+								TimeSyncResult st_fft = ofdm.time_sync_preamble_fft_norm(
+									&data_container.baseband_data_decimated[st_start_dec],
+									st_size_dec, 1, data_container.preamble_nSymb);
+								int fft_delay = st_start + st_fft.delay * st_M;
+								printf("[BER-DET-FFT] config=%d metric=%.4f delay=%d expected=%d %s\n",
+									current_configuration,
+									st_fft.correlation, fft_delay, ofdm_forced_delay,
+									(st_fft.correlation < preamble_detect_threshold
+									 || abs(fft_delay - ofdm_forced_delay) > gi_interp_st)
+									? "WARN-lowSNR" : "OK");
+							}
 						}
 					}
 				}
@@ -1240,9 +1296,21 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					int dec_buf = data_container.Nofdm * data_container.buffer_Nsymb;
 					if(verify_start_dec + verify_size_dec > dec_buf)
 						verify_size_dec = dec_buf - verify_start_dec;
-					TimeSyncResult verify = ofdm.time_sync_preamble_halfsym(
-						&data_container.baseband_data_decimated[verify_start_dec],
-						verify_size_dec, 1, 1);
+					// OFDM-data acquisition fix (Step 1): WB uses the coherent
+					// FFT detector (time_sync_preamble_fft_norm, [0,1]-normalized)
+					// on the decimated buffer — same buffer/interp the Schmidl-Cox
+					// coarse used. Moves the acquisition cliff +4-6 dB (plan §11).
+					// NB keeps Schmidl-Cox (nIS=2, only 4 preamble bins/sym —
+					// coherent gain thin; plan §5 risk #5).
+					TimeSyncResult verify;
+					if(!narrowband_enabled)
+						verify = ofdm.time_sync_preamble_fft_norm(
+							&data_container.baseband_data_decimated[verify_start_dec],
+							verify_size_dec, 1, data_container.preamble_nSymb);
+					else
+						verify = ofdm.time_sync_preamble_halfsym(
+							&data_container.baseband_data_decimated[verify_start_dec],
+							verify_size_dec, 1, 1);
 					verify.delay = verify.delay * v_M + verify_start_full;
 
 					if(verify.correlation >= preamble_detect_threshold)
@@ -1320,6 +1388,45 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				int s5_search_off_dec = search_offset / s5_M;
 				int s5_search_size_dec = search_size / s5_M;
 				int s5_gi_dec = data_container.Ngi;  // decimated GI stride
+
+				TimeSyncResult matched;
+
+				if(!narrowband_enabled)
+				{
+					// OFDM-data acquisition fix (Step 1, plan §11.4): WB coarse
+					// acquisition via the COHERENT FFT detector instead of the
+					// Schmidl-Cox autocorrelation. The autocorrelation metric mean
+					// is length-invariant (floors at ~0.11 at −3 dB SNR3k → the
+					// +0.9 dB cliff); coherent cross-correlation against the known
+					// preamble values recovers matched-filter gain (+4-6 dB,
+					// b328a4d MFSK precedent). Runs on the SAME decimated buffer at
+					// interp=1 the Schmidl-Cox coarse used (CPU-equivalent), then
+					// time_sync_preamble_fft_fine_norm gives sample-precise (within
+					// the decimated grid) timing. The result only needs SYMBOL-level
+					// accuracy here: site 8 (time_sync_preamble_with_metric,
+					// ~:2090) re-refines receive_stats.delay to full-rate precision
+					// from raw passband around pream_symb_loc. correlation is
+					// [0,1]-normalized (clean≈1, noise≈small) so every coarse_metric
+					// ARQ consumer (0.10/0.15/0.30/0.5/0.97 thresholds) is preserved.
+					int pn = data_container.preamble_nSymb;
+					TimeSyncResult fft_coarse = ofdm.time_sync_preamble_fft_norm(
+						&data_container.baseband_data_decimated[s5_search_off_dec],
+						s5_search_size_dec, 1, pn);
+					// Fine refinement around the coarse position (decimated coords).
+					// ±preamble window mirrors the Schmidl-Cox Phase-2 margin so the
+					// true peak is reachable even when coarse lands a few GI off.
+					int pream_dec = pn * data_container.Nofdm;
+					TimeSyncResult fft_fine = ofdm.time_sync_preamble_fft_fine_norm(
+						&data_container.baseband_data_decimated[s5_search_off_dec],
+						s5_search_size_dec, 1, pn,
+						fft_coarse.delay, pream_dec);
+					// Map decimated delay back to full rate (× M, + search_offset),
+					// mirroring the Schmidl-Cox decimated→full mapping.
+					matched.delay = fft_fine.delay * s5_M + search_offset;
+					matched.correlation = fft_fine.correlation;
+				}
+				else
+				{
 				TimeSyncResult s5_coarse = ofdm.time_sync_preamble_halfsym(
 					&data_container.baseband_data_decimated[s5_search_off_dec],
 					s5_search_size_dec, 1, s5_gi_dec, 0.5);
@@ -1337,7 +1444,6 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				if(s5_slice_start + s5_slice_len > search_offset + search_size)
 					s5_slice_len = (search_offset + search_size) - s5_slice_start;
 
-				TimeSyncResult matched;
 				// halfsym_2phase edge cases, replicated:
 				//   (A) coarse.correlation < 0.05  -> return coarse
 				//   (B) fine_size <= pream_len     -> return coarse
@@ -1393,6 +1499,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					matched.delay = s5_slice_start + s5_fine.delay;
 					matched.correlation = s5_fine.correlation;
 				}
+				} // end NB Schmidl-Cox (WB uses the coherent FFT detector above)
 
 				receive_stats.delay = matched.delay;
 				receive_stats.coarse_metric = matched.correlation;
@@ -2514,20 +2621,30 @@ skip_h_retry_point:
 					}
 				}
 
-				// Noise variance gate: if noise_variance > 0.5 (SNR < ~3 dB), the
-				// signal is either noise (false preamble detection) or completely
-				// unusable. Good frames: var=0.01-0.10. Garbage: var=1.7-3.3.
-				// Skip LDPC to free receiver for real frames.
+				// Noise variance gate: skip LDPC when the post-EQ pilot-noise nv is
+				// too high for THIS config's code rate to decode. Good frames:
+				// var=0.01-0.10. Garbage: var=1.7-3.3.
+				//
+				// OFDM-data acquisition fix (Change B, plan §6): the threshold is
+				// now PER-CONFIG (skip_var_threshold()), scaled by code rate. The
+				// old fixed 0.5 was mid-rate calibrated and bailed the decoder on
+				// rate-1/16 frames (which decode at nv≈1.4, MEASURED §23.0) —
+				// re-walling the −3 dB cliff Change A opens. A HARD CAP nv>5 always
+				// skips regardless of config (no config decodes there), so relaxing
+				// the per-config threshold cannot let true noise through unboundedly
+				// (plan §6.3: keeps the 3-strike pure-noise abort firing).
 				// Phase-2 validation: --skip-var-gate=off bypasses this gate.
 				//
 				// Phase-F stall fix (2026-05-12): if 3+ consecutive trials all
 				// SKIP-VAR, the entire trial range is noise — abort the trial
 				// loop entirely so the caller advances the buffer past this
 				// noise region instead of burning 20 trials (~2 s) on it.
-				if(skip_var_gate_enabled && ofdm.noise_variance_estimate > 0.5)
+				double skip_var_thr = skip_var_threshold();
+				if(skip_var_gate_enabled &&
+				   (ofdm.noise_variance_estimate > skip_var_thr || ofdm.noise_variance_estimate > 5.0))
 				{
-					printf("[OFDM-SYNC] trial %d SKIP-VAR: var=%.4f too high (>0.5), skipping LDPC\n",
-						receive_stats.sync_trials, ofdm.noise_variance_estimate);
+					printf("[OFDM-SYNC] trial %d SKIP-VAR: var=%.4f too high (>%.2f cfg=%d, hard cap 5.0), skipping LDPC\n",
+						receive_stats.sync_trials, ofdm.noise_variance_estimate, skip_var_thr, current_configuration);
 					fflush(stdout);
 					receive_stats.sync_trials++;
 					consecutive_skip_var++;
@@ -5602,6 +5719,66 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm.mfsk_preamble_match_threshold = 0;
 		for(int s = 0; s < 16; s++) ofdm.mfsk_preamble_tones[s] = 0;
 		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
+
+		// OFDM-data acquisition fix (Step 1, plan §11.5): calibrate the coherent
+		// FFT detector's CLEAN REFERENCE for the [0,1] coarse_metric
+		// normalization (so a clean preamble → exactly 1.0, preserving the
+		// telecom_system.cc:2469/2706 ≥0.97 sub-peak/iteration saturation gates).
+		// MEASURED at load (not guessed): synthesize the preamble through the
+		// same minimal round-trip the WB detector sees (preamble values →
+		// symbol_mod → b2p → p2b(FIR_rx_time_sync)) and record the raw mode-1
+		// metric. Amplitude-invariant, so boost/power-norm/peak_clip/FIR_tx are
+		// not needed. WB only (the FFT detector is wired WB-only; NB keeps
+		// Schmidl-Cox). Runs once per config switch (rare).
+		ofdm.fft_clean_ref = 0.0;
+		if(!narrowband_enabled && ofdm.ofdm_preamble != NULL
+		   && ofdm.preamble_configurator.nIdentical_sections == 4)
+		{
+			int cal_Nofdm = data_container.Nofdm;
+			int cal_Nc = ofdm.Nc;
+			int cal_pn = data_container.preamble_nSymb;
+			int cal_interp = frequency_interpolation_rate;
+			if(cal_Nofdm > 0 && cal_pn > 0 && cal_interp > 0)
+			{
+				int cal_bb = cal_pn * cal_Nofdm;
+				int cal_pb = cal_bb * cal_interp;
+				int cal_pad = 8 * cal_Nofdm * cal_interp;  // trailing pad for search
+				int cal_dec = (cal_pb + cal_pad) / cal_interp;  // decimated buffer length
+				std::complex<double>* cal_mod = new std::complex<double>[cal_bb];
+				double* cal_pbbuf = new double[cal_pb + cal_pad];
+				std::complex<double>* cal_rx = new std::complex<double>[cal_dec];
+				std::complex<double>* cal_sc = new std::complex<double>[cal_Nc];
+				for(int i = 0; i < cal_pb + cal_pad; i++) cal_pbbuf[i] = 0.0;
+				// preamble values → symbol_mod (NO pre-eq/boost: metric is a ratio)
+				for(int i = 0; i < cal_pn; i++)
+				{
+					for(int k = 0; k < cal_Nc; k++)
+						cal_sc[k] = ofdm.ofdm_preamble[i * cal_Nc + k].value;
+					ofdm.symbol_mod(cal_sc, &cal_mod[i * cal_Nofdm]);
+				}
+				long unsigned saved_pss = ofdm.passband_start_sample;
+				ofdm.passband_start_sample = 0;
+				ofdm.baseband_to_passband(cal_mod, cal_bb, cal_pbbuf,
+					sampling_frequency, carrier_frequency, carrier_amplitude, cal_interp);
+				ofdm.passband_start_sample = saved_pss;
+				// Decimate to base rate EXACTLY as production does (the WB primary
+				// detect runs on baseband_data_decimated). decimation_rate=cal_interp
+				// → cal_rx is the decimated buffer; the detector then strides by 1.
+				// (The earlier bug fed a full-rate buffer with interp=1, grabbing
+				// Nfft consecutive full-rate samples → clean_ref≈1.25 not ~11.)
+				ofdm.passband_to_baseband(cal_pbbuf, cal_pb + cal_pad, cal_rx,
+					sampling_frequency, carrier_frequency, carrier_amplitude,
+					cal_interp, &ofdm.FIR_rx_time_sync);
+				TimeSyncResult cal = ofdm.time_sync_preamble_fft(
+					cal_rx, cal_dec, 1, cal_pn, 1);
+				if(cal.correlation > 1.0)
+					ofdm.fft_clean_ref = cal.correlation;
+				printf("[PHY] OFDM FFT detector clean ref = %.4f (mode 1, %d bins/sym, %d-sym preamble)\n",
+					ofdm.fft_clean_ref, ofdm.preamble_bins_per_symbol(), cal_pn);
+				fflush(stdout);
+				delete[] cal_mod; delete[] cal_pbbuf; delete[] cal_rx; delete[] cal_sc;
+			}
+		}
 
 #if 0 // Template generation disabled: using Schmidl-Cox autocorrelation
 		// Generate OFDM matched-filter template for preamble detection.

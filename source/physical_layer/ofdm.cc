@@ -117,6 +117,7 @@ cl_ofdm::cl_ofdm()
 	mfsk_corr_template_energy=0.0;
 	mfsk_corr_template_nsymb=0;
 	for(int i=0;i<16;i++) mfsk_corr_template_sym_energy[i]=0.0;
+	fft_clean_ref=0.0;  // 0 → _norm wrappers fall back to bins/symbol until calibrated
 	// MFSK preamble parameters (discrete-match port, §14).
 	mfsk_M=0;
 	mfsk_nStreams=0;
@@ -2683,14 +2684,24 @@ TimeSyncResult cl_ofdm::time_sync_preamble_halfsym_2phase(
 
 TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 	std::complex<double>* baseband_interp, int buffer_size_interp,
-	int interpolation_rate, int preamble_nSymb)
+	int interpolation_rate, int preamble_nSymb, int combine_mode)
 {
 	/*
 	 * FFT-based preamble detection for narrowband OFDM.
 	 *
-	 * Coarse search at GI-period steps. Per-bin coherent across symbols
-	 * (timing-dependent phase is constant per bin across symbols), non-coherent
-	 * across bins (avoids cross-bin phase spread from timing offset).
+	 * combine_mode 0 (original): per-bin coherent across symbols (timing-
+	 * dependent phase is constant per bin across symbols), non-coherent across
+	 * bins. Max coherent gain (clean≈Nsymb) but the across-symbol coherence
+	 * collapses under residual CFO (MEASURED: −60% by 5 Hz, below noise by 8 Hz)
+	 * and has a fat pure-noise tail.
+	 *
+	 * combine_mode 1 (OFDM-data acquisition fix, plan §6 risk #2): coherent
+	 * across BINS within each symbol (the bins share the symbol's timing phase),
+	 * NON-coherent across symbols (Σ_sym |Σ_b fft·conj(pre)|²). Immune to
+	 * symbol-to-symbol CFO drift over the preamble span; the noise statistic is
+	 * a χ² with Nsymb DoF (tighter tail → lower FAR). Clean≈n_bins, noise≈1.
+	 *
+	 * Coarse search at GI-period steps.
 	 *
 	 * PREAMBLE-SPECIFIC: correlates against known preamble subcarrier values.
 	 * Data symbols produce metric ≈ 1 (random correlation), preamble ≈ Nsym.
@@ -2759,6 +2770,8 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 		for(int b = 0; b < max_bins; b++)
 			bin_accum[b] = std::complex<double>(0.0, 0.0);
 
+		double metric_noncoh = 0.0;  // mode 1: Σ_sym |Σ_b ...|²
+
 		for(int sym = 0; sym < preamble_nSymb; sym++)
 		{
 			int sym_start = sample_start + sym * symbol_interp;
@@ -2772,16 +2785,26 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 
 			fft(fft_in, fft_out, Nfft);
 
+			std::complex<double> sym_sum(0.0, 0.0);  // mode 1: coherent across bins
 			for(int b = 0; b < n_preamble_bins_per_sym[sym]; b++)
 			{
 				int sc = preamble_bin_list[sym][b];
-				bin_accum[b] += fft_out[preamble_bin_fft[sym][b]] * std::conj(ofdm_preamble[sym * Nc + sc].value);
+				std::complex<double> t = fft_out[preamble_bin_fft[sym][b]] * std::conj(ofdm_preamble[sym * Nc + sc].value);
+				bin_accum[b] += t;   // mode 0: coherent across symbols per bin
+				sym_sum += t;        // mode 1: coherent across bins this symbol
 			}
+			metric_noncoh += std::norm(sym_sum);  // mode 1: non-coherent across symbols
 		}
 
-		double metric = 0.0;
-		for(int b = 0; b < n_preamble_bins_per_sym[0]; b++)
-			metric += std::norm(bin_accum[b]);
+		double metric;
+		if(combine_mode == 1)
+			metric = metric_noncoh;
+		else
+		{
+			metric = 0.0;
+			for(int b = 0; b < n_preamble_bins_per_sym[0]; b++)
+				metric += std::norm(bin_accum[b]);
+		}
 
 		coarse_metrics[pos] = metric;
 		if(metric > best_coarse_metric)
@@ -2839,7 +2862,7 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft(
 TimeSyncResult cl_ofdm::time_sync_preamble_fft_fine(
 	std::complex<double>* baseband_interp, int buffer_size_interp,
 	int interpolation_rate, int preamble_nSymb,
-	int coarse_pos, int search_half_window)
+	int coarse_pos, int search_half_window, int combine_mode)
 {
 	/*
 	 * FFT fine preamble detection + GI-only sample-level refinement.
@@ -2917,6 +2940,8 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft_fine(
 		for(int b = 0; b < max_bins; b++)
 			bin_accum[b] = std::complex<double>(0.0, 0.0);
 
+		double metric_noncoh = 0.0;  // mode 1
+
 		for(int sym = 0; sym < preamble_nSymb; sym++)
 		{
 			int sym_start = sample_start + sym * symbol_interp;
@@ -2930,16 +2955,26 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft_fine(
 
 			fft(fft_in, fft_out, Nfft);
 
+			std::complex<double> sym_sum(0.0, 0.0);
 			for(int b = 0; b < n_preamble_bins_per_sym[sym]; b++)
 			{
 				int sc = preamble_bin_list[sym][b];
-				bin_accum[b] += fft_out[preamble_bin_fft[sym][b]] * std::conj(ofdm_preamble[sym * Nc + sc].value);
+				std::complex<double> t = fft_out[preamble_bin_fft[sym][b]] * std::conj(ofdm_preamble[sym * Nc + sc].value);
+				bin_accum[b] += t;
+				sym_sum += t;
 			}
+			metric_noncoh += std::norm(sym_sum);
 		}
 
-		double metric = 0.0;
-		for(int b = 0; b < n_preamble_bins_per_sym[0]; b++)
-			metric += std::norm(bin_accum[b]);
+		double metric;
+		if(combine_mode == 1)
+			metric = metric_noncoh;
+		else
+		{
+			metric = 0.0;
+			for(int b = 0; b < n_preamble_bins_per_sym[0]; b++)
+				metric += std::norm(bin_accum[b]);
+		}
 
 		fine_metrics[idx] = metric;
 		if(metric > best_fine_metric)
@@ -3031,6 +3066,68 @@ TimeSyncResult cl_ofdm::time_sync_preamble_fft_fine(
 	result.delay = best_gi_pos;
 	result.correlation = fft_metric;  // Return FFT metric (the discriminating one)
 	return result;
+}
+
+// OFDM-data acquisition fix (Step 1, ofdm-data-acquisition-fix-plan.md §11.2):
+// re-normalize the coherent FFT detector's raw metric into the [0,1]
+// coarse_metric ARQ contract so EVERY consumer (telecom_system.cc + arq_common.cc
+// thresholds: 0.10 / 0.15 / 0.30 / 0.50 / 0.97) keeps working unchanged.
+//
+// Both detector modes have a pure-noise random-walk floor ≈ 1; the clean value
+// differs by mode (mode 0 ≈ preamble_nSymb; mode 1 ≈ preamble bins/symbol). The
+// transform subtracts the floor and normalizes by the clean-minus-floor span,
+// so a clean preamble → 1.0 and noise → ~0 regardless of mode:
+//   norm = clamp( (raw - 1) / (clean_ref - 1), 0, 1 )
+// Production uses mode 1 with clean_ref = the MEASURED clean (fft_clean_ref,
+// ≈11.1 for WB CONFIG_0; calibrated at load) so clean→1.0 (satisfies the ≥0.97
+// saturation gates), noise→~0.03 (< all low thresholds), −3 dB→~0.25 (≥0.15
+// detect, in the [0.15,0.5) weak band). MEASURED in mfsk_ctrl_codec_tests §22.0.
+double cl_ofdm::normalize_fft_metric(double raw, double clean_ref)
+{
+	if(clean_ref <= 1.0)
+		return 0.0;  // degenerate; no coherent gain to normalize
+	double norm = (raw - 1.0) / (clean_ref - 1.0);
+	if(norm < 0.0) norm = 0.0;
+	if(norm > 1.0) norm = 1.0;
+	return norm;
+}
+
+int cl_ofdm::preamble_bins_per_symbol()
+{
+	int nb = 0;
+	for(int k = 0; k < Nc; k++)
+		if(ofdm_preamble[k].type == PREAMBLE)
+			nb++;
+	return nb;
+}
+
+// Production WB acquisition detector: combine_mode 1 (coherent across bins,
+// non-coherent across symbols → CFO-robust over the preamble span; MEASURED
+// mode-0 collapsed −60% by 5 Hz residual CFO, mode 1 holds), normalized to the
+// [0,1] coarse_metric ARQ contract using the mode-1 clean reference (the number
+// of preamble bins/symbol; MEASURED ≈11.1 for WB CONFIG_0; noise floor ≈1).
+TimeSyncResult cl_ofdm::time_sync_preamble_fft_norm(
+	std::complex<double>* baseband_interp, int buffer_size_interp,
+	int interpolation_rate, int preamble_nSymb)
+{
+	TimeSyncResult r = time_sync_preamble_fft(
+		baseband_interp, buffer_size_interp, interpolation_rate, preamble_nSymb, 1);
+	double clean_ref = (fft_clean_ref > 1.0) ? fft_clean_ref : (double)preamble_bins_per_symbol();
+	r.correlation = normalize_fft_metric(r.correlation, clean_ref);
+	return r;
+}
+
+TimeSyncResult cl_ofdm::time_sync_preamble_fft_fine_norm(
+	std::complex<double>* baseband_interp, int buffer_size_interp,
+	int interpolation_rate, int preamble_nSymb,
+	int coarse_pos, int search_half_window)
+{
+	TimeSyncResult r = time_sync_preamble_fft_fine(
+		baseband_interp, buffer_size_interp, interpolation_rate, preamble_nSymb,
+		coarse_pos, search_half_window, 1);
+	double clean_ref = (fft_clean_ref > 1.0) ? fft_clean_ref : (double)preamble_bins_per_symbol();
+	r.correlation = normalize_fft_metric(r.correlation, clean_ref);
+	return r;
 }
 
 TimeSyncResult cl_ofdm::time_sync_preamble_matched(
