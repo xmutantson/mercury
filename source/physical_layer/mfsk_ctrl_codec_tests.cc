@@ -3609,6 +3609,249 @@ static void test_gf16_ra_cliff_sweep() {
 	test_pass(name);  // infra ran; dB verdict is in the log
 }
 
+// =============================================================================
+// §10.6 — ROBUST_3 DATA-FRAME SCALING: does GF(16)-RA scale to K≈200 symbols
+// (800 info bits) near-capacity, or is it inherently short-message?
+// (fact-documents/robust3-gf16ra-data-code-feasibility.md — THE make-or-break.)
+//
+// ROBUST_3 @8c6d3b7 carries K=800 info bits = 200 GF(16) symbols on a binary
+// rate-8/16 LDPC (N=1600), AWGN cliff channel-SNR -7 dB = SNR3k -7.1, Eb/N0
+// +5.89. These tests measure the K-generalized GF(16)-RA (configure_k /
+// encode_k / soft_decode_k) at K=200 to see whether the non-binary symbol-
+// matched code moves that cliff toward VARA's -10 / +2.34 dB.
+// =============================================================================
+
+// Synthesize the M=16 per-tone matched-filter ENERGY matrix for an N-symbol
+// codeword under AWGN at per-symbol Es/N0 = esn0_lin (linear). Standard
+// noncoherent M-FSK model: the sent tone's complex MF output = signal + CN(0,N0)
+// (energy = noncentral chi-square_2), the M-1 other tones = CN(0,N0) (central
+// chi-square_2). Es = A^2 with A = sqrt(esn0_lin*N0); set N0=1 => A=sqrt(esn0).
+// energies[s*16+t] = |Y|^2. This is the same intrinsic the Bessel metric expects
+// and the standard model behind the in-tree §8.4 FEC-reach numbers.
+static void gf16ra_synth_energies(const int* tones, int N, double esn0_lin,
+                                  std::mt19937& rng, std::vector<double>& E) {
+	E.assign((size_t)N * 16, 0.0);
+	std::normal_distribution<double> nd(0.0, std::sqrt(0.5));  // per-quadrature N0/2, N0=1
+	double A = std::sqrt(esn0_lin);
+	for (int s = 0; s < N; s++) {
+		for (int t = 0; t < 16; t++) {
+			double re = nd(rng), im = nd(rng);
+			if (t == tones[s]) re += A;                 // sent tone gets the signal amplitude
+			E[(size_t)s * 16 + t] = re * re + im * im;  // |Y|^2 = MF energy
+		}
+	}
+}
+
+// Anchor the Es/N0 (per GF(16) symbol) -> Eb/N0 and -> SNR3k axes to the binary
+// ROBUST_3 measurement so the GF16-RA cliff is directly comparable.
+//   Eb/N0 = Es/N0 / (R * log2(M)),  log2(M)=4.   (energy per INFO bit)
+//   SNR3k = Eb/N0 + 10log10(4R) - 16.0  dB.
+// The -16.0 constant is fixed by the binary anchor: binary ROBUST_3 R=0.5 cliffs
+// at Eb/N0 +5.89 = SNR3k -7.1  =>  C = -7.1 - 5.89 - 10log10(2) = -16.0. (This is
+// 10log10(3000/sym_rate) for the M16x2 PHY; identical PHY => identical for the
+// GF16-RA codeword, which rides the same tones.) Net bps = 298 * R (binary R=0.5
+// => 149 bps; bps scales linearly with rate on the fixed symbol clock).
+static inline double esn0db_to_ebn0db(double esn0_db, double R) {
+	return esn0_db - 10.0 * std::log10(R * 4.0);
+}
+static inline double ebn0db_to_snr3k(double ebn0_db, double R) {
+	return ebn0_db + 10.0 * std::log10(4.0 * R) - 16.0;
+}
+static inline double rate_to_bps(double R) { return 298.0 * R; }
+
+// §10.6a — clean-flip symbol-correction capability at the DATA length (K=200),
+// cross-checked against K=13 (must reproduce the in-tree §8.2 capability — proof
+// the K-generalized encoder/decoder is faithful to the K=13 codec).
+static void test_gf16_ra_data_scaling_capability() {
+	const char* name = "gf16_ra_data_scaling_capability";
+	printf("    [CAP-K] GF(16)-RA symbol-correction capability vs K (P(frame-correct) vs #wrong symbols):\n");
+	const int Ks[]       = {13, 200};
+	const int repfacts[] = {1, 2, 3};
+	for (int ki = 0; ki < 2; ki++) {
+		int K = Ks[ki];
+		for (int ri = 0; ri < 3; ri++) {
+			int N = gf16ra::configure_k(K, repfacts[ri]);
+			printf("      K=%3d repfact=%d N=%4d R=%.3f :", K, repfacts[ri], N, (double)K / N);
+			std::mt19937 rng(0xDA7A + ki * 97 + ri);
+			// flip counts scaled to the codeword (K=13: up to 8; K=200: up to ~12% of N)
+			int flipset[6]; int nfs;
+			if (K == 13) { int f[] = {2,4,6,8,10,12}; for (int i=0;i<6;i++) flipset[i]=f[i]; nfs=6; }
+			else { int f[] = {10,20,40,60,80,100}; for (int i=0;i<6;i++) flipset[i]=f[i]; nfs=6; }
+			std::vector<int> info(K), tx(N), rx(K);
+			for (int fi = 0; fi < nfs; fi++) {
+				int nflip = flipset[fi]; if (nflip > N) nflip = N;
+				int ok = 0; const int T = (K == 13) ? 200 : 60;
+				for (int t = 0; t < T; t++) {
+					for (int s = 0; s < K; s++) info[s] = (int)(rng() & 0xF);
+					gf16ra::encode_k(info.data(), tx.data());
+					std::vector<double> e((size_t)N * 16, 0.1);
+					for (int s = 0; s < N; s++) e[(size_t)s*16 + tx[s]] = 1.0;
+					// flip nflip distinct codeword symbols to a wrong dominant tone
+					std::vector<int> idx(N); for (int i = 0; i < N; i++) idx[i] = i;
+					for (int i = 0; i < nflip; i++) { int j = i + (int)(rng() % (N - i)); std::swap(idx[i], idx[j]); }
+					for (int i = 0; i < nflip; i++) { int s = idx[i]; int wrong = (tx[s] + 1 + (int)(rng() % 15)) & 0xF;
+						e[(size_t)s*16 + tx[s]] = 0.1; e[(size_t)s*16 + wrong] = 1.0; }
+					gf16ra::soft_decode_k(e.data(), 50, GF16RA_ESNO_METRIC, rx.data());
+					bool allok = true; for (int s = 0; s < K; s++) if (rx[s] != info[s]) { allok = false; break; }
+					if (allok) ok++;
+				}
+				printf(" %d:%.2f", nflip, (double)ok / ((K == 13) ? 200 : 60));
+			}
+			printf("\n");
+		}
+	}
+	gf16ra::configure(2);  // restore the K=13 ctrl-path default
+	test_pass(name);
+}
+
+// §10.6b — THE MEASUREMENT: AWGN per-tone-energy cliff of the K=200 GF(16)-RA at
+// repfacts 1/2/3 (R=0.50/0.33/0.25). Reports, per rate: the Es/N0 cliff
+// (P(frame)=0.5), the converted Eb/N0 and SNR3k (binary-anchored), and net bps.
+// Compares to binary ROBUST_3 (-7.1 SNR3k / +5.89 Eb/N0 / 149 bps) and VARA L4
+// (-10 / +2.34). The K=13 R=1/4 cliff is also measured as a harness cross-check
+// vs the in-tree §8.4 FEC-reach number (-14.03 SNR3k).
+static void gf16ra_data_cliff_one(int K, int repfact) {
+	int N = gf16ra::configure_k(K, repfact);
+	double R = (double)K / N;
+	// Es/N0 sweep (dB). Frame-decode P over T trials at each point.
+	const double esn0_db[] = {-2,-1,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,16};
+	const int NE = (int)(sizeof(esn0_db)/sizeof(esn0_db[0]));
+	const int T = (K == 13) ? 120 : 40;
+	std::mt19937 rng(0x5CA1AB1E + K * 31 + repfact);
+	std::vector<int> info(K), tx(N), rx(K);
+	std::vector<double> E;
+	double cliff_esn0 = 999;
+	long bit_err_tot = 0, bit_tot = 0;  // raw symbol-error stats at/near cliff
+	printf("      [data-cliff K=%d r=%d N=%d R=%.3f bps=%.0f]  (Es/N0_dB : Eb/N0_dB : SNR3k_dB : P_frame)\n",
+		K, repfact, N, R, rate_to_bps(R));
+	for (int ei = 0; ei < NE; ei++) {
+		double esn0 = std::pow(10.0, esn0_db[ei] / 10.0);
+		int ok = 0; long se = 0;
+		for (int t = 0; t < T; t++) {
+			for (int s = 0; s < K; s++) info[s] = (int)(rng() & 0xF);
+			gf16ra::encode_k(info.data(), tx.data());
+			gf16ra_synth_energies(tx.data(), N, esn0, rng, E);
+			gf16ra::soft_decode_k(E.data(), 100, GF16RA_ESNO_METRIC, rx.data());
+			bool allok = true;
+			for (int s = 0; s < K; s++) if (rx[s] != info[s]) { allok = false; se++; }
+			if (allok) ok++;
+		}
+		double pf = (double)ok / T;
+		double ebn0 = esn0db_to_ebn0db(esn0_db[ei], R);
+		double snr3k = ebn0db_to_snr3k(ebn0, R);
+		printf("        %6.2f : %6.2f : %6.2f : %.3f\n", esn0_db[ei], ebn0, snr3k, pf);
+		if (pf >= 0.5 && esn0_db[ei] < cliff_esn0) cliff_esn0 = esn0_db[ei];
+		if (esn0_db[ei] >= 4 && esn0_db[ei] <= 9) { bit_err_tot += se; bit_tot += (long)T * K; }
+	}
+	if (cliff_esn0 < 900) {
+		double ebn0 = esn0db_to_ebn0db(cliff_esn0, R);
+		double snr3k = ebn0db_to_snr3k(ebn0, R);
+		printf("      [data-cliff K=%d r=%d] CLIFF Es/N0=%.2f dB | Eb/N0=%.2f dB | SNR3k=%.2f dB | bps=%.0f\n",
+			K, repfact, cliff_esn0, ebn0, snr3k, rate_to_bps(R));
+		printf("      [data-cliff K=%d r=%d] vs binary ROBUST_3(SNR3k -7.1 / Eb/N0 +5.89 / 149bps): SNR3k %+.2f dB, Eb/N0 %+.2f dB | vs VARA(-10/+2.34): SNR3k %+.2f dB\n",
+			K, repfact, snr3k - (-7.1), ebn0 - 5.89, snr3k - (-10.0));
+	} else {
+		printf("      [data-cliff K=%d r=%d] NO CLIFF in swept range (P_frame<0.5 everywhere)\n", K, repfact);
+	}
+}
+
+// IN-HARNESS BINARY-LDPC BASELINE (apples-to-apples). Drives the REAL ROBUST_3
+// rate-8/16 LDPC (loaded via config 103) and the REAL production MFSK bit-LLR
+// formula (log-sum-exp, mfsk.cc:1088-1139) on the SAME synthesized per-tone
+// energy model gf16ra_synth_energies uses — so the binary-vs-GF16RA comparison
+// is free of any cross-model axis offset (the K=13 cross-check showed this
+// idealized model is ~2 dB more optimistic than the §8.4 passband synthesis,
+// but BOTH codes are measured in it here). N=1600 coded bits sent un-punctured
+// = 400 GF(16) tones; Es/N0 axis identical to gf16ra_data_cliff_one (R=0.5).
+//   Gray TX: production demod extracts gray(m)=m^(m>>1) from tone m, so to send
+//   a 4-bit value v we place energy on tone m with gray(m)=v (m=inverse_gray(v)).
+static inline int inverse_gray4(int g) { int m = 0; for (int b = 0; b < 4; b++) m ^= (g >> b); return m & 0xF; }
+
+static void binary_ldpc_data_cliff(cl_telecom_system& ts) {
+	const double R = 0.5;       // ROBUST_3 rate 8/16
+	const int K = ts.ldpc.K, Ncw = ts.ldpc.N;   // 800, 1600
+	if (K <= 0 || Ncw <= 0) { printf("      [binary-LDPC] ldpc not initialized (K=%d N=%d), skip\n", K, Ncw); return; }
+	const int Ntone = Ncw / 4;  // GF(16)/M=16 tones carrying the coded bits (400)
+	printf("      [binary-LDPC ROBUST_3 K=%d N=%d R=0.50 bps=149]  (Es/N0_dB : Eb/N0_dB : SNR3k_dB : P_frame)\n", K, Ncw);
+	const double esn0_db[] = {-2,-1,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,16};
+	const int NE = (int)(sizeof(esn0_db)/sizeof(esn0_db[0]));
+	const int T = 40;
+	std::mt19937 rng(0xB1A2C3D4);
+	std::vector<int> info(K), enc(Ncw), dec(K), tones(Ntone);
+	std::vector<double> E; std::vector<float> llr(Ncw);
+	double cliff_esn0 = 999;
+	for (int ei = 0; ei < NE; ei++) {
+		double esn0 = std::pow(10.0, esn0_db[ei] / 10.0);
+		double A = std::sqrt(esn0);
+		double llr_scale = 1.0;   // N0=1 in this model => noise_var of a complex bin = 1
+		int ok = 0;
+		for (int t = 0; t < T; t++) {
+			for (int i = 0; i < K; i++) info[i] = (int)(rng() & 1);
+			ts.ldpc.encode(info.data(), enc.data());
+			// pack 4 coded bits -> Gray-encoded tone
+			for (int s = 0; s < Ntone; s++) {
+				int v = 0; for (int b = 0; b < 4; b++) v = (v << 1) | (enc[s*4 + b] & 1);
+				tones[s] = inverse_gray4(v);
+			}
+			gf16ra_synth_energies(tones.data(), Ntone, esn0, rng, E);
+			(void)A;
+			// production log-sum-exp bit-LLR per tone (4 bits, Gray), llr_scale=1/noise_var
+			for (int s = 0; s < Ntone; s++) {
+				const double* e = &E[(size_t)s * 16];
+				for (int k = 0; k < 4; k++) {
+					int mask = 1 << (4 - 1 - k);
+					double mE1 = -1e30, mE0 = -1e30;
+					for (int m = 0; m < 16; m++) { int gm = m ^ (m >> 1);
+						if (gm & mask) { if (e[m] > mE1) mE1 = e[m]; } else { if (e[m] > mE0) mE0 = e[m]; } }
+					double s0 = 0.0, s1 = 0.0;
+					for (int m = 0; m < 16; m++) { int gm = m ^ (m >> 1);
+						if (gm & mask) s1 += std::exp((e[m]-mE1)*llr_scale); else s0 += std::exp((e[m]-mE0)*llr_scale); }
+					double L = (mE0 - mE1) * llr_scale + std::log(s0) - std::log(s1);
+					if (!std::isfinite(L)) L = 0.0;
+					llr[s*4 + k] = (float)L;
+				}
+			}
+			ts.ldpc.decode(llr.data(), dec.data());
+			bool allok = true; for (int i = 0; i < K; i++) if (dec[i] != info[i]) { allok = false; break; }
+			if (allok) ok++;
+		}
+		double pf = (double)ok / T;
+		double ebn0 = esn0db_to_ebn0db(esn0_db[ei], R);
+		double snr3k = ebn0db_to_snr3k(ebn0, R);
+		printf("        %6.2f : %6.2f : %6.2f : %.3f\n", esn0_db[ei], ebn0, snr3k, pf);
+		if (pf >= 0.5 && esn0_db[ei] < cliff_esn0) cliff_esn0 = esn0_db[ei];
+	}
+	if (cliff_esn0 < 900) {
+		double ebn0 = esn0db_to_ebn0db(cliff_esn0, R);
+		double snr3k = ebn0db_to_snr3k(ebn0, R);
+		printf("      [binary-LDPC] CLIFF Es/N0=%.2f dB | Eb/N0=%.2f dB | SNR3k=%.2f dB | bps=149  (THIS is the in-harness anchor for GF16-RA R=0.5)\n",
+			cliff_esn0, ebn0, snr3k);
+	} else {
+		printf("      [binary-LDPC] NO CLIFF in swept range\n");
+	}
+}
+
+static void test_gf16_ra_data_scaling_cliff() {
+	const char* name = "gf16_ra_data_scaling_cliff";
+	printf("  [MEASURE] ROBUST_3 GF(16)-RA DATA-FRAME cliff (K-generalized, AWGN per-tone energies):\n");
+	printf("    Cross-check: K=13 R=1/4 should reproduce in-tree §8.4 FEC-reach (-14.03 SNR3k).\n");
+	gf16ra_data_cliff_one(13, 3);
+	printf("    --- K=200 (= 800 info bits = ROBUST_3 payload), repfact 1/2/3 (R=0.50/0.33/0.25) ---\n");
+	gf16ra_data_cliff_one(200, 1);
+	gf16ra_data_cliff_one(200, 2);
+	gf16ra_data_cliff_one(200, 3);
+	// In-harness binary-LDPC baseline at the EXACT ROBUST_3 rate-8/16 code +
+	// production bit-LLR demap, SAME energy model -> the apples-to-apples anchor
+	// for GF16-RA R=0.5 (eliminates the cross-model axis offset).
+	printf("    --- BINARY LDPC baseline (real ROBUST_3 rate-8/16 + production demap, SAME energy model) ---\n");
+	{
+		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_3);
+		binary_ldpc_data_cliff(ts);
+	}
+	gf16ra::configure(2);  // restore the K=13 ctrl-path default
+	test_pass(name);  // infra ran; the dB verdict is in the log
+}
+
 // §19 (INCREMENT 1) — THE GATE FOR THIS INCREMENT: the PRODUCTION CONNECT decode
 // path, with the GF(16) RA FEC wired in (suffix_fec_mode=3 via set_suffix_fec),
 // reaches ~−14 dB SNR3k — i.e. it now tracks the §12 FEC-reach (−14.03), NOT the
@@ -5001,6 +5244,10 @@ int run_mfsk_ctrl_codec_tests() {
 	test_gf16_ra_passband_roundtrip_clean();
 	test_gf16_ra_pure_noise_far();
 	test_gf16_ra_cliff_sweep();      // [MEASURE] prints the GF(16) cliff + gain dB
+	// §10.6 ROBUST_3 data-frame scaling (robust3-gf16ra): does GF(16)-RA scale to
+	// K=200 (800 info bits) near-capacity, or is it inherently short-message?
+	test_gf16_ra_data_scaling_capability();  // [CAP-K] multi-symbol correction vs K
+	test_gf16_ra_data_scaling_cliff();       // [MEASURE] K=200 cliff + Eb/N0 + bps
 	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
 	test_gf16_ra_production_path_cliff_sweep();
 
