@@ -138,9 +138,20 @@ inline int config_ladder_index(int config) {
 	return -1;
 }
 
+// ROBUST-CONFIG-AWARE ladder navigation (gearshift-climb-engine.md §19): the
+// OFDM-only fast-path is taken ONLY when the session is not robust-enabled AND
+// the config argument is not itself a robust-tier config. A robust LIVE config
+// (current_configuration in [ROBUST_0..ROBUST_2]) implies the full ladder
+// regardless of the intent flag `robust_enabled` (which the GUI per-loop sync at
+// main.cc:2430 can clobber to NO, and an explicit `-s 100` without `-R` leaves
+// NO). Without this, config_ladder_up(ROBUST_0, robust_enabled=NO) returns
+// ROBUST_0 UNCHANGED (100 >= WB ceiling 16) → FRAME-UP logs "config 100 -> 100"
+// → the link never climbs off ROBUST_0 at any SNR. When robust_enabled==YES the
+// added clause is a no-op (the full-ladder branch already ran), so the proven
+// climb/anti-thrash paths are byte-identical. See §19.
 inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = false) {
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
-	if (!robust_enabled) {
+	if (!robust_enabled && !is_robust_config(config)) {
 		return (config < ceiling) ? config + 1 : config;
 	}
 	int idx = config_ladder_index(config);
@@ -154,7 +165,7 @@ inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = f
 
 inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool narrowband = false) {
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
-	if (!robust_enabled) {
+	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		int target = config + steps;
 		return (target < ceiling) ? target : ceiling;
 	}
@@ -169,7 +180,7 @@ inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool n
 }
 
 inline int config_ladder_down(int config, bool robust_enabled) {
-	if (!robust_enabled) {
+	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		return (config > CONFIG_0) ? config - 1 : config;
 	}
 	int idx = config_ladder_index(config);
@@ -178,7 +189,7 @@ inline int config_ladder_down(int config, bool robust_enabled) {
 }
 
 inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
-	if (!robust_enabled) {
+	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		int target = config - steps;
 		return (target > CONFIG_0) ? target : CONFIG_0;
 	}
@@ -193,12 +204,14 @@ inline bool config_is_at_top(int config, bool robust_enabled, bool narrowband = 
 		int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 		return config >= ceiling;
 	}
-	if (!robust_enabled) return config == WB_CONFIG_MAX;
+	// §19: a robust LIVE config is never "at the OFDM ceiling"; rank it on the
+	// full ladder regardless of robust_enabled (which the GUI loop can clear).
+	if (!robust_enabled && !is_robust_config(config)) return config == WB_CONFIG_MAX;
 	return config_ladder_index(config) == FULL_CONFIG_LADDER_SIZE - 1;
 }
 
 inline bool config_is_at_bottom(int config, bool robust_enabled) {
-	if (!robust_enabled) return config == CONFIG_0;
+	if (!robust_enabled && !is_robust_config(config)) return config == CONFIG_0;   // §19
 	return config_ladder_index(config) == 0;
 }
 

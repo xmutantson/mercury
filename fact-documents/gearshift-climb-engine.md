@@ -2339,6 +2339,170 @@ arm/clear at member granularity through the REAL helper + method.
 
 ---
 
+## §19 ROBUST-TIER LADDER vs `robust_enabled` MISMATCH — the "stuck at ROBUST_0, config 100→100" bug
+
+**Date:** 2026-06-01. **Branch:** `fix/climb-from-robust0` off monitor `d5660bf`.
+**Symptom (HW-confirmed this session, agent a679ddf7, on the deadlock-fix binary
+`fix/robust0-compress-deadlock@901186e` delivering clean batches):** at clean
+WGN:0 the clean-streak `clean_batches_at_current_config` accumulated 1→15
+(`promotion_allowed_on_batch` satisfied every batch) but EVERY gearshift decision
+logged `config 100 → 100` — the link NEVER climbed off ROBUST_0 at ANY SNR.
+
+### §19.1 ROOT CAUSE (pinned; deterministic, reproduced in-process — Part P)
+
+The FRAME-UP block computes its target as
+`proposed_frame = config_ladder_up(current_configuration, robust_enabled, narrowband_enabled==YES)`
+(`arq_commander.cc:3687`). `config_ladder_up` (common_defines.h:141) branches on
+`robust_enabled`:
+
+```c
+if (!robust_enabled) { return (config < ceiling) ? config + 1 : config; }   // OFDM-only ladder
+... else use FULL_CONFIG_LADDER (robust rungs + OFDM) ...
+```
+
+When the live config is in the ROBUST tier (`current_configuration == ROBUST_0 == 100`)
+but `robust_enabled == NO`, the `!robust_enabled` branch runs: `config(100) < ceiling(16)`
+is FALSE → returns **100 UNCHANGED**. FRAME-UP fires (all its gates pass — see §1), sets
+`negotiated_configuration = proposed_frame = 100`, and logs `config 100 → 100`. No SET_CONFIG
+to a higher rung is ever issued → the link is pinned at ROBUST_0 regardless of channel
+quality or how many clean batches accumulate. (`config_ladder_down(100, NO)` is WORSE: the
+OFDM branch returns `100-1 = 99` — a config that is not on any ladder; latent corruption
+on the BREAK path.) **Empirically reproduced** (`/tmp/ladder_check`, and the integrated
+Part P fail-before): `config_ladder_up(ROBUST_0, robust=NO) = 100`; `config_ladder_down(ROBUST_0, robust=NO) = 99`.
+
+This is NOT in the gate arithmetic (every promotion gate in §1/§9/§11/§12 is correct);
+it is a **producer/consumer contract violation**: the entire gearshift/BREAK/anchor
+machinery assumes the invariant **"if `current_configuration` is a robust-tier config,
+then `robust_enabled == YES`."** Two production producers break it:
+
+1. **GUI build — `main.cc:2430`** (the deployed product). The per-loop GUI→ARQ sync runs
+   `ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;` EVERY iteration.
+   `g_gui_state.robust_mode_enabled` mirrors the "Enable Robust Mode (MFSK)" checkbox, whose
+   default is **false** (`ini_parser.cc:227 robust_mode_enabled = false`; the checkbox at
+   `setup_dialog.cc:429`). Meanwhile the start config defaults to ROBUST_0
+   (`ini_parser.cc:216 initial_config = ROBUST_0`, the c2725fa start-config fix). Startup
+   DOES set `robust_mode=1` for a robust initial_config (`main.cc:2227-2228`), so
+   `robust_enabled` is YES at connect — but the GUI loop at 2430 IMMEDIATELY clobbers it back
+   to NO because the checkbox is unchecked. ⇒ a default-config GUI session connects at ROBUST_0
+   with `robust_enabled` flapping to NO ⇒ stuck.
+2. **Bench / explicit pin — `sack_lossy_ab.run_one` / `client_rate_meas.py`** pass
+   `-s 100 -g` (explicit ROBUST_0) WITHOUT `-R`. `-s` sets `explicit_config=true`, which
+   SKIPS the headless auto-enable block (`main.cc:2238` is gated on `!explicit_config`), so
+   `robust_mode` stays 0 → `robust_enabled = NO` (`main.cc:2289`) while
+   `current_configuration = ROBUST_0`. The harness authors documented this exact gotcha
+   (`sack_lossy_ab.py:83-86`: "an explicit -s does NOT auto-enable robust … so [pinned ULTRA
+   configs] REQUIRE … MERCURY_EXTRA_FLAGS=-R"). This is how agent a679ddf7 saw it.
+
+**Why the cascade bench (gearshift_cascade_bench.py) CLIMBED (memory's 92 s WGN:30 result)
+while client_rate_meas did NOT:** the cascade bench launches `-g` WITHOUT `-s`
+(`gearshift_cascade_bench.py:53-55, 533`: "gearshift-on + no-explicit-config => ROBUST_0
+start with robust_mode=1"), so it hits the headless auto-enable → `robust_enabled = YES` →
+the ladder works. The two harnesses differ ONLY in `-s`/`-R` → `robust_enabled`. This
+reconciles the "climb is fixed/shipped" memory with the "still stuck" HW report.
+
+**SCOPE answer (for the parent):** NOT all unpinned production is stuck — it depends on the
+launch path. The HEADLESS CLI path `mercury -m ARQ -g` (no `-s`) correctly auto-enables
+robust → climbs (this is what the cascade bench proved on HW). BROKEN paths: (a) the GUI
+build with the RobustMode checkbox unchecked + a robust initial_config (the deployed product
+default — a real production bug), and (b) any launch that pins a robust config with `-s` but
+omits `-R` (benches; and any user doing `-g -s 100`).
+
+### §19.2 The fix — make the ladder primitives ROBUST-CONFIG-AWARE (consumer fix, the root)
+
+`robust_enabled` is an INTENT flag (derived from `-R`/checkbox = "use MFSK hailing / let
+BREAK descend into the robust tier"). But the config ladder is a FIXED structure whose
+robust rungs are reachable iff the session is in/uses the robust tier. The single source of
+truth for "is this a robust config" is `is_robust_config(config)`, not the intent flag. So
+the ladder navigators MUST treat a robust-tier *config argument* as implying the robust
+ladder, regardless of the flag. Fix (common_defines.h): in `config_ladder_up`,
+`config_ladder_up_n`, `config_ladder_down`, `config_ladder_down_n`, `config_is_at_top`,
+`config_is_at_bottom`, gate the OFDM-only fast-path on `(!robust_enabled && !is_robust_config(config))`
+instead of `!robust_enabled`. i.e. use the OFDM-only ladder ONLY when the session is not
+robust-enabled AND the config in hand is not itself a robust config.
+
+This is the minimal root fix: it corrects ALL ~25 `config_ladder_*` call sites at the
+primitive, so no producer (current or future) can re-introduce the mismatch, and there is
+no second flag to keep in sync. It is NOT architectural — six one-line predicate widenings
+in one header.
+
+### §19.3 §5 cross-layer audit — producers / consumers of `robust_enabled` × `current_configuration`
+
+**Producers of `robust_enabled`** (runtime, non-test): `arq_common.cc:289` (ctor → NO);
+`main.cc:2248/2289` (startup, from `-R`|INI|auto-enable); `main.cc:2430` (GUI per-loop sync
+from the checkbox). All other assignments (`arq_commander.cc:5919/5984/6127/6219/6414/6730/6958/7076/7181/7342/7544/7739/8229`)
+are INSIDE `test_*` functions (verified: 6401-8331 is `test_climb_engine`; 5910/5969/6086/6203 are other test fns).
+
+**Consumers of `robust_enabled`** — ALL pass it to a `config_ladder_*` navigator or
+`session_floor_anchor`/`anchor_demote_target`, EXCEPT the BREAK-floor ternaries
+`robust_enabled ? ROBUST_0 : CONFIG_0` (`arq_commander.cc:231,323`; `arq_responder.cc:476`).
+- config_ladder_up: `arq_commander.cc:3687, 4992, 5147, 6577(test); arq_responder.cc` (none direct)
+- config_ladder_up_n: `arq_commander.cc:4625, 4632, 8265; arq_responder.cc:1319`
+- config_ladder_down: `arq_commander.cc:1437, 2057, 2264, 2332, 2365, 2420, 3243, 3422, 3549, 5067, 5228; arq_common.cc:2316`
+- config_ladder_down_n: `arq_commander.cc:209, 300, 307`
+- config_is_at_top: `arq_commander.cc:3712, 4587, 5003, 5160`
+- config_is_at_bottom: `arq_commander.cc:2417, 3473, 5065, 5226`
+- session_floor_anchor: `arq_common.cc:357, 951, 3071` (already correct — robust_enabled gives ROBUST_0 floor)
+
+**What the fix changes (invariant-by-consumer walk):**
+The fix changes the value the navigators return ONLY in the case `(robust_enabled==NO AND
+is_robust_config(config)==true)` — i.e. exactly the bug state. In every OTHER state the
+return is byte-identical:
+- `robust_enabled==YES` (the working `-R`/cascade path): the navigators already took the
+  full-ladder branch; adding `|| is_robust_config(config)` to the full-ladder condition does
+  NOT change it. ⇒ ZERO behavior change for the proven-good climb path (the §10-§18 fixes,
+  the WGN:-10 anti-thrash, the over-climb guards) — all those run with `robust_enabled==YES`.
+- `robust_enabled==NO AND config is OFDM` (a true non-robust/pinned-OFDM session): the
+  config is not robust → the OFDM-only branch still runs → identical. ⇒ Part P4/P4b assert
+  this; the "non-robust session floors at CONFIG_0, never descends into robust" guarantee is
+  PRESERVED (config_ladder_down(CONFIG_0, NO) still returns CONFIG_0).
+- `robust_enabled==NO AND config is robust` (THE BUG): now uses the full ladder →
+  config_ladder_up(ROBUST_0)→ROBUST_1 (climb works), config_ladder_down(ROBUST_0)→ROBUST_0
+  (floors correctly, was 99 garbage).
+
+**The BREAK-floor ternaries `robust_enabled ? ROBUST_0 : CONFIG_0` are NOT config_ladder_*
+calls** → UNTOUCHED by this fix. Their meaning ("a non-robust session must NOT pick ROBUST_0
+as a BREAK floor") is a deliberate guard and is preserved. NOTE: in the buggy state (robust
+live config + robust_enabled=NO) these ternaries would still pick CONFIG_0 as the BREAK
+floor — but with the live config already at ROBUST_0, a BREAK recovery toward CONFIG_0 is an
+*upward* move that `break_target_with_anchor` (anchor=ROBUST_0) and the FRAME-UP +1 clamp
+both bound; and once the climb works (this fix) the session leaves ROBUST_0 normally. The
+ternaries are not on the climb-from-floor critical path and are left to the producer side
+(the GUI/bench correctly setting robust_enabled is still the cleaner long-term state, but the
+consumer fix makes the gearshift CORRECT regardless — defense in depth).
+
+**Invariant maintained / no consumer violated:** every consumer reads the navigators'
+output and either issues a SET_CONFIG to that rung or uses it as a ceiling/floor. After the
+fix the output is correct for the robust tier (was wrong); for OFDM it is unchanged. No
+consumer assumed the pre-fix garbage (`100→100`, `100→99`) — those were bugs, never relied on.
+
+### §19.4 Part P (`--test-climb-engine`) — fail-before / pass-after
+
+`arq_commander.cc` test_climb_engine() Part P drives the REAL `config_ladder_up` /
+`config_ladder_down` / `config_is_at_top` (the SAME calls FRAME-UP at :3687/:3712 and the
+BREAK floor make) under `current_configuration=ROBUST_0, robust_enabled=NO`:
+- P1  fail-before `config_ladder_up(ROBUST_0,NO)=100` → after `=ROBUST_1` (the climb unblock).
+- P1b/P1c robust→robust and robust→OFDM tier crossing.
+- P2  `config_is_at_top(ROBUST_0,NO)=false` (FRAME-UP gate open) — passed before & after.
+- P3  fail-before `config_ladder_down(ROBUST_0,NO)=99` garbage → after `=ROBUST_0` (floor).
+- P4/P4b REGRESSION GUARD: OFDM CONFIG_4→5 and the CONFIG_0 floor UNCHANGED with robust_enabled=NO
+  (proves the fix is robust-config-scoped and does not perturb non-robust sessions).
+Verified FAIL-BEFORE: 4 failures (P1, P1b, P1c, P3). Pass-after: 0 failures.
+
+### §19.5 HONEST scope (§8 applies)
+
+Part P + `/tmp/ladder_check` prove the PRIMITIVE is fixed (the necessary-and-sufficient
+cause of "config 100→100"). The full wire confirmation — a GUI/`-s 100`-style session now
+climbs off ROBUST_0 at clean SNR, AND WGN:-10 still holds ROBUST_0 (the §10/§17 anti-thrash
+guards, which run with robust_enabled=YES, are by construction untouched) — is the parent's
+HARDWARE re-test. The in-process drive does not run the full `process_messages_rx_acks_data()`
+tick sequence (the §15.5/§17.5 limitation); it drives the EXACT ladder primitives the
+FRAME-UP/BREAK paths consume. A VB-Cable two-process loopback was attempted (tools/
+climb_robust0_loopback.py) but is unusable on this box — a single shared cable starves the
+RSP→CMD return path (connection never reaches data flow), confirming the memory's VB-Cable
+RX-stall note; it is NOT a gate test.
+
+---
+
 ## §9 Related fact documents
 
 - `data-flow-messages_rx_prev.md` — the prev-storage state Bug 1 touches (RSP
