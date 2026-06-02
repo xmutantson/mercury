@@ -6886,7 +6886,14 @@ void cl_arq_controller::copy_data_to_buffer()
 	int copied = 0;
 	int total_bytes = 0;
 
-	if(compression_enabled)
+	// ROBUST_0 compression-deadlock fix (data-flow-compress-frame-fill.md §5/§6).
+	// MUST mirror the TX gate in process_buffer_data_commander(): both sides use
+	// compression_viable_for_batch() so a robust batch (where batch_capacity ==
+	// the streaming header) is a plain headerless DATA frame on both ends. If
+	// only one side flipped, the RX would mis-parse a headerless frame as a
+	// compression header. Both peers compute this identically from the shared
+	// config + the batch=1 robust invariant (data-flow-batch-size.md §1).
+	if(compression_viable_for_batch())
 	{
 		// --- Batch-level decompression ---
 		// Reassemble ACKED frames from current batch into one contiguous buffer,

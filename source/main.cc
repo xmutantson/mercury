@@ -346,6 +346,12 @@ int main(int argc, char *argv[])
                                         // panic counter, and BREAK still reaches ROBUST_0. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §8.
     bool test_clean_batch_viability_cli = false; // --test-clean-batch-viability: CLEAN-BATCH VIABILITY regression (§9).
+    bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
+                                        // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
+                                        // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
+                                        // a real compressible payload; asserts >0 application bytes are staged. FAILS on
+                                        // fef293f (every batch stages 0 payload → 0 throughput). See
+                                        // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -825,6 +831,15 @@ int main(int argc, char *argv[])
             // Integrated 3-bug climb regression — one-shot at startup, then exit
             // with the test's rc. See fact-documents/gearshift-climb-engine.md §7.
             test_climb_engine_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-robust0-compress-deadlock") == 0)
+        {
+            // ROBUST_0 + streaming-compression deadlock regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-compress-frame-fill.md §5.
+            test_robust0_compress_deadlock_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1854,6 +1869,21 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_climb_engine();
             printf("[FLAG] Climb-engine test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_robust0_compress_deadlock_cli) {
+            // ROBUST_0 + streaming-compression deadlock regression (one-shot,
+            // then exit rc). Drives the REAL process_buffer_data_commander()
+            // data-fill at ROBUST_0 frame dimensions with streaming compression
+            // enabled + a real compressible payload; asserts the staged batch
+            // carries >0 application bytes. See
+            // fact-documents/data-flow-compress-frame-fill.md §5.
+            printf("[FLAG] --test-robust0-compress-deadlock: invoking ROBUST_0 "
+                   "compression-deadlock regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_robust0_compress_deadlock();
+            printf("[FLAG] Robust0-compress-deadlock test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

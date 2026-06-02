@@ -1077,6 +1077,15 @@ public:
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
 
+  // ROBUST_0 + streaming-compression deadlock regression
+  // (data-flow-compress-frame-fill.md). Drives the REAL
+  // process_buffer_data_commander() data-fill path at ROBUST_0 frame
+  // dimensions (max_frame == 7 == COMPRESS_HEADER_SIZE) with streaming
+  // compression enabled and a real compressible payload staged. Asserts the
+  // batch carries > 0 application bytes (FAIL-BEFORE on fef293f: every batch
+  // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
+  int test_robust0_compress_deadlock();
+
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
   // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:
@@ -1790,6 +1799,28 @@ public:
   cl_b2f_handler b2f_handler;         // B2F protocol handler (Winlink LZHUF unroll/reroll)
   float compress_ratio_estimate;      // Running compression ratio (raw/compressed), init 2.0
   int batch_uncompressed_size;        // Uncompressed bytes in current TX batch (for throughput)
+
+  // ROBUST_0 compression-deadlock fix (data-flow-compress-frame-fill.md §5).
+  // Compression can only carry a payload byte if the per-batch budget
+  // (data_batch_size * max_frame, minus the crypto tag when active) EXCEEDS the
+  // streaming compression header. At ROBUST_0 the budget equals the header
+  // (1 * 7 == COMPRESS_HEADER_SIZE), leaving 0 payload room → compress_block()
+  // returns -1 forever and the RAW fallback degenerates to a 0-byte payload
+  // (the deadlock). This predicate gates BOTH the TX fill (process_buffer_data_
+  // commander) and the RX assembly (copy_data_to_buffer) so the two stay a
+  // matched pair: when false (robust / tiny-frame), both sides use the
+  // headerless uncompressed path and deliver raw bytes; when true (OFDM rungs),
+  // both compress. Computed identically on both peers from the shared config +
+  // batch invariant (data-flow-batch-size.md §1) — no wire negotiation needed.
+  bool compression_viable_for_batch() const
+  {
+    if(!compression_enabled) return false;
+    int eff_long = effective_data_long_header_length(sack_v2_enabled);
+    int max_frame = max_data_length + max_header_length - eff_long;
+    int batch_capacity = data_batch_size * max_frame;
+    if(cipher_suite.is_active()) batch_capacity -= AUTH_TAG_SIZE;
+    return batch_capacity > compressor.get_header_size();
+  }
 
   // Encryption (hybrid PQ: X25519 + ML-KEM-768 + ChaCha20-Poly1305)
   cl_cipher_suite cipher_suite;       // Per-connection cipher state (ephemeral keys, session key)
