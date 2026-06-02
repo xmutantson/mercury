@@ -65,4 +65,14 @@ const uint8_t* ldpc_get_dense_G_1_16();
 bool verify_ldpc_generator_1_16(int* out_failed_row = nullptr,
                                 int* out_failed_check = nullptr);
 
+// [robust3-feas] Generic dense-G builder for ANY rate Mercury has an LDPC
+// matrix family for. Spins up a throwaway cl_ldpc at the given (rate, N) so
+// cl_ldpc::init() selects the right QCmatrix tables, then encodes K one-hot
+// vectors into G[K*N] exactly like the rate-1/16 builder. Result cached per
+// distinct K (rate-8/16 ROBUST_3 has K=800, N=1600). Returns NULL if init
+// produced unexpected (K,N). Thread-safe (mutex-guarded cache). This is the
+// portability bridge that lets BP_OSD run on ROBUST_3's rate-8/16 code, which
+// the original a26 branch could not (it hardwired rate 1/16).
+const uint8_t* ldpc_get_dense_G_generic(int K, int N, float rate);
+
 #endif // LDPC_GENERATOR_1_16_H_

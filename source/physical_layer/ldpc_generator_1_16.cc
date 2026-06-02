@@ -25,7 +25,9 @@
 #include "physical_layer/mercury_normal_1_16.h"
 #include "physical_layer/physical_defines.h"
 
+#include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -134,4 +136,57 @@ bool verify_ldpc_generator_1_16(int* out_failed_row, int* out_failed_check)
         }
     }
     return true;
+}
+
+// ===========================================================================
+// [robust3-feas] Generic dense-G builder (any rate Mercury has a matrix for)
+// ===========================================================================
+namespace {
+std::mutex                              g_generic_mtx;
+std::map<int, std::vector<uint8_t>>     g_generic_G;   // keyed by K
+} // anonymous namespace
+
+const uint8_t* ldpc_get_dense_G_generic(int K, int N, float rate)
+{
+    std::lock_guard<std::mutex> lock(g_generic_mtx);
+
+    auto it = g_generic_G.find(K);
+    if (it != g_generic_G.end())
+        return it->second.data();
+
+    // Spin up a throwaway cl_ldpc at this rate so init() selects the right
+    // QCmatrix family (the K==... ladder in cl_ldpc::init / update_code_parameters).
+    cl_ldpc ldpc;
+    ldpc.standard = MERCURY;
+    ldpc.framesize = MERCURY_NORMAL;            // N = 1600 for all Mercury normal codes
+    ldpc.rate = rate;                           // -> K via update_code_parameters
+    ldpc.decoding_algorithm = SPA;              // we only encode
+    ldpc.nIteration_max = 1;
+    ldpc.GBF_eta = 0.0f;
+    ldpc.print_nIteration = NO;
+    ldpc.init();
+
+    if (ldpc.N != N || ldpc.K != K)
+    {
+        fprintf(stderr,
+                "[BP-OSD] ERROR ldpc_get_dense_G_generic: cl_ldpc init returned "
+                "N=%d K=%d for requested rate=%.4f (wanted N=%d K=%d). "
+                "dense_G not built.\n", ldpc.N, ldpc.K, (double)rate, N, K);
+        return nullptr;
+    }
+
+    std::vector<uint8_t> G((size_t)K * (size_t)N, 0);
+    std::vector<int> msg(K, 0);
+    std::vector<int> cw(N, 0);
+    for (int i = 0; i < K; i++)
+    {
+        std::memset(msg.data(), 0, sizeof(int) * (size_t)K);
+        msg[i] = 1;
+        ldpc.encode(msg.data(), cw.data());
+        for (int j = 0; j < N; j++)
+            G[(size_t)i * (size_t)N + j] = (uint8_t)(cw[j] & 0x01);
+    }
+
+    auto res = g_generic_G.emplace(K, std::move(G));
+    return res.first->second.data();
 }

@@ -92,14 +92,17 @@ void cl_ldpc::init()
 		}
 		else
 		{
-			// Defensive: BP_OSD selected on a code rate we haven't ported a
-			// dense generator for. Decode() will fail-soft (decode_BP_OSD with
-			// G=NULL would crash inside OSD's MRB encode). Keep dense_G_1_16
-			// NULL and log; the gate in telecom_system.cc:4690 should prevent
-			// this from happening in production.
-			std::cout << "[BP-OSD] WARN dense_G not built for K=" << K
-			          << " N=" << N << " (BP_OSD only supports rate 1/16 today);"
-			          << " decode() will return LDPC_BP_OSD_FAIL." << std::endl;
+			// [robust3-feas] BP_OSD on a non-1/16 rate (e.g. ROBUST_3 rate 8/16,
+			// K=800). The a26 branch only had a rate-1/16 dense generator; the
+			// generic builder constructs G[K*N] for any Mercury matrix family by
+			// encoding K one-hot vectors at the matching rate. dense_G_1_16 just
+			// holds "the dense G for this instance's rate" (name kept for the
+			// decode() call site). NULL if the rate has no matrix family.
+			dense_G_1_16 = ldpc_get_dense_G_generic(K, N, rate);
+			if (dense_G_1_16 == nullptr)
+				std::cout << "[BP-OSD] WARN dense_G not built for K=" << K
+				          << " N=" << N << " rate=" << rate
+				          << "; decode() will return LDPC_BP_OSD_FAIL." << std::endl;
 		}
 	}
 }
