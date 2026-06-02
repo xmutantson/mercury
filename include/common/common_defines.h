@@ -87,12 +87,13 @@ extern int g_verbose;
 #define CONFIG_16 16
 
 // ROBUST (MFSK) configurations - values 100+ to avoid collision with OFDM configs
-#define NUMBER_OF_ROBUST_CONFIGS 3
+#define NUMBER_OF_ROBUST_CONFIGS 4
 #define ROBUST_0 100  // 32-MFSK, LDPC rate 1/16, ~14 bps (hailing mode)
 #define ROBUST_1 101  // 16-MFSK x2, LDPC rate 1/16, ~22 bps
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
+#define ROBUST_3 103  // 16-MFSK x2, LDPC rate 8/16, ~149 bps (VARA -10 parity tier)
 
-inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
+inline bool is_robust_config(int config) { return config >= 100 && config <= 103; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor
