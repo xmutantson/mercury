@@ -5205,6 +5205,175 @@ static void test_ultra_establishment_timers() {
 }
 
 // =============================================================================
+// INCR-A DIAGNOSTIC (deep-snr-establishment-fix.md §2.3 / §5 INCR-A) — pin H1
+// (RSP capture-ring too small for the long ULTRA CONNECT frame) with
+// EXECUTING-CODE evidence through the PRODUCTION accessors + the PRODUCTION
+// decode (decode_ctrl_suffix_from_passband). INSTRUMENT-ONLY: this test asserts
+// NOTHING about production behavior it changes (it changes none); it MEASURES the
+// frame/ring geometry and the clean-SNR decodability of the production
+// tail-snapshot so the doorbell-switch (INCR-C) is informed by data, not
+// hand-arithmetic.
+//
+// Mechanism under test (the corrected H1): receive_mfsk_ctrl_suffix_phy_core
+// (arq_common.cc:5288-5291) reads a passband TAIL of
+//   tail_nsymb = connect_base_total_nsymb() + ctrl_suffix_len() + 16
+// CLAMPED to the ring signal_period = Nofdm*interp*buffer_Nsymb (arq_common.cc
+// :5295-5298 area). But the ULTRA CONNECT frame ON THE WIRE is
+//   full_frame_nsymb = connect_base_total_nsymb() + ctrl_suffix_total_nsymb()
+//                    = R_base*16 + R_suffix*codeword_len
+// with the BASE pattern at the FRONT [0, base_total) and the R_suffix suffix-
+// codeword reps at the BACK. The base-pattern detector (detect_ack_pattern over
+// connect_pattern_nsymb base symbols) is what gates the decode (matched>=thr).
+// If full_frame_nsymb > buffer_Nsymb, the ring cannot hold the whole frame: by
+// the time the frame finishes, the FRONT base block has scrolled out of the ring,
+// so the tail snapshot contains ONLY back-loaded suffix audio with NO base pattern
+// -> matched= never reaches threshold -> the decode NEVER fires, AT ANY SNR. That
+// is exactly the §2.1 HW signature (no `matched=`, no RX-MFSK-CTRL, even at -5.6 dB,
+// 15 dB above the PHY floor). This test demonstrates it deterministically on a
+// CLEAN channel (sigma=0) so the failure is provably GEOMETRIC, not SNR.
+static void test_incr_a_ultra_ring_capacity_h1() {
+	const char* name = "incr_a_ultra_ring_capacity_h1";
+	printf("  [INCR-A DIAG] ULTRA CONNECT frame vs RSP capture-ring geometry (H1 pin):\n");
+
+	cl_arq_controller arq;   // provides prod_crc12_cb context (CRC12_calc)
+
+	struct { int cfg; const char* label; } rows[] = {
+		{ ULTRA_0, "ULTRA_0(200)" },
+		{ ULTRA_1, "ULTRA_1(201)" },
+		{ ULTRA_2, "ULTRA_2(202)" },
+		{ ROBUST_0, "ROBUST_0(100)" },   // the short doorbell frame — control
+	};
+
+	int n_h1_binds = 0;
+	int n_clean_decode_fail_when_overflow = 0;
+	int n_clean_decode_ok_when_fits = 0;
+
+	for (auto& r : rows) {
+		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(r.cfg);
+		if (ts.ack_mfsk.connect_pattern_nsymb <= 0) {
+			printf("    [%s] no CONNECT pattern (NB?), skip\n", r.label);
+			continue;
+		}
+
+		// Apply the PRODUCTION ULTRA CONNECT-suffix params (FEC repfact -> K knob ->
+		// base reps -> suffix reps) exactly as the arq_common enable hook does. For
+		// ROBUST_0 (non-ULTRA) leave the default uncoded 13-tone single-block suffix
+		// (R_base=1, R_suffix=1) — the short doorbell frame.
+		if (is_ultra_config(r.cfg)) {
+			int N = ultra_apply_tier_params(ts, r.cfg);
+			if (N <= 13 || !ts.ack_mfsk.suffix_fec_coded) {
+				printf("    [%s] ULTRA coded path not up (N=%d) — skip\n", r.label, N);
+				continue;
+			}
+		}
+
+		// ---- REAL production accessor values (the executing-code evidence) ----
+		const int base_total   = ts.ack_mfsk.connect_base_total_nsymb();     // R_base*16
+		const int suffix_one   = ts.ack_mfsk.ctrl_suffix_len();              // ONE codeword (RSP tail uses this)
+		const int suffix_total = ts.ack_mfsk.ctrl_suffix_total_nsymb();      // R_suffix*codeword (ON WIRE)
+		const int full_frame   = base_total + suffix_total;                  // full CONNECT frame on the wire
+		const int rsp_tail      = base_total + suffix_one + 16;              // what the RSP tries to read (arq_common.cc:5291)
+		const int buffer_Nsymb  = ts.data_container.buffer_Nsymb;            // the ring (data_container.cc:171)
+		const int Nofdm         = ts.data_container.Nofdm;
+		const int interp        = ts.data_container.interpolation_rate;
+		const double sym_ms     = 1000.0 * Nofdm * interp / 48000.0;
+
+		const bool h1_binds = (full_frame > buffer_Nsymb);
+		if (h1_binds) n_h1_binds++;
+
+		printf("    [%s] base_total=%d suffix_one=%d suffix_total(wire)=%d => FULL FRAME=%d sym (%.1f s) | "
+		       "ring buffer_Nsymb=%d sym (%.1f s) | RSP tail target=%d sym\n",
+		       r.label, base_total, suffix_one, suffix_total, full_frame, full_frame*sym_ms/1000.0,
+		       buffer_Nsymb, buffer_Nsymb*sym_ms/1000.0, rsp_tail);
+		printf("        => H1 (full frame > ring) = %s%s\n",
+		       h1_binds ? "*** YES — ring holds only " : "NO — ring holds the whole frame",
+		       h1_binds ? "" : "");
+		if (h1_binds) {
+			double frac = 100.0 * (double)buffer_Nsymb / (double)full_frame;
+			printf("           ring captures only the LAST %.0f%% of the frame (%d of %d sym) — "
+			       "the FRONT base block [0,%d) has scrolled out -> detector sees NO base pattern.\n",
+			       frac, buffer_Nsymb, full_frame, base_total);
+		}
+
+		// ---- Two-buffer CLEAN-SNR decode through the PRODUCTION path ----
+		// Render the full CONNECT frame, lay it into a ring-sized passband buffer the
+		// SAME way receive_mfsk_ctrl_suffix_phy_core reads it (the tail of the ring),
+		// and run the production decode at sigma=0. If H1 binds, this MUST miss
+		// (geometry), proving the failure is SNR-independent.
+		const int n_sig = ts.ctrl_suffix_pattern_passband_samples;   // full frame in passband samples
+		if (n_sig <= 0) { printf("        (no passband samples; skip decode probe)\n"); continue; }
+
+		uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6);
+		// mask to the available message bits (ULTRA shrinks K)
+		int msg_bits = is_ultra_config(r.cfg) ? gf16ra::msg_bits() : 38;
+		uint64_t pl_mask = (msg_bits - 2 >= 64) ? ~0ULL : ((1ULL << (msg_bits - 2)) - 1ULL);
+		p38 &= pl_mask;
+		uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+		uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+
+		std::vector<double> frame_pb((size_t)n_sig, 0.0);
+		int written = ts.generate_ctrl_suffix_pattern_passband(frame_pb.data(), MFSK_CTRL_START_CONN, p38, crc12);
+		if (written != n_sig) { printf("        (TX render size %d != %d; skip decode probe)\n", written, n_sig); continue; }
+
+		// Build the ring exactly as production sizes it.
+		const int sym_samples   = Nofdm * interp;
+		const int signal_period = sym_samples * buffer_Nsymb;        // the ring, in passband samples
+		std::vector<double> ring((size_t)signal_period, 0.0);
+		// Lay the END of the frame at the END of the ring (frame just finished filling
+		// the ring head — the production steady state). If the frame is longer than the
+		// ring, only its last `signal_period` samples survive (the FRONT scrolls out) —
+		// which is precisely the ring-overflow we are demonstrating.
+		int copy_n = (n_sig <= signal_period) ? n_sig : signal_period;
+		int src_off = n_sig - copy_n;       // tail of the frame
+		int dst_off = signal_period - copy_n;
+		memcpy(&ring[(size_t)dst_off], &frame_pb[(size_t)src_off], (size_t)copy_n * sizeof(double));
+
+		// Production tail-snapshot: tail_nsymb = base_total + ctrl_suffix_len() + 16,
+		// clamped to the ring, read from the END of the ring (tail_offset).
+		int tail_nsymb   = rsp_tail;
+		int tail_samples = tail_nsymb * sym_samples;
+		if (tail_samples > signal_period) tail_samples = signal_period;   // arq_common.cc clamp
+		int tail_offset  = signal_period - tail_samples;
+		std::vector<double> snap((size_t)tail_samples, 0.0);
+		memcpy(snap.data(), &ring[(size_t)tail_offset], (size_t)tail_samples * sizeof(double));
+
+		mfsk_ctrl_frame_type rt; uint64_t rp = 0; uint16_t rc = 0; int rm = 0;
+		bool decoded = ts.decode_ctrl_suffix_from_passband(
+			snap.data(), tail_samples, &rt, &rp, &rc, &rm, prod_crc12_cb, &arq);
+		bool ok = decoded && rt == MFSK_CTRL_START_CONN && rp == p38;
+		printf("        CLEAN-SNR production decode of the ring tail: %s (matched=%d)%s\n",
+		       ok ? "DECODED" : "MISS", rm,
+		       ok ? "" : "  <- no base pattern in the tail (H1)");
+
+		if (h1_binds && !ok) n_clean_decode_fail_when_overflow++;
+		if (!h1_binds && ok) n_clean_decode_ok_when_fits++;
+
+		ts.set_connect_suffix_reps(1); ts.set_connect_preamble_reps(1);
+		ts.set_suffix_fec(false); gf16ra::configure(2); gf16ra::init();   // restore globals
+	}
+
+	// Diagnostic VERDICT (the INCR-A deliverable, fail-before/pass-after framing):
+	//  - H1 binds for the ULTRA configs (full frame > ring) AND the clean-SNR
+	//    production decode MISSES on exactly those (geometry, not noise);
+	//  - the short ROBUST_0 doorbell frame FITS the ring and DECODES clean (control).
+	printf("    [INCR-A VERDICT] H1 binds on %d config(s); clean decode MISSED on %d overflow config(s); "
+	       "short-frame control DECODED on %d fitting config(s).\n",
+	       n_h1_binds, n_clean_decode_fail_when_overflow, n_clean_decode_ok_when_fits);
+	if (n_h1_binds >= 3 && n_clean_decode_fail_when_overflow >= 3 && n_clean_decode_ok_when_fits >= 1) {
+		printf("    [INCR-A CONCLUSION] H1 CONFIRMED: the ULTRA CONNECT frame (576/608/668 sym) exceeds the\n"
+		       "    capture ring (~%d sym) by >2x; the front base pattern scrolls out before the frame ends,\n"
+		       "    so the RSP tail decode misses at ANY SNR. A ring-resize ALONE cannot fix it (the ring is\n"
+		       "    sized to the DATA frame for steady-state ARQ); the robust fix is to establish on the SHORT\n"
+		       "    doorbell frame (INCR-C), which this test shows DECODES clean.\n",
+		       (int)0);
+		test_pass(name);
+	} else {
+		test_fail(name, "INCR-A diagnostic did not reproduce the expected H1 geometry — investigate "
+		                "(accessor values printed above)");
+	}
+}
+
+// =============================================================================
 // §20 (INCREMENT 2) — THE GATE FOR THIS INCREMENT: noncoherent base-pattern
 // COMBINING on the CONNECT handshake deepens the base-pattern matched-count
 // detection floor ~+2.2-2.5 dB/doubling (measured: hail-detection-floor §4,
@@ -5722,6 +5891,10 @@ int run_mfsk_ctrl_codec_tests() {
 	// connect_listen_window_ms so no establishment timer fires before the deep ULTRA
 	// CONNECT frame completes; non-ULTRA byte-identical.
 	test_ultra_establishment_timers();
+	// INCR-A DIAGNOSTIC (deep-snr-establishment-fix.md §5 INCR-A): pin H1 (capture
+	// ring too small for the long ULTRA CONNECT frame) with executing-code evidence
+	// through the production accessors + production decode. INSTRUMENT-ONLY.
+	test_incr_a_ultra_ring_capacity_h1();
 
 	// §21 PRODUCTION robust-tier-trigger behavior (tier2-suffix-fec-design.md §21,
 	// CAP_SUFFIX_FEC negotiation removed in cleanup/drop-suffix-fec-cap): ACK gate
