@@ -48,6 +48,18 @@ static inline bool sack_rx_trace_enabled()
 	} \
 } while(0)
 
+// CRC-12 callback wrapping the PRODUCTION cl_arq_controller::CRC12_calc
+// (init=0xFFF) for the Tier-1 soft ACK+SACK list decoder's CRC accept gate
+// (deep-snr-establishment-fix.md INCR-B). ctx = cl_arq_controller*. Matches
+// ctrl_crc12_fn. Identical convention to arq_common.cc:arq_ctrl_crc12_cb (which
+// is file-static in that TU); NEVER inline the CRC (v1 bug #1 was an init
+// mismatch between TX CRC12_calc and an inlined RX copy).
+static uint16_t arq_ctrl_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
+	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
 void cl_arq_controller::register_ack(int message_id)
 {
 	if(message_id>=0 && message_id<this->nMessages && messages_tx[message_id].status==PENDING_ACK)
@@ -105,6 +117,35 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	bool decoded = telecom_system->decode_ack_sack_from_passband(
 		telecom_system->data_container.ready_to_process_passband_delayed_data,
 		tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+
+	// Tier-1 SOFT-DECODE FALLBACK (deep-snr-establishment-fix.md INCR-B): on a hard
+	// miss with suffix_fec_mode==1, retry the SAME tail with the CRC-aided soft list
+	// decode (ZERO airtime, +1.34 dB, 0.25% FAR @flips=1). The soft decoder accepts
+	// ONLY a codeword whose internal production-CRC12 over [ACK_SACK|bsi|bitmap]
+	// matches; on success we recompute rx_crc12 over the soft fields so the
+	// independent CRC re-check below passes by construction. suffix_fec_mode!=1 →
+	// this block is inert and the path is byte-identical to the legacy hard-only ACK.
+	if(!decoded && telecom_system->suffix_fec_mode == 1)
+	{
+		uint8_t  s_bsi = 0; uint32_t s_bitmap = 0; int s_matched = 0, s_flips = -1;
+		bool soft_ok = telecom_system->decode_ack_sack_from_passband_soft(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, arq_ctrl_crc12_cb, this,
+			&s_bsi, &s_bitmap, &s_matched, &s_flips);
+		if(soft_ok)
+		{
+			rx_bsi = s_bsi; rx_bitmap = s_bitmap; mfsk_matched = s_matched;
+			char s_in[5];
+			s_in[0] = (char)rx_bsi;
+			s_in[1] = (char)((rx_bitmap >> 24) & 0xFF);
+			s_in[2] = (char)((rx_bitmap >> 16) & 0xFF);
+			s_in[3] = (char)((rx_bitmap >>  8) & 0xFF);
+			s_in[4] = (char)( rx_bitmap        & 0xFF);
+			rx_crc12 = CRC12_calc(s_in, 5) & 0x0FFF;
+			decoded = true;
+		}
+	}
+
 	if(!decoded)
 		return false;
 
@@ -2548,6 +2589,34 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						bool decoded = telecom_system->decode_ack_sack_from_passband(
 							telecom_system->data_container.ready_to_process_passband_delayed_data,
 							tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+
+						// Tier-1 SOFT-DECODE FALLBACK (deep-snr-establishment-fix.md
+						// INCR-B): hard miss + suffix_fec_mode==1 → retry the SAME tail
+						// with the CRC-aided soft list decode (ZERO airtime, +1.34 dB,
+						// 0.25% FAR @flips=1). Recompute rx_crc12 over the soft fields so
+						// the CRC re-check below passes by construction. Inert (byte-
+						// identical to the legacy hard-only ACK) when suffix_fec_mode!=1.
+						if(!decoded && telecom_system->suffix_fec_mode == 1)
+						{
+							uint8_t  s_bsi = 0; uint32_t s_bitmap = 0;
+							int s_matched = 0, s_flips = -1;
+							bool soft_ok = telecom_system->decode_ack_sack_from_passband_soft(
+								telecom_system->data_container.ready_to_process_passband_delayed_data,
+								tail_samples, arq_ctrl_crc12_cb, this,
+								&s_bsi, &s_bitmap, &s_matched, &s_flips);
+							if(soft_ok)
+							{
+								rx_bsi = s_bsi; rx_bitmap = s_bitmap; mfsk_matched = s_matched;
+								char s_in[5];
+								s_in[0] = (char)rx_bsi;
+								s_in[1] = (char)((rx_bitmap >> 24) & 0xFF);
+								s_in[2] = (char)((rx_bitmap >> 16) & 0xFF);
+								s_in[3] = (char)((rx_bitmap >>  8) & 0xFF);
+								s_in[4] = (char)( rx_bitmap        & 0xFF);
+								rx_crc12 = CRC12_calc(s_in, 5) & 0x0FFF;
+								decoded = true;
+							}
+						}
 
 						// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
 						// On mismatch, treat as no-ACK — the timeout-retransmit path

@@ -301,6 +301,7 @@ int main(int argc, char *argv[])
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
     int rx_normalize_cli = -1;         // --rx-normalize=on|off: -1=default(on), 0=off, 1=on
     int csi_llr_cli = -1;              // --csi-llr=on|off: -1=default(on), 0=off, 1=on
+    int suffix_fec_soft_cli = -1;      // --suffix-fec-soft=on|off: -1=default(off), 0=off, 1=on (INCR-B Tier-1 soft ctrl-suffix fallback)
     int ls_nv_debug_cli = -1;          // --ls-nv-debug=on|off: -1=default(off), 0=off, 1=on (fix/cfg16-nv-restore)
     int ls_crosspilot_cli = -1;        // --ls-crosspilot-nv=on|off: -1=default(off=fix), 1=baseline A.1.4 cross-pilot
     int fsel_test_cli = -1;            // --fsel-test=on|off: -1=default(off), 0=off, 1=on (fix/cfg16-nv-restore BER freq-selective channel)
@@ -545,6 +546,15 @@ int main(int argc, char *argv[])
             if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) csi_llr_cli = 0;
             else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) csi_llr_cli = 1;
             else { fprintf(stderr, "--csi-llr: expected on|off, got %s\n", val); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--suffix-fec-soft=", 18) == 0)
+        {
+            const char* val = argv[i] + 18;
+            if (strcmp(val, "off") == 0 || strcmp(val, "0") == 0) suffix_fec_soft_cli = 0;
+            else if (strcmp(val, "on") == 0 || strcmp(val, "1") == 0) suffix_fec_soft_cli = 1;
+            else { fprintf(stderr, "--suffix-fec-soft: expected on|off, got %s\n", val); exit(1); }
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1555,6 +1565,19 @@ start_modem:
         telecom_system.csi_llr_enabled = (csi_llr_cli == 1);
         printf("[FLAG] --csi-llr=%s\n",
                telecom_system.csi_llr_enabled ? "on" : "off");
+    }
+    if (suffix_fec_soft_cli != -1) {
+        // INCR-B: Tier-1 CRC-aided soft list decode as a FALLBACK on the UNCODED
+        // ctrl-suffix (CONNECT + ACK), after a hard-decode miss. ZERO airtime,
+        // byte-identical when off, +1.34 dB acquisition / 0.25% FAR @flips=1.
+        // Set both the persistent baseline (survives config reloads via
+        // set_suffix_fec(false)) and the initial mode (active before the first
+        // set_suffix_fec call). Does NOT touch the GF(16) Tier-2 path (mode 3).
+        telecom_system.suffix_fec_soft_fallback = (suffix_fec_soft_cli == 1);
+        if (telecom_system.suffix_fec_soft_fallback && telecom_system.suffix_fec_mode == 0)
+            telecom_system.suffix_fec_mode = 1;
+        printf("[FLAG] --suffix-fec-soft=%s\n",
+               telecom_system.suffix_fec_soft_fallback ? "on" : "off");
     }
     if (ls_nv_debug_cli != -1) {
         // fix/cfg16-nv-restore: ofdm is a plain member of telecom_system and is

@@ -94,6 +94,14 @@ cl_telecom_system::cl_telecom_system()
 	// baseline hard decode path is byte-identical; the *_soft entry points are
 	// always callable for direct measurement.
 	suffix_fec_mode=0;
+	// deep-snr-establishment-fix.md INCR-B: when ON, the UNCODED ctrl-suffix
+	// baseline runs the Tier-1 CRC-aided soft list decode as a FALLBACK after a
+	// hard-decode miss (suffix_fec_mode==1). Default OFF → byte-identical hard-only
+	// path. Independent of the GF(16) Tier-2 path (suffix_fec_mode==3, set when
+	// ack_mfsk.suffix_fec_coded). set_suffix_fec(false) restores mode to THIS
+	// baseline (1 if the fallback is enabled, else 0) rather than hardcoding 0, so
+	// the CLI/INI request survives config reloads.
+	suffix_fec_soft_fallback=false;
 	suffix_fec_K=4;
 	suffix_fec_max_trials=4000;
 	// Default Hamming-ball radius = 1: measured pure-noise FAR 0.25% (vs 3.4% at
@@ -3470,7 +3478,10 @@ int cl_telecom_system::set_suffix_fec(bool on, int repfact)
 		suffix_fec_mode = 3;          // GF(16) RA production path
 	} else {
 		ack_mfsk.suffix_fec_coded = false;
-		suffix_fec_mode = 0;
+		// INCR-B: restore to the UNCODED baseline — Tier-1 soft fallback (mode 1)
+		// if enabled by CLI/INI, else fully off (mode 0). Do NOT hardcode 0 or a
+		// config reload would silently disable the soft fallback.
+		suffix_fec_mode = suffix_fec_soft_fallback ? 1 : 0;
 	}
 	// Re-derive the CONNECT-suffix passband sample count for the (now possibly
 	// coded) ctrl_suffix_len(). load_configuration computed it at the uncoded

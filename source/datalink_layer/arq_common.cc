@@ -5135,6 +5135,43 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
 		arq_ctrl_crc12_cb, self);
 
+	// Tier-1 SOFT-DECODE FALLBACK (connect-suffix-fec-research.md §6 / deep-snr-
+	// establishment-fix.md INCR-B): when suffix_fec_mode==1 and the hard argmax
+	// decode above missed, retry the SAME tail snapshot with the CRC-aided soft
+	// list decode (+1.34 dB acquisition, 0.25% FAR @flips=1, ZERO airtime). The
+	// soft decoder runs the SAME base detect + control mini-Moose as the hard path,
+	// then top-K per-symbol candidates + a CRC12-gated best-first search; it accepts
+	// ONLY a codeword whose production-CRC12 over [expected_type|payload38] matches
+	// (the I2 accept gate is UNCHANGED — no ARQ weakening beyond the bounded,
+	// measured FAR). On success we synthesize rx_type=expected_type and recompute
+	// rx_crc12 so the outer CRC re-check below passes by construction (soft_decode
+	// already proved decoded_crc == CRC12_calc). suffix_fec_mode!=1 → byte-identical
+	// to the legacy hard-only path (this block is inert). suffix_fec_mode==3 (GF16
+	// Tier-2) is handled INSIDE decode_ctrl_suffix_from_passband and never reaches
+	// here as a miss-then-retry, so the two modes do not interact.
+	if(!decoded && telecom_system->suffix_fec_mode == 1)
+	{
+		uint64_t soft_p38 = 0;
+		int soft_matched = 0, soft_flips = -1;
+		bool soft_ok = telecom_system->decode_ctrl_suffix_from_passband_soft(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, expected_type, arq_ctrl_crc12_cb, self,
+			&soft_p38, &soft_matched, &soft_flips);
+		if(soft_ok)
+		{
+			rx_type = expected_type;
+			rx_p38  = soft_p38;
+			rx_matched = soft_matched;
+			uint8_t soft_typed[5];
+			pack_ctrl_typed40_msb_v2(soft_typed, rx_type, rx_p38);
+			rx_crc12 = self->CRC12_calc((char*)soft_typed, 5) & 0x0FFF;
+			decoded = true;
+			printf("[RX-MFSK-CTRL-%s] SOFT-DECODE recovered (flips=%d matched=%d)\n",
+				tag, soft_flips, soft_matched);
+			fflush(stdout);
+		}
+	}
+
 	if(!decoded)
 	{
 		telecom_system->data_container.frames_to_read = 2;

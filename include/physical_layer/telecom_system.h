@@ -231,6 +231,12 @@ public:
 	// (tier2-suffix-fec-gf16-spike.md; measurement-only — the gf16ra codec has
 	// no production caller, exercised via the §10 cliff-sweep harness).
 	int  suffix_fec_mode;       // 0 = off (baseline). 1 = soft list decode. 2/3 = Tier-2 spikes.
+	// INCR-B (deep-snr-establishment-fix.md): when true, the UNCODED ctrl-suffix
+	// baseline runs the Tier-1 soft list decode as a fallback after a hard miss
+	// (production CONNECT + ACK consumers gate on suffix_fec_mode==1). CLI/INI-set.
+	// Survives config reloads: set_suffix_fec(false) restores mode to 1 when this
+	// is true (else 0). Orthogonal to the GF(16) Tier-2 path (suffix_fec_mode==3).
+	bool suffix_fec_soft_fallback;
 	int  suffix_fec_K;          // top-K candidates per symbol (default 4).
 	int  suffix_fec_max_trials; // CRC-trial cap (bounds runtime; default 4000).
 	int  suffix_fec_max_flips;  // Hamming-ball radius (primary FAR lever; default 3).
