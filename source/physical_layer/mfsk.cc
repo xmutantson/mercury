@@ -205,20 +205,38 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	// of per-symbol FFT-bin-argmax matches for the discrete-tone-match
 	// detector in cl_ofdm::time_sync_mfsk_corr to declare detection.
 	//
-	// Detector accepts expected_bin OR mirror_bin (Bug #39 carrier-image
-	// recovery, ofdm.cc:3130, 3228) so the random-data baseline is p=2/M
-	// per symbol, NOT 1/M. This makes M=32 FAR 100× tighter than M=16
-	// but does NOT support a one-notch relax of M=32 to T=6 (would give
-	// FAR 2.8e-4/poll, over the 1e-5 escalation bound — see §15 fact
-	// doc). Uniform T=7 retained; §15 push deferred pending design fix.
-	// FAR computed as P(K ≥ T) for K ~ Binomial(N, 2/M):
-	//   WB M=32 N=16 → T=7  : FAR = 2.57e-5/poll
-	//   WB M=16 N=16 → T=7  : FAR = 1.94e-3/poll
-	//   NB M=8  N=8  → T=7  : FAR = 3.82e-4/poll
-	//   NB M=4  N=8  → T=7  : FAR = 3.52e-2/poll (mirror collisions
-	//                          degenerate; mitigated by 2-stream all-match)
-	if (M >= 16)
-		preamble_match_threshold = 7;
+	// Detector accepts expected OR mirror (Bug #39 carrier-image recovery)
+	// so the random-data per-symbol false-match baseline is p≈2/M, NOT 1/M.
+	//
+	// THRESHOLD IS GATED ON nStreams to match the detector's two decision
+	// paths (ofdm.cc time_sync_mfsk_corr, productionized 2026-06-02):
+	//
+	//  nStreams == 1 (M32×1 ROBUST_0 / M8×1 NB-ROBUST_0): the legacy
+	//    per-stream argmax + bin-mirror accept path. T=7. Binomial(N,2/M)
+	//    FAR model (unchanged, byte-identical to the pre-combiner detector):
+	//      WB M=32 N=16 → T=7 : FAR = 2.57e-5/poll
+	//      NB M=8  N=8  → T=7 : FAR = 3.82e-4/poll
+	//
+	//  nStreams >= 2 (M16×2 ROBUST_1/2 / M4×2 NB): STREAM-ENERGY COMBINING
+	//    replaces the old 2-stream AND-gate (which had been the FAR
+	//    mitigation for the degenerate-mirror cases). Combining recovers the
+	//    redundant per-stream preamble tone for +6 dB acquisition reach
+	//    (M16×2 production data-frame cliff −9.03 → −15.05 dB SNR3k @T=7;
+	//    P3 data-frame-detector-deepening-p3.md §11) but raises FAR: the
+	//    Binomial(N,2/M) model no longer applies (combining + the Phase-2
+	//    fine-offset max over sub-positions inflate it). MEASURED on the
+	//    production detector (P3 sweep, 4000 pure-noise polls):
+	//      WB M16×2 : T=7 FAR 9.3e-2 (cliff −15.05) | T=8 FAR 1.8e-2 (cliff −13.89)
+	//    T=8 is chosen for nStreams>=2: it keeps the FULL end-to-end win
+	//    (the data FEC binds at −10.84 dB, ~3 dB ABOVE the −13.89 T=8
+	//    detector cliff, so −15.05→−13.89 costs nothing end-to-end) while
+	//    cutting FAR ~5×. The residual 1.8e-2 is CRC16-backstopped (a
+	//    spurious preamble → LDPC on noise → CRC16 reject → ~30 ms wasted,
+	//    not corruption). [OPEN] the fine-pass FAR inflation is a separate
+	//    architectural item (gate the detect decision on the COARSE matched
+	//    count, refine offset only) — tracked in the P3 fact-doc §11/§13.
+	if (nStreams >= 2)
+		preamble_match_threshold = 8;
 	else
 		preamble_match_threshold = 7;
 

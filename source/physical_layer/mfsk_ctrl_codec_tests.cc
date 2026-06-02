@@ -1834,7 +1834,10 @@ static void p3_sweep_one_config(cl_telecom_system& ts, int config, const char* l
 	};
 	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
 	const int NT = 200;                 // trials/σ
-	const int Ttest[] = {7, 6, 5, 4};   // production T then relaxed
+	// T=8 added (P3 §10.1 open question): the combined-arm FAR at T=7 was
+	// 6.25e-3; T=8 is predicted to restore FAR≈0 while keeping most of the
+	// +4.86 dB. Sweep it so the productionization can pick the FAR≈0 threshold.
+	const int Ttest[] = {8, 7, 6, 5, 4}; // T=8 (tighter), production T=7, then relaxed
 	const int NTT = (int)(sizeof(Ttest)/sizeof(Ttest[0]));
 
 	double cliff_snr[8]; for (int t = 0; t < NTT; t++) cliff_snr[t] = 999.0;
@@ -1843,7 +1846,7 @@ static void p3_sweep_one_config(cl_telecom_system& ts, int config, const char* l
 	double comb_cliff_snr[8]; for (int t = 0; t < NTT; t++) comb_cliff_snr[t] = 999.0;
 	double comb_cliff_sig[8]; for (int t = 0; t < NTT; t++) comb_cliff_sig[t] = 0.0;
 
-	printf("    (sigma/rms : SNR3k_dB : P_prod[T7 T6 T5 T4] mean_mc | P_streamComb[T7 T6 T5 T4] mean_mc)\n");
+	printf("    (sigma/rms : SNR3k_dB : P_prod[T8 T7 T6 T5 T4] mean_mc | P_streamComb[T8 T7 T6 T5 T4] mean_mc)\n");
 	for (int si = 0; si < NS; si++) {
 		double sigma = mults[si] * sig_rms;
 		int hits[8]; memset(hits, 0, sizeof(hits));
@@ -1857,9 +1860,14 @@ static void p3_sweep_one_config(cl_telecom_system& ts, int config, const char* l
 			int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
 			int mc = (int)metric;          // returned matched count (== fine_best_matched)
 			matched_sum += mc;
+			// mc is the true matched count on BOTH paths (ofdm.cc sets *out_metric
+			// = fine_best_matched even when returning -1), so mc>=T is exact for
+			// every T. At T==prodT it equals the production gate (delay>=0 ⟺
+			// mc>=prodT). This makes the T=8 column a real tighter-threshold
+			// measurement, not the T=7 gate result.
+			(void)delay;
 			for (int t = 0; t < NTT; t++) {
-				bool det = (Ttest[t] >= prodT) ? (delay >= 0) : (mc >= Ttest[t]);
-				if (det) hits[t]++;
+				if (mc >= Ttest[t]) hits[t]++;
 			}
 			// LEVER: stream-energy-combined scorer on the SAME noisy buffer.
 			int cmc = p3_score_stream_combined(ts.ofdm, Nofdm, Nfft, Nc, interp,
@@ -1868,10 +1876,10 @@ static void p3_sweep_one_config(cl_telecom_system& ts, int config, const char* l
 			for (int t = 0; t < NTT; t++) if (cmc >= Ttest[t]) chits[t]++;
 		}
 		double snr = snr3k_db(p_sig, sigma, fs);
-		printf("      %5.1f : %7.2f : [%.2f %.2f %.2f %.2f] %.1f | [%.2f %.2f %.2f %.2f] %.1f\n",
+		printf("      %5.1f : %7.2f : [%.2f %.2f %.2f %.2f %.2f] %.1f | [%.2f %.2f %.2f %.2f %.2f] %.1f\n",
 			mults[si], snr,
-			(double)hits[0]/NT, (double)hits[1]/NT, (double)hits[2]/NT, (double)hits[3]/NT, matched_sum/NT,
-			(double)chits[0]/NT, (double)chits[1]/NT, (double)chits[2]/NT, (double)chits[3]/NT, comb_sum/NT);
+			(double)hits[0]/NT, (double)hits[1]/NT, (double)hits[2]/NT, (double)hits[3]/NT, (double)hits[4]/NT, matched_sum/NT,
+			(double)chits[0]/NT, (double)chits[1]/NT, (double)chits[2]/NT, (double)chits[3]/NT, (double)chits[4]/NT, comb_sum/NT);
 		for (int t = 0; t < NTT; t++) {
 			double p = (double)hits[t]/NT;
 			if (p >= 0.5 && sigma > cliff_sig[t]) { cliff_sig[t] = sigma; cliff_snr[t] = snr; }
@@ -1881,11 +1889,11 @@ static void p3_sweep_one_config(cl_telecom_system& ts, int config, const char* l
 	}
 
 	printf("    --- [P3 %s] DATA-FRAME DETECTOR cliffs (P=0.5, SNR3k dB; more negative = deeper) ---\n", label);
-	printf("    PRODUCTION (AND-gate, T=%d): %.2f dB | relax T=6: %.2f | T=5: %.2f | T=4: %.2f\n",
-		prodT, cliff_snr[0], cliff_snr[1], cliff_snr[2], cliff_snr[3]);
-	printf("    LEVER stream-energy-COMBINED (T=%d): %.2f dB | T=6: %.2f | T=5: %.2f | T=4: %.2f  (delta@T7 = %+.2f dB)\n",
-		prodT, comb_cliff_snr[0], comb_cliff_snr[1], comb_cliff_snr[2], comb_cliff_snr[3],
-		comb_cliff_snr[0] - cliff_snr[0]);
+	printf("    PRODUCTION-PATH (gated combiner build): T=8: %.2f | T=7: %.2f dB | T=6: %.2f | T=5: %.2f | T=4: %.2f\n",
+		cliff_snr[0], cliff_snr[1], cliff_snr[2], cliff_snr[3], cliff_snr[4]);
+	printf("    LEVER stream-energy-COMBINED (ref scorer): T=8: %.2f | T=7: %.2f | T=6: %.2f | T=5: %.2f | T=4: %.2f  (delta@T7 = %+.2f dB)\n",
+		comb_cliff_snr[0], comb_cliff_snr[1], comb_cliff_snr[2], comb_cliff_snr[3], comb_cliff_snr[4],
+		comb_cliff_snr[1] - cliff_snr[1]);
 
 	// FAR on pure noise per T (the cost of relaxing / combining). Mid σ.
 	const int FN = 4000;
@@ -1899,18 +1907,18 @@ static void p3_sweep_one_config(cl_telecom_system& ts, int config, const char* l
 		double metric = 0.0;
 		int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
 		int mc = (int)metric;
+		(void)delay;
 		for (int t = 0; t < NTT; t++) {
-			bool det = (Ttest[t] >= prodT) ? (delay >= 0) : (mc >= Ttest[t]);
-			if (det) fa[t]++;
+			if (mc >= Ttest[t]) fa[t]++;
 		}
 		int cmc = p3_score_stream_combined(ts.ofdm, Nofdm, Nfft, Nc, interp,
 			start_shift, bb, Npre, ts.mfsk.preamble_tones, M, nStr, ts.mfsk.stream_offsets);
 		for (int t = 0; t < NTT; t++) if (cmc >= Ttest[t]) cfa[t]++;
 	}
-	printf("    FAR/poll PRODUCTION (pure noise, %d trials): T=%d: %.2e | T=6: %.2e | T=5: %.2e | T=4: %.2e\n",
-		FN, prodT, (double)fa[0]/FN, (double)fa[1]/FN, (double)fa[2]/FN, (double)fa[3]/FN);
-	printf("    FAR/poll stream-COMBINED         (%d trials): T=%d: %.2e | T=6: %.2e | T=5: %.2e | T=4: %.2e\n",
-		FN, prodT, (double)cfa[0]/FN, (double)cfa[1]/FN, (double)cfa[2]/FN, (double)cfa[3]/FN);
+	printf("    FAR/poll PRODUCTION-PATH (pure noise, %d trials): T=8: %.2e | T=7: %.2e | T=6: %.2e | T=5: %.2e | T=4: %.2e\n",
+		FN, (double)fa[0]/FN, (double)fa[1]/FN, (double)fa[2]/FN, (double)fa[3]/FN, (double)fa[4]/FN);
+	printf("    FAR/poll stream-COMBINED (ref scorer) (%d trials): T=8: %.2e | T=7: %.2e | T=6: %.2e | T=5: %.2e | T=4: %.2e\n",
+		FN, (double)cfa[0]/FN, (double)cfa[1]/FN, (double)cfa[2]/FN, (double)cfa[3]/FN, (double)cfa[4]/FN);
 }
 
 // MEASURE-only entry (env-gated). Prints the data-frame detector cliff for the
@@ -1925,6 +1933,121 @@ static void test_data_preamble_detector_cliff_sweep() {
 	{ cl_telecom_system ts0; p3_sweep_one_config(ts0, ROBUST_0, "ROBUST_0 / M32x1 (existing data preamble)"); }
 	{ cl_telecom_system ts2; p3_sweep_one_config(ts2, ROBUST_2, "ROBUST_2 / M16x2 (ROBUST_RA -10-mode geometry)"); }
 	printf("=== [P3] END ===\n\n");
+}
+
+// §6.P4 — STREAM-ENERGY COMBINER PRODUCTIONIZATION GUARD (always-on assertion).
+//
+// This is the FAIL-BEFORE / PASS-AFTER regression for the productionized
+// combiner (ofdm.cc time_sync_mfsk_corr, gated nStreams>=2). It runs in every
+// `mercury --test` (NOT env-gated) and is fast (~80 detector calls).
+//
+// The P3 sweep (§6.P3) MEASURED, on the same snr3k_db axis:
+//   SNR3k(mult) = 9.03 − 20·log10(mult)   [snr3k_db, p_sig=sig_rms², σ=mult·sig_rms]
+//   - M16×2 AND-gate (pre-fix) cliff = −9.03 dB  → P=0.5 at mult≈8.0
+//   - M16×2 stream-combiner          = −13.89 dB → P=0.5 at mult≈14.0  (+4.86 dB)
+//   - M32×1 production               = −13.89 dB (combiner is a no-op / gated off)
+//
+// Assertions:
+//  (A) M16×2 (ROBUST_2) at mult=11 (SNR3k ≈ −11.8 dB — DEEPER than the −11 PASS
+//      bar AND deeper than the old −9.03 cliff): the production detector must
+//      now detect in ≥75% of trials. PRE-FIX (AND-gate) this is ~0% (−11.8 is
+//      ~2.8 dB past the −9.03 cliff) → the test FAILS on monitor and PASSES with
+//      the combiner. This is the load-bearing failing-first assertion.
+//  (B) M32×1 (ROBUST_0) NON-REGRESSION: the combiner is gated off (nStreams==1),
+//      so the legacy per-stream path is byte-identical. Spot-check at mult=8
+//      (SNR3k ≈ −9.0 dB, comfortably inside the −13.89 ROBUST_0 cliff): must
+//      still detect ≥75%. (The full M32×1 byte-identity is also covered by the
+//      unchanged §6.1–§6.5 ROBUST_0 tests; this is an in-test tripwire.)
+static void test_mfsk_data_preamble_stream_combiner() {
+	const char* name = "mfsk_data_preamble_stream_combiner";
+	const int NT = 40;
+	const int need = 30;            // ≥75% detect
+
+	// --- (A) M16×2 deepening: production detector must clear the −11.8 dB cell ---
+	{
+		cl_telecom_system ts;
+		ts.operation_mode = ARQ_MODE;
+		ts.load_configuration(ROBUST_2);
+		if (ts.mfsk.nStreams != 2) {
+			test_fail(name, "pre-condition: ROBUST_2 not M16×2 (nStreams!=2)");
+			return;
+		}
+		std::vector<double> clean_pb; int buf_pb = 0, sym_samples = 0; double p_sig = 0.0;
+		if (!p3_build_clean_passband(ts, clean_pb, buf_pb, sym_samples, p_sig)) {
+			test_fail(name, "M16×2 build_clean_passband failed");
+			return;
+		}
+		int interp = ts.data_container.interpolation_rate;
+		int prodT = ts.mfsk.preamble_match_threshold;
+		double sig_rms = std::sqrt(p_sig);
+		double mult = 11.0;                     // SNR3k ≈ −11.8 dB
+		double sigma = mult * sig_rms;
+		double snr = snr3k_db(p_sig, sigma, ts.sampling_frequency);
+		int passes = 0, last_mc = -1;
+		for (int seed = 0; seed < NT; seed++) {
+			std::vector<std::complex<double> > bb;
+			std::mt19937 rng((uint32_t)(0x5C0FFEE0u + seed));
+			p3_noisy_baseband(ts, clean_pb, buf_pb, sigma, /*with_signal=*/true, rng, bb);
+			double metric = 0.0;
+			int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
+			last_mc = (int)metric;
+			if (delay >= 0 && (int)metric >= prodT) passes++;
+		}
+		if (passes < need) {
+			char b[256];
+			snprintf(b, sizeof(b),
+				"M16×2 combiner FAIL: only %d/%d detect at SNR3k=%.2f dB (mult=%.1f, T=%d); "
+				"pre-fix AND-gate cliff is −9.03 dB so this is the failing-first guard. last_mc=%d",
+				passes, NT, snr, mult, prodT, last_mc);
+			test_fail(name, b);
+			return;
+		}
+		printf("    [ASSERT OK] M16×2 production detector: %d/%d detect at SNR3k=%.2f dB "
+			"(clears the −11 bar; combiner active, nStreams=2).\n", passes, NT, snr);
+	}
+
+	// --- (B) M32×1 non-regression: gated path byte-identical, still detects ---
+	{
+		cl_telecom_system ts;
+		ts.operation_mode = ARQ_MODE;
+		ts.load_configuration(ROBUST_0);
+		if (ts.mfsk.nStreams != 1) {
+			test_fail(name, "pre-condition: ROBUST_0 not M32×1 (nStreams!=1)");
+			return;
+		}
+		std::vector<double> clean_pb; int buf_pb = 0, sym_samples = 0; double p_sig = 0.0;
+		if (!p3_build_clean_passband(ts, clean_pb, buf_pb, sym_samples, p_sig)) {
+			test_fail(name, "M32×1 build_clean_passband failed");
+			return;
+		}
+		int interp = ts.data_container.interpolation_rate;
+		int prodT = ts.mfsk.preamble_match_threshold;
+		double sig_rms = std::sqrt(p_sig);
+		double mult = 8.0;                      // SNR3k ≈ −9.0 dB, inside −13.89 cliff
+		double sigma = mult * sig_rms;
+		double snr = snr3k_db(p_sig, sigma, ts.sampling_frequency);
+		int passes = 0;
+		for (int seed = 0; seed < NT; seed++) {
+			std::vector<std::complex<double> > bb;
+			std::mt19937 rng((uint32_t)(0x32310000u + seed));
+			p3_noisy_baseband(ts, clean_pb, buf_pb, sigma, /*with_signal=*/true, rng, bb);
+			double metric = 0.0;
+			int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
+			if (delay >= 0 && (int)metric >= prodT) passes++;
+		}
+		if (passes < need) {
+			char b[200];
+			snprintf(b, sizeof(b),
+				"M32×1 NON-REGRESSION FAIL: only %d/%d detect at SNR3k=%.2f dB (combiner must be "
+				"gated OFF at nStreams=1; legacy path should be byte-identical)", passes, NT, snr);
+			test_fail(name, b);
+			return;
+		}
+		printf("    [ASSERT OK] M32×1 production detector: %d/%d detect at SNR3k=%.2f dB "
+			"(combiner gated off, nStreams=1; legacy path intact).\n", passes, NT, snr);
+	}
+
+	test_pass(name);
 }
 
 // =============================================================================
@@ -5216,6 +5339,10 @@ int run_mfsk_ctrl_codec_tests() {
 	// env-gated MERCURY_P3_SWEEP=1). Registered FIRST so the make-or-break
 	// numbers print before the slow §10/§11 sweeps. No-op without the env var.
 	test_data_preamble_detector_cliff_sweep();
+
+	// §6.P4 stream-energy combiner productionization guard (always-on,
+	// fail-before/pass-after): M16×2 cliff deepening + M32×1 non-regression.
+	test_mfsk_data_preamble_stream_combiner();
 
 	// §1 codec primitives
 	test_pack_unpack_callsign_body_b36();

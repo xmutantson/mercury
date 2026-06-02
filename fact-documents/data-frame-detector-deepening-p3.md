@@ -9,6 +9,13 @@ combiner** moves it to **−13.89 dB (+4.86 dB)** — deeper than the GF16-RA FE
 (−10.84), so the FEC, not the detector, becomes the binding constraint. The −10 mode keeps
 **103 bps wire** (R⅓ M16×2, P0 §3) > VARA's 71.
 
+> **UPDATE 2026-06-02 (INCR-1) — the combiner is now PRODUCTIONIZED (§11–§15).** SIM build +
+> `--test` (51/0) green; M16×2 production-path cliff DEEPENED −9.03 → **−15.05 dB @ T=7 /
+> −13.89 dB @ T=8** (T=8 chosen, FEC-bound at −10.84), M32×1 BYTE-IDENTICAL. **FAR
+> CORRECTION (§12):** the production detector's FAR is HIGHER than the §3 ref-scorer
+> (fine-pass max) — T=8 M16×2 FAR = 1.8e-2 (NOT ≈0); CRC16-backstopped; clean follow-on in
+> §13. **NOT merged** — pending the HW confirm that M16×2 acquisition deepens on RF.
+
 **Date:** 2026-06-02. **Worktree:** `C:/Users/kamer/mercury_wt/data-detector-p3`, branch
 `sim/data-detector-deepen-p3` off **mercury** repo `monitor @8fc1211`. Build `bash build.sh
 o3`; MEASURE-only test added (env-gated `MERCURY_P3_SWEEP=1`), default build byte-identical.
@@ -205,14 +212,16 @@ env MERCURY_P3_SWEEP=1 ./mercury.exe --test   # prints "[P3] DATA-FRAME DETECTOR
 | file:line | what |
 |---|---|
 | `ofdm.cc:3462` | `time_sync_mfsk_corr` — the shipped discrete-match data-frame detector |
-| `ofdm.cc:3556` | the 2-stream AND-gate (`streams_matched < mfsk_nStreams → continue`) — the cliff driver |
-| `ofdm.cc:3680` | detection gate `fine_best_matched < mfsk_preamble_match_threshold` |
+| `ofdm.cc:3560` (Phase-1), `ofdm.cc:3696` (Phase-2) | **PRODUCTIONIZED** `if (mfsk_nStreams>=2)` stream-energy combiner (sum-then-argmax); `else` = legacy per-stream AND-gate path (byte-identical at 1 stream) |
+| `ofdm.cc` (was :3556) | the OLD 2-stream AND-gate (`streams_matched < mfsk_nStreams → continue`) — the cliff driver, now REPLACED for nStreams≥2 |
+| `ofdm.cc` detection gate | `fine_best_matched < mfsk_preamble_match_threshold` (unchanged) |
 | `mfsk.cc:518-522` | `generate_preamble` places the SAME tone in both streams (redundant → combinable) |
-| `mfsk.cc:149-168,221` | preamble tones (Welch-Costas g=2 ×2 reps) + threshold=7/16 |
+| `mfsk.cc:149-168` | preamble tones (Welch-Costas g=2 ×2 reps) |
+| `mfsk.cc:220` | **threshold now `nStreams>=2 ? 8 : 7`** (was uniform 7) + the updated FAR-model comment |
 | `telecom_system.cc:1069` | sole production caller |
-| `telecom_system.cc:5582-5589` | per-config population of the detector's mfsk_* fields |
-| `mfsk_ctrl_codec_tests.cc` §6.P3 | this measurement (env `MERCURY_P3_SWEEP`) |
-| `mfsk_ctrl_codec_tests.cc:2843` | `snr3k_db` axis (shared with all campaign numbers) |
+| `telecom_system.cc:5582-5589` | per-config population of the detector's mfsk_* fields (routes the gate uniformly) |
+| `mfsk_ctrl_codec_tests.cc` §6.P3 | the MEASURE-only sweep (env `MERCURY_P3_SWEEP`); §6.P4 = the always-on fail-before/pass-after guard |
+| `mfsk_ctrl_codec_tests.cc` `snr3k_db` | the SNR3k axis (shared with all campaign numbers) |
 
 ## §10 Open questions [?]
 1. **[?] FAR of the combined detector at T=8/9 on M16×2** — not swept; the T=4..7 trend
@@ -222,3 +231,133 @@ env MERCURY_P3_SWEEP=1 ./mercury.exe --test   # prints "[P3] DATA-FRAME DETECTOR
 3. **[?] M32×1 byte-identical under a productionized combiner** — §3.1 shows a −1.34 dB
    difference in the *combined* scorer at 1 stream (mirror-tone argmax). Gate behind
    `nStreams>=2` to keep ROBUST_0 untouched.
+
+---
+
+## §11 PRODUCTIONIZATION (WIN CAMPAIGN INCR-1, 2026-06-02) — SIM only, NOT merged
+
+**Status:** the §5 lever #1 (stream-energy combiner) is now PRODUCTIONIZED in
+`cl_ofdm::time_sync_mfsk_corr`, gated `nStreams>=2`. SIM build + `--test` green; the
+M16×2 production-path cliff DEEPENED **−9.03 → −13.89 dB SNR3k @ the chosen T=8**
+(−15.05 @ T=7). M32×1 is BYTE-IDENTICAL. **NOT merged** — pending the HW confirm that
+M16×2 *acquisition* deepens on RF (the HW-confirm-better rule).
+
+**Branch:** `sim/data-detector-deepen-p3` (this worktree), one commit on top of the P3
+MEASURE commit `6771c8b`. Build `bash build.sh o3`; foreground.
+
+### §11.1 The two-block edit (`source/physical_layer/ofdm.cc`)
+Both per-symbol decision blocks of `time_sync_mfsk_corr` (Phase-1 coarse + Phase-2 fine)
+were restructured to branch on `mfsk_nStreams`:
+- **`ofdm.cc:3560` (Phase-1) and `ofdm.cc:3696` (Phase-2):** `if (mfsk_nStreams >= 2)`
+  → **SUM each candidate tone's per-stream energy, then a single argmax over M tones**,
+  accept iff argmax == expected tone OR `(M−tone)%M` (tone-space mirror). This is
+  **bit-equivalent to the P3 reference scorer** `p3_score_stream_combined` (§3), so it
+  inherits the measured combining gain. Replaces the legacy AND-gate
+  (`streams_matched < mfsk_nStreams → continue`).
+- **`else` (nStreams==1):** the legacy per-stream argmax + **bin-space** mirror accept,
+  kept VERBATIM (uses `mfsk_stream_offsets[0]` only). At 1 stream the combiner would be a
+  no-op except the tone- vs bin-mirror difference (§3.1, −1.34 dB), so gating preserves
+  ROBUST_0 / M32×1 byte-for-byte.
+- The secondary `e_target`/`metric` (energy-ratio tie-break, diagnostic only) is computed
+  identically in both branches (it already summed expected+mirror across all streams).
+
+### §11.2 Threshold (`source/physical_layer/mfsk.cc:220`) — gated on nStreams
+The discrete-match threshold is now **`nStreams>=2 ? 8 : 7`** (was uniform 7). Rationale,
+from the production-path FAR measured here (NOT the §3 ref-scorer; see §12):
+- **nStreams==1 (M32×1/M8×1):** T=7 unchanged → byte-identical; the Binomial(N,2/M) FAR
+  model (`mfsk.cc`) still holds (WB M=32 FAR 2.57e-5/poll).
+- **nStreams>=2 (M16×2/M4×2):** **T=8.** The combiner removes the AND-gate (which had been
+  the documented FAR mitigation for the degenerate-mirror cases, `mfsk.cc` old comment).
+  T=8 keeps the FULL end-to-end win — the data FEC binds at −10.84 dB, ~3 dB ABOVE the
+  −13.89 T=8 detector cliff, so −15.05→−13.89 costs **nothing** end-to-end — while cutting
+  FAR ~5× vs T=7 (§12). The residual is CRC16-backstopped.
+
+### §11.3 Measured outcome (`MERCURY_P3_SWEEP=1`, production detector, this build)
+
+| geometry | arm | cliff (P=0.5) T=7 | cliff T=8 | byte-identical? |
+|---|---|---|---|---|
+| M32×1 (ROBUST_0) | PRODUCTION-PATH | **−13.89** | −12.55 | **YES** — matches the pre-combiner −13.89 (gate off); FAR T=7 2.25e-3 (matches §3.1) |
+| M16×2 (ROBUST_2) | PRODUCTION-PATH (combiner) | **−15.05** | **−13.89** | n/a — this is the deepened path |
+| M16×2 | P3 ref scorer (coarse-only) | −13.89 | −12.55 | (reference; production-path is ≥ deeper) |
+
+M16×2 P(detect) on the production path: 1.00 @ −10.97 (T=8), **0.94 @ −11.80 (T=8)**,
+0.57 @ −13.89 (T=8). **CLEARS the −11 PASS bar with ~3 dB margin at T=8.** The production
+path (Phase-1 coarse + Phase-2 fine + full search) is ~1.2 dB DEEPER than the coarse-only
+ref scorer — the productionized result slightly exceeds the P3-measured lever.
+
+### §11.4 Tests (`source/physical_layer/mfsk_ctrl_codec_tests.cc`)
+- **NEW §6.P4 `test_mfsk_data_preamble_stream_combiner`** (always-on, fail-before/pass-after):
+  (A) M16×2 (ROBUST_2) at SNR3k −11.80 dB must detect ≥30/40 — PRE-FIX (AND-gate, cliff
+  −9.03) this is ~0% so it FAILS on `monitor`/`6771c8b`; POST-FIX **39/40 @ T=8** (40/40
+  @ T=7) → PASSES. (B) M32×1 (ROBUST_0) non-regression at −9.03 dB → **40/40**.
+- §6.P3 sweep extended: Ttest now `{8,7,6,5,4}` (T=8 added per §10.1), and the per-T
+  decision is `mc>=T` (exact at every T, including the new tighter T=8) instead of reusing
+  the T=7 gate result. The "PRODUCTION-PATH" arm now exercises the gated combiner build.
+- `mercury --test` = **51 passed / 0 failed** (was 50 at `6771c8b`; +1 = §6.P4). The five
+  existing §6.1–§6.5 ROBUST_0 argmax tests pass unchanged = the M32×1 byte-identity
+  regression evidence.
+
+---
+
+## §12 FAR CORRECTION — the production-path FAR is HIGHER than the P3 ref scorer
+
+§3.2 / §10.1 used the **coarse-only ref scorer** and reported combined FAR 6.25e-3 @ T=7,
+predicting "T=8 restores FAR≈0". The **production detector runs the Phase-2 fine pass**
+(±½-symbol, taking the MAX matched count over sub-positions), which inflates FAR. Measured
+on the production detector (4000 pure-noise polls, this build):
+
+| geometry / path | T=8 | T=7 | T=6 |
+|---|---:|---:|---:|
+| M32×1 production (legacy path) | 0.0 | 2.25e-3 | 2.80e-2 |
+| **M16×2 production (combiner)** | **1.80e-2** | **9.30e-2** | 3.18e-1 |
+| M16×2 ref scorer (coarse-only) | 1.75e-3 | 6.25e-3 | 4.05e-2 |
+
+**Correction:** on the production detector, T=8 does **NOT** give FAR≈0 for M16×2 (1.8e-2,
+not ~0). The ~15× gap vs the ref scorer is the fine-pass sub-position max. T=8 is still the
+right operating point (full end-to-end win at −13.89, FEC-bound; 5× lower FAR than T=7;
+CRC16-backstopped), but the FAR≈0 claim is REVISED — see §13 for the clean follow-on fix.
+
+---
+
+## §13 [OPEN] Fine-pass FAR inflation — a clean follow-on (NOT this increment)
+
+The residual M16×2 FAR (1.8e-2 @ T=8) is driven by the detection decision using
+`fine_best_matched` — the MAX matched count over the ±½-symbol fine grid. A cleaner design
+gates the *detect/no-detect* decision on the **coarse** matched count (one position per
+symbol grid, the ref-scorer's lower-FAR statistic) and uses the fine pass ONLY to refine
+the returned sample OFFSET, not to re-maximize the count. The ref-scorer FAR (1.75e-3 @ T=8)
+is the achievable target. This touches the detector's gate structure for BOTH stream paths
+(would change M32×1 too → must re-confirm byte-identity), so it is OUT OF SCOPE for INCR-1
+and is filed as a follow-on. It does NOT block the combiner: FAR is wasted compute (LDPC on
+noise → CRC16 reject → ~30 ms), never corruption.
+
+---
+
+## §14 Cross-layer §5 audit result (the productionized change)
+
+`time_sync_mfsk_corr` is shared by ALL MFSK data modes; its geometry fields
+(`mfsk_M`, `mfsk_nStreams`, `mfsk_stream_offsets`) are populated per-config at
+`telecom_system.cc:5582-5589`, so the `nStreams>=2` gate routes uniformly:
+- **ROBUST_1, ROBUST_2 (WB M16×2):** combiner active, T=8. ✓
+- **NB ROBUST_1/2 (M4×2):** combiner active, T=8 — and this is where the OLD AND-gate's
+  FAR mitigation (`mfsk.cc` comment "NB M=4 … mitigated by 2-stream all-match") is removed;
+  the T=8 + CRC16 backstop is the replacement. NB-specific FAR not separately swept [?].
+- **Future ROBUST_RA / ULTRA (M16×2 and deeper, ≥2 streams):** automatically covered by the
+  gate the moment they load with nStreams≥2 — uniform by construction (the §6 shared benefit).
+- **ROBUST_0 (M32×1) / NB-ROBUST_0 (M8×1):** gate off → legacy path → byte-identical.
+- **Control/HAIL/ACK (`detect_ack_pattern`, M16×1, `ack_mfsk`):** a DIFFERENT function and a
+  separate threshold (`ack_match_threshold`) — NOT touched by this change. ✓ (§7)
+- **Sole production caller** `telecom_system.cc:1069`: output contract unchanged (returns
+  delay; `*out_metric` = matched count). The fallback `time_sync_mfsk` (template==NULL) is a
+  different detector, not in scope.
+
+---
+
+## §15 Reproduction (productionized)
+```
+cd C:/Users/kamer/mercury_wt/data-detector-p3 && bash build.sh o3
+./mercury.exe --test                       # 51 passed / 0 failed; §6.P4 + §6.1-6.5 green
+env MERCURY_P3_SWEEP=1 ./mercury.exe --test # PRODUCTION-PATH M16x2 cliff -15.05(T7)/-13.89(T8);
+                                            # M32x1 -13.89(T7) unchanged; FARs per §12
+# fail-before: git stash the ofdm.cc+mfsk.cc change, rebuild, --test → §6.P4 (A) FAILS at -11.8 dB
+```
