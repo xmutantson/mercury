@@ -1647,6 +1647,287 @@ static void test_mfsk_data_preamble_argmax_high_snr_no_regression() {
 }
 
 // =============================================================================
+// §6.P3 — DATA-FRAME DETECTOR CLIFF SWEEP (WIN CAMPAIGN P3 make-or-break)
+//
+// Question (robust-ra-data-code-p0.md §5(a)): the GF16-RA data FEC reaches
+// −10.84 (R⅓) / −13.34 (R¼) genie-sync, but P0 warns the PRODUCTION end-to-end
+// cliff is "~3 dB shallower until the data-frame preamble detection/sync is
+// fixed". P3 asks: does the SHIPPED data-frame discrete-match detector
+// (ofdm.cc:3462 time_sync_mfsk_corr) ALREADY reach ≤ −11 dB SNR3k, so the FEC's
+// −10.84 is NOT detector-limited?
+//
+// This drives the PRODUCTION detector directly on a synthesized preamble +
+// passband AWGN, on the SAME snr3k_db axis as every campaign number
+// (−14.68 base floor, −13.25 HAIL, −11.75/−13.34 FEC). Measures:
+//   (a) production cliff at T=preamble_match_threshold (=7) — the binding gate;
+//   (b) relaxed-threshold lever: same matched-count, re-decided at T=6/5/4
+//       (free reinterpretation of the returned count — no re-run);
+//   (c) FAR on pure noise per T (the cost of the relax lever).
+// Run for BOTH the M=32×1 (ROBUST_0) and M=16×2 (ROBUST_2 = the ROBUST_RA /
+// −10 mode geometry, M16×2 per P0 §5) preamble geometries.
+//
+// MEASURE-only, env-gated (MERCURY_P3_SWEEP=1) so it does not slow --test.
+// No production code touched; uses the shipped detector and the shipped synth.
+// =============================================================================
+
+// Forward decl — snr3k_db is defined later (§9 helpers, ~line 2843); the P3
+// sweep is registered first so it needs the prototype here. Identical formula.
+static double snr3k_db(double p_sig, double sigma, double fs);
+
+// Generalized preamble synthesizer: like synth_preamble_buffer (§6) but takes a
+// config so the M=16×2 ROBUST_RA geometry can be measured too. Returns the
+// full-rate interpolated baseband buffer + the preamble passband power for the
+// snr3k_db axis.
+// Build the CLEAN preamble passband ONCE for an already-loaded ts (no reload).
+// Returns the clean passband buffer (preamble + trailing pad) and p_sig. The
+// per-trial path then just adds AWGN + FIRs this buffer — NO per-trial reload
+// (the reload floods the log + dominates runtime).
+static bool p3_build_clean_passband(cl_telecom_system& ts,
+                                    std::vector<double>& out_clean_pb,
+                                    int& out_buffer_pb_size, int& out_sym_samples,
+                                    double& out_p_sig)
+{
+	if (ts.mfsk.preamble_nSymb <= 0 || ts.ofdm.mfsk_M <= 0) return false;
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int preamble_nSymb = ts.data_container.preamble_nSymb;
+	int interp = ts.data_container.interpolation_rate;
+	out_sym_samples = Nofdm * interp;
+
+	int passband_samples = Nofdm * preamble_nSymb * interp;
+	std::vector<double> preamble_pb((size_t)passband_samples, 0.0);
+
+	ts.mfsk.generate_preamble(ts.data_container.preamble_data, preamble_nSymb);
+	for (int i = 0; i < preamble_nSymb; i++) {
+		ts.ofdm.symbol_mod(
+			&ts.data_container.preamble_data[i * Nc],
+			&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+	}
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		ts.data_container.preamble_symbol_modulated_data,
+		Nofdm * preamble_nSymb, preamble_pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	double s = 0.0; for (int i = 0; i < passband_samples; i++) s += preamble_pb[i]*preamble_pb[i];
+	out_p_sig = (passband_samples > 0) ? s / passband_samples : 0.0;
+
+	int trailing_pad = 12 * out_sym_samples;
+	int buffer_pb_size = passband_samples + trailing_pad;
+	int buffer_nsymb_pb = buffer_pb_size / out_sym_samples;
+	buffer_pb_size = buffer_nsymb_pb * out_sym_samples;
+	out_buffer_pb_size = buffer_pb_size;
+
+	out_clean_pb.assign((size_t)buffer_pb_size, 0.0);
+	for (int i = 0; i < passband_samples && i < buffer_pb_size; i++)
+		out_clean_pb[i] = preamble_pb[i];
+	return true;
+}
+
+// Per-trial: add AWGN (or pure noise if with_signal=false) to the precomputed
+// clean passband, FIR→baseband. Reuses the already-loaded ts (no reload).
+static void p3_noisy_baseband(cl_telecom_system& ts,
+                              const std::vector<double>& clean_pb, int buffer_pb_size,
+                              double noise_sigma_pb, bool with_signal,
+                              std::mt19937& rng,
+                              std::vector<std::complex<double> >& out_bb)
+{
+	std::vector<double> buffer_pb((size_t)buffer_pb_size, 0.0);
+	if (with_signal) {
+		for (int i = 0; i < buffer_pb_size; i++) buffer_pb[i] = clean_pb[(size_t)i];
+	}
+	if (noise_sigma_pb > 0.0) {
+		std::normal_distribution<double> nd(0.0, noise_sigma_pb);
+		for (int i = 0; i < buffer_pb_size; i++) buffer_pb[i] += nd(rng);
+	}
+	out_bb.assign((size_t)buffer_pb_size, std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(
+		buffer_pb.data(), buffer_pb_size, out_bb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		1, &ts.ofdm.FIR_rx_time_sync);
+}
+
+// LEVER scorer: STREAM-ENERGY-COMBINED matched count. Mirrors the production
+// time_sync_mfsk_corr Phase-1 coarse scan + bin mapping EXACTLY, except the
+// per-symbol decision SUMS the two streams' per-tone energy BEFORE argmax
+// (optimal noncoherent equal-gain combining of the redundant per-stream tone,
+// mfsk.cc:518-522 places the SAME tone in both streams) instead of the
+// production AND-gate (streams_matched<nStreams → reject). Returns best matched
+// count over the coarse grid (no fine pass — relative cliff is what we measure).
+// Prior art: equal-gain noncoherent combining (Proakis 5e §14.4); Q65 multi-tone
+// energy sum (K1JT). +3 dB array gain for 2 equal branches in AWGN.
+static int p3_score_stream_combined(cl_ofdm& ofdm, int Nofdm, int Nfft, int Nc,
+                                    int interp, int start_shift,
+                                    const std::vector<std::complex<double> >& bb,
+                                    int preamble_n, const int* preamble_tones,
+                                    int M, int nStreams, const int* stream_offsets)
+{
+	int buffer_size = (int)bb.size();
+	int sym_period = Nofdm * interp;
+	if (sym_period <= 0) return 0;
+	int buffer_nsymb = buffer_size / sym_period;
+	if (buffer_nsymb < preamble_n) return 0;
+	int half = Nc / 2;
+	std::vector<std::complex<double> > dec((size_t)Nfft), fo((size_t)Nfft);
+	int best_matched = 0;
+	for (int s = 0; s <= buffer_nsymb - preamble_n; s++) {
+		int matched = 0;
+		for (int p = 0; p < preamble_n; p++) {
+			int off = (s + p) * sym_period + (Nofdm - Nfft) /*Ngi*/ * interp;
+			if (off + Nfft * interp > buffer_size) break;
+			for (int i = 0; i < Nfft; i++) dec[(size_t)i] = bb[(size_t)(off + i * interp)];
+			ofdm.fft(dec.data(), fo.data(), Nfft);
+			int exp_tone = preamble_tones[p % 16];
+			if (exp_tone < 0 || exp_tone >= M) continue;
+			// Combined per-tone energy across streams, then argmax over M tones.
+			double best_e = -1.0; int best_t = -1;
+			for (int t = 0; t < M; t++) {
+				double e = 0.0;
+				for (int st = 0; st < nStreams; st++) {
+					int sub = stream_offsets[st] + t;
+					int b = (sub < half) ? (Nfft - half + sub) : (start_shift + (sub - half));
+					e += fo[(size_t)b].real()*fo[(size_t)b].real() + fo[(size_t)b].imag()*fo[(size_t)b].imag();
+				}
+				if (e > best_e) { best_e = e; best_t = t; }
+			}
+			int mtone = (M - exp_tone) % M;  // mirror tone (carrier-image)
+			if (best_e > 0 && (best_t == exp_tone || best_t == mtone)) matched++;
+		}
+		if (matched > best_matched) best_matched = matched;
+	}
+	return best_matched;
+}
+
+static void p3_sweep_one_config(cl_telecom_system& ts, int config, const char* label)
+{
+	// Load ONCE (caller passes a persistent ts). Build the clean preamble
+	// passband ONCE; every trial reuses it + fresh AWGN (no per-trial reload).
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(config);
+	std::vector<double> clean_pb; int buf_pb = 0, sym_samples = 0; double p_sig = 0.0;
+	if (!p3_build_clean_passband(ts, clean_pb, buf_pb, sym_samples, p_sig)) {
+		printf("    [P3 %s] build_clean FAILED (config not MFSK?)\n", label);
+		return;
+	}
+	int prodT = ts.mfsk.preamble_match_threshold;
+	int Npre = ts.mfsk.preamble_nSymb;
+	int M = ts.mfsk.M;
+	int nStr = ts.mfsk.nStreams;
+	int interp = ts.data_container.interpolation_rate;
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int Nfft = ts.data_container.Nfft;
+	int start_shift = ts.ofdm.start_shift;
+	double fs = ts.sampling_frequency;
+	double sig_rms = std::sqrt(p_sig);
+
+	printf("    [P3 %s] M=%d nStreams=%d preamble_nSymb=%d prod_threshold=%d/%d p_sig=%.4g sig_rms=%.4g fs=%.0f\n",
+		label, M, nStr, Npre, prodT, Npre, p_sig, sig_rms, fs);
+
+	// σ grid = mult × sig_rms; mult range brackets the matched-count floor
+	// (HAIL §11 measured −13.25 for this 16-sym M=16 algo). Fine near the cliff.
+	const double mults[] = {
+		1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0,
+		7.5, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0
+	};
+	const int NS = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 200;                 // trials/σ
+	const int Ttest[] = {7, 6, 5, 4};   // production T then relaxed
+	const int NTT = (int)(sizeof(Ttest)/sizeof(Ttest[0]));
+
+	double cliff_snr[8]; for (int t = 0; t < NTT; t++) cliff_snr[t] = 999.0;
+	double cliff_sig[8]; for (int t = 0; t < NTT; t++) cliff_sig[t] = 0.0;
+	// LEVER: stream-energy-combined detector cliff (only meaningful at nStreams>=2).
+	double comb_cliff_snr[8]; for (int t = 0; t < NTT; t++) comb_cliff_snr[t] = 999.0;
+	double comb_cliff_sig[8]; for (int t = 0; t < NTT; t++) comb_cliff_sig[t] = 0.0;
+
+	printf("    (sigma/rms : SNR3k_dB : P_prod[T7 T6 T5 T4] mean_mc | P_streamComb[T7 T6 T5 T4] mean_mc)\n");
+	for (int si = 0; si < NS; si++) {
+		double sigma = mults[si] * sig_rms;
+		int hits[8]; memset(hits, 0, sizeof(hits));
+		int chits[8]; memset(chits, 0, sizeof(chits));
+		double matched_sum = 0.0, comb_sum = 0.0;
+		for (int it = 0; it < NT; it++) {
+			std::vector<std::complex<double> > bb;
+			std::mt19937 trng((uint32_t)(0xBEEF0000u + config*100000 + si*NT + it));
+			p3_noisy_baseband(ts, clean_pb, buf_pb, sigma, /*with_signal=*/true, trng, bb);
+			double metric = 0.0;
+			int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
+			int mc = (int)metric;          // returned matched count (== fine_best_matched)
+			matched_sum += mc;
+			for (int t = 0; t < NTT; t++) {
+				bool det = (Ttest[t] >= prodT) ? (delay >= 0) : (mc >= Ttest[t]);
+				if (det) hits[t]++;
+			}
+			// LEVER: stream-energy-combined scorer on the SAME noisy buffer.
+			int cmc = p3_score_stream_combined(ts.ofdm, Nofdm, Nfft, Nc, interp,
+				start_shift, bb, Npre, ts.mfsk.preamble_tones, M, nStr, ts.mfsk.stream_offsets);
+			comb_sum += cmc;
+			for (int t = 0; t < NTT; t++) if (cmc >= Ttest[t]) chits[t]++;
+		}
+		double snr = snr3k_db(p_sig, sigma, fs);
+		printf("      %5.1f : %7.2f : [%.2f %.2f %.2f %.2f] %.1f | [%.2f %.2f %.2f %.2f] %.1f\n",
+			mults[si], snr,
+			(double)hits[0]/NT, (double)hits[1]/NT, (double)hits[2]/NT, (double)hits[3]/NT, matched_sum/NT,
+			(double)chits[0]/NT, (double)chits[1]/NT, (double)chits[2]/NT, (double)chits[3]/NT, comb_sum/NT);
+		for (int t = 0; t < NTT; t++) {
+			double p = (double)hits[t]/NT;
+			if (p >= 0.5 && sigma > cliff_sig[t]) { cliff_sig[t] = sigma; cliff_snr[t] = snr; }
+			double pc = (double)chits[t]/NT;
+			if (pc >= 0.5 && sigma > comb_cliff_sig[t]) { comb_cliff_sig[t] = sigma; comb_cliff_snr[t] = snr; }
+		}
+	}
+
+	printf("    --- [P3 %s] DATA-FRAME DETECTOR cliffs (P=0.5, SNR3k dB; more negative = deeper) ---\n", label);
+	printf("    PRODUCTION (AND-gate, T=%d): %.2f dB | relax T=6: %.2f | T=5: %.2f | T=4: %.2f\n",
+		prodT, cliff_snr[0], cliff_snr[1], cliff_snr[2], cliff_snr[3]);
+	printf("    LEVER stream-energy-COMBINED (T=%d): %.2f dB | T=6: %.2f | T=5: %.2f | T=4: %.2f  (delta@T7 = %+.2f dB)\n",
+		prodT, comb_cliff_snr[0], comb_cliff_snr[1], comb_cliff_snr[2], comb_cliff_snr[3],
+		comb_cliff_snr[0] - cliff_snr[0]);
+
+	// FAR on pure noise per T (the cost of relaxing / combining). Mid σ.
+	const int FN = 4000;
+	int fa[8]; memset(fa, 0, sizeof(fa));
+	int cfa[8]; memset(cfa, 0, sizeof(cfa));
+	double sig_far = 8.0 * sig_rms;
+	for (int trial = 0; trial < FN; trial++) {
+		std::vector<std::complex<double> > bb;
+		std::mt19937 trng((uint32_t)(0xC0FFEE00u + config*100000 + trial));
+		p3_noisy_baseband(ts, clean_pb, buf_pb, sig_far, /*with_signal=*/false, trng, bb);
+		double metric = 0.0;
+		int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
+		int mc = (int)metric;
+		for (int t = 0; t < NTT; t++) {
+			bool det = (Ttest[t] >= prodT) ? (delay >= 0) : (mc >= Ttest[t]);
+			if (det) fa[t]++;
+		}
+		int cmc = p3_score_stream_combined(ts.ofdm, Nofdm, Nfft, Nc, interp,
+			start_shift, bb, Npre, ts.mfsk.preamble_tones, M, nStr, ts.mfsk.stream_offsets);
+		for (int t = 0; t < NTT; t++) if (cmc >= Ttest[t]) cfa[t]++;
+	}
+	printf("    FAR/poll PRODUCTION (pure noise, %d trials): T=%d: %.2e | T=6: %.2e | T=5: %.2e | T=4: %.2e\n",
+		FN, prodT, (double)fa[0]/FN, (double)fa[1]/FN, (double)fa[2]/FN, (double)fa[3]/FN);
+	printf("    FAR/poll stream-COMBINED         (%d trials): T=%d: %.2e | T=6: %.2e | T=5: %.2e | T=4: %.2e\n",
+		FN, prodT, (double)cfa[0]/FN, (double)cfa[1]/FN, (double)cfa[2]/FN, (double)cfa[3]/FN);
+}
+
+// MEASURE-only entry (env-gated). Prints the data-frame detector cliff for the
+// M=32×1 (ROBUST_0) and M=16×2 (ROBUST_2 = ROBUST_RA geometry) preambles.
+static void test_data_preamble_detector_cliff_sweep() {
+	const char* p3env = getenv("MERCURY_P3_SWEEP");
+	printf("=== [P3-GATE] MERCURY_P3_SWEEP=%s (sweep %s) ===\n",
+		p3env ? p3env : "(null)", p3env ? "RUNS" : "SKIPPED");
+	fflush(stdout);
+	if (!p3env) return;
+	printf("\n=== [P3] DATA-FRAME DETECTOR CLIFF SWEEP (make-or-break: cliff <= -11 dB SNR3k?) ===\n");
+	{ cl_telecom_system ts0; p3_sweep_one_config(ts0, ROBUST_0, "ROBUST_0 / M32x1 (existing data preamble)"); }
+	{ cl_telecom_system ts2; p3_sweep_one_config(ts2, ROBUST_2, "ROBUST_2 / M16x2 (ROBUST_RA -10-mode geometry)"); }
+	printf("=== [P3] END ===\n\n");
+}
+
+// =============================================================================
 // §7 Mini-Moose CFO refinement regression suite
 // (data-preamble-port-research.md §20, data-flow-freq_offset_measured.md §7)
 // =============================================================================
@@ -4930,6 +5211,11 @@ int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
 	printf("=== MFSK ctrl-suffix codec tests (Phase B Wave 1 + Wave 2 v2 + Wave 3) ===\n");
+
+	// §6.P3 WIN-campaign data-frame detector cliff sweep (MEASURE-only,
+	// env-gated MERCURY_P3_SWEEP=1). Registered FIRST so the make-or-break
+	// numbers print before the slow §10/§11 sweeps. No-op without the env var.
+	test_data_preamble_detector_cliff_sweep();
 
 	// §1 codec primitives
 	test_pack_unpack_callsign_body_b36();
