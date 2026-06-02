@@ -4719,87 +4719,152 @@ static int ultra_prod_far(int FT, double far_sigma_mult) {
 
 static void test_ultra_tier_establishment_cliff_sweep() {
 	const char* name = "ultra_tier_establishment_cliff_sweep";
-	printf("  [MEASURE] ULTRA TIER production-path establishment (§22 reframe, tier-gated):\n");
+	printf("  [MEASURE] ULTRA TIER production-path establishment ((c) baud-scaled reframe, tier-gated):\n");
 
 	double u0_fc=0, u0_ec=0, u2_fc=0, u2_ec=0;
 
 	// (a) production ULTRA path: load ULTRA_0/2 → tier gate activates count-admission.
-	printf("    --- ULTRA_0 (cfg 200, tier-gated COUNT admission, R_frame=2) → ~-17.8 ---\n");
-	ultra_prod_sweep("ULTRA_0", ULTRA_0, ULTRA_0, /*admit=*/-1, /*R_frame=*/2, &u0_fc, &u0_ec);
-	printf("    --- ULTRA_2 (cfg 202, tier-gated COUNT admission, R_frame=4) → ~-19.9 ---\n");
-	ultra_prod_sweep("ULTRA_2", ULTRA_2, ULTRA_2, /*admit=*/-1, /*R_frame=*/4, &u2_fc, &u2_ec);
+	// REFRAME: R_frame=1 (no establishment repetition); depth is from baud-scaling
+	// (ULTRA_0 K=8 Nfft=2048; ULTRA_2 K=2 Nfft=512). With R_frame=1 the modeled
+	// establishment cliff (P_est = 1−(1−Pf)^1 = Pf) equals the per-frame content cliff
+	// — there is NO repetition gain to model. The cliff DEPTH comes from the larger FFT
+	// window (the CONNECT ctrl-suffix rides ofdm.Nfft).
+	//
+	// MEASURED (this worktree, §5.4): the CONNECT-ESTABLISHMENT cliff is a DIFFERENT
+	// quantity from the data-PHY cliff (§5.3's -13/-16/-20/-22 PLOT_PASSBAND BER).
+	// Baud-scaling extends the establishment-decode reach ONLY at HIGH K:
+	//   ULTRA_0 (K=8): establishment cliff -21.60 dB  (≈ its data cliff — baud delivers)
+	//   ULTRA_2 (K=2): establishment cliff -11.80 dB  (≈ ROBUST_0; NO establishment gain
+	//                  — at K=2 the larger FFT does NOT deepen the 16-symbol base-pattern
+	//                  detector / GF16 suffix decode, only the data BER. A real reframe
+	//                  finding: the handshake reaches the ULTRA_0 floor but NOT a
+	//                  graduated K-ladder; ULTRA_1/2/3 establish ≈ ROBUST_0-class.)
+	printf("    --- ULTRA_0 (cfg 200, K=8 Nfft=2048, tier-gated COUNT admission, R_frame=1) → ~-21.6 ---\n");
+	ultra_prod_sweep("ULTRA_0", ULTRA_0, ULTRA_0, /*admit=*/-1, /*R_frame=*/1, &u0_fc, &u0_ec);
+	printf("    --- ULTRA_2 (cfg 202, K=2 Nfft=512, tier-gated COUNT admission, R_frame=1) → ~-11.8 (no est gain) ---\n");
+	ultra_prod_sweep("ULTRA_2", ULTRA_2, ULTRA_2, /*admit=*/-1, /*R_frame=*/1, &u2_fc, &u2_ec);
 
-	// FAR on the deep ULTRA_2 count-admission band — a TOKEN in-suite regression
-	// guard (would catch a broken count gate / a missing CRC+type backstop): 0
-	// false CONNECT accepts. NOISE BAND = sigma 26×rms (~-18 dB SNR3k), NOT the
-	// deepest -24 band: at -24 the count gate admits nearly EVERY noise trial to the
-	// costly 4× GF16 BP (50 iters, no early-converge on noise → seconds/trial), which
-	// made the in-suite loop pathologically slow; at -18 the 7/16 count gate rejects
-	// the vast majority of noise so the BP rarely fires → FAST, while still exercising
-	// the count-admission FAR path. The AUTHORITATIVE deepest-band FAR is §22.5
-	// (0/4000 at sigma 64×); a §23.4 in-suite run separately confirmed 0/300 at
-	// sigma 64× on this exact production tier path. (Mirrors the §20 test's
-	// sigma-14× FAR-in-suite pattern.)
+	// FAR on a deep ULTRA_2 count-admission band — a TOKEN in-suite regression guard
+	// (would catch a broken count gate / a missing CRC+type backstop): 0 false CONNECT
+	// accepts. NOISE BAND = sigma 26×rms (~-19.9 dB SNR3k), far BELOW the ULTRA_2
+	// establishment cliff so it is genuine sub-cliff noise. The 7/16 count gate rejects
+	// most noise → FAST, while still exercising the count-admission FAR path (the ratio
+	// gate is BYPASSED at the ULTRA tier; CRC12 + 2-bit type are the backstop). The
+	// AUTHORITATIVE deepest-band FAR is §22.5 (0/4000 at sigma 64× — that path is
+	// unchanged by the reframe: count gate + CRC, not the suffix-repetition).
 	const int FT = 400;
 	int far_u2 = ultra_prod_far(FT, 26.0);
 
 	printf("    ==================== ULTRA TIER PRODUCTION SUMMARY ====================\n");
-	printf("      ULTRA_0  content=%.2f  establish=%.2f  (target ~-17.8)\n", u0_fc, u0_ec);
-	printf("      ULTRA_2  content=%.2f  establish=%.2f  (target ~-20 / -19.9)  reaches -20? %s\n",
-		u2_fc, u2_ec, (u2_ec <= -19.0) ? "YES (within sim variance)" : "no");
-	printf("      FAR ULTRA_2 ~-18 band (count-admission, NO ratio gate): %d/%d  [deepest band 0/4000 = §22.5]\n", far_u2<0?0:far_u2, FT);
+	printf("      ULTRA_0 (K=8)  content=%.2f  establish=%.2f  (baud delivers deep est: target ~-21.6)  reaches -20? %s\n",
+		u0_fc, u0_ec, (u0_ec <= -20.0) ? "YES (within sim variance)" : "no");
+	printf("      ULTRA_2 (K=2)  content=%.2f  establish=%.2f  (no est gain; ≈ROBUST_0 ~-11.8)\n",
+		u2_fc, u2_ec);
+	printf("      FAR ULTRA_2 sub-cliff band (count-admission, NO ratio gate): %d/%d  [deepest band 0/4000 = §22.5]\n", far_u2<0?0:far_u2, FT);
 	printf("    =======================================================================\n");
 
-	// GATE (a): ULTRA_2 establishment reaches ~-20 (the headline). §22 measured
-	// -19.91; allow -19.0 for the coarser axis + sim variance. ULTRA_0 content must
-	// reach P=0.5 (establishment ~-17.8). FAIL-BEFORE: on a binary without
-	// suffix-combining + count-admission, the cliff stalls at ~-13.9 → this fails.
-	if (!(u0_fc < 1e8)) { test_fail(name, "ULTRA_0 content never reached P=0.5 (suffix combining / count-admission not active?)"); return; }
-	if (!(u2_ec <= -19.0)) {
-		char b[200]; snprintf(b,sizeof(b),
-			"ULTRA_2 establishment cliff %.2f dB did NOT reach -19.0 (target -19.9 §22) — production tier path not reframed?", u2_ec);
+	// GATE (a) — BAUD-SCALING delivers DEEP establishment at the high-K rung (the
+	// reframe's establishment headline). ULTRA_0 (K=8) must reach its DEEP ~-21.6 cliff
+	// (allow -20.0 for the coarse axis + sim variance) — proving the larger FFT window
+	// extends the CONNECT handshake reach, NOT just the data BER. With R_frame=1
+	// establishment == content (no repetition), so u0_ec == u0_fc. FAIL-BEFORE: if
+	// per-config Nfft regressed to K=1, ULTRA_0 would stall at the ROBUST_0-class ~-12
+	// cliff (no baud-scaling depth) → this fails. This is the meaningful guard that the
+	// deep establishment depth comes from the larger FFT window, not repetition.
+	if (!(u0_fc < 1e8)) { test_fail(name, "ULTRA_0 content never reached P=0.5 (count-admission / baud-scaling not active?)"); return; }
+	if (!(u2_fc < 1e8)) { test_fail(name, "ULTRA_2 content never reached P=0.5 (CONNECT establishment path not up?)"); return; }
+	if (!(u0_ec <= -20.0)) {
+		char b[240]; snprintf(b,sizeof(b),
+			"ULTRA_0 (K=8) establishment cliff %.2f dB did NOT reach -20.0 (measured -21.6) — the deepest "
+			"rung's K=8 Nfft=2048 baud-scaling did not deliver its establishment depth (per-config Nfft regressed?)", u0_ec);
+		test_fail(name, b); return;
+	}
+	// ULTRA_2 (K=2) establishment SANITY FLOOR: it must still reach a ROBUST_0-class
+	// cliff (P=0.5 around -11/-12). It does NOT gain establishment depth from K=2 (the
+	// measured -11.8 ≈ ROBUST_0 — see the note above), so this is a floor, NOT a deep
+	// claim. Asserting only the floor keeps the test TRUE (no overclaim of the data
+	// -16 on the handshake path) while still catching an establishment-path regression.
+	if (!(u2_ec <= -11.0)) {
+		char b[240]; snprintf(b,sizeof(b),
+			"ULTRA_2 (K=2) establishment cliff %.2f dB did not reach the ROBUST_0-class floor (~-11.8) "
+			"— the CONNECT establishment decode regressed at the shallow rung", u2_ec);
+		test_fail(name, b); return;
+	}
+	// Baud-scaling establishment MONOTONICITY at the extremes: ULTRA_0 (K=8) must reach
+	// STRICTLY deeper establishment than ULTRA_2 (K=2). Guards against a config swap /
+	// a flat (regressed-to-K=1) ladder. (-21.6 < -11.8, large margin.)
+	if (!(u0_ec < u2_ec)) {
+		char b[240]; snprintf(b,sizeof(b),
+			"ULTRA establishment ladder not monotone: ULTRA_0 (K=8) cliff %.2f dB is not deeper than "
+			"ULTRA_2 (K=2) %.2f dB — baud-scaling depth ordering broke", u0_ec, u2_ec);
 		test_fail(name, b); return;
 	}
 	// GATE (c): FAR clean on the ULTRA count-admission path.
 	if (far_u2 > 0) {
-		char b[200]; snprintf(b,sizeof(b), "ULTRA_2 count-admission FAR = %d/%d (count+CRC backstop broke at deep R)", far_u2, FT);
+		char b[200]; snprintf(b,sizeof(b), "ULTRA_2 count-admission FAR = %d/%d (count+CRC backstop broke)", far_u2, FT);
 		test_fail(name, b); return;
 	}
-	printf("    [ASSERT OK] ULTRA_2 establishment %.2f dB (reaches ~-20); ULTRA_0 content %.2f dB; FAR %d/%d on the count-admission path.\n",
-		u2_ec, u0_fc, far_u2<0?0:far_u2, FT);
+	printf("    [ASSERT OK] baud establishment: ULTRA_0 (K=8) %.2f dB (deep ~-21.6, baud delivers), ULTRA_2 (K=2) "
+		"%.2f dB (≈ROBUST_0 floor, no est gain), ladder monotone; FAR %d/%d on the count-admission path.\n",
+		u0_ec, u2_ec, far_u2<0?0:far_u2, FT);
 	test_pass(name);
 }
 
-// GATE (b) — the load-bearing no-leak / byte-identical safety: count-based
-// admission must be ULTRA-tier-ONLY. At ROBUST_0 (and every OFDM config) the
-// scale-invariant ratio gate MUST stay intact — i.e. a deep cell where the COUNT
-// gate (combining-aware, alive much deeper) WOULD admit but the RATIO gate would
-// NOT must FAIL to decode at ROBUST_0, yet SUCCEED at the ULTRA tier with the same
-// PHY params. This proves count-admission did not leak to the non-ULTRA tiers
-// (production gap #2). It also re-asserts the byte-identical decode-admission of
-// the merged §20 robust path (ROBUST_0 here uses the exact §20 stack).
+// GATE (b) — the load-bearing no-leak / tier-gating safety: count-based admission
+// must be ULTRA-tier-ONLY (production gap #2). The ratio gate MUST stay intact at
+// ROBUST_0 / every OFDM config. RECONCILED + REDESIGNED for the (c) reframe (see
+// §5.4): the INCR contract proved this via a decode-fraction Δ≥0.15, because the OLD
+// ULTRA used DEEP establishment-suffix REPETITION (R_suffix=12) that pushed its
+// content cliff ~6 dB past ROBUST_0's, so the ULTRA arm decoded where ROBUST was
+// dead. That repetition is RETIRED. MEASURED CONSEQUENCE (this worktree, §5.4):
+//   • count-ON vs count-OFF on a K=1 wire differ by only ~0.015 decode-fraction —
+//     the count gate is a WEAK relaxation (admits a few CRC-valid marginal decodes
+//     the metric-ratio sub-gate would block); it is NOT a multi-dB cliff move.
+//   • baud-scaling (K≥2) does NOT give the ULTRA arm a CONNECT-establishment edge
+//     either — at K=2 the ratio-gate-block point moves BELOW the content cliff, so
+//     count-admission is moot there, and the K=2 CONNECT decode is actually no
+//     better than K=1 in the decodable band.
+// So a "ULTRA decodes ≥ ROBUST + 0.15" assertion is no longer TRUE under the reframe;
+// forcing it green would be a rubber-stamp. Instead this test verifies the GATING
+// LOGIC directly, on IDENTICAL K=1 wires (so baud-scaling is held OUT and only the
+// admission tier varies — the cleanest isolation of production gap #2):
+//   (a) NO LEAK: ROBUST_0 with FOLLOW_TIER decodes EXACTLY as count=OFF (forced) —
+//       the ratio gate is intact at the non-ULTRA tier (count-admission did NOT leak).
+//       FAIL-BEFORE: a global (non-tier-gated) count flag would make this == count=ON.
+//   (b) TIER ACTIVATION: an ULTRA config (ULTRA_3, K=1 — same wire as ROBUST_0)
+//       with FOLLOW_TIER decodes EXACTLY as count=ON (forced) — the tier gate turns
+//       count-admission ON for ULTRA. FAIL-BEFORE: if the tier gate were dead this
+//       would == count=OFF.
+//   (c) RELAXATION + EXERCISED: count=ON ≥ count=OFF everywhere (the gate only ever
+//       ADMITS more — it removes the metric sub-gate, a strict superset), AND count=ON
+//       > count=OFF in aggregate over the band (the gate is genuinely exercised, not a
+//       vacuous equality — guards that the chosen band reaches the marginal region
+//       where the two gates differ, so (a)/(b) are meaningful not tautological).
 static void test_ultra_count_admission_tier_gated_no_leak() {
 	const char* name = "ultra_count_admission_tier_gated_no_leak";
 	printf("  [MEASURE] count-admission TIER-GATING (no leak to ROBUST/OFDM — production gap #2):\n");
 
-	// Build ONE deep-SNR passband with the ULTRA_2 PHY params (deep R_base/R_suffix/
-	// low rate). Decode it twice through the SAME bytes/noise: once with the RX
-	// session pinned to ULTRA_2 (count-admission ON via the tier gate), once pinned
-	// to ROBUST_0 (count-admission OFF — ratio gate intact). The ULTRA arm must
-	// decode materially MORE at the deep band than the ROBUST arm; at the deepest
-	// cells the ROBUST (ratio-gate) arm must drop to ~0 while ULTRA still decodes.
+	// Reframed ULTRA establishment params (repfact=3, K_info=13, R_base=R_suffix=
+	// R_frame=1 — combining OFF). ULTRA_3 and ROBUST_0 are BOTH K=1 (Nfft=256), so with
+	// these params their CONNECT wires are byte-identical — the ONLY difference between
+	// the arms is the RX admission tier (count vs ratio). That isolates the gate.
 	int repfact, K, R_base, R_suffix, R_frame;
-	cl_telecom_system::ultra_tier_suffix_params(ULTRA_2, repfact, K, R_base, R_suffix, R_frame);
+	cl_telecom_system::ultra_tier_suffix_params(ULTRA_3, repfact, K, R_base, R_suffix, R_frame);
 
-	auto build_and_sweep = [&](int load_cfg, double* out_decode_frac, int NSwant) {
+	// Sweep the K=1 CONNECT establishment decode at `load_cfg` with a given count-
+	// admission override across the marginal band where the ratio gate blocks but
+	// count+CRC can still admit. Returns the summed decode fraction (and per-cell
+	// counts via out_cells for the relaxation check). Deterministic seed → reproducible.
+	const double mults[] = { 11.0, 12.0, 13.0, 14.0, 15.0, 16.0 };  // SNR3k -11.8..-15.1
+	const int NM = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT = 24;
+	auto sweep = [&](int load_cfg, int override_v, double* out_frac, int* out_cells) -> int {
 		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(load_cfg);
 		cl_arq_controller arq;
-		// Apply the SAME ULTRA_2 deep PHY params on BOTH arms (the wire is identical;
-		// only the RX admission tier differs — that is the variable under test).
 		ts.set_suffix_fec(true, repfact); gf16ra::configure_k(repfact, K); gf16ra::init();
 		ts.set_connect_preamble_reps(R_base); ts.set_connect_suffix_reps(R_suffix);
-		cl_telecom_system_set_ultra_count_admission_override(-1);  // FOLLOW TIER (the test!)
-		const double fs = ts.sampling_frequency; const int Mdec = ts.data_container.interpolation_rate;
+		cl_telecom_system_set_ultra_count_admission_override(override_v);
+		const double fs = ts.sampling_frequency;
 		uint64_t pl_mask = ((1ULL << (gf16ra::msg_bits()-2)) - 1ULL);
 		uint64_t p38 = 0; pack_start_conn_payload(&p38, false, "KE7TST", 6); p38 &= pl_mask;
 		uint8_t by[5]; pack_ctrl_typed40_msb(by, (uint8_t)MFSK_CTRL_START_CONN, p38);
@@ -4808,20 +4873,14 @@ static void test_ultra_count_admission_tier_gated_no_leak() {
 		const int lead = 4096; const int total_pb = n_sig + 2*lead;
 		std::vector<double> clean((size_t)total_pb, 0.0);
 		int wr = ts.generate_ctrl_suffix_pattern_passband(clean.data()+lead, MFSK_CTRL_START_CONN, p38, crc12);
-		if (wr != n_sig) { ts.set_suffix_fec(false); gf16ra::configure(2); return -1; }
+		if (wr != n_sig) { cl_telecom_system_set_ultra_count_admission_override(-1); ts.set_suffix_fec(false); gf16ra::configure(2); return -1; }
 		double psum=0.0; for(int i=0;i<n_sig;i++){double v=clean[(size_t)(lead+i)];psum+=v*v;}
 		double sig_rms = std::sqrt(psum/n_sig);
-		// Deep band: sigma mults bracketing ~-16..-22 (where the ratio gate is dead
-		// but the combining-aware count still admits). Sum decode fraction across it.
-		const double mults[] = { 22.0, 28.0, 34.0, 42.0 };
-		const int NS = NSwant < (int)(sizeof(mults)/sizeof(mults[0])) ? NSwant : (int)(sizeof(mults)/sizeof(mults[0]));
-		const int NT = 20;
 		std::vector<double> work((size_t)total_pb, 0.0);
-		int total_dec = 0, total_tr = 0;
-		printf("      [%s] (sigma/rms : SNR3k : P_decode)\n", is_ultra_config(load_cfg)?"ULTRA_2 RX":"ROBUST_0 RX");
-		for (int si=0; si<NS; si++) {
+		int total_dec = 0;
+		for (int si=0; si<NM; si++) {
 			double sigma = mults[si]*sig_rms;
-			std::mt19937 rng(0x0BEEF000u ^ (uint32_t)si);   // SAME seed both arms
+			std::mt19937 rng(0x0BEEF000u ^ (uint32_t)si);   // SAME seed across arms
 			std::normal_distribution<double> nd(0.0, sigma);
 			int dec=0;
 			for (int t=0;t<NT;t++) {
@@ -4830,59 +4889,100 @@ static void test_ultra_count_admission_tier_gated_no_leak() {
 				if (ts.decode_ctrl_suffix_from_passband(work.data(), total_pb, &rt,&rp,&rc,&rmm, prod_crc12_cb, &arq)
 				    && rt==MFSK_CTRL_START_CONN && rp==p38) dec++;
 			}
-			printf("        %6.1f : %7.2f : %.2f\n", mults[si], snr3k_db(psum/n_sig, sigma, fs), (double)dec/NT);
-			total_dec += dec; total_tr += NT;
+			if (out_cells) out_cells[si] = dec;
+			total_dec += dec;
 		}
-		*out_decode_frac = (double)total_dec / total_tr;
+		*out_frac = (double)total_dec / (NM*NT);
+		cl_telecom_system_set_ultra_count_admission_override(-1);
 		ts.set_connect_suffix_reps(1); ts.set_connect_preamble_reps(1);
 		ts.set_suffix_fec(false); gf16ra::configure(2);
 		return 0;
 	};
 
-	double ultra_frac = -1, robust_frac = -1;
-	if (build_and_sweep(ULTRA_2,  &ultra_frac, 3) != 0) { test_fail(name, "ULTRA_2 arm gen failed (buffer ceiling)"); return; }
-	if (build_and_sweep(ROBUST_0, &robust_frac, 3) != 0) { test_fail(name, "ROBUST_0 arm gen failed (buffer ceiling)"); return; }
+	double f_count_on=-1, f_count_off=-1, f_robust_follow=-1, f_ultra_follow=-1;
+	int cells_on[16]={0}, cells_off[16]={0};
+	if (sweep(ROBUST_0, 1,  &f_count_on,      cells_on ) != 0) { test_fail(name, "ROBUST_0 count=ON gen failed");  return; }
+	if (sweep(ROBUST_0, 0,  &f_count_off,     cells_off) != 0) { test_fail(name, "ROBUST_0 count=OFF gen failed"); return; }
+	if (sweep(ROBUST_0, -1, &f_robust_follow, nullptr  ) != 0) { test_fail(name, "ROBUST_0 FOLLOW_TIER gen failed"); return; }
+	if (sweep(ULTRA_3,  -1, &f_ultra_follow,  nullptr  ) != 0) { test_fail(name, "ULTRA_3 FOLLOW_TIER gen failed");  return; }
 
-	printf("    ULTRA_2-RX decode fraction (count-admission, tier-gated ON) = %.3f\n", ultra_frac);
-	printf("    ROBUST_0-RX decode fraction (ratio gate INTACT — no leak)   = %.3f\n", robust_frac);
+	printf("    K=1 CONNECT establishment (NM=%d cells, NT=%d): count=ON %.3f | count=OFF %.3f | "
+		"ROBUST_0 FOLLOW %.3f | ULTRA_3 FOLLOW %.3f\n",
+		NM, NT, f_count_on, f_count_off, f_robust_follow, f_ultra_follow);
 
-	// GATE (b): the ULTRA arm decodes materially more at the deep band (count
-	// admits), and the ROBUST arm is gated DOWN by the intact ratio gate. The wire
-	// is identical; only the RX tier differs. If count-admission leaked to ROBUST_0
-	// the two fractions would be EQUAL → this FAILS (fail-before on the spike's
-	// global-flag design). Require ULTRA >= ROBUST + 0.15 AND ROBUST materially
-	// suppressed (the ratio gate doing its job at the deep band).
-	if (!(ultra_frac >= robust_frac + 0.15)) {
-		char b[256]; snprintf(b,sizeof(b),
-			"count-admission NOT tier-gated: ULTRA_2 decode %.3f vs ROBUST_0 %.3f (Δ%.3f < 0.15) — "
-			"the ratio gate is NOT intact at ROBUST_0 (count-admission leaked?)",
-			ultra_frac, robust_frac, ultra_frac - robust_frac);
+	// (a) NO LEAK: ROBUST_0 (non-ULTRA) FOLLOW_TIER == count=OFF (ratio gate intact).
+	if (f_robust_follow != f_count_off) {
+		char b[240]; snprintf(b,sizeof(b),
+			"count-admission LEAKED to ROBUST_0: FOLLOW_TIER decode %.3f != count=OFF %.3f — the "
+			"ratio gate is NOT intact at the non-ULTRA tier (count gate is not tier-gated)",
+			f_robust_follow, f_count_off);
 		test_fail(name, b); return;
 	}
-	printf("    [ASSERT OK] count-admission is ULTRA-tier-ONLY: ULTRA_2 decodes %.3f vs ROBUST_0 %.3f at the deep band "
-		"(ratio gate intact at ROBUST_0 → no leak, production gap #2). Same wire, RX-tier-gated admission.\n",
-		ultra_frac, robust_frac);
+	// (b) TIER ACTIVATION: ULTRA_3 (K=1, same wire) FOLLOW_TIER == count=ON.
+	if (f_ultra_follow != f_count_on) {
+		char b[240]; snprintf(b,sizeof(b),
+			"ULTRA tier did NOT activate count-admission: ULTRA_3 FOLLOW_TIER decode %.3f != count=ON %.3f — "
+			"is_ultra_config gate not wired to the decode-admission path", f_ultra_follow, f_count_on);
+		test_fail(name, b); return;
+	}
+	// (c) RELAXATION (per-cell superset: count=ON admits ≥ count=OFF everywhere)…
+	for (int si=0; si<NM; si++) {
+		if (cells_on[si] < cells_off[si]) {
+			char b[200]; snprintf(b,sizeof(b),
+				"count gate NOT a relaxation at cell %d: count=ON %d < count=OFF %d decodes — the count "
+				"gate must only ADMIT more (it removes the metric sub-gate)", si, cells_on[si], cells_off[si]);
+			test_fail(name, b); return;
+		}
+	}
+	// …and EXERCISED: count=ON decodes strictly more in aggregate (the band reaches the
+	// marginal region where the gates differ → (a)/(b) are meaningful, not tautological).
+	if (!(f_count_on > f_count_off)) {
+		char b[220]; snprintf(b,sizeof(b),
+			"count gate not exercised: count=ON %.3f == count=OFF %.3f over the band — the SNR band did "
+			"NOT reach the marginal region where the metric sub-gate blocks (no-leak/activation vacuous)",
+			f_count_on, f_count_off);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] count-admission is tier-gated (no leak): ROBUST_0 FOLLOW==count=OFF (%.3f, ratio gate "
+		"intact), ULTRA_3 FOLLOW==count=ON (%.3f, tier activates); gate is a relaxation, exercised (ON %.3f > OFF %.3f). "
+		"production gap #2 — count-admission is ULTRA-tier-ONLY.\n",
+		f_robust_follow, f_ultra_follow, f_count_on, f_count_off);
 	test_pass(name);
 }
 
 // =============================================================================
-// ULTRA INCR-2 — THE GATE FOR THIS INCREMENT: Lever-D CONNECT choreography
-// (ultra-tier-design.md §10.4). The §9 HW finding was that the ULTRA_2 CONNECT
-// frame (~16 s, R_base+R_suffix combining) is LONGER than the data-frame-sized RSP
-// listen window (2*message_transmission_time_ms+3000 ≈ 13.5 s), so the responder
-// timed out ~3 s BEFORE the frame finished — the −20 PHY was never even tested.
+// ULTRA CONNECT choreography — RECONCILED to the (c) BAUD-SCALED REFRAME
+// (per-config-nfft-ultra-rungs.md §3.3). The INCR-1/2 contract this test was
+// built on (R_frame=2/3/4 whole-CONNECT-frame REPETITION, R_suffix=12 combining)
+// is RETIRED: ULTRA depth now comes from baud-scaling (Nfft=256*K), so every rung
+// uses the SAME single low-rate code (repfact=3, K_info=13) with combining OFF
+// (R_base=R_suffix=R_frame=1, ultra_tier_suffix_params). The CONNECT ctrl-suffix
+// rides the SAME Nfft FFT window as the data, so ONE CONNECT frame's airtime grows
+// EXACTLY K× with the baud multiplier (the depth mechanism) — NOT via repetition.
 //
 // This test drives the PRODUCTION shared helpers (cl_arq_controller::
 // connect_listen_window_ms + cl_telecom_system::ultra_tier_suffix_params) — the
 // SAME functions production calls (arq_responder.cc / send_mfsk_ctrl_suffix_phy_core)
-// — so the test cannot drift from production. Asserts:
-//   (a) for ULTRA_0/1/2, the computed RSP window ≥ R_frame × the REAL CONNECT-frame
-//       airtime (no premature timeout); AND the PRE-fix window (2*mtt+3000) would
-//       have been < the airtime (fail-before evidence the deficit was real).
-//   (b) the CMD send-count = R_frame at ULTRA (2/3/4) via ultra_tier_suffix_params,
-//       and the TX-core rep predicate (ULTRA && START_CONN) = R_frame, else 1.
+// — so the test cannot drift from production. Reframed asserts (each a meaningful
+// regression guard — see §5.4 for the stale-contract root cause):
+//   (a) the REFRAME contract itself: ultra_tier_suffix_params returns R_frame=1 for
+//       EVERY ULTRA rung (fails if establishment REPETITION is restored), and the
+//       TX-core rep predicate yields 1 for BOTH START_CONN and ACK (one frame, no
+//       repeat). The CMD send-count is therefore 1, not R_frame.
+//   (b) the BAUD-SCALING depth mechanism: the single-CONNECT-frame airtime grows
+//       EXACTLY K× across the rungs (ULTRA_0 K=8 ≈ 8× ULTRA_3 K=1; ULTRA_2 K=2 ≈ 2×)
+//       — fails if per-config Nfft regresses (the depth would collapse to K=1). AND
+//       the shared window helper is tier-aware: connect_listen_window_ms(true,
+//       airtime, 1, mtt) == airtime + (2*mtt+3000), i.e. it ADDS exactly the one
+//       baud-scaled CONNECT-frame airtime on top of the non-ULTRA window, so the RSP
+//       listen window covers one whole (now K×-longer) CONNECT frame.
 //   (c) non-ULTRA (ROBUST_0 + an OFDM config) window == EXACTLY 2*mtt+3000
 //       (byte-identical, the load-bearing safety) and ultra_tier_suffix_params=false.
+// NOTE: the INCR-era fail-before (pre-fix window < airtime, the ~16 s repeated
+// frame > 13.5 s data-window deficit) is GONE under the reframe — with R_frame=1
+// AND a baud-scaled DATA frame (mtt grows K× too), the data-frame window
+// (2*mtt+3000) is far LARGER than one CONNECT frame, so the floor's job is now to
+// ADD the CONNECT-frame airtime (tier-awareness), not to rescue a repetition deficit.
 static void test_ultra_connect_choreography() {
 	const char* name = "ultra_connect_choreography";
 
@@ -4906,10 +5006,15 @@ static void test_ultra_connect_choreography() {
 			/ ts.sampling_frequency);
 	};
 
-	// ---- (a)+(b): the three ULTRA submodes ----
-	struct { int cfg; int expect_Rframe; const char* label; } ultra[] = {
-		{ ULTRA_0, 2, "ULTRA_0" }, { ULTRA_1, 3, "ULTRA_1" }, { ULTRA_2, 4, "ULTRA_2" }
+	// ---- (a)+(b): the four ULTRA rungs, reframed (R_frame=1, depth = baud K) ----
+	// expect_K = the per-config baud multiplier (Nfft=256*K); airtime must scale K×.
+	// ULTRA_3 (K=1) is FIRST so its airtime baseline is set BEFORE the deeper rungs'
+	// K-scaling check runs (otherwise that check would be skipped for ULTRA_0/1/2).
+	struct { int cfg; int expect_K; const char* label; } ultra[] = {
+		{ ULTRA_3, 1, "ULTRA_3" }, { ULTRA_2, 2, "ULTRA_2" },
+		{ ULTRA_1, 4, "ULTRA_1" }, { ULTRA_0, 8, "ULTRA_0" }
 	};
+	int airtime_k1 = -1;   // the K=1 (ULTRA_3) airtime baseline for the K-scaling check
 	for (auto& u : ultra) {
 		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(u.cfg);
 		int N = ultra_apply_tier_params(ts, u.cfg);
@@ -4921,55 +5026,72 @@ static void test_ultra_connect_choreography() {
 		int rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe = -1;
 		bool is_u = cl_telecom_system::ultra_tier_suffix_params(
 			u.cfg, rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe);
+		int baud_k  = cl_telecom_system::ultra_baud_mult(u.cfg);
 		int airtime = frame_airtime_ms(ts);
 		int mtt     = real_mtt_ms(ts);
-		int prefix_window = 2 * mtt + 3000;   // the pre-INCR-2 expression
+		int base_window = 2 * mtt + 3000;   // the non-ULTRA window (pre-fix expression)
 		int window  = cl_arq_controller::connect_listen_window_ms(
 			is_u, airtime, rf_Rframe, mtt);
 
 		ts.set_suffix_fec(false); gf16ra::configure(2); gf16ra::init();  // restore global state
 
-		// (b) send-count = R_frame.
-		if (!is_u || rf_Rframe != u.expect_Rframe) {
+		// (a) THE REFRAME: R_frame=1 for every ULTRA rung (no establishment repetition).
+		if (!is_u || rf_Rframe != 1) {
 			char b[160]; snprintf(b, sizeof(b),
-				"%s: R_frame=%d (is_ultra=%d), expected %d",
-				u.label, rf_Rframe, (int)is_u, u.expect_Rframe);
+				"%s: R_frame=%d (is_ultra=%d), expected 1 (baud-scaled reframe — "
+				"establishment repetition is RETIRED)", u.label, rf_Rframe, (int)is_u);
 			test_fail(name, b); return;
 		}
-		// TX-core rep predicate: ULTRA && START_CONN → R_frame; ULTRA && ACK → 1.
+		// (a) TX-core rep predicate: with R_frame=1, START_CONN AND ACK both play ONCE.
 		int reps_start = (true /*START_CONN*/ && is_ultra_config(u.cfg)) ? rf_Rframe : 1;
 		int reps_ack   = (false /*not START_CONN*/ && is_ultra_config(u.cfg)) ? rf_Rframe : 1;
-		if (reps_start != u.expect_Rframe || reps_ack != 1) {
+		if (reps_start != 1 || reps_ack != 1) {
 			char b[160]; snprintf(b, sizeof(b),
-				"%s: TX rep predicate start=%d (want %d) ack=%d (want 1)",
-				u.label, reps_start, u.expect_Rframe, reps_ack);
+				"%s: TX rep predicate start=%d ack=%d (both must be 1 under the reframe)",
+				u.label, reps_start, reps_ack);
 			test_fail(name, b); return;
 		}
-		// Sanity: the frame really is the long ULTRA CONNECT frame.
+		// Sanity: a real CONNECT frame exists.
 		if (airtime <= 0) { test_fail(name, "ULTRA CONNECT airtime computed as 0"); return; }
 
-		// (a) fail-before: the OLD window must be SHORTER than one frame (the §9.3
-		// deficit). If this ever stops holding the deficit is gone for another reason
-		// and the test should be revisited.
-		if (prefix_window >= airtime) {
-			char b[200]; snprintf(b, sizeof(b),
-				"%s: pre-fix window %d ms >= frame airtime %d ms — the §9.3 deficit "
-				"the fix targets is not present (fail-before broke)",
-				u.label, prefix_window, airtime);
+		// (b) BAUD-SCALING is the depth mechanism: ultra_baud_mult matches the rung,
+		// AND the single-CONNECT-frame airtime grows EXACTLY K× (the CONNECT ctrl-
+		// suffix rides the Nfft FFT window). FAIL-BEFORE: if per-config Nfft regresses
+		// to K=1, airtime would NOT scale → depth collapses. ULTRA_3 (K=1) sets the
+		// baseline; the deeper rungs must be exactly K× it (±1 ms ceil rounding).
+		if (baud_k != u.expect_K) {
+			char b[160]; snprintf(b, sizeof(b),
+				"%s: ultra_baud_mult=%d, expected K=%d (the rung's Nfft multiplier)",
+				u.label, baud_k, u.expect_K);
 			test_fail(name, b); return;
 		}
-		// (a) pass-after: the NEW window must cover ALL R_frame whole frames.
-		if (window < rf_Rframe * airtime) {
-			char b[220]; snprintf(b, sizeof(b),
-				"%s: window %d ms < R_frame(%d) × airtime(%d) = %d ms — RSP would still "
-				"time out before the repeated frames finish",
-				u.label, window, rf_Rframe, airtime, rf_Rframe * airtime);
+		if (u.cfg == ULTRA_3) airtime_k1 = airtime;
+		if (airtime_k1 > 0) {
+			int expect_airtime = airtime_k1 * u.expect_K;
+			if (abs(airtime - expect_airtime) > u.expect_K + 1) {  // ceil() slack per K
+				char b[220]; snprintf(b, sizeof(b),
+					"%s: CONNECT-frame airtime %d ms != K(%d)×%d ms = %d ms — baud-scaling "
+					"did NOT lengthen the CONNECT symbol (per-config Nfft regressed?)",
+					u.label, airtime, u.expect_K, airtime_k1, expect_airtime);
+				test_fail(name, b); return;
+			}
+		}
+		// (b) the shared window helper is tier-aware: it ADDS exactly one baud-scaled
+		// CONNECT-frame airtime (R_frame=1) on top of the non-ULTRA base window, so the
+		// RSP listens through one whole (K×-longer) CONNECT frame. FAIL-BEFORE: a
+		// non-tier-aware helper would return base_window (== the non-ULTRA value) and
+		// the RSP would not cover the longer ULTRA CONNECT frame.
+		if (window != airtime + base_window) {
+			char b[240]; snprintf(b, sizeof(b),
+				"%s: window %d ms != airtime(%d)+base_window(%d)=%d ms — the tier-aware "
+				"connect_listen_window_ms is NOT adding the baud-scaled CONNECT-frame airtime",
+				u.label, window, airtime, base_window, airtime + base_window);
 			test_fail(name, b); return;
 		}
-		printf("    [%s] frame=%d ms mtt=%d ms R_frame=%d | pre-fix window=%d ms (< 1 frame, DEFICIT) "
-			"-> fixed window=%d ms (>= %d×frame=%d ms)\n",
-			u.label, airtime, mtt, rf_Rframe, prefix_window, window,
-			rf_Rframe, rf_Rframe * airtime);
+		if (window < airtime) { test_fail(name, "ULTRA window shorter than one CONNECT frame"); return; }
+		printf("    [%s] K=%d frame=%d ms (== %d×%d K=1 baseline) mtt=%d ms R_frame=1 | "
+			"window=%d ms == airtime+base_window (%d+%d) >= 1 frame\n",
+			u.label, baud_k, airtime, u.expect_K, airtime_k1, mtt, window, airtime, base_window);
 	}
 
 	// ---- (c): non-ULTRA window byte-identical + R_frame=1 ----
@@ -5006,35 +5128,38 @@ static void test_ultra_connect_choreography() {
 }
 
 // =============================================================================
-// ULTRA INCR-4 (Lever D, ultra-tier-design.md §11/§12) — THE GATE for the
-// COMPREHENSIVE establishment-timer fix. The §11 HW re-test found a THIRD timer
-// bug: after §10 scaled the RSP listen window, the CMD's per-attempt abort timer
-// (connection_timeout, arq_common.cc:1454) STILL FIRES DURING the CMD's own
-// blocking R_frame×ULTRA-CONNECT-frame TX (~65.5 s for ULTRA_2) because it was
-// left on the DATA-frame formula (~26 s). The §5 mandate: fix the ENTIRE
-// establishment timer set in ONE pass. This test asserts the fix's guarantee for
-// every deep-mode establishment timer that is floored to the SHARED
-// connect_listen_window_ms() helper (the SAME function production uses in
-// load_configuration / process_messages_rx_acks_control — no test/production
-// drift, §13.5):
+// ULTRA establishment-timer floors — RECONCILED to the (c) BAUD-SCALED REFRAME
+// (per-config-nfft-ultra-rungs.md §3.3 / §4.7). The INCR-4 fix floored the CMD-side
+// establishment timers to the SHARED connect_listen_window_ms() helper so no timer
+// aborts before the deep ULTRA CONNECT frame completes. That MECHANISM is KEPT; only
+// the per-rung NUMBERS change, because the reframe sets R_frame=1 (no establishment
+// repetition) and makes the CONNECT frame K×-longer via baud-scaling (Nfft=256*K)
+// rather than via R_frame×R_suffix repetition. The same helper still floors:
 //
-//   BINDER #1 connection_timeout       floored to connect_listen_window_ms(R_frame)
-//   BINDER #2 ack_timeout_control      floored to connect_listen_window_ms(1)
-//   BINDER #3 CMD receiving_timeout    floored to connect_listen_window_ms(1)
-//             (for the long ULTRA TEST_CONNECTION_ACK leg)
-//             link_timeout             floored to connect_listen_window_ms(R_frame)
+//   connection_timeout  floored to connect_listen_window_ms(true,airtime,R_frame,mtt)
+//   link_timeout        floored to the same (robustness/symmetry; STOPPED during CONNECT)
+//   ack_timeout_control floored to connect_listen_window_ms(true,airtime,1,mtt)
+//   CMD receiving_timeout (the long ULTRA TEST_CONNECTION_ACK leg) — same one-frame floor
 //
-// Asserts, for ULTRA_0/1/2:
-//   (a) connection_timeout / link_timeout floor = connect_listen_window_ms(true,
-//       airtime, R_frame, mtt) ≥ R_frame × airtime — the CMD cannot abort during
-//       its own R_frame START_CONN TX (the §11.2 mid-TX abort is gone). AND the
-//       PRE-fix data-frame connection_timeout (the exact :1454 min_ct formula,
-//       cited) is < R_frame × airtime — fail-before evidence the §11.2 deficit was
-//       real (~26 s vs ~65.5 s).
-//   (b) ack_timeout_control / CMD receiving_timeout floor = connect_listen_window_ms
-//       (true, airtime, 1, mtt) ≥ airtime — the CMD waits long enough for ONE whole
-//       ULTRA-ACK / TEST_CONNECTION_ACK frame. AND the pre-fix data-frame
-//       ack_timeout_control (the :1420 formula, cited) is < airtime — fail-before.
+// With R_frame=1 the connection_timeout and ack_timeout floors COINCIDE (both =
+// airtime + 2*mtt+3000). Reframed asserts, for ULTRA_0/1/2/3 (each a meaningful
+// regression guard — see §5.4 for the stale-contract root cause):
+//   (a) R_frame=1 for every ULTRA rung (the defining reframe; fails if repetition
+//       returns). The connection_timeout/link_timeout floor =
+//       connect_listen_window_ms(true,airtime,1,mtt) == airtime + (2*mtt+3000), i.e.
+//       it ADDS exactly one baud-scaled CONNECT-frame airtime, and is ≥ airtime so the
+//       per-attempt connection_attempt_timer cannot abort during the CMD's one-frame
+//       START_CONN TX.
+//   (b) the ack_timeout_control / CMD receiving_timeout floor =
+//       connect_listen_window_ms(true,airtime,1,mtt) ≥ airtime — the CMD waits ≥ one
+//       whole ULTRA-ACK / TEST_CONNECTION_ACK frame. REFRAMED BINDER: this floor is
+//       STRICTLY GREATER than the pre-fix data-frame ack_timeout_control (the :1420
+//       formula) at EVERY ULTRA rung — i.e. the tier-aware floor genuinely raises the
+//       ACK-wait timeout to add the baud-scaled CONNECT-frame airtime (the data-frame
+//       default adds only the short ack-tone time). (The INCR-era fail-before
+//       "pre-fix ack_timeout < airtime" is GONE: the DATA frame's own mtt grows K× too
+//       and now dwarfs one CONNECT frame, so the deficit is no longer a missed-ACK
+//       risk — the floor's job is to ADD the CONNECT-frame airtime, asserted here.)
 //   (c) non-ULTRA (ROBUST_0 + an OFDM config): connect_listen_window_ms(false,..)
 //       == EXACTLY 2*mtt+3000 and the is_ultra guard skips ALL floors → the
 //       establishment timers are byte-identical to pre-fix (the load-bearing safety
@@ -5075,16 +5200,18 @@ static void test_ultra_establishment_timers() {
 	const int PTT_ON = 100, PTT_OFF = 200;   // datalink_config.cc:60-61
 	const int CTRL_BATCH = 1;                // robust tier (arq_common.cc:1333-1338)
 
-	struct { int cfg; int expect_Rframe; const char* label; } ultra[] = {
-		{ ULTRA_0, 2, "ULTRA_0" }, { ULTRA_1, 3, "ULTRA_1" }, { ULTRA_2, 4, "ULTRA_2" }
+	struct { int cfg; int expect_K; const char* label; } ultra[] = {
+		{ ULTRA_0, 8, "ULTRA_0" }, { ULTRA_1, 4, "ULTRA_1" },
+		{ ULTRA_2, 2, "ULTRA_2" }, { ULTRA_3, 1, "ULTRA_3" }
 	};
-	// Binder #2 (ack_timeout_control) presence tracker. The deficit's MAGNITUDE grows
-	// with the ULTRA submode: ULTRA_0's ACK frame (~14.9 s) is ≈ the pre-fix
-	// ack_timeout_control (~15.2 s) so it is NOT a binder at ULTRA_0 (margin ~+0.3 s);
-	// it IS a binder at ULTRA_1/ULTRA_2 (ACK frame 15.7/17.3 s > 15.2 s). We REQUIRE the
-	// deepest tier (ULTRA_2 — the §11-measured case) to exhibit the deficit, proving
-	// binder #2 is real; the fix floors all three safely (a harmless +margin at ULTRA_0).
-	bool ultra2_ackto_deficit_seen = false;
+	// REFRAMED BINDER (ack_timeout_control): under the reframe the genuinely-binding
+	// floor is the ACK-wait leg. The tier-aware ack floor (airtime + 2*mtt + 3000)
+	// must be STRICTLY GREATER than the pre-fix data-frame ack_timeout_control at
+	// EVERY rung — i.e. it adds the baud-scaled CONNECT-frame airtime that the
+	// data-frame default (which adds only the short ack-tone time) does not. We
+	// REQUIRE this at every rung (the reframed mechanism is uniform — no submode-
+	// specific margin like the INCR-era repetition created).
+	int rungs_with_binding_ack_floor = 0;
 	for (auto& u : ultra) {
 		cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(u.cfg);
 		int N = ultra_apply_tier_params(ts, u.cfg);
@@ -5096,79 +5223,89 @@ static void test_ultra_establishment_timers() {
 		int rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe = -1;
 		bool is_u = cl_telecom_system::ultra_tier_suffix_params(
 			u.cfg, rf_rep, rf_K, rf_Rb, rf_Rs, rf_Rframe);
+		int baud_k  = cl_telecom_system::ultra_baud_mult(u.cfg);
 		int airtime = frame_airtime_ms(ts);
 		int mtt     = real_mtt_ms(ts);
 		int ack_pat = ack_pattern_ms(ts);
 
 		ts.set_suffix_fec(false); gf16ra::configure(2); gf16ra::init();  // restore global state
 
-		if (!is_u || rf_Rframe != u.expect_Rframe) {
+		// (a) THE REFRAME: R_frame=1 for every ULTRA rung (no establishment repetition).
+		if (!is_u || rf_Rframe != 1) {
 			char b[160]; snprintf(b, sizeof(b),
-				"%s: R_frame=%d (is_ultra=%d), expected %d",
-				u.label, rf_Rframe, (int)is_u, u.expect_Rframe);
+				"%s: R_frame=%d (is_ultra=%d), expected 1 (baud-scaled reframe)",
+				u.label, rf_Rframe, (int)is_u);
+			test_fail(name, b); return;
+		}
+		if (baud_k != u.expect_K) {
+			char b[160]; snprintf(b, sizeof(b),
+				"%s: ultra_baud_mult=%d, expected K=%d", u.label, baud_k, u.expect_K);
 			test_fail(name, b); return;
 		}
 		if (airtime <= 0) { test_fail(name, "ULTRA CONNECT airtime computed as 0"); return; }
 
 		// --- The fix's flooring quantities (the SAME calls production makes) ---
-		// connection_timeout & link_timeout floor (BINDER #1 / link): R_frame frames.
+		// connection_timeout & link_timeout floor: R_frame(=1) frames + turnaround.
 		int ct_floor  = cl_arq_controller::connect_listen_window_ms(true, airtime, rf_Rframe, mtt);
-		// ack_timeout_control & CMD receiving_timeout floor (BINDER #2/#3): 1 ACK frame.
+		// ack_timeout_control & CMD receiving_timeout floor: 1 ACK frame + turnaround.
 		int ack_floor = cl_arq_controller::connect_listen_window_ms(true, airtime, 1, mtt);
+		int base_window = 2 * mtt + 3000;
 
-		// --- (a) connection_timeout: pass-after ≥ R_frame×airtime (no mid-TX abort) ---
-		int cmd_tx_airtime = rf_Rframe * airtime;   // the CMD's blocking START_CONN TX
-		if (ct_floor < cmd_tx_airtime) {
-			char b[220]; snprintf(b, sizeof(b),
-				"%s: connection_timeout floor %d ms < R_frame(%d)×frame(%d)=%d ms — the "
-				"connection_attempt_timer would STILL fire during the CMD's own TX (§11.2)",
-				u.label, ct_floor, rf_Rframe, airtime, cmd_tx_airtime);
-			test_fail(name, b); return;
-		}
-		// (a) fail-before: the PRE-fix data-frame connection_timeout, EXACTLY the
-		//   arq_common.cc:1454 formula on the MFSK ctrl path (ack_time = ack_pattern_ms):
-		//   min_ct = 2*(control_batch_size*mtt + ack_pat) + 4*ptt_on + 4*ptt_off + 5000.
-		int prefix_ct = 2 * (CTRL_BATCH * mtt + ack_pat) + 4 * PTT_ON + 4 * PTT_OFF + 5000;
-		if (prefix_ct >= cmd_tx_airtime) {
+		// --- (a) connection_timeout/link_timeout: floor == airtime + base_window, and
+		//     ≥ airtime so the connection_attempt_timer cannot abort during the CMD's
+		//     one-frame START_CONN TX. With R_frame=1, ct_floor coincides with ack_floor.
+		if (ct_floor != airtime + base_window) {
 			char b[240]; snprintf(b, sizeof(b),
-				"%s: pre-fix connection_timeout %d ms >= CMD TX %d ms — the §11.2 mid-TX-"
-				"abort deficit is not present (fail-before broke)",
-				u.label, prefix_ct, cmd_tx_airtime);
+				"%s: connection_timeout floor %d ms != airtime(%d)+base_window(%d)=%d ms — "
+				"the tier-aware floor is NOT adding one baud-scaled CONNECT-frame airtime",
+				u.label, ct_floor, airtime, base_window, airtime + base_window);
+			test_fail(name, b); return;
+		}
+		if (ct_floor < airtime) {
+			char b[200]; snprintf(b, sizeof(b),
+				"%s: connection_timeout floor %d ms < one CONNECT frame %d ms — the "
+				"connection_attempt_timer could fire during the CMD's own START_CONN TX",
+				u.label, ct_floor, airtime);
 			test_fail(name, b); return;
 		}
 
-		// --- (b) ack_timeout_control & CMD receiving_timeout: pass-after ≥ 1 frame ---
+		// --- (b) ack_timeout_control & CMD receiving_timeout: floor ≥ one whole frame ---
 		if (ack_floor < airtime) {
 			char b[200]; snprintf(b, sizeof(b),
 				"%s: ack/recv floor %d ms < one ULTRA-ACK frame %d ms — the CMD would abort "
-				"the wait before the TEST_CONNECTION_ACK arrived (§11.4(b) binder #2/#3)",
-				u.label, ack_floor, airtime);
+				"the wait before the TEST_CONNECTION_ACK arrived", u.label, ack_floor, airtime);
 			test_fail(name, b); return;
 		}
-		// (b) fail-before (per-submode): pre-fix data-frame ack_timeout_control, EXACTLY
-		//   arq_common.cc:1420: (control_batch_size+1)*mtt + ack_pat + 2*ptt_on
-		//   + 2*ptt_off + 3000. For the DEEP submodes the ACK FRAME alone (15.7/17.3 s)
-		//   exceeds this (~15.2 s) → binder. ULTRA_0 (14.9 s) is just UNDER it → not a
-		//   binder there (the fix's floor is a harmless +margin). We don't assert the
-		//   deficit for every submode (it genuinely isn't one at ULTRA_0); we REQUIRE it
-		//   at ULTRA_2 below (the §11-measured worst case) to prove binder #2 is real.
+		// (b) REFRAMED BINDER: the tier-aware ack floor is STRICTLY GREATER than the
+		//   pre-fix data-frame ack_timeout_control (arq_common.cc:1420):
+		//   (control_batch+1)*mtt + ack_pat + 2*ptt_on + 2*ptt_off + 3000. The floor adds
+		//   the full CONNECT-frame airtime where the default adds only the short ack-tone
+		//   time (ack_pat) → ack_floor − prefix_ackto = airtime − ack_pat − 600 > 0 (the
+		//   CONNECT frame is many symbols; ack_pat is the 16-symbol tone; 600 = the PTT
+		//   delta between base_window and the :1420 formula). REQUIRED at every
+		//   rung: proves the floor genuinely raises the ACK-wait timeout (the reframed
+		//   load-bearing role). FAIL-BEFORE: if the floor stopped adding the CONNECT-frame
+		//   airtime (e.g. dropped tier-awareness), this would not hold.
 		int prefix_ackto = (CTRL_BATCH + 1) * mtt + ack_pat + 2 * PTT_ON + 2 * PTT_OFF + 3000;
-		bool ackto_deficit = (prefix_ackto < airtime);
-		if (u.cfg == ULTRA_2) ultra2_ackto_deficit_seen = ackto_deficit;
+		bool ack_floor_binds = (ack_floor > prefix_ackto);
+		if (ack_floor_binds) rungs_with_binding_ack_floor++;
 
-		printf("    [%s] frame=%d ms mtt=%d ms ack_pat=%d ms R_frame=%d | conn_to floor=%d ms "
-			"(>= CMD TX %d ms; pre-fix=%d, DEFICIT) | ack/recv floor=%d ms (>= 1 frame %d ms; "
-			"pre-fix ackto=%d, binder#2=%s)\n",
-			u.label, airtime, mtt, ack_pat, rf_Rframe, ct_floor, cmd_tx_airtime, prefix_ct,
-			ack_floor, airtime, prefix_ackto, ackto_deficit ? "yes" : "no(margin)");
+		printf("    [%s] K=%d frame=%d ms mtt=%d ms ack_pat=%d ms R_frame=1 | conn_to floor=%d ms "
+			"(== airtime+base_window; >= 1 frame) | ack/recv floor=%d ms (>= 1 frame %d ms; "
+			"pre-fix ackto=%d, floor adds CONNECT airtime=%s)\n",
+			u.label, baud_k, airtime, mtt, ack_pat, ct_floor,
+			ack_floor, airtime, prefix_ackto, ack_floor_binds ? "yes" : "NO");
 	}
-	// Binder #2 must be REAL at the deepest tier (the §11 HW case): the pre-fix
-	// ack_timeout_control is shorter than one ULTRA_2 ACK frame. If this ever stops
-	// holding, the ACK-leg deficit is gone for another reason — revisit the fix.
-	if (!ultra2_ackto_deficit_seen) {
-		test_fail(name, "ULTRA_2: pre-fix ack_timeout_control already covers one ACK frame "
-			"— binder #2 (the §11.4(b) TEST_CONNECTION_ACK-leg deficit) fail-before broke");
-		return;
+	// The reframed ACK-wait floor must genuinely BIND (exceed the data-frame default)
+	// at EVERY ULTRA rung — the tier-aware floor adds the baud-scaled CONNECT-frame
+	// airtime uniformly. If this stops holding, the floor lost its tier-awareness
+	// (or baud-scaling regressed) — revisit the fix.
+	if (rungs_with_binding_ack_floor != (int)(sizeof(ultra)/sizeof(ultra[0]))) {
+		char b[200]; snprintf(b, sizeof(b),
+			"ack_timeout_control floor binds at only %d/%d ULTRA rungs — the tier-aware "
+			"floor is not uniformly adding the CONNECT-frame airtime (reframed binder broke)",
+			rungs_with_binding_ack_floor, (int)(sizeof(ultra)/sizeof(ultra[0])));
+		test_fail(name, b); return;
 	}
 
 	// ---- (c) non-ULTRA: ALL establishment-timer floors guarded out (byte-identical) ----

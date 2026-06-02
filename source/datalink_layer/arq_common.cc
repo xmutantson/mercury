@@ -1543,19 +1543,22 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 				printf("[CFG] MERCURY_CONNECT_REPS override = %d (test)\n", reps_env_force); fflush(stdout); }
 			reps_env_cached = 1;
 		}
-		// ULTRA tier (tier2-suffix-fec-design.md §22): when the session is pinned to
-		// an ULTRA config (200-202; -s 200/201/202 this increment), apply the deep
-		// per-tier CONNECT ctrl-suffix params (low-rate GF(16) RA + fewer info
-		// symbols + base-combining + SUFFIX-energy combining) instead of the robust
-		// defaults. Count-based admission auto-activates at the decode gate (it reads
-		// is_ultra_config(current_configuration) — production gap #2, tier-gated, NOT
-		// a global, so OFDM/ROBUST keep the scale-invariant ratio gate intact). The
-		// ULTRA per-tier params are authoritative here (the MERCURY_SUFFIX_FEC /
-		// MERCURY_CONNECT_REPS env overrides apply only to the non-ULTRA robust branch
-		// below). Order matters: set_suffix_fec configures (repfact,K=13); configure_k
-		// re-sets the true (repfact,K); then the base/suffix rep hooks re-derive
-		// ctrl_suffix_pattern_passband_samples from the CURRENT coded N (R_base then
-		// R_suffix last = the correct final passband-sample member).
+		// ULTRA tier (per-config-nfft-ultra-rungs.md §3.3): when the session is pinned
+		// to an ULTRA config (200-203; -s 200..203 this increment), apply the per-rung
+		// CONNECT ctrl-suffix establishment params. BAUD-SCALED REFRAME — ULTRA depth
+		// now comes from baud-scaling (per-config Nfft), so ultra_tier_suffix_params
+		// returns the SAME single low-rate code the robust tier ships (repfact=3,
+		// K_info=13) with combining OFF (R_base=R_suffix=R_frame=1). The escalating
+		// INCR-1/2 suffix repetition is RETIRED (frontier §1/§2). Net effect: ULTRA's
+		// establishment path = ROBUST_0's enhanced CONNECT minus base-combining (R=1
+		// not 4), and baud-scaling deepens it via the larger Nfft FFT window. Count-
+		// based admission still auto-activates at the decode gate (reads
+		// is_ultra_config(current_configuration) — tier-gated, NOT a global, so
+		// OFDM/ROBUST keep the scale-invariant ratio gate intact), giving the deep
+		// establishment its acquisition reach. configure_k(3,13) == configure(3) (the
+		// robust path) since GF16RA_K=13. R_suffix last = the correct final passband-
+		// sample member; ctrl_suffix_tx_time_ms (below) then grows K* with the longer
+		// symbol so the INCR-4 timer floor scales correctly even at R_frame=1.
 		int u_repfact, u_K, u_Rbase, u_Rsuffix, u_Rframe;
 		if (cl_telecom_system::ultra_tier_suffix_params(configuration,
 		                                                u_repfact, u_K, u_Rbase, u_Rsuffix, u_Rframe))

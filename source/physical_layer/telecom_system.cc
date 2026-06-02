@@ -3739,23 +3739,56 @@ int cl_telecom_system::set_connect_suffix_reps(int reps)
 	return ack_mfsk.ctrl_suffix_total_nsymb();
 }
 
-// ULTRA tier per-tier CONNECT ctrl-suffix params (the §22.4 stacked table). SOLE
-// owner of the ULTRA PHY numbers. Returns false for non-ULTRA configs (out params
-// untouched) so the robust/OFDM tiers can never inherit ULTRA's deep settings.
+// ULTRA tier per-rung CONNECT ctrl-suffix establishment params. SOLE owner of the
+// ULTRA establishment PHY numbers. Returns false for non-ULTRA configs (out params
+// untouched) so the robust/OFDM tiers can never inherit ULTRA's settings.
+//
+// BAUD-SCALED REFRAME (per-config-nfft-ultra-rungs.md §3.3): the ULTRA tier now
+// gets its depth from BAUD-SCALING (per-config Nfft, see ultra_baud_mult), NOT
+// from establishment-suffix repetition. Baud-scaling deepens BOTH the data PHY
+// cliff AND the CONNECT establishment (same Nfft FFT window), so the aggressive
+// INCR-1/2 suffix repetition (R_base=8, R_suffix=8-12, R_frame=2-4 + escalating
+// low-rate GF16) is RETIRED (frontier §1/§2: repetition on an already-coded PHY
+// is the inefficient anomaly; the added reps measured "sub-one-WGN-cell" on HW,
+// ultra §20.9). Every rung now uses the SAME single low-rate code the production
+// ROBUST tier ships (repfact=3, K_info=13 — the §19/§20 enhanced CONNECT) with
+// combining OFF (R_base=R_suffix=R_frame=1). R_frame=1 makes the CMD frame-rep
+// loop a no-op, but the INCR-4 establishment-timer floor STILL fires (gated on
+// is_ultra_config + ctrl_suffix_tx_time_ms>0) and floors connection_timeout to
+// 1*ctrl_suffix_tx_time_ms + base_window — correct, because the SINGLE CONNECT
+// frame is K* longer than a data frame at the deep rungs (the exact bug INCR-4
+// fixed). The PER-RUNG depth is set by ultra_baud_mult(config) (the Nfft K), the
+// SOLE owner of the baud mapping. (repfact/K_info refinement, esp. the K=8 cap,
+// is the P1 follow-on.)
 bool cl_telecom_system::ultra_tier_suffix_params(int config, int& repfact, int& K,
                                                  int& R_base, int& R_suffix, int& R_frame)
 {
-	// §22.4 measured/interpolated stacked configs (per-frame content + base-combine
-	// co-limit): ULTRA_0 establishment ~−17.8, ULTRA_2 ~−19.9 dB SNR3k (sim, AWGN).
-	// R_frame = whole-CONNECT-frame repetition (Lever D, §2.5/§4.1): the CMD emits
-	// START_CONN R_frame× back-to-back per HAIL cycle; the RSP window covers all
-	// reps (INCR-2 choreography fix for the §9 HW timeout). ULTRA_0=2 / 1=3 / 2=4.
+	if (!is_ultra_config(config))
+		return false;
+	// Single low-rate code (ROBUST-tier §19/§20 enhanced CONNECT), combining OFF.
+	// Same for every rung — the depth differentiator is the baud multiplier (Nfft).
+	repfact  = 3;   // GF16 RA replicas/info-symbol (rate ~1/4) — the ROBUST default
+	K        = 13;  // K_info total GF16 info symbols incl 3 CRC — the ROBUST default
+	R_base   = 1;   // base-pattern combining OFF (baud-scaling replaces it)
+	R_suffix = 1;   // suffix-energy combining OFF (baud-scaling replaces it)
+	R_frame  = 1;   // whole-CONNECT-frame repetition OFF (single longer frame)
+	return true;
+}
+
+// ULTRA tier per-rung BAUD multiplier K (Nfft = 256*K). SOLE owner of the ULTRA
+// baud mapping (per-config-nfft-ultra-rungs.md §3.2, validated by the fading gate
+// for K in {1,2,4,8}). ULTRA_0=deepest=K=8 … ULTRA_3=shallowest=K=1. Returns 1 for
+// any non-ULTRA config (→ Nfft=256, byte-identical). K is clamped to a validated
+// power of two by construction (the switch only emits {8,4,2,1}).
+int cl_telecom_system::ultra_baud_mult(int config)
+{
 	switch (config)
 	{
-		case ULTRA_0: repfact = 6; K = 8; R_base = 8; R_suffix = 8;  R_frame = 2; return true;
-		case ULTRA_1: repfact = 7; K = 6; R_base = 8; R_suffix = 10; R_frame = 3; return true; // interpolated
-		case ULTRA_2: repfact = 8; K = 5; R_base = 8; R_suffix = 12; R_frame = 4; return true;
-		default: return false;
+		case ULTRA_0: return 8;   // Nfft=2048, ~-21 dB poor-fading (aggressive cap)
+		case ULTRA_1: return 4;   // Nfft=1024, ~-19/-20 dB (SAFE deepest)
+		case ULTRA_2: return 2;   // Nfft=512,  ~-16 dB
+		case ULTRA_3: return 1;   // Nfft=256,  ~-13 dB (bridges ROBUST_0)
+		default:      return 1;   // non-ULTRA → no scaling (byte-identical)
 	}
 }
 
@@ -5719,15 +5752,26 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.gi=default_configurations_telecom_system.ofdm_gi;
 	ofdm.Nsymb=default_configurations_telecom_system.ofdm_Nsymb;
 
-	// === P0 BAUD-SCALING SPIKE (SIM ONLY, env-gated) =======================
-	// baud-scaling-spike.md §3: a genuine 2x/4x LONGER coherent MFSK symbol is
-	// produced by enlarging the per-symbol FFT window (the symbol = exactly one
-	// Nfft FFT window, §1). Scale ofdm.Nfft by MERCURY_BAUD_MULT (K=1/2/4) for
-	// MFSK/robust configs only. Ngi=Nfft*gi, Nofdm, all buffers, the cached FFT
-	// plan, and the tone grid (M tones on Nc bins) follow automatically. Tone
-	// spacing narrows to 12000/(K*256) Hz, symbol period grows K*. Default (env
-	// unset) => K=1 => byte-identical to production for EVERY config.
-	baud_mult = 1;
+	// === PER-CONFIG Nfft (BAUD-SCALING, P3a) ================================
+	// per-config-nfft-ultra-rungs.md §3/§4: a genuine K* LONGER coherent MFSK
+	// symbol is produced by enlarging the per-symbol FFT window (the MFSK symbol =
+	// exactly one Nfft FFT window, baud-scaling-spike.md §1). This is the PRODUCTION
+	// per-config form of the P0 spike's global MERCURY_BAUD_MULT flag: each ULTRA
+	// config carries its baud multiplier K via ultra_baud_mult() (8/4/2/1 for
+	// ULTRA_0/1/2/3); every NON-ULTRA config (OFDM 0-16, ROBUST 100-102) gets K=1
+	// → ofdm.Nfft stays the default 256 → BYTE-IDENTICAL to monitor (the
+	// load-bearing safety gate, §4.4 INV-6). When K>1, ofdm.Nfft = 256*K and
+	// EVERYTHING downstream follows automatically (Ngi=Nfft*gi, Nofdm, all
+	// data_container buffers, the cached FFT plan, the bandwidth=48000*Nc/Nfft/interp
+	// → FST4 "narrow the signal", the tone grid on the fixed Nc bins) — see the §4
+	// audit. K is a fading-gate-validated power of two by construction.
+	baud_mult = ultra_baud_mult(configuration);
+
+	// SIM measurement instrument (UNCHANGED from the P0/fading spikes): the
+	// MERCURY_BAUD_MULT env var still forces K on ROBUST configs ONLY, so the
+	// ROBUST_0 cliff sweeps (the validation harness) can be re-run without defining
+	// throwaway configs. It does NOT touch ULTRA (those use their per-config K) and
+	// no production path sets it. Default unset → no effect.
 	if(is_robust_config(configuration))
 	{
 		const char* bm = getenv("MERCURY_BAUD_MULT");
@@ -5736,16 +5780,26 @@ void cl_telecom_system::load_configuration(int configuration)
 			int k = atoi(bm);
 			if(k == 2 || k == 4 || k == 8) baud_mult = k;
 		}
-		if(baud_mult > 1)
-		{
-			ofdm.Nfft = default_configurations_telecom_system.ofdm_Nfft * baud_mult;
-			printf("[BAUD-SPIKE] MERCURY_BAUD_MULT=%d -> Nfft %d->%d (symbol %dx longer, "
-			       "tone spacing %.2f Hz)\n",
-			       baud_mult, default_configurations_telecom_system.ofdm_Nfft, ofdm.Nfft,
-			       baud_mult,
-			       48000.0/frequency_interpolation_rate/(double)ofdm.Nfft);
-			fflush(stdout);
-		}
+	}
+
+	if(baud_mult > 1)
+	{
+		ofdm.Nfft = default_configurations_telecom_system.ofdm_Nfft * baud_mult;
+		// Banner reads the DEFAULT interp rate + the resolved Nc. At this point
+		// ofdm.Nc is still AUTO_SELLECT (resolved to 50 WB / 10 NB inside init()),
+		// and frequency_interpolation_rate is assigned later (:~5876), so use the
+		// authoritative defaults here (avoids the spike's cosmetic "inf Hz" and a
+		// bogus negative BW from the AUTO_SELLECT sentinel). init() prints the real
+		// Nc/Nofdm afterward.
+		int interp_for_banner = default_configurations_telecom_system.frequency_interpolation_rate;
+		int nc_for_banner = narrowband_enabled ? 10 : 50;
+		printf("[BAUD] config=%d K=%d -> Nfft %d->%d (symbol %dx longer, "
+		       "tone spacing %.2f Hz, occupied BW ~%.0f Hz)\n",
+		       configuration, baud_mult,
+		       default_configurations_telecom_system.ofdm_Nfft, ofdm.Nfft, baud_mult,
+		       48000.0/(double)interp_for_banner/(double)ofdm.Nfft,
+		       48000.0*(double)nc_for_banner/(double)ofdm.Nfft/(double)interp_for_banner);
+		fflush(stdout);
 	}
 	// =======================================================================
 
@@ -5802,8 +5856,10 @@ void cl_telecom_system::load_configuration(int configuration)
 	ldpc.nIteration_max=default_configurations_telecom_system.ldpc_nIteration_max;
 	// Q3: ROBUST tier (rate-1/16 LDPC) needs more SPA iterations to converge at
 	// the waterfall. OFDM configs are above the cliff and 100 iter is plenty.
-	// See mfsk-vara-parity-plan.md §2.1 Q3.
-	if(is_robust_config(configuration))
+	// See mfsk-vara-parity-plan.md §2.1 Q3. ULTRA configs use the SAME rate-1/16
+	// LDPC at an EVEN DEEPER waterfall (baud-scaling), so they need the 200-iter
+	// budget too (per-config-nfft-ultra-rungs.md §4.7 — a ROBUST_0-class consumer).
+	if(is_robust_config(configuration) || is_ultra_config(configuration))
 		ldpc.nIteration_max = 200;
 	ldpc.print_nIteration=default_configurations_telecom_system.ldpc_print_nIteration;
 
@@ -5866,7 +5922,11 @@ void cl_telecom_system::load_configuration(int configuration)
 		if(M == MOD_MFSK)
 		{
 			int mfsk_M, mfsk_nStreams;
-			if(current_configuration == ROBUST_0) {
+			// ULTRA configs reuse the ROBUST_0 single-stream MFSK DATA PHY (M=32 WB /
+			// M=8 NB) — depth comes from baud-scaling (Nfft), not a different modcod.
+			// Must match the new_mfsk_M selection above (telecom_system.cc:5654) and
+			// the post-init re-init below — all three authorities agree for ULTRA.
+			if(current_configuration == ROBUST_0 || is_ultra_config(current_configuration)) {
 				mfsk_M = narrowband_enabled ? 8 : 32;
 				mfsk_nStreams = 1;
 			} else {
@@ -5914,7 +5974,9 @@ void cl_telecom_system::load_configuration(int configuration)
 	if(M == MOD_MFSK)
 	{
 		int mfsk_M, mfsk_nStreams;
-		if(current_configuration == ROBUST_0) {
+		// ULTRA reuses the ROBUST_0 single-stream MFSK DATA PHY (M=32 WB / M=8 NB) —
+		// keep all M/nStreams selection sites in lockstep (see :5654, :5919).
+		if(current_configuration == ROBUST_0 || is_ultra_config(current_configuration)) {
 			mfsk_M = narrowband_enabled ? 8 : 32;
 			mfsk_nStreams = 1;
 		} else {
@@ -6219,7 +6281,9 @@ void cl_telecom_system::load_configuration(int configuration)
 		//   ROBUST_1 (rate 1/16, 16-MFSK×2): 1400 bits, waterfall -11 dB
 		//   ROBUST_2 (rate 1/4): no puncturing (rate 1/4 can't tolerate it)
 		int bps = mfsk.bits_per_symbol();
-		if(current_configuration == ROBUST_0)
+		// ULTRA configs use the ROBUST_0 M=32 PHY, so the same punctured ctrl-frame
+		// size applies (baud-scaling changes Nfft, not bits_per_symbol / nBits).
+		if(current_configuration == ROBUST_0 || is_ultra_config(current_configuration))
 		{
 			ctrl_nBits = 1200;
 			ctrl_nsymb = ctrl_nBits / bps;  // 240
@@ -6287,9 +6351,10 @@ void cl_telecom_system::load_configuration(int configuration)
 
 	// Per-mode detection threshold (all using ack_mfsk: M=16, nStreams=1):
 	// ROBUST_0 (-13 dB): low SNR, need conservative threshold
+	// ULTRA (-13..-21 dB): even deeper than ROBUST_0 → same conservative 0.65
 	// ROBUST_1/2 (-11/-8 dB): moderate SNR, standard threshold
 	// OFDM (0 to +20 dB): high SNR, easy detection
-	if(current_configuration == ROBUST_0)
+	if(current_configuration == ROBUST_0 || is_ultra_config(current_configuration))
 		ack_pattern_detection_threshold = 0.65;
 	else if(is_robust_config(current_configuration))
 		ack_pattern_detection_threshold = 1.0;

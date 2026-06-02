@@ -95,22 +95,39 @@ extern int g_verbose;
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
 
 // ULTRA (deep-SNR "survival") configurations - values 200+ (ULTRA tier, the
-// road DOWN from ROBUST is more noncoherent, ultra-tier-design.md §4.1). The
-// ULTRA tier reuses the ROBUST_0-class MFSK data PHY (M=32 WB / M=8 NB, single
-// stream) but pushes the CONNECT ctrl-suffix establishment FAR deeper via the
-// reframe levers (count-based admission + low-rate GF(16) RA + suffix-energy
-// combining), validated in sim to ~-20 dB SNR3k (tier2-suffix-fec-design.md §22).
-// The per-tier suffix params (R_base, R_suffix, K, repfact) are applied by the
-// ULTRA enable hook (arq_common.cc); see cl_telecom_system::ultra_tier_suffix_params.
-// SELECTABLE this increment via -s 200/201/202 (pin); full gearshift entry +
-// sticky-hysteresis is a later increment. NO CAP_ULTRA / no negotiation (the
-// enhanced suffix is backward-compatible by construction, §21.6 / §22).
-#define NUMBER_OF_ULTRA_CONFIGS 3
-#define ULTRA_0 200   // R_base=8 R_suffix=8  K=8 repfact=6 -> establishment ~-17.8 dB SNR3k
-#define ULTRA_1 201   // R_base=8 R_suffix=10 K=6 repfact=7 -> establishment ~-18.x dB (interpolated)
-#define ULTRA_2 202   // R_base=8 R_suffix=12 K=5 repfact=8 R_frame=4 -> establishment ~-19.9 dB
+// road DOWN from ROBUST is more noncoherent). The ULTRA tier reuses the
+// ROBUST_0-class MFSK data PHY (M=32 WB / M=8 NB, single stream, LDPC 1/16) but
+// reaches deeper via BAUD-SCALING: each rung carries a baud multiplier K that
+// scales Nfft (= 256*K) → a K* longer coherent MFSK symbol (the FST4/Q65
+// time-bandwidth lever, +~3 dB/2x, NO noncoherent-combining loss). This REPLACES
+// the INCR-1/2 establishment-suffix REPETITION (frontier §1/§2: repetition on an
+// already-coded PHY is the inefficient anomaly). Depth = Nfft; the establishment
+// path stays the single low-rate code the ROBUST tier ships (repfact=3/K_info=13),
+// combining OFF (R_base=R_suffix=R_frame=1). Baud-scaling deepens BOTH the data
+// PHY cliff AND the CONNECT establishment (same Nfft FFT window).
+//
+// K-mapping (baud-fading-spike.md §5, validated K in {1,2,4,8}; ULTRA_0=deepest
+// per the 0=deepest convention):
+//   ULTRA_0 200  K=8  Nfft=2048  ~-21 dB SNR3k (poor fading)  aggressive cap
+//   ULTRA_1 201  K=4  Nfft=1024  ~-19/-20 dB                  SAFE deepest workhorse
+//   ULTRA_2 202  K=2  Nfft=512   ~-16 dB
+//   ULTRA_3 203  K=1  Nfft=256   ~-13 dB                      bridges ROBUST_0 (-13/-14)
+//   ULTRA_4 204  K=16 Nfft=4096  (RESERVED, not built — unvalidated past the K=8
+//                                 coherence/coding-saturation wall; P1 follow-on)
+// SELECTABLE this increment via -s 200/201/202/203 (pin); gearshift entry +
+// sticky-hysteresis is a later increment (P3c). NO CAP_ULTRA / no negotiation
+// (backward-compatible by construction). The per-rung params (K, repfact, K_info,
+// R_base, R_suffix, R_frame) live in cl_telecom_system::ultra_tier_suffix_params
+// (the sole owner of the ULTRA PHY numbers). See fact-documents/
+// per-config-nfft-ultra-rungs.md for the full design + the §5 Nfft audit.
+#define NUMBER_OF_ULTRA_CONFIGS 4
+#define ULTRA_0 200   // K=8 (Nfft=2048) -> data+establishment cliff ~-21 dB SNR3k (poor fading)
+#define ULTRA_1 201   // K=4 (Nfft=1024) -> ~-19/-20 dB (SAFE deepest; fading-favorable)
+#define ULTRA_2 202   // K=2 (Nfft=512)  -> ~-16 dB
+#define ULTRA_3 203   // K=1 (Nfft=256)  -> ~-13 dB (bridges ROBUST_0)
+#define ULTRA_4 204   // K=16 RESERVED (not built this increment)
 
-inline bool is_ultra_config(int config) { return config >= 200 && config <= 202; }
+inline bool is_ultra_config(int config) { return config >= 200 && config <= 203; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor

@@ -264,22 +264,26 @@ public:
 	// Returns the on-wire suffix symbol count (ctrl_suffix_total_nsymb()).
 	int  set_connect_suffix_reps(int reps);
 
-	// ULTRA tier (tier2-suffix-fec-design.md §22 / ultra-tier-design.md §4.1): the
-	// per-tier CONNECT ctrl-suffix establishment parameters. Returns the (repfact,
-	// K, R_base, R_suffix, R_frame) for ULTRA_0/1/2 (the §22.4 stacked table).
-	// repfact = GF16 RA replicas/info-symbol (lower rate); K = total GF16 info
-	// symbols incl 3 CRC (fewer info bits = deeper, lever C); R_base = base-pattern
-	// combining reps; R_suffix = suffix-energy combining reps (the §22 Change-2
-	// content lever); R_frame = whole-CONNECT-frame repetition count (ultra-tier-
-	// design.md §2.5/§4.1 Lever D — the CMD emits START_CONN R_frame× back-to-back
-	// per HAIL cycle and the RSP listen window covers all reps; INCR-2 choreography
-	// fix). These are applied by the ULTRA enable hook (arq_common.cc) when the
-	// session is at an ULTRA config. Returns true and fills the out params for an
-	// ULTRA config; returns false (leaves out params untouched) for any non-ULTRA
-	// config — the SOLE entry point that knows the ULTRA PHY numbers, so non-ULTRA
-	// tiers cannot accidentally inherit them.
+	// ULTRA tier (per-config-nfft-ultra-rungs.md §3.3): the per-rung CONNECT
+	// ctrl-suffix ESTABLISHMENT parameters. BAUD-SCALED REFRAME — the ULTRA depth
+	// now comes from baud-scaling (per-config Nfft, see ultra_baud_mult), so the
+	// INCR-1/2 establishment-suffix repetition is RETIRED: every rung uses the SAME
+	// single low-rate code the ROBUST tier ships (repfact=3, K_info=13) with
+	// combining OFF (R_base=R_suffix=R_frame=1). R_frame=1 → the CMD frame-rep loop
+	// no-ops, but the INCR-4 timer floor still fires (gated on is_ultra_config +
+	// ctrl_suffix_tx_time_ms>0, which grows K* with the longer symbol). Applied by
+	// the ULTRA enable hook (arq_common.cc). Returns true + fills the out params for
+	// an ULTRA config; false (out params untouched) for non-ULTRA — the SOLE owner
+	// of the ULTRA establishment numbers, so non-ULTRA tiers can never inherit them.
 	static bool ultra_tier_suffix_params(int config, int& repfact, int& K,
 	                                     int& R_base, int& R_suffix, int& R_frame);
+
+	// ULTRA tier per-rung BAUD multiplier K (Nfft = 256*K). SOLE owner of the ULTRA
+	// baud mapping (per-config-nfft-ultra-rungs.md §3.2, fading-gate-validated for
+	// K in {1,2,4,8}): ULTRA_0=deepest=K=8 … ULTRA_3=shallowest=K=1. Returns 1 for
+	// any non-ULTRA config (Nfft=256, byte-identical). Read in load_configuration to
+	// scale ofdm.Nfft per-config (the productionized P0 baud-scaling lever).
+	static int ultra_baud_mult(int config);
 
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,
