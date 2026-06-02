@@ -3609,6 +3609,223 @@ static void test_gf16_ra_cliff_sweep() {
 	test_pass(name);  // infra ran; dB verdict is in the log
 }
 
+// =============================================================================
+// §20 — P0 GATE (robust-ra-data-p0): DOES THE GF(16)-RA CODEC TRANSFER FROM THE
+// K=13 CONTROL SUFFIX TO A DATA-LENGTH BLOCK AND HOLD A CLIFF <= -10 dB SNR3k?
+// (fact-documents/robust-ra-data-code-p0.md)
+//
+// This is the make-or-break for the -10-rate WIN. The K=13 ctrl suffix measured
+// GF16-RA R=1/2 at -11.75 SNR3k (§8.4 FEC-reach / test_gf16_ra_cliff_sweep). A
+// prior DATA attempt (sim/robust3-gf16ra @a0ee58e) reported a NEGATIVE on an
+// ANALYTICAL Eb/N0-anchored axis (R=1/2 K=200 = -7.0, 2 dB worse than binary
+// LDPC). THIS test re-measures the data-length cliff on the SAME PHYSICAL
+// passband snr3k_db axis as the -11.75 suffix number, so the -10 comparison is
+// apples-to-apples with the suffix result AND the VARA -10 reference.
+//
+// Method (genie-sync FEC reach, mirrors §8.4(B) / build_gf16ra_suffix_audio):
+//   TX: K-symbol GF(16)-RA codeword (configure_k/encode_k) laid one tone/symbol
+//       onto N = K + repfact*K OFDM-MFSK symbols on ack_mfsk (M=16, nStreams=1,
+//       the real M=16 noncoherent-FSK PHY). amp = sqrt(Nc/nStreams), tone-hop,
+//       symbol_mod, power-normalize, baseband_to_passband, peak_clip — byte-for-
+//       byte the suffix synthesis, no CONNECT base pattern (data frame has none).
+//   CH: per-sample passband AWGN at sigma.
+//   RX: passband_to_baseband_decimated -> decode_suffix_energies(pattern_offset=0,
+//       pattern_nsymb=0, suffix_len=N) extracts the N x 16 per-tone energy matrix
+//       at genie symbol offsets (NO detection scaffolding — the §16-exonerated
+//       FEC-reach criterion) -> gf16ra::soft_decode_k (Bessel-I0 intrinsic, NOT
+//       the square-law mfsk.cc:1006 demap). Frame OK iff ALL K info symbols match.
+//   AXIS: snr3k_db(p_sig, sigma, fs) — bit-identical to the -11.75 suffix axis.
+//
+// net wire bps on this PHY: K info symbols * 4 bits over (N/nStreams) symbol
+// periods of 24.33 ms each (one OFDM block/symbol). nStreams=1 here; the ROBUST_3
+// reference geometry is M16x2 (nStreams=2) which DOUBLES bps at the same per-tone
+// SNR (two independent bands, same symbol clock) — both reported.
+static double gf16ra_data_sym_ms(cl_telecom_system& ts) {
+	// one MFSK symbol = one OFDM block = Nofdm * interp samples at fs.
+	return 1000.0 * (double)ts.data_container.Nofdm * (double)ts.frequency_interpolation_rate
+	       / ts.sampling_frequency;
+}
+
+// Build the passband audio for an arbitrary K-symbol GF(16)-RA codeword (genie,
+// no base pattern). Returns audio (signal in [4096, 4096+active)); sets out_active.
+static std::vector<double> build_gf16ra_data_audio(cl_telecom_system& ts,
+	const std::vector<int>& code_tones, int& out_active)
+{
+	cl_mfsk& m = ts.ack_mfsk;
+	int nsymb = (int)code_tones.size();
+	int Nc = ts.data_container.Nc;
+	std::vector<std::complex<double> > framed((size_t)nsymb * Nc, std::complex<double>(0.0, 0.0));
+	double amp = sqrt((double)Nc / m.nStreams);
+	for (int s = 0; s < nsymb; s++) {
+		int actual_tone = (code_tones[s] + s * m.tone_hop_step) % m.M;
+		for (int st = 0; st < m.nStreams; st++)
+			framed[(size_t)s * Nc + m.stream_offsets[st] + actual_tone] = std::complex<double>(amp, 0.0);
+	}
+	int Nofdm = ts.data_container.Nofdm;
+	std::vector<std::complex<double> > modulated((size_t)Nofdm * nsymb);
+	float power_normalization = sqrt((double)(ts.ofdm.Nfft * ts.frequency_interpolation_rate));
+	for (int i = 0; i < nsymb; i++)
+		ts.ofdm.symbol_mod(&framed[(size_t)i * Nc], &modulated[(size_t)i * Nofdm]);
+	double ack_boost = ts.get_tx_gain(TX_SIG_ACK);
+	for (int j = 0; j < Nofdm * nsymb; j++) {
+		modulated[j] /= power_normalization;
+		modulated[j] *= sqrt(ts.output_power_Watt) * ack_boost;
+	}
+	int active_samples = Nofdm * nsymb * ts.frequency_interpolation_rate;
+	out_active = active_samples;
+	std::vector<double> audio((size_t)active_samples + 8192, 0.0);
+	ts.ofdm.baseband_to_passband(modulated.data(), Nofdm * nsymb, audio.data() + 4096,
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		ts.frequency_interpolation_rate);
+	ts.ofdm.peak_clip(audio.data() + 4096, active_samples, ts.ofdm.data_papr_cut);
+	return audio;
+}
+
+static void gf16ra_data_cliff_one(cl_telecom_system& ts, int K, int repfact) {
+	int N = gf16ra::configure_k(K, repfact);
+	double R = (double)K / N;
+	cl_mfsk& m = ts.ack_mfsk;
+	double fs = ts.sampling_frequency;
+	double sym_ms = gf16ra_data_sym_ms(ts);
+	// frame periods = N/nStreams (each period carries nStreams coded symbols)
+	double frame_periods_1s = (double)N;                 // nStreams=1 (this PHY)
+	double frame_ms_1s = frame_periods_1s * sym_ms;
+	double bps_1s = (double)K * 4.0 / (frame_ms_1s / 1000.0);
+	double bps_2s = bps_1s * 2.0;                        // M16x2 ROBUST_3 geometry
+
+	// Reference signal power p_sig (clean) — identical convention to suffix axis.
+	std::vector<int> info(K), tx(N);
+	std::mt19937 rng(0xDA7A0000u + (unsigned)K * 131u + (unsigned)repfact);
+	for (int s = 0; s < K; s++) info[s] = (int)(rng() & 0xF);
+	gf16ra::encode_k(info.data(), tx.data());
+	std::vector<int> tx_v(tx.begin(), tx.end());
+	int active = 0;
+	std::vector<double> ref = build_gf16ra_data_audio(ts, tx_v, active);
+	double p_sig = suffix_pb_power(ref, active);
+
+	// SELF-VALIDATION: decode the CLEAN (noiseless) reference. If the genie
+	// offset / extraction is wrong this is 0% even at infinite SNR — guards
+	// against mistaking a harness bug for a code FAIL (Phase-1 discipline).
+	{
+		int interp0 = ts.data_container.interpolation_rate;
+		int dec0 = (int)ref.size() / interp0;
+		std::vector<std::complex<double> > bb0((size_t)dec0 + 16, std::complex<double>(0.0,0.0));
+		ts.ofdm.passband_to_baseband_decimated(ref.data(), (int)ref.size(), bb0.data(),
+			ts.sampling_frequency, ts.carrier_frequency + ts.last_coarse_freq_offset,
+			ts.carrier_amplitude, interp0, &ts.ofdm.FIR_rx_data);
+		std::vector<double> E0((size_t)N * m.M);
+		ts.ofdm.decode_suffix_energies(bb0.data(), dec0, 1, 4096 / interp0, 0, N,
+			m.tone_hop_step, m.M, m.nStreams, m.stream_offsets, E0.data());
+		std::vector<int> rx0(K);
+		gf16ra::soft_decode_k(E0.data(), 100, GF16RA_ESNO_METRIC, rx0.data());
+		int good = 0; for (int s = 0; s < K; s++) if (rx0[s] == info[s]) good++;
+		printf("    [data-cliff K=%d r=%d] clean-channel self-check: %d/%d info symbols OK%s\n",
+			K, repfact, good, K, (good == K) ? " (genie offset VALID)" : "  <<< HARNESS BUG: offset/extraction wrong");
+	}
+
+	// SNR3k sweep — wide enough to bracket the cliff for R=1/2..1/4.
+	// MERCURY_P0_FINE=1 → fine grid (0.1-sigma steps in the R1/2 cliff band) +
+	// more trials, for a defensible P=0.5 crossing on the marginal R1/2 result.
+	static const double sigmas_coarse[] = {2.0,2.4,2.8,3.2,3.6,4.0,4.4,4.8,5.2,5.6,6.0,6.6,7.2,8.0,9.0,10.0,11.0,12.0};
+	static const double sigmas_fine[]   = {2.8,3.0,3.1,3.2,3.3,3.4,3.5,3.6,3.7,3.8,3.9,4.0,4.2,4.4,4.8};
+	bool fine = (getenv("MERCURY_P0_FINE") != NULL);
+	const double* sigmas = fine ? sigmas_fine : sigmas_coarse;
+	const int NS = fine ? (int)(sizeof(sigmas_fine)/sizeof(sigmas_fine[0]))
+	                    : (int)(sizeof(sigmas_coarse)/sizeof(sigmas_coarse[0]));
+	const int NTR = fine ? 200 : 60;
+	printf("    [data-cliff K=%d r=%d N=%d R=%.3f bps(1s)=%.0f bps(2s)=%.0f frame=%.1fs]  (sigma : SNR3k_dB : P_frame : iter_mean)\n",
+		K, repfact, N, R, bps_1s, bps_2s, frame_ms_1s / 1000.0);
+	double cliff_snr = 999.0;
+	double prev_snr = 999.0, prev_pf = -1.0, cross_snr = 999.0;
+	for (int si = 0; si < NS; si++) {
+		double sigma = sigmas[si];
+		int ok = 0; long it_sum = 0, it_cnt = 0;
+		for (int it = 0; it < NTR; it++) {
+			for (int s = 0; s < K; s++) info[s] = (int)(rng() & 0xF);
+			gf16ra::encode_k(info.data(), tx.data());
+			std::vector<int> tt(tx.begin(), tx.end());
+			int act = 0;
+			std::vector<double> audio = build_gf16ra_data_audio(ts, tt, act);
+			std::normal_distribution<double> nd(0.0, sigma);
+			for (size_t i = 0; i < audio.size(); i++) audio[i] += nd(rng);
+
+			int interp = ts.data_container.interpolation_rate;
+			int dec_size = (int)audio.size() / interp;
+			// PRIVATE decimation buffer: N (up to 800) symbols FAR exceed
+			// data_container.baseband_data_interpolated (sized buffer_Nsymb ~ 32
+			// at CONFIG_0) — reusing it would overflow / read garbage (the §5.2(1)
+			// "frame geometry mismatch" silent corruptor). Size to dec_size.
+			std::vector<std::complex<double> > bb((size_t)dec_size + 16, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(audio.data(), (int)audio.size(),
+				bb.data(), ts.sampling_frequency,
+				ts.carrier_frequency + ts.last_coarse_freq_offset, ts.carrier_amplitude,
+				interp, &ts.ofdm.FIR_rx_data);
+			// genie extraction. build_gf16ra_data_audio writes the signal at
+			// passband sample 4096 (audio.data()+4096); apply_decimate is
+			// center-tap aligned (zero net group delay, fir_filter.cc:250/268),
+			// so the signal starts at decimated sample 4096/interp. Symbol s'
+			// useful FFT window then begins at pattern_offset + s*Nofdm + Ngi
+			// (interp param = 1, sym_period_interp = Nofdm).
+			int genie_offset = 4096 / interp;
+			std::vector<double> E((size_t)N * m.M);
+			ts.ofdm.decode_suffix_energies(bb.data(),
+				dec_size, 1, /*pattern_offset=*/genie_offset, /*pattern_nsymb=*/0, /*suffix_len=*/N,
+				m.tone_hop_step, m.M, m.nStreams, m.stream_offsets, E.data());
+
+			std::vector<int> rx(K);
+			int iters = gf16ra::soft_decode_k(E.data(), 100, GF16RA_ESNO_METRIC, rx.data());
+			bool allok = true;
+			for (int s = 0; s < K; s++) if (rx[s] != info[s]) { allok = false; break; }
+			if (allok) ok++;
+			if (iters >= 0) { it_sum += iters; it_cnt++; }
+		}
+		double pf = (double)ok / NTR;
+		double snr = snr3k_db(p_sig, sigma, fs);
+		double itm = (it_cnt > 0) ? (double)it_sum / it_cnt : -1.0;
+		printf("      %.3f : %7.2f : %.3f : %.1f\n", sigma, snr, pf, itm);
+		if (pf >= 0.5 && snr < cliff_snr) cliff_snr = snr;  // deepest (most negative) SNR with P>=0.5
+		// linear-interpolated P=0.5 crossing between this cell (pf<0.5) and the
+		// previous deeper-or-shallower bracketing cell (pf>=0.5). sigma rises =>
+		// snr falls monotonically; capture the first downward 0.5 crossing.
+		if (prev_pf >= 0.5 && pf < 0.5 && cross_snr > 900.0 && prev_pf > pf) {
+			double frac = (0.5 - pf) / (prev_pf - pf);   // 0..1 toward prev (higher snr)
+			cross_snr = snr + frac * (prev_snr - snr);
+		}
+		prev_snr = snr; prev_pf = pf;
+	}
+	if (cliff_snr < 900.0) {
+		double rep = (cross_snr < 900.0) ? cross_snr : cliff_snr;
+		printf("    [data-cliff K=%d r=%d] CLIFF(interp P=0.5) SNR3k=%.2f dB (deepest-cell>=0.5 %.2f) | net bps 1-stream=%.0f / 2-stream=%.0f | vs -10 target: %+.2f dB | vs suffix R1/2(-11.75): %+.2f dB\n",
+			K, repfact, rep, cliff_snr, bps_1s, bps_2s, rep - (-10.0), rep - (-11.75));
+	} else {
+		printf("    [data-cliff K=%d r=%d] NO CLIFF in swept range (P_frame<0.5 everywhere)\n", K, repfact);
+	}
+}
+
+// THE P0 GATE TEST. PASS criterion (reported, asserted soft): R=1/2 data-length
+// cliff <= -10.0 dB SNR3k at >= 71 bps net wire. Also measures the K=13 suffix
+// R=1/2 on THIS genie axis (must reproduce ~-11.75) as the transfer cross-check,
+// and lower rates (1/3, 1/4) as the bps/depth tradeoff.
+static void test_gf16_ra_data_length_cliff_sweep() {
+	const char* name = "gf16_ra_data_length_cliff_sweep";
+	printf("  [MEASURE/P0] DATA-LENGTH GF(16)-RA cliff (does the codec transfer K=13 -> data block?):\n");
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	if (ts.ack_mfsk.M <= 0 || ts.ack_mfsk.nStreams <= 0) { test_fail(name, "ack_mfsk not configured"); return; }
+	printf("    PHY: M=%d nStreams=%d Nofdm=%d interp=%d sym=%.2f ms | axis=physical snr3k_db (== suffix -11.75 axis)\n",
+		ts.ack_mfsk.M, ts.ack_mfsk.nStreams, ts.data_container.Nofdm,
+		ts.frequency_interpolation_rate, gf16ra_data_sym_ms(ts));
+	bool fine = (getenv("MERCURY_P0_FINE") != NULL);
+	printf("    --- transfer cross-check: K=13 R=1/2 on THIS genie axis (suffix §8.4 FEC-reach = -11.75) ---\n");
+	gf16ra_data_cliff_one(ts, 13, 1);
+	printf("    --- DATA length K=200 (= 800 info bits, the ROBUST_3 payload), R=1/2%s ---\n", fine?"":", 1/3, 1/4");
+	gf16ra_data_cliff_one(ts, 200, 1);
+	if (!fine) { gf16ra_data_cliff_one(ts, 200, 2); gf16ra_data_cliff_one(ts, 200, 3); }
+	printf("    --- DATA length K=400 (= 1600 info bits), R=1/2 (further past the short-block crossover) ---\n");
+	gf16ra_data_cliff_one(ts, 400, 1);
+	gf16ra::configure(2);  // restore the K=13 ctrl-path default
+	test_pass(name);  // MEASURE infra ran; the dB/bps verdict is in the log
+}
+
 // §19 (INCREMENT 1) — THE GATE FOR THIS INCREMENT: the PRODUCTION CONNECT decode
 // path, with the GF(16) RA FEC wired in (suffix_fec_mode=3 via set_suffix_fec),
 // reaches ~−14 dB SNR3k — i.e. it now tracks the §12 FEC-reach (−14.03), NOT the
@@ -5001,6 +5218,10 @@ int run_mfsk_ctrl_codec_tests() {
 	test_gf16_ra_passband_roundtrip_clean();
 	test_gf16_ra_pure_noise_far();
 	test_gf16_ra_cliff_sweep();      // [MEASURE] prints the GF(16) cliff + gain dB
+	// §20 P0 GATE (robust-ra-data-p0): does GF16-RA transfer to a DATA-length
+	// block and hold a cliff <= -10 dB SNR3k at >= 71 bps? (reconciles the
+	// suffix -11.75 vs the failed-branch -7.0 on ONE physical axis).
+	test_gf16_ra_data_length_cliff_sweep();
 	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
 	test_gf16_ra_production_path_cliff_sweep();
 
