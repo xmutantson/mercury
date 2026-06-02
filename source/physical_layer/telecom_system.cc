@@ -5166,6 +5166,16 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
+	else if(configuration==ROBUST_3)
+	{
+		// sim/robust3-mfsk: VARA -10 dB parity tier. Same M=16x2 PHY as ROBUST_1/2,
+		// LDPC rate 8/16 (K=800). Net ~149 bps. Noncoherent M-FSK Shannon floor
+		// ~+1.98 dB Eb/N0 at this rate; targets SNR3k cliff ~-10 dB matching VARA L4.
+		_modulation=MOD_MFSK;
+		_ldpc_rate=8/16.0;
+		ofdm_preamble_configurator_Nsymb=4;
+		ofdm_channel_estimator=LEAST_SQUARE;
+	}
 
 	// Amplitude restoration disabled for all modes: full ZF equalization
 	// preserves |H| for MMSE erasure and CSI weighting on frequency-selective channels.
