@@ -65,6 +65,7 @@ extern int g_verbose;
 #define RX_SHM 7
 #define ARQ_MODE 8
 #define MONITOR_MODE 9
+#define TX_WAV 10  // ULTRA audio render: one frame -> S16LE WAV, no audio device (sim instrument)
 
 #define NUMBER_OF_CONFIGS 17
 #define CONFIG_NONE -1

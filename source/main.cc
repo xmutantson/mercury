@@ -25,6 +25,7 @@
 #include <fstream>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <cstdarg>
 #include <math.h>
@@ -1114,6 +1115,8 @@ int main(int argc, char *argv[])
                 operation_mode = BER_PLOT_passband;
             if (!strcmp(optarg, "MONITOR"))
                 operation_mode = MONITOR_MODE;
+            if (!strcmp(optarg, "TX_WAV"))
+                operation_mode = TX_WAV;
             break;
         case 'x':
             if (!strcmp(optarg, "alsa"))
@@ -2485,6 +2488,96 @@ start_modem:
             pthread_join(gui_thread, NULL);
         }
 #endif
+    }
+
+    if (telecom_system.operation_mode == TX_WAV)
+    {
+        // ULTRA audio render (SIM instrument, ultra-audio worktree only).
+        // Build ONE frame via transmit_byte() -> data_container.passband_data
+        // (double, 48 kHz mono) and write it straight to an S16LE WAV. No audio
+        // device, no playback thread, no IONOS. With MERCURY_BAUD_MULT set on a
+        // robust/MFSK config (-s 100), the captured tones are baud-scaled.
+        printf("Mode selected: TX_WAV (sim render, no audio device)\n");
+        telecom_system.load_configuration(mod_config);
+        printf("Modulation: %d  Bitrate: %.2f bps  Shannon_limit: %.2f db\n",
+               mod_config, telecom_system.rbc, telecom_system.Shannon_limit);
+
+        int nReal_data = telecom_system.data_container.nBits - telecom_system.ldpc.P;
+        int frame_size = (nReal_data - telecom_system.outer_code_reserved_bits) / 8;
+
+        // Deterministic, recognizable payload (repeating 0x00..0xFF ramp).
+        for (int i = 0; i < frame_size; i++)
+            telecom_system.data_container.data_byte[i] = i & 0xFF;
+
+        telecom_system.transmit_byte(telecom_system.data_container.data_byte,
+                                     frame_size,
+                                     telecom_system.data_container.passband_data,
+                                     SINGLE_MESSAGE);
+
+        long n_samples = (long)telecom_system.data_container.Nofdm
+                       * telecom_system.data_container.interpolation_rate
+                       * (telecom_system.ofdm.Nsymb
+                          + telecom_system.ofdm.preamble_configurator.Nsymb);
+
+        // Peak-normalize to 0.9 full-scale so the render is audible and clean
+        // regardless of per-config passband amplitude.
+        double peak = 0.0;
+        for (long i = 0; i < n_samples; i++)
+        {
+            double a = telecom_system.data_container.passband_data[i];
+            if (a < 0) a = -a;
+            if (a > peak) peak = a;
+        }
+        double scale = (peak > 1e-12) ? (0.9 * 32767.0 / peak) : 1.0;
+
+        const char* out_path = std::getenv("MERCURY_WAV_OUT");
+        if (out_path == NULL) out_path = "tx_render.wav";
+
+        double sym_ms = 1000.0 * telecom_system.data_container.Nofdm
+                      * telecom_system.data_container.interpolation_rate / 48000.0;
+        double dur_s = (double)n_samples / 48000.0;
+        printf("[TX_WAV] Nfft=%d Nofdm=%d Nsymb=%d preamble=%d interp=%d -> %ld samples, "
+               "%.3f s, %.2f ms/sym, peak=%.4f scale=%.1f -> %s\n",
+               telecom_system.ofdm.Nfft, telecom_system.data_container.Nofdm,
+               telecom_system.ofdm.Nsymb, telecom_system.ofdm.preamble_configurator.Nsymb,
+               telecom_system.data_container.interpolation_rate,
+               n_samples, dur_s, sym_ms, peak, scale, out_path);
+        fflush(stdout);
+
+        // Write a canonical 44-byte RIFF/WAVE header (PCM, mono, 48 kHz, 16-bit).
+        uint32_t sample_rate = 48000;
+        uint16_t n_chan = 1, bits = 16;
+        uint32_t byte_rate = sample_rate * n_chan * (bits / 8);
+        uint16_t block_align = n_chan * (bits / 8);
+        uint32_t data_bytes = (uint32_t)(n_samples * (bits / 8));
+        uint32_t riff_size = 36 + data_bytes;
+
+        std::ofstream wf(out_path, std::ios::binary);
+        if (!wf)
+        {
+            printf("[TX_WAV] ERROR: cannot open %s for writing\n", out_path);
+        }
+        else
+        {
+            auto w32 = [&](uint32_t v){ wf.write((const char*)&v, 4); };
+            auto w16 = [&](uint16_t v){ wf.write((const char*)&v, 2); };
+            wf.write("RIFF", 4); w32(riff_size); wf.write("WAVE", 4);
+            wf.write("fmt ", 4); w32(16); w16(1); w16(n_chan);
+            w32(sample_rate); w32(byte_rate); w16(block_align); w16(bits);
+            wf.write("data", 4); w32(data_bytes);
+            for (long i = 0; i < n_samples; i++)
+            {
+                double v = telecom_system.data_container.passband_data[i] * scale;
+                if (v > 32767.0) v = 32767.0;
+                if (v < -32768.0) v = -32768.0;
+                int16_t s = (int16_t)(v >= 0 ? v + 0.5 : v - 0.5);
+                wf.write((const char*)&s, 2);
+            }
+            wf.close();
+            printf("[TX_WAV] wrote %u PCM bytes (%.3f s) to %s\n",
+                   data_bytes, dur_s, out_path);
+        }
+        fflush(stdout);
     }
 
     if (telecom_system.operation_mode == RX_RAND)
