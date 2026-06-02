@@ -282,6 +282,16 @@ public:
 	// IONOS_ERA_VALIDATION_PLAN.md §16.2 (b806b76 drift-catalog item).
 	bool skip_var_gate_enabled;
 
+	// SKIP-VAR config-rate-aware noise-variance ceiling (win-campaign Phase 0,
+	// fact-documents/data-flow-dsp-phy.md §7). The historical flat 0.5 threshold
+	// is code-rate-INDEPENDENT, but the LDPC decode floor is strongly code-rate-
+	// DEPENDENT — so 0.5 rejected decodable weak frames on the low-rate BPSK
+	// configs (CONFIG_0-6), masking ~3-8 dB of real decode margin. Returns the
+	// per-config pilot-residual nv above which the frame cannot decode (so the
+	// trial loop may fast-reject it). Measured from the gate-OFF BER decode
+	// floors (§7.4); see skip_var_nv_ceiling() definition for the table.
+	double skip_var_nv_ceiling(int configuration);
+
 	// Phase-2 validation flag (--rx-normalize=on|off). Default true = HEAD. When
 	// false, the b806b76 RX passband auto-rescaling block is bypassed (impulse
 	// noise blanking still runs). See PHASE2_FLAGS_DESIGN.md §2.8.
