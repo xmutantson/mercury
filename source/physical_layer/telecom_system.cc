@@ -2647,6 +2647,21 @@ skip_h_retry_point:
 			receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit);
 			auto t5_ldpc = std::chrono::steady_clock::now();
 			timing_ldpc_ms += std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
+			// [robust3-feas] iter/OSD instrument: env-gated per-decode line so a
+			// PLOT_PASSBAND sweep can extract SPA iter_mean and BP+OSD OSD-fire
+			// rate without touching the BER harness. iterations_done semantics:
+			// SPA -> iter count (>= nIteration_max means did-not-converge);
+			// BP_OSD -> < 1000 BP iter, >= 1000 OSD fired (LDPC_BP_OSD_OSD_BASE).
+			{
+				static const char* iterdbg = getenv("MERCURY_ITER_DEBUG");
+				if (iterdbg && iterdbg[0] == '1')
+				{
+					fprintf(stderr, "[ITER] cfg=%d algo=%d iter=%d cap=%d\n",
+						current_configuration, ldpc.decoding_algorithm,
+						receive_stats.iterations_done, ldpc.nIteration_max);
+					fflush(stderr);
+				}
+			}
 
 			bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, data_container.hd_decoded_data_bit, nReal_data);
 
@@ -5394,7 +5409,14 @@ void cl_telecom_system::load_configuration(int configuration)
 	// the waterfall. OFDM configs are above the cliff and 100 iter is plenty.
 	// See mfsk-vara-parity-plan.md §2.1 Q3.
 	if(is_robust_config(configuration))
+	{
 		ldpc.nIteration_max = 200;
+		// [robust3-feas] sim diagnostic: let MERCURY_ROBUST_ITER raise the robust
+		// SPA cap so we can test whether ROBUST_3 (rate 8/16) cliff failures are
+		// convergence-limited (more iters help) vs capability-limited (SPA stuck).
+		const char* itenv = getenv("MERCURY_ROBUST_ITER");
+		if(itenv) { int v = atoi(itenv); if(v > 0) ldpc.nIteration_max = v; }
+	}
 	ldpc.print_nIteration=default_configurations_telecom_system.ldpc_print_nIteration;
 
 	outer_code=default_configurations_telecom_system.outer_code;

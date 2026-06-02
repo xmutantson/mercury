@@ -24,6 +24,76 @@
 #include "physical_layer/ldpc.h"
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cmath>
+
+namespace {
+// [robust3-feas] Bessel-I0 noncoherent-FSK ML demap LUT, lifted verbatim from
+// wt/bessel-i0 (commit 2d02e5c). log I0(2*sqrt(E_m/sigma^2)) per Proakis 5e
+// §4.5.4 eq 4.5-46; A&S 9.8.1 (x<3.75) / 9.8.2 (x>=3.75). Gated at the demod
+// call site by env MERCURY_DEMAP=bessel (default = linear/LSE, bit-identical
+// to the 8c6d3b7 baseline). Sim-only A/B knob; no production wiring.
+constexpr int    LOG_I0_LUT_N    = 256;
+constexpr double LOG_I0_LUT_XMAX = 30.0;
+
+struct LogI0Table {
+	double v[LOG_I0_LUT_N + 1];
+	LogI0Table() {
+		const double dx = LOG_I0_LUT_XMAX / LOG_I0_LUT_N;
+		for (int i = 0; i <= LOG_I0_LUT_N; i++) {
+			double x = i * dx;
+			double I0;
+			if (x < 3.75) {
+				double t = x / 3.75;
+				double t2 = t * t;
+				I0 = 1.0
+				   + t2 * (3.5156229
+				   + t2 * (3.0899424
+				   + t2 * (1.2067492
+				   + t2 * (0.2659732
+				   + t2 * (0.0360768
+				   + t2 *  0.0045813)))));
+				v[i] = std::log(I0);
+			} else {
+				double u = 3.75 / x;
+				double poly = 0.39894228
+				            + u * ( 0.01328592
+				            + u * ( 0.00225319
+				            + u * (-0.00157565
+				            + u * ( 0.00916281
+				            + u * (-0.02057706
+				            + u * ( 0.02635537
+				            + u * (-0.01647633
+				            + u *   0.00392377))))))) ;
+				v[i] = x - 0.5 * std::log(x) + std::log(poly);
+			}
+		}
+	}
+};
+
+inline double log_I0_lut(double x) {
+	static const LogI0Table tbl;
+	if (x <= 0.0) return 0.0;
+	if (x >= LOG_I0_LUT_XMAX) {
+		double u = 3.75 / x;
+		double poly = 0.39894228
+		            + u * ( 0.01328592
+		            + u * ( 0.00225319
+		            + u * (-0.00157565
+		            + u * ( 0.00916281
+		            + u * (-0.02057706
+		            + u * ( 0.02635537
+		            + u * (-0.01647633
+		            + u *   0.00392377))))))) ;
+		return x - 0.5 * std::log(x) + std::log(poly);
+	}
+	const double dx = LOG_I0_LUT_XMAX / LOG_I0_LUT_N;
+	double pos  = x / dx;
+	int    idx  = (int)pos;
+	double frac = pos - idx;
+	return tbl.v[idx] + frac * (tbl.v[idx + 1] - tbl.v[idx]);
+}
+} // anonymous namespace
 
 cl_mfsk::cl_mfsk()
 {
@@ -1065,6 +1135,23 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 				E[m] = E_raw[actual];
 			}
 
+			// [robust3-feas] Per-tone metric L[m], computed once per
+			// symbol/stream. MERCURY_DEMAP=bessel selects the exact
+			// noncoherent-FSK ML per-tone log-likelihood log I0(2*sqrt(E/sig^2))
+			// (wt/bessel-i0); default (linear) uses L[m]=E[m]*llr_scale, which
+			// makes the LSE below bit-identical to the 8c6d3b7 baseline since
+			// llr_scale>0 is monotonic. The per-bit LSE then runs over L[m].
+			static const char* demap_env = getenv("MERCURY_DEMAP");
+			static const bool use_bessel = (demap_env && demap_env[0]=='b');
+			double L[64];
+			for (int m = 0; m < M; m++)
+			{
+				if (use_bessel)
+					L[m] = log_I0_lut(2.0 * std::sqrt(E[m] * llr_scale));
+				else
+					L[m] = E[m] * llr_scale;
+			}
+
 			// Compute LLRs for this stream's bits — log-sum-exp noncoherent FSK
 			// metric (F2 retry on top of Q3). Per Proakis 5th ed §4.5.4 and
 			// Stark, IEEE TCOM 1985, the true bit LLR for noncoherent
@@ -1086,24 +1173,25 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 			for (int k = 0; k < nBits; k++)
 			{
 				int mask = 1 << (nBits - 1 - k);
-				double max_E1 = -1e30;
-				double max_E0 = -1e30;
+				double max_L1 = -1e30;
+				double max_L0 = -1e30;
 				for (int m = 0; m < M; m++)
 				{
 					int gray_m = m ^ (m >> 1);
 					if (gray_m & mask)
 					{
-						if (E[m] > max_E1) max_E1 = E[m];
+						if (L[m] > max_L1) max_L1 = L[m];
 					}
 					else
 					{
-						if (E[m] > max_E0) max_E0 = E[m];
+						if (L[m] > max_L0) max_L0 = L[m];
 					}
 				}
 
 				// Numerically-stable log-sum-exp over S_0 and S_1
 				// separately, using the per-set max as the pivot. Each set
-				// includes its own max (the exp(0)=1 term).
+				// includes its own max (the exp(0)=1 term). L[m] is already
+				// in LLR-domain (linear: E*1/sig^2; bessel: log I0(2*sqrt(E/sig^2))).
 				double sum0 = 0.0;
 				double sum1 = 0.0;
 				for (int m = 0; m < M; m++)
@@ -1111,18 +1199,16 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 					int gray_m = m ^ (m >> 1);
 					if (gray_m & mask)
 					{
-						sum1 += std::exp((E[m] - max_E1) * llr_scale);
+						sum1 += std::exp(L[m] - max_L1);
 					}
 					else
 					{
-						sum0 += std::exp((E[m] - max_E0) * llr_scale);
+						sum0 += std::exp(L[m] - max_L0);
 					}
 				}
-				// LSE(S_0) - LSE(S_1) where LSE is in LLR-domain (already
-				// scaled by 1/sigma^2). Note: max_E and llr_scale combine to
-				// (max_E0 - max_E1) * llr_scale as the dominant term, plus
-				// the log() correction that reduces to 0 at high SNR.
-				double llr = (max_E0 - max_E1) * llr_scale
+				// LSE(S_0) - LSE(S_1) in LLR-domain. (max_L0 - max_L1) is the
+				// dominant term plus the log() correction that -> 0 at high SNR.
+				double llr = (max_L0 - max_L1)
 				           + std::log(sum0) - std::log(sum1);
 				if (!std::isfinite(llr)) llr = 0.0;
 				// LLR cap removed 2026-05-24. The previous ±5 clip was
