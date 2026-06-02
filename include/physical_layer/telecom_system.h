@@ -282,6 +282,15 @@ public:
 	// IONOS_ERA_VALIDATION_PLAN.md §16.2 (b806b76 drift-catalog item).
 	bool skip_var_gate_enabled;
 
+	// OFDM-data acquisition fix (Change B, plan §6): per-config SKIP-VAR
+	// threshold scaled by code rate. The fixed nv>0.5 gate was mid-rate
+	// calibrated; rate-1/16 decodes at nv≈1.4 (MEASURED, §23.0), so 0.5 bails
+	// the decoder on exactly the low-rate frames Change A acquires at −3 dB. This
+	// returns the per-config threshold (MEASURED decode-boundary nv × 1.3 margin
+	// for the WB low-rate configs; 0.5 elsewhere; hard cap 5.0 always skips —
+	// no config decodes there). See plan §11.7.
+	double skip_var_threshold() const;
+
 	// Phase-2 validation flag (--rx-normalize=on|off). Default true = HEAD. When
 	// false, the b806b76 RX passband auto-rescaling block is bypassed (impulse
 	// noise blanking still runs). See PHASE2_FLAGS_DESIGN.md §2.8.

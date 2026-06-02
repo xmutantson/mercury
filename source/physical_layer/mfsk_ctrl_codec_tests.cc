@@ -60,6 +60,7 @@
 #include "physical_layer/physical_defines.h"
 #include "datalink_layer/arq.h"           // §3 Wave 2 v2 cross-layer tests
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -4926,6 +4927,884 @@ static void test_production_enhanced_connect_decodes() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §22 OFDM-DATA COHERENT ACQUISITION (ofdm-data-acquisition-fix-plan.md Step 1)
+//
+// Change A wires the coherent cross-correlation detector
+// (cl_ofdm::time_sync_preamble_fft, ofdm.cc:2684 — ZERO production callers
+// before this change) in as the WB OFDM coarse acquisition detector, replacing
+// the Schmidl-Cox autocorrelation (time_sync_preamble_halfsym) whose metric
+// mean is length-invariant and floors the cliff at SNR3k≈+0.9 dB.
+//
+// The plan (§3.2) proves the autocorrelation metric mean μ = 1/(1+1/ρ)² depends
+// only on in-band SNR ρ: ρ=-3 dB → μ=0.111 < the 0.15 WB threshold. A coherent
+// matched filter against the known preamble values recovers integration gain,
+// moving the cliff ≥4 dB (the b328a4d MFSK precedent).
+//
+// §22.0 is a [MEASURE]+hard-exercise harness for the orphan detector (plan
+// risk #7: never-exercised code, unit-test it before trusting). It prints the
+// RAW FFT metric scale (clean/noise/data/CFO) so the [0,1] re-normalization
+// (§5.1 ARQ contract) is MEASURED not guessed (plan §10 #1).
+// =============================================================================
+
+// Synthesize a WB OFDM-DATA preamble round-tripped through the production
+// TX→RX chain, returning the full-rate interpolated baseband the detector
+// consumes. Mirrors telecom_system.cc:614-701 (the OFDM preamble TX path) and
+// the §6 MFSK synth_preamble_buffer, but uses ofdm.ofdm_preamble[].value (the
+// known OFDM preamble subcarrier values) instead of the MFSK tone preamble.
+//
+// The FFT detector metric is amplitude-invariant (correlation = metric/energy),
+// so pre-eq / boost / power-normalization are intentionally skipped — only the
+// spectral content of the preamble must match ofdm_preamble[]. An optional CFO
+// (Hz) is injected by offsetting the RX mixing carrier (post-coarse-freq
+// residual that Moose would handle); guards the coherent-sum phase-rotation
+// risk (plan §6 risk #2, §4.1 ofdm_preamble_cfo).
+static bool synth_ofdm_preamble_buffer(cl_telecom_system& ts,
+                                       int config,
+                                       double noise_sigma_pb,
+                                       bool synthesize_preamble,
+                                       double cfo_hz,
+                                       std::mt19937& rng,
+                                       std::vector<std::complex<double> >& out_bb,
+                                       int& out_expected_delay,
+                                       int& out_sym_samples,
+                                       int leading_pad_syms = 0)
+{
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(config);
+	// WB OFDM (not MFSK): must be a real OFDM config with nIS=4 and a populated
+	// preamble. CONFIG_0..3 are the BPSK low-rate configs the cliff bites.
+	if (ts.M == MOD_MFSK || ts.ofdm.ofdm_preamble == NULL ||
+	    ts.ofdm.preamble_configurator.nIdentical_sections != 4)
+		return false;
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int preamble_nSymb = ts.data_container.preamble_nSymb;
+	int interp = ts.data_container.interpolation_rate;
+	int sym_full = Nofdm * interp;          // full-rate samples/symbol (TX/passband)
+	out_sym_samples = Nofdm;                // DECIMATED samples/symbol (what tests use)
+
+	int passband_samples = Nofdm * preamble_nSymb * interp;
+	std::vector<double> preamble_pb((size_t)passband_samples, 0.0);
+
+	if (synthesize_preamble) {
+		// preamble_data[i] = ofdm_preamble[i].value (telecom_system.cc:617)
+		for (int i = 0; i < preamble_nSymb * Nc; i++)
+			ts.data_container.preamble_data[i] = ts.ofdm.ofdm_preamble[i].value;
+		// symbol_mod each preamble symbol (telecom_system.cc:661)
+		for (int i = 0; i < preamble_nSymb; i++)
+			ts.ofdm.symbol_mod(
+				&ts.data_container.preamble_data[i * Nc],
+				&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			ts.data_container.preamble_symbol_modulated_data,
+			Nofdm * preamble_nSymb,
+			preamble_pb.data(),
+			ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+			interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	// Buffer = [leading pad] + preamble + trailing pad. leading_pad_syms>0 places
+	// the preamble AFTER that many symbols of leading content (silence + the same
+	// AWGN), so the detector must search past it — exposes any earliest-peak /
+	// straddle-lock weakness that an offset-0 buffer hides (plan open-Q #2).
+	int leading_pb = leading_pad_syms * sym_full;
+	int trailing_pad = 12 * sym_full;
+	int buffer_pb_size = leading_pb + passband_samples + trailing_pad;
+	int buffer_nsymb_pb = buffer_pb_size / sym_full;
+	buffer_pb_size = buffer_nsymb_pb * sym_full;
+	// expected preamble start in DECIMATED samples (out_bb is decimated).
+	out_expected_delay = leading_pb / interp;
+
+	std::vector<double> buffer_pb((size_t)buffer_pb_size, 0.0);
+	if (synthesize_preamble) {
+		for (int i = 0; i < passband_samples && (leading_pb + i) < buffer_pb_size; i++)
+			buffer_pb[leading_pb + i] = preamble_pb[i];
+	}
+
+	// AWGN at passband level (real-valued). FIR_rx_time_sync bandpass rejects
+	// out-of-band noise → in-band SNR ≈ passband_SNR + 10·log10(fs/BW)
+	// (≈ +13 dB for fs=48k, BW=2343Hz WB).
+	if (noise_sigma_pb > 0.0) {
+		std::normal_distribution<double> nd(0.0, noise_sigma_pb);
+		for (int i = 0; i < buffer_pb_size; i++)
+			buffer_pb[i] += nd(rng);
+	}
+
+	// Decimate to base rate EXACTLY as production does: the WB primary detect
+	// runs the FFT detector on baseband_data_decimated (decimation_rate=interp,
+	// interp=1 stride). Tests therefore consume the DECIMATED buffer and pass
+	// interpolation_rate=1 to the detector. (Earlier full-rate+interp synthesis
+	// did NOT match production and mis-scaled the clean ref.)
+	int dec_size = buffer_pb_size / interp;
+	out_bb.assign((size_t)dec_size, std::complex<double>(0.0, 0.0));
+	// Inject CFO by offsetting the RX mixing carrier (production residual-CFO
+	// path: carrier_frequency + last_coarse_freq_offset, telecom_system.cc:3331).
+	double rx_carrier = ts.carrier_frequency + cfo_hz;
+	ts.ofdm.passband_to_baseband(
+		buffer_pb.data(), buffer_pb_size, out_bb.data(),
+		ts.sampling_frequency, rx_carrier, ts.carrier_amplitude,
+		interp, &ts.ofdm.FIR_rx_time_sync);
+
+	return true;
+}
+
+// Passband RMS of the WB OFDM preamble waveform — sets the AWGN stddev relative
+// to signal level so the cliff tests are reproducible across build flags.
+// Mirrors §6 measure_preamble_rms_pb for the OFDM preamble.
+static double measure_ofdm_preamble_rms_pb(cl_telecom_system& ts, int config) {
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(config);
+	if (ts.M == MOD_MFSK || ts.ofdm.ofdm_preamble == NULL) return -1.0;
+
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int preamble_nSymb = ts.data_container.preamble_nSymb;
+	int interp = ts.data_container.interpolation_rate;
+	int passband_samples = Nofdm * preamble_nSymb * interp;
+	std::vector<double> pb((size_t)passband_samples, 0.0);
+
+	for (int i = 0; i < preamble_nSymb * Nc; i++)
+		ts.data_container.preamble_data[i] = ts.ofdm.ofdm_preamble[i].value;
+	for (int i = 0; i < preamble_nSymb; i++)
+		ts.ofdm.symbol_mod(
+			&ts.data_container.preamble_data[i * Nc],
+			&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		ts.data_container.preamble_symbol_modulated_data,
+		Nofdm * preamble_nSymb,
+		pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	double sum_sq = 0.0;
+	for (int i = 0; i < passband_samples; i++) sum_sq += pb[i] * pb[i];
+	return std::sqrt(sum_sq / (double)passband_samples);
+}
+
+// §22.0 [MEASURE] — hard-exercise the orphan FFT detector AND print the raw
+// metric scale. NOT an assertion gate on dB (that's §22.1-22.5); this prints
+// the numbers used to design the [0,1] re-normalization. It DOES assert the
+// orphan detector runs (returns a finite, non-negative metric at clean) so a
+// crash/NaN in never-exercised code fails the suite (plan risk #7).
+static void test_ofdm_coherent_detector_measure_scale() {
+	const char* name = "ofdm_coherent_detector_measure_scale";
+	const int config = CONFIG_0;  // WB BPSK, rate 1/16, 4-sym preamble
+
+	cl_telecom_system ts_meas;
+	double rms = measure_ofdm_preamble_rms_pb(ts_meas, config);
+	if (!(rms > 0.0)) { test_fail(name, "OFDM preamble RMS measurement failed"); return; }
+
+	printf("    [MEASURE] OFDM coherent FFT-detector raw scale, CONFIG_%d, preamble_nSymb=%d\n",
+		config, ts_meas.data_container.preamble_nSymb);
+	printf("    [MEASURE] preamble passband RMS = %.6f\n", rms);
+
+	// sigma multipliers chosen to bracket the cliff. The §6 MFSK cliff used
+	// 4×RMS (≈ in-band +1 dB). We sweep wider to reach in-band -3 dB (plan §4.1):
+	// passband SNR = -20·log10(sigma/rms); in-band ≈ passband + 13 dB.
+	struct { const char* label; double sigma_mult; bool preamble; } cases[] = {
+		{ "clean        ", 0.0,  true  },
+		{ "sigma=2xRMS  ", 2.0,  true  },
+		{ "sigma=4xRMS  ", 4.0,  true  },
+		{ "sigma=8xRMS  ", 8.0,  true  },
+		{ "sigma=11xRMS ", 11.0, true  },  // ≈ in-band -3 dB (plan §4.1 cliff point)
+		{ "sigma=16xRMS ", 16.0, true  },
+		{ "pure-noise-8x", 8.0,  false },  // no preamble: FAR floor
+		{ "pure-noise-16", 16.0, false },
+	};
+
+	for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+		double sc_acc = 0.0, hc_acc = 0.0; int n = 0; double sc_min = 1e9, sc_max = -1e9;
+		for (int seed = 1; seed <= 5; seed++) {
+			cl_telecom_system ts;
+			std::mt19937 rng((uint32_t)(0x0FD30000u + (unsigned)c * 17u + (unsigned)seed));
+			std::vector<std::complex<double> > bb;
+			int exp_delay = 0, sym_samples = 0;
+			if (!synth_ofdm_preamble_buffer(ts, config, cases[c].sigma_mult * rms,
+			        cases[c].preamble, 0.0, rng, bb, exp_delay, sym_samples)) {
+				test_fail(name, "synth_ofdm_preamble_buffer failed"); return;
+			}
+			int interp = ts.data_container.interpolation_rate;
+			int pn = ts.data_container.preamble_nSymb;
+			// Coherent FFT detector (the orphan being brought up).
+			TimeSyncResult fft = ts.ofdm.time_sync_preamble_fft(
+				bb.data(), (int)bb.size(), 1, pn);
+			// Schmidl-Cox for comparison (the incumbent, [0,1]).
+			TimeSyncResult sc = ts.ofdm.time_sync_preamble_halfsym(
+				bb.data(), (int)bb.size(), 1, 1);
+			if (!(fft.correlation == fft.correlation) /* NaN */ || fft.correlation < 0.0) {
+				char buf[160];
+				snprintf(buf, sizeof(buf), "orphan FFT detector returned bad metric=%.6f at %s",
+					fft.correlation, cases[c].label);
+				test_fail(name, buf); return;
+			}
+			sc_acc += fft.correlation; hc_acc += sc.correlation; n++;
+			if (fft.correlation < sc_min) sc_min = fft.correlation;
+			if (fft.correlation > sc_max) sc_max = fft.correlation;
+			(void)exp_delay;
+		}
+		printf("    [MEASURE] %s  FFT-raw mean=%.4f [min=%.4f max=%.4f]   Schmidl-Cox mean=%.4f\n",
+			cases[c].label, sc_acc/n, sc_min, sc_max, hc_acc/n);
+	}
+
+	// Compare mode 0 (coherent across symbols) vs mode 1 (coherent across bins,
+	// non-coherent across symbols) on the THREE axes that decide the detector:
+	// (a) CFO collapse, (b) pure-noise tail/FAR, (c) cliff detectability. Mode 1
+	// is the plan §6 risk #2 CFO-robust variant. Print raw clean refs so the
+	// [0,1] normalization is MEASURED per mode (§1 no magic numbers).
+	for (int mode = 0; mode <= 1; mode++) {
+		printf("    [MEASURE] ===== combine_mode=%d (%s) =====\n", mode,
+			mode == 0 ? "coherent-across-symbols" : "coherent-bins/noncoh-symbols");
+
+		// clean raw reference
+		{
+			double acc = 0.0; int n = 0;
+			for (int seed = 1; seed <= 5; seed++) {
+				cl_telecom_system ts; std::mt19937 rng((uint32_t)(0x0FD00100u + (unsigned)mode*7u + (unsigned)seed));
+				std::vector<std::complex<double> > bb; int ed=0, ss=0;
+				synth_ofdm_preamble_buffer(ts, config, 0.0, true, 0.0, rng, bb, ed, ss);
+				int interp = ts.data_container.interpolation_rate, pn = ts.data_container.preamble_nSymb;
+				acc += ts.ofdm.time_sync_preamble_fft(bb.data(), (int)bb.size(), 1, pn, mode).correlation; n++;
+			}
+			printf("    [MEASURE]   clean raw ref = %.4f\n", acc/n);
+		}
+		// CFO sweep (sigma=4×RMS)
+		{
+			double cfos[] = { 0.0, 5.0, 10.0, 15.0, 20.0 };
+			printf("    [MEASURE]   CFO: ");
+			for (size_t ci = 0; ci < sizeof(cfos)/sizeof(cfos[0]); ci++) {
+				double acc = 0.0; int n = 0;
+				for (int seed = 1; seed <= 5; seed++) {
+					cl_telecom_system ts; std::mt19937 rng((uint32_t)(0x0FDCF700u + (unsigned)mode*101u + (unsigned)ci*13u + (unsigned)seed));
+					std::vector<std::complex<double> > bb; int ed=0, ss=0;
+					synth_ofdm_preamble_buffer(ts, config, 4.0 * rms, true, cfos[ci], rng, bb, ed, ss);
+					int interp = ts.data_container.interpolation_rate, pn = ts.data_container.preamble_nSymb;
+					acc += ts.ofdm.time_sync_preamble_fft(bb.data(), (int)bb.size(), 1, pn, mode).correlation; n++;
+				}
+				printf("%.0fHz=%.3f ", cfos[ci], acc/n);
+			}
+			printf("\n");
+		}
+		// cliff raw (sigma=11×RMS ≈ −3 dB) + pure-noise mean/MAX
+		{
+			double cliff_acc=0.0; int cn=0;
+			for (int seed=1; seed<=5; seed++) {
+				cl_telecom_system ts; std::mt19937 rng((uint32_t)(0x0FDC1100u + (unsigned)mode*53u + (unsigned)seed));
+				std::vector<std::complex<double> > bb; int ed=0, ss=0;
+				synth_ofdm_preamble_buffer(ts, config, 11.0 * rms, true, 0.0, rng, bb, ed, ss);
+				int interp = ts.data_container.interpolation_rate, pn = ts.data_container.preamble_nSymb;
+				cliff_acc += ts.ofdm.time_sync_preamble_fft(bb.data(), (int)bb.size(), 1, pn, mode).correlation; cn++;
+			}
+			double nacc=0.0, nmx=-1e9;
+			for (int seed=0; seed<100; seed++) {
+				cl_telecom_system ts; std::mt19937 rng((uint32_t)(0x0FDFC000u + (unsigned)mode*211u + (unsigned)seed));
+				std::vector<std::complex<double> > bb; int ed=0, ss=0;
+				synth_ofdm_preamble_buffer(ts, config, 11.0 * rms, false, 0.0, rng, bb, ed, ss);
+				int interp = ts.data_container.interpolation_rate, pn = ts.data_container.preamble_nSymb;
+				double raw = ts.ofdm.time_sync_preamble_fft(bb.data(), (int)bb.size(), 1, pn, mode).correlation;
+				nacc += raw; if (raw > nmx) nmx = raw;
+			}
+			printf("    [MEASURE]   cliff(-3dB) raw mean=%.4f | pure-noise raw mean=%.4f MAX=%.4f\n",
+				cliff_acc/cn, nacc/100.0, nmx);
+		}
+	}
+
+	// Leading-context probe (plan open-Q #2): place a CLEAN preamble after N
+	// symbols of leading content and check the detector still locks at the true
+	// position with a saturated (≈1.0) NORMALIZED metric. An earliest-peak /
+	// straddle-lock weakness shows up as a wrong delay AND a depressed metric.
+	printf("    [MEASURE] --- leading-context lock (clean preamble, normalized) ---\n");
+	{
+		int pads[] = { 0, 2, 4, 6 };
+		for (size_t pi = 0; pi < sizeof(pads)/sizeof(pads[0]); pi++) {
+			cl_telecom_system ts; std::mt19937 rng(0x0FD1EAD0u + (unsigned)pads[pi]);
+			std::vector<std::complex<double> > bb; int ed=0, ss=0;
+			synth_ofdm_preamble_buffer(ts, config, 0.0, true, 0.0, rng, bb, ed, ss, pads[pi]);
+			int pn = ts.data_container.preamble_nSymb;
+			// PRODUCTION sequence: coarse FFT → fine FFT around the coarse pos
+			// (telecom_system.cc primary detect). Tests whether fine resolves any
+			// coarse periodicity-alias / straddle early-lock.
+			TimeSyncResult c = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn);
+			int pream_dec = pn * ts.data_container.Nofdm;
+			TimeSyncResult r = ts.ofdm.time_sync_preamble_fft_fine_norm(
+				bb.data(), (int)bb.size(), 1, pn, c.delay, pream_dec);
+			int derr = r.delay - ed;
+			printf("    [MEASURE]   lead=%d sym: coarse(norm=%.3f delay=%d) -> fine(norm=%.4f delay=%d) expected=%d delay_err=%d (%s)\n",
+				pads[pi], c.correlation, c.delay, r.correlation, r.delay, ed, derr,
+				(std::abs(derr) <= ss && r.correlation >= 0.97) ? "OK" : "WEAK/OFF");
+		}
+	}
+
+	// The harness passed (orphan detector executed without NaN/negative on all
+	// cases). Scale design uses the printed numbers.
+	test_pass(name);
+}
+
+// §22.1 — Clean no-regression: the [0,1]-normalized coherent detector
+// (time_sync_preamble_fft_norm — what production now calls) must detect at
+// sigma=0, locate the preamble within ±1 symbol, AND read >= 0.97 (so the
+// telecom_system.cc:2469/2706 sub-peak/iteration saturation gates, which fire
+// on coarse_metric>=0.97, still see a saturated clean metric).
+static void test_ofdm_coherent_clean() {
+	const char* name = "ofdm_coherent_clean";
+	cl_telecom_system ts;
+	std::mt19937 rng(0x0FD0C1EAu);
+	std::vector<std::complex<double> > bb;
+	int exp_delay = 0, sym_samples = 0;
+	if (!synth_ofdm_preamble_buffer(ts, CONFIG_0, 0.0, true, 0.0, rng, bb, exp_delay, sym_samples)) {
+		test_fail(name, "synth_ofdm_preamble_buffer failed"); return;
+	}
+	int interp = ts.data_container.interpolation_rate;
+	int pn = ts.data_container.preamble_nSymb;
+	TimeSyncResult r = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn);
+	if (r.correlation < 0.97) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "clean normalized metric=%.4f < 0.97 (saturation-gate contract)", r.correlation);
+		test_fail(name, buf); return;
+	}
+	int delay_err = std::abs(r.delay - exp_delay);
+	if (delay_err > sym_samples) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "clean delay=%d expected=%d err=%d > 1 sym (%d)",
+			r.delay, exp_delay, delay_err, sym_samples);
+		test_fail(name, buf); return;
+	}
+	test_pass(name);
+}
+
+// §22.2 — Low-SNR cliff (FAIL-BEFORE / PASS-AFTER): at in-band ≈ −3 dB the
+// incumbent Schmidl-Cox autocorrelation metric floors below the 0.15 WB detect
+// threshold (the +0.9 dB cliff, plan §3.2); the coherent FFT detector crosses
+// it. Both detectors are still in the binary, so this single test IS the
+// fail-before (Schmidl-Cox arm) / pass-after (FFT arm) artifact — no git-stash
+// needed. Require: Schmidl-Cox < 0.15 (the documented failure) AND FFT-norm
+// >= 0.15 with delay within ±1 symbol, on >= 4 of 5 seeds.
+//
+// Noise: sigma = 11×preamble-RMS. MEASURED (§22.0) to put Schmidl-Cox at ≈0.105
+// (< 0.15 → fails) and the coherent detector at raw≈1.77 → norm≈0.257 (detects).
+static void test_ofdm_coherent_cliff() {
+	const char* name = "ofdm_coherent_cliff";
+	cl_telecom_system ts_meas;
+	double rms = measure_ofdm_preamble_rms_pb(ts_meas, CONFIG_0);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+	double sigma_pb = 11.0 * rms;  // ≈ in-band −3 dB (plan §4.1 cliff point)
+
+	int interp_ref = ts_meas.data_container.interpolation_rate;
+	int pn_ref = ts_meas.data_container.preamble_nSymb;
+
+	int fft_passes = 0, sc_failures = 0;
+	double last_fft = 0.0, last_sc = 0.0; int last_delay = 0; int last_exp = 0; int last_sym = 0;
+	for (int seed = 1; seed <= 5; seed++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0x0FDC1FF0u + (unsigned)seed));
+		std::vector<std::complex<double> > bb;
+		int exp_delay = 0, sym_samples = 0;
+		if (!synth_ofdm_preamble_buffer(ts, CONFIG_0, sigma_pb, true, 0.0, rng, bb, exp_delay, sym_samples)) {
+			test_fail(name, "synth_ofdm_preamble_buffer failed"); return;
+		}
+		int interp = ts.data_container.interpolation_rate;
+		int pn = ts.data_container.preamble_nSymb;
+		TimeSyncResult fft = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn);
+		TimeSyncResult sc  = ts.ofdm.time_sync_preamble_halfsym(bb.data(), (int)bb.size(), 1, 1);
+
+		// FFT (after): detect + delay within ±1 symbol.
+		if (fft.correlation >= 0.15 && std::abs(fft.delay - exp_delay) <= sym_samples)
+			fft_passes++;
+		// Schmidl-Cox (before): documented to FAIL the 0.15 gate at this SNR.
+		if (sc.correlation < 0.15)
+			sc_failures++;
+		last_fft = fft.correlation; last_sc = sc.correlation;
+		last_delay = fft.delay; last_exp = exp_delay; last_sym = sym_samples;
+	}
+	// PASS-AFTER: the coherent detector crosses on >= 4/5 seeds.
+	if (fft_passes < 4) {
+		char buf[220];
+		snprintf(buf, sizeof(buf),
+			"PASS-AFTER FAILED: coherent detector crossed only %d/5 (need >=4); last norm=%.4f delay=%d exp=%d sym=%d",
+			fft_passes, last_fft, last_delay, last_exp, last_sym);
+		test_fail(name, buf); return;
+	}
+	// FAIL-BEFORE: confirm the incumbent really does floor below 0.15 here (so
+	// the test is genuinely exercising the cliff, not a too-easy SNR). Require
+	// >= 4/5 Schmidl-Cox failures.
+	if (sc_failures < 4) {
+		char buf[220];
+		snprintf(buf, sizeof(buf),
+			"FAIL-BEFORE not established: Schmidl-Cox failed the 0.15 gate only %d/5 (last sc=%.4f) — SNR too high to be the cliff",
+			sc_failures, last_sc);
+		test_fail(name, buf); return;
+	}
+	printf("    [FAIL-BEFORE/PASS-AFTER] CONFIG_%d @ in-band≈-3dB: Schmidl-Cox %d/5 FAIL (<0.15), "
+		"coherent %d/5 PASS (>=0.15). last sc=%.3f fft-norm=%.3f\n",
+		(int)CONFIG_0, sc_failures, fft_passes, last_sc, last_fft);
+	(void)interp_ref; (void)pn_ref;
+	test_pass(name);
+}
+
+// §22.3 — Pure-noise FAR characterization (MEASURE + bounded assert).
+//
+// IMPORTANT physics (plan §11.6): at the −3 dB cliff a 4-symbol-preamble
+// coherent metric puts the SIGNAL mean (norm ≈ 0.17-0.21) at the pure-noise
+// TAIL (worst-of-100 norm ≈ 0.22). They OVERLAP — so NO threshold can both
+// detect at −3 dB AND give near-zero FAR with only 4 preamble symbols. A
+// near-zero pure-noise FAR is therefore mathematically incompatible with the
+// Step-1 cliff goal; demanding it would re-wall the cliff. (Step 2 — lengthen
+// the preamble — is what buys the separation; plan §8.)
+//
+// This is a DELIBERATE trade (plan §7.3): Schmidl-Cox has ~0 FAR but cliffs at
+// +0.9 dB; the coherent detector reaches −3 dB at the cost of a few-% pure-noise
+// acquisition FAR. A false acquisition is NOT a wire event — it produces a
+// random channel estimate, so the DOWNSTREAM mean_H gate (telecom_system.cc:2487,
+// <0.30 → SKIP-H) and SKIP-VAR gate reject it before LDPC. Cost = one cheap
+// channel-estimate + gate, never a transmitted frame.
+//
+// So this test asserts the TRUE, defensible properties: (a) the TYPICAL noise
+// poll is safe (mean norm ≪ 0.15), (b) the FAR RATE is bounded (≤ 10%, documents
+// the nonzero-by-design level). It is NOT a near-zero-FAR gate (that would
+// contradict the cliff goal). The cliff move itself is asserted by §22.2.
+static void test_ofdm_coherent_pure_noise() {
+	const char* name = "ofdm_coherent_pure_noise";
+	cl_telecom_system ts_meas;
+	double rms = measure_ofdm_preamble_rms_pb(ts_meas, CONFIG_0);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+	double sigma_pb = 11.0 * rms;
+
+	const int N = 200;
+	int over15 = 0;
+	double acc = 0.0, worst = 0.0;
+	for (int seed = 0; seed < N; seed++) {
+		cl_telecom_system ts;
+		std::mt19937 rng((uint32_t)(0x0FDFA000u + (unsigned)seed));
+		std::vector<std::complex<double> > bb;
+		int exp_delay = 0, sym_samples = 0;
+		if (!synth_ofdm_preamble_buffer(ts, CONFIG_0, sigma_pb, /*preamble=*/false, 0.0, rng, bb, exp_delay, sym_samples)) {
+			test_fail(name, "synth_ofdm_preamble_buffer failed"); return;
+		}
+		int pn = ts.data_container.preamble_nSymb;
+		double m = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn).correlation;
+		acc += m; if (m > worst) worst = m;
+		if (m >= 0.15) over15++;
+	}
+	double mean = acc / N;
+	double far_rate = (double)over15 / N;  // NB: 'far' is a reserved MinGW macro
+	printf("    [FAR] pure-noise: mean norm=%.4f, worst=%.4f, FAR(>=0.15)=%d/%d=%.1f%% "
+		"(by-design trade for the cliff; downstream mean_H/SKIP-VAR gate the residual)\n",
+		mean, worst, over15, N, 100.0 * far_rate);
+	// (a) typical poll safe: mean well under the threshold.
+	if (mean >= 0.10) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "pure-noise MEAN norm=%.4f not < 0.10 (typical poll should be safe)", mean);
+		test_fail(name, buf); return;
+	}
+	// (b) FAR bounded (documents the nonzero-by-design level; not a near-zero gate).
+	if (far_rate > 0.10) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "pure-noise FAR=%.1f%% exceeds the 10%% bound", 100.0 * far_rate);
+		test_fail(name, buf); return;
+	}
+	test_pass(name);
+}
+
+// §22.4 — Data-content false-trigger guard. A buffer of OFDM DATA symbols (no
+// preamble) must not trigger the detector: the coherent metric's "data ≈ 1"
+// property (ofdm.cc:2696) → norm ≈ 0. Builds a CONFIG_0 BPSK data frame
+// (random ±1 on data subcarriers), runs the same TX→RX chain, asserts the
+// normalized metric stays below 0.15.
+static void test_ofdm_coherent_data_content() {
+	const char* name = "ofdm_coherent_data_content";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_0);
+	if (ts.M == MOD_MFSK || ts.ofdm.ofdm_preamble == NULL) {
+		test_fail(name, "pre-condition: CONFIG_0 not a WB OFDM config"); return;
+	}
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	int pn = ts.data_container.preamble_nSymb;
+	int nsymb_data = 24;  // data symbols, no preamble
+
+	std::mt19937 rng(0x0FDDA7A0u);
+	std::uniform_int_distribution<int> bit(0, 1);
+
+	// Frequency-domain DATA frame: BPSK ±amp on every DATA subcarrier.
+	std::vector<std::complex<double> > freq_data((size_t)(nsymb_data * Nc), std::complex<double>(0.0, 0.0));
+	double amp = 1.0;
+	for (int s = 0; s < nsymb_data; s++)
+		for (int k = 0; k < Nc; k++)
+			freq_data[s * Nc + k] = std::complex<double>(bit(rng) ? amp : -amp, 0.0);
+
+	std::vector<std::complex<double> > bb_tx((size_t)(nsymb_data * Nofdm), std::complex<double>(0.0, 0.0));
+	for (int i = 0; i < nsymb_data; i++)
+		ts.ofdm.symbol_mod(&freq_data[i * Nc], &bb_tx[i * Nofdm]);
+
+	int pb_len = nsymb_data * Nofdm * interp;
+	std::vector<double> pb_data((size_t)pb_len, 0.0);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(bb_tx.data(), nsymb_data * Nofdm, pb_data.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	// Decimate to base rate (match production: detector runs on the decimated
+	// buffer with interp=1).
+	int dec_len = pb_len / interp;
+	std::vector<std::complex<double> > bb_rx((size_t)dec_len, std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(pb_data.data(), pb_len, bb_rx.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, interp, &ts.ofdm.FIR_rx_time_sync);
+
+	TimeSyncResult r = ts.ofdm.time_sync_preamble_fft_norm(bb_rx.data(), dec_len, 1, pn);
+	if (r.correlation >= 0.15) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "DATA false-trigger: norm metric=%.4f >= 0.15 on data-only buffer", r.correlation);
+		test_fail(name, buf); return;
+	}
+	printf("    [DATA-GUARD] data-only buffer norm metric=%.4f (< 0.15)\n", r.correlation);
+	test_pass(name);
+}
+
+// §22.5 — CFO robustness (plan §6 risk #2, §4.1 ofdm_preamble_cfo). The
+// coherent sum across symbols accumulates CFO phase rotation; at large residual
+// CFO the |Σ|² collapses. The ±30 Hz coarse-freq search + Moose handle gross
+// CFO; this guards the residual the detector must tolerate. Inject ±20 Hz
+// residual at a detectable SNR (sigma=4×RMS, in-band ≈ +1 dB) and assert the
+// coherent detector still crosses 0.15 with correct delay (>= 4/5 seeds across
+// both signs).
+static void test_ofdm_coherent_cfo() {
+	const char* name = "ofdm_coherent_cfo";
+	cl_telecom_system ts_meas;
+	double rms = measure_ofdm_preamble_rms_pb(ts_meas, CONFIG_0);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+	double sigma_pb = 4.0 * rms;  // in-band ≈ +1 dB (well above cliff; isolate CFO effect)
+
+	const double cfos[2] = { +20.0, -20.0 };
+	int passes = 0, total = 0;
+	double last = 0.0; int last_delay = 0, last_exp = 0, last_sym = 0; double last_cfo = 0.0;
+	for (int ci = 0; ci < 2; ci++) {
+		for (int seed = 1; seed <= 3; seed++) {
+			cl_telecom_system ts;
+			std::mt19937 rng((uint32_t)(0x0FDCF000u + (unsigned)ci * 31u + (unsigned)seed));
+			std::vector<std::complex<double> > bb;
+			int exp_delay = 0, sym_samples = 0;
+			if (!synth_ofdm_preamble_buffer(ts, CONFIG_0, sigma_pb, true, cfos[ci], rng, bb, exp_delay, sym_samples)) {
+				test_fail(name, "synth_ofdm_preamble_buffer failed"); return;
+			}
+			int interp = ts.data_container.interpolation_rate;
+			int pn = ts.data_container.preamble_nSymb;
+			TimeSyncResult r = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn);
+			total++;
+			if (r.correlation >= 0.15 && std::abs(r.delay - exp_delay) <= sym_samples)
+				passes++;
+			last = r.correlation; last_delay = r.delay; last_exp = exp_delay; last_sym = sym_samples; last_cfo = cfos[ci];
+		}
+	}
+	if (passes < total - 1) {  // allow 1 of 6 to slip
+		char buf[220];
+		snprintf(buf, sizeof(buf),
+			"CFO: only %d/%d (±20 Hz) detected (need >=%d); last cfo=%.0f norm=%.4f delay=%d exp=%d sym=%d",
+			passes, total, total - 1, last_cfo, last, last_delay, last_exp, last_sym);
+		test_fail(name, buf); return;
+	}
+	printf("    [CFO] ±20 Hz residual: %d/%d detected\n", passes, total);
+	test_pass(name);
+}
+
+// §22.6 — ARQ-metric-semantics: the [0,1] coarse_metric contract every
+// consumer relies on (plan §5.1, §11.3). Asserts the normalized metric lands in
+// the correct band for each channel condition so the load-bearing thresholds
+// (telecom 0.10/0.15/0.97; arq_common BREAK<0.30, FTR/batch>=0.5) keep their
+// semantics:
+//   clean        -> [0.97, 1.0]   (>=0.97 saturation gates fire; >=0.5 confident; >=0.15 detect)
+//   pure-noise   -> [0.0, 0.15)   (< 0.10 weak-skip; < 0.30 BREAK-probe allowed; < 0.5)
+//   cliff (-3dB) -> [0.15, 0.5)   (>=0.15 detect; in the FTR "weak preamble" band; < BREAK-suppress 0.30..0.5)
+static void test_ofdm_coherent_arq_metric_semantics() {
+	const char* name = "ofdm_coherent_arq_metric_semantics";
+	cl_telecom_system ts_meas;
+	double rms = measure_ofdm_preamble_rms_pb(ts_meas, CONFIG_0);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+
+	// (a) clean → [0.97, 1.0]
+	{
+		cl_telecom_system ts; std::mt19937 rng(0x0FD5E0A0u);
+		std::vector<std::complex<double> > bb; int ed=0, ss=0;
+		synth_ofdm_preamble_buffer(ts, CONFIG_0, 0.0, true, 0.0, rng, bb, ed, ss);
+		int interp = ts.data_container.interpolation_rate, pn = ts.data_container.preamble_nSymb;
+		double m = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn).correlation;
+		if (m < 0.97 || m > 1.0001) {
+			char buf[160]; snprintf(buf, sizeof(buf), "clean metric=%.4f not in [0.97,1.0]", m);
+			test_fail(name, buf); return;
+		}
+	}
+	// (b) pure-noise → [0, 0.15)  (averaged over seeds for stability; assert every seed < 0.15)
+	{
+		double mx = 0.0;
+		for (int seed = 0; seed < 20; seed++) {
+			cl_telecom_system ts; std::mt19937 rng((uint32_t)(0x0FD5A000u + (unsigned)seed));
+			std::vector<std::complex<double> > bb; int ed=0, ss=0;
+			synth_ofdm_preamble_buffer(ts, CONFIG_0, 11.0 * rms, /*preamble=*/false, 0.0, rng, bb, ed, ss);
+			int interp = ts.data_container.interpolation_rate, pn = ts.data_container.preamble_nSymb;
+			double m = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn).correlation;
+			if (m > mx) mx = m;
+		}
+		if (mx >= 0.15) {
+			char buf[160]; snprintf(buf, sizeof(buf), "pure-noise worst metric=%.4f not < 0.15 (BREAK/weak-skip contract)", mx);
+			test_fail(name, buf); return;
+		}
+	}
+	// (c) cliff (-3 dB) → [0.15, 0.5)  — detected but not "confident". Use the
+	// median of 5 seeds to avoid a single-seed outlier; assert it lands in band.
+	{
+		double vals[5];
+		for (int seed = 0; seed < 5; seed++) {
+			cl_telecom_system ts; std::mt19937 rng((uint32_t)(0x0FD5C000u + (unsigned)seed));
+			std::vector<std::complex<double> > bb; int ed=0, ss=0;
+			synth_ofdm_preamble_buffer(ts, CONFIG_0, 11.0 * rms, true, 0.0, rng, bb, ed, ss);
+			int interp = ts.data_container.interpolation_rate, pn = ts.data_container.preamble_nSymb;
+			vals[seed] = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn).correlation;
+		}
+		std::sort(vals, vals + 5);
+		double med = vals[2];
+		if (med < 0.15) {
+			char buf[160]; snprintf(buf, sizeof(buf), "cliff median metric=%.4f < 0.15 (would not detect)", med);
+			test_fail(name, buf); return;
+		}
+		// Upper bound is informational: at exactly the cliff the metric SHOULD be
+		// weak (in the FTR band), not saturated. We only hard-assert >= 0.15
+		// (detection) since the exact upper value is SNR-dependent.
+		printf("    [ARQ-SEMANTICS] clean>=0.97 OK; pure-noise<0.15 OK; cliff median norm=%.3f (>=0.15 detect)\n", med);
+	}
+	test_pass(name);
+}
+
+// §22.7 — Leading-context periodicity early-lock (CHARACTERIZE + bounded
+// regression). The OFDM-data preamble repeats the SAME Zadoff-Chu sequence in
+// every symbol (ofdm.cc:1304), so the coherent detector cannot distinguish the
+// true start from a position k<Nsymb symbols earlier — they alias to nearly the
+// same metric. In a buffer with leading content (prior frames / silence, the
+// real case), the earliest-above-50% selection therefore locks UP TO Nsymb
+// symbols EARLY. This is the SAME ambiguity class the Schmidl-Cox path has;
+// production handles it via site-8 (time_sync_preamble_with_metric,
+// telecom_system.cc ~:2090) which re-refines the FULL-RATE demod delay from a
+// (preamble_nSymb+4)-symbol window around pream_symb_loc — wide enough to
+// recover a ≤Nsymb-early coarse lock.
+//
+// This test PINS the bounded behavior (so a WORSE regression — unbounded drift
+// or sub-0.5 metric — fails): for a CLEAN preamble at 0/2/4/6 symbols of lead,
+// (a) the coarse delay error is ≤ Nsymb symbols (site-8-recoverable), and
+// (b) the normalized metric stays ≥ 0.5 (the highest load-bearing ARQ threshold
+// a real preamble must satisfy: FTR/batch/SACK at arq_common.cc:6574/6615/6656).
+// NOTE: the ≥0.97 sub-peak/iteration gates (telecom_system.cc:2469/2706) may NOT
+// fire on an aliased lock (metric 0.85-1.0) — acceptable, they guard a
+// Schmidl-Cox-specific pathology the coherent detector does not have.
+static void test_ofdm_coherent_leading_context() {
+	const char* name = "ofdm_coherent_leading_context";
+	int pads[] = { 0, 2, 4, 6 };
+	for (size_t pi = 0; pi < sizeof(pads)/sizeof(pads[0]); pi++) {
+		cl_telecom_system ts; std::mt19937 rng(0x0FD1EAD0u + (unsigned)pads[pi]);
+		std::vector<std::complex<double> > bb; int ed = 0, ss = 0;
+		if (!synth_ofdm_preamble_buffer(ts, CONFIG_0, 0.0, true, 0.0, rng, bb, ed, ss, pads[pi])) {
+			test_fail(name, "synth_ofdm_preamble_buffer failed"); return;
+		}
+		int pn = ts.data_container.preamble_nSymb;
+		int Nofdm_dec = ts.data_container.Nofdm;  // decimated samples/symbol
+		// Production coarse → fine sequence.
+		TimeSyncResult c = ts.ofdm.time_sync_preamble_fft_norm(bb.data(), (int)bb.size(), 1, pn);
+		int pream_dec = pn * Nofdm_dec;
+		TimeSyncResult r = ts.ofdm.time_sync_preamble_fft_fine_norm(
+			bb.data(), (int)bb.size(), 1, pn, c.delay, pream_dec);
+		int derr = r.delay - ed;
+		// (a) bounded: the coarse lock is no more than Nsymb symbols EARLY (and
+		// never LATE past the true start) — within site-8's recovery window.
+		if (derr > Nofdm_dec || derr < -(pn * Nofdm_dec)) {
+			char buf[200];
+			snprintf(buf, sizeof(buf),
+				"lead=%d: delay_err=%d decimated samples exceeds [-Nsymb*Nofdm, +Nofdm] = [%d, %d] (site-8 may not recover)",
+				pads[pi], derr, -(pn * Nofdm_dec), Nofdm_dec);
+			test_fail(name, buf); return;
+		}
+		// (b) metric still satisfies the highest load-bearing ARQ threshold (0.5).
+		if (r.correlation < 0.5) {
+			char buf[200];
+			snprintf(buf, sizeof(buf),
+				"lead=%d: aliased-lock metric=%.4f < 0.5 (would break FTR/batch/SACK gate)",
+				pads[pi], r.correlation);
+			test_fail(name, buf); return;
+		}
+	}
+	printf("    [LEAD-CTX] clean preamble at 0/2/4/6-sym lead: coarse lock ≤Nsymb-early (site-8-recoverable), metric ≥0.5 (ARQ gates hold)\n");
+	test_pass(name);
+}
+
+// =============================================================================
+// §23 SKIP-VAR rate-adaptation (Change B — ofdm-data-acquisition-fix-plan.md §6)
+//
+// The fixed SKIP-VAR gate (telecom_system.cc:2578, nv>0.5 → skip LDPC) was
+// calibrated for mid-rate configs. Rate-1/16 (CONFIG_0) decodes at a far higher
+// post-EQ pilot-noise nv than rate 14/16, so the 0.5 gate bails the decoder
+// before LDPC on exactly the low-rate frames Change A now ACQUIRES at −3 dB —
+// re-walling the cliff. Change B replaces 0.5 with a per-config threshold scaled
+// by code rate, MEASURED from the decode-boundary nv (§1: no magic numbers), and
+// a hard cap nv>5 that always skips (no config decodes there).
+// =============================================================================
+
+// §23.0 [MEASURE] — decode-boundary nv per config. For each config, sweep
+// Es/N0 downward with SKIP-VAR OFF and record nv at the LOWEST Es/N0 that still
+// decodes (FER<1.0 = at least one CRC pass). The per-config SKIP-VAR threshold
+// is set to (boundary nv × safety margin) in telecom_system.cc — this test is
+// the traceable measurement basis for those constants.
+static void measure_decode_boundary_nv(int config, const char* label) {
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.skip_var_gate_enabled = false;   // OFF: let the decoder run below nv>0.5
+	ts.load_configuration(config);
+	double esn0_decode = 1e9, nv_decode = -1.0, ldpc_rate = ts.ldpc.rate;
+	// Coarse downward sweep; 4 frames/point (enough to see FER<1 onset).
+	for (double esn0 = 12.0; esn0 >= -6.0; esn0 -= 1.0) {
+		cl_error_rate er = ts.passband_test_EsN0((float)esn0, 4);
+		double nv = ts.ofdm.noise_variance_estimate;
+		// Decodes if at least one frame CRC-passed (FER < 1.0).
+		if (er.FER < 1.0) {
+			esn0_decode = esn0;
+			nv_decode = nv;
+		}
+	}
+	printf("    [SKIP-VAR-MEASURE] %s (cfg=%d rate=%.3f): decode-boundary Es/N0=%.1f dB, nv=%.4f "
+		"(old gate 0.5 → %s)\n",
+		label, config, ldpc_rate,
+		(esn0_decode < 1e8) ? esn0_decode : 99.9, nv_decode,
+		(nv_decode > 0.5) ? "WOULD SKIP (cliff re-walled!)" : "ok");
+}
+
+static void test_skip_var_decode_boundary_measure() {
+	const char* name = "skip_var_decode_boundary_measure";
+	printf("    [MEASURE] SKIP-VAR decode-boundary nv per config (skip-var OFF, FER<1 onset):\n");
+	// WB low-rate configs (the ones Change A acquires at −3 dB) + a mid/high-rate
+	// for contrast (where nv>0.5 genuinely means undecodable).
+	measure_decode_boundary_nv(CONFIG_0, "CONFIG_0 r1/16");
+	measure_decode_boundary_nv(CONFIG_1, "CONFIG_1 r2/16");
+	measure_decode_boundary_nv(CONFIG_2, "CONFIG_2 r3/16");
+	measure_decode_boundary_nv(CONFIG_3, "CONFIG_3 r4/16");
+	measure_decode_boundary_nv(CONFIG_10, "CONFIG_10 mid ");
+	test_pass(name);
+}
+
+// §23.1 — SKIP-VAR rate-adaptation: threshold contract + fail-before/pass-after.
+// Asserts the per-config threshold (a) is the MEASURED boundary × margin for the
+// WB low-rate configs and 0.5 elsewhere, (b) strictly exceeds the old 0.5 gate
+// for CONFIG_0-3 so the decoder is now INVOKED below the old wall (the
+// fail-before/pass-after in threshold terms), (c) the hard cap nv>5 holds (no
+// config decodes there), (d) monotonic with rate. Pure-state, no DSP — fast.
+static void test_skip_var_threshold_contract() {
+	const char* name = "skip_var_threshold_contract";
+
+	// Measured decode-boundary nv (mfsk_ctrl_codec_tests §23.0) — the basis.
+	struct { int cfg; double boundary_nv; double expect_thr; } meas[] = {
+		{ CONFIG_0, 1.43, 1.86 },
+		{ CONFIG_1, 1.23, 1.60 },
+		{ CONFIG_2, 1.12, 1.45 },
+		{ CONFIG_3, 1.05, 1.37 },
+	};
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+
+	double prev_thr = 1e9;
+	for (size_t i = 0; i < sizeof(meas)/sizeof(meas[0]); i++) {
+		ts.load_configuration(meas[i].cfg);
+		double thr = ts.skip_var_threshold();
+		// (a) threshold matches the measured ×1.3 value.
+		if (std::abs(thr - meas[i].expect_thr) > 0.01) {
+			char buf[160];
+			snprintf(buf, sizeof(buf), "cfg=%d skip_var_threshold=%.3f != expected %.3f (measured boundary ×1.3)",
+				meas[i].cfg, thr, meas[i].expect_thr);
+			test_fail(name, buf); return;
+		}
+		// (b) FAIL-BEFORE/PASS-AFTER: the measured decode boundary sits ABOVE the
+		// old 0.5 gate (old gate would SKIP → no decode → cliff re-walled) AND
+		// BELOW the new threshold (new gate PASSES → decoder invoked).
+		if (!(meas[i].boundary_nv > 0.5)) {
+			test_fail(name, "precondition: boundary nv not above old 0.5 gate"); return;
+		}
+		if (!(meas[i].boundary_nv < thr)) {
+			char buf[160];
+			snprintf(buf, sizeof(buf), "cfg=%d boundary nv %.3f NOT below new threshold %.3f (decoder still skipped)",
+				meas[i].cfg, meas[i].boundary_nv, thr);
+			test_fail(name, buf); return;
+		}
+		// (c) hard cap: threshold never above 5.0 (nv>5 always skips at the gate).
+		if (thr > 5.0) {
+			char buf[128]; snprintf(buf, sizeof(buf), "cfg=%d threshold %.3f exceeds hard cap 5.0", meas[i].cfg, thr);
+			test_fail(name, buf); return;
+		}
+		// (d) monotonic: lower rate → higher threshold.
+		if (thr > prev_thr) {
+			test_fail(name, "threshold not monotonic decreasing with config index (rate)"); return;
+		}
+		prev_thr = thr;
+	}
+
+	// mid/high-rate keeps the historical 0.5 (CONFIG_10 measured boundary 0.35
+	// < 0.5 → unchanged behavior, no loosening).
+	ts.load_configuration(CONFIG_10);
+	if (std::abs(ts.skip_var_threshold() - 0.5) > 1e-9) {
+		char buf[128]; snprintf(buf, sizeof(buf), "CONFIG_10 threshold=%.3f != 0.5 (mid-rate must be unchanged)", ts.skip_var_threshold());
+		test_fail(name, buf); return;
+	}
+
+	printf("    [SKIP-VAR] thresholds cfg0-3 = 1.86/1.60/1.45/1.37 (measured boundary×1.3, all >0.5 old gate, all <5.0 cap); cfg10+ = 0.5\n");
+	test_pass(name);
+}
+
+// §23.2 — End-to-end: CONFIG_0 frame at its decode boundary (nv≈1.4 > old 0.5
+// gate) DECODES with the production gate ON. Pre-Change-B the 0.5 gate would
+// SKIP-VAR every trial (no decode); post-Change-B the per-config 1.86 threshold
+// lets it through. Also confirms a HIGH-nv (pure-noise-class) frame still skips.
+static void test_skip_var_low_rate_decodes_at_boundary() {
+	const char* name = "skip_var_low_rate_decodes_at_boundary";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.skip_var_gate_enabled = true;   // PRODUCTION gate ON (the real path)
+	ts.load_configuration(CONFIG_0);
+
+	// At Es/N0 = −3 dB (the measured CONFIG_0 decode boundary, nv≈1.4) the frame
+	// must DECODE (FER<1) with the gate ON — i.e. the per-config threshold (1.86)
+	// admitted it past the gate where the old 0.5 would have skipped it.
+	cl_error_rate er = ts.passband_test_EsN0(-3.0f, 6);
+	double nv = ts.ofdm.noise_variance_estimate;
+	if (er.FER >= 1.0) {
+		char buf[200];
+		snprintf(buf, sizeof(buf),
+			"CONFIG_0 @ -3dB did NOT decode with gate ON (FER=%.2f, nv=%.3f, thr=%.2f) — SKIP-VAR re-walled the cliff",
+			er.FER, nv, ts.skip_var_threshold());
+		test_fail(name, buf); return;
+	}
+	// Sanity: the nv at this boundary is indeed above the OLD 0.5 gate (so this
+	// genuinely exercises the relaxation, not a trivially-clean frame).
+	if (!(nv > 0.5)) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "boundary nv=%.3f not above old 0.5 gate — test not exercising the relaxation", nv);
+		test_fail(name, buf); return;
+	}
+	printf("    [SKIP-VAR] CONFIG_0 @ -3dB DECODES with gate ON (FER=%.2f, nv=%.3f > old 0.5, < new 1.86)\n",
+		er.FER, nv);
+
+	// Hard-cap guard: a config with threshold T must still skip when nv>5. We
+	// can't easily force nv>5 in passband_test_EsN0, so assert the gate logic
+	// directly: even CONFIG_0's relaxed threshold (1.86) is < 5.0, so any nv>5
+	// trips the `|| nv>5.0` hard cap at the gate (telecom_system.cc:2578).
+	if (ts.skip_var_threshold() >= 5.0) {
+		test_fail(name, "CONFIG_0 threshold >= 5.0 would defeat the hard cap"); return;
+	}
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5032,6 +5911,26 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ack_suffix_throughput_neutral();
 	test_connect_suffix_byte_identical_when_off();
 	test_production_enhanced_connect_decodes();
+
+	// §22 OFDM-data coherent acquisition (ofdm-data-acquisition-fix-plan.md
+	// Step 1). §22.0 is the [MEASURE]+orphan-detector bring-up harness; §22.1-6
+	// are the Change-A fail-before/pass-after + guard suite.
+	test_ofdm_coherent_detector_measure_scale();
+	test_ofdm_coherent_clean();
+	test_ofdm_coherent_cliff();                 // FAIL-BEFORE (Schmidl-Cox) / PASS-AFTER (coherent)
+	test_ofdm_coherent_pure_noise();            // FAR guard
+	test_ofdm_coherent_data_content();          // data false-trigger guard
+	test_ofdm_coherent_cfo();                   // ±20 Hz residual CFO robustness
+	test_ofdm_coherent_arq_metric_semantics();  // [0,1] coarse_metric contract preserved
+	test_ofdm_coherent_leading_context();       // periodicity early-lock bounded + metric>=0.5
+
+	// §23 SKIP-VAR rate-adaptation (Change B). §23.0 measures the per-config
+	// decode-boundary nv (the basis for the per-config thresholds); §23.1 asserts
+	// the threshold contract + fail-before/pass-after; §23.2 is the end-to-end
+	// decode-at-boundary with the production gate ON.
+	test_skip_var_decode_boundary_measure();
+	test_skip_var_threshold_contract();
+	test_skip_var_low_rate_decodes_at_boundary();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

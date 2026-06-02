@@ -196,8 +196,26 @@ public:
 	TimeSyncResult time_sync_preamble_with_metric(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max);
 	TimeSyncResult time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric = 0.0);
 	TimeSyncResult time_sync_preamble_halfsym_2phase(std::complex<double>* in, int size, int interpolation_rate, double early_exit_metric = 0.0);
-	TimeSyncResult time_sync_preamble_fft(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb);
-	TimeSyncResult time_sync_preamble_fft_fine(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int coarse_pos, int search_half_window);
+	// combine_mode: 0 = coherent across symbols per bin (original orphan; max
+	// gain but CFO-fragile — collapses by ~5 Hz residual, fat noise tail).
+	// 1 = coherent across BINS within a symbol, NON-coherent across symbols
+	// (CFO-robust across the preamble span; tighter noise tail). Plan §6 risk #2.
+	TimeSyncResult time_sync_preamble_fft(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int combine_mode = 0);
+	TimeSyncResult time_sync_preamble_fft_fine(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int coarse_pos, int search_half_window, int combine_mode = 0);
+	// OFDM-data acquisition fix (Step 1): map the coherent FFT detector's RAW
+	// metric onto the [0,1] coarse_metric ARQ contract (clean≈1, noise≈small).
+	// Both modes have a pure-noise random-walk floor ≈ 1; the clean value
+	// differs by mode (mode 0 ≈ preamble_nSymb; mode 1 ≈ preamble_bins/symbol).
+	// Transform subtracts the floor and normalizes by the clean-minus-floor span:
+	//   norm = clamp( (raw - 1) / (clean_ref - 1), 0, 1 )
+	// See fact-documents/ofdm-data-acquisition-fix-plan.md §11.2.
+	static double normalize_fft_metric(double raw, double clean_ref);
+	// Number of PREAMBLE subcarriers in preamble symbol 0 (the mode-1 clean
+	// reference). Recomputes from ofdm_preamble[].type — config state.
+	int preamble_bins_per_symbol();
+	// Production WB detector: combine_mode 1 (CFO-robust), [0,1]-normalized.
+	TimeSyncResult time_sync_preamble_fft_norm(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb);
+	TimeSyncResult time_sync_preamble_fft_fine_norm(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int coarse_pos, int search_half_window);
 	int time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, const int* preamble_tones, int mfsk_M, int nStreams, const int* stream_offsets, int search_start_symb = 0, double* out_metric = nullptr);
 	// combine_reps (§20, tier2-suffix-fec-design.md): noncoherent base-pattern
 	// combining. When >1, the matcher treats ack_nsymb as ONE base block repeated
@@ -309,6 +327,13 @@ public:
 	double mfsk_corr_template_energy;
 	int mfsk_corr_template_nsymb;
 	double mfsk_corr_template_sym_energy[16]; // per-symbol energy for per-symbol correlation
+
+	// OFDM-data acquisition fix (Step 1): measured clean reference for the
+	// coherent FFT detector's [0,1] normalization (the raw mode-1 metric a clean
+	// preamble produces through the TX→RX round-trip; pure-noise floor ≈ 1).
+	// Calibrated in cl_telecom_system::load_configuration for WB OFDM; falls
+	// back to the theoretical bins/symbol if uncalibrated. See plan §11.2/§11.5.
+	double fft_clean_ref;
 
 	// MFSK preamble parameters consumed by `time_sync_mfsk_corr` (post-2026-05-27
 	// discrete-match port). Populated by load_configuration alongside the
