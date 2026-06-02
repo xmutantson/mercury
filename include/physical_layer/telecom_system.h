@@ -244,6 +244,19 @@ public:
 	// FORCE-on for this increment (no CAP negotiation yet). Returns the coded N.
 	int  set_suffix_fec(bool on, int repfact = 3);
 
+	// ROBUST_RA (WIN CAMPAIGN b, fact-documents/data-flow-robust-ra-e2e.md): decode
+	// the M16x2 GF(16)-RA R1/4 data payload from the SYNCED per-symbol FFT
+	// (data_container.ofdm_symbol_demodulated_data, already mixed/equalized at the
+	// detector+mini-Moose offset). Builds the N x 16 tone-energy matrix (per-stream
+	// energy SUM = the M16x2 diversity combine, same as decode_suffix_energies),
+	// runs gf16ra::soft_decode_k (Bessel-I0 intrinsic), and writes the K*4 decoded
+	// info bits to out_bits (MSB-first per GF(16) symbol). repfact selects the rate
+	// (3 = R1/4). Returns the BP iteration count (>=0) or -1 on a config/size error.
+	// ADDITIVE: only called from receive_msg when current_configuration==ROBUST_RA;
+	// all other configs keep the mfsk.demod + LDPC path byte-identical.
+	int  decode_robust_ra_data(const std::complex<double>* sym_fft, int n_periods,
+	                           int K_info, int repfact, int* out_bits);
+
 	// §20 (INCREMENT 2): set the CONNECT base-pattern noncoherent combining factor
 	// R. R>1 → ack_mfsk.connect_preamble_reps=R (TX emits the base block R times,
 	// RX sums per-symbol energy across the R aligned reps before the matched-count)

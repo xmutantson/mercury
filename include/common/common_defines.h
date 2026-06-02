@@ -88,12 +88,26 @@ extern int g_verbose;
 #define CONFIG_16 16
 
 // ROBUST (MFSK) configurations - values 100+ to avoid collision with OFDM configs
+// NUMBER_OF_ROBUST_CONFIGS stays 3 = the count of LADDER robust configs
+// (ROBUST_0/1/2). ROBUST_RA is an OFF-LADDER additive data mode reached only by an
+// explicit pin (-s 103); it is intentionally NOT in FULL_CONFIG_LADDER so the
+// gearshift/Q-table are byte-identical (fact-documents/data-flow-robust-ra-e2e.md
+// §1/§3). NUMBER_OF_ROBUST_CONFIGS is currently unreferenced in source/, so the
+// value is informational; leaving it 3 documents "ladder robust count".
 #define NUMBER_OF_ROBUST_CONFIGS 3
 #define ROBUST_0 100  // 32-MFSK, LDPC rate 1/16, ~14 bps (hailing mode)
 #define ROBUST_1 101  // 16-MFSK x2, LDPC rate 1/16, ~22 bps
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
+// ROBUST_RA: WIN CAMPAIGN (b) "-10 data mode" — 16-MFSK x2 (FREQUENCY DIVERSITY, the
+// model the combiner+extractor implement) + GF(16)-RA R1/4 Q-ary FEC (NOT binary
+// LDPC) on the data path. Off-ladder, pin-only (-s 103). END-TO-END (real sync)
+// AWGN cliff -12.28 dB SNR3k (genie -13.54, real-sync penalty +1.26); clears -10 by
+// 2.28 dB. ~39 bps net wire at R1/4 (the diversity rate; the P0 "77 bps" assumed an
+// independent-stream model the extractor does NOT implement — see
+// data-flow-robust-ra-e2e.md §10/§G2-CORRECTION). Additive: ROBUST_0/1/2 untouched.
+#define ROBUST_RA 103 // 16-MFSK x2 diversity, GF(16)-RA R1/4 Q-ary data FEC, ~39 bps (-10 reach)
 
-inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
+inline bool is_robust_config(int config) { return config >= 100 && config <= 103; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor

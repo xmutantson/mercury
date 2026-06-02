@@ -3484,6 +3484,60 @@ int cl_telecom_system::set_suffix_fec(bool on, int repfact)
 	return ack_mfsk.ctrl_suffix_len();
 }
 
+// ROBUST_RA data decode (WIN CAMPAIGN b). See telecom_system.h. Builds the N x 16
+// tone-energy matrix from the SYNCED per-symbol FFT and runs the GF(16)-RA Bessel-I0
+// soft decoder. This is the PRODUCTION Q-ary RA data path; it is the same chain the
+// end-to-end gate test (robust_ra_e2e_cliff) proved through the real combiner-detector
+// + mini-Moose. ADDITIVE: receive_msg calls it only for current_configuration==ROBUST_RA.
+//
+// FRAME-GEOMETRY note (fact-documents/data-flow-robust-ra-e2e.md §8(3)): the codeword
+// length N=K+repfact*K must equal the number of available data symbol periods. This
+// method decodes whatever (K,repfact) the caller configured against n_periods; making
+// data_container.nBits / the TX framing / ARQ batch sizing line up with the RA codeword
+// for an arbitrary-payload ARQ session is the explicit P2 follow-on. The PHY decode
+// here is complete and proven.
+int cl_telecom_system::decode_robust_ra_data(const std::complex<double>* sym_fft,
+	int n_periods, int K_info, int repfact, int* out_bits)
+{
+	if (sym_fft == NULL || out_bits == NULL) return -1;
+	int N = gf16ra::configure_k(K_info, repfact);
+	if (N <= 0 || N > n_periods) return -1;       // need one period per codeword symbol
+	const int Mt = gf16ra::GF16RA_M;              // GF(16) alphabet = 16 tones
+	if (mfsk.M != Mt) return -1;
+	// Es/No for the Bessel-I0 intrinsic — the §10/§20 spike value (4.0 = ~6 dB),
+	// matching the gate test's GF16RA_ESNO_METRIC (mfsk_ctrl_codec_tests.cc).
+	const double esno_metric = 4.0;
+	int Ncc = data_container.Nc;
+	std::vector<double> E((size_t)N * Mt, 0.0);
+	// Per period s: sum each candidate tone's energy across streams (the M16x2
+	// diversity combine, identical to decode_suffix_energies), then de-hop. The FFT
+	// here is already the centered symbol_demod output indexed [s*Nc + subcarrier].
+	for (int s = 0; s < N; s++) {
+		int hop = (s * mfsk.tone_hop_step) % Mt;
+		for (int t = 0; t < Mt; t++) {
+			double e_comb = 0.0;
+			for (int st = 0; st < mfsk.nStreams; st++) {
+				int sub = mfsk.stream_offsets[st] + t;
+				if (sub < 0 || sub >= Ncc) continue;
+				std::complex<double> v = sym_fft[(size_t)s * Ncc + sub];
+				e_comb += v.real() * v.real() + v.imag() * v.imag();
+			}
+			int data_tone = (t - hop + Mt * 256) % Mt;
+			E[(size_t)s * Mt + data_tone] = e_comb;
+		}
+	}
+	std::vector<int> info(K_info);
+	int iters = gf16ra::soft_decode_k(E.data(), 100, esno_metric, info.data());
+	// Unpack each GF(16) info symbol to 4 bits, MSB-first (matches mfsk.mod's
+	// Gray-then-binary bit->tone order is NOT used here: the RA codec is symbol-native,
+	// so we emit the raw 4-bit symbol value MSB-first; the TX encode hook must pack
+	// the same way -- this is the symmetric production convention for the RA path).
+	for (int k = 0; k < K_info; k++)
+		for (int b = 0; b < 4; b++)
+			out_bits[k * 4 + b] = (info[k] >> (3 - b)) & 1;
+	return iters;
+}
+
 // §20 (INCREMENT 2): set the CONNECT base-pattern combining factor R. See
 // telecom_system.h. Must be called AFTER load_configuration. R=1 = off
 // (byte-identical). Re-derives the passband sample count so every TX consumer
@@ -5163,6 +5217,20 @@ void cl_telecom_system::load_configuration(int configuration)
 	{
 		_modulation=MOD_MFSK;
 		_ldpc_rate=4/16.0;  // Rate 1/4: 4x throughput vs ROBUST_1, waterfall at -8 dB
+		ofdm_preamble_configurator_Nsymb=4;
+		ofdm_channel_estimator=LEAST_SQUARE;
+	}
+	else if(configuration==ROBUST_RA)
+	{
+		// WIN CAMPAIGN (b) -10 data mode. Same M16x2 MFSK PHY as ROBUST_1/2 (the
+		// ROBUST_0 != guards below route 103 -> M16x2), but the DATA payload is
+		// FEC-coded by the GF(16)-RA R1/4 Q-ary codec (gf16ra::*_k), NOT the binary
+		// LDPC. _ldpc_rate is kept at the ROBUST_0/1 1/16 value so the LDPC subsystem
+		// initializes to a known-good matrix for the control/handshake path; the RA
+		// data RX path (receive_msg, gated on ROBUST_RA) bypasses the binary LDPC.
+		// See fact-documents/data-flow-robust-ra-e2e.md §4 (INV-C1).
+		_modulation=MOD_MFSK;
+		_ldpc_rate=1/16.0;
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
