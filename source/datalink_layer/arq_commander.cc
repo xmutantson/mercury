@@ -8330,6 +8330,146 @@ printf("[TEST-CLIMB] %s (%d failure%s)\n",
 	return failed == 0 ? 0 : 1;
 }
 
+// ROBUST_0 + streaming-compression deadlock regression
+// (data-flow-compress-frame-fill.md). Production bug: with compression ON,
+// every ARQ session now STARTS at ROBUST_0 (batch=1) since MFSK-CONNECT
+// shipped. At ROBUST_0 the per-frame payload budget (max_frame) equals the
+// streaming compression header size (7 bytes), so batch_capacity = 1*max_frame
+// = 7. compress_block() needs hdr_size(7) + >=1 payload byte > out_capacity(7)
+// → returns -1 on EVERY block. The CMD-side adaptive-fill loop's RAW fallback
+// then caps raw to (batch_capacity - hdr_sz) = 0 bytes, stages a 7-byte
+// header-only frame carrying ZERO application payload, and pushes ALL popped
+// data back to the FIFO. Result: the link sends a DATA frame every batch but
+// delivers 0 application bytes forever (batch_uncompressed_size == 0), the FIFO
+// never drains (TX FIFO stays ~full on HW), and no clean batch ever completes
+// (no gearshift climb credit). DEADLOCK at ROBUST_0 even at high SNR.
+//
+// This test drives the REAL process_buffer_data_commander() data-fill path with
+// streaming compression enabled, ROBUST_0 frame dimensions, and a real
+// compressible payload staged in fifo_buffer_tx. The single load-bearing
+// assertion is C2: at least one application byte is staged for delivery
+// (batch_uncompressed_size > 0). FAIL-BEFORE on fef293f (every batch stages 0
+// payload); PASS-AFTER the fix.
+//
+// In-process, no PHY/audio/TCP. We prime ROBUST_0 dimensions directly (the same
+// values load_configuration(100) computes — verified empirically: nBits=1600,
+// LDPC rate 1/16 → frame=12 bytes, max_header_length=6 → max_data_length=6,
+// max_frame = 6 + 6 - DATA_LONG_HEADER_LENGTH_V2(5) = 7) and allocate only the
+// buffers the data-fill touches. One-shot, exits rc. See §5 audit.
+int cl_arq_controller::test_robust0_compress_deadlock()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-R0CMP] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-R0CMP] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// --- ROBUST_0 dimension priming (load_configuration(100) equivalent) ---
+	// nBytes_header = max(ACK_MULTI=3, CONTROL_ACK=3, eff_long_v2=5, eff_short_v2=6)=6
+	// nBytes_data   = get_frame_size_bytes()(12) - nBytes_header(6) = 6
+	max_data_length   = 6;
+	max_header_length = 6;
+	sack_v2_enabled   = true;   // production default since Design A Step 14
+	robust_enabled    = YES;
+	narrowband_enabled= NO;
+	current_configuration = ROBUST_0;
+	role          = COMMANDER;
+	original_role = COMMANDER;
+	link_status        = CONNECTED;
+	connection_status  = TRANSMITTING_DATA;
+	block_under_tx     = NO;
+	retransmit_count   = 0;
+	message_batch_counter_tx = 0;
+	compress_ratio_estimate = 2.0f;
+
+	// max_frame the data-fill computes — exposed so the assertion is explicit.
+	int max_frame = max_data_length + max_header_length
+	              - effective_data_long_header_length(sack_v2_enabled);
+	check(max_frame == 7,
+		"C0 ROBUST_0 max_frame == 7 (== COMPRESS_HEADER_SIZE, the worst case)",
+		max_frame, 7);
+
+	// load_configuration(100) pins data_batch_size=1 at robust (arq_common.cc:1334).
+	nMessages = 32;                 // >= a robust batch; alloc 32 slots
+	set_data_batch_size(1);
+	check(data_batch_size == 1, "C1 ROBUST_0 batch pinned to 1", data_batch_size, 1);
+
+	// --- Allocate only what process_buffer_data_commander() touches ---
+	deinit_messages_buffers();      // idempotent; clears any prior alloc
+	int alloc_rc = init_messages_buffers();   // allocates messages_tx[].data + message_TxRx_byte_buffer
+	check(alloc_rc == SUCCESSFUL, "C1b message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+
+	// --- Streaming compression ON (the production B2F/-F on path) ---
+	compressor.init();
+	compressor.streaming_enable();
+	compression_enabled = true;
+	check(compressor.is_streaming() ? 1 : 0,
+		"C1c streaming compression enabled", compressor.is_streaming() ? 1 : 0, 1);
+
+	// --- Stage a real compressible payload (highly repetitive => high ratio) ---
+	// 4 KB of text-like repetition. Even at a high compression ratio the
+	// compressed block + 7-byte streaming header cannot fit a 7-byte frame, so
+	// compress_block() returns -1 — exactly the production condition.
+	const int PAYLOAD = 4096;
+	char payload[PAYLOAD];
+	const char* phrase = "the quick brown fox jumps over the lazy dog. ";
+	int plen = (int)strlen(phrase);
+	for(int i=0;i<PAYLOAD;i++) payload[i] = phrase[i % plen];
+	int pushed = fifo_buffer_tx.push(payload, PAYLOAD);
+	check(pushed == PAYLOAD, "C1d payload staged in fifo_buffer_tx", pushed, PAYLOAD);
+
+	int fifo_before = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+
+	// --- Drive the REAL data-fill path (one batch cycle) ---
+	batch_uncompressed_size = -1;   // sentinel so we can see it was written
+	process_buffer_data_commander();
+
+	int fifo_after = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	int staged_frames = get_nOccupied_messages();
+
+	printf("[TEST-R0CMP] after fill: batch_uncompressed_size=%d staged_frames=%d "
+	       "fifo_before=%d fifo_after=%d block_under_tx=%d\n",
+	       batch_uncompressed_size, staged_frames, fifo_before, fifo_after,
+	       block_under_tx);
+	fflush(stdout);
+
+	// === THE load-bearing assertion ===
+	// C2: at least one APPLICATION byte must be carried by the staged batch.
+	// On fef293f this is 0 (RAW fallback caps raw to batch_capacity - hdr = 0),
+	// so the link delivers nothing forever. The fix must stage > 0 app bytes
+	// at ROBUST_0.
+	check(batch_uncompressed_size > 0,
+		"C2 ROBUST_0+compression stages >0 application bytes (THE deadlock fix)",
+		batch_uncompressed_size, 1);
+
+	// C3: a DATA frame was actually queued (the batch is non-empty).
+	check(staged_frames >= 1,
+		"C3 at least one DATA frame staged", staged_frames, 1);
+
+	// C4: the FIFO drained by the bytes we delivered (progress is made — the
+	// FIFO does not stay ~full). Drain == fifo_before - fifo_after must equal
+	// batch_uncompressed_size (every popped byte is either delivered or, on the
+	// fix, carried; none silently lost).
+	int drained = fifo_before - fifo_after;
+	check(drained == batch_uncompressed_size && drained > 0,
+		"C4 FIFO drained by exactly the delivered byte count (forward progress)",
+		drained, batch_uncompressed_size);
+
+	deinit_messages_buffers();      // tidy up
+
+	printf("[TEST-R0CMP] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // SACK Design A Step 11 — helper: stage and send a SET_LINK_PARAMS for a
 // new Axis-3 sack_mode value. Carries the CURRENT data_batch_size in the
 // batch field so the RSP-side controller (which already handles
@@ -8707,7 +8847,16 @@ void cl_arq_controller::process_buffer_data_commander()
 			// loses 1 byte to the batch_seq_id field.
 			int max_frame = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled);
 
-			if(compression_enabled)
+			// ROBUST_0 compression-deadlock fix (data-flow-compress-frame-fill.md
+			// §5). Use compression ONLY when the per-batch budget can hold the
+			// streaming header PLUS a payload byte. At ROBUST_0 batch_capacity ==
+			// get_header_size() == 7, so compress_block() would return -1 every
+			// batch and the RAW fallback would stage a 0-payload frame forever
+			// (0 bps, FIFO never drains, no clean batch, no gearshift climb). The
+			// SAME predicate gates the RX assembly in copy_data_to_buffer(), so
+			// both peers agree (no wire negotiation): at robust both run the
+			// headerless uncompressed path below; at OFDM rungs both compress.
+			if(compression_viable_for_batch())
 			{
 				// Phase D timing — bracket the compression+encrypt+frame-split
 				// work for this batch. Suspected to be the bulk of the 406ms
@@ -8970,7 +9119,17 @@ void cl_arq_controller::process_buffer_data_commander()
 			}
 			else
 			{
-				// --- No compression: original per-frame loop ---
+				// --- No compression (or compression not viable for this batch):
+				// original per-frame loop, headerless raw frames. ---
+				// Reached when compression is OFF, OR when it is ENABLED but the
+				// per-batch budget can't hold the streaming header (robust /
+				// tiny-frame; see compression_viable_for_batch()). When streaming
+				// is armed but bypassed for this batch, freeze the model: drop any
+				// pending raw a prior OFDM fill may have staged so the next data
+				// ACK's commit_pending() can't mis-commit it (data-flow-compress-
+				// frame-fill.md §6.1). No-op when nothing is pending / not streaming.
+				if(compression_enabled && compressor.is_streaming())
+					compressor.clear_pending();
 				int filled = 0;
 				int fill_limit = data_batch_size;
 				batch_uncompressed_size = 0;
