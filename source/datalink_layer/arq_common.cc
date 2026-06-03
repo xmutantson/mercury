@@ -73,22 +73,39 @@ extern cbuf_handle_t playback_buffer;
 //   (2) playback drain:          while(size_buffer(playback_buffer) > 0) msleep(1);
 //
 // Under -x sim, cl_timer already measures VIRTUAL channel time and the drain
-// is serviced by the TX bridge thread, so both loops auto-virtualize — BUT a
-// raw `while(...) msleep(1)` would either burn a real ms per virtual ms (no
-// speed-up) or, if the sleep were removed, peg a core / livelock while the
-// other thread advances virtual time. So in SIM mode these helpers yield()
-// (cooperatively hand the core to the RX-prep / TX-bridge thread that drives
-// virtual time) instead of sleeping a real millisecond. In PRODUCTION (sim
-// disabled) they do EXACTLY the stock `msleep(1)` — byte-identical behavior.
-// Factored to ONE definition each so the policy lives in a single place.
+// is serviced by the TX bridge thread, so both loops auto-virtualize: the PTT
+// spin exits as soon as VIRTUAL time passes delay_ms (which, with virtual time
+// advancing ~5-10x faster than wall-clock, takes a fraction of the real
+// delay), and the drain exits as soon as the bridge has shipped the frame.
+//
+// The poll granularity matters. A first cut used std::this_thread::yield()
+// (no sleep). That ran the ARQ thread, the RX-prep thread, the TX bridge and
+// the RX bridge ALL hot-spinning at max frequency, which made the CMD<->RSP
+// PTT turnaround timing race: the two peers are SEPARATE processes with
+// SEPARATE virtual clocks coupled only through the real-time relay, and
+// adversarial hot-spinning let one peer's virtual clock sprint past the
+// other's, corrupting the half-duplex turnaround (RSP's HAIL response was
+// dropped by a CMD that had already raced through its ptt_off_delay). It also
+// pegged a core to no purpose. So in SIM mode we sleep a SHORT real interval
+// (SIM_SPIN_SLEEP_US) instead of yielding: it hands the core to the sibling
+// threads, keeps the two processes loosely paced together (so their virtual
+// clocks stay coupled via the relay), and is far shorter than the virtual
+// durations being waited — so the faster-than-real-time speed-up is preserved
+// (the loop still exits on the VIRTUAL condition, the sleep only bounds the
+// poll overshoot to <1 ms). In PRODUCTION (sim disabled) both helpers do
+// EXACTLY the stock `msleep(1)` — byte-identical behavior. Factored to ONE
+// definition each so the policy lives in a single place.
+static const int SIM_SPIN_SLEEP_US = 200;
+static inline void sim_spin_sleep()
+{
+	std::this_thread::sleep_for(std::chrono::microseconds(SIM_SPIN_SLEEP_US));
+}
 static inline void ptt_busy_wait(cl_timer& t, int delay_ms)
 {
 	if (sim_clock_enabled())
 	{
-		// Virtual time advances on the RX-prep thread (rx_transfer); yield so
-		// it runs. The timer trips in virtual time without real wall sleep.
 		while (t.get_elapsed_time_ms() < delay_ms)
-			std::this_thread::yield();
+			sim_spin_sleep();
 	}
 	else
 	{
@@ -101,9 +118,8 @@ static inline void drain_playback_wait()
 {
 	if (sim_clock_enabled())
 	{
-		// The TX bridge thread drains playback_buffer; yield so it runs.
 		while (size_buffer(playback_buffer) > 0)
-			std::this_thread::yield();
+			sim_spin_sleep();
 	}
 	else
 	{
@@ -2777,11 +2793,13 @@ void cl_arq_controller::process_main()
 	// ARQ main-loop pacing floor. In production this 2 ms sleep caps the poll
 	// rate at ~500 Hz (plenty for a real radio's frame cadence). Under -x sim
 	// it would throttle the whole control loop to wall-clock 500 Hz and erase
-	// the faster-than-real-time speed-up, so yield instead: hand the core to
-	// the RX-prep / TX-bridge threads (which drive virtual time) and re-poll
-	// immediately. Gated on the flag -> production unchanged.
+	// the faster-than-real-time speed-up, so use the short SIM spin sleep: it
+	// hands the core to the RX-prep / TX-bridge threads (which drive virtual
+	// time) and keeps the two peer processes loosely paced together (a raw
+	// yield here hot-spun the loop and helped desync the CMD<->RSP turnaround).
+	// Gated on the flag -> production unchanged.
 	if (sim_clock_enabled())
-		std::this_thread::yield();
+		sim_spin_sleep();
 	else
 		usleep(2000);
 }
