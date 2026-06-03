@@ -5356,14 +5356,32 @@ void cl_telecom_system::load_configuration(int configuration)
 		// WIN CAMPAIGN (b) -10 data mode. Same M16x2 MFSK PHY as ROBUST_1/2 (the
 		// ROBUST_0 != guards below route 103 -> M16x2), but the DATA payload is
 		// FEC-coded by the GF(16)-RA R1/4 Q-ary codec (gf16ra::*_k), NOT the binary
-		// LDPC. _ldpc_rate is kept at the ROBUST_0/1 1/16 value so the LDPC subsystem
-		// initializes to a known-good matrix for the control/handshake path AND so the
-		// data-frame geometry (nReal_data=100 bits @ M16x2) matches the RA codeword
-		// (K_info=nReal_data/4=25 GF16 syms, R1/4 -> N=100 symbol periods, fits Nsymb=200);
-		// the RA data RX/TX path bypasses the binary LDPC. See
-		// fact-documents/data-flow-robust-ra-e2e.md §4 (INV-C1) + p2-robust-ra-wiring.md §1/§4.
+		// LDPC. The RA data RX/TX path bypasses the binary LDPC entirely; _ldpc_rate
+		// here serves TWO purposes: (a) the LDPC subsystem still init()s to a valid
+		// matrix for the control/handshake path, and (b) ldpc.P sizes the RA data
+		// frame, because nReal_data = nBits - ldpc.P (telecom_system.cc:4578) is the
+		// payload-bit budget the RA codec carries (K_info = ceil(nReal_data/4) GF(16)
+		// info symbols, N = 4*K_info codeword periods at repfact=3).
+		//
+		// WIN-CAMPAIGN Front-A increment 1 (LONGER FRAMES, p2-robust-ra-wiring.md §10):
+		// rate 1/16 left the frame HALF-EMPTY — nReal_data=100 -> K_info=25 -> N=100
+		// codeword periods in a Nsymb=200 frame (only 100 of 200 periods emitted). The
+		// per-frame ACK turnaround (~4.9s) + the fixed DATA header are amortized over
+		// just ~4-5 user bytes, so delivered net @ -10 is ~37% of the on-air budget.
+		// Raising the rate to 2/16 (= 1/8) sets ldpc.P=1400 -> nReal_data=200 ->
+		// K_info=50 -> N=200, which FILLS the existing Nsymb=200 frame exactly (no
+		// geometry / buffer_Nsymb / N_MAX change — Nsymb stays 200, every buffer is
+		// already sized for it; data-flow-robust-ra-e2e.md §1.3). The RA codec stays
+		// repfact=3 (R1/4 over the GF16 codeword), so the ~5.3 dB coding gain that puts
+		// cfg103 at the -14 dB floor (tier2-suffix-fec-gf16-spike.md §8.4) is UNCHANGED:
+		// the LDPC rate only sizes the payload, it is NOT the data FEC. frame_size
+		// grows 10B -> 23B; the bigger frame amortizes the fixed header (~6B) + ACK
+		// turnaround over ~2.3x more coded payload -> >=2x delivered user-bps (the
+		// 4x N_MAX-growth frame is the bounded follow-on, p2 §10.3). N=200 <= Nsymb=200
+		// so the §4 overflow clamp never trips. See p2-robust-ra-wiring.md §10 (the
+		// longer-frame audit) + §1/§4 (the geometry derivation).
 		_modulation=MOD_MFSK;
-		_ldpc_rate=1/16.0;
+		_ldpc_rate=2/16.0;
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}

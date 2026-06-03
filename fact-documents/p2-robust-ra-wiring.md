@@ -437,3 +437,174 @@ Branch `win/incr1-p2-robust-ra-wiring` off monitor @0c75cc2. Worktree
 `C:/Users/kamer/mercury_wt/incr1-p2-robust-ra-wiring`. Commit hash: [filled at commit]. NOT
 pushed; monitor untouched. Binary NOT installed to Program Files (SIM-only; --test runs
 in-process; avoided clobbering a possibly-concurrent bench binary).
+
+---
+
+## §10 WIN-CAMPAIGN Front-A increment 1 — LONGER FRAMES + the airtime nStreams/active bug
+
+**Status:** SIM/in-process, 2026-06-02, branch `win/incr1-longer-frame-airtime` off the
+integration `win/integ-incr1-incr2 @fd5c698` (worktree
+`C:/Users/kamer/mercury_wt/win-integ-incr1-incr2`). NO bench, NO HW. batch stays 1
+(incr2's batch≥2 RF-refuted; this increment keeps `robust_dwell_batch=1`).
+
+### §10.1 The problem (Front-A ac0546c5, code-grounded)
+Per-frame cycle @ −10 = 7891 ms for ~5 user bytes: frame on-air 2946 ms (37%), **ACK
+turnaround 4539 ms (57.5%)**, tails ~400 ms. The lever is LONGER FRAMES: efficiency =
+T_air/(T_air + ~4.9 s fixed). The shipped cfg103 (§9.1) is rate 1/16 →
+nReal_data=100 → K_info=25 → **N=100 codeword periods in a Nsymb=200 frame (HALF EMPTY,
+only 100 of 200 periods on air)**, so the fixed ACK turnaround + the fixed DATA header
+(6 B, §10.4) are amortized over only ~4 user bytes.
+
+### §10.2 The change (ONE structural change + the prerequisite airtime fix)
+**(a) Longer frame — `telecom_system.cc:5366` cfg103 `_ldpc_rate` 1/16 → 2/16.** The RA
+data path bypasses the binary LDPC; `ldpc.P` is ONLY the payload-size knob
+(`nReal_data = nBits − ldpc.P`, `:4578`). Rate 2/16 ⇒ P=1400 ⇒ nReal_data=200 ⇒
+K_info=50 ⇒ **N = configure_k(50,3) = 200**, which FILLS the existing Nsymb=200 frame
+exactly. The RA codec stays **repfact=3 (R¼)** — `ROBUST_RA_REPFACT` is unchanged — so the
+~5.3 dB coding gain that puts cfg103 at the −14 dB floor
+(`tier2-suffix-fec-gf16-spike.md` §8.4) is INTACT; the LDPC rate sizes the payload, it is
+NOT the data FEC. frame_size 10 B → **23 B**. N=200 ≤ Nsymb=200 ⇒ the §4 overflow clamp
+never trips. K is NOT a blocker: `gf16ra::configure_k/encode_k/soft_decode_k` are the
+K-GENERALIZED data variant (`mfsk_ctrl_codec.h:295-316`, heap-allocated, K unbounded by
+GF16RA_MAX_N); the K=13 lock is only the *ctrl-suffix* `configure/encode/soft_decode`
+(no `_k`), which this path does not use.
+
+**(b) Airtime bug (prerequisite) — `arq_common.cc:1397` `data_container.Nsymb` →
+`get_active_nsymb()`, cfg103-gated.** `message_transmission_time_ms` is the DATA-frame
+on-air time. The TX emits `get_active_nsymb()` data periods (`telecom_system.cc:712` loop
+bound), and the RX bounds use `get_active_nsymb()` (`:1490`), but the formula used the
+ALLOCATED `data_container.Nsymb`. For cfg103 `get_active_nsymb()` returns `robust_ra_N`
+(`:3168`) = N < Nsymb, so the formula **over-estimated cfg103 airtime by Nsymb/N** (1.86×
+at N=100; the formula computed 5580 ms vs the true ~2997 ms on-air — matches Front-A's
+~2946 ms measured). The task framed this as "Nsymb=200 but cl_mfsk emits 100 because
+nStreams=2 packs 2/period". That `Nsymb/nStreams` heuristic gives the right number ONLY
+while N=Nsymb/2 (the rate-1/16 coincidence); the ROOT CAUSE is **active≠allocated**, and
+once the longer frame fills N to 200 the `nStreams`-divide would compute HALF the true
+airtime (catastrophically short timeouts). **`get_active_nsymb()` is the correct,
+frame-size-robust fix.** Gated `current_configuration==ROBUST_RA` so the non-cfg103 value
+is provably byte-identical (and independent of the transient `mfsk_ctrl_mode` puncture,
+which is never active at config-load anyway). Ordering: ARQ `load_configuration`
+(`arq_common.cc:1325`) calls `telecom_system->load_configuration()` (which sets
+`robust_ra_N`, `:4580`) BEFORE the formula (`:1397`) — so `get_active_nsymb()` is valid.
+
+### §10.3 Why NOT 4× (the N_MAX ceiling — the bounded follow-on)
+4× payload (K_info≈100) needs N=400 > Nsymb=200. Nsymb is `N_MAX/bits_per_symbol`
+(`telecom_system.cc:4439`; N_MAX=1600, M16×2 ⇒ 200). Growing it would require raising the
+global `#define N_MAX` (`physical_defines.h:31`), which sizes `data_bit`, `encoded_data`,
+`bit_interleaved_data`, `hd_decoded_data_*` etc. (`data_container.cc:106-145`) for EVERY
+config AND the LDPC `framesize` (`MERCURY_NORMAL`) — the exact multi-layer ripple §1.3 +
+CLAUDE.md §5 warn against. Lever A (fill the existing frame) is the **largest frame
+achievable within the existing buffer geometry** and is fully contained. The N_MAX-growth
+4× frame is flagged as the bounded follow-on increment (a per-cfg103 Nsymb override + the
+N_MAX-sized buffers audited for the bigger frame).
+
+### §10.4 §5 cross-layer audit — the frame-size + airtime CONSUMERS
+
+**The shared state changed: (i) the cfg103 frame geometry (frame_size, N, nReal_data) via
+ldpc.P; (ii) `message_transmission_time_ms` via the airtime formula.** PHY (frame
+geometry/buffers) × ARQ (windows/caps). The decisive property that keeps this contained:
+**Nsymb stays 200** — only the *fill fraction* (N: 100→200) and the *payload* (P: 1500→1400)
+change. Every buffer sized on Nsymb is therefore UNCHANGED.
+
+**(1) Producers of the geometry:** `load_configuration` (`telecom_system.cc:5366`
+`_ldpc_rate`), `ldpc.init()` (`ldpc.cc:67-68` K=N·rate, P=N−K — algorithmic IRA, every k/16
+rate valid, NOT table-driven), the §1/§4 RA-geometry block (`:4576-4599` derives K_info, N
+from nReal_data). **Producer of the airtime:** `arq_common.cc:1397` (the one site;
+`ctrl_transmission_time_ms` `:1398-1400` keys on the separate `ctrl_nsymb` and is
+unchanged).
+
+**(2) Consumers and how each stays safe for the N=100→200 (active) + P=1500→1400 (payload)
+change:**
+
+| Consumer | file:line | Keys on | Safe because |
+|---|---|---|---|
+| RX overflow guard | telecom_system.cc:1490-1499 | `get_active_nsymb()` (=N) + `buffer_Nsymb` | `buffer_Nsymb` sized on `preamble+Nsymb=200` (`data_container.cc:150`); N≤200 ⇒ `frame_end_samples ≤ buffer_samples` exactly as a full robust frame |
+| OFDM preamble bound | telecom_system.cc:1503 | full `Nsymb` (=200) | Nsymb UNCHANGED |
+| TX symbol_mod loop | telecom_system.cc:712 | `get_active_nsymb()` (=N) | emits N periods into `ofdm_symbol_modulated_data` sized `Nofdm·alloc_Nsymb` (alloc=max(Nsymb,48,128)=200); N=200 fits |
+| TX passband span | telecom_system.cc:739 | `Nofdm·active_nsymb` | within `passband_data` sized `(Nsymb+preamble)·Nofdm·interp` (`data_container.cc:167`) |
+| RX FFT loop | telecom_system.cc:2329-2333 | `get_active_nsymb()` (=N) | writes `ofdm_symbol_demodulated_data` sized `Nsymb·Nc=200·Nc`; N≤200 |
+| RA decode periods | telecom_system.cc:2399 | `robust_ra_N` (=N) | reads N≤200 periods from the same Nsymb-sized buffer |
+| `ofdm_framed_data` | data_container.cc:129 | `alloc_Nsymb·Nc`=200·Nc | TX RA places N=200 tones (`:579+`), in-bounds |
+| ARQ frame_size | arq_common.cc:1355 | `nBits − ldpc.P − reserved` | grows 10→23 B BY DESIGN; the ARQ buffers (`set_max_buffer_length`) re-size to the new frame_size at load |
+| `message_transmission_time_ms` | arq_common.cc:1397 (FIXED) | `get_active_nsymb()` for cfg103 | now the TRUE on-air time (5580 ms at N=200; was wrongly 5580 at N=100) |
+| CMD post-TX frame_drain | arq_common.cc:703 (`2*msg_time`) | msg_time | was 1.86× inflated at N=100 → now correct; at N=200 the true bigger frame is correctly accounted |
+| RSP rx_timeout | arq_common.cc:732 (`batch*msg_time`) | msg_time | same — was inflated, now tracks active N |
+| data/ctrl ACK windows | arq_common.cc:749/753/1467/1468/1472/1473 | msg_time | same |
+| RSP monitor_timeout | arq_responder.cc:1787/2492/2562 (`batch*msg_time`) | msg_time | same |
+| OFDM batch sizing | arq_common.cc:1421-1424, :782 | msg_time, **gated `!is_robust_config`** | cfg103 IS robust ⇒ batch sizing SKIPS it (batch stays `robust_dwell_batch`=1) ⇒ the airtime change cannot perturb cfg103's batch |
+| `buffer_Nsymb` | data_container.cc:150 | full `Nsymb` (=200) | Nsymb UNCHANGED ⇒ buffer_Nsymb UNCHANGED (already holds the N=200 active frame) |
+
+**(3) Valid states / default-init:** before the geometry block runs, `robust_ra_N=0`
+(`:87`); `get_active_nsymb()` then returns `Nsymb` (the `robust_ra_N>0` guard fails) — so a
+mis-ordered call is fail-safe (full Nsymb, never a too-short airtime). After the load arm,
+`robust_ra_N=200` for cfg103, 0 for every other config.
+
+**(4) Invariants:** (INV-A) `N ≤ Nsymb` (200≤200 — clamp guard `:4581` is the backstop).
+(INV-B) `buffer_Nsymb ≥ preamble + N` (564 ≥ 216 — the RX ring holds the active frame with
+turnaround+margin headroom). (INV-C) airtime byte-identical for active==Nsymb (every
+non-cfg103 config — proven by the cfg103 gate). (INV-D) repfact unchanged ⇒ R¼ coding gain
+unchanged (the bigger frame is NOT weaker FEC, it is MORE coded symbols at the same rate).
+
+**(5) What the fix changes vs every consumer:** only (i) cfg103's payload/N (fills the
+already-allocated frame) and (ii) cfg103's airtime (corrects an over-estimate). No consumer
+that keys on full `Nsymb`, `buffer_Nsymb`, or any N_MAX-sized buffer sees any change. The
+ARQ frame_size grows by design and the ARQ buffers track it at load. batch stays 1.
+
+### §10.5 Failing-test-first (CLAUDE.md §3) — `test_robust_ra_longer_frame_throughput`
+New in-process gate (`mfsk_ctrl_codec_tests.cc` §23, runs in `mercury --test`). Measures
+delivered **USER-bps** = `(frame_size − 6) · 8 / (T_air + T_fixed)` (T_air ∝ N+preamble
+periods) for the COMPILED cfg103 frame vs the documented small-frame reference (10 B, N=100,
+§9.1), and asserts ≥ 1.8× at the PESSIMISTIC T_fixed=0 (header + frame-fill amortization
+only; the realistic T_fixed only raises the ratio). It also round-trips the compiled frame
+**clean (4/4) + a lossy AWGN cell** (targeted SNR3k, well within the R¼ waterfall) so the
+throughput reflects a frame that actually delivers.
+- **FAIL-BEFORE** (rate 1/16): live geometry == reference (10 B/100) ⇒ ratio **1.00× < 1.8×
+  ⇒ FAIL** (53 passed, 1 failed). clean 4/4 + lossy 8/8 STILL pass at 1/16 — proving the
+  gate discriminates FRAME SIZE, not decode capability. (Measured 2026-06-02.)
+- **PASS-AFTER** (rate 2/16): [filled from the final run — see §10.6].
+
+### §10.6 RESULTS (measured 2026-06-02, dev host, SIM/in-process)
+**Build:** `bash build.sh o3` clean (only pre-existing winsock2/wasapi warnings). **Test:**
+`./mercury.exe --test` (in-process; NO bench, NO HW; binary NOT installed — avoided
+clobbering a possibly-concurrent v13 Q-table bench, per §9.6).
+
+- **Geometry (PASS-AFTER, rate 2/16):** `[ROBUST_RA] geometry: nReal_data=200 K_info=50
+  repfact=3 N=200 Nsymb=200 (active data periods=200)`; PHY `nBits=1600 ldpc.P=1400 nReal=200
+  K_info=50 N=200 Nsymb=200 frame_size=23B reserved=16`. The frame is FILLED (N=200 of 200);
+  repfact=3 (R¼ coding gain intact). frame_size 10→**23 B**.
+- **§22 existing roundtrip STILL GREEN:** cfg103 round-tripped **23** real RA-coded bytes
+  TX→RX→CRC clean (message_decoded=YES, crc=0, BP iters=0) — the bigger frame still
+  byte-round-trips through the production PHY.
+- **§23 throughput gate (PASS-AFTER):** `LIVE frame=23B N=200` vs `REF frame=10B N=100`:
+  **delivered USER-bps ratio = 2.28× (T_fixed=0, pessimistic) / 3.21× (T_fixed=4945 ms,
+  realistic)** — both ≥ 1.8×. Delivery: **clean 4/4 + lossy (SNR3k=−5.0 dB) 8/8 byte-exact**
+  (the longer frame decodes reliably ~9 dB above the R¼ cliff — the throughput is real,
+  not fictional). sym=25.83 ms (matches `1000·Nofdm/((BW/Nc)·Nfft)` = 1000·310/12000).
+- **FAIL-BEFORE (rate 1/16, measured):** LIVE==REF (10B/100) → ratio **1.00× < 1.8× → FAIL**
+  (53 passed, 1 failed); clean 4/4 + lossy 8/8 STILL passed — the gate discriminates FRAME
+  SIZE, not decode. Only this one test flips → no collateral.
+- **Full suite:** **54 passed, 0 failed** (was 53; +1 new gate). Repeatable across runs
+  (deterministic seeds).
+- **Non-cfg103 byte-identity — PROVEN.** `git diff -w fd5c698 -- source/ include/`: (i)
+  telecom_system.cc = ONLY the cfg103 `_ldpc_rate` 1/16→2/16 inside the `ROBUST_RA` arm
+  (+comment); CONFIG_1's existing 2/16 untouched. (ii) arq_common.cc = the airtime formula
+  body is byte-identical for the `: data_container.Nsymb` branch (the original expression
+  verbatim); only cfg103 takes `get_active_nsymb()`. (iii) mfsk_ctrl_codec_tests.cc = pure
+  append (new helper + test + registration). NO edits to FULL_CONFIG_LADDER, the Q-table,
+  ofdm.cc, psk, the LDPC matrices, N_MAX, or buffer_Nsymb. Diffstat: arq_common.cc +20/-1,
+  telecom_system.cc cfg103-arm only, mfsk_ctrl_codec_tests.cc +196 (test). batch stays 1
+  (`robust_dwell_batch=1` default, is_robust_config(103)=true).
+
+### §10.7 Projected delivery efficiency at the new frame size
+on-air = (N+preamble)·sym_ms = (200+16)·25.83 = **5580 ms** (was 2997 ms at N=100). With
+the Front-A ~4945 ms fixed turnaround: efficiency T_air/(T_air+fixed) = 5580/10525 =
+**53%** (was 2997/7942 = 38%). Delivered USER-bps @ −10: ref ~4 B/cycle vs live ~17
+B/cycle → the realistic ratio 3.21× (the per-frame ACK turnaround is now amortized over
+4.25× more user payload + the airtime fix removes the 1.86× timeout inflation that was
+itself stretching the cycle). The 4× N_MAX-growth frame (§10.3) is the next lever; the
+Front B' "raw" lever (PHY-rate) combines orthogonally with this efficiency win at HW.
+
+### §10.8 Branch + commit
+Branch `win/incr1-longer-frame-airtime` off the integration `win/integ-incr1-incr2 @fd5c698`
+(worktree `C:/Users/kamer/mercury_wt/win-integ-incr1-incr2`). Commit hash: [filled at
+commit]. NOT pushed; integration branch otherwise untouched. SIM-only.

@@ -1394,7 +1394,27 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// NOTE: turboshift state is NOT reset here — it persists across config changes.
 	// Only reset at connection init (see init code above).
 
-	message_transmission_time_ms=ceil((1000.0*(telecom_system->data_container.Nsymb+telecom_system->data_container.preamble_nSymb)*telecom_system->data_container.Nofdm*telecom_system->frequency_interpolation_rate)/(float)(telecom_system->frequency_interpolation_rate*(telecom_system->bandwidth/telecom_system->ofdm.Nc)*telecom_system->ofdm.Nfft));
+	// Data-frame on-air time. The physically-emitted data symbol-period count is
+	// get_active_nsymb() (telecom_system.cc:712 TX loop / :1490 RX bounds), NOT the
+	// allocated data_container.Nsymb. For every OFDM and ROBUST_0/1/2 config these are
+	// equal (active == Nsymb), so this is byte-identical. For ROBUST_RA (cfg103) the RA
+	// codeword length N = robust_ra_N < Nsymb (the frame is intentionally shorter than
+	// the M16x2 geometry it reuses — p2-robust-ra-wiring.md §1.2/§4): using Nsymb here
+	// OVER-ESTIMATES cfg103's on-air time by Nsymb/N (~1.86x at N=100; ~1x once the
+	// increment-1 longer frame fills N to 200), which inflated EVERY downstream timeout
+	// that scales by message_transmission_time_ms — the CMD post-TX frame_drain
+	// (arq_common.cc:703 = 2*msg_time), the RSP rx_timeout (:732 = batch*msg_time), the
+	// data/control ACK windows (:749/:1467), and the RSP monitor_timeout
+	// (arq_responder.cc:1787/2492/2562). That over-estimate is part of the 57.5%
+	// ACK-turnaround overhead this increment attacks. get_active_nsymb() returns N for
+	// cfg103 and the full Nsymb otherwise. Gated on ROBUST_RA so the non-cfg103 value is
+	// provably unchanged (NOTE: get_active_nsymb() would also return ctrl_nsymb under
+	// mfsk_ctrl_mode, but that puncture is never active at config-load; the explicit
+	// cfg103 gate makes byte-identity independent of that.)
+	int airtime_nsymb = (telecom_system->current_configuration == ROBUST_RA)
+		? telecom_system->get_active_nsymb()
+		: telecom_system->data_container.Nsymb;
+	message_transmission_time_ms=ceil((1000.0*(airtime_nsymb+telecom_system->data_container.preamble_nSymb)*telecom_system->data_container.Nofdm*telecom_system->frequency_interpolation_rate)/(float)(telecom_system->frequency_interpolation_rate*(telecom_system->bandwidth/telecom_system->ofdm.Nc)*telecom_system->ofdm.Nfft));
 	if(telecom_system->ctrl_nsymb > 0)
 	{
 		ctrl_transmission_time_ms=ceil((1000.0*(telecom_system->ctrl_nsymb+telecom_system->data_container.preamble_nSymb)*telecom_system->data_container.Nofdm*telecom_system->frequency_interpolation_rate)/(float)(telecom_system->frequency_interpolation_rate*(telecom_system->bandwidth/telecom_system->ofdm.Nc)*telecom_system->ofdm.Nfft));
