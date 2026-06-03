@@ -103,6 +103,33 @@ inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 // negligible (§4). Only applied when is_robust_config(current) — OFDM stays R=1.
 #define CONNECT_PREAMBLE_REPS_PROD 4
 
+// FIX-A: ROBUST-tier dwell-batch decouple (data-flow-robust-tier-arq-batch.md).
+// At a ROBUST config the data batch is normally pinned to 1 (one MFSK frame per
+// ACK turnaround — >90% dead-time on the deep-SNR floor) because at the MFSK
+// cliff P(batch clean)=p^N and only batch=1 makes the strict all-ones clean
+// target achievable while the climb is still earning the rung. FIX-A lifts the
+// pin to a multi-frame batch ONLY once the link is PROVEN + PARKED on a robust
+// rung (robust_dwell_batch_eligible(), arq.h): the rung has already delivered
+// clean batches (anchor reached it) and the climb is not actively probing a
+// higher rung, so the p^N penalty is acceptable and the M=16 MFSK SACK suffix
+// patches any partial. Then the whole payload streams 4-8 frames per turnaround
+// instead of one, amortizing the fixed ACK dead-time.
+//
+// ROBUST_DWELL_BATCH_MAX — the hard ceiling the relaxed set_data_batch_size()
+//   chokepoint clamps a robust batch into ([1..MAX]). 8 keeps the all-ones SACK
+//   target (1<<batch)-1 = 0xFF well under both the CMD 32-bit and RSP 30-bit
+//   bitmap caps (data-flow-robust-tier-arq-batch.md §3.1), and ≤ the M=16 SACK
+//   suffix's 32-frame bitmap (mfsk-robust-ack.md).
+// ROBUST_DWELL_BATCH — the value the CMD requests on a proven+parked robust
+//   dwell (the operating point inside [1..MAX]).
+// ROBUST_DWELL_PROOF_BATCHES — consecutive clean batches AT THE ROBUST RUNG
+//   required before the raise fires (proves PARKED, not transient).
+// All three are SWEPT in the FTRT sim, not magic-numbered (CLAUDE.md §1 / OR-5).
+// Starting values below; the sweep result is recorded in the fact doc §8.
+#define ROBUST_DWELL_BATCH_MAX     8
+#define ROBUST_DWELL_BATCH         4
+#define ROBUST_DWELL_PROOF_BATCHES 2
+
 // NB mode cap — CONFIG_14 (8PSK, LDPC 14/16) is the highest feasible NB config.
 // 16QAM/32QAM (CONFIG_15+) require accurate amplitude equalization that NB's
 // sparse pilot grid (Nc=10, Dy=3) cannot provide with sufficient accuracy.

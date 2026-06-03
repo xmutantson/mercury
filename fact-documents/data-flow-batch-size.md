@@ -203,6 +203,18 @@ Per CLAUDE.md §5 (enforce the invariant against ALL paths, not the one path):
    and the RSP recompute already key off it). Test direct-assigns (§2.7) bypass
    it intentionally.
 
+   > **UPDATE — FIX-A (branch `fix/robust-dwell-batch`, 2026-06-03)**: the robust
+   > chokepoint is now a RANGE clamp `[1..ROBUST_DWELL_BATCH_MAX(8)]`, NOT
+   > force-to-1. The invariant is RELAXED from "robust ⇒ batch always 1" to
+   > "robust ⇒ batch always within `[1..ROBUST_DWELL_BATCH_MAX]`, and CMD batch ==
+   > RSP batch". batch=1 remains the DEFAULT (load_configuration seeds it; the
+   > connect-path SACK recompute leaves it; only a PROVEN+PARKED robust dwell —
+   > `robust_dwell_batch_eligible()`, CMD-decided — ever requests >1, mirrored to
+   > the RSP via the DEDICATED `ROBUST_DWELL_BATCH_OP` (0x44), NOT SET_LINK_PARAMS
+   > whose `[10,32]` clamp would break symmetry). The §1 CMD==RSP-symmetry
+   > invariant is UNCHANGED (the load-bearing one). See
+   > `data-flow-robust-tier-arq-batch.md` §10 for the full delta.
+
 2. **Symmetric predicate (readability + correct connect-path behavior)** —
    change the CMD recompute (`arq_commander.cc:3883`, `:3897`) from
    `negotiated_configuration` → `current_configuration`. Now the CMD recompute,

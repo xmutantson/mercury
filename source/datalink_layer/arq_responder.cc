@@ -2707,6 +2707,70 @@ void cl_arq_controller::process_control_responder()
 			messages_control.status = FREE;
 		}
 	}
+	else if((link_status==CONNECTED || link_status==DROPPED) && code==ROBUST_DWELL_BATCH_OP)
+	{
+		// FIX-A — RSP-side ROBUST_DWELL_BATCH_OP handler (data-flow-robust-tier-arq-batch.md
+		// §5.2). The CMD decides the robust dwell batch (it owns the climb state); the
+		// RSP simply MIRRORS the value so both sides hold the SAME data_batch_size (the
+		// 4-wire-failure all-ones-target symmetry invariant). Applied straight through
+		// set_data_batch_size() — whose RELAXED robust chokepoint clamps only to
+		// [1..ROBUST_DWELL_BATCH_MAX]. There is DELIBERATELY no [AXIS2_BATCH_FLOOR,CEIL]
+		// clamp here (that is the SET_LINK_PARAMS / Axis-2 OFDM contract; applying it
+		// would force a 4-8 robust batch UP to 10 and re-create the Bug-3 mismatch —
+		// OR-2 / L4).
+		//
+		// Wire format: [code, batch_u8, CRC8]. CRC8 covers data[1] only (the standard
+		// 3-byte msg header is already LDPC+CRC16 protected). messages_control.length
+		// is hardcoded to 1 on the RX path (arq_responder.cc:267) for control frames, so
+		// (like SET_CONFIG / SET_LINK_PARAMS) we read the fixed-format payload bytes
+		// unconditionally, gating the CRC on sack_v2_enabled (the only path that emits
+		// these bytes).
+		if(sack_v2_enabled)
+		{
+			int new_batch_u8 = (unsigned char)messages_control.data[1];
+			unsigned char rx_crc = (unsigned char)messages_control.data[2];
+			unsigned char computed_crc = CRC8_calc(
+				(char*)&messages_control.data[1], 1);
+			if(rx_crc != computed_crc)
+			{
+				// §4.3.4 invariant 3 "no silent corruption": discard, do NOT ACK; the
+				// CMD's control-frame timeout fires and resends, exactly as if the OFDM
+				// control frame had been lost on the air. The CMD's robust dwell batch
+				// is unchanged for the RSP until a clean frame applies — and the CMD
+				// applies locally only after add_message_control, so a lost op leaves
+				// CMD ahead by one; the EOB bit-7 self-correct + the CMD retry recover.
+				printf("[RSP-ROBUST-DWELL-CRC-FAIL] rx_crc=0x%02x computed=0x%02x "
+					"batch=%d (discarding; CMD will retransmit)\n",
+					rx_crc, computed_crc, new_batch_u8);
+				fflush(stdout);
+				messages_control.status = FREE;
+			}
+			else
+			{
+				int old_batch = data_batch_size;
+				// set_data_batch_size() re-validates the [1..ROBUST_DWELL_BATCH_MAX]
+				// range at the relaxed chokepoint and recomputes the ACK timeout (L3).
+				set_data_batch_size(new_batch_u8);
+				robust_dwell_batch_active = (data_batch_size > 1);
+				printf("[RSP-ROBUST-DWELL] APPLIED batch %d -> %d (rx=%d crc8=0x%02x) "
+					"config=%d\n",
+					old_batch, data_batch_size, new_batch_u8, rx_crc,
+					current_configuration);
+				fflush(stdout);
+				// ACK the control frame via the normal control-ACK path.
+				connection_status = ACKNOWLEDGING_CONTROL;
+				link_timer.start();
+				watchdog_timer.start();
+			}
+		}
+		else
+		{
+			printf("[RSP-ROBUST-DWELL] received v2=%d — IGNORED (v2 not negotiated)\n",
+				(int)sack_v2_enabled);
+			fflush(stdout);
+			messages_control.status = FREE;
+		}
+	}
 	else
 	{
 		if(code==CLOSE_CONNECTION)
