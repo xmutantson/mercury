@@ -946,6 +946,45 @@ public:
                                                 int control_code)
   { return (turbo_active || phase != TURBO_DONE) && control_code == SET_CONFIG; }
 
+  // ONE-WAY-TRANSFER STALL fix (data-flow-snr-measurements.md §9, 2026-06-03).
+  // The idle SWITCH_ROLE timer in process_buffer_data_commander()
+  // (arq_commander.cc:9229-9242) offers the floor to the peer whenever the CMD
+  // has a momentarily-empty TX FIFO (block_under_tx==NO + empty queues). On a
+  // ONE-WAY bulk transfer (the real Winlink scenario) the FIFO transiently
+  // empties between batches / TCP-feed gaps; at ROBUST_0 switch_role_timeout is
+  // only 200 ms (arq_common.cc:1441-1442), so SWITCH_ROLE fires MID-TRANSFER and
+  // swaps the CMD to RESPONDER — the new "commander" (the receiver) has no data
+  // to send, so the transfer stalls < 300 bytes (zeroed every SNR3k ≤ +2.4 cell
+  // in the like-for-like VARA measurement, run ac537ec8).
+  //
+  // The fix gates the idle role-OFFER on the APPLICATION DATA SOCKET being quiet
+  // (tcp_socket_data.timer.get_elapsed_time_ms(): ms since the app last fed TX
+  // data; reset on every received chunk at arq_common.cc:2555). While the app
+  // streams a large message the data-socket timer keeps resetting → the CMD never
+  // relinquishes the floor mid-transfer; once the whole message is delivered and
+  // the app stops, the timer grows past ROLE_OFFER_APP_IDLE_MS and turn-taking
+  // proceeds. This is the ROOT-CAUSE condition the idle-SWITCH was always SUPPOSED
+  // to mean ("the local app is done sending"), not a threshold masking a failure
+  // (CLAUDE.md §2).
+  //
+  // snr_downlink is measurements.SNR_downlink. The canonical producer writes it
+  // ONLY when role==RESPONDER (arq_common.cc:6213), so a CMD on a one-way transfer
+  // (no return LDPC data) never lifts it off the -99.9 ctor sentinel — the marker
+  // of "the downlink has never carried return data" (one-way), NOT "dead link".
+  // A PROVEN-bidirectional session (snr_downlink > -90 ⇒ the peer demonstrably
+  // sends return data) keeps the responsive existing turn-taking (no extra
+  // app-idle requirement); only a one-way / not-yet-bidirectional session must
+  // wait for the app to actually go quiet before offering the (useless) floor.
+  // PURE (no side effects) so the regression test (Part OW) replays the identical
+  // expression. See §9.4 / §9.6.
+  static bool should_offer_role_switch(int data_socket_idle_ms,
+                                       double snr_downlink)
+  {
+    if(snr_downlink > -90.0)
+      return true;                              // bidirectional: existing behavior
+    return data_socket_idle_ms >= ROLE_OFFER_APP_IDLE_MS;  // one-way: app must be quiet
+  }
+
   // REAL FAST-PROBE piece (A1) — repair the CMD arm asymmetry
   // (gearshift-climb-engine.md §14). ROOT CAUSE (diagnosed, not re-investigated):
   // the forward-link SNR is ALREADY on the wire — the RSP suffixes the measured
@@ -1085,6 +1124,20 @@ public:
   // batch carries > 0 application bytes (FAIL-BEFORE on fef293f: every batch
   // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
   int test_robust0_compress_deadlock();
+
+  // ONE-WAY-TRANSFER STALL regression (data-flow-snr-measurements.md §9).
+  // Replays the REAL should_offer_role_switch() decision (the gate the idle
+  // SWITCH_ROLE arm at arq_commander.cc:9229 now uses):
+  //   OW1 (FAIL-BEFORE) one-way (SNR_downlink=-99.9) + app just fed (idle 50 ms)
+  //       ⇒ must NOT offer the floor (no mid-transfer swap);
+  //   OW2 one-way + app quiet (idle ≥ ROLE_OFFER_APP_IDLE_MS) ⇒ offer (done);
+  //   OW3 bidirectional (SNR_downlink=+12) + transient idle ⇒ offer (turn-taking);
+  //   OW4 the gate is independent of dead-link detection (link_timer / emergency
+  //       BREAK) — it cannot suppress a genuine dead-link teardown.
+  // FAIL-BEFORE: reverting should_offer_role_switch() to `return true;` (the
+  // pre-fix unconditional arm) flips OW1 to FAIL while OW2/OW3/OW4 stay PASS.
+  // One-shot, exits rc. See §9.4 / §9.6.
+  int test_oneway_stall();
 
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
@@ -1899,6 +1952,17 @@ public:
   // single transient anchor-rung failure does not lower a genuinely-viable anchor.
   // TUNABLE.
   static const int ANCHOR_DEMOTE_BREAK_FAILS = 3;
+  // ONE-WAY-TRANSFER STALL fix (data-flow-snr-measurements.md §9, 2026-06-03) —
+  // the app-idle guard the idle SWITCH_ROLE arm requires on a one-way / not-yet-
+  // bidirectional session (snr_downlink at the -99.9 sentinel). Consumed ONLY by
+  // should_offer_role_switch(). 1500 ms = one OFDM switch_role_timeout period
+  // (arq_common.cc:95/datalink_config.cc:64): long enough that a one-way bulk
+  // transfer with normal TCP feeding never idles this long between batches (so it
+  // never spuriously swaps mid-transfer), short enough that a genuinely-complete
+  // transfer offers the floor within ~1.5 s. This is the DEFINITION of "the local
+  // app has stopped sending", the condition the idle-SWITCH was always meant to
+  // detect — NOT a threshold tuned to mask a failure (CLAUDE.md §2). TUNABLE.
+  static const int ROLE_OFFER_APP_IDLE_MS = 1500;
   // SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11, 2026-05-30) — closes the
   // leak at the source. The anchor-RAISE (:3454) credited ANY clean confirmation,
   // including the prev-path all-ones completion ACK that fires AFTER a batch is

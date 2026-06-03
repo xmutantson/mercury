@@ -3589,7 +3589,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// WGN:-10 cliff). See gearshift-start-and-recovery.md §9.
 			if(promotion_allowed_on_batch(last_batch_fully_acked))
 			{
-				break_drop_step = 2;       // Reset to initial aggression (2 steps).
+				// TOP-CONFIG CEILING FIX (gearshift-top-config-ceiling.md §3/§4): the
+				// per-event INITIAL established-data BREAK aggression is ONE rung, not
+				// two. A 2-rung initial drop overshoots the top of the ladder
+				// (CONFIG_16 -> CONFIG_14, SKIPPING CONFIG_15) on a transient 3-NAck
+				// burst, so the link can never HOLD the top config on a clean link (it
+				// oscillates 14<->16, steady=CONFIG_14, 0.74x; the one run that held
+				// CONFIG_16 hit 1.82x). One rung down (16->15) lands on the next-best
+				// config AND keeps the link at 15-16 where the §11 anchor can ratchet
+				// to the top, making HOLD-CONFIG_16 reachable. The :222/:321 doubling
+				// still escalates 1->2->4 across a recovery's retries, and the
+				// breaks>=2 panic-jump (:3492 -> 100) still force-floors a genuinely
+				// crashing channel — so crash/cliff escape latency is unchanged and the
+				// WGN:-10 anti-thrash (panic + §10 demotion) is INERT to this change.
+				break_drop_step = 1;       // Initial aggression: ONE rung (was 2).
 				breaks_since_last_data_success = 0;  // panic-mode counter resets on
 				                                     // CLEAN data flow (see arq.h / §9).
 				// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10): a CLEAN
@@ -6390,6 +6403,16 @@ int cl_arq_controller::test_clean_batch_viability()
 //       the §15 re-trigger gate was OPEN at t=0 → WGN:-10 over-climb. The fix seats it
 //       at the session FLOOR (session_floor_anchor: ROBUST_0 on -R, the start/pinned
 //       config otherwise). Drives the REAL helper vs the pre-fix init expression.
+//   Q — TOP-CONFIG CEILING (gearshift-top-config-ceiling.md §3/§4): the per-event
+//       INITIAL established-data emergency-BREAK aggression was break_drop_step=2
+//       (reset on every clean batch, arq_commander.cc:3592), so a transient 3-NAck
+//       burst at CONFIG_16 dropped the recovery TWO rungs (config_ladder_down_n(
+//       CONFIG_16,2)=CONFIG_14, SKIPPING CONFIG_15) → on a clean link the gearshift
+//       reached CONFIG_16 (peak) but settled CONFIG_14 (steady, 0.74×; the one run
+//       that HELD CONFIG_16 hit 1.82×). Fix: initial step = ONE rung (16→15) so the
+//       link dwells at 15-16 and the §11 anchor can ratchet to the top. Drives the
+//       REAL config_ladder_down_n + break_target_with_anchor; the doubling +
+//       panic-jump are preserved (Q4/Q3). Pre-fix step=2 → Q1 lands CONFIG_14 (FAIL).
 //
 // IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
 // NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
@@ -8385,6 +8408,98 @@ int cl_arq_controller::test_climb_engine()
 				p_ofdm_dn, CONFIG_0);
 		}
 
+		// ================================================================
+		// Part Q — TOP-CONFIG CEILING: the established-data BREAK initial
+		// aggression (gearshift-top-config-ceiling.md §3/§4/§6). On a clean WB
+		// link the climb reaches CONFIG_16 (peak) but settles at CONFIG_14
+		// (steady, 0.74x) — it cannot HOLD the top. ROOT CAUSE: the per-event
+		// INITIAL established-data emergency-BREAK aggression was break_drop_step=2
+		// (reset on every clean batch at arq_commander.cc:3592), so a transient
+		// 3-NAck burst at CONFIG_16 drops the recovery target TWO rungs to CONFIG_14
+		// (config_ladder_down_n(CONFIG_16, 2)), SKIPPING CONFIG_15 — confirmed by the
+		// IONOS clean-cell switch_seq (16->14, CONFIG_15 only ever appears on the
+		// climb-UP). With the anchor stuck below the top (the §11 OFDM N=2
+		// consecutive-clean gate is hard to satisfy at the marginal 32QAM top before
+		// a down-move knocks the link off), break_target_with_anchor cannot floor the
+		// drop at the top. The fix sets the INITIAL aggression to ONE rung (16->15):
+		// the link lands on the next-best config and dwells at 15-16 where the anchor
+		// can ratchet, making HOLD-CONFIG_16 reachable. These assertions drive the
+		// REAL production recovery primitives — config_ladder_down_n(
+		// emergency_previous_config, break_drop_step, robust_enabled) +
+		// break_target_with_anchor — the SAME calls the BREAK recovery sites
+		// (arq_commander.cc:209 / :307) make. FAIL-BEFORE (initial step=2):
+		// Q1 lands on CONFIG_14. PASS-AFTER (initial step=1): Q1 lands on CONFIG_15.
+		{
+			robust_enabled = NO;            // a WB (non-robust) clean-link session
+			narrowband_enabled = NO;
+			optimizer_disabled = true;      // optimizer_is_in_control()==false
+
+			// POST-FIX initial established-data BREAK aggression — this is the value
+			// arq_commander.cc:3592 assigns on every clean batch (the per-event
+			// initial). The fix changed it 2 -> 1. Mirror it here so Q tracks the
+			// production constant; to reproduce the FAIL-BEFORE, set this to 2.
+			break_drop_step = 1;
+
+			// Q0: document the TUNABLE — from CONFIG_16 the POST-FIX initial step
+			// drops exactly ONE rung (to CONFIG_15) BEFORE the anchor floor.
+			int q_raw = config_ladder_down_n(CONFIG_16, break_drop_step, robust_enabled);
+			check(q_raw == CONFIG_15,
+				"Q0 initial BREAK step drops CONFIG_16->CONFIG_15 (1 rung, the post-fix aggression)",
+				q_raw, CONFIG_15);
+
+			// Q1: THE ceiling assertion (fail-before). Anchor below the drop target
+			// so break_target_with_anchor is inert (raw_target >= anchor). The
+			// recovery from CONFIG_16 must land on CONFIG_15, NOT CONFIG_14.
+			// Pre-fix (break_drop_step=2): config_ladder_down_n(CONFIG_16,2)=CONFIG_14 -> FAIL.
+			breaks_since_last_data_success = 0;       // not in panic — anchor floor active
+			last_data_viable_config = CONFIG_13;      // anchor below the 1-rung target
+			int q_raw1 = config_ladder_down_n(CONFIG_16, break_drop_step, robust_enabled);
+			int q_tgt1 = break_target_with_anchor(q_raw1);
+			check(q_tgt1 == CONFIG_15,
+				"Q1 established-data BREAK from CONFIG_16 lands on CONFIG_15 not CONFIG_14 (the 2-rung overshoot fix)",
+				q_tgt1, CONFIG_15);
+
+			// Q2: the anchor floor HOLDS the top once the anchor reaches it (the
+			// hold mechanism is the anchor, independent of the step). With
+			// anchor=CONFIG_16, any 1-rung raw target floors UP to CONFIG_16 — the
+			// link HOLDS CONFIG_16. Passes before & after.
+			last_data_viable_config = CONFIG_16;
+			int q_raw2 = config_ladder_down_n(CONFIG_16, break_drop_step, robust_enabled);
+			int q_tgt2 = break_target_with_anchor(q_raw2);
+			check(q_tgt2 == CONFIG_16,
+				"Q2 anchor floor HOLDS CONFIG_16 once the anchor reaches the top (config_ladder_down_n floored UP)",
+				q_tgt2, CONFIG_16);
+
+			// Q3: SAFETY — the breaks>=2 panic-jump still reaches the ladder floor,
+			// UNAFFECTED by the initial-step change (panic forces break_drop_step=100
+			// and break_target_with_anchor returns the raw target unclamped). WB floor
+			// is CONFIG_0. Passes before & after.
+			breaks_since_last_data_success = 2;       // panic: bypass the anchor floor
+			last_data_viable_config = CONFIG_13;      // would otherwise floor at 13
+			int q_raw3 = config_ladder_down_n(CONFIG_16, /*panic step*/100, robust_enabled);
+			int q_tgt3 = break_target_with_anchor(q_raw3);
+			check(q_tgt3 == CONFIG_0,
+				"Q3 panic-jump (breaks>=2, step=100) still floors to CONFIG_0 (crash escape intact, step-independent)",
+				q_tgt3, CONFIG_0);
+
+			// Q4: the :222/:321 doubling escalation is preserved — one doubling round
+			// from the POST-FIX initial step yields a 2-rung drop (CONFIG_16->CONFIG_14),
+			// so a recovery that needs a retry still reaches the old aggression. The
+			// doubling is untouched by the fix. Passes before & after.
+			breaks_since_last_data_success = 0;
+			last_data_viable_config = CONFIG_0;       // anchor low — floor inert
+			int q_step_doubled = break_drop_step * 2; // mirrors arq_commander.cc:222/:321
+			int q_raw4 = config_ladder_down_n(CONFIG_16, q_step_doubled, robust_enabled);
+			int q_tgt4 = break_target_with_anchor(q_raw4);
+			check(q_tgt4 == CONFIG_14,
+				"Q4 doubling escalation preserved: one *=2 round from the initial step drops CONFIG_16->CONFIG_14",
+				q_tgt4, CONFIG_14);
+
+			// Restore production-default test state for any later additions.
+			break_drop_step = 1;
+			breaks_since_last_data_success = 0;
+		}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
@@ -8853,6 +8968,131 @@ void cl_arq_controller::test_fire_policy_axis3(int kind)
 	}
 }
 
+// ONE-WAY-TRANSFER STALL regression (data-flow-snr-measurements.md §9, CLI
+// --test-oneway-stall). Replays the REAL should_offer_role_switch() decision —
+// the gate the idle SWITCH_ROLE arm in process_buffer_data_commander()
+// (arq_commander.cc:9229-9242) now uses — plus the REAL emergency-BREAK gate
+// predicate, to prove the fix (a) stops the mid-transfer role swap on a one-way
+// bulk transfer, (b) preserves bidirectional turn-taking, and (c) does NOT
+// suppress genuine dead-link detection. In-process; no audio / RF. The wire-level
+// whole-message delivery is the parent's loopback harness
+// (tools/oneway_transfer_loopback.py).
+int cl_arq_controller::test_oneway_stall()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-ONEWAY] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-ONEWAY] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	const double SENTINEL = -99.9;   // ctor downlink sentinel (arq_common.cc:142),
+	                                  // i.e. a ONE-WAY session: the downlink has
+	                                  // never carried return data (the canonical
+	                                  // producer writes SNR_downlink only as
+	                                  // RESPONDER, arq_common.cc:6213).
+
+	// ----------------------------------------------------------------
+	// OW1 — FAIL-BEFORE: one-way transfer, app JUST fed data (transient empty
+	// FIFO between batches). The idle SWITCH_ROLE must NOT be offered, else the
+	// CMD swaps to RESPONDER mid-transfer and the receiver (no TX data) stalls
+	// the link. Pre-fix the idle path armed UNCONDITIONALLY (no guard) → it would
+	// have swapped. With ROLE_OFFER_APP_IDLE_MS=1500, an idle of 50 ms (one tick
+	// after the app fed a chunk) gates the offer OFF.
+	// ----------------------------------------------------------------
+	bool ow1 = should_offer_role_switch(/*data_socket_idle_ms=*/50, SENTINEL);
+	check(ow1 == false,
+		"OW1 one-way + app-just-fed (idle 50ms) does NOT offer role switch (no mid-transfer swap)",
+		ow1 ? 1 : 0, 0);
+
+	// OW1b — boundary: just under the guard still does NOT offer.
+	bool ow1b = should_offer_role_switch(ROLE_OFFER_APP_IDLE_MS - 1, SENTINEL);
+	check(ow1b == false,
+		"OW1b one-way + app idle just under guard does NOT offer",
+		ow1b ? 1 : 0, 0);
+
+	// ----------------------------------------------------------------
+	// OW2 — PASS-AFTER (transfer complete): one-way, app has gone quiet for the
+	// full guard (whole message handed to Mercury and delivered). NOW the floor
+	// IS offered, so bidirectional turn-taking after a one-way send still works.
+	// ----------------------------------------------------------------
+	bool ow2 = should_offer_role_switch(/*data_socket_idle_ms=*/2000, SENTINEL);
+	check(ow2 == true,
+		"OW2 one-way + app quiet >= guard offers role switch (transfer done; turn-taking ok)",
+		ow2 ? 1 : 0, 1);
+
+	// OW2b — boundary: exactly at the guard offers (>= comparison).
+	bool ow2b = should_offer_role_switch(ROLE_OFFER_APP_IDLE_MS, SENTINEL);
+	check(ow2b == true,
+		"OW2b one-way + app idle == guard offers (>= boundary)",
+		ow2b ? 1 : 0, 1);
+
+	// ----------------------------------------------------------------
+	// OW3 — bidirectional PRESERVED: the peer demonstrably sends return data
+	// (SNR_downlink > -90), so responsive turn-taking is UNCHANGED — the floor is
+	// offered even on a transient app-idle gap (the §9.3 degenerate reply case is
+	// not deadlocked). Drive a real measured downlink SNR.
+	// ----------------------------------------------------------------
+	bool ow3 = should_offer_role_switch(/*data_socket_idle_ms=*/50, /*snr_downlink=*/12.0);
+	check(ow3 == true,
+		"OW3 bidirectional (SNR_downlink=+12) offers on transient idle (turn-taking unchanged)",
+		ow3 ? 1 : 0, 1);
+
+	// OW3b — bidirectional boundary: just above the -90 threshold counts as
+	// proven-bidirectional and offers immediately.
+	bool ow3b = should_offer_role_switch(/*data_socket_idle_ms=*/0, /*snr_downlink=*/-89.9);
+	check(ow3b == true,
+		"OW3b SNR_downlink just > -90 treated as bidirectional (offers immediately)",
+		ow3b ? 1 : 0, 1);
+
+	// ----------------------------------------------------------------
+	// OW4 — DEAD-LINK DETECTION INTACT: the idle-SWITCH gate must not be able to
+	// suppress a genuine dead-link emergency BREAK. The REAL BREAK trigger
+	// (arq_commander.cc:3472-3476) is:
+	//   emergency_nack_count >= emergency_nack_threshold
+	//   && !config_is_at_bottom(current_configuration, robust_enabled)
+	//   && !emergency_break_active && turboshift_phase==TURBO_DONE
+	//   && gear_shift_on==YES
+	// — NONE of which is should_offer_role_switch() or either of its inputs
+	// (app-idle / SNR_downlink). Assert the BREAK gate fires on a real total-
+	// block-failure observable EVEN while the idle-offer is gated OFF (one-way,
+	// app just fed). This proves the fix is orthogonal to dead-link teardown.
+	// ----------------------------------------------------------------
+	robust_enabled = NO;
+	narrowband_enabled = NO;
+	gear_shift_on = YES;
+	turboshift_phase = TURBO_DONE;
+	emergency_break_active = 0;
+	emergency_nack_threshold = 3;          // production default (arq_common.cc:401)
+	current_configuration = CONFIG_10;     // a mid OFDM config (NOT at bottom)
+	// The idle-offer is suppressed in this exact state (one-way + app just fed):
+	bool offer_suppressed = !should_offer_role_switch(/*idle=*/50, SENTINEL);
+	check(offer_suppressed,
+		"OW4a idle role-offer is gated OFF in the dead-link scenario (one-way, app just fed)",
+		offer_suppressed ? 1 : 0, 1);
+	// A genuine dead link: consecutive total block failures reach threshold.
+	emergency_nack_count = emergency_nack_threshold;
+	bool break_gate = (emergency_nack_count >= emergency_nack_threshold)
+	               && !config_is_at_bottom(current_configuration, robust_enabled)
+	               && !emergency_break_active
+	               && turboshift_phase == TURBO_DONE
+	               && gear_shift_on == YES;
+	check(break_gate == true,
+		"OW4b genuine dead-link BREAK gate FIRES regardless of the idle-SWITCH gate (teardown intact)",
+		break_gate ? 1 : 0, 1);
+	emergency_nack_count = 0;              // restore
+
+	printf("[TEST-ONEWAY] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES PRESENT",
+		failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 void cl_arq_controller::process_buffer_data_commander()
 {
 	int data_read_size;
@@ -8903,6 +9143,18 @@ void cl_arq_controller::process_buffer_data_commander()
 		             || (sack_v2_enabled && retransmit_count > 0);
 		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && stage_ok)
 		{
+			// ONE-WAY-TRANSFER STALL fix (data-flow-snr-measurements.md §9.4
+			// defect #2): the app fed more data and we are staging a new batch, so
+			// the local node is NOT idle — cancel any pending idle SWITCH_ROLE
+			// offer. Without this the switch_role_timer kept counting across the
+			// data gap and the next idle moment read a stale (already-elapsed)
+			// timer and swapped roles almost instantly.
+			if(switch_role_timer.counting==YES)
+			{
+				switch_role_timer.stop();
+				switch_role_timer.reset();
+			}
+
 			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 			// payload budget. In v1 (default) identical to legacy macro; in v2
 			// loses 1 byte to the batch_seq_id field.
@@ -9228,16 +9480,46 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
-			if(switch_role_timer.counting==NO)
+			// ONE-WAY-TRANSFER STALL fix (data-flow-snr-measurements.md §9).
+			// Only OFFER the floor to the peer (idle SWITCH_ROLE) once the LOCAL
+			// app has genuinely stopped feeding TX data. On a one-way bulk
+			// transfer (SNR_downlink stuck at the -99.9 sentinel — the canonical
+			// producer writes SNR_downlink only as RESPONDER, arq_common.cc:6213)
+			// a momentarily-empty FIFO between batches must NOT swap roles: the
+			// peer has no data to send, so the swap stalls the transfer (zeroed
+			// every SNR3k ≤ +2.4 cell, run ac537ec8). should_offer_role_switch()
+			// gates on the app-data-socket idle time (tcp_socket_data.timer,
+			// reset on every app chunk at arq_common.cc:2555); a proven-
+			// bidirectional session (SNR_downlink > -90) keeps the responsive
+			// existing turn-taking. The turboshift SWITCH_ROLE sites (:3894/:3905)
+			// and the SWITCH_ROLE-ACK handler (:4400) are NOT on this path and are
+			// unchanged; real dead-link detection (link_timer, emergency BREAK) is
+			// independent of this timer (§9.4/§9.5).
+			if(should_offer_role_switch(
+			       tcp_socket_data.timer.get_elapsed_time_ms(),
+			       measurements.SNR_downlink))
 			{
-				switch_role_timer.reset();
-				switch_role_timer.start();
+				if(switch_role_timer.counting==NO)
+				{
+					switch_role_timer.reset();
+					switch_role_timer.start();
+				}
+				else if(switch_role_timer.get_elapsed_time_ms()>switch_role_timeout)
+				{
+					switch_role_timer.stop();
+					switch_role_timer.reset();
+					add_message_control(SWITCH_ROLE);
+				}
 			}
-			else if(switch_role_timer.get_elapsed_time_ms()>switch_role_timeout)
+			else if(switch_role_timer.counting==YES)
 			{
+				// App is still feeding (one-way transfer in progress): cancel a
+				// pending idle-offer so a transient gap cannot accumulate toward a
+				// stale fire (§9.4 defect #2 — the timer was previously never reset
+				// when data resumed, so the NEXT gap read an already-elapsed timer
+				// and swapped roles almost instantly).
 				switch_role_timer.stop();
 				switch_role_timer.reset();
-				add_message_control(SWITCH_ROLE);
 			}
 		}
 	}
