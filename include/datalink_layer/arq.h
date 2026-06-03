@@ -24,6 +24,7 @@
 #define ARQ_H_
 
 #include "timer.h"
+#include "common/sim_clock.h"
 #include <unistd.h>
 #include <cstdint>
 #include "tcp_socket.h"
@@ -2160,9 +2161,16 @@ public:
   // arq_commander.cc. Defined inline to avoid an extra .o churn for what is
   // a thin instrumentation layer; no decision logic lives in any of them.
   unsigned long long opt_now_ms() const {
-      return (unsigned long long)
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::steady_clock::now().time_since_epoch()).count();
+      // §5 LANDMINE (sim-arq-channel.md): the Q-table effective-rate optimizer
+      // measures bytes/time using THIS clock (opt_on_batch_tx_start ->
+      // opt_batch_wire_ms -> get_current_effective_rate_bps). Under -x sim the
+      // channel runs faster than wall-clock, so reading the wall-clock here
+      // would make the optimizer see bytes/wall-time and report a rate ~50x
+      // too high -> garbage config selection. Route it through the SAME virtual
+      // clock the cl_timers use so the optimizer measures bytes/CHANNEL-time.
+      // sim_clock_now_ns() falls back to steady_clock when sim is disabled, so
+      // production is byte-identical to the previous steady_clock read.
+      return (unsigned long long)(sim_clock_now_ns() / 1000000ULL);
   }
   // Called at the cmd_batch_tx_start instrumentation point. If a previous
   // batch already published its slot, back-fill its wire_ms with the cycle
