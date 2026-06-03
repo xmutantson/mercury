@@ -319,7 +319,7 @@ CRC16-backstopped), but the FAR≈0 claim is REVISED — see §13 for the clean 
 
 ---
 
-## §13 [OPEN] Fine-pass FAR inflation — a clean follow-on (NOT this increment)
+## §13 [DONE — see §17] Fine-pass FAR inflation — a clean follow-on (implemented before merge)
 
 The residual M16×2 FAR (1.8e-2 @ T=8) is driven by the detection decision using
 `fine_best_matched` — the MAX matched count over the ±½-symbol fine grid. A cleaner design
@@ -327,9 +327,10 @@ gates the *detect/no-detect* decision on the **coarse** matched count (one posit
 symbol grid, the ref-scorer's lower-FAR statistic) and uses the fine pass ONLY to refine
 the returned sample OFFSET, not to re-maximize the count. The ref-scorer FAR (1.75e-3 @ T=8)
 is the achievable target. This touches the detector's gate structure for BOTH stream paths
-(would change M32×1 too → must re-confirm byte-identity), so it is OUT OF SCOPE for INCR-1
-and is filed as a follow-on. It does NOT block the combiner: FAR is wasted compute (LDPC on
-noise → CRC16 reject → ~30 ms), never corruption.
+(would change M32×1 too → must re-confirm byte-identity), ~~so it is OUT OF SCOPE for INCR-1
+and is filed as a follow-on.~~ **IMPLEMENTED 2026-06-02 as the pre-merge §13 cleanup — see
+§17.** It does NOT block the combiner: FAR is wasted compute (LDPC on noise → CRC16 reject →
+~30 ms), never corruption.
 
 ---
 
@@ -361,3 +362,153 @@ env MERCURY_P3_SWEEP=1 ./mercury.exe --test # PRODUCTION-PATH M16x2 cliff -15.05
                                             # M32x1 -13.89(T7) unchanged; FARs per §12
 # fail-before: git stash the ofdm.cc+mfsk.cc change, rebuild, --test → §6.P4 (A) FAILS at -11.8 dB
 ```
+
+---
+
+## §16 HW VALIDATION — the combiner's acquisition gain HOLDS on the real IONOS channel (2026-06-02) — PASS
+
+**This is the FIRST independent RF validation of any RA-tier piece.** The combiner is the
+shared FOUNDATION (RA −10 detector + ULTRA reach), so it was HW-tested ALONE on the EXISTING
+ROBUST_2 (M16×2, config 102) — no RA mode needed. VERDICT: **PASS — the ~+4.86 dB sim
+acquisition gain TRANSFERS to RF.**
+
+### §16.1 Method (rigorous A/B, arms verified not trusted)
+- **Arm A** = monitor `@8fc1211` (baseline AND-gate). Pi binary md5 `f5c2ed3c…`, ofdm.cc
+  combiner-marker count 0, data-preamble `thr=7`.
+- **Arm B** = combiner `@9cecc8f`. Pi binary md5 `3b5871f6…` (DISTINCT from A),
+  combiner-marker 1, `thr=8` (the productionized nStreams≥2 gating). Both Pis `--test`
+  0-fail per arm (33 / 34 [OK], 0 [FAIL]).
+- Both arms carry a **byte-identical** `[MFSK-ACQ]` measurement probe in `telecom_system.cc`
+  (unchanged between the two HEADs → cannot bias the A/B) logging the data-frame preamble
+  matched count (`mfsk_sync_metric`) + detect decision at the `time_sync_mfsk_corr` call
+  site (`:1100`), on EVERY MFSK detection poll. The probe is the RF analogue of the §3 sim
+  `mean_matched` / P(detect).
+- Pinned ROBUST_2 via `-s 102 -R` (NOT `--max-config` — that clamps 0..15; ROBUST configs
+  need `-R` since explicit `-s` doesn't auto-enable robust, main.cc:2239), compress OFF, no
+  SACK, no gearshift. WGN:-8/-10/-12 (= SNR3k −5.6/−7.6/−9.6 via SNR3k = WGN+2.4).
+  Driver `tools/combiner_acq_hwval.py` (wraps `sack_lossy_ab.py`, +`WB_ROBUST2` config),
+  2 runs × 150 s/cell. Responder (rpi1) = the side whose data-frame detector sees the
+  commander's M16×2 frames. ACQUISITION measured SEPARATELY from decode/deliver (decode at
+  these cells is ≤ the −8 dB ROBUST_2 waterfall, so delivery is ~0 deep — EXPECTED, not the
+  metric). Both arms: 6/6 runs CONNECTED, ~112–128 polls/cell, geometry confirmed M16×2
+  cfg=102 in every `[MFSK-ACQ]` line.
+
+### §16.2 Result — mean matched count (threshold-INDEPENDENT; the clean combiner signal)
+| cell | SNR3k | arm A mean_matched | arm B mean_matched | delta |
+|---|---|---|---|---|
+| wgn-8 | −5.6 | 2.99 | **6.85** | +3.86 (2.3×) |
+| wgn-10 | −7.6 | 2.93 | **7.17** | +4.24 (2.4×) |
+| wgn-12 | −9.6 | 3.04 | **7.18** | +4.14 (2.4×) |
+
+The combiner ~2.4×s the mean matched count at every cell — equal-gain noncoherent combining
+of the 2 redundant streams lifts the whole matched-count distribution, exactly as §2/§3
+predict.
+
+### §16.3 Result — common-threshold detection (removes the T=7-vs-T=8 confound), from the matched-count histograms
+| cell | P(m≥7) A→B | P(m≥16) A→B (full-strength real preambles) |
+|---|---|---|
+| wgn-8  | 0.081 → 0.366 (**4.5×**) | 0.065 → 0.081 (1.25×) |
+| wgn-10 | 0.141 → 0.492 (**3.5×**) | 0.031 → 0.082 (**2.6×**) |
+| wgn-12 | 0.063 → 0.420 (**6.7×**) | **0.000 → 0.050 (∞)** |
+
+**Decisive deep-cell evidence:** at wgn-12 (−9.6 dB SNR3k) the baseline AND-gate's matched
+count for real preambles tops out at **13** (P(m≥14)=P(m≥16)=0 — it NEVER reaches full
+strength), while the combiner RESTORES full-strength matched 15–16 detections (P(m≥16)=0.050,
+P(m≥14)=0.084). This is the +4.86 dB acquisition deepening manifesting on RF: the combiner
+recovers the high-confidence real-preamble mode that the 2-stream AND-gate collapses at depth.
+Matched-count histograms (responder, n≈120/cell):
+```
+wgn-8  A: 1:26 2:77 3:10 | 15:2 16:8         B: 5:31 6:47 7:35 | 16:10
+wgn-10 A: 1:54 2:56 | 8:9 14:2 15:3 16:4     B: 5:8 6:54 7:49 8:1 | 16:10
+wgn-12 A: 1:31 2:42 3:17 6:15 | 11:2 12:2 13:3   B: 5:1 6:68 7:35 8:5 | 15:4 16:6   <-- A never hits 16; B does
+```
+The productionized arm B's *native* detect_rate (at its T=8) is similar/slightly lower at
+wgn-8/-10 purely from the T=7→T=8 FAR-control trade (§11.2/§12) — NOT a lack of combiner
+gain; at a COMMON threshold the gain is decisive everywhere (3.5–6.7× at T=7).
+
+### §16.4 Testbed note (a SIM-vs-RF non-finding worth recording)
+First arm-B sweep produced 0 polls (responder didn't reach data RX). Root cause: the
+responder **mercury process was killed by a kernel ALSA / dwc-AXI-DMA oops** (`dma_pool_alloc`,
+poisoned pool ptr `x20=deaddeaddeaddead`, on PCM-start ioctl during PTT keying) — a Pi 5
+kernel DMA-pool corruption that accumulates after ~30 min of rapid PTT keying, NOT a combiner
+bug (the combiner backtrace was nowhere near; the commander never crashed). Matches the
+MEMORY "Pi audio state drifts after long runs / reboot fixes it" note. Rebooting both Pis
+cleared it; the arm-B RE-RUN on the fresh testbed was crash-free (0 SIGSEGV) with 6/6 runs
+connected, yielding the §16.2/§16.3 data. Lesson: long A/B campaigns should reboot between
+arms (or cap keying time/run count) to keep the kernel DMA pool healthy.
+
+### §16.5 Verdict
+**PASS.** The combiner FOUNDATION is HW-validated on the IONOS channel: it materially deepens
+ROBUST_2 data-frame ACQUISITION (mean matched ~2.4×; full-strength detections recovered at
+−9.6 dB SNR3k where the baseline loses them). Ready to merge after the §13 fine-pass FAR
+cleanup. The RA-mode detector + ULTRA reach assumptions that build on it are NOT at risk from
+the detector side. (NOTE: this validates ACQUISITION only, on AWGN/WGN; the RA −10 DELIVERY
+still needs its R⅓ FEC + the P0/P1 pieces, and HF fading is not yet tested — §10.2.)
+
+Repro: deploy arm via `MERCURY_SRC_OVERRIDE=<worktree> python tools/mercury_deploy_rpi.py`;
+`python tools/combiner_acq_hwval.py --arm <X> --point wgn-12 --runs 2 --duration 150`. Logs +
+`.acq.json` per cell under `combiner_acq_logs/<A|B>/<point>/`; aggregate with
+`tools/_combiner_acq_verdict.py combiner_acq_logs`.
+
+---
+
+## §17 §13 FINE-PASS FAR CLEANUP — IMPLEMENTED + MERGED (2026-06-02) — SIM only
+
+**Status:** the §13 follow-on is DONE and the combiner (§11) + §13 cleanup are MERGED to
+`monitor`. SIM build + `--test` green (52/0); the §13 FAR cleanup CUTS M16×2 FAR 10× WITHOUT
+regressing the HW-validated (§16) coarse-combining acquisition gain. M32×1 byte-identical.
+
+### §17.1 The change (`source/physical_layer/ofdm.cc` — `time_sync_mfsk_corr` gate)
+The detect/no-detect decision is now gated on the COARSE matched count; the Phase-2 fine pass
+refines the returned sample OFFSET only (it no longer re-maximizes the count to re-decide):
+```
+int decision_matched = (mfsk_nStreams >= 2) ? best_matched : fine_best_matched;
+if (decision_matched < mfsk_preamble_match_threshold) { *out_metric = decision_matched; return -1; }
+*out_metric = decision_matched; return fine_best_offset;   // offset still fine-refined
+```
+- **nStreams>=2 (M16×2/M4×2 — the combiner geometry):** decide on `best_matched` (coarse).
+  This recovers the coarse-only ref-scorer FAR. The reported `*out_metric` becomes the coarse
+  decision statistic (honest; the §16 HW probe was on the pre-§13 build and is unaffected).
+- **nStreams==1 (M32×1/M8×1 — ROBUST_0):** `decision_matched == fine_best_matched` →
+  the gate, the reported metric, and the return are **textually equivalent to monitor
+  @8fc1211** (gate on `fine_best_matched`, return `fine_best_offset`). BYTE-IDENTICAL.
+
+### §17.2 Measured outcome (production detector, `MERCURY_P3_SWEEP=1`, this build)
+| geometry | metric | pre-§13 (fine-max gate) | post-§13 (coarse gate) | target |
+|---|---|---:|---:|---|
+| **M16×2** | **FAR/poll @ T=8** | **1.80e-2** | **1.75e-3** | ref-scorer 1.75e-3 ✓ |
+| M16×2 | cliff @ T=8 (P=0.5) | −13.89 | **−12.55** | ≤ −11 (clears +1.55 dB) |
+| M16×2 | prod-path == ref-scorer? | no | **YES at every T/σ** | (decision now coarse) |
+| M32×1 | cliff T=8 / T=7 | −12.55 / −13.89 | **−12.55 / −13.89** | unchanged (gate off) ✓ |
+| M32×1 | FAR T=8 / T=7 | 0.0 / 2.25e-3 | **0.0 / 2.25e-3** | unchanged (gate off) ✓ |
+
+The M16×2 cliff moves −13.89 → −12.55 (the **+1.34 dB fine-pass sub-position-MAX bonus**, which
+was the FAR-inflation source, is intentionally traded for the **10× FAR reduction**). The
+HW-validated CORE — coarse stream-energy combining — is **PRESERVED**: −9.03 (AND-gate
+baseline) → −12.55 (coarse-combined) = **+3.52 dB** of the §16 +4.86 dB gain retained, and
+−12.55 still clears the −11 PASS bar AND the −10.84 FEC bind with margin. The deepening that
+§16 measured on RF (mean matched ~2.4×, full-strength detections recovered at −9.6 dB) is a
+property of the COARSE combining and is therefore intact under §13. M16×2 P(detect) post-§13:
+0.97 @ −10.97, **0.87 @ −11.80**, 0.66 @ −12.55 (T=8).
+
+### §17.3 Test — §6.P5 always-on FAR regression (`mfsk_ctrl_codec_tests.cc`)
+**NEW §6.P5 `test_mfsk_data_preamble_far_coarse_gate`** (always-on, fail-before/pass-after):
+- **(A)** M16×2 pure-noise FAR through the PRODUCTION gate (`delay>=0`) at T=8 over 4000
+  trials must be ≤ 8e-3 (the bound separates pre-fix 1.8e-2 from post-fix 1.75e-3). PRE-FIX
+  (fine-max gate, `9cecc8f`) = **55/4000 = 1.38e-2 → FAILS**; POST-FIX (coarse gate) =
+  **5/4000 = 1.25e-3 → PASSES**.
+- **(B)** acquisition non-regression: at SNR3k −11.80 dB (inside the −12.55 coarse cliff) the
+  production detector must still detect ≥30/40 — POST-FIX **34/40** → the §13 cleanup did NOT
+  collapse the combiner core. (The §6.P4 guard independently gets 35/40 at the same cell.)
+- Fail-before verified by `git stash`-ing only `ofdm.cc` (revert the gate), rebuild, `--test`
+  → **51 passed, 1 failed** (§6.P5 FAR FAIL 1.38e-2). Restored → **52 passed, 0 failed**.
+- M32×1 byte-identity: source-diff of `time_sync_mfsk_corr` vs `8fc1211` confirms the
+  nStreams==1 path (per-symbol decision + gate + metric + return) is line-equivalent; plus
+  §6.P4(B) M32×1 40/40 and the unchanged §6.1–§6.5 ROBUST_0 argmax tests.
+
+### §17.4 Merge
+`sim/data-detector-deepen-p3` (combiner §11 + §13 cleanup) merged into `monitor`. Merged-tree
+`bash build.sh o3` + `--test` = 52/0; M32×1 byte-identical; combiner present (gated
+nStreams>=2 → ROBUST_0/MFSK-control untouched). The combiner ALSO lifts the EXISTING
+ROBUST_1/ROBUST_2 data-frame detection (a shipped improvement, not just RA-tier prep). NO push.
+Repro: `cd <worktree> && bash build.sh o3 && env MERCURY_P3_SWEEP=1 ./mercury.exe --test`.

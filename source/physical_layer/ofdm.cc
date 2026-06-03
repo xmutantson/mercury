@@ -3760,13 +3760,39 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 	}
 
 	// Detection gate: length-scaled discrete match count.
-	if (fine_best_matched < mfsk_preamble_match_threshold)
+	//
+	// §13 FAR cleanup (data-frame-detector-deepening-p3.md §13): the
+	// detect/no-detect DECISION is gated on the COARSE matched count, and the
+	// Phase-2 fine pass is used ONLY to refine the returned sample OFFSET — it
+	// does NOT re-maximize the count to RE-DECIDE detection. Rationale: the
+	// fine pass takes the MAX matched count over the ±½-symbol sub-positions,
+	// which lifts BOTH the signal AND the pure-noise matched-count distribution
+	// (a max over correlated positions). On the M16×2 combiner path that
+	// fine-pass max INFLATES FAR ~10× (T=8 1.8e-2 vs the coarse-only 1.75e-3,
+	// §12) without buying genuine detection — the real acquisition gain is
+	// carried by the COARSE stream-energy combining (the +4.86 dB / ~2.4×
+	// matched-count lift, HW-validated §16), not by the sub-position max.
+	// Deciding on the coarse count therefore recovers the ref-scorer FAR
+	// (1.75e-3 @ T=8) while preserving the combiner's coarse acquisition gain.
+	//
+	// GATED behind nStreams>=2 (the combiner geometry):
+	//  - nStreams>=2 (M16×2/M4×2 — ROBUST_1/2, future ROBUST_RA/ULTRA): decide
+	//    on best_matched (coarse); report it as the decision statistic. The fine
+	//    pass still ran and fine_best_offset is its alignment-refined position,
+	//    returned on a positive detection (offset refinement only).
+	//  - nStreams==1 (M32×1/M8×1 — ROBUST_0): UNCHANGED — gate on
+	//    fine_best_matched and report it, byte-identical to monitor @8fc1211
+	//    (the §11 combiner gate already preserves the 1-stream decision path;
+	//    this keeps the SAME gate statistic there too).
+	int decision_matched = (mfsk_nStreams >= 2) ? best_matched : fine_best_matched;
+
+	if (decision_matched < mfsk_preamble_match_threshold)
 	{
-		if (out_metric) *out_metric = (double)fine_best_matched;
+		if (out_metric) *out_metric = (double)decision_matched;
 		return -1;
 	}
 
-	if (out_metric) *out_metric = (double)fine_best_matched;
+	if (out_metric) *out_metric = (double)decision_matched;
 	return fine_best_offset;
 }
 

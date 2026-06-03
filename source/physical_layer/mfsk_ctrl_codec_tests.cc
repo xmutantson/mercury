@@ -2050,6 +2050,115 @@ static void test_mfsk_data_preamble_stream_combiner() {
 	test_pass(name);
 }
 
+// §6.P5 — §13 FINE-PASS FAR CLEANUP GUARD (always-on assertion).
+//
+// data-frame-detector-deepening-p3.md §13: the M16×2 combiner's detect/no-detect
+// DECISION must be gated on the COARSE matched count (one position per symbol
+// grid). The Phase-2 fine pass refines the returned sample OFFSET only — it must
+// NOT re-maximize the matched count to RE-DECIDE detection. The fine-pass
+// sub-position max lifts the pure-noise matched-count distribution, INFLATING the
+// M16×2 production FAR ~10× (§12: T=8 1.80e-2 fine-max vs 1.75e-3 coarse-only).
+//
+// This is the fail-before / pass-after regression for that fix (ofdm.cc
+// time_sync_mfsk_corr detection gate, `decision_matched = nStreams>=2 ?
+// best_matched : fine_best_matched`):
+//   - PRE-FIX (fine-max gate, monitor/6771c8b/9cecc8f): M16×2 pure-noise FAR at
+//     the production T=8 is ~1.80e-2 (≈72/4000) → EXCEEDS the bound → FAILS.
+//   - POST-FIX (coarse gate): FAR drops to the coarse-only ref-scorer level
+//     ~1.75e-3 (≈7/4000) → PASSES. (MEASURED, §13 post-fix sweep 2026-06-02.)
+//
+// The bound 8e-3 (≤32/4000) cleanly separates the two (fail-before 72 ≫ 32;
+// pass-after 7 ≪ 32) with ~4× headroom each side. FAR on the production gate is
+// measured via the detector's OWN decision (delay>=0), i.e. the real gate path,
+// NOT a re-derivation from the metric.
+//
+// Plus a non-regression tripwire: at SNR3k −11.80 dB (mult=11, INSIDE the coarse
+// cliff −12.55) the production detector must still detect ≥75% — proving the §13
+// FAR cleanup did NOT collapse the HW-validated coarse-combining acquisition gain
+// (§16: −9.03 AND-gate → −12.55 coarse-combined, +3.52 dB preserved; the 1.34 dB
+// of fine-max bonus is what is intentionally traded for the 10× FAR reduction).
+static void test_mfsk_data_preamble_far_coarse_gate() {
+	const char* name = "mfsk_data_preamble_far_coarse_gate";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_2);
+	if (ts.mfsk.nStreams != 2) {
+		test_fail(name, "pre-condition: ROBUST_2 not M16×2 (nStreams!=2)");
+		return;
+	}
+	std::vector<double> clean_pb; int buf_pb = 0, sym_samples = 0; double p_sig = 0.0;
+	if (!p3_build_clean_passband(ts, clean_pb, buf_pb, sym_samples, p_sig)) {
+		test_fail(name, "M16×2 build_clean_passband failed");
+		return;
+	}
+	int interp = ts.data_container.interpolation_rate;
+	double sig_rms = std::sqrt(p_sig);
+
+	// --- (A) FAR on pure noise through the PRODUCTION gate (delay>=0) at T=8 ---
+	const int FN = 4000;
+	double sig_far = 8.0 * sig_rms;            // mid-σ, matches §6.P3 FAR cell
+	int false_detects = 0;
+	for (int trial = 0; trial < FN; trial++) {
+		std::vector<std::complex<double> > bb;
+		std::mt19937 rng((uint32_t)(0xFA9C0000u + trial));
+		p3_noisy_baseband(ts, clean_pb, buf_pb, sig_far, /*with_signal=*/false, rng, bb);
+		double metric = 0.0;
+		int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
+		if (delay >= 0) false_detects++;        // production gate fired on noise
+	}
+	// NB: `far` is a legacy MS-DOS/MinGW keyword-macro on Windows — name it far_rate.
+	double far_rate = (double)false_detects / FN;
+	const double far_bound = 8.0e-3;            // separates 1.8e-2 (pre) from 1.75e-3 (post)
+	if (far_rate > far_bound) {
+		char b[256];
+		snprintf(b, sizeof(b),
+			"§13 FAR FAIL: M16×2 production FAR = %d/%d = %.2e on pure noise at T=8, "
+			"exceeds bound %.2e. The detect decision must gate on the COARSE matched "
+			"count (decision_matched = nStreams>=2 ? best_matched : fine_best_matched); "
+			"the fine-pass sub-position MAX inflates FAR ~10× (pre-fix ~1.8e-2).",
+			false_detects, FN, far_rate, far_bound);
+		test_fail(name, b);
+		return;
+	}
+	printf("    [ASSERT OK] §13 M16×2 production FAR = %d/%d = %.2e at T=8 "
+		"(<= %.0e; coarse-gate, was ~1.8e-2 with the fine-max gate).\n",
+		false_detects, FN, far_rate, far_bound);
+
+	// --- (B) acquisition gain PRESERVED: detect ≥75% inside the coarse cliff ---
+	{
+		const int NT = 40;
+		const int need = 30;                    // ≥75%
+		int prodT = ts.mfsk.preamble_match_threshold;
+		double mult = 11.0;                     // SNR3k ≈ −11.80 dB (inside −12.55 cliff)
+		double sigma = mult * sig_rms;
+		double snr = snr3k_db(p_sig, sigma, ts.sampling_frequency);
+		int passes = 0;
+		for (int seed = 0; seed < NT; seed++) {
+			std::vector<std::complex<double> > bb;
+			std::mt19937 rng((uint32_t)(0xACC00000u + seed));
+			p3_noisy_baseband(ts, clean_pb, buf_pb, sigma, /*with_signal=*/true, rng, bb);
+			double metric = 0.0;
+			int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), (int)bb.size(), interp, 0, &metric);
+			if (delay >= 0 && (int)metric >= prodT) passes++;
+		}
+		if (passes < need) {
+			char b[256];
+			snprintf(b, sizeof(b),
+				"§13 ACQUISITION-REGRESSION: M16×2 detect only %d/%d at SNR3k=%.2f dB "
+				"(mult=%.1f, T=%d). The coarse gate must keep the HW-validated combining "
+				"gain (cliff −12.55); a drop here means §13 collapsed acquisition.",
+				passes, NT, snr, mult, prodT);
+			test_fail(name, b);
+			return;
+		}
+		printf("    [ASSERT OK] §13 M16×2 acquisition PRESERVED: %d/%d detect at SNR3k=%.2f dB "
+			"(inside the −12.55 coarse cliff; combiner core intact).\n", passes, NT, snr);
+	}
+
+	test_pass(name);
+}
+
 // =============================================================================
 // §7 Mini-Moose CFO refinement regression suite
 // (data-preamble-port-research.md §20, data-flow-freq_offset_measured.md §7)
@@ -5343,6 +5452,11 @@ int run_mfsk_ctrl_codec_tests() {
 	// §6.P4 stream-energy combiner productionization guard (always-on,
 	// fail-before/pass-after): M16×2 cliff deepening + M32×1 non-regression.
 	test_mfsk_data_preamble_stream_combiner();
+
+	// §6.P5 §13 fine-pass FAR cleanup guard (always-on, fail-before/pass-after):
+	// M16×2 production FAR drops 1.8e-2 → ~1.75e-3 (coarse-gate decision) while
+	// the coarse-combining acquisition gain is preserved.
+	test_mfsk_data_preamble_far_coarse_gate();
 
 	// §1 codec primitives
 	test_pack_unpack_callsign_body_b36();
