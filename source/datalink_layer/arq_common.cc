@@ -145,6 +145,10 @@ cl_arq_controller::cl_arq_controller()
 
 	data_batch_size=1;
 	nominal_batch_size=1;
+	// WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §5): default 1 keeps
+	// the robust tier byte-identical to the historical stop-and-wait behavior.
+	// Overridden by --robust-batch and applied only to a PINNED robust dwell.
+	robust_dwell_batch=1;
 	batch_consec_acks=0;
 	control_batch_size=1;
 	ack_batch_size=1;
@@ -572,36 +576,62 @@ void cl_arq_controller::set_ack_batch_size(int ack_batch_size)
 
 void cl_arq_controller::set_data_batch_size(int data_batch_size)
 {
-	// CHOKEPOINT: robust => batch 1 (the single enforcement point).
-	// At any robust/MFSK config the batch MUST be 1 (all-or-nothing pattern ACK;
-	// a clean all-ones batch == one delivered MFSK frame). The CMD and RSP
-	// compute their clean-ACK target as (1<<data_batch_size)-1 independently
-	// (arq_commander.cc:131/2518, arq_responder.cc:801/1711); if the two sides
-	// ever hold different robust batch sizes the targets never match, no clean
-	// credit fires, and the gearshift climb cannot start or advance. Four
-	// successive wire failures of the climb-fix family were all this same class
-	// (CMD/RSP robust-batch mismatch via a different producer each time:
-	// SACK-recompute predicate skew, Axis-2 growth, SET_LINK_PARAMS clamp). Per
-	// the data-flow-batch-size.md audit (CLAUDE.md §5) we stop guarding each
-	// producer in isolation and enforce the invariant HERE, at the sole setter,
-	// so no current OR future producer can bypass it.
+	// CHOKEPOINT: robust-tier batch enforcement (the single enforcement point).
+	// At any robust/MFSK config CMD and RSP compute their clean-ACK target as
+	// (1<<data_batch_size)-1 independently (arq_commander.cc:131/2518,
+	// arq_responder.cc:801/1711); if the two sides ever hold different robust
+	// batch sizes the targets never match, no clean credit fires, and the
+	// gearshift climb cannot start or advance. Four successive wire failures of
+	// the climb-fix family were all this same class (CMD/RSP robust-batch
+	// mismatch via a different producer each time: SACK-recompute predicate skew,
+	// Axis-2 growth, SET_LINK_PARAMS clamp). Per the data-flow-batch-size.md audit
+	// (CLAUDE.md §5) we enforce the invariant HERE, at the sole setter, so no
+	// current OR future producer can bypass it.
+	//
+	// WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §1.2/§5): the robust
+	// batch is forced to the SYMMETRIC value the climb-vs-pinned discriminator
+	// selects, NOT unconditionally 1:
+	//   - CLIMB active (climb_owns_robust_batch()==gear_shift_on==YES): force 1.
+	//     A climbing rung promotes only on a clean all-ones batch, and at the
+	//     MFSK floor SNR a multi-frame all-ones batch never arrives first-pass —
+	//     so batch=1 (one delivered frame == clean batch) is the ONLY way the
+	//     climb advances. This preserves the data-flow-batch-size.md §1 safeguard
+	//     verbatim for every climb path.
+	//   - PINNED (gearshift OFF): force robust_dwell_batch (>=1). There is no
+	//     promotion gate when pinned, so the all-ones-symmetry concern is moot and
+	//     batch>=2 enables the (already-built) MFSK SACK selective-retransmit path
+	//     for delivered-rate. Forcing EXACTLY robust_dwell_batch (rather than
+	//     honoring whatever value a producer requested) also backstops the OFDM
+	//     30s/radio_batch recompute from ever leaking a 10/25 batch into a robust
+	//     config. Both CMD and RSP run this identical code keyed on the same
+	//     current_configuration + robust_dwell_batch, so they cannot diverge for a
+	//     session configured consistently (default robust_dwell_batch=1 is
+	//     byte-identical to the historical tier; cross-peer wire negotiation of a
+	//     non-default value is the deferred integration item, §5.1).
 	//
 	// current_configuration is the authoritative live-PHY config: set in
-	// load_configuration() (arq_common.cc:1168) BEFORE its own batch sizing runs,
-	// and it is the SAME variable the Axis-2 robust guard (policy_evaluate_axis2)
-	// and the RSP SACK recompute already key off. NOTE: the SACK-test direct
-	// assigns (this->data_batch_size = 25/30, arq_responder.cc:2895/3000)
-	// deliberately bypass this setter and are unaffected (OFDM-batch SACK tests).
-	if(is_robust_config(current_configuration) && data_batch_size != 1)
+	// load_configuration() BEFORE its own batch sizing runs, the SAME variable the
+	// Axis-2 robust guard and the RSP SACK recompute key off. NOTE: the SACK-test
+	// direct assigns (this->data_batch_size = 25/30, arq_responder.cc) deliberately
+	// bypass this setter and are unaffected (OFDM-batch SACK tests).
+	if(is_robust_config(current_configuration))
 	{
-		if(this->data_batch_size != 1)
+		int robust_target = climb_owns_robust_batch() ? 1 : robust_dwell_batch;
+		if(robust_target < 1) robust_target = 1;
+		// Bound a pinned dwell to the SACK bitmap width (the MFSK suffix carries
+		// 30 bits — fact-doc §11.2). The climb path is always 1.
+		if(robust_target > MAX_SACK_BATCH_SIZE) robust_target = MAX_SACK_BATCH_SIZE;
+		if(robust_target > 30) robust_target = 30;
+		if(data_batch_size != robust_target && this->data_batch_size != robust_target)
 		{
-			printf("[BATCH-CHOKEPOINT] robust config %d: clamped requested batch %d -> 1 "
-				"(robust => batch 1 invariant; CMD/RSP must agree)\n",
-				current_configuration, data_batch_size);
+			printf("[BATCH-CHOKEPOINT] robust config %d: requested batch %d -> %d "
+				"(%s; CMD/RSP must agree)\n",
+				current_configuration, data_batch_size, robust_target,
+				climb_owns_robust_batch() ? "climb owns batch => 1"
+				                          : "pinned robust_dwell_batch");
 			fflush(stdout);
 		}
-		this->data_batch_size = 1;
+		this->data_batch_size = robust_target;
 		return;
 	}
 
@@ -757,6 +787,18 @@ void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
 		if(new_batch > max_batch) new_batch = max_batch;
 		set_data_batch_size(new_batch);
 		nominal_batch_size = new_batch;
+	}
+	else
+	{
+		// WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §2.3/§5): adopt
+		// the robust dwell batch at connect so CMD and RSP agree from the first
+		// batch. The chokepoint (set_data_batch_size) decides the final value:
+		// robust_dwell_batch when PINNED, 1 when the CLIMB owns the batch. Both
+		// sides run this identical code keyed on the same current_configuration +
+		// robust_dwell_batch -> cannot diverge. Default robust_dwell_batch=1 keeps
+		// this byte-identical to the historical robust tier.
+		set_data_batch_size(robust_dwell_batch);
+		nominal_batch_size = data_batch_size;
 	}
 	recalculate_ack_timeout_for_batch();
 	printf("[SACK] %s Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
@@ -1329,9 +1371,16 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// LDPC provides cliff-effect protection; if a frame decodes, it's correct.
 	// Saves 1 frame per ACK cycle + 1 per control cycle = major time savings
 	// at 4.6-7.3s per frame.
+	//
+	// WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §2.1/§5): request the
+	// robust dwell batch for DATA; the set_data_batch_size() chokepoint forces it
+	// back to 1 whenever the CLIMB owns the batch (climb_owns_robust_batch()), and
+	// to robust_dwell_batch only when PINNED. ACK/control stay single-frame
+	// (pattern-ACK is all-or-nothing; SACK rides the per-DATA-frame ACK suffix,
+	// not the control batch). Default robust_dwell_batch=1 => byte-identical.
 	if(is_robust_config(configuration))
 	{
-		set_data_batch_size(1);
+		set_data_batch_size(robust_dwell_batch);
 		set_ack_batch_size(1);
 		set_control_batch_size(1);
 	}

@@ -785,8 +785,9 @@ void cl_arq_controller::process_messages_rx_data_control()
 							// already applied. Promotion still REQUIRES full delivery: a rung that never
 							// completes a batch never reaches this block, so the +1 anchor clamp +
 							// clean-batch-viability guard are unchanged (no deep-SNR over-climb). This
-							// path runs only at batch>=5 (OFDM tier); robust is batch=1 and never uses
-							// the prev path.
+							// path runs at batch>=2 (OFDM tier, or a PINNED robust dwell with
+							// --robust-batch>=2 per data-flow-robust-tier-arq-batch.md §5); the
+							// CLIMBING robust tier is batch=1 and never uses the prev path.
 							{
 								unsigned char prev_ack_bsi = (unsigned char)(
 									rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
@@ -1508,7 +1509,11 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							// default in MFSK / ROBUST modes per
 							// arq_common.cc:1163-1198). The EOB bit-7 on the lone
 							// DATA frame is the all-or-nothing receipt indicator.
-							// Suppress the dispatch entirely.
+							// Suppress the dispatch entirely. (WIN-CAMPAIGN incr2:
+							// a PINNED robust dwell with --robust-batch>=2 has
+							// data_batch_size>1 and falls into the else branch
+							// below -> the MFSK-suffix partial SACK fires at robust;
+							// see data-flow-robust-tier-arq-batch.md §1.1/§3.3.)
 							printf("[ACK-GATE-V2] SACK_RSP suppressed (data_batch_size=%d, multi-frame batches only)\n",
 								data_batch_size);
 							fflush(stdout);
