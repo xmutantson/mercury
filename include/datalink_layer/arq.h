@@ -756,6 +756,65 @@ public:
   static int fast_probe_clean_streak(int config)
   { return sustained_anchor_threshold(config); }
 
+  // FIX-A — ROBUST-tier dwell-batch eligibility (data-flow-robust-tier-arq-batch.md
+  // §5.1). TRUE iff a ROBUST dwell may SAFELY run batch > 1 (the FIX-A relaxation).
+  // The robust batch is pinned to 1 by default because at the MFSK cliff
+  // P(batch clean)=p^N and only batch=1 makes the strict all-ones clean target
+  // achievable WHILE THE CLIMB IS STILL EARNING THE RUNG (the central tension /
+  // landmine L8 — lifting batch while the climb owns the rung freezes the anchor
+  // and is the literal Bug-3 dormancy). This predicate lifts the pin ONLY when the
+  // rung is PROVEN and the climb is PARKED (not actively probing up), so the p^N
+  // penalty is acceptable and the M=16 MFSK SACK suffix patches any partial.
+  //
+  // PURE core — takes every input explicitly so the unit test (Parts D'1/D'3) can
+  // drive it with no live telecom_system / channel. ALL conjuncts must hold:
+  //  (a) live PHY is a ROBUST config            — is_robust_config(current_cfg)
+  //  (b) WB session (SACK suffix exists)        — suffix_capable
+  //        (NB: M=8 => ack_sack_suffix_len()==0 => NO bitmap => a multi-frame
+  //         partial is UNRECOVERABLE => MUST stay batch=1; landmine L2 / OR guard b)
+  //  (c) this rung is PROVEN delivered          — ladder_idx(current) <= ladder_idx(anchor)
+  //        (the anchor has reached/passed this rung => clean batch(es) already
+  //         confirmed here at batch=1; the climb has earned this rung)
+  //  (d) the clean streak is ESTABLISHED + parked HERE —
+  //        streak_cfg == current_cfg && clean_streak >= ROBUST_DWELL_PROOF_BATCHES
+  //        (proves we are PARKED on a SUSTAINED-clean robust rung, not transiently)
+  //  (e) PARKED at the proven ceiling, NOT actively climbing up —
+  //        proven_ceiling >= 0 && ladder_idx(current) >= ladder_idx(proven_ceiling)
+  //        (OR-1 / L8 LOAD-BEARING: if a higher rung is still reachable+unproven the
+  //         climb still OWNS the batch — keep 1 so the strict clean credit keeps
+  //         advancing the anchor. proven_ceiling<0 means no ceiling has been bounded
+  //         yet => the link is NOT established at a parked ceiling => keep 1.)
+  static bool robust_dwell_batch_eligible_core(
+      int current_cfg, int anchor, int streak_cfg, int clean_streak,
+      int proven_ceiling, bool suffix_capable)
+  {
+    if(!is_robust_config(current_cfg)) return false;                  // (a)
+    if(!suffix_capable) return false;                                 // (b)
+    if(config_ladder_index(current_cfg)
+       > config_ladder_index(anchor)) return false;                   // (c) rung not proven
+    if(streak_cfg != current_cfg) return false;                       // (d) streak not here
+    if(clean_streak < ROBUST_DWELL_PROOF_BATCHES) return false;       // (d) streak too short
+    if(proven_ceiling < 0) return false;                              // (e) no parked ceiling yet
+    if(config_ladder_index(current_cfg)
+       < config_ladder_index(proven_ceiling)) return false;           // (e) higher rung reachable
+    return true;
+  }
+
+  // Member wrapper — supplies the live climb state + the WB/NB suffix capability
+  // from the dedicated config-independent ack_mfsk (M=16 WB => suffix_len==13;
+  // NB M=8 => 0). CMD-only state (clean_batches_*, supershift_proven_ceiling), so
+  // ONLY the CMD evaluates this; the RSP mirrors the resulting batch via the
+  // dedicated ROBUST_DWELL_BATCH_OP transport (it has no climb state — identical to
+  // how Axis-2's batch decision is CMD-only / RSP-applied). PURE (const).
+  bool robust_dwell_batch_eligible() const {
+    bool suffix_capable = (telecom_system != NULL)
+      && (telecom_system->ack_mfsk.ack_sack_suffix_len() > 0);
+    return robust_dwell_batch_eligible_core(
+      current_configuration, last_data_viable_config,
+      clean_batches_config, clean_batches_at_current_config,
+      supershift_proven_ceiling, suffix_capable);
+  }
+
   // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12) — the EFFECTIVE
   // threshold the FRAME-UP comparison (arq_commander.cc:3637) uses, computed at
   // READ time so it NEVER mutates / caps the frame_shift_threshold member (which
@@ -1640,6 +1699,23 @@ public:
   // will substitute current data_batch_size / 1=ON).
   int pending_link_params_batch_size;
   int pending_link_params_sack_mode;
+
+  // FIX-A — ROBUST-tier dwell-batch transport state (data-flow-robust-tier-arq-batch.md
+  // §5.2/§5.3). CMD-side staging read by add_message_control(ROBUST_DWELL_BATCH_OP).
+  // pending_robust_dwell_batch = the batch the CMD wants the RSP to mirror (the raise
+  // target ROBUST_DWELL_BATCH, or 1 on the revert). -1 = unset. robust_dwell_batch_active
+  // = true once the CMD has raised to a multi-frame robust batch (so the revert fires
+  // exactly once when eligibility is lost). Both reset on connection init / BREAK /
+  // config change (reset_session_state + load_configuration revert the batch to 1).
+  int pending_robust_dwell_batch;
+  bool robust_dwell_batch_active;
+  // CMD: decide whether to raise/revert the robust dwell batch and stage the
+  // symmetric ROBUST_DWELL_BATCH_OP frame. Called from the clean-data-ACK PARKED
+  // path (arq_commander.cc, after FRAME-UP declined to promote). No-op unless the
+  // batch actually needs to change. Returns TRUE iff it queued a control frame
+  // (connection_status moved to TRANSMITTING_CONTROL) — the caller must then NOT
+  // overwrite connection_status with TRANSMITTING_DATA. See §5.2/§5.3.
+  bool evaluate_robust_dwell_batch();
 
   // SACK Design A Step 11 — Axis 3 controller state (SACK mode adaptation).
   // BOTH peers track sack_mode (CMD decides, RSP obeys via SET_LINK_PARAMS).

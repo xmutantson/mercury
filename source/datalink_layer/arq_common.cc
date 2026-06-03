@@ -299,6 +299,9 @@ cl_arq_controller::cl_arq_controller()
 	rsp_set_link_params_crc_fail_count=0;
 	pending_link_params_batch_size=-1;
 	pending_link_params_sack_mode=-1;
+	// FIX-A — ROBUST dwell-batch transport state (data-flow-robust-tier-arq-batch.md §5.2/§5.3).
+	pending_robust_dwell_batch=-1;
+	robust_dwell_batch_active=false;
 	// SACK Design A Step 11 — Axis 3 controller state (SACK mode ON↔PROBE↔OFF).
 	// Initial state = ON (per §4.3.2 spec). The mode is materially ON only on
 	// sack_v2_enabled sessions; on v1 sessions the field stays at its sentinel
@@ -655,16 +658,41 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 	// and the RSP SACK recompute already key off. NOTE: the SACK-test direct
 	// assigns (this->data_batch_size = 25/30, arq_responder.cc:2895/3000)
 	// deliberately bypass this setter and are unaffected (OFDM-batch SACK tests).
-	if(is_robust_config(current_configuration) && data_batch_size != 1)
+	// FIX-A (data-flow-robust-tier-arq-batch.md §5.2): the robust clamp is now a
+	// RANGE clamp [1..ROBUST_DWELL_BATCH_MAX], not force-to-1. The batch=1 invariant
+	// is still the DEFAULT (load_configuration() seeds 1 on every robust load, the
+	// connect-path SACK recompute leaves 1, and any out-of-range request is clamped
+	// in here), but a PROVEN+PARKED robust dwell may request a multi-frame batch via
+	// the dedicated ROBUST_DWELL_BATCH_OP transport. The CMD/RSP-agreement invariant
+	// is preserved because the same range clamp runs on BOTH sides' setter (the op
+	// applies the SAME value through here on each peer) — there is no asymmetric
+	// [10,32] floor like SET_LINK_PARAMS (OR-2 / L4). recalculate_ack_timeout_for_batch()
+	// keeps the data-ACK timeout tracking the wider batch (L3): without it CMD times
+	// out mid-batch and full-retransmits, the OPPOSITE of FIX-A's goal.
+	if(is_robust_config(current_configuration))
 	{
-		if(this->data_batch_size != 1)
+		int lo = 1, hi = ROBUST_DWELL_BATCH_MAX;
+		int clamped = data_batch_size;
+		if(clamped < lo) clamped = lo;
+		if(clamped > hi) clamped = hi;
+		int prev = this->data_batch_size;
+		if(prev != clamped)
 		{
-			printf("[BATCH-CHOKEPOINT] robust config %d: clamped requested batch %d -> 1 "
-				"(robust => batch 1 invariant; CMD/RSP must agree)\n",
-				current_configuration, data_batch_size);
+			printf("[BATCH-CHOKEPOINT] robust config %d: batch %d -> %d "
+				"(robust dwell range [%d,%d]; CMD/RSP must agree)\n",
+				current_configuration, data_batch_size, clamped, lo, hi);
 			fflush(stdout);
 		}
-		this->data_batch_size = 1;
+		this->data_batch_size = clamped;
+		// L3: keep the data-ACK timeout tracking the batch ONLY on an actual change
+		// to a multi-frame batch (the dwell raise) or back down (the revert). We do
+		// NOT recompute on the load_configuration() seed-to-1 (prev already 1): at
+		// that point message_transmission_time_ms is not yet recomputed for the new
+		// config, and set_ack_timeout_data() would read a stale value. The dwell
+		// raise/revert always fire AFTER load_configuration has finished (steady
+		// state), so message_transmission_time_ms is current there.
+		if(prev != clamped && (prev > 1 || clamped > 1))
+			recalculate_ack_timeout_for_batch();
 		return;
 	}
 
@@ -1397,6 +1425,13 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		set_data_batch_size(1);
 		set_ack_batch_size(1);
 		set_control_batch_size(1);
+		// FIX-A (data-flow-robust-tier-arq-batch.md §5.3): every robust config load
+		// (connect, BREAK→ROBUST_0, turbo-reverse, ROBUST_0→ROBUST_1 climb step)
+		// resets the dwell batch to its initial pin of 1 AND clears the raised flag,
+		// so a later proven+parked dwell at the NEW rung must re-earn the raise. This
+		// is the config-change revert leg of the symmetric revert — it runs on BOTH
+		// the CMD (which then re-evaluates) and the RSP (which adopts via the op).
+		robust_dwell_batch_active = false;
 	}
 	
 	gear_shift_up_success_rate_precentage=default_configuration_ARQ.gear_shift_up_success_rate_limit_precentage;
@@ -3148,6 +3183,10 @@ void cl_arq_controller::reset_session_state()
 	anchor_consec_break_fails = 0;
 	clean_batches_at_current_config = 0;
 	clean_batches_config = CONFIG_NONE;
+	// FIX-A — fresh session: the robust dwell batch is not raised; the pin is 1
+	// (data-flow-robust-tier-arq-batch.md §5.3). Mirrors the ctor init.
+	pending_robust_dwell_batch = -1;
+	robust_dwell_batch_active = false;
 	turbo_snr_ack_enabled = false;
 	turbo_received_snr = -99.0f;
 	turbo_switch_role_retries = 0;
