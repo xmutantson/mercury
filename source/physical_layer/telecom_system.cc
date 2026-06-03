@@ -5032,6 +5032,25 @@ void cl_telecom_system::load_configuration(int configuration)
 		_ldpc_rate=1/16.0;
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
+		// === P1 coherent mid-band prototype (THROWAWAY, sim/p1-coherent-midband) ===
+		// Re-tune CONFIG_0 into a few-carrier pilot-aided coherent QPSK r1/4 mode
+		// per phase4-coherent-tier-design.md §7.3. Gated behind MERCURY_P1 so the
+		// production CONFIG_0 (BPSK r1/16, Nc=50) is byte-for-byte unchanged when
+		// the env var is unset. Knobs: MERCURY_P1_MOD (bpsk|qpsk|8psk),
+		// MERCURY_P1_RATE (LDPC rate as N/16, e.g. 4 => 4/16=1/4), Nc via the
+		// override after the geometry copy below.
+		if(getenv("MERCURY_P1") != NULL)
+		{
+			const char* p1mod = getenv("MERCURY_P1_MOD");
+			if(p1mod != NULL && strcmp(p1mod,"bpsk")==0) _modulation=MOD_BPSK;
+			else if(p1mod != NULL && strcmp(p1mod,"8psk")==0) _modulation=MOD_8PSK;
+			else _modulation=MOD_QPSK; // default P1 modulation
+			const char* p1rate = getenv("MERCURY_P1_RATE");
+			int rate_num = (p1rate != NULL) ? atoi(p1rate) : 4; // default 4/16 = 1/4
+			if(rate_num < 1) rate_num = 1;
+			if(rate_num > 14) rate_num = 14;
+			_ldpc_rate = rate_num / 16.0f;
+		}
 	}
 	else if(configuration==CONFIG_1)
 	{
@@ -5328,6 +5347,38 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.Nfft=default_configurations_telecom_system.ofdm_Nfft;
 	ofdm.gi=default_configurations_telecom_system.ofdm_gi;
 	ofdm.Nsymb=default_configurations_telecom_system.ofdm_Nsymb;
+
+	// === P1 coherent mid-band prototype: per-config Nc + CP override (CONFIG_0 only) ===
+	// This is the plumbing phase4-coherent-tier-design.md §4.1 flagged as missing:
+	// today ofdm.Nc is a single AUTO_SELLECT->50/10 (telecom_system.cc init()).
+	// We set an explicit Nc here so the AUTO resolver (init(), Nc==AUTO_SELLECT
+	// branch) leaves it alone, and init() recomputes bandwidth/Nsymb from it.
+	// Nc<50 => nIdentical_sections=2 (the NB/narrow Moose path) is set later at
+	// the preamble block, which is correct for a narrowband mode.
+	if(configuration==CONFIG_0 && getenv("MERCURY_P1") != NULL && narrowband_enabled != YES)
+	{
+		const char* p1nc = getenv("MERCURY_P1_NC");
+		int nc = (p1nc != NULL) ? atoi(p1nc) : 5; // default 5 carriers (~234 Hz)
+		if(nc < 2) nc = 2;
+		if(nc > 50) nc = 50;
+		ofdm.Nc = nc;
+		// Optional CP override: MERCURY_P1_GI_MS in ms (DATAC4 uses 6 ms). gi is a
+		// fraction of Nfft samples at 12 kHz baseband: gi = (ms*12)/Nfft.
+		const char* p1gi = getenv("MERCURY_P1_GI_MS");
+		if(p1gi != NULL)
+		{
+			double gi_ms = atof(p1gi);
+			if(gi_ms > 0.0 && gi_ms < 12.0)
+				ofdm.gi = (gi_ms * 12.0) / (double)ofdm.Nfft;
+		}
+		// Force Nsymb to AUTO so init() recomputes the codeword length for the
+		// new (Nc, modulation) — the geometry copy above may have pulled a stale
+		// explicit value from a prior config.
+		ofdm.Nsymb = AUTO_SELLECT;
+		printf("[P1] CONFIG_0 re-tune: Nc=%d gi=%.4f (%.2f ms) mod=%.0f rate=%.4f\n",
+			ofdm.Nc, ofdm.gi, ofdm.gi*ofdm.Nfft/12.0, (double)M, (double)ldpc.rate);
+		fflush(stdout);
+	}
 
 	ofdm.pilot_configurator.Dx=default_configurations_telecom_system.ofdm_pilot_configurator_Dx;
 	ofdm.pilot_configurator.Dy=default_configurations_telecom_system.ofdm_pilot_configurator_Dy;
