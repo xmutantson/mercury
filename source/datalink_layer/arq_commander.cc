@@ -4500,6 +4500,33 @@ void cl_arq_controller::process_control_commander()
 				fflush(stdout);
 				this->connection_status=TRANSMITTING_DATA;
 			}
+			else if (messages_control.data[0]==ROBUST_DWELL_BATCH_OP)
+			{
+				// FIX-A P0 (adversarial-review fix, 2026-06-03) — CMD-side
+				// ROBUST_DWELL_BATCH_OP ACK consumer. Exact parallel of the
+				// SET_LINK_PARAMS branch above (the proven Axis-2 transport this op
+				// mirrors): the CMD already applied the new robust dwell batch
+				// locally at decision time (evaluate_robust_dwell_batch() →
+				// set_data_batch_size()); this ACK confirms the RSP adopted it too
+				// (arq_responder.cc ROBUST_DWELL_BATCH_OP handler), so both sides now
+				// agree on data_batch_size for the next DATA batch.
+				//
+				// Without this branch the CMD had NO transition out of
+				// RECEIVING_ACKS_CONTROL after the RSP ACKed → control-timeout →
+				// spurious emergency BREAK → load_configuration(ROBUST_0) reverted
+				// the batch to 1, on EVERY dwell raise AND revert (worse than the
+				// batch=1 floor). data-flow-robust-tier-arq-batch.md §5.4.
+				//
+				// Restart both timers to match the RSP-side handler, which restarts
+				// link_timer + watchdog_timer when it adopts the op
+				// (arq_responder.cc:2762-2763) — keeps the round-trip symmetric.
+				printf("[CMD-ROBUST-DWELL-ACKED] ROBUST_DWELL_BATCH_OP round-trip "
+					"complete (local batch=%d) — resuming data TX\n", data_batch_size);
+				fflush(stdout);
+				this->connection_status=TRANSMITTING_DATA;
+				watchdog_timer.start();
+				link_timer.start();
+			}
 			// BLOCK_END eliminated — pattern ACK / silence is sole flow control.
 			// finalize_block_commander() called directly after data ACK.
 			else if (messages_control.data[0]==SWITCH_ROLE)
@@ -8918,6 +8945,84 @@ int cl_arq_controller::test_climb_engine()
 	check(dp6_ofdm >= 5,
 		"D'6 OFDM (CONFIG_10) recompute still scales to SACK floor >=5 (FIX-A is robust-only)",
 		dp6_ofdm, 5);
+
+	// ================================================================
+	// Part D'-FLOW — FIX-A P0 (adversarial-review fix, 2026-06-03): the
+	// STATE-MACHINE FLOW round-trip the D'1-D'6 DECISION units never exercised.
+	// data-flow-robust-tier-arq-batch.md §5.4.
+	//
+	// FIX-A added the producer (encoder add_message_control(ROBUST_DWELL_BATCH_OP),
+	// decision evaluate_robust_dwell_batch()) + the RSP-side ACK handler
+	// (arq_responder.cc → ACKNOWLEDGING_CONTROL, ACKs), but the CMD-side
+	// process_control_commander() had NO data[0]==ROBUST_DWELL_BATCH_OP consumer.
+	// On the wire the CMD applies the dwell batch locally then sends the op and
+	// enters RECEIVING_ACKS_CONTROL; when the RSP ACK arrives the CMD had no
+	// transition back to TRANSMITTING_DATA → it sat in RECEIVING_ACKS_CONTROL →
+	// control-timeout → spurious emergency BREAK → load_configuration(ROBUST_0)
+	// reverted the batch to 1, on EVERY dwell raise AND revert — WORSE than the
+	// batch=1 floor it was trying to lift.
+	//
+	// This part drives the REAL process_control_commander() at the exact
+	// RECEIVING_ACKS_CONTROL state the RSP-ACK lands in (link_status=CONNECTED,
+	// connection_status=RECEIVING_ACKS_CONTROL, messages_control.data[0]=
+	// ROBUST_DWELL_BATCH_OP) and asserts the CMD reaches TRANSMITTING_DATA.
+	//
+	// FAIL-BEFORE: temporarily revert the new CMD consumer branch (the
+	// `else if (messages_control.data[0]==ROBUST_DWELL_BATCH_OP)` in
+	// process_control_commander()'s link_status==CONNECTED block) → the inner
+	// data[0] dispatch has NO catch-all else, so connection_status stays at
+	// RECEIVING_ACKS_CONTROL → DPF1 FAILS. PASS-AFTER: the branch sets
+	// TRANSMITTING_DATA → DPF1 PASSES. The D'1-D'6 parts CANNOT catch this — they
+	// call the pure DECISION helpers, never process_control_commander().
+	//
+	// Synthetic-fire safety: no init()/set_nMessages()/init_messages_buffers() ran, so
+	// (a) messages_tx/messages_rx are NULL — process_control_commander() ends in
+	//     cleanup(), which iterates messages_tx[0..nMessages]; force nMessages=0 so that
+	//     loop (and the analogous messages_rx loop) is a no-op and never derefs NULL; and
+	// (b) messages_control is a direct struct member, but its .data field is a char*
+	//     that is NULL until init_messages_buffers() allocates it (arq.h st_message:170).
+	//     We must point .data at a real buffer before writing data[0], or the write
+	//     faults. Allocate a scratch buffer here and restore NULL after.
+	// watchdog_timer/link_timer .start() only read the clock (timer.cc:140) — safe with
+	// no init. Restore all touched state after.
+	{
+		int saved_nMessages = nMessages;
+		int saved_link_status = link_status;
+		int saved_connection_status = connection_status;
+		char* saved_ctrl_data = messages_control.data;
+		int saved_ctrl_status = messages_control.status;
+
+		char dpf_ctrl_buf[N_MAX/8];
+		memset(dpf_ctrl_buf, 0, sizeof(dpf_ctrl_buf));
+		messages_control.data = dpf_ctrl_buf;   // give the control frame a real buffer
+		nMessages = 0;   // make cleanup()'s messages_tx/messages_rx loops no-ops (NULL-safe)
+
+		// Stage the exact post-RSP-ACK state: CONNECTED, awaiting a control ACK,
+		// the in-flight control frame is the dwell op.
+		link_status = CONNECTED;
+		connection_status = RECEIVING_ACKS_CONTROL;
+		messages_control.status = ACKED;   // an ACK was just received for this op
+		messages_control.data[0] = ROBUST_DWELL_BATCH_OP;
+
+		// Drive the REAL consumer.
+		process_control_commander();
+
+		// DPF1 — THE flow assertion: the CMD transitions out of
+		// RECEIVING_ACKS_CONTROL back to TRANSMITTING_DATA. Pre-fix (no consumer
+		// branch) this stays RECEIVING_ACKS_CONTROL and DPF1 FAILS.
+		check(connection_status == TRANSMITTING_DATA,
+			"DPF1 dwell-op ACK round-trips CMD RECEIVING_ACKS_CONTROL -> TRANSMITTING_DATA "
+			"(P0 consumer branch; FAIL-BEFORE without it)",
+			connection_status, TRANSMITTING_DATA);
+
+		// Restore (the scratch buffer is stack-local — null the pointer so no later
+		// teardown touches freed/stale storage).
+		messages_control.data = saved_ctrl_data;
+		messages_control.status = saved_ctrl_status;
+		nMessages = saved_nMessages;
+		link_status = saved_link_status;
+		connection_status = saved_connection_status;
+	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

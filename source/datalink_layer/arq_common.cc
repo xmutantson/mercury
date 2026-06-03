@@ -1427,18 +1427,17 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// at 4.6-7.3s per frame.
 	if(is_robust_config(configuration))
 	{
-		set_data_batch_size(1);
 		set_ack_batch_size(1);
 		set_control_batch_size(1);
-		// FIX-A (data-flow-robust-tier-arq-batch.md §5.3): every robust config load
-		// (connect, BREAK→ROBUST_0, turbo-reverse, ROBUST_0→ROBUST_1 climb step)
-		// resets the dwell batch to its initial pin of 1 AND clears the raised flag,
-		// so a later proven+parked dwell at the NEW rung must re-earn the raise. This
-		// is the config-change revert leg of the symmetric revert — it runs on BOTH
-		// the CMD (which then re-evaluates) and the RSP (which adopts via the op).
-		robust_dwell_batch_active = false;
+		// FIX-A P2 (adversarial-review fix, 2026-06-03): the robust DATA-batch reset
+		// (set_data_batch_size(1) + robust_dwell_batch_active=false) is DEFERRED to
+		// after the message_transmission_time_ms recompute below — see the relocated
+		// block. The ack/control batch resets above are timing-independent and stay
+		// here. ack/control single-frame: LDPC provides cliff-effect protection; if a
+		// frame decodes it's correct. Saves 1 frame per ACK/control cycle (major at
+		// 4.6-7.3s per frame).
 	}
-	
+
 	gear_shift_up_success_rate_precentage=default_configuration_ARQ.gear_shift_up_success_rate_limit_precentage;
 	gear_shift_down_success_rate_precentage=default_configuration_ARQ.gear_shift_down_success_rate_limit_precentage;
 
@@ -1460,6 +1459,29 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
     // TODO: After audio I/O rewrite we don't use this anymore. Was:
 	// time_left_to_send_last_frame=(float)telecom_system->speaker.frames_to_leave_transmit_fct/(float)(telecom_system->frequency_interpolation_rate*(telecom_system->bandwidth/telecom_system->ofdm.Nc)*telecom_system->ofdm.Nfft);
     time_left_to_send_last_frame=0;
+
+	// FIX-A P2 (adversarial-review fix, 2026-06-03): RELOCATED robust DATA-batch reset.
+	// data-flow-robust-tier-arq-batch.md §5.3 — every robust config load (connect,
+	// BREAK→ROBUST_0, turbo-reverse, ROBUST_0→ROBUST_1 climb step) resets the dwell
+	// batch to its initial pin of 1 AND clears the raised flag, so a later proven+parked
+	// dwell at the NEW rung must re-earn the raise. This is the config-change revert leg
+	// of the symmetric revert — it runs on BOTH the CMD (which then re-evaluates) and the
+	// RSP (which adopts via the op).
+	//
+	// WHY HERE (not back at the is_robust_config(configuration) reset block above): on a
+	// robust→robust reload while the dwell was RAISED (e.g. prev batch=4 → 1 on a
+	// ROBUST_0→ROBUST_1 step) the chokepoint's recalculate_ack_timeout_for_batch()
+	// (set_data_batch_size, arq_common.cc:~700) fires because prev>1. If the reset ran
+	// before message_transmission_time_ms is recomputed (the OLD site), that recompute
+	// read the STALE old-config frame time. Placing the reset AFTER the
+	// message_transmission_time_ms / ctrl_transmission_time_ms recompute above guarantees
+	// the chokepoint recompute uses the NEW config's frame time (L3). nominal_batch_size
+	// is set immediately below from the now-correct data_batch_size=1.
+	if(is_robust_config(configuration))
+	{
+		set_data_batch_size(1);
+		robust_dwell_batch_active = false;
+	}
 
 	// Scale data_batch_size based on block duration (OFDM modes only).
 	// MFSK modes keep batch_size=1 for pattern ACK optimization.

@@ -497,6 +497,75 @@ the link tries to climb again, BREAKs, or changes config:
 | §3.7 `messages_rx_prev` | ✓ verify | now live at robust; sized for ≥25, 4-8 fits; update its fact doc |
 | §3.8 climb credit | ✓ BY DESIGN | gate (e) keeps batch=1 while climb owns the rung; raise only when parked |
 
+### §5.5 ADVERSARIAL-REVIEW FIXES (2 bugs found in the shipped FIX-A — applied 2026-06-03 on `fix/floor-probe-backoff`)
+
+A read-only §5 sibling-bug review of the shipped FIX-A (commit `8ba8b46`) found
+the DATA-symmetry is SAFE (§5.4 holds) but the STATE-MACHINE FLOW of the §5.2
+transport had a hole, plus a stale-timeout ordering defect on the §5.3 config-load
+revert leg. Both fixed before the HW bench A/B (else the bench measures
+worse-than-floor and misattributes "dwell doesn't work").
+
+**P0 — the §5.2 transport was MISSING its CMD-side ACK consumer (the 0x44 round-trip
+never closed).** FIX-A wired the producer (encoder `add_message_control(
+ROBUST_DWELL_BATCH_OP)` at `arq_commander.cc:815`; decision
+`evaluate_robust_dwell_batch()` at `:5781`) and the RSP-side handler
+(`arq_responder.cc:2710` → `ACKNOWLEDGING_CONTROL`, restarts `link_timer` +
+`watchdog_timer` at `:2762-2763`, ACKs), but there was **NO
+`messages_control.data[0]==ROBUST_DWELL_BATCH_OP` branch in the CMD's
+`process_control_commander()`** (`arq_commander.cc:4021`). The decision applies the
+new batch locally then `add_message_control()` sets `connection_status=
+TRANSMITTING_CONTROL`; the CMD TXes the op and enters `RECEIVING_ACKS_CONTROL`.
+When the RSP ACK lands, the `link_status==CONNECTED` inner `data[0]` dispatch
+(`:4484-4905`) has NO catch-all `else`, so an unhandled op left
+`connection_status` stuck at `RECEIVING_ACKS_CONTROL` → control-timeout →
+spurious emergency BREAK → `load_configuration(ROBUST_0)` reverted the batch to 1,
+on EVERY dwell raise AND revert. Net: raise→stall→BREAK→revert→re-raise churn,
+WORSE than the batch=1 floor.
+
+  - **FIX**: added the consumer branch in `process_control_commander()`'s
+    `link_status==CONNECTED` block, EXACTLY parallel to the SET_LINK_PARAMS sibling
+    at `arq_commander.cc:4491` (`connection_status=TRANSMITTING_DATA`), plus
+    `watchdog_timer.start()` + `link_timer.start()` to MIRROR the RSP-side handler
+    (`arq_responder.cc:2762-2763`) so the round-trip is symmetric. The op now
+    round-trips identically to SET_LINK_PARAMS: CMD applies locally → TX op → RSP
+    applies + ACKs → CMD `RECEIVING_ACKS_CONTROL → TRANSMITTING_DATA`.
+  - **Consumer-list update**: §3 now has a NEW reader of the dwell-op control frame —
+    the CMD-side `process_control_commander()` ACK branch (consumer of the 0x44
+    control op, the close of the §5.2 transport loop). The RSP-side handler
+    (§2.7-analogue, `arq_responder.cc:2710`) is its producer-mirror.
+
+**P2 — stale ACK-timeout on the §5.3 config-load revert leg (the L3 gap).** The
+chokepoint recompute `if(prev!=clamped && (prev>1 || clamped>1))
+recalculate_ack_timeout_for_batch()` (`set_data_batch_size`, `arq_common.cc:~699`)
+deliberately skips `prev==1` because, in `load_configuration()`, the robust
+`set_data_batch_size(1)` originally ran BEFORE `message_transmission_time_ms` was
+recomputed for the new config. But a **robust→robust reload while the dwell was
+RAISED** (prev batch=4 → seed 1, e.g. ROBUST_0 dwell → ROBUST_1 step) hits
+`4!=1 && 4>1` → TRUE → the recompute fired with the STALE old-config frame time
+(transient, self-corrects next dwell eval, but a real defect).
+
+  - **FIX (Option A — move the reset, chosen over "suppress recompute within a
+    config load")**: in `load_configuration()` the robust DATA-batch reset
+    (`set_data_batch_size(1)` + `robust_dwell_batch_active=false`) is RELOCATED to
+    AFTER the `message_transmission_time_ms` / `ctrl_transmission_time_ms`
+    recompute (`arq_common.cc`, now right before the OFDM batch-scaling block). The
+    ack/control single-frame resets (`set_ack_batch_size(1)`,
+    `set_control_batch_size(1)`) stay at the original `is_robust_config` block
+    (timing-independent). Now the chokepoint's L3 recompute reads the NEW config's
+    frame time, and `nominal_batch_size = data_batch_size` reads the fresh `=1`. The
+    unconditional `set_ack_timeout_data/control` later in `load_configuration()`
+    still overwrites with fully-current values, so the final timeout is correct on
+    every path. Option A was chosen over the suppression flag because it fixes the
+    root-cause ordering (the chokepoint comment's own stated invariant
+    "message_transmission_time_ms is current" now actually holds) without threading
+    new state through the sole setter.
+
+**Flow-level regression test (the gap that hid P0)**: §6 D'1-D'6 test the dwell
+DECISION (pure helpers) but never drive the state-machine FLOW. Added **Part
+D'-FLOW / DPF1** (see §6). FAIL-BEFORE (P0 branch neutralized): DPF1 got=6
+(`RECEIVING_ACKS_CONTROL`) want=1 (`TRANSMITTING_DATA`), suite rc=1. PASS-AFTER:
+DPF1 got=1, suite rc=0.
+
 ---
 
 ## §6 PAIRED REGRESSION TEST (CLAUDE.md §"Cross-layer regression tests")
@@ -530,6 +599,21 @@ connect-path batch=1 symmetry, `:6635-6712`). ADD **Part D'** (robust dwell rais
   side that reloaded; assert a robust→robust reload does NOT leave a stale 4-8.
 - **D'6 — OFDM unchanged**: re-run old D5 (CONFIG_10 scales to ≥5) — FIX-A must
   not touch the OFDM path.
+- **D'-FLOW / DPF1 (NEW, §5.5 P0)** — the STATE-MACHINE FLOW the D'1-D'6 DECISION
+  units never exercised. Drives the REAL `process_control_commander()` at the exact
+  post-RSP-ACK state (`link_status=CONNECTED`,
+  `connection_status=RECEIVING_ACKS_CONTROL`,
+  `messages_control.data[0]=ROBUST_DWELL_BATCH_OP`) and asserts the CMD reaches
+  `TRANSMITTING_DATA`. Synthetic-fire safety: no `init()` ran, so (a) force
+  `nMessages=0` (the trailing `cleanup()` iterates `messages_tx[0..nMessages]` —
+  NULL until allocation) and (b) point `messages_control.data` at a stack scratch
+  buffer (it is a `char*`, NULL until `init_messages_buffers()`); restore both after.
+  **FAIL-BEFORE** (neutralize the P0 consumer branch → `else if(false && …)`): DPF1
+  got=6 (`RECEIVING_ACKS_CONTROL`) want=1, the inner `data[0]` dispatch has no
+  catch-all `else` so the CMD stays stuck → suite rc=1. **PASS-AFTER**: got=1,
+  rc=0. The D'1-D'6 parts CANNOT catch this — they call the pure DECISION helpers,
+  never `process_control_commander()`. (Lives in `test_climb_engine()`, run via
+  `--test-climb-engine` and `mercury.exe --test`.)
 
 **Wire test (FTRT sim then HW)**: the brief's "re-run with `-g`" maps to running
 the unpinned `-g -R` cascade in the FTRT sim at a deep-SNR cell where ROBUST_0 is
@@ -565,6 +649,11 @@ rate or the throughput-rise assertion is not trustworthy).
 - **L3** (`arq_common.cc:763`, `:1413+`): ACK-timeout scales by `data_batch_size`.
   The relaxed chokepoint MUST call `recalculate_ack_timeout_for_batch()` on every
   robust raise AND revert, on BOTH sides, or CMD times out mid-batch.
+  **L3 gap CLOSED (§5.5 P2)**: the chokepoint recompute on the config-load revert leg
+  (prev=4 → seed 1, robust→robust reload while dwell RAISED) used to read a STALE
+  `message_transmission_time_ms`. Fixed by relocating the robust DATA-batch reset in
+  `load_configuration()` to AFTER the frame-time recompute (Option A), so the L3
+  recompute always reads the NEW config's frame time.
 - **L4** (`arq_responder.cc:2609-2615`): SET_LINK_PARAMS clamps to `[10,32]`. Do
   NOT route the 4-8 robust raise through it (→ RSP=10 ≠ CMD=4-8 = Bug 3). Use a
   dedicated robust-dwell op OR a robust branch in the SET_LINK_PARAMS RSP handler
