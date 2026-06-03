@@ -8506,6 +8506,223 @@ printf("[TEST-CLIMB] %s (%d failure%s)\n",
 	return failed == 0 ? 0 : 1;
 }
 
+// =============================================================================
+// WIN-CAMPAIGN incr2 — robust-tier batch>=2 + SACK selective-retransmit
+// regression (data-flow-robust-tier-arq-batch.md §6). Two parts:
+//
+//   Part A (gating correctness): drives the REAL set_data_batch_size() chokepoint
+//   + sack_negotiated_recompute_batch() helper through the climb-vs-pinned
+//   discriminator. Asserts (1) a PINNED robust config adopts robust_dwell_batch
+//   on BOTH the CMD and RSP code paths (identical -> symmetric); (2) a CLIMBING
+//   robust config is forced to batch=1 (the data-flow-batch-size.md §1 safeguard
+//   is PRESERVED); (3) OFDM is unchanged (>=5).
+//
+//   Part B (delivered-throughput, fail-before/pass-after): a DETERMINISTIC
+//   wire-time model of delivering N DATA frames over a robust link under a fixed
+//   loss pattern. It uses the REAL chokepoint to obtain the batch size for each
+//   arm, then counts wire frame-slots under the ACTUAL ARQ retransmit semantics:
+//     - batch=1 (stop-and-wait, the historical robust tier): the controller can
+//       only have ONE frame outstanding, so EVERY frame costs an ACK turnaround,
+//       and a lost frame costs a full retransmit round (the all-or-nothing
+//       pattern-ACK has no partial credit).
+//     - batch>=2 (SACK selective-retransmit, the lift): a batch of B frames is
+//       sent in one TX; on loss the RSP SACKs the partial and the CMD
+//       retransmits ONLY the missing frame(s) (arq_responder.cc:1556 partial
+//       MFSK-suffix SACK -> arq_commander.cc:2641 sack_bitmap -> retransmit
+//       queue), amortizing the ACK turnaround over the batch.
+//   THROUGHPUT = delivered_frames / total_wire_slots. The assertion is that the
+//   batch>=2 arm STRICTLY beats the batch=1 arm under the same loss — the
+//   selective-retransmit win. FAIL-BEFORE: with the historical "robust => 1"
+//   chokepoint, the batch>=2 arm's chokepoint returns 1 too, so both arms are
+//   stop-and-wait and the throughputs are EQUAL (no win) -> the strict-greater
+//   assertion FAILS. PASS-AFTER: the pinned arm gets batch=2, selective
+//   retransmit, strictly higher throughput.
+// =============================================================================
+int cl_arq_controller::test_robust_batch_chokepoint()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-ROBUST-BATCH] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-ROBUST-BATCH] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Synthetic-fire priming (same pattern as test_climb_engine): no
+	// load_configuration() ran, so prime the length members the chokepoint's OFDM
+	// clamp reads, and the SACK/optimizer flags the recompute reads.
+	max_data_length   = 200;
+	max_header_length  = 7;
+	nMessages          = 120;
+	sack_enabled       = true;
+	sack_v2_enabled    = true;
+	optimizer_disabled = true;
+	message_transmission_time_ms = 1000;   // non-zero so OFDM scaling is deterministic
+	robust_enabled     = YES;
+	narrowband_enabled = NO;
+
+	// ----------------------------------------------------------------------
+	// Part A — gating correctness (chokepoint + recompute symmetry)
+	// ----------------------------------------------------------------------
+
+	// A1: PINNED robust (gearshift OFF), robust_dwell_batch=2. The chokepoint must
+	// ADOPT 2 (the lift). FAIL-BEFORE (historical chokepoint forces 1): got 1.
+	gear_shift_on      = NO;
+	robust_dwell_batch = 2;
+	current_configuration = ROBUST_2;
+	set_data_batch_size(99);                 // request anything; chokepoint decides
+	check(data_batch_size == 2, "A1 pinned ROBUST_2 adopts robust_dwell_batch=2 (the lift)",
+		data_batch_size, 2);
+
+	// A2: PINNED, via the production recompute helper (the CMD/RSP connect path).
+	current_configuration = ROBUST_2;
+	set_data_batch_size(1);
+	sack_negotiated_recompute_batch("CMD");
+	int cmd_pinned = data_batch_size;
+	set_data_batch_size(1);
+	sack_negotiated_recompute_batch("RSP");
+	int rsp_pinned = data_batch_size;
+	check(cmd_pinned == 2 && rsp_pinned == 2,
+		"A2 pinned recompute: CMD batch == RSP batch == robust_dwell_batch (symmetric)",
+		cmd_pinned, 2);
+	check(cmd_pinned == rsp_pinned,
+		"A2b CMD batch == RSP batch (the 4-failure symmetry invariant, pinned dwell)",
+		cmd_pinned, rsp_pinned);
+
+	// A3: CLIMBING robust (gearshift ON) — the data-flow-batch-size.md §1
+	// safeguard MUST hold: batch forced to 1 even though robust_dwell_batch=2.
+	// This is the climb-protection half (fail-before of the safeguard: if the lift
+	// ignored the climb, this would be 2 and the climb would stall at the floor).
+	gear_shift_on      = YES;
+	robust_dwell_batch = 2;
+	current_configuration = ROBUST_0;
+	set_data_batch_size(99);
+	check(data_batch_size == 1, "A3 CLIMBING ROBUST_0 forced to batch=1 (safeguard preserved)",
+		data_batch_size, 1);
+	current_configuration = ROBUST_0;
+	set_data_batch_size(1);
+	sack_negotiated_recompute_batch("CMD");
+	check(data_batch_size == 1, "A3b CLIMBING recompute keeps batch=1 (climb gets clean all-ones batch)",
+		data_batch_size, 1);
+
+	// A4: OFDM UNCHANGED — at CONFIG_10 the recompute scales to the SACK floor
+	// (>=5) regardless of robust_dwell_batch / gear_shift_on. Confirms the lift is
+	// robust-only and OFDM/non-robust behavior is byte-identical.
+	gear_shift_on      = NO;
+	robust_dwell_batch = 2;
+	current_configuration = CONFIG_10;
+	set_data_batch_size(1);
+	sack_negotiated_recompute_batch("CMD");
+	check(data_batch_size >= 5, "A4 OFDM (CONFIG_10) scales to SACK floor >=5 (lift is robust-only)",
+		data_batch_size, 5);
+
+	// A5: DEFAULT robust_dwell_batch=1 is byte-identical to the historical tier —
+	// a pinned robust config stays batch=1 (no behavior change unless opted in).
+	gear_shift_on      = NO;
+	robust_dwell_batch = 1;
+	current_configuration = ROBUST_2;
+	set_data_batch_size(99);
+	check(data_batch_size == 1, "A5 default robust_dwell_batch=1 keeps pinned robust at batch=1 (byte-identical)",
+		data_batch_size, 1);
+
+	// ----------------------------------------------------------------------
+	// Part B — delivered-throughput model (fail-before/pass-after)
+	// ----------------------------------------------------------------------
+	// Deliver N=8 DATA frames over a robust link. Loss pattern: a deterministic
+	// 1-in-4 drop (frames at 0-based indices 3 and 7 of the delivery order are lost
+	// on first attempt, then succeed on retransmit). Wire-cost model (in
+	// frame-slots; the ACK turnaround is one slot per CMD->RSP exchange):
+	//
+	//   throughput_units(batch B):
+	//     A batch carries up to B frames in one TX (B data slots), then 1 ACK
+	//     turnaround slot. On a clean batch all B advance. On a lossy batch:
+	//       - B==1 (stop-and-wait): the lone frame is lost -> it is re-sent in a
+	//         NEW batch (another data slot + another ACK slot). No partial credit.
+	//       - B>=2 (SACK): the RSP SACKs the partial; the CMD retransmits ONLY the
+	//         missing frame(s) in the next batch (missing-count data slots + 1 ACK
+	//         slot), then the batch completes.
+	// The model uses the REAL chokepoint to pick B for each arm, so the
+	// fail-before (historical chokepoint => B==1 for both arms) emerges naturally.
+	const int N = 8;
+	auto wire_slots_to_deliver = [&](int requested_batch, int cfg) -> int {
+		// Get the effective batch the production chokepoint would grant.
+		gear_shift_on = NO;            // pinned dwell (the throughput regime)
+		robust_dwell_batch = requested_batch;
+		current_configuration = cfg;
+		set_data_batch_size(99);
+		int B = data_batch_size;
+		if(B < 1) B = 1;
+		// Deterministic loss: frame index i is lost on first attempt iff (i % 4)==3.
+		auto lost_first = [](int i){ return (i % 4) == 3; };
+		int slots = 0;
+		int delivered = 0;
+		int next = 0;                  // next frame index to send
+		while(delivered < N)
+		{
+			// Form a batch of up to B not-yet-delivered frames.
+			int this_batch = 0;
+			int batch_first = next;
+			while(this_batch < B && (batch_first + this_batch) < N) this_batch++;
+			// First-pass TX of the batch: this_batch data slots + 1 ACK slot.
+			slots += this_batch + 1;
+			// Count which frames in this batch survive first pass.
+			int missing = 0;
+			for(int k = 0; k < this_batch; k++)
+				if(lost_first(batch_first + k)) missing++;
+			int got = this_batch - missing;
+			delivered += got;
+			if(missing > 0)
+			{
+				if(B == 1)
+				{
+					// Stop-and-wait: re-send the lone lost frame as a NEW batch
+					// (1 data slot + 1 ACK slot); on retransmit it succeeds.
+					slots += 1 + 1;
+					delivered += 1;
+				}
+				else
+				{
+					// SACK: retransmit ONLY the missing frames (missing data slots
+					// + 1 ACK slot); on retransmit they succeed.
+					slots += missing + 1;
+					delivered += missing;
+				}
+			}
+			next = batch_first + this_batch;
+		}
+		return slots;
+	};
+
+	// B1 — stop-and-wait arm (robust_dwell_batch=1 => chokepoint B=1).
+	int slots_b1 = wire_slots_to_deliver(/*requested_batch=*/1, ROBUST_2);
+	// B2 — selective-retransmit arm (robust_dwell_batch=2 => chokepoint B=2 when
+	// pinned; B=1 if the lift is absent -> fail-before).
+	int slots_b2 = wire_slots_to_deliver(/*requested_batch=*/2, ROBUST_2);
+	printf("[TEST-ROBUST-BATCH] throughput model: deliver %d frames -> "
+		"batch1 stop-and-wait=%d slots, batch2 SACK=%d slots\n",
+		N, slots_b1, slots_b2);
+	fflush(stdout);
+	// THE delivered-throughput assertion: selective retransmit uses STRICTLY fewer
+	// wire slots to deliver the same N frames under the same loss (== strictly
+	// higher throughput). FAIL-BEFORE: historical chokepoint forces batch2 arm to
+	// B=1 too -> slots_b2 == slots_b1 -> NOT strictly less -> FAILS.
+	check(slots_b2 < slots_b1,
+		"B1 batch>=2 SACK delivers N frames in FEWER wire slots than batch=1 stop-and-wait (selective-retransmit win)",
+		slots_b2, slots_b1);
+
+	// Restore the default so this test leaves no sticky state for any caller.
+	robust_dwell_batch = 1;
+	gear_shift_on = NO;
+
+	printf("[TEST-ROBUST-BATCH] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // ROBUST_0 + streaming-compression deadlock regression
 // (data-flow-compress-frame-fill.md). Production bug: with compression ON,
 // every ARQ session now STARTS at ROBUST_0 (batch=1) since MFSK-CONNECT

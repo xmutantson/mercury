@@ -322,6 +322,17 @@ public:
   // floor. The set_data_batch_size() chokepoint backstops the invariant.
   // See data-flow-batch-size.md §5. `who` is "CMD"/"RSP" for the log line only.
   void sack_negotiated_recompute_batch(const char* who);
+
+  // WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §1.2/§5): TRUE when
+  // the gearshift CLIMB owns the robust-tier batch size, in which case the batch
+  // MUST be pinned to 1 (a single clean MFSK frame == a clean all-ones batch, the
+  // only way a climbing rung promotes at the floor SNR — data-flow-batch-size.md
+  // §1). FALSE when pinned (gearshift OFF), where there is no promotion gate and
+  // the robust_dwell_batch may be >=2. Read identically by both CMD and RSP via
+  // the shared chokepoint + recompute helper, so the robust batch cannot diverge
+  // between the two sides for a session that configures them consistently.
+  bool climb_owns_robust_batch() const { return gear_shift_on == YES; }
+
   void set_call_sign(std::string call_sign);
 
   int get_nOccupied_messages();
@@ -1116,6 +1127,18 @@ public:
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
 
+  // WIN-CAMPAIGN incr2 — robust-tier batch>=2 + SACK selective-retransmit
+  // regression. Part A: drives the REAL set_data_batch_size() chokepoint +
+  // sack_negotiated_recompute_batch() through the climb-vs-pinned discriminator
+  // (pinned ROBUST adopts robust_dwell_batch symmetrically on CMD & RSP; CLIMBING
+  // ROBUST forced to 1 — the data-flow-batch-size.md §1 safeguard preserved; OFDM
+  // unchanged; default=1 byte-identical). Part B: a deterministic wire-slot
+  // throughput model asserting batch>=2 SACK delivers N frames in fewer slots than
+  // batch=1 stop-and-wait under the same loss (fail-before: historical chokepoint
+  // forces both arms to B=1 -> equal -> fails). Returns 0 on pass, 1 on fail.
+  // See data-flow-robust-tier-arq-batch.md §6.
+  int test_robust_batch_chokepoint();
+
   // ROBUST_0 + streaming-compression deadlock regression
   // (data-flow-compress-frame-fill.md). Drives the REAL
   // process_buffer_data_commander() data-fill path at ROBUST_0 frame
@@ -1815,6 +1838,17 @@ public:
   int reverse_configuration;   // Responder→Commander TX speed (after SWITCH_ROLE)
 
   int gear_shift_on;
+  // WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §5): batch size for a
+  // PINNED robust-tier dwell (ROBUST_0/1/2, gearshift OFF). Default 1 =
+  // byte-identical to the historical stop-and-wait robust tier. Set >=2 (CLI
+  // --robust-batch) to enable batch>=2 + the (already-built) MFSK SACK
+  // selective-retransmit path at a pinned robust config, lifting delivered rate
+  // above the 1-frame-per-batch cap. NEVER applies while the gearshift CLIMB is
+  // active (climb_owns_robust_batch()): the climb needs batch=1 so a single
+  // delivered MFSK frame is a clean all-ones batch at the floor SNR
+  // (data-flow-batch-size.md §1). Both peers must configure the same value (or
+  // leave the default); wire-negotiation is a deferred integration item (§5.1).
+  int robust_dwell_batch;
   int robust_enabled;
   int narrowband_enabled;  // 0=wideband (2344 Hz), 1=narrowband (469 Hz)
   int commander_configured_nb;  // commander's original NB setting (-1=unset, YES/NO)

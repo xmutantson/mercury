@@ -5439,6 +5439,310 @@ static void test_production_enhanced_connect_decodes() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §22 (WIN CAMPAIGN b — INCREMENT 1) — THE GATE FOR THIS INCREMENT: the
+// ROBUST_RA (cfg103) PRODUCTION PHY path round-trips real GF(16)-RA-coded BYTES
+// TX -> RX -> CRC on a clean channel. Drives the ACTUAL production functions:
+//   TX:  cl_telecom_system::transmit_byte (CRC16 append) -> transmit_bit
+//        (cfg103 branch: gf16ra::encode_k -> direct M16x2 diversity tone
+//        placement, bypassing LDPC + bit-interleaver) -> passband synthesis.
+//   CH:  clean copy-with-delay (awgn ampl=0), frame placed at the fixed delay.
+//   RX:  cl_telecom_system::receive_byte (cfg103 branch: symbol_demod ->
+//        decode_robust_ra_data -> hd_decoded_data_byte) -> the SHARED CRC16
+//        self-check + message_decoded contract.
+// ASSERTS (the gate): message_decoded==YES, crc==0, and the decoded bytes ==
+// the transmitted payload bytes (real RA codeword round-tripped through the
+// production path). FAIL-BEFORE: on the monitor base ROBUST_RA is not a usable
+// config (is_robust_config<=102, no load_configuration arm, no RA codec) so the
+// geometry assert fails (cfg103 does not bring up M16x2 / robust_ra_N stays 0);
+// and with only the define but the binary-LDPC path still in transmit_bit/
+// receive_byte there is no RA encode/decode to exercise. PASS-AFTER: the wired
+// TX RA-encode + RX RA-decode agree and the byte round-trip + CRC pass.
+//
+// This is the CLAUDE.md §5 cross-layer regression test for the ROBUST_RA
+// frame-fill / byte-contract shared state (p2-robust-ra-wiring.md §7): it drives
+// the full TX byte -> PHY -> RX byte -> CRC chain and asserts RX byte-state ==
+// TX byte-state. Clean channel only (sync/cliff is the e2e gate on the reference
+// branch + a later HW increment). In-process, no audio thread (mfsk_fixed_delay).
+// =============================================================================
+static void test_robust_ra_production_roundtrip() {
+	const char* name = "robust_ra_production_roundtrip";
+	printf("  [GATE] ROBUST_RA (cfg103) production PHY byte round-trip (TX RA-encode -> clean -> RX RA-decode -> CRC):\n");
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_RA);
+
+	// (1) geometry assertions (the fail-before trips here on the monitor base).
+	if (ts.M != MOD_MFSK || ts.mfsk.M != 16 || ts.mfsk.nStreams != 2) {
+		test_fail(name, "ROBUST_RA did not bring up M16x2 MFSK (cfg103 not wired?)");
+		return;
+	}
+	if (ts.robust_ra_N <= 0 || ts.robust_ra_K_info <= 0) {
+		test_fail(name, "robust_ra_N / robust_ra_K_info not set (load_configuration RA arm missing?)");
+		return;
+	}
+	if (ts.robust_ra_N > ts.data_container.Nsymb) {
+		test_fail(name, "robust_ra_N exceeds Nsymb (frame-geometry overflow)");
+		return;
+	}
+
+	int nReal_data = ts.data_container.nBits - ts.ldpc.P;
+	int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8;   // usable payload bytes
+	printf("    PHY: M=%d nStreams=%d Nofdm=%d interp=%d preamble=%d | nBits=%d ldpc.P=%d nReal=%d "
+		"K_info=%d N=%d Nsymb=%d frame_size=%dB reserved=%d\n",
+		ts.mfsk.M, ts.mfsk.nStreams, ts.data_container.Nofdm, ts.frequency_interpolation_rate,
+		ts.data_container.preamble_nSymb, ts.data_container.nBits, ts.ldpc.P, nReal_data,
+		ts.robust_ra_K_info, ts.robust_ra_N, ts.data_container.Nsymb, frame_size,
+		ts.outer_code_reserved_bits);
+
+	if (frame_size <= 0) { test_fail(name, "computed frame_size <= 0"); return; }
+
+	// (2) random payload (kept in a separate buffer; transmit_byte may zero-pad
+	//     its input byte array in place).
+	std::mt19937 rng(0x5A11ECEDu);
+	std::vector<int> payload(frame_size);
+	for (int i = 0; i < frame_size; i++) payload[i] = (int)(rng() & 0xFF);
+
+	// (3) PRODUCTION TX: transmit_byte (CRC16 append) -> transmit_bit (RA encode).
+	for (int i = 0; i < frame_size; i++) ts.data_container.data_byte[i] = payload[i];
+	ts.transmit_byte(ts.data_container.data_byte, frame_size,
+		ts.data_container.passband_data, SINGLE_MESSAGE);
+
+	// (4) clean channel: copy-with-delay (awgn ampl=0). Same delay convention as
+	//     passband_test_EsN0 (telecom_system.cc:440). MFSK uses mfsk_fixed_delay so
+	//     RX skips the time-sync search and reads at the known frame offset.
+	int interp = ts.frequency_interpolation_rate;
+	int frame_samples = (ts.data_container.Nofdm *
+		(ts.data_container.Nsymb + ts.data_container.preamble_nSymb)) * interp;
+	int delay = ((ts.data_container.preamble_nSymb + 2) * ts.data_container.Nofdm + 50) * interp;
+	ts.awgn_channel.apply_with_delay(ts.data_container.passband_data,
+		ts.data_container.passband_delayed_data, 0.0f, frame_samples, delay);
+	ts.mfsk_fixed_delay = delay;
+
+	// (5) PRODUCTION RX: receive_byte (RA decode -> hd_decoded_data_byte -> CRC).
+	st_receive_stats st = ts.receive_byte(ts.data_container.passband_delayed_data,
+		ts.data_container.hd_decoded_data_byte);
+	ts.mfsk_fixed_delay = -1;
+
+	// (6) the gate assertions.
+	char buf[200];
+	if (st.message_decoded != YES) {
+		snprintf(buf, sizeof(buf), "message_decoded=NO (crc=0x%04X iters=%d all_zeros=%d) — RA byte round-trip failed",
+			st.crc, st.iterations_done, st.all_zeros);
+		test_fail(name, buf);
+		return;
+	}
+	if (st.crc != 0) {
+		snprintf(buf, sizeof(buf), "CRC self-check non-zero (0x%04X) on clean channel", st.crc);
+		test_fail(name, buf);
+		return;
+	}
+	int mism = -1;
+	for (int i = 0; i < frame_size; i++) {
+		if ((ts.data_container.hd_decoded_data_byte[i] & 0xFF) != (payload[i] & 0xFF)) { mism = i; break; }
+	}
+	if (mism >= 0) {
+		snprintf(buf, sizeof(buf), "decoded byte[%d]=0x%02X != tx 0x%02X (RA codec TX/RX mismatch)",
+			mism, ts.data_container.hd_decoded_data_byte[mism] & 0xFF, payload[mism] & 0xFF);
+		test_fail(name, buf);
+		return;
+	}
+	printf("    [ASSERT OK] cfg103 round-tripped %d real RA-coded bytes TX->RX->CRC clean "
+		"(message_decoded=YES, crc=0, BP iters=%d).\n", frame_size, st.iterations_done);
+	test_pass(name);
+}
+
+// =============================================================================
+// §23 WIN CAMPAIGN Front-A increment 1 — ROBUST_RA (cfg103) LONGER-FRAME
+// delivered-throughput gate. p2-robust-ra-wiring.md §10.
+// =============================================================================
+//
+// The increment raises the cfg103 GF(16)-RA frame from K_info=25/N=100 (rate
+// 1/16, frame_size=10B — only 100 of the Nsymb=200 periods emitted) to
+// K_info=50/N=200 (rate 2/16, frame_size=23B — the frame FILLED). The win is
+// delivered USER-bps: a bigger frame amortizes the fixed per-frame DATA header
+// (DATA_SHORT_HEADER_LENGTH_V2=6B) AND the ~4.9s ACK turnaround over ~2.3x more
+// coded payload. The RA codec stays repfact=3 (R1/4 coding gain unchanged).
+//
+// This is a SIM/in-process test (no bench, no HW). It measures the delivered
+// USER-throughput of the COMPILED cfg103 frame against the documented small-
+// frame REFERENCE (frame_size=10B, N=100 — the measured rate-1/16 baseline,
+// p2 §9.1), and asserts the longer frame delivers >= 1.8x.
+//
+//   delivered_user_bps = (frame_size - HDR) * 8 / (T_air + T_fixed)
+//   T_air ∝ (N + preamble) data periods   (the on-air symbol-period count)
+//
+// FAIL-BEFORE: compiled at rate 1/16 the live geometry EQUALS the reference
+// (10B/100) -> ratio 1.0 < 1.8 -> FAIL. PASS-AFTER: rate 2/16 -> 23B/200 ->
+// ratio ~2.3x (at T_fixed=0, the pessimistic header-amortization-only bound) ->
+// PASS. The test also DECODES the compiled frame clean + at a lossy AWGN cell
+// (FER) so the delivered-bps reflects a frame that actually round-trips, not a
+// fictional one. Asserts on the T_fixed=0 ratio so the gate is independent of
+// the external turnaround constant (the realistic T_fixed only raises it).
+
+// Round-trip the COMPILED cfg103 frame `reps` times through an AWGN passband at
+// noise amplitude `noise_ampl` (0 = clean), using mfsk_fixed_delay so RX reads
+// at the known offset (the same scaffolding as test_robust_ra_production_round
+// trip steps 3-5). Returns the number of frames that decoded byte-exact.
+static int ra_roundtrip_decoded_count(cl_telecom_system& ts, int frame_size,
+                                      float noise_ampl, int reps, uint32_t seed0) {
+	int interp = ts.frequency_interpolation_rate;
+	int frame_samples = (ts.data_container.Nofdm *
+		(ts.data_container.Nsymb + ts.data_container.preamble_nSymb)) * interp;
+	int delay = ((ts.data_container.preamble_nSymb + 2) * ts.data_container.Nofdm + 50) * interp;
+	int ok = 0;
+	std::mt19937 rng(seed0);
+	std::vector<int> payload(frame_size);
+	for (int r = 0; r < reps; r++) {
+		for (int i = 0; i < frame_size; i++) payload[i] = (int)(rng() & 0xFF);
+		for (int i = 0; i < frame_size; i++) ts.data_container.data_byte[i] = payload[i];
+		ts.transmit_byte(ts.data_container.data_byte, frame_size,
+			ts.data_container.passband_data, SINGLE_MESSAGE);
+		ts.awgn_channel.apply_with_delay(ts.data_container.passband_data,
+			ts.data_container.passband_delayed_data, noise_ampl, frame_samples, delay);
+		ts.mfsk_fixed_delay = delay;
+		st_receive_stats st = ts.receive_byte(ts.data_container.passband_delayed_data,
+			ts.data_container.hd_decoded_data_byte);
+		ts.mfsk_fixed_delay = -1;
+		if (st.message_decoded == YES && st.crc == 0) {
+			bool match = true;
+			for (int i = 0; i < frame_size; i++)
+				if ((ts.data_container.hd_decoded_data_byte[i] & 0xFF) != (payload[i] & 0xFF)) { match = false; break; }
+			if (match) ok++;
+		}
+	}
+	return ok;
+}
+
+static void test_robust_ra_longer_frame_throughput() {
+	const char* name = "robust_ra_longer_frame_throughput";
+	printf("  [GATE] ROBUST_RA (cfg103) LONGER-FRAME delivered-throughput (>=1.8x vs small-frame ref):\n");
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_RA);
+
+	if (ts.M != MOD_MFSK || ts.mfsk.M != 16 || ts.mfsk.nStreams != 2) {
+		test_fail(name, "ROBUST_RA did not bring up M16x2 MFSK");
+		return;
+	}
+	if (ts.robust_ra_N <= 0 || ts.robust_ra_K_info <= 0) {
+		test_fail(name, "robust_ra_N / robust_ra_K_info not set");
+		return;
+	}
+
+	// Live (compiled) geometry.
+	const int HDR = 6;  // DATA_SHORT_HEADER_LENGTH_V2 (datalink_defines.h:183) — the
+	                    // fixed per-frame ARQ header the buffer reserves (arq_common.cc:1337-1356)
+	int nReal_data = ts.data_container.nBits - ts.ldpc.P;
+	int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8;   // PHY frame bytes
+	int N_live     = ts.robust_ra_N;                                   // active data periods
+	int preamble   = ts.data_container.preamble_nSymb;
+
+	// Documented small-frame reference (rate 1/16, p2-robust-ra-wiring.md §9.1):
+	// frame_size=10B, K_info=25, N=100. delivered USER-bps is computed identically
+	// for ref and live; the only difference is (frame_size, N).
+	const int REF_FRAME_SIZE = 10;
+	const int REF_N          = 100;
+
+	if (frame_size <= HDR) { test_fail(name, "frame_size <= header (no user payload)"); return; }
+
+	// delivered USER-bps at T_fixed = X ms. T_air(periods) ∝ (N + preamble) symbol
+	// periods; the absolute ms scale cancels in the ratio, so use period-units for
+	// T_air. We report the ratio at X=0 (pessimistic; header+fill amortization only)
+	// and at X=T_FIXED_MS (the Front-A measured ACK turnaround ~4945 ms) for context,
+	// and gate on the X=0 ratio (independent of the external constant).
+	const double T_FIXED_MS = 4945.0;  // Front-A ac0546c5: per-frame ACK turnaround
+	// Convert period-units to ms so T_fixed is commensurable.
+	double sym_ms = 1000.0 * ts.data_container.Nofdm /
+		((ts.bandwidth / ts.ofdm.Nc) * ts.ofdm.Nfft);
+	auto user_bps = [&](int fsz, int n, double x_ms) {
+		double t_air_ms = (n + preamble) * sym_ms;
+		return (double)(fsz - HDR) * 8.0 / (t_air_ms + x_ms);
+	};
+	double ref_bps_0  = user_bps(REF_FRAME_SIZE, REF_N, 0.0);
+	double live_bps_0 = user_bps(frame_size,     N_live, 0.0);
+	double ref_bps_X  = user_bps(REF_FRAME_SIZE, REF_N, T_FIXED_MS);
+	double live_bps_X = user_bps(frame_size,     N_live, T_FIXED_MS);
+	double ratio_0 = live_bps_0 / ref_bps_0;
+	double ratio_X = live_bps_X / ref_bps_X;
+
+	printf("    geometry: REF frame=%dB N=%d  |  LIVE frame=%dB N=%d preamble=%d sym=%.2fms\n",
+		REF_FRAME_SIZE, REF_N, frame_size, N_live, preamble, sym_ms);
+	printf("    delivered USER-bps: T_fixed=0  ref=%.3f live=%.3f ratio=%.2fx  |  "
+		"T_fixed=%.0fms ref=%.3f live=%.3f ratio=%.2fx\n",
+		ref_bps_0, live_bps_0, ratio_0, T_FIXED_MS, ref_bps_X, live_bps_X, ratio_X);
+
+	// Prove the compiled frame actually DELIVERS (clean + a lossy AWGN cell), so the
+	// throughput above is real. Clean: 4/4 byte-exact. Lossy: pick a passband sigma
+	// the M16x2-diversity RA frame decodes reliably at this in-process path. Measure
+	// the in-band SNR3k so the cell is documented.
+	int clean_ok = ra_roundtrip_decoded_count(ts, frame_size, /*noise_ampl=*/0.0f, 4, 0xC0FFEE01u);
+
+	// Lossy cell: TARGET a genuine low SNR3k well within the R1/4 waterfall (cliff
+	// ~ -14 dB, tier2-suffix-fec-gf16-spike.md §8.4) -> FER ~ 0 for BOTH frame sizes,
+	// so the delivered-bps comparison is a clean efficiency win, not differential-FER.
+	// Measure the ACTIVE in-band power (preamble + active data periods only, NOT the
+	// whole Nsymb buffer whose silent tail would dilute p_sig and inflate the SNR),
+	// then solve for the passband sigma that yields LOSSY_SNR3K_TARGET dB:
+	//   SNR3k = 10log10(p_sig / (sigma^2 * 3000/(fs/2)))  (snr3k_db) ->
+	//   sigma = sqrt( p_sig * (fs/2) / (3000 * 10^(SNR3k/10)) );  ampl = sigma*sqrt(2).
+	const double LOSSY_SNR3K_TARGET = -5.0;  // genuinely lossy, ~9 dB above the R1/4 cliff
+	int interp = ts.frequency_interpolation_rate;
+	int frame_samples = (ts.data_container.Nofdm *
+		(ts.data_container.Nsymb + ts.data_container.preamble_nSymb)) * interp;
+	int active_samples = (ts.data_container.Nofdm *
+		(N_live + ts.data_container.preamble_nSymb)) * interp;   // on-air span only
+	int delay = ((ts.data_container.preamble_nSymb + 2) * ts.data_container.Nofdm + 50) * interp;
+	for (int i = 0; i < frame_size; i++) ts.data_container.data_byte[i] = (int)(0xA5 + i);
+	ts.transmit_byte(ts.data_container.data_byte, frame_size,
+		ts.data_container.passband_data, SINGLE_MESSAGE);
+	double p_sig = 0.0;
+	for (int i = 0; i < active_samples; i++) {
+		double v = ts.data_container.passband_data[i]; p_sig += v * v;
+	}
+	p_sig /= active_samples;
+	double fs = ts.sampling_frequency;
+	double lossy_sigma = std::sqrt(p_sig * (fs / 2.0) /
+		(3000.0 * std::pow(10.0, LOSSY_SNR3K_TARGET / 10.0)));
+	float lossy_ampl = (float)(lossy_sigma * std::sqrt(2.0));
+	double lossy_snr3k = snr3k_db(p_sig, lossy_sigma, fs);   // == LOSSY_SNR3K_TARGET (report)
+	int lossy_reps = 8;
+	int lossy_ok = ra_roundtrip_decoded_count(ts, frame_size, lossy_ampl, lossy_reps, 0xBADC0DE2u);
+	printf("    delivery: clean %d/4 byte-exact | lossy(SNR3k=%.1f dB) %d/%d byte-exact\n",
+		clean_ok, lossy_snr3k, lossy_ok, lossy_reps);
+
+	char buf[256];
+	// (a) the compiled frame must actually round-trip clean (delivery is real).
+	if (clean_ok < 4) {
+		snprintf(buf, sizeof(buf), "clean round-trip %d/4 (frame does not deliver — throughput fictional)", clean_ok);
+		test_fail(name, buf);
+		return;
+	}
+	// (b) and at the lossy cell (well within the R1/4 waterfall) — allow 1 miss.
+	if (lossy_ok < lossy_reps - 1) {
+		snprintf(buf, sizeof(buf), "lossy round-trip %d/%d at SNR3k=%.1f dB (below RA waterfall?)",
+			lossy_ok, lossy_reps, lossy_snr3k);
+		test_fail(name, buf);
+		return;
+	}
+	// (c) the delivered USER-bps gate: longer frame >= 1.8x small-frame ref, at the
+	//     PESSIMISTIC T_fixed=0 (header+frame-fill amortization only). FAIL-BEFORE:
+	//     at rate 1/16 the live geometry == the ref -> ratio 1.0.
+	if (ratio_0 < 1.8) {
+		snprintf(buf, sizeof(buf),
+			"delivered user-bps ratio %.2fx < 1.8x (frame=%dB N=%d vs ref 10B/100 — frame not enlarged?)",
+			ratio_0, frame_size, N_live);
+		test_fail(name, buf);
+		return;
+	}
+	printf("    [ASSERT OK] cfg103 longer frame delivers %.2fx user-bps (T_fixed=0) / %.2fx "
+		"(T_fixed=%.0fms) vs small-frame ref; clean %d/4 + lossy %d/%d byte-exact.\n",
+		ratio_0, ratio_X, T_FIXED_MS, clean_ok, lossy_ok, lossy_reps);
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5559,6 +5863,17 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ack_suffix_throughput_neutral();
 	test_connect_suffix_byte_identical_when_off();
 	test_production_enhanced_connect_decodes();
+
+	// §22 WIN CAMPAIGN (b) INCREMENT 1: ROBUST_RA (cfg103) production PHY byte
+	// round-trip (TX RA-encode -> clean loopback -> RX RA-decode -> CRC). The
+	// §5 cross-layer gate for this increment (p2-robust-ra-wiring.md §7).
+	test_robust_ra_production_roundtrip();
+
+	// §23 WIN CAMPAIGN Front-A increment 1: ROBUST_RA (cfg103) LONGER-FRAME
+	// delivered-throughput gate (>=1.8x user-bps vs the small-frame reference).
+	// Fail-before at rate 1/16 (frame == ref), pass-after at rate 2/16 (frame
+	// filled). p2-robust-ra-wiring.md §10.
+	test_robust_ra_longer_frame_throughput();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

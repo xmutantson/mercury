@@ -296,6 +296,7 @@ int main(int argc, char *argv[])
     int max_config_cli = -1;          // --max-config: hard ceiling on turboshift
     int ptt_delay_cli = -1;           // --ptt-delay: override both PTT on/off delays (ms)
     int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
+    int robust_batch_cli = -1;        // --robust-batch: PINNED robust-tier dwell batch (>=1; default 1). WIN-CAMPAIGN incr2.
     int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
     int skip_var_gate_cli = -1;       // --skip-var-gate=on|off: -1=default(on), 0=off, 1=on
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
@@ -354,6 +355,7 @@ int main(int argc, char *argv[])
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
+    bool test_robust_batch_cli = false; // --test-robust-batch: WIN-CAMPAIGN incr2 robust-tier batch>=2 + SACK regression (data-flow-robust-tier-arq-batch.md §6).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
                                         // up-promotion gate; a CLEAN all-ones batch does all of those; and that BREAK can
@@ -475,6 +477,7 @@ int main(int argc, char *argv[])
         printf("  -Q [n]            NB probe max (0=disable, default 2)\n");
         printf("  --gi [ms]         Guard interval in ms (1.0-8.0, default 3.0)\n");
         printf("  --radio-batch [n] Total frames per radio TX for SACK (default: 25)\n");
+        printf("  --robust-batch [n] PINNED robust-tier dwell batch, 1..30 (default: 1; gearshift-off only)\n");
         printf("  --retransmit-headroom [n]  Max retransmit frames per batch (default: 5)\n");
         printf("  --disable-sack-v2 Opt out of CAP_SACK_V2 (legacy v1 ACK behavior)\n");
 
@@ -835,6 +838,15 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-robust-batch") == 0)
+        {
+            // WIN-CAMPAIGN incr2 — robust-tier batch>=2 + SACK selective-retransmit
+            // regression — one-shot at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-robust-tier-arq-batch.md §6.
+            test_robust_batch_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strcmp(argv[i], "--test-robust0-compress-deadlock") == 0)
         {
             // ROBUST_0 + streaming-compression deadlock regression — one-shot at
@@ -1057,6 +1069,22 @@ int main(int argc, char *argv[])
             if (radio_batch_cli < 5) radio_batch_cli = 5;
             if (radio_batch_cli > MAX_SACK_BATCH_SIZE) radio_batch_cli = MAX_SACK_BATCH_SIZE;
             printf("Radio batch size override: %d frames\n", radio_batch_cli);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        }
+        // WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §5): PINNED
+        // robust-tier dwell batch. Default 1 = byte-identical historical tier.
+        // Applies ONLY when gearshift is OFF (a pinned robust config, e.g. the
+        // -10 rate-win at -s 102); the climb always uses batch=1. Bitmap width
+        // caps it at 30 (the MFSK SACK suffix carries 30 bits).
+        else if (strcmp(argv[i], "--robust-batch") == 0 && i + 1 < argc)
+        {
+            robust_batch_cli = atoi(argv[i + 1]);
+            if (robust_batch_cli < 1) robust_batch_cli = 1;
+            if (robust_batch_cli > 30) robust_batch_cli = 30;
+            printf("Robust-tier dwell batch override: %d frames (pinned robust only)\n", robust_batch_cli);
             for (int j = i; j < argc - 2; j++)
                 argv[j] = argv[j + 2];
             argc -= 2;
@@ -1898,6 +1926,21 @@ start_modem:
             fflush(stdout);
             exit(rc);
         }
+        if (test_robust_batch_cli) {
+            // WIN-CAMPAIGN incr2 — robust-tier batch>=2 + SACK selective-retransmit
+            // regression (one-shot, then exit rc). Drives the REAL chokepoint +
+            // recompute helper through the climb-vs-pinned discriminator (Part A)
+            // and a deterministic wire-slot throughput model proving selective
+            // retransmit beats stop-and-wait under loss (Part B). See
+            // fact-documents/data-flow-robust-tier-arq-batch.md §6.
+            printf("[FLAG] --test-robust-batch: invoking robust-tier batch>=2 + "
+                   "SACK regression (Parts A-B)\n");
+            fflush(stdout);
+            int rc = ARQ.test_robust_batch_chokepoint();
+            printf("[FLAG] Robust-batch test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
         if (test_robust0_compress_deadlock_cli) {
             // ROBUST_0 + streaming-compression deadlock regression (one-shot,
             // then exit rc). Drives the REAL process_buffer_data_commander()
@@ -2193,6 +2236,17 @@ start_modem:
             if (ARQ.crypto_batch_size < 1) ARQ.crypto_batch_size = 1;
             printf("SACK CLI: radio_batch=%d crypto_batch=%d headroom=%d\n",
                 ARQ.radio_batch_size, ARQ.crypto_batch_size, ARQ.retransmit_headroom);
+        }
+
+        // WIN-CAMPAIGN incr2 (data-flow-robust-tier-arq-batch.md §5): set the
+        // robust dwell batch BEFORE ARQ.init() (which runs load_configuration and
+        // the chokepoint). Default robust_dwell_batch=1 is already set by the
+        // ctor; only override when the CLI flag was given.
+        if (robust_batch_cli >= 1)
+        {
+            ARQ.robust_dwell_batch = robust_batch_cli;
+            printf("ROBUST-BATCH CLI: robust_dwell_batch=%d (pinned robust tier)\n",
+                ARQ.robust_dwell_batch);
         }
 
         // Apply LDPC iterations: CLI overrides INI, INI overrides default

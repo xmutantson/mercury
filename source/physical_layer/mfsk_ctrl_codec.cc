@@ -700,4 +700,233 @@ bool soft_decode(const double* energies, int maxiter, double esno_metric,
 	return true;
 }
 
+// =============================================================================
+// K-GENERALIZED data-frame variant (WIN CAMPAIGN b — ROBUST_RA data FEC)
+// (fact-documents/robust3-gf16ra-data-code-feasibility.md,
+//  fact-documents/data-flow-robust-ra-e2e.md §7,
+//  fact-documents/p2-robust-ra-wiring.md §5)
+//
+// Same true-degree-3 GF(16)-RA construction as the K=13 ctrl codec above, but
+// with a runtime K_info and heap storage so it scales to the ROBUST_RA data
+// payload. Reuses the field tables / gf_mul / fwht16 / pd_* / log_i0_approx
+// defined above. Independent graph storage (g_k_*) so the K=13 ctrl path is
+// untouched.
+// =============================================================================
+
+static int g_k_K = 0;        // info symbols
+static int g_k_repfact = 2;
+static int g_k_NC = 0;       // parity symbols = repfact*K
+static int g_k_N = 0;        // codeword length = K + NC
+static std::vector<int> g_k_acc_idx;    // [NC] info edge per stage
+static std::vector<int> g_k_acc_wlog;   // [NC] GF weight-log per stage
+// Per-factor edge lists (degree 3): {var, wlog}. g_k_factor_edges[j] for j in [0,NC).
+static std::vector<std::vector<FactorEdge> > g_k_factor_edges;
+static bool g_k_inited = false;
+
+int configure_k(int K_info, int repfact)
+{
+	if (K_info < 1) K_info = 1;
+	if (repfact < 1) repfact = 1;
+	g_k_K = K_info;
+	g_k_repfact = repfact;
+	g_k_NC = repfact * K_info;
+	g_k_N = K_info + g_k_NC;
+	g_k_inited = false;   // force rebuild
+	return g_k_N;
+}
+
+int codeword_len_k() { return g_k_N; }
+int parity_len_k()   { return g_k_NC; }
+
+static bool init_k()
+{
+	build_field();
+	if (g_k_inited) return true;
+	const int K = g_k_K, NC = g_k_NC;
+	if (K < 1 || NC < 1) return false;
+
+	g_k_acc_idx.assign(NC, -1);
+	g_k_acc_wlog.assign(NC, 0);
+
+	// Same spread-interleaver + accumulator-weight construction as init():
+	// lay K*repfact replicas across NC stages via a coprime stride walk so each
+	// info symbol appears exactly repfact times, one info edge per stage
+	// (degree-3 check). Per-info weights forced to XOR-sum to 0 (accumulator
+	// termination / EXIT-convergence aid).
+	int stride = 1;
+	for (int s = K; s >= 2; s--) {
+		int a = s, b = NC; while (b) { int t = a % b; a = b; b = t; }
+		if (a == 1) { stride = s; break; }
+	}
+	int order_pos = 0;
+	std::vector<int> tmp_idx(NC, -1);
+	std::vector<int> tmp_info_wlog(NC, 0);
+	std::vector<int> info_wvals(K, 0);
+	for (int i = 0; i < K; i++) {
+		for (int r = 0; r < g_k_repfact; r++) {
+			int stage = (order_pos * stride) % NC;
+			int guard = 0;
+			while (tmp_idx[stage] != -1 && guard < NC) { order_pos++; stage = (order_pos * stride) % NC; guard++; }
+			order_pos++;
+			tmp_idx[stage] = i;
+			int wval;
+			if (r < g_k_repfact - 1) {
+				int wlog = 1 + ((i * g_k_repfact + r) % 14);   // 1..14, nonzero
+				wval = g_gfexp[wlog];
+				info_wvals[i] ^= wval;
+			} else {
+				wval = info_wvals[i];
+				if (wval == 0) wval = 1;
+			}
+			tmp_info_wlog[stage] = g_gflog[wval];
+		}
+	}
+	for (int j = 0; j < NC; j++) {
+		if (tmp_idx[j] == -1) { tmp_idx[j] = 0; tmp_info_wlog[j] = 0; }
+		g_k_acc_idx[j]  = tmp_idx[j];
+		g_k_acc_wlog[j] = tmp_info_wlog[j];
+	}
+
+	// Compile BP code-factor edge lists (degree 3): this parity, prev parity, one info.
+	g_k_factor_edges.assign(NC, std::vector<FactorEdge>());
+	for (int j = 0; j < NC; j++) {
+		FactorEdge pe;  pe.var  = K + j;     pe.wlog  = 0; g_k_factor_edges[j].push_back(pe);
+		if (j > 0) { FactorEdge ppe; ppe.var = K + j - 1; ppe.wlog = 0; g_k_factor_edges[j].push_back(ppe); }
+		FactorEdge ie;  ie.var  = g_k_acc_idx[j]; ie.wlog = g_k_acc_wlog[j]; g_k_factor_edges[j].push_back(ie);
+	}
+
+	g_k_inited = true;
+	return true;
+}
+
+void encode_k(const int* info, int* out_tones)
+{
+	init_k();
+	const int K = g_k_K, NC = g_k_NC;
+	for (int s = 0; s < K; s++) out_tones[s] = info[s] & 0xF;
+	int prev = 0;
+	for (int j = 0; j < NC; j++) {
+		int w = g_gfexp[g_k_acc_wlog[j]];
+		int acc = prev ^ gf_mul(w, info[g_k_acc_idx[j]] & 0xF);
+		out_tones[K + j] = acc & 0xF;
+		prev = acc;
+	}
+}
+
+int soft_decode_k(const double* energies, int maxiter, double esno_metric, int* out_info)
+{
+	init_k();
+	const int N = g_k_N, M = GF16RA_M, K = g_k_K, nfac = g_k_NC;
+	if (N < 1) return -1;
+
+	// ---- intrinsic (channel) probabilities pix[s][16] (Bessel metric) ----
+	std::vector<double> pix((size_t)N * M);
+	{
+		double rsum = 0.0;
+		for (int i = 0; i < N * M; i++) rsum += energies[i];
+		rsum /= (double)(N * M);
+		double sigmaest = std::sqrt(rsum / (1.0 + esno_metric / M) / 2.0);
+		if (!(sigmaest > 0.0)) sigmaest = 1e-6;
+		double cmetric = std::sqrt(2.0 * esno_metric) / sigmaest;
+		for (int s = 0; s < N; s++) {
+			double* p = &pix[(size_t)s * M];
+			for (int t = 0; t < M; t++)
+				p[t] = std::exp(log_i0_approx(std::sqrt(energies[(size_t)s * M + t]) * cmetric));
+			pd_normalize(p);
+		}
+	}
+
+	// ---- BP message arrays (per factor-edge) ----
+	std::vector<int> fac_off(nfac + 1, 0);
+	for (int j = 0; j < nfac; j++) fac_off[j + 1] = fac_off[j] + (int)g_k_factor_edges[j].size();
+	int total_edges = fac_off[nfac];
+	std::vector<double> v2c((size_t)total_edges * M);
+	std::vector<double> c2v((size_t)total_edges * M);
+
+	for (int j = 0; j < nfac; j++)
+		for (size_t k = 0; k < g_k_factor_edges[j].size(); k++) {
+			int e = fac_off[j] + (int)k, v = g_k_factor_edges[j][k].var;
+			for (int t = 0; t < M; t++) v2c[(size_t)e * M + t] = pix[(size_t)v * M + t];
+		}
+
+	double tmp[16], prod[16], permd[16];
+	int rc = -1;
+	std::vector<double> vprod((size_t)N * M);
+
+	for (int nit = 0; nit < maxiter; nit++) {
+		// ---- check -> variable ----
+		for (int j = 0; j < nfac; j++) {
+			int deg = (int)g_k_factor_edges[j].size();
+			double wht[3 * 16];   // deg <= 3
+			for (int k = 0; k < deg; k++) {
+				int e = fac_off[j] + k;
+				pd_mul_perm(tmp, &v2c[(size_t)e * M], g_k_factor_edges[j][k].wlog);
+				for (int t = 0; t < M; t++) wht[k * M + t] = tmp[t];
+				fwht16(&wht[k * M]);
+			}
+			for (int k = 0; k < deg; k++) {
+				for (int t = 0; t < M; t++) prod[t] = 1.0;
+				for (int kk = 0; kk < deg; kk++) if (kk != k)
+					for (int t = 0; t < M; t++) prod[t] *= wht[kk * M + t];
+				prod[0] += 1e-12;
+				fwht16(prod);
+				int e = fac_off[j] + k;
+				pd_div_perm(permd, prod, g_k_factor_edges[j][k].wlog);
+				pd_normalize(permd);
+				for (int t = 0; t < M; t++) c2v[(size_t)e * M + t] = permd[t];
+			}
+		}
+
+		// ---- variable -> check (and per-variable product) ----
+		for (int v = 0; v < N; v++)
+			for (int t = 0; t < M; t++) vprod[(size_t)v * M + t] = pix[(size_t)v * M + t];
+		for (int j = 0; j < nfac; j++)
+			for (size_t k = 0; k < g_k_factor_edges[j].size(); k++) {
+				int e = fac_off[j] + (int)k, v = g_k_factor_edges[j][k].var;
+				const double* m = &c2v[(size_t)e * M];
+				double* vp = &vprod[(size_t)v * M];
+				for (int t = 0; t < M; t++) vp[t] *= m[t];
+			}
+		for (int j = 0; j < nfac; j++)
+			for (size_t k = 0; k < g_k_factor_edges[j].size(); k++) {
+				int e = fac_off[j] + (int)k, v = g_k_factor_edges[j][k].var;
+				const double* vp = &vprod[(size_t)v * M];
+				const double* m  = &c2v[(size_t)e * M];
+				double* out = &v2c[(size_t)e * M];
+				for (int t = 0; t < M; t++) { double d = m[t]; out[t] = (d > 1e-300) ? vp[t] / d : vp[t]; }
+				pd_normalize(out);
+			}
+
+		// ---- EXIT-chart convergence: sum of per-symbol max-marginal ----
+		double totmax = 0.0;
+		for (int v = 0; v < N; v++) {
+			const double* vp = &vprod[(size_t)v * M];
+			double mx = 0.0, s = 0.0;
+			for (int t = 0; t < M; t++) { if (vp[t] > mx) mx = vp[t]; s += vp[t]; }
+			if (s > 0.0) mx /= s;
+			totmax += mx;
+		}
+		if (totmax > (double)N - 0.02) { rc = nit; break; }
+	}
+
+	// ---- MAP decode: APP = intrinsic * product(c->v), argmax on info symbols ----
+	std::vector<double> app((size_t)N * M);
+	for (int v = 0; v < N; v++)
+		for (int t = 0; t < M; t++) app[(size_t)v * M + t] = pix[(size_t)v * M + t];
+	for (int j = 0; j < nfac; j++)
+		for (size_t k = 0; k < g_k_factor_edges[j].size(); k++) {
+			int e = fac_off[j] + (int)k, v = g_k_factor_edges[j][k].var;
+			const double* m = &c2v[(size_t)e * M];
+			double* ap = &app[(size_t)v * M];
+			for (int t = 0; t < M; t++) ap[t] *= m[t];
+		}
+	for (int s = 0; s < K; s++) {
+		const double* ap = &app[(size_t)s * M];
+		int best = 0; double bv = -1.0;
+		for (int t = 0; t < M; t++) if (ap[t] > bv) { bv = ap[t]; best = t; }
+		out_info[s] = best;
+	}
+	return rc;
+}
+
 } // namespace gf16ra
