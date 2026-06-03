@@ -273,6 +273,48 @@ bool soft_decode(const double* energies, int maxiter, double esno_metric,
                  ctrl_crc12_fn crc12_fn, void* crc12_ctx,
                  uint64_t* out_payload38, int* out_iters);
 
+// =============================================================================
+// K-GENERALIZED data-frame variant (WIN CAMPAIGN b — ROBUST_RA data FEC)
+// =============================================================================
+//
+// fact-documents/robust3-gf16ra-data-code-feasibility.md +
+// fact-documents/data-flow-robust-ra-e2e.md §7 +
+// fact-documents/p2-robust-ra-wiring.md §5. The K=13 functions above are
+// hard-wired to the 40-bit message + 12-bit CRC ctrl suffix and stay
+// byte-identical (the production CONNECT path uses them unchanged). The
+// functions below generalize the SAME true-degree-3 GF(16)-RA construction
+// (machine-generated accumulator interleaver + weights, Bessel-I0 intrinsic,
+// WHT Q-ary BP) to an ARBITRARY number of info symbols. They are the
+// PRODUCTION ROBUST_RA data codec (consumed by cl_telecom_system::transmit_bit
+// TX encode and cl_telecom_system::decode_robust_ra_data RX decode for cfg103
+// only). Independent graph storage (g_k_*) so the K=13 ctrl path is untouched.
+// Operate on raw GF(16) symbol vectors (no [type|payload|crc] packing, no CRC
+// accept-gate — the ARQ frame CRC16 is the integrity check; see fact-doc §5.3).
+// Heap-allocate per-call so K/N are unbounded by GF16RA_MAX_N.
+
+// Configure the K-generalized RA graph for K_info info symbols at the given
+// repeat factor (NC = repfact*K_info parity, N = K_info + NC, rate
+// R = K_info/N). Independent of the K=13 ctrl-path configure() above (different
+// graph storage). Must be called before encode_k/soft_decode_k. Returns N.
+int  configure_k(int K_info, int repfact);
+int  codeword_len_k();   // current N for the K-generalized graph
+int  parity_len_k();     // current NC
+
+// Encode K_info GF(16) info symbols (each 0..15) -> N codeword tones (0..15).
+// info[0..K_info-1] are systematic (appear verbatim as the first K_info tones);
+// the remaining NC are the RA accumulator parity. out_tones must hold N.
+void encode_k(const int* info, int* out_tones);
+
+// Soft decode from the per-tone ENERGY matrix (N*M row-major, M=16). Runs
+// Bessel-I0 intrinsic + WHT Q-ary BP for up to maxiter iterations, then MAP
+// argmax on the K_info info symbols into out_info[0..K_info-1]. Returns the BP
+// iteration count (>=0 if it converged via the EXIT-chart test, -1 if it ran to
+// the cap). There is NO CRC gate — caller compares out_info to the transmitted
+// info to score symbol/frame errors (research harness) or, in production,
+// repacks to bits and lets the ARQ CRC verify.
+int  soft_decode_k(const double* energies, int maxiter, double esno_metric,
+                   int* out_info);
+
 } // namespace gf16ra
 
 #endif // INC_MFSK_CTRL_CODEC_H_

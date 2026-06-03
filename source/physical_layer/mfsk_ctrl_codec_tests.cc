@@ -5439,6 +5439,120 @@ static void test_production_enhanced_connect_decodes() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §22 (WIN CAMPAIGN b — INCREMENT 1) — THE GATE FOR THIS INCREMENT: the
+// ROBUST_RA (cfg103) PRODUCTION PHY path round-trips real GF(16)-RA-coded BYTES
+// TX -> RX -> CRC on a clean channel. Drives the ACTUAL production functions:
+//   TX:  cl_telecom_system::transmit_byte (CRC16 append) -> transmit_bit
+//        (cfg103 branch: gf16ra::encode_k -> direct M16x2 diversity tone
+//        placement, bypassing LDPC + bit-interleaver) -> passband synthesis.
+//   CH:  clean copy-with-delay (awgn ampl=0), frame placed at the fixed delay.
+//   RX:  cl_telecom_system::receive_byte (cfg103 branch: symbol_demod ->
+//        decode_robust_ra_data -> hd_decoded_data_byte) -> the SHARED CRC16
+//        self-check + message_decoded contract.
+// ASSERTS (the gate): message_decoded==YES, crc==0, and the decoded bytes ==
+// the transmitted payload bytes (real RA codeword round-tripped through the
+// production path). FAIL-BEFORE: on the monitor base ROBUST_RA is not a usable
+// config (is_robust_config<=102, no load_configuration arm, no RA codec) so the
+// geometry assert fails (cfg103 does not bring up M16x2 / robust_ra_N stays 0);
+// and with only the define but the binary-LDPC path still in transmit_bit/
+// receive_byte there is no RA encode/decode to exercise. PASS-AFTER: the wired
+// TX RA-encode + RX RA-decode agree and the byte round-trip + CRC pass.
+//
+// This is the CLAUDE.md §5 cross-layer regression test for the ROBUST_RA
+// frame-fill / byte-contract shared state (p2-robust-ra-wiring.md §7): it drives
+// the full TX byte -> PHY -> RX byte -> CRC chain and asserts RX byte-state ==
+// TX byte-state. Clean channel only (sync/cliff is the e2e gate on the reference
+// branch + a later HW increment). In-process, no audio thread (mfsk_fixed_delay).
+// =============================================================================
+static void test_robust_ra_production_roundtrip() {
+	const char* name = "robust_ra_production_roundtrip";
+	printf("  [GATE] ROBUST_RA (cfg103) production PHY byte round-trip (TX RA-encode -> clean -> RX RA-decode -> CRC):\n");
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_RA);
+
+	// (1) geometry assertions (the fail-before trips here on the monitor base).
+	if (ts.M != MOD_MFSK || ts.mfsk.M != 16 || ts.mfsk.nStreams != 2) {
+		test_fail(name, "ROBUST_RA did not bring up M16x2 MFSK (cfg103 not wired?)");
+		return;
+	}
+	if (ts.robust_ra_N <= 0 || ts.robust_ra_K_info <= 0) {
+		test_fail(name, "robust_ra_N / robust_ra_K_info not set (load_configuration RA arm missing?)");
+		return;
+	}
+	if (ts.robust_ra_N > ts.data_container.Nsymb) {
+		test_fail(name, "robust_ra_N exceeds Nsymb (frame-geometry overflow)");
+		return;
+	}
+
+	int nReal_data = ts.data_container.nBits - ts.ldpc.P;
+	int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8;   // usable payload bytes
+	printf("    PHY: M=%d nStreams=%d Nofdm=%d interp=%d preamble=%d | nBits=%d ldpc.P=%d nReal=%d "
+		"K_info=%d N=%d Nsymb=%d frame_size=%dB reserved=%d\n",
+		ts.mfsk.M, ts.mfsk.nStreams, ts.data_container.Nofdm, ts.frequency_interpolation_rate,
+		ts.data_container.preamble_nSymb, ts.data_container.nBits, ts.ldpc.P, nReal_data,
+		ts.robust_ra_K_info, ts.robust_ra_N, ts.data_container.Nsymb, frame_size,
+		ts.outer_code_reserved_bits);
+
+	if (frame_size <= 0) { test_fail(name, "computed frame_size <= 0"); return; }
+
+	// (2) random payload (kept in a separate buffer; transmit_byte may zero-pad
+	//     its input byte array in place).
+	std::mt19937 rng(0x5A11ECEDu);
+	std::vector<int> payload(frame_size);
+	for (int i = 0; i < frame_size; i++) payload[i] = (int)(rng() & 0xFF);
+
+	// (3) PRODUCTION TX: transmit_byte (CRC16 append) -> transmit_bit (RA encode).
+	for (int i = 0; i < frame_size; i++) ts.data_container.data_byte[i] = payload[i];
+	ts.transmit_byte(ts.data_container.data_byte, frame_size,
+		ts.data_container.passband_data, SINGLE_MESSAGE);
+
+	// (4) clean channel: copy-with-delay (awgn ampl=0). Same delay convention as
+	//     passband_test_EsN0 (telecom_system.cc:440). MFSK uses mfsk_fixed_delay so
+	//     RX skips the time-sync search and reads at the known frame offset.
+	int interp = ts.frequency_interpolation_rate;
+	int frame_samples = (ts.data_container.Nofdm *
+		(ts.data_container.Nsymb + ts.data_container.preamble_nSymb)) * interp;
+	int delay = ((ts.data_container.preamble_nSymb + 2) * ts.data_container.Nofdm + 50) * interp;
+	ts.awgn_channel.apply_with_delay(ts.data_container.passband_data,
+		ts.data_container.passband_delayed_data, 0.0f, frame_samples, delay);
+	ts.mfsk_fixed_delay = delay;
+
+	// (5) PRODUCTION RX: receive_byte (RA decode -> hd_decoded_data_byte -> CRC).
+	st_receive_stats st = ts.receive_byte(ts.data_container.passband_delayed_data,
+		ts.data_container.hd_decoded_data_byte);
+	ts.mfsk_fixed_delay = -1;
+
+	// (6) the gate assertions.
+	char buf[200];
+	if (st.message_decoded != YES) {
+		snprintf(buf, sizeof(buf), "message_decoded=NO (crc=0x%04X iters=%d all_zeros=%d) — RA byte round-trip failed",
+			st.crc, st.iterations_done, st.all_zeros);
+		test_fail(name, buf);
+		return;
+	}
+	if (st.crc != 0) {
+		snprintf(buf, sizeof(buf), "CRC self-check non-zero (0x%04X) on clean channel", st.crc);
+		test_fail(name, buf);
+		return;
+	}
+	int mism = -1;
+	for (int i = 0; i < frame_size; i++) {
+		if ((ts.data_container.hd_decoded_data_byte[i] & 0xFF) != (payload[i] & 0xFF)) { mism = i; break; }
+	}
+	if (mism >= 0) {
+		snprintf(buf, sizeof(buf), "decoded byte[%d]=0x%02X != tx 0x%02X (RA codec TX/RX mismatch)",
+			mism, ts.data_container.hd_decoded_data_byte[mism] & 0xFF, payload[mism] & 0xFF);
+		test_fail(name, buf);
+		return;
+	}
+	printf("    [ASSERT OK] cfg103 round-tripped %d real RA-coded bytes TX->RX->CRC clean "
+		"(message_decoded=YES, crc=0, BP iters=%d).\n", frame_size, st.iterations_done);
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5559,6 +5673,11 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ack_suffix_throughput_neutral();
 	test_connect_suffix_byte_identical_when_off();
 	test_production_enhanced_connect_decodes();
+
+	// §22 WIN CAMPAIGN (b) INCREMENT 1: ROBUST_RA (cfg103) production PHY byte
+	// round-trip (TX RA-encode -> clean loopback -> RX RA-decode -> CRC). The
+	// §5 cross-layer gate for this increment (p2-robust-ra-wiring.md §7).
+	test_robust_ra_production_roundtrip();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

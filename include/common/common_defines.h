@@ -88,12 +88,30 @@ extern int g_verbose;
 #define CONFIG_16 16
 
 // ROBUST (MFSK) configurations - values 100+ to avoid collision with OFDM configs
+// NUMBER_OF_ROBUST_CONFIGS stays 3 = the count of LADDER robust configs
+// (ROBUST_0/1/2). ROBUST_RA is an OFF-LADDER additive data mode reached only by an
+// explicit pin (-s 103); it is intentionally NOT in FULL_CONFIG_LADDER so the
+// gearshift/Q-table are byte-identical (fact-documents/data-flow-robust-ra-e2e.md
+// §1/§3, p2-robust-ra-wiring.md §5). NUMBER_OF_ROBUST_CONFIGS is currently
+// unreferenced in source/, so the value is informational; leaving it 3 documents
+// "ladder robust count".
 #define NUMBER_OF_ROBUST_CONFIGS 3
 #define ROBUST_0 100  // 32-MFSK, LDPC rate 1/16, ~14 bps (hailing mode)
 #define ROBUST_1 101  // 16-MFSK x2, LDPC rate 1/16, ~22 bps
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
+// ROBUST_RA: WIN CAMPAIGN (b) "-10 data mode" — 16-MFSK x2 (FREQUENCY DIVERSITY, the
+// model the combiner+extractor implement) + GF(16)-RA R1/4 Q-ary data FEC (NOT binary
+// LDPC) on the data path. Off-ladder, pin-only (-s 103). PHY e2e (real sync) AWGN cliff
+// -12.28 dB SNR3k proven on the reference branch; this increment wires the production
+// TX encode + RX decode + frame geometry so a -s 103 session round-trips real RA bytes.
+// Additive: ROBUST_0/1/2 untouched. See data-flow-robust-ra-e2e.md + p2-robust-ra-wiring.md.
+#define ROBUST_RA 103 // 16-MFSK x2 diversity, GF(16)-RA R1/4 Q-ary data FEC, ~39 bps (-10 reach)
+// ROBUST_RA repeat factor for the GF(16)-RA data codec. 3 = R1/4 (N=K+3K=4K), the
+// sim/e2e-proven rate (data-flow-robust-ra-e2e.md §10). Rate-opt (R~1/3-1/2) is a
+// LATER increment; increment 1 wires R1/4 only.
+#define ROBUST_RA_REPFACT 3
 
-inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
+inline bool is_robust_config(int config) { return config >= 100 && config <= 103; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor
