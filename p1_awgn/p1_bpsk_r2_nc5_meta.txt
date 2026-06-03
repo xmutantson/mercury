@@ -1,0 +1,44 @@
+Mercury Version 0.4.2
+Loaded settings from: C:\Users\kamer\AppData\Roaming\Mercury\mercury.ini
+Using input device from settings: Microphone (2- USB Audio CODEC )
+Using output device from settings: Speakers (2- USB Audio CODEC )
+Audio channels: input=LEFT, output=LEFT
+Using TCP ports from settings: control=7005, data=7006
+Audio System: Windows Audio Session API (WASAPI)
+Bandwidth: 2343.750000 Hz
+Center frequency: 1500.000000 Hz low: 328.125000 Hz high: 2671.875000 Hz
+[FLAG] --ber-esn0=18.00 --ber-frames=2
+Mode selected: PLOT_PASSBAND
+[PHY] Loading configuration 0 (was -1)
+[PHY-SWITCH] Taking capture_prep_mutex, zeroing Nofdm/buffer_Nsymb
+[PHY-SWITCH] deinit() start
+[PHY-SWITCH] deinit() done
+[P1] CONFIG_0 re-tune: Nc=5 gi=0.2109 (4.50 ms) mod=2 rate=0.1250
+[PHY-SWITCH] init() start (nb=0 M=2 config=0)
+[FFT] Using PocketFFT (mixed-radix, auto-vectorized)
+[PRE-EQ] Nc=5 min_mag=4.5759 max_mag=8.0953
+[PHY-SWITCH] init() done (Nc=5 Nsymb=480 Nofdm=310 buffer_Nsymb=1177)
+[PHY-SWITCH] Releasing capture_prep_mutex
+[PHY] Config 0 active: M=2 LDPC_rate=0.125 BW=234Hz Nc=5 Nsymb=480 nBits=1600
+[PHY] ACK pattern: 16 symbols (M=16, WB Welch-Costas), 19840 passband samples (413 ms), match_threshold=7/16, detection_threshold=1.00
+Modulation: 0  Bitrate: 14.72 bps  Shannon_limit: -10.52 db
+[TX-PREEQ] CONFIG_0 pre_eq[0..4]=(5.5350,-0.2662)(4.5732,-0.1572)(4.6672,-0.0409)(5.6976,0.0222)(8.0936,0.1695)
+[TX-PEAK] CONFIG_0 peak=0.514254 rms=0.160402 papr=10.1dB total_samples=600160
+[PB-ENERGY] rms=0.118346 peak=0.765001 samples=1459480 output_power=1.000
+[P2B-DIAG] M=2 carrier_freq=1500.0 carrier_amp=1.414214 fs=48000 interp=4 buf_samples=1459480
+[BER-DET] config=0 metric=0.9336 delay=7848 expected=7640 OK
+[OFDM-SYNC] coarse: pream_symb=6 delay=7640 bounds=[4,693] metric=10.000 bufNsymb=1177 Nsymb=480 preamNsymb=4 PASS
+[OFDM-ENERGY] pream=8.0551e-02 buf=5.3475e-02 count=310 delay=7640 symb=6 metric=10.000 PASS
+[ENERGY-DIAG] pream: pb=4.3542e-01 bb=8.4130e-02 | data: pb=2.2612e+00 bb=1.1965e-01 | delay=7640 data_off=12600 buf=1459480
+[FRAME-NV] trial=0 cfg=0 nv=1.132330e-02 mvar=0.0114 Nsymb=480 amprest=0
+[OFDM-OK] t0 cfg=0 delay=7640 iter=0 freq=0.0 var=0.0113 meanH=0.999 SNR=19.5 coarse=0.0
+[TIMING] total=55.8ms (0% of 12503ms frame) | pb_tsync=18.8 pb_data=31.8 ldpc=0.1 other=5.1 | buf_symb=1177 frame_symb=484 iter=0
+[TX-PREEQ] CONFIG_0 pre_eq[0..4]=(5.5350,-0.2662)(4.5732,-0.1572)(4.6672,-0.0409)(5.6976,0.0222)(8.0936,0.1695)
+[PB-ENERGY] rms=0.118546 peak=0.771242 samples=1459480 output_power=1.000
+[P2B-DIAG] M=2 carrier_freq=1500.0 carrier_amp=1.414214 fs=48000 interp=4 buf_samples=1459480
+[OFDM-SYNC] coarse: pream_symb=6 delay=7640 bounds=[4,693] metric=10.000 bufNsymb=1177 Nsymb=480 preamNsymb=4 PASS
+[OFDM-ENERGY] pream=8.4648e-02 buf=5.3552e-02 count=310 delay=7640 symb=6 metric=10.000 PASS
+[ENERGY-DIAG] pream: pb=4.3520e-01 bb=8.3797e-02 | data: pb=2.4163e+00 bb=1.3240e-01 | delay=7640 data_off=12600 buf=1459480
+[FRAME-NV] trial=0 cfg=0 nv=1.065069e-02 mvar=0.0107 Nsymb=480 amprest=0
+[OFDM-OK] t0 cfg=0 delay=7640 iter=0 freq=0.0 var=0.0107 meanH=0.998 SNR=19.7 coarse=0.0
+18;0

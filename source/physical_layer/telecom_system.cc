@@ -435,6 +435,43 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			}
 		}
 
+		// === P1 ACQUISITION-TEST mode (THROWAWAY, sim/p1-coherent-midband) ===
+		// phase4-coherent-tier-design.md §7.4 caveat #1: the normal BER harness
+		// FORCES the RX delay (ofdm_forced_delay) and skips freq sync — it tests
+		// decode-given-perfect-acquisition, NOT acquisition. MERCURY_P1_ACQ flips
+		// the harness into a FULL acquire+sync+decode test:
+		//   (1) noise fills the WHOLE ring buffer (buffer_Nsymb), so the burst sits
+		//       in a realistic noisy buffer the detector must FIND (apply_with_delay
+		//       already prepends a random+noise lead-in of `delay` symbols);
+		//   (2) ofdm_forced_delay is LEFT at -1, so receive_byte runs the real
+		//       Schmidl-Cox two-phase preamble detection + ±30 Hz coarse search +
+		//       Moose fine CFO (telecom_system.cc:1186-2009, :2213-2223);
+		//   (3) the CFO itself is injected upstream via -f <Hz> (test_tx_carrier_offset,
+		//       :700) so the RX (downconverting at carrier_frequency) sees a true
+		//       frequency offset it must estimate.
+		// Production BER path is byte-identical when MERCURY_P1_ACQ is unset.
+		static int p1_acq_mode = (getenv("MERCURY_P1_ACQ") != NULL) ? 1 : 0;
+		if(p1_acq_mode && M != MOD_MFSK)
+		{
+			// Enable the ±30 Hz coarse-freq search so a CFO beyond Moose's
+			// ±1-subcarrier capture is still acquired (Moose handles ±~93 Hz for
+			// Nc=5; the coarse search extends reach and is what production uses
+			// when trial 0 fails). Harmless when CFO is small.
+			coarse_freq_sync_enabled = true;
+			// Fill the entire ring buffer with AWGN; then overlay the burst at the
+			// known lead-in offset. The detector still has to locate the burst.
+			int buf_items = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			int frame_items = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
+			int lead = ((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate;
+			float ampl_val = sigma / sqrtf(2.0f);
+			for(int i = 0; i < buf_items; i++)
+				data_container.passband_delayed_data[i] = (double)(ampl_val * awgn_channel.awgn_value_generator());
+			for(int i = 0; i < frame_items && (lead + i) < buf_items; i++)
+				data_container.passband_delayed_data[lead + i] += data_container.passband_data[i];
+			// ofdm_forced_delay stays -1 → real acquisition path runs.
+		}
+		else
+		{
 		awgn_channel.apply_with_delay(data_container.passband_data,data_container.passband_delayed_data,sigma,(data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*this->frequency_interpolation_rate,((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate);
 		if(M == MOD_MFSK)
 		{
@@ -446,6 +483,7 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			// Also needed for NB to prevent the NB freq estimator from running
 			// on synthetic passband data (no real channel offset to measure).
 			ofdm_forced_delay = ((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate;
+		}
 		}
 		this->receive_byte(data_container.passband_delayed_data,data_container.hd_decoded_data_byte);
 		mfsk_fixed_delay = -1;
@@ -5050,6 +5088,19 @@ void cl_telecom_system::load_configuration(int configuration)
 			if(rate_num < 1) rate_num = 1;
 			if(rate_num > 14) rate_num = 14;
 			_ldpc_rate = rate_num / 16.0f;
+			// Preamble length override (phase4 §7.4 caveat #1 / §3.3 risk #1):
+			// the few-carrier Schmidl-Cox metric is weak (less subcarrier
+			// averaging), so a 4-symbol preamble cannot find the burst at low
+			// SNR. MERCURY_P1_PRE sweeps the coherent OFDM preamble length
+			// (4|8|16|...) to test whether more integration closes the
+			// acquisition gap. nIdentical_sections=2 (Moose half-symbol) is
+			// preserved by the configurator regardless of Nsymb.
+			const char* p1pre = getenv("MERCURY_P1_PRE");
+			if(p1pre != NULL)
+			{
+				int pre_n = atoi(p1pre);
+				if(pre_n >= 2 && pre_n <= 64) ofdm_preamble_configurator_Nsymb = pre_n;
+			}
 		}
 	}
 	else if(configuration==CONFIG_1)

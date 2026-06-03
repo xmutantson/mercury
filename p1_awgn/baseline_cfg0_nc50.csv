@@ -1,0 +1,16 @@
+# arm=baseline_cfg0_nc50 env=[] FSEL=0 frames=60 grid=[-9 -8 -7 -6 -5 -4 -3.5 -3 -2.5 -2 -1 0]
+[PHY] Config 0 active: M=2 LDPC_rate=0.062 BW=2344Hz Nc=50 Nsymb=48 nBits=1600
+Modulation: 0  Bitrate: 62.53 bps  Shannon_limit: -13.59 db
+# EsN0;BER
+-9;0.497817
+-8;0.486706
+-7;0.489484
+-6;0.492262
+-5;0.493849
+-4;0.42619
+-3.5;0.0686508
+-3;0
+-2.5;0
+-2;0
+-1;0
+0;0

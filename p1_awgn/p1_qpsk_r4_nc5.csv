@@ -1,0 +1,17 @@
+# arm=p1_qpsk_r4_nc5 env=[MERCURY_P1=1 MERCURY_P1_MOD=qpsk MERCURY_P1_RATE=4 MERCURY_P1_NC=5] FSEL=0 frames=60 grid=[-9 -8 -7 -6 -5 -4 -3.5 -3 -2.5 -2 -1 0]
+[P1] CONFIG_0 re-tune: Nc=5 gi=0.2109 (4.50 ms) mod=4 rate=0.2500
+[PHY] Config 0 active: M=4 LDPC_rate=0.250 BW=234Hz Nc=5 Nsymb=240 nBits=1600
+Modulation: 0  Bitrate: 60.92 bps  Shannon_limit: -4.19 db
+# EsN0;BER
+-9;0.493837
+-8;0.495573
+-7;0.495573
+-6;0.494531
+-5;0.493403
+-4;0.17908
+-3.5;0.0163194
+-3;0
+-2.5;0
+-2;0
+-1;0
+0;0
