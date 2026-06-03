@@ -1635,11 +1635,12 @@ void *sim_rx_bridge_thread(void *unused)
 		}
 		// Backpressure: if the prep thread is behind, spin briefly rather
 		// than overflow capture_buffer (mirrors the device-full guard).
-		// In sim mode yield (no real sleep) and DON'T use the wall-clock spin
-		// cap — virtual time only advances when the prep thread consumes via
-		// rx_transfer, so a full capture_buffer is guaranteed to drain as soon
-		// as we yield to the prep thread; the 5000-spin "~10 s" cap would
-		// otherwise trip in microseconds under yield and drop a chunk.
+		// In sim mode the short-sleep pace (sim_paced_wait) DON'T use the
+		// wall-clock spin cap — virtual time only advances when the prep thread
+		// consumes via rx_transfer, so a full capture_buffer is guaranteed to
+		// drain as soon as we hand the core to the prep thread; the 5000-spin
+		// "~10 s" cap is sized for the production 2 ms sleep and would trip far
+		// too early under the sub-ms sim pace and drop a chunk.
 		int spins = 0;
 		while (!shutdown_ &&
 		       circular_buf_free_size(capture_buffer) < (size_t)chunk_bytes) {
