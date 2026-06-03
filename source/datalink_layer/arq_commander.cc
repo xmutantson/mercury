@@ -3589,7 +3589,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// WGN:-10 cliff). See gearshift-start-and-recovery.md §9.
 			if(promotion_allowed_on_batch(last_batch_fully_acked))
 			{
-				break_drop_step = 2;       // Reset to initial aggression (2 steps).
+				// TOP-CONFIG CEILING FIX (gearshift-top-config-ceiling.md §3/§4): the
+				// per-event INITIAL established-data BREAK aggression is ONE rung, not
+				// two. A 2-rung initial drop overshoots the top of the ladder
+				// (CONFIG_16 -> CONFIG_14, SKIPPING CONFIG_15) on a transient 3-NAck
+				// burst, so the link can never HOLD the top config on a clean link (it
+				// oscillates 14<->16, steady=CONFIG_14, 0.74x; the one run that held
+				// CONFIG_16 hit 1.82x). One rung down (16->15) lands on the next-best
+				// config AND keeps the link at 15-16 where the §11 anchor can ratchet
+				// to the top, making HOLD-CONFIG_16 reachable. The :222/:321 doubling
+				// still escalates 1->2->4 across a recovery's retries, and the
+				// breaks>=2 panic-jump (:3492 -> 100) still force-floors a genuinely
+				// crashing channel — so crash/cliff escape latency is unchanged and the
+				// WGN:-10 anti-thrash (panic + §10 demotion) is INERT to this change.
+				break_drop_step = 1;       // Initial aggression: ONE rung (was 2).
 				breaks_since_last_data_success = 0;  // panic-mode counter resets on
 				                                     // CLEAN data flow (see arq.h / §9).
 				// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10): a CLEAN
@@ -6390,6 +6403,16 @@ int cl_arq_controller::test_clean_batch_viability()
 //       the §15 re-trigger gate was OPEN at t=0 → WGN:-10 over-climb. The fix seats it
 //       at the session FLOOR (session_floor_anchor: ROBUST_0 on -R, the start/pinned
 //       config otherwise). Drives the REAL helper vs the pre-fix init expression.
+//   Q — TOP-CONFIG CEILING (gearshift-top-config-ceiling.md §3/§4): the per-event
+//       INITIAL established-data emergency-BREAK aggression was break_drop_step=2
+//       (reset on every clean batch, arq_commander.cc:3592), so a transient 3-NAck
+//       burst at CONFIG_16 dropped the recovery TWO rungs (config_ladder_down_n(
+//       CONFIG_16,2)=CONFIG_14, SKIPPING CONFIG_15) → on a clean link the gearshift
+//       reached CONFIG_16 (peak) but settled CONFIG_14 (steady, 0.74×; the one run
+//       that HELD CONFIG_16 hit 1.82×). Fix: initial step = ONE rung (16→15) so the
+//       link dwells at 15-16 and the §11 anchor can ratchet to the top. Drives the
+//       REAL config_ladder_down_n + break_target_with_anchor; the doubling +
+//       panic-jump are preserved (Q4/Q3). Pre-fix step=2 → Q1 lands CONFIG_14 (FAIL).
 //
 // IMPORTANT (gearshift-climb-engine.md §8): these in-process assertions are
 // NECESSARY but NOT SUFFICIENT — the C1/C2/C3 singles passed local unit tests
@@ -8383,6 +8406,98 @@ int cl_arq_controller::test_climb_engine()
 			int p_ofdm_dn = config_ladder_down(CONFIG_0, robust_enabled);
 			check(p_ofdm_dn == CONFIG_0, "P4b OFDM floor CONFIG_0 UNCHANGED with robust_enabled=NO (non-robust stays out of robust tier)",
 				p_ofdm_dn, CONFIG_0);
+		}
+
+		// ================================================================
+		// Part Q — TOP-CONFIG CEILING: the established-data BREAK initial
+		// aggression (gearshift-top-config-ceiling.md §3/§4/§6). On a clean WB
+		// link the climb reaches CONFIG_16 (peak) but settles at CONFIG_14
+		// (steady, 0.74x) — it cannot HOLD the top. ROOT CAUSE: the per-event
+		// INITIAL established-data emergency-BREAK aggression was break_drop_step=2
+		// (reset on every clean batch at arq_commander.cc:3592), so a transient
+		// 3-NAck burst at CONFIG_16 drops the recovery target TWO rungs to CONFIG_14
+		// (config_ladder_down_n(CONFIG_16, 2)), SKIPPING CONFIG_15 — confirmed by the
+		// IONOS clean-cell switch_seq (16->14, CONFIG_15 only ever appears on the
+		// climb-UP). With the anchor stuck below the top (the §11 OFDM N=2
+		// consecutive-clean gate is hard to satisfy at the marginal 32QAM top before
+		// a down-move knocks the link off), break_target_with_anchor cannot floor the
+		// drop at the top. The fix sets the INITIAL aggression to ONE rung (16->15):
+		// the link lands on the next-best config and dwells at 15-16 where the anchor
+		// can ratchet, making HOLD-CONFIG_16 reachable. These assertions drive the
+		// REAL production recovery primitives — config_ladder_down_n(
+		// emergency_previous_config, break_drop_step, robust_enabled) +
+		// break_target_with_anchor — the SAME calls the BREAK recovery sites
+		// (arq_commander.cc:209 / :307) make. FAIL-BEFORE (initial step=2):
+		// Q1 lands on CONFIG_14. PASS-AFTER (initial step=1): Q1 lands on CONFIG_15.
+		{
+			robust_enabled = NO;            // a WB (non-robust) clean-link session
+			narrowband_enabled = NO;
+			optimizer_disabled = true;      // optimizer_is_in_control()==false
+
+			// POST-FIX initial established-data BREAK aggression — this is the value
+			// arq_commander.cc:3592 assigns on every clean batch (the per-event
+			// initial). The fix changed it 2 -> 1. Mirror it here so Q tracks the
+			// production constant; to reproduce the FAIL-BEFORE, set this to 2.
+			break_drop_step = 1;
+
+			// Q0: document the TUNABLE — from CONFIG_16 the POST-FIX initial step
+			// drops exactly ONE rung (to CONFIG_15) BEFORE the anchor floor.
+			int q_raw = config_ladder_down_n(CONFIG_16, break_drop_step, robust_enabled);
+			check(q_raw == CONFIG_15,
+				"Q0 initial BREAK step drops CONFIG_16->CONFIG_15 (1 rung, the post-fix aggression)",
+				q_raw, CONFIG_15);
+
+			// Q1: THE ceiling assertion (fail-before). Anchor below the drop target
+			// so break_target_with_anchor is inert (raw_target >= anchor). The
+			// recovery from CONFIG_16 must land on CONFIG_15, NOT CONFIG_14.
+			// Pre-fix (break_drop_step=2): config_ladder_down_n(CONFIG_16,2)=CONFIG_14 -> FAIL.
+			breaks_since_last_data_success = 0;       // not in panic — anchor floor active
+			last_data_viable_config = CONFIG_13;      // anchor below the 1-rung target
+			int q_raw1 = config_ladder_down_n(CONFIG_16, break_drop_step, robust_enabled);
+			int q_tgt1 = break_target_with_anchor(q_raw1);
+			check(q_tgt1 == CONFIG_15,
+				"Q1 established-data BREAK from CONFIG_16 lands on CONFIG_15 not CONFIG_14 (the 2-rung overshoot fix)",
+				q_tgt1, CONFIG_15);
+
+			// Q2: the anchor floor HOLDS the top once the anchor reaches it (the
+			// hold mechanism is the anchor, independent of the step). With
+			// anchor=CONFIG_16, any 1-rung raw target floors UP to CONFIG_16 — the
+			// link HOLDS CONFIG_16. Passes before & after.
+			last_data_viable_config = CONFIG_16;
+			int q_raw2 = config_ladder_down_n(CONFIG_16, break_drop_step, robust_enabled);
+			int q_tgt2 = break_target_with_anchor(q_raw2);
+			check(q_tgt2 == CONFIG_16,
+				"Q2 anchor floor HOLDS CONFIG_16 once the anchor reaches the top (config_ladder_down_n floored UP)",
+				q_tgt2, CONFIG_16);
+
+			// Q3: SAFETY — the breaks>=2 panic-jump still reaches the ladder floor,
+			// UNAFFECTED by the initial-step change (panic forces break_drop_step=100
+			// and break_target_with_anchor returns the raw target unclamped). WB floor
+			// is CONFIG_0. Passes before & after.
+			breaks_since_last_data_success = 2;       // panic: bypass the anchor floor
+			last_data_viable_config = CONFIG_13;      // would otherwise floor at 13
+			int q_raw3 = config_ladder_down_n(CONFIG_16, /*panic step*/100, robust_enabled);
+			int q_tgt3 = break_target_with_anchor(q_raw3);
+			check(q_tgt3 == CONFIG_0,
+				"Q3 panic-jump (breaks>=2, step=100) still floors to CONFIG_0 (crash escape intact, step-independent)",
+				q_tgt3, CONFIG_0);
+
+			// Q4: the :222/:321 doubling escalation is preserved — one doubling round
+			// from the POST-FIX initial step yields a 2-rung drop (CONFIG_16->CONFIG_14),
+			// so a recovery that needs a retry still reaches the old aggression. The
+			// doubling is untouched by the fix. Passes before & after.
+			breaks_since_last_data_success = 0;
+			last_data_viable_config = CONFIG_0;       // anchor low — floor inert
+			int q_step_doubled = break_drop_step * 2; // mirrors arq_commander.cc:222/:321
+			int q_raw4 = config_ladder_down_n(CONFIG_16, q_step_doubled, robust_enabled);
+			int q_tgt4 = break_target_with_anchor(q_raw4);
+			check(q_tgt4 == CONFIG_14,
+				"Q4 doubling escalation preserved: one *=2 round from the initial step drops CONFIG_16->CONFIG_14",
+				q_tgt4, CONFIG_14);
+
+			// Restore production-default test state for any later additions.
+			break_drop_step = 1;
+			breaks_since_last_data_success = 0;
 		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
