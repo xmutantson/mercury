@@ -3519,7 +3519,9 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 			int actual_tone = mfsk_preamble_tones[p % 16];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
-			int streams_matched = 0;
+			// e_target: energy in the expected (+mirror) tone bins summed over all
+			// streams — feeds the secondary tie-break metric only. Identical in
+			// both the 1-stream and multi-stream decision paths below.
 			double e_target = 0.0;
 			for (int st = 0; st < mfsk_nStreams; st++)
 			{
@@ -3533,13 +3535,62 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				double em = fft_out[mirror_bin].real() * fft_out[mirror_bin].real()
 				          + fft_out[mirror_bin].imag() * fft_out[mirror_bin].imag();
 				e_target += ee + em;
+			}
 
-				// Find peak bin among this stream's M tones (argmax).
+			// Per-symbol match decision.
+			//
+			// mfsk_nStreams >= 2: STREAM-ENERGY COMBINING (equal-gain noncoherent;
+			// Proakis 5e §14.4, Q65 multi-tone energy sum / K1JT). The TX places the
+			// SAME preamble tone in every stream's band (mfsk.cc generate_preamble),
+			// so the streams are redundant copies. Summing each candidate tone's
+			// energy ACROSS streams before a single argmax recovers the 2-branch
+			// array gain (+4.86 dB measured, M16×2 cliff −9.03 → −13.89; P3
+			// data-frame-detector-deepening-p3.md §3.2). This replaces the legacy
+			// per-stream AND-gate (each stream argmax-matched independently → p²
+			// per-symbol match prob, the cliff driver). Mirror handled in tone
+			// space ((M−tone)%M) for carrier-image recovery, bit-equivalent to the
+			// P3-measured scorer (p3_score_stream_combined).
+			//
+			// mfsk_nStreams == 1 (ROBUST_0 / M32×1): the combiner is a no-op
+			// (one branch to sum), so we keep the legacy per-stream argmax +
+			// bin-space-mirror accept path VERBATIM. The two formulations are NOT
+			// bit-identical at 1 stream (tone- vs bin-space mirror differ by
+			// −1.34 dB, P3 §3.1), so gating preserves ROBUST_0 byte-for-byte.
+			bool symbol_matched;
+			if (mfsk_nStreams >= 2)
+			{
+				// Combined per-tone energy across streams, then one argmax over M.
+				double best_e = -1.0;
+				int best_t = -1;
+				for (int t = 0; t < mfsk_M; t++)
+				{
+					double e = 0.0;
+					for (int st = 0; st < mfsk_nStreams; st++)
+					{
+						int tsub = mfsk_stream_offsets[st] + t;
+						int b = (tsub < half) ? (Nfft - half + tsub)
+						                       : (start_shift + (tsub - half));
+						e += fft_out[b].real() * fft_out[b].real()
+						   + fft_out[b].imag() * fft_out[b].imag();
+					}
+					if (e > best_e) { best_e = e; best_t = t; }
+				}
+				int mirror_tone = (mfsk_M - actual_tone) % mfsk_M;
+				symbol_matched = (best_e > 0 &&
+				                  (best_t == actual_tone || best_t == mirror_tone));
+			}
+			else
+			{
+				int sub = mfsk_stream_offsets[0] + actual_tone;
+				int expected_bin = (sub < half) ? (Nfft - half + sub)
+				                                 : (start_shift + (sub - half));
+				int mirror_bin = (Nfft - expected_bin) % Nfft;
+				// Find peak bin among the stream's M tones (argmax).
 				double peak_e = -1.0;
 				int peak_bin = -1;
 				for (int t = 0; t < mfsk_M; t++)
 				{
-					int tsub = mfsk_stream_offsets[st] + t;
+					int tsub = mfsk_stream_offsets[0] + t;
 					int b = (tsub < half) ? (Nfft - half + tsub)
 					                       : (start_shift + (tsub - half));
 					double e = fft_out[b].real() * fft_out[b].real()
@@ -3549,11 +3600,11 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				// Carrier-image recovery (Bug #39 pattern in detect_ack_pattern):
 				// accept expected OR mirror as peak. Energy gate prevents 0==0
 				// match on silence.
-				if (peak_e > 0 && (peak_bin == expected_bin || peak_bin == mirror_bin))
-					streams_matched++;
+				symbol_matched = (peak_e > 0 &&
+				                  (peak_bin == expected_bin || peak_bin == mirror_bin));
 			}
 
-			if (streams_matched < mfsk_nStreams)
+			if (!symbol_matched)
 				continue;
 			matched++;
 
@@ -3621,7 +3672,8 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 			int actual_tone = mfsk_preamble_tones[p % 16];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
-			int streams_ok = 0;
+			// e_targ: expected(+mirror) tone energy summed over streams — secondary
+			// metric only. Identical in both decision paths (mirrors Phase-1).
 			double e_targ = 0.0;
 			for (int st = 0; st < mfsk_nStreams; st++)
 			{
@@ -3635,23 +3687,54 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				double em = fft_out[mbin].real() * fft_out[mbin].real()
 				          + fft_out[mbin].imag() * fft_out[mbin].imag();
 				e_targ += ee + em;
+			}
 
+			// Per-symbol match decision — SAME gated logic as the Phase-1 coarse
+			// scan (see the long comment there). nStreams>=2: stream-energy
+			// combining; nStreams==1: legacy per-stream argmax (byte-identical).
+			bool symbol_ok;
+			if (mfsk_nStreams >= 2)
+			{
+				double best_e = -1.0;
+				int best_t = -1;
+				for (int t = 0; t < mfsk_M; t++)
+				{
+					double e = 0.0;
+					for (int st = 0; st < mfsk_nStreams; st++)
+					{
+						int tsub = mfsk_stream_offsets[st] + t;
+						int b = (tsub < half) ? (Nfft - half + tsub)
+						                       : (start_shift + (tsub - half));
+						e += fft_out[b].real() * fft_out[b].real()
+						   + fft_out[b].imag() * fft_out[b].imag();
+					}
+					if (e > best_e) { best_e = e; best_t = t; }
+				}
+				int mirror_tone = (mfsk_M - actual_tone) % mfsk_M;
+				symbol_ok = (best_e > 0 &&
+				             (best_t == actual_tone || best_t == mirror_tone));
+			}
+			else
+			{
+				int sub = mfsk_stream_offsets[0] + actual_tone;
+				int ebin = (sub < half) ? (Nfft - half + sub)
+				                        : (start_shift + (sub - half));
+				int mbin = (Nfft - ebin) % Nfft;
 				double pk = -1.0;
 				int pkbin = -1;
 				for (int t = 0; t < mfsk_M; t++)
 				{
-					int tsub = mfsk_stream_offsets[st] + t;
+					int tsub = mfsk_stream_offsets[0] + t;
 					int b = (tsub < half) ? (Nfft - half + tsub)
 					                       : (start_shift + (tsub - half));
 					double e = fft_out[b].real() * fft_out[b].real()
 					         + fft_out[b].imag() * fft_out[b].imag();
 					if (e > pk) { pk = e; pkbin = b; }
 				}
-				if (pk > 0 && (pkbin == ebin || pkbin == mbin))
-					streams_ok++;
+				symbol_ok = (pk > 0 && (pkbin == ebin || pkbin == mbin));
 			}
 
-			if (streams_ok < mfsk_nStreams) continue;
+			if (!symbol_ok) continue;
 			matched_f++;
 
 			double e_tot = 0.0;
@@ -3677,13 +3760,39 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 	}
 
 	// Detection gate: length-scaled discrete match count.
-	if (fine_best_matched < mfsk_preamble_match_threshold)
+	//
+	// §13 FAR cleanup (data-frame-detector-deepening-p3.md §13): the
+	// detect/no-detect DECISION is gated on the COARSE matched count, and the
+	// Phase-2 fine pass is used ONLY to refine the returned sample OFFSET — it
+	// does NOT re-maximize the count to RE-DECIDE detection. Rationale: the
+	// fine pass takes the MAX matched count over the ±½-symbol sub-positions,
+	// which lifts BOTH the signal AND the pure-noise matched-count distribution
+	// (a max over correlated positions). On the M16×2 combiner path that
+	// fine-pass max INFLATES FAR ~10× (T=8 1.8e-2 vs the coarse-only 1.75e-3,
+	// §12) without buying genuine detection — the real acquisition gain is
+	// carried by the COARSE stream-energy combining (the +4.86 dB / ~2.4×
+	// matched-count lift, HW-validated §16), not by the sub-position max.
+	// Deciding on the coarse count therefore recovers the ref-scorer FAR
+	// (1.75e-3 @ T=8) while preserving the combiner's coarse acquisition gain.
+	//
+	// GATED behind nStreams>=2 (the combiner geometry):
+	//  - nStreams>=2 (M16×2/M4×2 — ROBUST_1/2, future ROBUST_RA/ULTRA): decide
+	//    on best_matched (coarse); report it as the decision statistic. The fine
+	//    pass still ran and fine_best_offset is its alignment-refined position,
+	//    returned on a positive detection (offset refinement only).
+	//  - nStreams==1 (M32×1/M8×1 — ROBUST_0): UNCHANGED — gate on
+	//    fine_best_matched and report it, byte-identical to monitor @8fc1211
+	//    (the §11 combiner gate already preserves the 1-stream decision path;
+	//    this keeps the SAME gate statistic there too).
+	int decision_matched = (mfsk_nStreams >= 2) ? best_matched : fine_best_matched;
+
+	if (decision_matched < mfsk_preamble_match_threshold)
 	{
-		if (out_metric) *out_metric = (double)fine_best_matched;
+		if (out_metric) *out_metric = (double)decision_matched;
 		return -1;
 	}
 
-	if (out_metric) *out_metric = (double)fine_best_matched;
+	if (out_metric) *out_metric = (double)decision_matched;
 	return fine_best_offset;
 }
 
