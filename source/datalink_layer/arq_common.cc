@@ -302,6 +302,11 @@ cl_arq_controller::cl_arq_controller()
 	// FIX-A — ROBUST dwell-batch transport state (data-flow-robust-tier-arq-batch.md §5.2/§5.3).
 	pending_robust_dwell_batch=-1;
 	robust_dwell_batch_active=false;
+	// FIX-B — FLOOR-PROBE BACK-OFF state (gearshift-floor-probe-backoff.md §3/§5).
+	// Seed the window to INIT and zero the per-rung deadline array (no probe
+	// suppressed at session start). reset_session_state() mirrors this.
+	probe_backoff_ms=PROBE_BACKOFF_MS_INIT;
+	for(int i=0;i<FULL_CONFIG_LADDER_SIZE;i++) probe_backoff_until_ms[i]=0ULL;
 	// SACK Design A Step 11 — Axis 3 controller state (SACK mode ON↔PROBE↔OFF).
 	// Initial state = ON (per §4.3.2 spec). The mode is materially ON only on
 	// sack_v2_enabled sessions; on v1 sessions the field stays at its sentinel
@@ -3187,6 +3192,10 @@ void cl_arq_controller::reset_session_state()
 	// (data-flow-robust-tier-arq-batch.md §5.3). Mirrors the ctor init.
 	pending_robust_dwell_batch = -1;
 	robust_dwell_batch_active = false;
+	// FIX-B — fresh session: no rung is under a floor-probe back-off; window at
+	// INIT (gearshift-floor-probe-backoff.md §5). Mirrors the ctor init.
+	probe_backoff_ms = PROBE_BACKOFF_MS_INIT;
+	for(int i=0;i<FULL_CONFIG_LADDER_SIZE;i++) probe_backoff_until_ms[i]=0ULL;
 	turbo_snr_ack_enabled = false;
 	turbo_received_snr = -99.0f;
 	turbo_switch_role_retries = 0;

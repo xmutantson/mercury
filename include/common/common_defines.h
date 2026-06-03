@@ -404,6 +404,26 @@ CONFIG_16 (5664.7 bps).
 // leaps from a low OFDM anchor) while a pathological jump is bounded.
 #define RETRIGGER_MAX_LEAP 13
 
+// FIX-B — FLOOR-PROBE BACK-OFF (gearshift-floor-probe-backoff.md). At the
+// robust/OFDM boundary a failed CONFIG_0 up-probe panic-collapses the link to
+// the ROBUST tier; the climb then re-probes that SAME rung on a FIXED cadence,
+// re-fails, and the link burns the deep-SNR floor's airtime in a
+// CONFIG_0↔ROBUST_0/2 limit cycle (HW WGN:-10 config_counts ROBUST_0:6
+// ROBUST_2:4 CONFIG_0:4). These bound a PER-RUNG exponential back-off so a
+// PROVEN-FAILED up-probe is not hammered every cycle: the first failure
+// suppresses re-probing of that rung for PROBE_BACKOFF_MS_INIT, doubling on each
+// repeat fail up to PROBE_BACKOFF_MS_CAP, and the whole back-off is reset the
+// instant ANY clean OFDM batch is delivered (the channel proved it recovered).
+// OR-5 / [Q1]: these are STARTING values, to be SWEPT in the FTRT sim / HW
+// floor-stack A/B (NOT magic-numbered final constants — see CLAUDE.md §1 and the
+// fact-doc §6 sweep note). INIT ~8 s ≈ one robust-tier dwell cycle (long enough
+// to do real floor work between probes, short enough that a recovering channel
+// re-probes promptly); CAP ~120 s bounds the worst-case re-probe latency on a
+// channel that genuinely improved but delivered no clean OFDM batch to trigger
+// the reset.
+#define PROBE_BACKOFF_MS_INIT 8000
+#define PROBE_BACKOFF_MS_CAP  120000
+
 #define YES 1
 #define NO 0
 
