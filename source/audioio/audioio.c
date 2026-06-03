@@ -37,7 +37,6 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <sched.h>    // sched_yield (sim_paced_wait)
 #endif
 #include <stdlib.h>   // getenv, atoi
 
@@ -146,17 +145,27 @@ static inline void ffthread_sleep(ffuint msec)
 // fixed ffthread_sleep(ms) waits that are correct for a real device (the
 // device delivers audio in real time) but would throttle the device-free
 // channel to ~1x real time and erase the faster-than-real-time speed-up. When
-// the sim virtual clock is active, yield the core to the thread that makes
-// progress (relay TCP / capture_buffer) instead of sleeping a real ms; when
-// sim is disabled this is the stock ffthread_sleep(ms) — production unchanged.
+// the sim virtual clock is active, sleep a SHORT real interval (~200 us)
+// instead: it hands the core to the thread that makes progress (relay TCP /
+// capture_buffer) WITHOUT pegging a core, and — unlike a raw yield — keeps the
+// two peer processes loosely paced together so their independent virtual
+// clocks stay coupled through the relay (a hot yield here helped desync the
+// CMD<->RSP half-duplex turnaround). When sim is disabled this is the stock
+// ffthread_sleep(ms) — production unchanged.
 static inline void sim_paced_wait(ffuint msec)
 {
 	if (sim_clock_enabled())
 	{
-#if defined(_WIN32)
-		SwitchToThread();
+		// ~200 us cooperative pace. On Windows the finest Sleep() granularity
+		// is ~1 ms (Sleep(0) would just yield/hot-spin), so use a 1 ms floor
+		// there; on POSIX nanosleep gives true sub-ms. Either way this is far
+		// shorter than the virtual durations being waited, so the speed-up
+		// holds while the two peer processes stay loosely paced.
+#if defined(FF_WIN)
+		Sleep(1);
 #else
-		sched_yield();
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 };  // 200 us
+		nanosleep(&ts, NULL);
 #endif
 	}
 	else
