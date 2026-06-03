@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/timer.h"
+#include "common/sim_clock.h"
 
 
 // clock_gettime implementation for WIN32
@@ -97,6 +98,23 @@ int clock_gettime(clockid_t type, struct timespec *tp)
 }
 #endif
 
+// Single funnel for every cl_timer clock read. When the -x sim virtual clock
+// is active (sim_clock_enabled()), the timer measures VIRTUAL channel time
+// (driven by samples flowing through rx_transfer) instead of wall-clock, so
+// the entire ARQ control loop — PTT delays, ACK/HAIL/BREAK timeouts,
+// retransmit timers — runs at host-compute speed, decoupled from real time.
+// When disabled (every production mode), it falls through to the EXACT same
+// clock_gettime(CLOCK_MONOTONIC_RAW) the stock timer used, so behavior is
+// byte-identical. This is the ONLY change to the timer; reset()/stop() math
+// is untouched.
+static inline void cl_timer_clock_read(struct timespec *tp)
+{
+	if (sim_clock_enabled())
+		sim_clock_fill_timespec(tp);
+	else
+		clock_gettime(CLOCK_MONOTONIC_RAW, tp);
+}
+
 cl_timer::cl_timer()
 {
 	seconds=0;
@@ -122,14 +140,14 @@ void cl_timer::reset()
 void cl_timer::start()
 {
 	this->reset();
-	clock_gettime(CLOCK_MONOTONIC_RAW, &startTime);
+	cl_timer_clock_read(&startTime);
 	counting=YES;
 
 }
 
 void cl_timer::stop()
 {
-	clock_gettime(CLOCK_MONOTONIC_RAW, &stopTime);
+	cl_timer_clock_read(&stopTime);
 	seconds=stopTime.tv_sec-startTime.tv_sec;
 	nanoseconds=stopTime.tv_nsec-startTime.tv_nsec;
 	if(nanoseconds<0)
@@ -146,7 +164,7 @@ void cl_timer::stop()
 void cl_timer::_continue()
 {
 
-	clock_gettime(CLOCK_MONOTONIC_RAW, &stopTime);
+	cl_timer_clock_read(&stopTime);
 	seconds=stopTime.tv_sec-startTime.tv_sec;
 	nanoseconds=stopTime.tv_nsec-startTime.tv_nsec;
 	if(nanoseconds<0)
@@ -164,7 +182,7 @@ void cl_timer::update()
 {
 	if(counting==YES)
 	{
-		clock_gettime(CLOCK_MONOTONIC_RAW, &stopTime);
+		cl_timer_clock_read(&stopTime);
 		seconds=stopTime.tv_sec-startTime.tv_sec;
 		nanoseconds=stopTime.tv_nsec-startTime.tv_nsec;
 		if(nanoseconds<0)

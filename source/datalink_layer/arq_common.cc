@@ -65,6 +65,53 @@ static inline bool sack_rx_trace_enabled_common()
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
+// ---------------------------------------------------------------------------
+// SIM virtual-clock spin helpers (sim-arq-channel.md §Inc2).
+//
+// Two loop shapes recur ~24x across the TX path:
+//   (1) PTT pre/post-key delay:  while(t.get_elapsed_time_ms() < ms) msleep(1);
+//   (2) playback drain:          while(size_buffer(playback_buffer) > 0) msleep(1);
+//
+// Under -x sim, cl_timer already measures VIRTUAL channel time and the drain
+// is serviced by the TX bridge thread, so both loops auto-virtualize — BUT a
+// raw `while(...) msleep(1)` would either burn a real ms per virtual ms (no
+// speed-up) or, if the sleep were removed, peg a core / livelock while the
+// other thread advances virtual time. So in SIM mode these helpers yield()
+// (cooperatively hand the core to the RX-prep / TX-bridge thread that drives
+// virtual time) instead of sleeping a real millisecond. In PRODUCTION (sim
+// disabled) they do EXACTLY the stock `msleep(1)` — byte-identical behavior.
+// Factored to ONE definition each so the policy lives in a single place.
+static inline void ptt_busy_wait(cl_timer& t, int delay_ms)
+{
+	if (sim_clock_enabled())
+	{
+		// Virtual time advances on the RX-prep thread (rx_transfer); yield so
+		// it runs. The timer trips in virtual time without real wall sleep.
+		while (t.get_elapsed_time_ms() < delay_ms)
+			std::this_thread::yield();
+	}
+	else
+	{
+		while (t.get_elapsed_time_ms() < delay_ms)
+			msleep(1);
+	}
+}
+
+static inline void drain_playback_wait()
+{
+	if (sim_clock_enabled())
+	{
+		// The TX bridge thread drains playback_buffer; yield so it runs.
+		while (size_buffer(playback_buffer) > 0)
+			std::this_thread::yield();
+	}
+	else
+	{
+		while (size_buffer(playback_buffer) > 0)
+			msleep(1);
+	}
+}
+
 static const int RX_MUTE_GUARD_MS = 50;
 
 cl_arq_controller::cl_arq_controller()
@@ -2727,7 +2774,16 @@ void cl_arq_controller::process_main()
 	}
 
 	process_messages();
-	usleep(2000);
+	// ARQ main-loop pacing floor. In production this 2 ms sleep caps the poll
+	// rate at ~500 Hz (plenty for a real radio's frame cadence). Under -x sim
+	// it would throttle the whole control loop to wall-clock 500 Hz and erase
+	// the faster-than-real-time speed-up, so yield instead: hand the core to
+	// the RX-prep / TX-bridge threads (which drive virtual time) and re-poll
+	// immediately. Gated on the flag -> production unchanged.
+	if (sim_clock_enabled())
+		std::this_thread::yield();
+	else
+		usleep(2000);
 }
 
 void cl_arq_controller::process_user_command(std::string command)
@@ -3429,8 +3485,7 @@ void cl_arq_controller::send(st_message* message, int message_location)
 					(active_nsymb + telecom_system->data_container.preamble_nSymb));
 	}
 
-	while (size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	last_message_sent_type=message->type;
 	if(message->type==CONTROL || message->type==ACK_CONTROL)
@@ -3742,8 +3797,7 @@ void cl_arq_controller::send_batch()
 		}
 	}
 
-	while(ptt_on_delay.get_elapsed_time_ms() < ptt_on_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_on_delay, ptt_on_delay_ms);
 
 	// Generate pilot tone if enabled (configurable frequency to warm up TX/amp)
 	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
@@ -3780,8 +3834,7 @@ void cl_arq_controller::send_batch()
 
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
 	// wait buffer to be played
-	while (size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	// M1 (SACK turnaround trace): the true "last DATA audio sample left the
 	// sound card" instant — the playback buffer just drained, and this is
@@ -3813,8 +3866,7 @@ void cl_arq_controller::send_batch()
 	mtl::log_event("cmd_post_tx_unmute");
 
 	ptt_off_delay.start();
-	while(ptt_off_delay.get_elapsed_time_ms() < ptt_off_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_off_delay, ptt_off_delay_ms);
 
 	ptt_off();
 	mtl::log_event("cmd_ptt_off");
@@ -3967,8 +4019,7 @@ void cl_arq_controller::send_ack_pattern()
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
 	// Wait PTT on delay
-	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
 	// Pilot tone (if enabled)
 	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
@@ -4000,8 +4051,7 @@ void cl_arq_controller::send_ack_pattern()
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
 	// Wait for playback to drain
-	while(size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	printf("[TX-ACK-PAT] Audio done at t=%dms\n", (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
 	mtl::log_event("rsp_ack_audio_done");
@@ -4059,8 +4109,7 @@ void cl_arq_controller::send_ack_pattern()
 	// during this delay, receiving silence (VB-Cable) or post-TX settling
 	// noise (real radio — rejected by preamble energy gate / metric threshold).
 	ptt_off_delay_timer.start();
-	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
 }
@@ -4107,8 +4156,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
-	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
 	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
 	{
@@ -4134,8 +4182,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
-	while(size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -4169,8 +4216,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	fflush(stdout);
 
 	ptt_off_delay_timer.start();
-	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
 }
@@ -4570,8 +4616,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
 	// Wait PTT on delay
-	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
 	// Pilot tone (if enabled)
 	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
@@ -4602,8 +4647,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
 	// Wait for playback to drain
-	while(size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	printf("[TX-MFSK-ACK-SACK] Audio done\n");
 	fflush(stdout);
@@ -4644,8 +4688,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	fflush(stdout);
 
 	ptt_off_delay_timer.start();
-	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
 
@@ -4782,8 +4825,7 @@ void cl_arq_controller::send_break_pattern()
 	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
-	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
 	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
 	{
@@ -4811,8 +4853,7 @@ void cl_arq_controller::send_break_pattern()
 
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
-	while(size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -4845,8 +4886,7 @@ void cl_arq_controller::send_break_pattern()
 	fflush(stdout);
 
 	ptt_off_delay_timer.start();
-	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
 }
@@ -4968,8 +5008,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
-	while(ptt_on_delay_timer.get_elapsed_time_ms() < self->ptt_on_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_on_delay_timer, self->ptt_on_delay_ms);
 
 	// Pilot tone (same conditional shape as send_mfsk_ack_sack:4367-4387).
 	if(self->pilot_tone_ms > 0 && self->pilot_tone_hz > 0)
@@ -4996,8 +5035,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
-	while(size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -5035,8 +5073,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	fflush(stdout);
 
 	ptt_off_delay_timer.start();
-	while(ptt_off_delay_timer.get_elapsed_time_ms() < self->ptt_off_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_off_delay_timer, self->ptt_off_delay_ms);
 
 	self->ptt_off();
 
@@ -5315,8 +5352,7 @@ void cl_arq_controller::send_hail_pattern()
 	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
-	while(ptt_on_delay_timer.get_elapsed_time_ms() < ptt_on_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
 	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
 	{
@@ -5344,8 +5380,7 @@ void cl_arq_controller::send_hail_pattern()
 
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
-	while(size_buffer(playback_buffer) > 0)
-		msleep(1);
+	drain_playback_wait();
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -5376,8 +5411,7 @@ void cl_arq_controller::send_hail_pattern()
 	fflush(stdout);
 
 	ptt_off_delay_timer.start();
-	while(ptt_off_delay_timer.get_elapsed_time_ms() < ptt_off_delay_ms)
-		msleep(1);
+	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
 }

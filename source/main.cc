@@ -34,8 +34,10 @@
 #include <complex>
 #include "physical_layer/telecom_system.h"
 #include "physical_layer/mfsk_ctrl_codec_tests.h"
+#include "common/sim_clock_tests.h"
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
+#include "common/sim_clock.h"
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_main.h"
@@ -250,6 +252,7 @@ int main(int argc, char *argv[])
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
             int failed = run_mfsk_ctrl_codec_tests();
+            failed += run_sim_clock_tests();
             return (failed == 0) ? 0 : 1;
         }
     }
@@ -1520,7 +1523,17 @@ start_modem:
         // input/output device names are ignored (the relay is the channel).
         if (input_dev && input_dev[0] == 0)  { free(input_dev);  input_dev = NULL; }
         if (output_dev && output_dev[0] == 0) { free(output_dev); output_dev = NULL; }
+        // Engage the virtual clock: from here on, every cl_timer and the
+        // Q-table optimizer's opt_now_ms() measure VIRTUAL channel time
+        // (samples through rx_transfer) instead of wall-clock, so the ARQ
+        // control loop runs at host-compute speed. Set BEFORE audioio_init
+        // starts the bridge threads / the ARQ loop touches any timer. This is
+        // the ONLY place g_sim_time_enabled is ever set true; every other -x
+        // mode leaves it false -> byte-identical to pre-change.
+        sim_clock_set_enabled(1);
         printf("SIM software channel (device-free ARQ loopback via relay)\n");
+        printf("[SIM] virtual clock ENABLED — control-loop timers run on "
+               "channel-sample time, not wall-clock\n");
         break;
     default:
         printf("No supported audio system selected. Trying to continue.\n");

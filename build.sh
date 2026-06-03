@@ -362,6 +362,8 @@ source/physical_layer/telecom_system.cc
 source/common/os_interop.cc
 source/common/ring_buffer_posix.cc
 source/common/shm_posix.cc
+source/common/sim_clock.cc
+source/common/sim_clock_tests.cc
 source/gui/gui_main.cc
 source/gui/ini_parser.cc
 source/gui/widgets/waterfall.cc

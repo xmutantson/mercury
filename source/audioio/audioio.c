@@ -27,6 +27,7 @@
 #include "common/shm_posix.h"
 #include "common/common_defines.h"
 #include "common/os_interop.h"
+#include "common/sim_clock.h"
 
 // SIM channel backend (-x sim) socket headers. winsock2.h is pulled in by
 // os_interop.h on Windows; POSIX sockets on everything else.
@@ -36,6 +37,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sched.h>    // sched_yield (sim_paced_wait)
 #endif
 #include <stdlib.h>   // getenv, atoi
 
@@ -138,6 +140,29 @@ static inline void ffthread_sleep(ffuint msec)
 	};
 	nanosleep(&ts, NULL);
 #endif
+}
+
+// SIM-mode cooperative wait. The -x sim bridge + RX-prep loops are paced by
+// fixed ffthread_sleep(ms) waits that are correct for a real device (the
+// device delivers audio in real time) but would throttle the device-free
+// channel to ~1x real time and erase the faster-than-real-time speed-up. When
+// the sim virtual clock is active, yield the core to the thread that makes
+// progress (relay TCP / capture_buffer) instead of sleeping a real ms; when
+// sim is disabled this is the stock ffthread_sleep(ms) — production unchanged.
+static inline void sim_paced_wait(ffuint msec)
+{
+	if (sim_clock_enabled())
+	{
+#if defined(_WIN32)
+		SwitchToThread();
+#else
+		sched_yield();
+#endif
+	}
+	else
+	{
+		ffthread_sleep(msec);
+	}
 }
 
 #if defined(_WIN32)
@@ -1253,7 +1278,7 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 		{
 			size_t needed = symbol_period * sizeof(double);
 			while (!shutdown_ && size_buffer(capture_buffer) < needed) {
-				ffthread_sleep(1);
+				sim_paced_wait(1);
 			}
 			if (shutdown_) break;
 		}
@@ -1567,7 +1592,7 @@ void *sim_tx_bridge_thread(void *unused)
 			// No TX queued: send a silence chunk so the relay clock advances
 			// and the RX side still receives a noise floor (RF realism).
 			memset(chunk, 0, chunk_bytes);
-			ffthread_sleep(5);
+			sim_paced_wait(5);
 		}
 		if (sim_send_all(sim_sock, (const uint8_t *)chunk, chunk_bytes) != 0) {
 			printf("[SIM] TX bridge send failed (relay closed?)\n");
@@ -1601,11 +1626,16 @@ void *sim_rx_bridge_thread(void *unused)
 		}
 		// Backpressure: if the prep thread is behind, spin briefly rather
 		// than overflow capture_buffer (mirrors the device-full guard).
+		// In sim mode yield (no real sleep) and DON'T use the wall-clock spin
+		// cap — virtual time only advances when the prep thread consumes via
+		// rx_transfer, so a full capture_buffer is guaranteed to drain as soon
+		// as we yield to the prep thread; the 5000-spin "~10 s" cap would
+		// otherwise trip in microseconds under yield and drop a chunk.
 		int spins = 0;
 		while (!shutdown_ &&
 		       circular_buf_free_size(capture_buffer) < (size_t)chunk_bytes) {
-			ffthread_sleep(2);
-			if (++spins > 5000) break;  // ~10 s safety
+			sim_paced_wait(2);
+			if (!sim_clock_enabled() && ++spins > 5000) break;  // ~10 s safety
 		}
 		if (shutdown_) break;
 		write_buffer(capture_buffer, (uint8_t *)chunk, chunk_bytes);
@@ -1638,6 +1668,16 @@ int rx_transfer(double *buffer, size_t len)
 	int buffer_size_bytes = len * sizeof(double);
 
 	read_buffer(capture_buffer, buffer_internal, buffer_size_bytes);
+
+	// SIM virtual clock: every double the modem pulls off the RX boundary is
+	// one sample of channel time. Advancing here (and ONLY here) makes virtual
+	// time track the modem's demod cadence — the RX bridge feeds capture_buffer
+	// as fast as the relay delivers, so the modem reads it as fast as it can
+	// decode, and the control-loop timers advance with it. No-op (one branch +
+	// relaxed load) when sim is disabled, so production rx_transfer is
+	// unaffected. See include/common/sim_clock.h.
+	if (sim_clock_enabled())
+		sim_clock_add_samples((uint64_t) len);
 
     return 0;
 }
