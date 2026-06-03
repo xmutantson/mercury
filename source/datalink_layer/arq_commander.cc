@@ -5077,7 +5077,24 @@ void cl_arq_controller::finalize_block_commander()
 				}
 				else if(!config_is_at_bottom(current_configuration, robust_enabled))
 				{
-					negotiated_configuration=config_ladder_down(current_configuration, robust_enabled);
+					// SUSTAINABLE-CONFIG HOLD (gearshift-sustainable-config-hold.md
+					// §3.1/§4.2): v1 (sack_v2_enabled==false) twin of the policy_evaluate_axis1
+					// LADDER-DOWN anchor floor. Route the down-target through
+					// break_target_with_anchor so it never drops below the highest
+					// proven-sustainable rung (anchor floor inert above the anchor; panic
+					// bypass preserved → deep-cliff escape intact). See the v2 site for the
+					// full rationale. GUARD: a down move must never go up (see v2 site).
+					int raw_down = config_ladder_down(current_configuration, robust_enabled);
+					int floored_down = break_target_with_anchor(raw_down);
+					if(config_ladder_index(floored_down) > config_ladder_index(current_configuration))
+						floored_down = current_configuration;   // anchor >= current → HOLD
+					negotiated_configuration = floored_down;
+					if(negotiated_configuration != raw_down)
+					{
+						printf("[GEARSHIFT] LADDER DOWN: anchor floor — raw %d vs last_data_viable_config %d, holding at %d\n",
+							raw_down, last_data_viable_config, negotiated_configuration);
+						fflush(stdout);
+					}
 					// Lower ceiling to prevent immediate re-upshift to the failing config.
 					// Ceiling recovery (8 good blocks) will raise it if channel improves.
 					if(supershift_proven_ceiling < 0 ||
@@ -5238,7 +5255,33 @@ void cl_arq_controller::policy_evaluate_axis1()
 		}
 		else if(!config_is_at_bottom(current_configuration, robust_enabled))
 		{
-			negotiated_configuration=config_ladder_down(current_configuration, robust_enabled);
+			// SUSTAINABLE-CONFIG HOLD (gearshift-sustainable-config-hold.md §3.1/§4.2):
+			// floor the LADDER-DOWN target at last_data_viable_config (the SAME anchor
+			// the BREAK recovery uses via break_target_with_anchor) so a success-rate
+			// downshift NEVER drops BELOW the highest proven-sustainable rung. Pre-fix
+			// this used the raw config_ladder_down floored ONLY by config_is_at_bottom
+			// (ROBUST_0), so sustained low success marched the config rung-by-rung to the
+			// floor even past a rung the anchor PROVED carries data — the collapse-to-
+			// ROBUST_0 half of the HW over-climb->collapse. break_target_with_anchor
+			// floors UP to the anchor EXCEPT under the breaks>=2 panic (where it returns
+			// raw → the descent still reaches ROBUST_0, deep-cliff escape preserved). At a
+			// high config with a low/ROBUST anchor the floor is a no-op until the descent
+			// reaches the anchor, then it HOLDS — step-down-and-hold like VARA.
+			// GUARD: a "down" move must never go UP. If the anchor sits AT/ABOVE the
+			// live config (e.g. an over-climbed config whose anchor is the live rung),
+			// the floor would return a config >= current — clamp to current (HOLD here),
+			// never re-climb into the failing config via the down path.
+			int raw_down = config_ladder_down(current_configuration, robust_enabled);
+			int floored_down = break_target_with_anchor(raw_down);
+			if(config_ladder_index(floored_down) > config_ladder_index(current_configuration))
+				floored_down = current_configuration;   // anchor >= current → HOLD, don't climb
+			negotiated_configuration = floored_down;
+			if(negotiated_configuration != raw_down)
+			{
+				printf("[GEARSHIFT] LADDER DOWN: anchor floor — raw %d vs last_data_viable_config %d, holding at %d\n",
+					raw_down, last_data_viable_config, negotiated_configuration);
+				fflush(stdout);
+			}
 			// Lower ceiling to prevent immediate re-upshift to the failing config.
 			// Ceiling recovery (8 good blocks) will raise it if channel improves.
 			if(supershift_proven_ceiling < 0 ||
@@ -7410,23 +7453,29 @@ int cl_arq_controller::test_climb_engine()
 		// Clearly-high SNR=20 dB at a LOW OFDM rung (CONFIG_4) with the anchor still
 		// at CONFIG_4 (anchor_cap=CONFIG_5). get_configuration(20-6=14) -> CONFIG_16
 		// (idx 19), MANY rungs above anchor+1 (CONFIG_5, idx 8). proven=-1 (no cap).
-		// PASS-AFTER ((1) gate): target == CONFIG_16, a multi-rung jump > anchor+1.
-		// FAIL-BEFORE (pre-(1) hard clamp): target == CONFIG_5 (anchor+1) - NO jump.
+		// PASS-AFTER ((1) gate): a multi-rung jump > anchor+1, BOUNDED to anchor+MAX_LEAP
+		// (2026-06-03: MAX_LEAP 13->4, gearshift-sustainable-config-hold.md §4.1 — so the
+		// jump from CONFIG_4 lands at CONFIG_8, not the full SNR-ideal CONFIG_16; the
+		// expectation is macro-parameterised on leap_cap). FAIL-BEFORE (pre-(1) hard
+		// clamp): target == CONFIG_5 (anchor+1) - NO jump.
 		{
 			double snr = 20.0;
 			int anchor = CONFIG_4;
 			int snr_ideal_raw = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
 			int anchor_cap = config_ladder_up_n(anchor, 1, false, false);
+			int j1_leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP, false, false);
+			int j1_expected = (config_ladder_index(snr_ideal_raw) > config_ladder_index(j1_leap_cap))
+				? j1_leap_cap : snr_ideal_raw;
 			int t_after  = retrigger_target(snr, anchor, /*proven=*/-1, /*nb=*/false, /*adaptive=*/true);
 			int t_before = retrigger_target(snr, anchor, /*proven=*/-1, /*nb=*/false, /*adaptive=*/false);
 			// sanity: the SNR-ideal really is far above anchor+1 (the jump exists).
 			check(config_ladder_index(snr_ideal_raw) > config_ladder_index(anchor_cap) + 1,
 				"J1a SNR=20 -> snr_ideal (CFG16) is MULTI-rung above anchor+1 (CFG5)",
 				config_ladder_index(snr_ideal_raw), config_ladder_index(anchor_cap));
-			// PASS-AFTER: (1) lets the jump stand at the SNR-ideal.
-			check(t_after == snr_ideal_raw && t_after == CONFIG_16,
-				"J1b PASS-AFTER: (1) gate jumps to the SNR-ideal CFG16 (multi-rung)",
-				t_after, CONFIG_16);
+			// PASS-AFTER: (1) lets the jump stand, bounded to anchor+MAX_LEAP (leap_cap).
+			check(t_after == j1_expected,
+				"J1b PASS-AFTER: (1) gate jumps multi-rung, bounded to anchor+MAX_LEAP (leap_cap)",
+				t_after, j1_expected);
 			check(config_ladder_index(t_after) > config_ladder_index(anchor_cap),
 				"J1c PASS-AFTER: the (1) target is STRICTLY above anchor+1 (a real jump)",
 				config_ladder_index(t_after), config_ladder_index(anchor_cap));
@@ -7480,29 +7529,41 @@ int cl_arq_controller::test_climb_engine()
 		}
 		
 		// J4 - supershift_proven_ceiling CAP (SAFETY #2). High SNR=20 (-> CFG16),
-		// but a prior BREAK proved CONFIG_10 the ceiling. The (1) jump must be capped
-		// at CONFIG_10 - NEVER above proven-safe - while still being a multi-rung jump
-		// (CONFIG_10 > anchor+1=CONFIG_5).
+		// but a prior BREAK proved CONFIG_10 the ceiling. The (1) jump must NEVER exceed
+		// proven-safe NOR anchor+MAX_LEAP. 2026-06-03: with MAX_LEAP=4 the leap cap
+		// (anchor+4=CONFIG_8 from CONFIG_4) binds TIGHTER than the proven CONFIG_10, so
+		// the target is min(proven, leap_cap). The SAFETY #2 INTENT (never above proven)
+		// is preserved; the assertion now checks BOTH caps (macro-parameterised).
 		{
 			double snr = 20.0;
-			int t = retrigger_target(snr, /*anchor=*/CONFIG_4, /*proven=*/CONFIG_10, false, true);
-			check(t == CONFIG_10,
-				"J4a (1) jump CAPPED at supershift_proven_ceiling (CFG10, not CFG16)",
-				t, CONFIG_10);
+			int anchor = CONFIG_4;
+			int j4_leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP, false, false);
+			int j4_expected = (config_ladder_index(CONFIG_10) < config_ladder_index(j4_leap_cap))
+				? CONFIG_10 : j4_leap_cap;   // the TIGHTER of the two caps
+			int t = retrigger_target(snr, anchor, /*proven=*/CONFIG_10, false, true);
+			check(t == j4_expected,
+				"J4a (1) jump CAPPED at min(proven_ceiling, anchor+MAX_LEAP) — never above proven-safe",
+				t, j4_expected);
 			check(config_ladder_index(t) <= config_ladder_index(CONFIG_10),
 				"J4b (1) target never exceeds the proven ceiling",
 				config_ladder_index(t), config_ladder_index(CONFIG_10));
 		}
-		
+
 		// J5 - WB/NB ceiling CAP (SAFETY #2). NB mode, high SNR=20. The NB cap
-		// (:4588-4589) pins snr_ideal to NB_CONFIG_MAX (CONFIG_14); the (1) jump must
-		// land at CONFIG_14, never above the NB ceiling.
+		// (:4588-4589) pins snr_ideal to NB_CONFIG_MAX (CONFIG_14). 2026-06-03: with
+		// MAX_LEAP=4 the leap cap (anchor+4) binds first when it is below NB_CONFIG_MAX;
+		// the (1) jump lands at min(NB_CONFIG_MAX, anchor+MAX_LEAP), never above the NB
+		// ceiling. Macro-parameterised.
 		{
 			double snr = 20.0;
-			int t = retrigger_target(snr, /*anchor=*/CONFIG_4, /*proven=*/-1, /*nb=*/true, true);
-			check(t == NB_CONFIG_MAX && t == CONFIG_14,
-				"J5 NB (1) jump CAPPED at NB_CONFIG_MAX (CFG14)",
-				t, CONFIG_14);
+			int anchor = CONFIG_4;
+			int j5_leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP, false, /*nb=*/true);
+			int j5_expected = (config_ladder_index(NB_CONFIG_MAX) < config_ladder_index(j5_leap_cap))
+				? NB_CONFIG_MAX : j5_leap_cap;
+			int t = retrigger_target(snr, anchor, /*proven=*/-1, /*nb=*/true, true);
+			check(t == j5_expected && config_ladder_index(t) <= config_ladder_index(NB_CONFIG_MAX),
+				"J5 NB (1) jump CAPPED at min(NB_CONFIG_MAX, anchor+MAX_LEAP) — never above NB ceiling",
+				t, j5_expected);
 		}
 		
 		// J6 - the jump does NOT raise the anchor (SAFETY #3, SPECULATIVE landing).
@@ -7663,23 +7724,29 @@ int cl_arq_controller::test_climb_engine()
 		// current=CONFIG_0, anchor=CONFIG_0, proposed_frame=CONFIG_1 (the +1),
 		// SNR_uplink = snr_uplink_from_suffix(14.6) (the real relayed value from the
 		// §5 example), no proven-ceiling cap. get_configuration(14.6-6.0) lands
-		// MANY rungs above CONFIG_1. PASS-AFTER: the FRAME-UP target == the SNR-ideal
-		// (multi-rung). FAIL-BEFORE (unconditional +1): CONFIG_1.
+		// MANY rungs above CONFIG_1. PASS-AFTER: the FRAME-UP target is the SNR-ideal
+		// BOUNDED to anchor+RETRIGGER_MAX_LEAP (2026-06-03: MAX_LEAP 13->4, so the
+		// elevator now jumps to min(snr_ideal, anchor+4) — still a multi-rung jump above
+		// the +1, but bounded; gearshift-sustainable-config-hold.md §4.1). FAIL-BEFORE
+		// (unconditional +1): CONFIG_1.
 		{
 			double snr = snr_uplink_from_suffix(14.6f);   // the REAL producer value
-			// expected from the SAME value the shared method uses (avoid float/double
-			// bucket drift): get_configuration(snr - SUPERSHIFT_MARGIN_DB).
-			int expected_ideal = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+			// the SHARED method's output bound: min(get_configuration(snr-margin),
+			// anchor+MAX_LEAP). expected_capped tracks RETRIGGER_MAX_LEAP.
+			int snr_ideal = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+			int leap_cap  = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, false, false);
+			int expected_capped = (config_ladder_index(snr_ideal) > config_ladder_index(leap_cap))
+				? leap_cap : snr_ideal;
 			int t_after  = frameup_target(snr, CONFIG_0, CONFIG_0, CONFIG_1, -1, /*adaptive=*/true);
 			int t_before = frameup_target(snr, CONFIG_0, CONFIG_0, CONFIG_1, -1, /*adaptive=*/false);
-			// sanity: the SNR-ideal really is multi-rung above the +1 (CONFIG_1).
-			check(config_ladder_index(expected_ideal) > config_ladder_index(CONFIG_1),
-				"FP-J2a SNR=14.6 -> snr_ideal is MULTI-rung above the +1 proposed CONFIG_1",
-				config_ladder_index(expected_ideal), config_ladder_index(CONFIG_1));
-			check(t_after == expected_ideal &&
+			// sanity: the capped SNR-ideal is still multi-rung above the +1 (CONFIG_1).
+			check(config_ladder_index(expected_capped) > config_ladder_index(CONFIG_1),
+				"FP-J2a SNR=14.6 -> the MAX_LEAP-capped snr_ideal is still MULTI-rung above the +1 CONFIG_1",
+				config_ladder_index(expected_capped), config_ladder_index(CONFIG_1));
+			check(t_after == expected_capped &&
 			      config_ladder_index(t_after) > config_ladder_index(CONFIG_1),
-				"FP-J2b PASS-AFTER: FRAME-UP elevator jumps to get_configuration(14.6-6.0) (multi-rung, not +1)",
-				config_ladder_index(t_after), config_ladder_index(expected_ideal));
+				"FP-J2b PASS-AFTER: FRAME-UP elevator jumps to min(snr_ideal, anchor+MAX_LEAP) (multi-rung, bounded)",
+				config_ladder_index(t_after), config_ladder_index(expected_capped));
 			check(t_before == CONFIG_1,
 				"FP-J2c FAIL-BEFORE proof: the pre-fix unconditional +1 yields CONFIG_1 (no jump)",
 				t_before, CONFIG_1);
@@ -7835,7 +7902,11 @@ int cl_arq_controller::test_climb_engine()
 		// (an OFDM rung — #2's sustained gate raised it after clean OFDM batches),
 		// SNR_uplink = snr_uplink_from_suffix(20.0) -> get_configuration(14)=CONFIG_16
 		// (idx19), proposed_frame=CONFIG_1, proven=-1. leap_cap =
-		// config_ladder_up_n(CONFIG_0,13)=CONFIG_13 (idx16). robust_en=true (unpinned).
+		// config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP). 2026-06-03: MAX_LEAP lowered
+		// 13->4 (gearshift-sustainable-config-hold.md §4.1), so leap_cap is now CONFIG_4
+		// (was CONFIG_13). The assertions are macro-parameterised on leap_cap so they
+		// track RETRIGGER_MAX_LEAP — the INTENT (jump bounded to anchor+MAX_LEAP) is
+		// preserved; only the numeric landing follows the macro. robust_en=true (unpinned).
 		{
 			double snr = snr_uplink_from_suffix(20.0f);
 			int proposed_frame = config_ladder_up(CONFIG_0, true, false);  // CONFIG_1
@@ -7843,17 +7914,17 @@ int cl_arq_controller::test_climb_engine()
 			int leap_cap       = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
 			int t_after  = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
 			int t_before = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/false);
-			// premise: the SNR-ideal (CONFIG_16) is ABOVE the MAX_LEAP cap (CONFIG_13)
+			// premise: the SNR-ideal (CONFIG_16) is ABOVE the MAX_LEAP cap (leap_cap)
 			// from a CONFIG_0 anchor — the cap has something to bind.
-			check(snr_ideal_raw == CONFIG_16 && leap_cap == CONFIG_13 &&
+			check(snr_ideal_raw == CONFIG_16 &&
 			      config_ladder_index(snr_ideal_raw) > config_ladder_index(leap_cap),
-				"JJ2a premise: SNR-ideal CONFIG_16 exceeds the anchor+MAX_LEAP cap (CONFIG_13)",
+				"JJ2a premise: SNR-ideal CONFIG_16 exceeds the anchor+MAX_LEAP cap (leap_cap)",
 				config_ladder_index(snr_ideal_raw), config_ladder_index(leap_cap));
-			// PASS-AFTER: OFDM anchor -> jump LICENSED, but BOUNDED to leap_cap (CONFIG_13)
+			// PASS-AFTER: OFDM anchor -> jump LICENSED, but BOUNDED to leap_cap
 			// — still a multi-rung jump above the +1 (CONFIG_1).
-			check(t_after == CONFIG_13,
-				"JJ2b PASS-AFTER: §15 OFDM-anchor jump PRESERVED but bounded to anchor+MAX_LEAP (CONFIG_13)",
-				t_after, CONFIG_13);
+			check(t_after == leap_cap,
+				"JJ2b PASS-AFTER: §15 OFDM-anchor jump PRESERVED but bounded to anchor+MAX_LEAP (leap_cap)",
+				t_after, leap_cap);
 			check(config_ladder_index(t_after) > config_ladder_index(proposed_frame) &&
 			      config_ladder_index(t_after) <= config_ladder_index(leap_cap),
 				"JJ2c PASS-AFTER: §15 target is a multi-rung jump (> +1) AND <= the MAX_LEAP cap",
@@ -7868,21 +7939,31 @@ int cl_arq_controller::test_climb_engine()
 				config_ladder_index(t_after), config_ladder_index(proposed_frame));
 		}
 
-		// JJ3 — sanity: a CONFIG_0 OFDM anchor at a gap == MAX_LEAP is UNCAPPED (the
-		// WGN:30 fast climb is materially unchanged at gaps <= 13). SNR_uplink =
-		// snr_uplink_from_suffix(14.6) -> get_configuration(8.6)=CONFIG_13 (idx16);
-		// leap_cap=CONFIG_13 -> NOT capped (identical to FP-J2b's un-capped target).
+		// JJ3 — sanity: a CONFIG_0 OFDM anchor at a gap <= MAX_LEAP is UNCAPPED (the
+		// fast climb is materially unchanged for jumps within the bound). Pick an
+		// snr_ideal that lands at-or-below leap_cap (= anchor+MAX_LEAP) so the cap does
+		// NOT bind, and assert the target equals the (uncapped) snr_ideal. Macro-
+		// parameterised: snr_ideal == leap_cap by construction (snr chosen so
+		// get_configuration(snr-margin) == leap_cap), so this tracks RETRIGGER_MAX_LEAP.
 		{
-			double snr = snr_uplink_from_suffix(14.6f);
+			int leap_cap = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
+			// Find the SNR (via the suffix mapping) whose snr_ideal == leap_cap exactly,
+			// so the gap == MAX_LEAP and the cap is at the boundary (uncapped).
+			// get_configuration is monotone in SNR; scan a fine grid for the boundary.
+			double snr = -90.0;
+			for(double s = 0.0; s <= 30.0; s += 0.1)
+			{
+				double cand = snr_uplink_from_suffix((float)s);
+				if(get_configuration(cand - SUPERSHIFT_MARGIN_DB) == leap_cap) { snr = cand; break; }
+			}
 			int snr_ideal_raw = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
-			int leap_cap      = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
 			int t_after = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
-			check(snr_ideal_raw == CONFIG_13 && leap_cap == CONFIG_13,
-				"JJ3a premise: SNR-ideal (CONFIG_13) sits exactly AT the anchor+MAX_LEAP cap (gap==13)",
+			check(snr_ideal_raw == leap_cap,
+				"JJ3a premise: SNR-ideal sits exactly AT the anchor+MAX_LEAP cap (gap==MAX_LEAP)",
 				config_ladder_index(snr_ideal_raw), config_ladder_index(leap_cap));
-			check(t_after == CONFIG_13,
-				"JJ3b PASS-AFTER: gap==MAX_LEAP is UNCAPPED (CONFIG_13) — WGN:30 fast climb unchanged at gaps<=13",
-				t_after, CONFIG_13);
+			check(t_after == leap_cap,
+				"JJ3b PASS-AFTER: gap==MAX_LEAP is UNCAPPED (leap_cap) — fast climb unchanged within the bound",
+				t_after, leap_cap);
 		}
 
 		// ================================================================
@@ -8037,11 +8118,13 @@ int cl_arq_controller::test_climb_engine()
 			{
 				int raw_target = CONFIG_16;   // SNR-SUPERSHIFT wants the top
 				double snr = snr_uplink_from_suffix(20.0f);
-				int leap_cap = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);  // CONFIG_13
+				int leap_cap = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);  // anchor+MAX_LEAP
 				int t_after = turbo_clamp_v16(raw_target, snr, CONFIG_0, true, false, /*adaptive=*/true);
-				check(t_after == CONFIG_13,
-					"K'2a PASS-AFTER: OFDM-anchor turbo PRESERVED but bounded to anchor+MAX_LEAP (CONFIG_13)",
-					t_after, CONFIG_13);
+				// 2026-06-03: bounded to anchor+MAX_LEAP (now =4 -> CONFIG_4; was 13 -> CONFIG_13).
+				// Assert against the macro-derived leap_cap so the test tracks RETRIGGER_MAX_LEAP.
+				check(t_after == leap_cap,
+					"K'2a PASS-AFTER: OFDM-anchor turbo PRESERVED but bounded to anchor+MAX_LEAP (leap_cap)",
+					t_after, leap_cap);
 				check(config_ladder_index(t_after) > config_ladder_index(CONFIG_0),
 					"K'2b PASS-AFTER: the high-SNR turbo climb is NOT broken (still a multi-rung jump above the anchor)",
 					config_ladder_index(t_after), config_ladder_index(CONFIG_0));
@@ -8090,7 +8173,7 @@ int cl_arq_controller::test_climb_engine()
 				"K''3 from the OFDM anchor the elevator jump STILL fires (multi-rung, WGN:30 climb preserved)",
 				config_ladder_index(t), config_ladder_index(CONFIG_0));
 			check(t == config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false),
-				"K''4 the preserved jump is bounded to anchor+MAX_LEAP (CONFIG_13)",
+				"K''4 the preserved jump is bounded to anchor+MAX_LEAP (=4 -> CONFIG_4; macro-tracked)",
 				t, config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false));
 		}
 
@@ -8498,6 +8581,143 @@ int cl_arq_controller::test_climb_engine()
 			// Restore production-default test state for any later additions.
 			break_drop_step = 1;
 			breaks_since_last_data_success = 0;
+		}
+
+		// ================================================================
+		// Part R — SUSTAINABLE-CONFIG HOLD (gearshift-sustainable-config-hold.md
+		// §7.1). The HW Muething campaign (muething_results.json @730ffca) PROVED the
+		// real bottleneck: the gearshift OVER-CLIMBs (CONFIG_0 -> CONFIG_13 in one leap,
+		// because RETRIGGER_MAX_LEAP=13 == the whole OFDM tier) then COLLAPSES to ROBUST_0
+		// (the un-anchored LADDER-DOWN marches to the floor; the panic-jump bypasses the
+		// anchor) — it never finds + HOLDS a sustainable mid config. Two fixes, both
+		// read-time discipline on the EXISTING anchor:
+		//   Component 1: RETRIGGER_MAX_LEAP 13 -> 4 (bound the speculative leap to
+		//                anchor+4, climb prove-as-it-goes).
+		//   Component 2: route LADDER-DOWN through break_target_with_anchor (step-down to
+		//                the proven anchor and HOLD, never collapse below it).
+		// R drives the REAL primitives (supershift_retrigger_target + config_ladder_down +
+		// break_target_with_anchor) — the SAME calls production makes. FAIL-BEFORE models
+		// pre-fix as MAX_LEAP=13 (R0) and the un-floored config_ladder_down (R3/R4).
+		// ================================================================
+		{
+			robust_enabled = YES;          // unpinned `-R` cascade (full ladder)
+			narrowband_enabled = NO;
+			optimizer_disabled = true;     // optimizer_is_in_control()==false
+			supershift_proven_ceiling = -1;
+
+			// ---- Component 1: the bounded promotion leap (the over-climb fix) ----
+			// R0: from a CONFIG_0 OFDM anchor at a high EVM-SNR (snr_ideal=CONFIG_16),
+			// the elevator leap is now bounded to anchor+RETRIGGER_MAX_LEAP. POST-FIX
+			// (MAX_LEAP=4): CONFIG_4. FAIL-BEFORE (MAX_LEAP=13): CONFIG_13 — the HW
+			// over-climb. Drives the REAL supershift_retrigger_target.
+			int r_leap_now = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
+			int r_leap_old = config_ladder_up_n(CONFIG_0, /*the pre-fix 13*/13, true, false);
+			int r_t = supershift_retrigger_target(/*snr_ideal=*/CONFIG_16,
+				/*snr_uplink=*/snr_uplink_from_suffix(20.0f), /*anchor=*/CONFIG_0,
+				/*optimizer_owns=*/false, /*robust_en=*/true, /*nb=*/false);
+			check(r_leap_old == CONFIG_13,
+				"R0a FAIL-BEFORE proof: the pre-fix MAX_LEAP=13 leap from CONFIG_0 reaches CONFIG_13 (the HW over-climb)",
+				r_leap_old, CONFIG_13);
+			check(r_t == r_leap_now,
+				"R0b PASS-AFTER: the leap from a CONFIG_0 anchor is bounded to anchor+MAX_LEAP (=4 -> CONFIG_4, not CONFIG_13)",
+				r_t, r_leap_now);
+			check(config_ladder_index(r_t) < config_ladder_index(r_leap_old),
+				"R0c PASS-AFTER: the bounded leap lands STRICTLY below the pre-fix CONFIG_13 over-climb",
+				config_ladder_index(r_t), config_ladder_index(r_leap_old));
+
+			// R1: the bounded leap is STILL a real multi-rung climb (> anchor+1), not
+			// lobotomized to the +1 ladder — the clean-channel climb is preserved, just
+			// in bounded steps.
+			int r_anchor_cap = config_ladder_up_n(CONFIG_0, 1, true, false);  // CONFIG_1
+			check(config_ladder_index(r_t) > config_ladder_index(r_anchor_cap),
+				"R1 PASS-AFTER: the bounded leap is still multi-rung (> anchor+1) — the climb is preserved, just prove-as-it-goes",
+				config_ladder_index(r_t), config_ladder_index(r_anchor_cap));
+
+			// R2: DEEP-CLIFF INERT — at a ROBUST anchor the §15 is_ofdm_config(anchor)
+			// gate is closed, so the leap is clamped to anchor+1 regardless of MAX_LEAP
+			// (Component 1 cannot change the WGN:-10 anti-thrash). Passes before & after.
+			int r_t_cliff = supershift_retrigger_target(/*snr_ideal=*/CONFIG_16,
+				/*snr_uplink=*/snr_uplink_from_suffix(1.0f), /*anchor=*/ROBUST_2,
+				/*optimizer_owns=*/false, /*robust_en=*/true, /*nb=*/false);
+			check(r_t_cliff == config_ladder_up_n(ROBUST_2, 1, true, false) &&
+			      r_t_cliff == CONFIG_0,
+				"R2 deep-cliff INERT: a ROBUST anchor clamps the leap to anchor+1 (CONFIG_0) regardless of MAX_LEAP",
+				r_t_cliff, CONFIG_0);
+
+			// ---- Component 2: the anchor-floored LADDER-DOWN (the collapse fix) ----
+			// The production LADDER-DOWN target is now
+			//   floored = break_target_with_anchor(config_ladder_down(current))
+			//   if(idx(floored) > idx(current)) floored = current   // never go UP
+			// Model that here and drive the REAL config_ladder_down +
+			// break_target_with_anchor (the SAME primitives at :5241 / :5080).
+			auto ladder_down_floored = [&](int current, int anchor, int breaks) -> int {
+				last_data_viable_config = anchor;
+				breaks_since_last_data_success = breaks;
+				int raw_down = config_ladder_down(current, robust_enabled);
+				int floored  = break_target_with_anchor(raw_down);
+				if(config_ladder_index(floored) > config_ladder_index(current))
+					floored = current;
+				return floored;
+			};
+
+			// R3: LADDER-DOWN from CONFIG_8 with anchor=CONFIG_4 (not panic) steps to
+			// CONFIG_7 (one rung) — and crucially NEVER below CONFIG_4 across a descent.
+			// FAIL-BEFORE (raw config_ladder_down, no floor): the descent would march to
+			// CONFIG_0 / below the proven anchor (the HW collapse).
+			{
+				int r3_after = ladder_down_floored(CONFIG_8, CONFIG_4, /*breaks=*/0);
+				int r3_before = config_ladder_down(CONFIG_8, robust_enabled);  // raw, no floor
+				check(r3_after == CONFIG_7,
+					"R3a PASS-AFTER: LADDER-DOWN from CONFIG_8 steps ONE rung to CONFIG_7 (anchor floor inert above the anchor)",
+					r3_after, CONFIG_7);
+				// walk the descent down to prove it HOLDS at the anchor (CONFIG_4),
+				// never collapsing below it.
+				int cur = CONFIG_8;
+				for(int i = 0; i < 10; i++)
+					cur = ladder_down_floored(cur, CONFIG_4, /*breaks=*/0);
+				check(cur == CONFIG_4,
+					"R3b PASS-AFTER: a sustained LADDER-DOWN descent HOLDS at the proven anchor CONFIG_4 (no collapse to ROBUST_0)",
+					cur, CONFIG_4);
+				// FAIL-BEFORE: the un-floored raw descent would reach CONFIG_0 (below the
+				// anchor) — the HW collapse signature.
+				int cur_raw = CONFIG_8;
+				for(int i = 0; i < 10; i++)
+					if(!config_is_at_bottom(cur_raw, robust_enabled))
+						cur_raw = config_ladder_down(cur_raw, robust_enabled);
+				check(config_ladder_index(cur_raw) < config_ladder_index(CONFIG_4),
+					"R3c FAIL-BEFORE proof: the un-floored LADDER-DOWN marches BELOW the anchor (collapses past CONFIG_4)",
+					config_ladder_index(cur_raw), config_ladder_index(CONFIG_4));
+			}
+
+			// R4: LADDER-DOWN AT the anchor (current==anchor==CONFIG_4) HOLDS at CONFIG_4
+			// (the floored target floors UP to the anchor, then the never-go-UP guard
+			// keeps it at current) — the link rests at the proven sustainable rung
+			// instead of stepping to CONFIG_3.
+			{
+				int r4 = ladder_down_floored(CONFIG_4, CONFIG_4, /*breaks=*/0);
+				check(r4 == CONFIG_4,
+					"R4 PASS-AFTER: LADDER-DOWN at the anchor HOLDS (CONFIG_4), does not step below the proven rung",
+					r4, CONFIG_4);
+			}
+
+			// R5: SAFETY — under the breaks>=2 panic, break_target_with_anchor returns
+			// the raw target unclamped, so the LADDER-DOWN floor does NOT trap the link
+			// above the floor at a genuine crash — the deep-cliff escape (panic ->
+			// ROBUST_0) is preserved on the LADDER-DOWN path too. From CONFIG_4 with a
+			// ROBUST anchor under panic, the raw down (CONFIG_3) is returned unfloored.
+			{
+				int r5 = ladder_down_floored(CONFIG_4, /*anchor=*/CONFIG_4, /*breaks=*/2);
+				// panic bypass: break_target_with_anchor(config_ladder_down(CONFIG_4)=CONFIG_3)
+				// returns CONFIG_3 (raw, anchor floor bypassed); the never-go-UP guard is a
+				// no-op (CONFIG_3 < CONFIG_4). The descent proceeds toward the floor.
+				check(r5 == CONFIG_3,
+					"R5 SAFETY: under breaks>=2 panic the LADDER-DOWN floor is bypassed (CONFIG_3), descent toward the floor preserved",
+					r5, CONFIG_3);
+			}
+
+			// Restore production-default test state.
+			breaks_since_last_data_success = 0;
+			last_data_viable_config = ROBUST_0;
 		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",

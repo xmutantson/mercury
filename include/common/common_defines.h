@@ -388,12 +388,25 @@ CONFIG_16 (5664.7 bps).
 // a marginal-OFDM channel (CONFIG_0 holds but CONFIG_13 does not) cannot overshoot the
 // whole ladder in one shot — it leaps in bounded steps as the anchor ratchets up, with
 // the proven-ceiling cap (arq_commander.cc:4591-4592 / elevator_target_from_snr) and
-// the §10 anchor-demotion backstopping any residual overshoot. TUNABLE: chosen as the
-// smallest value that preserves the existing high-SNR multi-rung climb (a CONFIG_4
-// anchor still reaches CONFIG_16 in one leap = gap 12; a CONFIG_0 anchor still reaches
-// CONFIG_13 = gap 13), so the WGN:30 fast climb is materially unchanged (≤2 bounded
-// leaps from a low OFDM anchor) while a pathological jump is bounded.
-#define RETRIGGER_MAX_LEAP 13
+// the §10 anchor-demotion backstopping any residual overshoot.
+//
+// 2026-06-03 (gearshift-sustainable-config-hold.md §2/§4.1): lowered 13 -> 4. The
+// HW Muething campaign (muething_results.json, base 730ffca) PROVED 13 is a non-bound:
+// from the FIRST OFDM anchor CONFIG_0 (ladder idx 3) it permits a leap to idx 3+13=16
+// = CONFIG_13, i.e. the whole OFDM tier. At mid-SNR (wgn10/wgn20) the anchor
+// legitimately reaches CONFIG_0 but the EVM-SNR (post-EQ, saturates ~14.5, over-reports
+// the OFDM-data-viable rate) maps snr_ideal several rungs too high, so the link LEAPS
+// CONFIG_0->CONFIG_13, CONFIG_13 cannot sustain mid-SNR -> fails -> collapses to ROBUST_0
+// (the over-climb->collapse the §15/§16/§17 init-poison fixes did NOT catch: they bound
+// the leap only at a ROBUST anchor / the deep cliff, not from a legitimately-low OFDM
+// anchor). The old "13 = smallest value that preserves the one-shot clean climb"
+// rationale was the bug — chosen NOT to bound the climb, it therefore did not bound the
+// over-climb. 4 makes the climb PROVE-as-it-goes: a leap probes at most anchor+4 (≈ one
+// constellation+code-rate step), and the next leap fires only after that band delivers
+// clean batches and ratchets the anchor (§11 N=2 sustained gate). Clean still reaches
+// CONFIG_16 in a few bounded leaps (CONFIG_0->4->8->12->16), amortized over a bulk
+// transfer. TUNABLE (HW re-measure is the arbiter; try 5/6 if clean climbs too slowly).
+#define RETRIGGER_MAX_LEAP 4
 
 #define YES 1
 #define NO 0
