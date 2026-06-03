@@ -26,6 +26,17 @@
 #define AUDIO_SUBSYSTEM_COREAUDIO 4
 #define AUDIO_SUBSYSTEM_OSS 5
 #define AUDIO_SUBSYSTEM_AAUDIO 6
+// Device-free software channel backend (SIM). Selected with "-x sim".
+// Replaces the WASAPI/ALSA capture+playback device threads with two
+// localhost TCP socket-bridge threads that connect to an external channel
+// relay (tools/sim_channel_relay.py). The relay sums both peers' TX
+// passband, applies AWGN at a fixed SNR (+ optional bursty sample dropout
+// and Watterson fading), and fans the result back to both peers' RX. This
+// drives sustained channel loss through the FULL ARQ loop with no audio
+// hardware, so gearshift over-climb->collapse + deep-SNR STALL reproduce
+// deterministically at CPU speed. See tools/sim_arq_channel.py and
+// mercury/fact-documents/sim-arq-channel.md.
+#define AUDIO_SUBSYSTEM_SIM 7
 
 #define LEFT 0
 #define RIGHT 1
