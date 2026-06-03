@@ -8853,6 +8853,131 @@ void cl_arq_controller::test_fire_policy_axis3(int kind)
 	}
 }
 
+// ONE-WAY-TRANSFER STALL regression (data-flow-snr-measurements.md §9, CLI
+// --test-oneway-stall). Replays the REAL should_offer_role_switch() decision —
+// the gate the idle SWITCH_ROLE arm in process_buffer_data_commander()
+// (arq_commander.cc:9229-9242) now uses — plus the REAL emergency-BREAK gate
+// predicate, to prove the fix (a) stops the mid-transfer role swap on a one-way
+// bulk transfer, (b) preserves bidirectional turn-taking, and (c) does NOT
+// suppress genuine dead-link detection. In-process; no audio / RF. The wire-level
+// whole-message delivery is the parent's loopback harness
+// (tools/oneway_transfer_loopback.py).
+int cl_arq_controller::test_oneway_stall()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-ONEWAY] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-ONEWAY] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	const double SENTINEL = -99.9;   // ctor downlink sentinel (arq_common.cc:142),
+	                                  // i.e. a ONE-WAY session: the downlink has
+	                                  // never carried return data (the canonical
+	                                  // producer writes SNR_downlink only as
+	                                  // RESPONDER, arq_common.cc:6213).
+
+	// ----------------------------------------------------------------
+	// OW1 — FAIL-BEFORE: one-way transfer, app JUST fed data (transient empty
+	// FIFO between batches). The idle SWITCH_ROLE must NOT be offered, else the
+	// CMD swaps to RESPONDER mid-transfer and the receiver (no TX data) stalls
+	// the link. Pre-fix the idle path armed UNCONDITIONALLY (no guard) → it would
+	// have swapped. With ROLE_OFFER_APP_IDLE_MS=1500, an idle of 50 ms (one tick
+	// after the app fed a chunk) gates the offer OFF.
+	// ----------------------------------------------------------------
+	bool ow1 = should_offer_role_switch(/*data_socket_idle_ms=*/50, SENTINEL);
+	check(ow1 == false,
+		"OW1 one-way + app-just-fed (idle 50ms) does NOT offer role switch (no mid-transfer swap)",
+		ow1 ? 1 : 0, 0);
+
+	// OW1b — boundary: just under the guard still does NOT offer.
+	bool ow1b = should_offer_role_switch(ROLE_OFFER_APP_IDLE_MS - 1, SENTINEL);
+	check(ow1b == false,
+		"OW1b one-way + app idle just under guard does NOT offer",
+		ow1b ? 1 : 0, 0);
+
+	// ----------------------------------------------------------------
+	// OW2 — PASS-AFTER (transfer complete): one-way, app has gone quiet for the
+	// full guard (whole message handed to Mercury and delivered). NOW the floor
+	// IS offered, so bidirectional turn-taking after a one-way send still works.
+	// ----------------------------------------------------------------
+	bool ow2 = should_offer_role_switch(/*data_socket_idle_ms=*/2000, SENTINEL);
+	check(ow2 == true,
+		"OW2 one-way + app quiet >= guard offers role switch (transfer done; turn-taking ok)",
+		ow2 ? 1 : 0, 1);
+
+	// OW2b — boundary: exactly at the guard offers (>= comparison).
+	bool ow2b = should_offer_role_switch(ROLE_OFFER_APP_IDLE_MS, SENTINEL);
+	check(ow2b == true,
+		"OW2b one-way + app idle == guard offers (>= boundary)",
+		ow2b ? 1 : 0, 1);
+
+	// ----------------------------------------------------------------
+	// OW3 — bidirectional PRESERVED: the peer demonstrably sends return data
+	// (SNR_downlink > -90), so responsive turn-taking is UNCHANGED — the floor is
+	// offered even on a transient app-idle gap (the §9.3 degenerate reply case is
+	// not deadlocked). Drive a real measured downlink SNR.
+	// ----------------------------------------------------------------
+	bool ow3 = should_offer_role_switch(/*data_socket_idle_ms=*/50, /*snr_downlink=*/12.0);
+	check(ow3 == true,
+		"OW3 bidirectional (SNR_downlink=+12) offers on transient idle (turn-taking unchanged)",
+		ow3 ? 1 : 0, 1);
+
+	// OW3b — bidirectional boundary: just above the -90 threshold counts as
+	// proven-bidirectional and offers immediately.
+	bool ow3b = should_offer_role_switch(/*data_socket_idle_ms=*/0, /*snr_downlink=*/-89.9);
+	check(ow3b == true,
+		"OW3b SNR_downlink just > -90 treated as bidirectional (offers immediately)",
+		ow3b ? 1 : 0, 1);
+
+	// ----------------------------------------------------------------
+	// OW4 — DEAD-LINK DETECTION INTACT: the idle-SWITCH gate must not be able to
+	// suppress a genuine dead-link emergency BREAK. The REAL BREAK trigger
+	// (arq_commander.cc:3472-3476) is:
+	//   emergency_nack_count >= emergency_nack_threshold
+	//   && !config_is_at_bottom(current_configuration, robust_enabled)
+	//   && !emergency_break_active && turboshift_phase==TURBO_DONE
+	//   && gear_shift_on==YES
+	// — NONE of which is should_offer_role_switch() or either of its inputs
+	// (app-idle / SNR_downlink). Assert the BREAK gate fires on a real total-
+	// block-failure observable EVEN while the idle-offer is gated OFF (one-way,
+	// app just fed). This proves the fix is orthogonal to dead-link teardown.
+	// ----------------------------------------------------------------
+	robust_enabled = NO;
+	narrowband_enabled = NO;
+	gear_shift_on = YES;
+	turboshift_phase = TURBO_DONE;
+	emergency_break_active = 0;
+	emergency_nack_threshold = 3;          // production default (arq_common.cc:401)
+	current_configuration = CONFIG_10;     // a mid OFDM config (NOT at bottom)
+	// The idle-offer is suppressed in this exact state (one-way + app just fed):
+	bool offer_suppressed = !should_offer_role_switch(/*idle=*/50, SENTINEL);
+	check(offer_suppressed,
+		"OW4a idle role-offer is gated OFF in the dead-link scenario (one-way, app just fed)",
+		offer_suppressed ? 1 : 0, 1);
+	// A genuine dead link: consecutive total block failures reach threshold.
+	emergency_nack_count = emergency_nack_threshold;
+	bool break_gate = (emergency_nack_count >= emergency_nack_threshold)
+	               && !config_is_at_bottom(current_configuration, robust_enabled)
+	               && !emergency_break_active
+	               && turboshift_phase == TURBO_DONE
+	               && gear_shift_on == YES;
+	check(break_gate == true,
+		"OW4b genuine dead-link BREAK gate FIRES regardless of the idle-SWITCH gate (teardown intact)",
+		break_gate ? 1 : 0, 1);
+	emergency_nack_count = 0;              // restore
+
+	printf("[TEST-ONEWAY] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES PRESENT",
+		failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 void cl_arq_controller::process_buffer_data_commander()
 {
 	int data_read_size;
@@ -8903,6 +9028,18 @@ void cl_arq_controller::process_buffer_data_commander()
 		             || (sack_v2_enabled && retransmit_count > 0);
 		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && stage_ok)
 		{
+			// ONE-WAY-TRANSFER STALL fix (data-flow-snr-measurements.md §9.4
+			// defect #2): the app fed more data and we are staging a new batch, so
+			// the local node is NOT idle — cancel any pending idle SWITCH_ROLE
+			// offer. Without this the switch_role_timer kept counting across the
+			// data gap and the next idle moment read a stale (already-elapsed)
+			// timer and swapped roles almost instantly.
+			if(switch_role_timer.counting==YES)
+			{
+				switch_role_timer.stop();
+				switch_role_timer.reset();
+			}
+
 			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 			// payload budget. In v1 (default) identical to legacy macro; in v2
 			// loses 1 byte to the batch_seq_id field.
@@ -9228,16 +9365,46 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
-			if(switch_role_timer.counting==NO)
+			// ONE-WAY-TRANSFER STALL fix (data-flow-snr-measurements.md §9).
+			// Only OFFER the floor to the peer (idle SWITCH_ROLE) once the LOCAL
+			// app has genuinely stopped feeding TX data. On a one-way bulk
+			// transfer (SNR_downlink stuck at the -99.9 sentinel — the canonical
+			// producer writes SNR_downlink only as RESPONDER, arq_common.cc:6213)
+			// a momentarily-empty FIFO between batches must NOT swap roles: the
+			// peer has no data to send, so the swap stalls the transfer (zeroed
+			// every SNR3k ≤ +2.4 cell, run ac537ec8). should_offer_role_switch()
+			// gates on the app-data-socket idle time (tcp_socket_data.timer,
+			// reset on every app chunk at arq_common.cc:2555); a proven-
+			// bidirectional session (SNR_downlink > -90) keeps the responsive
+			// existing turn-taking. The turboshift SWITCH_ROLE sites (:3894/:3905)
+			// and the SWITCH_ROLE-ACK handler (:4400) are NOT on this path and are
+			// unchanged; real dead-link detection (link_timer, emergency BREAK) is
+			// independent of this timer (§9.4/§9.5).
+			if(should_offer_role_switch(
+			       tcp_socket_data.timer.get_elapsed_time_ms(),
+			       measurements.SNR_downlink))
 			{
-				switch_role_timer.reset();
-				switch_role_timer.start();
+				if(switch_role_timer.counting==NO)
+				{
+					switch_role_timer.reset();
+					switch_role_timer.start();
+				}
+				else if(switch_role_timer.get_elapsed_time_ms()>switch_role_timeout)
+				{
+					switch_role_timer.stop();
+					switch_role_timer.reset();
+					add_message_control(SWITCH_ROLE);
+				}
 			}
-			else if(switch_role_timer.get_elapsed_time_ms()>switch_role_timeout)
+			else if(switch_role_timer.counting==YES)
 			{
+				// App is still feeding (one-way transfer in progress): cancel a
+				// pending idle-offer so a transient gap cannot accumulate toward a
+				// stale fire (§9.4 defect #2 — the timer was previously never reset
+				// when data resumed, so the NEXT gap read an already-elapsed timer
+				// and swapped roles almost instantly).
 				switch_role_timer.stop();
 				switch_role_timer.reset();
-				add_message_control(SWITCH_ROLE);
 			}
 		}
 	}

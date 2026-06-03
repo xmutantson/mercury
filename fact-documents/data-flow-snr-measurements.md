@@ -7,9 +7,14 @@ SNR-sentinel PRODUCER fix (climb follow-up #1, "Option A", shipped on
 breaks the bootstrap deadlock that kept the §1.5 producer from EVER running
 on the CMD's forward pattern-ACK climb. **§8 (2026-05-31, READ+PLAN ONLY, NO
 code shipped) audits the PROPOSED "suffix the TRUE OFDM SNR" climb-throttle fix
-and finds the literal swap INFEASIBLE — see §8 verdict.** Every future change
+and finds the literal swap INFEASIBLE — see §8 verdict.** **§9 (2026-06-03, fix/oneway-stall, base `0c75cc2`)
+audits + fixes the ONE-WAY-TRANSFER STALL: the idle SWITCH_ROLE timer in
+`process_buffer_data_commander()` swaps roles mid-bulk-transfer on a transient-empty
+TX FIFO, and the never-populated `SNR_downlink` (-99.9 sentinel) is the one-way
+MARKER (NOT a dead-link signal). See §9.** Every future change
 that writes or reads either field — OR that touches `turbo_snr_ack_enabled` (the
-decode-branch selector that gates the §1.5 producer) — MUST update this document.
+decode-branch selector that gates the §1.5 producer) — OR the idle SWITCH_ROLE timer
+(§9) — MUST update this document.
 
 **The bootstrap deadlock (follow-up #1b, the §1.5 producer never ran)**: the
 §1.5 producer at `arq_common.cc:5555` runs ONLY inside
@@ -843,3 +848,270 @@ caveat is acceptable (the "one rung then jump" ordering). The parent must wire-t
   `arq.h:740-741`), §18 / Part N (the data-ACK SNR-leak bug — why Plan B is rejected).
 - This doc §1.5/§1.7/§7 (the existing CMD-side §1.5 producer + §1.7 enablement the fix builds
   on; the fix changes only the VALUE that arrives at `arq_common.cc:5576`, not the site).
+
+---
+
+## §9 ONE-WAY-TRANSFER STALL — idle SWITCH_ROLE on the never-populated downlink (2026-06-03, fix/oneway-stall, base `0c75cc2`)
+
+**Status**: SHIPPED on `fix/oneway-stall` @ `0c75cc2`+ (NOT pushed). This section
+audits a SWITCH_ROLE consumer the §1–§8 work never covered: the **idle role-swap
+timer** in `process_buffer_data_commander()`. It is the dominant throughput-killer
+on a one-way bulk transfer (the real Winlink message scenario), zeroing every
+SNR3k ≤ +2.4 cell in the like-for-like VARA measurement (forensics run
+`ac537ec8`). **NOTE ON LINE NUMBERS**: §1–§8 cite a later sibling commit; this
+section cites the `0c75cc2` worktree directly (the canonical SNR producer is at
+`arq_common.cc:6210/6213` here, not `:6087`). The STRUCTURE is identical.
+
+### §9.0 Symptom (from `ac537ec8` CMD `--log` forensics)
+
+A one-way bulk transfer (CMD streams a large message, RSP sends no return data):
+at SNR3k ≤ +2.4 the transfer stalls after < 300 bytes. Log signature:
+`nReSent_data=0`, `nAcked=nSent` (the uplink is HEALTHY — every sent frame is
+ACKed, no retransmits), then a `SWITCH_ROLE` control frame, then the link
+thrashes / tears down. The CMD's `measurements.SNR_downlink` reads `-99.90`
+throughout.
+
+### §9.1 ROOT CAUSE — the idle SWITCH_ROLE timer fires mid-transfer
+
+**The `-99.90` is NOT read by any dead-link branch.** Walking §2's consumer list,
+`SNR_downlink` is read ONLY at §2.4 (SET_CONFIG SNR_BASED — DEAD under the shipped
+`SUCCESS_BASED_LADDER` default, `arq_common.cc:328`), §2.6 (telemetry), §2.8 (RSP
+reverse pack). **None declares a dead link.** So the trigger is NOT "read
+SNR_downlink → conclude dead." The `-99.90` is the *marker* of a one-way session,
+not the *cause* of the teardown.
+
+**The actual trigger is the idle role-swap timer**, `process_buffer_data_commander()`
+(`arq_commander.cc:9229-9242`):
+
+```
+else if(block_under_tx==NO && message_batch_counter_tx==0
+        && get_nOccupied_messages()==0 && messages_control.status==FREE)
+{
+    if(switch_role_timer.counting==NO) { switch_role_timer.reset(); switch_role_timer.start(); }
+    else if(switch_role_timer.get_elapsed_time_ms()>switch_role_timeout)
+    { switch_role_timer.stop(); switch_role_timer.reset(); add_message_control(SWITCH_ROLE); }
+}
+```
+
+Causal chain on a one-way transfer:
+1. CMD sends a batch; RSP ACKs it cleanly (`nAcked=nSent`, `nReSent_data=0`).
+2. `finalize_block_commander()` (`arq_commander.cc:4817`) sets `block_under_tx=NO`
+   (`:4828`) after the clean batch ACK.
+3. If the TX FIFO is momentarily empty (the app hasn't fed the next chunk THIS tick,
+   or the whole message is delivered), the loop falls into the `:9229` branch and
+   ARMS `switch_role_timer`.
+4. After `switch_role_timeout` of continuous empty-FIFO, SWITCH_ROLE is queued
+   (`:9240`). **At ROBUST_0 `switch_role_timeout == 200 ms`** (`arq_common.cc:1441-1442`:
+   robust configs shorten it from the 1000/1500 ms default to 200 ms). At a deep-SNR
+   cell each MFSK batch is slow and the app/FIFO easily idles > 200 ms between
+   batches → SWITCH_ROLE fires DURING the transfer.
+5. The CMD swaps to RESPONDER (`arq_commander.cc:4431` `set_role(RESPONDER)` in the
+   SWITCH_ROLE-ACK handler). The new "commander" is the original RECEIVER, which has
+   **no data to send** (one-way). The transfer stalls; the role-restoration watchdog
+   (`update_status()`, `arq_common.cc:2137`, role restore to `original_role` after
+   `watchdog_timeout`) and the idle timer then oscillate → thrash.
+
+**Why `SNR_downlink` stays `-99.90` (confirms one-way)**: the canonical producer
+writes `SNR_downlink` ONLY when `this->role == RESPONDER` (`arq_common.cc:6211-6213`):
+```
+measurements.SNR_uplink = received_message_stats.SNR;        // all roles
+if(this->role == RESPONDER) measurements.SNR_downlink = received_message_stats.SNR;
+```
+A COMMANDER that never receives an LDPC DATA frame (one-way transfer → no return
+data → it only decodes MFSK ACK suffixes, never LDPC) never runs this as RESPONDER,
+so `SNR_downlink` sits at the ctor sentinel `-99.9` (`arq_common.cc:142`) for the
+whole session. **`-99.90` = "the downlink has never carried return data" = one-way,
+NOT "dead link."** This is the §9 hazard state: a sentinel that the IDLE-SWITCH path
+implicitly conflates with "I'm done; offer the floor to the peer."
+
+### §9.2 §5 audit — the five questions for `switch_role_timer` + the idle SWITCH_ROLE decision
+
+**Q1 Producers (writes) of `switch_role_timer`** (the new shared state the fix touches):
+- `arq_commander.cc:9233-9234` — `reset()`+`start()` when first idle (arm).
+- `arq_commander.cc:9238-9239` — `stop()`+`reset()` when it fires SWITCH_ROLE.
+- (Ctor: `cl_timer()` → `counting=NO`, fields 0, `timer.cc:100-107`.)
+- **The fix ADDS one producer**: a `switch_role_timer.reset()` on the data-staging
+  path (`arq_commander.cc:8904` branch) so a transient idle gap does not accumulate
+  toward a stale fire (see §9.4 defect #2).
+
+**Q2 Consumers (reads) of `switch_role_timer`**:
+- `arq_commander.cc:9231` (`counting==NO`), `:9236` (`get_elapsed_time_ms()>switch_role_timeout`).
+  These are the ONLY two reads in the whole tree (verified: grep `switch_role_timer`
+  → only `arq_commander.cc:9231/9233/9234/9238/9239`). No other layer reads it.
+
+**Q1' Producers of the DOWNLINK-IDLE signal the fix newly consumes** (`tcp_socket_data.timer`):
+- `arq_common.cc:2544` start-on-accept; `:2555` `start()` (reset) on every chunk
+  RECEIVED from the app's data socket; `:2622/:2642/:2653` start-on-reaccept.
+- `tcp_socket_data.timeout_ms` = `INFINITE_` by default (`datalink_config.cc:38`),
+  so the EXISTING `:2625` "client quiet → flush" branch is DISABLED by default — but
+  the timer itself still RUNS and is reset on every received chunk regardless of
+  `timeout_ms`. The fix READS `tcp_socket_data.timer.get_elapsed_time_ms()` (time
+  since the app last fed TX bytes); it does NOT change `timeout_ms` or the `:2625`
+  branch.
+
+**Q2' Consumers of `tcp_socket_data.timer`**: `:2542` (`counting`), `:2626`
+(`get_elapsed_time_ms()>=timeout_ms`, gated `!=INFINITE_` ⇒ off by default). The fix
+adds ONE read at `arq_commander.cc:9229` (the idle-SWITCH gate). No write.
+
+**Q3 Valid states (before any producer writes)**:
+- `switch_role_timer`: `counting=NO`, elapsed 0 at session start. First idle arms it.
+- `tcp_socket_data.timer`: started at data-socket accept (`:2544`), so by the time the
+  link is CONNECTED and data flows it is ALWAYS counting; elapsed = ms since last app
+  chunk. On a transfer that has just staged a batch, elapsed is small; on a transfer
+  whose app has stopped feeding (message fully handed to Mercury), elapsed grows.
+  **Edge**: if the FIFO is FULL, `:2550` backpressure skips `receive()` so the timer
+  is not reset — BUT the idle-SWITCH path (`:9229`) requires a DRAINED FIFO
+  (`block_under_tx==NO`, no occupied msgs), and a drained FIFO satisfies `:2550`'s
+  room check, so the SAME tick pulls any pending app data (resetting the timer)
+  in `process_main()` (`:2540`) BEFORE `process_messages()`→
+  `process_buffer_data_commander()` (`:2729`/`:3026`) runs. The two conditions are
+  complementary: the decision point only reads a grown timer when the app GENUINELY
+  has no more data.
+
+**Q4 Invariants the consumers assume**:
+- The idle-SWITCH consumer (`:9229`) assumed: "`block_under_tx==NO` + empty queues ⇒
+  I am DONE sending ⇒ offer the floor to the peer (turn-taking)." **This invariant is
+  FALSE on a one-way bulk transfer with a transient-empty FIFO** — the node is NOT
+  done; the app just hasn't fed the next chunk this instant. That false invariant IS
+  the bug.
+- The role-swap turn-taking design (the SWITCH_ROLE handler, `arq_commander.cc:4400`;
+  the RSP side, `arq_responder.cc:1328-1348` transitions the ex-RSP to
+  `TRANSMITTING_DATA`) assumes the peer may have queued data to send. On a one-way
+  transfer the peer NEVER has data → the swap is pure loss.
+
+**Q5 What the fix changes for each consumer**:
+- It tightens the idle-SWITCH ARM condition (`:9229`) so the timer only arms when the
+  app data socket has ALSO gone quiet (`tcp_socket_data.timer` elapsed past a guard).
+  The two reads at `:9231/:9236` are unchanged in form; they now run only when the
+  node is genuinely done. **Bidirectional turn-taking is PRESERVED**: when the app
+  stops feeding (message complete), the data-socket timer grows past the guard and
+  the floor IS offered — exactly when a bidirectional peer would want it.
+- It adds `switch_role_timer.reset()` on the staging path so the idle window is
+  measured from the LATEST idle moment (defect #2), not a stale first-idle start.
+
+### §9.3 Why NOT "just gate on SNR_downlink == -99.9"
+
+The task framed the signal as the `-99.90` downlink sentinel. Gating the idle-SWITCH
+PURELY on `SNR_downlink <= -90` (never swap on a one-way session) would FIX the stall
+but BREAK bidirectional turn-taking in one degenerate case: a session where the peer
+wants to reply but has not YET sent anything (so `SNR_downlink` is still `-99.9`). In
+that case the peer can only get the floor via the CMD's idle SWITCH_ROLE; a pure
+sentinel gate would deadlock the reply. The data-socket-quiet gate (§9.4) is the
+correct root-cause condition: it offers the floor exactly when the LOCAL app is done,
+regardless of one-way vs two-way, so the reply path still works. The `-99.9` sentinel
+is retained as a DEFENSE-IN-DEPTH term (see §9.4): a one-way session (sentinel) uses
+the FULL data-quiet guard; a proven-bidirectional session (`SNR_downlink > -90`) may
+offer the floor sooner, preserving responsive turn-taking.
+
+### §9.4 The fix (root cause, minimal) — two defects, one pure helper
+
+**Defect #1 (primary)**: the idle-SWITCH arms on a transient-empty FIFO.
+**Defect #2 (secondary)**: `switch_role_timer` is never `reset()` when data resumes,
+so after the first idle gap the timer keeps counting; the NEXT idle gap reads a stale
+(already-elapsed) timer and fires SWITCH_ROLE essentially instantly.
+
+**Pure helper** (in `arq.h`, static, no side effects so the test replays the identical
+expression):
+```
+// Returns true iff the idle commander should OFFER the role to the peer.
+// data_socket_idle_ms : ms since the app last fed TX data (tcp_socket_data.timer).
+// snr_downlink        : measurements.SNR_downlink (-99.9 sentinel ⇒ one-way / no return data).
+// switch_role_timeout : the existing per-config idle timeout.
+static bool should_offer_role_switch(int data_socket_idle_ms, double snr_downlink,
+                                     int switch_role_timeout)
+{
+    // One-way session (downlink never carried return data): require the app to be
+    // genuinely quiet for a full role-offer guard before relinquishing the floor,
+    // so a transient empty TX FIFO mid-bulk-transfer does NOT swap roles.
+    // Proven-bidirectional session (snr_downlink > -90): the peer demonstrably sends
+    // return data, so keep responsive turn-taking (no extra app-idle requirement).
+    if(snr_downlink > -90.0)
+        return true;                       // bidirectional: existing behavior
+    return data_socket_idle_ms >= ROLE_OFFER_APP_IDLE_MS;  // one-way: app must be quiet
+}
+```
+`ROLE_OFFER_APP_IDLE_MS` is a NEW guard constant (1500 ms — one OFDM `switch_role_timeout`
+period; chosen so a one-way transfer with normal TCP feeding never idles that long
+between batches, while a genuinely-complete transfer crosses it within ~1.5 s). It is
+NOT a tuned threshold masking a failure (CLAUDE.md §2): it is the definition of "the
+local app has stopped sending," the precise condition the idle-SWITCH was always
+*supposed* to mean.
+
+**Production wiring** (`arq_commander.cc:9229-9242`):
+- Arm/continue the `switch_role_timer` ONLY when `should_offer_role_switch(...)` is
+  true (so a one-way transfer with a recently-fed FIFO never arms it).
+- Add `switch_role_timer.reset()` on the staging path so the idle window restarts on
+  every batch staged (defect #2).
+
+This NEVER touches the turboshift SWITCH_ROLE sites (`arq_commander.cc:3894/3905`,
+gated on `turboshift_phase`) nor the SWITCH_ROLE-ACK handler (`:4400`) — only the
+idle-timer ARM. Real dead-link detection is UNAFFECTED: `link_timer` (`update_status()`
+`arq_common.cc:2077`, `link_timeout=10000 ms`, reset on every ACK/data event) and the
+emergency-BREAK NACK paths (`arq_commander.cc:2411/3463`, which fire on
+`data_ack_received != YES`) are independent of the idle-SWITCH timer and unchanged.
+
+### §9.5 SWITCH_ROLE/role-swap shared-state — every producer & consumer (CLAUDE.md §5)
+
+The fix changes WHEN `add_message_control(SWITCH_ROLE)` is queued on the idle path. The
+SWITCH_ROLE control frame + the role/`original_role` state are shared across ARQ:
+- **SWITCH_ROLE producers**: `arq_commander.cc:3894` (TURBO_FORWARD→REVERSE),
+  `:3905` (TURBO_REVERSE→DONE), **`:9240` (idle turn-taking — THE path the fix
+  gates)**, `:9240`'s twin on the RSP side is the reverse-probe (`arq_responder.cc`).
+  The fix touches ONLY `:9240`'s ARM condition; the two turboshift producers are
+  `turboshift_phase`-gated and run during the connect-time probe, never on the
+  steady-state one-way data path (where `turboshift_phase==TURBO_DONE`).
+- **SWITCH_ROLE consumers (handlers)**: CMD `arq_commander.cc:4400` (swaps to
+  RESPONDER, flushes RX, restarts watchdog/link timers); RSP `arq_responder.cc:1268+`
+  (turbo reverse / return-to-data). Neither handler is modified; the fix only reduces
+  the rate at which the idle producer feeds them on a one-way transfer.
+- **`role` / `original_role` producers**: `set_role()` (many sites); `original_role`
+  set once at session start. The role-restoration watchdog (`update_status()`
+  `arq_common.cc:2137-2179`) restores `original_role` after `watchdog_timeout`. The
+  fix removes the SPURIOUS swap that made this watchdog fire mid-transfer; it does not
+  change the watchdog.
+
+**Verdict**: no consumer's assumption is violated. The idle-SWITCH consumer's FALSE
+invariant ("empty queue ⇒ done") is CORRECTED at the producer (arm only when the app
+is actually quiet). Bidirectional turn-taking, turboshift role-swap, and dead-link
+detection all keep their existing inputs.
+
+### §9.6 Cross-layer regression test (paired) — `--test-oneway-stall`
+
+New synthetic-fire entry (`arq_commander.cc::test_oneway_stall`, CLI
+`--test-oneway-stall`), Part-G idiom, replaying the REAL helper
+`should_offer_role_switch()`:
+- **OW1 (FAIL-BEFORE)** — one-way (`SNR_downlink=-99.9`), app JUST fed data
+  (`data_socket_idle_ms=50`, a transient gap): `should_offer_role_switch()` must be
+  FALSE (do NOT swap mid-transfer). Pre-fix the idle path had NO such guard → armed
+  and fired → FAIL-BEFORE asserts the OLD unconditional-arm would have swapped.
+- **OW2 (PASS-AFTER, transfer complete)** — one-way, app quiet
+  (`data_socket_idle_ms=2000 ≥ ROLE_OFFER_APP_IDLE_MS`): helper TRUE (floor offered
+  once the message is genuinely done) — turn-taking still works.
+- **OW3 (bidirectional preserved)** — `SNR_downlink=+12` (peer sends return data),
+  app transiently idle (`data_socket_idle_ms=50`): helper TRUE (responsive turn-taking
+  unchanged for two-way sessions).
+- **OW4 (dead-link detection intact)** — assert the helper does NOT gate `link_timer`/
+  emergency-BREAK: drive a total-block-failure observable and confirm the BREAK NACK
+  path (`emergency_nack_count++` at `arq_commander.cc:3463`) is reached independent of
+  `should_offer_role_switch` (the idle-SWITCH gate cannot suppress a genuine dead-link
+  BREAK).
+
+**FAIL-BEFORE proof**: temporarily reverting the helper body to `return true;` (the
+pre-fix unconditional arm) makes OW1 FAIL (helper returns true → would swap on the 50 ms
+transient gap) while OW2/OW3/OW4 still PASS — confirming the test is not trivially
+all-or-nothing and that the gate is the lever. PASS-AFTER: all PASS with the shipped
+helper.
+
+**Honest scope**: OW1–OW4 prove the DECISION LOGIC in-process (no audio/RF). They do
+NOT prove end-to-end whole-message delivery on the wire — that is the loopback/IONOS
+parent test (`tools/oneway_transfer_loopback.py`, §9.7): FAIL-BEFORE stalls < 300 B;
+PASS-AFTER delivers the whole message with zero spurious SWITCH_ROLE in the CMD log.
+
+### §9.7 Related fact documents / tests
+
+- `gearshift-cascade-bench.md`, `gearshift-climb-engine.md` — the gearshift behavior
+  this stall sits beneath (the climb/ceiling fixes are the next two levers; this is the
+  biggest, zeroing SNR3k ≤ +2.4 today).
+- `tools/oneway_transfer_loopback.py` — the wire-level fail-before/pass-after harness.
+- This doc §1.2 (the RESPONDER-only `SNR_downlink` producer that leaves the CMD's
+  downlink at `-99.9` on a one-way transfer — the marker, not the cause).

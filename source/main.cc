@@ -346,6 +346,7 @@ int main(int argc, char *argv[])
                                         // panic counter, and BREAK still reaches ROBUST_0. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §8.
     bool test_clean_batch_viability_cli = false; // --test-clean-batch-viability: CLEAN-BATCH VIABILITY regression (§9).
+    bool test_oneway_stall_cli = false; // --test-oneway-stall: idle-SWITCH_ROLE one-way-transfer stall regression (data-flow-snr-measurements.md §9).
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
                                         // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
@@ -840,6 +841,15 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-compress-frame-fill.md §5.
             test_robust0_compress_deadlock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-oneway-stall") == 0)
+        {
+            // One-way-transfer idle-SWITCH_ROLE stall regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-snr-measurements.md §9.
+            test_oneway_stall_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1869,6 +1879,22 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_climb_engine();
             printf("[FLAG] Climb-engine test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_oneway_stall_cli) {
+            // One-way-transfer idle-SWITCH_ROLE stall regression (one-shot, then
+            // exit rc). Replays the REAL should_offer_role_switch() decision: a
+            // one-way transfer with a transient-empty FIFO must NOT swap roles
+            // (OW1), a completed transfer offers the floor (OW2), a bidirectional
+            // session keeps responsive turn-taking (OW3), and the gate cannot
+            // suppress real dead-link BREAK (OW4). See
+            // fact-documents/data-flow-snr-measurements.md §9.
+            printf("[FLAG] --test-oneway-stall: invoking one-way-transfer "
+                   "idle-SWITCH_ROLE stall regression (Parts OW1-OW4)\n");
+            fflush(stdout);
+            int rc = ARQ.test_oneway_stall();
+            printf("[FLAG] Oneway-stall test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
