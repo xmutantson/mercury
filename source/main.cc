@@ -431,7 +431,8 @@ int main(int argc, char *argv[])
         printf("\nDevice and audio:\n");
         printf("  -i [device]       Audio capture device (e.g. \"plughw:0,0\" or device name from -z)\n");
         printf("  -o [device]       Audio playback device\n");
-        printf("  -x [api]          Sound system: alsa, pulse, dsound, wasapi (default: alsa/wasapi)\n");
+        printf("  -x [api]          Sound system: alsa, pulse, dsound, wasapi, sim (default: alsa/wasapi)\n");
+        printf("                    sim = device-free software channel (ARQ loopback via tools/sim_channel_relay.py)\n");
         printf("  -A [channel]      Audio channel index override (enables multichannel mode)\n");
         printf("  --rx-channel [0|1|2]  RX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 0)\n");
         printf("  --tx-channel [0|1|2]  TX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 2)\n");
@@ -1146,6 +1147,8 @@ int main(int argc, char *argv[])
                 audio_system = AUDIO_SUBSYSTEM_OSS;
             if (!strcmp(optarg, "coreaudio"))
                 audio_system = AUDIO_SUBSYSTEM_COREAUDIO;
+            if (!strcmp(optarg, "sim"))
+                audio_system = AUDIO_SUBSYSTEM_SIM;
             break;
         case 'g':
             gear_shift_mode = GEAR_SHIFT_ENABLED;
@@ -1511,6 +1514,13 @@ start_modem:
             output_dev = NULL;
         }
         printf("Microsoft DirectSound (DSOUND)\n");
+        break;
+    case AUDIO_SUBSYSTEM_SIM:
+        // Device-free software channel. No real capture/playback device;
+        // input/output device names are ignored (the relay is the channel).
+        if (input_dev && input_dev[0] == 0)  { free(input_dev);  input_dev = NULL; }
+        if (output_dev && output_dev[0] == 0) { free(output_dev); output_dev = NULL; }
+        printf("SIM software channel (device-free ARQ loopback via relay)\n");
         break;
     default:
         printf("No supported audio system selected. Trying to continue.\n");

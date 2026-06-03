@@ -28,6 +28,17 @@
 #include "common/common_defines.h"
 #include "common/os_interop.h"
 
+// SIM channel backend (-x sim) socket headers. winsock2.h is pulled in by
+// os_interop.h on Windows; POSIX sockets on everything else.
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
+#include <stdlib.h>   // getenv, atoi
+
 #ifdef MERCURY_GUI_ENABLED
 #ifdef __cplusplus
 extern "C++" {
@@ -1411,6 +1422,198 @@ void list_soundcards(int audio_system)
 	}
 }
 
+// ===========================================================================
+// SIM channel backend (-x sim): device-free software channel.
+//
+// Replaces radio_capture_thread + radio_playback_thread with two socket
+// bridges to an external channel relay (tools/sim_channel_relay.py):
+//   * sim_tx_bridge_thread:  playback_buffer (this peer's TX passband) ->
+//                            TCP send to relay.
+//   * sim_rx_bridge_thread:  TCP recv from relay -> capture_buffer (this
+//                            peer's RX passband, AWGN + loss already applied
+//                            by the relay).
+// radio_capture_prep_thread is reused unchanged (it consumes capture_buffer).
+//
+// Wire format: little-endian float64 (double) mono passband, 48 kHz, the SAME
+// units tx_transfer/rx_transfer already move. The relay sums both peers'
+// TX streams, applies a fixed-SNR AWGN floor (+ optional bursty sample
+// dropout / Watterson fading) and fans the result back to both RX sockets.
+//
+// Connection: each peer connects to 127.0.0.1:<port> and immediately sends a
+// 1-byte role tag ('A' commander / 'B' responder) so the relay can cross-wire
+// the two directions. Port + role come from env:
+//     MERCURY_SIM_PORT (default 52100)
+//     MERCURY_SIM_ROLE ('A' or 'B'; default 'A')
+// One TCP connection carries BOTH directions (TX out, RX in) for that peer.
+// ===========================================================================
+
+#if defined(_WIN32)
+typedef SOCKET sim_sock_t;
+#define SIM_BAD_SOCK INVALID_SOCKET
+#else
+typedef int sim_sock_t;
+#define SIM_BAD_SOCK (-1)
+#endif
+
+static sim_sock_t sim_sock = SIM_BAD_SOCK;   // shared by both bridge threads
+static int sim_connected = 0;
+
+// SIM transport chunk: number of double samples per relay packet. 1024 doubles
+// = ~21 ms at 48 kHz, small enough that channel impairment granularity matches
+// a fraction of an OFDM symbol (Nofdm*interp ~= 3072 samples WB).
+#define SIM_CHUNK_SAMPLES 1024
+
+static int sim_send_all(sim_sock_t s, const uint8_t *buf, int len)
+{
+	int sent = 0;
+	while (sent < len) {
+		int n = send(s, (const char *)(buf + sent), len - sent, 0);
+		if (n <= 0) return -1;
+		sent += n;
+	}
+	return 0;
+}
+
+static int sim_recv_all(sim_sock_t s, uint8_t *buf, int len)
+{
+	int got = 0;
+	while (got < len) {
+		int n = recv(s, (char *)(buf + got), len - got, 0);
+		if (n <= 0) return -1;
+		got += n;
+	}
+	return 0;
+}
+
+// Establish the single shared TCP connection to the relay (idempotent).
+static int sim_connect_once(void)
+{
+	if (sim_connected) return 0;
+
+#if defined(_WIN32)
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+	const char *port_s = getenv("MERCURY_SIM_PORT");
+	const char *role_s = getenv("MERCURY_SIM_ROLE");
+	int port = port_s ? atoi(port_s) : 52100;
+	char role = (role_s && role_s[0]) ? role_s[0] : 'A';
+
+	sim_sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sim_sock == SIM_BAD_SOCK) {
+		printf("[SIM] socket() failed\n");
+		return -1;
+	}
+	int one = 1;
+	setsockopt(sim_sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((unsigned short)port);
+	addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+	// Retry: the relay or the peer may start a moment after us.
+	int attempts = 0;
+	while (connect(sim_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+		if (shutdown_) return -1;
+		if (++attempts > 200) {   // ~20 s
+			printf("[SIM] connect to 127.0.0.1:%d failed after %d attempts\n", port, attempts);
+			return -1;
+		}
+		ffthread_sleep(100);
+	}
+	// Send role tag so the relay knows which direction we are.
+	if (sim_send_all(sim_sock, (const uint8_t *)&role, 1) != 0) {
+		printf("[SIM] role handshake send failed\n");
+		return -1;
+	}
+	sim_connected = 1;
+	printf("[SIM] connected to channel relay 127.0.0.1:%d as role '%c'\n", port, role);
+	fflush(stdout);
+	return 0;
+}
+
+// TX bridge: pull this peer's TX passband from playback_buffer and ship it
+// to the relay in fixed-size chunks. When idle, send silence so the relay's
+// per-direction sample clock keeps advancing (the channel must add noise even
+// during TX gaps, exactly like RF — a silent peer still hears the channel).
+void *sim_tx_bridge_thread(void *unused)
+{
+	(void)unused;
+	if (sim_connect_once() != 0) { shutdown_ = true; return NULL; }
+
+	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
+	double *chunk = (double *)malloc(chunk_bytes);
+
+	while (!shutdown_) {
+		size_t avail = size_buffer(playback_buffer);
+		if (avail >= (size_t)chunk_bytes) {
+			// Full chunk available: forward verbatim.
+			read_buffer(playback_buffer, (uint8_t *)chunk, chunk_bytes);
+		} else if (avail > 0) {
+			// PARTIAL remainder. The modem busy-waits on
+			// `size_buffer(playback_buffer) > 0` to know a frame's TX has
+			// finished (arq_common.cc:4072 etc). If we only ever drain full
+			// chunks, a sub-chunk tail (a HAIL/ACK pattern is not a multiple
+			// of 1024 samples) is stranded forever -> the modem deadlocks in
+			// the drain-wait and never switches to RX. So drain the partial
+			// NOW and zero-pad it up to a full chunk before sending (the pad
+			// is just inter-frame silence on the wire — harmless).
+			memset(chunk, 0, chunk_bytes);
+			read_buffer(playback_buffer, (uint8_t *)chunk, (int)avail);
+		} else {
+			// No TX queued: send a silence chunk so the relay clock advances
+			// and the RX side still receives a noise floor (RF realism).
+			memset(chunk, 0, chunk_bytes);
+			ffthread_sleep(5);
+		}
+		if (sim_send_all(sim_sock, (const uint8_t *)chunk, chunk_bytes) != 0) {
+			printf("[SIM] TX bridge send failed (relay closed?)\n");
+			break;
+		}
+	}
+	free(chunk);
+	return NULL;
+}
+
+// RX bridge: pull channel-impaired passband from the relay and push it into
+// capture_buffer, where radio_capture_prep_thread + rx_transfer consume it.
+void *sim_rx_bridge_thread(void *unused)
+{
+	(void)unused;
+	// TX bridge owns the connect; wait for it.
+	int waited = 0;
+	while (!sim_connected && !shutdown_) {
+		ffthread_sleep(20);
+		if (++waited > 1500) { shutdown_ = true; return NULL; }  // ~30 s
+	}
+	if (shutdown_) return NULL;
+
+	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
+	double *chunk = (double *)malloc(chunk_bytes);
+
+	while (!shutdown_) {
+		if (sim_recv_all(sim_sock, (uint8_t *)chunk, chunk_bytes) != 0) {
+			printf("[SIM] RX bridge recv failed (relay closed?)\n");
+			break;
+		}
+		// Backpressure: if the prep thread is behind, spin briefly rather
+		// than overflow capture_buffer (mirrors the device-full guard).
+		int spins = 0;
+		while (!shutdown_ &&
+		       circular_buf_free_size(capture_buffer) < (size_t)chunk_bytes) {
+			ffthread_sleep(2);
+			if (++spins > 5000) break;  // ~10 s safety
+		}
+		if (shutdown_) break;
+		write_buffer(capture_buffer, (uint8_t *)chunk, chunk_bytes);
+	}
+	free(chunk);
+	return NULL;
+}
+
 // size in "double" samples
 int tx_transfer(double *buffer, size_t len)
 {
@@ -1465,6 +1668,18 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 #if defined(_WIN32)
     capture_prep_mutex = CreateMutex(NULL, FALSE, NULL);
 #endif
+
+    if (audio_subsys == AUDIO_SUBSYSTEM_SIM) {
+        // Device-free software channel: TX/RX bridge threads instead of
+        // WASAPI/ALSA device threads. radio_capture / radio_playback handles
+        // are reused to carry the bridge threads so audioio_deinit joins them.
+        printf("[SIM] software channel backend active (no audio device)\n");
+        fflush(stdout);
+        pthread_create(radio_playback, NULL, sim_tx_bridge_thread, NULL);
+        pthread_create(radio_capture,  NULL, sim_rx_bridge_thread, NULL);
+        pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread, (void *) telecom_system);
+        return 0;
+    }
 
     pthread_create(radio_capture, NULL, radio_capture_thread, (void *) capture_dev);
 	pthread_create(radio_playback, NULL, radio_playback_thread, (void *) playback_dev);
