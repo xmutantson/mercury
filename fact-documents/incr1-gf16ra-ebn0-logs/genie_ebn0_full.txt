@@ -1,0 +1,213 @@
+=== [INCR1-GATE] MERCURY_INCR1_EBN0=1 (genie Eb/N0 sweep RUNNING) ===
+  [MEASURE] GF(16)-RA PURE-FEC GENIE Eb/N0 vs +3.04 dB noncoherent-M16 floor:
+    Achievable rate set (codec constraint, K=13 hardwired): repfact 1/2/3 -> R=0.500/0.333/0.250.
+    Target R in {0.37,0.40} NOT directly achievable (between repfact 1 and 2); R=0.50 is the highest / closest to capacity-optimal ~1/e.
+    [genie R=0.500 N=26 repfact=1 esno_metric=4.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+        2.00 :    5.01 : 0.1420 : -1.0
+        2.25 :    5.26 : 0.1870 : -1.0
+        2.50 :    5.51 : 0.2715 : 1.0
+        2.75 :    5.76 : 0.3665 : 1.0
+        3.00 :    6.01 : 0.4335 : 2.2
+        3.25 :    6.26 : 0.5355 : 2.1
+        3.50 :    6.51 : 0.6165 : 2.1
+        3.75 :    6.76 : 0.6945 : 2.0
+        4.00 :    7.01 : 0.7800 : 2.0
+        4.25 :    7.26 : 0.8300 : 1.8
+        4.50 :    7.51 : 0.8890 : 1.7
+        4.75 :    7.76 : 0.9170 : 1.6
+        5.00 :    8.01 : 0.9425 : 1.4
+        5.25 :    8.26 : 0.9620 : 1.3
+        5.50 :    8.51 : 0.9745 : 1.3
+        5.75 :    8.76 : 0.9845 : 1.2
+        6.00 :    9.01 : 0.9895 : 1.1
+        6.25 :    9.26 : 0.9935 : 1.0
+        6.50 :    9.51 : 0.9970 : 0.9
+        6.75 :    9.76 : 0.9965 : 0.7
+        7.00 :   10.01 : 0.9985 : 0.6
+        7.25 :   10.26 : 0.9990 : 0.5
+        7.50 :   10.51 : 1.0000 : 0.3
+        7.75 :   10.76 : 1.0000 : 0.2
+        8.00 :   11.01 : 1.0000 : 0.1
+        8.25 :   11.26 : 1.0000 : 0.1
+        8.50 :   11.51 : 1.0000 : 0.1
+        8.75 :   11.76 : 1.0000 : 0.0
+        9.00 :   12.01 : 1.0000 : 0.0
+    [genie R=0.500 N=26] cliff(P>=0.5)=3.25 dB Eb/N0 | cliff(P>=0.99)=6.25 dB | GAP-to-floor(+3.04): P50 +0.21 dB, P99 +3.21 dB
+    [genie R=0.333 N=39 repfact=2 esno_metric=4.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+        2.00 :    3.25 : 0.1325 : 17.9
+        2.25 :    3.50 : 0.2050 : 16.2
+        2.50 :    3.75 : 0.2735 : 15.0
+        2.75 :    4.00 : 0.3810 : 14.6
+        3.00 :    4.25 : 0.4940 : 12.7
+        3.25 :    4.50 : 0.5935 : 11.3
+        3.50 :    4.75 : 0.6955 : 10.5
+        3.75 :    5.00 : 0.7950 : 8.8
+        4.00 :    5.25 : 0.8380 : 7.6
+        4.25 :    5.50 : 0.8955 : 6.6
+        4.50 :    5.75 : 0.9335 : 5.7
+        4.75 :    6.00 : 0.9615 : 4.9
+        5.00 :    6.25 : 0.9750 : 4.1
+        5.25 :    6.50 : 0.9845 : 3.5
+        5.50 :    6.75 : 0.9920 : 2.9
+        5.75 :    7.00 : 0.9970 : 2.5
+        6.00 :    7.25 : 0.9975 : 2.1
+        6.25 :    7.50 : 1.0000 : 1.8
+        6.50 :    7.75 : 0.9990 : 1.5
+        6.75 :    8.00 : 1.0000 : 1.3
+        7.00 :    8.25 : 1.0000 : 1.2
+        7.25 :    8.50 : 1.0000 : 1.0
+        7.50 :    8.75 : 1.0000 : 0.9
+        7.75 :    9.00 : 1.0000 : 0.7
+        8.00 :    9.25 : 1.0000 : 0.6
+        8.25 :    9.50 : 1.0000 : 0.4
+        8.50 :    9.75 : 1.0000 : 0.3
+        8.75 :   10.00 : 1.0000 : 0.2
+        9.00 :   10.25 : 1.0000 : 0.1
+    [genie R=0.333 N=39] cliff(P>=0.5)=3.25 dB Eb/N0 | cliff(P>=0.99)=5.50 dB | GAP-to-floor(+3.04): P50 +0.21 dB, P99 +2.46 dB
+    [genie R=0.250 N=52 repfact=3 esno_metric=4.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+        2.00 :    2.00 : 0.0680 : 19.4
+        2.25 :    2.25 : 0.1240 : 18.8
+        2.50 :    2.50 : 0.1820 : 16.8
+        2.75 :    2.75 : 0.2695 : 16.6
+        3.00 :    3.00 : 0.4040 : 15.4
+        3.25 :    3.25 : 0.5275 : 14.8
+        3.50 :    3.50 : 0.6625 : 13.2
+        3.75 :    3.75 : 0.7665 : 11.4
+        4.00 :    4.00 : 0.8560 : 10.0
+        4.25 :    4.25 : 0.9310 : 8.6
+        4.50 :    4.50 : 0.9570 : 7.4
+        4.75 :    4.75 : 0.9855 : 6.4
+        5.00 :    5.00 : 0.9885 : 5.3
+        5.25 :    5.25 : 0.9990 : 4.5
+        5.50 :    5.50 : 0.9985 : 3.8
+        5.75 :    5.75 : 0.9990 : 3.4
+        6.00 :    6.00 : 1.0000 : 3.0
+        6.25 :    6.25 : 0.9995 : 2.7
+        6.50 :    6.50 : 0.9995 : 2.4
+        6.75 :    6.75 : 1.0000 : 2.1
+        7.00 :    7.00 : 1.0000 : 1.9
+        7.25 :    7.25 : 1.0000 : 1.7
+        7.50 :    7.50 : 1.0000 : 1.5
+        7.75 :    7.75 : 1.0000 : 1.3
+        8.00 :    8.00 : 1.0000 : 1.2
+        8.25 :    8.25 : 1.0000 : 1.1
+        8.50 :    8.50 : 1.0000 : 1.0
+        8.75 :    8.75 : 1.0000 : 0.9
+        9.00 :    9.00 : 1.0000 : 0.7
+    [genie R=0.250 N=52] cliff(P>=0.5)=3.25 dB Eb/N0 | cliff(P>=0.99)=5.25 dB | GAP-to-floor(+3.04): P50 +0.21 dB, P99 +2.21 dB
+    --- esno_metric sensitivity (R=0.50, metric Es/N0=3 dB i.e. esno=2.0) ---
+    [genie R=0.500 N=26 repfact=1 esno_metric=2.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+        2.00 :    5.01 : 0.1055 : -1.0
+        2.25 :    5.26 : 0.1510 : -1.0
+        2.50 :    5.51 : 0.2250 : -1.0
+        2.75 :    5.76 : 0.3110 : -1.0
+        3.00 :    6.01 : 0.3795 : -1.0
+        3.25 :    6.26 : 0.4920 : -1.0
+        3.50 :    6.51 : 0.5730 : -1.0
+        3.75 :    6.76 : 0.6575 : -1.0
+        4.00 :    7.01 : 0.7370 : -1.0
+        4.25 :    7.26 : 0.8125 : -1.0
+        4.50 :    7.51 : 0.8810 : -1.0
+        4.75 :    7.76 : 0.9080 : 2.0
+        5.00 :    8.01 : 0.9320 : 2.0
+        5.25 :    8.26 : 0.9575 : 2.1
+        5.50 :    8.51 : 0.9715 : 2.1
+        5.75 :    8.76 : 0.9840 : 2.0
+        6.00 :    9.01 : 0.9890 : 1.9
+        6.25 :    9.26 : 0.9935 : 1.7
+        6.50 :    9.51 : 0.9970 : 1.6
+        6.75 :    9.76 : 0.9965 : 1.5
+        7.00 :   10.01 : 0.9980 : 1.4
+        7.25 :   10.26 : 0.9990 : 1.3
+        7.50 :   10.51 : 1.0000 : 1.2
+        7.75 :   10.76 : 1.0000 : 1.1
+        8.00 :   11.01 : 1.0000 : 1.1
+        8.25 :   11.26 : 1.0000 : 1.0
+        8.50 :   11.51 : 1.0000 : 1.0
+        8.75 :   11.76 : 1.0000 : 0.9
+        9.00 :   12.01 : 1.0000 : 0.8
+    [genie R=0.500 N=26] cliff(P>=0.5)=3.50 dB Eb/N0 | cliff(P>=0.99)=6.25 dB | GAP-to-floor(+3.04): P50 +0.46 dB, P99 +3.21 dB
+  [OK]   gf16_ra_genie_ebn0_sweep
+  [MEASURE] HAIL beacon-detection floor (metric-gate relax + noncoherent beacon combining):
+Bandwidth: 2343.750000 Hz
+Center frequency: 1500.000000 Hz low: 328.125000 Hz high: 2671.875000 Hz
+[PHY] Loading configuration 100 (was -1)
+[PHY-SWITCH] Taking capture_prep_mutex, zeroing Nofdm/buffer_Nsymb
+[PHY-SWITCH] deinit() start
+[PHY-SWITCH] deinit() done
+[PHY-SWITCH] init() start (nb=0 M=200 config=100)
+[PHY-SWITCH] init() done (Nc=50 Nsymb=320 Nofdm=310 buffer_Nsymb=804)
+[PHY-SWITCH] Releasing capture_prep_mutex
+[PHY] MFSK corr template: 16 symbols, 4960 samples, energy=202225.779 (per-sym corr, FIR round-tripped)
+[PHY] Config 100 active: M=200 LDPC_rate=0.062 BW=2344Hz Nc=50 Nsymb=320 nBits=1600
+[PHY] MFSK: M=32 nStreams=1 bps=5 offsets=[9] Nc=50 boost=15.0dB
+[PHY] Ctrl frame: nBits=1200 nsymb=240 (75% of data)
+[PHY] ACK pattern: 16 symbols (M=16, WB Welch-Costas), 19840 passband samples (413 ms), match_threshold=7/16, detection_threshold=0.65
+    HAIL config: M=16 nsymb=16 base_thr=8/16 nStreams=1 tone_hop=7 Nofdm=310 (ROBUST_0 WB)
+    Gates: OLD fast-poll HAIL = base>=8 && metric>=3.0 && quality>=0.3 (arq_common.cc:5375 pre-fix)
+           NEW (§10 fix) fast-poll HAIL = base>=8 && metric>=ack_pattern_detection_threshold(=0.65@R0), NO quality
+    [R=1 fidelity] fixed-offset scorer: matched=16 metric=13.22 | production(sliding): matched=16 metric=13.23
+    Sweep: 120 trials/mult, sig_rms=7.055 p_sig=49.776, CFO=+-12 Hz, AWGN (no timing jitter; RX searches timing).
+    count[..] = P(combined matched>=8), no soft gate (combining SHOULD help this).
+    Gate G0=OLD-SHIPPED(m>=3.0,q>=0.3)  G1=METRIC-RELAX(m>=2.0,q>=0.3)  G2=PROD-FIX(m>=0.65,no-q)
+    (sigma/rms : SNR3k_dB : count[R1 R2 R3 R5] : R1[G0 G1 G2] R2[G0 G1 G2] R5[G0 G1 G2])
+        3.0 :   -0.51 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[1.00 1.00 1.00] R2[1.00 1.00 1.00] R5[1.00 1.00 1.00]
+        4.0 :   -3.01 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[1.00 1.00 1.00] R2[1.00 1.00 1.00] R5[1.00 1.00 1.00]
+        4.5 :   -4.03 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.99 0.99 1.00] R2[1.00 1.00 1.00] R5[1.00 1.00 1.00]
+        5.0 :   -4.95 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.51 0.51 1.00] R2[0.51 0.51 1.00] R5[0.66 0.66 1.00]
+        5.5 :   -5.78 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.06 0.06 1.00] R2[0.01 0.01 1.00] R5[0.00 0.00 1.00]
+        6.0 :   -6.53 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 1.00] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+        6.5 :   -7.23 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 1.00] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+        7.0 :   -7.87 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 1.00] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+        7.5 :   -8.47 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 1.00] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+        8.0 :   -9.03 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 1.00] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+        9.0 :  -10.05 : count[R1=1.00 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 1.00] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+       10.0 :  -10.97 : count[R1=0.97 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 0.97] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+       11.0 :  -11.80 : count[R1=0.83 R2=1.00 R3=1.00 R5=1.00] : full R1[0.00 0.00 0.83] R2[0.00 0.00 1.00] R5[0.00 0.00 1.00]
+       12.0 :  -12.55 : count[R1=0.68 R2=0.97 R3=1.00 R5=1.00] : full R1[0.00 0.00 0.68] R2[0.00 0.00 0.97] R5[0.00 0.00 1.00]
+       13.0 :  -13.25 : count[R1=0.65 R2=0.98 R3=1.00 R5=1.00] : full R1[0.00 0.00 0.65] R2[0.00 0.00 0.98] R5[0.00 0.00 1.00]
+       14.0 :  -13.89 : count[R1=0.40 R2=0.82 R3=0.99 R5=1.00] : full R1[0.00 0.00 0.40] R2[0.00 0.00 0.82] R5[0.00 0.00 1.00]
+       16.0 :  -15.05 : count[R1=0.19 R2=0.63 R3=0.88 R5=1.00] : full R1[0.00 0.00 0.19] R2[0.00 0.00 0.63] R5[0.00 0.00 1.00]
+       18.0 :  -16.07 : count[R1=0.05 R2=0.30 R3=0.47 R5=0.87] : full R1[0.00 0.00 0.05] R2[0.00 0.00 0.30] R5[0.00 0.00 0.82]
+       20.0 :  -16.99 : count[R1=0.05 R2=0.18 R3=0.38 R5=0.77] : full R1[0.00 0.00 0.05] R2[0.00 0.00 0.18] R5[0.00 0.00 0.68]
+       24.0 :  -18.57 : count[R1=0.02 R2=0.06 R3=0.10 R5=0.28] : full R1[0.00 0.00 0.02] R2[0.00 0.00 0.06] R5[0.00 0.00 0.17]
+       28.0 :  -19.91 : count[R1=0.02 R2=0.00 R3=0.03 R5=0.09] : full R1[0.00 0.00 0.02] R2[0.00 0.00 0.00] R5[0.00 0.00 0.04]
+    --- HAIL detection cliffs (P=0.5, SNR3k dB; more negative = deeper/better) ---
+    BASE matched-count floor (the -14.68 target, R=1, no soft gate): -13.25 dB
+    Matched-count-only cliff vs combining R:  R=1: -13.25 | R=2: -15.05 | R=3: -15.05 | R=5: -16.99 dB
+    gate OLD-SHIPPED(m>=3.0,q>=0.3)  :  R=1: -4.95 | R=2: -4.95 | R=3: -4.95 | R=5: -4.95 dB
+    gate METRIC-RELAX(m>=2.0,q>=0.3) :  R=1: -4.95 | R=2: -4.95 | R=3: -4.95 | R=5: -4.95 dB
+    gate PROD-FIX(m>=0.65,no-q)      :  R=1: -13.25 | R=2: -15.05 | R=3: -15.05 | R=5: -16.99 dB
+    ==> metric-thr relax 3.0->2.0 ALONE (quality>=0.3 kept), R=1: +0.00 dB  <-- quality gate masks it
+    ==> PROD-FIX gate (metric>=0.65, NO quality) vs OLD-SHIPPED, R=1: -8.30 dB toward the count floor
+    ==> combining on matched-COUNT: R=2 -1.80 dB | R=5 -3.74 dB (10log10 ideal +3.0/+7.0; measured M=16 @ q~0.1-0.24)
+    ==> combining + PROD-FIX gate: R=5 -3.74 dB vs R=1 (combining helps ONLY once the ratio gate is off)
+    [ASSERT OK] PROD-FIX gate (m>=0.65, no-q) moves HAIL cliff +8.30 dB deeper to -13.25 dB (count floor -13.25 dB); old gate -4.95 dB.
+    --- FAR (pure noise, sigma=112.88 = 16x rms ~ -15 dB SNR3k, 5000 trials/cell) ---
+    gate OLD-SHIPPED(m>=3.0,q>=0.3)  : FAR R=1 0/5000 | R=2 0/5000 | R=3 0/5000 | R=5 0/5000
+    gate METRIC-RELAX(m>=2.0,q>=0.3) : FAR R=1 0/5000 | R=2 0/5000 | R=3 0/5000 | R=5 0/5000
+    gate PROD-FIX(m>=0.65,no-q)      : FAR R=1 0/5000 | R=2 1/5000 | R=3 1/5000 | R=5 0/5000
+    [ASSERT OK] PROD-FIX gate R=1 FAR = 0/5000 (count gate 8/16 holds the line on pure noise).
+  [OK]   hail_detection_cliff_sweep
+  [MEASURE] CONNECT ctrl-suffix detection floor under CTRL_DETECT_METRIC_MIN=1.20:
+Bandwidth: 2343.750000 Hz
+Center frequency: 1500.000000 Hz low: 328.125000 Hz high: 2671.875000 Hz
+[PHY] Loading configuration 100 (was -1)
+[PHY-SWITCH] Taking capture_prep_mutex, zeroing Nofdm/buffer_Nsymb
+[PHY-SWITCH] deinit() start
+[PHY-SWITCH] deinit() done
+[PHY-SWITCH] init() start (nb=0 M=200 config=100)
+[PHY-SWITCH] init() done (Nc=50 Nsymb=320 Nofdm=310 buffer_Nsymb=804)
+[PHY-SWITCH] Releasing capture_prep_mutex
+[PHY] MFSK corr template: 16 symbols, 4960 samples, energy=202225.779 (per-sym corr, FIR round-tripped)
+[PHY] Config 100 active: M=200 LDPC_rate=0.062 BW=2344Hz Nc=50 Nsymb=320 nBits=1600
+[PHY] MFSK: M=32 nStreams=1 bps=5 offsets=[9] Nc=50 boost=15.0dB
+[PHY] Ctrl frame: nBits=1200 nsymb=240 (75% of data)
+[PHY] ACK pattern: 16 symbols (M=16, WB Welch-Costas), 19840 passband samples (413 ms), match_threshold=7/16, detection_threshold=0.65
+    CONNECT config: M=16 conn_nsymb=16 conn_thr=7 nStreams=1 (ROBUST_0 WB); old gate metric>=3.0, new gate metric>=1.20; backstop=count 7/16 + CRC12 + 2-bit type
+    (sigma/rms : SNR3k_dB : P_decode@1.2 : mean_metric : mean_matched : rescued[1.2<=m<3.0 & decoded])
+       2.0 :    3.01 : 1.00 :    12.38 :  16.00 : 0/80
+       2.5 :    1.07 : 1.00 :    11.04 :  16.00 : 0/80
+       3.0 :   -0.51 : 1.00 :     9.74 :  16.00 : 0/80
+       3.5 :   -1.85 : 1.00 :     8.59 :  16.00 : 0/80
+       4.0 :   -3.01 : 1.00 :     7.58 :  16.00 : 0/80

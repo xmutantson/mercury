@@ -1,0 +1,13 @@
+3652:=== [INCR1-GATE] MERCURY_INCR1_EBN0=1 (genie Eb/N0 sweep RUNNING) ===
+3653:  [MEASURE] GF(16)-RA PURE-FEC GENIE Eb/N0 vs +3.04 dB noncoherent-M16 floor:
+3654:    Achievable rate set (codec constraint, K=13 hardwired): repfact 1/2/3 -> R=0.500/0.333/0.250.
+3655:    Target R in {0.37,0.40} NOT directly achievable (between repfact 1 and 2); R=0.50 is the highest / closest to capacity-optimal ~1/e.
+3656:    [genie R=0.500 N=26 repfact=1 esno_metric=4.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+3686:    [genie R=0.500 N=26] cliff(P>=0.5)=3.25 dB Eb/N0 | cliff(P>=0.99)=6.25 dB | GAP-to-floor(+3.04): P50 +0.21 dB, P99 +3.21 dB
+3687:    [genie R=0.333 N=39 repfact=2 esno_metric=4.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+3717:    [genie R=0.333 N=39] cliff(P>=0.5)=3.25 dB Eb/N0 | cliff(P>=0.99)=5.50 dB | GAP-to-floor(+3.04): P50 +0.21 dB, P99 +2.46 dB
+3718:    [genie R=0.250 N=52 repfact=3 esno_metric=4.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+3748:    [genie R=0.250 N=52] cliff(P>=0.5)=3.25 dB Eb/N0 | cliff(P>=0.99)=5.25 dB | GAP-to-floor(+3.04): P50 +0.21 dB, P99 +2.21 dB
+3749:    --- esno_metric sensitivity (R=0.50, metric Es/N0=3 dB i.e. esno=2.0) ---
+3750:    [genie R=0.500 N=26 repfact=1 esno_metric=2.0]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)
+3780:    [genie R=0.500 N=26] cliff(P>=0.5)=3.50 dB Eb/N0 | cliff(P>=0.99)=6.25 dB | GAP-to-floor(+3.04): P50 +0.46 dB, P99 +3.21 dB

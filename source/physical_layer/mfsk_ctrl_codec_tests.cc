@@ -4122,6 +4122,167 @@ static void test_gf16_ra_cliff_sweep() {
 	test_pass(name);  // infra ran; dB verdict is in the log
 }
 
+// =============================================================================
+// §20 — WIN CAMPAIGN INCR-1: PURE-FEC GENIE Eb/N0 GATE
+//
+// THE decisive Eb/N0-gap measurement for the -10 / 143-bps rate-win.
+//
+// Question: how close is the EXISTING gf16ra codec (the shipped GF(16)-RA
+// suffix code) to the noncoherent M=16 FSK CAPACITY floor (+3.04 dB Eb/N0 at
+// R=1/2, ML/Bessel; Guillen i Fabregas & Grant, ncfsk_twc.pdf), run at the
+// capacity-optimal rate? PASS (<=~+4.0 dB at the best rate) => 143@-10 is
+// reachable via independent multi-carrier (Eb/N0-invariant geometry) =>
+// greenlight. FAIL (>~+4.5 dB) => the machine-generated RA graph is too loose
+// at this block length => RA-graph-design effort or coherent-PHY => STOP.
+//
+// This is a GENIE measurement, distinct from gf16_ra_cliff_sweep (which rides
+// the OFDM passband + CONNECT-base detector + de-hop FFT, measures on the
+// SNR3k *channel* axis, and is confounded by base-preamble overhead + peak
+// clip). HERE we inject AWGN DIRECTLY at the per-tone matched-filter output
+// level (perfect sync, single-stream M=16, the codec's NATIVE Bessel-I0
+// intrinsic) so the Eb/N0 axis is unambiguous and bit-for-bit the convention
+// the +3.04 dB capacity floor is defined against.
+//
+// NOISE CONVENTION (standard noncoherent M-FSK genie, Proakis Ch.8):
+//   - Per codeword symbol: M complex matched-filter bins. The transmitted
+//     tone t* gets y = a + n; the other M-1 bins get y = n. Each n is
+//     CN(0, 2*sn^2) (variance sn^2 per real dimension => E[|n|^2] = 2*sn^2).
+//   - Symbol energy Es = a^2 (a=1 here). Matched-filter N0 = E[|n|^2] = 2*sn^2.
+//     => Es/N0 = a^2 / (2*sn^2). This Es/N0 is EXACTLY the codec's esno_metric
+//     semantics (mfsk_ctrl_codec.cc:587-589: cmetric = sqrt(2*esno)/sigma_est).
+//   - Info bits/symbol = log2(M)*R = 4*R (R = K/N = 13/N). Therefore
+//       Eb/N0 = Es/N0 / (4*R)  <=>  Es/N0 = (Eb/N0) * 4*R.
+//   - energies[s*M+t] = |y|^2, fed straight to gf16ra::soft_decode (full
+//     block, native Bessel intrinsic). Block-error = (decode miss OR payload
+//     mismatch); the production CRC12+type accept gate is the same one
+//     production uses (prod_crc12_cb).
+//
+// CODEC RATE CONSTRAINT (fact, mfsk_ctrl_codec.cc:427-437): rate is set ONLY
+// by repfact; N = K + repfact*K = 13*(1+repfact). The achievable rate set is
+// DISCRETE: repfact=1 -> N=26 -> R=0.500; repfact=2 -> N=39 -> R=0.333;
+// repfact=3 -> N=52 -> R=0.250. K is HARDWIRED to 13 (no configure_k API
+// exists). The task's target R in {0.37, 0.40} are NOT directly achievable
+// (they fall strictly between repfact=1 [0.50] and repfact=2 [0.33]); R=0.50
+// (repfact=1) is the HIGHEST achievable and the closest to the capacity-
+// optimal noncoherent rate (R ~= 1/e ~= 0.37). We sweep the whole achievable
+// set {0.50, 0.333, 0.25} so the gap-vs-rate trend is visible and the
+// best-rate gap is decision-grade.
+//
+// MEASURE-only, env-gated (MERCURY_INCR1_EBN0=1) so it does not slow --test.
+// No production code touched.
+// =============================================================================
+static const double GF16RA_NC_M16_FLOOR_DB = 3.04;  // noncoherent M=16 FSK
+                                                     // capacity floor, R=1/2,
+                                                     // ML/Bessel (ncfsk_twc.pdf)
+
+// Synthesize the per-tone energy matrix for one codeword at a given Eb/N0 and
+// run the codec's native soft decode. Returns true on (decode AND payload
+// match). esno_for_metric is what we hand the Bessel intrinsic (the codec's
+// design point); the GENIE Es/N0 driving the noise is computed from ebn0_db.
+static bool gf16ra_genie_decode_at_ebn0(cl_arq_controller& arq, uint64_t p38,
+                                        double ebn0_db, double esno_for_metric,
+                                        std::mt19937& rng, int* out_iters)
+{
+	const int N = gf16ra::codeword_len();
+	const int M = gf16ra::GF16RA_M;        // 16
+	const int K = gf16ra::GF16RA_K;        // 13
+	const double R = (double)K / (double)N;
+	// info bits/symbol = log2(M)*R = 4*R ; Es/N0 = (Eb/N0)*4*R
+	const double ebn0_lin = std::pow(10.0, ebn0_db / 10.0);
+	const double esno_lin = ebn0_lin * 4.0 * R;
+	// Es = a^2 = 1 ; N0 = 2*sn^2 = Es/(Es/N0) => sn = sqrt(1/(2*esno_lin))
+	const double sn = std::sqrt(1.0 / (2.0 * esno_lin));
+
+	uint8_t bytes[5]; pack_ctrl_typed40_msb(bytes, (uint8_t)MFSK_CTRL_START_CONN, p38);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+	int tones[gf16ra::GF16RA_MAX_N];
+	gf16ra::encode((uint8_t)MFSK_CTRL_START_CONN, p38, crc12, tones);
+
+	std::vector<double> energies((size_t)N * M);
+	std::normal_distribution<double> nd(0.0, sn);
+	for (int s = 0; s < N; s++) {
+		int t_tx = tones[s] & 0xF;
+		for (int t = 0; t < M; t++) {
+			double re = nd(rng), im = nd(rng);
+			if (t == t_tx) re += 1.0;            // signal tone: a = 1
+			energies[(size_t)s * M + t] = re * re + im * im;
+		}
+	}
+	uint64_t rx_p38 = 0; int it = -2;
+	bool ok = gf16ra::soft_decode(energies.data(), GF16RA_BP_MAXITER,
+		esno_for_metric, (uint8_t)MFSK_CTRL_START_CONN,
+		prod_crc12_cb, &arq, &rx_p38, &it);
+	if (out_iters) *out_iters = it;
+	return ok && rx_p38 == p38;
+}
+
+static void gf16ra_genie_ebn0_one(int repfact, double esno_for_metric) {
+	cl_arq_controller arq;
+	int N = gf16ra::configure(repfact);
+	gf16ra::init();
+	const int K = gf16ra::GF16RA_K;
+	const double R = (double)K / (double)N;
+	// Eb/N0 grid: 0.25 dB step over the noncoherent-FSK cliff regime. Wide
+	// enough to bracket all three rates (R=1/4 cliffs lowest).
+	const double e0 = 2.0, e1 = 9.0, estep = 0.25;
+	const int NTR = 2000;            // block trials per point (BLER resolution)
+	std::mt19937 rng(0xE6B0C0DEu ^ (unsigned)repfact);
+
+	printf("    [genie R=%.3f N=%d repfact=%d esno_metric=%.1f]  (Eb/N0_dB : Es/N0_dB : P_decode : iter_mean)\n",
+		R, N, repfact, esno_for_metric);
+	double cliff50 = 999.0, cliff99 = 999.0;   // lowest Eb/N0 with P>=0.5 / >=0.99
+	for (double ebn0 = e0; ebn0 <= e1 + 1e-9; ebn0 += estep) {
+		int ok = 0; long isum = 0, icnt = 0;
+		for (int it = 0; it < NTR; it++) {
+			uint64_t p38 = (((uint64_t)rng() << 6) ^ rng()) & ((1ULL << 38) - 1ULL);
+			int iters = -2;
+			if (gf16ra_genie_decode_at_ebn0(arq, p38, ebn0, esno_for_metric, rng, &iters)) {
+				ok++;
+				if (iters >= 0) { isum += iters; icnt++; }
+			}
+		}
+		double p = (double)ok / NTR;
+		double esno_db = ebn0 + 10.0 * std::log10(4.0 * R);
+		double imean = (icnt > 0) ? (double)isum / icnt : -1.0;
+		printf("      %6.2f : %7.2f : %.4f : %.1f\n", ebn0, esno_db, p, imean);
+		if (p >= 0.50 && ebn0 < cliff50) cliff50 = ebn0;
+		if (p >= 0.99 && ebn0 < cliff99) cliff99 = ebn0;
+	}
+	double gap50 = cliff50 - GF16RA_NC_M16_FLOOR_DB;
+	double gap99 = cliff99 - GF16RA_NC_M16_FLOOR_DB;
+	printf("    [genie R=%.3f N=%d] cliff(P>=0.5)=%.2f dB Eb/N0 | cliff(P>=0.99)=%.2f dB | GAP-to-floor(+%.2f): P50 %+.2f dB, P99 %+.2f dB\n",
+		R, N, (cliff50<900?cliff50:NAN), (cliff99<900?cliff99:NAN),
+		GF16RA_NC_M16_FLOOR_DB, gap50, gap99);
+}
+
+static void test_gf16_ra_genie_ebn0_sweep() {
+	const char* name = "gf16_ra_genie_ebn0_sweep";
+	const char* env = getenv("MERCURY_INCR1_EBN0");
+	bool run = env && env[0] && env[0] != '0';
+	printf("=== [INCR1-GATE] MERCURY_INCR1_EBN0=%s (genie Eb/N0 sweep %s) ===\n",
+		env ? env : "(unset)", run ? "RUNNING" : "SKIPPED");
+	if (!run) { test_pass(name); return; }
+
+	printf("  [MEASURE] GF(16)-RA PURE-FEC GENIE Eb/N0 vs +%.2f dB noncoherent-M16 floor:\n",
+		GF16RA_NC_M16_FLOOR_DB);
+	printf("    Achievable rate set (codec constraint, K=13 hardwired): repfact 1/2/3 -> R=0.500/0.333/0.250.\n");
+	printf("    Target R in {0.37,0.40} NOT directly achievable (between repfact 1 and 2); R=0.50 is the highest / closest to capacity-optimal ~1/e.\n");
+	// esno_metric: the codec's Bessel intrinsic design point. Default ship value
+	// is GF16RA_ESNO_METRIC=4.0 (Es/N0=6 dB). The cliff sits BELOW that; sweep a
+	// couple of metric points to confirm the result is insensitive (fact-doc §8.5
+	// found the optimum broad ~6 dB). Use the shipped 4.0 for the headline number.
+	gf16ra_genie_ebn0_one(1, GF16RA_ESNO_METRIC);   // R=0.50  (highest achievable)
+	gf16ra_genie_ebn0_one(2, GF16RA_ESNO_METRIC);   // R=0.333
+	gf16ra_genie_ebn0_one(3, GF16RA_ESNO_METRIC);   // R=0.25
+	// Sensitivity: re-run R=0.50 with a lower metric design point (Es/N0=3 dB,
+	// nearer the actual cliff) to confirm the headline gap is not a metric
+	// artifact.
+	printf("    --- esno_metric sensitivity (R=0.50, metric Es/N0=3 dB i.e. esno=2.0) ---\n");
+	gf16ra_genie_ebn0_one(1, 2.0);
+	gf16ra::configure(2);  // restore default
+	test_pass(name);       // infra ran; the dB verdict is in the log
+}
+
 // §19 (INCREMENT 1) — THE GATE FOR THIS INCREMENT: the PRODUCTION CONNECT decode
 // path, with the GF(16) RA FEC wired in (suffix_fec_mode=3 via set_suffix_fec),
 // reaches ~−14 dB SNR3k — i.e. it now tracks the §12 FEC-reach (−14.03), NOT the
@@ -5530,6 +5691,9 @@ int run_mfsk_ctrl_codec_tests() {
 	test_gf16_ra_cliff_sweep();      // [MEASURE] prints the GF(16) cliff + gain dB
 	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
 	test_gf16_ra_production_path_cliff_sweep();
+	// §20 WIN CAMPAIGN INCR-1: PURE-FEC GENIE Eb/N0 gate vs +3.04 dB floor.
+	// MEASURE-only, env-gated MERCURY_INCR1_EBN0=1 (no-op / fast otherwise).
+	test_gf16_ra_genie_ebn0_sweep();
 
 	// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation,
 	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the
