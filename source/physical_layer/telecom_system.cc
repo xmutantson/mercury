@@ -84,6 +84,8 @@ cl_telecom_system::cl_telecom_system()
 	ctrl_nBits=0;
 	ctrl_nsymb=0;
 	mfsk_ctrl_mode=false;
+	robust_ra_K_info=0;   // ROBUST_RA geometry (p2-robust-ra-wiring.md §4); 0 = not on ROBUST_RA
+	robust_ra_N=0;
 	coarse_freq_sync_enabled=false;
 	ack_pattern_passband_samples=0;
 	ack_snr_pattern_passband_samples=0;
@@ -554,7 +556,51 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 
 	interleaver(data_container.encoded_data,data_container.bit_interleaved_data,data_container.nBits,bit_interleaver_block_size);
 
-	if(M == MOD_MFSK)
+	if(M == MOD_MFSK && current_configuration == ROBUST_RA)
+	{
+		// ROBUST_RA TX (WIN CAMPAIGN b, p2-robust-ra-wiring.md §2): the DATA payload is
+		// FEC-coded by the GF(16)-RA codec (NOT binary LDPC), and the codeword TONES are
+		// placed DIRECTLY into ofdm_framed_data (bypassing mfsk.mod's bit→Gray→tone
+		// mapping AND the bit-interleaver — those ran above into bit_interleaved_data but
+		// are IGNORED here). The RA codec is symbol-native, so TX/RX share the symbol-value
+		// MSB-first convention (decode_robust_ra_data unpacks the same way).
+		//
+		// Reads the UN-energy-dispersed payload+CRC bits straight from `data`
+		// (data_container.data_bit[0..nReal_data) == [data][0]); RX likewise does NOT undo
+		// energy dispersal (the RA path is independent of the LDPC scrambler — symmetric).
+		int Nc = data_container.Nc;
+		int K_info = robust_ra_K_info;
+		int Nra = robust_ra_N;                          // = get_active_nsymb() for cfg103
+		std::vector<int> info(K_info, 0), tones(Nra, 0);
+		// Pack nReal_data payload+CRC bits -> K_info GF(16) symbols, 4 bits/sym MSB-first.
+		// (transmit_byte already zero-padded data_bit beyond the payload+CRC; any tail
+		// bits past nReal_data are not read.)
+		int nReal_data_tx = data_container.nBits - ldpc.P;
+		for (int k = 0; k < K_info; k++) {
+			int v = 0;
+			for (int b = 0; b < 4; b++) {
+				int bit_idx = k * 4 + b;
+				int bit = (bit_idx < nReal_data_tx) ? (data[bit_idx] & 1) : 0;
+				v |= bit << (3 - b);
+			}
+			info[k] = v;
+		}
+		gf16ra::configure_k(K_info, ROBUST_RA_REPFACT);
+		gf16ra::encode_k(info.data(), tones.data());
+		// Place each codeword tone (tone+hop)%M in BOTH stream bands (frequency DIVERSITY,
+		// the model the combiner/extractor implement). amp matches mfsk.mod (Nc/nStreams).
+		double amp = sqrt((double)Nc / mfsk.nStreams);
+		for (int s = 0; s < Nra; s++) {
+			for (int k = 0; k < Nc; k++)
+				data_container.ofdm_framed_data[s * Nc + k] = std::complex<double>(0.0, 0.0);
+			int hop = (s * mfsk.tone_hop_step) % mfsk.M;
+			int actual_tone = (tones[s] + hop) % mfsk.M;
+			for (int st = 0; st < mfsk.nStreams; st++)
+				data_container.ofdm_framed_data[s * Nc + mfsk.stream_offsets[st] + actual_tone] =
+					std::complex<double>(amp, 0.0);
+		}
+	}
+	else if(M == MOD_MFSK)
 	{
 		// MFSK: bits → one-hot subcarrier vectors, directly to framed data
 		// In ctrl mode, only modulate first ctrl_nBits interleaved bits (fewer symbols)
@@ -2333,7 +2379,43 @@ skip_h_retry_point:
 				}
 			}
 
-			if(M == MOD_MFSK)
+			// ROBUST_RA RX (WIN CAMPAIGN b, p2-robust-ra-wiring.md §3): decode the
+			// GF(16)-RA data codeword from the SYNCED per-symbol FFT
+			// (ofdm_symbol_demodulated_data, filled by the symbol_demod loop above at the
+			// detector + mini-Moose offset) directly into hd_decoded_data_bit, BYPASSING
+			// mfsk.demod + the bit-interleaver + the binary LDPC. The shared CRC16
+			// self-check + all_zeros + message_decoded contract below runs verbatim. On a
+			// decode/size error, hd_decoded_data_bit is left as-is and the accept gate
+			// rejects (CRC fail or all_zeros) — receive_stats.message_decoded=NO.
+			// ADDITIVE: ra_data_path is true ONLY for cfg103; every other config takes the
+			// byte-identical mfsk.demod / OFDM path.
+			bool ra_data_path = (M == MOD_MFSK && current_configuration == ROBUST_RA && robust_ra_N > 0);
+			if(ra_data_path)
+			{
+				int K_info = robust_ra_K_info;
+				int Nra = robust_ra_N;
+				int nReal_data_ra = nReal_data;   // = nBits - ldpc.P, the payload+CRC bit count
+				std::vector<int> ra_bits((size_t)K_info * 4, 0);
+				int iters = decode_robust_ra_data(data_container.ofdm_symbol_demodulated_data,
+					Nra, K_info, ROBUST_RA_REPFACT, ra_bits.data());
+				receive_stats.iterations_done = iters;   // diagnostic (CRC gates acceptance)
+				if(iters < 0)
+				{
+					// RA config/size error — force the failure path (no decoded bytes).
+					for(int i = 0; i < nReal_data_ra; i++) data_container.hd_decoded_data_bit[i] = 0;
+				}
+				else
+				{
+					// Lay the decoded info bits into hd_decoded_data_bit[0..nReal_data).
+					// decode_robust_ra_data emitted K_info*4 bits MSB-first per GF(16)
+					// symbol (symmetric with the TX pack); copy the first nReal_data of
+					// them (the payload+CRC), zero any non-byte-aligned tail.
+					for(int i = 0; i < nReal_data_ra; i++)
+						data_container.hd_decoded_data_bit[i] =
+							(i < (int)ra_bits.size()) ? ra_bits[i] : 0;
+				}
+			}
+			else if(M == MOD_MFSK)
 			{
 				// MFSK: non-coherent energy detection on FFT output → soft LLRs
 				int rx_nbits = get_active_nbits();
@@ -2631,24 +2713,31 @@ skip_h_retry_point:
 				}
 			}
 
-			deinterleaver(data_container.demodulated_data,data_container.deinterleaved_data,data_container.nBits,bit_interleaver_block_size);
-
-			for(int i=ldpc.P-1;i>=0;i--)
+			// ROBUST_RA bypasses the bit-deinterleaver + binary LDPC decode + energy-
+			// dispersal undo: decode_robust_ra_data already filled hd_decoded_data_bit
+			// from the GF(16)-RA codeword (p2-robust-ra-wiring.md §3). Every other config
+			// (MFSK-LDPC + OFDM) takes this block byte-identical.
+			if(!ra_data_path)
 			{
-				data_container.deinterleaved_data[i+nReal_data+nVirtual_data]=data_container.deinterleaved_data[i+nReal_data];
+				deinterleaver(data_container.demodulated_data,data_container.deinterleaved_data,data_container.nBits,bit_interleaver_block_size);
+
+				for(int i=ldpc.P-1;i>=0;i--)
+				{
+					data_container.deinterleaved_data[i+nReal_data+nVirtual_data]=data_container.deinterleaved_data[i+nReal_data];
+				}
+
+				for(int i=0;i<nVirtual_data;i++)
+				{
+					data_container.deinterleaved_data[nReal_data+i]=data_container.deinterleaved_data[i];
+				}
+
+				auto t4_ldpc = std::chrono::steady_clock::now();
+				receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit);
+				auto t5_ldpc = std::chrono::steady_clock::now();
+				timing_ldpc_ms += std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
+
+				bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, data_container.hd_decoded_data_bit, nReal_data);
 			}
-
-			for(int i=0;i<nVirtual_data;i++)
-			{
-				data_container.deinterleaved_data[nReal_data+i]=data_container.deinterleaved_data[i];
-			}
-
-			auto t4_ldpc = std::chrono::steady_clock::now();
-			receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit);
-			auto t5_ldpc = std::chrono::steady_clock::now();
-			timing_ldpc_ms += std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
-
-			bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, data_container.hd_decoded_data_bit, nReal_data);
 
 
 			bit_to_byte(data_container.hd_decoded_data_bit, data_container.hd_decoded_data_byte, nReal_data);
@@ -3072,11 +3161,19 @@ void cl_telecom_system::set_mfsk_ctrl_mode(bool enable)
 
 int cl_telecom_system::get_active_nsymb() const
 {
+	// ROBUST_RA (p2-robust-ra-wiring.md §4 INV-TX3/INV-RX4): the active data symbol
+	// period count is the RA codeword length N (= robust_ra_N), NOT the full Nsymb.
+	// TX emits and RX reads exactly N periods. Same active-symbol reduction mechanism
+	// as mfsk_ctrl_mode (all consumers already tolerate active<Nsymb).
+	if(current_configuration == ROBUST_RA && robust_ra_N > 0)
+		return robust_ra_N;
 	return (mfsk_ctrl_mode && ctrl_nsymb > 0) ? ctrl_nsymb : data_container.Nsymb;
 }
 
 int cl_telecom_system::get_active_nbits() const
 {
+	if(current_configuration == ROBUST_RA && robust_ra_N > 0)
+		return robust_ra_N * mfsk.bits_per_symbol();
 	return (mfsk_ctrl_mode && ctrl_nBits > 0) ? ctrl_nBits : data_container.nBits;
 }
 
@@ -3482,6 +3579,60 @@ int cl_telecom_system::set_suffix_fec(bool on, int repfact)
 		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
 		* data_container.Nofdm * frequency_interpolation_rate;
 	return ack_mfsk.ctrl_suffix_len();
+}
+
+// ROBUST_RA data decode (WIN CAMPAIGN b). See telecom_system.h + p2-robust-ra-wiring.md
+// §3. Builds the N x 16 tone-energy matrix from the SYNCED per-symbol FFT (the
+// receive_byte symbol_demod output, already mixed/equalized at the detector + mini-Moose
+// offset) and runs the GF(16)-RA Bessel-I0 soft decoder. This is the PRODUCTION Q-ary RA
+// data path; it is the same chain the end-to-end gate test (robust_ra_e2e_cliff) proved
+// through the real combiner-detector + mini-Moose. ADDITIVE: receive_byte calls it only
+// for current_configuration==ROBUST_RA.
+//
+// FRAME-GEOMETRY (p2-robust-ra-wiring.md §1): the codeword length N=K+repfact*K equals
+// robust_ra_N = get_active_nsymb() for cfg103, i.e. exactly the data symbol periods
+// receive_byte FFT'd into sym_fft. The K_info*4 decoded info bits are written MSB-first
+// per GF(16) symbol; receive_byte bit_to_byte's them into hd_decoded_data_byte and runs
+// the SAME CRC16 self-check + message_decoded contract as the LDPC path.
+int cl_telecom_system::decode_robust_ra_data(const std::complex<double>* sym_fft,
+	int n_periods, int K_info, int repfact, int* out_bits)
+{
+	if (sym_fft == NULL || out_bits == NULL) return -1;
+	int N = gf16ra::configure_k(K_info, repfact);
+	if (N <= 0 || N > n_periods) return -1;       // need one period per codeword symbol
+	const int Mt = gf16ra::GF16RA_M;              // GF(16) alphabet = 16 tones
+	if (mfsk.M != Mt) return -1;
+	// Es/No for the Bessel-I0 intrinsic — the §10/§20 spike value (4.0 = ~6 dB),
+	// matching the gate test's GF16RA_ESNO_METRIC (mfsk_ctrl_codec_tests.cc).
+	const double esno_metric = 4.0;
+	int Ncc = data_container.Nc;
+	std::vector<double> E((size_t)N * Mt, 0.0);
+	// Per period s: sum each candidate tone's energy across streams (the M16x2
+	// diversity combine, identical to decode_suffix_energies), then de-hop. The FFT
+	// here is already the centered symbol_demod output indexed [s*Nc + subcarrier].
+	for (int s = 0; s < N; s++) {
+		int hop = (s * mfsk.tone_hop_step) % Mt;
+		for (int t = 0; t < Mt; t++) {
+			double e_comb = 0.0;
+			for (int st = 0; st < mfsk.nStreams; st++) {
+				int sub = mfsk.stream_offsets[st] + t;
+				if (sub < 0 || sub >= Ncc) continue;
+				std::complex<double> v = sym_fft[(size_t)s * Ncc + sub];
+				e_comb += v.real() * v.real() + v.imag() * v.imag();
+			}
+			int data_tone = (t - hop + Mt * 256) % Mt;
+			E[(size_t)s * Mt + data_tone] = e_comb;
+		}
+	}
+	std::vector<int> info(K_info);
+	int iters = gf16ra::soft_decode_k(E.data(), 100, esno_metric, info.data());
+	// Unpack each GF(16) info symbol to 4 bits, MSB-first (matches the TX encode hook in
+	// transmit_bit which packs the same way -- the symmetric production convention for the
+	// RA path; p2-robust-ra-wiring.md §3 INV-RX2).
+	for (int k = 0; k < K_info; k++)
+		for (int b = 0; b < 4; b++)
+			out_bits[k * 4 + b] = (info[k] >> (3 - b)) & 1;
+	return iters;
 }
 
 // §20 (INCREMENT 2): set the CONNECT base-pattern combining factor R. See
@@ -4413,6 +4564,40 @@ void cl_telecom_system::init()
 		reinit_subsystems.data_container=NO;
 	}
 
+	// ROBUST_RA frame geometry (WIN CAMPAIGN b, p2-robust-ra-wiring.md §1/§4).
+	// Computed here AFTER ldpc.init() (sets ldpc.P) + data_container.set_size (sets
+	// nBits) + outer_code_reserved_bits (set in load_configuration before init()) are
+	// all finalized. nReal_data = nBits - ldpc.P payload+CRC bits; the RA codec carries
+	// the SAME bits the binary LDPC would (frame size UNCHANGED vs ROBUST_2 geometry).
+	// K_info = ceil(nReal_data/4) GF(16) info symbols (4 bits/symbol, MSB-first; if
+	// nReal_data%4 the top bits of the last symbol are zero-pad, symmetric TX/RX).
+	// robust_ra_N = configure_k(K_info, REPFACT) = active data symbol-period count for
+	// cfg103. get_active_nsymb/nbits return these for cfg103. Reset to 0 for non-RA.
+	if(current_configuration == ROBUST_RA && M == MOD_MFSK)
+	{
+		int nReal_data_ra = data_container.nBits - ldpc.P;
+		robust_ra_K_info = (nReal_data_ra + 3) / 4;          // ceil to whole GF(16) symbols
+		robust_ra_N = gf16ra::configure_k(robust_ra_K_info, ROBUST_RA_REPFACT);
+		if(robust_ra_N > data_container.Nsymb)
+		{
+			// Should not happen at R1/4 (N=4*ceil(100/4)=100 <= Nsymb=200). Guard so the
+			// frame cannot exceed the allocated symbol periods; clamp + warn (no silent
+			// corruption — p2-robust-ra-wiring.md §1.3 / §8 item 1).
+			printf("[ROBUST_RA] WARNING N=%d > Nsymb=%d (K_info=%d nReal=%d) — geometry overflow, clamping\n",
+				robust_ra_N, data_container.Nsymb, robust_ra_K_info, nReal_data_ra);
+			fflush(stdout);
+			robust_ra_N = data_container.Nsymb;
+		}
+		printf("[ROBUST_RA] geometry: nReal_data=%d K_info=%d repfact=%d N=%d Nsymb=%d (active data periods=%d)\n",
+			nReal_data_ra, robust_ra_K_info, ROBUST_RA_REPFACT, robust_ra_N, data_container.Nsymb, robust_ra_N);
+		fflush(stdout);
+	}
+	else
+	{
+		robust_ra_K_info = 0;
+		robust_ra_N = 0;
+	}
+
 	if(reinit_subsystems.pre_equalization_channel==YES && M != MOD_MFSK)
 	{
 		pre_equalization_channel=CNEW(struct st_channel_complex, data_container.Nc, "ts.pre_eq_channel");
@@ -5163,6 +5348,22 @@ void cl_telecom_system::load_configuration(int configuration)
 	{
 		_modulation=MOD_MFSK;
 		_ldpc_rate=4/16.0;  // Rate 1/4: 4x throughput vs ROBUST_1, waterfall at -8 dB
+		ofdm_preamble_configurator_Nsymb=4;
+		ofdm_channel_estimator=LEAST_SQUARE;
+	}
+	else if(configuration==ROBUST_RA)
+	{
+		// WIN CAMPAIGN (b) -10 data mode. Same M16x2 MFSK PHY as ROBUST_1/2 (the
+		// ROBUST_0 != guards below route 103 -> M16x2), but the DATA payload is
+		// FEC-coded by the GF(16)-RA R1/4 Q-ary codec (gf16ra::*_k), NOT the binary
+		// LDPC. _ldpc_rate is kept at the ROBUST_0/1 1/16 value so the LDPC subsystem
+		// initializes to a known-good matrix for the control/handshake path AND so the
+		// data-frame geometry (nReal_data=100 bits @ M16x2) matches the RA codeword
+		// (K_info=nReal_data/4=25 GF16 syms, R1/4 -> N=100 symbol periods, fits Nsymb=200);
+		// the RA data RX/TX path bypasses the binary LDPC. See
+		// fact-documents/data-flow-robust-ra-e2e.md §4 (INV-C1) + p2-robust-ra-wiring.md §1/§4.
+		_modulation=MOD_MFSK;
+		_ldpc_rate=1/16.0;
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}

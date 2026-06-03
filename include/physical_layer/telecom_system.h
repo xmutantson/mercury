@@ -254,6 +254,31 @@ public:
 	// count (connect_base_total_nsymb()).
 	int  set_connect_preamble_reps(int reps);
 
+	// ROBUST_RA (WIN CAMPAIGN b, fact-documents/p2-robust-ra-wiring.md §3): decode
+	// the M16x2 GF(16)-RA R1/4 data payload from the SYNCED per-symbol FFT
+	// (data_container.ofdm_symbol_demodulated_data, already mixed/equalized at the
+	// detector + mini-Moose offset by receive_byte). Builds the N x 16 tone-energy
+	// matrix (per-stream energy SUM = the M16x2 diversity combine, same as
+	// decode_suffix_energies), runs gf16ra::soft_decode_k (Bessel-I0 intrinsic), and
+	// writes the K_info*4 decoded info bits to out_bits (MSB-first per GF(16) symbol).
+	// repfact selects the rate (3 = R1/4). Returns the BP iteration count (>=0) or -1
+	// on a config/size error. ADDITIVE: receive_byte calls this ONLY when
+	// current_configuration==ROBUST_RA; all other configs keep the mfsk.demod + LDPC
+	// path byte-identical.
+	int  decode_robust_ra_data(const std::complex<double>* sym_fft, int n_periods,
+	                           int K_info, int repfact, int* out_bits);
+
+	// ROBUST_RA frame geometry (p2-robust-ra-wiring.md §1/§4). Computed in
+	// load_configuration's ROBUST_RA arm AFTER the data_container geometry is
+	// finalized: robust_ra_K_info = nReal_data/4 (GF16 info symbols), robust_ra_N =
+	// gf16ra::configure_k(K_info, ROBUST_RA_REPFACT) (codeword symbol count = active
+	// data symbol periods for cfg103). 0 when not on ROBUST_RA. get_active_nsymb/nbits
+	// return robust_ra_N / robust_ra_N*bits_per_symbol for cfg103 (the active-symbol
+	// reduction, same mechanism as mfsk_ctrl_mode). TX (transmit_bit) and RX
+	// (receive_byte) both gate on current_configuration==ROBUST_RA and use these.
+	int  robust_ra_K_info;
+	int  robust_ra_N;
+
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,
 	                                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,
