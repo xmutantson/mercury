@@ -617,6 +617,16 @@ public:
   // builds never call this. See fact-documents/gearshift-start-and-recovery.md §6.4.
   int test_data_anchored_promote();
 
+  // FIX-B — FLOOR-PROBE BACK-OFF synthetic-fire test (CLI --test-probe-backoff).
+  // Drives the REAL arm/gate/reset/predicate machinery (no channel) for the five
+  // PB cases (gearshift-floor-probe-backoff.md §7): PB1 FAIL-BEFORE/PASS-AFTER
+  // (armed rung is suppressed AND the UP gate blocks; reverting the conjunct
+  // fails), PB2 virtual-clock elapse lifts suppression (via sim_clock), PB3
+  // double-arm exponential+cap, PB4 reset zeroes, PB5 INV-2 (panic/demote targets
+  // unchanged with back-off armed). Returns 0 on pass, 1 on fail. Default builds
+  // never call this. See fact-documents/gearshift-floor-probe-backoff.md §7.
+  int test_probe_backoff();
+
   // Phantom-ACK content gate (2026-05-29). PURE policy predicate for the
   // clean-batch DATA-ACK bare-pattern acceptance at arq_commander.cc:2809.
   // receive_ack_pattern() returns a BARE bool on pattern-match-only (matched
@@ -1930,6 +1940,55 @@ public:
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
   int  frame_gearshift_retry_count;   // §7.13.33: retries on PHY-switched first batch before BREAK (rx_mute timing race)
+
+  // FIX-B — FLOOR-PROBE BACK-OFF state (gearshift-floor-probe-backoff.md §3).
+  // probe_backoff_until_ms[i] is the opt_now_ms() timestamp BEFORE which the
+  // config at FULL_CONFIG_LADDER index i must NOT be re-probed UP-ward (0 = no
+  // back-off armed). Indexed by config_ladder_index(cfg) (range
+  // [0,FULL_CONFIG_LADDER_SIZE)). probe_backoff_ms is the CURRENT exponential
+  // back-off window — doubled on each repeat up-probe fail, capped at
+  // PROBE_BACKOFF_MS_CAP, reset to PROBE_BACKOFF_MS_INIT the instant a clean
+  // OFDM batch is delivered. CMD-only state (the climb-control loop lives on the
+  // commander; the RSP has no climb decision). All three accessors are PURE
+  // helpers (no I/O) so the synthetic-fire unit test drives them with no live
+  // channel. INV-4: probe_rung_suppressed() reads opt_now_ms() ONLY — the SAME
+  // virtual clock the FTRT sim drives — NEVER cl_timer (which is wall-clock).
+  unsigned long long probe_backoff_until_ms[FULL_CONFIG_LADDER_SIZE];
+  int probe_backoff_ms;
+
+  // FIX-B predicate — TRUE iff `cfg` is currently under a floor-probe back-off
+  // (a proven-failed up-probe whose suppression window has not yet elapsed).
+  // PURE / const; reads opt_now_ms() ONLY (INV-4). A cfg not on the ladder
+  // (config_ladder_index < 0) is never suppressed (defensive). INV-1: this is
+  // AND-ed into the EXISTING up-gate (turning a PERMITTED probe OFF), so it can
+  // only ADD suppression — it never unblocks a probe the anchor/+1/ceiling
+  // clamps already blocked.
+  bool probe_rung_suppressed(int cfg) const {
+    int idx = config_ladder_index(cfg);
+    if(idx < 0) return false;
+    return opt_now_ms() < probe_backoff_until_ms[idx];
+  }
+
+  // FIX-B producer — ARM the back-off on `cfg` after a PROVEN-FAILED up-probe.
+  // Sets the suppression deadline to now + the current window, then DOUBLES the
+  // window (capped) so a repeat fail of the same/another rung waits longer. A
+  // cfg not on the ladder is ignored (defensive). NOT const.
+  void probe_backoff_arm(int cfg) {
+    int idx = config_ladder_index(cfg);
+    if(idx < 0) return;
+    probe_backoff_until_ms[idx] = opt_now_ms() + (unsigned long long)probe_backoff_ms;
+    long long next = (long long)probe_backoff_ms * 2;
+    if(next > (long long)PROBE_BACKOFF_MS_CAP) next = (long long)PROBE_BACKOFF_MS_CAP;
+    probe_backoff_ms = (int)next;
+  }
+
+  // FIX-B producer — RESET the entire back-off (called on a clean OFDM batch:
+  // the channel proved an OFDM rung recovered, so no rung is "proven-failed"
+  // anymore and the window returns to its INIT value). NOT const.
+  void probe_backoff_reset() {
+    for(int i=0; i<FULL_CONFIG_LADDER_SIZE; i++) probe_backoff_until_ms[i] = 0ULL;
+    probe_backoff_ms = PROBE_BACKOFF_MS_INIT;
+  }
 
   // Turboshift: bidirectional probing phase before data exchange
   enum TurboshiftPhase { TURBO_FORWARD, TURBO_REVERSE, TURBO_DONE };

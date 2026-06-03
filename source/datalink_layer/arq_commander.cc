@@ -2413,6 +2413,14 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
 
+				// FIX-B — ARM the floor-probe back-off on the FAILED up-probe rung
+				// (gearshift-floor-probe-backoff.md §5.1, arm-site #1). This is the
+				// SET_CONFIG-ACK-timeout fail: the SET_CONFIG to negotiated_configuration
+				// (the proposed UP rung) was NAcked. Arm BEFORE the working_config
+				// overwrite below clobbers negotiated_configuration, so the back-off is
+				// keyed to the rung the climb actually tried (not the recovered rung).
+				probe_backoff_arm(negotiated_configuration);
+
 				int working_config = config_ladder_down(negotiated_configuration, robust_enabled);
 				frame_shift_threshold *= 2;
 				consecutive_data_acks = 0;
@@ -3291,6 +3299,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		{
 			frame_gearshift_just_applied = false;
 			frame_gearshift_retry_count = 0;
+			// FIX-B — ARM the floor-probe back-off on the FAILED up-probe rung
+			// (gearshift-floor-probe-backoff.md §5.1, arm-site #2). NACK data-fail:
+			// the just-applied FRAME-UP to data_configuration could not pass DATA.
+			// Arm BEFORE the working_config overwrite below clobbers
+			// data_configuration, so the back-off is keyed to the rung that failed.
+			probe_backoff_arm(data_configuration);
 			int working_config = config_ladder_down(data_configuration, robust_enabled);
 			frame_shift_threshold *= 2;
 
@@ -3470,6 +3484,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			{
 				frame_gearshift_just_applied = false;
 				frame_gearshift_retry_count = 0;
+				// FIX-B — ARM the floor-probe back-off on the FAILED up-probe rung
+				// (gearshift-floor-probe-backoff.md §5.1, arm-site #3). pat data-fail:
+				// the just-applied FRAME-UP to data_configuration could not pass DATA
+				// (the MFSK-ACK-PAT path, after the §7.13.33 single retry already
+				// failed). Arm BEFORE the working_config overwrite below clobbers
+				// data_configuration, so the back-off is keyed to the rung that failed.
+				probe_backoff_arm(data_configuration);
 				int working_config = config_ladder_down(data_configuration, robust_enabled);
 				frame_shift_threshold *= 2;
 
@@ -3699,6 +3720,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				last_data_viable_config = data_anchor_raise_target(
 					clean_batches_config, current_configuration,
 					last_data_viable_config, clean_batches_at_current_config);
+				// FIX-B — RESET the floor-probe back-off on a CLEAN OFDM batch
+				// (gearshift-floor-probe-backoff.md §5.3). This is the sole reset
+				// producer: a fully-delivered batch at an OFDM config proves an OFDM
+				// rung recovered, so no rung is "proven-failed" anymore — clear every
+				// per-rung deadline and return the window to INIT. Gated on
+				// is_ofdm_config(current_configuration): a clean ROBUST-tier batch does
+				// NOT lift the back-off (the failed up-probe rung is OFDM; only OFDM
+				// success is evidence the boundary improved). Inside the
+				// promotion_allowed_on_batch() clean branch, so a partial SACK never
+				// resets the back-off.
+				if(is_ofdm_config(current_configuration))
+					probe_backoff_reset();
 			}
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
@@ -3746,6 +3779,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// the next rung but never skip ahead of unproven ground. See §6/§7.
 			if(!optimizer_is_in_control() &&
 			   config_ladder_index(proposed_frame) > config_ladder_index(last_data_viable_config) + 1)
+				frame_ceiling_blocked = true;
+			// FIX-B — floor-probe back-off (gearshift-floor-probe-backoff.md §5.2,
+			// gate-site #1). AND the per-rung suppression into the EXISTING up gate:
+			// a proven-failed up-probe is not re-hammered until its back-off elapses
+			// (or a clean OFDM batch resets it). INV-1: this only turns a PERMITTED
+			// probe OFF — it never unblocks a probe the anchor/+1/ceiling clamps above
+			// already blocked. INV-2: this is the UP path only; no BREAK/demote/panic
+			// (downward) site references the back-off, so the deep-SNR escape is intact.
+			if(probe_rung_suppressed(proposed_frame))
 				frame_ceiling_blocked = true;
 		// Handoff: above the lowest calibrated Q-table cell, the optimizer
 		// is the sole authority for upward config changes. Gearshift's
@@ -5063,6 +5105,12 @@ void cl_arq_controller::finalize_block_commander()
 				if(!optimizer_is_in_control() &&
 					config_ladder_index(proposed) > config_ladder_index(last_data_viable_config) + 1)
 					ceiling_blocked = true;
+				// FIX-B — floor-probe back-off (gearshift-floor-probe-backoff.md §5.2,
+				// gate-site #3, legacy v1 inline LADDER-UP twin). AND the per-rung
+				// suppression into the EXISTING up gate. INV-1: only turns a PERMITTED
+				// probe OFF. INV-2: UP path only; no downward site references back-off.
+				if(probe_rung_suppressed(proposed))
+					ceiling_blocked = true;
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;
@@ -5219,6 +5267,12 @@ void cl_arq_controller::policy_evaluate_axis1()
 		// predicate self-contained.) See §6/§7.
 		if(!optimizer_is_in_control() &&
 			config_ladder_index(proposed) > config_ladder_index(last_data_viable_config) + 1)
+			ceiling_blocked = true;
+		// FIX-B — floor-probe back-off (gearshift-floor-probe-backoff.md §5.2,
+		// gate-site #2, v2 policy_evaluate_axis1). AND the per-rung suppression into
+		// the EXISTING up gate. INV-1: only turns a PERMITTED probe OFF. INV-2: UP
+		// path only; no BREAK/demote/panic (downward) site references the back-off.
+		if(probe_rung_suppressed(proposed))
 			ceiling_blocked = true;
 		if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 		{
@@ -6204,6 +6258,192 @@ int cl_arq_controller::test_data_anchored_promote()
 	check(negotiated_configuration == CONFIG_0, "B3: gate releases one rung as anchor advances", negotiated_configuration, CONFIG_0);
 
 	printf("[TEST-DATA-ANCHOR] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// FIX-B — FLOOR-PROBE BACK-OFF synthetic-fire test (CLI --test-probe-backoff).
+// Drives the REAL arm/gate/reset/predicate machinery with NO channel. Models the
+// CONFIG_0↔ROBUST limit cycle at the deep-SNR floor: anchor parked at ROBUST_2,
+// the climb probes UP to CONFIG_0 (one rung above the anchor — the anchor+1 clamp
+// PERMITS it), CONFIG_0 fails, and pre-FIX-B the climb re-probes CONFIG_0 every
+// cycle (the airtime-burning thrash). FIX-B arms a per-rung back-off so the
+// proven-failed CONFIG_0 probe is suppressed until it elapses (PB1/PB2) or a clean
+// OFDM batch resets it (PB4); the window grows exponentially+capped (PB3); and the
+// deep-SNR DOWNWARD escape is provably untouched (PB5 / INV-2). Returns 0 on pass.
+// See fact-documents/gearshift-floor-probe-backoff.md §7.
+int cl_arq_controller::test_probe_backoff()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long long got, long long want) {
+		if(cond) {
+			printf("[TEST-PROBE-BACKOFF] PASS: %s (got=%lld want=%lld)\n", name, got, want);
+		} else {
+			printf("[TEST-PROBE-BACKOFF] FAIL: %s (got=%lld want=%lld)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Enable the SIM (virtual) clock so opt_now_ms() — which probe_rung_suppressed()
+	// reads (INV-4) — is DETERMINISTIC and ADVANCEABLE via sim_clock_add_samples().
+	// This is the SAME virtual clock the FTRT sim drives; PB2 elapses it explicitly.
+	// Restore the production (wall-clock) source on every exit path.
+	const uint64_t prev_samples = sim_clock_now_samples();
+	sim_clock_set_enabled(1);
+	auto restore_clock = [&]() { sim_clock_set_enabled(0); };
+
+	// ---- Common priming: -R gearshift session, anchor parked at ROBUST_2 ----
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;            // force optimizer_is_in_control()==false
+	sack_v2_enabled = true;               // route the UP gate to policy_evaluate_axis1
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+	supershift_proven_ceiling = -1;       // no ceiling cap (so the back-off is the sole blocker)
+	last_data_viable_config = ROBUST_2;   // anchor parked here
+	// CONFIG_0 = config_ladder_up(ROBUST_2) = the one-rung-above probe the floor hammers.
+	const int probe_cfg = config_ladder_up(ROBUST_2, robust_enabled, false);
+	check(probe_cfg == CONFIG_0, "precondition: up-probe from ROBUST_2 is CONFIG_0",
+		probe_cfg, CONFIG_0);
+
+	// Fresh back-off state (mirror ctor / reset_session_state).
+	probe_backoff_reset();
+
+	// ====================================================================
+	// PB1 — FAIL-BEFORE -> PASS-AFTER. With CONFIG_0 ARMED, (a) the predicate
+	// reports suppressed AND (b) the REAL UP gate (policy_evaluate_axis1) does NOT
+	// promote to CONFIG_0. The FAIL-BEFORE is proven explicitly: clearing the
+	// back-off (== reverting the `&& !probe_rung_suppressed(proposed)` conjunct,
+	// the pre-FIX-B code) makes the SAME gate DO promote to CONFIG_0 — so the
+	// back-off is the SOLE blocker; the anchor/+1/ceiling clamps PERMIT this probe.
+	// ====================================================================
+	probe_backoff_arm(CONFIG_0);
+	check(probe_rung_suppressed(CONFIG_0) == true,
+		"PB1a: armed CONFIG_0 reports suppressed", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 1);
+
+	// Drive the REAL up gate. Prime its preconditions (clean rate over threshold,
+	// blocks-held at threshold) exactly as test_data_anchored_promote does.
+	auto run_up_gate = [&]() -> int {
+		current_configuration = ROBUST_2;
+		negotiated_configuration = ROBUST_2;
+		last_transmission_block_stats.success_rate_data = 100.0f;
+		success_rate_data_clean = 100.0;
+		gear_shift_down_consecutive_fails = 0;
+		messages_control.status = FREE;
+		gear_shift_blocked_for_nBlocks = gear_shift_block_for_nBlocks_total;
+		policy_evaluate_axis1();
+		return negotiated_configuration;
+	};
+
+	int afterArmed = run_up_gate();
+	check(afterArmed == ROBUST_2,
+		"PB1b: suppressed probe BLOCKED by UP gate (parks at ROBUST_2)", afterArmed, ROBUST_2);
+
+	// FAIL-BEFORE demonstration: remove the suppression (== drop the conjunct) and
+	// the SAME gate now promotes to CONFIG_0 (the pre-FIX-B thrash behavior).
+	probe_backoff_reset();
+	check(probe_rung_suppressed(CONFIG_0) == false,
+		"PB1c: after reset CONFIG_0 NOT suppressed (revert-conjunct)",
+		probe_rung_suppressed(CONFIG_0) ? 1 : 0, 0);
+	int afterRevert = run_up_gate();
+	check(afterRevert == CONFIG_0,
+		"PB1d FAIL-BEFORE: WITHOUT back-off the gate DOES promote to CONFIG_0",
+		afterRevert, CONFIG_0);
+
+	// ====================================================================
+	// PB2 — virtual-clock elapse lifts suppression. Arm CONFIG_0, advance the SIM
+	// clock past the window via sim_clock_add_samples (48000 samples = 1000 ms).
+	// ====================================================================
+	probe_backoff_reset();
+	probe_backoff_arm(CONFIG_0);                       // window = INIT (8000 ms)
+	check(probe_rung_suppressed(CONFIG_0) == true,
+		"PB2a: just-armed CONFIG_0 suppressed", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 1);
+	// Advance just under the window — still suppressed.
+	sim_clock_add_samples((uint64_t)(PROBE_BACKOFF_MS_INIT - 1000) * (SIM_CLOCK_SAMPLE_RATE_HZ / 1000));
+	check(probe_rung_suppressed(CONFIG_0) == true,
+		"PB2b: still suppressed before window elapses", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 1);
+	// Advance past the window — suppression lifts.
+	sim_clock_add_samples((uint64_t)2000 * (SIM_CLOCK_SAMPLE_RATE_HZ / 1000));
+	check(probe_rung_suppressed(CONFIG_0) == false,
+		"PB2c: suppression LIFTS after virtual window elapses", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 0);
+
+	// ====================================================================
+	// PB3 — exponential back-off, capped. Each arm uses the CURRENT window then
+	// DOUBLES it: INIT -> 2*INIT -> ... -> CAP (and stays at CAP).
+	// ====================================================================
+	probe_backoff_reset();
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT,
+		"PB3a: reset window == INIT", probe_backoff_ms, PROBE_BACKOFF_MS_INIT);
+	probe_backoff_arm(CONFIG_0);                       // consumes INIT, window -> 2*INIT
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT * 2,
+		"PB3b: window doubled 8s->16s after first arm", probe_backoff_ms, PROBE_BACKOFF_MS_INIT * 2);
+	probe_backoff_arm(CONFIG_0);                       // window -> 4*INIT
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT * 4,
+		"PB3c: window doubled 16s->32s after second arm", probe_backoff_ms, PROBE_BACKOFF_MS_INIT * 4);
+	// Hammer it well past the cap; it must clamp at CAP and never exceed it.
+	for(int i=0; i<20; i++) probe_backoff_arm(CONFIG_0);
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_CAP,
+		"PB3d: window clamps at CAP", probe_backoff_ms, PROBE_BACKOFF_MS_CAP);
+
+	// ====================================================================
+	// PB4 — reset zeroes every per-rung deadline and returns the window to INIT.
+	// ====================================================================
+	probe_backoff_arm(ROBUST_1);   // arm a couple of distinct rungs
+	probe_backoff_arm(CONFIG_0);
+	probe_backoff_reset();
+	int nonzero = 0;
+	for(int i=0; i<FULL_CONFIG_LADDER_SIZE; i++)
+		if(probe_backoff_until_ms[i] != 0ULL) nonzero++;
+	check(nonzero == 0, "PB4a: all per-rung deadlines zeroed after reset", nonzero, 0);
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT,
+		"PB4b: window back to INIT after reset", probe_backoff_ms, PROBE_BACKOFF_MS_INIT);
+	check(probe_rung_suppressed(CONFIG_0) == false,
+		"PB4c: no rung suppressed after reset", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 0);
+
+	// ====================================================================
+	// PB5 — INV-2: the deep-SNR DOWNWARD escape is UNTOUCHED with a back-off ARMED.
+	// The panic floor (break_target_with_anchor, panic-bypass) and the anchor
+	// DEMOTE (anchor_demote_target) take NO back-off input, so arming CONFIG_0
+	// cannot trap the link above the floor. Assert their targets are IDENTICAL
+	// with and without the back-off armed — and that panic still reaches ROBUST_0.
+	// ====================================================================
+	// Capture the downward-escape targets with NO back-off armed.
+	probe_backoff_reset();
+	last_data_viable_config = ROBUST_1;        // anchor at ROBUST_1 for the floor helpers
+	breaks_since_last_data_success = 2;        // panic latched
+	emergency_previous_config = ROBUST_2;
+	int rawDeep = config_ladder_down_n(emergency_previous_config, 100, robust_enabled);
+	int panicTargetNoBackoff   = break_target_with_anchor(rawDeep);
+	int demoteTargetNoBackoff  = anchor_demote_target(last_data_viable_config,
+		ANCHOR_DEMOTE_BREAK_FAILS, robust_enabled);
+	// Now ARM the back-off on CONFIG_0 (and the anchor rung for good measure) and
+	// re-evaluate the SAME downward escapes — must be byte-identical.
+	probe_backoff_arm(CONFIG_0);
+	probe_backoff_arm(ROBUST_1);
+	int panicTargetArmed   = break_target_with_anchor(rawDeep);
+	int demoteTargetArmed  = anchor_demote_target(last_data_viable_config,
+		ANCHOR_DEMOTE_BREAK_FAILS, robust_enabled);
+	check(panicTargetArmed == panicTargetNoBackoff,
+		"PB5a: panic floor UNCHANGED with back-off armed", panicTargetArmed, panicTargetNoBackoff);
+	check(panicTargetArmed == ROBUST_0,
+		"PB5b: panic still reaches ROBUST_0 (deep escape intact)", panicTargetArmed, ROBUST_0);
+	check(demoteTargetArmed == demoteTargetNoBackoff,
+		"PB5c: anchor DEMOTE target UNCHANGED with back-off armed", demoteTargetArmed, demoteTargetNoBackoff);
+	check(demoteTargetArmed == ROBUST_0,
+		"PB5d: anchor demote from ROBUST_1 reaches ROBUST_0 (downward)", demoteTargetArmed, ROBUST_0);
+	breaks_since_last_data_success = 0;        // restore
+
+	// Restore the production clock and the back-off to a clean state.
+	probe_backoff_reset();
+	restore_clock();
+	// Defensive: the sim sample counter is process-global; leave it where it is
+	// (a one-shot test process exits immediately) but note the starting value.
+	(void)prev_samples;
+
+	printf("[TEST-PROBE-BACKOFF] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
