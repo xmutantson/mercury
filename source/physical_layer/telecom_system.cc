@@ -5167,6 +5167,23 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
 
+	// === SIM-ONLY: WIN-CAMPAIGN INCR-1 rate-win knob (m48-ratewin worktree) ===
+	// Env-gated, byte-identical when unset. MERCURY_RATEWIN_M48 forces the robust
+	// MFSK PHY to M=48 single-stream (RATE geometry) instead of M16x2 DIVERSITY
+	// (REACH geometry); MERCURY_RATEWIN_RATE=<n> overrides the LDPC code rate to
+	// n/16 (e.g. 8 = rate 1/2, the ROBUST_3 fail-before anchor's rate). Only the
+	// robust (MFSK) WB configs are affected; production paths never set these.
+	// See fact-documents/m48-ratewin-feasibility.md.
+	if(_modulation==MOD_MFSK && !narrowband_enabled && getenv("MERCURY_RATEWIN_M48")!=NULL)
+	{
+		const char* rate_env = getenv("MERCURY_RATEWIN_RATE");
+		if(rate_env!=NULL)
+		{
+			int rn = atoi(rate_env);
+			if(rn>=1 && rn<=14) _ldpc_rate = (float)rn / 16.0f;
+		}
+	}
+
 	// Amplitude restoration disabled for all modes: full ZF equalization
 	// preserves |H| for MMSE erasure and CSI weighting on frequency-selective channels.
 	// Previously PSK modes forced |H|=1, losing 35 dB SNR on analog channels with ~8 dB variation.
@@ -5453,6 +5470,14 @@ void cl_telecom_system::load_configuration(int configuration)
 				mfsk_M = narrowband_enabled ? 4 : 16;
 				mfsk_nStreams = 2;
 			}
+			// SIM-ONLY rate-win knob: single-stream higher-order override (see :5170).
+			// MERCURY_RATEWIN_M=<M> sets the tone order (default 48); nStreams forced 1.
+			if(!narrowband_enabled && getenv("MERCURY_RATEWIN_M48")!=NULL) {
+				const char* m_env = getenv("MERCURY_RATEWIN_M");
+				mfsk_M = (m_env!=NULL) ? atoi(m_env) : 48;
+				if(mfsk_M < 2) mfsk_M = 48;
+				mfsk_nStreams = 1;
+			}
 			mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
 		}
 		else
@@ -5500,6 +5525,13 @@ void cl_telecom_system::load_configuration(int configuration)
 		} else {
 			mfsk_M = narrowband_enabled ? 4 : 16;
 			mfsk_nStreams = 2;
+		}
+		// SIM-ONLY rate-win knob: single-stream higher-order override (see :5170).
+		if(!narrowband_enabled && getenv("MERCURY_RATEWIN_M48")!=NULL) {
+			const char* m_env = getenv("MERCURY_RATEWIN_M");
+			mfsk_M = (m_env!=NULL) ? atoi(m_env) : 48;
+			if(mfsk_M < 2) mfsk_M = 48;
+			mfsk_nStreams = 1;
 		}
 		mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
 	}
