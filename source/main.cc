@@ -255,6 +255,15 @@ int main(int argc, char *argv[])
             failed += run_sim_clock_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-sim-clock : run ONLY the sim-clock unit suite and exit. The
+        // full --test suite includes long stochastic MFSK detector sweeps;
+        // this gives a fast, deterministic entry for the sim-clock tests
+        // (test (a) of sim-arq-channel.md §3). Production behavior of --test is
+        // unchanged.
+        if (strcmp(argv[i], "--test-sim-clock") == 0) {
+            int failed = run_sim_clock_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;
