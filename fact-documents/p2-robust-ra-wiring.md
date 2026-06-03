@@ -606,5 +606,5 @@ Front B' "raw" lever (PHY-rate) combines orthogonally with this efficiency win a
 
 ### §10.8 Branch + commit
 Branch `win/incr1-longer-frame-airtime` off the integration `win/integ-incr1-incr2 @fd5c698`
-(worktree `C:/Users/kamer/mercury_wt/win-integ-incr1-incr2`). Commit hash: [filled at
-commit]. NOT pushed; integration branch otherwise untouched. SIM-only.
+(worktree `C:/Users/kamer/mercury_wt/win-integ-incr1-incr2`). Commit hash: **dc029fb**
+(code + this §10). NOT pushed; integration branch otherwise untouched. SIM-only.
