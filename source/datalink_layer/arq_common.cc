@@ -2907,7 +2907,18 @@ void cl_arq_controller::process_main()
 	// yield here hot-spun the loop and helped desync the CMD<->RSP turnaround).
 	// Gated on the flag -> production unchanged.
 	if (sim_clock_enabled())
+	{
+		// Publish the link state for the TX-bridge idle pacer's FTRT flood gate
+		// (sim-ftrt-speedup-floor.md §9). The idle-silence flood (which sets how
+		// fast virtual time advances) is SAFE only once CONNECTED; the multi-
+		// stage half-duplex handshake must stay paced or its TX/RX turnaround
+		// interleave desyncs CONNECT. process_main() is the once-per-iteration
+		// ARQ chokepoint, so this is always fresh. sim-only — production never
+		// reaches this branch (sim_clock_enabled()==0), so the TX-bridge flood
+		// branch is unreachable in production and behavior is byte-identical.
+		sim_clock_set_link_connected(link_status == CONNECTED);
 		sim_spin_sleep();
+	}
 	else
 		usleep(2000);
 }

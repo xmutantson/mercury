@@ -200,26 +200,49 @@ static inline void sim_tx_idle_pace(void)
 {
 	if (sim_clock_enabled())
 	{
-		// CONNECT-SAFETY (sim-ftrt-speedup-floor.md §7). A flat-out yield here
-		// floods idle silence faster than real time; forwarded to the peer it
-		// DESYNCS the half-duplex HAIL/CONNECT handshake — the receiving peer's
-		// connect FSM advances on its fast virtual clock and false-triggers into
-		// Receiving on the noise flood BEFORE the real HAIL aligns, so CONNECT
-		// never completes (clean SNR35 -> 0 bytes, three flood variants all broke
-		// it; the relay big-step does not help because during a handshake one side
-		// always carries signal so the other side's silence is NOT coalesced).
-		// The handshake FSM has real wall-clock-coupled timing that virtual-time
-		// acceleration breaks — see §7/§8 for the architectural conclusion. So the
-		// idle silence emit is paced to a real (sub-)ms tick, same as the RX data
-		// path. The SAFE, shipped speed-up is the ARQ-thread + spin-helper yield
-		// (sim_spin_sleep, arq_common.cc) which frees the wasted core WITHOUT
-		// touching virtual-time rate (CONNECT-safe, bisect-verified).
+		// LINK-STATE-GATED FTRT speed-up (sim-ftrt-speedup-floor.md §9).
+		//
+		// The idle silence emit RATE sets how fast virtual time advances (the
+		// relay stamps one chunk = 1024 samples per forwarded chunk). Flooding
+		// it flat-out hits >5x — BUT only the CONNECTED DATA phase is safe to
+		// flood. Phase-1 trace (§9.1): under a flat-out flood the HAIL itself
+		// still detects cleanly (metric 36.0), but the multi-stage half-duplex
+		// HANDSHAKE turnaround (HAIL→response→START_CONNECTION→TEST_CONNECTION)
+		// races: the commander, beaconing flat-out, MISSES the responder's first
+		// HAIL response (its own post-TX capture flush eats it), the responder's
+		// hail_timeout then fires and it re-scans — extra round-trips that make
+		// CONNECT flaky (1/3 on clean+tx). This is half-duplex TX/RX INTERLEAVE
+		// nondeterminism, not clock leakage: the handshake's loose alignment had
+		// been provided incidentally by the wall-clock pace.
+		//
+		// FIX: gate the flood on link_status == CONNECTED, published by the ARQ
+		// main loop (arq_common.cc process_main, sim-only). During the ENTIRE
+		// handshake (Idle/Listening/Connecting/ConnectionReceived/Negotiating)
+		// link_status != CONNECTED → we PACE (Sleep(1)), so the handshake runs
+		// at the proven-safe baseline cadence (byte-identical to the shipped
+		// 1.4x build). Once CONNECTED, the data phase (the bulk of any transfer,
+		// dominated by both-peers-idle ACK turnarounds) floods flat-out → >5x.
+		// Determinism holds: the relay K=1 barrier + shared clock fix the
+		// virtual timeline regardless of wall speed (the flood data phase is
+		// run-to-run bit-identical, §9.3), and the flood only ever runs when the
+		// link is already established so it cannot perturb a handshake.
+		if (sim_link_connected())
+		{
 #if defined(FF_WIN)
-		Sleep(1);
+			Sleep(0);          // yield: flood idle silence flat-out (data phase)
 #else
-		struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 };  // 200 us
-		nanosleep(&ts, NULL);
+			sched_yield();
 #endif
+		}
+		else
+		{
+#if defined(FF_WIN)
+			Sleep(1);          // pace: keep the handshake turnaround aligned
+#else
+			struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 };  // 200 us
+			nanosleep(&ts, NULL);
+#endif
+		}
 	}
 	else
 	{

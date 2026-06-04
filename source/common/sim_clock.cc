@@ -14,6 +14,11 @@
 // behavior is byte-identical to the pre-sim-clock cl_timer.
 static std::atomic<int>      g_sim_time_enabled{0};
 static std::atomic<uint64_t> g_sim_samples{0};
+// FTRT link-state gate (sim-ftrt-speedup-floor.md §9): non-zero when the ARQ
+// link_status == CONNECTED. Set ONLY on the -x sim path (the ARQ main loop
+// gates its publish on sim_clock_enabled()), so production never writes it and
+// the TX-bridge idle pacer's flood branch is unreachable in production.
+static std::atomic<int>      g_sim_link_connected{0};
 
 extern "C" int sim_clock_enabled(void)
 {
@@ -87,4 +92,17 @@ extern "C" void sim_clock_fill_timespec(struct timespec *ts)
     uint64_t ns = sim_clock_now_ns();
     ts->tv_sec  = (time_t)(ns / 1000000000ULL);
     ts->tv_nsec = (long)(ns % 1000000000ULL);
+}
+
+extern "C" int sim_link_connected(void)
+{
+    // Relaxed: a single producer (the ARQ main loop) and a single consumer (the
+    // TX-bridge idle pacer); a one-iteration-stale read only mis-paces ONE idle
+    // chunk (~21ms virtual), harmless. No ordering needed against other state.
+    return g_sim_link_connected.load(std::memory_order_relaxed);
+}
+
+extern "C" void sim_clock_set_link_connected(int connected)
+{
+    g_sim_link_connected.store(connected ? 1 : 0, std::memory_order_relaxed);
 }

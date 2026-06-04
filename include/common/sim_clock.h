@@ -105,7 +105,20 @@ extern "C" {
  *                            entry point every decision-path clock funnels
  *                            through.
  * sim_clock_fill_timespec(ts) : write sim_clock_now_ns() into *ts as a
- *                            monotonic timespec (the cl_timer call shape). */
+ *                            monotonic timespec (the cl_timer call shape).
+ *
+ * sim_link_connected()     : non-zero when the ARQ link_status == CONNECTED.
+ *                            Published once-per-iteration by the ARQ main loop
+ *                            (arq_common.cc process_main, sim-gated) and read by
+ *                            the TX-bridge idle pacer (audioio.c sim_tx_idle_pace)
+ *                            to decide flood-vs-pace: the FTRT idle-silence flood
+ *                            is SAFE only on the CONNECTED data phase; the
+ *                            multi-stage half-duplex handshake must stay paced or
+ *                            its TX/RX turnaround interleave desyncs (CONNECT goes
+ *                            flaky). sim-ftrt-speedup-floor.md §9. Defaults to 0;
+ *                            production never sets it (sim_clock_enabled()==0), so
+ *                            the production sim_tx_idle_pace path is untouched.
+ * sim_clock_set_link_connected(c) : ARQ publisher hook for the above. */
 int      sim_clock_enabled(void);
 void     sim_clock_set_enabled(int enabled);
 void     sim_clock_add_samples(uint64_t n);
@@ -113,6 +126,8 @@ void     sim_clock_set_samples(uint64_t n);
 uint64_t sim_clock_now_samples(void);
 uint64_t sim_clock_now_ns(void);
 void     sim_clock_fill_timespec(struct timespec *ts);
+int      sim_link_connected(void);
+void     sim_clock_set_link_connected(int connected);
 
 #ifdef __cplusplus
 }  /* extern "C" */
