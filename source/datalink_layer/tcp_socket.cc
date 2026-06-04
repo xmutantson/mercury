@@ -85,14 +85,23 @@ int cl_tcp_socket::init()
 			else
 			{
 				server.sin_family = AF_INET;
-				// Bind loopback only (127.0.0.1), NOT INADDR_ANY (0.0.0.0). Two reasons:
-				// (1) avoids the Windows Firewall "allow on the network?" prompt that fires
-				//     for every new mercury.exe path (e.g. per-worktree builds); loopback
-				//     binds are never filtered/prompted. (2) the TNC/control socket should
-				//     not be exposed to the LAN -- all clients (sim harness, GUI, on-Pi test
-				//     scripts) connect via 127.0.0.1. If remote access is ever needed, make
-				//     this configurable (INI/flag); do not default back to INADDR_ANY.
+				// Bind address is platform-conditional:
+				//   Windows  -> 127.0.0.1 (loopback): avoids the Windows Firewall "allow on the
+				//     network?" prompt that fires per new mercury.exe path (per-worktree dev/sim
+				//     builds spammed the user), and keeps the control socket off the LAN. Every
+				//     Windows-local client (sim harness, GUI, VB-Cable ARQ tests) connects via
+				//     127.0.0.1, so loopback is correct there.
+				//   Linux/Pi -> INADDR_ANY (0.0.0.0): the IONOS bench harness runs on the Windows
+				//     HOST and connects to the Pi's LAN IP, so loopback-only REFUSES it (regression
+				//     caught 2026-06-04 -- a blanket INADDR_LOOPBACK broke the testbed). The Pi is
+				//     Linux (no Windows Firewall), so binding all interfaces is safe + required.
+				// If a Windows station ever needs LAN access, add a CLI/INI override (do not flip
+				// the Windows default back to INADDR_ANY -- that reintroduces the firewall prompt).
+#if defined(_WIN32)
 				server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
+				server.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
 				server.sin_port = htons((uint16_t)port);
 				status=TCP_STATUS_SOCKET_CREATED;
 			}
