@@ -28,4 +28,11 @@
 // fact-documents/phase-b-mfsk-connect-research.md §11.7 for the list.
 int run_mfsk_ctrl_codec_tests();
 
+// Run ONLY the §22 OFDM fine-timing phase-invariant magnitude regression
+// suite (fix/ofdm-fine-timing-magnitude). Fast + deterministic — excludes the
+// long stochastic MFSK detector sweeps in the full suite above. Returns the
+// number of failed tests (0 = all pass). See
+// fact-documents/ofdm-fine-timing-magnitude.md §4.
+int run_ofdm_fine_timing_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_

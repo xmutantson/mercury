@@ -850,6 +850,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.SNR = -99.9;
 	receive_stats.all_zeros = NO;
 	receive_stats.coarse_metric = 0.0;
+	receive_stats.mean_H = -1.0;
 
 	// Timing breakdown
 	double timing_pb_tsync_ms = 0, timing_pb_data_ms = 0, timing_ldpc_ms = 0;
@@ -2416,6 +2417,10 @@ skip_h_retry_point:
 					}
 					if(h_count > 0) mean_H = h_sum / h_count;
 				}
+				// Test-observability: expose the per-trial mean(|H|) the SKIP-H
+				// gate keys on. Write-once-per-trial, read by unit tests only
+				// (ofdm-fine-timing-magnitude.md §3.5). No control-flow effect.
+				receive_stats.mean_H = mean_H;
 				// Cache channel selectivity = std(|H[k]|) / mean(|H[k]|) over DATA
 				// subcarriers for the 2D channel-state lookup (§3.2 of fact-doc
 				// channel-state-2d-lookup.md). At this point estimated_channel[]

@@ -98,6 +98,7 @@ struct st_receive_stats{
 	bool frame_skip_var_aborted;  // true: trial loop aborted on consecutive SKIP-VAR — caller should zero false preamble and advance cursor past noise region
 	double coarse_metric;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
 	double ofdm_drift_per_frame;  // IIR-filtered prediction error (interp samples) for BATCH verify
+	double mean_H;  // mean(|estimated_channel|) over MEASURED subcarriers for the last OFDM trial; -1 if not computed. Test-observability for the SKIP-H gate (write-once per receive, read by unit tests only). See fact-documents/ofdm-fine-timing-magnitude.md §3.5.
 };
 
 

@@ -264,6 +264,14 @@ int main(int argc, char *argv[])
             int failed = run_sim_clock_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-ofdm-fine-timing : run ONLY the §22 OFDM fine-timing
+        // phase-invariant magnitude regression suite and exit. Fast +
+        // deterministic — excludes the long stochastic MFSK detector sweeps in
+        // the full --test suite. See fact-documents/ofdm-fine-timing-magnitude.md §4.
+        if (strcmp(argv[i], "--test-ofdm-fine-timing") == 0) {
+            int failed = run_ofdm_fine_timing_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;
