@@ -617,6 +617,16 @@ public:
   // builds never call this. See fact-documents/gearshift-start-and-recovery.md §6.4.
   int test_data_anchored_promote();
 
+  // FIX-B — FLOOR-PROBE BACK-OFF synthetic-fire test (CLI --test-probe-backoff).
+  // Drives the REAL arm/gate/reset/predicate machinery (no channel) for the five
+  // PB cases (gearshift-floor-probe-backoff.md §7): PB1 FAIL-BEFORE/PASS-AFTER
+  // (armed rung is suppressed AND the UP gate blocks; reverting the conjunct
+  // fails), PB2 virtual-clock elapse lifts suppression (via sim_clock), PB3
+  // double-arm exponential+cap, PB4 reset zeroes, PB5 INV-2 (panic/demote targets
+  // unchanged with back-off armed). Returns 0 on pass, 1 on fail. Default builds
+  // never call this. See fact-documents/gearshift-floor-probe-backoff.md §7.
+  int test_probe_backoff();
+
   // Phantom-ACK content gate (2026-05-29). PURE policy predicate for the
   // clean-batch DATA-ACK bare-pattern acceptance at arq_commander.cc:2809.
   // receive_ack_pattern() returns a BARE bool on pattern-match-only (matched
@@ -755,6 +765,65 @@ public:
   // anchor bar today; split the constant if the two bars ever need to differ).
   static int fast_probe_clean_streak(int config)
   { return sustained_anchor_threshold(config); }
+
+  // FIX-A — ROBUST-tier dwell-batch eligibility (data-flow-robust-tier-arq-batch.md
+  // §5.1). TRUE iff a ROBUST dwell may SAFELY run batch > 1 (the FIX-A relaxation).
+  // The robust batch is pinned to 1 by default because at the MFSK cliff
+  // P(batch clean)=p^N and only batch=1 makes the strict all-ones clean target
+  // achievable WHILE THE CLIMB IS STILL EARNING THE RUNG (the central tension /
+  // landmine L8 — lifting batch while the climb owns the rung freezes the anchor
+  // and is the literal Bug-3 dormancy). This predicate lifts the pin ONLY when the
+  // rung is PROVEN and the climb is PARKED (not actively probing up), so the p^N
+  // penalty is acceptable and the M=16 MFSK SACK suffix patches any partial.
+  //
+  // PURE core — takes every input explicitly so the unit test (Parts D'1/D'3) can
+  // drive it with no live telecom_system / channel. ALL conjuncts must hold:
+  //  (a) live PHY is a ROBUST config            — is_robust_config(current_cfg)
+  //  (b) WB session (SACK suffix exists)        — suffix_capable
+  //        (NB: M=8 => ack_sack_suffix_len()==0 => NO bitmap => a multi-frame
+  //         partial is UNRECOVERABLE => MUST stay batch=1; landmine L2 / OR guard b)
+  //  (c) this rung is PROVEN delivered          — ladder_idx(current) <= ladder_idx(anchor)
+  //        (the anchor has reached/passed this rung => clean batch(es) already
+  //         confirmed here at batch=1; the climb has earned this rung)
+  //  (d) the clean streak is ESTABLISHED + parked HERE —
+  //        streak_cfg == current_cfg && clean_streak >= ROBUST_DWELL_PROOF_BATCHES
+  //        (proves we are PARKED on a SUSTAINED-clean robust rung, not transiently)
+  //  (e) PARKED at the proven ceiling, NOT actively climbing up —
+  //        proven_ceiling >= 0 && ladder_idx(current) >= ladder_idx(proven_ceiling)
+  //        (OR-1 / L8 LOAD-BEARING: if a higher rung is still reachable+unproven the
+  //         climb still OWNS the batch — keep 1 so the strict clean credit keeps
+  //         advancing the anchor. proven_ceiling<0 means no ceiling has been bounded
+  //         yet => the link is NOT established at a parked ceiling => keep 1.)
+  static bool robust_dwell_batch_eligible_core(
+      int current_cfg, int anchor, int streak_cfg, int clean_streak,
+      int proven_ceiling, bool suffix_capable)
+  {
+    if(!is_robust_config(current_cfg)) return false;                  // (a)
+    if(!suffix_capable) return false;                                 // (b)
+    if(config_ladder_index(current_cfg)
+       > config_ladder_index(anchor)) return false;                   // (c) rung not proven
+    if(streak_cfg != current_cfg) return false;                       // (d) streak not here
+    if(clean_streak < ROBUST_DWELL_PROOF_BATCHES) return false;       // (d) streak too short
+    if(proven_ceiling < 0) return false;                              // (e) no parked ceiling yet
+    if(config_ladder_index(current_cfg)
+       < config_ladder_index(proven_ceiling)) return false;           // (e) higher rung reachable
+    return true;
+  }
+
+  // Member wrapper — supplies the live climb state + the WB/NB suffix capability
+  // from the dedicated config-independent ack_mfsk (M=16 WB => suffix_len==13;
+  // NB M=8 => 0). CMD-only state (clean_batches_*, supershift_proven_ceiling), so
+  // ONLY the CMD evaluates this; the RSP mirrors the resulting batch via the
+  // dedicated ROBUST_DWELL_BATCH_OP transport (it has no climb state — identical to
+  // how Axis-2's batch decision is CMD-only / RSP-applied). PURE (const).
+  bool robust_dwell_batch_eligible() const {
+    bool suffix_capable = (telecom_system != NULL)
+      && (telecom_system->ack_mfsk.ack_sack_suffix_len() > 0);
+    return robust_dwell_batch_eligible_core(
+      current_configuration, last_data_viable_config,
+      clean_batches_config, clean_batches_at_current_config,
+      supershift_proven_ceiling, suffix_capable);
+  }
 
   // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12) — the EFFECTIVE
   // threshold the FRAME-UP comparison (arq_commander.cc:3637) uses, computed at
@@ -1641,6 +1710,23 @@ public:
   int pending_link_params_batch_size;
   int pending_link_params_sack_mode;
 
+  // FIX-A — ROBUST-tier dwell-batch transport state (data-flow-robust-tier-arq-batch.md
+  // §5.2/§5.3). CMD-side staging read by add_message_control(ROBUST_DWELL_BATCH_OP).
+  // pending_robust_dwell_batch = the batch the CMD wants the RSP to mirror (the raise
+  // target ROBUST_DWELL_BATCH, or 1 on the revert). -1 = unset. robust_dwell_batch_active
+  // = true once the CMD has raised to a multi-frame robust batch (so the revert fires
+  // exactly once when eligibility is lost). Both reset on connection init / BREAK /
+  // config change (reset_session_state + load_configuration revert the batch to 1).
+  int pending_robust_dwell_batch;
+  bool robust_dwell_batch_active;
+  // CMD: decide whether to raise/revert the robust dwell batch and stage the
+  // symmetric ROBUST_DWELL_BATCH_OP frame. Called from the clean-data-ACK PARKED
+  // path (arq_commander.cc, after FRAME-UP declined to promote). No-op unless the
+  // batch actually needs to change. Returns TRUE iff it queued a control frame
+  // (connection_status moved to TRANSMITTING_CONTROL) — the caller must then NOT
+  // overwrite connection_status with TRANSMITTING_DATA. See §5.2/§5.3.
+  bool evaluate_robust_dwell_batch();
+
   // SACK Design A Step 11 — Axis 3 controller state (SACK mode adaptation).
   // BOTH peers track sack_mode (CMD decides, RSP obeys via SET_LINK_PARAMS).
   // All ring/counter/diagnostic state is CMD-side only; RSP only needs the
@@ -1854,6 +1940,55 @@ public:
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
   int  frame_gearshift_retry_count;   // §7.13.33: retries on PHY-switched first batch before BREAK (rx_mute timing race)
+
+  // FIX-B — FLOOR-PROBE BACK-OFF state (gearshift-floor-probe-backoff.md §3).
+  // probe_backoff_until_ms[i] is the opt_now_ms() timestamp BEFORE which the
+  // config at FULL_CONFIG_LADDER index i must NOT be re-probed UP-ward (0 = no
+  // back-off armed). Indexed by config_ladder_index(cfg) (range
+  // [0,FULL_CONFIG_LADDER_SIZE)). probe_backoff_ms is the CURRENT exponential
+  // back-off window — doubled on each repeat up-probe fail, capped at
+  // PROBE_BACKOFF_MS_CAP, reset to PROBE_BACKOFF_MS_INIT the instant a clean
+  // OFDM batch is delivered. CMD-only state (the climb-control loop lives on the
+  // commander; the RSP has no climb decision). All three accessors are PURE
+  // helpers (no I/O) so the synthetic-fire unit test drives them with no live
+  // channel. INV-4: probe_rung_suppressed() reads opt_now_ms() ONLY — the SAME
+  // virtual clock the FTRT sim drives — NEVER cl_timer (which is wall-clock).
+  unsigned long long probe_backoff_until_ms[FULL_CONFIG_LADDER_SIZE];
+  int probe_backoff_ms;
+
+  // FIX-B predicate — TRUE iff `cfg` is currently under a floor-probe back-off
+  // (a proven-failed up-probe whose suppression window has not yet elapsed).
+  // PURE / const; reads opt_now_ms() ONLY (INV-4). A cfg not on the ladder
+  // (config_ladder_index < 0) is never suppressed (defensive). INV-1: this is
+  // AND-ed into the EXISTING up-gate (turning a PERMITTED probe OFF), so it can
+  // only ADD suppression — it never unblocks a probe the anchor/+1/ceiling
+  // clamps already blocked.
+  bool probe_rung_suppressed(int cfg) const {
+    int idx = config_ladder_index(cfg);
+    if(idx < 0) return false;
+    return opt_now_ms() < probe_backoff_until_ms[idx];
+  }
+
+  // FIX-B producer — ARM the back-off on `cfg` after a PROVEN-FAILED up-probe.
+  // Sets the suppression deadline to now + the current window, then DOUBLES the
+  // window (capped) so a repeat fail of the same/another rung waits longer. A
+  // cfg not on the ladder is ignored (defensive). NOT const.
+  void probe_backoff_arm(int cfg) {
+    int idx = config_ladder_index(cfg);
+    if(idx < 0) return;
+    probe_backoff_until_ms[idx] = opt_now_ms() + (unsigned long long)probe_backoff_ms;
+    long long next = (long long)probe_backoff_ms * 2;
+    if(next > (long long)PROBE_BACKOFF_MS_CAP) next = (long long)PROBE_BACKOFF_MS_CAP;
+    probe_backoff_ms = (int)next;
+  }
+
+  // FIX-B producer — RESET the entire back-off (called on a clean OFDM batch:
+  // the channel proved an OFDM rung recovered, so no rung is "proven-failed"
+  // anymore and the window returns to its INIT value). NOT const.
+  void probe_backoff_reset() {
+    for(int i=0; i<FULL_CONFIG_LADDER_SIZE; i++) probe_backoff_until_ms[i] = 0ULL;
+    probe_backoff_ms = PROBE_BACKOFF_MS_INIT;
+  }
 
   // Turboshift: bidirectional probing phase before data exchange
   enum TurboshiftPhase { TURBO_FORWARD, TURBO_REVERSE, TURBO_DONE };

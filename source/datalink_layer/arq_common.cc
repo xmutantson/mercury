@@ -332,6 +332,14 @@ cl_arq_controller::cl_arq_controller()
 	rsp_set_link_params_crc_fail_count=0;
 	pending_link_params_batch_size=-1;
 	pending_link_params_sack_mode=-1;
+	// FIX-A — ROBUST dwell-batch transport state (data-flow-robust-tier-arq-batch.md §5.2/§5.3).
+	pending_robust_dwell_batch=-1;
+	robust_dwell_batch_active=false;
+	// FIX-B — FLOOR-PROBE BACK-OFF state (gearshift-floor-probe-backoff.md §3/§5).
+	// Seed the window to INIT and zero the per-rung deadline array (no probe
+	// suppressed at session start). reset_session_state() mirrors this.
+	probe_backoff_ms=PROBE_BACKOFF_MS_INIT;
+	for(int i=0;i<FULL_CONFIG_LADDER_SIZE;i++) probe_backoff_until_ms[i]=0ULL;
 	// SACK Design A Step 11 — Axis 3 controller state (SACK mode ON↔PROBE↔OFF).
 	// Initial state = ON (per §4.3.2 spec). The mode is materially ON only on
 	// sack_v2_enabled sessions; on v1 sessions the field stays at its sentinel
@@ -688,16 +696,41 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 	// and the RSP SACK recompute already key off. NOTE: the SACK-test direct
 	// assigns (this->data_batch_size = 25/30, arq_responder.cc:2895/3000)
 	// deliberately bypass this setter and are unaffected (OFDM-batch SACK tests).
-	if(is_robust_config(current_configuration) && data_batch_size != 1)
+	// FIX-A (data-flow-robust-tier-arq-batch.md §5.2): the robust clamp is now a
+	// RANGE clamp [1..ROBUST_DWELL_BATCH_MAX], not force-to-1. The batch=1 invariant
+	// is still the DEFAULT (load_configuration() seeds 1 on every robust load, the
+	// connect-path SACK recompute leaves 1, and any out-of-range request is clamped
+	// in here), but a PROVEN+PARKED robust dwell may request a multi-frame batch via
+	// the dedicated ROBUST_DWELL_BATCH_OP transport. The CMD/RSP-agreement invariant
+	// is preserved because the same range clamp runs on BOTH sides' setter (the op
+	// applies the SAME value through here on each peer) — there is no asymmetric
+	// [10,32] floor like SET_LINK_PARAMS (OR-2 / L4). recalculate_ack_timeout_for_batch()
+	// keeps the data-ACK timeout tracking the wider batch (L3): without it CMD times
+	// out mid-batch and full-retransmits, the OPPOSITE of FIX-A's goal.
+	if(is_robust_config(current_configuration))
 	{
-		if(this->data_batch_size != 1)
+		int lo = 1, hi = ROBUST_DWELL_BATCH_MAX;
+		int clamped = data_batch_size;
+		if(clamped < lo) clamped = lo;
+		if(clamped > hi) clamped = hi;
+		int prev = this->data_batch_size;
+		if(prev != clamped)
 		{
-			printf("[BATCH-CHOKEPOINT] robust config %d: clamped requested batch %d -> 1 "
-				"(robust => batch 1 invariant; CMD/RSP must agree)\n",
-				current_configuration, data_batch_size);
+			printf("[BATCH-CHOKEPOINT] robust config %d: batch %d -> %d "
+				"(robust dwell range [%d,%d]; CMD/RSP must agree)\n",
+				current_configuration, data_batch_size, clamped, lo, hi);
 			fflush(stdout);
 		}
-		this->data_batch_size = 1;
+		this->data_batch_size = clamped;
+		// L3: keep the data-ACK timeout tracking the batch ONLY on an actual change
+		// to a multi-frame batch (the dwell raise) or back down (the revert). We do
+		// NOT recompute on the load_configuration() seed-to-1 (prev already 1): at
+		// that point message_transmission_time_ms is not yet recomputed for the new
+		// config, and set_ack_timeout_data() would read a stale value. The dwell
+		// raise/revert always fire AFTER load_configuration has finished (steady
+		// state), so message_transmission_time_ms is current there.
+		if(prev != clamped && (prev > 1 || clamped > 1))
+			recalculate_ack_timeout_for_batch();
 		return;
 	}
 
@@ -1427,11 +1460,17 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// at 4.6-7.3s per frame.
 	if(is_robust_config(configuration))
 	{
-		set_data_batch_size(1);
 		set_ack_batch_size(1);
 		set_control_batch_size(1);
+		// FIX-A P2 (adversarial-review fix, 2026-06-03): the robust DATA-batch reset
+		// (set_data_batch_size(1) + robust_dwell_batch_active=false) is DEFERRED to
+		// after the message_transmission_time_ms recompute below — see the relocated
+		// block. The ack/control batch resets above are timing-independent and stay
+		// here. ack/control single-frame: LDPC provides cliff-effect protection; if a
+		// frame decodes it's correct. Saves 1 frame per ACK/control cycle (major at
+		// 4.6-7.3s per frame).
 	}
-	
+
 	gear_shift_up_success_rate_precentage=default_configuration_ARQ.gear_shift_up_success_rate_limit_precentage;
 	gear_shift_down_success_rate_precentage=default_configuration_ARQ.gear_shift_down_success_rate_limit_precentage;
 
@@ -1453,6 +1492,29 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
     // TODO: After audio I/O rewrite we don't use this anymore. Was:
 	// time_left_to_send_last_frame=(float)telecom_system->speaker.frames_to_leave_transmit_fct/(float)(telecom_system->frequency_interpolation_rate*(telecom_system->bandwidth/telecom_system->ofdm.Nc)*telecom_system->ofdm.Nfft);
     time_left_to_send_last_frame=0;
+
+	// FIX-A P2 (adversarial-review fix, 2026-06-03): RELOCATED robust DATA-batch reset.
+	// data-flow-robust-tier-arq-batch.md §5.3 — every robust config load (connect,
+	// BREAK→ROBUST_0, turbo-reverse, ROBUST_0→ROBUST_1 climb step) resets the dwell
+	// batch to its initial pin of 1 AND clears the raised flag, so a later proven+parked
+	// dwell at the NEW rung must re-earn the raise. This is the config-change revert leg
+	// of the symmetric revert — it runs on BOTH the CMD (which then re-evaluates) and the
+	// RSP (which adopts via the op).
+	//
+	// WHY HERE (not back at the is_robust_config(configuration) reset block above): on a
+	// robust→robust reload while the dwell was RAISED (e.g. prev batch=4 → 1 on a
+	// ROBUST_0→ROBUST_1 step) the chokepoint's recalculate_ack_timeout_for_batch()
+	// (set_data_batch_size, arq_common.cc:~700) fires because prev>1. If the reset ran
+	// before message_transmission_time_ms is recomputed (the OLD site), that recompute
+	// read the STALE old-config frame time. Placing the reset AFTER the
+	// message_transmission_time_ms / ctrl_transmission_time_ms recompute above guarantees
+	// the chokepoint recompute uses the NEW config's frame time (L3). nominal_batch_size
+	// is set immediately below from the now-correct data_batch_size=1.
+	if(is_robust_config(configuration))
+	{
+		set_data_batch_size(1);
+		robust_dwell_batch_active = false;
+	}
 
 	// Scale data_batch_size based on block duration (OFDM modes only).
 	// MFSK modes keep batch_size=1 for pattern ACK optimization.
@@ -3181,6 +3243,14 @@ void cl_arq_controller::reset_session_state()
 	anchor_consec_break_fails = 0;
 	clean_batches_at_current_config = 0;
 	clean_batches_config = CONFIG_NONE;
+	// FIX-A — fresh session: the robust dwell batch is not raised; the pin is 1
+	// (data-flow-robust-tier-arq-batch.md §5.3). Mirrors the ctor init.
+	pending_robust_dwell_batch = -1;
+	robust_dwell_batch_active = false;
+	// FIX-B — fresh session: no rung is under a floor-probe back-off; window at
+	// INIT (gearshift-floor-probe-backoff.md §5). Mirrors the ctor init.
+	probe_backoff_ms = PROBE_BACKOFF_MS_INIT;
+	for(int i=0;i<FULL_CONFIG_LADDER_SIZE;i++) probe_backoff_until_ms[i]=0ULL;
 	turbo_snr_ack_enabled = false;
 	turbo_received_snr = -99.0f;
 	turbo_switch_role_retries = 0;

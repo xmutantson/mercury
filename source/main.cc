@@ -351,6 +351,12 @@ int main(int argc, char *argv[])
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
                                         // up-shifter promotes only one rung past it. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §6.4.
+    bool test_probe_backoff_cli = false; // --test-probe-backoff: FIX-B floor-probe back-off regression
+                                        // (gearshift-floor-probe-backoff.md §7). Drives the REAL arm/gate/reset/predicate
+                                        // machinery + the v2 policy_evaluate_axis1 UP gate over the SIM virtual clock.
+                                        // PB1 FAIL-BEFORE/PASS-AFTER (armed CONFIG_0 suppressed + UP gate blocks; revert
+                                        // -> promotes), PB2 virtual-clock elapse lifts, PB3 exponential+cap, PB4 reset,
+                                        // PB5 INV-2 deep-SNR escape unchanged. One-shot, exits rc.
     bool test_phantom_ack_gate_cli = false; // --test-phantom-ack-gate: phantom-ACK content-gate regression.
                                         // Drives data_ack_bare_pattern_acceptable() across WB/NB x CRC-valid/CRC-absent
                                         // (the WB-no-CRC phantom cell must be REJECTED) + asserts a rejected phantom leaves
@@ -818,6 +824,15 @@ int main(int argc, char *argv[])
             // at startup, then exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §6.4.
             test_data_anchored_promote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-probe-backoff") == 0)
+        {
+            // FIX-B floor-probe back-off regression — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/gearshift-floor-probe-backoff.md §7.
+            test_probe_backoff_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1878,6 +1893,19 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_data_anchored_promote();
             printf("[FLAG] Data-anchored-promote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_probe_backoff_cli) {
+            // FIX-B floor-probe back-off regression (one-shot, then exit rc).
+            // Drives the REAL arm/gate/reset/predicate machinery + the v2
+            // policy_evaluate_axis1 UP gate over the SIM virtual clock (PB1-PB5).
+            // See fact-documents/gearshift-floor-probe-backoff.md §7.
+            printf("[FLAG] --test-probe-backoff: invoking FIX-B floor-probe "
+                   "back-off regression (PB1-PB5)\n");
+            fflush(stdout);
+            int rc = ARQ.test_probe_backoff();
+            printf("[FLAG] Probe-backoff test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

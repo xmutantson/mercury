@@ -812,6 +812,57 @@ int cl_arq_controller::add_message_control(char code)
 			pending_link_params_batch_size = -1;
 			pending_link_params_sack_mode = -1;
 		}
+		else if(code==ROBUST_DWELL_BATCH_OP)
+		{
+			// FIX-A — ROBUST-tier dwell-batch encoder (data-flow-robust-tier-arq-batch.md
+			// §5.2). Carries the CMD's chosen robust dwell batch to the RSP so BOTH
+			// peers run the SAME data_batch_size (the 4-wire-failure symmetry invariant).
+			// DELIBERATELY NOT SET_LINK_PARAMS: that op's RSP handler clamps to
+			// [AXIS2_BATCH_FLOOR=10,32] and would force a 4-8 batch UP to 10 on the RSP
+			// only (OR-2 / L4). This op applies the value straight through the relaxed
+			// set_data_batch_size() chokepoint (clamped only to [1..ROBUST_DWELL_BATCH_MAX]).
+			//
+			// Wire format:
+			//   data[0] = ROBUST_DWELL_BATCH_OP (0x44)
+			//   data[1] = batch (u8, clamped [1..ROBUST_DWELL_BATCH_MAX])
+			//   data[2] = CRC8 over data[1], POLY_CRC8=0xF4 (CRC8_calc usage matches
+			//             SACK_RSP / SET_LINK_PARAMS coverage rule).
+			//   length  = 3
+			//
+			// Reads pending_robust_dwell_batch (set by evaluate_robust_dwell_batch()).
+			// Defensive null-guard mirrors SET_CONFIG / SET_LINK_PARAMS for the
+			// synthetic-fire test path (messages_control.data lazily allocated).
+			if(messages_control.data == NULL)
+			{
+				int peek_batch = pending_robust_dwell_batch;
+				if(peek_batch < 0) peek_batch = data_batch_size;
+				printf("[CMD-ROBUST-DWELL] SKIP TX: messages_control.data is NULL "
+					"(pre-init synthetic test mode; no real wire frame). "
+					"WOULD HAVE SENT: batch=%d\n", peek_batch);
+				fflush(stdout);
+				messages_control.status = FREE;
+				messages_control.type = NONE;
+				pending_robust_dwell_batch = -1;
+				return success;  // == ERROR_ fast-out
+			}
+			int target_batch = pending_robust_dwell_batch;
+			if(target_batch < 0) target_batch = data_batch_size;
+			if(target_batch < 1) target_batch = 1;
+			if(target_batch > ROBUST_DWELL_BATCH_MAX) target_batch = ROBUST_DWELL_BATCH_MAX;
+
+			messages_control.data[0] = code;
+			messages_control.data[1] = (char)(unsigned char)target_batch;
+			messages_control.data[2] = (char)CRC8_calc(
+				(char*)&messages_control.data[1], 1);
+			messages_control.length = 3;
+			messages_control.id = 0;
+
+			printf("[CMD-ROBUST-DWELL] ROBUST_DWELL_BATCH_OP TX: batch=%d crc8=0x%02x\n",
+				target_batch, (unsigned char)messages_control.data[2]);
+			fflush(stdout);
+
+			pending_robust_dwell_batch = -1;
+		}
 		else
 		{
 			messages_control.length=1;
@@ -2362,6 +2413,14 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
 
+				// FIX-B — ARM the floor-probe back-off on the FAILED up-probe rung
+				// (gearshift-floor-probe-backoff.md §5.1, arm-site #1). This is the
+				// SET_CONFIG-ACK-timeout fail: the SET_CONFIG to negotiated_configuration
+				// (the proposed UP rung) was NAcked. Arm BEFORE the working_config
+				// overwrite below clobbers negotiated_configuration, so the back-off is
+				// keyed to the rung the climb actually tried (not the recovered rung).
+				probe_backoff_arm(negotiated_configuration);
+
 				int working_config = config_ladder_down(negotiated_configuration, robust_enabled);
 				frame_shift_threshold *= 2;
 				consecutive_data_acks = 0;
@@ -3240,6 +3299,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		{
 			frame_gearshift_just_applied = false;
 			frame_gearshift_retry_count = 0;
+			// FIX-B — ARM the floor-probe back-off on the FAILED up-probe rung
+			// (gearshift-floor-probe-backoff.md §5.1, arm-site #2). NACK data-fail:
+			// the just-applied FRAME-UP to data_configuration could not pass DATA.
+			// Arm BEFORE the working_config overwrite below clobbers
+			// data_configuration, so the back-off is keyed to the rung that failed.
+			probe_backoff_arm(data_configuration);
 			int working_config = config_ladder_down(data_configuration, robust_enabled);
 			frame_shift_threshold *= 2;
 
@@ -3419,6 +3484,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			{
 				frame_gearshift_just_applied = false;
 				frame_gearshift_retry_count = 0;
+				// FIX-B — ARM the floor-probe back-off on the FAILED up-probe rung
+				// (gearshift-floor-probe-backoff.md §5.1, arm-site #3). pat data-fail:
+				// the just-applied FRAME-UP to data_configuration could not pass DATA
+				// (the MFSK-ACK-PAT path, after the §7.13.33 single retry already
+				// failed). Arm BEFORE the working_config overwrite below clobbers
+				// data_configuration, so the back-off is keyed to the rung that failed.
+				probe_backoff_arm(data_configuration);
 				int working_config = config_ladder_down(data_configuration, robust_enabled);
 				frame_shift_threshold *= 2;
 
@@ -3648,6 +3720,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				last_data_viable_config = data_anchor_raise_target(
 					clean_batches_config, current_configuration,
 					last_data_viable_config, clean_batches_at_current_config);
+				// FIX-B — RESET the floor-probe back-off on a CLEAN OFDM batch
+				// (gearshift-floor-probe-backoff.md §5.3). This is the sole reset
+				// producer: a fully-delivered batch at an OFDM config proves an OFDM
+				// rung recovered, so no rung is "proven-failed" anymore — clear every
+				// per-rung deadline and return the window to INIT. Gated on
+				// is_ofdm_config(current_configuration): a clean ROBUST-tier batch does
+				// NOT lift the back-off (the failed up-probe rung is OFDM; only OFDM
+				// success is evidence the boundary improved). Inside the
+				// promotion_allowed_on_batch() clean branch, so a partial SACK never
+				// resets the back-off.
+				if(is_ofdm_config(current_configuration))
+					probe_backoff_reset();
 			}
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
@@ -3695,6 +3779,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// the next rung but never skip ahead of unproven ground. See §6/§7.
 			if(!optimizer_is_in_control() &&
 			   config_ladder_index(proposed_frame) > config_ladder_index(last_data_viable_config) + 1)
+				frame_ceiling_blocked = true;
+			// FIX-B — floor-probe back-off (gearshift-floor-probe-backoff.md §5.2,
+			// gate-site #1). AND the per-rung suppression into the EXISTING up gate:
+			// a proven-failed up-probe is not re-hammered until its back-off elapses
+			// (or a clean OFDM batch resets it). INV-1: this only turns a PERMITTED
+			// probe OFF — it never unblocks a probe the anchor/+1/ceiling clamps above
+			// already blocked. INV-2: this is the UP path only; no BREAK/demote/panic
+			// (downward) site references the back-off, so the deep-SNR escape is intact.
+			if(probe_rung_suppressed(proposed_frame))
 				frame_ceiling_blocked = true;
 		// Handoff: above the lowest calibrated Q-table cell, the optimizer
 		// is the sole authority for upward config changes. Gearshift's
@@ -3794,6 +3887,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			}
 		}
 		} // frame-level gearshift ceiling scope
+
+		// FIX-A — ROBUST-tier dwell-batch raise/revert (data-flow-robust-tier-arq-batch.md
+		// §5.2). We reach here ONLY when FRAME-UP DECLINED to promote (a promotion does
+		// add_message_control(SET_CONFIG)+return above), i.e. the climb is PARKED this
+		// poll. evaluate_robust_dwell_batch() lifts the robust batch to a multi-frame
+		// dwell when the rung is proven+parked (gate (e) keeps it at 1 while a higher
+		// rung is still reachable — OR-1/L8), or reverts to 1 the instant eligibility is
+		// lost. It is a no-op on the OFDM tier and on every non-change poll. When it
+		// fires it sets connection_status=TRANSMITTING_CONTROL (the op TX), so the line
+		// below is superseded and the control-ACK handshake gates the next DATA batch.
+		if(evaluate_robust_dwell_batch())
+			return;  // op queued (connection_status=TRANSMITTING_CONTROL) — do not fall to DATA
 
 		connection_status=TRANSMITTING_DATA;
 	}
@@ -4394,6 +4499,33 @@ void cl_arq_controller::process_control_commander()
 					"(local batch=%d) — resuming data TX\n", data_batch_size);
 				fflush(stdout);
 				this->connection_status=TRANSMITTING_DATA;
+			}
+			else if (messages_control.data[0]==ROBUST_DWELL_BATCH_OP)
+			{
+				// FIX-A P0 (adversarial-review fix, 2026-06-03) — CMD-side
+				// ROBUST_DWELL_BATCH_OP ACK consumer. Exact parallel of the
+				// SET_LINK_PARAMS branch above (the proven Axis-2 transport this op
+				// mirrors): the CMD already applied the new robust dwell batch
+				// locally at decision time (evaluate_robust_dwell_batch() →
+				// set_data_batch_size()); this ACK confirms the RSP adopted it too
+				// (arq_responder.cc ROBUST_DWELL_BATCH_OP handler), so both sides now
+				// agree on data_batch_size for the next DATA batch.
+				//
+				// Without this branch the CMD had NO transition out of
+				// RECEIVING_ACKS_CONTROL after the RSP ACKed → control-timeout →
+				// spurious emergency BREAK → load_configuration(ROBUST_0) reverted
+				// the batch to 1, on EVERY dwell raise AND revert (worse than the
+				// batch=1 floor). data-flow-robust-tier-arq-batch.md §5.4.
+				//
+				// Restart both timers to match the RSP-side handler, which restarts
+				// link_timer + watchdog_timer when it adopts the op
+				// (arq_responder.cc:2762-2763) — keeps the round-trip symmetric.
+				printf("[CMD-ROBUST-DWELL-ACKED] ROBUST_DWELL_BATCH_OP round-trip "
+					"complete (local batch=%d) — resuming data TX\n", data_batch_size);
+				fflush(stdout);
+				this->connection_status=TRANSMITTING_DATA;
+				watchdog_timer.start();
+				link_timer.start();
 			}
 			// BLOCK_END eliminated — pattern ACK / silence is sole flow control.
 			// finalize_block_commander() called directly after data ACK.
@@ -5000,6 +5132,12 @@ void cl_arq_controller::finalize_block_commander()
 				if(!optimizer_is_in_control() &&
 					config_ladder_index(proposed) > config_ladder_index(last_data_viable_config) + 1)
 					ceiling_blocked = true;
+				// FIX-B — floor-probe back-off (gearshift-floor-probe-backoff.md §5.2,
+				// gate-site #3, legacy v1 inline LADDER-UP twin). AND the per-rung
+				// suppression into the EXISTING up gate. INV-1: only turns a PERMITTED
+				// probe OFF. INV-2: UP path only; no downward site references back-off.
+				if(probe_rung_suppressed(proposed))
+					ceiling_blocked = true;
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;
@@ -5156,6 +5294,12 @@ void cl_arq_controller::policy_evaluate_axis1()
 		// predicate self-contained.) See §6/§7.
 		if(!optimizer_is_in_control() &&
 			config_ladder_index(proposed) > config_ladder_index(last_data_viable_config) + 1)
+			ceiling_blocked = true;
+		// FIX-B — floor-probe back-off (gearshift-floor-probe-backoff.md §5.2,
+		// gate-site #2, v2 policy_evaluate_axis1). AND the per-rung suppression into
+		// the EXISTING up gate. INV-1: only turns a PERMITTED probe OFF. INV-2: UP
+		// path only; no BREAK/demote/panic (downward) site references the back-off.
+		if(probe_rung_suppressed(proposed))
 			ceiling_blocked = true;
 		if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 		{
@@ -5642,6 +5786,93 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	}
 }
 
+// FIX-A — ROBUST-tier dwell-batch decision (data-flow-robust-tier-arq-batch.md
+// §5.2/§5.3). CMD-side. Called from the clean-data-ACK PARKED path (after FRAME-UP
+// has DECLINED to promote this poll — see arq_commander.cc, just before
+// connection_status=TRANSMITTING_DATA). Decides whether the robust dwell batch
+// should be RAISED (proven+parked rung) or REVERTED (eligibility lost), and on a
+// change applies it locally + stages the symmetric ROBUST_DWELL_BATCH_OP frame.
+//
+// Transport model = the proven Axis-2 pattern (policy_evaluate_axis2 / SET_LINK_PARAMS):
+// CMD applies locally NOW and add_message_control() sets connection_status=
+// TRANSMITTING_CONTROL, so the control-frame ACK handshake (RECEIVING_ACKS_CONTROL)
+// gates the next DATA TX — the RSP adopts the new batch (via the op handler) and
+// ACKs BEFORE the next DATA batch is built. No DATA batch is ever built with
+// CMD≠RSP (L6 atomicity w.r.t. DATA TX). The EOB bit-7 self-correct is the same
+// safety net Axis-2 relies on if a control frame is lost.
+//
+// The function is a NO-OP unless the target batch actually differs from the live
+// data_batch_size, so it is cheap to call on every clean robust batch. Returns TRUE
+// iff it queued a ROBUST_DWELL_BATCH_OP control frame (the caller must then leave
+// connection_status at TRANSMITTING_CONTROL, NOT overwrite it with TRANSMITTING_DATA).
+bool cl_arq_controller::evaluate_robust_dwell_batch()
+{
+	// Gated to the robust tier + WB SACK suffix + sack_v2 selective-retransmit
+	// (the partial path that makes batch>1 recoverable). On a non-sack_v2 session
+	// a robust partial cannot be SACK-patched, so keep the pin at 1.
+	if(!is_robust_config(current_configuration)) return false;
+	if(!sack_v2_enabled) return false;
+
+	bool eligible = robust_dwell_batch_eligible();
+	int target = eligible ? ROBUST_DWELL_BATCH : 1;
+	if(target < 1) target = 1;
+	if(target > ROBUST_DWELL_BATCH_MAX) target = ROBUST_DWELL_BATCH_MAX;
+
+	// Only act on a genuine change. (data_batch_size is the authoritative live
+	// value; robust_dwell_batch_active tracks whether we have RAISED so a revert
+	// fires exactly once when eligibility is lost.)
+	if(target == data_batch_size && (eligible == robust_dwell_batch_active))
+		return false;
+	if(target == data_batch_size)
+	{
+		// Value already matches but the flag is stale — sync the flag, no wire frame.
+		robust_dwell_batch_active = eligible;
+		return false;
+	}
+
+	// L7 (revert symmetry) + L6: do NOT credit clean promotion on the transition
+	// batch — the all-ones target is mid-change. Mark this batch non-promoting so a
+	// stray clean-credit cannot fire while the raise/revert is in flight.
+	last_batch_fully_acked = false;
+
+	printf("[ROBUST-DWELL] %s robust dwell batch %d -> %d at config %d "
+		"(eligible=%d anchor=%d streak_cfg=%d streak=%d ceiling=%d)\n",
+		eligible ? "RAISE" : "REVERT", data_batch_size, target,
+		current_configuration, (int)eligible, last_data_viable_config,
+		clean_batches_config, clean_batches_at_current_config,
+		supershift_proven_ceiling);
+	fflush(stdout);
+
+	// Apply locally NOW (the relaxed chokepoint re-validates the [1..MAX] range and
+	// recomputes the ACK timeout — L3). The next DATA batch then builds at the new
+	// size; the RSP converges via the op + control-ACK handshake before that TX.
+	set_data_batch_size(target);
+	nominal_batch_size = data_batch_size;
+	robust_dwell_batch_active = eligible;
+
+	// Stage + send the symmetric op. add_message_control() bails if a control frame
+	// is already in flight (status != FREE); if so we miss this round's TX but the
+	// local size already changed — the EOB self-correct (§3.6) keeps the RSP within
+	// one batch, and the next clean poll re-attempts the op (target still differs).
+	pending_robust_dwell_batch = target;
+	if(messages_control.status == FREE)
+	{
+		add_message_control(ROBUST_DWELL_BATCH_OP);
+		// add_message_control set connection_status=TRANSMITTING_CONTROL; tell the
+		// caller to leave it there (the op TX + ACK handshake gates the next DATA TX).
+		return true;
+	}
+	else
+	{
+		printf("[ROBUST-DWELL] WARNING: messages_control busy (status=%d) — "
+			"ROBUST_DWELL_BATCH_OP NOT sent this cycle; relying on EOB self-correct "
+			"+ retry next clean poll.\n", messages_control.status);
+		fflush(stdout);
+		pending_robust_dwell_batch = -1;
+		return false;
+	}
+}
+
 // SACK Design A Step 10 — Axis-2 cooldown helper.
 // Decrement cooldown counter by one (clamped at zero) and return the
 // post-decrement value. Currently unused by the controller body (which
@@ -6054,6 +6285,192 @@ int cl_arq_controller::test_data_anchored_promote()
 	check(negotiated_configuration == CONFIG_0, "B3: gate releases one rung as anchor advances", negotiated_configuration, CONFIG_0);
 
 	printf("[TEST-DATA-ANCHOR] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// FIX-B — FLOOR-PROBE BACK-OFF synthetic-fire test (CLI --test-probe-backoff).
+// Drives the REAL arm/gate/reset/predicate machinery with NO channel. Models the
+// CONFIG_0↔ROBUST limit cycle at the deep-SNR floor: anchor parked at ROBUST_2,
+// the climb probes UP to CONFIG_0 (one rung above the anchor — the anchor+1 clamp
+// PERMITS it), CONFIG_0 fails, and pre-FIX-B the climb re-probes CONFIG_0 every
+// cycle (the airtime-burning thrash). FIX-B arms a per-rung back-off so the
+// proven-failed CONFIG_0 probe is suppressed until it elapses (PB1/PB2) or a clean
+// OFDM batch resets it (PB4); the window grows exponentially+capped (PB3); and the
+// deep-SNR DOWNWARD escape is provably untouched (PB5 / INV-2). Returns 0 on pass.
+// See fact-documents/gearshift-floor-probe-backoff.md §7.
+int cl_arq_controller::test_probe_backoff()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long long got, long long want) {
+		if(cond) {
+			printf("[TEST-PROBE-BACKOFF] PASS: %s (got=%lld want=%lld)\n", name, got, want);
+		} else {
+			printf("[TEST-PROBE-BACKOFF] FAIL: %s (got=%lld want=%lld)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Enable the SIM (virtual) clock so opt_now_ms() — which probe_rung_suppressed()
+	// reads (INV-4) — is DETERMINISTIC and ADVANCEABLE via sim_clock_add_samples().
+	// This is the SAME virtual clock the FTRT sim drives; PB2 elapses it explicitly.
+	// Restore the production (wall-clock) source on every exit path.
+	const uint64_t prev_samples = sim_clock_now_samples();
+	sim_clock_set_enabled(1);
+	auto restore_clock = [&]() { sim_clock_set_enabled(0); };
+
+	// ---- Common priming: -R gearshift session, anchor parked at ROBUST_2 ----
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;            // force optimizer_is_in_control()==false
+	sack_v2_enabled = true;               // route the UP gate to policy_evaluate_axis1
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+	supershift_proven_ceiling = -1;       // no ceiling cap (so the back-off is the sole blocker)
+	last_data_viable_config = ROBUST_2;   // anchor parked here
+	// CONFIG_0 = config_ladder_up(ROBUST_2) = the one-rung-above probe the floor hammers.
+	const int probe_cfg = config_ladder_up(ROBUST_2, robust_enabled, false);
+	check(probe_cfg == CONFIG_0, "precondition: up-probe from ROBUST_2 is CONFIG_0",
+		probe_cfg, CONFIG_0);
+
+	// Fresh back-off state (mirror ctor / reset_session_state).
+	probe_backoff_reset();
+
+	// ====================================================================
+	// PB1 — FAIL-BEFORE -> PASS-AFTER. With CONFIG_0 ARMED, (a) the predicate
+	// reports suppressed AND (b) the REAL UP gate (policy_evaluate_axis1) does NOT
+	// promote to CONFIG_0. The FAIL-BEFORE is proven explicitly: clearing the
+	// back-off (== reverting the `&& !probe_rung_suppressed(proposed)` conjunct,
+	// the pre-FIX-B code) makes the SAME gate DO promote to CONFIG_0 — so the
+	// back-off is the SOLE blocker; the anchor/+1/ceiling clamps PERMIT this probe.
+	// ====================================================================
+	probe_backoff_arm(CONFIG_0);
+	check(probe_rung_suppressed(CONFIG_0) == true,
+		"PB1a: armed CONFIG_0 reports suppressed", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 1);
+
+	// Drive the REAL up gate. Prime its preconditions (clean rate over threshold,
+	// blocks-held at threshold) exactly as test_data_anchored_promote does.
+	auto run_up_gate = [&]() -> int {
+		current_configuration = ROBUST_2;
+		negotiated_configuration = ROBUST_2;
+		last_transmission_block_stats.success_rate_data = 100.0f;
+		success_rate_data_clean = 100.0;
+		gear_shift_down_consecutive_fails = 0;
+		messages_control.status = FREE;
+		gear_shift_blocked_for_nBlocks = gear_shift_block_for_nBlocks_total;
+		policy_evaluate_axis1();
+		return negotiated_configuration;
+	};
+
+	int afterArmed = run_up_gate();
+	check(afterArmed == ROBUST_2,
+		"PB1b: suppressed probe BLOCKED by UP gate (parks at ROBUST_2)", afterArmed, ROBUST_2);
+
+	// FAIL-BEFORE demonstration: remove the suppression (== drop the conjunct) and
+	// the SAME gate now promotes to CONFIG_0 (the pre-FIX-B thrash behavior).
+	probe_backoff_reset();
+	check(probe_rung_suppressed(CONFIG_0) == false,
+		"PB1c: after reset CONFIG_0 NOT suppressed (revert-conjunct)",
+		probe_rung_suppressed(CONFIG_0) ? 1 : 0, 0);
+	int afterRevert = run_up_gate();
+	check(afterRevert == CONFIG_0,
+		"PB1d FAIL-BEFORE: WITHOUT back-off the gate DOES promote to CONFIG_0",
+		afterRevert, CONFIG_0);
+
+	// ====================================================================
+	// PB2 — virtual-clock elapse lifts suppression. Arm CONFIG_0, advance the SIM
+	// clock past the window via sim_clock_add_samples (48000 samples = 1000 ms).
+	// ====================================================================
+	probe_backoff_reset();
+	probe_backoff_arm(CONFIG_0);                       // window = INIT (8000 ms)
+	check(probe_rung_suppressed(CONFIG_0) == true,
+		"PB2a: just-armed CONFIG_0 suppressed", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 1);
+	// Advance just under the window — still suppressed.
+	sim_clock_add_samples((uint64_t)(PROBE_BACKOFF_MS_INIT - 1000) * (SIM_CLOCK_SAMPLE_RATE_HZ / 1000));
+	check(probe_rung_suppressed(CONFIG_0) == true,
+		"PB2b: still suppressed before window elapses", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 1);
+	// Advance past the window — suppression lifts.
+	sim_clock_add_samples((uint64_t)2000 * (SIM_CLOCK_SAMPLE_RATE_HZ / 1000));
+	check(probe_rung_suppressed(CONFIG_0) == false,
+		"PB2c: suppression LIFTS after virtual window elapses", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 0);
+
+	// ====================================================================
+	// PB3 — exponential back-off, capped. Each arm uses the CURRENT window then
+	// DOUBLES it: INIT -> 2*INIT -> ... -> CAP (and stays at CAP).
+	// ====================================================================
+	probe_backoff_reset();
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT,
+		"PB3a: reset window == INIT", probe_backoff_ms, PROBE_BACKOFF_MS_INIT);
+	probe_backoff_arm(CONFIG_0);                       // consumes INIT, window -> 2*INIT
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT * 2,
+		"PB3b: window doubled 8s->16s after first arm", probe_backoff_ms, PROBE_BACKOFF_MS_INIT * 2);
+	probe_backoff_arm(CONFIG_0);                       // window -> 4*INIT
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT * 4,
+		"PB3c: window doubled 16s->32s after second arm", probe_backoff_ms, PROBE_BACKOFF_MS_INIT * 4);
+	// Hammer it well past the cap; it must clamp at CAP and never exceed it.
+	for(int i=0; i<20; i++) probe_backoff_arm(CONFIG_0);
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_CAP,
+		"PB3d: window clamps at CAP", probe_backoff_ms, PROBE_BACKOFF_MS_CAP);
+
+	// ====================================================================
+	// PB4 — reset zeroes every per-rung deadline and returns the window to INIT.
+	// ====================================================================
+	probe_backoff_arm(ROBUST_1);   // arm a couple of distinct rungs
+	probe_backoff_arm(CONFIG_0);
+	probe_backoff_reset();
+	int nonzero = 0;
+	for(int i=0; i<FULL_CONFIG_LADDER_SIZE; i++)
+		if(probe_backoff_until_ms[i] != 0ULL) nonzero++;
+	check(nonzero == 0, "PB4a: all per-rung deadlines zeroed after reset", nonzero, 0);
+	check(probe_backoff_ms == PROBE_BACKOFF_MS_INIT,
+		"PB4b: window back to INIT after reset", probe_backoff_ms, PROBE_BACKOFF_MS_INIT);
+	check(probe_rung_suppressed(CONFIG_0) == false,
+		"PB4c: no rung suppressed after reset", probe_rung_suppressed(CONFIG_0) ? 1 : 0, 0);
+
+	// ====================================================================
+	// PB5 — INV-2: the deep-SNR DOWNWARD escape is UNTOUCHED with a back-off ARMED.
+	// The panic floor (break_target_with_anchor, panic-bypass) and the anchor
+	// DEMOTE (anchor_demote_target) take NO back-off input, so arming CONFIG_0
+	// cannot trap the link above the floor. Assert their targets are IDENTICAL
+	// with and without the back-off armed — and that panic still reaches ROBUST_0.
+	// ====================================================================
+	// Capture the downward-escape targets with NO back-off armed.
+	probe_backoff_reset();
+	last_data_viable_config = ROBUST_1;        // anchor at ROBUST_1 for the floor helpers
+	breaks_since_last_data_success = 2;        // panic latched
+	emergency_previous_config = ROBUST_2;
+	int rawDeep = config_ladder_down_n(emergency_previous_config, 100, robust_enabled);
+	int panicTargetNoBackoff   = break_target_with_anchor(rawDeep);
+	int demoteTargetNoBackoff  = anchor_demote_target(last_data_viable_config,
+		ANCHOR_DEMOTE_BREAK_FAILS, robust_enabled);
+	// Now ARM the back-off on CONFIG_0 (and the anchor rung for good measure) and
+	// re-evaluate the SAME downward escapes — must be byte-identical.
+	probe_backoff_arm(CONFIG_0);
+	probe_backoff_arm(ROBUST_1);
+	int panicTargetArmed   = break_target_with_anchor(rawDeep);
+	int demoteTargetArmed  = anchor_demote_target(last_data_viable_config,
+		ANCHOR_DEMOTE_BREAK_FAILS, robust_enabled);
+	check(panicTargetArmed == panicTargetNoBackoff,
+		"PB5a: panic floor UNCHANGED with back-off armed", panicTargetArmed, panicTargetNoBackoff);
+	check(panicTargetArmed == ROBUST_0,
+		"PB5b: panic still reaches ROBUST_0 (deep escape intact)", panicTargetArmed, ROBUST_0);
+	check(demoteTargetArmed == demoteTargetNoBackoff,
+		"PB5c: anchor DEMOTE target UNCHANGED with back-off armed", demoteTargetArmed, demoteTargetNoBackoff);
+	check(demoteTargetArmed == ROBUST_0,
+		"PB5d: anchor demote from ROBUST_1 reaches ROBUST_0 (downward)", demoteTargetArmed, ROBUST_0);
+	breaks_since_last_data_success = 0;        // restore
+
+	// Restore the production clock and the back-off to a clean state.
+	probe_backoff_reset();
+	restore_clock();
+	// Defensive: the sim sample counter is process-global; leave it where it is
+	// (a one-shot test process exits immediately) but note the starting value.
+	(void)prev_samples;
+
+	printf("[TEST-PROBE-BACKOFF] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
@@ -6690,15 +7107,21 @@ int cl_arq_controller::test_climb_engine()
 		cmd_robust_batch, rsp_robust_batch);
 
 	// D4 — the chokepoint backstop: even a DIRECT robust over-request (modeling a
-	// future/buggy producer calling the setter) is clamped to 1 by
-	// set_data_batch_size() while current_configuration is robust. This is the
-	// "no current OR future path can bypass" guarantee.
+	// future/buggy producer calling the setter) is clamped INTO the robust-legal
+	// range by set_data_batch_size() while current_configuration is robust. This is
+	// the "no current OR future path can bypass the invariant" guarantee. FIX-A
+	// (data-flow-robust-tier-arq-batch.md §6) relaxed the invariant from "always 1"
+	// to "always within [1..ROBUST_DWELL_BATCH_MAX]" (the dwell range), so a rogue
+	// 25 now clamps to ROBUST_DWELL_BATCH_MAX (8), NOT 25 — still no bypass. The
+	// "stays 1 by default / NB stays 1" intent is covered by D'2b/D'2c/D'3 and the
+	// dwell-eligibility gate (only a PROVEN+PARKED rung ever requests >1). The
+	// range-clamp detail is asserted in D'4/D'4b/D'4c below.
 	current_configuration = ROBUST_0;
 	set_data_batch_size(1);
 	set_data_batch_size(25);   // a rogue robust over-request
-	check(data_batch_size == 1,
-		"D4 chokepoint clamps a direct robust over-request (25) back to 1",
-		data_batch_size, 1);
+	check(data_batch_size == ROBUST_DWELL_BATCH_MAX,
+		"D4 chokepoint clamps a direct robust over-request (25) into the dwell range (->MAX 8, never 25)",
+		data_batch_size, ROBUST_DWELL_BATCH_MAX);
 
 	// D5 — OFDM connect is UNCHANGED: at CONFIG_10 the recompute scales batch to
 	// the SACK floor (>=5) on both sides. Confirms the fix is robust-only.
@@ -8384,6 +8807,222 @@ int cl_arq_controller::test_climb_engine()
 			check(p_ofdm_dn == CONFIG_0, "P4b OFDM floor CONFIG_0 UNCHANGED with robust_enabled=NO (non-robust stays out of robust tier)",
 				p_ofdm_dn, CONFIG_0);
 		}
+
+	// ================================================================
+	// Part D' — FIX-A: ROBUST-tier dwell-batch decouple
+	// (data-flow-robust-tier-arq-batch.md §6). The robust batch is pinned to 1 by
+	// default; FIX-A lifts it to a multi-frame dwell ONLY when the rung is PROVEN +
+	// PARKED (robust_dwell_batch_eligible). These parts assert the gate's conjunct
+	// (D'1/D'2/D'3 via the PURE core, no live telecom_system), the relaxed chokepoint
+	// (D'4), the revert-on-config-change symmetry (D'5), and OFDM-byte-unchanged (D'6).
+	//
+	// FAIL-BEFORE markers (prove BOTH directions):
+	//   D'1 — revert condition (e) [the proven-ceiling/not-climbing guard] in
+	//         robust_dwell_batch_eligible_core (e.g. drop the proven_ceiling check)
+	//         and D'1 FAILS (gate opens while a higher rung is reachable = OR-1/L8
+	//         regression). With the guard present it PASSES.
+	//   D'3 — remove the suffix_capable (NB) guard (b) in the core and D'3 FAILS
+	//         (NB robust would lift batch with no SACK bitmap = unrecoverable = L2).
+	//         With the guard present it PASSES.
+	// ================================================================
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;
+
+	// D'1 — gate CLOSED while still climbing: parked-ish at ROBUST_0 with a streak,
+	// BUT a higher rung is still reachable (proven_ceiling=CONFIG_4 above current).
+	// OR-1/L8: lifting batch here would freeze the anchor (p^N clean target
+	// unachievable at the floor with batch>1) — keep batch=1 so the strict clean
+	// credit keeps driving the climb. The PURE core must return FALSE.
+	bool dp1 = robust_dwell_batch_eligible_core(
+		/*current_cfg=*/ROBUST_0, /*anchor=*/ROBUST_0,
+		/*streak_cfg=*/ROBUST_0, /*clean_streak=*/ROBUST_DWELL_PROOF_BATCHES,
+		/*proven_ceiling=*/CONFIG_4, /*suffix_capable=*/true);
+	check(dp1 == false,
+		"D'1 gate CLOSED while climbing (higher rung reachable: ceiling CONFIG_4 > ROBUST_0) [FAIL-BEFORE if (e) reverted]",
+		dp1 ? 1 : 0, 0);
+
+	// D'2 — gate OPENS when proven + parked at the ceiling (WB). Anchor reached this
+	// rung, streak established HERE, proven_ceiling==current (no higher rung the climb
+	// is targeting), suffix_capable (WB). Core must return TRUE.
+	bool dp2 = robust_dwell_batch_eligible_core(
+		ROBUST_0, /*anchor=*/ROBUST_0, /*streak_cfg=*/ROBUST_0,
+		/*clean_streak=*/ROBUST_DWELL_PROOF_BATCHES,
+		/*proven_ceiling=*/ROBUST_0, /*suffix_capable=*/true);
+	check(dp2 == true,
+		"D'2 gate OPENS proven+parked at the robust ceiling (WB, streak>=PROOF, ceiling==current)",
+		dp2 ? 1 : 0, 1);
+
+	// D'2b — same parked state but streak too short → still CLOSED (proves the
+	// PROOF_BATCHES bar bites — guards a transient single clean).
+	bool dp2b = robust_dwell_batch_eligible_core(
+		ROBUST_0, ROBUST_0, ROBUST_0, /*clean_streak=*/ROBUST_DWELL_PROOF_BATCHES - 1,
+		ROBUST_0, true);
+	check(dp2b == false,
+		"D'2b gate CLOSED when clean streak < ROBUST_DWELL_PROOF_BATCHES (transient, not parked)",
+		dp2b ? 1 : 0, 0);
+
+	// D'2c — anchor BELOW current (rung NOT yet proven delivered) → CLOSED (cond c).
+	bool dp2c = robust_dwell_batch_eligible_core(
+		ROBUST_1, /*anchor=*/ROBUST_0, /*streak_cfg=*/ROBUST_1,
+		ROBUST_DWELL_PROOF_BATCHES, /*proven_ceiling=*/ROBUST_1, true);
+	check(dp2c == false,
+		"D'2c gate CLOSED when current rung above the anchor (rung not proven delivered)",
+		dp2c ? 1 : 0, 0);
+
+	// D'3 — NB stays pinned (L2): identical PARKED state to D'2 but suffix_capable=false
+	// (NB M=8 has NO SACK bitmap → a multi-frame partial is unrecoverable). Core must
+	// return FALSE. [FAIL-BEFORE if the (b) suffix guard is removed.]
+	bool dp3 = robust_dwell_batch_eligible_core(
+		ROBUST_0, ROBUST_0, ROBUST_0, ROBUST_DWELL_PROOF_BATCHES,
+		/*proven_ceiling=*/ROBUST_0, /*suffix_capable=*/false);
+	check(dp3 == false,
+		"D'3 NB robust stays pinned at 1 (suffix_capable=false, no SACK bitmap) [FAIL-BEFORE if (b) reverted]",
+		dp3 ? 1 : 0, 0);
+
+	// D'3b — non-robust (OFDM) config is NEVER dwell-eligible (cond a): FIX-A is
+	// robust-tier-only.
+	bool dp3b = robust_dwell_batch_eligible_core(
+		CONFIG_10, CONFIG_10, CONFIG_10, ROBUST_DWELL_PROOF_BATCHES, CONFIG_10, true);
+	check(dp3b == false,
+		"D'3b OFDM config is never robust-dwell-eligible (cond a — robust-tier-only)",
+		dp3b ? 1 : 0, 0);
+
+	// D'4 — the RELAXED chokepoint honors [1..ROBUST_DWELL_BATCH_MAX] at robust
+	// (REPLACES old D4's clamp-to-1; the invariant is now "no path escapes [1..MAX]").
+	current_configuration = ROBUST_0;
+	set_data_batch_size(1);
+	set_data_batch_size(ROBUST_DWELL_BATCH);        // the dwell raise — must survive
+	check(data_batch_size == ROBUST_DWELL_BATCH,
+		"D'4 relaxed chokepoint admits the dwell batch (4) at robust (not clamped to 1)",
+		data_batch_size, ROBUST_DWELL_BATCH);
+	set_data_batch_size(25);                         // a rogue robust over-request
+	check(data_batch_size == ROBUST_DWELL_BATCH_MAX,
+		"D'4b chokepoint clamps a rogue robust over-request (25) DOWN to ROBUST_DWELL_BATCH_MAX (8), not 1, not 25",
+		data_batch_size, ROBUST_DWELL_BATCH_MAX);
+	set_data_batch_size(0);                          // below floor
+	check(data_batch_size == 1,
+		"D'4c chokepoint clamps a sub-1 robust request UP to 1 (floor)",
+		data_batch_size, 1);
+
+	// D'5 — REVERT SYMMETRY on config change: a robust config (re)load reseeds batch=1
+	// AND clears robust_dwell_batch_active, so a stale 4-8 never survives a rung change
+	// (the climb-resume / BREAK / ROBUST_0→ROBUST_1 revert leg). We model the
+	// load_configuration() robust branch directly (set_data_batch_size(1) +
+	// robust_dwell_batch_active=false) on BOTH a CMD-state and an RSP-state snapshot and
+	// assert they converge on the SAME value (CMD batch == RSP batch == 1).
+	current_configuration = ROBUST_0;
+	set_data_batch_size(ROBUST_DWELL_BATCH);
+	robust_dwell_batch_active = true;
+	// --- the load_configuration() §5.3 revert leg (runs identically on CMD and RSP) ---
+	set_data_batch_size(1);
+	robust_dwell_batch_active = false;
+	int cmd_revert_batch = data_batch_size;
+	bool cmd_flag = robust_dwell_batch_active;
+	// RSP snapshot reaches the SAME leg on the same config load.
+	set_data_batch_size(ROBUST_DWELL_BATCH);  // (RSP had also been raised)
+	robust_dwell_batch_active = true;
+	set_data_batch_size(1);                   // RSP config (re)load
+	robust_dwell_batch_active = false;
+	int rsp_revert_batch = data_batch_size;
+	check(cmd_revert_batch == 1 && rsp_revert_batch == 1 && !cmd_flag && !robust_dwell_batch_active,
+		"D'5 config-change revert: CMD batch == RSP batch == 1, dwell flag cleared on BOTH (symmetric)",
+		cmd_revert_batch, rsp_revert_batch);
+
+	// D'6 — OFDM batch path is BYTE-UNCHANGED by FIX-A: at CONFIG_10 the SACK recompute
+	// still scales to the >=5 floor (re-runs old D5). FIX-A must not touch the OFDM path.
+	sack_enabled    = true;
+	sack_v2_enabled = true;
+	radio_batch_size = 25;
+	nMessages       = 120;
+	message_transmission_time_ms = 1000;
+	current_configuration    = CONFIG_10;
+	negotiated_configuration = CONFIG_10;
+	set_data_batch_size(1);
+	sack_negotiated_recompute_batch("CMD");
+	int dp6_ofdm = data_batch_size;
+	check(dp6_ofdm >= 5,
+		"D'6 OFDM (CONFIG_10) recompute still scales to SACK floor >=5 (FIX-A is robust-only)",
+		dp6_ofdm, 5);
+
+	// ================================================================
+	// Part D'-FLOW — FIX-A P0 (adversarial-review fix, 2026-06-03): the
+	// STATE-MACHINE FLOW round-trip the D'1-D'6 DECISION units never exercised.
+	// data-flow-robust-tier-arq-batch.md §5.4.
+	//
+	// FIX-A added the producer (encoder add_message_control(ROBUST_DWELL_BATCH_OP),
+	// decision evaluate_robust_dwell_batch()) + the RSP-side ACK handler
+	// (arq_responder.cc → ACKNOWLEDGING_CONTROL, ACKs), but the CMD-side
+	// process_control_commander() had NO data[0]==ROBUST_DWELL_BATCH_OP consumer.
+	// On the wire the CMD applies the dwell batch locally then sends the op and
+	// enters RECEIVING_ACKS_CONTROL; when the RSP ACK arrives the CMD had no
+	// transition back to TRANSMITTING_DATA → it sat in RECEIVING_ACKS_CONTROL →
+	// control-timeout → spurious emergency BREAK → load_configuration(ROBUST_0)
+	// reverted the batch to 1, on EVERY dwell raise AND revert — WORSE than the
+	// batch=1 floor it was trying to lift.
+	//
+	// This part drives the REAL process_control_commander() at the exact
+	// RECEIVING_ACKS_CONTROL state the RSP-ACK lands in (link_status=CONNECTED,
+	// connection_status=RECEIVING_ACKS_CONTROL, messages_control.data[0]=
+	// ROBUST_DWELL_BATCH_OP) and asserts the CMD reaches TRANSMITTING_DATA.
+	//
+	// FAIL-BEFORE: temporarily revert the new CMD consumer branch (the
+	// `else if (messages_control.data[0]==ROBUST_DWELL_BATCH_OP)` in
+	// process_control_commander()'s link_status==CONNECTED block) → the inner
+	// data[0] dispatch has NO catch-all else, so connection_status stays at
+	// RECEIVING_ACKS_CONTROL → DPF1 FAILS. PASS-AFTER: the branch sets
+	// TRANSMITTING_DATA → DPF1 PASSES. The D'1-D'6 parts CANNOT catch this — they
+	// call the pure DECISION helpers, never process_control_commander().
+	//
+	// Synthetic-fire safety: no init()/set_nMessages()/init_messages_buffers() ran, so
+	// (a) messages_tx/messages_rx are NULL — process_control_commander() ends in
+	//     cleanup(), which iterates messages_tx[0..nMessages]; force nMessages=0 so that
+	//     loop (and the analogous messages_rx loop) is a no-op and never derefs NULL; and
+	// (b) messages_control is a direct struct member, but its .data field is a char*
+	//     that is NULL until init_messages_buffers() allocates it (arq.h st_message:170).
+	//     We must point .data at a real buffer before writing data[0], or the write
+	//     faults. Allocate a scratch buffer here and restore NULL after.
+	// watchdog_timer/link_timer .start() only read the clock (timer.cc:140) — safe with
+	// no init. Restore all touched state after.
+	{
+		int saved_nMessages = nMessages;
+		int saved_link_status = link_status;
+		int saved_connection_status = connection_status;
+		char* saved_ctrl_data = messages_control.data;
+		int saved_ctrl_status = messages_control.status;
+
+		char dpf_ctrl_buf[N_MAX/8];
+		memset(dpf_ctrl_buf, 0, sizeof(dpf_ctrl_buf));
+		messages_control.data = dpf_ctrl_buf;   // give the control frame a real buffer
+		nMessages = 0;   // make cleanup()'s messages_tx/messages_rx loops no-ops (NULL-safe)
+
+		// Stage the exact post-RSP-ACK state: CONNECTED, awaiting a control ACK,
+		// the in-flight control frame is the dwell op.
+		link_status = CONNECTED;
+		connection_status = RECEIVING_ACKS_CONTROL;
+		messages_control.status = ACKED;   // an ACK was just received for this op
+		messages_control.data[0] = ROBUST_DWELL_BATCH_OP;
+
+		// Drive the REAL consumer.
+		process_control_commander();
+
+		// DPF1 — THE flow assertion: the CMD transitions out of
+		// RECEIVING_ACKS_CONTROL back to TRANSMITTING_DATA. Pre-fix (no consumer
+		// branch) this stays RECEIVING_ACKS_CONTROL and DPF1 FAILS.
+		check(connection_status == TRANSMITTING_DATA,
+			"DPF1 dwell-op ACK round-trips CMD RECEIVING_ACKS_CONTROL -> TRANSMITTING_DATA "
+			"(P0 consumer branch; FAIL-BEFORE without it)",
+			connection_status, TRANSMITTING_DATA);
+
+		// Restore (the scratch buffer is stack-local — null the pointer so no later
+		// teardown touches freed/stale storage).
+		messages_control.data = saved_ctrl_data;
+		messages_control.status = saved_ctrl_status;
+		nMessages = saved_nMessages;
+		link_status = saved_link_status;
+		connection_status = saved_connection_status;
+	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

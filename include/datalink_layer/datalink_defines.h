@@ -115,9 +115,26 @@
                                 // CRC8 over [echoed_peer_cap, own_cap], POLY=0xF4.
                                 // CMD validates echoed_peer_cap == local_capability
                                 // before transitioning out of CONNECTION_ACCEPTED.
-// 0x44 reserved (was OFDM_ACK_CLEAN; removed 2026-05-24, replaced by
-// the MFSK ACK+SACK pattern carrying [bsi:8|bitmap:32|crc12:12] —
-// see mercury/fact-documents/mfsk-robust-ack.md).
+#define ROBUST_DWELL_BATCH_OP 0x44  // FIX-A: ROBUST-tier dwell-batch decouple
+                                // (data-flow-robust-tier-arq-batch.md §5.2). CMD-decided,
+                                // RSP-mirrored batch size for a PROVEN+PARKED robust dwell.
+                                // Distinct from SET_LINK_PARAMS (0x43) ON PURPOSE: that op's
+                                // RSP handler clamps batch to [AXIS2_BATCH_FLOOR=10,32]
+                                // (the OFDM Axis-2 contract), which would force a robust
+                                // 4-8 batch UP to 10 on the RSP only → CMD≠RSP all-ones
+                                // target mismatch → the literal Bug-3 4-wire-failure
+                                // (OR-2 / landmine L4). This op applies the value straight
+                                // through the relaxed set_data_batch_size() chokepoint
+                                // (clamped only to the robust [1..ROBUST_DWELL_BATCH_MAX]
+                                // range), so CMD and RSP converge on the SAME value.
+                                // Wire payload after the 3-byte msg header:
+                                //   [batch : u8][CRC8 : u8]   (length=3 incl. data[0]=op)
+                                // CRC8 over data[1] only, POLY_CRC8=0xF4 (matches SACK_RSP /
+                                // SET_LINK_PARAMS coverage rule). batch ∈ [1..ROBUST_DWELL_BATCH_MAX].
+                                // (Reuses the 0x44 slot freed when OFDM_ACK_CLEAN was
+                                // removed 2026-05-24 — the MFSK ACK+SACK pattern carrying
+                                // [bsi:8|bitmap:32|crc12:12] superseded that frame type;
+                                // see mercury/fact-documents/mfsk-robust-ack.md.)
 
 // Capability flags (embedded in TEST_CONNECTION byte 5).
 // Down to two bits after the 2026-05-24 capability cleanup: compression /

@@ -103,6 +103,33 @@ inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 // negligible (§4). Only applied when is_robust_config(current) — OFDM stays R=1.
 #define CONNECT_PREAMBLE_REPS_PROD 4
 
+// FIX-A: ROBUST-tier dwell-batch decouple (data-flow-robust-tier-arq-batch.md).
+// At a ROBUST config the data batch is normally pinned to 1 (one MFSK frame per
+// ACK turnaround — >90% dead-time on the deep-SNR floor) because at the MFSK
+// cliff P(batch clean)=p^N and only batch=1 makes the strict all-ones clean
+// target achievable while the climb is still earning the rung. FIX-A lifts the
+// pin to a multi-frame batch ONLY once the link is PROVEN + PARKED on a robust
+// rung (robust_dwell_batch_eligible(), arq.h): the rung has already delivered
+// clean batches (anchor reached it) and the climb is not actively probing a
+// higher rung, so the p^N penalty is acceptable and the M=16 MFSK SACK suffix
+// patches any partial. Then the whole payload streams 4-8 frames per turnaround
+// instead of one, amortizing the fixed ACK dead-time.
+//
+// ROBUST_DWELL_BATCH_MAX — the hard ceiling the relaxed set_data_batch_size()
+//   chokepoint clamps a robust batch into ([1..MAX]). 8 keeps the all-ones SACK
+//   target (1<<batch)-1 = 0xFF well under both the CMD 32-bit and RSP 30-bit
+//   bitmap caps (data-flow-robust-tier-arq-batch.md §3.1), and ≤ the M=16 SACK
+//   suffix's 32-frame bitmap (mfsk-robust-ack.md).
+// ROBUST_DWELL_BATCH — the value the CMD requests on a proven+parked robust
+//   dwell (the operating point inside [1..MAX]).
+// ROBUST_DWELL_PROOF_BATCHES — consecutive clean batches AT THE ROBUST RUNG
+//   required before the raise fires (proves PARKED, not transient).
+// All three are SWEPT in the FTRT sim, not magic-numbered (CLAUDE.md §1 / OR-5).
+// Starting values below; the sweep result is recorded in the fact doc §8.
+#define ROBUST_DWELL_BATCH_MAX     8
+#define ROBUST_DWELL_BATCH         4
+#define ROBUST_DWELL_PROOF_BATCHES 2
+
 // NB mode cap — CONFIG_14 (8PSK, LDPC 14/16) is the highest feasible NB config.
 // 16QAM/32QAM (CONFIG_15+) require accurate amplitude equalization that NB's
 // sparse pilot grid (Nc=10, Dy=3) cannot provide with sufficient accuracy.
@@ -376,6 +403,26 @@ CONFIG_16 (5664.7 bps).
 // CONFIG_13 = gap 13), so the WGN:30 fast climb is materially unchanged (≤2 bounded
 // leaps from a low OFDM anchor) while a pathological jump is bounded.
 #define RETRIGGER_MAX_LEAP 13
+
+// FIX-B — FLOOR-PROBE BACK-OFF (gearshift-floor-probe-backoff.md). At the
+// robust/OFDM boundary a failed CONFIG_0 up-probe panic-collapses the link to
+// the ROBUST tier; the climb then re-probes that SAME rung on a FIXED cadence,
+// re-fails, and the link burns the deep-SNR floor's airtime in a
+// CONFIG_0↔ROBUST_0/2 limit cycle (HW WGN:-10 config_counts ROBUST_0:6
+// ROBUST_2:4 CONFIG_0:4). These bound a PER-RUNG exponential back-off so a
+// PROVEN-FAILED up-probe is not hammered every cycle: the first failure
+// suppresses re-probing of that rung for PROBE_BACKOFF_MS_INIT, doubling on each
+// repeat fail up to PROBE_BACKOFF_MS_CAP, and the whole back-off is reset the
+// instant ANY clean OFDM batch is delivered (the channel proved it recovered).
+// OR-5 / [Q1]: these are STARTING values, to be SWEPT in the FTRT sim / HW
+// floor-stack A/B (NOT magic-numbered final constants — see CLAUDE.md §1 and the
+// fact-doc §6 sweep note). INIT ~8 s ≈ one robust-tier dwell cycle (long enough
+// to do real floor work between probes, short enough that a recovering channel
+// re-probes promptly); CAP ~120 s bounds the worst-case re-probe latency on a
+// channel that genuinely improved but delivered no clean OFDM batch to trigger
+// the reset.
+#define PROBE_BACKOFF_MS_INIT 8000
+#define PROBE_BACKOFF_MS_CAP  120000
 
 #define YES 1
 #define NO 0

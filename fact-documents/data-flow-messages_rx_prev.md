@@ -201,6 +201,28 @@ Pre-R7 this invariant was missing: the bound was `loc < nMessages`. The
 new-data path at `arq_responder.cc:54` always had the right bound;
 prev-batch path was the asymmetric one.
 
+### 4.4 FIX-A — the prev-path is now LIVE at the ROBUST tier (2026-06-03)
+
+**Update (FIX-A, branch `fix/robust-dwell-batch`)**: before FIX-A the entire
+SACK partial / prev-batch machinery was **DEAD at the ROBUST tier** because the
+robust data batch was force-pinned to 1 (`set_data_batch_size()` chokepoint), and
+the partial branch (`arq_responder.cc:1462` `if(data_batch_size > 1 …)`) plus the
+`<=1` SACK-suppression short-circuit (`:1504`) meant a single-frame robust batch
+never reached `bump_bsi_and_transfer_prev()` / the prev-delivery loop. FIX-A lifts
+the robust batch to `[1..ROBUST_DWELL_BATCH_MAX(8)]` on a PROVEN+PARKED dwell
+(`robust_dwell_batch_eligible()`, `arq.h`), so at a robust dwell with batch 4-8 the
+prev-path becomes EXERCISED at ROBUST_0 WB.
+
+**No new invariant is broken** — every invariant in §4 is `data_batch_size`-
+parametric and `messages_rx_prev[]` is sized to `nMessages` (default 120, §1.1), so
+4-8 robust slots fit trivially (the path was already validated for OFDM batch ≥ 25).
+The one thing the FIX-A audit confirms: the M=16 `ack_mfsk` SACK suffix is
+config-independent (`telecom_system.cc:3095`) so `ack_sack_suffix_len()==13` at
+ROBUST_0 WB — the bitmap that drives the prev/partial path exists. On **NB** robust
+(`ack_sack_suffix_len()==0`) there is no bitmap, so the FIX-A gate keeps NB robust
+at batch=1 (conjunct (b)) and the prev-path stays dead there — unchanged.
+See `data-flow-robust-tier-arq-batch.md` §3.7 / L1.
+
 ---
 
 ## §5 The R7 fix — what changed and why
