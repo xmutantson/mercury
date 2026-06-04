@@ -85,7 +85,14 @@ int cl_tcp_socket::init()
 			else
 			{
 				server.sin_family = AF_INET;
-				server.sin_addr.s_addr = htonl(INADDR_ANY);
+				// Bind loopback only (127.0.0.1), NOT INADDR_ANY (0.0.0.0). Two reasons:
+				// (1) avoids the Windows Firewall "allow on the network?" prompt that fires
+				//     for every new mercury.exe path (e.g. per-worktree builds); loopback
+				//     binds are never filtered/prompted. (2) the TNC/control socket should
+				//     not be exposed to the LAN -- all clients (sim harness, GUI, on-Pi test
+				//     scripts) connect via 127.0.0.1. If remote access is ever needed, make
+				//     this configurable (INI/flag); do not default back to INADDR_ANY.
+				server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 				server.sin_port = htons((uint16_t)port);
 				status=TCP_STATUS_SOCKET_CREATED;
 			}
