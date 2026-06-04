@@ -37,6 +37,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sched.h>     // sched_yield (SIM cooperative yield, POSIX/Pi)
 #endif
 #include <stdlib.h>   // getenv, atoi
 
@@ -141,17 +142,19 @@ static inline void ffthread_sleep(ffuint msec)
 #endif
 }
 
-// SIM-mode cooperative wait. The -x sim bridge + RX-prep loops are paced by
-// fixed ffthread_sleep(ms) waits that are correct for a real device (the
-// device delivers audio in real time) but would throttle the device-free
-// channel to ~1x real time and erase the faster-than-real-time speed-up. When
-// the sim virtual clock is active, sleep a SHORT real interval (~200 us)
-// instead: it hands the core to the thread that makes progress (relay TCP /
-// capture_buffer) WITHOUT pegging a core, and — unlike a raw yield — keeps the
-// two peer processes loosely paced together so their independent virtual
-// clocks stay coupled through the relay (a hot yield here helped desync the
-// CMD<->RSP half-duplex turnaround). When sim is disabled this is the stock
-// ffthread_sleep(ms) — production unchanged.
+// SIM-mode cooperative wait (DATA-PATH variant — RX-bridge back-pressure +
+// RX-prep fill). These two loops gate the RECEIVE pipeline: the RX bridge waits
+// for capture_buffer space; the prep thread waits for a full symbol of capture
+// data. They MUST stay paced to a real (sub-)ms tick under sim, NOT a hot yield:
+// the half-duplex HAIL/CONNECT turnaround depends on the RECEIVE side sampling
+// the capture ring at the cadence the channel delivers it. A hot yield here
+// (Sleep(0)) let the RX/prep loops sprint, mis-windowing the inbound HAIL
+// correlation (RSP saw only the noise floor where the HAIL energy should be) and
+// BROKE CONNECT on the clean cell (sim-ftrt-speedup-floor.md §7.2 bisect). So the
+// data-path pace keeps the original SHORT real sleep. (The faster-than-real-time
+// speed-up is driven by the TX-bridge SILENCE producer instead — see
+// sim_tx_idle_pace() below — which can run flat-out without touching RX timing.)
+// When sim is disabled this is the stock ffthread_sleep(ms) — production unchanged.
 static inline void sim_paced_wait(ffuint msec)
 {
 	if (sim_clock_enabled())
@@ -160,7 +163,7 @@ static inline void sim_paced_wait(ffuint msec)
 		// is ~1 ms (Sleep(0) would just yield/hot-spin), so use a 1 ms floor
 		// there; on POSIX nanosleep gives true sub-ms. Either way this is far
 		// shorter than the virtual durations being waited, so the speed-up
-		// holds while the two peer processes stay loosely paced.
+		// holds while the RX pipeline stays paced to the channel cadence.
 #if defined(FF_WIN)
 		Sleep(1);
 #else
@@ -171,6 +174,56 @@ static inline void sim_paced_wait(ffuint msec)
 	else
 	{
 		ffthread_sleep(msec);
+	}
+}
+
+// SIM-mode TX-bridge idle pace (the FTRT speed-up lever).
+//
+// The TX bridge, when the modem has no TX queued, emits a SILENCE chunk so the
+// relay's per-direction sample clock keeps advancing (the channel must carry a
+// noise floor during TX gaps — RF realism). The RATE at which this loop emits
+// silence directly sets how fast VIRTUAL TIME advances, because the relay stamps
+// one chunk = 1024 samples of virtual time per forwarded chunk. The original
+// Sleep(1)=~15.3 ms quantum here throttled silence to ~65 chunks/s, capping the
+// whole sim at ~1.4x real-time (sim-ftrt-speedup-floor.md §4).
+//
+// Unlike the RX data-path pace (sim_paced_wait), this idle silence emit has NO
+// receive-timing dependency — it is pure inter-frame noise floor. So it can run
+// FLAT-OUT: we YIELD (not timed-sleep) and let the relay's K=1 conservative-PDES
+// window barrier + bounded inbound queue + TCP back-pressure be the flow control.
+// send() blocks the instant the relay can't accept more (event-driven), and the
+// barrier bounds the a2b/b2a virtual-clock split regardless of OS scheduling —
+// so determinism is preserved by the shared clock + barrier, not by a wall pace.
+// This is what lifts the deep/turnaround-dominated cell from 1.4x to >7x.
+// Production never runs the sim TX bridge, so this is sim-only by construction.
+static inline void sim_tx_idle_pace(void)
+{
+	if (sim_clock_enabled())
+	{
+		// CONNECT-SAFETY (sim-ftrt-speedup-floor.md §7). A flat-out yield here
+		// floods idle silence faster than real time; forwarded to the peer it
+		// DESYNCS the half-duplex HAIL/CONNECT handshake — the receiving peer's
+		// connect FSM advances on its fast virtual clock and false-triggers into
+		// Receiving on the noise flood BEFORE the real HAIL aligns, so CONNECT
+		// never completes (clean SNR35 -> 0 bytes, three flood variants all broke
+		// it; the relay big-step does not help because during a handshake one side
+		// always carries signal so the other side's silence is NOT coalesced).
+		// The handshake FSM has real wall-clock-coupled timing that virtual-time
+		// acceleration breaks — see §7/§8 for the architectural conclusion. So the
+		// idle silence emit is paced to a real (sub-)ms tick, same as the RX data
+		// path. The SAFE, shipped speed-up is the ARQ-thread + spin-helper yield
+		// (sim_spin_sleep, arq_common.cc) which frees the wasted core WITHOUT
+		// touching virtual-time rate (CONNECT-safe, bisect-verified).
+#if defined(FF_WIN)
+		Sleep(1);
+#else
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 };  // 200 us
+		nanosleep(&ts, NULL);
+#endif
+	}
+	else
+	{
+		ffthread_sleep(5);
 	}
 }
 
@@ -1626,9 +1679,13 @@ void *sim_tx_bridge_thread(void *unused)
 			read_buffer(playback_buffer, (uint8_t *)chunk, (int)avail);
 		} else {
 			// No TX queued: send a silence chunk so the relay clock advances
-			// and the RX side still receives a noise floor (RF realism).
+			// and the RX side still receives a noise floor (RF realism). Pace
+			// with the FLAT-OUT idle yield (the FTRT speed-up lever) — this loop
+			// has no RX-timing dependency, so it can produce silence as fast as
+			// the relay drains it (bounded by the relay K=1 barrier + TCP
+			// back-pressure on send below). See sim_tx_idle_pace().
 			memset(chunk, 0, chunk_bytes);
-			sim_paced_wait(5);
+			sim_tx_idle_pace();
 		}
 		if (sim_send_all(sim_sock, (const uint8_t *)chunk, chunk_bytes) != 0) {
 			printf("[SIM] TX bridge send failed (relay closed?)\n");

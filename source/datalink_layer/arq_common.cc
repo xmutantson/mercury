@@ -33,6 +33,9 @@
 #include <cstring>
 #include <chrono>
 #include <cstdlib>
+#if !defined(_WIN32)
+#include <sched.h>     // sched_yield (SIM cooperative yield, POSIX/Pi)
+#endif
 
 extern "C" {
     extern double noise_snr_db;
@@ -84,21 +87,31 @@ extern cbuf_handle_t playback_buffer;
 // PTT turnaround timing race: the two peers are SEPARATE processes with
 // SEPARATE virtual clocks coupled only through the real-time relay, and
 // adversarial hot-spinning let one peer's virtual clock sprint past the
-// other's, corrupting the half-duplex turnaround (RSP's HAIL response was
-// dropped by a CMD that had already raced through its ptt_off_delay). It also
-// pegged a core to no purpose. So in SIM mode we sleep a SHORT real interval
-// (SIM_SPIN_SLEEP_US) instead of yielding: it hands the core to the sibling
-// threads, keeps the two processes loosely paced together (so their virtual
-// clocks stay coupled via the relay), and is far shorter than the virtual
-// durations being waited — so the faster-than-real-time speed-up is preserved
-// (the loop still exits on the VIRTUAL condition, the sleep only bounds the
-// poll overshoot to <1 ms). In PRODUCTION (sim disabled) both helpers do
-// EXACTLY the stock `msleep(1)` — byte-identical behavior. Factored to ONE
-// definition each so the policy lives in a single place.
-static const int SIM_SPIN_SLEEP_US = 200;
+// other's, corrupting the half-duplex turnaround.
+//
+// Q3 SPEEDUP FIX (sim-ftrt-speedup-floor.md §4): that "spin must loosely pace
+// the two peers" rationale is now STALE. The relay K=1 conservative-PDES window
+// barrier (sim_channel_relay.py, added later) bounds the a2b/b2a virtual-clock
+// split to K*1024 samples REGARDLESS of OS scheduling — so determinism comes
+// from the shared clock + barrier, NOT from this spin's pacing. Worse, the
+// "short sleep" we used, std::this_thread::sleep_for(200us), does NOT sleep on
+// Windows (libstdc++ MinGW returns immediately for sub-ms durations) — it is a
+// HOT-SPIN that pegs a core AND starves the sibling TX-bridge thread that
+// produces the silence chunks driving virtual time, throttling the whole link
+// to ~1.4x real-time. So in SIM mode we now truly YIELD the core (Sleep(0) on
+// Windows / sched_yield on POSIX): the ARQ thread hands the core to the TX
+// bridge / RX bridge / prep threads that make progress, the silence producer
+// runs flat-out (bounded by the relay barrier), and the >5x speed-up is freed.
+// The half-duplex turnaround stays correct because the relay barrier — not this
+// spin — couples the two peers' virtual clocks. In PRODUCTION (sim disabled)
+// the wrapping helpers do EXACTLY the stock msleep(1) — byte-identical.
 static inline void sim_spin_sleep()
 {
-	std::this_thread::sleep_for(std::chrono::microseconds(SIM_SPIN_SLEEP_US));
+#if defined(_WIN32)
+	Sleep(0);          // yield to ready same-priority threads; no timed wait
+#else
+	sched_yield();
+#endif
 }
 static inline void ptt_busy_wait(cl_timer& t, int delay_ms)
 {
