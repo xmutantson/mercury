@@ -100,32 +100,74 @@ static inline void sim_spin_sleep()
 {
 	std::this_thread::sleep_for(std::chrono::microseconds(SIM_SPIN_SLEEP_US));
 }
-static inline void ptt_busy_wait(cl_timer& t, int delay_ms)
+
+// ---------------------------------------------------------------------------
+// SIM_INPROC step-pump hook (single-process-sim-refactor.md §2).
+//
+// In the two-process paced sim the spin-loops below exit because CONCURRENT
+// sibling threads make their exit condition true (the TX bridge drains
+// playback_buffer; the RX bridge + capture-prep thread advance the virtual
+// clock via rx_transfer). A SINGLE-THREAD stepper has no sibling threads, so
+// without help the waits would block forever inside process_main → DEADLOCK.
+//
+// g_sim_inproc_pump is a step-pump callback the SIM_INPROC stepper installs.
+// When non-null (ONLY under -m SIM_INPROC), the spin-loops call it instead of
+// sim_spin_sleep(): from INSIDE the wait it re-enters the loopback-drain +
+// clock-advance the stepper would otherwise do after process_main returns.
+//
+// CRITICAL FIDELITY GUARD: the pump only makes the EXISTING exit predicate
+// eventually true — it NEVER changes the threshold and NEVER lets the loop
+// exit early. ptt_busy_wait still exits at get_elapsed_time_ms() >= delay_ms;
+// drain_playback_wait still exits at size_buffer(playback_buffer) == 0. The
+// pump advances the clock through the SAME rx_transfer → sim_clock_add_samples
+// accounting as the capture-prep thread, so the exit instant is identical to
+// the two-process path.
+//
+// Default null. Production (-x wasapi/alsa) and the two-process paced sim
+// never install it, so their spin-loop bodies are BYTE-IDENTICAL to before
+// (sim_spin_sleep() under sim, msleep(1) otherwise).
+typedef void (*sim_inproc_pump_fn)(void* ctx);
+static sim_inproc_pump_fn g_sim_inproc_pump = nullptr;
+static void*              g_sim_inproc_pump_ctx = nullptr;
+
+void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx)
 {
-	if (sim_clock_enabled())
-	{
-		while (t.get_elapsed_time_ms() < delay_ms)
-			sim_spin_sleep();
-	}
-	else
-	{
-		while (t.get_elapsed_time_ms() < delay_ms)
-			msleep(1);
-	}
+	g_sim_inproc_pump = fn;
+	g_sim_inproc_pump_ctx = ctx;
 }
 
-static inline void drain_playback_wait()
+// Single place the step-pump is invoked from inside the spin loops. When no
+// pump is installed this is exactly the prior body: sim_spin_sleep() under the
+// virtual clock, msleep(1) on the production wall-clock path.
+static inline void sim_spin_or_pump(bool sim_clock_on)
 {
-	if (sim_clock_enabled())
-	{
-		while (size_buffer(playback_buffer) > 0)
-			sim_spin_sleep();
-	}
+	if (g_sim_inproc_pump != nullptr)
+		g_sim_inproc_pump(g_sim_inproc_pump_ctx);  // step-pumpable (SIM_INPROC only)
+	else if (sim_clock_on)
+		sim_spin_sleep();                          // two-process paced sim
 	else
-	{
-		while (size_buffer(playback_buffer) > 0)
-			msleep(1);
-	}
+		msleep(1);                                 // production
+}
+
+// NOTE: external linkage (not static) so the SIM_INPROC prototype in
+// arq_commander.cc can drive the EXACT same spin-loop functions the
+// production TX path uses (proving the real helpers are step-pumpable, not a
+// re-implementation). Bodies are unchanged from the prior static versions, so
+// the production path is behaviorally identical.
+void ptt_busy_wait(cl_timer& t, int delay_ms)
+{
+	const bool sim_clock_on = sim_clock_enabled();
+	// EXIT CONDITION UNCHANGED: virtual (or wall) time must pass delay_ms.
+	while (t.get_elapsed_time_ms() < delay_ms)
+		sim_spin_or_pump(sim_clock_on);
+}
+
+void drain_playback_wait()
+{
+	const bool sim_clock_on = sim_clock_enabled();
+	// EXIT CONDITION UNCHANGED: the playback ring must be fully drained.
+	while (size_buffer(playback_buffer) > 0)
+		sim_spin_or_pump(sim_clock_on);
 }
 
 static const int RX_MUTE_GUARD_MS = 50;

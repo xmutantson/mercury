@@ -1156,6 +1156,16 @@ public:
   // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
   int test_robust0_compress_deadlock();
 
+  // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
+  // Single-instance in-process self-loopback: keys PTT, emits a real frame,
+  // and proves the TX-path spin-loops (ptt_busy_wait + drain_playback_wait)
+  // become STEP-PUMPABLE under a single-thread stepper with NO concurrent
+  // drainer thread, while the spin-exit timing stays IDENTICAL to the
+  // two-process paced sim (clock past delay / ring drained). Sets up its own
+  // PHY + audio ring buffers (no device, no bridge/prep threads, no TCP, no
+  // relay). Returns 0 on a clean inline cycle, 1 on any failure. -m SIM_INPROC.
+  int test_sim_inproc();
+
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
   // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:

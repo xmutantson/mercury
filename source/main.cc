@@ -453,6 +453,7 @@ int main(int argc, char *argv[])
         printf("  PLOT_PASSBAND   Passband BER simulation (AWGN)\n");
         printf("  TX_TEST / RX_TEST   Test pattern transmission/reception\n");
         printf("  TX_RAND / RX_RAND   Random data transmission/reception\n");
+        printf("  SIM_INPROC      In-process self-loopback feasibility prototype (no device/TCP/threads)\n");
 
         printf("\nDevice and audio:\n");
         printf("  -i [device]       Audio capture device (e.g. \"plughw:0,0\" or device name from -z)\n");
@@ -1168,6 +1169,8 @@ int main(int argc, char *argv[])
                 operation_mode = MONITOR_MODE;
             if (!strcmp(optarg, "TX_WAV"))
                 operation_mode = TX_WAV;
+            if (!strcmp(optarg, "SIM_INPROC"))
+                operation_mode = SIM_INPROC;
             break;
         case 'x':
             if (!strcmp(optarg, "alsa"))
@@ -1723,6 +1726,25 @@ start_modem:
         telecom_system.tx_gain[TX_SIG_BREAK][1][1] = boost_override;
         printf("[TX-GAIN] Override: NB MFSK_1S=%.4f  MFSK_2S=%.4f  ACK/BREAK=%.4f\n",
                boost_override, boost_override * ratio_2s, boost_override);
+    }
+
+    // SIM_INPROC: single-process in-process self-loopback feasibility prototype.
+    // Additive one-shot — runs ONE telecom_system + arq_controller in-process
+    // with a single-thread step-pumped stepper. NO audio device, NO bridge/prep
+    // threads, NO TCP server, NO relay. Firewall-safe (no sockets) and
+    // audio-safe (no device). Proves the TX-path spin-loops become
+    // step-pumpable without a concurrent drainer while preserving spin-exit
+    // timing. See fact-documents/single-process-sim-refactor.md. Exits rc.
+    if (telecom_system.operation_mode == SIM_INPROC)
+    {
+        printf("Mode selected: SIM_INPROC (in-process self-loopback prototype)\n");
+        fflush(stdout);
+        cl_arq_controller ARQ;
+        ARQ.telecom_system = &telecom_system;
+        int rc = ARQ.test_sim_inproc();
+        printf("[FLAG] SIM_INPROC prototype complete (rc=%d) — exiting.\n", rc);
+        fflush(stdout);
+        return rc;
     }
 
     // initializing audio system

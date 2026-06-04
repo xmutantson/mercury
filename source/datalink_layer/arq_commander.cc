@@ -9170,6 +9170,298 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 	return failed == 0 ? 0 : 1;
 }
 
+// ===========================================================================
+// SIM_INPROC feasibility prototype — single-process in-process self-loopback.
+// See fact-documents/single-process-sim-refactor.md.
+//
+// Proves the make-or-break risk of the single-process sim refactor: that the
+// TX-path blocking spin-loops (ptt_busy_wait + drain_playback_wait, the two
+// shapes that recur ~24x) become STEP-PUMPABLE under a single-thread stepper
+// with NO concurrent drainer thread, while the spin-EXIT timing is IDENTICAL
+// to the two-process paced sim (clock past delay / ring drained — never early).
+// ===========================================================================
+
+// The pump-setter + the two production spin-loop helpers are defined in
+// arq_common.cc next to the spin helpers. We call the SAME helpers here so the
+// prototype proves the REAL production waits are step-pumpable.
+typedef void (*sim_inproc_pump_fn)(void* ctx);
+extern void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx);
+void ptt_busy_wait(cl_timer& t, int delay_ms);
+void drain_playback_wait();
+
+namespace {
+// Step-pump context: the single-thread stepper's view of the loopback channel.
+// One rx_transfer-sized "symbol" of channel time per pump step, mirroring the
+// capture-prep thread's symbol_period reads (audioio.c:1279,1295).
+struct SimInprocPumpCtx {
+	int    symbol_period_samples = 0;  // == Nofdm * interpolation_rate
+	double* scratch = nullptr;         // symbol_period_samples doubles
+	long long pump_calls = 0;
+	long long looped_samples = 0;      // playback bytes looped back into capture
+	long long idle_samples = 0;        // silence injected when playback empty
+	long long clock_samples = 0;       // total samples advanced via rx_transfer
+};
+
+// The step-pump. Invoked from INSIDE ptt_busy_wait / drain_playback_wait when
+// installed. Does, per call, exactly what the two-process sibling threads do:
+//   1. Loopback-drain: move all of playback_buffer into capture_buffer.
+//   2. Clock-advance:  drain capture_buffer in symbol-sized rx_transfer reads,
+//      which calls sim_clock_add_samples(len) — the SAME accounting as the
+//      capture-prep thread (audioio.c:1295 -> 1689). The virtual clock thus
+//      advances by exactly the samples that flowed.
+//   3. Idle-fill: if there was nothing to loop AND nothing in capture, inject
+//      one symbol of silence so the clock still advances during the PTT
+//      pre-key delay (the two-process RX bridge always delivers channel audio,
+//      so virtual time keeps ticking even before any TX). Without this the
+//      ptt_busy_wait before the first tx_transfer could never advance time.
+//
+// This NEVER changes a wait's exit predicate — it only makes the existing
+// predicate eventually true (clock crosses delay / playback empties).
+void sim_inproc_pump(void* ctxv)
+{
+	SimInprocPumpCtx* ctx = static_cast<SimInprocPumpCtx*>(ctxv);
+	const int sp = ctx->symbol_period_samples;
+	if (sp <= 0 || ctx->scratch == nullptr) return;
+	const size_t sp_bytes = (size_t)sp * sizeof(double);
+
+	ctx->pump_calls++;
+
+	// (1) Loopback-drain: playback -> capture, one symbol at a time, only
+	// while capture has room (mirrors the RX-bridge backpressure guard).
+	bool moved = false;
+	while (size_buffer(playback_buffer) >= sp_bytes &&
+	       circular_buf_free_size(capture_buffer) >= sp_bytes)
+	{
+		read_buffer(playback_buffer, (uint8_t*)ctx->scratch, sp_bytes);
+		write_buffer(capture_buffer, (uint8_t*)ctx->scratch, sp_bytes);
+		ctx->looped_samples += sp;
+		moved = true;
+	}
+
+	// (2) Clock-advance: drain capture via rx_transfer (advances sim clock).
+	bool drained = false;
+	while (size_buffer(capture_buffer) >= sp_bytes)
+	{
+		rx_transfer(ctx->scratch, sp);   // -> sim_clock_add_samples(sp)
+		ctx->clock_samples += sp;
+		drained = true;
+	}
+
+	// (3) Idle-fill: nothing moved/drained -> advance one symbol of silence so
+	// the PTT pre-key delay can elapse (no playback yet, empty capture).
+	if (!moved && !drained)
+	{
+		memset(ctx->scratch, 0, sp_bytes);
+		write_buffer(capture_buffer, (uint8_t*)ctx->scratch, sp_bytes);
+		rx_transfer(ctx->scratch, sp);
+		ctx->idle_samples += sp;
+		ctx->clock_samples += sp;
+	}
+}
+}  // namespace
+
+int cl_arq_controller::test_sim_inproc()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-SIM-INPROC] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	printf("[TEST-SIM-INPROC] single-instance in-process self-loopback "
+	       "(no audio device, no bridge/prep threads, no TCP, no relay)\n");
+	fflush(stdout);
+
+	// --- 1. PHY setup: load a real config so transmit_byte has a frame ---
+	// ROBUST_0 (MFSK) is the smallest, fastest-to-emit frame; it exercises the
+	// same PTT/TX/drain sequence as every OFDM config.
+	robust_enabled     = YES;
+	narrowband_enabled = NO;
+	telecom_system->narrowband_enabled = NO;
+	telecom_system->load_configuration(ROBUST_0);
+	current_configuration = ROBUST_0;
+
+	cl_data_container* dc = &telecom_system->data_container;
+	int active_nsymb = telecom_system->get_active_nsymb();
+	int symbol_period = dc->Nofdm * dc->interpolation_rate;
+	int frame_output_size = dc->Nofdm * dc->interpolation_rate *
+	                        (active_nsymb + dc->preamble_nSymb);
+	check(symbol_period > 0, "A0 PHY config loaded (symbol_period > 0)");
+	check(frame_output_size > 0, "A1 frame output size > 0");
+	printf("[TEST-SIM-INPROC] symbol_period=%d frame_output=%d active_nsymb=%d "
+	       "preamble_nSymb=%d\n", symbol_period, frame_output_size, active_nsymb,
+	       dc->preamble_nSymb);
+	fflush(stdout);
+
+	// --- 2. Audio ring buffers WITHOUT any device / bridge / prep thread ---
+	// These are the same globals tx_transfer/rx_transfer use; we create them
+	// here directly so the modem talks to ITSELF through them. No threads.
+	bool created_buffers = false;
+	if (capture_buffer == nullptr || playback_buffer == nullptr)
+	{
+		uint8_t* cap = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		uint8_t* play = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		capture_buffer  = circular_buf_init(cap,  AUDIO_PAYLOAD_BUFFER_SIZE);
+		playback_buffer = circular_buf_init(play, AUDIO_PAYLOAD_BUFFER_SIZE);
+		created_buffers = true;
+	}
+	clear_buffer(capture_buffer);
+	clear_buffer(playback_buffer);
+	check(capture_buffer != nullptr && playback_buffer != nullptr,
+	      "A2 audio ring buffers ready (no device, no threads)");
+
+	// --- 3. Engage the virtual clock (the -x sim time source) ---
+	sim_clock_set_enabled(1);
+	check(sim_clock_enabled() != 0, "A3 virtual clock engaged");
+
+	// --- 4. Install the step-pump (the inline single-thread drainer) ---
+	SimInprocPumpCtx pump_ctx;
+	pump_ctx.symbol_period_samples = symbol_period;
+	pump_ctx.scratch = (double*)malloc((size_t)symbol_period * sizeof(double) * 2);
+	arq_set_sim_inproc_pump(sim_inproc_pump, &pump_ctx);
+	check(pump_ctx.scratch != nullptr, "A4 step-pump installed");
+
+	// Non-zero PTT delays so ptt_busy_wait MUST advance the virtual clock to
+	// exit — this is what proves the clock-advance pump works (delay=0 would
+	// pass trivially without ever pumping). 100/200 ms == ini_parser defaults.
+	ptt_on_delay_ms  = 100;
+	ptt_off_delay_ms = 200;
+
+	// --- 5. Run the REAL PTT -> emit -> drain -> RX-capture sequence ---
+	// These are the EXACT calls send_batch() makes (arq_common.cc:3630-3959),
+	// run inline with NO concurrent thread. Each spin-loop is now step-pumped.
+	uint64_t t_start = sim_clock_now_samples();
+
+	ptt_on();   // harmless no-op without a TCP control socket (send() -> -1)
+
+	cl_timer ptt_on_delay, ptt_off_delay;
+	ptt_on_delay.start();
+
+	// (a) PTT pre-key delay — must elapse on the VIRTUAL clock (idle-fill pump).
+	uint64_t clk_before_on = sim_clock_now_samples();
+	ptt_busy_wait(ptt_on_delay, ptt_on_delay_ms);
+	int on_elapsed_ms = ptt_on_delay.get_elapsed_time_ms();
+	uint64_t clk_after_on = sim_clock_now_samples();
+	printf("[TEST-SIM-INPROC] [WAIT-A ptt_on] exit_elapsed=%dms (>=%dms?) "
+	       "clk %llu->%llu (+%llu samples = %.1fms virtual)\n",
+	       on_elapsed_ms, ptt_on_delay_ms,
+	       (unsigned long long)clk_before_on, (unsigned long long)clk_after_on,
+	       (unsigned long long)(clk_after_on - clk_before_on),
+	       (clk_after_on - clk_before_on) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ);
+	fflush(stdout);
+	// FIDELITY: the wait exited at the SAME condition as the two-process path —
+	// elapsed virtual time >= delay, NOT early.
+	check(on_elapsed_ms >= ptt_on_delay_ms,
+	      "B1 ptt_busy_wait(on) exited at >= delay (timing UNCHANGED, not early)");
+
+	// (b) Emit a real frame into playback_buffer (the modem's TX boundary).
+	// Use the data_container's own frame-sized data_byte buffer exactly as the
+	// production send() path does (arq_common.cc:3552) — transmit_byte()
+	// zero-pads the payload up to frame_size IN PLACE, so the buffer MUST be
+	// frame-sized (the robust frame is wider than the 7-byte payload).
+	{
+		const char* msg = "MERCURY";
+		int nb = (int)strlen(msg);
+		for(int i=0;i<nb;i++)
+			dc->data_byte[i] = (unsigned char)msg[i];
+		telecom_system->transmit_byte(dc->data_byte, nb,
+		                              dc->ready_to_transmit_passband_data_tx, 0);
+		tx_transfer(dc->ready_to_transmit_passband_data_tx, frame_output_size);
+	}
+	uint64_t play_after_emit = size_buffer(playback_buffer);
+	check(play_after_emit > 0, "B2 frame emitted into playback_buffer (TX boundary)");
+	printf("[TEST-SIM-INPROC] emitted frame: playback now %llu bytes (%llu samples)\n",
+	       (unsigned long long)play_after_emit,
+	       (unsigned long long)(play_after_emit / sizeof(double)));
+	fflush(stdout);
+
+	// (c) Drain the playback ring — the spin-loop that DEADLOCKED without a
+	// concurrent drainer. The step-pump loops it back into capture_buffer.
+	uint64_t cap_before_drain = size_buffer(capture_buffer);
+	uint64_t clk_before_drain = sim_clock_now_samples();
+	drain_playback_wait();
+	uint64_t play_after_drain = size_buffer(playback_buffer);
+	uint64_t clk_after_drain = sim_clock_now_samples();
+	printf("[TEST-SIM-INPROC] [WAIT-B drain] playback %llu->%llu "
+	       "clk %llu->%llu (+%llu samples) cap_before=%llu\n",
+	       (unsigned long long)play_after_emit, (unsigned long long)play_after_drain,
+	       (unsigned long long)clk_before_drain, (unsigned long long)clk_after_drain,
+	       (unsigned long long)(clk_after_drain - clk_before_drain),
+	       (unsigned long long)cap_before_drain);
+	fflush(stdout);
+	// FIDELITY: exited at size_buffer(playback)==0 — the SAME condition.
+	check(play_after_drain == 0,
+	      "B3 drain_playback_wait exited at playback ring EMPTY (no deadlock)");
+	// The drained frame's samples advanced the clock (looped through rx_transfer).
+	check(pump_ctx.looped_samples >= (long long)(frame_output_size),
+	      "B4 the emitted frame's samples looped back through the RX boundary");
+
+	// (d) PTT post-key delay — second clock-gated wait.
+	ptt_off_delay.start();
+	uint64_t clk_before_off = sim_clock_now_samples();
+	ptt_busy_wait(ptt_off_delay, ptt_off_delay_ms);
+	int off_elapsed_ms = ptt_off_delay.get_elapsed_time_ms();
+	uint64_t clk_after_off = sim_clock_now_samples();
+	printf("[TEST-SIM-INPROC] [WAIT-C ptt_off] exit_elapsed=%dms (>=%dms?) "
+	       "clk %llu->%llu (+%llu samples = %.1fms virtual)\n",
+	       off_elapsed_ms, ptt_off_delay_ms,
+	       (unsigned long long)clk_before_off, (unsigned long long)clk_after_off,
+	       (unsigned long long)(clk_after_off - clk_before_off),
+	       (clk_after_off - clk_before_off) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ);
+	fflush(stdout);
+	check(off_elapsed_ms >= ptt_off_delay_ms,
+	      "B5 ptt_busy_wait(off) exited at >= delay (timing UNCHANGED, not early)");
+
+	ptt_off();
+
+	uint64_t t_end = sim_clock_now_samples();
+
+	// --- 6. Timing fidelity: the total virtual time spanned is at least the
+	// sum of the two PTT delays plus the frame airtime — NOT short-circuited.
+	double total_virtual_ms = (t_end - t_start) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+	double frame_airtime_ms = frame_output_size * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+	double expected_min_ms  = (double)ptt_on_delay_ms + (double)ptt_off_delay_ms
+	                        + frame_airtime_ms;
+	printf("[TEST-SIM-INPROC] virtual-time accounting: total=%.1fms "
+	       "expected_min=%.1fms (on=%d off=%d frame_airtime=%.1fms)\n",
+	       total_virtual_ms, expected_min_ms, ptt_on_delay_ms, ptt_off_delay_ms,
+	       frame_airtime_ms);
+	printf("[TEST-SIM-INPROC] pump stats: calls=%lld looped=%lld idle=%lld "
+	       "clock_samples=%lld\n", pump_ctx.pump_calls, pump_ctx.looped_samples,
+	       pump_ctx.idle_samples, pump_ctx.clock_samples);
+	fflush(stdout);
+	// Allow one symbol of poll overshoot on each of the two PTT waits (the
+	// pump advances in whole symbols — same quantization the prep thread has).
+	double overshoot_tol_ms = 2.0 * symbol_period * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ
+	                        + 1.0;
+	check(total_virtual_ms >= expected_min_ms - 0.001,
+	      "B6 total virtual time >= on+off+airtime (waits did NOT exit early)");
+	check(total_virtual_ms <= expected_min_ms + overshoot_tol_ms + frame_airtime_ms,
+	      "B7 total virtual time bounded (no runaway clock; overshoot < 1 symbol/wait)");
+
+	// --- 7. Teardown: uninstall pump, leave globals as we found them ---
+	arq_set_sim_inproc_pump(nullptr, nullptr);
+	if(pump_ctx.scratch) free(pump_ctx.scratch);
+	if(created_buffers)
+	{
+		free(capture_buffer->buffer);
+		circular_buf_free(capture_buffer);
+		capture_buffer = nullptr;
+		free(playback_buffer->buffer);
+		circular_buf_free(playback_buffer);
+		playback_buffer = nullptr;
+	}
+	sim_clock_set_enabled(0);
+
+	printf("[TEST-SIM-INPROC] %s (%d failure%s) — inline cycle %s\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s",
+	       failed == 0 ? "COMPLETED with NO concurrent drainer (CLEAN_NO_DRAINER)"
+	                   : "did NOT complete cleanly");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // SACK Design A Step 11 — helper: stage and send a SET_LINK_PARAMS for a
 // new Axis-3 sack_mode value. Carries the CURRENT data_batch_size in the
 // batch field so the RSP-side controller (which already handles
