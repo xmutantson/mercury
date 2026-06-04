@@ -2220,6 +2220,75 @@ public:
                                        // between), break_drop_step is force-set
                                        // high enough to jump straight to ROBUST_0
                                        // instead of walking the ladder.
+  // FADING-FLOOR RIDE-THROUGH HOLD (fading-floor-hold.md §3/§4, mechanism #1).
+  // A multipath null (~0.3-0.5 s) makes a whole ROBUST/GF16-RA frame CRC-fail,
+  // but the noncoherent floor decodes the fade fine — the failure is a transient
+  // amplitude dropout, NOT an SNR cliff. Pre-fix the BREAK/panic/demote chain
+  // (emergency_nack_count++ :3535, breaks_since_last_data_success++ :3557,
+  // anchor_consec_break_fails++ :3585) treated a 300 ms null identical to a
+  // permanent cliff → 2-3 null-induced failures collapsed the link to ROBUST_0 +
+  // re-handshake, so the floor fixes (FIX-A/B) never held a stable parked rung.
+  // The HOLD inserts a fade-suspect state at the failure chokepoint (:3429):
+  // when a batch fails AND the 3-signal discriminator (§3) says "fade null", the
+  // current rung is HELD and the batch retransmitted across a bounded
+  // fade-coherence window BEFORE any panic/demote counter ticks. A genuine cliff
+  // (SNR floored, RA not decoding, or burst past the window) is NOT held — the
+  // existing collapse escape runs unchanged (INV-1/§5.4).
+  //
+  // fade_hold_window_start_ms: opt_now_ms() (the virtual/sim clock, INV-5 — never
+  // cl_timer) timestamp the current fade window opened; re-armed on ANY clean/
+  // partial delivery (:3651 block) so a recovered rung gets a fresh full window
+  // per fade. Default 0 at ctor ⇒ the FIRST failure of a never-delivered session
+  // is OUTSIDE the window ⇒ a pure connect-time cliff never HOLDs (§5.3).
+  unsigned long long fade_hold_window_start_ms;
+  // fade_hold_retries: consecutive HOLDs in the current window; capped at
+  // FADE_HOLD_MAX_RETRIES so a misclassified persistent failure cannot pin the
+  // link beyond the window (INV-1). Reset to 0 on any clean/partial delivery.
+  int fade_hold_retries;
+  // Fade-coherence window ≈ 2-3× the worst-case MPP null (~0.5 s). TUNABLE on the
+  // Watterson/HW bench (the delivered-rate confirmation, §7 open question).
+  static const int FADE_HOLD_WINDOW_MS = 2000;
+  static const int FADE_HOLD_MAX_RETRIES = 3;
+
+  // PURE fade-vs-cliff discriminator (fading-floor-hold.md §3). Returns TRUE
+  // (HOLD the rung, do NOT tick panic/demote) iff ALL three live signals say
+  // "fade null"; FALSE (let the collapse proceed) on a cliff. No I/O, no member
+  // writes — the synthetic-fire unit test (--test-fade-hold) drives it directly,
+  // exactly like break_target_with_anchor / anchor_demote_target. Root-cause, NOT
+  // a bare timer: the timer (within_window) is only ONE of three AND-ed signals.
+  //   channel_alive     = §3(a): SNR_uplink still supports this rung (call site
+  //                       evaluates per-tier via fade_channel_alive_at_rung()).
+  //   ra_decoded_burst  = §3(b): the GF16-RA decoder produced a frame that then
+  //                       CRC-failed (receive_stats.iterations_done >= 0) — the
+  //                       null-swallowed-a-frame signature. At a ROBUST rung the
+  //                       call site passes this permissively (INV-3); at OFDM it
+  //                       is a strict veto.
+  //   within_window     = §3(c): the failure burst is shorter than the fade
+  //                       window AND retries are below the cap.
+  bool fade_hold_should_hold(bool channel_alive, bool ra_decoded_burst,
+                             bool within_window, int retries_used,
+                             int max_retries) const {
+    return channel_alive
+        && ra_decoded_burst
+        && within_window
+        && retries_used < max_retries;
+  }
+
+  // §3(a) per-tier channel-alive evaluation (NOT pure — reads measurements +
+  // get_configuration()). At a ROBUST rung the noncoherent floor decodes far
+  // below the OFDM get_configuration() thresholds, so a valid SNR measurement
+  // (> -90) alone means the channel is alive (a fade null that still yields a
+  // measured SNR). At an OFDM rung the measured SNR must still support at least
+  // this rung by ladder index — the SAME SNR→config mapping the §13 elevator
+  // uses (no new threshold). A cliff drops SNR to the -99.9 sentinel ⇒ false at
+  // both tiers ⇒ no HOLD. Defined in arq_common.cc next to get_configuration().
+  bool fade_channel_alive_at_rung();
+
+  // Synthetic-fire regression for the fading-floor HOLD (CLI --test-fade-hold).
+  // FADE-NULL HOLDs the rung (counters frozen); CLIFF COLLAPSES (escape intact).
+  // FAIL-BEFORE→PASS-AFTER documented in-line. fading-floor-hold.md §6.
+  int test_fade_hold();
+
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)

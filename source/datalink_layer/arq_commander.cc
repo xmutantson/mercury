@@ -3428,6 +3428,77 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// Emergency BREAK: track consecutive complete failures (data + REPEAT_LAST_ACK)
 		if(data_ack_received == NO)
 		{
+			// ===== FADING-FLOOR RIDE-THROUGH HOLD (fading-floor-hold.md §3/§4) =====
+			// A multipath null makes a whole ROBUST/GF16-RA frame CRC-fail, but the
+			// noncoherent floor decodes the fade fine — this is a transient amplitude
+			// dropout, NOT an SNR cliff. If the 3-signal discriminator classifies a
+			// FADE NULL, HOLD the current rung and retransmit the SAME batch across a
+			// bounded fade-coherence window BEFORE any panic/demote counter ticks. A
+			// genuine cliff (SNR floored, RA not decoding, or burst past the window)
+			// is NOT held — control falls through to the existing collapse chain
+			// unchanged (INV-1). This is purely ADDITIVE in front of the counters; on
+			// a cliff the AWGN FIX-A/FIX-B behavior is byte-identical (INV-2).
+			//
+			// Gated on gearshift active + TURBO_DONE so it only governs the
+			// steady-state parked-rung data path (the connect/turbo/probe paths own
+			// their own transitions). The frame_gearshift_just_applied up-probe BREAK
+			// paths (:3298/:3471/:3483) already returned above and never reach here,
+			// so a deliberate up-probe failure is never mistaken for a fade null.
+			if(turboshift_phase == TURBO_DONE && gear_shift_on == YES
+			   && !emergency_break_active)
+			{
+				// (a) channel still alive at this rung (SNR not floored).
+				bool channel_alive = fade_channel_alive_at_rung();
+				// (b) the RA decoder produced a frame that CRC-failed (the
+				// null-swallowed-a-frame signature). At a ROBUST rung the control-
+				// plane ACK-timeout path may not carry an RA iter; treat (b)
+				// permissively there (INV-3) so (a)+(c) decide. At OFDM it is a
+				// strict veto: iterations_done == -1 means the decoder never even
+				// produced a frame = a sustained floor / cliff, not a null.
+				bool ra_decoded_burst =
+					is_robust_config(current_configuration)
+					? true
+					: (telecom_system->receive_stats.iterations_done >= 0);
+				// (c) failure burst shorter than the fade-coherence window AND
+				// retries below the cap. opt_now_ms() is the virtual/sim clock
+				// (INV-5) — never cl_timer. window_start==0 (never delivered) ⇒
+				// elapsed is huge ⇒ within_window false ⇒ a connect-time cliff
+				// never HOLDs (§5.3).
+				unsigned long long elapsed = opt_now_ms() - fade_hold_window_start_ms;
+				bool within_window =
+					(fade_hold_window_start_ms != 0)
+					&& (elapsed < (unsigned long long)FADE_HOLD_WINDOW_MS);
+
+				if(fade_hold_should_hold(channel_alive, ra_decoded_burst,
+				                         within_window, fade_hold_retries,
+				                         FADE_HOLD_MAX_RETRIES))
+				{
+					fade_hold_retries++;
+					// Requeue the failed batch for retransmit at the SAME rung
+					// (the existing per-message retransmit path); do NOT touch the
+					// panic/demote counters or the clean-streak. messages were
+					// already marked ACK_TIMED_OUT at :3399-3400 (pattern-ACK path)
+					// or REPEAT_LAST_ACK was queued (:3361); ensure any still-pending
+					// data is re-armed so process_messages_tx_data() resends.
+					for(int i=0; i<nMessages; i++)
+					{
+						if(messages_tx[i].status == PENDING_ACK)
+							messages_tx[i].status = ACK_TIMED_OUT;
+					}
+					printf("[FADE-HOLD] Null-suspect block fail at config %d "
+						"(SNR=%.1f iters=%d retry %d/%d, window %llums) — "
+						"HOLDING rung, retransmit (no panic/demote tick)\n",
+						current_configuration, measurements.SNR_uplink,
+						telecom_system->receive_stats.iterations_done,
+						fade_hold_retries, FADE_HOLD_MAX_RETRIES, elapsed);
+					fflush(stdout);
+					return;   // hold the rung; counters frozen; batch retransmits
+				}
+				// else: cliff (or window/retries exhausted) — fall through to the
+				// existing collapse chain below, UNCHANGED.
+			}
+			// ===== end FADING-FLOOR HOLD =====
+
 			consecutive_data_acks = 0;
 			// SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11): a failed block
 			// breaks the consecutive-clean run at this rung. This reset is UPSTREAM
@@ -3649,6 +3720,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
+
+			// FADING-FLOOR HOLD (fading-floor-hold.md §4) — ANY delivery (clean or
+			// partial) proves the channel came back, so the fade is over: RE-ARM the
+			// fade-coherence window and clear the retry count. The NEXT fade gets a
+			// fresh full window. Routed through opt_now_ms() (virtual/sim clock,
+			// INV-5). This is the sole production re-arm producer (§5.1).
+			fade_hold_window_start_ms = opt_now_ms();
+			fade_hold_retries = 0;
 
 			// CLEAN-BATCH VIABILITY (§9): the panic/aggression resets AND the
 			// data-viable anchor-raise are PROMOTION decisions — they must fire ONLY
@@ -9025,6 +9104,224 @@ int cl_arq_controller::test_climb_engine()
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// FADING-FLOOR RIDE-THROUGH HOLD synthetic-fire regression (CLI --test-fade-hold).
+// Mechanism #1 (fading-floor-hold.md §6). Drives the REAL fade-vs-cliff
+// discriminator (fade_hold_should_hold — the PURE helper, replayed exactly like
+// break_target_with_anchor / anchor_demote_target) + the per-tier channel-alive
+// evaluation (fade_channel_alive_at_rung — reads measurements.SNR_uplink +
+// current_configuration) with NO channel, NO audio, NO sim. Two scenarios:
+//   (i)  FADE-NULL: SNR alive, RA decoded-then-CRC-failed, within window/retries
+//        → the discriminator HOLDS the rung; replaying the gated counter/reset
+//        machinery proves the panic/demote counters do NOT advance and the FIX-A
+//        clean streak is NOT reset (no collapse to ROBUST_0).
+//   (ii) CLIFF: SNR floored / RA not decoding / burst past the window → the
+//        discriminator COLLAPSES; the counter machinery advances exactly as on
+//        ffe4b75 (the genuine-cliff escape preserved).
+// FAIL-BEFORE→PASS-AFTER (§6): reverting the discriminator to "always HOLD on a
+// batch fail" (the naive-timer band-aid) makes the CLIFF case wrongly HOLD — the
+// FH_CLIFF_* asserts FAIL. Restoring the 3-signal AND ⇒ PASS. The revert is
+// modeled in-line by always_hold_band_aid and asserted to DIVERGE from the real
+// discriminator on the cliff inputs. One-shot, exits rc. Default builds never
+// call this.
+int cl_arq_controller::test_fade_hold()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-FADE-HOLD] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-FADE-HOLD] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// ---- Part P: the PURE discriminator is a strict 4-way AND ----
+	// HOLD iff channel_alive AND ra_decoded_burst AND within_window AND
+	// retries_used < max_retries. Any single false → COLLAPSE.
+	const int MX = FADE_HOLD_MAX_RETRIES;
+	check(fade_hold_should_hold(true, true, true, 0, MX),
+		"P1 all-true → HOLD", fade_hold_should_hold(true,true,true,0,MX), 1);
+	check(!fade_hold_should_hold(false, true, true, 0, MX),
+		"P2 SNR dead → COLLAPSE (cliff signal a)", fade_hold_should_hold(false,true,true,0,MX), 0);
+	check(!fade_hold_should_hold(true, false, true, 0, MX),
+		"P3 RA not decoding → COLLAPSE (cliff signal b)", fade_hold_should_hold(true,false,true,0,MX), 0);
+	check(!fade_hold_should_hold(true, true, false, 0, MX),
+		"P4 burst past window → COLLAPSE (cliff signal c)", fade_hold_should_hold(true,true,false,0,MX), 0);
+	check(!fade_hold_should_hold(true, true, true, MX, MX),
+		"P5 retries exhausted → COLLAPSE (bounded — INV-1)", fade_hold_should_hold(true,true,true,MX,MX), 0);
+	check(fade_hold_should_hold(true, true, true, MX-1, MX),
+		"P6 last retry still HOLDs (< cap)", fade_hold_should_hold(true,true,true,MX-1,MX), 1);
+
+	// ---- Part A: per-tier channel-alive evaluation (fade_channel_alive_at_rung) ----
+	// ROBUST rung: alive iff SNR_uplink > -90 (robust decodes far below OFDM
+	// thresholds). The -99.9 sentinel (cliff/no-measurement) → dead.
+	current_configuration = ROBUST_0;
+	measurements.SNR_uplink = -8.0;            // a real, alive, deep SNR
+	check(fade_channel_alive_at_rung(),
+		"A1 ROBUST rung alive at SNR -8 (> -90)", fade_channel_alive_at_rung()?1:0, 1);
+	measurements.SNR_uplink = -99.9;           // the cliff / no-measurement sentinel
+	check(!fade_channel_alive_at_rung(),
+		"A2 ROBUST rung DEAD at the -99.9 sentinel (cliff)", fade_channel_alive_at_rung()?1:0, 0);
+
+	// OFDM rung: alive iff the measured SNR still supports >= this rung by ladder
+	// index (get_configuration(SNR) at-or-above current). A high SNR supports the
+	// rung; a floored SNR does not. Note get_configuration is the SAME mapping the
+	// §13 elevator uses — no new threshold.
+	current_configuration = CONFIG_10;
+	measurements.SNR_uplink = 25.0;            // ample SNR — supports CONFIG_10+
+	check(fade_channel_alive_at_rung(),
+		"A3 OFDM CONFIG_10 alive at SNR 25 (supports the rung)", fade_channel_alive_at_rung()?1:0, 1);
+	measurements.SNR_uplink = -99.9;           // floored — no config supported
+	check(!fade_channel_alive_at_rung(),
+		"A4 OFDM CONFIG_10 DEAD at the -99.9 sentinel (cliff)", fade_channel_alive_at_rung()?1:0, 0);
+
+	// ---- Part FH_NULL: end-to-end FADE-NULL holds the rung, counters frozen ----
+	// Model the deep-floor parked-ROBUST_0 link that just took a multipath null:
+	// a clean/partial DELIVERED earlier (window armed), SNR still alive, the RA
+	// frame decoded-then-CRC-failed, the burst is fresh. Prime the EXACT state the
+	// :3429 hook reads, then replay the hook's decision + the counter machinery it
+	// guards.
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	gear_shift_on = YES;
+	turboshift_phase = TURBO_DONE;
+	emergency_break_active = 0;
+	current_configuration = ROBUST_0;
+	last_data_viable_config = ROBUST_0;
+	measurements.SNR_uplink = -8.0;                       // alive
+	telecom_system->receive_stats.iterations_done = 7;    // RA decoded (CRC-failed)
+	fade_hold_window_start_ms = opt_now_ms();             // window armed by a prior delivery
+	fade_hold_retries = 0;
+	// Snapshot the counters the HOLD must NOT advance.
+	emergency_nack_count = 0;
+	breaks_since_last_data_success = 0;
+	anchor_consec_break_fails = 0;
+	clean_batches_config = ROBUST_0;
+	clean_batches_at_current_config = 1;                  // FIX-A streak the HOLD must preserve
+	int nack_before   = emergency_nack_count;
+	int panic_before  = breaks_since_last_data_success;
+	int demote_before = anchor_consec_break_fails;
+	int streak_before = clean_batches_at_current_config;
+
+	// Replay the §4 hook decision EXACTLY as production at :3429.
+	auto fade_hook_decision = [&]() -> bool {
+		if(!(turboshift_phase == TURBO_DONE && gear_shift_on == YES
+		     && !emergency_break_active))
+			return false;
+		bool channel_alive = fade_channel_alive_at_rung();
+		bool ra_decoded_burst =
+			is_robust_config(current_configuration)
+			? true
+			: (telecom_system->receive_stats.iterations_done >= 0);
+		unsigned long long elapsed = opt_now_ms() - fade_hold_window_start_ms;
+		bool within_window =
+			(fade_hold_window_start_ms != 0)
+			&& (elapsed < (unsigned long long)FADE_HOLD_WINDOW_MS);
+		return fade_hold_should_hold(channel_alive, ra_decoded_burst,
+		                             within_window, fade_hold_retries,
+		                             FADE_HOLD_MAX_RETRIES);
+	};
+	// The production HOLD branch: bump retries, DO NOT touch counters/streak.
+	auto apply_hold = [&]() { fade_hold_retries++; };
+	// The production COLLAPSE branch (what runs at :3436/:3535/:3557/:3585 when
+	// the HOLD is NOT taken) — the counter/reset machinery, modeled minimally.
+	auto apply_collapse = [&]() {
+		clean_batches_at_current_config = 0;     // :3436
+		emergency_nack_count++;                  // :3535
+		// (panic/demote only tick once the BREAK threshold is reached; for the
+		// cliff assertion the nack tick alone proves the chain advanced.)
+	};
+
+	bool null_holds = fade_hook_decision();
+	check(null_holds, "FH_NULL1 fade-null is classified HOLD", null_holds?1:0, 1);
+	if(null_holds) apply_hold(); else apply_collapse();
+	check(emergency_nack_count == nack_before,
+		"FH_NULL2 HOLD freezes emergency_nack_count", emergency_nack_count, nack_before);
+	check(breaks_since_last_data_success == panic_before,
+		"FH_NULL3 HOLD freezes the BREAK-panic counter", breaks_since_last_data_success, panic_before);
+	check(anchor_consec_break_fails == demote_before,
+		"FH_NULL4 HOLD freezes the anchor-demote counter", anchor_consec_break_fails, demote_before);
+	check(clean_batches_at_current_config == streak_before,
+		"FH_NULL5 HOLD preserves the FIX-A clean streak (INV-4)", clean_batches_at_current_config, streak_before);
+	check(fade_hold_retries == 1,
+		"FH_NULL6 HOLD bumped the retry count", fade_hold_retries, 1);
+
+	// ---- Part FH_CLIFF: end-to-end CLIFF collapses (escape preserved) ----
+	// Same parked rung, but the SNR has truly floored (the cliff). Re-prime fresh
+	// counters and assert the chain ADVANCES (the HOLD must NOT fire).
+	current_configuration = CONFIG_10;            // an OFDM rung (strict (b) veto applies)
+	last_data_viable_config = CONFIG_10;
+	measurements.SNR_uplink = -99.9;              // SNR floored — signal (a) = dead
+	telecom_system->receive_stats.iterations_done = -1;  // RA never decoded — signal (b) = dead
+	fade_hold_window_start_ms = opt_now_ms();     // window is armed and fresh...
+	fade_hold_retries = 0;                        // ...but (a)+(b) are dead → COLLAPSE
+	emergency_nack_count = 0;
+	clean_batches_config = CONFIG_10;
+	clean_batches_at_current_config = 1;
+	int cliff_nack_before   = emergency_nack_count;
+	int cliff_streak_before = clean_batches_at_current_config;
+
+	bool cliff_holds = fade_hook_decision();
+	check(!cliff_holds, "FH_CLIFF1 cliff (SNR floored, RA dead) is classified COLLAPSE", cliff_holds?1:0, 0);
+	if(cliff_holds) apply_hold(); else apply_collapse();
+	check(emergency_nack_count == cliff_nack_before + 1,
+		"FH_CLIFF2 COLLAPSE ticks emergency_nack_count (BREAK escape intact, INV-1)",
+		emergency_nack_count, cliff_nack_before + 1);
+	check(clean_batches_at_current_config == 0,
+		"FH_CLIFF3 COLLAPSE resets the clean streak (genuine-cliff behavior)",
+		clean_batches_at_current_config, 0);
+
+	// A SECOND cliff variant: SNR momentarily alive but the burst is PAST the
+	// window — must still COLLAPSE (signal (c) = dead). Proves the timer bound
+	// (INV-1) escapes a misclassified-alive persistent failure within one window.
+	current_configuration = CONFIG_10;
+	measurements.SNR_uplink = 25.0;               // (a) alive
+	telecom_system->receive_stats.iterations_done = 7;   // (b) alive
+	fade_hold_window_start_ms = opt_now_ms() - (unsigned long long)(FADE_HOLD_WINDOW_MS + 500);  // burst older than the window
+	fade_hold_retries = 0;
+	bool stale_window_holds = fade_hook_decision();
+	check(!stale_window_holds,
+		"FH_CLIFF4 burst past the fade window → COLLAPSE even with SNR alive (bounded escape)",
+		stale_window_holds?1:0, 0);
+
+	// ---- Part FB: FAIL-BEFORE → PASS-AFTER (the discriminator IS load-bearing) ----
+	// The naive-timer band-aid (the §4 RISK / CLAUDE.md §2 threshold-mask trap):
+	// "any batch fail within the window → HOLD", ignoring SNR + RA. On the CLIFF
+	// inputs above it would WRONGLY hold — losing the genuine-cliff escape. Assert
+	// the REAL 3-signal discriminator DIVERGES from the band-aid on the cliff (the
+	// band-aid would have returned HOLD where the real one returns COLLAPSE). This
+	// is the in-source proof that reverting the discriminator regresses the cliff.
+	auto always_hold_band_aid = [&]() -> bool {
+		// what a bare timer would do: HOLD whenever a fail lands inside the window,
+		// with no SNR / no RA gate.
+		unsigned long long elapsed = opt_now_ms() - fade_hold_window_start_ms;
+		return (fade_hold_window_start_ms != 0)
+		    && (elapsed < (unsigned long long)FADE_HOLD_WINDOW_MS)
+		    && (fade_hold_retries < FADE_HOLD_MAX_RETRIES);
+	};
+	// Re-prime the SNR-floored / RA-dead cliff WITHIN a fresh window.
+	current_configuration = CONFIG_10;
+	measurements.SNR_uplink = -99.9;              // cliff
+	telecom_system->receive_stats.iterations_done = -1;  // cliff
+	fade_hold_window_start_ms = opt_now_ms();
+	fade_hold_retries = 0;
+	bool real_decision     = fade_hook_decision();      // the shipped 3-signal AND
+	bool band_aid_decision = always_hold_band_aid();    // the reverted naive timer
+	check(!real_decision,
+		"FB1 PASS-AFTER: real discriminator COLLAPSES the SNR-floored cliff", real_decision?1:0, 0);
+	check(band_aid_decision,
+		"FB2 the naive-timer band-aid WRONGLY HOLDs the same cliff (the FAIL-BEFORE state)", band_aid_decision?1:0, 1);
+	check(real_decision != band_aid_decision,
+		"FB3 the discriminator DIVERGES from the band-aid on the cliff (it IS load-bearing)",
+		(real_decision != band_aid_decision)?1:0, 1);
+
+	printf("[TEST-FADE-HOLD] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

@@ -509,6 +509,11 @@ cl_arq_controller::cl_arq_controller()
 	break_drop_step=2;  // 2026-05-24: start aggressive (was 1) — first BREAK
 	                    // drops 2 configs, then doubles 4,8,16,32... uncapped.
 	breaks_since_last_data_success=0;
+	// FADING-FLOOR HOLD (fading-floor-hold.md §5.3): window_start=0 so the FIRST
+	// failure of a never-delivered session is OUTSIDE the window ⇒ a pure
+	// connect-time cliff never HOLDs. Re-armed on the first clean/partial.
+	fade_hold_window_start_ms=0;
+	fade_hold_retries=0;
 	break_recovery_phase=0;
 	break_recovery_retries=0;
 	ceiling_success_count=0;
@@ -1349,6 +1354,33 @@ int cl_arq_controller::get_configuration(double SNR)
 	int configuration;
 	configuration =telecom_system->get_configuration(SNR);
 	return configuration;
+}
+
+// FADING-FLOOR HOLD §3(a) — is the channel still alive AT THE CURRENT RUNG given
+// the measured SNR? Distinguishes a multipath null (brief amplitude dropout,
+// measurement survives) from an SNR cliff (no decode → -99.9 sentinel). See
+// fading-floor-hold.md §3. NOT pure: reads measurements.SNR_uplink +
+// current_configuration + get_configuration().
+bool cl_arq_controller::fade_channel_alive_at_rung()
+{
+	double snr = measurements.SNR_uplink;
+	// No valid SNR measurement (the -99.9 ctor/cliff sentinel) ⇒ treat as cliff.
+	if(snr <= -90.0)
+		return false;
+	if(is_robust_config(current_configuration))
+	{
+		// ROBUST/GF16-RA decodes far below the OFDM get_configuration()
+		// thresholds (memory: "robust decodes when OFDM data cannot, so
+		// snr_uplink > -90 ALONE is sufficient at robust"). A null that still
+		// yields a measured SNR ⇒ alive.
+		return true;
+	}
+	// OFDM rung: the measured SNR must still support at least this rung by ladder
+	// index (the SAME mapping elevator_target_from_snr() uses). A null that
+	// transiently raises EVM but keeps SNR≥the rung floor ⇒ alive; a cliff that
+	// drops SNR below the rung ⇒ not alive (collapse on the first failed frame).
+	int supported = get_configuration(snr);
+	return config_ladder_index(supported) >= config_ladder_index(current_configuration);
 }
 
 void cl_arq_controller::load_configuration(int configuration, int level, int backup_configuration)
@@ -3262,6 +3294,9 @@ void cl_arq_controller::reset_session_state()
 	emergency_previous_config = init_configuration;
 	break_drop_step = 2;  // initial aggression — see ctor comment
 	breaks_since_last_data_success = 0;
+	// FADING-FLOOR HOLD — fresh session: no fade window armed (§5.3).
+	fade_hold_window_start_ms = 0;
+	fade_hold_retries = 0;
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
 	ceiling_success_count = 0;
