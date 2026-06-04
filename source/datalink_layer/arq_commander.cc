@@ -25,6 +25,8 @@
 #include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
 #include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
 #include <cstdlib>
+#include <cstdint>     // uint32_t/uint8_t (2-instance stepper deterministic payload)
+#include <vector>      // std::vector (2-instance stepper large-payload buffer)
 #include <algorithm>   // std::min (2-instance stepper RX drain)
 
 #ifdef MERCURY_GUI_ENABLED
@@ -9946,15 +9948,54 @@ int cl_arq_controller::test_sim_inproc_2()
 
 	const double snr3k_db   = env_d("MERCURY_SIM2_SNR3K", 900.0);   // 900 = clean
 	const unsigned seed     = (unsigned)env_i("MERCURY_SIM2_SEED", 12345);
-	const long max_iters    = env_i("MERCURY_SIM2_MAXITERS", 60000);
 	const int  start_cfg    = (int)env_i("MERCURY_SIM2_CFG", ROBUST_0);
 	const bool robust       = env_i("MERCURY_SIM2_ROBUST", 1) != 0;
-	const char* payload     = "MERCURY-2INST-HELLO";
-	const int  payload_len  = (int)strlen(payload);
+
+	// CONTROL-LOOP PROBE additions (wf-sim-controlloop) — all env-gated and
+	// ADDITIVE; default values reproduce the legacy 19-byte smoke exactly so the
+	// regression (MERCURY_SIM_2INST=1 with no extra env) is byte-identical.
+	//   MERCURY_SIM2_PAYLOAD_BYTES : 0 = legacy short "HELLO" payload (default);
+	//                                >0 = deterministic pseudo-random payload of
+	//                                that many bytes (drives the gearshift climb).
+	//   MERCURY_SIM2_OPT           : 0 = optimizer OFF (== --no-optimizer, pure
+	//                                ladder gearshift, default); 1 = optimizer ON
+	//                                (load the calibration table via
+	//                                opt_load_rate_table(), honoring
+	//                                MERCURY_RATE_TABLE).
+	const long payload_bytes = env_i("MERCURY_SIM2_PAYLOAD_BYTES", 0);
+	const bool opt_on        = env_i("MERCURY_SIM2_OPT", 0) != 0;
+
+	// Build the payload buffer. Legacy default (payload_bytes==0): the original
+	// 19-byte greeting (verbatim, so the GATE-2 regression is unchanged). Large
+	// payload: a deterministic LCG byte stream keyed on the run seed so GATE-2
+	// (same seed twice -> byte-identical) holds for the data-heavy run too.
+	static const char* legacy_payload = "MERCURY-2INST-HELLO";
+	std::vector<char> payload_vec;
+	const char* payload;
+	int payload_len;
+	if (payload_bytes <= 0) {
+		payload     = legacy_payload;
+		payload_len = (int)strlen(legacy_payload);
+	} else {
+		payload_vec.resize((size_t)payload_bytes);
+		uint32_t lcg = 0x9E3779B9u ^ seed;   // deterministic, seed-keyed
+		for (long i = 0; i < payload_bytes; i++) {
+			lcg = lcg * 1664525u + 1013904223u;
+			payload_vec[(size_t)i] = (char)((lcg >> 24) & 0xFF);
+		}
+		payload     = payload_vec.data();
+		payload_len = (int)payload_bytes;
+	}
+
+	// max_iters: keep the legacy 60000 default for the short payload; scale the
+	// default headroom up for a large payload (the data-heavy climb needs far
+	// more ticks). Still env-overridable via MERCURY_SIM2_MAXITERS.
+	const long default_max_iters = (payload_bytes > 0) ? 4000000 : 60000;
+	const long max_iters    = env_i("MERCURY_SIM2_MAXITERS", default_max_iters);
 
 	printf("[TEST-SIM-2INST] params: snr3k=%.1f seed=%u max_iters=%ld start_cfg=%d "
-	       "robust=%d payload_len=%d\n", snr3k_db, seed, max_iters, start_cfg,
-	       (int)robust, payload_len);
+	       "robust=%d payload_len=%d opt=%s\n", snr3k_db, seed, max_iters, start_cfg,
+	       (int)robust, payload_len, opt_on ? "ON" : "OFF");
 	fflush(stdout);
 
 	// --- Construct two instances + two channels (one per direction) ---
@@ -9972,6 +10013,44 @@ int cl_arq_controller::test_sim_inproc_2()
 	bool okA = A->ts.data_container.Nofdm * A->ts.data_container.interpolation_rate > 0;
 	bool okB = B->ts.data_container.Nofdm * B->ts.data_container.interpolation_rate > 0;
 	check(okA && okB, "S1 both instances brought up (PHY + buffers, no TCP)");
+
+	// --- CONTROL-LOOP PROBE: optimizer toggle (wf-sim-controlloop) ---
+	// OFF (default): set_optimizer_disabled(true) on both instances. This is the
+	//   exact same state main.cc:2401 installs for --no-optimizer: opt_load_rate_table()
+	//   no-ops and opt_evaluate_batch_end() hard-short-circuits, so config selection
+	//   is owned ENTIRELY by the pure-ladder gearshift (gear_shift_on stays YES).
+	// ON: set_optimizer_disabled(false) and load the calibration table on the
+	//   COMMANDER (A) — the optimizer only acts on the commander (the role!=COMMANDER
+	//   gate in opt_evaluate_batch_end). Loaded on B too for symmetry/harmlessness
+	//   (B never evaluates). opt_load_rate_table() honors MERCURY_RATE_TABLE, which
+	//   the probe points at effective_rate_table.v13.json.
+	// Diagnostic knob: MERCURY_SIM2_PIN=1 disables the gearshift on both
+	// instances so the config is HELD at start_cfg. Used to isolate sustained
+	// multi-batch data flow from config-switch effects. Additive/env-gated.
+	const bool pin_cfg = env_i("MERCURY_SIM2_PIN", 0) != 0;
+	if (pin_cfg) {
+		A->arq.gear_shift_on = NO;
+		B->arq.gear_shift_on = NO;
+		printf("[TEST-SIM-2INST] gearshift PINNED off (config held at start_cfg=%d)\n", start_cfg);
+		fflush(stdout);
+	}
+
+	A->arq.set_optimizer_disabled(!opt_on);
+	B->arq.set_optimizer_disabled(!opt_on);
+	if (opt_on) {
+		printf("[TEST-SIM-2INST] optimizer ON: loading calibration table (A=CMD)\n");
+		fflush(stdout);
+		A->arq.opt_load_rate_table();
+		B->arq.opt_load_rate_table();
+	} else {
+		printf("[TEST-SIM-2INST] optimizer OFF (== --no-optimizer): pure-ladder gearshift owns config\n");
+		fflush(stdout);
+	}
+	// test_sim_inproc_2 is a cl_arq_controller member -> may read A->arq's private
+	// optimizer_disabled directly (same class).
+	check(A->arq.optimizer_disabled == !opt_on,
+	      opt_on ? "S1b optimizer ENABLED (table loaded, ON arm)"
+	             : "S1b optimizer DISABLED (pure ladder, OFF arm)");
 
 	cl_sim_awgn ch_a2b(((uint64_t)seed << 1) | 1u, snr3k_db);   // A->B
 	cl_sim_awgn ch_b2a(((uint64_t)seed << 1) | 0u, snr3k_db);   // B->A
@@ -10025,10 +10104,34 @@ int cl_arq_controller::test_sim_inproc_2()
 	bool connected_seen = false;
 	long iters = 0;
 	int  rx_have = 0;
-	char rx_buf[256] = {0};
+	// RX buffer sized to the full payload (+1 NUL) so the large-payload arm can
+	// hold tens of KB; the legacy 19-byte arm fits trivially.
+	std::vector<char> rx_vec((size_t)payload_len + 1, 0);
+	char* rx_buf = rx_vec.data();
+	const int rx_cap = payload_len + 1;
+
+	// --- CONTROL-LOOP PROBE: config switch-sequence tracker (wf-sim-controlloop).
+	//     Records every change of the COMMANDER's live current_configuration as
+	//     (iter, cfg). This is the climb path the probe reports: does OFF climb to
+	//     and HOLD an optimal config, while ON over-climbs past the cliff and
+	//     collapses back to ROBUST_0? Tracking the LIVE field (not load_configuration)
+	//     catches gearshift AND optimizer-driven switches uniformly. ---
+	std::vector<std::pair<long,int>> cfg_seq;
+	int last_cfg = A->arq.current_configuration;
+	cfg_seq.push_back({-1, last_cfg});   // initial config at loop entry
+	int max_cfg_reached = last_cfg;      // highest OFDM cfg the climb touched
+	long collapse_iter  = -1;            // first iter cfg fell back to a ROBUST_x
 
 	const bool dbg = (getenv("MERCURY_SIM2_DBG") != nullptr);
+	// Stall cutoff (large-payload arm only): if no new RX byte arrives for this
+	// many iters, terminate (the over-climb-collapse arm can otherwise crawl for
+	// millions of ticks). 0/legacy arm: disabled (legacy break-on-deliver only).
+	const long stall_cutoff = env_i("MERCURY_SIM2_STALL_ITERS",
+	                                 (payload_bytes > 0) ? 200000 : 0);
+	long last_progress_iter = 0;
+	int  prev_rx_have = 0;
 	uint64_t t0 = sim_clock_now_samples();
+	bool stalled = false;
 	for (; iters < max_iters; iters++)
 	{
 		if (dbg && (iters % 200 == 0)) {
@@ -10073,33 +10176,114 @@ int cl_arq_controller::test_sim_inproc_2()
 		    (A->arq.link_status == CONNECTED || B->arq.link_status == CONNECTED))
 			connected_seen = true;
 
+		// --- Track the commander's config switches (the climb path). ---
+		int cur_cfg = A->arq.current_configuration;
+		if (cur_cfg != last_cfg) {
+			cfg_seq.push_back({iters, cur_cfg});
+			// max_cfg_reached only over OFDM configs (ROBUST_x are id>=100; a
+			// numeric max would wrongly rank ROBUST over CONFIG_16). Track the
+			// highest OFDM config touched, and note the first collapse to ROBUST.
+			if (is_ofdm_config(cur_cfg) && cur_cfg > max_cfg_reached) max_cfg_reached = cur_cfg;
+			if (cur_cfg >= ROBUST_0 && collapse_iter < 0 && max_cfg_reached > last_cfg && is_ofdm_config(last_cfg))
+				collapse_iter = iters;
+			if (dbg) {
+				printf("[SIM2-CFG] it=%ld cfg %d -> %d (max_ofdm=%d)\n",
+				       iters, last_cfg, cur_cfg, max_cfg_reached);
+				fflush(stdout);
+			}
+			last_cfg = cur_cfg;
+		}
+
 		// Drain delivered bytes from B's RX FIFO.
 		int avail = B->arq.fifo_buffer_rx.get_size() - B->arq.fifo_buffer_rx.get_free_size();
-		if (avail > 0 && rx_have < (int)sizeof(rx_buf) - 1)
+		if (avail > 0 && rx_have < rx_cap - 1)
 		{
 			int got = B->arq.fifo_buffer_rx.pop(rx_buf + rx_have,
-			              std::min(avail, (int)sizeof(rx_buf) - 1 - rx_have));
+			              std::min(avail, rx_cap - 1 - rx_have));
 			if (got > 0) rx_have += got;
 		}
 
 		if (rx_have >= payload_len) break;   // delivered
+
+		// Stall detector (large-payload arm): break out if no new byte for
+		// stall_cutoff iters. Records the stall so the report can flag it.
+		if (rx_have != prev_rx_have) { prev_rx_have = rx_have; last_progress_iter = iters; }
+		if (stall_cutoff > 0 && (iters - last_progress_iter) >= stall_cutoff) {
+			stalled = true;
+			break;
+		}
 	}
 	uint64_t t1 = sim_clock_now_samples();
 	double sim_ms = (t1 - t0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+	bool bytes_ok = (rx_have >= payload_len && memcmp(rx_buf, payload, payload_len) == 0);
 
-	rx_buf[rx_have] = '\0';
-	printf("[TEST-SIM-2INST] loop done: iters=%ld sim_ms=%.0f connected=%d "
-	       "A.link=%d B.link=%d rx_have=%d rx=\"%s\"\n", iters, sim_ms,
-	       (int)connected_seen, A->arq.link_status, B->arq.link_status,
-	       rx_have, rx_buf);
+	if (payload_bytes <= 0) {
+		// Legacy short-text arm: print the string (regression output unchanged).
+		rx_buf[rx_have] = '\0';
+		printf("[TEST-SIM-2INST] loop done: iters=%ld sim_ms=%.0f connected=%d "
+		       "A.link=%d B.link=%d rx_have=%d rx=\"%s\"\n", iters, sim_ms,
+		       (int)connected_seen, A->arq.link_status, B->arq.link_status,
+		       rx_have, rx_buf);
+	} else {
+		// Large/binary arm: no string print (binary); report length + correctness.
+		printf("[TEST-SIM-2INST] loop done: iters=%ld sim_ms=%.0f connected=%d "
+		       "A.link=%d B.link=%d rx_have=%d/%d bytes_ok=%d\n", iters, sim_ms,
+		       (int)connected_seen, A->arq.link_status, B->arq.link_status,
+		       rx_have, payload_len, (int)bytes_ok);
+	}
 	printf("[TEST-SIM-2INST] pump: calls=%lld looped=%lld idle=%lld clock=%lld\n",
 	       pump.pump_calls, pump.looped_samples, pump.idle_samples, pump.clock_samples);
+
+	// --- CONTROL-LOOP PROBE report (wf-sim-controlloop) ---
+	// Config switch sequence (the climb path). Tag the final config + whether it
+	// is OFDM (held a real data config) or fell back to a ROBUST_x (the collapse).
+	{
+		int final_cfg = A->arq.current_configuration;
+		printf("[SIM2-PROBE] opt=%s snr3k=%.1f payload_len=%d : switch_seq=",
+		       opt_on ? "ON" : "OFF", snr3k_db, payload_len);
+		for (size_t i = 0; i < cfg_seq.size(); i++) {
+			printf("%s%d", (i ? "->" : ""), cfg_seq[i].second);
+		}
+		printf("  (final=%d ofdm=%d max_ofdm=%d collapse_iter=%ld)\n",
+		       final_cfg, (int)is_ofdm_config(final_cfg), max_cfg_reached, collapse_iter);
+		// Per-switch (iter,cfg) detail for the climb timeline.
+		printf("[SIM2-PROBE] switch_detail=");
+		for (size_t i = 0; i < cfg_seq.size(); i++) {
+			printf("%s(%ld:%d)", (i ? "," : ""), cfg_seq[i].first, cfg_seq[i].second);
+		}
+		printf("\n");
+		// Delivered rate in SIM UNITS: bits delivered / virtual-channel seconds.
+		// This is a sim-internal relative metric for OFF-vs-ON comparison at the
+		// SAME seed/SNR — NOT an absolute bps-vs-VARA figure (clean/AWGN, not
+		// GATE-3-validated vs PACED/HW).
+		double sim_s = sim_ms / 1000.0;
+		double delivered_bps_sim = (sim_s > 0.0) ? (rx_have * 8.0 / sim_s) : 0.0;
+		printf("[SIM2-PROBE] delivered: rx_bytes=%d sim_ms=%.0f delivered_bps_sim=%.1f "
+		       "final_cfg=%d held_ofdm=%d stalled=%d\n",
+		       rx_have, sim_ms, delivered_bps_sim, final_cfg, (int)is_ofdm_config(final_cfg),
+		       (int)stalled);
+		fflush(stdout);
+	}
 	fflush(stdout);
 
 	// --- G-SMOKE asserts ---
+	// CONNECT + no-hang are hard asserts for ALL arms. The byte-correct delivery
+	// assert is a hard assert only for the LEGACY short arm and for any LARGE arm
+	// that completed without stalling: an over-climb-collapse arm may intentionally
+	// FAIL to deliver the full payload at moderate SNR (it crawls in ROBUST_0 and
+	// hits the stall cutoff) — that is the scientific RESULT of the probe, not a
+	// code failure. The probe report above carries bytes_ok/stalled for analysis.
 	check(connected_seen, "G-SMOKE: 2-instance CONNECT completed (no deadlock, single thread)");
-	check(rx_have >= payload_len && memcmp(rx_buf, payload, payload_len) == 0,
-	      "G-SMOKE: payload delivered B<-A byte-correct (RX bytes match TX)");
+	if (payload_bytes <= 0 || !stalled) {
+		check(bytes_ok,
+		      "G-SMOKE: payload delivered B<-A byte-correct (RX bytes match TX)");
+	} else {
+		printf("[TEST-SIM-2INST] NOTE: large-payload arm STALLED (rx=%d/%d, "
+		       "final_cfg=%d) — over-climb/collapse regime, byte-correct assert "
+		       "skipped (this is the probe result, not a failure)\n",
+		       rx_have, payload_len, A->arq.current_configuration);
+		fflush(stdout);
+	}
 	check(iters < max_iters, "G-SMOKE: terminated before iteration cap (no hang)");
 
 	// --- Teardown ---
