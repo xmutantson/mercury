@@ -9181,13 +9181,14 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 // to the two-process paced sim (clock past delay / ring drained — never early).
 // ===========================================================================
 
-// The pump-setter + the two production spin-loop helpers are defined in
-// arq_common.cc next to the spin helpers. We call the SAME helpers here so the
-// prototype proves the REAL production waits are step-pumpable.
+// The pump-setter is defined in arq_common.cc next to the spin helpers. The
+// two production spin-loop helpers (ptt_busy_wait / drain_playback_wait) are
+// now declared in arq.h, so they are reachable here AND inside send_batch().
+// SIM_INPROC drives the REAL send_batch() (arq_common.cc) end-to-end rather
+// than re-invoking the helpers from a synthetic sequence — the helpers run
+// inside production code, proving the actual send-path waits are step-pumpable.
 typedef void (*sim_inproc_pump_fn)(void* ctx);
 extern void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx);
-void ptt_busy_wait(cl_timer& t, int delay_ms);
-void drain_playback_wait();
 
 namespace {
 // Step-pump context: the single-thread stepper's view of the loopback channel.
@@ -9273,14 +9274,29 @@ int cl_arq_controller::test_sim_inproc()
 	       "(no audio device, no bridge/prep threads, no TCP, no relay)\n");
 	fflush(stdout);
 
-	// --- 1. PHY setup: load a real config so transmit_byte has a frame ---
+	// --- 1. PHY + ARQ setup via the REAL production load_configuration ---
+	// INCREMENT step (3) (single-process-sim-refactor.md §5.6 step 3): drive the
+	// REAL production send path end-to-end, not the prior synthetic 3-call
+	// sequence. We therefore must bring up the SAME ARQ state the production
+	// commander has before send_batch(): message buffers (messages_tx[],
+	// messages_batch_tx[], message_TxRx_byte_buffer), max_header_length,
+	// nMessages, data_container PHY + passband_delayed_data, etc.
+	//
+	// cl_arq_controller::load_configuration(cfg, FULL, NO) does ALL of that
+	// (set_max_buffer_length + set_nMessages + init_messages_buffers at
+	// arq_common.cc:1455/1456/1659) AND calls telecom_system->load_configuration
+	// internally (arq_common.cc:1421) — WITHOUT touching the TCP sockets (those
+	// are only init()'d in cl_arq_controller::init(), which we deliberately do
+	// NOT call: SIM_INPROC binds NO socket). The ctor seated
+	// current_configuration=CONFIG_0 (arq_common.cc:393), and ROBUST_0 (100) !=
+	// CONFIG_0, so load_configuration proceeds rather than skipping.
+	//
 	// ROBUST_0 (MFSK) is the smallest, fastest-to-emit frame; it exercises the
-	// same PTT/TX/drain sequence as every OFDM config.
+	// same PTT/TX/drain spin sites send_batch() runs for every OFDM config.
 	robust_enabled     = YES;
 	narrowband_enabled = NO;
 	telecom_system->narrowband_enabled = NO;
-	telecom_system->load_configuration(ROBUST_0);
-	current_configuration = ROBUST_0;
+	load_configuration(ROBUST_0, FULL, NO);   // ARQ-side: buffers + PHY, no TCP
 
 	cl_data_container* dc = &telecom_system->data_container;
 	int active_nsymb = telecom_system->get_active_nsymb();
@@ -9289,10 +9305,29 @@ int cl_arq_controller::test_sim_inproc()
 	                        (active_nsymb + dc->preamble_nSymb);
 	check(symbol_period > 0, "A0 PHY config loaded (symbol_period > 0)");
 	check(frame_output_size > 0, "A1 frame output size > 0");
+	check(current_configuration == ROBUST_0, "A1b ARQ load_configuration set current_configuration=ROBUST_0");
+	check(message_TxRx_byte_buffer != nullptr && messages_batch_tx != nullptr && messages_tx != nullptr,
+	      "A1c ARQ message buffers allocated (init_messages_buffers ran, no TCP)");
 	printf("[TEST-SIM-INPROC] symbol_period=%d frame_output=%d active_nsymb=%d "
-	       "preamble_nSymb=%d\n", symbol_period, frame_output_size, active_nsymb,
-	       dc->preamble_nSymb);
+	       "preamble_nSymb=%d max_header_length=%d nMessages=%d\n", symbol_period,
+	       frame_output_size, active_nsymb, dc->preamble_nSymb, max_header_length,
+	       nMessages);
 	fflush(stdout);
+
+	// passband_delayed_data + capture_prep_mutex are normally set up by
+	// audioio_init (audioio.c:1719) and the PHY load. send_batch() locks
+	// capture_prep_mutex and zeroes passband_delayed_data; the PHY load
+	// allocated passband_delayed_data (data_container.cc:170). The mutex is a
+	// device-init artifact SIM_INPROC skips — create it so the production
+	// send_batch() MUTEX_LOCK/UNLOCK are real (uncontended: single thread).
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if (capture_prep_mutex == NULL)
+	{
+		capture_prep_mutex = CreateMutex(NULL, FALSE, NULL);
+		created_mutex = true;
+	}
+#endif
 
 	// --- 2. Audio ring buffers WITHOUT any device / bridge / prep thread ---
 	// These are the same globals tx_transfer/rx_transfer use; we create them
@@ -9322,125 +9357,106 @@ int cl_arq_controller::test_sim_inproc()
 	arq_set_sim_inproc_pump(sim_inproc_pump, &pump_ctx);
 	check(pump_ctx.scratch != nullptr, "A4 step-pump installed");
 
-	// Non-zero PTT delays so ptt_busy_wait MUST advance the virtual clock to
-	// exit — this is what proves the clock-advance pump works (delay=0 would
-	// pass trivially without ever pumping). 100/200 ms == ini_parser defaults.
+	// Non-zero PTT delays so the two PTT waits inside send_batch() MUST advance
+	// the virtual clock to exit — this is what proves the clock-advance pump
+	// works (delay=0 would pass trivially without ever pumping). 100/200 ms ==
+	// ini_parser defaults. send_batch() reads ptt_on_delay_ms / ptt_off_delay_ms.
 	ptt_on_delay_ms  = 100;
 	ptt_off_delay_ms = 200;
 
-	// --- 5. Run the REAL PTT -> emit -> drain -> RX-capture sequence ---
-	// These are the EXACT calls send_batch() makes (arq_common.cc:3630-3959),
-	// run inline with NO concurrent thread. Each spin-loop is now step-pumped.
-	uint64_t t_start = sim_clock_now_samples();
-
-	ptt_on();   // harmless no-op without a TCP control socket (send() -> -1)
-
-	cl_timer ptt_on_delay, ptt_off_delay;
-	ptt_on_delay.start();
-
-	// (a) PTT pre-key delay — must elapse on the VIRTUAL clock (idle-fill pump).
-	uint64_t clk_before_on = sim_clock_now_samples();
-	ptt_busy_wait(ptt_on_delay, ptt_on_delay_ms);
-	int on_elapsed_ms = ptt_on_delay.get_elapsed_time_ms();
-	uint64_t clk_after_on = sim_clock_now_samples();
-	printf("[TEST-SIM-INPROC] [WAIT-A ptt_on] exit_elapsed=%dms (>=%dms?) "
-	       "clk %llu->%llu (+%llu samples = %.1fms virtual)\n",
-	       on_elapsed_ms, ptt_on_delay_ms,
-	       (unsigned long long)clk_before_on, (unsigned long long)clk_after_on,
-	       (unsigned long long)(clk_after_on - clk_before_on),
-	       (clk_after_on - clk_before_on) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ);
-	fflush(stdout);
-	// FIDELITY: the wait exited at the SAME condition as the two-process path —
-	// elapsed virtual time >= delay, NOT early.
-	check(on_elapsed_ms >= ptt_on_delay_ms,
-	      "B1 ptt_busy_wait(on) exited at >= delay (timing UNCHANGED, not early)");
-
-	// (b) Emit a real frame into playback_buffer (the modem's TX boundary).
-	// Use the data_container's own frame-sized data_byte buffer exactly as the
-	// production send() path does (arq_common.cc:3552) — transmit_byte()
-	// zero-pads the payload up to frame_size IN PLACE, so the buffer MUST be
-	// frame-sized (the robust frame is wider than the 7-byte payload).
+	// --- 5. Stage a REAL DATA_SHORT batch into the production batch array ---
+	// This is exactly how the production commander stages a frame before
+	// send_batch() (arq_commander.cc:1323-1341): set the messages_batch_tx[i]
+	// fields + message_batch_counter_tx, then call send_batch(). The frame's
+	// .data points at a pre-allocated buffer (messages_tx[0].data, allocated by
+	// init_messages_buffers) — messages_batch_tx[i].data is NULL at init and in
+	// production inherits a valid pointer via a struct-copy (arq_common.cc:1314
+	// comment); we mirror that by aiming it at messages_tx[0].data.
 	{
 		const char* msg = "MERCURY";
 		int nb = (int)strlen(msg);
-		for(int i=0;i<nb;i++)
-			dc->data_byte[i] = (unsigned char)msg[i];
-		telecom_system->transmit_byte(dc->data_byte, nb,
-		                              dc->ready_to_transmit_passband_data_tx, 0);
-		tx_transfer(dc->ready_to_transmit_passband_data_tx, frame_output_size);
+		messages_batch_tx[0].type   = DATA_SHORT;
+		messages_batch_tx[0].length = nb;
+		messages_batch_tx[0].id     = 0;
+		messages_batch_tx[0].nResends = nResends;
+		messages_batch_tx[0].ack_timeout = ack_timeout_data;
+		messages_batch_tx[0].status = ADDED_TO_BATCH_BUFFER;
+		messages_batch_tx[0].sequence_number = 0;
+		messages_batch_tx[0].batch_seq_id = 0;
+		messages_batch_tx[0].data = messages_tx[0].data;  // real allocated buffer
+		for(int i=0;i<nb;i++) messages_batch_tx[0].data[i] = msg[i];
+		// Keep messages_tx[0] coherent so send_batch()'s post-TX ack bookkeeping
+		// (arq_common.cc:4020-4033, indexed by .id) writes into a real slot.
+		messages_tx[0].status = PENDING_ACK;
+		message_batch_counter_tx = 1;
+		connection_id = 1;
 	}
-	uint64_t play_after_emit = size_buffer(playback_buffer);
-	check(play_after_emit > 0, "B2 frame emitted into playback_buffer (TX boundary)");
-	printf("[TEST-SIM-INPROC] emitted frame: playback now %llu bytes (%llu samples)\n",
-	       (unsigned long long)play_after_emit,
-	       (unsigned long long)(play_after_emit / sizeof(double)));
-	fflush(stdout);
+	check(message_batch_counter_tx == 1, "A5 DATA_SHORT batch staged into messages_batch_tx[]");
 
-	// (c) Drain the playback ring — the spin-loop that DEADLOCKED without a
-	// concurrent drainer. The step-pump loops it back into capture_buffer.
-	uint64_t cap_before_drain = size_buffer(capture_buffer);
-	uint64_t clk_before_drain = sim_clock_now_samples();
-	drain_playback_wait();
-	uint64_t play_after_drain = size_buffer(playback_buffer);
-	uint64_t clk_after_drain = sim_clock_now_samples();
-	printf("[TEST-SIM-INPROC] [WAIT-B drain] playback %llu->%llu "
-	       "clk %llu->%llu (+%llu samples) cap_before=%llu\n",
-	       (unsigned long long)play_after_emit, (unsigned long long)play_after_drain,
-	       (unsigned long long)clk_before_drain, (unsigned long long)clk_after_drain,
-	       (unsigned long long)(clk_after_drain - clk_before_drain),
-	       (unsigned long long)cap_before_drain);
-	fflush(stdout);
-	// FIDELITY: exited at size_buffer(playback)==0 — the SAME condition.
-	check(play_after_drain == 0,
-	      "B3 drain_playback_wait exited at playback ring EMPTY (no deadlock)");
-	// The drained frame's samples advanced the clock (looped through rx_transfer).
-	check(pump_ctx.looped_samples >= (long long)(frame_output_size),
-	      "B4 the emitted frame's samples looped back through the RX boundary");
+	// --- 6. Run the REAL production send_batch() inline (no concurrent thread) ---
+	// send_batch() (arq_common.cc:3629) is the EXACT production send core. It
+	// keys PTT, frames + FIR-filters the batch, runs ptt_busy_wait(on),
+	// tx_transfers each frame, drain_playback_wait()s the ring, resets the
+	// capture ring, then ptt_busy_wait(off) + ptt_off. ALL THREE spin sites
+	// (ptt_busy_wait@3930, drain_playback_wait@3967, ptt_busy_wait@3999) now
+	// run inline, step-pumped by the installed pump. If ANY of them failed to
+	// become step-pumpable, send_batch() would never return (hard deadlock) —
+	// so a clean return is itself the proof of inline drive through production
+	// code. We bracket the call with virtual-clock snapshots to confirm the
+	// waits did NOT exit early (total >= on + airtime + off) and the clock did
+	// not run away.
+	uint64_t t_start = sim_clock_now_samples();
+	long long looped_before = pump_ctx.looped_samples;
 
-	// (d) PTT post-key delay — second clock-gated wait.
-	ptt_off_delay.start();
-	uint64_t clk_before_off = sim_clock_now_samples();
-	ptt_busy_wait(ptt_off_delay, ptt_off_delay_ms);
-	int off_elapsed_ms = ptt_off_delay.get_elapsed_time_ms();
-	uint64_t clk_after_off = sim_clock_now_samples();
-	printf("[TEST-SIM-INPROC] [WAIT-C ptt_off] exit_elapsed=%dms (>=%dms?) "
-	       "clk %llu->%llu (+%llu samples = %.1fms virtual)\n",
-	       off_elapsed_ms, ptt_off_delay_ms,
-	       (unsigned long long)clk_before_off, (unsigned long long)clk_after_off,
-	       (unsigned long long)(clk_after_off - clk_before_off),
-	       (clk_after_off - clk_before_off) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ);
-	fflush(stdout);
-	check(off_elapsed_ms >= ptt_off_delay_ms,
-	      "B5 ptt_busy_wait(off) exited at >= delay (timing UNCHANGED, not early)");
-
-	ptt_off();
+	send_batch();   // REAL production send-path core, driven inline.
 
 	uint64_t t_end = sim_clock_now_samples();
+	long long looped_in_batch = pump_ctx.looped_samples - looped_before;
 
-	// --- 6. Timing fidelity: the total virtual time spanned is at least the
-	// sum of the two PTT delays plus the frame airtime — NOT short-circuited.
+	// FIDELITY: a clean return proves no deadlock at any of the 3 spin sites.
+	check(true, "B1 send_batch() returned (all 3 internal spin sites stepped, NO deadlock)");
+	// The playback ring was fully drained by the inline pump (drain_playback_wait
+	// exited at size_buffer(playback)==0 — its UNCHANGED exit predicate).
+	check(size_buffer(playback_buffer) == 0,
+	      "B2 playback ring EMPTY after send_batch (drain_playback_wait exit predicate held)");
+	// send_batch() consumed + reset the staged batch (message_batch_counter_tx
+	// is cleared at arq_common.cc:4048 only after the full PTT/drain sequence).
+	check(message_batch_counter_tx == 0,
+	      "B3 send_batch consumed the batch (reached post-drain bookkeeping)");
+	// The frame's audio samples looped back through the RX boundary inside the
+	// real drain — i.e. real channel time, not a synthetic poke.
+	check(looped_in_batch >= (long long)frame_output_size,
+	      "B4 the batch's frame samples looped back through the RX boundary (real airtime)");
+
+	// --- 7. Timing fidelity: the total virtual time send_batch() spanned is at
+	// least on-delay + frame airtime + off-delay — NOT short-circuited. This is
+	// the SAME analytic floor the synthetic prototype proved, now measured
+	// across the REAL send_batch() body. (send_batch on ROBUST_0 emits the one
+	// staged frame; airtime == frame_output_size samples.)
 	double total_virtual_ms = (t_end - t_start) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
 	double frame_airtime_ms = frame_output_size * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
 	double expected_min_ms  = (double)ptt_on_delay_ms + (double)ptt_off_delay_ms
 	                        + frame_airtime_ms;
-	printf("[TEST-SIM-INPROC] virtual-time accounting: total=%.1fms "
-	       "expected_min=%.1fms (on=%d off=%d frame_airtime=%.1fms)\n",
+	printf("[TEST-SIM-INPROC] [REAL send_batch] virtual-time accounting: total=%.1fms "
+	       "expected_min=%.1fms (on=%d off=%d frame_airtime=%.1fms) clk %llu->%llu\n",
 	       total_virtual_ms, expected_min_ms, ptt_on_delay_ms, ptt_off_delay_ms,
-	       frame_airtime_ms);
+	       frame_airtime_ms, (unsigned long long)t_start, (unsigned long long)t_end);
 	printf("[TEST-SIM-INPROC] pump stats: calls=%lld looped=%lld idle=%lld "
-	       "clock_samples=%lld\n", pump_ctx.pump_calls, pump_ctx.looped_samples,
-	       pump_ctx.idle_samples, pump_ctx.clock_samples);
+	       "clock_samples=%lld looped_in_batch=%lld\n", pump_ctx.pump_calls,
+	       pump_ctx.looped_samples, pump_ctx.idle_samples, pump_ctx.clock_samples,
+	       looped_in_batch);
 	fflush(stdout);
 	// Allow one symbol of poll overshoot on each of the two PTT waits (the
-	// pump advances in whole symbols — same quantization the prep thread has).
+	// pump advances in whole symbols — same quantization the prep thread has),
+	// plus headroom for the start-of-batch capture-ring-reset idle pumping.
 	double overshoot_tol_ms = 2.0 * symbol_period * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ
 	                        + 1.0;
 	check(total_virtual_ms >= expected_min_ms - 0.001,
-	      "B6 total virtual time >= on+off+airtime (waits did NOT exit early)");
+	      "B6 total virtual time >= on+airtime+off (send_batch waits did NOT exit early)");
 	check(total_virtual_ms <= expected_min_ms + overshoot_tol_ms + frame_airtime_ms,
 	      "B7 total virtual time bounded (no runaway clock; overshoot < 1 symbol/wait)");
 
-	// --- 7. Teardown: uninstall pump, leave globals as we found them ---
+	// --- 8. Teardown: uninstall pump, leave globals as we found them ---
 	arq_set_sim_inproc_pump(nullptr, nullptr);
 	if(pump_ctx.scratch) free(pump_ctx.scratch);
 	if(created_buffers)
@@ -9452,6 +9468,13 @@ int cl_arq_controller::test_sim_inproc()
 		circular_buf_free(playback_buffer);
 		playback_buffer = nullptr;
 	}
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{
+		CloseHandle(capture_prep_mutex);
+		capture_prep_mutex = NULL;
+	}
+#endif
 	sim_clock_set_enabled(0);
 
 	printf("[TEST-SIM-INPROC] %s (%d failure%s) — inline cycle %s\n",

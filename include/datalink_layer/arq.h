@@ -44,6 +44,24 @@
 #include <atomic>
 #include <chrono>
 
+// ---------------------------------------------------------------------------
+// TX-path blocking-wait helpers (defined in arq_common.cc, external linkage).
+//
+// These are the two spin-loop shapes that recur across the send path:
+//   ptt_busy_wait(t, delay_ms) — block until virtual/wall time crosses delay_ms
+//   drain_playback_wait()      — block until the playback ring is fully drained
+//
+// Declared here (rather than re-forward-declared per .cc) so EVERY ARQ
+// translation unit routes through the SAME definition — in particular the
+// SWITCH_ROLE PTT-off wait in arq_responder.cc, which previously open-coded an
+// empty-body busy-spin that hard-deadlocks under the single-thread virtual
+// clock (single-process-sim-refactor.md §5.6(a) / §5.7-B6). Behavior is
+// byte-identical on every production / two-process-paced-sim path (the
+// step-pump hook inside these helpers is null unless -m SIM_INPROC installs
+// it); routing through them only makes those waits step-pumpable.
+void ptt_busy_wait(cl_timer& t, int delay_ms);
+void drain_playback_wait();
+
 union u_SNR {
   float f_SNR;
   char char4_SNR[4];

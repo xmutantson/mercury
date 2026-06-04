@@ -1247,7 +1247,19 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			cl_timer ptt_off_wait;
 			ptt_off_wait.reset();
 			ptt_off_wait.start();
-			while(ptt_off_wait.get_elapsed_time_ms()<ptt_off_delay_ms);
+			// 3rd-spin inversion (single-process-sim-refactor.md §5.6(a) /
+			// §5.7-B6): this was an EMPTY-body busy-spin
+			//   while(ptt_off_wait.get_elapsed_time_ms()<ptt_off_delay_ms);
+			// which hard-deadlocks under the single-thread virtual clock (the
+			// sim clock advances ONLY via rx_transfer; nothing drives it during
+			// an empty spin, so get_elapsed_time_ms() never increases). Route
+			// it through ptt_busy_wait so the SIM_INPROC step-pump drives the
+			// clock-advance from inside the wait. The EXIT PREDICATE is
+			// byte-identical (elapsed >= ptt_off_delay_ms), and on every
+			// production / two-process-paced-sim path the helper's behavior is
+			// unchanged (the pump hook is null there) — so this only un-deadlocks
+			// the single-thread stepper, it does not alter the live link.
+			ptt_busy_wait(ptt_off_wait, ptt_off_delay_ms);
 
 			bool has_asymmetric = (forward_configuration != CONFIG_NONE &&
 				reverse_configuration != CONFIG_NONE);
