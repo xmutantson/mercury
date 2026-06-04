@@ -36,6 +36,7 @@
 #include "physical_defines.h"
 #include "misc.h"
 #include "common/ring_buffer_posix.h"
+#include "common/os_interop.h"
 #include <iomanip>
 
 
@@ -423,6 +424,26 @@ public:
 	int outer_code_reserved_bits;
 
 	int bit_energy_dispersal_seed;
+
+	// Per-instance RNG (single-process-sim-refactor.md §10.1, Landmine 1). Each
+	// cl_telecom_system owns an INDEPENDENT glibc-TYPE_3 stream so two modem
+	// instances in one process (the 2-instance SIM_INPROC stepper) never
+	// cross-contaminate pre-eq channel / pilot / dispersal sequence generation
+	// (get_pre_equalization_channel runs a 1000-draw NO-RESEED loop that would
+	// otherwise inherit the OTHER instance's residual stream state). Bound +
+	// seeded in the ctor via os_rng_make. ts_srandom/ts_random route through it
+	// when rng_own_ (always true post-ctor); a single instance reproduces a clean
+	// run byte-for-byte because there is no other instance to inherit residue
+	// from and the TYPE_3 walk is deterministic from the seed.
+	int32_t           rng_state_[OS_RNG_STATE_WORDS];
+	struct random_data_t rng_;
+	bool              rng_own_;
+	void          ts_srandom(unsigned int seed);  // routed __srandom
+	long int      ts_random();                    // routed __random
+	// Opt this instance into its own residue-free RNG stream (re-seeds rng_ with
+	// `seed` and flips rng_own_ true). Called ONLY by the 2-instance SIM_INPROC
+	// stepper. Production never calls it → rng_own_ stays false → byte-identical.
+	void          enable_per_instance_rng(unsigned int seed);
 
 	int narrowband_enabled;  // 0=wideband (Nc=50, BW=2344 Hz), 1=narrowband (Nc=10, BW=469 Hz)
 	bool coarse_freq_sync_enabled;  // Coarse freq search (±30 Hz) for HF radio drift

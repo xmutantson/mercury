@@ -93,6 +93,13 @@ bool arq_sim_inproc_active();
 void pumped_settle_wait(int wait_ms);
 void sim_inproc_rx_mute_settle(int wait_ms);
 
+// SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5). Set true ONLY
+// while the 2-instance stepper runs; makes process_main() skip its TCP control +
+// data poll blocks (the stepper injects commands + data directly). Default false
+// → production + paced sim run the verbatim blocks (byte-identical).
+void arq_set_sim_inproc_skip_tcp(bool on);
+bool arq_sim_inproc_skip_tcp();
+
 union u_SNR {
   float f_SNR;
   char char4_SNR[4];
@@ -1214,6 +1221,15 @@ public:
   // PHY + audio ring buffers (no device, no bridge/prep threads, no TCP, no
   // relay). Returns 0 on a clean inline cycle, 1 on any failure. -m SIM_INPROC.
   int test_sim_inproc();
+
+  // 2-INSTANCE SIM_INPROC stepper (single-process-sim-refactor.md §10.5). Static
+  // because it constructs its OWN two cl_telecom_system + two cl_arq_controller
+  // (A=COMMANDER, B=RESPONDER) + two cl_sim_awgn (one per direction), drives the
+  // real handshake via process_user_command + the §3 lockstep A<->B loop on the
+  // shared virtual clock, and validates G-SMOKE (CONNECT + data B<-A), GATE-2
+  // (byte-identical determinism + switch_seq), GATE-3-light. Returns 0 on PASS.
+  // Selected by -m SIM_INPROC with MERCURY_SIM_2INST=1 / --sim-2inst.
+  static int test_sim_inproc_2();
 
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //

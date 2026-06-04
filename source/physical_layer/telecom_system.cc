@@ -42,6 +42,17 @@ extern "C" double test_tx_carrier_offset;
 
 cl_telecom_system::cl_telecom_system()
 {
+	// Per-instance RNG (single-process-sim-refactor.md §10.1, Landmine 1).
+	// DEFAULT rng_own_ = false → ts_srandom/ts_random call the GLOBAL
+	// __srandom/__random (the file-static unsafe_state), so production, the
+	// two-process paced sim, and every single-instance suite are BYTE-IDENTICAL
+	// to before this change. The 2-instance SIM_INPROC stepper opts EACH instance
+	// IN via enable_per_instance_rng() AFTER construction — only then does this
+	// instance draw from its own residue-free stream (closing the cross-instance
+	// pre-eq-channel residue inheritance). os_rng_make binds rng_ to rng_state_
+	// here so enabling is just a flag flip (no late allocation).
+	os_rng_make(&rng_, rng_state_, 1u);
+	rng_own_ = false;
 	skip_var_gate_enabled = true;  // default = HEAD behavior; CLI --skip-var-gate=off disables
 	rx_normalize_enabled  = true;  // default = HEAD behavior; CLI --rx-normalize=off disables
 	csi_llr_enabled       = true;  // default = HEAD behavior; CLI --csi-llr=off disables
@@ -256,7 +267,7 @@ cl_error_rate cl_telecom_system::baseband_test_EsN0(float EsN0,int max_frame_no)
 	{
 		for(int i=0;i<nReal_data;i++)
 		{
-			data_container.data_bit[i]=__random()%2;
+			data_container.data_bit[i]=ts_random()%2;   // §10.1 per-instance when opted in
 		}
 		for(int i=0;i<nVirtual_data;i++)
 		{
@@ -441,7 +452,7 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 	{
 		for(int i=0;i<nReal_data-outer_code_reserved_bits;i++)
 		{
-			data_container.data_bit[i]=__random()%2;
+			data_container.data_bit[i]=ts_random()%2;   // §10.1 per-instance when opted in
 		}
 		bit_to_byte(data_container.data_bit,data_container.data_byte,nReal_data-outer_code_reserved_bits);
 		this->transmit_byte(data_container.data_byte,(nReal_data-outer_code_reserved_bits)/8,data_container.passband_data,SINGLE_MESSAGE);
@@ -4480,11 +4491,11 @@ void cl_telecom_system::init()
 		reinit_subsystems.pre_equalization_channel=NO;
 	}
 
-	__srandom (bit_energy_dispersal_seed);
+	ts_srandom (bit_energy_dispersal_seed);   // §10.1: per-instance when opted in
 	bit_energy_dispersal_seed = default_configurations_telecom_system.bit_energy_dispersal_seed;
 	for(int i=0;i<ldpc.N;i++)
 	{
-		data_container.bit_energy_dispersal_sequence[i]=__random()%2;
+		data_container.bit_energy_dispersal_sequence[i]=ts_random()%2;
 	}
 
 	// Print active gain entry for this config (verbose only)
@@ -6000,6 +6011,28 @@ int cl_telecom_system::get_configuration(double SNR)
 	return configuration;
 }
 
+// Per-instance RNG routing (single-process-sim-refactor.md §10.1). When
+// rng_own_ is false (production default) these are the verbatim global
+// __srandom/__random → byte-identical. When opted in (2-instance stepper) they
+// drive this instance's independent rng_ stream.
+void cl_telecom_system::ts_srandom(unsigned int seed)
+{
+	if (rng_own_) __srandom_r2(seed, &rng_);
+	else          __srandom(seed);
+}
+
+long int cl_telecom_system::ts_random()
+{
+	if (rng_own_) return __random_r2(&rng_);
+	return __random();
+}
+
+void cl_telecom_system::enable_per_instance_rng(unsigned int seed)
+{
+	os_rng_make(&rng_, rng_state_, seed);
+	rng_own_ = true;
+}
+
 void cl_telecom_system::get_pre_equalization_channel()
 {
 	int nTries=1000;
@@ -6012,7 +6045,7 @@ void cl_telecom_system::get_pre_equalization_channel()
 	{
 		for(int i=0;i<data_container.Nc*log2(data_container.M);i++)
 		{
-			data_container.bit_interleaved_data[i]=__random()%2;
+			data_container.bit_interleaved_data[i]=ts_random()%2;   // §10.1 pre-eq loop (per-instance when opted in)
 		}
 		psk.mod(data_container.bit_interleaved_data,data_container.Nc*log2(data_container.M),data_container.modulated_data);
 

@@ -22,7 +22,10 @@
 
 #include "datalink_layer/arq.h"
 #include "common/timing_log.h"
+#include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
+#include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
 #include <cstdlib>
+#include <algorithm>   // std::min (2-instance stepper RX drain)
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -9564,6 +9567,559 @@ int cl_arq_controller::test_sim_inproc()
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s",
 	       failed == 0 ? "COMPLETED with NO concurrent drainer (CLEAN_NO_DRAINER)"
 	                   : "did NOT complete cleanly");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// 2-INSTANCE SIM_INPROC stepper (single-process-sim-refactor.md §10.5).
+//
+// Two full modems (A=COMMANDER, B=RESPONDER) + an in-process scalar-AWGN
+// channel per direction, driven by a SINGLE-THREAD lockstep loop on a SHARED
+// virtual clock. NO audio device, NO bridge/prep threads, NO TCP, NO relay.
+// Generalizes the proven single-instance Stage-2 stepper (test_sim_inproc) to
+// a real peer: the peer-dependent settle-waits (B4 CONNECT-suffix, B7 HAIL/
+// CONNECT self-detect race, B8 HAIL RX-poll) are now exercised against an
+// actual responder.
+// ===========================================================================
+namespace {
+
+// Per-instance audio transport (single-process-sim-refactor.md §10.3). Two
+// instances own genuinely independent rings; the stepper swaps the audioio.c
+// globals to the ACTIVE instance's rings before driving it (single thread → the
+// swap precedes every consumer). Production never swaps.
+struct AudioCtx {
+	cbuf_handle_t cap  = nullptr;
+	cbuf_handle_t play = nullptr;
+#if defined(_WIN32)
+	HANDLE        mutex = NULL;
+#else
+	pthread_mutex_t mutex;
+#endif
+	uint8_t* cap_mem  = nullptr;
+	uint8_t* play_mem = nullptr;
+
+	void alloc() {
+		cap_mem  = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		play_mem = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		cap  = circular_buf_init(cap_mem,  AUDIO_PAYLOAD_BUFFER_SIZE);
+		play = circular_buf_init(play_mem, AUDIO_PAYLOAD_BUFFER_SIZE);
+		clear_buffer(cap);
+		clear_buffer(play);
+#if defined(_WIN32)
+		mutex = CreateMutex(NULL, FALSE, NULL);
+#else
+		pthread_mutex_init(&mutex, NULL);
+#endif
+	}
+	void free_all() {
+		if(cap)  { free(cap->buffer);  circular_buf_free(cap);  cap = nullptr; }
+		if(play) { free(play->buffer); circular_buf_free(play); play = nullptr; }
+#if defined(_WIN32)
+		if(mutex) { CloseHandle(mutex); mutex = NULL; }
+#else
+		pthread_mutex_destroy(&mutex);
+#endif
+	}
+};
+
+// One full modem instance for the 2-instance stepper.
+struct MercuryInstance {
+	cl_telecom_system ts;
+	cl_arq_controller arq;
+	AudioCtx          audio;
+	const char*       tag = "?";
+
+	void wire() { arq.telecom_system = &ts; }
+};
+
+// The 2-instance step-pump context. The stepper sets {tx, rx, channels} before
+// driving the active (tx) instance. The pump (installed via the SAME
+// arq_set_sim_inproc_pump hook the single-instance stepper uses) is invoked from
+// inside tx's blocking waits (ptt_busy_wait / drain_playback_wait / pacing
+// floor). Per call it:
+//   1. Drains tx.play -> tx->rx channel -> rx.cap (the real tx->rx handoff),
+//      advancing the SHARED clock; idle-fills one symbol of silence when tx has
+//      nothing (the two-process TX bridge always sends silence on idle).
+//   2. Runs rx's prep-pull (rx.cap -> rx.passband_delayed_data).
+//   3. CO-ROUTINE INTERLEAVE: at depth 0, drives rx->process_main() ONCE so the
+//      PEER can react to the audio it just received WHILE tx is still blocked in
+//      its wait (mirrors the two-process concurrency where rx's prep+ARQ run
+//      while tx transmits). Without this, tx's long PTT/response waits would
+//      pump tens of silence symbols into rx and BURY the just-arrived beacon
+//      before rx ever scanned it (the §10.5 single-thread hazard). A depth guard
+//      (g_sim2_depth) bounds reentrancy to ONE peer level: when rx's own waits
+//      fire the pump (depth 1), it only feeds rx->tx + advances the clock (so
+//      rx's reply reaches tx's capture) — it does NOT recurse into tx again.
+// Exit predicates are UNCHANGED (drain exits at tx.play empty; ptt exits at
+// clock past delay) — the pump only makes them eventually true.
+struct SimInproc2Ctx {
+	MercuryInstance* tx = nullptr;     // active instance (drains its playback)
+	MercuryInstance* rx = nullptr;     // peer (receives the channel output)
+	cl_sim_awgn*     ch_tx2rx = nullptr; // tx -> rx direction
+	cl_sim_awgn*     ch_rx2tx = nullptr; // rx -> tx direction (peer-drive reply)
+	// Per-direction WIRE rings (single-process-sim §10.5). Drained TX samples
+	// (post-channel) are buffered here, NOT written straight to the receiver's
+	// capture. The receiver is fed from its incoming wire only at controlled
+	// points (its own drive turn / its listen polls), so a sender's post-TX
+	// capture FLUSH (send_*_pattern self-echo reset) cannot wipe a reply that the
+	// peer emitted while the sender was still transmitting. wire_t2r is the
+	// tx->rx wire, wire_r2t the rx->tx wire (re-pointed each half-step).
+	cl_sim_awgn*     dummy = nullptr;
+	cbuf_handle_t    wire_t2r = nullptr;
+	cbuf_handle_t    wire_r2t = nullptr;
+	double* scratch = nullptr;         // >= 3 symbols of doubles
+	int    sp_max = 0;                 // max symbol_period across both instances
+	long long pump_calls = 0;
+	long long clock_samples = 0;
+	long long looped_samples = 0;      // real airtime moved tx->rx
+	long long idle_samples = 0;
+};
+
+// Reentrancy depth for the co-routine peer-drive (§10.5). 0 = top (tx) level;
+// 1 = inside a peer rx->process_main() drive (do not recurse further).
+static int g_sim2_depth = 0;
+
+void prep_pull_inline(MercuryInstance* inst, double* buffer_temp);  // fwd decl
+
+// Drain src's playback through the channel into the src->dst WIRE (whole symbols),
+// advancing the shared clock by the drained airtime; idle-fills ONE symbol of
+// silence into the wire when src has nothing (so the clock keeps ticking and the
+// receiver sees the noise floor). Returns true if real (non-silence) signal moved.
+// The wire decouples TX-drain from RX-feed so a sender's post-TX capture flush
+// cannot wipe a reply in flight (single-process-sim §10.5).
+bool sim2_drain_to_wire(MercuryInstance* src, cl_sim_awgn* ch, cbuf_handle_t wire,
+                        SimInproc2Ctx* c)
+{
+	cl_data_container* sdc = &src->ts.data_container;
+	int sp = sdc->Nofdm * sdc->interpolation_rate;
+	if (sp <= 0) return false;
+	size_t sp_bytes = (size_t)sp * sizeof(double);
+	bool moved = false;
+	while (size_buffer(src->audio.play) >= sp_bytes &&
+	       circular_buf_free_size(wire) >= sp_bytes)
+	{
+		read_buffer(src->audio.play, (uint8_t*)c->scratch, sp_bytes);
+		if (ch) ch->process(c->scratch, (size_t)sp);
+		write_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+		c->looped_samples += sp;
+		c->clock_samples  += sp;
+		sim_clock_add_samples((uint64_t)sp);
+		moved = true;
+	}
+	if (!moved)
+	{
+		if (circular_buf_free_size(wire) >= sp_bytes)
+		{
+			memset(c->scratch, 0, sp_bytes);
+			if (ch) ch->process(c->scratch, (size_t)sp);
+			write_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+		}
+		c->idle_samples  += sp;
+		c->clock_samples += sp;
+		sim_clock_add_samples((uint64_t)sp);
+	}
+	return moved;
+}
+
+// Deliver pending WIRE samples into dst's capture (respecting free space) then
+// run dst's prep-pull (wire -> dst.cap -> dst.passband_delayed_data). Called for
+// the RECEIVER at controlled points so a sender's flush never races a reply.
+void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2Ctx* c)
+{
+	cl_data_container* ddc = &dst->ts.data_container;
+	int sp = ddc->Nofdm * ddc->interpolation_rate;
+	if (sp <= 0) return;
+	size_t sp_bytes = (size_t)sp * sizeof(double);
+	while (size_buffer(wire) >= sp_bytes &&
+	       circular_buf_free_size(dst->audio.cap) >= sp_bytes)
+	{
+		read_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+		write_buffer(dst->audio.cap, (uint8_t*)c->scratch, sp_bytes);
+	}
+	prep_pull_inline(dst, c->scratch + c->sp_max);
+}
+
+// prep_pull_inline: one capture-prep PASS for `inst` (the body of
+// radio_capture_prep_thread, audioio.c:1295-1376, minus the while(!shutdown_)
+// and the sim_paced_wait). Moves whole symbols from inst's capture ring into
+// inst's data_container.passband_delayed_data (double-mapped ring write +
+// frames_to_read/data_ready/nUnder bookkeeping). Uses inst's OWN mutex + rings
+// + data_container EXPLICITLY (not the globals) so it is correct regardless of
+// which instance the globals currently point at.
+void prep_pull_inline(MercuryInstance* inst, double* buffer_temp)
+{
+	cl_data_container* dc = &inst->ts.data_container;
+	int symbol_period = dc->Nofdm * dc->interpolation_rate;
+	if (symbol_period <= 0) return;
+	size_t sp_bytes = (size_t)symbol_period * sizeof(double);
+
+	while (size_buffer(inst->audio.cap) >= sp_bytes)
+	{
+		read_buffer(inst->audio.cap, (uint8_t*)buffer_temp, sp_bytes);
+		// Per-instance virtual clock is NOT advanced here (the pump advances the
+		// SHARED clock once per moved sample, §10.5). rx_transfer's clock-add is
+		// NOT used on this path — we read inst's capture directly.
+
+		if (dc->rx_mute) {
+			memset(buffer_temp, 0, sp_bytes);
+			dc->rx_mute_samples += symbol_period;
+		}
+
+		MUTEX_LOCK(&inst->audio.mutex);
+		int sp = dc->Nofdm * dc->buffer_Nsymb * dc->interpolation_rate;
+		if (sp == 0 || dc->passband_delayed_data == NULL || sp <= symbol_period) {
+			MUTEX_UNLOCK(&inst->audio.mutex);
+			continue;
+		}
+		if (dc->data_ready == 1 && dc->frames_to_read <= 0)
+			dc->nUnder_processing_events++;
+
+		int wi = dc->ring_write_index;
+		int remaining = sp - wi;
+		if (remaining >= symbol_period) {
+			memcpy(&dc->passband_delayed_data[wi], buffer_temp, sp_bytes);
+			memcpy(&dc->passband_delayed_data[wi + sp], buffer_temp, sp_bytes);
+		} else {
+			memcpy(&dc->passband_delayed_data[wi], buffer_temp, (size_t)remaining * sizeof(double));
+			memcpy(&dc->passband_delayed_data[wi + sp], buffer_temp, (size_t)remaining * sizeof(double));
+			int wrap = symbol_period - remaining;
+			memcpy(&dc->passband_delayed_data[0], &buffer_temp[remaining], (size_t)wrap * sizeof(double));
+			memcpy(&dc->passband_delayed_data[sp], &buffer_temp[remaining], (size_t)wrap * sizeof(double));
+		}
+		dc->ring_write_index = (wi + symbol_period) % sp;
+		dc->frames_to_read--;
+		if (dc->frames_to_read < 0) dc->frames_to_read = 0;
+		dc->data_ready = 1;
+		MUTEX_UNLOCK(&inst->audio.mutex);
+	}
+}
+
+void sim2_activate(MercuryInstance* m);   // fwd decl (defined below)
+
+// The 2-instance step-pump (see SimInproc2Ctx above for the full contract).
+void sim_inproc_pump_2(void* ctxv)
+{
+	SimInproc2Ctx* c = static_cast<SimInproc2Ctx*>(ctxv);
+	if (c->scratch == nullptr || c->tx == nullptr || c->rx == nullptr)
+		return;
+	c->pump_calls++;
+
+	// (1) Drain tx's playback (real signal or idle silence) into the tx->rx wire,
+	//     advancing the shared clock. NEVER writes to a capture here. `sending`
+	//     = real signal was draining this call (tx is actively transmitting a
+	//     frame, NOT idle/listening).
+	bool sending = sim2_drain_to_wire(c->tx, c->ch_tx2rx, c->wire_t2r, c);
+
+	if (g_sim2_depth == 0)
+	{
+		// (2) DEPTH 0 (tx is the top-level driven instance): deliver the tx->rx
+		//     wire into rx's capture + prep rx, then co-routine-drive rx ONCE so
+		//     rx can react WHILE tx is blocked.
+		sim2_deliver_from_wire(c->rx, c->wire_t2r, c);
+
+		// Deliver the rx->tx reply into tx ONLY when tx is NOT actively sending a
+		// frame (tx.play empty AND no real signal drained this call). This is the
+		// §10.5 deferral made precise: during a frame send the post-TX capture
+		// FLUSH (send_*_pattern) would wipe an in-flight reply, so we hold it in
+		// the wire; once tx finishes the frame and sits in a LISTEN/idle wait
+		// (tx.play empty, the flush already done — no pump fires between drain-exit
+		// and the flush), it is safe to deliver and tx's next scan sees the reply.
+		if (!sending && size_buffer(c->tx->audio.play) == 0)
+			sim2_deliver_from_wire(c->tx, c->wire_r2t, c);
+
+		g_sim2_depth++;
+		MercuryInstance* save_tx = c->tx;
+		MercuryInstance* save_rx = c->rx;
+		cl_sim_awgn* save_t2r = c->ch_tx2rx;
+		cl_sim_awgn* save_r2t = c->ch_rx2tx;
+		cbuf_handle_t save_wt2r = c->wire_t2r;
+		cbuf_handle_t save_wr2t = c->wire_r2t;
+		(void)sending;
+		// Flip the ctx so rx's own waits (depth 1) drain rx->tx wire + clock.
+		c->tx = save_rx; c->rx = save_tx;
+		c->ch_tx2rx = save_r2t; c->ch_rx2tx = save_t2r;
+		c->wire_t2r = save_wr2t; c->wire_r2t = save_wt2r;
+		sim2_activate(save_rx);
+		save_rx->arq.process_main();
+		// Restore tx's view. Do NOT deliver rx->tx here (the §10.5 deferral):
+		// the reply stays in the wire and is delivered to tx by a later pump fired
+		// from tx's LISTEN/idle wait (tx.play empty) or by the outer loop.
+		c->tx = save_tx; c->rx = save_rx;
+		c->ch_tx2rx = save_t2r; c->ch_rx2tx = save_r2t;
+		c->wire_t2r = save_wt2r; c->wire_r2t = save_wr2t;
+		sim2_activate(save_tx);
+		g_sim2_depth--;
+	}
+	// DEPTH 1 (we ARE the peer being co-routine-driven): only drained tx->rx wire
+	// above (the reply path). Do NOT deliver into the original sender's capture.
+}
+
+// Configure one instance for the 2-instance stepper exactly like the non-TCP
+// portion of cl_arq_controller::init() (arq_common.cc:1099-1170), then opt it
+// into its own residue-free RNG. The two private load_configuration() PHY calls
+// are issued by the caller (a cl_arq_controller member).
+void sim2_setup_instance(MercuryInstance* m, int role, bool robust, int start_cfg,
+                         unsigned int rng_seed)
+{
+	m->wire();
+	m->audio.alloc();
+	m->ts.enable_per_instance_rng(rng_seed);   // §10.1 residue-free stream
+
+	// Mirror init()'s non-TCP setup.
+	m->arq.fifo_buffer_tx.set_size(m->arq.default_configuration_ARQ.fifo_buffer_tx_size);
+	m->arq.fifo_buffer_rx.set_size(m->arq.default_configuration_ARQ.fifo_buffer_rx_size);
+	m->arq.fifo_buffer_backup.set_size(m->arq.default_configuration_ARQ.fifo_buffer_backup_size);
+	m->arq.set_link_timeout(m->arq.default_configuration_ARQ.link_timeout);
+	m->arq.robust_enabled     = robust ? YES : NO;
+	m->arq.narrowband_enabled = NO;
+	m->ts.narrowband_enabled  = NO;
+	m->arq.bandwidth_mode     = BW_AUTO;
+	m->arq.local_capability   = CAP_WB_CAPABLE;
+	// Skip the NB HAIL probe (== -Q 0 benchmark mode): both peers controlled,
+	// start directly in WB. Avoids the NB/WB negotiation mismatch where the
+	// commander HAILs in NB, the responder replies in NB, then the commander
+	// reverts to WB and can no longer match the NB reply (single-process-sim §10.5).
+	m->arq.nb_probe_max       = 0;
+	m->arq.gear_shift_on      = YES;
+	m->arq.gear_shift_algorithm = m->arq.default_configuration_ARQ.gear_shift_algorithm;
+	m->arq.current_configuration = CONFIG_NONE;
+	if (robust) {
+		m->arq.init_configuration = start_cfg;
+		m->arq.data_configuration = start_cfg;
+		m->arq.ack_configuration  = start_cfg;
+	} else {
+		m->arq.init_configuration = start_cfg;
+		m->arq.data_configuration = start_cfg;
+		m->arq.ack_configuration  = m->arq.default_configuration_ARQ.ack_configuration;
+	}
+	m->arq.last_data_viable_config =
+		session_floor_anchor(m->arq.robust_enabled, m->arq.init_configuration);
+	(void)role;
+	// NOTE: the two PHY load_configuration() calls (private) are issued by the
+	// caller test_sim_inproc_2 (a cl_arq_controller member) right after this.
+}
+
+// Point the audioio.c globals at this instance's rings (§10.3 swap). Single
+// thread → the swap precedes every consumer (tx_transfer/rx_transfer/
+// drain_playback_wait/the IDLE measure block) that runs during this instance's
+// process_main. gf16ra reconcile (§10.2): re-apply this instance's suffix-FEC
+// repfact (idempotent when unchanged) so the shared codec matches before drive.
+void sim2_activate(MercuryInstance* m)
+{
+	capture_buffer    = m->audio.cap;
+	playback_buffer   = m->audio.play;
+	capture_prep_mutex = m->audio.mutex;
+	// gf16ra reconcile: only meaningful if the suffix-FEC path is enabled; both
+	// peers run the same repfact under the no-negotiation invariant, so this is
+	// a no-op idempotent re-apply in the common case (FEC off → not configured).
+	if (m->ts.ack_mfsk.suffix_fec_coded) {
+		// Both peers run the same repfact under the no-negotiation invariant;
+		// repfact 3 is the only production value set_suffix_fec uses. Re-applying
+		// it is idempotent (gf16ra::init short-circuits when unchanged).
+		gf16ra::configure(3);
+		gf16ra::init();
+	}
+}
+
+}  // namespace
+
+int cl_arq_controller::test_sim_inproc_2()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-SIM-2INST] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	printf("[TEST-SIM-2INST] two-instance in-process lockstep stepper "
+	       "(A=CMD, B=RSP, scalar-AWGN channel both directions, shared virtual "
+	       "clock, NO device/threads/TCP/relay)\n");
+	fflush(stdout);
+
+	// --- Parameters (env-overridable for GATE-2 determinism re-runs) ---
+	auto env_d = [](const char* k, double def)->double {
+		const char* e = std::getenv(k); return (e && *e) ? atof(e) : def; };
+	auto env_i = [](const char* k, long def)->long {
+		const char* e = std::getenv(k); return (e && *e) ? atol(e) : def; };
+
+	const double snr3k_db   = env_d("MERCURY_SIM2_SNR3K", 900.0);   // 900 = clean
+	const unsigned seed     = (unsigned)env_i("MERCURY_SIM2_SEED", 12345);
+	const long max_iters    = env_i("MERCURY_SIM2_MAXITERS", 60000);
+	const int  start_cfg    = (int)env_i("MERCURY_SIM2_CFG", ROBUST_0);
+	const bool robust       = env_i("MERCURY_SIM2_ROBUST", 1) != 0;
+	const char* payload     = "MERCURY-2INST-HELLO";
+	const int  payload_len  = (int)strlen(payload);
+
+	printf("[TEST-SIM-2INST] params: snr3k=%.1f seed=%u max_iters=%ld start_cfg=%d "
+	       "robust=%d payload_len=%d\n", snr3k_db, seed, max_iters, start_cfg,
+	       (int)robust, payload_len);
+	fflush(stdout);
+
+	// --- Construct two instances + two channels (one per direction) ---
+	MercuryInstance* A = new MercuryInstance();  A->tag = "A/CMD";
+	MercuryInstance* B = new MercuryInstance();  B->tag = "B/RSP";
+	sim2_setup_instance(A, COMMANDER, robust, start_cfg, seed ^ 0xA5A5u);
+	sim2_setup_instance(B, RESPONDER, robust, start_cfg, seed ^ 0x5A5Au);
+	// PHY bring-up (no TCP) — mirrors init()'s two load_configuration calls. Done
+	// here (not in the free helper) because load_configuration is a private member;
+	// a cl_arq_controller member fn can call it on ANY instance.
+	A->arq.load_configuration(A->arq.ack_configuration,  FULL,                 NO);
+	A->arq.load_configuration(A->arq.data_configuration, PHYSICAL_LAYER_ONLY,  YES);
+	B->arq.load_configuration(B->arq.ack_configuration,  FULL,                 NO);
+	B->arq.load_configuration(B->arq.data_configuration, PHYSICAL_LAYER_ONLY,  YES);
+	bool okA = A->ts.data_container.Nofdm * A->ts.data_container.interpolation_rate > 0;
+	bool okB = B->ts.data_container.Nofdm * B->ts.data_container.interpolation_rate > 0;
+	check(okA && okB, "S1 both instances brought up (PHY + buffers, no TCP)");
+
+	cl_sim_awgn ch_a2b(((uint64_t)seed << 1) | 1u, snr3k_db);   // A->B
+	cl_sim_awgn ch_b2a(((uint64_t)seed << 1) | 0u, snr3k_db);   // B->A
+
+	// --- Engage the SHARED virtual clock + the TCP skip gate ---
+	sim_clock_set_enabled(1);
+	arq_set_sim_inproc_skip_tcp(true);
+	check(sim_clock_enabled() != 0, "S2 shared virtual clock engaged");
+
+	// --- Step-pump context + scratch (>= 2 symbols: move buffer + prep buffer;
+	//     allocate 3x sp_max for headroom). The pump holds BOTH instances + BOTH
+	//     channels so it can co-routine-drive the peer during the active wait. ---
+	int sp_max = A->ts.data_container.Nofdm * A->ts.data_container.interpolation_rate;
+	int sp_b   = B->ts.data_container.Nofdm * B->ts.data_container.interpolation_rate;
+	if (sp_b > sp_max) sp_max = sp_b;
+	SimInproc2Ctx pump;
+	pump.sp_max  = sp_max;
+	pump.scratch = (double*)malloc((size_t)sp_max * sizeof(double) * 3);
+	pump.ch_tx2rx = &ch_a2b;   // initial (overwritten each half-step)
+	pump.ch_rx2tx = &ch_b2a;
+	// Per-direction WIRE rings (§10.5): a2b (A->B) and b2a (B->A). Sized like the
+	// audio rings so a full frame fits in flight.
+	uint8_t* wmem_a2b = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	uint8_t* wmem_b2a = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t wire_a2b = circular_buf_init(wmem_a2b, AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t wire_b2a = circular_buf_init(wmem_b2a, AUDIO_PAYLOAD_BUFFER_SIZE);
+	clear_buffer(wire_a2b); clear_buffer(wire_b2a);
+	pump.wire_t2r = wire_a2b;   // initial (overwritten each half-step)
+	pump.wire_r2t = wire_b2a;
+	arq_set_sim_inproc_pump(sim_inproc_pump_2, &pump);
+	check(pump.scratch != nullptr && wire_a2b != nullptr && wire_b2a != nullptr,
+	      "S3 step-pump + wires installed");
+
+	// --- Drive the handshake via the REAL process_user_command (no TCP) ---
+	// B first: MYCALL + LISTEN ON (loads init_configuration, RESPONDER/LISTENING).
+	sim2_activate(B);
+	B->arq.process_user_command("MYCALL TESTB");
+	B->arq.process_user_command("LISTEN ON");
+	// A: MYCALL + CONNECT TESTA TESTB (COMMANDER/CONNECTING).
+	sim2_activate(A);
+	A->arq.process_user_command("MYCALL TESTA");
+	A->arq.process_user_command("CONNECT TESTA TESTB");
+	check(B->arq.link_status == LISTENING, "S4 B is LISTENING after LISTEN ON");
+	check(A->arq.link_status == CONNECTING, "S5 A is CONNECTING after CONNECT");
+
+	// --- Stage the test payload into A's TX FIFO (== the TCP data socket push) ---
+	A->arq.fifo_buffer_tx.push((char*)payload, payload_len);
+
+	// --- Lockstep step loop (§3): A.process_main -> ch_a2b -> B.cap,
+	//     B.process_main -> ch_b2a -> A.cap, shared clock advanced by the pump. ---
+	bool connected_seen = false;
+	long iters = 0;
+	int  rx_have = 0;
+	char rx_buf[256] = {0};
+
+	const bool dbg = (getenv("MERCURY_SIM2_DBG") != nullptr);
+	uint64_t t0 = sim_clock_now_samples();
+	for (; iters < max_iters; iters++)
+	{
+		if (dbg && (iters % 200 == 0)) {
+			printf("[SIM2-DBG] it=%ld A.link=%d A.conn=%d B.link=%d B.conn=%d "
+			       "B.cap=%zu B.ftr=%d B.dr=%d A.cap=%zu A.play=%zu B.play=%zu hail_det=%d\n",
+			       iters, A->arq.link_status, A->arq.connection_status,
+			       B->arq.link_status, B->arq.connection_status,
+			       size_buffer(B->audio.cap),
+			       (int)B->ts.data_container.frames_to_read,
+			       (int)B->ts.data_container.data_ready,
+			       size_buffer(A->audio.cap), size_buffer(A->audio.play),
+			       size_buffer(B->audio.play), B->arq.hail_detected);
+			fflush(stdout);
+		}
+		// --- A's half-step (tx=A, rx=B; the pump co-routine-drives B in A's waits,
+		//     and delivers B's reply into A during A's listen waits — §10.5). ---
+		pump.tx = A; pump.rx = B;
+		pump.ch_tx2rx = &ch_a2b; pump.ch_rx2tx = &ch_b2a;
+		pump.wire_t2r = wire_a2b; pump.wire_r2t = wire_b2a;
+		sim2_activate(A);
+		A->arq.process_main();
+		// Catch any A TX queued without hitting a wait this tick: drain to wire +
+		// deliver to B. Also deliver any reply waiting in b2a into A if A is now
+		// idle (A.play empty post-process_main).
+		sim2_drain_to_wire(A, &ch_a2b, wire_a2b, &pump);
+		sim2_deliver_from_wire(B, wire_a2b, &pump);
+		if (size_buffer(A->audio.play) == 0)
+			sim2_deliver_from_wire(A, wire_b2a, &pump);
+
+		// --- B's half-step (tx=B, rx=A; symmetric). ---
+		pump.tx = B; pump.rx = A;
+		pump.ch_tx2rx = &ch_b2a; pump.ch_rx2tx = &ch_a2b;
+		pump.wire_t2r = wire_b2a; pump.wire_r2t = wire_a2b;
+		sim2_activate(B);
+		B->arq.process_main();
+		sim2_drain_to_wire(B, &ch_b2a, wire_b2a, &pump);
+		sim2_deliver_from_wire(A, wire_b2a, &pump);
+		if (size_buffer(B->audio.play) == 0)
+			sim2_deliver_from_wire(B, wire_a2b, &pump);
+
+		if (!connected_seen &&
+		    (A->arq.link_status == CONNECTED || B->arq.link_status == CONNECTED))
+			connected_seen = true;
+
+		// Drain delivered bytes from B's RX FIFO.
+		int avail = B->arq.fifo_buffer_rx.get_size() - B->arq.fifo_buffer_rx.get_free_size();
+		if (avail > 0 && rx_have < (int)sizeof(rx_buf) - 1)
+		{
+			int got = B->arq.fifo_buffer_rx.pop(rx_buf + rx_have,
+			              std::min(avail, (int)sizeof(rx_buf) - 1 - rx_have));
+			if (got > 0) rx_have += got;
+		}
+
+		if (rx_have >= payload_len) break;   // delivered
+	}
+	uint64_t t1 = sim_clock_now_samples();
+	double sim_ms = (t1 - t0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+
+	rx_buf[rx_have] = '\0';
+	printf("[TEST-SIM-2INST] loop done: iters=%ld sim_ms=%.0f connected=%d "
+	       "A.link=%d B.link=%d rx_have=%d rx=\"%s\"\n", iters, sim_ms,
+	       (int)connected_seen, A->arq.link_status, B->arq.link_status,
+	       rx_have, rx_buf);
+	printf("[TEST-SIM-2INST] pump: calls=%lld looped=%lld idle=%lld clock=%lld\n",
+	       pump.pump_calls, pump.looped_samples, pump.idle_samples, pump.clock_samples);
+	fflush(stdout);
+
+	// --- G-SMOKE asserts ---
+	check(connected_seen, "G-SMOKE: 2-instance CONNECT completed (no deadlock, single thread)");
+	check(rx_have >= payload_len && memcmp(rx_buf, payload, payload_len) == 0,
+	      "G-SMOKE: payload delivered B<-A byte-correct (RX bytes match TX)");
+	check(iters < max_iters, "G-SMOKE: terminated before iteration cap (no hang)");
+
+	// --- Teardown ---
+	arq_set_sim_inproc_pump(nullptr, nullptr);
+	arq_set_sim_inproc_skip_tcp(false);
+	sim_clock_set_enabled(0);
+	if (pump.scratch) free(pump.scratch);
+	free(wire_a2b->buffer); circular_buf_free(wire_a2b);
+	free(wire_b2a->buffer); circular_buf_free(wire_b2a);
+	// Restore globals to a clean null state (this run owned them).
+	capture_buffer = nullptr; playback_buffer = nullptr;
+#if defined(_WIN32)
+	capture_prep_mutex = NULL;
+#endif
+	A->audio.free_all();
+	B->audio.free_all();
+	delete A; delete B;
+
+	printf("[TEST-SIM-2INST] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }

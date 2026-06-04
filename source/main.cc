@@ -1737,6 +1737,21 @@ start_modem:
     // timing. See fact-documents/single-process-sim-refactor.md. Exits rc.
     if (telecom_system.operation_mode == SIM_INPROC)
     {
+        // §10.5: with MERCURY_SIM_2INST=1 (or --sim-2inst, parsed earlier into
+        // the same env-style toggle) run the 2-INSTANCE lockstep stepper; default
+        // runs the single-instance Stage-2 GO/NO-GO prototype (preserved as the
+        // regression). Both are additive, in-process, no device/TCP/threads.
+        const char* two = getenv("MERCURY_SIM_2INST");
+        bool run_2inst = (two && *two && *two != '0');
+        if (run_2inst)
+        {
+            printf("Mode selected: SIM_INPROC (2-instance lockstep stepper)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_2();
+            printf("[FLAG] SIM_INPROC 2-instance complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            return rc;
+        }
         printf("Mode selected: SIM_INPROC (in-process self-loopback prototype)\n");
         fflush(stdout);
         cl_arq_controller ARQ;

@@ -136,6 +136,19 @@ void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx)
 	g_sim_inproc_pump_ctx = ctx;
 }
 
+// SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5/§10.7-item-4).
+// process_main()'s top blocks poll tcp_socket_control / tcp_socket_data (accept,
+// recv, transmit). The 2-instance stepper binds NO socket and injects user
+// commands + data DIRECTLY (process_user_command + fifo_buffer_*), so those polls
+// would syscall on uninit'd sockets (accept(fd=0) → spam + churn). When this flag
+// is set (ONLY while the 2-instance stepper runs) process_main skips the three TCP
+// blocks. Default false → production + the single-instance Stage-2 prototype +
+// the paced sim are byte-identical (the single-instance prototype drives
+// send_batch directly, never process_main, so it does not need this either).
+static bool g_sim_inproc_skip_tcp = false;
+void arq_set_sim_inproc_skip_tcp(bool on) { g_sim_inproc_skip_tcp = on; }
+bool arq_sim_inproc_skip_tcp()            { return g_sim_inproc_skip_tcp; }
+
 // Single place the step-pump is invoked from inside the spin loops. When no
 // pump is installed this is exactly the prior body: sim_spin_sleep() under the
 // virtual clock, msleep(1) on the production wall-clock path.
@@ -2687,6 +2700,12 @@ void cl_arq_controller::process_main()
 {
 	std::string command="";
 
+	// §10.5: the 2-instance SIM_INPROC stepper binds NO socket and injects user
+	// commands + data directly (process_user_command + fifo_buffer_*). Skip the
+	// TCP control + data poll blocks in that mode. Default false (gate cleared) →
+	// production + paced sim run the verbatim blocks → byte-identical.
+	if (!arq_sim_inproc_skip_tcp())
+	{
 	if (tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
 	{
 		// Mark that we had a control connection
@@ -2872,6 +2891,7 @@ void cl_arq_controller::process_main()
 			tcp_socket_data.timer.start();
 		}
 	}
+	}  // §10.5: end of the (skippable) TCP control + data poll blocks
 
 	// Signal measurement when idle: measure_signal_only() uses FIR_rx_time_sync,
 	// the same filter that receive_byte() uses for preamble detection. Running both
