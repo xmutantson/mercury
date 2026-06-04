@@ -128,6 +128,39 @@ static inline void drain_playback_wait()
 	}
 }
 
+// SIM virtual-clock guard-sleep (sim-arq-channel.md §11, Q3 STEP 3).
+//
+// The ACK-turnaround "Waiting Nms" guards and the RX_MUTE_GUARD_MS
+// capture-mute windows are FIXED-DURATION sleeps (not condition spins): they
+// hold real wall time on EVERY half-duplex turnaround to cover the radio's
+// PTT TX->RX switch + the capture-flush settle. Under -x sim the relay-stamped
+// shared clock (§10.5b) already couples the two peers' virtual time to actual
+// channel-chunk arrival, so the guard's PURPOSE (don't transmit the ACK before
+// the radio has switched / the capture buffer has flushed) is satisfied by the
+// channel coupling, NOT by burning wall time. So in sim we elapse the SAME ms
+// in VIRTUAL time (spin a fresh cl_timer to the target, exactly like
+// ptt_busy_wait) and let the faster-than-real-time clock run them out cheaply.
+//
+// PRODUCTION SAFETY: when sim is disabled this is byte-identical to the stock
+// `msleep(ms)` it replaced (the only other branch). Mirrors ptt_busy_wait's
+// gate. Non-positive ms is a no-op in both paths (msleep(0)/timer already past).
+static inline void sim_guard_sleep(int ms)
+{
+	if (ms <= 0)
+		return;
+	if (sim_clock_enabled())
+	{
+		cl_timer guard;
+		guard.start();
+		while (guard.get_elapsed_time_ms() < ms)
+			sim_spin_sleep();
+	}
+	else
+	{
+		msleep(ms);
+	}
+}
+
 static const int RX_MUTE_GUARD_MS = 50;
 
 cl_arq_controller::cl_arq_controller()
@@ -3988,7 +4021,7 @@ void cl_arq_controller::send_ack_pattern()
 			printf("[TX-ACK-PAT] Waiting %dms (remaining=%dsym delay=%dsym buf=%dsym frame=%dsym ptt_off=%d ptt_on=%d)\n",
 				wait_ms, remaining_sym, delay_sym, buf_sym, frame_sym, ptt_off_delay_ms, ptt_on_delay_ms);
 			fflush(stdout);
-			msleep(wait_ms);
+			sim_guard_sleep(wait_ms);
 		}
 	}
 	else
@@ -4001,7 +4034,7 @@ void cl_arq_controller::send_ack_pattern()
 		printf("[TX-ACK-PAT] MFSK guard %dms (ptt_off=%d, ptt_on=%d)\n",
 			wait_ms, ptt_off_delay_ms, ptt_on_delay_ms);
 		fflush(stdout);
-		msleep(wait_ms);
+		sim_guard_sleep(wait_ms);
 	}
 
 	printf("[TX-ACK-PAT] Guard done at t=%dms\n", (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
@@ -4086,7 +4119,7 @@ void cl_arq_controller::send_ack_pattern()
 	// Flushing now lets the capture thread receive clean audio during
 	// ptt_off_delay, giving 200ms+ margin instead of potentially negative.
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_guard_sleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -4144,7 +4177,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	if(is_robust_config(current_configuration))
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
-		msleep(wait_ms);
+		sim_guard_sleep(wait_ms);
 	}
 
 	ptt_on();
@@ -4208,7 +4241,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 
 	// Same flush sequence as send_ack_pattern
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_guard_sleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -4595,7 +4628,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	if(is_robust_config(current_configuration))
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
-		msleep(wait_ms);
+		sim_guard_sleep(wait_ms);
 	}
 
 	ptt_on();
@@ -4676,7 +4709,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	// Same flush sequence as send_ack_pattern / send_ack_pattern_with_snr
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_guard_sleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
@@ -4879,7 +4912,7 @@ void cl_arq_controller::send_break_pattern()
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_guard_sleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -4983,7 +5016,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	if(is_robust_config(self->current_configuration))
 	{
 		int wait_ms = self->ptt_off_delay_ms + self->ptt_on_delay_ms;
-		msleep(wait_ms);
+		sim_guard_sleep(wait_ms);
 	}
 
 	self->ptt_on();
@@ -5061,7 +5094,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 
 	// Same capture-flush sequence as send_mfsk_ack_sack:4406-4429.
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_guard_sleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
@@ -5406,7 +5439,7 @@ void cl_arq_controller::send_hail_pattern()
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_guard_sleep(RX_MUTE_GUARD_MS);
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;

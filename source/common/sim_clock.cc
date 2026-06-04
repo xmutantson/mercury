@@ -30,9 +30,29 @@ extern "C" void sim_clock_set_enabled(int enabled)
 
 extern "C" void sim_clock_add_samples(uint64_t n)
 {
-    // Single producer (the RX bridge via rx_transfer). fetch_add keeps it
-    // correct even if a future caller adds a second producer.
+    // ADDITIVE producer. NO LONGER on the live -x sim path (the relay-stamped
+    // shared clock advances via sim_clock_set_samples on RX-bridge arrival).
+    // Retained for the --test-sim-clock additive case and the disabled path.
+    // fetch_add keeps it correct if a future caller adds a second producer.
     g_sim_samples.fetch_add(n, std::memory_order_relaxed);
+}
+
+extern "C" void sim_clock_set_samples(uint64_t n)
+{
+    // Relay-stamped shared clock (sim-arq-channel.md §10.5b): adopt the relay's
+    // authoritative monotonic per-direction sample index. CAS-max so a chunk
+    // that races in slightly out of order (two RX bridges, two directions) can
+    // never rewind virtual time — cl_timer deltas must stay non-negative. In
+    // practice there is a single live producer per process (this peer's RX
+    // bridge), but max() is correct under any ordering.
+    uint64_t cur = g_sim_samples.load(std::memory_order_relaxed);
+    while (n > cur &&
+           !g_sim_samples.compare_exchange_weak(cur, n,
+               std::memory_order_relaxed, std::memory_order_relaxed))
+    {
+        // cur is reloaded by compare_exchange_weak on failure; loop until we
+        // either win the CAS or observe n <= cur (a newer/equal stamp landed).
+    }
 }
 
 extern "C" uint64_t sim_clock_now_samples(void)

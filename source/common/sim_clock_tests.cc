@@ -132,6 +132,43 @@ void test_disabled_uses_wall_clock()
              "of virtual time that must be ignored)", elapsed_ms);
 }
 
+// (a.7) AUTHORITATIVE + MONOTONIC setter (the Q3 relay-stamped live path).
+//   sim_clock_set_samples adopts the relay's absolute per-direction sample
+//   count. After set(96000) the clock reads 2000 ms; a STALE set(48000) must
+//   NOT rewind it (still 2000 ms); set(144000) advances to 3000 ms. This is the
+//   invariant cl_timer consumers rely on: virtual time is monotonic
+//   non-decreasing, so a slightly-out-of-order or duplicated relay chunk can
+//   never produce a negative elapsed delta.
+//
+//   NOTE: the cross-peer system property — "the CMD ACK-timeout window and the
+//   RSP reply now share ONE time base, so the commander's virtual ACK timeout
+//   cannot expire ahead of the channel that carries the reply" — is a SYSTEM
+//   property validated by the harness `repro_overclimb_collapse` flag
+//   (sim-arq-channel.md §10 ladder), not by this in-process unit test.
+void test_set_samples_authoritative_monotonic()
+{
+    SimEnableGuard g;
+    // g_sim_samples is only ever ADDED to (no zeroing API by design), so prior
+    // tests leave it at some baseline B. set_samples is ABSOLUTE, so we phrase
+    // the test as DELTAS relative to a baseline captured AFTER the timer start,
+    // using absolute targets above B. (A non-monotonic implementation would let
+    // the stale set rewind, producing a NEGATIVE/zero elapsed delta.)
+    uint64_t base = sim_clock_now_samples();
+    cl_timer t;
+    t.start();                                    // startTime captured at base
+    sim_clock_set_samples(base + 96000);          // +2000 ms absolute -> elapsed 2000
+    int after_set = t.get_elapsed_time_ms();
+    sim_clock_set_samples(base + 48000);          // STALE (< current) -> ignored
+    int after_stale = t.get_elapsed_time_ms();
+    sim_clock_set_samples(base + 144000);         // +3000 ms absolute -> elapsed 3000
+    int after_adv = t.get_elapsed_time_ms();
+    // Also assert the absolute sample count never rewound on the stale set.
+    SC_CHECK(after_set == 2000 && after_stale == 2000 && after_adv == 3000,
+             "a7_set_samples_authoritative_monotonic",
+             "expected 2000/2000/3000 ms (set/stale-ignored/advance), got "
+             "%d/%d/%d ms", after_set, after_stale, after_adv);
+}
+
 // (a.6) enabled()/set_enabled() flag round-trips and leaves FALSE at the end.
 void test_flag_roundtrip()
 {
@@ -157,6 +194,7 @@ int run_sim_clock_tests()
     test_now_ns_mapping_exact();
     test_disabled_uses_wall_clock();
     test_flag_roundtrip();
+    test_set_samples_authoritative_monotonic();
     // Safety: leave production default no matter what.
     sim_clock_set_enabled(0);
     printf("=== sim_clock tests: %d failed ===\n", g_failed);

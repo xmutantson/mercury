@@ -1147,20 +1147,39 @@ int main(int argc, char *argv[])
                 operation_mode = TX_WAV;
             break;
         case 'x':
+            // AUDIO-SAFETY GUARD (sim-arq-channel.md §11): an UNRECOGNIZED -x
+            // argument used to fall through this if-ladder leaving audio_system
+            // at its -1 default, which the block at ":if (audio_system == -1)"
+            // then silently promoted to WASAPI -> the DEFAULT render device.
+            // A typo (-x sims, -x wsapi, -x simm) therefore LEAKED modem tones
+            // to the machine's physical default output. Now we track whether
+            // the argument matched a KNOWN backend and HARD-FAIL (exit non-zero)
+            // if it did not, so a slip fails loudly instead of leaking audio.
+            // The bare "no -x at all" default path is untouched: it never enters
+            // this case, so audio_system stays -1 and the OS-appropriate default
+            // is selected below as before.
             if (!strcmp(optarg, "alsa"))
                 audio_system = AUDIO_SUBSYSTEM_ALSA;
-            if (!strcmp(optarg, "pulse"))
+            else if (!strcmp(optarg, "pulse"))
                 audio_system = AUDIO_SUBSYSTEM_PULSE;
-            if (!strcmp(optarg, "dsound"))
+            else if (!strcmp(optarg, "dsound"))
                 audio_system = AUDIO_SUBSYSTEM_DSOUND;
-            if (!strcmp(optarg, "wasapi"))
+            else if (!strcmp(optarg, "wasapi"))
                 audio_system = AUDIO_SUBSYSTEM_WASAPI;
-            if (!strcmp(optarg, "oss"))
+            else if (!strcmp(optarg, "oss"))
                 audio_system = AUDIO_SUBSYSTEM_OSS;
-            if (!strcmp(optarg, "coreaudio"))
+            else if (!strcmp(optarg, "coreaudio"))
                 audio_system = AUDIO_SUBSYSTEM_COREAUDIO;
-            if (!strcmp(optarg, "sim"))
+            else if (!strcmp(optarg, "sim"))
                 audio_system = AUDIO_SUBSYSTEM_SIM;
+            else {
+                fprintf(stderr,
+                    "FATAL: -x '%s' is not a known audio backend. "
+                    "Known: alsa, pulse, dsound, wasapi, oss, coreaudio, sim. "
+                    "Refusing to fall back to the default device (audio-safety "
+                    "guard, sim-arq-channel.md §11).\n", optarg);
+                exit(2);
+            }
             break;
         case 'g':
             gear_shift_mode = GEAR_SHIFT_ENABLED;

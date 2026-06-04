@@ -1626,21 +1626,52 @@ void *sim_rx_bridge_thread(void *unused)
 	if (shutdown_) return NULL;
 
 	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
-	double *chunk = (double *)malloc(chunk_bytes);
+	double  *chunk = (double *)malloc(chunk_bytes);
+	uint8_t  stamp_buf[8];
+	int      first_chunk = 1;
 
 	while (!shutdown_) {
+		// Wire format (sim-arq-channel.md §10.5b): the relay prepends an 8-byte
+		// LE monotonic per-direction virtual-sample index (the END index of this
+		// chunk, = samples carried so far in this direction) ahead of the
+		// CHUNK_BYTES payload. Read the stamp first, then the payload. Both ends
+		// change in one commit so the framing cannot drift.
+		if (sim_recv_all(sim_sock, stamp_buf, 8) != 0) {
+			printf("[SIM] RX bridge stamp recv failed (relay closed?)\n");
+			break;
+		}
 		if (sim_recv_all(sim_sock, (uint8_t *)chunk, chunk_bytes) != 0) {
 			printf("[SIM] RX bridge recv failed (relay closed?)\n");
 			break;
 		}
+		uint64_t stamp = (uint64_t)stamp_buf[0]        | ((uint64_t)stamp_buf[1] << 8)
+		               | ((uint64_t)stamp_buf[2] << 16) | ((uint64_t)stamp_buf[3] << 24)
+		               | ((uint64_t)stamp_buf[4] << 32) | ((uint64_t)stamp_buf[5] << 40)
+		               | ((uint64_t)stamp_buf[6] << 48) | ((uint64_t)stamp_buf[7] << 56);
+		if (first_chunk) {
+			// One-time sanity log to catch a stale relay/binary wire mismatch
+			// immediately (a non-monotonic-looking first stamp ~= framing desync).
+			printf("[SIM] RX bridge first vstamp=%llu\n", (unsigned long long)stamp);
+			fflush(stdout);
+			first_chunk = 0;
+		}
+		// Adopt the shared channel clock the instant the chunk ARRIVES (not when
+		// the prep thread later demods it via rx_transfer). This couples THIS
+		// peer's virtual time to relay-chunk arrival in THIS direction, so the
+		// commander's ACK-timeout window and the responder's reply share one
+		// timeline (§10.4/§10.5b). Idempotent/monotonic: a silence flood can no
+		// longer multiply virtual time because we SET to the relay's count.
+		if (sim_clock_enabled())
+			sim_clock_set_samples(stamp);
+
 		// Backpressure: if the prep thread is behind, spin briefly rather
 		// than overflow capture_buffer (mirrors the device-full guard).
 		// In sim mode the short-sleep pace (sim_paced_wait) DON'T use the
-		// wall-clock spin cap — virtual time only advances when the prep thread
-		// consumes via rx_transfer, so a full capture_buffer is guaranteed to
-		// drain as soon as we hand the core to the prep thread; the 5000-spin
-		// "~10 s" cap is sized for the production 2 ms sleep and would trip far
-		// too early under the sub-ms sim pace and drop a chunk.
+		// wall-clock spin cap — virtual time advances on chunk ARRIVAL above, so
+		// a full capture_buffer is guaranteed to drain as soon as we hand the
+		// core to the prep thread; the 5000-spin "~10 s" cap is sized for the
+		// production 2 ms sleep and would trip far too early under the sub-ms sim
+		// pace and drop a chunk.
 		int spins = 0;
 		while (!shutdown_ &&
 		       circular_buf_free_size(capture_buffer) < (size_t)chunk_bytes) {
@@ -1679,15 +1710,17 @@ int rx_transfer(double *buffer, size_t len)
 
 	read_buffer(capture_buffer, buffer_internal, buffer_size_bytes);
 
-	// SIM virtual clock: every double the modem pulls off the RX boundary is
-	// one sample of channel time. Advancing here (and ONLY here) makes virtual
-	// time track the modem's demod cadence — the RX bridge feeds capture_buffer
-	// as fast as the relay delivers, so the modem reads it as fast as it can
-	// decode, and the control-loop timers advance with it. No-op (one branch +
-	// relaxed load) when sim is disabled, so production rx_transfer is
-	// unaffected. See include/common/sim_clock.h.
-	if (sim_clock_enabled())
-		sim_clock_add_samples((uint64_t) len);
+	// SIM virtual clock (Q3, sim-arq-channel.md §10.5b): under the relay-stamped
+	// shared clock virtual time is SET by sim_rx_bridge_thread on chunk ARRIVAL
+	// from the relay stamp, NOT advanced here on demod consumption. Advancing
+	// here too would DOUBLE-count virtual time (once on arrival, once on demod)
+	// and re-introduce the §9.6 idle-silence warp. So the sim advance is removed
+	// from this site. PRODUCTION SAFETY: the old line was
+	//   if (sim_clock_enabled()) sim_clock_add_samples(len);
+	// which production (-x wasapi/alsa) NEVER entered (sim_clock_enabled()==0),
+	// so removing the body of that already-not-taken branch leaves the
+	// production rx_transfer path byte-identical. sim_clock_add_samples is
+	// retained (header API + --test-sim-clock) but no longer called live.
 
     return 0;
 }
