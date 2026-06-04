@@ -501,6 +501,20 @@ int validate_audio_config(const char *capture_dev, const char *playback_dev, int
 
 void *radio_playback_thread(void *device_ptr)
 {
+	// GUARD 1: hard abort-on-device-open in SIM mode. In -x sim the device-free
+	// SIM backend (audioio_init_internal, AUDIO_SUBSYSTEM_SIM branch) returns
+	// early and NEVER starts this thread. If a stale/wrong binary or a future
+	// regression ever spawns radio_playback_thread under -x sim, this guard
+	// fires HERE — the very first statement, BEFORE any audio->init/open/write
+	// or any sample render — so the leak that played modem tones to the user's
+	// physical speakers is structurally impossible. The marker string
+	// "[SIM-AUDIO-GUARD]" is what the harness (tools/sim_arq_channel.py, GUARD 2)
+	// greps the binary for to refuse running a non-guard build.
+	if (audio_subsystem == AUDIO_SUBSYSTEM_SIM) {
+		fprintf(stderr, "FATAL [SIM-AUDIO-GUARD]: -x sim attempted to open an audio device — aborting before any audio renders\n");
+		fflush(stderr);
+		abort();
+	}
     ffaudio_interface *audio;
 	int device_is_mono = 0;  // Will be set after device opens
 	int out_ch_idx = 0;
@@ -891,6 +905,19 @@ cleanup_play:
 
 void *radio_capture_thread(void *device_ptr)
 {
+	// GUARD 1: hard abort-on-device-open in SIM mode. In -x sim the device-free
+	// SIM backend (audioio_init_internal, AUDIO_SUBSYSTEM_SIM branch) returns
+	// early and NEVER starts this thread. If a stale/wrong binary or a future
+	// regression ever spawns radio_capture_thread under -x sim, this guard fires
+	// HERE — the very first statement, BEFORE any audio->init/open or capture —
+	// so no audio device can be touched. See the playback-thread guard above and
+	// tools/sim_arq_channel.py (GUARD 2) which greps the binary for the marker
+	// string "[SIM-AUDIO-GUARD]".
+	if (audio_subsystem == AUDIO_SUBSYSTEM_SIM) {
+		fprintf(stderr, "FATAL [SIM-AUDIO-GUARD]: -x sim attempted to open an audio device — aborting before any audio renders\n");
+		fflush(stderr);
+		abort();
+	}
     ffaudio_interface *audio;
 	int device_is_mono = 0;  // Will be set after device opens
 	int in_ch_idx = 0;
