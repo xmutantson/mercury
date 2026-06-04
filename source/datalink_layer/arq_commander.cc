@@ -144,9 +144,26 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 // arq_commander.cc:3253) must still reach ROBUST_0, so the floor is bypassed
 // under panic and the raw target is returned unchanged.
 // See fact-documents/gearshift-start-and-recovery.md §6/§7.
+//
+// FIX-2 Option-A companion (over-climb dwell-confirm): the panic-bypass must
+// fire ONLY when the panic itself is licensed — i.e. when current_configuration
+// is at/below the proven anchor (the SAME predicate that gates break_drop_step
+// =100 at the BREAK site, arq_commander.cc:~3486). An OVER-SHOOT (current ABOVE
+// anchor on an unproven leap) that accrued two BREAKs must NOT have its anchor
+// floor bypassed here, or this method would defeat c5d67cc Component-2's floor:
+// it would return the deep raw_target unclamped and the link would collapse to
+// ROBUST_0 even though the BREAK site (FIX-2) declined to set break_drop_step
+// =100. Gating both sites with the identical predicate keeps them coherent — an
+// over-shoot routes through the anchor floor (line 152) and HOLDs at the proven
+// rung; only an at/below-anchor panic reaches ROBUST_0. Deep-cliff escape (I1)
+// preserved: at the cliff current==anchor==ROBUST_0 → idx(current) <=
+// idx(anchor) TRUE → bypass still active → reaches the floor.
 int cl_arq_controller::break_target_with_anchor(int raw_target) const
 {
-	if(breaks_since_last_data_success >= 2)
+	bool at_or_below_anchor =
+		config_ladder_index(current_configuration) <=
+		config_ladder_index(last_data_viable_config);
+	if(breaks_since_last_data_success >= 2 && at_or_below_anchor)
 		return raw_target;  // panic-jump safety net — let it reach ROBUST_0
 	if(config_ladder_index(raw_target) < config_ladder_index(last_data_viable_config))
 		return last_data_viable_config;
@@ -3483,13 +3500,42 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// success reset clears the counter; until then every consecutive
 				// BREAK bottoms out.
 				breaks_since_last_data_success++;
-				if(breaks_since_last_data_success >= 2)
+				// FIX-2 (over-climb dwell-confirm): only the ANCHOR rung (or a rung
+				// at/below the proven anchor) is allowed to panic-collapse directly
+				// to ROBUST_0. An OVER-SHOOT — current_configuration sits ABOVE
+				// last_data_viable_config because the climb leapt to an unproven
+				// rung — must NOT crater the link to the floor on two BREAKs; it
+				// routes through the anchor-floored single-step descent
+				// (break_target_with_anchor) and HOLDS at the proven rung instead.
+				// Without this gate the over-climb→collapse pathology fires: the
+				// climb over-shoots to CONFIG_15/16 on a mid cell, the unproven rung
+				// can't pass data, two BREAKs latch break_drop_step=100, and the link
+				// collapses all the way to ROBUST_0 (0.37× VARA) instead of settling
+				// at the proven sustainable config. Predicate mirrors the deep-cliff
+				// escape (I1): at the cliff current==anchor==ROBUST_0 →
+				// idx(current) <= idx(anchor) is TRUE → panic STILL fires.
+				// config_ladder_index is total-ordered over the live ladder so the
+				// comparison is well-defined for all reachable configs.
+				bool at_or_below_anchor =
+					config_ladder_index(current_configuration) <=
+					config_ladder_index(last_data_viable_config);
+				if(breaks_since_last_data_success >= 2 && at_or_below_anchor)
 				{
-					printf("[BREAK-PANIC] %d BREAKs without data success — "
-						"forcing jump to ROBUST_0 (break_drop_step=100)\n",
-						breaks_since_last_data_success);
+					printf("[BREAK-PANIC] %d BREAKs without data success at/below anchor "
+						"(cfg=%d anchor=%d) — forcing jump to ROBUST_0 (break_drop_step=100)\n",
+						breaks_since_last_data_success, current_configuration,
+						last_data_viable_config);
 					fflush(stdout);
 					break_drop_step = 100;  // clamp at floor of ladder
+				}
+				else if(breaks_since_last_data_success >= 2)
+				{
+					printf("[BREAK-PANIC] %d BREAKs without data success but OVER-SHOOT "
+						"(cfg=%d > anchor=%d) — NOT collapsing; anchor-floored descent "
+						"HOLDs at the proven rung\n",
+						breaks_since_last_data_success, current_configuration,
+						last_data_viable_config);
+					fflush(stdout);
 				}
 
 				// DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10) — anchor
@@ -6058,11 +6104,15 @@ int cl_arq_controller::test_data_anchored_promote()
 	int gotA2 = break_target_with_anchor(ROBUST_2);
 	check(gotA2 == ROBUST_2, "A2: target above anchor unchanged", gotA2, ROBUST_2);
 
-	// A3: panic-jump (breaks_since_last_data_success >= 2) BYPASSES the floor and
-	// reaches ROBUST_0 (safety net preserved).
+	// A3: panic-jump (breaks_since_last_data_success >= 2) at/below the anchor
+	// BYPASSES the floor and reaches ROBUST_0 (safety net preserved). FIX-2
+	// Option-A gates the bypass on current_configuration<=anchor; the breaking
+	// rung here is the anchor ROBUST_1 (== emergency_previous_config's tier), so
+	// set it explicitly to make the at/below-anchor precondition unambiguous.
+	current_configuration = ROBUST_1;     // breaking rung == anchor (panic licensed)
 	breaks_since_last_data_success = 2;
 	int gotA3 = break_target_with_anchor(rawA1);
-	check(gotA3 == ROBUST_0, "A3: panic bypasses floor, reaches ROBUST_0", gotA3, ROBUST_0);
+	check(gotA3 == ROBUST_0, "A3: panic at anchor bypasses floor, reaches ROBUST_0", gotA3, ROBUST_0);
 	breaks_since_last_data_success = 0;   // restore for (B)
 
 	// ---- (B) up-shifter anchor gate (real policy_evaluate_axis1) ----
@@ -6226,7 +6276,13 @@ int cl_arq_controller::test_phantom_ack_gate()
 	int got_target = break_target_with_anchor(raw_target);
 	check(raw_target == ROBUST_0, "P2d precondition: raw BREAK target is ROBUST_0",
 		raw_target, ROBUST_0);
-	check(got_target == ROBUST_0, "P2e BREAK reaches ROBUST_0 under panic (anchor bypassed)",
+	// FIX-2 Option-A: current_configuration is ROBUST_2 (set at :6235) but the
+	// anchor is ROBUST_0, so this is an OVER-SHOOT and the panic-bypass no longer
+	// fires. The link still reaches ROBUST_0 — not via the bypass but via the
+	// anchor floor itself (last_data_viable_config==ROBUST_0): raw_target ROBUST_0
+	// is not below the anchor, so the floor returns it unchanged. The safety-net
+	// reach is therefore preserved when the anchor is already the floor.
+	check(got_target == ROBUST_0, "P2e BREAK reaches ROBUST_0 (anchor floor == ROBUST_0)",
 		got_target, ROBUST_0);
 	breaks_since_last_data_success = 0;            // restore
 
@@ -6877,9 +6933,12 @@ int cl_arq_controller::test_climb_engine()
 		last_data_viable_config, CONFIG_0);
 
 	// E4 — the panic-jump bypass is PRESERVED and COMPLEMENTARY: with
-	// breaks_since_last_data_success >= 2, break_target_with_anchor returns the raw
-	// ROBUST_0 unchanged (reaches the floor immediately) regardless of the anchor.
+	// breaks_since_last_data_success >= 2 AND the breaking rung at/below the anchor
+	// (FIX-2 Option-A), break_target_with_anchor returns the raw ROBUST_0 unchanged
+	// (reaches the floor immediately). current_configuration==anchor==CONFIG_0 here
+	// (the anchor rung itself is breaking), so idx(current)<=idx(anchor) holds.
 	last_data_viable_config        = CONFIG_0;
+	current_configuration          = CONFIG_0;   // breaking rung == anchor (panic licensed)
 	breaks_since_last_data_success = 2;
 	int e_panic_target = break_target_with_anchor(ROBUST_0);
 	check(e_panic_target == ROBUST_0,
@@ -8554,16 +8613,22 @@ int cl_arq_controller::test_climb_engine()
 				q_tgt2, CONFIG_16);
 
 			// Q3: SAFETY — the breaks>=2 panic-jump still reaches the ladder floor,
-			// UNAFFECTED by the initial-step change (panic forces break_drop_step=100
-			// and break_target_with_anchor returns the raw target unclamped). WB floor
-			// is CONFIG_0. Passes before & after.
-			breaks_since_last_data_success = 2;       // panic: bypass the anchor floor
-			last_data_viable_config = CONFIG_13;      // would otherwise floor at 13
+			// FIX-2 (over-climb dwell-confirm) CHANGES this case. The breaking rung is
+			// CONFIG_16 but the proven anchor is CONFIG_13 -- an OVER-SHOOT (current ABOVE
+			// anchor on an unproven leap). Under FIX-2 Option-A the breaks>=2 panic-bypass
+			// is GATED on current_configuration<=anchor, FALSE here, so the bypass NO LONGER
+			// fires: the raw CONFIG_0 target floors UP to the anchor CONFIG_13 and the link
+			// HOLDS the proven rung instead of cratering to CONFIG_0 (pre-FIX-2 the
+			// over-climb->collapse pathology). The deep-cliff escape (current==anchor) still
+			// reaches the floor -- see A3/E4 and Part R R5/R7.
+			breaks_since_last_data_success = 2;       // panic, but at an OVER-SHOOT
+			current_configuration = CONFIG_16;        // breaking rung ABOVE the anchor
+			last_data_viable_config = CONFIG_13;      // proven anchor -- floor target
 			int q_raw3 = config_ladder_down_n(CONFIG_16, /*panic step*/100, robust_enabled);
 			int q_tgt3 = break_target_with_anchor(q_raw3);
-			check(q_tgt3 == CONFIG_0,
-				"Q3 panic-jump (breaks>=2, step=100) still floors to CONFIG_0 (crash escape intact, step-independent)",
-				q_tgt3, CONFIG_0);
+			check(q_tgt3 == CONFIG_13,
+				"Q3 FIX-2: panic at an OVER-SHOOT (cfg16 > anchor13) HOLDS at anchor CONFIG_13, does NOT collapse to CONFIG_0",
+				q_tgt3, CONFIG_13);
 
 			// Q4: the :222/:321 doubling escalation is preserved — one doubling round
 			// from the POST-FIX initial step yields a 2-rung drop (CONFIG_16->CONFIG_14),
@@ -8653,6 +8718,11 @@ int cl_arq_controller::test_climb_engine()
 			auto ladder_down_floored = [&](int current, int anchor, int breaks) -> int {
 				last_data_viable_config = anchor;
 				breaks_since_last_data_success = breaks;
+				// FIX-2 Option-A: break_target_with_anchor now reads current_configuration
+				// for the at/below-anchor panic-bypass gate, mirroring the live BREAK
+				// site (where current_configuration == the breaking rung). Set it to
+				// `current` so this unit faithfully replays the production reference.
+				current_configuration = current;
 				int raw_down = config_ladder_down(current, robust_enabled);
 				int floored  = break_target_with_anchor(raw_down);
 				if(config_ladder_index(floored) > config_ladder_index(current))
@@ -8713,6 +8783,168 @@ int cl_arq_controller::test_climb_engine()
 				check(r5 == CONFIG_3,
 					"R5 SAFETY: under breaks>=2 panic the LADDER-DOWN floor is bypassed (CONFIG_3), descent toward the floor preserved",
 					r5, CONFIG_3);
+			}
+
+			// ============================================================
+			// R6 - FIX-1 (close the over-climb AUTHORITY GAP). The keystone:
+			// supershift_retrigger_target() opens with if(optimizer_owns) return
+			// snr_ideal; which BYPASSES the Component-1 leap_cap. On an uncalibrated/
+			// noisy channel ABOVE the calibrated floor config, the INDEX-ONLY pre-fix
+			// optimizer_is_in_control() returned TRUE (so optimizer_owns=true -> the cap
+			// is bypassed -> the climb over-shoots UNBOUNDED to CONFIG_16) WHILE
+			// opt_evaluate_batch_end() simultaneously RECUSED on the same channel - the
+			// authority gap. FIX-1 mirrors that channel recusal into
+			// optimizer_is_in_control(): observed sack_rate ABOVE max_calibrated_sack_rate
+			// -> return false -> the leap_cap now BITES above CONFIG_6.
+			//
+			// FAIL-BEFORE (unfixed c5d67cc index-only predicate):
+			// optimizer_is_in_control()==true on this noisy CONFIG_8 channel ->
+			// optimizer_owns early-return -> supershift_retrigger_target returns CONFIG_16
+			// (UNBOUNDED). PASS-AFTER: optimizer_is_in_control()==false -> bounded to
+			// anchor+RETRIGGER_MAX_LEAP (CONFIG_8+4 = CONFIG_12).
+			{
+				// Prime the optimizer so the index check PASSES (current ABOVE handoff)
+				// but the channel is NOISIER than anything calibrated (sack_rate > max).
+				optimizer_disabled = false;                 // optimizer plumbing live
+				narrowband_enabled = NO;
+				robust_enabled     = YES;
+				supershift_proven_ceiling = -1;
+				rate_opt.set_test_calibration(/*min_cfg=*/CONFIG_6, /*max_sack=*/0.30, /*is_nb=*/false);
+				current_configuration = CONFIG_8;           // ABOVE the CONFIG_6 handoff -> index check passes
+				// Seed get_current_sack_rate() = 1.0 (every batch needed SACK -> noisy,
+				// worse than the 0.30 calibrated ceiling). One window slot, sack used.
+				for(int i = 0; i < OPTIMIZER_WINDOW_SIZE; i++) opt_batch_sack_count[i] = 0;
+				opt_batch_sack_count[0] = 1;
+				opt_window_head  = 1;
+				opt_window_count = 1;
+
+				bool r6_owns = optimizer_is_in_control();
+				check(r6_owns == false,
+					"R6a FIX-1: optimizer_is_in_control() RECUSES on a noisy channel (sack_rate>max_calibrated) even ABOVE the handoff config",
+					r6_owns ? 1 : 0, 0);
+				check(get_current_sack_rate() > rate_opt.max_calibrated_sack_rate(false),
+					"R6b precondition: the seeded sack_rate (1.0) exceeds max_calibrated_sack_rate (0.30) - the noisy-channel discriminator",
+					(int)(get_current_sack_rate()*100), (int)(rate_opt.max_calibrated_sack_rate(false)*100));
+
+				// Feed the REAL optimizer_is_in_control() into the REAL retrigger helper.
+				// anchor = CONFIG_8 (a PROVEN OFDM rung -> is_ofdm_config true -> the section-15
+				// high_confidence gate is OPEN, so the cap is the only thing bounding it).
+				int r6_target = supershift_retrigger_target(/*snr_ideal=*/CONFIG_16,
+					/*snr_uplink=*/snr_uplink_from_suffix(20.0f), /*anchor=*/CONFIG_8,
+					/*optimizer_owns=*/optimizer_is_in_control(), /*robust_en=*/true, /*nb=*/false);
+				int r6_leap_cap = config_ladder_up_n(CONFIG_8, RETRIGGER_MAX_LEAP, true, false); // CONFIG_12
+				check(r6_target == r6_leap_cap,
+					"R6c PASS-AFTER: with the authority gap CLOSED the leap_cap BITES above CONFIG_6 - bounded to anchor+MAX_LEAP (CONFIG_12), not CONFIG_16",
+					r6_target, r6_leap_cap);
+				check(config_ladder_index(r6_target) < config_ladder_index(CONFIG_16),
+					"R6d PASS-AFTER: the bounded target lands STRICTLY below the unbounded CONFIG_16 over-shoot the early-return would have allowed",
+					config_ladder_index(r6_target), config_ladder_index(CONFIG_16));
+
+				// R6e FAIL-BEFORE proof (model the pre-fix index-only predicate as
+				// optimizer_owns=true): the early-return bypasses the cap -> CONFIG_16
+				// (the unbounded over-climb). This is the behavior FIX-1 eliminates.
+				int r6_prefix = supershift_retrigger_target(/*snr_ideal=*/CONFIG_16,
+					/*snr_uplink=*/snr_uplink_from_suffix(20.0f), /*anchor=*/CONFIG_8,
+					/*optimizer_owns=*/true, /*robust_en=*/true, /*nb=*/false);
+				check(r6_prefix == CONFIG_16,
+					"R6e FAIL-BEFORE proof: the index-only predicate (optimizer_owns=true) bypasses the cap and over-shoots to CONFIG_16 (the authority-gap leak)",
+					r6_prefix, CONFIG_16);
+
+				// Restore optimizer-disabled state for the remainder of the suite.
+				optimizer_disabled = true;
+				opt_window_head = 0;
+				opt_window_count = 0;
+				for(int i = 0; i < OPTIMIZER_WINDOW_SIZE; i++) opt_batch_sack_count[i] = 0;
+			}
+
+			// ============================================================
+			// R7 - FIX-2 (dwell-confirm; gate the breaks>=2 panic latch on the anchor).
+			// An OVER-SHOOT config (current ABOVE the proven anchor on an unproven leap)
+			// must HOLD at the proven rung when it BREAKs, not panic-collapse to ROBUST_0;
+			// only an AT/BELOW-anchor BREAK is allowed to set break_drop_step=100. R7
+			// drives the REAL break-site decision via a local mirror of the gate predicate
+			// plus the REAL break_target_with_anchor recovery primitive.
+			{
+				robust_enabled = NO;           // WB clean-link session (OFDM ladder)
+				narrowband_enabled = NO;
+				optimizer_disabled = true;
+				supershift_proven_ceiling = -1;
+
+				// Local mirror of the FIX-2 break-site gate (arq_commander.cc:~3486):
+				// break_drop_step=100 is set IFF breaks>=2 AND current<=anchor. Returns the
+				// break_drop_step the panic latch WOULD assign (100 = collapse, else the
+				// normal doubling step survives, modeled as the passed normal_step).
+				auto panic_break_drop_step = [&](int current, int anchor, int breaks,
+				                                 int normal_step) -> int {
+					current_configuration = current;
+					last_data_viable_config = anchor;
+					breaks_since_last_data_success = breaks;
+					bool at_or_below_anchor =
+						config_ladder_index(current_configuration) <=
+						config_ladder_index(last_data_viable_config);
+					if(breaks_since_last_data_success >= 2 && at_or_below_anchor)
+						return 100;          // panic collapse licensed (anchor / deep-cliff)
+					return normal_step;      // over-shoot: NO collapse, normal descent
+				};
+
+				// R7a: OVER-SHOOT (current=CONFIG_15 ABOVE anchor=CONFIG_10), two BREAKs.
+				// The panic latch must NOT fire - break_drop_step stays the normal step (1).
+				int r7_overshoot_step = panic_break_drop_step(CONFIG_15, CONFIG_10, /*breaks=*/2, /*normal=*/1);
+				check(r7_overshoot_step != 100,
+					"R7a FIX-2: an OVER-SHOOT BREAK (cfg15 > anchor10, breaks>=2) does NOT latch break_drop_step=100 - no panic collapse",
+					r7_overshoot_step, 1);
+
+				// R7b: the over-shoot BREAK recovery then HOLDS at the proven anchor
+				// (CONFIG_10), NOT ROBUST_0. Faithful to the live BREAK recovery site
+				// (arq_commander.cc:229): current_configuration stays at the breaking
+				// OVER-SHOOT rung (== emergency_previous_config) until a new config loads,
+				// so it is fixed at CONFIG_15 here. Because that is ABOVE the anchor, the
+				// FIX-2 Option-A panic-bypass in break_target_with_anchor does NOT fire even
+				// with breaks>=2 -> a deep raw recovery target (panic step 100 -> ROBUST_0)
+				// floors UP to the anchor CONFIG_10. The link HOLDS the proven rung.
+				current_configuration = CONFIG_15;       // the breaking over-shoot rung (fixed)
+				last_data_viable_config = CONFIG_10;     // the proven anchor (data flowed here)
+				breaks_since_last_data_success = 2;      // two BREAKs at the over-shoot
+				// This is a robust_enabled=NO (WB) session, so the ladder FLOOR is CONFIG_0
+				// (config_ladder_down_n WB fast-path clamps at CONFIG_0); in a -R cascade the
+				// same collapse lands on ROBUST_0. Either way it is the ladder floor - the
+				// "collapse signature" FIX-2 prevents for an over-shoot.
+				int r7_raw_deep = config_ladder_down_n(CONFIG_15, /*deep*/100, robust_enabled); // CONFIG_0 (WB floor)
+				int r7_recovery = break_target_with_anchor(r7_raw_deep);
+				check(r7_raw_deep == CONFIG_0,
+					"R7b0 precondition: an unfloored deep recovery from the over-shoot would reach the ladder floor CONFIG_0 (the collapse signature)",
+					r7_raw_deep, CONFIG_0);
+				check(r7_recovery == CONFIG_10,
+					"R7b FIX-2 PASS-AFTER: the OVER-SHOOT recovery floors at the proven anchor CONFIG_10 (bypass gated off above anchor), does NOT collapse to the floor",
+					r7_recovery, CONFIG_10);
+				// FAIL-BEFORE proof: the pre-FIX-2 unconditional bypass (breaks>=2 ALWAYS
+				// returns raw_target) would have returned the deep CONFIG_0 floor here - the
+				// over-climb->collapse pathology. Model it directly.
+				int r7_prefix = (breaks_since_last_data_success >= 2)
+					? r7_raw_deep                              // pre-FIX-2: unconditional bypass
+					: r7_recovery;
+				check(r7_prefix == CONFIG_0,
+					"R7b1 FAIL-BEFORE proof: the unconditional pre-FIX-2 panic bypass would crater the over-shoot to the ladder floor CONFIG_0",
+					r7_prefix, CONFIG_0);
+
+				// R7c: ANCHOR-RUNG cliff CONTRAST - an AT-anchor BREAK (current==anchor)
+				// under the same two BREAKs DOES latch break_drop_step=100 (the deep-cliff
+				// escape I1 is preserved). This is the discriminator R7a/R7b prove the gate
+				// keys on: same panic count, OPPOSITE outcome by current-vs-anchor position.
+				int r7_anchor_step = panic_break_drop_step(ROBUST_0, ROBUST_0, /*breaks=*/2, /*normal=*/1);
+				check(r7_anchor_step == 100,
+					"R7c FIX-2 contrast: an ANCHOR-rung BREAK (current==anchor==ROBUST_0) STILL latches break_drop_step=100 - deep-cliff escape preserved",
+					r7_anchor_step, 100);
+
+				// R7d: and the anchor-rung panic recovery REACHES ROBUST_0 (break_target
+				// bypass active because current==anchor). The complementary safety net.
+				current_configuration = ROBUST_0;
+				last_data_viable_config = ROBUST_0;
+				breaks_since_last_data_success = 2;
+				int r7_anchor_recovery = break_target_with_anchor(ROBUST_0);
+				check(r7_anchor_recovery == ROBUST_0,
+					"R7d FIX-2 contrast: the anchor-rung panic recovery reaches ROBUST_0 (bypass active at/below anchor)",
+					r7_anchor_recovery, ROBUST_0);
 			}
 
 			// Restore production-default test state.

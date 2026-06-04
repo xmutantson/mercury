@@ -2052,9 +2052,28 @@ public:
   // or current_configuration is below the calibrated band.
   bool optimizer_is_in_control() const {
     if (optimizer_disabled || !rate_opt.is_enabled()) return false;
-    int handoff = rate_opt.min_calibrated_cfg(narrowband_enabled == YES);
+    const bool is_nb = (narrowband_enabled == YES);
+    int handoff = rate_opt.min_calibrated_cfg(is_nb);
     if (handoff <= 0) return false;
-    return config_ladder_index(current_configuration) >= config_ladder_index(handoff);
+    if (config_ladder_index(current_configuration) < config_ladder_index(handoff))
+      return false;
+    // FIX-1 (over-climb authority gap): mirror EXACTLY the channel-recusal
+    // gate in opt_evaluate_batch_end() (arq_common.cc:3328-3331). The index
+    // check above only asks "are we ABOVE the calibrated floor config?" — it
+    // does NOT ask "is the optimizer actually steering THIS channel right
+    // now?". On an uncalibrated/noisy channel opt_evaluate_batch_end()
+    // recuses (returns false there too), but optimizer_is_in_control() kept
+    // returning true, so the 5 readers below disabled the gearshift's +1
+    // clamp / leap_cap while the optimizer was simultaneously silent — the
+    // AUTHORITY GAP that lets the climb over-shoot to CONFIG_16 unbounded and
+    // then collapse to ROBUST_0. Closing it makes c5d67cc's leap_cap bite
+    // above CONFIG_6. min_cfg / max_sack populated at load() time; -1 / -1.0
+    // sentinels mean "table never loaded" → ignore (matches arq_common.cc).
+    int    min_cfg  = rate_opt.min_calibrated_cfg(is_nb);
+    double max_sack = rate_opt.max_calibrated_sack_rate(is_nb);
+    if (min_cfg >= 0 && current_configuration < min_cfg) return false;
+    if (max_sack >= 0.0 && get_current_sack_rate() > max_sack) return false;
+    return true;
   }
 
   // Cap a turboshift SNR-derived target at the handoff config so the

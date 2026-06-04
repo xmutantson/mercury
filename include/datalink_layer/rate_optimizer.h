@@ -104,6 +104,19 @@ public:
     void set_cooldown_batches(int n)    { cooldown_max = n; }
     void set_switch_cost_ms(int ms)     { switch_cost_ms = ms; }
 
+    // TEST-ONLY seam (synthetic-fire). Mark the optimizer "enabled" and seed the
+    // below-table-range gate inputs (min_calibrated_cfg / max_calibrated_sack_rate)
+    // WITHOUT loading a JSON table — so unit tests can drive the
+    // cl_arq_controller::optimizer_is_in_control() / opt_evaluate_batch_end()
+    // channel-recusal predicate (FIX-1) deterministically. NOT called by any
+    // production path; the calibration members are otherwise only set by load().
+    // Passing min_cfg<0 / max_sack<0 reproduces the "table never loaded" sentinel.
+    void set_test_calibration(int min_cfg, double max_sack, bool is_nb = false) {
+        enabled = true;
+        if (is_nb) { min_cfg_calibrated_nb = min_cfg; max_sack_calibrated_nb = max_sack; }
+        else       { min_cfg_calibrated    = min_cfg; max_sack_calibrated    = max_sack; }
+    }
+
     // BREAK-driven cooldown — called from the BREAK handler in arq_common.cc
     // when BREAK fires. Pins cooldown_remaining to N batches so the optimizer
     // stays silent while gearshift/SUPERSHIFT/BREAK run the descent (and any
