@@ -254,6 +254,22 @@ int main(int argc, char *argv[])
         }
     }
 
+    // --validate-finetiming [out_dir] : SHADOW-only OFDM fine-timing detector
+    // A/B (wgn0 good-timing collapse investigation). No audio/GUI/ARQ init.
+    // Modulates a CONFIG_0 WB OFDM frame, places it at a KNOWN delay in AWGN,
+    // and runs all three fine detectors (production self-autocorr vs the two
+    // dormant coherent detectors) in shadow, writing delay-error distributions.
+    // No production behavior change — reached only via this flag.
+    {
+        extern int run_finetiming_validator(const char* out_dir);
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--validate-finetiming") == 0) {
+                const char* out_dir = (i + 1 < argc && argv[i+1][0] != '-') ? argv[i+1] : nullptr;
+                return run_finetiming_validator(out_dir);
+            }
+        }
+    }
+
     int cpu_nr = -1;
     bool list_modes = false;
     bool list_sndcards = false;

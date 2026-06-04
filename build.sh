@@ -359,6 +359,7 @@ source/physical_layer/mfsk.cc
 source/physical_layer/mfsk_ctrl_codec.cc
 source/physical_layer/mfsk_ctrl_codec_tests.cc
 source/physical_layer/telecom_system.cc
+source/physical_layer/finetiming_validator.cc
 source/common/os_interop.cc
 source/common/ring_buffer_posix.cc
 source/common/shm_posix.cc
