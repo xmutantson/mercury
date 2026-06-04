@@ -362,6 +362,50 @@ cl_error_rate cl_telecom_system::baseband_test_EsN0(float EsN0,int max_frame_no)
 	return lerror_rate;
 }
 
+double cl_telecom_system::skip_var_nv_ceiling(int configuration)
+{
+	// FIX-1 (2026-06-04): config-rate-aware SKIP-VAR noise-variance ceiling.
+	//
+	// The SKIP-VAR gate in receive_byte() rejects a frame BEFORE LDPC when the
+	// pilot-residual noise estimate (ofdm.noise_variance_estimate, the post-DFT LS
+	// residual mean|Y-H·Xpilot|²) exceeds this ceiling. Its legitimate purpose is
+	// to avoid burning decoder/trial budget on frames that genuinely cannot decode.
+	// The historical flat 0.5 was WRONG because it is code-rate-INDEPENDENT while
+	// the LDPC decode floor is code-rate-DEPENDENT: at low code rates (CONFIG_0-6
+	// BPSK, rates 1/16..8/16) the decoder recovers frames with nv well above 0.5,
+	// so 0.5 rejected decodable weak frames before LDPC ever ran.
+	//
+	// Measured (clean-AWGN, mercury -m PLOT_PASSBAND --skip-var-gate=off so the
+	// decoder runs at every nv, --ber-frames=40 — FIX-1 report 2026-06-04):
+	//   CONFIG_0 BPSK 1/16  decode floor nv≈1.49 (39/40 @ Es/N0 -12, 31/40 @ -13)
+	//   CONFIG_3 BPSK 4/16  decode floor nv≈1.13 (40/40 @ -8 nv→1.04, 31/40 @ -9, 0 @ -10)
+	//   CONFIG_6 BPSK 8/16  decode floor nv≈0.80 (40/40 @ -5 nv→0.68, 38/40 @ -6, 1/40 @ -7)
+	// Ceilings sit just ABOVE each config's measured gate-OFF decode floor, so a
+	// low-rate config admits the proven-decodable band (incl. the nv≈0.70 frames the
+	// flat 0.5 rejected — verified: CONFIG_0 @ -6 dB, nv 0.71→OFDM-OK) but still
+	// fast-skips beyond its real floor.
+	//
+	// CONFIG_7-16 (QPSK/8PSK/16QAM/32QAM) and ROBUST/NB ids KEEP the historical 0.5
+	// (UNCHANGED). Their decode floor sits below 0.5 already (decoder-bound), so the
+	// gate never bound them — keeping 0.5 makes this a pure LOOSENING for CONFIG_0-6
+	// and a strict no-op everywhere else (NO regression). MFSK/ROBUST never reach
+	// this gate (demod branch exits before the OFDM trial block) so they are 0.5 by
+	// construction. HARD CAP: CONFIG_0's 1.60 bounds the loosest config, so truly-
+	// hopeless frames (and any config above 1.60) are still rejected — LDPC+CRC
+	// remain the actual noise-rejection mechanism downstream regardless.
+	switch(configuration)
+	{
+		case CONFIG_0: return 1.60;  // BPSK 1/16, floor nv≈1.48 (hard cap)
+		case CONFIG_1: return 1.50;  // BPSK 2/16
+		case CONFIG_2: return 1.35;  // BPSK 3/16
+		case CONFIG_3: return 1.20;  // BPSK 4/16
+		case CONFIG_4: return 1.10;  // BPSK 5/16
+		case CONFIG_5: return 1.00;  // BPSK 6/16
+		case CONFIG_6: return 0.90;  // BPSK 8/16 (rate 0.5, masked↔decoder-bound boundary)
+		default:       return 0.50;  // CONFIG_7-16 + ROBUST/NB: HEAD behavior (decoder-bound)
+	}
+}
+
 cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 {
 	cl_error_rate lerror_rate;
@@ -2514,20 +2558,31 @@ skip_h_retry_point:
 					}
 				}
 
-				// Noise variance gate: if noise_variance > 0.5 (SNR < ~3 dB), the
-				// signal is either noise (false preamble detection) or completely
-				// unusable. Good frames: var=0.01-0.10. Garbage: var=1.7-3.3.
-				// Skip LDPC to free receiver for real frames.
+				// Noise variance gate: reject the frame before LDPC when the pilot-
+				// residual noise estimate exceeds this config's decode ceiling — the
+				// frame is either noise (false preamble) or below this config's LDPC
+				// floor. Good frames at moderate SNR: var=0.01-0.10. Skip LDPC to free
+				// the receiver for real frames.
 				// Phase-2 validation: --skip-var-gate=off bypasses this gate.
+				//
+				// FIX-1 (2026-06-04): the ceiling is now CONFIG-RATE-AWARE
+				// (skip_var_nv_ceiling), not a flat 0.5. The flat 0.5 was code-rate-
+				// INDEPENDENT and sat below every low-rate BPSK config's MEASURED
+				// decode-floor nv (CONFIG_0 decodes to nv≈1.48), so it dropped weak
+				// frames LDPC could still decode — masking real margin on CONFIG_0-6.
+				// CONFIG_7-16 + robust/NB keep 0.5 (decoder-bound, strict no-op).
+				// CONFIG_0's 1.60 is the hard cap; LDPC+CRC reject everything above.
 				//
 				// Phase-F stall fix (2026-05-12): if 3+ consecutive trials all
 				// SKIP-VAR, the entire trial range is noise — abort the trial
 				// loop entirely so the caller advances the buffer past this
 				// noise region instead of burning 20 trials (~2 s) on it.
-				if(skip_var_gate_enabled && ofdm.noise_variance_estimate > 0.5)
+				double skip_var_ceiling = skip_var_nv_ceiling(current_configuration);
+				if(skip_var_gate_enabled && ofdm.noise_variance_estimate > skip_var_ceiling)
 				{
-					printf("[OFDM-SYNC] trial %d SKIP-VAR: var=%.4f too high (>0.5), skipping LDPC\n",
-						receive_stats.sync_trials, ofdm.noise_variance_estimate);
+					printf("[OFDM-SYNC] trial %d SKIP-VAR: var=%.4f too high (>%.2f cfg=%d), skipping LDPC\n",
+						receive_stats.sync_trials, ofdm.noise_variance_estimate,
+						skip_var_ceiling, current_configuration);
 					fflush(stdout);
 					receive_stats.sync_trials++;
 					consecutive_skip_var++;
