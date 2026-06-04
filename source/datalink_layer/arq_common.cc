@@ -170,6 +170,58 @@ void drain_playback_wait()
 		sim_spin_or_pump(sim_clock_on);
 }
 
+// ---------------------------------------------------------------------------
+// SIM_INPROC settle-wait helpers (single-process-sim-refactor.md §5.7 / §7).
+//
+// arq_sim_inproc_active(): the step-pump pointer is the authoritative signal.
+// It is non-null ONLY while the -m SIM_INPROC single-thread stepper is driving
+// (arq_commander.cc test_sim_inproc installs it, clears it on exit). Every
+// production path and the two-process paced sim leave it null.
+bool arq_sim_inproc_active()
+{
+	return g_sim_inproc_pump != nullptr;
+}
+
+// pumped_settle_wait(): virtual-clock-ify a wall settle-wait WITHOUT changing
+// its exit semantics. On EVERY non-SIM_INPROC path (pump null) this is the
+// verbatim wall-clock body — msleep(wait_ms) — so production + the paced sim
+// are byte-identical. Under SIM_INPROC the wall msleep would freeze the single
+// shared sample-counter virtual clock (a peer instance's view of time stops),
+// so instead we run a cl_timer + step-pump loop: the SAME EXIT PREDICATE
+// (elapsed >= wait_ms, identical to ptt_busy_wait) with the pump advancing the
+// shared clock through the SAME rx_transfer -> sim_clock_add_samples accounting
+// as the two-process RX bridge. No early exit, no threshold change — only the
+// clock-advance mechanism differs.
+void pumped_settle_wait(int wait_ms)
+{
+	if (wait_ms <= 0)
+		return;
+	if (g_sim_inproc_pump == nullptr)
+	{
+		msleep(wait_ms);            // production + two-process paced sim: verbatim
+		return;
+	}
+	// SIM_INPROC: step-pumped wait, same exit predicate as ptt_busy_wait.
+	cl_timer t;
+	t.start();
+	while (t.get_elapsed_time_ms() < wait_ms)
+		sim_spin_or_pump(true);     // pump installed -> advances the shared clock
+}
+
+// sim_inproc_rx_mute_settle(): the RX_MUTE drain guard (B5 / ADD-ON1). The wait
+// exists to let in-flight ASYNC AUDIO CALLBACKS finish writing the capture ring
+// before circular_buf_reset() zeroes it. Under SIM_INPROC the stepper OWNS RX —
+// there is NO async audio-callback thread, nothing is in flight — so the drain
+// purpose is MOOT and the wait becomes a no-op. The caller's circular_buf_reset
+// (instantaneous state, no clock semantics) is UNCHANGED and still fires. On
+// production/paced-sim (pump null) it is the verbatim msleep(wait_ms).
+void sim_inproc_rx_mute_settle(int wait_ms)
+{
+	if (g_sim_inproc_pump != nullptr)
+		return;                     // no async drainer in-process -> moot, no-op
+	msleep(wait_ms);                // production + paced sim: verbatim
+}
+
 static const int RX_MUTE_GUARD_MS = 50;
 
 cl_arq_controller::cl_arq_controller()
@@ -2902,8 +2954,15 @@ void cl_arq_controller::process_main()
 	// time) and keeps the two peer processes loosely paced together (a raw
 	// yield here hot-spun the loop and helped desync the CMD<->RSP turnaround).
 	// Gated on the flag -> production unchanged.
+	//
+	// §5.7 pacing-floor: route the sim branch through sim_spin_or_pump so the
+	// SIM_INPROC inline stepper ADVANCES the shared virtual clock here too
+	// (a bare sim_spin_sleep() is a 200us WALL sleep that would freeze a peer
+	// instance's clock view). When no pump is installed (the two-process paced
+	// sim) sim_spin_or_pump(true) IS sim_spin_sleep() — byte-identical. The
+	// production (sim disabled) branch is the verbatim usleep(2000).
 	if (sim_clock_enabled())
-		sim_spin_sleep();
+		sim_spin_or_pump(true);
 	else
 		usleep(2000);
 }
@@ -4100,7 +4159,7 @@ void cl_arq_controller::send_ack_pattern()
 			printf("[TX-ACK-PAT] Waiting %dms (remaining=%dsym delay=%dsym buf=%dsym frame=%dsym ptt_off=%d ptt_on=%d)\n",
 				wait_ms, remaining_sym, delay_sym, buf_sym, frame_sym, ptt_off_delay_ms, ptt_on_delay_ms);
 			fflush(stdout);
-			msleep(wait_ms);
+			pumped_settle_wait(wait_ms);  // §5.7-B1: virtual-clock-ify (same exit predicate); verbatim msleep on production
 		}
 	}
 	else
@@ -4113,7 +4172,7 @@ void cl_arq_controller::send_ack_pattern()
 		printf("[TX-ACK-PAT] MFSK guard %dms (ptt_off=%d, ptt_on=%d)\n",
 			wait_ms, ptt_off_delay_ms, ptt_on_delay_ms);
 		fflush(stdout);
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B1: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	printf("[TX-ACK-PAT] Guard done at t=%dms\n", (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
@@ -4198,7 +4257,7 @@ void cl_arq_controller::send_ack_pattern()
 	// Flushing now lets the capture thread receive clean audio during
 	// ptt_off_delay, giving 200ms+ margin instead of potentially negative.
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -4256,7 +4315,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	if(is_robust_config(current_configuration))
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B2: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	ptt_on();
@@ -4320,7 +4379,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 
 	// Same flush sequence as send_ack_pattern
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -4707,7 +4766,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	if(is_robust_config(current_configuration))
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B3: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	ptt_on();
@@ -4788,7 +4847,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	// Same flush sequence as send_ack_pattern / send_ack_pattern_with_snr
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
@@ -4991,7 +5050,7 @@ void cl_arq_controller::send_break_pattern()
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -5095,7 +5154,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	if(is_robust_config(self->current_configuration))
 	{
 		int wait_ms = self->ptt_off_delay_ms + self->ptt_on_delay_ms;
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B4: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	self->ptt_on();
@@ -5173,7 +5232,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 
 	// Same capture-flush sequence as send_mfsk_ack_sack:4406-4429.
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
@@ -5518,7 +5577,7 @@ void cl_arq_controller::send_hail_pattern()
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;

@@ -422,7 +422,17 @@ void cl_arq_controller::process_messages_commander()
 					hail_detected = YES;
 					break;
 				}
-				msleep(50);
+				// §5.7-B8: pump-arm the poll body. On production this is the
+				// verbatim msleep(50) poll cadence. Under SIM_INPROC msleep(50)
+				// is a WALL pause that would BOTH freeze the shared virtual clock
+				// (so this loop's get_elapsed_time_ms() deadline could never
+				// advance) AND starve the peer's HAIL reply from flowing into RX
+				// before the next receive_hail_pattern() check. pumped_settle_wait
+				// instead pumps for 50ms of VIRTUAL time per poll: the shared clock
+				// advances toward the deadline and the peer's reply is consumed
+				// through rx_transfer. The outer hail_listen deadline + the
+				// receive_hail_pattern() early-exit are UNCHANGED.
+				pumped_settle_wait(50);
 			}
 
 			if(hail_detected == NO)
@@ -4578,7 +4588,11 @@ void cl_arq_controller::process_control_commander()
 				// frame shifts in. Flush with rx_mute to prevent capture thread
 				// race (same pattern as send_ack_pattern).
 				telecom_system->data_container.rx_mute = 1;
-				msleep(50); // RX_MUTE_GUARD_MS — let in-flight audio callbacks drain
+				// §5.7 ADD-ON1 (B5-class): gate-off the RX_MUTE drain guard — under
+				// SIM_INPROC there is no async audio-callback thread to drain, so the
+				// wait is moot (no-op); the circular_buf_reset below still fires.
+				// Verbatim msleep(50) on production / paced sim.
+				sim_inproc_rx_mute_settle(50); // RX_MUTE_GUARD_MS — let in-flight audio callbacks drain
 				circular_buf_reset(capture_buffer);
 				{
 					int buf_samples = telecom_system->data_container.Nofdm
@@ -4637,7 +4651,17 @@ void cl_arq_controller::process_control_commander()
 						printf("[GEARSHIFT] Settling %dms for responder PHY reinit\n",
 						       phy_reinit_settle_us / 1000);
 						fflush(stdout);
-						usleep(phy_reinit_settle_us);
+						// §5.7 ADD-ON2: virtual-clock-ify the peer-PHY-reinit settle.
+						// On production / paced sim this is the verbatim
+						// usleep(phy_reinit_settle_us). Under SIM_INPROC a wall usleep
+						// would freeze the shared clock while the peer (same thread)
+						// reinits synchronously; route the settle through the pump so
+						// the shared clock advances. Same wait semantics (elapsed >=
+						// settle). Default phy_reinit_settle_us == 0 -> branch skipped.
+						if(arq_sim_inproc_active())
+							pumped_settle_wait(phy_reinit_settle_us / 1000);
+						else
+							usleep(phy_reinit_settle_us);
 					}
 
 					// Re-fill TX messages for the new config's message sizes
@@ -9455,6 +9479,65 @@ int cl_arq_controller::test_sim_inproc()
 	      "B6 total virtual time >= on+airtime+off (send_batch waits did NOT exit early)");
 	check(total_virtual_ms <= expected_min_ms + overshoot_tol_ms + frame_airtime_ms,
 	      "B7 total virtual time bounded (no runaway clock; overshoot < 1 symbol/wait)");
+
+	// --- 7b. Settle-wait FIX validation (single-process-sim-refactor.md §7) ---
+	// The B1-B8 settle-wait fixes are single-instance-testable in two classes:
+	//
+	//  (i) GATE-OFF (B5 / ADD-ON1): sim_inproc_rx_mute_settle() must be a no-op
+	//      under SIM_INPROC (the pump is installed -> no async audio thread to
+	//      drain) AND the instantaneous circular_buf_reset() that follows it in
+	//      every caller must still fire. We exercise the helper directly here
+	//      (the pump is still installed at this point), measure that it consumes
+	//      ~0 wall time, then verify a real circular_buf_reset() empties the ring.
+	//
+	//  (ii) VIRTUAL-CLOCK-IFY (B1-B4/B7/ADD-ON2): pumped_settle_wait(N) must
+	//      advance the SHARED virtual clock by >= N ms (its exit predicate held,
+	//      not exited early) when the pump is installed — the property that lets
+	//      a peer instance see time pass during the wait. (The B1-B4/B7 CALL
+	//      SITES themselves are responder/peer-side ACK/HAIL paths a single
+	//      instance does not reach — those are audit-only this increment, §6.5 —
+	//      but the shared mechanism is validated here.)
+	{
+		// (i) gate-off no-op under SIM_INPROC + reset still fires.
+		// RX_MUTE_GUARD_MS is file-local to arq_common.cc; its value is 50ms.
+		const int rx_mute_guard_ms = 50;
+		uint64_t g0 = sim_clock_now_samples();
+		auto wall0 = std::chrono::steady_clock::now();
+		sim_inproc_rx_mute_settle(rx_mute_guard_ms);  // pump installed -> no-op
+		auto wall1 = std::chrono::steady_clock::now();
+		uint64_t g1 = sim_clock_now_samples();
+		double gate_wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+		check(gate_wall_ms < (double)rx_mute_guard_ms,
+		      "G1 sim_inproc_rx_mute_settle is a NO-OP under SIM_INPROC (no 50ms wall pause)");
+		check(g1 == g0,
+		      "G1b gate-off does not touch the virtual clock (drain is moot in-process)");
+		// circular_buf_reset still fires: stage one symbol, reset, confirm empty.
+		{
+			memset(pump_ctx.scratch, 0, (size_t)symbol_period * sizeof(double));
+			write_buffer(capture_buffer, (uint8_t*)pump_ctx.scratch,
+			             (size_t)symbol_period * sizeof(double));
+			bool had_data = size_buffer(capture_buffer) > 0;
+			circular_buf_reset(capture_buffer);
+			check(had_data && size_buffer(capture_buffer) == 0,
+			      "G2 circular_buf_reset still empties the capture ring after the gated no-op");
+		}
+
+		// (ii) pumped_settle_wait advances the shared virtual clock by >= N ms.
+		const int settle_ms = 60;
+		uint64_t p0 = sim_clock_now_samples();
+		pumped_settle_wait(settle_ms);   // pump installed -> step-pumped wait
+		uint64_t p1 = sim_clock_now_samples();
+		double advanced_ms = (p1 - p0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+		printf("[TEST-SIM-INPROC] pumped_settle_wait(%dms) advanced virtual clock %.1fms\n",
+		       settle_ms, advanced_ms);
+		fflush(stdout);
+		check(advanced_ms >= (double)settle_ms - 0.001,
+		      "G3 pumped_settle_wait advances the SHARED clock >= wait_ms (exit predicate held, no early exit)");
+		// Bounded: one symbol of poll overshoot (same quantization as the pump).
+		double settle_tol_ms = symbol_period * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ + 1.0;
+		check(advanced_ms <= (double)settle_ms + settle_tol_ms,
+		      "G4 pumped_settle_wait does not over-advance (overshoot < 1 symbol)");
+	}
 
 	// --- 8. Teardown: uninstall pump, leave globals as we found them ---
 	arq_set_sim_inproc_pump(nullptr, nullptr);

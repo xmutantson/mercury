@@ -162,7 +162,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 				int delay_ms = remaining_syms * sym_ms + 200;
 				printf("[HAIL] Waiting %d ms for commander TX to finish\n", delay_ms);
 				fflush(stdout);
-				msleep(delay_ms);
+				// §5.7-B7: virtual-clock-ify ONLY (Bug #55 delay FORMULA above is
+				// verbatim) — route the pause through the pump so the shared clock
+				// advances and the commander's trailing TX is consumed at the right
+				// sample boundary. Same exit predicate; verbatim msleep on production.
+				pumped_settle_wait(delay_ms);
 			}
 			// Respond with our own HAIL (suppressed in monitor mode)
 			send_hail_pattern();
@@ -278,7 +282,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 				printf("[RSP-CONNECT-V2] Waiting %d ms (HAIL race delay) "
 					"before synthesizing messages_rx_buffer\n", delay_ms);
 				fflush(stdout);
-				msleep(delay_ms);
+				// §5.7-B7: virtual-clock-ify ONLY (delay FORMULA above verbatim) —
+				// route through the pump so the shared clock advances; same exit
+				// predicate; verbatim msleep on production.
+				pumped_settle_wait(delay_ms);
 
 				// Synthesize messages_rx_buffer to match the LDPC
 				// START_CONNECTION layout the legacy code builds at
@@ -372,7 +379,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 				printf("[RSP-TEST-CONN-V3] Waiting %d ms (HAIL race delay) "
 					"before synthesizing messages_rx_buffer\n", delay_ms);
 				fflush(stdout);
-				msleep(delay_ms);
+				// §5.7-B7: virtual-clock-ify ONLY (delay FORMULA above verbatim) —
+				// route through the pump so the shared clock advances; same exit
+				// predicate; verbatim msleep on production.
+				pumped_settle_wait(delay_ms);
 
 				// Reconstruct float SNR from 4-bit quantization via the
 				// inverse of cl_mfsk::snr_to_tone(M=16).

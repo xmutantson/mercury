@@ -62,6 +62,37 @@
 void ptt_busy_wait(cl_timer& t, int delay_ms);
 void drain_playback_wait();
 
+// ---------------------------------------------------------------------------
+// SIM_INPROC settle-wait helpers (single-process-sim-refactor.md §5.7 / §7).
+//
+// arq_sim_inproc_active() — true iff the -m SIM_INPROC step-pump is installed
+// (i.e. g_sim_inproc_pump != nullptr). On EVERY production path and the
+// two-process paced sim it returns false, so the gated branches below take the
+// verbatim wall-clock body. The pump is installed ONLY by the SIM_INPROC
+// stepper (arq_commander.cc test_sim_inproc), so this is the authoritative
+// "are we the single-thread in-process stepper?" query.
+//
+// pumped_settle_wait(wait_ms) — virtual-clock-ify a wall settle-wait. When the
+// pump is NOT installed it is byte-identical to msleep(wait_ms) (production +
+// paced sim). When the pump IS installed it runs a cl_timer + step-pump loop
+// with the SAME exit predicate (elapsed >= wait_ms), advancing the shared
+// virtual clock through the pump so a peer instance sees time pass. The exit
+// SEMANTICS are unchanged — only the clock-advance mechanism differs. Used for
+// the B1-B4 / B7 turnaround + HAIL-race settle guards. For B7 the CALLER keeps
+// the delay FORMULA verbatim (Bug #55 HAIL reliability); this helper only
+// routes the already-computed wait_ms through the pump.
+//
+// sim_inproc_rx_mute_settle(wait_ms) — gate-off the RX_MUTE drain guard (B5 /
+// ADD-ON1). The msleep there waits for ASYNC AUDIO CALLBACKS to drain before
+// circular_buf_reset(); under SIM_INPROC the single-thread stepper owns RX —
+// there is NO async audio thread, nothing is in flight — so the drain wait is
+// MOOT and becomes a no-op. The instantaneous circular_buf_reset() that
+// follows the caller keeps verbatim. On production/paced-sim it is the verbatim
+// msleep(wait_ms).
+bool arq_sim_inproc_active();
+void pumped_settle_wait(int wait_ms);
+void sim_inproc_rx_mute_settle(int wait_ms);
+
 union u_SNR {
   float f_SNR;
   char char4_SNR[4];
