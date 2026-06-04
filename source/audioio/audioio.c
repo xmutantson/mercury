@@ -187,57 +187,71 @@ static inline void sim_paced_wait(ffuint msec)
 // Sleep(1)=~15.3 ms quantum here throttled silence to ~65 chunks/s, capping the
 // whole sim at ~1.4x real-time (sim-ftrt-speedup-floor.md §4).
 //
-// Unlike the RX data-path pace (sim_paced_wait), this idle silence emit has NO
-// receive-timing dependency — it is pure inter-frame noise floor. So it can run
-// FLAT-OUT: we YIELD (not timed-sleep) and let the relay's K=1 conservative-PDES
-// window barrier + bounded inbound queue + TCP back-pressure be the flow control.
-// send() blocks the instant the relay can't accept more (event-driven), and the
-// barrier bounds the a2b/b2a virtual-clock split regardless of OS scheduling —
-// so determinism is preserved by the shared clock + barrier, not by a wall pace.
-// This is what lifts the deep/turnaround-dominated cell from 1.4x to >7x.
+// CREDIT-PACED FTRT speed-up (sim-ftrt-speedup-floor.md §10). Two failed extremes
+// bracket the right answer:
+//   * PACE flat (Sleep(1)): CONNECT-safe but only ~1.4x (§4).
+//   * FLOOD flat-out (Sleep(0)/yield, the §9 link-state-gated build): hit >5x on
+//     the relay's virtual/wall ratio BUT was NOT FAITHFUL — it emitted silence
+//     faster than the PEER could decode + SACK-ACK, starving the RX-decode/prep
+//     thread, so CONFIG_0 data frames never ACKed: 0 B delivered, never climbed
+//     out of ROBUST_0 (§9.5, HW-faithfulness re-check: flood 5 B / no climb at
+//     WGN:40 vs paced 113 B + climb to CONFIG_13).
+// FIX: pace the idle silence emit to the RX DECODER's true consumption rate. The
+// capture-prep thread bumps an RX-decode credit (sim_clock_note_rx_consumed) every
+// symbol it demods; here we snapshot that credit, emit ONE idle chunk, then YIELD
+// the core until the credit ADVANCES (the decoder ran) — so silence is produced as
+// fast as the RX consumes it but can NEVER get ahead and starve the decoder. A
+// bounded spin budget then falls back to a single short timed sleep so we always
+// make forward progress even if the local prep thread is momentarily idle (no
+// pending RX) — that guarantees no hot-spin deadlock without re-introducing the
+// flood. The faithful ceiling is therefore the desktop demod rate (>> the Pi's
+// real-time rate), so this yields the speed-up WHILE delivering + climbing.
+//
+// Gated on link_status == CONNECTED (published by arq_common.cc process_main):
+// during the ENTIRE handshake we PACE (Sleep(1)) at the proven-safe baseline, so
+// the multi-stage half-duplex turnaround interleave is never perturbed (§9.1).
 // Production never runs the sim TX bridge, so this is sim-only by construction.
 static inline void sim_tx_idle_pace(void)
 {
 	if (sim_clock_enabled())
 	{
-		// LINK-STATE-GATED FTRT speed-up (sim-ftrt-speedup-floor.md §9).
-		//
-		// The idle silence emit RATE sets how fast virtual time advances (the
-		// relay stamps one chunk = 1024 samples per forwarded chunk). Flooding
-		// it flat-out hits >5x — BUT only the CONNECTED DATA phase is safe to
-		// flood. Phase-1 trace (§9.1): under a flat-out flood the HAIL itself
-		// still detects cleanly (metric 36.0), but the multi-stage half-duplex
-		// HANDSHAKE turnaround (HAIL→response→START_CONNECTION→TEST_CONNECTION)
-		// races: the commander, beaconing flat-out, MISSES the responder's first
-		// HAIL response (its own post-TX capture flush eats it), the responder's
-		// hail_timeout then fires and it re-scans — extra round-trips that make
-		// CONNECT flaky (1/3 on clean+tx). This is half-duplex TX/RX INTERLEAVE
-		// nondeterminism, not clock leakage: the handshake's loose alignment had
-		// been provided incidentally by the wall-clock pace.
-		//
-		// FIX: gate the flood on link_status == CONNECTED, published by the ARQ
-		// main loop (arq_common.cc process_main, sim-only). During the ENTIRE
-		// handshake (Idle/Listening/Connecting/ConnectionReceived/Negotiating)
-		// link_status != CONNECTED → we PACE (Sleep(1)), so the handshake runs
-		// at the proven-safe baseline cadence (byte-identical to the shipped
-		// 1.4x build). Once CONNECTED, the data phase (the bulk of any transfer,
-		// dominated by both-peers-idle ACK turnarounds) floods flat-out → >5x.
-		// Determinism holds: the relay K=1 barrier + shared clock fix the
-		// virtual timeline regardless of wall speed (the flood data phase is
-		// run-to-run bit-identical, §9.3), and the flood only ever runs when the
-		// link is already established so it cannot perturb a handshake.
 		if (sim_link_connected())
 		{
+			// CREDIT-PACED data-phase flood: yield to the RX decoder until it has
+			// consumed at least one more symbol, so the silence producer tracks
+			// (never out-runs) the decode rate. Bounded spin budget -> short
+			// timed-sleep fallback guarantees forward progress if no RX is pending.
+			uint64_t rx0 = sim_clock_rx_consumed();
+			int spins = 0;
+			const int SPIN_BUDGET = 20000;   // ~ms-scale yield budget before fallback
+			while (!shutdown_ && sim_clock_rx_consumed() == rx0)
+			{
+				if (++spins > SPIN_BUDGET)
+				{
+					// RX-decode idle (nothing to demod right now): take one short
+					// timed tick (the CONNECT-safe baseline cadence) so we neither
+					// hot-spin a core nor flood the peer, then re-arm.
 #if defined(FF_WIN)
-			Sleep(0);          // yield: flood idle silence flat-out (data phase)
+					Sleep(1);
 #else
-			sched_yield();
+					struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 };  // 200 us
+					nanosleep(&ts, NULL);
 #endif
+					break;
+				}
+#if defined(FF_WIN)
+				Sleep(0);          // yield to ready threads (the prep/RX-decode thread)
+#else
+				sched_yield();
+#endif
+			}
 		}
 		else
 		{
+			// HANDSHAKE: pace to a real (sub-)ms tick — keep the TX/RX turnaround
+			// interleave aligned (the §9.1 flat-out-flood CONNECT break is here).
 #if defined(FF_WIN)
-			Sleep(1);          // pace: keep the handshake turnaround aligned
+			Sleep(1);
 #else
 			struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 };  // 200 us
 			nanosleep(&ts, NULL);
@@ -1396,6 +1410,14 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 		}
 
 		rx_transfer(buffer_temp, symbol_period);
+
+		// RX-DECODE CREDIT (sim-ftrt-speedup-floor.md §10). One symbol just left
+		// capture_buffer and entered the demod pipeline — bump the credit the
+		// TX-bridge idle pacer waits on, so the idle-silence flood emits at this
+		// (the RX decoder's true) consumption rate and never out-runs it. Gated on
+		// sim: production never bumps it and sim_tx_idle_pace never reads it.
+		if (sim_clock_enabled())
+			sim_clock_note_rx_consumed();
 
 		// DIAG: capture peak amplitude (every 200 symbols ~4.5s for WB)
 		{

@@ -111,14 +111,27 @@ extern "C" {
  *                            Published once-per-iteration by the ARQ main loop
  *                            (arq_common.cc process_main, sim-gated) and read by
  *                            the TX-bridge idle pacer (audioio.c sim_tx_idle_pace)
- *                            to decide flood-vs-pace: the FTRT idle-silence flood
- *                            is SAFE only on the CONNECTED data phase; the
- *                            multi-stage half-duplex handshake must stay paced or
- *                            its TX/RX turnaround interleave desyncs (CONNECT goes
- *                            flaky). sim-ftrt-speedup-floor.md §9. Defaults to 0;
- *                            production never sets it (sim_clock_enabled()==0), so
- *                            the production sim_tx_idle_pace path is untouched.
- * sim_clock_set_link_connected(c) : ARQ publisher hook for the above. */
+ *                            to gate the FTRT credit-paced idle flood: it is SAFE
+ *                            only on the CONNECTED data phase; the multi-stage
+ *                            half-duplex handshake must stay paced or its TX/RX
+ *                            turnaround interleave desyncs CONNECT
+ *                            (sim-ftrt-speedup-floor.md §9.1/§10). Defaults 0;
+ *                            production never sets it (sim_clock_enabled()==0).
+ * sim_clock_set_link_connected(c) : ARQ publisher hook for the above.
+ *
+ * sim_clock_note_rx_consumed() : RX-DECODE CREDIT producer. The capture-prep
+ *                            thread calls this once per symbol it consumes via
+ *                            rx_transfer (audioio.c radio_capture_prep_thread).
+ *                            It is the heartbeat of the RX-decode pipeline.
+ * sim_clock_rx_consumed()  : read the credit counter. The TX-bridge idle pacer
+ *                            (sim_tx_idle_pace) snapshots it, emits one idle
+ *                            silence chunk, then yields until it ADVANCES — so
+ *                            the silence producer can never out-run the RX
+ *                            decoder it would otherwise starve (the §9.5 flood
+ *                            bug: a flat-out Sleep(0) flood emitted silence
+ *                            faster than the peer could decode+SACK-ACK, so
+ *                            CONFIG_0 data never ACKed -> 0 delivery, no climb).
+ *                            sim-only; production never bumps or reads it. */
 int      sim_clock_enabled(void);
 void     sim_clock_set_enabled(int enabled);
 void     sim_clock_add_samples(uint64_t n);
@@ -128,6 +141,8 @@ uint64_t sim_clock_now_ns(void);
 void     sim_clock_fill_timespec(struct timespec *ts);
 int      sim_link_connected(void);
 void     sim_clock_set_link_connected(int connected);
+uint64_t sim_clock_rx_consumed(void);
+void     sim_clock_note_rx_consumed(void);
 
 #ifdef __cplusplus
 }  /* extern "C" */

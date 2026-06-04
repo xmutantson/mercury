@@ -1574,6 +1574,17 @@ start_modem:
         // the ONLY place g_sim_time_enabled is ever set true; every other -x
         // mode leaves it false -> byte-identical to pre-change.
         sim_clock_set_enabled(1);
+        // FTRT speed lever (sim-ftrt-speedup-floor.md §11): the paced TX-idle and
+        // RX-path waits use Sleep(1), but the Windows DEFAULT timer resolution is
+        // ~15.6ms, so Sleep(1) actually parks ~15ms — capping the paced silence
+        // emit at ~65 chunks/s ≈ 1.4× (the measured floor, NOT a CPU/relay limit:
+        // host ~14% / relay ~24% during sim). The fine (1ms) timer resolution that
+        // lifts this is LINK-STATE-GATED (sim_clock_set_link_connected → Win
+        // timeBeginPeriod/timeEndPeriod): COARSE default during the handshake (so
+        // the multi-stage half-duplex turnaround keeps its proven ~15ms cadence and
+        // CONNECT stays reliable — a global 1ms timer broke CONNECT 4/4, §11.2),
+        // FINE 1ms only once CONNECTED (the data phase) → faithful >5×. sim-ONLY:
+        // production never hits AUDIO_SUBSYSTEM_SIM so the timer res is never raised.
         printf("SIM software channel (device-free ARQ loopback via relay)\n");
         printf("[SIM] virtual clock ENABLED — control-loop timers run on "
                "channel-sample time, not wall-clock\n");

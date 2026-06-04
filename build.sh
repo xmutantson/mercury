@@ -163,7 +163,11 @@ CFLAGS="$OPT $DBG $EXTRA_CFLAGS -Wall -Wno-unused -I./source/audioio/ffbase/ -I.
 if [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "mingw"* ]] || [[ "$OSTYPE" == "cygwin"* ]]; then
     PLATFORM="windows"
     CXXFLAGS="$CXXFLAGS -I./third_party/glfw/include"
-    LDFLAGS="-L./third_party/glfw/lib -lglfw3 -lopengl32 -lgdi32 -lole32 -ldsound -ldxguid -lws2_32 -lbcrypt -static-libgcc -static-libstdc++ -static -l:libwinpthread.a $EXTRA_LDFLAGS"
+    # -lwinmm: timeBeginPeriod/timeEndPeriod (raise Win timer resolution to 1ms
+    # under -x sim so the paced Sleep(1) ticks at ~1ms not the ~15.6ms default —
+    # sim-ftrt-speedup-floor.md §11; behavior-neutral in production, which never
+    # calls timeBeginPeriod).
+    LDFLAGS="-L./third_party/glfw/lib -lglfw3 -lopengl32 -lgdi32 -lole32 -ldsound -ldxguid -lws2_32 -lbcrypt -lwinmm -static-libgcc -static-libstdc++ -static -l:libwinpthread.a $EXTRA_LDFLAGS"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     PLATFORM="macos"
     CXXFLAGS="$CXXFLAGS $(pkg-config --cflags glfw3)"
