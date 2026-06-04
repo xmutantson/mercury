@@ -4800,10 +4800,25 @@ void cl_arq_controller::process_control_commander()
 							robust_enabled, narrowband_enabled == YES);
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
+						//
+						// §20 SACK-trust (gearshift-climb-engine.md): the truncation
+						// decision is the PURE turbo_snr_truncates_probe() predicate. When
+						// SACK Design A is negotiated it returns false — the
+						// CONTROL-PLANE EVM-SNR estimate (which underreports 1-3 dB and
+						// saturates ~14.5, jittering to ~9.0 on clean → get_configuration
+						// = CONFIG_13 < a negotiated CFG15) must NOT pre-truncate the
+						// climb, because the channel's data-carrying capability is PROVEN
+						// by SACK delivery + the top-config verification probe below
+						// (:4824-4845). This mirrors the DOWNSTREAM §7.13.38 SACK-trust at
+						// :3953 — without this, the guard returned BEFORE
+						// finish_turbo_direction() and the §7.13.38 SACK branch had
+						// nothing to recover, pinning the ceiling one rung short (CFG14)
+						// and never reaching CFG16 on clean. SACK OFF => legacy
+						// fading-margin truncation preserved UNCHANGED.
 						if(effective_snr > -90)
 						{
 							int snr_max_cfg = get_configuration(effective_snr);
-							if(config_ladder_index(snr_max_cfg) < config_ladder_index(negotiated_configuration))
+							if(turbo_snr_truncates_probe(snr_max_cfg, negotiated_configuration, sack_v2_enabled))
 							{
 								printf("[TURBO] SNR %.1f too low for config %d (max=%d), finishing at %d\n",
 									effective_snr, negotiated_configuration, snr_max_cfg, current_configuration);
@@ -9022,6 +9037,85 @@ int cl_arq_controller::test_climb_engine()
 		nMessages = saved_nMessages;
 		link_status = saved_link_status;
 		connection_status = saved_connection_status;
+	}
+
+	// ================================================================
+	// Part Q — TURBO SNR-CAPABILITY PRE-TRUNCATION SACK-TRUST
+	// (gearshift-climb-engine.md §20). THE CFG15->CFG16 under-climb on clean. At
+	// the turbo forward-probe +1 step the guard at arq_commander.cc:4803 truncated
+	// the probe whenever the CONTROL-PLANE EVM-SNR estimate mapped to a config
+	// BELOW the negotiated one. On clean that estimate jitters to ~9.0 dB
+	// (post-EQ EVM underreports 1-3 dB, saturates ~14.5) → get_configuration(9.0)
+	// = CONFIG_13; with the link negotiated at CONFIG_15 the guard fired, pinned
+	// supershift_proven_ceiling at CONFIG_14, and CFG16 was NEVER reached even
+	// though a pinned CFG16 decodes flawlessly on the SAME channel. The fix routes
+	// the decision through the PURE turbo_snr_truncates_probe() predicate, which
+	// returns false when SACK is negotiated (mirrors the DOWNSTREAM §7.13.38
+	// SACK-trust at :3953) and preserves the legacy fading-margin truncation when
+	// SACK is off. These assertions drive the REAL shipped predicate.
+	// FAIL-BEFORE: the pre-§20 path always truncated (snr_max < negotiated). The
+	// q_truncates_prefix lambda below models that exact pre-fix expression LIVE so
+	// the FAIL-BEFORE arm asserts the old outcome.
+	// ================================================================
+	{
+		// Model the PRE-§20 truncation expression VERBATIM (the inline index
+		// comparison that used to be at :4806, with NO sack exemption).
+		auto q_truncates_prefix = [&](int snr_max_cfg, int negotiated_cfg) -> bool {
+			return config_ladder_index(snr_max_cfg) < config_ladder_index(negotiated_cfg);
+		};
+
+		// Q1 — THE regression: SNR maps to CONFIG_13, link negotiated at CONFIG_15,
+		// SACK ON. FAIL-BEFORE: the pre-fix expression truncates (idx(13) < idx(15)).
+		// PASS-AFTER: the shipped predicate does NOT truncate (SACK trusts the
+		// proven delivery path) → the +1 step climbs 14->15->16.
+		{
+			bool q1_before = q_truncates_prefix(CONFIG_13, CONFIG_15);
+			bool q1_after  = turbo_snr_truncates_probe(CONFIG_13, CONFIG_15, /*sack_v2_enabled=*/true);
+			check(q1_before == true,
+				"Q1a FAIL-BEFORE proof: pre-fix guard TRUNCATES the probe (snr_max=CFG13 < negotiated=CFG15) on clean",
+				q1_before ? 1 : 0, 1);
+			check(q1_after == false,
+				"Q1b PASS-AFTER: with SACK negotiated the predicate does NOT truncate (CFG15->CFG16 climb proceeds)",
+				q1_after ? 1 : 0, 0);
+		}
+
+		// Q2 — LEGACY NET PRESERVED: SACK OFF must STILL truncate in BOTH the
+		// pre-fix and post-fix paths (the fading-margin safety net is unchanged
+		// when SACK is not negotiated).
+		{
+			bool q2_before = q_truncates_prefix(CONFIG_13, CONFIG_15);
+			bool q2_after  = turbo_snr_truncates_probe(CONFIG_13, CONFIG_15, /*sack_v2_enabled=*/false);
+			check(q2_after == true && q2_after == q2_before,
+				"Q2 SACK OFF: predicate STILL truncates (legacy fading-margin net unchanged; pre==post)",
+				(q2_after ? 2 : 0) + (q2_before ? 1 : 0), 3);
+		}
+
+		// Q3 — NO SPURIOUS TRUNCATION: when the SNR-mapped ceiling is AT OR ABOVE
+		// the negotiated config the predicate never truncates regardless of SACK
+		// (the guard only ever fires when the target exceeds the SNR ceiling). At
+		// equality and above, both SACK states return false — the within-capability
+		// probe is byte-identical to the pre-fix path.
+		{
+			bool q3_eq_sack    = turbo_snr_truncates_probe(CONFIG_15, CONFIG_15, /*sack=*/true);
+			bool q3_eq_nosack  = turbo_snr_truncates_probe(CONFIG_15, CONFIG_15, /*sack=*/false);
+			bool q3_above_sack = turbo_snr_truncates_probe(CONFIG_16, CONFIG_15, /*sack=*/true);
+			bool q3_above_nos  = turbo_snr_truncates_probe(CONFIG_16, CONFIG_15, /*sack=*/false);
+			check(!q3_eq_sack && !q3_eq_nosack && !q3_above_sack && !q3_above_nos,
+				"Q3 within-capability (snr_max >= negotiated) NEVER truncates, either SACK state (no spurious truncation)",
+				(q3_eq_sack?8:0)+(q3_eq_nosack?4:0)+(q3_above_sack?2:0)+(q3_above_nos?1:0), 0);
+		}
+
+		// Q4 — the headline single-rung case the HW log captured: snr_max=CFG14,
+		// negotiated=CFG16 (the final CFG15->CFG16 step). SACK ON => no truncation
+		// => CFG16 reachable; SACK OFF => truncates (legacy). Asserts the fix bites
+		// on the EXACT top-rung step, not just the mid-ladder one.
+		{
+			bool q4_sack   = turbo_snr_truncates_probe(CONFIG_14, CONFIG_16, /*sack=*/true);
+			bool q4_nosack = turbo_snr_truncates_probe(CONFIG_14, CONFIG_16, /*sack=*/false);
+			check(q4_sack == false && q4_nosack == true,
+				"Q4 top-rung step (snr_max=CFG14, negotiated=CFG16): SACK-ON reaches CFG16, SACK-OFF truncates (legacy)",
+				(q4_sack?2:0)+(q4_nosack?1:0), 1);
+		}
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
