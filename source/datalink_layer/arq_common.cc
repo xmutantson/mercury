@@ -5848,6 +5848,91 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 		tail_samples = signal_period;
 	int tail_offset = signal_period - tail_samples;
 
+	// ------------------------------------------------------------------
+	// SIM_INPROC control-ACK arrival-window re-scan (ADDITIVE; pump-armed
+	// poll, single-process-sim-refactor.md §5.7-B8 sibling).
+	//
+	// In production the ~500 Hz capture-prep thread CONTINUOUSLY refreshes the
+	// ring between A's process_main ticks, so the once-per-tick poll below
+	// naturally sweeps the entire ACK arrival window: whichever tick the
+	// trailing ACK sample reaches the demod, that tick's snapshot sees it.
+	//
+	// The single-thread stepper has NO prep thread. The peer's control-ACK
+	// pattern lands in A's ring exactly ONCE (when the §10.5 deferral releases
+	// the rx->tx wire while A is idle), and the pump's idle-silence symbols
+	// then push it out of the tail before A's NEXT per-tick scan — so every
+	// scan sees a silent tail (tail_rms < gate -> energy gate skips the
+	// correlator) and A never advances to NEGOTIATING. Identical class to the
+	// already-fixed B8 HAIL RX-poll (arq_commander.cc:428) and the inverted
+	// spin-loops: the detector is fine, the poll just never sees the buffer at
+	// the instant the reply lands.
+	//
+	// FIX (B8 mirror): when the step-pump is installed (ONLY under -m
+	// SIM_INPROC), pump the SHARED virtual clock forward in short slices and
+	// re-probe the tail until the ACK pattern's ENERGY is present in a
+	// scannable state (frames_to_read==0 AND tail RMS over the gate), or a
+	// bounded arrival window elapses. The pump drains peer->A through the wire
+	// + advances the clock through the SAME rx_transfer accounting the prep
+	// thread uses (and co-routine-drives the peer so it actually emits the
+	// reply), so this is the in-thread equivalent of letting the prep thread
+	// refresh the ring across the window. The UNCHANGED detection body below
+	// then runs exactly as in production — SAME energy gate, SAME correlator,
+	// SAME threshold (ack_match_threshold + ack_metric_threshold), SAME
+	// frames_to_read / defer_audio_advance bookkeeping. We only change WHEN the
+	// poll sees the buffer, never WHETHER it accepts. On a real miss the window
+	// expires and the body's normal miss path (frames_to_read=2; return false)
+	// fires verbatim, so A re-polls next tick exactly as in production.
+	//
+	// Production + the two-process paced sim leave the pump null
+	// (arq_sim_inproc_active()==false) -> this whole block is skipped ->
+	// byte-identical.
+	if(arq_sim_inproc_active())
+	{
+		// Arrival window: tail span + the responder's PTT/turnaround margin
+		// (~1 s, see [TX-ACK-PAT] guard) expressed in virtual ms, capped so a
+		// genuinely silent line still returns within one ack-poll cadence.
+		double sym_ms = (sym_samples > 0)
+			? (double)sym_samples * 1000.0 / (double)SIM_CLOCK_SAMPLE_RATE_HZ
+			: 1.0;
+		int window_ms = (int)((double)tail_nsymb * sym_ms) + 1200;
+		const double SIM_ACK_PROBE_GATE_RMS = 0.001; // == ACK_ENERGY_GATE_RMS
+		int elapsed_ms = 0;
+		// Slice = 2 symbols (== the body's frames_to_read=2 re-poll cadence),
+		// so the pump delivers whole symbols the way the prep thread would.
+		int slice_ms = (int)(2.0 * sym_ms) + 1;
+		// Probe the WHOLE tail (not just the last 8 symbols the body's CPU-gate
+		// uses). The stepper delivers the peer's ACK as ONE batch (drains the
+		// whole rx->tx wire at once: ACK pattern + the peer's trailing idle
+		// silence), so unlike the ~500 Hz prep thread it does NOT leave the ACK
+		// in the last few symbols — the ACK sits MID-tail with ~10-15 symbols of
+		// trailing silence. A last-8-symbol probe would therefore always read
+		// silence; we break as soon as the ACK ENERGY appears anywhere in the
+		// tail (the same span the correlator below searches). Pumping FURTHER
+		// only adds trailing silence and drifts the ACK out of the tail, so we
+		// must stop the instant energy is present — pump only to WAIT for it.
+		while(elapsed_ms < window_ms)
+		{
+			bool scannable = false;
+			MUTEX_LOCK(&capture_prep_mutex);
+			if(telecom_system->data_container.frames_to_read == 0)
+			{
+				int rwi = telecom_system->data_container.ring_write_index;
+				double* tp = &telecom_system->data_container
+					.passband_delayed_data[rwi + tail_offset];
+				double sumsq = 0.0;
+				for(int i = 0; i < tail_samples; i++) sumsq += tp[i] * tp[i];
+				double rms = std::sqrt(sumsq / tail_samples);
+				if(rms >= SIM_ACK_PROBE_GATE_RMS)
+					scannable = true;   // ACK energy is in the tail NOW — scan it
+			}
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			if(scannable)
+				break;                  // run the UNCHANGED detection body below
+			pumped_settle_wait(slice_ms);   // advance shared clock + deliver reply
+			elapsed_ms += slice_ms;
+		}
+	}
+
 	MUTEX_LOCK(&capture_prep_mutex);
 
 	if(telecom_system->data_container.frames_to_read == 0)
@@ -5877,7 +5962,18 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 			energy_logged_this_window = false;
 		}
 		const double ACK_ENERGY_GATE_RMS = 0.001;
-		int probe_n = 8 * sym_samples;
+		// Energy-gate window: last 8 symbols in production (CPU pre-filter — the
+		// prep thread leaves a freshly-arrived ACK in the newest symbols). Under
+		// the SIM_INPROC pump the peer's ACK is delivered as ONE batch (ACK +
+		// trailing idle silence), so it sits MID-tail; probing only the last 8
+		// symbols would read silence and skip a tail that DOES contain the ACK.
+		// Widen the GATE to the full tail under SIM so it does not pre-filter out
+		// a present ACK. This changes ONLY the CPU pre-filter span — the
+		// correlator below already searches the whole tail and its accept
+		// threshold (ack_match_threshold + ack_metric_threshold) is unchanged, so
+		// detection semantics are identical. Production/paced-sim keep the 8-symbol
+		// window (pump null) -> byte-identical.
+		int probe_n = arq_sim_inproc_active() ? tail_samples : (8 * sym_samples);
 		if(probe_n > tail_samples) probe_n = tail_samples;
 		double* tail_ptr = telecom_system->data_container.ready_to_process_passband_delayed_data
 			+ (tail_samples - probe_n);
