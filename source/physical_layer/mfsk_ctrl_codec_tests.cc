@@ -5783,6 +5783,290 @@ static void test_ofdm_fine_timing_magnitude_clean_no_regression() {
 	}
 }
 
+// =============================================================================
+// §22.3 MATCHED-FILTER fine-timing SYMBOL-RESOLUTION at the wgn0 SNR floor
+//       (sim/ofdm-finetiming-matched-swap, 2026-06-04).
+//
+// LEVER under test: the production site-8 FINE peak selection now SEEDS the
+// coherent matched filter (time_sync_preamble_matched) one symbol into the
+// slice (avoiding the (K-1)/K early-symbol trap) and takes ONLY matched's
+// discrete SYMBOL-index correction, anchored on the CFO-robust self-autocorr
+// sub-sample timing (telecom_system.cc site-8 HYBRID SELECTION block).
+//
+// At the operating Es/N0 (-4..-6) the self-autocorr (FIX-2 magnitude form)
+// TIES on the WRONG adjacent symbol boundary on a large fraction of noise
+// realizations -> FFT window a symbol off -> nv blows up / mean_H collapses ->
+// SKIP-H/SKIP-VAR reject. The matched filter's discrimination grows with
+// integration length, so it resolves WHICH symbol. This test reproduces the
+// site-8 slice geometry EXACTLY and runs BOTH selectors on the SAME noise
+// realizations using the PRODUCTION functions + the (now re-enabled) production
+// matched-filter template, then asserts the matched-hybrid lands the correct
+// symbol on substantially more realizations than the self-autocorr alone.
+//
+// FAIL-BEFORE: without the seeding shift the matched filter falls into the
+// one-symbol-early (K-1)/K trap (good-symbol fraction collapses to ~the
+// self-autocorr's). WITHOUT the matched filter (template NULL / sibling-disabled
+// state) the hybrid == self-autocorr (no lift). PASS-AFTER: the matched-hybrid
+// good-symbol fraction rises sharply.
+// =============================================================================
+static void test_ofdm_fine_timing_matched_symbol_resolution() {
+	const char* name = "ofdm_fine_timing_matched_symbol_resolution";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_0);   // WB BPSK, 4-sym OFDM preamble
+	if (ts.current_configuration != CONFIG_0) {
+		test_fail(name, "load_configuration(CONFIG_0) did not take");
+		return;
+	}
+
+	// Prereq #1 check: re-enabled production template must be live (non-NULL).
+	if (ts.ofdm.ofdm_corr_template == NULL || ts.ofdm.ofdm_corr_template_len <= 0) {
+		test_fail(name, "ofdm_corr_template is NULL — matched-filter template build "
+			"is not re-enabled (telecom_system.cc load_configuration #if 0 still active)");
+		return;
+	}
+
+	int interp     = ts.frequency_interpolation_rate;
+	int Nofdm      = ts.data_container.Nofdm;
+	int preamble_n = ts.data_container.preamble_nSymb;
+	int Nsymb      = ts.data_container.Nsymb;
+	int sym_samp   = Nofdm * interp;
+	int gi_interp  = ts.data_container.Ngi * interp;
+
+	// Build a clean CONFIG_0 frame (preamble+pilots+data), no CFO.
+	int nReal_data  = ts.data_container.nBits - ts.ldpc.P;
+	int frame_bytes = (nReal_data - ts.outer_code_reserved_bits) / 8;
+	if (frame_bytes < 1) frame_bytes = 1;
+	for (int i = 0; i < frame_bytes; i++)
+		ts.data_container.data_byte[i] = (i * 37 + 11) & 0xFF;
+	test_tx_carrier_offset = 0.0;
+	int frame_samp = Nofdm * (Nsymb + preamble_n) * interp;
+	std::vector<double> tx_frame((size_t)frame_samp, 0.0);
+	ts.transmit_byte(ts.data_container.data_byte, frame_bytes,
+		tx_frame.data(), SINGLE_MESSAGE);
+
+	double P_sig = 0.0;
+	for (int i = 0; i < frame_samp; i++) P_sig += tx_frame[i] * tx_frame[i];
+	P_sig /= frame_samp;
+	double f_nyquist = ts.sampling_frequency / 2.0;
+
+	// Buffer geometry mirrors site-8: lead noise + frame + trail noise. The
+	// true preamble sits at symbol `true_pream_symb_loc`; the site-8 slice the
+	// coarse stage would hand the fine stage begins ONE symbol earlier.
+	int true_pream_symb_loc = preamble_n + 4;            // == ofdm_ftr_roundtrip
+	int true_delay = true_pream_symb_loc * sym_samp;
+	int trail_symbols = 6;
+	int buf_samp = true_delay + frame_samp + trail_symbols * sym_samp;
+
+	// Site-8 slice bounds (full-rate), identical to telecom_system.cc.
+	int s8_win_start = (true_pream_symb_loc - 1) * sym_samp;
+	if (s8_win_start < 0) s8_win_start = 0;
+	int s8_win_len = (preamble_n + 4) * sym_samp;
+	if (s8_win_start + s8_win_len > buf_samp) s8_win_len = buf_samp - s8_win_start;
+
+	// matched seeding (same arithmetic as the production site-8 HYBRID block).
+	int mf_lead_skip = sym_samp - gi_interp;
+	if (mf_lead_skip < 0) mf_lead_skip = 0;
+	int mf_win_off = mf_lead_skip;
+	int mf_search_len = s8_win_len - mf_lead_skip;
+	int mf_min_len = (preamble_n + 1) * sym_samp;
+
+	const double ESN0[]  = { -4.0, -6.0 };
+	const int    NSEED   = 60;
+	const double half_sym = 0.5 * sym_samp;
+
+	std::vector<std::complex<double> > bb((size_t)buf_samp);
+	int worst = 0;
+	bool any_lever = false;
+
+	for (int e = 0; e < 2; e++) {
+		double esn0 = ESN0[e];
+		double sigma = sqrt(2.0 * P_sig * f_nyquist /
+			(pow(10.0, esn0 / 10.0) * ts.bandwidth));
+		double per_samp = sigma / sqrt(2.0);
+
+		int good_self = 0, good_hybrid = 0;
+		srand(91000u + (unsigned)e);
+
+		for (int t = 0; t < NSEED; t++) {
+			std::vector<double> rx((size_t)buf_samp, 0.0);
+			for (int i = 0; i < buf_samp; i++)
+				rx[(size_t)i] = per_samp * ts.awgn_channel.awgn_value_generator();
+			for (int i = 0; i < frame_samp; i++)
+				rx[(size_t)(true_delay + i)] += tx_frame[i];
+
+			// passband -> full-rate baseband, exactly as site-8 prepares the slice.
+			ts.ofdm.passband_to_baseband(rx.data(), buf_samp, bb.data(),
+				ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+				1, &ts.ofdm.FIR_rx_time_sync);
+
+			// A: self-autocorr alone (FIX-2 baseline), peak-pick over the slice.
+			TimeSyncResult sa = ts.ofdm.time_sync_preamble_with_metric(
+				&bb[(size_t)s8_win_start], s8_win_len, interp,
+				/*location_to_return=*/0, /*step=*/1,
+				/*nTrials_max=*/ts.time_sync_trials_max);
+			int self_delay = s8_win_start + sa.delay;
+			int hybrid_delay = self_delay;
+
+			// B: matched-hybrid — seed one symbol in, take only the discrete
+			//    symbol-index correction anchored on the self-autocorr (matches
+			//    the production site-8 HYBRID SELECTION block).
+			if (mf_search_len >= mf_min_len) {
+				TimeSyncResult mf = ts.ofdm.time_sync_preamble_matched(
+					&bb[(size_t)(s8_win_start + mf_win_off)], mf_search_len,
+					interp, preamble_n);
+				int matched_delay = s8_win_start + mf_lead_skip + mf.delay;
+				if (mf.correlation >= 0.1) {
+					double sym_q = (double)(matched_delay - self_delay) / (double)sym_samp;
+					int sym_shift = (int)floor(sym_q + 0.5);
+					if (sym_shift >= -1 && sym_shift <= 1)
+						hybrid_delay = self_delay + sym_shift * sym_samp;
+				}
+			}
+
+			if (std::abs(self_delay   - true_delay) <= (int)half_sym) good_self++;
+			if (std::abs(hybrid_delay - true_delay) <= (int)half_sym) good_hybrid++;
+		}
+
+		printf("    [FTR-MATCHED] EsN0=%.1f n=%d good-symbol: self-autocorr=%d/%d "
+			"matched-hybrid=%d/%d\n", esn0, NSEED, good_self, NSEED, good_hybrid, NSEED);
+		int lift = good_hybrid - good_self;   // track MIN lift across cells
+		if (e == 0 || lift < worst) worst = lift;
+		// Lever present at THIS cell: matched-hybrid lands the correct symbol on
+		// materially more realizations than the self-autocorr alone — a clear
+		// minimum absolute lift (>= NSEED/5) AND at least a 1.5x ratio. (The
+		// validator measured matched resolving 66-91% of the self-autocorr's
+		// >1-sym mis-places at Es/N0 -4..-6; here the analog is the good-symbol
+		// count lift. The absolute fraction is NOT required to be high — these
+		// deep single-frame cells are partly genuinely decode-limited, matching
+		// the validator's deeper-cell behavior.)
+		bool cell_lever = (lift >= NSEED / 5) &&
+		                  (good_hybrid * 2 >= good_self * 3);   // >= 1.5x
+		if (e == 0) any_lever = cell_lever; else any_lever = any_lever && cell_lever;
+	}
+
+	// PASS: the lever holds at BOTH operating cells (matched-hybrid resolves the
+	// self-autocorr's wrong-symbol mis-places) AND the matched-hybrid never lands
+	// the WRONG symbol more often than the self-autocorr alone (worst lift >= 0,
+	// no regression).
+	if (any_lever && worst >= 0)
+		test_pass(name);
+	else {
+		char b[220];
+		snprintf(b, sizeof(b),
+			"matched-filter symbol resolution insufficient: lever=%d worst_lift=%d "
+			"(expected matched-hybrid good-symbol count >= 1.5x self-autocorr's at "
+			"BOTH wgn0 cells; check seeding shift + symbol-quantized hybrid + template)",
+			(int)any_lever, worst);
+		test_fail(name, b);
+	}
+}
+
+// §22.4 HIGH-RATE no-regression: the matched-filter fine-timing swap must NOT
+// break clean-signal acquisition + decode on the high-throughput configs
+// (CONFIG_10, CONFIG_15). Drives the REAL production receive_byte acquisition
+// path (ofdm_forced_delay = -1, so site-8 fine timing — incl. the matched
+// hybrid — runs) on a clean (high-SNR, no-CFO) frame of the given config and
+// asserts the frame ACQUIRES at the correct delay (±Ngi), mean_H survives the
+// SKIP-H gate, AND the LDPC CRC passes (full decode). The PLOT_PASSBAND BER
+// sweep CANNOT cover this: it sets ofdm_forced_delay, bypassing site-8 entirely
+// (the very reason the original timing bug never showed in --test).
+static bool ofdm_highrate_acquire_decode(int config, double snr3k_db,
+                                          unsigned int seed, const char* name) {
+	srand(seed);
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(config);
+	if (ts.current_configuration != config) {
+		test_fail(name, "load_configuration(config) did not take");
+		return false;
+	}
+
+	int interp     = ts.frequency_interpolation_rate;
+	int Nofdm      = ts.data_container.Nofdm;
+	int preamble_n = ts.data_container.preamble_nSymb;
+	int Nsymb      = ts.data_container.Nsymb;
+	int buffer_N   = ts.data_container.buffer_Nsymb;
+	int sym_samp   = Nofdm * interp;
+	int Ngi_i      = ts.data_container.Ngi * interp;
+
+	int nReal_data  = ts.data_container.nBits - ts.ldpc.P;
+	int frame_bits  = nReal_data - ts.outer_code_reserved_bits;
+	int frame_bytes = frame_bits / 8;
+	if (frame_bytes < 1) { test_fail(name, "frame_bytes < 1"); return false; }
+
+	// Deterministic payload; keep a copy to verify the decode.
+	std::vector<int> tx_bytes((size_t)frame_bytes);
+	for (int i = 0; i < frame_bytes; i++) {
+		tx_bytes[(size_t)i] = (i * 53 + 7) & 0xFF;
+		ts.data_container.data_byte[i] = tx_bytes[(size_t)i];
+	}
+	test_tx_carrier_offset = 0.0;
+	ts.transmit_byte(ts.data_container.data_byte, frame_bytes,
+		ts.data_container.passband_data, SINGLE_MESSAGE);
+
+	int frame_samples = Nofdm * (Nsymb + preamble_n) * interp;
+	int rx_samples = Nofdm * buffer_N * interp;
+	std::vector<double> rx((size_t)rx_samples, 0.0);
+
+	int delay = (preamble_n + 4) * sym_samp;
+	if (delay + frame_samples > rx_samples) delay = rx_samples - frame_samples;
+	if (delay < 0) delay = 0;
+
+	double P_sig = 0.0;
+	for (int i = 0; i < frame_samples; i++)
+		P_sig += ts.data_container.passband_data[i] * ts.data_container.passband_data[i];
+	P_sig /= frame_samples;
+	double f_nyquist = ts.sampling_frequency / 2.0;
+	double sigma = sqrt(2.0 * P_sig * f_nyquist /
+		(pow(10.0, snr3k_db / 10.0) * ts.bandwidth));
+	double ampl_val = sigma / sqrt(2.0);
+
+	for (int i = 0; i < frame_samples; i++)
+		rx[(size_t)(delay + i)] = ts.data_container.passband_data[i];
+	for (int i = 0; i < rx_samples; i++)
+		rx[(size_t)i] += ampl_val * ts.awgn_channel.awgn_value_generator();
+
+	ts.ofdm_forced_delay = -1;   // REAL acquisition: site-8 + matched hybrid run
+	st_receive_stats st = ts.receive_byte(rx.data(), ts.data_container.hd_decoded_data_byte);
+
+	int derr = std::abs(st.delay - delay);
+	// Decode success = the LDPC-decoded payload bytes match the transmitted
+	// payload (ground truth). st.crc is the CRC16 *remainder* (0 == valid) and
+	// only meaningful for CRC-appended frames, so we assert on the byte match.
+	bool bytes_ok = true;
+	for (int i = 0; i < frame_bytes && bytes_ok; i++)
+		if ((ts.data_container.hd_decoded_data_byte[i] & 0xFF) != tx_bytes[(size_t)i])
+			bytes_ok = false;
+
+	printf("    [FTR-HIRATE] CONFIG_%d SNR3k=%.1f delay_err=%d (±Ngi=%d) mean_H=%.3f "
+		"crc=%d bytes_ok=%d\n", config, snr3k_db, derr, Ngi_i, st.mean_H, st.crc, (int)bytes_ok);
+
+	if (derr <= Ngi_i && st.mean_H >= 0.30 && bytes_ok)
+		return true;
+
+	char b[240];
+	snprintf(b, sizeof(b),
+		"CONFIG_%d clean acquisition/decode regressed under matched swap: "
+		"delay_err=%d (±Ngi=%d) mean_H=%.3f crc(rem)=%d bytes_ok=%d",
+		config, derr, Ngi_i, st.mean_H, st.crc, (int)bytes_ok);
+	test_fail(name, b);
+	return false;
+}
+
+static void test_ofdm_fine_timing_matched_highrate_no_regression() {
+	const char* name = "ofdm_fine_timing_matched_highrate_no_regression";
+	// Clean channel SNR3k well above each config's threshold so acquisition +
+	// decode are deterministic; the variable under test is whether the matched
+	// swap perturbs clean high-rate acquisition (it must not).
+	bool ok10 = ofdm_highrate_acquire_decode(CONFIG_10, /*snr3k=*/20.0, 31u, name);
+	bool ok15 = ofdm_highrate_acquire_decode(CONFIG_15, /*snr3k=*/24.0, 37u, name);
+	if (ok10 && ok15)
+		test_pass(name);
+	// (ofdm_highrate_acquire_decode already emitted test_fail on the failing arm.)
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5910,6 +6194,8 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (the keystone)
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
+	test_ofdm_fine_timing_matched_symbol_resolution();      // §22.3 matched-hybrid lever (wgn0 symbol resolution)
+	test_ofdm_fine_timing_matched_highrate_no_regression(); // §22.4 CONFIG_10/15 clean acquire+decode
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
@@ -5926,6 +6212,8 @@ int run_ofdm_fine_timing_tests() {
 	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (keystone)
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
+	test_ofdm_fine_timing_matched_symbol_resolution();      // §22.3 matched-hybrid lever (wgn0 symbol resolution)
+	test_ofdm_fine_timing_matched_highrate_no_regression(); // §22.4 CONFIG_10/15 clean acquire+decode
 	printf("=== §22 done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }

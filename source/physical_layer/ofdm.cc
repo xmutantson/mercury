@@ -3183,8 +3183,12 @@ TimeSyncResult cl_ofdm::time_sync_preamble_matched(
 	// all K>=2, systematically selecting the wrong (one-symbol-early) position.
 	int coarse_result_pos = best_coarse_pos;
 
-	// DIAG: per-symbol breakdown at best coarse position (remove after debug)
-	if (best_coarse_metric < 2.0)
+	// DIAG: per-symbol breakdown at best coarse position. Gated on g_verbose:
+	// time_sync_preamble_matched is now on the per-frame production RX hot path
+	// (SIM-validated fine-timing swap, 2026-06-04), so this must not spam logs
+	// / add latency on every sub-threshold fine slice (cf. printf-in-hot-loop
+	// SACK bug #15). Available with -v for debugging.
+	if (g_verbose && best_coarse_metric < 2.0)
 	{
 		printf("[MF-DIAG] best_coarse=%.4f pos=%d n_coarse=%d\n",
 			best_coarse_metric, best_coarse_pos, n_coarse);
@@ -3287,8 +3291,9 @@ TimeSyncResult cl_ofdm::time_sync_preamble_matched(
 		}
 	}
 
-	// DIAG: per-quarter energy decomposition at fine search peak
-	if (best_fine_metric < 2.0 && best_fine_metric >= 0.5)
+	// DIAG: per-quarter energy decomposition at fine search peak.
+	// Gated on g_verbose (per-frame production RX hot path; see [MF-DIAG] above).
+	if (g_verbose && best_fine_metric < 2.0 && best_fine_metric >= 0.5)
 	{
 		printf("[MF-DIAG2] fine_pos=%d fine_metric=%.4f interp=%d Nofdm=%d Ngi=%d\n",
 			best_fine_pos, best_fine_metric, interpolation_rate, Nofdm, Ngi);

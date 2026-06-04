@@ -3823,7 +3823,11 @@ void cl_arq_controller::send_batch()
 			batch_selftest_count = 0;
 			batch_selftest_last_config = current_configuration;
 		}
-		if(batch_selftest_count < 1 && telecom_system->ofdm.ofdm_corr_template != NULL
+		// Gated on g_verbose: re-enabling the ofdm_corr_template build (matched
+		// fine-timing swap, 2026-06-04) reactivates this TX self-test, which does
+		// a full passband->baseband round-trip per config. Keep it off the
+		// production path; available with -v to confirm the template matches TX.
+		if(g_verbose && batch_selftest_count < 1 && telecom_system->ofdm.ofdm_corr_template != NULL
 			&& telecom_system->M != MOD_MFSK)
 		{
 			batch_selftest_count++;

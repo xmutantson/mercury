@@ -2119,11 +2119,154 @@ skip_h_retry_point:
 				int s8_search_len = s8_win_len;
 				if(s8_interior + s8_search_len > s8_ext_len)
 					s8_search_len = s8_ext_len - s8_interior;
+				// SIM-validated fine peak selection (2026-06-04, branch
+				// sim/ofdm-finetiming-matched-build, fact-doc
+				// ofdm-data-acquisition-fix-plan.md).
+				//
+				// PREFERRED: the COHERENT matched filter (time_sync_preamble_matched).
+				// The self-autocorr (time_sync_preamble_with_metric) is a NORMALIZED
+				// |P|^2/(A^2 R) metric whose noise-floor mean is INTEGRATION-LENGTH-
+				// INVARIANT (Schmidl & Cox 1997 eq.19): at the wgn0 SNR floor it ties
+				// ~equally on the WRONG adjacent symbol boundary and picks a wrong
+				// sub-sample offset on ~94% of frames on RF -> FFT window misaligned
+				// -> nv blows up -> mean_H~0.29 -> SKIP-H/SKIP-VAR reject. (This is
+				// why FIX-2, which only changed the self-autocorr METRIC to magnitude,
+				// was inert: the failure is WHICH position it selects.) The matched
+				// filter correlates against the KNOWN preamble template
+				// (ofdm_corr_template) so its discrimination GROWS with integration
+				// length -> it RESOLVES the wrong-symbol tie (SIM-validated: resolves
+				// 66-91% of the self-autocorr mis-places at Es/N0 -4..-6, median
+				// abs-err -> 0 sub-sample; ofdm_finetiming_ab/SUMMARY.txt). It outputs
+				// only a DELAY (amplitude-independent), so NO gate re-tuning is needed
+				// (SUBPEAK-REJECT/SKIP-H/SKIP-VAR/coarse_metric key on coarse_metric +
+				// mean_H + nv, NOT the fine metric, which is and always was discarded
+				// here; see fact-doc §4).
+				//
+				// SEEDING (validator prereq #2 + the (K-1)/K early-symbol trap fix):
+				// run matched on the SAME guard-extended, FIR'd site-8 slice the
+				// self-autocorr uses, but SHIFTED FORWARD by ~one symbol so matched's
+				// own coarse(GI-stride)+fine(sample-stride) search is seeded AT the
+				// coarse-detected preamble boundary, not one symbol before it.
+				//
+				// WHY THE SHIFT IS REQUIRED (the sibling build's blocker, fact-doc §7):
+				// the slice begins at s8_win_start = (pream_symb_loc-1)*sym_interp =
+				// ONE SYMBOL before the true preamble (that lead symbol is the self-
+				// autocorr's sub-sample search room). When matched ran on the raw slice,
+				// its coarse search included that slice-start symbol, where its
+				// 3-of-4-symbol PARTIAL Cauchy-Schwarz (preamble symbols 0,1,2 align,
+				// symbol 3 falls on noise) ties/beats the full 4-of-4 match one symbol
+				// later under noise. With K=4 identical preamble symbols the (K-1)/K
+				// partial = 0.75 of full, close enough that a noise realization tips it
+				// (measured: matched->8680 mf_corr=2.965 vs true 9920; --test
+				// delay_err=1240 = exactly ONE symbol early). This is the same
+				// (K-1)/K identical-preamble-symbol trap the validator flagged for
+				// fft_fine; matched is NOT immune when seeded on a slice that includes
+				// the pre-preamble symbol. The whole-buffer flat-AWGN validator did not
+				// reproduce it because there the true preamble was 4 symbols interior,
+				// so the early-by-one position was a low-scoring far-noise candidate.
+				//
+				// FIX (single variable): hand matched a window starting mf_lead_skip =
+				// (sym_interp - gi_interp) into the slice. That puts matched's pos 0 one
+				// GI before the true-preamble boundary (sub-sample/jitter slack
+				// preserved) while structurally EXCLUDING the one-symbol-early trap
+				// (a full symbol earlier) from matched's candidate set. matched's coarse
+				// GI-stride candidates then start at the true boundary; its internal
+				// ±gi fine search resolves the sub-sample offset. The window still spans
+				// the slice's +4 trailing symbols, so a coarse symbol-undershoot
+				// (true preamble slightly LATER) is still reachable. (Validated:
+				// --test-ofdm-fine-timing clean+CFO production-path cells pass.)
+				//
+				// AMPLITUDE-INDEPENDENT / NO GATE RE-TUNE: matched contributes only a
+				// DELAY (Cauchy-Schwarz is RX-gain/fading invariant); its correlation is
+				// never read by SUBPEAK-REJECT/SKIP-H/SKIP-VAR/coarse_metric (all key on
+				// coarse_metric + mean_H + nv; the fine metric is and always was
+				// discarded here — see fact-doc §4).
+				//
+				// FALLBACK (keeps FIX-2 in the path): compute the self-autocorr result
+				// first and keep it bit-exactly when (a) the template is unavailable
+				// (NULL, e.g. a build/config without it) OR (b) matched fails to confirm
+				// a preamble in its (shifted) window (best_coarse_metric < 0.1 -> matched
+				// early-returns corr=0) OR (c) the seeded window is too short OR (d)
+				// matched disagrees with the self-autocorr by more than one symbol (a
+				// CFO-decorrelated wrong-frame grab). See the HYBRID SELECTION block
+				// below: FIX-2 is the CFO-robust sub-sample anchor and matched supplies
+				// only the discrete symbol-index correction.
 				TimeSyncResult fine_result = ofdm.time_sync_preamble_with_metric(
 					&data_container.baseband_data_fine_slice[s8_interior],
 					s8_search_len,
 					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max);
-				receive_stats.delay = s8_win_start + fine_result.delay;
+				int self_autocorr_delay = s8_win_start + fine_result.delay;
+				receive_stats.delay = self_autocorr_delay;
+
+				// Seed matched at the coarse preamble boundary (one symbol into the
+				// slice) minus one GI of sub-symbol slack. sym_interp / gi_interp here
+				// are in fine_slice (full-rate) coordinates, matching s8_interior /
+				// s8_search_len.
+				int s8_sym_interp = data_container.Nofdm * frequency_interpolation_rate;
+				int s8_gi_interp  = data_container.Ngi  * frequency_interpolation_rate;
+				int mf_lead_skip  = s8_sym_interp - s8_gi_interp;   // ~one symbol of lead
+				if(mf_lead_skip < 0) mf_lead_skip = 0;
+				int mf_win_off    = s8_interior + mf_lead_skip;     // fine_slice index
+				int mf_search_len = s8_search_len - mf_lead_skip;   // remaining window
+				// Require at least the preamble + the matched ±gi fine span to fit.
+				int mf_min_len = (data_container.preamble_nSymb + 1) * s8_sym_interp;
+				if(ofdm.ofdm_corr_template != NULL && ofdm.ofdm_corr_template_len > 0
+				   && mf_search_len >= mf_min_len)
+				{
+					TimeSyncResult mf = ofdm.time_sync_preamble_matched(
+						&data_container.baseband_data_fine_slice[mf_win_off],
+						mf_search_len,
+						data_container.interpolation_rate,
+						data_container.preamble_nSymb);
+					int matched_delay = s8_win_start + mf_lead_skip + mf.delay;
+
+					// HYBRID SELECTION (matched corrects the SYMBOL, self-autocorr keeps
+					// the sub-sample). Root diagnosis: the self-autocorr (FIX-2 magnitude
+					// |P|^2/(A^2 R)) ties on the WRONG adjacent SYMBOL boundary at the
+					// noise floor -> whole-symbol mis-placement -> FFT window off by a
+					// symbol -> nv blows up / mean_H collapses. The coherent matched
+					// filter's discrimination GROWS with integration length, so it
+					// reliably picks WHICH symbol. But matched is CFO-SENSITIVE at the
+					// sub-sample level (the template carries no CFO): under residual
+					// post-Moose CFO its raw sample drifts (measured: 30 Hz @ SNR3k=8 ->
+					// matched sub-sample err up to ~250 samp while the CFO-robust
+					// self-autocorr stays within a few samp of true) and it can grab a
+					// wrong frame / noise peak (>1 symbol away). So take ONLY matched's
+					// discrete symbol-index correction, anchored on the self-autocorr's
+					// (CFO-robust) sub-sample timing:
+					//   sym_shift = round((matched - self)/sym_interp)
+					//   delay     = self + sym_shift*sym_interp        (|sym_shift| <= 1)
+					// This (a) corrects the wgn0 whole-symbol mis-place (sym_shift=+/-1 ->
+					// the SIM-validated mean_H recovery, FFT window inside the GI), (b)
+					// ignores matched's CFO sub-sample drift (sym_shift=0 keeps self), and
+					// (c) rejects wrong-frame/noise-peak grabs (|sym_shift|>1 -> keep self,
+					// the CFO-robust fallback). matched contributes only a DELAY
+					// (amplitude-independent Cauchy-Schwarz) so NO gate re-tuning is
+					// needed (SUBPEAK-REJECT/SKIP-H/SKIP-VAR/coarse_metric never read the
+					// fine metric; fact-doc §4). 0.1 is the same in-window preamble-present
+					// floor matched's coarse stage uses (ofdm.cc:3233) -> below it matched
+					// saw no preamble, keep self.
+					if(mf.correlation >= 0.1)
+					{
+						double sym_q = (double)(matched_delay - self_autocorr_delay)
+							/ (double)s8_sym_interp;
+						int sym_shift = (int)floor(sym_q + 0.5);          // round to nearest symbol
+						if(sym_shift >= -1 && sym_shift <= 1)
+						{
+							int hybrid_delay = self_autocorr_delay + sym_shift * s8_sym_interp;
+							if(g_verbose && hybrid_delay != self_autocorr_delay)
+								printf("[OFDM-SYNC] matched fine: delay %d->%d (sym_shift=%+d mf_raw=%d mf_corr=%.3f seed=+%d)\n",
+									self_autocorr_delay, hybrid_delay, sym_shift, matched_delay,
+									mf.correlation, mf_lead_skip);
+							receive_stats.delay = hybrid_delay;
+						}
+						else if(g_verbose)
+						{
+							printf("[OFDM-SYNC] matched fine REJECT: |sym_shift|=%d>1 (mf_raw=%d self=%d mf_corr=%.3f) -> keep self-autocorr\n",
+								sym_shift, matched_delay, self_autocorr_delay, mf.correlation);
+						}
+					}
+				}
 			}
 
 			if(receive_stats.delay<0){receive_stats.delay=0;}
@@ -5663,7 +5806,15 @@ void cl_telecom_system::load_configuration(int configuration)
 		for(int s = 0; s < 16; s++) ofdm.mfsk_preamble_tones[s] = 0;
 		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
 
-#if 0 // Template generation disabled: using Schmidl-Cox autocorrelation
+		// RE-ENABLED 2026-06-04 (branch sim/ofdm-finetiming-matched-build):
+		// the coherent matched filter is the SIM-validated fine-timing selector
+		// (see fact-documents/ofdm-data-acquisition-fix-plan.md). The build was
+		// previously #if 0'd in 95a60b9 as a STRATEGY choice ("using Schmidl-Cox
+		// autocorrelation"); the matched filter's only historical weakness
+		// (Bug #54 -2fc conjugate-image leakage) was a FIR_rx_time_sync
+		// transition-bandwidth issue that the SAME commit fixed and that fix is
+		// in this base. Without this build ofdm_corr_template is NULL and
+		// time_sync_preamble_matched (ofdm.cc:3089) early-returns delay=0 (DEAD).
 		// Generate OFDM matched-filter template for preamble detection.
 		// Must replicate the full TX→RX chain so the template matches what
 		// receive_byte actually sees:
@@ -5689,7 +5840,8 @@ void cl_telecom_system::load_configuration(int configuration)
 			ofdm.symbol_mod(preamble_sc, &bb_template[i * Nofdm]);
 		}
 
-		// === DIAG: pre_eq at template generation (remove after debug) ===
+		// === DIAG: pre_eq at template generation (g_verbose only) ===
+		if(g_verbose) {
 		printf("[TMPL-PREEQ] CONFIG_%d preamble_nSymb=%d pre_eq[0..4]=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)\n",
 			current_configuration, template_nsymb,
 			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
@@ -5698,6 +5850,7 @@ void cl_telecom_system::load_configuration(int configuration)
 			pre_equalization_channel[3].value.real(), pre_equalization_channel[3].value.imag(),
 			pre_equalization_channel[4].value.real(), pre_equalization_channel[4].value.imag());
 		fflush(stdout);
+		}
 
 		// Apply power normalization + output power + preamble boost (same as transmit_bit lines 601-602).
 		// sqrt(output_power_Watt) MUST be included so peak_clip applies at the same
@@ -5773,6 +5926,7 @@ void cl_telecom_system::load_configuration(int configuration)
 
 		printf("[PHY] OFDM corr template: %d symbols, %d samples, energy=%.3f (matched filter, FIR round-tripped)\n",
 			template_nsymb, bb_len, ofdm.ofdm_corr_template_energy);
+		if(g_verbose) {
 		printf("[TMPL-INIT] t[0]=(%.6f,%.6f) t[1]=(%.6f,%.6f) t[2]=(%.6f,%.6f)\n",
 			ofdm.ofdm_corr_template[0].real(), ofdm.ofdm_corr_template[0].imag(),
 			ofdm.ofdm_corr_template[1].real(), ofdm.ofdm_corr_template[1].imag(),
@@ -5786,8 +5940,7 @@ void cl_telecom_system::load_configuration(int configuration)
 			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
 			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag());
 		fflush(stdout);
-	}
-#endif
+		}
 	}
 
 	bit_interleaver_block_size=data_container.nBits/10;
