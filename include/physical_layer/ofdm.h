@@ -148,6 +148,15 @@ public:
 	// Systems," IEEE Comm Surveys 2007, §IV-B.
 	double estimate_noise_from_pilot_pairs(std::complex<double>* in);
 	void CPE_correction(std::complex<double>* in);
+	// LEVER C: per-symbol Common-Phase-Error correction (OpenOFDM eq.9-10).
+	// Distinct from CPE_correction above (which is a MISNOMER — it is a
+	// frame-wide CFO-RAMP corrector that removes a LINEAR phase-vs-symbol). This
+	// removes a SEPARATE per-symbol COMMON rotation theta_i that the linear ramp
+	// cannot capture (phase-noise, residual sub-Hz CFO curvature). Called AFTER
+	// the channel estimate H is built and BEFORE channel_equalizer. The two
+	// compose. Returns the per-row theta_i it applied via out_theta (size
+	// >=Nsymb) when non-NULL, for unit-test observability.
+	void per_symbol_cpe_correction(std::complex<double>* in, double* out_theta = NULL);
 	void restore_channel_amplitude();
 	double carrier_sampling_frequency_sync(std::complex <double>*in, double carrier_freq_width, int preamble_nSymb, double sampling_frequency);
 	double carrier_frequency_sync_nb(std::complex<double>* in, double carrier_freq_width, int preamble_nSymb);

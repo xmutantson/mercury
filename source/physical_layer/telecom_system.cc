@@ -320,6 +320,11 @@ cl_error_rate cl_telecom_system::baseband_test_EsN0(float EsN0,int max_frame_no)
 			ofdm.LS_channel_estimator(data_container.ofdm_symbol_demodulated_data);
 		}
 
+		// LEVER C: per-symbol common-phase-error correction (OpenOFDM eq.9-10).
+		// AFTER H is built, BEFORE the equalizer. Removes the per-symbol common
+		// rotation theta_i the frame-wide CFO-ramp corrector cannot capture.
+		ofdm.per_symbol_cpe_correction(data_container.ofdm_symbol_demodulated_data);
+
 		if(ofdm.channel_estimator_amplitude_restoration==YES)
 		{
 			ofdm.restore_channel_amplitude();
@@ -2613,6 +2618,14 @@ skip_h_retry_point:
 				{
 					ofdm.LS_channel_estimator(data_container.ofdm_symbol_demodulated_data);
 				}
+
+				// LEVER C: per-symbol common-phase-error correction (OpenOFDM
+				// eq.9-10). AFTER H is built, BEFORE the equalizer. Reads (not
+				// writes) estimated_channel, so the SKIP-H / SKIP-VAR /
+				// selectivity gates below — which key on estimated_channel and
+				// noise_variance_estimate — see identical inputs. Only the
+				// equalizer input (ofdm_symbol_demodulated_data) is de-rotated.
+				ofdm.per_symbol_cpe_correction(data_container.ofdm_symbol_demodulated_data);
 
 				mean_H = -1.0;
 				int h_count = 0;
