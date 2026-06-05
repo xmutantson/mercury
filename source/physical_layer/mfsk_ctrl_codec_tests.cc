@@ -5783,6 +5783,11 @@ static void test_ofdm_fine_timing_magnitude_clean_no_regression() {
 	}
 }
 
+// §23 LEVER C per-symbol CPE de-rotation tests are defined below this runner;
+// forward-declare so the full --test suite can register them in source order.
+static void test_ofdm_cpe_recovers_and_derotates();
+static void test_ofdm_cpe_zero_offset_no_op();
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5911,7 +5916,256 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
 
+	// §23 LEVER C per-symbol CPE de-rotation (OpenOFDM eq.9-10).
+	test_ofdm_cpe_recovers_and_derotates();   // FAIL-before/PASS-after keystone
+	test_ofdm_cpe_zero_offset_no_op();        // no-op safety
+
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
+	return g_failures;
+}
+
+// =============================================================================
+// LEVER C — per-symbol Common-Phase-Error (CPE) de-rotation regression suite.
+// (OpenOFDM eq.9-10; cl_ofdm::per_symbol_cpe_correction, ofdm.cc.)
+//
+// Design = fail-before / pass-after, fully in-process (no audio, no channel
+// sim). Build a CONFIG_15 WB OFDM frame state directly:
+//   - estimated_channel[i*Nc+j].value = a known mild frequency-selective H
+//     (|H| varies across subcarriers so the |H|^2|X|^2 ML weighting is
+//     exercised, NOT a degenerate all-ones channel),
+//   - the received frame in[i*Nc+j] = H * S * e^{j*theta_true(i)} where S is the
+//     known pilot symbol X_j on pilots / a fixed test symbol on data carriers.
+// Inject a per-symbol common rotation theta_true(i) that is DELIBERATELY
+// NON-LINEAR in i (so the frame-wide CFO-RAMP corrector could not represent it),
+// then:
+//   (1) assert the estimator recovers theta_true(i) for every row,
+//   (2) assert the de-rotation drives the per-row pilot residual phase to ~0
+//       (and that the SAME residual was = theta_true BEFORE the call — the
+//       fail-before witness: a no-op stub leaves the residual non-zero),
+//   (3) assert zero injected offset is a no-op (no spurious rotation).
+// =============================================================================
+
+// Per-row pilot residual common phase = arg( SUM conj(in)*X*H ). This is the
+// quantity per_symbol_cpe_correction zeroes; the test uses it as ground truth
+// both before (== injected theta) and after (~0) the correction.
+static double cpe_row_residual_phase(cl_telecom_system& ts, int row,
+                                     int& pilot_index_io)
+{
+	int Nc = ts.ofdm.Nc;
+	std::complex<double> acc(0.0, 0.0);
+	for (int j = 0; j < Nc; j++) {
+		if ((ts.ofdm.ofdm_frame + row*Nc + j)->type == PILOT) {
+			std::complex<double> Y = ts.data_container.ofdm_symbol_demodulated_data[row*Nc + j];
+			std::complex<double> X = ts.ofdm.pilot_configurator.sequence[pilot_index_io];
+			std::complex<double> H = (ts.ofdm.estimated_channel + row*Nc + j)->value;
+			acc += std::conj(Y) * X * H;
+			pilot_index_io++;
+		}
+	}
+	if (acc.real() == 0.0 && acc.imag() == 0.0) return 0.0;
+	return std::arg(acc);
+}
+
+// Wrap a phase difference to (-pi, pi].
+static double cpe_wrap_pi(double a) {
+	while (a >  M_PI) a -= 2.0*M_PI;
+	while (a <= -M_PI) a += 2.0*M_PI;
+	return a;
+}
+
+// Build the synthetic frame state for a given injected per-symbol theta(i).
+// theta_fn: 0 = zero offset, 1 = non-linear-in-i offset.
+static bool cpe_build_frame(cl_telecom_system& ts, int theta_mode,
+                            double* theta_true /*size>=Nsymb*/, const char* name)
+{
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_15);
+	if (ts.current_configuration != CONFIG_15) {
+		test_fail(name, "load_configuration(CONFIG_15) did not take");
+		return false;
+	}
+	int Nc = ts.ofdm.Nc;
+	int Nsymb = ts.ofdm.Nsymb;
+	if (Nc <= 0 || Nsymb <= 0) { test_fail(name, "bad Nc/Nsymb"); return false; }
+
+	// Per-symbol injected common rotation.
+	for (int i = 0; i < Nsymb; i++) {
+		if (theta_mode == 0) theta_true[i] = 0.0;
+		else {
+			// Non-linear in i (a linear ramp corrector cannot fit this):
+			// a 10-degree-RMS-ish curved profile, alternating sign.
+			theta_true[i] = (10.0 * M_PI / 180.0) * std::sin(1.7 * i + 0.4)
+			              + (4.0 * M_PI / 180.0) * ((i % 2) ? 1.0 : -1.0);
+		}
+	}
+
+	// Known mild frequency-selective channel H[i*Nc+j] (|H| in ~[0.5,1.5],
+	// slowly varying with a non-trivial phase). Same H for all rows (the test
+	// isolates the per-symbol common rotation, not channel time-variation).
+	int pilot_index = 0;
+	for (int i = 0; i < Nsymb; i++) {
+		for (int j = 0; j < Nc; j++) {
+			double mag = 1.0 + 0.5 * std::cos(2.0*M_PI*j/(double)Nc);
+			double ph  = 0.6 * std::sin(2.0*M_PI*j/(double)Nc + 0.3);
+			std::complex<double> H = std::polar(mag, ph);
+			(ts.ofdm.estimated_channel + i*Nc + j)->value = H;
+			(ts.ofdm.estimated_channel + i*Nc + j)->status =
+				((ts.ofdm.ofdm_frame + i*Nc + j)->type == PILOT) ? MEASURED : UNKNOWN;
+
+			// Transmitted symbol S on this subcarrier: known pilot X_j on pilots,
+			// a fixed nonzero QAM-ish point on data carriers.
+			std::complex<double> S;
+			if ((ts.ofdm.ofdm_frame + i*Nc + j)->type == PILOT) {
+				S = ts.ofdm.pilot_configurator.sequence[pilot_index];
+				pilot_index++;
+			} else {
+				S = std::complex<double>(0.7071, -0.7071);  // unit-energy data point
+			}
+			// Received = H * S * e^{j*theta_true(i)}  (noiseless: isolates the
+			// estimator's bias/sign correctness from noise variance).
+			std::complex<double> rot = std::polar(1.0, theta_true[i]);
+			ts.data_container.ofdm_symbol_demodulated_data[i*Nc + j] = H * S * rot;
+		}
+	}
+	return true;
+}
+
+// (1)+(2): non-linear injected theta — recovery + de-rotation, fail-before
+// witnessed by the pre-call residual equalling the injected offset.
+static void test_ofdm_cpe_recovers_and_derotates() {
+	const char* name = "ofdm_cpe_recovers_and_derotates";
+	cl_telecom_system ts;
+	double theta_true[64] = {0.0};
+	if (!cpe_build_frame(ts, /*theta_mode=*/1, theta_true, name)) return;
+	int Nsymb = ts.ofdm.Nsymb;
+
+	// FAIL-BEFORE witness: residual on each row BEFORE correction must equal the
+	// injected theta_true (this is what a no-op stub would leave behind).
+	// Sign convention: the row residual cpe_row_residual_phase = arg(SUM
+	// conj(Y)*X*H). With Y = H*S*e^{+j*theta_true}, this equals -theta_true (the
+	// known matched-filter sign — see ofdm.cc derivation). So per_symbol_cpe_
+	// correction estimates theta_est = -theta_true and de-rotates by
+	// e^{+j*theta_est} = e^{-j*theta_true}, removing the injected rotation.
+	//
+	// FAIL-BEFORE witness: BEFORE the call the residual must equal -theta_true on
+	// every row (offset present). A no-op stub leaves it there; we record the
+	// magnitude so we can also assert the experiment is non-vacuous.
+	double before_res_match_max = 0.0;   // | residual - (-theta_true) | : must be ~0
+	double injected_mag_max = 0.0;       // max |theta_true| : must be clearly > 0
+	{
+		int pidx = 0;
+		for (int i = 0; i < Nsymb; i++) {
+			double res = cpe_row_residual_phase(ts, i, pidx);
+			double m = std::fabs(cpe_wrap_pi(res - (-theta_true[i])));
+			if (m > before_res_match_max) before_res_match_max = m;
+			if (std::fabs(theta_true[i]) > injected_mag_max)
+				injected_mag_max = std::fabs(theta_true[i]);
+		}
+	}
+
+	// Run the correction, capturing the estimated theta it applied.
+	double theta_est[64] = {0.0};
+	ts.ofdm.per_symbol_cpe_correction(
+		ts.data_container.ofdm_symbol_demodulated_data, theta_est);
+
+	// Recovery check: estimated theta == -theta_true (within 0.5 deg). i.e. the
+	// estimator recovered the injected common rotation up to the matched-filter
+	// sign, which is precisely the rotation it then removes.
+	double recover_err_max = 0.0;
+	for (int i = 0; i < Nsymb; i++) {
+		double e = std::fabs(cpe_wrap_pi(theta_est[i] - (-theta_true[i])));
+		if (e > recover_err_max) recover_err_max = e;
+	}
+
+	// De-rotation check: residual AFTER correction ~ 0 on every row.
+	double after_res_max = 0.0;
+	{
+		int pidx = 0;
+		for (int i = 0; i < Nsymb; i++) {
+			double res = cpe_row_residual_phase(ts, i, pidx);
+			double a = std::fabs(cpe_wrap_pi(res));
+			if (a > after_res_max) after_res_max = a;
+		}
+	}
+
+	printf("    [CPE] injected(nonlinear) max|theta|=%.4f deg  before_residual_matches_-theta(err=%.4f deg)  "
+		"recover_err=%.4f deg  after_residual=%.4f deg\n",
+		injected_mag_max*180.0/M_PI, before_res_match_max*180.0/M_PI,
+		recover_err_max*180.0/M_PI, after_res_max*180.0/M_PI);
+
+	const double TOL = 0.5 * M_PI / 180.0;   // 0.5 degree
+	// Non-vacuous: the injected offset must be clearly present (> 5 deg peak).
+	if (injected_mag_max < 5.0 * M_PI / 180.0) {
+		test_fail(name, "vacuous test: injected offset too small to witness");
+		return;
+	}
+	// Witness: BEFORE the call the residual carried exactly the injected offset.
+	if (before_res_match_max > TOL) {
+		test_fail(name, "fail-before witness broke: pre-call residual did not "
+			"carry the injected offset");
+		return;
+	}
+	if (recover_err_max > TOL) {
+		char b[160];
+		snprintf(b, sizeof(b), "estimator did not recover theta: max err=%.4f deg",
+			recover_err_max*180.0/M_PI);
+		test_fail(name, b);
+		return;
+	}
+	if (after_res_max > TOL) {
+		char b[160];
+		snprintf(b, sizeof(b), "de-rotation left residual: max=%.4f deg",
+			after_res_max*180.0/M_PI);
+		test_fail(name, b);
+		return;
+	}
+	test_pass(name);
+}
+
+// (3): zero injected offset is a no-op (estimate ~0, no spurious rotation
+// introduced, data carriers preserved bit-for-bit within float tolerance).
+static void test_ofdm_cpe_zero_offset_no_op() {
+	const char* name = "ofdm_cpe_zero_offset_no_op";
+	cl_telecom_system ts;
+	double theta_true[64] = {0.0};
+	if (!cpe_build_frame(ts, /*theta_mode=*/0, theta_true, name)) return;
+	int Nc = ts.ofdm.Nc, Nsymb = ts.ofdm.Nsymb;
+
+	// Snapshot the frame before correction.
+	std::vector<std::complex<double> > before(
+		ts.data_container.ofdm_symbol_demodulated_data,
+		ts.data_container.ofdm_symbol_demodulated_data + Nsymb*Nc);
+
+	double theta_est[64] = {0.0};
+	ts.ofdm.per_symbol_cpe_correction(
+		ts.data_container.ofdm_symbol_demodulated_data, theta_est);
+
+	double est_max = 0.0, drift_max = 0.0;
+	for (int i = 0; i < Nsymb; i++) {
+		double e = std::fabs(cpe_wrap_pi(theta_est[i]));
+		if (e > est_max) est_max = e;
+	}
+	for (int k = 0; k < Nsymb*Nc; k++) {
+		double d = std::abs(ts.data_container.ofdm_symbol_demodulated_data[k] - before[k]);
+		if (d > drift_max) drift_max = d;
+	}
+	printf("    [CPE] zero-offset  est_max=%.4f deg  sample_drift_max=%.2e\n",
+		est_max*180.0/M_PI, drift_max);
+
+	const double TOL = 0.5 * M_PI / 180.0;
+	if (est_max > TOL) { test_fail(name, "nonzero theta estimated on a clean frame"); return; }
+	if (drift_max > 1e-9) { test_fail(name, "spurious rotation applied on a clean frame"); return; }
+	test_pass(name);
+}
+
+// Fast focused runner: ONLY the LEVER C per-symbol CPE de-rotation suite.
+int run_ofdm_cpe_tests() {
+	g_failures = 0;
+	g_passes   = 0;
+	printf("=== OFDM per-symbol CPE de-rotation tests (LEVER C, OpenOFDM eq.9-10) ===\n");
+	test_ofdm_cpe_recovers_and_derotates();   // FAIL-before/PASS-after keystone
+	test_ofdm_cpe_zero_offset_no_op();        // no-op safety
+	printf("=== CPE done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }
 

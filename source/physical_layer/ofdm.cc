@@ -1944,6 +1944,82 @@ void cl_ofdm::CPE_correction(std::complex<double>* in)
 	}
 }
 
+// LEVER C — Per-symbol Common-Phase-Error (CPE) correction.
+//
+// Reference: OpenOFDM (https://openofdm.readthedocs.io, 802.11 receiver
+// walkthrough), "Phase Tracking" stage, equations 9-10. Each OFDM symbol
+// suffers a COMMON phase rotation theta_i (identical across all subcarriers in
+// that symbol) caused by residual carrier-frequency error and oscillator phase
+// noise. The pilot subcarriers, whose transmitted values are known, let us
+// estimate theta_i per symbol and de-rotate the symbol before equalization.
+//
+// OpenOFDM eq.9 (LS estimate of the common phase, here written with the
+// per-subcarrier channel H folded in so each pilot is matched-filtered by its
+// own gain):
+//
+//     theta_i = arg(  SUM_{j in pilots(i)}  conj(Y[i,j]) * X_j * H[i,j]  )
+//
+// where Y[i,j] = received pilot, X_j = known pilot symbol, H[i,j] = channel
+// estimate at that pilot. Derivation of the sign: if the symbol carries an
+// unwanted common rotation phi, then Y = H * X * e^{j*phi} + n, so
+//   conj(Y) * X * H = conj(H)*conj(X)*e^{-j*phi} * X * H = |H|^2 * |X|^2 * e^{-j*phi}
+// (X real for DBPSK pilots ⇒ conj(X)*X = |X|^2). Hence arg(SUM) = -phi = theta_i.
+// eq.10 then DE-ROTATES every subcarrier of the row by e^{+j*theta_i} = e^{-j*phi},
+// exactly removing the common rotation. Magnitude-weighting by |H|^2|X|^2 is the
+// ML combiner across pilots (down-weights deeply faded pilots) — standard.
+//
+// This is DISTINCT from cl_ofdm::CPE_correction above (a frame-wide CFO-RAMP
+// remover: one linear phase-rate across the whole frame). A linear ramp cannot
+// represent a symbol-to-symbol common rotation that is non-linear in i
+// (oscillator phase noise, sub-Hz CFO curvature). The two corrections COMPOSE:
+// the ramp remover runs first (before channel estimation), this per-symbol
+// remover runs after H is built and before the equalizer.
+//
+// Zero added acquisition cost: with the diagonal pilot walk (ofdm.cc:1138-1154,
+// Dx=1 Dy=3, Nc>=Nsymb) every symbol-row carries at least one pilot, so theta_i
+// is observable for every row from pilots that already exist — no extra symbols.
+void cl_ofdm::per_symbol_cpe_correction(std::complex<double>* in, double* out_theta)
+{
+	if (Nsymb <= 0 || Nc <= 0) return;
+
+	// pilot_configurator.sequence[] is indexed in row-major pilot-walk order
+	// (matches ZF/LS estimator + CPE_correction). Walk the same order so the
+	// pilot index stays aligned with the known pilot symbols X_j.
+	int pilot_index = 0;
+	for (int i = 0; i < Nsymb; i++)
+	{
+		std::complex<double> acc(0.0, 0.0);   // SUM conj(Y)*X*H over this row's pilots
+		int row_pilots = 0;
+		for (int j = 0; j < Nc; j++)
+		{
+			if ((ofdm_frame + i * Nc + j)->type == PILOT)
+			{
+				std::complex<double> Y = *(in + i * Nc + j);
+				std::complex<double> X = pilot_configurator.sequence[pilot_index];
+				std::complex<double> H = (estimated_channel + i * Nc + j)->value;
+				acc += std::conj(Y) * X * H;   // OpenOFDM eq.9 term
+				row_pilots++;
+				pilot_index++;
+			}
+		}
+
+		// Need at least one pilot to define theta_i; the diagonal walk
+		// guarantees this for Dx=1 Dy=3 with Nc>=Nsymb. acc==0 (pathological:
+		// all-faded pilots) ⇒ arg() is undefined; treat as no rotation.
+		double theta_i = 0.0;
+		if (row_pilots > 0 && (acc.real() != 0.0 || acc.imag() != 0.0))
+			theta_i = std::arg(acc);          // = -phi (the offset to remove)
+
+		if (out_theta != NULL)
+			out_theta[i] = theta_i;
+
+		// OpenOFDM eq.10: de-rotate the whole row by e^{+j*theta_i}.
+		std::complex<double> correction = std::exp(std::complex<double>(0.0, theta_i));
+		for (int j = 0; j < Nc; j++)
+			*(in + i * Nc + j) *= correction;
+	}
+}
+
 void cl_ofdm::restore_channel_amplitude()
 {
 	for(int i=0;i<Nsymb;i++)

@@ -272,6 +272,12 @@ int main(int argc, char *argv[])
             int failed = run_ofdm_fine_timing_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-cpe : run ONLY the LEVER C per-symbol CPE de-rotation suite
+        // (OpenOFDM eq.9-10). Fast + deterministic.
+        if (strcmp(argv[i], "--test-cpe") == 0) {
+            int failed = run_ofdm_cpe_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;

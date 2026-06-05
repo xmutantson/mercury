@@ -35,4 +35,9 @@ int run_mfsk_ctrl_codec_tests();
 // fact-documents/ofdm-fine-timing-magnitude.md §4.
 int run_ofdm_fine_timing_tests();
 
+// Run ONLY the LEVER C per-symbol CPE (common-phase-error) de-rotation
+// regression suite (OpenOFDM eq.9-10). Fast + deterministic. Returns the
+// number of failed tests (0 = all pass).
+int run_ofdm_cpe_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_
