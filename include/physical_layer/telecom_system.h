@@ -484,6 +484,19 @@ public:
 	// CONT_COLS, SCAT_DX, SCAT_DY. See fact-doc §13.
 	void sfo_grid_test();
 
+	// TEST 3 (sparse-capable 2D channel interpolator — the §13.5 production gap).
+	// On a frequency-SELECTIVE channel (MERCURY_SFO_GRID_CHAN=1 det-floor / =2 two-ray)
+	// the flat-ML H̄ shortcut FAILS (one global scalar cannot represent |H|+phase varying
+	// across 50 subcarriers). This estimator interpolates a real per-subcarrier-per-symbol
+	// H[n][j] from the 6% continual+scattered lattice by SEPARABLE 2D interpolation:
+	// (a) raw LS H=Y/X at every pilot; (b) TIME interp/Wiener-smooth across the scatter
+	// lattice's symbol spacing (dy) per carrier; (c) FREQUENCY interp across carriers
+	// within each symbol; (d) optional DDCE refinement between scatter updates. nv is the
+	// pilot residual against the interpolated H (preserves the TEST-2 nv that holds).
+	// Knobs: MERCURY_SFO_GRID_WIENER (1=Wiener time-smoother, 0=linear),
+	// MERCURY_SFO_GRID_DDCE (1=decision-directed refine). Driven from sfo_grid_test only.
+	void grid_sparse2d_estimator(std::complex<double>* rx, int Ngrid, int Nc);
+
 	void load_configuration();
 	void load_configuration(int configuration);
 	int last_configuration;

@@ -5720,6 +5720,216 @@ void cl_telecom_system::sfo_block_test()
 // STEP-2 anti-P CPE/PEG corrector: per symbol, LS line-fit pilot phase-error vs k
 // (intercept=CPE, slope=PEG), de-rotate every subcarrier BEFORE the equalizer.
 // ============================================================================
+
+// ----------------------------------------------------------------------------
+// SPARSE-CAPABLE 2D CHANNEL INTERPOLATOR (TEST 3 — the §13.5 production gap).
+// ----------------------------------------------------------------------------
+// Estimate a real per-subcarrier-per-symbol channel H[n][j] from the sparse 6%
+// continual+scattered pilot lattice, on a frequency-SELECTIVE channel (|H| and
+// phase varying across the 50 subcarriers even after the SFO ramp is removed).
+// The stock per-cell-LS+DFT smoother (ofdm.cc LS_channel_estimator) assumes a
+// DENSE REGULAR lattice and SMEARS a sparse one; the flat-ML H̄=mean(Y/X) shortcut
+// (the TEST-2 path) collapses the whole band to one scalar and so cannot represent
+// a selective channel. This is the DVB-T-style scattered-pilot SEPARABLE 2D
+// interpolation VARA uses (Hoeher/Kaiser/Robertson, "Two-dimensional pilot-symbol-
+// aided channel estimation by Wiener filtering", ICASSP 1997 — the canonical
+// separable freq×time pilot interpolator):
+//
+//   (1) RAW LS at every pilot cell:  Hp[n][j] = rx[n][j] / X(pilot).
+//   (2) TIME interpolation per carrier: for each carrier j that carries ≥1 pilot
+//       in time (continual carriers: every symbol; scattered carriers: the scatter
+//       symbols the diagonal lands on), fill ALL symbols n by linear interpolation
+//       between consecutive time-pilots (hold at the edges), then OPTIONALLY apply a
+//       short Wiener/MMSE moving-average time-smoother (MERCURY_SFO_GRID_WIENER=1)
+//       to suppress pilot noise. This is the "time interpolation across the scatter
+//       lattice's dy spacing" the design names.
+//   (3) FREQUENCY interpolation per symbol: now every symbol has H known at the
+//       carriers that received a time-estimate; linear-interpolate across carriers
+//       to fill the interior data carriers (hold at the band edges). This is the
+//       "frequency interpolation across the scatter+continual pilots within a
+//       symbol's neighborhood" the design names. Together (2)+(3) are the separable
+//       2D estimate.
+//   (4) DDCE (MERCURY_SFO_GRID_DDCE=1, optional): one decision-directed pass —
+//       equalize data cells with the (2)+(3) estimate, hard-decide the 32-QAM
+//       symbol, treat the decision as an extra "pilot", and re-run a light freq
+//       smooth. Refines H between scatter updates (the design's named DDCE).
+//
+// nv = pilot residual EVM against the FINAL interpolated H (NOT a global scalar) so
+// it tracks the true noise and the continual columns keep ≥N pilot pairs → the
+// TEST-2 nv that holds is preserved (no E1/cfg16-nvfix collapse).
+void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ngrid, int Nc)
+{
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+	bool wiener = (env_i("MERCURY_SFO_GRID_WIENER", 1) != 0);   // default Wiener time-smooth ON
+	bool ddce   = (env_i("MERCURY_SFO_GRID_DDCE",   0) != 0);
+	int  wlen   = env_i("MERCURY_SFO_GRID_WIENER_LEN", 5);      // moving-avg half-window (taps=2*L+1)
+
+	const int NG = Ngrid, NC = Nc;
+	std::vector<std::complex<double>> H((size_t)NG*NC, std::complex<double>(0,0));
+	std::vector<char> known((size_t)NG*NC, 0);   // 1 = has a usable estimate
+
+	// (1) RAW LS at every pilot. pilot_configurator.sequence is indexed in
+	//     (symbol,carrier) raster order over PILOT cells (the framer convention).
+	{
+		int pidx = 0;
+		for(int n=0;n<NG;n++) for(int j=0;j<NC;j++)
+			if((ofdm.ofdm_frame+n*NC+j)->type==PILOT)
+			{
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				H[(size_t)n*NC+j] = rx[(size_t)n*NC+j] / X;
+				known[(size_t)n*NC+j] = 1;
+			}
+	}
+
+	// (2) TIME interpolation per carrier (symbol axis), then optional Wiener smooth.
+	for(int j=0;j<NC;j++)
+	{
+		// collect this carrier's time-pilot symbol indices
+		std::vector<int> ts;
+		for(int n=0;n<NG;n++) if(known[(size_t)n*NC+j]) ts.push_back(n);
+		if(ts.empty()) continue;                      // no time samples — handled by (3)
+		// linear interpolate between consecutive time-pilots
+		for(size_t s=0;s+1<ts.size();s++)
+		{
+			int n0=ts[s], n1=ts[s+1];
+			std::complex<double> H0=H[(size_t)n0*NC+j], H1=H[(size_t)n1*NC+j];
+			for(int n=n0+1;n<n1;n++)
+			{
+				double t = (double)(n-n0)/(double)(n1-n0);
+				H[(size_t)n*NC+j] = H0*(1.0-t) + H1*t;
+				known[(size_t)n*NC+j] = 1;
+			}
+		}
+		// edge hold (extrapolate flat past the first/last time-pilot)
+		for(int n=0;n<ts.front();n++){ H[(size_t)n*NC+j]=H[(size_t)ts.front()*NC+j]; known[(size_t)n*NC+j]=1; }
+		for(int n=ts.back()+1;n<NG;n++){ H[(size_t)n*NC+j]=H[(size_t)ts.back()*NC+j]; known[(size_t)n*NC+j]=1; }
+		// Wiener/MMSE time-smoother: short centered moving average over the now-dense
+		// column (suppresses pilot noise; on a time-invariant channel it is a near-
+		// optimal MMSE smoother since the true H is constant in n). Smooth ONLY columns
+		// that had ≥2 time-pilots (a single-pilot scattered carrier has nothing to
+		// average and would just blur the freq-interp seed).
+		if(wiener && ts.size()>=2 && wlen>0)
+		{
+			std::vector<std::complex<double>> col(NG);
+			for(int n=0;n<NG;n++) col[n]=H[(size_t)n*NC+j];
+			for(int n=0;n<NG;n++)
+			{
+				std::complex<double> acc(0,0); int cnt=0;
+				for(int w=n-wlen; w<=n+wlen; w++) if(w>=0&&w<NG){ acc+=col[w]; cnt++; }
+				if(cnt>0) H[(size_t)n*NC+j]=acc/(double)cnt;
+			}
+		}
+	}
+
+	// (3) FREQUENCY interpolation per symbol (carrier axis). After (2), the carriers
+	//     that carry ANY pilot in time are "known" at every symbol; interpolate across
+	//     carriers to fill the interior data carriers, hold at the band edges.
+	//
+	// CRITICAL: interpolate in POLAR form (magnitude + UNWRAPPED phase), NOT in the
+	// complex plane. A frequency-selective channel (esp. the det-floor all-pass) rotates
+	// its phase by up to ±π across the band; if the phase between two adjacent pilots
+	// exceeds π, complex-linear interpolation cuts a CHORD through the origin and the
+	// interpolated |H| collapses toward 0 (measured: |H| min 0.016 on the all-pass) →
+	// the MMSE erasure drops whole bands → BER ~0.35. Unwrapping the phase (pick the
+	// shortest rotation each pilot step) and interpolating |H| and φ separately keeps the
+	// estimate ON the channel's actual locus. This is the standard polar/Wiener pilot
+	// interpolation (Hoeher/Kaiser/Robertson 1997). Note: if the TRUE phase rotation
+	// between two consecutive freq-pilots exceeds π the channel is UNDERSAMPLED in
+	// frequency (aliasing) — no interpolator can recover it; that sets the pilot-density
+	// floor reported by the density sweep.
+	bool polar = (env_i("MERCURY_SFO_GRID_POLAR", 1) != 0);   // default polar interp ON
+	for(int n=0;n<NG;n++)
+	{
+		std::vector<int> ks;
+		for(int j=0;j<NC;j++) if(known[(size_t)n*NC+j]) ks.push_back(j);
+		if(ks.empty()){ for(int j=0;j<NC;j++){ H[(size_t)n*NC+j]=std::complex<double>(1,0); } continue; }
+		for(size_t s=0;s+1<ks.size();s++)
+		{
+			int j0=ks[s], j1=ks[s+1];
+			std::complex<double> H0=H[(size_t)n*NC+j0], H1=H[(size_t)n*NC+j1];
+			if(polar)
+			{
+				double m0=std::abs(H0), m1=std::abs(H1);
+				double p0=std::arg(H0), p1=std::arg(H1);
+				double dp=p1-p0;                        // shortest-rotation unwrap
+				while(dp> M_PI) dp-=2.0*M_PI;
+				while(dp<-M_PI) dp+=2.0*M_PI;
+				for(int j=j0+1;j<j1;j++)
+				{
+					double t=(double)(j-j0)/(double)(j1-j0);
+					double m=m0*(1.0-t)+m1*t;
+					double p=p0+dp*t;
+					H[(size_t)n*NC+j]=std::polar(m,p);
+				}
+			}
+			else
+			{
+				for(int j=j0+1;j<j1;j++)
+				{
+					double t=(double)(j-j0)/(double)(j1-j0);
+					H[(size_t)n*NC+j]=H0*(1.0-t)+H1*t;
+				}
+			}
+		}
+		for(int j=0;j<ks.front();j++) H[(size_t)n*NC+j]=H[(size_t)n*NC+ks.front()];
+		for(int j=ks.back()+1;j<NC;j++) H[(size_t)n*NC+j]=H[(size_t)n*NC+ks.back()];
+	}
+
+	// (4) DDCE (optional): one decision-directed refinement pass. Equalize data cells
+	//     with the (2)+(3) estimate, hard-decide the 32-QAM constellation point, then
+	//     re-estimate H_data = Y/decision and blend a freq-smoothed version back in.
+	if(ddce)
+	{
+		std::vector<std::complex<double>> Hd((size_t)NG*NC);
+		for(int n=0;n<NG;n++) for(int j=0;j<NC;j++)
+		{
+			std::complex<double> Hcur=H[(size_t)n*NC+j];
+			if((ofdm.ofdm_frame+n*NC+j)->type==PILOT){ Hd[(size_t)n*NC+j]=Hcur; continue; }
+			std::complex<double> eq = (std::norm(Hcur)>1e-12) ? rx[(size_t)n*NC+j]/Hcur : std::complex<double>(0,0);
+			std::complex<double> dec = psk.slice_nearest(eq);   // nearest 32-QAM point
+			Hd[(size_t)n*NC+j] = (std::norm(dec)>1e-12) ? rx[(size_t)n*NC+j]/dec : Hcur;
+		}
+		// light freq smooth of the decision-directed estimate, blended 50/50 with the
+		// pilot estimate (keeps the pilot-anchored truth dominant; DDCE only nudges).
+		for(int n=0;n<NG;n++)
+		{
+			for(int j=0;j<NC;j++)
+			{
+				std::complex<double> acc(0,0); int cnt=0;
+				for(int w=j-1;w<=j+1;w++) if(w>=0&&w<NC){ acc+=Hd[(size_t)n*NC+w]; cnt++; }
+				std::complex<double> sm=(cnt>0)?acc/(double)cnt:Hd[(size_t)n*NC+j];
+				if((ofdm.ofdm_frame+n*NC+j)->type!=PILOT)
+					H[(size_t)n*NC+j] = 0.5*H[(size_t)n*NC+j] + 0.5*sm;
+			}
+		}
+	}
+
+	// Publish to estimated_channel (MEASURED everywhere → channel_equalizer uses it).
+	for(int n=0;n<NG;n++) for(int j=0;j<NC;j++)
+	{
+		(ofdm.estimated_channel+n*NC+j)->value  = H[(size_t)n*NC+j];
+		(ofdm.estimated_channel+n*NC+j)->status = MEASURED;
+	}
+
+	// nv = pilot residual EVM against the FINAL interpolated H (NOT a global scalar):
+	// resid = Y - H[pilot]*X over every pilot cell. The continual columns alone give
+	// 2*Ngrid pilot pairs, so this never collapses to the 1e-6 floor (preserves the
+	// TEST-2 nv that holds — no E1/cfg16-nvfix over-confident-LLR collapse).
+	{
+		double nsum=0.0; int pidx=0, npil=0;
+		for(int n=0;n<NG;n++) for(int j=0;j<NC;j++)
+			if((ofdm.ofdm_frame+n*NC+j)->type==PILOT)
+			{
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				std::complex<double> resid = rx[(size_t)n*NC+j] - H[(size_t)n*NC+j]*X;
+				nsum += resid.real()*resid.real() + resid.imag()*resid.imag();
+				npil++;
+			}
+		ofdm.noise_variance_estimate = (npil>0) ? (nsum/(double)npil) : 0.01;
+		if(ofdm.noise_variance_estimate < 1e-6) ofdm.noise_variance_estimate = 1e-6;
+	}
+}
+
 void cl_telecom_system::sfo_grid_test()
 {
 	if(M == MOD_MFSK){ std::cout << "[SFO-GRID] MFSK unsupported; use -s 15/16." << std::endl; return; }
@@ -5933,6 +6143,86 @@ void cl_telecom_system::sfo_grid_test()
 		}
 	}
 
+	// --- FREQUENCY-SELECTIVE CHANNEL (the §13.5 production gap) -----------------
+	// TEST-2 ran a FLAT unity channel: after the tracker removes the SFO ramp the
+	// residual is |H|=1 everywhere, so the flat-ML H=mean(Y/X) estimate is exact.
+	// A REAL HF/soundcard channel is frequency-SELECTIVE: |H| and phase VARY across
+	// the 50 subcarriers even after the SFO timing ramp is removed, so the equalizer
+	// needs a real per-subcarrier H interpolated from the sparse 6% pilots. This block
+	// injects that selective channel as a per-carrier complex coefficient T(j) (the
+	// channel is time-invariant across the block — frequency-selective only — so the
+	// same T(j) multiplies every symbol; the SFO ramp above sits ON TOP of it).
+	//
+	// Two faithful selective models (gated by MERCURY_SFO_GRID_CHAN):
+	//   1 = DET-FLOOR (phase-dispersive, |T|=1): the SHIPPED Schroeder all-pass
+	//       cl_sim_det_floor (sim_channel.h:750, g=0.50/D=16/N=3). The frequency
+	//       response of ONE all-pass section is the closed form
+	//         A(e^{jw}) = (-g + e^{-jwD}) / (1 - g·e^{-jwD})   (|A|≡1, dispersive φ),
+	//       cascaded ap_n times. |T|=1 (no amplitude null → 32-QAM tolerant) but the
+	//       per-subcarrier PHASE varies → the flat-ML estimate (one global H̄) cannot
+	//       represent it. This is the EVM-ceiling model the §10 bench shipped.
+	//   2 = TWO-RAY (magnitude-selective): the fsel_test model (telecom_system.h:324,
+	//       amp 0.6 @ delay 128 passband samples), T(j) = 1 + a·e^{-jw_j·Δ}, unit-power
+	//       normalized. |T| FADES across the band (deep nulls) — the HARDER case the
+	//       sparse interpolator must handle (it stresses BOTH magnitude and phase).
+	// w_j is the TRUE centered FFT-bin angular frequency of logical carrier j (the
+	// zero_padder mapping, ofdm.cc:331/697-723) so the ripple period is physical:
+	//   k_centered(j) = (j < Nc/2) ? (j - Nc/2) : (j - Nc/2 + start_shift)
+	//   w_j = 2*pi*k_centered / Nfft.
+	int    chan_sel  = env_i("MERCURY_SFO_GRID_CHAN", 0);          // 0=flat,1=det-floor,2=two-ray
+	double ap_g      = env_f("MERCURY_SFO_GRID_AP_G",   0.50);     // all-pass coeff (SHIPPED 0.50)
+	int    ap_dly    = env_i("MERCURY_SFO_GRID_AP_DLY", 16);       // all-pass delay D (SHIPPED 16)
+	int    ap_n      = env_i("MERCURY_SFO_GRID_AP_N",   3);        // all-pass cascade depth (SHIPPED 3)
+	double tr_amp    = env_f("MERCURY_SFO_GRID_FSEL_AMP",   0.6);  // two-ray 2nd-ray amplitude
+	int    tr_dly    = env_i("MERCURY_SFO_GRID_FSEL_DLY", 128);    // two-ray delay (passband samp)
+	std::vector<std::complex<double>> Tchan(Nc, std::complex<double>(1.0,0.0));
+	if(chan_sel != 0)
+	{
+		int sshift = ofdm.start_shift;
+		for(int j=0;j<Nc;j++)
+		{
+			int k_centered = (j < Nc/2) ? (j - Nc/2) : (j - Nc/2 + sshift);
+			double w = 2.0*M_PI*(double)k_centered/(double)Nfft;
+			std::complex<double> T(1.0,0.0);
+			if(chan_sel == 1)
+			{
+				// Schroeder all-pass cascade A(e^{jw})^ap_n.
+				std::complex<double> z_mD = std::polar(1.0, -w*(double)ap_dly);   // e^{-jwD}
+				std::complex<double> A = (-ap_g + z_mD) / (1.0 - ap_g*z_mD);
+				T = std::pow(A, ap_n);
+			}
+			else // chan_sel == 2: two-ray magnitude-selective
+			{
+				T = 1.0 + tr_amp * std::polar(1.0, -w*(double)tr_dly);
+			}
+			Tchan[j] = T;
+		}
+		// Two-ray: unit-power normalize so the AWGN Es/N0 axis stays exact
+		// (Σ|T|²/Nc == 1). The all-pass is already unit-magnitude → norm == 1.
+		if(chan_sel == 2)
+		{
+			double p=0.0; for(int j=0;j<Nc;j++) p += std::norm(Tchan[j]);
+			double g = (p>0.0) ? sqrt((double)Nc/p) : 1.0;
+			for(int j=0;j<Nc;j++) Tchan[j] *= g;
+		}
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			grid[(size_t)n*Nc+j] *= Tchan[j];
+	}
+	// Channel diagnostics: |T| min/max (selectivity depth) + phase spread.
+	{
+		double tmin=1e9, tmax=-1e9; double phmin=1e9, phmax=-1e9;
+		for(int j=0;j<Nc;j++){ double m=std::abs(Tchan[j]); if(m<tmin)tmin=m; if(m>tmax)tmax=m;
+			double p=std::arg(Tchan[j]); if(p<phmin)phmin=p; if(p>phmax)phmax=p; }
+		const char* cname = (chan_sel==1)?"DET-FLOOR(all-pass,|T|=1,phase-disp)"
+		                  : (chan_sel==2)?"TWO-RAY(magnitude-selective)" : "FLAT(unity)";
+		bool spx = (env_i("MERCURY_SFO_GRID_SPARSE2D",0)!=0);
+		std::cout << "[SFO-GRID] channel=" << cname
+		          << " |T|[" << tmin << ".." << tmax << "]"
+		          << " arg(T)[" << phmin << ".." << phmax << "] rad"
+		          << "  estimator=" << (no_interp?"NOINTERP" : (thin?(spx?"SPARSE-2D-INTERP":"FLAT-ML(control)"):"LS+DFT"))
+		          << std::endl;
+	}
+
 	// AWGN (Es/N0): added per data/pilot subcarrier so noise_variance_estimate is a
 	// meaningful quantity for the CODED path. Es/N0 >= 900 => clean (no noise, default
 	// for the uncoded timing probe). The 32-QAM symbols carry unit average Es here
@@ -6018,28 +6308,50 @@ void cl_telecom_system::sfo_grid_test()
 		for(int ci=0; ci<Ngrid*Nc; ci++){ (ofdm.estimated_channel+ci)->value = std::complex<double>(1.0,0.0);
 			(ofdm.estimated_channel+ci)->status = MEASURED; }
 	}
+	else if(thin && env_i("MERCURY_SFO_GRID_GENIE", 0))
+	{
+		// GENIE estimate: hand the equalizer the EXACT channel (Tchan[j] × the SFO ramp
+		// at symbol n, if the tracker is OFF). Isolates the LDPC/SNR decodability limit on
+		// the selective channel from the estimator quality — if genie still FAILS to decode
+		// at a given EsN0, the channel+SNR is past the waterfall and NO estimator helps.
+		for(int n=0;n<Ngrid;n++)
+		{
+			double tau_n = ppm*1e-6 * (double)n * (double)Nofdm;
+			for(int j=0;j<Nc;j++)
+			{
+				double ph = (track ? 0.0 : -2.0*M_PI*(double)j*tau_n/(double)Nfft);
+				std::complex<double> Hg = Tchan[j] * std::complex<double>(cos(ph), sin(ph));
+				(ofdm.estimated_channel+n*Nc+j)->value = Hg;
+				(ofdm.estimated_channel+n*Nc+j)->status = MEASURED;
+			}
+		}
+		// genie nv = the true AWGN variance (so CSI/MMSE weighting is correctly scaled).
+		double ge = env_f("MERCURY_SFO_GRID_ESN0", 900.0);
+		ofdm.noise_variance_estimate = (ge<900.0) ? pow(10.0,-ge/10.0) : 1e-6;
+		if(ofdm.noise_variance_estimate < 1e-6) ofdm.noise_variance_estimate = 1e-6;
+	}
+	else if(thin && env_i("MERCURY_SFO_GRID_SPARSE2D", 0))
+	{
+		grid_sparse2d_estimator(rx.data(), Ngrid, Nc);
+	}
 	else if(thin)
 	{
-		// SPARSE-LATTICE estimator. The stock LS_channel_estimator assumes a DENSE
-		// REGULAR (Dx=1/Dy=3) lattice: per-cell global-window scalar + a per-symbol
-		// DFT smoother (smooth_channel_estimate_dft, ofdm.cc:2127) that keeps ~gi*Nc
-		// time-domain taps. On a SPARSE IRREGULAR lattice the per-symbol H[k] is no
-		// longer flat across carriers (pilot cells hold exact Y/X, data cells hold the
-		// window scalar), so the DFT smoother IFFTs an irregular ripple and SMEARS the
-		// estimate (measured: |H| 0.05..1.37, mean 0.38 on a UNITY channel) -> BER 0.34
-		// even at 0 ppm. After the CPE/PEG tracker removes the SFO ramp the channel is
-		// flat unity, so the ML estimate of a flat channel is simply the pilot-averaged
-		// complex gain H = mean(Y_pilot / X_pilot). We compute that ONE scalar from all
-		// pilots and assign it to every cell, then derive a HONEST noise variance as the
-		// pilot residual against it (so nv does NOT collapse — the E1/cfg16-nvfix path).
-		// This is the faithful flat-channel estimator, not a smoother band-aid: the
-		// per-cell LS+DFT machinery is simply the wrong tool for a sparse lattice.
+		// FLAT-ML CONTROL (the §13.2 flat-channel shortcut). The stock
+		// LS_channel_estimator assumes a DENSE REGULAR (Dx=1/Dy=3) lattice: per-cell
+		// global-window scalar + a per-symbol DFT smoother (smooth_channel_estimate_dft,
+		// ofdm.cc:2127). On a SPARSE IRREGULAR lattice it SMEARS (|H| 0.05..1.37 on a
+		// UNITY channel -> BER 0.34 @0ppm). On a FLAT channel (TEST 2) the ML estimate
+		// is the pilot-averaged complex gain H̄ = mean(Y_pilot/X_pilot) assigned to every
+		// cell — EXACT for flat. On a frequency-SELECTIVE channel this single global
+		// scalar CANNOT represent |H| and phase varying across the 50 subcarriers, so it
+		// MUST FAIL — this is the negative control that proves the sparse 2D interpolator
+		// (MERCURY_SFO_GRID_SPARSE2D=1) is needed and works.
 		std::complex<double> Hsum(0,0); int pidx=0; int npil=0;
 		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
 			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT)
 			{
 				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
-				Hsum += rx[(size_t)n*Nc+j] / X;   // Y/X per pilot (post-tracker ~unity)
+				Hsum += rx[(size_t)n*Nc+j] / X;   // Y/X per pilot (post-tracker ~unity on FLAT)
 				npil++;
 			}
 		std::complex<double> Hbar = (npil>0) ? (Hsum / (double)npil) : std::complex<double>(1.0,0.0);
@@ -6060,6 +6372,25 @@ void cl_telecom_system::sfo_grid_test()
 	else
 	{
 		ofdm.LS_channel_estimator(rx.data());   // pilots -> interpolate across 60-grid
+	}
+
+	// Capture per-data-carrier CSI weight |H_k|² (in deframed raster order) BEFORE the
+	// equalizer wipes estimated_channel[].status. On a frequency-SELECTIVE channel the
+	// deep-magnitude-null carriers are noise-amplified by ZF (1/|H|²); a SCALAR nv makes
+	// the LDPC over-confident on those carriers and decode fails. The production path
+	// (telecom_system.cc:2874-2927) scales each carrier's LLRs by normalized |H_k|² so the
+	// decoder discounts the weak carriers — the SAME CSI weighting is required here for the
+	// selective channel (on a flat channel all weights ≈ 1 → no change, so TEST-2 holds).
+	std::vector<double> csi_data(nData, 1.0);
+	{
+		int di=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==DATA)
+			{
+				std::complex<double> H=(ofdm.estimated_channel+n*Nc+j)->value;
+				if(di<nData) csi_data[di]=H.real()*H.real()+H.imag()*H.imag();
+				di++;
+			}
 	}
 
 	std::vector<std::complex<double>> eq((size_t)Ngrid*Nc);
@@ -6153,6 +6484,29 @@ void cl_telecom_system::sfo_grid_test()
 		double cvar = ofdm.noise_variance_estimate;   // the estimator's nv (NOT measure_variance)
 		if(cvar < 1e-9) cvar = 1e-9;
 		psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
+
+		// CSI-weighted LLR (production telecom_system.cc:2901-2927): scale each data
+		// carrier's bit-LLRs by its normalized |H_k|² so the LDPC discounts the deep-null
+		// carriers a frequency-selective channel produces. On a flat channel all weights
+		// ≈ 1 → no change (TEST-2 byte-identical). Off via MERCURY_SFO_GRID_CSI=0.
+		bool csi = (env_i("MERCURY_SFO_GRID_CSI", 1) != 0);
+		if(csi)
+		{
+			double mean_w=0.0; for(int d=0;d<nData;d++) mean_w+=csi_data[d];
+			mean_w = (nData>0)?mean_w/(double)nData:1.0; if(mean_w<1e-9) mean_w=1.0;
+			for(int d=0;d<nData;d++)
+			{
+				double w = csi_data[d]/mean_w;
+				for(int b=0;b<log2M;b++)
+				{
+					size_t bi=(size_t)d*log2M+b;
+					if(bi>=(size_t)nBits) break;
+					float v = clr[bi]*(float)w;
+					if(v> 40.0f) v= 40.0f; else if(v<-40.0f) v=-40.0f;
+					clr[bi]=v;
+				}
+			}
+		}
 
 		int    cw_ok = 0, cw_crcfail = 0;
 		long   cw_infoerr = 0, cw_infobits = 0;
