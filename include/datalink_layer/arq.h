@@ -1155,6 +1155,52 @@ public:
       return rx_bsi != last_applied_clean_bsi;   // clean: dedupe vs clean tracker
     return rx_bsi != last_applied_sack_bsi;      // partial: dedupe vs partial tracker
   }
+
+  // TURBO step-1 SNR-capability pre-truncation gate (gearshift-climb-engine.md
+  // §20 — the CFG15->CFG16 under-climb on clean). PURE so --test-climb-engine can
+  // drive it with no live telecom_system / channel.
+  //
+  // THE BUG: at the turbo forward-probe +1 step (arq_commander.cc:4757 sets
+  // negotiated = current+1; the guard at :4803 then runs), a guard truncated the
+  // probe whenever the CONTROL-PLANE SNR estimate (effective_snr) mapped to a
+  // config BELOW the negotiated one. On a CLEAN channel that estimate is the
+  // post-EQ EVM-SNR, which UNDERREPORTS the channel by 1-3 dB and saturates near
+  // ~14.5 dB; it routinely jitters to ~9.0 dB → get_configuration(9.0)=CONFIG_13.
+  // With the link negotiated at CONFIG_15 the guard fired, pinned
+  // supershift_proven_ceiling at CONFIG_14, and CFG16 was NEVER reached even
+  // though a pinned CFG16 decodes flawlessly on the SAME channel (3048 bps,
+  // 400/400 nAcked, 0 retx) — i.e. the truncation is a FALSE PHY-capability
+  // verdict produced by an underreporting estimate.
+  //
+  // THE FIX (mirrors the DOWNSTREAM §7.13.38 SACK-trust the author already wrote
+  // at arq_commander.cc:3953 verbatim): only truncate when SACK Design A is NOT
+  // negotiated. With SACK on, the channel can absorb partial-batch loss (SACK_RSP
+  // patches missing frames) and the link's data-carrying capability is PROVEN by
+  // SACK delivery + the top-config verification probe (:4824-4845) — so the
+  // control-plane SNR estimate must NOT pre-truncate the climb. With SACK OFF the
+  // legacy fading-margin safety net is preserved UNCHANGED (truncate as before).
+  // This does NOT loosen any threshold/magic-number; it removes a false verdict on
+  // the exact path where the downstream SACK-trust has nothing to recover because
+  // this guard returned before finish_turbo_direction() ran.
+  //
+  // OVER-CLIMB STAYS FIXED: the SACK exemption only removes the SNR
+  // PRE-truncation; the top config must still ACK end-to-end (verification probe
+  // arq_commander.cc:4824-4845) or it BREAKs (:3483) and proven_ceiling is LOWERED
+  // (:3621-3624); the turbo target is still routed through
+  // supershift_retrigger_target (:4797) whose is_ofdm_config(anchor) gate clamps
+  // ROBUST->OFDM at anchor+1 (the 730ffca over-climb mechanism). Caller still
+  // guards effective_snr > -90 and computes snr_max_cfg = get_configuration(snr).
+  // Returns true iff the turbo probe should be TRUNCATED (finish at current).
+  static bool turbo_snr_truncates_probe(int snr_max_cfg, int negotiated_cfg,
+                                        bool sack_v2_enabled)
+  {
+    // SACK negotiated => trust the proven delivery path; do NOT pre-truncate on
+    // the underreporting control-plane SNR estimate (mirrors §7.13.38 :3953).
+    if(sack_v2_enabled) return false;
+    // Legacy fading-margin safety net (SACK off): truncate when the SNR-mapped
+    // ceiling is below the probe target.
+    return config_ladder_index(snr_max_cfg) < config_ladder_index(negotiated_cfg);
+  }
   // CLEAN-confirmation dedupe tracker (climb Bug 1). Ctor-init -1. Distinct from
   // cmd_last_applied_sack_bsi (the partial tracker) so a clean confirmation for a
   // bsi whose partial was already applied is NOT dropped. Set when an all-ones
