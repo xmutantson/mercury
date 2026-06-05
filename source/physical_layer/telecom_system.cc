@@ -1424,6 +1424,41 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					}
 				}
 
+				// LEVER P (INC-3): DEFER-not-search at the buffer edge. Before
+				// abandoning the batch lock to a full-buffer search, check whether
+				// the PREDICTED MINI tail frame extends beyond the samples we hold.
+				// On a MINI schedule the tail preambles march toward the buffer end
+				// (each frame advances only Nsymb+1 symbols), so a tail frame's
+				// preamble + data routinely straddles the buffer edge: its preamble
+				// is detectable but its data symbols haven't arrived yet. A full-
+				// buffer search there does NOT help — it finds the just-decoded
+				// frame's DATA-region Schmidl-Cox sub-peaks (metric ~0.18-0.28) and
+				// desyncs the whole batch. The correct response is the SAME one the
+				// FULL-preamble baseline uses: signal the ARQ layer to capture more
+				// audio (frame_overflow_symbols), let the buffer shift bring the
+				// complete MINI frame into the verify window, and re-enter batch-
+				// predict next dispatch. ofdm_defer_overflow_enabled gates this the
+				// same way as the primary defer site (telecom_system.cc:1625).
+				if(!batch_verified && rx_batch_predict_mode && mfsk_fixed_delay < 0
+					&& ofdm_defer_overflow_enabled)
+				{
+					int mini_active_nsymb = get_active_nsymb();
+					// rx_eff_preamble is still the MINI length (1) here — not yet
+					// reset to FULL. predicted_pos is the predicted MINI preamble
+					// start (full-rate samples); the MINI frame spans
+					// (rx_eff_preamble + Nsymb) symbols past it.
+					int mini_frame_end = predicted_pos
+						+ (rx_eff_preamble + mini_active_nsymb) * sym_samples;
+					if(mini_frame_end > buf_interp)
+					{
+						receive_stats.message_decoded = NO;
+						int overflow_samples = mini_frame_end - buf_interp;
+						receive_stats.frame_overflow_symbols =
+							(overflow_samples + sym_samples - 1) / sym_samples;
+						return receive_stats;
+					}
+				}
+
 				if(!batch_verified)
 				{
 					// Prediction failed — search full remaining buffer from
@@ -1629,7 +1664,18 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	}
 
 	int lower_bound = data_container.preamble_nSymb;
-	int upper_bound = data_container.buffer_Nsymb-(data_container.Nsymb+data_container.preamble_nSymb);
+	// LEVER P (INC-3): the bounds GATE must use the SAME per-frame preamble
+	// length the EXTRACTION uses (telecom_system.cc:2348 frame_size_interp =
+	// Nofdm*(Nsymb+rx_eff_preamble)). A MINI tail frame (rx_eff_preamble=1) is
+	// (Nsymb+1) symbols long, so the highest preamble symbol from which a
+	// complete MINI frame still fits is buffer_Nsymb-(Nsymb+1) — 3 symbols
+	// HIGHER than the FULL-frame bound. Using the FULL preamble_nSymb here
+	// rejected MINI tail frames at pream_symb 116..118 (frame ends <128, room
+	// to extract) as "beyond-bounds", losing every tail frame past the 11th in
+	// a 21-frame batch. rx_eff_preamble == preamble_nSymb on the full-search /
+	// re-anchor / MFSK / amortization-off paths, so this is byte-identical when
+	// the feature is off.
+	int upper_bound = data_container.buffer_Nsymb-(data_container.Nsymb+rx_eff_preamble);
 	// §7.13.29 (Proposal A) — SACK_RSP cross-check uses a stricter detection
 	// threshold so Schmidl-Cox sub-peaks in OFDM body audio (consistently
 	// metric≈0.555 in trace, vs ~0.9 for a real preamble) are rejected before
@@ -2262,10 +2308,16 @@ skip_h_retry_point:
 			if(receive_stats.delay<0){receive_stats.delay=0;}
 
 
-			// Clamp delay to prevent buffer overflow in rational_resampler
+			// Clamp delay to prevent buffer overflow in rational_resampler.
+			// LEVER P (INC-3): a MINI tail frame is (Nsymb+rx_eff_preamble)
+			// symbols, so its max_delay sits HIGHER than a FULL frame's. Clamping
+			// a MINI to the FULL-frame max_delay would shove its delay BELOW the
+			// real preamble position (mis-extracting the frame). Use rx_eff_preamble
+			// — identical to preamble_nSymb on every non-MINI / amortization-off
+			// path, so byte-identical when the feature is off.
 			{
 				int buf_size = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-				int frame_size = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
+				int frame_size = (data_container.Nofdm*(data_container.Nsymb+rx_eff_preamble))*frequency_interpolation_rate;
 				int max_delay = buf_size - frame_size;
 				if(receive_stats.delay > max_delay)
 				{
