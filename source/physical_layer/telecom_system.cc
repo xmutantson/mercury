@@ -5241,6 +5241,12 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 	// at a pinned ring offset — arq_commander.cc:~9822), this harness makes the RX
 	// ACQUIRE timing from a long, SFO-drifted continuous block, so SFO actually
 	// matters. See fact-documents/data-flow-sim2-time-domain-faithfulness.md §10.
+	const char* sgt = std::getenv("MERCURY_SFO_GRID");
+	if(sgt && atoi(sgt) != 0)
+	{
+		sfo_grid_test();
+		return;
+	}
 	const char* sft = std::getenv("MERCURY_SFO_BLOCK_TEST");
 	if(sft && atoi(sft) != 0)
 	{
@@ -5532,11 +5538,102 @@ void cl_telecom_system::sfo_block_test()
 	// AWGN seeded once (separate from TX data stream) for reproducibility.
 	awgn_channel.set_seed((long)(seed | 1));
 
+	// ---- BIG-BLOCK ONE-ACQUISITION MODE (MERCURY_SFO_BIGBLOCK) ----------------
+	// The task's "big block" = ONE timing acquisition on the HEAD preamble, then
+	// decode the whole contiguous K-frame run WITHOUT per-frame re-acquisition (the
+	// anti-LEVER-P model: VARA-style single-acquire-and-hold). The per-frame loop
+	// above RE-ACQUIRES every frame (Schmidl-Cox each time) and so structurally
+	// cannot show a tail timing failure — the very limitation §11 flagged.
+	//
+	// ARCHITECTURE NOTE (code-verified, fact-doc §12): a SINGLE LDPC codeword is
+	// fixed at N=MERCURY_NORMAL=1600 bits (ldpc.cc:66, physical_defines.h:31), and
+	// CFG16's Nsymb=9 is DERIVED so nData*log2(M)==1600 (telecom_system.cc:4598).
+	// A literal "one preamble + 60 DATA symbols carrying one codeword" is therefore
+	// IMPOSSIBLE without a new ~10k-bit LDPC code. The faithful realization of a
+	// 60-data-symbol block is K=ceil(60/Nsymb) back-to-back codeword-frames under
+	// ONE head acquisition: each frame is a valid 1600-bit codeword (real LDPC
+	// block-decode metric), the SFO drifts the WHOLE run on one clock, and the RX
+	// anchors all frames to the head-acquired alignment + NOMINAL frame stride
+	// (no Schmidl-Cox after frame 0). The SFO creep then walks the nominal window
+	// off the true (drifted) content across the block — the tail must HOLD (the
+	// per-frame pilot estimate + equalizer absorb it) or FAIL (the GO/NO-GO).
+	bool bigblock = (env_i("MERCURY_SFO_BIGBLOCK", 0) != 0);
+	// NEGATIVE CONTROL (faithfulness): MERCURY_SFO_BIGBLOCK_NOTRACK forces the RX
+	// to anchor every tail frame to the head alignment WITHOUT advancing by the
+	// per-frame SFO-creep that a real tracker/re-acquisition would apply. In the
+	// default bigblock mode the nominal stride is exact for SFO=0 and only drifts
+	// under SFO — i.e. the per-frame pilot estimate + equalizer are the ONLY thing
+	// holding the tail. To PROVE the harness is not too lenient, NOTRACK injects a
+	// fixed extra misalignment per frame (a few samples) that NO per-frame pilot
+	// estimate can absorb, so the tail MUST fail. If even the default bigblock tail
+	// holds at 50ppm but NOTRACK fails, the "holds" result is real discrimination.
+	bool notrack_ctrl = (env_i("MERCURY_SFO_BIGBLOCK_NOTRACK", 0) != 0);
+	// Per-frame extra misalignment (interp samples) injected in the NOTRACK control.
+	int  notrack_skew = env_i("MERCURY_SFO_BIGBLOCK_NOTRACK_SKEW", 8);
+
+	long   head_delay_interp = -1;   // acquired ONCE on frame 0 (bigblock mode)
+
 	for(int f = 0; f < nFrames; f++)
 	{
+		st_receive_stats st;
+		double metric;
+		long   det;
+
+		if(bigblock)
+		{
+			// Place the WHOLE contiguous drifted block once (frame 0), anchored so
+			// the head preamble lands at symbol (full_pre+2) like the standard path.
+			// Subsequent frames are NOT re-placed/re-acquired: we decode each frame
+			// from the SAME window at the head-anchored NOMINAL stride.
+			if(f == 0)
+			{
+				for(int i = 0; i < buf_interp; i++) data_container.passband_delayed_data[i] = 0.0;
+				int copy_n = (int)(block_len);
+				if(lead + copy_n > buf_interp) copy_n = buf_interp - lead;
+				for(int i = 0; i < copy_n; i++)
+				{
+					double s = tx_block[(size_t)i];
+					if(!clean && sigma > 0.0)
+						s += (double)((sigma / sqrtf(2.0f)) * awgn_channel.awgn_value_generator());
+					data_container.passband_delayed_data[lead + i] = s;
+				}
+				// ONE real acquisition on the head preamble (Schmidl-Cox + Moose).
+				ofdm_forced_delay = -1;
+				mfsk_fixed_delay  = -1;
+				st = this->receive_byte(data_container.passband_delayed_data,
+				                        data_container.hd_decoded_data_byte);
+				head_delay_interp = st.delay;   // acquired head position (interp samples)
+			}
+			else
+			{
+				// NO re-acquisition: decode this frame at the head-anchored nominal
+				// position. The block was TX'd as equal-length FULL frames, so the
+				// nominal stride is `full_frame` interp-samples. The SFO has drifted
+				// the real content by ~ppm*cumulative_samples; the receiver, having
+				// only the head lock, does NOT know this drift -> the window is
+				// progressively misaligned across the tail (the big-block timing
+				// wall, if any).
+				ofdm_forced_delay = head_delay_interp + (long)f * (long)full_frame;
+				// NEGATIVE CONTROL: inject a cumulative per-frame misalignment that
+				// no per-frame pilot estimate can absorb (proves the harness bites).
+				if(notrack_ctrl)
+					ofdm_forced_delay += (long)f * (long)notrack_skew;
+				mfsk_fixed_delay  = -1;
+				st = this->receive_byte(data_container.passband_delayed_data,
+				                        data_container.hd_decoded_data_byte);
+			}
+			ofdm_forced_delay = -1;
+			metric = st.coarse_metric;
+			det    = st.delay;
+			if(frame_pre[f] >= full_pre) { metric_sum_full += metric; n_full++; }
+			else                         { metric_sum_mini += metric; n_mini++; }
+			goto bigblock_score;
+		}
+
 		// Zero the RX window, then copy this frame's drifted samples after `lead`.
 		for(int i = 0; i < buf_interp; i++) data_container.passband_delayed_data[i] = 0.0;
 
+		{
 		long src = frame_off[f];
 		// Pull the frame plus a little of the NEXT frame's lead-in (so the data
 		// tail + any SFO over-read is present); bounded by the block end.
@@ -5549,6 +5646,7 @@ void cl_telecom_system::sfo_block_test()
 				s += (double)((sigma / sqrtf(2.0f)) * awgn_channel.awgn_value_generator());
 			data_container.passband_delayed_data[lead + i] = s;
 		}
+		}
 
 		// REAL acquisition: -1 ⇒ Schmidl-Cox time sync + Moose carrier sync run.
 		ofdm_forced_delay = -1;
@@ -5560,15 +5658,15 @@ void cl_telecom_system::sfo_block_test()
 		// That is the physically correct discriminator: a frame TX'd with a 1-sym
 		// preamble (MINI arm) presents a 4x-shorter half-symbol repeat to the SAME
 		// search, so its metric under-integrates under SFO regardless of ARQ state.
-		st_receive_stats st = this->receive_byte(data_container.passband_delayed_data,
-		                                          data_container.hd_decoded_data_byte);
+		st = this->receive_byte(data_container.passband_delayed_data,
+		                        data_container.hd_decoded_data_byte);
 		ofdm_forced_delay = -1;
-
-		// Per-frame metric / detected position (drift trajectory).
-		double metric = st.coarse_metric;
-		long   det    = st.delay;          // detected preamble sample position in window
+		metric = st.coarse_metric;
+		det    = st.delay;
 		if(frame_pre[f] >= full_pre) { metric_sum_full += metric; n_full++; }
 		else                         { metric_sum_mini += metric; n_mini++; }
+
+	bigblock_score:;
 
 		// BER for this frame: decode bytes -> bits, compare to TX bits.
 		byte_to_bit(data_container.hd_decoded_data_byte, data_container.hd_decoded_data_bit, payload_bytes);
@@ -5584,7 +5682,9 @@ void cl_telecom_system::sfo_block_test()
 		{
 			std::cout << "[SFO-BLOCK] frame=" << f
 			          << " pre=" << frame_pre[f]
-			          << " expect_off=" << (lead) << "(+drift)"
+			          << (bigblock ? " nominal_off=" : " expect_off=")
+			          << (bigblock ? (head_delay_interp + (long)f * (long)full_frame) : (long)lead)
+			          << (bigblock ? "(no-reacq)" : "(+drift)")
 			          << " det=" << det
 			          << " metric=" << metric
 			          << " decoded=" << (st.message_decoded == YES ? 1 : 0)
@@ -5602,6 +5702,265 @@ void cl_telecom_system::sfo_block_test()
 	if(n_mini > 0) std::cout << "[SFO-BLOCK]   mean_metric_MINIpre=" << (metric_sum_mini / n_mini) << std::endl;
 	std::cout << "[SFO-BLOCK]   tail-frame decode is the make-or-break: a clean control"
 	          << " run (SFO OFF) MUST be ~all-decoded; SFO ON must DEGRADE the MINI tail." << std::endl;
+}
+
+// ============================================================================
+// GENUINE single-grid big-block timing test. The sfo_block_test above tiles K
+// independent 9-symbol codeword-frames (per-frame channel estimate); this builds
+// ONE Nsymb-symbol grid carried by ONE channel estimate interpolated across the
+// whole block (interpolate_bilinear_matrix, 33% pilots), which is the literal
+// "one preamble + N data symbols, one estimate" the design asks about.
+//
+// SFO model (frequency-domain, exact): a sample-timing slip of tau samples at
+// OFDM symbol n rotates subcarrier k by exp(-j 2*pi*k*tau_n / Nfft) — a phase RAMP
+// in k whose slope GROWS with n (tau_n = ppm*1e-6 * n * (Nfft+Ngi)). This is the
+// omega+k*delta per-symbol ramp the design names (Speth/Fechtel/Meyr 1999). The
+// pilot lattice samples this ramp every Dy symbols; LS_channel_estimator's bilinear
+// interpolation MAY already track it (STEP 1). MERCURY_SFO_GRID_TRACK=1 adds the
+// STEP-2 anti-P CPE/PEG corrector: per symbol, LS line-fit pilot phase-error vs k
+// (intercept=CPE, slope=PEG), de-rotate every subcarrier BEFORE the equalizer.
+// ============================================================================
+void cl_telecom_system::sfo_grid_test()
+{
+	if(M == MOD_MFSK){ std::cout << "[SFO-GRID] MFSK unsupported; use -s 15/16." << std::endl; return; }
+
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+	auto env_f = [](const char* k, double def){ const char* e=std::getenv(k); return (e&&*e)?atof(e):def; };
+
+	int    Ngrid   = env_i("MERCURY_SFO_GRID_NSYMB", 60);   // data symbols in the ONE grid
+	double ppm     = env_f("MERCURY_SIM2_SFO_PPM", 0.0);
+	bool   track   = (env_i("MERCURY_SFO_GRID_TRACK", 0) != 0);     // STEP 2: CPE/PEG corrector
+	bool   no_interp = (env_i("MERCURY_SFO_GRID_NOINTERP", 0) != 0);// negative control
+	int    win      = env_i("MERCURY_SFO_GRID_TRACK_WIN", 9);       // CPE/PEG sliding window
+	uint64_t seed   = (uint64_t)env_i("MERCURY_SFO_GRID_SEED", 12345);
+
+	// --- Rebuild the OFDM grid at Nsymb=Ngrid (32QAM, 33% pilots Dx=1/Dy=3). ---
+	int saved_Nsymb = ofdm.Nsymb;
+	int Nc    = ofdm.Nc;
+	int Nfft  = ofdm.Nfft;
+	float gi  = ofdm.gi;
+	int Ngi   = (int)round((double)gi * (double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	// Preserve the preamble_configurator fields that ofdm.deinit() zeros but the
+	// 4-arg ofdm.init() does NOT restore (Nsymb/modulation/nIdentical_sections/
+	// boost). Without this, preamble_configurator::init divides nPreamble/Nsymb=0
+	// (ofdm.cc:1304) -> crash. We only change the DATA grid (Nsymb), not the
+	// preamble, so carry the preamble config across the rebuild verbatim.
+	int   sav_pre_Nsymb = ofdm.preamble_configurator.Nsymb;
+	int   sav_pre_mod   = ofdm.preamble_configurator.modulation;
+	int   sav_pre_nIS   = ofdm.preamble_configurator.nIdentical_sections;
+	double sav_pre_boost= ofdm.preamble_configurator.boost;
+	int   sav_start_shift = ofdm.start_shift;
+	// Pilot configurator: deinit() zeros boost (->1.33) which makes the pilot
+	// sequence all-zero -> H=Y/0=NaN -> equalizer erases everything. Preserve the
+	// pilot boost/modulation/seed too.
+	double sav_pil_boost = ofdm.pilot_configurator.boost;
+	int   sav_pil_mod    = ofdm.pilot_configurator.modulation;
+	int   sav_pil_seed   = ofdm.pilot_configurator.seed;
+	ofdm.deinit();
+	ofdm.start_shift = sav_start_shift;
+	ofdm.preamble_configurator.Nsymb = sav_pre_Nsymb;
+	ofdm.preamble_configurator.modulation = sav_pre_mod;
+	ofdm.preamble_configurator.nIdentical_sections = sav_pre_nIS;
+	ofdm.preamble_configurator.boost = sav_pre_boost;
+	ofdm.pilot_configurator.boost = sav_pil_boost;
+	ofdm.pilot_configurator.modulation = sav_pil_mod;
+	ofdm.pilot_configurator.seed = sav_pil_seed;
+	ofdm.pilot_configurator.Dx = 1; ofdm.pilot_configurator.Dy = 3;   // 33% pilots
+	ofdm.pilot_configurator.pilot_density = HIGH_DENSITY;
+	ofdm.channel_estimator = LEAST_SQUARE;
+	ofdm.channel_estimator_amplitude_restoration = NO;
+	ofdm.LS_window_width = 0; ofdm.LS_window_hight = 0;   // re-derive in init
+	ofdm.init(Nfft, Nc, Ngrid, gi);   // sets Nfft/Nc/Nsymb/gi/Ngi + allocs + configures lattice
+
+	int nData = ofdm.pilot_configurator.nData;     // data carriers across the 60-grid
+	int log2M = (int)round(log2((double)M));
+	int nBits = nData * log2M;
+
+	std::cout << "[SFO-GRID] cfg=" << current_configuration << " M=" << M
+	          << " Nsymb=" << Ngrid << " Nc=" << Nc << " Dx=1 Dy=3"
+	          << " nData=" << nData << " nBits=" << nBits
+	          << " pilots=" << ofdm.pilot_configurator.nPilots
+	          << " (" << (100.0*ofdm.pilot_configurator.nPilots/(double)(Ngrid*Nc)) << "% of grid)"
+	          << " ppm=" << ppm << " track=" << (track?1:0)
+	          << " no_interp=" << (no_interp?1:0) << std::endl;
+
+	// --- TX: known random 32QAM data symbols + known pilots into the 60-grid. ---
+	std::vector<int> tx_bits(nBits);
+	ts_srandom((unsigned int)seed);
+	for(int i=0;i<nBits;i++) tx_bits[i] = (int)(ts_random()%2);
+
+	std::vector<std::complex<double>> tx_syms(nData);
+	psk.mod(tx_bits.data(), nBits, tx_syms.data());
+
+	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
+	ofdm.framer(tx_syms.data(), grid.data());   // data + pilots placed by lattice
+
+	// --- CHANNEL: flat unity H + the SFO per-symbol subcarrier phase ramp. ---
+	// tau_n = accumulated timing slip (samples) at symbol n; phase(k) = -2*pi*k*tau_n/Nfft.
+	// k index runs over the active subcarriers as the modulator places them
+	// (zero_padder maps logical carrier j to FFT bin; the ramp is in the SAME
+	// logical-carrier index the estimator/equalizer use, so a per-carrier index j
+	// suffices — the bin mapping is a fixed permutation that cancels in est/eq).
+	for(int n=0; n<Ngrid; n++)
+	{
+		double tau_n = ppm*1e-6 * (double)n * (double)Nofdm;   // samples slipped by symbol n
+		for(int j=0;j<Nc;j++)
+		{
+			double ph = -2.0*M_PI*(double)j*tau_n/(double)Nfft;
+			grid[(size_t)n*Nc+j] *= std::complex<double>(cos(ph), sin(ph));
+		}
+	}
+
+	// --- RX: ONE channel estimate across the whole 60-grid, then equalize. ---
+	// (Acquisition is not re-tested here — sfo_block_test proved the head preamble
+	//  is found; this isolates the GRID estimate's ability to hold the ramp.)
+	// Copy the (drifted) grid into a demod buffer the estimator reads.
+	std::vector<std::complex<double>> rx(grid);
+
+	// STEP 2 corrector: per-symbol CPE/PEG LS de-rotation BEFORE the estimator/equalizer.
+	if(track)
+	{
+		// For each symbol n, gather pilot residual phase err vs carrier index k,
+		// LS-fit a line (intercept=CPE omega, slope=PEG delta), average over a
+		// +/- win/2 sliding window of symbols, de-rotate exp(-j[omega+k*delta]).
+		// Pilot value is known (pilot_configurator.sequence); residual phase =
+		// arg(rx / pilot) at each pilot carrier (flat H => 0 without SFO).
+		std::vector<double> sym_omega(Ngrid,0.0), sym_delta(Ngrid,0.0);
+		// first pass: per-symbol raw LS fit from that symbol's pilots
+		int pilot_index_base = 0;
+		// Need the pilot_index offset per symbol; recompute by walking the lattice.
+		std::vector<int> pidx_at_symbol(Ngrid,0);
+		{
+			int pidx=0;
+			for(int n=0;n<Ngrid;n++){ pidx_at_symbol[n]=pidx;
+				for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT) pidx++; }
+		}
+		(void)pilot_index_base;
+		for(int n=0;n<Ngrid;n++)
+		{
+			int pidx = pidx_at_symbol[n];
+			double Sx=0,Sy=0,Sxx=0,Sxy=0; int np=0;
+			for(int j=0;j<Nc;j++)
+			{
+				if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT)
+				{
+					std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+					std::complex<double> r = rx[(size_t)n*Nc+j] / X;   // = H_eff = unity*ramp
+					double phi = atan2(r.imag(), r.real());            // wrapped phase err
+					double x=(double)j;
+					Sx+=x; Sy+=phi; Sxx+=x*x; Sxy+=x*phi; np++;
+				}
+			}
+			if(np>=2){ double den=np*Sxx-Sx*Sx;
+				if(fabs(den)>1e-12){ sym_delta[n]=(np*Sxy-Sx*Sy)/den; sym_omega[n]=(Sy-sym_delta[n]*Sx)/np; } }
+		}
+		// sliding-window average + de-rotate every carrier of every symbol
+		for(int n=0;n<Ngrid;n++)
+		{
+			double om=0,dl=0; int cnt=0;
+			for(int w=n-win/2; w<=n+win/2; w++){ if(w>=0&&w<Ngrid){ om+=sym_omega[w]; dl+=sym_delta[w]; cnt++; } }
+			if(cnt>0){ om/=cnt; dl/=cnt; }
+			for(int j=0;j<Nc;j++)
+			{
+				double ph = -(om + dl*(double)j);
+				rx[(size_t)n*Nc+j] *= std::complex<double>(cos(ph), sin(ph));
+			}
+		}
+	}
+
+	// Channel estimate + equalize over the ONE 60-grid.
+	if(no_interp)
+	{
+		// NEGATIVE CONTROL: estimate ONLY from the head symbols' pilots and FREEZE
+		// (no per-block bilinear interpolation tracking the ramp). Implemented by
+		// assigning a flat unity estimate everywhere — the ramp is then NOT removed,
+		// so the tail MUST fail. Proves the harness is not too lenient.
+		for(int ci=0; ci<Ngrid*Nc; ci++){ (ofdm.estimated_channel+ci)->value = std::complex<double>(1.0,0.0);
+			(ofdm.estimated_channel+ci)->status = MEASURED; }
+	}
+	else
+	{
+		ofdm.LS_channel_estimator(rx.data());   // pilots -> interpolate across 60-grid
+	}
+
+	std::vector<std::complex<double>> eq((size_t)Ngrid*Nc);
+	ofdm.channel_equalizer(rx.data(), eq.data());
+
+	std::vector<std::complex<double>> deframed(nData);
+	ofdm.deframer(eq.data(), deframed.data());
+
+	if(env_i("MERCURY_SFO_GRID_DIAG",0))
+	{
+		std::cout << "[SFO-GRID-DIAG] nv=" << ofdm.noise_variance_estimate << std::endl;
+		for(int d=0; d<4 && d<nData; d++)
+			std::cout << "[SFO-GRID-DIAG] data["<<d<<"] tx=(" << tx_syms[d].real()<<","<<tx_syms[d].imag()
+			          << ") eqdeframed=(" << deframed[d].real()<<","<<deframed[d].imag()<<")" << std::endl;
+		// also dump a couple of estimated_channel values at DATA positions
+		std::cout << "[SFO-GRID-DIAG] H[sym0,c0]=(" << (ofdm.estimated_channel+0)->value.real()
+		          << "," << (ofdm.estimated_channel+0)->value.imag() << ")"
+		          << " H[sym30,c25]=(" << (ofdm.estimated_channel+30*Nc+25)->value.real()
+		          << "," << (ofdm.estimated_channel+30*Nc+25)->value.imag() << ")" << std::endl;
+	}
+
+	// --- SCORE: per-symbol uncoded symbol-error-rate, head vs tail. ---
+	// Hard-decision: re-mod the known bits per data carrier and compare nearest.
+	// Use psk.demod (LLR) -> hard bits and count bit errors, bucketed by symbol.
+	std::vector<float> llr(nBits);
+	double variance = ofdm.measure_variance(rx.data());
+	psk.demod(deframed.data(), nBits, llr.data(), (float)variance);
+
+	// Map each data carrier back to its symbol index to bucket errors head vs tail.
+	// data carriers are filled by framer in (symbol,carrier) raster order over DATA
+	// positions; reconstruct that order to know which symbol each data index lands in.
+	std::vector<int> data_symbol_of_idx(nData,0);
+	{
+		int di=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ if(di<nData) data_symbol_of_idx[di]=n; di++; }
+	}
+	long head_err=0, head_tot=0, tail_err=0, tail_tot=0, all_err=0;
+	int tail_start = (Ngrid*3)/4;   // last quarter = "tail"
+	for(int b=0;b<nBits;b++)
+	{
+		int hard = (llr[b] < 0.0f) ? 1 : 0;   // LLR sign -> bit (demod convention)
+		int bit_err = (hard != tx_bits[b]) ? 1 : 0;
+		all_err += bit_err;
+		int data_idx = b / log2M;
+		int sym = (data_idx<nData)?data_symbol_of_idx[data_idx]:0;
+		if(sym < Ngrid/4){ head_tot++; head_err+=bit_err; }
+		else if(sym >= tail_start){ tail_tot++; tail_err+=bit_err; }
+	}
+	double ber_all  = (double)all_err/(double)nBits;
+	double ber_head = head_tot? (double)head_err/(double)head_tot : 0.0;
+	double ber_tail = tail_tot? (double)tail_err/(double)tail_tot : 0.0;
+
+	std::cout << "[SFO-GRID] ===== RESULT (one estimate across " << Ngrid << " symbols) =====" << std::endl;
+	std::cout << "[SFO-GRID]   uncoded_BER_all=" << ber_all
+	          << "  HEAD(sym0.." << (Ngrid/4-1) << ")=" << ber_head
+	          << "  TAIL(sym" << tail_start << ".." << (Ngrid-1) << ")=" << ber_tail << std::endl;
+	std::cout << "[SFO-GRID]   tot biterr=" << all_err << "/" << nBits
+	          << "  mode=" << (no_interp?"NOINTERP(neg-ctrl)":(track?"CPE/PEG-TRACK":"2D-PILOT-EST"))
+	          << std::endl;
+	std::cout << "[SFO-GRID]   make-or-break: TAIL BER ~0 => grid holds the SFO ramp;"
+	          << " TAIL >> HEAD => ramp walks the tail off (needs tracker)." << std::endl;
+
+	// Restore the original grid geometry so the rest of the process is unaffected.
+	ofdm.deinit();
+	ofdm.start_shift = sav_start_shift;
+	ofdm.preamble_configurator.Nsymb = sav_pre_Nsymb;
+	ofdm.preamble_configurator.modulation = sav_pre_mod;
+	ofdm.preamble_configurator.nIdentical_sections = sav_pre_nIS;
+	ofdm.preamble_configurator.boost = sav_pre_boost;
+	ofdm.pilot_configurator.boost = sav_pil_boost;
+	ofdm.pilot_configurator.modulation = sav_pil_mod;
+	ofdm.pilot_configurator.seed = sav_pil_seed;
+	ofdm.pilot_configurator.Dx=1; ofdm.pilot_configurator.Dy=3;
+	ofdm.pilot_configurator.pilot_density=HIGH_DENSITY;
+	ofdm.channel_estimator=LEAST_SQUARE;
+	ofdm.channel_estimator_amplitude_restoration=NO;
+	ofdm.LS_window_width=0; ofdm.LS_window_hight=0;
+	ofdm.init(Nfft, Nc, saved_Nsymb, gi);
 }
 
 void cl_telecom_system::load_configuration()

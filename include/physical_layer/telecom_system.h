@@ -465,6 +465,15 @@ public:
 	// the impairment the pinned BER/in-proc paths structurally cannot show. See
 	// fact-documents/data-flow-sim2-time-domain-faithfulness.md §10.
 	void sfo_block_test();
+	// GENUINE single-grid big-block timing test (MERCURY_SFO_GRID=1). Builds ONE
+	// 60-data-symbol OFDM grid (32QAM, 33% pilots Dx=1/Dy=3), applies the SFO as the
+	// exact per-symbol subcarrier phase ramp (the omega+k*delta growth across the
+	// block), and decodes with ONE channel estimate interpolated across all 60
+	// symbols (interpolate_bilinear_matrix). Measures per-symbol uncoded SER head vs
+	// tail. Optional CPE/PEG LS per-symbol de-rotation (MERCURY_SFO_GRID_TRACK=1) is
+	// the STEP-2 anti-P tracker. Unlike sfo_block_test (K tiled 9-sym codeword-frames,
+	// per-frame estimate), this is the literal "one estimate across 60 symbols" case.
+	void sfo_grid_test();
 
 	void load_configuration();
 	void load_configuration(int configuration);

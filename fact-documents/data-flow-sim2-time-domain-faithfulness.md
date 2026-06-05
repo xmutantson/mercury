@@ -424,3 +424,71 @@ SEPARATELY, for big-block TEST 1 proper, add a single-window long-block decode (
 `receive_byte` over an N-symbol block, timing acquired ONCE at the head) so the
 per-symbol CPE/PEG tracker is what holds lock across the tail — the harness currently
 re-acquires per frame and so cannot test a tracker-hold.
+
+## §12. BIG-BLOCK TEST 1 — ONE-ACQUISITION DECODE-THE-TAIL (BUILT + RESULT, 2026-06-05)
+
+The §11 NEXT STEP is now DONE. Two big-block harnesses were added (entry via
+`-m PLOT_PASSBAND -s 16`), both single-thread, no HW, no butler.
+
+### §12.1 ARCHITECTURAL CONSTRAINT (code-verified) — Nsymb is NOT free
+A SINGLE LDPC codeword is hardwired to `N = framesize = MERCURY_NORMAL = 1600` bits
+(`ldpc.cc:66`, `physical_defines.h:31`). CFG16's `Nsymb=9` is DERIVED so that
+`nData * log2(M) == 1600` (`telecom_system.cc:4598`, with `nData` = data carriers of
+the 9×50 grid after the Dy=3 pilot lattice). `data_container.set_size` then ties
+`nBits = nData*log2M` to the codeword (`:4713`); `transmit_bit` pads with
+`nVirtual_data = ldpc.N - nBits` (`:643`). **Therefore a literal "one preamble + 60
+DATA symbols carrying ONE codeword" is IMPOSSIBLE** without a new ~10 k-bit LDPC code
+(`nVirtual_data` would go negative → corruption). The big-block must be EITHER (A) K
+back-to-back 1600-bit codeword-frames under one acquisition, OR (B) a single
+60-symbol grid scored UNCODED (the timing/channel-estimation question is orthogonal
+to FEC). Both were built.
+
+### §12.2 Harness A — K-tiled LDPC-coded big-block (`MERCURY_SFO_BIGBLOCK=1`)
+In `sfo_block_test()`. TX K FULL frames into one contiguous SFO-drifted buffer (one
+`cl_sim_sfo`). RX acquires ONCE on frame 0 (real Schmidl-Cox), then decodes frames
+1..K-1 at `head_delay + k*full_frame` via `ofdm_forced_delay` — NO re-acquisition.
+Negative control `MERCURY_SFO_BIGBLOCK_NOTRACK=1` injects cumulative per-frame skew.
+**Result (CFG16, K=7 = 63 data symbols, frames_decoded):**
+| ppm | 0 | 25 | 50 | 80 | NOTRACK@50 |
+|-----|---|----|----|----|-----------|
+| dec | 7/7 | 7/7 | 7/7 | 7/7 | **2/7 (BER 0.076, monotonic tail fail)** |
+Holds 9/9 up to the buffer limit (~80 data sym) at 80 ppm. The per-frame pilot
+estimate re-derives per 9-sym codeword, so the only uncorrected error is the
+cumulative frame-START offset, which over ≤80 sym at ≤80 ppm is ≤~7 samples — within
+pilot-absorbable range. The NOTRACK control proves the harness BITES (tail fails
+monotonically: biterr 71→134→138→153→186 across frames 2..6).
+
+### §12.3 Harness B — GENUINE single 60-symbol grid (`MERCURY_SFO_GRID=1`)
+In `sfo_grid_test()`. Temporarily rebuilds the `ofdm` object at `Nsymb=60` (32QAM,
+33% pilots Dx=1/Dy=3 → nData=2000, nPilots=1000), TXs ONE grid of known 32QAM,
+applies the SFO as the EXACT per-symbol subcarrier phase ramp
+`exp(-j 2π k τ_n / Nfft)`, `τ_n = ppm·1e-6·n·(Nfft+Ngi)` (the omega+k·delta growth),
+then decodes with ONE channel estimate interpolated across all 60 symbols
+(`LS_channel_estimator` + `interpolate_bilinear_matrix`). Scored UNCODED, head vs
+tail. Negative control `MERCURY_SFO_GRID_NOINTERP=1` freezes a flat-unity estimate
+(no ramp removal). STEP-2 tracker `MERCURY_SFO_GRID_TRACK=1` = per-symbol CPE/PEG LS
+line-fit of pilot phase-error vs k (intercept=CPE, slope=PEG), 9-sym sliding-window
+average, de-rotate `exp(-j[ω+k·δ])` BEFORE the equalizer.
+**Result (CFG16, Nsymb=60, uncoded_BER_all):**
+| ppm | NOINTERP (neg-ctrl) | 2D-PILOT-EST (STEP 1) | CPE/PEG-TRACK (STEP 2) |
+|-----|---------------------|------------------------|------------------------|
+| 0   | 0                   | 0                      | 0                      |
+| 25  | 0.0348 (tail 0.084) | 0.0012 (tail 0.0048)   | **0**                  |
+| 50  | 0.1083 (tail 0.217) | 0.0160 (tail 0.0496)   | **0**                  |
+| 80  | 0.1699 (tail 0.288) | 0.0460 (tail 0.113)    | **0**                  |
+
+### §12.4 VERDICT — GO, with the tracker
+- **Big-block timing HOLDS across 60 symbols under 50 ppm SFO with ONE acquisition.**
+- On the K-tiled (per-9-sym-frame estimate) it holds with the EXISTING 2D-pilot est
+  alone (no tracker). On the GENUINE single 60-sym grid (one estimate), the existing
+  2D-pilot est does NOT cleanly hold — tail uncoded BER 5 % @50 ppm, 11 % @80 ppm,
+  which would FAIL the rate-0.875 LDPC. The **CPE/PEG LS tracker (STEP 2) drives the
+  single-grid tail to 0 BER across 0–80 ppm** — the anti-P core works exactly as the
+  Speth/Fechtel/Meyr design predicts.
+- Faithfulness PROVEN both ways: the NOTRACK (tiled) and NOINTERP (grid) negative
+  controls FAIL the tail monotonically, so a "holds" result is real discrimination.
+- The integer `rational_resampler` (no fractional trim) caps faithful blocks at ≤~80
+  data symbols (creep <1 samp/frame); 60 is well inside. Did NOT chase 100-sym.
+- NEXT: pilot-thin 33 %→6 % (Dy=3→Dy≈16) with the tracker carrying the timing (the
+  net-PHY-recovery step = the design's TEST 2), then ARQ/SACK re-granularization so
+  the big block is one ARQ unit. The tracker is the enabler for both.
