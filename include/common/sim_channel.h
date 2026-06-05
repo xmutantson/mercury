@@ -160,7 +160,8 @@ public:
 	// set correctly for whatever config the pin selects without plumbing Nofdm
 	// through the channel ctor.
 	cl_sim_phase_noise(uint64_t seed, double sigma_phi_rad, double f3db_hz,
-	                   double fs_hz, double ici_frac, double droop_sigma_rad)
+	                   double fs_hz, double ici_frac, double droop_sigma_rad,
+	                   double resid_sigma_rad = 0.0, double slow_f3db_hz = 0.2)
 		: rng_(seed), cpe_state_(0.0), ici_state_(0.0)
 	{
 		enabled_ = (sigma_phi_rad > 0.0);
@@ -191,6 +192,25 @@ public:
 		// per-subcarrier power loss, not random scatter). σ_droop is its own knob so
 		// it sets meanH WITHOUT injecting decode-breaking scatter.
 		droop_     = std::exp(-0.5 * droop_sigma_rad * droop_sigma_rad);
+		// --- EXPERIMENTAL 2-component common-phase model (DIAGNOSIS VALIDATION,
+		// fact-documents/sim2-cfg16-phase-noise-faithfulness.md §5). DEFAULT OFF:
+		// when resid_sigma_rad==0 the path below is bypassed and the channel is
+		// byte-identical to fa033eb. When MERCURY_SIM2_PN_RESID_DEG>0, the per-symbol
+		// common phase becomes φ_c[m] = a·slow_AR1(ρ_slow) + N(0,σ_resid):
+		//   • slow_AR1 at a sub-Hz pole (MERCURY_SIM2_PN_SLOW_F3DB, default 0.2 Hz) is
+		//     ~purely LINEAR over a 9-12 symbol frame ⇒ FULLY absorbed by the linear
+		//     CPE_correction (ofdm.cc:1928) ⇒ contributes ~0 to EVM. Its amplitude
+		//     sigma_cpe_ is reused (the "drift" the corrector eats).
+		//   • σ_resid = i.i.d. zero-mean per-symbol jitter ⇒ survives the ramp-only
+		//     corrector ~undiminished on EVERY frame (sets the EVM ceiling) AND its
+		//     per-frame |·|² mean over Nsymb is TIGHT (sd ~1/√Nsymb → HW 0.09), and it
+		//     is a pure per-symbol ROTATION 32-QAM tolerates. This is the §5 model fix.
+		resid_sigma_ = resid_sigma_rad;
+		twocomp_     = (resid_sigma_ > 0.0);
+		slow_f3db_   = slow_f3db_hz;
+		slow_state_  = 0.0;
+		rho_slow_    = 0.0;
+		slow_gain_   = 0.0;
 		// Stateful Hilbert FIR + matched real-path delay line.
 		build_hilbert();
 		hist_pos_ = 0;
@@ -214,12 +234,30 @@ public:
 			// Warm the common-phase AR(1) to its stationary distribution.
 			for (int i = 0; i < 4000; i++)
 				cpe_state_ = rho_cpe_ * cpe_state_ + rng_.gauss();
+			// 2-component (experimental): set the SLOW drift AR(1) pole at the sub-Hz
+			// cutoff so it is corrector-absorbed over a frame; warm it too.
+			if (twocomp_) {
+				rho_slow_  = std::exp(-2.0 * M_PI * slow_f3db_ / f_sym);
+				double sss = 1.0 / std::sqrt(1.0 - rho_slow_ * rho_slow_);
+				slow_gain_ = (sss > 0.0) ? (sigma_cpe_ / sss) : 0.0;
+				for (int i = 0; i < 20000; i++)
+					slow_state_ = rho_slow_ * slow_state_ + rng_.gauss();
+			}
 			cpe_init_ = true;
 		}
-		// One common phase for the entire OFDM symbol (constant rotation = benign
-		// CPE; this is the EVM-setting term that 32QAM can tolerate).
-		cpe_state_ = rho_cpe_ * cpe_state_ + rng_.gauss();
-		double phi_c = cpe_gain_ * cpe_state_;
+		double phi_c;
+		if (twocomp_) {
+			// φ_c[m] = slow drift (corrector eats it) + i.i.d. per-symbol residual
+			// (survives the ramp-only corrector, sets a STABLE per-frame EVM ceiling
+			// with TIGHT sd; pure rotation 32-QAM tolerates). §5 model fix.
+			slow_state_ = rho_slow_ * slow_state_ + rng_.gauss();
+			phi_c = slow_gain_ * slow_state_ + resid_sigma_ * rng_.gauss();
+		} else {
+			// One common phase for the entire OFDM symbol (constant rotation = benign
+			// CPE; this is the EVM-setting term that 32QAM can tolerate).
+			cpe_state_ = rho_cpe_ * cpe_state_ + rng_.gauss();
+			phi_c = cpe_gain_ * cpe_state_;
+		}
 		for (size_t i = 0; i < n; i++)
 		{
 			// Per-sample ICI jitter: band-limited AR(1) at F_ICI_HZ (RMS sigma_ici),
@@ -294,6 +332,13 @@ private:
 	double ici_gain_;
 	double ici_state_;
 	double droop_;
+	// EXPERIMENTAL 2-component common-phase state (§5; default OFF).
+	bool   twocomp_;
+	double resid_sigma_;   // i.i.d. per-symbol residual RMS (the EVM carrier)
+	double slow_f3db_;     // sub-Hz drift pole (corrector-absorbed)
+	double rho_slow_;
+	double slow_gain_;
+	double slow_state_;
 	double htap_[DELAY + 1];
 	double hist_[HIST_LEN];
 	int    hist_pos_;
@@ -314,7 +359,7 @@ public:
 	// independent of the AWGN SNR knob).
 	cl_sim_awgn(uint64_t seed, double snr3k_db)
 		: rng_(seed), pn_(pn_seed(seed), pn_sigma(), pn_f3db(), 48000.0, pn_ici(),
-		                  pn_droop())
+		                  pn_droop(), pn_resid(), pn_slow_f3db())
 	{
 		clean_     = (snr3k_db >= 900.0);
 		snr_lin_   = clean_ ? 0.0 : std::pow(10.0, snr3k_db / 10.0);
@@ -411,6 +456,25 @@ private:
 		double deg = (e && *e) ? atof(e) : PN_DROOP_DEG_DEFAULT;
 		if (deg < 0.0) deg = 0.0;
 		return deg * M_PI / 180.0;
+	}
+	// EXPERIMENTAL 2-component knobs (§5 diagnosis validation; default 0 = OFF).
+	//   MERCURY_SIM2_PN_RESID_DEG  : i.i.d. per-symbol residual common-phase RMS in
+	//                                DEGREES. >0 engages the 2-component model.
+	//   MERCURY_SIM2_PN_SLOW_F3DB  : sub-Hz drift pole (Hz, default 0.2) — the
+	//                                corrector-absorbed slow component.
+	static double pn_resid()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_PN_RESID_DEG");
+		double deg = (e && *e) ? atof(e) : 0.0;
+		if (deg < 0.0) deg = 0.0;
+		return deg * M_PI / 180.0;
+	}
+	static double pn_slow_f3db()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_PN_SLOW_F3DB");
+		double f = (e && *e) ? atof(e) : 0.2;
+		if (f <= 0.0) f = 0.2;
+		return f;
 	}
 	// Deterministic, distinct PN seed: a fixed bijective transform of the AWGN
 	// ctor seed. NEVER shares the AWGN rng_ stream and preserves the per-direction
