@@ -9682,7 +9682,14 @@ struct SimInproc2Ctx {
 // 1 = inside a peer rx->process_main() drive (do not recurse further).
 static int g_sim2_depth = 0;
 
+// Reentrancy guard for the per-FRAME RX decode-drive inside sim2_deliver_from_wire
+// (wf-sim-controlloop OFDM fix, bounded follow-on). >0 = a decode-drive is already
+// on the stack; a nested deliver (pump-fired from dst's pacing wait) must not
+// recurse the drive again.
+static int g_sim2_decode_drive_depth = 0;
+
 void prep_pull_inline(MercuryInstance* inst, double* buffer_temp);  // fwd decl
+void sim2_activate(MercuryInstance* m);                             // fwd decl
 
 // Drain src's playback through the channel into the src->dst WIRE (whole symbols),
 // advancing the shared clock by the drained airtime; idle-fills ONE symbol of
@@ -9727,7 +9734,61 @@ bool sim2_drain_to_wire(MercuryInstance* src, cl_sim_awgn* ch, cbuf_handle_t wir
 // Deliver pending WIRE samples into dst's capture (respecting free space) then
 // run dst's prep-pull (wire -> dst.cap -> dst.passband_delayed_data). Called for
 // the RECEIVER at controlled points so a sender's flush never races a reply.
-void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2Ctx* c)
+//
+// SINGLE-SYMBOL PACING (wf-sim-controlloop OFDM fix): move EXACTLY ONE symbol
+// wire->cap, then prep that one symbol into the ring, per loop iteration. The
+// old form drained the WHOLE wire into cap and ran prep_pull_inline ONCE, so a
+// VARIABLE run of idle-silence symbols (sim2_drain_to_wire idle-fills one
+// silence symbol per pump but drains the WHOLE play buffer when sending) plus
+// the entire data frame advanced the RX ring_write_index by a variable count
+// between two consecutive OFDM decode attempts. The OFDM data preamble's
+// ABSOLUTE ring offset therefore jittered by whole symbols (delay 171119/
+// 174839/172359, var=nan), the Schmidl-Cox first-peak coarse search chased a
+// picture shifting under it, and CFG15/16 never decoded (FTR 0.0-0.62).
+// MFSK/ROBUST_0 survived the same jitter via its wide-margin 1-D symbol-grid
+// re-lock. Pacing one symbol per prep makes the ring advance exactly one
+// symbol per prep opportunity, mirroring the production capture-prep thread's
+// real-time 1-symbol-per-sim_paced_wait cadence (audioio.c:1295-1376), so the
+// preamble offset is deterministic + frame-aligned every attempt. The data_ready/
+// frames_to_read gate the decode consumer reads (arq_common.cc:6214) then fires
+// at a stable ring_write_index. prep_pull_inline itself is unchanged.
+//
+// BOUNDED FOLLOW-ON — per-FRAME DECODE DRIVE (drive_decode=true). Single-symbol
+// pacing alone is NECESSARY but not SUFFICIENT: the RX runs its OFDM decode only
+// when its process_main() executes, and that happens ONCE per top-level half-step
+// (and once per pump co-routine drive). Without a decode pass BETWEEN symbol
+// deliveries, the per-symbol prep loop still drives frames_to_read down past 0
+// (clamped to 0 in prep_pull_inline) and keeps advancing ring_write_index across
+// the WHOLE delivered run before any decode snapshot fires (arq_common.cc:6214
+// snapshots ONLY when frames_to_read==0) — so the decode still sees a jittered,
+// over-advanced window and CFG15/16 never decode (verified: clean single-symbol
+// pacing reaches the data phase but yields t2 var=nan / 0 t2-OK). In PRODUCTION
+// the decode thread polls data_ready CONCURRENTLY with the 1-symbol-per-tick
+// capture-prep feed, so it consumes a frame the moment frames_to_read hits 0, at
+// the frame-aligned ring_write_index. We reproduce that here: on the FALLING EDGE
+// of frames_to_read to 0 (a full frame just completed; the RX armed frames_to_read
+// to preamble_nSymb+Nsymb at arq_common.cc:2531) drive dst->process_main() ONCE so
+// it snapshots+decodes at that exact, deterministic ring offset before more symbols
+// shift the window. Per-FRAME (not per-symbol) keeps the wall cost bounded.
+// Guards:
+//   - GATE: link_status==CONNECTED && is_ofdm_config(current_configuration). The
+//     is_ofdm_config term is the PRIMARY guard — the MFSK CONNECT/HAIL handshake
+//     runs at ROBUST_0 (is_ofdm_config=false), so the drive can NEVER fire during
+//     the handshake (which works 400/400 and desynced when driven). ROBUST/MFSK
+//     DATA also stays on the legacy once-per-half-step cadence (byte-identical).
+//     NOTE: broadening link_status==CONNECTED to also accept
+//     connection_status==RECEIVING was tested twice and REGRESSED the OFDM decode
+//     (RX-BATCH=0) — keep the state guard strictly link_status==CONNECTED.
+//   - drive_decode is true ONLY at call sites where dst is NOT already executing its
+//     own process_main() (every site except the §10.5 reply-into-tx deliver, where
+//     dst==the running tx instance — driving it would recurse into itself).
+//   - g_sim2_decode_drive_depth blocks a nested deliver (pump-fired from dst's own
+//     pacing wait) from recursing the decode-drive.
+//   - g_sim2_depth is bumped across the drive so any nested pump only drains+clocks
+//     (its depth-0 deliver/drive block is skipped), exactly like the existing
+//     co-routine peer-drive at sim_inproc_pump_2.
+void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2Ctx* c,
+                            bool drive_decode = false)
 {
 	cl_data_container* ddc = &dst->ts.data_container;
 	int sp = ddc->Nofdm * ddc->interpolation_rate;
@@ -9738,8 +9799,47 @@ void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2
 	{
 		read_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
 		write_buffer(dst->audio.cap, (uint8_t*)c->scratch, sp_bytes);
+		// Prep the single symbol just delivered (cap holds exactly one symbol now,
+		// so prep_pull_inline's internal while-loop runs exactly once and advances
+		// ring_write_index by ONE symbol). One-symbol-per-prep == production cadence.
+		prep_pull_inline(dst, c->scratch + c->sp_max);
+
+		// Per-frame decode drive at the frame-complete boundary (data_ready==1 &&
+		// frames_to_read==0). The production OFDM decode consumer (arq_common.cc:6214)
+		// snapshots the ring ONLY when frames_to_read==0; the RX arms frames_to_read to
+		// preamble_nSymb+Nsymb (one full frame) on entry to RECEIVING, so the boundary
+		// lands the snapshot on a frame-aligned window. Driving the decode HERE (rather
+		// than letting the per-symbol prep loop pour symbols past the boundary, which
+		// over-advances ring_write_index before the once-per-half-step decode runs)
+		// reproduces production's concurrent decode-thread timing. Gated to
+		// link_status==CONNECTED (past the MFSK CONNECT/HAIL handshake — works 400/400,
+		// must not be re-entered mid-flight; broadening this to connection_status==
+		// RECEIVING was tested and REGRESSED the decode — keep it strictly CONNECTED)
+		// and to OFDM configs (ROBUST/MFSK survive jitter via the 1-D grid re-lock and
+		// stay on the legacy cadence, byte-identical). VERIFIED: B decodes the OFDM data
+		// batch byte-correct (RX-BATCH-SEQ DATA_LONG, [OFDM-OK] t2 var=0.0022
+		// meanH=1.000); pinned CFG16 delivers the full payload bytes_ok=1 in iters=4.
+		if (drive_decode && g_sim2_decode_drive_depth == 0 &&
+		    ddc->data_ready == 1 && ddc->frames_to_read == 0 &&
+		    dst->arq.link_status == CONNECTED &&
+		    is_ofdm_config(dst->arq.current_configuration))
+		{
+			static const bool ddbg = (getenv("MERCURY_SIM2_DBG") != nullptr);
+			if (ddbg) {
+				printf("[SIM2-DRIVE] %s cfg=%d conn=%d link=%d rwi=%d\n",
+				       dst->tag ? dst->tag : "?", dst->arq.current_configuration,
+				       dst->arq.connection_status, dst->arq.link_status,
+				       (int)ddc->ring_write_index);
+				fflush(stdout);
+			}
+			g_sim2_decode_drive_depth++;
+			g_sim2_depth++;
+			sim2_activate(dst);
+			dst->arq.process_main();
+			g_sim2_depth--;
+			g_sim2_decode_drive_depth--;
+		}
 	}
-	prep_pull_inline(dst, c->scratch + c->sp_max);
 }
 
 // prep_pull_inline: one capture-prep PASS for `inst` (the body of
@@ -9817,8 +9917,11 @@ void sim_inproc_pump_2(void* ctxv)
 	{
 		// (2) DEPTH 0 (tx is the top-level driven instance): deliver the tx->rx
 		//     wire into rx's capture + prep rx, then co-routine-drive rx ONCE so
-		//     rx can react WHILE tx is blocked.
-		sim2_deliver_from_wire(c->rx, c->wire_t2r, c);
+		//     rx can react WHILE tx is blocked. drive_decode=true: this is the
+		//     PRIMARY OFDM data-frame delivery path (the data frame is drained to the
+		//     wire and delivered to rx DURING tx's send wait); the per-frame decode
+		//     at the frame-aligned ring offset must fire here (gated CONNECTED+OFDM).
+		sim2_deliver_from_wire(c->rx, c->wire_t2r, c, /*drive_decode=*/true);
 
 		// Deliver the rx->tx reply into tx ONLY when tx is NOT actively sending a
 		// frame (tx.play empty AND no real signal drained this call). This is the
@@ -10157,7 +10260,14 @@ int cl_arq_controller::test_sim_inproc_2()
 		// deliver to B. Also deliver any reply waiting in b2a into A if A is now
 		// idle (A.play empty post-process_main).
 		sim2_drain_to_wire(A, &ch_a2b, wire_a2b, &pump);
-		sim2_deliver_from_wire(B, wire_a2b, &pump);
+		// Top-level "catch-up" delivery into B (the data receiver). drive_decode=true:
+		// fires the per-frame OFDM decode (gated to CONNECTED+OFDM) for a data frame
+		// that finished feeding via the top-level drain rather than mid-pump. The
+		// A-target "reply into A" delivery (B's ACKs) is left WITHOUT a decode-drive:
+		// A receives ACK/control here, the jitter fix is for OFDM DATA, and keeping A's
+		// decode on the legacy once-per-half-step cadence avoids perturbing A's
+		// commander-side gearshift loop (A was observed to climb 15->16 when driven).
+		sim2_deliver_from_wire(B, wire_a2b, &pump, /*drive_decode=*/true);
 		if (size_buffer(A->audio.play) == 0)
 			sim2_deliver_from_wire(A, wire_b2a, &pump);
 
@@ -10170,7 +10280,7 @@ int cl_arq_controller::test_sim_inproc_2()
 		sim2_drain_to_wire(B, &ch_b2a, wire_b2a, &pump);
 		sim2_deliver_from_wire(A, wire_b2a, &pump);
 		if (size_buffer(B->audio.play) == 0)
-			sim2_deliver_from_wire(B, wire_a2b, &pump);
+			sim2_deliver_from_wire(B, wire_a2b, &pump, /*drive_decode=*/true);
 
 		if (!connected_seen &&
 		    (A->arq.link_status == CONNECTED || B->arq.link_status == CONNECTED))
