@@ -25,6 +25,7 @@
 #include "debug/canary_guard.h"
 #include <chrono>
 #include <vector>  // suffix-FEC soft decode candidate buffers
+#include <cstdlib> // std::getenv / atoi for MERCURY_SIM2_MINI_NSYM (LEVER P MINI knob)
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
@@ -548,7 +549,28 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 	if(full_nsymb < 1) full_nsymb = 1;            // degenerate guard
 	if(force_full) return full_nsymb;             // retx / after-FAIL re-anchor
 	if(frame_idx_in_batch <= 0) return full_nsymb; // batch anchor (frame 0)
-	return 1;                                      // MINI 1-symbol resync
+
+	// MERCURY_SIM2_MINI_NSYM (default 1): the per-frame MINI preamble length for
+	// the in-process 2-instance time-domain-faithfulness sim (ARM C). The 1-sym
+	// MINI under-integrates the Schmidl-Cox metric (L=nsym*Nfft/nIS) by 4x vs the
+	// 4-sym FULL, so its variance (S&C 1997 eq.20, sigma^2 ~ 1/L) jitters the
+	// peak-pick +-1 OFDM symbol under SFO/CFO; a 2-sym MINI halves that variance
+	// and is the "recovers close to ARM A" arm. Read ONCE (function-local static)
+	// so TX and RX derive bit-identical schedules — the function stays PURE. The
+	// knob only RAISES the MINI floor; it never exceeds full_nsymb. Default 1 ⇒
+	// byte-identical to the pre-knob schedule (no env read changes the result).
+	// Production (-m ARQ) never sets this env ⇒ MINI stays 1, byte-identical.
+	static const int mini_nsymb = []() {
+		const char* e = std::getenv("MERCURY_SIM2_MINI_NSYM");
+		if(!e) return 1;
+		int v = atoi(e);
+		if(v < 1) v = 1;                          // clamp: MINI is at least 1 symbol
+		return v;
+	}();
+
+	int eff = mini_nsymb;
+	if(eff > full_nsymb) eff = full_nsymb;        // never exceed the FULL preamble
+	return eff;                                    // MINI resync (default 1 symbol)
 }
 
 int cl_telecom_system::tx_effective_preamble_nsymb() const
