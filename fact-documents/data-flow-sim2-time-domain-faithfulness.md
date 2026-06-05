@@ -327,12 +327,10 @@ fully.
 `MERCURY_SFO_BLOCK_SEED` (12345); SFO via `MERCURY_SIM2_SFO_PPM/_WALK_PPM/_MAX_PPM`;
 MINI arm via `preamble_amortization_enabled` + `MERCURY_SIM2_MINI_NSYM`.
 
-**STILL TO VALIDATE (Phase 2, NOT done here):** (1) SFO-MATTERS — a 60-frame CFG16
-block at 50 ppm must DEGRADE vs the clean control (timing creeps, tail decode fails);
-(2) P-REPRODUCTION — MINI (1-sym) under 50 ppm must FAIL on the tail while FULL (4-sym)
-HOLDS, matching the HW −90% signature. If SFO cannot be made to affect decode in this
-harness, the investment FAILED — report honestly, do not declare success on a still-
-pinned window.
+**VALIDATED (Phase 2, this session) — see §11 for the verdict and the falsified claim.**
+Headline: GATE 1 (SFO-MATTERS) PASSES for the FULL arm — SFO now reaches Schmidl-Cox;
+GATE 2 (P-REPRODUCTION) FAILS — the MINI failure is SFO-INDEPENDENT (a harness artifact),
+so the harness does NOT yet reproduce the HW −90% SFO signature.
 
 ## §8. Calibration artifacts (already captured — CONSUME only)
 
@@ -342,3 +340,87 @@ pinned window.
 - `preamble_hw_p2/` (2-sym; p2on JSON pending from wf `wakxzqmmo`).
 - DO NOT touch the concurrent HW run (wf `wme7070ep`/`wakxzqmmo`), the bench, or the
   butler — purely consume the JSON.
+
+## §11. PHASE 2 VALIDATION RESULTS + VERDICT (this session, 2026-06-05)
+
+All runs: `-m PLOT_PASSBAND -s 16`, CFG16 32-QAM, 60 frames, seed 12345.
+MINI-arm selection required a small env hook (`MERCURY_SFO_BLOCK_ARM=MINI|FULL`) —
+the PLOT_PASSBAND path has no ARQ pump to set `preamble_amortization_enabled`, so the
+Phase-1 build could not actually run the MINI arm. Hook added this session (1-file,
+`telecom_system.cc` top of `sfo_block_test()`; default = member flag = FULL).
+
+### GATE 1 — SFO-MATTERS: **PASS (FULL arm).**
+| run | det frame0 → frame59 | frames_decoded | block_BER | mean_metric |
+|-----|----------------------|----------------|-----------|-------------|
+| FULL clean (SFO OFF), 60f | 7439 → 7439 (no creep) | 60/60 | 0 | 0.99687 |
+| FULL **50 ppm** SFO, 60f  | **7440 → 7393** (−47 samp creep) | 60/60 | 0 | 0.99367 |
+| FULL **500 ppm** SFO, 60f | 7440 → 7355 (−85 samp creep) | 60/60 | 0 | 0.99276 |
+
+The detected preamble position **CREEPS MONOTONICALLY** with SFO (−47 samples at
+50 ppm; 50 ppm × 967200 block-samples ≈ 48 — physics matches). Under the OLD pinned
+in-process pump AND the standard BER sweep, this would be byte-identical to SFO-off
+(`det` fixed) — F1/§9. **So SFO now genuinely reaches the timing-acquisition logic.**
+The FULL 4-sym preamble HOLDS (60/60) because each `receive_byte` RE-ACQUIRES the
+drifted preamble via the full Schmidl-Cox search every frame.
+
+CAVEAT on what GATE 1 proves: the harness exercises **per-frame timing
+RE-ACQUISITION under accumulated drift** (window moves, Schmidl-Cox re-finds it). It
+does NOT exercise a single 60-symbol decode window where timing must HOLD across the
+whole block WITHOUT re-pinning — which is the literal big-block TEST 1 ("per-symbol
+CPE/PEG tracker holds lock across a 60-symbol block, byte-correct TAIL decode"). The
+harness re-pins per frame; big-block forbids the re-pin. So GATE 1 validates that the
+SFO stage + acquisition wiring are live, but it is NOT yet the big-block tracker test.
+
+### GATE 2 — P-REPRODUCTION: **FAIL (does NOT isolate SFO).**
+| run | frames_decoded | block_BER | mean_metric_MINI |
+|-----|----------------|-----------|------------------|
+| MINI **clean (SFO OFF)**, 60f | 1/60 | 0.49227 | 0.130 |
+| MINI **50 ppm** SFO, 60f      | 1/60 | 0.49227 | 0.131 |
+
+MINI 50 ppm is **byte-identical to MINI clean** (both 37806/76800 biterr). SFO adds
+**ZERO** to the MINI failure. The MINI arm fails because the STANDALONE harness runs a
+cold full-buffer Schmidl-Cox search per `receive_byte` (`ofdm_forced_delay=-1`) that
+cannot acquire a 1-sym preamble — the detected positions are garbage (det=26020,
+13620, 10900: random data correlation peaks, not the preamble). The metric ~0.13 is
+the search noise floor, not an SFO-degraded peak.
+
+ROOT CAUSE (verified at `telecom_system.cc:1349-1371`): production MINI decode does
+NOT use the cold full search. It uses the **batch-predict narrow search**, gated by
+`preamble_amortization_enabled && ofdm_batch_active && ofdm_search_raw > 0`
+(`:1349-1354`), which computes `predicted_pos = ofdm_skip*sym_samples +
+ofdm_drift_per_frame` (`:1365`) and verifies in a tiny `±2·GI` window (`:1369-1371`).
+The standalone harness never sets up `ofdm_batch_active`/`ofdm_search_raw`/`ofdm_skip`,
+so the batch-predict path is dead and MINI fails UNCONDITIONALLY.
+
+The Phase-1 comment (`telecom_system.cc:5549-5555`) asserting "a 1-sym preamble
+presents a 4× shorter half-symbol repeat to the SAME [full] search, so its metric
+under-integrates under SFO regardless of ARQ state" is **FALSIFIED**: production never
+decodes a MINI frame via the full search, and the harness's full search fails on MINI
+even at 0 ppm. The REAL SFO-vulnerability of LEVER P lives in the
+`ofdm_drift_per_frame` PREDICTION + narrow `±2·GI` verify window (`:1365-1371`): under
+SFO the predicted position drifts out of the narrow window → re-pin metric collapses →
+HW −90%. **That batch-predict path is exactly what the standalone harness bypasses.**
+
+### VERDICT: **PARTIAL_NEEDS_MORE.**
+- SFO MATTERS in the new harness (GATE 1 PASS, FULL arm) — durable progress, the F1
+  pin is broken for the acquisition-runs-per-frame case. Every future
+  timing/preamble lever can now be sim-checked that SFO at least reaches Schmidl-Cox.
+- But P-reproduction (GATE 2) is NOT achieved: the MINI failure is a harness artifact
+  (no batch-predict state), SFO-independent, so it does NOT match the HW −90%
+  signature. Declaring success here would be a band-aid (CLAUDE.md §2).
+- NOT ready for big-block TEST 1: (a) GATE 2 not reproduced; (b) even GATE 1 is
+  per-frame re-acquisition, not the single-window 60-symbol HOLD that TEST 1 needs.
+
+### NEXT STEP (the right fix, do NOT shotgun):
+Drive the harness's per-frame `receive_byte` through the production **batch-predict**
+state, not the cold full search — set `receive_stats.ofdm_batch_active=1`,
+`ofdm_search_raw>0`, and seed `ofdm_skip`/`ofdm_drift_per_frame` from the previous
+frame (mirror the ARQ batch cadence at `arq_commander` that normally maintains them),
+so the MINI frame is located by the narrow predict-verify window. THEN:
+  (1) MINI clean must DECODE (predict window finds the 1-sym preamble at 0 ppm);
+  (2) MINI 50 ppm must FAIL on the tail (drift walks the prediction out of the ±2·GI
+      window, metric ~0.25), while FULL 50 ppm HOLDS — the true HW −90% P-repro.
+SEPARATELY, for big-block TEST 1 proper, add a single-window long-block decode (one
+`receive_byte` over an N-symbol block, timing acquired ONCE at the head) so the
+per-symbol CPE/PEG tracker is what holds lock across the tail — the harness currently
+re-acquires per frame and so cannot test a tracker-hold.

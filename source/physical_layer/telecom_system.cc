@@ -5382,8 +5382,15 @@ void cl_telecom_system::sfo_block_test()
 	// LEVER P arm selection: MINI engages preamble amortization (the per-frame
 	// MINI preamble length is read from MERCURY_SIM2_MINI_NSYM inside
 	// preamble_sched_nsymb). FULL forces every frame to the configured 4-sym
-	// preamble. The arm is chosen here from preamble_amortization_enabled, which
-	// the CLI/caller already set; default (production) is the FULL behaviour.
+	// preamble. The arm is chosen from preamble_amortization_enabled, which the
+	// in-process pump path sets via the CLI (arq_commander.cc:10150). Standalone
+	// (this PLOT_PASSBAND harness has no ARQ pump to set it), select the arm with
+	// MERCURY_SFO_BLOCK_ARM=MINI|FULL (default = the member flag = FULL).
+	{
+		const char* arm = std::getenv("MERCURY_SFO_BLOCK_ARM");
+		if(arm && (*arm=='M' || *arm=='m')) preamble_amortization_enabled = true;
+		else if(arm && (*arm=='F' || *arm=='f')) preamble_amortization_enabled = false;
+	}
 	bool mini_arm = preamble_amortization_enabled;
 	int  full_pre = data_container.preamble_nSymb;
 
