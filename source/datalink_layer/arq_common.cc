@@ -3658,6 +3658,18 @@ void cl_arq_controller::send_batch()
 	}
 
 	int header_length=0;
+	// LEVER P: preamble amortization. Frames are concatenated into ONE gapless
+	// PTT waveform; with variable-length frames (anchor FULL + tail MINI) we pack
+	// them CONTIGUOUSLY rather than at a fixed frame_output_size stride. Slot 0 is
+	// the leading FIR pad (frame_output_size samples). Frame i is written at
+	// frame_pack_off[i] (running offset starting at frame_output_size). frame_len[i]
+	// is its actual emitted length (from tx_last_emitted_frame_samples). MFSK and
+	// retx batches force every frame FULL so frame_len == frame_output_size and the
+	// packing degenerates to the legacy fixed-stride layout (byte-identical).
+	std::vector<int> frame_pack_off(message_batch_counter_tx, 0);
+	std::vector<int> frame_len(message_batch_counter_tx, frame_output_size);
+	int pack_cursor = frame_output_size;  // first frame begins after the lead pad
+	const bool batch_force_full = sack_retransmit_active;  // retx => re-anchor every frame
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
 		// SACK retransmit: sequence_number already set to original position
@@ -3775,7 +3787,25 @@ void cl_arq_controller::send_batch()
 			fflush(stdout);
 		}
 
-		telecom_system->transmit_byte(telecom_system->data_container.data_byte,header_length+messages_batch_tx[i].length,&batch_frames_output_data[(i+1)*frame_output_size],NO_FILTER_MESSAGE);
+		// LEVER P: per-frame preamble schedule. Only DATA frames amortize; any
+		// CONTROL/ACK frame mixed into the batch keeps the FULL preamble (force
+		// full). The schedule is keyed on the in-batch frame index i and the
+		// batch-wide force-full flag (retx). transmit_bit reads the override and
+		// reports the actual emitted length via tx_last_emitted_frame_samples.
+		bool frame_is_data = (messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT);
+		bool frame_force_full = batch_force_full || !frame_is_data;
+		telecom_system->tx_preamble_nsymb_override =
+			cl_telecom_system::preamble_sched_nsymb(i, frame_force_full,
+				telecom_system->data_container.preamble_nSymb);
+
+		frame_pack_off[i] = pack_cursor;
+		telecom_system->transmit_byte(telecom_system->data_container.data_byte,header_length+messages_batch_tx[i].length,&batch_frames_output_data[pack_cursor],NO_FILTER_MESSAGE);
+		telecom_system->tx_preamble_nsymb_override = -1;  // reset (defensive)
+
+		frame_len[i] = telecom_system->tx_last_emitted_frame_samples;
+		if(frame_len[i] <= 0 || frame_len[i] > frame_output_size)
+			frame_len[i] = frame_output_size;  // defensive clamp
+		pack_cursor += frame_len[i];
 
 
 		last_message_sent_type=messages_batch_tx[i].type;
@@ -3787,14 +3817,23 @@ void cl_arq_controller::send_batch()
 
 	}
 
+	// LEVER P: contiguous packed layout. The frames region is
+	// [frame_output_size, pack_cursor). Lead pad (slot 0) = copy of the first
+	// frame_output_size samples of frame 0; trail pad = copy of the last
+	// frame_output_size samples of the final frame. This mirrors the legacy
+	// edge-replication so the FIR transient never bites a real sample.
+	int frames_region_len = pack_cursor - frame_output_size;  // sum of frame_len[i]
 	for(int i=0;i<frame_output_size;i++) //padding start and end to prepare for filtering
 	{
-		batch_frames_output_data[(0)*frame_output_size+i]=batch_frames_output_data[(0+1)*frame_output_size+i];
-		batch_frames_output_data[(message_batch_counter_tx+1)*frame_output_size+i]=batch_frames_output_data[(message_batch_counter_tx)*frame_output_size+i];
+		// lead pad: replicate the first frame's leading samples
+		batch_frames_output_data[i]=batch_frames_output_data[frame_output_size+i];
+		// trail pad: replicate the final frame's trailing samples (the last
+		// frame_output_size samples of the packed frames region)
+		batch_frames_output_data[pack_cursor+i]=batch_frames_output_data[pack_cursor-frame_output_size+i];
 	}
 
 	{
-		int total_fir_size = (message_batch_counter_tx+2)*frame_output_size;
+		int total_fir_size = pack_cursor + frame_output_size;  // lead pad + frames + trail pad
 		memset(batch_frames_output_data_filtered1, 0, total_fir_size * sizeof(double));
 		memset(batch_frames_output_data_filtered2, 0, total_fir_size * sizeof(double));
 		telecom_system->ofdm.FIR_tx1.apply(batch_frames_output_data,batch_frames_output_data_filtered1,total_fir_size);
@@ -3914,10 +3953,14 @@ void cl_arq_controller::send_batch()
 		delete[] pilot_buffer;
 	}
 
+	// LEVER P: transmit each frame at its actual packed offset and actual length
+	// (variable: anchor FULL, tail MINI). The frames are contiguous, so the wire
+	// sees one gapless waveform; per-frame tx_transfer granularity is preserved
+	// for the sim pacing / capture-prep symbol cadence.
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
-		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, size=%d\n", i, message_batch_counter_tx, frame_output_size); fflush(stdout); }
-		tx_transfer(&batch_frames_output_data_filtered2[(i+1)*frame_output_size], frame_output_size);
+		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, off=%d size=%d\n", i, message_batch_counter_tx, frame_pack_off[i], frame_len[i]); fflush(stdout); }
+		tx_transfer(&batch_frames_output_data_filtered2[frame_pack_off[i]], frame_len[i]);
 	}
 
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
@@ -6145,7 +6188,15 @@ void cl_arq_controller::receive()
 			&& received_message_stats.delay > 0)
 		{
 			int sp = signal_period;
-			int frame_syms = telecom_system->data_container.preamble_nSymb
+			// LEVER P: zero only the ACTUAL decoded frame (eff preamble + data).
+			// Zeroing the FULL preamble_nSymb on a MINI tail frame would erase
+			// 3 symbols into the NEXT frame's MINI preamble in the gapless batch
+			// waveform, destroying it. last_eff_preamble_nsymb == preamble_nSymb
+			// when amortization is off.
+			int zero_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
+			if(zero_eff_pre < 1 || zero_eff_pre > telecom_system->data_container.preamble_nSymb)
+				zero_eff_pre = telecom_system->data_container.preamble_nSymb;
+			int frame_syms = zero_eff_pre
 				+ telecom_system->get_active_nsymb();
 			int frame_samples = frame_syms * symbol_period;
 			int frame_ring_start = (rwi + received_message_stats.delay) % sp;
@@ -6204,7 +6255,16 @@ void cl_arq_controller::receive()
 		if (received_message_stats.message_decoded==YES)
 		{
 			int rx_nsymb = telecom_system->get_active_nsymb();
-			int rx_frame = rx_nsymb + telecom_system->data_container.preamble_nSymb;
+			// LEVER P: this frame's actual length is (eff preamble + data). For a
+			// MINI tail frame eff=1, so rx_frame is shorter; the next preamble in
+			// the gapless batch waveform sits exactly rx_frame symbols ahead. The
+			// position chain (ofdm_search_raw / frames_to_read) MUST advance by the
+			// ACTUAL length or the batch-predict window misses every tail frame.
+			// last_eff_preamble_nsymb == preamble_nSymb when amortization is off.
+			int rx_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
+			if(rx_eff_pre < 1 || rx_eff_pre > telecom_system->data_container.preamble_nSymb)
+				rx_eff_pre = telecom_system->data_container.preamble_nSymb;  // defensive
+			int rx_frame = rx_nsymb + rx_eff_pre;
 			int end_of_current_message = received_message_stats.delay / symbol_period  + rx_frame;
 			int frames_left_in_buffer = telecom_system->data_container.buffer_Nsymb - end_of_current_message;
 			if(frames_left_in_buffer<0)

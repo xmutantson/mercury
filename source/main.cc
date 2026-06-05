@@ -264,6 +264,13 @@ int main(int argc, char *argv[])
             int failed = run_sim_clock_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-preamble-sched : LEVER P preamble-amortization schedule +
+        // effective-length pure-function unit tests. Fast + deterministic.
+        // See fact-documents/data-flow-preamble-amortization.md §1.
+        if (strcmp(argv[i], "--test-preamble-sched") == 0) {
+            int failed = run_preamble_sched_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;

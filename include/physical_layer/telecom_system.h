@@ -98,6 +98,7 @@ struct st_receive_stats{
 	bool frame_skip_var_aborted;  // true: trial loop aborted on consecutive SKIP-VAR — caller should zero false preamble and advance cursor past noise region
 	double coarse_metric;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
 	double ofdm_drift_per_frame;  // IIR-filtered prediction error (interp samples) for BATCH verify
+	int last_eff_preamble_nsymb;  // LEVER P: actual preamble-symbol count of the most recently extracted OFDM frame (FULL anchor vs MINI tail). Read by the ARQ position-advance (rx_frame = last_eff_preamble_nsymb + Nsymb). Defaults to preamble_nSymb when amortization is off.
 };
 
 
@@ -370,6 +371,59 @@ public:
 
 	void transmit_byte(int* data, int nBytes, double *out, int message_location);
 	st_receive_stats receive_byte(double *data, int* out);
+
+	// ===== LEVER P: PREAMBLE AMORTIZATION =====
+	// A batch is one gapless PTT waveform of N concatenated OFDM frames; today
+	// every frame carries a full preamble_nSymb (=4) preamble, so 24 of 25
+	// preambles in a batch are pure redundancy. The deterministic schedule below
+	// emits a FULL preamble only on the batch anchor (frame 0) + on retx/after-
+	// FAIL frames, and a 1-symbol MINI Schmidl-Cox resync on the rest. TX and RX
+	// compute the schedule INDEPENDENTLY from (frame index, force-full) — no
+	// per-frame wire flag. The pilot-derived channel estimate (33%-density
+	// pilots in every DATA symbol) is unchanged, so SKIP-H / SKIP-VAR / partial-
+	// SACK gates survive untouched; the preamble was only ever timing + CFO.
+	// See fact-documents/data-flow-preamble-amortization.md.
+	//
+	// Pure schedule predicate (INC-0): how many preamble symbols frame
+	// frame_idx_in_batch emits. force_full forces FULL for retx + after-FAIL
+	// re-anchor frames. full_nsymb is the configured preamble_nSymb. Returns 1
+	// (MINI) for non-anchor non-forced frames; full_nsymb otherwise. STATIC /
+	// PURE so TX and RX get bit-identical results.
+	static int preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb);
+
+	// Master enable for preamble amortization. DEFAULT OFF pending INC-3 (the
+	// batch-predict position-chain handoff for MINI frames that land beyond the
+	// current buffer needs a defer-instead-of-full-search fix — see
+	// fact-documents/data-flow-preamble-amortization.md §3/§6). When OFF the
+	// schedule collapses to FULL on every frame: TX and RX are byte-identical to
+	// the pre-LEVER-P baseline (verified: pinned CFG16 sim delivers 468.2 bps,
+	// byte-correct, unchanged). When ON it activates the variable-preamble TX +
+	// RX MINI handling. Toggle via the env knob below for A/B + INC-3 work.
+	bool preamble_amortization_enabled = false;
+
+	// TX per-frame override: number of preamble symbols THIS transmit_bit call
+	// emits. -1 = use the full configured preamble_nSymb (legacy). send_batch
+	// sets this per frame from the schedule before each transmit_byte.
+	int tx_preamble_nsymb_override = -1;
+
+	// RX per-frame override: number of preamble symbols the frame about to be
+	// decoded is expected to carry (drives the data-symbol offset + frame
+	// extraction size). -1 = use the full configured preamble_nSymb (legacy).
+	// The ARQ receive driver sets this from the schedule (frame index counted
+	// within the current batch) before each receive_byte.
+	int rx_preamble_nsymb_override = -1;
+
+	// Effective preamble length helpers: clamp an override into [1, full] or
+	// fall back to the configured length when the override is -1.
+	int tx_effective_preamble_nsymb() const;
+	int rx_effective_preamble_nsymb() const;
+
+	// Set by transmit_bit to the number of passband samples it actually wrote to
+	// `out` for the most recent frame = Nofdm*(eff_preamble+active_nsymb)*interp.
+	// send_batch reads this to pack the next frame contiguously (variable-length
+	// frames in one gapless PTT waveform). Equals total_frame_size for FULL
+	// frames; smaller for MINI frames.
+	int tx_last_emitted_frame_samples = 0;
 
 	// Lightweight signal measurement only (no decoding)
 	double measure_signal_only(double *data);

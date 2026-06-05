@@ -5563,3 +5563,79 @@ int run_mfsk_ctrl_codec_tests() {
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }
+
+// =============================================================================
+// LEVER P: PREAMBLE AMORTIZATION — INC-0 schedule + effective-length tests
+// (pure functions; no PHY bring-up). See
+// fact-documents/data-flow-preamble-amortization.md §1.
+// =============================================================================
+
+// §P.1 schedule predicate: anchor=FULL, tail=MINI, force_full=FULL.
+static void test_preamble_sched_predicate() {
+	const char* name = "preamble_sched_predicate";
+	const int full_n = 4;
+	// frame 0 -> FULL (anchor)
+	if (cl_telecom_system::preamble_sched_nsymb(0, false, full_n) != full_n) {
+		test_fail(name, "frame 0 (anchor) must be FULL"); return; }
+	// frames 1..24 -> MINI (1)
+	for (int i = 1; i <= 24; i++) {
+		if (cl_telecom_system::preamble_sched_nsymb(i, false, full_n) != 1) {
+			test_fail(name, "tail frame must be MINI=1"); return; }
+	}
+	// force_full overrides MINI on any tail index (retx / after-FAIL)
+	for (int i = 0; i <= 24; i++) {
+		if (cl_telecom_system::preamble_sched_nsymb(i, true, full_n) != full_n) {
+			test_fail(name, "force_full must be FULL on every index"); return; }
+	}
+	// degenerate full<1 clamps to 1, anchor still uses it
+	if (cl_telecom_system::preamble_sched_nsymb(0, false, 0) != 1) {
+		test_fail(name, "full<1 must clamp to 1"); return; }
+	test_pass(name);
+}
+
+// §P.2 TX==RX symmetry: the same (idx, force_full, full) yields identical
+// results from the single shared pure function (this is the no-wire-flag
+// guarantee — both sides call the identical predicate).
+static void test_preamble_sched_tx_rx_symmetry() {
+	const char* name = "preamble_sched_tx_rx_symmetry";
+	for (int full = 1; full <= 16; full++) {
+		for (int idx = 0; idx < 30; idx++) {
+			for (int ff = 0; ff <= 1; ff++) {
+				int a = cl_telecom_system::preamble_sched_nsymb(idx, ff != 0, full);
+				int b = cl_telecom_system::preamble_sched_nsymb(idx, ff != 0, full);
+				if (a != b) { test_fail(name, "non-deterministic"); return; }
+				// invariants: 1 <= result <= max(full,1)
+				int fmax = (full < 1) ? 1 : full;
+				if (a < 1 || a > fmax) { test_fail(name, "out of [1,full]"); return; }
+			}
+		}
+	}
+	test_pass(name);
+}
+
+// §P.3 batch preamble-symbol accounting: a 25-frame clean batch carries
+// FULL + 24*MINI preamble symbols (the amortization invariant the win rests
+// on). At FULL=4 that is 4 + 24 = 28 vs the legacy 25*4 = 100.
+static void test_preamble_sched_batch_accounting() {
+	const char* name = "preamble_sched_batch_accounting";
+	const int full_n = 4, nframes = 25;
+	int amortized = 0, legacy = 0;
+	for (int i = 0; i < nframes; i++) {
+		amortized += cl_telecom_system::preamble_sched_nsymb(i, false, full_n);
+		legacy    += full_n;
+	}
+	if (legacy != 100)    { test_fail(name, "legacy must be 100"); return; }
+	if (amortized != 28)  { test_fail(name, "amortized must be 28 (4 + 24*1)"); return; }
+	test_pass(name);
+}
+
+int run_preamble_sched_tests() {
+	g_failures = 0;
+	g_passes   = 0;
+	printf("=== LEVER P preamble-amortization schedule tests ===\n");
+	test_preamble_sched_predicate();
+	test_preamble_sched_tx_rx_symmetry();
+	test_preamble_sched_batch_accounting();
+	printf("=== LEVER P done: %d passed, %d failed ===\n", g_passes, g_failures);
+	return g_failures;
+}

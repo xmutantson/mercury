@@ -529,6 +529,39 @@ int cl_telecom_system::get_frame_size_bits()
     return data_container.nBits - ldpc.P - outer_code_reserved_bits;
 }
 
+// ===== LEVER P: PREAMBLE AMORTIZATION — pure schedule + effective-length =====
+// See fact-documents/data-flow-preamble-amortization.md §1.
+// PURE: depends only on its arguments, so TX and RX derive identical schedules.
+int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb)
+{
+	if(full_nsymb < 1) full_nsymb = 1;            // degenerate guard
+	if(force_full) return full_nsymb;             // retx / after-FAIL re-anchor
+	if(frame_idx_in_batch <= 0) return full_nsymb; // batch anchor (frame 0)
+	return 1;                                      // MINI 1-symbol resync
+}
+
+int cl_telecom_system::tx_effective_preamble_nsymb() const
+{
+	int full = data_container.preamble_nSymb;
+	if(!preamble_amortization_enabled) return full;
+	if(tx_preamble_nsymb_override < 0) return full;        // legacy / unset
+	int eff = tx_preamble_nsymb_override;
+	if(eff < 1) eff = 1;
+	if(eff > full) eff = full;
+	return eff;
+}
+
+int cl_telecom_system::rx_effective_preamble_nsymb() const
+{
+	int full = data_container.preamble_nSymb;
+	if(!preamble_amortization_enabled) return full;
+	if(rx_preamble_nsymb_override < 0) return full;        // legacy / unset
+	int eff = rx_preamble_nsymb_override;
+	if(eff < 1) eff = 1;
+	if(eff > full) eff = full;
+	return eff;
+}
+
 void cl_telecom_system::transmit_byte(int *data, int nBytes, double* out, int message_location)
 {
 	int nReal_data = data_container.nBits - ldpc.P;
@@ -700,7 +733,18 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 		}
 	}
 
-	for(int i=0;i<data_container.preamble_nSymb;i++)
+	// LEVER P: preamble amortization. eff_preamble is the number of preamble
+	// symbols THIS frame actually emits (FULL for anchor/retx/after-FAIL, 1 for
+	// MINI tail frames). It is <= data_container.preamble_nSymb (the configured
+	// allocation maximum). For MINI (eff=1) only preamble symbol 0 is emitted —
+	// that is ofdm_preamble[0], the Schmidl-Cox resync anchor. All preamble
+	// emission math below uses eff_preamble; data symbols still start right after
+	// the (shortened) preamble, so the frame waveform is genuinely shorter.
+	// MFSK keeps the full preamble (override is OFDM-data-only); guard on M.
+	int eff_preamble = (M == MOD_MFSK) ? data_container.preamble_nSymb
+	                                   : tx_effective_preamble_nsymb();
+
+	for(int i=0;i<eff_preamble;i++)
 	{
 		ofdm.symbol_mod(&data_container.preamble_data[i*data_container.Nc],&data_container.preamble_symbol_modulated_data[i*data_container.Nofdm]);
 	}
@@ -728,7 +772,7 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 	// MFSK preamble is already a concentrated single tone — no boost needed.
 	double preamble_boost = (M == MOD_MFSK) ? 1.0 : ofdm.preamble_configurator.boost;
 
-	for(int j=0;j<data_container.Nofdm*data_container.preamble_nSymb;j++)
+	for(int j=0;j<data_container.Nofdm*eff_preamble;j++)
 	{
 		data_container.preamble_symbol_modulated_data[j]/=power_normalization;
 		data_container.preamble_symbol_modulated_data[j]*=sqrt(output_power_Watt)*preamble_boost*mfsk_boost;
@@ -740,17 +784,26 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 		data_container.ofdm_symbol_modulated_data[j]*=sqrt(output_power_Watt)*mfsk_boost;
 	}
 
+	// LEVER P: emitted frame size = (eff preamble + data) symbols. This is the
+	// actual length of the waveform written to `out` (<= total_frame_size, which
+	// is sized for the FULL preamble). tx_last_emitted_frame_samples lets the
+	// batch assembler in send_batch() pack the next frame contiguously.
+	int eff_preamble_samples = data_container.Nofdm*eff_preamble*frequency_interpolation_rate;
+	int eff_data_samples     = data_container.Nofdm*active_nsymb*frequency_interpolation_rate;
+	int eff_frame_samples    = eff_preamble_samples + eff_data_samples;
+	tx_last_emitted_frame_samples = eff_frame_samples;
+
 	// Apply test TX carrier offset for frequency sync testing
 	double tx_carrier = carrier_frequency + test_tx_carrier_offset;
-	ofdm.baseband_to_passband(data_container.preamble_symbol_modulated_data,data_container.Nofdm*data_container.preamble_nSymb,data_container.passband_data_tx,sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
-	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,data_container.Nofdm*active_nsymb,&data_container.passband_data_tx[data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate],sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
+	ofdm.baseband_to_passband(data_container.preamble_symbol_modulated_data,data_container.Nofdm*eff_preamble,data_container.passband_data_tx,sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,data_container.Nofdm*active_nsymb,&data_container.passband_data_tx[eff_preamble_samples],sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
 
-	ofdm.peak_clip(data_container.passband_data_tx, data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate,ofdm.preamble_papr_cut);
-	ofdm.peak_clip(&data_container.passband_data_tx[data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate], data_container.Nofdm*active_nsymb*frequency_interpolation_rate,ofdm.data_papr_cut);
+	ofdm.peak_clip(data_container.passband_data_tx, eff_preamble_samples,ofdm.preamble_papr_cut);
+	ofdm.peak_clip(&data_container.passband_data_tx[eff_preamble_samples], eff_data_samples,ofdm.data_papr_cut);
 
 	if(message_location==NO_FILTER_MESSAGE)
 	{
-		for(int i=0;i<data_container.total_frame_size;i++)
+		for(int i=0;i<eff_frame_samples;i++)
 		{
 			*(out+i)=data_container.passband_data_tx[i];
 		}
@@ -894,6 +947,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.SNR = -99.9;
 	receive_stats.all_zeros = NO;
 	receive_stats.coarse_metric = 0.0;
+	receive_stats.last_eff_preamble_nsymb = data_container.preamble_nSymb;  // LEVER P: FULL until a MINI tail frame is extracted
 
 	// Timing breakdown
 	double timing_pb_tsync_ms = 0, timing_pb_data_ms = 0, timing_ldpc_ms = 0;
@@ -901,6 +955,18 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 	int step=100;
 	int pream_symb_loc;
+
+	// LEVER P: preamble amortization (OFDM only). rx_eff_preamble is the number
+	// of preamble symbols the frame about to be extracted is expected to carry.
+	// It starts at the configured FULL length and is dropped to MINI (1) when the
+	// batch-predict verify locks a tail frame (ofdm_batch_active). On any full-
+	// buffer (re-anchor / initial) search it stays/returns to FULL — which
+	// matches the TX force-full-on-anchor/after-FAIL rule. Used at the data-
+	// symbol demod offset and frame-extraction size below. MFSK is unaffected
+	// (the amortization is OFDM-data-only). See
+	// fact-documents/data-flow-preamble-amortization.md §2.
+	int rx_eff_preamble = data_container.preamble_nSymb;
+	if(!preamble_amortization_enabled) rx_eff_preamble = data_container.preamble_nSymb;
 
 	// Coarse frequency offset - starts at 0, only searched on trial 1 if trial 0 fails
 	double coarse_freq_offset = 0.0;
@@ -1240,13 +1306,27 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			bool batch_verified = false;
 
+			// LEVER P: in BATCH-predict mode the frame about to be located is a
+			// tail frame, which the TX emitted with a MINI (1-symbol) preamble
+			// (anchor frame 0 came in via the INITIAL full search). Expect MINI
+			// here; if the predict-verify fails and we fall through to a full
+			// search below, rx_eff_preamble is reset to FULL (re-anchor).
+			bool rx_batch_predict_mode = preamble_amortization_enabled
+				&& M != MOD_MFSK
+				&& receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0;
+			if(rx_batch_predict_mode) rx_eff_preamble = 1;
+
 			if(receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
 			{
 				// BATCH mode: predict + verify. After successful decode, the next
 				// preamble position is predictable from ofdm_skip. Try a tiny
 				// verify window first; fall back to wider search on failure.
 				int gi_interp = data_container.Ngi * interp;
-				int preamble_interp = data_container.preamble_nSymb * sym_samples;
+				// LEVER P: the verify correlation window spans the MINI preamble
+				// length (rx_eff_preamble symbols), not the full 4. preamble_interp
+				// is the MINI preamble's sample span.
+				int verify_nsym = rx_batch_predict_mode ? rx_eff_preamble : data_container.preamble_nSymb;
+				int preamble_interp = verify_nsym * sym_samples;
 				int predicted_pos = ofdm_skip * sym_samples + (int)receive_stats.ofdm_drift_per_frame;
 				if(predicted_pos < 0) predicted_pos = 0;
 
@@ -1284,9 +1364,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					int dec_buf = data_container.Nofdm * data_container.buffer_Nsymb;
 					if(verify_start_dec + verify_size_dec > dec_buf)
 						verify_size_dec = dec_buf - verify_start_dec;
+					// LEVER P: correlate the verify over the MINI preamble length.
 					TimeSyncResult verify = ofdm.time_sync_preamble_halfsym(
 						&data_container.baseband_data_decimated[verify_start_dec],
-						verify_size_dec, 1, 1);
+						verify_size_dec, 1, 1, 0.0,
+						rx_batch_predict_mode ? verify_nsym : -1);
 					verify.delay = verify.delay * v_M + verify_start_full;
 
 					if(verify.correlation >= preamble_detect_threshold)
@@ -1300,6 +1382,48 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					}
 				}
 
+				// LEVER P (INC-3): MINI re-pin. The ±2·gi verify can miss a
+				// 1-symbol MINI preamble (short autocorrelation, low metric), or
+				// the predicted position may sit at the buffer edge. Before
+				// abandoning the batch lock and full-searching (which on a MINI
+				// schedule finds DATA/anchor sub-peaks far from the real frame and
+				// desyncs the whole batch), run a WIDER MINI-nsym coarse search in
+				// a bounded window around the prediction. Only if that also fails
+				// do we treat it as a re-anchor / loss and full-search.
+				if(!batch_verified && rx_batch_predict_mode)
+				{
+					int wide_half = 8 * gi_interp;               // wider than the ±2·gi verify
+					int repin_start = predicted_pos - wide_half;
+					if(repin_start < ofdm_skip * sym_samples) repin_start = ofdm_skip * sym_samples;
+					if(repin_start < 0) repin_start = 0;
+					int repin_size = 2 * wide_half + preamble_interp + sym_samples;
+					if(repin_start + repin_size > buf_interp)
+						repin_size = buf_interp - repin_start;
+					if(repin_size > preamble_interp)
+					{
+						int r_M = data_container.interpolation_rate;
+						int repin_start_dec = repin_start / r_M;
+						int repin_start_full = repin_start_dec * r_M;
+						int repin_end = repin_start + repin_size;
+						int repin_size_dec = (repin_end - repin_start_full + r_M - 1) / r_M;
+						int rdec_buf = data_container.Nofdm * data_container.buffer_Nsymb;
+						if(repin_start_dec + repin_size_dec > rdec_buf)
+							repin_size_dec = rdec_buf - repin_start_dec;
+						TimeSyncResult repin = ofdm.time_sync_preamble_halfsym(
+							&data_container.baseband_data_decimated[repin_start_dec],
+							repin_size_dec, 1, 1, 0.0, verify_nsym);
+						repin.delay = repin.delay * r_M + repin_start_full;
+						if(repin.correlation >= preamble_detect_threshold)
+						{
+							receive_stats.delay = repin.delay;
+							receive_stats.coarse_metric = repin.correlation;
+							int drift = (int)receive_stats.delay - predicted_pos;
+							receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * drift;
+							batch_verified = true;
+						}
+					}
+				}
+
 				if(!batch_verified)
 				{
 					// Prediction failed — search full remaining buffer from
@@ -1307,6 +1431,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					// forward_look=40 cap was causing preambles >40 symbols
 					// past ofdm_skip to be missed, especially after turnaround
 					// gaps where the next preamble arrives much later.
+					// LEVER P: a full-buffer search re-acquires from scratch — the
+					// frame it lands on is a re-anchor (TX forces FULL after any
+					// gap / loss), so expect a FULL preamble again.
+					rx_eff_preamble = data_container.preamble_nSymb;
 					int effective_start = (ofdm_skip > signal_start_symb) ? ofdm_skip : signal_start_symb;
 					search_offset = effective_start * sym_samples;
 					search_size = buf_interp - search_offset;
@@ -1486,7 +1614,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	{
 		int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
 		int active_nsymb = get_active_nsymb();
-		int frame_end_samples = receive_stats.delay + (data_container.preamble_nSymb + active_nsymb) * sym_samples;
+		// LEVER P: a MINI tail frame ends rx_eff_preamble+Nsymb symbols past the
+		// preamble, not preamble_nSymb+Nsymb — use the actual length so a
+		// complete MINI frame isn't spuriously deferred.
+		int frame_end_samples = receive_stats.delay + (rx_eff_preamble + active_nsymb) * sym_samples;
 		int buffer_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 		if(frame_end_samples > buffer_samples)
 		{
@@ -2085,7 +2216,9 @@ skip_h_retry_point:
 				// carrier_frequency + coarse_freq_offset reproduces both.
 				int s8_M = data_container.interpolation_rate;
 				int s8_win_start = (pream_symb_loc - 1) * data_container.Nofdm * frequency_interpolation_rate;
-				int s8_win_len = (ofdm.preamble_configurator.Nsymb + 4) * data_container.Nofdm * s8_M;
+				// LEVER P: window/template span the MINI preamble length (+4 sym
+				// search slack), not the full 4-symbol preamble.
+				int s8_win_len = (rx_eff_preamble + 4) * data_container.Nofdm * s8_M;
 				int s8_buf_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 				if(s8_win_start < 0) s8_win_start = 0;
 				if(s8_win_start + s8_win_len > s8_buf_interp)
@@ -2121,7 +2254,8 @@ skip_h_retry_point:
 				TimeSyncResult fine_result = ofdm.time_sync_preamble_with_metric(
 					&data_container.baseband_data_fine_slice[s8_interior],
 					s8_search_len,
-					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max);
+					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max,
+					(preamble_amortization_enabled && M != MOD_MFSK) ? rx_eff_preamble : -1);
 				receive_stats.delay = s8_win_start + fine_result.delay;
 			}
 
@@ -2193,9 +2327,16 @@ skip_h_retry_point:
 			double effective_carrier_freq = carrier_frequency + coarse_freq_offset;
 
 			// Compute extraction range before data FIR so we can scope it.
+			// LEVER P: a MINI tail frame is (rx_eff_preamble + Nsymb) symbols
+			// long, not (preamble_nSymb + Nsymb). Extract exactly the actual
+			// frame so the data-symbol demod offset (Nofdm*rx_eff_preamble below)
+			// stays aligned with the copied region.
 			int extraction_delay = receive_stats.delay;
 			int buf_size_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-			int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*frequency_interpolation_rate;
+			int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+rx_eff_preamble))*frequency_interpolation_rate;
+			// LEVER P: publish the eff preamble of this frame so the ARQ layer
+			// advances ofdm_search_raw / frames_to_read by the actual frame length.
+			receive_stats.last_eff_preamble_nsymb = rx_eff_preamble;
 			if(extraction_delay < 0) extraction_delay = 0;
 			if(extraction_delay > buf_size_interp - frame_size_interp)
 				extraction_delay = buf_size_interp - frame_size_interp;
@@ -2254,6 +2395,19 @@ skip_h_retry_point:
 				if(g_verbose)
 					printf("[NB-FREQ] skipped (relying on coarse sync + ZF)\n");
 			}
+			else if(rx_eff_preamble < 2)
+			{
+				// LEVER P: MINI preamble (1 symbol) — the Moose estimator needs >=2
+				// preamble symbols for its symbol-to-symbol phase difference, so
+				// reuse the last decoded frame's residual CFO (anchor frame 0
+				// measured it for the batch). The per-symbol CPE_correction +
+				// pilot-based ZF estimator below absorb residual drift per symbol,
+				// so a stale-by-one-frame CFO on a clean/short tail frame is safe.
+				// Risk under heavy phase noise / fast drift flagged for the PN sim.
+				freq_offset_measured = receive_stats.freq_offset_of_last_decoded_message;
+				if(g_verbose)
+					printf("[WB-FREQ] MINI preamble — reuse last CFO=%.4f Hz\n", freq_offset_measured);
+			}
 			else
 			{
 				// Fine frequency sync (Moose algorithm) - ±0.5 subcarrier range
@@ -2261,7 +2415,7 @@ skip_h_retry_point:
 				// BUG FIX: baseband_data is at decimated (base) rate after rational_resampler,
 				// so guard interval skip is Ngi samples, NOT Ngi*interpolation_rate.
 				// The old code skipped Ngi*4=256=Nfft samples, reading across symbol boundaries.
-				freq_offset_measured=ofdm.carrier_sampling_frequency_sync(&data_container.baseband_data[data_container.Ngi],bandwidth/(double)data_container.Nc,data_container.preamble_nSymb, sampling_frequency);
+				freq_offset_measured=ofdm.carrier_sampling_frequency_sync(&data_container.baseband_data[data_container.Ngi],bandwidth/(double)data_container.Nc,rx_eff_preamble, sampling_frequency);
 				if(g_verbose)
 					printf("[WB-FREQ] Moose=%.4f Hz\n", freq_offset_measured);
 			}
@@ -2371,9 +2525,11 @@ skip_h_retry_point:
 			}
 			{
 				int rx_nsymb = get_active_nsymb();
+				// LEVER P: data symbols begin right after the (possibly MINI)
+				// preamble — offset Nofdm*rx_eff_preamble, not Nofdm*preamble_nSymb.
 				for(int i=0;i<rx_nsymb;i++)
 				{
-					ofdm.symbol_demod(&data_container.baseband_data[i*data_container.Nofdm+data_container.Nofdm*data_container.preamble_nSymb],&data_container.ofdm_symbol_demodulated_data[i*data_container.Nc]);
+					ofdm.symbol_demod(&data_container.baseband_data[i*data_container.Nofdm+data_container.Nofdm*rx_eff_preamble],&data_container.ofdm_symbol_demodulated_data[i*data_container.Nc]);
 				}
 			}
 

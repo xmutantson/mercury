@@ -28,4 +28,10 @@
 // fact-documents/phase-b-mfsk-connect-research.md §11.7 for the list.
 int run_mfsk_ctrl_codec_tests();
 
+// LEVER P: run ONLY the preamble-amortization schedule + effective-length unit
+// tests (pure functions, no PHY bring-up). Fast + deterministic. Returns the
+// number of failed tests (0 = all pass). See
+// fact-documents/data-flow-preamble-amortization.md §1.
+int run_preamble_sched_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_
