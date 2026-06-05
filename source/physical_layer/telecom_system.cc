@@ -4364,7 +4364,14 @@ void cl_telecom_system::init()
 			if(M==MOD_QPSK){ofdm.Nsymb=24 * nc_scale;}
 			if(M==MOD_8PSK){ofdm.Nsymb=16 * nc_scale;}
 			if(M==MOD_16QAM){ofdm.Nsymb=12 * nc_scale;}
-			if(M==MOD_32QAM){ofdm.Nsymb=9 * nc_scale;}
+			// LEVER T (pilot thinning): 32QAM (CONFIG_16, the sole 32QAM config)
+			// frame shortened 9->8 OFDM data symbols, paired with Dy 3->4 below.
+			// nData held at 300 (=> nBits=1500<=N_MAX=1600 shorten budget), pilots
+			// cut 150->100 (33%->25%), payload delivered in one fewer symbol =>
+			// ~+8% net data-symbol rate. Every column keeps >=2 pilots for the
+			// existing linear column interpolation on the clean/flat channel.
+			// See fact-documents/lever-t-pilot-thinning.md.
+			if(M==MOD_32QAM){ofdm.Nsymb=8 * nc_scale;}
 			if(M==MOD_64QAM){ofdm.Nsymb=8 * nc_scale;}
 		}
 		else if(ofdm.pilot_configurator.pilot_density==LOW_DENSITY)
@@ -4396,7 +4403,10 @@ void cl_telecom_system::init()
 			if(M==MOD_QPSK){ofdm.pilot_configurator.Dy=3;}
 			if(M==MOD_8PSK){ofdm.pilot_configurator.Dy=3;}
 			if(M==MOD_16QAM){ofdm.pilot_configurator.Dy=3;}
-			if(M==MOD_32QAM){ofdm.pilot_configurator.Dy=3;}
+			// LEVER T (pilot thinning): 32QAM (CONFIG_16) time-spacing 3->4 thins
+			// the scattered-pilot density 33%->25%, paired with Nsymb 9->8 above.
+			// fact-documents/lever-t-pilot-thinning.md §3.
+			if(M==MOD_32QAM){ofdm.pilot_configurator.Dy=4;}
 			if(M==MOD_64QAM){ofdm.pilot_configurator.Dy=3;}
 		}
 		else if(ofdm.pilot_configurator.pilot_density==LOW_DENSITY)
