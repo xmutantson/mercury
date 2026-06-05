@@ -1,0 +1,339 @@
+{
+  "layouts": {
+    "2/2/8": {
+      "net_phy_data_payload": 7225.806451612903,
+      "net_phy_incl_preamble": 6774.193548387097,
+      "info_bits": 11200,
+      "pilots_pct": 10.4,
+      "K": 8,
+      "rate": 0.875,
+      "cells": {
+        "1.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0325837,
+          "min_Hinst": 0.738409
+        },
+        "1.0|0.5": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0698649,
+          "min_Hinst": 0.73999
+        },
+        "1.0|1.0": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0874338,
+          "min_Hinst": 0.752177
+        },
+        "2.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0619721,
+          "min_Hinst": 0.511937
+        },
+        "2.0|0.5": {
+          "block_ok_rate": 0.8,
+          "cw_rate": 0.975,
+          "ok": 8,
+          "n": 10,
+          "max_drift": 0.131934,
+          "min_Hinst": 0.506357
+        },
+        "2.0|1.0": {
+          "block_ok_rate": 0.3,
+          "cw_rate": 0.8875,
+          "ok": 3,
+          "n": 10,
+          "max_drift": 0.164238,
+          "min_Hinst": 0.528357
+        },
+        "3.0|0.1": {
+          "block_ok_rate": 0.9,
+          "cw_rate": 0.9875,
+          "ok": 9,
+          "n": 10,
+          "max_drift": 0.0882046,
+          "min_Hinst": 0.326551
+        },
+        "3.0|0.5": {
+          "block_ok_rate": 0.3,
+          "cw_rate": 0.875,
+          "ok": 3,
+          "n": 10,
+          "max_drift": 0.185356,
+          "min_Hinst": 0.311397
+        },
+        "3.0|1.0": {
+          "block_ok_rate": 0.0,
+          "cw_rate": 0.7125,
+          "ok": 0,
+          "n": 10,
+          "max_drift": 0.229434,
+          "min_Hinst": 0.336794
+        },
+        "4.0|0.1": {
+          "block_ok_rate": 0.9,
+          "cw_rate": 0.9625,
+          "ok": 9,
+          "n": 10,
+          "max_drift": 0.111459,
+          "min_Hinst": 0.192659
+        },
+        "4.0|0.5": {
+          "block_ok_rate": 0.1,
+          "cw_rate": 0.75,
+          "ok": 1,
+          "n": 10,
+          "max_drift": 0.230393,
+          "min_Hinst": 0.158891
+        },
+        "4.0|1.0": {
+          "block_ok_rate": 0.0,
+          "cw_rate": 0.475,
+          "ok": 0,
+          "n": 10,
+          "max_drift": 0.283562,
+          "min_Hinst": 0.178199
+        }
+      }
+    },
+    "2/3/4": {
+      "net_phy_data_payload": 7225.806451612903,
+      "net_phy_incl_preamble": 6774.193548387097,
+      "info_bits": 11200,
+      "pilots_pct": 12.0,
+      "K": 8,
+      "rate": 0.875,
+      "cells": {
+        "1.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0325837,
+          "min_Hinst": 0.738409
+        },
+        "1.0|0.5": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0698649,
+          "min_Hinst": 0.73999
+        },
+        "1.0|1.0": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0874338,
+          "min_Hinst": 0.752177
+        },
+        "2.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0619721,
+          "min_Hinst": 0.511937
+        },
+        "2.0|0.5": {
+          "block_ok_rate": 0.9,
+          "cw_rate": 0.9875,
+          "ok": 9,
+          "n": 10,
+          "max_drift": 0.131934,
+          "min_Hinst": 0.506357
+        },
+        "2.0|1.0": {
+          "block_ok_rate": 0.7,
+          "cw_rate": 0.9625,
+          "ok": 7,
+          "n": 10,
+          "max_drift": 0.164238,
+          "min_Hinst": 0.528357
+        },
+        "3.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0882046,
+          "min_Hinst": 0.326551
+        },
+        "3.0|0.5": {
+          "block_ok_rate": 0.6,
+          "cw_rate": 0.9375,
+          "ok": 6,
+          "n": 10,
+          "max_drift": 0.185356,
+          "min_Hinst": 0.311397
+        },
+        "3.0|1.0": {
+          "block_ok_rate": 0.1,
+          "cw_rate": 0.825,
+          "ok": 1,
+          "n": 10,
+          "max_drift": 0.229434,
+          "min_Hinst": 0.336794
+        },
+        "4.0|0.1": {
+          "block_ok_rate": 0.9,
+          "cw_rate": 0.9875,
+          "ok": 9,
+          "n": 10,
+          "max_drift": 0.111459,
+          "min_Hinst": 0.192659
+        },
+        "4.0|0.5": {
+          "block_ok_rate": 0.2,
+          "cw_rate": 0.8125,
+          "ok": 2,
+          "n": 10,
+          "max_drift": 0.230393,
+          "min_Hinst": 0.158891
+        },
+        "4.0|1.0": {
+          "block_ok_rate": 0.0,
+          "cw_rate": 0.5875,
+          "ok": 0,
+          "n": 10,
+          "max_drift": 0.283562,
+          "min_Hinst": 0.178199
+        }
+      }
+    },
+    "3/3/4": {
+      "net_phy_data_payload": 7225.806451612903,
+      "net_phy_incl_preamble": 6774.193548387097,
+      "info_bits": 11200,
+      "pilots_pct": 13.8333,
+      "K": 8,
+      "rate": 0.875,
+      "cells": {
+        "1.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0325837,
+          "min_Hinst": 0.738409
+        },
+        "1.0|0.5": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0698649,
+          "min_Hinst": 0.73999
+        },
+        "1.0|1.0": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0874338,
+          "min_Hinst": 0.752177
+        },
+        "2.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0619721,
+          "min_Hinst": 0.511937
+        },
+        "2.0|0.5": {
+          "block_ok_rate": 0.9,
+          "cw_rate": 0.9875,
+          "ok": 9,
+          "n": 10,
+          "max_drift": 0.131934,
+          "min_Hinst": 0.506357
+        },
+        "2.0|1.0": {
+          "block_ok_rate": 0.7,
+          "cw_rate": 0.9625,
+          "ok": 7,
+          "n": 10,
+          "max_drift": 0.164238,
+          "min_Hinst": 0.528357
+        },
+        "3.0|0.1": {
+          "block_ok_rate": 1.0,
+          "cw_rate": 1.0,
+          "ok": 10,
+          "n": 10,
+          "max_drift": 0.0882046,
+          "min_Hinst": 0.326551
+        },
+        "3.0|0.5": {
+          "block_ok_rate": 0.6,
+          "cw_rate": 0.95,
+          "ok": 6,
+          "n": 10,
+          "max_drift": 0.185356,
+          "min_Hinst": 0.311397
+        },
+        "3.0|1.0": {
+          "block_ok_rate": 0.1,
+          "cw_rate": 0.825,
+          "ok": 1,
+          "n": 10,
+          "max_drift": 0.229434,
+          "min_Hinst": 0.336794
+        },
+        "4.0|0.1": {
+          "block_ok_rate": 0.9,
+          "cw_rate": 0.9875,
+          "ok": 9,
+          "n": 10,
+          "max_drift": 0.111459,
+          "min_Hinst": 0.192659
+        },
+        "4.0|0.5": {
+          "block_ok_rate": 0.2,
+          "cw_rate": 0.8375,
+          "ok": 2,
+          "n": 10,
+          "max_drift": 0.230393,
+          "min_Hinst": 0.158891
+        },
+        "4.0|1.0": {
+          "block_ok_rate": 0.0,
+          "cw_rate": 0.575,
+          "ok": 0,
+          "n": 10,
+          "max_drift": 0.283562,
+          "min_Hinst": 0.178199
+        }
+      }
+    }
+  },
+  "params": {
+    "depths": [
+      1.0,
+      2.0,
+      3.0,
+      4.0
+    ],
+    "dopplers": [
+      0.1,
+      0.5,
+      1.0
+    ],
+    "seeds": 10,
+    "esn0": 900.0,
+    "vara": 7050,
+    "block_airtime_s": 1.6533333333333333
+  }
+}

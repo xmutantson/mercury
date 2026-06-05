@@ -497,6 +497,25 @@ public:
 	// MERCURY_SFO_GRID_DDCE (1=decision-directed refine). Driven from sfo_grid_test only.
 	void grid_sparse2d_estimator(std::complex<double>* rx, int Ngrid, int Nc);
 
+	// BIG-BLOCK HW DE-RISK (PHY-only, no ARQ) — emit/decode the validated big-block
+	// (one 4-sym preamble + K=8 1600-bit LDPC codeword-frames under ONE acquisition,
+	// ~7.2% freq-focused pilots, channel-adaptive flat-ML/sparse-2D, TRACK=0) over a
+	// REAL passband round-trip via a WAV file (S16LE 48 kHz mono), so the sim PHY win
+	// can be HW-validated on real Fe-Pi clocks (PLAY on RPi1 -> IONOS -> RECORD RPi2)
+	// BEFORE the production+ARQ build. The grid-build + estimator/LDPC are COPIED from
+	// sfo_grid_test (validated, §13-§14); only the passband bridge (symbol_mod/
+	// baseband_to_passband and the inverse + acquisition) is new — the SAME OFDM modem
+	// code transmit_byte/receive_byte use. See fact-documents/bigblock-hw-wav-derisk.md.
+	// Entry: -m PLOT_PASSBAND -s 16 with env MERCURY_BIGBLOCK_TX_WAV=<path> (emit) or
+	// MERCURY_BIGBLOCK_DECODE_WAV=<path> (decode). Returns 1 on full success.
+	int bigblock_tx_to_wav(const char* wav_path);
+	int bigblock_decode_from_wav(const char* wav_path);
+	// Shared builder: rebuild ofdm at Nsymb=Ngrid with the thin freq-focused lattice
+	// (cont_cols/scat_dx/scat_dy) + reseed the pilot DBPSK sequence, exactly as
+	// sfo_grid_test does. Returns nData; out-params give Ngrid/log2M/nBits. Both the TX
+	// and decode sides call this so the lattice/pilot sequence match bit-for-bit.
+	int bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out, int& nBits_out);
+
 	void load_configuration();
 	void load_configuration(int configuration);
 	int last_configuration;

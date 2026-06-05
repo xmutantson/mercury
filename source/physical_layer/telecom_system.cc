@@ -27,6 +27,9 @@
 #include <chrono>
 #include <vector>  // suffix-FEC soft decode candidate buffers
 #include <cstdlib> // std::getenv / atoi for MERCURY_SIM2_MINI_NSYM (LEVER P MINI knob)
+#include <cstdint> // bigblock WAV I/O: uint32_t/int16_t
+#include <cstdio>  // bigblock WAV I/O: FILE/fopen/fread/fwrite
+#include <cmath>   // bigblock: round/log2/sqrt/fabs
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
@@ -5253,6 +5256,21 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 		sfo_block_test();
 		return;
 	}
+	// BIG-BLOCK HW DE-RISK (PHY-only): emit the validated big-block to a WAV, or
+	// decode a recorded WAV. See bigblock_tx_to_wav / bigblock_decode_from_wav and
+	// fact-documents/bigblock-hw-wav-derisk.md. Entry shares -m PLOT_PASSBAND -s 16.
+	const char* bbtx = std::getenv("MERCURY_BIGBLOCK_TX_WAV");
+	if(bbtx && *bbtx)
+	{
+		bigblock_tx_to_wav(bbtx);
+		return;
+	}
+	const char* bbdec = std::getenv("MERCURY_BIGBLOCK_DECODE_WAV");
+	if(bbdec && *bbdec)
+	{
+		bigblock_decode_from_wav(bbdec);
+		return;
+	}
 
 	BER_plot.open("BER");
 	BER_plot.reset("BER");
@@ -6175,8 +6193,94 @@ void cl_telecom_system::sfo_grid_test()
 	int    ap_n      = env_i("MERCURY_SFO_GRID_AP_N",   3);        // all-pass cascade depth (SHIPPED 3)
 	double tr_amp    = env_f("MERCURY_SFO_GRID_FSEL_AMP",   0.6);  // two-ray 2nd-ray amplitude
 	int    tr_dly    = env_i("MERCURY_SFO_GRID_FSEL_DLY", 128);    // two-ray delay (passband samp)
+	// chan_sel==3: TIME-VARYING WATTERSON (2-path Gaussian-Doppler). The
+	// production-finalize question (§15): the freq-focused thin lattice (dy=8,
+	// time-SPARSE) was tuned on a STATIC selective channel. A time-varying fade
+	// makes H change ACROSS the ~1.3 s / 60-symbol block, so the per-symbol channel
+	// estimate needs TIME-axis pilots (smaller dy) to track it. This block injects a
+	// faithful 2-path Watterson channel so the layout sweep can find the slow-fade
+	// operating envelope (depth × Doppler) the big-block holds vs hands off to the
+	// gearshift. Model (Watterson 1970, CCIR 520; the standard HF channel sim):
+	//   H(n,j) = g0(n) + g1(n)·e^{-j·w_j·Δ}
+	//   g0,g1 = INDEPENDENT complex-Gaussian (Rayleigh) tap gains, each Doppler-
+	//           filtered to spread fd via a first-order AR(1) low-pass (the
+	//           Ornstein-Uhlenbeck spectrum, matching cl_sim_phase_noise's pole
+	//           form): g(n) = ρ·g(n-1) + sqrt(1-ρ²)·CN(0,1), ρ = exp(-2π·fd/f_sym),
+	//           f_sym = Fs/Nofdm (one tap update per OFDM symbol). fd is the Doppler
+	//           in Hz; ρ→1 as fd→0 (a SLOW fade is ~constant across the block).
+	//   FADE DEPTH D (dB): path 0 is a CONSTANT unit LOS ray (g0≡1, the stable
+	//           direct path); path 1 is the RAYLEIGH-FADING scatter ray with mean
+	//           amplitude a = 1 - 10^(-D/20) so its destructive combine drives the
+	//           |H| null toward ~10^(-D/20) (≈ D dB below the 1.0 LOS reference) and
+	//           its constructive combine to ~(1+a). This is the standard Rician /
+	//           one-fixed-one-Doppler-spread-tap Watterson used for mild/slow fade
+	//           characterization. D=0 ⇒ a=0 ⇒ H≡1 (TRULY FLAT, no fade — the clean
+	//           baseline); D=6 ⇒ a≈0.50 (mild-deep, nulls to ~-6 dB); D=10 ⇒ a≈0.68
+	//           (the deep fade the HW showed is out-of-scope, 0/8). ONLY g1 varies
+	//           (at the Doppler rate); g0 is the constant LOS so depth/Doppler are
+	//           independent axes. Es/N0 stays honest: the channel is unit-power-
+	//           normalized over the block (mean Σ|H|²/(Ngrid·Nc) == 1).
+	double watt_depth = env_f("MERCURY_SFO_GRID_WATT_DEPTH_DB", 0.0); // fade depth (dB)
+	double watt_fd    = env_f("MERCURY_SFO_GRID_WATT_FD_HZ",    0.5); // Doppler spread (Hz)
+	int    watt_dly   = env_i("MERCURY_SFO_GRID_WATT_DLY",     128);  // 2nd-path delay (passband samp)
 	std::vector<std::complex<double>> Tchan(Nc, std::complex<double>(1.0,0.0));
-	if(chan_sel != 0)
+	std::vector<std::complex<double>> Hwatt;   // (Ngrid×Nc) per-symbol time-varying H, chan_sel==3
+	if(chan_sel == 3)
+	{
+		// --- per-symbol Doppler-filtered tap gains ---
+		double Fs    = (double)sampling_frequency;            // passband sample rate
+		double f_sym = (Nofdm>0) ? (Fs / (double)Nofdm) : 1.0; // OFDM symbol rate (Hz)
+		double rho   = std::exp(-2.0*M_PI*watt_fd / f_sym);    // AR(1) Doppler pole
+		if(rho > 0.999999) rho = 0.999999;
+		double inn   = std::sqrt(1.0 - rho*rho);               // innovation scale (unit-var)
+		double a     = 1.0 - std::pow(10.0, -watt_depth/20.0); // 2nd-ray MEAN amplitude
+		if(a < 0.0) a = 0.0;
+		if(a > 0.99) a = 0.99;
+		cl_sim_xoshiro wrng(seed ^ 0xC0FFEEu);
+		auto cgauss = [&](){ return std::complex<double>(wrng.gauss(), wrng.gauss())/std::sqrt(2.0); };
+		// g0 = CONSTANT unit LOS ray; g1 = Rayleigh-fading scatter ray (mean amp a),
+		// init at its stationary distribution (start already faded, not from 0).
+		std::complex<double> g0(1.0, 0.0);              // fixed LOS (D=0 ⇒ H≡1)
+		std::complex<double> g1 = a * cgauss();         // mean power a²
+		int sshift = ofdm.start_shift;
+		// precompute per-carrier 2nd-path phase e^{-j w_j Δ}
+		std::vector<std::complex<double>> ph2(Nc);
+		for(int j=0;j<Nc;j++)
+		{
+			int k_centered = (j < Nc/2) ? (j - Nc/2) : (j - Nc/2 + sshift);
+			double w = 2.0*M_PI*(double)k_centered/(double)Nfft;
+			ph2[j] = std::polar(1.0, -w*(double)watt_dly);
+		}
+		Hwatt.assign((size_t)Ngrid*Nc, std::complex<double>(1.0,0.0));
+		double psum=0.0;
+		for(int n=0;n<Ngrid;n++)
+		{
+			// advance ONLY the scatter tap one symbol (AR(1) Doppler low-pass); the
+			// LOS tap g0 stays fixed so the depth and Doppler axes are independent.
+			g1 = rho*g1 + (a*inn)*cgauss();
+			for(int j=0;j<Nc;j++)
+			{
+				std::complex<double> H = g0 + g1*ph2[j];
+				Hwatt[(size_t)n*Nc+j] = H;
+				psum += std::norm(H);
+			}
+		}
+		// unit-power normalize over the whole block so the AWGN Es/N0 axis is exact
+		double gnorm = (psum>0.0) ? std::sqrt((double)(Ngrid*Nc)/psum) : 1.0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+		{
+			Hwatt[(size_t)n*Nc+j] *= gnorm;
+			grid[(size_t)n*Nc+j]  *= Hwatt[(size_t)n*Nc+j];
+		}
+		// expose the time-averaged |T| envelope in Tchan[] for the diagnostics print
+		for(int j=0;j<Nc;j++)
+		{
+			std::complex<double> acc(0,0);
+			for(int n=0;n<Ngrid;n++) acc += Hwatt[(size_t)n*Nc+j];
+			Tchan[j] = acc / (double)Ngrid;
+		}
+	}
+	else if(chan_sel != 0)
 	{
 		int sshift = ofdm.start_shift;
 		for(int j=0;j<Nc;j++)
@@ -6213,8 +6317,28 @@ void cl_telecom_system::sfo_grid_test()
 		double tmin=1e9, tmax=-1e9; double phmin=1e9, phmax=-1e9;
 		for(int j=0;j<Nc;j++){ double m=std::abs(Tchan[j]); if(m<tmin)tmin=m; if(m>tmax)tmax=m;
 			double p=std::arg(Tchan[j]); if(p<phmin)phmin=p; if(p>phmax)phmax=p; }
+		// chan_sel==3 (Watterson): also report the INSTANTANEOUS |H| span over the
+		// whole space-time block (the wandering null's true depth) + the per-carrier
+		// TIME variation (how much H drifts symbol-to-symbol = what the time-axis
+		// pilots must track). max time-drift = max_j std_n(|H(n,j)|).
+		if(chan_sel==3 && !Hwatt.empty())
+		{
+			double hmn=1e9, hmx=-1e9, maxdrift=0.0;
+			for(int j=0;j<Nc;j++)
+			{
+				double s=0,ss=0;
+				for(int n=0;n<Ngrid;n++){ double m=std::abs(Hwatt[(size_t)n*Nc+j]);
+					if(m<hmn){hmn=m;} if(m>hmx){hmx=m;} s+=m; ss+=m*m; }
+				double mean=s/Ngrid, var=ss/Ngrid-mean*mean; if(var<0)var=0;
+				double sd=std::sqrt(var); if(sd>maxdrift)maxdrift=sd;
+			}
+			std::cout << "[SFO-GRID] watterson depth=" << watt_depth << "dB fd=" << watt_fd
+			          << "Hz dly=" << watt_dly << " |H|inst[" << hmn << ".." << hmx << "]"
+			          << " max_time_drift(sd|H|)=" << maxdrift << std::endl;
+		}
 		const char* cname = (chan_sel==1)?"DET-FLOOR(all-pass,|T|=1,phase-disp)"
-		                  : (chan_sel==2)?"TWO-RAY(magnitude-selective)" : "FLAT(unity)";
+		                  : (chan_sel==2)?"TWO-RAY(magnitude-selective)"
+		                  : (chan_sel==3)?"WATTERSON(time-varying 2-path)" : "FLAT(unity)";
 		bool spx = (env_i("MERCURY_SFO_GRID_SPARSE2D",0)!=0);
 		std::cout << "[SFO-GRID] channel=" << cname
 		          << " |T|[" << tmin << ".." << tmax << "]"
@@ -6320,7 +6444,11 @@ void cl_telecom_system::sfo_grid_test()
 			for(int j=0;j<Nc;j++)
 			{
 				double ph = (track ? 0.0 : -2.0*M_PI*(double)j*tau_n/(double)Nfft);
-				std::complex<double> Hg = Tchan[j] * std::complex<double>(cos(ph), sin(ph));
+				// chan_sel==3: the TRUE channel is the per-symbol time-varying Hwatt[n][j];
+				// otherwise the static Tchan[j]. The SFO ramp sits on top in both cases.
+				std::complex<double> Hsel = (chan_sel==3 && !Hwatt.empty())
+				                          ? Hwatt[(size_t)n*Nc+j] : Tchan[j];
+				std::complex<double> Hg = Hsel * std::complex<double>(cos(ph), sin(ph));
 				(ofdm.estimated_channel+n*Nc+j)->value = Hg;
 				(ofdm.estimated_channel+n*Nc+j)->status = MEASURED;
 			}
@@ -6561,6 +6689,672 @@ void cl_telecom_system::sfo_grid_test()
 	ofdm.channel_estimator_amplitude_restoration=NO;
 	ofdm.LS_window_width=0; ofdm.LS_window_hight=0;
 	ofdm.init(Nfft, Nc, saved_Nsymb, gi);
+}
+
+// ============================================================================
+// BIG-BLOCK HW DE-RISK — PHY-only WAV emit / decode (no ARQ, no live audio dev)
+// ============================================================================
+// fact-documents/bigblock-hw-wav-derisk.md. These three functions emit the
+// validated big-block (§13-§14) over a REAL passband round-trip into a WAV file
+// (S16LE 48 kHz mono = the butler PLAY/RECORD format), and decode a recorded WAV
+// with REAL acquisition + the channel-adaptive sparse-2D/flat-ML estimator + LDPC.
+// The grid-build and the estimator/equalizer/LDPC are COPIED from sfo_grid_test so
+// a loopback decode failure isolates to the new passband bridge, not the validated
+// estimator. Knobs (env, all defaulted to the §14.4 freq-focused 7.2% layout):
+//   MERCURY_BIGBLOCK_NSYMB   (60)    data symbols in the block
+//   MERCURY_BIGBLOCK_SEED    (12345) known-payload PRBS seed (TX and decode share)
+//   MERCURY_BIGBLOCK_CONT_COLS (2)   continual pilot columns
+//   MERCURY_BIGBLOCK_SCAT_DX (3)     scatter carrier step (FINAL freeze; §7.4)
+//   MERCURY_BIGBLOCK_SCAT_DY (4)     scatter symbol step  (FINAL freeze; §7.4)
+//   FREEZE NOTE (fact-doc §7): the layout was dx=4/dy=8 (7.2%, freq-focused) — tuned on a
+//   STATIC selective channel; it holds ONLY a FLAT fade and collapses at the first dB of
+//   TIME-VARYING (Watterson) fade. The Watterson envelope sweep (watterson_sweep.py) found
+//   the slow-fade limiter is FREQUENCY resolution (dx) at low Doppler + TIME tracking (dy)
+//   at mild Doppler. dx 4->3 + dy 8->4 (12% pilots) extends the envelope to ~4 dB @0.1 Hz /
+//   ~2 dB @0.5 Hz at ZERO net-PHY cost (K=8 unchanged -> 7226 bps data-payload, > VARA 7050;
+//   K only drops to 7 at ~16% pilots). Loopback bigblock TX->decode 8/8 BER=0 at this layout.
+//   MERCURY_BIGBLOCK_SPARSE2D (1)    1=sparse-2D estimator, 0=flat-ML control
+//   MERCURY_BIGBLOCK_LEAD_MS (250)   lead silence ms (acquisition + HW key-up room)
+//   MERCURY_BIGBLOCK_TRAIL_MS (250)  trail silence ms (HW key-down room)
+//   MERCURY_BIGBLOCK_K       (0)     0 = all whole codewords that fit; else cap at K
+//   MERCURY_BIGBLOCK_DIAG    (0)     1 = extra per-codeword diagnostics
+
+// --- minimal WAV (RIFF/PCM S16LE) writer/reader, file-scope helpers ----------
+namespace {
+struct wav_hdr_le {
+	// little-endian PCM mono S16 @ given sample rate
+	static void put_u32(std::vector<unsigned char>& b, uint32_t v){
+		b.push_back(v&0xff); b.push_back((v>>8)&0xff); b.push_back((v>>16)&0xff); b.push_back((v>>24)&0xff); }
+	static void put_u16(std::vector<unsigned char>& b, uint16_t v){
+		b.push_back(v&0xff); b.push_back((v>>8)&0xff); }
+};
+
+// Write doubles (already clamped/scaled NOT — we scale here) as S16LE mono WAV.
+// Scaling matches production audio (audioio.c:733): clamp [-1,1] then *32767.0.
+static bool bigblock_write_wav(const char* path, const std::vector<double>& pb, int sample_rate)
+{
+	std::vector<unsigned char> hdr;
+	uint32_t nSamp = (uint32_t)pb.size();
+	uint32_t dataBytes = nSamp * 2u;        // 16-bit mono
+	uint32_t byteRate  = (uint32_t)sample_rate * 2u;
+	hdr.insert(hdr.end(), {'R','I','F','F'});
+	wav_hdr_le::put_u32(hdr, 36u + dataBytes);
+	hdr.insert(hdr.end(), {'W','A','V','E'});
+	hdr.insert(hdr.end(), {'f','m','t',' '});
+	wav_hdr_le::put_u32(hdr, 16u);          // fmt chunk size
+	wav_hdr_le::put_u16(hdr, 1u);           // PCM
+	wav_hdr_le::put_u16(hdr, 1u);           // mono
+	wav_hdr_le::put_u32(hdr, (uint32_t)sample_rate);
+	wav_hdr_le::put_u32(hdr, byteRate);
+	wav_hdr_le::put_u16(hdr, 2u);           // block align
+	wav_hdr_le::put_u16(hdr, 16u);          // bits/sample
+	hdr.insert(hdr.end(), {'d','a','t','a'});
+	wav_hdr_le::put_u32(hdr, dataBytes);
+	FILE* f = fopen(path, "wb");
+	if(!f) return false;
+	fwrite(hdr.data(), 1, hdr.size(), f);
+	std::vector<int16_t> s16(nSamp);
+	for(uint32_t i=0;i<nSamp;i++){
+		double c = pb[i];
+		if(c >  1.0) c =  1.0;
+		if(c < -1.0) c = -1.0;
+		s16[i] = (int16_t)(c * 32767.0);
+	}
+	fwrite(s16.data(), sizeof(int16_t), nSamp, f);
+	fclose(f);
+	return true;
+}
+
+// Read S16LE mono (or take channel 0 of multi-ch) WAV into doubles in [-1,1].
+// Parses the RIFF/fmt/data chunks; tolerant of extra chunks before "data".
+static bool bigblock_read_wav(const char* path, std::vector<double>& out, int& sample_rate_out, int& ch_out)
+{
+	FILE* f = fopen(path, "rb");
+	if(!f) return false;
+	auto rd_u32=[&](uint32_t& v)->bool{ unsigned char b[4]; if(fread(b,1,4,f)!=4) return false;
+		v=(uint32_t)b[0]|((uint32_t)b[1]<<8)|((uint32_t)b[2]<<16)|((uint32_t)b[3]<<24); return true; };
+	auto rd_u16=[&](uint16_t& v)->bool{ unsigned char b[2]; if(fread(b,1,2,f)!=2) return false;
+		v=(uint16_t)b[0]|((uint16_t)b[1]<<8); return true; };
+	char tag[4];
+	if(fread(tag,1,4,f)!=4 || tag[0]!='R'||tag[1]!='I'||tag[2]!='F'||tag[3]!='F'){ fclose(f); return false; }
+	uint32_t riffsz; rd_u32(riffsz);
+	if(fread(tag,1,4,f)!=4 || tag[0]!='W'||tag[1]!='A'||tag[2]!='V'||tag[3]!='E'){ fclose(f); return false; }
+	uint16_t fmt=0, nch=0, bits=0; uint32_t srate=0; bool haveFmt=false;
+	std::vector<int16_t> pcm; bool haveData=false;
+	while(true)
+	{
+		if(fread(tag,1,4,f)!=4) break;
+		uint32_t csz; if(!rd_u32(csz)) break;
+		if(tag[0]=='f'&&tag[1]=='m'&&tag[2]=='t'&&tag[3]==' ')
+		{
+			uint16_t blockalign=0; uint32_t byterate=0;
+			rd_u16(fmt); rd_u16(nch); rd_u32(srate); rd_u32(byterate); rd_u16(blockalign); rd_u16(bits);
+			haveFmt=true;
+			// skip any extra fmt bytes
+			if(csz>16) fseek(f, (long)(csz-16), SEEK_CUR);
+		}
+		else if(tag[0]=='d'&&tag[1]=='a'&&tag[2]=='t'&&tag[3]=='a')
+		{
+			uint32_t nbytes=csz;
+			pcm.resize(nbytes/2);
+			if(fread(pcm.data(),1,nbytes,f)!=nbytes){ /* short read tolerated */ }
+			haveData=true;
+			if(csz & 1) fseek(f, 1, SEEK_CUR); // pad byte
+		}
+		else
+		{
+			fseek(f, (long)csz + (long)(csz&1), SEEK_CUR); // skip unknown chunk (+pad)
+		}
+	}
+	fclose(f);
+	if(!haveFmt || !haveData || fmt!=1 || bits!=16 || nch==0) return false;
+	sample_rate_out = (int)srate;
+	ch_out = (int)nch;
+	size_t frames = pcm.size() / nch;
+	out.resize(frames);
+	for(size_t i=0;i<frames;i++)
+		out[i] = (double)pcm[i*nch + 0] / 32767.0;   // channel 0
+	return true;
+}
+} // anon namespace
+
+// Shared lattice rebuild — IDENTICAL to sfo_grid_test's thin-lattice setup, so the
+// TX framer, the RX deframer/estimator, and the pilot DBPSK sequence match exactly.
+int cl_telecom_system::bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out, int& nBits_out)
+{
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+	int Ngrid     = env_i("MERCURY_BIGBLOCK_NSYMB", 60);
+	int cont_cols = env_i("MERCURY_BIGBLOCK_CONT_COLS", 2);
+	int scat_dx   = env_i("MERCURY_BIGBLOCK_SCAT_DX", 3);   // FINAL freeze (fact-doc §7.4)
+	int scat_dy   = env_i("MERCURY_BIGBLOCK_SCAT_DY", 4);   // FINAL freeze (fact-doc §7.4)
+
+	int Nc    = ofdm.Nc;
+	int Nfft  = ofdm.Nfft;
+	float gi  = ofdm.gi;
+	int Ngi   = (int)round((double)gi * (double)Nfft);
+	// preserve preamble + pilot configurator fields ofdm.deinit() zeros (see sfo_grid_test)
+	int   sav_pre_Nsymb = ofdm.preamble_configurator.Nsymb;
+	int   sav_pre_mod   = ofdm.preamble_configurator.modulation;
+	int   sav_pre_nIS   = ofdm.preamble_configurator.nIdentical_sections;
+	double sav_pre_boost= ofdm.preamble_configurator.boost;
+	int   sav_start_shift = ofdm.start_shift;
+	double sav_pil_boost = ofdm.pilot_configurator.boost;
+	int   sav_pil_mod    = ofdm.pilot_configurator.modulation;
+	int   sav_pil_seed   = ofdm.pilot_configurator.seed;
+	ofdm.deinit();
+	ofdm.start_shift = sav_start_shift;
+	ofdm.preamble_configurator.Nsymb = sav_pre_Nsymb;
+	ofdm.preamble_configurator.modulation = sav_pre_mod;
+	ofdm.preamble_configurator.nIdentical_sections = sav_pre_nIS;
+	ofdm.preamble_configurator.boost = sav_pre_boost;
+	ofdm.pilot_configurator.boost = sav_pil_boost;
+	ofdm.pilot_configurator.modulation = sav_pil_mod;
+	ofdm.pilot_configurator.seed = sav_pil_seed;
+	ofdm.pilot_configurator.Dx = 1; ofdm.pilot_configurator.Dy = 3;
+	ofdm.pilot_configurator.pilot_density = HIGH_DENSITY;
+	ofdm.channel_estimator = LEAST_SQUARE;
+	ofdm.channel_estimator_amplitude_restoration = NO;
+	ofdm.LS_window_width = 0; ofdm.LS_window_hight = 0;
+	ofdm.init(Nfft, Nc, Ngrid, gi);
+
+	// THIN lattice (cont + scatter), exactly as sfo_grid_test:
+	for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+		(ofdm.ofdm_frame+n*Nc+j)->type = DATA;
+	std::vector<int> cont(cont_cols);
+	for(int c=0;c<cont_cols;c++)
+		cont[c] = (cont_cols<=1) ? 0
+		        : (int)llround((double)c*(double)(Nc-1)/(double)(cont_cols-1));
+	for(int c=0;c<cont_cols;c++)
+		for(int n=0;n<Ngrid;n++)
+			(ofdm.ofdm_frame+n*Nc+cont[c])->type = PILOT;
+	if(scat_dx > 0 && scat_dy > 0)
+	{
+		for(int n=0;n<Ngrid;n++)
+		{
+			if(n % scat_dy != 0) continue;
+			int off = (n/scat_dy) * (scat_dx/2 > 0 ? scat_dx/2 : 1);
+			for(int j = off % scat_dx; j < Nc; j += scat_dx)
+				(ofdm.ofdm_frame+n*Nc+j)->type = PILOT;
+		}
+	}
+	int np=0;
+	for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+		if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT) np++;
+	ofdm.pilot_configurator.nPilots = np;
+	ofdm.pilot_configurator.nConfig = 0;
+	ofdm.pilot_configurator.nData   = Ngrid*Nc - np;
+	CDELETE(ofdm.pilot_configurator.sequence);
+	ofdm.pilot_configurator.sequence =
+	    CNEW(std::complex<double>, np, "pilot.sequence.bigblock");
+	__srandom(ofdm.pilot_configurator.seed);
+	int last_pilot=0;
+	for(int i=0;i<np;i++)
+	{
+		int pv = (__random()%2) ^ last_pilot;
+		ofdm.pilot_configurator.sequence[i] =
+		    std::complex<double>(2*pv-1,0) * ofdm.pilot_configurator.boost;
+		last_pilot = pv;
+	}
+
+	Ngrid_out  = Ngrid;
+	log2M_out  = (int)round(log2((double)M));
+	nBits_out  = ofdm.pilot_configurator.nData * log2M_out;
+	(void)Ngi;
+	return ofdm.pilot_configurator.nData;
+}
+
+// Build the known TX bits: K systematic 1600-bit LDPC codewords from a seeded PRBS
+// payload, plus random filler past K*N. Shared by TX (emit) and decode (compare).
+// Returns K (codewords that fit). cw_info[c] = the K info bits of codeword c.
+static int bigblock_build_tx_bits(cl_ldpc& ldpc, int nBits, unsigned int seed, int kcap,
+                                  std::vector<int>& tx_bits,
+                                  std::vector<std::vector<int>>& cw_info)
+{
+	int Kcw = nBits / ldpc.N;
+	if(kcap > 0 && kcap < Kcw) Kcw = kcap;
+	tx_bits.assign(nBits, 0);
+	cw_info.assign(Kcw, std::vector<int>());
+	// local LCG PRBS so the payload is independent of the global ts_random state and
+	// bit-reproducible from the seed alone (TX and decode reconstruct identically).
+	uint64_t s = (uint64_t)seed * 2862933555777941757ULL + 3037000493ULL;
+	auto nextbit=[&]()->int{ s = s*6364136223846793005ULL + 1442695040888963407ULL;
+		return (int)((s >> 33) & 1ULL); };
+	std::vector<int> enc(ldpc.N), info(ldpc.K);
+	for(int c=0;c<Kcw;c++)
+	{
+		for(int i=0;i<ldpc.K;i++) info[i] = nextbit();
+		cw_info[c] = info;
+		ldpc.encode(info.data(), enc.data());
+		for(int i=0;i<ldpc.N;i++) tx_bits[(size_t)c*ldpc.N + i] = enc[i];
+	}
+	for(int i=Kcw*ldpc.N;i<nBits;i++) tx_bits[i] = nextbit();
+	return Kcw;
+}
+
+int cl_telecom_system::bigblock_tx_to_wav(const char* wav_path)
+{
+	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK-WAV] MFSK unsupported; use -s 15/16." << std::endl; return 0; }
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+
+	int saved_Nsymb = ofdm.Nsymb;
+	int Nc=0, Nfft=ofdm.Nfft; float gi=ofdm.gi;
+	int Ngi=(int)round((double)gi*(double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	int interp = frequency_interpolation_rate;
+	int sym_samples = Nofdm * interp;            // one OFDM symbol at 48 kHz
+	int pre_nSymb = data_container.preamble_nSymb;
+
+	int Ngrid=0, log2M=0, nBits=0;
+	int nData = bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+	Nc = ofdm.Nc;
+
+	unsigned int seed = (unsigned int)env_i("MERCURY_BIGBLOCK_SEED", 12345);
+	int kcap = env_i("MERCURY_BIGBLOCK_K", 0);
+	std::vector<int> tx_bits; std::vector<std::vector<int>> cw_info;
+	int Kcw = bigblock_build_tx_bits(ldpc, nBits, seed, kcap, tx_bits, cw_info);
+
+	// freq-domain grid (data + pilots placed by the thin lattice).
+	std::vector<std::complex<double>> tx_syms(nData);
+	psk.mod(tx_bits.data(), nBits, tx_syms.data());
+	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
+	ofdm.framer(tx_syms.data(), grid.data());
+
+	float power_normalization = sqrt((double)(ofdm.Nfft*interp));
+	double preamble_boost = ofdm.preamble_configurator.boost;
+	double tx_carrier = carrier_frequency + test_tx_carrier_offset;
+
+	// --- PASSBAND BRIDGE (mirrors transmit_byte:781-836) ----------------------
+	// (1) preamble symbols -> symbol_mod (baseband) -> scale.
+	// ofdm_preamble[] is an array of st_carrier (value+type), so copy the .value
+	// fields into a contiguous complex grid before symbol_mod (mirrors
+	// transmit_byte:726-729 building data_container.preamble_data).
+	std::vector<std::complex<double>> pre_bb((size_t)Nofdm*pre_nSymb);
+	{
+		std::vector<std::complex<double>> pre_grid((size_t)pre_nSymb*Nc);
+		for(int i=0;i<pre_nSymb*Nc;i++) pre_grid[i]=ofdm.ofdm_preamble[i].value;
+		for(int i=0;i<pre_nSymb;i++)
+			ofdm.symbol_mod(&pre_grid[(size_t)i*Nc], &pre_bb[(size_t)i*Nofdm]);
+	}
+	for(size_t j=0;j<(size_t)Nofdm*pre_nSymb;j++){
+		pre_bb[j] /= power_normalization;
+		pre_bb[j] *= sqrt(output_power_Watt)*preamble_boost;   // OFDM TX_SIG gain folded into level cal; loopback uses raw level
+	}
+	// (2) data symbols -> symbol_mod (baseband) -> scale
+	std::vector<std::complex<double>> dat_bb((size_t)Nofdm*Ngrid);
+	for(int i=0;i<Ngrid;i++)
+		ofdm.symbol_mod(&grid[(size_t)i*Nc], &dat_bb[(size_t)i*Nofdm]);
+	for(size_t j=0;j<(size_t)Nofdm*Ngrid;j++){
+		dat_bb[j] /= power_normalization;
+		dat_bb[j] *= sqrt(output_power_Watt);
+	}
+	// (3) baseband -> passband (upconvert + interpolate to 48 kHz)
+	int pre_pb_samples = Nofdm*pre_nSymb*interp;
+	int dat_pb_samples = Nofdm*Ngrid*interp;
+	std::vector<double> block_pb((size_t)pre_pb_samples + dat_pb_samples, 0.0);
+	ofdm.baseband_to_passband(pre_bb.data(), Nofdm*pre_nSymb, block_pb.data(),
+	                          sampling_frequency, tx_carrier, carrier_amplitude, interp);
+	ofdm.baseband_to_passband(dat_bb.data(), Nofdm*Ngrid, &block_pb[pre_pb_samples],
+	                          sampling_frequency, tx_carrier, carrier_amplitude, interp);
+	// (4) PAPR clip per transmit_byte:835-836
+	ofdm.peak_clip(block_pb.data(), pre_pb_samples, ofdm.preamble_papr_cut);
+	ofdm.peak_clip(&block_pb[pre_pb_samples], dat_pb_samples, ofdm.data_papr_cut);
+
+	// lead/trail silence (acquisition room + HW key-up/down margin)
+	int lead_ms  = env_i("MERCURY_BIGBLOCK_LEAD_MS", 250);
+	int trail_ms = env_i("MERCURY_BIGBLOCK_TRAIL_MS", 250);
+	int lead_n   = (int)((double)lead_ms  * sampling_frequency / 1000.0);
+	int trail_n  = (int)((double)trail_ms * sampling_frequency / 1000.0);
+	std::vector<double> wav_pb((size_t)lead_n + block_pb.size() + trail_n, 0.0);
+	for(size_t i=0;i<block_pb.size();i++) wav_pb[(size_t)lead_n+i] = block_pb[i];
+
+	// peak (level sanity — should be < 1.0 so int16 doesn't clip)
+	double pk=0.0; for(double v: wav_pb) if(fabs(v)>pk) pk=fabs(v);
+
+	bool ok = bigblock_write_wav(wav_path, wav_pb, (int)sampling_frequency);
+
+	std::cout << "[BIGBLOCK-WAV] TX cfg=" << current_configuration << " M=" << M
+	          << " Nsymb=" << Ngrid << " Nc=" << Nc
+	          << " pilots=" << ofdm.pilot_configurator.nPilots
+	          << " (" << (100.0*ofdm.pilot_configurator.nPilots/(double)(Ngrid*Nc)) << "%)"
+	          << " nData=" << nData << " nBits=" << nBits
+	          << " K=" << Kcw << " (ldpc.N=" << ldpc.N << " K=" << ldpc.K << " P=" << ldpc.P << ")"
+	          << " seed=" << seed << std::endl;
+	std::cout << "[BIGBLOCK-WAV] TX preamble_nSymb=" << pre_nSymb
+	          << " block_samples=" << block_pb.size()
+	          << " lead=" << lead_n << " trail=" << trail_n
+	          << " total=" << wav_pb.size()
+	          << " (" << ((double)wav_pb.size()/sampling_frequency) << " s @ "
+	          << sampling_frequency << " Hz)"
+	          << " peak=" << pk << std::endl;
+	std::cout << "[BIGBLOCK-WAV] TX wav=" << wav_path << " write=" << (ok?"OK":"FAIL")
+	          << "  (decode with MERCURY_BIGBLOCK_DECODE_WAV=<path>, SAME seed/layout)" << std::endl;
+
+	// teardown: restore the production ofdm config (as sfo_grid_test does)
+	ofdm.deinit();
+	ofdm.pilot_configurator.Dx=1; ofdm.pilot_configurator.Dy=3;
+	ofdm.pilot_configurator.pilot_density=HIGH_DENSITY;
+	ofdm.channel_estimator=LEAST_SQUARE;
+	ofdm.channel_estimator_amplitude_restoration=NO;
+	ofdm.LS_window_width=0; ofdm.LS_window_hight=0;
+	ofdm.init(Nfft, Nc, saved_Nsymb, gi);
+	return ok ? 1 : 0;
+}
+
+int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
+{
+	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK-WAV] MFSK unsupported; use -s 15/16." << std::endl; return 0; }
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+
+	// read WAV
+	std::vector<double> rxpb; int srate=0, nch=0;
+	if(!bigblock_read_wav(wav_path, rxpb, srate, nch)){
+		std::cout << "[BIGBLOCK-WAV] DECODE read FAIL wav=" << wav_path << std::endl; return 0; }
+	if(srate != (int)sampling_frequency)
+		std::cout << "[BIGBLOCK-WAV] WARN wav sample_rate=" << srate
+		          << " != expected " << (int)sampling_frequency << " Hz (resample upstream)" << std::endl;
+
+	int saved_Nsymb = ofdm.Nsymb;
+	int Nc=0, Nfft=ofdm.Nfft; float gi=ofdm.gi;
+	int Ngi=(int)round((double)gi*(double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	int interp = frequency_interpolation_rate;
+	int sym_samples = Nofdm * interp;
+	int pre_nSymb = data_container.preamble_nSymb;
+
+	int Ngrid=0, log2M=0, nBits=0;
+	int nData = bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+	Nc = ofdm.Nc;
+
+	unsigned int seed = (unsigned int)env_i("MERCURY_BIGBLOCK_SEED", 12345);
+	int kcap = env_i("MERCURY_BIGBLOCK_K", 0);
+	std::vector<int> tx_bits; std::vector<std::vector<int>> cw_info;
+	int Kcw = bigblock_build_tx_bits(ldpc, nBits, seed, kcap, tx_bits, cw_info);
+
+	// --- ACQUIRE the head preamble: real Schmidl-Cox over the whole rx buffer. ---
+	// We reuse the production acquisition by placing the buffer in the receive path
+	// and reading the detected delay. The block (preamble + Ngrid data symbols) must
+	// fit inside the RX buffer window; size buffer_Nsymb to cover lead+block.
+	int block_syms = pre_nSymb + Ngrid;
+	int need_syms = (int)(rxpb.size() / sym_samples) + 2;
+	// passband_to_baseband over the whole rx, decimate, then Schmidl-Cox.
+	// We mirror receive_byte's front end directly (no ARQ state).
+	long head_delay = -1; double head_metric = 0.0;
+	{
+		int buf_syms = need_syms;
+		int buf_interp = Nofdm * buf_syms * interp;
+		std::vector<double> pad(buf_interp, 0.0);
+		int copy_n = (int)rxpb.size(); if(copy_n > buf_interp) copy_n = buf_interp;
+		for(int i=0;i<copy_n;i++) pad[i]=rxpb[i];
+		// baseband (interp rate) + decimated buffers
+		std::vector<std::complex<double>> bb_interp(buf_interp);
+		ofdm.passband_to_baseband(pad.data(), buf_interp, bb_interp.data(),
+		                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+		                          &ofdm.FIR_rx_time_sync);
+		std::vector<std::complex<double>> bb_dec(Nofdm*buf_syms);
+		ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
+		// Coarse (GI-stride, decimated) then fine (full-rate slice) — like receive_byte.
+		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
+			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
+		long coarse_full = (long)coarse.delay * interp;
+		// fine: re-correlate a small full-rate slice around the coarse peak
+		long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
+		long slice_size  = (long)(pre_nSymb+4)*sym_samples;
+		if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
+		TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
+			&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
+		head_delay  = slice_start + fine.delay;
+		head_metric = fine.correlation;
+		if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+	}
+	if(head_delay < 0){
+		std::cout << "[BIGBLOCK-WAV] DECODE acquisition FAILED (no preamble found)" << std::endl;
+		ofdm.deinit(); ofdm.pilot_configurator.Dx=1; ofdm.pilot_configurator.Dy=3;
+		ofdm.pilot_configurator.pilot_density=HIGH_DENSITY; ofdm.channel_estimator=LEAST_SQUARE;
+		ofdm.channel_estimator_amplitude_restoration=NO; ofdm.LS_window_width=0; ofdm.LS_window_hight=0;
+		ofdm.init(Nfft, Nc, saved_Nsymb, gi); return 0;
+	}
+
+	// --- DEMOD: from the data start (head + preamble), rebuild the Ngrid grid. ---
+	// Mirror the production data extraction (telecom_system.cc:2434-2462): process a
+	// slice that includes a FIR_rx_data warm-up margin BEFORE the window start (so the
+	// FIR transient lands in the margin, not in the data), then skip the margin. The
+	// margin is a whole number of symbols so the demod symbol grid stays aligned.
+	// sample_offset = the slice's absolute passband start so the downconvert oscillator
+	// phase is CONTINUOUS with the TX upconvert (which ran from passband sample 0).
+	long data_start0 = head_delay + (long)pre_nSymb*sym_samples;
+	int span_interp = Nofdm*Ngrid*interp;
+	int fir_margin  = ofdm.FIR_rx_data.filter_nTaps * interp;
+	int margin_syms = (fir_margin + sym_samples - 1) / sym_samples;
+	int margin_interp = margin_syms * sym_samples;
+	float power_normalization = sqrt((double)ofdm.Nfft);
+
+	// Demod the Ngrid grid for a given window offset (full-rate samples) into rx.
+	auto demod_at = [&](long data_start, std::vector<std::complex<double>>& rx)
+	{
+		long ms = data_start - margin_interp;
+		int  mi = margin_interp;
+		if(ms < 0){ ms = 0; mi = (int)data_start; }
+		int slice_size = mi + span_interp;
+		std::vector<double> dat_pb(slice_size, 0.0);
+		for(int i=0;i<slice_size;i++){
+			long src=ms+i; dat_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
+		std::vector<std::complex<double>> dat_bb_interp(slice_size);
+		ofdm.passband_to_baseband(dat_pb.data(), slice_size, dat_bb_interp.data(),
+		                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+		                          &ofdm.FIR_rx_data, (int)ms);
+		std::vector<std::complex<double>> dat_bb_full((size_t)(slice_size/interp) + 1);
+		int dec_total = slice_size / interp;
+		ofdm.rational_resampler(dat_bb_interp.data(), slice_size, dat_bb_full.data(), interp, DECIMATION);
+		std::vector<std::complex<double>> dat_bb(Nofdm*Ngrid);
+		int mdec = mi / interp;
+		for(int j=0;j<Nofdm*Ngrid && (mdec+j)<dec_total;j++) dat_bb[j] = dat_bb_full[mdec + j];
+		for(int j=0;j<Nofdm*Ngrid;j++) dat_bb[j] *= power_normalization;
+		rx.assign((size_t)Ngrid*Nc, std::complex<double>(0,0));
+		for(int i=0;i<Ngrid;i++) ofdm.symbol_demod(&dat_bb[(size_t)i*Nofdm], &rx[(size_t)i*Nc]);
+	};
+
+	// Pilot-residual EVM for a grid (flat-ML residual; lower = better window placement).
+	auto pilot_evm = [&](const std::vector<std::complex<double>>& rx)->double
+	{
+		std::complex<double> Hsum(0,0); int pidx=0, np=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++];
+				Hsum += rx[(size_t)n*Nc+j]/X; np++; }
+		std::complex<double> Hbar=(np>0)?Hsum/(double)np:std::complex<double>(1,0);
+		// per-symbol CPE/PEG-free residual: use |rx/X - Hbar*(per-symbol phase)|? Keep it
+		// simple — residual against the global mean magnitude (timing ISI raises it).
+		double e=0.0; pidx=0; int cnt=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++];
+				std::complex<double> r=rx[(size_t)n*Nc+j]/X;
+				double dr=std::abs(r)-std::abs(Hbar); e+=dr*dr; cnt++; }
+		return cnt? e/cnt : 1e9;
+	};
+
+	// FINE TIMING SEARCH (principled OFDM fine-timing): Schmidl-Cox lands the window at
+	// integer-sample resolution and the time-sync vs data FIR + carrier path leave a
+	// FIXED few-sample residual (loopback showed optimum ~6 samp earlier). Rather than a
+	// magic constant, search a small ±window for the offset MINIMIZING pilot-EVM. This is
+	// self-calibrating across the FIR/oscillator path AND robust to real-HW jitter — the
+	// data window lands ISI-free regardless of the acquisition's integer pick. Override
+	// MERCURY_BIGBLOCK_TADJ forces a fixed nudge (diagnostic); _TSEARCH=0 disables.
+	long data_start = data_start0;
+	int tadj_force = env_i("MERCURY_BIGBLOCK_TADJ", 0);
+	int gi_interp  = Ngi * interp;
+	std::vector<std::complex<double>> rx;
+	if(tadj_force != 0)
+	{
+		data_start = data_start0 + tadj_force;
+		demod_at(data_start, rx);
+	}
+	else if(env_i("MERCURY_BIGBLOCK_TSEARCH", 1) != 0)
+	{
+		double best_e = 1e18; long best_off = 0;
+		std::vector<std::complex<double>> rx_try;
+		// search a window that comfortably spans the GI back-off region.
+		int lo = -gi_interp + 1, hi = gi_interp/4;
+		int step = env_i("BIGBLOCK_TSEARCH_STEP", 2);
+		for(int off=lo; off<=hi; off+=step)
+		{
+			demod_at(data_start0 + off, rx_try);
+			double e = pilot_evm(rx_try);
+			if(e < best_e){ best_e = e; best_off = off; rx = rx_try; }
+		}
+		data_start = data_start0 + best_off;
+		if((int)rx.size() != Ngrid*Nc) demod_at(data_start, rx);
+		if(env_i("MERCURY_BIGBLOCK_DIAG",0))
+			std::cout << "[BIGBLOCK-WAV]   fine_timing best_off=" << best_off
+			          << " (full-rate samp, "<<(best_off/(double)interp)<<" dec) pilotEVM=" << best_e << std::endl;
+	}
+	else
+	{
+		demod_at(data_start, rx);
+	}
+
+	// --- CPE/PEG residual-timing de-rotation (the §13/§14 STEP-2 tracker) --------
+	// Schmidl-Cox lands the FFT window at INTEGER-sample resolution; any residual
+	// sub-sample / few-sample timing error (the loopback showed the optimum window is
+	// ~6 samples earlier than the acquired delay) appears as a per-symbol linear phase
+	// ramp across carriers (slope ∝ timing error). The thin lattice's CONTINUAL columns
+	// give ≥2 pilots/symbol → a per-symbol LS line-fit (intercept=CPE ω, slope=PEG δ)
+	// removes that ramp, exactly as the validated tracker does for SFO. Default ON
+	// (MERCURY_BIGBLOCK_TRACK=1); the sparse-2D per-symbol estimate handles slow drift,
+	// but a CONSTANT few-sample window offset needs the explicit slope fit because the
+	// dx4 scatter undersamples a steep ramp in the band interior. This is principled
+	// (Speth/Fechtel/Meyr residual-timing correction), not a magic alignment constant.
+	bool track = (env_i("MERCURY_BIGBLOCK_TRACK", 1) != 0);
+	int  twin  = env_i("MERCURY_BIGBLOCK_TRACK_WIN", 9);
+	if(track)
+	{
+		std::vector<double> sym_omega(Ngrid,0.0), sym_delta(Ngrid,0.0);
+		std::vector<int> pidx_at_symbol(Ngrid,0);
+		{ int pidx=0; for(int n=0;n<Ngrid;n++){ pidx_at_symbol[n]=pidx;
+			for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT) pidx++; } }
+		for(int n=0;n<Ngrid;n++)
+		{
+			int pidx = pidx_at_symbol[n];
+			double Sx=0,Sy=0,Sxx=0,Sxy=0; int np=0;
+			for(int j=0;j<Nc;j++)
+				if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT)
+				{
+					std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+					std::complex<double> r = rx[(size_t)n*Nc+j] / X;
+					double phi = atan2(r.imag(), r.real());
+					double x=(double)j; Sx+=x; Sy+=phi; Sxx+=x*x; Sxy+=x*phi; np++;
+				}
+			if(np>=2){ double den=np*Sxx-Sx*Sx;
+				if(fabs(den)>1e-12){ sym_delta[n]=(np*Sxy-Sx*Sy)/den; sym_omega[n]=(Sy-sym_delta[n]*Sx)/np; } }
+		}
+		for(int n=0;n<Ngrid;n++)
+		{
+			double om=0,dl=0; int cnt=0;
+			for(int w=n-twin/2; w<=n+twin/2; w++) if(w>=0&&w<Ngrid){ om+=sym_omega[w]; dl+=sym_delta[w]; cnt++; }
+			if(cnt>0){ om/=cnt; dl/=cnt; }
+			for(int j=0;j<Nc;j++){ double ph=-(om+dl*(double)j);
+				rx[(size_t)n*Nc+j] *= std::complex<double>(cos(ph), sin(ph)); }
+		}
+	}
+
+	// --- CHANNEL-ADAPTIVE ESTIMATE (sparse-2D default; flat-ML control) ---------
+	bool sparse2d = (env_i("MERCURY_BIGBLOCK_SPARSE2D", 1) != 0);
+	if(sparse2d)
+	{
+		grid_sparse2d_estimator(rx.data(), Ngrid, Nc);
+	}
+	else
+	{
+		// flat-ML control (one global H̄ = mean(Y/X) over pilots) — exact on flat.
+		std::complex<double> Hsum(0,0); int pidx=0; int npil=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				Hsum += rx[(size_t)n*Nc+j] / X; npil++; }
+		std::complex<double> Hbar = (npil>0)?(Hsum/(double)npil):std::complex<double>(1,0);
+		double nsum=0.0; pidx=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				std::complex<double> resid = rx[(size_t)n*Nc+j]-Hbar*X;
+				nsum += resid.real()*resid.real()+resid.imag()*resid.imag(); }
+		for(int ci=0;ci<Ngrid*Nc;ci++){ (ofdm.estimated_channel+ci)->value=Hbar; (ofdm.estimated_channel+ci)->status=MEASURED; }
+		ofdm.noise_variance_estimate = (npil>0)?(nsum/(double)npil):0.01;
+		if(ofdm.noise_variance_estimate<1e-6) ofdm.noise_variance_estimate=1e-6;
+	}
+
+	// per-data-carrier CSI weight |H|^2 (deframed raster order) BEFORE equalize.
+	std::vector<double> csi_data(nData, 1.0);
+	{
+		int di=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> H=(ofdm.estimated_channel+n*Nc+j)->value;
+				if(di<nData) csi_data[di]=H.real()*H.real()+H.imag()*H.imag(); di++; }
+	}
+
+	std::vector<std::complex<double>> eq((size_t)Ngrid*Nc);
+	ofdm.channel_equalizer(rx.data(), eq.data());
+	std::vector<std::complex<double>> deframed(nData);
+	ofdm.deframer(eq.data(), deframed.data());
+
+	// --- LLR + CSI weighting + LDPC per codeword (mirrors sfo_grid_test coded) ---
+	std::vector<float> clr(nBits);
+	double cvar = ofdm.noise_variance_estimate; if(cvar<1e-9) cvar=1e-9;
+	psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
+	{
+		double mean_w=0.0; for(int d=0;d<nData;d++) mean_w+=csi_data[d];
+		mean_w=(nData>0)?mean_w/(double)nData:1.0; if(mean_w<1e-9) mean_w=1.0;
+		for(int d=0;d<nData;d++){ double w=csi_data[d]/mean_w;
+			for(int b=0;b<log2M;b++){ size_t bi=(size_t)d*log2M+b; if(bi>=(size_t)nBits) break;
+				float v=clr[bi]*(float)w; if(v>40.0f)v=40.0f; else if(v<-40.0f)v=-40.0f; clr[bi]=v; } }
+	}
+
+	int cw_ok=0; long cw_infoerr=0, cw_infobits=0; long iter_sum=0; int iter_min=1<<30, iter_max=-1;
+	bool diag = (env_i("MERCURY_BIGBLOCK_DIAG",0)!=0);
+	std::vector<float> cwllr(ldpc.N); std::vector<int> dec(ldpc.N);
+	for(int c=0;c<Kcw;c++)
+	{
+		for(int i=0;i<ldpc.N;i++) cwllr[i]=clr[(size_t)c*ldpc.N+i];
+		int iters = ldpc.decode(cwllr.data(), dec.data());
+		iter_sum += iters; if(iters<iter_min) iter_min=iters; if(iters>iter_max) iter_max=iters;
+		int ierr=0;
+		for(int i=0;i<ldpc.K;i++){ cw_infobits++; if(dec[i]!=cw_info[c][i]){ ierr++; cw_infoerr++; } }
+		if(ierr==0) cw_ok++;
+		if(diag) std::cout << "[BIGBLOCK-WAV]   cw=" << c << " iters=" << iters
+		                   << " infoerr=" << ierr << "/" << ldpc.K
+		                   << " decoded=" << (ierr==0?1:0) << std::endl;
+	}
+	double post_fec_ber = cw_infobits? (double)cw_infoerr/(double)cw_infobits : 1.0;
+
+	std::cout << "[BIGBLOCK-WAV] DECODE cfg=" << current_configuration
+	          << " Nsymb=" << Ngrid << " Nc=" << Nc
+	          << " pilots=" << ofdm.pilot_configurator.nPilots
+	          << " (" << (100.0*ofdm.pilot_configurator.nPilots/(double)(Ngrid*Nc)) << "%)"
+	          << " est=" << (sparse2d?"SPARSE-2D":"FLAT-ML")
+	          << " seed=" << seed << std::endl;
+	std::cout << "[BIGBLOCK-WAV] DECODE acq_delay=" << head_delay
+	          << " acq_metric=" << head_metric
+	          << " data_window=" << data_start << " (off=" << (data_start-data_start0) << ")"
+	          << " nv=" << ofdm.noise_variance_estimate
+	          << " iter[min/mean/max]=" << iter_min << "/"
+	          << (Kcw?(double)iter_sum/Kcw:0.0) << "/" << iter_max << std::endl;
+	std::cout << "[BIGBLOCK-WAV] ===== RESULT =====" << std::endl;
+	std::cout << "[BIGBLOCK-WAV]   codewords_decoded=" << cw_ok << "/" << Kcw
+	          << "  post_FEC_BER=" << post_fec_ber
+	          << "  infoerr=" << cw_infoerr << "/" << cw_infobits << std::endl;
+	std::cout << "[BIGBLOCK-WAV]   VERDICT=" << ((cw_ok==Kcw && Kcw>0) ? "PASS(8/8 clean)" : "FAIL")
+	          << std::endl;
+
+	// teardown
+	ofdm.deinit();
+	ofdm.pilot_configurator.Dx=1; ofdm.pilot_configurator.Dy=3;
+	ofdm.pilot_configurator.pilot_density=HIGH_DENSITY;
+	ofdm.channel_estimator=LEAST_SQUARE;
+	ofdm.channel_estimator_amplitude_restoration=NO;
+	ofdm.LS_window_width=0; ofdm.LS_window_hight=0;
+	ofdm.init(Nfft, Nc, saved_Nsymb, gi);
+	return (cw_ok==Kcw && Kcw>0) ? 1 : 0;
 }
 
 void cl_telecom_system::load_configuration()
