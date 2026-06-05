@@ -25,6 +25,7 @@
 #include "debug/canary_guard.h"
 #include <chrono>
 #include <vector>  // suffix-FEC soft decode candidate buffers
+#include <cstdlib>  // LEVER-F measurement scaffold: getenv/atoi for CONFIG_16 rate override
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
@@ -5382,6 +5383,23 @@ void cl_telecom_system::load_configuration(int configuration)
 	{
 		_modulation=MOD_32QAM;
 		_ldpc_rate=14/16.0;
+		// LEVER F (measurement scaffold): allow runtime override of the top-tier
+		// 32-QAM LDPC rate to measure the coding gain of a lower-rate top config
+		// (e.g. 12/16 = 0.75) vs the stock 14/16 = 0.875, with everything else
+		// (modulation, pilots, channel) identical. Only available LDPC matrices
+		// are valid (K must be a multiple of 100 in {100..1400}); 12/16->K=1200
+		// and 14/16->K=1400 both have precomputed mercury_normal matrices
+		// (ldpc.cc:235,247). Production default (env unset) is unchanged at 14/16.
+		const char* lf_num = getenv("LEVERF_C16_RATE_NUM");
+		if(lf_num != NULL)
+		{
+			int num = atoi(lf_num);
+			if(num >= 1 && num <= 14)
+			{
+				_ldpc_rate = num / 16.0;
+				printf("[LEVER-F] CONFIG_16 LDPC rate override -> %d/16 = %.4f\n", num, _ldpc_rate);
+			}
+		}
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
