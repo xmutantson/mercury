@@ -591,6 +591,20 @@ public:
 	// layout; valid once a CFG16 grid is loaded.
 	int bigblock_tx_total_samples();
 
+	// SACK-GATE P1 (data-flow-bigblock-arq-unit.md R-B): the codeword count K the
+	// big-block framing carries at the current CFG16 rung — the SAME geometry both
+	// the TX (transmit_bigblock:7832 nBits/ldpc.N capped by MERCURY_BIGBLOCK_K) and
+	// the RX (receive_bigblock:7890 nBits/ldpc.N) derive. The ARQ layer's shared
+	// batch-size election (sack_negotiated_recompute_batch) calls this to PIN
+	// data_batch_size == K at the big-block rung so CMD's clean-ACK target
+	// all_ones=(1<<data_batch_size)-1 EQUALS the RSP's K-bit big-block bitmap
+	// (closes bug #9: CMD batch=25 vs RSP K=8 -> 0x1FFFFFF != 0xFF -> no clean
+	// credit). Geometry-only (no I/O); rebuilds the thin grid to read nBits/ldpc.N
+	// then restores the stock CFG16 config (same rebuild+restore as
+	// bigblock_tx_total_samples). Valid once a CFG16 grid is loaded; returns 0 for
+	// MFSK or when the grid yields no codewords (caller must not pin on 0).
+	int bigblock_codeword_count();
+
 	// Big-block cross-call stash (P1 loopback validation + P2 handoff). The TX side
 	// records the K known info-bit groups it emitted + the sample count; the RX side
 	// records the per-codeword clean vector (the K-bit SACK granularity P2 consumes)
