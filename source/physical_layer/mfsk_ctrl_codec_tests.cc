@@ -5629,6 +5629,58 @@ static void test_preamble_sched_batch_accounting() {
 	test_pass(name);
 }
 
+// §P.4 PRODUCTION KNOB toggles the WIRED effective-preamble helpers. This
+// proves the MERCURY_PREAMBLE_AMORT env knob (which sets
+// preamble_amortization_enabled on the production cl_telecom_system instance,
+// see main.cc) actually changes the runtime TX/RX preamble length the emission
+// + extraction paths consume — not just the static predicate. With the flag
+// OFF, tx/rx_effective_preamble_nsymb() return the FULL configured length
+// REGARDLESS of any per-frame override (byte-identical baseline). With the flag
+// ON and a MINI override set, they return the (clamped) MINI length. Construct a
+// bare cl_telecom_system — no PHY bring-up, just the flag + overrides + the
+// configured preamble length the helpers read.
+static void test_preamble_amort_knob_gates_eff_helpers() {
+	const char* name = "preamble_amort_knob_gates_eff_helpers";
+	cl_telecom_system ts;
+	ts.data_container.preamble_nSymb = 4;  // FULL configured length
+
+	// --- knob OFF: overrides MUST be ignored, helpers return FULL ---
+	ts.preamble_amortization_enabled = false;
+	ts.tx_preamble_nsymb_override = 1;     // MINI request
+	ts.rx_preamble_nsymb_override = 1;
+	if (ts.tx_effective_preamble_nsymb() != 4) {
+		test_fail(name, "knob OFF: TX eff must be FULL (override ignored)"); return; }
+	if (ts.rx_effective_preamble_nsymb() != 4) {
+		test_fail(name, "knob OFF: RX eff must be FULL (override ignored)"); return; }
+
+	// --- knob ON, override unset (-1): legacy fall-back is still FULL ---
+	ts.preamble_amortization_enabled = true;
+	ts.tx_preamble_nsymb_override = -1;
+	ts.rx_preamble_nsymb_override = -1;
+	if (ts.tx_effective_preamble_nsymb() != 4) {
+		test_fail(name, "knob ON, override unset: TX eff must be FULL"); return; }
+	if (ts.rx_effective_preamble_nsymb() != 4) {
+		test_fail(name, "knob ON, override unset: RX eff must be FULL"); return; }
+
+	// --- knob ON + MINI override: helpers return the MINI length ---
+	ts.tx_preamble_nsymb_override = 1;
+	ts.rx_preamble_nsymb_override = 1;
+	if (ts.tx_effective_preamble_nsymb() != 1) {
+		test_fail(name, "knob ON: TX eff must follow MINI override=1"); return; }
+	if (ts.rx_effective_preamble_nsymb() != 1) {
+		test_fail(name, "knob ON: RX eff must follow MINI override=1"); return; }
+
+	// --- knob ON + over-range override clamps to [1, FULL] ---
+	ts.tx_preamble_nsymb_override = 99;
+	ts.rx_preamble_nsymb_override = 0;
+	if (ts.tx_effective_preamble_nsymb() != 4) {
+		test_fail(name, "knob ON: TX eff must clamp >FULL to FULL"); return; }
+	if (ts.rx_effective_preamble_nsymb() != 1) {
+		test_fail(name, "knob ON: RX eff must clamp <1 to 1"); return; }
+
+	test_pass(name);
+}
+
 int run_preamble_sched_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5636,6 +5688,7 @@ int run_preamble_sched_tests() {
 	test_preamble_sched_predicate();
 	test_preamble_sched_tx_rx_symmetry();
 	test_preamble_sched_batch_accounting();
+	test_preamble_amort_knob_gates_eff_helpers();
 	printf("=== LEVER P done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }
