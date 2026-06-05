@@ -344,11 +344,177 @@ private:
 	int    hist_pos_;
 };
 
+// ---------------------------------------------------------------------------
+// DETERMINISTIC frequency-selective passband FIR — the HW EVM/meanH FLOOR.
+//
+// fact-documents/sim2-cfg16-phase-noise-faithfulness.md §5b/§9. The HW EVM
+// ceiling (14.6 dB, per-frame sd 0.09) is DETERMINISTIC: a fixed, frame-
+// repeating implementation residual, NOT a random phase process (a per-symbol
+// common phase floors the per-frame sd at sqrt(2/Nsymb)=1.5-1.7 dB; only a
+// fixed coherent distortion gives sd→0 AND 32-QAM decode AND CFG15/16
+// co-location). The faithful realization is a fixed micro-multipath ripple in
+// the analog/soundcard passband: a short STATEFUL FIR g[] = main tap + a few
+// small "echo" taps. Its DTFT G(f) across the 2343.75 Hz OFDM band is a fixed
+// per-subcarrier complex taper T(k)=G(f_k):
+//   • a FREQUENCY-SELECTIVE residual the linear CPE corrector (one phase_rate
+//     ramp, symbol-axis — ofdm.cc:1928) does NOT remove and that the Nc-point
+//     DFT channel smoother (smooth_channel_estimate_dft, ofdm.cc:2127) cannot
+//     fully represent ⇒ a FIXED pilot residual ⇒ a deterministic var= field ⇒
+//     EVM_dB = -10log10(var), sd≈0 (frozen taps). The EVM echo gain sets the
+//     residual magnitude; its delay sets the ripple's subcarrier-period.
+//   • a frequency-selective AMPLITUDE ripple is NOT canceled by the AGC (which
+//     normalizes the MEAN pilot amplitude, ofdm.cc:1978): DFT-smoothing of the
+//     rippled complex H coherently shrinks |H_smooth| ⇒ mean|H| droops below 1
+//     (the meanH 0.979 signature). A 2nd shorter-delay "tilt" echo carries the
+//     droop with little extra EVM.
+// 32-QAM tolerates it (a fixed per-subcarrier rotation+gain the soft-demap/LDPC
+// absorb), so CFG15 and CFG16 BOTH sit at the same fixed EVM (co-locate).
+//
+// DETERMINISTIC: no rng, no seed — pure fixed taps. GATE-2 byte-identical and
+// seed-independent. Applied BEFORE the AGC (i.e. first in process(), ahead of
+// the small residual PN). Stateful history carried across OFDM-symbol blocks so
+// there is no per-block edge discontinuity (mirrors the Hilbert FIR state).
+class cl_sim_det_floor
+{
+public:
+	// A single strong echo makes ONE deep amplitude null per ripple period, which
+	// 32-QAM cannot tolerate (the MMSE erasure, ofdm.cc:2200, drops whole bands
+	// and CFG16's tight min-distance dies on a cliff). The faithful floor (a real
+	// soundcard's micro-multipath) is instead a SMALL COMB of echoes at staggered
+	// delays: the combined G(f) carries the SAME RMS ripple (⇒ same fixed pilot
+	// residual ⇒ same EVM) but SPREAD over several SHALLOW periods (no deep null),
+	// which 32-QAM tolerates while CFG15/CFG16 still co-locate at the EVM floor.
+	//
+	//   echo_db   : MASTER EVM-ripple gain in dB rel. main tap (<0; 0 disables).
+	//               The comb's per-tap amplitude derives from this and the count
+	//               so the total ripple RMS == echo_amp (EVM stays db-controlled).
+	//   echo_dly  : BASE delay (samples) of the first comb echo (sets ripple
+	//               period); subsequent echoes step by `echo_step`.
+	//   echo_n    : number of comb echoes (1 ⇒ single echo; >1 ⇒ shallow comb).
+	//   echo_step : delay step between comb echoes (samples).
+	//   tilt_db   : meanH-droop "tilt" echo gain in dB (<0). 0 ⇒ no tilt echo.
+	//   tilt_dly  : the tilt echo's (shorter) delay (low-spatial-freq amplitude
+	//               droop the smoother partly keeps ⇒ droops meanH).
+	// PHASE-ONLY (all-pass) floor — the 32-QAM-FRIENDLY deterministic distortion.
+	// A real echo makes AMPLITUDE nulls ⇒ the MMSE erasure (ofdm.cc:2200) drops
+	// subcarriers ⇒ a minority of 32-QAM frames fail regardless of EVM level (the
+	// comb's worst-case null alignment defeats CFG16 on ~10% of frames, multi-seed
+	// verified). The faithful 32-QAM-tolerable floor is a fixed FREQUENCY-SELECTIVE
+	// PHASE ripple with FLAT magnitude — a Schroeder all-pass section
+	//   y[n] = -g·x[n] + x[n-D] + g·y[n-D]   (|H(e^jω)| ≡ 1 exactly, dispersive φ).
+	// Flat |H| ⇒ NO amplitude nulls ⇒ NO MMSE erasure ⇒ 32-QAM tolerant; the
+	// dispersive phase is a fixed per-subcarrier rotation the linear CPE corrector
+	// (one ramp) cannot remove ⇒ a FIXED pilot residual ⇒ deterministic EVM, sd≈0.
+	// meanH droops from the DFT-smoother coherently cancelling the phase ripple
+	// (gentle, no erasure). ap_g sets the residual magnitude (EVM); ap_dly sets the
+	// phase-ripple period. ap_g==0 ⇒ all-pass disabled (echo-comb path used).
+	cl_sim_det_floor(double echo_db, int echo_dly, int echo_n, int echo_step,
+	                 double tilt_db, int tilt_dly,
+	                 double ap_g, int ap_dly, int ap_n)
+	{
+		// --- Schroeder all-pass cascade (phase-only floor). ---
+		ap_g_ = ap_g;
+		ap_dly_ = (ap_dly > 0 && ap_dly < RING - 1) ? ap_dly : 0;
+		ap_n_ = (ap_n < 0) ? 0 : (ap_n > MAX_AP ? MAX_AP : ap_n);
+		if (ap_g_ == 0.0 || ap_dly_ == 0) ap_n_ = 0;
+		for (int s = 0; s < MAX_AP; s++) { ap_xpos_[s] = 0; ap_ypos_[s] = 0;
+			for (int i = 0; i < AP_RING; i++) { ap_xh_[s][i] = 0.0; ap_yh_[s][i] = 0.0; } }
+
+		double master = (echo_db < 0.0) ? std::pow(10.0, echo_db / 20.0) : 0.0;
+		if (echo_n < 1) echo_n = 1;
+		if (echo_n > MAX_ECHO) echo_n = MAX_ECHO;
+		n_echo_ = 0;
+		double e2 = 0.0;
+		if (master > 0.0 && echo_dly > 0)
+		{
+			// Distribute the master RMS over echo_n taps: per-tap amp =
+			// master/sqrt(n) so sqrt(Σ amp²) == master (total ripple RMS held).
+			double per = master / std::sqrt((double)echo_n);
+			for (int m = 0; m < echo_n; m++)
+			{
+				int d = echo_dly + m * echo_step;
+				if (d <= 0 || d >= RING - 1) continue;
+				// Alternate sign so successive echoes do not pile a single deep
+				// null (a comb of ± echoes ⇒ several shallow nulls, 32-QAM-safe).
+				echo_amp_[n_echo_] = (m & 1) ? -per : per;
+				echo_dly_[n_echo_] = d;
+				e2 += per * per;
+				n_echo_++;
+			}
+		}
+		tilt_amp_ = (tilt_db < 0.0) ? std::pow(10.0, tilt_db / 20.0) : 0.0;
+		tilt_dly_ = (tilt_dly > 0 && tilt_dly < RING - 1) ? tilt_dly : 0;
+		if (tilt_amp_ > 0.0 && tilt_dly_ > 0) e2 += tilt_amp_ * tilt_amp_;
+		enabled_  = (n_echo_ > 0) || (tilt_amp_ > 0.0 && tilt_dly_ > 0) || (ap_n_ > 0);
+		// Unit-energy normalize so |G(f)|² averages 1 ⇒ the SNR3k axis is exact.
+		// (The all-pass is already unit-magnitude, so it does not enter e2.)
+		norm_ = 1.0 / std::sqrt(1.0 + e2);
+		pos_ = 0;
+		for (int i = 0; i < RING; i++) hist_[i] = 0.0;
+	}
+
+	// One Schroeder all-pass section: y[n] = -g·x[n] + x[n-D] + g·y[n-D].
+	double allpass_section(int s, double x)
+	{
+		double xD = ap_xh_[s][(ap_xpos_[s] - ap_dly_ + AP_RING) % AP_RING];
+		double yD = ap_yh_[s][(ap_ypos_[s] - ap_dly_ + AP_RING) % AP_RING];
+		double y  = -ap_g_ * x + xD + ap_g_ * yD;
+		ap_xh_[s][ap_xpos_[s]] = x;  ap_xpos_[s] = (ap_xpos_[s] + 1) % AP_RING;
+		ap_yh_[s][ap_ypos_[s]] = y;  ap_ypos_[s] = (ap_ypos_[s] + 1) % AP_RING;
+		return y;
+	}
+
+	// Apply the fixed FIR to a passband block in place. No-op + no state change
+	// when disabled (byte-identical to the pre-floor channel).
+	void apply(double* x, size_t n)
+	{
+		if (!enabled_ || n == 0) return;
+		for (size_t i = 0; i < n; i++)
+		{
+			double v = x[i];
+			// Phase-only all-pass cascade FIRST (flat magnitude, dispersive phase).
+			for (int s = 0; s < ap_n_; s++) v = allpass_section(s, v);
+			// Then the (optional) amplitude echo-comb + tilt for any residual shaping.
+			hist_[pos_] = v;
+			double y = v;                                 // main tap (gain 1)
+			for (int m = 0; m < n_echo_; m++)
+				y += echo_amp_[m] * hist_[(pos_ - echo_dly_[m] + RING) % RING];
+			if (tilt_dly_ > 0)
+				y += tilt_amp_ * hist_[(pos_ - tilt_dly_ + RING) % RING];
+			pos_ = (pos_ + 1) % RING;
+			x[i] = y * norm_;
+		}
+	}
+
+	bool enabled() const { return enabled_; }
+
+private:
+	static const int RING     = 1024;  // > max supported echo delay (comb span)
+	static const int MAX_ECHO = 8;
+	static const int MAX_AP   = 4;     // all-pass cascade depth
+	static const int AP_RING  = 1024;  // > max all-pass delay
+	bool   enabled_;
+	int    n_echo_;
+	double echo_amp_[MAX_ECHO];
+	int    echo_dly_[MAX_ECHO];
+	double tilt_amp_, norm_;
+	int    tilt_dly_;
+	double hist_[RING];
+	int    pos_;
+	// Schroeder all-pass cascade (phase-only floor) state.
+	double ap_g_;
+	int    ap_dly_, ap_n_;
+	double ap_xh_[MAX_AP][AP_RING];
+	double ap_yh_[MAX_AP][AP_RING];
+	int    ap_xpos_[MAX_AP], ap_ypos_[MAX_AP];
+};
+
 // Scalar AWGN channel for ONE direction. Mirrors sim_channel_relay.py:Channel
 // (AWGN-only path, fading=False): sticky TX-power tracking + the BER-harness
-// noise stddev formula. process() rotates by the band-limited Gaussian phase
-// noise (the permanent channel ceiling — applied EVEN on the clean cell) and
-// then adds AWGN IN PLACE to a passband block.
+// noise stddev formula. process() applies the DETERMINISTIC frequency-selective
+// floor (the dominant EVM/meanH source), then rotates by the SMALL residual
+// band-limited phase noise (kept as a small perturbation so the floor is "near
+// but not exactly noiseless"), then adds AWGN IN PLACE to a passband block.
 class cl_sim_awgn
 {
 public:
@@ -359,7 +525,10 @@ public:
 	// independent of the AWGN SNR knob).
 	cl_sim_awgn(uint64_t seed, double snr3k_db)
 		: rng_(seed), pn_(pn_seed(seed), pn_sigma(), pn_f3db(), 48000.0, pn_ici(),
-		                  pn_droop(), pn_resid(), pn_slow_f3db())
+		                  pn_droop(), pn_resid(), pn_slow_f3db()),
+		  det_(det_echo_db(), det_echo_dly(), det_echo_n(), det_echo_step(),
+		       det_tilt_db(), det_tilt_dly(),
+		       det_ap_g(), det_ap_dly(), det_ap_n())
 	{
 		clean_     = (snr3k_db >= 900.0);
 		snr_lin_   = clean_ ? 0.0 : std::pow(10.0, snr3k_db / 10.0);
@@ -375,9 +544,10 @@ public:
 	{
 		if (n == 0) return;
 
-		pn_.rotate(x, n);   // permanent phase-noise ceiling (on even when clean)
+		det_.apply(x, n);   // DETERMINISTIC freq-selective floor (dominant EVM/meanH)
+		pn_.rotate(x, n);   // small residual phase noise on top (near-but-not-zero sd)
 
-		if (clean_) return; // clean cell: PN only, no additive AWGN
+		if (clean_) return; // clean cell: floor+PN only, no additive AWGN
 
 		double ms = 0.0;
 		for (size_t i = 0; i < n; i++) ms += x[i] * x[i];
@@ -414,7 +584,15 @@ private:
 	//   the receiver AGC (automatic_gain_control, telecom_system.cc:2447) before
 	//   the channel estimate, so it does not move meanH — the knob is retained for
 	//   experimentation but is ineffective by design here (see rotate()).
-	static constexpr double PN_DEG_DEFAULT       = 13.8;
+	// Attempt-2 (§9/§10): the DETERMINISTIC all-pass+echo floor is the dominant EVM
+	// source. PN is kept ONLY as a SMALL residual perturbation (the floor is "near
+	// but not exactly noiseless" — real HW has a little residual variation). PN_DEG
+	// dropped 13.8 → 0.5° (alone ≈ 35 dB EVM, far above the 14.7 floor ⇒ a tiny sd
+	// contribution). A LARGER PN re-introduces 32-QAM BP-iter-cap fragility on the
+	// few borderline CFG16 frames (any per-symbol common-phase dither tips them over
+	// the cap); 0.5° at the -20 dB EVM-echo margin keeps CFG16 robustly ≥0.95 across
+	// seeds while preserving a genuine random residual (§10.3).
+	static constexpr double PN_DEG_DEFAULT       = 0.5;
 	static constexpr double PN_ICI_DEFAULT       = 0.15;
 	static constexpr double PN_DROOP_DEG_DEFAULT = 0.0;
 
@@ -476,6 +654,90 @@ private:
 		if (f <= 0.0) f = 0.2;
 		return f;
 	}
+	// --- DETERMINISTIC floor knobs (env-overridable; defaults = HW-faithful
+	// floor calibrated §9/§10). The deterministic FIR is the DOMINANT EVM/meanH
+	// source; it is seed-INDEPENDENT (pure fixed taps ⇒ GATE-2 byte-identical).
+	//   MERCURY_SIM2_DET_ECHO_DB  : EVM-ripple echo gain dB (<0; 0 disables the
+	//                               whole floor). Sets the fixed pilot residual
+	//                               ⇒ the EVM ceiling.
+	//   MERCURY_SIM2_DET_ECHO_DLY : EVM echo delay (passband samples) ⇒ the
+	//                               ripple's subcarrier-period (must exceed the
+	//                               DFT-smoother window to survive as residual).
+	//   MERCURY_SIM2_DET_TILT_DB  : meanH-droop tilt echo gain dB (<0).
+	//   MERCURY_SIM2_DET_TILT_DLY : tilt echo delay (short ⇒ smooth amplitude
+	//                               tilt the smoother partly keeps ⇒ droops meanH).
+	//   MERCURY_SIM2_DET_ECHO_N    : comb echo count (>1 ⇒ shallow comb, 32-QAM-safe).
+	//   MERCURY_SIM2_DET_ECHO_STEP : delay step between comb echoes (samples).
+	//   MERCURY_SIM2_DET_AP_G      : Schroeder all-pass coeff (phase-only floor —
+	//                                flat magnitude ⇒ no amplitude null ⇒ 32-QAM
+	//                                tolerant; this is the SHIPPED EVM mechanism).
+	//                                |g|<1; 0 ⇒ all-pass off (echo-comb path).
+	//   MERCURY_SIM2_DET_AP_DLY    : all-pass delay D (samples) ⇒ phase-ripple period.
+	//   MERCURY_SIM2_DET_AP_N      : all-pass cascade depth (1-4).
+	// SHIPPED floor (§10): a STRONG phase-only Schroeder all-pass (g=0.50, D=16,
+	// 3-section cascade) carries the bulk of the gentle, 32-QAM-tolerable residual,
+	// + a SMALL amplitude echo comb (-18 dB) for the final EVM push. Calibrated on
+	// the pinned clean cells so BOTH CFG15+CFG16 land EVM≈14.7 (in 14.6±0.3),
+	// per-frame sd 0.15-0.6 (≪ the old random-PN 1.6; toward HW 0.09), CFG15/CFG16
+	// EVM-CO-LOCATED, CFG16 32-QAM decoding (1.00 on most seeds; see §10 honesty
+	// note). meanH lands ~0.983 jointly-with-decode (the §6/§10 open question: the
+	// last ~0.004 to HW 0.979 is unreachable without an amplitude ripple that
+	// breaks 32-QAM decode — re-derive the HW meanH from the clean-decode
+	// population before treating 0.979 as a hard joint target).
+	static constexpr double DET_ECHO_DB_DEFAULT   = -17.0; // small EVM-push echo (lands EVM ~14.85, robust CFG16 across seeds)
+	static constexpr int    DET_ECHO_DLY_DEFAULT  = 80;
+	static constexpr int    DET_ECHO_N_DEFAULT    = 4;
+	static constexpr int    DET_ECHO_STEP_DEFAULT = 40;
+	static constexpr double DET_TILT_DB_DEFAULT   = 0.0;   // tilt echo OFF (unreliable meanH lever)
+	static constexpr int    DET_TILT_DLY_DEFAULT  = 48;
+	static constexpr double DET_AP_G_DEFAULT      = 0.50;  // strong gentle phase floor
+	static constexpr int    DET_AP_DLY_DEFAULT    = 16;
+	static constexpr int    DET_AP_N_DEFAULT      = 3;
+	static double det_echo_db()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_ECHO_DB");
+		return (e && *e) ? atof(e) : DET_ECHO_DB_DEFAULT;
+	}
+	static int det_echo_dly()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_ECHO_DLY");
+		return (e && *e) ? atoi(e) : DET_ECHO_DLY_DEFAULT;
+	}
+	static int det_echo_n()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_ECHO_N");
+		return (e && *e) ? atoi(e) : DET_ECHO_N_DEFAULT;
+	}
+	static int det_echo_step()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_ECHO_STEP");
+		return (e && *e) ? atoi(e) : DET_ECHO_STEP_DEFAULT;
+	}
+	static double det_tilt_db()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_TILT_DB");
+		return (e && *e) ? atof(e) : DET_TILT_DB_DEFAULT;
+	}
+	static int det_tilt_dly()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_TILT_DLY");
+		return (e && *e) ? atoi(e) : DET_TILT_DLY_DEFAULT;
+	}
+	static double det_ap_g()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_AP_G");
+		return (e && *e) ? atof(e) : DET_AP_G_DEFAULT;
+	}
+	static int det_ap_dly()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_AP_DLY");
+		return (e && *e) ? atoi(e) : DET_AP_DLY_DEFAULT;
+	}
+	static int det_ap_n()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_DET_AP_N");
+		return (e && *e) ? atoi(e) : DET_AP_N_DEFAULT;
+	}
 	// Deterministic, distinct PN seed: a fixed bijective transform of the AWGN
 	// ctor seed. NEVER shares the AWGN rng_ stream and preserves the per-direction
 	// seed separation (the A→B / B→A seeds differ in bit 0, so the transformed
@@ -487,6 +749,7 @@ private:
 
 	cl_sim_xoshiro     rng_;
 	cl_sim_phase_noise pn_;
+	cl_sim_det_floor   det_;
 	bool   clean_;
 	double snr_lin_;
 	double peak_ms_;
