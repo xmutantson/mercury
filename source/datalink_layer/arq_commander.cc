@@ -1283,8 +1283,35 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 	return success;
 }
 
+int arq_sim2_current_depth();   // fwd decl (defined at the step-pump, below)
+
 void cl_arq_controller::process_messages_tx_data()
 {
+	// ---- SIM_INPROC multi-batch deadlock fix — Option (a) defer-the-TX ----
+	// data-flow-sim2-time-domain-faithfulness.md §6. In the single-thread
+	// 2-instance stepper, the pump co-routine-drives the PEER inside the active
+	// instance's blocking waits (sim_inproc_pump_2, depth-gated by g_sim2_depth).
+	// When the COMMANDER is itself the peer being driven at depth 1 and it tries
+	// to start a NEW data batch here, transmit_batch() -> drain_playback_wait()
+	// (arq_common.cc:4046) spins waiting for the play buffer to drain — but the
+	// pump at depth>0 only drains+clocks the OTHER direction (the depth-0
+	// deliver/drive block at arq_commander.cc:~9916 is gated off), so the
+	// commander's own play buffer never moves to the wire ⇒ infinite spin
+	// (multi-batch CFG16 hung at batch 2). Option (a): DEFER the reentrant batch
+	// TX. Leave connection_status == TRANSMITTING_DATA untouched and return
+	// WITHOUT building/transmitting a batch; the ARQ state machine re-enters this
+	// function on the next TOP-LEVEL (depth-0) tick, where the TX runs normally
+	// and the pump CAN drain the play buffer. No state is mutated on the deferred
+	// path, so the re-entry is clean (see the §6 TRANSMITTING_DATA re-entry audit
+	// over messages_batch_tx / cmd_batch_seq_id / block_under_tx). Guarded by
+	// arq_sim_inproc_active() so production (-m ARQ, pump null) is byte-identical;
+	// the depth check makes depth-0 (top-level) TX unaffected even under SIM_INPROC.
+	if(arq_sim_inproc_active() && arq_sim2_current_depth() > 0)
+	{
+		if(getenv("MERCURY_SIM2_DBG")) { printf("[DEFER-TX] depth=%d conn=%d\n", arq_sim2_current_depth(), connection_status); fflush(stdout); }
+		return;
+	}
+
 	// Phase D timing — entry to the batch builder. The gap between
 	// cmd_ack_post_work_done and this marker is "state-machine idle"
 	// (one or more main-loop ticks that did NOT build a batch). The
@@ -9584,6 +9611,17 @@ int cl_arq_controller::test_sim_inproc()
 // CONNECT self-detect race, B8 HAIL RX-poll) are now exercised against an
 // actual responder.
 // ===========================================================================
+
+// SIM_INPROC peer-drive reentrancy depth. File scope (visible inside the
+// anonymous namespace below AND to the global accessor) so the depth-gated
+// defer-the-TX early-return at process_messages_tx_data can read it via the
+// external-linkage accessor (data-flow-sim2-time-domain-faithfulness.md §6).
+// 0 = top-level (tx) tick; 1 = inside a co-routine peer rx->process_main() drive.
+static int g_sim2_depth = 0;
+// External-linkage accessor (the member fn that precedes the pump reads it via a
+// forward declaration; an anonymous-namespace function could not satisfy that).
+int arq_sim2_current_depth() { return g_sim2_depth; }
+
 namespace {
 
 // Per-instance audio transport (single-process-sim-refactor.md §10.3). Two
@@ -9680,7 +9718,9 @@ struct SimInproc2Ctx {
 
 // Reentrancy depth for the co-routine peer-drive (§10.5). 0 = top (tx) level;
 // 1 = inside a peer rx->process_main() drive (do not recurse further).
-static int g_sim2_depth = 0;
+// NOTE: g_sim2_depth is now declared at FILE scope just above this anonymous
+// namespace (so the external-linkage arq_sim2_current_depth() accessor can read
+// it for the defer-the-TX gate); it remains fully visible here.
 
 // Reentrancy guard for the per-FRAME RX decode-drive inside sim2_deliver_from_wire
 // (wf-sim-controlloop OFDM fix, bounded follow-on). >0 = a decode-drive is already
