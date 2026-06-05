@@ -1667,6 +1667,26 @@ start_modem:
                telecom_system.ofdm_defer_overflow_enabled ? "on" : "off");
     }
 
+    // LEVER P: PRODUCTION preamble-amortization enable knob. The variable
+    // per-frame OFDM preamble schedule (FULL anchor + 1-symbol MINI tails, see
+    // telecom_system.h:402) is DEFAULT OFF — with it off TX and RX are
+    // byte-identical to the pre-LEVER-P baseline. Setting MERCURY_PREAMBLE_AMORT=1
+    // in the environment flips telecom_system.preamble_amortization_enabled at
+    // startup, which the single production telecom_system instance (shared by the
+    // ARQ controller via ARQ.telecom_system = &telecom_system below) honors on
+    // both the TX emission and RX MINI-extract paths. This is the SINGLE-binary
+    // A/B knob: one deployed mercury.exe runs both the P-OFF baseline and the
+    // P-ON arm depending on the env var. (The SIM A/B used MERCURY_SIM2_PREAMBLE_AMORT
+    // inside the in-process two-instance stepper, which is not present on the
+    // production path.) See fact-documents/data-flow-preamble-amortization.md.
+    {
+        const char* amort_env = std::getenv("MERCURY_PREAMBLE_AMORT");
+        bool amort_on = (amort_env != nullptr && atoi(amort_env) != 0);
+        telecom_system.preamble_amortization_enabled = amort_on;
+        printf("[FLAG] MERCURY_PREAMBLE_AMORT=%s (preamble amortization %s)\n",
+               amort_env ? amort_env : "(unset)", amort_on ? "ON" : "OFF");
+    }
+
     // Apply per-signal tx_gain overrides from INI [TxGain] section (plan §7.13.21).
     // Only non-NaN entries override; absent INI keys leave the code defaults from
     // cl_telecom_system::init_tx_gain_defaults() unchanged. Logged per override
