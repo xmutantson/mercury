@@ -492,3 +492,100 @@ average, de-rotate `exp(-j[ω+k·δ])` BEFORE the equalizer.
 - NEXT: pilot-thin 33 %→6 % (Dy=3→Dy≈16) with the tracker carrying the timing (the
   net-PHY-recovery step = the design's TEST 2), then ARQ/SACK re-granularization so
   the big block is one ARQ unit. The tracker is the enabler for both.
+
+## §13. TEST 2 — PILOT THINNING 33% → 6% (NET-PHY RECOVERY, BUILT + RESULT, 2026-06-05)
+
+The §12.4 NEXT STEP is DONE. The §12.3 `sfo_grid_test` was extended with a
+CONTINUAL+SCATTERED sparse-pilot lattice and a real LDPC coded decode. Entry is the
+same (`-m PLOT_PASSBAND -s 16`), single-thread, no HW, no butler. **VERDICT: GO at 6%.**
+
+### §13.1 The 6% layout (continual + scattered) — the configure() bypass
+`MERCURY_SFO_GRID_THIN=1` OVERWRITES the lattice in-harness AFTER `ofdm.init()`
+(telecom_system.cc ~5793-5870) — it does NOT touch the production
+`cl_pilot_configurator::configure()` (ofdm.cc:1133), whose Dy=3 full-column lattice
+is baked into all 17 configs and whose `nData` feeds the 1600-bit codeword sizing
+(§12.1). The thin layout:
+- **CONTINUAL columns** (`MERCURY_SFO_GRID_CONT_COLS`, default for 6% = **2**, carriers
+  {0, Nc-1}): a pilot on EVERY symbol. These anchor the CPE/PEG per-symbol LS fit
+  (omega+k·delta needs ≥2 pilots/symbol) AND feed the noise-variance estimator on
+  every symbol.
+- **SCATTERED diagonal** (`SCAT_DX`=12, `SCAT_DY`=4): interior pilots every 12 carriers,
+  every 4th symbol, offset by `(n/SCAT_DY)` so the diagonal walks the band — the 2D
+  samples the channel estimate needs without spending a full column.
+- For Nc=50, Nsymb=60: 2 continual (120) + scatter (60) = **180 pilots = exactly 6.0%**,
+  nData=2820 (vs 1000 pilots / nData=2000 at the stock 33%). pilots/sym min=2.
+
+### §13.2 ROOT-CAUSE: the stock LS+DFT estimator SMEARS a sparse lattice
+First attempt (sparse lattice fed to `LS_channel_estimator` + `smooth_channel_estimate_dft`)
+gave **uncoded BER 0.34 even at 0 ppm** on a flat UNITY channel. DIAG: `|H|` ranged
+0.05..1.37 (mean 0.38) instead of ~1.0; some data cells decoded to (0,0) (MMSE-erased
+because |H|²<σ²). Mechanism: the per-symbol DFT smoother (ofdm.cc:2127) keeps ~`gi·Nc`≈13
+time-domain taps assuming a DENSE REGULAR lattice makes H[k] flat across carriers. On a
+sparse IRREGULAR lattice the per-cell LS scalar + pilot cells make H[k] rippled; its IFFT
+is not a clean delta, so windowing SMEARS it. This is the dense-lattice assumption baked
+into the estimator, not a tuning issue. **Fix (telecom_system.cc, thin path only):** after
+the CPE/PEG tracker removes the SFO ramp the channel is flat unity, so the ML estimate is
+the pilot-averaged complex gain `H̄ = mean(Y_pilot/X_pilot)` assigned to every cell, with
+nv = the pilot residual EVM against H̄. With H̄ the estimate reads |H|=1.0 everywhere →
+BER 0. (A production sparse-pilot CFG would need a sparse-capable 2D interpolator, e.g.
+DFT-interp over the scattered lattice — out of TEST-2 scope; the flat-channel estimator is
+exact for THIS deterministic-floor bench.)
+
+### §13.3 RESULTS at 6% pilots (cont=2, scat dx=12/dy=4, 180 pilots)
+**(a) UNCODED tracker hold** — clean channel, CPE/PEG track, SFO sweep:
+
+| ppm | 0 | 25 | 50 | 80 |
+|-----|---|----|----|----|
+| uncoded_BER (track) | 0 | 0 | 0 | **0** |
+| uncoded_BER (NO track, 2D only) | 0 | — | 0.060 (tail 0.117) | 0.141 |
+
+The tracker is LOAD-BEARING: without it the sparse-pilot 2D estimate cannot hold the
+ramp (tail 0.117 @50 ppm — would fail LDPC); with it, 0 BER across 0–80 ppm. The negative
+control bites → the hold is real discrimination, not a lenient harness.
+
+**(b) CODED K-codeword decode + nv** — `MERCURY_SFO_GRID_CODED=1`, K=8 real rate-0.875
+(N=1600, K=1400, P=200) systematic LDPC codewords, demapped with the harness nv, AWGN via
+`MERCURY_SFO_GRID_ESN0`. At EsN0=16 dB (near the 32-QAM r=0.875 operating point), 50 ppm:
+
+| EsN0 dB | 18 | 16 | 14 | 12 | 30 |
+|---------|----|----|----|----|----|
+| codewords_decoded | 8/8 | 8/8 | 0/8 | 0/8 | 8/8 |
+| nv | 0.0145 | 0.0229 | 0.0362 | 0.0573 | 0.00100 |
+| iter_mean | 1.75 | 5.5 | 101(cap) | 101(cap) | 0 |
+
+- nv TRACKS the true noise monotonically (0.001 @30 dB = 10⁻³ exactly; 0.057 @12 dB) and
+  is **OK (>1e-5, NOT collapsed) at EVERY SNR incl. EsN0=30** — the E1/cfg16-nvfix collapse
+  (nv→1e-6 → over-confident LLR → BP caps at 101 even at high SNR) does NOT occur.
+- The iter-cap at 14/12 dB is the GENUINE LDPC waterfall edge (insufficient SNR), not an
+  nv pathology — at 16/18/30 dB iter_mean is low and decode is clean.
+- At EsN0=16, decode is **8/8 across the full 0/25/50/80 ppm SFO sweep**, nv≈0.023 stable.
+
+**(c) NET-PHY** — block airtime = 60 sym × Tsym(0.02583 s) = 1.55 s; net = nData·log2M·rate/airtime:
+
+| layout | pilots | nData | net-PHY |
+|--------|--------|-------|---------|
+| 33% stock | 1000 (33%) | 2000 | 5645 bps (= documented CFG16 5665, validates the model) |
+| **6% thin** | **180 (6%)** | **2820** | **7960 bps** |
+| 8% thin | 240 | 2760 | 7790 bps |
+| 11.6% thin | 350 | 2650 | 7480 bps |
+
+**6% pilots → net-PHY 7960 bps = 1.41× stock CFG16, > VARA Standard 7050** (in the predicted
+7370–8125 range). GO on all three requirements.
+
+### §13.4 Floor note — below 6%
+On a CLEAN channel the tracker holds the SFO timing even at 4% (cont=2, no scatter):
+uncoded BER 0 across 0–80 ppm. The practical floor is set by channel-estimate NOISE margin,
+not SFO: at EsN0=16 a 4% layout shows ~1.8% uncoded BER (residual the LDPC still corrects:
+coded 9/9), but 6% gives uncoded 0 even under noise. So **6% is the robust recommended
+layout** (strict uncoded-0 across the SFO band + comfortable coded margin), not a fallback —
+no lower floor was needed.
+
+### §13.5 What is NOT done (honest scope)
+- The 6% lattice + flat-channel estimator live in the TEST harness (`sfo_grid_test`), not in
+  a production CFG. Production thinning needs (i) a sparse-capable 2D channel interpolator
+  replacing the dense-lattice LS+DFT smoother (§13.2), (ii) re-derived `nData`→codeword
+  sizing per config, (iii) the CPE/PEG tracker wired into the live RX before the equalizer.
+- Bench is the deterministic FLAT-channel floor (SFO is the only impairment). A
+  frequency-selective Watterson channel would stress the channel estimate harder; the
+  flat-channel estimator is exact only for this floor. The tracker + nv findings transfer;
+  the estimator choice is bench-specific.

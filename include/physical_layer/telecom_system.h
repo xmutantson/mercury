@@ -473,6 +473,15 @@ public:
 	// tail. Optional CPE/PEG LS per-symbol de-rotation (MERCURY_SFO_GRID_TRACK=1) is
 	// the STEP-2 anti-P tracker. Unlike sfo_block_test (K tiled 9-sym codeword-frames,
 	// per-frame estimate), this is the literal "one estimate across 60 symbols" case.
+	//
+	// TEST 2 (pilot thinning, net-PHY recovery): MERCURY_SFO_GRID_THIN=1 rewrites the
+	// lattice in-harness to a CONTINUAL+SCATTERED ~6% layout (cont columns on every
+	// symbol anchor the per-symbol tracker fit + nv; a scattered diagonal feeds the
+	// channel est). The thin path uses a flat-channel pilot-averaged estimator (the
+	// per-cell-LS+DFT-smoother smears a sparse lattice). MERCURY_SFO_GRID_CODED=1 adds
+	// a real rate-0.875 LDPC K-codeword block decode (with AWGN via MERCURY_SFO_GRID_
+	// ESN0) to verify noise_variance_estimate does NOT collapse (E1/cfg16-nvfix). Knobs:
+	// CONT_COLS, SCAT_DX, SCAT_DY. See fact-doc §13.
 	void sfo_grid_test();
 
 	void load_configuration();

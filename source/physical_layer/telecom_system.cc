@@ -5773,22 +5773,143 @@ void cl_telecom_system::sfo_grid_test()
 	ofdm.LS_window_width = 0; ofdm.LS_window_hight = 0;   // re-derive in init
 	ofdm.init(Nfft, Nc, Ngrid, gi);   // sets Nfft/Nc/Nsymb/gi/Ngi + allocs + configures lattice
 
+	// ====================================================================
+	// TEST 2: PILOT THINNING 33% -> ~6% (CONTINUAL + SCATTERED lattice).
+	// ====================================================================
+	// The net-PHY-recovery step. The default configure() lays Dy=3 FULL columns
+	// (every column gets 1/3 of its rows = 33% pilots). To raise the data-carrying
+	// fraction we OVERWRITE the lattice in-harness (NOT the production configure(),
+	// which would re-derive nData->nBits and break CFG16's 1600-bit codeword sizing
+	// across all 17 configs) with the design's CONTINUAL + SCATTERED layout:
+	//
+	//   CONTINUAL columns  : a few carriers carrying a pilot on EVERY symbol. These
+	//                        anchor the CPE/PEG per-symbol LS phase fit (omega+k*delta
+	//                        needs >=2 pilots PER symbol) AND feed the LS-path residual
+	//                        nv estimator (every pilot counted, ofdm.cc:1816) so it
+	//                        cannot collapse to the 1e-6 floor (the E1/cfg16-nvfix
+	//                        sibling bug).
+	//   SCATTERED lattice  : interior pilots every SCAT_DX carriers, repeating every
+	//                        SCAT_DY symbols, offset by symbol -> the 2D samples the
+	//                        channel estimate needs without spending a full column.
+	//
+	// Because LS_window=(Nc x Nsymb) (full grid), LS_channel_estimator gives EVERY
+	// data cell the global LS fit over ALL pilots (ofdm.cc:1684-1745) and the
+	// column/bilinear interpolation is a no-op (all cells already MEASURED) -> the
+	// sparse layout needs NO interpolation rewrite. After the tracker removes the SFO
+	// ramp the channel is flat-unity, so the global LS fit is near-exact.
+	bool   thin      = (env_i("MERCURY_SFO_GRID_THIN", 0) != 0);
+	int    cont_cols = env_i("MERCURY_SFO_GRID_CONT_COLS", 3);   // continual pilot columns
+	int    scat_dx   = env_i("MERCURY_SFO_GRID_SCAT_DX", 12);    // scatter carrier step
+	int    scat_dy   = env_i("MERCURY_SFO_GRID_SCAT_DY", 4);     // scatter symbol step
+	if(thin)
+	{
+		// 1) Everything DATA.
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			(ofdm.ofdm_frame+n*Nc+j)->type = DATA;
+
+		// 2) CONTINUAL columns: cont_cols carriers spread across [0,Nc-1] incl. edges.
+		//    carrier_c = round(c*(Nc-1)/(cont_cols-1)). Pilot on every symbol.
+		std::vector<int> cont(cont_cols);
+		for(int c=0;c<cont_cols;c++)
+			cont[c] = (cont_cols<=1) ? 0
+			        : (int)llround((double)c*(double)(Nc-1)/(double)(cont_cols-1));
+		for(int c=0;c<cont_cols;c++)
+			for(int n=0;n<Ngrid;n++)
+				(ofdm.ofdm_frame+n*Nc+cont[c])->type = PILOT;
+
+		// 3) SCATTERED lattice: at symbols n%scat_dy==0, place interior pilots every
+		//    scat_dx carriers, offset by (n/scat_dy) so the diagonal walks across the
+		//    band over successive scatter-rows (full 2D coverage for the channel est).
+		if(scat_dx > 0 && scat_dy > 0)
+		{
+			for(int n=0;n<Ngrid;n++)
+			{
+				if(n % scat_dy != 0) continue;
+				int off = (n/scat_dy) * (scat_dx/2 > 0 ? scat_dx/2 : 1);
+				for(int j = off % scat_dx; j < Nc; j += scat_dx)
+					(ofdm.ofdm_frame+n*Nc+j)->type = PILOT;
+			}
+		}
+
+		// 4) Recount nPilots/nData. The framer/deframer/LS_channel_estimator and the
+		//    CPE/PEG tracker ALL read ofdm.ofdm_frame[].type (NOT virtual_carrier, which
+		//    is only consumed inside configure(), bypassed here). pilot_configurator.
+		//    carrier IS ofdm_frame (same buffer, ofdm.cc:175), so the lattice we wrote
+		//    above is already what every consumer sees. nData = Nc*Nsymb - nPilots,
+		//    matching configure()'s convention.
+		int np=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT) np++;
+		ofdm.pilot_configurator.nPilots = np;
+		ofdm.pilot_configurator.nConfig = 0;
+		ofdm.pilot_configurator.nData   = Ngrid*Nc - np;
+
+		// 5) Re-allocate + re-seed the pilot DBPSK sequence to the NEW nPilots. The
+		//    framer/estimator/tracker all index sequence[] by running pilot count in
+		//    raster order, so it MUST have exactly nPilots entries.
+		CDELETE(ofdm.pilot_configurator.sequence);
+		ofdm.pilot_configurator.sequence =
+		    CNEW(std::complex<double>, np, "pilot.sequence.thin");
+		__srandom(ofdm.pilot_configurator.seed);
+		int last_pilot=0;
+		for(int i=0;i<np;i++)
+		{
+			int pv = (__random()%2) ^ last_pilot;   // DBPSK, same generator as init()
+			ofdm.pilot_configurator.sequence[i] =
+			    std::complex<double>(2*pv-1,0) * ofdm.pilot_configurator.boost;
+			last_pilot = pv;
+		}
+	}
+
 	int nData = ofdm.pilot_configurator.nData;     // data carriers across the 60-grid
 	int log2M = (int)round(log2((double)M));
 	int nBits = nData * log2M;
 
 	std::cout << "[SFO-GRID] cfg=" << current_configuration << " M=" << M
-	          << " Nsymb=" << Ngrid << " Nc=" << Nc << " Dx=1 Dy=3"
+	          << " Nsymb=" << Ngrid << " Nc=" << Nc
+	          << (thin ? " THIN(cont+scatter)" : " Dx=1 Dy=3")
+	          << (thin ? " cont_cols=" : " ") << (thin ? cont_cols : 0)
+	          << (thin ? " scat_dx=" : "") << (thin ? scat_dx : 0)
+	          << (thin ? " scat_dy=" : "") << (thin ? scat_dy : 0)
 	          << " nData=" << nData << " nBits=" << nBits
 	          << " pilots=" << ofdm.pilot_configurator.nPilots
 	          << " (" << (100.0*ofdm.pilot_configurator.nPilots/(double)(Ngrid*Nc)) << "% of grid)"
 	          << " ppm=" << ppm << " track=" << (track?1:0)
 	          << " no_interp=" << (no_interp?1:0) << std::endl;
 
-	// --- TX: known random 32QAM data symbols + known pilots into the 60-grid. ---
+	// --- TX: data symbols + known pilots into the 60-grid. ---
+	// Two modes:
+	//  - UNCODED (default): nBits random bits (requirement (a), the timing/BER probe).
+	//  - CODED (MERCURY_SFO_GRID_CODED=1): fill the FIRST K*N bits with K LDPC
+	//    codewords (K = floor(nBits / ldpc.N)), each = [1400 info | 200 parity]
+	//    (systematic, ldpc.cc:107-120), so the decode is the REAL rate-0.875 LDPC
+	//    block-decode at the achieved pilot fraction. This is the "coded K-codeword
+	//    path at 6% pilots + tracker, under SFO" the GO/NO-GO names. AWGN is added in
+	//    the channel stage when MERCURY_SFO_GRID_ESN0 < 900 so noise_variance_estimate
+	//    is a meaningful quantity to check for the E1/cfg16-nvfix collapse.
+	bool coded = (env_i("MERCURY_SFO_GRID_CODED", 0) != 0);
+	int  Kcw   = coded ? (nBits / ldpc.N) : 0;     // whole codewords that fit
 	std::vector<int> tx_bits(nBits);
+	std::vector<std::vector<int>> cw_info(Kcw);    // per-codeword info bits (for BER/CRC)
 	ts_srandom((unsigned int)seed);
-	for(int i=0;i<nBits;i++) tx_bits[i] = (int)(ts_random()%2);
+	if(coded)
+	{
+		std::vector<int> enc(ldpc.N);
+		std::vector<int> info(ldpc.K);
+		for(int c=0;c<Kcw;c++)
+		{
+			for(int i=0;i<ldpc.K;i++) info[i] = (int)(ts_random()%2);
+			cw_info[c] = info;
+			ldpc.encode(info.data(), enc.data());   // enc = [K info | P parity] = N bits
+			for(int i=0;i<ldpc.N;i++) tx_bits[(size_t)c*ldpc.N + i] = enc[i];
+		}
+		// Any leftover bits past K*N are random filler (not scored).
+		for(int i=Kcw*ldpc.N; i<nBits; i++) tx_bits[i] = (int)(ts_random()%2);
+	}
+	else
+	{
+		for(int i=0;i<nBits;i++) tx_bits[i] = (int)(ts_random()%2);
+	}
 
 	std::vector<std::complex<double>> tx_syms(nData);
 	psk.mod(tx_bits.data(), nBits, tx_syms.data());
@@ -5809,6 +5930,24 @@ void cl_telecom_system::sfo_grid_test()
 		{
 			double ph = -2.0*M_PI*(double)j*tau_n/(double)Nfft;
 			grid[(size_t)n*Nc+j] *= std::complex<double>(cos(ph), sin(ph));
+		}
+	}
+
+	// AWGN (Es/N0): added per data/pilot subcarrier so noise_variance_estimate is a
+	// meaningful quantity for the CODED path. Es/N0 >= 900 => clean (no noise, default
+	// for the uncoded timing probe). The 32-QAM symbols carry unit average Es here
+	// (psk.mod normalization), so sigma^2 = 1/(2*Es/N0) per real dimension.
+	double grid_esn0 = env_f("MERCURY_SFO_GRID_ESN0", 900.0);
+	if(grid_esn0 < 900.0)
+	{
+		double snr_lin = pow(10.0, grid_esn0/10.0);
+		double sigma   = 1.0 / sqrt(snr_lin);   // per-complex-sample std (Es=1)
+		awgn_channel.set_seed((long)((seed ^ 0xA5A5A5A5u) | 1));
+		for(int ci=0; ci<Ngrid*Nc; ci++)
+		{
+			double nr = (sigma/sqrt(2.0)) * awgn_channel.awgn_value_generator();
+			double ni = (sigma/sqrt(2.0)) * awgn_channel.awgn_value_generator();
+			grid[ci] += std::complex<double>(nr, ni);
 		}
 	}
 
@@ -5879,6 +6018,45 @@ void cl_telecom_system::sfo_grid_test()
 		for(int ci=0; ci<Ngrid*Nc; ci++){ (ofdm.estimated_channel+ci)->value = std::complex<double>(1.0,0.0);
 			(ofdm.estimated_channel+ci)->status = MEASURED; }
 	}
+	else if(thin)
+	{
+		// SPARSE-LATTICE estimator. The stock LS_channel_estimator assumes a DENSE
+		// REGULAR (Dx=1/Dy=3) lattice: per-cell global-window scalar + a per-symbol
+		// DFT smoother (smooth_channel_estimate_dft, ofdm.cc:2127) that keeps ~gi*Nc
+		// time-domain taps. On a SPARSE IRREGULAR lattice the per-symbol H[k] is no
+		// longer flat across carriers (pilot cells hold exact Y/X, data cells hold the
+		// window scalar), so the DFT smoother IFFTs an irregular ripple and SMEARS the
+		// estimate (measured: |H| 0.05..1.37, mean 0.38 on a UNITY channel) -> BER 0.34
+		// even at 0 ppm. After the CPE/PEG tracker removes the SFO ramp the channel is
+		// flat unity, so the ML estimate of a flat channel is simply the pilot-averaged
+		// complex gain H = mean(Y_pilot / X_pilot). We compute that ONE scalar from all
+		// pilots and assign it to every cell, then derive a HONEST noise variance as the
+		// pilot residual against it (so nv does NOT collapse — the E1/cfg16-nvfix path).
+		// This is the faithful flat-channel estimator, not a smoother band-aid: the
+		// per-cell LS+DFT machinery is simply the wrong tool for a sparse lattice.
+		std::complex<double> Hsum(0,0); int pidx=0; int npil=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT)
+			{
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				Hsum += rx[(size_t)n*Nc+j] / X;   // Y/X per pilot (post-tracker ~unity)
+				npil++;
+			}
+		std::complex<double> Hbar = (npil>0) ? (Hsum / (double)npil) : std::complex<double>(1.0,0.0);
+		// Honest residual noise variance against the flat estimate (pilot EVM).
+		double nsum=0.0; pidx=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT)
+			{
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				std::complex<double> resid = rx[(size_t)n*Nc+j] - Hbar*X;
+				nsum += resid.real()*resid.real() + resid.imag()*resid.imag();
+			}
+		for(int ci=0; ci<Ngrid*Nc; ci++){ (ofdm.estimated_channel+ci)->value = Hbar;
+			(ofdm.estimated_channel+ci)->status = MEASURED; }
+		ofdm.noise_variance_estimate = (npil>0) ? (nsum/(double)npil) : 0.01;
+		if(ofdm.noise_variance_estimate < 1e-6) ofdm.noise_variance_estimate = 1e-6;
+	}
 	else
 	{
 		ofdm.LS_channel_estimator(rx.data());   // pilots -> interpolate across 60-grid
@@ -5901,6 +6079,20 @@ void cl_telecom_system::sfo_grid_test()
 		          << "," << (ofdm.estimated_channel+0)->value.imag() << ")"
 		          << " H[sym30,c25]=(" << (ofdm.estimated_channel+30*Nc+25)->value.real()
 		          << "," << (ofdm.estimated_channel+30*Nc+25)->value.imag() << ")" << std::endl;
+		// Lattice histogram (pilots per symbol) + |H| stats across the grid. The
+		// pilots/sym min is the tracker's per-symbol LS-fit support (needs >=2). The
+		// |H| min/max/mean is the channel-estimate sanity: on this flat-unity grid a
+		// healthy estimate reads ~1.0 everywhere; the per-cell-LS+DFT-smoother path
+		// SMEARS it on a sparse lattice (|H| 0.05..1.37, mean 0.38 -> BER 0.34), which
+		// is why the thin path uses the flat-channel pilot-averaged estimator instead.
+		int pmin=Nc+1, pmax=-1; double psum=0;
+		for(int n=0;n<Ngrid;n++){ int pc=0; for(int j=0;j<Nc;j++){ if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT) pc++; }
+			if(pc<pmin){ pmin=pc; } if(pc>pmax){ pmax=pc; } psum+=pc; }
+		double hmin=1e9,hmax=-1e9,hsum=0;
+		for(int ci=0;ci<Ngrid*Nc;ci++){ std::complex<double> H=(ofdm.estimated_channel+ci)->value;
+			double m=std::abs(H); if(m<hmin){ hmin=m; } if(m>hmax){ hmax=m; } hsum+=m; }
+		std::cout << "[SFO-GRID-DIAG] pilots/sym min="<<pmin<<" max="<<pmax<<" mean="<<(psum/Ngrid)
+		          << " |H| min="<<hmin<<" max="<<hmax<<" mean="<<(hsum/(Ngrid*Nc))<<std::endl;
 	}
 
 	// --- SCORE: per-symbol uncoded symbol-error-rate, head vs tail. ---
@@ -5944,6 +6136,60 @@ void cl_telecom_system::sfo_grid_test()
 	          << std::endl;
 	std::cout << "[SFO-GRID]   make-or-break: TAIL BER ~0 => grid holds the SFO ramp;"
 	          << " TAIL >> HEAD => ramp walks the tail off (needs tracker)." << std::endl;
+
+	// ====================================================================
+	// CODED K-CODEWORD DECODE (requirement (b)): real rate-0.875 LDPC block
+	// decode at the achieved pilot fraction, under SFO, with the tracker.
+	// ====================================================================
+	// The first Kcw*N data bits carry Kcw systematic codewords. Demap the SAME
+	// deframed data carriers with the production noise_variance_estimate (the
+	// quantity the E1/cfg16-nvfix bug collapses), then LDPC-decode each 1600-bit
+	// codeword and report decoded/iter. nv is REPORTED so the GO/NO-GO can confirm
+	// it did NOT collapse to ~1e-6 (over-confident LLRs -> BP iter caps at 101).
+	if(coded)
+	{
+		// Per-carrier LLR for the whole grid (production demapper + production nv).
+		std::vector<float> clr(nBits);
+		double cvar = ofdm.noise_variance_estimate;   // the estimator's nv (NOT measure_variance)
+		if(cvar < 1e-9) cvar = 1e-9;
+		psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
+
+		int    cw_ok = 0, cw_crcfail = 0;
+		long   cw_infoerr = 0, cw_infobits = 0;
+		long   iter_sum = 0; int iter_min = 1<<30, iter_max = -1;
+		std::vector<float> cwllr(ldpc.N);
+		std::vector<int>   dec(ldpc.N);
+		for(int c=0;c<Kcw;c++)
+		{
+			for(int i=0;i<ldpc.N;i++) cwllr[i] = clr[(size_t)c*ldpc.N + i];
+			int iters = ldpc.decode(cwllr.data(), dec.data());
+			iter_sum += iters;
+			if(iters < iter_min) iter_min = iters;
+			if(iters > iter_max) iter_max = iters;
+			// Info-bit errors of THIS codeword (dec[0..K-1] vs the TX info bits).
+			int ierr=0;
+			for(int i=0;i<ldpc.K;i++) if(dec[i] != cw_info[c][i]) ierr++;
+			cw_infoerr  += ierr;
+			cw_infobits += ldpc.K;
+			// "decoded" = converged before the iter cap AND info matches (the harness
+			// has no CRC; exact info recovery is the strict success criterion).
+			bool capped = (iters > (ldpc.nIteration_max - 1));
+			if(ierr == 0 && !capped) cw_ok++; else cw_crcfail++;
+		}
+		double cw_ber = cw_infobits ? (double)cw_infoerr/(double)cw_infobits : 1.0;
+		std::cout << "[SFO-GRID-CODED] ===== CODED RESULT (K=" << Kcw
+		          << " x " << ldpc.N << "-bit rate-" << ldpc.rate << " codewords) =====" << std::endl;
+		std::cout << "[SFO-GRID-CODED]   nv=" << ofdm.noise_variance_estimate
+		          << "  EsN0=" << grid_esn0
+		          << "  iter_mean=" << (Kcw? (double)iter_sum/(double)Kcw : 0.0)
+		          << " iter_min=" << (iter_max<0?0:iter_min) << " iter_max=" << (iter_max<0?0:iter_max)
+		          << "  iter_cap=" << ldpc.nIteration_max << std::endl;
+		std::cout << "[SFO-GRID-CODED]   codewords_decoded=" << cw_ok << "/" << Kcw
+		          << "  fail=" << cw_crcfail
+		          << "  post_FEC_info_BER=" << cw_ber << std::endl;
+		std::cout << "[SFO-GRID-CODED]   nv_check: " << (ofdm.noise_variance_estimate > 1e-5 ? "OK (not collapsed)" : "COLLAPSED (<1e-5 -> E1 bug)")
+		          << "  iter_cap_check: " << (iter_max < ldpc.nIteration_max ? "OK (no codeword hit cap)" : "CAPPED (BP at 101 -> over-confident LLR)") << std::endl;
+	}
 
 	// Restore the original grid geometry so the rest of the process is unaffected.
 	ofdm.deinit();
