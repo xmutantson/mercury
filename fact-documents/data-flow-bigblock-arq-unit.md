@@ -408,6 +408,68 @@ may be single-batch-limited. INV-7 (no per-block deinit/init) and INV-8
 ANY noisy test (P2.2); the sustained rate + the compress-ON VARA-parity verdict
 are P3.
 
+### §6a SACK-GATE extension (T4/T6/T7/T8/T9) — the R-B close-out gate
+
+The original 3 cases proved the carve mechanics but HARDCODED `data_batch_size = K`
+in each case setup, so a CMD/RSP batch-size DIVERGENCE (bug #9 / R-B) would PASS the
+unit test and still REPRODUCE the 4-wire-failures on the wire. The SACK-GATE
+extension (this session, `feat/bigblock-sack-gate-p1`) closes that gap. Now 8/8:
+
+- **T2/T3/lost-EOB** — the original CASE1/CASE2/CASE3 (unchanged).
+- **T4 (multi non-contiguous bad {1,4,6})** — popcount fidelity the single-bad CASE2
+  cannot reach: cw_ok clear at {1,4,6} ⇒ the RECEIVED-scan SACK bitmap reads `0xAD`
+  (the LSB-first pack the production producer `arq_responder.cc:1582-1594` emits) and
+  the retx queue holds EXACTLY 3 frames at positions {1,4,6} carrying the ORIGINAL
+  bsi (INV-2/INV-3, `retransmit_count == popcount`). bsi does NOT bump (partial).
+- **T6 (THE #9 GATE — election symmetry vs the PRODUCTION setter)** — the GO/NO-GO.
+  Builds TWO independent `cl_telecom_system` + `cl_arq_controller` (CMD + RSP), loads
+  a REAL CFG16 grid into each (which on its own elects `data_batch_size = 25` via the
+  30s formula — the bug-#9 SEED), turns on `bigblock_framing_enabled`, and runs the
+  PRODUCTION `sack_negotiated_recompute_batch()` on BOTH (`"CMD"` = TEST_CONNECTION_ACK
+  path, `"RSP"` = TEST_CONNECTION path — the SAME shared body). ASSERTS both elect
+  `data_batch_size == K == 8` (from the SAME geometry source `bigblock_codeword_count()`,
+  NOT hardcoded — `MERCURY_BIGBLOCK_K` pins the cap to 8 deterministically), both derive
+  the identical `all_ones = (1<<data_batch_size)-1 == 0xFF` (the exact
+  `cmd_clean_data_ack_crc_valid:136-139` expression), and the RSP's `0xFF` is accepted
+  (`rx_bitmap == all_ones` AND `sack_clean_confirmation_accepted()`). Observed:
+  `batch=25 -> pinned 8` on BOTH peers. FAIL-BEFORE proven: reverting the R-B pin
+  (`bigblock_rung=false`) elects 25 on both ⇒ `all_ones=0x1FFFFFF != 0xFF` ⇒ T6 FAILS
+  7/8. This is the divergence-proof property the climb-fix family lacked. (INV-5.)
+- **T7 (#12 silence / no all-ones bypass)** — a `0xFF` is NOT credited without a valid
+  CRC12. Drives the production accept gate's CRC predicate
+  (`cmd_clean_data_ack_crc_valid:117-124`): a forged/silence `0xFF` with the wrong
+  CRC12 is rejected BEFORE the all-ones comparison; the same bytes with the correct
+  CRC12 pass. There is no all-ones bypass.
+- **T8 (synthetic-EOB sizes prev at batch > K — the DIVERGENT RISK-4)** — CASE3 sized
+  `data_batch_size == K` so a stale-EOB bug would yield the SAME number and pass
+  silently. T8 sets `data_batch_size = 25 (> K)` BEFORE the decode and asserts the
+  synthetic `EOB=K-1` drives `rsp_prev_batch_expected_count == EOB+1 == 8`, NOT the
+  batch default 25 (INV-4 with a divergent batch).
+- **T9 (padded-slot vs real-loss)** — drives the padded-slot guard predicate
+  (`arq_commander.cc:2945-2952`): a GENUINELY FILLED clear-bit slot (length>0, bsi>=0,
+  type!=NONE) MUST enqueue a retx; a PADDED slot (length==0 / bsi<0 / type==NONE) is
+  swallowed (ACKED, no retx). Guards a future guard-broadening that would swallow real
+  big-block sub-codeword losses.
+- **T5 (#11 majority-vote)** — NOT a new addition: the SNR-tone 3/8-majority +
+  2-vote-margin decode lives in the MFSK ctrl codec (`telecom_system.cc:3408`,
+  covered by `mfsk_ctrl_codec_tests.cc`); the bitmap producer fidelity (the LSB-first
+  RECEIVED-scan pack, `arq_responder.cc:1582-1594`) is exercised by T4. T5 is the
+  existing-coverage line, not a re-implemented tone encoder.
+- **T10 (mixed-session RF demux)** — explicitly DEFERRED to P3 (full RF demux of
+  per-frame retx vs the next block's single acquisition needs HW / the Option-b pump;
+  see §8 [?] RISK-5). The in-process routing assertions are covered by T4's
+  position/bsi checks.
+
+**R-B CLOSED (grep-verified):** the `set_data_batch_size(K) + nominal_batch_size = K`
+pin is INSIDE the single `cl_arq_controller::sack_negotiated_recompute_batch()` body
+(`arq_common.cc:979-988`); the production callers are `arq_commander.cc:4263` (CMD,
+TEST_CONNECTION_ACK) and `arq_responder.cc:2181` (RSP, TEST_CONNECTION) — the SAME
+shared body ⇒ cannot diverge. It is NOT a CMD-only / RSP-only / carve-only path
+(`bigblock_block_to_arq` does not call `set_data_batch_size`). The optimizer/gearshift
+authority (`optimizer_is_in_control`, `last_data_viable_config`,
+`anchor_consec_break_fails`, `probe_backoff`) is UNTOUCHED — `--test-climb-engine`
+ALL PASS (0 failures), incl D5/D'6 (OFDM CONFIG_10 still scales to the >=5 SACK floor).
+
 ---
 
 ## §7 Related fact documents

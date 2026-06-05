@@ -1350,6 +1350,21 @@ public:
   int bigblock_test_delivered_bytes(int K, int sub_len,
                                     const unsigned char* tx_payload);
 
+  // SACK-GATE T6 (R-B / bug #9): CMD/RSP election symmetry against the
+  // PRODUCTION setter. Constructs TWO independent cl_telecom_system +
+  // cl_arq_controller (one CMD-role, one RSP-role), loads a REAL CFG16 grid into
+  // each (so bigblock_codeword_count() runs the live nBits/ldpc.N geometry, NOT a
+  // hardcoded K), turns on bigblock_framing_enabled, and runs the SHARED
+  // production sack_negotiated_recompute_batch() on BOTH. Asserts both elect
+  // data_batch_size == K == BB_TEST_K(8), both derive the identical all-ones
+  // target (1<<data_batch_size)-1 == 0xFF (the cmd_clean_data_ack_crc_valid:136-139
+  // expression), and the RSP's all-clean K-bit bitmap 0xFF is accepted by that
+  // gate (rx_bitmap==all_ones) AND by sack_clean_confirmation_accepted(). Returns
+  // 1 on PASS, 0 on FAIL (caller increments cases_passed). This is the #9 GO/NO-GO:
+  // without the R-B pin the non-robust 30s formula elects ~25 -> CMD all_ones
+  // 0x1FFFFFF != RSP 0xFF -> clean ACK never matches (the "4 wire failures").
+  int bigblock_test_election_symmetry();
+
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
   // policy_evaluate_axis3() implements the per-SACK-event §4.3.2 controller.
