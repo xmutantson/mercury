@@ -10140,6 +10140,19 @@ int cl_arq_controller::test_sim_inproc_2()
 
 	A->arq.set_optimizer_disabled(!opt_on);
 	B->arq.set_optimizer_disabled(!opt_on);
+
+	// LEVER P: preamble amortization A/B knob. MERCURY_SIM2_PREAMBLE_AMORT=1
+	// enables the variable per-frame OFDM preamble on BOTH instances. Default 0
+	// (legacy full preamble, byte-identical baseline). See
+	// fact-documents/data-flow-preamble-amortization.md.
+	{
+		const bool amort_on = env_i("MERCURY_SIM2_PREAMBLE_AMORT", 0) != 0;
+		A->ts.preamble_amortization_enabled = amort_on;
+		B->ts.preamble_amortization_enabled = amort_on;
+		printf("[TEST-SIM-2INST] preamble amortization %s\n", amort_on ? "ON" : "OFF");
+		fflush(stdout);
+	}
+
 	if (opt_on) {
 		printf("[TEST-SIM-2INST] optimizer ON: loading calibration table (A=CMD)\n");
 		fflush(stdout);

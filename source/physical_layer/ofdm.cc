@@ -2403,7 +2403,7 @@ int cl_ofdm::time_sync_preamble(std::complex <double>*in, int size, int interpol
  */
 }
 
-TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max)
+TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max, int nsym_override)
 {
 	/*
 	 * Fine per-trial timing refinement. Selects the sample-precise delay using
@@ -2425,6 +2425,17 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	double norm_a=0;
 	double norm_b=0;
 	double max_correlation = 0.0;
+
+	// LEVER P: correlate over n_sym preamble symbols (MINI = 1) instead of the
+	// configured full length. Without this the fine-sync template (4 symbols)
+	// re-locks a 1-symbol MINI frame onto a data subpeak, corrupting the delay.
+	int n_sym = preamble_configurator.Nsymb;
+	if(nsym_override > 0)
+	{
+		n_sym = nsym_override;
+		if(n_sym > preamble_configurator.Nsymb) n_sym = preamble_configurator.Nsymb;
+		if(n_sym < 1) n_sym = 1;
+	}
 
 	TimeSyncResult result;
 	result.delay = 0;
@@ -2459,9 +2470,9 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	}
 	std::complex <double> *data = tsync_data;
 
-	for(int i=0;i<size-preamble_configurator.Nsymb*(this->Ngi+this->Nfft)*interpolation_rate;i+=step)
+	for(int i=0;i<size-n_sym*(this->Ngi+this->Nfft)*interpolation_rate;i+=step)
 	{
-		for(int k=0;k<preamble_configurator.Nsymb*(this->Ngi+this->Nfft)*interpolation_rate;k++)
+		for(int k=0;k<n_sym*(this->Ngi+this->Nfft)*interpolation_rate;k++)
 		{
 			data[k]=*(in+i+k);
 		}
@@ -2507,7 +2518,7 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 		// Correlate adjacent L-sample sections within the FFT window.
 		int nIS = preamble_configurator.nIdentical_sections;
 		int L_interp = (this->Nfft / nIS) * interpolation_rate;
-		for(int l=0;l<preamble_configurator.Nsymb;l++)
+		for(int l=0;l<n_sym;l++)
 		{
 			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate;
 			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Nfft*interpolation_rate;
@@ -2592,7 +2603,7 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	return result;
 }
 
-TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric)
+TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric, int nsym_override)
 {
 	/*
 	 * Schmidl-Cox preamble detection using time-domain repetition.
@@ -2613,7 +2624,15 @@ TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int
 	int nIS = preamble_configurator.nIdentical_sections;
 	int L = (this->Nfft / nIS) * interpolation_rate;
 	int Nofdm = (this->Ngi + this->Nfft) * interpolation_rate;
+	// LEVER P: correlate over nsym_override symbols when set (MINI preamble),
+	// else the configured full preamble length. Clamp to [1, configured].
 	int nsym = preamble_configurator.Nsymb;
+	if(nsym_override > 0)
+	{
+		nsym = nsym_override;
+		if(nsym > preamble_configurator.Nsymb) nsym = preamble_configurator.Nsymb;
+		if(nsym < 1) nsym = 1;
+	}
 	int pream_len = nsym * Nofdm;
 
 	TimeSyncResult result;
