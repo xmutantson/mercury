@@ -54,25 +54,172 @@
 #define BB_TEST_SUB_LEN  16
 
 // ----------------------------------------------------------------------------
-// bigblock_block_to_arq() — PRODUCTION block->ARQ delivery entry.
+// bigblock_block_to_arq() — PRODUCTION block->ARQ delivery entry (P2.4/2.5/2.6).
 //
-// P2.0 STUB. NO ARQ LOGIC. It does not touch messages_rx[], the bsi counters, the
-// SACK bitmap, or the prev-batch state. It returns BIGBLOCK_ARQ_NOT_WIRED so the
-// regression below fails. P2.4/2.5/2.6 replace this body with the real
-// carve+SACK+bsi-once implementation (and this method moves into the production
-// path; the signature is the contract).
+// Translates ONE big-block decode (the PHY's K-bit cw_ok clean vector +
+// K decoded info-bit sub-units) into the ARQ data unit, replacing the K
+// per-frame add_message_rx_data() writes with ONE block carve. The K-bit cw_ok
+// IS the SACK bitmap (INV-2). This is the "one big-block = one acquisition = one
+// ACK over K sub-codewords, with selective-repeat per sub-codeword" granularity
+// the audit (fact-documents/data-flow-bigblock-arq-unit.md) covers.
 //
-// Args (see arq.h): cw_ok[K] clean bitmap, K codeword count, block_bsi the batch
-// id, tx_payload[K*sub_len] the bytes the TX block carried, sub_len bytes/codeword.
+// P2.4 (carve + synthetic EOB + bsi-once): each clean sub-codeword (cw_ok[c]==1)
+//   is carved into messages_rx[c] RECEIVED with the block's batch_seq_id and the
+//   sub-unit bytes; the synthetic end-of-batch is set to K-1 (the block has ONE
+//   acquisition and no per-frame wire bit-7, so EOB is inferred) — RISK-4: set
+//   BEFORE any prev-sizing so rsp_prev_batch_expected_count sizes from EOB+1=K,
+//   not a stale -1. On a CLEAN block the prev-batch bookkeeping is sized to K and
+//   marked delivered, and rsp_current_expected_batch_seq_id bumps EXACTLY ONCE
+//   (INV-1) — leaving messages_rx[0..K-1] RECEIVED for the downstream ACK-GATE
+//   copy_data_to_buffer() delivery (the carve is the inverse of the TX pack, so
+//   the carved bytes equal the TX bytes, INV-6).
+//
+// P2.5 (selective-repeat per sub-codeword): a clear cw_ok bit selects EXACTLY
+//   that failed sub-codeword for retransmit_frames[] (the CMD's stock CFG16
+//   per-frame retx queue) carrying its ORIGINAL batch_seq_id — NOT a whole-block
+//   resend (INV-3: retransmit_count == popcount of the clear bits). The block is
+//   incomplete, so the bsi does NOT bump (partial SACK, the rung is not promoted).
+//
+// P2.6 (single bsi): one block = one batch => one cmd_batch_seq_id /
+//   rsp_current_expected_batch_seq_id transition per block, fired once here (not
+//   once per sub-codeword).
+//
+// This entry does NOT touch the optimizer/gearshift (optimizer_is_in_control()
+// arq.h:2041-2058, last_data_viable_config, anchor_consec_break_fails,
+// probe_backoff) — the gearshift's only role is electing the bigblock framing
+// flag at the top rung (audit §5).
+//
+// Args (see arq.h): cw_ok[K] clean bitmap (1=clean,0=failed), K codeword count,
+// block_bsi the batch id the block advertises, tx_payload[K*sub_len] the bytes
+// the TX block carried (the carve source; on the live path these are the decoded
+// info bits, see telecom_system.cc receive_bigblock), sub_len bytes/codeword.
+// Returns SUCCESSFUL when the block was delivered to the ARQ layer.
 // ----------------------------------------------------------------------------
 int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
                                              unsigned char block_bsi,
                                              const unsigned char* tx_payload,
                                              int sub_len)
 {
-	// P2.0: not wired. Silence unused-arg warnings; populate nothing.
-	(void)cw_ok; (void)K; (void)block_bsi; (void)tx_payload; (void)sub_len;
-	return BIGBLOCK_ARQ_NOT_WIRED;
+	if(cw_ok == NULL || tx_payload == NULL || K <= 0 || sub_len < 0)
+		return ERROR_;
+	if(K > this->data_batch_size) K = this->data_batch_size;
+	if(K > this->nMessages)       K = this->nMessages;
+	const int alloc_size = N_MAX / 8;
+	if(sub_len > alloc_size) sub_len = alloc_size;
+
+	// --- P2.4: carve the K decoded sub-units into messages_rx[0..K-1] ---------
+	// RECEIVED iff cw_ok[c]==1 (the clear bits are the SACK gaps, INV-2). Each
+	// carved sub-unit stamps the block's bsi (or it routes as out_of_window) and
+	// sets id/sequence_number = c, with bit-7 EOB on the last sub-codeword — the
+	// exact per-slot fields add_message_rx_data() writes on the per-frame path.
+	int n_clean = 0;
+	for(int c = 0; c < K; c++)
+	{
+		if(cw_ok[c])
+		{
+			messages_rx[c].type            = DATA_LONG;
+			messages_rx[c].id              = (char)(unsigned char)c;
+			messages_rx[c].length          = sub_len;
+			messages_rx[c].batch_seq_id    = (int)block_bsi;
+			// low 7 bits = slot, bit 7 = EOB on the last sub-codeword.
+			messages_rx[c].sequence_number =
+				(char)(unsigned char)((c == K - 1) ? (c | 0x80) : c);
+			for(int j = 0; j < sub_len; j++)
+				messages_rx[c].data[j] = (char)tx_payload[c * sub_len + j];
+			messages_rx[c].status          = RECEIVED;
+			n_clean++;
+		}
+		else
+		{
+			// The gap: leave the slot FREE so the K-bit SACK reports it missing
+			// and selective-repeat (below) re-sends EXACTLY this sub-codeword.
+			messages_rx[c].status          = FREE;
+			messages_rx[c].length          = 0;
+			messages_rx[c].batch_seq_id    = -1;
+		}
+	}
+
+	// --- P2.4: synthetic EOB = K-1 (RISK-4 — BEFORE any prev-sizing) ----------
+	// The block has one acquisition and no per-frame wire bit-7; the EOB is
+	// inferred from the block's codeword count. Setting it here, before the
+	// prev-sizing below (and before any bump_bsi_and_transfer_prev() in the
+	// production partial path), makes rsp_prev_batch_expected_count size from
+	// EOB+1 = K, not a stale -1 (INV-4, regression case 3).
+	this->last_received_end_of_batch_seq = K - 1;
+	this->batch_rx_frame_count           = n_clean;
+
+	if(n_clean == K)
+	{
+		// ===================== CLEAN block (INV-1) ==========================
+		// One ACK, all-ones K-bit bitmap, bsi bumps ONCE. The K RECEIVED slots
+		// stay in messages_rx[] for the downstream ACK-GATE copy_data_to_buffer()
+		// delivery — so the unit test (and the real ACK-GATE) sees K/K RECEIVED.
+		//
+		// Record the completed batch in the prev-batch bookkeeping sized from the
+		// synthetic EOB (this is the RISK-4 path the partial branch shares): the
+		// batch is fully received (K/K), sized to K via EOB+1, and marked
+		// delivered. We size it directly (rather than calling
+		// bump_bsi_and_transfer_prev(), which transfers-and-FREES messages_rx —
+		// the clean block must KEEP messages_rx for the ACK-GATE delivery).
+		int prev_expected = this->data_batch_size;
+		if(this->last_received_end_of_batch_seq >= 0)
+		{
+			int eob = this->last_received_end_of_batch_seq + 1;
+			if(eob < prev_expected) prev_expected = eob;
+		}
+		if(prev_expected < 1)               prev_expected = 1;
+		if(prev_expected > this->nMessages) prev_expected = this->nMessages;
+
+		this->rsp_prev_batch_seq_id        = (int)block_bsi;
+		this->rsp_prev_batch_expected_count= prev_expected;   // == K (INV-4/5)
+		this->rsp_prev_batch_received_count= n_clean;         // == K, all clean
+		this->rsp_prev_batch_active        = false;           // completed on decode
+		this->rsp_prev_batch_delivered_count++;               // one block delivered
+
+		// P2.6 — one block = one batch => ONE bsi transition.
+		if(this->rsp_current_expected_batch_seq_id >= 0)
+			this->rsp_current_expected_batch_seq_id =
+				(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+
+		printf("[BIGBLOCK-ARQ] CLEAN block bsi=%u K=%d -> 1 ACK (all-ones), "
+			"prev_expected=%d bsi_next=%d\n",
+			(unsigned)block_bsi, K, this->rsp_prev_batch_expected_count,
+			this->rsp_current_expected_batch_seq_id);
+		fflush(stdout);
+	}
+	else
+	{
+		// ==================== PARTIAL block (INV-2/3) =======================
+		// Partial K-bit SACK: the clear bits select the failed sub-codewords for
+		// selective-repeat. Each is queued as ONE stock CFG16 per-frame retx
+		// (retransmit_frames[]) carrying its ORIGINAL batch_seq_id — never a
+		// whole-block resend. The bsi does NOT bump (block incomplete; the partial
+		// SACK keeps the link alive but must not promote the rung).
+		for(int c = 0; c < K; c++)
+		{
+			if(cw_ok[c]) continue;
+			if(this->retransmit_count >= MAX_RETRANSMIT_HEADROOM) break;
+			int rci = this->retransmit_count;
+			int len = sub_len;
+			if(len > MAX_SACK_FRAME_SIZE) len = MAX_SACK_FRAME_SIZE;
+			for(int j = 0; j < len; j++)
+				this->retransmit_frames[rci][j] = tx_payload[c * sub_len + j];
+			this->retransmit_frame_lengths[rci]       = len;
+			this->retransmit_frame_positions[rci]     = c;
+			this->retransmit_frame_types[rci]         = DATA_LONG;
+			this->retransmit_frame_batch_seq_ids[rci] = (int)block_bsi;
+			// low 7 bits = slot, bit 7 = EOB on the last sub-codeword.
+			this->retransmit_frame_seq_with_eob[rci]  =
+				(unsigned char)((c == K - 1) ? (c | 0x80) : c);
+			this->retransmit_count++;
+		}
+		printf("[BIGBLOCK-ARQ] PARTIAL block bsi=%u K=%d clean=%d -> SACK gaps=%d "
+			"queued for selective-repeat (stock CFG16 per-frame), no bsi bump\n",
+			(unsigned)block_bsi, K, n_clean, this->retransmit_count);
+		fflush(stdout);
+	}
+
+	return SUCCESSFUL;
 }
 
 // NOTE on helpers: messages_rx[] / nMessages are PRIVATE members of

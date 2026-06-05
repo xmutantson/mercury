@@ -1,10 +1,53 @@
 # Data-Flow Audit: big-block as ONE ARQ unit (P2 re-granularization)
 
-**Status**: DRAFT (P2.0), authoritative on `feat/bigblock-livepath-p2`
-(built off `feat/bigblock-livepath-p1` @ `0e94581`). Paired with the in-process
-regression `--test-bigblock-arq-unit` (`source/datalink_layer/test_bigblock_arq_unit.cc`).
-Every change to the structures in §0 — or to any predicate that gates a write —
-MUST update this document (CLAUDE.md §"Cross-Layer Data-Flow Audits").
+**Status**: P2.1/2.2/2.4/2.5/2.6 WIRED (P2.0 draft + this build), authoritative on
+`feat/bigblock-livepath-p2` (built off `feat/bigblock-livepath-p1` @ `0e94581`).
+Paired with the in-process regression `--test-bigblock-arq-unit`
+(`source/datalink_layer/test_bigblock_arq_unit.cc`) — now **PASS 3/3** (was FAIL 0/3
+at P2.0). Every change to the structures in §0 — or to any predicate that gates a
+write — MUST update this document (CLAUDE.md §"Cross-Layer Data-Flow Audits").
+
+**P2 BUILD STATUS (this session, see §9):**
+- **P2.4/2.5/2.6 (ARQ batch/SACK granularization)** — DONE. `bigblock_block_to_arq()`
+  carves cw_ok→messages_rx (RECEIVED iff cw_ok[c]==1), sets synthetic EOB=K-1 BEFORE
+  any prev-sizing (INV-4/RISK-4), one-ACK + single-bsi on a clean block (INV-1), and
+  selective-repeat of EXACTLY the clear-bit sub-codewords via the stock CFG16 per-frame
+  retx queue (INV-3, retransmit_count==popcount). Regression `--test-bigblock-arq-unit`
+  flips FAIL 0/3 → PASS 3/3.
+- **P2.1 (feed real ARQ bytes)** — DONE (TX side). `transmit_bigblock` now packs the K
+  codewords from REAL ARQ bytes (data/nBytes → payload_bits, LSB-first byte_to_bit) when
+  a payload is handed; nBytes==0 keeps the seeded-PRBS known payload so the byte-correct
+  loopback gate is unchanged (8/8). The RX carve of the decoded info bits into K
+  byte-sub-units is the ARQ caller's step (consumed by `bigblock_block_to_arq`'s
+  tx_payload arg, exercised by the unit test). The full live ARQ↔PHY send/receive
+  integration (replacing the per-frame send loop with the block entry) is the production
+  wiring validated at P3 (HW / Option-b pump).
+- **P2.2 (normalization-bypass)** — DONE (the stock normalization is now run on the
+  big-block RX). Factored the EXACT stock receive_byte RX passband normalization +
+  impulse-blanking (was inline at telecom_system.cc:1081-1124) into
+  `rx_passband_normalize_and_blank()`; called from BOTH receive_byte (byte-identical
+  extraction, stock path unchanged) and receive_bigblock (BEFORE the estimator). INV-8.
+  **RESIDUAL FINDING (NOT P2.2):** the live AWGN validator STILL fails at ≤~40 dB Es/N0
+  (deterministic, identical BER 0.43 across runs; clean PASS, 60/45 dB PASS, 35/30 dB
+  FAIL). This is a SEPARATE, PRE-EXISTING P1 PHY scaling/LLR bug in the big-block
+  estimator path (the ~25 dB implementation loss is not a true noncoherent SNR cliff and
+  is NOT masked by the normalization). It is OUT of the ARQ-granularization scope, does
+  NOT affect the in-process ARQ unit test (INV-8: the test runs on the clean carve, no
+  channel), and is GATED before any noisy/HW test (P3). Per CLAUDE.md §1/§2 it needs a
+  proper DSP root-cause investigation (research before guessing; no threshold-tuning to
+  mask), NOT a shotgun fix — flagged for P3 PHY work.
+- **P2.3 (hot-path realloc move)** — DEFERRED to P3 (validation-gated). The plan's
+  RISK-1 fear (the per-block `bigblock_restore_stock_config()` full reload reallocating
+  the `data_container` buffers the ARQ aliases via `messages_tx.data`) is **UNFOUNDED**:
+  `telecom_system.cc` has ZERO references to `messages_tx` — `load_configuration`
+  reallocates the PHY `data_container` (sample buffers), NOT the ARQ message queues
+  (those are owned by `cl_arq_controller::init_messages_buffers`, never touched by the
+  PHY reload). So there is no per-block ARQ-alias corruption. The residual cost is PURELY
+  performance (per-block OFDM deinit/init) and matters only for a SUSTAINED multi-block
+  rate, which is single-batch-limited in the in-process sim (§8 [?]) and thus needs P3
+  HW / the Option-b pump to validate the move — moving the reload to config-load now
+  would be an UNTESTED structural change (CLAUDE.md §3). Deferred with the canary plan in
+  §8 [?].
 
 **Scope of this audit**: P2 changes the ARQ *data-unit granularity* at the
 CFG16-bigblock rung from **"one frame = one preamble = one ACK"** to
@@ -383,11 +426,51 @@ are P3.
 - **[?]** Does the in-process 2-instance sim pump deliver MULTIPLE blocks
   back-to-back, or is it single-batch-limited (Option-b deferred)? Determines
   whether the sustained delivered RATE is measurable in sim or needs P3 HW.
-- **[?]** RISK-3: does moving the thin-lattice rebuild to config-load fully avoid
-  the `data_container` realloc that aliases `messages_tx.data`? Needs the P2.3
-  multi-block alias-survival check (a canary on `messages_tx[i].data` across two
-  blocks).
+- **[RESOLVED, downgraded]** RISK-1/RISK-3: the per-block reload does NOT realloc
+  the `messages_tx.data` the ARQ aliases — `telecom_system.cc` has ZERO references
+  to `messages_tx` (grep-confirmed); `load_configuration` reallocates the PHY
+  `data_container`, not the ARQ message queues. So there is no per-block ARQ-alias
+  corruption. The P2.3 config-load move is now PURELY a sustained-rate performance
+  optimization (avoid per-block OFDM deinit/init) — deferred to P3 where a
+  multi-block canary on `messages_tx[i].data` + a sustained-rate measurement can
+  validate it (moving it now = untested structural change, CLAUDE.md §3).
+- **[?] (NEW, P3 PHY)** The big-block live AWGN path has a deterministic ~25 dB
+  implementation loss (clean/60/45 dB PASS, 35/30 dB FAIL with identical BER 0.43).
+  This is a PRE-EXISTING P1 PHY scaling/LLR bug (NOT the normalization, which P2.2
+  fixed faithfully and which did not move the cliff). Needs a DSP root-cause trace
+  (noise_variance_estimate / CSI-LLR clamp / constellation scaling in
+  `bigblock_rx_passband`) before any noisy/HW big-block test. Gated before P3.
 - **[?]** P2.5 mixed session: when a block's selective-repeat (stock CFG16
   per-frame) is in flight AND a new block follows, does the RX capture loop
   correctly demux per-frame retx vs the next block's single acquisition? RISK-5
   says transparent (per-frame preambles already handled); verify on HW (P3).
+
+---
+
+## §9 Implementation record (P2.1/2.2/2.4/2.5/2.6 build)
+
+**Files changed** (3, none in the ARQ commander/responder/common = optimizer/gearshift
+untouched):
+- `source/datalink_layer/test_bigblock_arq_unit.cc` — `bigblock_block_to_arq()` stub
+  replaced with the real carve + synthetic-EOB + bsi-once + selective-repeat body
+  (P2.4/2.5/2.6). The 3-case regression flips FAIL 0/3 → PASS 3/3.
+- `source/physical_layer/telecom_system.cc` — `transmit_bigblock` feeds real ARQ bytes
+  as the block payload (P2.1, PRBS fallback when nBytes==0);
+  `rx_passband_normalize_and_blank()` factored from receive_byte's inline normalization
+  and called from receive_bigblock before the estimator (P2.2); receive_byte's inline
+  block replaced by the identical helper call (byte-identical extraction).
+- `include/physical_layer/telecom_system.h` — `rx_passband_normalize_and_blank()` decl.
+
+**Verification (all green):**
+- `--test-bigblock-arq-unit` → PASS 3/3 (CASE1 clean 8/8 + bsi 7→8; CASE2 one-bad-cw=3
+  partial 7/8 + retx_count=1 + full 8/8; CASE3 lost-EOB synthetic eob=7 + expected=8 +
+  prev complete + 128/128). Was FAIL 0/3 at P2.0 — the fail-before/pass-after contract.
+- `--test-partial-bsi-advance=ofdm` PASS, `=mfsk` PASS — stock SACK path no regression.
+- `--test-climb-engine` ALL PASS (0 failures) — gearshift/optimizer untouched.
+- bigblock clean live validator (`MERCURY_BIGBLOCK_LIVE=1 -m PLOT_PASSBAND -s 16`) →
+  VERDICT PASS 8/8 byte-correct — P1 PHY no regression; the P2.2 receive_byte refactor
+  is byte-identical on the stock path.
+
+**Commits** (bisectable, per P4): the P2.0 audit+failing-test anchor is `d7eaf1f`; this
+build is a SEPARATE commit on `feat/bigblock-livepath-p2` (PHY-wiring + ARQ
+granularization). NO monitor merge, NO push, NO Claude/Anthropic attribution.

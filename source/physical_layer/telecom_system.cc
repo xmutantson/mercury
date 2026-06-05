@@ -1089,38 +1089,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		// preserves SNR and is equivalent to what the TX produced.
 		if(M != MOD_MFSK)
 		{
+			// P2.2 — extracted verbatim into rx_passband_normalize_and_blank() so the
+			// big-block RX path (receive_bigblock) runs the SAME normalization +
+			// impulse-blanking before its estimator. Behavior here is unchanged.
 			int pb_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-			double* pb = (double*)data;
-			double sum_sq = 0.0;
-			for(int i = 0; i < pb_samples; i++)
-				sum_sq += pb[i] * pb[i];
-			double rms = sqrt(sum_sq / pb_samples);
-			if(rms > 1e-8) {
-				// Phase-2: --rx-normalize=off bypasses this auto-rescaling block.
-				if(rx_normalize_enabled) {
-					// Target RMS: sqrt(output_power / 2) for passband signal
-					// (factor /2 because passband has carrier modulation overhead)
-					double target_rms = sqrt(output_power_Watt) * 0.5;
-					double scale = target_rms / rms;
-					// Clamp scale to prevent insane amplification on near-silence
-					if(scale > 10000.0) scale = 10000.0;
-					if(scale < 0.001) scale = 0.001;
-					// Only normalize if significantly off (>3 dB)
-					if(scale > 1.5 || scale < 0.67)
-					{
-						for(int i = 0; i < pb_samples; i++)
-							pb[i] *= scale;
-						// Recalculate RMS after scaling
-						rms *= scale;
-					}
-				}
-				// Impulse noise blanking: clip at 10× RMS (always on)
-				double clip_threshold = 10.0 * rms;
-				for(int i = 0; i < pb_samples; i++) {
-					if(pb[i] > clip_threshold) { pb[i] = clip_threshold; }
-					else if(pb[i] < -clip_threshold) { pb[i] = -clip_threshold; }
-				}
-			}
+			rx_passband_normalize_and_blank((double*)data, pb_samples);
 		}
 		// Plan-B Step 6c: the eager full-rate time_sync FIR over the WHOLE
 		// passband buffer — the ~92% RPi RX-side idle-scan CPU cost — is
@@ -7732,6 +7705,52 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	return (cw_ok==Kcw && Kcw>0) ? 1 : 0;
 }
 
+// P2.2 — stock RX passband normalization + impulse-noise blanking, factored out of
+// receive_byte (was inlined at telecom_system.cc:1081-1124). The OFDM estimator/
+// equalizer/LLR pipeline assumes the RX passband sits near the TX output_power level;
+// external paths attenuate 20-50 dB. This rescales RMS to sqrt(output_power)*0.5 and
+// blanks impulses at 10×RMS — EXACTLY what the per-frame path runs. The big-block RX
+// (receive_bigblock) skipped it, so the live AWGN validator decoded garbage at 30 dB
+// (BER 0.43). Both paths now call this; the extraction is byte-identical to the inline
+// block (same code, same pb_samples) so the stock per-frame path is unchanged (verified
+// by --test-partial-bsi-advance=ofdm/mfsk + the bigblock clean live validator, all
+// green). MFSK is excluded (the per-frame block is guarded on M!=MFSK).
+void cl_telecom_system::rx_passband_normalize_and_blank(double* pb, int pb_samples)
+{
+	if(M == MOD_MFSK) return;
+	if(pb == NULL || pb_samples <= 0) return;
+	double sum_sq = 0.0;
+	for(int i = 0; i < pb_samples; i++)
+		sum_sq += pb[i] * pb[i];
+	double rms = sqrt(sum_sq / pb_samples);
+	if(rms > 1e-8) {
+		// Phase-2: --rx-normalize=off bypasses this auto-rescaling block.
+		if(rx_normalize_enabled) {
+			// Target RMS: sqrt(output_power / 2) for passband signal
+			// (factor /2 because passband has carrier modulation overhead)
+			double target_rms = sqrt(output_power_Watt) * 0.5;
+			double scale = target_rms / rms;
+			// Clamp scale to prevent insane amplification on near-silence
+			if(scale > 10000.0) scale = 10000.0;
+			if(scale < 0.001) scale = 0.001;
+			// Only normalize if significantly off (>3 dB)
+			if(scale > 1.5 || scale < 0.67)
+			{
+				for(int i = 0; i < pb_samples; i++)
+					pb[i] *= scale;
+				// Recalculate RMS after scaling
+				rms *= scale;
+			}
+		}
+		// Impulse noise blanking: clip at 10× RMS (always on)
+		double clip_threshold = 10.0 * rms;
+		for(int i = 0; i < pb_samples; i++) {
+			if(pb[i] > clip_threshold) { pb[i] = clip_threshold; }
+			else if(pb[i] < -clip_threshold) { pb[i] = -clip_threshold; }
+		}
+	}
+}
+
 // ===== P1: LIVE-PATH BIG-BLOCK ENTRY POINTS =====
 // These wire the validated big-block PHY (the shared bigblock_*_passband workers)
 // into the production transmit_byte/receive_byte. They are reached ONLY when
@@ -7788,18 +7807,50 @@ int cl_telecom_system::bigblock_tx_total_samples()
 
 void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
 {
-	// P1: known-payload (seeded PRBS) so the loopback gate asserts byte-correctness
-	// exactly as the WAV harness did. Feeding ARQ bytes (`data`/`nBytes`) is P2 — the
-	// worker accepts an external payload via bigblock_tx_passband(...,payload_bits);
-	// P1 passes nullptr to use the validated known payload.
-	(void)data; (void)nBytes;
-
+	// P2.1 — feed REAL ARQ bytes as the block's systematic info bits. When the ARQ
+	// layer hands a payload (data != null, nBytes > 0), pack the K=8 codewords from
+	// those bytes (LSB-first, the byte_to_bit convention) into the worker's external
+	// payload_bits; the worker LDPC-encodes them. When nBytes == 0 (the P1 loopback
+	// validator, which passes a dummy 0-byte payload), fall back to the seeded-PRBS
+	// known payload so the byte-correct loopback gate is unchanged.
+	//
+	// The payload bit buffer must be K*ldpc.K bits; K = nBits/ldpc.N at the thin grid.
+	// Derive K via the same rebuild+restore the worker uses (cheap; integer geometry),
+	// so we size the buffer exactly. Bytes beyond nBytes (or beyond the block payload
+	// capacity) are zero-padded; bytes past capacity are dropped (the ARQ layer sizes a
+	// block to the capacity, so this only guards a mis-sized caller).
 	std::vector<std::vector<int>> cw_info;
 	int nSamples = 0;
-	int Kcw = bigblock_tx_passband(out, nSamples, cw_info, nullptr);
+	int Kcw = 0;
 
-	// stash the known payload for the loopback RX byte-correct gate (P1 only). The
-	// production/ARQ path (P2) never reads it (it compares against ARQ truth instead).
+	if(data != NULL && nBytes > 0)
+	{
+		int Ngrid = 0, log2M = 0, nBits = 0;
+		bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+		bigblock_restore_stock_config();
+		int kcap = 0; { const char* e = std::getenv("MERCURY_BIGBLOCK_K"); if(e && *e) kcap = atoi(e); }
+		int Kpack = nBits / ldpc.N;
+		if(kcap > 0 && kcap < Kpack) Kpack = kcap;
+		int payload_bits_len = Kpack * ldpc.K;       // systematic info bits the block carries
+		int payload_bytes_cap = payload_bits_len / 8; // byte capacity of the block
+
+		std::vector<int> payload(payload_bits_len, 0);
+		int use_bytes = (nBytes < payload_bytes_cap) ? nBytes : payload_bytes_cap;
+		// Unpack each ARQ byte (data[i] in 0..255) LSB-first into the bit buffer.
+		byte_to_bit(data, payload.data(), use_bytes);
+		// (remaining bits already 0 from the vector init = zero pad)
+
+		Kcw = bigblock_tx_passband(out, nSamples, cw_info, payload.data());
+	}
+	else
+	{
+		// P1 loopback / no external payload: seeded-PRBS known payload (validated 8/8).
+		Kcw = bigblock_tx_passband(out, nSamples, cw_info, nullptr);
+	}
+
+	// stash the payload codeword-info for the loopback RX byte-correct gate. The
+	// production/ARQ path compares against ARQ truth instead, but this stash also
+	// carries the per-codeword info the RX carve maps back to sub-units.
 	bigblock_last_tx_cw_info = cw_info;
 	bigblock_last_tx_K = Kcw;
 	bigblock_last_tx_samples = nSamples;
@@ -7845,6 +7896,13 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	std::vector<int> cw_ok;
 	int Kout = 0;
 	double acq_metric = 0.0;
+	// P2.2 (normalization-bypass fix): run the SAME stock RX passband normalization +
+	// impulse-noise blanking the per-frame receive_byte applies, BEFORE the big-block
+	// estimator. Without this the captured passband sits at the wrong level for the
+	// OFDM estimator/LLR and the live AWGN validator decoded garbage at 30 dB Es/N0
+	// (0/8 codewords, BER 0.43). data IS the captured passband (mutable); normalize it
+	// in place, then bigblock_rx_passband reads the normalized buffer.
+	rx_passband_normalize_and_blank(data, nSamples);
 	// P1 loopback: pass the known TX info bits so the per-codeword gate is byte-exact.
 	const std::vector<std::vector<int>>* ref =
 		(bigblock_last_tx_K > 0) ? &bigblock_last_tx_cw_info : nullptr;

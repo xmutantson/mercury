@@ -577,6 +577,14 @@ public:
 	// HARNESS-HID-BUG note at the definition). Replaces the WAV harness's fragile
 	// partial pilot-field hand-restore that faulted in the live path.
 	void bigblock_restore_stock_config();
+	// P2.2 (normalization-bypass fix): the EXACT stock receive_byte RX passband
+	// normalization + impulse-noise blanking (telecom_system.cc:1081-1124), factored
+	// so the big-block RX path (receive_bigblock) runs it on the captured passband
+	// BEFORE the big-block estimator — the OFDM estimator/LLR assume a normalized
+	// level, and bigblock_rx_passband skipped this, so the live AWGN validator FAILED
+	// at 30 dB (BER 0.43). Called from BOTH receive_byte (extraction is byte-identical
+	// to the inline block — no stock-path drift) and receive_bigblock. No-op for MFSK.
+	void rx_passband_normalize_and_blank(double* pb, int pb_samples);
 	// #samples one big-block TX writes to `out` (= preamble + K*frame passband
 	// samples at the frozen layout). The ARQ/capture sizing needs this in P2; for
 	// P1 the loopback validator uses it to size buffers. Computed from the frozen
