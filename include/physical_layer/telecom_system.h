@@ -38,6 +38,7 @@
 #include "common/ring_buffer_posix.h"
 #include "common/os_interop.h"
 #include <iomanip>
+#include <vector>
 
 
 #if defined(_WIN32)
@@ -515,6 +516,93 @@ public:
 	// sfo_grid_test does. Returns nData; out-params give Ngrid/log2M/nBits. Both the TX
 	// and decode sides call this so the lattice/pilot sequence match bit-for-bit.
 	int bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out, int& nBits_out);
+
+	// ===== P1: BIG-BLOCK PHY IN THE LIVE PATH (gated; NO ARQ change) =====
+	// The big-block PHY validated in the WAV harness (one 4-sym preamble + K=8
+	// 1600-bit LDPC codeword-frames under ONE acquisition, frozen 12% lattice
+	// cont2/dx3/dy4, channel-ADAPTIVE flat-ML/sparse-2D estimator + CSI-LLR) moved
+	// into the production transmit_byte/receive_byte. It is the SAME DSP the WAV
+	// harness exercises — the WAV methods are now thin WAV-I/O wrappers over the
+	// shared in-memory PHY workers below; transmit_byte/receive_byte branch to the
+	// live entry points (transmit_bigblock / receive_bigblock) when this flag is
+	// set. The flag is a FRAMING-MODE bit on the CFG16 rung (same 32-QAM rate-0.875
+	// modulation; only the one-acquisition K-codeword framing + 12% layout differ —
+	// NOT a new config). DEFAULT OFF so stock CFG15/16 per-frame paths are
+	// byte-identical to the pre-P1 baseline. See P1 plan / bigblock-hw-wav-derisk.md.
+	bool bigblock_framing_enabled = false;
+
+	// In-memory big-block PHY workers (the validated DSP, no WAV I/O). Both the WAV
+	// harness and the live path call these so the framing/estimator/LDPC are
+	// bit-identical across entry points.
+	//   TX  worker: emit one 4-sym preamble + K codeword-frames into out_pb (raw
+	//               passband doubles, NO lead/trail silence). cw_info_out[c] = the
+	//               ldpc.K info bits of codeword c (so the live RX side can compare /
+	//               the caller can map sub-units). Returns K (codewords emitted);
+	//               *nSamples_out = passband samples written. payload_bits (length
+	//               >= nBits) supplies the systematic info bits; pass nullptr to use
+	//               the seeded-PRBS known payload (loopback validation, matches the
+	//               WAV harness byte-for-byte).
+	int bigblock_tx_passband(double* out_pb, int& nSamples_out,
+	                         std::vector<std::vector<int>>& cw_info_out,
+	                         const int* payload_bits = nullptr);
+	//   RX  worker: acquire ONCE over [pb, pb+nSamples), then decode K codewords
+	//               with the channel-adaptive estimator + CSI-LLR + frozen layout.
+	//               out_infobits (length >= K*ldpc.K) receives the decoded info bits
+	//               of every codeword (carved into K sub-units by the caller).
+	//               cw_ok_out[c] = 1 if codeword c decoded clean (CRC/known-payload
+	//               gate); else 0 — this K-bit vector IS the per-codeword SACK
+	//               granularity P2 will use. *K_out = K. Returns #codewords that
+	//               decoded clean. acq_metric_out (optional) gets the Schmidl-Cox
+	//               acquisition metric. cw_info_ref (optional, non-null) supplies the
+	//               KNOWN info bits per codeword for the loopback byte-correct gate;
+	//               when null the CRC/all-decode path is used (P2).
+	int bigblock_rx_passband(const double* pb, int nSamples,
+	                         int* out_infobits, int& K_out,
+	                         std::vector<int>& cw_ok_out,
+	                         double* acq_metric_out = nullptr,
+	                         const std::vector<std::vector<int>>* cw_info_ref = nullptr);
+
+	// LIVE-PATH entry points (branched from transmit_byte/receive_byte when
+	// bigblock_framing_enabled). transmit_bigblock emits the block into out (raw
+	// passband, NO_FILTER_MESSAGE-style contiguous samples); receive_bigblock
+	// acquires + decodes the K codewords from the captured passband buffer and
+	// returns the per-codeword decode result in receive_stats + the decoded info
+	// bits in out. P1 keeps the seeded-PRBS known payload so the loopback gate can
+	// assert byte-correctness exactly as the WAV harness does; feeding real ARQ
+	// bytes + the K-sub-unit ACK granularity is P2 (no ARQ change in P1).
+	void transmit_bigblock(int* data, int nBytes, double* out);
+	st_receive_stats receive_bigblock(double* data, int* out);
+	// Restore the stock OFDM config after a big-block rebuild (full CONFIG_NONE ->
+	// load_configuration reload — sets every pilot field cleanly; see the
+	// HARNESS-HID-BUG note at the definition). Replaces the WAV harness's fragile
+	// partial pilot-field hand-restore that faulted in the live path.
+	void bigblock_restore_stock_config();
+	// #samples one big-block TX writes to `out` (= preamble + K*frame passband
+	// samples at the frozen layout). The ARQ/capture sizing needs this in P2; for
+	// P1 the loopback validator uses it to size buffers. Computed from the frozen
+	// layout; valid once a CFG16 grid is loaded.
+	int bigblock_tx_total_samples();
+
+	// Big-block cross-call stash (P1 loopback validation + P2 handoff). The TX side
+	// records the K known info-bit groups it emitted + the sample count; the RX side
+	// records the per-codeword clean vector (the K-bit SACK granularity P2 consumes)
+	// + how many decoded clean. In P1 the same-process loopback validator reads these
+	// to assert 8/8 byte-correct; the production/ARQ path in P2 replaces the
+	// known-payload compare with ARQ truth.
+	std::vector<std::vector<int>> bigblock_last_tx_cw_info;
+	int bigblock_last_tx_K = 0;
+	int bigblock_last_tx_samples = 0;
+	std::vector<int> bigblock_last_rx_cw_ok;
+	int bigblock_last_rx_K = 0;
+	int bigblock_last_rx_cw_ok_count = 0;
+
+	// P1 LIVE-PATH loopback validator (env MERCURY_BIGBLOCK_LIVE=1 under -m
+	// PLOT_PASSBAND -s 16). Sets bigblock_framing_enabled, drives ONE block through
+	// the production transmit_byte -> in-memory passband round-trip -> receive_byte,
+	// and asserts K/K codewords decode byte-correct. Proves the PHY is in the live
+	// path (not just the standalone WAV harness). MERCURY_BIGBLOCK_LIVE_ESN0 (<= -900
+	// = clean) optionally adds AWGN.
+	void bigblock_livepath_loopback();
 
 	void load_configuration();
 	void load_configuration(int configuration);

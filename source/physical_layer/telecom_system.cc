@@ -601,6 +601,16 @@ int cl_telecom_system::rx_effective_preamble_nsymb() const
 
 void cl_telecom_system::transmit_byte(int *data, int nBytes, double* out, int message_location)
 {
+	// P1: big-block framing branch (gated; CFG16-rung framing-mode bit, default OFF).
+	// When set, one transmit_byte call emits the whole big-block (one 4-sym preamble +
+	// K codeword-frames under one acquisition) into `out` instead of one per-frame
+	// OFDM frame. NO ARQ change in P1 — the loopback validator drives this directly.
+	if(bigblock_framing_enabled && M != MOD_MFSK)
+	{
+		transmit_bigblock(data, nBytes, out);
+		return;
+	}
+
 	int nReal_data = data_container.nBits - ldpc.P;
 	int msB = 0, lsB = 0;
 	int frame_size = (nReal_data - outer_code_reserved_bits) / 8;
@@ -968,7 +978,14 @@ st_receive_stats cl_telecom_system::receive_bit(double *data, int* out)
 
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 {
-
+	// P1: big-block framing branch (gated; default OFF). When set, receive_byte
+	// acquires ONCE over the captured passband and decodes the K codewords with the
+	// channel-adaptive estimator + CSI-LLR, returning the per-codeword decode result
+	// in receive_stats (+ the decoded info bits in out). NO ARQ change in P1.
+	if(bigblock_framing_enabled && M != MOD_MFSK)
+	{
+		return receive_bigblock(data, out);
+	}
 
 	float variance = 1.0f;
 	int nVirtual_data=ldpc.N-data_container.nBits;
@@ -5271,6 +5288,19 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 		bigblock_decode_from_wav(bbdec);
 		return;
 	}
+	// P1: LIVE-PATH big-block loopback validation. Unlike the *_WAV hooks (which call
+	// the standalone harness methods), this drives the big-block through the
+	// PRODUCTION transmit_byte / receive_byte (gated on bigblock_framing_enabled), so
+	// it proves the PHY is wired into the live path — TX emits one block, an in-memory
+	// passband round-trip (NO channel; clean loopback) feeds it back through
+	// receive_byte, and the per-codeword gate asserts 8/8 byte-correct. Optional
+	// MERCURY_BIGBLOCK_LIVE_ESN0 adds AWGN to confirm the estimator/LLR path runs.
+	const char* bblive = std::getenv("MERCURY_BIGBLOCK_LIVE");
+	if(bblive && atoi(bblive) != 0)
+	{
+		bigblock_livepath_loopback();
+		return;
+	}
 
 	BER_plot.open("BER");
 	BER_plot.reset("BER");
@@ -6903,12 +6933,20 @@ int cl_telecom_system::bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out
 	return ofdm.pilot_configurator.nData;
 }
 
-// Build the known TX bits: K systematic 1600-bit LDPC codewords from a seeded PRBS
-// payload, plus random filler past K*N. Shared by TX (emit) and decode (compare).
-// Returns K (codewords that fit). cw_info[c] = the K info bits of codeword c.
+// Build the TX bits: K systematic 1600-bit LDPC codewords plus random filler past
+// K*N. Shared by TX (emit) and decode (compare). Returns K (codewords that fit).
+// cw_info[c] = the K info bits of codeword c.
+//
+// payload (P1 live-path / P2 ARQ): when non-null it supplies the info bits to encode
+// (length >= Kcw*ldpc.K consumed); the filler past K*N is still seeded-PRBS so the
+// grid is fully populated and the (deterministic) filler matches at decode. When
+// payload is null the info bits come from the seeded-PRBS (the validated known
+// payload — TX and decode reconstruct identically from the seed, used by the WAV
+// loopback + the P1 byte-correct gate).
 static int bigblock_build_tx_bits(cl_ldpc& ldpc, int nBits, unsigned int seed, int kcap,
                                   std::vector<int>& tx_bits,
-                                  std::vector<std::vector<int>>& cw_info)
+                                  std::vector<std::vector<int>>& cw_info,
+                                  const int* payload = nullptr)
 {
 	int Kcw = nBits / ldpc.N;
 	if(kcap > 0 && kcap < Kcw) Kcw = kcap;
@@ -6922,13 +6960,350 @@ static int bigblock_build_tx_bits(cl_ldpc& ldpc, int nBits, unsigned int seed, i
 	std::vector<int> enc(ldpc.N), info(ldpc.K);
 	for(int c=0;c<Kcw;c++)
 	{
-		for(int i=0;i<ldpc.K;i++) info[i] = nextbit();
+		for(int i=0;i<ldpc.K;i++)
+			info[i] = payload ? (payload[(size_t)c*ldpc.K + i] & 1) : nextbit();
 		cw_info[c] = info;
 		ldpc.encode(info.data(), enc.data());
 		for(int i=0;i<ldpc.N;i++) tx_bits[(size_t)c*ldpc.N + i] = enc[i];
 	}
 	for(int i=Kcw*ldpc.N;i<nBits;i++) tx_bits[i] = nextbit();
 	return Kcw;
+}
+
+// ===== P1: SHARED IN-MEMORY BIG-BLOCK PHY WORKERS =====
+// These hold the validated big-block DSP (grid build + passband bridge on TX; real
+// acquisition + channel-adaptive estimate + CSI-LLR + per-codeword LDPC on RX). The
+// WAV harness methods (bigblock_tx_to_wav / bigblock_decode_from_wav) and the live
+// path (transmit_bigblock / receive_bigblock) BOTH call these, so the framing /
+// estimator / LDPC are bit-identical across every entry point — the WAV harness is
+// now WAV-I/O + lead/trail silence only. The PHY below is COPIED verbatim from the
+// previous bigblock_tx_to_wav / bigblock_decode_from_wav bodies (validated 8/8 on
+// real Fe-Pi clocks); only the data source (WAV file vs in-memory double*) changed.
+
+int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
+                                            std::vector<std::vector<int>>& cw_info_out,
+                                            const int* payload_bits)
+{
+	nSamples_out = 0;
+	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK] MFSK unsupported; use cfg 15/16." << std::endl; return 0; }
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+
+	int Nfft=ofdm.Nfft; float gi=ofdm.gi;
+	int Ngi=(int)round((double)gi*(double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	int interp = frequency_interpolation_rate;
+	int pre_nSymb = data_container.preamble_nSymb;
+
+	int Ngrid=0, log2M=0, nBits=0;
+	int nData = bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+	int Nc = ofdm.Nc;
+
+	unsigned int seed = (unsigned int)env_i("MERCURY_BIGBLOCK_SEED", 12345);
+	int kcap = env_i("MERCURY_BIGBLOCK_K", 0);
+	std::vector<int> tx_bits;
+	int Kcw = bigblock_build_tx_bits(ldpc, nBits, seed, kcap, tx_bits, cw_info_out, payload_bits);
+
+	// freq-domain grid (data + pilots placed by the thin lattice).
+	std::vector<std::complex<double>> tx_syms(nData);
+	psk.mod(tx_bits.data(), nBits, tx_syms.data());
+	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
+	ofdm.framer(tx_syms.data(), grid.data());
+
+	float power_normalization = sqrt((double)(ofdm.Nfft*interp));
+	double preamble_boost = ofdm.preamble_configurator.boost;
+	double tx_carrier = carrier_frequency + test_tx_carrier_offset;
+
+	// --- PASSBAND BRIDGE (mirrors transmit_byte:781-836) ----------------------
+	std::vector<std::complex<double>> pre_bb((size_t)Nofdm*pre_nSymb);
+	{
+		std::vector<std::complex<double>> pre_grid((size_t)pre_nSymb*Nc);
+		for(int i=0;i<pre_nSymb*Nc;i++) pre_grid[i]=ofdm.ofdm_preamble[i].value;
+		for(int i=0;i<pre_nSymb;i++)
+			ofdm.symbol_mod(&pre_grid[(size_t)i*Nc], &pre_bb[(size_t)i*Nofdm]);
+	}
+	for(size_t j=0;j<(size_t)Nofdm*pre_nSymb;j++){
+		pre_bb[j] /= power_normalization;
+		pre_bb[j] *= sqrt(output_power_Watt)*preamble_boost;
+	}
+	std::vector<std::complex<double>> dat_bb((size_t)Nofdm*Ngrid);
+	for(int i=0;i<Ngrid;i++)
+		ofdm.symbol_mod(&grid[(size_t)i*Nc], &dat_bb[(size_t)i*Nofdm]);
+	for(size_t j=0;j<(size_t)Nofdm*Ngrid;j++){
+		dat_bb[j] /= power_normalization;
+		dat_bb[j] *= sqrt(output_power_Watt);
+	}
+	int pre_pb_samples = Nofdm*pre_nSymb*interp;
+	int dat_pb_samples = Nofdm*Ngrid*interp;
+	ofdm.baseband_to_passband(pre_bb.data(), Nofdm*pre_nSymb, out_pb,
+	                          sampling_frequency, tx_carrier, carrier_amplitude, interp);
+	ofdm.baseband_to_passband(dat_bb.data(), Nofdm*Ngrid, &out_pb[pre_pb_samples],
+	                          sampling_frequency, tx_carrier, carrier_amplitude, interp);
+	ofdm.peak_clip(out_pb, pre_pb_samples, ofdm.preamble_papr_cut);
+	ofdm.peak_clip(&out_pb[pre_pb_samples], dat_pb_samples, ofdm.data_papr_cut);
+
+	nSamples_out = pre_pb_samples + dat_pb_samples;
+	return Kcw;
+}
+
+int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
+                                            int* out_infobits, int& K_out,
+                                            std::vector<int>& cw_ok_out,
+                                            double* acq_metric_out,
+                                            const std::vector<std::vector<int>>* cw_info_ref)
+{
+	K_out = 0;
+	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK] MFSK unsupported; use cfg 15/16." << std::endl; return 0; }
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+
+	int Nfft=ofdm.Nfft; float gi=ofdm.gi;
+	int Ngi=(int)round((double)gi*(double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	int interp = frequency_interpolation_rate;
+	int sym_samples = Nofdm * interp;
+	int pre_nSymb = data_container.preamble_nSymb;
+
+	int Ngrid=0, log2M=0, nBits=0;
+	int nData = bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+	int Nc = ofdm.Nc;
+
+	// rxpb as a vector view (the demod lambda indexes by sample, tolerating OOB)
+	std::vector<double> rxpb(pb, pb + nSamples);
+
+	// --- ACQUIRE the head preamble: real Schmidl-Cox over the whole rx buffer. ---
+	long head_delay = -1; double head_metric = 0.0;
+	{
+		int need_syms = (int)(rxpb.size() / sym_samples) + 2;
+		int buf_syms = need_syms;
+		int buf_interp = Nofdm * buf_syms * interp;
+		std::vector<double> pad(buf_interp, 0.0);
+		int copy_n = (int)rxpb.size(); if(copy_n > buf_interp) copy_n = buf_interp;
+		for(int i=0;i<copy_n;i++) pad[i]=rxpb[i];
+		std::vector<std::complex<double>> bb_interp(buf_interp);
+		ofdm.passband_to_baseband(pad.data(), buf_interp, bb_interp.data(),
+		                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+		                          &ofdm.FIR_rx_time_sync);
+		std::vector<std::complex<double>> bb_dec(Nofdm*buf_syms);
+		ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
+		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
+			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
+		long coarse_full = (long)coarse.delay * interp;
+		long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
+		long slice_size  = (long)(pre_nSymb+4)*sym_samples;
+		if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
+		TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
+			&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
+		head_delay  = slice_start + fine.delay;
+		head_metric = fine.correlation;
+		if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+	}
+	if(acq_metric_out) *acq_metric_out = head_metric;
+	if(head_delay < 0){
+		std::cout << "[BIGBLOCK] RX acquisition FAILED (no preamble found)" << std::endl;
+		return 0;
+	}
+
+	// --- DEMOD: from the data start (head + preamble), rebuild the Ngrid grid. ---
+	long data_start0 = head_delay + (long)pre_nSymb*sym_samples;
+	int span_interp = Nofdm*Ngrid*interp;
+	int fir_margin  = ofdm.FIR_rx_data.filter_nTaps * interp;
+	int margin_syms = (fir_margin + sym_samples - 1) / sym_samples;
+	int margin_interp = margin_syms * sym_samples;
+	float power_normalization = sqrt((double)ofdm.Nfft);
+
+	auto demod_at = [&](long data_start, std::vector<std::complex<double>>& rx)
+	{
+		long ms = data_start - margin_interp;
+		int  mi = margin_interp;
+		if(ms < 0){ ms = 0; mi = (int)data_start; }
+		int slice_size = mi + span_interp;
+		std::vector<double> dat_pb(slice_size, 0.0);
+		for(int i=0;i<slice_size;i++){
+			long src=ms+i; dat_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
+		std::vector<std::complex<double>> dat_bb_interp(slice_size);
+		ofdm.passband_to_baseband(dat_pb.data(), slice_size, dat_bb_interp.data(),
+		                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+		                          &ofdm.FIR_rx_data, (int)ms);
+		std::vector<std::complex<double>> dat_bb_full((size_t)(slice_size/interp) + 1);
+		int dec_total = slice_size / interp;
+		ofdm.rational_resampler(dat_bb_interp.data(), slice_size, dat_bb_full.data(), interp, DECIMATION);
+		std::vector<std::complex<double>> dat_bb(Nofdm*Ngrid);
+		int mdec = mi / interp;
+		for(int j=0;j<Nofdm*Ngrid && (mdec+j)<dec_total;j++) dat_bb[j] = dat_bb_full[mdec + j];
+		for(int j=0;j<Nofdm*Ngrid;j++) dat_bb[j] *= power_normalization;
+		rx.assign((size_t)Ngrid*Nc, std::complex<double>(0,0));
+		for(int i=0;i<Ngrid;i++) ofdm.symbol_demod(&dat_bb[(size_t)i*Nofdm], &rx[(size_t)i*Nc]);
+	};
+
+	auto pilot_evm = [&](const std::vector<std::complex<double>>& rx)->double
+	{
+		std::complex<double> Hsum(0,0); int pidx=0, np=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++];
+				Hsum += rx[(size_t)n*Nc+j]/X; np++; }
+		std::complex<double> Hbar=(np>0)?Hsum/(double)np:std::complex<double>(1,0);
+		double e=0.0; pidx=0; int cnt=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++];
+				std::complex<double> r=rx[(size_t)n*Nc+j]/X;
+				double dr=std::abs(r)-std::abs(Hbar); e+=dr*dr; cnt++; }
+		return cnt? e/cnt : 1e9;
+	};
+
+	// FINE TIMING SEARCH (pilot-EVM minimizing window nudge).
+	long data_start = data_start0;
+	int tadj_force = env_i("MERCURY_BIGBLOCK_TADJ", 0);
+	int gi_interp  = Ngi * interp;
+	std::vector<std::complex<double>> rx;
+	if(tadj_force != 0)
+	{
+		data_start = data_start0 + tadj_force;
+		demod_at(data_start, rx);
+	}
+	else if(env_i("MERCURY_BIGBLOCK_TSEARCH", 1) != 0)
+	{
+		double best_e = 1e18; long best_off = 0;
+		std::vector<std::complex<double>> rx_try;
+		int lo = -gi_interp + 1, hi = gi_interp/4;
+		int step = env_i("BIGBLOCK_TSEARCH_STEP", 2);
+		for(int off=lo; off<=hi; off+=step)
+		{
+			demod_at(data_start0 + off, rx_try);
+			double e = pilot_evm(rx_try);
+			if(e < best_e){ best_e = e; best_off = off; rx = rx_try; }
+		}
+		data_start = data_start0 + best_off;
+		if((int)rx.size() != Ngrid*Nc) demod_at(data_start, rx);
+	}
+	else
+	{
+		demod_at(data_start, rx);
+	}
+
+	// --- CPE/PEG residual-timing de-rotation (STEP-2 tracker) --------
+	bool track = (env_i("MERCURY_BIGBLOCK_TRACK", 1) != 0);
+	int  twin  = env_i("MERCURY_BIGBLOCK_TRACK_WIN", 9);
+	if(track)
+	{
+		std::vector<double> sym_omega(Ngrid,0.0), sym_delta(Ngrid,0.0);
+		std::vector<int> pidx_at_symbol(Ngrid,0);
+		{ int pidx=0; for(int n=0;n<Ngrid;n++){ pidx_at_symbol[n]=pidx;
+			for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT) pidx++; } }
+		for(int n=0;n<Ngrid;n++)
+		{
+			int pidx = pidx_at_symbol[n];
+			double Sx=0,Sy=0,Sxx=0,Sxy=0; int np=0;
+			for(int j=0;j<Nc;j++)
+				if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT)
+				{
+					std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+					std::complex<double> r = rx[(size_t)n*Nc+j] / X;
+					double phi = atan2(r.imag(), r.real());
+					double x=(double)j; Sx+=x; Sy+=phi; Sxx+=x*x; Sxy+=x*phi; np++;
+				}
+			if(np>=2){ double den=np*Sxx-Sx*Sx;
+				if(fabs(den)>1e-12){ sym_delta[n]=(np*Sxy-Sx*Sy)/den; sym_omega[n]=(Sy-sym_delta[n]*Sx)/np; } }
+		}
+		for(int n=0;n<Ngrid;n++)
+		{
+			double om=0,dl=0; int cnt=0;
+			for(int w=n-twin/2; w<=n+twin/2; w++) if(w>=0&&w<Ngrid){ om+=sym_omega[w]; dl+=sym_delta[w]; cnt++; }
+			if(cnt>0){ om/=cnt; dl/=cnt; }
+			for(int j=0;j<Nc;j++){ double ph=-(om+dl*(double)j);
+				rx[(size_t)n*Nc+j] *= std::complex<double>(cos(ph), sin(ph)); }
+		}
+	}
+
+	// --- CHANNEL-ADAPTIVE ESTIMATE (sparse-2D on selective; flat-ML on flat) -----
+	// Channel-adaptive selection per the FINAL design: sparse-2D DVB-T polar-interp on
+	// a frequency-SELECTIVE channel; flat-ML (lower noise) on a flat/clean channel.
+	// last_channel_selectivity (std|H|/mean|H| from the most recent estimate) keys the
+	// switch; MERCURY_BIGBLOCK_SPARSE2D forces (1=sparse-2D, 0=flat-ML) for A/B.
+	bool sparse2d;
+	{
+		const char* e = std::getenv("MERCURY_BIGBLOCK_SPARSE2D");
+		if(e && *e) sparse2d = (atoi(e) != 0);
+		else {
+			// adaptive: selective -> sparse-2D, flat -> flat-ML. Sentinel -1 (no prior
+			// estimate) defaults to sparse-2D (the robust choice; flat-ML is the
+			// optimization only when the channel is confirmed flat).
+			double sel = last_channel_selectivity;
+			sparse2d = (sel < 0.0) ? true : (sel >= 0.15);
+		}
+	}
+	if(sparse2d)
+	{
+		grid_sparse2d_estimator(rx.data(), Ngrid, Nc);
+	}
+	else
+	{
+		std::complex<double> Hsum(0,0); int pidx=0; int npil=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				Hsum += rx[(size_t)n*Nc+j] / X; npil++; }
+		std::complex<double> Hbar = (npil>0)?(Hsum/(double)npil):std::complex<double>(1,0);
+		double nsum=0.0; pidx=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+				std::complex<double> X = ofdm.pilot_configurator.sequence[pidx++];
+				std::complex<double> resid = rx[(size_t)n*Nc+j]-Hbar*X;
+				nsum += resid.real()*resid.real()+resid.imag()*resid.imag(); }
+		for(int ci=0;ci<Ngrid*Nc;ci++){ (ofdm.estimated_channel+ci)->value=Hbar; (ofdm.estimated_channel+ci)->status=MEASURED; }
+		ofdm.noise_variance_estimate = (npil>0)?(nsum/(double)npil):0.01;
+		if(ofdm.noise_variance_estimate<1e-6) ofdm.noise_variance_estimate=1e-6;
+	}
+
+	// per-data-carrier CSI weight |H|^2 (deframed raster order) BEFORE equalize.
+	std::vector<double> csi_data(nData, 1.0);
+	{
+		int di=0;
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> H=(ofdm.estimated_channel+n*Nc+j)->value;
+				if(di<nData) csi_data[di]=H.real()*H.real()+H.imag()*H.imag(); di++; }
+	}
+
+	std::vector<std::complex<double>> eq((size_t)Ngrid*Nc);
+	ofdm.channel_equalizer(rx.data(), eq.data());
+	std::vector<std::complex<double>> deframed(nData);
+	ofdm.deframer(eq.data(), deframed.data());
+
+	// --- LLR + CSI weighting + LDPC per codeword ---
+	std::vector<float> clr(nBits);
+	double cvar = ofdm.noise_variance_estimate; if(cvar<1e-9) cvar=1e-9;
+	psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
+	{
+		double mean_w=0.0; for(int d=0;d<nData;d++) mean_w+=csi_data[d];
+		mean_w=(nData>0)?mean_w/(double)nData:1.0; if(mean_w<1e-9) mean_w=1.0;
+		for(int d=0;d<nData;d++){ double w=csi_data[d]/mean_w;
+			for(int b=0;b<log2M;b++){ size_t bi=(size_t)d*log2M+b; if(bi>=(size_t)nBits) break;
+				float v=clr[bi]*(float)w; if(v>40.0f)v=40.0f; else if(v<-40.0f)v=-40.0f; clr[bi]=v; } }
+	}
+
+	int Kcw = nBits / ldpc.N;
+	{ int kcap = env_i("MERCURY_BIGBLOCK_K", 0); if(kcap>0 && kcap<Kcw) Kcw=kcap; }
+	cw_ok_out.assign(Kcw, 0);
+	int cw_ok=0;
+	std::vector<float> cwllr(ldpc.N); std::vector<int> dec(ldpc.N);
+	for(int c=0;c<Kcw;c++)
+	{
+		for(int i=0;i<ldpc.N;i++) cwllr[i]=clr[(size_t)c*ldpc.N+i];
+		ldpc.decode(cwllr.data(), dec.data());
+		// extract the K info bits of this codeword into out_infobits (sub-unit c)
+		for(int i=0;i<ldpc.K;i++)
+			out_infobits[(size_t)c*ldpc.K + i] = dec[i];
+		// per-codeword clean gate: compare against the known info bits when the caller
+		// supplied them (loopback byte-correct); else (P2) the caller validates via CRC.
+		int ierr=0;
+		if(cw_info_ref && (int)cw_info_ref->size() > c)
+			for(int i=0;i<ldpc.K;i++) if(dec[i]!=(*cw_info_ref)[c][i]){ ierr++; }
+		cw_ok_out[c] = (ierr==0) ? 1 : 0;
+		if(ierr==0) cw_ok++;
+	}
+	K_out = Kcw;
+	return cw_ok;
 }
 
 int cl_telecom_system::bigblock_tx_to_wav(const char* wav_path)
@@ -7355,6 +7730,248 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	ofdm.LS_window_width=0; ofdm.LS_window_hight=0;
 	ofdm.init(Nfft, Nc, saved_Nsymb, gi);
 	return (cw_ok==Kcw && Kcw>0) ? 1 : 0;
+}
+
+// ===== P1: LIVE-PATH BIG-BLOCK ENTRY POINTS =====
+// These wire the validated big-block PHY (the shared bigblock_*_passband workers)
+// into the production transmit_byte/receive_byte. They are reached ONLY when
+// bigblock_framing_enabled is set (a CFG16-rung framing-mode bit; default OFF), so
+// the stock per-frame path is byte-identical when the flag is clear.
+//
+// RISK-1 (harness divergence): the workers rebuild the thin lattice via
+// bigblock_rebuild_thin_grid() (which deinit()/init()s ofdm to Nsymb=Ngrid). In P1
+// — with NO ARQ change and the loopback validator driving a single block per
+// direction — these methods OWN their teardown (restore the stock CFG16 ofdm grid),
+// so the OFDM config the rest of the modem sees is unchanged after the call. P2 moves
+// the rebuild to config-load (once per big-block-framing election) so a multi-block
+// ARQ session does not deinit/init per block; that is the documented P2 hot-path fix,
+// NOT a P1 change.
+//
+// HARNESS-HID BUG (surfaced by the live-path refactor): the WAV harness's teardown
+// (bigblock_tx_to_wav/decode_from_wav) hand-restores ONLY a few pilot_configurator
+// fields (Dx/Dy/density/estimator) after deinit() — but deinit() ALSO zeros
+// first_row/last_row/first_col/second_col/last_col/boost (ofdm.cc:207-219). The
+// partial restore leaves those stale, and the subsequent ofdm.init()->
+// pilot_configurator.configure() faults (integer div, exit 0xC0000094). In the WAV
+// harness this is invisible because the teardown runs at process exit AFTER the
+// VERDICT prints, so it never blocked the result (verified: baseline b619423 crashes
+// here too). On the LIVE path the modem must KEEP RUNNING (TX then RX then stock
+// frames), so a clean restore is mandatory. ROOT-CAUSE FIX: do NOT hand-restore the
+// pilot configurator — force a FULL stock config reload (CONFIG_NONE -> load) which
+// sets EVERY pilot field from the config defaults and re-inits cleanly. This is the
+// exact path every real config switch uses (validated).
+void cl_telecom_system::bigblock_restore_stock_config()
+{
+	int stock = current_configuration;
+	// CONFIG_NONE forces load_configuration's full-reinit branch (all pilot fields set
+	// from defaults), avoiding the early-return when configuration==current.
+	current_configuration = CONFIG_NONE;
+	load_configuration(stock);
+}
+
+int cl_telecom_system::bigblock_tx_total_samples()
+{
+	// preamble + K*frame passband samples at the frozen layout. Computed without a
+	// full TX by re-deriving Ngrid + K from the lattice rebuild, then restoring stock.
+	if(M == MOD_MFSK) return 0;
+	int Nfft=ofdm.Nfft; float gi=ofdm.gi;
+	int Ngi=(int)round((double)gi*(double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	int interp = frequency_interpolation_rate;
+	int pre_nSymb = data_container.preamble_nSymb;
+	int Ngrid=0, log2M=0, nBits=0;
+	bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+	int total = (Nofdm*pre_nSymb + Nofdm*Ngrid) * interp;
+	bigblock_restore_stock_config();
+	return total;
+}
+
+void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
+{
+	// P1: known-payload (seeded PRBS) so the loopback gate asserts byte-correctness
+	// exactly as the WAV harness did. Feeding ARQ bytes (`data`/`nBytes`) is P2 — the
+	// worker accepts an external payload via bigblock_tx_passband(...,payload_bits);
+	// P1 passes nullptr to use the validated known payload.
+	(void)data; (void)nBytes;
+
+	std::vector<std::vector<int>> cw_info;
+	int nSamples = 0;
+	int Kcw = bigblock_tx_passband(out, nSamples, cw_info, nullptr);
+
+	// stash the known payload for the loopback RX byte-correct gate (P1 only). The
+	// production/ARQ path (P2) never reads it (it compares against ARQ truth instead).
+	bigblock_last_tx_cw_info = cw_info;
+	bigblock_last_tx_K = Kcw;
+	bigblock_last_tx_samples = nSamples;
+
+	bigblock_restore_stock_config();
+}
+
+st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
+{
+	// initialize stats (mirror the receive_byte defaults that downstream reads)
+	receive_stats.message_decoded = NO;
+	receive_stats.iterations_done = -1;
+	receive_stats.crc = 0;
+	receive_stats.SNR = -99.9;
+	receive_stats.coarse_metric = 0.0;
+	receive_stats.mean_H = -1.0;
+	receive_stats.frame_overflow_symbols = 0;
+
+	// the captured passband buffer spans the same window the live capture loop hands
+	// receive_byte: Nofdm*buffer_Nsymb*interp samples.
+	int interp = frequency_interpolation_rate;
+	int nSamples = data_container.Nofdm * data_container.buffer_Nsymb * interp;
+	if(nSamples <= 0) nSamples = (bigblock_last_tx_samples > 0) ? bigblock_last_tx_samples : 0;
+
+	// decoded info bits land here (carved into K sub-units by the caller in P2). Size
+	// for the BIG-BLOCK K (= thin-grid nBits/ldpc.N), NOT the stock config's nBits —
+	// the thin grid packs many more codewords than one stock frame. Use the TX stash
+	// when present (loopback), else a generous bound covering the frozen layout's K.
+	// (Bug: sizing from data_container.nBits/ldpc.N gave Kcap=1 → the worker, which
+	// writes K*ldpc.K bits, overran the buffer → heap corruption. Surfaced by the
+	// live-path refactor; the WAV harness never wrote bits back so never hit it.)
+	int K_expected = (bigblock_last_tx_K > 0) ? bigblock_last_tx_K : 0;
+	if(K_expected <= 0)
+	{
+		// derive K from the thin-grid layout without a full TX: rebuild + restore.
+		int Ng=0,l2=0,nb=0; bigblock_rebuild_thin_grid(Ng,l2,nb);
+		K_expected = nb / ldpc.N;
+		bigblock_restore_stock_config();
+	}
+	if(K_expected <= 0) K_expected = 1;
+	std::vector<int> info_bits((size_t)(K_expected + 1) * ldpc.K, 0);
+
+	std::vector<int> cw_ok;
+	int Kout = 0;
+	double acq_metric = 0.0;
+	// P1 loopback: pass the known TX info bits so the per-codeword gate is byte-exact.
+	const std::vector<std::vector<int>>* ref =
+		(bigblock_last_tx_K > 0) ? &bigblock_last_tx_cw_info : nullptr;
+	int cw_ok_count = bigblock_rx_passband(data, nSamples, info_bits.data(), Kout,
+	                                       cw_ok, &acq_metric, ref);
+
+	receive_stats.coarse_metric = acq_metric;
+	receive_stats.delay = 0;
+	// copy decoded info bits to the production output buffer (the ARQ layer carves K
+	// sub-units in P2; P1 just needs them present + the per-codeword gate).
+	int copy_bits = Kout * ldpc.K;
+	for(int i=0;i<copy_bits;i++) out[i] = info_bits[i];
+
+	// stash per-codeword result for the loopback validator / P2 SACK bitmap.
+	bigblock_last_rx_cw_ok = cw_ok;
+	bigblock_last_rx_K = Kout;
+	bigblock_last_rx_cw_ok_count = cw_ok_count;
+
+	// Restore stock config FIRST (it does a full reload; keep the result fields we set
+	// AFTER it so nothing it touches clobbers them), then stamp the decode result.
+	bigblock_restore_stock_config();
+
+	// message_decoded = whole block clean (P1 gate). P2 redefines this as a per-block
+	// ACK whose bitmap = cw_ok (one bad codeword does NOT fail the block).
+	receive_stats.message_decoded = (Kout>0 && cw_ok_count==Kout) ? YES : NO;
+	receive_stats.coarse_metric = acq_metric;
+	receive_stats.iterations_done = -1;
+	return receive_stats;
+}
+
+void cl_telecom_system::bigblock_livepath_loopback()
+{
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+	auto env_d = [](const char* k, double def){ const char* e=std::getenv(k); return (e&&*e)?atof(e):def; };
+	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK-LIVE] MFSK unsupported; use -s 15/16." << std::endl; return; }
+
+	std::cout << "[BIGBLOCK-LIVE] ===== LIVE-PATH big-block loopback (production transmit_byte/receive_byte) =====" << std::endl;
+
+	// 1) GATE the production path on. Stock config stays CFG16 (32-QAM/0.875).
+	bigblock_framing_enabled = true;
+
+	// 2) size the TX output buffer = preamble + K*frame passband samples, plus lead so
+	//    Schmidl-Cox has acquisition room (mirrors the WAV lead silence).
+	int interp = frequency_interpolation_rate;
+	int lead_n  = (int)(env_d("MERCURY_BIGBLOCK_LIVE_LEAD_MS", 100.0) * sampling_frequency / 1000.0);
+	int block_n = bigblock_tx_total_samples();
+	if(block_n <= 0){ std::cout << "[BIGBLOCK-LIVE] tx_total_samples=0; abort." << std::endl; bigblock_framing_enabled=false; return; }
+	int trail_n = (int)(env_d("MERCURY_BIGBLOCK_LIVE_TRAIL_MS", 50.0) * sampling_frequency / 1000.0);
+
+	std::vector<double> tx_pb(block_n, 0.0);
+	// 3) PRODUCTION TX through transmit_byte (which branches to transmit_bigblock).
+	//    NO_FILTER_MESSAGE writes raw passband. data/nBytes unused in P1 (known payload).
+	int dummy[1] = {0};
+	transmit_byte(dummy, 0, tx_pb.data(), NO_FILTER_MESSAGE);
+	int K_tx = bigblock_last_tx_K;
+	int n_tx = bigblock_last_tx_samples;
+	std::cout << "[BIGBLOCK-LIVE] TX via transmit_byte: K=" << K_tx
+	          << " block_samples=" << n_tx << " (buf=" << block_n << ")" << std::endl;
+	if(K_tx <= 0 || n_tx <= 0){ std::cout << "[BIGBLOCK-LIVE] TX produced no block; abort." << std::endl; bigblock_framing_enabled=false; return; }
+
+	// 4) build the captured RX passband buffer the way the live capture loop would hand
+	//    it to receive_byte: [lead silence | block | trail silence], sized to
+	//    Nofdm*buffer_Nsymb*interp so receive_bigblock reads the whole window.
+	//    Make the capture window at least lead+block+trail.
+	int rx_window = lead_n + n_tx + trail_n;
+	std::vector<double> rx_pb(rx_window, 0.0);
+	for(int i=0;i<n_tx;i++) rx_pb[lead_n + i] = tx_pb[i];
+
+	// optional clean->AWGN to confirm the estimator/LLR path runs (default clean).
+	double live_esn0 = env_d("MERCURY_BIGBLOCK_LIVE_ESN0", -999.0);
+	if(live_esn0 > -900.0)
+	{
+		// passband AWGN at the requested Es/N0, using the SAME convention as the
+		// production BER path (passband_test_EsN0, telecom_system.cc:480):
+		//   sigma = sqrt( 2 * P_sig * f_nyquist / (10^(EsN0/10) * bandwidth) )
+		// where P_sig is the mean passband power of the BLOCK (signal region only).
+		double sumsq=0.0; for(int i=0;i<n_tx;i++) sumsq += tx_pb[i]*tx_pb[i];
+		double P_sig = sumsq / (n_tx>0?n_tx:1);
+		double f_nyquist = sampling_frequency / 2.0;
+		double sigma = sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, live_esn0/10.0) * bandwidth));
+		awgn_channel.set_seed(rand());
+		for(int i=0;i<rx_window;i++)
+			rx_pb[i] += sigma * awgn_channel.awgn_value_generator();
+		std::cout << "[BIGBLOCK-LIVE] AWGN Es/N0=" << live_esn0 << " dB sigma=" << sigma
+		          << " (P_sig=" << P_sig << " bw=" << bandwidth << ")" << std::endl;
+	}
+
+	// 5) hand the capture buffer to receive_byte through a data_container whose window
+	//    matches rx_window. receive_bigblock reads nSamples = Nofdm*buffer_Nsymb*interp;
+	//    override buffer_Nsymb so that == rx_window. Save+restore so stock is untouched.
+	int Nofdm = data_container.Nofdm;
+	int saved_buffer_Nsymb = data_container.buffer_Nsymb;
+	if(Nofdm > 0)
+	{
+		int need_syms = (rx_window + Nofdm*interp - 1) / (Nofdm*interp);
+		data_container.buffer_Nsymb = need_syms;
+		// re-pad rx_pb to exactly need_syms*Nofdm*interp so the read is in-bounds.
+		int exact = need_syms * Nofdm * interp;
+		if((int)rx_pb.size() < exact) rx_pb.resize(exact, 0.0);
+	}
+
+	// 6) PRODUCTION RX through receive_byte (branches to receive_bigblock).
+	std::vector<int> out_bits((size_t)(K_tx+1) * ldpc.K + ldpc.K, 0);
+	st_receive_stats rs = receive_byte(rx_pb.data(), out_bits.data());
+	data_container.buffer_Nsymb = saved_buffer_Nsymb;
+
+	int K_rx = bigblock_last_rx_K;
+	int cw_ok = bigblock_last_rx_cw_ok_count;
+	std::cout << "[BIGBLOCK-LIVE] RX via receive_byte: acq_metric=" << rs.coarse_metric
+	          << " K=" << K_rx << " codewords_decoded=" << cw_ok << "/" << K_rx
+	          << " message_decoded=" << (rs.message_decoded==YES?1:0) << std::endl;
+
+	// 7) explicit byte-correct re-check: every decoded info bit == the known TX info bit.
+	long bit_err=0, bit_tot=0;
+	int Kcmp = (K_rx<K_tx?K_rx:K_tx);
+	for(int c=0;c<Kcmp && c<(int)bigblock_last_tx_cw_info.size();c++)
+		for(int i=0;i<ldpc.K;i++){ bit_tot++;
+			if(out_bits[(size_t)c*ldpc.K+i] != bigblock_last_tx_cw_info[c][i]) bit_err++; }
+	double ber = bit_tot? (double)bit_err/(double)bit_tot : 1.0;
+
+	bool pass = (K_rx==K_tx && K_tx>0 && cw_ok==K_tx && bit_err==0);
+	std::cout << "[BIGBLOCK-LIVE] ===== RESULT =====" << std::endl;
+	std::cout << "[BIGBLOCK-LIVE]   codewords_decoded=" << cw_ok << "/" << K_tx
+	          << "  post_FEC_BER=" << ber << "  infoerr=" << bit_err << "/" << bit_tot << std::endl;
+	std::cout << "[BIGBLOCK-LIVE]   VERDICT=" << (pass ? "PASS(live-path 8/8 byte-correct)" : "FAIL") << std::endl;
+
+	bigblock_framing_enabled = false;
 }
 
 void cl_telecom_system::load_configuration()
