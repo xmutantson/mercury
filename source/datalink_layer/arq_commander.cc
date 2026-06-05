@@ -4759,6 +4759,23 @@ void cl_arq_controller::process_control_commander()
 							effective_snr = measurements.SNR_uplink;
 						else
 							effective_snr = -99.0;  // Force incremental probing
+						// TEST-ONLY (env-gated, SIM_INPROC-only): force the control-plane
+						// effective_snr at the turbo decision point so the in-process sim can
+						// REPRODUCE the HW pathology where, on a CLEAN channel that genuinely
+						// carries CFG16, the post-EQ EVM-SNR estimate UNDERREPORTS to ~9.0 dB
+						// (get_configuration(9.0)=CONFIG_13) and fires the step-1 SNR-capability
+						// guard below (arq_commander.cc:~4835). Clean AWGN in the sim reads
+						// ~25 dB (guard never fires) so without this the bug cannot be staged.
+						// Gated on arq_sim_inproc_active() (the SIM_INPROC step-pump pointer,
+						// non-null ONLY under -m SIM_INPROC) AND a non-empty MERCURY_SIM2_INJECT_SNR
+						// -> ZERO effect on every production path and the paced/two-process sim.
+						{
+							static const char* inj_env = std::getenv("MERCURY_SIM2_INJECT_SNR");
+							if(inj_env != nullptr && *inj_env != '\0' && arq_sim_inproc_active())
+							{
+								effective_snr = atof(inj_env);   // TEST-ONLY estimate injection
+							}
+						}
 						int snr_target = -1;
 						if(is_ofdm_config(current_configuration) && effective_snr > -90)
 						{
