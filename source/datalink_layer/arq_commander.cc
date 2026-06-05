@@ -4338,10 +4338,53 @@ void cl_arq_controller::process_control_commander()
 				// See fact-documents/gearshift-start-and-recovery.md §6.
 				else
 				{
-					turboshift_active = false;
-					turbo_supershift_announce_pending = false;
-					turboshift_phase = TURBO_DONE;
-					this->connection_status=TRANSMITTING_DATA;
+					// TEST-ONLY (env-gated, SIM_INPROC-only): re-arm the forward
+					// turboshift at CONNECT so the in-process sim drives the climb
+					// through the TURBO step-1 SNR-capability guard (the e38143a fix
+					// site). The production Option-B change (2026-05-29) disables the
+					// post-CONNECT turbo and climbs via FRAME-UP, which reads the REAL
+					// measurements.SNR_uplink (NOT the injected turbo-block effective_snr)
+					// and never traverses the step-1 guard -- so the documented HW
+					// pathology (turbo climbing 14->15 while the control-plane EVM-SNR
+					// underreports to ~9) cannot be staged on the gearshift path in this
+					// lineage. With MERCURY_SIM2_FORCE_TURBO_CLIMB set we restore the
+					// turbo-driven climb the e38143a fix was written against: turbo stays
+					// active+TURBO_FORWARD and issues a forward SET_CONFIG to current+1,
+					// so each confirmed step re-enters the turbo block (~:4748) and hits
+					// the step-1 guard with the injected effective_snr. Gated on
+					// arq_sim_inproc_active() AND the env flag -> ZERO effect on
+					// production / paced / two-process sim. Pairs with
+					// MERCURY_SIM2_INJECT_SNR (the A/B cell).
+					static const char* force_turbo_env = std::getenv("MERCURY_SIM2_FORCE_TURBO_CLIMB");
+					bool force_turbo = (force_turbo_env != nullptr && *force_turbo_env != '\0'
+					                    && arq_sim_inproc_active());
+					if(force_turbo
+					   && !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+					{
+						turboshift_active = true;
+						turboshift_phase = TURBO_FORWARD;
+						turboshift_initiator = true;
+						turbo_snr_ack_enabled = true;
+						turbo_received_snr = -99.0f;
+						turbo_best_snr = -99.0f;
+						turboshift_last_good = current_configuration;
+						turboshift_retries = 1;
+						negotiated_configuration = config_ladder_up_n(
+							current_configuration, 1, robust_enabled, narrowband_enabled == YES);
+						printf("[SIM2-FORCE-TURBO] re-armed forward turbo at CONNECT: config %d -> %d (climb through step-1 guard)\n",
+							current_configuration, negotiated_configuration);
+						fflush(stdout);
+						cleanup();
+						add_message_control(SET_CONFIG);
+						this->connection_status = TRANSMITTING_CONTROL;
+					}
+					else
+					{
+						turboshift_active = false;
+						turbo_supershift_announce_pending = false;
+						turboshift_phase = TURBO_DONE;
+						this->connection_status=TRANSMITTING_DATA;
+					}
 				}
 			}
 
