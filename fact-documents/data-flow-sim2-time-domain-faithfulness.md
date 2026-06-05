@@ -277,6 +277,63 @@ the task explicitly scoped OUT. Surfaced for a decision.
 byte-identical; Phase 0b holds. The two-sided ARM A/B/C discrimination is NOT
 demonstrable single-batch and is gated on the multi-batch unblock (Option b).
 
+## §10. F1 RESOLUTION — the PHY-level long-block-decode-under-SFO harness (BUILT)
+
+F1/§9 says the in-process pump CANNOT exhibit timing-acquisition failure because
+the per-frame decode-drive pins the FFT window. The DURABLE fix is NOT to un-pin the
+pump (that reintroduces the 9336c23 delivery-cadence deadlock — §9 DEPENDENCY); it is
+a SEPARATE PHY-level harness that makes the RX ACQUIRE timing from a long, SFO-drifted
+continuous block. Built this session (`win/sim-faithful`):
+
+**Entry:** `-m PLOT_PASSBAND -s <cfg>` with env `MERCURY_SFO_BLOCK_TEST=1`. Implemented
+as `cl_telecom_system::sfo_block_test()` (`telecom_system.cc`, dispatched at the top of
+`BER_PLOT_passband_process_main`). Single-file change + 1 header decl + a
+`#include "common/sim_channel.h"`.
+
+**Why this is faithful where the BER sweep / pump are not.** Both pinned paths set
+`ofdm_forced_delay` to a KNOWN position and the RX then BYPASSES Schmidl-Cox + Moose
+(`:504` sets it; `:1010/:2137/:2462` bypass). The harness instead:
+1. TXes N back-to-back OFDM frames (the SAME `transmit_byte`) into ONE contiguous
+   passband buffer — a real batch is back-to-back frames on ONE continuous TX clock.
+   Per-frame preamble length is driven by LEVER P (`tx_preamble_nsymb_override` +
+   `preamble_sched_nsymb`, exactly as `arq_common.cc:3918`), so FULL vs MINI arms emit
+   the genuine 4-sym / 1-sym geometry.
+2. Drifts the WHOLE buffer through ONE `cl_sim_sfo` (sim_channel.h). One stateful
+   instance ⇒ the fractional accumulator + integer SOF-creep carry across the entire
+   block; frame boundaries are NOT realigned (the HW continuous-clock drift). The
+   integer part skips/repeats whole samples (SOF creep); the fractional part
+   sub-sample-misaligns the Schmidl-Cox half-symbol repeat.
+3. Per frame, presents a `buffer_Nsymb` window to the REAL `receive_byte` with
+   `ofdm_forced_delay = -1` ⇒ real Schmidl-Cox time sync + Moose carrier sync + channel
+   est + equalizer + LDPC; compares decoded bits to the known TX bits, and records the
+   detected (drifting) preamble position + coarse metric to expose the timing creep.
+
+**Placement gotcha (fixed).** The RX coarse-bounds gate (`:1701,:1730`) requires
+`pream_symb_loc > preamble_nSymb`, so the frame must be placed with a lead of
+`(preamble_nSymb+2)` symbols (mirrors the BER path's `(preamble_nSymb+2)*Nofdm+delay`
+forced-delay convention). A 2-symbol lead landed the preamble at symbol 2 < bound 4 ⇒
+every frame SKIPPED pre-LDPC (BER 0.5). With the correct lead the clean control decodes
+fully.
+
+**Build/baseline status (this session, Phase 1 — build only, NOT yet validated):**
+- o3 build clean (no errors, no c++17 extension warning after rewriting the init-if).
+- Installed to `C:\Program Files\Mercury\mercury.exe`.
+- CLEAN CONTROL (SFO OFF, ESN0=900, CFG16, FULL arm, 4 frames): **4/4 decoded,
+  block_BER=0**, det delay 7439-7440 vs expected 7440, metric 0.9987 — i.e. real
+  acquisition works and the acceptance-test-1 baseline holds.
+- Standard BER sweep CFG16 sanity unchanged (`--ber-esn0=30` → `30;0`).
+
+**Knobs:** `MERCURY_SFO_BLOCK_NFRAMES` (60), `MERCURY_SFO_BLOCK_ESN0` (900=clean),
+`MERCURY_SFO_BLOCK_SEED` (12345); SFO via `MERCURY_SIM2_SFO_PPM/_WALK_PPM/_MAX_PPM`;
+MINI arm via `preamble_amortization_enabled` + `MERCURY_SIM2_MINI_NSYM`.
+
+**STILL TO VALIDATE (Phase 2, NOT done here):** (1) SFO-MATTERS — a 60-frame CFG16
+block at 50 ppm must DEGRADE vs the clean control (timing creeps, tail decode fails);
+(2) P-REPRODUCTION — MINI (1-sym) under 50 ppm must FAIL on the tail while FULL (4-sym)
+HOLDS, matching the HW −90% signature. If SFO cannot be made to affect decode in this
+harness, the investment FAILED — report honestly, do not declare success on a still-
+pinned window.
+
 ## §8. Calibration artifacts (already captured — CONSUME only)
 
 - `preamble_hw/p_on_cfg16_clean.json` (1-sym), `p_off_cfg16_clean.json`,

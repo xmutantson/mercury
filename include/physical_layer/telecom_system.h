@@ -458,6 +458,13 @@ public:
 	void RX_SHM_process_main(cbuf_handle_t buffer);
 	void BER_PLOT_baseband_process_main();
 	void BER_PLOT_passband_process_main();
+	// Timing-acquisition-under-SFO harness (F1 fix). Entry via -m PLOT_PASSBAND -s
+	// <cfg> with MERCURY_SFO_BLOCK_TEST=1. Builds a long back-to-back OFDM block,
+	// drifts it through cl_sim_sfo, and decodes each frame via REAL Schmidl-Cox +
+	// Moose acquisition (ofdm_forced_delay=-1) so SFO actually affects timing —
+	// the impairment the pinned BER/in-proc paths structurally cannot show. See
+	// fact-documents/data-flow-sim2-time-domain-faithfulness.md §10.
+	void sfo_block_test();
 
 	void load_configuration();
 	void load_configuration(int configuration);

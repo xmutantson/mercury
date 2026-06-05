@@ -23,6 +23,7 @@
 #include "physical_layer/telecom_system.h"
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
+#include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
 #include <chrono>
 #include <vector>  // suffix-FEC soft decode candidate buffers
 #include <cstdlib> // std::getenv / atoi for MERCURY_SIM2_MINI_NSYM (LEVER P MINI knob)
@@ -5231,6 +5232,22 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 	// Step 15: legacy SACK pattern roundtrip test removed (function deleted
 	// alongside the MFSK SACK bitmap path).
 
+	// ---- TIMING-ACQUISITION-UNDER-SFO HARNESS (F1 fix) -------------------------
+	// MERCURY_SFO_BLOCK_TEST=1 reuses the PLOT_PASSBAND mode (-m PLOT_PASSBAND -s
+	// <cfg>) as the entry point for the long-block-decode-under-SFO harness. Unlike
+	// the standard BER sweep below (which sets ofdm_forced_delay = a KNOWN position
+	// and bypasses Schmidl-Cox / Moose — telecom_system.cc:504,2137,2462) and unlike
+	// the in-process 2-instance pump (which hands the decoder a FRAME-ALIGNED window
+	// at a pinned ring offset — arq_commander.cc:~9822), this harness makes the RX
+	// ACQUIRE timing from a long, SFO-drifted continuous block, so SFO actually
+	// matters. See fact-documents/data-flow-sim2-time-domain-faithfulness.md §10.
+	const char* sft = std::getenv("MERCURY_SFO_BLOCK_TEST");
+	if(sft && atoi(sft) != 0)
+	{
+		sfo_block_test();
+		return;
+	}
+
 	BER_plot.open("BER");
 	BER_plot.reset("BER");
 	// MFSK: sweep channel SNR from -25 to +5 dB in 1 dB steps
@@ -5293,6 +5310,291 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 		ack_pattern_detection_test();
 	}
 	// Step 15: legacy SACK roundtrip test removed.
+}
+
+// ============================================================================
+// TIMING-ACQUISITION-UNDER-SFO HARNESS  (F1 fix — the durable infra investment)
+// ============================================================================
+// PURPOSE. The two existing decode paths CANNOT exhibit timing-acquisition
+// failures, because both PIN the FFT window:
+//   • the standard BER sweep (passband_test_EsN0) sets ofdm_forced_delay to a
+//     KNOWN nominal position and the RX then bypasses Schmidl-Cox AND Moose
+//     (telecom_system.cc:504 sets it; :1010/:2137/:2462 bypass on it);
+//   • the in-process 2-instance pump hands the decoder a frame-aligned window
+//     at a deterministic ring offset (arq_commander.cc:~9822). Injecting
+//     cl_sim_sfo there leaves ARM A == ARM B byte-identical to SFO-off, because
+//     the pinned window cannot move (fact-doc §9/F1).
+// So SFO has ZERO effect in either path. This harness instead makes the RX
+// ACQUIRE timing from a LONG, SFO-DRIFTED, CONTINUOUS block (a real OFDM batch
+// is back-to-back frames on ONE continuous TX clock), so SFO matters:
+//   1. TX N back-to-back CFG OFDM frames into one contiguous passband buffer
+//      (the SAME transmit_byte the production TX uses; per-frame preamble length
+//      governed by LEVER P's tx override / MERCURY_SIM2_MINI_NSYM).
+//   2. Pass the WHOLE buffer through ONE cl_sim_sfo instance — a stateful,
+//      phase-continuous fractional resampler (sim_channel.h). The integer part
+//      of the accumulated SFO phase skips/repeats whole input samples, so the
+//      start-of-frame CREEPS across the block; the fractional part sub-sample-
+//      misaligns the Schmidl-Cox half-symbol repeat. This is the impairment the
+//      pinned paths structurally cannot show.
+//   3. For each frame, present a buffer_Nsymb window to the REAL receive_byte
+//      with ofdm_forced_delay = -1 (so it runs Schmidl-Cox time sync + Moose
+//      carrier sync + channel est + equalizer + LDPC), and compare the decoded
+//      bits against the known TX bits. Record the detected (drifting) preamble
+//      position + coarse metric per frame to expose the timing creep.
+//
+// Two arms (env-selected, NOT hard-coded here):
+//   • FULL : preamble_amortization_enabled = false  ⇒ every frame 4-sym preamble
+//            (long Schmidl-Cox integration L; should HOLD under SFO).
+//   • MINI : preamble_amortization_enabled = true, MERCURY_SIM2_MINI_NSYM = 1
+//            ⇒ tail frames carry a 1-sym preamble (L 4× shorter ⇒ metric
+//            variance 4× ⇒ peak-pick jitters under SFO; should FAIL on the tail).
+//
+// Knobs (all default to a sensible value; NONE change the production BER sweep —
+// that path is gated out above by MERCURY_SFO_BLOCK_TEST):
+//   MERCURY_SFO_BLOCK_NFRAMES : frames in the block (default 60 — the make-or-
+//                               break TEST 1 length for big-block framing).
+//   MERCURY_SFO_BLOCK_ESN0    : channel Es/N0 in dB (default 900 = clean cell;
+//                               isolates the SFO timing effect from AWGN).
+//   MERCURY_SFO_BLOCK_SEED    : TX-data + AWGN RNG seed (default 12345).
+//   MERCURY_SIM2_SFO_PPM / _SFO_WALK_PPM / _SFO_MAX_PPM / _SFO_SEED : the SFO
+//                               itself (cl_sim_sfo knobs; default OFF ⇒ a clean
+//                               control run that MUST decode the whole block).
+//   MERCURY_SIM2_MINI_NSYM    : MINI-arm per-frame preamble length (LEVER P).
+//
+// Determinism: TX data + AWGN seeded from MERCURY_SFO_BLOCK_SEED; the SFO stage
+// has its OWN cl_sim_xoshiro (sfo_seed). Same env ⇒ bit-reproducible.
+void cl_telecom_system::sfo_block_test()
+{
+	if(M == MOD_MFSK)
+	{
+		std::cout << "[SFO-BLOCK] MFSK not supported (OFDM timing-acquisition harness); use -s 15/16." << std::endl;
+		return;
+	}
+
+	auto env_i = [](const char* k, int def) { const char* e = std::getenv(k); return (e && *e) ? atoi(e) : def; };
+	auto env_f = [](const char* k, double def) { const char* e = std::getenv(k); return (e && *e) ? atof(e) : def; };
+
+	int    nFrames = env_i("MERCURY_SFO_BLOCK_NFRAMES", 60);
+	if(nFrames < 1) nFrames = 1;
+	double esn0_db = env_f("MERCURY_SFO_BLOCK_ESN0", 900.0);
+	uint64_t seed  = (uint64_t)env_i("MERCURY_SFO_BLOCK_SEED", 12345);
+
+	// LEVER P arm selection: MINI engages preamble amortization (the per-frame
+	// MINI preamble length is read from MERCURY_SIM2_MINI_NSYM inside
+	// preamble_sched_nsymb). FULL forces every frame to the configured 4-sym
+	// preamble. The arm is chosen here from preamble_amortization_enabled, which
+	// the CLI/caller already set; default (production) is the FULL behaviour.
+	bool mini_arm = preamble_amortization_enabled;
+	int  full_pre = data_container.preamble_nSymb;
+
+	// Geometry (one frame, FULL preamble = the allocation maximum).
+	int interp        = frequency_interpolation_rate;
+	int sym_samples   = data_container.Nofdm * interp;            // one OFDM symbol, passband
+	int data_nsymb    = data_container.Nsymb;                     // data symbols / frame
+	int full_frame    = (data_nsymb + full_pre) * sym_samples;    // FULL frame, passband samples
+	int buf_interp    = data_container.Nofdm * data_container.buffer_Nsymb * interp; // RX window
+
+	int nReal_data    = data_container.nBits - ldpc.P;
+	int payload_bytes = (nReal_data - outer_code_reserved_bits) / 8;
+	int payload_bits  = payload_bytes * 8;   // byte-aligned: matches transmit_byte(payload_bytes)
+
+	std::cout << "[SFO-BLOCK] cfg=" << current_configuration
+	          << " M=" << M << " Nsymb=" << data_nsymb
+	          << " full_pre=" << full_pre
+	          << " arm=" << (mini_arm ? "MINI" : "FULL")
+	          << " mini_nsym=" << preamble_sched_nsymb(1, false, full_pre)
+	          << " nFrames=" << nFrames
+	          << " EsN0=" << esn0_db
+	          << " SFO_ppm=" << env_f("MERCURY_SIM2_SFO_PPM", 0.0)
+	          << " SFO_walk_ppm=" << env_f("MERCURY_SIM2_SFO_WALK_PPM", 0.0)
+	          << " seed=" << seed << std::endl;
+
+	// --- TX: build N back-to-back frames into one contiguous passband buffer. ---
+	// Capacity: N FULL frames + headroom; emitted MINI frames are shorter so this
+	// is a safe upper bound regardless of arm.
+	std::vector<double> tx_block((size_t)nFrames * (size_t)full_frame + (size_t)sym_samples, 0.0);
+	// Per-frame: TX bit pattern (for BER) + the emitted-frame sample offset/length.
+	std::vector<std::vector<int>> frame_bits(nFrames);
+	std::vector<long>             frame_off(nFrames, 0);
+	std::vector<int>              frame_len(nFrames, 0);
+	std::vector<int>              frame_pre(nFrames, 0);   // preamble symbols this frame emitted
+
+	output_power_Watt = 1;
+	ts_srandom((unsigned int)seed);
+
+	long write_pos = 0;
+	for(int f = 0; f < nFrames; f++)
+	{
+		// Per-frame known random payload (reproducible from the block seed).
+		frame_bits[f].resize(payload_bits);
+		for(int i = 0; i < payload_bits; i++)
+			frame_bits[f][i] = (int)(ts_random() % 2);
+		bit_to_byte(frame_bits[f].data(), data_container.data_byte, payload_bits);
+
+		// LEVER P: drive the per-frame TX preamble length exactly like the ARQ
+		// batch assembler does (arq_common.cc:3918). Frame 0 = anchor (FULL);
+		// tail frames = MINI when the MINI arm is on. preamble_sched_nsymb is the
+		// SAME pure schedule the production TX/RX both derive, so this faithfully
+		// reproduces LEVER P's emitted-frame geometry.
+		int emit_pre = full_pre;
+		if(mini_arm)
+		{
+			tx_preamble_nsymb_override = preamble_sched_nsymb(f, /*force_full=*/false, full_pre);
+			emit_pre = tx_preamble_nsymb_override;
+		}
+		else
+		{
+			tx_preamble_nsymb_override = -1; // FULL every frame
+		}
+
+		// Emit one frame into passband_data; transmit_byte populates it and sets
+		// tx_last_emitted_frame_samples to the ACTUAL emitted length (preamble+data).
+		tx_last_emitted_frame_samples = full_frame;
+		this->transmit_byte(data_container.data_byte, payload_bytes,
+		                    data_container.passband_data, SINGLE_MESSAGE);
+		int emitted = tx_last_emitted_frame_samples;
+		if(emitted <= 0 || emitted > full_frame) emitted = full_frame;
+
+		frame_off[f] = write_pos;
+		frame_len[f] = emitted;
+		frame_pre[f] = emit_pre;
+		for(int i = 0; i < emitted; i++)
+			tx_block[(size_t)write_pos + i] = data_container.passband_data[i];
+		write_pos += emitted;
+	}
+	tx_preamble_nsymb_override = -1; // defensive reset
+	long block_len = write_pos;
+
+	// --- CHANNEL: drift the WHOLE contiguous block through one cl_sim_sfo. ---
+	// One stateful instance ⇒ the fractional accumulator + integer SOF-creep carry
+	// across the entire block (frame boundaries are NOT realigned — exactly the HW
+	// continuous-clock drift). cl_sim_sfo is n-in/n-out exact; the read pointer's
+	// accumulated drift across block_len samples is the cumulative timing error the
+	// per-frame acquisition must track. SFO knobs come from the env (default OFF).
+	{
+		cl_sim_sfo sfo(/*seed=*/ (seed ^ 0x2545F4914F6CDD1DULL) + 0xC2B2AE3D27D4EB4FULL,
+		               env_f("MERCURY_SIM2_SFO_PPM", 0.0),
+		               env_f("MERCURY_SIM2_SFO_WALK_PPM", 0.0),
+		               env_f("MERCURY_SIM2_SFO_MAX_PPM", 90.0),
+		               48000.0);
+		// Process in one shot over the whole block (phase-continuous; equivalent to
+		// streaming since the resampler carries state, but one call is simplest and
+		// has no inter-block edge since there are no edges).
+		sfo.process(tx_block.data(), (size_t)block_len);
+		std::cout << "[SFO-BLOCK] SFO stage " << (sfo.enabled() ? "ON" : "OFF (control run)")
+		          << " block_samples=" << block_len << std::endl;
+	}
+
+	// AWGN sigma (Es/N0), measured from the actual block power (same calibration as
+	// passband_test_EsN0). Clean cell (esn0>=900) ⇒ no additive noise.
+	double sigma = 0.0;
+	bool clean = (esn0_db >= 900.0);
+	if(!clean)
+		sigma = 1.0 / sqrt(pow(10.0, esn0_db / 10.0));
+
+	// --- RX: per-frame REAL acquisition over a buffer_Nsymb window. ---
+	// Window layout: [lead margin of zeros | frame's drifted samples | trailing
+	// zeros], placed in passband_delayed_data. The lead margin (a couple symbols)
+	// gives the Schmidl-Cox search room and lets the SFO-creep move the preamble
+	// AWAY from a fixed sample so timing acquisition is genuinely exercised. We map
+	// frame f to its TX offset; the SFO has already drifted the content so the
+	// actual preamble sits at frame_off[f] +/- accumulated creep, which the RX must
+	// re-find. ofdm_forced_delay = -1 ⇒ full Schmidl-Cox + Moose.
+	// Lead margin: place the preamble at symbol (full_pre+2) so it clears the RX
+	// coarse-bounds gate (lower_bound = preamble_nSymb; the gate requires
+	// pream_symb_loc > preamble_nSymb — telecom_system.cc:1701,1730). This mirrors
+	// the standard BER path's forced-delay convention
+	// ((preamble_nSymb+2)*Nofdm+delay). The SFO-creep then moves the actual
+	// preamble away from this nominal sample, which the RX must re-acquire.
+	int lead = (full_pre + 2) * sym_samples;            // preamble lands at symbol full_pre+2
+	int win_frame_max = full_frame + 4 * sym_samples;   // FULL frame + slack
+	if(lead + win_frame_max > buf_interp)
+	{
+		// Should not happen for WB CFG15/16 (buffer_Nsymb >> frame), but clamp.
+		lead = 0;
+		if(win_frame_max > buf_interp) win_frame_max = buf_interp;
+	}
+
+	int    decoded_ok = 0;
+	long   total_bit_errors = 0;
+	long   total_bits = 0;
+	int    frames_zero_ber = 0;
+	double metric_sum_full = 0.0, metric_sum_mini = 0.0;
+	int    n_full = 0, n_mini = 0;
+
+	// AWGN seeded once (separate from TX data stream) for reproducibility.
+	awgn_channel.set_seed((long)(seed | 1));
+
+	for(int f = 0; f < nFrames; f++)
+	{
+		// Zero the RX window, then copy this frame's drifted samples after `lead`.
+		for(int i = 0; i < buf_interp; i++) data_container.passband_delayed_data[i] = 0.0;
+
+		long src = frame_off[f];
+		// Pull the frame plus a little of the NEXT frame's lead-in (so the data
+		// tail + any SFO over-read is present); bounded by the block end.
+		int copy_n = win_frame_max;
+		if(src + copy_n > block_len) copy_n = (int)(block_len - src);
+		for(int i = 0; i < copy_n && (lead + i) < buf_interp; i++)
+		{
+			double s = tx_block[(size_t)src + i];
+			if(!clean && sigma > 0.0)
+				s += (double)((sigma / sqrtf(2.0f)) * awgn_channel.awgn_value_generator());
+			data_container.passband_delayed_data[lead + i] = s;
+		}
+
+		// REAL acquisition: -1 ⇒ Schmidl-Cox time sync + Moose carrier sync run.
+		ofdm_forced_delay = -1;
+		mfsk_fixed_delay  = -1;
+		// The RX MINI extraction (rx_eff_preamble=1) is gated behind the ARQ
+		// batch-predict state machine, which this standalone harness does not run;
+		// here every frame is acquired by the FULL-buffer Schmidl-Cox search, whose
+		// integration length is set by the preamble actually present in the signal.
+		// That is the physically correct discriminator: a frame TX'd with a 1-sym
+		// preamble (MINI arm) presents a 4x-shorter half-symbol repeat to the SAME
+		// search, so its metric under-integrates under SFO regardless of ARQ state.
+		st_receive_stats st = this->receive_byte(data_container.passband_delayed_data,
+		                                          data_container.hd_decoded_data_byte);
+		ofdm_forced_delay = -1;
+
+		// Per-frame metric / detected position (drift trajectory).
+		double metric = st.coarse_metric;
+		long   det    = st.delay;          // detected preamble sample position in window
+		if(frame_pre[f] >= full_pre) { metric_sum_full += metric; n_full++; }
+		else                         { metric_sum_mini += metric; n_mini++; }
+
+		// BER for this frame: decode bytes -> bits, compare to TX bits.
+		byte_to_bit(data_container.hd_decoded_data_byte, data_container.hd_decoded_data_bit, payload_bytes);
+		int errs = 0;
+		for(int i = 0; i < payload_bits; i++)
+			if(frame_bits[f][i] != data_container.hd_decoded_data_bit[i]) errs++;
+		total_bit_errors += errs;
+		total_bits       += payload_bits;
+		if(errs == 0) frames_zero_ber++;
+		if(st.message_decoded == YES) decoded_ok++;
+
+		if(f < 8 || f >= nFrames - 4 || (f % 10) == 0)
+		{
+			std::cout << "[SFO-BLOCK] frame=" << f
+			          << " pre=" << frame_pre[f]
+			          << " expect_off=" << (lead) << "(+drift)"
+			          << " det=" << det
+			          << " metric=" << metric
+			          << " decoded=" << (st.message_decoded == YES ? 1 : 0)
+			          << " biterr=" << errs << "/" << payload_bits << std::endl;
+		}
+	}
+
+	double block_ber = (total_bits > 0) ? (double)total_bit_errors / (double)total_bits : 1.0;
+	std::cout << "[SFO-BLOCK] ===== RESULT (" << (mini_arm ? "MINI" : "FULL") << " arm) ====="  << std::endl;
+	std::cout << "[SFO-BLOCK]   frames_decoded=" << decoded_ok << "/" << nFrames
+	          << "  frames_zero_ber=" << frames_zero_ber << "/" << nFrames << std::endl;
+	std::cout << "[SFO-BLOCK]   block_BER=" << block_ber
+	          << "  total_biterr=" << total_bit_errors << "/" << total_bits << std::endl;
+	if(n_full > 0) std::cout << "[SFO-BLOCK]   mean_metric_FULLpre=" << (metric_sum_full / n_full) << std::endl;
+	if(n_mini > 0) std::cout << "[SFO-BLOCK]   mean_metric_MINIpre=" << (metric_sum_mini / n_mini) << std::endl;
+	std::cout << "[SFO-BLOCK]   tail-frame decode is the make-or-break: a clean control"
+	          << " run (SFO OFF) MUST be ~all-decoded; SFO ON must DEGRADE the MINI tail." << std::endl;
 }
 
 void cl_telecom_system::load_configuration()
