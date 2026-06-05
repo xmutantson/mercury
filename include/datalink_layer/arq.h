@@ -1309,6 +1309,47 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
 
+  // ---- P2 big-block ARQ re-granularization (see
+  // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
+  //
+  // bigblock_block_to_arq(): the PRODUCTION block->ARQ delivery entry. At the
+  // CFG16-bigblock rung (bigblock_framing_enabled), ONE receive_bigblock decode
+  // yields K=8 per-codeword info-bit sub-units + a K-bit cw_ok clean vector (the
+  // SACK granularity, telecom_system.h:595). This entry carves cw_ok into
+  // messages_rx[0..K-1] (RECEIVED iff cw_ok[c]==1), sets the synthetic EOB=K-1
+  // (RISK-4, BEFORE the prev branch), and drives the ONE-ACK / partial-SACK /
+  // bsi-once flow — replacing the K per-frame add_message_rx_data writes.
+  //   cw_ok          : length-K per-codeword clean bitmap (1=clean, 0=failed).
+  //   block_bsi      : the batch_seq_id this block advertises (one block=one batch).
+  //   tx_payload     : K*sub_len bytes the TX block carried (for the
+  //                    delivered==TX assertion); sub_len = bytes/codeword.
+  //   sub_len        : payload bytes per codeword sub-unit.
+  // Returns SUCCESSFUL when the block was delivered to messages_rx[] + the ARQ
+  // state advanced; BIGBLOCK_ARQ_NOT_WIRED (the P2.0 stub return) when the
+  // block->ARQ logic is not yet wired. P2.0 ships this as a one-line stub (NO ARQ
+  // logic) so --test-bigblock-arq-unit FAILS; P2.4/2.5/2.6 implement the body so
+  // it PASSES (bisectable, see fact-doc §6).
+  int bigblock_block_to_arq(const int* cw_ok, int K, unsigned char block_bsi,
+                            const unsigned char* tx_payload, int sub_len);
+
+  // In-process big-block ARQ-granularization regression (one-shot, then exit rc).
+  // CLI: --test-bigblock-arq-unit. THREE cases per fact-doc §6:
+  //   1 clean K=8 -> one ACK / all-ones K-bit bitmap / bsi bumps ONCE;
+  //   2 one-bad-codeword -> partial K-bit SACK + selective-repeat of EXACTLY that
+  //     codeword (stock CFG16 per-frame retx + messages_rx_prev);
+  //   3 lost-EOB -> synthetic EOB=K-1 holds, RSP sizes batch=K, prev completes.
+  // Asserts RX delivered bytes == TX bytes at every transition. Returns 0=PASS,
+  // 1=FAIL. MUST FAIL before P2 wiring (the stub above), PASS after. Default
+  // builds never call this.
+  int test_bigblock_arq_unit();
+  // Test-only helpers for test_bigblock_arq_unit (member methods because
+  // messages_rx[]/nMessages are private). Count RECEIVED slots in
+  // messages_rx[0..K-1]; count delivered bytes that match the expected TX
+  // payload byte-for-byte (the "RX delivered == TX" measure, INV-6).
+  int bigblock_test_count_received(int K);
+  int bigblock_test_delivered_bytes(int K, int sub_len,
+                                    const unsigned char* tx_payload);
+
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
   // policy_evaluate_axis3() implements the per-SACK-event §4.3.2 controller.

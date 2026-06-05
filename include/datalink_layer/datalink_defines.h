@@ -164,6 +164,15 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 #define ERROR_ -1
 #define SUCCESSFUL 0
 
+// P2 big-block ARQ re-granularization stub sentinel
+// (fact-documents/data-flow-bigblock-arq-unit.md §6): returned by
+// bigblock_block_to_arq() while the block->ARQ logic is NOT yet wired (P2.0). The
+// --test-bigblock-arq-unit regression treats this as "block not delivered" so the
+// test FAILS before P2 wiring and PASSES after (the stub body is replaced in
+// P2.4/2.5/2.6). Distinct from any success/error code above so a future real
+// implementation can never collide with it.
+#define BIGBLOCK_ARQ_NOT_WIRED -77
+
 //Node role
 #define COMMANDER 0
 #define RESPONDER 1

@@ -361,6 +361,10 @@ int main(int argc, char *argv[])
                                         // 'mfsk' should FAIL on HEAD (used_mfsk_path=true bypasses send_sack_v2_frame's Step 8a bump).
                                         // 'ofdm' should PASS on HEAD (regression guard for the existing OFDM SACK_RSP path).
                                         // One-shot at startup, then exit. See fact-documents/sack_partial_bsi_advance.md §5.
+    bool test_bigblock_arq_unit_cli = false; // --test-bigblock-arq-unit: P2 big-block ARQ-granularization regression.
+                                        // 3 cases (clean K=8 / one-bad-cw / lost-EOB). MUST FAIL before P2 wiring (the
+                                        // bigblock_block_to_arq stub returns BIGBLOCK_ARQ_NOT_WIRED), PASS after.
+                                        // One-shot at startup, then exit rc. See fact-documents/data-flow-bigblock-arq-unit.md §6.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -831,6 +835,16 @@ int main(int argc, char *argv[])
             if (strcmp(arg, "mfsk") == 0 || strcmp(arg, "ofdm") == 0)
                 test_partial_bsi_advance_cli = arg;
             else { fprintf(stderr, "--test-partial-bsi-advance: expected 'mfsk' or 'ofdm'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-arq-unit") == 0)
+        {
+            // P2 big-block ARQ-granularization regression — one-shot at startup,
+            // then exit with the test's rc. See
+            // fact-documents/data-flow-bigblock-arq-unit.md §6. FAILS before P2
+            // wiring (the bigblock_block_to_arq stub), PASSES after.
+            test_bigblock_arq_unit_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1913,6 +1927,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_partial_bsi_advance(test_partial_bsi_advance_cli);
             printf("[FLAG] Partial-bsi-advance test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_arq_unit_cli) {
+            // P2 big-block ARQ-granularization regression (one-shot, then exit rc).
+            // Drives bigblock_block_to_arq() through 3 cases (clean K=8 / one-bad-cw
+            // / lost-EOB) + asserts RX delivered == TX at every transition. FAILS
+            // before P2 wiring (the stub), PASSES after. See
+            // fact-documents/data-flow-bigblock-arq-unit.md §6.
+            printf("[FLAG] --test-bigblock-arq-unit: invoking big-block "
+                   "ARQ-granularization regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_bigblock_arq_unit();
+            printf("[FLAG] Bigblock-arq-unit test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
