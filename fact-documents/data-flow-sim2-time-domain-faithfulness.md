@@ -1,6 +1,9 @@
 # Data-Flow / Design: SIM_INPROC 2-Instance Time-Domain Faithfulness
 
-Status: **SKELETON (Phase 0 complete)** — impairment stages NOT yet implemented.
+Status: **IMPLEMENTED (Phase 1) — stages built, default-off byte-identical, GATE-2
++ Phase-0b pass. CRITICAL FINDING: the acceptance-test cascade is NOT reproducible
+single-batch through ANY faithful impairment (it is intrinsically multi-batch /
+long-session) — see §9. Surfaced for decision, NOT tuned around.**
 Worktree: `C:/Users/kamer/mercury_wt/sim-faithful` — branch `win/sim-faithful`
 Base: `9336c23` (SIM_INPROC 2-instance OFDM data decode) merged with
 `6f3c83a` (deterministic-floor) + `3a8f3f8` (LEVER P preamble amortization).
@@ -60,7 +63,24 @@ and LDPC iter = 101 on a wrong-offset buffer → mis-extract → batch-tail loss
 baseline survives because it re-acquires a 4-symbol preamble + a fresh Moose CFO
 every frame.
 
-## §2. The four impairments to add (Phase 1+, NOT yet implemented)
+## §2. The four impairments (Phase 1 — IMPLEMENTED in `sim_channel.h`)
+
+IMPLEMENTATION NOTES (what shipped vs the plan below):
+- SFO `cl_sim_sfo`: built as planned (4-tap cubic Lagrange Farrow, per-output-sample
+  clamped walk + static bias, streaming/phase-continuous, n-in/n-out exact).
+- CFO `cl_sim_cfo`: the static-residual part is as planned; the "slow random-walk
+  drift" was IMPLEMENTED AS A CLAMPED AR(1) (Ornstein-Uhlenbeck), NOT a free Wiener
+  walk. **Correction to the plan:** a Wiener walk drifts WITHIN a frame (∝√n) and
+  breaks the FULL/ARM-A arm (the anti-tuning gate) — verified empirically (CFO=2-8 Hz
+  Wiener broke ARM A, var→0.46, iter=101). The AR(1) is intra-frame-flat so Moose
+  (FULL) tracks it while the MINI reuses the stale estimate. Knob `_CFO_WALK_HZ` is
+  now the AR(1) STATIONARY std; added `_CFO_DRIFT_F3DB` (correlation BW, default 0.05).
+- AGC `cl_sim_agc_transient`: built; silence→signal edge detected in process().
+- SOF jitter: NOT shipped — §9/F1 shows the timing axis is pinned by the per-frame
+  decode-drive, so a wire→cap sample-jitter is a no-op against the pinned window.
+  The §4 audit skeleton is retained for if/when the decode-drive is changed.
+
+The original plan (for reference):
 
 Calibrated to MEASURED hardware, never magic numbers. Default-off = byte-identical.
 Per-direction state lives INSIDE `cl_sim_awgn` (one instance per direction at
@@ -125,15 +145,31 @@ The SOF-jitter term (impairment 3) perturbs the sample ALIGNMENT of the bytes
 written to the wire. It crosses PHY (timing acquisition / `coarse_metric`) and the
 sim-pump layer (`ring_write_index`). Before shipping the jitter term, complete:
 
-1. **Producers** of `ring_write_index` / `ofdm_drift_per_frame` / `coarse_metric`:
-   **[TODO — enumerate file:line each]**
-2. **Consumers** of each: **[TODO — file:line each]**
-3. **Valid states** incl. default-init (before any producer writes):
-   **[TODO]**
-4. **Invariants the consumers assume** (esp. uncommon paths: retx, FAIL re-anchor,
-   config switch, batch boundary): **[TODO]**
-5. **What the jitter term changes** — which assumption(s) it alters, walked per
-   consumer: **[TODO]**
+**RESOLUTION: the SOF-jitter term is NOT shipped (see §9/F1).** The per-frame
+decode-drive pins the FFT window at a deterministic ring offset, so a wire→cap
+sample-alignment jitter cannot move the decode result — it would be a no-op against
+the pinned window (and adding a no-op that LOOKS like an impairment would be
+misleading). The audit below is recorded for the future case where the decode-drive
+is changed to run a real per-frame coarse search.
+
+1. **Producers**: `ring_write_index` written by `prep_pull_inline`
+   (`arq_commander.cc:9892`, `+= symbol_period % sp`). `coarse_metric` written by the
+   OFDM timing search (`ofdm.cc:2820+`, `best_coarse_metric`). `ofdm_drift_per_frame`
+   — per-frame timing-drift accumulator (PHY).
+2. **Consumers**: `ring_write_index` read by the OFDM decode snapshot
+   (`arq_common.cc:6214`, snapshots ONLY at `frames_to_read==0`) and the coarse
+   search window. `coarse_metric` read by the sub-peak-recovery gate
+   (`telecom_system.cc:3007`, `>= 0.97`) + the OFDM-OK/FAIL log
+   (`telecom_system.cc:2991/3092`).
+3. **Valid states**: pre-write `ring_write_index=0` (reset at TX-END,
+   `arq_common.cc:4066`); `frames_to_read` armed to `preamble_nSymb+Nsymb` on
+   RECEIVING entry.
+4. **Invariants**: the decode snapshot assumes a frame-aligned window at the falling
+   edge of `frames_to_read` to 0 (the per-frame decode-drive guarantees this); a SOF
+   jitter would VIOLATE the alignment — which is precisely why it cannot be added
+   without first un-pinning the decode-drive.
+5. **What the jitter term changes**: it would shift the wire→cap byte alignment, but
+   the decode-drive re-aligns to symbol boundaries, so no consumer observes it ⇒ no-op.
 
 GATE-2 sample-accounting invariant (owned by the companion cadence doc): the wire
 delivers whole-integer `sp`-sample symbols and ticks the shared clock by exactly
@@ -178,7 +214,68 @@ ceiling REGRESSES, STOP. **Result recorded below in §7.**
   fntree comment banners). Both features present and intact.
 - `MERCURY_SIM2_MINI_NSYM` knob: `telecom_system.cc:546-572` (default 1,
   byte-identical; clamped [1, full_nsymb]; PURE).
-- EVM-ceiling re-validation: **see structured result for this Phase-0 run.**
+- EVM-ceiling re-validation (Phase 0b): **PASS.** CFG16 single-batch (2000 B,
+  impairments off) decodes clean: var≈0.0316-0.0332 ⇒ EVM ≈ 14.8-15.0 dB (within
+  14.6±0.3), meanH 0.982-0.983, iter 3-4, 13 OK / 0 FAIL, bytes_ok=1. The det-floor
+  survived the merge.
+- Default-off byte-identity: legacy 19-byte ROBUST_0 smoke unchanged
+  (rx="MERCURY-2INST-HELLO", iters=15); ARM A default-off == pre-impairment baseline
+  (iters=4, sim_ms=14854, 13 OK/0 FAIL).
+- GATE-2 determinism (impairments ON, completing/clean config, same seed twice):
+  byte-identical OFDM stream + iters=4 + bytes_ok=1. (A non-completing cascade config
+  differs ONLY at the tail by wall-clock-timeout truncation, not nondeterminism.)
+- Production -m ARQ byte-identical: `cl_sim_awgn` has NO production callers (grep:
+  only `arq_commander.cc` `test_sim_inproc_2`); never instantiated in -m ARQ.
+- `--test-sim-clock`: 0 failed.
+
+## §9. CRITICAL FINDINGS — the acceptance-test cascade is multi-batch-intrinsic
+
+**F1 — SFO does not discriminate in-sim (sim-architecture limitation, not a bug).**
+The per-frame decode-drive (single-symbol pacing + decode at `frames_to_read==0`,
+`arq_commander.cc:9790-9842`, commit 9336c23) hands the OFDM decoder a FRAME-ALIGNED
+window at a deterministic ring offset, BYPASSING the Schmidl-Cox timing acquisition
+that SFO perturbs on HW. Verified: SFO at 50 ppm AND 500 ppm leaves ARM A and ARM B
+byte-identical to off. The very fix that made OFDM decode in-sim also removed the
+timing-acquisition fragility. SFO is faithfully modeled in the sample content (flows
+through the real RX `rational_resampler`) but cannot move a pinned window. NOT tuned
+around (that would mask, CLAUDE.md §2) — the stage is left correct + default-off.
+
+**F2 — CFO is the in-sim lever but only over a LONG session.** MINI-vs-FULL is
+explicit in the freq path (`telecom_system.cc:2484`: MINI reuses prev-frame CFO; FULL
+re-runs Moose). An AR(1) drift exercises it. BUT a single short batch (13 frames ≈ 1 s)
+is too short: at any drift where the FULL stays clean (≤0.5 Hz / f3db 0.1), the MINI's
+stale-by-one-frame CFO is absorbed by the per-symbol CPE corrector + ZF estimator
+(var ~0.01-0.03, 13 OK / 0-2 FAIL, bytes_ok=1) — no cascade (the code comment at
+`telecom_system.cc:2489` predicted exactly this: "stale-by-one-frame CFO on a
+clean/short tail frame is safe"). A drift fast enough to cascade the MINI (≥1 Hz) ALSO
+breaks the FULL — the anti-tuning gate fails. Verified by sweep.
+
+**F3 — the faithful cascade is intrinsically multi-batch / long-session.** The HW
+cascade (`p_on_cfg16_clean.json`: 408.9 vs 3229.7 bps −87%; low_metric_frac 0.46;
+ofdm_fail 56/264 ≈ 21%; nReSent 320; ack_frac 0.65) COMPOUNDS the stale-CFO per-frame
+error across MANY batches over 300 s AND amplifies it through the SACK-retx cascade
+into a hard stall. A single-batch in-sim test cannot reproduce a cross-batch-
+compounding phenomenon through any faithful impairment.
+
+**Correction to §5:** the design assumed `MERCURY_SIM2_PAYLOAD_BYTES=8000` is "a
+single pinned batch with many tail frames; multi-batch NOT required." MEASURED: 8000 B
+at CFG16 (frame ≈ 155 B data, batch = 25 frames ≈ 3.4 KB) spans ~3 batches; even a
+single batch is only ~13-25 frames ≈ 1 s — far too short for the cross-batch cascade.
+The faithful acceptance test REQUIRES the multi-batch path.
+
+**DEPENDENCY:** multi-batch in-sim is BLOCKED. The sibling worktree
+`win/sim-multibatch-deferTX` implements Option (a) defer-the-TX (audited, §6 of that
+worktree's copy of this doc); it correctly stops the depth-1 reentrant-TX spin
+(DEFER-TX fires 1154× at depth 1), but multi-batch STILL does not complete because of
+a SECOND deadlock facet: the responder→commander SACK/ACK turnaround delivery does not
+complete under the single-thread pump's depth-0-gated delivery, so the commander
+LINK-TIMEOUTs and re-HAILs instead of advancing to batch 2. That facet is in the pump
+delivery cadence — the territory of Option (b) (the role-agnostic pump rewrite) which
+the task explicitly scoped OUT. Surfaced for a decision.
+
+**NET:** impairment stages correct + deterministic + calibrated + default-off
+byte-identical; Phase 0b holds. The two-sided ARM A/B/C discrimination is NOT
+demonstrable single-batch and is gated on the multi-batch unblock (Option b).
 
 ## §8. Calibration artifacts (already captured — CONSUME only)
 

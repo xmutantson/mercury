@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 
 // Portable Gaussian source: Box-Muller on a splitmix64 stream. Byte-for-byte
 // equal to sim_channel_relay.py:Xoshiro (the misnomer is preserved from the
@@ -345,6 +346,378 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// SAMPLE-RATE OFFSET (SFO) — the DOMINANT time-domain impairment.
+//
+// fact-documents/data-flow-sim2-time-domain-faithfulness.md §1. The 2-instance
+// in-process wire is a PERFECT shared clock: sim2_drain_to_wire moves whole-
+// integer sp-sample symbols and ticks ONE shared clock by exactly sp
+// (arq_commander.cc:9700-9732), so SFO=0. Two independent crystal oscillators
+// (the two Fe-Pi soundcards) instead run at slightly different sample rates, so
+// the receiver's notion of "one sample" drifts from the transmitter's. That
+// differential SFO is the dominant reason the 1-symbol MINI preamble (LEVER P)
+// fails on HW while the 4-symbol FULL survives:
+//   • the Schmidl & Cox half-symbol-repeat identity r[d+m]=r[d+m+L] holds only
+//     when the two repeated halves are sample-aligned. SFO sub-sample-misaligns
+//     them, deflating |P|² (S&C 1997 §III). At the 4-sym FULL preamble the long
+//     integration length L=nsym·Nfft/nIS averages this down; at the 1-sym MINI
+//     L is 4× shorter so the timing-metric VARIANCE (S&C eq.20, σ²∝1/L) is ~4×
+//     larger ⇒ the peak-pick jitters ±1 OFDM symbol.
+//   • the integer part of the accumulated SFO phase SKIPS/REPEATS a whole input
+//     sample, which is the SOF integer-creep that walks the FFT window across
+//     the batch tail; the fractional part is the sub-sample shift.
+//
+// MODEL (ported from GNU Radio gr-channels sro_model_impl.cc — BSD/GPL, cited,
+// re-implemented from the algorithm, not copied): a per-OUTPUT-sample Gaussian
+// random-walk frequency offset d_sro (in Hz) CLAMPED to ±sro_max_dev, giving an
+// instantaneous resample ratio mu_inc = 1 + d_sro/fs. The read pointer into the
+// input stream advances by mu_inc each output sample; the integer part skips/
+// repeats input samples, the fractional part is applied with a short 4-tap cubic
+// (Lagrange) Farrow fractional interpolator (GNU Radio mmse_fir_interpolator uses
+// the same idea; cubic Lagrange is the standard low-tap form, Erup/Gardner/Harris
+// 1993 "Interpolation in Digital Modems II"). This is a STATEFUL CONTINUOUS
+// resampler: the fractional accumulator mu_ and a small input-history ring carry
+// across process() blocks so there is NO per-block discontinuity (mirrors the
+// Hilbert/det-floor FIR state).
+//
+// SAMPLE ACCOUNTING (GATE-2): process() consumes n input samples and emits
+// EXACTLY n output samples in place. The drift means the resampler would, over a
+// long run, want slightly more/fewer input samples than output samples; we
+// reconcile by buffering pending input in a ring and, when the read pointer
+// outruns available input, holding the last sample (a momentary stall that is
+// itself part of the SFO signature — the same thing a real ASRC does at a buffer
+// edge). The wire still delivers whole-integer sp-sample symbols and ticks the
+// clock by exactly sp — only the CONTENT is the resampled drifting copy.
+//
+// MAGNITUDE (calibrated to MEASURED HW, NOT magic numbers):
+//   • LeapSecond.com GPS-1PPS soundcard characterization: 44 ppm static + drift.
+//   • Yamaha A/D converter spec: ±25 ppm.
+//   • Two independent Fe-Pi crystals ⇒ differential ±50-90 ppm.
+//   • HW-direct p_on_rsp.log CLK-drift forensics: ±100-500 ppm typical,
+//     transients to +2456 ppm.
+//   Default sro_ppm = 50 ppm static bias (≈ 2.4 Hz at fs=48 kHz), walk_ppm tuned
+//   so the random walk adds ±1-2 ppm/hour-scale wander clamped to a ±90 ppm band.
+//   Range knob 25-90 ppm. Default-OFF: sro_ppm==0 && walk_ppm==0 ⇒ a no-op pass
+//   (no rng draw, no state change) ⇒ MERCURY_SIM_2INST with no extra env stays
+//   byte-identical (GATE-2 same-seed-twice + the legacy 19-byte smoke unchanged).
+//
+// DETERMINISM: own cl_sim_xoshiro seeded by a fixed bijection of the ctor seed
+// (the pn_seed() pattern), NEVER drawing from the AWGN/PN rng_. Per-direction
+// seed separation propagates (A→B / B→A seeds differ ⇒ transformed SFO seeds
+// differ). MERCURY_SIM2_SFO_SEED overrides for sensitivity sweeps.
+class cl_sim_sfo
+{
+public:
+	// seed        : distinct from AWGN/PN seeds (GATE-2).
+	// sro_ppm     : STATIC mean sample-rate offset in ppm (the crystal bias).
+	// walk_ppm    : per-sample Gaussian random-walk std in ppm (slow wander).
+	// max_dev_ppm : hard clamp on |total offset| in ppm (the ±band).
+	// fs_hz       : passband sample rate (48000) — for the Hz print only; the
+	//               ratio math is dimensionless in ppm.
+	cl_sim_sfo(uint64_t seed, double sro_ppm, double walk_ppm,
+	           double max_dev_ppm, double fs_hz)
+		: rng_(seed)
+	{
+		(void)fs_hz;
+		bias_     = sro_ppm * 1e-6;            // static fractional rate offset
+		walk_     = walk_ppm * 1e-6;           // per-sample random-walk std (fractional)
+		max_dev_  = (max_dev_ppm > 0.0 ? max_dev_ppm : 90.0) * 1e-6;
+		enabled_  = (sro_ppm != 0.0) || (walk_ppm != 0.0);
+		// Read-pointer fractional accumulator: mu_ in [0,1) is the sub-sample
+		// position between hist_ taps; the input-history ring holds the most recent
+		// samples for the 4-tap cubic interpolator.
+		mu_       = 0.0;
+		walk_state_ = 0.0;                     // current random-walk component (fractional)
+		hpos_     = 0;
+		hcount_   = 0;
+		for (int i = 0; i < HLEN; i++) hist_[i] = 0.0;
+		warm_     = false;
+	}
+
+	// Resample a passband block IN PLACE: n input samples -> n output samples,
+	// content drifted by the instantaneous SFO. No-op + no state/rng change when
+	// disabled (byte-identical to the pre-SFO channel).
+	//
+	// STREAMING RESAMPLER (n-in / n-out exact, phase-continuous across blocks):
+	//   • A history ring `hist_` holds the most-recent input samples (the 4 taps
+	//     of the cubic Lagrange interpolator + slack). It carries across blocks so
+	//     the leading taps of this block see the tail of the previous block — no
+	//     edge discontinuity.
+	//   • `mu_` ∈ [0,1) is the sub-sample read position between the two center taps.
+	//   • For each OUTPUT sample we advance mu_ by the instantaneous ratio
+	//     `1 + offset`, where offset = bias_ + walk (clamped to ±max_dev_). When mu_
+	//     crosses 1.0 we PUSH the next available input sample into the ring (consume
+	//     one input); when it would cross 2.0 in one step (|offset|>1, never happens
+	//     at ppm-scale) we'd push two. At the block's trailing edge, if the resampler
+	//     wants an input we don't have yet, we HOLD the last input (ASRC edge stall —
+	//     itself part of the SFO signature). The leftover fractional position lives
+	//     in mu_ for the next block ⇒ the integer skip/repeat emerges naturally at
+	//     block boundaries (the SOF integer-creep).
+	void process(double* x, size_t n)
+	{
+		if (!enabled_ || n == 0) return;
+		// On the very first block, prime the ring with the first input sample so the
+		// interpolator's "previous" taps are defined (zero-state otherwise injects a
+		// startup transient; priming with x[0] is the neutral choice).
+		if (!warm_) {
+			for (int i = 0; i < HLEN; i++) hist_[i] = x[0];
+			hpos_ = 0; hcount_ = HLEN;
+			warm_ = true;
+		}
+		size_t in_idx = 0;                 // next input sample to consume from x[]
+		for (size_t j = 0; j < n; j++)
+		{
+			// Instantaneous fractional rate offset = static bias + clamped walk.
+			walk_state_ += walk_ * rng_.gauss();
+			if (walk_state_ >  max_dev_) walk_state_ =  max_dev_;
+			if (walk_state_ < -max_dev_) walk_state_ = -max_dev_;
+			double offset = bias_ + walk_state_;
+			if (offset >  max_dev_) offset =  max_dev_;
+			if (offset < -max_dev_) offset = -max_dev_;
+			double ratio = 1.0 + offset;   // ~ 1 ± 9e-5
+
+			// Advance the read pointer; consume whole input samples as mu_ crosses 1.
+			mu_ += ratio;
+			while (mu_ >= 1.0) {
+				double s = (in_idx < n) ? x[in_idx] : hist_[(hpos_ - 1 + HLEN) % HLEN];
+				if (in_idx < n) in_idx++;  // else HOLD last (trailing-edge stall)
+				hist_[hpos_] = s;
+				hpos_ = (hpos_ + 1) % HLEN;
+				if (hcount_ < HLEN) hcount_++;
+				mu_ -= 1.0;
+			}
+			// 4-tap cubic Lagrange interpolation at fractional position mu_ between
+			// the two center taps. Tap layout (newest = hist_[(hpos_-1)]):
+			//   p0 = sample[k-1], p1 = sample[k], p2 = sample[k+1 == newest], p3 ...
+			// We use the 4 newest ring samples y0..y3 (oldest..newest) and evaluate
+			// the cubic at t = mu_ relative to y2 (Erup/Gardner/Harris 1993 form).
+			double y3 = hist_[(hpos_ - 1 + HLEN) % HLEN];   // newest (just pushed)
+			double y2 = hist_[(hpos_ - 2 + HLEN) % HLEN];
+			double y1 = hist_[(hpos_ - 3 + HLEN) % HLEN];
+			double y0 = hist_[(hpos_ - 4 + HLEN) % HLEN];   // oldest
+			double t  = mu_;                                 // [0,1) between y2 and y3
+			// Cubic Lagrange (4-point) interpolation, points at x=-1,0,1,2 = y0,y1,y2,y3,
+			// evaluated at x = 1 + t (between y2 and y3 in this index convention):
+			double xt = 1.0 + t;
+			double L0 = -(xt)*(xt-1.0)*(xt-2.0)/6.0;
+			double L1 =  (xt+1.0)*(xt-1.0)*(xt-2.0)/2.0;
+			double L2 = -(xt+1.0)*(xt)*(xt-2.0)/2.0;
+			double L3 =  (xt+1.0)*(xt)*(xt-1.0)/6.0;
+			x[j] = y0*L0 + y1*L1 + y2*L2 + y3*L3;
+		}
+	}
+
+	bool enabled() const { return enabled_; }
+
+private:
+	static const int HLEN = 8;     // history ring (>= interpolator span + slack)
+	cl_sim_xoshiro rng_;
+	bool   enabled_;
+	bool   warm_;
+	double bias_, walk_, max_dev_;
+	double mu_;            // fractional read-pointer position in [0,1)
+	double walk_state_;    // current random-walk fractional-rate component
+	double hist_[HLEN];
+	int    hpos_, hcount_;
+};
+
+// ---------------------------------------------------------------------------
+// CARRIER FREQUENCY OFFSET (CFO) — the secondary cross-frame phase ramp.
+//
+// fact-documents/data-flow-sim2-time-domain-faithfulness.md §2. DISTINCT from
+// cl_sim_phase_noise: PN is a per-symbol-RESET common-phase EVM ceiling; CFO is
+// a CONTINUOUS cross-frame carrier phase RAMP. The MINI preamble never re-runs
+// Moose (telecom_system.cc:2462-2474 — the MINI reuses the stale CFO estimate),
+// so an un-tracked residual CFO walks the demod constellation across the batch
+// tail; the 4-sym FULL re-estimates Moose every frame and is immune. This is the
+// residual that survives Moose acquisition (post-Moose residual band, ofdm.cc:2477).
+//
+// MODEL: per-acquisition static residual ~N(0,σ_cfo) plus a slow clamped random-
+// walk drift, applied as a continuous frequency shift of the REAL passband.
+// A real passband cannot be naive-multiplied by exp(j·θ); we form the analytic
+// signal with a stateful Type-III Hilbert FIR (the SAME proven construction as
+// cl_sim_phase_noise) and rotate: y[n] = Re{ (x_d + j·x_h)·e^{jφ[n]} } where
+// φ[n] is the continuous CFO phase accumulator. Power-preserving to the Hilbert
+// band edges, so the SNR3k axis is unchanged (CFO applied BEFORE AWGN in process()).
+//
+// MAGNITUDE: σ_cfo ~ 5-20 Hz (the post-Moose residual band; Moose clamps ±93.75 Hz
+// WB but leaves a few-Hz residual). Default σ_cfo = 8 Hz static residual drawn
+// ONCE per direction (one acquisition), walk std a fraction of a Hz/sample clamped
+// to a ±25 Hz band. Default-OFF: cfo_hz==0 && walk_hz==0 ⇒ no-op (no rng, no
+// state) ⇒ byte-identical. Knobs MERCURY_SIM2_CFO_HZ / _CFO_WALK_HZ / _CFO_SEED.
+//
+// DETERMINISM: own xoshiro seeded by a distinct bijection of the ctor seed; the
+// static residual is one gauss() draw at construction (per-acquisition), so the
+// per-direction residual is fixed-but-distinct (A→B / B→A seeds differ).
+class cl_sim_cfo
+{
+public:
+	// cfo_sigma_hz : per-acquisition STATIC residual std (one draw, frame-flat).
+	// drift_hz     : stationary std of the SLOW cross-frame drift (a clamped AR(1)
+	//                / Ornstein-Uhlenbeck process). This is INTRA-FRAME FLAT (the
+	//                AR(1) pole is set so the correlation time spans many frames),
+	//                so within any one frame the CFO is ~constant — Moose (one
+	//                estimate/frame, FULL preamble) tracks it cleanly. The MINI
+	//                preamble REUSES the previous frame's stale estimate
+	//                (telecom_system.cc:2484), so it accumulates the cross-frame
+	//                drift delta ⇒ the constellation rotates ⇒ LDPC fails. A Wiener
+	//                (free random walk) was rejected: it drifts WITHIN a frame too
+	//                (grows ∝√n) and breaks the FULL arm — the anti-tuning gate.
+	// drift_f3db   : correlation bandwidth (Hz) of the AR(1) drift (small ⇒ slow).
+	cl_sim_cfo(uint64_t seed, double cfo_sigma_hz, double drift_hz,
+	           double max_dev_hz, double fs_hz, double drift_f3db_hz)
+		: rng_(seed)
+	{
+		fs_hz_   = fs_hz;
+		max_dev_hz_ = (max_dev_hz > 0.0 ? max_dev_hz : 25.0);
+		enabled_ = (cfo_sigma_hz > 0.0) || (drift_hz > 0.0);
+		// Per-acquisition static residual: ONE draw (a fixed offset for this run/
+		// direction), so the ramp is deterministic per seed.
+		resid_hz_ = (cfo_sigma_hz > 0.0) ? (cfo_sigma_hz * rng_.gauss()) : 0.0;
+		if (resid_hz_ >  max_dev_hz_) resid_hz_ =  max_dev_hz_;
+		if (resid_hz_ < -max_dev_hz_) resid_hz_ = -max_dev_hz_;
+		// Clamped AR(1) drift: ρ = exp(-2π·f3db/fs); per-sample gain set so the
+		// stationary std == drift_hz. Warmed to stationary at construction.
+		drift_sigma_hz_ = (drift_hz > 0.0) ? drift_hz : 0.0;
+		rho_drift_ = std::exp(-2.0 * M_PI * (drift_f3db_hz > 0.0 ? drift_f3db_hz : 0.05) / fs_hz_);
+		double ss = 1.0 / std::sqrt(1.0 - rho_drift_ * rho_drift_);
+		drift_gain_ = (ss > 0.0 && drift_sigma_hz_ > 0.0) ? (drift_sigma_hz_ / ss) : 0.0;
+		drift_state_ = 0.0;
+		if (drift_gain_ > 0.0)
+			for (int i = 0; i < 8000; i++)
+				drift_state_ = rho_drift_ * drift_state_ + rng_.gauss();
+		phase_ = 0.0;
+		build_hilbert();
+		hist_pos_ = 0;
+		for (int i = 0; i < HIST_LEN; i++) hist_[i] = 0.0;
+	}
+
+	// Apply the continuous CFO frequency shift to a passband block IN PLACE.
+	// No-op + no state/rng change when disabled.
+	void process(double* x, size_t n)
+	{
+		if (!enabled_ || n == 0) return;
+		for (size_t i = 0; i < n; i++)
+		{
+			// Slow clamped AR(1) drift of the instantaneous CFO (intra-frame flat).
+			if (drift_gain_ > 0.0) {
+				drift_state_ = rho_drift_ * drift_state_ + rng_.gauss();
+			}
+			double cfo = resid_hz_ + drift_gain_ * drift_state_;
+			if (cfo >  max_dev_hz_) cfo =  max_dev_hz_;
+			if (cfo < -max_dev_hz_) cfo = -max_dev_hz_;
+
+			// Stateful analytic pair (Type-III Hilbert FIR, group delay D).
+			hist_[hist_pos_] = x[i];
+			double xd = hist_[(hist_pos_ - DELAY + 2 * HIST_LEN) % HIST_LEN];
+			double xh = 0.0;
+			for (int k = 1; k <= DELAY; k += 2) {
+				double c = htap_[k];
+				double a = hist_[(hist_pos_ - (DELAY - k) + 2 * HIST_LEN) % HIST_LEN];
+				double b = hist_[(hist_pos_ - (DELAY + k) + 2 * HIST_LEN) % HIST_LEN];
+				xh += c * (a - b);
+			}
+			hist_pos_ = (hist_pos_ + 1) % HIST_LEN;
+
+			phase_ += 2.0 * M_PI * cfo / fs_hz_;
+			if (phase_ >  M_PI) phase_ -= 2.0 * M_PI;
+			if (phase_ < -M_PI) phase_ += 2.0 * M_PI;
+			double ct = std::cos(phase_), st = std::sin(phase_);
+			x[i] = xd * ct - xh * st;   // Re{ (xd + j·xh)·e^{jφ} }
+		}
+	}
+
+	bool enabled() const { return enabled_; }
+
+private:
+	static const int HILB_LEN = 65;
+	static const int DELAY    = (HILB_LEN - 1) / 2;
+	static const int HIST_LEN = HILB_LEN + 1;
+
+	void build_hilbert()
+	{
+		for (int k = 0; k <= DELAY; k++) htap_[k] = 0.0;
+		for (int k = 1; k <= DELAY; k += 2) {
+			double ideal = 2.0 / (M_PI * (double)k);
+			double w = 0.54 - 0.46 * std::cos(2.0 * M_PI * (double)(DELAY - k) /
+			                                  (double)(HILB_LEN - 1));
+			htap_[k] = ideal * w;
+		}
+	}
+
+	cl_sim_xoshiro rng_;
+	bool   enabled_;
+	double fs_hz_, max_dev_hz_;
+	double resid_hz_;        // per-acquisition static residual (one draw)
+	double drift_sigma_hz_;  // stationary std of the slow AR(1) drift
+	double rho_drift_;       // AR(1) pole
+	double drift_gain_;      // per-step gain for exact stationary std
+	double drift_state_;     // AR(1) state
+	double phase_;           // continuous CFO phase accumulator
+	double htap_[DELAY + 1];
+	double hist_[HIST_LEN];
+	int    hist_pos_;
+};
+
+// ---------------------------------------------------------------------------
+// AGC TRANSIENT — lowest-priority burst-onset gain settle (add LAST).
+//
+// fact-documents/data-flow-sim2-time-domain-faithfulness.md §4. A one-pole gain
+// settle g[n] = g_ss + (g_0 - g_ss)·exp(-n/τ) over the first ~1 symbol of a fresh
+// burst. The metric is energy-normalized so a smooth ramp largely cancels — this
+// is the lowest-priority lever, added only if a residual gap remains after SFO+CFO.
+// τ ~0.5-1 symbol; g_0 = g_ss·10^(step_db/20). Default-OFF (tau_sym==0 ⇒ no-op).
+// Knobs MERCURY_SIM2_AGC_TAU_SYM / _AGC_STEP_DB. Deterministic (no rng).
+class cl_sim_agc_transient
+{
+public:
+	// symbol_period unknown at ctor (set lazily from the first block size n, which
+	// is exactly one OFDM symbol — see the process() block-size note). tau_samp_ /
+	// win_ are derived on first trigger().
+	cl_sim_agc_transient(double tau_sym, double step_db)
+	{
+		enabled_ = (tau_sym > 0.0);
+		tau_sym_ = tau_sym;
+		g0_ = std::pow(10.0, step_db / 20.0);   // initial gain rel. steady-state
+		tau_samp_ = 0.0;
+		win_ = 0;
+		n_   = -1;   // <0 = no active burst
+		inited_ = false;
+	}
+
+	// Mark the start of a fresh burst (gain restarts the settle). `symbol_period`
+	// is the current block size (one OFDM symbol). Sets the time-constant on first
+	// call.
+	void trigger(int symbol_period)
+	{
+		if (!enabled_ || symbol_period <= 0) return;
+		if (!inited_) {
+			tau_samp_ = tau_sym_ * (double)symbol_period;
+			win_ = (int)(4.0 * tau_samp_ + 0.5);
+			inited_ = true;
+		}
+		n_ = 0;
+	}
+
+	void process(double* x, size_t n)
+	{
+		if (!enabled_ || n_ < 0 || n == 0 || !inited_) return;
+		for (size_t i = 0; i < n; i++) {
+			if (n_ >= win_) { n_ = -1; break; }  // settled; gain == 1 hereafter
+			double g = 1.0 + (g0_ - 1.0) * std::exp(-(double)n_ / tau_samp_);
+			x[i] *= g;
+			n_++;
+		}
+	}
+
+	bool enabled() const { return enabled_; }
+
+private:
+	bool   enabled_, inited_;
+	double tau_sym_, tau_samp_, g0_;
+	int    win_, n_;
+};
+
+// ---------------------------------------------------------------------------
 // DETERMINISTIC frequency-selective passband FIR — the HW EVM/meanH FLOOR.
 //
 // fact-documents/sim2-cfg16-phase-noise-faithfulness.md §5b/§9. The HW EVM
@@ -528,12 +901,20 @@ public:
 		                  pn_droop(), pn_resid(), pn_slow_f3db()),
 		  det_(det_echo_db(), det_echo_dly(), det_echo_n(), det_echo_step(),
 		       det_tilt_db(), det_tilt_dly(),
-		       det_ap_g(), det_ap_dly(), det_ap_n())
+		       det_ap_g(), det_ap_dly(), det_ap_n()),
+		  // TIME-DOMAIN-FAITHFULNESS stages (default-OFF ⇒ byte-identical). Each
+		  // gets its OWN xoshiro seeded by a distinct bijection of the ctor seed
+		  // (the pn_seed() pattern), NEVER drawing from rng_ or the PN stream; the
+		  // per-direction seed separation (A→B / B→A differ in bit 0) propagates.
+		  sfo_(sfo_seed(seed), sfo_ppm(), sfo_walk_ppm(), sfo_max_dev_ppm(), 48000.0),
+		  cfo_(cfo_seed(seed), cfo_hz(), cfo_walk_hz(), cfo_max_dev_hz(), 48000.0, cfo_drift_f3db()),
+		  agc_(agc_tau_sym(), agc_step_db())  // symbol_period set lazily on trigger()
 	{
 		clean_     = (snr3k_db >= 900.0);
 		snr_lin_   = clean_ ? 0.0 : std::pow(10.0, snr3k_db / 10.0);
 		peak_ms_   = 0.0;
 		noise_std_ = 0.0;
+		prev_silent_ = true;
 	}
 
 	// PN-rotate (always, incl. clean) then add AWGN (skipped when clean). Sticky
@@ -544,10 +925,33 @@ public:
 	{
 		if (n == 0) return;
 
+		// --- TIME-DOMAIN-FAITHFULNESS stages (all default-OFF ⇒ no-op pass) ---
+		// Order matters: SFO/CFO are the TX/RX clock-offset impairments that act on
+		// the channel INPUT (the drifting copy the production RX rational_resampler +
+		// Moose then process), so they run FIRST, ahead of the fixed passband floor.
+		// AGC transient runs LAST of the deterministic stages (on a fresh burst's
+		// onset, after the signal shaping, before AWGN).
+		sfo_.process(x, n);   // [DOMINANT] sample-rate offset (drifting resample)
+		cfo_.process(x, n);   // secondary cross-frame carrier phase ramp
+
 		det_.apply(x, n);   // DETERMINISTIC freq-selective floor (dominant EVM/meanH)
 		pn_.rotate(x, n);   // small residual phase noise on top (near-but-not-zero sd)
 
-		if (clean_) return; // clean cell: floor+PN only, no additive AWGN
+		// AGC burst-onset transient: detect a silence->signal edge (this block has
+		// real energy, the previous block was silent) and re-arm the settle. The
+		// metric is energy-normalized so the smooth ramp largely cancels — lowest
+		// priority, OFF by default.
+		if (agc_.enabled())
+		{
+			double e = 0.0;
+			for (size_t i = 0; i < n; i++) e += x[i] * x[i];
+			bool silent = (e / (double)n) < 1e-9;
+			if (!silent && prev_silent_) agc_.trigger((int)n);
+			prev_silent_ = silent;
+			agc_.process(x, n);
+		}
+
+		if (clean_) return; // clean cell: floor+PN(+SFO/CFO/AGC) only, no additive AWGN
 
 		double ms = 0.0;
 		for (size_t i = 0; i < n; i++) ms += x[i] * x[i];
@@ -746,11 +1150,104 @@ private:
 	{
 		return (s ^ 0xD1B54A32D192ED03ULL) + 0x9E3779B97F4A7C15ULL;
 	}
+	// Distinct seed bijections for the SFO/CFO stages (same pattern as pn_seed:
+	// a fixed XOR + golden-ratio add). Each transform is a bijection so the
+	// per-direction seed separation (A→B/B→A differ in bit 0) propagates, and each
+	// is distinct so the SFO/CFO/PN streams never alias. GATE-2: same ctor seed ⇒
+	// identical SFO/CFO streams. Env overrides for sensitivity sweeps.
+	static uint64_t sfo_seed(uint64_t s)
+	{
+		const char* e = std::getenv("MERCURY_SIM2_SFO_SEED");
+		if (e && *e) return (uint64_t)strtoull(e, nullptr, 10);
+		return (s ^ 0x2545F4914F6CDD1DULL) + 0xC2B2AE3D27D4EB4FULL;
+	}
+	static uint64_t cfo_seed(uint64_t s)
+	{
+		const char* e = std::getenv("MERCURY_SIM2_CFO_SEED");
+		if (e && *e) return (uint64_t)strtoull(e, nullptr, 10);
+		return (s ^ 0x8EBC6AF09C88C6E3ULL) + 0x589965CC75374CC3ULL;
+	}
+
+	// --- SFO knobs (env-overridable; default 0 = DISABLED ⇒ byte-identical). ---
+	//   MERCURY_SIM2_SFO_PPM      : static sample-rate offset in ppm (0 = off; the
+	//                               dominant lever; calibrated 50 ppm ≈ 2.4 Hz @48k).
+	//   MERCURY_SIM2_SFO_WALK_PPM : per-sample random-walk std in ppm (slow wander).
+	//   MERCURY_SIM2_SFO_MAX_PPM  : hard clamp on |total offset| in ppm (±band).
+	static double sfo_ppm()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_SFO_PPM");
+		return (e && *e) ? atof(e) : 0.0;     // default OFF
+	}
+	static double sfo_walk_ppm()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_SFO_WALK_PPM");
+		double v = (e && *e) ? atof(e) : 0.0; // default OFF
+		return (v < 0.0) ? 0.0 : v;
+	}
+	static double sfo_max_dev_ppm()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_SFO_MAX_PPM");
+		double v = (e && *e) ? atof(e) : 90.0;
+		return (v <= 0.0) ? 90.0 : v;
+	}
+	// --- CFO knobs (env-overridable; default 0 = DISABLED ⇒ byte-identical). ---
+	//   MERCURY_SIM2_CFO_HZ        : per-acquisition STATIC residual std in Hz (0 = off;
+	//                                frame-flat, one draw; the FULL Moose tracks it).
+	//   MERCURY_SIM2_CFO_WALK_HZ   : stationary std of the SLOW cross-frame AR(1)
+	//                                drift in Hz (intra-frame flat). This is the
+	//                                lever that discriminates MINI (reuses stale CFO,
+	//                                accumulates the cross-frame delta) from FULL
+	//                                (re-measures every frame). NOT a Wiener walk.
+	//   MERCURY_SIM2_CFO_DRIFT_F3DB: AR(1) correlation bandwidth (Hz, default 0.05 —
+	//                                a ~3 s correlation time ⇒ many-frame-flat).
+	//   MERCURY_SIM2_CFO_MAX_HZ    : hard clamp on |total CFO| in Hz (±band).
+	static double cfo_hz()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_CFO_HZ");
+		double v = (e && *e) ? atof(e) : 0.0; // default OFF
+		return (v < 0.0) ? 0.0 : v;
+	}
+	static double cfo_walk_hz()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_CFO_WALK_HZ");
+		double v = (e && *e) ? atof(e) : 0.0; // default OFF (now the AR(1) drift std)
+		return (v < 0.0) ? 0.0 : v;
+	}
+	static double cfo_drift_f3db()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_CFO_DRIFT_F3DB");
+		double v = (e && *e) ? atof(e) : 0.05;
+		return (v <= 0.0) ? 0.05 : v;
+	}
+	static double cfo_max_dev_hz()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_CFO_MAX_HZ");
+		double v = (e && *e) ? atof(e) : 25.0;
+		return (v <= 0.0) ? 25.0 : v;
+	}
+	// --- AGC transient knobs (env-overridable; default 0 = DISABLED). ---
+	//   MERCURY_SIM2_AGC_TAU_SYM : settle time constant in OFDM symbols (0 = off).
+	//   MERCURY_SIM2_AGC_STEP_DB : initial gain step in dB rel. steady-state.
+	static double agc_tau_sym()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_AGC_TAU_SYM");
+		double v = (e && *e) ? atof(e) : 0.0; // default OFF
+		return (v < 0.0) ? 0.0 : v;
+	}
+	static double agc_step_db()
+	{
+		const char* e = std::getenv("MERCURY_SIM2_AGC_STEP_DB");
+		return (e && *e) ? atof(e) : 0.0;
+	}
 
 	cl_sim_xoshiro     rng_;
 	cl_sim_phase_noise pn_;
 	cl_sim_det_floor   det_;
+	cl_sim_sfo         sfo_;
+	cl_sim_cfo         cfo_;
+	cl_sim_agc_transient agc_;
 	bool   clean_;
+	bool   prev_silent_;
 	double snr_lin_;
 	double peak_ms_;
 	double noise_std_;
