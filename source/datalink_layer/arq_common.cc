@@ -6935,8 +6935,18 @@ void cl_arq_controller::receive()
 					int sym_period = telecom_system->data_container.Nofdm
 						* telecom_system->data_container.interpolation_rate;
 					int pream_symb = received_message_stats.delay / sym_period;
-					int frame_symb = telecom_system->data_container.Nsymb
-						+ telecom_system->data_container.preamble_nSymb;
+					// LEVER P (INC-3): the beyond-bounds fast-forward `upper` must
+					// match the MINI-aware extraction/gate bound (telecom_system.cc
+					// upper_bound + frame_size_interp). In a MINI batch the tail
+					// frames are (Nsymb+1) symbols, so the FULL-frame `upper` over-
+					// shifts (skips a decodable tail frame) and misreports beyond-
+					// bounds. last_eff_preamble_nsymb carries the active per-frame
+					// preamble length (== preamble_nSymb on every non-MINI /
+					// amortization-off path, so byte-identical when the feature is off).
+					int ff_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
+					if(ff_eff_pre < 1 || ff_eff_pre > telecom_system->data_container.preamble_nSymb)
+						ff_eff_pre = telecom_system->data_container.preamble_nSymb;
+					int frame_symb = telecom_system->data_container.Nsymb + ff_eff_pre;
 					int upper = telecom_system->data_container.buffer_Nsymb - frame_symb;
 
 					if(received_message_stats.frame_data_missing)
