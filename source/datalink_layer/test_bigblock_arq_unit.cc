@@ -1363,6 +1363,341 @@ int cl_arq_controller::test_bigblock_arq_unit()
 }
 
 // ============================================================================
+// FULL-FILL ROUND-TRIP — the MISSING regression (data-flow-bigblock-arq-unit.md §18).
+//
+// CLI: --test-bigblock-roundtrip
+//
+// The HW NOCRC-isolation symptom was on a FULLY-FILLED 1374-byte / 8-codeword block
+// (cw0=156 app bytes after the 18-byte header + 1 CRC byte, cw1..7=174 app bytes each).
+// The pre-existing tests left a gap at THAT boundary:
+//   - CASE A (run_block_loopback): real round-trip but VARIABLE *small* app_len.
+//   - --test-bigblock-multicw: real LIVE 2-instance round-trip but PAYLOAD=1200 (< full).
+//   - the 622-byte synthetic carve: < a full 1374-byte / 8-cw block.
+// This test drives the MAX-FILL 1374-byte / 8-cw block through the REAL pipeline on a
+// CLEAN channel (no noise -> LDPC must decode the whitened bits bit-perfect):
+//   transmit_byte -> transmit_bigblock (whiten payload + per-cw CRC stamp + LDPC encode)
+//   -> CLEAN loopback -> receive_byte -> receive_bigblock (LDPC decode)
+//   -> bigblock_receive_carve (de-whiten + per-cw CRC recompute + carve into messages_rx[]).
+//
+// It DISAMBIGUATES the L1/L2 finder ambiguity (cw_ok_count=8 = real convergence vs
+// forced-oracle stub) by inspecting the bits DIRECTLY at every stage, BYPASSING the
+// forced-oracle cw_ok (which is 1 for all c because tsB->bigblock_last_tx_K==0 -> the
+// :7450 ref==NULL gate is skipped). Three direct checkpoints:
+//   (i)   DECODE: RX decoded info bits (tsB->bigblock_rx_infobits) == TX whitened info
+//         bits (tsA->bigblock_last_tx_cw_info[c]). On a clean channel they MUST match
+//         bit-for-bit; a mismatch = a DECODE/encode/bit-layout bug (the forced oracle
+//         would still say cw_ok=8, so this is the non-vacuous decode truth).
+//   (ii)  DE-WHITEN: de-whitened RX payload == the ORIGINAL pre-whiten 1374-byte block
+//         (tx_truth). A mismatch with (i) clean = a de-whiten seed/offset/length/order
+//         misalign (L1's hypothesis).
+//   (iii) CRC: per-codeword wire CRC-8 recompute over the de-whitened payload MATCHES
+//         each codeword's tail byte (L2's hypothesis: a TX-vs-RX span/offset divergence).
+//   (iv)  DELIVERY: bigblock_receive_carve delivers all 1374 app bytes byte-faithful.
+//
+// If the clean round-trip is byte-faithful at every checkpoint => de-whiten + CRC are
+// INNOCENT and the HW garbage is a BAD DECODE masked by the forced oracle (the RX
+// capture window, already fixed on this branch by --test-bigblock-multicw ARM-C).
+// If it REPRODUCES the garbage => the bug is byte-domain and (i)/(ii)/(iii) pinpoint it.
+// Returns 0 = PASS (full byte-faithful), 1 = FAIL.
+// ============================================================================
+int cl_arq_controller::test_bigblock_roundtrip()
+{
+	printf("[TEST-BIGBLOCK-RT] FULL-FILL 1374-byte / 8-cw round-trip "
+	       "(REAL whiten -> CRC stamp -> LDPC encode -> CLEAN channel -> decode -> "
+	       "de-whiten -> CRC recompute -> carve)\n");
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-BIGBLOCK-RT] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	// Pin K = 8 deterministically (production MERCURY_BIGBLOCK_K cap path).
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_BIGBLOCK_K", "8");
+#else
+	setenv("MERCURY_BIGBLOCK_K", "8", 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else           _putenv_s("MERCURY_BIGBLOCK_K", "");
+#else
+		if(had_prev_k) setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else           unsetenv("MERCURY_BIGBLOCK_K");
+#endif
+	};
+
+	cl_telecom_system* tsA = new cl_telecom_system();
+	cl_telecom_system* tsB = new cl_telecom_system();
+	cl_arq_controller* A   = new cl_arq_controller();
+	cl_arq_controller* B   = new cl_arq_controller();
+	A->telecom_system = tsA;
+	B->telecom_system = tsB;
+
+	auto bringup = [&](cl_arq_controller* a, cl_telecom_system* ts, int role) {
+		a->role            = role;
+		a->sack_enabled    = true;
+		a->sack_v2_enabled = true;
+		a->axis3_sack_mode = 1;
+		a->compression_enabled = false;
+		a->bigblock_skip_fifo_delivery = true;
+		a->nMessages          = 255;
+		a->max_data_length    = 170;
+		a->max_message_length = 200;
+		a->max_header_length  = 6;
+		a->init_messages_buffers();
+		a->load_configuration(CONFIG_16, FULL, YES);
+		ts->bigblock_framing_enabled = true;
+		a->sack_negotiated_recompute_batch(role==COMMANDER ? "CMD" : "RSP");
+	};
+	bringup(A, tsA, COMMANDER);
+	bringup(B, tsB, RESPONDER);
+
+	const int K       = BB_TEST_K;            // 8
+	const int sub_len = tsA->ldpc.K / 8;      // 175 for CFG16
+	const long total_tx_bytes = (long)K * sub_len;   // 1400
+	const int  hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);          // 18
+	const int  cw0_cap   = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;  // 156
+	const int  cwc_cap   = sub_len - BIGBLOCK_CW_CRC_BYTES;              // 174
+	const long full_app  = (long)cw0_cap + (long)(K-1)*cwc_cap;         // 156 + 7*174 = 1374
+	const int  block_bsi = 6;
+
+	printf("[TEST-BIGBLOCK-RT] geometry: K=%d sub_len=%d total_tx_bytes=%ld hdr=%d "
+	       "cw0_cap=%d cwc_cap=%d FULL_app=%ld (target 1374)\n",
+	       K, sub_len, total_tx_bytes, hdr_total, cw0_cap, cwc_cap, full_app);
+	fflush(stdout);
+
+	// MAX-FILL per-codeword app payload (every codeword filled to capacity).
+	std::vector<std::vector<unsigned char>> app_truth((size_t)K);
+	std::vector<int> app_len((size_t)K, 0);
+	for(int i=0;i<K;i++)
+	{
+		int len = (i==0) ? cw0_cap : cwc_cap;
+		app_len[i] = len;
+		app_truth[i].assign((size_t)len, 0);
+		for(int j=0;j<len;j++)
+		{
+			unsigned char b = (unsigned char)((i*131 + j*97 + 41) & 0xFF);
+			app_truth[i][(size_t)j] = b;
+		}
+		A->messages_batch_tx[i].data         = A->messages_tx[i].data;
+		A->messages_batch_tx[i].type         = DATA_LONG;
+		A->messages_batch_tx[i].id           = (char)(unsigned char)i;
+		A->messages_batch_tx[i].length       = len;
+		A->messages_batch_tx[i].batch_seq_id = block_bsi;
+		A->messages_batch_tx[i].status       = ADDED_TO_BATCH_BUFFER;
+		for(int j=0;j<len;j++) A->messages_batch_tx[i].data[j] = (char)app_truth[i][(size_t)j];
+		A->messages_tx[i].status = ADDED_TO_BATCH_BUFFER;
+	}
+	A->message_batch_counter_tx = K;
+
+	// Build the on-wire pre-whiten block payload EXACTLY as bigblock_send_one_block:
+	// header in cw0 prefix + per-codeword app bytes + per-codeword tail CRC-8.
+	std::vector<unsigned char> tx_truth((size_t)total_tx_bytes, 0);
+	tx_truth[0] = (unsigned char)(block_bsi & 0xFF);
+	tx_truth[1] = (unsigned char)(K & 0xFF);
+	for(int c=0;c<K;c++)
+	{
+		int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+		tx_truth[(size_t)lo + 0] = (unsigned char)(app_len[c] & 0xFF);
+		tx_truth[(size_t)lo + 1] = (unsigned char)((app_len[c] >> 8) & 0xFF);
+		int base = (c==0) ? hdr_total : (c*sub_len);
+		for(int j=0;j<app_len[c];j++)
+			tx_truth[(size_t)base + j] = app_truth[c][(size_t)j];
+	}
+	for(int c=0;c<K;c++)
+	{
+		int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+		int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+		if(crc_off < 0 || crc_off >= (int)total_tx_bytes || crc_span < 0) continue;
+		tx_truth[(size_t)crc_off] = A->CRC8_calc((char*)&tx_truth[(size_t)c*sub_len], crc_span);
+	}
+
+	// Flatten app_truth for the variable-length delivered measure.
+	std::vector<unsigned char> app_flat;
+	std::vector<int> app_off((size_t)K, 0);
+	for(int c=0;c<K;c++)
+	{
+		app_off[c] = (int)app_flat.size();
+		for(int j=0;j<app_len[c];j++) app_flat.push_back(app_truth[c][(size_t)j]);
+	}
+
+	// --- REAL round-trip: TX transmit_byte -> transmit_bigblock; clean channel;
+	//     RX receive_byte -> receive_bigblock (decode lands in tsB->bigblock_rx_infobits). ---
+	int interp  = tsA->frequency_interpolation_rate;
+	int block_n = tsA->bigblock_tx_total_samples();
+	bool tx_ok = (block_n > 0);
+	int lead_n  = (int)(100.0 * tsA->sampling_frequency / 1000.0);
+	int trail_n = (int)(50.0  * tsA->sampling_frequency / 1000.0);
+
+	std::vector<int> payload((size_t)tx_truth.size(), 0);
+	for(size_t i=0;i<tx_truth.size();i++) payload[i] = (int)tx_truth[i];
+	std::vector<double> tx_pb((size_t)(block_n>0?block_n:1), 0.0);
+	tsA->bigblock_framing_enabled = true;
+	if(tx_ok)
+	{
+		cl_telecom_system::bigblock_emit_scope emit_guard(tsA, block_n);
+		tsA->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+	}
+	int K_tx = tsA->bigblock_last_tx_K;
+	int n_tx = tsA->bigblock_last_tx_samples;
+	tx_ok = tx_ok && (K_tx == K) && (n_tx > 0);
+	check(tx_ok, "TX emitted a full K=8 block waveform (transmit_bigblock)");
+
+	int K_rx = 0;
+	if(tx_ok)
+	{
+		int rx_window = lead_n + n_tx + trail_n;
+		std::vector<double> rx_pb((size_t)rx_window, 0.0);
+		for(int i=0;i<n_tx;i++) rx_pb[lead_n + i] = tx_pb[i];     // CLEAN loopback (no noise)
+		int Nofdm = tsB->data_container.Nofdm;
+		int saved_buffer_Nsymb = tsB->data_container.buffer_Nsymb;
+		if(Nofdm > 0)
+		{
+			int need_syms = (rx_window + Nofdm*interp - 1) / (Nofdm*interp);
+			tsB->data_container.buffer_Nsymb = need_syms;
+			int exact = need_syms * Nofdm * interp;
+			if((int)rx_pb.size() < exact) rx_pb.resize((size_t)exact, 0.0);
+		}
+		std::vector<int> info_bits_out((size_t)(K+1) * tsB->ldpc.K + tsB->ldpc.K, 0);
+		tsB->bigblock_framing_enabled = true;
+		tsB->receive_byte(rx_pb.data(), info_bits_out.data());
+		tsB->data_container.buffer_Nsymb = saved_buffer_Nsymb;
+		K_rx = tsB->bigblock_last_rx_K;
+	}
+	bool decoded_K = (K_rx == K);
+	int cw_ok_count = tsB->bigblock_last_rx_cw_ok_count;
+	printf("[TEST-BIGBLOCK-RT] decode: K_rx=%d cw_ok_count=%d/%d "
+	       "(cw_ok_count is the FORCED-ORACLE value: tsB->bigblock_last_tx_K=%d -> ref==NULL "
+	       "-> NON-DIAGNOSTIC; the bit checks below bypass it)\n",
+	       K_rx, cw_ok_count, K, tsB->bigblock_last_tx_K);
+	check(decoded_K, "RX decoded K=8 codewords (receive_bigblock)");
+
+	const std::vector<int>& rx_info = tsB->bigblock_rx_infobits;   // decoded info bits (whitened domain)
+
+	// ---- CHECKPOINT (i): DECODE TRUTH (bypasses the forced oracle) ----
+	// On a clean channel the decoded info bits MUST equal the TX *whitened* info bits
+	// (tsA->bigblock_last_tx_cw_info[c], the exact bits LDPC-encoded at telecom_system.cc:8180).
+	int decode_bit_mismatch = 0; int first_bad_decode_cw = -1;
+	bool decode_ref_ok = ((int)tsA->bigblock_last_tx_cw_info.size() == K);
+	if(decode_ref_ok && decoded_K)
+	{
+		for(int c=0;c<K;c++)
+		{
+			int cw_mis = 0;
+			const std::vector<int>& txw = tsA->bigblock_last_tx_cw_info[(size_t)c];
+			for(int i=0;i<tsB->ldpc.K;i++)
+			{
+				int rxbit = (i < (int)rx_info.size() - c*tsB->ldpc.K)
+				          ? (rx_info[(size_t)c*tsB->ldpc.K + i] & 1) : -1;
+				int txbit = (i < (int)txw.size()) ? (txw[(size_t)i] & 1) : -2;
+				if(rxbit != txbit){ cw_mis++; decode_bit_mismatch++; }
+			}
+			if(cw_mis>0 && first_bad_decode_cw<0) first_bad_decode_cw = c;
+		}
+	}
+	bool decode_byte_exact = decode_ref_ok && decoded_K && (decode_bit_mismatch == 0);
+	printf("[TEST-BIGBLOCK-RT] (i) DECODE-vs-TX-whitened: mismatched_bits=%d first_bad_cw=%d "
+	       "(clean channel => MUST be 0; nonzero => decode/encode/bit-layout bug)\n",
+	       decode_bit_mismatch, first_bad_decode_cw);
+	check(decode_byte_exact, "(i) decoded info bits == TX whitened bits (clean channel, oracle-independent)");
+
+	// ---- CHECKPOINT (ii): DE-WHITEN TRUTH ----
+	// De-whiten the decoded bits EXACTLY as bigblock_receive_carve (self-inverse XOR, same
+	// seed) and re-pack LSB-first; compare to the ORIGINAL pre-whiten 1374-byte block.
+	int nbits = K * sub_len * 8;
+	std::vector<int> dw((size_t)nbits, 0);
+	for(int i=0;i<nbits && i<(int)rx_info.size();i++) dw[i] = rx_info[(size_t)i] & 1;
+	tsB->bigblock_whiten_bits(dw.data(), nbits);
+	std::vector<unsigned char> rx_payload((size_t)K*sub_len, 0);
+	for(int c=0;c<K;c++)
+		for(int b=0;b<sub_len;b++)
+		{
+			unsigned char by=0;
+			for(int bit=0;bit<8;bit++){ int idx=(c*sub_len+b)*8+bit;
+				if(idx<nbits && (dw[idx]&1)) by|=(unsigned char)(1u<<bit); }
+			rx_payload[(size_t)c*sub_len + b]=by;
+		}
+	long dewhiten_byte_mismatch = 0; int first_bad_dw_byte = -1;
+	for(long i=0;i<total_tx_bytes;i++)
+		if(rx_payload[(size_t)i] != tx_truth[(size_t)i]){ dewhiten_byte_mismatch++;
+			if(first_bad_dw_byte<0) first_bad_dw_byte=(int)i; }
+	// the decoded header bytes (what the HW NOCRC symptom read as wire_bsi=205/159 garbage):
+	int rx_wire_bsi   = rx_payload[0];
+	int rx_wire_ndata = rx_payload[1];
+	bool dewhiten_byte_exact = (dewhiten_byte_mismatch == 0);
+	printf("[TEST-BIGBLOCK-RT] (ii) DE-WHITEN-vs-TX-payload: mismatched_bytes=%ld/%ld "
+	       "first_bad_byte=%d rx_wire_bsi=%d(=%d?) rx_wire_ndata=%d(=%d?)\n",
+	       dewhiten_byte_mismatch, total_tx_bytes, first_bad_dw_byte,
+	       rx_wire_bsi, block_bsi, rx_wire_ndata, K);
+	check(dewhiten_byte_exact, "(ii) de-whitened payload == original pre-whiten block (de-whiten faithful)");
+
+	// ---- CHECKPOINT (iii): per-codeword WIRE CRC-8 ----
+	int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+	int crc_fail = 0; int first_crc_fail_cw = -1;
+	for(int c=0;c<K;c++)
+	{
+		int crc_off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+		unsigned char calc = CRC8_calc((char*)&rx_payload[(size_t)c*sub_len], crc_span);
+		if(calc != rx_payload[(size_t)crc_off]){ crc_fail++; if(first_crc_fail_cw<0) first_crc_fail_cw=c; }
+	}
+	bool crc_all_pass = (crc_fail == 0);
+	printf("[TEST-BIGBLOCK-RT] (iii) WIRE-CRC recompute: failed_cw=%d first_fail_cw=%d "
+	       "(span=%d; failure here with (ii) clean => TX/RX CRC span/offset divergence)\n",
+	       crc_fail, first_crc_fail_cw, crc_span);
+	check(crc_all_pass, "(iii) per-codeword wire CRC-8 all pass on de-whitened payload");
+
+	// ---- CHECKPOINT (iv): full carve DELIVERY (the production RX consumer) ----
+	B->rsp_current_expected_batch_seq_id = (block_bsi + 5) & 0xFF;  // DELIBERATELY wrong (drift)
+	B->rsp_prev_batch_seq_id             = -1;
+	B->rsp_prev_batch_active             = false;
+	B->rsp_prev_batch_received_count     = 0;
+	B->retransmit_count                  = 0;
+	B->batch_rx_frame_count              = 0;
+	B->last_received_end_of_batch_seq    = -1;
+	for(int i=0;i<B->nMessages;i++)
+	{
+		B->messages_rx[i].status = FREE;
+		B->messages_rx[i].length = 0;
+		B->messages_rx[i].batch_seq_id = -1;
+	}
+	int rc = B->bigblock_receive_carve(rx_info.data(), (unsigned char)((block_bsi + 3) & 0xFF));
+	bool wired = (rc == SUCCESSFUL);
+	int  recv  = B->bigblock_test_count_received(K);
+	long delivered = B->bigblock_test_delivered_varlen(K, app_len.data(), app_off.data(), app_flat.data());
+	bool all_recv  = (recv == K);
+	bool all_bytes = (delivered == full_app);
+	printf("[TEST-BIGBLOCK-RT] (iv) CARVE delivery: carve_rc=%d recv=%d/%d delivered=%ld/%ld\n",
+	       rc, recv, K, delivered, full_app);
+	check(wired && all_recv && all_bytes,
+	      "(iv) carve delivered all 1374 app bytes byte-faithful (full-fill, drift-proof)");
+
+	delete A; delete B; delete tsA; delete tsB;
+	restore_env();
+
+	// Disambiguation verdict line (machine-readable).
+	const char* domain;
+	if(!decode_byte_exact)            domain = "DECODE_BUG(i)";
+	else if(!dewhiten_byte_exact)     domain = "DEWHITEN_BUG(ii)";
+	else if(!crc_all_pass)            domain = "CRC_SPAN_BUG(iii)";
+	else if(!(wired && all_recv && all_bytes)) domain = "CARVE_DELIVERY_BUG(iv)";
+	else                              domain = "ALL_CLEAN_DEWHITEN_INNOCENT";
+	printf("[TEST-BIGBLOCK-RT] DISAMBIGUATION: clean 1374-byte/8-cw round-trip "
+	       "reproduced_garbage=%d domain=%s\n",
+	       (failed!=0)?1:0, domain);
+	printf("[TEST-BIGBLOCK-RT] %s (%d failure%s)\n",
+	       failed==0 ? "ALL PASS" : "FAILURES", failed, failed==1 ? "" : "s");
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
+}
+
+// ============================================================================
 // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
 //
 // CLI: --test-sim-inproc-bigblock

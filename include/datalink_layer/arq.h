@@ -1498,6 +1498,17 @@ public:
   // 1=FAIL. MUST FAIL before P2 wiring (the stub above), PASS after. Default
   // builds never call this.
   int test_bigblock_arq_unit();
+  // FULL-FILL ROUND-TRIP (data-flow-bigblock-arq-unit.md §18). CLI:
+  // --test-bigblock-roundtrip. Drives a MAX-FILL 1374-byte / 8-codeword block through
+  // the REAL pipeline on a CLEAN channel (whiten + per-cw CRC stamp -> LDPC encode ->
+  // clean loopback -> decode -> de-whiten -> CRC recompute -> carve) and inspects the
+  // bits DIRECTLY at four checkpoints that BYPASS the forced-oracle cw_ok (which is
+  // forced to 8 on the 2-instance RX): (i) decoded info bits == TX whitened bits,
+  // (ii) de-whitened payload == original pre-whiten 1374-byte block, (iii) per-cw wire
+  // CRC-8 all pass, (iv) carve delivers all 1374 app bytes byte-faithful. Closes the
+  // gap the variable-length CASE A and the 1200-byte / 622-byte tests left at the
+  // exact full-fill HW boundary. Returns 0=PASS (full byte-faithful), 1=FAIL.
+  int test_bigblock_roundtrip();
   // Test-only helpers for test_bigblock_arq_unit (member methods because
   // messages_rx[]/nMessages are private). Count RECEIVED slots in
   // messages_rx[0..K-1]; count delivered bytes that match the expected TX

@@ -374,6 +374,10 @@ int main(int argc, char *argv[])
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
                                         // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
                                         // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
+    bool test_bigblock_roundtrip_cli = false; // --test-bigblock-roundtrip: MAX-FILL 1374-byte / 8-cw block through the
+                                        // REAL whiten->CRC-stamp->LDPC encode->CLEAN channel->decode->de-whiten->CRC
+                                        // recompute->carve pipeline. 4 oracle-independent checkpoints disambiguate the
+                                        // forced-oracle cw_ok vs real-convergence ambiguity. One-shot at startup, exit rc.
     bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
@@ -885,6 +889,16 @@ int main(int argc, char *argv[])
             // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
             // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
             test_bigblock_multicw_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-roundtrip") == 0)
+        {
+            // FULL-FILL ROUND-TRIP (data-flow-bigblock-arq-unit.md §18): MAX-FILL
+            // 1374-byte / 8-cw block through the REAL whiten/CRC/encode/decode/de-whiten/
+            // carve pipeline on a CLEAN channel; 4 oracle-independent checkpoints
+            // disambiguate the forced-oracle cw_ok vs real-convergence ambiguity. One-shot.
+            test_bigblock_roundtrip_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2036,6 +2050,21 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
             printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_roundtrip_cli) {
+            // FULL-FILL ROUND-TRIP (data-flow-bigblock-arq-unit.md §18): a MAX-FILL
+            // 1374-byte / 8-codeword block driven through the REAL whiten + per-cw CRC
+            // stamp -> LDPC encode -> CLEAN channel -> decode -> de-whiten -> CRC recompute
+            // -> carve pipeline. Four oracle-independent checkpoints (decode-vs-TX-whitened,
+            // de-whiten-vs-TX-payload, per-cw CRC, full carve delivery) disambiguate whether
+            // cw_ok_count=8 is real convergence or the forced-oracle stub. One-shot, exit rc.
+            printf("[FLAG] --test-bigblock-roundtrip: invoking MAX-FILL 1374-byte / 8-cw "
+                   "round-trip disambiguation regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_bigblock_roundtrip();
+            printf("[FLAG] Bigblock-roundtrip test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
