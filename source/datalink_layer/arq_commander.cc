@@ -1102,6 +1102,7 @@ void cl_arq_controller::process_messages_tx_control()
 			telecom_system->set_mfsk_ctrl_mode(false);
 			telecom_system->data_container.frames_to_read =
 				telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+			bigblock_dbg_ftr_set("cmd_kx1_ack_rearm:arq_commander.cc:1103");
 			printf("[CMD-RX] KEY_EXCHANGE_1: expecting LDPC ACK on config %d, ftr=%d\n",
 				data_configuration,
 				telecom_system->data_container.frames_to_read.load());
@@ -1122,6 +1123,7 @@ void cl_arq_controller::process_messages_tx_control()
 			telecom_system->set_mfsk_ctrl_mode(true);
 			telecom_system->data_container.frames_to_read =
 				telecom_system->data_container.preamble_nSymb + telecom_system->get_active_nsymb();
+			bigblock_dbg_ftr_set("cmd_ctrl_ack_fallback:arq_commander.cc:1123");
 		}
 		connection_status=RECEIVING_ACKS_CONTROL;
 
@@ -1879,6 +1881,7 @@ void cl_arq_controller::process_messages_tx_data()
 		{
 			// Expect ACK tone pattern — start polling quickly (same as control path).
 			telecom_system->data_container.frames_to_read = 4;
+			bigblock_dbg_ftr_set("cmd_data_ack_pat_wait:arq_commander.cc:1883");
 		}
 		else
 		{
@@ -1886,6 +1889,7 @@ void cl_arq_controller::process_messages_tx_data()
 			telecom_system->set_mfsk_ctrl_mode(true);
 			telecom_system->data_container.frames_to_read =
 				telecom_system->data_container.preamble_nSymb + telecom_system->get_active_nsymb();
+			bigblock_dbg_ftr_set("cmd_data_ack_ldpc_wait:arq_commander.cc:1889");
 		}
 		data_ack_received=NO;
 		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
@@ -4634,6 +4638,7 @@ void cl_arq_controller::process_control_commander()
 					// stock per-frame turnaround is byte-identical.
 					telecom_system->data_container.frames_to_read =
 						bigblock_block_ftr_or(rx_frame + 10);
+					bigblock_dbg_ftr_set("cmd_switchrole_turnaround:arq_commander.cc:4635");
 				}
 				telecom_system->data_container.nUnder_processing_events = 0;
 				telecom_system->receive_stats.delay_of_last_decoded_message = -1;

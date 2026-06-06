@@ -2626,6 +2626,7 @@ void cl_arq_controller::update_status()
 					telecom_system->data_container.frames_to_read =
 						telecom_system->data_container.preamble_nSymb
 						+ telecom_system->data_container.Nsymb;
+					bigblock_dbg_ftr_set("turbo_switchrole_timeout:arq_common.cc:2626");
 					telecom_system->data_container.nUnder_processing_events = 0;
 					telecom_system->receive_stats.mfsk_search_raw = 0;
 					telecom_system->receive_stats.ofdm_search_raw = 0;
@@ -3909,6 +3910,26 @@ bool cl_arq_controller::bigblock_send_one_block()
 // byte-identical to baseline. MERCURY_BIGBLOCK_DEFEAT_FIX=1 bypasses the clamp (returns the
 // stock value) so the SAME binary reproduces the pre-fix truncated-window corruption for the
 // fail-before/pass-after A/B (production never sets it).
+// DIAGNOSTIC-ONLY (diag/bigblock-ftr-instr): emit one [FTR-SET] line at each
+// frames_to_read arming site and stamp the diag members so receive_bigblock's
+// [FTR-USE] line can report which site armed the window the big-block decode used.
+// Pure logging — reads the now-current frames_to_read, writes nothing back to it.
+void cl_arq_controller::bigblock_dbg_ftr_set(const char* tag)
+{
+	if(telecom_system == NULL) return;
+	int ftr = telecom_system->data_container.frames_to_read.load();
+	int bbf = telecom_system->bigblock_framing_enabled ? 1 : 0;
+	bigblock_dbg_last_armed_ftr.store(ftr);
+	bigblock_dbg_last_armed_site = tag;
+	// mirror into data_container so the FTR-USE consumer log (a telecom_system method
+	// with no arq-controller handle) can report the armed width + the site that set it.
+	telecom_system->data_container.bigblock_dbg_armed_ftr.store(ftr);
+	telecom_system->data_container.bigblock_dbg_armed_site = tag;
+	fprintf(stderr, "[FTR-SET] site=%s ftr=%d cfg=%d bbframing=%d\n",
+		tag, ftr, current_configuration, bbf);
+	fflush(stderr);
+}
+
 int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 {
 	if(telecom_system == NULL) return stock_ftr;
@@ -4333,6 +4354,7 @@ void cl_arq_controller::send_batch()
 
 		telecom_system->data_container.frames_to_read =
 			telecom_system->data_container.preamble_nSymb;
+		bigblock_dbg_ftr_set("tx_end_bigblock:arq_common.cc:4351");
 		printf("[TX-END-BIGBLOCK] frames_to_read=%d\n",
 			telecom_system->data_container.frames_to_read.load());
 		fflush(stdout);
@@ -4764,6 +4786,7 @@ void cl_arq_controller::send_batch()
 	// gives a ~90ms initial delay, then receive_ack_pattern sets ftr=2.
 	telecom_system->data_container.frames_to_read =
 		telecom_system->data_container.preamble_nSymb;
+	bigblock_dbg_ftr_set("tx_end_ackpoll:arq_common.cc:4783");
 	printf("[TX-END] frames_to_read=%d (ctrl=%d)\n", telecom_system->data_container.frames_to_read.load(), telecom_system->mfsk_ctrl_mode ? 1 : 0);
 	fflush(stdout);
 }
@@ -4940,6 +4963,7 @@ void cl_arq_controller::send_ack_pattern()
 		// receive is ONE K-codeword block (~64 sym), not a stock frame (~13). Snapshot
 		// MUST wait for the WHOLE block or cw1..cw7 read a stale ring (cw0-ok garbage).
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
+		bigblock_dbg_ftr_set("ackpat:arq_common.cc:4958");
 	}
 
 	printf("[TX-ACK-PAT] Done at t=%dms, flushed capture buffer, nUnder reset, ftr=%d\n", (int)ack_turnaround_timer.get_elapsed_time_ms(), telecom_system->data_container.frames_to_read.load());
@@ -5052,6 +5076,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 		             + telecom_system->data_container.Nsymb;
 		// MULTI-CW WINDOW FIX (fact-doc §17): block-span the window at the bigblock rung.
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
+		bigblock_dbg_ftr_set("ackpat_snr:arq_common.cc:5071");
 	}
 
 	printf("[TX-ACK-SNR] Done, flushed capture buffer, ftr=%d\n", telecom_system->data_container.frames_to_read.load());
@@ -5524,6 +5549,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		             + telecom_system->data_container.Nsymb;
 		// MULTI-CW WINDOW FIX (fact-doc §17): block-span the window at the bigblock rung.
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
+		bigblock_dbg_ftr_set("mfsk_ack_sack:arq_common.cc:5544");
 	}
 
 	printf("[TX-MFSK-ACK-SACK] Done, flushed capture buffer, ftr=%d\n",
@@ -5723,6 +5749,7 @@ void cl_arq_controller::send_break_pattern()
 		// One frame + 10 symbol margin for PTT turnaround settle.
 		int frame_symb = telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
 		telecom_system->data_container.frames_to_read = frame_symb + 10;
+		bigblock_dbg_ftr_set("break_pat:arq_common.cc:5744");
 	}
 
 	printf("[TX-BREAK] Done, flushed capture buffer, ftr=%d\n", telecom_system->data_container.frames_to_read.load());
@@ -6386,6 +6413,7 @@ bool cl_arq_controller::receive_hail_pattern()
 			MUTEX_LOCK(&capture_prep_mutex);
 			telecom_system->data_container.frames_to_read =
 				telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+			bigblock_dbg_ftr_set("hail_detected_connect:arq_common.cc:6410");
 			telecom_system->data_container.nUnder_processing_events = 0;
 			telecom_system->receive_stats.mfsk_search_raw = 0;
 			telecom_system->receive_stats.ofdm_search_raw = 0;
@@ -7034,6 +7062,7 @@ void cl_arq_controller::receive()
 					// advancing it; resetting it mid-stream desyncs the next block's write
 					// position and the acquisition lands on a misaligned window.
 					telecom_system->data_container.frames_to_read = block_nsymb + 10;
+					bigblock_dbg_ftr_set("recv_postcarve_blockspan:arq_common.cc:7055");
 					telecom_system->data_container.nUnder_processing_events = 0;
 					telecom_system->receive_stats.ofdm_search_raw = 0;
 					telecom_system->receive_stats.ofdm_batch_active = false;
@@ -7869,6 +7898,7 @@ void cl_arq_controller::receive()
 				// passive_monitor only) so that fast-scan semantics are unchanged.
 				if(ftr > 0) ftr = bigblock_block_ftr_or(ftr);
 				telecom_system->data_container.frames_to_read = ftr;
+				bigblock_dbg_ftr_set("ofdm_antispin_nopre:arq_common.cc:7891");
 				telecom_system->data_container.nUnder_processing_events = 0;
 				// === DIAG: OFDM anti-spin ftr trace ===
 				// Suppress during rapid same-mod opportunistic scan (ftr==0)
@@ -7940,6 +7970,7 @@ void cl_arq_controller::receive()
 				// at :6994). Block-span the re-arm at the rung so a failed block re-accumulates
 				// a WHOLE block before the next snapshot.
 				telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame);
+				bigblock_dbg_ftr_set("ofdm_antispin_fail:arq_common.cc:7962");
 				telecom_system->data_container.nUnder_processing_events = 0;
 				int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
 				telecom_system->receive_stats.ofdm_search_raw = buf_nsymb - rx_frame;

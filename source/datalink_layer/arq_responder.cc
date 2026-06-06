@@ -214,6 +214,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 			// (send_hail_pattern leaves ftr=2 which is too short for START_CONNECTION)
 			telecom_system->data_container.frames_to_read =
 				telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+			bigblock_dbg_ftr_set("rsp_posthail_connect:arq_responder.cc:215");
 		}
 		return; // Keep scanning (fast cycle) or just responded
 	}
@@ -1218,6 +1219,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				}
 			}
 			telecom_system->data_container.frames_to_read = ftr_val;
+			bigblock_dbg_ftr_set("rsp_ack_ctrl_rearm:arq_responder.cc:1220");
 			telecom_system->data_container.nUnder_processing_events = 0;
 
 			// === DIAG: gearshift ftr trace (verbose only) ===
@@ -1262,6 +1264,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				int rx_frame = telecom_system->data_container.preamble_nSymb
 				             + telecom_system->data_container.Nsymb;
 				telecom_system->data_container.frames_to_read = rx_frame + 10;
+				bigblock_dbg_ftr_set("rsp_bwneg_wb_rearm:arq_responder.cc:1264");
 				telecom_system->data_container.nUnder_processing_events = 0;
 				printf("[BW-NEG] WB ftr reset to %d\n",
 					telecom_system->data_container.frames_to_read.load());
@@ -1690,6 +1693,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				telecom_system->data_container.frames_to_read =
 					telecom_system->data_container.preamble_nSymb
 					+ telecom_system->get_active_nsymb();
+				bigblock_dbg_ftr_set("rsp_partial_retx_rearm:arq_responder.cc:1690");
 				telecom_system->data_container.nUnder_processing_events = 0;
 				// DON'T reset search_raw here. If the timer fires mid-batch
 				// while frames are still arriving, resetting to 0 causes
@@ -1805,6 +1809,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			int rx_frame = telecom_system->data_container.preamble_nSymb
 			             + telecom_system->data_container.Nsymb;
 			telecom_system->data_container.frames_to_read = rx_frame * 2;
+			bigblock_dbg_ftr_set("rsp_monitor_ackdata_rearm:arq_responder.cc:1810");
 			telecom_system->data_container.nUnder_processing_events = 0;
 		}
 
@@ -1933,6 +1938,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		telecom_system->set_mfsk_ctrl_mode(false);
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(
 			telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb + 10);
+		bigblock_dbg_ftr_set("rsp_data_ack_reload:arq_responder.cc:1934");
 
 		batch_rx_frame_count = 0;
 		connection_status=RECEIVING;
@@ -2555,6 +2561,7 @@ void cl_arq_controller::process_control_responder()
 				int rx_frame = telecom_system->data_container.preamble_nSymb
 					+ telecom_system->data_container.Nsymb;
 				telecom_system->data_container.frames_to_read = rx_frame * 2;
+				bigblock_dbg_ftr_set("rsp_ctrl_turnaround:arq_responder.cc:2557");
 				telecom_system->data_container.nUnder_processing_events = 0;
 			}
 			else if(forward_configuration != current_configuration &&
@@ -2624,6 +2631,7 @@ void cl_arq_controller::process_control_responder()
 					int rx_frame = telecom_system->data_container.preamble_nSymb
 						+ telecom_system->data_container.Nsymb;
 					telecom_system->data_container.frames_to_read = rx_frame * 2;
+					bigblock_dbg_ftr_set("rsp_monitor_switchrole:arq_responder.cc:2626");
 					telecom_system->data_container.nUnder_processing_events = 0;
 				}
 				link_timer.start();

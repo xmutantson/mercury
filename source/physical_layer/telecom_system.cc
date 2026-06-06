@@ -8219,6 +8219,18 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	int nSamples = data_container.Nofdm * data_container.buffer_Nsymb * interp;
 	if(nSamples <= 0) nSamples = (bigblock_last_tx_samples > 0) ? bigblock_last_tx_samples : 0;
 
+	// DIAGNOSTIC-ONLY (diag/bigblock-ftr-instr): the DECISIVE datapoint. armed_ftr is the
+	// last frames_to_read the ARQ layer armed for THIS acquisition (stock CFG16 frame ~13
+	// => truncated head-only window; full block-span ~74 => whole block captured). block_nsymb
+	// is the ring depth (buffer_Nsymb) the snapshot reads; nsamples_grabbed is the actual
+	// passband sample count handed to the big-block decoder. armed_site names the FTR-SET call
+	// site that armed this window — cross-reference the last [FTR-SET] before this line.
+	fprintf(stderr, "[FTR-USE] receive_bigblock armed_ftr=%d armed_site=%s block_nsymb=%d nsamples_grabbed=%d cfg=%d\n",
+		data_container.bigblock_dbg_armed_ftr.load(),
+		data_container.bigblock_dbg_armed_site,
+		(int)data_container.buffer_Nsymb.load(), nSamples, current_configuration);
+	fflush(stderr);
+
 	// USE-AFTER-FREE ROOT-CAUSE FIX (bigblock-whiten-align): `data` is the caller's
 	// data_container.ready_to_process_passband_delayed_data (live ARQ path,
 	// arq_common.cc:6864). Below we derive K via bigblock_rebuild_thin_grid +

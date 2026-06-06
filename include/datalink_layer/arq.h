@@ -1464,6 +1464,16 @@ public:
   // MERCURY_BIGBLOCK_DEFEAT_FIX=1 reproducer hook bypasses the clamp (returns stock_ftr)
   // so the SAME binary reproduces the pre-fix truncated-window corruption for the A/B.
   int bigblock_block_ftr_or(int stock_ftr);
+  // DIAGNOSTIC-ONLY (diag/bigblock-ftr-instr): the last frames_to_read value armed +
+  // which call site armed it. Written by the [FTR-SET] log lines, read ONLY by the
+  // [FTR-USE] log line in receive_bigblock. NEVER read by any control-flow / logic —
+  // pure instrumentation so the HW log shows the actual armed window width at the
+  // big-block receive and which re-arm site produced it. No behaviour change.
+  std::atomic<int> bigblock_dbg_last_armed_ftr{-1};
+  const char*      bigblock_dbg_last_armed_site = "none";
+  // logging-only: read the now-current frames_to_read, emit [FTR-SET] with the unique
+  // site tag, and stamp the diag members above. Defined in arq_common.cc. No logic.
+  void bigblock_dbg_ftr_set(const char* tag);
   // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
   // block carried + its geometry, so the in-process single-block harness can carve
   // it back byte-faithfully (the delivered==TX ground truth, INV-6).

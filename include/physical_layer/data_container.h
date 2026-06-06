@@ -86,6 +86,12 @@ class cl_data_container
 	_Atomic(int) rx_mute;
 	_Atomic(int) rx_mute_samples;  // samples zeroed by rx_mute since last MF search
 	_Atomic(int) ring_write_index;  // current write position in double-mapped ring buffer
+	// DIAGNOSTIC-ONLY (diag/bigblock-ftr-instr): mirror of the last frames_to_read value
+	// the ARQ layer armed + which call site armed it. Stamped by cl_arq_controller::
+	// bigblock_dbg_ftr_set; read ONLY by the [FTR-USE] log in receive_bigblock so the HW
+	// log shows the armed window width at the big-block receive. NEVER read by any logic.
+	_Atomic(int) bigblock_dbg_armed_ftr{-1};
+	const char*  bigblock_dbg_armed_site{"none"};
 
 	int total_frame_size;
 
