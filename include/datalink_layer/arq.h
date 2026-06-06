@@ -1450,6 +1450,17 @@ public:
   // is used only if use_wire_header is false (legacy path) or the header is unusable.
   int bigblock_receive_carve(const int* info_bits, unsigned char fallback_bsi,
                              bool use_wire_header = true);
+  // GAP-3 CARVE-GATE HARDENING (cfg16-controlack-hold): returns true iff the just-
+  // decoded CFG16 acquisition (in telecom_system->bigblock_rx_infobits, K codewords)
+  // is a REAL big-block — i.e. cw0's de-whitened wire-CRC-8 matches its tail byte.
+  // A real block's cw0 always carries the FEC+CRC-protected [bsi,n_data,length-table]
+  // header; a single OFDM control frame / stale audio / noise mis-routed into the
+  // block carver does NOT produce a valid cw0 CRC. Used by process_messages_data to
+  // REJECT a mis-carve and re-decode the audio on the stock per-frame path (so a
+  // SET_CONFIG/ACK control turnaround received at CFG16 is parsed as control, not
+  // carved). Reuses the SAME de-whiten + CRC8_calc + BIGBLOCK_CW_CRC_* the carve and
+  // the TX use, so it cannot drift from the on-wire format.
+  bool bigblock_rx_cw0_header_valid();
   // MULTI-CW WINDOW FIX (fact-doc §17): a big-block decode snapshots buffer_Nsymb
   // samples but the snapshot only fires when frames_to_read hits 0, so frames_to_read
   // controls how many FRESH symbols are accumulated before the block is handed to the

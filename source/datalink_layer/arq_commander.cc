@@ -4657,6 +4657,22 @@ void cl_arq_controller::process_control_commander()
 					messages_control_restore();
 					printf("[GEARSHIFT] SET_CONFIG ACKed, loaded config %d\n", data_configuration);
 					fflush(stdout);
+					// CFG16 CONTROL-ACK HOLD (cfg16-controlack-hold): mark the moment the
+					// climb SET_CONFIG to the big-block rung is CONFIRMED (RSP ACKed on the
+					// old PHY, both peers now loaded CFG16). After this the CMD must HOLD
+					// CFG16 to DATA without emitting another OFDM control frame (the top-
+					// config verification probe is skipped on the big-block rung; see the
+					// "at the top config" branch). This log lets a HW capture SEE the rung
+					// confirm independently of the DATA transition.
+					if(telecom_system != NULL
+						&& telecom_system->bigblock_framing_enabled
+						&& telecom_system->M != MOD_MFSK
+						&& data_configuration == CONFIG_16)
+					{
+						printf("[CFG16-HOLD] climb SET_CONFIG to CONFIG_16 (big-block rung) "
+							"CONFIRMED — holding; verification probe will be skipped\n");
+						fflush(stdout);
+					}
 
 					// Bug #60: PHY reinit race condition.
 					// When modulation changes (e.g. 8PSK->32QAM), both sides do a full
@@ -4885,7 +4901,65 @@ void cl_arq_controller::process_control_commander()
 						// Verify by sending SET_CONFIG(top) AT the top config. If the responder
 						// can decode it, the config works and we can finish. If not, the existing
 						// turboshift retry/BREAK recovery will settle at turboshift_last_good.
-						if(turboshift_last_good == current_configuration)
+						//
+						// CFG16 CONTROL-ACK HOLD (cfg16-controlack-hold, GAP1 root fix): the
+						// verification probe (the last else-branch below) re-sends
+						// SET_CONFIG(top) AS A SINGLE OFDM CONTROL FRAME on the live PHY. At
+						// the CFG16 big-block rung that control frame is STRUCTURALLY
+						// UNDECODABLE by the responder: the RSP's receive_byte routes ANY
+						// CFG16 OFDM audio into the block carver (telecom_system.cc:1024 /
+						// the arq_common.cc carve gate), so the single-frame SET_CONFIG is
+						// carved as a fake K-codeword block, never parsed as control, never
+						// ACKed -> [TURBO] RETRY -> CEILING -> [TX-BREAK] back to ROBUST_0,
+						// BEFORE any DATA batch is dispatched at CFG16 ([TXCW]=0). The
+						// big-block TX is innocent; the verification turnaround is the
+						// failure. NO control turnaround survives on the CFG16 OFDM PHY (any
+						// SET_CONFIG/ACK is a single frame the carver eats), so the ONLY way
+						// to HOLD CFG16 is to NOT emit a control frame here: skip the
+						// redundant probe and transition straight to DATA. CFG16 viability
+						// is then proven by the FIRST DATA big-block + its K-bit SACK -- the
+						// SAME SACK-trust authority finish_turbo_direction() already uses for
+						// the verified ceiling (sec 7.13.38, arq_common.cc:3958-3969) and that
+						// turbo_snr_truncates_probe() honors above (:4862-4874). GATED
+						// STRICTLY on the big-block rung being live; off the rung the
+						// verification handshake is UNCHANGED (byte-identical) -- at lower
+						// OFDM configs the SET_CONFIG control frame IS decoded normally (the
+						// carve gate is false below CONFIG_16).
+						bool bigblock_rung_live =
+							(telecom_system != NULL
+							 && telecom_system->bigblock_framing_enabled
+							 && telecom_system->M != MOD_MFSK
+							 && current_configuration == CONFIG_16);
+						if(bigblock_rung_live)
+						{
+							printf("[CFG16-HOLD] Top config %d on big-block rung -- skipping "
+								"undecodable OFDM verification probe, holding CFG16 (SACK-trust "
+								"ceiling; first DATA block + K-bit SACK proves viability)\n",
+								current_configuration);
+							fflush(stdout);
+							// Mirror finish_turbo_direction()'s skip-reverse terminal state
+							// (turbo done, ceiling pinned at the verified top), but transition
+							// DIRECTLY to DATA instead of emitting a SET_CONFIG control frame
+							// the responder cannot decode. No config change (top==current), so
+							// no PHY reload / SET_CONFIG announcement is needed.
+							turboshift_active = false;
+							turbo_supershift_announce_pending = false;
+							turbo_snr_ack_enabled = false;
+							turbo_received_snr = -99.0f;
+							turboshift_phase = TURBO_DONE;
+							turboshift_last_good = current_configuration;
+							supershift_proven_ceiling = current_configuration;
+							data_configuration = current_configuration;
+							negotiated_configuration = current_configuration;
+							reverse_configuration = current_configuration;
+							printf("[BBTX-GATE] CFG16 held -- transition TRANSMITTING_DATA "
+								"(ceiling=%d, proven_ceiling=%d); next send_batch routes a DATA "
+								"big-block to bigblock_send_one_block\n",
+								turboshift_last_good, supershift_proven_ceiling);
+							fflush(stdout);
+							this->connection_status = TRANSMITTING_DATA;
+						}
+						else if(turboshift_last_good == current_configuration)
 						{
 							// Second pass: verification probe ACKed. Top config works.
 							printf("[TURBO] Top config %d verified, finishing\n", current_configuration);

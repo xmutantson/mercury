@@ -1021,7 +1021,16 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// session would otherwise route every CONFIG_0..15 per-frame decode during the climb
 	// into receive_bigblock with the wrong geometry, stalling the gearshift. Validators
 	// run at CONFIG_16 (-s 16), so they are unaffected.
-	if(bigblock_framing_enabled && M != MOD_MFSK && current_configuration == CONFIG_16)
+	// GAP-3 CARVE-GATE HARDENING (cfg16-controlack-hold): the big-block route is
+	// SUPPRESSED for this one call when bigblock_rx_force_stock is set. The ARQ
+	// carve gate sets it after a CFG16 acquisition fails the cw0 wire-header CRC
+	// check (i.e. the audio is a single OFDM control frame / stale / noise, NOT a
+	// real K-codeword block) and re-invokes receive_byte to decode it on the STOCK
+	// per-frame path. Without this, ANY CFG16 OFDM audio (including the SET_CONFIG
+	// control turnaround) is unconditionally carved as a fake block and never
+	// parsed as control. Default false -> the production block decode is unchanged.
+	if(bigblock_framing_enabled && M != MOD_MFSK && current_configuration == CONFIG_16
+		&& !bigblock_rx_force_stock)
 	{
 		return receive_bigblock(data, out);
 	}

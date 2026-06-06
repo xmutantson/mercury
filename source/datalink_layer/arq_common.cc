@@ -3943,6 +3943,51 @@ int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 // is used only when use_wire_header is false (legacy) or the header is unusable.
 //
 // §5 audit: this is the RX consumer wiring. It calls ONLY bigblock_block_to_arq
+// GAP-3 CARVE-GATE HARDENING (cfg16-controlack-hold): is the just-decoded CFG16
+// acquisition a REAL big-block? A real block's cw0 carries the FEC+CRC-protected
+// [bsi, n_data, length-table] header followed (like every codeword) by a CRC-8 tail
+// byte over its first BIGBLOCK_CW_CRC_SPAN(sub_len) de-whitened bytes. A single OFDM
+// control frame, stale audio, or noise that the unconditional CFG16->receive_bigblock
+// gate mis-routed into the carver does NOT produce a cw0 whose recomputed CRC-8 matches
+// — so this is the structural discriminator the pinpoint identified (the cw0
+// wire-header CRC). We recompute ONLY cw0's CRC here (cheap, header-bearing); the full
+// per-codeword demote still runs inside bigblock_receive_carve for the accepted block.
+// Reuses the EXACT de-whiten + CRC8_calc + BIGBLOCK_CW_CRC_* the TX/carve use, so it
+// cannot drift from the on-wire format. Returns false (reject) on any inconsistency.
+bool cl_arq_controller::bigblock_rx_cw0_header_valid()
+{
+	if(telecom_system == NULL) return false;
+	int K = telecom_system->bigblock_last_rx_K;
+	if(K <= 0) return false;
+	int sub_len = telecom_system->ldpc.K / 8;
+	if(sub_len <= 0) return false;
+	const int alloc_size = N_MAX / 8;
+	if(sub_len > alloc_size) sub_len = alloc_size;
+	int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+	int crc_off  = BIGBLOCK_CW_CRC_OFFSET(0, sub_len);   // cw0's CRC tail byte index
+	if(crc_span <= 0 || crc_off < 0 || crc_off >= sub_len) return false;
+	// Need cw0's full sub_len*8 decoded info bits.
+	const std::vector<int>& bits = telecom_system->bigblock_rx_infobits;
+	int need_bits = sub_len * 8;
+	if((int)bits.size() < need_bits) return false;
+	// De-whiten ONLY cw0's bits (self-inverse XOR over the SAME PRBS the TX whitened
+	// with). bigblock_whiten_bits whitens the WHOLE block from bit 0; cw0 occupies the
+	// first sub_len*8 bits, so de-whitening a length-need_bits prefix recovers cw0.
+	std::vector<int> dw(bits.begin(), bits.begin() + need_bits);
+	telecom_system->bigblock_whiten_bits(dw.data(), need_bits);
+	std::vector<unsigned char> cw0((size_t)sub_len, 0);
+	for(int b=0;b<sub_len;b++)
+	{
+		unsigned char byte = 0;
+		for(int bit=0;bit<8;bit++)
+			if(dw[b*8 + bit] & 1) byte |= (unsigned char)(1u << bit);
+		cw0[b] = byte;
+	}
+	unsigned char calc = CRC8_calc((char*)cw0.data(), crc_span);
+	unsigned char wire = cw0[(size_t)crc_off];
+	return (calc == wire);
+}
+
 // (already §5-audited) — it does NOT touch the optimizer/gearshift authority.
 // Returns SUCCESSFUL when the block was carved into the ARQ layer.
 int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
@@ -6981,10 +7026,44 @@ void cl_arq_controller::receive()
 		// carve at CONFIG_0..15 during the climb, where the block geometry is unvalidated
 		// (K=1 at CONFIG_0) — corrupting RX and stalling the gearshift. Stock per-frame
 		// parse handles CONFIG_0..15.
-		if(telecom_system->bigblock_framing_enabled
-			&& telecom_system->M != MOD_MFSK
-			&& current_configuration == CONFIG_16
-			&& telecom_system->bigblock_last_rx_K > 0)
+		// GAP-3 CARVE-GATE HARDENING (cfg16-controlack-hold): the route at
+		// telecom_system.cc:1024 sent EVERY CFG16 OFDM acquisition into receive_bigblock
+		// with NO big-block marker check, so a single OFDM control frame (SET_CONFIG /
+		// ACK turnaround), stale audio, or noise was carved into a fake K-codeword block
+		// (the red-herring "whitening misalignment" signature: wire_bsi=garbage). Require
+		// a REAL big-block here: cw0's de-whitened wire-CRC-8 must validate (a real block
+		// always carries the FEC+CRC-protected cw0 header; a mis-routed control/stale/noise
+		// frame does not). When it FAILS, this was not a block — re-decode the SAME captured
+		// passband on the STOCK per-frame path (bigblock_rx_force_stock suppresses the route
+		// for one receive_byte call) so the control frame is parsed normally and ACKed,
+		// instead of being eaten by the carver. Mirrors the TX, which already declines
+		// control (bigblock_send_one_block). Real big-blocks (the dominant CFG16 traffic
+		// once GAP-1 holds the rung) pass the cw0 CRC and carve exactly as before.
+		bool bigblock_rx_candidate =
+			(telecom_system->bigblock_framing_enabled
+			 && telecom_system->M != MOD_MFSK
+			 && current_configuration == CONFIG_16
+			 && telecom_system->bigblock_last_rx_K > 0);
+		if(bigblock_rx_candidate && !bigblock_rx_cw0_header_valid())
+		{
+			printf("[BBTX-GATE] CFG16 acquisition (K=%d) failed cw0 wire-CRC -> NOT a "
+				"big-block; re-decoding on stock per-frame path (control/stale/noise, "
+				"not carved)\n", telecom_system->bigblock_last_rx_K);
+			fflush(stdout);
+			// One-shot stock re-decode of the SAME captured passband. receive_bigblock
+			// ran its normalize/blank on a LOCAL snapshot (telecom_system.cc:8246-8251),
+			// so ready_to_process_passband_delayed_data is intact for a second decode.
+			telecom_system->bigblock_rx_force_stock = true;
+			received_message_stats = telecom_system->receive_byte(
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				telecom_system->data_container.data_byte);
+			telecom_system->bigblock_rx_force_stock = false;
+			// Not a block: clear the RX-K marker so the carve gate below is FALSE and the
+			// downstream per-frame parse keys on the (stock) received_message_stats.
+			telecom_system->bigblock_last_rx_K = 0;
+			bigblock_rx_candidate = false;
+		}
+		if(bigblock_rx_candidate)
 		{
 			int fallback_bsi = (rsp_current_expected_batch_seq_id >= 0)
 				? (rsp_current_expected_batch_seq_id & 0xFF) : 0;

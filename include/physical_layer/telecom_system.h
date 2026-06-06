@@ -690,6 +690,22 @@ public:
 	int bigblock_last_rx_K = 0;
 	int bigblock_last_rx_cw_ok_count = 0;
 
+	// CFG16 CARVE-GATE HARDENING (cfg16-controlack-hold, GAP3): a one-shot RX
+	// intent override that SUPPRESSES the big-block route in receive_byte for the
+	// NEXT call only, so the captured passband is decoded by the STOCK per-frame
+	// path instead of receive_bigblock. The ARQ carve gate (arq_common.cc) sets
+	// this when a CFG16 acquisition fails the cw0 wire-header CRC check — i.e. the
+	// audio is NOT a real big-block (a single OFDM control frame, stale audio, or
+	// noise mis-routed by the unconditional CFG16->receive_bigblock gate). It then
+	// re-decodes via the stock path so control frames received at CFG16 (e.g. a
+	// SET_CONFIG/ACK turnaround) are parsed normally rather than carved into a fake
+	// K-codeword block (the GAP-3 red-herring "whitening misalignment" source).
+	// Mirrors the TX-side bigblock_emit_as_block intent flag (the TX already
+	// declines control via bigblock_send_one_block); this makes the RX symmetric.
+	// Auto-cleared by the caller after the one stock re-decode. Default false ->
+	// production big-block decode path is byte-identical when the flag is unused.
+	bool bigblock_rx_force_stock = false;
+
 	// P1 LIVE-PATH loopback validator (env MERCURY_BIGBLOCK_LIVE=1 under -m
 	// PLOT_PASSBAND -s 16). Sets bigblock_framing_enabled, drives ONE block through
 	// the production transmit_byte -> in-memory passband round-trip -> receive_byte,
