@@ -7018,6 +7018,48 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	return Kcw;
 }
 
+long cl_telecom_system::bigblock_preamble_mf_snap(const std::complex<double>* bb_dec,
+                                                  int bb_dec_len, long coarse_dec,
+                                                  int pre_nSymb, int Nofdm, int Nc,
+                                                  int search_dec)
+{
+	// Build the DECIMATED reference preamble baseband EXACTLY as the TX did (symbol_mod of
+	// ofdm_preamble[].value) — the absolute level cancels in the normalized correlation, so
+	// only the per-sample SHAPE matters. ref_len = pre_nSymb*Nofdm decimated samples.
+	int ref_len = pre_nSymb * Nofdm;
+	if(ref_len <= 0 || bb_dec_len < ref_len) return coarse_dec;
+	std::vector<std::complex<double>> ref((size_t)ref_len);
+	{
+		std::vector<std::complex<double>> pre_grid((size_t)pre_nSymb*Nc);
+		for(int i=0;i<pre_nSymb*Nc;i++) pre_grid[i]=ofdm.ofdm_preamble[i].value;
+		for(int i=0;i<pre_nSymb;i++)
+			ofdm.symbol_mod(&pre_grid[(size_t)i*Nc], &ref[(size_t)i*Nofdm]);
+	}
+	double ref_e=0.0; for(int m=0;m<ref_len;m++) ref_e += std::norm(ref[m]);
+	if(ref_e < 1e-30) return coarse_dec;
+
+	// Search ±search_dec decimated samples around the SC coarse pick for the position that
+	// MAXIMIZES |<ref, rx>|^2 / (||ref||^2 * ||rx_window||^2) — normalized matched filter.
+	long lo = coarse_dec - search_dec; if(lo < 0) lo = 0;
+	long hi = coarse_dec + search_dec;
+	if(hi > bb_dec_len - ref_len) hi = bb_dec_len - ref_len;
+	double best_c = -1.0; long best_d = coarse_dec;
+	for(long d=lo; d<=hi; d++)
+	{
+		std::complex<double> acc(0,0); double rx_e=0.0;
+		for(int m=0;m<ref_len;m++)
+		{
+			std::complex<double> r = bb_dec[d+m];
+			acc += std::conj(ref[m]) * r;     // matched filter (mag => CFO-robust locally)
+			rx_e += std::norm(r);
+		}
+		double denom = ref_e * rx_e;
+		double c = (denom>1e-30) ? (std::norm(acc)/denom) : 0.0;
+		if(c > best_c){ best_c = c; best_d = d; }
+	}
+	return best_d;
+}
+
 int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
                                             int* out_infobits, int& K_out,
                                             std::vector<int>& cw_ok_out,
@@ -7059,15 +7101,36 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
 		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
 			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
-		long coarse_full = (long)coarse.delay * interp;
-		long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
-		long slice_size  = (long)(pre_nSymb+4)*sym_samples;
-		if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
-		TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
-			&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
-		head_delay  = slice_start + fine.delay;
-		head_metric = fine.correlation;
-		if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		// MATCHED-FILTER SNAP: disambiguate the Schmidl-Cox plateau (±~half-symbol noise-
+		// fragile argmax) by snapping the coarse decimated pick to the preamble matched-
+		// filter peak within ±1 symbol. Sharp single peak at the true start; recovers the
+		// spurious-lobe flip the SC argmax suffers under AWGN. Env-disable for A/B.
+		bool mfsnap = (std::getenv("MERCURY_BIGBLOCK_MFSNAP")==NULL || atoi(std::getenv("MERCURY_BIGBLOCK_MFSNAP"))!=0);
+		long coarse_dec = coarse.delay;
+		if(mfsnap)
+			coarse_dec = bigblock_preamble_mf_snap(bb_dec.data(), Nofdm*buf_syms,
+			                                       coarse.delay, pre_nSymb, Nofdm, Nc, Nofdm);
+		long coarse_full = (long)coarse_dec * interp;
+		if(mfsnap)
+		{
+			// The MF snap already locked the true preamble start at decimation resolution.
+			// SKIP the plateau-prone fine SC re-correlation (it re-flips to the spurious
+			// lobe inside its slice); the demod's pilot-EVM ±GI search recovers the
+			// sub-decimation residual. head_delay = the snapped full-rate start.
+			head_delay  = coarse_full;
+			head_metric = coarse.correlation;
+		}
+		else
+		{
+			long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
+			long slice_size  = (long)(pre_nSymb+4)*sym_samples;
+			if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
+			TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
+				&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
+			head_delay  = slice_start + fine.delay;
+			head_metric = fine.correlation;
+			if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		}
 	}
 	if(acq_metric_out) *acq_metric_out = head_metric;
 	if(head_delay < 0){
@@ -7243,6 +7306,25 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	std::vector<std::complex<double>> deframed(nData);
 	ofdm.deframer(eq.data(), deframed.data());
 
+	// [DIAG-RXPB] instrument nv, mean|H|, post-EQ deframed constellation RMS.
+	if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))
+	{
+		double Hmag=0.0, Hmin=1e9, Hmax=0.0; for(int ci=0;ci<Ngrid*Nc;ci++){ double a=std::abs((ofdm.estimated_channel+ci)->value); Hmag+=a; if(a<Hmin)Hmin=a; if(a>Hmax)Hmax=a;} Hmag/=(Ngrid*Nc);
+		// std of |H| (selectivity numerator) + count of near-zero |H| (polar collapse)
+		double Hvar=0.0; long nzero=0; for(int ci=0;ci<Ngrid*Nc;ci++){ double a=std::abs((ofdm.estimated_channel+ci)->value); Hvar+=(a-Hmag)*(a-Hmag); if(a<0.3*Hmag)nzero++; } Hvar=sqrt(Hvar/(Ngrid*Nc));
+		// raw pilot Y/X mean magnitude + max adjacent-pilot phase step in a mid symbol
+		double pilraw=0.0; int pidx=0,np=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){ std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++]; pilraw+=std::abs(rx[(size_t)n*Nc+j]/X); np++; } pilraw/=(np>0?np:1);
+		double crms=0.0; for(int d=0;d<nData;d++) crms+=std::norm(deframed[d]); crms=sqrt(crms/(nData>0?nData:1));
+		double rxrms=0.0; int dn=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ rxrms+=std::norm(rx[(size_t)n*Nc+j]); dn++; } rxrms=sqrt(rxrms/(dn>0?dn:1));
+		std::cout << "[DIAG-RXPB] nv=" << ofdm.noise_variance_estimate
+		          << " mean|H|=" << Hmag << " |H|[" << Hmin << ".." << Hmax << "]"
+		          << " std|H|=" << Hvar << " nzero(<0.3mean)=" << nzero << "/" << (Ngrid*Nc)
+		          << " pilraw|Y/X|=" << pilraw
+		          << " deframed_rms=" << crms
+		          << " rx_data_rms=" << rxrms
+		          << " last_sel=" << last_channel_selectivity << std::endl;
+	}
+
 	// --- LLR + CSI weighting + LDPC per codeword ---
 	std::vector<float> clr(nBits);
 	double cvar = ofdm.noise_variance_estimate; if(cvar<1e-9) cvar=1e-9;
@@ -7401,6 +7483,36 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 		std::cout << "[BIGBLOCK-WAV] WARN wav sample_rate=" << srate
 		          << " != expected " << (int)sampling_frequency << " Hz (resample upstream)" << std::endl;
 
+	// [DIAG] STEP-1 controlled AWGN injection into the WAV-read passband so the SAME
+	// decoder can be tested at a KNOWN Es/N0 (computed from the BLOCK signal power).
+	// MERCURY_BIGBLOCK_WAV_ESN0 = label dB. MERCURY_BIGBLOCK_WAV_AWGN_CONV selects the
+	// per-sample noise scale: 0 = canonical sigma/sqrt(2) (apply_with_delay/passband_test),
+	// 1 = bare sigma (the live validator's convention at telecom_system.cc:7988).
+	{
+		auto env_d2 = [](const char* k, double def){ const char* e=std::getenv(k); return (e&&*e)?atof(e):def; };
+		double wav_esn0 = env_d2("MERCURY_BIGBLOCK_WAV_ESN0", -999.0);
+		if(wav_esn0 > -900.0)
+		{
+			// signal region = non-silent samples (rough): use the loudest contiguous run.
+			// Measure P_sig over samples whose |x| exceeds 5% of peak (the block body),
+			// matching the live validator's block-only P_sig.
+			double pk=0.0; for(double v: rxpb) if(fabs(v)>pk) pk=fabs(v);
+			double thr=0.05*pk; double sumsq=0.0; long cnt=0;
+			for(double v: rxpb){ if(fabs(v)>thr){ sumsq+=v*v; cnt++; } }
+			double P_sig = (cnt>0)? sumsq/(double)cnt : 0.0;
+			double f_nyquist = sampling_frequency/2.0;
+			double sigma = sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, wav_esn0/10.0) * bandwidth));
+			int conv = env_i("MERCURY_BIGBLOCK_WAV_AWGN_CONV", 0);
+			double per_sample = (conv==1) ? sigma : (sigma/sqrt(2.0));
+			awgn_channel.set_seed(rand());
+			for(size_t i=0;i<rxpb.size();i++) rxpb[i] += per_sample * awgn_channel.awgn_value_generator();
+			std::cout << "[DIAG-WAV] STEP1 AWGN label=" << wav_esn0 << " conv=" << conv
+			          << " P_sig=" << P_sig << " sigma=" << sigma
+			          << " per_sample_std=" << per_sample
+			          << " (signal_samples=" << cnt << "/" << rxpb.size() << ")" << std::endl;
+		}
+	}
+
 	int saved_Nsymb = ofdm.Nsymb;
 	int Nc=0, Nfft=ofdm.Nfft; float gi=ofdm.gi;
 	int Ngi=(int)round((double)gi*(double)Nfft);
@@ -7443,16 +7555,40 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 		// Coarse (GI-stride, decimated) then fine (full-rate slice) — like receive_byte.
 		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
 			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
-		long coarse_full = (long)coarse.delay * interp;
-		// fine: re-correlate a small full-rate slice around the coarse peak
-		long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
-		long slice_size  = (long)(pre_nSymb+4)*sym_samples;
-		if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
-		TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
-			&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
-		head_delay  = slice_start + fine.delay;
-		head_metric = fine.correlation;
-		if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		// MATCHED-FILTER SNAP (see bigblock_preamble_mf_snap): disambiguate the Schmidl-Cox
+		// plateau (the noise-fragile ±half-symbol argmax flip that half-symbols the FFT
+		// window and kills the decode). Sharp single peak at the true preamble start.
+		bool mfsnap = (std::getenv("MERCURY_BIGBLOCK_MFSNAP")==NULL || atoi(std::getenv("MERCURY_BIGBLOCK_MFSNAP"))!=0);
+		long coarse_dec = coarse.delay;
+		if(mfsnap)
+			coarse_dec = bigblock_preamble_mf_snap(bb_dec.data(), Nofdm*buf_syms,
+			                                       coarse.delay, pre_nSymb, Nofdm, Nc, Nofdm);
+		long coarse_full = (long)coarse_dec * interp;
+		long fine_delay_dbg = -1;
+		if(mfsnap)
+		{
+			// MF snap locked the true start; SKIP the plateau-prone fine SC re-correlation
+			// (re-flips to the spurious lobe). Demod pilot-EVM ±GI recovers the residual.
+			head_delay  = coarse_full;
+			head_metric = coarse.correlation;
+		}
+		else
+		{
+			long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
+			long slice_size  = (long)(pre_nSymb+4)*sym_samples;
+			if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
+			TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
+				&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
+			head_delay  = slice_start + fine.delay; fine_delay_dbg = fine.delay;
+			head_metric = fine.correlation;
+			if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		}
+		if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))
+			std::cout << "[DIAG-WAV-ACQ] coarse.delay=" << coarse.delay << " coarse_dec_snapped=" << coarse_dec
+			          << " coarse_full=" << coarse_full << " coarse.corr=" << coarse.correlation
+			          << " fine.delay=" << fine_delay_dbg << " head_delay=" << head_delay
+			          << " head_metric=" << head_metric
+			          << " sym_samples=" << sym_samples << std::endl;
 	}
 	if(head_delay < 0){
 		std::cout << "[BIGBLOCK-WAV] DECODE acquisition FAILED (no preamble found)" << std::endl;
@@ -7646,6 +7782,32 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	std::vector<std::complex<double>> deframed(nData);
 	ofdm.deframer(eq.data(), deframed.data());
 
+	// [DIAG-WAV] instrument nv, mean|H|, post-EQ deframed constellation RMS.
+	if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))
+	{
+		double Hmag=0.0; for(int ci=0;ci<Ngrid*Nc;ci++){ std::complex<double> H=(ofdm.estimated_channel+ci)->value; Hmag+=std::abs(H);} Hmag/=(Ngrid*Nc);
+		double crms=0.0; for(int d=0;d<nData;d++) crms+=std::norm(deframed[d]); crms=sqrt(crms/(nData>0?nData:1));
+		double rxrms=0.0; int dn=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ rxrms+=std::norm(rx[(size_t)n*Nc+j]); dn++; } rxrms=sqrt(rxrms/(dn>0?dn:1));
+		// ACHIEVED per-subcarrier Es/N0: signal energy per data carrier (mean |H*X|^2 over
+		// pilots = noiseless per-SC symbol energy) over nv (per-SC noise variance). This is
+		// the axis the LDPC waterfall lives on (sfo_grid_test EsN0). Compares the passband
+		// validator's full-band Es/N0 LABEL to the per-SC Es/N0 the code actually sees.
+		double sig_sc=0.0; int pidx_d=0, npd=0;
+		for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+			std::complex<double> X=ofdm.pilot_configurator.sequence[pidx_d++];
+			std::complex<double> H=(ofdm.estimated_channel+n*Nc+j)->value;
+			sig_sc += std::norm(H)*std::norm(X); npd++; }
+		sig_sc = npd? sig_sc/npd : 0.0;
+		double nv_sc = ofdm.noise_variance_estimate;
+		double persc_esn0_db = (nv_sc>0.0)? 10.0*log10(sig_sc/nv_sc) : 999.0;
+		std::cout << "[DIAG-WAV] nv=" << ofdm.noise_variance_estimate
+		          << " mean|H|=" << Hmag
+		          << " deframed_rms=" << crms
+		          << " rx_data_rms=" << rxrms
+		          << " sig_per_SC=" << sig_sc
+		          << " achieved_perSC_EsN0_dB=" << persc_esn0_db << std::endl;
+	}
+
 	// --- LLR + CSI weighting + LDPC per codeword (mirrors sfo_grid_test coded) ---
 	std::vector<float> clr(nBits);
 	double cvar = ofdm.noise_variance_estimate; if(cvar<1e-9) cvar=1e-9;
@@ -7723,6 +7885,7 @@ void cl_telecom_system::rx_passband_normalize_and_blank(double* pb, int pb_sampl
 	for(int i = 0; i < pb_samples; i++)
 		sum_sq += pb[i] * pb[i];
 	double rms = sqrt(sum_sq / pb_samples);
+	double rms_in = rms; double applied_scale = 1.0;
 	if(rms > 1e-8) {
 		// Phase-2: --rx-normalize=off bypasses this auto-rescaling block.
 		if(rx_normalize_enabled) {
@@ -7739,15 +7902,22 @@ void cl_telecom_system::rx_passband_normalize_and_blank(double* pb, int pb_sampl
 				for(int i = 0; i < pb_samples; i++)
 					pb[i] *= scale;
 				// Recalculate RMS after scaling
-				rms *= scale;
+				rms *= scale; applied_scale = scale;
 			}
 		}
 		// Impulse noise blanking: clip at 10× RMS (always on)
 		double clip_threshold = 10.0 * rms;
+		long nclip=0;
 		for(int i = 0; i < pb_samples; i++) {
-			if(pb[i] > clip_threshold) { pb[i] = clip_threshold; }
-			else if(pb[i] < -clip_threshold) { pb[i] = -clip_threshold; }
+			if(pb[i] > clip_threshold) { pb[i] = clip_threshold; nclip++; }
+			else if(pb[i] < -clip_threshold) { pb[i] = -clip_threshold; nclip++; }
 		}
+		if(std::getenv("MERCURY_BIGBLOCK_RXPB_DIAG"))
+			std::cout << "[DIAG-NORM] pb_samples=" << pb_samples << " rms_in=" << rms_in
+			          << " scale=" << applied_scale << " final_rms=" << rms
+			          << " clip_thr=" << clip_threshold
+			          << " nclip=" << nclip << " norm_enabled=" << rx_normalize_enabled
+			          << " target=" << (sqrt(output_power_Watt)*0.5) << std::endl;
 	}
 }
 
@@ -8002,11 +8172,31 @@ void cl_telecom_system::bigblock_livepath_loopback()
 		double P_sig = sumsq / (n_tx>0?n_tx:1);
 		double f_nyquist = sampling_frequency / 2.0;
 		double sigma = sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, live_esn0/10.0) * bandwidth));
+		// AWGN-scale calibration (this-session diag): the shipped validator added
+		// `sigma * awgn_value_generator()` per REAL passband sample, but the canonical
+		// passband AWGN (apply_with_delay, awgn.cc:68/75; passband_test_EsN0,
+		// telecom_system.cc:480/498; sfo_block_test :5618; the -10 path :4484) all add
+		// `(sigma/sqrt(2)) * awgn_value_generator()` because awgn_value_generator() is
+		// UNIT-variance and the convention is per-real-sample noise variance = sigma^2/2.
+		// Bare sigma => 2x noise power => the labeled Es/N0 was 3.01 dB OPTIMISTIC (a TRUE
+		// label-3 dB channel). Default is now the canonical convention so the dB label is
+		// EXACT; MERCURY_BIGBLOCK_LIVE_AWGN_CONV=1 restores the old bare-sigma for A/B.
+		int conv = env_d("MERCURY_BIGBLOCK_LIVE_AWGN_CONV", 0.0) != 0.0 ? 1 : 0;
+		double per_sample = (conv==1) ? sigma : (sigma/sqrt(2.0));
 		awgn_channel.set_seed(rand());
-		for(int i=0;i<rx_window;i++)
-			rx_pb[i] += sigma * awgn_channel.awgn_value_generator();
-		std::cout << "[BIGBLOCK-LIVE] AWGN Es/N0=" << live_esn0 << " dB sigma=" << sigma
-		          << " (P_sig=" << P_sig << " bw=" << bandwidth << ")" << std::endl;
+		double noise_sumsq=0.0;
+		for(int i=0;i<rx_window;i++){
+			double nz = per_sample * awgn_channel.awgn_value_generator();
+			rx_pb[i] += nz; noise_sumsq += nz*nz;
+		}
+		double P_noise = noise_sumsq/(rx_window>0?rx_window:1);
+		// TRUE per-sample Es/N0: passband Es/N0 = P_sig*f_nyquist/(P_noise*bw) under the
+		// production convention (P_noise=sigma^2/2). Report what was ACTUALLY injected.
+		double true_esn0 = 10.0*log10( P_sig*f_nyquist / (P_noise*bandwidth) );
+		std::cout << "[BIGBLOCK-LIVE] AWGN Es/N0(label)=" << live_esn0 << " dB conv=" << conv
+		          << " sigma=" << sigma << " per_sample_std=" << per_sample
+		          << " P_sig=" << P_sig << " P_noise=" << P_noise
+		          << " TRUE_injected_EsN0=" << true_esn0 << " dB bw=" << bandwidth << std::endl;
 	}
 
 	// 5) hand the capture buffer to receive_byte through a data_container whose window
