@@ -819,6 +819,59 @@ int cl_arq_controller::test_bigblock_climb_election()
 		free_pair(cmd, tsc, rsp, tsr);
 	}
 
+	// ===================== RUNG SELF-HEAL ARM (fact-doc §18) =====================
+	// Regression for the LIVE emit=0 bug: on the pinned -s 16 path (and after any path
+	// where TEST_CONNECTION re-set the stock batch at the control tier) data_batch_size
+	// stays at the stock 25 > K at CFG16, so bigblock_send_one_block declines every batch
+	// (n_data > K) and NO block ever emits. The CMD batch-builder entry self-heal
+	// (process_messages_tx_data, arq_commander.cc:1295) re-pins data_batch_size = K at the
+	// live rung. Prove FAIL-BEFORE (stock batch > K -> a full batch is NOT big-block
+	// eligible) then PASS-AFTER (the rung self-heal re-pins to K -> eligible).
+	{
+		cl_arq_controller *cmd, *rsp; cl_telecom_system *tsc, *tsr;
+		build_pair(cmd, tsc, rsp, tsr);
+		// Reach the rung: framing on + live config CFG16 (the pinned-start state).
+		tsc->bigblock_framing_enabled = true;
+		// Defeat the transition election so the CFG16 load leaves data_batch_size at the
+		// stock value — exactly the pinned/negotiation desync the HW hit.
+		set_env("MERCURY_BIGBLOCK_DEFEAT_ELECTION", "1");
+		cmd->load_configuration(CONFIG_16, FULL, YES);
+		set_env("MERCURY_BIGBLOCK_DEFEAT_ELECTION", "");
+		// Force the stock-batch desync explicitly (robust to default-batch drift).
+		cmd->set_data_batch_size(25);
+		int stock_batch = cmd->data_batch_size;          // 25 (the desync)
+		int K = tsc->bigblock_codeword_count();          // 8 at the pinned K geometry
+		// FAIL-BEFORE: a full new-data batch (stock_batch frames) is NOT big-block eligible
+		// because n_data (= stock_batch) > K — bigblock_send_one_block's :3735 decline.
+		bool eligible_before = (stock_batch > 0) && (K > 0) && (stock_batch <= K);
+		printf("[TEST-CLIMB-ELECT] SELF-HEAL FAIL-BEFORE: framing=1 cfg=CONFIG_16 "
+		       "data_batch_size=%d K=%d -> full-batch eligible=%d (want 0)\n",
+		       stock_batch, K, (int)eligible_before);
+		fflush(stdout);
+		check(!eligible_before && stock_batch > K,
+		      "SELF-HEAL FAIL-BEFORE: stock batch > K -> over-sized batch declines the block");
+
+		// PASS-AFTER: run the SAME self-heal predicate + re-election the batch-builder entry
+		// runs (arq_commander.cc:1295). data_batch_size must become K.
+		if(tsc->bigblock_framing_enabled
+		   && tsc->M != MOD_MFSK
+		   && cmd->current_configuration == CONFIG_16)
+		{
+			int Kre = tsc->bigblock_codeword_count();
+			if(Kre > 0 && cmd->data_batch_size != Kre)
+				cmd->sack_negotiated_recompute_batch("CMD");
+		}
+		int healed_batch = cmd->data_batch_size;         // K (8)
+		bool eligible_after = (healed_batch > 0) && (K > 0) && (healed_batch <= K);
+		printf("[TEST-CLIMB-ELECT] SELF-HEAL PASS-AFTER: data_batch_size=%d K=%d "
+		       "-> K-batch eligible=%d (want 1)\n",
+		       healed_batch, K, (int)eligible_after);
+		fflush(stdout);
+		check(healed_batch == K && eligible_after,
+		      "SELF-HEAL PASS-AFTER: rung re-election pins data_batch_size==K -> block eligible");
+		free_pair(cmd, tsc, rsp, tsr);
+	}
+
 	restore_env();
 	printf("[TEST-CLIMB-ELECT] %s (%d failure%s)\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

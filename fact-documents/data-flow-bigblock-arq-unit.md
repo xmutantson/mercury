@@ -1549,3 +1549,89 @@ SWITCH_ROLE site itself is UNREACHABLE in-process — the sim PINs the config (`
 turboshift OFF, SWITCH_ROLE count = 0 observed), so role reversal never fires. The SWITCH_ROLE wrap
 is a FAITHFUL application of the §17.4-proven mechanism to the audit-found sibling; its live
 role-reversal path is validated at P3/P4 HW. NO monitor merge, NO push, NO attribution.
+
+## §18. LIVE TX EMIT=0 — `data_batch_size` desync at CFG16 declines every block (2026-06-06, branch `fix/bigblock-tx-rung-rearm` off `fix/bigblock-rearm-window`@`2e8ca1f`, worktree `C:/Users/kamer/mercury_wt/bigblock-tx-rung-rearm`)
+
+### §18.1 Symptom (HW, the wujwgjtx5 localization)
+The CMD reaches CFG16, `[BIGBLOCK-ELECT]` fires, OFDM is healthy, but `[BIGBLOCK-TX] one-block emit`
+count = 0 and `[TXCW]` = 0 — the big-block TX never ran. The 96 `[RXCW]` were SPURIOUS (the RSP
+carved per-frame warm-blast audio; all-identical garbage, ldpc_iter=101). Only 113 app bytes,
+measured_bytes=0. VERDICT: TX_BIGBLOCK_NOT_EMITTED — the bug is on the TX path between ELECT and EMIT.
+
+### §18.2 Root cause — `data_batch_size` is the emit gate, and the rung election does not own it at send time
+`bigblock_send_one_block()` declines a batch when `n_data > K` (`arq_common.cc:3735`, K = `bigblock_codeword_count()`
+= 8 at CFG16). So a block can only emit when the new-data batch builder caps the batch at K. That cap
+is `data_batch_size`, which the rung election (`sack_negotiated_recompute_batch`, `arq_common.cc:981-993`)
+pins to K. But that election is EVENT-gated and on every real path the LAST writer of `data_batch_size`
+at CFG16 is NOT the election:
+
+- **Climb path (`-R`)** — `nc_cmd_iso.log`: the CFG16-transition tail (`arq_common.cc:1856`) DID fire
+  (`[BIGBLOCK-ELECT]`, `data_batch_size=8`), but the new-data queue DRAINED at the slow low rungs
+  (ROBUST_0..CONFIG_0) before CFG16 was reached. `send_batch() on CONFIG_16` carried ONLY `type=48`
+  CONTROL frames; the type=16 DATA went out at CONFIG_100/101/102 + CONFIG_0. No DATA batch at CFG16 → emit=0.
+- **Pinned path (`-s 16`)** — `m_cmd_pf_off.log`: DATA frames DID reach `send_batch` at CONFIG_16
+  (12 calls, 25/30 frames each), but `[SACK] ... bigblock=0` and `data_batch_size=25` (NOT 8). The pinned
+  start has no CFG16 *transition* so the tail election never fired; `sack_negotiated_recompute_batch` ran
+  at TEST_CONNECTION on the MFSK control tier (`current_configuration != CONFIG_16` → `bigblock_rung=0`
+  → stock 30s branch → 25). Result: every CFG16 batch had n_data=25 > K=8 → declined → per-frame → emit=0.
+
+ONE root cause: PROD_ELECTION_STATE_DESYNC — the emit gate (`n_data <= K`) depends on `data_batch_size==K`,
+but nothing guarantees that at the moment a DATA batch is built at CFG16.
+
+### §18.3 Why the in-process tests missed it
+`test_bigblock_climb_election` / `test_bigblock_multicw` / `test_bigblock_arq_unit` HAND-SET
+`data_batch_size=K` (or drive the election directly) and either check the gate predicate manually or call
+`transmit_byte` directly — they NEVER exercise the live `send_batch -> bigblock_send_one_block` routing
+nor the climb-time queue drainage. The "622/622 byte-faithful" proves the PHY emit+carve works and the gate
+is satisfiable; it gave ZERO coverage of the `data_batch_size` state at send time. Exactly the cross-layer
+regression gap CLAUDE.md warns about.
+
+### §18.4 Fix — rung self-heal at the CMD batch-builder entry
+`process_messages_tx_data()` (the CMD new-data batch builder, `arq_commander.cc:1295`): when the LIVE state
+is the big-block rung (`telecom_system->bigblock_framing_enabled && M != MOD_MFSK && current_configuration ==
+CONFIG_16`) and `data_batch_size != K`, re-run the SHARED, divergence-proof election
+`sack_negotiated_recompute_batch("CMD")` so `data_batch_size==K` right before the batch is built — on EVERY
+path (pinned, climb, post-negotiation). Reuses the exact audited election body (no parallel mechanism).
+Self-gated on the rung + the `!= K` check → no-op off the rung and idempotent on it → stock per-frame path
+byte-identical. Instrumentation: `[BBTX-GATE]` at the `send_batch` big-block routing decision
+(`arq_common.cc:~4282`) prints `framing, cfg, data_batch_size, K, n_data, retx -> bigblock_eligible`, then
+`routed=1` (emitted) or `routed=0` (per-frame) — so the HW confirm SEES the gate.
+
+### §18.5 §5 cross-layer audit of `data_batch_size`
+1. **Producers** (writers): `set_data_batch_size()` (`arq_common.cc:751`, the chokepoint, called from
+   `load_configuration` :1567/:1630/:1656, `sack_negotiated_recompute_batch` :990/:1002, SET_LINK_PARAMS
+   adopt on RSP, dwell-batch raise/revert). My fix adds ONE more producer call site (the rung re-election),
+   routed THROUGH the existing `sack_negotiated_recompute_batch -> set_data_batch_size(K)` — not a raw write.
+2. **Consumers** (readers): the new-data batch builder cap (`arq_commander.cc:1626/1678/1697`), the clean-ACK
+   `all_ones=(1<<data_batch_size)-1` (`arq_commander.cc:136-139`), the BREAK runaway threshold
+   `2*data_batch_size` (:1494), `bigblock_send_one_block`'s `n_data > K` decline (consumer of the CAP, not the
+   var directly), the RSP expected-batch/all_ones. My fix sets `data_batch_size = K` which is EXACTLY the value
+   the election already pins at the rung — every consumer is then in the SAME state the transition-election path
+   already produces (the §16 PASS state, proven `all_ones=0xFF`, T6/T8 green). No consumer sees a NEW value.
+3. **Valid states / default-init**: before any producer, `data_batch_size` defaults from
+   `default_configuration_ARQ.batch_size`; at CFG16 non-robust it becomes 25 (the desync). The fix only fires
+   AT the rung (CFG16, framing on) so it cannot touch robust/MFSK/other-OFDM batch sizing.
+4. **Invariants**: (a) CMD and RSP must elect the SAME K (divergence-proof) — preserved: both call the SAME
+   `bigblock_codeword_count()` geometry; the RSP carve self-derives K from the block (EOB=K-1) so the RSP all_ones
+   already matched K via §16; my CMD-side re-pin makes the CMD match what the RSP carve already produces. (b)
+   Off-rung byte-identical — preserved by the strict guard. (c) Idempotent — the `!= K` check.
+5. **What the fix changes**: the TIMING of when `data_batch_size==K` holds (now: guaranteed at every CFG16 DATA
+   batch build, not just at a transition/negotiation event). It does NOT change the elected VALUE, the authority
+   model (optimizer/gearshift untouched), or any wire format.
+
+### §18.6 Test (fail-before / pass-after, SAME binary)
+New SELF-HEAL arm in `test_bigblock_climb_election` (`test_bigblock_arq_unit.cc`): force the desync
+(`MERCURY_BIGBLOCK_DEFEAT_ELECTION=1` on the CFG16 load + `set_data_batch_size(25)`), assert FAIL-BEFORE
+(`data_batch_size=25 K=8 -> full-batch eligible=0`), run the SAME self-heal predicate + re-election, assert
+PASS-AFTER (`data_batch_size=8 -> eligible=1`). Verified: `--test-bigblock-climb-election` ALL PASS (incl the
+new arm); `--test-bigblock-arq-unit` 8/8; `--test-bigblock-multicw` ALL PASS; `--test-climb-engine` ALL PASS.
+Build o3 rc=0.
+
+### §18.7 HW confirm — what to deploy / look for
+Deploy `C:/Users/kamer/mercury_wt/bigblock-tx-rung-rearm/mercury.exe` (branch `fix/bigblock-tx-rung-rearm`).
+PREFER the PINNED path (`bigblock_p3_hw.py --pin-config 16` — the climb is unreliable on this testbed; pinned
+puts DATA at CFG16 directly, which this fix now makes emit). On the CMD log expect: `[BBTX-GATE] rung self-heal:
+data_batch_size 25 -> K=8`, then `[BBTX-GATE] ... n_data=8/8 ... bigblock_eligible=1` + `routed=1` +
+`[BIGBLOCK-TX] one-block emit: K=8`. NOTE: this fix addresses ONLY the EMIT. The PRIOR whitening/CRC carve bug
+(§ STATUS.md t22) is a SEPARATE downstream issue — once emit fires, re-check end-to-end byte delivery; if blocks
+emit but deliver garbage, that is the whiten-alignment bug, not this fix.

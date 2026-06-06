@@ -4277,8 +4277,35 @@ void cl_arq_controller::send_batch()
 	// off — the default). On a handled block, do the SAME post-TX bookkeeping the
 	// per-frame path does (ptt-off-delay, capture flush + unmute, ack timers,
 	// frames_to_read reset) and return.
+	//
+	// [BBTX-GATE] instrumentation (fact-doc §18): log the big-block routing-decision
+	// state at EVERY send_batch so the HW confirm SEES why a block did or did not emit
+	// (framing flag, live config, the data_batch_size cap vs K, n_data in this batch,
+	// retx). routed=1 means bigblock_send_one_block() handled the batch and emitted a
+	// block; routed=0 means it declined and the stock per-frame path runs. Cheap (one
+	// printf per batch); the K query is geometry-only.
+	{
+		bool bb_framing = (telecom_system != NULL) && telecom_system->bigblock_framing_enabled;
+		bool bb_mfsk    = (telecom_system != NULL) && (telecom_system->M == MOD_MFSK);
+		int  bb_K       = (bb_framing && !bb_mfsk && current_configuration == CONFIG_16
+		                   && telecom_system != NULL)
+		                ? telecom_system->bigblock_codeword_count() : -1;
+		int  bb_ndata   = 0;
+		for(int i=0;i<message_batch_counter_tx;i++)
+			if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+				bb_ndata++;
+		printf("[BBTX-GATE] framing=%d cfg=CONFIG_%d data_batch_size=%d K=%d "
+			"n_data=%d/%d retx=%d -> bigblock_eligible=%d\n",
+			bb_framing ? 1 : 0, current_configuration, data_batch_size, bb_K,
+			bb_ndata, message_batch_counter_tx, sack_retransmit_active ? 1 : 0,
+			(bb_framing && !bb_mfsk && current_configuration == CONFIG_16
+			 && !sack_retransmit_active && bb_ndata > 0 && bb_K > 0
+			 && bb_ndata <= bb_K) ? 1 : 0);
+		fflush(stdout);
+	}
 	if(bigblock_send_one_block())
 	{
+		printf("[BBTX-GATE] routed=1 (big-block emitted)\n"); fflush(stdout);
 		ptt_busy_wait(ptt_on_delay, ptt_on_delay_ms);
 
 		if(g_verbose) { printf("[TX] big-block: waiting for playback buffer to drain...\n"); fflush(stdout); }
@@ -4338,6 +4365,7 @@ void cl_arq_controller::send_batch()
 		fflush(stdout);
 		return;
 	}
+	printf("[BBTX-GATE] routed=0 (per-frame path)\n"); fflush(stdout);
 
 	int active_nsymb = telecom_system->get_active_nsymb();
 	int frame_output_size = telecom_system->data_container.Nofdm*telecom_system->data_container.interpolation_rate*(active_nsymb+telecom_system->data_container.preamble_nSymb);

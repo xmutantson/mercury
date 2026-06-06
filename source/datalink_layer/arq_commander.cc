@@ -1292,6 +1292,46 @@ void cl_arq_controller::process_messages_tx_data()
 	// batch-prep work (retx prefix, compression of new-data frames,
 	// pad to size, etc.).
 	mtl::log_event("cmd_tx_data_entry");
+
+	// BIG-BLOCK RUNG SELF-HEAL (fact-doc data-flow-bigblock-arq-unit.md §18). The big-block
+	// TX switch bigblock_send_one_block() declines a batch when n_data > K (arq_common.cc:3735)
+	// — so it can only emit when the new-data batch builder below caps the batch at K. That cap
+	// comes from data_batch_size, which the rung election (sack_negotiated_recompute_batch)
+	// pins to K = bigblock_codeword_count() (=8 at CFG16). But the election is event-gated and
+	// neither event reliably leaves data_batch_size==K at the moment a DATA batch is built at
+	// CFG16: (1) TEST_CONNECTION negotiation runs at the MFSK control tier (current_configuration
+	// != CONFIG_16 -> bigblock_rung=0 -> the stock 30s branch elects 25); (2) the load_configuration
+	// CFG16-transition tail only fires on a transition INTO CONFIG_16 — a pinned -s 16 start has no
+	// transition, and TEST_CONNECTION then overwrites data_batch_size back to 25. On BOTH the climb
+	// (election fires, but the queue drains at the slow low rungs before CFG16) and the pinned path
+	// (election never fires) the result was data_batch_size=25/30 > K at CFG16 -> every batch >K ->
+	// bigblock_send_one_block declined -> [BIGBLOCK-TX] emit=0 (HW: m_cmd_pf_off.log 25/30-frame
+	// CFG16 batches, BIGBLOCK-TX=0; nc_cmd_iso.log climb reached CFG16 but only type=48 control).
+	//
+	// FIX: re-run the SHARED, divergence-proof rung election here, at the new-data batch builder
+	// entry, whenever the live state IS the big-block rung — so data_batch_size==K right before the
+	// batch is built, on EVERY path (pinned, climb, post-negotiation). This reuses the exact
+	// audited election body (sack_negotiated_recompute_batch -> set_data_batch_size(K) ->
+	// recalculate_ack_timeout_for_batch), introduces NO parallel mechanism, and keeps the builder
+	// cap, the post-TX bookkeeping (arq_common.cc:4313), and the clean-ACK all_ones target
+	// consistent. STRICTLY gated on the live rung (framing on, !MFSK, CONFIG_16) and a no-op when
+	// data_batch_size is already K — OFF the rung the stock per-frame path is byte-identical.
+	if(telecom_system != NULL
+	   && telecom_system->bigblock_framing_enabled
+	   && telecom_system->M != MOD_MFSK
+	   && current_configuration == CONFIG_16)
+	{
+		int K = telecom_system->bigblock_codeword_count();
+		if(K > 0 && data_batch_size != K)
+		{
+			printf("[BBTX-GATE] rung self-heal: data_batch_size %d -> K=%d "
+				"(framing=1 cfg=CONFIG_16) re-electing big-block rung\n",
+				data_batch_size, K);
+			fflush(stdout);
+			sack_negotiated_recompute_batch("CMD");
+		}
+	}
+
 	// SACK retransmit path (v1 only): send only the missing frames from last SACK
 	// as a standalone retransmit-only batch.
 	//
