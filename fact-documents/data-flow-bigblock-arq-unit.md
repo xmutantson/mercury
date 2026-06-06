@@ -986,3 +986,50 @@ change — so the §13-sibling sim2 net-PHY (7859/7960 bps > VARA 7050) is prese
 
 **Commit** (heap-overrun fix): on `fix/bigblock-cfg16-heap-overrun` off
 `integ/bigblock-merge-2026-06-05`@`fe9d3e3`. NO monitor merge, NO push, NO attribution.
+
+## §14. FINAL CONSOLIDATION — heap-fix + CRC-fix + LAN-bind in one binary (2026-06-05)
+
+Branch `integ/bigblock-final-2026-06-05` (worktree `C:/Users/kamer/mercury_wt/bigblock-final`)
+off `integ/bigblock-merge-2026-06-05`@`fe9d3e3`:
+- `git merge --no-ff fix/bigblock-cfg16-heap-overrun` — clean (descended from `fe9d3e3`).
+- `git merge --no-ff feat/bigblock-cw-crc8` — conflicted ONLY in
+  `test_bigblock_arq_unit.cc` (both branches add a sim "CASE C" to
+  `test_sim_inproc_bigblock`). `arq_common.cc` + `telecom_system.cc` auto-merged (disjoint
+  line ranges: CRC touches `bigblock_send_one_block` payload-assembly :3700-3785 + the carve
+  CRC-demote :3908-3940 + `bigblock_rx_passband` LLR-corruptor :7414; heap touches the same
+  function's TX-buffer/emit-scope :3809-3822 + the `receive()` member-carve call :6892 +
+  `transmit_byte`/`transmit_bigblock`/`receive_bigblock` :642/8126/8226). Verified both
+  change-sets coexist: cw caps (`cw0_cap`/`cwc_cap`) + CRC stamping over `block_payload_bytes`
+  AND the `bigblock_emit_scope`/`block_pb_capacity` sizing; carve recomputes CRC + demotes
+  cw_ok BEFORE the cw0 header-trust gate AND reads from the dedicated `bigblock_rx_infobits`
+  member. The CRC byte is one of the `K*sub_len` info bytes → the passband sample count
+  (`block_pb_capacity` from `bigblock_tx_total_samples()`) is unchanged; no capacity edit needed.
+- `git cherry-pick 06cbbce` (LAN-bind, platform-conditional tcp_socket bind) — clean.
+
+**CASE-C collision resolved by KEEPING BOTH, renaming the CRC one to CASE D.** The shared
+`build_block_wire` lambda (auto-merged) now stamps the per-codeword wire CRC, so BOTH the
+heap-canary case (CASE C) and the bit-flip case (CASE D) drive CRC-valid wire blocks.
+
+**Cross-layer reconciliation required for CASE D** (the canonical CLAUDE.md §5 trap): CASE D
+was authored against the pre-heap-fix RX, reading the decoded bits from `receive_byte`'s `out`
+param. The heap-fix re-routed the full `K*ldpc.K` decode into `bigblock_rx_infobits` and bounded
+`out` to `N_MAX` (~1.1 codewords). CASE D's direct-CRC-proof and its `bigblock_receive_carve`
+call both had to read from `tsB->bigblock_rx_infobits` (the full member) — exactly as the live
+`receive()` path and the heap-fix's CASE A/B do. Pre-reconciliation CASE D FAILED in the normal
+run (`crc_match_others=0 partial=1/8`); post-reconciliation it PASSES (`partial=7/8 retx_count=1`).
+
+**Two fail-befores, both on the SAME consolidated binary** (no revert build):
+- `MERCURY_BIGBLOCK_OLDGATE=1` → CASE C heap canary FAILs (`rx_canary_ok=0 tx_canary_ok=0`).
+- `MERCURY_BIGBLOCK_NOCRC=1` (NEW reproducer hook added to the carve CRC-demote, mirrors
+  OLDGATE) → CASE D FAILs with the silent-corruption signature (`partial=8/8 retx_count=0`).
+
+**Regression (all FOREGROUND, green):** `--test-sim-inproc-bigblock` ALL PASS (CASE A/B + heap
+CASE C + bit-flip CASE D); `--test-bigblock-arq-unit` 8/8 (T1-T9); `--test-climb-engine` 0
+failures; plus `--test-sim-clock`/`--test-clean-batch-viability`/`--test-data-anchored-promote`/
+`--test-probe-backoff`/`--test-phantom-ack-gate` all 0 failures.
+
+**Net-PHY WITH the 8-byte/block CRC overhead** (K=8 codewords × 1 CRC-8 byte = 8/1400 = 0.57%
+of the info bytes): 7.2% selective layout = **7814 bps net-PHY (7713 bps app-delivered) > VARA
+Standard 7050**; 6% flat = 7915 (7813 app). The CRC win is preserved.
+
+NO monitor merge, NO push, NO attribution.
