@@ -173,6 +173,25 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 // implementation can never collide with it.
 #define BIGBLOCK_ARQ_NOT_WIRED -77
 
+// PHASE 1 (P3 prereq, fact-documents/data-flow-bigblock-arq-unit.md §11): the
+// big-block carries a SELF-DESCRIBING header ON THE WIRE so a SUSTAINED multi-block
+// session cannot drift the CMD/RSP block bsi (the block has ONE acquisition + no
+// per-frame wire bit-7 to carry it) AND so the RX delivers each sub-codeword its
+// EXACT frame length (REQUIRED for compression transparency: variable-length
+// compressed frames must reassemble byte-faithfully — §11.4 / INV-10).
+//
+// The header rides as a PREFIX of codeword 0's systematic info bits ⇒ LDPC-protected,
+// decoded with the block. Layout (LSB-first bytes, hdr_total = BB_HDR_FIXED + 2*K):
+//   [0] = block_bsi (low 8 bits)            <- the authoritative wire bsi
+//   [1] = n_data    (0..K filled codewords)
+//   [BB_HDR_FIXED + 2*c + 0] = length[c] low  byte   } per-codeword app length (uint16 LE),
+//   [BB_HDR_FIXED + 2*c + 1] = length[c] high byte   }  c = 0..K-1
+// cw0's app bytes start at offset hdr_total (cw0 capacity = sub_len - hdr_total);
+// cwc (c>=1) app bytes occupy [c*sub_len .. c*sub_len + length[c]) (codeword-aligned
+// so the K-bit cw_ok SACK granularity / selective-repeat stays frame == codeword).
+#define BIGBLOCK_HDR_FIXED_BYTES 2                            // bsi + n_data
+#define BIGBLOCK_HDR_TOTAL_BYTES(K) (BIGBLOCK_HDR_FIXED_BYTES + 2*(K))  // + uint16 length table
+
 //Node role
 #define COMMANDER 0
 #define RESPONDER 1

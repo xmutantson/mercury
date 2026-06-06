@@ -620,6 +620,14 @@ public:
 	// MFSK or when the grid yields no codewords (caller must not pin on 0).
 	int bigblock_codeword_count();
 
+	// PHASE 1 (fact-doc §11.6): apply (self-inverse) the big-block payload energy
+	// dispersal / whitening to a bit buffer. The real-bytes TX (transmit_bigblock)
+	// whitens the payload before LDPC encode so a zero-padded short compressed frame
+	// still modulates to a well-conditioned signal; the ARQ RX (bigblock_receive_carve)
+	// calls this on the decoded info bits to recover the exact payload. Same fixed-seed
+	// PRBS on both ends (no wire negotiation). XOR => calling it twice is a no-op.
+	void bigblock_whiten_bits(int* bits, int nbits);
+
 	// Big-block cross-call stash (P1 loopback validation + P2 handoff). The TX side
 	// records the K known info-bit groups it emitted + the sample count; the RX side
 	// records the per-codeword clean vector (the K-bit SACK granularity P2 consumes)

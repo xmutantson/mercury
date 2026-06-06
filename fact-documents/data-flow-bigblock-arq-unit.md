@@ -628,3 +628,183 @@ deliverable (Option-b STOP) — NOT attempted here (one block = one ARQ unit in-
 **Commit** (bisectable, per P4): a SEPARATE commit on `integ/bigblock-merge-2026-06-05`
 ON TOP of the two merge commits (so the merge and the send-path wiring are distinct).
 NO monitor merge, NO push, NO Claude/Anthropic attribution.
+
+---
+
+## §11 PHASE 1 (P3 prereq, no-HW) — block-BSI ON THE WIRE + compression transparency
+
+**Why** (the §10 item-3 open question): the live RX carve `receive()` (`arq_common.cc:6677-6680`)
+derived the block bsi from the RX's OWN `rsp_current_expected_batch_seq_id` — a LOCAL guess,
+NOT the bsi the TX block advertised. For ONE block this is correct (RX-expected == TX-bsi).
+But a SUSTAINED multi-block session has ONE acquisition per block and no per-frame wire bit-7
+(`arq_common.cc:6639`) to carry the bsi, so if any block is dropped/missed the CMD and RSP bsi
+counters can DRIFT with no wire mechanism to resynchronize → every subsequent block routes
+`out_of_window` (`arq_responder.cc:332-441`) and the session stalls. Phase 1 closes this by
+carrying the block bsi ON THE WIRE (FEC-protected) so RX adopts the TX's authoritative bsi.
+
+### §11.1 Design — a self-describing block header inside codeword 0 (LDPC-protected)
+
+The block payload is a FIXED `K*sub_len` bytes (`sub_len = ldpc.K/8`), packed LSB-first as the
+K codewords' systematic info bits (`transmit_bigblock:8029 byte_to_bit`; the geometry is locked,
+so we CANNOT append bytes beyond `K*sub_len`). The wire header occupies a small PREFIX of
+**codeword 0** so it rides inside cw0's systematic info bits ⇒ LDPC-protected, decoded with the
+block in the SAME single acquisition (no extra preamble, no separate field). It is
+SELF-DESCRIBING so the RX delivers each sub-codeword its EXACT frame length (REQUIRED for
+compression transparency — see §11.4 / INV-10):
+
+```
+  Block header (cw0 prefix), hdr_total = BB_HDR_FIXED(2) + 2*K bytes:
+    payload[0]            = block_bsi (low 8 bits)        <- THE wire bsi (drift-proof)
+    payload[1]            = n_data    (0..K)              <- # filled sub-codewords this block
+    payload[2 + 2*c + 0]  = length[c] low  byte           } per-codeword app length table
+    payload[2 + 2*c + 1]  = length[c] high byte           }  (c = 0..K-1)
+  App payloads (frame c -> sub-codeword c, ALIGNED to the LDPC codeword for cw_ok/SACK):
+    cw0 app:  payload[hdr_total .. sub_len-1]              (frame 0, capacity sub_len - hdr_total)
+    cwc app:  payload[c*sub_len .. c*sub_len + length[c]-1]  c=1..K-1 (full sub_len capacity)
+```
+
+**Why frame c MUST stay aligned to LDPC codeword c (NOT a contiguous byte stream):** the PHY
+exposes a PER-LDPC-CODEWORD clean vector `cw_ok` (K bits, `telecom_system.h:595`) = the SACK
+granularity (INV-2). Selective-repeat re-sends EXACTLY the failed codeword (INV-3). If a frame's
+payload spanned codeword boundaries, a single bad codeword would corrupt two frames and break
+INV-2/3. So each frame stays in its OWN codeword's `sub_len` region; the header carries the real
+lengths so the carve trims the per-codeword zero-pad on delivery.
+
+**Why a header in cw0 (not a separate PHY field):** (a) the PHY treats the payload as OPAQUE
+bytes ⇒ ZERO PHY change (`telecom_system.cc` byte-identical); (b) FEC-protected (rides in cw0's
+info bits); (c) decoded in the normal carve — RX reads the header back AFTER the decode and uses
+the wire bsi as authoritative, replacing the local `rsp_current_expected_batch_seq_id` guess, and
+the length table so each delivered slot byte-matches its TX frame (compression transparency).
+
+**Capacity guard (INV-9, NEW):** cw0's reduced capacity `sub_len - hdr_total` must still hold a
+full compressed frame `max_frame` (`arq.h:2072`). The big-block lattice (Ngrid=60) gives
+`sub_len` ≫ `max_frame` + `hdr_total`, so the guard holds with margin;
+`bigblock_send_one_block` DECLINES the block (→ stock per-frame path) if `sub_len <= hdr_total`
+or if frame-0's `length > sub_len - hdr_total` (defensive; never hit at the CFG16 rung).
+`length[c]` is a uint16 (≤ `sub_len`); `max_frame ≈ 173` ≤ 255 today but uint16 is future-proof.
+
+### §11.2 Producers / Consumers delta (the §1/§2 audit for the NEW wire header)
+
+- **PRODUCER (TX) `bigblock_send_one_block`** (`arq_common.cc:3643`): writes the cw0 header
+  prefix `[bsi, n_data, length[0..K-1] (uint16 LE)]`; packs frame 0's app bytes at payload offset
+  `hdr_total`, frames 1..K-1 at `c*sub_len` (codeword-aligned). The TX stash `bigblock_tx_block_*`
+  records the per-codeword lengths too (ground truth for the in-sim harness). Optimizer/gearshift
+  authority UNTOUCHED (grep-verified, as §10).
+- **CONSUMER (RX) `bigblock_receive_carve`** (`arq_common.cc:3754`): the decoded info bits are
+  re-packed (LSB-first inverse, unchanged) into `payload[]`; the carve PARSES the cw0 header
+  (`wire_bsi`, `n_data`, `length[]`), then hands `bigblock_block_to_arq()` the wire bsi + the
+  per-codeword lengths + the app-byte base offsets (cw0 at `hdr_total`, cwc at `c*sub_len`).
+- **CONSUMER `bigblock_block_to_arq`** (`test_bigblock_arq_unit.cc:102`): NEW signature carries a
+  `const int* sub_lengths` (per-codeword app byte length) + a `header_offset` for cw0. It stamps
+  `messages_rx[c].length = sub_lengths[c]` (NOT `sub_len`) and copies exactly that many bytes from
+  the codeword's app base ⇒ the delivered slot byte-matches the TX frame (INV-6 with VARIABLE
+  lengths; compression transparency). The bsi stamp (`messages_rx[c].batch_seq_id = block_bsi`,
+  INV-2), the synthetic EOB (INV-4), the one-ACK/partial/bsi-once flow are UNCHANGED — block_bsi
+  now comes from the WIRE. Selective-repeat (INV-3) re-sends the failed codeword's app bytes
+  (its `sub_lengths[c]` bytes from `retransmit_frames[]`), unchanged in mechanism.
+- **CONSUMER (live `receive()`)** (`arq_common.cc:6677-6685`): no longer passes
+  `rsp_current_expected_batch_seq_id` as the block bsi. The wire-bsi is read INSIDE
+  `bigblock_receive_carve` from the decoded payload, so the live path passes a SENTINEL and the
+  carve uses the wire value. (RISK-6: a total acquisition miss leaves no decoded payload — the
+  carve already guards `info_bits==NULL`; on the live path `bigblock_last_rx_K>0` gates entry,
+  so a decoded block is present when the carve runs.)
+
+### §11.3 Single-block byte-faithfulness with EXPLICIT wire-bsi (the validation)
+
+`test_sim_inproc_bigblock` CASE A is upgraded to the DRIFT-PROOF assertion: the RSP's local
+`rsp_current_expected_batch_seq_id` is set to a DIFFERENT value than the TX block's bsi (the
+drift the multi-block session would suffer), and the test asserts the carve recovers the TX bsi
+FROM THE WIRE (`messages_rx[c].batch_seq_id == TX block_bsi`, NOT the RSP's wrong local guess),
+delivers 1400/1400 byte-faithful, and the ONE-bump lands on the wire bsi. This is the
+fail-before/pass-after for the wire-bsi: before the change the carve stamps the RSP's wrong local
+bsi (drift) ⇒ the assertion FAILS; after, it stamps the wire bsi ⇒ PASS.
+
+### §11.4 Compression transparency to the big-block path (CONFIRMED, no interaction)
+
+Compression is at the ARQ batch layer ABOVE the big-block framing — VERIFIED by data flow:
+- TX: `compressor.compress_block(staging, raw_size, comp_buf, batch_capacity)`
+  (`arq_commander.cc:10868`) produces the COMPRESSED bytes; they are split into frames via
+  `add_message_tx_data(DATA_LONG/SHORT, chunk, comp_buf+pos)` (`:11061/11063`) → `messages_tx[]`.
+  So `messages_tx`/`messages_batch_tx[i].data` already hold COMPRESSED bytes BEFORE any framing.
+- `bigblock_send_one_block` (`arq_common.cc:3685-3697`) reads `messages_batch_tx[i].data` (the
+  already-compressed app payload) and transports it verbatim. The big-block carries the
+  COMPRESSED bytes; it has NO knowledge of / interaction with the compressor.
+- RX: `bigblock_block_to_arq` carves the bytes into `messages_rx[]` byte-faithfully (INV-6,
+  1400/1400). Downstream `copy_data_to_buffer` → decompress runs IDENTICALLY to the per-frame
+  path (the carve sets the same `messages_rx[c]` fields `add_message_rx_data` would).
+- INV-10 (NEW, compression↔framing): the splitter sizes each frame ≤ `max_frame` (`arq.h:2072`);
+  the big-block packs each frame into a `sub_len`-capacity sub-codeword and the WIRE LENGTH TABLE
+  (§11.1) carries each frame's exact length so the RX delivers EXACTLY `length[c]` bytes per slot
+  (not `sub_len` with zero-pad — that would inject pad bytes into the reassembled compressed
+  stream and break decompress). `sub_len >= max_frame` (cw0 = `sub_len - hdr_total >= max_frame`,
+  INV-9) ⇒ no frame truncated ⇒ the variable-length compressed byte stream reassembles
+  byte-faithfully (`copy_data_to_buffer` `arq_common.cc:7657-7661` copies `messages_rx[i].length`
+  bytes per ACKED slot) ⇒ decompress is byte-faithful. CONCLUSION: compression is TRANSPARENT to
+  big-block framing once the carve delivers the WIRE length (the P2.0 carve that delivered a
+  uniform `sub_len` was a LATENT compression-breaking bug, fixed here). The compressor itself
+  (`compress_block` `arq_commander.cc:10868` → frames `:11061/11063` → `messages_tx`) is byte-for
+  -byte UNCHANGED; the big-block carries the compressed bytes opaquely.
+
+### §11.5 Verification (Phase 1 gates) — ALL GREEN
+
+- `--test-sim-inproc-bigblock` → CASE A **drift-proof wire-bsi** (TX bsi=7 recovered from the wire
+  despite the RSP's local guess=12 AND the carve fallback=10 both WRONG; every carved slot stamps
+  the wire bsi) + **VARIABLE-length byte-faithful** (delivered 619/619, frames 12/49/86/123/160/
+  26/63/100 bytes); CASE B one-bad-cw=3 → partial SACK + selective-repeat (retx at pos 3, original
+  bsi, REAL length) completes 619/619.
+- `--test-bigblock-arq-unit` → 8/8 (T1-T9) — the new `bigblock_block_to_arq` args are defaulted
+  (NULL `sub_lengths`, `cw0_offset=0`) so the legacy uniform-length unit-test path is byte-identical.
+- bigblock LIVE validator (`MERCURY_BIGBLOCK_LIVE=1 -m PLOT_PASSBAND -s 16`) → 8/8 byte-correct,
+  post_FEC_BER=0 — the PRBS `nBytes==0` path is UNTOUCHED by the whitening; stock `transmit_byte`/
+  `receive_byte` per-frame path is byte-identical (whitening is INSIDE the `nBytes>0` big-block
+  branch only, gated by `bigblock_framing_enabled`).
+- `--test-climb-engine` ALL PASS (0 failures); `--test-sim-clock` 0 failed;
+  `--test-partial-bsi-advance=ofdm` + `=mfsk` PASS — optimizer/gearshift + stock SACK no regression.
+
+### §11.6 ROOT-CAUSE FINDING — big-block payload was missing ENERGY DISPERSAL (whitening)
+
+While validating variable-length (compression-realistic) frames, the in-sim loopback decoded the
+big-block payload to GARBAGE: **788/1400 byte errors with a ZERO-PADDED payload, 0/1400 errors
+with a full-entropy payload** (DBG-confirmed both ways, deterministic). Root cause (CONFIRMED, not
+guessed): the STOCK per-frame OFDM TX XORs its info bits with a PRBS before LDPC encode
+(`bit_energy_dispersal`, `telecom_system.cc:665`; the descrambler exists since the modem's origin,
+`interleaver.cc:111`) precisely so an arbitrary payload — including the long runs of zeros a SHORT
+compressed frame produces when zero-padded to `sub_len` — modulates to a well-conditioned signal.
+The big-block real-bytes path (`transmit_bigblock` `nBytes>0`) packed the payload bits STRAIGHT
+into the LDPC codewords with NO dispersal, so a zero-heavy payload produced a degenerate
+constellation the channel estimator / CSI-LLR could not decode. The P1 seeded-PRBS validator never
+exposed this because PRBS is full-entropy by construction.
+
+**Fix (root cause, using Mercury's OWN existing mechanism — NOT a new DSP guess):** apply the same
+self-inverse XOR energy dispersal to the big-block payload. A fixed-seed LCG PRBS
+(`bigblock_whiten_payload_bits`, seed `BIGBLOCK_WHITEN_SEED`, deterministic so TX/RX agree with no
+wire negotiation) whitens the WHOLE `K*ldpc.K`-bit payload in `transmit_bigblock` (real-bytes
+branch only) before encode; the ARQ RX de-whitens the decoded bits in `bigblock_receive_carve`
+(via the public `cl_telecom_system::bigblock_whiten_bits`) before re-packing to bytes. Self-inverse
+⇒ TX-whiten + RX-de-whiten recovers the exact payload. The PRBS validator path (`nBytes==0`) does
+NOT use this scrambler (its payload is already random + gated by its own cw_info_ref), so it stays
+8/8. **This was a PRE-EXISTING big-block PHY gap (P1 carried it latently) that ONLY a non-PRBS
+payload exposes — exactly the realistic compressed-frame case Phase 1 set out to validate.** It is
+ALSO almost certainly a contributor to the §2.2 "~25 dB implementation loss / BER 0.43 at 30 dB"
+open question (that was measured with a non-PRBS / partly-zero live AWGN payload); the residual P3
+PHY DSP trace should re-measure with whitening ON.
+
+**Files changed (Phase 1):**
+- `include/datalink_layer/datalink_defines.h` — `BIGBLOCK_HDR_FIXED_BYTES` (2) +
+  `BIGBLOCK_HDR_TOTAL_BYTES(K)` (= 2 + 2K) wire-header layout constants.
+- `source/datalink_layer/arq_common.cc` — `bigblock_send_one_block` packs the cw0 wire header
+  `[bsi, n_data, length[0..K-1] uint16 LE]` + frame-0 app at `hdr_total`; `bigblock_receive_carve`
+  parses the wire header (authoritative bsi + length table), DE-WHITENS the decoded bits, hands the
+  per-codeword lengths + cw0 offset to the carve; the live `receive()` carve passes
+  `use_wire_header=true` (wire bsi authoritative, `rsp_current_expected_batch_seq_id` is a fallback
+  only).
+- `source/datalink_layer/test_bigblock_arq_unit.cc` — `bigblock_block_to_arq` gains
+  `sub_lengths`/`cw0_offset` (defaulted; legacy path byte-identical) + delivers the exact wire
+  length per slot; `bigblock_test_delivered_varlen` helper; `test_sim_inproc_bigblock` CASE A/B
+  upgraded to the drift-proof wire-bsi + variable-length byte-faithful assertions.
+- `include/physical_layer/telecom_system.h` + `source/physical_layer/telecom_system.cc` —
+  `bigblock_whiten_payload_bits` (static) + `bigblock_whiten_bits` (public) energy dispersal;
+  applied in `transmit_bigblock` real-bytes branch. Stock per-frame path UNCHANGED.
+
+**Commit** (Phase 1): a SEPARATE commit on `integ/bigblock-merge-2026-06-05` ON TOP of `676f055`.
+NO monitor merge, NO push, NO Claude/Anthropic attribution. P3 HW is the NEXT phase.

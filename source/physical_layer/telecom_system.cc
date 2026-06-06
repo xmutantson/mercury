@@ -6916,6 +6916,32 @@ int cl_telecom_system::bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out
 // payload is null the info bits come from the seeded-PRBS (the validated known
 // payload — TX and decode reconstruct identically from the seed, used by the WAV
 // loopback + the P1 byte-correct gate).
+// PHASE 1 (fact-doc §11.6): big-block payload ENERGY DISPERSAL (whitening). The stock
+// per-frame OFDM path XORs its info bits with a PRBS before LDPC encode
+// (bit_energy_dispersal, telecom_system.cc:665) so an arbitrary payload — incl. long
+// runs of zeros from a SHORT compressed frame zero-padded to sub_len — modulates to a
+// well-conditioned signal. The big-block real-bytes path skipped it, so a zero-padded
+// payload decoded to GARBAGE (788/1400 byte errors in the in-sim loopback; full-entropy
+// payloads decode 0 errors). This helper applies the SAME self-inverse XOR (a fixed-seed
+// LCG PRBS, deterministic so TX and RX agree) over the whole K*ldpc.K-bit payload. It is
+// a NO-OP for the seeded-PRBS validator path (nBytes==0; that payload is already random
+// and uses bigblock_tx_passband's own PRBS, never this scrambler). Self-inverse: applying
+// it on TX before encode and on RX after decode recovers the exact payload.
+static void bigblock_whiten_payload_bits(int* payload_bits, int nbits, unsigned int seed)
+{
+	uint64_t s = (uint64_t)seed * 6364136223846793005ULL + 1442695040888963407ULL;
+	for(int i=0;i<nbits;i++)
+	{
+		s = s*6364136223846793005ULL + 1442695040888963407ULL;
+		int w = (int)((s >> 33) & 1ULL);
+		payload_bits[i] ^= w;
+	}
+}
+// the whitening seed (distinct from MERCURY_BIGBLOCK_SEED used for the PRBS validator
+// payload so the two streams never alias). Fixed constant => TX and RX agree with no
+// wire negotiation.
+#define BIGBLOCK_WHITEN_SEED 0x5A3C96E1u
+
 static int bigblock_build_tx_bits(cl_ldpc& ldpc, int nBits, unsigned int seed, int kcap,
                                   std::vector<int>& tx_bits,
                                   std::vector<std::vector<int>>& cw_info,
@@ -7994,6 +8020,13 @@ int cl_telecom_system::bigblock_codeword_count()
 	return K;
 }
 
+void cl_telecom_system::bigblock_whiten_bits(int* bits, int nbits)
+{
+	// public wrapper so the ARQ RX (bigblock_receive_carve) can de-whiten the decoded
+	// info bits with the SAME PRBS the real-bytes TX applied. Self-inverse XOR.
+	bigblock_whiten_payload_bits(bits, nbits, BIGBLOCK_WHITEN_SEED);
+}
+
 void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
 {
 	// P2.1 — feed REAL ARQ bytes as the block's systematic info bits. When the ARQ
@@ -8028,6 +8061,12 @@ void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
 		// Unpack each ARQ byte (data[i] in 0..255) LSB-first into the bit buffer.
 		byte_to_bit(data, payload.data(), use_bytes);
 		// (remaining bits already 0 from the vector init = zero pad)
+
+		// PHASE 1 (fact-doc §11.6): energy-disperse the WHOLE payload (incl. the zero pad)
+		// so a short/zero-heavy compressed frame still modulates to a well-conditioned
+		// signal. Self-inverse; the RX de-whitens after decode. Without this a zero-padded
+		// payload decoded to garbage (788/1400 errors). MUST cover all payload_bits_len.
+		bigblock_whiten_payload_bits(payload.data(), payload_bits_len, BIGBLOCK_WHITEN_SEED);
 
 		Kcw = bigblock_tx_passband(out, nSamples, cw_info, payload.data());
 	}

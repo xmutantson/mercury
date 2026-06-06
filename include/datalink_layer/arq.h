@@ -1330,8 +1330,15 @@ public:
   // block->ARQ logic is not yet wired. P2.0 ships this as a one-line stub (NO ARQ
   // logic) so --test-bigblock-arq-unit FAILS; P2.4/2.5/2.6 implement the body so
   // it PASSES (bisectable, see fact-doc §6).
+  // PHASE 1 (fact-doc §11): `sub_lengths` is the per-codeword APP byte length (from the
+  // wire length table) so each delivered slot byte-matches its TX frame (INV-6 with
+  // VARIABLE-length compressed frames). `cw0_offset` is codeword 0's app-byte base in
+  // `tx_payload` (= hdr_total; the wire header occupies cw0's prefix); codewords c>=1
+  // start at c*sub_len. When sub_lengths==NULL the carve falls back to a uniform sub_len
+  // length per codeword and cw0_offset=0 (the legacy fixed-length unit-test path).
   int bigblock_block_to_arq(const int* cw_ok, int K, unsigned char block_bsi,
-                            const unsigned char* tx_payload, int sub_len);
+                            const unsigned char* tx_payload, int sub_len,
+                            const int* sub_lengths = nullptr, int cw0_offset = 0);
 
   // ---- STEP 2: live send-path wiring (P3 prereq, see arq_common.cc) ----------
   // bigblock_send_one_block(): emit the current new-data batch as ONE big-block
@@ -1346,7 +1353,15 @@ public:
   // decoded info-bit sub-units in `info_bits`), translate it into the ARQ data unit
   // via bigblock_block_to_arq() (carve cw_ok -> messages_rx[], synthetic EOB, one
   // ACK / partial SACK / bsi-once). Returns the bigblock_block_to_arq rc.
-  int bigblock_receive_carve(const int* info_bits, unsigned char block_bsi);
+  //
+  // PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header in cw0's prefix
+  // [bsi, n_data, length[0..K-1]]. When `use_wire_header` is true (the live path) the
+  // carve PARSES that header off the decoded payload and uses the WIRE bsi (authoritative
+  // — drift-proof across a multi-block session) + the per-codeword length table (so each
+  // delivered slot byte-matches its TX frame; compression transparency). `fallback_bsi`
+  // is used only if use_wire_header is false (legacy path) or the header is unusable.
+  int bigblock_receive_carve(const int* info_bits, unsigned char fallback_bsi,
+                             bool use_wire_header = true);
   // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
   // block carried + its geometry, so the in-process single-block harness can carve
   // it back byte-faithfully (the delivered==TX ground truth, INV-6).
@@ -1355,6 +1370,10 @@ public:
   int           bigblock_tx_block_sub_len = 0;
   unsigned char bigblock_tx_block_bsi     = 0;
   int           bigblock_tx_block_ndata   = 0;
+  // PHASE 1 (fact-doc §11): per-codeword app byte length (the wire length table), so
+  // the in-process harness carves each sub-codeword its EXACT TX length byte-faithfully
+  // (INV-6 with VARIABLE lengths; the production RX reads the same table off the wire).
+  std::vector<int> bigblock_tx_block_lengths;
 
   // ---- STEP 3: single-block end-to-end in the 2-instance in-process sim -------
   // test_sim_inproc_bigblock(): a dedicated single-block 2-instance ARQ harness
@@ -1384,6 +1403,12 @@ public:
   int bigblock_test_count_received(int K);
   int bigblock_test_delivered_bytes(int K, int sub_len,
                                     const unsigned char* tx_payload);
+  // PHASE 1 (fact-doc §11): VARIABLE-length delivered measure — count bytes that match
+  // app_flat[app_off[c]+j] AND require messages_rx[c].length == app_len[c] (so a slot
+  // delivering sub_len pad bytes instead of its real frame length FAILS). Equals
+  // sum(app_len[0..K-1]) iff every sub-codeword delivered its exact TX frame bytes.
+  int bigblock_test_delivered_varlen(int K, const int* app_len, const int* app_off,
+                                     const unsigned char* app_flat);
 
   // SACK-GATE T6 (R-B / bug #9): CMD/RSP election symmetry against the
   // PRODUCTION setter. Constructs TWO independent cl_telecom_system +

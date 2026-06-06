@@ -48,6 +48,8 @@
 #include <cstdlib>
 #include <string>
 #include <cstdint>
+#include <vector>
+#include <algorithm>
 
 // Big-block geometry constant for the test. K=8 = the thin-grid codeword count
 // (telecom_system.cc:7285 nBits/ldpc.N, capped by MERCURY_BIGBLOCK_K). SUB_LEN =
@@ -102,7 +104,9 @@
 int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
                                              unsigned char block_bsi,
                                              const unsigned char* tx_payload,
-                                             int sub_len)
+                                             int sub_len,
+                                             const int* sub_lengths,
+                                             int cw0_offset)
 {
 	if(cw_ok == NULL || tx_payload == NULL || K <= 0 || sub_len < 0)
 		return ERROR_;
@@ -110,6 +114,20 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 	if(K > this->nMessages)       K = this->nMessages;
 	const int alloc_size = N_MAX / 8;
 	if(sub_len > alloc_size) sub_len = alloc_size;
+	if(cw0_offset < 0) cw0_offset = 0;
+
+	// PHASE 1 (fact-doc §11): per-codeword app-byte BASE offset + delivered LENGTH.
+	// cw0's app bytes start at cw0_offset (the wire header occupies cw0's prefix);
+	// cwc (c>=1) at c*sub_len. The delivered length is the wire length table entry
+	// (sub_lengths[c]) so VARIABLE-length compressed frames reassemble byte-faithfully;
+	// NULL sub_lengths => the legacy uniform-sub_len unit-test path.
+	auto cw_base = [&](int c) -> int { return (c == 0) ? cw0_offset : c * sub_len; };
+	auto cw_len  = [&](int c) -> int {
+		int l = sub_lengths ? sub_lengths[c] : sub_len;
+		if(l < 0) l = 0;
+		if(l > sub_len) l = sub_len;       // never deliver past a codeword's capacity
+		return l;
+	};
 
 	// --- P2.4: carve the K decoded sub-units into messages_rx[0..K-1] ---------
 	// RECEIVED iff cw_ok[c]==1 (the clear bits are the SACK gaps, INV-2). Each
@@ -121,15 +139,17 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 	{
 		if(cw_ok[c])
 		{
+			int base = cw_base(c);
+			int dlen = cw_len(c);
 			messages_rx[c].type            = DATA_LONG;
 			messages_rx[c].id              = (char)(unsigned char)c;
-			messages_rx[c].length          = sub_len;
+			messages_rx[c].length          = dlen;
 			messages_rx[c].batch_seq_id    = (int)block_bsi;
 			// low 7 bits = slot, bit 7 = EOB on the last sub-codeword.
 			messages_rx[c].sequence_number =
 				(char)(unsigned char)((c == K - 1) ? (c | 0x80) : c);
-			for(int j = 0; j < sub_len; j++)
-				messages_rx[c].data[j] = (char)tx_payload[c * sub_len + j];
+			for(int j = 0; j < dlen; j++)
+				messages_rx[c].data[j] = (char)tx_payload[base + j];
 			messages_rx[c].status          = RECEIVED;
 			n_clean++;
 		}
@@ -204,10 +224,11 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 			if(cw_ok[c]) continue;
 			if(this->retransmit_count >= MAX_RETRANSMIT_HEADROOM) break;
 			int rci = this->retransmit_count;
-			int len = sub_len;
+			int base = cw_base(c);
+			int len  = cw_len(c);            // the failed codeword's REAL app length (wire table)
 			if(len > MAX_SACK_FRAME_SIZE) len = MAX_SACK_FRAME_SIZE;
 			for(int j = 0; j < len; j++)
-				this->retransmit_frames[rci][j] = tx_payload[c * sub_len + j];
+				this->retransmit_frames[rci][j] = tx_payload[base + j];
 			this->retransmit_frame_lengths[rci]       = len;
 			this->retransmit_frame_positions[rci]     = c;
 			this->retransmit_frame_types[rci]         = DATA_LONG;
@@ -256,6 +277,26 @@ int cl_arq_controller::bigblock_test_delivered_bytes(int K, int sub_len,
 		for (int j = 0; j < sub_len; j++)
 			if ((unsigned char)this->messages_rx[c].data[j]
 			    == tx_payload[c * sub_len + j]) ok++;
+	}
+	return ok;
+}
+
+// PHASE 1 (fact-doc §11) — VARIABLE-length delivered measure. Each slot must have
+// status RECEIVED, recorded length == app_len[c] (NOT sub_len — a slot delivering pad
+// past the frame fails the length check), and bytes byte-matching app_flat. Equals
+// sum(app_len[0..K-1]) iff every sub-codeword delivered its exact TX frame bytes.
+int cl_arq_controller::bigblock_test_delivered_varlen(int K, const int* app_len,
+                                                      const int* app_off,
+                                                      const unsigned char* app_flat)
+{
+	int ok = 0;
+	for (int c = 0; c < K && c < this->nMessages; c++)
+	{
+		if (this->messages_rx[c].status != RECEIVED) continue;
+		if (this->messages_rx[c].length != app_len[c]) continue;  // EXACT length match
+		for (int j = 0; j < app_len[c]; j++)
+			if ((unsigned char)this->messages_rx[c].data[j]
+			    == app_flat[app_off[c] + j]) ok++;
 	}
 	return ok;
 }
@@ -1045,30 +1086,85 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 	       K, sub_len, total_tx_bytes);
 	fflush(stdout);
 
-	// --- Build the CMD new-data batch: K DATA_LONG frames of deterministic bytes.
-	const int block_bsi = 7;
+	// --- Build the CMD new-data batch: K DATA_LONG frames of VARIABLE deterministic
+	// lengths. PHASE 1 (fact-doc §11): the block carries a self-describing header in
+	// cw0's prefix [bsi, n_data, length[0..K-1]], cw0's app bytes start at hdr_total,
+	// cwc (c>=1) at c*sub_len. VARIABLE lengths exercise the wire length table — the RX
+	// must deliver each slot its EXACT length (compression transparency: variable-length
+	// compressed frames). app_truth[c] holds each frame's real app bytes (the ground
+	// truth the RX must deliver byte-faithfully).
+	const int block_bsi  = 7;
+	const int hdr_total  = BIGBLOCK_HDR_TOTAL_BYTES(K);   // 2 + 2*K
+	const int cw0_cap    = sub_len - hdr_total;
 	A->message_batch_counter_tx = K;
-	std::vector<unsigned char> tx_truth((size_t)total_tx_bytes, 0);
+	std::vector<std::vector<unsigned char>> app_truth((size_t)K);
+	std::vector<int> app_len((size_t)K, 0);
+	long total_app_bytes = 0;
 	for(int i=0;i<K;i++)
 	{
-		// messages_batch_tx[i].data is left NULL by init_messages_buffers (it ALIASES
-		// the owning messages_tx[i].data, which the production builder struct-copies
-		// from messages_tx). Mirror that: point .data at the real allocated buffer.
+		// deterministic variable length: a spread of sizes incl. a short last frame, all
+		// within the per-codeword app capacity (cw0 is reduced by the header).
+		int cap = (i == 0) ? cw0_cap : sub_len;
+		int len = ((i*37 + 11) % (cap - 4)) + 1;   // 1..cap-4 (well within capacity)
+		if(len > cap) len = cap;
+		app_len[i] = len;
+		total_app_bytes += len;
+		app_truth[i].assign((size_t)len, 0);
+
 		A->messages_batch_tx[i].data         = A->messages_tx[i].data;
 		A->messages_batch_tx[i].type         = DATA_LONG;
 		A->messages_batch_tx[i].id           = (char)(unsigned char)i;
-		A->messages_batch_tx[i].length       = sub_len;
+		A->messages_batch_tx[i].length       = len;
 		A->messages_batch_tx[i].batch_seq_id = block_bsi;
 		A->messages_batch_tx[i].status       = ADDED_TO_BATCH_BUFFER;
-		for(int j=0;j<sub_len;j++)
+		for(int j=0;j<len;j++)
 		{
 			unsigned char b = (unsigned char)((i*53 + j*17 + 3) & 0xFF);
 			A->messages_batch_tx[i].data[j]   = (char)b;
-			tx_truth[(size_t)i*sub_len + j]   = b;
+			app_truth[i][(size_t)j]           = b;
 		}
-		// owning messages_tx slot (so the post-TX PENDING_ACK bookkeeping is valid).
 		A->messages_tx[i].status = ADDED_TO_BATCH_BUFFER;
 	}
+
+	// Build the on-wire block payload EXACTLY as production bigblock_send_one_block does
+	// (header in cw0 prefix + app bytes per codeword). The loopback transmits THIS as the
+	// block payload; the RX carve must recover the header + each frame byte-faithfully.
+	std::vector<unsigned char> tx_truth((size_t)total_tx_bytes, 0);
+	auto build_block_wire = [&](int bsi)
+	{
+		std::fill(tx_truth.begin(), tx_truth.end(), 0);
+		tx_truth[0] = (unsigned char)(bsi & 0xFF);
+		tx_truth[1] = (unsigned char)(K & 0xFF);                 // n_data == K (all filled)
+		for(int c=0;c<K;c++)
+		{
+			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+			tx_truth[(size_t)lo + 0] = (unsigned char)(app_len[c] & 0xFF);
+			tx_truth[(size_t)lo + 1] = (unsigned char)((app_len[c] >> 8) & 0xFF);
+			int base = (c == 0) ? hdr_total : (c * sub_len);
+			for(int j=0;j<app_len[c];j++)
+				tx_truth[(size_t)base + j] = app_truth[c][(size_t)j];
+		}
+	};
+	build_block_wire(block_bsi);
+	printf("[TEST-SIM-BIGBLOCK] geometry: hdr_total=%d cw0_cap=%d variable app_len total=%ld\n",
+	       hdr_total, cw0_cap, total_app_bytes);
+	fflush(stdout);
+
+	// Helper: count delivered bytes that byte-match app_truth per slot (the variable-
+	// length INV-6 measure — each slot must deliver EXACTLY its frame's app bytes,
+	// with the slot's recorded length == the TX frame length). Flatten app_truth +
+	// app_len for the member helper (messages_rx[] is private).
+	std::vector<unsigned char> app_flat;
+	std::vector<int> app_off((size_t)K, 0);
+	for(int c=0;c<K;c++)
+	{
+		app_off[c] = (int)app_flat.size();
+		for(int j=0;j<app_len[c];j++) app_flat.push_back(app_truth[c][(size_t)j]);
+	}
+	auto delivered_app_bytes = [&](cl_arq_controller* a) -> long {
+		return a->bigblock_test_delivered_varlen(K, app_len.data(), app_off.data(),
+			app_flat.data());
+	};
 
 	// ====================================================================
 	// PHY block loopback (CMD transmit_bigblock -> clean wire -> RSP
@@ -1121,10 +1217,16 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 
 	// ====================================================================
 	// CASE A — clean single block: CMD->RSP->ACK->CMD byte-faithful.
-	// ====================================================================
+	// PHASE 1 DRIFT-PROOF: the RSP's local expected bsi is set to a WRONG value (the
+	// drift a multi-block session would suffer) and the carve fallback is ALSO wrong;
+	// the carve must recover the AUTHORITATIVE bsi FROM THE WIRE (cw0 header) and stamp
+	// messages_rx[c].batch_seq_id == the TX block_bsi (NOT the wrong local guess).
+	// Frames are VARIABLE length -> the carve must deliver each slot its EXACT length
+	// (compression transparency). Without the wire header both would fail.
 	{
-		// reset RSP RX state.
-		B->rsp_current_expected_batch_seq_id = block_bsi;
+		// reset RSP RX state. DRIFT: the RSP's local expected bsi is DELIBERATELY wrong.
+		const int wrong_local_bsi = (block_bsi + 5) & 0xFF;   // != block_bsi (drift)
+		B->rsp_current_expected_batch_seq_id = wrong_local_bsi;
 		B->rsp_prev_batch_seq_id             = -1;
 		B->rsp_prev_batch_active             = false;
 		B->rsp_prev_batch_received_count     = 0;
@@ -1139,7 +1241,6 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 			B->messages_rx[i].length = 0;
 			B->messages_rx[i].batch_seq_id = -1;
 		}
-		int bsi_before = B->rsp_current_expected_batch_seq_id;
 
 		std::vector<int> info_bits;
 		int K_rx = run_block_loopback(tsA, tsB, tx_truth, info_bits);
@@ -1147,16 +1248,24 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		int cw_ok_count = tsB->bigblock_last_rx_cw_ok_count;
 		bool all_clean = (cw_ok_count == K);
 
-		// RSP carve (production RX wiring).
-		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)bsi_before);
+		// RSP carve (production RX wiring): fallback_bsi is DELIBERATELY wrong; the wire
+		// header (use_wire_header=true, default) must override it with the TX bsi.
+		const int wrong_fallback = (block_bsi + 3) & 0xFF;
+		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)wrong_fallback);
 		bool wired = (rc == SUCCESSFUL);
 
-		int recv      = B->bigblock_test_count_received(K);
-		int delivered = B->bigblock_test_delivered_bytes(K, sub_len, tx_truth.data());
-		int bsi_after = B->rsp_current_expected_batch_seq_id;
-		bool one_bump = (bsi_after == ((bsi_before + 1) & 0xFF));
-		bool all_recv = (recv == K);
-		bool all_bytes= (delivered == total_tx_bytes);
+		int recv       = B->bigblock_test_count_received(K);
+		long delivered = delivered_app_bytes(B);          // variable-length INV-6 measure
+		int bsi_after  = B->rsp_current_expected_batch_seq_id;
+		// DRIFT-PROOF: the carve adopted the WIRE bsi for every slot, NOT the wrong local
+		// guess; and the bsi bump landed on (wire_bsi+1), proving the wire value was used.
+		bool slots_wire_bsi = true;
+		for(int c=0;c<K;c++)
+			if(B->messages_rx[c].status==RECEIVED && B->messages_rx[c].batch_seq_id != block_bsi)
+				slots_wire_bsi = false;
+		bool one_bump  = (bsi_after == ((wrong_local_bsi + 1) & 0xFF));  // bumped from local once
+		bool all_recv  = (recv == K);
+		bool all_bytes = (delivered == total_app_bytes);
 
 		// ACK leg (R-B): the clean block emits all-ones K-bit 0xFF; the CMD all_ones
 		// target (data_batch_size==K==8) is 0xFF -> they MATCH -> clean ACK credited.
@@ -1166,21 +1275,21 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		                       : ((1u << A->data_batch_size) - 1u);
 		bool ack_match = (rsp_bitmap == cmd_all_ones) && (rsp_bitmap == 0xFFu);
 		bool cmd_credits = cl_arq_controller::sack_clean_confirmation_accepted(
-		                     (unsigned char)bsi_before, /*is_all_ones=*/true,
+		                     (unsigned char)block_bsi, /*is_all_ones=*/true,
 		                     /*last_applied_clean_bsi=*/-1, /*last_applied_sack_bsi=*/-1);
 
 		bool pass = decoded && all_clean && wired && all_recv && all_bytes
-		         && one_bump && ack_match && cmd_credits;
-		printf("[TEST-SIM-BIGBLOCK] CASE A clean: %s "
-			"(decoded=%d K_rx=%d cw_ok=%d/%d carve_rc=%d recv=%d/%d delivered=%d/%ld "
-			"bsi %d->%d one_bump=%d rsp_bitmap=0x%X cmd_all_ones=0x%X ack_match=%d "
-			"cmd_credits=%d)\n",
+		         && slots_wire_bsi && one_bump && ack_match && cmd_credits;
+		printf("[TEST-SIM-BIGBLOCK] CASE A clean (wire-bsi drift-proof): %s "
+			"(decoded=%d K_rx=%d cw_ok=%d/%d carve_rc=%d recv=%d/%d delivered=%ld/%ld "
+			"tx_bsi=%d wrong_local=%d wrong_fallback=%d slots_wire_bsi=%d bsi_after=%d "
+			"one_bump=%d rsp_bitmap=0x%X cmd_all_ones=0x%X ack_match=%d cmd_credits=%d)\n",
 			pass ? "PASS" : "FAIL", (int)decoded, K_rx, cw_ok_count, K, rc, recv, K,
-			delivered, total_tx_bytes, bsi_before, bsi_after, one_bump,
+			delivered, total_app_bytes, block_bsi, wrong_local_bsi, wrong_fallback,
+			(int)slots_wire_bsi, bsi_after, one_bump,
 			(unsigned)rsp_bitmap, (unsigned)cmd_all_ones, ack_match, cmd_credits);
 		fflush(stdout);
-		if(pass) check(true, "CASE A single big-block ARQ-drives CMD->RSP->ACK->CMD byte-faithful");
-		else     check(false,"CASE A single big-block ARQ-drives CMD->RSP->ACK->CMD byte-faithful");
+		check(pass, "CASE A single big-block wire-bsi drift-proof + variable-length byte-faithful");
 	}
 
 	// ====================================================================
@@ -1190,6 +1299,8 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 	{
 		const int bad_cw = 3;
 		const int block_bsi_b = 9;
+		// Rebuild the on-wire block payload with CASE B's bsi (the wire header carries it).
+		build_block_wire(block_bsi_b);
 		B->rsp_current_expected_batch_seq_id = block_bsi_b;
 		B->rsp_prev_batch_seq_id             = -1;
 		B->rsp_prev_batch_active             = false;
@@ -1212,11 +1323,13 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		// Inject one bad codeword DETERMINISTICALLY: clear cw_ok[bad_cw] before the
 		// carve (the carve reads telecom_system->bigblock_last_rx_cw_ok). This is the
 		// same one-clear-bit injection the unit test CASE2 uses, but driven through
-		// the real PHY decode + the real RX carve wiring.
+		// the real PHY decode + the real RX carve wiring. (bad_cw != 0 so cw0 — which
+		// carries the wire header — stays clean and the header is trusted.)
 		if((int)tsB->bigblock_last_rx_cw_ok.size() > bad_cw)
 			tsB->bigblock_last_rx_cw_ok[bad_cw] = 0;
 		tsB->bigblock_last_rx_cw_ok_count = K - 1;
 
+		// Wire header in cw0 is clean -> the carve uses the WIRE bsi + length table.
 		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)block_bsi_b);
 		bool wired = (rc == SUCCESSFUL);
 
@@ -1224,37 +1337,41 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		bool bad_absent  = (B->messages_rx[bad_cw].status != RECEIVED);
 		bool partial_ok  = (recv_partial == K - 1) && bad_absent;
 		bool one_retx    = (B->retransmit_count == 1);
+		// the retx carries the bad codeword's ORIGINAL bsi (from the wire) + its REAL
+		// app length (the wire length table), NOT sub_len.
 		bool retx_pos_ok = one_retx && (B->retransmit_frame_positions[0] == bad_cw)
-		                && (B->retransmit_frame_batch_seq_ids[0] == block_bsi_b);
+		                && (B->retransmit_frame_batch_seq_ids[0] == block_bsi_b)
+		                && (B->retransmit_frame_lengths[0] == app_len[bad_cw]);
 		bool no_bump     = (B->rsp_current_expected_batch_seq_id == block_bsi_b);
 
 		// Model the selective-repeat arrival: the retx of EXACTLY the bad codeword
-		// fills the gap (what the stock CFG16 per-frame retx path does on RX).
+		// fills the gap (what the stock CFG16 per-frame retx path does on RX). The
+		// delivered slot carries the frame's REAL app length, not sub_len.
 		if(wired && partial_ok && one_retx)
 		{
 			int loc = bad_cw;
 			B->messages_rx[loc].type            = DATA_LONG;
 			B->messages_rx[loc].id              = (char)(unsigned char)loc;
-			B->messages_rx[loc].length          = sub_len;
+			B->messages_rx[loc].length          = app_len[loc];
 			B->messages_rx[loc].status          = RECEIVED;
 			B->messages_rx[loc].batch_seq_id    = block_bsi_b;
 			B->messages_rx[loc].sequence_number = (char)(unsigned char)loc;
-			for(int j=0;j<sub_len;j++)
-				B->messages_rx[loc].data[j] = (char)tx_truth[(size_t)loc*sub_len + j];
+			for(int j=0;j<app_len[loc];j++)
+				B->messages_rx[loc].data[j] = (char)app_truth[loc][(size_t)j];
 		}
 
-		int recv_full = B->bigblock_test_count_received(K);
-		int delivered = B->bigblock_test_delivered_bytes(K, sub_len, tx_truth.data());
-		bool full_ok  = (recv_full == K) && (delivered == total_tx_bytes);
+		int recv_full  = B->bigblock_test_count_received(K);
+		long delivered = delivered_app_bytes(B);
+		bool full_ok   = (recv_full == K) && (delivered == total_app_bytes);
 
 		bool pass = decoded && wired && partial_ok && one_retx && retx_pos_ok
 		         && no_bump && full_ok;
 		printf("[TEST-SIM-BIGBLOCK] CASE B one-bad-cw=%d: %s "
 			"(decoded=%d carve_rc=%d partial=%d/%d bad_absent=%d retx_count=%d "
-			"retx_pos_ok=%d no_bump=%d full=%d/%d delivered=%d/%ld)\n",
+			"retx_pos_ok=%d no_bump=%d full=%d/%d delivered=%ld/%ld)\n",
 			bad_cw, pass ? "PASS" : "FAIL", (int)decoded, rc, recv_partial, K,
 			bad_absent, B->retransmit_count, retx_pos_ok, no_bump, recv_full, K,
-			delivered, total_tx_bytes);
+			delivered, total_app_bytes);
 		fflush(stdout);
 		check(pass, "CASE B one-bad-codeword partial -> selective-repeat completes block in-sim");
 	}

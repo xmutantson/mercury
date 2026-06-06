@@ -3673,6 +3673,24 @@ bool cl_arq_controller::bigblock_send_one_block()
 	const int alloc_size = N_MAX / 8;
 	if(sub_len > alloc_size) sub_len = alloc_size;
 
+	// PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header ON THE WIRE in
+	// codeword 0's systematic info bits (LDPC-protected): [bsi, n_data, length[0..K-1]].
+	// The bsi makes a multi-block session drift-proof (the block has one acquisition +
+	// no per-frame wire bit-7); the per-codeword length table lets the RX deliver each
+	// sub-codeword its EXACT frame length so VARIABLE-length compressed frames reassemble
+	// byte-faithfully (compression transparency, INV-10). cw0's app bytes start at offset
+	// hdr_total; cw1..K-1 are codeword-aligned at c*sub_len (so the K-bit cw_ok SACK
+	// granularity / selective-repeat keeps frame == codeword).
+	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);   // 2 + 2*K bytes
+	const int cw0_cap = sub_len - hdr_total;             // sub-codeword 0 app capacity
+	if(cw0_cap < 0) return false;                        // sub_len too small to hold the header
+	// INV-9 guard: frame 0 must fit in the reduced cw0 capacity. The big-block lattice
+	// gives sub_len >> max_frame + hdr_total, so this never fires at the CFG16 rung.
+	{
+		int len0 = messages_batch_tx[0].length;
+		if(len0 > cw0_cap) return false;                 // -> stock per-frame path
+	}
+
 	long block_payload_len = (long)K * (long)sub_len;
 	std::vector<int>           block_payload((size_t)block_payload_len, 0);
 	std::vector<unsigned char> block_payload_bytes((size_t)block_payload_len, 0);
@@ -3682,29 +3700,58 @@ bool cl_arq_controller::bigblock_send_one_block()
 	int block_bsi = messages_batch_tx[0].batch_seq_id;
 	if(block_bsi < 0) block_bsi = 0;
 
+	// Clamp each frame to its sub-codeword app capacity and record the per-codeword
+	// length table (the RX reads it back to deliver the exact byte count per slot).
+	std::vector<int> tx_lengths((size_t)K, 0);
 	for(int i=0;i<n_data && i<K;i++)
 	{
+		int cap = (i == 0) ? cw0_cap : sub_len;
 		int len = messages_batch_tx[i].length;
 		if(len < 0) len = 0;
-		if(len > sub_len) len = sub_len;   // a frame longer than the sub-codeword is clamped
+		if(len > cap) len = cap;          // a frame longer than the sub-codeword is clamped
+		tx_lengths[i] = len;
+	}
+
+	// --- Wire header in cw0 prefix: [bsi][n_data][length[0..K-1] uint16 LE] ----------
+	block_payload[0]       = (int)(block_bsi & 0xFF);
+	block_payload_bytes[0] = (unsigned char)(block_bsi & 0xFF);
+	block_payload[1]       = (int)(n_data & 0xFF);
+	block_payload_bytes[1] = (unsigned char)(n_data & 0xFF);
+	for(int c=0;c<K;c++)
+	{
+		int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+		unsigned char b_lo = (unsigned char)(tx_lengths[c] & 0xFF);
+		unsigned char b_hi = (unsigned char)((tx_lengths[c] >> 8) & 0xFF);
+		block_payload[(size_t)lo + 0]       = (int)b_lo;
+		block_payload_bytes[(size_t)lo + 0] = b_lo;
+		block_payload[(size_t)lo + 1]       = (int)b_hi;
+		block_payload_bytes[(size_t)lo + 1] = b_hi;
+	}
+
+	// --- App payloads: frame c -> sub-codeword c (cw0 after the header prefix) --------
+	for(int i=0;i<n_data && i<K;i++)
+	{
+		int base = (i == 0) ? hdr_total : (i * sub_len);
+		int len  = tx_lengths[i];
 		for(int j=0;j<len;j++)
 		{
 			unsigned char b = (unsigned char)messages_batch_tx[i].data[j];
-			block_payload[(size_t)i*sub_len + j]       = (int)b;
-			block_payload_bytes[(size_t)i*sub_len + j] = b;
+			block_payload[(size_t)base + j]       = (int)b;
+			block_payload_bytes[(size_t)base + j] = b;
 		}
 		// (remaining bytes of this sub-codeword already 0 = pad)
 	}
 
-	// Stash the TX block payload + geometry so the in-process single-block harness
-	// (and any RX in the same process) can carve it back byte-faithfully. The live
-	// RX carve uses the decoded info bits; the harness uses this stash as ground
-	// truth for the delivered==TX assertion (INV-6).
+	// Stash the TX block payload + geometry + per-codeword lengths so the in-process
+	// single-block harness (and any RX in the same process) can carve it back
+	// byte-faithfully. The live RX carve reads the wire header off the decoded payload;
+	// the harness uses this stash as ground truth for the delivered==TX assertion (INV-6).
 	bigblock_tx_block_payload = block_payload_bytes;
 	bigblock_tx_block_K       = K;
 	bigblock_tx_block_sub_len = sub_len;
 	bigblock_tx_block_bsi     = (unsigned char)(block_bsi & 0xFF);
 	bigblock_tx_block_ndata   = n_data;
+	bigblock_tx_block_lengths = tx_lengths;
 
 	// Emit ONE big-block through the production transmit_byte (branches to
 	// transmit_bigblock when bigblock_framing_enabled). data = the K*sub_len real
@@ -3744,15 +3791,19 @@ bool cl_arq_controller::bigblock_send_one_block()
 //
 // info_bits = the decoded systematic info bits receive_bigblock wrote to `out`
 // (K*ldpc.K of them); we re-pack them into K*sub_len bytes (sub_len = ldpc.K/8,
-// the same packing the TX used) so the carve is byte-faithful (INV-6). block_bsi
-// is the batch id the block advertises; on the live path the harness supplies it
-// (the block has one acquisition + no per-frame wire bit-7).
+// the same packing the TX used) so the carve is byte-faithful (INV-6).
+//
+// PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header in cw0's prefix
+// [bsi, n_data, length[0..K-1]]. When use_wire_header is true (the live path), the
+// carve PARSES that header off the decoded payload and uses the WIRE bsi (authoritative,
+// drift-proof) + the per-codeword length table (compression transparency). fallback_bsi
+// is used only when use_wire_header is false (legacy) or the header is unusable.
 //
 // §5 audit: this is the RX consumer wiring. It calls ONLY bigblock_block_to_arq
 // (already §5-audited) — it does NOT touch the optimizer/gearshift authority.
 // Returns SUCCESSFUL when the block was carved into the ARQ layer.
 int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
-		unsigned char block_bsi)
+		unsigned char fallback_bsi, bool use_wire_header)
 {
 	if(telecom_system == NULL) return ERROR_;
 	int K = telecom_system->bigblock_last_rx_K;
@@ -3770,9 +3821,18 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 
 	// re-pack the decoded info bits -> K*sub_len bytes (LSB-first, the byte_to_bit
 	// convention transmit_bigblock used). info_bits may be null on a total acq miss.
+	// PHASE 1 (fact-doc §11.6): the real-bytes TX energy-disperses (whitens) the payload
+	// bits before LDPC encode (so a zero-padded short compressed frame still decodes).
+	// De-whiten the decoded bits HERE (self-inverse XOR, same PRBS) before re-packing to
+	// bytes — recovers the exact payload. Copy into a local buffer first (info_bits is
+	// the shared data_byte; must not mutate it in place).
 	std::vector<unsigned char> payload((size_t)K * sub_len, 0);
 	if(info_bits != NULL)
 	{
+		int nbits = K * sub_len * 8;
+		std::vector<int> dw((size_t)nbits, 0);
+		for(int i=0;i<nbits;i++) dw[i] = info_bits[i] & 1;
+		telecom_system->bigblock_whiten_bits(dw.data(), nbits);   // de-whiten (self-inverse)
 		for(int c=0;c<K;c++)
 		{
 			for(int b=0;b<sub_len;b++)
@@ -3781,16 +3841,47 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 				for(int bit=0;bit<8;bit++)
 				{
 					int idx = (c*sub_len + b)*8 + bit;
-					if(info_bits[idx] & 1) byte |= (unsigned char)(1u << bit);
+					if(dw[idx] & 1) byte |= (unsigned char)(1u << bit);
 				}
 				payload[(size_t)c*sub_len + b] = byte;
 			}
 		}
 	}
 
-	int rc = bigblock_block_to_arq(cw_ok.data(), K, block_bsi, payload.data(), sub_len);
-	printf("[BIGBLOCK-RX] carve: K=%d cw_ok_count=%d bsi=%u sub_len=%d rc=%d\n",
-		K, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi, sub_len, rc);
+	// --- PHASE 1: parse the cw0 wire header [bsi, n_data, length[0..K-1] uint16 LE] ---
+	unsigned char block_bsi = fallback_bsi;
+	int cw0_offset = 0;
+	const int* sub_lengths_ptr = nullptr;
+	std::vector<int> wire_lengths;
+	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
+	bool header_usable = use_wire_header && info_bits != NULL
+		&& hdr_total <= sub_len;            // header must fit in cw0
+	if(header_usable && cw_ok[0])
+	{
+		// cw0 (which carries the header) must have decoded clean for the header to be
+		// trusted. The wire bsi is authoritative (drift-proof); the length table sizes
+		// each delivered slot. cw0's app bytes start AFTER the header prefix.
+		block_bsi = payload[0];
+		wire_lengths.assign((size_t)K, 0);
+		for(int c=0;c<K;c++)
+		{
+			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+			int len = (int)payload[lo] | ((int)payload[lo+1] << 8);
+			int cap = (c == 0) ? (sub_len - hdr_total) : sub_len;
+			if(len < 0)   len = 0;
+			if(len > cap) len = cap;       // never deliver past a codeword's app capacity
+			wire_lengths[c] = len;
+		}
+		cw0_offset      = hdr_total;
+		sub_lengths_ptr = wire_lengths.data();
+	}
+
+	int rc = bigblock_block_to_arq(cw_ok.data(), K, block_bsi, payload.data(), sub_len,
+		sub_lengths_ptr, cw0_offset);
+	printf("[BIGBLOCK-RX] carve: K=%d cw_ok_count=%d wire_bsi=%u (fallback=%u used_hdr=%d) "
+		"sub_len=%d rc=%d\n",
+		K, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi,
+		(unsigned)fallback_bsi, (int)(sub_lengths_ptr != nullptr), sub_len, rc);
 	fflush(stdout);
 	return rc;
 }
@@ -6666,18 +6757,22 @@ void cl_arq_controller::receive()
 		// bigblock_receive_carve -> bigblock_block_to_arq (carve cw_ok -> messages_rx[],
 		// synthetic EOB, one ACK / partial SACK / bsi-once) and SKIP the per-frame
 		// messages_rx_buffer dispatch below (one acquisition = one carve, not K
-		// per-frame parses). Gated + default-off -> zero stock-path change. The block's
-		// bsi is the RSP's current-expected bsi (the block advertises one batch).
+		// per-frame parses). Gated + default-off -> zero stock-path change.
+		//
+		// PHASE 1 (fact-doc §11): the block's bsi is carried ON THE WIRE (cw0 header,
+		// FEC-protected). The carve READS the wire bsi (use_wire_header=true) — drift-
+		// proof across a SUSTAINED multi-block session. rsp_current_expected_batch_seq_id
+		// is passed only as a FALLBACK (used if cw0 didn't decode / header unusable).
 		bool bigblock_rx_handled = false;
 		if(telecom_system->bigblock_framing_enabled
 			&& telecom_system->M != MOD_MFSK
 			&& is_ofdm_config(current_configuration)
 			&& telecom_system->bigblock_last_rx_K > 0)
 		{
-			int bsi = (rsp_current_expected_batch_seq_id >= 0)
+			int fallback_bsi = (rsp_current_expected_batch_seq_id >= 0)
 				? (rsp_current_expected_batch_seq_id & 0xFF) : 0;
 			bigblock_receive_carve(telecom_system->data_container.data_byte,
-				(unsigned char)bsi);
+				(unsigned char)fallback_bsi, /*use_wire_header=*/true);
 			bigblock_rx_handled = true;
 			// the carve already populated messages_rx[] + advanced ARQ state; the
 			// per-frame parse path below keys on received_message_stats.message_decoded.
