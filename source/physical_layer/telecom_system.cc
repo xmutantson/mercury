@@ -7805,6 +7805,25 @@ int cl_telecom_system::bigblock_tx_total_samples()
 	return total;
 }
 
+int cl_telecom_system::bigblock_codeword_count()
+{
+	// SACK-GATE P1 (R-B): the big-block codeword count K at the current CFG16 rung.
+	// IDENTICAL geometry to the TX/RX workers (transmit_bigblock:7832,
+	// receive_bigblock:7890): rebuild the thin grid, K = nBits/ldpc.N, capped by
+	// MERCURY_BIGBLOCK_K. The ARQ batch-size election PINS data_batch_size = K on
+	// BOTH peers from THIS one source so they cannot diverge (bug #9). Geometry-only
+	// (no I/O); rebuild then restore stock CFG16 (same as bigblock_tx_total_samples).
+	if(M == MOD_MFSK) return 0;
+	int Ngrid=0, log2M=0, nBits=0;
+	bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+	int K = (ldpc.N > 0) ? (nBits / ldpc.N) : 0;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_K");
+	  if(e && *e){ int kcap = atoi(e); if(kcap > 0 && kcap < K) K = kcap; } }
+	bigblock_restore_stock_config();
+	if(K < 0) K = 0;
+	return K;
+}
+
 void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
 {
 	// P2.1 — feed REAL ARQ bytes as the block's systematic info bits. When the ARQ

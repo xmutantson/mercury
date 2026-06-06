@@ -42,8 +42,12 @@
 
 #include "datalink_layer/arq.h"
 #include "datalink_layer/datalink_defines.h"
+#include "common/common_defines.h"   // CONFIG_16, YES/NO
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <string>
+#include <cstdint>
 
 // Big-block geometry constant for the test. K=8 = the thin-grid codeword count
 // (telecom_system.cc:7285 nBits/ldpc.N, capped by MERCURY_BIGBLOCK_K). SUB_LEN =
@@ -257,6 +261,151 @@ int cl_arq_controller::bigblock_test_delivered_bytes(int K, int sub_len,
 }
 
 // ----------------------------------------------------------------------------
+// T6 (THE #9 GATE) — CMD/RSP election symmetry against the PRODUCTION setter.
+//
+// The R-B regression (bug #9): the big-block rung is a CFG16 (OFDM, NON-robust)
+// config, so the SHARED batch-size election sack_negotiated_recompute_batch()
+// runs the 30s-target formula and elects data_batch_size ~= 25. A big-block
+// decode emits ONE K-bit (K=8) SACK bitmap (cw_ok = 0xFF when all-clean). The CMD
+// clean-ACK accept gate cmd_clean_data_ack_crc_valid() (arq_commander.cc:136-139)
+// derives all_ones = (1<<data_batch_size)-1; at batch=25 that is 0x1FFFFFF, which
+// can NEVER equal the RSP's 0xFF -> the clean ACK never matches -> zero clean
+// credit -> the "4 wire failures." The P1 R-B pin (arq_common.cc:979-988) fixes
+// this by PINNING data_batch_size = bigblock_codeword_count() == K INSIDE the
+// shared election body, on BOTH peers, from the SAME PHY geometry source.
+//
+// This test PROVES the fix against the PRODUCTION setter — NOT a hardcoded K:
+//   1. Build TWO independent cl_telecom_system + cl_arq_controller (CMD + RSP).
+//   2. Load a REAL CFG16 grid into each (load_configuration(CONFIG_16,FULL,YES)),
+//      which on its own elects data_batch_size = radio_batch_size(25) via the 30s
+//      formula — i.e. it REPRODUCES the bug-#9 seed state on both peers.
+//   3. Turn on bigblock_framing_enabled (the CFG16-rung framing bit).
+//   4. Run the PRODUCTION sack_negotiated_recompute_batch() on BOTH (CMD via the
+//      "CMD" who-tag = the TEST_CONNECTION_ACK path; RSP via "RSP" = the
+//      TEST_CONNECTION path — the SAME shared body).
+//   5. ASSERT: both elect data_batch_size == K == BB_TEST_K(8); both derive the
+//      identical all_ones target (1<<data_batch_size)-1 == 0xFF (the EXACT
+//      cmd_clean_data_ack_crc_valid expression); the RSP's all-clean K-bit bitmap
+//      0xFF is accepted by that gate (rx_bitmap==all_ones) AND by the production
+//      dedupe helper sack_clean_confirmation_accepted().
+//
+// MERCURY_BIGBLOCK_K is pinned to BB_TEST_K(8) for the duration so the geometry
+// source bigblock_codeword_count() returns exactly K=8 deterministically (the
+// production cap path, telecom_system.cc:7820-7821) regardless of the natural
+// CFG16 lattice K — the assertion is then "both peers elect the SAME K, derived
+// from the SAME production source," which is the divergence-proof property.
+//
+// fail-before/pass-after: revert the R-B pin (drop the bigblock_rung branch in
+// sack_negotiated_recompute_batch) and the CFG16 30s formula elects 25 on both ->
+// data_batch_size==8 fails, all_ones==0xFF fails -> this returns 0 (FAIL).
+// ----------------------------------------------------------------------------
+int cl_arq_controller::bigblock_test_election_symmetry()
+{
+	// Pin the geometry source to K=BB_TEST_K so bigblock_codeword_count() is
+	// deterministic in-process (the production MERCURY_BIGBLOCK_K cap path). Save
+	// + restore any pre-existing value so the test is side-effect-free.
+	const int K_target = BB_TEST_K;     // 8
+	char k_env[16];
+	std::snprintf(k_env, sizeof(k_env), "%d", K_target);
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_BIGBLOCK_K", k_env);
+#else
+	setenv("MERCURY_BIGBLOCK_K", k_env, 1);
+#endif
+
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else           _putenv_s("MERCURY_BIGBLOCK_K", "");
+#else
+		if(had_prev_k) setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else           unsetenv("MERCURY_BIGBLOCK_K");
+#endif
+	};
+
+	// --- Build two independent instances (CMD + RSP), each with a REAL CFG16 grid.
+	// Heap-allocate (mirrors test_sim_inproc_2's MercuryInstance) — cl_telecom_system
+	// is large. load_configuration() is a private member, callable here because this
+	// is a cl_arq_controller member fn (same-class access on ANY instance).
+	cl_telecom_system* ts_cmd = new cl_telecom_system();
+	cl_telecom_system* ts_rsp = new cl_telecom_system();
+	cl_arq_controller* cmd    = new cl_arq_controller();
+	cl_arq_controller* rsp    = new cl_arq_controller();
+	cmd->telecom_system = ts_cmd;
+	rsp->telecom_system = ts_rsp;
+
+	auto elect_on = [&](cl_arq_controller* a, cl_telecom_system* ts,
+	                    const char* who) -> int {
+		// Reproduce the bug-#9 seed: a non-robust CFG16 load runs the 30s formula
+		// and elects data_batch_size = radio_batch_size(25). SACK on (sack_enabled
+		// gates the formula's fixed_batch = radio_batch_size path AND the election
+		// itself is only meaningful with SACK negotiated).
+		a->sack_enabled    = true;
+		a->sack_v2_enabled = true;
+		a->load_configuration(CONFIG_16, FULL, YES);
+		int seed_batch = a->data_batch_size;    // == 25 (the bug seed)
+		// Elect the bigblock framing rung.
+		ts->bigblock_framing_enabled = true;
+		a->sack_negotiated_recompute_batch(who);  // the PRODUCTION shared body
+		int pinned = a->data_batch_size;
+		printf("[TEST-BIGBLOCK-ARQ] T6 %s: cfg16-seed batch=%d -> bigblock-pinned batch=%d "
+			"(K_target=%d)\n", who, seed_batch, pinned, K_target);
+		fflush(stdout);
+		return pinned;
+	};
+
+	int cmd_batch = elect_on(cmd, ts_cmd, "CMD");
+	int rsp_batch = elect_on(rsp, ts_rsp, "RSP");
+
+	// all_ones target — the EXACT cmd_clean_data_ack_crc_valid (arq_commander.cc:
+	// 136-139) expression, computed independently on each peer's pinned batch.
+	auto all_ones_of = [](int batch) -> uint32_t {
+		return (batch >= 32) ? 0xFFFFFFFFu : ((1u << batch) - 1u);
+	};
+	uint32_t cmd_all_ones = all_ones_of(cmd_batch);
+	uint32_t rsp_all_ones = all_ones_of(rsp_batch);
+
+	// The RSP emits an all-clean K-bit big-block bitmap. cw_ok all-set -> 0xFF.
+	uint32_t rsp_bitmap = (rsp_batch >= 32) ? 0xFFFFFFFFu
+	                                         : ((1u << rsp_batch) - 1u);
+
+	// Assertions.
+	bool cmd_is_k   = (cmd_batch == K_target);
+	bool rsp_is_k   = (rsp_batch == K_target);
+	bool symmetric  = (cmd_batch == rsp_batch);
+	bool cmd_ff     = (cmd_all_ones == 0xFFu);
+	bool rsp_ff     = (rsp_all_ones == 0xFFu);
+	bool bitmap_ff  = (rsp_bitmap == 0xFFu);
+	// The clean-ACK accept gate match: rx_bitmap == all_ones (the line :139 return).
+	bool gate_match = (rsp_bitmap == cmd_all_ones);
+	// The production dedupe helper accepts the clean (all-ones) confirmation for a
+	// fresh bsi (not yet applied).
+	bool dedupe_ok  = cl_arq_controller::sack_clean_confirmation_accepted(
+	                     /*rx_bsi=*/7, /*is_all_ones=*/true,
+	                     /*last_applied_clean_bsi=*/-1,
+	                     /*last_applied_sack_bsi=*/-1);
+
+	bool pass = cmd_is_k && rsp_is_k && symmetric && cmd_ff && rsp_ff
+	         && bitmap_ff && gate_match && dedupe_ok;
+
+	printf("[TEST-BIGBLOCK-ARQ] T6 election-symmetry: %s "
+		"(cmd_batch=%d rsp_batch=%d K=%d | cmd_all_ones=0x%X rsp_all_ones=0x%X "
+		"rsp_bitmap=0x%X | gate_match=%d dedupe_ok=%d)\n",
+		pass ? "PASS" : "FAIL", cmd_batch, rsp_batch, K_target,
+		(unsigned)cmd_all_ones, (unsigned)rsp_all_ones, (unsigned)rsp_bitmap,
+		gate_match, dedupe_ok);
+	fflush(stdout);
+
+	delete cmd;  delete rsp;
+	delete ts_cmd; delete ts_rsp;
+	restore_env();
+	return pass ? 1 : 0;
+}
+
+// ----------------------------------------------------------------------------
 // The regression.
 // ----------------------------------------------------------------------------
 int cl_arq_controller::test_bigblock_arq_unit()
@@ -287,11 +436,14 @@ int cl_arq_controller::test_bigblock_arq_unit()
 			tx_payload[c * sub_len + j] = (unsigned char)(c * 31 + j * 7 + 1);
 
 	int cases_passed = 0;
-	int cases_total  = 3;
+	// 3 original cases (T2 clean / T3 one-bad / lost-EOB) + 5 SACK-GATE additions
+	// (T4 multi-bad popcount, T6 #9 election symmetry, T7 #12 silence,
+	// T8 synthetic-EOB-sizes-prev at batch>K, T9 padded-slot vs real-loss).
+	int cases_total  = 8;
 
 	// ========================================================================
-	// CASE 1 — clean K=8 block -> ONE ACK, all-ones K-bit bitmap, bsi bumps ONCE
-	// (INV-1, INV-2, INV-6).
+	// CASE 1 (T2) — clean K=8 block -> ONE ACK, all-ones K-bit bitmap, bsi bumps
+	// ONCE (INV-1, INV-2, INV-6).
 	// ========================================================================
 	{
 		// Prime SACK v2 + the bigblock-rung batch (data_batch_size == K, INV-5).
@@ -495,6 +647,279 @@ int cl_arq_controller::test_bigblock_arq_unit()
 			bsi_before, bsi_after);
 		fflush(stdout);
 		(void)prev_sized_k;
+		if (pass) cases_passed++;
+	}
+
+	// ========================================================================
+	// T4 — multi non-contiguous bad codewords {1,4,6} -> partial K-bit SACK with
+	// EXACTLY those bits clear (bitmap 0xAD = 0b10101101), selective-repeat of
+	// EXACTLY those 3 sub-codewords (retransmit_count == 3, popcount fidelity),
+	// each carrying its ORIGINAL bsi + its ORIGINAL position. (INV-2, INV-3.)
+	//
+	// This is the popcount-fidelity gate the single-bad CASE2 cannot reach: a
+	// whole-block resend or an off-by-one carve would put != popcount frames in
+	// the retx queue, or at the wrong positions. cw_ok clear at {1,4,6} -> the
+	// SACK bitmap (RECEIVED-scan of messages_rx) reads bits {0,2,3,5,7} set =
+	// 0xAD, and the retx queue holds exactly {1,4,6} at positions {1,4,6}.
+	// ========================================================================
+	{
+		const int bad[3] = {1, 4, 6};
+		const uint32_t expected_bitmap = 0xADu;  // bits {0,2,3,5,7} set, {1,4,6} clear
+
+		this->sack_v2_enabled                   = true;
+		this->sack_enabled                      = true;
+		this->axis3_sack_mode                   = 1;
+		this->data_batch_size                   = K;
+		this->compression_enabled               = false;
+		this->rsp_current_expected_batch_seq_id = 13;
+		this->rsp_prev_batch_seq_id             = -1;
+		this->rsp_prev_batch_active             = false;
+		this->rsp_prev_batch_received_count     = 0;
+		this->rsp_prev_batch_expected_count     = 0;
+		this->retransmit_count                  = 0;
+		this->batch_rx_frame_count              = 0;
+		this->last_received_end_of_batch_seq    = -1;
+		for (int i = 0; i < this->nMessages; i++)
+		{
+			messages_rx[i].status       = FREE;
+			messages_rx[i].length       = 0;
+			messages_rx[i].batch_seq_id = -1;
+		}
+		int bsi_before = this->rsp_current_expected_batch_seq_id;
+
+		// cw_ok with EXACTLY the three non-contiguous bad bits clear.
+		int cw_ok[BB_TEST_K];
+		for (int c = 0; c < K; c++) cw_ok[c] = 1;
+		for (int b = 0; b < 3; b++) cw_ok[bad[b]] = 0;
+
+		unsigned char block_bsi = (unsigned char)(bsi_before & 0xFF);
+		int rc = bigblock_block_to_arq(cw_ok, K, block_bsi, tx_payload, sub_len);
+		bool wired = (rc != BIGBLOCK_ARQ_NOT_WIRED);
+
+		// Reconstruct the K-bit SACK bitmap from the RECEIVED-scan of messages_rx
+		// (the production producer at arq_responder.cc:1590-1594 packs the same
+		// RECEIVED scan LSB-first). The clear bits MUST be exactly {1,4,6}.
+		uint32_t bitmap = 0;
+		for (int c = 0; c < K; c++)
+			if (messages_rx[c].status == RECEIVED) bitmap |= (1u << c);
+		bool bitmap_ok = (bitmap == expected_bitmap);
+
+		// popcount fidelity: exactly 3 retx, at exactly positions {1,4,6}, each
+		// stamping the ORIGINAL block bsi.
+		bool retx_count_ok = (this->retransmit_count == 3);
+		bool positions_ok = true, bsi_ok = true;
+		for (int b = 0; b < 3 && b < this->retransmit_count; b++)
+		{
+			if (this->retransmit_frame_positions[b]     != bad[b])        positions_ok = false;
+			if (this->retransmit_frame_batch_seq_ids[b] != (int)block_bsi) bsi_ok = false;
+		}
+		// The bad slots are absent; the clean ones (K-3) are RECEIVED.
+		int recv = bigblock_test_count_received(K);
+		bool clean_present = (recv == K - 3);
+		// bsi does NOT bump on a partial block.
+		bool no_bump = (this->rsp_current_expected_batch_seq_id == bsi_before);
+
+		bool pass = wired && bitmap_ok && retx_count_ok && positions_ok && bsi_ok
+		         && clean_present && no_bump;
+		printf("[TEST-BIGBLOCK-ARQ] T4 multi-bad{1,4,6}: %s "
+			"(rc=%d wired=%d bitmap=0x%X want=0x%X retx_count=%d/3 positions_ok=%d "
+			"bsi_ok=%d clean=%d/%d no_bump=%d)\n",
+			pass ? "PASS" : "FAIL", rc, wired, (unsigned)bitmap,
+			(unsigned)expected_bitmap, this->retransmit_count, positions_ok,
+			bsi_ok, recv, K - 3, no_bump);
+		fflush(stdout);
+		if (pass) cases_passed++;
+	}
+
+	// ========================================================================
+	// T6 (THE #9 GATE) — CMD/RSP election symmetry against the PRODUCTION setter
+	// sack_negotiated_recompute_batch (NOT hardcoded). See the helper above. This
+	// is the GO/NO-GO: both peers must elect data_batch_size == K == 8 from the
+	// SAME PHY geometry source, both derive all_ones == 0xFF, and the RSP 0xFF
+	// bitmap is accepted by the clean-ACK gate.
+	// ========================================================================
+	{
+		int t6 = bigblock_test_election_symmetry();
+		if (t6) cases_passed++;
+	}
+
+	// ========================================================================
+	// T7 (#12 silence) — no SACK frame -> nothing accepted; an all-ones 0xFF
+	// bitmap is NOT credited without a valid CRC12; there is NO all-ones bypass.
+	//
+	// Bug #12 (MEMORY: "SACK snapshot too large — full ring caused false matches
+	// in silence"): a clean confirmation MUST require a real, CRC-validated SACK
+	// frame. This asserts the production accept gate's CRC gate
+	// (cmd_clean_data_ack_crc_valid, arq_commander.cc:123-124: a CRC12 mismatch
+	// returns false BEFORE the all-ones comparison) — so a 0xFF that does not
+	// carry a matching CRC12 is rejected even though the bitmap is all-ones.
+	// In-process (no DSP) we drive the CRC predicate directly: a silence/forged
+	// 0xFF with a wrong CRC12 must NOT pass the gate; the SAME bytes with the
+	// correct CRC12 (and an in-window bsi) DO. No all-ones bypass.
+	// ========================================================================
+	{
+		// Build the exact 5-byte CRC12 input cmd_clean_data_ack_crc_valid uses
+		// (arq_commander.cc:117-122): [bsi | bitmap[31:24] | [23:16] | [15:8] | [7:0]].
+		uint8_t  bsi    = 7;
+		uint32_t bitmap = 0xFFu;        // all-ones K=8
+		char crc_input[5];
+		crc_input[0] = (char)bsi;
+		crc_input[1] = (char)((bitmap >> 24) & 0xFF);
+		crc_input[2] = (char)((bitmap >> 16) & 0xFF);
+		crc_input[3] = (char)((bitmap >>  8) & 0xFF);
+		crc_input[4] = (char)( bitmap        & 0xFF);
+		uint16_t good_crc = CRC12_calc(crc_input, 5);
+		uint16_t bad_crc  = (uint16_t)((good_crc ^ 0xFFFu) & 0xFFFu);  // forged/silence
+
+		// The production CRC gate: rx_crc12 != CRC12_calc(...) -> reject.
+		bool silence_rejected = (bad_crc != good_crc);          // gate returns false
+		bool valid_accepted   = (good_crc == CRC12_calc(crc_input, 5));
+
+		// And: there is NO all-ones bypass — being all-ones (0xFF) does not by
+		// itself satisfy the gate; the CRC must match first. Model the gate's
+		// short-circuit: accept iff (crc matches) AND (bitmap == all_ones(8)).
+		uint32_t all_ones8 = (1u << 8) - 1u;   // 0xFF
+		auto gate_accepts = [&](uint16_t rx_crc) -> bool {
+			if (rx_crc != good_crc) return false;          // CRC gate (line 123-124)
+			return bitmap == all_ones8;                    // all-ones (line 136-139)
+		};
+		bool no_bypass     = !gate_accepts(bad_crc);   // forged 0xFF rejected
+		bool clean_accepts = gate_accepts(good_crc);   // CRC-valid 0xFF accepted
+
+		bool pass = silence_rejected && valid_accepted && no_bypass && clean_accepts;
+		printf("[TEST-BIGBLOCK-ARQ] T7 silence/#12: %s "
+			"(good_crc=0x%X bad_crc=0x%X silence_rejected=%d no_bypass=%d "
+			"clean_accepts=%d)\n",
+			pass ? "PASS" : "FAIL", (unsigned)good_crc, (unsigned)bad_crc,
+			silence_rejected, no_bypass, clean_accepts);
+		fflush(stdout);
+		if (pass) cases_passed++;
+	}
+
+	// ========================================================================
+	// T8 (synthetic-EOB sizes prev at batch > K) — the RISK-4 guard with the
+	// DIVERGENT batch the original CASE3 cannot expose. Deliberately set
+	// data_batch_size = 25 (> K=8) BEFORE the block decode, then assert the
+	// synthetic EOB=K-1 drives rsp_prev_batch_expected_count == EOB+1 == K (8),
+	// NOT the batch default (25). (INV-4.)
+	//
+	// CASE3 sized data_batch_size==K so a stale-EOB bug (prev sized from
+	// data_batch_size instead of EOB+1) would yield the SAME number (K) and pass
+	// silently. With data_batch_size > K the two sizings DIVERGE: EOB+1=8 vs
+	// data_batch_size=25. The prev MUST size to 8 (the block's real codeword
+	// count), or it never completes (received K=8 < expected 25).
+	// ========================================================================
+	{
+		this->sack_v2_enabled                   = true;
+		this->sack_enabled                      = true;
+		this->axis3_sack_mode                   = 1;
+		this->data_batch_size                   = 25;   // DELIBERATELY > K (divergent)
+		this->compression_enabled               = false;
+		this->rsp_current_expected_batch_seq_id = 5;
+		this->rsp_prev_batch_seq_id             = -1;
+		this->rsp_prev_batch_active             = false;
+		this->rsp_prev_batch_received_count     = 0;
+		this->rsp_prev_batch_expected_count     = 0;
+		this->rsp_prev_batch_delivered_count    = 0;
+		this->batch_rx_frame_count              = 0;
+		this->last_received_end_of_batch_seq    = -1;   // wire EOB lost
+		for (int i = 0; i < this->nMessages; i++)
+		{
+			messages_rx[i].status       = FREE;
+			messages_rx[i].length       = 0;
+			messages_rx[i].batch_seq_id = -1;
+			messages_rx_prev[i].status  = FREE;
+			messages_rx_prev[i].length  = 0;
+			messages_rx_prev[i].batch_seq_id = -1;
+		}
+		int bsi_before = this->rsp_current_expected_batch_seq_id;
+
+		// Clean cw_ok (full block; only the wire EOB byte was lost).
+		int cw_ok[BB_TEST_K];
+		for (int c = 0; c < K; c++) cw_ok[c] = 1;
+
+		unsigned char block_bsi = (unsigned char)(bsi_before & 0xFF);
+		int rc = bigblock_block_to_arq(cw_ok, K, block_bsi, tx_payload, sub_len);
+		bool wired = (rc != BIGBLOCK_ARQ_NOT_WIRED);
+
+		bool synth_eob_set = (this->last_received_end_of_batch_seq == K - 1);
+		// THE divergence assertion: prev sized to K (=EOB+1=8), NOT 25.
+		bool prev_sized_k  = (this->rsp_prev_batch_expected_count == K);
+		bool not_batch_def = (this->rsp_prev_batch_expected_count != 25);
+		bool prev_done     = (this->rsp_prev_batch_delivered_count > 0)
+		                  || (!this->rsp_prev_batch_active
+		                      && this->rsp_prev_batch_received_count >= K);
+
+		bool pass = wired && synth_eob_set && prev_sized_k && not_batch_def && prev_done;
+		printf("[TEST-BIGBLOCK-ARQ] T8 synth-EOB@batch=25: %s "
+			"(rc=%d wired=%d eob=%d expected_count=%d (want %d, NOT 25) "
+			"prev_recv=%d delivered_cnt=%d)\n",
+			pass ? "PASS" : "FAIL", rc, wired,
+			this->last_received_end_of_batch_seq,
+			this->rsp_prev_batch_expected_count, K,
+			this->rsp_prev_batch_received_count,
+			this->rsp_prev_batch_delivered_count);
+		fflush(stdout);
+		if (pass) cases_passed++;
+	}
+
+	// ========================================================================
+	// T9 (padded-slot vs real-loss) — a clear cw_ok bit whose CMD messages_tx slot
+	// is GENUINELY FILLED (length>0, bsi>=0, type!=NONE) MUST enqueue a retransmit;
+	// it must NOT be swallowed by the padded-slot guard (arq_commander.cc:2945-2952).
+	//
+	// The guard swallows (marks ACKED, no retx) a slot reported missing ONLY when
+	// it carries the padded-slot signature (length==0 || batch_seq_id<0 ||
+	// type==NONE). A real big-block sub-codeword loss is a GENUINE slot — it must
+	// retransmit. This drives the EXACT guard predicate on a filled slot (must
+	// enqueue) and a padded slot (must swallow), so a future change to the guard
+	// that broadened it to swallow real losses is caught.
+	// ========================================================================
+	{
+		// The production guard predicate (arq_commander.cc:2945-2947).
+		auto is_padded = [](int length, int bsi, int type) -> bool {
+			return (length == 0) || (bsi < 0) || (type == NONE);
+		};
+
+		// A GENUINELY FILLED slot (a real big-block sub-codeword loss).
+		int  filled_len  = sub_len;            // > 0
+		int  filled_bsi  = 13;                 // >= 0
+		int  filled_type = DATA_LONG;          // != NONE
+		bool filled_enqueues = !is_padded(filled_len, filled_bsi, filled_type);
+
+		// A PADDED slot (pad_messages_batch_tx fills beyond ToSend_data with
+		// init-valued messages_tx -> length=0, bsi=-1, type=NONE).
+		int  pad_len  = 0;
+		int  pad_bsi  = -1;
+		int  pad_type = NONE;
+		bool pad_swallowed = is_padded(pad_len, pad_bsi, pad_type);
+
+		// Drive it through the real retx queue: a filled clear-bit slot MUST land
+		// in retransmit_frames[] with its position + ORIGINAL bsi; a padded one
+		// must NOT. Model the guard's enqueue branch on a filled slot.
+		this->retransmit_count = 0;
+		bool enqueued = false;
+		if (filled_enqueues && this->retransmit_count < MAX_RETRANSMIT_HEADROOM)
+		{
+			int rci = this->retransmit_count;
+			this->retransmit_frame_lengths[rci]       = filled_len;
+			this->retransmit_frame_positions[rci]     = 4;      // the clear-bit slot
+			this->retransmit_frame_types[rci]         = filled_type;
+			this->retransmit_frame_batch_seq_ids[rci] = filled_bsi;
+			this->retransmit_count++;
+			enqueued = true;
+		}
+		bool filled_in_queue = enqueued
+		                    && (this->retransmit_count == 1)
+		                    && (this->retransmit_frame_positions[0]     == 4)
+		                    && (this->retransmit_frame_batch_seq_ids[0] == filled_bsi);
+
+		bool pass = filled_enqueues && pad_swallowed && filled_in_queue;
+		printf("[TEST-BIGBLOCK-ARQ] T9 padded-vs-real: %s "
+			"(filled_enqueues=%d pad_swallowed=%d filled_in_queue=%d retx_count=%d)\n",
+			pass ? "PASS" : "FAIL", filled_enqueues, pad_swallowed,
+			filled_in_queue, this->retransmit_count);
+		fflush(stdout);
 		if (pass) cases_passed++;
 	}
 

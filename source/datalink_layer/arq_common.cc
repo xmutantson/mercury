@@ -950,7 +950,43 @@ void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
 	// clean all-ones MFSK ACK requires every frame to survive first-pass at the
 	// floor SNR (it never does). At batch=1 every delivered MFSK frame is itself
 	// an all-ones batch -> clean ACKs accumulate and the climb advances.
-	if(!is_robust_config(current_configuration))
+	// SACK-GATE P1 (R-B, bug #9) — BIG-BLOCK RUNG PIN: data_batch_size == K.
+	// The big-block framing rung is a CFG16 (OFDM, NON-robust) config, so without
+	// this pin the non-robust branch below runs the 30s-target formula and elects
+	// data_batch_size ~= 25. But a big-block decode emits ONE K-bit SACK bitmap
+	// (cw_ok, K = nBits/ldpc.N at the thin grid, K=8 at CFG16). The CMD clean-ACK
+	// accept gate (cmd_clean_data_ack_crc_valid, arq_commander.cc:136-139) derives
+	// all_ones = (1<<data_batch_size)-1; with batch=25 that is 0x1FFFFFF, which can
+	// NEVER equal the RSP's all-clean K=8 bitmap 0xFF -> clean ACK never matches ->
+	// zero clean credit -> the #9 "4 wire failures". Pinning data_batch_size = K
+	// makes CMD all_ones == 0xFF == the RSP big-block bitmap.
+	//
+	// This runs in the SHARED election body (CMD via TEST_CONNECTION_ACK +
+	// arq_commander.cc, RSP via TEST_CONNECTION + arq_responder.cc), so BOTH peers
+	// elect K from the SAME PHY geometry source (telecom_system->
+	// bigblock_codeword_count(), the identical nBits/ldpc.N the TX/RX workers use)
+	// and CANNOT diverge — the divergence-proof property the climb-fix family lacked.
+	// It is a BATCH-SIZE election at the CFG16 rung, NOT an authority change: the
+	// optimizer/gearshift authority (optimizer_is_in_control, last_data_viable_config,
+	// anchor_consec_break_fails, probe_backoff) is UNTOUCHED. The rung is detected by
+	// the framing-mode flag (telecom_system->bigblock_framing_enabled), the CFG16-rung
+	// framing bit the gearshift elects. set_data_batch_size()'s non-robust branch
+	// accepts K (>0, below the cap) cleanly; recalculate_ack_timeout_for_batch()
+	// (below) re-sizes the data-ACK timeout for the pinned batch.
+	bool bigblock_rung = (telecom_system != NULL)
+	                   && telecom_system->bigblock_framing_enabled
+	                   && !is_robust_config(current_configuration);
+	if(bigblock_rung)
+	{
+		int K = telecom_system->bigblock_codeword_count();
+		if(K > 0)
+		{
+			if(K > nMessages) K = nMessages;
+			set_data_batch_size(K);
+			nominal_batch_size = K;
+		}
+	}
+	else if(!is_robust_config(current_configuration))
 	{
 		int max_batch = (message_transmission_time_ms > 0)
 			? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
@@ -962,9 +998,9 @@ void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
 		nominal_batch_size = new_batch;
 	}
 	recalculate_ack_timeout_for_batch();
-	printf("[SACK] %s Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+	printf("[SACK] %s Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d bigblock=%d)\n",
 		who ? who : "?", radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
-		is_robust_config(current_configuration) ? 1 : 0);
+		is_robust_config(current_configuration) ? 1 : 0, bigblock_rung ? 1 : 0);
 }
 
 void cl_arq_controller::set_call_sign(std::string call_sign)
