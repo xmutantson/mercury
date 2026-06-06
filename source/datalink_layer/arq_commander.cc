@@ -4618,7 +4618,22 @@ void cl_arq_controller::process_control_commander()
 				{
 					int rx_frame = telecom_system->data_container.preamble_nSymb
 						+ telecom_system->get_active_nsymb();
-					telecom_system->data_container.frames_to_read = rx_frame + 10;
+					// §17.5/§17.8 (§5 cross-layer fix): SWITCH_ROLE turns THIS peer into
+					// the RESPONDER/receiver. data_configuration was (re)loaded at :4565
+					// for the return path and may be CONFIG_16 + big-block framing. The
+					// new receiver now awaits the new TX side's first DATA — at the
+					// big-block rung that DATA is a big-block spanning
+					// bigblock_rx_block_nsymb() (~64) OFDM symbols. Arming a STOCK frame
+					// (~13) here snapshots only the block HEAD: cw0 fresh -> byte-correct,
+					// cw1..cw7 decoded from stale ring -> deterministic garbage (the §17.2
+					// truncated-window signature, on the REVERSE-direction / bidirectional
+					// path the single-direction RSP test never exercised). Route through
+					// bigblock_block_ftr_or() so the window spans the whole block whenever
+					// the CFG16 big-block rung is live; off-rung (framing-off / M==MFSK /
+					// config != CONFIG_16) the helper returns rx_frame+10 UNCHANGED, so the
+					// stock per-frame turnaround is byte-identical.
+					telecom_system->data_container.frames_to_read =
+						bigblock_block_ftr_or(rx_frame + 10);
 				}
 				telecom_system->data_container.nUnder_processing_events = 0;
 				telecom_system->receive_stats.delay_of_last_decoded_message = -1;

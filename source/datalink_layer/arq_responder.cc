@@ -1674,7 +1674,19 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				stats.nNAcked_data++;
 				batch_rx_frame_count = 0;
 				last_received_end_of_batch_seq = -1;
-				// Reset RX state for fresh retransmission capture
+				// Reset RX state for fresh retransmission capture.
+				// §17.6 / §17.8 (§5 cross-layer audit): this is the ACK-GATE
+				// partial-batch retx re-arm. It is DELIBERATELY left STOCK-frame
+				// (NOT routed through bigblock_block_ftr_or). When a big-block decoded
+				// PARTIAL (some cw demoted by the per-cw wire-CRC), the CMD sends the
+				// selective-repeat as STOCK per-frame frames — bigblock_send_one_block()
+				// declines while sack_retransmit_active (arq_common.cc:3718, CMD sets it
+				// at arq_commander.cc:1803). So the RX legitimately expects per-frame
+				// retx frames here; block-spanning this arming would OVER-WAIT for a
+				// big-block that is not coming and stall the retx. The NEXT NEW-DATA
+				// block IS re-armed to full block-span by the wrapped ACK-send paths
+				// (send_mfsk_ack_sack arq_common.cc:5526 etc.), so the new-data path
+				// still gets its full window. DO NOT "fix" this by wrapping it.
 				telecom_system->data_container.frames_to_read =
 					telecom_system->data_container.preamble_nSymb
 					+ telecom_system->get_active_nsymb();

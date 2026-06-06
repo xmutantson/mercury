@@ -1504,3 +1504,48 @@ arq_commander.cc) drives a FULL K=8 block (1200B, all 8 codewords) in THREE arms
 (B) NOCRC stock-window (DEFEAT_FIX=1) -> forced-clean but `bytes_ok=0` (cw1..cw7 corrupt);
 (C) NOCRC block-window -> `bytes_ok=1`. This is the K>1 byte-faithfulness test the 622-byte synthetic
 cases and the single-arming fullpath could not catch. NO monitor merge, NO push, NO attribution.
+
+### §17.8 The §17 audit was STILL incomplete — the SWITCH_ROLE bidirectional re-arm + the multi-block sim limitation (2026-06-06, branch `fix/bigblock-rearm-window` off `fix/bigblock-multicw-dewhiten`@`6e08f2e`, worktree `C:/Users/kamer/mercury_wt/bigblock-rearm`)
+
+The §17.3 producer list enumerated the RSP-direction data-path re-arms but MISSED one sibling on the
+COMMANDER side: the **SWITCH_ROLE turnaround re-arm** (`arq_commander.cc:4618-4637`, in
+`process_control_commander()`). On a turboshift role reversal the commander becomes the
+RESPONDER/receiver: `data_configuration` was (re)loaded for the return path at `arq_commander.cc:4565`
+and MAY be CONFIG_16 + big-block framing, and this peer then awaits the new TX side's FIRST DATA —
+which at the big-block rung is a full block (`bigblock_rx_block_nsymb()` ~64 OFDM symbols). The
+pre-fix arming was a STOCK frame (`rx_frame + 10`), so the snapshot fired on the block HEAD only:
+cw0 fresh → byte-correct, cw1..cw7 from the stale ring → the §17.2 truncated-window signature on the
+REVERSE / bidirectional path. The single-direction RSP tests never exercised it.
+
+**FIX**: route `arq_commander.cc:4635` through `bigblock_block_ftr_or()` — the SAME shared clamp the
+§17.4 sites use (no new geometry source; byte-identical off-rung: framing-off / M==MFSK /
+config != CONFIG_16 → returns `rx_frame+10` unchanged). This is the only code change beyond §17.4.
+
+**§17.6 re-confirmed** (the comment at `arq_responder.cc:1677-1689` was elaborated, behaviour
+UNCHANGED): the ACK-GATE partial-batch retx re-arm (`arq_responder.cc:1690`) stays STOCK-frame —
+`bigblock_send_one_block()` declines while `sack_retransmit_active` (`arq_common.cc:3718`, CMD sets it
+`arq_commander.cc:1803`), so selective-repeat retx is per-frame and the RX legitimately expects stock
+frames during the retx window. NOT a gap. The CLOSE_CONNECTION / disconnect re-arms
+(`arq_responder.cc:1418`, `arq_commander.cc:500`, `arq_commander.cc:4973`) reset the config to the
+init seed before LISTENING, so the helper guard is false there too — correctly stock.
+
+**MULTI-BLOCK SIM LIMITATION (resolves §8 [?])**: an attempt to add a SECOND-block re-arm regression
+(driving PAYLOAD ≥ 2 blocks with a `MERCURY_SIM2_STOP_AFTER_NBLOCKS` hook + per-block clean tracking)
+was BUILT then REMOVED as non-viable. Empirically (this worktree, NOCRC + CRC-ON, PAYLOAD=2400,
+PIN CFG16 framing-on): the in-process 2-instance sim CARVES both blocks (block 2 `cw_ok_count=8`,
+`fallback=1` bsi) but **never reaches `loop done` / `bytes_ok`** — it spins indefinitely on block-2
+sequencing and never delivers the full message. The sim is effectively SINGLE-BLOCK-LIMITED for
+end-to-end byte-faithful delivery. Worse, `cw_ok_count`/`n_clean` tracks the per-cw CRC pass (under
+NOCRC always K, regardless of window), NOT byte-truth — so a `blocks_all_clean` assertion does NOT
+differentiate fail-before from pass-after for block 2. A multi-block test on that signal would either
+HANG (full-payload `memcmp` never completes) or FALSE-GREEN (cw_ok_count). The dangling infra was
+therefore removed rather than shipped (CLAUDE.md: no false-green / hanging tests, no dead code).
+
+**VALIDATION of this fix**: the window-arming root cause IS proven byte-truthfully by the EXISTING
+`--test-bigblock-multicw` (ARM-B `bytes_ok=0` fail-before vs ARM-C `bytes_ok=1` pass-after, full K=8
+~64-sym block via the REAL `test_sim_inproc_2` wire path, which exercises `send_ack_pattern`
+[TX-ACK-PAT @4942]) and `--test-bigblock-fullpath` (first_clean 1/8 rx=0 → 8/8 rx=1200/1200). The
+SWITCH_ROLE site itself is UNREACHABLE in-process — the sim PINs the config (`MERCURY_SIM2_PIN=1`,
+turboshift OFF, SWITCH_ROLE count = 0 observed), so role reversal never fires. The SWITCH_ROLE wrap
+is a FAITHFUL application of the §17.4-proven mechanism to the audit-found sibling; its live
+role-reversal path is validated at P3/P4 HW. NO monitor merge, NO push, NO attribution.
