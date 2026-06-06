@@ -1581,6 +1581,13 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		unsetenv("MERCURY_BIGBLOCK_CORRUPT_CW");
 #endif
 
+		// HEAP-OVERRUN FIX RECONCILIATION (fact-doc §13): receive_bigblock now lands the FULL
+		// K*ldpc.K decode in the dedicated member bigblock_rx_infobits; the `info_bits` (out)
+		// buffer is only an N_MAX-bounded legacy copy (~1.1 codewords). Read the full decode
+		// from the member for BOTH the direct CRC proof and the production carve — exactly as
+		// the live RX path (arq_common.cc receive()) and the heap-fix CASE A/B do.
+		const std::vector<int>& full_info = tsB->bigblock_rx_infobits;
+
 		// FAIL-BEFORE EVIDENCE: the PHY cw_ok producer (bigblock_rx_passband, the
 		// telecom_system->bigblock_last_rx_cw_ok array) forced ALL codewords clean even
 		// though bad_cw decoded corrupt (cw_info_ref==NULL on the 2-instance path). This
@@ -1603,7 +1610,7 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 			int sub_len_c = tsB->ldpc.K / 8;
 			int nbits_c   = K * sub_len_c * 8;
 			std::vector<int> dw((size_t)nbits_c, 0);
-			for(int i=0;i<nbits_c && i<(int)info_bits.size();i++) dw[i] = info_bits[i] & 1;
+			for(int i=0;i<nbits_c && i<(int)full_info.size();i++) dw[i] = full_info[i] & 1;
 			tsB->bigblock_whiten_bits(dw.data(), nbits_c);   // de-whiten (self-inverse)
 			std::vector<unsigned char> pl((size_t)K * sub_len_c, 0);
 			for(int c=0;c<K;c++)
@@ -1627,7 +1634,9 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		// RX carve: the wire CRC recompute (FAILURE-2 fix) runs on the de-whitened payload
 		// BEFORE the header-trust gate and DEMOTES the corrupted codeword in the carve's
 		// own cw_ok vector (the consumer the SACK reads — NOT the stale telecom array).
-		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)block_bsi_c);
+		// Carve from the dedicated full-decode member (heap-fix reconciliation), NOT the
+		// N_MAX-truncated `info_bits` out-copy.
+		int rc = B->bigblock_receive_carve(full_info.data(), (unsigned char)block_bsi_c);
 		bool wired = (rc == SUCCESSFUL);
 
 		// PASS-AFTER (the OBSERVABLE consumer effect of the carve's cw_ok==0 demotion):
