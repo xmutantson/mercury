@@ -7018,6 +7018,48 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	return Kcw;
 }
 
+long cl_telecom_system::bigblock_preamble_mf_snap(const std::complex<double>* bb_dec,
+                                                  int bb_dec_len, long coarse_dec,
+                                                  int pre_nSymb, int Nofdm, int Nc,
+                                                  int search_dec)
+{
+	// Build the DECIMATED reference preamble baseband EXACTLY as the TX did (symbol_mod of
+	// ofdm_preamble[].value) — the absolute level cancels in the normalized correlation, so
+	// only the per-sample SHAPE matters. ref_len = pre_nSymb*Nofdm decimated samples.
+	int ref_len = pre_nSymb * Nofdm;
+	if(ref_len <= 0 || bb_dec_len < ref_len) return coarse_dec;
+	std::vector<std::complex<double>> ref((size_t)ref_len);
+	{
+		std::vector<std::complex<double>> pre_grid((size_t)pre_nSymb*Nc);
+		for(int i=0;i<pre_nSymb*Nc;i++) pre_grid[i]=ofdm.ofdm_preamble[i].value;
+		for(int i=0;i<pre_nSymb;i++)
+			ofdm.symbol_mod(&pre_grid[(size_t)i*Nc], &ref[(size_t)i*Nofdm]);
+	}
+	double ref_e=0.0; for(int m=0;m<ref_len;m++) ref_e += std::norm(ref[m]);
+	if(ref_e < 1e-30) return coarse_dec;
+
+	// Search ±search_dec decimated samples around the SC coarse pick for the position that
+	// MAXIMIZES |<ref, rx>|^2 / (||ref||^2 * ||rx_window||^2) — normalized matched filter.
+	long lo = coarse_dec - search_dec; if(lo < 0) lo = 0;
+	long hi = coarse_dec + search_dec;
+	if(hi > bb_dec_len - ref_len) hi = bb_dec_len - ref_len;
+	double best_c = -1.0; long best_d = coarse_dec;
+	for(long d=lo; d<=hi; d++)
+	{
+		std::complex<double> acc(0,0); double rx_e=0.0;
+		for(int m=0;m<ref_len;m++)
+		{
+			std::complex<double> r = bb_dec[d+m];
+			acc += std::conj(ref[m]) * r;     // matched filter (mag => CFO-robust locally)
+			rx_e += std::norm(r);
+		}
+		double denom = ref_e * rx_e;
+		double c = (denom>1e-30) ? (std::norm(acc)/denom) : 0.0;
+		if(c > best_c){ best_c = c; best_d = d; }
+	}
+	return best_d;
+}
+
 int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
                                             int* out_infobits, int& K_out,
                                             std::vector<int>& cw_ok_out,
@@ -7059,15 +7101,36 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
 		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
 			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
-		long coarse_full = (long)coarse.delay * interp;
-		long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
-		long slice_size  = (long)(pre_nSymb+4)*sym_samples;
-		if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
-		TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
-			&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
-		head_delay  = slice_start + fine.delay;
-		head_metric = fine.correlation;
-		if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		// MATCHED-FILTER SNAP: disambiguate the Schmidl-Cox plateau (±~half-symbol noise-
+		// fragile argmax) by snapping the coarse decimated pick to the preamble matched-
+		// filter peak within ±1 symbol. Sharp single peak at the true start; recovers the
+		// spurious-lobe flip the SC argmax suffers under AWGN. Env-disable for A/B.
+		bool mfsnap = (std::getenv("MERCURY_BIGBLOCK_MFSNAP")==NULL || atoi(std::getenv("MERCURY_BIGBLOCK_MFSNAP"))!=0);
+		long coarse_dec = coarse.delay;
+		if(mfsnap)
+			coarse_dec = bigblock_preamble_mf_snap(bb_dec.data(), Nofdm*buf_syms,
+			                                       coarse.delay, pre_nSymb, Nofdm, Nc, Nofdm);
+		long coarse_full = (long)coarse_dec * interp;
+		if(mfsnap)
+		{
+			// The MF snap already locked the true preamble start at decimation resolution.
+			// SKIP the plateau-prone fine SC re-correlation (it re-flips to the spurious
+			// lobe inside its slice); the demod's pilot-EVM ±GI search recovers the
+			// sub-decimation residual. head_delay = the snapped full-rate start.
+			head_delay  = coarse_full;
+			head_metric = coarse.correlation;
+		}
+		else
+		{
+			long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
+			long slice_size  = (long)(pre_nSymb+4)*sym_samples;
+			if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
+			TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
+				&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
+			head_delay  = slice_start + fine.delay;
+			head_metric = fine.correlation;
+			if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		}
 	}
 	if(acq_metric_out) *acq_metric_out = head_metric;
 	if(head_delay < 0){
@@ -7492,16 +7555,40 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 		// Coarse (GI-stride, decimated) then fine (full-rate slice) — like receive_byte.
 		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
 			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
-		long coarse_full = (long)coarse.delay * interp;
-		// fine: re-correlate a small full-rate slice around the coarse peak
-		long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
-		long slice_size  = (long)(pre_nSymb+4)*sym_samples;
-		if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
-		TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
-			&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
-		head_delay  = slice_start + fine.delay;
-		head_metric = fine.correlation;
-		if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		// MATCHED-FILTER SNAP (see bigblock_preamble_mf_snap): disambiguate the Schmidl-Cox
+		// plateau (the noise-fragile ±half-symbol argmax flip that half-symbols the FFT
+		// window and kills the decode). Sharp single peak at the true preamble start.
+		bool mfsnap = (std::getenv("MERCURY_BIGBLOCK_MFSNAP")==NULL || atoi(std::getenv("MERCURY_BIGBLOCK_MFSNAP"))!=0);
+		long coarse_dec = coarse.delay;
+		if(mfsnap)
+			coarse_dec = bigblock_preamble_mf_snap(bb_dec.data(), Nofdm*buf_syms,
+			                                       coarse.delay, pre_nSymb, Nofdm, Nc, Nofdm);
+		long coarse_full = (long)coarse_dec * interp;
+		long fine_delay_dbg = -1;
+		if(mfsnap)
+		{
+			// MF snap locked the true start; SKIP the plateau-prone fine SC re-correlation
+			// (re-flips to the spurious lobe). Demod pilot-EVM ±GI recovers the residual.
+			head_delay  = coarse_full;
+			head_metric = coarse.correlation;
+		}
+		else
+		{
+			long slice_start = coarse_full - 2*sym_samples; if(slice_start<0) slice_start=0;
+			long slice_size  = (long)(pre_nSymb+4)*sym_samples;
+			if(slice_start+slice_size > buf_interp) slice_size = buf_interp - slice_start;
+			TimeSyncResult fine = ofdm.time_sync_preamble_halfsym(
+				&bb_interp[slice_start], (int)slice_size, interp, 1, 0.0, pre_nSymb);
+			head_delay  = slice_start + fine.delay; fine_delay_dbg = fine.delay;
+			head_metric = fine.correlation;
+			if(head_metric < coarse.correlation*0.5){ head_delay=coarse_full; head_metric=coarse.correlation; }
+		}
+		if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))
+			std::cout << "[DIAG-WAV-ACQ] coarse.delay=" << coarse.delay << " coarse_dec_snapped=" << coarse_dec
+			          << " coarse_full=" << coarse_full << " coarse.corr=" << coarse.correlation
+			          << " fine.delay=" << fine_delay_dbg << " head_delay=" << head_delay
+			          << " head_metric=" << head_metric
+			          << " sym_samples=" << sym_samples << std::endl;
 	}
 	if(head_delay < 0){
 		std::cout << "[BIGBLOCK-WAV] DECODE acquisition FAILED (no preamble found)" << std::endl;
@@ -7701,10 +7788,24 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 		double Hmag=0.0; for(int ci=0;ci<Ngrid*Nc;ci++){ std::complex<double> H=(ofdm.estimated_channel+ci)->value; Hmag+=std::abs(H);} Hmag/=(Ngrid*Nc);
 		double crms=0.0; for(int d=0;d<nData;d++) crms+=std::norm(deframed[d]); crms=sqrt(crms/(nData>0?nData:1));
 		double rxrms=0.0; int dn=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ rxrms+=std::norm(rx[(size_t)n*Nc+j]); dn++; } rxrms=sqrt(rxrms/(dn>0?dn:1));
+		// ACHIEVED per-subcarrier Es/N0: signal energy per data carrier (mean |H*X|^2 over
+		// pilots = noiseless per-SC symbol energy) over nv (per-SC noise variance). This is
+		// the axis the LDPC waterfall lives on (sfo_grid_test EsN0). Compares the passband
+		// validator's full-band Es/N0 LABEL to the per-SC Es/N0 the code actually sees.
+		double sig_sc=0.0; int pidx_d=0, npd=0;
+		for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+			std::complex<double> X=ofdm.pilot_configurator.sequence[pidx_d++];
+			std::complex<double> H=(ofdm.estimated_channel+n*Nc+j)->value;
+			sig_sc += std::norm(H)*std::norm(X); npd++; }
+		sig_sc = npd? sig_sc/npd : 0.0;
+		double nv_sc = ofdm.noise_variance_estimate;
+		double persc_esn0_db = (nv_sc>0.0)? 10.0*log10(sig_sc/nv_sc) : 999.0;
 		std::cout << "[DIAG-WAV] nv=" << ofdm.noise_variance_estimate
 		          << " mean|H|=" << Hmag
 		          << " deframed_rms=" << crms
-		          << " rx_data_rms=" << rxrms << std::endl;
+		          << " rx_data_rms=" << rxrms
+		          << " sig_per_SC=" << sig_sc
+		          << " achieved_perSC_EsN0_dB=" << persc_esn0_db << std::endl;
 	}
 
 	// --- LLR + CSI weighting + LDPC per codeword (mirrors sfo_grid_test coded) ---

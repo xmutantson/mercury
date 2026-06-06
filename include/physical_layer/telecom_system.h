@@ -562,6 +562,21 @@ public:
 	                         double* acq_metric_out = nullptr,
 	                         const std::vector<std::vector<int>>* cw_info_ref = nullptr);
 
+	// Big-block preamble matched-filter SNAP. The Schmidl-Cox autocorrelation metric is
+	// flat across the whole 4-symbol preamble plateau, so its (energy-weighted) argmax is
+	// noise-fragile and can flip to a spurious plateau lobe ~half a symbol off the true
+	// preamble start (DIAG bigblock-livepath-awgn-cliff §X). The pilot-EVM fine search
+	// cannot recover a >GI coarse error (and pilot-EVM is nearly blind to the sharp true
+	// timing peak). This SNAP cross-correlates the captured baseband (DECIMATED rate,
+	// Nofdm/sym) against the KNOWN reference preamble baseband over a small ±search_dec
+	// window around the SC coarse pick and returns the decimated position MAXIMIZING the
+	// normalized matched-filter magnitude — a SHARP single peak at the true preamble start
+	// (CFO-robust over the ~1-symbol local window). Returns the refined decimated start, or
+	// coarse_dec unchanged if no qualified peak. bb_dec/bb_dec_len: captured decimated bb.
+	long bigblock_preamble_mf_snap(const std::complex<double>* bb_dec, int bb_dec_len,
+	                               long coarse_dec, int pre_nSymb, int Nofdm, int Nc,
+	                               int search_dec);
+
 	// LIVE-PATH entry points (branched from transmit_byte/receive_byte when
 	// bigblock_framing_enabled). transmit_bigblock emits the block into out (raw
 	// passband, NO_FILTER_MESSAGE-style contiguous samples); receive_bigblock
