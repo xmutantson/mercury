@@ -3615,6 +3615,187 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 }
 
 
+// ============================================================================
+// STEP 2 — live send-path wiring for the big-block (P3 prereq).
+//
+// bigblock_send_one_block(): emit the current new-data batch as ONE big-block
+// instead of the per-frame preamble loop. Gated by send_batch() on
+// telecom_system->bigblock_framing_enabled (the CFG16-rung framing flag, default
+// OFF — FORCED true for this validation; the gearshift AUTO-election is DEFERRED
+// to P4). Returns true when it HANDLED the batch (the caller skips the per-frame
+// loop); false when it declined (caller falls through to the stock per-frame path
+// — e.g. MFSK, retx batch, control frame in the batch, or no DATA frames).
+//
+// §5 audit (data-flow-bigblock-arq-unit.md): this is the TX producer of the block.
+// It feeds the K codewords' REAL ARQ bytes via transmit_byte -> transmit_bigblock
+// (P2.1 payload arg). It does NOT touch the optimizer/gearshift authority
+// (optimizer_is_in_control arq.h:2041-2058, last_data_viable_config :2086,
+// anchor_consec_break_fails :2106, probe_backoff :2031). Retx stays STOCK CFG16
+// per-frame framing (P2.5) — this helper declines a retx batch.
+//
+// The per-codeword payload byte capacity (sub_len) = ldpc.K/8 (systematic info
+// bytes per LDPC codeword). The block carries K = bigblock_codeword_count()
+// codewords; the new-data batch packs min(K, message_batch_counter_tx) DATA
+// frames, each frame's application payload occupying one sub-codeword slot
+// (zero-padded to sub_len). The RX carve (bigblock_block_to_arq) is the exact
+// inverse (INV-6). The block's batch_seq_id = the batch's bsi (one block = one
+// batch, INV-1/P2.6).
+bool cl_arq_controller::bigblock_send_one_block()
+{
+	if(telecom_system == NULL) return false;
+	if(!telecom_system->bigblock_framing_enabled) return false;
+	if(telecom_system->M == MOD_MFSK) return false;
+	// Retx batches stay STOCK CFG16 per-frame framing (P2.5).
+	if(sack_retransmit_active) return false;
+	if(message_batch_counter_tx <= 0) return false;
+
+	// Only emit a block for an all-DATA new-data batch. A CONTROL/ACK frame mixed
+	// into the batch keeps the stock per-frame path (the block carries data only).
+	int n_data = 0;
+	for(int i=0;i<message_batch_counter_tx;i++)
+	{
+		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			n_data++;
+		else
+			return false;   // non-data frame present -> decline, stock path handles it
+	}
+	if(n_data <= 0) return false;
+
+	int K = telecom_system->bigblock_codeword_count();
+	if(K <= 0) return false;
+	if(n_data > K) return false;   // batch larger than the block can carry -> stock path
+
+	// sub_len = systematic info bytes per codeword (ldpc.K/8). The block payload is
+	// K*sub_len bytes; we fill the first n_data sub-codewords from the batch frames'
+	// application payloads and zero-pad the rest.
+	int sub_len = telecom_system->ldpc.K / 8;
+	if(sub_len <= 0) return false;
+	const int alloc_size = N_MAX / 8;
+	if(sub_len > alloc_size) sub_len = alloc_size;
+
+	long block_payload_len = (long)K * (long)sub_len;
+	std::vector<int>           block_payload((size_t)block_payload_len, 0);
+	std::vector<unsigned char> block_payload_bytes((size_t)block_payload_len, 0);
+	// the bsi the block advertises (one block = one batch). Use the first DATA
+	// frame's batch_seq_id (the new-data builder stamps every frame the same bsi);
+	// defensive 0 if unset.
+	int block_bsi = messages_batch_tx[0].batch_seq_id;
+	if(block_bsi < 0) block_bsi = 0;
+
+	for(int i=0;i<n_data && i<K;i++)
+	{
+		int len = messages_batch_tx[i].length;
+		if(len < 0) len = 0;
+		if(len > sub_len) len = sub_len;   // a frame longer than the sub-codeword is clamped
+		for(int j=0;j<len;j++)
+		{
+			unsigned char b = (unsigned char)messages_batch_tx[i].data[j];
+			block_payload[(size_t)i*sub_len + j]       = (int)b;
+			block_payload_bytes[(size_t)i*sub_len + j] = b;
+		}
+		// (remaining bytes of this sub-codeword already 0 = pad)
+	}
+
+	// Stash the TX block payload + geometry so the in-process single-block harness
+	// (and any RX in the same process) can carve it back byte-faithfully. The live
+	// RX carve uses the decoded info bits; the harness uses this stash as ground
+	// truth for the delivered==TX assertion (INV-6).
+	bigblock_tx_block_payload = block_payload_bytes;
+	bigblock_tx_block_K       = K;
+	bigblock_tx_block_sub_len = sub_len;
+	bigblock_tx_block_bsi     = (unsigned char)(block_bsi & 0xFF);
+	bigblock_tx_block_ndata   = n_data;
+
+	// Emit ONE big-block through the production transmit_byte (branches to
+	// transmit_bigblock when bigblock_framing_enabled). data = the K*sub_len real
+	// ARQ payload bytes; nBytes = block_payload_len (>0 so transmit_bigblock packs
+	// the real bytes, P2.1, NOT the PRBS fallback).
+	int active_nsymb = telecom_system->get_active_nsymb();
+	int frame_output_size = telecom_system->data_container.Nofdm
+		* telecom_system->data_container.interpolation_rate
+		* (active_nsymb + telecom_system->data_container.preamble_nSymb);
+	// the block is ~ (4 preamble + Ngrid) symbols; size the TX buffer generously.
+	int block_buf_samples = telecom_system->bigblock_tx_total_samples();
+	if(block_buf_samples <= 0) block_buf_samples = frame_output_size;
+	std::vector<double> block_pb((size_t)block_buf_samples + frame_output_size, 0.0);
+
+	telecom_system->transmit_byte(block_payload.data(), (int)block_payload_len,
+		block_pb.data(), NO_FILTER_MESSAGE);
+	int K_tx = telecom_system->bigblock_last_tx_K;
+	int n_tx = telecom_system->bigblock_last_tx_samples;
+	printf("[BIGBLOCK-TX] one-block emit: K=%d (n_data=%d) sub_len=%d bsi=%u "
+		"block_samples=%d\n", K_tx, n_data, sub_len, (unsigned)bigblock_tx_block_bsi, n_tx);
+	fflush(stdout);
+	if(K_tx <= 0 || n_tx <= 0) return false;
+
+	// Hand the raw block passband to the wire (one gapless transfer). The capture/
+	// drain pipeline (sim wire or radio playback) carries it as one acquisition.
+	tx_transfer(block_pb.data(), n_tx);
+
+	return true;
+}
+
+// bigblock_receive_carve(): the RX side of STEP 2. After receive_byte() branched
+// to receive_bigblock() and decoded ONE block (stashing the per-codeword clean
+// vector telecom_system->bigblock_last_rx_cw_ok + the K decoded info-bit
+// sub-units in data_byte_out), translate the block into the ARQ data unit via the
+// already-built+gated bigblock_block_to_arq() carve (P2.4/2.5/2.6): carve cw_ok ->
+// messages_rx[], set the synthetic EOB=K-1, fire one ACK / partial SACK / bsi-once.
+//
+// info_bits = the decoded systematic info bits receive_bigblock wrote to `out`
+// (K*ldpc.K of them); we re-pack them into K*sub_len bytes (sub_len = ldpc.K/8,
+// the same packing the TX used) so the carve is byte-faithful (INV-6). block_bsi
+// is the batch id the block advertises; on the live path the harness supplies it
+// (the block has one acquisition + no per-frame wire bit-7).
+//
+// §5 audit: this is the RX consumer wiring. It calls ONLY bigblock_block_to_arq
+// (already §5-audited) — it does NOT touch the optimizer/gearshift authority.
+// Returns SUCCESSFUL when the block was carved into the ARQ layer.
+int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
+		unsigned char block_bsi)
+{
+	if(telecom_system == NULL) return ERROR_;
+	int K = telecom_system->bigblock_last_rx_K;
+	if(K <= 0) return ERROR_;
+	int sub_len = telecom_system->ldpc.K / 8;
+	if(sub_len <= 0) return ERROR_;
+	const int alloc_size = N_MAX / 8;
+	if(sub_len > alloc_size) sub_len = alloc_size;
+
+	// the K-bit per-codeword clean vector (the SACK granularity).
+	const std::vector<int>& cw_ok_vec = telecom_system->bigblock_last_rx_cw_ok;
+	std::vector<int> cw_ok((size_t)K, 0);
+	for(int c=0;c<K;c++)
+		cw_ok[c] = (c < (int)cw_ok_vec.size()) ? (cw_ok_vec[c] ? 1 : 0) : 0;
+
+	// re-pack the decoded info bits -> K*sub_len bytes (LSB-first, the byte_to_bit
+	// convention transmit_bigblock used). info_bits may be null on a total acq miss.
+	std::vector<unsigned char> payload((size_t)K * sub_len, 0);
+	if(info_bits != NULL)
+	{
+		for(int c=0;c<K;c++)
+		{
+			for(int b=0;b<sub_len;b++)
+			{
+				unsigned char byte = 0;
+				for(int bit=0;bit<8;bit++)
+				{
+					int idx = (c*sub_len + b)*8 + bit;
+					if(info_bits[idx] & 1) byte |= (unsigned char)(1u << bit);
+				}
+				payload[(size_t)c*sub_len + b] = byte;
+			}
+		}
+	}
+
+	int rc = bigblock_block_to_arq(cw_ok.data(), K, block_bsi, payload.data(), sub_len);
+	printf("[BIGBLOCK-RX] carve: K=%d cw_ok_count=%d bsi=%u sub_len=%d rc=%d\n",
+		K, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi, sub_len, rc);
+	fflush(stdout);
+	return rc;
+}
+
+
 void cl_arq_controller::send(st_message* message, int message_location)
 {
 	printf("send()\n");
@@ -3788,6 +3969,77 @@ void cl_arq_controller::send_batch()
 
 	cl_timer ptt_on_delay, ptt_off_delay;
 	ptt_on_delay.start();
+
+	// STEP 2 — big-block live send path. When the CFG16-rung framing flag is set
+	// (FORCED true for this validation; gearshift AUTO-election DEFERRED to P4),
+	// emit the new-data batch as ONE big-block (one acquisition, K codewords) via
+	// transmit_byte -> transmit_bigblock instead of the per-frame preamble loop.
+	// Declines (returns false) for MFSK / retx / mixed-control batches, which fall
+	// through to the stock per-frame path below (byte-identical when the flag is
+	// off — the default). On a handled block, do the SAME post-TX bookkeeping the
+	// per-frame path does (ptt-off-delay, capture flush + unmute, ack timers,
+	// frames_to_read reset) and return.
+	if(bigblock_send_one_block())
+	{
+		ptt_busy_wait(ptt_on_delay, ptt_on_delay_ms);
+
+		if(g_verbose) { printf("[TX] big-block: waiting for playback buffer to drain...\n"); fflush(stdout); }
+		drain_playback_wait();
+		mtl::log_event("cmd_batch_last_sym_out");
+
+		// Unmute + flush right after playback drain (mirrors the per-frame tail).
+		circular_buf_reset(capture_buffer);
+		{
+			int buf_samples = telecom_system->data_container.Nofdm
+				* telecom_system->data_container.buffer_Nsymb
+				* telecom_system->data_container.interpolation_rate;
+			MUTEX_LOCK(&capture_prep_mutex);
+			memset(telecom_system->data_container.passband_delayed_data, 0,
+				2 * buf_samples * sizeof(double));
+			telecom_system->data_container.ring_write_index = 0;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+		}
+		mtl::log_event("cmd_ring_reset_done");
+		telecom_system->data_container.rx_mute = 0;
+		telecom_system->data_container.rx_mute_samples = 0;
+		mtl::log_event("cmd_post_tx_unmute");
+
+		ptt_off_delay.start();
+		ptt_busy_wait(ptt_off_delay, ptt_off_delay_ms);
+		ptt_off();
+		mtl::log_event("cmd_ptt_off");
+
+		// Post-TX bookkeeping: arm ack timers + PENDING_ACK on each DATA frame's
+		// owning messages_tx slot (SAME as the per-frame path), then clear the
+		// batch slots. The block is ONE batch -> the K frames PENDING_ACK on one ACK.
+		for(int i=0;i<message_batch_counter_tx;i++)
+		{
+			if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			{
+				int id = (int)(unsigned char)messages_batch_tx[i].id;
+				messages_tx[id].ack_timer.start();
+				messages_tx[id].status=PENDING_ACK;
+				if(messages_tx[id].ack_timeout == 0)
+					messages_tx[id].ack_timeout = ack_timeout_data;
+				if(messages_tx[id].nResends == 0)
+					messages_tx[id].nResends = nResends;
+			}
+			this->messages_batch_tx[i].ack_timeout=0;
+			this->messages_batch_tx[i].id=0;
+			this->messages_batch_tx[i].length=0;
+			this->messages_batch_tx[i].nResends=0;
+			this->messages_batch_tx[i].status=FREE;
+			this->messages_batch_tx[i].type=NONE;
+		}
+		message_batch_counter_tx=0;
+
+		telecom_system->data_container.frames_to_read =
+			telecom_system->data_container.preamble_nSymb;
+		printf("[TX-END-BIGBLOCK] frames_to_read=%d\n",
+			telecom_system->data_container.frames_to_read.load());
+		fflush(stdout);
+		return;
+	}
 
 	int active_nsymb = telecom_system->get_active_nsymb();
 	int frame_output_size = telecom_system->data_container.Nofdm*telecom_system->data_container.interpolation_rate*(active_nsymb+telecom_system->data_container.preamble_nSymb);
@@ -6406,6 +6658,32 @@ void cl_arq_controller::receive()
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
 				telecom_system->data_container.data_byte);
 		}
+
+		// STEP 2 — big-block RX carve. When the CFG16-rung framing flag is set and
+		// receive_byte branched to receive_bigblock (gated identically), the decode
+		// produced ONE block's K-bit cw_ok + the K decoded info-bit sub-units (in
+		// data_byte). Translate the block into the ARQ data unit via
+		// bigblock_receive_carve -> bigblock_block_to_arq (carve cw_ok -> messages_rx[],
+		// synthetic EOB, one ACK / partial SACK / bsi-once) and SKIP the per-frame
+		// messages_rx_buffer dispatch below (one acquisition = one carve, not K
+		// per-frame parses). Gated + default-off -> zero stock-path change. The block's
+		// bsi is the RSP's current-expected bsi (the block advertises one batch).
+		bool bigblock_rx_handled = false;
+		if(telecom_system->bigblock_framing_enabled
+			&& telecom_system->M != MOD_MFSK
+			&& is_ofdm_config(current_configuration)
+			&& telecom_system->bigblock_last_rx_K > 0)
+		{
+			int bsi = (rsp_current_expected_batch_seq_id >= 0)
+				? (rsp_current_expected_batch_seq_id & 0xFF) : 0;
+			bigblock_receive_carve(telecom_system->data_container.data_byte,
+				(unsigned char)bsi);
+			bigblock_rx_handled = true;
+			// the carve already populated messages_rx[] + advanced ARQ state; the
+			// per-frame parse path below keys on received_message_stats.message_decoded.
+			received_message_stats.message_decoded = NO;
+		}
+		(void)bigblock_rx_handled;
 
 		auto proc_end = std::chrono::steady_clock::now();
 		double proc_ms = std::chrono::duration<double, std::milli>(proc_end - proc_start).count();

@@ -933,3 +933,338 @@ int cl_arq_controller::test_bigblock_arq_unit()
 	fflush(stdout);
 	return all_pass ? 0 : 1;
 }
+
+// ============================================================================
+// STEP 3 — single-block end-to-end in the in-process 2-instance sim.
+//
+// CLI: --test-sim-inproc-bigblock
+//
+// Drives a SINGLE big-block through the PRODUCTION send/receive path, device-free
+// and deterministic, proving the block is ARQ-drivable end-to-end:
+//   CMD: pack K codewords of REAL ARQ bytes -> transmit_byte (branches to
+//        transmit_bigblock, P2.1) -> ONE block passband.
+//   CHANNEL: in-process clean loopback (the PROVEN PHY block path —
+//        bigblock_livepath_loopback decodes 8/8 byte-correct at 20 dB Es/N0; this
+//        harness uses the SAME window construction but channel-free so the carve
+//        is deterministic). The sustained MULTI-block rate over the paced wire is
+//        the HW/P3 deliverable (Option-b STOP); here ONE block = ONE ARQ unit,
+//        which the in-process path CAN do.
+//   RSP: receive_byte (branches to receive_bigblock) -> cw_ok + decoded info bits
+//        -> bigblock_receive_carve -> bigblock_block_to_arq: carve cw_ok ->
+//        messages_rx[], synthetic EOB, ONE ACK / partial SACK / bsi-once.
+//   ACK: the clean block emits an all-ones K-bit bitmap (0xFF); assert it MATCHES
+//        the CMD all_ones target (R-B: data_batch_size==K==8 on both peers ->
+//        all_ones == 0xFF == cw_ok bitmap) so the CMD credits the clean ACK.
+//
+// CASE A: clean single block -> CMD->RSP->ACK->CMD byte-faithful (delivered==TX).
+// CASE B: one bad codeword -> partial K-bit SACK + selective-repeat of EXACTLY
+//         that codeword; the retx fill completes the block K/K (byte-faithful).
+//
+// Optimizer/gearshift authority UNTOUCHED (no optimizer_is_in_control /
+// last_data_viable_config / anchor_consec_break_fails / probe_backoff access).
+// Returns 0 = PASS (both cases), 1 = FAIL.
+// ============================================================================
+int cl_arq_controller::test_sim_inproc_bigblock()
+{
+	printf("[TEST-SIM-BIGBLOCK] single-block end-to-end (CMD->RSP->ACK->CMD), "
+	       "production transmit_bigblock/receive_bigblock/bigblock_block_to_arq, "
+	       "in-process clean loopback (NO device/threads/TCP)\n");
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-SIM-BIGBLOCK] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	// Pin K = 8 deterministically (the production MERCURY_BIGBLOCK_K cap path), so
+	// the geometry source bigblock_codeword_count() and the TX/RX workers all agree.
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_BIGBLOCK_K", "8");
+#else
+	setenv("MERCURY_BIGBLOCK_K", "8", 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else           _putenv_s("MERCURY_BIGBLOCK_K", "");
+#else
+		if(had_prev_k) setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else           unsetenv("MERCURY_BIGBLOCK_K");
+#endif
+	};
+
+	// --- Build CMD (A) + RSP (B): real CFG16 grid + ARQ buffers + R-B batch pin.
+	cl_telecom_system* tsA = new cl_telecom_system();
+	cl_telecom_system* tsB = new cl_telecom_system();
+	cl_arq_controller* A   = new cl_arq_controller();
+	cl_arq_controller* B   = new cl_arq_controller();
+	A->telecom_system = tsA;
+	B->telecom_system = tsB;
+
+	auto bringup = [&](cl_arq_controller* a, cl_telecom_system* ts, int role) {
+		a->role            = role;
+		a->sack_enabled    = true;
+		a->sack_v2_enabled = true;
+		a->axis3_sack_mode = 1;            // SACK_MODE_ON
+		a->compression_enabled = false;
+		// The ctor NULLs the ARQ message buffers; production init() allocates them
+		// (init_messages_buffers) BEFORE any load_configuration. load_configuration(FULL)
+		// calls deinit_messages_buffers() -> check_buffer_canaries(), which dereferences
+		// message_TxRx_byte_buffer[alloc_size] — a NULL deref + crash if never allocated.
+		// So allocate ONCE here first (the FULL load deinits + re-inits them, harmless),
+		// exactly as test_bigblock_arq_unit Step 0 does.
+		a->nMessages          = 255;
+		a->max_data_length    = 170;
+		a->max_message_length = 200;
+		a->max_header_length  = 6;
+		a->init_messages_buffers();
+		a->load_configuration(CONFIG_16, FULL, YES);   // real CFG16 grid + buffers
+		ts->bigblock_framing_enabled = true;           // elect the CFG16-rung framing
+		// R-B pin: data_batch_size = K via the SHARED production election body
+		// (current_configuration == CONFIG_16, non-robust; flag set above).
+		a->sack_negotiated_recompute_batch(role==COMMANDER ? "CMD" : "RSP");
+	};
+	bringup(A, tsA, COMMANDER);
+	bringup(B, tsB, RESPONDER);
+
+	int K_a = tsA->bigblock_codeword_count();
+	int K_b = tsB->bigblock_codeword_count();
+	check(K_a == BB_TEST_K && K_b == BB_TEST_K, "S1 both peers K==8 (bigblock_codeword_count)");
+	check(A->data_batch_size == BB_TEST_K && B->data_batch_size == BB_TEST_K,
+	      "S2 both peers data_batch_size==K (R-B pin)");
+
+	const int K       = BB_TEST_K;
+	const int sub_len = tsA->ldpc.K / 8;     // production per-codeword byte capacity
+	const long total_tx_bytes = (long)K * sub_len;
+	printf("[TEST-SIM-BIGBLOCK] geometry: K=%d sub_len=%d total_tx_bytes=%ld\n",
+	       K, sub_len, total_tx_bytes);
+	fflush(stdout);
+
+	// --- Build the CMD new-data batch: K DATA_LONG frames of deterministic bytes.
+	const int block_bsi = 7;
+	A->message_batch_counter_tx = K;
+	std::vector<unsigned char> tx_truth((size_t)total_tx_bytes, 0);
+	for(int i=0;i<K;i++)
+	{
+		// messages_batch_tx[i].data is left NULL by init_messages_buffers (it ALIASES
+		// the owning messages_tx[i].data, which the production builder struct-copies
+		// from messages_tx). Mirror that: point .data at the real allocated buffer.
+		A->messages_batch_tx[i].data         = A->messages_tx[i].data;
+		A->messages_batch_tx[i].type         = DATA_LONG;
+		A->messages_batch_tx[i].id           = (char)(unsigned char)i;
+		A->messages_batch_tx[i].length       = sub_len;
+		A->messages_batch_tx[i].batch_seq_id = block_bsi;
+		A->messages_batch_tx[i].status       = ADDED_TO_BATCH_BUFFER;
+		for(int j=0;j<sub_len;j++)
+		{
+			unsigned char b = (unsigned char)((i*53 + j*17 + 3) & 0xFF);
+			A->messages_batch_tx[i].data[j]   = (char)b;
+			tx_truth[(size_t)i*sub_len + j]   = b;
+		}
+		// owning messages_tx slot (so the post-TX PENDING_ACK bookkeeping is valid).
+		A->messages_tx[i].status = ADDED_TO_BATCH_BUFFER;
+	}
+
+	// ====================================================================
+	// PHY block loopback (CMD transmit_bigblock -> clean wire -> RSP
+	// receive_bigblock). Modeled on bigblock_livepath_loopback (the proven
+	// 8/8 path) but channel-free (clean), so the carve is deterministic.
+	// We pack the K*sub_len real bytes and transmit ONE block via the
+	// PRODUCTION transmit_byte (branches to transmit_bigblock, P2.1).
+	// ====================================================================
+	auto run_block_loopback = [&](cl_telecom_system* tx, cl_telecom_system* rx,
+	                              const std::vector<unsigned char>& bytes,
+	                              std::vector<int>& info_bits_out) -> int {
+		int interp = tx->frequency_interpolation_rate;
+		int block_n = tx->bigblock_tx_total_samples();
+		if(block_n <= 0) return -1;
+		int lead_n  = (int)(100.0 * tx->sampling_frequency / 1000.0);
+		int trail_n = (int)(50.0  * tx->sampling_frequency / 1000.0);
+
+		// TX: pack real bytes -> transmit_byte -> transmit_bigblock.
+		std::vector<int> payload((size_t)bytes.size(), 0);
+		for(size_t i=0;i<bytes.size();i++) payload[i] = (int)bytes[i];
+		std::vector<double> tx_pb((size_t)block_n, 0.0);
+		tx->bigblock_framing_enabled = true;
+		tx->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		int K_tx = tx->bigblock_last_tx_K;
+		int n_tx = tx->bigblock_last_tx_samples;
+		if(K_tx <= 0 || n_tx <= 0) return -1;
+
+		// CHANNEL: clean loopback into the RX capture window [lead | block | trail].
+		int rx_window = lead_n + n_tx + trail_n;
+		std::vector<double> rx_pb((size_t)rx_window, 0.0);
+		for(int i=0;i<n_tx;i++) rx_pb[lead_n + i] = tx_pb[i];
+
+		// RX: size buffer_Nsymb to span the window, then receive_byte ->
+		// receive_bigblock (SAME construction as bigblock_livepath_loopback).
+		int Nofdm = rx->data_container.Nofdm;
+		int saved_buffer_Nsymb = rx->data_container.buffer_Nsymb;
+		if(Nofdm > 0)
+		{
+			int need_syms = (rx_window + Nofdm*interp - 1) / (Nofdm*interp);
+			rx->data_container.buffer_Nsymb = need_syms;
+			int exact = need_syms * Nofdm * interp;
+			if((int)rx_pb.size() < exact) rx_pb.resize((size_t)exact, 0.0);
+		}
+		info_bits_out.assign((size_t)(K_tx+1) * rx->ldpc.K + rx->ldpc.K, 0);
+		rx->bigblock_framing_enabled = true;
+		rx->receive_byte(rx_pb.data(), info_bits_out.data());
+		rx->data_container.buffer_Nsymb = saved_buffer_Nsymb;
+		return rx->bigblock_last_rx_K;
+	};
+
+	// ====================================================================
+	// CASE A — clean single block: CMD->RSP->ACK->CMD byte-faithful.
+	// ====================================================================
+	{
+		// reset RSP RX state.
+		B->rsp_current_expected_batch_seq_id = block_bsi;
+		B->rsp_prev_batch_seq_id             = -1;
+		B->rsp_prev_batch_active             = false;
+		B->rsp_prev_batch_received_count     = 0;
+		B->rsp_prev_batch_expected_count     = 0;
+		B->rsp_prev_batch_delivered_count    = 0;
+		B->retransmit_count                  = 0;
+		B->batch_rx_frame_count              = 0;
+		B->last_received_end_of_batch_seq    = -1;
+		for(int i=0;i<B->nMessages;i++)
+		{
+			B->messages_rx[i].status = FREE;
+			B->messages_rx[i].length = 0;
+			B->messages_rx[i].batch_seq_id = -1;
+		}
+		int bsi_before = B->rsp_current_expected_batch_seq_id;
+
+		std::vector<int> info_bits;
+		int K_rx = run_block_loopback(tsA, tsB, tx_truth, info_bits);
+		bool decoded = (K_rx == K);
+		int cw_ok_count = tsB->bigblock_last_rx_cw_ok_count;
+		bool all_clean = (cw_ok_count == K);
+
+		// RSP carve (production RX wiring).
+		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)bsi_before);
+		bool wired = (rc == SUCCESSFUL);
+
+		int recv      = B->bigblock_test_count_received(K);
+		int delivered = B->bigblock_test_delivered_bytes(K, sub_len, tx_truth.data());
+		int bsi_after = B->rsp_current_expected_batch_seq_id;
+		bool one_bump = (bsi_after == ((bsi_before + 1) & 0xFF));
+		bool all_recv = (recv == K);
+		bool all_bytes= (delivered == total_tx_bytes);
+
+		// ACK leg (R-B): the clean block emits all-ones K-bit 0xFF; the CMD all_ones
+		// target (data_batch_size==K==8) is 0xFF -> they MATCH -> clean ACK credited.
+		uint32_t rsp_bitmap = 0;
+		for(int c=0;c<K;c++) if(B->messages_rx[c].status==RECEIVED) rsp_bitmap |= (1u<<c);
+		uint32_t cmd_all_ones = (A->data_batch_size >= 32) ? 0xFFFFFFFFu
+		                       : ((1u << A->data_batch_size) - 1u);
+		bool ack_match = (rsp_bitmap == cmd_all_ones) && (rsp_bitmap == 0xFFu);
+		bool cmd_credits = cl_arq_controller::sack_clean_confirmation_accepted(
+		                     (unsigned char)bsi_before, /*is_all_ones=*/true,
+		                     /*last_applied_clean_bsi=*/-1, /*last_applied_sack_bsi=*/-1);
+
+		bool pass = decoded && all_clean && wired && all_recv && all_bytes
+		         && one_bump && ack_match && cmd_credits;
+		printf("[TEST-SIM-BIGBLOCK] CASE A clean: %s "
+			"(decoded=%d K_rx=%d cw_ok=%d/%d carve_rc=%d recv=%d/%d delivered=%d/%ld "
+			"bsi %d->%d one_bump=%d rsp_bitmap=0x%X cmd_all_ones=0x%X ack_match=%d "
+			"cmd_credits=%d)\n",
+			pass ? "PASS" : "FAIL", (int)decoded, K_rx, cw_ok_count, K, rc, recv, K,
+			delivered, total_tx_bytes, bsi_before, bsi_after, one_bump,
+			(unsigned)rsp_bitmap, (unsigned)cmd_all_ones, ack_match, cmd_credits);
+		fflush(stdout);
+		if(pass) check(true, "CASE A single big-block ARQ-drives CMD->RSP->ACK->CMD byte-faithful");
+		else     check(false,"CASE A single big-block ARQ-drives CMD->RSP->ACK->CMD byte-faithful");
+	}
+
+	// ====================================================================
+	// CASE B — one bad codeword: partial K-bit SACK + selective-repeat of
+	// EXACTLY that codeword; the retx fill completes the block K/K.
+	// ====================================================================
+	{
+		const int bad_cw = 3;
+		const int block_bsi_b = 9;
+		B->rsp_current_expected_batch_seq_id = block_bsi_b;
+		B->rsp_prev_batch_seq_id             = -1;
+		B->rsp_prev_batch_active             = false;
+		B->rsp_prev_batch_received_count     = 0;
+		B->rsp_prev_batch_expected_count     = 0;
+		B->retransmit_count                  = 0;
+		B->batch_rx_frame_count              = 0;
+		B->last_received_end_of_batch_seq    = -1;
+		for(int i=0;i<B->nMessages;i++)
+		{
+			B->messages_rx[i].status = FREE;
+			B->messages_rx[i].length = 0;
+			B->messages_rx[i].batch_seq_id = -1;
+		}
+
+		std::vector<int> info_bits;
+		int K_rx = run_block_loopback(tsA, tsB, tx_truth, info_bits);
+		bool decoded = (K_rx == K);
+
+		// Inject one bad codeword DETERMINISTICALLY: clear cw_ok[bad_cw] before the
+		// carve (the carve reads telecom_system->bigblock_last_rx_cw_ok). This is the
+		// same one-clear-bit injection the unit test CASE2 uses, but driven through
+		// the real PHY decode + the real RX carve wiring.
+		if((int)tsB->bigblock_last_rx_cw_ok.size() > bad_cw)
+			tsB->bigblock_last_rx_cw_ok[bad_cw] = 0;
+		tsB->bigblock_last_rx_cw_ok_count = K - 1;
+
+		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)block_bsi_b);
+		bool wired = (rc == SUCCESSFUL);
+
+		int recv_partial = B->bigblock_test_count_received(K);
+		bool bad_absent  = (B->messages_rx[bad_cw].status != RECEIVED);
+		bool partial_ok  = (recv_partial == K - 1) && bad_absent;
+		bool one_retx    = (B->retransmit_count == 1);
+		bool retx_pos_ok = one_retx && (B->retransmit_frame_positions[0] == bad_cw)
+		                && (B->retransmit_frame_batch_seq_ids[0] == block_bsi_b);
+		bool no_bump     = (B->rsp_current_expected_batch_seq_id == block_bsi_b);
+
+		// Model the selective-repeat arrival: the retx of EXACTLY the bad codeword
+		// fills the gap (what the stock CFG16 per-frame retx path does on RX).
+		if(wired && partial_ok && one_retx)
+		{
+			int loc = bad_cw;
+			B->messages_rx[loc].type            = DATA_LONG;
+			B->messages_rx[loc].id              = (char)(unsigned char)loc;
+			B->messages_rx[loc].length          = sub_len;
+			B->messages_rx[loc].status          = RECEIVED;
+			B->messages_rx[loc].batch_seq_id    = block_bsi_b;
+			B->messages_rx[loc].sequence_number = (char)(unsigned char)loc;
+			for(int j=0;j<sub_len;j++)
+				B->messages_rx[loc].data[j] = (char)tx_truth[(size_t)loc*sub_len + j];
+		}
+
+		int recv_full = B->bigblock_test_count_received(K);
+		int delivered = B->bigblock_test_delivered_bytes(K, sub_len, tx_truth.data());
+		bool full_ok  = (recv_full == K) && (delivered == total_tx_bytes);
+
+		bool pass = decoded && wired && partial_ok && one_retx && retx_pos_ok
+		         && no_bump && full_ok;
+		printf("[TEST-SIM-BIGBLOCK] CASE B one-bad-cw=%d: %s "
+			"(decoded=%d carve_rc=%d partial=%d/%d bad_absent=%d retx_count=%d "
+			"retx_pos_ok=%d no_bump=%d full=%d/%d delivered=%d/%ld)\n",
+			bad_cw, pass ? "PASS" : "FAIL", (int)decoded, rc, recv_partial, K,
+			bad_absent, B->retransmit_count, retx_pos_ok, no_bump, recv_full, K,
+			delivered, total_tx_bytes);
+		fflush(stdout);
+		check(pass, "CASE B one-bad-codeword partial -> selective-repeat completes block in-sim");
+	}
+
+	delete A; delete B;
+	delete tsA; delete tsB;
+	restore_env();
+
+	printf("[TEST-SIM-BIGBLOCK] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}

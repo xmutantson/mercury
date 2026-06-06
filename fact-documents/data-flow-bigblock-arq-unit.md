@@ -536,3 +536,95 @@ untouched):
 **Commits** (bisectable, per P4): the P2.0 audit+failing-test anchor is `d7eaf1f`; this
 build is a SEPARATE commit on `feat/bigblock-livepath-p2` (PHY-wiring + ARQ
 granularization). NO monitor merge, NO push, NO Claude/Anthropic attribution.
+
+---
+
+## §10 Implementation record — STEP 2/3 LIVE SEND-PATH WIRING (P3 prereq)
+
+**Built on** the integration tree `integ/bigblock-merge-2026-06-05` (merge of
+`feat/bigblock-sack-gate-p1` + `feat/bigblock-livepath-p2-diag` off
+`feat/bigblock-livepath-p2 @269942e`). STEP 1 (merge + gate re-verify) was the prior
+turn; THIS section is the STEP 2 (wire `send_batch`↔block) + STEP 3 (in-sim single-block
+end-to-end) deliverable. The `bigblock_framing_enabled` flag is FORCED true for
+validation; the gearshift AUTO-election is DEFERRED to P4 (NOT in this commit).
+
+**Files changed** (4 — telecom_system.cc UNCHANGED, so the PHY is byte-identical):
+- `source/datalink_layer/arq_common.cc`:
+  - `bigblock_send_one_block()` (NEW) — TX producer of the block. Packs the K=8
+    new-data frames' REAL ARQ payload bytes (`messages_batch_tx[i].data[0..length-1]`,
+    sub_len = `ldpc.K/8`) into ONE block payload and emits it via the PRODUCTION
+    `transmit_byte` → `transmit_bigblock` (P2.1 real-bytes arg) + one `tx_transfer`.
+    DECLINES (returns false → stock per-frame path) for MFSK / retx
+    (`sack_retransmit_active`) / mixed-control / oversized batches → retx stays STOCK
+    CFG16 per-frame (P2.5, INV-3).
+  - `send_batch()` — gated branch `if(bigblock_send_one_block())` right after `ptt_on`:
+    on a handled block, runs the SAME post-TX bookkeeping as the per-frame tail
+    (drain + capture-flush + unmute + ptt-off, then ack-timer/`PENDING_ACK` per DATA
+    frame's owning `messages_tx` slot, then clears `messages_batch_tx` + resets
+    `frames_to_read`) and returns. Default-OFF → the stock loop is byte-identical.
+  - `bigblock_receive_carve()` (NEW) — RX consumer wiring. Re-packs the K decoded
+    info-bit sub-units (LSB-first, the TX pack's inverse) into K*sub_len bytes and
+    calls the already-§5-audited `bigblock_block_to_arq()` (carve cw_ok→messages_rx[],
+    synthetic EOB=K-1, one ACK / partial SACK / bsi-once).
+  - `receive()` — gated branch after `receive_byte` returns: when
+    `bigblock_framing_enabled && M!=MFSK && is_ofdm_config && bigblock_last_rx_K>0`,
+    calls `bigblock_receive_carve` and SKIPs the per-frame `messages_rx_buffer`
+    dispatch (one acquisition = one carve, not K per-frame parses). Default-OFF.
+- `include/datalink_layer/arq.h` — decls for the three new methods + the TX block
+  stash (`bigblock_tx_block_payload/K/sub_len/bsi/ndata`) + `test_sim_inproc_bigblock`;
+  `#include <vector>` made explicit.
+- `source/datalink_layer/test_bigblock_arq_unit.cc` — `test_sim_inproc_bigblock()`
+  (STEP 3 harness): two real instances (CMD A + RSP B), CFG16 grid + R-B pin
+  (`data_batch_size==K==8` on both via the shared `sack_negotiated_recompute_batch`),
+  drives the PRODUCTION `transmit_bigblock` (real 1400 bytes) → clean PHY block
+  loopback (the PROVEN bigblock_livepath path, channel-free for determinism) →
+  `receive_bigblock` → `bigblock_receive_carve`/`bigblock_block_to_arq` → ACK-GATE /
+  R-B clean-ACK match. CASE A clean = byte-faithful CMD→RSP→ACK→CMD; CASE B one-bad-cw
+  = partial SACK + selective-repeat completes.
+- `source/main.cc` — `--test-sim-inproc-bigblock` flag + dispatch.
+
+**§5 audit — the NEW producers/consumers (walk):**
+1. **TX producer `messages_batch_tx[]` → block payload** (`bigblock_send_one_block`).
+   READS `messages_batch_tx[i].data/length` (the per-frame app payload the new-data
+   builder filled). Does NOT change `messages_batch_tx` (read-only feed). The block's
+   bsi = `messages_batch_tx[0].batch_seq_id` (one block = one batch, INV-1). The
+   post-TX `messages_tx[id].status=PENDING_ACK` bookkeeping is byte-identical to the
+   per-frame tail (same loop). ✓
+2. **RX consumer `bigblock_last_rx_cw_ok` → `messages_rx[]`** (`bigblock_receive_carve`
+   → `bigblock_block_to_arq`). The carve is the EXACT P2.4/2.5/2.6 body already audited
+   (§1.2/§1.7/§2.2/§2.5). The live `receive()` skips the per-frame parse on a handled
+   block (sets `received_message_stats.message_decoded=NO`) so the K-per-frame
+   `add_message_rx_data` writes do NOT double-fire. ✓
+3. **EOB / bsi** — set by `bigblock_block_to_arq` (synthetic EOB=K-1 BEFORE prev-sizing,
+   INV-4; bsi bump ONCE on a clean block, INV-1). The live RX carve passes
+   `rsp_current_expected_batch_seq_id` as the block bsi (the block has no per-frame wire
+   bit-7 to carry it). **[?] P3:** the wire-carried bsi for a block (so CMD/RSP cannot
+   drift the block bsi across a multi-block session) is a P3/HW detail — the single-block
+   in-sim path uses the expected bsi, which is correct for ONE block. ✓ for single-block.
+4. **Optimizer/gearshift authority** — `optimizer_is_in_control` (`arq.h:2041-2058`),
+   `last_data_viable_config` (`:2086`), `anchor_consec_break_fails` (`:2106`),
+   `probe_backoff` (`:2031`) — NONE referenced by the new code (grep-verified). No
+   bundle=bug. `--test-climb-engine` ALL PASS (0 failures). ✓
+
+**Verification (all green):**
+- `--test-sim-inproc-bigblock` → ALL PASS (rc=0): **CASE A clean** decoded=1 K_rx=8
+  cw_ok=8/8 recv=8/8 **delivered=1400/1400 byte-faithful** bsi 7→8 one_bump=1
+  rsp_bitmap=0xFF==cmd_all_ones=0xFF (R-B) ack_match=1 cmd_credits=1; **CASE B**
+  one-bad-cw=3 partial=7/8 bad_absent=1 retx_count=1 at pos 3 + bsi=9 no_bump=1 →
+  selective-repeat fill → full=8/8 **delivered=1400/1400**.
+- `--test-bigblock-arq-unit` → 8/8 (T1-T9, incl T6 election-symmetry). rc=0.
+- `--test-climb-engine` ALL PASS (0 failures); `--test-sim-clock` 0 failed.
+  `--test-partial-bsi-advance=ofdm` + `=mfsk` PASS — stock per-frame path no regression.
+- bigblock LIVE validator (`MERCURY_BIGBLOCK_LIVE=1 -m PLOT_PASSBAND -s 16`) → 8/8
+  byte-correct, post_FEC_BER=0 — PHY no regression (telecom_system.cc unchanged).
+
+**GO/NO-GO:** the big-block IS ARQ-drivable end-to-end — a SINGLE block ARQ-drives
+CMD→RSP→ACK→CMD byte-faithful in the in-process sim, the clean ACK matches via R-B
+(0xFF==0xFF), and a one-bad-codeword partial completes via selective-repeat. All merge
+gates remain green. READY for P3 HW (deploy + sustained transfer + compress-on vs VARA).
+The sustained MULTI-block delivered RATE over the paced/real wire is the P3/HW
+deliverable (Option-b STOP) — NOT attempted here (one block = one ARQ unit in-sim).
+
+**Commit** (bisectable, per P4): a SEPARATE commit on `integ/bigblock-merge-2026-06-05`
+ON TOP of the two merge commits (so the merge and the send-path wiring are distinct).
+NO monitor merge, NO push, NO Claude/Anthropic attribution.

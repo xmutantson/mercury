@@ -365,6 +365,9 @@ int main(int argc, char *argv[])
                                         // 3 cases (clean K=8 / one-bad-cw / lost-EOB). MUST FAIL before P2 wiring (the
                                         // bigblock_block_to_arq stub returns BIGBLOCK_ARQ_NOT_WIRED), PASS after.
                                         // One-shot at startup, then exit rc. See fact-documents/data-flow-bigblock-arq-unit.md §6.
+    bool test_sim_inproc_bigblock_cli = false; // --test-sim-inproc-bigblock: STEP 3 single-block end-to-end in the
+                                        // in-process 2-instance sim (CMD->RSP->ACK->CMD byte-faithful + one-bad-cw
+                                        // partial -> selective-repeat completes). One-shot at startup, then exit rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -845,6 +848,14 @@ int main(int argc, char *argv[])
             // fact-documents/data-flow-bigblock-arq-unit.md §6. FAILS before P2
             // wiring (the bigblock_block_to_arq stub), PASSES after.
             test_bigblock_arq_unit_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sim-inproc-bigblock") == 0)
+        {
+            // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
+            // One-shot at startup, then exit rc.
+            test_sim_inproc_bigblock_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1941,6 +1952,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_bigblock_arq_unit();
             printf("[FLAG] Bigblock-arq-unit test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_sim_inproc_bigblock_cli) {
+            // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
+            // Drives the production transmit_bigblock/receive_bigblock/
+            // bigblock_block_to_arq path: a single big-block ARQ-drives
+            // CMD->RSP->ACK->CMD byte-faithful + a one-bad-codeword partial ->
+            // selective-repeat completes. One-shot at startup, then exit rc.
+            printf("[FLAG] --test-sim-inproc-bigblock: invoking single-block "
+                   "end-to-end in-process sim\n");
+            fflush(stdout);
+            int rc = ARQ.test_sim_inproc_bigblock();
+            printf("[FLAG] Sim-inproc-bigblock test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

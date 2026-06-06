@@ -27,6 +27,7 @@
 #include "common/sim_clock.h"
 #include <unistd.h>
 #include <cstdint>
+#include <vector>
 #include "tcp_socket.h"
 #include "fifo_buffer.h"
 #include "physical_layer/telecom_system.h"
@@ -1331,6 +1332,40 @@ public:
   // it PASSES (bisectable, see fact-doc §6).
   int bigblock_block_to_arq(const int* cw_ok, int K, unsigned char block_bsi,
                             const unsigned char* tx_payload, int sub_len);
+
+  // ---- STEP 2: live send-path wiring (P3 prereq, see arq_common.cc) ----------
+  // bigblock_send_one_block(): emit the current new-data batch as ONE big-block
+  // via transmit_byte -> transmit_bigblock (gated on
+  // telecom_system->bigblock_framing_enabled; FORCED true for validation, AUTO-
+  // election DEFERRED to P4). Returns true when it HANDLED the batch (caller skips
+  // the per-frame loop); false when it declined (MFSK / retx / mixed-control /
+  // oversized batch -> stock per-frame path). Retx stays STOCK CFG16 per-frame.
+  bool bigblock_send_one_block();
+  // bigblock_receive_carve(): the RX side — after receive_byte()->receive_bigblock()
+  // decoded ONE block (stashing telecom_system->bigblock_last_rx_cw_ok + the K
+  // decoded info-bit sub-units in `info_bits`), translate it into the ARQ data unit
+  // via bigblock_block_to_arq() (carve cw_ok -> messages_rx[], synthetic EOB, one
+  // ACK / partial SACK / bsi-once). Returns the bigblock_block_to_arq rc.
+  int bigblock_receive_carve(const int* info_bits, unsigned char block_bsi);
+  // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
+  // block carried + its geometry, so the in-process single-block harness can carve
+  // it back byte-faithfully (the delivered==TX ground truth, INV-6).
+  std::vector<unsigned char> bigblock_tx_block_payload;
+  int           bigblock_tx_block_K       = 0;
+  int           bigblock_tx_block_sub_len = 0;
+  unsigned char bigblock_tx_block_bsi     = 0;
+  int           bigblock_tx_block_ndata   = 0;
+
+  // ---- STEP 3: single-block end-to-end in the 2-instance in-process sim -------
+  // test_sim_inproc_bigblock(): a dedicated single-block 2-instance ARQ harness
+  // (CMD + RSP, pinned CFG16-bigblock). Drives the PRODUCTION send-path
+  // (bigblock_send_one_block -> transmit_byte -> transmit_bigblock) through the
+  // PROVEN PHY block loopback into the RSP's receive_byte -> receive_bigblock ->
+  // bigblock_receive_carve, then the ACK-GATE / clean-ACK match (R-B). Asserts a
+  // single block ARQ-drives CMD->RSP->ACK->CMD byte-faithful, plus a one-bad-
+  // codeword partial -> selective-repeat completes the block. Returns 0=PASS.
+  // Optimizer/gearshift authority UNTOUCHED. CLI: --test-sim-inproc-bigblock.
+  int test_sim_inproc_bigblock();
 
   // In-process big-block ARQ-granularization regression (one-shot, then exit rc).
   // CLI: --test-bigblock-arq-unit. THREE cases per fact-doc §6:
