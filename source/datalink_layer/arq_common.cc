@@ -6904,6 +6904,46 @@ void cl_arq_controller::receive()
 			// the carve already populated messages_rx[] + advanced ARQ state; the
 			// per-frame parse path below keys on received_message_stats.message_decoded.
 			received_message_stats.message_decoded = NO;
+
+			// PARTIAL-BLOCK FIX (bigblock-whiten-align): a big-block is ONE acquisition of
+			// the WHOLE K-codeword block (preamble + Ngrid data symbols, ~64 sym). The
+			// snapshot fires when frames_to_read==0, and message_decoded is forced NO above
+			// so the stock per-frame success re-arm (this function, ~line 7041) does NOT run.
+			// Re-arm frames_to_read to span a FULL next block so the next snapshot waits for
+			// the complete block (otherwise it fires after one stock frame's worth of symbols
+			// and the late codewords read silence -> CRC-fail -> 0 delivered). Also zero the
+			// just-decoded block region in the ring so its preamble/pilots can't false-trigger
+			// the next Schmidl-Cox acquisition (the stock zeroing at ~line 6972 is gated on
+			// message_decoded==YES, which we cleared).
+			{
+				int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+				if(block_nsymb > 0)
+				{
+					MUTEX_LOCK(&capture_prep_mutex);
+					int sp = signal_period;
+					// Zero the WHOLE ring after a block decode. The just-decoded block (its
+					// preamble + data) sits somewhere in this window; any residual OFDM
+					// structure (preamble autocorr, pilots) would false-trigger the NEXT
+					// block's Schmidl-Cox acquisition and make it lock the wrong offset
+					// (observed: block 2 acquired on block 1's stale preamble -> garbage
+					// payload, every codeword CRC-fail). One acquisition == one block, so a
+					// full wipe is correct (unlike the stock per-frame path, which keeps
+					// trailing batch frames). The next block re-accumulates from silence.
+					for(int k = 0; k < sp; k++)
+					{
+						telecom_system->data_container.passband_delayed_data[k] = 0.0;
+						telecom_system->data_container.passband_delayed_data[k + sp] = 0.0;
+					}
+					// NOTE: do NOT reset ring_write_index — the capture-prep feed keeps
+					// advancing it; resetting it mid-stream desyncs the next block's write
+					// position and the acquisition lands on a misaligned window.
+					telecom_system->data_container.frames_to_read = block_nsymb + 10;
+					telecom_system->data_container.nUnder_processing_events = 0;
+					telecom_system->receive_stats.ofdm_search_raw = 0;
+					telecom_system->receive_stats.ofdm_batch_active = false;
+					MUTEX_UNLOCK(&capture_prep_mutex);
+				}
+			}
 		}
 		(void)bigblock_rx_handled;
 

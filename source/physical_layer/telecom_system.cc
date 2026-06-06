@@ -8070,6 +8070,23 @@ int cl_telecom_system::bigblock_tx_total_samples()
 	return total;
 }
 
+int cl_telecom_system::bigblock_rx_block_nsymb()
+{
+	// USE-AFTER-FREE / PARTIAL-BLOCK FIX (bigblock-whiten-align): symbols ONE big-block
+	// spans on the wire = preamble_nSymb + Ngrid (the thin-grid data-symbol count for the
+	// WHOLE K-codeword block). The live RX arms frames_to_read to this so the decode
+	// snapshot fires only AFTER the full block is captured (mirrors bigblock_tx_total_samples
+	// which returns the SAME extent in samples: (Nofdm*pre + Nofdm*Ngrid)*interp). Geometry-
+	// only: rebuild thin grid -> read Ngrid -> restore stock CFG16.
+	if(M == MOD_MFSK) return 0;
+	int pre_nSymb = data_container.preamble_nSymb;
+	int Ngrid=0, log2M=0, nBits=0;
+	bigblock_rebuild_thin_grid(Ngrid, log2M, nBits);
+	bigblock_restore_stock_config();
+	if(Ngrid <= 0) return 0;
+	return pre_nSymb + Ngrid;
+}
+
 int cl_telecom_system::bigblock_codeword_count()
 {
 	// SACK-GATE P1 (R-B): the big-block codeword count K at the current CFG16 rung.
@@ -8201,6 +8218,37 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	int interp = frequency_interpolation_rate;
 	int nSamples = data_container.Nofdm * data_container.buffer_Nsymb * interp;
 	if(nSamples <= 0) nSamples = (bigblock_last_tx_samples > 0) ? bigblock_last_tx_samples : 0;
+
+	// USE-AFTER-FREE ROOT-CAUSE FIX (bigblock-whiten-align): `data` is the caller's
+	// data_container.ready_to_process_passband_delayed_data (live ARQ path,
+	// arq_common.cc:6864). Below we derive K via bigblock_rebuild_thin_grid +
+	// bigblock_restore_stock_config — and restore_stock_config calls load_configuration,
+	// which DEINITS+REINITS the data_container, FREEING and REALLOCATING
+	// ready_to_process_passband_delayed_data. That left `data` DANGLING (points at freed
+	// memory), so the subsequent rx_passband_normalize_and_blank(data,...) read freed/
+	// re-used heap → SIM_INPROC SIGSEGV / HW silent garbage decode (wire_bsi=159, every
+	// per-codeword CRC fails → PARTIAL clean=0 → 0 app bytes delivered). The standalone
+	// BIGBLOCK_LIVE validator + the CASE A-D unit tests never hit this: they hand a
+	// caller-owned std::vector as `data` (NOT the data_container buffer), so the realloc
+	// could not dangle it. Snapshot the captured passband into a stable LOCAL buffer NOW,
+	// before any rebuild/restore can move the data_container allocation, and run the whole
+	// decode (normalize + bigblock_rx_passband) against the snapshot. nSamples doubles are
+	// in-bounds here (data is sized Nofdm*buffer_Nsymb*interp at the live config, == nSamples).
+	// REPRODUCER HOOK (bigblock-whiten-align): MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1 SKIPS this
+	// snapshot (restores the pre-fix dangling-`data` use-after-free) for the standalone UAF
+	// fail-before demo. The full-path regression (test_sim_inproc_bigblock_fullpath) does
+	// NOT set this — a UAF SEGV would abort the whole test process before the pass-after arm
+	// — it sets MERCURY_BIGBLOCK_DEFEAT_FIX (the partial-block bug, a clean non-crashing
+	// 0-delivery) instead. The UAF fail-before is independently evidenced by the crash this
+	// hook reproduces. Production never sets either.
+	bool defeat_uaf = false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_FIX_UAF"); if(e && *e && atoi(e)!=0) defeat_uaf = true; }
+	std::vector<double> data_snapshot;
+	if(!defeat_uaf && data != NULL && nSamples > 0)
+	{
+		data_snapshot.assign(data, data + nSamples);
+		data = data_snapshot.data();   // all readers below use the stable copy
+	}
 
 	// decoded info bits land here (carved into K sub-units by the caller in P2). Size
 	// for the BIG-BLOCK K (= thin-grid nBits/ldpc.N), NOT the stock config's nBits —

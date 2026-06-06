@@ -739,3 +739,41 @@ tolerance — the faithfulness gap (in-sim green while live-overrunning) is clos
 production data-flow now trips on any mis-sizing. (Fix branch `fix/bigblock-cfg16-heap-overrun`
 off `integ/bigblock-merge-2026-06-05`@`fe9d3e3`; net-PHY 7859/7960 > VARA 7050 preserved — a
 buffer-sizing/free correction, not a wire-format change.)
+
+## §16. SIM-FAITHFULNESS GAP CLOSED (again) — CASE A-D ran GREEN while the LIVE big-block delivered 0 app bytes (2026-06-05)
+
+Same shape as §15 (in-sim green / live broken), a different live-only defect class. The CFG16
+big-block CASE A-D unit tests (`--test-sim-inproc-bigblock`) and the standalone `BIGBLOCK_LIVE`
+validator all passed byte-correct, yet the LIVE 2-instance ARQ session delivered **0 of the app
+bytes** (HW + SIM_INPROC). Root causes (full detail in `data-flow-bigblock-arq-unit.md` §15):
+1. **Use-after-free** in `receive_bigblock`: `bigblock_restore_stock_config()` reallocs
+   `ready_to_process_passband_delayed_data` while the caller's `data` pointer still aims at the
+   freed buffer -> normalize reads freed heap (SIGSEGV in SIM_INPROC, garbage decode on HW).
+2. **Partial-block decode**: the live RX arms `frames_to_read` for ONE stock frame (~13 sym) but
+   the block is ~64 sym, so the decode snapshots before the late codewords arrive (cw0 clean,
+   cw1..K-1 garbage).
+3. **Missing FIFO delivery**: the CLEAN-block carve left slots `RECEIVED` and never called
+   `copy_data_to_buffer()`, so bytes never reached `fifo_buffer_rx`.
+
+**Why CASE A-D / BIGBLOCK_LIVE stayed green** (the faithfulness gap):
+- They hand a **caller-owned `std::vector`** as the RX passband `data` (not the data_container
+  buffer), so the `receive_bigblock` realloc could never dangle it -> the UAF was invisible.
+- They drive **one `receive_bigblock` directly** on a window pre-sized to span the whole block, so
+  the live per-block `frames_to_read` wait (and the partial-block decode) was never exercised.
+- They assert on **`messages_rx[]` directly** (`bigblock_test_delivered_varlen` / `count_received`),
+  so the missing `copy_data_to_buffer` FIFO push was invisible.
+
+**Closed by a new SIM_INPROC full-path case** — `--test-bigblock-fullpath`
+(`cl_arq_controller::test_sim_inproc_bigblock_fullpath`). It runs the 2-instance lockstep stepper
+(`test_sim_inproc_2`) pinned at CFG16 with big-block framing on, driving the REAL
+`transmit_byte`/`transmit_bigblock` -> wire/capture ring -> `receive_byte`/`receive_bigblock` ->
+`bigblock_receive_carve` -> `bigblock_block_to_arq` -> `copy_data_to_buffer` -> `fifo_buffer_rx`,
+and asserts the FULL message is delivered byte-faithful (`rx_have==payload_len`, `bytes_ok=1`,
+first block clean=K/K). FAIL-BEFORE/PASS-AFTER on the SAME binary via `MERCURY_BIGBLOCK_DEFEAT_FIX=1`
+(+ `MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK=1` to break right after the first partial block, avoiding the
+slow/unstable post-partial retry loop). Result: fail-before first_clean=1/8 rx=0; pass-after
+first_clean=8/8 rx=1200/1200; ALL PASS. The SIM_INPROC big-block transfer now routes through the
+SAME `receive_bigblock` + carve + whiten the production HW path uses, so a sim pass predicts HW.
+
+(Fix branch `fix/bigblock-whiten-align` off `integ/bigblock-final-2026-06-05`@`c746064`. Net-PHY
+UNCHANGED — buffer-lifetime + RX-wait + FIFO-delivery, not geometry; > VARA 7050 preserved.)

@@ -1033,3 +1033,102 @@ of the info bytes): 7.2% selective layout = **7814 bps net-PHY (7713 bps app-del
 Standard 7050**; 6% flat = 7915 (7813 app). The CRC win is preserved.
 
 NO monitor merge, NO push, NO attribution.
+
+## §15. LIVE-PATH 0-BYTE DELIVERY — NOT whitening; use-after-free + partial-block decode + missing FIFO delivery (2026-06-05, fix branch `fix/bigblock-whiten-align` off `integ/bigblock-final-2026-06-05`@`c746064`)
+
+The consolidated final binary (§14) TXed a CFG16 big-block to completion but delivered **0 of
+the app bytes** end-to-end. The leading hypothesis (and the task framing) was a TX/RX **whitening
+(energy-dispersal) misalignment** — a double de-whiten or a span/seed/offset mismatch. **All three
+parallel source-audits REFUTED whitening, and the empirical reproduction CONFIRMED the refutation:
+whitening was never the bug.** Three other root causes, all on the LIVE 2-instance path that the
+synthetic CASE A-D bypass, were found and fixed. SIM_INPROC (`MERCURY_SIM_2INST=1 -m SIM_INPROC`
+with `MERCURY_BIGBLOCK_FRAMING=1`, pinned CFG16) DOES route the big-block through the REAL
+`transmit_byte`/`transmit_bigblock` -> wire/capture ring -> `receive_byte`/`receive_bigblock` ->
+`bigblock_receive_carve` -> `bigblock_block_to_arq`, so it reproduces the live bug (the CASE A-D
+unit tests do not — see §15.4).
+
+### §15.1 Root cause 1 — USE-AFTER-FREE of the RX passband buffer across the config rebuild/restore
+`receive_bigblock` (telecom_system.cc:8205) derives the block K when `bigblock_last_tx_K<=0` (the
+RX side: it never TXed a block) by calling `bigblock_rebuild_thin_grid()` + `bigblock_restore_stock_config()`
+(:8222-8224). **`bigblock_restore_stock_config()` calls `load_configuration()`, which DEINITS+REINITS
+the `data_container` — FREEING and REALLOCATING `ready_to_process_passband_delayed_data`.** The `data`
+pointer the live caller (`receive()`, arq_common.cc:6864) passed IS that buffer, so after the rebuild
+`data` is **dangling** (freed). The next line, `rx_passband_normalize_and_blank(data, nSamples)` (:8245),
+reads freed/re-used heap. gdb proof: at the normalize, `data=0x63fb040` but the LIVE
+`ready_to_process_passband_delayed_data=0x63fe040` — **different buffers** (the realloc moved it). In
+SIM_INPROC this SIGSEGVs (over-reading the freed region) / corrupts the heap; on HW the allocator
+happened to leave readable-but-stale bytes -> garbage decode -> `wire_bsi=159`, every per-codeword CRC
+fails -> `PARTIAL clean=0` -> 0 delivered (the exact HW symptom). **FIX:** snapshot `data[0..nSamples)`
+into a stable LOCAL `std::vector<double>` at the TOP of `receive_bigblock` (before any rebuild) and run
+the whole decode against the snapshot (telecom_system.cc, "USE-AFTER-FREE ROOT-CAUSE FIX").
+
+### §15.2 Root cause 2 — the live RX decoded a PARTIAL block (one-stock-frame wait)
+After the UAF fix the crash was gone but only **cw0 decoded byte-perfect; cw1..K-1 were garbage**
+(channel estimate `nzero(<0.3mean)=1755/3000`, `mean|H|` collapsing). The codewords map sequentially
+across the block OFDM symbols (`clr[c*ldpc.N+i]` from `deframed` in raster order), so cw0 = early
+symbols, cw7 = late symbols. The big-block is **preamble + Ngrid = ~64 OFDM symbols**, but the live RX
+arms `frames_to_read = preamble_nSymb + Nsymb` = **ONE stock frame (~13 symbols)** at every data-receive
+entry (e.g. arq_responder.cc:1197). The decode snapshot fires at `frames_to_read==0` — after only the
+block HEAD is captured — so the late codewords read silence/stale ring -> CRC-fail. The standalone
+`BIGBLOCK_LIVE` validator and CASE A-D pass because they hand the WHOLE block in a window sized to span
+it; only the live ring-fed path under-waits. **FIX:** new geometry helper
+`cl_telecom_system::bigblock_rx_block_nsymb()` (= preamble_nSymb + Ngrid); arm `frames_to_read` to that
+block span when big-block framing is active at CFG16 (arq_responder.cc data-receive arming + a re-arm +
+full-ring wipe after each big-block carve in arq_common.cc `receive()`). After this, the first block
+decodes **8/8 byte-faithful**.
+
+### §15.3 Root cause 3 — CLEAN big-block never delivered to the app FIFO
+With cw0..7 all-clean, `bigblock_block_to_arq` CLEAN branch (test_bigblock_arq_unit.cc) set the K
+slots `RECEIVED` and bumped bsi, but **nothing downstream marked them `ACKED` and called
+`copy_data_to_buffer()`** on the live path — so the decoded sub-units never reached `fifo_buffer_rx`
+(the app RX FIFO). The unit tests never noticed: they read `messages_rx[]` DIRECTLY
+(`bigblock_test_delivered_*`), never the FIFO. **FIX:** the CLEAN branch now marks RECEIVED->ACKED and
+calls `copy_data_to_buffer()` (mirrors the prev-batch retx delivery at arq_responder.cc:760-767), and
+seeds `rsp_current_expected_batch_seq_id` from the authoritative wire bsi when it is still -1 (first
+block) so the one-bsi-transition advances. A new member `bigblock_skip_fifo_delivery` (default false =
+live deliver) is set TRUE by the unit-test bringups so CASE1..N / CASE A-D keep their messages_rx[]
+assertions. Result: SIM_INPROC pinned-CFG16 delivers the FULL 1200-byte (one full block) message
+**byte-faithful, `bytes_ok=1`, ALL PASS**.
+
+### §15.4 Producer/consumer correction — the whitening was symmetric all along
+- **TX whiten** (the ONLY TX site): `transmit_bigblock` (telecom_system.cc:8161)
+  `bigblock_whiten_payload_bits(payload, Kpack*ldpc.K, BIGBLOCK_WHITEN_SEED=0x5A3C96E1)` BEFORE LDPC encode.
+- **RX de-whiten** (the ONLY RX site): the carve (arq_common.cc:3892) `bigblock_whiten_bits(dw, K*sub_len*8)`
+  AFTER LDPC decode. `sub_len=ldpc.K/8=175`, so `K*sub_len*8 = K*1400 = K*ldpc.K = Kpack*ldpc.K` —
+  **spans MATCH, same seed, offset 0, contiguous, self-inverse.**
+- `receive_bigblock` de-whitens **ZERO** times; `bigblock_rx_passband` de-whitens **ZERO** times — **no
+  double de-whiten.** The stock per-frame `bit_energy_dispersal` is NOT applied to the big-block on either
+  side. **Empirical proof:** once the partial-block bug was fixed, the de-whitened `payload[0..15]` matched
+  the TX block payload byte-for-byte (`00 08 9b 00 9b 00 ...`) and ALL 8 per-codeword wire CRCs matched
+  (`calc==wire`). Do NOT re-plumb the whitening.
+
+### §15.5 NEW full-path regression — `--test-bigblock-fullpath` (closes the cross-layer gap, CLAUDE.md §5)
+`cl_arq_controller::test_sim_inproc_bigblock_fullpath()` drives the 2-instance SIM_INPROC CFG16
+big-block transfer through the **REAL** TX-encode->whiten->PHY->`receive_bigblock` de-whiten->carve->
+`copy_data_to_buffer` FIFO-deliver path and asserts the full message is delivered **byte-faithful**
+(every codeword clean + `payload[0]==bsi` + per-codeword CRC pass + `rx_have==payload_len`,
+`bytes_ok=1`). FAIL-BEFORE/PASS-AFTER on the SAME binary via `MERCURY_BIGBLOCK_DEFEAT_FIX=1` (restores
+the one-stock-frame partial-block wait; the fail-before captures the FIRST block PARTIAL outcome and
+breaks immediately via `MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK=1` to avoid the slow/unstable post-partial
+retry loop). The sibling UAF fail-before is reproduced separately by `MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1`
+(SEGV — cannot share a process with pass-after, documented not folded in). **Result:**
+`FAIL-BEFORE: first_block clean=1/8 rx_have=0/1200 full=0` ; `PASS-AFTER: first_block clean=8/8
+rx_have=1200/1200 full=1` ; **ALL PASS**. This is the test the synthetic CASE A-D could not catch:
+they hand a caller-owned `std::vector` as the RX passband (no UAF), drive one `receive_bigblock`
+directly (no per-block wait), and assert on `messages_rx[]` directly (no FIFO delivery).
+
+### §15.6 Regression (all FOREGROUND, green)
+`--test-bigblock-fullpath` ALL PASS (fail-before/pass-after) · `--test-sim-inproc-bigblock` ALL PASS
+(CASE A-D) · `--test-bigblock-arq-unit` 8/8 (T1-T9) · `--test-climb-engine` 0 failures ·
+`MERCURY_BIGBLOCK_LIVE=1 -m PLOT_PASSBAND -s 16` -> 8/8 byte-correct, post_FEC_BER=0. **Net-PHY
+UNCHANGED** (K=8, sub_len=175, block_samples=79360 at CFG16 — the fix is buffer-lifetime + RX-wait +
+FIFO-delivery, NOT geometry); the §14 net-PHY > VARA 7050 holds.
+
+### §15.7 Open — multi-block sequencing (NOT a whitening/carve issue, out of scope here)
+A SINGLE full block (<=1400 bytes) delivers byte-faithful. A MULTI-block payload delivers block 1 CLEAN
+then block 2 acquires the WRONG window (decodes garbage, every CRC fails) — a SACK/ACK-turnaround +
+SIM single-symbol-pacing cadence interaction across blocks, NOT the whiten/carve path (block 1 proves
+those correct). This was never reachable before (the UAF crashed the first block). Tracked as a
+follow-on for the sim-cadence fact docs; the byte-faithful single-block delivery is the deliverable here.
+
+NO monitor merge, NO push, NO attribution.

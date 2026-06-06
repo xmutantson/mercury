@@ -1194,6 +1194,29 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				else
 					ftr_val = frame_symb + 10;  // ~1.3s: normal turnaround
 			}
+			// PARTIAL-BLOCK FIX (bigblock-whiten-align): when the next thing we receive is
+			// ONE big-block (CFG16 framing), the decode snapshot fires when frames_to_read
+			// hits 0 — so the wait MUST span the WHOLE block (preamble + Ngrid data symbols,
+			// ~64 sym), not one stock frame (~13). The stock arming snapshotted after only
+			// the block's head was captured, so cw1..K-1 read silence and CRC-failed (cw0
+			// clean, 0 app bytes delivered). Extend the wait to cover a full block.
+			// REPRODUCER HOOK (bigblock-whiten-align): MERCURY_BIGBLOCK_DEFEAT_FIX=1 keeps the
+			// stock one-stock-frame wait so the full-path regression shows its fail-before
+			// (decode fires on a partial block -> cw1..K-1 garbage). Production never sets it.
+			bool defeat_block_ftr = false;
+			{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_FIX"); if(e && *e && atoi(e)!=0) defeat_block_ftr = true; }
+			if(!defeat_block_ftr
+				&& telecom_system->bigblock_framing_enabled
+				&& telecom_system->M != MOD_MFSK
+				&& current_configuration == CONFIG_16)
+			{
+				int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+				if(block_nsymb > 0)
+				{
+					int block_ftr = block_nsymb + 10;   // block span + turnaround margin
+					if(block_ftr > ftr_val) ftr_val = block_ftr;
+				}
+			}
 			telecom_system->data_container.frames_to_read = ftr_val;
 			telecom_system->data_container.nUnder_processing_events = 0;
 

@@ -101,6 +101,12 @@
 // info bits, see telecom_system.cc receive_bigblock), sub_len bytes/codeword.
 // Returns SUCCESSFUL when the block was delivered to the ARQ layer.
 // ----------------------------------------------------------------------------
+// FULL-PATH REGRESSION captures (bigblock-whiten-align): first-block clean/K of the
+// current run, so test_sim_inproc_bigblock_fullpath() can assert fail-before/pass-after
+// on the FIRST decoded block without running the unstable post-partial retry loop.
+int cl_arq_controller::bigblock_first_clean = -1;
+int cl_arq_controller::bigblock_first_K     = -1;
+
 int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
                                              unsigned char block_bsi,
                                              const unsigned char* tx_payload,
@@ -172,6 +178,9 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 	this->last_received_end_of_batch_seq = K - 1;
 	this->batch_rx_frame_count           = n_clean;
 
+	// FULL-PATH REGRESSION capture: record the FIRST block decoded this run.
+	if(bigblock_first_clean < 0) { bigblock_first_clean = n_clean; bigblock_first_K = K; }
+
 	if(n_clean == K)
 	{
 		// ===================== CLEAN block (INV-1) ==========================
@@ -200,15 +209,42 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 		this->rsp_prev_batch_active        = false;           // completed on decode
 		this->rsp_prev_batch_delivered_count++;               // one block delivered
 
-		// P2.6 — one block = one batch => ONE bsi transition.
-		if(this->rsp_current_expected_batch_seq_id >= 0)
-			this->rsp_current_expected_batch_seq_id =
-				(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+		// LIVE-PATH DELIVERY FIX (bigblock-whiten-align): on the live ARQ path nothing
+		// downstream marks these RECEIVED slots ACKED and calls copy_data_to_buffer(),
+		// so the K decoded sub-units never reached fifo_buffer_rx (the app FIFO) — the
+		// PHY/carve decoded the block byte-faithfully but 0 app bytes were delivered.
+		// The unit-test harness reads messages_rx[] directly (bigblock_test_delivered_*),
+		// so it never needed the FIFO push and the gap was invisible. Deliver the clean
+		// block to the app FIFO HERE (mirrors the prev-batch retx delivery at
+		// arq_responder.cc:760-767: mark RECEIVED->ACKED so copy_data_to_buffer's
+		// ACKED-only iteration picks them up, then push). bigblock_deliver_clean is a
+		// guarded no-op in the unit-test context (telecom_system/fifo present on the live
+		// path; the unit test sets bigblock_skip_fifo_delivery=true to keep reading
+		// messages_rx[] directly). data_batch_size == K is pinned at the rung.
+		if(!bigblock_skip_fifo_delivery)
+		{
+			for(int c = 0; c < K && c < this->nMessages; c++)
+				if(this->messages_rx[c].status == RECEIVED)
+					this->messages_rx[c].status = ACKED;
+			copy_data_to_buffer();   // pushes ACKED slots to fifo_buffer_rx, frees them
+			this->batch_data_delivered = true;
+		}
+
+		// P2.6 — one block = one batch => ONE bsi transition. INIT-ON-FIRST-BLOCK
+		// (bigblock-whiten-align): the responder's expected-bsi starts at -1 until the
+		// first DATA frame stamps it (arq_responder.cc:620). The big-block carve is the
+		// data path, so SEED it from the authoritative wire bsi on the first block so the
+		// "one bsi transition" advances correctly (was stuck at -1 -> no bump -> the CMD's
+		// clean-ACK bsi match could never line up).
+		if(this->rsp_current_expected_batch_seq_id < 0)
+			this->rsp_current_expected_batch_seq_id = (int)block_bsi;
+		this->rsp_current_expected_batch_seq_id =
+			(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
 
 		printf("[BIGBLOCK-ARQ] CLEAN block bsi=%u K=%d -> 1 ACK (all-ones), "
-			"prev_expected=%d bsi_next=%d\n",
+			"prev_expected=%d bsi_next=%d delivered_fifo=%d\n",
 			(unsigned)block_bsi, K, this->rsp_prev_batch_expected_count,
-			this->rsp_current_expected_batch_seq_id);
+			this->rsp_current_expected_batch_seq_id, (int)!bigblock_skip_fifo_delivery);
 		fflush(stdout);
 	}
 	else
@@ -386,6 +422,10 @@ int cl_arq_controller::bigblock_test_election_symmetry()
 		// itself is only meaningful with SACK negotiated).
 		a->sack_enabled    = true;
 		a->sack_v2_enabled = true;
+		// LIVE-PATH DELIVERY FIX (bigblock-whiten-align): these CASE1..N asserts read
+		// messages_rx[] DIRECTLY (no real FIFO/compression context), so keep the carved
+		// slots in messages_rx[] instead of pushing+freeing them via copy_data_to_buffer().
+		a->bigblock_skip_fifo_delivery = true;
 		a->load_configuration(CONFIG_16, FULL, YES);
 		int seed_batch = a->data_batch_size;    // == 25 (the bug seed)
 		// Elect the bigblock framing rung.
@@ -454,6 +494,13 @@ int cl_arq_controller::test_bigblock_arq_unit()
 	const int K       = BB_TEST_K;        // 8 sub-codewords / block
 	const int sub_len = BB_TEST_SUB_LEN;  // 16 payload bytes / codeword
 	const int total_tx_bytes = K * sub_len;
+
+	// LIVE-PATH DELIVERY FIX (bigblock-whiten-align): these CASE1..N asserts call
+	// bigblock_block_to_arq on `this` and read messages_rx[] DIRECTLY
+	// (bigblock_test_count_received / bigblock_test_delivered_bytes) with no real
+	// FIFO/compression context. Keep the carved slots in messages_rx[] (skip the live
+	// copy_data_to_buffer FIFO push that would mark them ACKED+free them).
+	this->bigblock_skip_fifo_delivery = true;
 
 	// --- Step 0: allocate buffers (mirror test_partial_bsi_advance Step 0) ---
 	// Avoid load_configuration(): set only the fields init_messages_buffers reads.
@@ -1053,6 +1100,10 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		a->sack_v2_enabled = true;
 		a->axis3_sack_mode = 1;            // SACK_MODE_ON
 		a->compression_enabled = false;
+		// LIVE-PATH DELIVERY FIX (bigblock-whiten-align): CASE A-D assert on messages_rx[]
+		// DIRECTLY (bigblock_test_delivered_varlen / count_received) — keep carved slots in
+		// messages_rx[] (skip the live copy_data_to_buffer FIFO push, which would free them).
+		a->bigblock_skip_fifo_delivery = true;
 		// The ctor NULLs the ARQ message buffers; production init() allocates them
 		// (init_messages_buffers) BEFORE any load_configuration. load_configuration(FULL)
 		// calls deinit_messages_buffers() -> check_buffer_canaries(), which dereferences

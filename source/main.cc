@@ -368,6 +368,9 @@ int main(int argc, char *argv[])
     bool test_sim_inproc_bigblock_cli = false; // --test-sim-inproc-bigblock: STEP 3 single-block end-to-end in the
                                         // in-process 2-instance sim (CMD->RSP->ACK->CMD byte-faithful + one-bad-cw
                                         // partial -> selective-repeat completes). One-shot at startup, then exit rc.
+    bool test_bigblock_fullpath_cli = false; // --test-bigblock-fullpath: LIVE 2-instance CFG16 big-block transfer
+                                        // through the REAL receive_bigblock+carve+whiten+FIFO deliver path with
+                                        // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -856,6 +859,15 @@ int main(int argc, char *argv[])
             // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
             // One-shot at startup, then exit rc.
             test_sim_inproc_bigblock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-fullpath") == 0)
+        {
+            // FULL-PATH REGRESSION (bigblock-whiten-align): the LIVE 2-instance CFG16
+            // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
+            // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
+            test_bigblock_fullpath_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1966,6 +1978,22 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_sim_inproc_bigblock();
             printf("[FLAG] Sim-inproc-bigblock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_fullpath_cli) {
+            // FULL-PATH REGRESSION (bigblock-whiten-align): the LIVE 2-instance CFG16
+            // big-block transfer through the REAL TX-encode->whiten->PHY->receive_bigblock
+            // de-whiten->arq carve->copy_data_to_buffer FIFO deliver path. Asserts the full
+            // message is delivered byte-faithful, with fail-before (DEFEAT_FIX=1) / pass-after
+            // on the SAME binary. Closes the cross-layer gap the CASE A-D synthetic carve
+            // tests bypassed (caller-owned RX vector / direct receive_bigblock / messages_rx[]
+            // assertions never exercised the live UAF, per-block wait, or FIFO delivery).
+            printf("[FLAG] --test-bigblock-fullpath: invoking LIVE 2-instance big-block "
+                   "full-path delivery regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_fullpath();
+            printf("[FLAG] Bigblock-fullpath test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -646,6 +646,15 @@ public:
 	// layout; valid once a CFG16 grid is loaded.
 	int bigblock_tx_total_samples();
 
+	// USE-AFTER-FREE / PARTIAL-BLOCK FIX (bigblock-whiten-align): the number of OFDM
+	// symbols ONE big-block occupies on the wire (preamble + Ngrid data symbols). The
+	// live RX must wait for THIS MANY symbols before snapshotting+decoding the block —
+	// the stock per-frame arming (preamble_nSymb + Nsymb = ONE stock frame, ~13 sym)
+	// snapshots after only the block's head is captured, so the later codewords (cw1..K-1)
+	// read silence and the decode garbles them (cw0 clean, cw1..7 CRC-fail -> 0 delivered).
+	// Geometry-only (rebuild thin grid then restore stock); returns 0 for MFSK / no grid.
+	int bigblock_rx_block_nsymb();
+
 	// SACK-GATE P1 (data-flow-bigblock-arq-unit.md R-B): the codeword count K the
 	// big-block framing carries at the current CFG16 rung — the SAME geometry both
 	// the TX (transmit_bigblock:7832 nBits/ldpc.N capped by MERCURY_BIGBLOCK_K) and

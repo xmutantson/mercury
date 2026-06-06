@@ -1232,6 +1232,29 @@ public:
   // Selected by -m SIM_INPROC with MERCURY_SIM_2INST=1 / --sim-2inst.
   static int test_sim_inproc_2();
 
+  // FULL-PATH REGRESSION (bigblock-whiten-align): the cross-layer test the CASE A-D
+  // synthetic carve tests could NOT catch (they hand a caller-owned vector as the RX
+  // passband and never exercise the LIVE receive_bigblock buffer-realloc / the per-block
+  // frames_to_read arming / the FIFO delivery). Drives the 2-instance SIM_INPROC CFG16
+  // big-block transfer through the REAL TX-encode -> whiten -> PHY -> receive_bigblock
+  // de-whiten -> arq carve -> copy_data_to_buffer FIFO deliver, and asserts the full
+  // message is delivered BYTE-FAITHFUL. FAIL-BEFORE (MERCURY_BIGBLOCK_DEFEAT_FIX=1:
+  // dangling-data UAF + one-frame wait) delivers 0 bytes; PASS-AFTER delivers all.
+  // Returns 0 on PASS. Selected by --test-bigblock-fullpath.
+  static int test_sim_inproc_bigblock_fullpath();
+  // Capture of the last test_sim_inproc_2() run's delivery (read by the full-path
+  // regression to assert byte-faithful delivery without re-parsing stdout).
+  static long sim2_last_rx_have;
+  static long sim2_last_payload_len;
+  static bool sim2_last_bytes_ok;
+  // Capture of the FIRST big-block carved in the current run (bigblock_block_to_arq):
+  // n_clean / K of the first decoded block. The full-path regression reads these to
+  // assert fail-before (first block decodes PARTIAL, n_clean<K) vs pass-after (CLEAN,
+  // n_clean==K) WITHOUT running the unstable post-partial retry loop to completion.
+  // Reset to -1 by the regression before each arm.
+  static int  bigblock_first_clean;
+  static int  bigblock_first_K;
+
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
   // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:
@@ -1339,6 +1362,16 @@ public:
   int bigblock_block_to_arq(const int* cw_ok, int K, unsigned char block_bsi,
                             const unsigned char* tx_payload, int sub_len,
                             const int* sub_lengths = nullptr, int cw0_offset = 0);
+
+  // LIVE-PATH DELIVERY FIX (bigblock-whiten-align): when a CLEAN big-block is carved,
+  // bigblock_block_to_arq delivers the K decoded sub-units to the app FIFO via
+  // copy_data_to_buffer() (RECEIVED->ACKED then push) — the live ARQ path had no
+  // downstream gate doing this, so the block decoded byte-faithfully but 0 app bytes
+  // reached fifo_buffer_rx. The CASE A-D unit tests (test_bigblock_arq_unit.cc) assert
+  // on messages_rx[] DIRECTLY (bigblock_test_delivered_varlen) and have no real
+  // FIFO/compression context, so they set this flag true to KEEP the slots in
+  // messages_rx[] (skip the FIFO push). Default false = live behavior (deliver).
+  bool bigblock_skip_fifo_delivery = false;
 
   // ---- STEP 2: live send-path wiring (P3 prereq, see arq_common.cc) ----------
   // bigblock_send_one_block(): emit the current new-data batch as ONE big-block

@@ -10029,6 +10029,12 @@ void sim2_activate(MercuryInstance* m)
 
 }  // namespace
 
+// FULL-PATH REGRESSION (bigblock-whiten-align): capture of the last 2-instance run's
+// delivery so test_sim_inproc_bigblock_fullpath() can assert without re-parsing stdout.
+long cl_arq_controller::sim2_last_rx_have     = -1;
+long cl_arq_controller::sim2_last_payload_len = -1;
+bool cl_arq_controller::sim2_last_bytes_ok    = false;
+
 int cl_arq_controller::test_sim_inproc_2()
 {
 	int failed = 0;
@@ -10328,6 +10334,16 @@ int cl_arq_controller::test_sim_inproc_2()
 
 		if (rx_have >= payload_len) break;   // delivered
 
+		// FULL-PATH REGRESSION (bigblock-whiten-align): MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK=1
+		// breaks the loop as soon as the FIRST big-block has been carved (bigblock_first_K>0).
+		// The fail-before arm uses this so it captures the first block's PARTIAL outcome and
+		// exits FAST — it must NOT run the slow/unstable post-partial stock per-frame retry
+		// loop. Default off (regression/HW sessions run to completion).
+		if (env_i("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", 0) != 0 && bigblock_first_K > 0) {
+			stalled = true;   // mark so the byte-correct G-SMOKE assert is skipped
+			break;
+		}
+
 		// Stall detector (large-payload arm): break out if no new byte for
 		// stall_cutoff iters. Records the stall so the report can flag it.
 		if (rx_have != prev_rx_have) { prev_rx_have = rx_have; last_progress_iter = iters; }
@@ -10339,6 +10355,12 @@ int cl_arq_controller::test_sim_inproc_2()
 	uint64_t t1 = sim_clock_now_samples();
 	double sim_ms = (t1 - t0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
 	bool bytes_ok = (rx_have >= payload_len && memcmp(rx_buf, payload, payload_len) == 0);
+
+	// FULL-PATH REGRESSION capture (bigblock-whiten-align): record this run's delivery so
+	// test_sim_inproc_bigblock_fullpath() can assert byte-faithful delivery directly.
+	sim2_last_rx_have     = rx_have;
+	sim2_last_payload_len = payload_len;
+	sim2_last_bytes_ok    = bytes_ok;
 
 	if (payload_bytes <= 0) {
 		// Legacy short-text arm: print the string (regression output unchanged).
@@ -10427,6 +10449,160 @@ int cl_arq_controller::test_sim_inproc_2()
 
 	printf("[TEST-SIM-2INST] %s (%d failure%s)\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// FULL-PATH REGRESSION (bigblock-whiten-align): the missing cross-layer test.
+//
+// Drives a 2-instance SIM_INPROC CFG16 BIG-BLOCK transfer (PINNED CFG16, big-block
+// framing on, K=8, a one-block deterministic payload) through the REAL production
+// stack: bigblock_send_one_block -> transmit_byte/transmit_bigblock (LDPC encode AFTER
+// the energy-dispersal WHITEN) -> the in-process wire/capture ring -> receive_byte ->
+// receive_bigblock (acquire + per-codeword LDPC decode) -> bigblock_receive_carve (the
+// single de-whiten + per-codeword wire-CRC gate + cw0 wire-header parse) ->
+// bigblock_block_to_arq (CLEAN block -> copy_data_to_buffer -> fifo_buffer_rx) -> the
+// app RX FIFO. Asserts the WHOLE message is delivered BYTE-FAITHFUL.
+//
+// Why CASE A-D could not catch this: those synthetic carve tests hand a CALLER-OWNED
+// std::vector as the RX passband (so the receive_bigblock buffer-realloc never dangled
+// it -> no UAF), drive ONE receive_bigblock directly (so the per-block frames_to_read
+// arming was never exercised), and assert on messages_rx[] DIRECTLY (so the missing
+// copy_data_to_buffer FIFO delivery was invisible). This test exercises all three on
+// the LIVE 2-instance path.
+//
+// FAIL-BEFORE / PASS-AFTER on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_FIX=1, which
+// restores the one-stock-frame RX wait (snapshots a PARTIAL block -> cw0 decodes, cw1..K-1
+// read silence and CRC-fail -> PARTIAL clean<K -> 0 app bytes reach the FIFO). This is the
+// DETERMINISTIC, NON-CRASHING 0-delivery symptom, so the SAME process can run the pass-after
+// arm after it. (The sibling use-after-free root cause is independently reproduced by
+// MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1, which SEGVs — it cannot share a process with pass-after,
+// so it is documented as a standalone crash, not folded into this in-process A/B.)
+// Pass-after delivers the full message byte-faithful.
+int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
+{
+	printf("[TEST-BIGBLOCK-FULLPATH] ===== SIM_INPROC CFG16 big-block FULL-PATH "
+	       "(TX-encode->whiten->PHY->receive_bigblock-de-whiten->carve->FIFO deliver) =====\n");
+	fflush(stdout);
+
+	// --- save the env we will set, so the test leaves the process env clean ---
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_SIM_2INST", "MERCURY_BIGBLOCK_FRAMING", "MERCURY_BIGBLOCK_K",
+		"MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
+		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
+		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key   = keys[i];
+		env_saved[(size_t)i].had   = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	// One full CFG16 K=8 block carries K*(ldpc.K/8)=8*175=1400 bytes of wire payload
+	// (minus the cw0 header + per-codeword CRC overhead); 1200 app bytes fit in ONE block.
+	const long PAYLOAD = 1200;
+	set_env("MERCURY_SIM_2INST",            "1");
+	set_env("MERCURY_BIGBLOCK_FRAMING",     "1");
+	set_env("MERCURY_BIGBLOCK_K",           "8");
+	set_env("MERCURY_SIM2_PIN",             "1");     // hold CFG16 (no gearshift)
+	set_env("MERCURY_SIM2_CFG",             "16");
+	set_env("MERCURY_SIM2_ROBUST",          "0");
+	{ char b[32]; snprintf(b,sizeof(b),"%ld",PAYLOAD); set_env("MERCURY_SIM2_PAYLOAD_BYTES", b); }
+
+	int failed = 0;
+
+	// ---------- FAIL-BEFORE: restore the pre-fix bug (partial-block wait) ------------
+	// With the one-stock-frame RX wait, the FIRST big-block decodes PARTIAL (cw0 clean,
+	// cw1..K-1 read silence) and the carve PARTIAL branch delivers 0 app bytes to the FIFO.
+	// MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK=1 breaks the 2-instance loop the moment that first
+	// block is carved, so we capture its PARTIAL outcome and exit FAST — we do NOT run the
+	// slow/unstable post-partial stock per-frame retry loop. (The UAF sibling is reproduced
+	// separately by MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1, which SEGVs and is documented.)
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");
+	set_env("MERCURY_SIM2_MAXITERS",        "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS",     "60000");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",  "1");
+	printf("[TEST-BIGBLOCK-FULLPATH] --- FAIL-BEFORE arm (MERCURY_BIGBLOCK_DEFEAT_FIX=1: "
+	       "one-stock-frame RX wait -> partial-block decode) ---\n"); fflush(stdout);
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_before = test_sim_inproc_2();
+	long before_rx       = sim2_last_rx_have;
+	int  before_clean    = bigblock_first_clean;
+	int  before_K        = bigblock_first_K;
+	bool before_full     = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-FULLPATH] FAIL-BEFORE: first_block clean=%d/%d rx_have=%ld/%ld "
+	       "full=%d (rc=%d)\n", before_clean, before_K, before_rx, PAYLOAD,
+	       (int)before_full, rc_before);
+	fflush(stdout);
+	// fail-before reproduces iff the first big-block did NOT decode all-clean (partial) AND
+	// the full message was NOT delivered byte-faithful.
+	bool fail_before_ok = (before_K > 0) && (before_clean >= 0) && (before_clean < before_K)
+	                   && !before_full;
+	printf("[TEST-BIGBLOCK-FULLPATH] %s: FAIL-BEFORE reproduces (first block PARTIAL "
+	       "clean=%d<K=%d, full message NOT delivered)\n",
+	       fail_before_ok ? "PASS" : "FAIL", before_clean, before_K);
+	if(!fail_before_ok) failed++;
+
+	// ---------- PASS-AFTER: the real fix path ----------
+	// The fixed path decodes the FIRST block all-clean and delivers the full message in a
+	// handful of iters; run to full delivery (no early stop).
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "0");
+	set_env("MERCURY_SIM2_MAXITERS",        "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS",     "60000");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",  "0");
+	printf("[TEST-BIGBLOCK-FULLPATH] --- PASS-AFTER arm (fix active) ---\n"); fflush(stdout);
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_after = test_sim_inproc_2();
+	long after_rx    = sim2_last_rx_have;
+	int  after_clean = bigblock_first_clean;
+	int  after_K     = bigblock_first_K;
+	bool after_full  = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-FULLPATH] PASS-AFTER: first_block clean=%d/%d rx_have=%ld/%ld "
+	       "full=%d (rc=%d)\n", after_clean, after_K, after_rx, PAYLOAD,
+	       (int)after_full, rc_after);
+	fflush(stdout);
+	// The fix MUST: (a) decode the first big-block ALL-CLEAN (every codeword byte-faithful
+	// through the real whiten+carve), (b) deliver the FULL message byte-faithful to the app
+	// FIFO, and (c) pass the underlying 2-instance G-SMOKE asserts (CONNECT + byte-correct).
+	bool pass_after_ok = (after_K > 0) && (after_clean == after_K)
+	                  && after_full && (rc_after == 0);
+	printf("[TEST-BIGBLOCK-FULLPATH] %s: PASS-AFTER decodes the first block all-clean "
+	       "(clean=%d/%d) AND delivers the full %ld-byte message byte-faithful through the "
+	       "REAL receive_bigblock+carve+whiten path\n",
+	       pass_after_ok ? "PASS" : "FAIL", after_clean, after_K, PAYLOAD);
+	if(!pass_after_ok) failed++;
+
+	restore_env();
+
+	printf("[TEST-BIGBLOCK-FULLPATH] %s (%d failure%s)  [fail_before: first_clean=%d/%d "
+	       "rx=%ld | pass_after: first_clean=%d/%d rx=%ld/%ld]\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s",
+	       before_clean, before_K, before_rx, after_clean, after_K, after_rx, PAYLOAD);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }
