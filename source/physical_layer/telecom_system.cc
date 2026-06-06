@@ -31,6 +31,7 @@
 #include <cstdio>  // bigblock WAV I/O: FILE/fopen/fread/fwrite
 #include <cmath>   // bigblock: round/log2/sqrt/fabs
 #include <cassert> // fact-doc §13: deterministic bounds assert on the big-block TX/RX write
+#include <string>  // D1-sfo-repro: ppm-sweep string parse + std::to_string in bigblock_sfo_test
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
@@ -5314,6 +5315,17 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 		return;
 	}
 
+	// D1-sfo-repro: TIMING-FAITHFUL big-block cw1..cw7-corruption reproduction.
+	// TX a full K-codeword big-block -> drift the WHOLE contiguous buffer through ONE
+	// cl_sim_sfo -> decode via the REAL bigblock_rx_passband (one acquisition + per-cw
+	// LDPC + per-cw gate) across a ppm sweep, reporting per-codeword byte-faithfulness.
+	const char* bbsfo = std::getenv("MERCURY_BIGBLOCK_SFO_TEST");
+	if(bbsfo && atoi(bbsfo) != 0)
+	{
+		bigblock_sfo_test();
+		return;
+	}
+
 	BER_plot.open("BER");
 	BER_plot.reset("BER");
 	// MFSK: sweep channel SNR from -25 to +5 dB in 1 dB steps
@@ -8456,6 +8468,210 @@ void cl_telecom_system::bigblock_livepath_loopback()
 	std::cout << "[BIGBLOCK-LIVE]   VERDICT=" << (pass ? "PASS(live-path 8/8 byte-correct)" : "FAIL") << std::endl;
 
 	bigblock_framing_enabled = false;
+}
+
+// ============================================================================
+// D1-sfo-repro: TIMING-FAITHFUL big-block cw1..cw7-corruption reproduction.
+// ============================================================================
+// WHY this harness exists (the gap it fills). The in-process 2-instance sim
+// reports ALL 8 codewords CLEAN, but HW delivers cw0 byte-correct and cw1..cw7
+// CORRUPT (every block PARTIAL clean=0 -> 0/1200 byte-faithful, recv=113 = cw0
+// head only). Per fact-documents/data-flow-sim2-time-domain-faithfulness.md §9/F1,
+// the in-process sim is FREQUENCY-domain faithful but TIME-domain PERFECT (SFO=0,
+// CFO=0, SOF-jitter=0) and its per-frame decode-drive hands the decoder a FRAME-
+// ALIGNED window that BYPASSES Schmidl-Cox timing acquisition (50 AND 500 ppm
+// leave its arms byte-identical to off). So it STRUCTURALLY cannot see SFO/timing
+// drift across a single-acquisition K-codeword block.
+//
+// This harness is timing-FAITHFUL: it runs the REAL big-block PHY end-to-end with a
+// genuine sample-rate offset on the wire, so SFO actually affects the RX:
+//   1. TX one FULL K-codeword CFG16 big-block (one 4-sym preamble + K codewords
+//      under ONE acquisition) into a contiguous passband buffer via the SHARED,
+//      validated bigblock_tx_passband worker (same DSP the WAV harness + the live
+//      transmit_byte path run). cw_info[c] = the known info bits of codeword c.
+//   2. Lay the block into a capture buffer with lead silence (Schmidl-Cox search
+//      room, mirrors the HW capture + bigblock_livepath_loopback), then drift the
+//      WHOLE capture buffer through ONE stateful cl_sim_sfo (Farrow fractional
+//      resampler, sim_channel.h; HW-measured ~50-90 ppm differential Fe-Pi
+//      crystals). One instance => the fractional accumulator + integer SOF-creep
+//      carry across the entire block exactly like a real receive crystal — the
+//      drift ACCUMULATES from the block start (cw0) through the tail (cw7).
+//   3. (optional) add passband AWGN at MERCURY_BIGBLOCK_SFO_ESN0 (default clean,
+//      to isolate the SFO timing effect).
+//   4. Decode via the REAL bigblock_rx_passband: ONE Schmidl-Cox acquisition + MF
+//      snap + pilot-EVM fine-timing + CPE/PEG track + sparse-2D/flat-ML continual-
+//      pilot channel estimate + CSI-LLR + per-codeword LDPC + per-codeword known-
+//      payload gate (cw_info_ref). cw_ok_out[c] is the per-codeword byte-faithful
+//      result — the SAME granularity the HW per-cw CRC demotes.
+//
+// KEY QUESTIONS the per-cw-per-ppm table answers:
+//   • Does cw1..cw7 corrupt while cw0 stays clean (matching the recv=113 HW signature)?
+//   • At what ppm does the onset happen?
+//   • Is the degradation GRADUAL across cw0->cw7 (monotone tail decay => accumulating
+//     SFO/coherence drift, the design assumption "the per-symbol continual estimate
+//     absorbs SFO" is WRONG on HW) or a SHARP CLIFF right after cw0 (cw0 clean, cw1+
+//     all dead at the SAME ppm => a per-codeword code/layout/whitening bug, NOT drift)?
+//
+// Determinism: TX info + AWGN seeded from MERCURY_BIGBLOCK_SEED; the SFO stage has
+// its OWN cl_sim_xoshiro (MERCURY_BIGBLOCK_SFO_SEED). Same env => bit-reproducible.
+void cl_telecom_system::bigblock_sfo_test()
+{
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+	auto env_d = [](const char* k, double def){ const char* e=std::getenv(k); return (e&&*e)?atof(e):def; };
+	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK-SFO] MFSK unsupported; use -s 15/16." << std::endl; return; }
+
+	int interp        = frequency_interpolation_rate;
+	double esn0_db    = env_d("MERCURY_BIGBLOCK_SFO_ESN0", 900.0);
+	bool   clean      = (esn0_db >= 900.0);
+	double walk_ppm   = env_d("MERCURY_BIGBLOCK_SFO_WALK_PPM", 0.0);
+	double max_ppm    = env_d("MERCURY_BIGBLOCK_SFO_MAX_PPM", 200.0);
+	uint64_t sfo_seed = (uint64_t)env_i("MERCURY_BIGBLOCK_SFO_SEED", 777);
+	unsigned int seed = (unsigned int)env_i("MERCURY_BIGBLOCK_SEED", 12345);
+	int lead_n        = (int)(env_d("MERCURY_BIGBLOCK_SFO_LEAD_MS", 100.0) * sampling_frequency / 1000.0);
+	int trail_n       = (int)(env_d("MERCURY_BIGBLOCK_SFO_TRAIL_MS", 50.0) * sampling_frequency / 1000.0);
+
+	// ppm sweep (comma-separated). Default spans clean -> beyond the HW band so the
+	// onset is bracketed: 0 (control) / 25 / 50 / 90 (HW differential) / 150.
+	std::vector<double> ppm_list;
+	{
+		const char* sw = std::getenv("MERCURY_BIGBLOCK_SFO_SWEEP");
+		std::string s = (sw && *sw) ? sw : "0,25,50,90,150";
+		size_t pos=0;
+		while(pos < s.size())
+		{
+			size_t comma = s.find(',', pos);
+			std::string tok = (comma==std::string::npos) ? s.substr(pos) : s.substr(pos, comma-pos);
+			if(!tok.empty()) ppm_list.push_back(atof(tok.c_str()));
+			if(comma==std::string::npos) break;
+			pos = comma+1;
+		}
+		if(ppm_list.empty()) ppm_list.push_back(0.0);
+	}
+
+	output_power_Watt = 1;
+
+	// --- TX ONCE: build the big-block waveform (preamble + K codewords). The known
+	//     payload (seeded PRBS) is reconstructed identically by cw_info; passing it as
+	//     cw_info_ref to the RX gives the per-codeword byte-correct gate. ----------
+	int block_n = bigblock_tx_total_samples();   // rebuild+restore internally
+	if(block_n <= 0){ std::cout << "[BIGBLOCK-SFO] tx_total_samples=0; abort (need -s 16)." << std::endl; return; }
+	std::vector<double> block_pb((size_t)block_n + 8, 0.0);
+	int n_tx = 0;
+	std::vector<std::vector<int>> cw_info;
+	int K_tx = bigblock_tx_passband(block_pb.data(), n_tx, cw_info, /*payload_bits=*/nullptr);
+	if(K_tx <= 0 || n_tx <= 0){ std::cout << "[BIGBLOCK-SFO] TX produced no block; abort." << std::endl; bigblock_restore_stock_config(); return; }
+
+	// signal power of the clean block (for AWGN sigma at the labeled Es/N0; SAME
+	// convention as passband_test_EsN0 / bigblock_livepath_loopback).
+	double sumsq=0.0; for(int i=0;i<n_tx;i++) sumsq += block_pb[i]*block_pb[i];
+	double P_sig = sumsq / (n_tx>0?n_tx:1);
+	double f_nyquist = sampling_frequency / 2.0;
+
+	std::cout << "[BIGBLOCK-SFO] ===== TIMING-FAITHFUL big-block SFO sweep (REAL bigblock_tx/rx_passband) =====" << std::endl;
+	std::cout << "[BIGBLOCK-SFO] cfg=" << current_configuration << " M=" << M
+	          << " K=" << K_tx << " (ldpc.N=" << ldpc.N << " K=" << ldpc.K << ")"
+	          << " block_samples=" << n_tx << " lead=" << lead_n << " trail=" << trail_n
+	          << " interp=" << interp
+	          << " ESN0=" << (clean?std::string("clean"):std::to_string(esn0_db))
+	          << " walk_ppm=" << walk_ppm << " max_ppm=" << max_ppm
+	          << " seed=" << seed << " sfo_seed=" << sfo_seed << std::endl;
+	std::cout << "[BIGBLOCK-SFO] (drift the WHOLE contiguous buffer through ONE cl_sim_sfo,"
+	          << " then ONE Schmidl-Cox acquisition decodes all K codewords)" << std::endl;
+
+	// Per-ppm per-cw clean tallies (rows = ppm, cols = codeword index).
+	std::vector<std::vector<int>> cw_ok_table(ppm_list.size(), std::vector<int>(K_tx, 0));
+	std::vector<int>    clean_count(ppm_list.size(), 0);
+	std::vector<double> acq_metric(ppm_list.size(), 0.0);
+
+	for(size_t pi=0; pi<ppm_list.size(); pi++)
+	{
+		double ppm = ppm_list[pi];
+
+		// 1) capture buffer = [lead silence | block | trail silence].
+		std::vector<double> rx_pb((size_t)lead_n + (size_t)n_tx + (size_t)trail_n, 0.0);
+		for(int i=0;i<n_tx;i++) rx_pb[(size_t)lead_n + i] = block_pb[i];
+
+		// 2) drift the WHOLE capture buffer through ONE stateful cl_sim_sfo. The drift
+		//    accumulates continuously across the contiguous block (cw0..cw7 on one clock).
+		{
+			cl_sim_sfo sfo(/*seed=*/ (sfo_seed ^ 0x2545F4914F6CDD1DULL) + 0xC2B2AE3D27D4EB4FULL,
+			               ppm, walk_ppm, max_ppm, sampling_frequency);
+			sfo.process(rx_pb.data(), rx_pb.size());
+		}
+
+		// 3) optional AWGN at the labeled Es/N0 (canonical sigma/sqrt(2) per real sample).
+		if(!clean)
+		{
+			double sigma = sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, esn0_db/10.0) * bandwidth));
+			double per_sample = sigma / sqrt(2.0);
+			awgn_channel.set_seed((long)(seed | 1) + (long)pi);
+			for(size_t i=0;i<rx_pb.size();i++)
+				rx_pb[i] += per_sample * awgn_channel.awgn_value_generator();
+		}
+
+		// 4) decode via the REAL big-block RX worker: ONE acquisition + sparse-2D/flat-ML
+		//    continual-pilot tracking + per-codeword LDPC + per-codeword known-payload gate.
+		std::vector<int> out_infobits((size_t)K_tx * ldpc.K + ldpc.K, 0);
+		std::vector<int> cw_ok_out;
+		int K_rx = 0; double am = 0.0;
+		int cw_clean = bigblock_rx_passband(rx_pb.data(), (int)rx_pb.size(),
+		                                    out_infobits.data(), K_rx, cw_ok_out,
+		                                    &am, &cw_info);
+
+		acq_metric[pi]  = am;
+		clean_count[pi] = cw_clean;
+		for(int c=0;c<K_tx && c<(int)cw_ok_out.size() && c<K_rx; c++)
+			cw_ok_table[pi][c] = cw_ok_out[c];
+
+		// per-cw byte-error tally (independent of the gate) for the GRADUAL-vs-CLIFF call.
+		std::vector<int> cw_biterr(K_tx, -1);
+		for(int c=0;c<K_tx && c<K_rx; c++)
+		{
+			int e=0;
+			for(int i=0;i<ldpc.K;i++)
+			{
+				size_t bi=(size_t)c*ldpc.K+i;
+				int got = (bi < out_infobits.size()) ? out_infobits[bi] : -1;
+				if(got != cw_info[c][i]) e++;
+			}
+			cw_biterr[c]=e;
+		}
+
+		std::cout << "[BIGBLOCK-SFO] ppm=" << ppm
+		          << " acq_metric=" << am
+		          << " K_rx=" << K_rx
+		          << " codewords_clean=" << cw_clean << "/" << K_tx << std::endl;
+		std::cout << "[BIGBLOCK-SFO]   per-cw OK   : ";
+		for(int c=0;c<K_tx;c++) std::cout << (cw_ok_table[pi][c]?"1":"0") << (c+1<K_tx?" ":"");
+		std::cout << std::endl;
+		std::cout << "[BIGBLOCK-SFO]   per-cw berr : ";
+		for(int c=0;c<K_tx;c++) std::cout << cw_biterr[c] << "/" << ldpc.K << (c+1<K_tx?"  ":"");
+		std::cout << std::endl;
+	}
+
+	// --- SUMMARY TABLE: rows=ppm, cols=cw0..cw{K-1} (1=clean,0=corrupt) --------
+	std::cout << "[BIGBLOCK-SFO] ===== PER-CODEWORD x PER-PPM CLEAN TABLE =====" << std::endl;
+	std::cout << "[BIGBLOCK-SFO]   ppm \\ cw : ";
+	for(int c=0;c<K_tx;c++) std::cout << "cw" << c << (c+1<K_tx?" ":"");
+	std::cout << "   | clean/K" << std::endl;
+	for(size_t pi=0; pi<ppm_list.size(); pi++)
+	{
+		std::cout << "[BIGBLOCK-SFO]   " << ppm_list[pi] << "      : ";
+		for(int c=0;c<K_tx;c++) std::cout << " " << (cw_ok_table[pi][c]?"1":"0") << " "
+		                                  << (c+1<K_tx?"":"");
+		std::cout << "  | " << clean_count[pi] << "/" << K_tx
+		          << "  acq=" << acq_metric[pi] << std::endl;
+	}
+	std::cout << "[BIGBLOCK-SFO] INTERPRETATION: a GRADUAL cw0->cw{K-1} decay (clean head, more"
+	          << " corrupt toward the tail, onset rising with ppm) = accumulating SFO/coherence"
+	          << " drift (the 'continual estimate absorbs SFO' assumption fails on HW)." << std::endl;
+	std::cout << "[BIGBLOCK-SFO] A SHARP cw0-only-clean cliff at ALL ppm INCLUDING 0 = a per-codeword"
+	          << " layout/code/whitening bug, NOT drift (the in-proc sim should then ALSO fail; if it"
+	          << " passes at ppm=0 here too, the corruption is NOT in this PHY worker)." << std::endl;
+
+	// teardown: restore the stock production config (bigblock_rx_passband left the
+	// thin-grid layout in ofdm; same restore the WAV/live harnesses use).
+	bigblock_restore_stock_config();
 }
 
 void cl_telecom_system::load_configuration()

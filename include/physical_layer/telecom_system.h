@@ -498,6 +498,34 @@ public:
 	// MERCURY_SFO_GRID_DDCE (1=decision-directed refine). Driven from sfo_grid_test only.
 	void grid_sparse2d_estimator(std::complex<double>* rx, int Ngrid, int Nc);
 
+	// D1-sfo-repro (scratch/d1-sfo-repro): TIMING-FAITHFUL reproduction of the
+	// big-block cw1..cw7 corruption. The in-process 2-instance sim is FREQUENCY-
+	// domain faithful but TIME-domain PERFECT (per-frame decode-drive hands the
+	// decoder a FRAME-ALIGNED window that BYPASSES Schmidl-Cox timing acquisition;
+	// 50 AND 500 ppm leave its arms byte-identical — see
+	// fact-documents/data-flow-sim2-time-domain-faithfulness.md §9/F1). This harness
+	// instead exercises the REAL big-block PHY end-to-end under genuine SFO timing
+	// drift: TX one FULL K-codeword CFG16 big-block (one 4-sym preamble + K codewords
+	// under ONE acquisition) into a contiguous passband buffer via bigblock_tx_passband,
+	// drift the WHOLE buffer through ONE cl_sim_sfo (Farrow fractional resampler,
+	// HW-measured ~50-90 ppm differential Fe-Pi crystals), then decode via the REAL
+	// bigblock_rx_passband (ONE Schmidl-Cox acquisition + sparse-2D/flat-ML continual-
+	// pilot channel tracking + CSI-LLR + per-codeword LDPC + per-codeword
+	// known-payload gate). Reports per-codeword byte-faithfulness across a ppm sweep so
+	// the cw0-clean / cw1..7-corrupt HW signature (recv=113=cw0-only) can be reproduced
+	// (or refuted) in sim, and discriminates GRADUAL drift-degradation (cw0->cw7
+	// monotone, accumulating SFO/coherence) from a SHARP per-cw layout/code-bug cliff
+	// right after cw0. Entry: -m PLOT_PASSBAND -s 16 with env MERCURY_BIGBLOCK_SFO_TEST=1.
+	// Knobs: MERCURY_BIGBLOCK_SFO_SWEEP (comma ppm list, default "0,25,50,90,150"),
+	// MERCURY_BIGBLOCK_SFO_WALK_PPM, MERCURY_BIGBLOCK_SFO_MAX_PPM,
+	// MERCURY_BIGBLOCK_SFO_ESN0 (default 900=clean), MERCURY_BIGBLOCK_SFO_LEAD_MS
+	// (default 100), MERCURY_BIGBLOCK_SFO_TRAIL_MS (default 50),
+	// MERCURY_BIGBLOCK_SFO_SEED, MERCURY_BIGBLOCK_K (codeword cap, default = full K=8),
+	// plus the shared big-block knobs (MERCURY_BIGBLOCK_NSYMB/CONT_COLS/SCAT_DX/SCAT_DY/
+	// TRACK/SPARSE2D/MFSNAP/TSEARCH). Determinism: same env => bit-reproducible (TX/AWGN
+	// from MERCURY_BIGBLOCK_SEED; SFO has its own xoshiro seeded from MERCURY_BIGBLOCK_SFO_SEED).
+	void bigblock_sfo_test();
+
 	// BIG-BLOCK HW DE-RISK (PHY-only, no ARQ) — emit/decode the validated big-block
 	// (one 4-sym preamble + K=8 1600-bit LDPC codeword-frames under ONE acquisition,
 	// ~7.2% freq-focused pilots, channel-adaptive flat-ML/sparse-2D, TRACK=0) over a
