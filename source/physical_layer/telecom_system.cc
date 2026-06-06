@@ -30,6 +30,7 @@
 #include <cstdint> // bigblock WAV I/O: uint32_t/int16_t
 #include <cstdio>  // bigblock WAV I/O: FILE/fopen/fread/fwrite
 #include <cmath>   // bigblock: round/log2/sqrt/fabs
+#include <cassert> // fact-doc §13: deterministic bounds assert on the big-block TX/RX write
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
 #endif
@@ -623,7 +624,23 @@ void cl_telecom_system::transmit_byte(int *data, int nBytes, double* out, int me
 	// CONFIG_16 so CONFIG_0..15 use the stock per-frame path and only the validated rung
 	// emits a block. The PLOT_PASSBAND / unit validators run at CONFIG_16 (-s 16), so they
 	// are unaffected.
-	if(bigblock_framing_enabled && M != MOD_MFSK && current_configuration == CONFIG_16)
+	//
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): config + flag are NOT sufficient. At the
+	// CFG16 rung the gearshift and ARQ control loop still issue MANY stock per-frame /
+	// single-frame / CONTROL transmits, each handing a FRAME-sized `out` slot (~15184
+	// doubles). The block waveform is ~45552 doubles; branching here for those callers
+	// overran their slot and smashed the heap. Require an EXPLICIT per-call block intent
+	// (bigblock_emit_as_block), which ONLY the dedicated block driver (bigblock_send_one_
+	// block) + the loopback validators set — and only while they pass a block-sized buffer.
+	//
+	// REPRODUCER HOOK (fact-doc §13.R): MERCURY_BIGBLOCK_OLDGATE=1 restores the PRE-FIX gate
+	// (config alone, ignoring the per-call capacity intent) so the in-sim CASE C can
+	// demonstrate the fail-before overrun with the SAME binary. Production never sets it;
+	// it exists purely for the deterministic local fail-before/pass-after proof.
+	bool emit_block = bigblock_emit_as_block;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_OLDGATE"); if(e && *e && atoi(e)!=0) emit_block = true; }
+	if(bigblock_framing_enabled && M != MOD_MFSK && current_configuration == CONFIG_16
+		&& emit_block)
 	{
 		transmit_bigblock(data, nBytes, out);
 		return;
@@ -8067,6 +8084,29 @@ void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
 	int nSamples = 0;
 	int Kcw = 0;
 
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): the block waveform is preamble + K*frame
+	// passband samples (~45552 doubles at the CFG16 thin grid) — 3-5x one stock OFDM frame
+	// slot. bigblock_tx_passband writes that whole extent into `out`. If a (declined /
+	// control / per-frame) caller routed here with a FRAME-sized `out`, the write smashed
+	// adjacent heap chunks (the original "free(): invalid next size" abort). Compute the
+	// required extent from the REAL block geometry and HARD-REFUSE (no write) when it
+	// exceeds the caller-declared capacity. This fires on ANY platform regardless of the
+	// OS allocator's slack — it is the deterministic bounds check the reproducer asserts on.
+	int required_samples = bigblock_tx_total_samples();   // rebuild+restore internally
+	if(bigblock_emit_out_capacity > 0 && required_samples > bigblock_emit_out_capacity)
+	{
+		std::cout << "[BIGBLOCK-TX-GUARD] REFUSED: block needs " << required_samples
+		          << " passband samples but out capacity is only " << bigblock_emit_out_capacity
+		          << " — NOT writing (would overrun). cfg=" << current_configuration << std::endl;
+		// assert in debug builds so a CI/reproducer catches the mis-sizing at the source.
+		assert(required_samples <= bigblock_emit_out_capacity
+		       && "transmit_bigblock: block waveform exceeds out buffer capacity");
+		bigblock_last_tx_K = 0;
+		bigblock_last_tx_samples = 0;
+		bigblock_restore_stock_config();
+		return;
+	}
+
 	if(data != NULL && nBytes > 0)
 	{
 		int Ngrid = 0, log2M = 0, nBits = 0;
@@ -8105,6 +8145,13 @@ void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
 	bigblock_last_tx_K = Kcw;
 	bigblock_last_tx_samples = nSamples;
 
+	// Defense-in-depth (fact-doc §13): make the per-frame bookkeeping reflect the ACTUAL
+	// emitted length. Stock transmit_bit sets this; transmit_bigblock previously left it
+	// stale, so a caller's frame_len clamp (arq_common.cc:4321) under-advanced and MASKED
+	// the raw overrun in software. With the producer constraint a block can only be emitted
+	// into a block-sized buffer, but stamp the true length so the bookkeeping never lies.
+	tx_last_emitted_frame_samples = nSamples;
+
 	bigblock_restore_stock_config();
 }
 
@@ -8141,7 +8188,14 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 		bigblock_restore_stock_config();
 	}
 	if(K_expected <= 0) K_expected = 1;
-	std::vector<int> info_bits((size_t)(K_expected + 1) * ldpc.K, 0);
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): decode the K*ldpc.K (= 8*1400 = 11200)
+	// info bits into the DEDICATED member buffer, NOT the caller's `out` (which on the live
+	// ARQ path is data_container.data_byte[N_MAX=1600]). bigblock_rx_passband writes
+	// Kout*ldpc.K ints; sizing for (K_expected+1)*ldpc.K + ldpc.K gives slack for a Kout
+	// that exceeds the expected K (the worker caps Kout to the grid's K, but be defensive).
+	bigblock_rx_infobits.assign((size_t)(K_expected + 1) * ldpc.K + ldpc.K, 0);
+	int* info_bits = bigblock_rx_infobits.data();
+	int  info_bits_cap = (int)bigblock_rx_infobits.size();
 
 	std::vector<int> cw_ok;
 	int Kout = 0;
@@ -8156,15 +8210,27 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	// P1 loopback: pass the known TX info bits so the per-codeword gate is byte-exact.
 	const std::vector<std::vector<int>>* ref =
 		(bigblock_last_tx_K > 0) ? &bigblock_last_tx_cw_info : nullptr;
-	int cw_ok_count = bigblock_rx_passband(data, nSamples, info_bits.data(), Kout,
+	int cw_ok_count = bigblock_rx_passband(data, nSamples, info_bits, Kout,
 	                                       cw_ok, &acq_metric, ref);
 
 	receive_stats.coarse_metric = acq_metric;
 	receive_stats.delay = 0;
-	// copy decoded info bits to the production output buffer (the ARQ layer carves K
-	// sub-units in P2; P1 just needs them present + the per-codeword gate).
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): the decode already landed in the
+	// dedicated bigblock_rx_infobits member (the ARQ carve reads from THERE, not `out`).
+	// Copy into the caller's `out` ONLY a SAFE prefix bounded by N_MAX so the stock
+	// data_byte[N_MAX] is NEVER overrun (pre-fix this copied Kout*ldpc.K=11200 ints into the
+	// 1600-int data_byte -> 9600-int forward smash -> abort at the next config-switch free).
+	// `out` is only a legacy convenience copy now; bigblock_receive_carve uses the member.
 	int copy_bits = Kout * ldpc.K;
-	for(int i=0;i<copy_bits;i++) out[i] = info_bits[i];
+	if(copy_bits > info_bits_cap) copy_bits = info_bits_cap;   // never read past the decode buffer
+	assert(copy_bits <= info_bits_cap && "receive_bigblock: decode exceeds info-bit buffer");
+	int out_copy = copy_bits;
+	if(out_copy > N_MAX) out_copy = N_MAX;                     // never overrun a stock data_byte[N_MAX]
+	// REPRODUCER HOOK (fact-doc §13.R): MERCURY_BIGBLOCK_OLDGATE=1 restores the PRE-FIX
+	// UNBOUNDED copy-out so CASE C can show the data_byte[N_MAX] forward overrun fail-before.
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_OLDGATE");
+	  if(e && *e && atoi(e)!=0) out_copy = copy_bits; }
+	for(int i=0;i<out_copy;i++) out[i] = info_bits[i];
 
 	// stash per-codeword result for the loopback validator / P2 SACK bitmap.
 	bigblock_last_rx_cw_ok = cw_ok;
@@ -8205,8 +8271,13 @@ void cl_telecom_system::bigblock_livepath_loopback()
 	std::vector<double> tx_pb(block_n, 0.0);
 	// 3) PRODUCTION TX through transmit_byte (which branches to transmit_bigblock).
 	//    NO_FILTER_MESSAGE writes raw passband. data/nBytes unused in P1 (known payload).
+	//    HEAP-OVERRUN FIX (fact-doc §13): arm the per-call block-emit intent so the CFG16
+	//    transmit_byte branch fires; tx_pb is block-sized (block_n).
 	int dummy[1] = {0};
-	transmit_byte(dummy, 0, tx_pb.data(), NO_FILTER_MESSAGE);
+	{
+		bigblock_emit_scope emit_guard(this, block_n);
+		transmit_byte(dummy, 0, tx_pb.data(), NO_FILTER_MESSAGE);
+	}
 	int K_tx = bigblock_last_tx_K;
 	int n_tx = bigblock_last_tx_samples;
 	std::cout << "[BIGBLOCK-LIVE] TX via transmit_byte: K=" << K_tx
@@ -8286,11 +8357,18 @@ void cl_telecom_system::bigblock_livepath_loopback()
 	          << " message_decoded=" << (rs.message_decoded==YES?1:0) << std::endl;
 
 	// 7) explicit byte-correct re-check: every decoded info bit == the known TX info bit.
+	// HEAP-OVERRUN FIX (fact-doc §13): receive_bigblock now lands the full K*ldpc.K decode
+	// in the dedicated member (out_bits/`out` is only an N_MAX-bounded legacy copy). Compare
+	// against the member so the full-block byte-correct gate is unaffected by the bound.
+	const std::vector<int>& rx_bits = bigblock_rx_infobits;
 	long bit_err=0, bit_tot=0;
 	int Kcmp = (K_rx<K_tx?K_rx:K_tx);
 	for(int c=0;c<Kcmp && c<(int)bigblock_last_tx_cw_info.size();c++)
 		for(int i=0;i<ldpc.K;i++){ bit_tot++;
-			if(out_bits[(size_t)c*ldpc.K+i] != bigblock_last_tx_cw_info[c][i]) bit_err++; }
+			size_t bi=(size_t)c*ldpc.K+i;
+			int got = (bi < rx_bits.size()) ? rx_bits[bi] : -1;
+			if(got != bigblock_last_tx_cw_info[c][i]) bit_err++; }
+	(void)out_bits;
 	double ber = bit_tot? (double)bit_err/(double)bit_tot : 1.0;
 
 	bool pass = (K_rx==K_tx && K_tx>0 && cw_ok==K_tx && bit_err==0);

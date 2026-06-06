@@ -531,6 +531,46 @@ public:
 	// byte-identical to the pre-P1 baseline. See P1 plan / bigblock-hw-wav-derisk.md.
 	bool bigblock_framing_enabled = false;
 
+	// ===== HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13) =====
+	// The CFG16 big-block writes a K-codeword concatenated waveform (~45552 doubles)
+	// that is MUCH larger than one stock OFDM frame (~15184 doubles). The transmit_byte
+	// branch below must therefore fire ONLY when the CALLER actually handed a block-sized
+	// `out` buffer — NOT for every stock per-frame / single-frame / CONTROL-frame TX that
+	// happens at CONFIG_16 (those pass a frame-sized slot). bigblock_framing_enabled +
+	// current_configuration==CONFIG_16 are necessary but NOT sufficient: the gearshift
+	// (and ARQ control traffic) emit many frame-sized transmits at CFG16. The ONLY producer
+	// that passes a correctly block-sized buffer is bigblock_send_one_block() (+ the two
+	// loopback validators); they set bigblock_emit_as_block=true via the scope guard below
+	// for the duration of their transmit_byte() call. Any other CFG16 transmit_byte keeps
+	// the stock per-frame OFDM geometry. bigblock_emit_out_capacity is the block buffer's
+	// real sample capacity; transmit_bigblock/bigblock_tx_passband REFUSE to write (no
+	// overrun) if the block needs more than this. (Pre-fix: the branch fired on config
+	// alone -> a declined/control/per-frame batch overran its frame-sized slot -> heap
+	// metadata smash -> abort at the next delete[] / config-switch free.)
+	bool bigblock_emit_as_block = false;
+	int  bigblock_emit_out_capacity = 0;   // sample capacity of `out` when emit_as_block
+
+	// RAII guard: arm the block-emit intent for exactly one transmit_byte() call. Only the
+	// dedicated block driver constructs it; it auto-clears on scope exit (exception-safe).
+	struct bigblock_emit_scope
+	{
+		cl_telecom_system* ts; bool prev_flag; int prev_cap;
+		bigblock_emit_scope(cl_telecom_system* t, int out_capacity_samples)
+			: ts(t), prev_flag(t->bigblock_emit_as_block), prev_cap(t->bigblock_emit_out_capacity)
+		{ ts->bigblock_emit_as_block = true; ts->bigblock_emit_out_capacity = out_capacity_samples; }
+		~bigblock_emit_scope()
+		{ ts->bigblock_emit_as_block = prev_flag; ts->bigblock_emit_out_capacity = prev_cap; }
+	};
+
+	// Dedicated RX output buffer for the decoded K-codeword info bits. receive_bigblock
+	// decodes K*ldpc.K (= 8*1400 = 11200) info bits — WAY past N_MAX(1600). It MUST NOT
+	// be funneled through data_container.data_byte[N_MAX] (the stock per-frame output): the
+	// 9600-int forward overrun smashed adjacent data_container chunks and aborted at the
+	// next config-switch free. receive_bigblock sizes THIS to bigblock_codeword_count()*
+	// ldpc.K and writes the decode here; the ARQ carve (bigblock_receive_carve) reads from
+	// here. data_byte stays <= N_MAX so the stock-path N_MAX consumers need no re-audit.
+	std::vector<int> bigblock_rx_infobits;
+
 	// In-memory big-block PHY workers (the validated DSP, no WAV I/O). Both the WAV
 	// harness and the live path call these so the framing/estimator/LDPC are
 	// bit-identical across entry points.

@@ -874,3 +874,115 @@ VARA-parity NUMBER is NOT yet obtained on HW (no sustained CFG16 block transfer 
 
 **Commit** (P3 HW): `528234c` on `integ/bigblock-merge-2026-06-05` (on top of `0300ea0`). NO
 monitor merge, NO push, NO attribution. Bench left UNLOCKED + tables as-found.
+
+---
+
+## §13. HEAP-OVERRUN ROOT CAUSE — the K-codeword block written into / read from STOCK single-frame buffers (2026-06-05, fix branch `fix/bigblock-cfg16-heap-overrun` off `integ/bigblock-merge-2026-06-05`@`fe9d3e3`)
+
+**Symptom (HW-observed, A/B-localized to `MERCURY_BIGBLOCK_FRAMING=1`):** the FIRST CFG16
+big-block TX aborts BOTH instances with glibc heap corruption — COMMANDER `free(): invalid
+next size` right after an OVERSIZED `[TX-PEAK] ... size=45552 cfg=16` burst; RESPONDER
+`free(): invalid pointer` in the CFG16 PHY-SWITCH deinit. Env UNSET ⇒ CFG16 completes clean.
+So the fault is in the big-block CFG16 TX/RX path: a K=8 concatenated block written
+into/freed from an allocation sized for ONE stock CFG16 frame.
+
+### §13.1 The TWO production overruns (both confirmed in CASE C, see §13.4)
+**(A) TX divert — COMMANDER.** The big-block branch in `transmit_byte`
+(`telecom_system.cc:626`, pre-fix) gated ONLY on `bigblock_framing_enabled && M!=MFSK &&
+current_configuration==CONFIG_16` — it ignored WHICH caller / which `out` buffer it was
+handed. But at the CFG16 rung the gearshift + ARQ control loop issue MANY stock per-frame
+(`send_batch` loop `arq_common.cc:4317`, into `&batch_frames_output_data[pack_cursor]`, one
+`frame_output_size`≈16120-double slot) and single-frame (`send()` `arq_common.cc:4011`, into
+`ready_to_transmit_passband_data_tx`, `total_frame_size` doubles) transmits — every
+CONTROL/ACK/SACK_RSP frame, and the WHOLE batch whenever `bigblock_send_one_block()` DECLINES
+(mixed-control batch, `sack_retransmit_active`, `n_data>K`, `len0>cw0_cap`;
+`arq_common.cc:3666-3706`). Each of those handed a FRAME-sized `out`. The unconditional
+divert routed them into `transmit_bigblock`→`bigblock_tx_passband`, which writes the WHOLE
+K-block passband (`(Nofdm*pre_nSymb + Nofdm*Ngrid)*interp` doubles — **MEASURED 79360 at the
+live thin grid**, telecom_system.cc:7058-7065) into the frame slot ⇒ ~63k-double forward heap
+smash of `batch_frames_output_data_filtered1/2`. `transmit_bigblock` never set
+`tx_last_emitted_frame_samples`, so the `frame_len` clamp (`arq_common.cc:4321`) under-advanced
+`pack_cursor` and HID the overrun in software; the next `delete[] batch_frames_output_data`
+(`arq_common.cc:4522`) aborted `free(): invalid next size`. (The 45552 in the HW log was the
+in-bounds size of the VICTIM stock buffer, printed AFTER the smash.)
+
+**(B) RX copy-out — RESPONDER.** `receive_bigblock` decodes `Kout*ldpc.K = 8*1400 = 11200`
+info bits, then copied them with `for(i<copy_bits) out[i]=info_bits[i]`
+(`telecom_system.cc:8166-8167`, pre-fix) into the caller's `out`. On the live ARQ path
+`out == data_container.data_byte = int[N_MAX=1600]` (`arq_common.cc:6765`; alloc
+`data_container.cc:108`; `N_MAX` `physical_defines.h:31`) ⇒ **9600-int (38400-byte) forward
+overrun** smashing the adjacent `data_container` chunk headers (`encoded_data`,
+`bit_interleaved_data`, …). Latent until the next `bigblock_restore_stock_config()` →
+`load_configuration` → `data_container.deinit()` CDELETE chain (`data_container.cc:222-227`)
+freed a clobbered neighbor ⇒ `free(): invalid pointer` in the PHY-SWITCH deinit. The consumer
+`bigblock_receive_carve` (`arq_common.cc:3847`, `nbits=K*sub_len*8=11200`) likewise OVER-READ
+the 1600-int `data_byte`.
+
+### §13.2 Why the in-sim CASE A/B ran GREEN while the live path crashed (the sim-faithfulness gap)
+`run_block_loopback` (`test_bigblock_arq_unit.cc`) passed a CORRECTLY block-sized
+`info_bits_out` (`(K_tx+1)*ldpc.K + ldpc.K`) to `receive_byte` and a block-sized `tx_pb`
+(`bigblock_tx_total_samples()`) to `transmit_byte` — so NEITHER the copy-out NOR the divert
+ever touched an undersized PRODUCTION allocation. Canaries were disabled passthrough
+(`include/debug/canary_guard.h`), so the Windows allocator's slack hid the smash. The sim
+exercised the block PHY but NOT the stock production buffers the live ARQ path hands it.
+
+### §13.3 The fix (root cause: SIZE from real geometry + CONSTRAIN the producer; never enlarge a magic constant)
+- **Producer constraint (TX, fixes COMMANDER on every decline/control/per-frame path).** Added
+  a per-call block-emit intent `bigblock_emit_as_block` (+ `bigblock_emit_out_capacity`) on
+  `cl_telecom_system` and a RAII `bigblock_emit_scope` (`telecom_system.h`). The
+  `telecom_system.cc:626` branch now ALSO requires `bigblock_emit_as_block`. Only the dedicated
+  block driver `bigblock_send_one_block` (`arq_common.cc`) and the two loopback validators set
+  it — and ONLY while they pass a BLOCK-sized buffer (`bigblock_tx_total_samples()`-derived).
+  Every stock per-frame/single-frame/control `transmit_byte` at CFG16 keeps the per-frame OFDM
+  geometry. A HARD GUARD inside `transmit_bigblock` computes `required =
+  bigblock_tx_total_samples()` and REFUSES (no write, `assert`) when it exceeds
+  `bigblock_emit_out_capacity`. Defense-in-depth: a block emit now stamps
+  `tx_last_emitted_frame_samples` so the `frame_len` bookkeeping can never again mask an overrun.
+- **RX output sizing (fixes RESPONDER on every path).** Added `std::vector<int>
+  bigblock_rx_infobits` on `cl_telecom_system`; `receive_bigblock` sizes it to
+  `(K_expected+1)*ldpc.K + ldpc.K` (≥ `Kout*ldpc.K`) and lands the decode THERE. The ARQ carve
+  reads from that member (`arq_common.cc:6794` now passes
+  `telecom_system->bigblock_rx_infobits.data()`, NOT `data_byte`). The legacy copy into `out`
+  is BOUNDED by `N_MAX` so the stock `data_byte[N_MAX]` is never overrun and its N_MAX consumers
+  need no re-audit. `bigblock_livepath_loopback`'s byte-correct re-check now reads the member too.
+
+### §13.4 Producer/consumer audit update for the big-block TX/RX info-bit buffers
+- **`bigblock_rx_infobits` (NEW).** Producer: `receive_bigblock` copy-in (`telecom_system.cc`,
+  sized `(K_expected+1)*ldpc.K + ldpc.K`). Consumers: `bigblock_receive_carve`
+  (`arq_common.cc:3847`, reads `K*sub_len*8 = K*ldpc.K` ints — `<=` size by construction since
+  `sub_len==ldpc.K/8`); the live-path validator §7 re-check; CASE A/B/C. INVARIANT: capacity
+  `>= Kout*ldpc.K`; held by construction.
+- **`data_container.data_byte[N_MAX]`.** Producer on the big-block path is now ONLY the
+  N_MAX-bounded legacy copy in `receive_bigblock` (never `> N_MAX`). The full block decode no
+  longer flows through it — so its long list of stock N_MAX consumers is unchanged/safe.
+- **`batch_frames_output_data` (per-frame TX slots) / `ready_to_transmit_passband_data_tx`
+  (single-frame TX).** Producer `transmit_byte` at CFG16 now stays on the per-frame OFDM path
+  unless the caller armed `bigblock_emit_as_block` with a block-sized buffer ⇒ writes
+  `<= frame_output_size` / `total_frame_size`. INVARIANT restored: a block waveform is emitted
+  ONLY into a `bigblock_tx_total_samples()`-sized buffer (the `block_pb` in
+  `bigblock_send_one_block`, `tx_pb` in the validators).
+
+### §13.5 Reproducer — `--test-sim-inproc-bigblock` CASE C (deterministic, local, fail-before/pass-after on ONE binary)
+CASE C (`test_bigblock_arq_unit.cc`) drives the EXACT production buffers with explicit tail
+canaries: **RX leg** calls the REAL `receive_byte(rx_pb, out)` with `out` a `data_byte`-shaped
+buffer (canary AT the `N_MAX` boundary); **TX leg** calls the REAL `transmit_byte` at CFG16 into
+a frame-sized slot (canary at the slot boundary) WITHOUT arming the emit scope — the exact
+declined-batch/control fallthrough. `MERCURY_BIGBLOCK_OLDGATE=1` restores the pre-fix gate
+(config-only divert + unbounded copy-out) on the SAME binary so the fail-before is reproducible
+without a revert build; buffers are over-allocated so the pre-fix write trips the boundary
+canary WITHOUT a process-killing smash.
+
+| run | RX canary | TX canary | rx_member | result |
+|-----|-----------|-----------|-----------|--------|
+| `MERCURY_BIGBLOCK_OLDGATE=1` (pre-fix) | **0 (SMASHED)** | **0 (SMASHED)** | 14000≥11200 | **CASE C FAIL** |
+| (fixed, default) | 1 (intact) | 1 (intact) | 14000≥11200 | **CASE C PASS** |
+
+Measured geometry: `frame_slot=16120  block_n=79360  n_tx=79360` ⇒ the block is **4.9×** the
+stock frame slot. **Regression:** `--test-sim-inproc-bigblock` ALL PASS (CASE A 619/619
+byte-faithful, CASE B selective-repeat, CASE C); `--test-bigblock-arq-unit` 8/8;
+`--test-climb-engine` 0 failures. Net-PHY is a function of the UNCHANGED block geometry (pilot
+thinning / nData / log2M / rate) — this is a buffer-sizing + free correction, NOT a wire-format
+change — so the §13-sibling sim2 net-PHY (7859/7960 bps > VARA 7050) is preserved.
+
+**Commit** (heap-overrun fix): on `fix/bigblock-cfg16-heap-overrun` off
+`integ/bigblock-merge-2026-06-05`@`fe9d3e3`. NO monitor merge, NO push, NO attribution.
