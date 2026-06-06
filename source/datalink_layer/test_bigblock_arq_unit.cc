@@ -1391,6 +1391,139 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		check(pass, "CASE B one-bad-codeword partial -> selective-repeat completes block in-sim");
 	}
 
+	// ====================================================================
+	// CASE C — FAILURE-2 PRODUCER TEST (the gap T3/T4/CASE-B skipped). Flip a
+	// bit in the LLR of ONE codeword (NOT the cw_ok array) so the REAL PHY decode
+	// emits a corrupted info-bit sub-unit for that codeword. On the live 2-instance
+	// path the PHY cw_ok producer (bigblock_rx_passband, cw_info_ref==NULL) FORCES
+	// cw_ok=1 for every codeword — so WITHOUT the wire CRC this corrupted codeword
+	// is accepted clean and NEVER retransmitted (the silent-corruption bug). The
+	// wire-CRC recompute in bigblock_receive_carve must DEMOTE that codeword's
+	// cw_ok to 0, and the selective-repeat must re-send EXACTLY it.
+	//   FAIL-BEFORE (no wire CRC): producer forces cw_ok all-clean -> carve delivers
+	//                              the corrupted codeword, retx_count==0 (accepted).
+	//   PASS-AFTER  (wire CRC):    carve recomputes CRC over the de-whitened bytes,
+	//                              demotes the corrupted codeword, retx re-sends it.
+	{
+		const int bad_cw      = 4;          // != 0 so cw0 (the wire header) stays clean
+		const int block_bsi_c = 11;
+		build_block_wire(block_bsi_c);      // wire header carries CASE C's bsi
+		B->rsp_current_expected_batch_seq_id = block_bsi_c;
+		B->rsp_prev_batch_seq_id             = -1;
+		B->rsp_prev_batch_active             = false;
+		B->rsp_prev_batch_received_count     = 0;
+		B->retransmit_count                  = 0;
+		B->batch_rx_frame_count              = 0;
+		B->last_received_end_of_batch_seq    = -1;
+		for(int i=0;i<B->nMessages;i++)
+		{
+			B->messages_rx[i].status = FREE;
+			B->messages_rx[i].length = 0;
+			B->messages_rx[i].batch_seq_id = -1;
+		}
+
+		// Arm the PHY-layer LLR corruption hook for EXACTLY codeword bad_cw. This flips
+		// the sign of a run of that codeword's LLRs before its ldpc.decode, so the REAL
+		// decode produces wrong info_bits for it (a miscorrection / residual-error the
+		// LDPC iter-count does NOT flag) while cw0 + the other codewords stay clean.
+		char cw_env[16]; snprintf(cw_env, sizeof(cw_env), "%d", bad_cw);
+#if defined(_WIN32)
+		_putenv_s("MERCURY_BIGBLOCK_CORRUPT_CW", cw_env);
+#else
+		setenv("MERCURY_BIGBLOCK_CORRUPT_CW", cw_env, 1);
+#endif
+
+		std::vector<int> info_bits;
+		int K_rx = run_block_loopback(tsA, tsB, tx_truth, info_bits);
+		bool decoded = (K_rx == K);
+
+		// Disarm the hook immediately (so nothing else in the process is corrupted).
+#if defined(_WIN32)
+		_putenv_s("MERCURY_BIGBLOCK_CORRUPT_CW", "");
+#else
+		unsetenv("MERCURY_BIGBLOCK_CORRUPT_CW");
+#endif
+
+		// FAIL-BEFORE EVIDENCE: the PHY cw_ok producer (bigblock_rx_passband, the
+		// telecom_system->bigblock_last_rx_cw_ok array) forced ALL codewords clean even
+		// though bad_cw decoded corrupt (cw_info_ref==NULL on the 2-instance path). This
+		// is exactly the state in which, WITHOUT the wire CRC, the carve would have
+		// accepted the corrupted codeword + never retransmitted it. We do NOT touch the
+		// cw_ok array — the carve's wire-CRC recompute is the only thing that can demote.
+		int producer_clean_count = tsB->bigblock_last_rx_cw_ok_count;
+		bool producer_forced_clean = (producer_clean_count == K)
+		    && (bad_cw < (int)tsB->bigblock_last_rx_cw_ok.size())
+		    && (tsB->bigblock_last_rx_cw_ok[bad_cw] == 1);
+
+		// DIRECT WIRE-CRC PROOF (non-vacuous): de-whiten the decoded info_bits EXACTLY as
+		// bigblock_receive_carve does, then recompute the per-codeword CRC-8 over the same
+		// span and compare to each codeword's tail CRC byte. This is the very check the
+		// carve runs to produce cw_ok. Assert it MISMATCHES on bad_cw (the corruption
+		// landed -> the wire CRC catches what the producer forced clean) and MATCHES on
+		// cw0 (the header codeword) + every other codeword (no false demotion).
+		bool crc_mismatch_bad = false, crc_match_others = true, crc_match_cw0 = true;
+		{
+			int sub_len_c = tsB->ldpc.K / 8;
+			int nbits_c   = K * sub_len_c * 8;
+			std::vector<int> dw((size_t)nbits_c, 0);
+			for(int i=0;i<nbits_c && i<(int)info_bits.size();i++) dw[i] = info_bits[i] & 1;
+			tsB->bigblock_whiten_bits(dw.data(), nbits_c);   // de-whiten (self-inverse)
+			std::vector<unsigned char> pl((size_t)K * sub_len_c, 0);
+			for(int c=0;c<K;c++)
+				for(int b=0;b<sub_len_c;b++){
+					unsigned char by=0;
+					for(int bit=0;bit<8;bit++){ int idx=(c*sub_len_c+b)*8+bit;
+						if(idx<nbits_c && (dw[idx]&1)) by|=(unsigned char)(1u<<bit); }
+					pl[(size_t)c*sub_len_c + b]=by; }
+			int span = BIGBLOCK_CW_CRC_SPAN(sub_len_c);
+			for(int c=0;c<K;c++){
+				int off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len_c);
+				unsigned char calc = CRC8_calc((char*)&pl[(size_t)c*sub_len_c], span);
+				bool match = (calc == pl[(size_t)off]);
+				if(c==bad_cw){ crc_mismatch_bad = !match; }
+				else if(c==0){ crc_match_cw0 = match; if(!match) crc_match_others=false; }
+				else if(!match) crc_match_others=false;
+			}
+		}
+		bool corruption_landed = crc_mismatch_bad;  // bad_cw's bytes provably differ from its CRC
+
+		// RX carve: the wire CRC recompute (FAILURE-2 fix) runs on the de-whitened payload
+		// BEFORE the header-trust gate and DEMOTES the corrupted codeword in the carve's
+		// own cw_ok vector (the consumer the SACK reads — NOT the stale telecom array).
+		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)block_bsi_c);
+		bool wired = (rc == SUCCESSFUL);
+
+		// PASS-AFTER (the OBSERVABLE consumer effect of the carve's cw_ok==0 demotion):
+		// bad_cw is absent from messages_rx[] and the selective-repeat re-requested
+		// EXACTLY it. Because the producer forced bad_cw CLEAN, the ONLY thing that could
+		// make it absent + re-requested is the wire-CRC demote -> this IS the demotion.
+		int recv_partial = B->bigblock_test_count_received(K);
+		bool bad_absent  = (B->messages_rx[bad_cw].status != RECEIVED);
+		bool partial_ok  = (recv_partial == K - 1) && bad_absent;
+		bool one_retx    = (B->retransmit_count == 1);
+		bool retx_pos_ok = one_retx && (B->retransmit_frame_positions[0] == bad_cw)
+		                && (B->retransmit_frame_batch_seq_ids[0] == block_bsi_c);
+		bool others_recv = true;             // every OTHER codeword delivered clean (no false demote)
+		for(int c=0;c<K;c++)
+			if(c != bad_cw && B->messages_rx[c].status != RECEIVED) others_recv = false;
+
+		bool pass = decoded && producer_forced_clean && wired && corruption_landed
+		         && crc_match_cw0 && crc_match_others && partial_ok && one_retx
+		         && retx_pos_ok && others_recv;
+		printf("[TEST-SIM-BIGBLOCK] CASE C FAILURE-2 producer (LLR-corrupt cw=%d): %s "
+			"(decoded=%d K_rx=%d producer_forced_clean=%d[count=%d] wired=%d "
+			"crc_mismatch_bad=%d crc_match_cw0=%d crc_match_others=%d partial=%d/%d "
+			"bad_absent=%d retx_count=%d retx_pos_ok=%d others_recv=%d)\n",
+			bad_cw, pass ? "PASS" : "FAIL", (int)decoded, K_rx,
+			(int)producer_forced_clean, producer_clean_count, (int)wired,
+			(int)crc_mismatch_bad, (int)crc_match_cw0, (int)crc_match_others,
+			recv_partial, K, (int)bad_absent, B->retransmit_count, (int)retx_pos_ok,
+			(int)others_recv);
+		fflush(stdout);
+		check(pass, "CASE C FAILURE-2 wire-CRC producer: LLR-corrupt cw -> cw_ok==0 -> "
+		            "selective-repeat re-sends EXACTLY it (FAIL-before/PASS-after)");
+	}
+
 	delete A; delete B;
 	delete tsA; delete tsB;
 	restore_env();
