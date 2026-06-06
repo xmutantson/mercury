@@ -3779,10 +3779,20 @@ bool cl_arq_controller::bigblock_send_one_block()
 	// the block is ~ (4 preamble + Ngrid) symbols; size the TX buffer generously.
 	int block_buf_samples = telecom_system->bigblock_tx_total_samples();
 	if(block_buf_samples <= 0) block_buf_samples = frame_output_size;
-	std::vector<double> block_pb((size_t)block_buf_samples + frame_output_size, 0.0);
+	int block_pb_capacity = block_buf_samples + frame_output_size;
+	std::vector<double> block_pb((size_t)block_pb_capacity, 0.0);
 
-	telecom_system->transmit_byte(block_payload.data(), (int)block_payload_len,
-		block_pb.data(), NO_FILTER_MESSAGE);
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): this is the ONLY ARQ producer that hands
+	// transmit_byte a BLOCK-sized `out`. Arm the per-call block-emit intent (+ the real
+	// capacity) for the duration of THIS transmit_byte so its CFG16 branch may emit the
+	// K-codeword waveform here; every other CFG16 transmit_byte (stock per-frame / single-
+	// frame / control) leaves the flag false and keeps the per-frame OFDM geometry. The
+	// guard auto-clears on scope exit (exception-safe).
+	{
+		cl_telecom_system::bigblock_emit_scope emit_guard(telecom_system, block_pb_capacity);
+		telecom_system->transmit_byte(block_payload.data(), (int)block_payload_len,
+			block_pb.data(), NO_FILTER_MESSAGE);
+	}
 	int K_tx = telecom_system->bigblock_last_tx_K;
 	int n_tx = telecom_system->bigblock_last_tx_samples;
 	printf("[BIGBLOCK-TX] one-block emit: K=%d (n_data=%d) sub_len=%d bsi=%u "
@@ -3836,11 +3846,16 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 
 	// re-pack the decoded info bits -> K*sub_len bytes (LSB-first, the byte_to_bit
 	// convention transmit_bigblock used). info_bits may be null on a total acq miss.
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): on the live path info_bits is
+	// telecom_system->bigblock_rx_infobits (sized K*ldpc.K by receive_bigblock), NOT
+	// data_container.data_byte[N_MAX] — this carve reads nbits = K*sub_len*8 = K*ldpc.K ints,
+	// which would over-read the 1600-int data_byte. (The in-process test passes its own
+	// correctly-sized vector.) nbits == K*ldpc.K by construction (sub_len == ldpc.K/8).
 	// PHASE 1 (fact-doc §11.6): the real-bytes TX energy-disperses (whitens) the payload
 	// bits before LDPC encode (so a zero-padded short compressed frame still decodes).
 	// De-whiten the decoded bits HERE (self-inverse XOR, same PRBS) before re-packing to
-	// bytes — recovers the exact payload. Copy into a local buffer first (info_bits is
-	// the shared data_byte; must not mutate it in place).
+	// bytes — recovers the exact payload. Copy into a local buffer first (don't mutate the
+	// source in place).
 	std::vector<unsigned char> payload((size_t)K * sub_len, 0);
 	if(info_bits != NULL)
 	{
@@ -6791,7 +6806,13 @@ void cl_arq_controller::receive()
 		{
 			int fallback_bsi = (rsp_current_expected_batch_seq_id >= 0)
 				? (rsp_current_expected_batch_seq_id & 0xFF) : 0;
-			bigblock_receive_carve(telecom_system->data_container.data_byte,
+			// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): carve from the DEDICATED
+			// telecom_system->bigblock_rx_infobits (sized K*ldpc.K = 11200 ints by
+			// receive_bigblock), NOT data_container.data_byte[N_MAX=1600]. The carve reads
+			// K*sub_len*8 = 11200 ints; reading them out of the 1600-int data_byte was a
+			// 9600-int over-read (and the decode copy-in had already over-written it). The
+			// member always holds the full block decode; data_byte stays a stock-path buffer.
+			bigblock_receive_carve(telecom_system->bigblock_rx_infobits.data(),
 				(unsigned char)fallback_bsi, /*use_wire_header=*/true);
 			bigblock_rx_handled = true;
 			// the carve already populated messages_rx[] + advanced ARQ state; the

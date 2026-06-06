@@ -1187,7 +1187,12 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		for(size_t i=0;i<bytes.size();i++) payload[i] = (int)bytes[i];
 		std::vector<double> tx_pb((size_t)block_n, 0.0);
 		tx->bigblock_framing_enabled = true;
-		tx->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		// HEAP-OVERRUN FIX (fact-doc §13): arm the per-call block-emit intent so the CFG16
+		// transmit_byte branch fires (tx_pb is block-sized = block_n).
+		{
+			cl_telecom_system::bigblock_emit_scope emit_guard(tx, block_n);
+			tx->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		}
 		int K_tx = tx->bigblock_last_tx_K;
 		int n_tx = tx->bigblock_last_tx_samples;
 		if(K_tx <= 0 || n_tx <= 0) return -1;
@@ -1250,8 +1255,11 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 
 		// RSP carve (production RX wiring): fallback_bsi is DELIBERATELY wrong; the wire
 		// header (use_wire_header=true, default) must override it with the TX bsi.
+		// HEAP-OVERRUN FIX (fact-doc §13): carve from the DEDICATED rx member exactly as the
+		// live RX path (arq_common.cc:6794) — receive_bigblock landed the full K*ldpc.K decode
+		// there, NOT in `info_bits` (which is now only an N_MAX-bounded legacy copy).
 		const int wrong_fallback = (block_bsi + 3) & 0xFF;
-		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)wrong_fallback);
+		int rc = B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)wrong_fallback);
 		bool wired = (rc == SUCCESSFUL);
 
 		int recv       = B->bigblock_test_count_received(K);
@@ -1330,7 +1338,8 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		tsB->bigblock_last_rx_cw_ok_count = K - 1;
 
 		// Wire header in cw0 is clean -> the carve uses the WIRE bsi + length table.
-		int rc = B->bigblock_receive_carve(info_bits.data(), (unsigned char)block_bsi_b);
+		// HEAP-OVERRUN FIX (fact-doc §13): carve from the dedicated rx member (live wiring).
+		int rc = B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)block_bsi_b);
 		bool wired = (rc == SUCCESSFUL);
 
 		int recv_partial = B->bigblock_test_count_received(K);
@@ -1374,6 +1383,128 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 			delivered, total_app_bytes);
 		fflush(stdout);
 		check(pass, "CASE B one-bad-codeword partial -> selective-repeat completes block in-sim");
+	}
+
+	// ====================================================================
+	// CASE C — PRODUCTION-BUFFER big-block TX/RX heap-overrun guard
+	// (fact-doc §13). CASE A/B bypass the undersized PRODUCTION buffers:
+	// run_block_loopback passes a correctly block-sized info_bits_out + a
+	// block-sized tx_pb, so neither the receive_bigblock copy-out nor the
+	// transmit_byte divert ever touches an undersized live allocation — they
+	// ran GREEN on Windows WHILE the live path heap-overran (the OS allocator
+	// tolerated it). CASE C drives the EXACT live buffers with an explicit
+	// tail canary so the overrun is caught deterministically on ANY platform.
+	//
+	//   RX leg: call the REAL receive_byte(rx_pb, out) where `out` is a
+	//           data_byte-shaped buffer (N_MAX ints) followed by a CANARY
+	//           guard region — exactly as arq_common.cc:6765 passes
+	//           data_container.data_byte. PRE-fix the copy-out wrote
+	//           Kout*ldpc.K=11200 ints -> smashed the guard. POST-fix the
+	//           decode lands in bigblock_rx_infobits and only N_MAX is copied
+	//           -> guard intact.
+	//   TX leg: call the REAL transmit_byte at CFG16 into a FRAME-sized buffer
+	//           + CANARY, WITHOUT arming the block-emit scope — the exact
+	//           declined-batch / control-frame fallthrough condition
+	//           (arq_common.cc:4317/4011). PRE-fix the config-only gate routed
+	//           it into transmit_bigblock -> ~45552 doubles into the frame slot
+	//           -> guard smashed. POST-fix the per-call intent is false -> stock
+	//           per-frame OFDM geometry -> guard intact.
+	//
+	// Both legs PASS in the normal suite run (fixed). MERCURY_BIGBLOCK_OLDGATE=1
+	// restores the pre-fix behavior on the SAME binary so the fail-before is
+	// reproducible without a revert build (the guard checks then FAIL).
+	{
+		const int GUARD = 64;
+		const int sentinel = 0x5A5A5A5A;
+		bool oldgate = false;
+		{ const char* e = std::getenv("MERCURY_BIGBLOCK_OLDGATE"); if(e && *e && atoi(e)!=0) oldgate = true; }
+
+		// ---- produce ONE valid clean block waveform (CMD side), for the RX leg ----
+		build_block_wire(block_bsi);
+		int interp = tsA->frequency_interpolation_rate;
+		int block_n = tsA->bigblock_tx_total_samples();
+		std::vector<double> tx_pb((size_t)block_n, 0.0);
+		{
+			std::vector<int> payload((size_t)tx_truth.size(), 0);
+			for(size_t i=0;i<tx_truth.size();i++) payload[i] = (int)tx_truth[i];
+			tsA->bigblock_framing_enabled = true;
+			cl_telecom_system::bigblock_emit_scope emit_guard(tsA, block_n);  // CMD emits a BLOCK (correct buffer)
+			tsA->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		}
+		int n_tx = tsA->bigblock_last_tx_samples;
+
+		// ---- RX LEG: receive_byte into a data_byte-shaped buffer + tail canary ----
+		int lead_n  = (int)(100.0 * tsB->sampling_frequency / 1000.0);
+		int trail_n = (int)(50.0  * tsB->sampling_frequency / 1000.0);
+		int rx_window = lead_n + n_tx + trail_n;
+		std::vector<double> rx_pb((size_t)rx_window, 0.0);
+		for(int i=0;i<n_tx && i<(int)tx_pb.size();i++) rx_pb[lead_n + i] = tx_pb[i];
+		int Nofdm = tsB->data_container.Nofdm;
+		int saved_buffer_Nsymb = tsB->data_container.buffer_Nsymb;
+		if(Nofdm > 0)
+		{
+			int need_syms = (rx_window + Nofdm*interp - 1) / (Nofdm*interp);
+			tsB->data_container.buffer_Nsymb = need_syms;
+			int exact = need_syms * Nofdm * interp;
+			if((int)rx_pb.size() < exact) rx_pb.resize((size_t)exact, 0.0);
+		}
+		// out buffer models data_container.data_byte[N_MAX]: the canary sits AT the N_MAX
+		// boundary (the live data_byte's true end). Allocate the FULL block-decode extent +
+		// guard so that under OLDGATE the (wrong) unbounded copy lands WITHIN this allocation
+		// and only trips the boundary canary — no unrelated heap smash / crash. Post-fix the
+		// copy is bounded to N_MAX, so the canary stays intact.
+		int rx_full = (K + 1) * tsB->ldpc.K + tsB->ldpc.K;   // >= Kout*ldpc.K
+		size_t rx_out_cap = (size_t)(rx_full > N_MAX ? rx_full : N_MAX) + GUARD;
+		std::vector<int> rx_out(rx_out_cap, sentinel);
+		tsB->bigblock_framing_enabled = true;
+		tsB->receive_byte(rx_pb.data(), rx_out.data());
+		tsB->data_container.buffer_Nsymb = saved_buffer_Nsymb;
+		bool rx_canary_ok = true;
+		for(int i=0;i<GUARD;i++) if(rx_out[(size_t)N_MAX + i] != sentinel) { rx_canary_ok = false; break; }
+		// post-fix the full decode is in the dedicated member (carve reads it), sized for K.
+		bool rx_member_sized = ((int)tsB->bigblock_rx_infobits.size() >= K * tsB->ldpc.K);
+
+		// ---- TX LEG: transmit_byte at CFG16 into a FRAME-sized buffer + tail canary,
+		//      WITHOUT the block-emit scope (the declined-batch / control fallthrough) ----
+		int active_nsymb = tsA->get_active_nsymb();
+		int frame_output_size = tsA->data_container.Nofdm
+			* tsA->data_container.interpolation_rate
+			* (active_nsymb + tsA->data_container.preamble_nSymb);
+		// Allocate the FULL block extent + guard so that under OLDGATE the (wrong) block
+		// write lands WITHIN this allocation and only trips the canary at the frame-slot
+		// boundary — no unrelated heap smash / crash, a clean deterministic FAIL signal.
+		// Post-fix the stock per-frame path writes <= frame_output_size, leaving the canary
+		// (placed AT the slot boundary) intact.
+		size_t tx_frame_cap = (size_t)(block_n > frame_output_size ? block_n : frame_output_size) + GUARD;
+		std::vector<double> tx_frame(tx_frame_cap, 0.0);
+		for(int i=0;i<GUARD;i++) tx_frame[(size_t)frame_output_size + i] = (double)sentinel;
+		// a small stock CONTROL-sized payload (well within one frame). NO emit scope ->
+		// bigblock_emit_as_block stays false -> stock per-frame path (post-fix). Mark the
+		// TX stash so we can detect whether a block was (wrongly) emitted into the frame slot.
+		int ctrl_len = 4;
+		for(int i=0;i<ctrl_len;i++) tsA->data_container.data_byte[i] = i & 0xFF;
+		tsA->bigblock_last_tx_samples = -1;   // sentinel: stock path won't touch it; a block emit sets it >0
+		tsA->bigblock_framing_enabled = true;
+		tsA->transmit_byte(tsA->data_container.data_byte, ctrl_len, tx_frame.data(), NO_FILTER_MESSAGE);
+		bool tx_canary_ok = true;
+		for(int i=0;i<GUARD;i++) if(tx_frame[(size_t)frame_output_size + i] != (double)sentinel) { tx_canary_ok = false; break; }
+		// post-fix the declined frame took the STOCK per-frame path (no block emitted here):
+		// the block stash was NOT updated (still the -1 sentinel) AND a block could not have
+		// fit (frame_output_size < block_n). PRE-fix (oldgate) a block IS emitted -> stash >0.
+		bool tx_no_block = (tsA->bigblock_last_tx_samples <= 0) && (frame_output_size < block_n);
+
+		bool pass = rx_canary_ok && tx_canary_ok && rx_member_sized && tx_no_block;
+		printf("[TEST-SIM-BIGBLOCK] CASE C production-buffer overrun guard: %s "
+			"(oldgate=%d rx_canary_ok=%d tx_canary_ok=%d rx_member=%zu(>=%d) "
+			"frame_slot=%d block_n=%d n_tx=%d)\n",
+			pass ? "PASS" : "FAIL", (int)oldgate, (int)rx_canary_ok, (int)tx_canary_ok,
+			tsB->bigblock_rx_infobits.size(), K * tsB->ldpc.K,
+			frame_output_size, block_n, n_tx);
+		fflush(stdout);
+		if(oldgate)
+			printf("[TEST-SIM-BIGBLOCK] CASE C NOTE: OLDGATE=1 reproduces the PRE-FIX overrun "
+				"(expect canary FAIL) — fail-before proof on the same binary.\n");
+		check(pass, "CASE C production-buffer big-block TX/RX no heap overrun (data_byte + frame slot canaries intact)");
 	}
 
 	delete A; delete B;

@@ -707,3 +707,35 @@ flat 6% 7960). The net-PHY recovery is PRESERVED on the selective channel.
 - The Watterson time-VARYING (fading) channel is not tested — this bench is selective-
   but-STATIC. A fading channel would need the time-interp/Wiener to actually track time
   variation (here it only suppresses noise); that is a further increment.
+
+## §15. SIM-FAITHFULNESS GAP CLOSED — in-sim big-block CASE ran GREEN while the LIVE path heap-overran (2026-06-05)
+
+**The gap.** The CFG16 big-block had a heap-corruption bug (full audit:
+`data-flow-bigblock-arq-unit.md §13`): the K=8 concatenated block was WRITTEN INTO a stock
+single-frame TX slot (`transmit_byte` config-only divert → `transmit_bigblock` wrote ~79360
+doubles into a ~16120-double frame slot) and the K*ldpc.K=11200-int decode was COPIED OUT into
+`data_container.data_byte[N_MAX=1600]` (a 9600-int forward overrun). On HW both instances
+aborted with glibc heap corruption on the FIRST CFG16 block (`free(): invalid next size` /
+`invalid pointer` in the PHY-SWITCH deinit). **Yet `--test-sim-inproc-bigblock` CASE A/B ran
+GREEN.** Why: the in-sim harness `run_block_loopback` passed a CORRECTLY block-sized
+`info_bits_out` and a block-sized `tx_pb` to the production `receive_byte`/`transmit_byte`, so
+neither the copy-out nor the divert ever touched an UNDERSIZED PRODUCTION allocation. Canaries
+were disabled passthrough (`include/debug/canary_guard.h`), so the Windows allocator's slack hid
+the smash. **The sim exercised the block PHY but NOT the stock production buffers the live ARQ
+path hands it** — the same class of faithfulness gap this document tracks (the sim modeled the
+DSP but not the live data-flow plumbing).
+
+**How it was closed.** Added `--test-sim-inproc-bigblock` **CASE C** ("production-buffer
+big-block TX/RX heap-overrun guard"): it drives the EXACT live buffers with explicit tail
+canaries — the RX leg calls the real `receive_byte(rx_pb, out)` with `out` a `data_byte`-shaped
+buffer (canary AT the N_MAX boundary, exactly as `arq_common.cc:6765` passes
+`data_container.data_byte`); the TX leg calls the real `transmit_byte` at CFG16 into a
+frame-sized slot (canary at the slot boundary) WITHOUT arming the block-emit scope — the exact
+declined-batch/control fallthrough that overran. `MERCURY_BIGBLOCK_OLDGATE=1` restores the
+pre-fix behavior on the SAME binary, so the fail-before is reproducible without a revert build:
+pre-fix BOTH canaries are SMASHED (CASE C FAIL); post-fix BOTH intact (CASE C PASS). This is a
+deterministic, platform-independent bounds check that no longer depends on the OS allocator's
+tolerance — the faithfulness gap (in-sim green while live-overrunning) is closed by a canary the
+production data-flow now trips on any mis-sizing. (Fix branch `fix/bigblock-cfg16-heap-overrun`
+off `integ/bigblock-merge-2026-06-05`@`fe9d3e3`; net-PHY 7859/7960 > VARA 7050 preserved — a
+buffer-sizing/free correction, not a wire-format change.)
