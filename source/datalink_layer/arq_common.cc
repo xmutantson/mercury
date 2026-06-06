@@ -973,9 +973,14 @@ void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
 	// framing bit the gearshift elects. set_data_batch_size()'s non-robust branch
 	// accepts K (>0, below the cap) cleanly; recalculate_ack_timeout_for_batch()
 	// (below) re-sizes the data-ACK timeout for the pinned batch.
+	// P3 HW FIX: pin batch=K ONLY at the CONFIG_16 big-block rung (was: any non-robust
+	// config). At CONFIG_0..15 bigblock_codeword_count() returns that config's K (e.g. 1)
+	// and pinning batch=1 there, combined with the carve engaging, stalled the climb. The
+	// block framing only runs at CONFIG_16 (see bigblock_send_one_block / the RX carve), so
+	// the K-pin belongs there too; CONFIG_0..15 use the stock 30s-target batch below.
 	bool bigblock_rung = (telecom_system != NULL)
 	                   && telecom_system->bigblock_framing_enabled
-	                   && !is_robust_config(current_configuration);
+	                   && current_configuration == CONFIG_16;
 	if(bigblock_rung)
 	{
 		int K = telecom_system->bigblock_codeword_count();
@@ -3645,6 +3650,16 @@ bool cl_arq_controller::bigblock_send_one_block()
 	if(telecom_system == NULL) return false;
 	if(!telecom_system->bigblock_framing_enabled) return false;
 	if(telecom_system->M == MOD_MFSK) return false;
+	// P3 HW FIX: the big-block framing is a CFG16-RUNG mode (validated geometry K=8,
+	// sub_len=ldpc.K/8). It must engage ONLY at CONFIG_16. The flag alone is not enough:
+	// the gearshift starts at ROBUST_0 and climbs through OTHER OFDM configs (CONFIG_0..15,
+	// all is_ofdm_config()==true, all !is_robust_config()). At those rungs the block has a
+	// DIFFERENT, unvalidated geometry (HW-observed CONFIG_0: K=1 sub_len=12) that corrupts
+	// the data path and STALLS the climb (every batch carves clean=0 -> no clean ACK ->
+	// gearshift BREAKs, never reaches CFG16). Gate on the live config == CONFIG_16 so the
+	// stock per-frame path carries CONFIG_0..15 and the block engages only at the validated
+	// rung. (The gearshift AUTO-election of this rung is still P4; here the flag is FORCED.)
+	if(current_configuration != CONFIG_16) return false;
 	// Retx batches stay STOCK CFG16 per-frame framing (P2.5).
 	if(sack_retransmit_active) return false;
 	if(message_batch_counter_tx <= 0) return false;
@@ -6764,9 +6779,14 @@ void cl_arq_controller::receive()
 		// proof across a SUSTAINED multi-block session. rsp_current_expected_batch_seq_id
 		// is passed only as a FALLBACK (used if cw0 didn't decode / header unusable).
 		bool bigblock_rx_handled = false;
+		// P3 HW FIX: carve ONLY at the CONFIG_16 rung (matches the TX gate in
+		// bigblock_send_one_block). is_ofdm_config() (configs 0..16) wrongly engaged the
+		// carve at CONFIG_0..15 during the climb, where the block geometry is unvalidated
+		// (K=1 at CONFIG_0) — corrupting RX and stalling the gearshift. Stock per-frame
+		// parse handles CONFIG_0..15.
 		if(telecom_system->bigblock_framing_enabled
 			&& telecom_system->M != MOD_MFSK
-			&& is_ofdm_config(current_configuration)
+			&& current_configuration == CONFIG_16
 			&& telecom_system->bigblock_last_rx_K > 0)
 		{
 			int fallback_bsi = (rsp_current_expected_batch_seq_id >= 0)

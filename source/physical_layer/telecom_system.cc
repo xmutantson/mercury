@@ -69,6 +69,16 @@ cl_telecom_system::cl_telecom_system()
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
+	// P3 HW VALIDATION FORCE: the CFG16-rung big-block framing flag is normally OFF
+	// (default; the gearshift AUTO-election is P4). For the P3 VARA-parity HW test we
+	// FORCE it on via env MERCURY_BIGBLOCK_FRAMING=1 so a real two-instance ARQ session
+	// uses the one-acquisition K-codeword block path at CFG16. This only flips the
+	// persistent member; sack_negotiated_recompute_batch() then pins data_batch_size=K
+	// on BOTH peers (the R-B pin), and the live TX/RX paths (bigblock_send_one_block /
+	// bigblock_receive_carve) engage at the CFG16 OFDM rung. Default unset = stock OFF =
+	// byte-identical per-frame path. Not wired into the gearshift (that is P4).
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_FRAMING");
+	  if(e && *e && atoi(e) != 0) bigblock_framing_enabled = true; }
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -605,7 +615,15 @@ void cl_telecom_system::transmit_byte(int *data, int nBytes, double* out, int me
 	// When set, one transmit_byte call emits the whole big-block (one 4-sym preamble +
 	// K codeword-frames under one acquisition) into `out` instead of one per-frame
 	// OFDM frame. NO ARQ change in P1 — the loopback validator drives this directly.
-	if(bigblock_framing_enabled && M != MOD_MFSK)
+	// P3 HW FIX: the big-block geometry is CFG16-ONLY (K=8, sub_len=ldpc.K/8). With the
+	// flag FORCED on for a live ARQ session, the gearshift climbs ROBUST_0 -> CFG16 through
+	// CONFIG_0..15 (all M != MFSK), and WITHOUT this config guard every stock per-frame
+	// transmit at those rungs wrongly branched into transmit_bigblock with the wrong
+	// geometry — corrupting the climb (HW-observed). Gate on current_configuration ==
+	// CONFIG_16 so CONFIG_0..15 use the stock per-frame path and only the validated rung
+	// emits a block. The PLOT_PASSBAND / unit validators run at CONFIG_16 (-s 16), so they
+	// are unaffected.
+	if(bigblock_framing_enabled && M != MOD_MFSK && current_configuration == CONFIG_16)
 	{
 		transmit_bigblock(data, nBytes, out);
 		return;
@@ -982,7 +1000,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// acquires ONCE over the captured passband and decodes the K codewords with the
 	// channel-adaptive estimator + CSI-LLR, returning the per-codeword decode result
 	// in receive_stats (+ the decoded info bits in out). NO ARQ change in P1.
-	if(bigblock_framing_enabled && M != MOD_MFSK)
+	// P3 HW FIX: CFG16-ONLY (matches transmit_byte). The flag FORCED on for a live ARQ
+	// session would otherwise route every CONFIG_0..15 per-frame decode during the climb
+	// into receive_bigblock with the wrong geometry, stalling the gearshift. Validators
+	// run at CONFIG_16 (-s 16), so they are unaffected.
+	if(bigblock_framing_enabled && M != MOD_MFSK && current_configuration == CONFIG_16)
 	{
 		return receive_bigblock(data, out);
 	}
