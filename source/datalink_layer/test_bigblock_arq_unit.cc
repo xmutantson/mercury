@@ -1095,7 +1095,10 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 	// truth the RX must deliver byte-faithfully).
 	const int block_bsi  = 7;
 	const int hdr_total  = BIGBLOCK_HDR_TOTAL_BYTES(K);   // 2 + 2*K
-	const int cw0_cap    = sub_len - hdr_total;
+	// FAILURE-2 fix: each codeword reserves its tail byte for the wire CRC-8, so the
+	// per-codeword app capacity shrinks by BIGBLOCK_CW_CRC_BYTES (cw0 also by the header).
+	const int cw0_cap    = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;
+	const int cwc_cap    = sub_len - BIGBLOCK_CW_CRC_BYTES;
 	A->message_batch_counter_tx = K;
 	std::vector<std::vector<unsigned char>> app_truth((size_t)K);
 	std::vector<int> app_len((size_t)K, 0);
@@ -1103,8 +1106,9 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 	for(int i=0;i<K;i++)
 	{
 		// deterministic variable length: a spread of sizes incl. a short last frame, all
-		// within the per-codeword app capacity (cw0 is reduced by the header).
-		int cap = (i == 0) ? cw0_cap : sub_len;
+		// within the per-codeword app capacity (cw0 is reduced by the header, every
+		// codeword by the CRC byte).
+		int cap = (i == 0) ? cw0_cap : cwc_cap;
 		int len = ((i*37 + 11) % (cap - 4)) + 1;   // 1..cap-4 (well within capacity)
 		if(len > cap) len = cap;
 		app_len[i] = len;
@@ -1143,6 +1147,17 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 			int base = (c == 0) ? hdr_total : (c * sub_len);
 			for(int j=0;j<app_len[c];j++)
 				tx_truth[(size_t)base + j] = app_truth[c][(size_t)j];
+		}
+		// FAILURE-2 fix: stamp the per-codeword wire CRC-8 EXACTLY as production
+		// bigblock_send_one_block does (CRC over the codeword's first
+		// BIGBLOCK_CW_CRC_SPAN(sub_len) bytes -> tail byte). cw0's CRC covers the header.
+		for(int c=0;c<K;c++)
+		{
+			int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+			int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+			if(crc_off < 0 || crc_off >= (int)total_tx_bytes || crc_span < 0) continue;
+			tx_truth[(size_t)crc_off] = A->CRC8_calc(
+				(char*)&tx_truth[(size_t)c*sub_len], crc_span);
 		}
 	};
 	build_block_wire(block_bsi);

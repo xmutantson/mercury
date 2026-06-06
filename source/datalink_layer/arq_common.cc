@@ -3682,8 +3682,16 @@ bool cl_arq_controller::bigblock_send_one_block()
 	// hdr_total; cw1..K-1 are codeword-aligned at c*sub_len (so the K-bit cw_ok SACK
 	// granularity / selective-repeat keeps frame == codeword).
 	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);   // 2 + 2*K bytes
-	const int cw0_cap = sub_len - hdr_total;             // sub-codeword 0 app capacity
-	if(cw0_cap < 0) return false;                        // sub_len too small to hold the header
+	// FAILURE-2 fix: each sub-codeword reserves its LAST byte for an on-wire CRC-8
+	// (BIGBLOCK_CW_CRC_BYTES). The per-codeword app capacity shrinks by that 1 byte:
+	//   cw0  app cap = sub_len - hdr_total - CRC   (header prefix + CRC both reserved)
+	//   cwc  app cap = sub_len            - CRC    (c >= 1)
+	// The CRC byte sits at the FIXED offset BIGBLOCK_CW_CRC_OFFSET(c, sub_len) and covers
+	// the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes (header+app for cw0).
+	const int cw0_cap = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;  // cw0 app capacity
+	if(cw0_cap < 0) return false;                        // sub_len too small for header+CRC
+	const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;             // cwc (c>=1) app capacity
+	if(cwc_cap < 0) return false;
 	// INV-9 guard: frame 0 must fit in the reduced cw0 capacity. The big-block lattice
 	// gives sub_len >> max_frame + hdr_total, so this never fires at the CFG16 rung.
 	{
@@ -3705,7 +3713,7 @@ bool cl_arq_controller::bigblock_send_one_block()
 	std::vector<int> tx_lengths((size_t)K, 0);
 	for(int i=0;i<n_data && i<K;i++)
 	{
-		int cap = (i == 0) ? cw0_cap : sub_len;
+		int cap = (i == 0) ? cw0_cap : cwc_cap;   // CRC byte reserved at the codeword tail
 		int len = messages_batch_tx[i].length;
 		if(len < 0) len = 0;
 		if(len > cap) len = cap;          // a frame longer than the sub-codeword is clamped
@@ -3740,6 +3748,25 @@ bool cl_arq_controller::bigblock_send_one_block()
 			block_payload_bytes[(size_t)base + j] = b;
 		}
 		// (remaining bytes of this sub-codeword already 0 = pad)
+	}
+
+	// --- FAILURE-2 fix: per-codeword CRC-8 ON THE WIRE -------------------------------
+	// After every codeword's header/app bytes are packed (pad bytes already 0), stamp a
+	// CRC-8 over the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes into its tail
+	// byte BIGBLOCK_CW_CRC_OFFSET(c, sub_len). cw0's CRC covers [header | app | pad]; cwc
+	// covers [app | pad]. The RX recomputes the SAME CRC over the de-whitened payload and
+	// demotes cw_ok[c] on mismatch (the producer the old oracle compare faked). CRC8_calc
+	// is the stock per-frame helper (POLY_CRC8=0xF4); it runs over the byte mirror.
+	// Compute over ALL K codewords (filled + zero-pad) so the RX gate is uniform — a
+	// pad-only codeword has a deterministic CRC over its zero bytes.
+	for(int c=0;c<K;c++)
+	{
+		int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+		int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+		if(crc_off < 0 || crc_off >= block_payload_len || crc_span < 0) continue;
+		unsigned char crc = CRC8_calc((char*)&block_payload_bytes[(size_t)c*sub_len], crc_span);
+		block_payload[(size_t)crc_off]       = (int)crc;
+		block_payload_bytes[(size_t)crc_off] = crc;
 	}
 
 	// Stash the TX block payload + geometry + per-codeword lengths so the in-process
@@ -3848,6 +3875,32 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		}
 	}
 
+	// --- FAILURE-2 fix: per-codeword WIRE CRC-8 verify -> cw_ok demote --------------
+	// The PHY-layer cw_ok producer (bigblock_rx_passband) is an ORACLE compare on the
+	// single-instance loopback (cw_info_ref) and is FORCED CLEAN (all 1s) on the live
+	// 2-instance path (ref==NULL) — so a MISCORRECTED codeword arrived "clean" and was
+	// never retransmitted (silent corruption). Recompute the on-wire CRC-8 over each
+	// codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) de-whitened bytes and compare to its
+	// tail CRC byte. This is the REAL per-codeword detector; it can only DEMOTE cw_ok[c]
+	// (a CRC failure clears it), never PROMOTE a genuine bit-mismatch the oracle caught.
+	// It runs BEFORE the cw0 header-trust gate below, so a CRC-failed cw0 (cw_ok[0]==0)
+	// forces the fallback-bsi path and is NOT length-table-parsed (§5 cross-layer). Skip
+	// only when there are no decoded bytes (total acquisition miss: payload all-zero).
+	if(info_bits != NULL)
+	{
+		int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+		for(int c=0;c<K;c++)
+		{
+			if(crc_span < 0) break;
+			int crc_off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+			if(crc_off < 0 || crc_off >= (int)((long)K*sub_len)) { cw_ok[c] = 0; continue; }
+			unsigned char calc = CRC8_calc(
+				(char*)&payload[(size_t)c*sub_len], crc_span);
+			unsigned char wire = payload[(size_t)crc_off];
+			if(calc != wire) cw_ok[c] = 0;   // demote-only: CRC mismatch => failed codeword
+		}
+	}
+
 	// --- PHASE 1: parse the cw0 wire header [bsi, n_data, length[0..K-1] uint16 LE] ---
 	unsigned char block_bsi = fallback_bsi;
 	int cw0_offset = 0;
@@ -3867,12 +3920,36 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		{
 			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
 			int len = (int)payload[lo] | ((int)payload[lo+1] << 8);
-			int cap = (c == 0) ? (sub_len - hdr_total) : sub_len;
+			// FAILURE-2 fix: the codeword's tail byte is the CRC, NOT app data — reserve it
+			// so the delivered length can never include the CRC byte (matches the TX caps
+			// cw0_cap/cwc_cap above). cw0 also reserves the header prefix.
+			int cap = (c == 0) ? (sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES)
+			                   : (sub_len - BIGBLOCK_CW_CRC_BYTES);
+			if(cap < 0)   cap = 0;
 			if(len < 0)   len = 0;
 			if(len > cap) len = cap;       // never deliver past a codeword's app capacity
 			wire_lengths[c] = len;
 		}
 		cw0_offset      = hdr_total;
+		sub_lengths_ptr = wire_lengths.data();
+	}
+	else
+	{
+		// FALLBACK (legacy / CRC-failed-cw0 / no-header): we cannot trust the length
+		// table, but the codeword tail byte is STILL the CRC and must not be delivered as
+		// app data. Pass an explicit uniform table = the per-codeword capacity minus the
+		// CRC byte (cw0 also minus the header prefix) so the CRC byte stays out of the
+		// delivered payload. cw0_offset stays 0 (legacy: cw0 had no header prefix on the
+		// no-header path; on the CRC-failed-cw0 path cw0 is a SACK gap anyway, so its
+		// length is unused). This only fires off the production live path when cw0's CRC
+		// fails — the block is mostly re-requested, so exactness here is not load-bearing.
+		wire_lengths.assign((size_t)K, 0);
+		for(int c=0;c<K;c++)
+		{
+			int cap = sub_len - BIGBLOCK_CW_CRC_BYTES;
+			if(cap < 0) cap = 0;
+			wire_lengths[c] = cap;
+		}
 		sub_lengths_ptr = wire_lengths.data();
 	}
 
