@@ -3888,6 +3888,43 @@ bool cl_arq_controller::bigblock_send_one_block()
 	return true;
 }
 
+// bigblock_block_ftr_or(): MULTI-CW WINDOW FIX (fact-doc §17). The big-block decode
+// snapshots buffer_Nsymb samples (receive_bigblock, telecom_system.cc:8219), but the
+// snapshot only fires when frames_to_read counts down to 0 — so frames_to_read sets HOW
+// MANY FRESH symbols are accumulated into the ring before the block is handed to the
+// decoder. The block spans bigblock_rx_block_nsymb() (= preamble_nSymb + Ngrid, ~64) OFDM
+// symbols; a stock CFG16 frame is get_active_nsymb()+preamble_nSymb (~13). Codewords map
+// SEQUENTIALLY across the block's symbols (cw0 = earliest, cw7 = latest), so a stock-frame
+// window snapshots only the block HEAD: cw0's symbols are fresh -> cw0 byte-correct; cw1..7
+// fall outside the fresh region -> decode from silence/stale ring -> DETERMINISTIC garbage
+// (the §15.2 partial-block signature, recurring on the live multi-block path because the
+// §15.2 fix only guarded the messages_control turnaround + the post-carve re-arm, NOT the
+// per-block ACK-turnaround / FAIL re-arms — see §17.3).
+//
+// This helper raises a stock frames_to_read value to the FULL block span (+10 turnaround
+// margin, matching the §15.2 :6994 re-arm) WHEN the bigblock rung is live, and returns
+// stock_ftr UNCHANGED otherwise. Reuses the EXACT geometry source the §15.2 sites use
+// (bigblock_rx_block_nsymb()), so there is no parallel mechanism and the two peers cannot
+// diverge. On every non-CFG16 / framing-off / MFSK path the guard is false -> the binary is
+// byte-identical to baseline. MERCURY_BIGBLOCK_DEFEAT_FIX=1 bypasses the clamp (returns the
+// stock value) so the SAME binary reproduces the pre-fix truncated-window corruption for the
+// fail-before/pass-after A/B (production never sets it).
+int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
+{
+	if(telecom_system == NULL) return stock_ftr;
+	if(!(telecom_system->bigblock_framing_enabled
+	     && telecom_system->M != MOD_MFSK
+	     && current_configuration == CONFIG_16))
+		return stock_ftr;
+	// reproducer hook: restore the pre-fix stock-frame arming for the fail-before A/B.
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_FIX");
+	  if(e && *e && atoi(e)!=0) return stock_ftr; }
+	int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+	if(block_nsymb <= 0) return stock_ftr;          // geometry unavailable -> leave stock
+	int block_ftr = block_nsymb + 10;               // block span + turnaround margin
+	return (block_ftr > stock_ftr) ? block_ftr : stock_ftr;
+}
+
 // bigblock_receive_carve(): the RX side of STEP 2. After receive_byte() branched
 // to receive_bigblock() and decoded ONE block (stashing the per-codeword clean
 // vector telecom_system->bigblock_last_rx_cw_ok + the K decoded info-bit
@@ -4899,7 +4936,10 @@ void cl_arq_controller::send_ack_pattern()
 	{
 		int rx_frame = telecom_system->data_container.preamble_nSymb
 		             + telecom_system->data_container.Nsymb;
-		telecom_system->data_container.frames_to_read = rx_frame + 10;
+		// MULTI-CW WINDOW FIX (fact-doc §17): at the bigblock rung the NEXT thing we
+		// receive is ONE K-codeword block (~64 sym), not a stock frame (~13). Snapshot
+		// MUST wait for the WHOLE block or cw1..cw7 read a stale ring (cw0-ok garbage).
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
 	printf("[TX-ACK-PAT] Done at t=%dms, flushed capture buffer, nUnder reset, ftr=%d\n", (int)ack_turnaround_timer.get_elapsed_time_ms(), telecom_system->data_container.frames_to_read.load());
@@ -5010,7 +5050,8 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	{
 		int rx_frame = telecom_system->data_container.preamble_nSymb
 		             + telecom_system->data_container.Nsymb;
-		telecom_system->data_container.frames_to_read = rx_frame + 10;
+		// MULTI-CW WINDOW FIX (fact-doc §17): block-span the window at the bigblock rung.
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
 	printf("[TX-ACK-SNR] Done, flushed capture buffer, ftr=%d\n", telecom_system->data_container.frames_to_read.load());
@@ -5481,7 +5522,8 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	{
 		int rx_frame = telecom_system->data_container.preamble_nSymb
 		             + telecom_system->data_container.Nsymb;
-		telecom_system->data_container.frames_to_read = rx_frame + 10;
+		// MULTI-CW WINDOW FIX (fact-doc §17): block-span the window at the bigblock rung.
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
 	printf("[TX-MFSK-ACK-SACK] Done, flushed capture buffer, ftr=%d\n",
@@ -7817,6 +7859,15 @@ void cl_arq_controller::receive()
 						}
 					}
 				}
+				// MULTI-CW WINDOW FIX (fact-doc §17): a big-block decode FAIL that lands in
+				// this OFDM anti-spin handler (total acq miss -> no carve re-arm at :7036)
+				// would re-arm a small false-preamble shift (8/16), truncating the next
+				// block's window. Block-span the re-arm at the rung so the next snapshot
+				// waits for a WHOLE block (the carve's full-ring wipe + search_raw reset
+				// already handle stale preambles, so a longer wait is safe). NO-OP off-rung.
+				// Skip when ftr==0 (the same-mod opportunistic-scan immediate-rescan path,
+				// passive_monitor only) so that fast-scan semantics are unchanged.
+				if(ftr > 0) ftr = bigblock_block_ftr_or(ftr);
 				telecom_system->data_container.frames_to_read = ftr;
 				telecom_system->data_container.nUnder_processing_events = 0;
 				// === DIAG: OFDM anti-spin ftr trace ===
@@ -7882,7 +7933,13 @@ void cl_arq_controller::receive()
 			{
 				int rx_frame = telecom_system->get_active_nsymb()
 					+ telecom_system->data_container.preamble_nSymb;
-				telecom_system->data_container.frames_to_read = rx_frame;
+				// MULTI-CW WINDOW FIX (fact-doc §17): a FAILED big-block decode (the carve
+				// forces message_decoded=NO) lands here when frames_to_read hit 0. Re-arming
+				// a stock frame truncates the NEXT block's window (cw1..7 stale-ring garbage)
+				// — the chicken-and-egg recurrence (only a CLEAN carve arms the full window
+				// at :6994). Block-span the re-arm at the rung so a failed block re-accumulates
+				// a WHOLE block before the next snapshot.
+				telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame);
 				telecom_system->data_container.nUnder_processing_events = 0;
 				int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
 				telecom_system->receive_stats.ofdm_search_raw = buf_nsymb - rx_frame;

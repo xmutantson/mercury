@@ -1288,6 +1288,15 @@ public:
   // dangling-data UAF + one-frame wait) delivers 0 bytes; PASS-AFTER delivers all.
   // Returns 0 on PASS. Selected by --test-bigblock-fullpath.
   static int test_sim_inproc_bigblock_fullpath();
+  // MULTI-CW WINDOW REGRESSION (fact-doc §17): the K>1 full-block byte-faithfulness test
+  // the 622-byte synthetic cases and the single-arming fullpath could NOT catch. Drives a
+  // FULL K=8 block (1200B, all 8 codewords) through the LIVE receive_bigblock+de-whiten+
+  // per-cw-CRC carve in THREE arms: (A) CRC-ON block-window -> clean=8/8 + byte-faithful;
+  // (B) NOCRC stock-window (MERCURY_BIGBLOCK_DEFEAT_FIX=1) -> forced-clean but BYTES WRONG
+  // (cw0 ok, cw1..cw7 stale-ring corruption = the HW signature); (C) NOCRC block-window ->
+  // byte-faithful. Proves the root cause is the RX capture WINDOW (not whiten/offset).
+  // Returns 0 on PASS. Selected by --test-bigblock-multicw.
+  static int test_sim_inproc_bigblock_multicw();
   // Capture of the last test_sim_inproc_2() run's delivery (read by the full-path
   // regression to assert byte-faithful delivery without re-parsing stdout).
   static long sim2_last_rx_have;
@@ -1441,6 +1450,20 @@ public:
   // is used only if use_wire_header is false (legacy path) or the header is unusable.
   int bigblock_receive_carve(const int* info_bits, unsigned char fallback_bsi,
                              bool use_wire_header = true);
+  // MULTI-CW WINDOW FIX (fact-doc §17): a big-block decode snapshots buffer_Nsymb
+  // samples but the snapshot only fires when frames_to_read hits 0, so frames_to_read
+  // controls how many FRESH symbols are accumulated before the block is handed to the
+  // decoder. The block spans bigblock_rx_block_nsymb() (~64) OFDM symbols; a stock
+  // CFG16 frame is ~13. Every per-block ACK-turnaround / FAIL re-arm that arms a STOCK
+  // frame (send_ack_pattern et al.) truncates the next block's window so cw1..cw7 read
+  // a stale ring and decode to deterministic garbage (cw0 — the early symbols — stays
+  // byte-correct). This helper raises a stock frames_to_read to the FULL block span
+  // when the bigblock rung is active (framing on, M!=MFSK, CFG16), and returns
+  // stock_ftr UNCHANGED on every other path (byte-identical to baseline). It reads the
+  // SAME bigblock_rx_block_nsymb() the §15.2 sites use — no parallel mechanism. The
+  // MERCURY_BIGBLOCK_DEFEAT_FIX=1 reproducer hook bypasses the clamp (returns stock_ftr)
+  // so the SAME binary reproduces the pre-fix truncated-window corruption for the A/B.
+  int bigblock_block_ftr_or(int stock_ftr);
   // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
   // block carried + its geometry, so the in-process single-block harness can carve
   // it back byte-faithfully (the delivered==TX ground truth, INV-6).

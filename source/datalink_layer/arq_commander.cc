@@ -10715,6 +10715,133 @@ int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
 	return failed == 0 ? 0 : 1;
 }
 
+// MULTI-CW WINDOW REGRESSION (fact-doc §17): the K>1 full-block byte-faithfulness test the
+// 622-byte synthetic cases and the single-arming fullpath could NOT catch. A FULL K=8 block
+// (1200 app bytes spanning ALL 8 codewords) is driven through the LIVE 2-instance SIM_INPROC
+// CFG16 path (TX-encode->whiten->cl_sim_awgn PHY->receive_bigblock de-whiten->per-cw CRC carve
+// ->FIFO deliver). The decode snapshots buffer_Nsymb samples but only when frames_to_read==0,
+// so frames_to_read sizes how many FRESH symbols are accumulated before the block is decoded.
+//
+// Three arms in ONE process prove the ROOT CAUSE is the RX capture-WINDOW (NOT whiten/offset):
+//   A) CRC-ON  PASS-AFTER (block window): all 8 codewords decode byte-faithful AND the per-cw
+//      wire-CRC PASSES all 8 (clean==K==8, NOT demoting) -> full 1200B delivered byte-faithful.
+//   B) NOCRC   FAIL-BEFORE (stock window via MERCURY_BIGBLOCK_DEFEAT_FIX=1): the block is forced
+//      CLEAN (CRC demote disabled) and "delivers" 1200/1200, but the BYTES ARE WRONG
+//      (bytes_ok=0) — cw0 byte-correct (early symbols, fresh), cw1..cw7 corrupt (later symbols
+//      outside the truncated window -> stale ring). This is the EXACT HW signature.
+//   C) NOCRC   PASS-AFTER (block window): the SAME NOCRC isolation now delivers byte-faithful
+//      (bytes_ok=1) because the full window makes cw1..cw7 real. The ONLY variable A->B->C is
+//      the armed frames_to_read window — proving the fix and refuting the whiten/offset theory.
+int cl_arq_controller::test_sim_inproc_bigblock_multicw()
+{
+	printf("[TEST-BIGBLOCK-MULTICW] ===== FULL K=8 block (all 8 codewords) byte-faithful "
+	       "through the LIVE receive_bigblock+de-whiten+per-cw-CRC carve =====\n");
+	fflush(stdout);
+
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_SIM_2INST", "MERCURY_BIGBLOCK_FRAMING", "MERCURY_BIGBLOCK_K",
+		"MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
+		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
+		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_BIGBLOCK_NOCRC",
+		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key   = keys[i];
+		env_saved[(size_t)i].had   = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	const long PAYLOAD = 1200;   // a FULL K=8 block spanning all 8 codewords
+	set_env("MERCURY_SIM_2INST",        "1");
+	set_env("MERCURY_BIGBLOCK_FRAMING", "1");
+	set_env("MERCURY_BIGBLOCK_K",       "8");
+	set_env("MERCURY_SIM2_PIN",         "1");
+	set_env("MERCURY_SIM2_CFG",         "16");
+	set_env("MERCURY_SIM2_ROBUST",      "0");
+	{ char b[32]; snprintf(b,sizeof(b),"%ld",PAYLOAD); set_env("MERCURY_SIM2_PAYLOAD_BYTES", b); }
+	set_env("MERCURY_SIM2_MAXITERS",    "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS", "60000");
+
+	int failed = 0;
+
+	// --- ARM A: CRC-ON, block window (the fix). All 8 codewords byte-faithful + CRC passes. ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",              "0");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",         "0");
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_a = test_sim_inproc_2();
+	int  a_clean = bigblock_first_clean;
+	int  a_K     = bigblock_first_K;
+	bool a_full  = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-A (CRC-ON, block window): first_block clean=%d/%d "
+	       "rx_have=%ld/%ld bytes_ok=%d (rc=%d)\n", a_clean, a_K, sim2_last_rx_have, PAYLOAD,
+	       (int)sim2_last_bytes_ok, rc_a);
+	bool a_ok = (a_K == 8) && (a_clean == a_K) && a_full && (rc_a == 0);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-A all 8 codewords clean (per-cw CRC PASSES, NOT "
+	       "demoting) AND full 1200B byte-faithful\n", a_ok ? "PASS" : "FAIL");
+	if(!a_ok) failed++;
+
+	// --- ARM B: NOCRC, STOCK window (fail-before). Forced-clean but BYTES WRONG (cw0 ok). ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");   // isolate byte-truth from the CRC gate
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX", "1");   // restore the pre-fix stock-frame window
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_b = test_sim_inproc_2();
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-B (NOCRC, stock window): rx_have=%ld/%ld bytes_ok=%d "
+	       "(rc=%d) — expect delivered-but-WRONG (cw1..cw7 stale-ring corruption)\n",
+	       sim2_last_rx_have, PAYLOAD, (int)sim2_last_bytes_ok, rc_b);
+	bool b_repro = (sim2_last_rx_have == PAYLOAD) && !sim2_last_bytes_ok;
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-B reproduces the corruption (block forced CLEAN, "
+	       "1200B 'delivered', but bytes WRONG)\n", b_repro ? "PASS" : "FAIL");
+	if(!b_repro) failed++;
+
+	// --- ARM C: NOCRC, BLOCK window (the fix). SAME NOCRC isolation now byte-faithful. ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX", "0");   // the fix: block-span window
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_c = test_sim_inproc_2();
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-C (NOCRC, block window): rx_have=%ld/%ld bytes_ok=%d "
+	       "(rc=%d) — expect byte-faithful (cw1..cw7 now fresh)\n",
+	       sim2_last_rx_have, PAYLOAD, (int)sim2_last_bytes_ok, rc_c);
+	bool c_ok = (sim2_last_rx_have == PAYLOAD) && sim2_last_bytes_ok;
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-C the window fix recovers byte-faithful delivery "
+	       "(the ONLY variable B->C is the armed frames_to_read window — NOT the whiten)\n",
+	       c_ok ? "PASS" : "FAIL");
+	if(!c_ok) failed++;
+
+	restore_env();
+
+	printf("[TEST-BIGBLOCK-MULTICW] %s (%d failure%s)  [A: clean=%d/%d byteok | B: corrupt-repro "
+	       "| C: window-fix byteok]\n", failed == 0 ? "ALL PASS" : "FAILURES", failed,
+	       failed == 1 ? "" : "s", a_clean, a_K);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // SACK Design A Step 11 — helper: stage and send a SET_LINK_PARAMS for a
 // new Axis-3 sack_mode value. Carries the CURRENT data_batch_size in the
 // batch field so the RSP-side controller (which already handles

@@ -1358,3 +1358,149 @@ is therefore validated by the SYNTHETIC `--test-bigblock-climb-election` test, w
 the EXACT `load_configuration(CONFIG_16)` gearshift entry the climb uses and asserts
 fail-before/pass-after election + symmetric K + emit + byte-faithful delivery. This is the
 CLAUDE.md §3-compliant "fails before / passes after" proof for the wiring seam.
+
+## §17. MULTI-CODEWORD CORRUPTION ON THE LIVE CLIMB — the §15.2 partial-block window fix was INCOMPLETE; the per-block ACK-turnaround re-arms (and the data-path FAIL/anti-spin re-arm) are NOT big-block-aware (2026-06-06, branch `fix/bigblock-multicw-dewhiten` off `fix/bigblock-rung-election`@`984c43b`, worktree `C:/Users/kamer/mercury_wt/bigblock-multicw`)
+
+**Symptom (HW-confirmed on `integ/bigblock-rung-election`@`984c43b`):** after the §16 rung
+election lands and the gearshift reaches CFG16 with both peers electing the big-block rung,
+the RX carves `13× [BIGBLOCK-RX] carve K=8` but delivers **0 byte-faithful app bytes**. The
+NOCRC isolation is decisive: with the per-cw wire-CRC ON, every block is PARTIAL `clean=0`
+(cw1..cw7 demoted — the CRC is CORRECTLY rejecting genuinely-corrupt codewords); with
+`MERCURY_BIGBLOCK_NOCRC=1` the blocks go CLEAN and "deliver" but the bytes are WRONG (recv
+head `fa66a8..` ≠ sent head `32ab98..`, the 1200B block not found at any offset, `wire_bsi`
+reads garbage). **cw0 is byte-correct** (`used_hdr=1`, `wire_bsi` correct) — only cw1..cw7 are
+corrupt → a PER-CODEWORD signature.
+
+### §17.1 NOT a whiten / per-cw offset / stride misalignment — REFUTED (again) by reproduction
+
+The task framing was a "TX-encode vs live-RX de-whiten / payload-mapping MISALIGNMENT for the
+MULTI-codeword case." This is **REFUTED**, four ways:
+1. The §15.4 producer/consumer trace: TX whiten span `Kpack*ldpc.K` @ seed `0x5A3C96E1` offset 0
+   == RX de-whiten span `K*sub_len*8 = K*ldpc.K` @ same seed/offset; self-inverse; `Kpack==K==8`;
+   `ldpc.K=1400` is an exact multiple of 8 so codeword `c`'s info bits land at the exact byte
+   boundary `c*sub_len = c*175`. No per-cw offset/stride asymmetry exists in the source (cw0's
+   +18 header offset is INSIDE cw0's own `[0..175)` region and does NOT shift cw1..7, which start
+   at the fixed boundary `N*175`).
+2. **`--test-bigblock-fullpath` (PAYLOAD=1200, a FULL K=8 single block spanning all 8 codewords)
+   PASSES 8/8 byte-faithful** through the REAL `transmit_bigblock`→whiten→PHY (cl_sim_awgn channel,
+   distorted not noiseless)→`receive_bigblock`→de-whiten→carve→FIFO path. If the whiten/offset/stride
+   were wrong, this full-K=8 single block could not deliver byte-faithful. It does.
+3. The candidate fix (swap `bigblock_whiten` for stock `bit_energy_dispersal` per codeword) would
+   NOT change the corruption: the corrupt bytes come from a stale-ring DECODE WINDOW (§17.2), which
+   NO whitener can recover — de-whitening stale bits yields different-but-still-wrong bits. We did
+   NOT swap the whitener (`used_stock_dispersal=false`); the whiten is correct and TX/RX-matched.
+4. EMPIRICAL: `MERCURY_BIGBLOCK_DEFEAT_FIX=1 MERCURY_BIGBLOCK_NOCRC=1` (PIN CFG16, PAYLOAD=1200,
+   STOP_AFTER_FIRST_BLOCK) reproduces the EXACT HW signature in the faithful sim:
+   `[BIGBLOCK-RX] carve: K=8 cw_ok_count=8 wire_bsi=0 (used_hdr=1) ... rx_have=1200/1200 bytes_ok=0`
+   — cw0 correct, block "delivered", bytes WRONG. The SAME run with the full window (DEFEAT_FIX=0)
+   delivers `clean=8/8 bytes_ok=1`. The ONLY variable is the RX capture-window size.
+
+### §17.2 ROOT CAUSE — the big-block decode snapshots a STOCK-FRAME-sized capture window after every per-block ACK turnaround
+
+`receive_byte` routes to `receive_bigblock` whenever `bigblock_framing_enabled && M!=MFSK &&
+current_configuration==CONFIG_16` (telecom_system.cc:1024-1026), regardless of window size.
+`receive_bigblock` decodes `nSamples = Nofdm * buffer_Nsymb * interp` (telecom_system.cc:8219) —
+it reads `buffer_Nsymb` symbols from the ring. But the SNAPSHOT (capture-prep handoff) fires only
+when `frames_to_read` counts down to 0 (capture-prep thread on HW; `sim2_deliver_from_wire`
+arq_commander.cc:9931 in the sim). So `frames_to_read` controls HOW MANY FRESH SYMBOLS are
+accumulated into the ring before the block is handed to the decoder.
+
+The big-block spans `bigblock_rx_block_nsymb() = preamble_nSymb(4) + Ngrid(60) = 64` OFDM symbols
+(telecom_system.cc:8073-8088). The stock CFG16 frame is `rx_frame = get_active_nsymb(9) +
+preamble_nSymb(4) = 13`. Codewords map SEQUENTIALLY across the block's OFDM symbols (cw0 = earliest
+symbols, cw7 = latest — `clr[c*ldpc.N+i]` in deframer raster order, telecom_system.cc:7442). So when
+`frames_to_read` is armed to a STOCK FRAME (~13–23 symbols) instead of the block span (~74), the
+snapshot fires after only the block HEAD is freshly captured: cw0's symbols are fresh → cw0 decodes
+byte-correct; cw1..cw7's symbols are NOT yet in the ring (silence / stale / the post-carve full-ring
+wipe at arq_common.cc:6986) → cw1..cw7 decode from non-signal → DETERMINISTIC garbage.
+
+### §17.3 Why §15.2's fix was INCOMPLETE — the unguarded sibling re-arm sites (CLAUDE.md §5)
+
+§15.2 added `bigblock_rx_block_nsymb()` and guarded TWO `frames_to_read` writers:
+- `arq_responder.cc:1208-1219` — the messages_control TURNAROUND arming (the FIRST block).
+- `arq_common.cc:6972-6994` — the POST-CARVE re-arm (gated on `bigblock_last_rx_K>0`, a successful
+  prior carve).
+
+It MISSED every per-block ACK-turnaround re-arm in the SUSTAINED data path. On the live HW climb a
+multi-block session sends a data/SACK ACK after EACH block; the ACK-send tail flushes the ring and
+re-arms `frames_to_read` to the STOCK FRAME with NO big-block awareness, CLOBBERING the post-carve
+`block_nsymb+10` arming for the NEXT block. The unguarded sibling sites (the NEW producers this audit
+adds to the §1/§16.1 producer list for `frames_to_read` at the bigblock rung):
+- `send_ack_pattern()` `arq_common.cc:4899-4903` (`[TX-ACK-PAT]`): `frames_to_read = rx_frame + 10`.
+  **THE primary per-block turnaround in the main RSP data path.**
+- `send_ack_pattern_with_snr()` `arq_common.cc:5010-5014` (`[TX-ACK-SNR]`): same.
+- the SACK-ACK send tail `arq_common.cc:5481-5485` (`[TX-MFSK-ACK-SACK]`): same.
+- `arq_responder.cc:1915-1920` (WB data-ACK reload): `frames_to_read = preamble_nSymb + Nsymb + 10`.
+- `arq_responder.cc:1677-1681` (ACK-GATE partial-batch retx reset): `frames_to_read = preamble_nSymb
+  + get_active_nsymb()`.
+- the data-path OFDM-FAIL/anti-spin re-arm `arq_common.cc:7557` (`ftr=8/2`) and `:7879-7897`
+  (`frames_to_read = rx_frame`). These fire on a FAILED big-block decode (`message_decoded==NO`,
+  which the carve forces) when `frames_to_read` has counted to 0 — re-arming a stock frame so the
+  NEXT block is truncated again (the chicken-and-egg recurrence: only a CLEAN carve arms the full
+  window via :6994, but a truncated window cannot produce a clean carve).
+
+### §17.4 The fix — one shared clamp helper at every data-path re-arm (reuse the §15.2 mechanism)
+
+Per CLAUDE.md §2 (reuse the existing aligned mechanism; no parallel band-aid), add ONE helper
+`cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)` that returns
+`max(stock_ftr, telecom_system->bigblock_rx_block_nsymb()+10)` when the bigblock rung is active
+(`telecom_system->bigblock_framing_enabled && telecom_system->M!=MOD_MFSK &&
+current_configuration==CONFIG_16`) and `stock_ftr` UNCHANGED otherwise. Wrap EVERY data-path
+`frames_to_read = <stock>` re-arm at the sites in §17.3 in this helper. The helper reads the SAME
+`bigblock_rx_block_nsymb()` the §15.2 sites use — no new geometry source, divergence-proof. On every
+non-CFG16 / framing-off / MFSK path the guard is false → the helper returns the stock value → the
+binary is BYTE-IDENTICAL to baseline (verified: net-PHY + stock per-frame configs unchanged).
+
+REPRODUCER HOOK: `MERCURY_BIGBLOCK_DEFEAT_FIX=1` is extended to ALSO bypass the new clamp (helper
+returns `stock_ftr` when the env is set), so the SAME binary reproduces the pre-fix stock-frame
+arming for the fail-before/pass-after A/B. Production never sets it.
+
+### §17.5 S5 cross-layer audit — `frames_to_read` at the bigblock rung
+
+1. **Producers** (writers of `frames_to_read` reachable at CFG16+framing during a data session):
+   the §17.3 list + the §15.2-guarded `:1208`/`:6994` + the success re-arm `arq_common.cc:7126`
+   (gated `message_decoded==YES`, NOT taken for big-block — the carve forces NO at :6960, verified).
+   The capture-prep COUNTDOWN producer (`dc->frames_to_read--`, arq_commander.cc:10001 sim;
+   capture-prep thread on HW) is unchanged — it only DECREMENTS; the clamp raises the ARMED value.
+2. **Consumers**: the snapshot trigger `frames_to_read==0` (sim `sim2_deliver_from_wire`
+   arq_commander.cc:9931; HW capture-prep). `receive_bigblock` reads `buffer_Nsymb` samples
+   (telecom_system.cc:8219), so the consumer needs the FULL block accumulated before the snapshot —
+   the invariant the clamp restores.
+3. **Valid states** before any producer writes at the rung: `frames_to_read` defaults to a
+   stock-frame seed from `load_configuration` (the §16.3 climb seed). The clamp raises it to the
+   block span the first time a data-path re-arm runs at CFG16+framing — so even the FIRST block
+   (which on HW never routed through the `:1208` control arming on the climb) gets the full window.
+4. **Invariant the consumer assumes** (NEW — INV-9b): at the bigblock rung, the armed
+   `frames_to_read` MUST be ≥ `bigblock_rx_block_nsymb()` so the snapshot waits for the whole block.
+   Every producer in §17.3 now maintains it via the clamp. `buffer_Nsymb` (=128 at CFG16) ≥ the
+   block span (74), so the ring can hold a full block — the window was the only deficient axis.
+5. **What the fix changes**: only the ARMED window magnitude at the rung. It does NOT touch the
+   carve, whiten, de-whiten, per-cw CRC, bsi, EOB, selective-repeat, batch-size election (§16), or
+   the optimizer. Stock per-frame configs (0..15) and MFSK are byte-identical (guard false).
+
+### §17.6 NOT block-spanned — the partial-batch retx capture (intentionally stock-frame)
+`arq_responder.cc:1677-1681` (ACK-GATE partial-batch reset) is NOT wrapped in the clamp. When a
+big-block is PARTIAL (some cw demoted by the wire-CRC), the SACK retransmit is sent via STOCK
+per-frame framing — `bigblock_send_one_block()` declines while `sack_retransmit_active`
+(arq_common.cc:3718) — so the RX legitimately expects stock per-frame frames during the retx
+window. Block-spanning that arming would over-wait for a block that is not coming. The NEXT
+NEW-DATA batch (a fresh big-block) is re-armed by the ACK-send paths (§17.3, now fixed), so the
+next block still gets its full window. (Audited against `data-flow-batch-size.md` §3 / the retx
+queue; the retx path is per-frame, the new-data path is the block.)
+
+### §17.7 Reproduction + validation (faithful sim, fail-before / pass-after)
+The deterministic faithful reproducer (no HW, no climb needed): `MERCURY_SIM_2INST=1 -m SIM_INPROC`
+PIN CFG16 framing-on PAYLOAD=1200 (full K=8 block) STOP_AFTER_FIRST_BLOCK=1, NOCRC=1:
+- FAIL-BEFORE (`MERCURY_BIGBLOCK_DEFEAT_FIX=1`, stock window): `[BIGBLOCK-RX] carve: K=8
+  cw_ok_count=8 wire_bsi=0 (used_hdr=1) ... rx_have=1200/1200 bytes_ok=0` — cw0 correct, the
+  block forced CLEAN and "delivered", but the BYTES ARE WRONG (the HW signature).
+- PASS-AFTER (DEFEAT_FIX=0, block window): `... rx_have=1200/1200 bytes_ok=1` — byte-faithful.
+The ONLY variable is the armed `frames_to_read` window — proving the root cause and refuting the
+whiten/offset theory (§17.1.3).
+
+The paired regression `--test-bigblock-multicw` (`cl_arq_controller::test_sim_inproc_bigblock_multicw()`,
+arq_commander.cc) drives a FULL K=8 block (1200B, all 8 codewords) in THREE arms in one process:
+(A) CRC-ON block-window -> `clean=8/8` (per-cw CRC PASSES all 8, NOT demoting) + byte-faithful;
+(B) NOCRC stock-window (DEFEAT_FIX=1) -> forced-clean but `bytes_ok=0` (cw1..cw7 corrupt);
+(C) NOCRC block-window -> `bytes_ok=1`. This is the K>1 byte-faithfulness test the 622-byte synthetic
+cases and the single-arming fullpath could not catch. NO monitor merge, NO push, NO attribution.

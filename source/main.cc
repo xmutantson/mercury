@@ -371,6 +371,9 @@ int main(int argc, char *argv[])
     bool test_bigblock_fullpath_cli = false; // --test-bigblock-fullpath: LIVE 2-instance CFG16 big-block transfer
                                         // through the REAL receive_bigblock+carve+whiten+FIFO deliver path with
                                         // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
+    bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
+                                        // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
+                                        // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
     bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
@@ -872,6 +875,16 @@ int main(int argc, char *argv[])
             // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
             // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
             test_bigblock_fullpath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-multicw") == 0)
+        {
+            // MULTI-CW WINDOW REGRESSION (data-flow-bigblock-arq-unit.md §17): a FULL K=8
+            // block (all 8 codewords) through the LIVE receive_bigblock+de-whiten+per-cw-CRC
+            // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
+            // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
+            test_bigblock_multicw_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2008,6 +2021,21 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_fullpath();
             printf("[FLAG] Bigblock-fullpath test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_multicw_cli) {
+            // MULTI-CW WINDOW REGRESSION (data-flow-bigblock-arq-unit.md §17): a FULL K=8
+            // block (all 8 codewords) through the LIVE receive_bigblock+de-whiten+per-cw-CRC
+            // carve. Three arms (CRC-on block-window byte-faithful + clean=8/8; NOCRC
+            // stock-window corruption-repro; NOCRC block-window byte-faithful) prove the root
+            // cause is the RX capture WINDOW, NOT whiten/offset. The K>1 test the 622-byte
+            // cases could not catch. One-shot at startup, then exit rc.
+            printf("[FLAG] --test-bigblock-multicw: invoking FULL K=8 multi-codeword "
+                   "byte-faithfulness regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
+            printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

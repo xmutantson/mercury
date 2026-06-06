@@ -1915,9 +1915,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
 		// Expect data frames next: use full Nsymb for capture.
 		// Frame completeness gating handles late arrivals adaptively.
+		// MULTI-CW WINDOW FIX (fact-doc §17): at the bigblock rung the next thing we
+		// receive is ONE K-codeword block (~64 sym), not a stock frame (~13) — block-span
+		// the window so the decode snapshot waits for the WHOLE block (cw1..7 fresh).
 		telecom_system->set_mfsk_ctrl_mode(false);
-		telecom_system->data_container.frames_to_read =
-			telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb + 10;
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(
+			telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb + 10);
 
 		batch_rx_frame_count = 0;
 		connection_status=RECEIVING;
