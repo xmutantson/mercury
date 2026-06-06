@@ -7404,6 +7404,36 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 
 	int Kcw = nBits / ldpc.N;
 	{ int kcap = env_i("MERCURY_BIGBLOCK_K", 0); if(kcap>0 && kcap<Kcw) Kcw=kcap; }
+
+	// FAILURE-2 TEST HOOK (the --test-bigblock-cw-crc producer test): flip the sign of a
+	// deterministic run of ONE codeword's LLRs BEFORE the per-codeword ldpc.decode, so the
+	// REAL decode emits a corrupted (miscorrected / residual-error) info-bit sub-unit for
+	// EXACTLY that codeword while the others decode clean. This drives the genuine
+	// bigblock_last_rx_cw_ok producer (NOT the cw_ok array): on the live 2-instance path
+	// (cw_info_ref==NULL) the producer FORCES cw_ok=1 for the corrupted codeword, and only
+	// the wire-CRC recompute in the carve can demote it. MERCURY_BIGBLOCK_CORRUPT_CW = the
+	// target codeword (-1 = off); MERCURY_BIGBLOCK_CORRUPT_NBITS = how many leading LLRs of
+	// that codeword to slam to a strong wrong sign (enough to force a miscorrection on the
+	// clean grid, default ldpc.N/4). Production never sets these; this is test-only.
+	{
+		int corrupt_cw = env_i("MERCURY_BIGBLOCK_CORRUPT_CW", -1);
+		if(corrupt_cw >= 0 && corrupt_cw < Kcw)
+		{
+			int nbits_flip = env_i("MERCURY_BIGBLOCK_CORRUPT_NBITS", ldpc.N/4);
+			if(nbits_flip < 1)        nbits_flip = 1;
+			if(nbits_flip > ldpc.N)   nbits_flip = ldpc.N;
+			long base = (long)corrupt_cw * ldpc.N;
+			for(int i=0;i<nbits_flip;i++)
+			{
+				size_t bi = (size_t)(base + i);
+				if(bi >= (size_t)nBits) break;
+				// slam to a strong WRONG-sign LLR (clean LLRs are huge & correct, so an
+				// equally-huge wrong sign forces the decoder off the true codeword).
+				clr[bi] = (clr[bi] >= 0.0f) ? -40.0f : 40.0f;
+			}
+		}
+	}
+
 	cw_ok_out.assign(Kcw, 0);
 	int cw_ok=0;
 	std::vector<float> cwllr(ldpc.N); std::vector<int> dec(ldpc.N);
