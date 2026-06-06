@@ -808,3 +808,69 @@ PHY DSP trace should re-measure with whitening ON.
 
 **Commit** (Phase 1): a SEPARATE commit on `integ/bigblock-merge-2026-06-05` ON TOP of `676f055`.
 NO monitor merge, NO push, NO Claude/Anthropic attribution. P3 HW is the NEXT phase.
+
+## §12 PHASE 2 (P3 HW) — the VARA-parity verdict attempt (2026-06-05)
+
+Goal: deploy the integration branch to BOTH Pis, FORCE the big-block framing flag, run a
+SUSTAINED compressible Winlink message at a clean IONOS channel (WGN:40), measure the
+EFFECTIVE delivered rate vs VARA EFFECTIVE = 6241 × LZHUF_ratio.
+
+Commit `528234c` on `integ/bigblock-merge-2026-06-05` (on top of `0300ea0`). Tools added:
+`tools/bigblock_p3_hw.py` (orchestrator) + `tools/bigblock_p3_pihelper.py` (Pi-local driver).
+Results dir: `bigblock_p3_hw/` (STATUS.md + per-run logs/JSONs).
+
+### §12.1 ROOT-CAUSE FIX — big-block engaged at EVERY OFDM config, stalling the climb [the headline code finding]
+The forcing mechanism (`MERCURY_BIGBLOCK_FRAMING=1` → `bigblock_framing_enabled=true`,
+telecom_system ctor) turned the flag on GLOBALLY. But ALL FIVE engagement gates checked only
+`M != MFSK` / `is_ofdm_config()` (configs **0..16**) / `!is_robust_config()` — NONE required
+CONFIG_16. The gearshift starts at ROBUST_0 and climbs through CONFIG_0..15 (every one
+`is_ofdm_config()==true`, `!is_robust_config()`), so the block engaged at those rungs with a
+DIFFERENT, unvalidated geometry. **HW-observed at CONFIG_0:** `[BIGBLOCK-ARQ] PARTIAL block
+bsi=0 K=1 ... clean=0 -> SACK gaps`, `[BIGBLOCK-RX] carve: K=1 ... sub_len=12` (vs the validated
+CFG16 K=8 sub_len=175). Every batch carved `clean=0` → no clean ACK → `[GEARSHIFT] FRAME UP DATA
+FAILED -> BREAK to 102`. The climb could NEVER reach CFG16; delivered ~53 bytes in 7 min.
+
+FIX (root-cause, CLAUDE.md §2 — gate on the validated rung, not threshold-tune): added
+`current_configuration == CONFIG_16` to all five points:
+- `telecom_system.cc` PHY `transmit_byte` branch (:626) and `receive_byte` branch (:1007)
+- `arq_common.cc` `bigblock_send_one_block` TX gate (:~3653), `receive()` RX carve gate (:~6787,
+  was `is_ofdm_config`), `sack_negotiated_recompute_batch` K-pin (:~982, was `!is_robust_config`)
+- PLOT_PASSBAND / unit validators run at `-s 16` (current_configuration==16) → unaffected.
+
+VALIDATION: in-sim `--test-sim-inproc-bigblock` ALL PASS (CASE A 619/619 byte-faithful, CASE B
+selective-repeat), `--test-bigblock-arq-unit` 8/8, `--test-climb-engine` 0 failures. **HW
+structural validation:** with the fix the gearshift climb PROGRESSES
+ROBUST_0(100)→ROBUST_1(101)→ROBUST_2(102)→CONFIG_0→…→CONFIG_4 with clean MFSK ACKs
+(`matched=16`) and **ZERO** `BIGBLOCK-ARQ` engagement at low configs (was constant PARTIAL spam).
+The big-block no longer corrupts the low-config data path.
+
+### §12.2 Infra bugs found+fixed in the P3 harness (not Mercury code)
+- **mercury binds 127.0.0.1 ONLY** (`tcp_socket.cc:95` `INADDR_LOOPBACK`, all platforms): the
+  direct-LAN-connect pattern (connect to Pi IP:8400) CANNOT reach mercury. The ARQ session must be
+  driven Pi-LOCAL. FIX: `bigblock_p3_pihelper.py` runs ON each Pi (uploaded via butler), connects
+  to 127.0.0.1 ports; the orchestrator launches mercury + helpers via SSH and downloads results.
+- **butler UPLOAD/DOWNLOAD split args on whitespace** (`ionos_butler.py:309` `rest.split()`): the
+  workspace path `…\hermes and mercury\…` has spaces → UPLOAD returns OK but transfers NOTHING
+  (silent). FIX: stage every up/download through a SPACE-FREE temp dir + verify-after-upload guard.
+- **CONNECT needs `-R`**: with `-s 16` (no `-R`) the connect control frames go out on CONFIG_16
+  and the RSP control-ACK turnaround fails (HW: HAIL ok, RSP gets CONNECT_START, CMD "attempt N of
+  15"). FIX: launch with `-R` so the handshake runs at the ROBUST/MFSK tier, then climb.
+
+### §12.3 BLOCKER — testbed CONNECT instability + marginal SNR prevented the CFG16 measurement [?]
+After the §12.1 fix the climb works but never reached CFG16 in the dwell window: reached only
+CONFIG_4 in 140s, gearshift SNR reads ~1.0 dB at WGN:40 (should be ~42 dB per
+`testbed_wgn_snr3k_mapping`: SNR3k = WGN + 2.4). The ARQ CONNECT was unreliable/slow (3–8 min,
+sometimes never finalizing): the MFSK handshake reaches RSP `link_status:Connected to TESTA` +
+CMD `Connection Accepted by TESTB` / `[RX-MFSK-CTRL-CONNECT-ACK] echoed_cap=0x01==0x01` but the
+CMD does NOT reliably transition to the CONNECTED state that emits `CONNECTED <call>…` on the TCP
+control socket. Run-to-run INCONSISTENT (one run sat `link_status:Idle`, never attempting).
+Matches the MEMORY-documented Pi audio-state drift (`pi_audio_state_drift.md`, ~6h uptime, many
+bench sessions today). A Pi REBOOT (the documented fix) did NOT recover the connect reliability;
+a 200→420 s connect-timeout bump did not catch a finalize either. **Open [?]:** the connect
+finalization at CONNECTION_ACCEPTED on the MFSK control tier is intermittent on this testbed
+state — a pre-existing ARQ/testbed issue, OUTSIDE the big-block scope, but it gates the P3
+sustained measurement. The big-block STRUCTURAL fix (§12.1) is validated; the EFFECTIVE-delivered
+VARA-parity NUMBER is NOT yet obtained on HW (no sustained CFG16 block transfer completed).
+
+**Commit** (P3 HW): `528234c` on `integ/bigblock-merge-2026-06-05` (on top of `0300ea0`). NO
+monitor merge, NO push, NO attribution. Bench left UNLOCKED + tables as-found.
