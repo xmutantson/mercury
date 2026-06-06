@@ -9635,26 +9635,29 @@ struct MercuryInstance {
 	void wire() { arq.telecom_system = &ts; }
 };
 
-// The 2-instance step-pump context. The stepper sets {tx, rx, channels} before
-// driving the active (tx) instance. The pump (installed via the SAME
-// arq_set_sim_inproc_pump hook the single-instance stepper uses) is invoked from
-// inside tx's blocking waits (ptt_busy_wait / drain_playback_wait / pacing
-// floor). Per call it:
-//   1. Drains tx.play -> tx->rx channel -> rx.cap (the real tx->rx handoff),
-//      advancing the SHARED clock; idle-fills one symbol of silence when tx has
-//      nothing (the two-process TX bridge always sends silence on idle).
-//   2. Runs rx's prep-pull (rx.cap -> rx.passband_delayed_data).
-//   3. CO-ROUTINE INTERLEAVE: at depth 0, drives rx->process_main() ONCE so the
-//      PEER can react to the audio it just received WHILE tx is still blocked in
-//      its wait (mirrors the two-process concurrency where rx's prep+ARQ run
-//      while tx transmits). Without this, tx's long PTT/response waits would
-//      pump tens of silence symbols into rx and BURY the just-arrived beacon
-//      before rx ever scanned it (the §10.5 single-thread hazard). A depth guard
-//      (g_sim2_depth) bounds reentrancy to ONE peer level: when rx's own waits
-//      fire the pump (depth 1), it only feeds rx->tx + advances the clock (so
-//      rx's reply reaches tx's capture) — it does NOT recurse into tx again.
-// Exit predicates are UNCHANGED (drain exits at tx.play empty; ptt exits at
+// The 2-instance step-pump context. Option-b (data-flow-sim2-roleagnostic-pump.md):
+// the pump is PART A (the VERBATIM legacy c->tx/c->rx orientation pump, byte-
+// identical — preserves the proven handshake + single-batch OFDM cadence) PLUS
+// PART B (a depth>0-only, CONNECTED-OFDM-only role-agnostic UN-STRANDING pass keyed
+// on the STABLE A/B fields {inst_a, inst_b, ch_a2b_d, ch_b2a_d, wire_a2b, wire_b2a},
+// set ONCE before the loop and NEVER flipped). The legacy tx/rx/ch_*/wire_* flip
+// fields below are still set each half-step (PART A reads them). The pump (installed
+// via the SAME arq_set_sim_inproc_pump hook) is invoked from inside the active
+// instance's blocking waits (ptt_busy_wait / drain_playback_wait / pacing floor).
+// PART A per call: drains tx->rx wire (advancing the SHARED clock, idle-filling one
+// silence symbol when idle); at depth 0 delivers tx->rx wire into rx + per-frame
+// OFDM decode-drive, delivers the rx->tx reply when tx idle (§10.5), and co-routine-
+// drives rx ONCE. PART B per call (depth>0, the reentrant case PART A cannot reach):
+// drains a STRANDED CONNECTED-OFDM playback (the commander re-entering a batch-N TX,
+// whose drain_playback_wait would otherwise spin forever — the orientation trap is
+// gone because PART B is keyed on "who is stranded", not the c->tx flip), delivers
+// it to the receiver, drives the receiver to consume it, and delivers the receiver's
+// reply back. Exit predicates are UNCHANGED (drain exits at play empty; ptt exits at
 // clock past delay) — the pump only makes them eventually true.
+// NOTE (status): PART B removes the deadlock + decodes batch-2 frames byte-correct,
+// but the partial-batch SACK→retransmit turnaround does NOT yet complete in-sim
+// (data-flow-sim2-roleagnostic-pump.md §6.2/§6.4 — a deeper single-thread-pump
+// invariant; HW is the sustained-rate path).
 struct SimInproc2Ctx {
 	MercuryInstance* tx = nullptr;     // active instance (drains its playback)
 	MercuryInstance* rx = nullptr;     // peer (receives the channel output)
@@ -9676,17 +9679,50 @@ struct SimInproc2Ctx {
 	long long clock_samples = 0;
 	long long looped_samples = 0;      // real airtime moved tx->rx
 	long long idle_samples = 0;
+
+	// ---- ROLE-AGNOSTIC pump fields (Option-b, data-flow-sim2-roleagnostic-pump.md) ----
+	// STABLE, direction-keyed references set ONCE before the step loop and NEVER
+	// flipped. The role-agnostic pump (sim_inproc_pump_2) ignores the legacy
+	// tx/rx/ch_*/wire_* flip fields above and instead pumps BOTH directions
+	// (A->B and B->A) every call using these, so whichever instance has stranded
+	// playback (e.g. the commander's reentrant batch-N TX) is always delivered to
+	// its peer regardless of the outer stepper's "active" orientation — removing
+	// the tx/rx-orientation trap that stranded the inter-batch turnaround (§2).
+	MercuryInstance* inst_a   = nullptr;   // A (commander)
+	MercuryInstance* inst_b   = nullptr;   // B (responder)
+	cl_sim_awgn*     ch_a2b_d = nullptr;   // A->B channel (direction-keyed)
+	cl_sim_awgn*     ch_b2a_d = nullptr;   // B->A channel (direction-keyed)
+	cbuf_handle_t    wire_a2b = nullptr;   // A->B wire (direction-keyed)
+	cbuf_handle_t    wire_b2a = nullptr;   // B->A wire (direction-keyed)
 };
 
-// Reentrancy depth for the co-routine peer-drive (§10.5). 0 = top (tx) level;
-// 1 = inside a peer rx->process_main() drive (do not recurse further).
-static int g_sim2_depth = 0;
+// PUMP peer-drive level (Option-b, data-flow-sim2-roleagnostic-pump.md §3.2).
+// Renamed from the former g_sim2_depth. 0 = the OUTERMOST pump call: PART A's
+// legacy deliver+peer-drive block runs. >0 = a nested pump (fired from a peer's
+// own pacing/drain wait): PART A's depth-0 block is skipped (only the verbatim
+// tx->rx drain runs), and PART B (the role-agnostic un-stranding) runs to deliver
+// any stranded CONNECTED-OFDM playback that the depth-0 block can no longer reach.
+static int g_sim2_pump_depth = 0;
 
-// Reentrancy guard for the per-FRAME RX decode-drive inside sim2_deliver_from_wire
-// (wf-sim-controlloop OFDM fix, bounded follow-on). >0 = a decode-drive is already
-// on the stack; a nested deliver (pump-fired from dst's pacing wait) must not
-// recurse the drive again.
+// DECODE-DRIVE reentrancy guard (per-frame OFDM decode inside
+// sim2_deliver_from_wire). SEPARATE from g_sim2_pump_depth so the decode-drive can
+// fire INSIDE PART B (at pump depth>0) when PART B delivers a stranded batch-N
+// frame — the frame MUST be decoded at its frame-aligned ring offset the moment
+// frames_to_read hits 0, or the prep loop over-advances the ring past the boundary
+// and the decode lands on a jittered window (cadence doc §3.2). This guard only
+// prevents the decode-drive from recursing into ITSELF (a deliver fired from dst's
+// own pacing wait during the drive must not re-drive the decode). >0 = a
+// decode-drive is already on the stack.
 static int g_sim2_decode_drive_depth = 0;
+
+// PART-B receiver-drive reentrancy guard (Option-b un-stranding). PART B drives the
+// RECEIVER's process_main so its ARQ state advances and it consumes the reentrant
+// batch-N frames. That drive can re-enter the pump; this guard prevents PART B from
+// recursively re-driving the receiver (>0 = a PART-B receiver-drive is on the
+// stack). It is SEPARATE from g_sim2_decode_drive_depth because the reentrant
+// commander batch-N TX itself occurs INSIDE a decode-drive (g_sim2_decode_drive_depth
+// is already >0 at the wedge), so PART B must NOT be gated on that guard.
+static int g_sim2_partb_depth = 0;
 
 void prep_pull_inline(MercuryInstance* inst, double* buffer_temp);  // fwd decl
 void sim2_activate(MercuryInstance* m);                             // fwd decl
@@ -9782,11 +9818,13 @@ bool sim2_drain_to_wire(MercuryInstance* src, cl_sim_awgn* ch, cbuf_handle_t wir
 //   - drive_decode is true ONLY at call sites where dst is NOT already executing its
 //     own process_main() (every site except the §10.5 reply-into-tx deliver, where
 //     dst==the running tx instance — driving it would recurse into itself).
-//   - g_sim2_decode_drive_depth blocks a nested deliver (pump-fired from dst's own
-//     pacing wait) from recursing the decode-drive.
-//   - g_sim2_depth is bumped across the drive so any nested pump only drains+clocks
-//     (its depth-0 deliver/drive block is skipped), exactly like the existing
-//     co-routine peer-drive at sim_inproc_pump_2.
+//   - The FLAT g_sim2_pump_depth guard (Option-b) does BOTH jobs the two former
+//     depth counters did: the decode-drive fires ONLY at g_sim2_pump_depth==0
+//     (blocks a nested deliver pump-fired from dst's own pacing wait from
+//     recursing the decode-drive), and is bumped across the drive so any nested
+//     pump only drains+clocks both directions (its role-agnostic deliver/drive is
+//     skipped), exactly like the role-agnostic co-routine peer-drive at
+//     sim_inproc_pump_2.
 void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2Ctx* c,
                             bool drive_decode = false)
 {
@@ -9819,6 +9857,11 @@ void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2
 		// stay on the legacy cadence, byte-identical). VERIFIED: B decodes the OFDM data
 		// batch byte-correct (RX-BATCH-SEQ DATA_LONG, [OFDM-OK] t2 var=0.0022
 		// meanH=1.000); pinned CFG16 delivers the full payload bytes_ok=1 in iters=4.
+		// GUARD: g_sim2_decode_drive_depth==0 (the decode-drive's OWN reentrancy,
+		// SEPARATE from g_sim2_pump_depth) so the decode CAN fire inside PART B (at
+		// pump depth>0) when PART B delivers a stranded batch-N frame — the frame
+		// must be decoded at its frame-aligned ring offset the instant frames_to_read
+		// hits 0 (cadence doc §3.2). The pump-depth guard is NOT used here.
 		if (drive_decode && g_sim2_decode_drive_depth == 0 &&
 		    ddc->data_ready == 1 && ddc->frames_to_read == 0 &&
 		    dst->arq.link_status == CONNECTED &&
@@ -9832,11 +9875,19 @@ void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2
 				       (int)ddc->ring_write_index);
 				fflush(stdout);
 			}
+			// Bump BOTH guards across the decode-drive: g_sim2_decode_drive_depth so a
+			// nested deliver (pump-fired from dst's own pacing wait) does not re-drive
+			// the decode; g_sim2_pump_depth so the nested pump runs PART B / skips
+			// PART A's depth-0 block (same one-level bound as the original).
+			// Do NOT change c->tx here: the decode-drive is a NESTED receiver-drive
+			// fired while the SENDER's send-wait is still on the outer stack; the
+			// nested pump must keep draining the SENDER (c->tx unchanged), exactly as
+			// the original left c->tx==the sender so the data keeps flowing.
 			g_sim2_decode_drive_depth++;
-			g_sim2_depth++;
+			g_sim2_pump_depth++;
 			sim2_activate(dst);
 			dst->arq.process_main();
-			g_sim2_depth--;
+			g_sim2_pump_depth--;
 			g_sim2_decode_drive_depth--;
 		}
 	}
@@ -9899,7 +9950,50 @@ void prep_pull_inline(MercuryInstance* inst, double* buffer_temp)
 
 void sim2_activate(MercuryInstance* m);   // fwd decl (defined below)
 
-// The 2-instance step-pump (see SimInproc2Ctx above for the full contract).
+// Pump ONE direction (src -> dst) for the role-agnostic pump: drain src's
+// playback (real signal or idle silence) through ch into the src->dst wire
+// (advancing the shared clock), then deliver that wire into dst's capture +
+// prep + per-frame OFDM decode-drive. The §10.5 deferral is applied per
+// direction: deliver into dst ONLY when dst is NOT actively transmitting its own
+// frame (dst.play empty), so a reply/data in the wire is never wiped by dst's
+// own post-TX capture flush. Returns true if real (non-silence) signal drained
+// True when `m` has a STRANDED CONNECTED-OFDM data TX: a non-empty playback in
+// the CONNECTED + OFDM-config regime. This is the ONLY regime the role-agnostic
+// un-stranding pass touches — the multi-batch inter-batch commander turnaround
+// (its reentrant batch-N play buffer). The handshake/ROBUST_0/MFSK regime
+// (is_ofdm_config==false) is DELIBERATELY excluded: driving/delivering it
+// off-orientation desynced the 400/400 MFSK handshake (cadence doc §4, §7.4-2).
+static inline bool sim2_stranded_ofdm_tx(MercuryInstance* m)
+{
+	return size_buffer(m->audio.play) > 0 &&
+	       m->arq.link_status == CONNECTED &&
+	       is_ofdm_config(m->arq.current_configuration);
+}
+
+// The 2-instance step-pump — Option-b (data-flow-sim2-roleagnostic-pump.md). It is
+// PART A (verbatim legacy pump) PLUS PART B (role-agnostic un-stranding):
+//
+//   PART A — VERBATIM legacy c->tx/c->rx orientation pump. Byte-identical to the
+//     baseline @0e94581 pump: drains c->tx->wire; at depth 0 delivers c->tx->c->rx
+//     wire into c->rx (per-frame OFDM decode-drive), delivers the c->rx->c->tx reply
+//     when c->tx idle (§10.5), and co-routine-drives c->rx ONCE with the c->tx/c->rx
+//     flip. This preserves the proven MFSK CONNECT/HAIL handshake (the 4 prior
+//     reverts kept breaking it) AND the single-batch OFDM cadence (single-symbol
+//     pacing + frame-boundary decode-drive) EXACTLY — both validated byte-identical.
+//
+//   PART B — un-stranding, DEPTH>0 ONLY, CONNECTED-OFDM ONLY, keyed on the STABLE
+//     A/B fields (NOT the c->tx flip). The deadlock §2: the commander re-enters a
+//     NEW batch TX at depth 1 and its drain_playback_wait spins because PART A's
+//     depth-0 deliver block is gated off and PART A's depth>0 path only drains
+//     c->tx (the IDLE responder at the wedge — the orientation trap §7.3). PART B
+//     drains whichever instance has a STRANDED CONNECTED-OFDM playback that is NOT
+//     the one PART A is already draining (!= c->tx), delivers it to the receiver,
+//     DRIVES the receiver's process_main so its ARQ consumes the batch (enters
+//     RECEIVING, arms frames_to_read, sends the SACK), and delivers the receiver's
+//     reply back to the commander. Gated CONNECTED-OFDM so it can NEVER touch the
+//     handshake. Bounded by g_sim2_partb_depth (fires once per un-strand).
+//     STATUS: removes the deadlock + decodes batch-2 frames byte-correct, but the
+//     partial-batch SACK→retransmit turnaround does not yet complete in-sim (§6.4).
 void sim_inproc_pump_2(void* ctxv)
 {
 	SimInproc2Ctx* c = static_cast<SimInproc2Ctx*>(ctxv);
@@ -9907,33 +10001,120 @@ void sim_inproc_pump_2(void* ctxv)
 		return;
 	c->pump_calls++;
 
+	// ---- PART B (un-stranding, DEPTH>0 ONLY, CONNECTED-OFDM ONLY) ----
+	// PART B is the ONLY change vs the proven legacy pump (PART A below is verbatim).
+	// It fires ONLY at depth>0 — the reentrant case PART A (depth-0-only) can NOT
+	// reach. The deadlock §2: the commander re-enters a NEW batch TX at depth 1 and
+	// its drain_playback_wait spins because the legacy depth-0 deliver block is gated
+	// off and the legacy depth-1 path only drains c->tx (the IDLE responder at the
+	// wedge, NOT the stranded commander — the orientation trap, cadence doc §7.3).
+	// PART B drains whichever instance has a stranded CONNECTED-OFDM playback (keyed
+	// on "who is stranded" via the STABLE A/B fields, NOT the c->tx/c->rx flip) to
+	// its peer wire and delivers it to its peer, so the reentrant commander batch-N
+	// audio reaches the responder and drain_playback_wait exits. Gated CONNECTED-OFDM
+	// so it can NEVER touch the MFSK CONNECT/HAIL handshake (the 4 prior reverts'
+	// regression). At depth 0 PART A owns the data cadence byte-identically (the
+	// single-symbol pacing + frame-boundary decode-drive that makes OFDM decode);
+	// PART B at depth 0 raced that pacing and corrupted the decode, so it is excluded
+	// there. The decode-drive inside sim2_deliver_from_wire is flat-guard-gated (>0
+	// here) so PART B only DELIVERS+PREPS; the frame decode fires when the stepper
+	// unwinds to depth 0 and the receiver's process_main runs the frame-boundary
+	// decode at the frame-aligned ring offset.
+	// PART B handles a stranded instance ONLY when it is NOT the instance PART A is
+	// already draining (c->tx). This is the precise discriminator between the two
+	// depth>0 cases: (1) the NORMAL decode-drive nesting, where the legacy code left
+	// c->tx == the SENDER (so PART A drains the sender and PART B must NOT touch it —
+	// touching it raced the single-symbol pacing and zeroed the decode); and (2) the
+	// STRANDED reentrant batch-N TX, where the orientation at the wedge leaves c->tx
+	// == the IDLE responder while the COMMANDER (!= c->tx) is the stranded
+	// transmitter — PART B drains it. Keyed on the STABLE A/B fields, so it works
+	// regardless of how the c->tx/c->rx flip happens to be oriented at the wedge.
+	if (g_sim2_pump_depth > 0 && g_sim2_partb_depth == 0)
+	{
+		static const bool pbdbg = (getenv("MERCURY_SIM2_PBDBG") != nullptr);
+		MercuryInstance* cur_tx = c->tx;
+		// Identify the stranded transmitter (the reentrant batch-N CMD) and its
+		// receiver. Keyed on the STABLE A/B fields, not the c->tx flip; excludes the
+		// instance PART A is already draining (cur_tx) so the normal decode-drive
+		// nesting is untouched.
+		MercuryInstance* str_src = nullptr; MercuryInstance* str_dst = nullptr;
+		cl_sim_awgn* str_ch = nullptr;      cbuf_handle_t str_wire = nullptr;
+		cl_sim_awgn* rev_ch = nullptr;      cbuf_handle_t rev_wire = nullptr; // dst->src (reply)
+		if (sim2_stranded_ofdm_tx(c->inst_a) && c->inst_a != cur_tx) {
+			str_src = c->inst_a; str_dst = c->inst_b; str_ch = c->ch_a2b_d; str_wire = c->wire_a2b;
+			rev_ch = c->ch_b2a_d; rev_wire = c->wire_b2a;
+		} else if (sim2_stranded_ofdm_tx(c->inst_b) && c->inst_b != cur_tx) {
+			str_src = c->inst_b; str_dst = c->inst_a; str_ch = c->ch_b2a_d; str_wire = c->wire_b2a;
+			rev_ch = c->ch_a2b_d; rev_wire = c->wire_a2b;
+		}
+		if (str_src != nullptr)
+		{
+			if (pbdbg) { printf("[PARTB] depth=%d src=%s play=%zu wire=%zu dst=%s dstconn=%d dstftr=%d\n",
+			    g_sim2_pump_depth, str_src->tag, size_buffer(str_src->audio.play), size_buffer(str_wire),
+			    str_dst->tag, str_dst->arq.connection_status, (int)str_dst->ts.data_container.frames_to_read); fflush(stdout); }
+			// (1) Un-strand: drain the reentrant TX's playback to its wire so its
+			//     drain_playback_wait exits (the deadlock fix).
+			sim2_drain_to_wire(str_src, str_ch, str_wire, c);
+			// (2) Deliver to the receiver (single-symbol-paced + per-frame decode).
+			if (size_buffer(str_dst->audio.play) == 0 && size_buffer(str_wire) > 0 &&
+			    str_dst->arq.link_status == CONNECTED &&
+			    is_ofdm_config(str_dst->arq.current_configuration))
+				sim2_deliver_from_wire(str_dst, str_wire, c, /*drive_decode=*/true);
+			// (3) CO-ROUTINE DRIVE the RECEIVER once so its ARQ state machine advances
+			//     (enters RECEIVING for the new batch, arms frames_to_read, consumes the
+			//     delivered frames into messages_rx, sends the SACK). Without this the
+			//     reentrant batch-N TX starves the depth-0 outer loop and the receiver
+			//     never processes the batch we just delivered (it sat in its ring while
+			//     the CMD retransmitted endlessly). Gated CONNECTED-OFDM (str_dst is by
+			//     construction CONNECTED-OFDM) so it can NEVER touch the MFSK handshake.
+			//     Guarded by g_sim2_partb_depth (bumped here) so PART B fires ONCE per
+			//     un-strand and the nested pump only drains+clocks — bounded recursion.
+			g_sim2_partb_depth++;
+			g_sim2_pump_depth++;
+			MercuryInstance* save_tx2 = c->tx; MercuryInstance* save_rx2 = c->rx;
+			c->tx = str_src; c->rx = str_dst;   // keep draining str_src in the nested pump
+			sim2_activate(str_dst);
+			str_dst->arq.process_main();
+			c->tx = save_tx2; c->rx = save_rx2;
+			sim2_activate(cur_tx);
+			g_sim2_pump_depth--;
+			g_sim2_partb_depth--;
+
+			// (4) RESPONDER->COMMANDER TURNAROUND (the 2nd facet, task-named). Driving
+			//     the receiver above made it emit its SACK/ACK reply into ITS playback
+			//     (str_dst.play). Drain that reply through the reverse channel into the
+			//     dst->src wire and deliver it to the commander (str_src) so the
+			//     commander's next scan sees the SACK and retransmits the missing
+			//     frame(s) — completing the multi-batch SACK loop. The reply is MFSK
+			//     (NOT OFDM), so it is delivered WITHOUT a decode-drive (drive_decode
+			//     defaults false), exactly like the legacy §10.5 rx->tx reply delivery.
+			//     §10.5 deferral: deliver into str_src only when it is idle (play empty
+			//     — true now that PART B drained its batch and it awaits the SACK), so
+			//     no in-flight reply is wiped.
+			sim2_drain_to_wire(str_dst, rev_ch, rev_wire, c);
+			if (size_buffer(str_src->audio.play) == 0 && size_buffer(rev_wire) > 0)
+				sim2_deliver_from_wire(str_src, rev_wire, c);
+			sim2_activate(cur_tx);
+		}
+	}
+
+	// ---- PART A (VERBATIM legacy pump — c->tx/c->rx orientation, byte-identical) ----
 	// (1) Drain tx's playback (real signal or idle silence) into the tx->rx wire,
-	//     advancing the shared clock. NEVER writes to a capture here. `sending`
-	//     = real signal was draining this call (tx is actively transmitting a
-	//     frame, NOT idle/listening).
+	//     advancing the shared clock. `sending` = real signal drained this call.
 	bool sending = sim2_drain_to_wire(c->tx, c->ch_tx2rx, c->wire_t2r, c);
 
-	if (g_sim2_depth == 0)
+	if (g_sim2_pump_depth == 0)
 	{
-		// (2) DEPTH 0 (tx is the top-level driven instance): deliver the tx->rx
-		//     wire into rx's capture + prep rx, then co-routine-drive rx ONCE so
-		//     rx can react WHILE tx is blocked. drive_decode=true: this is the
-		//     PRIMARY OFDM data-frame delivery path (the data frame is drained to the
-		//     wire and delivered to rx DURING tx's send wait); the per-frame decode
-		//     at the frame-aligned ring offset must fire here (gated CONNECTED+OFDM).
+		// (2) DEPTH 0 (tx is the top-level driven instance): deliver tx->rx wire into
+		//     rx's capture + prep + decode-drive, then co-routine-drive rx ONCE.
 		sim2_deliver_from_wire(c->rx, c->wire_t2r, c, /*drive_decode=*/true);
 
 		// Deliver the rx->tx reply into tx ONLY when tx is NOT actively sending a
-		// frame (tx.play empty AND no real signal drained this call). This is the
-		// §10.5 deferral made precise: during a frame send the post-TX capture
-		// FLUSH (send_*_pattern) would wipe an in-flight reply, so we hold it in
-		// the wire; once tx finishes the frame and sits in a LISTEN/idle wait
-		// (tx.play empty, the flush already done — no pump fires between drain-exit
-		// and the flush), it is safe to deliver and tx's next scan sees the reply.
+		// frame (§10.5 deferral — the post-TX flush would wipe an in-flight reply).
 		if (!sending && size_buffer(c->tx->audio.play) == 0)
 			sim2_deliver_from_wire(c->tx, c->wire_r2t, c);
 
-		g_sim2_depth++;
+		g_sim2_pump_depth++;
 		MercuryInstance* save_tx = c->tx;
 		MercuryInstance* save_rx = c->rx;
 		cl_sim_awgn* save_t2r = c->ch_tx2rx;
@@ -9947,17 +10128,16 @@ void sim_inproc_pump_2(void* ctxv)
 		c->wire_t2r = save_wr2t; c->wire_r2t = save_wt2r;
 		sim2_activate(save_rx);
 		save_rx->arq.process_main();
-		// Restore tx's view. Do NOT deliver rx->tx here (the §10.5 deferral):
-		// the reply stays in the wire and is delivered to tx by a later pump fired
-		// from tx's LISTEN/idle wait (tx.play empty) or by the outer loop.
+		// Restore tx's view (§10.5: the reply stays in the wire, delivered later).
 		c->tx = save_tx; c->rx = save_rx;
 		c->ch_tx2rx = save_t2r; c->ch_rx2tx = save_r2t;
 		c->wire_t2r = save_wt2r; c->wire_r2t = save_wr2t;
 		sim2_activate(save_tx);
-		g_sim2_depth--;
+		g_sim2_pump_depth--;
 	}
-	// DEPTH 1 (we ARE the peer being co-routine-driven): only drained tx->rx wire
-	// above (the reply path). Do NOT deliver into the original sender's capture.
+	// DEPTH 1 (we ARE the peer being co-routine-driven): only PART B (un-stranding)
+	// + the PART-A tx->rx drain above ran. Do NOT deliver into the original sender's
+	// capture here.
 }
 
 // Configure one instance for the 2-instance stepper exactly like the non-TCP
@@ -10196,6 +10376,12 @@ int cl_arq_controller::test_sim_inproc_2()
 	clear_buffer(wire_a2b); clear_buffer(wire_b2a);
 	pump.wire_t2r = wire_a2b;   // initial (overwritten each half-step)
 	pump.wire_r2t = wire_b2a;
+	// ROLE-AGNOSTIC pump fields (Option-b PART B): STABLE direction-keyed references
+	// the un-stranding pass uses (keyed on "who is stranded", NOT the tx/rx flip).
+	// Set ONCE here, never flipped. A=CMD, B=RSP.
+	pump.inst_a   = A;        pump.inst_b   = B;
+	pump.ch_a2b_d = &ch_a2b;  pump.ch_b2a_d = &ch_b2a;
+	pump.wire_a2b = wire_a2b; pump.wire_b2a = wire_b2a;
 	arq_set_sim_inproc_pump(sim_inproc_pump_2, &pump);
 	check(pump.scratch != nullptr && wire_a2b != nullptr && wire_b2a != nullptr,
 	      "S3 step-pump + wires installed");
