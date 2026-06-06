@@ -6981,6 +6981,42 @@ static void bigblock_whiten_payload_bits(int* payload_bits, int nbits, unsigned 
 // wire negotiation.
 #define BIGBLOCK_WHITEN_SEED 0x5A3C96E1u
 
+// ===== diag/bigblock-rxdecode: oracle-INDEPENDENT per-codeword decode-truth hash =====
+// Packs ONE codeword's info bits (int 0/1, length nbits == ldpc.K) MSB-first into bytes
+// and computes a stable CRC-32 (IEEE 802.3 / zlib polynomial 0xEDB88320, reflected) over
+// them. TX prints this over the WHITENED info bits it is about to encode; RX prints the
+// SAME hash over the LDPC-DECODED info bits BEFORE de-whiten. Because the de-whiten is the
+// only transform between them and it is applied to NEITHER side here, [TXCW] crc32 ==
+// [RXCW] crc32 IFF the decoded info bits equal the transmitted whitened info bits per
+// codeword — a decode-correctness signal that does NOT depend on the forced-clean oracle
+// (cw_info_ref) nor on the carve / FIFO / network DOWNLOAD path. head8_out receives the
+// first up-to-8 packed bytes (MSB-first) for a quick eyeball compare. Logging-only.
+static uint32_t bigblock_cw_crc32(const int* bits, int nbits, unsigned char* head8_out, int* head8_len_out)
+{
+	// IEEE CRC-32 (reflected), table-free bit-at-a-time so it is self-contained and
+	// deterministic; identical implementation is called from TX and RX so the polynomial
+	// state can never drift between the two sites.
+	uint32_t crc = 0xFFFFFFFFu;
+	int head8_len = 0;
+	for(int byte_i = 0; byte_i * 8 < nbits; byte_i++)
+	{
+		unsigned char b = 0;
+		for(int k = 0; k < 8; k++)
+		{
+			int idx = byte_i * 8 + k;
+			int bit = (idx < nbits) ? (bits[idx] & 1) : 0;   // pad tail with 0 if K not byte-aligned
+			b = (unsigned char)((b << 1) | (unsigned char)bit);  // MSB-first
+		}
+		if(head8_out && head8_len < 8){ head8_out[head8_len++] = b; }
+		// fold this byte into the reflected CRC-32
+		crc ^= (uint32_t)b;
+		for(int k = 0; k < 8; k++)
+			crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+	}
+	if(head8_len_out) *head8_len_out = head8_len;
+	return crc ^ 0xFFFFFFFFu;
+}
+
 static int bigblock_build_tx_bits(cl_ldpc& ldpc, int nBits, unsigned int seed, int kcap,
                                   std::vector<int>& tx_bits,
                                   std::vector<std::vector<int>>& cw_info,
@@ -7040,6 +7076,22 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	int kcap = env_i("MERCURY_BIGBLOCK_K", 0);
 	std::vector<int> tx_bits;
 	int Kcw = bigblock_build_tx_bits(ldpc, nBits, seed, kcap, tx_bits, cw_info_out, payload_bits);
+
+	// [TXCW] diag/bigblock-rxdecode (logging-only): per-codeword crc32 + head8 over the
+	// WHITENED info bits this block is about to LDPC-encode (cw_info_out[c] is the exact
+	// info[] copied at bigblock_build_tx_bits before ldpc.encode). RX prints the SAME hash
+	// over the decoded info bits PRE-de-whiten; matching crc32 per c proves the live decode
+	// recovered the transmitted whitened bits, independent of the forced-clean oracle.
+	for(int c = 0; c < (int)cw_info_out.size(); c++)
+	{
+		unsigned char h8[8]; int h8len = 0;
+		uint32_t cw_crc = bigblock_cw_crc32(cw_info_out[c].data(),
+		                                    (int)cw_info_out[c].size(), h8, &h8len);
+		fprintf(stderr, "[TXCW] c=%d crc32=%08x head8=", c, cw_crc);
+		for(int b = 0; b < h8len; b++) fprintf(stderr, "%02x", h8[b]);
+		fprintf(stderr, " nbits=%d\n", (int)cw_info_out[c].size());
+	}
+	fflush(stderr);
 
 	// freq-domain grid (data + pilots placed by the thin lattice).
 	std::vector<std::complex<double>> tx_syms(nData);
@@ -7390,6 +7442,28 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		          << " last_sel=" << last_channel_selectivity << std::endl;
 	}
 
+	// [RXACQ] diag/bigblock-rxdecode (logging-only): acquisition + channel-estimate health for
+	// THIS block decode, so a garbage [RXCW] can be attributed to a bad lock (acquisition /
+	// timing / channel-est) vs a clean lock that still mis-decodes. block_start_off = the
+	// snapped preamble (block) start sample offset (head_delay); sc_metric = Schmidl-Cox
+	// timing correlation; mean_pilot_evm = pilot EVM over the chosen (fine-timed) rx grid;
+	// meanH = mean |H| of the channel estimate; nzero = zeroed/collapsed subcarriers
+	// (|H| < 0.3*meanH), the MMSE/polar-collapse signal. Computed on the SAME estimated_channel
+	// and rx the decode below uses; behaviour-neutral.
+	{
+		double meanH = 0.0;
+		for(int ci=0; ci<Ngrid*Nc; ci++) meanH += std::abs((ofdm.estimated_channel+ci)->value);
+		meanH /= (Ngrid*Nc > 0 ? (double)(Ngrid*Nc) : 1.0);
+		long nzero = 0;
+		for(int ci=0; ci<Ngrid*Nc; ci++)
+			if(std::abs((ofdm.estimated_channel+ci)->value) < 0.3*meanH) nzero++;
+		double mean_evm = pilot_evm(rx);
+		fprintf(stderr, "[RXACQ] block_start_off=%ld sc_metric=%.3f mean_pilot_evm=%.3f "
+		        "meanH=%.3f nzero_carriers=%ld\n",
+		        head_delay, head_metric, mean_evm, meanH, nzero);
+		fflush(stderr);
+	}
+
 	// --- LLR + CSI weighting + LDPC per codeword ---
 	std::vector<float> clr(nBits);
 	double cvar = ofdm.noise_variance_estimate; if(cvar<1e-9) cvar=1e-9;
@@ -7440,10 +7514,26 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	for(int c=0;c<Kcw;c++)
 	{
 		for(int i=0;i<ldpc.N;i++) cwllr[i]=clr[(size_t)c*ldpc.N+i];
-		ldpc.decode(cwllr.data(), dec.data());
+		// diag/bigblock-rxdecode: CAPTURE the per-codeword decode iteration count (previously
+		// discarded). This is a REAL decode-health signal independent of the forced-clean
+		// oracle: a clean converged decode returns a low count, a non-converging / garbage
+		// decode runs to the iteration cap.
+		int ldpc_iter = ldpc.decode(cwllr.data(), dec.data());
 		// extract the K info bits of this codeword into out_infobits (sub-unit c)
 		for(int i=0;i<ldpc.K;i++)
 			out_infobits[(size_t)c*ldpc.K + i] = dec[i];
+		// [RXCW] diag/bigblock-rxdecode (logging-only): same crc32+head8 hash as [TXCW], over
+		// the DECODED info bits dec[0..ldpc.K) PRE-de-whiten. Compare crc32 per c against the
+		// matching [TXCW] line: equal => the live decode recovered the transmitted whitened
+		// bits for that codeword; unequal => the decode produced garbage info bits (live
+		// acquisition / demod / channel-est fed it a bad block). Oracle-independent.
+		{
+			unsigned char h8[8]; int h8len = 0;
+			uint32_t cw_crc = bigblock_cw_crc32(dec.data(), ldpc.K, h8, &h8len);
+			fprintf(stderr, "[RXCW] c=%d crc32=%08x head8=", c, cw_crc);
+			for(int b = 0; b < h8len; b++) fprintf(stderr, "%02x", h8[b]);
+			fprintf(stderr, " ldpc_iter=%d\n", ldpc_iter);
+		}
 		// per-codeword clean gate: compare against the known info bits when the caller
 		// supplied them (loopback byte-correct); else (P2) the caller validates via CRC.
 		int ierr=0;
@@ -7452,6 +7542,7 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		cw_ok_out[c] = (ierr==0) ? 1 : 0;
 		if(ierr==0) cw_ok++;
 	}
+	fflush(stderr);
 	K_out = Kcw;
 	return cw_ok;
 }
