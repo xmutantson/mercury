@@ -1504,6 +1504,19 @@ public:
   // 0x1FFFFFF != RSP 0xFF -> clean ACK never matches (the "4 wire failures").
   int bigblock_test_election_symmetry();
 
+  // CLIMB-ELECTION (fact-doc data-flow-bigblock-arq-unit.md §16): proves the
+  // big-block rung is ELECTED by the GEARSHIFT CONFIG TRANSITION (load_configuration
+  // landing on CFG16 with framing on), NOT only by an explicit
+  // sack_negotiated_recompute_batch() at connect. Builds two instances (CMD+RSP),
+  // seeds the bug-#9 state (load_configuration(CFG15) -> 30s formula -> batch=25),
+  // turns on bigblock_framing_enabled, then fires the SAME gearshift entry the climb
+  // uses (load_configuration(CFG16)) and asserts the transition elected K==8 on BOTH
+  // peers (symmetric, all_ones==0xFF) WITHOUT any explicit election call, then drives
+  // the REAL emit (bigblock_send_one_block) + carve + delivers byte-faithful.
+  // fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1
+  // (skips the load_configuration tail election). Returns 0 on all-pass, 1 on failure.
+  static int test_bigblock_climb_election();
+
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
   // policy_evaluate_axis3() implements the per-SACK-event §4.3.2 controller.

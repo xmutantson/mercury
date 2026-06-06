@@ -1132,3 +1132,229 @@ those correct). This was never reachable before (the UAF crashed the first block
 follow-on for the sim-cadence fact docs; the byte-faithful single-block delivery is the deliverable here.
 
 NO monitor merge, NO push, NO attribution.
+
+---
+
+## §16. RUNG ELECTION ON THE GEARSHIFT CLIMB — close the last "not-wired-into-the-gearshift (P4)" gap (2026-06-06, branch `fix/bigblock-rung-election` off `integ/bigblock-climb-2026-06-06`@`b5fa65d`, worktree `C:/Users/kamer/mercury_wt/bigblock-election`)
+
+**Symptom (HW-confirmed on `integ/bigblock-climb-2026-06-06`@`b5fa65d`):** the climb
+reaches CFG16 via the `-R` turbo path (negotiated/data_cfg/current=16, SNR up=15.0)
+and the af5f012 RX carve runs on HW (13× `[BIGBLOCK-RX] carve K=8 cw_ok=8`), but the
+big-block delivers **0/1200** because **the big-block rung is never ELECTED on the
+climb path**: CMD has 0 `[BIGBLOCK-TX]`, `bigblock_rung=0` on BOTH peers, every block
+PARTIAL `clean=0`.
+
+**Root cause:** `sack_negotiated_recompute_batch()` (`arq_common.cc:944`) — which pins
+`data_batch_size=K` (the R-B/#9 pin, §16.4 INV-5), the precondition for the clean-ACK
+`all_ones` mask to equal the K-bit big-block bitmap — is invoked ONLY at CONNECT
+negotiation (`arq_commander.cc:4263` TEST_CONNECTION_ACK, `:7131/:7141/:7175/:8987`;
+`arq_responder.cc:2204` TEST_CONNECTION) and from the synthetic-fire/unit-test paths.
+It is **never re-invoked when the gearshift switches the live config to CONFIG_16 on
+the climb.** On a robust/`-R` connect the negotiation ran at ROBUST_0 (`current_configuration`
+was ROBUST_0 → the `bigblock_rung` branch's `current_configuration==CONFIG_16` guard was
+false → no K-pin), and nothing re-elects the rung when the climb later lands on CFG16.
+So at CFG16 the climb holds the stock OFDM 30s batch (`data_batch_size≈25`) while the
+RX carve emits a K=8 bitmap → CMD `all_ones=(1<<25)-1=0x1FFFFFF ≠ 0xFF` → zero clean
+credit → every block PARTIAL. This is the documented "Not wired into the gearshift
+(that is P4)" gap (`telecom_system.cc:80`, `arq_common.cc:976-983` comment).
+
+**This audit covers the NEW PRODUCER** of `data_batch_size` (the gearshift-transition
+election trigger) and the NEW reader-relevant transition of the election condition
+`bigblock_rung = bigblock_framing_enabled && current_configuration==CONFIG_16`. The §1/§2
+producer/consumer lists and §4 invariants below are EXTENDED, not replaced.
+
+### §16.1 Producers — `bigblock_rung` (the election condition) and `data_batch_size`
+
+`bigblock_rung` is NOT a stored member; it is a derived predicate recomputed wherever
+the big-block path gates. Its two inputs:
+
+- `telecom_system->bigblock_framing_enabled` (bool member, `telecom_system.h`).
+  Producers: ctor env-read `MERCURY_BIGBLOCK_FRAMING` (`telecom_system.cc:81-82`, set
+  ONCE, persistent); `transmit_bigblock`/`bigblock_*` self-clear on a degenerate block
+  (`telecom_system.cc:8346/8363`); the unit-test direct sets (`test_bigblock_arq_unit.cc`,
+  test-only). It is a "framing-mode PERMITTED" flag — both peers carry the SAME value
+  (both have the env var in a session); it does NOT toggle per-config.
+- `current_configuration` (int member). SOLE production producer:
+  `cl_arq_controller::load_configuration()` writes it at `arq_common.cc:1512`
+  (`this->current_configuration=configuration`) on EVERY config switch — connect,
+  every gearshift up/down step, BREAK→ROBUST_0, turbo-reverse, NB switch. This is the
+  single chokepoint every gearshift transition flows through, on BOTH the CMD and RSP
+  side (each peer runs its own `load_configuration` from its own gearshift logic).
+
+`data_batch_size` producers (full list in `data-flow-batch-size.md` §2; setter
+chokepoint `set_data_batch_size()` `arq_common.cc:751`):
+- `load_configuration()` itself: FULL-load seed `default_configuration_ARQ.batch_size`
+  (`:1567`); robust pin `set_data_batch_size(1)` (`:1630`); OFDM 30s-scaling
+  `set_data_batch_size(fixed_batch)` where `fixed_batch=sack_enabled?radio_batch_size(25):10`
+  (`:1656`).
+- `sack_negotiated_recompute_batch()` (`arq_common.cc:944`): at the bigblock rung pins
+  `set_data_batch_size(K)`, `K=telecom_system->bigblock_codeword_count()` (`:986-991`);
+  else (non-robust, non-bigblock) the 30s formula (`:994-1004`).
+- Axis-2 adaptive controller `policy_evaluate_axis2()` (`arq_commander.cc:5769` up/down
+  ±5) + RSP adopt of `SET_LINK_PARAMS` (`arq_responder.cc:2714`). **THE SIBLING RISK,
+  see §16.5.**
+- Robust dwell op + connect-path recomputes (§2 of `data-flow-batch-size.md`).
+
+**NEW PRODUCER (this fix):** at the END of `load_configuration()` (after all batch/timing/
+buffer init is settled, `arq_common.cc:~1824`), when the just-loaded config makes
+`bigblock_rung` TRUE, call the SHARED election body `sack_negotiated_recompute_batch()`,
+which re-pins `data_batch_size=K`. Because `load_configuration()` runs on BOTH peers at
+their respective CFG16 transitions and `bigblock_framing_enabled` + `bigblock_codeword_count()`
+are identical on both, the election fires SYMMETRICALLY and elects the SAME K (the
+divergence-proof property — same shared body, same geometry source). This is exactly the
+T6 election-symmetry contract, now fired by the gearshift transition instead of only by the
+connect handlers.
+
+### §16.2 Consumers — unchanged set, re-verified at the new producer
+
+The election sets `data_batch_size=K`; its consumers are the §2.7 / `data-flow-batch-size.md`
+§3 set. The divergence-sensitive one (§2.5 / `data-flow-batch-size.md` §3.1): the clean-ACK
+`all_ones` target `(1<<data_batch_size)-1` computed independently on each side
+(`cmd_clean_data_ack_crc_valid` `arq_commander.cc:136-139`; the RSP big-block bitmap is the
+K-bit `cw_ok`). With both peers at `data_batch_size==K`, both derive `0xFF` and match the
+emitted bitmap. The TX switch `bigblock_send_one_block()` (`arq_common.cc:3648`) and the RX
+carve gate (`arq_common.cc:6888`) self-gate on `bigblock_framing_enabled && M!=MFSK &&
+current_configuration==CONFIG_16` — they need NO extra wiring; they engage automatically once
+the config is CFG16. The ONLY missing piece was the batch-size election, which keeps their
+K-bit SACK in sync with the ARQ clean-ACK gate.
+
+### §16.3 Valid states — especially the climb seed BEFORE the election fires
+
+| moment | `bigblock_framing_enabled` | `current_configuration` | `data_batch_size` | bigblock TX/RX engage? | clean-ACK works? |
+|---|---|---|---|---|---|
+| robust connect (`-R`) | true (env) | ROBUST_0 | 1 (robust pin) | no (MFSK + !CFG16) | n/a (per-frame MFSK) |
+| climbing CFG6..15 | true | CFG6..15 | 25 (30s scale) | no (!CFG16) | stock OFDM per-frame |
+| **lands on CFG16 — PRE-FIX** | true | CFG16 | **25 (stale 30s)** | **TX/RX yes (auto-gated)** | **NO — all_ones 0x1FFFFFF ≠ 0xFF (bug #9)** |
+| **lands on CFG16 — POST-FIX** | true | CFG16 | **K=8 (election)** | TX/RX yes | **YES — all_ones 0xFF == bitmap 0xFF** |
+| later Axis-2 up-move at CFG16 (PRE §16.5 guard) | true | CFG16 | 8→13 (un-pinned) | TX yes (block emits min(K,batch)), RX K=8 | **NO — all_ones 0x1FFF ≠ 0xFF (re-diverges!)** |
+| later Axis-2 (POST §16.5 guard) | true | CFG16 | held K=8 | yes | YES |
+
+The PRE-FIX "lands on CFG16" row is the exact HW-observed `bigblock_rung=0`/clean=0 failure.
+The Axis-2 row is the latent SIBLING bug §16.5 closes in the same change.
+
+### §16.4 Invariants — INV-5 extended to the gearshift transition
+
+**INV-5 (CMD==RSP batch symmetry at the rung)** (§4): `data_batch_size==K` on BOTH peers
+at the bigblock rung so the `all_ones` target matches the emitted bitmap. *Producer
+obligation EXTENDED:* in addition to the connect handlers, the gearshift CFG16 transition
+must elect K on BOTH peers. Maintained because the SHARED election body runs from the SINGLE
+`load_configuration` chokepoint each peer hits at its CFG16 transition, with identical inputs
+(`bigblock_framing_enabled`, `bigblock_codeword_count()`), so it CANNOT diverge.
+
+**INV-5b (NEW — the bigblock-rung batch is geometry-locked, not link-adaptive):** once the
+rung is elected, `data_batch_size` MUST remain == K for the lifetime of the CFG16 dwell.
+Any mid-session producer that moves it away from K re-opens bug #9. *Producer obligation:*
+suppress the Axis-2 adaptive batch controller at the bigblock rung (§16.5). The K-pin is a
+PHY-geometry fact (K = `nBits/ldpc.N` codewords per acquisition), not a link-quality knob.
+
+All other invariants (INV-1..INV-4, INV-6..INV-8) are PHY/carve invariants the election does
+not touch — it only sets `data_batch_size`; the carve, EOB, bsi, and selective-repeat paths
+are unchanged.
+
+### §16.5 SIBLING BUG found by the audit — Axis-2 can un-pin K mid-session (CLAUDE.md §5)
+
+`policy_evaluate_axis2()` (`arq_commander.cc:5589`) is the OFDM adaptive batch controller.
+It is gated OFF only for robust configs (`if(is_robust_config(current_configuration)) return;`
+`:5608`). At CFG16 it RUNS: after `AXIS2_UP_GOOD_RUN=4` clean batches it steps
+`data_batch_size += AXIS2_STEP(5)` up to `AXIS2_BATCH_CEIL`, and `set_data_batch_size(13)`
+accepts it (non-robust branch), then `SET_LINK_PARAMS` pushes the RSP to the same value
+(`arq_responder.cc:2714`, clamped `[10,32]`). That moves BOTH peers off K=8 → `all_ones`
+becomes `(1<<13)-1` while the carve still emits a K=8 bitmap → re-diverges (bug #9), mid-session.
+This is latent (the pinned `-s16` path is blocked by a separate CONNECT control-ACK no-decode
+bug and never ran long enough for Axis-2 to fire; T6 runs the election in isolation), but it
+is on the exact path this fix is about to make live. **Fix (root cause, mirrors the robust
+guard at `:5608`):** early-return `policy_evaluate_axis2()` at the bigblock rung
+(`bigblock_framing_enabled && current_configuration==CONFIG_16`) so K stays geometry-locked.
+This is NOT a threshold tune — the bigblock rung's batch is dictated by codeword geometry, so
+the adaptive controller has no valid axis to act on there.
+
+### §16.6 What the fix changes (walk every consumer)
+
+1. **NEW gearshift-transition election (`load_configuration` tail).** Alters the §1.8 / §16.1
+   producer set: `data_batch_size` is now re-pinned to K whenever a config switch lands on
+   CFG16 with framing on. Consumers: the clean-ACK `all_ones` gate (§2.5) now sees `0xFF` at
+   CFG16 (was `0x1FFFFFF`); `recalculate_ack_timeout_for_batch()` (called inside the body)
+   re-sizes the data-ACK timeout for batch=K. The TX/RX big-block gates (§16.2) are unchanged
+   (already config-gated). Stock per-frame path (non-CFG16, or framing off) is BYTE-IDENTICAL
+   — the body's outer guard `bigblock_framing_enabled && current_configuration==CONFIG_16`
+   is false there and the call early-returns to the stock 30s/robust branch already run by
+   `load_configuration`. ✓
+2. **NEW Axis-2 suppression at the bigblock rung.** Alters the §16.1 Axis-2 producer: it no
+   longer moves `data_batch_size` at CFG16-with-framing. Consumer of Axis-2's output
+   (`SET_LINK_PARAMS` → RSP adopt) simply never fires at that rung, so the two peers stay at
+   K. Every OTHER config (CONFIG_0..15, framing off) is UNCHANGED — Axis-2 runs exactly as
+   before. ✓
+3. **Structures explicitly NOT changed:** the optimizer (`optimizer_is_in_control()`
+   `arq.h:2041-2058`, `last_data_viable_config`, `anchor_consec_break_fails`,
+   `probe_backoff`), the carve, EOB, bsi, retx queue. This is a batch-size election at the
+   CFG16 rung, NOT an authority/gearshift change — the gearshift still owns config selection;
+   we only react to its CFG16 transition. ✓
+
+### §16.7 Symmetry argument (the R-B / #9 contract)
+
+The election fires from `load_configuration()`, which BOTH peers execute independently when
+their own gearshift drives them to CFG16. The body reads only `bigblock_framing_enabled`
+(identical: both have `MERCURY_BIGBLOCK_FRAMING=1`) and `bigblock_codeword_count()` (identical
+PHY geometry, the same `nBits/ldpc.N` the TX/RX workers use; deterministic, capped by
+`MERCURY_BIGBLOCK_K`). There is no link-quality, timing, or peer-specific input. Therefore
+both peers elect the SAME K at their CFG16 transition and the all-ones targets match — the
+divergence-proof property the connect-path election already had, now extended to the climb.
+(Empirically asserted by the new `--test-bigblock-climb-election` symmetry case and by T6.)
+
+### §16.8 Paired regression — `--test-bigblock-climb-election`
+
+New in-process case (`bigblock_test_climb_election()`, `test_bigblock_arq_unit.cc`, fired by
+the `--test-bigblock-climb-election` CLI flag) following the T6 pattern but proving the
+election fires from the GEARSHIFT TRANSITION, not from an explicit `sack_negotiated_recompute_batch()`
+call:
+- Build two instances (CMD + RSP). Seed the bug-#9 state: `load_configuration(CONFIG_15,FULL,YES)`
+  (30s formula → `data_batch_size=25` on both), framing OFF at CFG15 (rung not elected).
+- Set `bigblock_framing_enabled=true` (the persistent env-style flag, both peers).
+- **Fire the gearshift transition:** `load_configuration(CONFIG_16, FULL, YES)` — the SAME
+  entry the climb uses. Assert the transition ELECTED the rung: `data_batch_size==K==8`
+  on BOTH peers, symmetric, `all_ones==0xFF`. **fail-before** (`MERCURY_BIGBLOCK_DEFEAT_ELECTION=1`
+  skips the new tail call): the transition leaves `data_batch_size=25`, `all_ones=0x1FFFFFF` →
+  assertion fails. **pass-after**: election fires → 8/0xFF.
+- Then drive the REAL emit+deliver: `bigblock_send_one_block()` returns true at CFG16 (the TX
+  switch engages), the block goes through the production carve, and the RX delivers byte-faithful
+  (re-using the CASE-A loopback + carve). This proves the elected rung actually EMITS and DELIVERS,
+  not merely that the batch number changed.
+
+Also extended `--test-bigblock-fullpath` doc note: the gearshift-transition seam is now covered.
+
+### §16.9 Build & regression result
+
+Build `o3` clean (71 files, 0 errors; only pre-existing vendored-audio format warnings).
+All FOREGROUND, GREEN:
+
+- **`--test-bigblock-climb-election`** (NEW): `ALL PASS (0 failures)`.
+  - FAIL-BEFORE (`MERCURY_BIGBLOCK_DEFEAT_ELECTION=1`): the CFG15→CFG16 transition does
+    NOT elect → `cfg16 batch cmd=25 rsp=25`, `cmd_all_ones=0x1FFFFFF` (≠ 0xFF) — the bug-#9
+    observable reproduced.
+  - PASS-AFTER (default env): the CFG16 transition ELECTS `batch cmd=8 rsp=8`
+    (symmetric, `all_ones cmd=0xFF rsp=0xFF`) with NO explicit election call; the elected
+    rung's TX gate engages and a big-block EMITS (`K_tx=8 n_tx=79360`) + DELIVERS
+    byte-faithful (`recv=8/8 delivered=622/622`, `carve_rc=0`).
+- **`--test-bigblock-arq-unit` (T1–T9)**: `8/8 cases passed`. T6 election-symmetry
+  (the R-B/#9 gate): `cmd_batch=8 rsp_batch=8 K=8 | cmd_all_ones=0xFF rsp_all_ones=0xFF
+  rsp_bitmap=0xFF | gate_match=1 dedupe_ok=1`.
+- **`--test-bigblock-fullpath`**: `ALL PASS` (FAIL-BEFORE first_clean=1/8 rx=0 ;
+  PASS-AFTER first_clean=8/8 rx=1200/1200) — the live 2-instance pinned-CFG16 big-block
+  delivery is unregressed (the election ALSO fires on its CFG16 setup, still green).
+- **`--test-sim-inproc-bigblock` (CASE A–D)**: `ALL PASS` — carve/selective-repeat/
+  heap-guard/wire-CRC unchanged.
+- **`--test-climb-engine`**: `ALL PASS (0 failures)` — the Axis-2 bigblock-rung suppression
+  (§16.5) and the election wiring do not regress the gearshift/climb/dwell logic.
+- **Net-PHY UNCHANGED**: `MERCURY_BIGBLOCK_LIVE=1 -m PLOT_PASSBAND -s 16` →
+  `codewords_decoded=8/8 post_FEC_BER=0 infoerr=0/11200 VERDICT=PASS`, K=8,
+  block_samples=79360 — byte-identical to the §15.6 baseline. The fix is ARQ batch-size
+  election + Axis-2 gating only; PHY geometry is untouched.
+
+**Sim climb (Option-b limitation):** the single-thread in-process 2-instance sim is the
+documented OFF-bench validator, but it cannot drive the multi-batch ROBUST/CFG15→CFG16
+turbo climb to completion (the `-R` turbo path + multi-batch climb is not reproduced by the
+lockstep stepper; the fullpath test PINS CFG16 for exactly this reason). The election seam
+is therefore validated by the SYNTHETIC `--test-bigblock-climb-election` test, which fires
+the EXACT `load_configuration(CONFIG_16)` gearshift entry the climb uses and asserts
+fail-before/pass-after election + symmetric K + emit + byte-faithful delivery. This is the
+CLAUDE.md §3-compliant "fails before / passes after" proof for the wiring seam.

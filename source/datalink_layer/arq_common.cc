@@ -1822,6 +1822,60 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		telecom_system->set_suffix_fec(fec_on, 3);
 		telecom_system->set_connect_preamble_reps(reps);
 	}
+
+	// BIG-BLOCK RUNG ELECTION ON THE GEARSHIFT TRANSITION (P4 — the "not wired into
+	// the gearshift" gap, fact-doc data-flow-bigblock-arq-unit.md §16). The big-block
+	// TX switch (bigblock_send_one_block, arq_common.cc:3648) and RX carve
+	// (arq_common.cc:6888) already SELF-GATE on bigblock_framing_enabled && M!=MFSK &&
+	// current_configuration==CONFIG_16, so they engage automatically once the live
+	// config is CFG16 — no TX-switch wiring is needed here. The ONLY missing piece on
+	// the climb path was the BATCH-SIZE ELECTION: sack_negotiated_recompute_batch()
+	// pins data_batch_size=K (the R-B/#9 pin) so the clean-ACK all_ones target
+	// (1<<data_batch_size)-1 equals the K-bit big-block cw_ok bitmap (0xFF at K=8).
+	// That election fired ONLY at CONNECT negotiation; on a robust/`-R` connect that
+	// ran at ROBUST_0 (rung guard false), and nothing re-elected when the gearshift
+	// later climbed onto CFG16 -> data_batch_size stayed at the stock 30s value (~25)
+	// -> all_ones=0x1FFFFFF != 0xFF -> ZERO clean credit -> every block PARTIAL (the
+	// HW-observed bigblock_rung=0 / clean=0 failure).
+	//
+	// load_configuration() is the SINGLE chokepoint every config switch flows through,
+	// on BOTH the CMD and RSP side (each peer runs its own gearshift -> its own
+	// load_configuration). Re-invoking the SHARED election body here makes both peers
+	// run IDENTICAL code from the SAME PHY geometry source (bigblock_codeword_count())
+	// at their CFG16 transition, so they elect the SAME K and CANNOT diverge (the
+	// R-B/#9 symmetry contract, §16.7). Gated STRICTLY on the bigblock rung; OFF the
+	// rung the shared body's own outer guard early-returns to the stock 30s/robust
+	// branch already run above, so the stock per-frame path is BYTE-IDENTICAL.
+	//
+	// TEST ESCAPE (fail-before/pass-after on the SAME binary, NOT a production knob):
+	// MERCURY_BIGBLOCK_DEFEAT_ELECTION=1 skips this tail call so the transition leaves
+	// data_batch_size at the stock value — the --test-bigblock-climb-election
+	// fail-before arm. getenv() is read HERE (inside the rare CFG16+framing guard, NOT
+	// every config switch) so the in-process A/B test can flip the flag between arms
+	// without the static-cache trap; production (env unset) takes the fast NULL return.
+	if(telecom_system != NULL
+		&& telecom_system->bigblock_framing_enabled
+		&& current_configuration == CONFIG_16)
+	{
+		bool defeat_election = false;
+		{
+			const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_ELECTION");
+			if(e && *e && atoi(e) != 0) defeat_election = true;
+		}
+		if(!defeat_election)
+		{
+			printf("[BIGBLOCK-ELECT] gearshift CFG16 transition -> electing big-block "
+				"rung (role=%s)\n", (role==COMMANDER) ? "CMD" : "RSP");
+			fflush(stdout);
+			sack_negotiated_recompute_batch((role==COMMANDER) ? "CMD" : "RSP");
+		}
+		else
+		{
+			printf("[BIGBLOCK-ELECT] DEFEAT_ELECTION=1 — skipping CFG16 rung election "
+				"(test fail-before arm; data_batch_size stays %d)\n", data_batch_size);
+			fflush(stdout);
+		}
+	}
 }
 
 void cl_arq_controller::return_to_last_configuration()

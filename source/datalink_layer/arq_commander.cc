@@ -5606,6 +5606,20 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	// (This is the standalone-C2 sibling fix that the combined C3 dropped — that
 	// omission IS the dormancy. OFDM CONFIG_0..16 is unchanged: Axis-2 runs.)
 	if(is_robust_config(current_configuration)) return;
+	// BIG-BLOCK RUNG: data_batch_size is GEOMETRY-LOCKED to K (= one acquisition's
+	// codeword count), NOT link-adaptive (fact-doc data-flow-bigblock-arq-unit.md
+	// §16.5, INV-5b). The gearshift CFG16 transition elects data_batch_size=K via the
+	// shared election body (arq_common.cc load_configuration tail). If Axis-2 ran here
+	// it would step K=8 -> 13 after AXIS2_UP_GOOD_RUN clean batches and push the RSP to
+	// match via SET_LINK_PARAMS, moving BOTH peers off K while the RX carve still emits
+	// a K=8 cw_ok bitmap -> all_ones (1<<13)-1 != 0xFF -> bug #9 re-diverges MID-SESSION.
+	// Suppress the whole controller at the bigblock rung (same shape as the robust guard
+	// above) so K stays geometry-locked. This is NOT a threshold tune — the rung's batch
+	// is a PHY fact, so the adaptive controller has no valid axis to act on there. Every
+	// other OFDM config (CONFIG_0..15, framing off) is UNCHANGED: Axis-2 runs.
+	if(telecom_system != NULL
+		&& telecom_system->bigblock_framing_enabled
+		&& current_configuration == CONFIG_16) return;
 	axis2_evaluations++;
 	if(batch_size_observed <= 0) return;  // defensive — no observation
 	if(rx_count < 0) rx_count = 0;

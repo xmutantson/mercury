@@ -371,6 +371,10 @@ int main(int argc, char *argv[])
     bool test_bigblock_fullpath_cli = false; // --test-bigblock-fullpath: LIVE 2-instance CFG16 big-block transfer
                                         // through the REAL receive_bigblock+carve+whiten+FIFO deliver path with
                                         // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
+    bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
+                                        // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
+                                        // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
+                                        // One-shot at startup, then exit rc. See data-flow-bigblock-arq-unit.md §16.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -868,6 +872,16 @@ int main(int argc, char *argv[])
             // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
             // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
             test_bigblock_fullpath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-climb-election") == 0)
+        {
+            // CLIMB-ELECTION (data-flow-bigblock-arq-unit.md §16): prove the big-block
+            // rung is ELECTED by the gearshift CFG16 transition (load_configuration tail),
+            // symmetric on both peers, and the elected rung emits + delivers byte-faithful.
+            // fail-before/pass-after on the same binary. One-shot at startup, then exit rc.
+            test_bigblock_climb_election_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1994,6 +2008,20 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_fullpath();
             printf("[FLAG] Bigblock-fullpath test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_climb_election_cli) {
+            // CLIMB-ELECTION regression (data-flow-bigblock-arq-unit.md §16): the big-block
+            // rung is ELECTED by the gearshift CFG16 transition (load_configuration tail),
+            // not only at connect. Asserts the transition elects K==8 symmetrically on both
+            // peers (all_ones==0xFF) and the elected rung emits + delivers byte-faithful.
+            // fail-before/pass-after on the same binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
+            printf("[FLAG] --test-bigblock-climb-election: invoking gearshift CFG16 "
+                   "rung-election regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_climb_election();
+            printf("[FLAG] Bigblock-climb-election test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

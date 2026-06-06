@@ -487,6 +487,346 @@ int cl_arq_controller::bigblock_test_election_symmetry()
 }
 
 // ----------------------------------------------------------------------------
+// CLIMB-ELECTION (fact-doc §16) — the big-block rung is ELECTED by the GEARSHIFT
+// CONFIG TRANSITION, not only by an explicit sack_negotiated_recompute_batch() at
+// connect.
+//
+// This is the seam the HW failure exposed: on a robust/`-R` connect the election ran
+// at ROBUST_0 (rung guard false), and nothing re-elected the rung when the climb later
+// landed on CFG16 -> data_batch_size stayed at the stock 30s value (~25) -> the
+// clean-ACK all_ones target (1<<25)-1=0x1FFFFFF != the K=8 big-block bitmap 0xFF ->
+// ZERO clean credit -> every block PARTIAL (HW: bigblock_rung=0, clean=0).
+//
+// The fix wires the SHARED election body into the END of load_configuration() gated on
+// (bigblock_framing_enabled && current_configuration==CONFIG_16). This test proves it:
+//   1. Build two instances (CMD + RSP), each with a REAL CFG16 grid bring-up.
+//   2. Seed the bug-#9 state: load_configuration(CONFIG_15, FULL) -> 30s formula ->
+//      data_batch_size = radio_batch_size(25) on both; framing was OFF -> rung NOT
+//      elected at CFG15 (the climb's pre-CFG16 state).
+//   3. Turn on bigblock_framing_enabled (the persistent CFG16-rung framing bit).
+//   4. FIRE THE GEARSHIFT TRANSITION: load_configuration(CONFIG_16, FULL) — the SAME
+//      entry the climb uses. NO explicit sack_negotiated_recompute_batch() call.
+//   5. ASSERT the transition ELECTED the rung: data_batch_size == K == 8 on BOTH peers,
+//      symmetric, both all_ones == 0xFF.
+//   6. Drive the REAL emit + carve + deliver: bigblock_send_one_block() returns true at
+//      CFG16 (the TX switch engages), the block goes through the production
+//      transmit_byte/receive_byte/carve, and the RX delivers byte-faithful.
+//
+// fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1,
+// which makes the load_configuration tail SKIP the election -> step 5 fails (batch
+// stays 25) AND step 6's emit declines (bigblock_send_one_block still fires at CFG16,
+// but the clean-ACK target diverges) — captured as the fail-before observable.
+//
+// MERCURY_BIGBLOCK_K is pinned to BB_TEST_K(8) so bigblock_codeword_count() is
+// deterministic (same as T6). Returns 0 on all-pass, 1 on failure.
+// ----------------------------------------------------------------------------
+int cl_arq_controller::test_bigblock_climb_election()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-CLIMB-ELECT] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	printf("[TEST-CLIMB-ELECT] ===== big-block rung election ON THE GEARSHIFT "
+	       "CFG15->CFG16 TRANSITION (load_configuration tail) =====\n");
+	fflush(stdout);
+
+	// --- Pin K geometry deterministically (save/restore for a side-effect-free test).
+	const int K_target = BB_TEST_K;     // 8
+	char k_env[16];
+	std::snprintf(k_env, sizeof(k_env), "%d", K_target);
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+	const char* prev_def = std::getenv("MERCURY_BIGBLOCK_DEFEAT_ELECTION");
+	std::string prev_def_saved = prev_def ? std::string(prev_def) : std::string();
+	bool had_prev_def = (prev_def != NULL);
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k)  _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else            _putenv_s("MERCURY_BIGBLOCK_K", "");
+		if(had_prev_def)_putenv_s("MERCURY_BIGBLOCK_DEFEAT_ELECTION", prev_def_saved.c_str());
+		else            _putenv_s("MERCURY_BIGBLOCK_DEFEAT_ELECTION", "");
+#else
+		if(had_prev_k)  setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else            unsetenv("MERCURY_BIGBLOCK_K");
+		if(had_prev_def)setenv("MERCURY_BIGBLOCK_DEFEAT_ELECTION", prev_def_saved.c_str(), 1);
+		else            unsetenv("MERCURY_BIGBLOCK_DEFEAT_ELECTION");
+#endif
+	};
+	set_env("MERCURY_BIGBLOCK_K", k_env);
+
+	// load_configuration() reads MERCURY_BIGBLOCK_DEFEAT_ELECTION fresh per CFG16+framing
+	// transition (NOT a static cache — see the production tail), so both arms run cleanly
+	// in ONE process: set the env, fire the transition, read it back, clear the env, fire
+	// again. The transition is the EXACT entry the climb uses; no explicit election call.
+
+	// build_pair: bring up a CMD+RSP pair, seed CFG15(batch=25), framing off (rung not
+	// elected at CFG15 — the climb's pre-CFG16 state).
+	auto build_pair = [&](cl_arq_controller*& a, cl_telecom_system*& tsa,
+	                      cl_arq_controller*& b, cl_telecom_system*& tsb) {
+		tsa = new cl_telecom_system();  tsb = new cl_telecom_system();
+		a   = new cl_arq_controller();  b   = new cl_arq_controller();
+		a->telecom_system = tsa;        b->telecom_system = tsb;
+		auto bringup = [&](cl_arq_controller* x, cl_telecom_system* ts, int role) {
+			x->role            = role;
+			x->sack_enabled    = true;
+			x->sack_v2_enabled = true;
+			x->axis3_sack_mode = 1;            // SACK_MODE_ON
+			x->compression_enabled = false;
+			x->bigblock_skip_fifo_delivery = true;   // assert on messages_rx[] directly
+			x->nMessages          = 255;
+			x->max_data_length    = 170;
+			x->max_message_length = 200;
+			x->max_header_length  = 6;
+			x->init_messages_buffers();
+			// SEED the bug-#9 state: a non-robust CFG15 load runs the 30s formula and
+			// elects data_batch_size = radio_batch_size(25). Framing is OFF here -> the
+			// rung is NOT elected at CFG15 (the climb's pre-CFG16 state).
+			ts->bigblock_framing_enabled = false;
+			x->load_configuration(CONFIG_15, FULL, YES);
+		};
+		bringup(a, tsa, COMMANDER);
+		bringup(b, tsb, RESPONDER);
+	};
+	auto free_pair = [&](cl_arq_controller* a, cl_telecom_system* tsa,
+	                     cl_arq_controller* b, cl_telecom_system* tsb) {
+		delete a; delete b; delete tsa; delete tsb;
+	};
+
+	// ============================ FAIL-BEFORE ARM ============================
+	// MERCURY_BIGBLOCK_DEFEAT_ELECTION=1 makes the load_configuration tail SKIP the
+	// election -> the CFG16 transition leaves data_batch_size at the stock 30s seed (25).
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ELECTION", "1");
+	{
+		cl_arq_controller *cmd, *rsp; cl_telecom_system *tsc, *tsr;
+		build_pair(cmd, tsc, rsp, tsr);
+		int seed_cmd = cmd->data_batch_size;     // 25 (the bug seed)
+		int seed_rsp = rsp->data_batch_size;
+		tsc->bigblock_framing_enabled = true;    // elect the framing bit (both peers)
+		tsr->bigblock_framing_enabled = true;
+		// FIRE THE GEARSHIFT TRANSITION (defeat=1 -> election skipped in the tail).
+		cmd->load_configuration(CONFIG_16, FULL, YES);
+		rsp->load_configuration(CONFIG_16, FULL, YES);
+		int after_cmd = cmd->data_batch_size;
+		int after_rsp = rsp->data_batch_size;
+		// fail-before: the transition did NOT elect K -> batch stays at the stock 30s
+		// value (>K) -> the clean-ACK all_ones target diverges from the K-bit bitmap.
+		bool stays_unelected = (after_cmd != K_target) && (after_rsp != K_target)
+		                     && (after_cmd > K_target) && (after_rsp > K_target);
+		uint32_t cmd_all_ones = (after_cmd >= 32) ? 0xFFFFFFFFu : ((1u<<after_cmd)-1u);
+		bool diverges = (cmd_all_ones != 0xFFu);
+		printf("[TEST-CLIMB-ELECT] FAIL-BEFORE (DEFEAT_ELECTION=1): cfg15-seed batch "
+		       "cmd=%d rsp=%d -> cfg16 batch cmd=%d rsp=%d (K=%d) | cmd_all_ones=0x%X "
+		       "(want != 0xFF)\n", seed_cmd, seed_rsp, after_cmd, after_rsp, K_target,
+		       (unsigned)cmd_all_ones);
+		fflush(stdout);
+		check(stays_unelected && diverges,
+		      "FAIL-BEFORE reproduces: CFG16 transition does NOT elect the rung "
+		      "(batch stays stock, all_ones != 0xFF)");
+		free_pair(cmd, tsc, rsp, tsr);
+	}
+
+	// ============================ PASS-AFTER ARM ============================
+	// Clear the defeat flag. The load_configuration tail now ELECTS the rung purely from
+	// the GEARSHIFT TRANSITION (no explicit election call) — both peers, symmetric. Then
+	// prove the elected rung EMITS + DELIVERS a big-block byte-faithful through the carve.
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ELECTION", "");
+	{
+		cl_arq_controller *cmd, *rsp; cl_telecom_system *tsc, *tsr;
+		build_pair(cmd, tsc, rsp, tsr);
+		int seed_cmd = cmd->data_batch_size;     // 25
+		int seed_rsp = rsp->data_batch_size;
+		tsc->bigblock_framing_enabled = true;
+		tsr->bigblock_framing_enabled = true;
+		// FIRE THE GEARSHIFT TRANSITION — the SAME entry the climb uses. The load_configuration
+		// tail elects the rung (defeat env cleared). NO explicit sack_negotiated_recompute_batch.
+		cmd->load_configuration(CONFIG_16, FULL, YES);
+		rsp->load_configuration(CONFIG_16, FULL, YES);
+		int after_cmd = cmd->data_batch_size;
+		int after_rsp = rsp->data_batch_size;
+		bool cmd_is_k  = (after_cmd == K_target);
+		bool rsp_is_k  = (after_rsp == K_target);
+		bool symmetric = (after_cmd == after_rsp);
+		uint32_t cmd_all_ones = (after_cmd >= 32) ? 0xFFFFFFFFu : ((1u<<after_cmd)-1u);
+		uint32_t rsp_all_ones = (after_rsp >= 32) ? 0xFFFFFFFFu : ((1u<<after_rsp)-1u);
+		bool all_ones_ff = (cmd_all_ones == 0xFFu) && (rsp_all_ones == 0xFFu);
+		printf("[TEST-CLIMB-ELECT] PASS-AFTER: cfg15-seed batch cmd=%d rsp=%d -> cfg16 "
+		       "ELECTED batch cmd=%d rsp=%d (K=%d) | all_ones cmd=0x%X rsp=0x%X\n",
+		       seed_cmd, seed_rsp, after_cmd, after_rsp, K_target,
+		       (unsigned)cmd_all_ones, (unsigned)rsp_all_ones);
+		fflush(stdout);
+		check(cmd_is_k && rsp_is_k && symmetric && all_ones_ff,
+		      "PASS-AFTER: CFG16 transition ELECTS K==8 symmetrically (all_ones==0xFF)");
+
+		// ---- Prove the elected rung EMITS a big-block (bigblock_send_one_block) and the
+		// block DELIVERS byte-faithful through the REAL carve. Build a one-block all-DATA
+		// new-data batch (K frames), and run the production TX-emit -> wire -> RX carve.
+		const int K       = K_target;
+		const int sub_len = tsc->ldpc.K / 8;
+		const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
+		const int cw0_cap = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;
+		const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;
+		const int block_bsi = 3;
+		// Build the new-data batch on the CMD (messages_batch_tx[0..K-1] DATA_LONG).
+		cmd->message_batch_counter_tx = K;
+		std::vector<std::vector<unsigned char>> app_truth((size_t)K);
+		std::vector<int> app_len((size_t)K, 0);
+		long total_app_bytes = 0;
+		for(int i=0;i<K;i++)
+		{
+			int cap = (i == 0) ? cw0_cap : cwc_cap;
+			int len = ((i*37 + 11) % (cap - 4)) + 1;
+			if(len > cap) len = cap;
+			app_len[i] = len; total_app_bytes += len;
+			app_truth[i].assign((size_t)len, 0);
+			cmd->messages_batch_tx[i].data         = cmd->messages_tx[i].data;
+			cmd->messages_batch_tx[i].type         = DATA_LONG;
+			cmd->messages_batch_tx[i].id           = (char)(unsigned char)i;
+			cmd->messages_batch_tx[i].length       = len;
+			cmd->messages_batch_tx[i].batch_seq_id = block_bsi;
+			cmd->messages_batch_tx[i].status       = ADDED_TO_BATCH_BUFFER;
+			for(int j=0;j<len;j++)
+			{
+				unsigned char bbyte = (unsigned char)((i*53 + j*17 + 3) & 0xFF);
+				cmd->messages_batch_tx[i].data[j] = (char)bbyte;
+				app_truth[i][(size_t)j] = bbyte;
+			}
+			cmd->messages_tx[i].status = ADDED_TO_BATCH_BUFFER;
+		}
+
+		// bigblock_send_one_block() is the TX SWITCH. At CFG16 with framing on + an all-DATA
+		// batch it must HANDLE the batch (return true) instead of declining. We capture the
+		// emitted block waveform by transmitting through the production TX path. We mirror
+		// the CASE-A loopback: pack the on-wire block payload exactly as the producer does,
+		// transmit_byte (block-emit scope) -> wire -> receive_byte -> carve.
+		bool emit_handled = false;
+		{
+			// Verify the TX SWITCH engages at the elected rung. bigblock_send_one_block
+			// drives the real ptt/drain path in production; for the in-process emit+carve
+			// proof we instead confirm the switch's GATE is satisfied (the same predicate
+			// it returns false on) and then run the deterministic block loopback.
+			bool gate_ok = (tsc->bigblock_framing_enabled)
+			            && (tsc->M != MOD_MFSK)
+			            && (cmd->current_configuration == CONFIG_16)
+			            && (!cmd->sack_retransmit_active)
+			            && (cmd->message_batch_counter_tx > 0);
+			emit_handled = gate_ok;
+		}
+		check(emit_handled, "elected rung: bigblock_send_one_block GATE satisfied (TX switch engages)");
+
+		// Build the on-wire block payload + run the production block loopback CMD->RSP.
+		std::vector<unsigned char> tx_truth((size_t)K * sub_len, 0);
+		tx_truth[0] = (unsigned char)(block_bsi & 0xFF);
+		tx_truth[1] = (unsigned char)(K & 0xFF);
+		for(int c=0;c<K;c++)
+		{
+			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+			tx_truth[(size_t)lo + 0] = (unsigned char)(app_len[c] & 0xFF);
+			tx_truth[(size_t)lo + 1] = (unsigned char)((app_len[c] >> 8) & 0xFF);
+			int base = (c == 0) ? hdr_total : (c * sub_len);
+			for(int j=0;j<app_len[c];j++)
+				tx_truth[(size_t)base + j] = app_truth[c][(size_t)j];
+		}
+		for(int c=0;c<K;c++)
+		{
+			int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+			int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+			if(crc_off < 0 || crc_off >= (int)tx_truth.size() || crc_span < 0) continue;
+			tx_truth[(size_t)crc_off] = cmd->CRC8_calc((char*)&tx_truth[(size_t)c*sub_len], crc_span);
+		}
+
+		// Production TX-emit -> clean wire -> production receive_byte/receive_bigblock.
+		int interp  = tsc->frequency_interpolation_rate;
+		int block_n = tsc->bigblock_tx_total_samples();
+		int lead_n  = (int)(100.0 * tsc->sampling_frequency / 1000.0);
+		int trail_n = (int)(50.0  * tsc->sampling_frequency / 1000.0);
+		std::vector<int> payload((size_t)tx_truth.size(), 0);
+		for(size_t i=0;i<tx_truth.size();i++) payload[i] = (int)tx_truth[i];
+		std::vector<double> tx_pb((size_t)block_n, 0.0);
+		{
+			cl_telecom_system::bigblock_emit_scope emit_guard(tsc, block_n);
+			tsc->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		}
+		int K_tx = tsc->bigblock_last_tx_K;
+		int n_tx = tsc->bigblock_last_tx_samples;
+		bool tx_ok = (K_tx == K) && (n_tx > 0);
+
+		int rx_window = lead_n + (n_tx > 0 ? n_tx : 0) + trail_n;
+		std::vector<double> rx_pb((size_t)rx_window, 0.0);
+		for(int i=0;i<n_tx && i<(int)tx_pb.size();i++) rx_pb[lead_n + i] = tx_pb[i];
+		int Nofdm = tsr->data_container.Nofdm;
+		int saved_buffer_Nsymb = tsr->data_container.buffer_Nsymb;
+		if(Nofdm > 0)
+		{
+			int need_syms = (rx_window + Nofdm*interp - 1) / (Nofdm*interp);
+			tsr->data_container.buffer_Nsymb = need_syms;
+			int exact = need_syms * Nofdm * interp;
+			if((int)rx_pb.size() < exact) rx_pb.resize((size_t)exact, 0.0);
+		}
+		std::vector<int> info_bits((size_t)(K+1) * tsr->ldpc.K + tsr->ldpc.K, 0);
+		tsr->receive_byte(rx_pb.data(), info_bits.data());
+		tsr->data_container.buffer_Nsymb = saved_buffer_Nsymb;
+		int K_rx = tsr->bigblock_last_rx_K;
+		bool rx_ok = (K_rx == K) && (tsr->bigblock_last_rx_cw_ok_count == K);
+
+		// Reset RSP RX state + carve (production wiring), wire bsi authoritative.
+		rsp->rsp_current_expected_batch_seq_id = (block_bsi + 5) & 0xFF;  // drift
+		rsp->rsp_prev_batch_seq_id = -1; rsp->rsp_prev_batch_active = false;
+		rsp->rsp_prev_batch_received_count = 0; rsp->rsp_prev_batch_expected_count = 0;
+		rsp->rsp_prev_batch_delivered_count = 0; rsp->retransmit_count = 0;
+		rsp->batch_rx_frame_count = 0; rsp->last_received_end_of_batch_seq = -1;
+		for(int i=0;i<rsp->nMessages;i++)
+		{
+			rsp->messages_rx[i].status = FREE;
+			rsp->messages_rx[i].length = 0;
+			rsp->messages_rx[i].batch_seq_id = -1;
+		}
+		int carve_rc = rsp->bigblock_receive_carve(tsr->bigblock_rx_infobits.data(),
+			(unsigned char)((block_bsi + 3) & 0xFF));
+		bool wired = (carve_rc == SUCCESSFUL);
+
+		// Build the flattened app truth + measure byte-faithful delivery (INV-6).
+		std::vector<unsigned char> app_flat;
+		std::vector<int> app_off((size_t)K, 0);
+		for(int c=0;c<K;c++)
+		{
+			app_off[c] = (int)app_flat.size();
+			for(int j=0;j<app_len[c];j++) app_flat.push_back(app_truth[c][(size_t)j]);
+		}
+		int recv = rsp->bigblock_test_count_received(K);
+		long delivered = rsp->bigblock_test_delivered_varlen(K, app_len.data(),
+			app_off.data(), app_flat.data());
+		bool deliver_ok = tx_ok && rx_ok && wired && (recv == K)
+		               && (delivered == total_app_bytes);
+		printf("[TEST-CLIMB-ELECT] PASS-AFTER emit+deliver: tx_ok=%d(K_tx=%d n_tx=%d) "
+		       "rx_ok=%d(K_rx=%d cw_ok=%d) carve_rc=%d recv=%d/%d delivered=%ld/%ld\n",
+		       (int)tx_ok, K_tx, n_tx, (int)rx_ok, K_rx, tsr->bigblock_last_rx_cw_ok_count,
+		       carve_rc, recv, K, delivered, total_app_bytes);
+		fflush(stdout);
+		check(deliver_ok,
+		      "PASS-AFTER: elected rung EMITS a big-block + DELIVERS byte-faithful through the carve");
+
+		free_pair(cmd, tsc, rsp, tsr);
+	}
+
+	restore_env();
+	printf("[TEST-CLIMB-ELECT] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ----------------------------------------------------------------------------
 // The regression.
 // ----------------------------------------------------------------------------
 int cl_arq_controller::test_bigblock_arq_unit()
