@@ -2403,17 +2403,39 @@ int cl_ofdm::time_sync_preamble(std::complex <double>*in, int size, int interpol
  */
 }
 
-TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max)
+TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max, int nsym_override)
 {
 	/*
-	 * Same as time_sync_preamble() but also returns the correlation metric.
-	 * This allows the caller to assess the quality of the time sync detection.
-	 * A high correlation (>0.7) indicates strong preamble detection.
+	 * Fine per-trial timing refinement. Selects the sample-precise delay using
+	 * a PHASE-INVARIANT magnitude statistic, mirroring the coarse
+	 * time_sync_preamble_halfsym detector — CFO-robust. The candidate score is
+	 * the average of two per-lag magnitude coefficients |P|²/(A²·R): one for
+	 * the GI/cyclic-prefix lag (Nfft) and one for the repetition-period lag
+	 * (L=Nfft/nIS). They are accumulated SEPARATELY and combined incoherently —
+	 * summing the two different lags into one complex P would let them cancel
+	 * under CFO (different phase ramps), reintroducing the very mistiming this
+	 * fix removes. result.correlation is bounded [0,1] (Cauchy-Schwarz); ~1.0
+	 * at a clean preamble, small at noise/data. NOTE: result.correlation from
+	 * THIS fine function is NOT consumed by any caller (only result.delay is, at
+	 * telecom_system.cc:2078-2082); the load-bearing receive_stats.coarse_metric
+	 * is fed exclusively by the coarse detectors. See
+	 * fact-documents/ofdm-fine-timing-magnitude.md §3.
 	 */
 	double corss_corr=0;
 	double norm_a=0;
 	double norm_b=0;
 	double max_correlation = 0.0;
+
+	// LEVER P: correlate over n_sym preamble symbols (MINI = 1) instead of the
+	// configured full length. Without this the fine-sync template (4 symbols)
+	// re-locks a 1-symbol MINI frame onto a data subpeak, corrupting the delay.
+	int n_sym = preamble_configurator.Nsymb;
+	if(nsym_override > 0)
+	{
+		n_sym = nsym_override;
+		if(n_sym > preamble_configurator.Nsymb) n_sym = preamble_configurator.Nsymb;
+		if(n_sym < 1) n_sym = 1;
+	}
 
 	TimeSyncResult result;
 	result.delay = 0;
@@ -2448,9 +2470,9 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	}
 	std::complex <double> *data = tsync_data;
 
-	for(int i=0;i<size-preamble_configurator.Nsymb*(this->Ngi+this->Nfft)*interpolation_rate;i+=step)
+	for(int i=0;i<size-n_sym*(this->Ngi+this->Nfft)*interpolation_rate;i+=step)
 	{
-		for(int k=0;k<preamble_configurator.Nsymb*(this->Ngi+this->Nfft)*interpolation_rate;k++)
+		for(int k=0;k<n_sym*(this->Ngi+this->Nfft)*interpolation_rate;k++)
 		{
 			data[k]=*(in+i+k);
 		}
@@ -2458,27 +2480,56 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 		corss_corr=0;
 		norm_a=0;
 		norm_b=0;
-		// GI + repetition-period correlation.
+		// PHASE-INVARIANT MAGNITUDE fine-timing metric (fix/ofdm-fine-timing-
+		// magnitude, 2026-06-03). Previously this loop accumulated the
+		// PHASE-SENSITIVE real projection of conj(a)*b:
+		//     corss_corr += a.real()*b.real() + a.imag()*b.imag();   // Re(conj(a)*b)
+		// which is |a||b|cos(theta) and COLLAPSES (and can go negative) under
+		// residual CFO (post-Moose ~±20 Hz) as the repetition-period phase
+		// theta drifts toward ±90°. The mis-selected peak then lands ±1 OFDM
+		// symbol off, pilots misalign, mean_H collapses to ~0.30, and the
+		// SKIP-H gate (telecom_system.cc:2486) rejects the frame before LDPC.
+		//
+		// Fix: score on the magnitude statistic |P|²/(A²·R) the COARSE detector
+		// time_sync_preamble_halfsym uses (ofdm.cc:2581-2631, Schmidl & Cox 1997
+		// / Wilson&Shang arXiv:2010.00762; FreeDV/STANAG/liquid-dsp all use
+		// magnitude fine-timing). Bounded [0,1] by Cauchy-Schwarz.
+		//
+		// CRITICAL: this loop correlates TWO DIFFERENT LAGS — the GI/cyclic-
+		// prefix lag (Nfft samples) and the repetition-period lag (L=Nfft/nIS
+		// samples). Under CFO each lag accrues a DIFFERENT phase ramp
+		// (e^{j2πfΔt}, Δt ∝ lag). Summing both into ONE complex P before |·|²
+		// makes the two lag families add with different phases and partially
+		// CANCEL — that cross-lag cancellation, not the per-lag phase, is what
+		// jumps the fine peak ±symbols under CFO. So accumulate the two lag
+		// families in SEPARATE complex accumulators (each internally coherent,
+		// hence phase-invariant) and combine their normalized magnitudes
+		// INCOHERENTLY (average of two [0,1] coefficients → still [0,1]). This
+		// is the noncoherent-combining form; it keeps both timing sources (GI =
+		// sample precision, repetition = strong period lock) without the
+		// cross-lag CFO cancellation. corss_corr/P_imag/norm_a/norm_b below hold
+		// the *result* (so the unchanged downstream sort/return code still
+		// works); the per-lag accumulators are local.
+		double Pg_re=0, Pg_im=0, Ag=0, Rg=0;   // GI lag (Nfft)
+		double Pr_re=0, Pr_im=0, Ar=0, Rr=0;   // repetition lag (L=Nfft/nIS)
 		// GI: correlate cyclic prefix with end of FFT symbol (Ngi samples/symbol).
 		// Repetition: preamble subcarrier pattern creates time-domain repetition
 		// with period L = Nfft/nIS (nIS=4 for WB every-4th, nIS=2 for NB every-2nd).
 		// Correlate adjacent L-sample sections within the FFT window.
 		int nIS = preamble_configurator.nIdentical_sections;
 		int L_interp = (this->Nfft / nIS) * interpolation_rate;
-		for(int l=0;l<preamble_configurator.Nsymb;l++)
+		for(int l=0;l<n_sym;l++)
 		{
 			a_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate;
 			b_c=data+l*(this->Ngi+this->Nfft)*interpolation_rate+this->Nfft*interpolation_rate;
 
 			for(int m=0;m<this->Ngi*interpolation_rate;m++)
 			{
-				corss_corr+=a_c[m].real()*b_c[m].real();
-				norm_a+=a_c[m].real()*a_c[m].real();
-				norm_b+=b_c[m].real()*b_c[m].real();
-
-				corss_corr+=a_c[m].imag()*b_c[m].imag();
-				norm_a+=a_c[m].imag()*a_c[m].imag();
-				norm_b+=b_c[m].imag()*b_c[m].imag();
+				// conj(a)*b = (ar*br + ai*bi) + j(ar*bi - ai*br)
+				Pg_re += a_c[m].real()*b_c[m].real() + a_c[m].imag()*b_c[m].imag();
+				Pg_im += a_c[m].real()*b_c[m].imag() - a_c[m].imag()*b_c[m].real();
+				Ag    += a_c[m].real()*a_c[m].real() + a_c[m].imag()*a_c[m].imag();
+				Rg    += b_c[m].real()*b_c[m].real() + b_c[m].imag()*b_c[m].imag();
 			}
 
 			// Correlate all (nIS-1) adjacent pairs within the FFT window.
@@ -2491,13 +2542,10 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 
 				for(int m=0;m<L_interp;m++)
 				{
-					corss_corr+=a_c[m].real()*b_c[m].real();
-					norm_a+=a_c[m].real()*a_c[m].real();
-					norm_b+=b_c[m].real()*b_c[m].real();
-
-					corss_corr+=a_c[m].imag()*b_c[m].imag();
-					norm_a+=a_c[m].imag()*a_c[m].imag();
-					norm_b+=b_c[m].imag()*b_c[m].imag();
+					Pr_re += a_c[m].real()*b_c[m].real() + a_c[m].imag()*b_c[m].imag();
+					Pr_im += a_c[m].real()*b_c[m].imag() - a_c[m].imag()*b_c[m].real();
+					Ar    += a_c[m].real()*a_c[m].real() + a_c[m].imag()*a_c[m].imag();
+					Rr    += b_c[m].real()*b_c[m].real() + b_c[m].imag()*b_c[m].imag();
 				}
 			}
 		}
@@ -2505,11 +2553,27 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 		// Norm threshold: VB-Cable silence has amplitude ~1e-10 (nonzero).
 		// Norms accumulate to ~1e-18 and the ratio produces unstable metrics
 		// (up to 0.93) that can beat real preamble peaks. Use threshold
-		// instead of exact == 0.0 to suppress these degenerate cases.
+		// instead of exact == 0.0 to suppress these degenerate cases. Apply the
+		// floor to the COMBINED per-half energy (the old norm_a/norm_b roles).
+		norm_a = Ag + Ar;   // total "a-half" energy (kept for the silence gate)
+		norm_b = Rg + Rr;   // total "b-half" energy
 		if(norm_a < 0.001 || norm_b < 0.001)
+		{
 			corss_corr = 0.0;
+		}
 		else
-			corss_corr=corss_corr/sqrt(norm_a*norm_b);
+		{
+			// Per-lag magnitude coefficients, each bounded [0,1] (Cauchy-Schwarz),
+			// each phase-invariant within its lag. Average them (still [0,1]).
+			// A lag family with ~zero energy (e.g. nIS=1 → no rep pairs) is
+			// dropped from the average rather than dividing by zero.
+			double mg = (Ag*Rg > 1e-20) ? (Pg_re*Pg_re + Pg_im*Pg_im)/(Ag*Rg) : -1.0;
+			double mr = (Ar*Rr > 1e-20) ? (Pr_re*Pr_re + Pr_im*Pr_im)/(Ar*Rr) : -1.0;
+			if(mg >= 0.0 && mr >= 0.0)      corss_corr = 0.5*(mg + mr);
+			else if(mg >= 0.0)              corss_corr = mg;
+			else if(mr >= 0.0)              corss_corr = mr;
+			else                            corss_corr = 0.0;
+		}
 		corss_corr_vals[i]=corss_corr;
 		corss_corr_loc[i]=i;
 	}
@@ -2539,7 +2603,7 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	return result;
 }
 
-TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric)
+TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric, int nsym_override)
 {
 	/*
 	 * Schmidl-Cox preamble detection using time-domain repetition.
@@ -2560,7 +2624,15 @@ TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int
 	int nIS = preamble_configurator.nIdentical_sections;
 	int L = (this->Nfft / nIS) * interpolation_rate;
 	int Nofdm = (this->Ngi + this->Nfft) * interpolation_rate;
+	// LEVER P: correlate over nsym_override symbols when set (MINI preamble),
+	// else the configured full preamble length. Clamp to [1, configured].
 	int nsym = preamble_configurator.Nsymb;
+	if(nsym_override > 0)
+	{
+		nsym = nsym_override;
+		if(nsym > preamble_configurator.Nsymb) nsym = preamble_configurator.Nsymb;
+		if(nsym < 1) nsym = 1;
+	}
 	int pream_len = nsym * Nofdm;
 
 	TimeSyncResult result;

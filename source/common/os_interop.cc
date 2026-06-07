@@ -167,16 +167,9 @@ static int32_t randtbl[DEG_3 + 1] =
     -205601318,
   };
 
-struct random_data_t
-  {
-    int32_t *fptr;		/* Front pointer.  */
-    int32_t *rptr;		/* Rear pointer.  */
-    int32_t *state;		/* Array of state values.  */
-    int rand_type;		/* Type of random number generator.  */
-    int rand_deg;		/* Degree of random number generator.  */
-    int rand_sep;		/* Distance between front and rear.  */
-    int32_t *end_ptr;		/* Pointer behind state table.  */
-  };
+/* struct random_data_t now lives in os_interop.h (single-process-sim-refactor.md
+ * §10.1) so cl_telecom_system can embed a per-instance copy. The static
+ * unsafe_state below is UNCHANGED — the file-static path stays byte-identical. */
 
 static struct random_data_t unsafe_state =
 {
@@ -411,5 +404,56 @@ long int __random (void)
 
   (void) __random_r (&unsafe_state, &retval);
 
+  return retval;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Per-instance RNG (single-process-sim-refactor.md §10.1, Landmine 1).
+ *
+ * The file-static unsafe_state above shares the file-static randtbl[] table.
+ * To give each cl_telecom_system an INDEPENDENT, residue-free glibc-TYPE_3
+ * stream, the caller must own BOTH a random_data_t AND its own 33-int32 state
+ * table. os_rng_make() initialises a caller-owned random_data_t to point at a
+ * caller-owned state table and seeds it with the SAME TYPE_3 walk the static
+ * uses (so a single instance reproduces a clean run byte-for-byte).
+ *
+ * __srandom_r2 / __random_r2 are thin C-linkage wrappers over the existing
+ * __srandom_r / __random_r so C++ callers (telecom_system.cc, ofdm.cc) can
+ * route their sequence generation through a per-instance state without
+ * touching the file-static. The file-static path (__srandom/__random above)
+ * is UNCHANGED → production + the two-process paced sim are byte-identical.
+ *
+ * STATE_WORDS must equal DEG_3 + 1 (the TYPE_3 state-table length the static
+ * unsafe_state uses: randtbl[DEG_3 + 1]). The header mirrors this constant.
+ * ------------------------------------------------------------------------- */
+
+void os_rng_make (struct random_data_t *buf, int32_t *state_words, unsigned int seed)
+{
+  if (buf == NULL || state_words == NULL)
+    return;
+  /* state[0] is the type word slot; state pointer starts at state_words[1],
+     exactly as the static unsafe_state has .state = &randtbl[1] with
+     randtbl[0] = TYPE_3. We reproduce that layout so __random_r walks the
+     same polynomial as the file-static. */
+  buf->rand_type = TYPE_3;
+  buf->rand_deg  = DEG_3;
+  buf->rand_sep  = SEP_3;
+  buf->state     = &state_words[1];
+  buf->end_ptr   = &state_words[DEG_3 + 1];
+  buf->fptr      = &state_words[SEP_3 + 1];
+  buf->rptr      = &state_words[1];
+  state_words[0] = TYPE_3;
+  (void) __srandom_r (seed, buf);
+}
+
+void __srandom_r2 (unsigned int seed, struct random_data_t *buf)
+{
+  (void) __srandom_r (seed, buf);
+}
+
+long int __random_r2 (struct random_data_t *buf)
+{
+  int32_t retval = 0;
+  (void) __random_r (buf, &retval);
   return retval;
 }

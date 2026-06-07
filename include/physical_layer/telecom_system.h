@@ -36,7 +36,9 @@
 #include "physical_defines.h"
 #include "misc.h"
 #include "common/ring_buffer_posix.h"
+#include "common/os_interop.h"
 #include <iomanip>
+#include <vector>
 
 
 #if defined(_WIN32)
@@ -98,6 +100,8 @@ struct st_receive_stats{
 	bool frame_skip_var_aborted;  // true: trial loop aborted on consecutive SKIP-VAR — caller should zero false preamble and advance cursor past noise region
 	double coarse_metric;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
 	double ofdm_drift_per_frame;  // IIR-filtered prediction error (interp samples) for BATCH verify
+	double mean_H;  // mean(|estimated_channel|) over MEASURED subcarriers for the last OFDM trial; -1 if not computed. Test-observability for the SKIP-H gate (write-once per receive, read by unit tests only). See fact-documents/ofdm-fine-timing-magnitude.md §3.5.
+	int last_eff_preamble_nsymb;  // LEVER P: actual preamble-symbol count of the most recently extracted OFDM frame (FULL anchor vs MINI tail). Read by the ARQ position-advance (rx_frame = last_eff_preamble_nsymb + Nsymb). Defaults to preamble_nSymb when amortization is off.
 };
 
 
@@ -371,6 +375,59 @@ public:
 	void transmit_byte(int* data, int nBytes, double *out, int message_location);
 	st_receive_stats receive_byte(double *data, int* out);
 
+	// ===== LEVER P: PREAMBLE AMORTIZATION =====
+	// A batch is one gapless PTT waveform of N concatenated OFDM frames; today
+	// every frame carries a full preamble_nSymb (=4) preamble, so 24 of 25
+	// preambles in a batch are pure redundancy. The deterministic schedule below
+	// emits a FULL preamble only on the batch anchor (frame 0) + on retx/after-
+	// FAIL frames, and a 1-symbol MINI Schmidl-Cox resync on the rest. TX and RX
+	// compute the schedule INDEPENDENTLY from (frame index, force-full) — no
+	// per-frame wire flag. The pilot-derived channel estimate (33%-density
+	// pilots in every DATA symbol) is unchanged, so SKIP-H / SKIP-VAR / partial-
+	// SACK gates survive untouched; the preamble was only ever timing + CFO.
+	// See fact-documents/data-flow-preamble-amortization.md.
+	//
+	// Pure schedule predicate (INC-0): how many preamble symbols frame
+	// frame_idx_in_batch emits. force_full forces FULL for retx + after-FAIL
+	// re-anchor frames. full_nsymb is the configured preamble_nSymb. Returns 1
+	// (MINI) for non-anchor non-forced frames; full_nsymb otherwise. STATIC /
+	// PURE so TX and RX get bit-identical results.
+	static int preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb);
+
+	// Master enable for preamble amortization. DEFAULT OFF pending INC-3 (the
+	// batch-predict position-chain handoff for MINI frames that land beyond the
+	// current buffer needs a defer-instead-of-full-search fix — see
+	// fact-documents/data-flow-preamble-amortization.md §3/§6). When OFF the
+	// schedule collapses to FULL on every frame: TX and RX are byte-identical to
+	// the pre-LEVER-P baseline (verified: pinned CFG16 sim delivers 468.2 bps,
+	// byte-correct, unchanged). When ON it activates the variable-preamble TX +
+	// RX MINI handling. Toggle via the env knob below for A/B + INC-3 work.
+	bool preamble_amortization_enabled = false;
+
+	// TX per-frame override: number of preamble symbols THIS transmit_bit call
+	// emits. -1 = use the full configured preamble_nSymb (legacy). send_batch
+	// sets this per frame from the schedule before each transmit_byte.
+	int tx_preamble_nsymb_override = -1;
+
+	// RX per-frame override: number of preamble symbols the frame about to be
+	// decoded is expected to carry (drives the data-symbol offset + frame
+	// extraction size). -1 = use the full configured preamble_nSymb (legacy).
+	// The ARQ receive driver sets this from the schedule (frame index counted
+	// within the current batch) before each receive_byte.
+	int rx_preamble_nsymb_override = -1;
+
+	// Effective preamble length helpers: clamp an override into [1, full] or
+	// fall back to the configured length when the override is -1.
+	int tx_effective_preamble_nsymb() const;
+	int rx_effective_preamble_nsymb() const;
+
+	// Set by transmit_bit to the number of passband samples it actually wrote to
+	// `out` for the most recent frame = Nofdm*(eff_preamble+active_nsymb)*interp.
+	// send_batch reads this to pack the next frame contiguously (variable-length
+	// frames in one gapless PTT waveform). Equals total_frame_size for FULL
+	// frames; smaller for MINI frames.
+	int tx_last_emitted_frame_samples = 0;
+
 	// Lightweight signal measurement only (no decoding)
 	double measure_signal_only(double *data);
 
@@ -402,6 +459,260 @@ public:
 	void RX_SHM_process_main(cbuf_handle_t buffer);
 	void BER_PLOT_baseband_process_main();
 	void BER_PLOT_passband_process_main();
+	// Timing-acquisition-under-SFO harness (F1 fix). Entry via -m PLOT_PASSBAND -s
+	// <cfg> with MERCURY_SFO_BLOCK_TEST=1. Builds a long back-to-back OFDM block,
+	// drifts it through cl_sim_sfo, and decodes each frame via REAL Schmidl-Cox +
+	// Moose acquisition (ofdm_forced_delay=-1) so SFO actually affects timing —
+	// the impairment the pinned BER/in-proc paths structurally cannot show. See
+	// fact-documents/data-flow-sim2-time-domain-faithfulness.md §10.
+	void sfo_block_test();
+	// GENUINE single-grid big-block timing test (MERCURY_SFO_GRID=1). Builds ONE
+	// 60-data-symbol OFDM grid (32QAM, 33% pilots Dx=1/Dy=3), applies the SFO as the
+	// exact per-symbol subcarrier phase ramp (the omega+k*delta growth across the
+	// block), and decodes with ONE channel estimate interpolated across all 60
+	// symbols (interpolate_bilinear_matrix). Measures per-symbol uncoded SER head vs
+	// tail. Optional CPE/PEG LS per-symbol de-rotation (MERCURY_SFO_GRID_TRACK=1) is
+	// the STEP-2 anti-P tracker. Unlike sfo_block_test (K tiled 9-sym codeword-frames,
+	// per-frame estimate), this is the literal "one estimate across 60 symbols" case.
+	//
+	// TEST 2 (pilot thinning, net-PHY recovery): MERCURY_SFO_GRID_THIN=1 rewrites the
+	// lattice in-harness to a CONTINUAL+SCATTERED ~6% layout (cont columns on every
+	// symbol anchor the per-symbol tracker fit + nv; a scattered diagonal feeds the
+	// channel est). The thin path uses a flat-channel pilot-averaged estimator (the
+	// per-cell-LS+DFT-smoother smears a sparse lattice). MERCURY_SFO_GRID_CODED=1 adds
+	// a real rate-0.875 LDPC K-codeword block decode (with AWGN via MERCURY_SFO_GRID_
+	// ESN0) to verify noise_variance_estimate does NOT collapse (E1/cfg16-nvfix). Knobs:
+	// CONT_COLS, SCAT_DX, SCAT_DY. See fact-doc §13.
+	void sfo_grid_test();
+
+	// TEST 3 (sparse-capable 2D channel interpolator — the §13.5 production gap).
+	// On a frequency-SELECTIVE channel (MERCURY_SFO_GRID_CHAN=1 det-floor / =2 two-ray)
+	// the flat-ML H̄ shortcut FAILS (one global scalar cannot represent |H|+phase varying
+	// across 50 subcarriers). This estimator interpolates a real per-subcarrier-per-symbol
+	// H[n][j] from the 6% continual+scattered lattice by SEPARABLE 2D interpolation:
+	// (a) raw LS H=Y/X at every pilot; (b) TIME interp/Wiener-smooth across the scatter
+	// lattice's symbol spacing (dy) per carrier; (c) FREQUENCY interp across carriers
+	// within each symbol; (d) optional DDCE refinement between scatter updates. nv is the
+	// pilot residual against the interpolated H (preserves the TEST-2 nv that holds).
+	// Knobs: MERCURY_SFO_GRID_WIENER (1=Wiener time-smoother, 0=linear),
+	// MERCURY_SFO_GRID_DDCE (1=decision-directed refine). Driven from sfo_grid_test only.
+	void grid_sparse2d_estimator(std::complex<double>* rx, int Ngrid, int Nc);
+
+	// BIG-BLOCK HW DE-RISK (PHY-only, no ARQ) — emit/decode the validated big-block
+	// (one 4-sym preamble + K=8 1600-bit LDPC codeword-frames under ONE acquisition,
+	// ~7.2% freq-focused pilots, channel-adaptive flat-ML/sparse-2D, TRACK=0) over a
+	// REAL passband round-trip via a WAV file (S16LE 48 kHz mono), so the sim PHY win
+	// can be HW-validated on real Fe-Pi clocks (PLAY on RPi1 -> IONOS -> RECORD RPi2)
+	// BEFORE the production+ARQ build. The grid-build + estimator/LDPC are COPIED from
+	// sfo_grid_test (validated, §13-§14); only the passband bridge (symbol_mod/
+	// baseband_to_passband and the inverse + acquisition) is new — the SAME OFDM modem
+	// code transmit_byte/receive_byte use. See fact-documents/bigblock-hw-wav-derisk.md.
+	// Entry: -m PLOT_PASSBAND -s 16 with env MERCURY_BIGBLOCK_TX_WAV=<path> (emit) or
+	// MERCURY_BIGBLOCK_DECODE_WAV=<path> (decode). Returns 1 on full success.
+	int bigblock_tx_to_wav(const char* wav_path);
+	int bigblock_decode_from_wav(const char* wav_path);
+	// Shared builder: rebuild ofdm at Nsymb=Ngrid with the thin freq-focused lattice
+	// (cont_cols/scat_dx/scat_dy) + reseed the pilot DBPSK sequence, exactly as
+	// sfo_grid_test does. Returns nData; out-params give Ngrid/log2M/nBits. Both the TX
+	// and decode sides call this so the lattice/pilot sequence match bit-for-bit.
+	int bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out, int& nBits_out);
+
+	// ===== P1: BIG-BLOCK PHY IN THE LIVE PATH (gated; NO ARQ change) =====
+	// The big-block PHY validated in the WAV harness (one 4-sym preamble + K=8
+	// 1600-bit LDPC codeword-frames under ONE acquisition, frozen 12% lattice
+	// cont2/dx3/dy4, channel-ADAPTIVE flat-ML/sparse-2D estimator + CSI-LLR) moved
+	// into the production transmit_byte/receive_byte. It is the SAME DSP the WAV
+	// harness exercises — the WAV methods are now thin WAV-I/O wrappers over the
+	// shared in-memory PHY workers below; transmit_byte/receive_byte branch to the
+	// live entry points (transmit_bigblock / receive_bigblock) when this flag is
+	// set. The flag is a FRAMING-MODE bit on the CFG16 rung (same 32-QAM rate-0.875
+	// modulation; only the one-acquisition K-codeword framing + 12% layout differ —
+	// NOT a new config). DEFAULT OFF so stock CFG15/16 per-frame paths are
+	// byte-identical to the pre-P1 baseline. See P1 plan / bigblock-hw-wav-derisk.md.
+	bool bigblock_framing_enabled = false;
+
+	// ===== HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13) =====
+	// The CFG16 big-block writes a K-codeword concatenated waveform (~45552 doubles)
+	// that is MUCH larger than one stock OFDM frame (~15184 doubles). The transmit_byte
+	// branch below must therefore fire ONLY when the CALLER actually handed a block-sized
+	// `out` buffer — NOT for every stock per-frame / single-frame / CONTROL-frame TX that
+	// happens at CONFIG_16 (those pass a frame-sized slot). bigblock_framing_enabled +
+	// current_configuration==CONFIG_16 are necessary but NOT sufficient: the gearshift
+	// (and ARQ control traffic) emit many frame-sized transmits at CFG16. The ONLY producer
+	// that passes a correctly block-sized buffer is bigblock_send_one_block() (+ the two
+	// loopback validators); they set bigblock_emit_as_block=true via the scope guard below
+	// for the duration of their transmit_byte() call. Any other CFG16 transmit_byte keeps
+	// the stock per-frame OFDM geometry. bigblock_emit_out_capacity is the block buffer's
+	// real sample capacity; transmit_bigblock/bigblock_tx_passband REFUSE to write (no
+	// overrun) if the block needs more than this. (Pre-fix: the branch fired on config
+	// alone -> a declined/control/per-frame batch overran its frame-sized slot -> heap
+	// metadata smash -> abort at the next delete[] / config-switch free.)
+	bool bigblock_emit_as_block = false;
+	int  bigblock_emit_out_capacity = 0;   // sample capacity of `out` when emit_as_block
+
+	// RAII guard: arm the block-emit intent for exactly one transmit_byte() call. Only the
+	// dedicated block driver constructs it; it auto-clears on scope exit (exception-safe).
+	struct bigblock_emit_scope
+	{
+		cl_telecom_system* ts; bool prev_flag; int prev_cap;
+		bigblock_emit_scope(cl_telecom_system* t, int out_capacity_samples)
+			: ts(t), prev_flag(t->bigblock_emit_as_block), prev_cap(t->bigblock_emit_out_capacity)
+		{ ts->bigblock_emit_as_block = true; ts->bigblock_emit_out_capacity = out_capacity_samples; }
+		~bigblock_emit_scope()
+		{ ts->bigblock_emit_as_block = prev_flag; ts->bigblock_emit_out_capacity = prev_cap; }
+	};
+
+	// Dedicated RX output buffer for the decoded K-codeword info bits. receive_bigblock
+	// decodes K*ldpc.K (= 8*1400 = 11200) info bits — WAY past N_MAX(1600). It MUST NOT
+	// be funneled through data_container.data_byte[N_MAX] (the stock per-frame output): the
+	// 9600-int forward overrun smashed adjacent data_container chunks and aborted at the
+	// next config-switch free. receive_bigblock sizes THIS to bigblock_codeword_count()*
+	// ldpc.K and writes the decode here; the ARQ carve (bigblock_receive_carve) reads from
+	// here. data_byte stays <= N_MAX so the stock-path N_MAX consumers need no re-audit.
+	std::vector<int> bigblock_rx_infobits;
+
+	// In-memory big-block PHY workers (the validated DSP, no WAV I/O). Both the WAV
+	// harness and the live path call these so the framing/estimator/LDPC are
+	// bit-identical across entry points.
+	//   TX  worker: emit one 4-sym preamble + K codeword-frames into out_pb (raw
+	//               passband doubles, NO lead/trail silence). cw_info_out[c] = the
+	//               ldpc.K info bits of codeword c (so the live RX side can compare /
+	//               the caller can map sub-units). Returns K (codewords emitted);
+	//               *nSamples_out = passband samples written. payload_bits (length
+	//               >= nBits) supplies the systematic info bits; pass nullptr to use
+	//               the seeded-PRBS known payload (loopback validation, matches the
+	//               WAV harness byte-for-byte).
+	int bigblock_tx_passband(double* out_pb, int& nSamples_out,
+	                         std::vector<std::vector<int>>& cw_info_out,
+	                         const int* payload_bits = nullptr);
+	//   RX  worker: acquire ONCE over [pb, pb+nSamples), then decode K codewords
+	//               with the channel-adaptive estimator + CSI-LLR + frozen layout.
+	//               out_infobits (length >= K*ldpc.K) receives the decoded info bits
+	//               of every codeword (carved into K sub-units by the caller).
+	//               cw_ok_out[c] = 1 if codeword c decoded clean (CRC/known-payload
+	//               gate); else 0 — this K-bit vector IS the per-codeword SACK
+	//               granularity P2 will use. *K_out = K. Returns #codewords that
+	//               decoded clean. acq_metric_out (optional) gets the Schmidl-Cox
+	//               acquisition metric. cw_info_ref (optional, non-null) supplies the
+	//               KNOWN info bits per codeword for the loopback byte-correct gate;
+	//               when null the CRC/all-decode path is used (P2).
+	int bigblock_rx_passband(const double* pb, int nSamples,
+	                         int* out_infobits, int& K_out,
+	                         std::vector<int>& cw_ok_out,
+	                         double* acq_metric_out = nullptr,
+	                         const std::vector<std::vector<int>>* cw_info_ref = nullptr);
+
+	// Big-block preamble matched-filter SNAP. The Schmidl-Cox autocorrelation metric is
+	// flat across the whole 4-symbol preamble plateau, so its (energy-weighted) argmax is
+	// noise-fragile and can flip to a spurious plateau lobe ~half a symbol off the true
+	// preamble start (DIAG bigblock-livepath-awgn-cliff §X). The pilot-EVM fine search
+	// cannot recover a >GI coarse error (and pilot-EVM is nearly blind to the sharp true
+	// timing peak). This SNAP cross-correlates the captured baseband (DECIMATED rate,
+	// Nofdm/sym) against the KNOWN reference preamble baseband over a small ±search_dec
+	// window around the SC coarse pick and returns the decimated position MAXIMIZING the
+	// normalized matched-filter magnitude — a SHARP single peak at the true preamble start
+	// (CFO-robust over the ~1-symbol local window). Returns the refined decimated start, or
+	// coarse_dec unchanged if no qualified peak. bb_dec/bb_dec_len: captured decimated bb.
+	long bigblock_preamble_mf_snap(const std::complex<double>* bb_dec, int bb_dec_len,
+	                               long coarse_dec, int pre_nSymb, int Nofdm, int Nc,
+	                               int search_dec);
+
+	// LIVE-PATH entry points (branched from transmit_byte/receive_byte when
+	// bigblock_framing_enabled). transmit_bigblock emits the block into out (raw
+	// passband, NO_FILTER_MESSAGE-style contiguous samples); receive_bigblock
+	// acquires + decodes the K codewords from the captured passband buffer and
+	// returns the per-codeword decode result in receive_stats + the decoded info
+	// bits in out. P1 keeps the seeded-PRBS known payload so the loopback gate can
+	// assert byte-correctness exactly as the WAV harness does; feeding real ARQ
+	// bytes + the K-sub-unit ACK granularity is P2 (no ARQ change in P1).
+	void transmit_bigblock(int* data, int nBytes, double* out);
+	st_receive_stats receive_bigblock(double* data, int* out);
+	// Restore the stock OFDM config after a big-block rebuild (full CONFIG_NONE ->
+	// load_configuration reload — sets every pilot field cleanly; see the
+	// HARNESS-HID-BUG note at the definition). Replaces the WAV harness's fragile
+	// partial pilot-field hand-restore that faulted in the live path.
+	void bigblock_restore_stock_config();
+	// P2.2 (normalization-bypass fix): the EXACT stock receive_byte RX passband
+	// normalization + impulse-noise blanking (telecom_system.cc:1081-1124), factored
+	// so the big-block RX path (receive_bigblock) runs it on the captured passband
+	// BEFORE the big-block estimator — the OFDM estimator/LLR assume a normalized
+	// level, and bigblock_rx_passband skipped this, so the live AWGN validator FAILED
+	// at 30 dB (BER 0.43). Called from BOTH receive_byte (extraction is byte-identical
+	// to the inline block — no stock-path drift) and receive_bigblock. No-op for MFSK.
+	void rx_passband_normalize_and_blank(double* pb, int pb_samples);
+	// #samples one big-block TX writes to `out` (= preamble + K*frame passband
+	// samples at the frozen layout). The ARQ/capture sizing needs this in P2; for
+	// P1 the loopback validator uses it to size buffers. Computed from the frozen
+	// layout; valid once a CFG16 grid is loaded.
+	int bigblock_tx_total_samples();
+
+	// USE-AFTER-FREE / PARTIAL-BLOCK FIX (bigblock-whiten-align): the number of OFDM
+	// symbols ONE big-block occupies on the wire (preamble + Ngrid data symbols). The
+	// live RX must wait for THIS MANY symbols before snapshotting+decoding the block —
+	// the stock per-frame arming (preamble_nSymb + Nsymb = ONE stock frame, ~13 sym)
+	// snapshots after only the block's head is captured, so the later codewords (cw1..K-1)
+	// read silence and the decode garbles them (cw0 clean, cw1..7 CRC-fail -> 0 delivered).
+	// Geometry-only (rebuild thin grid then restore stock); returns 0 for MFSK / no grid.
+	int bigblock_rx_block_nsymb();
+
+	// SACK-GATE P1 (data-flow-bigblock-arq-unit.md R-B): the codeword count K the
+	// big-block framing carries at the current CFG16 rung — the SAME geometry both
+	// the TX (transmit_bigblock:7832 nBits/ldpc.N capped by MERCURY_BIGBLOCK_K) and
+	// the RX (receive_bigblock:7890 nBits/ldpc.N) derive. The ARQ layer's shared
+	// batch-size election (sack_negotiated_recompute_batch) calls this to PIN
+	// data_batch_size == K at the big-block rung so CMD's clean-ACK target
+	// all_ones=(1<<data_batch_size)-1 EQUALS the RSP's K-bit big-block bitmap
+	// (closes bug #9: CMD batch=25 vs RSP K=8 -> 0x1FFFFFF != 0xFF -> no clean
+	// credit). Geometry-only (no I/O); rebuilds the thin grid to read nBits/ldpc.N
+	// then restores the stock CFG16 config (same rebuild+restore as
+	// bigblock_tx_total_samples). Valid once a CFG16 grid is loaded; returns 0 for
+	// MFSK or when the grid yields no codewords (caller must not pin on 0).
+	int bigblock_codeword_count();
+
+	// PHASE 1 (fact-doc §11.6): apply (self-inverse) the big-block payload energy
+	// dispersal / whitening to a bit buffer. The real-bytes TX (transmit_bigblock)
+	// whitens the payload before LDPC encode so a zero-padded short compressed frame
+	// still modulates to a well-conditioned signal; the ARQ RX (bigblock_receive_carve)
+	// calls this on the decoded info bits to recover the exact payload. Same fixed-seed
+	// PRBS on both ends (no wire negotiation). XOR => calling it twice is a no-op.
+	void bigblock_whiten_bits(int* bits, int nbits);
+
+	// Big-block cross-call stash (P1 loopback validation + P2 handoff). The TX side
+	// records the K known info-bit groups it emitted + the sample count; the RX side
+	// records the per-codeword clean vector (the K-bit SACK granularity P2 consumes)
+	// + how many decoded clean. In P1 the same-process loopback validator reads these
+	// to assert 8/8 byte-correct; the production/ARQ path in P2 replaces the
+	// known-payload compare with ARQ truth.
+	std::vector<std::vector<int>> bigblock_last_tx_cw_info;
+	int bigblock_last_tx_K = 0;
+	int bigblock_last_tx_samples = 0;
+	std::vector<int> bigblock_last_rx_cw_ok;
+	int bigblock_last_rx_K = 0;
+	int bigblock_last_rx_cw_ok_count = 0;
+
+	// CFG16 CARVE-GATE HARDENING (cfg16-controlack-hold, GAP3): a one-shot RX
+	// intent override that SUPPRESSES the big-block route in receive_byte for the
+	// NEXT call only, so the captured passband is decoded by the STOCK per-frame
+	// path instead of receive_bigblock. The ARQ carve gate (arq_common.cc) sets
+	// this when a CFG16 acquisition fails the cw0 wire-header CRC check — i.e. the
+	// audio is NOT a real big-block (a single OFDM control frame, stale audio, or
+	// noise mis-routed by the unconditional CFG16->receive_bigblock gate). It then
+	// re-decodes via the stock path so control frames received at CFG16 (e.g. a
+	// SET_CONFIG/ACK turnaround) are parsed normally rather than carved into a fake
+	// K-codeword block (the GAP-3 red-herring "whitening misalignment" source).
+	// Mirrors the TX-side bigblock_emit_as_block intent flag (the TX already
+	// declines control via bigblock_send_one_block); this makes the RX symmetric.
+	// Auto-cleared by the caller after the one stock re-decode. Default false ->
+	// production big-block decode path is byte-identical when the flag is unused.
+	bool bigblock_rx_force_stock = false;
+
+	// P1 LIVE-PATH loopback validator (env MERCURY_BIGBLOCK_LIVE=1 under -m
+	// PLOT_PASSBAND -s 16). Sets bigblock_framing_enabled, drives ONE block through
+	// the production transmit_byte -> in-memory passband round-trip -> receive_byte,
+	// and asserts K/K codewords decode byte-correct. Proves the PHY is in the live
+	// path (not just the standalone WAV harness). MERCURY_BIGBLOCK_LIVE_ESN0 (<= -900
+	// = clean) optionally adds AWGN.
+	void bigblock_livepath_loopback();
 
 	void load_configuration();
 	void load_configuration(int configuration);
@@ -422,6 +733,26 @@ public:
 	int outer_code_reserved_bits;
 
 	int bit_energy_dispersal_seed;
+
+	// Per-instance RNG (single-process-sim-refactor.md §10.1, Landmine 1). Each
+	// cl_telecom_system owns an INDEPENDENT glibc-TYPE_3 stream so two modem
+	// instances in one process (the 2-instance SIM_INPROC stepper) never
+	// cross-contaminate pre-eq channel / pilot / dispersal sequence generation
+	// (get_pre_equalization_channel runs a 1000-draw NO-RESEED loop that would
+	// otherwise inherit the OTHER instance's residual stream state). Bound +
+	// seeded in the ctor via os_rng_make. ts_srandom/ts_random route through it
+	// when rng_own_ (always true post-ctor); a single instance reproduces a clean
+	// run byte-for-byte because there is no other instance to inherit residue
+	// from and the TYPE_3 walk is deterministic from the seed.
+	int32_t           rng_state_[OS_RNG_STATE_WORDS];
+	struct random_data_t rng_;
+	bool              rng_own_;
+	void          ts_srandom(unsigned int seed);  // routed __srandom
+	long int      ts_random();                    // routed __random
+	// Opt this instance into its own residue-free RNG stream (re-seeds rng_ with
+	// `seed` and flips rng_own_ true). Called ONLY by the 2-instance SIM_INPROC
+	// stepper. Production never calls it → rng_own_ stays false → byte-identical.
+	void          enable_per_instance_rng(unsigned int seed);
 
 	int narrowband_enabled;  // 0=wideband (Nc=50, BW=2344 Hz), 1=narrowband (Nc=10, BW=469 Hz)
 	bool coarse_freq_sync_enabled;  // Coarse freq search (±30 Hz) for HF radio drift

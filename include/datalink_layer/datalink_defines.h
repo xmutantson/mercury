@@ -164,6 +164,55 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 #define ERROR_ -1
 #define SUCCESSFUL 0
 
+// P2 big-block ARQ re-granularization stub sentinel
+// (fact-documents/data-flow-bigblock-arq-unit.md §6): returned by
+// bigblock_block_to_arq() while the block->ARQ logic is NOT yet wired (P2.0). The
+// --test-bigblock-arq-unit regression treats this as "block not delivered" so the
+// test FAILS before P2 wiring and PASSES after (the stub body is replaced in
+// P2.4/2.5/2.6). Distinct from any success/error code above so a future real
+// implementation can never collide with it.
+#define BIGBLOCK_ARQ_NOT_WIRED -77
+
+// PHASE 1 (P3 prereq, fact-documents/data-flow-bigblock-arq-unit.md §11): the
+// big-block carries a SELF-DESCRIBING header ON THE WIRE so a SUSTAINED multi-block
+// session cannot drift the CMD/RSP block bsi (the block has ONE acquisition + no
+// per-frame wire bit-7 to carry it) AND so the RX delivers each sub-codeword its
+// EXACT frame length (REQUIRED for compression transparency: variable-length
+// compressed frames must reassemble byte-faithfully — §11.4 / INV-10).
+//
+// The header rides as a PREFIX of codeword 0's systematic info bits ⇒ LDPC-protected,
+// decoded with the block. Layout (LSB-first bytes, hdr_total = BB_HDR_FIXED + 2*K):
+//   [0] = block_bsi (low 8 bits)            <- the authoritative wire bsi
+//   [1] = n_data    (0..K filled codewords)
+//   [BB_HDR_FIXED + 2*c + 0] = length[c] low  byte   } per-codeword app length (uint16 LE),
+//   [BB_HDR_FIXED + 2*c + 1] = length[c] high byte   }  c = 0..K-1
+// cw0's app bytes start at offset hdr_total (cw0 capacity = sub_len - hdr_total);
+// cwc (c>=1) app bytes occupy [c*sub_len .. c*sub_len + length[c]) (codeword-aligned
+// so the K-bit cw_ok SACK granularity / selective-repeat stays frame == codeword).
+#define BIGBLOCK_HDR_FIXED_BYTES 2                            // bsi + n_data
+#define BIGBLOCK_HDR_TOTAL_BYTES(K) (BIGBLOCK_HDR_FIXED_BYTES + 2*(K))  // + uint16 length table
+
+// FAILURE-2 fix (per-codeword CRC-8 ON THE WIRE). The LDPC iter count does NOT
+// detect a MISCORRECTION (the decoder converges to a valid-but-wrong codeword on a
+// noisy channel), and the only per-codeword "clean" check on the live 2-instance
+// path was an ORACLE compare against the TX instance's own info bits — valid ONLY in
+// single-instance loopback (telecom_system.cc bigblock_rx_passband cw_info_ref). On
+// the live path that ref is NULL -> cw_ok was FORCED CLEAN -> a corrupted codeword was
+// delivered clean + NEVER retransmitted (silent corruption). The fix reserves ONE
+// CRC-8 byte per sub-codeword (mirrors the stock per-frame CRC; CRC8_calc + POLY_CRC8),
+// at a FIXED offset the RX can locate WITHOUT trusting the (possibly-corrupt) length
+// table: the LAST byte of each codeword's sub_len systematic-byte region. The CRC
+// covers that codeword's first (sub_len - 1) bytes — for cw0 that INCLUDES the wire
+// header, so a corrupted header is caught (§5: a CRC-failed cw0 forces the fallback-bsi
+// path and is NOT length-table-parsed). The RX recomputes the CRC over the de-whitened
+// payload and DEMOTES cw_ok[c] on mismatch (can only demote, never promote a genuine
+// bit-mismatch to clean), feeding the existing SACK selective-repeat.
+#define BIGBLOCK_CW_CRC_BYTES 1                               // 1 CRC-8 byte / sub-codeword
+// byte offset of codeword c's CRC within the K*sub_len block payload, and the span the
+// CRC covers (the codeword's systematic bytes EXCLUDING its own CRC byte).
+#define BIGBLOCK_CW_CRC_OFFSET(c, sub_len) ((c)*(sub_len) + (sub_len) - BIGBLOCK_CW_CRC_BYTES)
+#define BIGBLOCK_CW_CRC_SPAN(sub_len)      ((sub_len) - BIGBLOCK_CW_CRC_BYTES)
+
 //Node role
 #define COMMANDER 0
 #define RESPONDER 1

@@ -100,32 +100,139 @@ static inline void sim_spin_sleep()
 {
 	std::this_thread::sleep_for(std::chrono::microseconds(SIM_SPIN_SLEEP_US));
 }
-static inline void ptt_busy_wait(cl_timer& t, int delay_ms)
+
+// ---------------------------------------------------------------------------
+// SIM_INPROC step-pump hook (single-process-sim-refactor.md §2).
+//
+// In the two-process paced sim the spin-loops below exit because CONCURRENT
+// sibling threads make their exit condition true (the TX bridge drains
+// playback_buffer; the RX bridge + capture-prep thread advance the virtual
+// clock via rx_transfer). A SINGLE-THREAD stepper has no sibling threads, so
+// without help the waits would block forever inside process_main → DEADLOCK.
+//
+// g_sim_inproc_pump is a step-pump callback the SIM_INPROC stepper installs.
+// When non-null (ONLY under -m SIM_INPROC), the spin-loops call it instead of
+// sim_spin_sleep(): from INSIDE the wait it re-enters the loopback-drain +
+// clock-advance the stepper would otherwise do after process_main returns.
+//
+// CRITICAL FIDELITY GUARD: the pump only makes the EXISTING exit predicate
+// eventually true — it NEVER changes the threshold and NEVER lets the loop
+// exit early. ptt_busy_wait still exits at get_elapsed_time_ms() >= delay_ms;
+// drain_playback_wait still exits at size_buffer(playback_buffer) == 0. The
+// pump advances the clock through the SAME rx_transfer → sim_clock_add_samples
+// accounting as the capture-prep thread, so the exit instant is identical to
+// the two-process path.
+//
+// Default null. Production (-x wasapi/alsa) and the two-process paced sim
+// never install it, so their spin-loop bodies are BYTE-IDENTICAL to before
+// (sim_spin_sleep() under sim, msleep(1) otherwise).
+typedef void (*sim_inproc_pump_fn)(void* ctx);
+static sim_inproc_pump_fn g_sim_inproc_pump = nullptr;
+static void*              g_sim_inproc_pump_ctx = nullptr;
+
+void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx)
 {
-	if (sim_clock_enabled())
-	{
-		while (t.get_elapsed_time_ms() < delay_ms)
-			sim_spin_sleep();
-	}
-	else
-	{
-		while (t.get_elapsed_time_ms() < delay_ms)
-			msleep(1);
-	}
+	g_sim_inproc_pump = fn;
+	g_sim_inproc_pump_ctx = ctx;
 }
 
-static inline void drain_playback_wait()
+// SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5/§10.7-item-4).
+// process_main()'s top blocks poll tcp_socket_control / tcp_socket_data (accept,
+// recv, transmit). The 2-instance stepper binds NO socket and injects user
+// commands + data DIRECTLY (process_user_command + fifo_buffer_*), so those polls
+// would syscall on uninit'd sockets (accept(fd=0) → spam + churn). When this flag
+// is set (ONLY while the 2-instance stepper runs) process_main skips the three TCP
+// blocks. Default false → production + the single-instance Stage-2 prototype +
+// the paced sim are byte-identical (the single-instance prototype drives
+// send_batch directly, never process_main, so it does not need this either).
+static bool g_sim_inproc_skip_tcp = false;
+void arq_set_sim_inproc_skip_tcp(bool on) { g_sim_inproc_skip_tcp = on; }
+bool arq_sim_inproc_skip_tcp()            { return g_sim_inproc_skip_tcp; }
+
+// Single place the step-pump is invoked from inside the spin loops. When no
+// pump is installed this is exactly the prior body: sim_spin_sleep() under the
+// virtual clock, msleep(1) on the production wall-clock path.
+static inline void sim_spin_or_pump(bool sim_clock_on)
 {
-	if (sim_clock_enabled())
-	{
-		while (size_buffer(playback_buffer) > 0)
-			sim_spin_sleep();
-	}
+	if (g_sim_inproc_pump != nullptr)
+		g_sim_inproc_pump(g_sim_inproc_pump_ctx);  // step-pumpable (SIM_INPROC only)
+	else if (sim_clock_on)
+		sim_spin_sleep();                          // two-process paced sim
 	else
+		msleep(1);                                 // production
+}
+
+// NOTE: external linkage (not static) so the SIM_INPROC prototype in
+// arq_commander.cc can drive the EXACT same spin-loop functions the
+// production TX path uses (proving the real helpers are step-pumpable, not a
+// re-implementation). Bodies are unchanged from the prior static versions, so
+// the production path is behaviorally identical.
+void ptt_busy_wait(cl_timer& t, int delay_ms)
+{
+	const bool sim_clock_on = sim_clock_enabled();
+	// EXIT CONDITION UNCHANGED: virtual (or wall) time must pass delay_ms.
+	while (t.get_elapsed_time_ms() < delay_ms)
+		sim_spin_or_pump(sim_clock_on);
+}
+
+void drain_playback_wait()
+{
+	const bool sim_clock_on = sim_clock_enabled();
+	// EXIT CONDITION UNCHANGED: the playback ring must be fully drained.
+	while (size_buffer(playback_buffer) > 0)
+		sim_spin_or_pump(sim_clock_on);
+}
+
+// ---------------------------------------------------------------------------
+// SIM_INPROC settle-wait helpers (single-process-sim-refactor.md §5.7 / §7).
+//
+// arq_sim_inproc_active(): the step-pump pointer is the authoritative signal.
+// It is non-null ONLY while the -m SIM_INPROC single-thread stepper is driving
+// (arq_commander.cc test_sim_inproc installs it, clears it on exit). Every
+// production path and the two-process paced sim leave it null.
+bool arq_sim_inproc_active()
+{
+	return g_sim_inproc_pump != nullptr;
+}
+
+// pumped_settle_wait(): virtual-clock-ify a wall settle-wait WITHOUT changing
+// its exit semantics. On EVERY non-SIM_INPROC path (pump null) this is the
+// verbatim wall-clock body — msleep(wait_ms) — so production + the paced sim
+// are byte-identical. Under SIM_INPROC the wall msleep would freeze the single
+// shared sample-counter virtual clock (a peer instance's view of time stops),
+// so instead we run a cl_timer + step-pump loop: the SAME EXIT PREDICATE
+// (elapsed >= wait_ms, identical to ptt_busy_wait) with the pump advancing the
+// shared clock through the SAME rx_transfer -> sim_clock_add_samples accounting
+// as the two-process RX bridge. No early exit, no threshold change — only the
+// clock-advance mechanism differs.
+void pumped_settle_wait(int wait_ms)
+{
+	if (wait_ms <= 0)
+		return;
+	if (g_sim_inproc_pump == nullptr)
 	{
-		while (size_buffer(playback_buffer) > 0)
-			msleep(1);
+		msleep(wait_ms);            // production + two-process paced sim: verbatim
+		return;
 	}
+	// SIM_INPROC: step-pumped wait, same exit predicate as ptt_busy_wait.
+	cl_timer t;
+	t.start();
+	while (t.get_elapsed_time_ms() < wait_ms)
+		sim_spin_or_pump(true);     // pump installed -> advances the shared clock
+}
+
+// sim_inproc_rx_mute_settle(): the RX_MUTE drain guard (B5 / ADD-ON1). The wait
+// exists to let in-flight ASYNC AUDIO CALLBACKS finish writing the capture ring
+// before circular_buf_reset() zeroes it. Under SIM_INPROC the stepper OWNS RX —
+// there is NO async audio-callback thread, nothing is in flight — so the drain
+// purpose is MOOT and the wait becomes a no-op. The caller's circular_buf_reset
+// (instantaneous state, no clock semantics) is UNCHANGED and still fires. On
+// production/paced-sim (pump null) it is the verbatim msleep(wait_ms).
+void sim_inproc_rx_mute_settle(int wait_ms)
+{
+	if (g_sim_inproc_pump != nullptr)
+		return;                     // no async drainer in-process -> moot, no-op
+	msleep(wait_ms);                // production + paced sim: verbatim
 }
 
 static const int RX_MUTE_GUARD_MS = 50;
@@ -843,7 +950,48 @@ void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
 	// clean all-ones MFSK ACK requires every frame to survive first-pass at the
 	// floor SNR (it never does). At batch=1 every delivered MFSK frame is itself
 	// an all-ones batch -> clean ACKs accumulate and the climb advances.
-	if(!is_robust_config(current_configuration))
+	// SACK-GATE P1 (R-B, bug #9) — BIG-BLOCK RUNG PIN: data_batch_size == K.
+	// The big-block framing rung is a CFG16 (OFDM, NON-robust) config, so without
+	// this pin the non-robust branch below runs the 30s-target formula and elects
+	// data_batch_size ~= 25. But a big-block decode emits ONE K-bit SACK bitmap
+	// (cw_ok, K = nBits/ldpc.N at the thin grid, K=8 at CFG16). The CMD clean-ACK
+	// accept gate (cmd_clean_data_ack_crc_valid, arq_commander.cc:136-139) derives
+	// all_ones = (1<<data_batch_size)-1; with batch=25 that is 0x1FFFFFF, which can
+	// NEVER equal the RSP's all-clean K=8 bitmap 0xFF -> clean ACK never matches ->
+	// zero clean credit -> the #9 "4 wire failures". Pinning data_batch_size = K
+	// makes CMD all_ones == 0xFF == the RSP big-block bitmap.
+	//
+	// This runs in the SHARED election body (CMD via TEST_CONNECTION_ACK +
+	// arq_commander.cc, RSP via TEST_CONNECTION + arq_responder.cc), so BOTH peers
+	// elect K from the SAME PHY geometry source (telecom_system->
+	// bigblock_codeword_count(), the identical nBits/ldpc.N the TX/RX workers use)
+	// and CANNOT diverge — the divergence-proof property the climb-fix family lacked.
+	// It is a BATCH-SIZE election at the CFG16 rung, NOT an authority change: the
+	// optimizer/gearshift authority (optimizer_is_in_control, last_data_viable_config,
+	// anchor_consec_break_fails, probe_backoff) is UNTOUCHED. The rung is detected by
+	// the framing-mode flag (telecom_system->bigblock_framing_enabled), the CFG16-rung
+	// framing bit the gearshift elects. set_data_batch_size()'s non-robust branch
+	// accepts K (>0, below the cap) cleanly; recalculate_ack_timeout_for_batch()
+	// (below) re-sizes the data-ACK timeout for the pinned batch.
+	// P3 HW FIX: pin batch=K ONLY at the CONFIG_16 big-block rung (was: any non-robust
+	// config). At CONFIG_0..15 bigblock_codeword_count() returns that config's K (e.g. 1)
+	// and pinning batch=1 there, combined with the carve engaging, stalled the climb. The
+	// block framing only runs at CONFIG_16 (see bigblock_send_one_block / the RX carve), so
+	// the K-pin belongs there too; CONFIG_0..15 use the stock 30s-target batch below.
+	bool bigblock_rung = (telecom_system != NULL)
+	                   && telecom_system->bigblock_framing_enabled
+	                   && current_configuration == CONFIG_16;
+	if(bigblock_rung)
+	{
+		int K = telecom_system->bigblock_codeword_count();
+		if(K > 0)
+		{
+			if(K > nMessages) K = nMessages;
+			set_data_batch_size(K);
+			nominal_batch_size = K;
+		}
+	}
+	else if(!is_robust_config(current_configuration))
 	{
 		int max_batch = (message_transmission_time_ms > 0)
 			? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
@@ -855,9 +1003,9 @@ void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
 		nominal_batch_size = new_batch;
 	}
 	recalculate_ack_timeout_for_batch();
-	printf("[SACK] %s Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d)\n",
+	printf("[SACK] %s Enabled (radio_batch=%d crypto_batch=%d headroom=%d batch=%d robust=%d bigblock=%d)\n",
 		who ? who : "?", radio_batch_size, crypto_batch_size, retransmit_headroom, data_batch_size,
-		is_robust_config(current_configuration) ? 1 : 0);
+		is_robust_config(current_configuration) ? 1 : 0, bigblock_rung ? 1 : 0);
 }
 
 void cl_arq_controller::set_call_sign(std::string call_sign)
@@ -1673,6 +1821,60 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		// the CURRENT coded-suffix length × base reps; reps last = correct member).
 		telecom_system->set_suffix_fec(fec_on, 3);
 		telecom_system->set_connect_preamble_reps(reps);
+	}
+
+	// BIG-BLOCK RUNG ELECTION ON THE GEARSHIFT TRANSITION (P4 — the "not wired into
+	// the gearshift" gap, fact-doc data-flow-bigblock-arq-unit.md §16). The big-block
+	// TX switch (bigblock_send_one_block, arq_common.cc:3648) and RX carve
+	// (arq_common.cc:6888) already SELF-GATE on bigblock_framing_enabled && M!=MFSK &&
+	// current_configuration==CONFIG_16, so they engage automatically once the live
+	// config is CFG16 — no TX-switch wiring is needed here. The ONLY missing piece on
+	// the climb path was the BATCH-SIZE ELECTION: sack_negotiated_recompute_batch()
+	// pins data_batch_size=K (the R-B/#9 pin) so the clean-ACK all_ones target
+	// (1<<data_batch_size)-1 equals the K-bit big-block cw_ok bitmap (0xFF at K=8).
+	// That election fired ONLY at CONNECT negotiation; on a robust/`-R` connect that
+	// ran at ROBUST_0 (rung guard false), and nothing re-elected when the gearshift
+	// later climbed onto CFG16 -> data_batch_size stayed at the stock 30s value (~25)
+	// -> all_ones=0x1FFFFFF != 0xFF -> ZERO clean credit -> every block PARTIAL (the
+	// HW-observed bigblock_rung=0 / clean=0 failure).
+	//
+	// load_configuration() is the SINGLE chokepoint every config switch flows through,
+	// on BOTH the CMD and RSP side (each peer runs its own gearshift -> its own
+	// load_configuration). Re-invoking the SHARED election body here makes both peers
+	// run IDENTICAL code from the SAME PHY geometry source (bigblock_codeword_count())
+	// at their CFG16 transition, so they elect the SAME K and CANNOT diverge (the
+	// R-B/#9 symmetry contract, §16.7). Gated STRICTLY on the bigblock rung; OFF the
+	// rung the shared body's own outer guard early-returns to the stock 30s/robust
+	// branch already run above, so the stock per-frame path is BYTE-IDENTICAL.
+	//
+	// TEST ESCAPE (fail-before/pass-after on the SAME binary, NOT a production knob):
+	// MERCURY_BIGBLOCK_DEFEAT_ELECTION=1 skips this tail call so the transition leaves
+	// data_batch_size at the stock value — the --test-bigblock-climb-election
+	// fail-before arm. getenv() is read HERE (inside the rare CFG16+framing guard, NOT
+	// every config switch) so the in-process A/B test can flip the flag between arms
+	// without the static-cache trap; production (env unset) takes the fast NULL return.
+	if(telecom_system != NULL
+		&& telecom_system->bigblock_framing_enabled
+		&& current_configuration == CONFIG_16)
+	{
+		bool defeat_election = false;
+		{
+			const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_ELECTION");
+			if(e && *e && atoi(e) != 0) defeat_election = true;
+		}
+		if(!defeat_election)
+		{
+			printf("[BIGBLOCK-ELECT] gearshift CFG16 transition -> electing big-block "
+				"rung (role=%s)\n", (role==COMMANDER) ? "CMD" : "RSP");
+			fflush(stdout);
+			sack_negotiated_recompute_batch((role==COMMANDER) ? "CMD" : "RSP");
+		}
+		else
+		{
+			printf("[BIGBLOCK-ELECT] DEFEAT_ELECTION=1 — skipping CFG16 rung election "
+				"(test fail-before arm; data_batch_size stays %d)\n", data_batch_size);
+			fflush(stdout);
+		}
 	}
 }
 
@@ -2593,6 +2795,12 @@ void cl_arq_controller::process_main()
 {
 	std::string command="";
 
+	// §10.5: the 2-instance SIM_INPROC stepper binds NO socket and injects user
+	// commands + data directly (process_user_command + fifo_buffer_*). Skip the
+	// TCP control + data poll blocks in that mode. Default false (gate cleared) →
+	// production + paced sim run the verbatim blocks → byte-identical.
+	if (!arq_sim_inproc_skip_tcp())
+	{
 	if (tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
 	{
 		// Mark that we had a control connection
@@ -2778,6 +2986,7 @@ void cl_arq_controller::process_main()
 			tcp_socket_data.timer.start();
 		}
 	}
+	}  // §10.5: end of the (skippable) TCP control + data poll blocks
 
 	// Signal measurement when idle: measure_signal_only() uses FIR_rx_time_sync,
 	// the same filter that receive_byte() uses for preamble detection. Running both
@@ -2860,8 +3069,15 @@ void cl_arq_controller::process_main()
 	// time) and keeps the two peer processes loosely paced together (a raw
 	// yield here hot-spun the loop and helped desync the CMD<->RSP turnaround).
 	// Gated on the flag -> production unchanged.
+	//
+	// §5.7 pacing-floor: route the sim branch through sim_spin_or_pump so the
+	// SIM_INPROC inline stepper ADVANCES the shared virtual clock here too
+	// (a bare sim_spin_sleep() is a 200us WALL sleep that would freeze a peer
+	// instance's clock view). When no pump is installed (the two-process paced
+	// sim) sim_spin_or_pump(true) IS sim_spin_sleep() — byte-identical. The
+	// production (sim disabled) branch is the verbatim usleep(2000).
 	if (sim_clock_enabled())
-		sim_spin_sleep();
+		sim_spin_or_pump(true);
 	else
 		usleep(2000);
 }
@@ -3458,6 +3674,604 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 }
 
 
+// ============================================================================
+// STEP 2 — live send-path wiring for the big-block (P3 prereq).
+//
+// bigblock_send_one_block(): emit the current new-data batch as ONE big-block
+// instead of the per-frame preamble loop. Gated by send_batch() on
+// telecom_system->bigblock_framing_enabled (the CFG16-rung framing flag, default
+// OFF — FORCED true for this validation; the gearshift AUTO-election is DEFERRED
+// to P4). Returns true when it HANDLED the batch (the caller skips the per-frame
+// loop); false when it declined (caller falls through to the stock per-frame path
+// — e.g. MFSK, retx batch, control frame in the batch, or no DATA frames).
+//
+// §5 audit (data-flow-bigblock-arq-unit.md): this is the TX producer of the block.
+// It feeds the K codewords' REAL ARQ bytes via transmit_byte -> transmit_bigblock
+// (P2.1 payload arg). It does NOT touch the optimizer/gearshift authority
+// (optimizer_is_in_control arq.h:2041-2058, last_data_viable_config :2086,
+// anchor_consec_break_fails :2106, probe_backoff :2031). Retx stays STOCK CFG16
+// per-frame framing (P2.5) — this helper declines a retx batch.
+//
+// The per-codeword payload byte capacity (sub_len) = ldpc.K/8 (systematic info
+// bytes per LDPC codeword). The block carries K = bigblock_codeword_count()
+// codewords; the new-data batch packs min(K, message_batch_counter_tx) DATA
+// frames, each frame's application payload occupying one sub-codeword slot
+// (zero-padded to sub_len). The RX carve (bigblock_block_to_arq) is the exact
+// inverse (INV-6). The block's batch_seq_id = the batch's bsi (one block = one
+// batch, INV-1/P2.6).
+bool cl_arq_controller::bigblock_send_one_block()
+{
+	if(telecom_system == NULL) return false;
+	if(!telecom_system->bigblock_framing_enabled) return false;
+	if(telecom_system->M == MOD_MFSK) return false;
+	// P3 HW FIX: the big-block framing is a CFG16-RUNG mode (validated geometry K=8,
+	// sub_len=ldpc.K/8). It must engage ONLY at CONFIG_16. The flag alone is not enough:
+	// the gearshift starts at ROBUST_0 and climbs through OTHER OFDM configs (CONFIG_0..15,
+	// all is_ofdm_config()==true, all !is_robust_config()). At those rungs the block has a
+	// DIFFERENT, unvalidated geometry (HW-observed CONFIG_0: K=1 sub_len=12) that corrupts
+	// the data path and STALLS the climb (every batch carves clean=0 -> no clean ACK ->
+	// gearshift BREAKs, never reaches CFG16). Gate on the live config == CONFIG_16 so the
+	// stock per-frame path carries CONFIG_0..15 and the block engages only at the validated
+	// rung. (The gearshift AUTO-election of this rung is still P4; here the flag is FORCED.)
+	if(current_configuration != CONFIG_16) return false;
+	// Retx batches stay STOCK CFG16 per-frame framing (P2.5).
+	if(sack_retransmit_active) return false;
+	if(message_batch_counter_tx <= 0) return false;
+
+	// Only emit a block for an all-DATA new-data batch. A CONTROL/ACK frame mixed
+	// into the batch keeps the stock per-frame path (the block carries data only).
+	int n_data = 0;
+	for(int i=0;i<message_batch_counter_tx;i++)
+	{
+		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			n_data++;
+		else
+			return false;   // non-data frame present -> decline, stock path handles it
+	}
+	if(n_data <= 0) return false;
+
+	int K = telecom_system->bigblock_codeword_count();
+	if(K <= 0) return false;
+	if(n_data > K) return false;   // batch larger than the block can carry -> stock path
+
+	// sub_len = systematic info bytes per codeword (ldpc.K/8). The block payload is
+	// K*sub_len bytes; we fill the first n_data sub-codewords from the batch frames'
+	// application payloads and zero-pad the rest.
+	int sub_len = telecom_system->ldpc.K / 8;
+	if(sub_len <= 0) return false;
+	const int alloc_size = N_MAX / 8;
+	if(sub_len > alloc_size) sub_len = alloc_size;
+
+	// PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header ON THE WIRE in
+	// codeword 0's systematic info bits (LDPC-protected): [bsi, n_data, length[0..K-1]].
+	// The bsi makes a multi-block session drift-proof (the block has one acquisition +
+	// no per-frame wire bit-7); the per-codeword length table lets the RX deliver each
+	// sub-codeword its EXACT frame length so VARIABLE-length compressed frames reassemble
+	// byte-faithfully (compression transparency, INV-10). cw0's app bytes start at offset
+	// hdr_total; cw1..K-1 are codeword-aligned at c*sub_len (so the K-bit cw_ok SACK
+	// granularity / selective-repeat keeps frame == codeword).
+	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);   // 2 + 2*K bytes
+	// FAILURE-2 fix: each sub-codeword reserves its LAST byte for an on-wire CRC-8
+	// (BIGBLOCK_CW_CRC_BYTES). The per-codeword app capacity shrinks by that 1 byte:
+	//   cw0  app cap = sub_len - hdr_total - CRC   (header prefix + CRC both reserved)
+	//   cwc  app cap = sub_len            - CRC    (c >= 1)
+	// The CRC byte sits at the FIXED offset BIGBLOCK_CW_CRC_OFFSET(c, sub_len) and covers
+	// the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes (header+app for cw0).
+	const int cw0_cap = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;  // cw0 app capacity
+	if(cw0_cap < 0) return false;                        // sub_len too small for header+CRC
+	const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;             // cwc (c>=1) app capacity
+	if(cwc_cap < 0) return false;
+	// INV-9 guard: frame 0 must fit in the reduced cw0 capacity. The big-block lattice
+	// gives sub_len >> max_frame + hdr_total, so this never fires at the CFG16 rung.
+	{
+		int len0 = messages_batch_tx[0].length;
+		if(len0 > cw0_cap) return false;                 // -> stock per-frame path
+	}
+
+	long block_payload_len = (long)K * (long)sub_len;
+	std::vector<int>           block_payload((size_t)block_payload_len, 0);
+	std::vector<unsigned char> block_payload_bytes((size_t)block_payload_len, 0);
+	// the bsi the block advertises (one block = one batch). Use the first DATA
+	// frame's batch_seq_id (the new-data builder stamps every frame the same bsi);
+	// defensive 0 if unset.
+	int block_bsi = messages_batch_tx[0].batch_seq_id;
+	if(block_bsi < 0) block_bsi = 0;
+
+	// Clamp each frame to its sub-codeword app capacity and record the per-codeword
+	// length table (the RX reads it back to deliver the exact byte count per slot).
+	std::vector<int> tx_lengths((size_t)K, 0);
+	for(int i=0;i<n_data && i<K;i++)
+	{
+		int cap = (i == 0) ? cw0_cap : cwc_cap;   // CRC byte reserved at the codeword tail
+		int len = messages_batch_tx[i].length;
+		if(len < 0) len = 0;
+		if(len > cap) len = cap;          // a frame longer than the sub-codeword is clamped
+		tx_lengths[i] = len;
+	}
+
+	// --- Wire header in cw0 prefix: [bsi][n_data][length[0..K-1] uint16 LE] ----------
+	block_payload[0]       = (int)(block_bsi & 0xFF);
+	block_payload_bytes[0] = (unsigned char)(block_bsi & 0xFF);
+	block_payload[1]       = (int)(n_data & 0xFF);
+	block_payload_bytes[1] = (unsigned char)(n_data & 0xFF);
+	for(int c=0;c<K;c++)
+	{
+		int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+		unsigned char b_lo = (unsigned char)(tx_lengths[c] & 0xFF);
+		unsigned char b_hi = (unsigned char)((tx_lengths[c] >> 8) & 0xFF);
+		block_payload[(size_t)lo + 0]       = (int)b_lo;
+		block_payload_bytes[(size_t)lo + 0] = b_lo;
+		block_payload[(size_t)lo + 1]       = (int)b_hi;
+		block_payload_bytes[(size_t)lo + 1] = b_hi;
+	}
+
+	// --- App payloads: frame c -> sub-codeword c (cw0 after the header prefix) --------
+	for(int i=0;i<n_data && i<K;i++)
+	{
+		int base = (i == 0) ? hdr_total : (i * sub_len);
+		int len  = tx_lengths[i];
+		for(int j=0;j<len;j++)
+		{
+			unsigned char b = (unsigned char)messages_batch_tx[i].data[j];
+			block_payload[(size_t)base + j]       = (int)b;
+			block_payload_bytes[(size_t)base + j] = b;
+		}
+		// (remaining bytes of this sub-codeword already 0 = pad)
+	}
+
+	// --- FAILURE-2 fix: per-codeword CRC-8 ON THE WIRE -------------------------------
+	// After every codeword's header/app bytes are packed (pad bytes already 0), stamp a
+	// CRC-8 over the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes into its tail
+	// byte BIGBLOCK_CW_CRC_OFFSET(c, sub_len). cw0's CRC covers [header | app | pad]; cwc
+	// covers [app | pad]. The RX recomputes the SAME CRC over the de-whitened payload and
+	// demotes cw_ok[c] on mismatch (the producer the old oracle compare faked). CRC8_calc
+	// is the stock per-frame helper (POLY_CRC8=0xF4); it runs over the byte mirror.
+	// Compute over ALL K codewords (filled + zero-pad) so the RX gate is uniform — a
+	// pad-only codeword has a deterministic CRC over its zero bytes.
+	for(int c=0;c<K;c++)
+	{
+		int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+		int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+		if(crc_off < 0 || crc_off >= block_payload_len || crc_span < 0) continue;
+		unsigned char crc = CRC8_calc((char*)&block_payload_bytes[(size_t)c*sub_len], crc_span);
+		block_payload[(size_t)crc_off]       = (int)crc;
+		block_payload_bytes[(size_t)crc_off] = crc;
+	}
+
+	// Stash the TX block payload + geometry + per-codeword lengths so the in-process
+	// single-block harness (and any RX in the same process) can carve it back
+	// byte-faithfully. The live RX carve reads the wire header off the decoded payload;
+	// the harness uses this stash as ground truth for the delivered==TX assertion (INV-6).
+	bigblock_tx_block_payload = block_payload_bytes;
+	bigblock_tx_block_K       = K;
+	bigblock_tx_block_sub_len = sub_len;
+	bigblock_tx_block_bsi     = (unsigned char)(block_bsi & 0xFF);
+	bigblock_tx_block_ndata   = n_data;
+	bigblock_tx_block_lengths = tx_lengths;
+
+	// Emit ONE big-block through the production transmit_byte (branches to
+	// transmit_bigblock when bigblock_framing_enabled). data = the K*sub_len real
+	// ARQ payload bytes; nBytes = block_payload_len (>0 so transmit_bigblock packs
+	// the real bytes, P2.1, NOT the PRBS fallback).
+	int active_nsymb = telecom_system->get_active_nsymb();
+	int frame_output_size = telecom_system->data_container.Nofdm
+		* telecom_system->data_container.interpolation_rate
+		* (active_nsymb + telecom_system->data_container.preamble_nSymb);
+	// the block is ~ (4 preamble + Ngrid) symbols; size the TX buffer generously.
+	int block_buf_samples = telecom_system->bigblock_tx_total_samples();
+	if(block_buf_samples <= 0) block_buf_samples = frame_output_size;
+	int block_pb_capacity = block_buf_samples + frame_output_size;
+	std::vector<double> block_pb((size_t)block_pb_capacity, 0.0);
+
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): this is the ONLY ARQ producer that hands
+	// transmit_byte a BLOCK-sized `out`. Arm the per-call block-emit intent (+ the real
+	// capacity) for the duration of THIS transmit_byte so its CFG16 branch may emit the
+	// K-codeword waveform here; every other CFG16 transmit_byte (stock per-frame / single-
+	// frame / control) leaves the flag false and keeps the per-frame OFDM geometry. The
+	// guard auto-clears on scope exit (exception-safe).
+	{
+		cl_telecom_system::bigblock_emit_scope emit_guard(telecom_system, block_pb_capacity);
+		telecom_system->transmit_byte(block_payload.data(), (int)block_payload_len,
+			block_pb.data(), NO_FILTER_MESSAGE);
+	}
+	int K_tx = telecom_system->bigblock_last_tx_K;
+	int n_tx = telecom_system->bigblock_last_tx_samples;
+	printf("[BIGBLOCK-TX] one-block emit: K=%d (n_data=%d) sub_len=%d bsi=%u "
+		"block_samples=%d\n", K_tx, n_data, sub_len, (unsigned)bigblock_tx_block_bsi, n_tx);
+	fflush(stdout);
+	if(K_tx <= 0 || n_tx <= 0) return false;
+
+	// === TX-LEVEL PARITY (P3 HW, fact-doc §18) — band-limit the block through the
+	// SAME FIR_tx1->FIR_tx2 cascade a regular CFG16 OFDM batch applies (send_batch,
+	// arq_common.cc:4591-4592) before tx_transfer. The stock per-frame passband is
+	// emitted RAW (NO_FILTER) by transmit_byte; the batch assembler is what runs the
+	// WHOLE packed buffer through the two band-pass FIRs, and that band-limit is the
+	// stage that disciplines a regular frame's final wire level (it flattens the
+	// per-subcarrier pre_equalization_channel boost: STOCK +FIR peak 0.583->0.492,
+	// rms 0.184->0.139, --test-bigblock-txlevel). The big-block had pre-eq + the
+	// TX_SIG_OFDM level-cal applied at the modulator (telecom_system.cc:7072-7110)
+	// but went to the wire WITHOUT this FIR, so it transmitted ~+1.4 dB peak / +2.3 dB
+	// RMS HOTTER than a stock frame (HW scope: ~1400-1450 mVp-p vs the 1000 mVp-p
+	// calibrated sweet spot). Apply the IDENTICAL conditioning here, in the same
+	// order, so the block transmits at the SAME level and spectrum as a regular frame
+	// — just longer under one preamble.
+	//
+	// Mirror send_batch's FIR scheme EXACTLY: edge-replicate a frame_output_size lead
+	// pad and trail pad around the real block so the ~96-tap (2x97-1)/2 group-delay
+	// transient bites only padding, then extract the n_tx real samples back from the
+	// filtered buffer. block_pb already carries frame_output_size of slack capacity
+	// (block_pb_capacity = block_buf_samples + frame_output_size, :3863), but build a
+	// dedicated padded buffer so the lead/trail replication is unambiguous. The RX is
+	// unchanged: FIR is an in-band band-pass, the OFDM signal sits inside the band, and
+	// the pilot-based channel estimate captures+divides out any residual shaping — the
+	// exact mechanism the stock OFDM RX already relies on for its own FIR'd frames.
+	//
+	// BLOCKED / DEFAULT-OFF (fact-doc §18.3): applying the FIR achieves the level goal
+	// (RMS ratio bb/stock+FIR -> ~1.0, vs +2.3 dB without it) BUT costs ~0.5-1 dB of
+	// decode margin that the big-block's BESPOKE RX (bigblock_rx_passband, sparse-pilot
+	// estimate) cannot absorb on a 32-QAM CFG16 block: exactly ONE middle codeword (cw2)
+	// miscorrects on the PERFECT channel, the --test-bigblock-multicw/-fullpath byte gate
+	// drops 8/8 -> 7/8 and the partial-block path then never delivers (gate hang). The
+	// pre-eq-only block "passes" 8/8 only because its UN-cut pre-eq edge boost (~+4.8x on
+	// the band edges) over-powers those subcarriers — i.e. it passes BY running +2.3 dB
+	// hot, not by having real margin. At the calibrated level the RX is genuinely ~1 cw
+	// short via the FIR — the FIR's STEEP per-subcarrier band-edge attenuation is what the
+	// sparse (2-cont-col + scat_dx=3/dy=4) thin grid cannot track, NOT the absolute level.
+	//
+	// === APPROACH A — FLAT GLOBAL GAIN CUT (default, P3 HW) =====================
+	// The FIR breaks decode because it RESHAPES the spectrum (steep band-edge rolloff the
+	// thin grid can't equalize). But on a clean channel the big-block decode is LEVEL-
+	// INVARIANT for a FIXED SHAPE: the sparse pilot estimate already divides out the pre-eq
+	// shape and decodes the pre-eq'd block 8/8 at the hot level. So instead of the FIR,
+	// apply a SINGLE UNIFORM scalar to the whole block to bring its RMS down to a stock
+	// CFG16 +FIR frame's RMS. A uniform scale preserves the SHAPE exactly -> the thin-grid
+	// estimate is unchanged -> decode stays 8/8, while the wire level matches a regular
+	// frame (the +2.3 dB HW overdrive closes), with ZERO pilot/geometry/throughput change.
+	//
+	// The cancel factor is MEASURED, not hardcoded (CLAUDE.md §1): it is the SAME level
+	// reduction the FIR cascade would impose on THIS block. Apply FIR_tx1->FIR_tx2 to a
+	// scratch copy (the band-limit reference), measure the FIR'd-vs-raw data-region RMS
+	// ratio, and scale the raw (un-FIR'd, shape-preserving) block by that ratio. This makes
+	// the flat-gain path land at the SAME disciplined level the FIR achieves
+	// (--test-bigblock-txlevel STOCK +FIR data rms 0.139) — self-calibrating, config-
+	// independent, derived from the modem's own band-pass response, no magic constant.
+	//
+	// A/B escape hatches: MERCURY_BIGBLOCK_FIR=1 -> old (decode-breaking) FIR path;
+	// MERCURY_BIGBLOCK_NOGAINCUT=1 -> raw hot block (the previous default, +2.3 dB).
+	bool bb_apply_fir = false;
+	{ const char* e=std::getenv("MERCURY_BIGBLOCK_FIR"); if(e && atoi(e)!=0) bb_apply_fir=true; }
+	bool bb_no_gaincut = false;
+	{ const char* e=std::getenv("MERCURY_BIGBLOCK_NOGAINCUT"); if(e && atoi(e)!=0) bb_no_gaincut=true; }
+	if(!bb_apply_fir)
+	{
+		if(bb_no_gaincut)
+		{
+			// legacy raw path: pre-eq + level-cal block, no level discipline (+2.3 dB hot).
+			tx_transfer(block_pb.data(), n_tx);
+			return true;
+		}
+		// FLAT-GAIN cut. Data region = samples AFTER the shared preamble (preamble_nSymb
+		// OFDM symbols), matching --test-bigblock-txlevel's data-region RMS basis (the HW
+		// concern is per-symbol transmit power, set by the data region).
+		int pre_samp = telecom_system->data_container.preamble_nSymb
+			* telecom_system->data_container.Nofdm
+			* telecom_system->data_container.interpolation_rate;
+		int dlo = (pre_samp < n_tx) ? pre_samp : 0;
+		auto rms_region = [](const double* s, int lo, int hi)->double{
+			double acc=0.0; int n=(hi>lo)?(hi-lo):0;
+			for(int i=lo;i<hi;i++) acc += s[i]*s[i];
+			return (n>0) ? std::sqrt(acc/(double)n) : 0.0;
+		};
+		double raw_rms = rms_region(block_pb.data(), dlo, n_tx);
+
+		// FIR'd reference (scratch only — NOT transmitted). Same pad scheme as send_batch /
+		// the FIR path below so the group-delay transient bites padding, giving a faithful
+		// band-limited level reference.
+		int pad = frame_output_size;
+		int total_fir = pad + n_tx + pad;
+		double fir_rms = raw_rms;   // fallback: identity (no cut) if FIR scratch fails
+		if(total_fir > 0 && raw_rms > 1e-12)
+		{
+			std::vector<double> fir_in((size_t)total_fir, 0.0);
+			std::vector<double> fir_t1((size_t)total_fir, 0.0);
+			std::vector<double> fir_t2((size_t)total_fir, 0.0);
+			for(int i=0;i<n_tx;i++) fir_in[(size_t)pad+i] = block_pb[(size_t)i];
+			int rep = (pad < n_tx) ? pad : n_tx;
+			for(int i=0;i<rep;i++)
+			{
+				fir_in[(size_t)i]            = block_pb[(size_t)i];
+				fir_in[(size_t)(pad+n_tx)+i] = block_pb[(size_t)(n_tx-rep)+i];
+			}
+			telecom_system->ofdm.FIR_tx1.apply(fir_in.data(), fir_t1.data(), total_fir);
+			telecom_system->ofdm.FIR_tx2.apply(fir_t1.data(), fir_t2.data(), total_fir);
+			fir_rms = rms_region(&fir_t2[(size_t)pad], dlo, n_tx);
+		}
+		double g_flat = (raw_rms > 1e-12) ? (fir_rms / raw_rms) : 1.0;
+		if(!(g_flat > 0.0) || g_flat > 1.0) g_flat = (g_flat>1.0)?1.0:1.0;  // clamp: never boost
+		printf("[BIGBLOCK-TX] flat-gain cut: raw_rms=%.6f fir_rms=%.6f g=%.4f (%.2f dB) "
+			"[shape-preserving level discipline; decode unchanged]\n",
+			raw_rms, fir_rms, g_flat, 20.0*std::log10((g_flat>0)?g_flat:1e-12));
+		fflush(stdout);
+		for(int i=0;i<n_tx;i++) block_pb[(size_t)i] *= g_flat;
+		tx_transfer(block_pb.data(), n_tx);
+		return true;
+	}
+	{
+		int pad = frame_output_size;                  // same pad width send_batch uses
+		int total_fir = pad + n_tx + pad;             // lead pad + block + trail pad
+		std::vector<double> fir_in((size_t)total_fir, 0.0);
+		std::vector<double> fir_t1((size_t)total_fir, 0.0);
+		std::vector<double> fir_t2((size_t)total_fir, 0.0);
+		// real block in the middle
+		for(int i=0;i<n_tx;i++) fir_in[(size_t)pad+i] = block_pb[(size_t)i];
+		// lead pad = replicate the block's leading `pad` samples; trail pad = replicate
+		// the block's trailing `pad` samples (send_batch:4578-4585 edge replication).
+		int rep = (pad < n_tx) ? pad : n_tx;
+		for(int i=0;i<rep;i++)
+		{
+			fir_in[(size_t)i]                 = block_pb[(size_t)i];                 // lead
+			fir_in[(size_t)(pad+n_tx)+i]      = block_pb[(size_t)(n_tx-rep)+i];      // trail
+		}
+		telecom_system->ofdm.FIR_tx1.apply(fir_in.data(), fir_t1.data(), total_fir);
+		telecom_system->ofdm.FIR_tx2.apply(fir_t1.data(), fir_t2.data(), total_fir);
+		// the real block is the [pad, pad+n_tx) region of the filtered buffer.
+		tx_transfer(&fir_t2[(size_t)pad], n_tx);
+	}
+
+	return true;
+}
+
+// bigblock_block_ftr_or(): MULTI-CW WINDOW FIX (fact-doc §17). The big-block decode
+// snapshots buffer_Nsymb samples (receive_bigblock, telecom_system.cc:8219), but the
+// snapshot only fires when frames_to_read counts down to 0 — so frames_to_read sets HOW
+// MANY FRESH symbols are accumulated into the ring before the block is handed to the
+// decoder. The block spans bigblock_rx_block_nsymb() (= preamble_nSymb + Ngrid, ~64) OFDM
+// symbols; a stock CFG16 frame is get_active_nsymb()+preamble_nSymb (~13). Codewords map
+// SEQUENTIALLY across the block's symbols (cw0 = earliest, cw7 = latest), so a stock-frame
+// window snapshots only the block HEAD: cw0's symbols are fresh -> cw0 byte-correct; cw1..7
+// fall outside the fresh region -> decode from silence/stale ring -> DETERMINISTIC garbage
+// (the §15.2 partial-block signature, recurring on the live multi-block path because the
+// §15.2 fix only guarded the messages_control turnaround + the post-carve re-arm, NOT the
+// per-block ACK-turnaround / FAIL re-arms — see §17.3).
+//
+// This helper raises a stock frames_to_read value to the FULL block span (+10 turnaround
+// margin, matching the §15.2 :6994 re-arm) WHEN the bigblock rung is live, and returns
+// stock_ftr UNCHANGED otherwise. Reuses the EXACT geometry source the §15.2 sites use
+// (bigblock_rx_block_nsymb()), so there is no parallel mechanism and the two peers cannot
+// diverge. On every non-CFG16 / framing-off / MFSK path the guard is false -> the binary is
+// byte-identical to baseline. MERCURY_BIGBLOCK_DEFEAT_FIX=1 bypasses the clamp (returns the
+// stock value) so the SAME binary reproduces the pre-fix truncated-window corruption for the
+// fail-before/pass-after A/B (production never sets it).
+int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
+{
+	if(telecom_system == NULL) return stock_ftr;
+	if(!(telecom_system->bigblock_framing_enabled
+	     && telecom_system->M != MOD_MFSK
+	     && current_configuration == CONFIG_16))
+		return stock_ftr;
+	// reproducer hook: restore the pre-fix stock-frame arming for the fail-before A/B.
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_FIX");
+	  if(e && *e && atoi(e)!=0) return stock_ftr; }
+	int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+	if(block_nsymb <= 0) return stock_ftr;          // geometry unavailable -> leave stock
+	int block_ftr = block_nsymb + 10;               // block span + turnaround margin
+	return (block_ftr > stock_ftr) ? block_ftr : stock_ftr;
+}
+
+// bigblock_receive_carve(): the RX side of STEP 2. After receive_byte() branched
+// to receive_bigblock() and decoded ONE block (stashing the per-codeword clean
+// vector telecom_system->bigblock_last_rx_cw_ok + the K decoded info-bit
+// sub-units in data_byte_out), translate the block into the ARQ data unit via the
+// already-built+gated bigblock_block_to_arq() carve (P2.4/2.5/2.6): carve cw_ok ->
+// messages_rx[], set the synthetic EOB=K-1, fire one ACK / partial SACK / bsi-once.
+//
+// info_bits = the decoded systematic info bits receive_bigblock wrote to `out`
+// (K*ldpc.K of them); we re-pack them into K*sub_len bytes (sub_len = ldpc.K/8,
+// the same packing the TX used) so the carve is byte-faithful (INV-6).
+//
+// PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header in cw0's prefix
+// [bsi, n_data, length[0..K-1]]. When use_wire_header is true (the live path), the
+// carve PARSES that header off the decoded payload and uses the WIRE bsi (authoritative,
+// drift-proof) + the per-codeword length table (compression transparency). fallback_bsi
+// is used only when use_wire_header is false (legacy) or the header is unusable.
+//
+// §5 audit: this is the RX consumer wiring. It calls ONLY bigblock_block_to_arq
+// GAP-3 CARVE-GATE HARDENING (cfg16-controlack-hold): is the just-decoded CFG16
+// acquisition a REAL big-block? A real block's cw0 carries the FEC+CRC-protected
+// [bsi, n_data, length-table] header followed (like every codeword) by a CRC-8 tail
+// byte over its first BIGBLOCK_CW_CRC_SPAN(sub_len) de-whitened bytes. A single OFDM
+// control frame, stale audio, or noise that the unconditional CFG16->receive_bigblock
+// gate mis-routed into the carver does NOT produce a cw0 whose recomputed CRC-8 matches
+// — so this is the structural discriminator the pinpoint identified (the cw0
+// wire-header CRC). We recompute ONLY cw0's CRC here (cheap, header-bearing); the full
+// per-codeword demote still runs inside bigblock_receive_carve for the accepted block.
+// Reuses the EXACT de-whiten + CRC8_calc + BIGBLOCK_CW_CRC_* the TX/carve use, so it
+// cannot drift from the on-wire format. Returns false (reject) on any inconsistency.
+bool cl_arq_controller::bigblock_rx_cw0_header_valid()
+{
+	if(telecom_system == NULL) return false;
+	int K = telecom_system->bigblock_last_rx_K;
+	if(K <= 0) return false;
+	int sub_len = telecom_system->ldpc.K / 8;
+	if(sub_len <= 0) return false;
+	const int alloc_size = N_MAX / 8;
+	if(sub_len > alloc_size) sub_len = alloc_size;
+	int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+	int crc_off  = BIGBLOCK_CW_CRC_OFFSET(0, sub_len);   // cw0's CRC tail byte index
+	if(crc_span <= 0 || crc_off < 0 || crc_off >= sub_len) return false;
+	// Need cw0's full sub_len*8 decoded info bits.
+	const std::vector<int>& bits = telecom_system->bigblock_rx_infobits;
+	int need_bits = sub_len * 8;
+	if((int)bits.size() < need_bits) return false;
+	// De-whiten ONLY cw0's bits (self-inverse XOR over the SAME PRBS the TX whitened
+	// with). bigblock_whiten_bits whitens the WHOLE block from bit 0; cw0 occupies the
+	// first sub_len*8 bits, so de-whitening a length-need_bits prefix recovers cw0.
+	std::vector<int> dw(bits.begin(), bits.begin() + need_bits);
+	telecom_system->bigblock_whiten_bits(dw.data(), need_bits);
+	std::vector<unsigned char> cw0((size_t)sub_len, 0);
+	for(int b=0;b<sub_len;b++)
+	{
+		unsigned char byte = 0;
+		for(int bit=0;bit<8;bit++)
+			if(dw[b*8 + bit] & 1) byte |= (unsigned char)(1u << bit);
+		cw0[b] = byte;
+	}
+	unsigned char calc = CRC8_calc((char*)cw0.data(), crc_span);
+	unsigned char wire = cw0[(size_t)crc_off];
+	return (calc == wire);
+}
+
+// (already §5-audited) — it does NOT touch the optimizer/gearshift authority.
+// Returns SUCCESSFUL when the block was carved into the ARQ layer.
+int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
+		unsigned char fallback_bsi, bool use_wire_header)
+{
+	if(telecom_system == NULL) return ERROR_;
+	int K = telecom_system->bigblock_last_rx_K;
+	if(K <= 0) return ERROR_;
+	int sub_len = telecom_system->ldpc.K / 8;
+	if(sub_len <= 0) return ERROR_;
+	const int alloc_size = N_MAX / 8;
+	if(sub_len > alloc_size) sub_len = alloc_size;
+
+	// the K-bit per-codeword clean vector (the SACK granularity).
+	const std::vector<int>& cw_ok_vec = telecom_system->bigblock_last_rx_cw_ok;
+	std::vector<int> cw_ok((size_t)K, 0);
+	for(int c=0;c<K;c++)
+		cw_ok[c] = (c < (int)cw_ok_vec.size()) ? (cw_ok_vec[c] ? 1 : 0) : 0;
+
+	// re-pack the decoded info bits -> K*sub_len bytes (LSB-first, the byte_to_bit
+	// convention transmit_bigblock used). info_bits may be null on a total acq miss.
+	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): on the live path info_bits is
+	// telecom_system->bigblock_rx_infobits (sized K*ldpc.K by receive_bigblock), NOT
+	// data_container.data_byte[N_MAX] — this carve reads nbits = K*sub_len*8 = K*ldpc.K ints,
+	// which would over-read the 1600-int data_byte. (The in-process test passes its own
+	// correctly-sized vector.) nbits == K*ldpc.K by construction (sub_len == ldpc.K/8).
+	// PHASE 1 (fact-doc §11.6): the real-bytes TX energy-disperses (whitens) the payload
+	// bits before LDPC encode (so a zero-padded short compressed frame still decodes).
+	// De-whiten the decoded bits HERE (self-inverse XOR, same PRBS) before re-packing to
+	// bytes — recovers the exact payload. Copy into a local buffer first (don't mutate the
+	// source in place).
+	std::vector<unsigned char> payload((size_t)K * sub_len, 0);
+	if(info_bits != NULL)
+	{
+		int nbits = K * sub_len * 8;
+		std::vector<int> dw((size_t)nbits, 0);
+		for(int i=0;i<nbits;i++) dw[i] = info_bits[i] & 1;
+		telecom_system->bigblock_whiten_bits(dw.data(), nbits);   // de-whiten (self-inverse)
+		for(int c=0;c<K;c++)
+		{
+			for(int b=0;b<sub_len;b++)
+			{
+				unsigned char byte = 0;
+				for(int bit=0;bit<8;bit++)
+				{
+					int idx = (c*sub_len + b)*8 + bit;
+					if(dw[idx] & 1) byte |= (unsigned char)(1u << bit);
+				}
+				payload[(size_t)c*sub_len + b] = byte;
+			}
+		}
+	}
+
+	// --- FAILURE-2 fix: per-codeword WIRE CRC-8 verify -> cw_ok demote --------------
+	// The PHY-layer cw_ok producer (bigblock_rx_passband) is an ORACLE compare on the
+	// single-instance loopback (cw_info_ref) and is FORCED CLEAN (all 1s) on the live
+	// 2-instance path (ref==NULL) — so a MISCORRECTED codeword arrived "clean" and was
+	// never retransmitted (silent corruption). Recompute the on-wire CRC-8 over each
+	// codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) de-whitened bytes and compare to its
+	// tail CRC byte. This is the REAL per-codeword detector; it can only DEMOTE cw_ok[c]
+	// (a CRC failure clears it), never PROMOTE a genuine bit-mismatch the oracle caught.
+	// It runs BEFORE the cw0 header-trust gate below, so a CRC-failed cw0 (cw_ok[0]==0)
+	// forces the fallback-bsi path and is NOT length-table-parsed (§5 cross-layer). Skip
+	// only when there are no decoded bytes (total acquisition miss: payload all-zero).
+	//
+	// REPRODUCER HOOK (fact-doc §13.R, mirrors the heap-fix MERCURY_BIGBLOCK_OLDGATE): set
+	// MERCURY_BIGBLOCK_NOCRC=1 to DISABLE the wire-CRC demote on the SAME binary — this
+	// restores the PRE-FIX silent-corruption behavior (the PHY producer's forced-clean
+	// cw_ok stands) so the bit-flip-cw_ok test (CASE D) can show its fail-before without a
+	// revert build. Production never sets it; it exists purely for the local fail-before
+	// / pass-after proof.
+	bool nocrc_demote = false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_NOCRC"); if(e && *e && atoi(e)!=0) nocrc_demote = true; }
+	if(info_bits != NULL && !nocrc_demote)
+	{
+		int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+		for(int c=0;c<K;c++)
+		{
+			if(crc_span < 0) break;
+			int crc_off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+			if(crc_off < 0 || crc_off >= (int)((long)K*sub_len)) { cw_ok[c] = 0; continue; }
+			unsigned char calc = CRC8_calc(
+				(char*)&payload[(size_t)c*sub_len], crc_span);
+			unsigned char wire = payload[(size_t)crc_off];
+			if(calc != wire) cw_ok[c] = 0;   // demote-only: CRC mismatch => failed codeword
+		}
+	}
+
+	// --- PHASE 1: parse the cw0 wire header [bsi, n_data, length[0..K-1] uint16 LE] ---
+	unsigned char block_bsi = fallback_bsi;
+	int cw0_offset = 0;
+	const int* sub_lengths_ptr = nullptr;
+	std::vector<int> wire_lengths;
+	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
+	bool header_usable = use_wire_header && info_bits != NULL
+		&& hdr_total <= sub_len;            // header must fit in cw0
+	if(header_usable && cw_ok[0])
+	{
+		// cw0 (which carries the header) must have decoded clean for the header to be
+		// trusted. The wire bsi is authoritative (drift-proof); the length table sizes
+		// each delivered slot. cw0's app bytes start AFTER the header prefix.
+		block_bsi = payload[0];
+		wire_lengths.assign((size_t)K, 0);
+		for(int c=0;c<K;c++)
+		{
+			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+			int len = (int)payload[lo] | ((int)payload[lo+1] << 8);
+			// FAILURE-2 fix: the codeword's tail byte is the CRC, NOT app data — reserve it
+			// so the delivered length can never include the CRC byte (matches the TX caps
+			// cw0_cap/cwc_cap above). cw0 also reserves the header prefix.
+			int cap = (c == 0) ? (sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES)
+			                   : (sub_len - BIGBLOCK_CW_CRC_BYTES);
+			if(cap < 0)   cap = 0;
+			if(len < 0)   len = 0;
+			if(len > cap) len = cap;       // never deliver past a codeword's app capacity
+			wire_lengths[c] = len;
+		}
+		cw0_offset      = hdr_total;
+		sub_lengths_ptr = wire_lengths.data();
+	}
+	else
+	{
+		// FALLBACK (legacy / CRC-failed-cw0 / no-header): we cannot trust the length
+		// table, but the codeword tail byte is STILL the CRC and must not be delivered as
+		// app data. Pass an explicit uniform table = the per-codeword capacity minus the
+		// CRC byte (cw0 also minus the header prefix) so the CRC byte stays out of the
+		// delivered payload. cw0_offset stays 0 (legacy: cw0 had no header prefix on the
+		// no-header path; on the CRC-failed-cw0 path cw0 is a SACK gap anyway, so its
+		// length is unused). This only fires off the production live path when cw0's CRC
+		// fails — the block is mostly re-requested, so exactness here is not load-bearing.
+		wire_lengths.assign((size_t)K, 0);
+		for(int c=0;c<K;c++)
+		{
+			int cap = sub_len - BIGBLOCK_CW_CRC_BYTES;
+			if(cap < 0) cap = 0;
+			wire_lengths[c] = cap;
+		}
+		sub_lengths_ptr = wire_lengths.data();
+	}
+
+	int rc = bigblock_block_to_arq(cw_ok.data(), K, block_bsi, payload.data(), sub_len,
+		sub_lengths_ptr, cw0_offset);
+	printf("[BIGBLOCK-RX] carve: K=%d cw_ok_count=%d wire_bsi=%u (fallback=%u used_hdr=%d) "
+		"sub_len=%d rc=%d\n",
+		K, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi,
+		(unsigned)fallback_bsi, (int)(sub_lengths_ptr != nullptr), sub_len, rc);
+	fflush(stdout);
+	return rc;
+}
+
+
 void cl_arq_controller::send(st_message* message, int message_location)
 {
 	printf("send()\n");
@@ -3632,6 +4446,77 @@ void cl_arq_controller::send_batch()
 	cl_timer ptt_on_delay, ptt_off_delay;
 	ptt_on_delay.start();
 
+	// STEP 2 — big-block live send path. When the CFG16-rung framing flag is set
+	// (FORCED true for this validation; gearshift AUTO-election DEFERRED to P4),
+	// emit the new-data batch as ONE big-block (one acquisition, K codewords) via
+	// transmit_byte -> transmit_bigblock instead of the per-frame preamble loop.
+	// Declines (returns false) for MFSK / retx / mixed-control batches, which fall
+	// through to the stock per-frame path below (byte-identical when the flag is
+	// off — the default). On a handled block, do the SAME post-TX bookkeeping the
+	// per-frame path does (ptt-off-delay, capture flush + unmute, ack timers,
+	// frames_to_read reset) and return.
+	if(bigblock_send_one_block())
+	{
+		ptt_busy_wait(ptt_on_delay, ptt_on_delay_ms);
+
+		if(g_verbose) { printf("[TX] big-block: waiting for playback buffer to drain...\n"); fflush(stdout); }
+		drain_playback_wait();
+		mtl::log_event("cmd_batch_last_sym_out");
+
+		// Unmute + flush right after playback drain (mirrors the per-frame tail).
+		circular_buf_reset(capture_buffer);
+		{
+			int buf_samples = telecom_system->data_container.Nofdm
+				* telecom_system->data_container.buffer_Nsymb
+				* telecom_system->data_container.interpolation_rate;
+			MUTEX_LOCK(&capture_prep_mutex);
+			memset(telecom_system->data_container.passband_delayed_data, 0,
+				2 * buf_samples * sizeof(double));
+			telecom_system->data_container.ring_write_index = 0;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+		}
+		mtl::log_event("cmd_ring_reset_done");
+		telecom_system->data_container.rx_mute = 0;
+		telecom_system->data_container.rx_mute_samples = 0;
+		mtl::log_event("cmd_post_tx_unmute");
+
+		ptt_off_delay.start();
+		ptt_busy_wait(ptt_off_delay, ptt_off_delay_ms);
+		ptt_off();
+		mtl::log_event("cmd_ptt_off");
+
+		// Post-TX bookkeeping: arm ack timers + PENDING_ACK on each DATA frame's
+		// owning messages_tx slot (SAME as the per-frame path), then clear the
+		// batch slots. The block is ONE batch -> the K frames PENDING_ACK on one ACK.
+		for(int i=0;i<message_batch_counter_tx;i++)
+		{
+			if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			{
+				int id = (int)(unsigned char)messages_batch_tx[i].id;
+				messages_tx[id].ack_timer.start();
+				messages_tx[id].status=PENDING_ACK;
+				if(messages_tx[id].ack_timeout == 0)
+					messages_tx[id].ack_timeout = ack_timeout_data;
+				if(messages_tx[id].nResends == 0)
+					messages_tx[id].nResends = nResends;
+			}
+			this->messages_batch_tx[i].ack_timeout=0;
+			this->messages_batch_tx[i].id=0;
+			this->messages_batch_tx[i].length=0;
+			this->messages_batch_tx[i].nResends=0;
+			this->messages_batch_tx[i].status=FREE;
+			this->messages_batch_tx[i].type=NONE;
+		}
+		message_batch_counter_tx=0;
+
+		telecom_system->data_container.frames_to_read =
+			telecom_system->data_container.preamble_nSymb;
+		printf("[TX-END-BIGBLOCK] frames_to_read=%d\n",
+			telecom_system->data_container.frames_to_read.load());
+		fflush(stdout);
+		return;
+	}
+
 	int active_nsymb = telecom_system->get_active_nsymb();
 	int frame_output_size = telecom_system->data_container.Nofdm*telecom_system->data_container.interpolation_rate*(active_nsymb+telecom_system->data_container.preamble_nSymb);
 
@@ -3658,6 +4543,18 @@ void cl_arq_controller::send_batch()
 	}
 
 	int header_length=0;
+	// LEVER P: preamble amortization. Frames are concatenated into ONE gapless
+	// PTT waveform; with variable-length frames (anchor FULL + tail MINI) we pack
+	// them CONTIGUOUSLY rather than at a fixed frame_output_size stride. Slot 0 is
+	// the leading FIR pad (frame_output_size samples). Frame i is written at
+	// frame_pack_off[i] (running offset starting at frame_output_size). frame_len[i]
+	// is its actual emitted length (from tx_last_emitted_frame_samples). MFSK and
+	// retx batches force every frame FULL so frame_len == frame_output_size and the
+	// packing degenerates to the legacy fixed-stride layout (byte-identical).
+	std::vector<int> frame_pack_off(message_batch_counter_tx, 0);
+	std::vector<int> frame_len(message_batch_counter_tx, frame_output_size);
+	int pack_cursor = frame_output_size;  // first frame begins after the lead pad
+	const bool batch_force_full = sack_retransmit_active;  // retx => re-anchor every frame
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
 		// SACK retransmit: sequence_number already set to original position
@@ -3775,7 +4672,25 @@ void cl_arq_controller::send_batch()
 			fflush(stdout);
 		}
 
-		telecom_system->transmit_byte(telecom_system->data_container.data_byte,header_length+messages_batch_tx[i].length,&batch_frames_output_data[(i+1)*frame_output_size],NO_FILTER_MESSAGE);
+		// LEVER P: per-frame preamble schedule. Only DATA frames amortize; any
+		// CONTROL/ACK frame mixed into the batch keeps the FULL preamble (force
+		// full). The schedule is keyed on the in-batch frame index i and the
+		// batch-wide force-full flag (retx). transmit_bit reads the override and
+		// reports the actual emitted length via tx_last_emitted_frame_samples.
+		bool frame_is_data = (messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT);
+		bool frame_force_full = batch_force_full || !frame_is_data;
+		telecom_system->tx_preamble_nsymb_override =
+			cl_telecom_system::preamble_sched_nsymb(i, frame_force_full,
+				telecom_system->data_container.preamble_nSymb);
+
+		frame_pack_off[i] = pack_cursor;
+		telecom_system->transmit_byte(telecom_system->data_container.data_byte,header_length+messages_batch_tx[i].length,&batch_frames_output_data[pack_cursor],NO_FILTER_MESSAGE);
+		telecom_system->tx_preamble_nsymb_override = -1;  // reset (defensive)
+
+		frame_len[i] = telecom_system->tx_last_emitted_frame_samples;
+		if(frame_len[i] <= 0 || frame_len[i] > frame_output_size)
+			frame_len[i] = frame_output_size;  // defensive clamp
+		pack_cursor += frame_len[i];
 
 
 		last_message_sent_type=messages_batch_tx[i].type;
@@ -3787,14 +4702,23 @@ void cl_arq_controller::send_batch()
 
 	}
 
+	// LEVER P: contiguous packed layout. The frames region is
+	// [frame_output_size, pack_cursor). Lead pad (slot 0) = copy of the first
+	// frame_output_size samples of frame 0; trail pad = copy of the last
+	// frame_output_size samples of the final frame. This mirrors the legacy
+	// edge-replication so the FIR transient never bites a real sample.
+	int frames_region_len = pack_cursor - frame_output_size;  // sum of frame_len[i]
 	for(int i=0;i<frame_output_size;i++) //padding start and end to prepare for filtering
 	{
-		batch_frames_output_data[(0)*frame_output_size+i]=batch_frames_output_data[(0+1)*frame_output_size+i];
-		batch_frames_output_data[(message_batch_counter_tx+1)*frame_output_size+i]=batch_frames_output_data[(message_batch_counter_tx)*frame_output_size+i];
+		// lead pad: replicate the first frame's leading samples
+		batch_frames_output_data[i]=batch_frames_output_data[frame_output_size+i];
+		// trail pad: replicate the final frame's trailing samples (the last
+		// frame_output_size samples of the packed frames region)
+		batch_frames_output_data[pack_cursor+i]=batch_frames_output_data[pack_cursor-frame_output_size+i];
 	}
 
 	{
-		int total_fir_size = (message_batch_counter_tx+2)*frame_output_size;
+		int total_fir_size = pack_cursor + frame_output_size;  // lead pad + frames + trail pad
 		memset(batch_frames_output_data_filtered1, 0, total_fir_size * sizeof(double));
 		memset(batch_frames_output_data_filtered2, 0, total_fir_size * sizeof(double));
 		telecom_system->ofdm.FIR_tx1.apply(batch_frames_output_data,batch_frames_output_data_filtered1,total_fir_size);
@@ -3914,10 +4838,14 @@ void cl_arq_controller::send_batch()
 		delete[] pilot_buffer;
 	}
 
+	// LEVER P: transmit each frame at its actual packed offset and actual length
+	// (variable: anchor FULL, tail MINI). The frames are contiguous, so the wire
+	// sees one gapless waveform; per-frame tx_transfer granularity is preserved
+	// for the sim pacing / capture-prep symbol cadence.
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
-		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, size=%d\n", i, message_batch_counter_tx, frame_output_size); fflush(stdout); }
-		tx_transfer(&batch_frames_output_data_filtered2[(i+1)*frame_output_size], frame_output_size);
+		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, off=%d size=%d\n", i, message_batch_counter_tx, frame_pack_off[i], frame_len[i]); fflush(stdout); }
+		tx_transfer(&batch_frames_output_data_filtered2[frame_pack_off[i]], frame_len[i]);
 	}
 
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
@@ -4058,7 +4986,7 @@ void cl_arq_controller::send_ack_pattern()
 			printf("[TX-ACK-PAT] Waiting %dms (remaining=%dsym delay=%dsym buf=%dsym frame=%dsym ptt_off=%d ptt_on=%d)\n",
 				wait_ms, remaining_sym, delay_sym, buf_sym, frame_sym, ptt_off_delay_ms, ptt_on_delay_ms);
 			fflush(stdout);
-			msleep(wait_ms);
+			pumped_settle_wait(wait_ms);  // §5.7-B1: virtual-clock-ify (same exit predicate); verbatim msleep on production
 		}
 	}
 	else
@@ -4071,7 +4999,7 @@ void cl_arq_controller::send_ack_pattern()
 		printf("[TX-ACK-PAT] MFSK guard %dms (ptt_off=%d, ptt_on=%d)\n",
 			wait_ms, ptt_off_delay_ms, ptt_on_delay_ms);
 		fflush(stdout);
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B1: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	printf("[TX-ACK-PAT] Guard done at t=%dms\n", (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
@@ -4156,7 +5084,7 @@ void cl_arq_controller::send_ack_pattern()
 	// Flushing now lets the capture thread receive clean audio during
 	// ptt_off_delay, giving 200ms+ margin instead of potentially negative.
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -4186,7 +5114,10 @@ void cl_arq_controller::send_ack_pattern()
 	{
 		int rx_frame = telecom_system->data_container.preamble_nSymb
 		             + telecom_system->data_container.Nsymb;
-		telecom_system->data_container.frames_to_read = rx_frame + 10;
+		// MULTI-CW WINDOW FIX (fact-doc §17): at the bigblock rung the NEXT thing we
+		// receive is ONE K-codeword block (~64 sym), not a stock frame (~13). Snapshot
+		// MUST wait for the WHOLE block or cw1..cw7 read a stale ring (cw0-ok garbage).
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
 	printf("[TX-ACK-PAT] Done at t=%dms, flushed capture buffer, nUnder reset, ftr=%d\n", (int)ack_turnaround_timer.get_elapsed_time_ms(), telecom_system->data_container.frames_to_read.load());
@@ -4214,7 +5145,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	if(is_robust_config(current_configuration))
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B2: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	ptt_on();
@@ -4278,7 +5209,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 
 	// Same flush sequence as send_ack_pattern
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -4297,7 +5228,8 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	{
 		int rx_frame = telecom_system->data_container.preamble_nSymb
 		             + telecom_system->data_container.Nsymb;
-		telecom_system->data_container.frames_to_read = rx_frame + 10;
+		// MULTI-CW WINDOW FIX (fact-doc §17): block-span the window at the bigblock rung.
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
 	printf("[TX-ACK-SNR] Done, flushed capture buffer, ftr=%d\n", telecom_system->data_container.frames_to_read.load());
@@ -4665,7 +5597,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	if(is_robust_config(current_configuration))
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B3: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	ptt_on();
@@ -4746,7 +5678,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	// Same flush sequence as send_ack_pattern / send_ack_pattern_with_snr
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
@@ -4768,7 +5700,8 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	{
 		int rx_frame = telecom_system->data_container.preamble_nSymb
 		             + telecom_system->data_container.Nsymb;
-		telecom_system->data_container.frames_to_read = rx_frame + 10;
+		// MULTI-CW WINDOW FIX (fact-doc §17): block-span the window at the bigblock rung.
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
 	printf("[TX-MFSK-ACK-SACK] Done, flushed capture buffer, ftr=%d\n",
@@ -4949,7 +5882,7 @@ void cl_arq_controller::send_break_pattern()
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -5053,7 +5986,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	if(is_robust_config(self->current_configuration))
 	{
 		int wait_ms = self->ptt_off_delay_ms + self->ptt_on_delay_ms;
-		msleep(wait_ms);
+		pumped_settle_wait(wait_ms);  // §5.7-B4: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
 	self->ptt_on();
@@ -5131,7 +6064,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 
 	// Same capture-flush sequence as send_mfsk_ack_sack:4406-4429.
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
@@ -5476,7 +6409,7 @@ void cl_arq_controller::send_hail_pattern()
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
-	msleep(RX_MUTE_GUARD_MS);
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
 	circular_buf_reset(capture_buffer);
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
@@ -5727,6 +6660,91 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 		tail_samples = signal_period;
 	int tail_offset = signal_period - tail_samples;
 
+	// ------------------------------------------------------------------
+	// SIM_INPROC control-ACK arrival-window re-scan (ADDITIVE; pump-armed
+	// poll, single-process-sim-refactor.md §5.7-B8 sibling).
+	//
+	// In production the ~500 Hz capture-prep thread CONTINUOUSLY refreshes the
+	// ring between A's process_main ticks, so the once-per-tick poll below
+	// naturally sweeps the entire ACK arrival window: whichever tick the
+	// trailing ACK sample reaches the demod, that tick's snapshot sees it.
+	//
+	// The single-thread stepper has NO prep thread. The peer's control-ACK
+	// pattern lands in A's ring exactly ONCE (when the §10.5 deferral releases
+	// the rx->tx wire while A is idle), and the pump's idle-silence symbols
+	// then push it out of the tail before A's NEXT per-tick scan — so every
+	// scan sees a silent tail (tail_rms < gate -> energy gate skips the
+	// correlator) and A never advances to NEGOTIATING. Identical class to the
+	// already-fixed B8 HAIL RX-poll (arq_commander.cc:428) and the inverted
+	// spin-loops: the detector is fine, the poll just never sees the buffer at
+	// the instant the reply lands.
+	//
+	// FIX (B8 mirror): when the step-pump is installed (ONLY under -m
+	// SIM_INPROC), pump the SHARED virtual clock forward in short slices and
+	// re-probe the tail until the ACK pattern's ENERGY is present in a
+	// scannable state (frames_to_read==0 AND tail RMS over the gate), or a
+	// bounded arrival window elapses. The pump drains peer->A through the wire
+	// + advances the clock through the SAME rx_transfer accounting the prep
+	// thread uses (and co-routine-drives the peer so it actually emits the
+	// reply), so this is the in-thread equivalent of letting the prep thread
+	// refresh the ring across the window. The UNCHANGED detection body below
+	// then runs exactly as in production — SAME energy gate, SAME correlator,
+	// SAME threshold (ack_match_threshold + ack_metric_threshold), SAME
+	// frames_to_read / defer_audio_advance bookkeeping. We only change WHEN the
+	// poll sees the buffer, never WHETHER it accepts. On a real miss the window
+	// expires and the body's normal miss path (frames_to_read=2; return false)
+	// fires verbatim, so A re-polls next tick exactly as in production.
+	//
+	// Production + the two-process paced sim leave the pump null
+	// (arq_sim_inproc_active()==false) -> this whole block is skipped ->
+	// byte-identical.
+	if(arq_sim_inproc_active())
+	{
+		// Arrival window: tail span + the responder's PTT/turnaround margin
+		// (~1 s, see [TX-ACK-PAT] guard) expressed in virtual ms, capped so a
+		// genuinely silent line still returns within one ack-poll cadence.
+		double sym_ms = (sym_samples > 0)
+			? (double)sym_samples * 1000.0 / (double)SIM_CLOCK_SAMPLE_RATE_HZ
+			: 1.0;
+		int window_ms = (int)((double)tail_nsymb * sym_ms) + 1200;
+		const double SIM_ACK_PROBE_GATE_RMS = 0.001; // == ACK_ENERGY_GATE_RMS
+		int elapsed_ms = 0;
+		// Slice = 2 symbols (== the body's frames_to_read=2 re-poll cadence),
+		// so the pump delivers whole symbols the way the prep thread would.
+		int slice_ms = (int)(2.0 * sym_ms) + 1;
+		// Probe the WHOLE tail (not just the last 8 symbols the body's CPU-gate
+		// uses). The stepper delivers the peer's ACK as ONE batch (drains the
+		// whole rx->tx wire at once: ACK pattern + the peer's trailing idle
+		// silence), so unlike the ~500 Hz prep thread it does NOT leave the ACK
+		// in the last few symbols — the ACK sits MID-tail with ~10-15 symbols of
+		// trailing silence. A last-8-symbol probe would therefore always read
+		// silence; we break as soon as the ACK ENERGY appears anywhere in the
+		// tail (the same span the correlator below searches). Pumping FURTHER
+		// only adds trailing silence and drifts the ACK out of the tail, so we
+		// must stop the instant energy is present — pump only to WAIT for it.
+		while(elapsed_ms < window_ms)
+		{
+			bool scannable = false;
+			MUTEX_LOCK(&capture_prep_mutex);
+			if(telecom_system->data_container.frames_to_read == 0)
+			{
+				int rwi = telecom_system->data_container.ring_write_index;
+				double* tp = &telecom_system->data_container
+					.passband_delayed_data[rwi + tail_offset];
+				double sumsq = 0.0;
+				for(int i = 0; i < tail_samples; i++) sumsq += tp[i] * tp[i];
+				double rms = std::sqrt(sumsq / tail_samples);
+				if(rms >= SIM_ACK_PROBE_GATE_RMS)
+					scannable = true;   // ACK energy is in the tail NOW — scan it
+			}
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			if(scannable)
+				break;                  // run the UNCHANGED detection body below
+			pumped_settle_wait(slice_ms);   // advance shared clock + deliver reply
+			elapsed_ms += slice_ms;
+		}
+	}
+
 	MUTEX_LOCK(&capture_prep_mutex);
 
 	if(telecom_system->data_container.frames_to_read == 0)
@@ -5756,7 +6774,18 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 			energy_logged_this_window = false;
 		}
 		const double ACK_ENERGY_GATE_RMS = 0.001;
-		int probe_n = 8 * sym_samples;
+		// Energy-gate window: last 8 symbols in production (CPU pre-filter — the
+		// prep thread leaves a freshly-arrived ACK in the newest symbols). Under
+		// the SIM_INPROC pump the peer's ACK is delivered as ONE batch (ACK +
+		// trailing idle silence), so it sits MID-tail; probing only the last 8
+		// symbols would read silence and skip a tail that DOES contain the ACK.
+		// Widen the GATE to the full tail under SIM so it does not pre-filter out
+		// a present ACK. This changes ONLY the CPU pre-filter span — the
+		// correlator below already searches the whole tail and its accept
+		// threshold (ack_match_threshold + ack_metric_threshold) is unchanged, so
+		// detection semantics are identical. Production/paced-sim keep the 8-symbol
+		// window (pump null) -> byte-identical.
+		int probe_n = arq_sim_inproc_active() ? tail_samples : (8 * sym_samples);
 		if(probe_n > tail_samples) probe_n = tail_samples;
 		double* tail_ptr = telecom_system->data_container.ready_to_process_passband_delayed_data
 			+ (tail_samples - probe_n);
@@ -6111,6 +7140,121 @@ void cl_arq_controller::receive()
 				telecom_system->data_container.data_byte);
 		}
 
+		// STEP 2 — big-block RX carve. When the CFG16-rung framing flag is set and
+		// receive_byte branched to receive_bigblock (gated identically), the decode
+		// produced ONE block's K-bit cw_ok + the K decoded info-bit sub-units (in
+		// data_byte). Translate the block into the ARQ data unit via
+		// bigblock_receive_carve -> bigblock_block_to_arq (carve cw_ok -> messages_rx[],
+		// synthetic EOB, one ACK / partial SACK / bsi-once) and SKIP the per-frame
+		// messages_rx_buffer dispatch below (one acquisition = one carve, not K
+		// per-frame parses). Gated + default-off -> zero stock-path change.
+		//
+		// PHASE 1 (fact-doc §11): the block's bsi is carried ON THE WIRE (cw0 header,
+		// FEC-protected). The carve READS the wire bsi (use_wire_header=true) — drift-
+		// proof across a SUSTAINED multi-block session. rsp_current_expected_batch_seq_id
+		// is passed only as a FALLBACK (used if cw0 didn't decode / header unusable).
+		bool bigblock_rx_handled = false;
+		// P3 HW FIX: carve ONLY at the CONFIG_16 rung (matches the TX gate in
+		// bigblock_send_one_block). is_ofdm_config() (configs 0..16) wrongly engaged the
+		// carve at CONFIG_0..15 during the climb, where the block geometry is unvalidated
+		// (K=1 at CONFIG_0) — corrupting RX and stalling the gearshift. Stock per-frame
+		// parse handles CONFIG_0..15.
+		// GAP-3 CARVE-GATE HARDENING (cfg16-controlack-hold): the route at
+		// telecom_system.cc:1024 sent EVERY CFG16 OFDM acquisition into receive_bigblock
+		// with NO big-block marker check, so a single OFDM control frame (SET_CONFIG /
+		// ACK turnaround), stale audio, or noise was carved into a fake K-codeword block
+		// (the red-herring "whitening misalignment" signature: wire_bsi=garbage). Require
+		// a REAL big-block here: cw0's de-whitened wire-CRC-8 must validate (a real block
+		// always carries the FEC+CRC-protected cw0 header; a mis-routed control/stale/noise
+		// frame does not). When it FAILS, this was not a block — re-decode the SAME captured
+		// passband on the STOCK per-frame path (bigblock_rx_force_stock suppresses the route
+		// for one receive_byte call) so the control frame is parsed normally and ACKed,
+		// instead of being eaten by the carver. Mirrors the TX, which already declines
+		// control (bigblock_send_one_block). Real big-blocks (the dominant CFG16 traffic
+		// once GAP-1 holds the rung) pass the cw0 CRC and carve exactly as before.
+		bool bigblock_rx_candidate =
+			(telecom_system->bigblock_framing_enabled
+			 && telecom_system->M != MOD_MFSK
+			 && current_configuration == CONFIG_16
+			 && telecom_system->bigblock_last_rx_K > 0);
+		if(bigblock_rx_candidate && !bigblock_rx_cw0_header_valid())
+		{
+			printf("[BBTX-GATE] CFG16 acquisition (K=%d) failed cw0 wire-CRC -> NOT a "
+				"big-block; re-decoding on stock per-frame path (control/stale/noise, "
+				"not carved)\n", telecom_system->bigblock_last_rx_K);
+			fflush(stdout);
+			// One-shot stock re-decode of the SAME captured passband. receive_bigblock
+			// ran its normalize/blank on a LOCAL snapshot (telecom_system.cc:8246-8251),
+			// so ready_to_process_passband_delayed_data is intact for a second decode.
+			telecom_system->bigblock_rx_force_stock = true;
+			received_message_stats = telecom_system->receive_byte(
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				telecom_system->data_container.data_byte);
+			telecom_system->bigblock_rx_force_stock = false;
+			// Not a block: clear the RX-K marker so the carve gate below is FALSE and the
+			// downstream per-frame parse keys on the (stock) received_message_stats.
+			telecom_system->bigblock_last_rx_K = 0;
+			bigblock_rx_candidate = false;
+		}
+		if(bigblock_rx_candidate)
+		{
+			int fallback_bsi = (rsp_current_expected_batch_seq_id >= 0)
+				? (rsp_current_expected_batch_seq_id & 0xFF) : 0;
+			// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): carve from the DEDICATED
+			// telecom_system->bigblock_rx_infobits (sized K*ldpc.K = 11200 ints by
+			// receive_bigblock), NOT data_container.data_byte[N_MAX=1600]. The carve reads
+			// K*sub_len*8 = 11200 ints; reading them out of the 1600-int data_byte was a
+			// 9600-int over-read (and the decode copy-in had already over-written it). The
+			// member always holds the full block decode; data_byte stays a stock-path buffer.
+			bigblock_receive_carve(telecom_system->bigblock_rx_infobits.data(),
+				(unsigned char)fallback_bsi, /*use_wire_header=*/true);
+			bigblock_rx_handled = true;
+			// the carve already populated messages_rx[] + advanced ARQ state; the
+			// per-frame parse path below keys on received_message_stats.message_decoded.
+			received_message_stats.message_decoded = NO;
+
+			// PARTIAL-BLOCK FIX (bigblock-whiten-align): a big-block is ONE acquisition of
+			// the WHOLE K-codeword block (preamble + Ngrid data symbols, ~64 sym). The
+			// snapshot fires when frames_to_read==0, and message_decoded is forced NO above
+			// so the stock per-frame success re-arm (this function, ~line 7041) does NOT run.
+			// Re-arm frames_to_read to span a FULL next block so the next snapshot waits for
+			// the complete block (otherwise it fires after one stock frame's worth of symbols
+			// and the late codewords read silence -> CRC-fail -> 0 delivered). Also zero the
+			// just-decoded block region in the ring so its preamble/pilots can't false-trigger
+			// the next Schmidl-Cox acquisition (the stock zeroing at ~line 6972 is gated on
+			// message_decoded==YES, which we cleared).
+			{
+				int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+				if(block_nsymb > 0)
+				{
+					MUTEX_LOCK(&capture_prep_mutex);
+					int sp = signal_period;
+					// Zero the WHOLE ring after a block decode. The just-decoded block (its
+					// preamble + data) sits somewhere in this window; any residual OFDM
+					// structure (preamble autocorr, pilots) would false-trigger the NEXT
+					// block's Schmidl-Cox acquisition and make it lock the wrong offset
+					// (observed: block 2 acquired on block 1's stale preamble -> garbage
+					// payload, every codeword CRC-fail). One acquisition == one block, so a
+					// full wipe is correct (unlike the stock per-frame path, which keeps
+					// trailing batch frames). The next block re-accumulates from silence.
+					for(int k = 0; k < sp; k++)
+					{
+						telecom_system->data_container.passband_delayed_data[k] = 0.0;
+						telecom_system->data_container.passband_delayed_data[k + sp] = 0.0;
+					}
+					// NOTE: do NOT reset ring_write_index — the capture-prep feed keeps
+					// advancing it; resetting it mid-stream desyncs the next block's write
+					// position and the acquisition lands on a misaligned window.
+					telecom_system->data_container.frames_to_read = block_nsymb + 10;
+					telecom_system->data_container.nUnder_processing_events = 0;
+					telecom_system->receive_stats.ofdm_search_raw = 0;
+					telecom_system->receive_stats.ofdm_batch_active = false;
+					MUTEX_UNLOCK(&capture_prep_mutex);
+				}
+			}
+		}
+		(void)bigblock_rx_handled;
+
 		auto proc_end = std::chrono::steady_clock::now();
 		double proc_ms = std::chrono::duration<double, std::milli>(proc_end - proc_start).count();
 
@@ -6145,7 +7289,15 @@ void cl_arq_controller::receive()
 			&& received_message_stats.delay > 0)
 		{
 			int sp = signal_period;
-			int frame_syms = telecom_system->data_container.preamble_nSymb
+			// LEVER P: zero only the ACTUAL decoded frame (eff preamble + data).
+			// Zeroing the FULL preamble_nSymb on a MINI tail frame would erase
+			// 3 symbols into the NEXT frame's MINI preamble in the gapless batch
+			// waveform, destroying it. last_eff_preamble_nsymb == preamble_nSymb
+			// when amortization is off.
+			int zero_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
+			if(zero_eff_pre < 1 || zero_eff_pre > telecom_system->data_container.preamble_nSymb)
+				zero_eff_pre = telecom_system->data_container.preamble_nSymb;
+			int frame_syms = zero_eff_pre
 				+ telecom_system->get_active_nsymb();
 			int frame_samples = frame_syms * symbol_period;
 			int frame_ring_start = (rwi + received_message_stats.delay) % sp;
@@ -6204,7 +7356,16 @@ void cl_arq_controller::receive()
 		if (received_message_stats.message_decoded==YES)
 		{
 			int rx_nsymb = telecom_system->get_active_nsymb();
-			int rx_frame = rx_nsymb + telecom_system->data_container.preamble_nSymb;
+			// LEVER P: this frame's actual length is (eff preamble + data). For a
+			// MINI tail frame eff=1, so rx_frame is shorter; the next preamble in
+			// the gapless batch waveform sits exactly rx_frame symbols ahead. The
+			// position chain (ofdm_search_raw / frames_to_read) MUST advance by the
+			// ACTUAL length or the batch-predict window misses every tail frame.
+			// last_eff_preamble_nsymb == preamble_nSymb when amortization is off.
+			int rx_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
+			if(rx_eff_pre < 1 || rx_eff_pre > telecom_system->data_container.preamble_nSymb)
+				rx_eff_pre = telecom_system->data_container.preamble_nSymb;  // defensive
+			int rx_frame = rx_nsymb + rx_eff_pre;
 			int end_of_current_message = received_message_stats.delay / symbol_period  + rx_frame;
 			int frames_left_in_buffer = telecom_system->data_container.buffer_Nsymb - end_of_current_message;
 			if(frames_left_in_buffer<0)
@@ -6658,8 +7819,18 @@ void cl_arq_controller::receive()
 					int sym_period = telecom_system->data_container.Nofdm
 						* telecom_system->data_container.interpolation_rate;
 					int pream_symb = received_message_stats.delay / sym_period;
-					int frame_symb = telecom_system->data_container.Nsymb
-						+ telecom_system->data_container.preamble_nSymb;
+					// LEVER P (INC-3): the beyond-bounds fast-forward `upper` must
+					// match the MINI-aware extraction/gate bound (telecom_system.cc
+					// upper_bound + frame_size_interp). In a MINI batch the tail
+					// frames are (Nsymb+1) symbols, so the FULL-frame `upper` over-
+					// shifts (skips a decodable tail frame) and misreports beyond-
+					// bounds. last_eff_preamble_nsymb carries the active per-frame
+					// preamble length (== preamble_nSymb on every non-MINI /
+					// amortization-off path, so byte-identical when the feature is off).
+					int ff_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
+					if(ff_eff_pre < 1 || ff_eff_pre > telecom_system->data_container.preamble_nSymb)
+						ff_eff_pre = telecom_system->data_container.preamble_nSymb;
+					int frame_symb = telecom_system->data_container.Nsymb + ff_eff_pre;
 					int upper = telecom_system->data_container.buffer_Nsymb - frame_symb;
 
 					if(received_message_stats.frame_data_missing)
@@ -6900,6 +8071,15 @@ void cl_arq_controller::receive()
 						}
 					}
 				}
+				// MULTI-CW WINDOW FIX (fact-doc §17): a big-block decode FAIL that lands in
+				// this OFDM anti-spin handler (total acq miss -> no carve re-arm at :7036)
+				// would re-arm a small false-preamble shift (8/16), truncating the next
+				// block's window. Block-span the re-arm at the rung so the next snapshot
+				// waits for a WHOLE block (the carve's full-ring wipe + search_raw reset
+				// already handle stale preambles, so a longer wait is safe). NO-OP off-rung.
+				// Skip when ftr==0 (the same-mod opportunistic-scan immediate-rescan path,
+				// passive_monitor only) so that fast-scan semantics are unchanged.
+				if(ftr > 0) ftr = bigblock_block_ftr_or(ftr);
 				telecom_system->data_container.frames_to_read = ftr;
 				telecom_system->data_container.nUnder_processing_events = 0;
 				// === DIAG: OFDM anti-spin ftr trace ===
@@ -6965,7 +8145,13 @@ void cl_arq_controller::receive()
 			{
 				int rx_frame = telecom_system->get_active_nsymb()
 					+ telecom_system->data_container.preamble_nSymb;
-				telecom_system->data_container.frames_to_read = rx_frame;
+				// MULTI-CW WINDOW FIX (fact-doc §17): a FAILED big-block decode (the carve
+				// forces message_decoded=NO) lands here when frames_to_read hit 0. Re-arming
+				// a stock frame truncates the NEXT block's window (cw1..7 stale-ring garbage)
+				// — the chicken-and-egg recurrence (only a CLEAN carve arms the full window
+				// at :6994). Block-span the re-arm at the rung so a failed block re-accumulates
+				// a WHOLE block before the next snapshot.
+				telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame);
 				telecom_system->data_container.nUnder_processing_events = 0;
 				int buf_nsymb = telecom_system->data_container.buffer_Nsymb.load();
 				telecom_system->receive_stats.ofdm_search_raw = buf_nsymb - rx_frame;

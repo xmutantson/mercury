@@ -68,6 +68,11 @@
 #include <random>
 #include <vector>
 
+// §22 OFDM fine-timing test injects a residual TX carrier offset via the
+// production test hook (global, defined in main.cc, consumed in
+// telecom_system.cc:700). extern "C" matches its linkage (telecom_system.cc:39).
+extern "C" double test_tx_carrier_offset;
+
 // =============================================================================
 // Test helpers
 // =============================================================================
@@ -5439,6 +5444,345 @@ static void test_production_enhanced_connect_decodes() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §22. OFDM FINE-timing phase-invariant magnitude metric regression suite
+//      (fix/ofdm-fine-timing-magnitude, ofdm-fine-timing-magnitude.md).
+//
+// Root cause: cl_ofdm::time_sync_preamble_with_metric (the FINE per-trial
+// timer, ofdm.cc) previously scored candidate positions on the PHASE-SENSITIVE
+// real projection Re(conj(a)*b) = |a||b|cos(theta). Under residual CFO (the
+// post-Moose ~±20 Hz the production path leaves), the repetition-period phase
+// theta drifts and the real projection collapses, so the peak `delay` lands ±1
+// OFDM symbol off → pilots misalign → mean_H collapses to ~0.30 → the SKIP-H
+// gate (telecom_system.cc:2486) rejects the frame before LDPC. The fix scores
+// on the PHASE-INVARIANT magnitude |P|²/(A²·R) the coarse detector already uses.
+//
+// These tests drive the REAL production receive_byte acquisition path (NOT
+// ofdm_forced_delay — that BER bypass is exactly why the bug never showed in
+// --test) on a CONFIG_0 (WB BPSK, 4-sym preamble) frame, and read back the
+// production-computed receive_stats.delay + receive_stats.mean_H.
+//
+// FAIL-BEFORE / PASS-AFTER: §22.1 (CFO) fails on the phase-sensitive form and
+// passes on the magnitude form. §22.2 (clean) passes on both (high-SNR
+// non-regression guard).
+// =============================================================================
+
+// Build a CONFIG_0 OFDM frame, place it at a known delay in an RX-sized
+// passband buffer, add AWGN calibrated to target channel SNR (SNR3k), and run
+// the REAL receive_byte acquisition. On return, out_delay / out_mean_H carry
+// the production receive_stats; out_expected_delay is the true frame offset.
+// cfo_hz injects a residual carrier offset via the production test hook
+// test_tx_carrier_offset (TX modulates at carrier+cfo_hz, RX mixes at carrier).
+static bool ofdm_ftr_roundtrip(double target_snr3k_db, double cfo_hz,
+                               unsigned int seed,
+                               int& out_delay, int& out_expected_delay,
+                               double& out_mean_H, int& out_Ngi_interp,
+                               int& out_sym_samples, const char* name)
+{
+	srand(seed);
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_0);   // WB BPSK, rate 1/16, 4-sym OFDM preamble
+
+	if (ts.current_configuration != CONFIG_0) {
+		test_fail(name, "load_configuration(CONFIG_0) did not take");
+		return false;
+	}
+
+	int interp     = ts.frequency_interpolation_rate;
+	int Nofdm      = ts.data_container.Nofdm;
+	int preamble_n = ts.data_container.preamble_nSymb;
+	int Nsymb      = ts.data_container.Nsymb;
+	int buffer_N   = ts.data_container.buffer_Nsymb;
+	out_sym_samples = Nofdm * interp;
+	out_Ngi_interp  = ts.data_container.Ngi * interp;
+
+	int nReal_data = ts.data_container.nBits - ts.ldpc.P;
+	int frame_bits = nReal_data - ts.outer_code_reserved_bits;
+	int frame_bytes = frame_bits / 8;
+
+	// --- TX: build a known frame into data_container.passband_data ---
+	for (int i = 0; i < frame_bytes; i++)
+		ts.data_container.data_byte[i] = (i * 37 + 11) & 0xFF;  // deterministic payload
+	test_tx_carrier_offset = cfo_hz;
+	ts.transmit_byte(ts.data_container.data_byte, frame_bytes,
+		ts.data_container.passband_data, SINGLE_MESSAGE);
+	test_tx_carrier_offset = 0.0;
+
+	int frame_samples = Nofdm * (Nsymb + preamble_n) * interp;
+
+	// --- Channel: zero an RX-sized buffer, place the frame at a known delay,
+	//     add AWGN calibrated to target SNR3k (channel SNR over `bandwidth`). ---
+	int rx_samples = Nofdm * buffer_N * interp;
+	std::vector<double> rx((size_t)rx_samples, 0.0);
+
+	// Known delay: place the preamble at symbol (preamble_n + 4) so pream_symb
+	// lands comfortably inside the production coarse-bounds window [4,160]
+	// (the bounds gate at telecom_system.cc rejects pream_symb < 4). Mirrors
+	// passband_test_EsN0's (preamble_nSymb+2)*Nofdm+delay convention with extra
+	// margin. Keep the whole frame inside the RX buffer.
+	int delay = (preamble_n + 4) * out_sym_samples;
+	if (delay + frame_samples > rx_samples)
+		delay = rx_samples - frame_samples;
+	if (delay < 0) delay = 0;
+	out_expected_delay = delay;
+
+	// Signal power for SNR calibration (same formula as passband_test_EsN0 /
+	// ack_pattern_detection_test).
+	double P_sig = 0.0;
+	for (int i = 0; i < frame_samples; i++)
+		P_sig += ts.data_container.passband_data[i] * ts.data_container.passband_data[i];
+	P_sig /= frame_samples;
+	double f_nyquist = ts.sampling_frequency / 2.0;
+	double sigma = sqrt(2.0 * P_sig * f_nyquist /
+		(pow(10.0, target_snr3k_db / 10.0) * ts.bandwidth));
+	double ampl_val = sigma / sqrt(2.0);
+
+	for (int i = 0; i < frame_samples; i++)
+		rx[(size_t)(delay + i)] = ts.data_container.passband_data[i];
+	for (int i = 0; i < rx_samples; i++)
+		rx[(size_t)i] += ampl_val * ts.awgn_channel.awgn_value_generator();
+
+	// --- RX: REAL acquisition (ofdm_forced_delay stays -1). ---
+	ts.ofdm_forced_delay = -1;
+	extern int g_verbose; int saved_v = g_verbose;
+	if (getenv("FTR_DEBUG")) g_verbose = 1;
+	st_receive_stats st = ts.receive_byte(rx.data(), ts.data_container.hd_decoded_data_byte);
+	g_verbose = saved_v;
+	if (getenv("FTR_DEBUG"))
+		printf("    [FTR-DBG] snr=%.1f cfo=%.0f seed=%u expected=%d delay=%d mean_H=%.3f "
+			"coarse=%.3f crc=%d sync_trials=%d frame_samples=%d rx_samples=%d\n",
+			target_snr3k_db, cfo_hz, seed, delay, st.delay, st.mean_H,
+			st.coarse_metric, st.crc, st.sync_trials, frame_samples, rx_samples);
+
+	out_delay  = st.delay;
+	out_mean_H = st.mean_H;
+	return true;
+}
+
+// Direct unit test of the FINE timer cl_ofdm::time_sync_preamble_with_metric,
+// isolated from the coarse / Moose / channel-estimate stages. Builds an OFDM
+// preamble at a known sub-symbol offset in a full-rate interpolated baseband
+// buffer, optionally with a residual CFO injected via the TX-carrier hook
+// (TX at carrier+cfo, RX mix at carrier), then calls with_metric (step=1,
+// location_to_return=0 = strongest peak) over a window straddling the
+// preamble. Returns the timing error |delay - true_offset| in interp samples
+// and the peak correlation. This is the variable the magnitude-form fix
+// changes: under CFO the phase-sensitive Re(conj(a)*b) drifts off the true
+// peak; the magnitude |P|²/(A²·R) holds.
+static bool ofdm_ftr_direct(double cfo_hz, int& out_delay,
+                            double& out_corr, int& out_Ngi_interp,
+                            const char* name)
+{
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_0);
+	if (ts.current_configuration != CONFIG_0) {
+		test_fail(name, "load_configuration(CONFIG_0) did not take");
+		return false;
+	}
+
+	int interp     = ts.frequency_interpolation_rate;
+	int Nofdm      = ts.data_container.Nofdm;
+	int Nc         = ts.data_container.Nc;
+	int preamble_n = ts.data_container.preamble_nSymb;
+	int sym_samp   = Nofdm * interp;
+	out_Ngi_interp = ts.data_container.Ngi * interp;
+
+	// Build the OFDM preamble (frequency-domain known values → time domain).
+	// ofdm.ofdm_preamble[].value is populated by load_configuration's
+	// preamble_configurator; mirror transmit_bit's preamble path: copy the
+	// known preamble values into preamble_data, symbol_mod each into the
+	// time-domain modulated buffer.
+	for (int i = 0; i < preamble_n; i++)
+		for (int j = 0; j < Nc; j++)
+			ts.data_container.preamble_data[i*Nc + j] =
+				ts.ofdm.ofdm_preamble[i*Nc + j].value;
+	for (int i = 0; i < preamble_n; i++)
+		ts.ofdm.symbol_mod(&ts.data_container.preamble_data[i*Nc],
+			&ts.data_container.preamble_symbol_modulated_data[i*Nofdm]);
+
+	// baseband → passband at carrier+cfo (CFO injection), preamble only.
+	int pre_pb_samples = Nofdm * preamble_n * interp;
+	std::vector<double> pre_pb((size_t)pre_pb_samples, 0.0);
+	long unsigned saved_pss = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(
+		ts.data_container.preamble_symbol_modulated_data,
+		Nofdm * preamble_n, pre_pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency + cfo_hz,
+		ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved_pss;
+
+	// Place the preamble at a known offset inside a passband buffer with
+	// silence padding (so with_metric can scan around the true peak).
+	int true_offset = 3 * sym_samp;                       // sub-buffer position
+	int trailing    = 6 * sym_samp;
+	int buf_pb = true_offset + pre_pb_samples + trailing;
+	std::vector<double> buf((size_t)buf_pb, 0.0);
+	for (int i = 0; i < pre_pb_samples; i++)
+		buf[(size_t)(true_offset + i)] = pre_pb[(size_t)i];
+
+	// passband → full-rate interpolated baseband (RX mix at carrier; the cfo
+	// remains as a residual rotation, exactly the with_metric input format).
+	std::vector<std::complex<double> > bb((size_t)buf_pb,
+		std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(buf.data(), buf_pb, bb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		1, &ts.ofdm.FIR_rx_time_sync);
+
+	// Call the FINE timer directly: step=1, strongest peak (ltr=0), over the
+	// whole buffer (size = buf_pb). nTrials_max=1 (only the best peak).
+	TimeSyncResult r = ts.ofdm.time_sync_preamble_with_metric(
+		bb.data(), buf_pb, interp, /*location_to_return=*/0, /*step=*/1,
+		/*nTrials_max=*/1);
+
+	out_delay = r.delay;
+	out_corr = r.correlation;
+	if (getenv("FTR_DEBUG"))
+		printf("    [FTR-DIRECT-DBG] cfo=%.0f true_off=%d delay=%d corr=%.4f Ngi=%d\n",
+			cfo_hz, true_offset, r.delay, out_corr, out_Ngi_interp);
+	return true;
+}
+
+// §22.0 DIRECT FAIL-BEFORE / PASS-AFTER on the fine timer in isolation.
+// Reference = the clean (no-CFO) detected peak position (a fixed value set by
+// the FIR group delay + GI alignment, ~7442 interp samples). Clean test: the
+// peak must be strong (corr near 1) — both forms find it (non-regression).
+// CFO test: the CFO-detected peak must stay within ±Ngi of the CLEAN peak.
+// Under CFO the phase-sensitive Re(conj(a)*b) drifts the peak off by ≫ Ngi
+// (often onto a spurious early window position); the magnitude form holds.
+static void test_ofdm_fine_timing_magnitude_direct_clean() {
+	const char* name = "ofdm_fine_timing_magnitude_direct_clean";
+	int delay = -1, Ngi_i = 0; double corr = 0.0;
+	if (!ofdm_ftr_direct(/*cfo=*/0.0, delay, corr, Ngi_i, name)) return;
+	printf("    [FTR-DIRECT clean] delay=%d corr=%.4f (±Ngi=%d)\n",
+		delay, corr, Ngi_i);
+	// Clean preamble → strong magnitude correlation (~1). This is the timing
+	// reference the CFO test compares against.
+	if (corr > 0.50)
+		test_pass(name);
+	else {
+		char b[160];
+		snprintf(b, sizeof(b),
+			"clean fine-timing regressed: corr=%.4f (<0.50) at delay=%d", corr, delay);
+		test_fail(name, b);
+	}
+}
+
+static void test_ofdm_fine_timing_magnitude_direct_cfo() {
+	const char* name = "ofdm_fine_timing_magnitude_direct_cfo";
+	const double CFO = 40.0;   // residual CFO that breaks the phase-sensitive form
+	int Ngi_i = 0; double corr_clean = 0.0, corr_cfo = 0.0;
+	int delay_clean = -1, delay_cfo = -1;
+	// Clean reference (same buffer geometry, zero CFO).
+	if (!ofdm_ftr_direct(/*cfo=*/0.0, delay_clean, corr_clean, Ngi_i, name)) return;
+	// CFO arm.
+	if (!ofdm_ftr_direct(CFO, delay_cfo, corr_cfo, Ngi_i, name)) return;
+
+	int drift = std::abs(delay_cfo - delay_clean);
+	printf("    [FTR-DIRECT cfo] cfo=%.0fHz delay_clean=%d delay_cfo=%d drift=%d "
+		"(±Ngi=%d) corr_cfo=%.4f\n",
+		CFO, delay_clean, delay_cfo, drift, Ngi_i, corr_cfo);
+	// Magnitude form: the CFO-detected peak stays within ±Ngi of the clean
+	// peak (CFO-invariant). Pre-fix (phase-sensitive) the peak drifts off by
+	// ≫ Ngi under this CFO.
+	if (drift <= Ngi_i)
+		test_pass(name);
+	else {
+		char b[200];
+		snprintf(b, sizeof(b),
+			"fine-timing peak drifted under %.0f Hz CFO: drift=%d > ±Ngi=%d "
+			"(delay_clean=%d delay_cfo=%d; pre-fix phase-sensitive form fails here)",
+			CFO, drift, Ngi_i, delay_clean, delay_cfo);
+		test_fail(name, b);
+	}
+}
+
+// §22.1 FAIL-BEFORE / PASS-AFTER: residual CFO + a reliable SNR. The SNR
+// (+8 dB SNR3k) is chosen high enough that the COARSE Schmidl-Cox detector
+// reliably acquires on every seed, so the FINE timer (the function under test)
+// is exercised every time and the metric-form difference — not coarse luck —
+// determines the outcome. Under the residual CFO the phase-sensitive fine
+// timer Re(conj(a)*b) mis-selects the sub-symbol peak → delay off by ≥1 symbol
+// → pilots misalign → mean_H collapses below the 0.30 SKIP-H gate. The
+// magnitude form |P|²/(A²·R) is CFO-invariant and holds timing → mean_H
+// survives.
+static void test_ofdm_fine_timing_magnitude_cfo_cliff() {
+	const char* name = "ofdm_fine_timing_magnitude_cfo_cliff";
+	const double SNR3K = 8.0;     // reliable-coarse SNR so the FINE timer is the variable
+	const double CFO   = 30.0;    // residual post-Moose CFO (Hz)
+	const int    NSEED = 10;
+	int coarse_ok = 0;            // seeds where the coarse detector reached the channel estimate
+	int passed = 0, worst_delay_err = 0; double min_mean_H = 1e30;
+
+	for (unsigned int s = 1; s <= (unsigned)NSEED; s++) {
+		int delay = -1, expected = -1, Ngi_i = 0, sym = 0;
+		double mean_H = -1.0;
+		if (!ofdm_ftr_roundtrip(SNR3K, CFO, 2000u + s,
+				delay, expected, mean_H, Ngi_i, sym, name))
+			return;  // ofdm_ftr_roundtrip already called test_fail
+		// Only seeds whose coarse detector reached the channel estimate
+		// (mean_H computed, i.e. >= 0) exercise the fine timer end-to-end.
+		if (mean_H < 0.0) continue;
+		coarse_ok++;
+		int derr = std::abs(delay - expected);
+		if (derr > worst_delay_err) worst_delay_err = derr;
+		if (mean_H < min_mean_H) min_mean_H = mean_H;
+		// PASS for a seed: fine timing within ±Ngi AND mean_H survives SKIP-H.
+		if (derr <= Ngi_i && mean_H >= 0.30)
+			passed++;
+	}
+
+	printf("    [FTR-MAG cfo] SNR3k=%.1f cfo=%.0fHz coarse_ok=%d/%d seeds_pass=%d "
+		"worst_delay_err=%d min_mean_H=%.3f\n",
+		SNR3K, CFO, coarse_ok, NSEED, passed, worst_delay_err,
+		(min_mean_H < 1e29 ? min_mean_H : -1.0));
+
+	// Require the vast majority of coarse-acquired seeds to recover fine timing
+	// + survive SKIP-H. Pre-fix (phase-sensitive) the fine timer mis-times most
+	// of these under CFO; post-fix (magnitude) it recovers them.
+	if (coarse_ok >= 6 && passed >= coarse_ok - 1)
+		test_pass(name);
+	else {
+		char b[220];
+		snprintf(b, sizeof(b),
+			"fine-timing recovery insufficient under CFO: %d/%d coarse-acquired seeds "
+			"passed (coarse_ok=%d, worst_delay_err=%d, min_mean_H=%.3f; pre-fix "
+			"phase-sensitive form mis-times here)",
+			passed, coarse_ok, coarse_ok, worst_delay_err,
+			(min_mean_H < 1e29 ? min_mean_H : -1.0));
+		test_fail(name, b);
+	}
+}
+
+// §22.2 High-SNR / zero-CFO non-regression: the magnitude metric must not
+// regress clean acquisition. Passes on BOTH pre- and post-fix.
+static void test_ofdm_fine_timing_magnitude_clean_no_regression() {
+	const char* name = "ofdm_fine_timing_magnitude_clean_no_regression";
+	const double SNR3K = 20.0;    // clean
+	int delay = -1, expected = -1, Ngi_i = 0, sym = 0;
+	double mean_H = -1.0;
+	if (!ofdm_ftr_roundtrip(SNR3K, /*cfo=*/0.0, /*seed=*/7u,
+			delay, expected, mean_H, Ngi_i, sym, name))
+		return;
+
+	int derr = std::abs(delay - expected);
+	printf("    [FTR-MAG clean] SNR3k=%.1f delay_err=%d (±Ngi=%d) mean_H=%.3f\n",
+		SNR3K, derr, Ngi_i, mean_H);
+
+	if (derr <= Ngi_i && mean_H >= 0.30)
+		test_pass(name);
+	else {
+		char b[200];
+		snprintf(b, sizeof(b),
+			"clean acquisition regressed: delay_err=%d (>±Ngi=%d) or mean_H=%.3f (<0.30)",
+			derr, Ngi_i, mean_H);
+		test_fail(name, b);
+	}
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5560,6 +5904,104 @@ int run_mfsk_ctrl_codec_tests() {
 	test_connect_suffix_byte_identical_when_off();
 	test_production_enhanced_connect_decodes();
 
+	// §22 OFDM FINE-timing phase-invariant magnitude metric regression
+	// (fix/ofdm-fine-timing-magnitude, ofdm-fine-timing-magnitude.md §4).
+	test_ofdm_fine_timing_magnitude_direct_clean();         // direct, non-regression
+	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (the keystone)
+	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
+	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
+
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
+	return g_failures;
+}
+
+// Fast focused runner: ONLY the §22 OFDM fine-timing magnitude regression
+// tests. Excludes the long stochastic MFSK detector sweeps that make the full
+// run_mfsk_ctrl_codec_tests() suite slow. Used by main.cc --test-ofdm-fine-timing.
+int run_ofdm_fine_timing_tests() {
+	g_failures = 0;
+	g_passes   = 0;
+	printf("=== OFDM fine-timing magnitude metric tests (§22) ===\n");
+	test_ofdm_fine_timing_magnitude_direct_clean();         // direct, non-regression
+	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (keystone)
+	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
+	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
+	printf("=== §22 done: %d passed, %d failed ===\n", g_passes, g_failures);
+	return g_failures;
+}
+
+// =============================================================================
+// LEVER P: PREAMBLE AMORTIZATION — INC-0 schedule + effective-length tests
+// (pure functions; no PHY bring-up). See
+// fact-documents/data-flow-preamble-amortization.md §1.
+// =============================================================================
+
+// §P.1 schedule predicate: anchor=FULL, tail=MINI, force_full=FULL.
+static void test_preamble_sched_predicate() {
+	const char* name = "preamble_sched_predicate";
+	const int full_n = 4;
+	// frame 0 -> FULL (anchor)
+	if (cl_telecom_system::preamble_sched_nsymb(0, false, full_n) != full_n) {
+		test_fail(name, "frame 0 (anchor) must be FULL"); return; }
+	// frames 1..24 -> MINI (1)
+	for (int i = 1; i <= 24; i++) {
+		if (cl_telecom_system::preamble_sched_nsymb(i, false, full_n) != 1) {
+			test_fail(name, "tail frame must be MINI=1"); return; }
+	}
+	// force_full overrides MINI on any tail index (retx / after-FAIL)
+	for (int i = 0; i <= 24; i++) {
+		if (cl_telecom_system::preamble_sched_nsymb(i, true, full_n) != full_n) {
+			test_fail(name, "force_full must be FULL on every index"); return; }
+	}
+	// degenerate full<1 clamps to 1, anchor still uses it
+	if (cl_telecom_system::preamble_sched_nsymb(0, false, 0) != 1) {
+		test_fail(name, "full<1 must clamp to 1"); return; }
+	test_pass(name);
+}
+
+// §P.2 TX==RX symmetry: the same (idx, force_full, full) yields identical
+// results from the single shared pure function (this is the no-wire-flag
+// guarantee — both sides call the identical predicate).
+static void test_preamble_sched_tx_rx_symmetry() {
+	const char* name = "preamble_sched_tx_rx_symmetry";
+	for (int full = 1; full <= 16; full++) {
+		for (int idx = 0; idx < 30; idx++) {
+			for (int ff = 0; ff <= 1; ff++) {
+				int a = cl_telecom_system::preamble_sched_nsymb(idx, ff != 0, full);
+				int b = cl_telecom_system::preamble_sched_nsymb(idx, ff != 0, full);
+				if (a != b) { test_fail(name, "non-deterministic"); return; }
+				// invariants: 1 <= result <= max(full,1)
+				int fmax = (full < 1) ? 1 : full;
+				if (a < 1 || a > fmax) { test_fail(name, "out of [1,full]"); return; }
+			}
+		}
+	}
+	test_pass(name);
+}
+
+// §P.3 batch preamble-symbol accounting: a 25-frame clean batch carries
+// FULL + 24*MINI preamble symbols (the amortization invariant the win rests
+// on). At FULL=4 that is 4 + 24 = 28 vs the legacy 25*4 = 100.
+static void test_preamble_sched_batch_accounting() {
+	const char* name = "preamble_sched_batch_accounting";
+	const int full_n = 4, nframes = 25;
+	int amortized = 0, legacy = 0;
+	for (int i = 0; i < nframes; i++) {
+		amortized += cl_telecom_system::preamble_sched_nsymb(i, false, full_n);
+		legacy    += full_n;
+	}
+	if (legacy != 100)    { test_fail(name, "legacy must be 100"); return; }
+	if (amortized != 28)  { test_fail(name, "amortized must be 28 (4 + 24*1)"); return; }
+	test_pass(name);
+}
+
+int run_preamble_sched_tests() {
+	g_failures = 0;
+	g_passes   = 0;
+	printf("=== LEVER P preamble-amortization schedule tests ===\n");
+	test_preamble_sched_predicate();
+	test_preamble_sched_tx_rx_symmetry();
+	test_preamble_sched_batch_accounting();
+	printf("=== LEVER P done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }

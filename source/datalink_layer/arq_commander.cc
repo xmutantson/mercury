@@ -22,7 +22,12 @@
 
 #include "datalink_layer/arq.h"
 #include "common/timing_log.h"
+#include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
+#include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
 #include <cstdlib>
+#include <cstdint>     // uint32_t/uint8_t (2-instance stepper deterministic payload)
+#include <vector>      // std::vector (2-instance stepper large-payload buffer)
+#include <algorithm>   // std::min (2-instance stepper RX drain)
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -422,7 +427,17 @@ void cl_arq_controller::process_messages_commander()
 					hail_detected = YES;
 					break;
 				}
-				msleep(50);
+				// §5.7-B8: pump-arm the poll body. On production this is the
+				// verbatim msleep(50) poll cadence. Under SIM_INPROC msleep(50)
+				// is a WALL pause that would BOTH freeze the shared virtual clock
+				// (so this loop's get_elapsed_time_ms() deadline could never
+				// advance) AND starve the peer's HAIL reply from flowing into RX
+				// before the next receive_hail_pattern() check. pumped_settle_wait
+				// instead pumps for 50ms of VIRTUAL time per poll: the shared clock
+				// advances toward the deadline and the peer's reply is consumed
+				// through rx_transfer. The outer hail_listen deadline + the
+				// receive_hail_pattern() early-exit are UNCHANGED.
+				pumped_settle_wait(50);
 			}
 
 			if(hail_detected == NO)
@@ -4578,7 +4593,11 @@ void cl_arq_controller::process_control_commander()
 				// frame shifts in. Flush with rx_mute to prevent capture thread
 				// race (same pattern as send_ack_pattern).
 				telecom_system->data_container.rx_mute = 1;
-				msleep(50); // RX_MUTE_GUARD_MS — let in-flight audio callbacks drain
+				// §5.7 ADD-ON1 (B5-class): gate-off the RX_MUTE drain guard — under
+				// SIM_INPROC there is no async audio-callback thread to drain, so the
+				// wait is moot (no-op); the circular_buf_reset below still fires.
+				// Verbatim msleep(50) on production / paced sim.
+				sim_inproc_rx_mute_settle(50); // RX_MUTE_GUARD_MS — let in-flight audio callbacks drain
 				circular_buf_reset(capture_buffer);
 				{
 					int buf_samples = telecom_system->data_container.Nofdm
@@ -4599,7 +4618,22 @@ void cl_arq_controller::process_control_commander()
 				{
 					int rx_frame = telecom_system->data_container.preamble_nSymb
 						+ telecom_system->get_active_nsymb();
-					telecom_system->data_container.frames_to_read = rx_frame + 10;
+					// §17.5/§17.8 (§5 cross-layer fix): SWITCH_ROLE turns THIS peer into
+					// the RESPONDER/receiver. data_configuration was (re)loaded at :4565
+					// for the return path and may be CONFIG_16 + big-block framing. The
+					// new receiver now awaits the new TX side's first DATA — at the
+					// big-block rung that DATA is a big-block spanning
+					// bigblock_rx_block_nsymb() (~64) OFDM symbols. Arming a STOCK frame
+					// (~13) here snapshots only the block HEAD: cw0 fresh -> byte-correct,
+					// cw1..cw7 decoded from stale ring -> deterministic garbage (the §17.2
+					// truncated-window signature, on the REVERSE-direction / bidirectional
+					// path the single-direction RSP test never exercised). Route through
+					// bigblock_block_ftr_or() so the window spans the whole block whenever
+					// the CFG16 big-block rung is live; off-rung (framing-off / M==MFSK /
+					// config != CONFIG_16) the helper returns rx_frame+10 UNCHANGED, so the
+					// stock per-frame turnaround is byte-identical.
+					telecom_system->data_container.frames_to_read =
+						bigblock_block_ftr_or(rx_frame + 10);
 				}
 				telecom_system->data_container.nUnder_processing_events = 0;
 				telecom_system->receive_stats.delay_of_last_decoded_message = -1;
@@ -4623,6 +4657,22 @@ void cl_arq_controller::process_control_commander()
 					messages_control_restore();
 					printf("[GEARSHIFT] SET_CONFIG ACKed, loaded config %d\n", data_configuration);
 					fflush(stdout);
+					// CFG16 CONTROL-ACK HOLD (cfg16-controlack-hold): mark the moment the
+					// climb SET_CONFIG to the big-block rung is CONFIRMED (RSP ACKed on the
+					// old PHY, both peers now loaded CFG16). After this the CMD must HOLD
+					// CFG16 to DATA without emitting another OFDM control frame (the top-
+					// config verification probe is skipped on the big-block rung; see the
+					// "at the top config" branch). This log lets a HW capture SEE the rung
+					// confirm independently of the DATA transition.
+					if(telecom_system != NULL
+						&& telecom_system->bigblock_framing_enabled
+						&& telecom_system->M != MOD_MFSK
+						&& data_configuration == CONFIG_16)
+					{
+						printf("[CFG16-HOLD] climb SET_CONFIG to CONFIG_16 (big-block rung) "
+							"CONFIRMED — holding; verification probe will be skipped\n");
+						fflush(stdout);
+					}
 
 					// Bug #60: PHY reinit race condition.
 					// When modulation changes (e.g. 8PSK->32QAM), both sides do a full
@@ -4637,7 +4687,17 @@ void cl_arq_controller::process_control_commander()
 						printf("[GEARSHIFT] Settling %dms for responder PHY reinit\n",
 						       phy_reinit_settle_us / 1000);
 						fflush(stdout);
-						usleep(phy_reinit_settle_us);
+						// §5.7 ADD-ON2: virtual-clock-ify the peer-PHY-reinit settle.
+						// On production / paced sim this is the verbatim
+						// usleep(phy_reinit_settle_us). Under SIM_INPROC a wall usleep
+						// would freeze the shared clock while the peer (same thread)
+						// reinits synchronously; route the settle through the pump so
+						// the shared clock advances. Same wait semantics (elapsed >=
+						// settle). Default phy_reinit_settle_us == 0 -> branch skipped.
+						if(arq_sim_inproc_active())
+							pumped_settle_wait(phy_reinit_settle_us / 1000);
+						else
+							usleep(phy_reinit_settle_us);
 					}
 
 					// Re-fill TX messages for the new config's message sizes
@@ -4841,7 +4901,65 @@ void cl_arq_controller::process_control_commander()
 						// Verify by sending SET_CONFIG(top) AT the top config. If the responder
 						// can decode it, the config works and we can finish. If not, the existing
 						// turboshift retry/BREAK recovery will settle at turboshift_last_good.
-						if(turboshift_last_good == current_configuration)
+						//
+						// CFG16 CONTROL-ACK HOLD (cfg16-controlack-hold, GAP1 root fix): the
+						// verification probe (the last else-branch below) re-sends
+						// SET_CONFIG(top) AS A SINGLE OFDM CONTROL FRAME on the live PHY. At
+						// the CFG16 big-block rung that control frame is STRUCTURALLY
+						// UNDECODABLE by the responder: the RSP's receive_byte routes ANY
+						// CFG16 OFDM audio into the block carver (telecom_system.cc:1024 /
+						// the arq_common.cc carve gate), so the single-frame SET_CONFIG is
+						// carved as a fake K-codeword block, never parsed as control, never
+						// ACKed -> [TURBO] RETRY -> CEILING -> [TX-BREAK] back to ROBUST_0,
+						// BEFORE any DATA batch is dispatched at CFG16 ([TXCW]=0). The
+						// big-block TX is innocent; the verification turnaround is the
+						// failure. NO control turnaround survives on the CFG16 OFDM PHY (any
+						// SET_CONFIG/ACK is a single frame the carver eats), so the ONLY way
+						// to HOLD CFG16 is to NOT emit a control frame here: skip the
+						// redundant probe and transition straight to DATA. CFG16 viability
+						// is then proven by the FIRST DATA big-block + its K-bit SACK -- the
+						// SAME SACK-trust authority finish_turbo_direction() already uses for
+						// the verified ceiling (sec 7.13.38, arq_common.cc:3958-3969) and that
+						// turbo_snr_truncates_probe() honors above (:4862-4874). GATED
+						// STRICTLY on the big-block rung being live; off the rung the
+						// verification handshake is UNCHANGED (byte-identical) -- at lower
+						// OFDM configs the SET_CONFIG control frame IS decoded normally (the
+						// carve gate is false below CONFIG_16).
+						bool bigblock_rung_live =
+							(telecom_system != NULL
+							 && telecom_system->bigblock_framing_enabled
+							 && telecom_system->M != MOD_MFSK
+							 && current_configuration == CONFIG_16);
+						if(bigblock_rung_live)
+						{
+							printf("[CFG16-HOLD] Top config %d on big-block rung -- skipping "
+								"undecodable OFDM verification probe, holding CFG16 (SACK-trust "
+								"ceiling; first DATA block + K-bit SACK proves viability)\n",
+								current_configuration);
+							fflush(stdout);
+							// Mirror finish_turbo_direction()'s skip-reverse terminal state
+							// (turbo done, ceiling pinned at the verified top), but transition
+							// DIRECTLY to DATA instead of emitting a SET_CONFIG control frame
+							// the responder cannot decode. No config change (top==current), so
+							// no PHY reload / SET_CONFIG announcement is needed.
+							turboshift_active = false;
+							turbo_supershift_announce_pending = false;
+							turbo_snr_ack_enabled = false;
+							turbo_received_snr = -99.0f;
+							turboshift_phase = TURBO_DONE;
+							turboshift_last_good = current_configuration;
+							supershift_proven_ceiling = current_configuration;
+							data_configuration = current_configuration;
+							negotiated_configuration = current_configuration;
+							reverse_configuration = current_configuration;
+							printf("[BBTX-GATE] CFG16 held -- transition TRANSMITTING_DATA "
+								"(ceiling=%d, proven_ceiling=%d); next send_batch routes a DATA "
+								"big-block to bigblock_send_one_block\n",
+								turboshift_last_good, supershift_proven_ceiling);
+							fflush(stdout);
+							this->connection_status = TRANSMITTING_DATA;
+						}
+						else if(turboshift_last_good == current_configuration)
 						{
 							// Second pass: verification probe ACKed. Top config works.
 							printf("[TURBO] Top config %d verified, finishing\n", current_configuration);
@@ -5577,6 +5695,20 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	// (This is the standalone-C2 sibling fix that the combined C3 dropped — that
 	// omission IS the dormancy. OFDM CONFIG_0..16 is unchanged: Axis-2 runs.)
 	if(is_robust_config(current_configuration)) return;
+	// BIG-BLOCK RUNG: data_batch_size is GEOMETRY-LOCKED to K (= one acquisition's
+	// codeword count), NOT link-adaptive (fact-doc data-flow-bigblock-arq-unit.md
+	// §16.5, INV-5b). The gearshift CFG16 transition elects data_batch_size=K via the
+	// shared election body (arq_common.cc load_configuration tail). If Axis-2 ran here
+	// it would step K=8 -> 13 after AXIS2_UP_GOOD_RUN clean batches and push the RSP to
+	// match via SET_LINK_PARAMS, moving BOTH peers off K while the RX carve still emits
+	// a K=8 cw_ok bitmap -> all_ones (1<<13)-1 != 0xFF -> bug #9 re-diverges MID-SESSION.
+	// Suppress the whole controller at the bigblock rung (same shape as the robust guard
+	// above) so K stays geometry-locked. This is NOT a threshold tune — the rung's batch
+	// is a PHY fact, so the adaptive controller has no valid axis to act on there. Every
+	// other OFDM config (CONFIG_0..15, framing off) is UNCHANGED: Axis-2 runs.
+	if(telecom_system != NULL
+		&& telecom_system->bigblock_framing_enabled
+		&& current_configuration == CONFIG_16) return;
 	axis2_evaluations++;
 	if(batch_size_observed <= 0) return;  // defensive — no observation
 	if(rx_count < 0) rx_count = 0;
@@ -9260,6 +9392,1541 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 
 	printf("[TEST-R0CMP] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// SIM_INPROC feasibility prototype — single-process in-process self-loopback.
+// See fact-documents/single-process-sim-refactor.md.
+//
+// Proves the make-or-break risk of the single-process sim refactor: that the
+// TX-path blocking spin-loops (ptt_busy_wait + drain_playback_wait, the two
+// shapes that recur ~24x) become STEP-PUMPABLE under a single-thread stepper
+// with NO concurrent drainer thread, while the spin-EXIT timing is IDENTICAL
+// to the two-process paced sim (clock past delay / ring drained — never early).
+// ===========================================================================
+
+// The pump-setter is defined in arq_common.cc next to the spin helpers. The
+// two production spin-loop helpers (ptt_busy_wait / drain_playback_wait) are
+// now declared in arq.h, so they are reachable here AND inside send_batch().
+// SIM_INPROC drives the REAL send_batch() (arq_common.cc) end-to-end rather
+// than re-invoking the helpers from a synthetic sequence — the helpers run
+// inside production code, proving the actual send-path waits are step-pumpable.
+typedef void (*sim_inproc_pump_fn)(void* ctx);
+extern void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx);
+
+namespace {
+// Step-pump context: the single-thread stepper's view of the loopback channel.
+// One rx_transfer-sized "symbol" of channel time per pump step, mirroring the
+// capture-prep thread's symbol_period reads (audioio.c:1279,1295).
+struct SimInprocPumpCtx {
+	int    symbol_period_samples = 0;  // == Nofdm * interpolation_rate
+	double* scratch = nullptr;         // symbol_period_samples doubles
+	long long pump_calls = 0;
+	long long looped_samples = 0;      // playback bytes looped back into capture
+	long long idle_samples = 0;        // silence injected when playback empty
+	long long clock_samples = 0;       // total samples advanced via rx_transfer
+};
+
+// The step-pump. Invoked from INSIDE ptt_busy_wait / drain_playback_wait when
+// installed. Does, per call, exactly what the two-process sibling threads do:
+//   1. Loopback-drain: move all of playback_buffer into capture_buffer.
+//   2. Clock-advance:  drain capture_buffer in symbol-sized rx_transfer reads,
+//      which calls sim_clock_add_samples(len) — the SAME accounting as the
+//      capture-prep thread (audioio.c:1295 -> 1689). The virtual clock thus
+//      advances by exactly the samples that flowed.
+//   3. Idle-fill: if there was nothing to loop AND nothing in capture, inject
+//      one symbol of silence so the clock still advances during the PTT
+//      pre-key delay (the two-process RX bridge always delivers channel audio,
+//      so virtual time keeps ticking even before any TX). Without this the
+//      ptt_busy_wait before the first tx_transfer could never advance time.
+//
+// This NEVER changes a wait's exit predicate — it only makes the existing
+// predicate eventually true (clock crosses delay / playback empties).
+void sim_inproc_pump(void* ctxv)
+{
+	SimInprocPumpCtx* ctx = static_cast<SimInprocPumpCtx*>(ctxv);
+	const int sp = ctx->symbol_period_samples;
+	if (sp <= 0 || ctx->scratch == nullptr) return;
+	const size_t sp_bytes = (size_t)sp * sizeof(double);
+
+	ctx->pump_calls++;
+
+	// (1) Loopback-drain: playback -> capture, one symbol at a time, only
+	// while capture has room (mirrors the RX-bridge backpressure guard).
+	bool moved = false;
+	while (size_buffer(playback_buffer) >= sp_bytes &&
+	       circular_buf_free_size(capture_buffer) >= sp_bytes)
+	{
+		read_buffer(playback_buffer, (uint8_t*)ctx->scratch, sp_bytes);
+		write_buffer(capture_buffer, (uint8_t*)ctx->scratch, sp_bytes);
+		ctx->looped_samples += sp;
+		moved = true;
+	}
+
+	// (2) Clock-advance: drain capture via rx_transfer (advances sim clock).
+	bool drained = false;
+	while (size_buffer(capture_buffer) >= sp_bytes)
+	{
+		rx_transfer(ctx->scratch, sp);   // -> sim_clock_add_samples(sp)
+		ctx->clock_samples += sp;
+		drained = true;
+	}
+
+	// (3) Idle-fill: nothing moved/drained -> advance one symbol of silence so
+	// the PTT pre-key delay can elapse (no playback yet, empty capture).
+	if (!moved && !drained)
+	{
+		memset(ctx->scratch, 0, sp_bytes);
+		write_buffer(capture_buffer, (uint8_t*)ctx->scratch, sp_bytes);
+		rx_transfer(ctx->scratch, sp);
+		ctx->idle_samples += sp;
+		ctx->clock_samples += sp;
+	}
+}
+}  // namespace
+
+int cl_arq_controller::test_sim_inproc()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-SIM-INPROC] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	printf("[TEST-SIM-INPROC] single-instance in-process self-loopback "
+	       "(no audio device, no bridge/prep threads, no TCP, no relay)\n");
+	fflush(stdout);
+
+	// --- 1. PHY + ARQ setup via the REAL production load_configuration ---
+	// INCREMENT step (3) (single-process-sim-refactor.md §5.6 step 3): drive the
+	// REAL production send path end-to-end, not the prior synthetic 3-call
+	// sequence. We therefore must bring up the SAME ARQ state the production
+	// commander has before send_batch(): message buffers (messages_tx[],
+	// messages_batch_tx[], message_TxRx_byte_buffer), max_header_length,
+	// nMessages, data_container PHY + passband_delayed_data, etc.
+	//
+	// cl_arq_controller::load_configuration(cfg, FULL, NO) does ALL of that
+	// (set_max_buffer_length + set_nMessages + init_messages_buffers at
+	// arq_common.cc:1455/1456/1659) AND calls telecom_system->load_configuration
+	// internally (arq_common.cc:1421) — WITHOUT touching the TCP sockets (those
+	// are only init()'d in cl_arq_controller::init(), which we deliberately do
+	// NOT call: SIM_INPROC binds NO socket). The ctor seated
+	// current_configuration=CONFIG_0 (arq_common.cc:393), and ROBUST_0 (100) !=
+	// CONFIG_0, so load_configuration proceeds rather than skipping.
+	//
+	// ROBUST_0 (MFSK) is the smallest, fastest-to-emit frame; it exercises the
+	// same PTT/TX/drain spin sites send_batch() runs for every OFDM config.
+	robust_enabled     = YES;
+	narrowband_enabled = NO;
+	telecom_system->narrowband_enabled = NO;
+	load_configuration(ROBUST_0, FULL, NO);   // ARQ-side: buffers + PHY, no TCP
+
+	cl_data_container* dc = &telecom_system->data_container;
+	int active_nsymb = telecom_system->get_active_nsymb();
+	int symbol_period = dc->Nofdm * dc->interpolation_rate;
+	int frame_output_size = dc->Nofdm * dc->interpolation_rate *
+	                        (active_nsymb + dc->preamble_nSymb);
+	check(symbol_period > 0, "A0 PHY config loaded (symbol_period > 0)");
+	check(frame_output_size > 0, "A1 frame output size > 0");
+	check(current_configuration == ROBUST_0, "A1b ARQ load_configuration set current_configuration=ROBUST_0");
+	check(message_TxRx_byte_buffer != nullptr && messages_batch_tx != nullptr && messages_tx != nullptr,
+	      "A1c ARQ message buffers allocated (init_messages_buffers ran, no TCP)");
+	printf("[TEST-SIM-INPROC] symbol_period=%d frame_output=%d active_nsymb=%d "
+	       "preamble_nSymb=%d max_header_length=%d nMessages=%d\n", symbol_period,
+	       frame_output_size, active_nsymb, dc->preamble_nSymb, max_header_length,
+	       nMessages);
+	fflush(stdout);
+
+	// passband_delayed_data + capture_prep_mutex are normally set up by
+	// audioio_init (audioio.c:1719) and the PHY load. send_batch() locks
+	// capture_prep_mutex and zeroes passband_delayed_data; the PHY load
+	// allocated passband_delayed_data (data_container.cc:170). The mutex is a
+	// device-init artifact SIM_INPROC skips — create it so the production
+	// send_batch() MUTEX_LOCK/UNLOCK are real (uncontended: single thread).
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if (capture_prep_mutex == NULL)
+	{
+		capture_prep_mutex = CreateMutex(NULL, FALSE, NULL);
+		created_mutex = true;
+	}
+#endif
+
+	// --- 2. Audio ring buffers WITHOUT any device / bridge / prep thread ---
+	// These are the same globals tx_transfer/rx_transfer use; we create them
+	// here directly so the modem talks to ITSELF through them. No threads.
+	bool created_buffers = false;
+	if (capture_buffer == nullptr || playback_buffer == nullptr)
+	{
+		uint8_t* cap = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		uint8_t* play = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		capture_buffer  = circular_buf_init(cap,  AUDIO_PAYLOAD_BUFFER_SIZE);
+		playback_buffer = circular_buf_init(play, AUDIO_PAYLOAD_BUFFER_SIZE);
+		created_buffers = true;
+	}
+	clear_buffer(capture_buffer);
+	clear_buffer(playback_buffer);
+	check(capture_buffer != nullptr && playback_buffer != nullptr,
+	      "A2 audio ring buffers ready (no device, no threads)");
+
+	// --- 3. Engage the virtual clock (the -x sim time source) ---
+	sim_clock_set_enabled(1);
+	check(sim_clock_enabled() != 0, "A3 virtual clock engaged");
+
+	// --- 4. Install the step-pump (the inline single-thread drainer) ---
+	SimInprocPumpCtx pump_ctx;
+	pump_ctx.symbol_period_samples = symbol_period;
+	pump_ctx.scratch = (double*)malloc((size_t)symbol_period * sizeof(double) * 2);
+	arq_set_sim_inproc_pump(sim_inproc_pump, &pump_ctx);
+	check(pump_ctx.scratch != nullptr, "A4 step-pump installed");
+
+	// Non-zero PTT delays so the two PTT waits inside send_batch() MUST advance
+	// the virtual clock to exit — this is what proves the clock-advance pump
+	// works (delay=0 would pass trivially without ever pumping). 100/200 ms ==
+	// ini_parser defaults. send_batch() reads ptt_on_delay_ms / ptt_off_delay_ms.
+	ptt_on_delay_ms  = 100;
+	ptt_off_delay_ms = 200;
+
+	// --- 5. Stage a REAL DATA_SHORT batch into the production batch array ---
+	// This is exactly how the production commander stages a frame before
+	// send_batch() (arq_commander.cc:1323-1341): set the messages_batch_tx[i]
+	// fields + message_batch_counter_tx, then call send_batch(). The frame's
+	// .data points at a pre-allocated buffer (messages_tx[0].data, allocated by
+	// init_messages_buffers) — messages_batch_tx[i].data is NULL at init and in
+	// production inherits a valid pointer via a struct-copy (arq_common.cc:1314
+	// comment); we mirror that by aiming it at messages_tx[0].data.
+	{
+		const char* msg = "MERCURY";
+		int nb = (int)strlen(msg);
+		messages_batch_tx[0].type   = DATA_SHORT;
+		messages_batch_tx[0].length = nb;
+		messages_batch_tx[0].id     = 0;
+		messages_batch_tx[0].nResends = nResends;
+		messages_batch_tx[0].ack_timeout = ack_timeout_data;
+		messages_batch_tx[0].status = ADDED_TO_BATCH_BUFFER;
+		messages_batch_tx[0].sequence_number = 0;
+		messages_batch_tx[0].batch_seq_id = 0;
+		messages_batch_tx[0].data = messages_tx[0].data;  // real allocated buffer
+		for(int i=0;i<nb;i++) messages_batch_tx[0].data[i] = msg[i];
+		// Keep messages_tx[0] coherent so send_batch()'s post-TX ack bookkeeping
+		// (arq_common.cc:4020-4033, indexed by .id) writes into a real slot.
+		messages_tx[0].status = PENDING_ACK;
+		message_batch_counter_tx = 1;
+		connection_id = 1;
+	}
+	check(message_batch_counter_tx == 1, "A5 DATA_SHORT batch staged into messages_batch_tx[]");
+
+	// --- 6. Run the REAL production send_batch() inline (no concurrent thread) ---
+	// send_batch() (arq_common.cc:3629) is the EXACT production send core. It
+	// keys PTT, frames + FIR-filters the batch, runs ptt_busy_wait(on),
+	// tx_transfers each frame, drain_playback_wait()s the ring, resets the
+	// capture ring, then ptt_busy_wait(off) + ptt_off. ALL THREE spin sites
+	// (ptt_busy_wait@3930, drain_playback_wait@3967, ptt_busy_wait@3999) now
+	// run inline, step-pumped by the installed pump. If ANY of them failed to
+	// become step-pumpable, send_batch() would never return (hard deadlock) —
+	// so a clean return is itself the proof of inline drive through production
+	// code. We bracket the call with virtual-clock snapshots to confirm the
+	// waits did NOT exit early (total >= on + airtime + off) and the clock did
+	// not run away.
+	uint64_t t_start = sim_clock_now_samples();
+	long long looped_before = pump_ctx.looped_samples;
+
+	send_batch();   // REAL production send-path core, driven inline.
+
+	uint64_t t_end = sim_clock_now_samples();
+	long long looped_in_batch = pump_ctx.looped_samples - looped_before;
+
+	// FIDELITY: a clean return proves no deadlock at any of the 3 spin sites.
+	check(true, "B1 send_batch() returned (all 3 internal spin sites stepped, NO deadlock)");
+	// The playback ring was fully drained by the inline pump (drain_playback_wait
+	// exited at size_buffer(playback)==0 — its UNCHANGED exit predicate).
+	check(size_buffer(playback_buffer) == 0,
+	      "B2 playback ring EMPTY after send_batch (drain_playback_wait exit predicate held)");
+	// send_batch() consumed + reset the staged batch (message_batch_counter_tx
+	// is cleared at arq_common.cc:4048 only after the full PTT/drain sequence).
+	check(message_batch_counter_tx == 0,
+	      "B3 send_batch consumed the batch (reached post-drain bookkeeping)");
+	// The frame's audio samples looped back through the RX boundary inside the
+	// real drain — i.e. real channel time, not a synthetic poke.
+	check(looped_in_batch >= (long long)frame_output_size,
+	      "B4 the batch's frame samples looped back through the RX boundary (real airtime)");
+
+	// --- 7. Timing fidelity: the total virtual time send_batch() spanned is at
+	// least on-delay + frame airtime + off-delay — NOT short-circuited. This is
+	// the SAME analytic floor the synthetic prototype proved, now measured
+	// across the REAL send_batch() body. (send_batch on ROBUST_0 emits the one
+	// staged frame; airtime == frame_output_size samples.)
+	double total_virtual_ms = (t_end - t_start) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+	double frame_airtime_ms = frame_output_size * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+	double expected_min_ms  = (double)ptt_on_delay_ms + (double)ptt_off_delay_ms
+	                        + frame_airtime_ms;
+	printf("[TEST-SIM-INPROC] [REAL send_batch] virtual-time accounting: total=%.1fms "
+	       "expected_min=%.1fms (on=%d off=%d frame_airtime=%.1fms) clk %llu->%llu\n",
+	       total_virtual_ms, expected_min_ms, ptt_on_delay_ms, ptt_off_delay_ms,
+	       frame_airtime_ms, (unsigned long long)t_start, (unsigned long long)t_end);
+	printf("[TEST-SIM-INPROC] pump stats: calls=%lld looped=%lld idle=%lld "
+	       "clock_samples=%lld looped_in_batch=%lld\n", pump_ctx.pump_calls,
+	       pump_ctx.looped_samples, pump_ctx.idle_samples, pump_ctx.clock_samples,
+	       looped_in_batch);
+	fflush(stdout);
+	// Allow one symbol of poll overshoot on each of the two PTT waits (the
+	// pump advances in whole symbols — same quantization the prep thread has),
+	// plus headroom for the start-of-batch capture-ring-reset idle pumping.
+	double overshoot_tol_ms = 2.0 * symbol_period * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ
+	                        + 1.0;
+	check(total_virtual_ms >= expected_min_ms - 0.001,
+	      "B6 total virtual time >= on+airtime+off (send_batch waits did NOT exit early)");
+	check(total_virtual_ms <= expected_min_ms + overshoot_tol_ms + frame_airtime_ms,
+	      "B7 total virtual time bounded (no runaway clock; overshoot < 1 symbol/wait)");
+
+	// --- 7b. Settle-wait FIX validation (single-process-sim-refactor.md §7) ---
+	// The B1-B8 settle-wait fixes are single-instance-testable in two classes:
+	//
+	//  (i) GATE-OFF (B5 / ADD-ON1): sim_inproc_rx_mute_settle() must be a no-op
+	//      under SIM_INPROC (the pump is installed -> no async audio thread to
+	//      drain) AND the instantaneous circular_buf_reset() that follows it in
+	//      every caller must still fire. We exercise the helper directly here
+	//      (the pump is still installed at this point), measure that it consumes
+	//      ~0 wall time, then verify a real circular_buf_reset() empties the ring.
+	//
+	//  (ii) VIRTUAL-CLOCK-IFY (B1-B4/B7/ADD-ON2): pumped_settle_wait(N) must
+	//      advance the SHARED virtual clock by >= N ms (its exit predicate held,
+	//      not exited early) when the pump is installed — the property that lets
+	//      a peer instance see time pass during the wait. (The B1-B4/B7 CALL
+	//      SITES themselves are responder/peer-side ACK/HAIL paths a single
+	//      instance does not reach — those are audit-only this increment, §6.5 —
+	//      but the shared mechanism is validated here.)
+	{
+		// (i) gate-off no-op under SIM_INPROC + reset still fires.
+		// RX_MUTE_GUARD_MS is file-local to arq_common.cc; its value is 50ms.
+		const int rx_mute_guard_ms = 50;
+		uint64_t g0 = sim_clock_now_samples();
+		auto wall0 = std::chrono::steady_clock::now();
+		sim_inproc_rx_mute_settle(rx_mute_guard_ms);  // pump installed -> no-op
+		auto wall1 = std::chrono::steady_clock::now();
+		uint64_t g1 = sim_clock_now_samples();
+		double gate_wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+		check(gate_wall_ms < (double)rx_mute_guard_ms,
+		      "G1 sim_inproc_rx_mute_settle is a NO-OP under SIM_INPROC (no 50ms wall pause)");
+		check(g1 == g0,
+		      "G1b gate-off does not touch the virtual clock (drain is moot in-process)");
+		// circular_buf_reset still fires: stage one symbol, reset, confirm empty.
+		{
+			memset(pump_ctx.scratch, 0, (size_t)symbol_period * sizeof(double));
+			write_buffer(capture_buffer, (uint8_t*)pump_ctx.scratch,
+			             (size_t)symbol_period * sizeof(double));
+			bool had_data = size_buffer(capture_buffer) > 0;
+			circular_buf_reset(capture_buffer);
+			check(had_data && size_buffer(capture_buffer) == 0,
+			      "G2 circular_buf_reset still empties the capture ring after the gated no-op");
+		}
+
+		// (ii) pumped_settle_wait advances the shared virtual clock by >= N ms.
+		const int settle_ms = 60;
+		uint64_t p0 = sim_clock_now_samples();
+		pumped_settle_wait(settle_ms);   // pump installed -> step-pumped wait
+		uint64_t p1 = sim_clock_now_samples();
+		double advanced_ms = (p1 - p0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+		printf("[TEST-SIM-INPROC] pumped_settle_wait(%dms) advanced virtual clock %.1fms\n",
+		       settle_ms, advanced_ms);
+		fflush(stdout);
+		check(advanced_ms >= (double)settle_ms - 0.001,
+		      "G3 pumped_settle_wait advances the SHARED clock >= wait_ms (exit predicate held, no early exit)");
+		// Bounded: one symbol of poll overshoot (same quantization as the pump).
+		double settle_tol_ms = symbol_period * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ + 1.0;
+		check(advanced_ms <= (double)settle_ms + settle_tol_ms,
+		      "G4 pumped_settle_wait does not over-advance (overshoot < 1 symbol)");
+	}
+
+	// --- 8. Teardown: uninstall pump, leave globals as we found them ---
+	arq_set_sim_inproc_pump(nullptr, nullptr);
+	if(pump_ctx.scratch) free(pump_ctx.scratch);
+	if(created_buffers)
+	{
+		free(capture_buffer->buffer);
+		circular_buf_free(capture_buffer);
+		capture_buffer = nullptr;
+		free(playback_buffer->buffer);
+		circular_buf_free(playback_buffer);
+		playback_buffer = nullptr;
+	}
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{
+		CloseHandle(capture_prep_mutex);
+		capture_prep_mutex = NULL;
+	}
+#endif
+	sim_clock_set_enabled(0);
+
+	printf("[TEST-SIM-INPROC] %s (%d failure%s) — inline cycle %s\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s",
+	       failed == 0 ? "COMPLETED with NO concurrent drainer (CLEAN_NO_DRAINER)"
+	                   : "did NOT complete cleanly");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// 2-INSTANCE SIM_INPROC stepper (single-process-sim-refactor.md §10.5).
+//
+// Two full modems (A=COMMANDER, B=RESPONDER) + an in-process scalar-AWGN
+// channel per direction, driven by a SINGLE-THREAD lockstep loop on a SHARED
+// virtual clock. NO audio device, NO bridge/prep threads, NO TCP, NO relay.
+// Generalizes the proven single-instance Stage-2 stepper (test_sim_inproc) to
+// a real peer: the peer-dependent settle-waits (B4 CONNECT-suffix, B7 HAIL/
+// CONNECT self-detect race, B8 HAIL RX-poll) are now exercised against an
+// actual responder.
+// ===========================================================================
+namespace {
+
+// Per-instance audio transport (single-process-sim-refactor.md §10.3). Two
+// instances own genuinely independent rings; the stepper swaps the audioio.c
+// globals to the ACTIVE instance's rings before driving it (single thread → the
+// swap precedes every consumer). Production never swaps.
+struct AudioCtx {
+	cbuf_handle_t cap  = nullptr;
+	cbuf_handle_t play = nullptr;
+#if defined(_WIN32)
+	HANDLE        mutex = NULL;
+#else
+	pthread_mutex_t mutex;
+#endif
+	uint8_t* cap_mem  = nullptr;
+	uint8_t* play_mem = nullptr;
+
+	void alloc() {
+		cap_mem  = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		play_mem = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		cap  = circular_buf_init(cap_mem,  AUDIO_PAYLOAD_BUFFER_SIZE);
+		play = circular_buf_init(play_mem, AUDIO_PAYLOAD_BUFFER_SIZE);
+		clear_buffer(cap);
+		clear_buffer(play);
+#if defined(_WIN32)
+		mutex = CreateMutex(NULL, FALSE, NULL);
+#else
+		pthread_mutex_init(&mutex, NULL);
+#endif
+	}
+	void free_all() {
+		if(cap)  { free(cap->buffer);  circular_buf_free(cap);  cap = nullptr; }
+		if(play) { free(play->buffer); circular_buf_free(play); play = nullptr; }
+#if defined(_WIN32)
+		if(mutex) { CloseHandle(mutex); mutex = NULL; }
+#else
+		pthread_mutex_destroy(&mutex);
+#endif
+	}
+};
+
+// One full modem instance for the 2-instance stepper.
+struct MercuryInstance {
+	cl_telecom_system ts;
+	cl_arq_controller arq;
+	AudioCtx          audio;
+	const char*       tag = "?";
+
+	void wire() { arq.telecom_system = &ts; }
+};
+
+// The 2-instance step-pump context. The stepper sets {tx, rx, channels} before
+// driving the active (tx) instance. The pump (installed via the SAME
+// arq_set_sim_inproc_pump hook the single-instance stepper uses) is invoked from
+// inside tx's blocking waits (ptt_busy_wait / drain_playback_wait / pacing
+// floor). Per call it:
+//   1. Drains tx.play -> tx->rx channel -> rx.cap (the real tx->rx handoff),
+//      advancing the SHARED clock; idle-fills one symbol of silence when tx has
+//      nothing (the two-process TX bridge always sends silence on idle).
+//   2. Runs rx's prep-pull (rx.cap -> rx.passband_delayed_data).
+//   3. CO-ROUTINE INTERLEAVE: at depth 0, drives rx->process_main() ONCE so the
+//      PEER can react to the audio it just received WHILE tx is still blocked in
+//      its wait (mirrors the two-process concurrency where rx's prep+ARQ run
+//      while tx transmits). Without this, tx's long PTT/response waits would
+//      pump tens of silence symbols into rx and BURY the just-arrived beacon
+//      before rx ever scanned it (the §10.5 single-thread hazard). A depth guard
+//      (g_sim2_depth) bounds reentrancy to ONE peer level: when rx's own waits
+//      fire the pump (depth 1), it only feeds rx->tx + advances the clock (so
+//      rx's reply reaches tx's capture) — it does NOT recurse into tx again.
+// Exit predicates are UNCHANGED (drain exits at tx.play empty; ptt exits at
+// clock past delay) — the pump only makes them eventually true.
+struct SimInproc2Ctx {
+	MercuryInstance* tx = nullptr;     // active instance (drains its playback)
+	MercuryInstance* rx = nullptr;     // peer (receives the channel output)
+	cl_sim_awgn*     ch_tx2rx = nullptr; // tx -> rx direction
+	cl_sim_awgn*     ch_rx2tx = nullptr; // rx -> tx direction (peer-drive reply)
+	// Per-direction WIRE rings (single-process-sim §10.5). Drained TX samples
+	// (post-channel) are buffered here, NOT written straight to the receiver's
+	// capture. The receiver is fed from its incoming wire only at controlled
+	// points (its own drive turn / its listen polls), so a sender's post-TX
+	// capture FLUSH (send_*_pattern self-echo reset) cannot wipe a reply that the
+	// peer emitted while the sender was still transmitting. wire_t2r is the
+	// tx->rx wire, wire_r2t the rx->tx wire (re-pointed each half-step).
+	cl_sim_awgn*     dummy = nullptr;
+	cbuf_handle_t    wire_t2r = nullptr;
+	cbuf_handle_t    wire_r2t = nullptr;
+	double* scratch = nullptr;         // >= 3 symbols of doubles
+	int    sp_max = 0;                 // max symbol_period across both instances
+	long long pump_calls = 0;
+	long long clock_samples = 0;
+	long long looped_samples = 0;      // real airtime moved tx->rx
+	long long idle_samples = 0;
+};
+
+// Reentrancy depth for the co-routine peer-drive (§10.5). 0 = top (tx) level;
+// 1 = inside a peer rx->process_main() drive (do not recurse further).
+static int g_sim2_depth = 0;
+
+// Reentrancy guard for the per-FRAME RX decode-drive inside sim2_deliver_from_wire
+// (wf-sim-controlloop OFDM fix, bounded follow-on). >0 = a decode-drive is already
+// on the stack; a nested deliver (pump-fired from dst's pacing wait) must not
+// recurse the drive again.
+static int g_sim2_decode_drive_depth = 0;
+
+void prep_pull_inline(MercuryInstance* inst, double* buffer_temp);  // fwd decl
+void sim2_activate(MercuryInstance* m);                             // fwd decl
+
+// Drain src's playback through the channel into the src->dst WIRE (whole symbols),
+// advancing the shared clock by the drained airtime; idle-fills ONE symbol of
+// silence into the wire when src has nothing (so the clock keeps ticking and the
+// receiver sees the noise floor). Returns true if real (non-silence) signal moved.
+// The wire decouples TX-drain from RX-feed so a sender's post-TX capture flush
+// cannot wipe a reply in flight (single-process-sim §10.5).
+bool sim2_drain_to_wire(MercuryInstance* src, cl_sim_awgn* ch, cbuf_handle_t wire,
+                        SimInproc2Ctx* c)
+{
+	cl_data_container* sdc = &src->ts.data_container;
+	int sp = sdc->Nofdm * sdc->interpolation_rate;
+	if (sp <= 0) return false;
+	size_t sp_bytes = (size_t)sp * sizeof(double);
+	bool moved = false;
+	while (size_buffer(src->audio.play) >= sp_bytes &&
+	       circular_buf_free_size(wire) >= sp_bytes)
+	{
+		read_buffer(src->audio.play, (uint8_t*)c->scratch, sp_bytes);
+		if (ch) ch->process(c->scratch, (size_t)sp);
+		write_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+		c->looped_samples += sp;
+		c->clock_samples  += sp;
+		sim_clock_add_samples((uint64_t)sp);
+		moved = true;
+	}
+	if (!moved)
+	{
+		if (circular_buf_free_size(wire) >= sp_bytes)
+		{
+			memset(c->scratch, 0, sp_bytes);
+			if (ch) ch->process(c->scratch, (size_t)sp);
+			write_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+		}
+		c->idle_samples  += sp;
+		c->clock_samples += sp;
+		sim_clock_add_samples((uint64_t)sp);
+	}
+	return moved;
+}
+
+// Deliver pending WIRE samples into dst's capture (respecting free space) then
+// run dst's prep-pull (wire -> dst.cap -> dst.passband_delayed_data). Called for
+// the RECEIVER at controlled points so a sender's flush never races a reply.
+//
+// SINGLE-SYMBOL PACING (wf-sim-controlloop OFDM fix): move EXACTLY ONE symbol
+// wire->cap, then prep that one symbol into the ring, per loop iteration. The
+// old form drained the WHOLE wire into cap and ran prep_pull_inline ONCE, so a
+// VARIABLE run of idle-silence symbols (sim2_drain_to_wire idle-fills one
+// silence symbol per pump but drains the WHOLE play buffer when sending) plus
+// the entire data frame advanced the RX ring_write_index by a variable count
+// between two consecutive OFDM decode attempts. The OFDM data preamble's
+// ABSOLUTE ring offset therefore jittered by whole symbols (delay 171119/
+// 174839/172359, var=nan), the Schmidl-Cox first-peak coarse search chased a
+// picture shifting under it, and CFG15/16 never decoded (FTR 0.0-0.62).
+// MFSK/ROBUST_0 survived the same jitter via its wide-margin 1-D symbol-grid
+// re-lock. Pacing one symbol per prep makes the ring advance exactly one
+// symbol per prep opportunity, mirroring the production capture-prep thread's
+// real-time 1-symbol-per-sim_paced_wait cadence (audioio.c:1295-1376), so the
+// preamble offset is deterministic + frame-aligned every attempt. The data_ready/
+// frames_to_read gate the decode consumer reads (arq_common.cc:6214) then fires
+// at a stable ring_write_index. prep_pull_inline itself is unchanged.
+//
+// BOUNDED FOLLOW-ON — per-FRAME DECODE DRIVE (drive_decode=true). Single-symbol
+// pacing alone is NECESSARY but not SUFFICIENT: the RX runs its OFDM decode only
+// when its process_main() executes, and that happens ONCE per top-level half-step
+// (and once per pump co-routine drive). Without a decode pass BETWEEN symbol
+// deliveries, the per-symbol prep loop still drives frames_to_read down past 0
+// (clamped to 0 in prep_pull_inline) and keeps advancing ring_write_index across
+// the WHOLE delivered run before any decode snapshot fires (arq_common.cc:6214
+// snapshots ONLY when frames_to_read==0) — so the decode still sees a jittered,
+// over-advanced window and CFG15/16 never decode (verified: clean single-symbol
+// pacing reaches the data phase but yields t2 var=nan / 0 t2-OK). In PRODUCTION
+// the decode thread polls data_ready CONCURRENTLY with the 1-symbol-per-tick
+// capture-prep feed, so it consumes a frame the moment frames_to_read hits 0, at
+// the frame-aligned ring_write_index. We reproduce that here: on the FALLING EDGE
+// of frames_to_read to 0 (a full frame just completed; the RX armed frames_to_read
+// to preamble_nSymb+Nsymb at arq_common.cc:2531) drive dst->process_main() ONCE so
+// it snapshots+decodes at that exact, deterministic ring offset before more symbols
+// shift the window. Per-FRAME (not per-symbol) keeps the wall cost bounded.
+// Guards:
+//   - GATE: link_status==CONNECTED && is_ofdm_config(current_configuration). The
+//     is_ofdm_config term is the PRIMARY guard — the MFSK CONNECT/HAIL handshake
+//     runs at ROBUST_0 (is_ofdm_config=false), so the drive can NEVER fire during
+//     the handshake (which works 400/400 and desynced when driven). ROBUST/MFSK
+//     DATA also stays on the legacy once-per-half-step cadence (byte-identical).
+//     NOTE: broadening link_status==CONNECTED to also accept
+//     connection_status==RECEIVING was tested twice and REGRESSED the OFDM decode
+//     (RX-BATCH=0) — keep the state guard strictly link_status==CONNECTED.
+//   - drive_decode is true ONLY at call sites where dst is NOT already executing its
+//     own process_main() (every site except the §10.5 reply-into-tx deliver, where
+//     dst==the running tx instance — driving it would recurse into itself).
+//   - g_sim2_decode_drive_depth blocks a nested deliver (pump-fired from dst's own
+//     pacing wait) from recursing the decode-drive.
+//   - g_sim2_depth is bumped across the drive so any nested pump only drains+clocks
+//     (its depth-0 deliver/drive block is skipped), exactly like the existing
+//     co-routine peer-drive at sim_inproc_pump_2.
+void sim2_deliver_from_wire(MercuryInstance* dst, cbuf_handle_t wire, SimInproc2Ctx* c,
+                            bool drive_decode = false)
+{
+	cl_data_container* ddc = &dst->ts.data_container;
+	int sp = ddc->Nofdm * ddc->interpolation_rate;
+	if (sp <= 0) return;
+	size_t sp_bytes = (size_t)sp * sizeof(double);
+	while (size_buffer(wire) >= sp_bytes &&
+	       circular_buf_free_size(dst->audio.cap) >= sp_bytes)
+	{
+		read_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+		write_buffer(dst->audio.cap, (uint8_t*)c->scratch, sp_bytes);
+		// Prep the single symbol just delivered (cap holds exactly one symbol now,
+		// so prep_pull_inline's internal while-loop runs exactly once and advances
+		// ring_write_index by ONE symbol). One-symbol-per-prep == production cadence.
+		prep_pull_inline(dst, c->scratch + c->sp_max);
+
+		// Per-frame decode drive at the frame-complete boundary (data_ready==1 &&
+		// frames_to_read==0). The production OFDM decode consumer (arq_common.cc:6214)
+		// snapshots the ring ONLY when frames_to_read==0; the RX arms frames_to_read to
+		// preamble_nSymb+Nsymb (one full frame) on entry to RECEIVING, so the boundary
+		// lands the snapshot on a frame-aligned window. Driving the decode HERE (rather
+		// than letting the per-symbol prep loop pour symbols past the boundary, which
+		// over-advances ring_write_index before the once-per-half-step decode runs)
+		// reproduces production's concurrent decode-thread timing. Gated to
+		// link_status==CONNECTED (past the MFSK CONNECT/HAIL handshake — works 400/400,
+		// must not be re-entered mid-flight; broadening this to connection_status==
+		// RECEIVING was tested and REGRESSED the decode — keep it strictly CONNECTED)
+		// and to OFDM configs (ROBUST/MFSK survive jitter via the 1-D grid re-lock and
+		// stay on the legacy cadence, byte-identical). VERIFIED: B decodes the OFDM data
+		// batch byte-correct (RX-BATCH-SEQ DATA_LONG, [OFDM-OK] t2 var=0.0022
+		// meanH=1.000); pinned CFG16 delivers the full payload bytes_ok=1 in iters=4.
+		if (drive_decode && g_sim2_decode_drive_depth == 0 &&
+		    ddc->data_ready == 1 && ddc->frames_to_read == 0 &&
+		    dst->arq.link_status == CONNECTED &&
+		    is_ofdm_config(dst->arq.current_configuration))
+		{
+			static const bool ddbg = (getenv("MERCURY_SIM2_DBG") != nullptr);
+			if (ddbg) {
+				printf("[SIM2-DRIVE] %s cfg=%d conn=%d link=%d rwi=%d\n",
+				       dst->tag ? dst->tag : "?", dst->arq.current_configuration,
+				       dst->arq.connection_status, dst->arq.link_status,
+				       (int)ddc->ring_write_index);
+				fflush(stdout);
+			}
+			g_sim2_decode_drive_depth++;
+			g_sim2_depth++;
+			sim2_activate(dst);
+			dst->arq.process_main();
+			g_sim2_depth--;
+			g_sim2_decode_drive_depth--;
+		}
+	}
+}
+
+// prep_pull_inline: one capture-prep PASS for `inst` (the body of
+// radio_capture_prep_thread, audioio.c:1295-1376, minus the while(!shutdown_)
+// and the sim_paced_wait). Moves whole symbols from inst's capture ring into
+// inst's data_container.passband_delayed_data (double-mapped ring write +
+// frames_to_read/data_ready/nUnder bookkeeping). Uses inst's OWN mutex + rings
+// + data_container EXPLICITLY (not the globals) so it is correct regardless of
+// which instance the globals currently point at.
+void prep_pull_inline(MercuryInstance* inst, double* buffer_temp)
+{
+	cl_data_container* dc = &inst->ts.data_container;
+	int symbol_period = dc->Nofdm * dc->interpolation_rate;
+	if (symbol_period <= 0) return;
+	size_t sp_bytes = (size_t)symbol_period * sizeof(double);
+
+	while (size_buffer(inst->audio.cap) >= sp_bytes)
+	{
+		read_buffer(inst->audio.cap, (uint8_t*)buffer_temp, sp_bytes);
+		// Per-instance virtual clock is NOT advanced here (the pump advances the
+		// SHARED clock once per moved sample, §10.5). rx_transfer's clock-add is
+		// NOT used on this path — we read inst's capture directly.
+
+		if (dc->rx_mute) {
+			memset(buffer_temp, 0, sp_bytes);
+			dc->rx_mute_samples += symbol_period;
+		}
+
+		MUTEX_LOCK(&inst->audio.mutex);
+		int sp = dc->Nofdm * dc->buffer_Nsymb * dc->interpolation_rate;
+		if (sp == 0 || dc->passband_delayed_data == NULL || sp <= symbol_period) {
+			MUTEX_UNLOCK(&inst->audio.mutex);
+			continue;
+		}
+		if (dc->data_ready == 1 && dc->frames_to_read <= 0)
+			dc->nUnder_processing_events++;
+
+		int wi = dc->ring_write_index;
+		int remaining = sp - wi;
+		if (remaining >= symbol_period) {
+			memcpy(&dc->passband_delayed_data[wi], buffer_temp, sp_bytes);
+			memcpy(&dc->passband_delayed_data[wi + sp], buffer_temp, sp_bytes);
+		} else {
+			memcpy(&dc->passband_delayed_data[wi], buffer_temp, (size_t)remaining * sizeof(double));
+			memcpy(&dc->passband_delayed_data[wi + sp], buffer_temp, (size_t)remaining * sizeof(double));
+			int wrap = symbol_period - remaining;
+			memcpy(&dc->passband_delayed_data[0], &buffer_temp[remaining], (size_t)wrap * sizeof(double));
+			memcpy(&dc->passband_delayed_data[sp], &buffer_temp[remaining], (size_t)wrap * sizeof(double));
+		}
+		dc->ring_write_index = (wi + symbol_period) % sp;
+		dc->frames_to_read--;
+		if (dc->frames_to_read < 0) dc->frames_to_read = 0;
+		dc->data_ready = 1;
+		MUTEX_UNLOCK(&inst->audio.mutex);
+	}
+}
+
+void sim2_activate(MercuryInstance* m);   // fwd decl (defined below)
+
+// The 2-instance step-pump (see SimInproc2Ctx above for the full contract).
+void sim_inproc_pump_2(void* ctxv)
+{
+	SimInproc2Ctx* c = static_cast<SimInproc2Ctx*>(ctxv);
+	if (c->scratch == nullptr || c->tx == nullptr || c->rx == nullptr)
+		return;
+	c->pump_calls++;
+
+	// (1) Drain tx's playback (real signal or idle silence) into the tx->rx wire,
+	//     advancing the shared clock. NEVER writes to a capture here. `sending`
+	//     = real signal was draining this call (tx is actively transmitting a
+	//     frame, NOT idle/listening).
+	bool sending = sim2_drain_to_wire(c->tx, c->ch_tx2rx, c->wire_t2r, c);
+
+	if (g_sim2_depth == 0)
+	{
+		// (2) DEPTH 0 (tx is the top-level driven instance): deliver the tx->rx
+		//     wire into rx's capture + prep rx, then co-routine-drive rx ONCE so
+		//     rx can react WHILE tx is blocked. drive_decode=true: this is the
+		//     PRIMARY OFDM data-frame delivery path (the data frame is drained to the
+		//     wire and delivered to rx DURING tx's send wait); the per-frame decode
+		//     at the frame-aligned ring offset must fire here (gated CONNECTED+OFDM).
+		sim2_deliver_from_wire(c->rx, c->wire_t2r, c, /*drive_decode=*/true);
+
+		// Deliver the rx->tx reply into tx ONLY when tx is NOT actively sending a
+		// frame (tx.play empty AND no real signal drained this call). This is the
+		// §10.5 deferral made precise: during a frame send the post-TX capture
+		// FLUSH (send_*_pattern) would wipe an in-flight reply, so we hold it in
+		// the wire; once tx finishes the frame and sits in a LISTEN/idle wait
+		// (tx.play empty, the flush already done — no pump fires between drain-exit
+		// and the flush), it is safe to deliver and tx's next scan sees the reply.
+		if (!sending && size_buffer(c->tx->audio.play) == 0)
+			sim2_deliver_from_wire(c->tx, c->wire_r2t, c);
+
+		g_sim2_depth++;
+		MercuryInstance* save_tx = c->tx;
+		MercuryInstance* save_rx = c->rx;
+		cl_sim_awgn* save_t2r = c->ch_tx2rx;
+		cl_sim_awgn* save_r2t = c->ch_rx2tx;
+		cbuf_handle_t save_wt2r = c->wire_t2r;
+		cbuf_handle_t save_wr2t = c->wire_r2t;
+		(void)sending;
+		// Flip the ctx so rx's own waits (depth 1) drain rx->tx wire + clock.
+		c->tx = save_rx; c->rx = save_tx;
+		c->ch_tx2rx = save_r2t; c->ch_rx2tx = save_t2r;
+		c->wire_t2r = save_wr2t; c->wire_r2t = save_wt2r;
+		sim2_activate(save_rx);
+		save_rx->arq.process_main();
+		// Restore tx's view. Do NOT deliver rx->tx here (the §10.5 deferral):
+		// the reply stays in the wire and is delivered to tx by a later pump fired
+		// from tx's LISTEN/idle wait (tx.play empty) or by the outer loop.
+		c->tx = save_tx; c->rx = save_rx;
+		c->ch_tx2rx = save_t2r; c->ch_rx2tx = save_r2t;
+		c->wire_t2r = save_wt2r; c->wire_r2t = save_wr2t;
+		sim2_activate(save_tx);
+		g_sim2_depth--;
+	}
+	// DEPTH 1 (we ARE the peer being co-routine-driven): only drained tx->rx wire
+	// above (the reply path). Do NOT deliver into the original sender's capture.
+}
+
+// Configure one instance for the 2-instance stepper exactly like the non-TCP
+// portion of cl_arq_controller::init() (arq_common.cc:1099-1170), then opt it
+// into its own residue-free RNG. The two private load_configuration() PHY calls
+// are issued by the caller (a cl_arq_controller member).
+void sim2_setup_instance(MercuryInstance* m, int role, bool robust, int start_cfg,
+                         unsigned int rng_seed)
+{
+	m->wire();
+	m->audio.alloc();
+	m->ts.enable_per_instance_rng(rng_seed);   // §10.1 residue-free stream
+
+	// Mirror init()'s non-TCP setup.
+	m->arq.fifo_buffer_tx.set_size(m->arq.default_configuration_ARQ.fifo_buffer_tx_size);
+	m->arq.fifo_buffer_rx.set_size(m->arq.default_configuration_ARQ.fifo_buffer_rx_size);
+	m->arq.fifo_buffer_backup.set_size(m->arq.default_configuration_ARQ.fifo_buffer_backup_size);
+	m->arq.set_link_timeout(m->arq.default_configuration_ARQ.link_timeout);
+	m->arq.robust_enabled     = robust ? YES : NO;
+	m->arq.narrowband_enabled = NO;
+	m->ts.narrowband_enabled  = NO;
+	m->arq.bandwidth_mode     = BW_AUTO;
+	m->arq.local_capability   = CAP_WB_CAPABLE;
+	// Skip the NB HAIL probe (== -Q 0 benchmark mode): both peers controlled,
+	// start directly in WB. Avoids the NB/WB negotiation mismatch where the
+	// commander HAILs in NB, the responder replies in NB, then the commander
+	// reverts to WB and can no longer match the NB reply (single-process-sim §10.5).
+	m->arq.nb_probe_max       = 0;
+	m->arq.gear_shift_on      = YES;
+	m->arq.gear_shift_algorithm = m->arq.default_configuration_ARQ.gear_shift_algorithm;
+	m->arq.current_configuration = CONFIG_NONE;
+	if (robust) {
+		m->arq.init_configuration = start_cfg;
+		m->arq.data_configuration = start_cfg;
+		m->arq.ack_configuration  = start_cfg;
+	} else {
+		m->arq.init_configuration = start_cfg;
+		m->arq.data_configuration = start_cfg;
+		m->arq.ack_configuration  = m->arq.default_configuration_ARQ.ack_configuration;
+	}
+	m->arq.last_data_viable_config =
+		session_floor_anchor(m->arq.robust_enabled, m->arq.init_configuration);
+	(void)role;
+	// NOTE: the two PHY load_configuration() calls (private) are issued by the
+	// caller test_sim_inproc_2 (a cl_arq_controller member) right after this.
+}
+
+// Point the audioio.c globals at this instance's rings (§10.3 swap). Single
+// thread → the swap precedes every consumer (tx_transfer/rx_transfer/
+// drain_playback_wait/the IDLE measure block) that runs during this instance's
+// process_main. gf16ra reconcile (§10.2): re-apply this instance's suffix-FEC
+// repfact (idempotent when unchanged) so the shared codec matches before drive.
+void sim2_activate(MercuryInstance* m)
+{
+	capture_buffer    = m->audio.cap;
+	playback_buffer   = m->audio.play;
+	capture_prep_mutex = m->audio.mutex;
+	// gf16ra reconcile: only meaningful if the suffix-FEC path is enabled; both
+	// peers run the same repfact under the no-negotiation invariant, so this is
+	// a no-op idempotent re-apply in the common case (FEC off → not configured).
+	if (m->ts.ack_mfsk.suffix_fec_coded) {
+		// Both peers run the same repfact under the no-negotiation invariant;
+		// repfact 3 is the only production value set_suffix_fec uses. Re-applying
+		// it is idempotent (gf16ra::init short-circuits when unchanged).
+		gf16ra::configure(3);
+		gf16ra::init();
+	}
+}
+
+}  // namespace
+
+// FULL-PATH REGRESSION (bigblock-whiten-align): capture of the last 2-instance run's
+// delivery so test_sim_inproc_bigblock_fullpath() can assert without re-parsing stdout.
+long cl_arq_controller::sim2_last_rx_have     = -1;
+long cl_arq_controller::sim2_last_payload_len = -1;
+bool cl_arq_controller::sim2_last_bytes_ok    = false;
+
+int cl_arq_controller::test_sim_inproc_2()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-SIM-2INST] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	printf("[TEST-SIM-2INST] two-instance in-process lockstep stepper "
+	       "(A=CMD, B=RSP, scalar-AWGN channel both directions, shared virtual "
+	       "clock, NO device/threads/TCP/relay)\n");
+	fflush(stdout);
+
+	// --- Parameters (env-overridable for GATE-2 determinism re-runs) ---
+	auto env_d = [](const char* k, double def)->double {
+		const char* e = std::getenv(k); return (e && *e) ? atof(e) : def; };
+	auto env_i = [](const char* k, long def)->long {
+		const char* e = std::getenv(k); return (e && *e) ? atol(e) : def; };
+
+	const double snr3k_db   = env_d("MERCURY_SIM2_SNR3K", 900.0);   // 900 = clean
+	const unsigned seed     = (unsigned)env_i("MERCURY_SIM2_SEED", 12345);
+	const int  start_cfg    = (int)env_i("MERCURY_SIM2_CFG", ROBUST_0);
+	const bool robust       = env_i("MERCURY_SIM2_ROBUST", 1) != 0;
+
+	// CONTROL-LOOP PROBE additions (wf-sim-controlloop) — all env-gated and
+	// ADDITIVE; default values reproduce the legacy 19-byte smoke exactly so the
+	// regression (MERCURY_SIM_2INST=1 with no extra env) is byte-identical.
+	//   MERCURY_SIM2_PAYLOAD_BYTES : 0 = legacy short "HELLO" payload (default);
+	//                                >0 = deterministic pseudo-random payload of
+	//                                that many bytes (drives the gearshift climb).
+	//   MERCURY_SIM2_OPT           : 0 = optimizer OFF (== --no-optimizer, pure
+	//                                ladder gearshift, default); 1 = optimizer ON
+	//                                (load the calibration table via
+	//                                opt_load_rate_table(), honoring
+	//                                MERCURY_RATE_TABLE).
+	const long payload_bytes = env_i("MERCURY_SIM2_PAYLOAD_BYTES", 0);
+	const bool opt_on        = env_i("MERCURY_SIM2_OPT", 0) != 0;
+
+	// Build the payload buffer. Legacy default (payload_bytes==0): the original
+	// 19-byte greeting (verbatim, so the GATE-2 regression is unchanged). Large
+	// payload: a deterministic LCG byte stream keyed on the run seed so GATE-2
+	// (same seed twice -> byte-identical) holds for the data-heavy run too.
+	static const char* legacy_payload = "MERCURY-2INST-HELLO";
+	std::vector<char> payload_vec;
+	const char* payload;
+	int payload_len;
+	if (payload_bytes <= 0) {
+		payload     = legacy_payload;
+		payload_len = (int)strlen(legacy_payload);
+	} else {
+		payload_vec.resize((size_t)payload_bytes);
+		uint32_t lcg = 0x9E3779B9u ^ seed;   // deterministic, seed-keyed
+		for (long i = 0; i < payload_bytes; i++) {
+			lcg = lcg * 1664525u + 1013904223u;
+			payload_vec[(size_t)i] = (char)((lcg >> 24) & 0xFF);
+		}
+		payload     = payload_vec.data();
+		payload_len = (int)payload_bytes;
+	}
+
+	// max_iters: keep the legacy 60000 default for the short payload; scale the
+	// default headroom up for a large payload (the data-heavy climb needs far
+	// more ticks). Still env-overridable via MERCURY_SIM2_MAXITERS.
+	const long default_max_iters = (payload_bytes > 0) ? 4000000 : 60000;
+	const long max_iters    = env_i("MERCURY_SIM2_MAXITERS", default_max_iters);
+
+	printf("[TEST-SIM-2INST] params: snr3k=%.1f seed=%u max_iters=%ld start_cfg=%d "
+	       "robust=%d payload_len=%d opt=%s\n", snr3k_db, seed, max_iters, start_cfg,
+	       (int)robust, payload_len, opt_on ? "ON" : "OFF");
+	fflush(stdout);
+
+	// --- Construct two instances + two channels (one per direction) ---
+	MercuryInstance* A = new MercuryInstance();  A->tag = "A/CMD";
+	MercuryInstance* B = new MercuryInstance();  B->tag = "B/RSP";
+	sim2_setup_instance(A, COMMANDER, robust, start_cfg, seed ^ 0xA5A5u);
+	sim2_setup_instance(B, RESPONDER, robust, start_cfg, seed ^ 0x5A5Au);
+	// PHY bring-up (no TCP) — mirrors init()'s two load_configuration calls. Done
+	// here (not in the free helper) because load_configuration is a private member;
+	// a cl_arq_controller member fn can call it on ANY instance.
+	A->arq.load_configuration(A->arq.ack_configuration,  FULL,                 NO);
+	A->arq.load_configuration(A->arq.data_configuration, PHYSICAL_LAYER_ONLY,  YES);
+	B->arq.load_configuration(B->arq.ack_configuration,  FULL,                 NO);
+	B->arq.load_configuration(B->arq.data_configuration, PHYSICAL_LAYER_ONLY,  YES);
+	bool okA = A->ts.data_container.Nofdm * A->ts.data_container.interpolation_rate > 0;
+	bool okB = B->ts.data_container.Nofdm * B->ts.data_container.interpolation_rate > 0;
+	check(okA && okB, "S1 both instances brought up (PHY + buffers, no TCP)");
+
+	// --- CONTROL-LOOP PROBE: optimizer toggle (wf-sim-controlloop) ---
+	// OFF (default): set_optimizer_disabled(true) on both instances. This is the
+	//   exact same state main.cc:2401 installs for --no-optimizer: opt_load_rate_table()
+	//   no-ops and opt_evaluate_batch_end() hard-short-circuits, so config selection
+	//   is owned ENTIRELY by the pure-ladder gearshift (gear_shift_on stays YES).
+	// ON: set_optimizer_disabled(false) and load the calibration table on the
+	//   COMMANDER (A) — the optimizer only acts on the commander (the role!=COMMANDER
+	//   gate in opt_evaluate_batch_end). Loaded on B too for symmetry/harmlessness
+	//   (B never evaluates). opt_load_rate_table() honors MERCURY_RATE_TABLE, which
+	//   the probe points at effective_rate_table.v13.json.
+	// Diagnostic knob: MERCURY_SIM2_PIN=1 disables the gearshift on both
+	// instances so the config is HELD at start_cfg. Used to isolate sustained
+	// multi-batch data flow from config-switch effects. Additive/env-gated.
+	const bool pin_cfg = env_i("MERCURY_SIM2_PIN", 0) != 0;
+	if (pin_cfg) {
+		A->arq.gear_shift_on = NO;
+		B->arq.gear_shift_on = NO;
+		printf("[TEST-SIM-2INST] gearshift PINNED off (config held at start_cfg=%d)\n", start_cfg);
+		fflush(stdout);
+	}
+
+	A->arq.set_optimizer_disabled(!opt_on);
+	B->arq.set_optimizer_disabled(!opt_on);
+
+	// LEVER P: preamble amortization A/B knob. MERCURY_SIM2_PREAMBLE_AMORT=1
+	// enables the variable per-frame OFDM preamble on BOTH instances. Default 0
+	// (legacy full preamble, byte-identical baseline). See
+	// fact-documents/data-flow-preamble-amortization.md.
+	{
+		const bool amort_on = env_i("MERCURY_SIM2_PREAMBLE_AMORT", 0) != 0;
+		A->ts.preamble_amortization_enabled = amort_on;
+		B->ts.preamble_amortization_enabled = amort_on;
+		printf("[TEST-SIM-2INST] preamble amortization %s\n", amort_on ? "ON" : "OFF");
+		fflush(stdout);
+	}
+
+	if (opt_on) {
+		printf("[TEST-SIM-2INST] optimizer ON: loading calibration table (A=CMD)\n");
+		fflush(stdout);
+		A->arq.opt_load_rate_table();
+		B->arq.opt_load_rate_table();
+	} else {
+		printf("[TEST-SIM-2INST] optimizer OFF (== --no-optimizer): pure-ladder gearshift owns config\n");
+		fflush(stdout);
+	}
+	// test_sim_inproc_2 is a cl_arq_controller member -> may read A->arq's private
+	// optimizer_disabled directly (same class).
+	check(A->arq.optimizer_disabled == !opt_on,
+	      opt_on ? "S1b optimizer ENABLED (table loaded, ON arm)"
+	             : "S1b optimizer DISABLED (pure ladder, OFF arm)");
+
+	cl_sim_awgn ch_a2b(((uint64_t)seed << 1) | 1u, snr3k_db);   // A->B
+	cl_sim_awgn ch_b2a(((uint64_t)seed << 1) | 0u, snr3k_db);   // B->A
+
+	// --- Engage the SHARED virtual clock + the TCP skip gate ---
+	sim_clock_set_enabled(1);
+	arq_set_sim_inproc_skip_tcp(true);
+	check(sim_clock_enabled() != 0, "S2 shared virtual clock engaged");
+
+	// --- Step-pump context + scratch (>= 2 symbols: move buffer + prep buffer;
+	//     allocate 3x sp_max for headroom). The pump holds BOTH instances + BOTH
+	//     channels so it can co-routine-drive the peer during the active wait. ---
+	int sp_max = A->ts.data_container.Nofdm * A->ts.data_container.interpolation_rate;
+	int sp_b   = B->ts.data_container.Nofdm * B->ts.data_container.interpolation_rate;
+	if (sp_b > sp_max) sp_max = sp_b;
+	SimInproc2Ctx pump;
+	pump.sp_max  = sp_max;
+	pump.scratch = (double*)malloc((size_t)sp_max * sizeof(double) * 3);
+	pump.ch_tx2rx = &ch_a2b;   // initial (overwritten each half-step)
+	pump.ch_rx2tx = &ch_b2a;
+	// Per-direction WIRE rings (§10.5): a2b (A->B) and b2a (B->A). Sized like the
+	// audio rings so a full frame fits in flight.
+	uint8_t* wmem_a2b = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	uint8_t* wmem_b2a = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t wire_a2b = circular_buf_init(wmem_a2b, AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t wire_b2a = circular_buf_init(wmem_b2a, AUDIO_PAYLOAD_BUFFER_SIZE);
+	clear_buffer(wire_a2b); clear_buffer(wire_b2a);
+	pump.wire_t2r = wire_a2b;   // initial (overwritten each half-step)
+	pump.wire_r2t = wire_b2a;
+	arq_set_sim_inproc_pump(sim_inproc_pump_2, &pump);
+	check(pump.scratch != nullptr && wire_a2b != nullptr && wire_b2a != nullptr,
+	      "S3 step-pump + wires installed");
+
+	// --- Drive the handshake via the REAL process_user_command (no TCP) ---
+	// B first: MYCALL + LISTEN ON (loads init_configuration, RESPONDER/LISTENING).
+	sim2_activate(B);
+	B->arq.process_user_command("MYCALL TESTB");
+	B->arq.process_user_command("LISTEN ON");
+	// A: MYCALL + CONNECT TESTA TESTB (COMMANDER/CONNECTING).
+	sim2_activate(A);
+	A->arq.process_user_command("MYCALL TESTA");
+	A->arq.process_user_command("CONNECT TESTA TESTB");
+	check(B->arq.link_status == LISTENING, "S4 B is LISTENING after LISTEN ON");
+	check(A->arq.link_status == CONNECTING, "S5 A is CONNECTING after CONNECT");
+
+	// --- Stage the test payload into A's TX FIFO (== the TCP data socket push) ---
+	A->arq.fifo_buffer_tx.push((char*)payload, payload_len);
+
+	// --- Lockstep step loop (§3): A.process_main -> ch_a2b -> B.cap,
+	//     B.process_main -> ch_b2a -> A.cap, shared clock advanced by the pump. ---
+	bool connected_seen = false;
+	long iters = 0;
+	int  rx_have = 0;
+	// RX buffer sized to the full payload (+1 NUL) so the large-payload arm can
+	// hold tens of KB; the legacy 19-byte arm fits trivially.
+	std::vector<char> rx_vec((size_t)payload_len + 1, 0);
+	char* rx_buf = rx_vec.data();
+	const int rx_cap = payload_len + 1;
+
+	// --- CONTROL-LOOP PROBE: config switch-sequence tracker (wf-sim-controlloop).
+	//     Records every change of the COMMANDER's live current_configuration as
+	//     (iter, cfg). This is the climb path the probe reports: does OFF climb to
+	//     and HOLD an optimal config, while ON over-climbs past the cliff and
+	//     collapses back to ROBUST_0? Tracking the LIVE field (not load_configuration)
+	//     catches gearshift AND optimizer-driven switches uniformly. ---
+	std::vector<std::pair<long,int>> cfg_seq;
+	int last_cfg = A->arq.current_configuration;
+	cfg_seq.push_back({-1, last_cfg});   // initial config at loop entry
+	int max_cfg_reached = last_cfg;      // highest OFDM cfg the climb touched
+	long collapse_iter  = -1;            // first iter cfg fell back to a ROBUST_x
+
+	const bool dbg = (getenv("MERCURY_SIM2_DBG") != nullptr);
+	// Stall cutoff (large-payload arm only): if no new RX byte arrives for this
+	// many iters, terminate (the over-climb-collapse arm can otherwise crawl for
+	// millions of ticks). 0/legacy arm: disabled (legacy break-on-deliver only).
+	const long stall_cutoff = env_i("MERCURY_SIM2_STALL_ITERS",
+	                                 (payload_bytes > 0) ? 200000 : 0);
+	long last_progress_iter = 0;
+	int  prev_rx_have = 0;
+	uint64_t t0 = sim_clock_now_samples();
+	bool stalled = false;
+	for (; iters < max_iters; iters++)
+	{
+		if (dbg && (iters % 200 == 0)) {
+			printf("[SIM2-DBG] it=%ld A.link=%d A.conn=%d B.link=%d B.conn=%d "
+			       "B.cap=%zu B.ftr=%d B.dr=%d A.cap=%zu A.play=%zu B.play=%zu hail_det=%d\n",
+			       iters, A->arq.link_status, A->arq.connection_status,
+			       B->arq.link_status, B->arq.connection_status,
+			       size_buffer(B->audio.cap),
+			       (int)B->ts.data_container.frames_to_read,
+			       (int)B->ts.data_container.data_ready,
+			       size_buffer(A->audio.cap), size_buffer(A->audio.play),
+			       size_buffer(B->audio.play), B->arq.hail_detected);
+			fflush(stdout);
+		}
+		// --- A's half-step (tx=A, rx=B; the pump co-routine-drives B in A's waits,
+		//     and delivers B's reply into A during A's listen waits — §10.5). ---
+		pump.tx = A; pump.rx = B;
+		pump.ch_tx2rx = &ch_a2b; pump.ch_rx2tx = &ch_b2a;
+		pump.wire_t2r = wire_a2b; pump.wire_r2t = wire_b2a;
+		sim2_activate(A);
+		A->arq.process_main();
+		// Catch any A TX queued without hitting a wait this tick: drain to wire +
+		// deliver to B. Also deliver any reply waiting in b2a into A if A is now
+		// idle (A.play empty post-process_main).
+		sim2_drain_to_wire(A, &ch_a2b, wire_a2b, &pump);
+		// Top-level "catch-up" delivery into B (the data receiver). drive_decode=true:
+		// fires the per-frame OFDM decode (gated to CONNECTED+OFDM) for a data frame
+		// that finished feeding via the top-level drain rather than mid-pump. The
+		// A-target "reply into A" delivery (B's ACKs) is left WITHOUT a decode-drive:
+		// A receives ACK/control here, the jitter fix is for OFDM DATA, and keeping A's
+		// decode on the legacy once-per-half-step cadence avoids perturbing A's
+		// commander-side gearshift loop (A was observed to climb 15->16 when driven).
+		sim2_deliver_from_wire(B, wire_a2b, &pump, /*drive_decode=*/true);
+		if (size_buffer(A->audio.play) == 0)
+			sim2_deliver_from_wire(A, wire_b2a, &pump);
+
+		// --- B's half-step (tx=B, rx=A; symmetric). ---
+		pump.tx = B; pump.rx = A;
+		pump.ch_tx2rx = &ch_b2a; pump.ch_rx2tx = &ch_a2b;
+		pump.wire_t2r = wire_b2a; pump.wire_r2t = wire_a2b;
+		sim2_activate(B);
+		B->arq.process_main();
+		sim2_drain_to_wire(B, &ch_b2a, wire_b2a, &pump);
+		sim2_deliver_from_wire(A, wire_b2a, &pump);
+		if (size_buffer(B->audio.play) == 0)
+			sim2_deliver_from_wire(B, wire_a2b, &pump, /*drive_decode=*/true);
+
+		if (!connected_seen &&
+		    (A->arq.link_status == CONNECTED || B->arq.link_status == CONNECTED))
+			connected_seen = true;
+
+		// --- Track the commander's config switches (the climb path). ---
+		int cur_cfg = A->arq.current_configuration;
+		if (cur_cfg != last_cfg) {
+			cfg_seq.push_back({iters, cur_cfg});
+			// max_cfg_reached only over OFDM configs (ROBUST_x are id>=100; a
+			// numeric max would wrongly rank ROBUST over CONFIG_16). Track the
+			// highest OFDM config touched, and note the first collapse to ROBUST.
+			if (is_ofdm_config(cur_cfg) && cur_cfg > max_cfg_reached) max_cfg_reached = cur_cfg;
+			if (cur_cfg >= ROBUST_0 && collapse_iter < 0 && max_cfg_reached > last_cfg && is_ofdm_config(last_cfg))
+				collapse_iter = iters;
+			if (dbg) {
+				printf("[SIM2-CFG] it=%ld cfg %d -> %d (max_ofdm=%d)\n",
+				       iters, last_cfg, cur_cfg, max_cfg_reached);
+				fflush(stdout);
+			}
+			last_cfg = cur_cfg;
+		}
+
+		// Drain delivered bytes from B's RX FIFO.
+		int avail = B->arq.fifo_buffer_rx.get_size() - B->arq.fifo_buffer_rx.get_free_size();
+		if (avail > 0 && rx_have < rx_cap - 1)
+		{
+			int got = B->arq.fifo_buffer_rx.pop(rx_buf + rx_have,
+			              std::min(avail, rx_cap - 1 - rx_have));
+			if (got > 0) rx_have += got;
+		}
+
+		if (rx_have >= payload_len) break;   // delivered
+
+		// FULL-PATH REGRESSION (bigblock-whiten-align): MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK=1
+		// breaks the loop as soon as the FIRST big-block has been carved (bigblock_first_K>0).
+		// The fail-before arm uses this so it captures the first block's PARTIAL outcome and
+		// exits FAST — it must NOT run the slow/unstable post-partial stock per-frame retry
+		// loop. Default off (regression/HW sessions run to completion).
+		if (env_i("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", 0) != 0 && bigblock_first_K > 0) {
+			stalled = true;   // mark so the byte-correct G-SMOKE assert is skipped
+			break;
+		}
+
+		// Stall detector (large-payload arm): break out if no new byte for
+		// stall_cutoff iters. Records the stall so the report can flag it.
+		if (rx_have != prev_rx_have) { prev_rx_have = rx_have; last_progress_iter = iters; }
+		if (stall_cutoff > 0 && (iters - last_progress_iter) >= stall_cutoff) {
+			stalled = true;
+			break;
+		}
+	}
+	uint64_t t1 = sim_clock_now_samples();
+	double sim_ms = (t1 - t0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+	bool bytes_ok = (rx_have >= payload_len && memcmp(rx_buf, payload, payload_len) == 0);
+
+	// FULL-PATH REGRESSION capture (bigblock-whiten-align): record this run's delivery so
+	// test_sim_inproc_bigblock_fullpath() can assert byte-faithful delivery directly.
+	sim2_last_rx_have     = rx_have;
+	sim2_last_payload_len = payload_len;
+	sim2_last_bytes_ok    = bytes_ok;
+
+	if (payload_bytes <= 0) {
+		// Legacy short-text arm: print the string (regression output unchanged).
+		rx_buf[rx_have] = '\0';
+		printf("[TEST-SIM-2INST] loop done: iters=%ld sim_ms=%.0f connected=%d "
+		       "A.link=%d B.link=%d rx_have=%d rx=\"%s\"\n", iters, sim_ms,
+		       (int)connected_seen, A->arq.link_status, B->arq.link_status,
+		       rx_have, rx_buf);
+	} else {
+		// Large/binary arm: no string print (binary); report length + correctness.
+		printf("[TEST-SIM-2INST] loop done: iters=%ld sim_ms=%.0f connected=%d "
+		       "A.link=%d B.link=%d rx_have=%d/%d bytes_ok=%d\n", iters, sim_ms,
+		       (int)connected_seen, A->arq.link_status, B->arq.link_status,
+		       rx_have, payload_len, (int)bytes_ok);
+	}
+	printf("[TEST-SIM-2INST] pump: calls=%lld looped=%lld idle=%lld clock=%lld\n",
+	       pump.pump_calls, pump.looped_samples, pump.idle_samples, pump.clock_samples);
+
+	// --- CONTROL-LOOP PROBE report (wf-sim-controlloop) ---
+	// Config switch sequence (the climb path). Tag the final config + whether it
+	// is OFDM (held a real data config) or fell back to a ROBUST_x (the collapse).
+	{
+		int final_cfg = A->arq.current_configuration;
+		printf("[SIM2-PROBE] opt=%s snr3k=%.1f payload_len=%d : switch_seq=",
+		       opt_on ? "ON" : "OFF", snr3k_db, payload_len);
+		for (size_t i = 0; i < cfg_seq.size(); i++) {
+			printf("%s%d", (i ? "->" : ""), cfg_seq[i].second);
+		}
+		printf("  (final=%d ofdm=%d max_ofdm=%d collapse_iter=%ld)\n",
+		       final_cfg, (int)is_ofdm_config(final_cfg), max_cfg_reached, collapse_iter);
+		// Per-switch (iter,cfg) detail for the climb timeline.
+		printf("[SIM2-PROBE] switch_detail=");
+		for (size_t i = 0; i < cfg_seq.size(); i++) {
+			printf("%s(%ld:%d)", (i ? "," : ""), cfg_seq[i].first, cfg_seq[i].second);
+		}
+		printf("\n");
+		// Delivered rate in SIM UNITS: bits delivered / virtual-channel seconds.
+		// This is a sim-internal relative metric for OFF-vs-ON comparison at the
+		// SAME seed/SNR — NOT an absolute bps-vs-VARA figure (clean/AWGN, not
+		// GATE-3-validated vs PACED/HW).
+		double sim_s = sim_ms / 1000.0;
+		double delivered_bps_sim = (sim_s > 0.0) ? (rx_have * 8.0 / sim_s) : 0.0;
+		printf("[SIM2-PROBE] delivered: rx_bytes=%d sim_ms=%.0f delivered_bps_sim=%.1f "
+		       "final_cfg=%d held_ofdm=%d stalled=%d\n",
+		       rx_have, sim_ms, delivered_bps_sim, final_cfg, (int)is_ofdm_config(final_cfg),
+		       (int)stalled);
+		fflush(stdout);
+	}
+	fflush(stdout);
+
+	// --- G-SMOKE asserts ---
+	// CONNECT + no-hang are hard asserts for ALL arms. The byte-correct delivery
+	// assert is a hard assert only for the LEGACY short arm and for any LARGE arm
+	// that completed without stalling: an over-climb-collapse arm may intentionally
+	// FAIL to deliver the full payload at moderate SNR (it crawls in ROBUST_0 and
+	// hits the stall cutoff) — that is the scientific RESULT of the probe, not a
+	// code failure. The probe report above carries bytes_ok/stalled for analysis.
+	check(connected_seen, "G-SMOKE: 2-instance CONNECT completed (no deadlock, single thread)");
+	if (payload_bytes <= 0 || !stalled) {
+		check(bytes_ok,
+		      "G-SMOKE: payload delivered B<-A byte-correct (RX bytes match TX)");
+	} else {
+		printf("[TEST-SIM-2INST] NOTE: large-payload arm STALLED (rx=%d/%d, "
+		       "final_cfg=%d) — over-climb/collapse regime, byte-correct assert "
+		       "skipped (this is the probe result, not a failure)\n",
+		       rx_have, payload_len, A->arq.current_configuration);
+		fflush(stdout);
+	}
+	check(iters < max_iters, "G-SMOKE: terminated before iteration cap (no hang)");
+
+	// --- Teardown ---
+	arq_set_sim_inproc_pump(nullptr, nullptr);
+	arq_set_sim_inproc_skip_tcp(false);
+	sim_clock_set_enabled(0);
+	if (pump.scratch) free(pump.scratch);
+	free(wire_a2b->buffer); circular_buf_free(wire_a2b);
+	free(wire_b2a->buffer); circular_buf_free(wire_b2a);
+	// Restore globals to a clean null state (this run owned them).
+	capture_buffer = nullptr; playback_buffer = nullptr;
+#if defined(_WIN32)
+	capture_prep_mutex = NULL;
+#endif
+	A->audio.free_all();
+	B->audio.free_all();
+	delete A; delete B;
+
+	printf("[TEST-SIM-2INST] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// FULL-PATH REGRESSION (bigblock-whiten-align): the missing cross-layer test.
+//
+// Drives a 2-instance SIM_INPROC CFG16 BIG-BLOCK transfer (PINNED CFG16, big-block
+// framing on, K=8, a one-block deterministic payload) through the REAL production
+// stack: bigblock_send_one_block -> transmit_byte/transmit_bigblock (LDPC encode AFTER
+// the energy-dispersal WHITEN) -> the in-process wire/capture ring -> receive_byte ->
+// receive_bigblock (acquire + per-codeword LDPC decode) -> bigblock_receive_carve (the
+// single de-whiten + per-codeword wire-CRC gate + cw0 wire-header parse) ->
+// bigblock_block_to_arq (CLEAN block -> copy_data_to_buffer -> fifo_buffer_rx) -> the
+// app RX FIFO. Asserts the WHOLE message is delivered BYTE-FAITHFUL.
+//
+// Why CASE A-D could not catch this: those synthetic carve tests hand a CALLER-OWNED
+// std::vector as the RX passband (so the receive_bigblock buffer-realloc never dangled
+// it -> no UAF), drive ONE receive_bigblock directly (so the per-block frames_to_read
+// arming was never exercised), and assert on messages_rx[] DIRECTLY (so the missing
+// copy_data_to_buffer FIFO delivery was invisible). This test exercises all three on
+// the LIVE 2-instance path.
+//
+// FAIL-BEFORE / PASS-AFTER on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_FIX=1, which
+// restores the one-stock-frame RX wait (snapshots a PARTIAL block -> cw0 decodes, cw1..K-1
+// read silence and CRC-fail -> PARTIAL clean<K -> 0 app bytes reach the FIFO). This is the
+// DETERMINISTIC, NON-CRASHING 0-delivery symptom, so the SAME process can run the pass-after
+// arm after it. (The sibling use-after-free root cause is independently reproduced by
+// MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1, which SEGVs — it cannot share a process with pass-after,
+// so it is documented as a standalone crash, not folded into this in-process A/B.)
+// Pass-after delivers the full message byte-faithful.
+int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
+{
+	printf("[TEST-BIGBLOCK-FULLPATH] ===== SIM_INPROC CFG16 big-block FULL-PATH "
+	       "(TX-encode->whiten->PHY->receive_bigblock-de-whiten->carve->FIFO deliver) =====\n");
+	fflush(stdout);
+
+	// --- save the env we will set, so the test leaves the process env clean ---
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_SIM_2INST", "MERCURY_BIGBLOCK_FRAMING", "MERCURY_BIGBLOCK_K",
+		"MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
+		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
+		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key   = keys[i];
+		env_saved[(size_t)i].had   = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	// One full CFG16 K=8 block carries K*(ldpc.K/8)=8*175=1400 bytes of wire payload
+	// (minus the cw0 header + per-codeword CRC overhead); 1200 app bytes fit in ONE block.
+	const long PAYLOAD = 1200;
+	set_env("MERCURY_SIM_2INST",            "1");
+	set_env("MERCURY_BIGBLOCK_FRAMING",     "1");
+	set_env("MERCURY_BIGBLOCK_K",           "8");
+	set_env("MERCURY_SIM2_PIN",             "1");     // hold CFG16 (no gearshift)
+	set_env("MERCURY_SIM2_CFG",             "16");
+	set_env("MERCURY_SIM2_ROBUST",          "0");
+	{ char b[32]; snprintf(b,sizeof(b),"%ld",PAYLOAD); set_env("MERCURY_SIM2_PAYLOAD_BYTES", b); }
+
+	int failed = 0;
+
+	// ---------- FAIL-BEFORE: restore the pre-fix bug (partial-block wait) ------------
+	// With the one-stock-frame RX wait, the FIRST big-block decodes PARTIAL (cw0 clean,
+	// cw1..K-1 read silence) and the carve PARTIAL branch delivers 0 app bytes to the FIFO.
+	// MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK=1 breaks the 2-instance loop the moment that first
+	// block is carved, so we capture its PARTIAL outcome and exit FAST — we do NOT run the
+	// slow/unstable post-partial stock per-frame retry loop. (The UAF sibling is reproduced
+	// separately by MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1, which SEGVs and is documented.)
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");
+	set_env("MERCURY_SIM2_MAXITERS",        "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS",     "60000");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",  "1");
+	printf("[TEST-BIGBLOCK-FULLPATH] --- FAIL-BEFORE arm (MERCURY_BIGBLOCK_DEFEAT_FIX=1: "
+	       "one-stock-frame RX wait -> partial-block decode) ---\n"); fflush(stdout);
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_before = test_sim_inproc_2();
+	long before_rx       = sim2_last_rx_have;
+	int  before_clean    = bigblock_first_clean;
+	int  before_K        = bigblock_first_K;
+	bool before_full     = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-FULLPATH] FAIL-BEFORE: first_block clean=%d/%d rx_have=%ld/%ld "
+	       "full=%d (rc=%d)\n", before_clean, before_K, before_rx, PAYLOAD,
+	       (int)before_full, rc_before);
+	fflush(stdout);
+	// fail-before reproduces iff the first big-block did NOT decode all-clean (partial) AND
+	// the full message was NOT delivered byte-faithful.
+	bool fail_before_ok = (before_K > 0) && (before_clean >= 0) && (before_clean < before_K)
+	                   && !before_full;
+	printf("[TEST-BIGBLOCK-FULLPATH] %s: FAIL-BEFORE reproduces (first block PARTIAL "
+	       "clean=%d<K=%d, full message NOT delivered)\n",
+	       fail_before_ok ? "PASS" : "FAIL", before_clean, before_K);
+	if(!fail_before_ok) failed++;
+
+	// ---------- PASS-AFTER: the real fix path ----------
+	// The fixed path decodes the FIRST block all-clean and delivers the full message in a
+	// handful of iters; run to full delivery (no early stop).
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "0");
+	set_env("MERCURY_SIM2_MAXITERS",        "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS",     "60000");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",  "0");
+	printf("[TEST-BIGBLOCK-FULLPATH] --- PASS-AFTER arm (fix active) ---\n"); fflush(stdout);
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_after = test_sim_inproc_2();
+	long after_rx    = sim2_last_rx_have;
+	int  after_clean = bigblock_first_clean;
+	int  after_K     = bigblock_first_K;
+	bool after_full  = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-FULLPATH] PASS-AFTER: first_block clean=%d/%d rx_have=%ld/%ld "
+	       "full=%d (rc=%d)\n", after_clean, after_K, after_rx, PAYLOAD,
+	       (int)after_full, rc_after);
+	fflush(stdout);
+	// The fix MUST: (a) decode the first big-block ALL-CLEAN (every codeword byte-faithful
+	// through the real whiten+carve), (b) deliver the FULL message byte-faithful to the app
+	// FIFO, and (c) pass the underlying 2-instance G-SMOKE asserts (CONNECT + byte-correct).
+	bool pass_after_ok = (after_K > 0) && (after_clean == after_K)
+	                  && after_full && (rc_after == 0);
+	printf("[TEST-BIGBLOCK-FULLPATH] %s: PASS-AFTER decodes the first block all-clean "
+	       "(clean=%d/%d) AND delivers the full %ld-byte message byte-faithful through the "
+	       "REAL receive_bigblock+carve+whiten path\n",
+	       pass_after_ok ? "PASS" : "FAIL", after_clean, after_K, PAYLOAD);
+	if(!pass_after_ok) failed++;
+
+	restore_env();
+
+	printf("[TEST-BIGBLOCK-FULLPATH] %s (%d failure%s)  [fail_before: first_clean=%d/%d "
+	       "rx=%ld | pass_after: first_clean=%d/%d rx=%ld/%ld]\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s",
+	       before_clean, before_K, before_rx, after_clean, after_K, after_rx, PAYLOAD);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// MULTI-CW WINDOW REGRESSION (fact-doc §17): the K>1 full-block byte-faithfulness test the
+// 622-byte synthetic cases and the single-arming fullpath could NOT catch. A FULL K=8 block
+// (1200 app bytes spanning ALL 8 codewords) is driven through the LIVE 2-instance SIM_INPROC
+// CFG16 path (TX-encode->whiten->cl_sim_awgn PHY->receive_bigblock de-whiten->per-cw CRC carve
+// ->FIFO deliver). The decode snapshots buffer_Nsymb samples but only when frames_to_read==0,
+// so frames_to_read sizes how many FRESH symbols are accumulated before the block is decoded.
+//
+// Three arms in ONE process prove the ROOT CAUSE is the RX capture-WINDOW (NOT whiten/offset):
+//   A) CRC-ON  PASS-AFTER (block window): all 8 codewords decode byte-faithful AND the per-cw
+//      wire-CRC PASSES all 8 (clean==K==8, NOT demoting) -> full 1200B delivered byte-faithful.
+//   B) NOCRC   FAIL-BEFORE (stock window via MERCURY_BIGBLOCK_DEFEAT_FIX=1): the block is forced
+//      CLEAN (CRC demote disabled) and "delivers" 1200/1200, but the BYTES ARE WRONG
+//      (bytes_ok=0) — cw0 byte-correct (early symbols, fresh), cw1..cw7 corrupt (later symbols
+//      outside the truncated window -> stale ring). This is the EXACT HW signature.
+//   C) NOCRC   PASS-AFTER (block window): the SAME NOCRC isolation now delivers byte-faithful
+//      (bytes_ok=1) because the full window makes cw1..cw7 real. The ONLY variable A->B->C is
+//      the armed frames_to_read window — proving the fix and refuting the whiten/offset theory.
+int cl_arq_controller::test_sim_inproc_bigblock_multicw()
+{
+	printf("[TEST-BIGBLOCK-MULTICW] ===== FULL K=8 block (all 8 codewords) byte-faithful "
+	       "through the LIVE receive_bigblock+de-whiten+per-cw-CRC carve =====\n");
+	fflush(stdout);
+
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_SIM_2INST", "MERCURY_BIGBLOCK_FRAMING", "MERCURY_BIGBLOCK_K",
+		"MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
+		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
+		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_BIGBLOCK_NOCRC",
+		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key   = keys[i];
+		env_saved[(size_t)i].had   = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	const long PAYLOAD = 1200;   // a FULL K=8 block spanning all 8 codewords
+	set_env("MERCURY_SIM_2INST",        "1");
+	set_env("MERCURY_BIGBLOCK_FRAMING", "1");
+	set_env("MERCURY_BIGBLOCK_K",       "8");
+	set_env("MERCURY_SIM2_PIN",         "1");
+	set_env("MERCURY_SIM2_CFG",         "16");
+	set_env("MERCURY_SIM2_ROBUST",      "0");
+	{ char b[32]; snprintf(b,sizeof(b),"%ld",PAYLOAD); set_env("MERCURY_SIM2_PAYLOAD_BYTES", b); }
+	set_env("MERCURY_SIM2_MAXITERS",    "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS", "60000");
+
+	int failed = 0;
+
+	// --- ARM A: CRC-ON, block window (the fix). All 8 codewords byte-faithful + CRC passes. ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",              "0");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",         "0");
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_a = test_sim_inproc_2();
+	int  a_clean = bigblock_first_clean;
+	int  a_K     = bigblock_first_K;
+	bool a_full  = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-A (CRC-ON, block window): first_block clean=%d/%d "
+	       "rx_have=%ld/%ld bytes_ok=%d (rc=%d)\n", a_clean, a_K, sim2_last_rx_have, PAYLOAD,
+	       (int)sim2_last_bytes_ok, rc_a);
+	bool a_ok = (a_K == 8) && (a_clean == a_K) && a_full && (rc_a == 0);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-A all 8 codewords clean (per-cw CRC PASSES, NOT "
+	       "demoting) AND full 1200B byte-faithful\n", a_ok ? "PASS" : "FAIL");
+	if(!a_ok) failed++;
+
+	// --- ARM B: NOCRC, STOCK window (fail-before). Forced-clean but BYTES WRONG (cw0 ok). ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");   // isolate byte-truth from the CRC gate
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX", "1");   // restore the pre-fix stock-frame window
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_b = test_sim_inproc_2();
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-B (NOCRC, stock window): rx_have=%ld/%ld bytes_ok=%d "
+	       "(rc=%d) — expect delivered-but-WRONG (cw1..cw7 stale-ring corruption)\n",
+	       sim2_last_rx_have, PAYLOAD, (int)sim2_last_bytes_ok, rc_b);
+	bool b_repro = (sim2_last_rx_have == PAYLOAD) && !sim2_last_bytes_ok;
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-B reproduces the corruption (block forced CLEAN, "
+	       "1200B 'delivered', but bytes WRONG)\n", b_repro ? "PASS" : "FAIL");
+	if(!b_repro) failed++;
+
+	// --- ARM C: NOCRC, BLOCK window (the fix). SAME NOCRC isolation now byte-faithful. ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX", "0");   // the fix: block-span window
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_c = test_sim_inproc_2();
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-C (NOCRC, block window): rx_have=%ld/%ld bytes_ok=%d "
+	       "(rc=%d) — expect byte-faithful (cw1..cw7 now fresh)\n",
+	       sim2_last_rx_have, PAYLOAD, (int)sim2_last_bytes_ok, rc_c);
+	bool c_ok = (sim2_last_rx_have == PAYLOAD) && sim2_last_bytes_ok;
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-C the window fix recovers byte-faithful delivery "
+	       "(the ONLY variable B->C is the armed frames_to_read window — NOT the whiten)\n",
+	       c_ok ? "PASS" : "FAIL");
+	if(!c_ok) failed++;
+
+	restore_env();
+
+	printf("[TEST-BIGBLOCK-MULTICW] %s (%d failure%s)  [A: clean=%d/%d byteok | B: corrupt-repro "
+	       "| C: window-fix byteok]\n", failed == 0 ? "ALL PASS" : "FAILURES", failed,
+	       failed == 1 ? "" : "s", a_clean, a_K);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }

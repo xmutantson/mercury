@@ -333,4 +333,18 @@ void cl_psk::demod(const std::complex <double> *in,int nItems,float *out,float v
 
 }
 
+std::complex <double> cl_psk::slice_nearest(std::complex <double> y) const
+{
+	if(constellation==NULL || nSymbols<=0) return std::complex<double>(0,0);
+	int best=0; double bestd=1e300;
+	for(int j=0;j<nSymbols;j++)
+	{
+		double dr=real(y)-real(constellation[j]);
+		double di=imag(y)-imag(constellation[j]);
+		double d=dr*dr+di*di;
+		if(d<bestd){ bestd=d; best=j; }
+	}
+	return constellation[best];
+}
+
 
