@@ -1100,6 +1100,25 @@ public:
     return rx_bsi != last_applied_sack_bsi;      // partial: dedupe vs partial tracker
   }
 
+  // R039 (race audit 2026-06-06): the SACK-v2 accept "window" check. A decoded
+  // SACK_RSP's rx_bsi must be the current or just-prior CMD batch (mod 256),
+  // because RSP only ACKs frames whose batch_seq_id is one of those. The OFDM
+  // SACK_RSP arm (arq_commander.cc:2814) had NO such guard (only an exact-dup
+  // reject), unlike the MFSK ACK+SACK arms (arq_commander.cc:2642-2645 partial,
+  // :121-126 clean). decode_sack_v2_frame() is CRC8-only and never validates
+  // rx_bsi, so a double-checksum (LDPC+CRC8) false-decode out-of-window SACK_RSP
+  // would be applied by slot index against a messages_tx[] describing a
+  // DIFFERENT batch -> silent mis-ACK / needless retransmit. PURE + static so
+  // --test-sack-oow-reject exercises the EXACT production predicate.
+  // cmd_bsi = cmd_batch_seq_id & 0xFF, prev_bsi = (cmd_bsi - 1) & 0xFF.
+  static bool sack_v2_bsi_in_window(int rx_bsi, int cmd_batch_seq_id)
+  {
+    unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+    unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+    unsigned rx       = (unsigned)(rx_bsi & 0xFF);
+    return (rx == cmd_bsi || rx == prev_bsi);
+  }
+
   // TURBO step-1 SNR-capability pre-truncation gate (gearshift-climb-engine.md
   // §20 — the CFG15->CFG16 under-climb on clean). PURE so --test-climb-engine can
   // drive it with no live telecom_system / channel.
@@ -1279,6 +1298,16 @@ public:
   // 'ofdm' variant: should PASS on HEAD (regression guard).
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
+
+  // R039 (race audit 2026-06-06) — OFDM SACK_RSP out-of-window reject test.
+  // CLI: --test-sack-oow-reject. Builds a CRC8-VALID SACK_RSP payload with an
+  // out-of-window batch_seq_id, drives the REAL decode_sack_v2_frame() (which is
+  // CRC8-only and DOES accept it — the root-cause gap), then applies the REAL
+  // production window predicate sack_v2_bsi_in_window() (the fix). Asserts: the
+  // OOW frame decodes (proving the decode layer doesn't guard), the new guard
+  // REJECTS it (pre-fix: no guard -> bitmap applied -> mis-ACK), and an
+  // in-window frame is still ACCEPTED (regression guard). Returns 0=PASS,1=FAIL.
+  int test_sack_oow_reject();
 
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //

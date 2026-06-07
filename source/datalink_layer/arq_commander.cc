@@ -2820,6 +2820,27 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							sack_bitmap, data_batch_size, &rx_bsi);
 						SACK_TRACE("decode_sack_v2: ok=%d rx_bsi=%u cmd_bsi=%d",
 							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
+						// R039 (race audit 2026-06-06): bsi-in-window guard.
+						// decode_sack_v2_frame() is CRC8-only and never validates
+						// rx_bsi. The MFSK arms reject rx_bsi outside the
+						// {cmd_bsi, prev_bsi} window (arq_commander.cc:2642-2645,
+						// :121-126); the OFDM arm previously had only the exact-dup
+						// reject below, so a double-checksum (LDPC+CRC8) false-decode
+						// of an out-of-window SACK_RSP would be applied by slot index
+						// against a messages_tx[] describing a DIFFERENT batch ->
+						// silent mis-ACK / needless retransmit. Treat OOW as a CRC
+						// fail (fall through to the timeout-driven full-batch
+						// retransmit, exactly as if the OFDM frame had been lost).
+						if(decoded
+						   && !sack_v2_bsi_in_window((int)rx_bsi, cmd_batch_seq_id))
+						{
+							unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+							printf("[CMD-SACK-V2-OOW] rx_bsi=%u not in window {cmd=%u,prev=%u} — discarding (treat as CRC fail)\n",
+								(unsigned)rx_bsi, cmd_bsi, prev_bsi);
+							fflush(stdout);
+							decoded = false;
+						}
 						if(decoded
 						   && (int)rx_bsi == cmd_last_applied_sack_bsi)
 						{

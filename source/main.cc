@@ -446,6 +446,9 @@ int main(int argc, char *argv[])
                                         // 'mfsk' should FAIL on HEAD (used_mfsk_path=true bypasses send_sack_v2_frame's Step 8a bump).
                                         // 'ofdm' should PASS on HEAD (regression guard for the existing OFDM SACK_RSP path).
                                         // One-shot at startup, then exit. See fact-documents/sack_partial_bsi_advance.md §5.
+    bool test_sack_oow_reject_cli = false; // --test-sack-oow-reject: R039 — OFDM SACK_RSP out-of-window
+                                        // reject. Drives real decode_sack_v2_frame + real sack_v2_bsi_in_window guard;
+                                        // asserts CRC8-valid OOW SACK decoded-but-rejected, in-window accepted. One-shot, exits rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -918,6 +921,15 @@ int main(int argc, char *argv[])
             if (strcmp(arg, "mfsk") == 0 || strcmp(arg, "ofdm") == 0)
                 test_partial_bsi_advance_cli = arg;
             else { fprintf(stderr, "--test-partial-bsi-advance: expected 'mfsk' or 'ofdm'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sack-oow-reject") == 0)
+        {
+            // R039 — OFDM SACK_RSP out-of-window reject regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.5 / §5.4.
+            test_sack_oow_reject_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1984,6 +1996,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_partial_bsi_advance(test_partial_bsi_advance_cli);
             printf("[FLAG] Partial-bsi-advance test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_sack_oow_reject_cli) {
+            // R039 — OFDM SACK_RSP out-of-window reject (one-shot, then exit rc).
+            printf("[FLAG] --test-sack-oow-reject: invoking R039 OFDM SACK_RSP "
+                   "out-of-window reject regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_sack_oow_reject();
+            printf("[FLAG] Sack-oow-reject test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

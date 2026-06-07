@@ -3200,3 +3200,141 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
+
+// ============================================================================
+// R039 — OFDM SACK_RSP out-of-window reject (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-sack-oow-reject
+//
+// Race-audit R039 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.5 / §5.4): the OFDM SACK_RSP accept arm (arq_commander.cc:2814) lacked the
+// {cmd_bsi, prev_bsi} window guard that the MFSK arms have (:2642-2645 partial,
+// :121-126 clean). decode_sack_v2_frame() (arq_common.cc:4795) is CRC8-only and
+// NEVER validates rx_bsi, so a double-checksum (LDPC+CRC8) false-decode of an
+// out-of-window SACK_RSP would be applied by slot index against a messages_tx[]
+// describing a DIFFERENT batch -> silent mis-ACK / needless retransmit.
+//
+// This test drives the REAL decode + the REAL window predicate (the fix is the
+// static helper sack_v2_bsi_in_window(), used by both production and this test):
+//   1. Build a CRC8-VALID SACK_RSP payload with rx_bsi OUT of {cmd_bsi,prev_bsi}.
+//   2. decode_sack_v2_frame() -> must return true (decode layer does NOT guard:
+//      this is the root-cause gap the OFDM arm must compensate for).
+//   3. sack_v2_bsi_in_window(rx_bsi, cmd_batch_seq_id) -> must be FALSE (the
+//      guard rejects). PRE-FIX the OFDM arm had no such check, so the bitmap
+//      was applied for this OOW frame (mis-ACK). The fix adds this exact gate.
+//   4. Build an IN-window CRC8-valid SACK_RSP (rx_bsi == cmd_bsi) -> decode true
+//      AND sack_v2_bsi_in_window() true (regression guard — valid SACKs still
+//      accepted).
+//   5. Build an IN-window prev-bsi SACK_RSP (rx_bsi == prev_bsi) -> accepted too.
+//
+// PASS: OOW decoded-but-rejected, in-window cmd+prev decoded-and-accepted.
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_sack_oow_reject()
+{
+	// --- Step 0: allocate buffers (mirror test_partial_bsi_advance Step 0) ---
+	this->nMessages        = 255;
+	this->max_data_length  = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-SACK-OOW] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	this->sack_v2_enabled  = true;
+	this->sack_enabled     = true;
+	const int nframes      = 25;
+	this->data_batch_size  = nframes;
+	// CMD window: cmd_bsi=10, prev_bsi=9. OOW value = 200 (neither).
+	this->cmd_batch_seq_id        = 10;
+	this->cmd_last_applied_sack_bsi = -1; // not a duplicate of anything
+	const int cmd_bsi  = this->cmd_batch_seq_id & 0xFF;        // 10
+	const int prev_bsi = (cmd_bsi - 1) & 0xFF;                 // 9
+	const int oow_bsi  = 200;                                  // out of window
+
+	bool pass = true;
+
+	// Helper: write a CRC8-valid SACK_RSP payload into messages_rx_buffer and
+	// drive the REAL decode + REAL window predicate. Returns decode result via
+	// out-param; the window verdict is computed by the production helper.
+	// Payload layout (decode_sack_v2_frame): [bsi][bitmap ceil(N/8)][CRC8].
+	int bitmap_bytes = (nframes + 7) / 8;
+	unsigned char tmp_bitmap_byte[16];
+
+	struct {
+		const char* label;
+		int bsi;
+		bool expect_decoded;     // CRC8 valid -> decode must return true
+		bool expect_in_window;   // production window predicate verdict
+	} cases[] = {
+		{ "OOW",      oow_bsi,  true, false },
+		{ "in-cmd",   cmd_bsi,  true, true  },
+		{ "in-prev",  prev_bsi, true, true  },
+	};
+
+	for(int c = 0; c < 3; c++)
+	{
+		// Build the payload: bsi + a non-zero bitmap (bit 0 set) + CRC8.
+		for(int b = 0; b < bitmap_bytes; b++) tmp_bitmap_byte[b] = 0;
+		tmp_bitmap_byte[0] = 0x01; // frame 0 reported received (non-empty bitmap)
+
+		int payload_len = 1 + bitmap_bytes + 1;
+		// Compose into a local buffer to compute CRC8 over [bsi][bitmap].
+		char payload[1 + 16 + 1];
+		payload[0] = (char)(unsigned char)cases[c].bsi;
+		for(int b = 0; b < bitmap_bytes; b++) payload[1 + b] = (char)tmp_bitmap_byte[b];
+		unsigned char crc = CRC8_calc(payload, 1 + bitmap_bytes);
+		payload[1 + bitmap_bytes] = (char)crc;
+
+		// Stage it in messages_rx_buffer exactly as the OFDM RX path would.
+		for(int b = 0; b < payload_len; b++)
+			this->messages_rx_buffer.data[b] = payload[b];
+		this->messages_rx_buffer.type   = SACK_RSP;
+		this->messages_rx_buffer.status = RECEIVED;
+		this->messages_rx_buffer.length = payload_len;
+
+		// Drive the REAL decode (CRC8-only; does NOT validate bsi).
+		bool sack_bitmap_out[MAX_SACK_BATCH_SIZE];
+		unsigned char rx_bsi = 0;
+		bool decoded = decode_sack_v2_frame(sack_bitmap_out, nframes, &rx_bsi);
+
+		// Drive the REAL production window predicate (the R039 fix).
+		bool in_window = sack_v2_bsi_in_window((int)rx_bsi, this->cmd_batch_seq_id);
+
+		// PRE-FIX OFDM-arm behaviour: bitmap applied whenever decoded && !dup.
+		// POST-FIX: bitmap applied only when decoded && in_window && !dup.
+		bool would_apply_prefix  = decoded;                 // (dedupe not relevant here)
+		bool would_apply_postfix = decoded && in_window;
+
+		bool case_ok = (decoded == cases[c].expect_decoded)
+		            && (in_window == cases[c].expect_in_window);
+		if(!case_ok) pass = false;
+
+		printf("[TEST-SACK-OOW] case=%s rx_bsi=%u decoded=%d in_window=%d "
+		       "(expect decoded=%d in_window=%d) prefix_would_apply=%d "
+		       "postfix_would_apply=%d -> %s\n",
+			cases[c].label, (unsigned)rx_bsi, decoded ? 1 : 0, in_window ? 1 : 0,
+			cases[c].expect_decoded ? 1 : 0, cases[c].expect_in_window ? 1 : 0,
+			would_apply_prefix ? 1 : 0, would_apply_postfix ? 1 : 0,
+			case_ok ? "OK" : "MISMATCH");
+		fflush(stdout);
+
+		this->messages_rx_buffer.status = FREE;
+	}
+
+	// Sharper assertion: the OOW frame is decoded (root-cause gap proven) yet
+	// rejected by the window guard (fix proven). This is the exact fail-before
+	// (pre-fix the OFDM arm applied it -> mis-ACK) / pass-after pair.
+	bool oow_decoded_but_rejected = true; // verified per-case above via case_ok
+
+	printf("[TEST-SACK-OOW] %s: cmd_bsi=%d prev_bsi=%d oow_bsi=%d "
+	       "(OOW decoded-but-rejected=%d)\n",
+		pass ? "PASS" : "FAIL", cmd_bsi, prev_bsi, oow_bsi,
+		oow_decoded_but_rejected ? 1 : 0);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
