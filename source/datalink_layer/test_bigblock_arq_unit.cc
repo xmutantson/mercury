@@ -2502,24 +2502,67 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 	// correction. This test is the durable off-bench arbiter for that fix.
 	// ============================================================================
 
-	// Save+restore the channel env so the test leaves the process clean. The CFO knobs are read
+	// Save+restore the channel env so the test leaves the process clean. The CFO/SFO knobs are read
 	// by cl_sim_awgn at CONSTRUCTION, so they must be set BEFORE the impaired channel is built.
 	auto getenv_s = [](const char* k){ const char* v=std::getenv(k); return v?std::string(v):std::string(); };
-	bool had_cfo=std::getenv("MERCURY_SIM2_CFO_HZ")!=NULL, had_cfow=std::getenv("MERCURY_SIM2_CFO_WALK_HZ")!=NULL;
-	std::string sv_cfo=getenv_s("MERCURY_SIM2_CFO_HZ"), sv_cfow=getenv_s("MERCURY_SIM2_CFO_WALK_HZ");
-	auto set_cfo = [&](const char* hz, const char* walk){
-#if defined(_WIN32)
-		_putenv_s("MERCURY_SIM2_CFO_HZ", hz); _putenv_s("MERCURY_SIM2_CFO_WALK_HZ", walk);
-#else
-		setenv("MERCURY_SIM2_CFO_HZ", hz, 1); setenv("MERCURY_SIM2_CFO_WALK_HZ", walk, 1);
-#endif
-	};
 	auto put = [&](const char* k, bool had, const std::string& v){
 #if defined(_WIN32)
 		if(had) _putenv_s(k, v.c_str()); else _putenv_s(k, "");
 #else
 		if(had) setenv(k, v.c_str(), 1); else unsetenv(k);
 #endif
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	// All channel-impairment + estimator-path env keys this test touches (saved/restored as a set).
+	const char* IMP_KEYS[] = {
+		"MERCURY_SIM2_CFO_HZ", "MERCURY_SIM2_CFO_WALK_HZ", "MERCURY_SIM2_CFO_DRIFT_F3DB", "MERCURY_SIM2_CFO_MAX_HZ",
+		"MERCURY_SIM2_SFO_PPM", "MERCURY_SIM2_SFO_WALK_PPM", "MERCURY_SIM2_SFO_MAX_PPM",
+		"MERCURY_BIGBLOCK_SPARSE2D"
+	};
+	const int N_IMP = (int)(sizeof(IMP_KEYS)/sizeof(IMP_KEYS[0]));
+	bool        imp_had[8]; std::string imp_sv[8];
+	for(int i=0;i<N_IMP;i++){ imp_had[i]=(std::getenv(IMP_KEYS[i])!=NULL); imp_sv[i]=getenv_s(IMP_KEYS[i]); }
+	auto restore_imp = [&](){ for(int i=0;i<N_IMP;i++) put(IMP_KEYS[i], imp_had[i], imp_sv[i]); };
+
+	// HW-FAITHFUL IMPAIRMENT VECTOR (fix/bigblock-chanest, results_sim_hw_faithfulness.json).
+	// Mined from the Option-C HW RSP logs (A_rsp_a1..a4.log) + block_meanh_diag:
+	//   • CFO: per-frame Moose swing sd ~33 Hz, residual sd ~31 Hz (the per-frame path re-acquires
+	//     Moose every ~12-sym frame and reads meanH 0.981; the big-block does ONE head Moose over
+	//     133 sym/1.56 s, so it integrates a residual a substantial fraction of that swing on EVERY
+	//     block). Faithful: static residual sigma 12 Hz (one draw/acquisition) + a fast cross-frame
+	//     AR(1) drift sd 25 Hz at f3db 3 Hz (varies WITHIN the block, unlike the 0.05 Hz many-frame-
+	//     flat default), clamped to the ±93.75 Hz Moose band.
+	//   • SFO: HW CLK-drift forensics (CLK-RX/CLK-TX) sd 210/563 ppm (10 s soundcard-window estimates);
+	//     differential ~150 ppm static + ~1 ppm walk, ±500 ppm band. (SFO is a SECONDARY lever for the
+	//     big-block meanH metric — it is largely GI-absorbed / CPE-corrected; CFO is dominant — but it
+	//     is injected at the real magnitude so the channel content is faithful for any future fix that
+	//     DOES track timing.)
+	// ESTIMATOR PATH: the HW big-block adaptive selector lands its blocks PREDOMINANTLY on the flat-ML
+	// deep-collapse path (HW all-block meanH: 14/51 deep<0.02, 34/51 mid 0.02-0.09, only 3/51 >=0.09;
+	// median 0.039, chosen-attempt median 0.068). The single-block test's adaptive sentinel
+	// (last_channel_selectivity=-1 → sparse-2D) was the ARTIFACT that floored sim meanH at ~0.10 and
+	// made the channel look like it "under-collapsed" vs HW. Pinning flat-ML (MERCURY_BIGBLOCK_SPARSE2D=0)
+	// is the HW-faithful estimator path — under the real vector it reproduces the HW collapse band
+	// (AFCTRACK-off meanH ~0.008 == HW deep ~0.005; Option C AFCTRACK-on ~0.03-0.07 == HW recovered
+	// median 0.068, still < health gate, bytes_ok=0 == HW bytes_delivered=0). DBG overrides below let a
+	// developer isolate any axis; the defaults ARE the faithful vector.
+	auto set_faithful_impairments = [&](){
+		const char* d;
+		d=std::getenv("MERCURY_BBCHANEST_DBG_CFO_HZ");        set_env("MERCURY_SIM2_CFO_HZ",       (d&&*d)?d:"12");
+		d=std::getenv("MERCURY_BBCHANEST_DBG_CFO_WALK_HZ");   set_env("MERCURY_SIM2_CFO_WALK_HZ",  (d&&*d)?d:"25");
+		d=std::getenv("MERCURY_BBCHANEST_DBG_CFO_F3DB");      set_env("MERCURY_SIM2_CFO_DRIFT_F3DB",(d&&*d)?d:"3");
+		set_env("MERCURY_SIM2_CFO_MAX_HZ", "93");
+		d=std::getenv("MERCURY_BBCHANEST_DBG_SFO_PPM");       set_env("MERCURY_SIM2_SFO_PPM",      (d&&*d)?d:"150");
+		d=std::getenv("MERCURY_BBCHANEST_DBG_SFO_WALK_PPM");  set_env("MERCURY_SIM2_SFO_WALK_PPM", (d&&*d)?d:"1");
+		set_env("MERCURY_SIM2_SFO_MAX_PPM", "500");
+		// HW-faithful estimator path (flat-ML deep-collapse) unless a DBG A/B forces sparse-2D.
+		d=std::getenv("MERCURY_BBCHANEST_DBG_SPARSE2D");      set_env("MERCURY_BIGBLOCK_SPARSE2D", (d&&*d)?d:"0");
 	};
 	const uint64_t SEED = ((uint64_t)12345 << 1) | 1u;   // A→B direction (live wire convention)
 
@@ -2533,34 +2576,53 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 	       sanity_ok ? "PASS" : "FAIL");
 	if(!sanity_ok) failed++;
 
-	// ---------- 1) FAIL-BEFORE: residual CFO ON → estimate COLLAPSES, not 8/8. ----------
-	// DIAG-only override (defaults 8/4 = the arbiter contract; lets Option-C characterization
-	// isolate static-vs-drift without changing the default fail-before/pass-after gate).
-	const char* dbg_hz   = std::getenv("MERCURY_BBCHANEST_DBG_CFO_HZ");
-	const char* dbg_walk = std::getenv("MERCURY_BBCHANEST_DBG_CFO_WALK_HZ");
-	set_cfo((dbg_hz&&*dbg_hz)?dbg_hz:"8", (dbg_walk&&*dbg_walk)?dbg_walk:"4");
+	// ---------- 1) FAIL-BEFORE: HW-faithful CFO+SFO+DRIFT ON → estimate COLLAPSES, not 8/8. ----------
+	// The impaired arms now inject the FULL measured HW vector (CFO static+fast-drift + SFO+walk) on
+	// the HW-faithful flat-ML estimator path (set_faithful_impairments above), NOT the prior CFO-only
+	// 8/4 sparse-2D artifact. DBG_* overrides isolate any single axis without changing the gate.
+	set_faithful_impairments();
+	int afctrack_on = 1; { const char* e=std::getenv("MERCURY_BIGBLOCK_AFCTRACK"); if(e&&*e) afctrack_on=atoi(e); }
 	double b_meanh=-1; int b_cwok=-1; bool b_bytes=false;
 	{ cl_sim_awgn ch_bad(SEED, 900.0); run_block(&ch_bad, b_meanh, b_cwok, b_bytes); }
-	printf("[TEST-BIGBLOCK-CHANEST] FAIL-BEFORE (CFO): meanH=%.4f (want<%.2f) cw_ok=%d/%d bytes_ok=%d\n",
-	       b_meanh, MEANH_BAD, b_cwok, K, (int)b_bytes);
+	printf("[TEST-BIGBLOCK-CHANEST] FAIL-BEFORE (CFO+SFO+DRIFT, AFCTRACK=%d): meanH=%.4f (want<%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	       afctrack_on, b_meanh, MEANH_BAD, b_cwok, K, (int)b_bytes);
 	bool fail_before_ok = (b_meanh >= 0.0) && (b_meanh < MEANH_BAD) && !(b_cwok == K && b_bytes);
 	printf("[TEST-BIGBLOCK-CHANEST] %s: FAIL-BEFORE reproduces the HW [RXACQ] collapse "
 	       "(meanH=%.4f<%.2f, NOT 8/8 byte-faithful)\n",
 	       fail_before_ok ? "PASS" : "FAIL", b_meanh, MEANH_BAD);
 	if(!fail_before_ok) failed++;
 
-	// ---------- 2) PASS-AFTER: same impaired channel; a fix must restore estimate + 8/8. ----------
+	// ---------- 1b) HW-FAITHFULNESS: the collapsed meanH lands in the MEASURED HW collapse band. ----------
+	// HW Option-C run (results_bb_hw_optionC.json): per-block meanH min 0.0, median 0.039 (all blocks)
+	// / 0.068 (chosen attempt), max 0.241; AFCTRACK-on recovered from the stock ~0.005 collapse but did
+	// NOT reach the 0.18 health gate and delivered 0 bytes. The faithful sim must land its impaired
+	// meanH in that band [0, 0.10] — NOT the non-HW sparse-2D artifact floor (~0.10-0.18) the CFO-only
+	// 8/4 default produced. This is the "sim predicts HW" gate (faithfulness, not the fix's pass-after).
+	const double HW_BAND_HI = 0.10;   // upper edge of the HW collapse band (chosen 0.068, all-block 0.039)
+	bool hw_faithful = (b_meanh >= 0.0) && (b_meanh <= HW_BAND_HI);
+	printf("[TEST-BIGBLOCK-CHANEST] %s: SIM-PREDICTS-HW faithfulness — impaired meanH=%.4f in HW collapse "
+	       "band [0,%.2f] (HW median 0.039-0.068)\n", hw_faithful ? "PASS" : "FAIL", b_meanh, HW_BAND_HI);
+	if(!hw_faithful) failed++;
+
+	// ---------- 2) PASS-AFTER: same impaired channel; the CFO/SFO-tracking fix must restore estimate + 8/8. ----------
+	// AFCTRACK (Option C) is default-ON; this arm is the SAME faithful channel. Under the faithful
+	// vector Option C RECOVERS the estimate partially (HW: 0.005→0.068) but does NOT reach health or
+	// deliver bytes — reproducing the HW "estimate-not-payload" gap OFF-BENCH. So PASS-AFTER still
+	// FAILS the 0.18 health+8/8 gate — correctly, because the fix is incomplete at the payload layer
+	// (the durable arbiter for the next iteration: a developer can now develop the per-symbol tracker
+	// AND/OR a windowed-OFDM ICI-reducing lever against a channel that PREDICTS HW, HW-validate only
+	// the final). NOT a band-aid: the gate is unchanged; we ADDED the faithfulness check, not weakened.
 	double f_meanh=-1; int f_cwok=-1; bool f_bytes=false;
 	{ cl_sim_awgn ch_fix(SEED, 900.0); run_block(&ch_fix, f_meanh, f_cwok, f_bytes); }
-	printf("[TEST-BIGBLOCK-CHANEST] PASS-AFTER (CFO, fix): meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	printf("[TEST-BIGBLOCK-CHANEST] PASS-AFTER (CFO+SFO+DRIFT, fix): meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
 	       f_meanh, MEANH_OK, f_cwok, K, (int)f_bytes);
 	bool pass_after_ok = (f_meanh > MEANH_OK) && (f_cwok == K) && f_bytes;
-	printf("[TEST-BIGBLOCK-CHANEST] %s: PASS-AFTER healthy estimate + 8/8 byte-faithful under CFO "
-	       "(FAILS until a PHY CFO-tracking fix lands)\n", pass_after_ok ? "PASS" : "FAIL");
+	printf("[TEST-BIGBLOCK-CHANEST] %s: PASS-AFTER healthy estimate + 8/8 byte-faithful under faithful "
+	       "CFO+SFO+DRIFT (FAILS until the CFO/SFO-tracking fix reaches the PAYLOAD layer)\n",
+	       pass_after_ok ? "PASS" : "FAIL");
 	if(!pass_after_ok) failed++;
 
-	put("MERCURY_SIM2_CFO_HZ", had_cfo, sv_cfo);
-	put("MERCURY_SIM2_CFO_WALK_HZ", had_cfow, sv_cfow);
+	restore_imp();
 	restore_k();
 	delete A; delete B; delete tsA; delete tsB;
 
