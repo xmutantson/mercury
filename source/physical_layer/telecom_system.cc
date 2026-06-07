@@ -7483,6 +7483,47 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 			          << " dfs[" << mn << ".." << mx << "] mean=" << mean << " psi0=" << psi0
 			          << " Tsym=" << Tsym << "s | fs_base=" << fs_base
 			          << " Nfft=" << Nfft << " Ngi=" << Ngi << " Nofdm=" << Nofdm << std::endl;
+			// GROUND-TRUTH residual per-symbol common phase from ALL known pilots on the
+			// AFC-corrected rx (this is what a post-FFT CPE corrector would see/remove).
+			// Per symbol n: theta[n]=arg(Σ_pilots rx[n,j]·conj(X)). Unwrap, report span +
+			// RMS of the residual AFTER removing a best-fit linear ramp (= what's left for
+			// a per-symbol CPE corrector to chase that a constant CFO cannot).
+			std::vector<double> th(Ngrid,0.0); { int pidx=0; double prev=0; bool hp=false;
+			  for(int n=0;n<Ngrid;n++){ std::complex<double> acc(0,0);
+			    for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+			      std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++]; acc+=rx[(size_t)n*Nc+j]*std::conj(X); }
+			    double a=(std::abs(acc)>1e-18)?atan2(acc.imag(),acc.real()):(hp?prev:0.0);
+			    if(hp){ while(a-prev>M_PI)a-=2*M_PI; while(a-prev<-M_PI)a+=2*M_PI; } th[n]=a; prev=a; hp=true; } }
+			double thmn=1e9,thmx=-1e9; for(int n=0;n<Ngrid;n++){ if(th[n]<thmn)thmn=th[n]; if(th[n]>thmx)thmx=th[n]; }
+			// best-fit linear ramp residual RMS
+			double Sx=0,Sy=0,Sxx=0,Sxy=0; for(int n=0;n<Ngrid;n++){ Sx+=n; Sy+=th[n]; Sxx+=(double)n*n; Sxy+=(double)n*th[n]; }
+			double den=Ngrid*Sxx-Sx*Sx, sl=0,ic=0; if(fabs(den)>1e-12){ sl=(Ngrid*Sxy-Sx*Sy)/den; ic=(Sy-sl*Sx)/Ngrid; }
+			double rr=0; for(int n=0;n<Ngrid;n++){ double r=th[n]-(ic+sl*n); rr+=r*r; } rr=sqrt(rr/(Ngrid>0?Ngrid:1));
+			std::cout << "[AFC-PILTHETA] theta_span[" << thmn << ".." << thmx << "] slope=" << sl
+			          << " rad/sym  resid_after_ramp_RMS=" << rr << " rad" << std::endl;
+			// WITHIN-SYMBOL pilot phase spread: per symbol, the RMS deviation of each pilot's
+			// phase from that symbol's mean pilot phase. SMALL ⇒ residual is a per-symbol COMMON
+			// phase (CPE-fixable). LARGE ⇒ residual is per-subcarrier (ICI / estimate phase err,
+			// NOT removable by a per-symbol CPE). Averaged over symbols.
+			{ int pidx2=0; double wsum=0; double rsum=0; int wn=0;
+			  for(int n=0;n<Ngrid;n++){ std::vector<double> ph, kk; double cmean=th[n];
+			    for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+			      std::complex<double> X=ofdm.pilot_configurator.sequence[pidx2++];
+			      std::complex<double> r=rx[(size_t)n*Nc+j]/X;
+			      double p=atan2(r.imag(),r.real()); double d=p-cmean; while(d>M_PI)d-=2*M_PI; while(d<-M_PI)d+=2*M_PI;
+			      ph.push_back(cmean+d); kk.push_back((double)j); }
+			    if(ph.size()>=2){ double s=0; for(double p:ph){ double d=p-cmean; s+=d*d; }
+			      wsum+=sqrt(s/ph.size());
+			      // per-symbol linear fit phi = a + b*k; residual RMS = the NON-linear part
+			      // (NOT removable by a per-symbol CPE+slope corrector = ICI/selectivity).
+			      double Sx=0,Sy=0,Sxx=0,Sxy=0; int m=ph.size();
+			      for(int t=0;t<m;t++){ Sx+=kk[t]; Sy+=ph[t]; Sxx+=kk[t]*kk[t]; Sxy+=kk[t]*ph[t]; }
+			      double dn=m*Sxx-Sx*Sx, b=0,a=0; if(fabs(dn)>1e-12){ b=(m*Sxy-Sx*Sy)/dn; a=(Sy-b*Sx)/m; }
+			      double rs=0; for(int t=0;t<m;t++){ double e=ph[t]-(a+b*kk[t]); rs+=e*e; } rsum+=sqrt(rs/m);
+			      wn++; } }
+			  std::cout << "[AFC-WITHINSYM] mean within-symbol pilot phase RMS=" << (wn?wsum/wn:-1.0)
+			            << " rad | residual_after_per-sym_LINEAR_fit=" << (wn?rsum/wn:-1.0)
+			            << " rad (small=fixable by CPE+slope, large=ICI/selectivity)" << std::endl; }
 		}
 	}
 
@@ -7593,12 +7634,84 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		double pilraw=0.0; int pidx=0,np=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){ std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++]; pilraw+=std::abs(rx[(size_t)n*Nc+j]/X); np++; } pilraw/=(np>0?np:1);
 		double crms=0.0; for(int d=0;d<nData;d++) crms+=std::norm(deframed[d]); crms=sqrt(crms/(nData>0?nData:1));
 		double rxrms=0.0; int dn=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ rxrms+=std::norm(rx[(size_t)n*Nc+j]); dn++; } rxrms=sqrt(rxrms/(dn>0?dn:1));
+		// DECISION-DIRECTED post-EQ EVM + per-symbol-row residual common phase.
+		// slice each equalized DATA cell to the nearest 32-QAM point, accumulate the
+		// residual vector (y - ŷ) for EVM and the residual common phase arg(Σ y·conj(ŷ))
+		// per symbol-row n. If Option C left a per-row CPE that the block-avg H cannot
+		// remove, the per-row phases SPREAD even when mean|H| looks healthy.
+		double evm_num=0.0, evm_den=0.0; int evcnt=0;
+		double cpe_min=1e9, cpe_max=-1e9, cpe_abs_sum=0.0; int cpe_rows=0;
+		for(int n=0;n<Ngrid;n++){
+			std::complex<double> rowacc(0,0); int rown=0;
+			for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> y = eq[(size_t)n*Nc+j];
+				if(std::abs(y)<1e-12) continue;          // skip erased cells
+				std::complex<double> yhat = psk.slice_nearest(y);
+				std::complex<double> e = y - yhat;
+				evm_num += std::norm(e); evm_den += std::norm(yhat); evcnt++;
+				rowacc += y*std::conj(yhat); rown++;
+			}
+			if(rown>0){ double ph=atan2(rowacc.imag(),rowacc.real());
+				if(ph<cpe_min)cpe_min=ph; if(ph>cpe_max)cpe_max=ph; cpe_abs_sum+=fabs(ph); cpe_rows++; }
+		}
+		double evm = (evm_den>0.0)? sqrt(evm_num/evm_den) : -1.0;
+		double cpe_mean_abs = (cpe_rows>0)? cpe_abs_sum/cpe_rows : 0.0;
+		// GENIE decomposition: per DATA cell, the true channel H_g = rx / (ŷ·cscale),
+		// where ŷ is the sliced constellation point and cscale maps the unit-power
+		// constellation to the rx scale (cscale = pilot Hbar magnitude proxy). Decompose
+		// the equalizer error into (i) intra-column TIME variation of H_g (residual
+		// ICI/SFO/CFO the per-cell estimate cannot be constant against) vs (ii) the
+		// estimate's per-cell bias. csi_data already holds |H_est|^2 in deframed order.
+		{
+			// constellation rx-scale: mean |rx_data| / mean |ŷ| (decision-directed)
+			double sr=0.0, sy=0.0; int sc=0;
+			std::vector<std::complex<double>> Hg((size_t)Ngrid*Nc, std::complex<double>(0,0));
+			std::vector<char> Hg_ok((size_t)Ngrid*Nc, 0);
+			for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> y = eq[(size_t)n*Nc+j]; if(std::abs(y)<1e-12) continue;
+				std::complex<double> yhat = psk.slice_nearest(y);
+				sr += std::abs(rx[(size_t)n*Nc+j]); sy += std::abs(yhat); sc++;
+			}
+			double cscale = (sy>0.0)? sr/sy : 1.0;
+			for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> y = eq[(size_t)n*Nc+j]; if(std::abs(y)<1e-12) continue;
+				std::complex<double> yhat = psk.slice_nearest(y);
+				std::complex<double> Xs = yhat*cscale;
+				if(std::abs(Xs)>1e-12){ Hg[(size_t)n*Nc+j]=rx[(size_t)n*Nc+j]/Xs; Hg_ok[(size_t)n*Nc+j]=1; }
+			}
+			// intra-column TIME variation of the genie channel (std/mean of |Hg| per column,
+			// and the per-column phase spread) — averaged over data columns.
+			double col_magcv_sum=0.0, col_phspread_sum=0.0; int col_n=0;
+			for(int j=0;j<Nc;j++){
+				bool isdata=false; for(int n=0;n<Ngrid;n++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ isdata=true; break; }
+				if(!isdata) continue;
+				std::complex<double> macc(0,0); double m1=0,m2=0; int cn=0; double pmin=1e9,pmax=-1e9;
+				for(int n=0;n<Ngrid;n++){ size_t id=(size_t)n*Nc+j; if(!Hg_ok[id]) continue;
+					double mag=std::abs(Hg[id]); m1+=mag; m2+=mag*mag; macc+=Hg[id]; cn++; }
+				if(cn>=4){ double mean=m1/cn; double var=m2/cn-mean*mean; if(var<0)var=0;
+					double cv=(mean>1e-9)?sqrt(var)/mean:0.0;
+					// per-column residual phase spread: derotate by column-mean phase, measure RMS
+					double cmph=atan2(macc.imag(),macc.real()); double ps=0; int pc=0;
+					for(int n=0;n<Ngrid;n++){ size_t id=(size_t)n*Nc+j; if(!Hg_ok[id]) continue;
+						double d=atan2(Hg[id].imag(),Hg[id].real())-cmph;
+						while(d>M_PI)d-=2*M_PI; while(d<-M_PI)d+=2*M_PI; ps+=d*d; pc++; }
+					double phrms=(pc>0)?sqrt(ps/pc):0.0;
+					col_magcv_sum+=cv; col_phspread_sum+=phrms; col_n++; }
+			}
+			double col_magcv = (col_n>0)? col_magcv_sum/col_n : -1.0;
+			double col_phrms = (col_n>0)? col_phspread_sum/col_n : -1.0;
+			std::cout << "[DIAG-GENIE] cscale=" << cscale
+			          << " col_magCV=" << col_magcv << " col_phaseRMS=" << col_phrms
+			          << " (data cols=" << col_n << ")" << std::endl;
+		}
 		std::cout << "[DIAG-RXPB] nv=" << ofdm.noise_variance_estimate
 		          << " mean|H|=" << Hmag << " |H|[" << Hmin << ".." << Hmax << "]"
 		          << " std|H|=" << Hvar << " nzero(<0.3mean)=" << nzero << "/" << (Ngrid*Nc)
 		          << " pilraw|Y/X|=" << pilraw
 		          << " deframed_rms=" << crms
 		          << " rx_data_rms=" << rxrms
+		          << " DDevm=" << evm << " (n=" << evcnt << ")"
+		          << " rowCPE[" << cpe_min << ".." << cpe_max << "] meanabs=" << cpe_mean_abs
 		          << " last_sel=" << last_channel_selectivity << std::endl;
 	}
 

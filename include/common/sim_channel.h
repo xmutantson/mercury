@@ -645,6 +645,9 @@ public:
 	}
 
 	bool enabled() const { return enabled_; }
+	// The per-acquisition drawn STATIC residual frequency (Hz) — for the ideal
+	// whole-buffer SSB shift (cl_sim_awgn::apply_ideal_cfo, fact-doc §13 fidelity fix).
+	double resid_hz() const { return resid_hz_; }
 
 private:
 	// 641-tap Type-III Hilbert: band-flat (|H|>0.999) above ~245 Hz, so the OFDM
@@ -964,7 +967,7 @@ public:
 		// AGC transient runs LAST of the deterministic stages (on a fresh burst's
 		// onset, after the signal shaping, before AWGN).
 		sfo_.process(x, n);   // [DOMINANT] sample-rate offset (drifting resample)
-		cfo_.process(x, n);   // secondary cross-frame carrier phase ramp
+		if(!cfo_disabled_) cfo_.process(x, n);   // secondary cross-frame carrier phase ramp
 
 		det_.apply(x, n);   // DETERMINISTIC freq-selective floor (dominant EVM/meanH)
 		pn_.rotate(x, n);   // small residual phase noise on top (near-but-not-zero sd)
@@ -996,6 +999,68 @@ public:
 		if (noise_std_ > 0.0)
 			for (size_t i = 0; i < n; i++)
 				x[i] += noise_std_ * rng_.gauss();
+	}
+
+	// IDEAL whole-buffer CFO: apply the injector's drawn STATIC residual frequency as a
+	// mathematically EXACT analytic (one-sided-FFT Hilbert) SSB shift over the WHOLE
+	// buffer at once. FREE of the streaming FIR-Hilbert's per-subcarrier phase artifact
+	// (the LSB-leakage / finite-FIR imperfection that adds a FIXED, CFO-magnitude-
+	// INDEPENDENT ~0.11 rad non-linear per-subcarrier phase distortion — diagnosed in
+	// fact-doc §13: within-symbol pilot phase residual flat at 0.109 rad for cfo_sigma
+	// 0.25..1.0). A real residual CFO is a clean SSB frequency shift (HW §3.1: pilot
+	// MAGNITUDES survive, only the per-symbol phase spreads) = EXACTLY this. The genuine
+	// off-bench arbiter uses it to test the RX's CFO tracking against a FAITHFUL
+	// impairment. Cross-frame WALK is NOT modeled here (use walk=0). Operates on a local
+	// pow2-padded copy; writes back ONLY the first n samples (caller's buffer length is
+	// preserved). No rng draw / no streaming-injector state change.
+	// Disable the streaming FIR CFO injector for subsequent process() calls (used after
+	// apply_ideal_cfo so the per-chunk AWGN/floor pass does NOT re-apply the FIR CFO).
+	void disable_streaming_cfo() { cfo_disabled_ = true; }
+
+	void apply_ideal_cfo(double* x, size_t n)
+	{
+		double cfo = cfo_.resid_hz();
+		if (cfo == 0.0 || n < 2) return;
+		size_t N = 1; while (N < n) N <<= 1;     // next pow2 (zero-pad into trailing silence)
+		std::vector<std::complex<double>> X(N, std::complex<double>(0,0));
+		for (size_t i = 0; i < n; i++) X[i] = std::complex<double>(x[i], 0.0);
+		sim_fft_inplace(X, false);               // forward FFT
+		size_t half = N / 2;                     // one-sided → analytic signal
+		for (size_t k = 1; k < half; k++)      X[k] *= 2.0;
+		for (size_t k = half + 1; k < N; k++)  X[k] = std::complex<double>(0,0);
+		sim_fft_inplace(X, true);                // inverse FFT → analytic xa
+		double w = 2.0 * M_PI * cfo / 48000.0;
+		for (size_t i = 0; i < n; i++) {
+			std::complex<double> r(std::cos(w * (double)i), std::sin(w * (double)i));
+			x[i] = std::real(X[i] * r);
+		}
+	}
+
+private:
+	// Radix-2 iterative FFT for apply_ideal_cfo (deterministic, no rng). a.size() must be
+	// a power of two on entry.
+	static void sim_fft_inplace(std::vector<std::complex<double>>& a, bool inverse)
+	{
+		size_t N = a.size();
+		for (size_t i = 1, j = 0; i < N; i++) {
+			size_t bit = N >> 1;
+			for (; j & bit; bit >>= 1) j ^= bit;
+			j ^= bit;
+			if (i < j) std::swap(a[i], a[j]);
+		}
+		for (size_t len = 2; len <= N; len <<= 1) {
+			double ang = 2.0 * M_PI / (double)len * (inverse ? 1.0 : -1.0);
+			std::complex<double> wlen(std::cos(ang), std::sin(ang));
+			for (size_t i = 0; i < N; i += len) {
+				std::complex<double> w(1, 0);
+				for (size_t k = 0; k < len / 2; k++) {
+					std::complex<double> u = a[i + k], v = a[i + k + len/2] * w;
+					a[i + k] = u + v; a[i + k + len/2] = u - v;
+					w *= wlen;
+				}
+			}
+		}
+		if (inverse) for (size_t i = 0; i < N; i++) a[i] /= (double)N;
 	}
 
 private:
@@ -1279,6 +1344,7 @@ private:
 	cl_sim_cfo         cfo_;
 	cl_sim_agc_transient agc_;
 	bool   clean_;
+	bool   cfo_disabled_ = false;   // set after apply_ideal_cfo (skip streaming FIR CFO)
 	bool   prev_silent_;
 	double snr_lin_;
 	double peak_ms_;

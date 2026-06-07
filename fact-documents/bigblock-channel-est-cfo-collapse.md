@@ -1,8 +1,11 @@
 # Big-block channel-estimation collapse — un-tracked residual CFO
 
 Branch: `fix/bigblock-chanest` (worktree `C:/Users/kamer/mercury_wt/bb-chanest`, off `monitor` be80936)
-Status: **localized + genuine off-bench reproduction built; fix NOT landed (one principled attempt refuted).**
-Off-bench artifact: `bigblock_p3_hw/results_bb_chanest_fix.json`.
+Status: **localized + genuine off-bench reproduction built; Option C (pre-FFT tracked CFO) recovers the
+ESTIMATE but NOT the payload; CFO-injector FIDELITY fixed (§12, 641-tap band-flat Hilbert) — arbiter now
+faithful but PASS-AFTER still fails (estimate≠payload + 2nd timing artifact). HW validation of Option C is
+the remaining gate.** See §11 (Option C) and §12 (injector fidelity + new findings).
+Off-bench artifacts: `bigblock_p3_hw/results_bb_chanest_fix3.json`, `results_cfo_testfidelity.json`.
 
 ## §1 Symptom (from the bench)
 `results_rxdecode_diag.json` / `results_overnight_campaign.json`: same RX / same channel /
@@ -234,3 +237,137 @@ The collapse has TWO components vs channel CFO (AFC-OFF, walk=0):
   (B) HW-VALIDATE THE FIX DIRECTLY on the bench (the real channel has magnitude-surviving phase-spread, §3.1):
       enable bigblock + AFCTRACK at CFG16 under the residual-CFO HW cell, expect mean\|H\| recovery 0.005→healthy.
 - Either way: the fix is a STRONG candidate. NOT merged to monitor (HW-validation required first).
+
+## §12 Attempt #4 — CFO-INJECTOR FIDELITY FIX (path A): IMPLEMENTED + PROVEN; arbiter is MORE faithful, but PASS-AFTER STILL FAILS for a DEEPER reason (Option C recovers the ESTIMATE not the PAYLOAD). 2026-06-07.
+**What was built** (`include/common/sim_channel.h`, `cl_sim_cfo`): replaced the 65-tap Hamming-windowed
+Type-III Hilbert (`build_hilbert`, HILB_LEN 65→**641**, window Hamming→**Blackman-Harris**). The CFO
+injector still forms `y[n] = Re{ (x_d + j·x_h)·e^{jφ[n]} }` with the SAME stateful/continuous-phase/
+default-OFF contract (cfo_hz==0 && walk_hz==0 ⇒ no-op ⇒ byte-identical), only the analytic transform is
+now **band-flat across the full OFDM occupancy** (carrier 1500 Hz ± 1171.875 = **328.125..2671.875 Hz @
+fs=48k**, where the band-edge continual pilots sit).
+
+**FIDELITY PROVEN (the §11 injector artifact is GONE):**
+- *Band-edge magnitude response* (standalone numerics): the 65-tap Hamming Hilbert retains only **0.45**
+  of unit magnitude at 328 Hz (carrier-0 pilot) — a Type-III Hilbert has a DC null and the 65-tap lower
+  transition band is far wider than the 328 Hz edge. The **641-tap Blackman-Harris is |H|=0.99999 @ 328 Hz**,
+  reaches 0.999 by 245 Hz (margin below the edge), in-band ripple < 2e-5.
+- *Injector == ideal*: a 641-tap-FIR analytic shift of a multi-tone passband at cfo=8 matches the **ideal
+  FFT-domain analytic shift to 4 decimals** at EVERY band tone (328→2672 Hz: ratio 1.0000), LSB leakage
+  ~0.0077 (edges) / 0.0002 (mid). The OLD 65-tap retained ~0.27 at 328 Hz AND leaked ~0.71 into the LSB —
+  it was barely SSB at all. (`/tmp/cfo_compare.py` methodology; reproducible.)
+- *In-modem pilraw now PRESERVED* (AFC-OFF, walk=0): clean=0.226; cfo=2→**0.225**, cfo=4→**0.219** (vs OLD
+  cfo=4=0.202, cfo=8=0.154). Up to ~5 Hz the band-edge continual-pilot MAGNITUDE survives, matching the
+  clean synthesized shift (§11) and HW §3.1. The cfo=8 magnitude artifact the §11 STOP blamed on the
+  injector is **resolved for cfo≤5**.
+
+**RIGOR HOLDS — the gate is NOT trivially passable.** With the faithful injector the FAIL-BEFORE arm
+(AFC-OFF) STILL collapses at the default cfo=8/walk=4: meanH=**0.10** (<0.16), bytes_ok=**0**. The genuine
+phase-spread defect is still reproduced and caught. SANITY clean unchanged: meanH=0.194, 8/8 byte-faithful.
+
+**OPTION C now RECOVERS the ESTIMATE exactly where the injector is faithful** (AFC-OFF→AFC-ON mean|H|,
+walk=0): cfo=1 .173→**.192**, cfo=2 .144→**.191**, cfo=3 .177→**.190**, cfo=4 .103→**.183** — full meanH
+recovery for cfo≤4. The AFC recovery boundary tracks the pilraw-preservation boundary precisely.
+
+**BUT PASS-AFTER STILL FAILS — two NEW, deeper findings (the blocker is no longer the injector):**
+1. **Option C recovers the channel ESTIMATE, not the PAYLOAD.** At cfo=3 and cfo=4 (faithful regime,
+   pilraw≈0.22), AFC-ON restores meanH to **0.19/0.183** (>0.18 gate) yet **bytes_ok=0**. (cw_ok=8/8 is a
+   NO-OP here: `bigblock_rx_passband` only counts ierr when `cw_info_ref!=NULL` — telecom_system.cc:7662;
+   the genuine `--test-bigblock-chanest` runs ref==NULL so cw_ok is always Kcw. The TRUE arbiter is the
+   test lambda's `bytes_ok` carve+compare.) So restoring mean|H| is NECESSARY but NOT SUFFICIENT: the LDPC
+   payload still decodes wrong even with a healthy estimate + faithful CFO. Option C is **incomplete at the
+   bit/payload layer**, independent of the CFO model. [?] residual per-symbol phase the meanH metric
+   averages out but the per-subcarrier soft-demap still sees (CPE/SFO interaction, or a CSI-weighting bug).
+2. **A SECOND, distinct sim-RX artifact at cfo≈6-8.** pilraw cliffs 0.219(cfo4)→**0.168**(cfo6,7,8) then
+   RECOVERS to 0.206(cfo10)/0.195(cfo14) — **non-monotonic**. Genuine OFDM ICI is monotonic and tiny
+   (sinc(ε): ε=8/46.875=0.171 ⇒ 0.953 retention, only 5%). A 23% non-monotonic dip is NOT ICI; it is an
+   ACQUISITION/timing-acq resonance (head Schmidl-Cox timing estimate jumps a sample near ~6 Hz, sliding
+   the FFT window, then re-locks higher). The arbiter's DEFAULT cfo=8 sits in this trough — so cfo=8 is now
+   the LESS HW-faithful cell (HW §3.1: magnitudes SURVIVE), while cfo≤4 is the MORE faithful (pure
+   phase-spread). This is a DIFFERENT artifact from the §11 Hilbert one; NOT chased (CLAUDE.md §2 / the
+   3-attempt rule). [?] localize to `passband_to_baseband`/`rational_resampler` band edge vs S&C timing.
+
+**CONCLUSION (path A done; verdict = NEW info, STOP not iterate):**
+- The CFO-injector fidelity fix is CORRECT and worth keeping: the test is now strictly MORE faithful (the
+  §11 band-edge magnitude artifact is eliminated; injector == ideal shift). COMMITTED to fix/bigblock-chanest.
+- It does NOT make `--test-bigblock-chanest` PASS at the default cfo=8, because (a) Option C recovers the
+  ESTIMATE but not the PAYLOAD even in the faithful cfo≤4 regime (bytes_ok=0 @ meanH 0.183), and (b) the
+  default cfo=8 also sits in a 2nd timing-acq artifact trough. Moving the default to cfo=4 would NOT fix it
+  (bytes_ok=0 there too) — so the default is LEFT UNCHANGED (no masking).
+- Do NOT shotgun a payload-layer fix. The correct next step is **HW validation of Option C directly** (path B,
+  §11): the real channel has magnitude-surviving phase-spread (§3.1), and bytes_ok is the only true gate.
+  If Option C also fails to deliver bytes on HW, the estimate-vs-payload gap (finding #1) is the real defect
+  to investigate next — NOT the CFO model.
+
+## §13 Estimate-vs-payload gap DIAGNOSED at cfo≤4 (Option C ON): the residual is a CFO-MAGNITUDE-INDEPENDENT per-subcarrier artifact, NOT a per-symbol CPE and NOT a production PHY defect. 2026-06-07.
+**The §12 finding #1 open question is resolved.** Why does Option C recover mean|H| (0.183 > 0.18 gate) at
+cfo≤4 yet bytes_ok=0? Decision-directed post-EQ instrumentation (all env-gated; production byte-identical):
+`[DIAG-RXPB]` adds DD-EVM + per-symbol-row residual common phase (rowCPE); `[DIAG-GENIE]` adds a genie
+per-cell channel decomposition; `[AFC-PILTHETA]`/`[AFC-WITHINSYM]` (under `MERCURY_BIGBLOCK_AFC_DIAG`) add
+the ground-truth per-symbol common-phase trajectory + within-symbol pilot-phase spread from ALL known pilots.
+
+**The leading hypothesis (a) — residual per-symbol CPE — is REFUTED BY MEASUREMENT.**
+Post-EQ per-symbol-row common phase `rowCPE` is TINY at every CFO: ±0.06 rad (~±3°), meanabs ~0.03 rad.
+Far too small to break 32-QAM. Option C already removes the per-symbol common-phase ramp well. A post-FFT
+per-symbol CPE correction has nothing to correct (confirmed: STEP-2 tracker `twin=1/3/9` all leave
+DDevm≈0.13–0.39; STEP-2 OFF is WORSE — it is helping a little, not the cause). Attempt #2 (§9) was the right
+layer-refutation; (a)'s refinement does not revive it.
+
+**The real cause: a per-SUBCARRIER, NON-LINEAR, CFO-MAGNITUDE-INDEPENDENT phase distortion (~0.109 rad).**
+Decision-directed post-EQ EVM (`DDevm`, DATA cells, AFC ON):
+  | arm           | DDevm  | rowCPE (per-sym common)        | within-sym pilot RMS | resid after per-sym LINEAR fit |
+  |---------------|--------|--------------------------------|----------------------|--------------------------------|
+  | clean (cfo=0) | 0.038  | ±0.015 rad                     | 0.125 rad            | **0.004 rad**                  |
+  | cfo=1         | 0.137  | ±0.06 rad                      | 0.371 rad            | **0.109 rad**                  |
+  | cfo=4         | 0.392  | ±0.06 rad                      | 1.03 rad             | **0.421 rad**                  |
+- Clean: the within-symbol pilot phase spread (0.125 rad) is FULLY explained by a per-symbol LINEAR fit
+  (residual 0.004 rad) = the channel's genuine timing/selectivity slope, perfectly removable.
+- Under CFO: after removing the best per-symbol LINEAR (CPE+slope) fit there is STILL a **non-linear
+  per-subcarrier residual** (0.109 rad @cfo=1, 0.421 @cfo=4). NOT a common phase, NOT a slope ⇒ NOT removable
+  by ANY per-symbol phase tracker NOR by any per-cell channel estimate (it is per-cell phase, not a gain).
+  32-QAM needs ≲~8% EVM; 13.7% @cfo=1 is already over the cliff ⇒ bytes_ok=0 even where mean|H| is healthy.
+
+**SMOKING GUN — the residual is CFO-MAGNITUDE-INDEPENDENT (proves it is NOT real CFO physics).** Sweeping
+`cfo_sigma` = 0.25 / 0.5 / 0.75 / 1.0 (head-Moose tracks proportionally: 0.30/0.58/0.87/1.15 — correct), the
+non-linear within-symbol residual is **FLAT at 0.1086 rad** and DDevm flat at ~0.13. A genuine CFO-induced
+impairment (ICI ∝ (πε)²/3 ⇒ ~3e-5 at these residuals; or a common-phase ramp ∝ ε) would VANISH as ε→0. A
+fixed 0.109 rad floor that appears the instant ANY CFO is enabled but is 0.004 rad at exactly cfo=0 is a
+**fixed numerical/discretization artifact of how the impairment + RX pipeline handle a frequency-offset
+buffer**, not a channel response. (The cfo_sigma=4 jump to 0.42 is a separate larger-draw/timing effect on
+top of the floor.)
+
+**Localization: the artifact is mostly in the RX big-block pipeline, NOT only the FIR-Hilbert injector.**
+Added an IDEAL whole-buffer FFT-domain analytic SSB shift to `cl_sim_awgn::apply_ideal_cfo`
+(include/common/sim_channel.h) + a `MERCURY_BBCHANEST_DBG_IDEAL_CFO=1` test knob (DIAG-ONLY; the DEFAULT
+arbiter is UNCHANGED — streaming FIR + walk — no masking). The ideal injector IMPROVES the gap (cfo=4 AFC-ON
+DDevm 0.392→0.228, nzero 41→0) — so the FIR injector DOES contribute — but the within-symbol non-linear
+residual is STILL FLAT at 0.109 rad for cfo_sigma 0.5/1/2 with the ideal injector, and the residual persists
+with AFC OFF too. So most of the floor is the RX side (`passband_to_baseband` + `rational_resampler` +
+window-boundary handling of a frequency-offset block), CFO-magnitude-independent. A standalone numeric
+FIR-vs-ideal phase check (`bigblock_hw/cfo_phase_fidelity.py`) confirms the FIR adds a CFO-independent
+per-tone phase discrepancy; longer Hilbert (1281/2561 taps) does NOT reduce it.
+
+**The "exact constant CFO" red herring (recorded so it is not re-tried):** forcing the de-rotation to the
+true injected value as a CONSTANT is WORSE than the head-Moose+ψ tracker (DDevm 0.60 vs 0.14 @cfo=1). Reason:
+`MERCURY_SIM2_CFO_HZ` is the residual STD; the actual residual is `cfo_sigma·gauss()` (one draw) — NOT exactly
+the env value — and the effective per-symbol phase the FFT sees is time-varying (resampler/timing), so a
+decision-directed tracker beats any single constant. (Diag knob removed after this clarified it.)
+
+**CONCLUSION (CLAUDE.md §2 — STOP, verdict = the gap is a sim/RX-pipeline artifact, NOT a PHY defect):**
+- Hypothesis (a) per-symbol CPE: REFUTED (rowCPE ±3°). Hypotheses (b)/(c)/(d): the residual is per-subcarrier
+  & CFO-magnitude-INDEPENDENT ⇒ not a per-subcarrier-estimate-accuracy problem that scales with the impairment,
+  not a fixed LLR/CSI scale (clean decodes fine), and the deframe/whitening is byte-faithful on clean (SANITY
+  8/8) ⇒ it is a numerical artifact of CFO-on-buffer, not a production decode defect.
+- Two grounded attempts at THIS payload layer: (1) the post-FFT CPE family (refuted by direct measurement);
+  (2) the ideal-CFO injector fidelity path (improved DDevm 0.392→0.228 but did NOT close the gap — most of the
+  floor is RX-pipeline, CFO-independent). Per §2, STOP — do not shotgun a third payload-layer fix into
+  production: there is no evidenced production defect at cfo≤4 (the residual does not scale with the real
+  impairment; HW §3.1 has magnitude-surviving phase-spread, which Option C demonstrably RECOVERS — mean|H|
+  0.005→0.183).
+- **Option C remains the strong candidate; the next step is HW validation (path B), exactly as §12 concluded.**
+  bytes_ok byte-faithful at cfo≤4 is the correct final gate but it is blocked off-bench by this artifact floor,
+  not by a PHY bug. KEEP the diagnostics (durable characterization infra) + the opt-in ideal-CFO knob (it
+  proved part of the artifact and is the basis for any future arbiter-fidelity work). Default arbiter unchanged.
+
+**Status of the bytes_ok arbiter:** FAIL-BEFORE (AFC-OFF) bytes_ok=0 at cfo≤4 (confirmed, defect reproduced);
+PASS-AFTER (Option C ON) bytes_ok=0 at cfo≤4 (artifact floor, NOT a PHY miss); SANITY clean 8/8 byte-faithful
+(no regression). cfo=8 default additionally sits in the §12 finding-#2 timing-acq trough (separate, not chased).

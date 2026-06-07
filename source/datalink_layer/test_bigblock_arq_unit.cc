@@ -2419,11 +2419,24 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 		// live wire, where the channel state ticks during idle), so the CFO/SFO phase ramp the
 		// RX integrates is the genuine one. ch==NULL → clean (the sanity arm).
 		if(ch){
+			// Default: stream the channel per-chunk (CFO via the FIR injector + the
+			// cross-frame WALK AR(1)), exactly as the live wire feeds the RX. The DEFAULT
+			// arbiter is UNCHANGED (no masking).
+			// DIAG-ONLY (fact-doc §13): MERCURY_BBCHANEST_DBG_IDEAL_CFO=1 routes the STATIC
+			// residual CFO through an IDEAL whole-buffer SSB shift (free of the FIR-Hilbert
+			// per-subcarrier artifact) to CHARACTERIZE how much of the estimate-vs-payload
+			// gap is injector artifact vs RX-pipeline residual. It drops the WALK component,
+			// so it is NOT a faithful default — characterization only.
+			bool ideal_cfo = (std::getenv("MERCURY_BBCHANEST_DBG_IDEAL_CFO")!=NULL &&
+			                  atoi(std::getenv("MERCURY_BBCHANEST_DBG_IDEAL_CFO"))!=0);
 			int sp = tsB->data_container.Nofdm * interp;
 			if(sp <= 0) sp = tsA->data_container.Nofdm * interp;
-			if(sp > 0){
-				for(int off=0; off+sp<=(int)rx_pb.size(); off+=sp) ch->process(&rx_pb[off], (size_t)sp);
+			if(ideal_cfo){
+				ch->apply_ideal_cfo(rx_pb.data(), rx_pb.size());
+				ch->disable_streaming_cfo();
 			}
+			if(sp > 0)
+				for(int off=0; off+sp<=(int)rx_pb.size(); off+=sp) ch->process(&rx_pb[off], (size_t)sp);
 		}
 
 		int Nofdm = tsB->data_container.Nofdm;
