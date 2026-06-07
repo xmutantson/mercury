@@ -2521,7 +2521,11 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 	if(!sanity_ok) failed++;
 
 	// ---------- 1) FAIL-BEFORE: residual CFO ON → estimate COLLAPSES, not 8/8. ----------
-	set_cfo("8", "4");
+	// DIAG-only override (defaults 8/4 = the arbiter contract; lets Option-C characterization
+	// isolate static-vs-drift without changing the default fail-before/pass-after gate).
+	const char* dbg_hz   = std::getenv("MERCURY_BBCHANEST_DBG_CFO_HZ");
+	const char* dbg_walk = std::getenv("MERCURY_BBCHANEST_DBG_CFO_WALK_HZ");
+	set_cfo((dbg_hz&&*dbg_hz)?dbg_hz:"8", (dbg_walk&&*dbg_walk)?dbg_walk:"4");
 	double b_meanh=-1; int b_cwok=-1; bool b_bytes=false;
 	{ cl_sim_awgn ch_bad(SEED, 900.0); run_block(&ch_bad, b_meanh, b_cwok, b_bytes); }
 	printf("[TEST-BIGBLOCK-CHANEST] FAIL-BEFORE (CFO): meanH=%.4f (want<%.2f) cw_ok=%d/%d bytes_ok=%d\n",

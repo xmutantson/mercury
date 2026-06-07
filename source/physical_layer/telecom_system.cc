@@ -25,6 +25,7 @@
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
 #include <chrono>
+#include <algorithm> // std::sort — bigblock pre-FFT AFC-track median smoother (Option C)
 #include <vector>  // suffix-FEC soft decode candidate buffers
 #include <cstdlib> // std::getenv / atoi for MERCURY_SIM2_MINI_NSYM (LEVER P MINI knob)
 #include <cstdint> // bigblock WAV I/O: uint32_t/int16_t
@@ -7258,7 +7259,21 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	int margin_interp = margin_syms * sym_samples;
 	float power_normalization = sqrt((double)ofdm.Nfft);
 
-	auto demod_at = [&](long data_start, std::vector<std::complex<double>>& rx)
+	// PRE-FFT TRACKED-CFO de-rotation (attempt #3, Option C): an optional per-
+	// decimated-baseband-sample phase array. When supplied, demod_at de-rotates the
+	// (decimated, post-resampler) baseband block by exp(-j*phase[k]) BEFORE symbol_demod's
+	// FFT. Applied in the TIME domain pre-FFT, so a CONTINUOUS phase ramp (= a genuine
+	// frequency correction) removes BOTH the inter-symbol phase ramp AND the intra-symbol
+	// magnitude loss (the FFT of a frequency-offset signal smears bins; removing the offset
+	// pre-FFT eliminates the smear) — the two obstructions §9 proved a POST-FFT per-symbol
+	// phase fix cannot touch. phase[k] is built by the inter-symbol-increment tracker below.
+	// nullptr => byte-identical to the stock pre-fix demod (no de-rotation).
+	const std::vector<double>* cfo_track_phase = nullptr;
+	// bb_at: produce the decimated, power-normalized TIME-DOMAIN baseband block (Nofdm*Ngrid
+	// complex samples) for a window offset, with the optional pre-FFT CFO de-rotation already
+	// applied. Split out of demod_at so the tracked-CFO estimator (below) can read the time-
+	// domain samples (cyclic-prefix CFO estimate) before/without the FFT.
+	auto bb_at = [&](long data_start, std::vector<std::complex<double>>& dat_bb)
 	{
 		long ms = data_start - margin_interp;
 		int  mi = margin_interp;
@@ -7274,10 +7289,20 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		std::vector<std::complex<double>> dat_bb_full((size_t)(slice_size/interp) + 1);
 		int dec_total = slice_size / interp;
 		ofdm.rational_resampler(dat_bb_interp.data(), slice_size, dat_bb_full.data(), interp, DECIMATION);
-		std::vector<std::complex<double>> dat_bb(Nofdm*Ngrid);
+		dat_bb.assign((size_t)Nofdm*Ngrid, std::complex<double>(0,0));
 		int mdec = mi / interp;
 		for(int j=0;j<Nofdm*Ngrid && (mdec+j)<dec_total;j++) dat_bb[j] = dat_bb_full[mdec + j];
 		for(int j=0;j<Nofdm*Ngrid;j++) dat_bb[j] *= power_normalization;
+		// PRE-FFT time-domain de-rotation by the tracked CFO phase (Option C).
+		if(cfo_track_phase && (int)cfo_track_phase->size() == Nofdm*Ngrid)
+			for(int k=0;k<Nofdm*Ngrid;k++){
+				double ph = -(*cfo_track_phase)[k];
+				dat_bb[k] *= std::complex<double>(cos(ph), sin(ph)); }
+	};
+	auto demod_at = [&](long data_start, std::vector<std::complex<double>>& rx)
+	{
+		std::vector<std::complex<double>> dat_bb;
+		bb_at(data_start, dat_bb);
 		rx.assign((size_t)Ngrid*Nc, std::complex<double>(0,0));
 		for(int i=0;i<Ngrid;i++) ofdm.symbol_demod(&dat_bb[(size_t)i*Nofdm], &rx[(size_t)i*Nc]);
 	};
@@ -7327,6 +7352,138 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	else
 	{
 		demod_at(data_start, rx);
+	}
+
+	// ============================================================================
+	// PRE-FFT TRACKED-CFO AFC (attempt #3, Option C) — the principled fix.
+	// ----------------------------------------------------------------------------
+	// The big-block RX does ONE head Schmidl-Cox TIMING acquire and (pre-fix) NO carrier-
+	// frequency correction, so a residual CFO ramps a multi-cycle phasor across the ~1.56 s
+	// block; the block-wide pilot estimate destructively integrates it → mean|H| → 0 → LDPC
+	// decodes noise (fact-doc §3). The per-frame receive_byte path is immune because it re-
+	// runs Moose every ~12-symbol frame and re-mixes in the TIME domain (telecom_system.cc
+	// :2546 / :2645). This block mirrors that recipe WITHIN the big block, with NO TX change:
+	//
+	//   (1) PER-SYMBOL CYCLIC-PREFIX CFO (van de Beek 1997). Each OFDM symbol's guard interval
+	//       (CP) is a copy of the symbol's LAST Ngi samples (gi_adder: out[j]=in[j+Nfft-Ngi]).
+	//       Under a residual CFO δ the CP and its body copy differ in phase by 2π·δ·Nfft/fs.
+	//       C[n] = Σ_{i<Ngi} y[n,i]·conj(y[n, Nfft+i]); δ[n] = arg(C[n])·fs/(2π·Nfft). FULL-BAND,
+	//       NO pilot dependency, high-SNR (Ngi×Nc carriers' energy), unambiguous to ±fs/(2·Nfft)
+	//       ≈ ±23 Hz (WB) — covers the post-Moose residual band. This is a TIME-DOMAIN, per-
+	//       symbol, INSTANTANEOUS-frequency estimate: exactly what tracks the drift, and exactly
+	//       what neither refuted attempt had (attempt #2 was post-FFT 2-band-edge-pilot phase).
+	//   (2) HEAD Moose seeds/sanity-bounds δ and resolves the (mild) CP wrap ambiguity.
+	//   (3) Median-smooth δ[n] (the drift is band-limited; rejects per-symbol jitter), INTEGRATE
+	//       to a CONTINUOUS per-decimated-sample phase (a true frequency ramp, piecewise-constant
+	//       rate per symbol), and RE-DEMOD with that phase removed PRE-FFT in the TIME domain.
+	//       Pre-FFT + continuous tracked ramp removes BOTH the inter-symbol phase ramp AND the
+	//       intra-symbol magnitude loss (the two §9 obstructions a post-FFT fix cannot touch).
+	//
+	// Refs: van de Beek/Sandell/Börjesson 1997 (10.1109/78.611811, ML CP-based CFO/timing for
+	// OFDM); Moose 1994 (10.1109/26.328961); Speth et al. 2001 (10.1109/26.917759). Env
+	// MERCURY_BIGBLOCK_AFCTRACK (default 1) toggles for A/B; =0 ⇒ stock path. Confined to
+	// bigblock_rx_passband (dormant default-off bigblock_framing_enabled); the per-frame path is
+	// untouched. §8 audit: only the PHASE of the time-domain block fed to the unchanged FFT/
+	// estimators changes — no pilot.sequence / per-frame / consumer-invariant change.
+	// ============================================================================
+	std::vector<double> afc_phase;  // owns the storage cfo_track_phase points at
+	if(env_i("MERCURY_BIGBLOCK_AFCTRACK", 1) != 0 && Ngrid >= 3)
+	{
+		// Decimated baseband sample rate and the per-symbol period in those samples.
+		double fs_base = (interp > 0) ? (sampling_frequency / (double)interp) : sampling_frequency;
+		double Tsym    = (fs_base > 0.0) ? ((double)Nofdm / fs_base) : 0.0;  // seconds
+
+		// (1) HEAD Moose: residual CFO at block start (seeds δf[0]). Same estimator the per-
+		// frame path uses; the head preamble lives at [head_delay .. data_start0) full-rate.
+		double cfo0_hz = 0.0;
+		{
+			long pre_start = data_start - (long)pre_nSymb*sym_samples;  // preamble start (full rate)
+			if(pre_start < 0) pre_start = 0;
+			int pre_slice = (pre_nSymb + 1) * sym_samples;
+			std::vector<double> pre_pb(pre_slice, 0.0);
+			for(int i=0;i<pre_slice;i++){ long src=pre_start+i;
+				pre_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
+			std::vector<std::complex<double>> pre_bb_i(pre_slice);
+			ofdm.passband_to_baseband(pre_pb.data(), pre_slice, pre_bb_i.data(),
+			                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+			                          &ofdm.FIR_rx_data, (int)pre_start);
+			std::vector<std::complex<double>> pre_bb((size_t)(pre_slice/interp) + 1);
+			ofdm.rational_resampler(pre_bb_i.data(), pre_slice, pre_bb.data(), interp, DECIMATION);
+			// carrier_sampling_frequency_sync expects in = &baseband[Ngi] (skip the GI).
+			if((int)pre_bb.size() > Ngi + pre_nSymb*Nofdm)
+				cfo0_hz = ofdm.carrier_sampling_frequency_sync(
+					&pre_bb[Ngi], bandwidth/(double)ofdm.Nc, pre_nSymb, sampling_frequency);
+			// Sanity clamp (mirror the per-frame ±1-subcarrier clamp at :2606-2608).
+			double clamp = bandwidth / (double)ofdm.Nc;
+			if(cfo0_hz >  clamp) cfo0_hz =  clamp;
+			if(cfo0_hz < -clamp) cfo0_hz = -clamp;
+		}
+
+		bool diag = (env_i("MERCURY_BIGBLOCK_AFC_DIAG",0) != 0);
+		bool stage2_on = (env_i("MERCURY_BIGBLOCK_AFC_STAGE2", 1) != 0);
+
+		// (2) STAGE 1 — remove the BULK residual with the ACCURATE head Moose (a constant pre-FFT
+		// frequency shift, the same recipe the per-frame path uses). Proven accurate (the recovery
+		// peak coincides with the head-Moose value); shrinks the residual so the continual-pilot
+		// common phase is small + unwraps cleanly for Stage 2.
+		std::vector<double> dfs(Ngrid, cfo0_hz);
+		afc_phase.assign((size_t)Nofdm*Ngrid, 0.0);
+		auto build_and_demod = [&](double acc0){
+			afc_phase.assign((size_t)Nofdm*Ngrid, 0.0);
+			double acc = acc0;
+			for(int n=0;n<Ngrid;n++){
+				double step = (fs_base>0.0) ? (2.0*M_PI*dfs[n]/fs_base) : 0.0;
+				for(int s=0;s<Nofdm;s++){ afc_phase[(size_t)n*Nofdm+s] = acc; acc += step; }
+			}
+			cfo_track_phase = &afc_phase; demod_at(data_start, rx); cfo_track_phase = nullptr;
+		};
+		build_and_demod(0.0);   // rx now Stage-1-corrected (~residual-drift only)
+
+		// (3) STAGE 2 — track the residual DRIFT from the continual pilots' CUMULATIVE common
+		// phase ψ[n]=arg(Σ_{continual j} rx[n,j]·conj(X[n,j])). After Stage 1 ψ is small/slow, so
+		// it UNWRAPS cleanly (the §9 aliasing was on the LARGE un-corrected ramp). Convert the
+		// SMOOTHED ψ to a per-symbol residual frequency (its derivative) and ADD to Stage-1; re-
+		// demod once. dfs then carries Stage1 + Stage2 = the total tracked CFO(t).
+		std::vector<int> cont_cols;
+		for(int j=0;j<Nc;j++){ bool all=true;
+			for(int n=0;n<Ngrid;n++) if((ofdm.ofdm_frame+n*Nc+j)->type!=PILOT){ all=false; break; }
+			if(all) cont_cols.push_back(j); }
+		double psi0=0.0;
+		if(stage2_on && !cont_cols.empty())
+		{
+			std::vector<std::complex<double>> P(Ngrid, std::complex<double>(0,0));
+			{ int pidx=0; for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+				if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+					std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++];
+					for(int c:cont_cols) if(c==j){ P[n]+=rx[(size_t)n*Nc+j]*std::conj(X); break; } } }
+			std::vector<double> psi(Ngrid,0.0); double prev=0.0; bool hp=false;
+			for(int n=0;n<Ngrid;n++){
+				if(std::abs(P[n])<1e-18){ psi[n]=hp?prev:0.0; continue; }
+				double a=atan2(P[n].imag(),P[n].real());
+				if(hp){ while(a-prev> M_PI)a-=2.0*M_PI; while(a-prev<-M_PI)a+=2.0*M_PI; }
+				psi[n]=a; prev=a; hp=true;
+			}
+			int sw = env_i("MERCURY_BIGBLOCK_AFC_WIN", 9); if(sw<1) sw=1;
+			std::vector<double> psis(Ngrid,0.0);
+			for(int n=0;n<Ngrid;n++){ double s=0; int c=0;
+				for(int w=n-sw/2; w<=n+sw/2; w++) if(w>=0&&w<Ngrid){ s+=psi[w]; c++; }
+				psis[n]= c? s/c : psi[n]; }
+			psi0 = psis[0];
+			for(int n=0;n<Ngrid;n++){
+				double dpsi = (n==0)?(psis[1]-psis[0]) : (n==Ngrid-1)?(psis[Ngrid-1]-psis[Ngrid-2])
+				                                                     : 0.5*(psis[n+1]-psis[n-1]);
+				dfs[n] += (Tsym>0.0) ? (dpsi/(2.0*M_PI*Tsym)) : 0.0;   // Stage1 + Stage2(drift)
+			}
+			build_and_demod(psi0);  // start phase = ψ[0] removes the residual common-phase offset too
+		}
+
+		if(diag){
+			double mn=1e9,mx=-1e9,mean=0; for(int n=0;n<Ngrid;n++){ mean+=dfs[n]; if(dfs[n]<mn)mn=dfs[n]; if(dfs[n]>mx)mx=dfs[n]; } mean/=(Ngrid>0?Ngrid:1);
+			std::cout << "[AFC-TRACK] head_cfo=" << cfo0_hz << " cont_cols=" << cont_cols.size()
+			          << " dfs[" << mn << ".." << mx << "] mean=" << mean << " psi0=" << psi0
+			          << " Tsym=" << Tsym << "s | fs_base=" << fs_base
+			          << " Nfft=" << Nfft << " Ngi=" << Ngi << " Nofdm=" << Nofdm << std::endl;
+		}
 	}
 
 	// --- CPE/PEG residual-timing de-rotation (STEP-2 tracker) --------

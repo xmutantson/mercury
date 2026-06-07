@@ -178,3 +178,59 @@ from the un-corrected pre-FFT carrier offset; only a pre-FFT AFC removes both.
   slope) is DOMINATED — still post-FFT, can't fix the 0.153 magnitude floor. Option C likely needs a TX-side
   change (periodic mid-block preambles) or a robust decision-directed time-domain CFO estimator = an
   architectural increment, not a tweak — hence the STOP-and-discuss gate.
+
+## §11 Attempt #3 — Option C PRE-FFT TRACKED CFO: IMPLEMENTED + MECHANISM-VALIDATED, but the GATE is BLOCKED by a TEST-HARNESS CFO-MODEL ARTIFACT (NOT the fix). SS2 STOP.
+**What was built** (telecom_system.cc bigblock_rx_passband, +161 lines, confined to the dormant default-off
+big-block path; per-frame byte-identical; env MERCURY_BIGBLOCK_AFCTRACK default 1):
+- A real PRE-FFT, TIME-DOMAIN, TRACKED CFO de-rotation. `demod_at`/`bb_at` split so the time-domain decimated
+  baseband can be de-rotated by a CONTINUOUS per-sample phase ramp (a genuine frequency correction) BEFORE the
+  per-symbol FFT. Estimator: STAGE 1 = head Moose (`carrier_sampling_frequency_sync`, ACCURATE — the recovery
+  peak coincides with its value), constant pre-FFT removal of the bulk residual; STAGE 2 = residual DRIFT from
+  the continual-pilots' CUMULATIVE common phase ψ[n]=arg(Σ rx·conj(X)), unwrapped (small after Stage 1, so NO
+  aliasing — the §9 aliasing was on the LARGE un-corrected ramp), smoothed, differentiated to a per-symbol
+  residual freq, ADDED to Stage 1, single re-demod. Refs van de Beek 1997 / Moose 1994 / Speth 2001.
+  (A per-symbol cyclic-prefix CFO estimator was also tried; it is SYSTEMATICALLY BIASED HIGH in this decimated/
+  FIR'd pipeline — chan=4 → est 8.7 Hz, chan=8 → 9.6 w/ ±20 spikes — so the head-Moose+ψ tracker is used.)
+
+**MECHANISM VALIDATED (measured, via env DBG knobs that vary the test's CFO/walk without changing the default
+arbiter — MERCURY_BBCHANEST_DBG_CFO_HZ/_CFO_WALK_HZ, defaults 8/4):** the fix RECOVERS the genuine phase-spread
+collapse wherever the sim CFO model is faithful (AFC-OFF→AFC-ON mean|H|):
+- cfo=2 w=0: 0.134→**0.183** | cfo=4 w=0: 0.099→**0.175** | cfo=4 w=2: 0.091→**0.171** | cfo=6 w=0: 0.163→**0.170**.
+  (clean=0.194; SANITY clean stays 0.194 8/8 — AFC is a no-op on a clean channel: head Moose≈0.)
+
+**WHY THE GATE (cfo=8/walk=4) STILL FAILS — DECISIVE NEW FINDING (the BLOCKER is the TEST, not the fix):**
+The collapse has TWO components vs channel CFO (AFC-OFF, walk=0):
+  | chanCFO | mean\|H\| | pilraw\|Y/X\| |   ← pilraw = raw continual-pilot magnitude (the band-edge pilots)
+  |   ~0    |  0.191   |  0.226 |
+  |    4    |  0.099   |  0.202 |   ← meanH collapsed (phase-spread) but MAGNITUDE HEALTHY → RECOVERABLE
+  |    8    |  0.099   |  0.154 |   ← MAGNITUDE also destroyed → NOT recoverable by any freq correction
+- The ≤~5 Hz collapse is PURE inter-symbol phase-spread (pilraw healthy) → the fix recovers it.
+- The ≥~6 Hz magnitude loss (pilraw 0.226→0.154) is **an ARTIFACT of the sim's CFO model, NOT real CFO ICI.**
+  PROOF: applying a CLEAN synthesized 8 Hz pre-FFT shift to the CLEAN signal preserves pilraw (0.226→**0.219**),
+  while the sim's real 8 Hz channel CFO destroys it (→**0.154**); and NO pre-FFT correction (any sign/value,
+  ±0.5 Hz fine sweep, ± timing nudge) restores pilraw past ~0.157 at chan=8. A clean frequency offset does NOT
+  cause this magnitude loss; the loss is therefore not removable by frequency correction.
+- ROOT of the artifact: `cl_sim_cfo` (include/common/sim_channel.h:551-627) rotates the passband by forming the
+  analytic signal with a **65-tap Hamming-windowed Hilbert FIR** (build_hilbert :636). A 65-tap Hilbert has poor
+  amplitude response near the band EDGES — exactly where the big-block CONTINUAL pilots sit (carriers 0 & Nc-1,
+  the thin-grid cont_cols). So the model attenuates/distorts the band-edge pilots ∝ the rotation phase → the
+  ~33% pilraw loss at ≥6 Hz. This is a measurement artifact of the impairment generator, not a property of carrier
+  frequency offset. **HW reality is the OPPOSITE: fact-doc §3.1 — HW per-pilot MAGNITUDES SURVIVE, only the
+  per-symbol PHASES spread (the recoverable kind). So the fix recovers the REAL bug; the test over-penalizes.**
+
+**CONCLUSION (SS2 — 3rd attempt, BLOCKED not refuted):**
+- The pre-FFT tracked-CFO fix is MECHANISM-CORRECT and recovers the genuine phase-spread collapse (the HW bug).
+  It is production-safe (dormant default-off; all big-block + climb-engine + probe-backoff + sim-clock +
+  bigblock-climb-election tests rc=0; per-frame byte-identical).
+- It does NOT pass `--test-bigblock-chanest` PASS-AFTER because that gate's CFO=8 cell triggers the sim's
+  Hilbert-FIR band-edge magnitude artifact, which caps mean\|H\|≈0.10 (pilraw≈0.143) for ANY correct AFC.
+- **The arbiter, not the fix, is the blocker.** Do NOT weaken the gate to force a pass (CLAUDE.md §2/§What-NOT).
+  Two clean paths for the morning (pick one, supervised):
+  (A) FIX THE TEST HARNESS: replace `cl_sim_cfo`'s 65-tap Hilbert with an FFT-domain / longer-FIR analytic
+      transform (band-edge-flat), OR apply the CFO as a true complex rotation on a baseband-then-reupconvert
+      path so the band edges are not attenuated; then the cfo=8 cell becomes pure phase-spread and the fix's
+      PASS-AFTER is reachable. Re-run --test-bigblock-chanest → expect PASS. (This is fixing arbiter FIDELITY,
+      which IS allowed and required — distinct from weakening the gate.)
+  (B) HW-VALIDATE THE FIX DIRECTLY on the bench (the real channel has magnitude-surviving phase-spread, §3.1):
+      enable bigblock + AFCTRACK at CFG16 under the residual-CFO HW cell, expect mean\|H\| recovery 0.005→healthy.
+- Either way: the fix is a STRONG candidate. NOT merged to monitor (HW-validation required first).
