@@ -534,10 +534,28 @@ private:
 // MODEL: per-acquisition static residual ~N(0,σ_cfo) plus a slow clamped random-
 // walk drift, applied as a continuous frequency shift of the REAL passband.
 // A real passband cannot be naive-multiplied by exp(j·θ); we form the analytic
-// signal with a stateful Type-III Hilbert FIR (the SAME proven construction as
-// cl_sim_phase_noise) and rotate: y[n] = Re{ (x_d + j·x_h)·e^{jφ[n]} } where
-// φ[n] is the continuous CFO phase accumulator. Power-preserving to the Hilbert
-// band edges, so the SNR3k axis is unchanged (CFO applied BEFORE AWGN in process()).
+// signal with a stateful Type-III Hilbert FIR and rotate:
+// y[n] = Re{ (x_d + j·x_h)·e^{jφ[n]} } where φ[n] is the continuous CFO phase
+// accumulator. The frequency shift is MAGNITUDE-PRESERVING across the OFDM band
+// (a true single-sideband translation), matching HW (fact-doc §3.1: HW per-pilot
+// magnitudes SURVIVE; only the per-symbol phases spread — the recoverable kind).
+//
+// FIDELITY (2026-06-07): the analytic transform MUST be band-flat across the FULL
+// OFDM occupancy (carrier 1500 Hz ± 1171.875 Hz = 328.125..2671.875 Hz @ fs=48k),
+// where the BAND-EDGE continual pilots sit (big-block carriers 0 & Nc-1, ~328 Hz
+// & ~2672 Hz). A Type-III Hilbert has a magnitude null at DC, so its lower
+// transition band MUST end well below 328 Hz or it attenuates the carrier-0 pilot
+// ∝ the rotation phase — an AMPLITUDE artifact no frequency correction can undo
+// (the original 65-tap Hamming Hilbert was 0.45 of full magnitude at 328 Hz →
+// pilraw 0.226→0.154 at chanCFO=8, fact-doc §11). The replacement is a 641-tap
+// Blackman-Harris Hilbert: |H|@328Hz = 0.99999, reaches 0.999 by 245 Hz (margin
+// below the 328 Hz edge), in-band ripple < 2e-5. A clean synthesized shift through
+// this transform preserves pilraw (0.226→~0.22), so the cfo=8 cell is now PURE
+// inter-symbol phase-spread = the genuine HW defect (recoverable by tracked AFC),
+// not a non-HW magnitude artifact. Power-preserving across the OFDM band, so the
+// SNR3k axis is unchanged (CFO applied BEFORE AWGN in process()). The longer FIR
+// adds a fixed bulk group delay (D=320 samples, ~6.7 ms) to the WHOLE stream —
+// a constant timing shift the head Schmidl-Cox acquisition absorbs.
 //
 // MAGNITUDE: σ_cfo ~ 5-20 Hz (the post-Moose residual band; Moose clamps ±93.75 Hz
 // WB but leaves a few-Hz residual). Default σ_cfo = 8 Hz static residual drawn
@@ -629,17 +647,31 @@ public:
 	bool enabled() const { return enabled_; }
 
 private:
-	static const int HILB_LEN = 65;
+	// 641-tap Type-III Hilbert: band-flat (|H|>0.999) above ~245 Hz, so the OFDM
+	// band (328..2672 Hz) — including the band-edge continual pilots — is preserved
+	// in MAGNITUDE under the SSB frequency shift (fact-doc §11; see header comment).
+	static const int HILB_LEN = 641;
 	static const int DELAY    = (HILB_LEN - 1) / 2;
 	static const int HIST_LEN = HILB_LEN + 1;
 
 	void build_hilbert()
 	{
+		// Ideal antisymmetric Type-III Hilbert taps (odd k only) windowed by a
+		// 4-term Blackman-Harris window. BH (vs the prior 65-tap Hamming) + the
+		// longer length pushes the DC transition band below 245 Hz, leaving the
+		// OFDM band edges (≥328 Hz) at unit magnitude. Pure cosines (no Bessel),
+		// fully deterministic. htap_[k] is the half-kernel; process() uses the
+		// antisymmetry via c·(a−b).
+		const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
 		for (int k = 0; k <= DELAY; k++) htap_[k] = 0.0;
 		for (int k = 1; k <= DELAY; k += 2) {
 			double ideal = 2.0 / (M_PI * (double)k);
-			double w = 0.54 - 0.46 * std::cos(2.0 * M_PI * (double)(DELAY - k) /
-			                                  (double)(HILB_LEN - 1));
+			// Window sample index for tap at distance k from center:
+			//   n = DELAY - k  (mirrors the prior Hamming indexing).
+			double n  = (double)(DELAY - k);
+			double th = 2.0 * M_PI * n / (double)(HILB_LEN - 1);
+			double w  = a0 - a1 * std::cos(th) + a2 * std::cos(2.0 * th)
+			               - a3 * std::cos(3.0 * th);
 			htap_[k] = ideal * w;
 		}
 	}
