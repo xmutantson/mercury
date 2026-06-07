@@ -1775,7 +1775,7 @@ void cl_arq_controller::process_messages_tx_data()
 		// wire_ms with the cycle-time delta, and refresh the tx-start stamp for
 		// the batch about to leave. No decision logic here — pure measurement.
 		opt_on_batch_tx_start();
-		if(sack_v2_enabled && batch_includes_new_data)
+		if(sack_v2_enabled && batch_includes_new_data && !mtl::quiet_enabled())
 		{
 			printf("[CMD-BATCH-SEQ] new-data batch_seq_id=%d (frames in batch=%d)\n",
 				cmd_batch_seq_id & 0xFF, message_batch_counter_tx);
@@ -10224,6 +10224,24 @@ int cl_arq_controller::test_sim_inproc_2()
 	cfg_seq.push_back({-1, last_cfg});   // initial config at loop entry
 	int max_cfg_reached = last_cfg;      // highest OFDM cfg the climb touched
 	long collapse_iter  = -1;            // first iter cfg fell back to a ROBUST_x
+	// SETTLING-TIME instrumentation (gearshift settling-time WGN sweep): record the
+	// VIRTUAL-CLOCK time (ms of channel time, via sim_clock) of every commander
+	// config switch, anchored to CONNECT. cfg_ms_seq[i] is the virtual-ms at which
+	// cfg_seq[i] took effect (the initial entry is 0 == connect). The settling time
+	// is then the virtual-ms of the LAST switch into the config that is held to the
+	// end of the run (the steady/optimal config) — i.e. cold-start-to-steady. Pure
+	// in-process sim metric; no device/TCP. Additive (only read at report time).
+	std::vector<double> cfg_ms_seq;
+	cfg_ms_seq.push_back(0.0);           // initial config is "set" at connect (t=0)
+	// Virtual-clock anchor for the settling-time metric. Captured here (loop entry,
+	// just after CONNECT) so cfg_ms_seq is measured from CONNECT. The original t1
+	// total-time print below re-reads this SAME anchor (moved up from its old spot a
+	// few lines down; identical value — sim_clock_now_samples is monotonic and no
+	// samples are added between the two old locations).
+	uint64_t t0 = sim_clock_now_samples();
+	auto sim_ms_now = [&]() -> double {
+		return (sim_clock_now_samples() - t0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
+	};
 
 	const bool dbg = (getenv("MERCURY_SIM2_DBG") != nullptr);
 	// Stall cutoff (large-payload arm only): if no new RX byte arrives for this
@@ -10233,8 +10251,22 @@ int cl_arq_controller::test_sim_inproc_2()
 	                                 (payload_bytes > 0) ? 200000 : 0);
 	long last_progress_iter = 0;
 	int  prev_rx_have = 0;
-	uint64_t t0 = sim_clock_now_samples();
 	bool stalled = false;
+	// SETTLING-TIME early termination (gearshift settling-time WGN sweep). When
+	// MERCURY_SIM2_SETTLE_HOLD_MS>0, terminate the loop once the commander config has
+	// been UNCHANGED for that many VIRTUAL (channel) ms — i.e. it has SETTLED — rather
+	// than waiting for the full payload to deliver. This decouples the settling-time
+	// measurement from the (very slow, virtual-time-wise) steady-state CONFIG_0
+	// throughput: a cold-start cascade settles in seconds of virtual time, but
+	// delivering a multi-kB payload at CONFIG_0's ~tens-of-bps virtual rate takes
+	// hundreds of virtual seconds (==> minutes of wall time even with QUIET). With
+	// this knob the sweep finishes each cell shortly after the config stabilises.
+	// Default 0 = OFF (legacy delivery/stall termination, byte-identical). The cap
+	// MERCURY_SIM2_SETTLE_MAX_MS bounds total virtual time so a thrashing cell that
+	// never holds still terminates. last_cfg_change_sim_ms tracks the last switch.
+	const double settle_hold_ms = env_d("MERCURY_SIM2_SETTLE_HOLD_MS", 0.0);
+	const double settle_max_ms  = env_d("MERCURY_SIM2_SETTLE_MAX_MS", 180000.0);
+	bool settled_break = false;
 	for (; iters < max_iters; iters++)
 	{
 		if (dbg && (iters % 200 == 0)) {
@@ -10290,6 +10322,7 @@ int cl_arq_controller::test_sim_inproc_2()
 		int cur_cfg = A->arq.current_configuration;
 		if (cur_cfg != last_cfg) {
 			cfg_seq.push_back({iters, cur_cfg});
+			cfg_ms_seq.push_back(sim_ms_now());   // virtual-ms (from CONNECT) of this switch
 			// max_cfg_reached only over OFDM configs (ROBUST_x are id>=100; a
 			// numeric max would wrongly rank ROBUST over CONFIG_16). Track the
 			// highest OFDM config touched, and note the first collapse to ROBUST.
@@ -10302,6 +10335,43 @@ int cl_arq_controller::test_sim_inproc_2()
 				fflush(stdout);
 			}
 			last_cfg = cur_cfg;
+		}
+
+		// SETTLING-TIME early termination: once the cascade has STARTED climbing
+		// (>=1 config switch past the start config) AND then held that config
+		// UNCHANGED for settle_hold_ms of VIRTUAL time, it has SETTLED — stop and
+		// report. Requiring >=1 switch is essential: right after CONNECT the config
+		// is still the start config (ROBUST_0) and the handshake has already burned
+		// many virtual seconds, so without this guard the hold-timer would fire
+		// IMMEDIATELY (measuring the handshake, not the climb — observed: iters=3,
+		// settle_to_cfg=ROBUST_0). If the channel is so poor the cascade never leaves
+		// the start config, the settle_max_ms cap terminates the cell (it settled at
+		// the floor — reported with settled=0 + n_switches=0). Gated settle_hold_ms>0;
+		// OFF by default (legacy delivery/stall termination, byte-identical).
+		if (settle_hold_ms > 0.0 && connected_seen) {
+			double now_ms = sim_ms_now();
+			double last_change_ms = cfg_ms_seq.empty() ? 0.0 : cfg_ms_seq.back();
+			// "Settled" = reached an OFDM config (escaped the ROBUST floor — the
+			// cascade's normal climb endpoint here) AND held it UNCHANGED for
+			// settle_hold_ms. Gating on is_ofdm_config lets settle_hold_ms be SHORT
+			// (~10 s) without false-settling MID-CLIMB inside the ROBUST tier, where
+			// each rung dwells ~40 s (ROBUST_0->1->2 are ~40 s apart; a short hold
+			// would otherwise fire at ROBUST_1 before it advances). A channel that
+			// never reaches the OFDM tier (deep SNR, or a cascade that parks in the
+			// ROBUST tier) does NOT settle-detect and instead hits settle_max_ms —
+			// reported settled=0 with its final ROBUST config + timeline, which is
+			// the correct "settled at the floor / never climbed out" datum.
+			bool ofdm_now = is_ofdm_config(cur_cfg);
+			if (ofdm_now && (now_ms - last_change_ms) >= settle_hold_ms) {
+				settled_break = true;
+				break;
+			}
+			if (now_ms >= settle_max_ms) {
+				// Did not reach a stable OFDM config within the cap (never climbed
+				// out, or still thrashing) — terminate. settled stays 0; the timeline
+				// + n_switches + final_cfg show why.
+				break;
+			}
 		}
 
 		// Drain delivered bytes from B's RX FIFO.
@@ -10373,6 +10443,67 @@ int cl_arq_controller::test_sim_inproc_2()
 		       rx_have, sim_ms, delivered_bps_sim, final_cfg, (int)is_ofdm_config(final_cfg),
 		       (int)stalled);
 		fflush(stdout);
+
+		// --- SETTLING-TIME report (gearshift settling-time WGN sweep) ---
+		// The settling time is the cold-start-to-steady virtual-clock time: the ms
+		// (channel time, from CONNECT) at which the commander LAST switched into the
+		// config it then held to the end of the run (its steady/optimal config). If
+		// the config never switched (held start_cfg the whole run) settle_ms is 0.
+		// settle_to_cfg is that steady config. We also emit the full (cfg:ms) timeline
+		// so the analysis can see the per-rung climb cadence, and time_to_first_ofdm:
+		// the ms at which the climb first left the ROBUST tier into an OFDM config
+		// (the "escape the floor" milestone, == settling for the climb-from-floor view).
+		{
+			// cfg_ms_seq is 1:1 with cfg_seq (both start with the initial entry). Find
+			// the last index whose cfg equals final_cfg AND is the start of the
+			// final unbroken run of final_cfg (so settle_ms is when it FIRST reached
+			// the config it ultimately holds, not a re-entry after a later switch).
+			double settle_ms = 0.0;
+			int    settle_to_cfg = final_cfg;
+			if (!cfg_seq.empty()) {
+				// Walk back from the end while cfg stays == final_cfg; the first index
+				// of that trailing run is the settle point.
+				size_t i = cfg_seq.size();
+				size_t first_of_run = cfg_seq.size() - 1;
+				while (i > 0 && cfg_seq[i-1].second == final_cfg) { first_of_run = i-1; i--; }
+				settle_ms = (first_of_run < cfg_ms_seq.size()) ? cfg_ms_seq[first_of_run] : 0.0;
+				settle_to_cfg = cfg_seq[first_of_run].second;
+			}
+			// Highest OFDM config the climb touched, BY LADDER RANK (the shared
+			// max_cfg_reached uses a NUMERIC > and is seeded at start_cfg=100, so a
+			// climb that tops out at CONFIG_0..16 — numeric 0..16 < 100 — never updates
+			// it and it misleadingly stays 100; recompute here from cfg_seq for the
+			// settle report). -1 ⇒ never reached the OFDM tier.
+			int highest_ofdm = -1;
+			for (size_t i = 0; i < cfg_seq.size(); i++) {
+				int c = cfg_seq[i].second;
+				if (is_ofdm_config(c) && c > highest_ofdm) highest_ofdm = c;
+			}
+			// Time to first OFDM config (escape the ROBUST floor).
+			double time_to_first_ofdm = -1.0;
+			for (size_t i = 0; i < cfg_seq.size(); i++) {
+				if (is_ofdm_config(cfg_seq[i].second)) {
+					time_to_first_ofdm = (i < cfg_ms_seq.size()) ? cfg_ms_seq[i] : -1.0;
+					break;
+				}
+			}
+			printf("[SIM2-SETTLE] snr3k=%.1f opt=%s start_cfg=%d : settle_ms=%.0f "
+			       "settle_to_cfg=%d ofdm=%d time_to_first_ofdm_ms=%.0f final_cfg=%d "
+			       "highest_ofdm=%d total_sim_ms=%.0f n_switches=%d delivered=%d/%d stalled=%d "
+			       "settled=%d\n",
+			       snr3k_db, opt_on ? "ON" : "OFF", start_cfg, settle_ms, settle_to_cfg,
+			       (int)is_ofdm_config(settle_to_cfg), time_to_first_ofdm, final_cfg,
+			       highest_ofdm, sim_ms, (int)cfg_seq.size() - 1, rx_have, payload_len,
+			       (int)stalled, (int)settled_break);
+			// Full (cfg:ms) climb timeline.
+			printf("[SIM2-SETTLE] timeline=");
+			for (size_t i = 0; i < cfg_seq.size(); i++) {
+				double ms = (i < cfg_ms_seq.size()) ? cfg_ms_seq[i] : 0.0;
+				printf("%s(%d:%.0fms)", (i ? "->" : ""), cfg_seq[i].second, ms);
+			}
+			printf("\n");
+			fflush(stdout);
+		}
 	}
 	fflush(stdout);
 
@@ -10384,9 +10515,19 @@ int cl_arq_controller::test_sim_inproc_2()
 	// hits the stall cutoff) — that is the scientific RESULT of the probe, not a
 	// code failure. The probe report above carries bytes_ok/stalled for analysis.
 	check(connected_seen, "G-SMOKE: 2-instance CONNECT completed (no deadlock, single thread)");
-	if (payload_bytes <= 0 || !stalled) {
+	// settled_break (settling-time sweep early termination): the loop intentionally
+	// stops once the config settles, BEFORE the full payload delivers, so a partial
+	// rx is the DESIGNED outcome — skip the byte-correct assert exactly as the stall
+	// arm does. The settle-sweep cares about WHEN/WHERE the cascade settled, not full
+	// delivery (which at CONFIG_0's virtual rate would take hundreds of virtual sec).
+	if ((payload_bytes <= 0 || !stalled) && !settled_break) {
 		check(bytes_ok,
 		      "G-SMOKE: payload delivered B<-A byte-correct (RX bytes match TX)");
+	} else if (settled_break) {
+		printf("[TEST-SIM-2INST] NOTE: settling-sweep early termination (config "
+		       "settled, rx=%d/%d) — byte-correct assert skipped by design\n",
+		       rx_have, payload_len);
+		fflush(stdout);
 	} else {
 		printf("[TEST-SIM-2INST] NOTE: large-payload arm STALLED (rx=%d/%d, "
 		       "final_cfg=%d) — over-climb/collapse regime, byte-correct assert "

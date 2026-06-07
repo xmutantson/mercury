@@ -2613,7 +2613,19 @@ void cl_arq_controller::update_status()
 	if(print_stats_timer.get_elapsed_time_ms()>(int)(1000.0/print_stats_frequency_hz))
 	{
 		print_stats_timer.start();
-		print_stats();
+		// SIM-SWEEP quiet gate (gearshift settling-time WGN sweep): the 2-instance
+		// in-process sim runs FASTER-THAN-REAL-TIME, so the 2 Hz VIRTUAL-clock
+		// print_stats() fires extremely often and the ~50-line dump becomes the
+		// dominant WALL-clock cost (a clean-SNR 4 kB climb did not finish in 120 s
+		// of wall time purely from printf). MERCURY_SIM2_QUIET=1 suppresses the
+		// periodic stats dump so a settling-time sweep completes in seconds.
+		// Additive + env-gated: default (unset) is byte-identical to prior behaviour;
+		// the gate only ever fires in the SIM_INPROC sweep which sets the env.
+		static int sim_quiet = -1;
+		if(sim_quiet < 0)
+			sim_quiet = (getenv("MERCURY_SIM2_QUIET") != nullptr) ? 1 : 0;
+		if(!sim_quiet)
+			print_stats();
 	}
 
 }
@@ -3709,12 +3721,16 @@ void cl_arq_controller::send_batch()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
 	// === DIAG: always print TX activity (remove after debug) ===
+	// SIM-SWEEP quiet gate: this per-batch printf floods the FTRT sim (see
+	// timing_log.h quiet_enabled). Suppressed only when MERCURY_SIM2_QUIET is set.
+	if(!mtl::quiet_enabled()) {
 	printf("[CMD-TX] CONFIG_%d batch=%d type=%d pream=%d Nsymb=%d\n",
 		current_configuration, message_batch_counter_tx,
 		message_batch_counter_tx > 0 ? messages_batch_tx[0].type : -1,
 		telecom_system->data_container.preamble_nSymb,
 		telecom_system->data_container.Nsymb);
 	fflush(stdout);
+	}
 	if(g_verbose) {
 		printf("[TX] send_batch() on CONFIG_%d, %d messages, first type=%d\n",
 			current_configuration, message_batch_counter_tx,
@@ -3922,7 +3938,9 @@ void cl_arq_controller::send_batch()
 		telecom_system->ofdm.FIR_tx2.apply(batch_frames_output_data_filtered1,batch_frames_output_data_filtered2,total_fir_size);
 
 		// DIAG: TX peak amplitude after FIR filtering
-		{
+		// SIM-SWEEP quiet gate: the per-batch peak scan + printf floods the FTRT
+		// sim. Skipped (scan included) when MERCURY_SIM2_QUIET is set.
+		if(!mtl::quiet_enabled()) {
 			double pk_pre = 0, pk_post = 0;
 			for(int j = 0; j < total_fir_size; j++) {
 				if(fabs(batch_frames_output_data[j]) > pk_pre) pk_pre = fabs(batch_frames_output_data[j]);
@@ -7541,6 +7559,17 @@ void cl_arq_controller::restore_backup_buffer_data()
 
 void cl_arq_controller::print_stats()
 {
+	// SIM-SWEEP quiet gate (gearshift settling-time WGN sweep). print_stats() is a
+	// PURE diagnostic dump (~50 printfs, no book-keeping side effects — the backup-
+	// restore lives in the separate function above) called from SIX sites (the 2 Hz
+	// virtual-clock tick + the per-state-transition direct calls in
+	// process_messages_responder/commander). In the faster-than-real-time 2-instance
+	// in-process sim those fire constantly and the dump dominates WALL time.
+	// MERCURY_SIM2_QUIET=1 short-circuits the whole dump. Additive + env-gated:
+	// default (unset) is byte-identical to prior behaviour. Gating HERE (not at each
+	// call site) covers all six callers uniformly and cannot drop any book-keeping.
+	if(mtl::quiet_enabled()) return;
+
 	printf("\033[2J");  // clean screen
 	printf("\033[H");   // go to upper left corner
 
