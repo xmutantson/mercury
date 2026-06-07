@@ -97,3 +97,84 @@ All existing big-block tests pass on this branch (production unchanged): `--test
   ARM-B (`DEFEAT_FIX=1`, a deliberately truncated stock RX window), NOT a cross-block bug. The
   isolated harness decodes consecutive clean blocks all-healthy (0.194 ×3). The real reproducer
   is the un-tracked residual CFO. (Struck through the cross-block-state hypothesis.)
+
+## §8 SS5 cross-layer data-flow audit (before changing the estimator/de-rotator)
+Shared state the big-block RX channel-est path writes, and every other producer/consumer:
+
+**`ofdm.estimated_channel[Ngrid*Nc]`** (one complex H per grid cell)
+- Producers (big-block RX): flat-ML write `telecom_system.cc:7401` (Hbar broadcast to all cells);
+  sparse-2D write `grid_sparse2d_estimator:5977-5981`. Both set `status=MEASURED`.
+- Producers (per-frame, SHARED member): LS/ZF estimator in the `receive_byte` OFDM path
+  (`telecom_system.cc:~2737-2785`) + `OFDM.cc` fills. The big-block path REBUILDS the grid
+  (`bigblock_rebuild_thin_grid` deinit/init to `Nsymb=Ngrid`) and owns `estimated_channel`
+  exclusively for the block; the per-frame path never runs concurrently (different `Nsymb`/site).
+- Consumers: `cl_ofdm::channel_equalizer` (`OFDM.cc:2173-2208`) reads `H`, computes `out=in/H` (ZF)
+  with MMSE erasure when `alpha=|H|^2/(|H|^2+nv) < 0.1`, then sets `status=UNKNOWN`. Big-block CSI
+  loop `:7407-7414` reads `|H|^2` for LLR weighting. meanH stash `:7425-7426` (test metric). DIAG `:7432`.
+- INVARIANT: `out=in/H=X` requires H to capture the cell's TRUE complex gain INCLUDING per-symbol
+  phase. A per-symbol-LOCAL estimate satisfies it; a block-AVERAGED estimate does not when the
+  per-symbol phase ramps.
+
+**`ofdm.pilot_configurator.sequence[]`** (transmitted pilots X, raster order over PILOT cells)
+- Producer: `pilot_configurator.init` at grid rebuild; read-only after.
+- Consumers: every Y/X site (`pilot_evm:7290`, TRACK LS `:7348`, flat-ML `:7392`, sparse-2D `:5847`,
+  nv residual `:5992`/`:7398`, DIAG `:7436`) walk it by a running `pidx` in the SAME nested-n/j
+  `type==PILOT` raster order. INVARIANT (held): pidx order matches the framer's PILOT order.
+
+**`ofdm.noise_variance_estimate`** (scalar sigma^2_n)
+- Producers: flat-ML `:7402`, sparse-2D `:5997` (pilot-residual EVM, floored 1e-6). SHARED with the
+  per-frame nv; big-block owns it for the block.
+- Consumers: equalizer MMSE erasure threshold (`OFDM.cc:2200`); `psk.demod` LLR scale (`:7451`).
+  INVARIANT: nv must reflect the post-de-rotation pilot residual (TRACK de-rotates `rx` before nv).
+
+**What Option A changed**: only the PHASE of `rx` fed to the (unchanged) estimators -> estimated_channel/nv.
+It does NOT touch pilot.sequence, does NOT touch the per-frame path (change is inside
+`bigblock_rx_passband`, reached only when `bigblock_framing_enabled`, default-off), and the
+equalizer/demod/CSI consumers keep reading estimated_channel/nv exactly as before. **Audit conclusion:
+confined to the big-block RX seam; no consumer invariant violated. Audit done.**
+
+## §9 Attempt #2 — Option A (post-FFT per-symbol pilot phase tracking): IMPLEMENTED, REFUTED by measurement
+**What**: in `bigblock_rx_passband` STEP-2 TRACK, replaced the harmful window-AVERAGE of the WRAPPED
+per-symbol common phase `sym_omega[n]` with: UNWRAP `sym_omega` along the symbol axis (shortest-step
+cumulative), then de-rotate each symbol by its OWN unwrapped common phase (light-smooth the unwrapped
+near-linear sequence = the 802.11a smoother). `sym_delta` (per-carrier SFO slope) kept window-averaged.
+Confined to the big-block RX path; per-frame untouched. (Reverted after refutation — not left as dead
+code, per the §4 attempt-#1 precedent. Binary byte-identical to baseline: 32867491.)
+
+**Genuine test result (`--test-bigblock-chanest`, the off-bench arbiter)**: PASS-AFTER still FAILS.
+- baseline (no fix):           PASS-AFTER meanH **0.0982**, bytes_ok=0
+- Option A (unwrap+derotate):  PASS-AFTER meanH **0.0965** (sparse-2D) / **0.0192** (flat-ML) = NO recovery
+  (flat-ML slightly WORSE than the 0.0235 TRACK-off baseline). SANITY clean stays 0.194 8/8 (no regression).
+
+**Why it failed (MEASURED) — two independent obstructions, both rooted in NO pre-FFT AFC:**
+1. **Per-symbol common phase is UN-ESTIMABLE from this lattice under CFO.** `[TRACK-DIAG]` under CFO=8:
+   `sym_omega` n=0->1.06, n=1->-1.77, n=2->2.01 rad (wild jumps, not a 0.59 rad/sym ramp). The 2 CONTINUAL
+   pilots sit at band edges (carriers 0, 49); under CFO there is also a per-carrier slope, and each pilot
+   phase is `atan2`-wrapped to (-pi,pi], so once inter-pilot phase across the band exceeds pi the LS fit
+   CONFLATES slope+intercept and the intercept ALIASES. The unwrapper then aliases (span 11.68 rad vs the
+   true ~78 rad / 12.46 cycles). De-rotating by aliased phase scrambles, not corrects.
+2. **Genuine ~33% INTRA-symbol MAGNITUDE loss that NO post-FFT phase tracking recovers.** Raw pilot `|Y/X|`
+   (measured after TRACK, before the estimate): clean **0.228** -> CFO **0.153**. Timing-search-INDEPENDENT
+   (`BIGBLOCK_TSEARCH_STEP=1` -> 0.1535 == step=2) so NOT a window artifact; it is intra-symbol ICI / the
+   FFT integrating a frequency-offset signal. Flat-ML Hbar collapses 0.228(clean)->**0.0235**(CFO, phase
+   spread); even a perfect phase fix leaves the 0.153 magnitude floor (< 0.18 gate, < 0.228 clean).
+
+**Conclusion**: post-FFT pilot tracking is the WRONG LAYER. Both obstructions are symptoms of the §3 gap:
+the big-block RX does ONE head Schmidl-Cox TIMING acquire and NO carrier-frequency (Moose) correction, so
+the residual CFO is never removed in the TIME DOMAIN before the FFT. Phase ramp AND magnitude loss both come
+from the un-corrected pre-FFT carrier offset; only a pre-FFT AFC removes both.
+
+## §10 SS2 attempt count + next option (DO NOT iterate unsupervised)
+- Attempt #1 (§4): head-preamble AFC single re-mix — REFUTED (drift; one estimate insufficient for 1.56 s).
+- Attempt #2 (§9): post-FFT per-symbol pilot phase tracking (Option A) — REFUTED (lattice can't estimate the
+  per-symbol phase; intra-symbol magnitude loss is post-FFT-unrecoverable).
+- **2 consecutive principled attempts on the same defect. CLAUDE.md §2 -> STOP and discuss before #3.**
+- **NEXT (supervised) = Option C: mid-block / sub-block Moose RE-ACQUISITION (true pre-FFT AFC tracking).**
+  Re-estimate the carrier frequency periodically across the 1.56 s span (embedded mid-block preambles, or a
+  decision-directed TIME-DOMAIN CFO from the continual pilots' inter-symbol phase rate) and RE-MIX each
+  sub-block's time samples at `carrier - cfo` BEFORE its FFT. Only this removes BOTH the phase ramp AND the
+  intra-symbol magnitude loss (both pre-FFT). Most invasive (most faithful to the per-frame path, immune
+  precisely because it re-runs Moose every ~12-sym frame). Option B (fix TRACK to estimate the global ramp
+  slope) is DOMINATED — still post-FFT, can't fix the 0.153 magnitude floor. Option C likely needs a TX-side
+  change (periodic mid-block preambles) or a robust decision-directed time-domain CFO estimator = an
+  architectural increment, not a tweak — hence the STOP-and-discuss gate.
