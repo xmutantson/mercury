@@ -372,8 +372,36 @@ feed. Production-path code is byte-identical (the change is inside the
 SIM_INPROC-only sim2_deliver_from_wire helper).
 
 ### §8.5 Block fits ONE batch (why this is the ONLY blocker)
-At CFG16 K=8: 8 codewords × ldpc.K(1400) = 11200 info bits = 1400 bytes/block.
-The test PAYLOAD=1374 < 1400 → the WHOLE payload is ONE big block = ONE batch.
-So this transfer NEVER hits the §7 multi-batch reentrancy wedge; the
-geometry-helper ring-zeroing is the sole remaining blocker to full
+At CFG16 K=8: 8 codewords × ldpc.K(1400) = 11200 info bits = 1400 wire bytes/block;
+the APP capacity is 1400 − hdr_total(2+2K=18) − K·CRC(8) = **1374 bytes/block**
+(arq_common.cc:3753-3762). The test PAYLOAD=1374 → the WHOLE payload is ONE big
+block = ONE batch. So this transfer NEVER hits the §7 multi-batch reentrancy
+wedge; the geometry-helper ring-zeroing was the sole remaining blocker to full
 1374/1374 byte-faithful delivery on the live path.
+
+### §8.6 RESULT after the ring-preservation fix (commit on diag/livepath-sim)
+- **Ring-zeroing FIXED**: `--test-bigblock-livepath` snapshot rms 0.000000 →
+  0.047630 (block now PRESENT; `[OFDM-SYNC]` preamble acquires metric=0.992).
+  No regression: pinned fullpath 1200/1200 (8/8 clean), multicw ALL PASS,
+  arq-unit 8/8, climb-engine ALL PASS, legacy 2INST smoke byte-identical.
+- **Full byte-faithful delivery PROVEN on the PINNED full path**
+  (`--test-bigblock-fullpath`: 1200/1200 bytes, first_block clean=8/8) through the
+  REAL receive_bigblock + de-whiten + carve + FIFO path; `--test-bigblock-multicw`
+  K=8 full-block byte-faithful (ALL PASS).
+- **UNPINNED live-handshake full delivery NOT yet reached**: the FIRST big-block
+  lands at the robust→CFG16 SET_CONFIG transition edge where the sim decode-drive
+  window arming is not yet settled, so it misses cw0-CRC and the symbol-paced clock
+  crawls through the SACK-retransmit ACK timeout past the wall cap. SAME class as §6
+  (first-frame at link-up edge), NOT a delivery-path defect (identical decode path
+  delivers 1200/1200 when settled). Follow-on: a one-shot "first OFDM block at the
+  PHY-switch edge" decode-drive that does not depend on the steady gate.
+- **THROUGHPUT vs VARA (clean channel, deterministic on-air airtimes)**: Mercury
+  production PPMd8+zstd streaming compresses Project Gutenberg #84 (pg84,
+  448,885 B) → 121,496 B (**3.695×**). Block carries 1374 compressed app bytes in
+  1.6533 s airtime (6649 bps compressed wire). effective = orig·8 / (88.4 blocks ·
+  cycle): airtime-only ceiling **24,564 bps**; nominal 913 ms turnaround
+  **15,825 bps**; conservative 1014 ms **15,226 bps**. **WIN across the whole band
+  vs VARA HF Standard 13,048 bps.** Clean-channel number (no SFO/CFO, matching
+  VARA's bar); HW confirmation pending (testbed emulator low-pass collapse).
+  Numbers + harness: `bigblock_p3_hw/results_simproof.json`,
+  `bigblock_p3_hw/measure_compress.cc`.
