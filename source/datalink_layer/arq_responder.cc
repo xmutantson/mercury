@@ -162,7 +162,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 				int delay_ms = remaining_syms * sym_ms + 200;
 				printf("[HAIL] Waiting %d ms for commander TX to finish\n", delay_ms);
 				fflush(stdout);
-				msleep(delay_ms);
+				// §5.7-B7: virtual-clock-ify ONLY (Bug #55 delay FORMULA above is
+				// verbatim) — route the pause through the pump so the shared clock
+				// advances and the commander's trailing TX is consumed at the right
+				// sample boundary. Same exit predicate; verbatim msleep on production.
+				pumped_settle_wait(delay_ms);
 			}
 			// Respond with our own HAIL (suppressed in monitor mode)
 			send_hail_pattern();
@@ -278,7 +282,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 				printf("[RSP-CONNECT-V2] Waiting %d ms (HAIL race delay) "
 					"before synthesizing messages_rx_buffer\n", delay_ms);
 				fflush(stdout);
-				msleep(delay_ms);
+				// §5.7-B7: virtual-clock-ify ONLY (delay FORMULA above verbatim) —
+				// route through the pump so the shared clock advances; same exit
+				// predicate; verbatim msleep on production.
+				pumped_settle_wait(delay_ms);
 
 				// Synthesize messages_rx_buffer to match the LDPC
 				// START_CONNECTION layout the legacy code builds at
@@ -372,7 +379,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 				printf("[RSP-TEST-CONN-V3] Waiting %d ms (HAIL race delay) "
 					"before synthesizing messages_rx_buffer\n", delay_ms);
 				fflush(stdout);
-				msleep(delay_ms);
+				// §5.7-B7: virtual-clock-ify ONLY (delay FORMULA above verbatim) —
+				// route through the pump so the shared clock advances; same exit
+				// predicate; verbatim msleep on production.
+				pumped_settle_wait(delay_ms);
 
 				// Reconstruct float SNR from 4-bit quantization via the
 				// inverse of cl_mfsk::snr_to_tone(M=16).
@@ -1184,6 +1194,29 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				else
 					ftr_val = frame_symb + 10;  // ~1.3s: normal turnaround
 			}
+			// PARTIAL-BLOCK FIX (bigblock-whiten-align): when the next thing we receive is
+			// ONE big-block (CFG16 framing), the decode snapshot fires when frames_to_read
+			// hits 0 — so the wait MUST span the WHOLE block (preamble + Ngrid data symbols,
+			// ~64 sym), not one stock frame (~13). The stock arming snapshotted after only
+			// the block's head was captured, so cw1..K-1 read silence and CRC-failed (cw0
+			// clean, 0 app bytes delivered). Extend the wait to cover a full block.
+			// REPRODUCER HOOK (bigblock-whiten-align): MERCURY_BIGBLOCK_DEFEAT_FIX=1 keeps the
+			// stock one-stock-frame wait so the full-path regression shows its fail-before
+			// (decode fires on a partial block -> cw1..K-1 garbage). Production never sets it.
+			bool defeat_block_ftr = false;
+			{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_FIX"); if(e && *e && atoi(e)!=0) defeat_block_ftr = true; }
+			if(!defeat_block_ftr
+				&& telecom_system->bigblock_framing_enabled
+				&& telecom_system->M != MOD_MFSK
+				&& current_configuration == CONFIG_16)
+			{
+				int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+				if(block_nsymb > 0)
+				{
+					int block_ftr = block_nsymb + 10;   // block span + turnaround margin
+					if(block_ftr > ftr_val) ftr_val = block_ftr;
+				}
+			}
 			telecom_system->data_container.frames_to_read = ftr_val;
 			telecom_system->data_container.nUnder_processing_events = 0;
 
@@ -1247,7 +1280,19 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			cl_timer ptt_off_wait;
 			ptt_off_wait.reset();
 			ptt_off_wait.start();
-			while(ptt_off_wait.get_elapsed_time_ms()<ptt_off_delay_ms);
+			// 3rd-spin inversion (single-process-sim-refactor.md §5.6(a) /
+			// §5.7-B6): this was an EMPTY-body busy-spin
+			//   while(ptt_off_wait.get_elapsed_time_ms()<ptt_off_delay_ms);
+			// which hard-deadlocks under the single-thread virtual clock (the
+			// sim clock advances ONLY via rx_transfer; nothing drives it during
+			// an empty spin, so get_elapsed_time_ms() never increases). Route
+			// it through ptt_busy_wait so the SIM_INPROC step-pump drives the
+			// clock-advance from inside the wait. The EXIT PREDICATE is
+			// byte-identical (elapsed >= ptt_off_delay_ms), and on every
+			// production / two-process-paced-sim path the helper's behavior is
+			// unchanged (the pump hook is null there) — so this only un-deadlocks
+			// the single-thread stepper, it does not alter the live link.
+			ptt_busy_wait(ptt_off_wait, ptt_off_delay_ms);
 
 			bool has_asymmetric = (forward_configuration != CONFIG_NONE &&
 				reverse_configuration != CONFIG_NONE);
@@ -1629,7 +1674,19 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				stats.nNAcked_data++;
 				batch_rx_frame_count = 0;
 				last_received_end_of_batch_seq = -1;
-				// Reset RX state for fresh retransmission capture
+				// Reset RX state for fresh retransmission capture.
+				// §17.6 / §17.8 (§5 cross-layer audit): this is the ACK-GATE
+				// partial-batch retx re-arm. It is DELIBERATELY left STOCK-frame
+				// (NOT routed through bigblock_block_ftr_or). When a big-block decoded
+				// PARTIAL (some cw demoted by the per-cw wire-CRC), the CMD sends the
+				// selective-repeat as STOCK per-frame frames — bigblock_send_one_block()
+				// declines while sack_retransmit_active (arq_common.cc:3718, CMD sets it
+				// at arq_commander.cc:1803). So the RX legitimately expects per-frame
+				// retx frames here; block-spanning this arming would OVER-WAIT for a
+				// big-block that is not coming and stall the retx. The NEXT NEW-DATA
+				// block IS re-armed to full block-span by the wrapped ACK-send paths
+				// (send_mfsk_ack_sack arq_common.cc:5526 etc.), so the new-data path
+				// still gets its full window. DO NOT "fix" this by wrapping it.
 				telecom_system->data_container.frames_to_read =
 					telecom_system->data_container.preamble_nSymb
 					+ telecom_system->get_active_nsymb();
@@ -1870,9 +1927,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
 		// Expect data frames next: use full Nsymb for capture.
 		// Frame completeness gating handles late arrivals adaptively.
+		// MULTI-CW WINDOW FIX (fact-doc §17): at the bigblock rung the next thing we
+		// receive is ONE K-codeword block (~64 sym), not a stock frame (~13) — block-span
+		// the window so the decode snapshot waits for the WHOLE block (cw1..7 fresh).
 		telecom_system->set_mfsk_ctrl_mode(false);
-		telecom_system->data_container.frames_to_read =
-			telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb + 10;
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(
+			telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb + 10);
 
 		batch_rx_frame_count = 0;
 		connection_status=RECEIVING;

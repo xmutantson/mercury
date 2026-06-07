@@ -27,6 +27,7 @@
 #include "common/sim_clock.h"
 #include <unistd.h>
 #include <cstdint>
+#include <vector>
 #include "tcp_socket.h"
 #include "fifo_buffer.h"
 #include "physical_layer/telecom_system.h"
@@ -43,6 +44,62 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+
+// ---------------------------------------------------------------------------
+// TX-path blocking-wait helpers (defined in arq_common.cc, external linkage).
+//
+// These are the two spin-loop shapes that recur across the send path:
+//   ptt_busy_wait(t, delay_ms) — block until virtual/wall time crosses delay_ms
+//   drain_playback_wait()      — block until the playback ring is fully drained
+//
+// Declared here (rather than re-forward-declared per .cc) so EVERY ARQ
+// translation unit routes through the SAME definition — in particular the
+// SWITCH_ROLE PTT-off wait in arq_responder.cc, which previously open-coded an
+// empty-body busy-spin that hard-deadlocks under the single-thread virtual
+// clock (single-process-sim-refactor.md §5.6(a) / §5.7-B6). Behavior is
+// byte-identical on every production / two-process-paced-sim path (the
+// step-pump hook inside these helpers is null unless -m SIM_INPROC installs
+// it); routing through them only makes those waits step-pumpable.
+void ptt_busy_wait(cl_timer& t, int delay_ms);
+void drain_playback_wait();
+
+// ---------------------------------------------------------------------------
+// SIM_INPROC settle-wait helpers (single-process-sim-refactor.md §5.7 / §7).
+//
+// arq_sim_inproc_active() — true iff the -m SIM_INPROC step-pump is installed
+// (i.e. g_sim_inproc_pump != nullptr). On EVERY production path and the
+// two-process paced sim it returns false, so the gated branches below take the
+// verbatim wall-clock body. The pump is installed ONLY by the SIM_INPROC
+// stepper (arq_commander.cc test_sim_inproc), so this is the authoritative
+// "are we the single-thread in-process stepper?" query.
+//
+// pumped_settle_wait(wait_ms) — virtual-clock-ify a wall settle-wait. When the
+// pump is NOT installed it is byte-identical to msleep(wait_ms) (production +
+// paced sim). When the pump IS installed it runs a cl_timer + step-pump loop
+// with the SAME exit predicate (elapsed >= wait_ms), advancing the shared
+// virtual clock through the pump so a peer instance sees time pass. The exit
+// SEMANTICS are unchanged — only the clock-advance mechanism differs. Used for
+// the B1-B4 / B7 turnaround + HAIL-race settle guards. For B7 the CALLER keeps
+// the delay FORMULA verbatim (Bug #55 HAIL reliability); this helper only
+// routes the already-computed wait_ms through the pump.
+//
+// sim_inproc_rx_mute_settle(wait_ms) — gate-off the RX_MUTE drain guard (B5 /
+// ADD-ON1). The msleep there waits for ASYNC AUDIO CALLBACKS to drain before
+// circular_buf_reset(); under SIM_INPROC the single-thread stepper owns RX —
+// there is NO async audio thread, nothing is in flight — so the drain wait is
+// MOOT and becomes a no-op. The instantaneous circular_buf_reset() that
+// follows the caller keeps verbatim. On production/paced-sim it is the verbatim
+// msleep(wait_ms).
+bool arq_sim_inproc_active();
+void pumped_settle_wait(int wait_ms);
+void sim_inproc_rx_mute_settle(int wait_ms);
+
+// SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5). Set true ONLY
+// while the 2-instance stepper runs; makes process_main() skip its TCP control +
+// data poll blocks (the stepper injects commands + data directly). Default false
+// → production + paced sim run the verbatim blocks (byte-identical).
+void arq_set_sim_inproc_skip_tcp(bool on);
+bool arq_sim_inproc_skip_tcp();
 
 union u_SNR {
   float f_SNR;
@@ -1202,6 +1259,65 @@ public:
   // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
   int test_robust0_compress_deadlock();
 
+  // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
+  // Single-instance in-process self-loopback: keys PTT, emits a real frame,
+  // and proves the TX-path spin-loops (ptt_busy_wait + drain_playback_wait)
+  // become STEP-PUMPABLE under a single-thread stepper with NO concurrent
+  // drainer thread, while the spin-exit timing stays IDENTICAL to the
+  // two-process paced sim (clock past delay / ring drained). Sets up its own
+  // PHY + audio ring buffers (no device, no bridge/prep threads, no TCP, no
+  // relay). Returns 0 on a clean inline cycle, 1 on any failure. -m SIM_INPROC.
+  int test_sim_inproc();
+
+  // 2-INSTANCE SIM_INPROC stepper (single-process-sim-refactor.md §10.5). Static
+  // because it constructs its OWN two cl_telecom_system + two cl_arq_controller
+  // (A=COMMANDER, B=RESPONDER) + two cl_sim_awgn (one per direction), drives the
+  // real handshake via process_user_command + the §3 lockstep A<->B loop on the
+  // shared virtual clock, and validates G-SMOKE (CONNECT + data B<-A), GATE-2
+  // (byte-identical determinism + switch_seq), GATE-3-light. Returns 0 on PASS.
+  // Selected by -m SIM_INPROC with MERCURY_SIM_2INST=1 / --sim-2inst.
+  static int test_sim_inproc_2();
+
+  // FULL-PATH REGRESSION (bigblock-whiten-align): the cross-layer test the CASE A-D
+  // synthetic carve tests could NOT catch (they hand a caller-owned vector as the RX
+  // passband and never exercise the LIVE receive_bigblock buffer-realloc / the per-block
+  // frames_to_read arming / the FIFO delivery). Drives the 2-instance SIM_INPROC CFG16
+  // big-block transfer through the REAL TX-encode -> whiten -> PHY -> receive_bigblock
+  // de-whiten -> arq carve -> copy_data_to_buffer FIFO deliver, and asserts the full
+  // message is delivered BYTE-FAITHFUL. FAIL-BEFORE (MERCURY_BIGBLOCK_DEFEAT_FIX=1:
+  // dangling-data UAF + one-frame wait) delivers 0 bytes; PASS-AFTER delivers all.
+  // Returns 0 on PASS. Selected by --test-bigblock-fullpath.
+  static int test_sim_inproc_bigblock_fullpath();
+  // MULTI-CW WINDOW REGRESSION (fact-doc §17): the K>1 full-block byte-faithfulness test
+  // the 622-byte synthetic cases and the single-arming fullpath could NOT catch. Drives a
+  // FULL K=8 block (1200B, all 8 codewords) through the LIVE receive_bigblock+de-whiten+
+  // per-cw-CRC carve in THREE arms: (A) CRC-ON block-window -> clean=8/8 + byte-faithful;
+  // (B) NOCRC stock-window (MERCURY_BIGBLOCK_DEFEAT_FIX=1) -> forced-clean but BYTES WRONG
+  // (cw0 ok, cw1..cw7 stale-ring corruption = the HW signature); (C) NOCRC block-window ->
+  // byte-faithful. Proves the root cause is the RX capture WINDOW (not whiten/offset).
+  // Returns 0 on PASS. Selected by --test-bigblock-multicw.
+  static int test_sim_inproc_bigblock_multicw();
+  // TX-LEVEL parity (HW over-level diag): builds a CFG16 telecom_system, emits a
+  // production K=8 big-block waveform AND a stock per-frame CONFIG_16 OFDM waveform
+  // through the SAME transmit_byte entry, and measures peak (Vp-p proxy = max|s|) +
+  // RMS over the DATA span (post-preamble) of each. Prints peak/RMS ratios + PAPR.
+  // Diagnoses whether the bench-observed +3.2 dB big-block over-level is a GAIN
+  // difference (RMS ratio != 1) or PAPR/length peak-vs-RMS (RMS ~1, peak ratio >1).
+  // Returns 0 always (measurement, not pass/fail). Selected by --test-bigblock-txlevel.
+  static int test_bigblock_txlevel();
+  // Capture of the last test_sim_inproc_2() run's delivery (read by the full-path
+  // regression to assert byte-faithful delivery without re-parsing stdout).
+  static long sim2_last_rx_have;
+  static long sim2_last_payload_len;
+  static bool sim2_last_bytes_ok;
+  // Capture of the FIRST big-block carved in the current run (bigblock_block_to_arq):
+  // n_clean / K of the first decoded block. The full-path regression reads these to
+  // assert fail-before (first block decodes PARTIAL, n_clean<K) vs pass-after (CLEAN,
+  // n_clean==K) WITHOUT running the unstable post-partial retry loop to completion.
+  // Reset to -1 by the regression before each arm.
+  static int  bigblock_first_clean;
+  static int  bigblock_first_K;
+
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
   // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:
@@ -1279,6 +1395,169 @@ public:
   // 'ofdm' variant: should PASS on HEAD (regression guard).
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
+
+  // ---- P2 big-block ARQ re-granularization (see
+  // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
+  //
+  // bigblock_block_to_arq(): the PRODUCTION block->ARQ delivery entry. At the
+  // CFG16-bigblock rung (bigblock_framing_enabled), ONE receive_bigblock decode
+  // yields K=8 per-codeword info-bit sub-units + a K-bit cw_ok clean vector (the
+  // SACK granularity, telecom_system.h:595). This entry carves cw_ok into
+  // messages_rx[0..K-1] (RECEIVED iff cw_ok[c]==1), sets the synthetic EOB=K-1
+  // (RISK-4, BEFORE the prev branch), and drives the ONE-ACK / partial-SACK /
+  // bsi-once flow — replacing the K per-frame add_message_rx_data writes.
+  //   cw_ok          : length-K per-codeword clean bitmap (1=clean, 0=failed).
+  //   block_bsi      : the batch_seq_id this block advertises (one block=one batch).
+  //   tx_payload     : K*sub_len bytes the TX block carried (for the
+  //                    delivered==TX assertion); sub_len = bytes/codeword.
+  //   sub_len        : payload bytes per codeword sub-unit.
+  // Returns SUCCESSFUL when the block was delivered to messages_rx[] + the ARQ
+  // state advanced; BIGBLOCK_ARQ_NOT_WIRED (the P2.0 stub return) when the
+  // block->ARQ logic is not yet wired. P2.0 ships this as a one-line stub (NO ARQ
+  // logic) so --test-bigblock-arq-unit FAILS; P2.4/2.5/2.6 implement the body so
+  // it PASSES (bisectable, see fact-doc §6).
+  // PHASE 1 (fact-doc §11): `sub_lengths` is the per-codeword APP byte length (from the
+  // wire length table) so each delivered slot byte-matches its TX frame (INV-6 with
+  // VARIABLE-length compressed frames). `cw0_offset` is codeword 0's app-byte base in
+  // `tx_payload` (= hdr_total; the wire header occupies cw0's prefix); codewords c>=1
+  // start at c*sub_len. When sub_lengths==NULL the carve falls back to a uniform sub_len
+  // length per codeword and cw0_offset=0 (the legacy fixed-length unit-test path).
+  int bigblock_block_to_arq(const int* cw_ok, int K, unsigned char block_bsi,
+                            const unsigned char* tx_payload, int sub_len,
+                            const int* sub_lengths = nullptr, int cw0_offset = 0);
+
+  // LIVE-PATH DELIVERY FIX (bigblock-whiten-align): when a CLEAN big-block is carved,
+  // bigblock_block_to_arq delivers the K decoded sub-units to the app FIFO via
+  // copy_data_to_buffer() (RECEIVED->ACKED then push) — the live ARQ path had no
+  // downstream gate doing this, so the block decoded byte-faithfully but 0 app bytes
+  // reached fifo_buffer_rx. The CASE A-D unit tests (test_bigblock_arq_unit.cc) assert
+  // on messages_rx[] DIRECTLY (bigblock_test_delivered_varlen) and have no real
+  // FIFO/compression context, so they set this flag true to KEEP the slots in
+  // messages_rx[] (skip the FIFO push). Default false = live behavior (deliver).
+  bool bigblock_skip_fifo_delivery = false;
+
+  // ---- STEP 2: live send-path wiring (P3 prereq, see arq_common.cc) ----------
+  // bigblock_send_one_block(): emit the current new-data batch as ONE big-block
+  // via transmit_byte -> transmit_bigblock (gated on
+  // telecom_system->bigblock_framing_enabled; FORCED true for validation, AUTO-
+  // election DEFERRED to P4). Returns true when it HANDLED the batch (caller skips
+  // the per-frame loop); false when it declined (MFSK / retx / mixed-control /
+  // oversized batch -> stock per-frame path). Retx stays STOCK CFG16 per-frame.
+  bool bigblock_send_one_block();
+  // bigblock_receive_carve(): the RX side — after receive_byte()->receive_bigblock()
+  // decoded ONE block (stashing telecom_system->bigblock_last_rx_cw_ok + the K
+  // decoded info-bit sub-units in `info_bits`), translate it into the ARQ data unit
+  // via bigblock_block_to_arq() (carve cw_ok -> messages_rx[], synthetic EOB, one
+  // ACK / partial SACK / bsi-once). Returns the bigblock_block_to_arq rc.
+  //
+  // PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header in cw0's prefix
+  // [bsi, n_data, length[0..K-1]]. When `use_wire_header` is true (the live path) the
+  // carve PARSES that header off the decoded payload and uses the WIRE bsi (authoritative
+  // — drift-proof across a multi-block session) + the per-codeword length table (so each
+  // delivered slot byte-matches its TX frame; compression transparency). `fallback_bsi`
+  // is used only if use_wire_header is false (legacy path) or the header is unusable.
+  int bigblock_receive_carve(const int* info_bits, unsigned char fallback_bsi,
+                             bool use_wire_header = true);
+  // GAP-3 CARVE-GATE HARDENING (cfg16-controlack-hold): returns true iff the just-
+  // decoded CFG16 acquisition (in telecom_system->bigblock_rx_infobits, K codewords)
+  // is a REAL big-block — i.e. cw0's de-whitened wire-CRC-8 matches its tail byte.
+  // A real block's cw0 always carries the FEC+CRC-protected [bsi,n_data,length-table]
+  // header; a single OFDM control frame / stale audio / noise mis-routed into the
+  // block carver does NOT produce a valid cw0 CRC. Used by process_messages_data to
+  // REJECT a mis-carve and re-decode the audio on the stock per-frame path (so a
+  // SET_CONFIG/ACK control turnaround received at CFG16 is parsed as control, not
+  // carved). Reuses the SAME de-whiten + CRC8_calc + BIGBLOCK_CW_CRC_* the carve and
+  // the TX use, so it cannot drift from the on-wire format.
+  bool bigblock_rx_cw0_header_valid();
+  // MULTI-CW WINDOW FIX (fact-doc §17): a big-block decode snapshots buffer_Nsymb
+  // samples but the snapshot only fires when frames_to_read hits 0, so frames_to_read
+  // controls how many FRESH symbols are accumulated before the block is handed to the
+  // decoder. The block spans bigblock_rx_block_nsymb() (~64) OFDM symbols; a stock
+  // CFG16 frame is ~13. Every per-block ACK-turnaround / FAIL re-arm that arms a STOCK
+  // frame (send_ack_pattern et al.) truncates the next block's window so cw1..cw7 read
+  // a stale ring and decode to deterministic garbage (cw0 — the early symbols — stays
+  // byte-correct). This helper raises a stock frames_to_read to the FULL block span
+  // when the bigblock rung is active (framing on, M!=MFSK, CFG16), and returns
+  // stock_ftr UNCHANGED on every other path (byte-identical to baseline). It reads the
+  // SAME bigblock_rx_block_nsymb() the §15.2 sites use — no parallel mechanism. The
+  // MERCURY_BIGBLOCK_DEFEAT_FIX=1 reproducer hook bypasses the clamp (returns stock_ftr)
+  // so the SAME binary reproduces the pre-fix truncated-window corruption for the A/B.
+  int bigblock_block_ftr_or(int stock_ftr);
+  // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
+  // block carried + its geometry, so the in-process single-block harness can carve
+  // it back byte-faithfully (the delivered==TX ground truth, INV-6).
+  std::vector<unsigned char> bigblock_tx_block_payload;
+  int           bigblock_tx_block_K       = 0;
+  int           bigblock_tx_block_sub_len = 0;
+  unsigned char bigblock_tx_block_bsi     = 0;
+  int           bigblock_tx_block_ndata   = 0;
+  // PHASE 1 (fact-doc §11): per-codeword app byte length (the wire length table), so
+  // the in-process harness carves each sub-codeword its EXACT TX length byte-faithfully
+  // (INV-6 with VARIABLE lengths; the production RX reads the same table off the wire).
+  std::vector<int> bigblock_tx_block_lengths;
+
+  // ---- STEP 3: single-block end-to-end in the 2-instance in-process sim -------
+  // test_sim_inproc_bigblock(): a dedicated single-block 2-instance ARQ harness
+  // (CMD + RSP, pinned CFG16-bigblock). Drives the PRODUCTION send-path
+  // (bigblock_send_one_block -> transmit_byte -> transmit_bigblock) through the
+  // PROVEN PHY block loopback into the RSP's receive_byte -> receive_bigblock ->
+  // bigblock_receive_carve, then the ACK-GATE / clean-ACK match (R-B). Asserts a
+  // single block ARQ-drives CMD->RSP->ACK->CMD byte-faithful, plus a one-bad-
+  // codeword partial -> selective-repeat completes the block. Returns 0=PASS.
+  // Optimizer/gearshift authority UNTOUCHED. CLI: --test-sim-inproc-bigblock.
+  int test_sim_inproc_bigblock();
+
+  // In-process big-block ARQ-granularization regression (one-shot, then exit rc).
+  // CLI: --test-bigblock-arq-unit. THREE cases per fact-doc §6:
+  //   1 clean K=8 -> one ACK / all-ones K-bit bitmap / bsi bumps ONCE;
+  //   2 one-bad-codeword -> partial K-bit SACK + selective-repeat of EXACTLY that
+  //     codeword (stock CFG16 per-frame retx + messages_rx_prev);
+  //   3 lost-EOB -> synthetic EOB=K-1 holds, RSP sizes batch=K, prev completes.
+  // Asserts RX delivered bytes == TX bytes at every transition. Returns 0=PASS,
+  // 1=FAIL. MUST FAIL before P2 wiring (the stub above), PASS after. Default
+  // builds never call this.
+  int test_bigblock_arq_unit();
+  // Test-only helpers for test_bigblock_arq_unit (member methods because
+  // messages_rx[]/nMessages are private). Count RECEIVED slots in
+  // messages_rx[0..K-1]; count delivered bytes that match the expected TX
+  // payload byte-for-byte (the "RX delivered == TX" measure, INV-6).
+  int bigblock_test_count_received(int K);
+  int bigblock_test_delivered_bytes(int K, int sub_len,
+                                    const unsigned char* tx_payload);
+  // PHASE 1 (fact-doc §11): VARIABLE-length delivered measure — count bytes that match
+  // app_flat[app_off[c]+j] AND require messages_rx[c].length == app_len[c] (so a slot
+  // delivering sub_len pad bytes instead of its real frame length FAILS). Equals
+  // sum(app_len[0..K-1]) iff every sub-codeword delivered its exact TX frame bytes.
+  int bigblock_test_delivered_varlen(int K, const int* app_len, const int* app_off,
+                                     const unsigned char* app_flat);
+
+  // SACK-GATE T6 (R-B / bug #9): CMD/RSP election symmetry against the
+  // PRODUCTION setter. Constructs TWO independent cl_telecom_system +
+  // cl_arq_controller (one CMD-role, one RSP-role), loads a REAL CFG16 grid into
+  // each (so bigblock_codeword_count() runs the live nBits/ldpc.N geometry, NOT a
+  // hardcoded K), turns on bigblock_framing_enabled, and runs the SHARED
+  // production sack_negotiated_recompute_batch() on BOTH. Asserts both elect
+  // data_batch_size == K == BB_TEST_K(8), both derive the identical all-ones
+  // target (1<<data_batch_size)-1 == 0xFF (the cmd_clean_data_ack_crc_valid:136-139
+  // expression), and the RSP's all-clean K-bit bitmap 0xFF is accepted by that
+  // gate (rx_bitmap==all_ones) AND by sack_clean_confirmation_accepted(). Returns
+  // 1 on PASS, 0 on FAIL (caller increments cases_passed). This is the #9 GO/NO-GO:
+  // without the R-B pin the non-robust 30s formula elects ~25 -> CMD all_ones
+  // 0x1FFFFFF != RSP 0xFF -> clean ACK never matches (the "4 wire failures").
+  int bigblock_test_election_symmetry();
+
+  // CLIMB-ELECTION (fact-doc data-flow-bigblock-arq-unit.md §16): proves the
+  // big-block rung is ELECTED by the GEARSHIFT CONFIG TRANSITION (load_configuration
+  // landing on CFG16 with framing on), NOT only by an explicit
+  // sack_negotiated_recompute_batch() at connect. Builds two instances (CMD+RSP),
+  // seeds the bug-#9 state (load_configuration(CFG15) -> 30s formula -> batch=25),
+  // turns on bigblock_framing_enabled, then fires the SAME gearshift entry the climb
+  // uses (load_configuration(CFG16)) and asserts the transition elected K==8 on BOTH
+  // peers (symmetric, all_ones==0xFF) WITHOUT any explicit election call, then drives
+  // the REAL emit (bigblock_send_one_block) + carve + delivers byte-faithful.
+  // fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1
+  // (skips the load_configuration tail election). Returns 0 on all-pass, 1 on failure.
+  static int test_bigblock_climb_election();
 
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //

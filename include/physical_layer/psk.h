@@ -53,6 +53,10 @@ public:
 	void deinit();
 	void mod(const int *in,int nItems,std::complex <double> *out);
 	void demod(const std::complex <double> *in,int nItems,float *out,float variance);
+	// Nearest-constellation-point hard slicer (min Euclidean distance). Used by the
+	// sparse-2D channel interpolator's optional DDCE pass (grid_sparse2d_estimator).
+	// Returns (0,0) if the constellation is not initialized.
+	std::complex <double> slice_nearest(std::complex <double> y) const;
 
 	// Phase-2 validation flag (--psk-var-floor=F). Default 0.001 = HEAD (b806b76);
 	// pre-IONOS was 0.05. Lower-bound on variance used in LLR computation.

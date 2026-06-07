@@ -193,8 +193,18 @@ public:
 	double measure_SNR(std::complex <double>*in_s, std::complex <double>*in_n, int nItems);
 	int time_sync(std::complex <double>*in, int size, int interpolation_rate, int location_to_return);
 	int time_sync_preamble(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max);
-	TimeSyncResult time_sync_preamble_with_metric(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max);
-	TimeSyncResult time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric = 0.0);
+	// nsym_override: LEVER P. Correlate the fine-timing template over
+	// nsym_override preamble symbols (MINI tail frame = 1) instead of the
+	// configured length, so a 1-symbol MINI preamble is not re-locked onto a
+	// data subpeak. Default -1 = configured length (legacy, byte-identical).
+	TimeSyncResult time_sync_preamble_with_metric(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max, int nsym_override = -1);
+	// nsym_override: LEVER P preamble amortization. When >0 the Schmidl-Cox
+	// correlation window spans nsym_override preamble symbols instead of the
+	// configured preamble_configurator.Nsymb. Used so the batch-predict verify
+	// correlates over a 1-symbol MINI preamble (tail frame) rather than the full
+	// 4-symbol window (which would dilute the metric with 3 data symbols).
+	// Default -1 = use the configured length (legacy, byte-identical).
+	TimeSyncResult time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric = 0.0, int nsym_override = -1);
 	TimeSyncResult time_sync_preamble_halfsym_2phase(std::complex<double>* in, int size, int interpolation_rate, double early_exit_metric = 0.0);
 	TimeSyncResult time_sync_preamble_fft(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb);
 	TimeSyncResult time_sync_preamble_fft_fine(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int coarse_pos, int search_half_window);

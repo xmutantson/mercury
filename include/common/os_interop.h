@@ -105,9 +105,38 @@ int COND_SIGNAL(HANDLE *mqh_wait);
 extern "C" {
 #endif
 
+#include <stdint.h>
+#include <stddef.h>
+
 // portable glibc-based srand/rand
 long int __random (void);
 void __srandom (unsigned int x);
+
+// Per-instance RNG (single-process-sim-refactor.md §10.1, Landmine 1).
+// The struct mirrors the file-static random_data_t in os_interop.cc; its layout
+// MUST stay in sync with that definition. OS_RNG_STATE_WORDS is DEG_3 + 1 (the
+// TYPE_3 state-table length) — a caller embeds an int32_t[OS_RNG_STATE_WORDS]
+// alongside an os_random_data_t and calls os_rng_make() to bind+seed them. After
+// that, __srandom_r2/__random_r2 drive that INDEPENDENT stream (residue-free of
+// the file-static and of any other instance). Used by cl_telecom_system so two
+// modem instances in one process do not cross-contaminate pre-eq channel /
+// pilot / dispersal sequence generation.
+#define OS_RNG_STATE_WORDS 32   /* == DEG_3 + 1 in os_interop.cc */
+
+struct random_data_t
+{
+    int32_t *fptr;
+    int32_t *rptr;
+    int32_t *state;
+    int rand_type;
+    int rand_deg;
+    int rand_sep;
+    int32_t *end_ptr;
+};
+
+void     os_rng_make   (struct random_data_t *buf, int32_t *state_words, unsigned int seed);
+void     __srandom_r2  (unsigned int seed, struct random_data_t *buf);
+long int __random_r2   (struct random_data_t *buf);
 
 #ifdef __cplusplus
 };

@@ -264,6 +264,21 @@ int main(int argc, char *argv[])
             int failed = run_sim_clock_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-ofdm-fine-timing : run ONLY the §22 OFDM fine-timing
+        // phase-invariant magnitude regression suite and exit. Fast +
+        // deterministic — excludes the long stochastic MFSK detector sweeps in
+        // the full --test suite. See fact-documents/ofdm-fine-timing-magnitude.md §4.
+        if (strcmp(argv[i], "--test-ofdm-fine-timing") == 0) {
+            int failed = run_ofdm_fine_timing_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-preamble-sched : LEVER P preamble-amortization schedule +
+        // effective-length pure-function unit tests. Fast + deterministic.
+        // See fact-documents/data-flow-preamble-amortization.md §1.
+        if (strcmp(argv[i], "--test-preamble-sched") == 0) {
+            int failed = run_preamble_sched_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;
@@ -346,6 +361,25 @@ int main(int argc, char *argv[])
                                         // 'mfsk' should FAIL on HEAD (used_mfsk_path=true bypasses send_sack_v2_frame's Step 8a bump).
                                         // 'ofdm' should PASS on HEAD (regression guard for the existing OFDM SACK_RSP path).
                                         // One-shot at startup, then exit. See fact-documents/sack_partial_bsi_advance.md §5.
+    bool test_bigblock_arq_unit_cli = false; // --test-bigblock-arq-unit: P2 big-block ARQ-granularization regression.
+                                        // 3 cases (clean K=8 / one-bad-cw / lost-EOB). MUST FAIL before P2 wiring (the
+                                        // bigblock_block_to_arq stub returns BIGBLOCK_ARQ_NOT_WIRED), PASS after.
+                                        // One-shot at startup, then exit rc. See fact-documents/data-flow-bigblock-arq-unit.md §6.
+    bool test_sim_inproc_bigblock_cli = false; // --test-sim-inproc-bigblock: STEP 3 single-block end-to-end in the
+                                        // in-process 2-instance sim (CMD->RSP->ACK->CMD byte-faithful + one-bad-cw
+                                        // partial -> selective-repeat completes). One-shot at startup, then exit rc.
+    bool test_bigblock_fullpath_cli = false; // --test-bigblock-fullpath: LIVE 2-instance CFG16 big-block transfer
+                                        // through the REAL receive_bigblock+carve+whiten+FIFO deliver path with
+                                        // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
+    bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
+                                        // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
+                                        // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
+    bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
+                                        // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
+                                        // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
+                                        // One-shot at startup, then exit rc. See data-flow-bigblock-arq-unit.md §16.
+    bool test_bigblock_txlevel_cli = false; // --test-bigblock-txlevel: measure CFG16 big-block vs stock-OFDM TX
+                                        // peak+RMS (HW over-level diag). One-shot at startup, then exit rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -445,6 +479,7 @@ int main(int argc, char *argv[])
         printf("  PLOT_PASSBAND   Passband BER simulation (AWGN)\n");
         printf("  TX_TEST / RX_TEST   Test pattern transmission/reception\n");
         printf("  TX_RAND / RX_RAND   Random data transmission/reception\n");
+        printf("  SIM_INPROC      In-process self-loopback feasibility prototype (no device/TCP/threads)\n");
 
         printf("\nDevice and audio:\n");
         printf("  -i [device]       Audio capture device (e.g. \"plughw:0,0\" or device name from -z)\n");
@@ -818,6 +853,61 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-bigblock-arq-unit") == 0)
+        {
+            // P2 big-block ARQ-granularization regression — one-shot at startup,
+            // then exit with the test's rc. See
+            // fact-documents/data-flow-bigblock-arq-unit.md §6. FAILS before P2
+            // wiring (the bigblock_block_to_arq stub), PASSES after.
+            test_bigblock_arq_unit_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sim-inproc-bigblock") == 0)
+        {
+            // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
+            // One-shot at startup, then exit rc.
+            test_sim_inproc_bigblock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-fullpath") == 0)
+        {
+            // FULL-PATH REGRESSION (bigblock-whiten-align): the LIVE 2-instance CFG16
+            // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
+            // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
+            test_bigblock_fullpath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-multicw") == 0)
+        {
+            // MULTI-CW WINDOW REGRESSION (data-flow-bigblock-arq-unit.md §17): a FULL K=8
+            // block (all 8 codewords) through the LIVE receive_bigblock+de-whiten+per-cw-CRC
+            // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
+            // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
+            test_bigblock_multicw_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-txlevel") == 0)
+        {
+            // TX-LEVEL parity diag: measure CFG16 big-block vs stock-OFDM TX peak+RMS
+            // to localize the bench-observed +3.2 dB big-block over-level (gain vs PAPR).
+            test_bigblock_txlevel_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-climb-election") == 0)
+        {
+            // CLIMB-ELECTION (data-flow-bigblock-arq-unit.md §16): prove the big-block
+            // rung is ELECTED by the gearshift CFG16 transition (load_configuration tail),
+            // symmetric on both peers, and the elected rung emits + delivers byte-faithful.
+            // fail-before/pass-after on the same binary. One-shot at startup, then exit rc.
+            test_bigblock_climb_election_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strcmp(argv[i], "--test-data-anchored-promote") == 0)
         {
             // Option B (data-anchored gearshift promotion) regression — one-shot
@@ -1160,6 +1250,8 @@ int main(int argc, char *argv[])
                 operation_mode = MONITOR_MODE;
             if (!strcmp(optarg, "TX_WAV"))
                 operation_mode = TX_WAV;
+            if (!strcmp(optarg, "SIM_INPROC"))
+                operation_mode = SIM_INPROC;
             break;
         case 'x':
             if (!strcmp(optarg, "alsa"))
@@ -1717,6 +1809,40 @@ start_modem:
                boost_override, boost_override * ratio_2s, boost_override);
     }
 
+    // SIM_INPROC: single-process in-process self-loopback feasibility prototype.
+    // Additive one-shot — runs ONE telecom_system + arq_controller in-process
+    // with a single-thread step-pumped stepper. NO audio device, NO bridge/prep
+    // threads, NO TCP server, NO relay. Firewall-safe (no sockets) and
+    // audio-safe (no device). Proves the TX-path spin-loops become
+    // step-pumpable without a concurrent drainer while preserving spin-exit
+    // timing. See fact-documents/single-process-sim-refactor.md. Exits rc.
+    if (telecom_system.operation_mode == SIM_INPROC)
+    {
+        // §10.5: with MERCURY_SIM_2INST=1 (or --sim-2inst, parsed earlier into
+        // the same env-style toggle) run the 2-INSTANCE lockstep stepper; default
+        // runs the single-instance Stage-2 GO/NO-GO prototype (preserved as the
+        // regression). Both are additive, in-process, no device/TCP/threads.
+        const char* two = getenv("MERCURY_SIM_2INST");
+        bool run_2inst = (two && *two && *two != '0');
+        if (run_2inst)
+        {
+            printf("Mode selected: SIM_INPROC (2-instance lockstep stepper)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_2();
+            printf("[FLAG] SIM_INPROC 2-instance complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            return rc;
+        }
+        printf("Mode selected: SIM_INPROC (in-process self-loopback prototype)\n");
+        fflush(stdout);
+        cl_arq_controller ARQ;
+        ARQ.telecom_system = &telecom_system;
+        int rc = ARQ.test_sim_inproc();
+        printf("[FLAG] SIM_INPROC prototype complete (rc=%d) — exiting.\n", rc);
+        fflush(stdout);
+        return rc;
+    }
+
     // initializing audio system
     pthread_t radio_capture, radio_playback, radio_capture_prep;
 
@@ -1861,6 +1987,88 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_partial_bsi_advance(test_partial_bsi_advance_cli);
             printf("[FLAG] Partial-bsi-advance test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_arq_unit_cli) {
+            // P2 big-block ARQ-granularization regression (one-shot, then exit rc).
+            // Drives bigblock_block_to_arq() through 3 cases (clean K=8 / one-bad-cw
+            // / lost-EOB) + asserts RX delivered == TX at every transition. FAILS
+            // before P2 wiring (the stub), PASSES after. See
+            // fact-documents/data-flow-bigblock-arq-unit.md §6.
+            printf("[FLAG] --test-bigblock-arq-unit: invoking big-block "
+                   "ARQ-granularization regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_bigblock_arq_unit();
+            printf("[FLAG] Bigblock-arq-unit test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_sim_inproc_bigblock_cli) {
+            // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
+            // Drives the production transmit_bigblock/receive_bigblock/
+            // bigblock_block_to_arq path: a single big-block ARQ-drives
+            // CMD->RSP->ACK->CMD byte-faithful + a one-bad-codeword partial ->
+            // selective-repeat completes. One-shot at startup, then exit rc.
+            printf("[FLAG] --test-sim-inproc-bigblock: invoking single-block "
+                   "end-to-end in-process sim\n");
+            fflush(stdout);
+            int rc = ARQ.test_sim_inproc_bigblock();
+            printf("[FLAG] Sim-inproc-bigblock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_fullpath_cli) {
+            // FULL-PATH REGRESSION (bigblock-whiten-align): the LIVE 2-instance CFG16
+            // big-block transfer through the REAL TX-encode->whiten->PHY->receive_bigblock
+            // de-whiten->arq carve->copy_data_to_buffer FIFO deliver path. Asserts the full
+            // message is delivered byte-faithful, with fail-before (DEFEAT_FIX=1) / pass-after
+            // on the SAME binary. Closes the cross-layer gap the CASE A-D synthetic carve
+            // tests bypassed (caller-owned RX vector / direct receive_bigblock / messages_rx[]
+            // assertions never exercised the live UAF, per-block wait, or FIFO delivery).
+            printf("[FLAG] --test-bigblock-fullpath: invoking LIVE 2-instance big-block "
+                   "full-path delivery regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_fullpath();
+            printf("[FLAG] Bigblock-fullpath test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_multicw_cli) {
+            // MULTI-CW WINDOW REGRESSION (data-flow-bigblock-arq-unit.md §17): a FULL K=8
+            // block (all 8 codewords) through the LIVE receive_bigblock+de-whiten+per-cw-CRC
+            // carve. Three arms (CRC-on block-window byte-faithful + clean=8/8; NOCRC
+            // stock-window corruption-repro; NOCRC block-window byte-faithful) prove the root
+            // cause is the RX capture WINDOW, NOT whiten/offset. The K>1 test the 622-byte
+            // cases could not catch. One-shot at startup, then exit rc.
+            printf("[FLAG] --test-bigblock-multicw: invoking FULL K=8 multi-codeword "
+                   "byte-faithfulness regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
+            printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_txlevel_cli) {
+            printf("[FLAG] --test-bigblock-txlevel: measuring CFG16 big-block vs "
+                   "stock-OFDM TX peak/RMS\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_txlevel();
+            printf("[FLAG] Bigblock-txlevel test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_climb_election_cli) {
+            // CLIMB-ELECTION regression (data-flow-bigblock-arq-unit.md §16): the big-block
+            // rung is ELECTED by the gearshift CFG16 transition (load_configuration tail),
+            // not only at connect. Asserts the transition elects K==8 symmetrically on both
+            // peers (all_ones==0xFF) and the elected rung emits + delivers byte-faithful.
+            // fail-before/pass-after on the same binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
+            printf("[FLAG] --test-bigblock-climb-election: invoking gearshift CFG16 "
+                   "rung-election regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_climb_election();
+            printf("[FLAG] Bigblock-climb-election test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
