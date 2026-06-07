@@ -712,6 +712,24 @@ void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
 	rsp_prev_batch_expected_count = new_expected;
 }
 
+// R029 (race audit 2026-06-06): the single owner of zeroing the TX retransmit
+// queue. See the arq.h declaration for the full rationale. Called from every
+// messages_tx[]-freeing recovery site; idempotent (count already 0 -> no-op log
+// suppressed). retransmit_count is the only live cursor — the parallel arrays
+// (retransmit_frames/_lengths/_positions/_types/_batch_seq_ids/_seq_with_eob) are
+// only ever read over [0, retransmit_count), so zeroing the count discards them.
+void cl_arq_controller::clear_retx_queue()
+{
+	if(retransmit_count != 0)
+	{
+		printf("[RETX-CLEAR] dropping %d stale retransmit frame(s) on recovery "
+			"(old-epoch/old-config bytes; plaintext re-queued for re-send under "
+			"the new epoch)\n", retransmit_count);
+		fflush(stdout);
+	}
+	retransmit_count = 0;
+}
+
 void cl_arq_controller::set_data_batch_size(int data_batch_size)
 {
 	// CHOKEPOINT: robust => batch 1 (the single enforcement point).
@@ -2347,6 +2365,7 @@ void cl_arq_controller::update_status()
 			{
 				messages_tx[i].status=FREE;
 			}
+			clear_retx_queue();  // R029: watchdog recovery re-queues plaintext; drop stale retx
 
 			char restore_buf[N_MAX/8 * 20];
 			int total_restore = 0;
@@ -2434,6 +2453,7 @@ void cl_arq_controller::update_status()
 				{
 					messages_tx[i].status=FREE;
 				}
+				clear_retx_queue();  // R029: gearshift-down (SNR_BASED) recovery re-queues plaintext
 
 				char restore_buf[N_MAX/8 * 20];
 				int total_restore = 0;
@@ -2527,6 +2547,7 @@ void cl_arq_controller::update_status()
 				{
 					messages_tx[i].status=FREE;
 				}
+				clear_retx_queue();  // R029: gearshift-down (SUCCESS_BASED_LADDER) recovery re-queues plaintext
 
 				char restore_buf[N_MAX/8 * 20];
 				int total_restore = 0;
@@ -3413,6 +3434,12 @@ void cl_arq_controller::reset_session_state()
 	axis3_recent_sack_ok_count     = 0;
 	axis3_recent_sack_ok_pos       = 0;
 	axis3_batches_since_off        = 0;
+
+	// R029: a session reset (FORCED_ROLE_SWITCH, disconnect, role-switch) abandons
+	// the entire in-flight TX state. The retransmit queue's frames belong to the
+	// dead session's crypto epoch + bsi window — discard them so they cannot be
+	// prepended to the first batch of the next session.
+	clear_retx_queue();
 }
 
 void cl_arq_controller::opt_load_rate_table()
@@ -7309,6 +7336,15 @@ copy_data_done:
 
 void cl_arq_controller::restore_tx_from_compressed()
 {
+	// R029: every caller of this helper is a recovery/config-change path that
+	// frees messages_tx[] and re-queues plaintext to fifo_buffer_tx for re-send
+	// under the new config/epoch (BREAK ACK-recovery, BREAK EXHAUSTED, gearshift
+	// FRAME-UP-DATA-FAILED, gearshift FRAME-UP). The retransmit queue's frames
+	// reference the OLD messages_tx positions and (under encryption) OLD-epoch
+	// bytes, so they MUST be discarded here too — they'll re-send as fresh
+	// new-data once re-queued.
+	clear_retx_queue();
+
 	// When streaming is active, messages_tx was compressed with streaming context
 	// that has already advanced the PPMd model. We can't decompress it again.
 	// Use the backup buffer (raw plaintext) and reset streaming context.

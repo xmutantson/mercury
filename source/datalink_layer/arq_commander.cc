@@ -262,6 +262,7 @@ void cl_arq_controller::process_messages_commander()
 							messages_tx[i].status = FREE;
 						}
 						fifo_buffer_backup.flush();
+						clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 					}
 					block_under_tx = NO;
 					int fifo_load = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
@@ -348,6 +349,7 @@ void cl_arq_controller::process_messages_commander()
 						messages_tx[i].status = FREE;
 					}
 					fifo_buffer_backup.flush();
+					clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 				}
 				block_under_tx = NO;
 
@@ -3351,6 +3353,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					messages_tx[i].status = FREE;
 				}
 				fifo_buffer_backup.flush();
+				clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 			}
 			block_under_tx = NO;
 
@@ -3899,6 +3902,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						messages_tx[i].status = FREE;
 					}
 					fifo_buffer_backup.flush();
+					clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 				}
 				block_under_tx = NO;
 

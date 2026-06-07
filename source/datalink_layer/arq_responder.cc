@@ -3730,3 +3730,114 @@ int cl_arq_controller::test_batch_shrink_strands_prev()
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
+
+// ============================================================================
+// R029 — stale retx queue survives recovery (in-process synthetic-fire)
+// ============================================================================
+//
+// CLI: --test-retx-clear-on-recovery
+//
+// Race-audit R029 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.1 / §5.1): no messages_tx[]-freeing recovery site (watchdog, gearshift-down,
+// BREAK, config-change re-encode, reset_session_state, restore_tx_from_compressed)
+// cleared retransmit_count. The frames in retransmit_frames[] belong to the LIVE
+// crypto epoch + current bsi window; after a recovery re-queues PLAINTEXT under a
+// NEW epoch, the stale entries (OLD-config / dead-crypto-epoch / foreign-bsi)
+// survived, and the v2 mixbatch builder (which has NO epoch guard,
+// arq_commander.cc:1467) prepended them to the first post-recovery batch.
+//
+// The fix adds clear_retx_queue() (the single owner of zeroing the retx queue)
+// and calls it from every recovery site. This test drives the REAL helper and
+// asserts the fail-before/pass-after on retransmit_count:
+//   1. Populate retransmit_count=K with a known OLD bsi (99) distinct from the
+//      current window. (PRE-FIX: a recovery left this dangling.)
+//   2. Call clear_retx_queue() (the production helper every recovery site now
+//      invokes) -> assert retransmit_count==0 (the stale OLD-bsi frames are gone;
+//      a subsequent v2 mixbatch builds pure new-data, no pre-recovery bsi).
+//   3. Idempotency: call it again on the empty queue -> still 0, no spurious log.
+//   4. Re-populate + clear once more to confirm repeatability across recoveries.
+//
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_retx_clear_on_recovery()
+{
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-RETX-CLEAR] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->sack_v2_enabled = true;
+
+	bool pass = true;
+	const int OLD_BSI = 99;   // a pre-recovery batch_seq_id outside the new window
+	const int K       = 6;    // stale frames captured before recovery
+
+	// Helper lambda: populate the retx queue with K stale OLD-bsi frames.
+	auto populate_stale = [&](int k, int old_bsi) {
+		this->retransmit_count = k;
+		for(int r = 0; r < k && r < MAX_RETRANSMIT_HEADROOM; r++)
+		{
+			this->retransmit_frame_batch_seq_ids[r] = old_bsi;
+			this->retransmit_frame_lengths[r]       = 16;
+			this->retransmit_frame_positions[r]     = r;
+			this->retransmit_frame_types[r]         = DATA_LONG;
+			this->retransmit_frame_seq_with_eob[r]  = (unsigned char)r;
+			this->retransmit_frames[r][0]           = (unsigned char)old_bsi; // stale bsi byte
+		}
+	};
+
+	// --- Step 1: populate stale + clear via the REAL helper -----------------
+	populate_stale(K, OLD_BSI);
+	int before = this->retransmit_count;
+	clear_retx_queue();
+	int after = this->retransmit_count;
+	if(before != K || after != 0)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: clear did not empty the queue "
+		       "(before=%d after=%d, expected before=%d after=0)\n",
+			before, after, K);
+		pass = false;
+	}
+	// After clear, NO stale OLD-bsi frame is reachable: the v2 mixbatch builder
+	// reads only [0, retransmit_count) == empty, so it builds pure new-data.
+	bool any_stale_reachable = false;
+	for(int r = 0; r < this->retransmit_count; r++)
+		if(this->retransmit_frame_batch_seq_ids[r] == OLD_BSI) any_stale_reachable = true;
+	if(any_stale_reachable)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: a pre-recovery bsi=%d frame is still "
+		       "reachable after clear\n", OLD_BSI);
+		pass = false;
+	}
+
+	// --- Step 2: idempotency on the empty queue -----------------------------
+	clear_retx_queue();
+	if(this->retransmit_count != 0)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: second clear left count=%d (expected 0)\n",
+			this->retransmit_count);
+		pass = false;
+	}
+
+	// --- Step 3: repeatability across a second recovery ---------------------
+	populate_stale(K, OLD_BSI);
+	clear_retx_queue();
+	if(this->retransmit_count != 0)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: re-populate+clear left count=%d (expected 0)\n",
+			this->retransmit_count);
+		pass = false;
+	}
+
+	printf("[TEST-RETX-CLEAR] %s: K=%d old_bsi=%d before=%d after=%d "
+	       "stale_reachable=%d (every recovery site calls clear_retx_queue())\n",
+		pass ? "PASS" : "FAIL", K, OLD_BSI, before, after,
+		any_stale_reachable ? 1 : 0);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}

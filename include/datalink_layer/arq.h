@@ -323,6 +323,20 @@ public:
   // leg). `new_batch` is the post-clamp value about to be stored. See
   // data-flow-arq-recovery-cluster.md §4.3 / §5.2.
   void rescan_prev_on_batch_shrink(int new_batch);
+  // R029 (race audit 2026-06-06) — the SINGLE owner of zeroing the TX retransmit
+  // queue. The retransmit_frames[] / retransmit_count parallel arrays hold frames
+  // captured (and, under encryption, byte-encoded) for the LIVE crypto epoch +
+  // current bsi window. Every messages_tx[]-freeing recovery site (watchdog,
+  // gearshift-down, BREAK, config-change re-encode, reset_session_state,
+  // restore_tx_from_compressed) re-queues PLAINTEXT to fifo_buffer_tx so it
+  // re-sends under the NEW epoch — but historically NONE of them cleared
+  // retransmit_count, leaving stale OLD-epoch/foreign-bsi frames that the v2
+  // mixbatch builder (which has no epoch guard) would prepend to the first
+  // post-recovery batch. clear_retx_queue() restores INV-R029. Mirrors the
+  // runaway-BREAK clear (arq_commander.cc:1502). If R030 later adds a separate
+  // retx-prefix structure it MUST be zeroed here too (single-owner contract).
+  // See data-flow-arq-recovery-cluster.md §2.2 / §4.1 / §5.1.
+  void clear_retx_queue();
   void set_control_batch_size(int control_batch_size);
   void set_role(int role);
   void calculate_receiving_timeout();
@@ -1340,6 +1354,14 @@ public:
   // orphaned slot fires a single streaming_reset (streaming stays active).
   // Returns 0=PASS, 1=FAIL.
   int test_batch_shrink_strands_prev();
+
+  // R029 (race audit 2026-06-06) — stale-retx-queue-cleared-on-recovery test.
+  // CLI: --test-retx-clear-on-recovery. Populates retransmit_count>0 with a known
+  // OLD bsi, calls the REAL clear_retx_queue() (the single owner every recovery
+  // site now invokes), and asserts the queue empties (no pre-recovery bsi
+  // reachable), is idempotent on empty, and repeatable across recoveries.
+  // Returns 0=PASS, 1=FAIL.
+  int test_retx_clear_on_recovery();
 
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //

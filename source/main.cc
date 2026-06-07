@@ -455,6 +455,9 @@ int main(int argc, char *argv[])
     bool test_batch_shrink_strands_prev_cli = false; // --test-batch-shrink-strands-prev: R035 — data_batch_size
                                         // shrink strands the active prev. Drives the REAL set_data_batch_size chokepoint;
                                         // asserts prev counters re-derived (gate reachable) + streaming defense on orphan. One-shot, exits rc.
+    bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
+                                        // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
+                                        // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -954,6 +957,15 @@ int main(int argc, char *argv[])
             // one-shot at startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.3 / §5.2.
             test_batch_shrink_strands_prev_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-retx-clear-on-recovery") == 0)
+        {
+            // R029 — stale retx queue cleared on recovery regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.1 / §5.1.
+            test_retx_clear_on_recovery_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2050,6 +2062,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_batch_shrink_strands_prev();
             printf("[FLAG] Batch-shrink-strands-prev test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_retx_clear_on_recovery_cli) {
+            // R029 — stale retx queue cleared on recovery (one-shot, then exit rc).
+            printf("[FLAG] --test-retx-clear-on-recovery: invoking R029 "
+                   "retx-clear-on-recovery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_retx_clear_on_recovery();
+            printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
