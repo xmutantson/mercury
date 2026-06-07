@@ -6918,14 +6918,96 @@ int cl_telecom_system::bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out
 	for(int c=0;c<cont_cols;c++)
 		for(int n=0;n<Ngrid;n++)
 			(ofdm.ofdm_frame+n*Nc+cont[c])->type = PILOT;
+	// APPROACH B — DENSE BAND-EDGE PILOTS (band-limit deployment fix) — INVESTIGATED, DOES NOT
+	// REACH 8/8 FIR-ON. KEPT OFF BY DEFAULT (edge_depth=0). DO NOT enable in production.
+	//
+	// HYPOTHESIS (the deployment band-limit problem): the deployment TX KEEPS the band-limiting
+	// FIR (MERCURY_BIGBLOCK_FIR=1); pre_equalization boosts the band edges (~+4.78x at j=0/Nc-1
+	// falling to ~1.6 mid-band, measured [PRE-EQ-COL]) and FIR_tx1/FIR_tx2 then cancel that boost
+	// to a stock-CFG16 wire level so the signal stays inside the spectral mask. With the FIR ON
+	// the big-block RX loses exactly ~1 codeword of 32-QAM margin (--test-bigblock-multicw drops
+	// 8/8 -> 7/8 and the partial-block ARQ path then never delivers; MEASURED 2026-06-07). The
+	// hypothesis under test here was that denser CONTINUOUS pilot columns just inside each band
+	// edge would let the estimator track the steep pre-eq*FIR edge ramp and recover that codeword.
+	//
+	// RESULT — NEGATIVE (CLAUDE.md §2: stop, do not shotgun a 3rd pilot variant):
+	//  (1) The grid is at a frozen ~12% density (cont_cols=2 + dx=3/dy=4 scatter, §7 Watterson
+	//      freeze) sized so EXACTLY K=8 LDPC codewords fit (np=360, nData=2640, nBits=13200 >=
+	//      8*1600). A NAIVE add of even ONE continuous column per edge raises np 360->470 ->
+	//      nData 2530 -> only Kfit=7 codewords fit -> the K=8 byte gate is structurally
+	//      unsatisfiable (MEASURED via [BB-GRID] GRIDDUMP).
+	//  (2) The K-PRESERVING variant below (add edge columns, DECIMATE flat-interior scatter to
+	//      hold np within the K=8 capacity) keeps K=8 ONLY at edge_depth=1 (np~365-380); but
+	//      thinning the interior scatter degrades the sparse-2D interior channel estimate enough
+	//      that a codeword FAILS even FIR-OFF -> the in-proc gate DEADLOCKS at the partial-block
+	//      wait (MEASURED: FIR-off edge_depth=1 hangs where edge_depth=0 passes 8/8). The dx=3
+	//      grid is already at minimum viable density — there is no interior slack to redistribute.
+	//  (3) ROOT-CAUSE MISMATCH: the FIR-on failing codeword is cw2 (a MIDDLE codeword); codewords
+	//      are laid into the grid in raster (symbol-major) order, so EVERY codeword spans the full
+	//      band edge-to-center (telecom_system.cc:6697 clr[c*N+i]). The FIR loss is therefore a
+	//      ~uniform per-subcarrier SNR/level reduction (it removed the +2.3 dB hot level that
+	//      provided margin), NOT an edge-localized channel-estimation BIAS. Denser EDGE pilots
+	//      cannot buy back a GLOBAL margin deficit. (A prior estimation-improvement attempt
+	//      "force sparse-2D" already failed on this same blocker, §18.3.)
+	// CONCLUSION: spectral compliance via the FIR needs RX MARGIN (e.g. one LDPC rung lower / a
+	// coherent preamble-LS edge estimate / accepting K=7), NOT a denser pilot grid. The FIR stays
+	// OPT-IN; the byte gate stays green only at the +2.3-dB-hot pre-eq-only level (the residual the
+	// band-limit fix could not safely close). See bigblock_p3_hw/results_bb_bandlimit.json.
+	//
+	// edge_depth>0 is retained ENV-GATED (default 0) purely so the negative result is reproducible
+	// (MERCURY_BIGBLOCK_EDGE_DEPTH / _DENSE_BAND / _INTERIOR_DECIM + _GRIDDUMP). At the default
+	// edge_depth=0 the loop below is a no-op and the grid is BYTE-IDENTICAL to the validated layout.
+	int edge_depth = env_i("MERCURY_BIGBLOCK_EDGE_DEPTH", 0);
+	if(edge_depth < 0) edge_depth = 0;
+	if(edge_depth > Nc/2 - 1) edge_depth = Nc/2 - 1;
+	{
+		for(int d=1; d<=edge_depth; d++)
+		{
+			int jlo = d;            // just inside the low-frequency edge column (0)
+			int jhi = Nc-1-d;       // just inside the high-frequency edge column (Nc-1)
+			if(jlo < Nc)                for(int n=0;n<Ngrid;n++) (ofdm.ofdm_frame+n*Nc+jlo)->type = PILOT;
+			if(jhi >= 0 && jhi != jlo)  for(int n=0;n<Ngrid;n++) (ofdm.ofdm_frame+n*Nc+jhi)->type = PILOT;
+		}
+	}
+	// K-PRESERVING REDISTRIBUTION (band-limit fix, not a net pilot ADD). The continuous
+	// edge columns above each cost Ngrid data cells; naively keeping the full-band scatter
+	// then pushes np past the K=8 capacity (np 360->470 -> nData 2640->2530 -> only 7 LDPC
+	// codewords fit, so the K=8 byte gate becomes unsatisfiable — MEASURED, GRIDDUMP). The
+	// channel the scatter grid samples is FLAT across the band INTERIOR (pre-eq ~1.6x mid vs
+	// ~4.78x edge, FIR flat in-band), so the dx=3 scatter OVER-samples the center once the
+	// edges carry their own per-symbol continuous pilots. Reclaim the cells by THINNING the
+	// scatter in the flat interior: keep the full dx=3 scatter only in the outer `dense_band`
+	// columns adjacent to the edge ramp (where frequency curvature is highest), and DECIMATE
+	// the interior scatter by `interior_decim` (drop every Nth interior scatter pilot back to
+	// DATA). This MOVES pilot density from the over-sampled flat center to the steep edges
+	// while holding total np within the K=8 capacity — the textbook remedy for a known steep
+	// band-edge response. edge_depth=0 + interior_decim=1 reproduces the exact prior layout,
+	// so the default-OFF (FIR-off) byte gate stays byte-identical.
+	int dense_band     = env_i("MERCURY_BIGBLOCK_DENSE_BAND", 6);      // outer cols kept dense per side
+	int interior_decim = env_i("MERCURY_BIGBLOCK_INTERIOR_DECIM", (edge_depth>0)?2:1);
+	if(dense_band < 0) dense_band = 0;
+	if(interior_decim < 1) interior_decim = 1;
 	if(scat_dx > 0 && scat_dy > 0)
 	{
+		int ilo = dense_band;            // interior (decimated) region: [ilo, ihi]
+		int ihi = Nc - 1 - dense_band;
 		for(int n=0;n<Ngrid;n++)
 		{
 			if(n % scat_dy != 0) continue;
 			int off = (n/scat_dy) * (scat_dx/2 > 0 ? scat_dx/2 : 1);
+			int kept = 0;
 			for(int j = off % scat_dx; j < Nc; j += scat_dx)
+			{
+				bool interior = (j >= ilo && j <= ihi);
+				if(interior)
+				{
+					// decimate the flat-interior scatter: keep 1 of every `interior_decim`.
+					bool keep = (kept % interior_decim == 0);
+					kept++;
+					if(!keep) continue;       // leave this interior cell as DATA (reclaimed)
+				}
 				(ofdm.ofdm_frame+n*Nc+j)->type = PILOT;
+			}
 		}
 	}
 	int np=0;
@@ -6950,6 +7032,15 @@ int cl_telecom_system::bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out
 	Ngrid_out  = Ngrid;
 	log2M_out  = (int)round(log2((double)M));
 	nBits_out  = ofdm.pilot_configurator.nData * log2M_out;
+	if(const char* e=std::getenv("MERCURY_BIGBLOCK_GRIDDUMP")){ if(*e&&atoi(e)){
+		int kfit = (ldpc.N>0)? nBits_out/ldpc.N : 0;
+		printf("[BB-GRID] edge_depth=%d dense_band=%d interior_decim=%d Ngrid=%d Nc=%d cells=%d "
+		       "np=%d nData=%d nBits=%d ldpcN=%d Kfit=%d pilot_pct=%.1f\n",
+		       edge_depth, dense_band, interior_decim, Ngrid, Nc, Ngrid*Nc, np,
+		       ofdm.pilot_configurator.nData, nBits_out, ldpc.N, kfit,
+		       100.0*(double)np/(double)(Ngrid*Nc));
+		fflush(stdout);
+	}}
 	(void)Ngi;
 	return ofdm.pilot_configurator.nData;
 }
