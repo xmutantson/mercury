@@ -540,8 +540,34 @@ calls.
 Grep confirmation:
 - `mfsk_sync_metric` consumers: only the local store + the RX-DECODE
   log printf. No Q-table, gearshift, or ARQ state-machine reads.
-- `receive_stats.coarse_metric` consumers: arq_common.cc:5798-5811
-  (log only). Not read elsewhere as a flow-control gate.
+- ~~`receive_stats.coarse_metric` consumers: arq_common.cc:5798-5811
+  (log only). Not read elsewhere as a flow-control gate.~~
+  **CORRECTION (factdoc-refresh, 2026-06-07 — stale, flagged by race audit
+  R057/R079):** FALSE. `receive_stats.coarse_metric` IS read as a flow-control
+  gate in multiple ARQ and PHY sites, not "log only". The grep above missed the
+  full-word `coarse_metric` reads in the RESPONDER recovery/BREAK block of
+  `arq_common.cc` and in `telecom_system.cc`. Live flow-control consumers:
+  - `arq_common.cc:6575` — `coarse_metric < 0.30` GATES the BREAK-pattern probe
+    (RESPONDER only, `link_status==CONNECTED`). This is a true branch: it decides
+    whether `detect_break_pattern_from_passband()` is even called.
+  - `arq_common.cc:6696` — `&& coarse_metric >= 0.5` is a term in a
+    recovery-acceptance predicate.
+  - `arq_common.cc:6737` — `if(coarse_metric >= 0.5)` branch.
+  - `arq_common.cc:6778` — `if(coarse_metric < 0.5)` branch.
+  - `arq_common.cc:6806-6807` — `coarse_metric >= 0.15 && coarse_metric < 0.5`
+    band gate (mid-confidence recovery handling).
+  - `telecom_system.cc:1714` — `if(energy_ok && coarse_metric < 0.10)` decode-path
+    branch.
+  - `telecom_system.cc:2574` — `if(coarse_metric >= 0.97 && mean_H < 0.5)` branch.
+  - `telecom_system.cc:2822` — `coarse_metric >= 0.97` term in a decode-decision.
+  The original "(log only)" characterization referred to the `[RX-DECODE#N] FAIL`
+  printf (arq_common.cc:5798-5811), which IS log-only — but that printf is NOT the
+  only consumer, so the magnitude-change-safety conclusion of §10.2 must be
+  re-evaluated against the gates above (a 0..1 → 0..16 metric rescale would
+  break the `< 0.30`, `< 0.5`, `>= 0.5`, `< 0.10`, `>= 0.97` thresholds).
+  Note: the BER harness forces `coarse_metric = 10.0` (telecom_system.cc:1184),
+  which is ≥ all these thresholds, so the gates do NOT fire in sim — only on the
+  live path. This is why the magnitude-change risk was not caught in sim.
 
 ### §10.3 Invariants (post-port)
 
