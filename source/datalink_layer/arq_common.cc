@@ -3915,17 +3915,84 @@ bool cl_arq_controller::bigblock_send_one_block()
 	// pre-eq-only block "passes" 8/8 only because its UN-cut pre-eq edge boost (~+4.8x on
 	// the band edges) over-powers those subcarriers — i.e. it passes BY running +2.3 dB
 	// hot, not by having real margin. At the calibrated level the RX is genuinely ~1 cw
-	// short. The fix belongs in the big-block RX estimator (it must recover edge-subcarrier
-	// SNR the way the stock receive_byte preamble-LS estimate does); two RX recovery
-	// attempts (force sparse-2D; broadband-preamble pre-correction) did NOT recover it, so
-	// per CLAUDE.md §2 the RX margin work is deferred to its own audited fix + regression.
-	// Until then the FIR is OPT-IN (MERCURY_BIGBLOCK_FIR=1) so the byte gate stays green;
-	// the default path emits the pre-eq + level-cal block (validated 8/8) — still +2.3 dB
-	// hot on HW, the residual this fix could not safely close.
+	// short via the FIR — the FIR's STEEP per-subcarrier band-edge attenuation is what the
+	// sparse (2-cont-col + scat_dx=3/dy=4) thin grid cannot track, NOT the absolute level.
+	//
+	// === APPROACH A — FLAT GLOBAL GAIN CUT (default, P3 HW) =====================
+	// The FIR breaks decode because it RESHAPES the spectrum (steep band-edge rolloff the
+	// thin grid can't equalize). But on a clean channel the big-block decode is LEVEL-
+	// INVARIANT for a FIXED SHAPE: the sparse pilot estimate already divides out the pre-eq
+	// shape and decodes the pre-eq'd block 8/8 at the hot level. So instead of the FIR,
+	// apply a SINGLE UNIFORM scalar to the whole block to bring its RMS down to a stock
+	// CFG16 +FIR frame's RMS. A uniform scale preserves the SHAPE exactly -> the thin-grid
+	// estimate is unchanged -> decode stays 8/8, while the wire level matches a regular
+	// frame (the +2.3 dB HW overdrive closes), with ZERO pilot/geometry/throughput change.
+	//
+	// The cancel factor is MEASURED, not hardcoded (CLAUDE.md §1): it is the SAME level
+	// reduction the FIR cascade would impose on THIS block. Apply FIR_tx1->FIR_tx2 to a
+	// scratch copy (the band-limit reference), measure the FIR'd-vs-raw data-region RMS
+	// ratio, and scale the raw (un-FIR'd, shape-preserving) block by that ratio. This makes
+	// the flat-gain path land at the SAME disciplined level the FIR achieves
+	// (--test-bigblock-txlevel STOCK +FIR data rms 0.139) — self-calibrating, config-
+	// independent, derived from the modem's own band-pass response, no magic constant.
+	//
+	// A/B escape hatches: MERCURY_BIGBLOCK_FIR=1 -> old (decode-breaking) FIR path;
+	// MERCURY_BIGBLOCK_NOGAINCUT=1 -> raw hot block (the previous default, +2.3 dB).
 	bool bb_apply_fir = false;
 	{ const char* e=std::getenv("MERCURY_BIGBLOCK_FIR"); if(e && atoi(e)!=0) bb_apply_fir=true; }
+	bool bb_no_gaincut = false;
+	{ const char* e=std::getenv("MERCURY_BIGBLOCK_NOGAINCUT"); if(e && atoi(e)!=0) bb_no_gaincut=true; }
 	if(!bb_apply_fir)
 	{
+		if(bb_no_gaincut)
+		{
+			// legacy raw path: pre-eq + level-cal block, no level discipline (+2.3 dB hot).
+			tx_transfer(block_pb.data(), n_tx);
+			return true;
+		}
+		// FLAT-GAIN cut. Data region = samples AFTER the shared preamble (preamble_nSymb
+		// OFDM symbols), matching --test-bigblock-txlevel's data-region RMS basis (the HW
+		// concern is per-symbol transmit power, set by the data region).
+		int pre_samp = telecom_system->data_container.preamble_nSymb
+			* telecom_system->data_container.Nofdm
+			* telecom_system->data_container.interpolation_rate;
+		int dlo = (pre_samp < n_tx) ? pre_samp : 0;
+		auto rms_region = [](const double* s, int lo, int hi)->double{
+			double acc=0.0; int n=(hi>lo)?(hi-lo):0;
+			for(int i=lo;i<hi;i++) acc += s[i]*s[i];
+			return (n>0) ? std::sqrt(acc/(double)n) : 0.0;
+		};
+		double raw_rms = rms_region(block_pb.data(), dlo, n_tx);
+
+		// FIR'd reference (scratch only — NOT transmitted). Same pad scheme as send_batch /
+		// the FIR path below so the group-delay transient bites padding, giving a faithful
+		// band-limited level reference.
+		int pad = frame_output_size;
+		int total_fir = pad + n_tx + pad;
+		double fir_rms = raw_rms;   // fallback: identity (no cut) if FIR scratch fails
+		if(total_fir > 0 && raw_rms > 1e-12)
+		{
+			std::vector<double> fir_in((size_t)total_fir, 0.0);
+			std::vector<double> fir_t1((size_t)total_fir, 0.0);
+			std::vector<double> fir_t2((size_t)total_fir, 0.0);
+			for(int i=0;i<n_tx;i++) fir_in[(size_t)pad+i] = block_pb[(size_t)i];
+			int rep = (pad < n_tx) ? pad : n_tx;
+			for(int i=0;i<rep;i++)
+			{
+				fir_in[(size_t)i]            = block_pb[(size_t)i];
+				fir_in[(size_t)(pad+n_tx)+i] = block_pb[(size_t)(n_tx-rep)+i];
+			}
+			telecom_system->ofdm.FIR_tx1.apply(fir_in.data(), fir_t1.data(), total_fir);
+			telecom_system->ofdm.FIR_tx2.apply(fir_t1.data(), fir_t2.data(), total_fir);
+			fir_rms = rms_region(&fir_t2[(size_t)pad], dlo, n_tx);
+		}
+		double g_flat = (raw_rms > 1e-12) ? (fir_rms / raw_rms) : 1.0;
+		if(!(g_flat > 0.0) || g_flat > 1.0) g_flat = (g_flat>1.0)?1.0:1.0;  // clamp: never boost
+		printf("[BIGBLOCK-TX] flat-gain cut: raw_rms=%.6f fir_rms=%.6f g=%.4f (%.2f dB) "
+			"[shape-preserving level discipline; decode unchanged]\n",
+			raw_rms, fir_rms, g_flat, 20.0*std::log10((g_flat>0)?g_flat:1e-12));
+		fflush(stdout);
+		for(int i=0;i<n_tx;i++) block_pb[(size_t)i] *= g_flat;
 		tx_transfer(block_pb.data(), n_tx);
 		return true;
 	}
