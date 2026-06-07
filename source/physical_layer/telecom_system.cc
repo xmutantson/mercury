@@ -5851,42 +5851,170 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 			}
 	}
 
+	// (1b) PER-SYMBOL COMMON-PHASE (CPE) de-rotation from the CONTINUAL columns
+	//      (802.11 continual-pilot CPE; FreeDV-700D pilot-assisted-coherent). The
+	//      CONTINUAL carriers carry a pilot at EVERY symbol, so they DIRECTLY observe
+	//      the per-symbol common rotation the channel applies (residual CFO/SFO drift
+	//      + slow time-variation), the dominant un-tracked term: on the HW-faithful
+	//      vector the per-symbol common phase walks NON-LINEARLY by ~2.16 rad over the
+	//      block (measured [AFC-PILTHETA] resid_after_ramp), which the AFC tracker's
+	//      linear-ramp model and the sparse scattered TIME-interp (pilots every ~Dy
+	//      symbols) cannot follow. By measuring cpe[n] from the dense continual columns
+	//      and de-rotating the WHOLE pilot grid by it BEFORE interpolation, the
+	//      time/freq interpolation only has to track the SLOWLY-varying per-carrier
+	//      residual (which sparse pilots CAN follow); cpe[n] is then re-applied to the
+	//      final per-cell H so the published estimate carries the true per-symbol phase
+	//      the equalizer divides out. cpe[n] is referenced to EACH continual carrier's
+	//      OWN time-mean phase, so a static per-carrier channel phase is NOT folded into
+	//      the common term (only the time-VARYING common rotation is captured). On a
+	//      time-invariant channel (per-frame regime) cpe[n]≈0 ⇒ no-op (per-frame path
+	//      does not call this estimator anyway; see SS5 audit §16). MERCURY_SFO_GRID_CPE
+	//      default ON; needs ≥1 continual column (a carrier pilot-known at every symbol).
+	std::vector<double> cpe(NG, 0.0);
+	bool cpe_on = (env_i("MERCURY_SFO_GRID_CPE", 1) != 0);
+	if(cpe_on)
+	{
+		// continual carriers = those with a pilot at EVERY symbol
+		std::vector<int> ccols;
+		for(int j=0;j<NC;j++){ bool all=true;
+			for(int n=0;n<NG;n++) if(!known[(size_t)n*NC+j]){ all=false; break; }
+			if(all) ccols.push_back(j); }
+		if(!ccols.empty())
+		{
+			// per continual carrier, its time-mean H (the static reference phase)
+			std::vector<std::complex<double>> cref(ccols.size(), std::complex<double>(0,0));
+			for(size_t c=0;c<ccols.size();c++){ std::complex<double> a(0,0);
+				for(int n=0;n<NG;n++) a += H[(size_t)n*NC+ccols[c]];
+				cref[c] = a/(double)NG; }
+			// per symbol, common rotation = arg(Σ_c H[n,col_c]·conj(cref_c)) (the phasor
+			// rotating each continual carrier off its own time-mean, magnitude-weighted).
+			for(int n=0;n<NG;n++){
+				std::complex<double> acc(0,0);
+				for(size_t c=0;c<ccols.size();c++)
+					acc += H[(size_t)n*NC+ccols[c]] * std::conj(cref[c]);
+				cpe[n] = (std::abs(acc)>1e-18) ? std::arg(acc) : 0.0;
+			}
+			// de-rotate the whole RAW pilot grid by cpe[n] (interp now tracks only the
+			// slow per-carrier residual; cpe re-applied after step (3)).
+			for(int n=0;n<NG;n++){
+				std::complex<double> r = std::polar(1.0, -cpe[n]);
+				for(int j=0;j<NC;j++) if(known[(size_t)n*NC+j]) H[(size_t)n*NC+j] *= r;
+			}
+		}
+	}
+
 	// (2) TIME interpolation per carrier (symbol axis), then optional Wiener smooth.
+	//
+	// CRITICAL (fix/bigblock-chanest §17): interpolate AND smooth the TIME axis in
+	// POLAR form (magnitude + UNWRAPPED phase), mirroring step (3)'s frequency-axis
+	// polar interp. The block-fold defect was here: a slowly time-varying channel
+	// (det-floor dispersion + residual CFO/SFO walk) rotates each carrier's pilot
+	// phase across the 60-symbol block (measured genie col_phaseRMS = 0.83 rad on the
+	// HW-faithful vector). Complex-LINEAR time interpolation cuts a CHORD across that
+	// rotation (shrinking |H| and losing the ramp), and the complex moving-average
+	// Wiener smooth (±wlen) destructively AVERAGES the walking phasor — exactly the
+	// fold that drove mean|H| -> 0 and bytes_ok=0. Polar interp/smooth tracks the
+	// per-symbol phase ramp instead of folding it, so the per-cell H the equalizer
+	// divides by (out=in/H) captures each cell's TRUE per-symbol phase (the invariant
+	// channel_equalizer already assumes — SS5 audit §16). When the per-symbol step is
+	// small (the per-frame WB/NB regime: a re-acquired ~12-sym frame has negligible
+	// phase walk) polar == complex-linear to first order, so the shared per-frame path
+	// is preserved (A/B verified). Std two-1D scattered-pilot polar interpolation
+	// (Hoeher/Kaiser/Robertson 1997); per-symbol pilot phase tracking is the
+	// FreeDV-700D / 802.11 continual-pilot recipe.
+	bool time_polar = (env_i("MERCURY_SFO_GRID_TIME_POLAR", 1) != 0);   // default polar time axis ON
 	for(int j=0;j<NC;j++)
 	{
 		// collect this carrier's time-pilot symbol indices
 		std::vector<int> ts;
 		for(int n=0;n<NG;n++) if(known[(size_t)n*NC+j]) ts.push_back(n);
 		if(ts.empty()) continue;                      // no time samples — handled by (3)
-		// linear interpolate between consecutive time-pilots
+		// interpolate between consecutive time-pilots (polar: track the phase ramp)
 		for(size_t s=0;s+1<ts.size();s++)
 		{
 			int n0=ts[s], n1=ts[s+1];
 			std::complex<double> H0=H[(size_t)n0*NC+j], H1=H[(size_t)n1*NC+j];
-			for(int n=n0+1;n<n1;n++)
+			if(time_polar)
 			{
-				double t = (double)(n-n0)/(double)(n1-n0);
-				H[(size_t)n*NC+j] = H0*(1.0-t) + H1*t;
-				known[(size_t)n*NC+j] = 1;
+				double m0=std::abs(H0), m1=std::abs(H1);
+				double p0=std::arg(H0), p1=std::arg(H1);
+				double dp=p1-p0;                         // shortest-rotation unwrap
+				while(dp> M_PI) dp-=2.0*M_PI;
+				while(dp<-M_PI) dp+=2.0*M_PI;
+				for(int n=n0+1;n<n1;n++)
+				{
+					double t = (double)(n-n0)/(double)(n1-n0);
+					double m = m0*(1.0-t)+m1*t;
+					double p = p0+dp*t;
+					H[(size_t)n*NC+j] = std::polar(m,p);
+					known[(size_t)n*NC+j] = 1;
+				}
+			}
+			else
+			{
+				for(int n=n0+1;n<n1;n++)
+				{
+					double t = (double)(n-n0)/(double)(n1-n0);
+					H[(size_t)n*NC+j] = H0*(1.0-t) + H1*t;
+					known[(size_t)n*NC+j] = 1;
+				}
 			}
 		}
 		// edge hold (extrapolate flat past the first/last time-pilot)
 		for(int n=0;n<ts.front();n++){ H[(size_t)n*NC+j]=H[(size_t)ts.front()*NC+j]; known[(size_t)n*NC+j]=1; }
 		for(int n=ts.back()+1;n<NG;n++){ H[(size_t)n*NC+j]=H[(size_t)ts.back()*NC+j]; known[(size_t)n*NC+j]=1; }
 		// Wiener/MMSE time-smoother: short centered moving average over the now-dense
-		// column (suppresses pilot noise; on a time-invariant channel it is a near-
-		// optimal MMSE smoother since the true H is constant in n). Smooth ONLY columns
-		// that had ≥2 time-pilots (a single-pilot scattered carrier has nothing to
-		// average and would just blur the freq-interp seed).
-		if(wiener && ts.size()>=2 && wlen>0)
+		// column (suppresses pilot noise). Smooth ONLY columns that had ≥2 time-pilots
+		// (a single-pilot scattered carrier has nothing to average and would just blur
+		// the freq-interp seed). POLAR smooth (magnitude + UNWRAPPED phase separately):
+		// a complex moving-average of a per-symbol phase RAMP shrinks the magnitude and
+		// flattens the ramp (the §3.3/§9 "averaging a ramp is harmful" fold); smoothing
+		// the unwrapped phase preserves the ramp's slope while still suppressing pilot
+		// noise. On a time-INVARIANT channel (per-frame regime) the unwrapped phase is
+		// flat, so the polar smooth == the complex smooth (per-frame preserved).
+		//
+		// CONTINUAL columns (a pilot at EVERY symbol, ts.size()==NG) DIRECTLY observe the
+		// per-symbol channel phase — do NOT time-smooth them (§17 step 3): an 11-tap
+		// moving average over a 0.83-rad/60-sym ramp blurs the per-symbol CPE the decode
+		// needs. Smoothing is for noise suppression on the INTERPOLATED scattered columns
+		// (sparse time-pilots), where the interpolated phase is already a straight line
+		// that benefits from de-noising without losing a per-symbol observation. Gate via
+		// MERCURY_SFO_GRID_SMOOTH_CONT (default 0 = skip smoothing continual columns).
+		bool is_continual = ((int)ts.size() == NG);   // pilot at every symbol → continual
+		bool smooth_cont  = (env_i("MERCURY_SFO_GRID_SMOOTH_CONT", 0) != 0);
+		bool do_smooth    = wiener && ts.size()>=2 && wlen>0 && (!is_continual || smooth_cont);
+		if(do_smooth)
 		{
 			std::vector<std::complex<double>> col(NG);
 			for(int n=0;n<NG;n++) col[n]=H[(size_t)n*NC+j];
-			for(int n=0;n<NG;n++)
+			if(time_polar)
 			{
-				std::complex<double> acc(0,0); int cnt=0;
-				for(int w=n-wlen; w<=n+wlen; w++) if(w>=0&&w<NG){ acc+=col[w]; cnt++; }
-				if(cnt>0) H[(size_t)n*NC+j]=acc/(double)cnt;
+				// build a CONTIGUOUS unwrapped-phase track over the dense column
+				std::vector<double> mag(NG), ph(NG);
+				double acc_ph = std::arg(col[0]); mag[0]=std::abs(col[0]); ph[0]=acc_ph;
+				double prev = std::arg(col[0]);
+				for(int n=1;n<NG;n++){
+					double a=std::arg(col[n]); double d=a-prev;
+					while(d> M_PI) d-=2.0*M_PI;
+					while(d<-M_PI) d+=2.0*M_PI;
+					acc_ph += d; prev = a;
+					mag[n]=std::abs(col[n]); ph[n]=acc_ph;
+				}
+				for(int n=0;n<NG;n++)
+				{
+					double ms=0.0, ps=0.0; int cnt=0;
+					for(int w=n-wlen; w<=n+wlen; w++) if(w>=0&&w<NG){ ms+=mag[w]; ps+=ph[w]; cnt++; }
+					if(cnt>0) H[(size_t)n*NC+j]=std::polar(ms/(double)cnt, ps/(double)cnt);
+				}
+			}
+			else
+			{
+				for(int n=0;n<NG;n++)
+				{
+					std::complex<double> acc(0,0); int cnt=0;
+					for(int w=n-wlen; w<=n+wlen; w++) if(w>=0&&w<NG){ acc+=col[w]; cnt++; }
+					if(cnt>0) H[(size_t)n*NC+j]=acc/(double)cnt;
+				}
 			}
 		}
 	}
@@ -5943,6 +6071,19 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 		}
 		for(int j=0;j<ks.front();j++) H[(size_t)n*NC+j]=H[(size_t)n*NC+ks.front()];
 		for(int j=ks.back()+1;j<NC;j++) H[(size_t)n*NC+j]=H[(size_t)n*NC+ks.back()];
+	}
+
+	// (3b) RE-APPLY the per-symbol CPE removed at (1b): the interpolation tracked the
+	//      slow per-carrier residual on the common-phase-stabilized grid; re-rotating by
+	//      +cpe[n] restores the TRUE per-symbol channel phase into every cell so the
+	//      equalizer's out=in/H divides out the actual per-symbol rotation.
+	if(cpe_on)
+	{
+		for(int n=0;n<NG;n++){
+			if(cpe[n]==0.0) continue;
+			std::complex<double> r = std::polar(1.0, +cpe[n]);
+			for(int j=0;j<NC;j++) H[(size_t)n*NC+j] *= r;
+		}
 	}
 
 	// (4) DDCE (optional): one decision-directed refinement pass. Equalize data cells
@@ -7278,7 +7419,15 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		long ms = data_start - margin_interp;
 		int  mi = margin_interp;
 		if(ms < 0){ ms = 0; mi = (int)data_start; }
-		int slice_size = mi + span_interp;
+		// BB-1 (PIPELINE_AUDIT BB-1, rx-baseband D1): add the TRAILING FIR warm-up margin
+		// too, mirroring the per-frame reference (pb_end = extraction_delay + frame_size +
+		// fir_margin, :2480). Without it the FIR epilogue zero-pads/truncates the tail
+		// (~half_taps decimated samples) of the FINAL OFDM data symbol -> last codeword
+		// residual. The trailing read is bounds-guarded (src<rxpb.size() zero-pads) so a
+		// short rxpb just pads zeros into the margin, never the data span. The grid
+		// extraction below still starts at mdec=mi/interp for Nofdm*Ngrid samples, so the
+		// right margin only feeds the FIR lookahead — it does NOT shift the symbol grid.
+		int slice_size = mi + span_interp + margin_interp;
 		std::vector<double> dat_pb(slice_size, 0.0);
 		for(int i=0;i<slice_size;i++){
 			long src=ms+i; dat_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
@@ -8040,10 +8189,13 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	}
 
 	// --- DEMOD: from the data start (head + preamble), rebuild the Ngrid grid. ---
-	// Mirror the production data extraction (telecom_system.cc:2434-2462): process a
-	// slice that includes a FIR_rx_data warm-up margin BEFORE the window start (so the
-	// FIR transient lands in the margin, not in the data), then skip the margin. The
-	// margin is a whole number of symbols so the demod symbol grid stays aligned.
+	// Mirror the production data extraction (telecom_system.cc:2434-2482): process a
+	// slice that includes a FIR_rx_data warm-up margin BOTH BEFORE and AFTER the window
+	// (so the FIR start transient lands in the LEFT margin and the FIR epilogue lands in
+	// the RIGHT margin, not in the data), then skip the left margin. The margin is a
+	// whole number of symbols so the demod symbol grid stays aligned. BB-1 fix: the
+	// trailing (right) margin was previously omitted, truncating the tail of the final
+	// OFDM symbol (see :2480 pb_end = extraction_delay + frame_size + fir_margin).
 	// sample_offset = the slice's absolute passband start so the downconvert oscillator
 	// phase is CONTINUOUS with the TX upconvert (which ran from passband sample 0).
 	long data_start0 = head_delay + (long)pre_nSymb*sym_samples;
@@ -8059,7 +8211,11 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 		long ms = data_start - margin_interp;
 		int  mi = margin_interp;
 		if(ms < 0){ ms = 0; mi = (int)data_start; }
-		int slice_size = mi + span_interp;
+		// BB-1 (PIPELINE_AUDIT BB-1): trailing FIR margin too (mirror per-frame :2480).
+		// Bounds-guarded read below zero-pads past rxpb end; grid extraction still starts
+		// at mdec=mi/interp for Nofdm*Ngrid samples, so the right margin only feeds the
+		// FIR lookahead and does NOT shift the symbol grid.
+		int slice_size = mi + span_interp + margin_interp;
 		std::vector<double> dat_pb(slice_size, 0.0);
 		for(int i=0;i<slice_size;i++){
 			long src=ms+i; dat_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
