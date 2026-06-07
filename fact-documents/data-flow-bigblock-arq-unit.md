@@ -1549,3 +1549,98 @@ SWITCH_ROLE site itself is UNREACHABLE in-process — the sim PINs the config (`
 turboshift OFF, SWITCH_ROLE count = 0 observed), so role reversal never fires. The SWITCH_ROLE wrap
 is a FAITHFUL application of the §17.4-proven mechanism to the audit-found sibling; its live
 role-reversal path is validated at P3/P4 HW. NO monitor merge, NO push, NO attribution.
+
+## §18. TX-LEVEL PARITY — the big-block transmits HOT on real HW; route it through the IDENTICAL conditioning chain a stock CFG16 OFDM DATA frame uses (2026-06-06, branch `fix/cfg16-controlack-hold`, worktree `C:/Users/kamer/mercury_wt/cfg16-hold`, on `464e1fa` + the uncommitted pre-eq/level-cal change)
+
+### §18.1 HW symptom + the loopback red herring
+
+User watching the REAL bench scope (2026-06-06): the big-block frames run **~1400-1450 mVp-p**
+(~+3.2 dB) over the 1000 mVp-p calibrated sweet spot, while ACKs and stock OFDM frames sit at
+calibration. Regular OFDM decodes fine on HW; the big-block does not. A prior loopback measurement
+(agent a3d777f5) reported the block ~6 dB QUIETER — that is NON-REPRESENTATIVE: `telecom_system.cc`
+comment at the OFDM TX scaling notes "OFDM TX_SIG gain folded into level cal; loopback uses raw
+level". Trust the HW scope: the big-block is HOT.
+
+### §18.2 The COMPLETE stock CFG16 OFDM-DATA TX chain (every stage to the DAC), and what the block bypassed
+
+A regular CFG16 DATA frame: `transmit_byte` (OFDM, `NO_FILTER_MESSAGE`) → `send_batch` packs the
+per-frame raw passband and band-limits the WHOLE batch → `tx_transfer`. Stages, in order:
+
+| # | stage | stock site | block (`bigblock_tx_passband`, telecom_system.cc:7030) |
+|---|---|---|---|
+| a | `pre_equalization_channel[j]` per-subcarrier (preamble + data) | transmit_byte:805,813 | YES :7072-7078 / :7093-7096 (uncommitted change) |
+| - | `symbol_mod` | :831,838 | YES |
+| b+d | level-cal norm `/power_normalization * sqrt(output_power_Watt)*[preamble_boost]*get_tx_gain(TX_SIG_OFDM)` | :859-866 (mfsk_boost=get_tx_gain(TX_SIG_OFDM) for OFDM, :850) | YES :7100-7110 (uncommitted change, `*ofdm_tx_gain`) |
+| - | `baseband_to_passband` | :880-881 | YES :7113-7116 |
+| - | `peak_clip` (preamble + data) | :883-884 | YES :7117-7118 |
+| **c** | **`FIR_tx1` → `FIR_tx2` band-limit** | **send_batch arq_common.cc:4591-4592** (edge-pad :4577-4585, extract per-frame :4715) | **WAS MISSING** — §18.3 fix adds it |
+
+`tx_transfer` (audioio.c:1658) does NO normalization — it writes doubles to the playback ring. There
+is no separate output-power/RMS/DAC stage after FIR. So stage (d) the task referenced IS the
+`sqrt(output_power_Watt)*get_tx_gain(TX_SIG_OFDM)` normalization, and it was ALREADY applied by the
+uncommitted change. **The ONLY remaining stock-chain stage the block bypassed is the FIR band-limit (c).**
+
+### §18.3 ROOT CAUSE of the overdrive — pre-eq and FIR are a MATCHED PAIR; the block applied pre-eq but not its canceling FIR
+
+`get_pre_equalization_channel()` (telecom_system.cc:9475) computes pre-eq by passing a known symbol
+through the EXACT cascade `baseband_to_passband → FIR_tx1 → FIR_tx2 → passband_to_baseband(FIR_rx) →
+symbol_demod` and setting `pre_eq[j] = modulated[j]/demodulated[j]` — i.e. **pre-eq is precisely the
+inverse of the per-subcarrier FIR response** (it BOOSTS the band edges, measured `[PRE-EQ] min_mag
+1.60 max_mag 4.78` at CFG16). In the stock path FIR then ATTENUATES those same edges back → net flat
+at the calibrated level. The block applied pre-eq (edge boost) but skipped the FIR (edge cut), so the
+edges stayed boosted → HOT.
+
+`--test-bigblock-txlevel` (in-process, device-free; same `transmit_byte` entry) quantifies it
+(bb-vs-stock+FIR, the production HW reference; STOCK+FIR data peak 0.492 rms 0.139):
+
+| block conditioning | RMS ratio (data) | peak ratio | byte gate |
+|---|---|---|---|
+| pre-eq + level-cal, **no FIR** (the +pre-eq baseline) | **1.31 (+2.33 dB)** HOT | 1.17 (+1.38 dB) | 8/8 PASS |
+| level-cal only (no pre-eq, no FIR) | 0.52 (−5.74 dB) QUIET | 0.46 | 8/8 (=464e1fa) |
+| **pre-eq + level-cal + FIR** (§18 fix, opt-in) | **0.96 (−0.35 dB)** / 1.04 whole | 1.07 (+0.62 dB) | **7/8 FAIL** |
+
+The +2.33 dB matches the HW scope (~+3.2 dB). Level parity REQUIRES the full pre-eq+FIR pair — no
+shortcut (no-pre-eq is −5.7 dB quiet; pre-eq-no-FIR is +2.3 dB hot). The residual +0.62 dB peak with
+FIR is a PAPR effect (one long ~79k-sample waveform's extreme peak > a 16k-sample frame's at equal
+power); RMS (the level metric) is ~1.0.
+
+### §18.4 The FIX (arq_common.cc `bigblock_send_one_block`, before `tx_transfer`) — OPT-IN, BLOCKED on RX margin
+
+Band-limit the block through the SAME `FIR_tx1→FIR_tx2` cascade, mirroring `send_batch` EXACTLY:
+edge-replicate a `frame_output_size` lead+trail pad (absorbs the ~96-tap cascade group-delay
+transient), filter, extract the `[pad, pad+n_tx)` real region, `tx_transfer` that. Architecturally
+faithful: the stock FIR lives at the batch-assembler layer (`send_batch`), NOT in `transmit_byte`,
+so the block's FIR belongs in `bigblock_send_one_block`, NOT in `bigblock_tx_passband`.
+
+**BLOCKER (CLAUDE.md §2):** the FIR costs ~0.5-1 dB of decode margin the big-block's BESPOKE RX
+(`bigblock_rx_passband`, sparse-pilot estimate + CSI-weighted LLR) cannot absorb on a 32-QAM CFG16
+block: exactly ONE MIDDLE codeword (`cw2`, CARVE-CRC `calc=0f wire=e8` → miscorrection, NOT an
+edge/window/timing artifact) fails on the PERFECT channel; 8/8→7/8; the partial-block path then SACKs
+the gap and never first-block-delivers (gate hang). Decisive comparison: the pre-eq-no-FIR block
+"passes" 8/8 only because its UN-cut pre-eq edge boost (~+4.8×) over-powers the edge subcarriers — it
+passes BY running +2.3 dB hot, not by real margin (its channel is MORE selective, std|H| 0.046 vs the
+FIR block's 0.031, yet it decodes — selectivity is NOT the discriminator; edge-subcarrier SNR is). At
+the calibrated level the stock `receive_byte` RX survives the same FIR (broadband preamble-LS estimate
+recovers edge SNR) but the big-block RX is ~1 cw short.
+
+**Two RX recovery attempts FAILED** (so per §2 the RX margin work is deferred to its own audited fix +
+regression, NOT shotgunned here): (1) force sparse-2D estimator (`MERCURY_BIGBLOCK_SPARSE2D=1`) → still
+7/8; (2) broadband-preamble per-subcarrier pre-correction (divide data by `H_pre[j]` measured off the
+block preamble, mirroring receive_byte) → made |H| MORE selective (the block preamble is not a flat
+broadband pilot — it carries its own per-subcarrier structure + preamble_boost, so dividing injected
+that structure), 7/8. Reverted.
+
+**Shipped state:** FIR is OPT-IN `MERCURY_BIGBLOCK_FIR=1` (default OFF). Default path = pre-eq +
+level-cal block (validated 8/8 multicw + fullpath) — still +2.3 dB hot, the residual this fix could
+not safely close. `--test-bigblock-txlevel` applies the FIR unconditionally so the achievable AFTER
+ratio (~1.0) is on the record (`MERCURY_BIGBLOCK_NOFIR=1` to measure the default wire).
+
+### §18.5 The real fix path (cost) — big-block RX edge-SNR recovery
+
+The block must transmit at the calibrated level (pre-eq+FIR) AND its RX must recover edge-subcarrier
+SNR the way stock `receive_byte` does. Candidate: a TRUE broadband channel estimate from the block
+preamble using the SAME known-preamble convention + LS window receive_byte uses (the naive Y/X
+pre-correction in §18.4 attempt 2 was wrong because it ignored the preamble's own modulation/boost
+profile). Needs a §5 cross-layer audit against the §7.4 grid freeze + §15-17 window invariants and a
+dedicated fail-before/pass-after regression at the calibrated level. Until then, big-block on HW must
+either run hot (decodes via the over-boost) or stay opt-in. NO monitor merge, NO push, NO attribution.

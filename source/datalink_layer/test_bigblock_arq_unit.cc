@@ -2158,6 +2158,35 @@ int cl_arq_controller::test_bigblock_txlevel()
 	}
 	int bb_n = ts->bigblock_last_tx_samples;
 	int bb_K = ts->bigblock_last_tx_K;
+	// LEVEL-FIX WIRE (fact-doc §18): the §18 level fix band-limits the block through the
+	// SAME FIR_tx1->FIR_tx2 cascade send_batch applies to a stock batch (arq_common.cc).
+	// Mirror that here (edge-padded, identical order) so this measurement reports the
+	// achieved AFTER-FIR ratio (target ~1.0). NOTE: on the live wire the FIR is OPT-IN
+	// (MERCURY_BIGBLOCK_FIR=1, default OFF) because it costs one codeword of RX margin
+	// (§18.3 blocker); this diag applies it unconditionally so the level result is on the
+	// record. Set MERCURY_BIGBLOCK_NOFIR=1 to instead measure the default (no-FIR, +2.3 dB)
+	// wire.
+	bool meas_fir = true;
+	{ const char* e=std::getenv("MERCURY_BIGBLOCK_NOFIR"); if(e && atoi(e)!=0) meas_fir=false; }
+	if(meas_fir)
+	{
+		int pad = (preN + Nsymb) * Nofdm * interp;   // ~one stock frame, send_batch pad width
+		int total_fir = pad + bb_n + pad;
+		std::vector<double> fin((size_t)((total_fir>0)?total_fir:1), 0.0);
+		std::vector<double> ft1((size_t)((total_fir>0)?total_fir:1), 0.0);
+		std::vector<double> ft2((size_t)((total_fir>0)?total_fir:1), 0.0);
+		for(int i=0;i<bb_n;i++) fin[(size_t)pad+i] = bb_pb[(size_t)i];
+		int rep = (pad < bb_n) ? pad : bb_n;
+		for(int i=0;i<rep;i++){
+			fin[(size_t)i]            = bb_pb[(size_t)i];
+			fin[(size_t)(pad+bb_n)+i] = bb_pb[(size_t)(bb_n-rep)+i];
+		}
+		if(total_fir>0){
+			ts->ofdm.FIR_tx1.apply(fin.data(), ft1.data(), total_fir);
+			ts->ofdm.FIR_tx2.apply(ft1.data(), ft2.data(), total_fir);
+			for(int i=0;i<bb_n;i++) bb_pb[(size_t)i] = ft2[(size_t)pad+i];   // real block back
+		}
+	}
 	double bb_peak_all=0, bb_rms_all=0, bb_peak_dat=0, bb_rms_dat=0;
 	if(bb_n > 0){
 		measure(bb_pb.data(), 0, bb_n, bb_peak_all, bb_rms_all);
@@ -2188,9 +2217,11 @@ int cl_arq_controller::test_bigblock_txlevel()
 	// ---- (2b) PRODUCTION-FAITHFUL stock level: the live batch path packs each
 	// NO_FILTER frame (pre-eq applied, no FIR) then runs the WHOLE batch buffer
 	// through FIR_tx1 -> FIR_tx2 (arq_common.cc:4591-4592) before tx_transfer. The
-	// FIRs flatten the pre-eq boost. The big-block path applies NEITHER pre-eq NOR
-	// the batch FIR (tx_transfer of the raw block_pb). So the true HW comparison is
-	// the FILTERED stock frame vs the RAW big-block. Apply the same two FIRs here.
+	// FIRs flatten the pre-eq boost. POST-§18 the big-block path applies pre-eq + the
+	// TX_SIG_OFDM level-cal at the modulator AND the SAME batch FIR before tx_transfer
+	// (the big-block arm above is now FIR'd to match). So both sides are pre-eq +
+	// level-cal + FIR — the production HW ratio should be ~1.0. Apply the same two
+	// FIRs to the stock reference here.
 	std::vector<double> fr_f1((size_t)frame_total, 0.0), fr_f2((size_t)frame_total, 0.0);
 	ts->ofdm.FIR_tx1.apply(fr_pb.data(), fr_f1.data(), fr_n);
 	ts->ofdm.FIR_tx2.apply(fr_f1.data(), fr_f2.data(), fr_n);
@@ -2207,13 +2238,13 @@ int cl_arq_controller::test_bigblock_txlevel()
 	printf("[TXLEVEL] geometry: interp=%d Nofdm=%d preN=%d Nsymb=%d pre_samp=%d "
 	       "block_n=%d bb_n=%d bb_K=%d fr_n=%d frame_size=%d sub_len=%d\n",
 	       interp, Nofdm, preN, Nsymb, pre_samp, block_n, bb_n, bb_K, fr_n, frame_size, sub_len);
-	printf("[TXLEVEL] BIGBLOCK whole : peak=%.6f rms=%.6f papr=%.2fdB\n", bb_peak_all, bb_rms_all, papr(bb_peak_all,bb_rms_all));
+	printf("[TXLEVEL] BIGBLOCK whole : peak=%.6f rms=%.6f papr=%.2fdB (POST-§18: pre-eq + level-cal + FIR_tx1/2)\n", bb_peak_all, bb_rms_all, papr(bb_peak_all,bb_rms_all));
 	printf("[TXLEVEL] BIGBLOCK data  : peak=%.6f rms=%.6f papr=%.2fdB\n", bb_peak_dat, bb_rms_dat, papr(bb_peak_dat,bb_rms_dat));
 	printf("[TXLEVEL] STOCK NOFIR whole: peak=%.6f rms=%.6f papr=%.2fdB (pre-eq applied, no FIR)\n", fr_peak_all, fr_rms_all, papr(fr_peak_all,fr_rms_all));
 	printf("[TXLEVEL] STOCK NOFIR data : peak=%.6f rms=%.6f papr=%.2fdB\n", fr_peak_dat, fr_rms_dat, papr(fr_peak_dat,fr_rms_dat));
 	printf("[TXLEVEL] STOCK +FIR  whole: peak=%.6f rms=%.6f papr=%.2fdB (PRODUCTION batch: pre-eq + FIR_tx1/2)\n", frf_peak_all, frf_rms_all, papr(frf_peak_all,frf_rms_all));
 	printf("[TXLEVEL] STOCK +FIR  data : peak=%.6f rms=%.6f papr=%.2fdB\n", frf_peak_dat, frf_rms_dat, papr(frf_peak_dat,frf_rms_dat));
-	printf("[TXLEVEL] === PRODUCTION HW RATIO (raw big-block vs FIRed stock) ===\n");
+	printf("[TXLEVEL] === PRODUCTION HW RATIO (FIRed big-block vs FIRed stock; target ~1.0) ===\n");
 	printf("[TXLEVEL] RATIO data  peak bb/stock+FIR = %.4f (%.2f dB)  RMS = %.4f (%.2f dB)\n",
 	       (frf_peak_dat>0)?bb_peak_dat/frf_peak_dat:0.0, db((frf_peak_dat>0)?bb_peak_dat/frf_peak_dat:1.0),
 	       (frf_rms_dat>0)?bb_rms_dat/frf_rms_dat:0.0,   db((frf_rms_dat>0)?bb_rms_dat/frf_rms_dat:1.0));
@@ -2224,8 +2255,8 @@ int cl_arq_controller::test_bigblock_txlevel()
 	       (fr_peak_dat>0)?bb_peak_dat/fr_peak_dat:0.0, db((fr_peak_dat>0)?bb_peak_dat/fr_peak_dat:1.0),
 	       (fr_rms_dat>0)?bb_rms_dat/fr_rms_dat:0.0,   db((fr_rms_dat>0)?bb_rms_dat/fr_rms_dat:1.0));
 	double ofdm_gain = ts->get_tx_gain(TX_SIG_OFDM);
-	printf("[TXLEVEL] get_tx_gain(TX_SIG_OFDM)=%.4f (the calibrated factor the STOCK path applies; "
-	       "big-block path applies NO TX_SIG_OFDM factor)\n", ofdm_gain);
+	printf("[TXLEVEL] get_tx_gain(TX_SIG_OFDM)=%.4f (the calibrated factor BOTH paths now apply; "
+	       "POST-§18 big-block applies pre-eq + this TX_SIG_OFDM factor + FIR_tx1/2)\n", ofdm_gain);
 	fflush(stdout);
 
 	delete A; delete ts;

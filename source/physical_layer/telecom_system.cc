@@ -7056,8 +7056,32 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
 	ofdm.framer(tx_syms.data(), grid.data());
 
+	// TX-LEVEL PARITY (P3 HW): the stock CFG16 DATA path applies a per-subcarrier
+	// pre_equalization_channel multiply (transmit_byte:813, ~+8 dB CFG16 boost) on the
+	// framed grid (data + pilots) BEFORE symbol_mod, then scales the whole frame by
+	// get_tx_gain(TX_SIG_OFDM) (:866) and the batch band-limits with FIR_tx1/FIR_tx2
+	// (arq_common.cc:4591-4592). The big-block emitted at the RAW modulator level —
+	// bypassing all three — so it transmitted ~6.7 dB peak / ~5.7 dB RMS QUIETER than a
+	// stock CFG16 batch frame (results_bigblock_txlevel.json). Apply the SAME conditioning
+	// here so the block transmits identically-conditioned, just longer under one preamble.
+	// Pre-eq goes on pilots too (the framer interleaves them): the RX pilot-based estimate
+	// captures it and divides it back out (telecom_system.cc:7345-7379), so the perfect-
+	// channel roundtrip still equalizes to the unit constellation — exactly the mechanism
+	// the stock RX relies on. The big-block preamble matched-filter reference is updated to
+	// match (bigblock_preamble_mf_snap, this file) since pre-eq reshapes the preamble too.
+	bool apply_preeq = (M != MOD_MFSK && pre_equalization_channel != NULL);
+	{ const char* e=std::getenv("MERCURY_BIGBLOCK_NOPREEQ"); if(e && atoi(e)!=0) apply_preeq=false; }
+	if(apply_preeq)
+	{
+		for(int i=0;i<Ngrid;i++)
+			for(int j=0;j<Nc;j++)
+				grid[(size_t)i*Nc+j] *= pre_equalization_channel[j].value;
+	}
+
 	float power_normalization = sqrt((double)(ofdm.Nfft*interp));
 	double preamble_boost = ofdm.preamble_configurator.boost;
+	// TX_SIG_OFDM calibration gain (stock applies it to BOTH preamble and data, :860/:866).
+	double ofdm_tx_gain = get_tx_gain(TX_SIG_OFDM);
 	double tx_carrier = carrier_frequency + test_tx_carrier_offset;
 
 	// --- PASSBAND BRIDGE (mirrors transmit_byte:781-836) ----------------------
@@ -7065,19 +7089,25 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	{
 		std::vector<std::complex<double>> pre_grid((size_t)pre_nSymb*Nc);
 		for(int i=0;i<pre_nSymb*Nc;i++) pre_grid[i]=ofdm.ofdm_preamble[i].value;
+		// pre-eq on the preamble subcarriers (mirrors transmit_byte:805). The RX
+		// matched-filter reference is reshaped identically so acquisition stays matched.
+		if(apply_preeq)
+			for(int i=0;i<pre_nSymb;i++)
+				for(int j=0;j<Nc;j++)
+					pre_grid[(size_t)i*Nc+j] *= pre_equalization_channel[j].value;
 		for(int i=0;i<pre_nSymb;i++)
 			ofdm.symbol_mod(&pre_grid[(size_t)i*Nc], &pre_bb[(size_t)i*Nofdm]);
 	}
 	for(size_t j=0;j<(size_t)Nofdm*pre_nSymb;j++){
 		pre_bb[j] /= power_normalization;
-		pre_bb[j] *= sqrt(output_power_Watt)*preamble_boost;
+		pre_bb[j] *= sqrt(output_power_Watt)*preamble_boost*ofdm_tx_gain;
 	}
 	std::vector<std::complex<double>> dat_bb((size_t)Nofdm*Ngrid);
 	for(int i=0;i<Ngrid;i++)
 		ofdm.symbol_mod(&grid[(size_t)i*Nc], &dat_bb[(size_t)i*Nofdm]);
 	for(size_t j=0;j<(size_t)Nofdm*Ngrid;j++){
 		dat_bb[j] /= power_normalization;
-		dat_bb[j] *= sqrt(output_power_Watt);
+		dat_bb[j] *= sqrt(output_power_Watt)*ofdm_tx_gain;
 	}
 	int pre_pb_samples = Nofdm*pre_nSymb*interp;
 	int dat_pb_samples = Nofdm*Ngrid*interp;
@@ -7098,14 +7128,22 @@ long cl_telecom_system::bigblock_preamble_mf_snap(const std::complex<double>* bb
                                                   int search_dec)
 {
 	// Build the DECIMATED reference preamble baseband EXACTLY as the TX did (symbol_mod of
-	// ofdm_preamble[].value) — the absolute level cancels in the normalized correlation, so
-	// only the per-sample SHAPE matters. ref_len = pre_nSymb*Nofdm decimated samples.
+	// ofdm_preamble[].value WITH pre_equalization_channel) — the absolute level cancels in
+	// the normalized correlation, but the per-subcarrier pre-eq RESHAPES the preamble, so
+	// the reference MUST carry the same pre-eq the TX applies (bigblock_tx_passband). The
+	// stock OFDM RX matched-filter template bakes in pre-eq identically (telecom_system.cc:
+	// 9100). Without this the snap correlation collapses against a pre-eq'd TX preamble.
+	// ref_len = pre_nSymb*Nofdm decimated samples.
 	int ref_len = pre_nSymb * Nofdm;
 	if(ref_len <= 0 || bb_dec_len < ref_len) return coarse_dec;
 	std::vector<std::complex<double>> ref((size_t)ref_len);
 	{
 		std::vector<std::complex<double>> pre_grid((size_t)pre_nSymb*Nc);
 		for(int i=0;i<pre_nSymb*Nc;i++) pre_grid[i]=ofdm.ofdm_preamble[i].value;
+		if(M != MOD_MFSK && pre_equalization_channel != NULL)
+			for(int i=0;i<pre_nSymb;i++)
+				for(int j=0;j<Nc;j++)
+					pre_grid[(size_t)i*Nc+j] *= pre_equalization_channel[j].value;
 		for(int i=0;i<pre_nSymb;i++)
 			ofdm.symbol_mod(&pre_grid[(size_t)i*Nc], &ref[(size_t)i*Nofdm]);
 	}

@@ -3881,9 +3881,75 @@ bool cl_arq_controller::bigblock_send_one_block()
 	fflush(stdout);
 	if(K_tx <= 0 || n_tx <= 0) return false;
 
-	// Hand the raw block passband to the wire (one gapless transfer). The capture/
-	// drain pipeline (sim wire or radio playback) carries it as one acquisition.
-	tx_transfer(block_pb.data(), n_tx);
+	// === TX-LEVEL PARITY (P3 HW, fact-doc §18) — band-limit the block through the
+	// SAME FIR_tx1->FIR_tx2 cascade a regular CFG16 OFDM batch applies (send_batch,
+	// arq_common.cc:4591-4592) before tx_transfer. The stock per-frame passband is
+	// emitted RAW (NO_FILTER) by transmit_byte; the batch assembler is what runs the
+	// WHOLE packed buffer through the two band-pass FIRs, and that band-limit is the
+	// stage that disciplines a regular frame's final wire level (it flattens the
+	// per-subcarrier pre_equalization_channel boost: STOCK +FIR peak 0.583->0.492,
+	// rms 0.184->0.139, --test-bigblock-txlevel). The big-block had pre-eq + the
+	// TX_SIG_OFDM level-cal applied at the modulator (telecom_system.cc:7072-7110)
+	// but went to the wire WITHOUT this FIR, so it transmitted ~+1.4 dB peak / +2.3 dB
+	// RMS HOTTER than a stock frame (HW scope: ~1400-1450 mVp-p vs the 1000 mVp-p
+	// calibrated sweet spot). Apply the IDENTICAL conditioning here, in the same
+	// order, so the block transmits at the SAME level and spectrum as a regular frame
+	// — just longer under one preamble.
+	//
+	// Mirror send_batch's FIR scheme EXACTLY: edge-replicate a frame_output_size lead
+	// pad and trail pad around the real block so the ~96-tap (2x97-1)/2 group-delay
+	// transient bites only padding, then extract the n_tx real samples back from the
+	// filtered buffer. block_pb already carries frame_output_size of slack capacity
+	// (block_pb_capacity = block_buf_samples + frame_output_size, :3863), but build a
+	// dedicated padded buffer so the lead/trail replication is unambiguous. The RX is
+	// unchanged: FIR is an in-band band-pass, the OFDM signal sits inside the band, and
+	// the pilot-based channel estimate captures+divides out any residual shaping — the
+	// exact mechanism the stock OFDM RX already relies on for its own FIR'd frames.
+	//
+	// BLOCKED / DEFAULT-OFF (fact-doc §18.3): applying the FIR achieves the level goal
+	// (RMS ratio bb/stock+FIR -> ~1.0, vs +2.3 dB without it) BUT costs ~0.5-1 dB of
+	// decode margin that the big-block's BESPOKE RX (bigblock_rx_passband, sparse-pilot
+	// estimate) cannot absorb on a 32-QAM CFG16 block: exactly ONE middle codeword (cw2)
+	// miscorrects on the PERFECT channel, the --test-bigblock-multicw/-fullpath byte gate
+	// drops 8/8 -> 7/8 and the partial-block path then never delivers (gate hang). The
+	// pre-eq-only block "passes" 8/8 only because its UN-cut pre-eq edge boost (~+4.8x on
+	// the band edges) over-powers those subcarriers — i.e. it passes BY running +2.3 dB
+	// hot, not by having real margin. At the calibrated level the RX is genuinely ~1 cw
+	// short. The fix belongs in the big-block RX estimator (it must recover edge-subcarrier
+	// SNR the way the stock receive_byte preamble-LS estimate does); two RX recovery
+	// attempts (force sparse-2D; broadband-preamble pre-correction) did NOT recover it, so
+	// per CLAUDE.md §2 the RX margin work is deferred to its own audited fix + regression.
+	// Until then the FIR is OPT-IN (MERCURY_BIGBLOCK_FIR=1) so the byte gate stays green;
+	// the default path emits the pre-eq + level-cal block (validated 8/8) — still +2.3 dB
+	// hot on HW, the residual this fix could not safely close.
+	bool bb_apply_fir = false;
+	{ const char* e=std::getenv("MERCURY_BIGBLOCK_FIR"); if(e && atoi(e)!=0) bb_apply_fir=true; }
+	if(!bb_apply_fir)
+	{
+		tx_transfer(block_pb.data(), n_tx);
+		return true;
+	}
+	{
+		int pad = frame_output_size;                  // same pad width send_batch uses
+		int total_fir = pad + n_tx + pad;             // lead pad + block + trail pad
+		std::vector<double> fir_in((size_t)total_fir, 0.0);
+		std::vector<double> fir_t1((size_t)total_fir, 0.0);
+		std::vector<double> fir_t2((size_t)total_fir, 0.0);
+		// real block in the middle
+		for(int i=0;i<n_tx;i++) fir_in[(size_t)pad+i] = block_pb[(size_t)i];
+		// lead pad = replicate the block's leading `pad` samples; trail pad = replicate
+		// the block's trailing `pad` samples (send_batch:4578-4585 edge replication).
+		int rep = (pad < n_tx) ? pad : n_tx;
+		for(int i=0;i<rep;i++)
+		{
+			fir_in[(size_t)i]                 = block_pb[(size_t)i];                 // lead
+			fir_in[(size_t)(pad+n_tx)+i]      = block_pb[(size_t)(n_tx-rep)+i];      // trail
+		}
+		telecom_system->ofdm.FIR_tx1.apply(fir_in.data(), fir_t1.data(), total_fir);
+		telecom_system->ofdm.FIR_tx2.apply(fir_t1.data(), fir_t2.data(), total_fir);
+		// the real block is the [pad, pad+n_tx) region of the filtered buffer.
+		tx_transfer(&fir_t2[(size_t)pad], n_tx);
+	}
 
 	return true;
 }
