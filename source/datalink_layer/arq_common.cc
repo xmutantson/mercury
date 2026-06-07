@@ -3985,6 +3985,20 @@ bool cl_arq_controller::bigblock_rx_cw0_header_valid()
 	}
 	unsigned char calc = CRC8_calc((char*)cw0.data(), crc_span);
 	unsigned char wire = cw0[(size_t)crc_off];
+	// [CW0GATE] diag/cfg16hold-rxdecode (logging-only): surface the gate's cw0-CRC
+	// decision so the HW trace can attribute a [BBTX-GATE] reject to either (a) the gate
+	// mis-computing (static analysis: it does NOT — same de-whiten stage / span / offset
+	// as the proven carve) or (b) the live block genuinely de-whitening to wrong bytes.
+	// Computed POST-de-whiten over cw0's first crc_span bytes; compared to cw0[crc_off].
+	// head8 hashes the first up-to-8 de-whitened cw0 bytes so a TX/RX byte diff is visible
+	// alongside the [RXCW]/[TXCW] crc32. Behaviour byte-identical (return value unchanged).
+	fprintf(stderr, "[CW0GATE] stage=post-de-whiten K=%d sub_len=%d span=%d off=%d "
+		"calc=%02x wire=%02x %s head8=",
+		K, sub_len, crc_span, crc_off, (unsigned)calc, (unsigned)wire,
+		(calc==wire) ? "PASS" : "FAIL");
+	for(int b=0; b<sub_len && b<8; b++) fprintf(stderr, "%02x", (unsigned)cw0[(size_t)b]);
+	fprintf(stderr, "\n");
+	fflush(stderr);
 	return (calc == wire);
 }
 
