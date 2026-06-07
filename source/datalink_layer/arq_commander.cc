@@ -10720,10 +10720,16 @@ int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
 
 	// One full CFG16 K=8 block carries K*(ldpc.K/8)=8*175=1400 bytes of wire payload
 	// (minus the cw0 header + per-codeword CRC overhead); 1200 app bytes fit in ONE block.
-	const long PAYLOAD = 1200;
+	// APPROACH C (bb-shortk): K is parameterizable (default 8). A caller may pre-set
+	// MERCURY_BIGBLOCK_K=<n> (1..8) to drive a SHORTER block; PAYLOAD scales to exactly
+	// fill the K real codewords (150 app bytes/codeword), so the FIRST-block all-clean +
+	// full-delivery assertions stay valid for any K.
+	int Kblk = 8;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_K"); if(e && *e){ int v=atoi(e); if(v>=1 && v<=8) Kblk=v; } }
+	const long PAYLOAD = (long)Kblk * 150;
 	set_env("MERCURY_SIM_2INST",            "1");
 	set_env("MERCURY_BIGBLOCK_FRAMING",     "1");
-	set_env("MERCURY_BIGBLOCK_K",           "8");
+	{ char kb[8]; snprintf(kb,sizeof(kb),"%d",Kblk); set_env("MERCURY_BIGBLOCK_K", kb); }
 	set_env("MERCURY_SIM2_PIN",             "1");     // hold CFG16 (no gearshift)
 	set_env("MERCURY_SIM2_CFG",             "16");
 	set_env("MERCURY_SIM2_ROBUST",          "0");
@@ -10862,10 +10868,18 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 		}
 	};
 
-	const long PAYLOAD = 1200;   // a FULL K=8 block spanning all 8 codewords
+	// APPROACH C (bb-shortk): the codewords-per-block K is parameterizable. The default
+	// is the frozen K=8 full block (1200 app bytes spanning all 8 codewords); a caller may
+	// pre-set MERCURY_BIGBLOCK_K=<n> (1..8) to drive a SHORTER block. PAYLOAD scales to
+	// EXACTLY fill the K real codewords (150 app bytes/codeword: K=8 -> 1200, K=4 -> 600)
+	// so the gate stays "all real codewords byte-faithful" regardless of K. The env-save
+	// loop snapshots+restores MERCURY_BIGBLOCK_K, so reading the caller value here is clean.
+	int Kblk = 8;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_K"); if(e && *e){ int v=atoi(e); if(v>=1 && v<=8) Kblk=v; } }
+	const long PAYLOAD = (long)Kblk * 150;   // a FULL K-codeword block spanning all K codewords
 	set_env("MERCURY_SIM_2INST",        "1");
 	set_env("MERCURY_BIGBLOCK_FRAMING", "1");
-	set_env("MERCURY_BIGBLOCK_K",       "8");
+	{ char kb[8]; snprintf(kb,sizeof(kb),"%d",Kblk); set_env("MERCURY_BIGBLOCK_K", kb); }
 	set_env("MERCURY_SIM2_PIN",         "1");
 	set_env("MERCURY_SIM2_CFG",         "16");
 	set_env("MERCURY_SIM2_ROBUST",      "0");
@@ -10888,9 +10902,9 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	printf("[TEST-BIGBLOCK-MULTICW] ARM-A (CRC-ON, block window): first_block clean=%d/%d "
 	       "rx_have=%ld/%ld bytes_ok=%d (rc=%d)\n", a_clean, a_K, sim2_last_rx_have, PAYLOAD,
 	       (int)sim2_last_bytes_ok, rc_a);
-	bool a_ok = (a_K == 8) && (a_clean == a_K) && a_full && (rc_a == 0);
-	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-A all 8 codewords clean (per-cw CRC PASSES, NOT "
-	       "demoting) AND full 1200B byte-faithful\n", a_ok ? "PASS" : "FAIL");
+	bool a_ok = (a_K == Kblk) && (a_clean == a_K) && a_full && (rc_a == 0);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-A all %d codewords clean (per-cw CRC PASSES, NOT "
+	       "demoting) AND full %ldB byte-faithful\n", a_ok ? "PASS" : "FAIL", Kblk, PAYLOAD);
 	if(!a_ok) failed++;
 
 	// --- ARM B: NOCRC, STOCK window (fail-before). Forced-clean but BYTES WRONG (cw0 ok). ---

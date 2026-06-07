@@ -2102,15 +2102,23 @@ int cl_arq_controller::test_bigblock_txlevel()
 	       "(in-process, device-free; same transmit_byte entry)\n");
 	fflush(stdout);
 
-	// Pin K = 8 (production cap path) so the block geometry is deterministic.
+	// K defaults to 8 (production cap path); a caller may pre-set MERCURY_BIGBLOCK_K=<n>
+	// to measure a shorter block. NOTE: the block WAVEFORM (Ngrid=60 symbols) is identical
+	// for any K (the codewords past K are seeded-PRBS filler, full-entropy QAM symbols too),
+	// so the TX level ratio is K-INVARIANT — this knob exists only for symmetry with the
+	// shorter-K decode gate (Approach C, bb-shortk).
 	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
 	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
 	bool had_prev_k = (prev_k != NULL);
+	int Kblk = 8;
+	if(prev_k && *prev_k){ int v=atoi(prev_k); if(v>=1 && v<=8) Kblk=v; }
+	{ char kb[8]; snprintf(kb,sizeof(kb),"%d",Kblk);
 #if defined(_WIN32)
-	_putenv_s("MERCURY_BIGBLOCK_K", "8");
+	_putenv_s("MERCURY_BIGBLOCK_K", kb);
 #else
-	setenv("MERCURY_BIGBLOCK_K", "8", 1);
+	setenv("MERCURY_BIGBLOCK_K", kb, 1);
 #endif
+	}
 	auto restore_env = [&]() {
 #if defined(_WIN32)
 		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
@@ -2147,7 +2155,7 @@ int cl_arq_controller::test_bigblock_txlevel()
 	// ---- (1) BIG-BLOCK waveform via production transmit_byte branch ----------
 	int block_n = ts->bigblock_tx_total_samples();
 	int sub_len = ts->ldpc.K / 8;
-	int K       = 8;
+	int K       = Kblk;
 	std::vector<int> bb_payload((size_t)K * (size_t)sub_len, 0);
 	for(size_t i=0;i<bb_payload.size();i++) bb_payload[i] = (int)((i*53 + 17) & 0xFF);
 	std::vector<double> bb_pb((size_t)((block_n>0)?block_n:1), 0.0);
