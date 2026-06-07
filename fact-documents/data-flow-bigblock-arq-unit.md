@@ -1028,9 +1028,20 @@ CASE C + bit-flip CASE D); `--test-bigblock-arq-unit` 8/8 (T1-T9); `--test-climb
 failures; plus `--test-sim-clock`/`--test-clean-batch-viability`/`--test-data-anchored-promote`/
 `--test-probe-backoff`/`--test-phantom-ack-gate` all 0 failures.
 
-**Net-PHY WITH the 8-byte/block CRC overhead** (K=8 codewords × 1 CRC-8 byte = 8/1400 = 0.57%
+~~**Net-PHY WITH the 8-byte/block CRC overhead** (K=8 codewords × 1 CRC-8 byte = 8/1400 = 0.57%
 of the info bytes): 7.2% selective layout = **7814 bps net-PHY (7713 bps app-delivered) > VARA
-Standard 7050**; 6% flat = 7915 (7813 app). The CRC win is preserved.
+Standard 7050**; 6% flat = 7915 (7813 app). The CRC win is preserved.~~
+
+**CORRECTION (monitor-hygiene, 2026-06-07):** the "7713 bps app-delivered > VARA Standard 7050"
+is a SIM-derived net-PHY *rate* projection, NOT a live end-to-end delivery result. It comes from
+the same `--test-bigblock-*` gates that take the in-process ORACLE decode path (`ref!=NULL` @
+`telecom_system.cc:8336`), which bypasses genuine LDPC acquire+decode. On the FIRST unconfounded
+healthy-bench HW run the big-block delivers **0 app bytes** (RSP rejects every block at the cw0
+wire-CRC gate; `bigblock_p3_hw/results_bb_hw_A.json`), so the live app-delivered rate is 0, not
+7713. The "CRC win" is a TX-side layout property, not a delivered-throughput win. See
+`data-flow-sim2-ofdm-delivery-cadence.md` §8.6 CORRECTION for the full evidence: the big-block
+decode is BLOCKED by a localized channel-estimation/decode defect on the `ref==NULL` live path;
+the framing rung stays default-OFF.
 
 NO monitor merge, NO push, NO attribution.
 

@@ -395,7 +395,7 @@ wedge; the geometry-helper ring-zeroing was the sole remaining blocker to full
   (first-frame at link-up edge), NOT a delivery-path defect (identical decode path
   delivers 1200/1200 when settled). Follow-on: a one-shot "first OFDM block at the
   PHY-switch edge" decode-drive that does not depend on the steady gate.
-- **THROUGHPUT vs VARA (clean channel, deterministic on-air airtimes)**: Mercury
+- ~~**THROUGHPUT vs VARA (clean channel, deterministic on-air airtimes)**: Mercury
   production PPMd8+zstd streaming compresses Project Gutenberg #84 (pg84,
   448,885 B) → 121,496 B (**3.695×**). Block carries 1374 compressed app bytes in
   1.6533 s airtime (6649 bps compressed wire). effective = orig·8 / (88.4 blocks ·
@@ -404,4 +404,41 @@ wedge; the geometry-helper ring-zeroing was the sole remaining blocker to full
   vs VARA HF Standard 13,048 bps.** Clean-channel number (no SFO/CFO, matching
   VARA's bar); HW confirmation pending (testbed emulator low-pass collapse).
   Numbers + harness: `bigblock_p3_hw/results_simproof.json`,
-  `bigblock_p3_hw/measure_compress.cc`.
+  `bigblock_p3_hw/measure_compress.cc`.~~
+
+- **CORRECTION (monitor-hygiene, 2026-06-07 — the VARA "WIN" above is FALSE; the
+  big-block does NOT genuinely decode end-to-end):** the 15,226-24,564 bps "WIN
+  across the whole band vs VARA" figures were derived from the in-process SIM
+  gates (`--test-bigblock-fullpath`/`-multicw`/`-livepath`), which all take an
+  **ORACLE decode path** (`bigblock_last_tx_K>0` ⇒ the reference block is handed
+  to the decoder, `ref!=NULL` @ `telecom_system.cc:8336`), BYPASSING genuine
+  LDPC acquisition+decode. The throughput projection therefore assumed a
+  byte-faithful block that the live 2-instance receiver (`ref==NULL`) does NOT
+  produce.
+  - **HW bench, FIRST UNCONFOUNDED healthy-bench run** (Approach-A flat-gain,
+    `A-flatgain`@`84f7add`; `bigblock_p3_hw/results_bb_hw_A.json`): the link was
+    healthy (CFG15 5000 B on-Pi byte-faithful @10891.6 bps, `ofdm_ok=33`,
+    `meanH=0.979`), the climb held CFG16 and EMITTED big-blocks (`bbtx=3`,
+    `bsi=5`, `K=8`), yet the RSP rejected **EVERY** block at the cw0 wire-CRC
+    gate → `carve_k8=0`, **0/1374 app bytes delivered**, deterministic 2/2.
+    `pg84_win_loss: NA (decode not 8/8 → pg84 skipped)`. This is NOT the prior
+    "emulator low-pass collapse" attribution — the WB path was alive
+    (`meanH=0.979`, `ofdm_ok=17` during the big-block emit); the genuine
+    (`ref==NULL`) RX produces wrong cw0 bits and the gate correctly rejects.
+  - **The defect is a localized big-block channel-estimation / decode defect**,
+    masked in sim by the oracle (`ref!=NULL`) bypass. (The earlier in-sim
+    `meanH≈0`-over-the-133-sym-block framing was a sim-harness symptom of the
+    same not-genuinely-decoding class.) The pinned `1200/1200` / `1374/1374`
+    "byte-faithful" sim results in this section are ORACLE-confounded and do NOT
+    establish live decode.
+  - **What actually holds:** Approach-A's flat-gain **TX-LEVEL** discipline
+    works on HW (`g≈0.733`, −2.69/−2.71 dB, `raw_rms 0.183→fir_rms 0.134` at the
+    modulator — the level math is confirmed). **The per-frame (stock CFG16) path
+    is at ~PARITY** with VARA, not a win: ~13,350 vs VARA ~13,048 bps.
+  - **The VARA win is NOT achieved.** Big-block end-to-end delivery is BLOCKED
+    pending a fix to the big-block channel-estimation/decode defect on the live
+    (`ref==NULL`) path. The big-block framing rung remains **default-OFF**
+    (`bigblock_framing_enabled=false`, `telecom_system.h:532`; only set by env
+    `MERCURY_BIGBLOCK_FRAMING` or the `--test-bigblock-*` harnesses), so CFG16
+    in production runs the byte-identical stock per-frame path and does NOT elect
+    the non-decoding block rung (verified `arq_common.cc:1122-1124`).
