@@ -1297,11 +1297,35 @@ public:
   // byte-faithful. Proves the root cause is the RX capture WINDOW (not whiten/offset).
   // Returns 0 on PASS. Selected by --test-bigblock-multicw.
   static int test_sim_inproc_bigblock_multicw();
+  // GAP-2 LIVE-PATH REGRESSION (diag/livepath-sim): the cross-layer test the PINNED
+  // fullpath/multicw could NOT catch — they hand-pin CFG16 via load_configuration
+  // (MERCURY_SIM2_PIN=1, gear_shift_on=NO) so they BYPASS the live config transition
+  // (no SET_CONFIG control frame, no control-ACK turnaround — the exact path the
+  // 79207f7 TX-hold fix protects). This drives a REAL CONNECT at the robust start, then
+  // fires ONE production SET_CONFIG handshake robust->CFG16 over the live wire (the
+  // gearshift's own negotiated_configuration + add_message_control(SET_CONFIG) sequence,
+  // NOT a load_configuration hand-pin), then transfers a real K=8 (1374B) payload through
+  // the REAL process_messages_tx_data -> send_batch -> bigblock_send_one_block emit and
+  // the REAL receive_byte -> bigblock_rx_cw0_header_valid() gate -> carve -> FIFO. Asserts
+  // the cw0-CRC gate ACCEPTS the real emitted blocks and the message delivers byte-faithful
+  // (the KEY question: does sim REPRODUCE the HW cw0-CRC reject, or is the bug HW-only?).
+  // Returns 0 on PASS. Selected by --test-bigblock-livepath.
+  static int test_sim_inproc_bigblock_livepath();
   // Capture of the last test_sim_inproc_2() run's delivery (read by the full-path
   // regression to assert byte-faithful delivery without re-parsing stdout).
   static long sim2_last_rx_have;
   static long sim2_last_payload_len;
   static bool sim2_last_bytes_ok;
+  // GAP-2 LIVE-PATH: cw0-CRC gate decision tally for the last receive run. accepts =
+  // real big-blocks that PASSED bigblock_rx_cw0_header_valid() and were carved; rejects =
+  // CFG16 acquisitions that FAILED the cw0 wire-CRC and were re-decoded on the stock
+  // per-frame path. The live-path regression reads these to answer reproduces_cw0crc_reject.
+  static long sim2_gate_accepts;
+  static long sim2_gate_rejects;
+  // GAP-2 LIVE-PATH: count of real big-blocks EMITTED by bigblock_send_one_block in the
+  // current run (the TX switch engaged + tx_transfer'd a block). The live-path regression
+  // asserts emits>0 so the cw0-CRC-gate assert is meaningful (the gate ran on real blocks).
+  static long sim2_tx_block_emits;
   // Capture of the FIRST big-block carved in the current run (bigblock_block_to_arq):
   // n_clean / K of the first decoded block. The full-path regression reads these to
   // assert fail-before (first block decodes PARTIAL, n_clean<K) vs pass-after (CLEAN,

@@ -3885,6 +3885,10 @@ bool cl_arq_controller::bigblock_send_one_block()
 	// drain pipeline (sim wire or radio playback) carries it as one acquisition.
 	tx_transfer(block_pb.data(), n_tx);
 
+	// GAP-2 LIVE-PATH tally (diag/livepath-sim): a real big-block was emitted onto the
+	// wire (the TX switch engaged + tx_transfer succeeded). SIM_INPROC-only test-static.
+	sim2_tx_block_emits++;
+
 	return true;
 }
 
@@ -7046,6 +7050,11 @@ void cl_arq_controller::receive()
 			 && telecom_system->bigblock_last_rx_K > 0);
 		if(bigblock_rx_candidate && !bigblock_rx_cw0_header_valid())
 		{
+			// GAP-2 LIVE-PATH tally (diag/livepath-sim): this acquisition was a CFG16
+			// big-block candidate that FAILED the cw0 wire-CRC gate. Count it so the
+			// live-path regression can answer reproduces_cw0crc_reject without re-parsing
+			// stdout. SIM_INPROC-only mutation of a test-static; zero production effect.
+			cl_arq_controller::sim2_gate_rejects++;
 			printf("[BBTX-GATE] CFG16 acquisition (K=%d) failed cw0 wire-CRC -> NOT a "
 				"big-block; re-decoding on stock per-frame path (control/stale/noise, "
 				"not carved)\n", telecom_system->bigblock_last_rx_K);
@@ -7065,6 +7074,9 @@ void cl_arq_controller::receive()
 		}
 		if(bigblock_rx_candidate)
 		{
+			// GAP-2 LIVE-PATH tally (diag/livepath-sim): a real big-block whose cw0
+			// wire-CRC PASSED the gate and is about to be carved. SIM_INPROC-only.
+			cl_arq_controller::sim2_gate_accepts++;
 			int fallback_bsi = (rsp_current_expected_batch_seq_id >= 0)
 				? (rsp_current_expected_batch_seq_id & 0xFF) : 0;
 			// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): carve from the DEDICATED
