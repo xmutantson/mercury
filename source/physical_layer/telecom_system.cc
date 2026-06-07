@@ -7700,9 +7700,30 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 			}
 			double col_magcv = (col_n>0)? col_magcv_sum/col_n : -1.0;
 			double col_phrms = (col_n>0)? col_phspread_sum/col_n : -1.0;
+			// ESTIMATE-vs-GENIE per-DATA-cell phase error: how well the PUBLISHED estimate
+			// H_est tracks the TRUE channel H_g. phase err = arg(H_g·conj(H_est)). This is
+			// the DECISIVE estimator-accuracy metric and the §18 block localizer: clean
+			// ~0.034 rad (estimate≈truth) vs the HW-faithful vector ~0.21 rad (the estimate
+			// undersamples the per-cell non-linear time-walk at the 6-8% lattice) — above the
+			// 32-QAM ~0.1-rad EVM cliff, which is why bytes_ok stays 0 even after the polar
+			// time-axis magnitude-fold fix recovers mean|H|. DIAG-ONLY (env-gated print);
+			// no production behavior change. magRMS carries a decision-directed cscale
+			// offset (genie reconstructs on a unit-power constellation scale) so it is NOT a
+			// real-error metric — read the PHASE only.
+			double estg_ph2=0.0; int estg_n=0;
+			for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				size_t id=(size_t)n*Nc+j; if(!Hg_ok[id]) continue;
+				std::complex<double> He=(ofdm.estimated_channel+id)->value;
+				if(std::abs(He)<1e-12) continue;
+				double dph=std::arg(Hg[id]*std::conj(He));
+				while(dph>M_PI)dph-=2*M_PI; while(dph<-M_PI)dph+=2*M_PI;
+				estg_ph2+=dph*dph; estg_n++;
+			}
+			double estg_phrms=(estg_n>0)?sqrt(estg_ph2/estg_n):-1.0;
 			std::cout << "[DIAG-GENIE] cscale=" << cscale
 			          << " col_magCV=" << col_magcv << " col_phaseRMS=" << col_phrms
-			          << " (data cols=" << col_n << ")" << std::endl;
+			          << " est_vs_genie_phaseRMS=" << estg_phrms
+			          << " (data cols=" << col_n << ", n=" << estg_n << ")" << std::endl;
 		}
 		std::cout << "[DIAG-RXPB] nv=" << ofdm.noise_variance_estimate
 		          << " mean|H|=" << Hmag << " |H|[" << Hmin << ".." << Hmax << "]"
