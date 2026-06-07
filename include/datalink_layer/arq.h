@@ -1297,6 +1297,14 @@ public:
   // byte-faithful. Proves the root cause is the RX capture WINDOW (not whiten/offset).
   // Returns 0 on PASS. Selected by --test-bigblock-multicw.
   static int test_sim_inproc_bigblock_multicw();
+  // TX-LEVEL parity (HW over-level diag): builds a CFG16 telecom_system, emits a
+  // production K=8 big-block waveform AND a stock per-frame CONFIG_16 OFDM waveform
+  // through the SAME transmit_byte entry, and measures peak (Vp-p proxy = max|s|) +
+  // RMS over the DATA span (post-preamble) of each. Prints peak/RMS ratios + PAPR.
+  // Diagnoses whether the bench-observed +3.2 dB big-block over-level is a GAIN
+  // difference (RMS ratio != 1) or PAPR/length peak-vs-RMS (RMS ~1, peak ratio >1).
+  // Returns 0 always (measurement, not pass/fail). Selected by --test-bigblock-txlevel.
+  static int test_bigblock_txlevel();
   // Capture of the last test_sim_inproc_2() run's delivery (read by the full-path
   // regression to assert byte-faithful delivery without re-parsing stdout).
   static long sim2_last_rx_have;

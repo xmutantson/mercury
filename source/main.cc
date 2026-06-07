@@ -378,6 +378,8 @@ int main(int argc, char *argv[])
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
                                         // One-shot at startup, then exit rc. See data-flow-bigblock-arq-unit.md §16.
+    bool test_bigblock_txlevel_cli = false; // --test-bigblock-txlevel: measure CFG16 big-block vs stock-OFDM TX
+                                        // peak+RMS (HW over-level diag). One-shot at startup, then exit rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -885,6 +887,14 @@ int main(int argc, char *argv[])
             // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
             // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
             test_bigblock_multicw_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-txlevel") == 0)
+        {
+            // TX-LEVEL parity diag: measure CFG16 big-block vs stock-OFDM TX peak+RMS
+            // to localize the bench-observed +3.2 dB big-block over-level (gain vs PAPR).
+            test_bigblock_txlevel_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2036,6 +2046,15 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
             printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_txlevel_cli) {
+            printf("[FLAG] --test-bigblock-txlevel: measuring CFG16 big-block vs "
+                   "stock-OFDM TX peak/RMS\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_txlevel();
+            printf("[FLAG] Bigblock-txlevel test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

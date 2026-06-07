@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <string>
 #include <cstdint>
+#include <cmath>
 #include <vector>
 #include <algorithm>
 
@@ -2072,4 +2073,162 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// TX-LEVEL parity diag — --test-bigblock-txlevel
+//
+// HW symptom (bench scope, user-observed 2026-06-06): the big-block frames run
+// ~1400-1450 mVp-p (+~3.2 dB) over the 1000 mVp-p calibrated sweet spot, while
+// ACKs and stock OFDM frames sit at calibration. This measures, in-process and
+// device-free, whether that is a GAIN difference (RMS ratio != 1, e.g. a missing
+// TX_SIG_OFDM calibration factor) or a PAPR/length peak-vs-RMS effect (RMS ~= 1
+// but peak ratio > 1 because the K=8 block is ONE long waveform whose extreme
+// peak is higher at equal RMS power).
+//
+// Method: bring up a single CFG16 cl_telecom_system, emit BOTH waveforms via the
+// SAME production transmit_byte entry:
+//   (1) BIG-BLOCK: bigblock_framing_enabled=1 + bigblock_emit_scope -> branches
+//       to transmit_bigblock -> bigblock_tx_passband (the path the bench saw hot).
+//   (2) STOCK OFDM: bigblock_framing_enabled=0 -> the per-frame OFDM path
+//       (transmit_byte:649+) — the calibrated reference.
+// Both at CONFIG_16 (same constellation/grid/pilots). Measure peak (Vp-p proxy =
+// max|sample|) + RMS over (a) the whole waveform and (b) the DATA span only
+// (post-preamble), since the data symbols are what clip on HW. Print ratios.
+// ============================================================================
+int cl_arq_controller::test_bigblock_txlevel()
+{
+	printf("[TXLEVEL] big-block vs stock-OFDM CONFIG_16 TX peak/RMS parity "
+	       "(in-process, device-free; same transmit_byte entry)\n");
+	fflush(stdout);
+
+	// Pin K = 8 (production cap path) so the block geometry is deterministic.
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_BIGBLOCK_K", "8");
+#else
+	setenv("MERCURY_BIGBLOCK_K", "8", 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else           _putenv_s("MERCURY_BIGBLOCK_K", "");
+#else
+		if(had_prev_k) setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else           unsetenv("MERCURY_BIGBLOCK_K");
+#endif
+	};
+
+	cl_telecom_system* ts = new cl_telecom_system();
+	cl_arq_controller* A  = new cl_arq_controller();
+	A->telecom_system = ts;
+	A->nMessages          = 255;
+	A->max_data_length    = 170;
+	A->max_message_length = 200;
+	A->max_header_length  = 6;
+	A->init_messages_buffers();
+	A->load_configuration(CONFIG_16, FULL, YES);   // real CFG16 grid + buffers
+
+	int interp   = ts->frequency_interpolation_rate;
+	int Nofdm    = ts->data_container.Nofdm;
+	int preN     = ts->data_container.preamble_nSymb;
+	int Nsymb    = ts->data_container.Nsymb;
+	int pre_samp = Nofdm * preN * interp;   // shared preamble extent (same on both paths)
+
+	// peak (max|s|) + RMS over [lo, hi).
+	auto measure = [](const double* s, int lo, int hi, double& peak, double& rms){
+		peak = 0.0; double acc = 0.0; int n = (hi>lo)?(hi-lo):0;
+		for(int i=lo;i<hi;i++){ double a = std::fabs(s[i]); if(a>peak) peak=a; acc += s[i]*s[i]; }
+		rms = (n>0) ? std::sqrt(acc/(double)n) : 0.0;
+	};
+
+	// ---- (1) BIG-BLOCK waveform via production transmit_byte branch ----------
+	int block_n = ts->bigblock_tx_total_samples();
+	int sub_len = ts->ldpc.K / 8;
+	int K       = 8;
+	std::vector<int> bb_payload((size_t)K * (size_t)sub_len, 0);
+	for(size_t i=0;i<bb_payload.size();i++) bb_payload[i] = (int)((i*53 + 17) & 0xFF);
+	std::vector<double> bb_pb((size_t)((block_n>0)?block_n:1), 0.0);
+	ts->bigblock_framing_enabled = true;
+	{
+		cl_telecom_system::bigblock_emit_scope guard(ts, block_n);
+		ts->transmit_byte(bb_payload.data(), (int)bb_payload.size(), bb_pb.data(), NO_FILTER_MESSAGE);
+	}
+	int bb_n = ts->bigblock_last_tx_samples;
+	int bb_K = ts->bigblock_last_tx_K;
+	double bb_peak_all=0, bb_rms_all=0, bb_peak_dat=0, bb_rms_dat=0;
+	if(bb_n > 0){
+		measure(bb_pb.data(), 0, bb_n, bb_peak_all, bb_rms_all);
+		int dlo = (pre_samp < bb_n) ? pre_samp : bb_n;
+		measure(bb_pb.data(), dlo, bb_n, bb_peak_dat, bb_rms_dat);
+	}
+
+	// ---- (2) STOCK CONFIG_16 OFDM frame via the SAME transmit_byte entry ------
+	// big-block framing OFF -> per-frame OFDM path (transmit_byte:649+). One DATA
+	// frame's worth of bytes (frame_size = nReal_data/8). Use a typical full frame.
+	ts->bigblock_framing_enabled = false;
+	int frame_size = (ts->data_container.nBits - ts->ldpc.P) / 8;   // upper bound on bytes/frame
+	if(frame_size > 160) frame_size = 160;
+	std::vector<int> fr_payload((size_t)frame_size, 0);
+	for(int i=0;i<frame_size;i++) fr_payload[i] = (int)((i*31 + 7) & 0xFF);
+	int frame_total = (preN + Nsymb) * Nofdm * interp + 64;   // generous slot
+	std::vector<double> fr_pb((size_t)frame_total, 0.0);
+	ts->transmit_byte(fr_payload.data(), frame_size, fr_pb.data(), NO_FILTER_MESSAGE);
+	int fr_n = ts->tx_last_emitted_frame_samples;
+	if(fr_n <= 0 || fr_n > frame_total) fr_n = (preN + Nsymb) * Nofdm * interp;
+	double fr_peak_all=0, fr_rms_all=0, fr_peak_dat=0, fr_rms_dat=0;
+	measure(fr_pb.data(), 0, fr_n, fr_peak_all, fr_rms_all);
+	{
+		int dlo = (pre_samp < fr_n) ? pre_samp : fr_n;
+		measure(fr_pb.data(), dlo, fr_n, fr_peak_dat, fr_rms_dat);
+	}
+
+	// ---- (2b) PRODUCTION-FAITHFUL stock level: the live batch path packs each
+	// NO_FILTER frame (pre-eq applied, no FIR) then runs the WHOLE batch buffer
+	// through FIR_tx1 -> FIR_tx2 (arq_common.cc:4591-4592) before tx_transfer. The
+	// FIRs flatten the pre-eq boost. The big-block path applies NEITHER pre-eq NOR
+	// the batch FIR (tx_transfer of the raw block_pb). So the true HW comparison is
+	// the FILTERED stock frame vs the RAW big-block. Apply the same two FIRs here.
+	std::vector<double> fr_f1((size_t)frame_total, 0.0), fr_f2((size_t)frame_total, 0.0);
+	ts->ofdm.FIR_tx1.apply(fr_pb.data(), fr_f1.data(), fr_n);
+	ts->ofdm.FIR_tx2.apply(fr_f1.data(), fr_f2.data(), fr_n);
+	double frf_peak_all=0, frf_rms_all=0, frf_peak_dat=0, frf_rms_dat=0;
+	measure(fr_f2.data(), 0, fr_n, frf_peak_all, frf_rms_all);
+	{
+		int dlo = (pre_samp < fr_n) ? pre_samp : fr_n;
+		measure(fr_f2.data(), dlo, fr_n, frf_peak_dat, frf_rms_dat);
+	}
+
+	auto db = [](double r){ return 20.0*std::log10((r>0)?r:1e-12); };
+	auto papr = [](double pk, double rms){ return 20.0*std::log10((rms>0)?(pk/rms):1.0); };
+
+	printf("[TXLEVEL] geometry: interp=%d Nofdm=%d preN=%d Nsymb=%d pre_samp=%d "
+	       "block_n=%d bb_n=%d bb_K=%d fr_n=%d frame_size=%d sub_len=%d\n",
+	       interp, Nofdm, preN, Nsymb, pre_samp, block_n, bb_n, bb_K, fr_n, frame_size, sub_len);
+	printf("[TXLEVEL] BIGBLOCK whole : peak=%.6f rms=%.6f papr=%.2fdB\n", bb_peak_all, bb_rms_all, papr(bb_peak_all,bb_rms_all));
+	printf("[TXLEVEL] BIGBLOCK data  : peak=%.6f rms=%.6f papr=%.2fdB\n", bb_peak_dat, bb_rms_dat, papr(bb_peak_dat,bb_rms_dat));
+	printf("[TXLEVEL] STOCK NOFIR whole: peak=%.6f rms=%.6f papr=%.2fdB (pre-eq applied, no FIR)\n", fr_peak_all, fr_rms_all, papr(fr_peak_all,fr_rms_all));
+	printf("[TXLEVEL] STOCK NOFIR data : peak=%.6f rms=%.6f papr=%.2fdB\n", fr_peak_dat, fr_rms_dat, papr(fr_peak_dat,fr_rms_dat));
+	printf("[TXLEVEL] STOCK +FIR  whole: peak=%.6f rms=%.6f papr=%.2fdB (PRODUCTION batch: pre-eq + FIR_tx1/2)\n", frf_peak_all, frf_rms_all, papr(frf_peak_all,frf_rms_all));
+	printf("[TXLEVEL] STOCK +FIR  data : peak=%.6f rms=%.6f papr=%.2fdB\n", frf_peak_dat, frf_rms_dat, papr(frf_peak_dat,frf_rms_dat));
+	printf("[TXLEVEL] === PRODUCTION HW RATIO (raw big-block vs FIRed stock) ===\n");
+	printf("[TXLEVEL] RATIO data  peak bb/stock+FIR = %.4f (%.2f dB)  RMS = %.4f (%.2f dB)\n",
+	       (frf_peak_dat>0)?bb_peak_dat/frf_peak_dat:0.0, db((frf_peak_dat>0)?bb_peak_dat/frf_peak_dat:1.0),
+	       (frf_rms_dat>0)?bb_rms_dat/frf_rms_dat:0.0,   db((frf_rms_dat>0)?bb_rms_dat/frf_rms_dat:1.0));
+	printf("[TXLEVEL] RATIO whole peak bb/stock+FIR = %.4f (%.2f dB)  RMS = %.4f (%.2f dB)\n",
+	       (frf_peak_all>0)?bb_peak_all/frf_peak_all:0.0, db((frf_peak_all>0)?bb_peak_all/frf_peak_all:1.0),
+	       (frf_rms_all>0)?bb_rms_all/frf_rms_all:0.0,   db((frf_rms_all>0)?bb_rms_all/frf_rms_all:1.0));
+	printf("[TXLEVEL] (sanity) RATIO data peak bb/stock-NOFIR = %.4f (%.2f dB)  RMS = %.4f (%.2f dB)\n",
+	       (fr_peak_dat>0)?bb_peak_dat/fr_peak_dat:0.0, db((fr_peak_dat>0)?bb_peak_dat/fr_peak_dat:1.0),
+	       (fr_rms_dat>0)?bb_rms_dat/fr_rms_dat:0.0,   db((fr_rms_dat>0)?bb_rms_dat/fr_rms_dat:1.0));
+	double ofdm_gain = ts->get_tx_gain(TX_SIG_OFDM);
+	printf("[TXLEVEL] get_tx_gain(TX_SIG_OFDM)=%.4f (the calibrated factor the STOCK path applies; "
+	       "big-block path applies NO TX_SIG_OFDM factor)\n", ofdm_gain);
+	fflush(stdout);
+
+	delete A; delete ts;
+	restore_env();
+	return 0;
 }
