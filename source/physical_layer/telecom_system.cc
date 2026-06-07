@@ -5831,6 +5831,18 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 {
 	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
 	bool wiener = (env_i("MERCURY_SFO_GRID_WIENER", 1) != 0);   // default Wiener time-smooth ON
+	// DDCE default OFF (env-overridable for A/B). NOTE 2026-06-07 (ddce_finalize): a blanket
+	// DDCE-default-ON was ATTEMPTED and REVERTED — it crosses the deterministic-floor 32-QAM
+	// cliff on the single-block chanest decode (phaseRMS 0.124->0.100, bytes_ok 0->1) but
+	// REGRESSES the clean-channel LIVE big-block path: --test-bigblock-multicw drops 8/8->7/8 +
+	// ARM-C byte-faithful->corrupt, and --test-bigblock-fullpath partial-block GATE-HANGS (the
+	// exactly-one-codeword-of-margin signature documented at arq_common.cc:4062-4067). The
+	// data-cell decision-EVM does NOT separate the helped case (single-block decode) from the
+	// hurt case (live 2-instance decode): BOTH run the always-on Schroeder floor at dataEVM
+	// ~0.0137-0.015, so DDCE's benefit is decode-PATH-dependent, not channel-dependent — no
+	// simple measured gate separates them. Conditional DDCE needs an estimator-design pass
+	// (per-codeword convergence-aware DDCE, or restricting it to bigblock_rx_passband and not
+	// the live receive_bigblock carve). Surfaced as path+cost; NOT shipped as a blind default.
 	bool ddce   = (env_i("MERCURY_SFO_GRID_DDCE",   0) != 0);
 	int  wlen   = env_i("MERCURY_SFO_GRID_WIENER_LEN", 5);      // moving-avg half-window (taps=2*L+1)
 
