@@ -371,3 +371,120 @@ decision-directed tracker beats any single constant. (Diag knob removed after th
 **Status of the bytes_ok arbiter:** FAIL-BEFORE (AFC-OFF) bytes_ok=0 at cfo≤4 (confirmed, defect reproduced);
 PASS-AFTER (Option C ON) bytes_ok=0 at cfo≤4 (artifact floor, NOT a PHY miss); SANITY clean 8/8 byte-faithful
 (no regression). cfo=8 default additionally sits in the §12 finding-#2 timing-acq trough (separate, not chased).
+
+## §14 Attempt #5 — PER-SUB-BLOCK BAND-SPREAD CFO TRACKING (the prescribed fix; supervised re-entry 2026-06-07).
+**Re-framing (matches the directed-fix brief, NOT a blind 4th iteration):** the §13 "CFO-magnitude-INDEPENDENT
+per-subcarrier ~0.109 rad artifact" verdict was measured against the §12 default at cfo≤4 with the EXISTING
+Option C tracker (Stage-2 ψ from the **2 band-edge continual pilots only**, `cont_cols=2`). At the FULL
+HW-faithful magnitude (the current default: `CFO_HZ=12 sd, WALK=25, F3DB=3` ⇒ per-symbol swing the brief
+measured as sd ~33 Hz ≈ 0.70 of the ~46.9 Hz subcarrier spacing ⇒ Dirichlet ICI puts carriers ~70% off-grid)
+the existing tracker barely moves the needle:
+
+  | arm                        | impaired meanH | clean | gate |
+  |----------------------------|----------------|-------|------|
+  | AFCTRACK=0 (no tracker)    | **0.053**      | 0.194 | —    |
+  | AFCTRACK=1 (Option C, ψ@2edge) | **0.085**  | 0.194 | 0.18 |
+
+  measured 2026-06-07 against `--test-bigblock-chanest` at the committed `e3601f5` defaults (this branch).
+
+**§14.1 ROOT CAUSE of the residual (re-localized — the §13 "artifact" is the 2-edge-pilot LIMIT, not the
+RX pipeline).** `MERCURY_BIGBLOCK_AFC_DIAG=1` on the impaired arm (head_cfo=-13.4 Hz):
+- `[AFC-PILTHETA]` (per-symbol common phase from ALL pilots, AFTER Option C): theta_span 11.9 rad,
+  **resid_after_best-fit-linear-ramp RMS = 2.16 rad**. The tracker fit a LINEAR frequency ramp `dfs[-19.6..-7.4]`
+  to a phase trajectory that is NOT linear after correction ⇒ 2.16 rad unflattened (clean: 0.0067 rad).
+- `[AFC-WITHINSYM]` within-symbol pilot phase RMS **0.646 rad** (clean 0.125), residual after per-symbol
+  linear (CPE+slope) fit **0.127 rad** (clean 0.004). The within-symbol pilots DISAGREE by 0.65 rad.
+- WHY the 2-edge ψ fails: Stage-2 builds ψ[n]=arg(Σ_{j∈cont_cols} rx[n,j]·conj(X[n,j])) over carriers {0, Nc-1}
+  ONLY (`bigblock_rebuild_thin_grid:6916-6918`, cont_cols default 2 ⇒ edges only). Under CFO the across-band
+  per-carrier phase SLOPE (the 0.65 rad within-symbol spread) makes the 2-edge VECTOR SUM's argument neither
+  pilot's phase and slope-corrupted; differentiating it yields a bad linear `dfs` ⇒ 2.16 rad residual. This IS
+  the §9 aliasing, persisting at the realistic magnitude (Stage 1 does NOT shrink the swing enough at 33 Hz to
+  de-alias the 2-edge ψ). The §13 "per-subcarrier non-linear residual" is the SIGNATURE of this missing
+  band-spread information, NOT a sim/RX-pipeline numerical artifact.
+
+**§14.2 THE FIX (per-sub-block band-spread frequency tracking — what attempts #1-4 never had):**
+1. **ADD band-spread continual pilots:** `MERCURY_BIGBLOCK_CONT_COLS` default 2→5 ⇒ continual carriers at
+   {0, ~12, ~24, ~37, 49} (edges + center + quarters). Small overhead (3 extra continual cols × Ngrid);
+   headroom 15,226 bps > VARA 13,048 (the brief's explicit "ADD them"). Throughput re-measured post-fix.
+2. **Per-sub-block residual-CFO from band-spread pilots, frequency-FIRST:** in each window of W symbols
+   (W~6-9), for EACH continual carrier estimate its OWN inter-symbol phase RATE (≈ residual frequency on
+   that carrier), THEN average the per-carrier rates across the band-spread carriers. Estimating a FREQUENCY
+   per carrier first cancels the per-carrier phase SLOPE (a constant-in-time offset has zero time-rate), so
+   the slope that aliased the lumped-ψ no longer biases the estimate. This is the 802.11 continual-pilot /
+   FreeDV-700D pilot-assisted recipe (per-carrier pilot phase tracking, then combine).
+3. **Feed per-sub-block frequencies into the existing `dfs[n]` ramp + reuse `build_and_demod`** (pre-FFT
+   time-domain de-rotation, already in place from attempt #3). Confined to `bigblock_rx_passband`
+   (dormant default-off `bigblock_framing_enabled`; per-frame byte-identical).
+
+**§14.3 SS5 audit delta (vs §8 — only the ADD-pilots changes shared state):**
+- `ofdm.pilot_configurator.sequence[]` + the `ofdm_frame[].type` PILOT mask: cont_cols 2→5 ADDS 3 continual
+  columns ⇒ MORE PILOT cells, FEWER DATA cells. Producer = `bigblock_rebuild_thin_grid` (TX emit AND RX
+  decode call the SAME function ⇒ TX and RX grids stay IDENTICAL; nData/nBits/K recompute symmetrically).
+  Consumers (pilot_evm, TRACK LS, flat-ML, sparse-2D, nv residual, the new tracker) all walk the PILOT mask
+  by running pidx in the same raster order — they AUTOMATICALLY pick up the new pilots (no consumer hardcodes
+  cont_cols). INVARIANT held: pidx order == framer PILOT order (the mask is the single source of truth).
+- The new tracker only changes the PHASE of the time-domain block fed to the unchanged FFT/estimators (same
+  as §8 conclusion for attempt #3). No per-frame path touched (different Nsymb/site; bigblock dormant).
+- K-symmetry RISK: cont_cols affects nData ⇒ ldpc codeword packing. TX and RX both derive K from the SAME
+  `bigblock_rebuild_thin_grid` so K matches; the test/T6/climb-election all pin K=8 via MERCURY_BIGBLOCK_K
+  (cap path) so the unit tests are unaffected by the geometry change. VERIFY: --test-bigblock-multicw /
+  -fullpath / -arq-unit / climb-election still rc=0 after the cont_cols bump (they exercise the grid).
+
+**§14.4 VALIDATION CONTRACT (the faithful sim arbiter):** FAIL-BEFORE (AFCTRACK=0) meanH≈0.053 bytes_ok=0
+(reproduced) → PASS-AFTER (new tracker) meanH>0.18 AND bytes_ok 8/8 byte-faithful at the DEFAULT HW vector.
+bytes_ok is the TRUE arbiter. Iterate W / cont_cols / window-LS against the faithful sim. Then SWEEP CFO
+0-60 Hz, SFO 0-1000 ppm to confirm the envelope. Clean stays 8/8; per-frame byte-identical; fast tests green.
+
+**§14.5 RESULT (IMPLEMENTED + MEASURED 2026-06-07): the band-spread per-sub-block tracker is mechanism-sound
+but NOT a net improvement, and bytes_ok is BLOCKED by the same magnitude-INDEPENDENT sim/RX-pipeline artifact
+§13 found — independently re-confirmed from a fresh angle. REVERTED; the committed OLD tracker (e3601f5) is
+kept as the best candidate. DO NOT thrash (CLAUDE.md §2).**
+
+*Bit-budget table (computed):* thin grid Ngrid=60 Nc=50 log2M=5 ldpc.N=1600 ⇒ K=nBits/1600 needs nBits≥12800.
+cont_cols=2: npil=360 nData=2640 nBits=13200 **K=8** (slack 400b). cont=3: npil=415 nData=2585 nBits=12925
+**K=8** (slack 125b). cont=4: nData=2530 nBits=12650 **K=7** ✗. cont≥4 drops K below 8 ⇒ the K=8 test bails
+(meanH=-1, decode never runs). So cont_cols=3 ({0,24,49}=edges+CENTER) is the MAX band-spread that keeps K=8;
+the "≥4 / 5-cols" target is NOT reachable in the K=8 block budget (would need a larger Ngrid = architectural).
+
+*Tracker built:* Stage-2 replaced lumped-ψ with PER-SUB-BLOCK (W=7) BAND-SPREAD frequency-FIRST estimate —
+per continual carrier LS-fit φ_c[n]=a+b·n (b=phase rate=residual freq on that carrier), magnitude-weighted,
+MEDIAN-combined across the band-spread carriers, assigned per window into dfs, re-mixed pre-FFT via the existing
+build_and_demod. Frequency-first cancels the per-carrier phase OFFSET/SLOPE (constant-in-time ⇒ zero rate).
+
+*Measured (--test-bigblock-chanest, the off-bench arbiter):*
+  | arm                                   | default HW vector | cfo=2 ideal | cfo=4 ideal | bytes_ok |
+  |---------------------------------------|-------------------|-------------|-------------|----------|
+  | OLD ψ-tracker, cont=2 (committed)     | meanH **0.085**   | 0.191       | 0.183       | 0        |
+  | NEW band-spread tracker, cont=3       | meanH **0.057**   | 0.124       | 0.124       | 0        |
+  | OLD ψ-tracker forced cont=3           | meanH **0.049**   | 0.121       | 0.109       | 0        |
+- The NEW tracker is WORSE at the default HW vector (0.057 < 0.085): the per-window LS frequency jitters more
+  under WALK=25 Hz + SFO than the OLD smooth-ψ-derivative. It wins only at FIR-injector mid-CFO (cfo=4 default
+  injector: 0.124 vs OLD 0.077) where a real per-carrier slope exists to resolve — but loses where the §13
+  artifact dominates. The band-spread pilots HURT BOTH trackers (cont=3 < cont=2 for OLD too), partly the
+  tightened LDPC margin, partly the ψ math destabilized by 3-carrier mixing.
+
+*WHY bytes_ok cannot crack (the DECISIVE re-confirmation of §13, from a NEW angle):* at cfo=1 with the IDEAL
+injector + a per-symbol-tight CPE (TRACK_WIN=1), meanH recovers to **0.196 ≈ clean** and rowCPE is tiny
+(±0.05 rad, meanabs 0.021) — yet **DDevm=0.247 (24.7%, vs clean 0.033) and bytes_ok=0.** The GENIE
+decomposition (true channel from sliced symbols) shows the residual is INTRA-COLUMN TIME variation
+col_phaseRMS=**0.231 rad** — and it is **FLAT across cfo_sigma 0.25/0.5/1.0 (0.233/0.233/0.231 rad), i.e.
+CFO-MAGNITUDE-INDEPENDENT.** A genuine residual CFO would scale linearly with the offset; this does not. It is
+0.030 rad at exactly cfo=0 and jumps to ~0.23 rad the instant ANY CFO is injected — a FIXED numerical artifact
+of how the impaired buffer flows through passband_to_baseband/rational_resampler/FIR window boundaries, NOT a
+trackable carrier offset and NOT a per-symbol common phase. nv inflates 1e-5→0.022 (2000×) even with healthy
+mean|H|. No frequency correction (head-Moose, ψ-derivative, per-sub-block band-spread, ideal injector) and no
+per-symbol CPE touches it. This is exactly §13's verdict, reproduced independently here with the band-spread
+tracker + GENIE + ideal-injector + TRACK_WIN sweep.
+
+*VERDICT (CLAUDE.md §2 — STOP, the brief's documented-floor branch):* the band-spread per-sub-block tracker is
+the CORRECT mechanism for the REAL HW bug (HW §3.1: pilot magnitudes SURVIVE, only phases spread — that IS
+recoverable), but in THIS faithful sim it is dominated by a magnitude-independent RX-pipeline artifact that caps
+bytes_ok at 0 regardless of tracker. It is not a net win over the committed tracker and does not crack the
+arbiter ⇒ NOT committed (source reverted to e3601f5; only this fact-doc + results JSON kept). The HW-faithful
+fix candidate REMAINS the committed Option C (pre-FFT tracked CFO). **The bytes_ok off-bench gate is blocked by
+the sim/RX-pipeline artifact, NOT a PHY/tracking defect — so the next step is HW validation of the committed
+Option C directly (the real channel has magnitude-surviving phase-spread; bytes_ok is the only true gate), NOT
+a 4th off-bench tracker iteration.** If a future arbiter-fidelity pass localizes + removes the ~0.23 rad
+RX-pipeline artifact (the magnitude-independent col_phaseRMS in passband_to_baseband/resampler/FIR boundary),
+THEN re-run the band-spread tracker against the cleaned arbiter — but only the artifact removal, not the tracker,
+is the off-bench blocker.
