@@ -8094,10 +8094,65 @@ void cl_telecom_system::rx_passband_normalize_and_blank(double* pb, int pb_sampl
 void cl_telecom_system::bigblock_restore_stock_config()
 {
 	int stock = current_configuration;
+
+	// RX-RING PRESERVATION (data-flow-sim2-ofdm-delivery-cadence.md §8) — a geometry-
+	// derivation helper must NEVER destroy the live RX accumulation buffer.
+	//
+	// The CONFIG_NONE -> load_configuration(stock) reload below forces a FULL reinit
+	// (telecom_system.cc:8664-8674) -> data_container.set_size(), which deinit()s and
+	// REALLOCS + memset-ZEROES passband_delayed_data + ready_to_process_passband_delayed_data
+	// (data_container.cc:170-173). On the continuous-stream production RX this is harmless
+	// (the helper fires only at quiescent inter-block / TX-turnaround boundaries; CLAUDE.md
+	// data-flow audit §8.3 INV-2). But under the in-process SIM single-symbol pacing the
+	// next block's samples are ALREADY accumulated in the ring when a control-turnaround
+	// restore (arq_responder.cc:1213) fires -> the realloc wipes the in-flight block and the
+	// subsequent decode snapshots rms=0 SILENCE -> cw0-CRC fails -> 0 bytes delivered.
+	//
+	// Restore to the SAME stock config => the data_container ring dimensions
+	// (Nofdm * buffer_Nsymb * interp) are IDENTICAL before and after, so a snapshot+restore
+	// of the ring contents + accumulation bookkeeping across the reload is always valid.
+	// This makes the helper non-destructive to shared RX state on BOTH paths (defense-in-
+	// depth on production: a no-op when the ring was already quiescent, since saved==loaded).
+	int sp_full = 2 * data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+	int sp_rtp  =     data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+	std::vector<double> save_pdd, save_rtp;
+	int  save_rwi = data_container.ring_write_index;
+	int  save_ftr = data_container.frames_to_read.load();
+	int  save_dr  = data_container.data_ready;
+	int  save_nupe= data_container.nUnder_processing_events.load();
+	bool ring_saved = false;
+	if(sp_full > 0 && data_container.passband_delayed_data != NULL
+	   && data_container.ready_to_process_passband_delayed_data != NULL)
+	{
+		save_pdd.assign(data_container.passband_delayed_data, data_container.passband_delayed_data + sp_full);
+		save_rtp.assign(data_container.ready_to_process_passband_delayed_data,
+		                data_container.ready_to_process_passband_delayed_data + sp_rtp);
+		ring_saved = true;
+	}
+
 	// CONFIG_NONE forces load_configuration's full-reinit branch (all pilot fields set
 	// from defaults), avoiding the early-return when configuration==current.
 	current_configuration = CONFIG_NONE;
 	load_configuration(stock);
+
+	// Restore the RX accumulation buffer + bookkeeping the realloc zeroed. Dimensions
+	// are unchanged (same stock config), so the saved extents fit the reallocated buffers.
+	if(ring_saved)
+	{
+		int sp_full2 = 2 * data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+		int sp_rtp2  =     data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+		if(sp_full2 == sp_full && sp_rtp2 == sp_rtp
+		   && data_container.passband_delayed_data != NULL
+		   && data_container.ready_to_process_passband_delayed_data != NULL)
+		{
+			memcpy(data_container.passband_delayed_data, save_pdd.data(), (size_t)sp_full * sizeof(double));
+			memcpy(data_container.ready_to_process_passband_delayed_data, save_rtp.data(), (size_t)sp_rtp * sizeof(double));
+			data_container.ring_write_index = save_rwi;
+			data_container.frames_to_read   = save_ftr;
+			data_container.data_ready       = save_dr;
+			data_container.nUnder_processing_events = save_nupe;
+		}
+	}
 }
 
 int cl_telecom_system::bigblock_tx_total_samples()

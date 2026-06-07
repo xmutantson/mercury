@@ -252,3 +252,156 @@ plan, not a 5th iteration on the same mechanism):
   playback to its peer + drive the peer's receive loop, indexed by "who has play
   data" rather than the `c->tx`/`c->rx` flip — removing the orientation trap. This
   is the larger redesign §7.3 implies.
+
+## §8 BIG-BLOCK live-path: geometry-helper ring-zeroing under single-symbol pacing (2026-06-06, diag/livepath-sim)
+
+**Context.** `--test-bigblock-livepath` drives the real gearshift robust→CFG16
+SET_CONFIG + `send_batch` → `bigblock_send_one_block` (TX emits, `bbtx>0`
+confirmed) + the cw0-CRC carve gate. The gate RUNS (B reaches CFG16) but the
+cw0-CRC REJECTS and full byte-faithful delivery is blocked. The prior diagnostic
+(arq_commander.cc:11305-11331) attributed this to the big-block geometry helpers
+calling `bigblock_restore_stock_config()` → a full `load_configuration` reinit
+that ZEROES the RX ring mid-accumulation under the sim's single-symbol pacing.
+This section is the Phase-1 VERDICT + the mandated cross-layer audit.
+
+### §8.1 VERDICT: (A) SIM-ONLY — NOT a production RX bug
+
+`bigblock_restore_stock_config()` (telecom_system.cc:8056-8063) sets
+`current_configuration = CONFIG_NONE` then calls `load_configuration(stock)`.
+Because `current_configuration==CONFIG_NONE`, load_configuration forces a FULL
+reinit (`reinit_subsystems = st_reinit_subsystems()`, telecom_system.cc:8664-8674)
+→ `reinit_subsystems.data_container==YES` (telecom_system.cc:4743-4756) →
+`data_container.set_size()` which `memset`s `passband_delayed_data` +
+`ready_to_process_passband_delayed_data` to 0 and reallocates them
+(data_container.cc:171-173 memset, :248-249 free in deinit). So EVERY restore
+ZEROES + REALLOCS the RX ring. This is real shared-RX-state destruction.
+
+**The difference is WHEN it fires relative to block accumulation:**
+
+PRODUCTION continuous-stream RX (the real path):
+- The audio capture-prep thread fills the ring CONCURRENTLY, one symbol per
+  `sim_paced_wait` tick (audioio.c:1295-1376), decrementing `frames_to_read`.
+- `receive()` (arq_common.cc:6897) only enters the decode block when
+  `frames_to_read==0`; while `>0`, the WHOLE block accumulates and NO geometry
+  helper / receive_byte / restore runs.
+- At `frames_to_read==0` the full window is memcpy'd to
+  `ready_to_process_passband_delayed_data` (arq_common.cc:6902) then
+  receive_byte→receive_bigblock runs. receive_bigblock SNAPSHOTS `data` into a
+  LOCAL std::vector BEFORE any restore (telecom_system.cc:8255-8260), so its own
+  restore (telecom_system.cc:8329) zeroing the ring cannot corrupt the block being
+  decoded.
+- After the carve, `frames_to_read` is re-armed to `block_nsymb+10`
+  (arq_common.cc:7127); the NEXT block accumulates from a clean ring. The restore
+  fired at an INTER-BLOCK quiescent point.
+- The other restore sites (`bigblock_block_ftr_or` via `bigblock_rx_block_nsymb`,
+  called at TX-turnaround re-arms arq_common.cc:4991/5103/5575) fire right after
+  the modem finished a TX and flushed its capture buffer to begin a fresh listen —
+  again, no in-flight block accumulation to corrupt.
+- CONCLUSION: NO production restore fires while a block's already-captured samples
+  sit mid-accumulation in the ring.
+
+SIM single-symbol-paced RX (the artifact):
+- `sim2_deliver_from_wire` (arq_commander.cc:9994) runs a tight `while` loop:
+  deliver one symbol → `prep_pull_inline` → and on the falling edge of
+  `frames_to_read==0`, drive `process_main()` (→ decode → carve → restore →
+  re-arm `frames_to_read=block_nsymb+10`). The loop then KEEPS DELIVERING the
+  remaining symbols already queued in `dst->audio.cap`/wire in the SAME iteration
+  burst, writing them into the JUST-REALLOCATED/ZEROED ring at a desynced offset.
+  When `frames_to_read` next hits 0, the snapshot reads silence/garbage → cw0-CRC
+  fails. Production has no "already-buffered future-block symbols" at the instant
+  of reallocation because its feed is real-time concurrent, not a pre-filled wire.
+
+### §8.2 Production-impact one-liner
+NOT a production bug. The ring-zeroing fires only at inter-block/turnaround
+quiescent points on the real continuous-stream RX. It does NOT explain the HW
+`bbtx=3 / 0-bytes-delivered` symptom — that is the testbed channel-emulator analog
+low-pass collapse (MEMORY.md `testbed_emulator_lowpass_collapse`), a physical
+hardware fault, not this code path.
+
+### §8.3 Cross-layer data-flow audit (CLAUDE.md mandate)
+
+State under change: the SIM-harness delivery cadence around the RX ring
+(`passband_delayed_data` / `ready_to_process_passband_delayed_data`),
+`current_configuration`, and the block-accumulation gate (`frames_to_read`).
+
+1. **Producers** (who WRITES the ring / accum state):
+   - PROD capture-prep: audioio.c:1295-1376 (1 symbol/tick, decrements
+     frames_to_read).
+   - SIM capture-prep equivalent: `prep_pull_inline` arq_commander.cc:10049-10095
+     (1 symbol/iter; decrements frames_to_read, sets data_ready).
+   - Ring REALLOC/ZERO: `data_container.set_size` data_container.cc:95-173 (called
+     from load_configuration telecom_system.cc:4750/4754, reached via
+     `bigblock_restore_stock_config`).
+   - Post-carve manual ring wipe: arq_common.cc:7119-7123 (zeros both ring halves
+     after a block decode).
+   - frames_to_read re-arm: arq_common.cc:7127 (post-carve), :4991/:5103/:5575
+     (TX-turnaround via bigblock_block_ftr_or), :6446/:6857/:6871 (HAIL/ACK poll).
+2. **Consumers** (who READS the ring / accum state):
+   - PROD decode: `receive()` arq_common.cc:6897-7012 (snapshots ring→
+     ready_to_process when frames_to_read==0, then receive_byte/receive_bigblock).
+   - receive_bigblock telecom_system.cc:8214-8337 (reads `data`, immediately
+     snapshots to local buffer 8255-8260).
+   - SIM decode-drive: sim2_deliver_from_wire arq_commander.cc:10019-10038
+     (drives process_main on the frames_to_read==0 falling edge).
+3. **Valid states / pre-write defaults**: BEFORE any producer, the ring is
+   memset-0 (data_container.cc:171). frames_to_read default after a fresh arm =
+   block_nsymb+10 (the count of symbols to accumulate before the next snapshot).
+   `bigblock_last_rx_K` default 0 (carve gate false until a block decodes).
+4. **Invariants the consumers assume**:
+   - INV-1: when `receive()`/decode-drive fires (frames_to_read==0), the ring's
+     `signal_period` window holds EXACTLY one fully-accumulated block at a
+     frame-aligned offset.
+   - INV-2: no producer reallocates/zeros the ring while a partially-accumulated
+     block's samples are live in it.
+   PROD maintains both (restore only at quiescent boundaries; current block
+   snapshotted before restore). SIM VIOLATES INV-2: the deliver loop pours the
+   next block's queued symbols into the reallocated ring before the next snapshot.
+5. **What the fix changes** (see §8.4): the SIM deliver loop must not pour
+   post-restore symbols into the ring within the same burst — it must let the
+   reallocated ring re-accumulate the next block from clean state, exactly as
+   production's concurrent feed does. Production code is UNTOUCHED, so every
+   production consumer is unaffected by construction.
+
+### §8.4 Fix (Phase 2) — SIM-harness only
+See the live-path test + sim2_deliver_from_wire change on diag/livepath-sim
+(commit recorded below). One change: after a decode-drive fires the carve+restore
+(falling edge of frames_to_read), STOP pouring further symbols into the ring in
+the same deliver burst — return so the reallocated ring re-accumulates the next
+block cleanly on subsequent deliver calls, mirroring production's concurrent
+feed. Production-path code is byte-identical (the change is inside the
+SIM_INPROC-only sim2_deliver_from_wire helper).
+
+### §8.5 Block fits ONE batch (why this is the ONLY blocker)
+At CFG16 K=8: 8 codewords × ldpc.K(1400) = 11200 info bits = 1400 wire bytes/block;
+the APP capacity is 1400 − hdr_total(2+2K=18) − K·CRC(8) = **1374 bytes/block**
+(arq_common.cc:3753-3762). The test PAYLOAD=1374 → the WHOLE payload is ONE big
+block = ONE batch. So this transfer NEVER hits the §7 multi-batch reentrancy
+wedge; the geometry-helper ring-zeroing was the sole remaining blocker to full
+1374/1374 byte-faithful delivery on the live path.
+
+### §8.6 RESULT after the ring-preservation fix (commit on diag/livepath-sim)
+- **Ring-zeroing FIXED**: `--test-bigblock-livepath` snapshot rms 0.000000 →
+  0.047630 (block now PRESENT; `[OFDM-SYNC]` preamble acquires metric=0.992).
+  No regression: pinned fullpath 1200/1200 (8/8 clean), multicw ALL PASS,
+  arq-unit 8/8, climb-engine ALL PASS, legacy 2INST smoke byte-identical.
+- **Full byte-faithful delivery PROVEN on the PINNED full path**
+  (`--test-bigblock-fullpath`: 1200/1200 bytes, first_block clean=8/8) through the
+  REAL receive_bigblock + de-whiten + carve + FIFO path; `--test-bigblock-multicw`
+  K=8 full-block byte-faithful (ALL PASS).
+- **UNPINNED live-handshake full delivery NOT yet reached**: the FIRST big-block
+  lands at the robust→CFG16 SET_CONFIG transition edge where the sim decode-drive
+  window arming is not yet settled, so it misses cw0-CRC and the symbol-paced clock
+  crawls through the SACK-retransmit ACK timeout past the wall cap. SAME class as §6
+  (first-frame at link-up edge), NOT a delivery-path defect (identical decode path
+  delivers 1200/1200 when settled). Follow-on: a one-shot "first OFDM block at the
+  PHY-switch edge" decode-drive that does not depend on the steady gate.
+- **THROUGHPUT vs VARA (clean channel, deterministic on-air airtimes)**: Mercury
+  production PPMd8+zstd streaming compresses Project Gutenberg #84 (pg84,
+  448,885 B) → 121,496 B (**3.695×**). Block carries 1374 compressed app bytes in
+  1.6533 s airtime (6649 bps compressed wire). effective = orig·8 / (88.4 blocks ·
+  cycle): airtime-only ceiling **24,564 bps**; nominal 913 ms turnaround
+  **15,825 bps**; conservative 1014 ms **15,226 bps**. **WIN across the whole band
+  vs VARA HF Standard 13,048 bps.** Clean-channel number (no SFO/CFO, matching
+  VARA's bar); HW confirmation pending (testbed emulator low-pass collapse).
+  Numbers + harness: `bigblock_p3_hw/results_simproof.json`,
+  `bigblock_p3_hw/measure_compress.cc`.
