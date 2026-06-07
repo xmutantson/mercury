@@ -368,6 +368,37 @@ public:
   void set_max_buffer_length(int max_data_length, int max_message_length, int max_header_length);
   void set_ack_batch_size(int ack_batch_size);
   void set_data_batch_size(int data_batch_size);
+  // R038 (race audit 2026-06-06) — per-frame v2 EOB staging consumed by the
+  // match-current storage block; declared near last_received_end_of_batch_seq.
+  // R035 (race audit 2026-06-06) — called from the set_data_batch_size()
+  // chokepoint when the data batch SHRINKS while an RSP prev-batch is active.
+  // Re-derives rsp_prev_batch_{received,expected}_count against the NEW (smaller)
+  // batch so the live prev-completion gate stays reachable, and -- if any
+  // already-RECEIVED prev slot is orphaned in [new_batch, old_batch) -- fires the
+  // streaming desync defense BEFORE the inevitable stale-discard (which FREEs
+  // messages_rx_prev[] without a streaming_reset, the asymmetry vs the delivery
+  // leg). `new_batch` is the post-clamp value about to be stored. See
+  // data-flow-arq-recovery-cluster.md §4.3 / §5.2.
+  void rescan_prev_on_batch_shrink(int new_batch);
+  // R029 (race audit 2026-06-06) — the SINGLE owner of zeroing the TX retransmit
+  // queue. The retransmit_frames[] / retransmit_count parallel arrays hold frames
+  // captured (and, under encryption, byte-encoded) for the LIVE crypto epoch +
+  // current bsi window. Every messages_tx[]-freeing recovery site (watchdog,
+  // gearshift-down, BREAK, config-change re-encode, reset_session_state,
+  // restore_tx_from_compressed) re-queues PLAINTEXT to fifo_buffer_tx so it
+  // re-sends under the NEW epoch — but historically NONE of them cleared
+  // retransmit_count, leaving stale OLD-epoch/foreign-bsi frames that the v2
+  // mixbatch builder (which has no epoch guard) would prepend to the first
+  // post-recovery batch. clear_retx_queue() restores INV-R029. Mirrors the
+  // runaway-BREAK clear (arq_commander.cc:1502). If R030 later adds a separate
+  // retx-prefix structure it MUST be zeroed here too (single-owner contract).
+  // See data-flow-arq-recovery-cluster.md §2.2 / §4.1 / §5.1.
+  void clear_retx_queue();
+  // R030 (race audit 2026-06-06) — resolve the messages_tx[] slot the post-TX
+  // PENDING_ACK flip must mark for messages_batch_tx[batch_idx], or -1 to skip.
+  // Shared by send_batch()'s flip and the --test-v2-pendingack-flip-alias test.
+  // See data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+  int v2_flip_resolve_slot(int batch_idx);
   void set_control_batch_size(int control_batch_size);
   void set_role(int role);
   void calculate_receiving_timeout();
@@ -1157,6 +1188,25 @@ public:
     return rx_bsi != last_applied_sack_bsi;      // partial: dedupe vs partial tracker
   }
 
+  // R039 (race audit 2026-06-06): the SACK-v2 accept "window" check. A decoded
+  // SACK_RSP's rx_bsi must be the current or just-prior CMD batch (mod 256),
+  // because RSP only ACKs frames whose batch_seq_id is one of those. The OFDM
+  // SACK_RSP arm (arq_commander.cc:2814) had NO such guard (only an exact-dup
+  // reject), unlike the MFSK ACK+SACK arms (arq_commander.cc:2642-2645 partial,
+  // :121-126 clean). decode_sack_v2_frame() is CRC8-only and never validates
+  // rx_bsi, so a double-checksum (LDPC+CRC8) false-decode out-of-window SACK_RSP
+  // would be applied by slot index against a messages_tx[] describing a
+  // DIFFERENT batch -> silent mis-ACK / needless retransmit. PURE + static so
+  // --test-sack-oow-reject exercises the EXACT production predicate.
+  // cmd_bsi = cmd_batch_seq_id & 0xFF, prev_bsi = (cmd_bsi - 1) & 0xFF.
+  static bool sack_v2_bsi_in_window(int rx_bsi, int cmd_batch_seq_id)
+  {
+    unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+    unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+    unsigned rx       = (unsigned)(rx_bsi & 0xFF);
+    return (rx == cmd_bsi || rx == prev_bsi);
+  }
+
   // TURBO step-1 SNR-capability pre-truncation gate (gearshift-climb-engine.md
   // §20 — the CFG15->CFG16 under-climb on clean). PURE so --test-climb-engine can
   // drive it with no live telecom_system / channel.
@@ -1558,6 +1608,53 @@ public:
   // fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1
   // (skips the load_configuration tail election). Returns 0 on all-pass, 1 on failure.
   static int test_bigblock_climb_election();
+  // R039 (race audit 2026-06-06) — OFDM SACK_RSP out-of-window reject test.
+  // CLI: --test-sack-oow-reject. Builds a CRC8-VALID SACK_RSP payload with an
+  // out-of-window batch_seq_id, drives the REAL decode_sack_v2_frame() (which is
+  // CRC8-only and DOES accept it — the root-cause gap), then applies the REAL
+  // production window predicate sack_v2_bsi_in_window() (the fix). Asserts: the
+  // OOW frame decodes (proving the decode layer doesn't guard), the new guard
+  // REJECTS it (pre-fix: no guard -> bitmap applied -> mis-ACK), and an
+  // in-window frame is still ACCEPTED (regression guard). Returns 0=PASS,1=FAIL.
+  int test_sack_oow_reject();
+
+  // R038 (race audit 2026-06-06) — EOB-poison-from-prev-retransmit test.
+  // CLI: --test-eob-poison-prev-retx. Drives the real EOB staging/promotion
+  // members (last_received_end_of_batch_seq, rx_buffer_eob_seq) through a
+  // receive->stage->route->promote->gate sequence where a prev-retransmit of a
+  // SHORTER batch's EOB arrives while the current batch's own EOB is lost.
+  // Asserts the PRE-FIX single-stage capture reproduces the early ACK-GATE PASS
+  // (truncated delivery) AND the POST-FIX staged+match-current-gated promotion
+  // prevents it. Returns 0=PASS, 1=FAIL.
+  int test_eob_poison_prev_retx();
+
+  // R035 (race audit 2026-06-06) — data_batch_size SHRINK strands active prev.
+  // CLI: --test-batch-shrink-strands-prev. Arms an active RSP prev with a frozen
+  // expected_count=15 and a RECEIVED slot in [10,15), then SHRINKS via the REAL
+  // set_data_batch_size(10) chokepoint (not a direct assign). Asserts the pre-fix
+  // gate was unreachable (expected frozen at 15), that the fix re-derives
+  // expected/received against the new batch (gate reachable), and that the
+  // orphaned slot fires a single streaming_reset (streaming stays active).
+  // Returns 0=PASS, 1=FAIL.
+  int test_batch_shrink_strands_prev();
+
+  // R029 (race audit 2026-06-06) — stale-retx-queue-cleared-on-recovery test.
+  // CLI: --test-retx-clear-on-recovery. Populates retransmit_count>0 with a known
+  // OLD bsi, calls the REAL clear_retx_queue() (the single owner every recovery
+  // site now invokes), and asserts the queue empties (no pre-recovery bsi
+  // reachable), is idempotent on empty, and repeatable across recoveries.
+  // Returns 0=PASS, 1=FAIL.
+  int test_retx_clear_on_recovery();
+
+  // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
+  // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
+  // messages_tx[] array-index space DIVERGED from the wire positions (holes + a
+  // retx prefix), drives the REAL v2_flip_resolve_slot() for every batch slot,
+  // and asserts retx-prefix slots are skipped (-1), new-data slots resolve to the
+  // correct diverged array index (not the wire id), no FREE/foreign slot is left
+  // PENDING_ACK, and the pre-fix wire-id flip WOULD have poisoned a non-owning
+  // slot. Returns 0=PASS, 1=FAIL.
+  int test_v2_pendingack_flip_alias();
 
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
@@ -2122,6 +2219,15 @@ public:
   float print_stats_frequency_hz;
 
   int message_batch_counter_tx;
+  // R030 (race audit 2026-06-06): number of leading messages_batch_tx[] entries
+  // that are the v2 retx PREFIX (their payload lives in retx_scratch[], NOT in
+  // any live messages_tx[] slot — the original slot was freed to ACKED at SACK
+  // capture, arq_commander.cc:2983). Set by process_messages_tx_data() on a v2
+  // MIXED batch (=R), 0 otherwise. The post-TX PENDING_ACK flip in send_batch()
+  // reads it to (a) SKIP retx-prefix frames (no messages_tx slot to flip) and
+  // (b) for new-data frames route by (batch_seq_id, low7-seq) instead of the
+  // overwritten wire .id. See data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+  int v2_retx_prefix_count;
 
   char* message_TxRx_byte_buffer;
   struct st_message messages_rx_buffer;
@@ -2768,6 +2874,17 @@ private:
 
   char last_received_message_sequence;
   int last_received_end_of_batch_seq;  // End-of-batch flag: seq# of frame with bit 7 set, or -1
+  // R038 (race audit 2026-06-06): per-frame EOB STAGING for the v2 path.
+  // receive() decodes the EOB bit BEFORE the responder knows whether the frame
+  // is match-current / match-prev / drop. Writing last_received_end_of_batch_seq
+  // pre-routing let a CRC-valid prev-retransmit / late-duplicate of a SHORTER
+  // batch poison the CURRENT batch's effective_batch (early ACK-GATE PASS ->
+  // truncated delivery). For v2, receive() now stages the decoded EOB seq here
+  // (or -1 if the frame has no EOB bit) and the responder promotes it to
+  // last_received_end_of_batch_seq ONLY inside the confirmed match-current
+  // storage block. v1 (no bsi routing) keeps writing last_received_end_of_batch
+  // _seq directly in receive() and leaves this field unused (-1).
+  int rx_buffer_eob_seq;               // staged EOB seq for current v2 frame, or -1
   char last_message_sent_type;
   char last_message_sent_code;
 

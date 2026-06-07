@@ -267,6 +267,7 @@ void cl_arq_controller::process_messages_commander()
 							messages_tx[i].status = FREE;
 						}
 						fifo_buffer_backup.flush();
+						clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 					}
 					block_under_tx = NO;
 					int fifo_load = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
@@ -353,6 +354,7 @@ void cl_arq_controller::process_messages_commander()
 						messages_tx[i].status = FREE;
 					}
 					fifo_buffer_backup.flush();
+					clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 				}
 				block_under_tx = NO;
 
@@ -1439,7 +1441,12 @@ void cl_arq_controller::process_messages_tx_data()
 	//      Step 8a's match-prev path; new-data routes to messages_rx[]
 	//      via match-current. Different physical buffers — no cross-batch
 	//      slot collisions (§7.8.3's hazard structurally eliminated).
-	int v2_retx_prefix_count = 0;
+	// R030 (race audit 2026-06-06): v2_retx_prefix_count is now a MEMBER (was a
+	// local) so the post-TX PENDING_ACK flip in send_batch() can see how many
+	// leading messages_batch_tx[] entries are the retx prefix. Reset to 0 here at
+	// the start of every batch build; set to R below only on a v2 mixed batch.
+	// (v2_mixed_batch stays local — only this function needs it.)
+	v2_retx_prefix_count = 0;
 	bool v2_mixed_batch = false;
 
 	// §7.13.39 Fix 2 — single source of truth for batch_tx slot identity.
@@ -2835,6 +2842,27 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							sack_bitmap, data_batch_size, &rx_bsi);
 						SACK_TRACE("decode_sack_v2: ok=%d rx_bsi=%u cmd_bsi=%d",
 							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
+						// R039 (race audit 2026-06-06): bsi-in-window guard.
+						// decode_sack_v2_frame() is CRC8-only and never validates
+						// rx_bsi. The MFSK arms reject rx_bsi outside the
+						// {cmd_bsi, prev_bsi} window (arq_commander.cc:2642-2645,
+						// :121-126); the OFDM arm previously had only the exact-dup
+						// reject below, so a double-checksum (LDPC+CRC8) false-decode
+						// of an out-of-window SACK_RSP would be applied by slot index
+						// against a messages_tx[] describing a DIFFERENT batch ->
+						// silent mis-ACK / needless retransmit. Treat OOW as a CRC
+						// fail (fall through to the timeout-driven full-batch
+						// retransmit, exactly as if the OFDM frame had been lost).
+						if(decoded
+						   && !sack_v2_bsi_in_window((int)rx_bsi, cmd_batch_seq_id))
+						{
+							unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+							printf("[CMD-SACK-V2-OOW] rx_bsi=%u not in window {cmd=%u,prev=%u} — discarding (treat as CRC fail)\n",
+								(unsigned)rx_bsi, cmd_bsi, prev_bsi);
+							fflush(stdout);
+							decoded = false;
+						}
 						if(decoded
 						   && (int)rx_bsi == cmd_last_applied_sack_bsi)
 						{
@@ -3345,6 +3373,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					messages_tx[i].status = FREE;
 				}
 				fifo_buffer_backup.flush();
+				clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 			}
 			block_under_tx = NO;
 
@@ -3893,6 +3922,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						messages_tx[i].status = FREE;
 					}
 					fifo_buffer_backup.flush();
+					clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 				}
 				block_under_tx = NO;
 

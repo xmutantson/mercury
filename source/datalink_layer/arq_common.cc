@@ -257,6 +257,7 @@ cl_arq_controller::cl_arq_controller()
 	message_TxRx_byte_buffer=NULL;
 
 	message_batch_counter_tx=0;
+	v2_retx_prefix_count=0;  // R030: reset every batch build; set to R on v2 mixed
 	ack_timeout_data=1000;
 	ack_timeout_control=1000;
 	link_timeout=10000;
@@ -602,6 +603,7 @@ cl_arq_controller::cl_arq_controller()
 
 	last_received_message_sequence=255;
 	last_received_end_of_batch_seq=-1;
+	rx_buffer_eob_seq=-1;  // R038: per-frame v2 EOB staging (set in receive())
 	data_ack_received=NO;
 	repeating_last_ack=NO;
 	disconnect_requested=NO;
@@ -748,6 +750,139 @@ void cl_arq_controller::set_ack_batch_size(int ack_batch_size)
 	}
 }
 
+// R035 (race audit 2026-06-06): re-derive the active RSP prev-batch counters
+// when the data batch SHRINKS, and fire the streaming desync defense if any
+// already-RECEIVED prev slot is orphaned beyond the new (smaller) batch.
+//
+// THE BUG: rsp_prev_batch_expected_count is FROZEN at arm-time from the OLD
+// data_batch_size (bump_bsi_and_transfer_prev, arq_common.cc:4437). An Axis-2
+// down-move (e.g. 15->10) or a robust-dwell revert (8->1) shrinks data_batch_size
+// while prev is active, but no path re-derives expected_count. The LIVE prev-write
+// bound (arq_responder.cc:686, loc >= data_batch_size reject) then rejects any
+// prev frame whose slot is in [new, old), so rsp_prev_batch_received_count can
+// never reach the frozen expected_count -> the prev never delivers via the
+// completion gate (arq_responder.cc:728) -> the eventual re-bump hits the
+// stale-discard (arq_common.cc:4366-4379) which FREEs messages_rx_prev[] WITHOUT
+// streaming_reset() -> PPMd streaming desync (the ff829d5 class).
+//
+// THE FIX (mirrors the delivery leg's streaming defense, arq_responder.cc:731):
+//   - received_count := count of RECEIVED prev slots in [0, new)
+//   - expected_count := min(old expected, new)  (gate becomes reachable)
+//   - if any RECEIVED prev slot is orphaned in [new, old): the prev cannot be
+//     delivered intact, so fire streaming_reset() (guarded is_streaming() &&
+//     batch_data_delivered) NOW, before the data is lost, instead of silently
+//     desyncing at the later stale-discard.
+//
+// Called from the set_data_batch_size() chokepoint (both the robust and OFDM
+// clamp branches) with the post-clamp value, BEFORE data_batch_size is updated.
+void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
+{
+	if(!sack_v2_enabled) return;
+	if(!rsp_prev_batch_active) return;
+	int old_batch = this->data_batch_size;
+	if(new_batch >= old_batch) return;   // only SHRINK strands the prev path
+
+	// Recompute received_count within the new (smaller) bound, and detect
+	// already-RECEIVED slots that the new bound orphans in [new_batch, old_batch).
+	int new_received = 0;
+	for(int i = 0; i < new_batch && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) new_received++;
+	int orphaned_received = 0;
+	for(int i = new_batch; i < old_batch && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) orphaned_received++;
+
+	int old_expected = rsp_prev_batch_expected_count;
+	int new_expected = old_expected;
+	if(new_expected > new_batch) new_expected = new_batch;
+	if(new_expected < 1)         new_expected = 1;
+
+	// If RECEIVED prev data is orphaned beyond the new bound, the prev batch can
+	// no longer be delivered intact. Fire the streaming defense (same guard +
+	// handshake as the in-order delivery leg) BEFORE the data is discarded, so
+	// the next TX batch detects RX-cold and resets — no silent PPMd desync.
+	if(orphaned_received > 0 && compressor.is_streaming() && batch_data_delivered)
+	{
+		compressor.streaming_reset();
+		printf("[STREAMING] Reset: prev-batch orphaned by data_batch_size shrink "
+			"%d->%d (orphaned_received=%d) — R035 desync defense\n",
+			old_batch, new_batch, orphaned_received);
+		fflush(stdout);
+	}
+
+	printf("[RSP-V2-PREV-RESHRINK] data_batch_size %d->%d prev_batch_seq_id=%d "
+		"received %d->%d expected %d->%d orphaned_received=%d\n",
+		old_batch, new_batch, rsp_prev_batch_seq_id,
+		rsp_prev_batch_received_count, new_received,
+		old_expected, new_expected, orphaned_received);
+	fflush(stdout);
+
+	rsp_prev_batch_received_count = new_received;
+	rsp_prev_batch_expected_count = new_expected;
+}
+
+// R029 (race audit 2026-06-06): the single owner of zeroing the TX retransmit
+// queue. See the arq.h declaration for the full rationale. Called from every
+// messages_tx[]-freeing recovery site; idempotent (count already 0 -> no-op log
+// suppressed). retransmit_count is the only live cursor — the parallel arrays
+// (retransmit_frames/_lengths/_positions/_types/_batch_seq_ids/_seq_with_eob) are
+// only ever read over [0, retransmit_count), so zeroing the count discards them.
+void cl_arq_controller::clear_retx_queue()
+{
+	if(retransmit_count != 0)
+	{
+		printf("[RETX-CLEAR] dropping %d stale retransmit frame(s) on recovery "
+			"(old-epoch/old-config bytes; plaintext re-queued for re-send under "
+			"the new epoch)\n", retransmit_count);
+		fflush(stdout);
+	}
+	retransmit_count = 0;
+}
+
+// R030 (race audit 2026-06-06): resolve which messages_tx[] slot the post-TX
+// PENDING_ACK flip must mark for messages_batch_tx[batch_idx]. Returns the
+// messages_tx[] array index, or -1 to SKIP (retx-prefix frame with no live
+// slot, or no owning slot found). The flip (send_batch) and the regression test
+// (--test-v2-pendingack-flip-alias) BOTH call this so the test exercises the
+// exact production predicate. See the flip comment in send_batch() and
+// data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+//
+//   - v2 MIXED batch (v2_retx_prefix_count > 0):
+//       * batch_idx < v2_retx_prefix_count  -> retx prefix: payload lives in
+//         retx_scratch[], original messages_tx[] slot was freed to ACKED at SACK
+//         capture (arq_commander.cc:2983). NO live slot -> return -1 (skip).
+//       * else (new-data): messages_batch_tx[batch_idx].id is the OVERWRITTEN
+//         wire id (pos_in_new_batch), NOT the array index. Find the owning slot
+//         by (batch_seq_id, low7-seq) -- the duplicate-(bsi,seq) validation at
+//         arq_commander.cc:1797 guarantees that tuple is UNIQUE among populated
+//         slots, so the match is unambiguous.
+//   - v2 NON-mixed batch (v2_retx_prefix_count == 0) and v1: wire .id ==
+//     messages_tx[] array index -> return it directly (legacy behaviour).
+int cl_arq_controller::v2_flip_resolve_slot(int batch_idx)
+{
+	if(v2_retx_prefix_count > 0)
+	{
+		if(batch_idx < v2_retx_prefix_count)
+			return -1;  // retx prefix: no messages_tx[] slot to flip
+		int want_bsi = (int)(unsigned char)messages_batch_tx[batch_idx].batch_seq_id;
+		int want_seq = (int)((unsigned char)messages_batch_tx[batch_idx].sequence_number & 0x7F);
+		for(int s = 0; s < this->nMessages; s++)
+		{
+			if(messages_tx[s].status == ADDED_TO_BATCH_BUFFER
+			   && (int)(unsigned char)messages_tx[s].batch_seq_id == want_bsi
+			   && ((int)((unsigned char)messages_tx[s].sequence_number & 0x7F)) == want_seq)
+				return s;
+		}
+		// No owning slot — should not happen (the new-data fill wrote the tuple).
+		// Skip rather than alias a wrong slot.
+		printf("[CMD-V2-FLIP-NOSLOT] no messages_tx slot for bsi=%d seq=%d "
+			"(batch_idx=%d) — skipping PENDING_ACK flip (R030 guard)\n",
+			want_bsi, want_seq, batch_idx);
+		fflush(stdout);
+		return -1;
+	}
+	return (int)(unsigned char)messages_batch_tx[batch_idx].id;
+}
+
 void cl_arq_controller::set_data_batch_size(int data_batch_size)
 {
 	// CHOKEPOINT: robust => batch 1 (the single enforcement point).
@@ -795,6 +930,9 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 				current_configuration, data_batch_size, clamped, lo, hi);
 			fflush(stdout);
 		}
+		// R035: re-derive an active prev-batch's counters against the new (smaller)
+		// batch BEFORE updating data_batch_size (robust-dwell revert 8->1 is a shrink).
+		rescan_prev_on_batch_shrink(clamped);
 		this->data_batch_size = clamped;
 		// L3: keep the data-ACK timeout tracking the batch ONLY on an actual change
 		// to a multi-frame batch (the dwell raise) or back down (the revert). We do
@@ -810,14 +948,17 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 
 	if (data_batch_size>0)
 	{
+		// Resolve the post-clamp target FIRST so R035's prev-shrink rescan sees
+		// the value that will actually be stored.
+		int target;
 		if(data_batch_size<(max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1))
-		{
-			this->data_batch_size=data_batch_size;
-		}
+			target = data_batch_size;
 		else
-		{
-			this->data_batch_size=(max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
-		}
+			target = (max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
+		// R035: re-derive an active prev-batch's counters against the new (smaller)
+		// batch BEFORE updating data_batch_size (Axis-2 down-move 15->10 is a shrink).
+		rescan_prev_on_batch_shrink(target);
+		this->data_batch_size = target;
 	}
 }
 
@@ -2472,6 +2613,7 @@ void cl_arq_controller::update_status()
 			{
 				messages_tx[i].status=FREE;
 			}
+			clear_retx_queue();  // R029: watchdog recovery re-queues plaintext; drop stale retx
 
 			char restore_buf[N_MAX/8 * 20];
 			int total_restore = 0;
@@ -2559,6 +2701,7 @@ void cl_arq_controller::update_status()
 				{
 					messages_tx[i].status=FREE;
 				}
+				clear_retx_queue();  // R029: gearshift-down (SNR_BASED) recovery re-queues plaintext
 
 				char restore_buf[N_MAX/8 * 20];
 				int total_restore = 0;
@@ -2652,6 +2795,7 @@ void cl_arq_controller::update_status()
 				{
 					messages_tx[i].status=FREE;
 				}
+				clear_retx_queue();  // R029: gearshift-down (SUCCESS_BASED_LADDER) recovery re-queues plaintext
 
 				char restore_buf[N_MAX/8 * 20];
 				int total_restore = 0;
@@ -3552,6 +3696,12 @@ void cl_arq_controller::reset_session_state()
 	axis3_recent_sack_ok_count     = 0;
 	axis3_recent_sack_ok_pos       = 0;
 	axis3_batches_since_off        = 0;
+
+	// R029: a session reset (FORCED_ROLE_SWITCH, disconnect, role-switch) abandons
+	// the entire in-flight TX state. The retransmit queue's frames belong to the
+	// dead session's crypto epoch + bsi window — discard them so they cannot be
+	// prepended to the first batch of the next session.
+	clear_retx_queue();
 }
 
 void cl_arq_controller::opt_load_rate_table()
@@ -4907,7 +5057,28 @@ void cl_arq_controller::send_batch()
 	{
 		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
 		{
-			int id = (int)(unsigned char)messages_batch_tx[i].id;
+			// R030 (race audit 2026-06-06): resolve the messages_tx[] slot to flip
+			// PENDING_ACK. messages_batch_tx[i].id is the WIRE id, which on a v2
+			// MIXED batch is NOT the messages_tx[] array index:
+			//   - retx-prefix frames (i < v2_retx_prefix_count): .id = the ORIGINAL
+			//     wire slot of a PRIOR batch; their payload is in retx_scratch[] and
+			//     their original messages_tx[] slot was freed to ACKED at SACK
+			//     capture (arq_commander.cc:2983). They have NO live messages_tx[]
+			//     slot in THIS batch — their delivery is tracked via the SACK
+			//     bitmap / retx queue, NOT via a messages_tx[] PENDING_ACK. Flipping
+			//     messages_tx[orig_wire_slot] aliased a FREE/foreign slot (the R030
+			//     bug). SKIP them.
+			//   - new-data frames (i >= v2_retx_prefix_count): .id = pos_in_new_batch
+			//     (overwritten at arq_commander.cc:1645), NOT the array index. Find
+			//     the owning slot by (batch_seq_id, low7-seq) — both were written to
+			//     messages_tx[idx] at fill time (arq_commander.cc:1616/1644) and to
+			//     messages_batch_tx[i] (send_batch's renumber is suppressed on mixed
+			//     batches via sack_retransmit_active), so the tuple matches exactly.
+			// On a v2 NON-mixed batch (v2_retx_prefix_count==0) and on v1, the wire
+			// .id == messages_tx[] array index, so the legacy direct path is correct.
+			int id = v2_flip_resolve_slot(i);
+			if(id < 0)
+				continue;  // retx-prefix (no slot) or no owning slot — see helper
 			messages_tx[id].ack_timer.start();
 			messages_tx[id].status=PENDING_ACK;
 			// Ensure padded (duplicate) frames have valid timeout/resend
@@ -7518,9 +7689,26 @@ void cl_arq_controller::receive()
 				messages_rx_buffer.status=RECEIVED;
 				messages_rx_buffer.type=message_TxRx_byte_buffer[0];
 				// Bit 7 of sequence_number = end-of-batch flag from commander (data frames only)
+				// R038 (race audit 2026-06-06): this capture runs PRE-ROUTING — before
+				// the responder classifies the frame as match-current / match-prev /
+				// drop. Writing last_received_end_of_batch_seq here for ANY CRC-valid
+				// EOB frame let a prev-retransmit / late-duplicate of a SHORTER batch
+				// poison the CURRENT batch's effective_batch (early ACK-GATE PASS ->
+				// truncated delivery). For v2, STAGE the EOB seq and let the responder
+				// promote it ONLY inside the confirmed match-current storage block
+				// (arq_responder.cc match-current path). v1 has no bsi routing, so it
+				// keeps writing last_received_end_of_batch_seq directly here
+				// (byte-for-byte unchanged).
+				rx_buffer_eob_seq = -1;
 				if((message_TxRx_byte_buffer[2] & 0x80)
 					&& (messages_rx_buffer.type == DATA_LONG || messages_rx_buffer.type == DATA_SHORT))
-					last_received_end_of_batch_seq = message_TxRx_byte_buffer[2] & 0x7F;
+				{
+					int eob_seq = message_TxRx_byte_buffer[2] & 0x7F;
+					if(sack_v2_enabled)
+						rx_buffer_eob_seq = eob_seq;   // v2: stage, promote on match-current
+					else
+						last_received_end_of_batch_seq = eob_seq;  // v1: unchanged
+				}
 				messages_rx_buffer.sequence_number=message_TxRx_byte_buffer[2] & 0x7F;
 				last_received_message_sequence=messages_rx_buffer.sequence_number;
 				// Defensive clamp: never write more than alloc_size (N_MAX/8 = 200) bytes
@@ -8401,6 +8589,15 @@ copy_data_done:
 
 void cl_arq_controller::restore_tx_from_compressed()
 {
+	// R029: every caller of this helper is a recovery/config-change path that
+	// frees messages_tx[] and re-queues plaintext to fifo_buffer_tx for re-send
+	// under the new config/epoch (BREAK ACK-recovery, BREAK EXHAUSTED, gearshift
+	// FRAME-UP-DATA-FAILED, gearshift FRAME-UP). The retransmit queue's frames
+	// reference the OLD messages_tx positions and (under encryption) OLD-epoch
+	// bytes, so they MUST be discarded here too — they'll re-send as fresh
+	// new-data once re-queued.
+	clear_retx_queue();
+
 	// When streaming is active, messages_tx was compressed with streaming context
 	// that has already advanced the PPMd model. We can't decompress it again.
 	// Use the backup buffer (raw plaintext) and reset streaming context.

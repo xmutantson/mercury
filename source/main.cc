@@ -28,6 +28,9 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstdarg>
+#include <atomic>   // R006: std::atomic<bool> shutdown_ (cross-thread termination flag)
+#include <thread>   // R006: --test-shutdown-atomic cross-thread smoke
+#include <type_traits> // R006: static_assert shutdown_ is atomic
 #include <math.h>
 #include <unistd.h>
 #include <iostream>
@@ -222,7 +225,17 @@ extern "C" {
     int radio_type;
     char *input_dev;
     char *output_dev;
-    bool shutdown_;
+    // R006 fix (race audit 2026-06-06): shutdown_ is read in main-thread spin
+    // loops AND written from the audio capture/playback/sim threads
+    // (audioio.c). A plain `bool` makes the concurrent unsynchronized
+    // read+write a C/C++ data race (UB). Make it a lock-free atomic so the
+    // termination flag is well-defined across threads. The C TU (audioio.c)
+    // declares the matching `extern _Atomic bool shutdown_;`
+    // (std::atomic<bool> and _Atomic bool are representation-compatible for
+    // the always-lock-free bool type). Mirrors gui_state.h:185
+    // `std::atomic<bool> request_shutdown{false}`. memory_order is the default
+    // seq_cst — these are infrequent termination predicates, not a hot path.
+    std::atomic<bool> shutdown_{false};
     // Audio channel configuration (0=LEFT, 1=RIGHT, 2=STEREO)
     extern int configured_input_channel;
     extern int configured_output_channel;
@@ -231,6 +244,93 @@ extern "C" {
 }
 
 int g_verbose = 0;
+
+// ============================================================================
+// R006 — shutdown_ atomicity regression (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-shutdown-atomic
+//
+// Race-audit R006 (mercury/fact-documents/data-flow-arq-recovery-cluster.md §7,
+// race_audit/race_fix_audit.json): the termination flag `shutdown_` is read in
+// main-thread spin loops AND written from the audio capture/playback/sim threads
+// (audioio.c). As a plain `bool` that concurrent unsynchronized read+write is a
+// C/C++ data race (UB). The fix makes it std::atomic<bool> (C++) / _Atomic bool
+// (C, audioio.c), which is representation-compatible for the always-lock-free
+// bool type.
+//
+// FAIL-BEFORE / PASS-AFTER:
+//   - COMPILE-TIME guarantee (the structural fail-before): the static_assert
+//     below fails to compile on the pre-fix tree where `shutdown_` is a plain
+//     `bool` (std::is_same<decltype(shutdown_), std::atomic<bool>> is false).
+//     This is the deterministic fail-before for a behaviour-neutral UB fix:
+//     the audit (§7/§8) prescribes a TSan/clean-shutdown smoke, not a runtime
+//     state assertion, because the data race is UB that does not manifest
+//     deterministically without a sanitizer (no -flto here).
+//   - RUNTIME smoke (pass-after): a writer thread sets shutdown_ from another
+//     thread exactly as audioio.c does; the main thread observes the flip in a
+//     spin loop exactly as main.cc does. Asserts the flip is observed (clean
+//     termination) and that the atomic is lock-free (so no lock-induced
+//     ordering surprises across the C/C++ boundary).
+//
+// Returns 0 on PASS, 1 on FAIL.
+static int test_shutdown_atomic()
+{
+    // --- Compile-time structural assertions (the fail-before on pre-fix code) -
+    static_assert(std::is_same<decltype(shutdown_), std::atomic<bool>>::value,
+        "R006: shutdown_ must be std::atomic<bool> (a plain bool is a data race "
+        "between the main-thread spin loops and the audioio.c audio threads).");
+
+    bool pass = true;
+
+    // Lock-free is required for representation-compatibility with the C TU's
+    // _Atomic bool view and to avoid lock-induced cross-thread surprises.
+    if(!shutdown_.is_lock_free())
+    {
+        printf("[TEST-SHUTDOWN-ATOMIC] FAIL: shutdown_ is not lock-free\n");
+        pass = false;
+    }
+
+    // --- Runtime cross-thread smoke (the pass-after observation) -------------
+    // Mirror the production access pattern: a non-main thread stores `true`
+    // (audioio.c:886/1264/1381/...) while the main thread reads `!shutdown_`
+    // (main.cc spin loops). On the pre-fix plain bool this is UB; on the
+    // atomic it is well-defined and the flip is guaranteed observable.
+    shutdown_.store(false);
+    std::atomic<long long> spins{0};
+    std::thread writer([&]() {
+        // Brief spin so the reader genuinely loops before the flip arrives.
+        for(volatile int i = 0; i < 100000; ++i) { /* burn */ }
+        shutdown_.store(true);
+    });
+
+    long long guard = 0;
+    const long long GUARD_MAX = 2000000000LL; // ~liveness bound; never hang
+    while(!shutdown_)
+    {
+        spins.fetch_add(1, std::memory_order_relaxed);
+        if(++guard >= GUARD_MAX) break;
+    }
+    writer.join();
+
+    bool observed = (bool)shutdown_;
+    if(!observed)
+    {
+        printf("[TEST-SHUTDOWN-ATOMIC] FAIL: main-thread spin never observed "
+               "the cross-thread shutdown_=true store (guard=%lld)\n", guard);
+        pass = false;
+    }
+
+    printf("[TEST-SHUTDOWN-ATOMIC] %s: lock_free=%d observed_flip=%d "
+           "reader_spins=%lld\n",
+        pass ? "PASS" : "FAIL", shutdown_.is_lock_free() ? 1 : 0,
+        observed ? 1 : 0, (long long)spins.load());
+    fflush(stdout);
+
+    // Leave the flag clear so we do not poison any later test in the same proc.
+    shutdown_.store(false);
+    return pass ? 0 : 1;
+}
 
 int main(int argc, char *argv[])
 {
@@ -380,11 +480,29 @@ int main(int argc, char *argv[])
                                         // One-shot at startup, then exit rc. See data-flow-bigblock-arq-unit.md §16.
     bool test_bigblock_txlevel_cli = false; // --test-bigblock-txlevel: measure CFG16 big-block vs stock-OFDM TX
                                         // peak+RMS (HW over-level diag). One-shot at startup, then exit rc.
+    bool test_sack_oow_reject_cli = false; // --test-sack-oow-reject: R039 — OFDM SACK_RSP out-of-window
+                                        // reject. Drives real decode_sack_v2_frame + real sack_v2_bsi_in_window guard;
+                                        // asserts CRC8-valid OOW SACK decoded-but-rejected, in-window accepted. One-shot, exits rc.
+    bool test_eob_poison_prev_retx_cli = false; // --test-eob-poison-prev-retx: R038 — prev-retransmit EOB
+                                        // poison. Drives the real EOB staging/promotion members; asserts pre-fix early
+                                        // ACK-GATE PASS reproduced AND post-fix prevents it. One-shot, exits rc.
+    bool test_batch_shrink_strands_prev_cli = false; // --test-batch-shrink-strands-prev: R035 — data_batch_size
+                                        // shrink strands the active prev. Drives the REAL set_data_batch_size chokepoint;
+                                        // asserts prev counters re-derived (gate reachable) + streaming defense on orphan. One-shot, exits rc.
+    bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
+                                        // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
+                                        // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
+    bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
+                                        // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
+                                        // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
                                         // up-shifter promotes only one rung past it. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §6.4.
+    bool test_shutdown_atomic_cli = false; // --test-shutdown-atomic: R006 — shutdown_ atomicity
+                                        // regression (race_audit R006). Compile-time static_assert (fail-before on
+                                        // pre-fix plain-bool tree) + cross-thread runtime smoke. One-shot, exits rc.
     bool test_probe_backoff_cli = false; // --test-probe-backoff: FIX-B floor-probe back-off regression
                                         // (gearshift-floor-probe-backoff.md §7). Drives the REAL arm/gate/reset/predicate
                                         // machinery + the v2 policy_evaluate_axis1 UP gate over the SIM virtual clock.
@@ -908,12 +1026,66 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-sack-oow-reject") == 0)
+        {
+            // R039 — OFDM SACK_RSP out-of-window reject regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.5 / §5.4.
+            test_sack_oow_reject_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-eob-poison-prev-retx") == 0)
+        {
+            // R038 — prev-retransmit EOB poison regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.4 / §5.3.
+            test_eob_poison_prev_retx_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batch-shrink-strands-prev") == 0)
+        {
+            // R035 — data_batch_size shrink strands active prev regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.3 / §5.2.
+            test_batch_shrink_strands_prev_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-retx-clear-on-recovery") == 0)
+        {
+            // R029 — stale retx queue cleared on recovery regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.1 / §5.1.
+            test_retx_clear_on_recovery_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-v2-pendingack-flip-alias") == 0)
+        {
+            // R030 — v2 PENDING_ACK flip aliasing regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+            test_v2_pendingack_flip_alias_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strcmp(argv[i], "--test-data-anchored-promote") == 0)
         {
             // Option B (data-anchored gearshift promotion) regression — one-shot
             // at startup, then exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §6.4.
             test_data_anchored_promote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-shutdown-atomic") == 0)
+        {
+            // R006 — shutdown_ atomicity regression — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §7.
+            test_shutdown_atomic_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1978,6 +2150,17 @@ start_modem:
             fflush(stdout);
             exit(0);
         }
+        if (test_shutdown_atomic_cli) {
+            // R006 — shutdown_ atomicity regression (one-shot, then exit rc).
+            // Free function on the main.cc global; no ARQ/telecom_system state.
+            printf("[FLAG] --test-shutdown-atomic: invoking R006 shutdown_ "
+                   "atomicity regression\n");
+            fflush(stdout);
+            int rc = test_shutdown_atomic();
+            printf("[FLAG] Shutdown-atomic test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
         if (test_partial_bsi_advance_cli != NULL) {
             // SACK partial-path BSI non-advance reproducer (one-shot, then exit).
             // Returns 0 on PASS, 1 on FAIL. Exit code propagates so test
@@ -2069,6 +2252,56 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_bigblock_climb_election();
             printf("[FLAG] Bigblock-climb-election test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_sack_oow_reject_cli) {
+            // R039 — OFDM SACK_RSP out-of-window reject (one-shot, then exit rc).
+            printf("[FLAG] --test-sack-oow-reject: invoking R039 OFDM SACK_RSP "
+                   "out-of-window reject regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_sack_oow_reject();
+            printf("[FLAG] Sack-oow-reject test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_eob_poison_prev_retx_cli) {
+            // R038 — prev-retransmit EOB poison (one-shot, then exit rc).
+            printf("[FLAG] --test-eob-poison-prev-retx: invoking R038 EOB-poison "
+                   "regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_eob_poison_prev_retx();
+            printf("[FLAG] Eob-poison test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_batch_shrink_strands_prev_cli) {
+            // R035 — data_batch_size shrink strands prev (one-shot, then exit rc).
+            printf("[FLAG] --test-batch-shrink-strands-prev: invoking R035 "
+                   "batch-shrink-strands-prev regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_strands_prev();
+            printf("[FLAG] Batch-shrink-strands-prev test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_retx_clear_on_recovery_cli) {
+            // R029 — stale retx queue cleared on recovery (one-shot, then exit rc).
+            printf("[FLAG] --test-retx-clear-on-recovery: invoking R029 "
+                   "retx-clear-on-recovery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_retx_clear_on_recovery();
+            printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_v2_pendingack_flip_alias_cli) {
+            // R030 — v2 PENDING_ACK flip aliasing (one-shot, then exit rc).
+            printf("[FLAG] --test-v2-pendingack-flip-alias: invoking R030 "
+                   "PENDING_ACK flip aliasing regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_v2_pendingack_flip_alias();
+            printf("[FLAG] V2-pendingack-flip-alias test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

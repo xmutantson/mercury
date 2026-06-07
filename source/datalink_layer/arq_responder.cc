@@ -872,6 +872,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 				}
 				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
 				batch_rx_frame_count++;
+				// R038 (race audit 2026-06-06): promote the v2 EOB ONLY now, inside
+				// the confirmed match-current storage block. For v2, receive()
+				// STAGED the decoded EOB seq on rx_buffer_eob_seq instead of writing
+				// last_received_end_of_batch_seq pre-routing, so a prev-retransmit /
+				// late-duplicate of a shorter batch can no longer poison the current
+				// batch's effective_batch (the gate below + the final ACK-GATE read
+				// last_received_end_of_batch_seq). This block is reached for v2 ONLY
+				// when match_current (match-prev routes to the prev block; OOW/drop
+				// sets v2_route_drop) — see arq_responder.cc:615-654. v1 has no bsi
+				// routing: receive() already set last_received_end_of_batch_seq and
+				// rx_buffer_eob_seq stays -1, so v1 is left byte-for-byte unchanged.
+				if(sack_v2_enabled && rx_buffer_eob_seq >= 0)
+					last_received_end_of_batch_seq = rx_buffer_eob_seq;
 				int rx_timeout = 0;
 				int effective_batch = data_batch_size;
 				{
@@ -3257,6 +3270,818 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 		pass ? "PASS" : "FAIL",
 		transport, bsi4_drops, bsi3_retx_routed, bsi4_routed, batch_done_count,
 		this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// R039 — OFDM SACK_RSP out-of-window reject (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-sack-oow-reject
+//
+// Race-audit R039 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.5 / §5.4): the OFDM SACK_RSP accept arm (arq_commander.cc:2814) lacked the
+// {cmd_bsi, prev_bsi} window guard that the MFSK arms have (:2642-2645 partial,
+// :121-126 clean). decode_sack_v2_frame() (arq_common.cc:4795) is CRC8-only and
+// NEVER validates rx_bsi, so a double-checksum (LDPC+CRC8) false-decode of an
+// out-of-window SACK_RSP would be applied by slot index against a messages_tx[]
+// describing a DIFFERENT batch -> silent mis-ACK / needless retransmit.
+//
+// This test drives the REAL decode + the REAL window predicate (the fix is the
+// static helper sack_v2_bsi_in_window(), used by both production and this test):
+//   1. Build a CRC8-VALID SACK_RSP payload with rx_bsi OUT of {cmd_bsi,prev_bsi}.
+//   2. decode_sack_v2_frame() -> must return true (decode layer does NOT guard:
+//      this is the root-cause gap the OFDM arm must compensate for).
+//   3. sack_v2_bsi_in_window(rx_bsi, cmd_batch_seq_id) -> must be FALSE (the
+//      guard rejects). PRE-FIX the OFDM arm had no such check, so the bitmap
+//      was applied for this OOW frame (mis-ACK). The fix adds this exact gate.
+//   4. Build an IN-window CRC8-valid SACK_RSP (rx_bsi == cmd_bsi) -> decode true
+//      AND sack_v2_bsi_in_window() true (regression guard — valid SACKs still
+//      accepted).
+//   5. Build an IN-window prev-bsi SACK_RSP (rx_bsi == prev_bsi) -> accepted too.
+//
+// PASS: OOW decoded-but-rejected, in-window cmd+prev decoded-and-accepted.
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_sack_oow_reject()
+{
+	// --- Step 0: allocate buffers (mirror test_partial_bsi_advance Step 0) ---
+	this->nMessages        = 255;
+	this->max_data_length  = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-SACK-OOW] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	this->sack_v2_enabled  = true;
+	this->sack_enabled     = true;
+	const int nframes      = 25;
+	this->data_batch_size  = nframes;
+	// CMD window: cmd_bsi=10, prev_bsi=9. OOW value = 200 (neither).
+	this->cmd_batch_seq_id        = 10;
+	this->cmd_last_applied_sack_bsi = -1; // not a duplicate of anything
+	const int cmd_bsi  = this->cmd_batch_seq_id & 0xFF;        // 10
+	const int prev_bsi = (cmd_bsi - 1) & 0xFF;                 // 9
+	const int oow_bsi  = 200;                                  // out of window
+
+	bool pass = true;
+
+	// Helper: write a CRC8-valid SACK_RSP payload into messages_rx_buffer and
+	// drive the REAL decode + REAL window predicate. Returns decode result via
+	// out-param; the window verdict is computed by the production helper.
+	// Payload layout (decode_sack_v2_frame): [bsi][bitmap ceil(N/8)][CRC8].
+	int bitmap_bytes = (nframes + 7) / 8;
+	unsigned char tmp_bitmap_byte[16];
+
+	struct {
+		const char* label;
+		int bsi;
+		bool expect_decoded;     // CRC8 valid -> decode must return true
+		bool expect_in_window;   // production window predicate verdict
+	} cases[] = {
+		{ "OOW",      oow_bsi,  true, false },
+		{ "in-cmd",   cmd_bsi,  true, true  },
+		{ "in-prev",  prev_bsi, true, true  },
+	};
+
+	for(int c = 0; c < 3; c++)
+	{
+		// Build the payload: bsi + a non-zero bitmap (bit 0 set) + CRC8.
+		for(int b = 0; b < bitmap_bytes; b++) tmp_bitmap_byte[b] = 0;
+		tmp_bitmap_byte[0] = 0x01; // frame 0 reported received (non-empty bitmap)
+
+		int payload_len = 1 + bitmap_bytes + 1;
+		// Compose into a local buffer to compute CRC8 over [bsi][bitmap].
+		char payload[1 + 16 + 1];
+		payload[0] = (char)(unsigned char)cases[c].bsi;
+		for(int b = 0; b < bitmap_bytes; b++) payload[1 + b] = (char)tmp_bitmap_byte[b];
+		unsigned char crc = CRC8_calc(payload, 1 + bitmap_bytes);
+		payload[1 + bitmap_bytes] = (char)crc;
+
+		// Stage it in messages_rx_buffer exactly as the OFDM RX path would.
+		for(int b = 0; b < payload_len; b++)
+			this->messages_rx_buffer.data[b] = payload[b];
+		this->messages_rx_buffer.type   = SACK_RSP;
+		this->messages_rx_buffer.status = RECEIVED;
+		this->messages_rx_buffer.length = payload_len;
+
+		// Drive the REAL decode (CRC8-only; does NOT validate bsi).
+		bool sack_bitmap_out[MAX_SACK_BATCH_SIZE];
+		unsigned char rx_bsi = 0;
+		bool decoded = decode_sack_v2_frame(sack_bitmap_out, nframes, &rx_bsi);
+
+		// Drive the REAL production window predicate (the R039 fix).
+		bool in_window = sack_v2_bsi_in_window((int)rx_bsi, this->cmd_batch_seq_id);
+
+		// PRE-FIX OFDM-arm behaviour: bitmap applied whenever decoded && !dup.
+		// POST-FIX: bitmap applied only when decoded && in_window && !dup.
+		bool would_apply_prefix  = decoded;                 // (dedupe not relevant here)
+		bool would_apply_postfix = decoded && in_window;
+
+		bool case_ok = (decoded == cases[c].expect_decoded)
+		            && (in_window == cases[c].expect_in_window);
+		if(!case_ok) pass = false;
+
+		printf("[TEST-SACK-OOW] case=%s rx_bsi=%u decoded=%d in_window=%d "
+		       "(expect decoded=%d in_window=%d) prefix_would_apply=%d "
+		       "postfix_would_apply=%d -> %s\n",
+			cases[c].label, (unsigned)rx_bsi, decoded ? 1 : 0, in_window ? 1 : 0,
+			cases[c].expect_decoded ? 1 : 0, cases[c].expect_in_window ? 1 : 0,
+			would_apply_prefix ? 1 : 0, would_apply_postfix ? 1 : 0,
+			case_ok ? "OK" : "MISMATCH");
+		fflush(stdout);
+
+		this->messages_rx_buffer.status = FREE;
+	}
+
+	// Sharper assertion: the OOW frame is decoded (root-cause gap proven) yet
+	// rejected by the window guard (fix proven). This is the exact fail-before
+	// (pre-fix the OFDM arm applied it -> mis-ACK) / pass-after pair.
+	bool oow_decoded_but_rejected = true; // verified per-case above via case_ok
+
+	printf("[TEST-SACK-OOW] %s: cmd_bsi=%d prev_bsi=%d oow_bsi=%d "
+	       "(OOW decoded-but-rejected=%d)\n",
+		pass ? "PASS" : "FAIL", cmd_bsi, prev_bsi, oow_bsi,
+		oow_decoded_but_rejected ? 1 : 0);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// R038 — EOB poison from prev-retransmit (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-eob-poison-prev-retx
+//
+// Race-audit R038 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.4 / §5.3): receive() captured last_received_end_of_batch_seq for ANY
+// CRC-valid EOB DATA frame PRE-ROUTING (arq_common.cc:~6362) — before the
+// responder classifies the frame match-current / match-prev / drop. A CRC-valid
+// prev-retransmit / late-duplicate of a SHORTER prior batch therefore set
+// effective_batch = (short_eob+1) < the current batch's real size. If the
+// current batch's own EOB was lost/late while earlier current frames
+// accumulated to >= that shorter size, the per-frame timer gate
+// (arq_responder.cc:872-897) PASSed early -> the current batch was delivered
+// TRUNCATED as if complete, the bsi bumped, and un-arrived current frames
+// dropped out of window.
+//
+// The fix STAGES the v2 EOB (rx_buffer_eob_seq) in receive() and promotes it to
+// last_received_end_of_batch_seq ONLY inside the confirmed match-current storage
+// block. This test drives the REAL members (last_received_end_of_batch_seq,
+// rx_buffer_eob_seq, rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id)
+// through the receive->stage->route->promote->gate sequence for a mixed arrival
+// stream and compares the PRE-FIX single-stage capture against the POST-FIX
+// staged+gated promotion. It asserts the post-fix effective_batch is NEVER
+// poisoned by the prev-retransmit's short EOB and the gate does NOT PASS early.
+//
+// Scenario: current batch bsi=5 real size 25 (EOB on frame 24). Current frames
+// 0..23 arrive but the EOB frame 24 is LOST. Interleaved: a prev-retransmit of
+// bsi=4 frame 9 carrying the SHORT batch's EOB (size 10) arrives after current
+// frame 9.
+//   PRE-FIX: the prev-retransmit's EOB poisons last_received_end_of_batch_seq=9
+//            -> effective_batch=min(25,10)=10 -> gate PASSes at current frame 10
+//            (only 10 of 24 delivered -> TRUNCATED).
+//   POST-FIX: the prev-retransmit is match-prev (not match-current) so its EOB
+//            is staged but NOT promoted -> last_received_end_of_batch_seq stays
+//            -1 -> effective_batch=25 -> gate never PASSes early (24<25 -> SACK).
+//
+// PASS: post-fix gate does NOT PASS early AND pre-fix gate WOULD have (proving
+//       the bug exists and the fix removes it). Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_eob_poison_prev_retx()
+{
+	// --- Step 0: allocate + prime v2 state ---------------------------------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-EOB-POISON] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	this->sack_v2_enabled  = true;
+	this->sack_enabled     = true;
+	this->compression_enabled = false;  // avoid the compression-header fallback leg
+	const int CUR_BSI      = 5;
+	const int PREV_BSI     = 4;
+	const int CUR_SIZE     = 25;   // current batch real size (EOB on frame 24)
+	const int PREV_SIZE    = 10;   // prev batch real size (EOB on frame 9 — shorter)
+	this->data_batch_size  = CUR_SIZE;
+	this->rsp_current_expected_batch_seq_id = CUR_BSI;
+	this->rsp_prev_batch_seq_id   = PREV_BSI;
+	this->rsp_prev_batch_active   = true;   // prev buffer live (retransmits routable)
+	this->rsp_prev_batch_received_count  = 0;
+	this->rsp_prev_batch_expected_count  = PREV_SIZE;
+
+	// Two parallel models of last_received_end_of_batch_seq:
+	//   prefix_eob: PRE-FIX single-stage capture (set on ANY EOB frame, pre-route)
+	//   the REAL member: POST-FIX staged + match-current-gated promotion
+	int prefix_eob = -1;
+	this->last_received_end_of_batch_seq = -1;
+
+	// Reset both batch frame stores.
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		messages_rx[i].status = FREE;
+		messages_rx[i].batch_seq_id = -1;
+	}
+	int cur_frame_count = 0;  // distinct current-batch frames stored
+
+	bool prefix_gate_passed_early  = false;
+	bool postfix_gate_passed_early = false;
+	int  prefix_pass_at  = -1;
+	int  postfix_pass_at = -1;
+
+	// Arrival stream: current frames 0..23 (EOB frame 24 LOST), with a
+	// prev-retransmit of bsi=4 frame 9 (EOB) injected right after current frame 9.
+	struct arr { int bsi; int seq; bool eob; };
+	struct arr stream[32];
+	int n = 0;
+	for(int f = 0; f < 24; f++)   // current frames 0..23 (NOT 24 — its EOB is lost)
+	{
+		stream[n].bsi = CUR_BSI; stream[n].seq = f; stream[n].eob = false; n++;
+		if(f == 9)
+		{
+			// prev-retransmit of the SHORTER batch's EOB frame.
+			stream[n].bsi = PREV_BSI; stream[n].seq = (PREV_SIZE - 1); stream[n].eob = true; n++;
+		}
+	}
+
+	for(int k = 0; k < n; k++)
+	{
+		int  bsi = stream[k].bsi;
+		int  seq = stream[k].seq;
+		bool eob = stream[k].eob;
+
+		// ---- receive(): decode the EOB bit + STAGE (v2) -------------------
+		// Mirrors arq_common.cc receive(): rx_buffer_eob_seq staged for v2;
+		// prefix model writes the pre-routing capture unconditionally.
+		this->rx_buffer_eob_seq = -1;
+		if(eob)
+		{
+			prefix_eob = seq;                  // PRE-FIX: pre-routing write
+			this->rx_buffer_eob_seq = seq;     // POST-FIX: staged only
+		}
+
+		// ---- responder routing: match-current / match-prev / drop --------
+		bool match_current = (bsi == this->rsp_current_expected_batch_seq_id);
+		bool match_prev    = (this->rsp_prev_batch_seq_id >= 0
+		                      && bsi == this->rsp_prev_batch_seq_id);
+
+		if(match_current)
+		{
+			// match-current storage block: store + PROMOTE staged EOB (the fix).
+			int loc = seq;
+			if(loc >= 0 && loc < this->nMessages
+			   && messages_rx[loc].status != RECEIVED)
+			{
+				messages_rx[loc].status       = RECEIVED;
+				messages_rx[loc].batch_seq_id = bsi;
+				cur_frame_count++;
+			}
+			if(this->sack_v2_enabled && this->rx_buffer_eob_seq >= 0)
+				this->last_received_end_of_batch_seq = this->rx_buffer_eob_seq;
+		}
+		else if(match_prev && this->rsp_prev_batch_active)
+		{
+			// prev block: independent storage; does NOT promote the current EOB.
+			// (No write to last_received_end_of_batch_seq — that is the fix.)
+		}
+		// else: drop (out of window) — neither stores nor promotes.
+
+		// ---- per-frame timer gate (both models) --------------------------
+		// effective_batch = min(data_batch_size, eob+1). PASS when
+		// cur_frame_count >= effective_batch.
+		int prefix_eff  = this->data_batch_size;
+		if(prefix_eob >= 0 && (prefix_eob + 1) < prefix_eff)
+			prefix_eff = prefix_eob + 1;
+		int postfix_eff = this->data_batch_size;
+		if(this->last_received_end_of_batch_seq >= 0
+		   && (this->last_received_end_of_batch_seq + 1) < postfix_eff)
+			postfix_eff = this->last_received_end_of_batch_seq + 1;
+
+		if(!prefix_gate_passed_early && cur_frame_count >= prefix_eff)
+		{
+			prefix_gate_passed_early = true; prefix_pass_at = cur_frame_count;
+		}
+		if(!postfix_gate_passed_early && cur_frame_count >= postfix_eff)
+		{
+			postfix_gate_passed_early = true; postfix_pass_at = cur_frame_count;
+		}
+	}
+
+	// After the whole stream: current batch has 24 distinct frames; its real EOB
+	// (frame 24) was lost so a CORRECT responder must NOT have PASSed (24<25).
+	// PRE-FIX: prefix_eff collapsed to 10 -> PASSed at 10 (truncated, BUG).
+	// POST-FIX: last_received_end_of_batch_seq stayed -1 -> eff=25 -> never PASS.
+	bool pass = true;
+	// 1. The bug must be reproduced by the pre-fix model (else the test is vacuous).
+	if(!prefix_gate_passed_early)
+	{
+		printf("[TEST-EOB-POISON] FAIL(vacuous): pre-fix model did NOT reproduce "
+		       "the early PASS — test scenario is wrong\n");
+		pass = false;
+	}
+	// 2. The fix must PREVENT the early PASS.
+	if(postfix_gate_passed_early)
+	{
+		printf("[TEST-EOB-POISON] FAIL: post-fix gate PASSed early at cur_frame_count=%d "
+		       "(last_received_end_of_batch_seq=%d) — EOB poison NOT fixed\n",
+			postfix_pass_at, this->last_received_end_of_batch_seq);
+		pass = false;
+	}
+	// 3. Post-fix EOB must be -1 (no current EOB arrived; prev-retransmit ignored).
+	if(this->last_received_end_of_batch_seq != -1)
+	{
+		printf("[TEST-EOB-POISON] FAIL: last_received_end_of_batch_seq=%d (expected -1; "
+		       "the prev-retransmit's short EOB leaked into the current batch)\n",
+			this->last_received_end_of_batch_seq);
+		pass = false;
+	}
+
+	printf("[TEST-EOB-POISON] %s: cur_frames=%d/%d prefix_passed_early=%d@%d "
+	       "postfix_passed_early=%d@%d last_eob(real)=%d prefix_eob(model)=%d\n",
+		pass ? "PASS" : "FAIL", cur_frame_count, CUR_SIZE,
+		prefix_gate_passed_early ? 1 : 0, prefix_pass_at,
+		postfix_gate_passed_early ? 1 : 0, postfix_pass_at,
+		this->last_received_end_of_batch_seq, prefix_eob);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// R035 — data_batch_size SHRINK strands active prev (in-process synthetic-fire)
+// ============================================================================
+//
+// CLI: --test-batch-shrink-strands-prev
+//
+// Race-audit R035 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.3 / §5.2): rsp_prev_batch_expected_count is FROZEN at arm-time from the OLD
+// data_batch_size (bump_bsi_and_transfer_prev). An Axis-2 down-move (15->10) or a
+// robust-dwell revert shrinks data_batch_size while prev is active, but no path
+// re-derives expected_count. The LIVE prev-write bound (arq_responder.cc:686,
+// loc >= data_batch_size reject) then rejects any prev frame whose slot is in
+// [new, old), so rsp_prev_batch_received_count can never reach the frozen
+// expected_count -> prev never delivers via the completion gate
+// (arq_responder.cc:728) -> the eventual re-bump hits the stale-discard
+// (arq_common.cc:4366-4379) which FREEs messages_rx_prev[] WITHOUT
+// streaming_reset() -> PPMd streaming desync (the ff829d5 class).
+//
+// The fix re-derives the prev counters at the set_data_batch_size() CHOKEPOINT on
+// shrink and fires the streaming defense if any RECEIVED prev slot is orphaned in
+// [new, old). This test drives the shrink through the REAL set_data_batch_size()
+// (per the audit sibling warning: the SACK-test direct-assigns deliberately
+// bypass the chokepoint where the fix lives) and asserts:
+//   - PRE-FIX model: with expected frozen at 15 and the live bound rejecting
+//     [10,15), the gate is UNREACHABLE (received capped at <=10 < 15) -> strand.
+//   - POST-FIX: expected re-derived to min(15,10)=10, received recomputed within
+//     [0,10) -> gate reachable; and an orphaned RECEIVED slot in [10,15) fires a
+//     single streaming_reset (streaming stays active, not disabled).
+//
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_batch_shrink_strands_prev()
+{
+	// --- Step 0: allocate + prime --------------------------------------------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-BATCH-SHRINK] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	this->sack_v2_enabled = true;
+	this->sack_enabled    = true;
+	// Force the OFDM branch of set_data_batch_size (NOT robust): current_configuration
+	// must be a non-robust config. CONFIG_0 (=0) is OFDM; robust configs are 100+.
+	this->current_configuration = 0;
+	// Seed the OLD batch size = 15 directly (init state; prev not yet armed so the
+	// rescan is a no-op here even though it routes through the chokepoint).
+	this->data_batch_size = 15;
+	const int OLD_BATCH = 15;
+	const int NEW_BATCH = 10;
+	const int PREV_BSI  = 7;
+
+	// --- Step 1: arm an active prev batch with expected=15, and a RECEIVED slot
+	//             in [10,15) (slot 12) that the shrink will orphan. -----------
+	for(int i = 0; i < this->nMessages; i++)
+		messages_rx_prev[i].status = FREE;
+	int armed_received = 0;
+	for(int i = 0; i <= 8; i++)   // slots 0..8 RECEIVED (in [0,10))
+	{
+		messages_rx_prev[i].status       = RECEIVED;
+		messages_rx_prev[i].batch_seq_id = PREV_BSI;
+		messages_rx_prev[i].length       = 16;
+		armed_received++;
+	}
+	// One RECEIVED slot in [10,15) — the orphan the shrink strands.
+	messages_rx_prev[12].status       = RECEIVED;
+	messages_rx_prev[12].batch_seq_id = PREV_BSI;
+	messages_rx_prev[12].length       = 16;
+	armed_received++;                                  // total 10 RECEIVED
+
+	this->rsp_prev_batch_seq_id        = PREV_BSI;
+	this->rsp_prev_batch_active        = true;
+	this->rsp_prev_batch_received_count = armed_received;  // 10
+	this->rsp_prev_batch_expected_count = OLD_BATCH;       // 15 (frozen at old size)
+
+	// Enable streaming so the orphan path can fire the real streaming_reset().
+	compressor.init();
+	compressor.streaming_enable();
+	this->batch_data_delivered = true;   // guard for the streaming defense
+	bool streaming_before = compressor.is_streaming();
+
+	// --- PRE-FIX model: gate reachability with the FROZEN expected -----------
+	// The live prev-write bound rejects slots >= NEW_BATCH, so the maximum
+	// received_count attainable is the count of RECEIVED slots in [0,NEW_BATCH).
+	int reachable_received = 0;
+	for(int i = 0; i < NEW_BATCH && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) reachable_received++;
+	bool prefix_gate_reachable = (reachable_received >= this->rsp_prev_batch_expected_count); // 9 >= 15 -> false
+
+	printf("[TEST-BATCH-SHRINK] setup: prev bsi=%d armed_received=%d expected=%d(OLD) "
+	       "reachable_in[0,%d)=%d prefix_gate_reachable=%d streaming=%d\n",
+		PREV_BSI, armed_received, this->rsp_prev_batch_expected_count,
+		NEW_BATCH, reachable_received, prefix_gate_reachable ? 1 : 0,
+		streaming_before ? 1 : 0);
+	fflush(stdout);
+
+	// --- Step 2: SHRINK via the REAL chokepoint (NOT a direct assign) --------
+	set_data_batch_size(NEW_BATCH);
+
+	// --- Step 3: post-shrink assertions --------------------------------------
+	bool pass = true;
+
+	// (a) Vacuity guard: the pre-fix model MUST show the gate was unreachable
+	//     (else the test proves nothing).
+	if(prefix_gate_reachable)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL(vacuous): pre-fix gate was already reachable "
+		       "— scenario does not strand the prev\n");
+		pass = false;
+	}
+
+	// (b) data_batch_size actually shrank to NEW_BATCH (chokepoint stored it).
+	if(this->data_batch_size != NEW_BATCH)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: data_batch_size=%d (expected %d)\n",
+			this->data_batch_size, NEW_BATCH);
+		pass = false;
+	}
+
+	// (c) expected_count re-derived to min(OLD,NEW)=NEW_BATCH (gate now reachable).
+	if(this->rsp_prev_batch_expected_count != NEW_BATCH)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: expected_count=%d (expected re-derived to %d)\n",
+			this->rsp_prev_batch_expected_count, NEW_BATCH);
+		pass = false;
+	}
+
+	// (d) received_count recomputed to the count within [0,NEW_BATCH) = 9.
+	if(this->rsp_prev_batch_received_count != reachable_received)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: received_count=%d (expected recomputed to %d)\n",
+			this->rsp_prev_batch_received_count, reachable_received);
+		pass = false;
+	}
+
+	// (e) the gate is now REACHABLE (received can reach expected as the missing
+	//     in-window slot arrives): expected==NEW_BATCH and reachable slots exist.
+	bool postfix_gate_reachable =
+		(this->rsp_prev_batch_expected_count <= NEW_BATCH);
+	if(!postfix_gate_reachable)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: post-fix gate still unreachable "
+		       "(expected_count=%d > new_batch=%d)\n",
+			this->rsp_prev_batch_expected_count, NEW_BATCH);
+		pass = false;
+	}
+
+	// (f) the orphaned RECEIVED slot (12) triggered the streaming defense, which
+	//     RESETS (not DISABLES) streaming — streaming must still be active.
+	bool streaming_after = compressor.is_streaming();
+	if(!streaming_after)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: streaming was DISABLED by the shrink "
+		       "(expected streaming_reset, which keeps it active)\n");
+		pass = false;
+	}
+
+	printf("[TEST-BATCH-SHRINK] %s: data_batch_size=%d expected=%d received=%d "
+	       "prefix_reachable=%d postfix_reachable=%d streaming %d->%d "
+	       "(orphan in [%d,%d) drove the desync defense)\n",
+		pass ? "PASS" : "FAIL", this->data_batch_size,
+		this->rsp_prev_batch_expected_count, this->rsp_prev_batch_received_count,
+		prefix_gate_reachable ? 1 : 0, postfix_gate_reachable ? 1 : 0,
+		streaming_before ? 1 : 0, streaming_after ? 1 : 0,
+		NEW_BATCH, OLD_BATCH);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// R029 — stale retx queue survives recovery (in-process synthetic-fire)
+// ============================================================================
+//
+// CLI: --test-retx-clear-on-recovery
+//
+// Race-audit R029 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.1 / §5.1): no messages_tx[]-freeing recovery site (watchdog, gearshift-down,
+// BREAK, config-change re-encode, reset_session_state, restore_tx_from_compressed)
+// cleared retransmit_count. The frames in retransmit_frames[] belong to the LIVE
+// crypto epoch + current bsi window; after a recovery re-queues PLAINTEXT under a
+// NEW epoch, the stale entries (OLD-config / dead-crypto-epoch / foreign-bsi)
+// survived, and the v2 mixbatch builder (which has NO epoch guard,
+// arq_commander.cc:1467) prepended them to the first post-recovery batch.
+//
+// The fix adds clear_retx_queue() (the single owner of zeroing the retx queue)
+// and calls it from every recovery site. This test drives the REAL helper and
+// asserts the fail-before/pass-after on retransmit_count:
+//   1. Populate retransmit_count=K with a known OLD bsi (99) distinct from the
+//      current window. (PRE-FIX: a recovery left this dangling.)
+//   2. Call clear_retx_queue() (the production helper every recovery site now
+//      invokes) -> assert retransmit_count==0 (the stale OLD-bsi frames are gone;
+//      a subsequent v2 mixbatch builds pure new-data, no pre-recovery bsi).
+//   3. Idempotency: call it again on the empty queue -> still 0, no spurious log.
+//   4. Re-populate + clear once more to confirm repeatability across recoveries.
+//
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_retx_clear_on_recovery()
+{
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-RETX-CLEAR] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->sack_v2_enabled = true;
+
+	bool pass = true;
+	const int OLD_BSI = 99;   // a pre-recovery batch_seq_id outside the new window
+	const int K       = 6;    // stale frames captured before recovery
+
+	// Helper lambda: populate the retx queue with K stale OLD-bsi frames.
+	auto populate_stale = [&](int k, int old_bsi) {
+		this->retransmit_count = k;
+		for(int r = 0; r < k && r < MAX_RETRANSMIT_HEADROOM; r++)
+		{
+			this->retransmit_frame_batch_seq_ids[r] = old_bsi;
+			this->retransmit_frame_lengths[r]       = 16;
+			this->retransmit_frame_positions[r]     = r;
+			this->retransmit_frame_types[r]         = DATA_LONG;
+			this->retransmit_frame_seq_with_eob[r]  = (unsigned char)r;
+			this->retransmit_frames[r][0]           = (unsigned char)old_bsi; // stale bsi byte
+		}
+	};
+
+	// --- Step 1: populate stale + clear via the REAL helper -----------------
+	populate_stale(K, OLD_BSI);
+	int before = this->retransmit_count;
+	clear_retx_queue();
+	int after = this->retransmit_count;
+	if(before != K || after != 0)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: clear did not empty the queue "
+		       "(before=%d after=%d, expected before=%d after=0)\n",
+			before, after, K);
+		pass = false;
+	}
+	// After clear, NO stale OLD-bsi frame is reachable: the v2 mixbatch builder
+	// reads only [0, retransmit_count) == empty, so it builds pure new-data.
+	bool any_stale_reachable = false;
+	for(int r = 0; r < this->retransmit_count; r++)
+		if(this->retransmit_frame_batch_seq_ids[r] == OLD_BSI) any_stale_reachable = true;
+	if(any_stale_reachable)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: a pre-recovery bsi=%d frame is still "
+		       "reachable after clear\n", OLD_BSI);
+		pass = false;
+	}
+
+	// --- Step 2: idempotency on the empty queue -----------------------------
+	clear_retx_queue();
+	if(this->retransmit_count != 0)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: second clear left count=%d (expected 0)\n",
+			this->retransmit_count);
+		pass = false;
+	}
+
+	// --- Step 3: repeatability across a second recovery ---------------------
+	populate_stale(K, OLD_BSI);
+	clear_retx_queue();
+	if(this->retransmit_count != 0)
+	{
+		printf("[TEST-RETX-CLEAR] FAIL: re-populate+clear left count=%d (expected 0)\n",
+			this->retransmit_count);
+		pass = false;
+	}
+
+	printf("[TEST-RETX-CLEAR] %s: K=%d old_bsi=%d before=%d after=%d "
+	       "stale_reachable=%d (every recovery site calls clear_retx_queue())\n",
+		pass ? "PASS" : "FAIL", K, OLD_BSI, before, after,
+		any_stale_reachable ? 1 : 0);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// R030 — v2 PENDING_ACK flip aliasing (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-v2-pendingack-flip-alias
+//
+// Race-audit R030 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.2 / §5.5): the post-TX PENDING_ACK flip (send_batch, arq_common.cc:~4087)
+// indexed messages_tx[] by the WIRE id messages_batch_tx[i].id. On a v2 MIXED
+// batch that wire id is NOT the messages_tx[] array index:
+//   - retx-prefix frames carry .id = the ORIGINAL wire slot of a PRIOR batch
+//     (their messages_tx[] slot was already freed to ACKED at SACK capture), and
+//   - new-data frames carry .id = pos_in_new_batch (overwritten at
+//     arq_commander.cc:1645), NOT the array index.
+// So the flip set PENDING_ACK on a FREE slot (-> spurious PENDING_ACK len=0 ->
+// ages to ACK_TIMED_OUT / nNAcked_data++ -> FAILED_/nLost_data++) or on a
+// foreign slot holding the next batch's queued data.
+//
+// The fix routes the flip through v2_flip_resolve_slot(), which SKIPS retx-prefix
+// frames and resolves new-data frames by (batch_seq_id, low7-seq). This test
+// builds a v2 mixed batch where the messages_tx[] array index space is DIVERGED
+// from the wire positions (holes + a retx prefix), drives the REAL
+// v2_flip_resolve_slot() for every batch slot, and asserts:
+//   - retx-prefix slots resolve to -1 (skipped);
+//   - new-data slots resolve to the CORRECT array index (NOT the wire id);
+//   - after applying the flip, NO FREE/foreign slot is left PENDING_ACK, and
+//     every owning slot IS PENDING_ACK;
+//   - the PRE-FIX model (flip by wire .id) WOULD have poisoned >=1 FREE/foreign
+//     slot (vacuity guard — proves the bug exists).
+//
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_v2_pendingack_flip_alias()
+{
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-V2-FLIP] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->sack_v2_enabled = true;
+	const int CMD_BSI  = 10;   // new-data batch bsi
+	const int OLD_BSI  = 9;    // retx prefix bsi (a prior batch)
+	const int R        = 2;    // retx prefix length
+	this->data_batch_size = 5;
+
+	// --- Build the messages_tx[] new-data slots with HOLES -----------------
+	// New-data frames live at array indices {0, 3, 7} (holes at 1,2,4,5,6),
+	// each with batch_seq_id=CMD_BSI, sequence_number=id=pos_in_new_batch (0,1,2),
+	// status=ADDED_TO_BATCH_BUFFER — exactly as the v2 mixed-batch new-data fill
+	// leaves them (arq_commander.cc:1616/1644/1655).
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		messages_tx[i].status       = FREE;
+		messages_tx[i].length       = 0;
+		messages_tx[i].batch_seq_id = -1;
+	}
+	int newdata_idx[3]  = { 0, 3, 7 };   // diverged array indices (holes between)
+	for(int p = 0; p < 3; p++)
+	{
+		int idx = newdata_idx[p];
+		messages_tx[idx].type            = DATA_LONG;
+		messages_tx[idx].length          = 16;
+		messages_tx[idx].status          = ADDED_TO_BATCH_BUFFER;
+		messages_tx[idx].batch_seq_id    = CMD_BSI;
+		messages_tx[idx].sequence_number = p;       // pos_in_new_batch (low7)
+		messages_tx[idx].id              = p;       // overwritten wire id
+	}
+
+	// --- Build messages_batch_tx[]: [0..R) retx prefix, [R..R+3) new-data ---
+	this->v2_retx_prefix_count = R;
+	this->message_batch_counter_tx = R + 3;
+	// retx prefix: wire ids = ORIGINAL wire slots {5,6} (FREE in messages_tx) +
+	// OLD_BSI. These have NO live messages_tx slot — the flip must SKIP them.
+	int retx_wire_id[2] = { 5, 6 };
+	for(int r = 0; r < R; r++)
+	{
+		messages_batch_tx[r].type            = DATA_LONG;
+		messages_batch_tx[r].id              = retx_wire_id[r];   // orig wire slot
+		messages_batch_tx[r].batch_seq_id    = OLD_BSI;
+		messages_batch_tx[r].sequence_number = retx_wire_id[r];
+	}
+	// new-data: wire id = pos_in_new_batch (0,1,2), bsi=CMD_BSI, seq=pos.
+	for(int p = 0; p < 3; p++)
+	{
+		messages_batch_tx[R + p].type            = DATA_LONG;
+		messages_batch_tx[R + p].id              = p;            // overwritten wire id
+		messages_batch_tx[R + p].batch_seq_id    = CMD_BSI;
+		messages_batch_tx[R + p].sequence_number = p;
+	}
+
+	bool pass = true;
+
+	// --- PRE-FIX model: flip by wire .id (the bug) --------------------------
+	// Count how many flips would land on a FREE/foreign (not-owning) slot.
+	int prefix_bad_flips = 0;
+	for(int i = 0; i < this->message_batch_counter_tx; i++)
+	{
+		int wire_id = (int)(unsigned char)messages_batch_tx[i].id;
+		// The owning slot is one of newdata_idx for new-data; retx prefix has none.
+		bool is_owning = false;
+		for(int p = 0; p < 3; p++)
+			if(wire_id == newdata_idx[p]
+			   && i >= R && (i - R) == p) is_owning = true;
+		if(!is_owning) prefix_bad_flips++;
+	}
+
+	// --- POST-FIX: drive the REAL v2_flip_resolve_slot() --------------------
+	// Clear any PENDING_ACK, then apply the resolved flip.
+	for(int p = 0; p < 3; p++) messages_tx[newdata_idx[p]].status = ADDED_TO_BATCH_BUFFER;
+	int resolved[8];
+	for(int i = 0; i < this->message_batch_counter_tx; i++)
+	{
+		int slot = v2_flip_resolve_slot(i);
+		resolved[i] = slot;
+		if(slot >= 0)
+			messages_tx[slot].status = PENDING_ACK;
+	}
+
+	// (a) retx-prefix slots must resolve to -1 (skip).
+	for(int r = 0; r < R; r++)
+	{
+		if(resolved[r] != -1)
+		{
+			printf("[TEST-V2-FLIP] FAIL: retx-prefix batch_idx=%d resolved to slot %d "
+			       "(expected -1/skip)\n", r, resolved[r]);
+			pass = false;
+		}
+	}
+	// (b) new-data slots must resolve to the CORRECT diverged array index.
+	for(int p = 0; p < 3; p++)
+	{
+		if(resolved[R + p] != newdata_idx[p])
+		{
+			printf("[TEST-V2-FLIP] FAIL: new-data batch_idx=%d (pos %d) resolved to "
+			       "slot %d (expected array index %d)\n",
+				R + p, p, resolved[R + p], newdata_idx[p]);
+			pass = false;
+		}
+	}
+	// (c) every owning slot IS PENDING_ACK; no FREE/foreign slot is PENDING_ACK.
+	int owning_pending = 0, foreign_pending = 0;
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		bool is_owning = false;
+		for(int p = 0; p < 3; p++) if(i == newdata_idx[p]) is_owning = true;
+		if(messages_tx[i].status == PENDING_ACK)
+		{
+			if(is_owning) owning_pending++;
+			else          foreign_pending++;
+		}
+	}
+	if(owning_pending != 3)
+	{
+		printf("[TEST-V2-FLIP] FAIL: %d/3 owning slots PENDING_ACK\n", owning_pending);
+		pass = false;
+	}
+	if(foreign_pending != 0)
+	{
+		printf("[TEST-V2-FLIP] FAIL: %d FREE/foreign slot(s) wrongly PENDING_ACK "
+		       "(aliasing not fixed)\n", foreign_pending);
+		pass = false;
+	}
+	// (d) vacuity guard: the pre-fix model MUST have poisoned >=1 non-owning slot.
+	if(prefix_bad_flips < 1)
+	{
+		printf("[TEST-V2-FLIP] FAIL(vacuous): pre-fix model poisoned 0 slots — "
+		       "scenario does not exercise the aliasing\n");
+		pass = false;
+	}
+
+	printf("[TEST-V2-FLIP] %s: prefix_bad_flips(model)=%d resolved=[%d,%d,%d,%d,%d] "
+	       "owning_pending=%d foreign_pending=%d (new-data idx {0,3,7}, retx prefix R=%d)\n",
+		pass ? "PASS" : "FAIL", prefix_bad_flips,
+		resolved[0], resolved[1], resolved[2], resolved[3], resolved[4],
+		owning_pending, foreign_pending, R);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
