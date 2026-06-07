@@ -474,6 +474,9 @@ int main(int argc, char *argv[])
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
                                         // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
                                         // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
+    bool test_bigblock_chanest_cli = false; // --test-bigblock-chanest: GENUINE (ref==NULL) 2-instance CFG16 big-block
+                                        // decode under a CFO/SFO-impaired channel; reproduces the HW [RXACQ] meanH
+                                        // collapse off-bench (clean passes, CFO/SFO collapses the block estimate).
     bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
@@ -1009,6 +1012,16 @@ int main(int argc, char *argv[])
             // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
             // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
             test_bigblock_multicw_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-chanest") == 0)
+        {
+            // GENUINE channel-estimation regression (fix/bigblock-chanest): the 2-instance
+            // CFG16 big-block decode (ref==NULL) under a CFO/SFO-impaired channel. Reproduces
+            // the HW [RXACQ] meanH collapse OFF-BENCH (clean default passes; CFO/SFO collapses
+            // the block-wide estimate -> 0-delivery). One-shot.
+            test_bigblock_chanest_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2244,6 +2257,19 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
             printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_chanest_cli) {
+            // GENUINE channel-estimation regression (fix/bigblock-chanest): drive the 2-instance
+            // CFG16 big-block decode (ref==NULL) under a CFO/SFO-impaired channel; assert the
+            // block-wide estimate collapses (fail-before) and recovers byte-faithful (pass-after).
+            // Reproduces the HW [RXACQ] meanH~0.005 collapse off-bench. One-shot, then exit rc.
+            printf("[FLAG] --test-bigblock-chanest: invoking GENUINE big-block channel-estimation "
+                   "regression (CFO/SFO-impaired 2-instance decode)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_chanest();
+            printf("[FLAG] Bigblock-chanest test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

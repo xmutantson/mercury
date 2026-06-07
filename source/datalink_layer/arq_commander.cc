@@ -11159,6 +11159,7 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	return failed == 0 ? 0 : 1;
 }
 
+
 // ============================================================================
 // GAP-2 LIVE-PATH REGRESSION (diag/livepath-sim): the cross-layer test the PINNED
 // fullpath/multicw could NOT catch.

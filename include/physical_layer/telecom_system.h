@@ -689,6 +689,13 @@ public:
 	std::vector<int> bigblock_last_rx_cw_ok;
 	int bigblock_last_rx_K = 0;
 	int bigblock_last_rx_cw_ok_count = 0;
+	// CHANNEL-ESTIMATION HEALTH stash (fix/bigblock-chanest): the mean |estimated_channel|
+	// over the last big-block RX. Healthy ~0.24 (the big-block raw |H| scale on the clean
+	// calibrated sim cell); collapses toward ~0 when an un-tracked CFO/SFO ramps a rotating
+	// phasor across the 133-symbol block (the genuine-path defect). Set unconditionally in
+	// bigblock_rx_passband so the genuine 2-instance test can assert on it directly (the
+	// DIAG print is env-gated; this stash is always live).
+	double bigblock_last_rx_meanh = -1.0;
 
 	// CFG16 CARVE-GATE HARDENING (cfg16-controlack-hold, GAP3): a one-shot RX
 	// intent override that SUPPRESSES the big-block route in receive_byte for the

@@ -7418,6 +7418,14 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	std::vector<std::complex<double>> deframed(nData);
 	ofdm.deframer(eq.data(), deframed.data());
 
+	// CHANNEL-ESTIMATION HEALTH stash (fix/bigblock-chanest): always-on mean|H| over the
+	// estimated channel grid so the genuine 2-instance regression can assert the estimate
+	// did not collapse (the DIAG print below is env-gated; this stash is unconditional).
+	{
+		double hmag=0.0; for(int ci=0;ci<Ngrid*Nc;ci++) hmag+=std::abs((ofdm.estimated_channel+ci)->value);
+		bigblock_last_rx_meanh = (Ngrid*Nc>0) ? hmag/(double)(Ngrid*Nc) : -1.0;
+	}
+
 	// [DIAG-RXPB] instrument nv, mean|H|, post-EQ deframed constellation RMS.
 	if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))
 	{

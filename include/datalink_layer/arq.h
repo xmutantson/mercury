@@ -1391,6 +1391,16 @@ public:
   // Reset to -1 by the regression before each arm.
   static int  bigblock_first_clean;
   static int  bigblock_first_K;
+  // CHANNEL-ESTIMATION HEALTH (fix/bigblock-chanest): the big-block RX mean|H| of the FIRST
+  // block carved this run. The genuine 2-instance regression (test_sim_inproc_bigblock_chanest)
+  // asserts it stays healthy (collapses toward 0 when an un-tracked CFO/SFO ramps a rotating
+  // phasor across the 133-symbol block — the off-bench reproduction of the HW [RXACQ] defect).
+  static double bigblock_first_meanh;
+
+  // GENUINE big-block channel-estimation regression: drive the 2-instance SIM_INPROC CFG16
+  // big-block decode through the REAL ref==NULL path with a CFO/SFO-impaired channel; assert
+  // mean|H| collapse + 0-delivery (fail-before) and recovery to byte-faithful (pass-after).
+  static int test_sim_inproc_bigblock_chanest();
 
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //

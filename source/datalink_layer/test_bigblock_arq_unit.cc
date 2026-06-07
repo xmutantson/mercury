@@ -43,6 +43,7 @@
 #include "datalink_layer/arq.h"
 #include "datalink_layer/datalink_defines.h"
 #include "common/common_defines.h"   // CONFIG_16, YES/NO
+#include "common/sim_channel.h"      // cl_sim_awgn (fix/bigblock-chanest: CFO/SFO-impaired genuine decode)
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -107,6 +108,10 @@
 // on the FIRST decoded block without running the unstable post-partial retry loop.
 int cl_arq_controller::bigblock_first_clean = -1;
 int cl_arq_controller::bigblock_first_K     = -1;
+// CHANNEL-ESTIMATION HEALTH (fix/bigblock-chanest): the big-block RX mean|H| of the FIRST
+// block carved this run, so test_sim_inproc_bigblock_chanest() can assert the estimate did
+// not collapse (the genuine, ref==NULL, 2-instance path). Sourced from the RX telecom_system.
+double cl_arq_controller::bigblock_first_meanh = -1.0;
 
 int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
                                              unsigned char block_bsi,
@@ -180,7 +185,13 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 	this->batch_rx_frame_count           = n_clean;
 
 	// FULL-PATH REGRESSION capture: record the FIRST block decoded this run.
-	if(bigblock_first_clean < 0) { bigblock_first_clean = n_clean; bigblock_first_K = K; }
+	if(bigblock_first_clean < 0) {
+		bigblock_first_clean = n_clean; bigblock_first_K = K;
+		// CHANNEL-ESTIMATION HEALTH (fix/bigblock-chanest): stash the RX big-block mean|H|
+		// of this first block (the genuine ref==NULL estimate). telecom_system may be null
+		// on a synthetic carve unit-test; guard it.
+		if(telecom_system) bigblock_first_meanh = telecom_system->bigblock_last_rx_meanh;
+	}
 
 	if(n_clean == K)
 	{
@@ -2262,4 +2273,277 @@ int cl_arq_controller::test_bigblock_txlevel()
 	delete A; delete ts;
 	restore_env();
 	return 0;
+}
+
+// ============================================================================
+// GENUINE BIG-BLOCK CHANNEL-ESTIMATION REGRESSION (fix/bigblock-chanest).
+//
+// THE DEFECT (HW, results_rxdecode_diag.json): same RX / same channel / same run, the
+// per-frame OFDM path re-acquires every ~12-symbol frame and reads [OFDM-OK] meanH=0.979,
+// WHILE the big-block path runs ONE Schmidl-Cox acquisition + ONE channel estimate over a
+// 133-symbol / ~1.56 s block and reads [RXACQ] meanH=0.002-0.011 (~0); LDPC then decodes
+// pure noise (ldpc_iter=101 cap, all 8 cw identical garbage e296c428). ROOT CAUSE:
+// bigblock_rx_passband does NO carrier-frequency (Moose) correction (telecom_system.cc
+// :7199-7251 = Schmidl-Cox TIMING only; the per-frame receive_byte runs Moose every frame at
+// :2570). An un-tracked residual CFO/SFO (HW: two independent crystals + post-Moose residual)
+// ramps a MULTI-CYCLE phasor across the long block (8 Hz over ~1.56 s = ~12.5 cycles); the
+// block-wide pilot average (flat-ML Hbar=Hsum/npil :7389-7401, and the sparse-2D estimate)
+// destructively integrates the rotating phasor → |H| → 0.
+//
+// WHY THE GENUINE PATH MATTERS / WHY THE SIM HID IT: receive_bigblock passes cw_info_ref to
+// the worker ONLY when bigblock_last_tx_K>0 (telecom_system.cc:8391-8392) — i.e. when the
+// SAME instance just transmitted (oracle gate). Here the RX (tsB) NEVER transmits, so
+// bigblock_last_tx_K==0 → cw_info_ref==NULL → the GENUINE decode (the cw_ok gate is the real
+// per-codeword decode, not an oracle compare). The existing --test-bigblock-multicw is ALSO
+// ref==NULL, but it runs the DEFAULT channel with SFO=0 AND CFO=0, so there is no rotating
+// phasor to integrate and it passes 8/8. This regression turns CFO+SFO ON in the same genuine
+// single-block transfer (through cl_sim_awgn) and asserts the collapse — the HW defect,
+// reproduced OFF-BENCH, with NO ARQ loop / NO ACK spin (a single TX→channel→RX decode).
+//
+//   SANITY arm:     clean channel → estimate HEALTHY (mean|H| > MEANH_OK) + 8/8 byte-faithful.
+//   FAIL-BEFORE arm: CFO+SFO ON → estimate COLLAPSED (mean|H| < MEANH_BAD) + NOT 8/8.
+//   PASS-AFTER arm:  CFO+SFO ON, fix active → estimate HEALTHY + 8/8 byte-faithful.
+// Until a PHY CFO/SFO-tracking fix lands, the PASS-AFTER arm FAILS (so the test FAILS) — the
+// intended fail-before→pass-after contract for the channel-estimation fix.
+// ============================================================================
+int cl_arq_controller::test_sim_inproc_bigblock_chanest()
+{
+	printf("[TEST-BIGBLOCK-CHANEST] ===== GENUINE (ref==NULL) big-block channel-estimation "
+	       "regression: one CFG16 block TX->cl_sim_awgn(CFO/SFO)->RX decode =====\n");
+	fflush(stdout);
+
+	// Pin K=8 (production MERCURY_BIGBLOCK_K cap path).
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_BIGBLOCK_K", "8");
+#else
+	setenv("MERCURY_BIGBLOCK_K", "8", 1);
+#endif
+	auto restore_k = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else           _putenv_s("MERCURY_BIGBLOCK_K", "");
+#else
+		if(had_prev_k) setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else           unsetenv("MERCURY_BIGBLOCK_K");
+#endif
+	};
+
+	// Bring up CMD (tsA, the TX) + RSP (tsB, the RX) at a real CFG16 grid (mirrors
+	// test_sim_inproc_bigblock bringup). tsB NEVER transmits → bigblock_last_tx_K==0 on the
+	// RX → cw_info_ref==NULL = the GENUINE decode.
+	cl_telecom_system* tsA = new cl_telecom_system();
+	cl_telecom_system* tsB = new cl_telecom_system();
+	cl_arq_controller* A   = new cl_arq_controller();
+	cl_arq_controller* B   = new cl_arq_controller();
+	A->telecom_system = tsA;
+	B->telecom_system = tsB;
+	auto bringup = [&](cl_arq_controller* a, cl_telecom_system* ts, int role) {
+		a->role = role; a->sack_enabled = true; a->sack_v2_enabled = true;
+		a->axis3_sack_mode = 1; a->compression_enabled = false;
+		a->bigblock_skip_fifo_delivery = true;
+		a->nMessages = 255; a->max_data_length = 170; a->max_message_length = 200;
+		a->max_header_length = 6; a->init_messages_buffers();
+		a->load_configuration(CONFIG_16, FULL, YES);
+		ts->bigblock_framing_enabled = true;
+		a->sack_negotiated_recompute_batch(role==COMMANDER ? "CMD" : "RSP");
+	};
+	bringup(A, tsA, COMMANDER);
+	bringup(B, tsB, RESPONDER);
+
+	const int K = BB_TEST_K;
+	const int sub_len = tsA->ldpc.K / 8;
+	const long total_tx_bytes = (long)K * sub_len;
+	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
+	const int block_bsi = 7;
+
+	// Build the on-wire block payload EXACTLY as production bigblock_send_one_block does
+	// (header in cw0 prefix + per-codeword app bytes + per-cw wire CRC-8). Variable lengths.
+	std::vector<std::vector<unsigned char>> app_truth((size_t)K);
+	std::vector<int> app_len((size_t)K, 0);
+	std::vector<unsigned char> tx_truth((size_t)total_tx_bytes, 0);
+	{
+		const int cw0_cap = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;
+		const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;
+		for(int i=0;i<K;i++){
+			int cap = (i==0)?cw0_cap:cwc_cap;
+			int len = ((i*37 + 11) % (cap - 4)) + 1; if(len>cap) len=cap;
+			app_len[i]=len; app_truth[i].assign((size_t)len,0);
+			for(int j=0;j<len;j++){ unsigned char b=(unsigned char)((i*53+j*17+3)&0xFF); app_truth[i][(size_t)j]=b; }
+		}
+		tx_truth[0]=(unsigned char)(block_bsi&0xFF);
+		tx_truth[1]=(unsigned char)(K&0xFF);
+		for(int c=0;c<K;c++){
+			int lo=BIGBLOCK_HDR_FIXED_BYTES+2*c;
+			tx_truth[(size_t)lo+0]=(unsigned char)(app_len[c]&0xFF);
+			tx_truth[(size_t)lo+1]=(unsigned char)((app_len[c]>>8)&0xFF);
+			int base=(c==0)?hdr_total:(c*sub_len);
+			for(int j=0;j<app_len[c];j++) tx_truth[(size_t)base+j]=app_truth[c][(size_t)j];
+		}
+		for(int c=0;c<K;c++){
+			int crc_off=BIGBLOCK_CW_CRC_OFFSET(c,sub_len), crc_span=BIGBLOCK_CW_CRC_SPAN(sub_len);
+			if(crc_off<0||crc_off>=(int)tx_truth.size()||crc_span<0) continue;
+			tx_truth[(size_t)crc_off]=A->CRC8_calc((char*)&tx_truth[(size_t)c*sub_len],crc_span);
+		}
+	}
+
+	// ONE genuine block transfer through an (optional) channel. ch==NULL → clean wire.
+	// Applies the channel in WHOLE-SYMBOL chunks exactly as the production wire feeds the RX
+	// (sim2_drain_to_wire moves sp = Nofdm*interp samples per process() call), so the SFO/CFO/
+	// PN state advances per OFDM symbol just like the live path. Returns mean|H| and 8/8-ness.
+	auto run_block = [&](cl_sim_awgn* ch, double& meanh_out, int& cw_ok_out,
+	                     bool& bytes_ok_out) -> bool {
+		int interp  = tsA->frequency_interpolation_rate;
+		int block_n = tsA->bigblock_tx_total_samples();
+		if(block_n <= 0) return false;
+		int lead_n  = (int)(100.0 * tsA->sampling_frequency / 1000.0);
+		int trail_n = (int)(50.0  * tsA->sampling_frequency / 1000.0);
+		std::vector<int> payload((size_t)tx_truth.size(), 0);
+		for(size_t i=0;i<tx_truth.size();i++) payload[i]=(int)tx_truth[i];
+		std::vector<double> tx_pb((size_t)block_n, 0.0);
+		{
+			cl_telecom_system::bigblock_emit_scope emit_guard(tsA, block_n);
+			tsA->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		}
+		int K_tx = tsA->bigblock_last_tx_K, n_tx = tsA->bigblock_last_tx_samples;
+		if(K_tx != K || n_tx <= 0) return false;
+
+		int rx_window = lead_n + n_tx + trail_n;
+		std::vector<double> rx_pb((size_t)rx_window, 0.0);
+		for(int i=0;i<n_tx && i<(int)tx_pb.size();i++) rx_pb[lead_n + i] = tx_pb[i];
+
+		// CHANNEL: feed the whole RX window (incl. lead/trail silence) through the channel in
+		// Nofdm*interp-sample chunks — the impairment runs across the silence too (matching the
+		// live wire, where the channel state ticks during idle), so the CFO/SFO phase ramp the
+		// RX integrates is the genuine one. ch==NULL → clean (the sanity arm).
+		if(ch){
+			int sp = tsB->data_container.Nofdm * interp;
+			if(sp <= 0) sp = tsA->data_container.Nofdm * interp;
+			if(sp > 0){
+				for(int off=0; off+sp<=(int)rx_pb.size(); off+=sp) ch->process(&rx_pb[off], (size_t)sp);
+			}
+		}
+
+		int Nofdm = tsB->data_container.Nofdm;
+		int saved_buffer_Nsymb = tsB->data_container.buffer_Nsymb;
+		if(Nofdm > 0){
+			int need_syms = (rx_window + Nofdm*interp - 1) / (Nofdm*interp);
+			tsB->data_container.buffer_Nsymb = need_syms;
+			int exact = need_syms * Nofdm * interp;
+			if((int)rx_pb.size() < exact) rx_pb.resize((size_t)exact, 0.0);
+		}
+		std::vector<int> info_bits((size_t)(K+1) * tsB->ldpc.K + tsB->ldpc.K, 0);
+		tsB->bigblock_last_rx_meanh = -1.0;
+		tsB->receive_byte(rx_pb.data(), info_bits.data());            // → receive_bigblock (ref==NULL)
+		tsB->data_container.buffer_Nsymb = saved_buffer_Nsymb;
+
+		meanh_out = tsB->bigblock_last_rx_meanh;
+		cw_ok_out = tsB->bigblock_last_rx_cw_ok_count;
+		int K_rx  = tsB->bigblock_last_rx_K;
+
+		// BYTE-FAITHFUL check: carve the decoded info bits and compare each slot's app bytes.
+		bool bytes_ok = false;
+		if(K_rx == K){
+			for(int i=0;i<B->nMessages;i++){ B->messages_rx[i].status=FREE; B->messages_rx[i].length=0; B->messages_rx[i].batch_seq_id=-1; }
+			B->rsp_current_expected_batch_seq_id = block_bsi; B->rsp_prev_batch_seq_id=-1;
+			B->rsp_prev_batch_active=false; B->batch_rx_frame_count=0; B->last_received_end_of_batch_seq=-1;
+			int carve_rc = B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)block_bsi);
+			if(carve_rc == SUCCESSFUL){
+				bytes_ok = true;
+				for(int c=0;c<K && bytes_ok;c++){
+					if(B->messages_rx[c].status != RECEIVED || B->messages_rx[c].length != app_len[c]){ bytes_ok=false; break; }
+					for(int j=0;j<app_len[c];j++)
+						if((unsigned char)B->messages_rx[c].data[j] != app_truth[c][(size_t)j]){ bytes_ok=false; break; }
+				}
+			}
+		}
+		bytes_ok_out = bytes_ok;
+		return true;
+	};
+
+	// Thresholds: the big-block RAW |H| scale on the calibrated clean cell is ~0.24; the
+	// un-tracked-CFO collapse drops it to ~0.02-0.13 (HW: ~0.005). A wide gap → robust gate.
+	const double MEANH_OK  = 0.18;
+	const double MEANH_BAD = 0.16;
+
+	int failed = 0;
+
+	// ---------- 0) SANITY: clean channel is HEALTHY + byte-faithful. ----------
+	double s_meanh=-1; int s_cwok=-1; bool s_bytes=false;
+	bool s_ran = run_block(nullptr, s_meanh, s_cwok, s_bytes);
+	printf("[TEST-BIGBLOCK-CHANEST] SANITY clean: meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	       s_meanh, MEANH_OK, s_cwok, K, (int)s_bytes);
+	bool sanity_ok = s_ran && (s_meanh > MEANH_OK) && (s_cwok == K) && s_bytes;
+	printf("[TEST-BIGBLOCK-CHANEST] %s: SANITY clean channel healthy estimate + byte-faithful\n",
+	       sanity_ok ? "PASS" : "FAIL");
+	if(!sanity_ok) failed++;
+
+	// ---------- 1) FAIL-BEFORE: CFO+SFO ON → estimate COLLAPSES, not 8/8. ----------
+	// HW-calibrated magnitudes (sim_channel.h §CFO/§SFO): static residual CFO + slow AR(1)
+	// drift + SFO. The CFO/SFO knobs are read by cl_sim_awgn at CONSTRUCTION (env-gated), so
+	// set the channel env BEFORE constructing ch_bad. clean SNR3k≥900 → no additive AWGN; only
+	// the CFO/SFO/PN/floor impairments, isolating the channel-estimation collapse from thermal
+	// noise. Distinct per-direction seed (the live wire seeds A→B with (seed<<1)|1).
+	auto set_ch_env = [&](const char* cfo, const char* cfo_walk, const char* sfo){
+#if defined(_WIN32)
+		_putenv_s("MERCURY_SIM2_CFO_HZ", cfo); _putenv_s("MERCURY_SIM2_CFO_WALK_HZ", cfo_walk); _putenv_s("MERCURY_SIM2_SFO_PPM", sfo);
+#else
+		setenv("MERCURY_SIM2_CFO_HZ", cfo, 1); setenv("MERCURY_SIM2_CFO_WALK_HZ", cfo_walk, 1); setenv("MERCURY_SIM2_SFO_PPM", sfo, 1);
+#endif
+	};
+	// Save+restore the channel env so the test leaves the process clean.
+	auto getenv_s = [](const char* k){ const char* v=std::getenv(k); return v?std::string(v):std::string(); };
+	bool had_cfo=std::getenv("MERCURY_SIM2_CFO_HZ")!=NULL, had_cfow=std::getenv("MERCURY_SIM2_CFO_WALK_HZ")!=NULL, had_sfo=std::getenv("MERCURY_SIM2_SFO_PPM")!=NULL;
+	std::string sv_cfo=getenv_s("MERCURY_SIM2_CFO_HZ"), sv_cfow=getenv_s("MERCURY_SIM2_CFO_WALK_HZ"), sv_sfo=getenv_s("MERCURY_SIM2_SFO_PPM");
+
+	set_ch_env("8", "4", "50");
+	double b_meanh=-1; int b_cwok=-1; bool b_bytes=false;
+	{
+		cl_sim_awgn ch_bad(((uint64_t)12345 << 1) | 1u, 900.0);
+		run_block(&ch_bad, b_meanh, b_cwok, b_bytes);
+	}
+	printf("[TEST-BIGBLOCK-CHANEST] FAIL-BEFORE (CFO+SFO): meanH=%.4f (want<%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	       b_meanh, MEANH_BAD, b_cwok, K, (int)b_bytes);
+	bool fail_before_ok = (b_meanh >= 0.0) && (b_meanh < MEANH_BAD) && !(b_cwok == K && b_bytes);
+	printf("[TEST-BIGBLOCK-CHANEST] %s: FAIL-BEFORE reproduces the HW [RXACQ] collapse "
+	       "(meanH=%.4f<%.2f, NOT 8/8 byte-faithful)\n",
+	       fail_before_ok ? "PASS" : "FAIL", b_meanh, MEANH_BAD);
+	if(!fail_before_ok) failed++;
+
+	// ---------- 2) PASS-AFTER: same impaired channel; the fix restores estimate + 8/8. ----------
+	double f_meanh=-1; int f_cwok=-1; bool f_bytes=false;
+	{
+		cl_sim_awgn ch_fix(((uint64_t)12345 << 1) | 1u, 900.0);
+		run_block(&ch_fix, f_meanh, f_cwok, f_bytes);
+	}
+	printf("[TEST-BIGBLOCK-CHANEST] PASS-AFTER (CFO+SFO, fix): meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	       f_meanh, MEANH_OK, f_cwok, K, (int)f_bytes);
+	bool pass_after_ok = (f_meanh > MEANH_OK) && (f_cwok == K) && f_bytes;
+	printf("[TEST-BIGBLOCK-CHANEST] %s: PASS-AFTER healthy estimate + 8/8 byte-faithful under "
+	       "CFO/SFO (the fix; FAILS until a PHY CFO/SFO-tracking fix lands)\n",
+	       pass_after_ok ? "PASS" : "FAIL");
+	if(!pass_after_ok) failed++;
+
+	// restore channel env
+	auto put = [&](const char* k, bool had, const std::string& v){
+#if defined(_WIN32)
+		if(had) _putenv_s(k, v.c_str()); else _putenv_s(k, "");
+#else
+		if(had) setenv(k, v.c_str(), 1); else unsetenv(k);
+#endif
+	};
+	put("MERCURY_SIM2_CFO_HZ", had_cfo, sv_cfo);
+	put("MERCURY_SIM2_CFO_WALK_HZ", had_cfow, sv_cfow);
+	put("MERCURY_SIM2_SFO_PPM", had_sfo, sv_sfo);
+	restore_k();
+
+	delete A; delete B; delete tsA; delete tsB;
+
+	printf("[TEST-BIGBLOCK-CHANEST] %s (%d failure%s)  [sanity meanH=%.3f | fail-before meanH=%.3f "
+	       "| pass-after meanH=%.3f bytes_ok=%d]\n", failed == 0 ? "ALL PASS" : "FAILURES", failed,
+	       failed == 1 ? "" : "s", s_meanh, b_meanh, f_meanh, (int)f_bytes);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
 }
