@@ -311,6 +311,18 @@ public:
   void set_max_buffer_length(int max_data_length, int max_message_length, int max_header_length);
   void set_ack_batch_size(int ack_batch_size);
   void set_data_batch_size(int data_batch_size);
+  // R038 (race audit 2026-06-06) — per-frame v2 EOB staging consumed by the
+  // match-current storage block; declared near last_received_end_of_batch_seq.
+  // R035 (race audit 2026-06-06) — called from the set_data_batch_size()
+  // chokepoint when the data batch SHRINKS while an RSP prev-batch is active.
+  // Re-derives rsp_prev_batch_{received,expected}_count against the NEW (smaller)
+  // batch so the live prev-completion gate stays reachable, and -- if any
+  // already-RECEIVED prev slot is orphaned in [new_batch, old_batch) -- fires the
+  // streaming desync defense BEFORE the inevitable stale-discard (which FREEs
+  // messages_rx_prev[] without a streaming_reset, the asymmetry vs the delivery
+  // leg). `new_batch` is the post-clamp value about to be stored. See
+  // data-flow-arq-recovery-cluster.md §4.3 / §5.2.
+  void rescan_prev_on_batch_shrink(int new_batch);
   void set_control_batch_size(int control_batch_size);
   void set_role(int role);
   void calculate_receiving_timeout();
@@ -1318,6 +1330,16 @@ public:
   // (truncated delivery) AND the POST-FIX staged+match-current-gated promotion
   // prevents it. Returns 0=PASS, 1=FAIL.
   int test_eob_poison_prev_retx();
+
+  // R035 (race audit 2026-06-06) — data_batch_size SHRINK strands active prev.
+  // CLI: --test-batch-shrink-strands-prev. Arms an active RSP prev with a frozen
+  // expected_count=15 and a RECEIVED slot in [10,15), then SHRINKS via the REAL
+  // set_data_batch_size(10) chokepoint (not a direct assign). Asserts the pre-fix
+  // gate was unreachable (expected frozen at 15), that the fix re-derives
+  // expected/received against the new batch (gate reachable), and that the
+  // orphaned slot fires a single streaming_reset (streaming stays active).
+  // Returns 0=PASS, 1=FAIL.
+  int test_batch_shrink_strands_prev();
 
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //

@@ -3556,3 +3556,177 @@ int cl_arq_controller::test_eob_poison_prev_retx()
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
+
+// ============================================================================
+// R035 — data_batch_size SHRINK strands active prev (in-process synthetic-fire)
+// ============================================================================
+//
+// CLI: --test-batch-shrink-strands-prev
+//
+// Race-audit R035 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.3 / §5.2): rsp_prev_batch_expected_count is FROZEN at arm-time from the OLD
+// data_batch_size (bump_bsi_and_transfer_prev). An Axis-2 down-move (15->10) or a
+// robust-dwell revert shrinks data_batch_size while prev is active, but no path
+// re-derives expected_count. The LIVE prev-write bound (arq_responder.cc:686,
+// loc >= data_batch_size reject) then rejects any prev frame whose slot is in
+// [new, old), so rsp_prev_batch_received_count can never reach the frozen
+// expected_count -> prev never delivers via the completion gate
+// (arq_responder.cc:728) -> the eventual re-bump hits the stale-discard
+// (arq_common.cc:4366-4379) which FREEs messages_rx_prev[] WITHOUT
+// streaming_reset() -> PPMd streaming desync (the ff829d5 class).
+//
+// The fix re-derives the prev counters at the set_data_batch_size() CHOKEPOINT on
+// shrink and fires the streaming defense if any RECEIVED prev slot is orphaned in
+// [new, old). This test drives the shrink through the REAL set_data_batch_size()
+// (per the audit sibling warning: the SACK-test direct-assigns deliberately
+// bypass the chokepoint where the fix lives) and asserts:
+//   - PRE-FIX model: with expected frozen at 15 and the live bound rejecting
+//     [10,15), the gate is UNREACHABLE (received capped at <=10 < 15) -> strand.
+//   - POST-FIX: expected re-derived to min(15,10)=10, received recomputed within
+//     [0,10) -> gate reachable; and an orphaned RECEIVED slot in [10,15) fires a
+//     single streaming_reset (streaming stays active, not disabled).
+//
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_batch_shrink_strands_prev()
+{
+	// --- Step 0: allocate + prime --------------------------------------------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-BATCH-SHRINK] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	this->sack_v2_enabled = true;
+	this->sack_enabled    = true;
+	// Force the OFDM branch of set_data_batch_size (NOT robust): current_configuration
+	// must be a non-robust config. CONFIG_0 (=0) is OFDM; robust configs are 100+.
+	this->current_configuration = 0;
+	// Seed the OLD batch size = 15 directly (init state; prev not yet armed so the
+	// rescan is a no-op here even though it routes through the chokepoint).
+	this->data_batch_size = 15;
+	const int OLD_BATCH = 15;
+	const int NEW_BATCH = 10;
+	const int PREV_BSI  = 7;
+
+	// --- Step 1: arm an active prev batch with expected=15, and a RECEIVED slot
+	//             in [10,15) (slot 12) that the shrink will orphan. -----------
+	for(int i = 0; i < this->nMessages; i++)
+		messages_rx_prev[i].status = FREE;
+	int armed_received = 0;
+	for(int i = 0; i <= 8; i++)   // slots 0..8 RECEIVED (in [0,10))
+	{
+		messages_rx_prev[i].status       = RECEIVED;
+		messages_rx_prev[i].batch_seq_id = PREV_BSI;
+		messages_rx_prev[i].length       = 16;
+		armed_received++;
+	}
+	// One RECEIVED slot in [10,15) — the orphan the shrink strands.
+	messages_rx_prev[12].status       = RECEIVED;
+	messages_rx_prev[12].batch_seq_id = PREV_BSI;
+	messages_rx_prev[12].length       = 16;
+	armed_received++;                                  // total 10 RECEIVED
+
+	this->rsp_prev_batch_seq_id        = PREV_BSI;
+	this->rsp_prev_batch_active        = true;
+	this->rsp_prev_batch_received_count = armed_received;  // 10
+	this->rsp_prev_batch_expected_count = OLD_BATCH;       // 15 (frozen at old size)
+
+	// Enable streaming so the orphan path can fire the real streaming_reset().
+	compressor.init();
+	compressor.streaming_enable();
+	this->batch_data_delivered = true;   // guard for the streaming defense
+	bool streaming_before = compressor.is_streaming();
+
+	// --- PRE-FIX model: gate reachability with the FROZEN expected -----------
+	// The live prev-write bound rejects slots >= NEW_BATCH, so the maximum
+	// received_count attainable is the count of RECEIVED slots in [0,NEW_BATCH).
+	int reachable_received = 0;
+	for(int i = 0; i < NEW_BATCH && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) reachable_received++;
+	bool prefix_gate_reachable = (reachable_received >= this->rsp_prev_batch_expected_count); // 9 >= 15 -> false
+
+	printf("[TEST-BATCH-SHRINK] setup: prev bsi=%d armed_received=%d expected=%d(OLD) "
+	       "reachable_in[0,%d)=%d prefix_gate_reachable=%d streaming=%d\n",
+		PREV_BSI, armed_received, this->rsp_prev_batch_expected_count,
+		NEW_BATCH, reachable_received, prefix_gate_reachable ? 1 : 0,
+		streaming_before ? 1 : 0);
+	fflush(stdout);
+
+	// --- Step 2: SHRINK via the REAL chokepoint (NOT a direct assign) --------
+	set_data_batch_size(NEW_BATCH);
+
+	// --- Step 3: post-shrink assertions --------------------------------------
+	bool pass = true;
+
+	// (a) Vacuity guard: the pre-fix model MUST show the gate was unreachable
+	//     (else the test proves nothing).
+	if(prefix_gate_reachable)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL(vacuous): pre-fix gate was already reachable "
+		       "— scenario does not strand the prev\n");
+		pass = false;
+	}
+
+	// (b) data_batch_size actually shrank to NEW_BATCH (chokepoint stored it).
+	if(this->data_batch_size != NEW_BATCH)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: data_batch_size=%d (expected %d)\n",
+			this->data_batch_size, NEW_BATCH);
+		pass = false;
+	}
+
+	// (c) expected_count re-derived to min(OLD,NEW)=NEW_BATCH (gate now reachable).
+	if(this->rsp_prev_batch_expected_count != NEW_BATCH)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: expected_count=%d (expected re-derived to %d)\n",
+			this->rsp_prev_batch_expected_count, NEW_BATCH);
+		pass = false;
+	}
+
+	// (d) received_count recomputed to the count within [0,NEW_BATCH) = 9.
+	if(this->rsp_prev_batch_received_count != reachable_received)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: received_count=%d (expected recomputed to %d)\n",
+			this->rsp_prev_batch_received_count, reachable_received);
+		pass = false;
+	}
+
+	// (e) the gate is now REACHABLE (received can reach expected as the missing
+	//     in-window slot arrives): expected==NEW_BATCH and reachable slots exist.
+	bool postfix_gate_reachable =
+		(this->rsp_prev_batch_expected_count <= NEW_BATCH);
+	if(!postfix_gate_reachable)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: post-fix gate still unreachable "
+		       "(expected_count=%d > new_batch=%d)\n",
+			this->rsp_prev_batch_expected_count, NEW_BATCH);
+		pass = false;
+	}
+
+	// (f) the orphaned RECEIVED slot (12) triggered the streaming defense, which
+	//     RESETS (not DISABLES) streaming — streaming must still be active.
+	bool streaming_after = compressor.is_streaming();
+	if(!streaming_after)
+	{
+		printf("[TEST-BATCH-SHRINK] FAIL: streaming was DISABLED by the shrink "
+		       "(expected streaming_reset, which keeps it active)\n");
+		pass = false;
+	}
+
+	printf("[TEST-BATCH-SHRINK] %s: data_batch_size=%d expected=%d received=%d "
+	       "prefix_reachable=%d postfix_reachable=%d streaming %d->%d "
+	       "(orphan in [%d,%d) drove the desync defense)\n",
+		pass ? "PASS" : "FAIL", this->data_batch_size,
+		this->rsp_prev_batch_expected_count, this->rsp_prev_batch_received_count,
+		prefix_gate_reachable ? 1 : 0, postfix_gate_reachable ? 1 : 0,
+		streaming_before ? 1 : 0, streaming_after ? 1 : 0,
+		NEW_BATCH, OLD_BATCH);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}

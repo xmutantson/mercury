@@ -452,6 +452,9 @@ int main(int argc, char *argv[])
     bool test_eob_poison_prev_retx_cli = false; // --test-eob-poison-prev-retx: R038 — prev-retransmit EOB
                                         // poison. Drives the real EOB staging/promotion members; asserts pre-fix early
                                         // ACK-GATE PASS reproduced AND post-fix prevents it. One-shot, exits rc.
+    bool test_batch_shrink_strands_prev_cli = false; // --test-batch-shrink-strands-prev: R035 — data_batch_size
+                                        // shrink strands the active prev. Drives the REAL set_data_batch_size chokepoint;
+                                        // asserts prev counters re-derived (gate reachable) + streaming defense on orphan. One-shot, exits rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -942,6 +945,15 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.4 / §5.3.
             test_eob_poison_prev_retx_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batch-shrink-strands-prev") == 0)
+        {
+            // R035 — data_batch_size shrink strands active prev regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.3 / §5.2.
+            test_batch_shrink_strands_prev_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2028,6 +2040,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_eob_poison_prev_retx();
             printf("[FLAG] Eob-poison test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_batch_shrink_strands_prev_cli) {
+            // R035 — data_batch_size shrink strands prev (one-shot, then exit rc).
+            printf("[FLAG] --test-batch-shrink-strands-prev: invoking R035 "
+                   "batch-shrink-strands-prev regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_strands_prev();
+            printf("[FLAG] Batch-shrink-strands-prev test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

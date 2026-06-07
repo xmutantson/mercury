@@ -642,6 +642,76 @@ void cl_arq_controller::set_ack_batch_size(int ack_batch_size)
 	}
 }
 
+// R035 (race audit 2026-06-06): re-derive the active RSP prev-batch counters
+// when the data batch SHRINKS, and fire the streaming desync defense if any
+// already-RECEIVED prev slot is orphaned beyond the new (smaller) batch.
+//
+// THE BUG: rsp_prev_batch_expected_count is FROZEN at arm-time from the OLD
+// data_batch_size (bump_bsi_and_transfer_prev, arq_common.cc:4437). An Axis-2
+// down-move (e.g. 15->10) or a robust-dwell revert (8->1) shrinks data_batch_size
+// while prev is active, but no path re-derives expected_count. The LIVE prev-write
+// bound (arq_responder.cc:686, loc >= data_batch_size reject) then rejects any
+// prev frame whose slot is in [new, old), so rsp_prev_batch_received_count can
+// never reach the frozen expected_count -> the prev never delivers via the
+// completion gate (arq_responder.cc:728) -> the eventual re-bump hits the
+// stale-discard (arq_common.cc:4366-4379) which FREEs messages_rx_prev[] WITHOUT
+// streaming_reset() -> PPMd streaming desync (the ff829d5 class).
+//
+// THE FIX (mirrors the delivery leg's streaming defense, arq_responder.cc:731):
+//   - received_count := count of RECEIVED prev slots in [0, new)
+//   - expected_count := min(old expected, new)  (gate becomes reachable)
+//   - if any RECEIVED prev slot is orphaned in [new, old): the prev cannot be
+//     delivered intact, so fire streaming_reset() (guarded is_streaming() &&
+//     batch_data_delivered) NOW, before the data is lost, instead of silently
+//     desyncing at the later stale-discard.
+//
+// Called from the set_data_batch_size() chokepoint (both the robust and OFDM
+// clamp branches) with the post-clamp value, BEFORE data_batch_size is updated.
+void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
+{
+	if(!sack_v2_enabled) return;
+	if(!rsp_prev_batch_active) return;
+	int old_batch = this->data_batch_size;
+	if(new_batch >= old_batch) return;   // only SHRINK strands the prev path
+
+	// Recompute received_count within the new (smaller) bound, and detect
+	// already-RECEIVED slots that the new bound orphans in [new_batch, old_batch).
+	int new_received = 0;
+	for(int i = 0; i < new_batch && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) new_received++;
+	int orphaned_received = 0;
+	for(int i = new_batch; i < old_batch && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) orphaned_received++;
+
+	int old_expected = rsp_prev_batch_expected_count;
+	int new_expected = old_expected;
+	if(new_expected > new_batch) new_expected = new_batch;
+	if(new_expected < 1)         new_expected = 1;
+
+	// If RECEIVED prev data is orphaned beyond the new bound, the prev batch can
+	// no longer be delivered intact. Fire the streaming defense (same guard +
+	// handshake as the in-order delivery leg) BEFORE the data is discarded, so
+	// the next TX batch detects RX-cold and resets — no silent PPMd desync.
+	if(orphaned_received > 0 && compressor.is_streaming() && batch_data_delivered)
+	{
+		compressor.streaming_reset();
+		printf("[STREAMING] Reset: prev-batch orphaned by data_batch_size shrink "
+			"%d->%d (orphaned_received=%d) — R035 desync defense\n",
+			old_batch, new_batch, orphaned_received);
+		fflush(stdout);
+	}
+
+	printf("[RSP-V2-PREV-RESHRINK] data_batch_size %d->%d prev_batch_seq_id=%d "
+		"received %d->%d expected %d->%d orphaned_received=%d\n",
+		old_batch, new_batch, rsp_prev_batch_seq_id,
+		rsp_prev_batch_received_count, new_received,
+		old_expected, new_expected, orphaned_received);
+	fflush(stdout);
+
+	rsp_prev_batch_received_count = new_received;
+	rsp_prev_batch_expected_count = new_expected;
+}
+
 void cl_arq_controller::set_data_batch_size(int data_batch_size)
 {
 	// CHOKEPOINT: robust => batch 1 (the single enforcement point).
@@ -689,6 +759,9 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 				current_configuration, data_batch_size, clamped, lo, hi);
 			fflush(stdout);
 		}
+		// R035: re-derive an active prev-batch's counters against the new (smaller)
+		// batch BEFORE updating data_batch_size (robust-dwell revert 8->1 is a shrink).
+		rescan_prev_on_batch_shrink(clamped);
 		this->data_batch_size = clamped;
 		// L3: keep the data-ACK timeout tracking the batch ONLY on an actual change
 		// to a multi-frame batch (the dwell raise) or back down (the revert). We do
@@ -704,14 +777,17 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 
 	if (data_batch_size>0)
 	{
+		// Resolve the post-clamp target FIRST so R035's prev-shrink rescan sees
+		// the value that will actually be stored.
+		int target;
 		if(data_batch_size<(max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1))
-		{
-			this->data_batch_size=data_batch_size;
-		}
+			target = data_batch_size;
 		else
-		{
-			this->data_batch_size=(max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
-		}
+			target = (max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
+		// R035: re-derive an active prev-batch's counters against the new (smaller)
+		// batch BEFORE updating data_batch_size (Axis-2 down-move 15->10 is a shrink).
+		rescan_prev_on_batch_shrink(target);
+		this->data_batch_size = target;
 	}
 }
 
