@@ -488,3 +488,160 @@ a 4th off-bench tracker iteration.** If a future arbiter-fidelity pass localizes
 RX-pipeline artifact (the magnitude-independent col_phaseRMS in passband_to_baseband/resampler/FIR boundary),
 THEN re-run the band-spread tracker against the cleaned arbiter — but only the artifact removal, not the tracker,
 is the off-bench blocker.
+
+## §15 ARBITER RESTORED to the PRODUCTION sparse-2D estimator (MORNING_VERDICT Step 0). 2026-06-07.
+
+**This SUPERSEDES the §11-§14 "the off-bench gate is blocked by a sim/RX-pipeline artifact, just HW-validate"
+framing for the bytes_ok arbiter.** The §11-§14 agents measured the arbiter while it PINNED the
+NON-PRODUCTION flat-ML estimator (`set_faithful_impairments()` set `MERCURY_BIGBLOCK_SPARSE2D=0`,
+test_bigblock_arq_unit.cc:2565). That pin was itself the contaminant the morning verdict identified:
+production AND HW run sparse-2D (`telecom_system.cc:8165` default `env_i("MERCURY_BIGBLOCK_SPARSE2D",1)` =1;
+adaptive sentinel `:7578` `sel<0 -> sparse-2D`). Measuring flat-ML floored col_phaseRMS at ~0.10 rad and
+inflated nv ~2500x on a channel-free clean-class waveform, so the "magnitude-independent ~0.23 rad artifact
+that caps bytes_ok" was substantially the flat-ML estimator's own behavior, not a property of the RX pipeline.
+
+**THE FIX (test-only, committed 1d773ec):** flip the test estimator default `MERCURY_BIGBLOCK_SPARSE2D` 0->1
+in `set_faithful_impairments()` (DBG override `MERCURY_BBCHANEST_DBG_SPARSE2D` kept for flat-ML A/B); and
+re-baseline the §1b sim-predicts-HW magnitude band from the flat-ML-tuned `[0,0.10]` to the production
+sparse-2D collapse (ceiling = the health gate `MEANH_BAD=0.16`; no new magic number).
+
+**MEASURED — the restored arbiter now SEPARATES on the PRODUCTION estimator** (`--test-bigblock-chanest`,
+`MERCURY_BIGBLOCK_RXPB_DIAG=1` for the GENIE/DD numbers; rebuilt `bash build.sh o3`):
+
+  | arm                        | meanH  | col_phaseRMS | DDevm | nv       | bytes_ok | gate verdict |
+  |----------------------------|--------|--------------|-------|----------|----------|--------------|
+  | SANITY (clean)             | 0.1941 | **0.031**    | 0.038 | 9.4e-6   | **1**    | PASS (decodes) |
+  | FAIL-BEFORE (faithful)     | 0.1487 | **0.826**    | 0.546 | 0.0347   | **0**    | PASS (genuine collapse reproduced) |
+  | SIM-PREDICTS-HW            | 0.1487 | —            | —     | —        | —        | PASS (in re-baselined band [0,0.16]) |
+  | PASS-AFTER (no DSP fix)    | 0.1487 | 0.826        | 0.546 | 0.0347   | **0**    | FAIL (the contract a real fix must flip) |
+
+- These match the morning verdict's EXP-B/EXP-E predictions to the decimal (SANITY 0.031 rad / faithful
+  meanH 0.149 / col_phaseRMS 0.83 / bytes_ok=0). The single remaining `--test-bigblock-chanest` failure is the
+  intended PASS-AFTER contract: a correct per-symbol estimator fix must flip the faithful arm bytes_ok 0->1.
+- **WHY sparse-2D, not flat-ML, is the right discriminator** (and reconciles the §13/§14 "magnitude-independent
+  artifact"): under sparse-2D the per-cell MAGNITUDE largely SURVIVES (meanH only droops 0.194->0.149; the
+  flat-ML deep-magnitude collapse to 0.085 is a flat-averaging artifact) — matching HW §3.1 "magnitudes survive,
+  only phases spread." What breaks the decode under sparse-2D is the per-COLUMN (intra-carrier, over symbol-axis)
+  phase spread `col_phaseRMS 0.031->0.826 rad`. That is exactly the block-fold defect the per-symbol fix targets,
+  and it is REAL on the production estimator — not a flat-ML-only artifact and not a magnitude-band artifact.
+- A/B confirmed: `MERCURY_BBCHANEST_DBG_SPARSE2D=0` still reproduces the OLD flat-ML deep collapse (meanH 0.085),
+  preserved for comparison.
+- NO regression: `--test-bigblock-multicw / -fullpath / -arq-unit / -sim-inproc-bigblock` all rc=0 ALL PASS.
+- Change is confined to the test; NO production DSP touched.
+
+## §16 SS5 DATA-FLOW AUDIT for the PER-SYMBOL / time-local sparse-2D fix (supersedes §8, which audited the
+Attempt-#3 rx-phase-only change; this audits the ACTUAL fix = changing the ESTIMATOR's time-axis behavior + the
+pilot lattice). 2026-06-07.
+
+**Shared state under change:** `ofdm.estimated_channel[Ngrid*Nc]`, `ofdm.pilot_configurator.sequence[]` +
+the `ofdm.ofdm_frame[].type` PILOT mask, `ofdm.noise_variance_estimate`.
+
+**(1) PRODUCERS of `ofdm.estimated_channel`** (big-block RX, all inside `bigblock_rx_passband`,
+telecom_system.cc:7176-8584; reached only when `bigblock_framing_enabled`, default-off):
+- sparse-2D estimator `grid_sparse2d_estimator()` (telecom_system.cc:5830; called at :7583 and :8168). THIS is
+  the production/HW default and the fix target. Internally: (1) raw LS at every pilot :5843-5852; (2) per-carrier
+  TIME interpolation + Wiener time-smooth (`MERCURY_SFO_GRID_WIENER` def 1, `_WIENER_LEN` def 5) :5854-5892;
+  (3) per-symbol FREQUENCY interpolation in polar/unwrapped form (`MERCURY_SFO_GRID_POLAR` def 1) :5894-5946;
+  (4) optional DDCE (def OFF) :5948-5975; publish to estimated_channel MEASURED :5977-5982; nv from final-H
+  pilot residual :5984-6000.
+- flat-ML control (block-wide `Hbar` broadcast to ALL cells) :7587-7602 and :8173-8188 (A/B only, env-forced).
+- per-frame path (SHARED member, DIFFERENT site): LS/ZF estimator in `receive_byte` OFDM path
+  (`telecom_system.cc:~2737-2785` + `OFDM.cc`). The big-block path REBUILDS the grid via
+  `bigblock_rebuild_thin_grid` (deinit/init to Nsymb=Ngrid, :6875) and owns estimated_channel exclusively for
+  the block; the two paths never run concurrently (different Nsymb/site; big-block dormant).
+
+**(2) CONSUMERS of `ofdm.estimated_channel`:**
+- `cl_ofdm::channel_equalizer` (OFDM.cc:2173-2209): iterates `Nsymb x Nc`, reads the PER-CELL complex H, computes
+  `out=in/H` (ZF) with MMSE erasure when `alpha=|H|^2/(|H|^2+nv) < 0.1` (:2200), sets status=UNKNOWN. **Already
+  per-cell — it consumes whatever the estimator wrote and supports a per-symbol-varying H natively; NOT a
+  bottleneck.** INVARIANT: `out=in/H=X` requires H to capture the cell's TRUE complex gain INCLUDING per-symbol
+  phase — a per-symbol-LOCAL estimate SATISFIES it; a block-AVERAGED (flat-ML) estimate VIOLATES it when the
+  per-symbol phase ramps. (This is the defect; the fix repairs the producer, the consumer is already correct.)
+- big-block CSI loop (telecom_system.cc:7604-7612 / :8190-8198): reads per-DATA-cell `|H|^2` into `csi_data` for
+  LDPC LLR weighting (:8235-8241). Per-cell read — benefits from a per-symbol-accurate H automatically.
+- meanH health stash (telecom_system.cc:7622-7625 / `bigblock_last_rx_meanh`) — the test metric; per-cell mean.
+- DIAG `[DIAG-RXPB]`/`[DIAG-WAV]`/`[DIAG-GENIE]` (env-gated).
+
+**(3) CONSUMERS of `ofdm.noise_variance_estimate`** (scalar): equalizer MMSE erasure threshold (OFDM.cc:2200);
+`psk.demod` LLR scale (telecom_system.cc:8233-8234). INVARIANT: nv must reflect the post-estimate pilot residual.
+The sparse-2D nv (:5984-6000) is the residual against the FINAL interpolated per-cell H — already time-local-
+consistent. (A per-symbol estimate that tracks the phase makes the residual SMALLER and more honest, lifting nv
+off the 0.0347 inflated value toward the clean 9.4e-6 — strictly helps the LLR scale.)
+
+**(4) CONSUMERS of `pilot_configurator.sequence[]` + PILOT mask:** every `Y/X` site walks `sequence` by a running
+`pidx` in the SAME nested-(n,j) `type==PILOT` raster order — raw LS :5848, time-interp seed, TRACK LS :8146,
+flat-ML :8176, nv residual :5993, DIAG :7634. INVARIANT (held): `pidx` order == framer PILOT order; the
+`ofdm_frame[].type` mask is the SINGLE source of truth. No consumer hardcodes `cont_cols` or pilot positions.
+
+**(5) WHAT THE FIX CHANGES, and consumer-by-consumer verification:**
+- **(a) Add band-spread continual columns: `MERCURY_BIGBLOCK_CONT_COLS` 2->3** (carriers {0, 24, 49} = edges +
+  CENTER). Producer: `bigblock_rebuild_thin_grid` (:6879/:6915-6921) — TX emit AND RX decode call the SAME
+  function, so the TX and RX grids stay IDENTICAL; nData/nBits/K recompute symmetrically. Consumers auto-pick-up
+  the new pilots via the mask (no hardcode). K-SYMMETRY: the §14.5 bit-budget table is authoritative —
+  cont=3 -> nBits=12925 -> **K=8** (slack 125 b); cont>=4 -> K=7 (drops below 8). So cont_cols=3 is the MAX
+  band-spread that PRESERVES K=8 (zero wire-rate cost). MUST VERIFY post-change: `--test-bigblock-multicw /
+  -fullpath / -arq-unit / -sim-inproc-bigblock / -bigblock-climb-election` still rc=0 (they exercise the grid;
+  the unit tests pin K=8 via `MERCURY_BIGBLOCK_K`).
+- **(b) Make the per-carrier TIME axis genuinely time-LOCAL (stop blurring the per-symbol phase ramp).** Inside
+  `grid_sparse2d_estimator` step (2): (i) interpolate the time axis in UNWRAPPED-POLAR (magnitude + shortest-step
+  phase), mirroring step (3)'s polar freq-interp, so a per-symbol phase ramp is tracked not chord-cut; (ii)
+  shrink/disable the Wiener time-smooth on the CONTINUAL columns (which carry a pilot at EVERY symbol, :6919-6921)
+  so the per-symbol CPE ramp is preserved — averaging a ramp is harmful (§3.3/§9). Keep the light smooth only on
+  scattered columns (noise suppression where there is no per-symbol ramp to preserve). Consumer impact: the
+  equalizer/CSI/nv all read the resulting per-cell H/nv unchanged — they already support per-symbol variation;
+  this just makes the per-symbol H ACCURATE. No consumer invariant is altered; the change makes the producer
+  HONOR the invariant the equalizer already assumes.
+- **Audit conclusion:** the fix is CONFINED to (i) `bigblock_rebuild_thin_grid` cont_cols (TX+RX symmetric, K=8
+  preserved) and (ii) the time-axis branch of `grid_sparse2d_estimator` (reached by big-block RX; the per-frame
+  path also calls grid_sparse2d_estimator via the normal `MERCURY_SFO_GRID_*` knobs, so the time-axis change must
+  be gated/verified for the per-frame regime too — VERIFY per-frame WB/NB BER unchanged, since
+  grid_sparse2d_estimator is SHARED). No consumer invariant is violated; the equalizer/demod/CSI/nv consumers all
+  read per-cell H/nv exactly as before, now with a per-symbol-accurate producer. gearshift mean_H/coarse_metric
+  are set to -1/0.0 at `receive_bigblock` entry (:8592-8593) and the big-block path is dormant, so the per-frame
+  gearshift `coarse_metric` consumers (arq_common.cc:7936/8067/8108/8149/8177) are NOT cross-fed by the big-block
+  estimate. SHARED-ESTIMATOR caveat is the one real cross-path risk: `grid_sparse2d_estimator` is ALSO the
+  per-frame estimator -> any time-axis change must be A/B'd on the per-frame WB path, not just the big-block.
+
+## §17 SS4 IMPLEMENTATION PLAN — per-symbol / time-local sparse-2D scattered+continual re-estimation
+(MORNING_VERDICT Step 1). NOT YET IMPLEMENTED — this is the plan to get sign-off before coding. 2026-06-07.
+
+**Goal:** flip the restored arbiter's faithful arm bytes_ok 0->1 by replacing the de-facto block-folding behavior
+(under the realistic vector the 2-edge continual sampling + Wiener time-blur collapses to a near-block-average)
+with a genuine PER-SYMBOL, TIME-LOCAL channel estimate that tracks the col_phaseRMS=0.83 rad per-column phase
+walk, while KEEPING K=8 (zero wire-rate cost) and the +18.9%..+91.8% margin over VARA 13,048.
+
+**Prior art (CLAUDE.md §1, cited):**
+- Mercury's own FreeDV-700D pilot-assisted-coherent lineage: pilot symbols transmitted regularly so the demod
+  estimates the REFERENCE PHASE OF EACH CARRIER per pilot position, then interpolates the channel across pilot
+  positions (rowetel.com FreeDV 700D release notes; codec2 README_freedv.md). This is per-symbol time-local
+  pilot phase tracking by design — the exact pattern the fix restores.
+- DVB-T / Hoeher-Kaiser-Robertson 1997 two-1D (time-then-frequency) scattered-pilot Wiener interpolation — ALREADY
+  the structure of grid_sparse2d_estimator (cited in-code at telecom_system.cc:5905-5906); the fix corrects its
+  TIME axis to be polar/local instead of complex-blur.
+- 802.11a/g continual-pilot per-symbol CPE + pilot-equalization-gain (PEG) tracking (Speth/Fechtel/Meyr 2001) —
+  the per-symbol common-phase + across-band slope removal; the band-spread continual columns supply the across-band
+  pilots PEG needs (the 2-edge lattice undersamples the slope — §14.1).
+- VARA HF continual + scattered pilot grid (reference_vara_benchmark_data) — confirms a 6-8% pilot density is far
+  below VARA's ~41%, so Mercury can track the real <=0.2 Hz HW residual at K=8 where VARA-density would force K=5.
+
+**Steps (each is ONE change + ONE test against the restored arbiter; one-change-one-test per CLAUDE.md):**
+1. **Band-spread continual pilots cont_cols 2->3** ({0,24,49}). Verify K stays 8 (bit-budget §14.5: nBits=12925)
+   and grid tests rc=0. Measure faithful-arm meanH/col_phaseRMS/bytes_ok. (Expected: gives PEG the across-band
+   pilots; alone may not crack bytes_ok but is the enabler for step 2.)
+2. **Time-axis polar interpolation** in grid_sparse2d_estimator step (2): interpolate the per-carrier time series
+   in unwrapped-magnitude+phase (mirror step 3's polar), so a per-symbol phase ramp is followed, not chord-cut.
+   A/B on the restored arbiter AND on per-frame WB BER (shared estimator). Measure col_phaseRMS drop.
+3. **Stop blurring the per-symbol CPE on continual columns**: disable/shrink the Wiener time-smooth for the
+   continual carriers (pilot every symbol -> the per-symbol phase is directly observed and must be PRESERVED, not
+   averaged); keep the light smooth only on scattered columns. A/B arbiter + per-frame BER.
+4. If steps 1-3 leave a residual per-symbol common-phase, ADD an explicit per-symbol CPE estimate from the (now 3)
+   continual pilots applied BEFORE the freq-interp (802.11 CPE), reusing the existing STEP-2 TRACK machinery
+   (telecom_system.cc:8120-8162) but per-symbol-LOCAL (no window-average — the §9 lesson).
+**GATE (the restored arbiter, bytes_ok the TRUE arbiter):** faithful arm meanH>0.18 AND col_phaseRMS back toward
+~0.03 AND **bytes_ok 0->1**, SANITY stays 8/8, per-frame WB/NB BER unchanged, all big-block + climb + sim-clock +
+probe-backoff fast tests rc=0. THEN (and only then) HW-validate (uhubctl power-cycle first; bench is off-limits
+until the q-table cal finishes and the arbiter is GREEN).
+**CLAUDE.md §2 STOP:** this is the FIRST attempt at the CORRECT root cause (the prior 4 attacked the exonerated
+CFO). If this honest attempt fails the restored bytes_ok gate, STOP and discuss — do not iterate blindly; a
+failure there means either the shared-estimator per-frame constraint conflicts (split the big-block estimator out)
+or the residual is genuinely an RX-pipeline numeric issue that must be localized first.
