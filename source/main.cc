@@ -495,6 +495,10 @@ int main(int argc, char *argv[])
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
+    bool test_bigblock_livepath_cli = false; // --test-bigblock-livepath: GAP-2 — real CONNECT + real SET_CONFIG
+                                        // handshake robust->CFG16 (NO pin), then a 1374B K=8 transfer through the
+                                        // REAL send_batch->bigblock_send_one_block emit + receive_byte cw0-CRC gate
+                                        // + carve + FIFO. Answers: does sim reproduce the HW cw0-CRC reject? exit rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -1068,6 +1072,17 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.2 / §5.5.
             test_v2_pendingack_flip_alias_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-livepath") == 0)
+        {
+            // GAP-2 LIVE-PATH (diag/livepath-sim): real CONNECT at the robust start, then
+            // ONE real SET_CONFIG handshake robust->CFG16 over the live wire (NO pin), then
+            // a 1374B K=8 transfer through the REAL send_batch->bigblock_send_one_block emit
+            // + receive_byte cw0-CRC gate + carve + FIFO. Key question: does the in-sim live
+            // path reproduce the HW cw0-CRC reject? One-shot at startup, then exit rc.
+            test_bigblock_livepath_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2302,6 +2317,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_v2_pendingack_flip_alias();
             printf("[FLAG] V2-pendingack-flip-alias test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_livepath_cli) {
+            // GAP-2 LIVE-PATH regression (diag/livepath-sim): real CONNECT at the robust
+            // start + ONE real SET_CONFIG handshake robust->CFG16 (NO pin), then a 1374B K=8
+            // transfer through the REAL send_batch->bigblock_send_one_block emit + the
+            // receive_byte cw0-CRC gate + carve + FIFO. Answers the key question whether the
+            // in-sim live path reproduces the HW cw0-CRC reject. One-shot, then exit rc.
+            printf("[FLAG] --test-bigblock-livepath: invoking GAP-2 live-path "
+                   "(real SET_CONFIG -> CFG16, no pin) big-block regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_livepath();
+            printf("[FLAG] Bigblock-livepath test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
