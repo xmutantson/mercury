@@ -10,6 +10,16 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+/* R006: shutdown_ is an atomic flag shared with main.cc (std::atomic<bool>).
+ * NOTE: although named *.c, this TU is compiled as C++ (build.sh:463 — it pulls
+ * in C++ headers via gui_state.h), so the C++ <atomic> header / std::atomic is
+ * the correct cross-TU-compatible declaration here (a C11 _Atomic keyword would
+ * not even parse under the C++ compiler). */
+#ifdef __cplusplus
+#include <atomic>
+#else
+#include <stdatomic.h>
+#endif
 #include <limits.h>
 #include <string.h>
 #include <math.h>
@@ -48,8 +58,22 @@ extern "C++" {
 #endif
 #endif
 
-// bool shutdown_;
-extern bool shutdown_;
+// R006 fix (race audit 2026-06-06): shutdown_ is written from this TU's audio
+// capture/playback/sim threads and read in main.cc's main-thread spin loops.
+// As a plain `bool` that concurrent unsynchronized access is a data race (UB).
+// It is defined as `std::atomic<bool> shutdown_` inside main.cc's `extern "C"`
+// block (C language linkage, unmangled name). This TU is compiled as C++
+// (build.sh:463), so we MUST declare it with the SAME C language linkage and
+// SAME type or the link will fail with an undefined symbol. std::atomic<bool>
+// is a standard-layout type and may have C language linkage. The simple
+// `shutdown_ = true` stores and `!shutdown_` / `if(shutdown_)` reads below
+// resolve to the atomic's seq_cst store / load operators — drop-in for the
+// existing plain-bool usage.
+#ifdef __cplusplus
+extern "C" { extern std::atomic<bool> shutdown_; }
+#else
+extern _Atomic bool shutdown_;
+#endif
 extern int radio_type;
 
 // Audio channel configuration (set from main.cc / GUI settings)
