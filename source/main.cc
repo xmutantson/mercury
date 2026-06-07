@@ -458,6 +458,9 @@ int main(int argc, char *argv[])
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
+    bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
+                                        // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
+                                        // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -966,6 +969,15 @@ int main(int argc, char *argv[])
             // at startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.1 / §5.1.
             test_retx_clear_on_recovery_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-v2-pendingack-flip-alias") == 0)
+        {
+            // R030 — v2 PENDING_ACK flip aliasing regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+            test_v2_pendingack_flip_alias_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2072,6 +2084,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_retx_clear_on_recovery();
             printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_v2_pendingack_flip_alias_cli) {
+            // R030 — v2 PENDING_ACK flip aliasing (one-shot, then exit rc).
+            printf("[FLAG] --test-v2-pendingack-flip-alias: invoking R030 "
+                   "PENDING_ACK flip aliasing regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_v2_pendingack_flip_alias();
+            printf("[FLAG] V2-pendingack-flip-alias test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

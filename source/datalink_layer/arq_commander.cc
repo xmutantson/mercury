@@ -1426,7 +1426,12 @@ void cl_arq_controller::process_messages_tx_data()
 	//      Step 8a's match-prev path; new-data routes to messages_rx[]
 	//      via match-current. Different physical buffers — no cross-batch
 	//      slot collisions (§7.8.3's hazard structurally eliminated).
-	int v2_retx_prefix_count = 0;
+	// R030 (race audit 2026-06-06): v2_retx_prefix_count is now a MEMBER (was a
+	// local) so the post-TX PENDING_ACK flip in send_batch() can see how many
+	// leading messages_batch_tx[] entries are the retx prefix. Reset to 0 here at
+	// the start of every batch build; set to R below only on a v2 mixed batch.
+	// (v2_mixed_batch stays local — only this function needs it.)
+	v2_retx_prefix_count = 0;
 	bool v2_mixed_batch = false;
 
 	// §7.13.39 Fix 2 — single source of truth for batch_tx slot identity.

@@ -3841,3 +3841,187 @@ int cl_arq_controller::test_retx_clear_on_recovery()
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
+
+// ============================================================================
+// R030 — v2 PENDING_ACK flip aliasing (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-v2-pendingack-flip-alias
+//
+// Race-audit R030 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.2 / §5.5): the post-TX PENDING_ACK flip (send_batch, arq_common.cc:~4087)
+// indexed messages_tx[] by the WIRE id messages_batch_tx[i].id. On a v2 MIXED
+// batch that wire id is NOT the messages_tx[] array index:
+//   - retx-prefix frames carry .id = the ORIGINAL wire slot of a PRIOR batch
+//     (their messages_tx[] slot was already freed to ACKED at SACK capture), and
+//   - new-data frames carry .id = pos_in_new_batch (overwritten at
+//     arq_commander.cc:1645), NOT the array index.
+// So the flip set PENDING_ACK on a FREE slot (-> spurious PENDING_ACK len=0 ->
+// ages to ACK_TIMED_OUT / nNAcked_data++ -> FAILED_/nLost_data++) or on a
+// foreign slot holding the next batch's queued data.
+//
+// The fix routes the flip through v2_flip_resolve_slot(), which SKIPS retx-prefix
+// frames and resolves new-data frames by (batch_seq_id, low7-seq). This test
+// builds a v2 mixed batch where the messages_tx[] array index space is DIVERGED
+// from the wire positions (holes + a retx prefix), drives the REAL
+// v2_flip_resolve_slot() for every batch slot, and asserts:
+//   - retx-prefix slots resolve to -1 (skipped);
+//   - new-data slots resolve to the CORRECT array index (NOT the wire id);
+//   - after applying the flip, NO FREE/foreign slot is left PENDING_ACK, and
+//     every owning slot IS PENDING_ACK;
+//   - the PRE-FIX model (flip by wire .id) WOULD have poisoned >=1 FREE/foreign
+//     slot (vacuity guard — proves the bug exists).
+//
+// Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_v2_pendingack_flip_alias()
+{
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-V2-FLIP] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->sack_v2_enabled = true;
+	const int CMD_BSI  = 10;   // new-data batch bsi
+	const int OLD_BSI  = 9;    // retx prefix bsi (a prior batch)
+	const int R        = 2;    // retx prefix length
+	this->data_batch_size = 5;
+
+	// --- Build the messages_tx[] new-data slots with HOLES -----------------
+	// New-data frames live at array indices {0, 3, 7} (holes at 1,2,4,5,6),
+	// each with batch_seq_id=CMD_BSI, sequence_number=id=pos_in_new_batch (0,1,2),
+	// status=ADDED_TO_BATCH_BUFFER — exactly as the v2 mixed-batch new-data fill
+	// leaves them (arq_commander.cc:1616/1644/1655).
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		messages_tx[i].status       = FREE;
+		messages_tx[i].length       = 0;
+		messages_tx[i].batch_seq_id = -1;
+	}
+	int newdata_idx[3]  = { 0, 3, 7 };   // diverged array indices (holes between)
+	for(int p = 0; p < 3; p++)
+	{
+		int idx = newdata_idx[p];
+		messages_tx[idx].type            = DATA_LONG;
+		messages_tx[idx].length          = 16;
+		messages_tx[idx].status          = ADDED_TO_BATCH_BUFFER;
+		messages_tx[idx].batch_seq_id    = CMD_BSI;
+		messages_tx[idx].sequence_number = p;       // pos_in_new_batch (low7)
+		messages_tx[idx].id              = p;       // overwritten wire id
+	}
+
+	// --- Build messages_batch_tx[]: [0..R) retx prefix, [R..R+3) new-data ---
+	this->v2_retx_prefix_count = R;
+	this->message_batch_counter_tx = R + 3;
+	// retx prefix: wire ids = ORIGINAL wire slots {5,6} (FREE in messages_tx) +
+	// OLD_BSI. These have NO live messages_tx slot — the flip must SKIP them.
+	int retx_wire_id[2] = { 5, 6 };
+	for(int r = 0; r < R; r++)
+	{
+		messages_batch_tx[r].type            = DATA_LONG;
+		messages_batch_tx[r].id              = retx_wire_id[r];   // orig wire slot
+		messages_batch_tx[r].batch_seq_id    = OLD_BSI;
+		messages_batch_tx[r].sequence_number = retx_wire_id[r];
+	}
+	// new-data: wire id = pos_in_new_batch (0,1,2), bsi=CMD_BSI, seq=pos.
+	for(int p = 0; p < 3; p++)
+	{
+		messages_batch_tx[R + p].type            = DATA_LONG;
+		messages_batch_tx[R + p].id              = p;            // overwritten wire id
+		messages_batch_tx[R + p].batch_seq_id    = CMD_BSI;
+		messages_batch_tx[R + p].sequence_number = p;
+	}
+
+	bool pass = true;
+
+	// --- PRE-FIX model: flip by wire .id (the bug) --------------------------
+	// Count how many flips would land on a FREE/foreign (not-owning) slot.
+	int prefix_bad_flips = 0;
+	for(int i = 0; i < this->message_batch_counter_tx; i++)
+	{
+		int wire_id = (int)(unsigned char)messages_batch_tx[i].id;
+		// The owning slot is one of newdata_idx for new-data; retx prefix has none.
+		bool is_owning = false;
+		for(int p = 0; p < 3; p++)
+			if(wire_id == newdata_idx[p]
+			   && i >= R && (i - R) == p) is_owning = true;
+		if(!is_owning) prefix_bad_flips++;
+	}
+
+	// --- POST-FIX: drive the REAL v2_flip_resolve_slot() --------------------
+	// Clear any PENDING_ACK, then apply the resolved flip.
+	for(int p = 0; p < 3; p++) messages_tx[newdata_idx[p]].status = ADDED_TO_BATCH_BUFFER;
+	int resolved[8];
+	for(int i = 0; i < this->message_batch_counter_tx; i++)
+	{
+		int slot = v2_flip_resolve_slot(i);
+		resolved[i] = slot;
+		if(slot >= 0)
+			messages_tx[slot].status = PENDING_ACK;
+	}
+
+	// (a) retx-prefix slots must resolve to -1 (skip).
+	for(int r = 0; r < R; r++)
+	{
+		if(resolved[r] != -1)
+		{
+			printf("[TEST-V2-FLIP] FAIL: retx-prefix batch_idx=%d resolved to slot %d "
+			       "(expected -1/skip)\n", r, resolved[r]);
+			pass = false;
+		}
+	}
+	// (b) new-data slots must resolve to the CORRECT diverged array index.
+	for(int p = 0; p < 3; p++)
+	{
+		if(resolved[R + p] != newdata_idx[p])
+		{
+			printf("[TEST-V2-FLIP] FAIL: new-data batch_idx=%d (pos %d) resolved to "
+			       "slot %d (expected array index %d)\n",
+				R + p, p, resolved[R + p], newdata_idx[p]);
+			pass = false;
+		}
+	}
+	// (c) every owning slot IS PENDING_ACK; no FREE/foreign slot is PENDING_ACK.
+	int owning_pending = 0, foreign_pending = 0;
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		bool is_owning = false;
+		for(int p = 0; p < 3; p++) if(i == newdata_idx[p]) is_owning = true;
+		if(messages_tx[i].status == PENDING_ACK)
+		{
+			if(is_owning) owning_pending++;
+			else          foreign_pending++;
+		}
+	}
+	if(owning_pending != 3)
+	{
+		printf("[TEST-V2-FLIP] FAIL: %d/3 owning slots PENDING_ACK\n", owning_pending);
+		pass = false;
+	}
+	if(foreign_pending != 0)
+	{
+		printf("[TEST-V2-FLIP] FAIL: %d FREE/foreign slot(s) wrongly PENDING_ACK "
+		       "(aliasing not fixed)\n", foreign_pending);
+		pass = false;
+	}
+	// (d) vacuity guard: the pre-fix model MUST have poisoned >=1 non-owning slot.
+	if(prefix_bad_flips < 1)
+	{
+		printf("[TEST-V2-FLIP] FAIL(vacuous): pre-fix model poisoned 0 slots — "
+		       "scenario does not exercise the aliasing\n");
+		pass = false;
+	}
+
+	printf("[TEST-V2-FLIP] %s: prefix_bad_flips(model)=%d resolved=[%d,%d,%d,%d,%d] "
+	       "owning_pending=%d foreign_pending=%d (new-data idx {0,3,7}, retx prefix R=%d)\n",
+		pass ? "PASS" : "FAIL", prefix_bad_flips,
+		resolved[0], resolved[1], resolved[2], resolved[3], resolved[4],
+		owning_pending, foreign_pending, R);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}

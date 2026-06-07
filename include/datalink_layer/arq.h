@@ -337,6 +337,11 @@ public:
   // retx-prefix structure it MUST be zeroed here too (single-owner contract).
   // See data-flow-arq-recovery-cluster.md §2.2 / §4.1 / §5.1.
   void clear_retx_queue();
+  // R030 (race audit 2026-06-06) — resolve the messages_tx[] slot the post-TX
+  // PENDING_ACK flip must mark for messages_batch_tx[batch_idx], or -1 to skip.
+  // Shared by send_batch()'s flip and the --test-v2-pendingack-flip-alias test.
+  // See data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+  int v2_flip_resolve_slot(int batch_idx);
   void set_control_batch_size(int control_batch_size);
   void set_role(int role);
   void calculate_receiving_timeout();
@@ -1363,6 +1368,16 @@ public:
   // Returns 0=PASS, 1=FAIL.
   int test_retx_clear_on_recovery();
 
+  // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
+  // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
+  // messages_tx[] array-index space DIVERGED from the wire positions (holes + a
+  // retx prefix), drives the REAL v2_flip_resolve_slot() for every batch slot,
+  // and asserts retx-prefix slots are skipped (-1), new-data slots resolve to the
+  // correct diverged array index (not the wire id), no FREE/foreign slot is left
+  // PENDING_ACK, and the pre-fix wire-id flip WOULD have poisoned a non-owning
+  // slot. Returns 0=PASS, 1=FAIL.
+  int test_v2_pendingack_flip_alias();
+
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
   // policy_evaluate_axis3() implements the per-SACK-event §4.3.2 controller.
@@ -1926,6 +1941,15 @@ public:
   float print_stats_frequency_hz;
 
   int message_batch_counter_tx;
+  // R030 (race audit 2026-06-06): number of leading messages_batch_tx[] entries
+  // that are the v2 retx PREFIX (their payload lives in retx_scratch[], NOT in
+  // any live messages_tx[] slot — the original slot was freed to ACKED at SACK
+  // capture, arq_commander.cc:2983). Set by process_messages_tx_data() on a v2
+  // MIXED batch (=R), 0 otherwise. The post-TX PENDING_ACK flip in send_batch()
+  // reads it to (a) SKIP retx-prefix frames (no messages_tx slot to flip) and
+  // (b) for new-data frames route by (batch_seq_id, low7-seq) instead of the
+  // overwritten wire .id. See data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+  int v2_retx_prefix_count;
 
   char* message_TxRx_byte_buffer;
   struct st_message messages_rx_buffer;
