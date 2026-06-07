@@ -2463,70 +2463,44 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 		return true;
 	};
 
-	// Thresholds: the big-block RAW |H| scale on the calibrated clean cell is ~0.24; the
-	// un-tracked-CFO collapse drops it to ~0.02-0.13 (HW: ~0.005). A wide gap → robust gate.
+	// Thresholds: the big-block RAW |H| scale on the calibrated clean cell is ~0.19-0.24; an
+	// un-tracked residual CFO collapses it to ~0.10 (HW: ~0.005). A wide gap → robust gate.
 	const double MEANH_OK  = 0.18;
 	const double MEANH_BAD = 0.16;
 
 	int failed = 0;
 
-	// ---------- 0) SANITY: clean channel is HEALTHY + byte-faithful. ----------
-	double s_meanh=-1; int s_cwok=-1; bool s_bytes=false;
-	bool s_ran = run_block(nullptr, s_meanh, s_cwok, s_bytes);
-	printf("[TEST-BIGBLOCK-CHANEST] SANITY clean: meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
-	       s_meanh, MEANH_OK, s_cwok, K, (int)s_bytes);
-	bool sanity_ok = s_ran && (s_meanh > MEANH_OK) && (s_cwok == K) && s_bytes;
-	printf("[TEST-BIGBLOCK-CHANEST] %s: SANITY clean channel healthy estimate + byte-faithful\n",
-	       sanity_ok ? "PASS" : "FAIL");
-	if(!sanity_ok) failed++;
+	// ============================================================================
+	// THE DEFECT (genuine reproduction, fix/bigblock-chanest): bigblock_rx_passband does ONE
+	// Schmidl-Cox TIMING acquisition and NO carrier-frequency (Moose) correction, unlike the
+	// per-frame receive_byte path (Moose every ~12-symbol frame, telecom_system.cc:2546). On a
+	// CLEAN channel the genuine big-block decode is healthy (mean|H|≈0.19, 8/8 byte-faithful). An
+	// un-tracked residual CFO (HW: post-Moose residual + crystal drift) makes the block-wide pilot
+	// estimate collapse: each pilot Y/X keeps ~full magnitude but the per-symbol phases spread
+	// across the 133-symbol / ~1.56 s block (8 Hz ⇒ ~12 cycles) and average toward 0 ⇒ mean|H|→0
+	// ⇒ LDPC decodes noise = the HW [RXACQ] mean|H|≈0.005 signature. Three arms drive ONE genuine
+	// (ref==NULL: tsB never transmits) CFG16 block through cl_sim_awgn:
+	//   SANITY (clean)        : mean|H| HEALTHY + 8/8 byte-faithful.
+	//   FAIL-BEFORE (CFO on)  : mean|H| COLLAPSED + NOT 8/8.
+	//   PASS-AFTER (CFO on, fix): mean|H| HEALTHY + 8/8 — FAILS until a PHY CFO-tracking fix lands.
+	// NOTE (refuted, see results_bb_chanest_fix.json): a head-preamble Moose estimate + one re-mix
+	// is ACCURATE (~8 Hz) but does NOT recover mean|H| (flat-ML Hbar 0.023 vs 0.024) — the fix
+	// needs a per-symbol / per-sub-block CFO+CPE track (decision-directed), NOT a single head
+	// correction. This test is the durable off-bench arbiter for that fix.
+	// ============================================================================
 
-	// ---------- 1) FAIL-BEFORE: CFO+SFO ON → estimate COLLAPSES, not 8/8. ----------
-	// HW-calibrated magnitudes (sim_channel.h §CFO/§SFO): static residual CFO + slow AR(1)
-	// drift + SFO. The CFO/SFO knobs are read by cl_sim_awgn at CONSTRUCTION (env-gated), so
-	// set the channel env BEFORE constructing ch_bad. clean SNR3k≥900 → no additive AWGN; only
-	// the CFO/SFO/PN/floor impairments, isolating the channel-estimation collapse from thermal
-	// noise. Distinct per-direction seed (the live wire seeds A→B with (seed<<1)|1).
-	auto set_ch_env = [&](const char* cfo, const char* cfo_walk, const char* sfo){
+	// Save+restore the channel env so the test leaves the process clean. The CFO knobs are read
+	// by cl_sim_awgn at CONSTRUCTION, so they must be set BEFORE the impaired channel is built.
+	auto getenv_s = [](const char* k){ const char* v=std::getenv(k); return v?std::string(v):std::string(); };
+	bool had_cfo=std::getenv("MERCURY_SIM2_CFO_HZ")!=NULL, had_cfow=std::getenv("MERCURY_SIM2_CFO_WALK_HZ")!=NULL;
+	std::string sv_cfo=getenv_s("MERCURY_SIM2_CFO_HZ"), sv_cfow=getenv_s("MERCURY_SIM2_CFO_WALK_HZ");
+	auto set_cfo = [&](const char* hz, const char* walk){
 #if defined(_WIN32)
-		_putenv_s("MERCURY_SIM2_CFO_HZ", cfo); _putenv_s("MERCURY_SIM2_CFO_WALK_HZ", cfo_walk); _putenv_s("MERCURY_SIM2_SFO_PPM", sfo);
+		_putenv_s("MERCURY_SIM2_CFO_HZ", hz); _putenv_s("MERCURY_SIM2_CFO_WALK_HZ", walk);
 #else
-		setenv("MERCURY_SIM2_CFO_HZ", cfo, 1); setenv("MERCURY_SIM2_CFO_WALK_HZ", cfo_walk, 1); setenv("MERCURY_SIM2_SFO_PPM", sfo, 1);
+		setenv("MERCURY_SIM2_CFO_HZ", hz, 1); setenv("MERCURY_SIM2_CFO_WALK_HZ", walk, 1);
 #endif
 	};
-	// Save+restore the channel env so the test leaves the process clean.
-	auto getenv_s = [](const char* k){ const char* v=std::getenv(k); return v?std::string(v):std::string(); };
-	bool had_cfo=std::getenv("MERCURY_SIM2_CFO_HZ")!=NULL, had_cfow=std::getenv("MERCURY_SIM2_CFO_WALK_HZ")!=NULL, had_sfo=std::getenv("MERCURY_SIM2_SFO_PPM")!=NULL;
-	std::string sv_cfo=getenv_s("MERCURY_SIM2_CFO_HZ"), sv_cfow=getenv_s("MERCURY_SIM2_CFO_WALK_HZ"), sv_sfo=getenv_s("MERCURY_SIM2_SFO_PPM");
-
-	set_ch_env("8", "4", "50");
-	double b_meanh=-1; int b_cwok=-1; bool b_bytes=false;
-	{
-		cl_sim_awgn ch_bad(((uint64_t)12345 << 1) | 1u, 900.0);
-		run_block(&ch_bad, b_meanh, b_cwok, b_bytes);
-	}
-	printf("[TEST-BIGBLOCK-CHANEST] FAIL-BEFORE (CFO+SFO): meanH=%.4f (want<%.2f) cw_ok=%d/%d bytes_ok=%d\n",
-	       b_meanh, MEANH_BAD, b_cwok, K, (int)b_bytes);
-	bool fail_before_ok = (b_meanh >= 0.0) && (b_meanh < MEANH_BAD) && !(b_cwok == K && b_bytes);
-	printf("[TEST-BIGBLOCK-CHANEST] %s: FAIL-BEFORE reproduces the HW [RXACQ] collapse "
-	       "(meanH=%.4f<%.2f, NOT 8/8 byte-faithful)\n",
-	       fail_before_ok ? "PASS" : "FAIL", b_meanh, MEANH_BAD);
-	if(!fail_before_ok) failed++;
-
-	// ---------- 2) PASS-AFTER: same impaired channel; the fix restores estimate + 8/8. ----------
-	double f_meanh=-1; int f_cwok=-1; bool f_bytes=false;
-	{
-		cl_sim_awgn ch_fix(((uint64_t)12345 << 1) | 1u, 900.0);
-		run_block(&ch_fix, f_meanh, f_cwok, f_bytes);
-	}
-	printf("[TEST-BIGBLOCK-CHANEST] PASS-AFTER (CFO+SFO, fix): meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
-	       f_meanh, MEANH_OK, f_cwok, K, (int)f_bytes);
-	bool pass_after_ok = (f_meanh > MEANH_OK) && (f_cwok == K) && f_bytes;
-	printf("[TEST-BIGBLOCK-CHANEST] %s: PASS-AFTER healthy estimate + 8/8 byte-faithful under "
-	       "CFO/SFO (the fix; FAILS until a PHY CFO/SFO-tracking fix lands)\n",
-	       pass_after_ok ? "PASS" : "FAIL");
-	if(!pass_after_ok) failed++;
-
-	// restore channel env
 	auto put = [&](const char* k, bool had, const std::string& v){
 #if defined(_WIN32)
 		if(had) _putenv_s(k, v.c_str()); else _putenv_s(k, "");
@@ -2534,11 +2508,43 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 		if(had) setenv(k, v.c_str(), 1); else unsetenv(k);
 #endif
 	};
+	const uint64_t SEED = ((uint64_t)12345 << 1) | 1u;   // A→B direction (live wire convention)
+
+	// ---------- 0) SANITY: clean channel is HEALTHY + byte-faithful. ----------
+	double s_meanh=-1; int s_cwok=-1; bool s_bytes=false;
+	bool s_ran = run_block(nullptr, s_meanh, s_cwok, s_bytes);
+	printf("[TEST-BIGBLOCK-CHANEST] SANITY (clean): meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	       s_meanh, MEANH_OK, s_cwok, K, (int)s_bytes);
+	bool sanity_ok = s_ran && (s_meanh > MEANH_OK) && (s_cwok == K) && s_bytes;
+	printf("[TEST-BIGBLOCK-CHANEST] %s: SANITY clean genuine big-block healthy + byte-faithful\n",
+	       sanity_ok ? "PASS" : "FAIL");
+	if(!sanity_ok) failed++;
+
+	// ---------- 1) FAIL-BEFORE: residual CFO ON → estimate COLLAPSES, not 8/8. ----------
+	set_cfo("8", "4");
+	double b_meanh=-1; int b_cwok=-1; bool b_bytes=false;
+	{ cl_sim_awgn ch_bad(SEED, 900.0); run_block(&ch_bad, b_meanh, b_cwok, b_bytes); }
+	printf("[TEST-BIGBLOCK-CHANEST] FAIL-BEFORE (CFO): meanH=%.4f (want<%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	       b_meanh, MEANH_BAD, b_cwok, K, (int)b_bytes);
+	bool fail_before_ok = (b_meanh >= 0.0) && (b_meanh < MEANH_BAD) && !(b_cwok == K && b_bytes);
+	printf("[TEST-BIGBLOCK-CHANEST] %s: FAIL-BEFORE reproduces the HW [RXACQ] collapse "
+	       "(meanH=%.4f<%.2f, NOT 8/8 byte-faithful)\n",
+	       fail_before_ok ? "PASS" : "FAIL", b_meanh, MEANH_BAD);
+	if(!fail_before_ok) failed++;
+
+	// ---------- 2) PASS-AFTER: same impaired channel; a fix must restore estimate + 8/8. ----------
+	double f_meanh=-1; int f_cwok=-1; bool f_bytes=false;
+	{ cl_sim_awgn ch_fix(SEED, 900.0); run_block(&ch_fix, f_meanh, f_cwok, f_bytes); }
+	printf("[TEST-BIGBLOCK-CHANEST] PASS-AFTER (CFO, fix): meanH=%.4f (want>%.2f) cw_ok=%d/%d bytes_ok=%d\n",
+	       f_meanh, MEANH_OK, f_cwok, K, (int)f_bytes);
+	bool pass_after_ok = (f_meanh > MEANH_OK) && (f_cwok == K) && f_bytes;
+	printf("[TEST-BIGBLOCK-CHANEST] %s: PASS-AFTER healthy estimate + 8/8 byte-faithful under CFO "
+	       "(FAILS until a PHY CFO-tracking fix lands)\n", pass_after_ok ? "PASS" : "FAIL");
+	if(!pass_after_ok) failed++;
+
 	put("MERCURY_SIM2_CFO_HZ", had_cfo, sv_cfo);
 	put("MERCURY_SIM2_CFO_WALK_HZ", had_cfow, sv_cfow);
-	put("MERCURY_SIM2_SFO_PPM", had_sfo, sv_sfo);
 	restore_k();
-
 	delete A; delete B; delete tsA; delete tsB;
 
 	printf("[TEST-BIGBLOCK-CHANEST] %s (%d failure%s)  [sanity meanH=%.3f | fail-before meanH=%.3f "
