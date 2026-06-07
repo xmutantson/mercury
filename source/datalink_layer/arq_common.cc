@@ -495,6 +495,7 @@ cl_arq_controller::cl_arq_controller()
 
 	last_received_message_sequence=255;
 	last_received_end_of_batch_seq=-1;
+	rx_buffer_eob_seq=-1;  // R038: per-frame v2 EOB staging (set in receive())
 	data_ack_received=NO;
 	repeating_last_ack=NO;
 	disconnect_requested=NO;
@@ -6357,9 +6358,26 @@ void cl_arq_controller::receive()
 				messages_rx_buffer.status=RECEIVED;
 				messages_rx_buffer.type=message_TxRx_byte_buffer[0];
 				// Bit 7 of sequence_number = end-of-batch flag from commander (data frames only)
+				// R038 (race audit 2026-06-06): this capture runs PRE-ROUTING — before
+				// the responder classifies the frame as match-current / match-prev /
+				// drop. Writing last_received_end_of_batch_seq here for ANY CRC-valid
+				// EOB frame let a prev-retransmit / late-duplicate of a SHORTER batch
+				// poison the CURRENT batch's effective_batch (early ACK-GATE PASS ->
+				// truncated delivery). For v2, STAGE the EOB seq and let the responder
+				// promote it ONLY inside the confirmed match-current storage block
+				// (arq_responder.cc match-current path). v1 has no bsi routing, so it
+				// keeps writing last_received_end_of_batch_seq directly here
+				// (byte-for-byte unchanged).
+				rx_buffer_eob_seq = -1;
 				if((message_TxRx_byte_buffer[2] & 0x80)
 					&& (messages_rx_buffer.type == DATA_LONG || messages_rx_buffer.type == DATA_SHORT))
-					last_received_end_of_batch_seq = message_TxRx_byte_buffer[2] & 0x7F;
+				{
+					int eob_seq = message_TxRx_byte_buffer[2] & 0x7F;
+					if(sack_v2_enabled)
+						rx_buffer_eob_seq = eob_seq;   // v2: stage, promote on match-current
+					else
+						last_received_end_of_batch_seq = eob_seq;  // v1: unchanged
+				}
 				messages_rx_buffer.sequence_number=message_TxRx_byte_buffer[2] & 0x7F;
 				last_received_message_sequence=messages_rx_buffer.sequence_number;
 				// Defensive clamp: never write more than alloc_size (N_MAX/8 = 200) bytes

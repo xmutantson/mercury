@@ -1309,6 +1309,16 @@ public:
   // in-window frame is still ACCEPTED (regression guard). Returns 0=PASS,1=FAIL.
   int test_sack_oow_reject();
 
+  // R038 (race audit 2026-06-06) — EOB-poison-from-prev-retransmit test.
+  // CLI: --test-eob-poison-prev-retx. Drives the real EOB staging/promotion
+  // members (last_received_end_of_batch_seq, rx_buffer_eob_seq) through a
+  // receive->stage->route->promote->gate sequence where a prev-retransmit of a
+  // SHORTER batch's EOB arrives while the current batch's own EOB is lost.
+  // Asserts the PRE-FIX single-stage capture reproduces the early ACK-GATE PASS
+  // (truncated delivery) AND the POST-FIX staged+match-current-gated promotion
+  // prevents it. Returns 0=PASS, 1=FAIL.
+  int test_eob_poison_prev_retx();
+
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
   // policy_evaluate_axis3() implements the per-SACK-event §4.3.2 controller.
@@ -2518,6 +2528,17 @@ private:
 
   char last_received_message_sequence;
   int last_received_end_of_batch_seq;  // End-of-batch flag: seq# of frame with bit 7 set, or -1
+  // R038 (race audit 2026-06-06): per-frame EOB STAGING for the v2 path.
+  // receive() decodes the EOB bit BEFORE the responder knows whether the frame
+  // is match-current / match-prev / drop. Writing last_received_end_of_batch_seq
+  // pre-routing let a CRC-valid prev-retransmit / late-duplicate of a SHORTER
+  // batch poison the CURRENT batch's effective_batch (early ACK-GATE PASS ->
+  // truncated delivery). For v2, receive() now stages the decoded EOB seq here
+  // (or -1 if the frame has no EOB bit) and the responder promotes it to
+  // last_received_end_of_batch_seq ONLY inside the confirmed match-current
+  // storage block. v1 (no bsi routing) keeps writing last_received_end_of_batch
+  // _seq directly in receive() and leaves this field unused (-1).
+  int rx_buffer_eob_seq;               // staged EOB seq for current v2 frame, or -1
   char last_message_sent_type;
   char last_message_sent_code;
 

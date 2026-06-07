@@ -862,6 +862,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 				}
 				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
 				batch_rx_frame_count++;
+				// R038 (race audit 2026-06-06): promote the v2 EOB ONLY now, inside
+				// the confirmed match-current storage block. For v2, receive()
+				// STAGED the decoded EOB seq on rx_buffer_eob_seq instead of writing
+				// last_received_end_of_batch_seq pre-routing, so a prev-retransmit /
+				// late-duplicate of a shorter batch can no longer poison the current
+				// batch's effective_batch (the gate below + the final ACK-GATE read
+				// last_received_end_of_batch_seq). This block is reached for v2 ONLY
+				// when match_current (match-prev routes to the prev block; OOW/drop
+				// sets v2_route_drop) — see arq_responder.cc:615-654. v1 has no bsi
+				// routing: receive() already set last_received_end_of_batch_seq and
+				// rx_buffer_eob_seq stays -1, so v1 is left byte-for-byte unchanged.
+				if(sack_v2_enabled && rx_buffer_eob_seq >= 0)
+					last_received_end_of_batch_seq = rx_buffer_eob_seq;
 				int rx_timeout = 0;
 				int effective_batch = data_batch_size;
 				{
@@ -3335,6 +3348,211 @@ int cl_arq_controller::test_sack_oow_reject()
 	       "(OOW decoded-but-rejected=%d)\n",
 		pass ? "PASS" : "FAIL", cmd_bsi, prev_bsi, oow_bsi,
 		oow_decoded_but_rejected ? 1 : 0);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// R038 — EOB poison from prev-retransmit (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-eob-poison-prev-retx
+//
+// Race-audit R038 (mercury/fact-documents/data-flow-arq-recovery-cluster.md
+// §4.4 / §5.3): receive() captured last_received_end_of_batch_seq for ANY
+// CRC-valid EOB DATA frame PRE-ROUTING (arq_common.cc:~6362) — before the
+// responder classifies the frame match-current / match-prev / drop. A CRC-valid
+// prev-retransmit / late-duplicate of a SHORTER prior batch therefore set
+// effective_batch = (short_eob+1) < the current batch's real size. If the
+// current batch's own EOB was lost/late while earlier current frames
+// accumulated to >= that shorter size, the per-frame timer gate
+// (arq_responder.cc:872-897) PASSed early -> the current batch was delivered
+// TRUNCATED as if complete, the bsi bumped, and un-arrived current frames
+// dropped out of window.
+//
+// The fix STAGES the v2 EOB (rx_buffer_eob_seq) in receive() and promotes it to
+// last_received_end_of_batch_seq ONLY inside the confirmed match-current storage
+// block. This test drives the REAL members (last_received_end_of_batch_seq,
+// rx_buffer_eob_seq, rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id)
+// through the receive->stage->route->promote->gate sequence for a mixed arrival
+// stream and compares the PRE-FIX single-stage capture against the POST-FIX
+// staged+gated promotion. It asserts the post-fix effective_batch is NEVER
+// poisoned by the prev-retransmit's short EOB and the gate does NOT PASS early.
+//
+// Scenario: current batch bsi=5 real size 25 (EOB on frame 24). Current frames
+// 0..23 arrive but the EOB frame 24 is LOST. Interleaved: a prev-retransmit of
+// bsi=4 frame 9 carrying the SHORT batch's EOB (size 10) arrives after current
+// frame 9.
+//   PRE-FIX: the prev-retransmit's EOB poisons last_received_end_of_batch_seq=9
+//            -> effective_batch=min(25,10)=10 -> gate PASSes at current frame 10
+//            (only 10 of 24 delivered -> TRUNCATED).
+//   POST-FIX: the prev-retransmit is match-prev (not match-current) so its EOB
+//            is staged but NOT promoted -> last_received_end_of_batch_seq stays
+//            -1 -> effective_batch=25 -> gate never PASSes early (24<25 -> SACK).
+//
+// PASS: post-fix gate does NOT PASS early AND pre-fix gate WOULD have (proving
+//       the bug exists and the fix removes it). Returns 0 on PASS, 1 on FAIL.
+int cl_arq_controller::test_eob_poison_prev_retx()
+{
+	// --- Step 0: allocate + prime v2 state ---------------------------------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-EOB-POISON] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	this->sack_v2_enabled  = true;
+	this->sack_enabled     = true;
+	this->compression_enabled = false;  // avoid the compression-header fallback leg
+	const int CUR_BSI      = 5;
+	const int PREV_BSI     = 4;
+	const int CUR_SIZE     = 25;   // current batch real size (EOB on frame 24)
+	const int PREV_SIZE    = 10;   // prev batch real size (EOB on frame 9 — shorter)
+	this->data_batch_size  = CUR_SIZE;
+	this->rsp_current_expected_batch_seq_id = CUR_BSI;
+	this->rsp_prev_batch_seq_id   = PREV_BSI;
+	this->rsp_prev_batch_active   = true;   // prev buffer live (retransmits routable)
+	this->rsp_prev_batch_received_count  = 0;
+	this->rsp_prev_batch_expected_count  = PREV_SIZE;
+
+	// Two parallel models of last_received_end_of_batch_seq:
+	//   prefix_eob: PRE-FIX single-stage capture (set on ANY EOB frame, pre-route)
+	//   the REAL member: POST-FIX staged + match-current-gated promotion
+	int prefix_eob = -1;
+	this->last_received_end_of_batch_seq = -1;
+
+	// Reset both batch frame stores.
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		messages_rx[i].status = FREE;
+		messages_rx[i].batch_seq_id = -1;
+	}
+	int cur_frame_count = 0;  // distinct current-batch frames stored
+
+	bool prefix_gate_passed_early  = false;
+	bool postfix_gate_passed_early = false;
+	int  prefix_pass_at  = -1;
+	int  postfix_pass_at = -1;
+
+	// Arrival stream: current frames 0..23 (EOB frame 24 LOST), with a
+	// prev-retransmit of bsi=4 frame 9 (EOB) injected right after current frame 9.
+	struct arr { int bsi; int seq; bool eob; };
+	struct arr stream[32];
+	int n = 0;
+	for(int f = 0; f < 24; f++)   // current frames 0..23 (NOT 24 — its EOB is lost)
+	{
+		stream[n].bsi = CUR_BSI; stream[n].seq = f; stream[n].eob = false; n++;
+		if(f == 9)
+		{
+			// prev-retransmit of the SHORTER batch's EOB frame.
+			stream[n].bsi = PREV_BSI; stream[n].seq = (PREV_SIZE - 1); stream[n].eob = true; n++;
+		}
+	}
+
+	for(int k = 0; k < n; k++)
+	{
+		int  bsi = stream[k].bsi;
+		int  seq = stream[k].seq;
+		bool eob = stream[k].eob;
+
+		// ---- receive(): decode the EOB bit + STAGE (v2) -------------------
+		// Mirrors arq_common.cc receive(): rx_buffer_eob_seq staged for v2;
+		// prefix model writes the pre-routing capture unconditionally.
+		this->rx_buffer_eob_seq = -1;
+		if(eob)
+		{
+			prefix_eob = seq;                  // PRE-FIX: pre-routing write
+			this->rx_buffer_eob_seq = seq;     // POST-FIX: staged only
+		}
+
+		// ---- responder routing: match-current / match-prev / drop --------
+		bool match_current = (bsi == this->rsp_current_expected_batch_seq_id);
+		bool match_prev    = (this->rsp_prev_batch_seq_id >= 0
+		                      && bsi == this->rsp_prev_batch_seq_id);
+
+		if(match_current)
+		{
+			// match-current storage block: store + PROMOTE staged EOB (the fix).
+			int loc = seq;
+			if(loc >= 0 && loc < this->nMessages
+			   && messages_rx[loc].status != RECEIVED)
+			{
+				messages_rx[loc].status       = RECEIVED;
+				messages_rx[loc].batch_seq_id = bsi;
+				cur_frame_count++;
+			}
+			if(this->sack_v2_enabled && this->rx_buffer_eob_seq >= 0)
+				this->last_received_end_of_batch_seq = this->rx_buffer_eob_seq;
+		}
+		else if(match_prev && this->rsp_prev_batch_active)
+		{
+			// prev block: independent storage; does NOT promote the current EOB.
+			// (No write to last_received_end_of_batch_seq — that is the fix.)
+		}
+		// else: drop (out of window) — neither stores nor promotes.
+
+		// ---- per-frame timer gate (both models) --------------------------
+		// effective_batch = min(data_batch_size, eob+1). PASS when
+		// cur_frame_count >= effective_batch.
+		int prefix_eff  = this->data_batch_size;
+		if(prefix_eob >= 0 && (prefix_eob + 1) < prefix_eff)
+			prefix_eff = prefix_eob + 1;
+		int postfix_eff = this->data_batch_size;
+		if(this->last_received_end_of_batch_seq >= 0
+		   && (this->last_received_end_of_batch_seq + 1) < postfix_eff)
+			postfix_eff = this->last_received_end_of_batch_seq + 1;
+
+		if(!prefix_gate_passed_early && cur_frame_count >= prefix_eff)
+		{
+			prefix_gate_passed_early = true; prefix_pass_at = cur_frame_count;
+		}
+		if(!postfix_gate_passed_early && cur_frame_count >= postfix_eff)
+		{
+			postfix_gate_passed_early = true; postfix_pass_at = cur_frame_count;
+		}
+	}
+
+	// After the whole stream: current batch has 24 distinct frames; its real EOB
+	// (frame 24) was lost so a CORRECT responder must NOT have PASSed (24<25).
+	// PRE-FIX: prefix_eff collapsed to 10 -> PASSed at 10 (truncated, BUG).
+	// POST-FIX: last_received_end_of_batch_seq stayed -1 -> eff=25 -> never PASS.
+	bool pass = true;
+	// 1. The bug must be reproduced by the pre-fix model (else the test is vacuous).
+	if(!prefix_gate_passed_early)
+	{
+		printf("[TEST-EOB-POISON] FAIL(vacuous): pre-fix model did NOT reproduce "
+		       "the early PASS — test scenario is wrong\n");
+		pass = false;
+	}
+	// 2. The fix must PREVENT the early PASS.
+	if(postfix_gate_passed_early)
+	{
+		printf("[TEST-EOB-POISON] FAIL: post-fix gate PASSed early at cur_frame_count=%d "
+		       "(last_received_end_of_batch_seq=%d) — EOB poison NOT fixed\n",
+			postfix_pass_at, this->last_received_end_of_batch_seq);
+		pass = false;
+	}
+	// 3. Post-fix EOB must be -1 (no current EOB arrived; prev-retransmit ignored).
+	if(this->last_received_end_of_batch_seq != -1)
+	{
+		printf("[TEST-EOB-POISON] FAIL: last_received_end_of_batch_seq=%d (expected -1; "
+		       "the prev-retransmit's short EOB leaked into the current batch)\n",
+			this->last_received_end_of_batch_seq);
+		pass = false;
+	}
+
+	printf("[TEST-EOB-POISON] %s: cur_frames=%d/%d prefix_passed_early=%d@%d "
+	       "postfix_passed_early=%d@%d last_eob(real)=%d prefix_eob(model)=%d\n",
+		pass ? "PASS" : "FAIL", cur_frame_count, CUR_SIZE,
+		prefix_gate_passed_early ? 1 : 0, prefix_pass_at,
+		postfix_gate_passed_early ? 1 : 0, postfix_pass_at,
+		this->last_received_end_of_batch_seq, prefix_eob);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }

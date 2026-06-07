@@ -449,6 +449,9 @@ int main(int argc, char *argv[])
     bool test_sack_oow_reject_cli = false; // --test-sack-oow-reject: R039 — OFDM SACK_RSP out-of-window
                                         // reject. Drives real decode_sack_v2_frame + real sack_v2_bsi_in_window guard;
                                         // asserts CRC8-valid OOW SACK decoded-but-rejected, in-window accepted. One-shot, exits rc.
+    bool test_eob_poison_prev_retx_cli = false; // --test-eob-poison-prev-retx: R038 — prev-retransmit EOB
+                                        // poison. Drives the real EOB staging/promotion members; asserts pre-fix early
+                                        // ACK-GATE PASS reproduced AND post-fix prevents it. One-shot, exits rc.
     bool test_data_anchored_promote_cli = false; // --test-data-anchored-promote: Option B (data-anchored gearshift
                                         // promotion) regression. Drives break_target_with_anchor() + policy_evaluate_axis1()
                                         // with last_data_viable_config primed; asserts BREAK floors at the anchor and the
@@ -930,6 +933,15 @@ int main(int argc, char *argv[])
             // at startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.5 / §5.4.
             test_sack_oow_reject_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-eob-poison-prev-retx") == 0)
+        {
+            // R038 — prev-retransmit EOB poison regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.4 / §5.3.
+            test_eob_poison_prev_retx_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2006,6 +2018,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_sack_oow_reject();
             printf("[FLAG] Sack-oow-reject test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_eob_poison_prev_retx_cli) {
+            // R038 — prev-retransmit EOB poison (one-shot, then exit rc).
+            printf("[FLAG] --test-eob-poison-prev-retx: invoking R038 EOB-poison "
+                   "regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_eob_poison_prev_retx();
+            printf("[FLAG] Eob-poison test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
