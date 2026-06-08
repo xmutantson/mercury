@@ -1576,22 +1576,25 @@ public:
   // MERCURY_BIGBLOCK_DEFEAT_FIX=1 reproducer hook bypasses the clamp (returns stock_ftr)
   // so the SAME binary reproduces the pre-fix truncated-window corruption for the A/B.
   int bigblock_block_ftr_or(int stock_ftr);
-  // ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). The §17 ftr clamp made the
-  // snapshot WAIT for a block-span of FRESH symbols (the COUNT), but the snapshot still
-  // fires at a RANDOM ring write-head phase (the POSITION), so a block whose preamble
-  // lands late in the captured window has its tail STILL ARRIVING (future samples, not
-  // yet in the ring) when frames_to_read hits 0 -> bb_at zero-pads the tail -> the
-  // block-wide estimate collapses -> cw0 wire-CRC fails even on a perfect timing lock
-  // (HW ACQ_GATE_ANALYSIS: only the preamble_symbol==0 attempt passed; metric-0.999
-  // late-landing attempts failed). bigblock_acq_window_fits() returns true when the
-  // FULL located block (head + preamble + Ngrid) fits inside the captured window
-  // (head_delay + block_nsymb*sym_samples <= capture_nsamples), i.e. the carve will see
-  // a complete block. When it returns false the receive() guard DEFERS the carve one
-  // arming cycle (re-arm frames_to_read to the block span, leave the ring intact) so the
-  // tail arrives and the block re-lands earlier in the window. Gated on the CFG16
+  // ACQUISITION-WINDOW POSITION GUARD — WAIT-FOR-TAIL (fact-doc §22, supersedes the §19
+  // defer-and-re-arm REGRESSION). The §17 ftr clamp made the snapshot WAIT for a block-span
+  // of FRESH symbols (the COUNT), but the snapshot still fires at a RANDOM ring write-head
+  // phase (the POSITION), so a block whose preamble lands late in the captured window has
+  // its tail STILL ARRIVING (future samples, not yet in the ring) when frames_to_read hits
+  // 0 -> bb_at zero-pads the tail -> the block-wide estimate collapses -> cw0 wire-CRC fails
+  // even on a perfect timing lock. bigblock_acq_window_fits() returns true when the FULL
+  // located block (head + preamble + Ngrid) fits inside the captured window (head_delay +
+  // block_nsymb*sym_samples <= capture_nsamples), i.e. the carve will see a complete block.
+  // When it returns false the receive() guard WAITS-FOR-TAIL: it re-arms frames_to_read to
+  // ONLY ceil(overrun/symbol_period)+1 fresh symbols (NOT a block-span — a block-span re-arm
+  // scrolls the head off the back of the ring, the §19 deadlock), leaves the ring INTACT
+  // (head must survive) and does NOT touch ring_write_index. The ring slides forward by that
+  // short wait so the SAME single transmission's tail arrives in-ring and the block re-lands
+  // earlier in the window -> fits -> carves 8/8 (no NAK/retransmit needed; geometry guarantees
+  // the head stays in-ring since block_span 64 sym <= ring 133 sym). Gated on the CFG16
   // big-block rung; off-rung the guard is never entered (byte-identical).
-  // bigblock_rx_defer_count caps consecutive defers so a genuinely absent block falls
-  // through to the stock cw0-CRC gate instead of spinning. Reset on every accept.
+  // bigblock_rx_defer_count caps consecutive WAITS so a genuinely absent block falls through
+  // to the stock cw0-CRC gate instead of spinning. Reset on every accept.
   bool bigblock_acq_window_fits();
   int  bigblock_rx_defer_count = 0;
   // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the

@@ -2852,10 +2852,9 @@ int cl_arq_controller::test_sim_inproc_bigblock_acqwindow()
 
 	int failed = 0;
 
-	// Three in-window offsets. HEAD/MID fit; NEAR-END's tail runs past the window.
+	// Two in-window offsets that FIT (no-regression on the common path).
 	const int OFF_HEAD = 0;
 	const int OFF_MID  = SLACK / 2;          // still fits (offset + block_nsymb <= WIN_NSYMB)
-	const int OFF_NEAR = SLACK + 6;          // tail past window: offset+block_nsymb > WIN_NSYMB
 
 	// ---------- HEAD: fits -> carve 8/8 (no regression on the common path). ----------
 	{
@@ -2877,43 +2876,117 @@ int cl_arq_controller::test_sim_inproc_bigblock_acqwindow()
 		if(!ok) failed++;
 	}
 
-	// ---------- NEAR-END FAIL-BEFORE: guard BYPASSED -> truncated carve -> bytes_ok=0. ----------
+	// ============================================================================
+	// §22 LIVE-RING ONE-SHOT MODEL. ONE transmission `tx_pb` is laid into a long zero-padded
+	// `stream` at absolute position `lead`. A "snapshot at write-head T" copies the most-recent
+	// WIN_NSYMB symbols [T-win_samp, T) and ZEROS everything at index >= T (the future, not yet
+	// produced into the ring). This is the live capture: the producer fills the ring one symbol
+	// at a time, the consumer snapshots when frames_to_read hits 0, and the tail beyond the
+	// current write-head is silence. NO re-injection — the SAME tx_pb is read at two write-heads.
+	// ============================================================================
+	// Geometry of the first (overrunning) snapshot. window = [T0-win_samp, T0); preamble at
+	// absolute `lead`; in-window head0 = lead - (T0 - win_samp) = win_samp - (T0 - lead). For the
+	// tail to overrun by OVERRUN_SYM symbols we need head0 + block_nsymb*sym > win_samp, i.e.
+	// head0 = (SLACK + OVERRUN_SYM)*sym (since win_samp = (block_nsymb+SLACK)*sym). So set the
+	// 1st-snapshot write-head T0 such that (T0 - lead) = (block_nsymb - OVERRUN_SYM)*sym. This is
+	// the HW position bug: the §17 block-span arming fired BEFORE the full block was produced.
+	const int   OVERRUN_SYM  = 6;                                       // tail past window by 6 sym
+	const long  lead         = (long)block_nsymb * sym_samp;           // arbitrary positive lead
+	const long  T0           = lead + (long)(block_nsymb - OVERRUN_SYM) * sym_samp; // 1st snapshot write-head
+	const long  stream_len   = lead + (long)n_tx + (long)WIN_NSYMB * sym_samp; // generous tail room
+	std::vector<double> stream((size_t)stream_len, 0.0);
+	for(int i=0;i<n_tx;i++){ long d = lead + i; if(d>=0 && d<stream_len) stream[(size_t)d] = tx_pb[(size_t)i]; }
+
+	// snapshot_at(T): the live capture window the consumer would see if the producer's write-head
+	// is at sample T. Returns fits + (carved) byte-faithfulness, and the in-window head offset.
+	auto snapshot_at = [&](long T, bool& fits_out, int& cwok_out, bool& bytes_ok_out,
+	                       long& head_out, bool do_carve)->void {
+		fits_out = false; cwok_out = -1; bytes_ok_out = false; head_out = -1;
+		std::vector<double> rx_pb((size_t)win_samp, 0.0);
+		long wstart = T - win_samp;                          // absolute index of window sample 0
+		for(int i=0;i<win_samp;i++){
+			long abs = wstart + i;
+			if(abs >= 0 && abs < T && abs < stream_len)      // only PAST samples are produced
+				rx_pb[(size_t)i] = stream[(size_t)abs];      // (index >= T stays 0: the future)
+		}
+		int saved_buffer_Nsymb = tsB->data_container.buffer_Nsymb;
+		tsB->data_container.buffer_Nsymb = WIN_NSYMB;
+		std::vector<int> info_bits((size_t)(K+1) * tsB->ldpc.K + tsB->ldpc.K, 0);
+		tsB->bigblock_last_rx_meanh = -1.0;
+		tsB->receive_byte(rx_pb.data(), info_bits.data());   // -> receive_bigblock (ref==NULL)
+		fits_out = B->bigblock_acq_window_fits();
+		head_out = tsB->bigblock_last_rx_head_delay_samples;
+		cwok_out = tsB->bigblock_last_rx_cw_ok_count;
+		int K_rx = tsB->bigblock_last_rx_K;
+		if(do_carve && K_rx == K){
+			for(int i=0;i<B->nMessages;i++){ B->messages_rx[i].status=FREE; B->messages_rx[i].length=0; B->messages_rx[i].batch_seq_id=-1; }
+			B->rsp_current_expected_batch_seq_id = block_bsi; B->rsp_prev_batch_seq_id=-1;
+			B->rsp_prev_batch_active=false; B->batch_rx_frame_count=0; B->last_received_end_of_batch_seq=-1;
+			int carve_rc = B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)block_bsi);
+			if(carve_rc == SUCCESSFUL){
+				bytes_ok_out = true;
+				for(int c=0;c<K && bytes_ok_out;c++){
+					if(B->messages_rx[c].status != RECEIVED || B->messages_rx[c].length != app_len[c]){ bytes_ok_out=false; break; }
+					for(int j=0;j<app_len[c];j++)
+						if((unsigned char)B->messages_rx[c].data[j] != app_truth[c][(size_t)j]){ bytes_ok_out=false; break; }
+				}
+			}
+		}
+		tsB->data_container.buffer_Nsymb = saved_buffer_Nsymb;
+	};
+
+	// First snapshot (write-head T0): the block tail overran the window (the HW position bug).
+	// This is the same for both arms — the divergence is the RE-ARM the guard chooses next.
+	bool fits0; int cwok0; bool bytes0; long head0;
+	snapshot_at(T0, fits0, cwok0, bytes0, head0, /*do_carve=*/false);
+	long overrun0 = (head0 >= 0) ? (head0 + (long)block_nsymb*sym_samp - (long)win_samp) : -1;
+	printf("[TEST-BIGBLOCK-ACQWINDOW] LIVE-RING 1st snapshot (write-head T0): fits=%d head=%ld "
+		"(=%.1f sym) overrun=%ld -> %s\n", (int)fits0, head0, (sym_samp>0?(double)head0/sym_samp:0.0),
+		overrun0, (!fits0) ? "OVERRAN (defer)" : "fits (unexpected)");
+
+	// ---------- LIVE-RING FAIL-BEFORE: the §19 recovery re-arms a FULL block-span -> the
+	//            write-head jumps T0 + (block_nsymb+10)*sym, scrolling the head OFF THE BACK
+	//            of the window -> acquisition can no longer find the block -> 0/8 (deadlock). ----
 	{
-		set_envv("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "1");
-		bool fits; int cwok; bool bytes;
-		decode_at_offset(OFF_NEAR, fits, cwok, bytes, /*do_carve=*/true);
-		set_envv("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "");
-		// fail-before contract: the block does NOT fit, and carving it anyway yields WRONG bytes.
-		bool reproduced = (!fits) && (!bytes);
-		printf("[TEST-BIGBLOCK-ACQWINDOW] NEAR-END FAIL-BEFORE (off=%d sym, DEFEAT_ACQGUARD=1): "
-			"fits=%d cw_ok=%d/%d bytes_ok=%d -> %s (want fits=0 bytes_ok=0 = truncated carve)\n",
-			OFF_NEAR, (int)fits, cwok, K, (int)bytes, reproduced ? "PASS" : "FAIL");
-		if(!reproduced) failed++;
+		long T1_bad = T0 + (long)(block_nsymb + 10) * sym_samp;   // the §19 block-span re-arm
+		bool fits1; int cwok1; bool bytes1; long head1;
+		snapshot_at(T1_bad, fits1, cwok1, bytes1, head1, /*do_carve=*/true);
+		// fail-before contract: after the block-span re-arm the head scrolled past the window start
+		// (the original single transmission is GONE from the ring) -> NO byte-faithful delivery.
+		// That is the deadlock: the CMD waits a SACK that this re-arm can never produce.
+		bool deadlocked = (!bytes1);
+		printf("[TEST-BIGBLOCK-ACQWINDOW] LIVE-RING FAIL-BEFORE (§19 block-span re-arm): "
+			"2nd snapshot fits=%d head=%ld cw_ok=%d/%d bytes_ok=%d -> %s "
+			"(want head scrolled off / 0 delivered = the deadlock)\n",
+			(int)fits1, head1, cwok1, K, (int)bytes1, deadlocked ? "PASS" : "FAIL");
+		if(!deadlocked) failed++;
 	}
 
-	// ---------- NEAR-END PASS-AFTER: guard ON -> DEFER (no fit), then re-present the SAME block
-	//            at an EARLY offset (next arming cycle: tail arrived, block re-lands early) -> 8/8.
+	// ---------- LIVE-RING PASS-AFTER: wait-for-tail re-arms ONLY wait_syms = ceil(overrun/sym)+1
+	//            -> write-head T0 + wait_syms*sym -> the head slides earlier (still in-ring) and
+	//            the tail of the SAME single transmission has now been produced -> carve 8/8. ----
 	{
-		bool fits; int cwok; bool bytes;
-		// pass 1: the late block -> guard says "does not fit" (defer; do NOT carve a truncated block).
-		decode_at_offset(OFF_NEAR, fits, cwok, bytes, /*do_carve=*/false);
-		bool deferred = !fits;   // the §19 guard would DEFER (receive() skips the carve)
-		// pass 2: the re-presented complete block at HEAD -> fits + carve 8/8 byte-faithful.
-		bool fits2; int cwok2; bool bytes2;
-		decode_at_offset(OFF_HEAD, fits2, cwok2, bytes2, /*do_carve=*/true);
-		bool recovered = fits2 && (cwok2 == K) && bytes2;
-		bool ok = deferred && recovered;
-		printf("[TEST-BIGBLOCK-ACQWINDOW] NEAR-END PASS-AFTER (guard ON): pass1 fits=%d (defer=%d) | "
-			"pass2(re-armed) fits=%d cw_ok=%d/%d bytes_ok=%d -> %s\n",
-			(int)fits, (int)deferred, (int)fits2, cwok2, K, (int)bytes2, ok ? "PASS" : "FAIL");
-		if(!ok) failed++;
+		int wait_syms = 1;
+		if(overrun0 > 0) wait_syms = (int)((overrun0 + sym_samp - 1) / sym_samp) + 1;
+		if(wait_syms < 1) wait_syms = 1;
+		long T1_good = T0 + (long)wait_syms * sym_samp;           // the §22 wait-for-tail re-arm
+		bool fits2; int cwok2; bool bytes2; long head2;
+		snapshot_at(T1_good, fits2, cwok2, bytes2, head2, /*do_carve=*/true);
+		bool recovered = fits2 && (cwok2 == K) && bytes2 && (head2 >= 0);
+		printf("[TEST-BIGBLOCK-ACQWINDOW] LIVE-RING PASS-AFTER (wait-for-tail, wait_syms=%d): "
+			"2nd snapshot fits=%d head=%ld (=%.1f sym, in-ring) cw_ok=%d/%d bytes_ok=%d -> %s "
+			"(one transmission, no re-injection)\n",
+			wait_syms, (int)fits2, head2, (sym_samp>0?(double)head2/sym_samp:0.0),
+			cwok2, K, (int)bytes2, recovered ? "PASS" : "FAIL");
+		if(!recovered) failed++;
 	}
 
 	restore_k();
 	delete A; delete B; delete tsA; delete tsB;
 
-	printf("[TEST-BIGBLOCK-ACQWINDOW] %s (%d failure%s)  [HEAD+MID fit&8/8 | NEAR-END fail-before "
-	       "truncated bytes_ok=0 | NEAR-END pass-after defer-then-8/8]\n",
+	printf("[TEST-BIGBLOCK-ACQWINDOW] %s (%d failure%s)  [HEAD+MID fit&8/8 | LIVE-RING fail-before "
+	       "(§19 block-span re-arm -> head off back -> deadlock) | LIVE-RING pass-after "
+	       "(wait-for-tail -> 8/8 from ONE transmission)]\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

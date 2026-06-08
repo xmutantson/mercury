@@ -10917,7 +10917,8 @@ int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
 		"MERCURY_SIM_2INST", "MERCURY_BIGBLOCK_FRAMING", "MERCURY_BIGBLOCK_K",
 		"MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
 		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
-		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
+		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_BIGBLOCK_DEFEAT_ACQGUARD",
+		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
 	};
 	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
 	std::vector<EnvSave> env_saved((size_t)nkeys);
@@ -10970,8 +10971,15 @@ int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
 	set_env("MERCURY_SIM2_MAXITERS",        "200000");
 	set_env("MERCURY_SIM2_STALL_ITERS",     "60000");
 	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",  "1");
-	printf("[TEST-BIGBLOCK-FULLPATH] --- FAIL-BEFORE arm (MERCURY_BIGBLOCK_DEFEAT_FIX=1: "
-	       "one-stock-frame RX wait -> partial-block decode) ---\n"); fflush(stdout);
+	// §22: DEFEAT_FIX=1 restores the §17 one-stock-frame RX wait, which truncates the block so its
+	// tail overruns the window. The §22 acq-window WAIT-FOR-TAIL guard would CATCH that overrun and
+	// recover the block (defeating this §17 fail-before), so DEFEAT the acq-guard here to isolate
+	// the §17 partial-block bug. (The two fixes are independent: §17 = the armed window COUNT; §22 =
+	// the snapshot POSITION/wait. ARM-B2 in --test-bigblock-multicw demonstrates §22 rescuing the
+	// SAME truncated window with the acq-guard ON.)
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "1");
+	printf("[TEST-BIGBLOCK-FULLPATH] --- FAIL-BEFORE arm (MERCURY_BIGBLOCK_DEFEAT_FIX=1 + "
+	       "DEFEAT_ACQGUARD=1: one-stock-frame RX wait -> partial-block decode) ---\n"); fflush(stdout);
 	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
 	bigblock_first_clean = -1; bigblock_first_K = -1;
 	int rc_before = test_sim_inproc_2();
@@ -10999,6 +11007,7 @@ int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
 	set_env("MERCURY_SIM2_MAXITERS",        "200000");
 	set_env("MERCURY_SIM2_STALL_ITERS",     "60000");
 	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",  "0");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "0");   // §22 acq-guard active (production)
 	printf("[TEST-BIGBLOCK-FULLPATH] --- PASS-AFTER arm (fix active) ---\n"); fflush(stdout);
 	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
 	bigblock_first_clean = -1; bigblock_first_K = -1;
@@ -11061,6 +11070,7 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 		"MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
 		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
 		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_BIGBLOCK_NOCRC",
+		"MERCURY_BIGBLOCK_DEFEAT_ACQGUARD",   // §22: saved/restored so the arm toggles don't leak
 		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
 	};
 	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
@@ -11106,6 +11116,7 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	// --- ARM A: CRC-ON, block window (the fix). All 8 codewords byte-faithful + CRC passes. ---
 	set_env("MERCURY_BIGBLOCK_NOCRC",              "0");
 	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",         "0");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD",    "0");   // §22: acq-guard active (production)
 	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");
 	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
 	bigblock_first_clean = -1; bigblock_first_K = -1;
@@ -11124,6 +11135,13 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	// --- ARM B: NOCRC, STOCK window (fail-before). Forced-clean but BYTES WRONG (cw0 ok). ---
 	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");   // isolate byte-truth from the CRC gate
 	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX", "1");   // restore the pre-fix stock-frame window
+	// §22: this arm isolates the §17 stock-frame-window TRUNCATION corruption. The §22 acq-window
+	// WAIT-FOR-TAIL guard would otherwise CATCH that truncated-window overrun and recover the block
+	// (defeating the fail-before), so DEFEAT the acq-guard here to expose the §17 corruption in
+	// isolation. (Confirms the two fixes are independent: §17 = the armed frames_to_read COUNT;
+	// §22 = the snapshot POSITION/wait. With the acq-guard ON, §22 alone already rescues a
+	// short-window block — see ARM-B2 below.)
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "1");
 	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
 	bigblock_first_clean = -1; bigblock_first_K = -1;
 	int rc_b = test_sim_inproc_2();
@@ -11135,9 +11153,28 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	       "1200B 'delivered', but bytes WRONG)\n", b_repro ? "PASS" : "FAIL");
 	if(!b_repro) failed++;
 
-	// --- ARM C: NOCRC, BLOCK window (the fix). SAME NOCRC isolation now byte-faithful. ---
-	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");
-	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX", "0");   // the fix: block-span window
+	// --- ARM B2 (§22): SAME truncated stock window as ARM-B, but the acq-window WAIT-FOR-TAIL
+	//     guard is ACTIVE (production). The guard catches the short-window overrun, waits the few
+	//     fresh symbols for the tail, and recovers the SAME single transmission -> byte-faithful.
+	//     This is the §22 fix demonstrated on the live path (no re-injection / no NAK). ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",           "1");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",      "1");   // keep the §17 short stock window
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "0");   // but ACQ-GUARD ON: §22 wait-for-tail
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_b2 = test_sim_inproc_2();
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-B2 (NOCRC, stock window, ACQ-GUARD ON): rx_have=%ld/%ld "
+	       "bytes_ok=%d (rc=%d) — expect byte-faithful (§22 wait-for-tail recovers the short-window "
+	       "block from ONE transmission)\n", sim2_last_rx_have, PAYLOAD, (int)sim2_last_bytes_ok, rc_b2);
+	bool b2_ok = (sim2_last_rx_have == PAYLOAD) && sim2_last_bytes_ok;
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-B2 §22 wait-for-tail recovers the truncated-window "
+	       "block (SAME stock window as ARM-B, only the acq-guard differs)\n", b2_ok ? "PASS" : "FAIL");
+	if(!b2_ok) failed++;
+
+	// --- ARM C: NOCRC, BLOCK window (the §17 fix). SAME NOCRC isolation now byte-faithful. ---
+	set_env("MERCURY_BIGBLOCK_NOCRC",           "1");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",      "0");   // the §17 fix: block-span window
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "0");   // §22 acq-guard active (production)
 	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
 	bigblock_first_clean = -1; bigblock_first_K = -1;
 	int rc_c = test_sim_inproc_2();
@@ -11153,7 +11190,8 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	restore_env();
 
 	printf("[TEST-BIGBLOCK-MULTICW] %s (%d failure%s)  [A: clean=%d/%d byteok | B: corrupt-repro "
-	       "| C: window-fix byteok]\n", failed == 0 ? "ALL PASS" : "FAILURES", failed,
+	       "(§17 trunc) | B2: §22 wait-for-tail byteok | C: window-fix byteok]\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed,
 	       failed == 1 ? "" : "s", a_clean, a_K);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

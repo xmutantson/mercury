@@ -7381,44 +7381,75 @@ void cl_arq_controller::receive()
 			 && telecom_system->M != MOD_MFSK
 			 && current_configuration == CONFIG_16
 			 && telecom_system->bigblock_last_rx_K > 0);
-		// ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). Run BEFORE the cw0-CRC gate:
-		// when the located block's tail ran past the captured window (bb_at zero-padded it
-		// because the block landed too late in the snapshot / its tail had not yet arrived
-		// in the ring at snapshot time), the block-wide estimate collapses and the cw0 CRC
-		// fails even on a perfect timing lock — so without this guard the §19.1 late-landing
-		// attempts route into the cw0-CRC-fail "not a block" path and the block is dropped
-		// (the HW ~5.6% pass rate). Instead, DEFER one arming cycle: re-arm frames_to_read to
-		// the block span (the §17 bigblock_block_ftr_or mechanism, so a fresh full block-span
-		// accumulates and the tail arrives), leave the ring INTACT (do NOT wipe — the head is
-		// already here), and SKIP the carve. On the next snapshot the block has fully arrived
-		// and re-lands earlier in the window -> fits -> carves 8/8. A bounded defer counter
-		// (reset on every accept) prevents an infinite spin on a genuinely absent block: when
-		// it is exceeded we fall through to the existing cw0-CRC gate (which rejects the
-		// truncated block exactly as today — no regression, just no infinite defer).
-		// MERCURY_BIGBLOCK_DEFEAT_ACQGUARD=1 bypasses the defer (carve the truncated block as
+		// ACQUISITION-WINDOW POSITION GUARD — WAIT-FOR-TAIL (fact-doc §22, supersedes the §19
+		// defer-and-re-arm REGRESSION). Run BEFORE the cw0-CRC gate. When the located block's
+		// tail ran past the captured window (head + block_span > cap: the block landed too late
+		// in the snapshot, so its tail samples are FUTURE — not yet produced into the ring at
+		// snapshot time — and bb_at zero-padded them), the block-wide estimate collapses and the
+		// cw0 CRC fails even on a perfect timing lock.
+		//
+		// §22 ROOT CAUSE of the §19 regression: the §19 recovery re-armed frames_to_read to a
+		// FULL block-span (bigblock_block_ftr_or(0) = block_nsymb+10 = 74 sym) and walked away,
+		// expecting the block to "re-land earlier on the next snapshot." On the LIVE path that
+		// premise is false TWICE: (1) the CMD emits each big-block EXACTLY ONCE then waits on a
+		// positive SACK — there is NO re-presentation, only the SAME single transmission captured
+		// later; (2) waiting a full 74-sym block-span advances ring_write_index by 74 sym, so the
+		// head (typ. sym ~70-124) scrolls clean OFF THE BACK of the 133-sym window before the
+		// next snapshot — destroying the only copy. Result on HW: every attempt deferred, 0
+		// carves, CMD-waits-SACK / RSP-waits-rearrival DEADLOCK (winrun_recovery.json:
+		// accept_frac 0.0, WORSE than the pre-fix 0.056).
+		//
+		// THE FIX: the ring slides forward by symbol_period per produced symbol (audioio.c:1390),
+		// and each snapshot is the most-recent `cap` samples. To bring the missing tail in-ring
+		// we wait ONLY as many fresh symbols as the overrun needs — NOT a block-span. After
+		// wait_syms symbols the window slid forward by wait_syms*symbol_period, so head_new =
+		// head - wait_syms*symbol_period <= cap-block_span (fits) AND the tail (overrun samples
+		// past the old window end) is now inside. Geometric safety (§22.4): block_span(64 sym) <=
+		// ring(133 sym), so when the tail just arrives the head sits at sym ~69 with 64 sym of
+		// head-room behind it — the head STAYS in-ring through the wait. The SAME single
+		// transmission is recovered; no NAK/retransmit needed, so the SACK the CMD is waiting for
+		// IS produced and the deadlock is broken. Leave the ring INTACT (do NOT wipe — unlike the
+		// carve-success path; the head must survive) and do NOT touch ring_write_index (producer-
+		// owned). SKIP the carve this pass; re-attempt on the next snapshot.
+		// MERCURY_BIGBLOCK_DEFEAT_ACQGUARD=1 bypasses the wait (carve the truncated block as
 		// pre-fix) for the fail-before/pass-after A/B. Production never sets it.
 		bool acqguard_defeat = false;
 		{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD");
 		  if(e && *e && atoi(e) != 0) acqguard_defeat = true; }
-		const int BIGBLOCK_RX_MAX_DEFERS = 3;   // bounded; one defer suffices in the common case
+		// Bounded: each wait is SHORT (a few symbols, the overrun), not a block-span, so allow a
+		// few consecutive waits before falling through to the cw0-CRC gate on a genuinely absent
+		// block (no infinite spin). Reset on every accept (:7475 carve-success).
+		const int BIGBLOCK_RX_MAX_DEFERS = 6;
 		if(bigblock_rx_candidate && !acqguard_defeat && !bigblock_acq_window_fits()
 		   && bigblock_rx_defer_count < BIGBLOCK_RX_MAX_DEFERS)
 		{
 			bigblock_rx_defer_count++;
-			printf("[BBTX-ACQ-DEFER] CFG16 big-block (K=%d) tail past capture window "
-				"(head=%ld cap=%d block_nsymb=%d defer=%d/%d) -> deferring carve one arming "
-				"cycle for the full block\n",
+			// Compute the wait: exactly enough fresh symbols for the overrun tail to arrive, +1
+			// symbol of margin so the tail is comfortably in-ring against a producer race.
+			long head        = telecom_system->bigblock_last_rx_head_delay_samples;
+			long cap_samples = telecom_system->bigblock_last_rx_capture_nsamples;
+			int  block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+			int  sym_samples = telecom_system->data_container.Nofdm
+			                   * telecom_system->data_container.interpolation_rate;
+			long block_span  = (long)block_nsymb * (long)sym_samples;
+			long overrun     = (head >= 0 && sym_samples > 0)
+			                   ? (head + block_span - cap_samples) : 0;
+			int  wait_syms   = 1;   // safe default if geometry is unavailable
+			if(overrun > 0 && sym_samples > 0)
+				wait_syms = (int)((overrun + sym_samples - 1) / sym_samples) + 1;
+			if(wait_syms < 1) wait_syms = 1;
+			printf("[BBTX-ACQ-WAIT] CFG16 big-block (K=%d) tail past capture window "
+				"(head=%ld cap=%ld block_nsymb=%d overrun=%ld wait_syms=%d defer=%d/%d) -> "
+				"waiting %d fresh symbols for the tail; same single transmission, ring kept\n",
 				telecom_system->bigblock_last_rx_K,
-				telecom_system->bigblock_last_rx_head_delay_samples,
-				telecom_system->bigblock_last_rx_capture_nsamples,
-				telecom_system->bigblock_rx_block_nsymb(),
-				bigblock_rx_defer_count, BIGBLOCK_RX_MAX_DEFERS);
+				head, cap_samples, block_nsymb, overrun, wait_syms,
+				bigblock_rx_defer_count, BIGBLOCK_RX_MAX_DEFERS, wait_syms);
 			fflush(stdout);
-			// Re-arm a full block span (reuse the §17 clamp helper) and leave the ring intact
-			// so the already-arrived block head survives to the next snapshot. Do NOT carve;
+			// Re-arm ONLY the short wait (NOT a block-span) and leave the ring intact so the
+			// already-arrived head + body survive while the producer fills the tail. Do NOT carve;
 			// the downstream per-frame parse keys on received_message_stats (forced NO below).
 			MUTEX_LOCK(&capture_prep_mutex);
-			telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(0);
+			telecom_system->data_container.frames_to_read = wait_syms;
 			telecom_system->data_container.nUnder_processing_events = 0;
 			telecom_system->receive_stats.ofdm_search_raw = 0;
 			telecom_system->receive_stats.ofdm_batch_active = false;
