@@ -204,7 +204,15 @@ public:
 	// correlates over a 1-symbol MINI preamble (tail frame) rather than the full
 	// 4-symbol window (which would dilute the metric with 3 data symbols).
 	// Default -1 = use the configured length (legacy, byte-identical).
-	TimeSyncResult time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric = 0.0, int nsym_override = -1);
+	// earliest_relative (D3 big-block false-lock fix): when true, after the global
+	// metric peak is found, return the EARLIEST position whose normalized metric is
+	// >= early_exit_metric * best_metric (a SCALE-INVARIANT earliest-preamble select,
+	// the same global-max-then-earliest->=50% logic time_sync_preamble_fft uses at
+	// ofdm.cc:2866-2881). This prevents a fresher/louder LATER co-resident copy (a
+	// retransmission near the ring end) from winning the energy-weighted global argmax
+	// and false-locking the acquisition onto a future-tailed window. Default false =>
+	// every existing caller is byte-identical (the global energy-argmax, as before).
+	TimeSyncResult time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric = 0.0, int nsym_override = -1, bool earliest_relative = false);
 	TimeSyncResult time_sync_preamble_halfsym_2phase(std::complex<double>* in, int size, int interpolation_rate, double early_exit_metric = 0.0);
 	TimeSyncResult time_sync_preamble_fft(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb);
 	TimeSyncResult time_sync_preamble_fft_fine(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb, int coarse_pos, int search_half_window);

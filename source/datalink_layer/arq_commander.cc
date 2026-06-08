@@ -11073,6 +11073,9 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 		"MERCURY_BIGBLOCK_DEFEAT_ACQGUARD",   // §22: saved/restored so the arm toggles don't leak
 		"MERCURY_BIGBLOCK_CORRUPT_CW", "MERCURY_BIGBLOCK_CORRUPT_NBITS",  // ARM-D: D2 genuine per-cw corruption
 		"MERCURY_BIGBLOCK_DEFEAT_D2",         // ARM-D: D2 fail-before reproducer (pre-fix stranding)
+		"MERCURY_BIGBLOCK_SIM_RINGPHASE", "MERCURY_BIGBLOCK_SIM_STALERING",  // ARM-E: D3 acq nondeterminism
+		"MERCURY_BIGBLOCK_SIM_RETXCOPY", "MERCURY_BIGBLOCK_SIM_RINGSEED",    // ARM-E: D3 acq nondeterminism
+		"MERCURY_BIGBLOCK_EARLIEST", "MERCURY_BIGBLOCK_MFSNAP",              // ARM-E/F: D3 earliest-preamble fix
 		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
 	};
 	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
@@ -11117,6 +11120,16 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	set_env("MERCURY_BIGBLOCK_CORRUPT_CW",    "-1");
 	set_env("MERCURY_BIGBLOCK_CORRUPT_NBITS", "0");
 	set_env("MERCURY_BIGBLOCK_DEFEAT_D2",     "0");
+	// ARM-E (D3) sim-acquisition impairments default OFF for arms A/B/B2/C/D ("" = unset).
+	set_env("MERCURY_BIGBLOCK_SIM_RINGPHASE", "");
+	set_env("MERCURY_BIGBLOCK_SIM_STALERING", "0");
+	set_env("MERCURY_BIGBLOCK_SIM_RETXCOPY",  "0");
+	// D3 earliest-preamble early-exit ON (production default) for arms A/B/B2/C/D — with NO
+	// impairment the earliest >=50%-of-peak pick and the global argmax both lock the single
+	// block identically, so these arms are byte-identical to before. ARM-E toggles it for the
+	// false-lock fail-before/pass-after. MFSNAP at its production default (unset = ON).
+	set_env("MERCURY_BIGBLOCK_EARLIEST", "1");
+	set_env("MERCURY_BIGBLOCK_MFSNAP",   "");
 
 	int failed = 0;
 
@@ -11256,11 +11269,85 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	       "for the partial block (SAME binary, only DEFEAT_D2 differs)\n", dp_pass ? "PASS" : "FAIL");
 	if(!dp_pass) failed++;
 
+	// --- ARM E (D3, fix/bigblock-d3-carve): the global-argmax FALSE-LOCK on a co-resident retx copy,
+	//     and its FIX (earliest-preamble early-exit). The ACQUISITION nondeterminism the sim never
+	//     modeled. ARM-A delivered 8/8 CLEAN because the deterministic single-symbol pacing lands the
+	//     block at a CONSTANT head, the carve ZEROES the ring after each block, and the CMD emits each
+	//     block once (no co-resident retransmit copy). HW has NONE of those: the CMD re-emits when no
+	//     SACK is accepted (trace_falselock §1, three "one-block emit bsi=5"), so 2+ copies co-reside,
+	//     and the big-block Schmidl-Cox passed early_exit=0 -> it returned the GLOBAL energy-weighted
+	//     argmax (ofdm.cc weighted=metric*(A2+R)), which locks the FRESHEST/LOUDEST LATER copy near the
+	//     ring end whose body tail is FUTURE -> bb_at zero-pads the late codewords -> per-cw CRC-8
+	//     demote -> PARTIAL -> 0 delivered, AND defeats §22 (re-snapshot re-locks a still-later copy ->
+	//     head DRIFTS FORWARD, the "inverted §22"). MERCURY_BIGBLOCK_SIM_RETXCOPY lays exactly such a
+	//     fresher (1.6x) co-resident copy mid-window in the SIM_INPROC snapshot (CFG16+big-block gated,
+	//     zero production effect). The FIX = MERCURY_BIGBLOCK_EARLIEST (default ON): the coarse SC now
+	//     returns the EARLIEST position at >= 50% of the global metric peak (the ORIGINAL block, always
+	//     the earliest copy), so the later/louder retransmission can no longer shadow it.
+	//
+	// The ONLY variable between the two sub-arms is MERCURY_BIGBLOCK_EARLIEST (the fix), SAME binary,
+	// SAME RETXCOPY impairment, §22 acq-guard ON (production) in BOTH:
+	//   FAIL-BEFORE (EARLIEST=0, pre-fix global argmax): the louder LATER copy wins the argmax -> head
+	//     jumps FORWARD to the future-tailed copy -> overrun -> NOT cleanly delivered (PARTIAL/no carve).
+	//   PASS-AFTER  (EARLIEST=1, the fix): the earliest >=50%-of-peak pick locks the ORIGINAL block ->
+	//     fits -> CLEAN carve 8/8 -> full 1200B byte-faithful, from the SAME impaired ring.
+	set_env("MERCURY_BIGBLOCK_NOCRC",          "0");   // production: per-cw wire-CRC demote ON
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",     "0");   // §17 block-span window (real window)
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD","0");   // §22 acq-guard ON (production) in BOTH sub-arms
+	set_env("MERCURY_BIGBLOCK_CORRUPT_CW",     "-1");  // NO LLR corruption — the demote here is purely
+	set_env("MERCURY_BIGBLOCK_CORRUPT_NBITS",  "0");   //   acquisition-geometry (false-locked window).
+	set_env("MERCURY_BIGBLOCK_DEFEAT_D2",      "0");
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");
+	// The RETXCOPY false-lock impairment (a fresher 1.6x co-resident copy mid-window). RINGPHASE off
+	// (the original block sits at its natural fitting head); STALERING on (the never-zeroed HW ring).
+	set_env("MERCURY_BIGBLOCK_SIM_RINGPHASE", "");        // original block at its natural (fitting) head
+	set_env("MERCURY_BIGBLOCK_SIM_STALERING", "1");       // stale resident ring (previous burst)
+	set_env("MERCURY_BIGBLOCK_SIM_RETXCOPY",  "1");       // a fresher LATER copy -> global-argmax bait
+	// Bound the wall time so a no-carve fail-before cannot run the full default iteration budget.
+	set_env("MERCURY_SIM2_STALL_ITERS", "6000");
+	set_env("MERCURY_SIM2_MAXITERS",    "30000");
+
+	// E-FAIL (EARLIEST=0): the pre-fix global energy-argmax false-locks the louder later copy.
+	set_env("MERCURY_BIGBLOCK_EARLIEST", "0");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_ef = test_sim_inproc_2();
+	int  ef_clean = bigblock_first_clean, ef_K = bigblock_first_K;
+	bool ef_full  = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-E FAIL-BEFORE (EARLIEST=0, RETXCOPY false-lock): first_block "
+	       "clean=%d/%d rx_have=%ld/%ld bytes_ok=%d (rc=%d) — expect NOT clean 8/8 (the global "
+	       "energy-argmax locks the louder LATER copy whose tail is future -> PARTIAL/no carve), "
+	       "reproducing the HW '8/8-oracle -> 0-delivered' false-lock\n",
+	       ef_clean, ef_K, sim2_last_rx_have, PAYLOAD, (int)ef_full, rc_ef);
+	bool ef_fail = !((ef_K == 8) && (ef_clean == 8) && ef_full);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-E fail-before reproduces the global-argmax false-lock "
+	       "(SILENT in the stock sim — the deterministic single-copy pacing never had a co-resident "
+	       "retransmission to false-lock)\n", ef_fail ? "PASS" : "FAIL");
+	if(!ef_fail) failed++;
+
+	// E-PASS (EARLIEST=1, the fix): the earliest >=50%-of-peak pick locks the ORIGINAL block.
+	set_env("MERCURY_BIGBLOCK_EARLIEST", "1");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_ep = test_sim_inproc_2();
+	int  ep_clean = bigblock_first_clean, ep_K = bigblock_first_K;
+	bool ep_full  = sim2_last_bytes_ok && (sim2_last_rx_have == PAYLOAD);
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-E PASS-AFTER (EARLIEST=1, the D3 fix, SAME RETXCOPY ring): "
+	       "first_block clean=%d/%d rx_have=%ld/%ld bytes_ok=%d (rc=%d) — expect CLEAN 8/8 + full 1200B "
+	       "byte-faithful (earliest-preamble early-exit locks the ORIGINAL block, NOT the fresher "
+	       "retransmission copy)\n", ep_clean, ep_K, sim2_last_rx_have, PAYLOAD, (int)ep_full, rc_ep);
+	bool ep_pass = (ep_K == 8) && (ep_clean == 8) && ep_full && (rc_ep == 0);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-E pass-after — the earliest-preamble early-exit defeats "
+	       "the false-lock and delivers the block CLEAN from the SAME impaired ring (the ONLY variable "
+	       "fail->pass is MERCURY_BIGBLOCK_EARLIEST)\n", ep_pass ? "PASS" : "FAIL");
+	if(!ep_pass) failed++;
+
 	restore_env();
 
 	printf("[TEST-BIGBLOCK-MULTICW] %s (%d failure%s)  [A: clean=%d/%d byteok | B: corrupt-repro "
 	       "(§17 trunc) | B2: §22 wait-for-tail byteok | C: window-fix byteok | D: per-cw PARTIAL "
-	       "D2 delivery-arming fail-before(strand)->pass-after(prev-armed)]\n",
+	       "D2 delivery-arming fail-before(strand)->pass-after(prev-armed) | E: D3 false-lock "
+	       "fail-before(global-argmax)->pass-after(earliest-preamble)]\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed,
 	       failed == 1 ? "" : "s", a_clean, a_K);
 	fflush(stdout);

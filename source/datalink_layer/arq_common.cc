@@ -178,9 +178,59 @@ void ptt_busy_wait(cl_timer& t, int delay_ms)
 void drain_playback_wait()
 {
 	const bool sim_clock_on = sim_clock_enabled();
-	// EXIT CONDITION UNCHANGED: the playback ring must be fully drained.
+	// EXIT CONDITION UNCHANGED on production + the two-process paced sim: the
+	// playback ring must be fully drained (the real audio DAC always drains it
+	// at the sample rate, so the loop always terminates).
+	//
+	// SIM_INPROC NO-PROGRESS DEADLOCK BREAK (fix/bigblock-d3-carve): the
+	// single-thread cooperative pump (sim_inproc_pump_2) can only drain TX
+	// playback -> the in-flight WIRE while the wire has free space, and it can
+	// only deliver the wire -> RX (freeing the wire) at pump call-DEPTH 0. When
+	// this drain_playback_wait runs NESTED (depth>0 — e.g. driven from the peer's
+	// own wait while the RX is stalled), and the RX is NOT consuming the wire
+	// (the D3 RETXCOPY false-lock arm never carves a deliverable block, so it
+	// never re-arms / drains), the wire SATURATES and the TX playback can never
+	// move -> this loop spins forever (HW has no analogue: a real half-duplex DAC
+	// drains unconditionally; the finite sim "wire" models samples in flight and
+	// a jammed channel must eventually DROP the un-deliverable TX tail). Bound the
+	// SIM_INPROC spin by NO-PROGRESS: if the playback occupancy has not shrunk for
+	// a large number of consecutive pump calls, the channel is jammed -> abandon
+	// the undrainable tail (exit the wait) so the outer stepper regains control
+	// and its own stall/iter cutoff terminates the run. This is a harness-only
+	// flow-control floor: passing arms ALWAYS make progress (the RX consumes the
+	// wire every depth-0 pump), so the guard NEVER fires for them (verified). The
+	// production + paced-sim paths (pump==null) keep the verbatim unbounded body.
+	const bool inproc = arq_sim_inproc_active();
+	// A HEALTHY drain makes progress on (essentially) every pump call: at pump
+	// call-depth 0 each pump moves one TX symbol playback->wire and delivers a
+	// symbol wire->RX, so the playback occupancy strictly shrinks and the
+	// no-progress counter resets. The DEADLOCK case makes ZERO progress on EVERY
+	// pump call (depth>0 + saturated wire). 2000 consecutive no-progress pump
+	// calls is therefore orders of magnitude above any healthy transient yet
+	// bounds the jammed-channel wall time to a few ms; the passing arms never
+	// reach even a handful (verified — they deliver and exit normally).
+	const long NO_PROGRESS_LIMIT = 2000;
+	size_t prev_occ = size_buffer(playback_buffer);
+	long   no_progress = 0;
 	while (size_buffer(playback_buffer) > 0)
+	{
 		sim_spin_or_pump(sim_clock_on);
+		if (inproc)
+		{
+			size_t occ = size_buffer(playback_buffer);
+			if (occ < prev_occ) { prev_occ = occ; no_progress = 0; }
+			else if (++no_progress >= NO_PROGRESS_LIMIT)
+			{
+				printf("[SIM2-DEADLOCK-BREAK] drain_playback_wait: playback "
+				       "un-drainable for %ld pump calls (wire jammed, RX not "
+				       "consuming) -> abandoning %zu-byte TX tail so the stepper "
+				       "can terminate (harness-only; production DAC always drains)\n",
+				       no_progress, occ);
+				fflush(stdout);
+				break;
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -7242,6 +7292,113 @@ void cl_arq_controller::receive()
 		int rwi = telecom_system->data_container.ring_write_index;
 		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data, &telecom_system->data_container.passband_delayed_data[rwi], signal_period * sizeof(double));
 
+		// ===== D3 ACQUISITION-NONDETERMINISM SIM INJECTION (fix/bigblock-d3-carve) =====
+		// The in-process SIM_INPROC big-block path delivers 1200/1200 deterministically because
+		// its single-symbol pacing + decode-drive lands the block at a CONSTANT, frame-aligned
+		// head every run, the carve ZEROES the whole ring after each block (no stale carry), and
+		// the CMD emits each block exactly once (no co-resident retransmit copy). HW has NONE of
+		// those properties (independent Pi audio clocks => arbitrary block-arrival phase; a
+		// continuously-running ring carrying the previous burst; and multiple co-resident retx
+		// copies when no SACK is accepted). So D3 — (1) the rwi-relative carve PHASE LOTTERY
+		// (head must be <= cap-block_span to fit, bigblock_acq_window_fits arq_common.cc:4226),
+		// (2) the global energy-argmax FALSE-LOCK onto a fresher retransmit copy (ofdm.cc:2685,
+		// early_exit=0.0 at telecom_system.cc:7434), and (3) the INVERTED §22 wait-for-tail re-arm
+		// (:7460 pushes the head LATER on the rwi-relative snapshot) — is SILENT in sim. These
+		// three env-gated impairments reproduce the HW acquisition behavior so the D3 fix can be
+		// validated off-bench. Production NEVER sets these vars => zero production effect; the
+		// block also gates on CFG16 + big-block framing so the stock per-frame path is untouched.
+		// The snapshot is the SINGLE chokepoint: receive_byte->receive_bigblock acquisition
+		// (telecom_system.cc:7433 time_sync over Nofdm*buf_syms of THIS buffer) AND the carve both
+		// read ready_to_process_passband_delayed_data, so mutating it here moves the head for both.
+		if(telecom_system->bigblock_framing_enabled
+		   && telecom_system->M != MOD_MFSK
+		   && current_configuration == CONFIG_16)
+		{
+			// Read the env EACH PASS (this CFG16+big-block gate is rare relative to the FFT
+			// decode that follows, and test_sim_inproc_bigblock_multicw toggles these vars
+			// between arms in ONE process — a cached-once read would lock arm A's values).
+			int d3_ringphase = -3;   // -3 = disabled; -1 = random; >=0 = fixed right-shift samples
+			const char* e = std::getenv("MERCURY_BIGBLOCK_SIM_RINGPHASE");
+			if(e && *e){
+				if(std::string(e)=="rand" || atoi(e)<0) d3_ringphase = -1;
+				else d3_ringphase = atoi(e);
+			}
+			const char* es = std::getenv("MERCURY_BIGBLOCK_SIM_STALERING");
+			int d3_stalering = (es && *es && atoi(es)!=0) ? 1 : 0;
+			const char* er = std::getenv("MERCURY_BIGBLOCK_SIM_RETXCOPY");
+			int d3_retxcopy = (er && *er && atoi(er)!=0) ? 1 : 0;
+			// xorshift32 RNG state for the random-phase lottery. Re-seeded whenever the seed env
+			// changes (per-arm determinism) so each arm's randomness is reproducible.
+			static unsigned long d3_rng = 0;
+			static std::string   d3_seed_seen = "\x01";   // sentinel "never set"
+			const char* ee = std::getenv("MERCURY_BIGBLOCK_SIM_RINGSEED");
+			std::string seed_now = (ee && *ee) ? std::string(ee) : std::string("");
+			if(seed_now != d3_seed_seen){
+				d3_seed_seen = seed_now;
+				d3_rng = seed_now.empty() ? 0x9E3779B9UL : (unsigned long)strtoul(seed_now.c_str(),nullptr,10);
+				if(d3_rng == 0) d3_rng = 0x9E3779B9UL;
+			}
+			bool d3_active = (d3_ringphase != -3) || d3_stalering==1 || d3_retxcopy==1;
+			if(d3_active && signal_period > 0)
+			{
+				double* snap = telecom_system->data_container.ready_to_process_passband_delayed_data;
+				int sp = signal_period;
+				// Pick the per-snapshot right-shift (how much LATER the block lands in the window).
+				int shift;
+				if(d3_ringphase == -1){
+					// xorshift32 LCG: uniformly random phase in [0,sp) — the independent-clock lottery.
+					d3_rng ^= d3_rng << 13; d3_rng ^= d3_rng >> 17; d3_rng ^= d3_rng << 5;
+					shift = (int)(d3_rng % (unsigned long)sp);
+				} else if(d3_ringphase >= 0){
+					shift = d3_ringphase % sp;
+				} else {
+					shift = 0;   // phase disabled, but stale/retx still apply
+				}
+				// (1)+(2): build the impaired snapshot in a scratch buffer.
+				//   - RINGPHASE: the real block content moves to [shift, shift+sp) (right-shift),
+				//     so its head_delay grows by `shift`. Content past sp is LOST (the HW overrun:
+				//     the tail is FUTURE/unproduced => bb_at zero-pads it, telecom_system.cc:7515).
+				//   - STALERING: the vacated front [0,shift) is filled with the PREVIOUS snapshot
+				//     (stale resident audio) instead of silence — so the window is never clean.
+				//   - RETXCOPY: a FRESHER (slightly higher-energy) copy of the original block head
+				//     is laid near the ring END so the global energy-weighted argmax (early_exit=0)
+				//     locks onto IT (a future-tailed copy) instead of the earlier real block.
+				static std::vector<double> d3_prev;          // last snapshot (stale-ring source)
+				std::vector<double> orig(snap, snap + sp);   // the real (constant-phase) block
+				std::vector<double> out(sp, 0.0);
+				if(d3_stalering==1 && (int)d3_prev.size()==sp)
+					for(int i=0;i<sp;i++) out[i] = d3_prev[i];   // start from the stale burst
+				// right-shift the real block by `shift`, dropping the overrun tail.
+				for(int i=0; i+shift < sp; i++) out[i+shift] = orig[i];
+				if(d3_retxcopy==1){
+					// FALSE-LOCK model: the CMD re-emits the block when no SACK is accepted, so 2+
+					// copies co-reside in the ring (trace_falselock §1, val_cmd_off_A1.log three
+					// "one-block emit bsi=5"). The big-block time_sync passes early_exit=0
+					// (telecom_system.cc:7434) so time_sync_preamble_halfsym (ofdm.cc:2646-2691)
+					// returns the GLOBAL energy-weighted argmax, NOT the earliest preamble — with
+					// multiple copies it picks the FRESHEST/LATEST (least channel-decayed => highest
+					// energy) whose PREAMBLE is in-window but whose BODY tail is future. Lay such a
+					// copy: a LATER head (rpos, in-window so its preamble wins the argmax) at 1.6x
+					// amplitude (fresher), its body overrunning the window end (future => bb_at
+					// zero-pads the late codewords => demote). The real (earlier) block stays too,
+					// but the argmax false-locks the louder later copy -> head jumps FORWARD (the
+					// HW 116664->132932 forward drift), exactly the §22-can't-recover false-lock.
+					int rpos = (sp/2);   // ~half-way: preamble fully in-window, body overruns the end
+					for(int i=0; i+rpos < sp && i < sp; i++) out[i+rpos] += 1.6 * orig[i];
+				}
+				memcpy(snap, out.data(), (size_t)sp * sizeof(double));
+				d3_prev.assign(snap, snap + sp);   // remember for the next snapshot's stale carry
+				static int d3_logn = 0;
+				if(d3_logn < 64){
+					d3_logn++;
+					printf("[BBTX-SIM-D3] inject ringphase=%s shift=%d stalering=%d retxcopy=%d sp=%d\n",
+						(d3_ringphase==-1?"rand":(d3_ringphase>=0?"fixed":"off")),
+						shift, d3_stalering, d3_retxcopy, sp);
+					fflush(stdout);
+				}
+			}
+		}
+
 		// DIAG: ring buffer snapshot debug (verbose only — buffer scan is expensive)
 		if(g_verbose)
 		{
@@ -7446,12 +7603,35 @@ void cl_arq_controller::receive()
 			if(overrun > 0 && sym_samples > 0)
 				wait_syms = (int)((overrun + sym_samples - 1) / sym_samples) + 1;
 			if(wait_syms < 1) wait_syms = 1;
+			// D3 §22 UN-INVERSION (fix/bigblock-d3-carve): the snapshot is rwi-relative, so after
+			// the producer advances ring_write_index by wait_syms symbols the SAME located block's
+			// window offset becomes head1 = head - wait_syms*sym_samples — i.e. it slides EARLIER
+			// (toward the front of the window) by exactly the tail it was missing, landing at
+			// head1 ~ cap - block_span (FITS) with its now-produced tail in-ring. This direction is
+			// correct ONLY because the acquisition now re-locks the SAME EARLIEST copy each pass
+			// (the earliest-preamble early-exit, telecom_system.cc bigblock_rx_passband). With the
+			// old global energy-argmax the re-snapshot false-locked a still-FRESHER later copy, so
+			// head DRIFTED FORWARD (head1 > head, HW 116664->132932) — that forward drift WAS the
+			// "inverted §22". HEAD-SURVIVAL CAP: never wait so long that the block's head scrolls
+			// off the OLDEST edge before the next snapshot (head1 must stay >= 0). The head sits
+			// `head` samples ahead of the window's oldest sample, so the most we can slide is
+			// `head` samples; cap wait_syms to floor(head/sym) so head1 = head - wait_syms*sym >= 0.
+			// (Geometry guarantees this is never binding for a real overrun — block_span < cap, so
+			// when the tail just arrives head ~ cap-block_span, far above 0 — but the cap makes the
+			// re-arm provably head-preserving rather than relying on that invariant holding.)
+			if(head >= 0 && sym_samples > 0)
+			{
+				int max_wait = (int)(head / sym_samples);   // keep head1 = head - wait*sym >= 0
+				if(max_wait >= 1 && wait_syms > max_wait) wait_syms = max_wait;
+			}
 			printf("[BBTX-ACQ-WAIT] CFG16 big-block (K=%d) tail past capture window "
 				"(head=%ld cap=%ld block_nsymb=%d overrun=%ld wait_syms=%d defer=%d/%d) -> "
-				"waiting %d fresh symbols for the tail; same single transmission, ring kept\n",
+				"waiting %d fresh symbols for the tail; same single transmission, ring kept; "
+				"head slides EARLIER to ~%ld (FITS, earliest-lock keeps it the SAME block)\n",
 				telecom_system->bigblock_last_rx_K,
 				head, cap_samples, block_nsymb, overrun, wait_syms,
-				bigblock_rx_defer_count, BIGBLOCK_RX_MAX_DEFERS, wait_syms);
+				bigblock_rx_defer_count, BIGBLOCK_RX_MAX_DEFERS, wait_syms,
+				head - (long)wait_syms*(long)sym_samples);
 			fflush(stdout);
 			// Re-arm ONLY the short wait (NOT a block-span) and leave the ring intact so the
 			// already-arrived head + body survive while the producer fills the tail. Do NOT carve;

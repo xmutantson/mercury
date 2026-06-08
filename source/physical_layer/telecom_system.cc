@@ -7430,17 +7430,44 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		                          &ofdm.FIR_rx_time_sync);
 		std::vector<std::complex<double>> bb_dec(Nofdm*buf_syms);
 		ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
+		// D3 EARLIEST-PREAMBLE EARLY-EXIT (fix/bigblock-d3-carve): the LIVE big-block ring
+		// can hold 2-3 CO-RESIDENT copies of the same one-shot block (the CMD re-emits when
+		// it gets no accepted SACK — trace_falselock §1). With early_exit=0 the Schmidl-Cox
+		// returned the GLOBAL energy-weighted argmax (ofdm.cc weighted=metric*(A2+R)), which
+		// false-locks the FRESHEST/LOUDEST LATER copy near the ring end whose body tail is
+		// FUTURE -> bb_at zero-pads the late codewords -> per-cw CRC-8 demote -> PARTIAL ->
+		// 0 delivered, AND defeats the §22 wait-for-tail recovery (each defer re-snapshots
+		// and re-false-locks a still-later copy, so the head DRIFTS FORWARD, HW 116664->
+		// 132932 — the "inverted §22"). earliest_relative=true makes the coarse SC return the
+		// EARLIEST position at >= 50% of the GLOBAL metric peak (the ORIGINAL block, always
+		// the earliest copy), so a later retransmission cannot shadow it. Now the §22 re-arm
+		// slides the SAME earliest block's tail in-range as designed (head moves EARLIER, not
+		// later). Env MERCURY_BIGBLOCK_EARLIEST=0 reverts to the global argmax for A/B.
+		bool earliest = (std::getenv("MERCURY_BIGBLOCK_EARLIEST")==NULL
+		                 || atoi(std::getenv("MERCURY_BIGBLOCK_EARLIEST"))!=0);
 		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
-			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
+			bb_dec.data(), Nofdm*buf_syms, 1, 1, earliest ? 0.5 : 0.0, pre_nSymb, earliest);
 		// MATCHED-FILTER SNAP: disambiguate the Schmidl-Cox plateau (±~half-symbol noise-
 		// fragile argmax) by snapping the coarse decimated pick to the preamble matched-
 		// filter peak within ±1 symbol. Sharp single peak at the true start; recovers the
 		// spurious-lobe flip the SC argmax suffers under AWGN. Env-disable for A/B.
 		bool mfsnap = (std::getenv("MERCURY_BIGBLOCK_MFSNAP")==NULL || atoi(std::getenv("MERCURY_BIGBLOCK_MFSNAP"))!=0);
 		long coarse_dec = coarse.delay;
+		// In earliest_relative mode the coarse SC returns the EARLIEST position whose
+		// normalized Schmidl-Cox metric crosses 50% of the global peak — which is the
+		// LEADING EDGE of the preamble plateau (the halfsym metric is ~1.0 across the
+		// WHOLE ~pre_nSymb-symbol preamble, MEASURED: a ~870-sample / ~2.8-symbol plateau
+		// 16214..17087 in the CFG16 K=8 SIM_INPROC acquisition, with the global argmax at
+		// the plateau's far end). The matched-filter snap must therefore search the FULL
+		// plateau width FORWARD of that leading edge to land on the true preamble start.
+		// Widen the MF-snap search to ±(pre_nSymb+1) symbols in earliest mode (covers the
+		// whole preamble plateau + 1 symbol margin); a co-resident retransmission copy is a
+		// FULL block_span (~64 symbols) away, so this window cannot reach it (no re-introduced
+		// false-lock). ±1 symbol when earliest mode is off (the global argmax sits AT the peak).
+		int mf_search_dec = earliest ? ((pre_nSymb+1)*Nofdm) : Nofdm;
 		if(mfsnap)
 			coarse_dec = bigblock_preamble_mf_snap(bb_dec.data(), Nofdm*buf_syms,
-			                                       coarse.delay, pre_nSymb, Nofdm, Nc, Nofdm);
+			                                       coarse.delay, pre_nSymb, Nofdm, Nc, mf_search_dec);
 		long coarse_full = (long)coarse_dec * interp;
 		if(mfsnap)
 		{

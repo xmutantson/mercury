@@ -2603,7 +2603,7 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	return result;
 }
 
-TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric, int nsym_override)
+TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int size, int interpolation_rate, int step, double early_exit_metric, int nsym_override, bool earliest_relative)
 {
 	/*
 	 * Schmidl-Cox preamble detection using time-domain repetition.
@@ -2642,6 +2642,22 @@ TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int
 	double best_weighted = -1.0;
 	double best_normalized = 0.0;
 	int best_pos = 0;
+
+	// D3 earliest-relative select: record the normalized metric (and its energy floor)
+	// at every scanned position so that, AFTER the global peak is known, we can return
+	// the EARLIEST position whose metric >= early_exit_metric*best (scale-invariant).
+	// Only allocated when requested -> stock callers pay nothing and stay byte-identical.
+	std::vector<double> er_metric;
+	std::vector<double> er_energy;
+	std::vector<int>    er_pos;
+	if(earliest_relative)
+	{
+		int n_scan = (size - pream_len) / (step > 0 ? step : 1) + 2;
+		if(n_scan < 0) n_scan = 0;
+		er_metric.reserve(n_scan);
+		er_energy.reserve(n_scan);
+		er_pos.reserve(n_scan);
+	}
 
 	for(int d = 0; d <= size - pream_len; d += step)
 	{
@@ -2690,17 +2706,59 @@ TimeSyncResult cl_ofdm::time_sync_preamble_halfsym(std::complex<double>* in, int
 			best_pos = d;
 		}
 
+		if(earliest_relative)
+		{
+			er_metric.push_back(metric);
+			er_energy.push_back(A2 + R);
+			er_pos.push_back(d);
+		}
+
 		// Early exit: return the FIRST position where normalized metric
 		// exceeds threshold. Energy floor rejects false peaks on digital
 		// silence. This finds the earliest preamble in the buffer rather
 		// than the strongest, preventing later frames from shadowing
 		// earlier ones when multiple back-to-back frames are present.
-		if(early_exit_metric > 0.0 && metric >= early_exit_metric
+		// SUPPRESSED in earliest_relative mode: that mode must finish the full
+		// scan to learn the GLOBAL peak before choosing the earliest position
+		// at >= a FRACTION of it (an absolute first-crossing would fire on the
+		// metric ramp ~2 sym before the true peak / on a stale-ring sub-peak).
+		if(!earliest_relative && early_exit_metric > 0.0 && metric >= early_exit_metric
 			&& (A2 + R) > 1e-6)
 		{
 			result.delay = d;
 			result.correlation = metric;
 			return result;
+		}
+	}
+
+	// D3 EARLIEST-RELATIVE select (mirrors time_sync_preamble_fft ofdm.cc:2866-2881):
+	// the global energy-weighted argmax (best_pos) FALSE-LOCKS the freshest/loudest
+	// LATER co-resident copy (a retransmission near the ring end) whose body tail is
+	// future. Instead walk forward and return the EARLIEST position whose normalized
+	// metric reaches early_exit_metric (default 0.5) of the GLOBAL best — the original
+	// (earliest) block always crosses 50% of its own peak before any later copy, and a
+	// data/silence sub-peak never reaches it (preamble metric ~Nsymb^2*E vs data
+	// ~Nsymb*E random walk, the 4:1 ratio the FFT path documents). The energy floor
+	// rejects silence. Scale-invariant: no dependence on the absolute correlation level.
+	if(earliest_relative && best_normalized > 0.0)
+	{
+		double frac = (early_exit_metric > 0.0) ? early_exit_metric : 0.5;
+		double thr  = frac * best_normalized;
+		// The halfsym metric is ~1.0 across the WHOLE preamble plateau (MEASURED: a
+		// ~870-sample / ~2.8-symbol plateau in the CFG16 K=8 acquisition), so the earliest
+		// >= 0.5*peak crossing lands at the plateau's LEADING EDGE — up to a preamble-length
+		// before the global argmax. The big-block caller's MF-snap (widened to ±(pre_nSymb+1)
+		// symbols in earliest mode, telecom_system.cc bigblock_rx_passband) then refines this
+		// edge to the true preamble start. A co-resident later copy is a full block_span away,
+		// far beyond the plateau, so it is never the earliest crossing -> no false-lock.
+		for(size_t i = 0; i < er_metric.size(); i++)
+		{
+			if(er_metric[i] >= thr && er_energy[i] > 1e-6)
+			{
+				result.delay = er_pos[i];
+				result.correlation = er_metric[i];
+				return result;
+			}
 		}
 	}
 
