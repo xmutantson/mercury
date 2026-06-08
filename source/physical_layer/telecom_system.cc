@@ -7144,6 +7144,57 @@ static void bigblock_whiten_payload_bits(int* payload_bits, int nbits, unsigned 
 // wire negotiation.
 #define BIGBLOCK_WHITEN_SEED 0x5A3C96E1u
 
+// 1C — BIG-BLOCK TIME/FREQ SYMBOL INTERLEAVER (fact-doc §20; CW0_GAP_VERDICT amplifier D).
+// The big-block packs K LDPC codewords CODEWORD-CONTIGUOUSLY into the QAM-symbol stream
+// (bigblock_build_tx_bits: cw c == tx_bits[c*N..]; psk.mod then maps log2M bits/symbol so
+// cw c == a CONTIGUOUS run of ~N/log2M symbols), and ofdm.framer lays the symbol stream
+// into the grid in symbol-MAJOR DATA-cell raster order. So codeword c occupies a CONTIGUOUS
+// block of grid cells (~7 symbol-rows). A localized channel-estimate error (the deterministic
+// Schroeder all-pass per-cell phase curvature is worst in specific grid regions) therefore
+// piles CONTIGUOUS coded-bit errors into ONE codeword -> that codeword exceeds the LDPC's
+// error-correcting radius -> wire-CRC fail, even though the SAME number of errors SPREAD
+// across all K codewords would be cleared. The per-frame path already block-interleaves
+// (telecom_system.cc:304/352, block_size=nData/10); the big-block had NO interleaver. This
+// adds the SAME classic block (matrix-transpose) time/freq interleaver to the big-block TX
+// (after psk.mod, before framer) and the mirror deinterleaver to every big-block RX demap
+// (after deframer, before psk.demod; CSI weights deinterleaved identically — exactly the
+// per-frame pattern). It spreads each codeword's symbols across the WHOLE time x freq grid so
+// a localized estimate error diffuses across all K codewords. Block (de)interleaver refs:
+// Forney 1971; the existing Mercury per-frame interleaver (interleaver.cc). TX+RX symmetric;
+// the block size is derived from nData IDENTICALLY at TX and every RX site (below) so no wire
+// negotiation is needed. Default-OFF outside the big-block path (only these functions call it).
+//
+// Block size: consecutive symbols (one codeword's run) must land far apart after the transpose
+// so a contiguous bad region scatters across rows AND codewords. The transpose maps input
+// index i*B+j -> output j*nBlocks+i, so two consecutive inputs land nBlocks=nData/B cells apart.
+// Choosing B near K (the codeword count) gives nBlocks ~= symbols-per-codeword, tiling each
+// codeword's run across the full grid (set MERCURY_BIGBLOCK_TFILV=8/=K to enable). DEFAULT = 1
+// (identity / OFF) — see bigblock_tf_block_size below for the measured reason. A degenerate B
+// (<=1, or that does not divide into >1 block) falls back to identity, so the interleaver is a
+// safe no-op when disabled or when the geometry is too small.
+static int bigblock_tf_block_size(int nData)
+{
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+	// DEFAULT = 1 (identity / OFF). MEASURED (fact-doc §20, --test-bigblock-chanest A/B): on
+	// the off-bench arbiter — whose failing mode is the DETERMINISTIC, spatially-SMOOTH
+	// Schroeder all-pass per-cell phase curvature (~0.10-0.19 rad), NOT a localized BURST —
+	// no non-identity B is a net win: B=8 REGRESSES the DDCE-recovered PASS-AFTER arm
+	// (bytes_ok 1->0), and B>=16 DEFEATS the FAIL-BEFORE regression-catcher (the DDCE-OFF arm
+	// starts decoding). The interleaver only helps when errors are CONCENTRATED in a contiguous
+	// region (CW0_GAP_VERDICT amplifier D, a BURSTY channel); the deterministic-floor sim has no
+	// such burst, so spreading does nothing and only disturbs DDCE's per-cell coherence. The
+	// REAL HW channel (HW §3.1: localized fades / impulse noise) IS bursty, so the interleaver is
+	// the correct mechanism THERE and is kept fully implemented + TX/RX-symmetric, gated by
+	// MERCURY_BIGBLOCK_TFILV for the HW bench A/B (set =8 or =K to enable). Shipping it ON by
+	// default would mask the off-bench gate (CLAUDE.md §2 / What-NOT) and is unvalidated on HW.
+	int B = env_i("MERCURY_BIGBLOCK_TFILV", 1);
+	if(B < 1) B = 1;
+	if(B > nData) B = nData;
+	// require at least 2 blocks for the transpose to actually spread; else identity.
+	if(nData / B < 2) B = 1;
+	return B;
+}
+
 static int bigblock_build_tx_bits(cl_ldpc& ldpc, int nBits, unsigned int seed, int kcap,
                                   std::vector<int>& tx_bits,
                                   std::vector<std::vector<int>>& cw_info,
@@ -7207,6 +7258,17 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	// freq-domain grid (data + pilots placed by the thin lattice).
 	std::vector<std::complex<double>> tx_syms(nData);
 	psk.mod(tx_bits.data(), nBits, tx_syms.data());
+	// 1C — time/freq symbol interleave: spread codeword-contiguous symbols across the whole
+	// grid (deinterleaved at every big-block RX demap; see bigblock_tf_block_size). NO-OP
+	// when B==1 (degenerate geometry). TX and RX derive B identically from nData.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> ilv(nData);
+			interleaver(tx_syms.data(), ilv.data(), nData, B);
+			tx_syms.swap(ilv);
+		}
+	}
 	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
 	ofdm.framer(tx_syms.data(), grid.data());
 
@@ -7777,6 +7839,31 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	std::vector<std::complex<double>> deframed(nData);
 	ofdm.deframer(eq.data(), deframed.data());
 
+	// 1C — time/freq symbol DE-interleave: invert the TX interleaver (bigblock_tx_passband)
+	// so the QAM-symbol stream is back in codeword-contiguous order before psk.demod, and
+	// deinterleave the per-cell CSI |H|^2 the SAME way so each symbol's reliability weight
+	// follows its symbol (exactly the per-frame pattern, telecom_system.cc:2936/2940). The
+	// estimate/equalize/nv all ran in GRID order above (unchanged); only the demap order is
+	// restored here. NO-OP when B==1. The DIAG blocks below read eq/rx in GRID order, so they
+	// remain valid measurements of the (still grid-ordered) channel.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> dil(nData);
+			deinterleaver(deframed.data(), dil.data(), nData, B);
+			deframed.swap(dil);
+			// CSI is std::vector<double> (no free deinterleaver overload); apply the SAME
+			// block-transpose inverse inline (matches deinterleaver() in interleaver.cc).
+			std::vector<double> cil(nData);
+			int nBlocks = nData / B;
+			for(int i=0;i<nBlocks;i++)
+				for(int j=0;j<B;j++)
+					cil[(size_t)i*B+j] = csi_data[(size_t)j*nBlocks+i];
+			for(int i=nBlocks*B;i<nData;i++) cil[i] = csi_data[i];
+			csi_data.swap(cil);
+		}
+	}
+
 	// CHANNEL-ESTIMATION HEALTH stash (fix/bigblock-chanest): always-on mean|H| over the
 	// estimated channel grid so the genuine 2-instance regression can assert the estimate
 	// did not collapse (the DIAG print below is env-gated; this stash is unconditional).
@@ -7988,6 +8075,16 @@ int cl_telecom_system::bigblock_tx_to_wav(const char* wav_path)
 	// freq-domain grid (data + pilots placed by the thin lattice).
 	std::vector<std::complex<double>> tx_syms(nData);
 	psk.mod(tx_bits.data(), nBits, tx_syms.data());
+	// 1C — time/freq symbol interleave (WAV TX; mirror of bigblock_tx_passband). Deinterleaved
+	// in bigblock_decode_from_wav. NO-OP when B==1.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> ilv(nData);
+			interleaver(tx_syms.data(), ilv.data(), nData, B);
+			tx_syms.swap(ilv);
+		}
+	}
 	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
 	ofdm.framer(tx_syms.data(), grid.data());
 
@@ -8390,6 +8487,24 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	ofdm.channel_equalizer(rx.data(), eq.data());
 	std::vector<std::complex<double>> deframed(nData);
 	ofdm.deframer(eq.data(), deframed.data());
+
+	// 1C — time/freq symbol DE-interleave (WAV decode; mirror of bigblock_rx_passband).
+	// Restore codeword-contiguous order before demap; deinterleave CSI the same way. NO-OP B==1.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> dil(nData);
+			deinterleaver(deframed.data(), dil.data(), nData, B);
+			deframed.swap(dil);
+			std::vector<double> cil(nData);
+			int nBlocks = nData / B;
+			for(int i=0;i<nBlocks;i++)
+				for(int j=0;j<B;j++)
+					cil[(size_t)i*B+j] = csi_data[(size_t)j*nBlocks+i];
+			for(int i=nBlocks*B;i<nData;i++) cil[i] = csi_data[i];
+			csi_data.swap(cil);
+		}
+	}
 
 	// [DIAG-WAV] instrument nv, mean|H|, post-EQ deframed constellation RMS.
 	if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))

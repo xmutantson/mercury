@@ -645,3 +645,227 @@ until the q-table cal finishes and the arbiter is GREEN).
 CFO). If this honest attempt fails the restored bytes_ok gate, STOP and discuss — do not iterate blindly; a
 failure there means either the shared-estimator per-frame constraint conflicts (split the big-block estimator out)
 or the residual is genuinely an RX-pipeline numeric issue that must be localized first.
+
+## §18 SS4 ATTEMPT — per-symbol/time-local sparse-2D re-estimation: IMPLEMENTED (one honest, multi-part
+effort), recovers the MAGNITUDE fold but does NOT crack bytes_ok; the residual is an est-vs-truth PHASE
+error (~0.20 rad) at the 6-8% time-pilot lattice. CLAUDE.md §2 HARD-STOP. Production RX REVERTED to HEAD;
+only the durable est-vs-genie diagnostic kept. 2026-06-07.
+
+**What was implemented** (the FULL §17 plan, ONE coherent effort in `grid_sparse2d_estimator`, telecom_system.cc;
+this estimator is called ONLY by the big-block RX (:7583/:8168) and `sfo_grid_test` (:6515) — NOT the per-frame
+`receive_byte` path, which uses the OFDM.cc LS/ZF estimator — so the §16 "shared estimator" per-frame cross-path
+risk is MOOT for the default WB/NB decode; verified by grep of all callers):
+- **§17 step 1** cont_cols 2->3 ({0,24,49}): K=8 preserved (decode ran, SANITY 8/8); alone it slightly WORSENED
+  the faithful arm (meanH 0.149->0.126, col_phaseRMS 0.83->0.98) — the center pilot is an enabler, not a fix.
+- **§17 step 2** TIME-axis POLAR interpolation (mirror the proven freq-axis polar at :5986): interpolate the
+  per-carrier time series in unwrapped mag+phase instead of complex-linear (which chord-cuts a rotating phasor).
+- **§17 step 3** stop the COMPLEX Wiener time-blur folding the per-symbol phase ramp: polar (mag + unwrapped-phase)
+  moving-average, and SKIP smoothing the CONTINUAL columns (a pilot every symbol directly observes the per-symbol
+  CPE — an 11-tap average blurs it).
+- **§17 step 4** per-symbol CPE de-rotation (1b/3b) from the continual columns (802.11 continual-pilot CPE):
+  measure cpe[n]=arg(Σ_continual H[n,c]·conj(time-mean_c)), de-rotate the raw pilot grid before interp, re-apply
+  after — so the sparse time-interp tracks only the slow per-carrier residual.
+
+**MEASURED (`--test-bigblock-chanest`, the restored production-sparse-2D arbiter; `MERCURY_BIGBLOCK_RXPB_DIAG=1`):**
+
+  | arm / config                              | meanH | DDevm | est_vs_genie_phaseRMS | nzero  | bytes_ok |
+  |-------------------------------------------|-------|-------|-----------------------|--------|----------|
+  | SANITY clean (HEAD)                        | 0.194 | 0.038 | **0.038**             | 0      | **1**    |
+  | FAIL-BEFORE faithful (HEAD, baseline)      | 0.149 | 0.546 | **0.199**             | 57     | 0        |
+  | + polar-time (step 2)                      | 0.179 | 0.315 | (improved)            | 0      | 0        |
+  | + polar-time + no-blur-cont (step 3)       | 0.179 | 0.342 | —                     | 0      | 0        |
+  | + steps 2/3 + cont=3 (step 1)              | 0.181 | 0.354 | 0.211                 | 16     | 0        |
+  | + steps 1/2/3 + CPE (step 4, FULL)         | 0.181 | 0.353 | 0.211                 | 16     | 0        |
+
+- The polar time-axis fix RECOVERED THE MAGNITUDE fold exactly as MORNING_VERDICT predicted: faithful meanH
+  0.149->0.18 (the complex-chord-cut + complex-Wiener-blur collapse is fixed; nzero 57->0) and HALVED the post-EQ
+  EVM (DDevm 0.546->0.35). **But bytes_ok stayed 0.**
+- The DECISIVE localizer (`est_vs_genie_phaseRMS` = RMS arg(H_g·conj(H_est)) per DATA cell): clean 0.038 rad
+  (estimate ≈ truth) vs faithful **~0.20 rad** — ABOVE the 32-QAM ~0.1-rad EVM cliff. The published estimate's
+  PER-CELL phase misses the true channel by ~0.20 rad. This holds on the HEAD estimator too (0.199) — it is NOT an
+  artifact of the polar change.
+- The §17-step-4 CPE de-rotation was a **NO-OP** on bytes_ok/DDevm/est-vs-genie (0.211->0.211): the residual is
+  NOT a per-symbol COMMON phase. Confirmed by the post-EQ `rowCPE meanabs=0.022` rad (the common phase is already
+  tracked by the pilots) and by `[AFC-WITHINSYM] residual_after_per-sym_LINEAR_fit=0.127 rad` (within-symbol the
+  channel is CPE+slope to 0.13 rad, so a common-phase corrector has little to remove). The 0.20-rad residual is the
+  per-CARRIER-INDEPENDENT, NON-LINEARLY-WALKING phase: each data carrier's phase walks its own AR(1) trajectory
+  (faithful vector CFO walk sd=25 Hz, f3db=3 Hz), sampled in TIME only every scat_dy=4–12 symbols on scattered
+  columns. Polar interpolation tracks a LINEAR ramp between time-pilots; a non-linear AR(1) walk between sparse
+  time-pilots leaves ~0.20 rad it cannot follow.
+
+**WHY THIS CANNOT BE FIXED WITHOUT WIRE COST (the hard-stop root):** the only lever that reduces the per-cell
+time-walk residual is DENSER TIME PILOTS (smaller scat_dy / more continual columns), so each carrier is sampled
+often enough to follow its non-linear walk. But the K=8 bit-budget (§14.5) is already at the edge: cont_cols=3 +
+scat_dy=4 gives nBits=12925 (K=8, slack 125 bits). ANY density increase (scat_dy 4->2, or cont>=4) drops nData
+below 8×1600=12800 ⇒ the K=8 block cannot be built (the test bails meanH=-1, confirmed). So tracking the residual
+costs wire rate = drops to K=7/K=6, which erodes/erases the +18.9%..+91.8% VARA margin the big-block win depends on.
+The fix CLASS the morning verdict identified (per-symbol/time-local sparse-2D) IS correct for the MAGNITUDE fold
+and DOES recover meanH, but at the HW-faithful AR(1) drift magnitude the per-cell PHASE walk is undersampled in
+TIME by the 6-8% lattice, and re-interpolating the SAME pilots better (polar/CPE) cannot manufacture the missing
+time samples. This independently re-confirms the §13/§14 "~0.2 rad residual" verdict — now from the PRODUCTION
+sparse-2D estimator (not the flat-ML pin), localized to a pilot-density-IN-TIME limit, not an RX-pipeline numeric
+artifact and not a per-symbol CPE.
+
+**§2 STOP — what I did NOT do:** I did NOT shotgun a 2nd estimator variant (DDCE blend, Wiener-coefficient retune,
+2D-jointly-optimal Wiener, decision-directed time-DDCE), because the est-vs-genie localizer proves the blocker is
+missing TIME samples, not a better interpolator of the present ones — and denser sampling breaks K=8. This seam has
+5+ prior measurement flip-flops; per CLAUDE.md §2 the call is STOP + discuss, not iterate.
+
+**Disposition:** production RX REVERTED to HEAD (9b93ccd) — the polar/CPE estimator change is NOT committed
+(it does not crack bytes_ok; per the gate a non-cracking estimator change does not ship into the production RX).
+KEPT (committed): the durable `est_vs_genie_phaseRMS` DIAG-GENIE diagnostic (env-gated, zero production behavior
+change) — it is the decisive estimator-accuracy localizer for any future arbiter-fidelity or geometry work.
+SANITY stays 8/8 byte-faithful; the restored arbiter still separates (1 failure = the PASS-AFTER contract); all
+sibling fast tests rc=0 (multicw/fullpath/arq-unit/climb-engine/probe-backoff).
+
+**Paths forward (for DISCUSSION, not auto-iterated):**
+1. **Spend a little K** — accept K=7 (cont=3 + scat_dy=2 or cont=5) to densify time pilots; re-measure
+   est_vs_genie + bytes_ok; K=7 still beats VARA per MORNING_VERDICT (+4.0%..+67.9%). This trades the "zero wire
+   cost" premise for a payload-cracking estimate — a real, bounded engineering choice, NOT a band-aid.
+2. **Mid-block re-acquisition preamble** (a TX-side change): re-run Moose every ~Ngrid/2 symbols to re-zero the
+   AR(1) walk, so the residual phase walk per segment shrinks below the lattice's tracking floor (+~97ms airtime,
+   still beats VARA per MORNING_VERDICT geometry).
+3. **Smaller-K proportional geometry** (K=4/K=6, Ngrid shrunk proportionally): a shorter block accumulates less
+   AR(1) walk per block; MORNING_VERDICT shows every K>=4 proportional geometry still beats 13048. The per-symbol
+   walk over Ngrid=30 (K=4) is ~half of Ngrid=60, which may drop est-vs-genie below the cliff at the SAME density.
+4. **HW-validate the polar magnitude-fold fix directly** — the polar time-axis change is a genuine, regression-clean
+   magnitude recovery (0.149->0.18); on the REAL channel (HW §3.1: magnitudes survive, phases spread, and the real
+   residual CFO is ~0 not the sim's 25 Hz AR(1) walk) the per-cell phase walk may be far smaller than this faithful
+   sim's deliberately-aggressive drift, so the polar fix MIGHT crack bytes_ok on HW where it does not in this sim.
+   This is the path the prior §11/§12/§14 verdicts also converged on: bytes_ok on HW is the only true final gate.
+
+## §19 COMPLETE-THE-FIX (PIPELINE_AUDIT companions: re-est H + LOCALIZE nv + BB-1). 2026-06-07. The H fix +
+BB-1 are COMMITTED; the audit's nv-localization premise is EMPIRICALLY FALSIFIED (nv already localized under
+sparse-2D); bytes_ok stays 0 in the harsh sim (per-cell PHASE residual — §2 hard-stop holds). HW-validation only.
+
+The PIPELINE_AUDIT_VERDICT.json (12-agent) endorsed the per-symbol estimator but called it INCOMPLETE: it
+localized H but allegedly not the noise-variance nv, which it said "still inflates ~2500x (9.4e-6 -> 0.008-0.024)
+on a channel-free waveform", weakening the demap LLRs -> LDPC non-convergence. I treated that as the hypothesis to
+test (CLAUDE.md §3) rather than a fact to implement, and MEASURED it under the RESTORED production sparse-2D arbiter.
+
+**FINDING — the nv premise is the FLAT-ML-PIN artifact, NOT the production path:**
+- nv has TWO code forms. Flat-ML path (telecom_system.cc:7728-7742): nv = residual against a SINGLE block-wide
+  `Hbar` -> on a CFO/SFO-walked waveform Hbar matches no cell, so resid is large -> THIS is the 0.008-0.024 / 2500x
+  inflation the audit saw (it ran the contaminated flat-ML arbiter, EXP-C1). Sparse-2D path (:6125-6141): nv =
+  pilot-residual EVM against the FINAL **per-cell** interpolated H (`resid = rx[cell] - H[cell]*X`). ALREADY localized.
+- MEASURED [DIAG-RXPB], H fix applied, faithful CFO+SFO+DRIFT, SPARSE2D=1: **nv = 3.91e-4** (clean SANITY nv=1.15e-6).
+  ~3 orders of magnitude BELOW the audit's flat-ML figure. There is NO nv block-fold left to localize. nv=3.9e-4 is
+  the honest residual-EVM of a per-cell estimate vs a channel it can't perfectly track — small, NOT LLR-killing.
+- Therefore NO nv change was made: fabricating an "nv localization" against a non-existent fold is a no-op that would
+  MASK the real residual (§2 / What-NOT-to-do). §5 nv audit: consumers (demap cvar :7889, MMSE alpha=|H|^2/(|H|^2+nv),
+  CSI |H|^2 :7745, gearshift :2909) all read the scalar `ofdm.noise_variance_estimate`; their invariant (nv ~= true
+  post-EQ floor) is SATISFIED by sparse-2D nv=3.9e-4. Per-frame nv (OFDM.cc LS/ZF via receive_byte) UNTOUCHED —
+  grid_sparse2d_estimator has exactly 3 callers (:6656 sfo_grid_test, :7732 bigblock_rx_passband, :8345
+  bigblock_decode_from_wav), none receive_byte.
+
+**BB-1 (right-FIR margin) — APPLIED.** bb_at (bigblock_rx_passband) and demod_at (bigblock_decode_from_wav):
+`slice_size = mi + span_interp` -> `+ margin_interp`, mirroring per-frame :2480 (`pb_end = extraction_delay +
+frame_size_interp + fir_margin`). Bounds-guarded read zero-pads past rxpb; grid extraction unchanged (mdec=mi/interp,
+Nofdm*Ngrid), so the right margin only feeds FIR lookahead and does not shift the symbol grid. Inaccurate :2434-2462
+comment corrected to :2434-2482 (both-sides margin). Regression-clean.
+
+**RESULT (--test-bigblock-chanest, RXPB_DIAG):** SANITY meanH 0.194 / 8/8 / bytes_ok=1. Faithful meanH 0.179
+(recovered) / DDevm 0.339 / **est_vs_genie_phaseRMS 0.207 rad** / col_phaseRMS 1.35 rad / **bytes_ok 0**. The
+blocker is the per-cell PHASE residual (above the 32-QAM ~0.1-rad cliff), present on HEAD too (0.199, §18) —
+STRUCTURAL pilot-density-in-time, not nv. Fast suites all rc=0 (multicw 1200/1200 bytes_ok=1, fullpath 1200/1200
+byte-faithful, arq-unit 8/8, climb-engine, probe-backoff). Build rc=0.
+
+**DISPOSITION:** COMMIT the §17 polar-time/CPE H estimator (magnitude-fold recovery) + BB-1 — both big-block-
+exclusive, per-frame byte-identical, regression-clean. They do NOT crack the harsh-sim bytes_ok (§2 hard-stop, NOT
+iterating a 6th estimator variant), but they ARE the regression-clean magnitude recovery + last-symbol fix the next
+phase HW-validates. Next phase: sweep MERCURY_BBCHANEST_DBG_CFO_WALK_HZ (25->...->0.07 = real HW magnitude) and
+watch est_vs_genie_phaseRMS cross <0.1 + bytes_ok flip — bytes_ok on HW is the only true final gate (path-forward #4).
+
+## §20 PART-1 brief (1A nv-restore + 1C interleaver): 1A is a NO-OP under the production estimator (the
+over-confident-nv fold the brief targets does NOT exist on the sparse-2D path — re-confirmed §19); 1C
+(time/freq symbol interleaver) IMPLEMENTED + TX/RX-symmetric + default-OFF, but is NOT a net win on the
+off-bench arbiter (its failing mode is DETERMINISTIC-SMOOTH phase curvature, not a BURST) — kept for the HW
+bursty channel, gated MERCURY_BIGBLOCK_TFILV. CLAUDE.md §2 STOP (do not ship a masking default). 2026-06-07.
+
+The directed PIPELINE/CW0_GAP brief (bigblock_p3_hw/CW0_GAP_VERDICT.json) prescribed two PHY changes to raise the
+per-codeword decode rate: **1A** port the cfg16-nv-restore over-confident-LLR fix to the big-block thin lattice
+(brief: block-wide nv 0.001-0.003 is 11-37x over-confident vs honest per-frame 0.036), and **1C** add the
+time/freq interleaver the big-block lacks (brief amplifier D: no interleaver concentrates block-region estimate
+errors into contiguous codewords). I MEASURED both against the restored production-sparse-2D arbiter before coding.
+
+**§20.1 1A — the over-confident-nv premise is FALSE on the production path (re-confirms §19, now my own measurement).**
+The brief's 0.001-0.003 nv figure is the FLAT-ML pin artifact (telecom_system.cc:7796-7811: nv = residual vs a
+SINGLE block-wide Hbar, which matches no cell on a walked channel ⇒ large/inflated resid). The PRODUCTION sparse-2D
+nv (telecom_system.cc:6137-6153) is ALREADY the pilot-residual EVM against the FINAL **per-cell** interpolated H
+(`resid = rx[cell] - H[cell]*X`), and its in-code comment already cites the cfg16-nvfix as the reason it cannot
+collapse. MEASURED (`--test-bigblock-chanest`, MERCURY_BIGBLOCK_RXPB_DIAG=1, HEAD 176042c, sparse-2D):
+nv = **1.15e-6** (SANITY clean) → **1.16e-5** (static det-floor) → **3.91e-4** (HARSH-OTA). It TRACKS the channel
+honestly across three orders of magnitude — there is NO 11-37x over-confident fold to restore. Porting "1A" would
+mean inflating an already-honest nv, which would WEAKEN good LLRs and MASK the real residual (CLAUDE.md §2 /
+What-NOT). So **1A was deliberately NOT implemented** — the fix it describes is already in place (telecom_system.cc:
+6137-6153, the per-cell residual-EVM nv), exactly as §19 found. No nv change shipped.
+
+**§20.2 1C — the time/freq symbol interleaver: IMPLEMENTED, TX/RX-symmetric, default-OFF.** The big-block packed
+K LDPC codewords CODEWORD-CONTIGUOUSLY (bigblock_build_tx_bits: cw c == tx_bits[c*N..]; psk.mod ⇒ cw c == a
+contiguous symbol run; ofdm.framer ⇒ a contiguous grid region ≈7 symbol-rows) with NO interleaver — confirmed: the
+per-frame TX (telecom_system.cc:304/352) block-interleaves at block_size=nData/10, the big-block TX
+(bigblock_tx_passband:7246) called psk.mod→framer directly. ADDED the SAME classic block (matrix-transpose)
+time/freq symbol interleaver (Forney 1971; reuse interleaver.cc) to the big-block TX (after psk.mod, before framer)
+and the mirror deinterleaver to every big-block RX demap (after deframer, before psk.demod; CSI |H|^2 deinterleaved
+the SAME way — exactly the per-frame pattern at :2936/:2940). Two matched TX/RX pairs covered:
+bigblock_tx_passband↔bigblock_rx_passband (live + chanest test) and bigblock_tx_to_wav↔bigblock_decode_from_wav
+(WAV harness). Block size from `bigblock_tf_block_size(nData)` (env MERCURY_BIGBLOCK_TFILV; derived identically at
+TX and every RX site ⇒ no wire negotiation). sfo_grid_test (the -m SFO_GRID estimator-only diagnostic, no codeword
+decode) intentionally untouched. Per-frame `receive_byte`/`transmit_byte` BYTE-IDENTICAL (the big-block functions
+are a different code path, reached only when bigblock_framing_enabled).
+
+**§20.3 MEASURED — no non-identity block size is a net win on the off-bench arbiter** (`--test-bigblock-chanest`,
+gated arms = SANITY/FAIL-BEFORE/PASS-AFTER/BENCH-REALISTIC; HARSH-OTA non-gating):
+
+  | MERCURY_BIGBLOCK_TFILV | sanity | fail-before(DDCE0, want 0) | pass-after(DDCE1, want 1) | bench | verdict |
+  |------------------------|--------|----------------------------|---------------------------|-------|---------|
+  | 1 (identity / OFF)     | 1      | 0                          | 1                         | 1     | ALL PASS (== HEAD) |
+  | 8 (=K)                 | 1      | 0                          | **0**                     | 1     | FAIL (PASS-AFTER regressed) |
+  | 16 / 40 / 264          | 1      | **1**                      | 1                         | 1     | FAIL (FAIL-BEFORE gate defeated) |
+
+- B=1 reproduces HEAD exactly ⇒ the implementation is a clean no-op when disabled (and the SANITY arm is bytes_ok=1
+  at every B ⇒ the TX-interleave/RX-deinterleave round-trip is byte-faithful = TX/RX symmetric).
+- B=8 REGRESSES the DDCE-recovered PASS-AFTER arm (bytes_ok 1→0): est_vs_genie_phaseRMS is unchanged (~0.10 rad);
+  the interleave just reshuffles which marginal cells land in which codeword, tipping the just-barely-recovered
+  PASS-AFTER over. B≥16 DEFEATS the FAIL-BEFORE regression-catcher: enough marginal cells get LDPC-cleared that the
+  DDCE-OFF arm starts decoding ⇒ the test can no longer catch a sparse-2D estimator regression (an UNTRUTHFUL gate).
+
+**§20.4 WHY the interleaver does not help here (root cause, not a tuning miss).** The arbiter's failing mode is the
+DETERMINISTIC, spatially-SMOOTH Schroeder all-pass per-cell PHASE curvature (~0.10-0.19 rad, just over the 32-QAM
+~0.1-rad cliff — §15/§18/§19), plus a smooth AR(1) CFO walk. An interleaver only helps when coded-bit errors are
+CONCENTRATED in a contiguous BURST (CW0_GAP_VERDICT amplifier D assumed a localized block-region error). A smooth,
+correlated, already-spread phase residual has no burst to break up, so spreading it does nothing to the per-codeword
+error load — and it DISTURBS DDCE's per-cell coherence (DDCE corrects against the local decision; moving correlated
+marginal cells around changes each codeword's error set). This is the SAME conclusion §18/§19 reached for the
+estimator (the blocker is est_vs_genie phase accuracy / TIME-pilot density, a STRUCTURAL limit), now independently
+re-confirmed from the interleaver angle: the off-bench gate is phase-accuracy-bound, not burst-bound.
+
+**§20.5 DISPOSITION (CLAUDE.md §2 / §3 / What-NOT).** (i) 1A: nothing to ship (the production nv is already the
+honest per-cell residual-EVM; fabricating an inflation would mask). (ii) 1C: SHIP the interleaver fully implemented,
+TX/RX-symmetric, regression-clean, **default-OFF (B=1)**. It is the CORRECT mechanism for the REAL HW channel
+(HW §3.1: localized fades / impulse noise = genuine bursts the off-bench deterministic floor does not model), so it
+is kept and env-gated (MERCURY_BIGBLOCK_TFILV=8 to enable) for the SONNET HW bench A/B — exactly the brief's "push
+the big-block deeper into the noise" intent, validated where the burst actually exists. Shipping it ON by default
+would either regress PASS-AFTER or defeat the FAIL-BEFORE gate ⇒ it would be a masking default (forbidden). All
+gated `--test-bigblock-chanest` arms GREEN at default; SANITY proves byte-faithful round-trip; per-frame
+byte-identical; sibling fast tests rc=0 (multicw / fullpath / arq-unit / sim-inproc-bigblock / climb-engine /
+probe-backoff / sim-clock). **HW A/B (TFILV=8 vs 1) under the bursty bench is the next true gate for 1C; 1A is
+closed (already in place).**
+
+**§20.6 TFILV=8 ENABLED — byte-faithful CORRECTNESS verified on the live path; the multicw/fullpath rc=1 is a
+DEFEAT-arm artifact, NOT a symmetry bug.** Concern: a TX/RX-asymmetric interleaver would corrupt clean decodes
+when enabled. RESOLVED by measurement: with MERCURY_BIGBLOCK_TFILV=8, (i) `--test-bigblock-chanest` SANITY
+(clean, B=8, the live bigblock_tx_passband↔bigblock_rx_passband pair) = bytes_ok=1; (ii)
+`--test-sim-inproc-bigblock` (full live transmit_bigblock→receive_bigblock→carve, K=8) = rc=0, CASE A
+622/622 byte-faithful cw_ok=8/8; (iii) `--test-bigblock-multicw` **ARM-A** (CRC-ON, block window, the
+correctness arm) = clean 8/8, rx_have 1200/1200, bytes_ok=1. So the interleave/deinterleave is an EXACT,
+TX/RX-symmetric permutation (B derived identically from nData at TX and every RX site) and is byte-faithful on a
+clean channel through the full live pipeline when enabled. The multicw/fullpath SUITE returns rc=1 at TFILV=8
+only because their NON-correctness arms are corruption REPRODUCERS: multicw ARM-B forces the pre-fix STOCK RX
+window (MERCURY_BIGBLOCK_DEFEAT_FIX=1) and ASSERTS `!bytes_ok` (the stale-ring corruption must reproduce) — a
+different symbol mapping changes that exact corruption signature, so the `!bytes_ok` assertion is mapping-specific
+and not meaningful under interleaving; fullpath similarly drives a config-transition/window diagnostic. These
+DEFEAT arms are NOT correctness gates for the interleaver (they validate the WINDOW/whiten fixes against a pinned
+mapping). For the HW A/B, the correctness gate is ARM-A / sim-inproc-bigblock / chanest-SANITY (all GREEN at
+TFILV=8); the DEFEAT arms should be run at TFILV=1 (their designed mapping). Default-OFF keeps the whole suite
+rc=0; enabling TFILV=8 is byte-safe on the production live path.
