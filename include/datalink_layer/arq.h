@@ -436,6 +436,14 @@ public:
   // mercury/fact-documents/mfsk-robust-ack.md §3.2.
   uint16_t CRC12_calc(const char* data_byte, int nBytes);
 
+  // BLOCK-CRC (D2_BLOCKCRC, fix/bigblock-d3-carve): CRC-32 over `nItems` bytes,
+  // reflected (LSB-first) IEEE 802.3 — polynomial 0xEDB88320, init 0xFFFFFFFF,
+  // final XOR 0xFFFFFFFF. The whole-block integrity anchor stacked on top of the
+  // per-codeword CRC-8 (datalink_defines.h BIGBLOCK_BLOCK_CRC_*). Catches a K-block
+  // the 8-bit per-cw gates false-pass; on mismatch the block routes to PARTIAL/SACK
+  // and is never delivered.
+  uint32_t CRC32_calc(const char* data_byte, int nItems);
+
 	//! Updates timers values and check for timeouts.
 	    /*!
 	      \return None

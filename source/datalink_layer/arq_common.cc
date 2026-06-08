@@ -4019,15 +4019,48 @@ bool cl_arq_controller::bigblock_send_one_block()
 		// (remaining bytes of this sub-codeword already 0 = pad)
 	}
 
+	// --- D2_BLOCKCRC: WHOLE-BLOCK CRC-32 ON THE WIRE (fix/bigblock-d3-carve) ----------
+	// Stack a block-level CRC-32 over the ENTIRE assembled K*sub_len payload ON TOP of the
+	// per-codeword CRC-8s. It lives in cw (K-1)'s TRAILER at BIGBLOCK_BLOCK_CRC_OFFSET(K,sub_len)
+	// — the 4 bytes just before that codeword's per-cw CRC-8 tail — so cw0's header/app capacity
+	// is UNCHANGED (a cw0 placement shrank app below the ~155B frames and stalled the block).
+	// Stamped BEFORE the per-cw CRC-8 loop. To keep TX and RX computing the CRC-32 over an
+	// IDENTICAL byte image with NO circular dependency, the CRC-32 covers the payload with TWO
+	// sets of bytes treated as ZERO: (a) its own 4 block-CRC bytes, and (b) all K per-codeword
+	// CRC-8 tail bytes (BIGBLOCK_CW_CRC_OFFSET(c)). At this point in TX BOTH are still 0 (the
+	// per-cw loop has not run, the field is unwritten) so we compute directly; RX explicitly
+	// zeroes the SAME bytes before recomputing. This decouples the two CRC layers (each treats
+	// the other's tail bytes as zero), so neither ordering bites. The RX recomputes and REJECTS
+	// the block on mismatch (bigblock_receive_carve) when the per-cw gate said all-clean —
+	// catching a corrupt K-block whose 8 per-cw CRC-8 all false-passed (the HW NO-GO). Does NOT
+	// weaken the per-cw CRC-8 (CLAUDE.md §2): both run.
+	{
+		long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);   // cw(K-1) trailer, before its CRC-8
+		if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= block_payload_len)
+		{
+			// block_payload_bytes here has: block-CRC field = 0 (unwritten) AND all per-cw CRC
+			// tail bytes = 0 (the per-cw loop runs AFTER this). So a direct CRC over it already
+			// matches the RX's "zero both" image — no scratch copy needed at TX.
+			uint32_t bcrc = CRC32_calc((char*)block_payload_bytes.data(), (int)block_payload_len);
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+			{
+				unsigned char by = (unsigned char)((bcrc >> (8*b)) & 0xFF);
+				block_payload[(size_t)bcrc_off + b]       = (int)by;
+				block_payload_bytes[(size_t)bcrc_off + b] = by;
+			}
+		}
+	}
+
 	// --- FAILURE-2 fix: per-codeword CRC-8 ON THE WIRE -------------------------------
 	// After every codeword's header/app bytes are packed (pad bytes already 0), stamp a
 	// CRC-8 over the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes into its tail
-	// byte BIGBLOCK_CW_CRC_OFFSET(c, sub_len). cw0's CRC covers [header | app | pad]; cwc
-	// covers [app | pad]. The RX recomputes the SAME CRC over the de-whitened payload and
+	// byte BIGBLOCK_CW_CRC_OFFSET(c, sub_len). cw0's CRC covers [header | block-CRC | app | pad];
+	// cwc covers [app | pad]. The RX recomputes the SAME CRC over the de-whitened payload and
 	// demotes cw_ok[c] on mismatch (the producer the old oracle compare faked). CRC8_calc
 	// is the stock per-frame helper (POLY_CRC8=0xF4); it runs over the byte mirror.
 	// Compute over ALL K codewords (filled + zero-pad) so the RX gate is uniform — a
-	// pad-only codeword has a deterministic CRC over its zero bytes.
+	// pad-only codeword has a deterministic CRC over its zero bytes. Stamped AFTER the
+	// block-CRC-32 so cw0's CRC-8 covers the now-populated block-CRC field.
 	for(int c=0;c<K;c++)
 	{
 		int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
@@ -4356,6 +4389,44 @@ bool cl_arq_controller::bigblock_rx_cw0_header_valid()
 
 // (already §5-audited) — it does NOT touch the optimizer/gearshift authority.
 // Returns SUCCESSFUL when the block was carved into the ARQ layer.
+//
+// === §1.5 CROSS-LAYER DATA-FLOW AUDIT — block-integrity state (D2_BLOCKCRC) =========
+// New shared state added by this fix: a WHOLE-BLOCK CRC-32 carried in cw (K-1)'s TRAILER
+// (datalink_defines.h BIGBLOCK_BLOCK_CRC_OFFSET(K,sub_len) = the 4 bytes just before that
+// codeword's per-cw CRC-8), 4 bytes uint32 LE, over the assembled K*sub_len de-whitened
+// payload with its own 4 bytes AND all K per-cw CRC-8 tail bytes zeroed.
+//   1. PRODUCERS (writers of the wire CRC-32 field):
+//      - TX: bigblock_send_one_block (arq_common.cc, "D2_BLOCKCRC: WHOLE-BLOCK CRC-32"
+//        block) writes it once per emitted block, BEFORE the per-cw CRC-8 loop (so both
+//        zeroed sets are still 0 at compute) and AFTER all app payloads (input is final).
+//      - Tests: every harness that hand-builds a wire block (test_bigblock_arq_unit.cc
+//        tx_truth builders) must stamp it the SAME way (added in this fix).
+//   2. CONSUMERS (readers/checkers):
+//      - RX: bigblock_receive_carve (THIS function, "D2_BLOCKCRC: WHOLE-BLOCK CRC-32
+//        VERIFY") recomputes over the de-whitened payload (zeroing the block-CRC field +
+//        all per-cw CRC tails) and clears ALL cw_ok on mismatch — ONLY when the per-cw
+//        layer reports the block fully clean (n_clean==K), i.e. the would-be DELIVER path.
+//      - bigblock_rx_cw0_header_valid (the receive() carve GATE) recomputes cw0's per-cw
+//        CRC-8; UNAFFECTED — the block-CRC lives in cw K-1, not cw0, so cw0's header/CRC-8
+//        span is byte-identical to before this fix (no false gate reject of real blocks).
+//   3. VALID STATES: before any producer writes, the 4 field bytes are 0 (the zero
+//      placeholder). On a total acquisition miss (info_bits==NULL) there is no payload ->
+//      the RX check is SKIPPED. A degenerate sub_len that cannot hold the trailer ->
+//      bounds guard skips the check (no false reject of a tiny non-CFG16 geometry).
+//   4. INVARIANTS the consumers assume: (a) TX and RX zero the SAME bytes (block-CRC field
+//      + per-cw CRC tails) before computing -> identical input, no self/circular reference;
+//      (b) the field lives in cw (K-1) so it does NOT shrink cw0's app capacity (a cw0
+//      placement dropped cw0 below the ~155B first frame -> bigblock declined -> block never
+//      emitted; this placement keeps cw0 unchanged and steals 4B from cw K-1's ~174B app);
+//      (c) on mismatch ALL cw_ok are cleared -> the EXISTING PARTIAL/SACK branch of
+//      bigblock_block_to_arq runs (no new delivery path) -> the block is re-sent, never
+//      delivered. The per-cw CRC-8 demote is UNCHANGED and still picks the SACK gaps when
+//      the block-CRC passes; the block-CRC only fires when the per-cw layer said all-clean.
+//   5. WHAT THE FIX CHANGES: it adds a reject decision BEFORE bigblock_block_to_arq. The
+//      only consumer of cw_ok downstream is bigblock_block_to_arq; clearing all bits is a
+//      valid input it already handles (n_clean=0 -> PARTIAL). No optimizer/gearshift state
+//      is touched (the carve never did). The wire grows 4 bytes/block in cw K-1's app
+//      region. No legacy peers exist -> the trailer is unconditional.
 int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		unsigned char fallback_bsi, bool use_wire_header)
 {
@@ -4407,6 +4478,50 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		}
 	}
 
+	// --- D2_BLOCKCRC FALSEPASS REPRODUCER HOOK (fix/bigblock-d3-carve) ----------------
+	// Model the HW NO-GO (WINRUN_FINAL_VERDICT.json): a corrupt K-block whose 8 per-cw
+	// CRC-8 all FALSE-PASS (the LDPC miscorrected each codeword to a valid-but-wrong word
+	// whose recomputed CRC-8 still matched), so the block was DELIVERED with wrong bytes.
+	// MERCURY_BIGBLOCK_FALSEPASS_CW=k corrupts codeword k's DE-WHITENED PAYLOAD bytes and
+	// then RE-STAMPS its per-cw CRC-8 over the corrupt bytes, so the per-cw demote below
+	// PASSES on the wrong data (a self-consistent false-locked window) — exactly the HW
+	// case where ONLY a whole-block CRC can catch it. We mutate the local `payload` AFTER
+	// de-whiten (the byte image the demote + carve consume), corrupting app bytes only (not
+	// the cw's own CRC byte, which we then recompute). Production never sets it.
+	{
+		const char* e = std::getenv("MERCURY_BIGBLOCK_FALSEPASS_CW");
+		int fp_cw = (e && *e) ? atoi(e) : -1;
+		// ONE-SHOT: corrupt only the FIRST block of the run (bigblock_first_clean is still <0
+		// until bigblock_block_to_arq records this first carve). The re-sent copy (after the
+		// block-CRC reject routes the first block to PARTIAL/SACK) is NOT injected -> it delivers
+		// clean, proving the recover-via-re-send pass-after.
+		if(info_bits != NULL && fp_cw >= 0 && fp_cw < K && bigblock_first_clean < 0)
+		{
+			int crc_off  = BIGBLOCK_CW_CRC_OFFSET(fp_cw, sub_len);
+			int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+			int base     = fp_cw * sub_len;
+			// flip the first app byte AFTER any cw0 header prefix so a delivered block is
+			// guaranteed wrong (cw0 header bytes are not app data). Use codeword-interior
+			// bytes well clear of the CRC tail.
+			int app_start = (fp_cw == 0) ? BIGBLOCK_HDR_TOTAL_BYTES(K) : 0;
+			int flip_at   = base + app_start;
+			if(crc_span > 0 && flip_at >= 0 && flip_at < base + crc_span)
+			{
+				payload[(size_t)flip_at] ^= 0xFF;   // corrupt one app byte (wrong on delivery)
+				// re-stamp THIS codeword's per-cw CRC-8 over the now-corrupt bytes so the
+				// per-cw demote PASSES (the false-pass). Block-CRC over the assembled payload
+				// will NOT match the TX's clean-payload CRC-32 -> the block must be rejected.
+				if(crc_off >= 0 && crc_off < (int)((long)K*sub_len))
+					payload[(size_t)crc_off] =
+						(unsigned char)CRC8_calc((char*)&payload[(size_t)base], crc_span);
+				printf("[BIGBLOCK-RX] FALSEPASS-INJECT cw=%d: corrupted app byte @%d + re-stamped "
+					"per-cw CRC-8 (per-cw gate will PASS; only the block CRC-32 can catch this)\n",
+					fp_cw, flip_at);
+				fflush(stdout);
+			}
+		}
+	}
+
 	// --- FAILURE-2 fix: per-codeword WIRE CRC-8 verify -> cw_ok demote --------------
 	// The PHY-layer cw_ok producer (bigblock_rx_passband) is an ORACLE compare on the
 	// single-instance loopback (cw_info_ref) and is FORCED CLEAN (all 1s) on the live
@@ -4439,6 +4554,65 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 				(char*)&payload[(size_t)c*sub_len], crc_span);
 			unsigned char wire = payload[(size_t)crc_off];
 			if(calc != wire) cw_ok[c] = 0;   // demote-only: CRC mismatch => failed codeword
+		}
+	}
+
+	// --- D2_BLOCKCRC: WHOLE-BLOCK CRC-32 VERIFY -> reject (route to PARTIAL/SACK) ------
+	// The block-level integrity anchor (datalink_defines.h BIGBLOCK_BLOCK_CRC_*) stacked ON
+	// TOP of the per-codeword CRC-8. The HW NO-GO (WINRUN_FINAL_VERDICT.json) showed all 8
+	// per-cw CRC-8 false-passing a corrupt K=8 block -> 1374 wrong bytes delivered. This gate
+	// is the SAFETY NET for exactly that case: it fires ONLY when the per-cw layer believes the
+	// block is FULLY CLEAN (n_clean == K) — i.e. it would otherwise DELIVER. When the per-cw
+	// CRC-8 already demoted >=1 codeword the block is going PARTIAL regardless, the gap codeword
+	// is re-sent + re-validated, and re-checking the (expected-mismatching) block-CRC here would
+	// only DEFEAT the per-codeword selective-repeat granularity (CASE D / SACK) — so we skip it.
+	// When n_clean == K, recompute the CRC-32 over the assembled DE-WHITENED payload (with the 4
+	// block-CRC bytes zeroed, the SAME placeholder the TX used so there is no self-reference) and
+	// compare to cw0's header field. On MISMATCH the "all-clean" verdict is FALSE: the block is
+	// corrupt despite all per-cw gates passing, so it MUST NOT be delivered. Clear ALL cw_ok ->
+	// n_clean=0 < K -> bigblock_block_to_arq routes the WHOLE block to the EXISTING PARTIAL/SACK
+	// gap path (re-send), never copy_data_to_buffer. We clear all codewords because a 32-bit block
+	// check localizes nothing — a block-wide false-clean means the whole assembled payload is
+	// suspect, and re-sending the entire block is the byte-faithful action for a life-critical
+	// modem. Skip on a total acquisition miss (info_bits==NULL) and when the geometry cannot hold
+	// the field (degenerate sub_len). §1.5 producer/consumer audit: see the function-header block.
+	// REPRODUCER HOOK (mirrors §17 MERCURY_BIGBLOCK_DEFEAT_FIX / D2 DEFEAT_D2): set
+	// MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC=1 to DISABLE the block-CRC reject on the SAME binary,
+	// restoring the PRE-FIX silent wrong-byte delivery (the per-cw false-pass stands) so the
+	// FALSEPASS fail-before is provable without a revert build. Production never sets it.
+	bool defeat_blockcrc = false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC"); if(e && *e && atoi(e)!=0) defeat_blockcrc = true; }
+	int n_clean_precheck = 0;
+	for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_precheck++;
+	if(info_bits != NULL && !defeat_blockcrc && n_clean_precheck == K)
+	{
+		long total   = (long)K * sub_len;
+		long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);   // cw(K-1) trailer, before its CRC-8
+		if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= total)
+		{
+			// read the wire CRC-32 (uint32 LE) then build the SAME zeroed image the TX computed
+			// over: zero the 4 block-CRC field bytes AND all K per-codeword CRC-8 tail bytes
+			// (the TX computed the block-CRC before either was written = both 0). This decouples
+			// the two CRC layers with no circular dependency.
+			uint32_t wire_bcrc = 0;
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+				wire_bcrc |= ((uint32_t)payload[(size_t)bcrc_off + b]) << (8*b);
+			std::vector<unsigned char> chk(payload.begin(), payload.begin() + total);
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++) chk[(size_t)bcrc_off + b] = 0;
+			for(int c=0;c<K;c++){
+				int cwc_off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+				if(cwc_off >= 0 && cwc_off < total) chk[(size_t)cwc_off] = 0;
+			}
+			uint32_t calc_bcrc = CRC32_calc((char*)chk.data(), (int)total);
+			if(calc_bcrc != wire_bcrc)
+			{
+				printf("[BIGBLOCK-RX] BLOCK-CRC MISMATCH (calc=%08x wire=%08x) — all %d per-cw "
+					"CRC-8 FALSE-PASSED a corrupt K=%d block; REJECTING (clear all cw_ok -> "
+					"PARTIAL/SACK re-send, NOT delivered)\n",
+					(unsigned)calc_bcrc, (unsigned)wire_bcrc, K, K);
+				fflush(stdout);
+				for(int c=0;c<K;c++) cw_ok[c] = 0;   // force PARTIAL: never deliver a block-CRC-failed block
+			}
 		}
 	}
 
@@ -9315,5 +9489,26 @@ uint8_t cl_arq_controller::CRC8_calc(char* data_byte, int nItems)
 	}
 	return crc;
 	//ref: MODBUS over serial line specification and implementation guide V1.02, Dec 20,2006, available at https://modbus.org/docs/Modbus_over_serial_line_V1_02.pdf
+}
+
+uint32_t cl_arq_controller::CRC32_calc(const char* data_byte, int nItems)
+{
+	// Reflected IEEE 802.3 CRC-32 (poly 0xEDB88320, init 0xFFFFFFFF, final XOR
+	// 0xFFFFFFFF). Bit-serial reflected form so the implementation is allocator-free
+	// and matches the standard zlib/Ethernet CRC-32 used across the in-tree ffbase
+	// crc32 family. Used as the big-block whole-block integrity anchor on top of the
+	// per-codeword CRC-8 (datalink_defines.h BIGBLOCK_BLOCK_CRC_*). No table needed —
+	// runs over a 1374-byte block exactly once per RX block (negligible cost).
+	uint32_t crc = 0xFFFFFFFFu;
+	for(int j=0; j < nItems; j++)
+	{
+		crc ^= (uint32_t)(unsigned char)data_byte[j];
+		for(int i=0; i<8; i++)
+		{
+			if(crc & 1u) crc = (crc >> 1) ^ 0xEDB88320u;
+			else         crc = (crc >> 1);
+		}
+	}
+	return crc ^ 0xFFFFFFFFu;
 }
 

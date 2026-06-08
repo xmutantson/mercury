@@ -191,6 +191,42 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 // so the K-bit cw_ok SACK granularity / selective-repeat stays frame == codeword).
 #define BIGBLOCK_HDR_FIXED_BYTES 2                            // bsi + n_data
 #define BIGBLOCK_HDR_TOTAL_BYTES(K) (BIGBLOCK_HDR_FIXED_BYTES + 2*(K))  // + uint16 length table
+// BLOCK-CRC (D2_BLOCKCRC, fix/bigblock-d3-carve): a WHOLE-BLOCK CRC-32 over the
+// assembled de-whitened K*sub_len payload. It is the block-level integrity anchor
+// STACKED ON TOP of the K per-codeword CRC-8s: the HW NO-GO (WINRUN_FINAL_VERDICT.json)
+// showed all 8 per-cw CRC-8 FALSE-PASSING a corrupt K=8 block (the LDPC miscorrected
+// each codeword to a valid-but-wrong word whose recomputed CRC-8 still matched),
+// delivering 1374 wrong bytes. An 8-bit per-cw gate cannot rule that out (2^-8 residual
+// per cw, and the failure was self-consistent ACROSS all 8). CRC-32 (poly 0x04C11DB7,
+// reflected 0xEDB88320 — the IEEE 802.3 CRC the in-tree ffbase crc32 family uses) gives
+// a ~2^-32 block-level residual with Hamming distance >= 4 well past the ~11200-bit
+// block, at a 4-byte/block (=0.29% of 1374B) cost. CRC-16's 2^-16 residual is too weak
+// for a life-critical "silent wrong-byte must be impossible" guarantee.
+//
+// PLACEMENT: the 4 block-CRC bytes sit in the LAST codeword (cw K-1), immediately BEFORE
+// that codeword's own per-cw CRC-8 tail byte. This deliberately does NOT touch cw0's
+// header (BIGBLOCK_HDR_TOTAL_BYTES is unchanged at 2+2*K) so cw0's app capacity — which
+// must hold the first ARQ frame — is NOT reduced (a 4-byte cw0 shrink dropped it below the
+// ~155-byte frames and tripped the bigblock decline guard, stalling the block). cw K-1
+// (app cap sub_len-1) loses only 4 of its ~174 bytes, far above any frame. The offset is
+// FIXED (geometry-derived) so the RX can locate it WITHOUT trusting the length table.
+//
+// COVERAGE / SELF-REFERENCE: the CRC-32 covers the ENTIRE K*sub_len payload with TWO sets
+// of bytes treated as ZERO — its own 4 block-CRC bytes AND all K per-codeword CRC-8 tail
+// bytes — so the two CRC layers are decoupled (neither's tail bytes feed the other) and TX
+// and RX (which de-whitens first) compute over an identical image with no circular
+// dependency. Checked at RX in bigblock_receive_carve BEFORE bigblock_block_to_arq, ONLY
+// when the per-cw layer reports the block fully clean (n_clean==K); on mismatch ALL cw_ok
+// are cleared -> the block routes to the EXISTING PARTIAL/SACK gap path (re-send) and is
+// NEVER delivered. Does NOT weaken the per-cw CRC-8 (CLAUDE.md §2): both run, the CRC-8
+// still picks the per-codeword SACK granularity when the block is partial.
+#define BIGBLOCK_BLOCK_CRC_BYTES 4                            // 1 CRC-32 byte-quad / block
+// byte offset of the block CRC-32 within the K*sub_len payload: the 4 bytes just before
+// cw (K-1)'s per-cw CRC-8 tail byte. uint32 little-endian. Requires sub_len large enough
+// to hold both (sub_len > BIGBLOCK_CW_CRC_BYTES + BIGBLOCK_BLOCK_CRC_BYTES); the CFG16 thin
+// grid (sub_len=175) has ample room. The RX/TX guard the bound before using it.
+#define BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len) \
+	((long)(K)*(long)(sub_len) - BIGBLOCK_CW_CRC_BYTES - BIGBLOCK_BLOCK_CRC_BYTES)
 
 // FAILURE-2 fix (per-codeword CRC-8 ON THE WIRE). The LDPC iter count does NOT
 // detect a MISCORRECTION (the decoder converges to a valid-but-wrong codeword on a

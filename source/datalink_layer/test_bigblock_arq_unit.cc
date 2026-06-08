@@ -831,6 +831,18 @@ int cl_arq_controller::test_bigblock_climb_election()
 			for(int j=0;j<app_len[c];j++)
 				tx_truth[(size_t)base + j] = app_truth[c][(size_t)j];
 		}
+		// D2_BLOCKCRC: stamp the whole-block CRC-32 (cw K-1 trailer) BEFORE the per-cw CRC-8
+		// loop, exactly as production TX — at this point BOTH the 4 field bytes and all per-cw
+		// CRC tail bytes are still 0, so the CRC-32 matches the RX "zero both" recompute image.
+		{
+			long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+			if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= (long)tx_truth.size())
+			{
+				uint32_t bcrc = cmd->CRC32_calc((char*)tx_truth.data(), (int)tx_truth.size());
+				for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+					tx_truth[(size_t)bcrc_off + b] = (unsigned char)((bcrc >> (8*b)) & 0xFF);
+			}
+		}
 		for(int c=0;c<K;c++)
 		{
 			int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
@@ -1632,6 +1644,17 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 			int base = (c == 0) ? hdr_total : (c * sub_len);
 			for(int j=0;j<app_len[c];j++)
 				tx_truth[(size_t)base + j] = app_truth[c][(size_t)j];
+		}
+		// D2_BLOCKCRC: stamp the whole-block CRC-32 (cw K-1 trailer) BEFORE the per-cw CRC-8
+		// loop (both field + per-cw tails still 0), matching the RX "zero both" recompute.
+		{
+			long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+			if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= (long)total_tx_bytes)
+			{
+				uint32_t bcrc = A->CRC32_calc((char*)tx_truth.data(), (int)total_tx_bytes);
+				for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+					tx_truth[(size_t)bcrc_off + b] = (unsigned char)((bcrc >> (8*b)) & 0xFF);
+			}
 		}
 		// FAILURE-2 fix: stamp the per-codeword wire CRC-8 EXACTLY as production
 		// bigblock_send_one_block does (CRC over the codeword's first
@@ -2470,6 +2493,16 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 			int base=(c==0)?hdr_total:(c*sub_len);
 			for(int j=0;j<app_len[c];j++) tx_truth[(size_t)base+j]=app_truth[c][(size_t)j];
 		}
+		// D2_BLOCKCRC: whole-block CRC-32 (cw K-1 trailer) BEFORE per-cw CRC-8 (both field +
+		// per-cw tails still 0), matching the RX "zero both" recompute, as production TX does.
+		{
+			long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+			if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= (long)tx_truth.size()){
+				uint32_t bcrc = A->CRC32_calc((char*)tx_truth.data(), (int)tx_truth.size());
+				for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+					tx_truth[(size_t)bcrc_off + b] = (unsigned char)((bcrc >> (8*b)) & 0xFF);
+			}
+		}
 		for(int c=0;c<K;c++){
 			int crc_off=BIGBLOCK_CW_CRC_OFFSET(c,sub_len), crc_span=BIGBLOCK_CW_CRC_SPAN(sub_len);
 			if(crc_off<0||crc_off>=(int)tx_truth.size()||crc_span<0) continue;
@@ -2887,6 +2920,16 @@ int cl_arq_controller::test_sim_inproc_bigblock_acqwindow()
 			tx_truth[(size_t)lo+1]=(unsigned char)((app_len[c]>>8)&0xFF);
 			int base=(c==0)?hdr_total:(c*sub_len);
 			for(int j=0;j<app_len[c];j++) tx_truth[(size_t)base+j]=app_truth[c][(size_t)j];
+		}
+		// D2_BLOCKCRC: whole-block CRC-32 (cw K-1 trailer) BEFORE per-cw CRC-8 (both field +
+		// per-cw tails still 0), matching the RX "zero both" recompute, as production TX does.
+		{
+			long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+			if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= (long)tx_truth.size()){
+				uint32_t bcrc = A->CRC32_calc((char*)tx_truth.data(), (int)tx_truth.size());
+				for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+					tx_truth[(size_t)bcrc_off + b] = (unsigned char)((bcrc >> (8*b)) & 0xFF);
+			}
 		}
 		for(int c=0;c<K;c++){
 			int crc_off=BIGBLOCK_CW_CRC_OFFSET(c,sub_len), crc_span=BIGBLOCK_CW_CRC_SPAN(sub_len);

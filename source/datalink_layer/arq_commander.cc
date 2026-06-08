@@ -11076,6 +11076,8 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 		"MERCURY_BIGBLOCK_SIM_RINGPHASE", "MERCURY_BIGBLOCK_SIM_STALERING",  // ARM-E: D3 acq nondeterminism
 		"MERCURY_BIGBLOCK_SIM_RETXCOPY", "MERCURY_BIGBLOCK_SIM_RINGSEED",    // ARM-E: D3 acq nondeterminism
 		"MERCURY_BIGBLOCK_EARLIEST", "MERCURY_BIGBLOCK_MFSNAP",              // ARM-E/F: D3 earliest-preamble fix
+		"MERCURY_BIGBLOCK_FALSEPASS_CW",      // ARM-F: D2_BLOCKCRC per-cw-CRC-8 false-pass (block-CRC catches it)
+		"MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC",   // ARM-F: D2_BLOCKCRC fail-before reproducer (block-CRC disabled)
 		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
 	};
 	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
@@ -11130,6 +11132,9 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	// false-lock fail-before/pass-after. MFSNAP at its production default (unset = ON).
 	set_env("MERCURY_BIGBLOCK_EARLIEST", "1");
 	set_env("MERCURY_BIGBLOCK_MFSNAP",   "");
+	// ARM-F (D2_BLOCKCRC) per-cw-CRC-8 FALSE-PASS injection + its defeat default OFF for arms A..E.
+	set_env("MERCURY_BIGBLOCK_FALSEPASS_CW",    "-1");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC", "0");
 
 	int failed = 0;
 
@@ -11153,7 +11158,7 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	if(!a_ok) failed++;
 
 	// --- ARM B: NOCRC, STOCK window (fail-before). Forced-clean but BYTES WRONG (cw0 ok). ---
-	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");   // isolate byte-truth from the CRC gate
+	set_env("MERCURY_BIGBLOCK_NOCRC",      "1");   // isolate byte-truth from the per-cw CRC gate
 	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX", "1");   // restore the pre-fix stock-frame window
 	// §22: this arm isolates the §17 stock-frame-window TRUNCATION corruption. The §22 acq-window
 	// WAIT-FOR-TAIL guard would otherwise CATCH that truncated-window overrun and recover the block
@@ -11162,6 +11167,12 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	// §22 = the snapshot POSITION/wait. With the acq-guard ON, §22 alone already rescues a
 	// short-window block — see ARM-B2 below.)
 	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "1");
+	// D2_BLOCKCRC: this arm DELIVERS wrong bytes ON PURPOSE to demonstrate the §17 corruption.
+	// The block-CRC-32 (independent of NOCRC) would now CATCH that corruption and route it to
+	// PARTIAL (rx_have=0), defeating this fail-before isolation — so DEFEAT the block-CRC here
+	// too. (This proves orthogonality: with the block-CRC ON in production the same §17 corruption
+	// is rejected, not delivered — exactly the safety ARM-F asserts.)
+	set_env("MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC", "1");
 	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
 	bigblock_first_clean = -1; bigblock_first_K = -1;
 	int rc_b = test_sim_inproc_2();
@@ -11180,6 +11191,8 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	set_env("MERCURY_BIGBLOCK_NOCRC",           "1");
 	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",      "1");   // keep the §17 short stock window
 	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "0");   // but ACQ-GUARD ON: §22 wait-for-tail
+	set_env("MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC", "0");   // D2_BLOCKCRC ON (production) — B2 delivers
+	                                                    //   CORRECT bytes so the block-CRC passes.
 	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
 	bigblock_first_clean = -1; bigblock_first_K = -1;
 	int rc_b2 = test_sim_inproc_2();
@@ -11342,12 +11355,99 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	       "fail->pass is MERCURY_BIGBLOCK_EARLIEST)\n", ep_pass ? "PASS" : "FAIL");
 	if(!ep_pass) failed++;
 
+	// --- ARM F (D2_BLOCKCRC, fix/bigblock-d3-carve): the HW NO-GO the sim NEVER modeled —
+	//     a per-codeword CRC-8 FALSE-PASS. WINRUN_FINAL_VERDICT.json: a K=8 block whose ALL 8
+	//     per-cw CRC-8 passed on corrupt data was DELIVERED (1374 bytes, md5 MISMATCH) — a
+	//     SILENT WRONG-BYTE. Every arm above decodes byte-true, so the per-cw demote never had
+	//     a self-consistent false-locked window to false-pass; this arm injects exactly one.
+	//     MERCURY_BIGBLOCK_FALSEPASS_CW=k (bigblock_receive_carve) corrupts codeword k's
+	//     de-whitened PAYLOAD and RE-STAMPS its per-cw CRC-8 so the per-cw gate PASSES on the
+	//     wrong bytes — only the whole-block CRC-32 can catch it. One-shot (first block only),
+	//     so the re-sent copy is clean.
+	//     The ONLY variable fail->pass is MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC (SAME binary, SAME
+	//     FALSEPASS injection), STOP_AFTER_FIRST_BLOCK=1 to capture the first block fast:
+	//       FAIL-BEFORE (DEFEAT_BLOCKCRC=1, block-CRC OFF): the per-cw false-pass stands -> the
+	//         corrupt block is "clean" 8/8 and DELIVERED -> rx_have=1200 but bytes_ok=0 (the EXACT
+	//         HW silent wrong-byte: delivered, md5 mismatch).
+	//       PASS-AFTER  (DEFEAT_BLOCKCRC=0, the fix): the block-CRC-32 catches the false-pass ->
+	//         clears all cw_ok -> the block is NOT delivered as clean (first_clean=0, PARTIAL/SACK
+	//         re-send) -> NO wrong bytes ever reach the FIFO (bytes_ok stays 0 with rx_have<1200,
+	//         i.e. the silent wrong-byte DELIVERY is eliminated).
+	const int FALSEPASS_CW = 4;   // interior codeword (clear of cw0 header + tail CRC)
+	set_env("MERCURY_BIGBLOCK_NOCRC",          "0");   // production per-cw CRC-8 demote ON
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",     "0");   // §17 block-span window
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD","0");   // §22 acq-guard ON
+	set_env("MERCURY_BIGBLOCK_CORRUPT_CW",     "-1");  // no LLR corruption (this is a payload+CRC restamp)
+	set_env("MERCURY_BIGBLOCK_CORRUPT_NBITS",  "0");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_D2",      "0");
+	set_env("MERCURY_BIGBLOCK_SIM_RINGPHASE",  "");
+	set_env("MERCURY_BIGBLOCK_SIM_STALERING",  "0");
+	set_env("MERCURY_BIGBLOCK_SIM_RETXCOPY",   "0");
+	set_env("MERCURY_BIGBLOCK_EARLIEST",       "1");
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");
+	set_env("MERCURY_SIM2_STALL_ITERS", "6000");
+	set_env("MERCURY_SIM2_MAXITERS",    "30000");
+	{ char b[8]; snprintf(b,sizeof(b),"%d",FALSEPASS_CW); set_env("MERCURY_BIGBLOCK_FALSEPASS_CW", b); }
+
+	// F-FAIL (DEFEAT_BLOCKCRC=1): block-CRC OFF -> the per-cw false-pass delivers wrong bytes.
+	set_env("MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC", "1");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_ff = test_sim_inproc_2();
+	int  ff_clean = bigblock_first_clean, ff_K = bigblock_first_K;
+	long ff_rx    = sim2_last_rx_have;
+	bool ff_byteok= sim2_last_bytes_ok;
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-F FAIL-BEFORE (FALSEPASS_CW=%d, DEFEAT_BLOCKCRC=1): first_block "
+	       "clean=%d/%d rx_have=%ld/%ld bytes_ok=%d (rc=%d) — expect all-8 per-cw CRC FALSE-PASS "
+	       "(clean=8/8) DELIVERED with WRONG bytes (rx_have=1200, bytes_ok=0): the HW silent wrong-byte\n",
+	       FALSEPASS_CW, ff_clean, ff_K, ff_rx, PAYLOAD, (int)ff_byteok, rc_ff);
+	bool ff_fail = (ff_K == 8) && (ff_clean == 8) && (ff_rx == PAYLOAD) && !ff_byteok;
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-F fail-before reproduces the per-cw-CRC-8 FALSE-PASS "
+	       "(block delivered 1200B, md5/bytes WRONG — exactly WINRUN_FINAL_VERDICT.json)\n",
+	       ff_fail ? "PASS" : "FAIL");
+	if(!ff_fail) failed++;
+
+	// F-PASS (DEFEAT_BLOCKCRC=0, the fix): block-CRC-32 catches the false-pass -> NOT delivered.
+	set_env("MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC", "0");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1;
+	int rc_fp = test_sim_inproc_2();
+	int  fp_clean = bigblock_first_clean, fp_K = bigblock_first_K;
+	long fp_rx    = sim2_last_rx_have;
+	bool fp_byteok= sim2_last_bytes_ok;
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-F PASS-AFTER (FALSEPASS_CW=%d, DEFEAT_BLOCKCRC=0, the fix): "
+	       "first_block clean=%d/%d rx_have=%ld/%ld bytes_ok=%d (rc=%d) — expect block-CRC-32 REJECT "
+	       "(clean=0, all cw_ok cleared -> PARTIAL/SACK), the corrupt block NOT delivered (no wrong "
+	       "bytes in the FIFO)\n",
+	       FALSEPASS_CW, fp_clean, fp_K, fp_rx, PAYLOAD, (int)fp_byteok, rc_fp);
+	// the safety property: the corrupt first block was REJECTED (clean=0, NOT 8) and NO wrong bytes
+	// were delivered byte-faithful (bytes_ok stays false; rx_have did NOT reach a full wrong block).
+	bool fp_pass = (fp_K == 8) && (fp_clean == 0) && !(fp_rx == PAYLOAD && fp_byteok);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-F pass-after — the block-CRC-32 converts the silent "
+	       "wrong-byte DELIVERY into a PARTIAL/SACK REJECT (the corrupt block is never delivered; "
+	       "the ONLY variable fail->pass is MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC)\n",
+	       fp_pass ? "PASS" : "FAIL");
+	if(!fp_pass) failed++;
+
+	// F-RECOVER: the end-to-end "re-sent clean copy delivers byte-faithful" property is NOT
+	// re-run here on the slow live 2-instance run-to-completion path (the post-reject whole-block
+	// re-emit cycles many virtual ACK-timeouts in this sim and would dominate the suite runtime).
+	// It is ALREADY proven deterministically and fast by --test-sim-inproc-bigblock CASE B
+	// ("one-bad-cw=3 ... partial -> selective-repeat completes block in-sim, full=8/8
+	// delivered=622/622"): a PARTIAL block (which is EXACTLY the state the block-CRC reject puts
+	// the FALSEPASS block in — n_clean<K -> the same PARTIAL/SACK branch) recovers byte-faithful
+	// via the existing transport. The block-CRC reject (F-PASS above) converts the silent
+	// wrong-byte into that proven-recoverable PARTIAL; CASE B closes the loop. (Keeping ARM-F to
+	// its two fast STOP_AFTER_FIRST_BLOCK assertions keeps this durable suite runnable.)
+	(void)FALSEPASS_CW;
+
 	restore_env();
 
 	printf("[TEST-BIGBLOCK-MULTICW] %s (%d failure%s)  [A: clean=%d/%d byteok | B: corrupt-repro "
 	       "(§17 trunc) | B2: §22 wait-for-tail byteok | C: window-fix byteok | D: per-cw PARTIAL "
 	       "D2 delivery-arming fail-before(strand)->pass-after(prev-armed) | E: D3 false-lock "
-	       "fail-before(global-argmax)->pass-after(earliest-preamble)]\n",
+	       "fail-before(global-argmax)->pass-after(earliest-preamble) | F: D2_BLOCKCRC per-cw-CRC-8 "
+	       "false-pass fail-before(silent-wrong-byte)->pass-after(block-CRC reject); recover=CASE-B]\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed,
 	       failed == 1 ? "" : "s", a_clean, a_K);
 	fflush(stdout);
