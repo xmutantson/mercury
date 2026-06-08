@@ -3899,39 +3899,26 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 // (zero-padded to sub_len). The RX carve (bigblock_block_to_arq) is the exact
 // inverse (INV-6). The block's batch_seq_id = the batch's bsi (one block = one
 // batch, INV-1/P2.6).
-bool cl_arq_controller::bigblock_send_one_block()
+//
+// bigblock_pack_block(): build the K*sub_len on-wire block payload (header in cw0
+// prefix + per-codeword app bytes + the whole-block CRC-32 in cw(K-1)'s trailer +
+// the per-codeword CRC-8 tails) from the current new-data batch. Extracted from
+// bigblock_send_one_block so the CAP-RESERVATION rule (V2 FIX-1, fact-doc §9) lives
+// in ONE place exercised by BOTH production AND the MAX-PAYLOAD test arm — the V1
+// LIVELOCK existed precisely because the test builder reserved the block-CRC field
+// while production (cwc_cap=174 with no K-1 reservation) did NOT. On success returns
+// true and fills out_payload (the packed byte image, == bigblock_tx_block_payload),
+// out_K, out_sub_len, out_ndata, out_lengths; also stashes bigblock_tx_block_*.
+bool cl_arq_controller::bigblock_pack_block(int n_data,
+                                            std::vector<unsigned char>& out_payload,
+                                            int& out_K, int& out_sub_len,
+                                            int& out_ndata,
+                                            std::vector<int>& out_lengths)
 {
 	if(telecom_system == NULL) return false;
-	if(!telecom_system->bigblock_framing_enabled) return false;
-	if(telecom_system->M == MOD_MFSK) return false;
-	// P3 HW FIX: the big-block framing is a CFG16-RUNG mode (validated geometry K=8,
-	// sub_len=ldpc.K/8). It must engage ONLY at CONFIG_16. The flag alone is not enough:
-	// the gearshift starts at ROBUST_0 and climbs through OTHER OFDM configs (CONFIG_0..15,
-	// all is_ofdm_config()==true, all !is_robust_config()). At those rungs the block has a
-	// DIFFERENT, unvalidated geometry (HW-observed CONFIG_0: K=1 sub_len=12) that corrupts
-	// the data path and STALLS the climb (every batch carves clean=0 -> no clean ACK ->
-	// gearshift BREAKs, never reaches CFG16). Gate on the live config == CONFIG_16 so the
-	// stock per-frame path carries CONFIG_0..15 and the block engages only at the validated
-	// rung. (The gearshift AUTO-election of this rung is still P4; here the flag is FORCED.)
-	if(current_configuration != CONFIG_16) return false;
-	// Retx batches stay STOCK CFG16 per-frame framing (P2.5).
-	if(sack_retransmit_active) return false;
-	if(message_batch_counter_tx <= 0) return false;
-
-	// Only emit a block for an all-DATA new-data batch. A CONTROL/ACK frame mixed
-	// into the batch keeps the stock per-frame path (the block carries data only).
-	int n_data = 0;
-	for(int i=0;i<message_batch_counter_tx;i++)
-	{
-		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
-			n_data++;
-		else
-			return false;   // non-data frame present -> decline, stock path handles it
-	}
-	if(n_data <= 0) return false;
-
 	int K = telecom_system->bigblock_codeword_count();
 	if(K <= 0) return false;
+	if(n_data <= 0) return false;
 	if(n_data > K) return false;   // batch larger than the block can carry -> stock path
 
 	// sub_len = systematic info bytes per codeword (ldpc.K/8). The block payload is
@@ -3942,25 +3929,28 @@ bool cl_arq_controller::bigblock_send_one_block()
 	const int alloc_size = N_MAX / 8;
 	if(sub_len > alloc_size) sub_len = alloc_size;
 
-	// PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header ON THE WIRE in
-	// codeword 0's systematic info bits (LDPC-protected): [bsi, n_data, length[0..K-1]].
-	// The bsi makes a multi-block session drift-proof (the block has one acquisition +
-	// no per-frame wire bit-7); the per-codeword length table lets the RX deliver each
-	// sub-codeword its EXACT frame length so VARIABLE-length compressed frames reassemble
-	// byte-faithfully (compression transparency, INV-10). cw0's app bytes start at offset
-	// hdr_total; cw1..K-1 are codeword-aligned at c*sub_len (so the K-bit cw_ok SACK
-	// granularity / selective-repeat keeps frame == codeword).
 	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);   // 2 + 2*K bytes
 	// FAILURE-2 fix: each sub-codeword reserves its LAST byte for an on-wire CRC-8
 	// (BIGBLOCK_CW_CRC_BYTES). The per-codeword app capacity shrinks by that 1 byte:
-	//   cw0  app cap = sub_len - hdr_total - CRC   (header prefix + CRC both reserved)
-	//   cwc  app cap = sub_len            - CRC    (c >= 1)
-	// The CRC byte sits at the FIXED offset BIGBLOCK_CW_CRC_OFFSET(c, sub_len) and covers
-	// the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes (header+app for cw0).
+	//   cw0    app cap = sub_len - hdr_total - CRC          (header prefix + CRC both reserved)
+	//   cwc    app cap = sub_len            - CRC           (1 <= c <= K-2)
+	//   cwK-1  app cap = sub_len            - CRC - BLOCK   (V2 FIX-1: ALSO reserve the 4-byte
+	//                                                         whole-block CRC-32 trailer field)
 	const int cw0_cap = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;  // cw0 app capacity
 	if(cw0_cap < 0) return false;                        // sub_len too small for header+CRC
-	const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;             // cwc (c>=1) app capacity
+	const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;             // cwc (1<=c<=K-2) app capacity
 	if(cwc_cap < 0) return false;
+	// V2 FIX-1 (LIVELOCK, fact-doc §9): the block-CRC field lives in cw(K-1)'s trailer at
+	// BIGBLOCK_BLOCK_CRC_OFFSET = (K-1)*sub_len + (sub_len-1-4). Reserve it out of cw(K-1)'s
+	// app capacity so a genuinely-clean full block never writes an app byte into the field
+	// (TX would then overwrite it with the CRC AND its CRC image would diverge from the RX
+	// recompute, which zeroes the field -> deterministic false-reject livelock). A defeat hook
+	// MERCURY_BIGBLOCK_DEFEAT_CAPFIX=1 restores the PRE-FIX unreserved cap on the SAME binary so
+	// the MAX-PAYLOAD fail-before is reproducible without a revert build. Production never sets it.
+	bool defeat_capfix = false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_CAPFIX"); if(e && *e && atoi(e)!=0) defeat_capfix = true; }
+	const int cwlast_cap = defeat_capfix ? cwc_cap : (cwc_cap - BIGBLOCK_BLOCK_CRC_BYTES);  // cw(K-1) app cap
+	if(cwlast_cap < 0) return false;
 	// INV-9 guard: frame 0 must fit in the reduced cw0 capacity. The big-block lattice
 	// gives sub_len >> max_frame + hdr_total, so this never fires at the CFG16 rung.
 	{
@@ -3982,7 +3972,8 @@ bool cl_arq_controller::bigblock_send_one_block()
 	std::vector<int> tx_lengths((size_t)K, 0);
 	for(int i=0;i<n_data && i<K;i++)
 	{
-		int cap = (i == 0) ? cw0_cap : cwc_cap;   // CRC byte reserved at the codeword tail
+		// V2 FIX-1: the LAST codeword reserves the block-CRC field too (cwlast_cap).
+		int cap = (i == 0) ? cw0_cap : (i == K - 1 ? cwlast_cap : cwc_cap);
 		int len = messages_batch_tx[i].length;
 		if(len < 0) len = 0;
 		if(len > cap) len = cap;          // a frame longer than the sub-codeword is clamped
@@ -4029,18 +4020,12 @@ bool cl_arq_controller::bigblock_send_one_block()
 	// sets of bytes treated as ZERO: (a) its own 4 block-CRC bytes, and (b) all K per-codeword
 	// CRC-8 tail bytes (BIGBLOCK_CW_CRC_OFFSET(c)). At this point in TX BOTH are still 0 (the
 	// per-cw loop has not run, the field is unwritten) so we compute directly; RX explicitly
-	// zeroes the SAME bytes before recomputing. This decouples the two CRC layers (each treats
-	// the other's tail bytes as zero), so neither ordering bites. The RX recomputes and REJECTS
-	// the block on mismatch (bigblock_receive_carve) when the per-cw gate said all-clean —
-	// catching a corrupt K-block whose 8 per-cw CRC-8 all false-passed (the HW NO-GO). Does NOT
-	// weaken the per-cw CRC-8 (CLAUDE.md §2): both run.
+	// zeroes the SAME bytes before recomputing. V2 FIX-1 reserves the field out of cw(K-1)'s app
+	// cap above, so no app byte ever occupies the field (TX/RX CRC images match).
 	{
 		long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);   // cw(K-1) trailer, before its CRC-8
 		if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= block_payload_len)
 		{
-			// block_payload_bytes here has: block-CRC field = 0 (unwritten) AND all per-cw CRC
-			// tail bytes = 0 (the per-cw loop runs AFTER this). So a direct CRC over it already
-			// matches the RX's "zero both" image — no scratch copy needed at TX.
 			uint32_t bcrc = CRC32_calc((char*)block_payload_bytes.data(), (int)block_payload_len);
 			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
 			{
@@ -4052,15 +4037,9 @@ bool cl_arq_controller::bigblock_send_one_block()
 	}
 
 	// --- FAILURE-2 fix: per-codeword CRC-8 ON THE WIRE -------------------------------
-	// After every codeword's header/app bytes are packed (pad bytes already 0), stamp a
-	// CRC-8 over the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes into its tail
-	// byte BIGBLOCK_CW_CRC_OFFSET(c, sub_len). cw0's CRC covers [header | block-CRC | app | pad];
-	// cwc covers [app | pad]. The RX recomputes the SAME CRC over the de-whitened payload and
-	// demotes cw_ok[c] on mismatch (the producer the old oracle compare faked). CRC8_calc
-	// is the stock per-frame helper (POLY_CRC8=0xF4); it runs over the byte mirror.
-	// Compute over ALL K codewords (filled + zero-pad) so the RX gate is uniform — a
-	// pad-only codeword has a deterministic CRC over its zero bytes. Stamped AFTER the
-	// block-CRC-32 so cw0's CRC-8 covers the now-populated block-CRC field.
+	// Stamp a CRC-8 over each codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes into its
+	// tail byte. cw0's CRC covers [header | block-CRC | app | pad]; cw(K-1)'s covers
+	// [app | block-CRC field | pad]. Stamped AFTER the block-CRC-32.
 	for(int c=0;c<K;c++)
 	{
 		int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
@@ -4073,14 +4052,67 @@ bool cl_arq_controller::bigblock_send_one_block()
 
 	// Stash the TX block payload + geometry + per-codeword lengths so the in-process
 	// single-block harness (and any RX in the same process) can carve it back
-	// byte-faithfully. The live RX carve reads the wire header off the decoded payload;
-	// the harness uses this stash as ground truth for the delivered==TX assertion (INV-6).
+	// byte-faithfully.
 	bigblock_tx_block_payload = block_payload_bytes;
 	bigblock_tx_block_K       = K;
 	bigblock_tx_block_sub_len = sub_len;
 	bigblock_tx_block_bsi     = (unsigned char)(block_bsi & 0xFF);
 	bigblock_tx_block_ndata   = n_data;
 	bigblock_tx_block_lengths = tx_lengths;
+
+	out_payload = block_payload_bytes;
+	out_K       = K;
+	out_sub_len = sub_len;
+	out_ndata   = n_data;
+	out_lengths = tx_lengths;
+	return true;
+}
+
+bool cl_arq_controller::bigblock_send_one_block()
+{
+	if(telecom_system == NULL) return false;
+	if(!telecom_system->bigblock_framing_enabled) return false;
+	if(telecom_system->M == MOD_MFSK) return false;
+	// P3 HW FIX: the big-block framing is a CFG16-RUNG mode (validated geometry K=8,
+	// sub_len=ldpc.K/8). It must engage ONLY at CONFIG_16. The flag alone is not enough:
+	// the gearshift starts at ROBUST_0 and climbs through OTHER OFDM configs (CONFIG_0..15,
+	// all is_ofdm_config()==true, all !is_robust_config()). At those rungs the block has a
+	// DIFFERENT, unvalidated geometry (HW-observed CONFIG_0: K=1 sub_len=12) that corrupts
+	// the data path and STALLS the climb (every batch carves clean=0 -> no clean ACK ->
+	// gearshift BREAKs, never reaches CFG16). Gate on the live config == CONFIG_16 so the
+	// stock per-frame path carries CONFIG_0..15 and the block engages only at the validated
+	// rung. (The gearshift AUTO-election of this rung is still P4; here the flag is FORCED.)
+	if(current_configuration != CONFIG_16) return false;
+	// Retx batches stay STOCK CFG16 per-frame framing (P2.5).
+	if(sack_retransmit_active) return false;
+	if(message_batch_counter_tx <= 0) return false;
+
+	// Only emit a block for an all-DATA new-data batch. A CONTROL/ACK frame mixed
+	// into the batch keeps the stock per-frame path (the block carries data only).
+	int n_data = 0;
+	for(int i=0;i<message_batch_counter_tx;i++)
+	{
+		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			n_data++;
+		else
+			return false;   // non-data frame present -> decline, stock path handles it
+	}
+	if(n_data <= 0) return false;
+
+	// Build the K*sub_len on-wire block payload (header + app + block-CRC-32 + per-cw CRC-8s)
+	// via the SHARED packer so the V2 FIX-1 cap reservation (fact-doc §9) is identical to the
+	// MAX-PAYLOAD test arm. On decline (geometry too small / frame 0 doesn't fit cw0) -> stock
+	// per-frame path. The packer also stashes bigblock_tx_block_* (the in-process carve ground
+	// truth, INV-6).
+	int K = 0, sub_len = 0, packed_ndata = 0;
+	std::vector<unsigned char> block_payload_bytes;
+	std::vector<int> tx_lengths;
+	if(!bigblock_pack_block(n_data, block_payload_bytes, K, sub_len, packed_ndata, tx_lengths))
+		return false;
+	long block_payload_len = (long)block_payload_bytes.size();
+	// transmit_byte takes an int* payload; mirror the packed byte image.
+	std::vector<int> block_payload((size_t)block_payload_len, 0);
+	for(long i=0;i<block_payload_len;i++) block_payload[(size_t)i] = (int)block_payload_bytes[(size_t)i];
 
 	// Emit ONE big-block through the production transmit_byte (branches to
 	// transmit_bigblock when bigblock_framing_enabled). data = the K*sub_len real
@@ -4638,8 +4670,15 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 			// FAILURE-2 fix: the codeword's tail byte is the CRC, NOT app data — reserve it
 			// so the delivered length can never include the CRC byte (matches the TX caps
 			// cw0_cap/cwc_cap above). cw0 also reserves the header prefix.
+			// V2 FIX-1 (LIVELOCK): the LAST codeword (c==K-1) ALSO carries the 4-byte whole-block
+			// CRC-32 field in its trailer (BIGBLOCK_BLOCK_CRC_OFFSET = cw(K-1)-local [sub_len-1-4 ..
+			// sub_len-1-1]), so its app capacity reserves BIGBLOCK_BLOCK_CRC_BYTES too. Mirrors the
+			// TX cap in bigblock_pack_block(); without it a genuinely-clean full block delivers a
+			// wire length that runs into the block-CRC field and the block-CRC zeroing diverges TX
+			// vs RX -> deterministic false-reject livelock (fact-doc §9).
 			int cap = (c == 0) ? (sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES)
-			                   : (sub_len - BIGBLOCK_CW_CRC_BYTES);
+			          : (c == K - 1) ? (sub_len - BIGBLOCK_CW_CRC_BYTES - BIGBLOCK_BLOCK_CRC_BYTES)
+			                         : (sub_len - BIGBLOCK_CW_CRC_BYTES);
 			if(cap < 0)   cap = 0;
 			if(len < 0)   len = 0;
 			if(len > cap) len = cap;       // never deliver past a codeword's app capacity
@@ -4668,6 +4707,53 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		sub_lengths_ptr = wire_lengths.data();
 	}
 
+	// --- V2 FIX-2 (fact-doc §10): stash the assembled-block integrity context for the
+	// PARTIAL / SACK-completed delivery gate. The full-clean block-CRC gate above only
+	// fires when n_clean==K; a KEPT codeword that the per-cw CRC-8 FALSE-PASSES inside a
+	// PARTIAL block is otherwise delivered at the prev-batch completion (arq_responder.cc)
+	// with NO block-CRC check (the §5 residual). We stash the TX block-CRC-32 value + the
+	// geometry HERE so the completion can reassemble the K-codeword image from the prev
+	// slots and re-verify the SAME CRC-32 before delivering. ARM only when:
+	//   (a) this is a real header-bearing big-block carve (header_usable + cw0 clean),
+	//   (b) the block is PARTIAL (n_clean < K) — the only path that reaches the prev
+	//       completion; a clean block (n_clean==K) is already gated above and delivers now,
+	//   (c) cw(K-1) decoded CRC-8-clean — it carries the block-CRC field (its CRC-8 span
+	//       covers the field), so the stashed value is trustworthy; if cw(K-1) is itself the
+	//       gap the field is untrustworthy AND never recovered (the app-only retx omits it),
+	//       so we do NOT arm — that one codeword stays at the unchanged per-cw CRC-8 floor,
+	//       and NO false reject of a genuinely-clean completion is ever introduced.
+	// Reset to disarmed first (a clean carve / non-armable PARTIAL clears any stale stash).
+	bigblock_partial_armed = false;
+	{
+		int n_clean_stash = 0;
+		for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_stash++;
+		long total_sl = (long)K * sub_len;
+		long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+		bool cwlast_clean = (K-1 >= 0 && K-1 < (int)cw_ok.size()) ? (cw_ok[K-1] != 0) : false;
+		if(info_bits != NULL && header_usable && cw_ok[0]
+		   && n_clean_stash < K && cwlast_clean
+		   && bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= total_sl)
+		{
+			unsigned int wire_bcrc = 0;
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+				wire_bcrc |= ((unsigned int)payload[(size_t)bcrc_off + b]) << (8*b);
+			bigblock_partial_block_bsi      = (int)(unsigned char)block_bsi;
+			bigblock_partial_K              = K;
+			bigblock_partial_sub_len        = sub_len;
+			bigblock_partial_hdr_total      = hdr_total;
+			bigblock_partial_cw0_offset     = cw0_offset;
+			bigblock_partial_expected_crc32 = wire_bcrc;
+			bigblock_partial_lengths.assign((size_t)K, 0);
+			for(int c=0;c<K;c++)
+				bigblock_partial_lengths[(size_t)c] = sub_lengths_ptr ? sub_lengths_ptr[c] : 0;
+			bigblock_partial_armed = true;
+			printf("[BIGBLOCK-RX] FIX-2: armed PARTIAL block-CRC gate bsi=%d K=%d sub_len=%d "
+				"expected_crc32=%08x (verified at prev-batch completion before delivery)\n",
+				bigblock_partial_block_bsi, K, sub_len, wire_bcrc);
+			fflush(stdout);
+		}
+	}
+
 	int rc = bigblock_block_to_arq(cw_ok.data(), K, block_bsi, payload.data(), sub_len,
 		sub_lengths_ptr, cw0_offset);
 	// HONEST DIAGNOSTIC (D1 fix, fact-doc bigblock-delivery-handoff §2): report the REAL
@@ -4684,6 +4770,87 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		(unsigned)fallback_bsi, (int)(sub_lengths_ptr != nullptr), sub_len, rc);
 	fflush(stdout);
 	return rc;
+}
+
+// V2 FIX-2 (fact-doc §10): re-verify the stashed whole-block CRC-32 over the K-codeword
+// payload REASSEMBLED from messages_rx_prev[0..K-1] at the prev-batch completion, BEFORE
+// the completion delivers via copy_data_to_buffer (arq_responder.cc). The codeword-aligned
+// wire image (per-cw CRC tails + the block-CRC field) was discarded by
+// bump_bsi_and_transfer_prev (it transfers only per-frame app bytes), so we reconstruct the
+// SAME image the TX computed the CRC-32 over: cw0 = [reconstructed header | app | pad];
+// cwc (c>=1) = [app | pad]; ALL per-cw CRC-8 tail bytes AND the 4 block-CRC field bytes
+// ZEROED (the TX computed the block-CRC with both sets still 0, the RX recompute zeroes them).
+// A KEPT codeword that the per-cw CRC-8 FALSE-PASSED carries WRONG app bytes -> the reassembled
+// image differs from the TX image -> CRC-32 differs from the stashed expected -> return false
+// (do NOT deliver -> re-request). Returns true (deliver) when the block is byte-consistent.
+// Caller guards on bigblock_partial_armed + bsi match.
+bool cl_arq_controller::bigblock_partial_block_crc_ok()
+{
+	int K       = bigblock_partial_K;
+	int sub_len = bigblock_partial_sub_len;
+	int hdr_total   = bigblock_partial_hdr_total;
+	int cw0_offset  = bigblock_partial_cw0_offset;
+	if(K <= 0 || sub_len <= 0) return true;            // nothing to check -> do not block delivery
+	long total = (long)K * (long)sub_len;
+	long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+	if(bcrc_off < 0 || bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES > total) return true;  // degenerate -> skip
+
+	std::vector<unsigned char> img((size_t)total, 0);   // codeword-aligned, zero pad
+
+	// Reconstruct cw0's wire header [bsi, n_data, length[0..K-1] uint16 LE]. n_data is the
+	// number of filled codewords; the stashed length table is per-codeword so the byte image
+	// matches the TX (which wrote n_data = the batch's filled count). We rebuild it from the
+	// stashed lengths: n_data = count of c with length>0 is NOT robust (a 0-length frame is
+	// valid), so we use K (the full block the TX emitted n_data==K for a full K-frame batch).
+	// The header bytes are part of the CRC-32 image, so they must match the TX exactly; the
+	// TX wrote [bsi][n_data][lengths]. We store n_data == the carve's K (full-block batches,
+	// the only case big-block emits). If a future partial-fill batch differs, the CRC mismatch
+	// is SAFE (reject) — never a wrong-byte delivery.
+	if(hdr_total >= 2 && hdr_total <= sub_len)
+	{
+		img[0] = (unsigned char)(bigblock_partial_block_bsi & 0xFF);
+		img[1] = (unsigned char)(K & 0xFF);
+		for(int c=0;c<K;c++)
+		{
+			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+			if(lo + 1 >= sub_len) break;                // header must fit cw0
+			int L = (c < (int)bigblock_partial_lengths.size()) ? bigblock_partial_lengths[(size_t)c] : 0;
+			img[(size_t)lo + 0] = (unsigned char)(L & 0xFF);
+			img[(size_t)lo + 1] = (unsigned char)((L >> 8) & 0xFF);
+		}
+	}
+
+	// Place each codeword's delivered app bytes from messages_rx_prev[] at its base offset.
+	for(int c=0;c<K && c<this->nMessages; c++)
+	{
+		int base = (c == 0) ? cw0_offset : (c * sub_len);
+		int L    = (c < (int)bigblock_partial_lengths.size()) ? bigblock_partial_lengths[(size_t)c] : 0;
+		if(L < 0) L = 0;
+		int avail = messages_rx_prev[c].length;
+		if(avail < 0) avail = 0;
+		int n = (L < avail) ? L : avail;               // deliver-exact: clamp to the stashed wire length
+		for(int j=0;j<n && (base + j) < total; j++)
+			img[(size_t)base + j] = (unsigned char)messages_rx_prev[c].data[j];
+		// bytes [base+n .. base+L) stay 0 (pad) — matches the TX's zero-pad image.
+	}
+
+	// Zero the per-cw CRC-8 tails + the block-CRC field (the SAME placeholders the TX used).
+	for(int c=0;c<K;c++)
+	{
+		long off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+		if(off >= 0 && off < total) img[(size_t)off] = 0;
+	}
+	for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++) img[(size_t)bcrc_off + b] = 0;
+
+	unsigned int calc = (unsigned int)CRC32_calc((char*)img.data(), (int)total);
+	bool ok = (calc == bigblock_partial_expected_crc32);
+	printf("[BIGBLOCK-RX] FIX-2: prev-batch completion block-CRC %s (calc=%08x expected=%08x "
+		"bsi=%d K=%d) %s\n",
+		ok ? "MATCH" : "MISMATCH", calc, bigblock_partial_expected_crc32,
+		bigblock_partial_block_bsi, K,
+		ok ? "-> deliver" : "-> REJECT (a kept codeword FALSE-PASSED per-cw CRC-8; not delivered)");
+	fflush(stdout);
+	return ok;
 }
 
 

@@ -738,6 +738,50 @@ void cl_arq_controller::process_messages_rx_data_control()
 						if(rsp_prev_batch_active
 						   && rsp_prev_batch_received_count >= rsp_prev_batch_expected_count)
 						{
+							// V2 FIX-2 (fact-doc §10): the SACK-completed assembled-block delivery
+							// gate. If THIS completing prev-batch is a stashed big-block (armed at
+							// the PARTIAL carve, bsi matches), re-verify the whole-block CRC-32 over
+							// the K-codeword image reassembled from messages_rx_prev[] BEFORE
+							// delivering — a KEPT codeword that the per-cw CRC-8 FALSE-PASSED would
+							// otherwise deliver wrong bytes here at the unchanged ~2^-8 floor (the §5
+							// residual). On mismatch: do NOT deliver — clear the prev-batch so the
+							// CMD's ACK-timeout re-emits the whole block (fresh decode). Big-block-
+							// scoped: a non-big-block / non-armed prev completion (bigblock_partial_armed
+							// false or bsi mismatch) is byte-identical to before (gate passes through).
+							// MERCURY_BIGBLOCK_DEFEAT_PARTIALCRC=1 disables the reject on the SAME binary
+							// (restores the pre-fix silent-wrong-byte delivery) for the ARM-G fail-before.
+							bool prev_deliver_ok = true;
+							if(bigblock_partial_armed
+							   && bigblock_partial_block_bsi == rsp_prev_batch_seq_id)
+							{
+								bool defeat_partialcrc = false;
+								{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_PARTIALCRC");
+								  if(e && *e && atoi(e)!=0) defeat_partialcrc = true; }
+								bool crc_ok = bigblock_partial_block_crc_ok();
+								bigblock_partial_armed = false;   // one-shot: consumed at completion
+								if(!crc_ok && !defeat_partialcrc)
+									prev_deliver_ok = false;
+							}
+							if(!prev_deliver_ok)
+							{
+								// REJECT: a kept codeword false-passed its per-cw CRC-8 -> the assembled
+								// block is byte-wrong. Drop the prev-batch WITHOUT delivering and WITHOUT
+								// a clean ACK, so the CMD never sees this block ACKed and its ACK-timeout
+								// re-emits the whole block (a fresh decode is independent of this carve).
+								for(int i=0; i<this->nMessages; i++)
+									messages_rx_prev[i].status = FREE;
+								rsp_prev_batch_active            = false;
+								rsp_prev_batch_received_count    = 0;
+								rsp_prev_batch_expected_count    = 0;
+								rsp_prev_batch_blockcrc_reject_count++;
+								printf("[RSP-V2-PREV-BLOCKCRC-REJECT] prev_batch_seq_id=%d NOT delivered "
+									"(assembled-block CRC-32 mismatch: a kept codeword FALSE-PASSED per-cw "
+									"CRC-8); prev dropped -> CMD re-emits the block (reject_count=%lld)\n",
+									rsp_prev_batch_seq_id, rsp_prev_batch_blockcrc_reject_count);
+								fflush(stdout);
+							}
+							else
+							{
 							if(compressor.is_streaming() && batch_data_delivered) {
 								// V1 defense: out-of-order prev-batch delivery would desync the
 								// streaming PPMd model. Current batch already committed; prev-batch
@@ -832,6 +876,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 									send_ack_pattern();
 								}
 							}
+							}   // end V2 FIX-2 SACK-completed delivery (prev_deliver_ok else-branch close)
 						}
 					}
 					else

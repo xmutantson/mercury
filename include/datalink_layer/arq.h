@@ -1554,6 +1554,18 @@ public:
   // the per-frame loop); false when it declined (MFSK / retx / mixed-control /
   // oversized batch -> stock per-frame path). Retx stays STOCK CFG16 per-frame.
   bool bigblock_send_one_block();
+  // bigblock_pack_block(): build the K*sub_len on-wire block payload (cw0 header prefix +
+  // per-codeword app bytes + the whole-block CRC-32 in cw(K-1)'s trailer + per-cw CRC-8
+  // tails) from the current new-data batch (messages_batch_tx[]). Extracted from
+  // bigblock_send_one_block so the V2 FIX-1 cap-reservation rule (the LAST codeword reserves
+  // BIGBLOCK_BLOCK_CRC_BYTES for the block-CRC field, fact-doc §9) lives in ONE place
+  // exercised by BOTH production AND the MAX-PAYLOAD test arm. Returns true + fills
+  // out_payload/out_K/out_sub_len/out_ndata/out_lengths (and stashes bigblock_tx_block_*)
+  // on success; false (decline -> stock per-frame path) when the geometry is too small or
+  // frame 0 does not fit cw0's reduced capacity.
+  bool bigblock_pack_block(int n_data, std::vector<unsigned char>& out_payload,
+                           int& out_K, int& out_sub_len, int& out_ndata,
+                           std::vector<int>& out_lengths);
   // bigblock_receive_carve(): the RX side — after receive_byte()->receive_bigblock()
   // decoded ONE block (stashing telecom_system->bigblock_last_rx_cw_ok + the K
   // decoded info-bit sub-units in `info_bits`), translate it into the ARQ data unit
@@ -1626,6 +1638,33 @@ public:
   // the in-process harness carves each sub-codeword its EXACT TX length byte-faithfully
   // (INV-6 with VARIABLE lengths; the production RX reads the same table off the wire).
   std::vector<int> bigblock_tx_block_lengths;
+
+  // ---- V2 FIX-2 (fact-doc §10): assembled-block integrity stash for the PARTIAL /
+  // SACK-completed delivery gate. The whole-block CRC-32 only gates the FULL-CLEAN carve
+  // (bigblock_receive_carve, n_clean==K). A KEPT codeword that the per-cw CRC-8 FALSE-PASSES
+  // (wrong bytes at the ~2^-8 floor) inside a PARTIAL block is transferred to messages_rx_prev[]
+  // and, once the GENUINE gap codewords are recovered, delivered via copy_data_to_buffer at the
+  // prev-batch completion (arq_responder.cc:738-784) with NO block-CRC check. FIX-2 stashes the
+  // block-integrity context HERE at a big-block PARTIAL carve so the completion can REASSEMBLE the
+  // K*sub_len codeword-aligned image from the prev slots and re-verify the SAME block-CRC-32
+  // before delivery; on mismatch the completion does NOT deliver (re-requests the block).
+  // Armed ONLY when cw(K-1) decoded CRC-8-clean at carve (it carries the block-CRC field, so its
+  // value is then trustworthy) -> NO false reject of a genuinely-clean completion. One-shot:
+  // consumed at completion / reset at the start of each carve. Big-block-scoped: a non-big-block
+  // prev completion (armed=false or bsi mismatch) is byte-identical to before.
+  bool          bigblock_partial_armed         = false;
+  int           bigblock_partial_block_bsi     = -1;   // the bsi (0..255) of the stashed block
+  int           bigblock_partial_K             = 0;
+  int           bigblock_partial_sub_len       = 0;
+  int           bigblock_partial_hdr_total     = 0;
+  int           bigblock_partial_cw0_offset    = 0;
+  unsigned int  bigblock_partial_expected_crc32= 0;    // TX block-CRC-32 read from cw(K-1) trailer
+  std::vector<int> bigblock_partial_lengths;            // per-codeword wire app lengths
+  // Verify the stashed block-CRC-32 over the K-codeword payload reassembled from messages_rx_prev[]
+  // (app bytes per slot + reconstructed cw0 header, with per-cw CRC tails + the block-CRC field
+  // zeroed — the SAME image the TX computed over). Returns true when the block is byte-consistent
+  // (deliver) and false on mismatch (do NOT deliver). Called at the prev-batch completion.
+  bool bigblock_partial_block_crc_ok();
 
   // ---- STEP 3: single-block end-to-end in the 2-instance in-process sim -------
   // test_sim_inproc_bigblock(): a dedicated single-block 2-instance ARQ harness
@@ -2122,6 +2161,12 @@ public:
                                          //      visibility window). Indicates
                                          //      a stalled retransmit cycle;
                                          //      logged via [RSP-V2-PREV-STALE].
+  // V2 FIX-2 (fact-doc §10): count of SACK-completed big-blocks REJECTED at the
+  // prev-batch completion because the reassembled-block CRC-32 mismatched (a kept
+  // codeword false-passed its per-cw CRC-8). Each reject drops the prev-batch
+  // undelivered so the CMD re-emits the block. Diagnostic; logged via
+  // [RSP-V2-PREV-BLOCKCRC-REJECT]. Initialized to 0 (init_messages_buffers reset path).
+  long long rsp_prev_batch_blockcrc_reject_count = 0;
 
   // SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
   // ALL CMD-side; gated on `sack_v2_enabled` at the call sites. v1 sessions

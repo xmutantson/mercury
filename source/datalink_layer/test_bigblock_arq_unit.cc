@@ -2181,6 +2181,284 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		            "selective-repeat re-sends EXACTLY it (FAIL-before/PASS-after)");
 	}
 
+	// ====================================================================
+	// CASE E — V2 FIX-1 MAX-PAYLOAD boundary (the LIVELOCK regression).
+	// A clean FULL K=8 block whose LAST codeword frame is the MAXIMUM
+	// payload (frame[K-1] == cwc_cap = sub_len - CRC = 174). The V1 builder
+	// universally used `cap-4` so frame[K-1] never reached the boundary and
+	// the block-CRC field [sub_len-1-4 .. sub_len-1-1] of cw(K-1) was never
+	// touched by app bytes. Production V1 (cwc_cap, no K-1 reservation) DID
+	// place app bytes into the field on the genuinely-clean 1374-byte block,
+	// truncating frame[K-1] AND diverging the TX vs RX block-CRC image ->
+	// deterministic false-reject LIVELOCK (fact-doc §4/§9, the HW NO-GO size).
+	//
+	// This arm packs the batch via the PRODUCTION packer bigblock_pack_block()
+	// (the SAME code production bigblock_send_one_block uses) so the cap rule
+	// under test is the real one — then transmits the packed image, carves it,
+	// and asserts byte-faithful delivery of EXACTLY the (clamped) TX lengths.
+	//   FAIL-BEFORE (MERCURY_BIGBLOCK_DEFEAT_CAPFIX=1): cw(K-1) cap = cwc_cap
+	//     (unreserved) -> frame[K-1]=174 overlaps the block-CRC field -> the TX
+	//     CRC-32 ran over app bytes the field then overwrote, RX zeroes them ->
+	//     MISMATCH -> carve clears all cw_ok -> NOT delivered (recv != K): the
+	//     livelock's first cycle (a genuinely-clean full block false-rejected).
+	//   PASS-AFTER (the reservation): cw(K-1) cap = cwc_cap - 4 = 170 -> the
+	//     field is clear of app bytes -> block-CRC matches -> all K delivered
+	//     byte-faithful at their reserved lengths.
+	{
+		bool defeat_capfix = false;
+		{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_CAPFIX"); if(e && *e && atoi(e)!=0) defeat_capfix = true; }
+		const int block_bsi_e = 13;
+		const int sub_len_e = tsA->ldpc.K / 8;
+		const int cwc_cap_e = sub_len_e - BIGBLOCK_CW_CRC_BYTES;   // 174 (the boundary)
+
+		// Build a clean all-DATA K=8 batch on A. EVERY frame is MAX payload (cwc_cap for
+		// c>=1, cw0_cap for c=0) so the production packer must clamp; frame[K-1]==cwc_cap
+		// is the boundary the V1 builder avoided. (The packer clamps to its caps; we read
+		// the actual placed lengths back from bigblock_tx_block_lengths.)
+		const int hdr_total_e = BIGBLOCK_HDR_TOTAL_BYTES(K);
+		const int cw0_cap_e   = sub_len_e - hdr_total_e - BIGBLOCK_CW_CRC_BYTES;
+		A->message_batch_counter_tx = K;
+		std::vector<std::vector<unsigned char>> app_truth_e((size_t)K);
+		for(int i=0;i<K;i++)
+		{
+			int req = (i == 0) ? cw0_cap_e : cwc_cap_e;   // request the MAX (boundary for c==K-1)
+			app_truth_e[i].assign((size_t)req, 0);
+			A->messages_batch_tx[i].data         = A->messages_tx[i].data;
+			A->messages_batch_tx[i].type         = DATA_LONG;
+			A->messages_batch_tx[i].id           = (char)(unsigned char)i;
+			A->messages_batch_tx[i].length       = req;
+			A->messages_batch_tx[i].batch_seq_id = block_bsi_e;
+			A->messages_batch_tx[i].status       = ADDED_TO_BATCH_BUFFER;
+			for(int j=0;j<req;j++)
+			{
+				unsigned char b = (unsigned char)((i*61 + j*23 + 5) & 0xFF);
+				A->messages_batch_tx[i].data[j] = (char)b;
+				app_truth_e[i][(size_t)j]       = b;
+			}
+			A->messages_tx[i].status = ADDED_TO_BATCH_BUFFER;
+		}
+
+		// PRODUCTION packer (the code under test). Honors MERCURY_BIGBLOCK_DEFEAT_CAPFIX.
+		std::vector<unsigned char> packed;
+		int pk_K=0, pk_sub=0, pk_nd=0;
+		std::vector<int> pk_lengths;
+		bool packed_ok = A->bigblock_pack_block(K, packed, pk_K, pk_sub, pk_nd, pk_lengths);
+
+		// The ACTUAL placed length of cw(K-1) reveals the reservation: 174 (defeat) vs 170 (fix).
+		int last_len = (pk_lengths.size() >= (size_t)K) ? pk_lengths[(size_t)(K-1)] : -1;
+		bool reservation_applied = (last_len == cwc_cap_e - BIGBLOCK_BLOCK_CRC_BYTES);  // 170
+		bool reservation_defeated = (last_len == cwc_cap_e);                            // 174
+
+		// Reset RSP RX state + transmit the production-packed block -> carve.
+		B->rsp_current_expected_batch_seq_id = (block_bsi_e + 5) & 0xFF;   // drift
+		B->rsp_prev_batch_seq_id             = -1;
+		B->rsp_prev_batch_active             = false;
+		B->rsp_prev_batch_received_count     = 0;
+		B->rsp_prev_batch_expected_count     = 0;
+		B->retransmit_count                  = 0;
+		B->batch_rx_frame_count              = 0;
+		B->last_received_end_of_batch_seq    = -1;
+		for(int i=0;i<B->nMessages;i++)
+		{
+			B->messages_rx[i].status = FREE;
+			B->messages_rx[i].length = 0;
+			B->messages_rx[i].batch_seq_id = -1;
+		}
+
+		std::vector<int> info_bits_e;
+		int K_rx_e = packed_ok ? run_block_loopback(tsA, tsB, packed, info_bits_e) : -1;
+		bool decoded_e = (K_rx_e == K);
+		int rc_e = packed_ok
+			? B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)((block_bsi_e + 3) & 0xFF))
+			: ERROR_;
+		bool wired_e = (rc_e == SUCCESSFUL);
+
+		// Ground truth: each slot must deliver its (clamped) TX length byte-faithfully.
+		std::vector<int>  app_len_e((size_t)K, 0);
+		std::vector<unsigned char> app_flat_e;
+		std::vector<int>  app_off_e((size_t)K, 0);
+		long total_app_e = 0;
+		for(int c=0;c<K;c++)
+		{
+			int L = (pk_lengths.size() >= (size_t)K) ? pk_lengths[(size_t)c] : 0;
+			app_len_e[c]  = L;
+			app_off_e[c]  = (int)app_flat_e.size();
+			for(int j=0;j<L && j<(int)app_truth_e[c].size();j++) app_flat_e.push_back(app_truth_e[c][(size_t)j]);
+			total_app_e += L;
+		}
+		int  recv_e      = B->bigblock_test_count_received(K);
+		long delivered_e = B->bigblock_test_delivered_varlen(K, app_len_e.data(), app_off_e.data(), app_flat_e.data());
+		bool full_e      = decoded_e && wired_e && (recv_e == K) && (delivered_e == total_app_e);
+
+		bool pass_e;
+		if(defeat_capfix)
+			// FAIL-BEFORE: the unreserved cap put app bytes in the block-CRC field -> the
+			// clean full block FALSE-REJECTS (carve clears cw_ok -> recv != K, not delivered).
+			pass_e = packed_ok && reservation_defeated && !full_e && (recv_e != K);
+		else
+			// PASS-AFTER: the reservation delivers the full block byte-faithful.
+			pass_e = packed_ok && reservation_applied && full_e;
+
+		printf("[TEST-SIM-BIGBLOCK] CASE E V2-FIX-1 MAX-PAYLOAD (frame[K-1]=cwc_cap=%d): %s "
+			"(defeat_capfix=%d packed_ok=%d last_len=%d reserved=%d defeated=%d decoded=%d "
+			"carve_rc=%d recv=%d/%d delivered=%ld/%ld full=%d)\n",
+			cwc_cap_e, pass_e ? "PASS" : "FAIL", (int)defeat_capfix, (int)packed_ok, last_len,
+			(int)reservation_applied, (int)reservation_defeated, (int)decoded_e, rc_e,
+			recv_e, K, delivered_e, total_app_e, (int)full_e);
+		fflush(stdout);
+		if(defeat_capfix)
+			printf("[TEST-SIM-BIGBLOCK] CASE E NOTE: DEFEAT_CAPFIX=1 reproduces the V1 unreserved "
+				"cw(K-1) cap -> a genuinely-clean full block FALSE-REJECTS (livelock first cycle) — "
+				"fail-before proof on the same binary.\n");
+		check(pass_e, "CASE E V2-FIX-1: max-payload last codeword reserves the block-CRC field -> "
+		              "clean full block delivers byte-faithful (FAIL-before livelock / PASS-after)");
+	}
+
+	// ====================================================================
+	// CASE F — V2 FIX-2 FALSEPASS-on-PARTIAL (the §5 PARTIAL-path silent
+	// wrong-byte residual). A PARTIAL block (one GENUINE gap forces n_clean<K
+	// -> the prev-batch / SACK-completed delivery path) that ALSO contains a
+	// KEPT codeword whose per-cw CRC-8 FALSE-PASSED on WRONG bytes
+	// (MERCURY_BIGBLOCK_FALSEPASS_CW). Before FIX-2 the block-CRC gated ONLY
+	// the full-clean carve (n_clean==K), so this kept-but-wrong codeword was
+	// transferred to messages_rx_prev[] and DELIVERED at the prev-batch
+	// completion (arq_responder.cc:767) with NO block-CRC check — a silent
+	// wrong-byte at the unchanged ~2^-8 floor.
+	//
+	// FIX-2 arms the assembled-block block-CRC stash at the PARTIAL carve and
+	// re-verifies it over the K-codeword image REASSEMBLED from the prev slots
+	// at completion: a false-passed kept codeword's WRONG bytes diverge the
+	// reassembled CRC-32 from the TX value -> the gate REJECTS (no delivery).
+	// This drives the carve PARTIAL (arming the stash via the production
+	// bigblock_receive_carve), then exercises the gate
+	// bigblock_partial_block_crc_ok() over messages_rx_prev[] exactly as the
+	// responder completion does (the gap recovery is modeled by landing the
+	// recovered CORRECT codeword into prev, mirroring CASE B's retx arrival).
+	//   FAIL-BEFORE (the §5 residual / DEFEAT_PARTIALCRC at the responder): the
+	//     completion delivers the false-passed kept codeword's WRONG bytes.
+	//     Modeled here by the gate's INPUT: a prev image carrying cw4's wrong
+	//     bytes -> WITHOUT the gate that block would deliver wrong.
+	//   PASS-AFTER (the gate): bigblock_partial_block_crc_ok() returns FALSE on
+	//     the wrong-byte reassembly (REJECT) and TRUE on the all-correct
+	//     reassembly (no false reject) — the gate catches the false-pass.
+	{
+		const int gap_cw       = 2;    // GENUINE gap (demoted) -> PARTIAL + prev path
+		const int falsepass_cw = 5;    // KEPT codeword, per-cw CRC-8 re-stamped to PASS on wrong bytes
+		const int block_bsi_f  = 17;
+		build_block_wire(block_bsi_f);
+
+		// One-shot FALSEPASS hook keys on bigblock_first_clean<0 — reset so it fires this carve.
+		bigblock_first_clean = -1; bigblock_first_K = -1;
+		char fp_env[16]; snprintf(fp_env, sizeof(fp_env), "%d", falsepass_cw);
+#if defined(_WIN32)
+		_putenv_s("MERCURY_BIGBLOCK_FALSEPASS_CW", fp_env);
+#else
+		setenv("MERCURY_BIGBLOCK_FALSEPASS_CW", fp_env, 1);
+#endif
+
+		B->rsp_current_expected_batch_seq_id = block_bsi_f;
+		B->rsp_prev_batch_seq_id             = -1;
+		B->rsp_prev_batch_active             = false;
+		B->rsp_prev_batch_received_count     = 0;
+		B->rsp_prev_batch_expected_count     = 0;
+		B->retransmit_count                  = 0;
+		B->batch_rx_frame_count              = 0;
+		B->last_received_end_of_batch_seq    = -1;
+		B->bigblock_partial_armed            = false;
+		for(int i=0;i<B->nMessages;i++)
+		{
+			B->messages_rx[i].status = FREE;
+			B->messages_rx[i].length = 0;
+			B->messages_rx[i].batch_seq_id = -1;
+			B->messages_rx_prev[i].status = FREE;
+			B->messages_rx_prev[i].length = 0;
+			B->messages_rx_prev[i].batch_seq_id = -1;
+		}
+
+		std::vector<int> info_bits;
+		int K_rx = run_block_loopback(tsA, tsB, tx_truth, info_bits);
+		bool decoded = (K_rx == K);
+
+		// GENUINE gap: clear gap_cw's PHY cw_ok before the carve (its bytes are real but the
+		// SACK marks it missing -> demote -> n_clean=K-1 -> PARTIAL). falsepass_cw stays clean
+		// (its re-stamped CRC-8 passes) -> a KEPT codeword carrying WRONG bytes.
+		if((int)tsB->bigblock_last_rx_cw_ok.size() > gap_cw)
+			tsB->bigblock_last_rx_cw_ok[gap_cw] = 0;
+
+		// Disarm the FALSEPASS hook immediately after the carve consumes it.
+		int rc = B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)block_bsi_f);
+#if defined(_WIN32)
+		_putenv_s("MERCURY_BIGBLOCK_FALSEPASS_CW", "");
+#else
+		unsetenv("MERCURY_BIGBLOCK_FALSEPASS_CW");
+#endif
+		bool wired = (rc == SUCCESSFUL);
+
+		// The carve must have routed PARTIAL (gap_cw demoted) AND armed the FIX-2 stash
+		// (cw0 + cw(K-1) clean). The false-passed codeword stays RECEIVED with WRONG bytes.
+		bool partial      = (B->messages_rx[gap_cw].status != RECEIVED);
+		bool armed        = B->bigblock_partial_armed
+		                 && (B->bigblock_partial_block_bsi == block_bsi_f);
+		bool fp_kept      = (B->messages_rx[falsepass_cw].status == RECEIVED);
+		// fp_kept slot's bytes differ from the TX truth (the corruption the per-cw CRC-8 masked):
+		bool fp_wrong = false;
+		if(fp_kept)
+		{
+			int L = B->messages_rx[falsepass_cw].length;
+			for(int j=0;j<L && j<app_len[falsepass_cw];j++)
+				if((unsigned char)B->messages_rx[falsepass_cw].data[j] != app_truth[falsepass_cw][(size_t)j])
+					{ fp_wrong = true; break; }
+		}
+
+		// Build the prev-batch image the completion gate consumes (as bump_bsi_and_transfer_prev
+		// + the recovered-gap arrival would): every KEPT slot -> its carved bytes (cw4 WRONG);
+		// the gap slot -> the RECOVERED CORRECT bytes (the per-frame retx delivers the real frame).
+		auto seed_prev = [&](bool gap_correct){
+			for(int c=0;c<K;c++)
+			{
+				int L = app_len[c];
+				B->messages_rx_prev[c].length = L;
+				B->messages_rx_prev[c].status = RECEIVED;
+				B->messages_rx_prev[c].batch_seq_id = block_bsi_f;
+				if(c == gap_cw)
+					for(int j=0;j<L;j++) B->messages_rx_prev[c].data[j] = (char)app_truth[c][(size_t)j];
+				else
+					for(int j=0;j<L;j++) B->messages_rx_prev[c].data[j] = B->messages_rx[c].data[j];
+				(void)gap_correct;
+			}
+			B->rsp_prev_batch_seq_id = block_bsi_f;
+		};
+
+		// PASS-AFTER assertion #1 (REJECT): the false-passed kept codeword's WRONG bytes are in
+		// prev -> the reassembled-block CRC-32 mismatches the stashed TX value -> gate FALSE.
+		seed_prev(true);
+		bool gate_rejects = armed && (B->bigblock_partial_block_crc_ok() == false);
+
+		// PASS-AFTER assertion #2 (NO FALSE REJECT): replace the false-passed slot with its
+		// CORRECT bytes -> the reassembled block matches the TX -> gate TRUE (a genuinely-clean
+		// completion still delivers). Re-arm the (one-shot consumed) stash from the captured state.
+		B->bigblock_partial_armed = armed;   // restore the armed stash (one-shot was consumed above)
+		for(int j=0;j<app_len[falsepass_cw];j++)
+			B->messages_rx_prev[falsepass_cw].data[j] = (char)app_truth[falsepass_cw][(size_t)j];
+		bool gate_accepts_clean = armed && (B->bigblock_partial_block_crc_ok() == true);
+
+		bool pass = decoded && wired && partial && armed && fp_kept && fp_wrong
+		         && gate_rejects && gate_accepts_clean;
+		printf("[TEST-SIM-BIGBLOCK] CASE F V2-FIX-2 FALSEPASS-on-PARTIAL (gap_cw=%d falsepass_cw=%d): %s "
+			"(decoded=%d carve_rc=%d partial=%d armed=%d fp_kept=%d fp_wrong=%d gate_rejects=%d "
+			"gate_accepts_clean=%d)\n",
+			gap_cw, falsepass_cw, pass ? "PASS" : "FAIL", (int)decoded, rc, (int)partial, (int)armed,
+			(int)fp_kept, (int)fp_wrong, (int)gate_rejects, (int)gate_accepts_clean);
+		fflush(stdout);
+		printf("[TEST-SIM-BIGBLOCK] CASE F NOTE: WITHOUT FIX-2 (or MERCURY_BIGBLOCK_DEFEAT_PARTIALCRC=1 "
+			"at the responder completion) the false-passed kept codeword's WRONG bytes deliver silently "
+			"at the prev-batch completion — the §5 residual. The gate converts that into a REJECT "
+			"(re-request the block).\n");
+		check(pass, "CASE F V2-FIX-2: a CRC-8-false-passed KEPT codeword in a SACK-completed block is "
+		            "caught by the assembled-block CRC-32 gate (REJECT, not delivered) — and a "
+		            "genuinely-clean completion still delivers (no false reject)");
+	}
+
 	delete A; delete B;
 	delete tsA; delete tsB;
 	restore_env();
