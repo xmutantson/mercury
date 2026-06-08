@@ -2670,3 +2670,251 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }
+
+// ============================================================================
+// ACQUISITION-WINDOW POSITION REGRESSION (fact-doc §19, fix/bigblock-chanest).
+//
+// THE DEFECT (HW, bigblock_p3_hw/ACQ_GATE_ANALYSIS.json): the big-block BBTX-GATE passed only
+// ~5.6% even though EVERY pass decoded 8/8 byte-faithful. The §17 ftr clamp made the snapshot
+// WAIT for a block-span of FRESH symbols (the COUNT), but the snapshot still fires at a RANDOM
+// ring write-head phase (the POSITION), so a block whose preamble lands LATE in the captured
+// window has its tail STILL ARRIVING (future samples not yet in the ring) when frames_to_read
+// hits 0 -> bigblock_rx_passband's bb_at zero-pads the tail -> the block-wide estimate
+// collapses -> cw0 wire-CRC fails even on a perfect timing lock. The HW decisive triplet: three
+// near-perfect Schmidl-Cox locks (metric 0.998-0.999), only the preamble_symbol==0 one passed;
+// the symbol-116 and symbol-128 ones failed (tail past the window).
+//
+// WHY THE EXISTING chanest HARNESS CANNOT REPRODUCE IT: run_block() custom-sizes buffer_Nsymb
+// to EXACTLY fit (lead + block + trail), so the block always fits ANY offset -> the position
+// axis is never exercised. THIS test pins a FIXED, production-class buffer_Nsymb (= block_nsymb
+// + a small slack) and drives the SAME genuine K=8 block at SEVERAL in-window preamble offsets
+// (head ~0, mid, near-end), so a late offset's tail runs PAST the captured window exactly as on
+// HW.
+//
+// FAIL-BEFORE / PASS-AFTER (the §19 guard is the lever):
+//   • HEAD / MID offsets (block fits): decode 8/8 byte-faithful in BOTH arms (no regression).
+//   • NEAR-END offset (tail past window):
+//       - DEFEAT_ACQGUARD=1 (fail-before): bigblock_acq_window_fits()==false but the guard is
+//         BYPASSED -> the truncated block is carved -> bytes_ok=0 (the HW position-bug signature).
+//       - guard ON (pass-after): bigblock_acq_window_fits()==false -> DEFER (no carve); the test
+//         then re-presents the SAME block at an EARLY offset (modelling the next arming cycle,
+//         where the tail has arrived and the block re-lands earlier) -> decode 8/8 byte-faithful.
+// Drives the REAL ref==NULL genuine decode (tsB never transmits) through the production
+// receive_byte -> receive_bigblock -> bigblock_acq_window_fits -> bigblock_receive_carve path.
+// Returns 0 on PASS, 1 on FAIL.
+// ============================================================================
+int cl_arq_controller::test_sim_inproc_bigblock_acqwindow()
+{
+	printf("[TEST-BIGBLOCK-ACQWINDOW] ===== §19 acquisition-window POSITION guard: one genuine "
+	       "CFG16 K=8 block at several in-window preamble offsets =====\n");
+	fflush(stdout);
+
+	// Pin K=8 (production MERCURY_BIGBLOCK_K cap path).
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+	auto set_envv = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	set_envv("MERCURY_BIGBLOCK_K", "8");
+	auto restore_k = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else           _putenv_s("MERCURY_BIGBLOCK_K", "");
+#else
+		if(had_prev_k) setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else           unsetenv("MERCURY_BIGBLOCK_K");
+#endif
+	};
+
+	cl_telecom_system* tsA = new cl_telecom_system();
+	cl_telecom_system* tsB = new cl_telecom_system();
+	cl_arq_controller* A   = new cl_arq_controller();
+	cl_arq_controller* B   = new cl_arq_controller();
+	A->telecom_system = tsA;
+	B->telecom_system = tsB;
+
+	auto bringup = [&](cl_arq_controller* a, cl_telecom_system* ts, int role) {
+		a->role = role; a->sack_enabled = true; a->sack_v2_enabled = true;
+		a->axis3_sack_mode = 1; a->compression_enabled = false;
+		a->bigblock_skip_fifo_delivery = true;
+		a->nMessages = 255; a->max_data_length = 170; a->max_message_length = 200;
+		a->max_header_length = 6; a->init_messages_buffers();
+		a->load_configuration(CONFIG_16, FULL, YES);
+		ts->bigblock_framing_enabled = true;
+		a->sack_negotiated_recompute_batch(role==COMMANDER ? "CMD" : "RSP");
+	};
+	bringup(A, tsA, COMMANDER);
+	bringup(B, tsB, RESPONDER);
+
+	const int K = BB_TEST_K;
+	const int sub_len = tsA->ldpc.K / 8;
+	const long total_tx_bytes = (long)K * sub_len;
+	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
+	const int block_bsi = 7;
+
+	// Build the on-wire block payload EXACTLY as production bigblock_send_one_block does
+	// (identical to the chanest harness): header in cw0 prefix + per-cw app bytes + per-cw CRC-8.
+	std::vector<std::vector<unsigned char>> app_truth((size_t)K);
+	std::vector<int> app_len((size_t)K, 0);
+	std::vector<unsigned char> tx_truth((size_t)total_tx_bytes, 0);
+	{
+		const int cw0_cap = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;
+		const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;
+		for(int i=0;i<K;i++){
+			int cap = (i==0)?cw0_cap:cwc_cap;
+			int len = ((i*37 + 11) % (cap - 4)) + 1; if(len>cap) len=cap;
+			app_len[i]=len; app_truth[i].assign((size_t)len,0);
+			for(int j=0;j<len;j++){ unsigned char b=(unsigned char)((i*53+j*17+3)&0xFF); app_truth[i][(size_t)j]=b; }
+		}
+		tx_truth[0]=(unsigned char)(block_bsi&0xFF);
+		tx_truth[1]=(unsigned char)(K&0xFF);
+		for(int c=0;c<K;c++){
+			int lo=BIGBLOCK_HDR_FIXED_BYTES+2*c;
+			tx_truth[(size_t)lo+0]=(unsigned char)(app_len[c]&0xFF);
+			tx_truth[(size_t)lo+1]=(unsigned char)((app_len[c]>>8)&0xFF);
+			int base=(c==0)?hdr_total:(c*sub_len);
+			for(int j=0;j<app_len[c];j++) tx_truth[(size_t)base+j]=app_truth[c][(size_t)j];
+		}
+		for(int c=0;c<K;c++){
+			int crc_off=BIGBLOCK_CW_CRC_OFFSET(c,sub_len), crc_span=BIGBLOCK_CW_CRC_SPAN(sub_len);
+			if(crc_off<0||crc_off>=(int)tx_truth.size()||crc_span<0) continue;
+			tx_truth[(size_t)crc_off]=A->CRC8_calc((char*)&tx_truth[(size_t)c*sub_len],crc_span);
+		}
+	}
+
+	// TX the block ONCE on a clean wire -> tx_pb (the same passband for every offset arm).
+	const int interp   = tsA->frequency_interpolation_rate;
+	const int Nofdm    = tsB->data_container.Nofdm;
+	const int sym_samp = Nofdm * interp;
+	const int block_n  = tsA->bigblock_tx_total_samples();
+	const int block_nsymb = tsB->bigblock_rx_block_nsymb();   // preamble_nSymb + Ngrid (= 64-class)
+	std::vector<double> tx_pb((size_t)((block_n>0)?block_n:1), 0.0);
+	int n_tx = 0;
+	if(block_n > 0){
+		std::vector<int> payload((size_t)tx_truth.size(), 0);
+		for(size_t i=0;i<tx_truth.size();i++) payload[i]=(int)tx_truth[i];
+		cl_telecom_system::bigblock_emit_scope emit_guard(tsA, block_n);
+		tsA->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		n_tx = tsA->bigblock_last_tx_samples;
+	}
+	if(n_tx <= 0 || tsA->bigblock_last_tx_K != K){
+		printf("[TEST-BIGBLOCK-ACQWINDOW] FAIL: TX did not emit a K=%d block (K_tx=%d n_tx=%d)\n",
+			K, tsA->bigblock_last_tx_K, n_tx);
+		restore_k(); delete A; delete B; delete tsA; delete tsB; return 1;
+	}
+
+	// FIXED, production-class capture window: block span + a small slack (so the block fits at
+	// HEAD/MID but a NEAR-END offset's tail runs PAST the window — the HW position bug). The
+	// production buffer_Nsymb at CFG16 is ~128-133; we use block_nsymb+SLACK so the offsets land
+	// the tail in/out of window deterministically.
+	const int SLACK   = 12;
+	const int WIN_NSYMB = block_nsymb + SLACK;
+	const int win_samp  = WIN_NSYMB * sym_samp;
+
+	// decode ONE block placed at `offset_sym` symbols into a FIXED WIN_NSYMB capture window.
+	// Returns whether bigblock_acq_window_fits() (true=fit) + (when carved) byte-faithfulness.
+	auto decode_at_offset = [&](int offset_sym, bool& fits_out, int& cwok_out, bool& bytes_ok_out,
+	                            bool do_carve)->void {
+		fits_out = false; cwok_out = -1; bytes_ok_out = false;
+		std::vector<double> rx_pb((size_t)win_samp, 0.0);
+		long lead = (long)offset_sym * sym_samp;
+		for(int i=0;i<n_tx;i++){ long d = lead + i; if(d>=0 && d<win_samp) rx_pb[(size_t)d] = tx_pb[(size_t)i]; }
+		// pin the FIXED production-class window (do NOT custom-fit like run_block).
+		int saved_buffer_Nsymb = tsB->data_container.buffer_Nsymb;
+		tsB->data_container.buffer_Nsymb = WIN_NSYMB;
+		std::vector<int> info_bits((size_t)(K+1) * tsB->ldpc.K + tsB->ldpc.K, 0);
+		tsB->bigblock_last_rx_meanh = -1.0;
+		tsB->receive_byte(rx_pb.data(), info_bits.data());      // -> receive_bigblock (ref==NULL)
+		fits_out = B->bigblock_acq_window_fits();               // the §19 decision under test
+		cwok_out = tsB->bigblock_last_rx_cw_ok_count;
+		int K_rx = tsB->bigblock_last_rx_K;
+		if(do_carve && K_rx == K){
+			for(int i=0;i<B->nMessages;i++){ B->messages_rx[i].status=FREE; B->messages_rx[i].length=0; B->messages_rx[i].batch_seq_id=-1; }
+			B->rsp_current_expected_batch_seq_id = block_bsi; B->rsp_prev_batch_seq_id=-1;
+			B->rsp_prev_batch_active=false; B->batch_rx_frame_count=0; B->last_received_end_of_batch_seq=-1;
+			int carve_rc = B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)block_bsi);
+			if(carve_rc == SUCCESSFUL){
+				bytes_ok_out = true;
+				for(int c=0;c<K && bytes_ok_out;c++){
+					if(B->messages_rx[c].status != RECEIVED || B->messages_rx[c].length != app_len[c]){ bytes_ok_out=false; break; }
+					for(int j=0;j<app_len[c];j++)
+						if((unsigned char)B->messages_rx[c].data[j] != app_truth[c][(size_t)j]){ bytes_ok_out=false; break; }
+				}
+			}
+		}
+		tsB->data_container.buffer_Nsymb = saved_buffer_Nsymb;
+	};
+
+	int failed = 0;
+
+	// Three in-window offsets. HEAD/MID fit; NEAR-END's tail runs past the window.
+	const int OFF_HEAD = 0;
+	const int OFF_MID  = SLACK / 2;          // still fits (offset + block_nsymb <= WIN_NSYMB)
+	const int OFF_NEAR = SLACK + 6;          // tail past window: offset+block_nsymb > WIN_NSYMB
+
+	// ---------- HEAD: fits -> carve 8/8 (no regression on the common path). ----------
+	{
+		bool fits; int cwok; bool bytes;
+		decode_at_offset(OFF_HEAD, fits, cwok, bytes, /*do_carve=*/true);
+		bool ok = fits && (cwok == K) && bytes;
+		printf("[TEST-BIGBLOCK-ACQWINDOW] HEAD (off=%d sym): fits=%d cw_ok=%d/%d bytes_ok=%d -> %s\n",
+			OFF_HEAD, (int)fits, cwok, K, (int)bytes, ok ? "PASS" : "FAIL");
+		if(!ok) failed++;
+	}
+
+	// ---------- MID: fits -> carve 8/8. ----------
+	{
+		bool fits; int cwok; bool bytes;
+		decode_at_offset(OFF_MID, fits, cwok, bytes, /*do_carve=*/true);
+		bool ok = fits && (cwok == K) && bytes;
+		printf("[TEST-BIGBLOCK-ACQWINDOW] MID  (off=%d sym): fits=%d cw_ok=%d/%d bytes_ok=%d -> %s\n",
+			OFF_MID, (int)fits, cwok, K, (int)bytes, ok ? "PASS" : "FAIL");
+		if(!ok) failed++;
+	}
+
+	// ---------- NEAR-END FAIL-BEFORE: guard BYPASSED -> truncated carve -> bytes_ok=0. ----------
+	{
+		set_envv("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "1");
+		bool fits; int cwok; bool bytes;
+		decode_at_offset(OFF_NEAR, fits, cwok, bytes, /*do_carve=*/true);
+		set_envv("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD", "");
+		// fail-before contract: the block does NOT fit, and carving it anyway yields WRONG bytes.
+		bool reproduced = (!fits) && (!bytes);
+		printf("[TEST-BIGBLOCK-ACQWINDOW] NEAR-END FAIL-BEFORE (off=%d sym, DEFEAT_ACQGUARD=1): "
+			"fits=%d cw_ok=%d/%d bytes_ok=%d -> %s (want fits=0 bytes_ok=0 = truncated carve)\n",
+			OFF_NEAR, (int)fits, cwok, K, (int)bytes, reproduced ? "PASS" : "FAIL");
+		if(!reproduced) failed++;
+	}
+
+	// ---------- NEAR-END PASS-AFTER: guard ON -> DEFER (no fit), then re-present the SAME block
+	//            at an EARLY offset (next arming cycle: tail arrived, block re-lands early) -> 8/8.
+	{
+		bool fits; int cwok; bool bytes;
+		// pass 1: the late block -> guard says "does not fit" (defer; do NOT carve a truncated block).
+		decode_at_offset(OFF_NEAR, fits, cwok, bytes, /*do_carve=*/false);
+		bool deferred = !fits;   // the §19 guard would DEFER (receive() skips the carve)
+		// pass 2: the re-presented complete block at HEAD -> fits + carve 8/8 byte-faithful.
+		bool fits2; int cwok2; bool bytes2;
+		decode_at_offset(OFF_HEAD, fits2, cwok2, bytes2, /*do_carve=*/true);
+		bool recovered = fits2 && (cwok2 == K) && bytes2;
+		bool ok = deferred && recovered;
+		printf("[TEST-BIGBLOCK-ACQWINDOW] NEAR-END PASS-AFTER (guard ON): pass1 fits=%d (defer=%d) | "
+			"pass2(re-armed) fits=%d cw_ok=%d/%d bytes_ok=%d -> %s\n",
+			(int)fits, (int)deferred, (int)fits2, cwok2, K, (int)bytes2, ok ? "PASS" : "FAIL");
+		if(!ok) failed++;
+	}
+
+	restore_k();
+	delete A; delete B; delete tsA; delete tsB;
+
+	printf("[TEST-BIGBLOCK-ACQWINDOW] %s (%d failure%s)  [HEAD+MID fit&8/8 | NEAR-END fail-before "
+	       "truncated bytes_ok=0 | NEAR-END pass-after defer-then-8/8]\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}

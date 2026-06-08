@@ -7395,6 +7395,9 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
                                             const std::vector<std::vector<int>>* cw_info_ref)
 {
 	K_out = 0;
+	// §19: reset the located-head stash (acq-fail leaves -1; the guard treats <0 as
+	// "no locatable block" and does NOT defer). Stamped from head_delay once acquired.
+	bigblock_last_rx_head_delay_samples = -1;
 	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK] MFSK unsupported; use cfg 15/16." << std::endl; return 0; }
 	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
 
@@ -7465,6 +7468,11 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		std::cout << "[BIGBLOCK] RX acquisition FAILED (no preamble found)" << std::endl;
 		return 0;
 	}
+	// §19: stash the located head start (full-rate samples) so the ARQ window-position
+	// guard can test whether the FULL block (head + preamble + Ngrid) fit the captured
+	// window or whether its tail was zero-padded by bb_at (block landed too late / tail
+	// not yet in the ring at snapshot time -> defer one arming cycle, do not carve garbage).
+	bigblock_last_rx_head_delay_samples = head_delay;
 
 	// --- DEMOD: from the data start (head + preamble), rebuild the Ngrid grid. ---
 	long data_start0 = head_delay + (long)pre_nSymb*sym_samples;
@@ -8902,6 +8910,11 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	int interp = frequency_interpolation_rate;
 	int nSamples = data_container.Nofdm * data_container.buffer_Nsymb * interp;
 	if(nSamples <= 0) nSamples = (bigblock_last_tx_samples > 0) ? bigblock_last_tx_samples : 0;
+	// §19: stash the captured-window length (samples) the decode runs over, so the ARQ
+	// window-position guard can compare the located block extent against it WITHOUT
+	// re-deriving buffer_Nsymb at carve time (bigblock_restore_stock_config may have
+	// changed buffer_Nsymb by then). Captured here, BEFORE any rebuild/restore.
+	bigblock_last_rx_capture_nsamples = nSamples;
 
 	// USE-AFTER-FREE ROOT-CAUSE FIX (bigblock-whiten-align): `data` is the caller's
 	// data_container.ready_to_process_passband_delayed_data (live ARQ path,

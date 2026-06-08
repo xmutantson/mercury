@@ -477,6 +477,10 @@ int main(int argc, char *argv[])
     bool test_bigblock_chanest_cli = false; // --test-bigblock-chanest: GENUINE (ref==NULL) 2-instance CFG16 big-block
                                         // decode under a CFO/SFO-impaired channel; reproduces the HW [RXACQ] meanH
                                         // collapse off-bench (clean passes, CFO/SFO collapses the block estimate).
+    bool test_bigblock_acqwindow_cli = false; // --test-bigblock-acqwindow: §19 acquisition-window POSITION guard —
+                                        // one genuine K=8 block at several in-window preamble offsets in a FIXED
+                                        // production-sized window; near-end (tail past window) DEFERS (guard ON) /
+                                        // carves truncated bytes_ok=0 (DEFEAT_ACQGUARD). Reproduces the HW ~5.6% bug.
     bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
@@ -1022,6 +1026,17 @@ int main(int argc, char *argv[])
             // the HW [RXACQ] meanH collapse OFF-BENCH (clean default passes; CFO/SFO collapses
             // the block-wide estimate -> 0-delivery). One-shot.
             test_bigblock_chanest_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-acqwindow") == 0)
+        {
+            // §19 acquisition-window POSITION guard regression (fix/bigblock-chanest): drive ONE
+            // genuine K=8 CFG16 block at several in-window preamble offsets in a FIXED production-
+            // sized capture window; assert the near-end (tail-past-window) block DEFERS (guard ON)
+            // / carves a truncated bytes_ok=0 block (DEFEAT_ACQGUARD). Reproduces the HW ~5.6%
+            // acquisition-fraction defect off-bench. One-shot.
+            test_bigblock_acqwindow_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2270,6 +2285,19 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_chanest();
             printf("[FLAG] Bigblock-chanest test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_acqwindow_cli) {
+            // §19 acquisition-window POSITION guard regression: drive ONE genuine K=8 CFG16 block
+            // at several in-window preamble offsets in a FIXED production-sized window; assert the
+            // near-end block (tail past window) DEFERS (guard ON) and carves a truncated bytes_ok=0
+            // block under DEFEAT_ACQGUARD. Off-bench reproduction of the HW ~5.6% defect. One-shot.
+            printf("[FLAG] --test-bigblock-acqwindow: invoking §19 acquisition-window POSITION guard "
+                   "regression (in-window preamble offsets, fixed capture window)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_acqwindow();
+            printf("[FLAG] Bigblock-acqwindow test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

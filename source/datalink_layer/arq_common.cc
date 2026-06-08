@@ -4212,6 +4212,35 @@ int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 	return (block_ftr > stock_ftr) ? block_ftr : stock_ftr;
 }
 
+// bigblock_acq_window_fits(): ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). After
+// receive_bigblock located the head preamble (bigblock_last_rx_head_delay_samples) and
+// recorded the captured-window length (bigblock_last_rx_capture_nsamples), test whether the
+// FULL block — head + preamble_nSymb + Ngrid OFDM symbols (= bigblock_rx_block_nsymb()
+// symbols counting from head_delay) — fits inside the captured samples. When it does NOT,
+// bb_at zero-padded the tail (the block landed too late in the window / its tail had not yet
+// arrived in the ring at snapshot time), so the carve would see a truncated block and the
+// estimate collapses -> cw0 wire-CRC fails. The receive() guard then DEFERS instead of
+// carving garbage. head_delay<0 (acq fail) or capture<=0 (no decode) => treated as "not a
+// locatable block" -> returns true (let the existing cw0-CRC gate handle it as today; do not
+// defer on a non-block). Geometry from the SAME bigblock_rx_block_nsymb() the §17 sites use.
+bool cl_arq_controller::bigblock_acq_window_fits()
+{
+	if(telecom_system == NULL) return true;
+	long head = telecom_system->bigblock_last_rx_head_delay_samples;
+	int  cap  = telecom_system->bigblock_last_rx_capture_nsamples;
+	if(head < 0 || cap <= 0) return true;            // no locatable block -> do not defer
+	int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+	if(block_nsymb <= 0) return true;                // geometry unavailable -> do not defer
+	int sym_samples = telecom_system->data_container.Nofdm
+	                  * telecom_system->data_container.interpolation_rate;
+	if(sym_samples <= 0) return true;
+	// block_end = head + (preamble_nSymb + Ngrid)*sym_samples = head + block_nsymb*sym_samples.
+	// bigblock_rx_passband reads forward from data_start = head + preamble_nSymb*sym_samples for
+	// Ngrid*sym_samples; the END coincides with head + block_nsymb*sym_samples.
+	long block_end = head + (long)block_nsymb * (long)sym_samples;
+	return block_end <= (long)cap;
+}
+
 // bigblock_receive_carve(): the RX side of STEP 2. After receive_byte() branched
 // to receive_bigblock() and decoded ONE block (stashing the per-codeword clean
 // vector telecom_system->bigblock_last_rx_cw_ok + the K decoded info-bit
@@ -7352,6 +7381,54 @@ void cl_arq_controller::receive()
 			 && telecom_system->M != MOD_MFSK
 			 && current_configuration == CONFIG_16
 			 && telecom_system->bigblock_last_rx_K > 0);
+		// ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). Run BEFORE the cw0-CRC gate:
+		// when the located block's tail ran past the captured window (bb_at zero-padded it
+		// because the block landed too late in the snapshot / its tail had not yet arrived
+		// in the ring at snapshot time), the block-wide estimate collapses and the cw0 CRC
+		// fails even on a perfect timing lock — so without this guard the §19.1 late-landing
+		// attempts route into the cw0-CRC-fail "not a block" path and the block is dropped
+		// (the HW ~5.6% pass rate). Instead, DEFER one arming cycle: re-arm frames_to_read to
+		// the block span (the §17 bigblock_block_ftr_or mechanism, so a fresh full block-span
+		// accumulates and the tail arrives), leave the ring INTACT (do NOT wipe — the head is
+		// already here), and SKIP the carve. On the next snapshot the block has fully arrived
+		// and re-lands earlier in the window -> fits -> carves 8/8. A bounded defer counter
+		// (reset on every accept) prevents an infinite spin on a genuinely absent block: when
+		// it is exceeded we fall through to the existing cw0-CRC gate (which rejects the
+		// truncated block exactly as today — no regression, just no infinite defer).
+		// MERCURY_BIGBLOCK_DEFEAT_ACQGUARD=1 bypasses the defer (carve the truncated block as
+		// pre-fix) for the fail-before/pass-after A/B. Production never sets it.
+		bool acqguard_defeat = false;
+		{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD");
+		  if(e && *e && atoi(e) != 0) acqguard_defeat = true; }
+		const int BIGBLOCK_RX_MAX_DEFERS = 3;   // bounded; one defer suffices in the common case
+		if(bigblock_rx_candidate && !acqguard_defeat && !bigblock_acq_window_fits()
+		   && bigblock_rx_defer_count < BIGBLOCK_RX_MAX_DEFERS)
+		{
+			bigblock_rx_defer_count++;
+			printf("[BBTX-ACQ-DEFER] CFG16 big-block (K=%d) tail past capture window "
+				"(head=%ld cap=%d block_nsymb=%d defer=%d/%d) -> deferring carve one arming "
+				"cycle for the full block\n",
+				telecom_system->bigblock_last_rx_K,
+				telecom_system->bigblock_last_rx_head_delay_samples,
+				telecom_system->bigblock_last_rx_capture_nsamples,
+				telecom_system->bigblock_rx_block_nsymb(),
+				bigblock_rx_defer_count, BIGBLOCK_RX_MAX_DEFERS);
+			fflush(stdout);
+			// Re-arm a full block span (reuse the §17 clamp helper) and leave the ring intact
+			// so the already-arrived block head survives to the next snapshot. Do NOT carve;
+			// the downstream per-frame parse keys on received_message_stats (forced NO below).
+			MUTEX_LOCK(&capture_prep_mutex);
+			telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(0);
+			telecom_system->data_container.nUnder_processing_events = 0;
+			telecom_system->receive_stats.ofdm_search_raw = 0;
+			telecom_system->receive_stats.ofdm_batch_active = false;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			// clear the RX-K marker so the carve gate below is FALSE; not a delivered block.
+			telecom_system->bigblock_last_rx_K = 0;
+			received_message_stats.message_decoded = NO;
+			bigblock_rx_candidate = false;
+			bigblock_rx_handled = true;   // suppress the per-frame parse for this deferred pass
+		}
 		if(bigblock_rx_candidate && !bigblock_rx_cw0_header_valid())
 		{
 			// GAP-2 LIVE-PATH tally (diag/livepath-sim): this acquisition was a CFG16
@@ -7375,6 +7452,9 @@ void cl_arq_controller::receive()
 			// downstream per-frame parse keys on the (stock) received_message_stats.
 			telecom_system->bigblock_last_rx_K = 0;
 			bigblock_rx_candidate = false;
+			// §19: this acquisition is abandoned (control/stale/noise, OR a defer-cap
+			// give-up). Reset the defer cap so the NEXT real block can defer afresh.
+			bigblock_rx_defer_count = 0;
 		}
 		if(bigblock_rx_candidate)
 		{
@@ -7392,6 +7472,7 @@ void cl_arq_controller::receive()
 			bigblock_receive_carve(telecom_system->bigblock_rx_infobits.data(),
 				(unsigned char)fallback_bsi, /*use_wire_header=*/true);
 			bigblock_rx_handled = true;
+			bigblock_rx_defer_count = 0;   // §19: full block carved -> reset the defer cap
 			// the carve already populated messages_rx[] + advanced ARQ state; the
 			// per-frame parse path below keys on received_message_stats.message_decoded.
 			received_message_stats.message_decoded = NO;

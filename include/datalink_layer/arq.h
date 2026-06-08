@@ -1402,6 +1402,15 @@ public:
   // mean|H| collapse + 0-delivery (fail-before) and recovery to byte-faithful (pass-after).
   static int test_sim_inproc_bigblock_chanest();
 
+  // ACQUISITION-WINDOW POSITION regression (fact-doc §19): drive ONE genuine K=8 CFG16
+  // big-block into a FIXED production-sized capture window at several IN-WINDOW preamble
+  // offsets (head, mid, near-end) and assert the §19 window-position guard DEFERS a
+  // late-landing block (tail past the window) and decodes 8/8 once the full block fits,
+  // vs the pre-fix DEFEAT_ACQGUARD arm which carves a TRUNCATED block (bytes_ok=0). This
+  // is the off-bench fail-before/pass-after for the HW ~5.6% acquisition-fraction defect
+  // the existing chanest harness cannot reproduce (it custom-sizes buffer_Nsymb to fit).
+  static int test_sim_inproc_bigblock_acqwindow();
+
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
   // policy_evaluate_axis2() implements the per-batch §4.3.2 controller:
@@ -1567,6 +1576,24 @@ public:
   // MERCURY_BIGBLOCK_DEFEAT_FIX=1 reproducer hook bypasses the clamp (returns stock_ftr)
   // so the SAME binary reproduces the pre-fix truncated-window corruption for the A/B.
   int bigblock_block_ftr_or(int stock_ftr);
+  // ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). The §17 ftr clamp made the
+  // snapshot WAIT for a block-span of FRESH symbols (the COUNT), but the snapshot still
+  // fires at a RANDOM ring write-head phase (the POSITION), so a block whose preamble
+  // lands late in the captured window has its tail STILL ARRIVING (future samples, not
+  // yet in the ring) when frames_to_read hits 0 -> bb_at zero-pads the tail -> the
+  // block-wide estimate collapses -> cw0 wire-CRC fails even on a perfect timing lock
+  // (HW ACQ_GATE_ANALYSIS: only the preamble_symbol==0 attempt passed; metric-0.999
+  // late-landing attempts failed). bigblock_acq_window_fits() returns true when the
+  // FULL located block (head + preamble + Ngrid) fits inside the captured window
+  // (head_delay + block_nsymb*sym_samples <= capture_nsamples), i.e. the carve will see
+  // a complete block. When it returns false the receive() guard DEFERS the carve one
+  // arming cycle (re-arm frames_to_read to the block span, leave the ring intact) so the
+  // tail arrives and the block re-lands earlier in the window. Gated on the CFG16
+  // big-block rung; off-rung the guard is never entered (byte-identical).
+  // bigblock_rx_defer_count caps consecutive defers so a genuinely absent block falls
+  // through to the stock cw0-CRC gate instead of spinning. Reset on every accept.
+  bool bigblock_acq_window_fits();
+  int  bigblock_rx_defer_count = 0;
   // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
   // block carried + its geometry, so the in-process single-block harness can carve
   // it back byte-faithfully (the delivered==TX ground truth, INV-6).

@@ -697,6 +697,20 @@ public:
 	// DIAG print is env-gated; this stash is always live).
 	double bigblock_last_rx_meanh = -1.0;
 
+	// ACQUISITION-WINDOW POSITION stash (fix/bigblock-chanest §19): the located head
+	// preamble start (FULL-RATE samples) of the last big-block RX, and the captured-window
+	// length (samples) the decode ran over. The ARQ window-position guard reads BOTH to
+	// decide whether the FULL block (head + preamble + Ngrid) fit inside the captured
+	// window or whether its tail was zero-padded (the block landed too late in the window /
+	// its tail had not yet arrived in the ring at snapshot time). When the block would
+	// overrun the captured samples, the guard DEFERS the carve one arming cycle instead of
+	// decoding a truncated block (§19.3). bigblock_rx_passband resets head_delay to -1 at
+	// entry (acq-fail leaves -1); receive_bigblock stamps capture_nsamples to the nSamples
+	// it decoded. Diagnostic-stash convention (mirrors bigblock_last_rx_meanh); off-rung
+	// they are never read -> production byte-identical.
+	long bigblock_last_rx_head_delay_samples = -1;
+	int  bigblock_last_rx_capture_nsamples   = 0;
+
 	// CFG16 CARVE-GATE HARDENING (cfg16-controlack-hold, GAP3): a one-shot RX
 	// intent override that SUPPRESSES the big-block route in receive_byte for the
 	// NEXT call only, so the captured passband is decoded by the STOCK per-frame
