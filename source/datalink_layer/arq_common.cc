@@ -4651,6 +4651,12 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 	// --- PHASE 1: parse the cw0 wire header [bsi, n_data, length[0..K-1] uint16 LE] ---
 	unsigned char block_bsi = fallback_bsi;
 	int cw0_offset = 0;
+	// V3 FIX (fact-doc §10/§14): the REAL decoded n_data (cw0 header byte payload[1], the count of
+	// filled codewords the TX emitted). Parsed here when cw0 is clean and STASHED at the FIX-2 arm
+	// site so bigblock_partial_block_crc_ok() rebuilds the header byte with the actual value
+	// (NOT a hard-coded K) — an UNDER-FILLED clean block (n_data<K) would otherwise false-reject
+	// forever (LIVELOCK). -1 == unset (no usable header) -> consumer falls back to K.
+	int wire_n_data = -1;
 	const int* sub_lengths_ptr = nullptr;
 	std::vector<int> wire_lengths;
 	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
@@ -4662,6 +4668,13 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		// trusted. The wire bsi is authoritative (drift-proof); the length table sizes
 		// each delivered slot. cw0's app bytes start AFTER the header prefix.
 		block_bsi = payload[0];
+		// payload[1] = n_data (filled-codeword count); clamp to [1,K] defensively (the TX
+		// emits n_data in [1,K], bigblock_pack_block() :3921-3922). hdr_total>=2 always (it
+		// is BIGBLOCK_HDR_FIXED_BYTES=2 + 2K) and hdr_total<=sub_len is checked above, so
+		// payload[1] is in-bounds whenever the header is usable.
+		wire_n_data = (int)(unsigned char)payload[1];
+		if(wire_n_data < 1) wire_n_data = 1;
+		if(wire_n_data > K) wire_n_data = K;
 		wire_lengths.assign((size_t)K, 0);
 		for(int c=0;c<K;c++)
 		{
@@ -4723,7 +4736,8 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 	//       so we do NOT arm — that one codeword stays at the unchanged per-cw CRC-8 floor,
 	//       and NO false reject of a genuinely-clean completion is ever introduced.
 	// Reset to disarmed first (a clean carve / non-armable PARTIAL clears any stale stash).
-	bigblock_partial_armed = false;
+	bigblock_partial_armed  = false;
+	bigblock_partial_n_data = -1;   // V3: clear stale n_data with the rest of the stash
 	{
 		int n_clean_stash = 0;
 		for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_stash++;
@@ -4743,13 +4757,19 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 			bigblock_partial_hdr_total      = hdr_total;
 			bigblock_partial_cw0_offset     = cw0_offset;
 			bigblock_partial_expected_crc32 = wire_bcrc;
+			// V3 FIX (fact-doc §10/§14): stash the REAL decoded n_data (parsed above when cw0 is
+			// clean — a FIX-2 arm precondition, so wire_n_data is always set here). The completion
+			// gate reconstructs cw0's header byte img[1] with THIS value, matching the TX exactly,
+			// so a genuinely-clean UNDER-FILLED (n_data<K) block reassembles byte-identical -> CRC
+			// MATCH -> delivers, instead of false-rejecting forever (the §10 livelock).
+			bigblock_partial_n_data         = (wire_n_data >= 1 && wire_n_data <= K) ? wire_n_data : K;
 			bigblock_partial_lengths.assign((size_t)K, 0);
 			for(int c=0;c<K;c++)
 				bigblock_partial_lengths[(size_t)c] = sub_lengths_ptr ? sub_lengths_ptr[c] : 0;
 			bigblock_partial_armed = true;
-			printf("[BIGBLOCK-RX] FIX-2: armed PARTIAL block-CRC gate bsi=%d K=%d sub_len=%d "
+			printf("[BIGBLOCK-RX] FIX-2: armed PARTIAL block-CRC gate bsi=%d K=%d n_data=%d sub_len=%d "
 				"expected_crc32=%08x (verified at prev-batch completion before delivery)\n",
-				bigblock_partial_block_bsi, K, sub_len, wire_bcrc);
+				bigblock_partial_block_bsi, K, bigblock_partial_n_data, sub_len, wire_bcrc);
 			fflush(stdout);
 		}
 	}
@@ -4797,19 +4817,30 @@ bool cl_arq_controller::bigblock_partial_block_crc_ok()
 
 	std::vector<unsigned char> img((size_t)total, 0);   // codeword-aligned, zero pad
 
-	// Reconstruct cw0's wire header [bsi, n_data, length[0..K-1] uint16 LE]. n_data is the
-	// number of filled codewords; the stashed length table is per-codeword so the byte image
-	// matches the TX (which wrote n_data = the batch's filled count). We rebuild it from the
-	// stashed lengths: n_data = count of c with length>0 is NOT robust (a 0-length frame is
-	// valid), so we use K (the full block the TX emitted n_data==K for a full K-frame batch).
-	// The header bytes are part of the CRC-32 image, so they must match the TX exactly; the
-	// TX wrote [bsi][n_data][lengths]. We store n_data == the carve's K (full-block batches,
-	// the only case big-block emits). If a future partial-fill batch differs, the CRC mismatch
-	// is SAFE (reject) — never a wrong-byte delivery.
+	// Reconstruct cw0's wire header [bsi, n_data, length[0..K-1] uint16 LE]. The header bytes
+	// are part of the CRC-32 image, so they must match the TX exactly; the TX wrote
+	// [bsi][n_data][lengths] where n_data = the batch's filled-codeword count.
+	// V3 FIX (fact-doc §10/§14): use the REAL decoded n_data stashed at the carve
+	// (bigblock_partial_n_data, = cw0 header byte payload[1]). The PRE-V3 code hard-coded
+	// img[1]=K, which is correct ONLY for a full K-frame batch; an UNDER-FILLED (n_data<K)
+	// block — a FIFO-drained / end-of-document tick, near-certain on a finite document's final
+	// CFG16 tick — then reassembled with img[1]=K != TX n_data, CRC-MISMATCHED, REJECTED, and
+	// re-emitted byte-identical -> re-rejected FOREVER (a deterministic false-reject LIVELOCK on a
+	// genuinely-clean block, the §10 blocker). Falling back to K when n_data is unset (-1) is
+	// safe: arming requires a clean cw0 header, so the value is always parsed when armed.
+	int img_ndata = (bigblock_partial_n_data >= 1 && bigblock_partial_n_data <= K)
+	                ? bigblock_partial_n_data : K;
+	// REPRODUCER HOOK (fact-doc §14, mirrors DEFEAT_CAPFIX / DEFEAT_PARTIALCRC): set
+	// MERCURY_BIGBLOCK_DEFEAT_NDATA=1 to restore the PRE-V3 hard-coded img[1]=K on the SAME
+	// binary, so the n_data<K false-reject LIVELOCK fail-before is reproducible without a
+	// revert build. With it set, a genuinely-clean UNDER-FILLED block reassembles with
+	// img[1]=K != TX n_data -> CRC MISMATCH -> REJECT (the livelock). Production never sets it.
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_NDATA");
+	  if(e && *e && atoi(e)!=0) img_ndata = K; }
 	if(hdr_total >= 2 && hdr_total <= sub_len)
 	{
 		img[0] = (unsigned char)(bigblock_partial_block_bsi & 0xFF);
-		img[1] = (unsigned char)(K & 0xFF);
+		img[1] = (unsigned char)(img_ndata & 0xFF);
 		for(int c=0;c<K;c++)
 		{
 			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
@@ -4845,9 +4876,9 @@ bool cl_arq_controller::bigblock_partial_block_crc_ok()
 	unsigned int calc = (unsigned int)CRC32_calc((char*)img.data(), (int)total);
 	bool ok = (calc == bigblock_partial_expected_crc32);
 	printf("[BIGBLOCK-RX] FIX-2: prev-batch completion block-CRC %s (calc=%08x expected=%08x "
-		"bsi=%d K=%d) %s\n",
+		"bsi=%d K=%d n_data=%d) %s\n",
 		ok ? "MATCH" : "MISMATCH", calc, bigblock_partial_expected_crc32,
-		bigblock_partial_block_bsi, K,
+		bigblock_partial_block_bsi, K, img_ndata,
 		ok ? "-> deliver" : "-> REJECT (a kept codeword FALSE-PASSED per-cw CRC-8; not delivered)");
 	fflush(stdout);
 	return ok;

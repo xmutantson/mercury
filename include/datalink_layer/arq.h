@@ -1659,6 +1659,14 @@ public:
   int           bigblock_partial_hdr_total     = 0;
   int           bigblock_partial_cw0_offset    = 0;
   unsigned int  bigblock_partial_expected_crc32= 0;    // TX block-CRC-32 read from cw(K-1) trailer
+  // V3 FIX (fact-doc §10/§14): the REAL decoded n_data (cw0 header byte payload[1], the count of
+  // filled codewords the TX emitted), parsed at the carve when cw0 is clean. The TX writes
+  // block_payload_bytes[1]=n_data (arq_common.cc:3987), which is <K for an UNDER-FILLED block
+  // (FIFO-drained / end-of-document tick). bigblock_partial_block_crc_ok() MUST reconstruct the
+  // header byte with THIS value (not the hard-coded K) or a genuinely-clean n_data<K PARTIAL block
+  // CRC-mismatches -> false-reject LIVELOCK (the §10 blocker). Stashed at the arm site alongside the
+  // expected CRC-32. Default -1 (unset, defensive) is treated as K at the consumer.
+  int           bigblock_partial_n_data        = -1;   // decoded cw0 n_data (filled-codeword count)
   std::vector<int> bigblock_partial_lengths;            // per-codeword wire app lengths
   // Verify the stashed block-CRC-32 over the K-codeword payload reassembled from messages_rx_prev[]
   // (app bytes per slot + reconstructed cw0 header, with per-cw CRC tails + the block-CRC field

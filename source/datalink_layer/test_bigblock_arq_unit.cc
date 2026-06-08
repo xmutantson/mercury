@@ -2459,6 +2459,249 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		            "genuinely-clean completion still delivers (no false reject)");
 	}
 
+	// ====================================================================
+	// CLASS-COMPLETE MATRIX (fact-doc §14) — one case per big-block delivery
+	// class, asserting the RIGHT outcome for each so we stop discovering one
+	// class per HW cycle. Each case drives the PRODUCTION carve
+	// (bigblock_receive_carve) to arm the FIX-2 stash, then exercises the
+	// assembled-block gate bigblock_partial_block_crc_ok() over messages_rx_prev[]
+	// EXACTLY as the responder completion does. For every class we assert:
+	//   - NO livelock: a genuinely-clean block ALWAYS eventually delivers (gate
+	//     MATCH on the correct reassembly);
+	//   - NO silent wrong-byte beyond the documented cw(K-1)-gap per-cw CRC-8 floor
+	//     (gate MISMATCH on a corrupt kept codeword).
+	// build_wire_nd() builds the on-wire K*sub_len image for a block with the REAL
+	// n_data in the header (codewords >= n_data zero-padded, length=0) — the same
+	// bytes production bigblock_pack_block() emits — so the carve parses the true
+	// n_data into the stash (the V3 fix).
+	{
+		// Parameterized wire builder: header [bsi, n_data, len[0..K-1]] + app bytes,
+		// block-CRC-32 in cw(K-1) trailer, per-cw CRC-8 tails. Returns the per-codeword
+		// app lengths actually placed (codewords >= nd have length 0). wlen[c] is the
+		// app length for codeword c (clamped to its cap); for c>=nd it is forced 0.
+		auto build_wire_nd = [&](int bsi, int nd, std::vector<unsigned char>& out,
+		                         std::vector<std::vector<unsigned char>>& truth_out,
+		                         std::vector<int>& wlen_out)
+		{
+			out.assign((size_t)total_tx_bytes, 0);
+			truth_out.assign((size_t)K, std::vector<unsigned char>());
+			wlen_out.assign((size_t)K, 0);
+			out[0] = (unsigned char)(bsi & 0xFF);
+			out[1] = (unsigned char)(nd & 0xFF);             // REAL n_data (may be < K)
+			for(int c=0;c<K;c++)
+			{
+				int cap = (c == 0) ? cw0_cap
+				          : (c == K-1 ? (cwc_cap - BIGBLOCK_BLOCK_CRC_BYTES) : cwc_cap);
+				int len = 0;
+				if(c < nd)
+				{
+					len = ((c*29 + 7) % (cap - 4)) + 1;       // 1..cap-4, deterministic
+					if(len > cap) len = cap;
+				}
+				wlen_out[c] = len;
+				int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+				out[(size_t)lo + 0] = (unsigned char)(len & 0xFF);
+				out[(size_t)lo + 1] = (unsigned char)((len >> 8) & 0xFF);
+				int base = (c == 0) ? hdr_total : (c * sub_len);
+				truth_out[c].assign((size_t)len, 0);
+				for(int j=0;j<len;j++)
+				{
+					unsigned char b = (unsigned char)((c*71 + j*13 + nd) & 0xFF);
+					out[(size_t)base + j] = b;
+					truth_out[c][(size_t)j] = b;
+				}
+			}
+			// block-CRC-32 (cw(K-1) trailer) BEFORE per-cw CRC-8 (both placeholders still 0).
+			{
+				long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+				if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= (long)total_tx_bytes)
+				{
+					uint32_t bcrc = A->CRC32_calc((char*)out.data(), (int)total_tx_bytes);
+					for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+						out[(size_t)bcrc_off + b] = (unsigned char)((bcrc >> (8*b)) & 0xFF);
+				}
+			}
+			for(int c=0;c<K;c++)
+			{
+				int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+				int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+				if(crc_off < 0 || crc_off >= (int)total_tx_bytes || crc_span < 0) continue;
+				out[(size_t)crc_off] = A->CRC8_calc((char*)&out[(size_t)c*sub_len], crc_span);
+			}
+		};
+
+		// Reset B's RX state and seed the wire CRC-8 oracle for a fresh carve.
+		auto reset_B = [&](int bsi){
+			B->rsp_current_expected_batch_seq_id = bsi;
+			B->rsp_prev_batch_seq_id             = -1;
+			B->rsp_prev_batch_active             = false;
+			B->rsp_prev_batch_received_count     = 0;
+			B->rsp_prev_batch_expected_count     = 0;
+			B->retransmit_count                  = 0;
+			B->batch_rx_frame_count              = 0;
+			B->last_received_end_of_batch_seq    = -1;
+			B->bigblock_partial_armed            = false;
+			B->bigblock_partial_n_data           = -1;
+			bigblock_first_clean = -1; bigblock_first_K = -1;
+			for(int i=0;i<B->nMessages;i++){
+				B->messages_rx[i].status = FREE;      B->messages_rx[i].length = 0;
+				B->messages_rx[i].batch_seq_id = -1;
+				B->messages_rx_prev[i].status = FREE; B->messages_rx_prev[i].length = 0;
+				B->messages_rx_prev[i].batch_seq_id = -1;
+			}
+		};
+
+		// Drive the PRODUCTION carve over a built wire image with a GENUINE gap at gap_cw.
+		// Transmits the wire through the real PHY (run_block_loopback -> transmit_bigblock /
+		// receive_bigblock, the SAME path CASE A-F use) so tsB->bigblock_rx_infobits holds the
+		// correctly-whitened decoded bits the carve de-whitens. The gap is modeled exactly as
+		// CASE B/F: clear gap_cw's PHY oracle cw_ok BEFORE the carve so the carve routes PARTIAL
+		// (n_clean<K) and arms the FIX-2 stash (which parses the REAL n_data — the V3 fix).
+		// Returns whether the stash armed for THIS bsi.
+		auto carve_partial = [&](int bsi, const std::vector<unsigned char>& wire,
+		                         int gap_cw) -> bool {
+			reset_B(bsi);
+			std::vector<int> info_bits;
+			int K_rx = run_block_loopback(tsA, tsB, wire, info_bits);
+			if(K_rx != K) return false;
+			// GENUINE gap: demote gap_cw's oracle cw_ok (its bytes are real but the SACK marks it
+			// missing) -> the carve demotes it -> n_clean=K-1 -> PARTIAL -> arms the stash when
+			// cw0 + cw(K-1) are clean.
+			if(gap_cw >= 0 && gap_cw < (int)tsB->bigblock_last_rx_cw_ok.size())
+				tsB->bigblock_last_rx_cw_ok[gap_cw] = 0;
+			B->bigblock_receive_carve(tsB->bigblock_rx_infobits.data(), (unsigned char)bsi);
+			return B->bigblock_partial_armed && (B->bigblock_partial_block_bsi == bsi);
+		};
+
+		// Seed messages_rx_prev[] with the per-codeword TRUTH app bytes (the gap recovered via
+		// retx) for codewords [0,nd); codewords [nd,K) stay length 0 (the TX zero-pad). Then the
+		// gate reassembles + recomputes the CRC-32. corrupt_cw>=0 plants WRONG bytes in that slot
+		// (models a kept codeword that false-passed per-cw CRC-8).
+		auto seed_prev_and_gate = [&](int bsi, int nd,
+		                              const std::vector<std::vector<unsigned char>>& truth,
+		                              const std::vector<int>& wlen, int corrupt_cw) -> bool {
+			for(int c=0;c<K;c++){
+				int L = wlen[c];
+				B->messages_rx_prev[c].length = L;
+				B->messages_rx_prev[c].status = (L>0 || c<nd) ? RECEIVED : FREE;
+				B->messages_rx_prev[c].batch_seq_id = bsi;
+				for(int j=0;j<L;j++) B->messages_rx_prev[c].data[j] = (char)truth[c][(size_t)j];
+				if(c == corrupt_cw)
+					for(int j=0;j<L;j++) B->messages_rx_prev[c].data[j] ^= (char)0xFF;
+			}
+			B->rsp_prev_batch_seq_id = bsi;
+			return B->bigblock_partial_block_crc_ok();   // true = deliver, false = reject
+		};
+
+		struct ClassRow { const char* name; bool gate_clean_delivers; bool gate_corrupt_rejects; };
+		int class_pass = 0, class_total = 0;
+		auto run_class = [&](const char* name, int bsi, int nd, int gap_cw, int corrupt_cw,
+		                     bool expect_arm) {
+			std::vector<unsigned char> wire;
+			std::vector<std::vector<unsigned char>> truth;
+			std::vector<int> wlen;
+			build_wire_nd(bsi, nd, wire, truth, wlen);
+			bool armed = carve_partial(bsi, wire, gap_cw);
+			bool ok;
+			if(expect_arm)
+			{
+				// CLEAN reassembly -> gate MUST MATCH (deliver): NO livelock.
+				bool clean_delivers = armed && (seed_prev_and_gate(bsi, nd, truth, wlen, -1) == true);
+				// CORRUPT a kept codeword -> gate MUST REJECT (no silent wrong byte).
+				B->bigblock_partial_armed = armed;     // re-arm (one-shot consumed above)
+				int cc = (corrupt_cw >= 0 && corrupt_cw != gap_cw) ? corrupt_cw : -1;
+				bool corrupt_rejects = (cc < 0) ? true
+				    : (armed && (seed_prev_and_gate(bsi, nd, truth, wlen, cc) == false));
+				ok = armed && clean_delivers && corrupt_rejects;
+				printf("[TEST-SIM-BIGBLOCK] CLASS %-16s nd=%d gap=%d corrupt=%d: %s "
+				       "(armed=%d clean_delivers=%d corrupt_rejects=%d)\n",
+				       name, nd, gap_cw, corrupt_cw, ok?"PASS":"FAIL",
+				       (int)armed, (int)clean_delivers, (int)corrupt_rejects);
+			}
+			else
+			{
+				// Class expected NOT to arm (e.g. cw(K-1) gap): assert it did not arm (so it
+				// rides the per-cw CRC-8 floor for that codeword) AND there is no livelock — a
+				// non-armed completion is byte-identical to pre-FIX-2 (gate passes through).
+				ok = !armed;
+				printf("[TEST-SIM-BIGBLOCK] CLASS %-16s nd=%d gap=%d: %s (armed=%d, "
+				       "rides per-cw CRC-8 floor as documented; no new bypass, no livelock)\n",
+				       name, nd, gap_cw, ok?"PASS":"FAIL", (int)armed);
+			}
+			fflush(stdout);
+			class_total++; if(ok) class_pass++;
+			check(ok, name);
+		};
+
+		// CASE-G — UNDER-FILLED clean PARTIAL (n_data<K): THE V3 FIX. Pre-V3 hard-coded img[1]=K
+		// -> reassembly header byte mismatches the TX n_data -> CRC MISMATCH -> false-reject
+		// LIVELOCK on a genuinely-clean block. Post-V3 the stashed real n_data makes img[1]
+		// match -> MATCH -> delivers. (Fail-before is structural: with img[1]=K the clean
+		// reassembly would NOT match; the V3 stash is what makes clean_delivers=1 here.)
+		run_class("G-underfilled",   31, /*nd=*/5, /*gap=*/2, /*corrupt=*/4, /*arm=*/true);
+		// full-clean K block taken on the PARTIAL path (gap+recover): clean delivers, corrupt rejects.
+		run_class("full-clean-K",    32, /*nd=*/K, /*gap=*/2, /*corrupt=*/4, /*arm=*/true);
+		// cw0-gap then SACK-filled: cw0 IS the gap -> NOT armed (header untrusted) -> rides floor,
+		// no livelock. (The carve falls back; the block re-requests cw0 — a fresh decode.)
+		run_class("cw0-gap",         33, /*nd=*/K, /*gap=*/0, /*corrupt=*/-1, /*arm=*/false);
+		// cw(K-1)-gap: the CRC-bearing last codeword is the gap -> NOT armed (documented floor:
+		// that one codeword rides the per-cw CRC-8 ~2^-8 until cw(K-1) arrives; NOT a new bypass).
+		run_class("cwKm1-gap",       34, /*nd=*/K, /*gap=*/K-1, /*corrupt=*/-1, /*arm=*/false);
+		// mid-cw gap: a middle codeword is the gap -> armed -> gates on completion.
+		run_class("mid-cw-gap",      35, /*nd=*/K, /*gap=*/3, /*corrupt=*/5, /*arm=*/true);
+		// under-filled with the LAST FILLED codeword as the gap (nd<K, gap=nd-1): armed (cw(K-1)
+		// is a clean zero-pad codeword carrying the CRC field), clean delivers, corrupt rejects.
+		run_class("G-underfilled-gap",36, /*nd=*/4, /*gap=*/2, /*corrupt=*/1, /*arm=*/true);
+
+		// ---- THE V3 n_data FIX: explicit FAIL-BEFORE / PASS-AFTER on the SAME binary ----
+		// A genuinely-clean UNDER-FILLED (n_data<K) PARTIAL block. PASS-AFTER (default): the
+		// stashed REAL n_data makes the reassembled header byte match the TX -> CRC MATCH ->
+		// deliver. FAIL-BEFORE (MERCURY_BIGBLOCK_DEFEAT_NDATA=1, restoring the pre-V3 hard-coded
+		// img[1]=K): the reassembled header byte (K) != TX n_data -> CRC MISMATCH -> REJECT — a
+		// genuinely-clean block false-rejected (the livelock's first cycle, never delivers).
+		{
+			const int bsi_nd = 41, nd = 3;   // n_data=3 << K=8: end-of-document under-filled tick
+			std::vector<unsigned char> wire;
+			std::vector<std::vector<unsigned char>> truth;
+			std::vector<int> wlen;
+			build_wire_nd(bsi_nd, nd, wire, truth, wlen);
+
+			// FAIL-BEFORE: DEFEAT_NDATA forces img[1]=K -> the clean under-filled reassembly REJECTS.
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_DEFEAT_NDATA", "1");
+#else
+			setenv("MERCURY_BIGBLOCK_DEFEAT_NDATA", "1", 1);
+#endif
+			bool armed_b = carve_partial(bsi_nd, wire, /*gap=*/2);
+			bool reject_before = armed_b && (seed_prev_and_gate(bsi_nd, nd, truth, wlen, -1) == false);
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_DEFEAT_NDATA", "");
+#else
+			unsetenv("MERCURY_BIGBLOCK_DEFEAT_NDATA");
+#endif
+			// PASS-AFTER: the V3 stash (real n_data) -> the SAME clean under-filled block DELIVERS.
+			bool armed_a = carve_partial(bsi_nd, wire, /*gap=*/2);
+			bool deliver_after = armed_a && (seed_prev_and_gate(bsi_nd, nd, truth, wlen, -1) == true);
+
+			bool ndata_fix = reject_before && deliver_after;
+			printf("[TEST-SIM-BIGBLOCK] V3 n_data FIX (n_data=%d<K=%d): %s "
+			       "(FAIL-BEFORE reject_with_K=%d -> PASS-AFTER deliver_with_real_ndata=%d)\n",
+			       nd, K, ndata_fix?"PASS":"FAIL", (int)reject_before, (int)deliver_after);
+			fflush(stdout);
+			check(ndata_fix, "V3 n_data FIX: a genuinely-clean UNDER-FILLED (n_data<K) PARTIAL block "
+			      "FALSE-REJECTS with the pre-V3 hard-coded img[1]=K (the livelock) and DELIVERS with "
+			      "the stashed real n_data (fail-before/pass-after on the same binary)");
+		}
+
+		bool matrix_pass = (class_pass == class_total);
+		printf("[TEST-SIM-BIGBLOCK] CLASS-COMPLETE MATRIX: %d/%d classes pass\n",
+		       class_pass, class_total);
+		fflush(stdout);
+		check(matrix_pass, "CLASS-COMPLETE MATRIX: every big-block delivery class gates correctly "
+		      "(under-filled n_data<K clean delivers — the V3 fix; corrupt kept codeword rejects; "
+		      "cw0/cw(K-1) gaps ride the documented per-cw floor with NO livelock, NO new bypass)");
+	}
+
 	delete A; delete B;
 	delete tsA; delete tsB;
 	restore_env();

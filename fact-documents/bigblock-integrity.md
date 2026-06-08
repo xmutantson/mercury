@@ -187,9 +187,80 @@ carve so the prev-batch completion can re-verify the whole-block CRC-32 over the
   clean) IS covered, and a cw(K-1)-gap completion would have to ALSO false-pass a different kept
   codeword (joint ~2^-8 × the cw(K-1)-gap fraction) to slip through.
 
+## §14. V3 — close §10 (n_data<K clean-PARTIAL false-reject livelock) + class-complete matrix
+
+Built ON TOP of V2 (`cd3d5ca`). The CRC-32 algorithm, cw(K-1) trailer placement, FIX-1 cap
+reservation, and FIX-2 PARTIAL gate are UNCHANGED. ONE behavioral change (the §10 blocker the
+BLOCKCRC_V2_VERDICT flagged NO-GO) + a class-complete test matrix.
+
+### §14.1 The n_data fix (closes the BLOCKCRC_V2_VERDICT §10 blocker)
+
+`bigblock_partial_block_crc_ok()` previously HARD-CODED the reassembled cw0 header byte
+`img[1] = (K & 0xFF)`. The TX writes the REAL `n_data` (filled-codeword count) there
+(`block_payload_bytes[1] = n_data`, arq_common.cc:3987), `< K` for an under-filled batch
+(FIFO-drained / end-of-document tick — near-certain on a finite document's final CFG16 tick).
+A genuinely-clean `n_data<K` PARTIAL block reassembled with `img[1]=K` ≠ TX n_data → CRC-32
+MISMATCH → REJECT → re-emit byte-identical → re-REJECT FOREVER (deterministic false-reject
+LIVELOCK, byte-safe / liveness-unsafe — the SAME prohibited shape §4/§9 killed, reintroduced by
+FIX-2 on the under-filled block class).
+
+**Fix:** stash the REAL decoded n_data at the FIX-2 arm site and use it at the gate.
+- Carve parses `wire_n_data = payload[1]` (clamped [1,K]) when cw0 is clean — the FIX-2 arm
+  precondition (arq_common.cc:4675).
+- Arm site stashes `bigblock_partial_n_data = wire_n_data` (arq_common.cc:4765); reset to `-1` on
+  every carve entry (arq_common.cc:4740).
+- `bigblock_partial_block_crc_ok()` builds `img[1] = bigblock_partial_n_data` (arq_common.cc:4843).
+- Reproducer hook `MERCURY_BIGBLOCK_DEFEAT_NDATA=1` restores the pre-V3 `img[1]=K` (the
+  fail-before) on the SAME binary. Production never sets it.
+
+### §14.2 §1.5 PRODUCER/CONSUMER AUDIT — `bigblock_partial_n_data` (new shared state, arq.h, init -1)
+
+1. **PRODUCERS:** carve arm site (arq_common.cc:4765) `= (wire_n_data∈[1,K])?wire_n_data:K`;
+   carve reset (arq_common.cc:4740) `= -1` every entry; member default `-1` (arq.h). Tests drive
+   it only via the production carve.
+2. **CONSUMERS:** `bigblock_partial_block_crc_ok()` (arq_common.cc:4831/:4843) — SOLE reader,
+   `img_ndata = (n_data∈[1,K])?n_data:K; img[1]=img_ndata`.
+3. **VALID STATES:** `-1` (unset — default-init OR a non-arming carve; the consumer is only reached
+   when `bigblock_partial_armed`, set in the SAME block that writes a valid `[1,K]` n_data, so the
+   consumer never sees `-1`; the `?:`→K fallback is defensive and matches pre-V3 for that
+   impossible case). Armed: `[1,K]`.
+4. **INVARIANTS:** (a) the stashed n_data equals the TX n_data the CRC-32 covered — both are the
+   SAME wire cw0 header byte `payload[1]` (TX wrote, carve parsed from the clean cw0 decode). (b) the
+   reassembled header (bsi,n_data,lengths) now matches the TX exactly, so the ONLY CRC-32 input
+   difference is per-codeword app bytes → a kept-codeword false-pass still MISMATCHES (FIX-2
+   preserved; n_data only removes a FALSE mismatch on a genuinely-clean block).
+5. **WHAT CHANGES:** `img[1]` goes constant-`K` → decoded n_data. For n_data==K (the only case V2
+   exercised) the value is IDENTICAL → byte-for-byte no change (verified: CASE F + matrix
+   full-clean-K rows MATCH-on-clean / MISMATCH-on-corrupt with the SAME CRC values). For n_data<K it
+   converts a guaranteed false-reject into a correct MATCH. Reset/arm lifecycle unchanged (one-shot).
+   No optimizer/gearshift/per-frame state touched (big-block-scoped; partial-bsi-advance GREEN).
+
+### §14.3 CLASS-COMPLETE MATRIX (`--test-sim-inproc-bigblock`, test_bigblock_arq_unit.cc)
+
+One case per delivery class, each driving the PRODUCTION carve to arm the stash then exercising
+`bigblock_partial_block_crc_ok()` over `messages_rx_prev[]` exactly as the responder completion
+does. For each: NO livelock (clean always delivers) AND NO silent wrong-byte beyond the cw(K-1) floor.
+
+| Class | n_data | gap | expected | result |
+|-------|--------|-----|----------|--------|
+| G-underfilled (V3 fix) | 5 | mid | armed; clean→deliver, corrupt→reject | PASS |
+| full-clean-K | 8 | mid | armed; clean→deliver, corrupt→reject | PASS |
+| cw0-gap | 8 | cw0 | NOT armed (header untrusted) → per-cw floor, no livelock | PASS |
+| cwKm1-gap | 8 | cw(K-1) | NOT armed (CRC-bearer is the gap) → DOCUMENTED per-cw CRC-8 floor until cw(K-1) arrives; no new bypass, no livelock | PASS |
+| mid-cw-gap | 8 | mid | armed; gates on completion | PASS |
+| G-underfilled-gap | 4 | mid | armed; clean→deliver, corrupt→reject | PASS |
+
+Plus an explicit **V3 n_data fail-before/pass-after** (n_data=3<K): `DEFEAT_NDATA=1` → the
+genuinely-clean under-filled reassembly REJECTS (livelock first cycle); default → DELIVERS. PROVEN
+on the same binary. `cwKm1-gap` is the accepted bounded §12 floor (NOT a new bypass): that one
+codeword rides the per-cw CRC-8 ~2^-8 until cw(K-1) arrives clean, at which point the block is
+re-carved full-clean and the §2 gate fires; the matrix asserts it does NOT livelock.
+
 ## §13. Cross-references
 
 - `bigblock_p3_hw/WINRUN_FINAL_VERDICT.json` — the HW NO-GO this anchors against.
 - `bigblock_p3_hw/_blockcrc/D2_BLOCKCRC_RESULT.json` — V1 fix design record (commit 10f7ad5).
 - `bigblock_p3_hw/_blockcrc/BLOCKCRC_VERDICT.json` — the V1 review verdict (Findings 1+2 origin).
-- `bigblock_p3_hw/_blockcrc/BLOCKCRC_V2_RESULT.json` — the V2 fix record (this commit).
+- `bigblock_p3_hw/_blockcrc/BLOCKCRC_V2_RESULT.json` — the V2 fix record (commit cd3d5ca).
+- `bigblock_p3_hw/_blockcrc/BLOCKCRC_V2_VERDICT.json` — V2 synthesis (NO-GO; §10 n_data blocker).
+- `bigblock_p3_hw/_blockcrc/BLOCKCRC_V3_RESULT.json` — V3 fix record (§10 n_data fix + class matrix).
