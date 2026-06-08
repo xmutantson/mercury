@@ -112,6 +112,9 @@ int cl_arq_controller::bigblock_first_K     = -1;
 // block carved this run, so test_sim_inproc_bigblock_chanest() can assert the estimate did
 // not collapse (the genuine, ref==NULL, 2-instance path). Sourced from the RX telecom_system.
 double cl_arq_controller::bigblock_first_meanh = -1.0;
+// D2 DELIVERY-ARMING capture (fix/bigblock-chanest): see arq.h. -1 = no partial carved yet;
+// 0 = PARTIAL with prev NOT armed (the bug); 1 = PARTIAL routed to the ACK-GATE (the fix).
+int cl_arq_controller::bigblock_first_partial_prev_armed = -1;
 
 int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
                                              unsigned char block_bsi,
@@ -265,8 +268,12 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 		// Partial K-bit SACK: the clear bits select the failed sub-codewords for
 		// selective-repeat. Each is queued as ONE stock CFG16 per-frame retx
 		// (retransmit_frames[]) carrying its ORIGINAL batch_seq_id — never a
-		// whole-block resend. The bsi does NOT bump (block incomplete; the partial
-		// SACK keeps the link alive but must not promote the rung).
+		// whole-block resend.
+		//
+		// NOTE: queue the gap retx frames FIRST (they read tx_payload, not
+		// messages_rx[]), THEN transfer the clean slots to messages_rx_prev[]
+		// below — bump_bsi_and_transfer_prev() FREES messages_rx[], so the order
+		// matters only for messages_rx[]-sourced reads (there are none here).
 		for(int c = 0; c < K; c++)
 		{
 			if(cw_ok[c]) continue;
@@ -286,9 +293,84 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 				(unsigned char)((c == K - 1) ? (c | 0x80) : c);
 			this->retransmit_count++;
 		}
+
+		// D2 FIX (fix/bigblock-chanest, fact-doc bigblock-delivery-handoff §3/§7): RESTORE
+		// INV-B. On the LIVE ARQ path, a PARTIAL block must DELIVER its K-1 clean slots once
+		// the gap codeword is recovered — instead of STRANDING them. BEFORE this fix the
+		// PARTIAL carve left the K-1 clean slots RECEIVED in messages_rx[] but the RX path
+		// (cl_arq_controller::receive, arq_common.cc:7519-7557) forces message_decoded=NO and
+		// re-arms frames_to_read for the NEXT block, keeping connection_status=RECEIVING — so
+		// the RSP just waited for the next acquisition and NEVER ACK-GATEd this partial: no
+		// SACK_RSP was ever sent, the CMD fell back to ACK-timeout WHOLE-BLOCK re-emit (which
+		// re-corrupts the same codeword on a residual channel), the block re-carved PARTIAL
+		// again, and messages_rx[] was overwritten each cycle (HW: gaps grew 8->16->...->48,
+		// 0 delivered — the "8/8 oracle -> 0 delivered" deadlock). The prev-batch DELIVERY
+		// consumer (arq_responder.cc:738-784) was never armed because the ACK-GATE that arms
+		// it (bump_bsi_and_transfer_prev at arq_responder.cc:1604) never ran.
+		//
+		// ROOT-CAUSE FIX (no band-aid, no weakened gate): route the PARTIAL big-block into the
+		// EXISTING, §5-AUDITED ACK-GATE partial-SACK path — the SAME machinery the per-frame
+		// partial path uses — by transitioning the responder to ACKNOWLEDGING_DATA. The carve
+		// already left the K-1 clean slots RECEIVED in messages_rx[] and set the synthetic EOB
+		// (= K-1) at :184; on the next process_messages_responder() the ACK-GATE
+		// (process_messages_acknowledging_data, arq_responder.cc:1444+) computes rx_received=K-1
+		// < expected=K, builds the K-bit SACK bitmap from the RECEIVED scan (gap bit clear),
+		// runs bump_bsi_and_transfer_prev() (transfers the K-1 clean slots to messages_rx_prev[],
+		// arms rsp_prev_batch_active with received=K-1/expected=K, bumps current_expected past
+		// this block), and DISPATCHES the SACK_RSP. The CMD then enters selective-repeat
+		// (sack_retransmit_active) and re-sends ONLY the gap codeword as a STOCK CFG16 per-frame
+		// frame carrying the SAME bsi; the RSP routing (arq_responder.cc:626-664) sees match_prev
+		// (bsi == rsp_prev_batch_seq_id, NOT == current_expected = bsi+1) and lands it in
+		// messages_rx_prev[]; rsp_prev_batch_received_count reaches expected_count -> the prev
+		// DELIVERY leg fires copy_data_to_buffer() and pushes ALL K slots IN ORDER (0..K-1) to
+		// fifo_buffer_rx -> the full block delivers byte-faithfully. We do NOT deliver clean
+		// slots out-of-order per-slot (the FIFO is a byte stream; a gap before a delivered slot
+		// would corrupt byte ordering) — completing-then-delivering in-order via the prev
+		// consumer is the byte-faithful "fair trade per codeword."
+		//
+		// This does NOT weaken the CRC-8 gate (the demote still selects the gap), does NOT
+		// loosen any threshold, does NOT touch the per-frame path, and INVENTS NO parallel
+		// accounting — it reuses the production ACK-GATE+prev path verbatim. The unit-test
+		// harness (bigblock_skip_fifo_delivery=true) reads messages_rx[] directly and models
+		// the gap recovery by re-carving into messages_rx[], so it must KEEP messages_rx[]
+		// untouched and must NOT enter the live ACK-GATE — hence the guard (mirrors the CLEAN
+		// branch's :236 guard).
+		// REPRODUCER HOOK (mirrors the §17 MERCURY_BIGBLOCK_DEFEAT_FIX / §22 DEFEAT_ACQGUARD):
+		// MERCURY_BIGBLOCK_DEFEAT_D2=1 SKIPS the ACK-GATE routing below, restoring the PRE-FIX
+		// behavior on the SAME binary (the K-1 clean slots are left RECEIVED-and-forgotten in
+		// messages_rx[]; the RX path waits for the next block; no SACK is sent; no prev armed) so
+		// the fail-before (delivery-arming NOT done -> INV-B violated) is provable without a
+		// revert build. Production never sets it.
+		bool defeat_d2 = false;
+		{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_D2"); if(e && *e && atoi(e)!=0) defeat_d2 = true; }
+
+		bool ack_gate_armed = false;
+		if(!bigblock_skip_fifo_delivery && !defeat_d2)
+		{
+			// INIT-ON-FIRST-BLOCK: seed current_expected from the wire bsi so the ACK-GATE's
+			// bump_bsi_and_transfer_prev() is well-defined (it early-returns unless
+			// rsp_current_expected_batch_seq_id >= 0) and the recovered gap retx routes to PREV
+			// (not adopted as a fresh current batch). Mirrors the CLEAN branch seed at :251-252
+			// and the responder DATA-adopt at arq_responder.cc:618-624.
+			if(this->rsp_current_expected_batch_seq_id < 0)
+				this->rsp_current_expected_batch_seq_id = (int)block_bsi;
+			// Hand the partial to the audited ACK-GATE on the next responder tick: it sends the
+			// SACK_RSP for the gap codeword(s) and arms the prev-batch from the RECEIVED slots.
+			this->connection_status = ACKNOWLEDGING_DATA;
+			ack_gate_armed = true;
+		}
+
+		// D2 DELIVERY-ARMING capture (live path only): record the FIRST partial block's arming
+		// outcome so ARM-D can assert fail-before(0)/pass-after(1) deterministically on the FIRST
+		// block. 0 = stranded (bug / DEFEAT_D2), 1 = routed to the audited ACK-GATE (fix).
+		if(!bigblock_skip_fifo_delivery && bigblock_first_partial_prev_armed < 0)
+			bigblock_first_partial_prev_armed = ack_gate_armed ? 1 : 0;
+
 		printf("[BIGBLOCK-ARQ] PARTIAL block bsi=%u K=%d clean=%d -> SACK gaps=%d "
-			"queued for selective-repeat (stock CFG16 per-frame), no bsi bump\n",
-			(unsigned)block_bsi, K, n_clean, this->retransmit_count);
+			"queued for selective-repeat (stock CFG16 per-frame); ack_gate_armed=%d "
+			"(curr_expected=%d) -> RSP ACK-GATEs partial + arms prev for in-order delivery\n",
+			(unsigned)block_bsi, K, n_clean, this->retransmit_count, (int)ack_gate_armed,
+			this->rsp_current_expected_batch_seq_id);
 		fflush(stdout);
 	}
 
@@ -2690,6 +2772,32 @@ int cl_arq_controller::test_sim_inproc_bigblock_chanest()
 // + a small slack) and drives the SAME genuine K=8 block at SEVERAL in-window preamble offsets
 // (head ~0, mid, near-end), so a late offset's tail runs PAST the captured window exactly as on
 // HW.
+//
+// §22 LIVE-RING MODEL (replaces the §19 re-presentation that HID the deadlock). The original
+// PASS-AFTER arm re-INJECTED a complete block at OFF_HEAD on pass2 — modelling RE-PRESENTATION,
+// which the live CMD (one-block emit, then wait-on-SACK, never re-TX) NEVER produces. The
+// NEAR-END arms below now model the REAL forward-sliding ring from ONE transmission: a single
+// `tx_pb` is laid into a long zero-padded `stream` at absolute position `lead`; a "snapshot at
+// write-head T" copies the most-recent `cap` samples [T-cap, T) and ZEROS everything at index
+// >= T (the future — not yet produced into the ring). The snapshot's preamble in-window offset
+// is head = lead - (T - cap); a small T (early write-head) leaves the tail [T, lead+block_span)
+// unwritten (the HW overrun). No re-injection: the SAME tx_pb is read at two write-heads.
+//   • FAIL-BEFORE (§19 deadlock): the guard re-arms a FULL block-span (block_nsymb+10 sym) ->
+//     a SHORT block-span re-arm cannot rescue the overrun. COMMENT-DRIFT FIX (D3, fact-doc
+//     bigblock-delivery-handoff §4/§9): the original comment claimed the head scrolls "OFF THE
+//     BACK" (head1 = head0 - 74*sym < 0). HW shows the OPPOSITE: because the live snapshot is
+//     rwi-RELATIVE, a re-arm ADVANCES ring_write_index and re-snapshots, pushing the located
+//     head LATER (FORWARD), not earlier — HW-proven head 116664->132932 (+16268), overrun
+//     36072->52340 (val_rsp_off_A1.log:10158,10307), compounded by the global energy-argmax
+//     false-locking a fresher/later retransmit copy near the ring end. Either way acquisition
+//     can no longer lock the original block -> 0/8 and the CMD waits a SACK that never comes
+//     (deadlock). (This single-block backward-scroll MODEL passes falsely vs the real
+//     forward-drift lifecycle; a faithful D3 arm must lay down >=2 co-resident copies on a
+//     residual channel — tracked as the SEPARATE D3 acquisition fix, NOT this D2 delivery fix.)
+//   • PASS-AFTER (wait-for-tail): the guard re-arms ONLY wait_syms = ceil(overrun/sym)+1 ->
+//     write-head T1 = T0 + wait_syms*sym -> head1 = head0 - wait_syms*sym <= cap-block_span
+//     (fits) AND the tail (<= lead+block_span <= T1) is now produced -> full block in-window,
+//     head still in-ring -> carve 8/8 from the SAME single transmission.
 //
 // FAIL-BEFORE / PASS-AFTER (the §19 guard is the lever):
 //   • HEAD / MID offsets (block fits): decode 8/8 byte-faithful in BOTH arms (no regression).

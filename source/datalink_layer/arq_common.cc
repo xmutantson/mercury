@@ -4446,9 +4446,17 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 
 	int rc = bigblock_block_to_arq(cw_ok.data(), K, block_bsi, payload.data(), sub_len,
 		sub_lengths_ptr, cw0_offset);
-	printf("[BIGBLOCK-RX] carve: K=%d cw_ok_count=%d wire_bsi=%u (fallback=%u used_hdr=%d) "
-		"sub_len=%d rc=%d\n",
-		K, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi,
+	// HONEST DIAGNOSTIC (D1 fix, fact-doc bigblock-delivery-handoff §2): report the REAL
+	// per-codeword clean count (n_clean after the wire-CRC-8 demote above), NOT the PHY
+	// forced ORACLE bigblock_last_rx_cw_ok_count. On the live 2-instance RX (cw_info_ref==NULL)
+	// the oracle is FORCED all-1s (telecom_system.cc:8067-8070), so it printed cw_ok_count=8
+	// even when the carve routed PARTIAL clean<K — a misleading log that hid D2 on HW. n_clean
+	// is the count of demoted-clean codewords actually delivered/SACKed by the carve.
+	int n_clean_real = 0;
+	for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_real++;
+	printf("[BIGBLOCK-RX] carve: K=%d n_clean=%d (oracle_cw_ok_count=%d) wire_bsi=%u "
+		"(fallback=%u used_hdr=%d) sub_len=%d rc=%d\n",
+		K, n_clean_real, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi,
 		(unsigned)fallback_bsi, (int)(sub_lengths_ptr != nullptr), sub_len, rc);
 	fflush(stdout);
 	return rc;

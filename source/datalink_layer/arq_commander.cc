@@ -11071,6 +11071,8 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
 		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_BIGBLOCK_NOCRC",
 		"MERCURY_BIGBLOCK_DEFEAT_ACQGUARD",   // §22: saved/restored so the arm toggles don't leak
+		"MERCURY_BIGBLOCK_CORRUPT_CW", "MERCURY_BIGBLOCK_CORRUPT_NBITS",  // ARM-D: D2 genuine per-cw corruption
+		"MERCURY_BIGBLOCK_DEFEAT_D2",         // ARM-D: D2 fail-before reproducer (pre-fix stranding)
 		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK"
 	};
 	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
@@ -11110,6 +11112,11 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	{ char b[32]; snprintf(b,sizeof(b),"%ld",PAYLOAD); set_env("MERCURY_SIM2_PAYLOAD_BYTES", b); }
 	set_env("MERCURY_SIM2_MAXITERS",    "200000");
 	set_env("MERCURY_SIM2_STALL_ITERS", "60000");
+	// ARM-D defaults OFF for arms A/B/B2/C (the genuine per-cw corruption hook + the D2
+	// fail-before reproducer are ARM-D-only; -1/0 = disabled).
+	set_env("MERCURY_BIGBLOCK_CORRUPT_CW",    "-1");
+	set_env("MERCURY_BIGBLOCK_CORRUPT_NBITS", "0");
+	set_env("MERCURY_BIGBLOCK_DEFEAT_D2",     "0");
 
 	int failed = 0;
 
@@ -11187,10 +11194,73 @@ int cl_arq_controller::test_sim_inproc_bigblock_multicw()
 	       c_ok ? "PASS" : "FAIL");
 	if(!c_ok) failed++;
 
+	// --- ARM D (D2, fix/bigblock-chanest): the ACTUAL HW failure the sim never modeled. ---
+	// A GENUINE per-codeword corruption WITH the production per-cw wire-CRC demote ON (NOCRC=0).
+	// MERCURY_BIGBLOCK_CORRUPT_CW=k slams codeword k's LLRs to a wrong sign BEFORE decode on the
+	// LIVE ref==NULL producer (telecom_system.cc bigblock_rx_passband) -> the carve CRC-8 demotes
+	// EXACTLY that codeword -> n_clean = K-1 -> the PARTIAL branch (test_bigblock_arq_unit.cc).
+	// This is the EXACT HW signature: the forced ORACLE prints cw_ok_count=8 while the REAL carve
+	// routes PARTIAL clean=K-1. ARM-A..C all decode CLEAN, so they never exercise the PARTIAL
+	// DELIVERY path — the "sim lies green" gap the handoff doc (§9) names.
+	//
+	// D2 is the DELIVERY-LAYER bug (INV-B): a PARTIAL block must ARM the prev-batch delivery
+	// machinery + dispatch the SACK so the K-1 clean slots are NOT stranded. (The end-to-end
+	// byte-faithful RECOVERY additionally needs the CMD-side per-frame selective-repeat transport,
+	// which the handoff doc §8/§4 names as the SEPARATE, NOT-bundled D3 follow-on.) So ARM-D
+	// asserts the D2 OBSERVABLE deterministically on the FIRST partial block via
+	// bigblock_first_partial_prev_armed, with STOP_AFTER_FIRST_BLOCK=1 (fast, no flaky
+	// post-partial loop), using the MERCURY_BIGBLOCK_DEFEAT_D2 reproducer for fail-before:
+	//   FAIL-BEFORE (DEFEAT_D2=1, restores the pre-fix stranding): carve routes PARTIAL clean=K-1
+	//     (oracle still 8) but the K-1 clean slots are left RECEIVED-and-forgotten in messages_rx[],
+	//     the RSP never ACK-GATEs the partial, no SACK is sent, prev is NOT armed -> prev_armed=0.
+	//   PASS-AFTER (DEFEAT_D2=0, the fix): the carve routes the partial into the audited ACK-GATE
+	//     (connection_status=ACKNOWLEDGING_DATA) which dispatches the SACK_RSP + arms
+	//     rsp_prev_batch_active from the RECEIVED slots -> prev_armed=1 (INV-B restored).
+	const int CORRUPT_CW = 3;            // one demoted codeword (interior, gap before tail slots)
+	set_env("MERCURY_BIGBLOCK_NOCRC",          "0");   // production: per-cw wire-CRC demote ON
+	set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",     "0");   // §17 block-span window (real window)
+	set_env("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD","0");   // §22 acq-guard active (production)
+	set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "1");   // capture the FIRST partial fast
+	{ char b[8]; snprintf(b,sizeof(b),"%d",CORRUPT_CW); set_env("MERCURY_BIGBLOCK_CORRUPT_CW", b); }
+	{ char b[16]; snprintf(b,sizeof(b),"%d",512/4); set_env("MERCURY_BIGBLOCK_CORRUPT_NBITS", b); } // >= ldpc.N/4 (hook clamps to N/4 default if 0)
+
+	// D-FAIL (DEFEAT_D2=1): pre-fix stranding -> the PARTIAL does NOT arm prev (the D2 bug).
+	set_env("MERCURY_BIGBLOCK_DEFEAT_D2", "1");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1; bigblock_first_partial_prev_armed = -1;
+	int rc_df = test_sim_inproc_2();
+	int  df_clean = bigblock_first_clean, df_K = bigblock_first_K;
+	int  df_armed = bigblock_first_partial_prev_armed;
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-D FAIL-BEFORE (DEFEAT_D2=1, CORRUPT_CW=%d): first_block "
+	       "clean=%d/%d prev_armed=%d (rc=%d) — expect PARTIAL clean=K-1 with prev_armed=0 "
+	       "(K-1 clean slots STRANDED, INV-B violated, the HW 8/8-oracle->0-delivered bug)\n",
+	       CORRUPT_CW, df_clean, df_K, df_armed, rc_df);
+	bool df_fail = (df_K == 8) && (df_clean == df_K - 1) && (df_armed == 0);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-D fail-before reproduces the stranding (PARTIAL, "
+	       "prev NOT armed)\n", df_fail ? "PASS" : "FAIL");
+	if(!df_fail) failed++;
+
+	// D-PASS (DEFEAT_D2=0, the fix): the PARTIAL routes to the audited ACK-GATE -> arms prev.
+	set_env("MERCURY_BIGBLOCK_DEFEAT_D2", "0");
+	sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+	bigblock_first_clean = -1; bigblock_first_K = -1; bigblock_first_partial_prev_armed = -1;
+	int rc_dp = test_sim_inproc_2();
+	int  dp_clean = bigblock_first_clean, dp_K = bigblock_first_K;
+	int  dp_armed = bigblock_first_partial_prev_armed;
+	printf("[TEST-BIGBLOCK-MULTICW] ARM-D PASS-AFTER (DEFEAT_D2=0, CORRUPT_CW=%d): first_block "
+	       "clean=%d/%d prev_armed=%d (rc=%d) — expect PARTIAL clean=K-1 with prev_armed=1 "
+	       "(routed to the audited ACK-GATE -> SACK dispatched + prev armed, INV-B restored)\n",
+	       CORRUPT_CW, dp_clean, dp_K, dp_armed, rc_dp);
+	bool dp_pass = (dp_K == 8) && (dp_clean == dp_K - 1) && (dp_armed == 1);
+	printf("[TEST-BIGBLOCK-MULTICW] %s: ARM-D pass-after — the D2 fix ARMS the prev-batch delivery "
+	       "for the partial block (SAME binary, only DEFEAT_D2 differs)\n", dp_pass ? "PASS" : "FAIL");
+	if(!dp_pass) failed++;
+
 	restore_env();
 
 	printf("[TEST-BIGBLOCK-MULTICW] %s (%d failure%s)  [A: clean=%d/%d byteok | B: corrupt-repro "
-	       "(§17 trunc) | B2: §22 wait-for-tail byteok | C: window-fix byteok]\n",
+	       "(§17 trunc) | B2: §22 wait-for-tail byteok | C: window-fix byteok | D: per-cw PARTIAL "
+	       "D2 delivery-arming fail-before(strand)->pass-after(prev-armed)]\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed,
 	       failed == 1 ? "" : "s", a_clean, a_K);
 	fflush(stdout);

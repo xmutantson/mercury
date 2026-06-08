@@ -1396,6 +1396,15 @@ public:
   // asserts it stays healthy (collapses toward 0 when an un-tracked CFO/SFO ramps a rotating
   // phasor across the 133-symbol block — the off-bench reproduction of the HW [RXACQ] defect).
   static double bigblock_first_meanh;
+  // D2 DELIVERY-ARMING capture (fix/bigblock-chanest, fact-doc bigblock-delivery-handoff §3/§7):
+  // for the FIRST big-block carved this run, whether the carve ARMED the prev-batch delivery
+  // machinery on a PARTIAL outcome. -1 = no partial block carved yet (or clean); 0 = PARTIAL
+  // but prev NOT armed (the D2 BUG: clean slots stranded -> INV-B violated); 1 = PARTIAL and
+  // the responder was routed to the audited ACK-GATE which arms rsp_prev_batch_active + sends
+  // the SACK (the D2 FIX). test_sim_inproc_bigblock_multicw ARM-D reads this to assert the
+  // delivery-arming fail-before (0) -> pass-after (1) deterministically on the FIRST block,
+  // without depending on the (separate, flaky) D3 selective-repeat recovery transport.
+  static int bigblock_first_partial_prev_armed;
 
   // GENUINE big-block channel-estimation regression: drive the 2-instance SIM_INPROC CFG16
   // big-block decode through the REAL ref==NULL path with a CFO/SFO-impaired channel; assert
