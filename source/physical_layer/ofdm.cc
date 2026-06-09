@@ -168,6 +168,12 @@ void cl_ofdm::init()
 	ffted_data=CNEW(std::complex<double>, Nfft, "ofdm.ffted_data");
 	estimated_channel=CNEW(struct st_channel_complex, this->Nsymb*this->Nc, "ofdm.estimated_channel");
 	estimated_channel_without_amplitude_restoration=CNEW(struct st_channel_complex, this->Nsymb*this->Nc, "ofdm.est_channel_noamp");
+
+	// L3 D1 — inter-frame estimate carry ring (separate from estimated_channel).
+	carry_pilot_value    = CNEW(std::complex<double>, this->Nc, "ofdm.carry_pilot_value");
+	carry_pilot_age_rows = CNEW(double, this->Nc, "ofdm.carry_pilot_age_rows");
+	carry_pilot_valid    = CNEW(bool, this->Nc, "ofdm.carry_pilot_valid");
+	reset_estimate_carry();
 	ofdm_preamble = CNEW(struct st_carrier, this->preamble_configurator.Nsymb*this->Nc, "ofdm.ofdm_preamble");
 	passband_start_sample=0;
 
@@ -227,6 +233,10 @@ void cl_ofdm::deinit()
 	CDELETE(ffted_data);
 	CDELETE(estimated_channel);
 	CDELETE(estimated_channel_without_amplitude_restoration);
+	CDELETE(carry_pilot_value);          // L3 D1 carry ring
+	CDELETE(carry_pilot_age_rows);
+	CDELETE(carry_pilot_valid);
+	carry_estimate_valid=false;
 	if(p2b_l_data!=NULL){delete[] p2b_l_data; p2b_l_data=NULL;}
 	if(p2b_data_filtered!=NULL){delete[] p2b_data_filtered; p2b_data_filtered=NULL;}
 	p2b_buffer_size=0;
@@ -1641,6 +1651,20 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 	// noise (smoother absorbs noise into H; downstream consumers use the
 	// smoothed H but expect noise_variance_estimate to track raw pilot SNR).
 	smooth_channel_estimate_dft();
+
+	// L3 D1 — inter-frame estimate carry: rewrite each column's LEADING data rows
+	// (before this frame's first pilot) by interpolating from the carried prior-frame
+	// anchor toward this frame's first pilot. Applied AFTER the DFT smoother so the
+	// carried values are NOT spread across carriers by the smoother's IFFT/FFT (a
+	// pre-smoother carry injected a row discontinuity that the smoother leaked into
+	// all carriers, harming the high-order tier). Carry is a SEPARATE ring — never
+	// MEASURED — so mean_H / SKIP-H / interpolator anchors are unchanged.
+	// fact-documents/data-flow-channel-estimate.md §8.
+	apply_estimate_carry();
+
+	// Snapshot this frame's last-pilot-row H per column for the NEXT frame's carry.
+	// Done AFTER smoothing so the anchor equals the H the equalizer used (INV-3).
+	capture_carry_from_estimate();
 /*
  * Ref: R. Lucky, “The adaptive equalizer,” IEEE Signal Processing Magazine, vol. 23, no. 3, pp. 104–107, 2006.
  */
@@ -1868,9 +1892,100 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 			(crosspilot_nv > 0 ? noise_variance_estimate / crosspilot_nv : -1.0));
 		fflush(stdout);
 	}
+
+	// L3 D1 — inter-frame estimate carry (LS path). Applied AFTER the smoother AND
+	// after the pilot-residual nv estimate (which reads pilot bins the carry never
+	// touches), so neither is perturbed. See ZF path + §8 for rationale.
+	apply_estimate_carry();
+
+	// L3 D1 — snapshot for the NEXT frame's leading-row carry (LS path). §8.4.
+	capture_carry_from_estimate();
 /*
  * Ref J. . -J. van de Beek, O. Edfors, M. Sandell, S. K. Wilson and P. O. Borjesson, "On channel estimation in OFDM systems," 1995 IEEE 45th Vehicular Technology Conference. Countdown to the Wireless Twenty-First Century, Chicago, IL, USA, 1995, pp. 815-819 vol.2, doi: 10.1109/VETEC.1995.504981.
  */
+}
+
+// ============================================================================
+// L3 D1 — inter-frame channel-estimate carry (the keystone).
+// fact-documents/data-flow-channel-estimate.md §8. A SEPARATE persistent ring of
+// the previous frame's last-pilot-row H per column; the time-axis interpolator
+// uses it to fill the leading data rows so the coherent estimate tracks the fade
+// across the frame boundary instead of restarting blind each frame.
+// ============================================================================
+
+void cl_ofdm::reset_estimate_carry()
+{
+	carry_estimate_valid = false;
+	if(carry_pilot_valid != NULL)
+	{
+		for(int j=0;j<Nc;j++)
+		{
+			carry_pilot_valid[j]    = false;
+			carry_pilot_value[j]    = std::complex<double>(1.0, 0.0);
+			carry_pilot_age_rows[j] = -1.0;
+		}
+	}
+}
+
+// Apply the carried prior-frame anchors to each column's LEADING rows. No-op when
+// the carry is cold (first frame after a reset/config switch). Honors INV-1
+// (recent frame dominates: only rows before this frame's first pilot are touched,
+// interpolated TOWARD the current pilot) and INV-2 (the carry never becomes a
+// MEASURED bin — apply_carry_leading_rows leaves status INTERPOLATED).
+void cl_ofdm::apply_estimate_carry()
+{
+	// L3 D1 carry default-OFF on the PER-FRAME decode path. MEASURED RESULT
+	// (fact-documents/data-flow-channel-estimate.md §8.8, D1_RESULT.json): on the
+	// per-frame ARQ path the inter-frame carry does NOT flip the Watterson wall
+	// (each frame is ALREADY independently re-estimated at Dy=3, so the wall is an
+	// INTRA-frame Doppler-decorrelation, not the big-block frozen-estimate the carry
+	// addresses) and it HARMS the margin-sensitive 16-QAM tier (GOOD p 0.15->0.0).
+	// So the active carry is gated OFF by default to guarantee ZERO production
+	// regression; the mechanism is retained (validated A/B, big-block path is its
+	// real target). Enable for experiments via L3_CARRY=1. Honors CLAUDE.md §3 (no
+	// untested/regressing fix shipped) + "never mask a failure" (the negative result
+	// is recorded, not buried).
+	static int carry_on = -1;
+	if(carry_on < 0) carry_on = (getenv("L3_CARRY") != NULL) ? 1 : 0;
+	if(!carry_on) return;
+	if(!carry_estimate_valid || carry_pilot_valid==NULL) return;
+	for(int j=0;j<Nc;j++)
+	{
+		if(carry_pilot_valid[j])
+			apply_carry_leading_rows(estimated_channel, Nc, Nsymb, j,
+			                         carry_pilot_value[j], carry_pilot_age_rows[j]);
+	}
+}
+
+// Snapshot this frame's LAST measured pilot row per column into the carry ring for
+// the next frame. The anchor's position is expressed in the NEXT frame's coordinate
+// as a negative row index (r_last - Nsymb), a first-order contiguous-frame anchor.
+void cl_ofdm::capture_carry_from_estimate()
+{
+	if(carry_pilot_valid==NULL) return;
+	for(int j=0;j<Nc;j++)
+	{
+		int last_meas = -1;
+		for(int i=Nsymb-1;i>=0;i--)
+		{
+			if((estimated_channel+i*Nc+j)->status==MEASURED)
+			{
+				last_meas=i;
+				break;
+			}
+		}
+		if(last_meas>=0)
+		{
+			carry_pilot_value[j]    = (estimated_channel+last_meas*Nc+j)->value;
+			carry_pilot_age_rows[j] = (double)(last_meas - Nsymb); // negative: prior frame
+			carry_pilot_valid[j]    = true;
+		}
+		else
+		{
+			carry_pilot_valid[j] = false;
+		}
+	}
+	carry_estimate_valid = true;
 }
 
 void cl_ofdm::CPE_correction(std::complex<double>* in)

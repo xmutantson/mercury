@@ -34,6 +34,17 @@ std::complex <double> interpolate_bilinear(std::complex <double> a,double a_x,do
 void interpolate_linear_col(st_channel_real* estimated_channel, int max_col, int max_row, int col);
 void interpolate_linear_col(st_channel_complex* estimated_channel, int max_col, int max_row, int col);
 
+// L3 D1 — inter-frame estimate carry. After interpolate_linear_col() has filled a
+// column, REWRITE only the LEADING rows (rows 0..first_measured-1) so they are
+// interpolated between a carried prior-frame anchor (carry_value at row carry_pos<0)
+// and this frame's first MEASURED row, instead of the legacy back-extrapolation. The
+// carry value/position come from a SEPARATE ring (cl_ofdm::carry_*), never the
+// current lattice — so MEASURED-bin semantics (interpolator anchors, mean_H) are
+// untouched. No-op if there is no MEASURED row in this column or the carry is invalid.
+// See fact-documents/data-flow-channel-estimate.md §8.3.
+void apply_carry_leading_rows(st_channel_complex* estimated_channel, int max_col, int max_row, int col,
+                              std::complex<double> carry_value, double carry_pos);
+
 void interpolate_bilinear_matrix(st_channel_real* estimated_channel, int max_col, int max_row, int col1,int col2, int row1, int row2);
 void interpolate_bilinear_matrix(st_channel_complex* estimated_channel, int max_col, int max_row, int col1,int col2, int row1, int row2);
 

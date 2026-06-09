@@ -67,6 +67,11 @@ cl_telecom_system::cl_telecom_system()
 	fsel_delay            = 128;   // second-ray delay in passband samples (~Nfft/8 @ interp=4, within GI)
 	ber_single_esn0       = -999.0f; // fix/cfg16-nv-restore: <=-900 = normal full sweep
 	ber_frames_override   = 0;     // 0 = use sweep default frame count
+	// L3 PHASE 1 (D6): Watterson BER harness, OFF by default (test-only).
+	watterson_test_enabled = false;
+	watterson_fd_hz        = 1.0;    // POOR default; set per-profile by the sweep
+	watterson_dtau_s       = 2.0e-3; // POOR default; set per-profile by the sweep
+	watterson_state_       = nullptr;
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
@@ -506,6 +511,18 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			}
 		}
 
+		// L3 PHASE 1 (D6): optional time-varying 2-tap Watterson fade, injected
+		// onto the real passband BEFORE AWGN (same placement as the static
+		// fsel_test 2-ray). State PERSISTS across frames (apply_watterson_passband
+		// holds the fade in watterson_state_) so the channel decorrelates over the
+		// codeword sequence — the condition that reproduces the block wall.
+		// l3-coherent-phy-design.md §5 D6 / §6 Layer 1. Off by default.
+		if(watterson_test_enabled && M != MOD_MFSK)
+		{
+			int nSamp = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb)) * this->frequency_interpolation_rate;
+			apply_watterson_passband(data_container.passband_data, nSamp);
+		}
+
 		awgn_channel.apply_with_delay(data_container.passband_data,data_container.passband_delayed_data,sigma,(data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*this->frequency_interpolation_rate,((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate);
 		if(M == MOD_MFSK)
 		{
@@ -544,6 +561,314 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 		lerror_rate.check(data_container.data_bit,data_container.hd_decoded_data_bit,nReal_data-outer_code_reserved_bits);
 	}
 	return lerror_rate;
+}
+
+// =====================================================================
+// L3 PHASE 1 (D6) — in-process Watterson BER harness.
+// l3-coherent-phy-design.md §5 D6 / §6 Layer 1. TEST-ONLY: only reached
+// when watterson_test_enabled (set by --test-watterson-ber); production
+// decode/estimate path untouched.
+//
+// The fading model is a faithful C++ port of the relay's two-equal-tap
+// Gaussian-Doppler Watterson channel (tools/sim_channel_relay.py:
+// DopplerTap / class Channel.process, ITU-R F.1487 mpg/mpm/mpp):
+//   1. real passband -> analytic (complex baseband) via a causal Hilbert FIR
+//      (Type-III, Hann-windowed) with persistent history (continuous across
+//      frames);
+//   2. y = g0*z + g1*z_delayed, each tap a unit-power complex Gaussian
+//      process with a Gaussian-shaped Doppler PSD (1st-order IIR,
+//      alpha=exp(-2*pi*fd*dt)), coarse-updated and linearly interpolated;
+//      two equal taps scaled by 1/sqrt(2) so mean |h|^2 = 1;
+//   3. back to the real passband (Re{y}).
+// All tap/Hilbert/delay-line state PERSISTS across frames within a sweep
+// point (held in cl_watterson_channel via watterson_state_) so the channel
+// DECORRELATES over the codeword sequence — the condition that reproduces
+// the block wall (per-cw p 0.97->0.81 at POOR). dt/alpha are computed from
+// THIS system's sampling_frequency so Doppler is physically correct at any
+// interpolation rate.
+// =====================================================================
+namespace {
+
+// Type-III FIR Hilbert transformer (odd length, antisymmetric), Hann-windowed.
+// Matches sim_channel_relay.py::_hilbert_fir. Returns the (numtaps-1)/2 group
+// delay via 'delay_out'.
+static void l3_hilbert_fir(int numtaps, std::vector<double>& h, int& delay_out)
+{
+	if(numtaps % 2 == 0) numtaps += 1;
+	int m = (numtaps - 1) / 2;
+	h.assign(numtaps, 0.0);
+	for(int k = 0; k < numtaps; k++)
+	{
+		int n = k - m;
+		if(n != 0 && (n % 2 != 0))
+			h[k] = 2.0 / (M_PI * (double)n);
+		// Hann window: 0.5 - 0.5*cos(2*pi*k/(N-1))
+		double w = 0.5 - 0.5 * cos(2.0 * M_PI * (double)k / (double)(numtaps - 1));
+		h[k] *= w;
+	}
+	delay_out = m;
+}
+
+// One unit-power complex Gaussian Doppler tap (1st-order IIR on white
+// innovations), coarse-updated and linearly interpolated. Mirrors
+// sim_channel_relay.py::DopplerTap.
+struct l3_doppler_tap
+{
+	double fd;
+	int    update;        // coarse update span (samples)
+	double alpha, inno;
+	std::complex<double> g_prev, g_next;
+	int    pos;
+
+	// deterministic per-tap RNG (splitmix64 -> Box-Muller), seeded per tap so
+	// the sweep is reproducible and the two taps are independent.
+	uint64_t s;
+	bool   have_spare; double spare;
+
+	double u01()
+	{
+		s += 0x9E3779B97F4A7C15ULL;
+		uint64_t z = s;
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+		z = z ^ (z >> 31);
+		return (double)(z >> 11) * (1.0 / 9007199254740992.0);
+	}
+	double gauss()
+	{
+		if(have_spare) { have_spare = false; return spare; }
+		double u1 = u01(); if(u1 < 1e-15) u1 = 1e-15;
+		double u2 = u01();
+		double mag = sqrt(-2.0 * log(u1));
+		spare = mag * sin(2.0 * M_PI * u2);
+		have_spare = true;
+		return mag * cos(2.0 * M_PI * u2);
+	}
+	std::complex<double> white()
+	{
+		// unit-variance complex (var(re)=var(im)=1/2)
+		double r = gauss(), i = gauss();
+		return std::complex<double>(r, i) / sqrt(2.0);
+	}
+
+	void init(double fd_hz, double fs, uint64_t seed)
+	{
+		fd = fd_hz;
+		s = (seed * 0x9E3779B97F4A7C15ULL);
+		have_spare = false; spare = 0.0;
+		if(fd_hz > 0.0)
+			update = (int)std::max(1.0, fs / (fd_hz * 64.0));   // >> Nyquist for fd
+		else
+			update = 4096;
+		double dt = (double)update / fs;
+		if(fd_hz > 0.0) alpha = exp(-2.0 * M_PI * fd_hz * dt);
+		else            alpha = 1.0;
+		inno = sqrt(std::max(0.0, 1.0 - alpha * alpha));
+		g_prev = white();
+		g_next = alpha * g_prev + inno * white();
+		pos = 0;
+	}
+
+	void advance(std::complex<double>* out, int n)
+	{
+		int k = 0;
+		while(k < n)
+		{
+			if(fd <= 0.0)
+			{
+				for(int j = k; j < n; j++) out[j] = g_prev;
+				pos = (pos + (n - k)) % update;
+				break;
+			}
+			int span = update - pos;
+			int take = std::min(span, n - k);
+			for(int j = 0; j < take; j++)
+			{
+				double frac = ((double)(pos + j) + 0.5) / (double)update;
+				out[k + j] = (1.0 - frac) * g_prev + frac * g_next;
+			}
+			k += take;
+			pos += take;
+			if(pos >= update)
+			{
+				pos = 0;
+				g_prev = g_next;
+				g_next = alpha * g_prev + inno * white();
+			}
+		}
+	}
+};
+
+} // namespace
+
+// Persistent 2-tap Watterson channel state (one analytic filter + two taps +
+// a delay line), carried across frames within a sweep point.
+struct cl_watterson_channel
+{
+	std::vector<double> h;       // Hilbert FIR
+	int    hdelay;
+	std::vector<double> hist;    // FIR input history (continuous across calls)
+	l3_doppler_tap tap0, tap1;
+	int    dtau_samp;
+	std::vector<std::complex<double> > delay_buf; // second-tap delay line
+	double tap_scale;
+
+	void init(double fd_hz, double dtau_s, double fs, uint64_t seed)
+	{
+		l3_hilbert_fir(129, h, hdelay);
+		hist.assign((int)h.size() - 1, 0.0);
+		dtau_samp = std::max(1, (int)llround(dtau_s * fs));
+		delay_buf.assign(dtau_samp, std::complex<double>(0.0, 0.0));
+		tap0.init(fd_hz, fs, seed * 2654435761ULL + 1ULL);
+		tap1.init(fd_hz, fs, seed * 40503ULL + 7ULL);
+		tap_scale = 1.0 / sqrt(2.0);
+	}
+
+	// Streaming real->analytic conversion (overlap-save with persistent hist),
+	// matching sim_channel_relay.py::AnalyticFilter.process.
+	void analytic(const double* x, int n, std::complex<double>* y)
+	{
+		int ntaps = (int)h.size();
+		// buf = hist (ntaps-1) + x (n)
+		std::vector<double> buf(hist.size() + (size_t)n);
+		for(size_t i = 0; i < hist.size(); i++) buf[i] = hist[i];
+		for(int i = 0; i < n; i++) buf[hist.size() + i] = x[i];
+		int blen = (int)buf.size();
+		// Q = conv(buf, h)[ntaps-1 : ntaps-1+n]  (the 'full'-conv region aligned
+		// to the current chunk). For each output sample m (0..n-1):
+		//   qfull index = (ntaps-1) + m  =  sum_j h[j]*buf[(ntaps-1)+m - j]
+		for(int m = 0; m < n; m++)
+		{
+			double q = 0.0;
+			int base = (ntaps - 1) + m;
+			for(int j = 0; j < ntaps; j++)
+			{
+				int bi = base - j;
+				if(bi >= 0 && bi < blen) q += h[j] * buf[bi];
+			}
+			// I = x delayed by hdelay, aligned to Q's group delay:
+			//   i_chunk index in buf = (blen - hdelay - n) + m
+			int ii = (blen - hdelay - n) + m;
+			double iq = (ii >= 0 && ii < blen) ? buf[ii] : 0.0;
+			y[m] = std::complex<double>(iq, q);
+		}
+		// update history = last (ntaps-1) samples of buf
+		for(int i = 0; i < ntaps - 1; i++) hist[i] = buf[blen - (ntaps - 1) + i];
+	}
+
+	// Apply the 2-tap fade in place on a real passband buffer.
+	void process(double* buf, int n)
+	{
+		std::vector<std::complex<double> > z((size_t)n), zd((size_t)n);
+		std::vector<std::complex<double> > g0((size_t)n), g1((size_t)n);
+		analytic(buf, n, z.data());
+		tap0.advance(g0.data(), n);
+		tap1.advance(g1.data(), n);
+		int d = dtau_samp;
+		if(n >= d)
+		{
+			for(int i = 0; i < d; i++) zd[i] = delay_buf[i];
+			for(int i = d; i < n; i++) zd[i] = z[i - d];
+			for(int i = 0; i < d; i++) delay_buf[i] = z[n - d + i];
+		}
+		else
+		{
+			// chunk shorter than the delay: shift the delay line
+			for(int i = 0; i < n; i++) zd[i] = delay_buf[i];
+			std::vector<std::complex<double> > nb(delay_buf.begin() + n, delay_buf.end());
+			for(int i = 0; i < n; i++) nb.push_back(z[i]);
+			// keep the last d
+			int start = (int)nb.size() - d;
+			for(int i = 0; i < d; i++) delay_buf[i] = nb[start + i];
+		}
+		for(int i = 0; i < n; i++)
+		{
+			std::complex<double> y = tap_scale * g0[i] * z[i] + tap_scale * g1[i] * zd[i];
+			buf[i] = y.real();    // back to real passband
+		}
+	}
+};
+
+void cl_telecom_system::reset_watterson_state()
+{
+	if(watterson_state_)
+	{
+		delete static_cast<cl_watterson_channel*>(watterson_state_);
+		watterson_state_ = nullptr;
+	}
+}
+
+void cl_telecom_system::apply_watterson_passband(double* buf, int nSamp)
+{
+	if(nSamp <= 0) return;
+	cl_watterson_channel* ch = static_cast<cl_watterson_channel*>(watterson_state_);
+	if(ch == nullptr)
+	{
+		ch = new cl_watterson_channel();
+		// Seed from fd/dtau so each profile is reproducible but distinct.
+		uint64_t seed = (uint64_t)(watterson_fd_hz * 1000.0 + 1.0) * 1000003ULL
+		              + (uint64_t)(watterson_dtau_s * 1e6 + 1.0);
+		ch->init(watterson_fd_hz, watterson_dtau_s, sampling_frequency, seed);
+		watterson_state_ = ch;
+	}
+	ch->process(buf, nSamp);
+}
+
+// Per-config x per-profile Watterson FER sweep (D6 / §6 Layer 1). For each
+// requested config, runs GOOD/MODERATE/POOR profiles across the Es/N0 list and
+// prints, per point: per-cw decode rate p=1-FER, coded FER, uncoded BER, plus
+// the realized fade params. Returns 0 if at least one frame decoded anywhere
+// (runs-ok smoke); 1 only on an internal fault.
+int cl_telecom_system::watterson_ber_sweep(const int* configs, int nConfigs,
+                                           const float* esn0_list, int nEsN0,
+                                           int frames_per_point)
+{
+	struct l3_profile { const char* name; double dtau_s; double fd_hz; };
+	// ITU-R F.1487 / ARSFI mid-latitude (== sim_channel_relay.py PROFILES).
+	const l3_profile profiles[3] = {
+		{ "GOOD",     0.5e-3, 0.1 },   // mpg
+		{ "MODERATE", 1.0e-3, 0.5 },   // mpm
+		{ "POOR",     2.0e-3, 1.0 },   // mpp  (binding case, fd=1 Hz)
+	};
+
+	int total_frames_decoded = 0;
+	printf("# L3 PHASE 1 (D6) Watterson BER harness — per-codeword decode under fade\n");
+	printf("# columns: config profile fd_hz dtau_ms EsN0_dB p(=1-FER) coded_FER uncoded_BER frames\n");
+
+	for(int ci = 0; ci < nConfigs; ci++)
+	{
+		int cfg = configs[ci];
+		load_configuration(cfg);
+		printf("# --- config %d : M=%d  rbc=%.1f bps  Shannon=%.2f dB ---\n",
+		       cfg, (int)M, rbc, Shannon_limit);
+		for(int pi = 0; pi < 3; pi++)
+		{
+			// configure the persistent fade for this profile and reset state
+			watterson_test_enabled = true;
+			watterson_fd_hz  = profiles[pi].fd_hz;
+			watterson_dtau_s = profiles[pi].dtau_s;
+			for(int ei = 0; ei < nEsN0; ei++)
+			{
+				reset_watterson_state();           // fresh, decorrelating fade per point
+				ofdm.reset_estimate_carry();        // L3 D1: cold carry per point (no leak across EsN0)
+				float esn0 = esn0_list[ei];
+				cl_error_rate er = passband_test_EsN0(esn0, frames_per_point);
+				double fer = (er.Frames_total > 0)
+				             ? (er.Error_frames_total / er.Frames_total) : 1.0;
+				double p   = 1.0 - fer;
+				total_frames_decoded += (int)(er.Frames_total - er.Error_frames_total);
+				printf("%d %s %.2f %.2f %.2f %.4f %.4f %.6f %d\n",
+				       cfg, profiles[pi].name, profiles[pi].fd_hz,
+				       profiles[pi].dtau_s * 1000.0, esn0, p, fer, er.BER,
+				       (int)er.Frames_total);
+				fflush(stdout);
+			}
+		}
+	}
+	watterson_test_enabled = false;
+	reset_watterson_state();
+	printf("# done. total frames decoded (any profile/point): %d\n", total_frames_decoded);
+	return (total_frames_decoded > 0) ? 0 : 1;
 }
 
 int cl_telecom_system::get_frame_size_bytes()

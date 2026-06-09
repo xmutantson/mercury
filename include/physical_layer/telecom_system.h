@@ -331,6 +331,38 @@ public:
 	float ber_single_esn0;
 	int   ber_frames_override;
 
+	// ---- L3 PHASE 1 (D6): in-process Watterson BER harness ----------------
+	// l3-coherent-phy-design.md §5 D6 / §6 Layer 1. ADDITIVE test-only hook.
+	// When watterson_test_enabled, passband_test_EsN0() injects a time-varying
+	// 2-equal-tap Gaussian-Doppler (ITU-R F.1487) fading channel onto the TX
+	// passband BEFORE AWGN (same site as the static fsel_test 2-ray), then the
+	// REAL shipping sparse-2D estimator + MMSE-erasure + CSI-LLR + LDPC decode
+	// it. The fade STATE PERSISTS across frames within a sweep point so the
+	// channel decorrelates over the codeword sequence (reproduces the block
+	// wall: per-cw p 0.97->0.81 at POOR). Production paths never set these;
+	// passband_test_EsN0 is a test-only function. Mirrors the relay model in
+	// tools/sim_channel_relay.py (DopplerTap / Channel.process). Off by default.
+	bool   watterson_test_enabled;   // gate; default false
+	double watterson_fd_hz;          // Doppler spread fd (Hz, 2-sigma Gaussian)
+	double watterson_dtau_s;         // delay spread of the second tap (s)
+	// Persistent fade state (carried frame-to-frame within one sweep point so
+	// the channel evolves continuously). Reset by reset_watterson_state().
+	void   reset_watterson_state();
+	// The per-config x per-profile Watterson FER sweep entry point (D6 / §6
+	// Layer 1). Loops GOOD/MODERATE/POOR x the QAM ladder (configs argv-set),
+	// across an Es/N0 list, reporting per-cw decode rate p=1-FER, coded FER,
+	// and uncoded BER. Invoked by main.cc --test-watterson-ber; returns 0 on
+	// the runs-ok smoke (any frame decoded), nonzero only on internal fault.
+	int    watterson_ber_sweep(const int* configs, int nConfigs,
+	                           const float* esn0_list, int nEsN0,
+	                           int frames_per_point);
+	// Opaque persistent fade state (cl_watterson_channel; defined in the .cc to
+	// keep <complex>/<vector> out of the header). NULL until first use.
+	void*  watterson_state_;
+	// Apply the persistent 2-tap Watterson fade to a real passband buffer
+	// in-place (test-only; called from passband_test_EsN0 when enabled).
+	void   apply_watterson_passband(double* buf, int nSamp);
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.

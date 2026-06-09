@@ -245,6 +245,29 @@ public:
 	// showed FIR at 92% CPU; this drops the FIR portion ~M× on hot paths.
 	void passband_to_baseband_decimated(double* in, int in_size, std::complex <double>* out, double sampling_frequency, double carrier_frequency, double carrier_amplitude, int M, cl_FIR* filter, int sample_offset=0);
 	struct st_channel_complex * estimated_channel, *estimated_channel_without_amplitude_restoration;
+
+	// L3 D1 — inter-frame channel-estimate CARRY (the keystone).
+	// l3-coherent-phy-design.md §5 D1 / fact-documents/data-flow-channel-estimate.md §8.
+	// A SEPARATE persistent pilot ring (NOT stamped into estimated_channel, NOT
+	// MEASURED — honors INV-2) holding the PREVIOUS frame's LAST measured pilot H
+	// per column + that anchor's time position. The time-axis interpolator
+	// (interpolate_linear_col) uses it ONLY to fill the leading data rows (rows
+	// before this frame's first pilot) by interpolating from the carried prior-frame
+	// anchor toward this frame's first pilot — so the coherent estimate TRACKS the
+	// fade across the frame boundary instead of restarting blind each frame.
+	// Reset on ctor/deinit/config-switch so a different geometry never carries stale H.
+	std::complex<double>* carry_pilot_value;   // [Nc] prev-frame last-pilot H per column
+	double*               carry_pilot_age_rows; // [Nc] anchor row in THIS frame's coord (<0)
+	bool*                 carry_pilot_valid;    // [Nc] per-column carry present
+	bool                  carry_estimate_valid; // global gate (false until 1 frame done)
+	// After a per-frame estimate completes (post DFT-smooth), snapshot the last
+	// MEASURED pilot row per column into the carry ring for the NEXT frame.
+	void capture_carry_from_estimate();
+	// Apply the carried anchors to the current frame's leading rows (called inside
+	// the ZF/LS estimator AFTER interpolation, BEFORE the DFT smoother).
+	void apply_estimate_carry();
+	void reset_estimate_carry();
+
 	int Nfft,Nc,Nsymb;
 	float gi;
 	struct st_carrier* ofdm_frame;

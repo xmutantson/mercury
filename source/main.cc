@@ -379,6 +379,52 @@ int main(int argc, char *argv[])
             int failed = run_preamble_sched_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-watterson-ber[=c1,c2,...] : L3 PHASE 1 (D6). In-process
+        // Watterson (ITU-R F.1487 GOOD/MODERATE/POOR) per-codeword decode-rate
+        // BER harness over the QAM ladder, through the REAL shipping sparse-2D
+        // estimator + MMSE-erasure + CSI-LLR + LDPC (NOT genie CSI). Additive,
+        // test-only — uses passband_test_EsN0 with the persistent fade injector.
+        // Optional config list (default 10,12,15,16) and --watterson-frames=N /
+        // --watterson-esn0=lo,hi,step. See l3-coherent-phy-design.md §5 D6 / §6.
+        if (strncmp(argv[i], "--test-watterson-ber", 20) == 0) {
+            int configs[NUMBER_OF_CONFIGS];
+            int nConfigs = 0;
+            const char* eq = strchr(argv[i], '=');
+            if (eq && *(eq + 1)) {
+                char buf[256]; strncpy(buf, eq + 1, sizeof(buf) - 1); buf[sizeof(buf)-1]=0;
+                char* tok = strtok(buf, ",");
+                while (tok && nConfigs < NUMBER_OF_CONFIGS) {
+                    configs[nConfigs++] = atoi(tok); tok = strtok(NULL, ",");
+                }
+            }
+            if (nConfigs == 0) {
+                // default = the coherent QAM ladder (CONFIG_10/12/15/16)
+                configs[nConfigs++] = CONFIG_10; // 16-QAM-class lower
+                configs[nConfigs++] = 12;
+                configs[nConfigs++] = CONFIG_15; // 16-QAM
+                configs[nConfigs++] = CONFIG_16; // 32-QAM
+            }
+            int frames = 40;
+            float esn0_lo = 4.0f, esn0_hi = 22.0f, esn0_step = 3.0f;
+            for (int j = 1; j < argc; j++) {
+                if (strncmp(argv[j], "--watterson-frames=", 19) == 0)
+                    frames = atoi(argv[j] + 19);
+                else if (strncmp(argv[j], "--watterson-esn0=", 17) == 0) {
+                    char b[128]; strncpy(b, argv[j] + 17, sizeof(b)-1); b[sizeof(b)-1]=0;
+                    char* t = strtok(b, ","); if (t) esn0_lo = (float)atof(t);
+                    t = strtok(NULL, ",");   if (t) esn0_hi = (float)atof(t);
+                    t = strtok(NULL, ",");   if (t) esn0_step = (float)atof(t);
+                }
+            }
+            if (frames < 1) frames = 1;
+            if (esn0_step <= 0.0f) esn0_step = 1.0f;
+            float esn0_list[64]; int nEsN0 = 0;
+            for (float e = esn0_lo; e <= esn0_hi + 1e-6f && nEsN0 < 64; e += esn0_step)
+                esn0_list[nEsN0++] = e;
+            cl_telecom_system ts;
+            int rc = ts.watterson_ber_sweep(configs, nConfigs, esn0_list, nEsN0, frames);
+            return rc;
+        }
     }
 
     int cpu_nr = -1;

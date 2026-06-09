@@ -253,6 +253,39 @@ void interpolate_linear_col(st_channel_complex* estimated_channel, int max_col, 
 	}
 }
 
+// L3 D1 — inter-frame estimate carry. Rewrite ONLY the leading rows of one column
+// (rows before this frame's first MEASURED pilot row) by interpolating between the
+// carried prior-frame anchor (carry_value at the negative row carry_pos) and this
+// frame's first measured row. Leaves interior + trailing rows (the legacy path) and
+// the status field of MEASURED bins untouched. fact-documents/data-flow-channel-estimate.md §8.3.
+void apply_carry_leading_rows(st_channel_complex* estimated_channel, int max_col, int max_row, int col,
+                              std::complex<double> carry_value, double carry_pos)
+{
+	// Find this frame's first MEASURED row in the column.
+	int first_meas = -1;
+	for(int i=0;i<max_row;i++)
+	{
+		if(estimated_channel[i*max_col+col].status==MEASURED)
+		{
+			first_meas=i;
+			break;
+		}
+	}
+	if(first_meas<=0) return;          // no leading gap (or no pilot) — nothing to carry into
+	if(carry_pos>=first_meas) return;  // degenerate anchor — keep legacy fill
+
+	std::complex<double> v_first = estimated_channel[first_meas*max_col+col].value;
+	for(int i=0;i<first_meas;i++)
+	{
+		// Track from the prior-frame anchor toward this frame's first pilot (recent
+		// frame dominates: the anchor is in the past at carry_pos<0). Keep status
+		// INTERPOLATED — these were already filled by interpolate_linear_col.
+		estimated_channel[i*max_col+col].value =
+			interpolate_linear(carry_value, carry_pos, v_first, (double)first_meas, (double)i);
+		estimated_channel[i*max_col+col].status = INTERPOLATED;
+	}
+}
+
 void interpolate_bilinear_matrix(st_channel_real* estimated_channel, int max_col, int max_row, int col1,int col2, int row1, int row2)
 {
 	double a,b,c,d;
