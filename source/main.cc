@@ -469,6 +469,7 @@ int main(int argc, char *argv[])
                                         // in-process 2-instance sim (CMD->RSP->ACK->CMD byte-faithful + one-bad-cw
                                         // partial -> selective-repeat completes). One-shot at startup, then exit rc.
     bool test_bigblock_fullpath_cli = false; // --test-bigblock-fullpath: LIVE 2-instance CFG16 big-block transfer
+    bool test_sim_sustain_cli = false; // --test-sim-sustain: OUTER-stepper OFDM big-block no-wedge + clean-carve regression (Phase b)
                                         // through the REAL receive_bigblock+carve+whiten+FIFO deliver path with
                                         // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
@@ -1006,6 +1007,15 @@ int main(int argc, char *argv[])
             // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
             // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
             test_bigblock_fullpath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sim-sustain") == 0)
+        {
+            // STEPPER-CORE REWRITE Phase b durable regression: the OUTER-loop stepper drives a
+            // live ROBUST_0->CFG16 OFDM big-block transfer; asserts the (iii) DATA-path wedge is
+            // gone (ZERO [SIM2-DEADLOCK-BREAK]) + the K=8 block carves clean 8/8. One-shot, exit rc.
+            test_sim_sustain_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2257,6 +2267,18 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_fullpath();
             printf("[FLAG] Bigblock-fullpath test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_sim_sustain_cli) {
+            // STEPPER-CORE REWRITE Phase b durable regression (--test-sim-sustain): OUTER-loop
+            // stepper, live ROBUST_0->CFG16 OFDM big-block transfer; asserts the (iii) data-path
+            // wedge is gone (ZERO [SIM2-DEADLOCK-BREAK]) + clean K=8 carve. One-shot, exit rc.
+            printf("[FLAG] --test-sim-sustain: invoking OUTER-stepper OFDM big-block no-wedge "
+                   "+ clean-carve regression (sim2-stepper-rewrite Phase b)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_sustain();
+            printf("[FLAG] Sim-sustain test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

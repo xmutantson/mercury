@@ -9445,6 +9445,16 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 // inside production code, proving the actual send-path waits are step-pumpable.
 typedef void (*sim_inproc_pump_fn)(void* ctx);
 extern void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx);
+// STEPPER-CORE REWRITE Phase b: sim2_activate records the active instance's modulation
+// so the outer-stepper TX-wait seams pace OFDM data per-symbol but keep the legacy
+// co-routine pump for the MFSK handshake (arq_common.cc §10.4). SIM-internal (not in arq.h).
+extern void arq_set_sim2_active_is_ofdm(bool on);
+// STEPPER-CORE REWRITE Phase b: the drain-ONLY pump the OFDM-data drain_playback_wait spins to
+// egress a big-block play -> wire without bursting it to the RX (§10.4). SIM-internal.
+extern void arq_set_sim_inproc_drain_only_pump(sim_inproc_pump_fn fn);
+// STEPPER-CORE REWRITE Phase b: [SIM2-DEADLOCK-BREAK] floor fire counter (--test-sim-sustain).
+extern void arq_reset_sim2_deadlock_break_count();
+extern long arq_get_sim2_deadlock_break_count();
 
 namespace {
 // Step-pump context: the single-thread stepper's view of the loopback channel.
@@ -10187,6 +10197,28 @@ void sim_inproc_pump_2(void* ctxv)
 	// above (the reply path). Do NOT deliver into the original sender's capture.
 }
 
+// STEPPER-CORE REWRITE Phase b: DRAIN-TO-WIRE-ONLY pump (the OFDM DATA-path drain seam).
+// Under the outer stepper, send_batch's drain_playback_wait must EGRESS the OFDM big-block out
+// of the TX play ring BEFORE the same process_main's post-TX ACK path runs (which
+// clear_buffer(playback_buffer)s any residual -> would DISCARD a block left in play). But it
+// must NOT burst-DELIVER the block to the RX (that is the §8 cadence break + the depth>0
+// reentrancy the rewrite kills). The resolution: drain tx.play -> the in-flight WIRE here
+// (one symbol per call; the wire is 12.288 MB, ~19 blocks, so a single block never saturates
+// it), then let the OUTER loop FEED the wire -> RX one symbol per iter (per-frame decode
+// pacing preserved). This callback ONLY drains tx->wire (no deliver, no decode-drive, no
+// peer-recurse), so play empties deterministically with zero RX-side burst. tx orientation
+// (c->tx / c->wire_t2r) is set by the outer loop's current half-step, so it always drains the
+// instance whose process_main is running.
+void sim_inproc_drain_to_wire_only(void* ctxv)
+{
+	SimInproc2Ctx* c = static_cast<SimInproc2Ctx*>(ctxv);
+	if (c->scratch == nullptr || c->tx == nullptr)
+		return;
+	c->pump_calls++;
+	// Drain exactly one TX symbol (or one idle-fill) into the tx->rx wire. NO deliver.
+	sim2_drain_to_wire(c->tx, c->ch_tx2rx, c->wire_t2r, c);
+}
+
 // ============================================================================
 // OUTER-LOOP DRIVER per-symbol helpers (sim2-stepper-rewrite Phase a).
 //
@@ -10339,6 +10371,11 @@ void sim2_activate(MercuryInstance* m)
 	capture_buffer    = m->audio.cap;
 	playback_buffer   = m->audio.play;
 	capture_prep_mutex = m->audio.mutex;
+	// STEPPER-CORE REWRITE Phase b: tag the active instance's modulation so the
+	// outer-stepper TX-wait seams (drain_playback_wait / ptt_busy_wait / pacing-floor)
+	// pace OFDM data per-symbol but keep the legacy co-routine pump for the MFSK
+	// handshake (arq_common.cc §10.4). No-op outside the outer stepper.
+	arq_set_sim2_active_is_ofdm(is_ofdm_config(m->arq.current_configuration));
 	// gf16ra reconcile: only meaningful if the suffix-FEC path is enabled; both
 	// peers run the same repfact under the no-negotiation invariant, so this is
 	// a no-op idempotent re-apply in the common case (FEC off → not configured).
@@ -10577,6 +10614,12 @@ int cl_arq_controller::test_sim_inproc_2()
 	pump.wire_t2r = wire_a2b;   // initial (overwritten each half-step)
 	pump.wire_r2t = wire_b2a;
 	arq_set_sim_inproc_pump(sim_inproc_pump_2, &pump);
+	// STEPPER-CORE REWRITE Phase b: install the drain-ONLY pump (egress big-block play -> wire
+	// without RX burst) + arm the OUTER-stepper gate so the OFDM-data drain_playback_wait egresses
+	// to the wire (and ptt_busy_wait clock-only), with the outer loop the SOLE RX-feed driver. Only
+	// armed when MERCURY_SIM2_STEPPER=outer; legacy keeps the pump-driven blocking waits.
+	arq_set_sim_inproc_drain_only_pump(sim_inproc_drain_to_wire_only);
+	arq_set_sim_inproc_outer_stepper(use_outer_stepper);
 	check(pump.scratch != nullptr && wire_a2b != nullptr && wire_b2a != nullptr,
 	      "S3 step-pump + wires installed");
 
@@ -10689,6 +10732,20 @@ int cl_arq_controller::test_sim_inproc_2()
 			// delivers the WHOLE wire in one catch-up call, this drains/feeds the
 			// same residual one symbol per inner step until the rings are empty.
 
+			// PHASE b — drain GRANULARITY is the headline of the rewrite. On the OFDM DATA
+			// path the TX big-block was QUEUED by send_batch (drain_playback_wait no-op'd) and
+			// must be drained ONE SYMBOL PER OUTER ITER so (a) OFDM decode sees the §8 per-symbol
+			// cadence and (b) the CMD's ACK poll (process_messages_rx_acks_data) runs BETWEEN
+			// symbols within the receiving_timeout window (a whole-buffer drain jumps the virtual
+			// clock ~1.65 s/block in one iter BEFORE the CMD polls -> polls=0 -> ACK timeout ->
+			// nAcked_data=0 -> re-send bsi=0 forever). On the ROBUST/MFSK HANDSHAKE path the
+			// legacy co-routine pump already drained+delivered everything INTRA-process_main, so
+			// the residual play is empty and the whole-buffer catch-up is a harmless no-op — keep
+			// it (G2 byte-identical). The per-iter quantum is therefore: OFDM active -> ONE
+			// symbol; else -> drain the residual (legacy catch-up). bigblock_one_symbol selects it.
+			const bool ofdm_phase = is_ofdm_config(A->arq.current_configuration)
+			                     || is_ofdm_config(B->arq.current_configuration);
+
 			// --- A's half-step (tx=A, rx=B). The pump (in A's blocking waits) uses
 			//     these ctx fields, so set them exactly as the legacy body did. ---
 			pump.tx = A; pump.rx = B;
@@ -10696,40 +10753,53 @@ int cl_arq_controller::test_sim_inproc_2()
 			pump.wire_t2r = wire_a2b; pump.wire_r2t = wire_b2a;
 			sim2_activate(A);
 			A->arq.process_main();
-			// (1) DRAIN A.play -> ch_a2b -> wire_a2b, one symbol per step, until the
-			//     residual play is drained (matches legacy sim2_drain_to_wire whole-
-			//     buffer catch-up). Idle-fill is NOT done here (only when the play is
-			//     truly empty would legacy idle-fill; the legacy catch-up's idle-fill
-			//     fires once with an empty play — preserved by the trailing tick below).
+			// (1) DRAIN A.play -> ch_a2b -> wire_a2b. OFDM: exactly ONE symbol/iter (or one
+			//     idle-fill if empty) so the clock advances one symbol at a time. ROBUST/MFSK:
+			//     whole-buffer catch-up (the pump already drained it -> typically a no-op).
 			{
 				cl_data_container* sdc = &A->ts.data_container;
 				size_t sp_bytes = (size_t)(sdc->Nofdm * sdc->interpolation_rate) * sizeof(double);
-				if (sp_bytes > 0 && size_buffer(A->audio.play) >= sp_bytes) {
+				if (ofdm_phase) {
+					sim_step_drain_one_symbol(A, &ch_a2b, wire_a2b, &pump);   // one symbol/iter
+				} else if (sp_bytes > 0 && size_buffer(A->audio.play) >= sp_bytes) {
 					while (size_buffer(A->audio.play) >= sp_bytes &&
 					       circular_buf_free_size(wire_a2b) >= sp_bytes)
 						sim_step_drain_one_symbol(A, &ch_a2b, wire_a2b, &pump);
 				} else {
-					// Empty play -> one idle-fill tick (legacy drains-nothing branch).
-					sim_step_drain_one_symbol(A, &ch_a2b, wire_a2b, &pump);
+					sim_step_drain_one_symbol(A, &ch_a2b, wire_a2b, &pump);   // idle-fill tick
 				}
 			}
-			// (2) FEED wire_a2b -> B.cap, one symbol per step + per-frame decode
-			//     drive (drive_decode=true; same gate as legacy top-level catch-up).
+			// (2) FEED wire_a2b -> B.cap + per-frame decode drive. OFDM: ONE symbol/iter (so the
+			//     ring never over-advances a frame boundary before the decode fires — §8/INV-A).
+			//     ROBUST/MFSK: whole wire (pump already delivered -> typically a no-op).
 			{
 				cl_data_container* ddc = &B->ts.data_container;
 				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
-				while (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
-				       circular_buf_free_size(B->audio.cap) >= sp_bytes)
-					sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+				if (ofdm_phase) {
+					if (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
+					    circular_buf_free_size(B->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+				} else {
+					while (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
+					       circular_buf_free_size(B->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+				}
 			}
-			// Deliver any reply waiting in b2a into A if A is now idle (legacy parity).
+			// Deliver any reply waiting in b2a into A if A is now idle (legacy parity). OFDM: one
+			//     symbol/iter; ROBUST/MFSK: whole wire.
 			if (size_buffer(A->audio.play) == 0)
 			{
 				cl_data_container* ddc = &A->ts.data_container;
 				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
-				while (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
-				       circular_buf_free_size(A->audio.cap) >= sp_bytes)
-					sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+				if (ofdm_phase) {
+					if (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
+					    circular_buf_free_size(A->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+				} else {
+					while (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
+					       circular_buf_free_size(A->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+				}
 			}
 
 			// --- B's half-step (tx=B, rx=A; symmetric). ---
@@ -10741,28 +10811,63 @@ int cl_arq_controller::test_sim_inproc_2()
 			{
 				cl_data_container* sdc = &B->ts.data_container;
 				size_t sp_bytes = (size_t)(sdc->Nofdm * sdc->interpolation_rate) * sizeof(double);
-				if (sp_bytes > 0 && size_buffer(B->audio.play) >= sp_bytes) {
+				if (ofdm_phase) {
+					sim_step_drain_one_symbol(B, &ch_b2a, wire_b2a, &pump);   // one symbol/iter
+				} else if (sp_bytes > 0 && size_buffer(B->audio.play) >= sp_bytes) {
 					while (size_buffer(B->audio.play) >= sp_bytes &&
 					       circular_buf_free_size(wire_b2a) >= sp_bytes)
 						sim_step_drain_one_symbol(B, &ch_b2a, wire_b2a, &pump);
 				} else {
-					sim_step_drain_one_symbol(B, &ch_b2a, wire_b2a, &pump);
+					sim_step_drain_one_symbol(B, &ch_b2a, wire_b2a, &pump);   // idle-fill tick
 				}
 			}
 			{
 				cl_data_container* ddc = &A->ts.data_container;
 				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
-				while (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
-				       circular_buf_free_size(A->audio.cap) >= sp_bytes)
-					sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+				if (ofdm_phase) {
+					if (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
+					    circular_buf_free_size(A->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+				} else {
+					while (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
+					       circular_buf_free_size(A->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+				}
 			}
 			if (size_buffer(B->audio.play) == 0)
 			{
 				cl_data_container* ddc = &B->ts.data_container;
 				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
-				while (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
-				       circular_buf_free_size(B->audio.cap) >= sp_bytes)
-					sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+				if (ofdm_phase) {
+					if (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
+					    circular_buf_free_size(B->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+				} else {
+					while (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
+					       circular_buf_free_size(B->audio.cap) >= sp_bytes)
+						sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+				}
+			}
+
+			// PHASE b — POST-TX TIMER RX-CONSUMPTION ALIGNMENT (production-faithful). Under the
+			// OFDM-data egress (§10.3) the big-block is drained play -> the in-flight WIRE inside
+			// send_batch (clock +~1.65 s) and the RECEIVING_ACKS_DATA / receiving_timer.start()
+			// fires immediately after — but the RSP has NOT yet CONSUMED the block (the outer loop
+			// feeds wire -> RX one symbol per iter over the following iters). In PRODUCTION the
+			// blocking drain holds until the DAC drains AND the RSP consumes concurrently, so the
+			// ACK window measures from the moment the last sample reaches the RSP. Mirror that:
+			// while an instance is in RECEIVING_ACKS_DATA and its OUTGOING wire still holds the
+			// block (the RSP has not consumed it all), RESTART that instance's receiving_timer.
+			// Once the wire empties (block fully fed to the RSP) the timer free-runs and the
+			// window covers only the genuine ACK round-trip — exactly production. OFDM phase only;
+			// idempotent, deterministic (A drains -> wire_a2b, B drains -> wire_b2a).
+			if (ofdm_phase) {
+				if (A->arq.connection_status == RECEIVING_ACKS_DATA &&
+				    (size_buffer(A->audio.play) > 0 || size_buffer(wire_a2b) > 0))
+					A->arq.receiving_timer.start();
+				if (B->arq.connection_status == RECEIVING_ACKS_DATA &&
+				    (size_buffer(B->audio.play) > 0 || size_buffer(wire_b2a) > 0))
+					B->arq.receiving_timer.start();
 			}
 		}
 		else
@@ -11059,6 +11164,8 @@ int cl_arq_controller::test_sim_inproc_2()
 	check(iters < max_iters, "G-SMOKE: terminated before iteration cap (no hang)");
 
 	// --- Teardown ---
+	arq_set_sim_inproc_outer_stepper(false);   // disarm the Phase-b queue-and-return gate
+	arq_set_sim_inproc_drain_only_pump(nullptr);
 	arq_set_sim_inproc_pump(nullptr, nullptr);
 	arq_set_sim_inproc_skip_tcp(false);
 	sim_clock_set_enabled(0);
@@ -11239,6 +11346,161 @@ int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
 	       "rx=%ld | pass_after: first_clean=%d/%d rx=%ld/%ld]\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s",
 	       before_clean, before_K, before_rx, after_clean, after_K, after_rx, PAYLOAD);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// STEPPER-CORE REWRITE Phase b durable regression (--test-sim-sustain). The cross-layer test
+// CLAUDE.md requires for the stepper-core rewrite. It drives the OUTER-loop stepper
+// (MERCURY_SIM2_STEPPER=outer) through a LIVE CONNECT-at-ROBUST_0 -> SET_CONFIG -> CFG16 OFDM
+// big-block transfer and asserts the Phase-b headline: the (iii) nested-drain DATA-path wedge
+// (root-cause §9.3) is GONE. FAIL-BEFORE (the legacy stepper / Phase a, MERCURY_SIM2_STEPPER
+// unset): the OFDM data send_batch spins drain_playback_wait -> the NO-PROGRESS floor fires
+// [SIM2-DEADLOCK-BREAK] and abandons the multi-MB TX tail (0 OFDM bytes carved). PASS-AFTER
+// (outer): drain_playback_wait EGRESSES the block play->wire (drain-only pump), the outer loop
+// feeds it per-symbol, the RSP carves it byte-faithful, ZERO deadlock-breaks fire. The byte-
+// stream that reaches the RX FIFO is the carved block (rx_have>0). NOTE (recorded, NOT asserted
+// here): the multi-batch ACK round-trip vs receiving_timeout under the per-symbol feed is the
+// documented Phase-c item (data-flow-sim2-ofdm-delivery-cadence.md §10.5) — full byte-correct
+// SUSTAIN across many batches is gated on that turnaround-timing reconciliation. This test locks
+// in the proven Phase-b invariants (no data-path wedge + clean OFDM carve) so they cannot regress.
+int cl_arq_controller::test_sim_inproc_sustain()
+{
+	printf("[TEST-SIM-SUSTAIN] ===== OUTER-stepper OFDM big-block data-path: no-wedge + clean "
+	       "carve regression (sim2-stepper-rewrite Phase b) =====\n");
+	fflush(stdout);
+
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_SIM_2INST", "MERCURY_SIM2_STEPPER", "MERCURY_BIGBLOCK_FRAMING",
+		"MERCURY_BIGBLOCK_K", "MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
+		"MERCURY_SIM2_FORCE_SETCONFIG", "MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_SNR3K",
+		"MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS", "MERCURY_SIM2_SEED",
+		"MERCURY_BIGBLOCK_DEFEAT_FIX", "MERCURY_BIGBLOCK_NOCRC",
+		"MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "MERCURY_SIM2_STOP_AFTER_TX_EMITS"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key   = keys[i];
+		env_saved[(size_t)i].had   = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name){
+		printf("[TEST-SIM-SUSTAIN] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	// One CFG16 K=8 big-block of clean payload over a real ROBUST_0->CFG16 SET_CONFIG handshake.
+	const long PAYLOAD = 1374;
+	auto run_arm = [&](const char* stepper)->long {  // returns deadlock-break count for the arm
+		set_env("MERCURY_SIM_2INST",            "1");
+		set_env("MERCURY_SIM2_STEPPER",         stepper);   // "outer" (after) or "legacy" (before)
+		set_env("MERCURY_BIGBLOCK_FRAMING",     "1");
+		set_env("MERCURY_BIGBLOCK_K",           "8");
+		set_env("MERCURY_SIM2_PIN",             "0");
+		set_env("MERCURY_SIM2_ROBUST",          "1");
+		set_env("MERCURY_SIM2_CFG",             "100");     // CONNECT at ROBUST_0
+		set_env("MERCURY_SIM2_FORCE_SETCONFIG", "16");      // real SET_CONFIG -> CFG16
+		set_env("MERCURY_SIM2_SNR3K",           "900");     // clean
+		set_env("MERCURY_SIM2_SEED",            "12345");
+		set_env("MERCURY_SIM2_MAXITERS",        "400000");
+		set_env("MERCURY_SIM2_STALL_ITERS",     "40000");
+		set_env("MERCURY_BIGBLOCK_DEFEAT_FIX",  "0");
+		set_env("MERCURY_BIGBLOCK_NOCRC",       "0");
+		set_env("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", "0");
+		set_env("MERCURY_SIM2_STOP_AFTER_TX_EMITS",    "0");
+		{ char b[32]; snprintf(b,sizeof(b),"%ld",PAYLOAD); set_env("MERCURY_SIM2_PAYLOAD_BYTES", b); }
+
+		sim2_last_rx_have = -1; sim2_last_bytes_ok = false; sim2_last_payload_len = -1;
+		bigblock_first_clean = -1; bigblock_first_K = -1;
+		sim2_gate_accepts = 0; sim2_gate_rejects = 0; sim2_tx_block_emits = 0;
+		arq_reset_sim2_deadlock_break_count();
+
+		test_sim_inproc_2();
+		return arq_get_sim2_deadlock_break_count();
+	};
+
+	// FAIL-BEFORE arm: the LEGACY pump stepper. The OFDM data send_batch spins
+	// drain_playback_wait at co-routine depth>0, the wire saturates, and the NO-PROGRESS floor
+	// fires [SIM2-DEADLOCK-BREAK] abandoning the multi-MB TX tail (root-cause §7/§9). This is the
+	// baseline the rewrite removes — run it FIRST so the same binary demonstrates before vs after.
+	long before_breaks  = run_arm("legacy");
+	long before_rx      = sim2_last_rx_have;
+	printf("[TEST-SIM-SUSTAIN] BEFORE (legacy pump): rx_have=%ld/%ld deadlock_breaks=%ld\n",
+	       before_rx, PAYLOAD, before_breaks);
+	fflush(stdout);
+
+	// PASS-AFTER arm: the OUTER stepper.
+	long after_breaks   = run_arm("outer");
+	long after_rx       = sim2_last_rx_have;
+	int  after_first_K  = bigblock_first_K;
+	int  after_first_cl = bigblock_first_clean;
+
+	printf("[TEST-SIM-SUSTAIN] AFTER (outer): rx_have=%ld/%ld first_block_clean=%d/%d "
+	       "deadlock_breaks=%ld\n",
+	       after_rx, PAYLOAD, after_first_cl, after_first_K, after_breaks);
+	fflush(stdout);
+
+	// ASSERT 0 — FAIL-BEFORE proof: the LEGACY pump stepper WEDGES on the OFDM data path
+	// ([SIM2-DEADLOCK-BREAK] fired) — the very failure the rewrite removes. Without this the
+	// pass-after asserts would be vacuous (no demonstrated baseline failure).
+	check(before_breaks > 0,
+	      "FAIL-BEFORE: the LEGACY pump stepper WEDGES on the OFDM data path "
+	      "([SIM2-DEADLOCK-BREAK] fired, multi-MB TX tail abandoned) — the baseline the rewrite removes");
+
+	// ASSERT 1 — the DATA-path (iii) wedge is GONE: ZERO [SIM2-DEADLOCK-BREAK] fired on the OFDM
+	// big-block data path under the outer stepper. This is the Phase-b headline (root-cause §9.3).
+	check(after_breaks == 0,
+	      "OUTER stepper: ZERO [SIM2-DEADLOCK-BREAK] on the OFDM big-block data path (the (iii) "
+	      "nested-drain wedge is gone — drain_playback_wait egresses play->wire, no spin floor)");
+
+	// ASSERT 2 — the OFDM big-block was carved BYTE-FAITHFULLY by the RSP (K=8 clean): the per-
+	// symbol outer-loop feed preserves the §8 decode cadence (clean carve, not a stale-ring miss).
+	check(after_first_K == 8 && after_first_cl == 8,
+	      "OUTER stepper: the first CFG16 K=8 big-block carved CLEAN 8/8 (per-symbol feed preserves "
+	      "OFDM decode cadence — the data-path delivers, not just non-wedges)");
+
+	// ASSERT 3 — the carved block bytes reached the RX FIFO (delivery flowed, rx_have>0).
+	check(after_rx > 0,
+	      "OUTER stepper: carved big-block bytes delivered to the RX FIFO (rx_have>0 — the OFDM "
+	      "data path flows end-to-end through the outer loop)");
+
+	// DIAGNOSTIC (recorded, NOT a hard assert) — the documented Phase-c gap. Full byte-correct
+	// multi-batch SUSTAIN (bytes_ok=1 across many batches) is gated on the OFDM ACK round-trip vs
+	// receiving_timeout reconciliation under the per-symbol feed (data-flow-sim2-ofdm §10.5). This
+	// test proves the STEPPER WEDGE is fixed; the turnaround timing is the next phase.
+	printf("[TEST-SIM-SUSTAIN] DIAGNOSTIC: data-path wedge FIXED (breaks=%ld, clean carve=%d/%d). "
+	       "Full multi-batch byte-correct SUSTAIN gated on the Phase-c OFDM ACK-turnaround timing "
+	       "(receiving_timeout vs per-symbol-feed round-trip) — data-flow-sim2-ofdm-delivery-cadence.md §10.5.\n",
+	       after_breaks, after_first_cl, after_first_K);
+	fflush(stdout);
+
+	restore_env();
+	printf("[TEST-SIM-SUSTAIN] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }

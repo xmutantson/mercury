@@ -136,6 +136,17 @@ void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx)
 	g_sim_inproc_pump_ctx = ctx;
 }
 
+// STEPPER-CORE REWRITE Phase b: the DRAIN-TO-WIRE-ONLY pump (arq_commander.cc
+// sim_inproc_drain_to_wire_only). Installed alongside the main pump by the OUTER stepper. Under
+// the OFDM DATA path, drain_playback_wait spins THIS (not the full pump) to EGRESS the big-block
+// out of the TX play ring into the in-flight wire WITHOUT bursting it to the RX — the outer loop
+// then feeds the wire -> RX one symbol per iter (decode pacing preserved). Shares the same ctx.
+static sim_inproc_pump_fn g_sim_inproc_drain_only_pump = nullptr;
+void arq_set_sim_inproc_drain_only_pump(sim_inproc_pump_fn fn)
+{
+	g_sim_inproc_drain_only_pump = fn;
+}
+
 // SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5/§10.7-item-4).
 // process_main()'s top blocks poll tcp_socket_control / tcp_socket_data (accept,
 // recv, transmit). The 2-instance stepper binds NO socket and injects user
@@ -148,6 +159,78 @@ void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx)
 static bool g_sim_inproc_skip_tcp = false;
 void arq_set_sim_inproc_skip_tcp(bool on) { g_sim_inproc_skip_tcp = on; }
 bool arq_sim_inproc_skip_tcp()            { return g_sim_inproc_skip_tcp; }
+
+// SIM_INPROC OUTER-STEPPER gate (sim2-stepper-rewrite Phase b). Non-null/true ONLY
+// while the 2-instance OUTER-loop stepper (MERCURY_SIM2_STEPPER=outer) is driving.
+// When set, drain_playback_wait() QUEUE-and-returns (no spin-drain): the outer loop
+// is the SOLE DAC-drain driver, so every TX site becomes queue-and-return uniformly
+// with this single seam (tx_transfer already queues, audioio.c:1691). Gated SEPARATELY
+// from arq_sim_inproc_active() so the LEGACY pump stepper (still runnable until Phase d)
+// keeps its pump-driven blocking drain. Production + paced sim never set it (false →
+// verbatim blocking body → byte-identical). See data-flow-sim2-ofdm-delivery-cadence.md §10.
+static bool g_sim_inproc_outer_stepper = false;
+void arq_set_sim_inproc_outer_stepper(bool on) { g_sim_inproc_outer_stepper = on; }
+bool arq_sim_inproc_outer_stepper_active()     { return g_sim_inproc_outer_stepper; }
+
+// SIM_INPROC OUTER-STEPPER active-instance modulation tag (sim2-stepper-rewrite Phase b).
+// sim2_activate(m) records whether the now-active instance is on an OFDM config. The
+// outer-stepper TX-wait seams use it to decide pacing vs co-routine delivery:
+//   - OFDM active  -> the DATA path: drain_playback_wait / ptt_busy_wait QUEUE-and-return
+//     (clock-only); the outer loop paces the big-block ONE SYMBOL PER ITER (the §8 cadence
+//     the per-symbol stepper exists to provide; pumping here would BURST-deliver and break
+//     OFDM decode).
+//   - ROBUST/MFSK active -> the HANDSHAKE / control-ACK path: keep the LEGACY co-routine
+//     pump (the peer's HAIL / control-ACK reply must be delivered INTRA-process_main so the
+//     same call's receive_* poll sees it — the outer loop cannot inject delivery mid-call,
+//     and send_*_pattern's post-TX RX-ring flush would wipe an out-of-band reply; the burst
+//     is harmless for MFSK control frames, G2 proves it). This is the per-modulation seam
+//     that lets ONE uniform process_main serve both the MFSK handshake and the OFDM data
+//     phase. Default false (no active OFDM instance). See §10.4.
+static bool g_sim2_active_is_ofdm = false;
+void arq_set_sim2_active_is_ofdm(bool on) { g_sim2_active_is_ofdm = on; }
+
+// SIM_INPROC OUTER-STEPPER data-batch-TX scope (sim2-stepper-rewrite Phase b). True ONLY
+// while send_batch() is emitting a DATA batch (set at its top, cleared at every exit). This
+// is the precise discriminator the per-modulation tag alone could NOT give: at CFG16 the DATA
+// (big-block, OFDM) needs per-symbol pacing, but the RSP's batch ACK is an MFSK ACK PATTERN
+// sent on the SAME current_configuration=16 — so a config-only gate would wrongly pace the MFSK
+// ACK per-symbol and the CMD's correlator would never see it (nAcked_data stuck at 0 -> the CMD
+// re-sends bsi=0 forever, delivering duplicate blocks -> bytes_ok=0). Requiring this flag
+// confines the per-symbol no-op to the OFDM big-block DATA TX; ACK patterns / control / HAIL keep
+// the legacy co-routine pump (intra-call delivery). See §10.4.
+static bool g_sim2_in_data_batch_tx = false;
+void arq_set_sim2_in_data_batch_tx(bool on) { g_sim2_in_data_batch_tx = on; }
+
+// STEPPER-CORE REWRITE Phase b: count of [SIM2-DEADLOCK-BREAK] floor fires this session. The
+// durable --test-sim-sustain asserts this is 0 (a passing arm NEVER wedges; any fire = a
+// stranded TX tail = a regression). Reset by the test before each run.
+static long g_sim2_deadlock_break_count = 0;
+void arq_reset_sim2_deadlock_break_count() { g_sim2_deadlock_break_count = 0; }
+long arq_get_sim2_deadlock_break_count()   { return g_sim2_deadlock_break_count; }
+
+// True iff the outer stepper is driving AND we are emitting an OFDM DATA batch (send_batch on an
+// OFDM config) — i.e. this TX-wait must EGRESS the big-block out of play (to the wire, via the
+// drain-only pump) so the SAME process_main's post-TX path does not strand it, and leave the
+// per-symbol delivery to the outer loop. OFDM-gated so the ROBUST/MFSK 19-B data batch (the G2
+// arm) stays on the legacy co-routine pump and remains BYTE-IDENTICAL to the legacy stepper
+// (dropping the OFDM conjunct re-routes the small MFSK data batch through egress and shifts
+// G2's iters 15->16 — a determinism regression). FALSE for the MFSK HANDSHAKE / ACK patterns /
+// control frames (legacy co-routine pump delivers them intra-call).
+static inline bool sim_outer_stepper_paces_active()
+{
+	return g_sim_inproc_outer_stepper && g_sim2_active_is_ofdm && g_sim2_in_data_batch_tx;
+}
+
+// True iff the outer stepper is driving AND the active instance is OFDM — i.e. we are in the
+// OFDM DATA PHASE and the outer loop owns clock+delivery. Used by the end-of-process_main
+// pacing-floor pump (which must NOT fire in the OFDM phase even AFTER send_batch returns —
+// the queued block is still in play and a pump would BURST-drain it before the outer loop
+// paces it). The ACK patterns deliver via their OWN drain (in_data_batch_tx is false there,
+// so their drain spins the legacy pump). FALSE for the MFSK handshake (legacy pump runs).
+static inline bool sim_outer_stepper_ofdm_phase()
+{
+	return g_sim_inproc_outer_stepper && g_sim2_active_is_ofdm;
+}
 
 // Single place the step-pump is invoked from inside the spin loops. When no
 // pump is installed this is exactly the prior body: sim_spin_sleep() under the
@@ -169,6 +252,23 @@ static inline void sim_spin_or_pump(bool sim_clock_on)
 // the production path is behaviorally identical.
 void ptt_busy_wait(cl_timer& t, int delay_ms)
 {
+	// STEPPER-CORE REWRITE Phase b (sim2-stepper-rewrite): under the OUTER-loop stepper,
+	// on the OFDM DATA path the PTT on/off turnaround must NOT spin the pump — spinning it
+	// would re-enter the pump's BURST deliver+decode-drive at depth 0 DURING process_main
+	// (right after a batch was queued, sim2_drain_to_wire drains the WHOLE play buffer in
+	// one shot), defeating the outer loop's per-symbol pacing and re-introducing the (iii)
+	// nested-drain coupling this rewrite eliminates. Instead ADVANCE THE SHARED VIRTUAL
+	// CLOCK by delay_ms directly (clock-only tick): the exit predicate is satisfied so any
+	// in-call wait terminates, while the TX drain is left to the OUTER loop's per-symbol
+	// feed. On the ROBUST/MFSK HANDSHAKE path the gate is FALSE -> the verbatim spin body
+	// runs (legacy co-routine pump), so the peer's HAIL/control-ACK reply is delivered
+	// intra-call. Production + paced sim keep the verbatim spin body (byte-identical).
+	if (sim_outer_stepper_paces_active())
+	{
+		if (delay_ms > 0)
+			sim_clock_add_samples((uint64_t)delay_ms * (SIM_CLOCK_SAMPLE_RATE_HZ / 1000));
+		return;
+	}
 	const bool sim_clock_on = sim_clock_enabled();
 	// EXIT CONDITION UNCHANGED: virtual (or wall) time must pass delay_ms.
 	while (t.get_elapsed_time_ms() < delay_ms)
@@ -177,6 +277,27 @@ void ptt_busy_wait(cl_timer& t, int delay_ms)
 
 void drain_playback_wait()
 {
+	// STEPPER-CORE REWRITE Phase b (sim2-stepper-rewrite): under the OUTER-loop stepper, on the
+	// OFDM DATA path drain_playback_wait EGRESSES the big-block out of the TX play ring into the
+	// in-flight WIRE (via the drain-ONLY pump — NO RX deliver, NO decode burst), then returns. The
+	// OUTER loop feeds the wire -> RX ONE SYMBOL PER ITER, so OFDM decode still sees the §8
+	// per-symbol cadence and the nested-drain (i)/(ii)/(iii) call-stack coupling (§9.3) that
+	// defeated all 8 localized fixes is gone (the drain-only pump never delivers, never
+	// re-enters a peer process_main). EGRESS (not no-op) is REQUIRED because the SAME process_main's
+	// post-TX ACK path clear_buffer(playback_buffer)s any residual — a block left in play would be
+	// DISCARDED the instant the CMD enters the ACK wait (rx never gets it). The wire is 12.288 MB
+	// (~19 blocks) so a single in-flight block never saturates it -> the spin always terminates (no
+	// deadlock-break floor needed). INV-D (§10.2): the post-TX bookkeeping touches ONLY the RX ring
+	// + STATE fields; with play now EMPTY the ACK-path flush is harmless. On the ROBUST/MFSK
+	// HANDSHAKE path the gate is FALSE -> the verbatim spin body runs (legacy co-routine pump
+	// delivers the beacon/control intra-call). Production + paced sim leave the gate false.
+	if (sim_outer_stepper_paces_active())
+	{
+		if (g_sim_inproc_drain_only_pump != nullptr)
+			while (size_buffer(playback_buffer) > 0)
+				g_sim_inproc_drain_only_pump(g_sim_inproc_pump_ctx);
+		return;
+	}
 	const bool sim_clock_on = sim_clock_enabled();
 	// EXIT CONDITION UNCHANGED on production + the two-process paced sim: the
 	// playback ring must be fully drained (the real audio DAC always drains it
@@ -221,6 +342,7 @@ void drain_playback_wait()
 			if (occ < prev_occ) { prev_occ = occ; no_progress = 0; }
 			else if (++no_progress >= NO_PROGRESS_LIMIT)
 			{
+				g_sim2_deadlock_break_count++;   // Phase b: assertable by --test-sim-sustain
 				printf("[SIM2-DEADLOCK-BREAK] drain_playback_wait: playback "
 				       "un-drainable for %ld pump calls (wire jammed, RX not "
 				       "consuming) -> abandoning %zu-byte TX tail so the stepper "
@@ -259,6 +381,20 @@ void pumped_settle_wait(int wait_ms)
 {
 	if (wait_ms <= 0)
 		return;
+	// STEPPER-CORE REWRITE Phase b: under the OUTER-loop stepper, pumped_settle_wait STILL
+	// pumps (clock-pumping via the step-pump), exactly like the legacy stepper. Its callers
+	// are the HANDSHAKE / ACK-turnaround settle guards (the HAIL listen loop
+	// arq_commander.cc:423, the control-ACK arrival rescan arq_common.cc:7437, the
+	// send_ack_pattern* / send_mfsk_ack_sack ROBUST guards). These need the peer reply
+	// delivered INTRA-process_main (the peer's HAIL/control-ACK reply must land in the RX
+	// ring BEFORE the same call's receive_* poll — the outer loop cannot inject delivery
+	// mid-process_main). The pump's burst delivery is HARMLESS here: these are all MFSK /
+	// ROBUST control frames (G2 proves MFSK decodes under burst), and the OFDM DATA batch is
+	// never in the play buffer during a pumped_settle_wait call (it is drained only by the
+	// now-no-op drain_playback_wait + clock-only ptt_busy_wait inside send_batch, then
+	// send_batch RETURNS — so no pumped_settle_wait fires with a data batch queued). The
+	// OFDM data path's per-symbol pacing is owned entirely by the outer loop. Production +
+	// paced sim keep the verbatim body (byte-identical).
 	if (g_sim_inproc_pump == nullptr)
 	{
 		msleep(wait_ms);            // production + two-process paced sim: verbatim
@@ -3270,7 +3406,19 @@ void cl_arq_controller::process_main()
 	// instance's clock view). When no pump is installed (the two-process paced
 	// sim) sim_spin_or_pump(true) IS sim_spin_sleep() — byte-identical. The
 	// production (sim disabled) branch is the verbatim usleep(2000).
-	if (sim_clock_enabled())
+	//
+	// STEPPER-CORE REWRITE Phase b: under the OUTER-loop stepper, in the OFDM DATA PHASE the
+	// outer loop is the SOLE clock-drain + RX-feed driver, so this end-of-process_main pump
+	// call must NOT fire (one pump = one out-of-order depth-0 deliver+decode-drive that would
+	// BURST-drain the big-block still queued in play AFTER send_batch returned — the exact
+	// polls=0 / nAcked_data=0 / re-send-bsi=0 failure). Gated on the OFDM-PHASE predicate (NOT
+	// the narrower in-data-batch-tx scope, which the send_batch RAII already cleared by here),
+	// so the whole OFDM data phase routes clock+delivery through the outer loop. The MFSK ACK
+	// patterns deliver via their OWN drain (legacy pump). On the ROBUST/MFSK HANDSHAKE the gate
+	// is FALSE -> the legacy pump runs. Paced sim + production are byte-identical.
+	if (sim_outer_stepper_ofdm_phase())
+		;  // OFDM data phase: outer loop owns clock + delivery; no in-process_main pump
+	else if (sim_clock_enabled())
 		sim_spin_or_pump(true);
 	else
 		usleep(2000);
@@ -5014,6 +5162,15 @@ void cl_arq_controller::send(st_message* message, int message_location)
 void cl_arq_controller::send_batch()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
+	// STEPPER-CORE REWRITE Phase b: mark the whole send_batch body as DATA-batch TX so the
+	// outer-stepper TX-wait seams (drain_playback_wait / ptt_busy_wait) QUEUE-and-return
+	// (per-symbol pacing) for the OFDM DATA path ONLY — NOT for the MFSK ACK patterns / control
+	// the RSP sends on the same CFG16 (§10.4). RAII clears it at EVERY exit (the big-block
+	// return + the normal end). No-op outside the outer stepper (the flag is only read there).
+	struct DataBatchTxScope {
+		DataBatchTxScope()  { arq_set_sim2_in_data_batch_tx(true);  }
+		~DataBatchTxScope() { arq_set_sim2_in_data_batch_tx(false); }
+	} _data_batch_tx_scope;
 	// === DIAG: always print TX activity (remove after debug) ===
 	printf("[CMD-TX] CONFIG_%d batch=%d type=%d pream=%d Nsymb=%d\n",
 		current_configuration, message_batch_counter_tx,
@@ -7332,6 +7489,12 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 	// Production + the two-process paced sim leave the pump null
 	// (arq_sim_inproc_active()==false) -> this whole block is skipped ->
 	// byte-identical.
+	//
+	// STEPPER-CORE REWRITE Phase b: this pump-armed control-ACK re-scan RUNS under the
+	// outer stepper too (pumped_settle_wait still pumps for handshake/control-ACK
+	// turnarounds — see its Phase-b note). It delivers the peer's control-ACK reply
+	// INTRA-process_main so A's same-call poll sees it (the outer loop cannot inject
+	// delivery mid-process_main). These are MFSK / control frames; the burst is harmless.
 	if(arq_sim_inproc_active())
 	{
 		// Arrival window: tail span + the responder's PTT/turnaround margin

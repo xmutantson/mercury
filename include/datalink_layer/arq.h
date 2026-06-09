@@ -101,6 +101,18 @@ void sim_inproc_rx_mute_settle(int wait_ms);
 void arq_set_sim_inproc_skip_tcp(bool on);
 bool arq_sim_inproc_skip_tcp();
 
+// SIM_INPROC OUTER-STEPPER gate (sim2-stepper-rewrite Phase b). Set true ONLY while
+// the 2-instance OUTER-loop stepper (MERCURY_SIM2_STEPPER=outer) is driving; makes
+// drain_playback_wait() QUEUE-and-return (no spin-drain) because the outer loop is the
+// SOLE DAC-drain driver (one symbol/instance/iter, both directions, like the two real
+// audio threads). The TX symbols are queued by tx_transfer and drained by the outer
+// loop on subsequent iters, so no TX site needs to block. Default false → production +
+// paced sim + the LEGACY pump stepper keep the verbatim blocking drain (byte-identical;
+// gated separately from arq_sim_inproc_active() so the legacy pump path is unaffected
+// until Phase d removes it). See data-flow-sim2-ofdm-delivery-cadence.md §10.
+void arq_set_sim_inproc_outer_stepper(bool on);
+bool arq_sim_inproc_outer_stepper_active();
+
 union u_SNR {
   float f_SNR;
   char char4_SNR[4];
@@ -1346,6 +1358,14 @@ public:
   // dangling-data UAF + one-frame wait) delivers 0 bytes; PASS-AFTER delivers all.
   // Returns 0 on PASS. Selected by --test-bigblock-fullpath.
   static int test_sim_inproc_bigblock_fullpath();
+  // STEPPER-CORE REWRITE Phase b durable regression (--test-sim-sustain): drives the OUTER-loop
+  // stepper through a live ROBUST_0->CFG16 SET_CONFIG + OFDM big-block transfer and asserts the
+  // Phase-b headline — the (iii) nested-drain DATA-path wedge is GONE (ZERO [SIM2-DEADLOCK-BREAK])
+  // and the CFG16 K=8 block carves CLEAN 8/8 (per-symbol feed preserves the §8 decode cadence).
+  // FAIL-BEFORE = legacy stepper wedges (deadlock-break, 0 OFDM bytes); PASS-AFTER = no wedge,
+  // clean carve, bytes reach RX. Full multi-batch byte-correct sustain is the documented Phase-c
+  // turnaround-timing item (recorded as a DIAGNOSTIC, not asserted). Returns 0 on PASS.
+  static int test_sim_inproc_sustain();
   // MULTI-CW WINDOW REGRESSION (fact-doc §17): the K>1 full-block byte-faithfulness test
   // the 622-byte synthetic cases and the single-arming fullpath could NOT catch. Drives a
   // FULL K=8 block (1200B, all 8 codewords) through the LIVE receive_bigblock+de-whiten+
