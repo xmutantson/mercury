@@ -10703,6 +10703,13 @@ int cl_arq_controller::test_sim_inproc_2()
 	// GAP-2 LIVE-PATH: iter at which the stop-after-tx-emits threshold was first met (the
 	// grace window is measured from here). -1 = not yet armed. Loop-local (reset per run).
 	long emit_break_arm_iter = -1;
+	// C0-a (fact-doc §10.8): iter at which the FIRST block was carved, for the
+	// STOP_AFTER_FIRST_BLOCK grace window. The clean big-block now DELIVERS via the
+	// responder ACK-GATE on a LATER tick (not in-carve), so the stop-after-first-block
+	// break must give the RSP a bounded grace to run that ACK-GATE before terminating —
+	// otherwise it stops the instant the carve fires and reads rx_have=0 (the clean arms
+	// would never see their delivery). -1 = not yet armed. Loop-local (reset per run).
+	long first_block_break_arm_iter = -1;
 	for (; iters < max_iters; iters++)
 	{
 		if (dbg && (iters % 200 == 0)) {
@@ -11030,9 +11037,26 @@ int cl_arq_controller::test_sim_inproc_2()
 		// The fail-before arm uses this so it captures the first block's PARTIAL outcome and
 		// exits FAST — it must NOT run the slow/unstable post-partial stock per-frame retry
 		// loop. Default off (regression/HW sessions run to completion).
+		//
+		// C0-a GRACE (fact-doc §10.8): the CLEAN big-block now delivers via the responder
+		// ACK-GATE on a LATER responder tick (the carve transitions to ACKNOWLEDGING_DATA;
+		// the ACK-GATE TX's the data-ACK then copy_data_to_buffer()'s to the FIFO) — it is
+		// NO LONGER delivered in-carve. So after the first block is carved, give the RSP a
+		// bounded grace for that ACK-GATE tick to deliver before terminating; the loop top
+		// drains B's FIFO every iter, so a clean block fills rx_have within a handful of
+		// iters and hits the rx_have>=payload_len break above FIRST. A PARTIAL/fail-before
+		// block legitimately delivers 0 (its ACK-GATE sends a SACK, pushes nothing to the
+		// FIFO), so it exits after the grace with rx_have=0 — the SAME fail-before signature
+		// as before, just one ACK-GATE tick later. Grace bounds wall time (each grace iter is
+		// one cheap per-symbol step). Mirrors the GAP-2 STOP_AFTER_TX_EMITS grace pattern.
 		if (env_i("MERCURY_SIM2_STOP_AFTER_FIRST_BLOCK", 0) != 0 && bigblock_first_K > 0) {
-			stalled = true;   // mark so the byte-correct G-SMOKE assert is skipped
-			break;
+			if (first_block_break_arm_iter < 0) first_block_break_arm_iter = iters;
+			const long fb_grace = env_i("MERCURY_SIM2_FIRST_BLOCK_GRACE_ITERS", 64);
+			bool fb_grace_expired = (iters - first_block_break_arm_iter) >= fb_grace;
+			if (fb_grace_expired) {
+				stalled = true;   // mark so the byte-correct G-SMOKE assert is skipped
+				break;
+			}
 		}
 
 		// GAP-2 LIVE-PATH: MERCURY_SIM2_STOP_AFTER_TX_EMITS=N breaks the loop once N real
@@ -11456,12 +11480,13 @@ int cl_arq_controller::test_sim_inproc_sustain()
 	// PASS-AFTER arm: the OUTER stepper.
 	long after_breaks   = run_arm("outer");
 	long after_rx       = sim2_last_rx_have;
+	bool after_bytes_ok = sim2_last_bytes_ok;
 	int  after_first_K  = bigblock_first_K;
 	int  after_first_cl = bigblock_first_clean;
 
-	printf("[TEST-SIM-SUSTAIN] AFTER (outer): rx_have=%ld/%ld first_block_clean=%d/%d "
+	printf("[TEST-SIM-SUSTAIN] AFTER (outer): rx_have=%ld/%ld bytes_ok=%d first_block_clean=%d/%d "
 	       "deadlock_breaks=%ld\n",
-	       after_rx, PAYLOAD, after_first_cl, after_first_K, after_breaks);
+	       after_rx, PAYLOAD, (int)after_bytes_ok, after_first_cl, after_first_K, after_breaks);
 	fflush(stdout);
 
 	// ASSERT 0 — FAIL-BEFORE proof: the LEGACY pump stepper WEDGES on the OFDM data path
@@ -11488,14 +11513,23 @@ int cl_arq_controller::test_sim_inproc_sustain()
 	      "OUTER stepper: carved big-block bytes delivered to the RX FIFO (rx_have>0 — the OFDM "
 	      "data path flows end-to-end through the outer loop)");
 
-	// DIAGNOSTIC (recorded, NOT a hard assert) — the documented Phase-c gap. Full byte-correct
-	// multi-batch SUSTAIN (bytes_ok=1 across many batches) is gated on the OFDM ACK round-trip vs
-	// receiving_timeout reconciliation under the per-symbol feed (data-flow-sim2-ofdm §10.5). This
-	// test proves the STEPPER WEDGE is fixed; the turnaround timing is the next phase.
-	printf("[TEST-SIM-SUSTAIN] DIAGNOSTIC: data-path wedge FIXED (breaks=%ld, clean carve=%d/%d). "
-	       "Full multi-batch byte-correct SUSTAIN gated on the Phase-c OFDM ACK-turnaround timing "
-	       "(receiving_timeout vs per-symbol-feed round-trip) — data-flow-sim2-ofdm-delivery-cadence.md §10.5.\n",
-	       after_breaks, after_first_cl, after_first_K);
+	// ASSERT 4 (C0-a, fact-doc §10.8) — FULL BYTE-CORRECT SUSTAIN: the whole PAYLOAD delivered
+	// byte-faithfully (rx_have==PAYLOAD AND bytes_ok==1, a full memcmp). This is the G1 headline
+	// that was RED before C0-a: the CLEAN big-block now transmits its data-ACK via the production
+	// ACK-GATE ([TX-ACK-SACK] clean via MFSK suffix on CFG16), so the CMD gets the clean ACK, does
+	// NOT hit "first-batch ACK miss", does NOT BREAK, and does NOT re-send a duplicate bsi=0 — the
+	// FIFO fills with the CORRECT bytes (bsi advances 0->1, no duplicate), bytes_ok flips 0->1.
+	// FAIL-BEFORE: pristine 5e7cc15/c4c991d delivered rx_have=1374 via a DUPLICATE bsi=0 with
+	// bytes_ok=0 (the missing-ACK -> BREAK -> dup signature). PASS-AFTER: bytes_ok=1, no dup, no break.
+	check(after_rx == PAYLOAD && after_bytes_ok,
+	      "OUTER stepper: FULL byte-correct sustain (rx_have==PAYLOAD AND bytes_ok=1 memcmp) — the "
+	      "clean big-block data-ACK is transmitted via the ACK-GATE, so the CMD does not BREAK + "
+	      "re-send a duplicate; the FIFO fills with the CORRECT bytes (C0-a, §10.8)");
+
+	printf("[TEST-SIM-SUSTAIN] G1 HEADLINE: data-path wedge FIXED (breaks=%ld), clean carve=%d/%d, "
+	       "FULL byte-correct sustain rx_have=%ld/%ld bytes_ok=%d (C0-a wired the clean big-block "
+	       "CFG16 data-ACK via the production ACK-GATE — data-flow-sim2-ofdm-delivery-cadence.md §10.8).\n",
+	       after_breaks, after_first_cl, after_first_K, after_rx, PAYLOAD, (int)after_bytes_ok);
 	fflush(stdout);
 
 	restore_env();

@@ -703,3 +703,76 @@ This is a cross-layer ARQ change (CLAUDE.md §5), larger than the one-line timin
 scoped as. NOT shipped; the worktree source is left at pristine 5e7cc15 (only this fact-doc updated).
 The two reverted attempts + this corrected diagnosis are recorded so the next session does not
 re-chase the timing-only framing.
+
+### §10.8 C0-a — THE FIX: wire the CLEAN big-block data-ACK via the production ACK-GATE (2026-06-09, fix/bigblock-d3-carve)
+
+**This is a PRODUCTION ARQ gap, not a sim artifact.** Confirmed by code trace (file:line below): a
+CLEAN big-block carve (n_clean==K) on the LIVE ARQ path delivers to the app FIFO + bumps bsi but
+NEVER transitions the responder to ACKNOWLEDGING_DATA, so the production clean-batch ACK transmitter
+(`process_messages_acknowledging_data`, arq_responder.cc:1489) is NEVER entered for a clean block.
+This is the SAME root cause as the HW "carve then BREAK CFG16->CFG15" win-blocker
+(MEMORY bigblock_livepath_p3 / minus10): the CMD sends the block, the RSP carves+delivers but sends
+no data-ACK, the CMD's clean-ACK wait times out -> first-batch ACK miss -> BREAK -> CFG16->CFG15
+demote + duplicate re-send. The sim merely made it cheaply reproducible.
+
+#### The asymmetry (root cause), file:line
+- CLEAN branch (`bigblock_block_to_arq`, test_bigblock_arq_unit.cc:199-264): on the LIVE path it
+  calls `copy_data_to_buffer()` (`:244`, marks the K slots RECEIVED->ACKED then FREES them),
+  sets `batch_data_delivered=true` (`:245`), and bumps `rsp_current_expected_batch_seq_id` (`:254-257`)
+  — but does NOT set `connection_status`. It stays RECEIVING. No ACK is ever queued.
+- PARTIAL branch (same fn, `:265-375`): on the LIVE path it sets
+  `connection_status = ACKNOWLEDGING_DATA` (`:359`), so the NEXT `process_messages_responder()` tick
+  (arq_responder.cc:38-42) enters the ACK-GATE and transmits the SACK_RSP. The PARTIAL path was
+  fixed (D2, "bigblock-chanest") to route through the audited ACK-GATE; the CLEAN path was NOT.
+- Even the per-frame RX-timeout->ACK-GATE transition (arq_responder.cc:1037-1040,
+  `get_nReceived_messages()!=0 -> ACKNOWLEDGING_DATA`) cannot rescue a clean big-block: the carve's
+  own `copy_data_to_buffer()` already FREED the K slots (arq_common.cc:9259/9264, every slot ->FREE),
+  so `get_nReceived_messages()==0` and the transition never fires.
+
+#### §1.5 CROSS-LAYER AUDIT — state changed: the CLEAN-carve delivery/ACK ordering
+1. **Producers** of the clean-block delivery + ACK state:
+   - The carve `bigblock_block_to_arq` CLEAN branch (test_bigblock_arq_unit.cc:199-264): writes
+     `messages_rx[0..K-1].status`, `last_received_end_of_batch_seq` (`:187`), `batch_rx_frame_count`
+     (`:188`), `rsp_prev_batch_*` (`:221-225`), `rsp_current_expected_batch_seq_id` (`:254-257`),
+     and (live) `copy_data_to_buffer`+`batch_data_delivered` (`:239-246`).
+   - The ACK-GATE clean path (arq_responder.cc:1768-1909): the production clean-batch ACK
+     transmitter — counts `rx_received` (`:1522-1524`), marks RECEIVED->ACKED (`:1773-1780`),
+     bumps `rsp_current_expected_batch_seq_id`/sets `rsp_prev_batch_seq_id` (`:1789-1797`), TX's the
+     all-ones MFSK-SACK ACK (`send_mfsk_ack_sack`, `:1830`), then delivers via `copy_data_to_buffer`
+     gated `!batch_data_delivered` (`:1886-1890`), returns to RECEIVING (`:1909`).
+2. **Consumers**: the CMD clean-batch ACK funnel (arq_commander.cc:3146-3199:
+   `data_ack_received=YES`, `last_batch_fully_acked`, `register_ack`, gearshift promotion). It needs
+   the all-ones ACK to carry the block's bsi. The dedupe/prev-completion consumer
+   (arq_responder.cc:738-784) reads `rsp_prev_batch_*`.
+3. **Valid states / pre-write defaults**: at carve entry the K slots are RECEIVED (set in the same
+   fn `:159-169`), `last_received_end_of_batch_seq=K-1`, `data_batch_size==K` (pinned at the rung),
+   `rsp_current_expected_batch_seq_id` may be -1 (uninitialized until the first DATA stamps it,
+   arq_responder.cc:620) — the carve seeds it (`:254`/`:355`).
+4. **Invariants consumers assume**: (INV-once-deliver) the block is delivered to the app FIFO EXACTLY
+   ONCE; (INV-once-bump) bsi advances EXACTLY ONCE per block; (INV-ack-bsi) the clean ACK carries the
+   block's bsi so the CMD's clean funnel matches; (INV-unit) the unit test
+   (`bigblock_skip_fifo_delivery=true`) reads `messages_rx[]` directly and requires the K slots stay
+   RECEIVED + `rsp_prev_batch_expected_count==K` + one bsi bump (CASE1/CASE3, :1012-1027/:1159-1184).
+5. **What the fix changes**: on the LIVE path ONLY (`!bigblock_skip_fifo_delivery`) the CLEAN branch
+   STOPS doing the in-carve delivery + bsi-bump + prev-bookkeeping and instead transitions
+   `connection_status = ACKNOWLEDGING_DATA` (mirroring the PARTIAL branch :359), handing the clean
+   block to the audited ACK-GATE — which TX's the ACK and delivers exactly once via its own
+   `copy_data_to_buffer` (`:1888`, `batch_data_delivered` left false so it fires) and bumps bsi once
+   (`:1789-1797`). The unit-test path (`bigblock_skip_fifo_delivery==true`) keeps the EXISTING
+   in-carve bookkeeping verbatim (it never enters the live ACK-GATE), so CASE1/CASE3 are unchanged.
+   Per-consumer walk: INV-once-deliver HELD (delivery moves from carve to ACK-GATE, still once;
+   `batch_data_delivered=false` on entry so the ACK-GATE delivers). INV-once-bump HELD (bump moves to
+   the ACK-GATE; the carve no longer bumps on the live path). INV-ack-bsi HELD (the carve seeds
+   `rsp_current_expected_batch_seq_id=block_bsi` when -1; the ACK-GATE sets
+   `rsp_prev_batch_seq_id=that` then bumps, and the ACK carries `ack_bsi=rsp_prev_batch_seq_id`
+   =block_bsi). INV-unit HELD (live split is guarded; unit path verbatim). Per-frame ACK path,
+   SACK bitmap, CMD ACK-wait/break logic: UNCHANGED — the fix only routes the clean big-block into
+   the SAME generic ACK-GATE the per-frame full-batch already uses; no new accounting, no threshold,
+   no per-frame-path edit.
+
+#### Production-impact verdict
+PRODUCTION ARQ GAP. Before this fix, a clean CFG16 big-block in production delivers to the app FIFO
+but transmits no data-ACK; the CMD times out, BREAKs, and re-sends. The fix makes the clean big-block
+ACK via the production ACK-GATE on the real live path (guarded only against the synthetic unit-test
+harness). It LIKELY also fixes the HW carve-then-BREAK win-blocker (same missing-ACK mechanism); HW
+confirmation stays gated on the testbed-emulator recovery (MEMORY testbed_emulator_lowpass_collapse).

@@ -202,65 +202,95 @@ int cl_arq_controller::bigblock_block_to_arq(const int* cw_ok, int K,
 		// One ACK, all-ones K-bit bitmap, bsi bumps ONCE. The K RECEIVED slots
 		// stay in messages_rx[] for the downstream ACK-GATE copy_data_to_buffer()
 		// delivery — so the unit test (and the real ACK-GATE) sees K/K RECEIVED.
-		//
-		// Record the completed batch in the prev-batch bookkeeping sized from the
-		// synthetic EOB (this is the RISK-4 path the partial branch shares): the
-		// batch is fully received (K/K), sized to K via EOB+1, and marked
-		// delivered. We size it directly (rather than calling
-		// bump_bsi_and_transfer_prev(), which transfers-and-FREES messages_rx —
-		// the clean block must KEEP messages_rx for the ACK-GATE delivery).
-		int prev_expected = this->data_batch_size;
-		if(this->last_received_end_of_batch_seq >= 0)
-		{
-			int eob = this->last_received_end_of_batch_seq + 1;
-			if(eob < prev_expected) prev_expected = eob;
-		}
-		if(prev_expected < 1)               prev_expected = 1;
-		if(prev_expected > this->nMessages) prev_expected = this->nMessages;
-
-		this->rsp_prev_batch_seq_id        = (int)block_bsi;
-		this->rsp_prev_batch_expected_count= prev_expected;   // == K (INV-4/5)
-		this->rsp_prev_batch_received_count= n_clean;         // == K, all clean
-		this->rsp_prev_batch_active        = false;           // completed on decode
-		this->rsp_prev_batch_delivered_count++;               // one block delivered
-
-		// LIVE-PATH DELIVERY FIX (bigblock-whiten-align): on the live ARQ path nothing
-		// downstream marks these RECEIVED slots ACKED and calls copy_data_to_buffer(),
-		// so the K decoded sub-units never reached fifo_buffer_rx (the app FIFO) — the
-		// PHY/carve decoded the block byte-faithfully but 0 app bytes were delivered.
-		// The unit-test harness reads messages_rx[] directly (bigblock_test_delivered_*),
-		// so it never needed the FIFO push and the gap was invisible. Deliver the clean
-		// block to the app FIFO HERE (mirrors the prev-batch retx delivery at
-		// arq_responder.cc:760-767: mark RECEIVED->ACKED so copy_data_to_buffer's
-		// ACKED-only iteration picks them up, then push). bigblock_deliver_clean is a
-		// guarded no-op in the unit-test context (telecom_system/fifo present on the live
-		// path; the unit test sets bigblock_skip_fifo_delivery=true to keep reading
-		// messages_rx[] directly). data_batch_size == K is pinned at the rung.
 		if(!bigblock_skip_fifo_delivery)
 		{
-			for(int c = 0; c < K && c < this->nMessages; c++)
-				if(this->messages_rx[c].status == RECEIVED)
-					this->messages_rx[c].status = ACKED;
-			copy_data_to_buffer();   // pushes ACKED slots to fifo_buffer_rx, frees them
-			this->batch_data_delivered = true;
+			// ===== LIVE ARQ PATH (C0-a fix, fact-doc §10.8) =====================
+			// ROOT-CAUSE FIX for the missing clean big-block data-ACK (the HW
+			// "carve then BREAK CFG16->CFG15" win-blocker; bytes_ok=0 G1 RED): a
+			// CLEAN block used to DELIVER to the FIFO + bump bsi IN THE CARVE but
+			// never transition the responder to ACKNOWLEDGING_DATA, so the
+			// production clean-batch ACK transmitter (ACK-GATE,
+			// process_messages_acknowledging_data, arq_responder.cc:1489) was NEVER
+			// entered for a clean block — the RSP sent NO data-ACK, the CMD's
+			// clean-ACK wait timed out -> first-batch ACK miss -> BREAK -> demote +
+			// duplicate re-send. The PARTIAL branch was already fixed (D2) to route
+			// through the audited ACK-GATE (:359 below); the CLEAN branch was not.
+			//
+			// THE FIX (mirrors the PARTIAL branch and the per-frame full-batch path):
+			// leave the K slots RECEIVED in messages_rx[] (carved above :159-169),
+			// keep the synthetic EOB + batch_rx_frame_count (:187-188), seed
+			// rsp_current_expected_batch_seq_id from the wire bsi if uninitialized
+			// (the responder starts at -1 until the first DATA stamps it,
+			// arq_responder.cc:620; the big-block carve IS the data path), then
+			// transition to ACKNOWLEDGING_DATA. On the NEXT process_messages_responder()
+			// tick (arq_responder.cc:38-42) the ACK-GATE computes rx_received=K >=
+			// expected=K (last_received_end_of_batch_seq=K-1 -> expected=K,
+			// arq_responder.cc:1530-1533), TAKES THE CLEAN PATH, TRANSMITS the all-ones
+			// MFSK-SACK ACK on CFG16 (send_mfsk_ack_sack, arq_responder.cc:1830) carrying
+			// the block's bsi, bumps rsp_current_expected_batch_seq_id ONCE
+			// (arq_responder.cc:1789-1797), and DELIVERS to the app FIFO via its OWN
+			// copy_data_to_buffer() (arq_responder.cc:1886-1890, gated !batch_data_delivered).
+			//
+			// We do NOT deliver / bump / set prev-bookkeeping HERE on the live path:
+			// the ACK-GATE owns all of that (delivery + bsi bump). Leaving
+			// batch_data_delivered=false lets the ACK-GATE's copy_data_to_buffer() fire.
+			// This reuses the production ACK-GATE clean path VERBATIM — the same machinery
+			// a per-frame full batch uses — so it introduces no new accounting, no
+			// threshold, and does not touch the per-frame path, the SACK bitmap, or the
+			// CMD's ACK-wait/break logic (those are unchanged; they now simply RECEIVE the
+			// clean ACK that was previously never sent).
+			if(this->rsp_current_expected_batch_seq_id < 0)
+				this->rsp_current_expected_batch_seq_id = (int)block_bsi;
+			this->connection_status = ACKNOWLEDGING_DATA;
+
+			printf("[BIGBLOCK-ARQ] CLEAN block bsi=%u K=%d -> ACK-GATE (transmit "
+				"clean all-ones data-ACK on next responder tick; deliver via ACK-GATE) "
+				"curr_expected=%d\n",
+				(unsigned)block_bsi, K, this->rsp_current_expected_batch_seq_id);
+			fflush(stdout);
 		}
+		else
+		{
+			// ===== UNIT-TEST PATH (bigblock_skip_fifo_delivery=true) ============
+			// The unit-test harness reads messages_rx[] DIRECTLY
+			// (bigblock_test_count_received / bigblock_test_delivered_bytes) and never
+			// enters the live ACK-GATE, so it needs the carve to do the bsi bump +
+			// prev-batch bookkeeping IN-PLACE (CASE1 one_bump + K/K received; CASE3
+			// rsp_prev_batch_expected_count==K + prev completes). KEEP this verbatim.
+			//
+			// Record the completed batch in the prev-batch bookkeeping sized from the
+			// synthetic EOB (the RISK-4 path the partial branch shares): the batch is
+			// fully received (K/K), sized to K via EOB+1, marked delivered. Sized
+			// directly (NOT bump_bsi_and_transfer_prev(), which FREES messages_rx — the
+			// clean block must KEEP messages_rx for the unit-test read).
+			int prev_expected = this->data_batch_size;
+			if(this->last_received_end_of_batch_seq >= 0)
+			{
+				int eob = this->last_received_end_of_batch_seq + 1;
+				if(eob < prev_expected) prev_expected = eob;
+			}
+			if(prev_expected < 1)               prev_expected = 1;
+			if(prev_expected > this->nMessages) prev_expected = this->nMessages;
 
-		// P2.6 — one block = one batch => ONE bsi transition. INIT-ON-FIRST-BLOCK
-		// (bigblock-whiten-align): the responder's expected-bsi starts at -1 until the
-		// first DATA frame stamps it (arq_responder.cc:620). The big-block carve is the
-		// data path, so SEED it from the authoritative wire bsi on the first block so the
-		// "one bsi transition" advances correctly (was stuck at -1 -> no bump -> the CMD's
-		// clean-ACK bsi match could never line up).
-		if(this->rsp_current_expected_batch_seq_id < 0)
-			this->rsp_current_expected_batch_seq_id = (int)block_bsi;
-		this->rsp_current_expected_batch_seq_id =
-			(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+			this->rsp_prev_batch_seq_id        = (int)block_bsi;
+			this->rsp_prev_batch_expected_count= prev_expected;   // == K (INV-4/5)
+			this->rsp_prev_batch_received_count= n_clean;         // == K, all clean
+			this->rsp_prev_batch_active        = false;           // completed on decode
+			this->rsp_prev_batch_delivered_count++;               // one block delivered
 
-		printf("[BIGBLOCK-ARQ] CLEAN block bsi=%u K=%d -> 1 ACK (all-ones), "
-			"prev_expected=%d bsi_next=%d delivered_fifo=%d\n",
-			(unsigned)block_bsi, K, this->rsp_prev_batch_expected_count,
-			this->rsp_current_expected_batch_seq_id, (int)!bigblock_skip_fifo_delivery);
-		fflush(stdout);
+			// P2.6 — one block = one batch => ONE bsi transition. INIT-ON-FIRST-BLOCK:
+			// seed from the authoritative wire bsi on the first block (was -1).
+			if(this->rsp_current_expected_batch_seq_id < 0)
+				this->rsp_current_expected_batch_seq_id = (int)block_bsi;
+			this->rsp_current_expected_batch_seq_id =
+				(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+
+			printf("[BIGBLOCK-ARQ] CLEAN block bsi=%u K=%d -> 1 ACK (all-ones, "
+				"unit-test in-carve bookkeeping), prev_expected=%d bsi_next=%d\n",
+				(unsigned)block_bsi, K, this->rsp_prev_batch_expected_count,
+				this->rsp_current_expected_batch_seq_id);
+			fflush(stdout);
+		}
 	}
 	else
 	{
