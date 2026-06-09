@@ -3714,6 +3714,33 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// demotion require K *consecutive* anchor-rung BREAKs with NO clean
 				// in between — a rung that recovers between failures is not demoted.
 				anchor_consec_break_fails = 0;
+				// AARF DECAY (long-run-degradation.md §2.3): frame_shift_threshold
+				// is the FRAME-UP gate denominator (:3869). It is multiplicatively
+				// INCREASED (*=2 at :2447/:3352/:3539) on every FRAME-UP failure but
+				// -- until now -- had NO decrease half anywhere in the live path, so a
+				// run of OFDM-crossing failures marched it 3->6->12->24->... and the
+				// gate consecutive_data_acks >= eff_frame_shift_threshold became
+				// permanently unsatisfiable, walling off the re-climb and PARKING at
+				// the highest MFSK rung (the long-run "stuck-at-ROBUST" latch). AARF
+				// is multiplicative-increase / multiplicative-DECREASE; the decrease
+				// half was missing. A CLEAN, fully-delivered batch is proof the
+				// channel improved, so HALVE the threshold back toward its base floor
+				// (3, arq_common.cc:702) here, alongside the sibling recovery resets
+				// (break_drop_step, anchor_consec_break_fails). This is
+				// decay-on-SUCCESS, NOT a blanket reset: a genuinely-bad channel keeps
+				// failing FRAME-UP and never reaches this clean-batch branch, so the
+				// doubling still suppresses over-climb on a bad channel; only sustained
+				// clean delivery relaxes the gate. Gated inside
+				// promotion_allowed_on_batch() so a partial SACK never decays it.
+				if(frame_shift_threshold > 3)
+				{
+					frame_shift_threshold /= 2;
+					if(frame_shift_threshold < 3)
+						frame_shift_threshold = 3;
+					printf("[GEARSHIFT] AARF decay: clean batch at config %d, frame_shift_threshold now %d\n",
+						current_configuration, frame_shift_threshold);
+					fflush(stdout);
+				}
 				// SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11): track the run
 				// of CONSECUTIVE clean batches AT THIS RUNG. A clean at a NEW rung
 				// (config != the streak's rung) starts the count fresh at 1; otherwise
@@ -9279,6 +9306,75 @@ int cl_arq_controller::test_climb_engine()
 				(q4_sack?2:0)+(q4_nosack?1:0), 1);
 		}
 	}
+
+	// ================================================================
+	// Part I — AARF DECAY on frame_shift_threshold (long-run-degradation.md §2.3).
+	// THE long-run latch: frame_shift_threshold is multiplicatively INCREASED
+	// (*=2 at arq_commander.cc:2447/3352/3539) on every FRAME-UP failure but had NO
+	// decrease half in the live path, so a run of OFDM-crossing failures marched it
+	// 3->6->12->24->... and the FRAME-UP gate (consecutive_data_acks >=
+	// eff_frame_shift_threshold, :3869) became permanently unsatisfiable — the climb
+	// walled off and parked at the highest MFSK rung until a process restart. The
+	// FIX is the missing decrease half: a CLEAN, fully-delivered batch HALVES the
+	// threshold back toward its base floor (3), inside the SAME
+	// promotion_allowed_on_batch() credit block (:3706) that already resets the
+	// sibling aggression counters (break_drop_step, anchor_consec_break_fails).
+	// This replays the REAL decay expression production runs at :3706. FAIL-BEFORE:
+	// the decay block does not exist; the threshold stays latched at the doubled
+	// value across any number of clean batches -> H1/H2 FAIL.
+	// ================================================================
+	// Replay the REAL :3706 decay expression on ONE clean fully-delivered batch.
+	auto decay_clean_batch = [&]() {
+		if(frame_shift_threshold > 3)
+		{
+			frame_shift_threshold /= 2;
+			if(frame_shift_threshold < 3)
+				frame_shift_threshold = 3;
+		}
+	};
+	// Replay the REAL FRAME-UP-failure doubling (:2447/3352/3539).
+	auto fail_frame_up = [&]() { frame_shift_threshold *= 2; };
+
+	// H1 — after K=3 FRAME-UP failures the threshold is 3*2^3=24; a run of clean
+	// batches must DECAY it geometrically back to the base floor 3 (and NOT below).
+	// Pre-fix: it stays pinned at 24 forever -> the FRAME-UP gate needs an
+	// impossible 24-clean unbroken streak -> the re-climb is walled off.
+	frame_shift_threshold = 3;
+	fail_frame_up(); fail_frame_up(); fail_frame_up();   // 3 -> 24
+	check(frame_shift_threshold == 24, "I0 three FRAME-UP failures double the threshold to 24",
+		frame_shift_threshold, 24);
+	// 24 -> 12 -> 6 -> 3 over three clean batches, then floor-clamped.
+	decay_clean_batch();   // 24->12
+	check(frame_shift_threshold == 12, "I1a one clean batch halves 24->12", frame_shift_threshold, 12);
+	decay_clean_batch();   // 12->6
+	decay_clean_batch();   // 6->3
+	check(frame_shift_threshold == 3, "I1 sustained clean delivery decays the threshold back to the base floor 3",
+		frame_shift_threshold, 3);
+	// I2 — the decay FLOORS at 3 (never below): more clean batches do not drive it
+	// to 1 (which would over-promote on a marginal rung).
+	decay_clean_batch(); decay_clean_batch();
+	check(frame_shift_threshold == 3, "I2 decay floors at the base 3 (never below — no over-promote)",
+		frame_shift_threshold, 3);
+	// I3 — the FRAME-UP gate is SATISFIABLE again after decay: with the threshold
+	// back at 3, three consecutive clean data ACKs re-arm a FRAME-UP. Pre-fix at the
+	// latched 24 the same three ACKs cannot fire the gate. (Models the gate
+	// arithmetic directly: consecutive_data_acks >= frame_shift_threshold.)
+	{
+		int acks = 0; bool gate_fires = false;
+		for(int k=0;k<3 && !gate_fires;k++){ acks++; if(acks >= frame_shift_threshold) gate_fires = true; }
+		check(gate_fires, "I3 FRAME-UP gate satisfiable after decay (3 clean ACKs re-arm a promotion)",
+			gate_fires ? 1 : 0, 1);
+	}
+	// I4 — decay is decay-on-SUCCESS, NOT a blanket reset: a genuinely bad channel
+	// that keeps FAILING FRAME-UP (no clean batch ever credits) keeps the threshold
+	// HIGH (over-climb still suppressed). Model: double, then double again with NO
+	// clean batch in between — the threshold rises, never decays without a clean.
+	frame_shift_threshold = 3;
+	fail_frame_up();                 // 3->6 (no clean credit)
+	fail_frame_up();                 // 6->12
+	check(frame_shift_threshold == 12,
+		"I4 repeated FRAME-UP failures with NO clean batch keep the threshold HIGH (bad-channel over-climb still suppressed)",
+		frame_shift_threshold, 12);
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

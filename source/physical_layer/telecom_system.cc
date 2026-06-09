@@ -109,6 +109,7 @@ cl_telecom_system::cl_telecom_system()
 	ofdm_forced_delay=-1;
 	test_puncture_nBits=0;
 	last_coarse_freq_offset=0.0;
+	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 	ctrl_nBits=0;
 	ctrl_nsymb=0;
 	mfsk_ctrl_mode=false;
@@ -3170,6 +3171,13 @@ skip_h_retry_point:
 				{
 					receive_stats.freq_offset_of_last_decoded_message=freq_offset_measured;
 					receive_stats.freq_offset=freq_offset_measured;
+					// STALE-CFO scoped reset (long-run-degradation.md §2.2): a fresh
+					// OFDM decode succeeded, so the latched CFO is GOOD again — clear the
+					// consecutive-fail run that gates the poison-CFO scrub at function
+					// exit. On a healthy link this keeps the counter pinned at 0, so the
+					// scrub NEVER fires and the deliberate last-trial / MINI-preamble
+					// (LEVER P) / cfg=6 stickiness is fully preserved.
+					consecutive_ofdm_decode_fails = 0;
 				}
 
 				receive_stats.delay_of_last_decoded_message=receive_stats.delay;
@@ -3301,6 +3309,47 @@ skip_h_retry_point:
 				skip_h_count, time_sync_trials_max + 1,
 				receive_stats.delay, mean_H, pream_energy, data_energy);
 			fflush(stdout);
+		}
+
+		// STALE-CFO SCOPED RESET (long-run-degradation.md §2.2). We are inside the
+		// energy_ok block: a real OFDM preamble was DETECTED and the trial loop ran
+		// (silence / sub-threshold / weak-peak / no-preamble all returned earlier or
+		// skipped this block, so they are correctly EXCLUDED). If the OFDM decode
+		// still failed here, every fresh fine-sync trial failed and the :2510
+		// last-trial fallback mixed the NEXT acquisition at the stale
+		// freq_offset_of_last_decoded_message. That stale value is refreshed ONLY on
+		// success (:3179), so a run of these failures is exactly the poison-latch:
+		// the demod keeps mixing at a dead CFO and can never relock. Count the run;
+		// once it crosses STALE_CFO_RESET_FAILS, SCRUB the stale CFO + the companion
+		// coarse offset so the next acquisition re-measures from scratch.
+		//
+		// SCOPING (preserves the deliberate cfg=6 / LEVER-P stickiness):
+		//  - A SINGLE marginal/dropped frame does NOT trip it (threshold > 1), so the
+		//    last-trial reuse (:2510) and MINI-preamble reuse (:2536) still recover an
+		//    isolated loss by reusing the recent-good CFO.
+		//  - On a healthy link a decode succeeds and resets the counter to 0 (:3179),
+		//    so the scrub NEVER fires -> the session-long last_coarse_freq_offset
+		//    stickiness (arq_common.cc:3850-3854, the ~26% cfg=6 gain) is intact.
+		//  - It fires ONLY in the sustained-failure regime where the stale CFO is
+		//    provably poison, not a useful anchor. This is the cure for the long-run
+		//    WB-OFDM fall-off, scoped to a FAILED-sync run rather than a blanket
+		//    per-receive wipe.
+		if(M != MOD_MFSK && receive_stats.message_decoded != YES)
+		{
+			const int STALE_CFO_RESET_FAILS = 3;
+			consecutive_ofdm_decode_fails++;
+			if(consecutive_ofdm_decode_fails >= STALE_CFO_RESET_FAILS &&
+			   receive_stats.freq_offset_of_last_decoded_message != 0)
+			{
+				printf("[STALE-CFO] %d consecutive OFDM decode fails — scrubbing stale CFO (was %.4f Hz, coarse %.4f Hz) for fresh re-acquisition\n",
+					consecutive_ofdm_decode_fails,
+					receive_stats.freq_offset_of_last_decoded_message,
+					last_coarse_freq_offset);
+				fflush(stdout);
+				receive_stats.freq_offset_of_last_decoded_message = 0;
+				last_coarse_freq_offset = 0.0;
+				consecutive_ofdm_decode_fails = 0;  // armed again; one scrub per run
+			}
 		}
 
 		} // end if(energy_ok)
@@ -4804,6 +4853,7 @@ void cl_telecom_system::init()
 	receive_stats.message_decoded=NO;
 	receive_stats.SNR=-99.9;
 	receive_stats.signal_stregth_dbm=-999;
+	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 
 }
 
@@ -9965,6 +10015,7 @@ void cl_telecom_system::load_configuration(int configuration)
 	// so old values would be wrong
 	receive_stats.delay_of_last_decoded_message = -1;
 	receive_stats.freq_offset_of_last_decoded_message = 0;
+	consecutive_ofdm_decode_fails = 0;  // STALE-CFO scoped reset: config change re-acquires fresh
 	receive_stats.mfsk_search_raw = 0;
 	receive_stats.ofdm_search_raw = 0;
 	receive_stats.ofdm_batch_active = false;

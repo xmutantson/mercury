@@ -140,6 +140,22 @@ public:
 	// (~24 Hz on RPi CM108) puts MFSK tones at FFT half-bin boundary.
 	double last_coarse_freq_offset;
 
+	// STALE-CFO SCOPED RESET (long-run-degradation.md §2.2): counts CONSECUTIVE
+	// full OFDM-decode failures. The receive() last-trial fallback
+	// (telecom_system.cc:2510) reuses freq_offset_of_last_decoded_message as the
+	// demod mixer when every fresh sync fails; that stale value is written ONLY
+	// on a successful OFDM decode (:3171) and was NEVER cleared on failure, so a
+	// marginal frame that latches an edge-of-range CFO poisons every subsequent
+	// acquisition (the link can never relock -> WB dies -> parks ROBUST until a
+	// process restart). This counter SCOPES the cure: incremented on each failed
+	// OFDM receive, reset to 0 on any OFDM success; when it crosses
+	// STALE_CFO_RESET_FAILS it clears the stale CFO + last_coarse_freq_offset so
+	// the NEXT acquisition re-measures from scratch. A SINGLE dropped frame does
+	// NOT trip it, preserving the deliberate last-trial / MINI-preamble (LEVER P)
+	// reuse and the cfg=6 throughput stickiness (arq_common.cc:3850-3854) on a
+	// healthy link (where the counter stays at 0). Reset in init()/load_configuration.
+	int consecutive_ofdm_decode_fails;
+
 	// MFSK short control frames: punctured LDPC for ACK/control messages
 	int ctrl_nBits;    // interleaved bits to transmit for ctrl frames (0 = no puncturing)
 	int ctrl_nsymb;    // MFSK symbols for ctrl frames
