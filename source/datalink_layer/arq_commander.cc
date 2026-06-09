@@ -10187,6 +10187,103 @@ void sim_inproc_pump_2(void* ctxv)
 	// above (the reply path). Do NOT deliver into the original sender's capture.
 }
 
+// ============================================================================
+// OUTER-LOOP DRIVER per-symbol helpers (sim2-stepper-rewrite Phase a).
+//
+// These are thin re-slices of the EXISTING, validated drain/feed helpers,
+// BOUNDED to exactly ONE symbol per call, so the new outer-loop driver
+// (MERCURY_SIM2_STEPPER=outer) can advance the whole system by one symbol per
+// instance per direction per outer iteration — mirroring production's two
+// continuous audio threads (DAC drain + capture-prep feed). The DSP / prep /
+// decode bodies are UNCHANGED from sim2_drain_to_wire / sim2_deliver_from_wire
+// (that is what keeps GATE-2 + production byte-identical); the ONLY change is
+// the per-symbol bound (the `while` becomes an `if`).
+//
+// PHASE a SCOPE: drain_playback_wait is NOT yet a no-op (that is Phase b), so the
+// pump (sim_inproc_pump_2) still drains TX inside the blocking waits. These
+// helpers only do the OUTER-loop top-level catch-up drain/feed that the legacy
+// body does via the whole-buffer sim2_drain_to_wire / sim2_deliver_from_wire
+// catch-up calls — now one symbol at a time. This phase proves the per-symbol
+// helpers move bytes IDENTICALLY to the whole-buffer catch-up on the paths that
+// do NOT wedge (the legacy 19-B MFSK arm), with no behavior change otherwise.
+
+// Drain EXACTLY ONE symbol of `src`'s playback through `ch` into `wire`,
+// advancing the shared clock by one symbol of airtime; idle-fill ONE symbol of
+// silence when src has nothing queued (so the clock keeps ticking and the
+// receiver sees the noise floor). One-symbol-bounded re-slice of
+// sim2_drain_to_wire (arq_commander.cc:9927-9959). Returns true iff a real
+// (non-silence) symbol moved this call.
+bool sim_step_drain_one_symbol(MercuryInstance* src, cl_sim_awgn* ch,
+                               cbuf_handle_t wire, SimInproc2Ctx* c)
+{
+	cl_data_container* sdc = &src->ts.data_container;
+	int sp = sdc->Nofdm * sdc->interpolation_rate;
+	if (sp <= 0) return false;
+	size_t sp_bytes = (size_t)sp * sizeof(double);
+	// Real symbol available AND room on the wire -> move exactly one.
+	if (size_buffer(src->audio.play) >= sp_bytes &&
+	    circular_buf_free_size(wire) >= sp_bytes)
+	{
+		read_buffer(src->audio.play, (uint8_t*)c->scratch, sp_bytes);
+		if (ch) ch->process(c->scratch, (size_t)sp);
+		write_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+		c->looped_samples += sp;
+		c->clock_samples  += sp;
+		sim_clock_add_samples((uint64_t)sp);
+		return true;
+	}
+	// Nothing to send -> idle-fill exactly one silence symbol (clock ticks once).
+	if (circular_buf_free_size(wire) >= sp_bytes)
+	{
+		memset(c->scratch, 0, sp_bytes);
+		if (ch) ch->process(c->scratch, (size_t)sp);
+		write_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+	}
+	c->idle_samples  += sp;
+	c->clock_samples += sp;
+	sim_clock_add_samples((uint64_t)sp);
+	return false;
+}
+
+// Consume EXACTLY ONE symbol from `wire` into `dst`'s capture, prep it into the
+// ring (advancing ring_write_index by one symbol), and on the frames_to_read==0
+// falling edge drive dst's OFDM decode ONCE (the GATE-2 per-frame decode pacing).
+// One-iteration re-slice of the sim2_deliver_from_wire `while` body
+// (arq_commander.cc:10024-10069) — SAME prep, SAME decode-drive gate + depth
+// guards, only bounded to one symbol per call.
+void sim_step_feed_one_symbol(MercuryInstance* dst, cbuf_handle_t wire,
+                              SimInproc2Ctx* c, bool drive_decode = false)
+{
+	cl_data_container* ddc = &dst->ts.data_container;
+	int sp = ddc->Nofdm * ddc->interpolation_rate;
+	if (sp <= 0) return;
+	size_t sp_bytes = (size_t)sp * sizeof(double);
+	if (size_buffer(wire) < sp_bytes ||
+	    circular_buf_free_size(dst->audio.cap) < sp_bytes)
+		return;
+	read_buffer(wire, (uint8_t*)c->scratch, sp_bytes);
+	write_buffer(dst->audio.cap, (uint8_t*)c->scratch, sp_bytes);
+	// Prep the single symbol just delivered (cap holds exactly one symbol now,
+	// so prep_pull_inline's internal while-loop runs exactly once and advances
+	// ring_write_index by ONE symbol). One-symbol-per-prep == production cadence.
+	prep_pull_inline(dst, c->scratch + c->sp_max);
+
+	// Per-frame decode drive at the frame-complete boundary (UNCHANGED gate +
+	// depth guards from sim2_deliver_from_wire arq_commander.cc:10049-10068).
+	if (drive_decode && g_sim2_decode_drive_depth == 0 &&
+	    ddc->data_ready == 1 && ddc->frames_to_read == 0 &&
+	    dst->arq.link_status == CONNECTED &&
+	    is_ofdm_config(dst->arq.current_configuration))
+	{
+		g_sim2_decode_drive_depth++;
+		g_sim2_depth++;
+		sim2_activate(dst);
+		dst->arq.process_main();
+		g_sim2_depth--;
+		g_sim2_decode_drive_depth--;
+	}
+}
+
 // Configure one instance for the 2-instance stepper exactly like the non-TCP
 // portion of cl_arq_controller::init() (arq_common.cc:1099-1170), then opt it
 // into its own residue-free RNG. The two private load_configuration() PHY calls
@@ -10319,6 +10416,16 @@ int cl_arq_controller::test_sim_inproc_2()
 	// MERCURY_SIM2_DEFEAT_FIRSTBLOCK_FIX=1 reproduces the PRE-FIX artifact behavior so the SAME
 	// binary shows fail-before (gate_ran==false). Production never sets it.
 	const bool defeat_firstblock_fix = env_i("MERCURY_SIM2_DEFEAT_FIRSTBLOCK_FIX", 0) != 0;
+	// STEPPER-CORE REWRITE (sim2-stepper-rewrite Phase a): MERCURY_SIM2_STEPPER selects the
+	// outer-loop driver. "legacy" (default) = the existing per-half-step pump loop. "outer" =
+	// the new symbol-pump driver that advances BOTH instances by ONE symbol in BOTH directions
+	// per outer iteration (drain-before-tick), routing the top-level catch-up drain/feed through
+	// the one-symbol helpers (sim_step_drain_one_symbol / sim_step_feed_one_symbol). Phase a does
+	// NOT yet no-op drain_playback_wait (the pump still drains TX inside the blocking waits), so
+	// "outer" must be byte-identical to "legacy" on the non-wedging paths (G2). Default legacy =
+	// fully reversible; every existing arm is byte-identical when the flag is unset.
+	const char* stepper_env = std::getenv("MERCURY_SIM2_STEPPER");
+	const bool use_outer_stepper = (stepper_env != nullptr && strcmp(stepper_env, "outer") == 0);
 	// Reset the cw0-CRC gate decision tally + TX-emit count for this run (read by the
 	// live-path regression).
 	sim2_gate_accepts = 0;
@@ -10567,6 +10674,100 @@ int cl_arq_controller::test_sim_inproc_2()
 			       size_buffer(B->audio.play), B->arq.hail_detected);
 			fflush(stdout);
 		}
+		if (use_outer_stepper)
+		{
+			// ================= OUTER-LOOP DRIVER (Phase a) =================
+			// One outer iteration advances BOTH instances by symbols in BOTH
+			// directions, top-level catch-up routed through the one-symbol helpers
+			// (sim_step_drain_one_symbol / sim_step_feed_one_symbol). PHASE a: the
+			// pump still drains TX inside the blocking waits (drain_playback_wait is
+			// NOT yet a no-op — that is Phase b), so this loop performs the SAME
+			// top-level catch-up the legacy body does (drain residual play -> wire,
+			// feed wire -> cap), just one symbol at a time. The fixed A-before-B
+			// service order + the per-symbol quantum preserve determinism (INV-1).
+			// Equivalence to legacy: where legacy drains the WHOLE play buffer and
+			// delivers the WHOLE wire in one catch-up call, this drains/feeds the
+			// same residual one symbol per inner step until the rings are empty.
+
+			// --- A's half-step (tx=A, rx=B). The pump (in A's blocking waits) uses
+			//     these ctx fields, so set them exactly as the legacy body did. ---
+			pump.tx = A; pump.rx = B;
+			pump.ch_tx2rx = &ch_a2b; pump.ch_rx2tx = &ch_b2a;
+			pump.wire_t2r = wire_a2b; pump.wire_r2t = wire_b2a;
+			sim2_activate(A);
+			A->arq.process_main();
+			// (1) DRAIN A.play -> ch_a2b -> wire_a2b, one symbol per step, until the
+			//     residual play is drained (matches legacy sim2_drain_to_wire whole-
+			//     buffer catch-up). Idle-fill is NOT done here (only when the play is
+			//     truly empty would legacy idle-fill; the legacy catch-up's idle-fill
+			//     fires once with an empty play — preserved by the trailing tick below).
+			{
+				cl_data_container* sdc = &A->ts.data_container;
+				size_t sp_bytes = (size_t)(sdc->Nofdm * sdc->interpolation_rate) * sizeof(double);
+				if (sp_bytes > 0 && size_buffer(A->audio.play) >= sp_bytes) {
+					while (size_buffer(A->audio.play) >= sp_bytes &&
+					       circular_buf_free_size(wire_a2b) >= sp_bytes)
+						sim_step_drain_one_symbol(A, &ch_a2b, wire_a2b, &pump);
+				} else {
+					// Empty play -> one idle-fill tick (legacy drains-nothing branch).
+					sim_step_drain_one_symbol(A, &ch_a2b, wire_a2b, &pump);
+				}
+			}
+			// (2) FEED wire_a2b -> B.cap, one symbol per step + per-frame decode
+			//     drive (drive_decode=true; same gate as legacy top-level catch-up).
+			{
+				cl_data_container* ddc = &B->ts.data_container;
+				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
+				while (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
+				       circular_buf_free_size(B->audio.cap) >= sp_bytes)
+					sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+			}
+			// Deliver any reply waiting in b2a into A if A is now idle (legacy parity).
+			if (size_buffer(A->audio.play) == 0)
+			{
+				cl_data_container* ddc = &A->ts.data_container;
+				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
+				while (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
+				       circular_buf_free_size(A->audio.cap) >= sp_bytes)
+					sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+			}
+
+			// --- B's half-step (tx=B, rx=A; symmetric). ---
+			pump.tx = B; pump.rx = A;
+			pump.ch_tx2rx = &ch_b2a; pump.ch_rx2tx = &ch_a2b;
+			pump.wire_t2r = wire_b2a; pump.wire_r2t = wire_a2b;
+			sim2_activate(B);
+			B->arq.process_main();
+			{
+				cl_data_container* sdc = &B->ts.data_container;
+				size_t sp_bytes = (size_t)(sdc->Nofdm * sdc->interpolation_rate) * sizeof(double);
+				if (sp_bytes > 0 && size_buffer(B->audio.play) >= sp_bytes) {
+					while (size_buffer(B->audio.play) >= sp_bytes &&
+					       circular_buf_free_size(wire_b2a) >= sp_bytes)
+						sim_step_drain_one_symbol(B, &ch_b2a, wire_b2a, &pump);
+				} else {
+					sim_step_drain_one_symbol(B, &ch_b2a, wire_b2a, &pump);
+				}
+			}
+			{
+				cl_data_container* ddc = &A->ts.data_container;
+				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
+				while (sp_bytes > 0 && size_buffer(wire_b2a) >= sp_bytes &&
+				       circular_buf_free_size(A->audio.cap) >= sp_bytes)
+					sim_step_feed_one_symbol(A, wire_b2a, &pump, /*drive_decode=*/false);
+			}
+			if (size_buffer(B->audio.play) == 0)
+			{
+				cl_data_container* ddc = &B->ts.data_container;
+				size_t sp_bytes = (size_t)(ddc->Nofdm * ddc->interpolation_rate) * sizeof(double);
+				while (sp_bytes > 0 && size_buffer(wire_a2b) >= sp_bytes &&
+				       circular_buf_free_size(B->audio.cap) >= sp_bytes)
+					sim_step_feed_one_symbol(B, wire_a2b, &pump, /*drive_decode=*/true);
+			}
+		}
+		else
+		{
+		// ================= LEGACY per-half-step pump loop (default) =================
 		// --- A's half-step (tx=A, rx=B; the pump co-routine-drives B in A's waits,
 		//     and delivers B's reply into A during A's listen waits — §10.5). ---
 		pump.tx = A; pump.rx = B;
@@ -10599,6 +10800,7 @@ int cl_arq_controller::test_sim_inproc_2()
 		sim2_deliver_from_wire(A, wire_b2a, &pump);
 		if (size_buffer(B->audio.play) == 0)
 			sim2_deliver_from_wire(B, wire_a2b, &pump, /*drive_decode=*/true);
+		}
 
 		if (!connected_seen &&
 		    (A->arq.link_status == CONNECTED || B->arq.link_status == CONNECTED))
