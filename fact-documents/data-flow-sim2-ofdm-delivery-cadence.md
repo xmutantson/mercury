@@ -609,3 +609,97 @@ accounting RECONCILIATION the design assigned to Phase c (couple TX-drain-time a
 to ONE symbol of channel time per iter; route the post-CONNECT control/BREAK turnaround through the
 outer loop). Per CLAUDE.md §1.2, after >3 turnaround-timing attempts this is STOPPED here as a
 distinct Phase-c workstream — Phase b ships the proven DATA-path wedge removal + clean OFDM carve.
+
+### §10.6 C0 — the ACK-turnaround timing fix (clock-attribution instrumented, 2026-06-09)
+PRE-CODE measurement (one-change-one-test, CLAUDE.md §4): a clock-attribution counter
+(`sim2_drain_to_wire` bulk vs `sim_step_drain_one_symbol` per-symbol) on the `--test-sim-sustain`
+outer arm (`MERCURY_SIM2_DBG=1`) pinpointed the double-count EXACTLY. Per-outer-iter clock delta
+(`[C0-ITER]`), batch-1 OFDM block (K=8, 79360 samples = 1653 ms airtime, `receiving_timeout=2686`):
+- `it=11` (`receiving_timer.start` @ clk=1395760, the post-TX timer is AFTER this point): the EGRESS
+  fires `sim2_drain_to_wire` ONCE for the whole block — `bulk=79360(n=1)`. This is the legit TX
+  airtime and it is PRE-TIMER, so it does NOT count against `receiving_timeout`. (Not the bug.)
+- `it=12`: `bulk=174840(n=141)` — **141 `sim2_drain_to_wire` calls add 174840 samples (3643 ms) in
+  ONE outer iter**, inside B/RSP's decode-drive `process_main` ACK turnaround (the nested legacy
+  pump `sim_inproc_pump_2` idle-fills/drains the reverse wire while B waits). The CMD's
+  `receiving_timer` (started @ it=11) accrues this whole 3643 ms → `elapsed=3694ms > 2686ms`,
+  `polls=0` → ACK-timeout → BREAK → re-send `bsi=0` (`fallback=1`) → duplicate → `bytes_ok=0`.
+- The outer loop's OWN per-symbol pacing is correctly bounded: `step=2480(n=2)` per iter (2 symbols).
+
+ROOT CAUSE (single sentence): in the OFDM data phase, the shared virtual clock is advanced INDE-
+PENDENTLY by every per-instance/per-direction `sim2_drain_to_wire` (egress whole-block + the nested
+ACK-turnaround pump's 141 idle-fills), so one outer iteration can jump the clock by HUNDREDS of
+symbol-times — but production's two concurrent audio threads advance ONE shared wall-clock by ONE
+symbol per quantum. The clock is double/over-counted because TX-drain and RX-consume each bump it.
+
+FIX (couple to ONE symbol of channel time per outer iter — the design's §6/§9 keystone): in the
+OFDM data phase (`sim_outer_stepper_ofdm_phase()`), the per-instance/per-direction drains
+(`sim2_drain_to_wire`, `sim_step_drain_one_symbol`) MOVE BYTES but do NOT each bump the shared clock;
+the OUTER LOOP advances the shared clock by EXACTLY ONE symbol ONCE per iteration (both directions
+advance one symbol of wire-time together, sharing one symbol of wall-clock). Consequence: the
+64-symbol block consume costs 64 symbol-times (its airtime, ONCE) paced one-symbol-per-iter by the
+outer loop; the existing RECEIVING_ACKS_DATA restart guard (arq_commander.cc, OFDM phase) pins the
+CMD's `receiving_timer` at ~0 while `wire_a2b>0`; after the block fully consumes, the receiving
+window measures only the genuine ACK round-trip (~ack_pattern 413 ms + ptt/decode margins) which
+fits inside `receiving_timeout=2686ms` → ACK detected → `nAcked_data>0` → no re-send → no duplicate
+→ `bytes_ok=1`. This is NOT widening `receiving_timeout` (forbidden threshold-masking); it removes
+the SPURIOUS clock time the sim injected that production never had.
+
+### §10.7 C0 — CORRECTION: the timing fix is NECESSARY but NOT SUFFICIENT — a DEEPER blocker (the RSP never TRANSMITS the clean big-block data-ACK). STOP per CLAUDE.md §1.2 (2026-06-09)
+The §10.6 timing model was VERIFIED correct but implementing it surfaced a SECOND, dominant blocker
+that the §10.6 timing fix CANNOT resolve. Two fix attempts on the timing (one-change-one-test, both
+reverted, full revalidation owed):
+- ATTEMPT-1 (whole-iter `g_sim2_outer_owns_clock` clock suppression + one tick/iter): HUNG. The
+  clock-driven waits (`ptt_busy_wait`/`pumped_settle_wait`) inside B's nested ACK turnaround exit on
+  `get_elapsed_time_ms() >= delay_ms`; suppressing the clock for the whole OFDM-phase iter froze them
+  → infinite spin inside one `process_main`. (Clock authority cannot be blanket-removed during the
+  nested waits that depend on it.) Reverted.
+- ATTEMPT-2 (gate OFF the `receive_ack_pattern` intra-call re-scan spin under outer+OFDM, so the
+  re-scan's ~94×`pumped_settle_wait(52)`=~4.9 s window no longer inflates the CMD timer): the timing
+  HALF FIXED — `polls=0 → polls=34`, the receiving window no longer overruns before the first poll.
+  But `bytes_ok` STAYED 0: the CMD polled 34× and detected NOTHING (`peak_matched=0/7
+  peak_metric=0.0`). Reverted.
+
+The DEEPER ROOT CAUSE (measured, pristine 5e7cc15 binary, `MERCURY_SIM2_DBG=1`):
+**the RSP carves the clean K=8 block but NEVER TRANSMITS a data-batch ACK on CFG16.** Evidence,
+all from the SAME run:
+- `[BIGBLOCK-ARQ] CLEAN block bsi=0 K=8 -> 1 ACK (all-ones) ... delivered_fifo=1` — the carve
+  (`bigblock_block_to_arq` / `bigblock_arq_decide_and_ack`, test_bigblock_arq_unit.cc:199-264) DELIVERS
+  to the FIFO + bumps bsi, but is DELIVERY-ONLY: it does NOT call `send_ack_pattern` /
+  `send_mfsk_ack_sack`. "1 ACK (all-ones)" is a LOG of the ARQ DECISION, not a wire transmission.
+- The generic clean-batch ACK transmitter is the ACK-GATE (`[RSP-RX-TIMEOUT] Entering ACK-GATE ...`
+  → `send_batch`/`send_ack_pattern`, arq_responder.cc:1490/1983). Across the whole run that print
+  fires **0 times** for the big-block; `stats.nAcks_sent_data = 0` throughout; the ONLY ACK on the
+  wire is the CONNECT handshake (`[TX-ACK-PAT] Sending ACK pattern on CONFIG_100`). There is NO
+  `[TX-ACK-PAT] ... CONFIG_16` and NO `[RSP-MFSK-SACK] clean path`.
+- So no data ACK is EVER on `wire_b2a`. The CMD's `[CMD-ACK-PAT] Timeout peak_metric=0.0` is therefore
+  CORRECT — there is nothing to detect. The CMD BREAKs and re-sends `bsi=0`; the RSP carves it AGAIN
+  (`fallback=1`); the duplicate fills the FIFO → `rx_have=1374/1374 bytes_ok=0`. The timing overrun
+  (§10.6) and the missing transmission are BOTH present, but the missing transmission is the
+  bytes_ok blocker: even with perfect timing there is no ACK to receive.
+
+WHY this was invisible until now: the single-arming `--test-bigblock-fullpath` (G5, bytes_ok=1) and
+`--test-bigblock-multicw` (G6) drive ONE instance's TX→PHY→RX carve and assert on the delivered FIFO /
+`messages_rx[]` DIRECTLY — they never run the 2-instance RSP→CMD data-ACK ROUND TRIP. The 2-instance
+sustain (G1) is the FIRST test that requires the RSP to actually transmit the clean big-block data-ACK
+back to the CMD — and that transmission path is not wired for the big-block carve under the 2-inst
+stepper (the carve, fired from B's decode-drive at depth 1, delivers but does not route to the
+ACK-GATE; B's top-level RECEIVING→ACK-GATE transition would see `rx_received=0` anyway because the
+carve's `copy_data_to_buffer()` already marked the slots ACKED and freed them).
+
+STATUS: STOPPED per CLAUDE.md §1.2 (two timing attempts failed to flip bytes_ok; the third diagnosis
+shows the scoped item — a timing coupling — is NOT the root cause) and §2 (a timing-only fix would
+mask the missing-ACK; forbidden). The C0 scope as written ("couple to one symbol of channel time so
+the batch-ACK completes inside receiving_timeout") presupposes the ACK is transmitted; it is not.
+The TRUE Phase-c fix is TWO coupled changes, both in the RSP/ARQ layer + the stepper clock:
+  (C0-a) WIRE THE CLEAN BIG-BLOCK DATA-ACK TRANSMISSION: after `bigblock_block_to_arq` carves a CLEAN
+         block (n_clean==K) on the live 2-inst path, the RSP must TRANSMIT the clean-batch ACK
+         (`send_mfsk_ack_sack` all-ones / `send_ack_pattern`) on CFG16 — the carve currently only
+         delivers+bumps. Audit `copy_data_to_buffer` freeing the slots before the ACK-GATE counts
+         them (the ACK-GATE's `rx_received` would be 0). This is the ACTUAL bytes_ok blocker.
+  (C0-b) THEN the §10.6 clock-coupling so the now-transmitted ACK round-trip fits receiving_timeout
+         WITHOUT the re-scan's full-window spin inflating the CMD timer. (ATTEMPT-2's re-scan gate is
+         the right shape for the timing half once an ACK actually exists to deliver.)
+This is a cross-layer ARQ change (CLAUDE.md §5), larger than the one-line timing coupling C0 was
+scoped as. NOT shipped; the worktree source is left at pristine 5e7cc15 (only this fact-doc updated).
+The two reverted attempts + this corrected diagnosis are recorded so the next session does not
+re-chase the timing-only framing.
