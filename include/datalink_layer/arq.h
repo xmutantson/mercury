@@ -1605,6 +1605,15 @@ public:
   // MERCURY_BIGBLOCK_DEFEAT_FIX=1 reproducer hook bypasses the clamp (returns stock_ftr)
   // so the SAME binary reproduces the pre-fix truncated-window corruption for the A/B.
   int bigblock_block_ftr_or(int stock_ftr);
+  // HOLD-CFG16 predicate (inv_holddesign.md §2.1) — PURE commander-side test: is the CURRENT
+  // big-block batch a SACK-RECOVERABLE PARTIAL at CFG16 that the per-frame BREAK/demote must
+  // NOT tear down? Returns true IFF the bigblock CFG16 rung is live (mirror of the
+  // bigblock_block_ftr_or self-gate: framing on, M!=MFSK, current==CONFIG_16) AND sack_v2 is
+  // negotiated AND data_batch_size==K (>1, the CFG16 K-pin arq_common.cc:1175) AND positive
+  // commander evidence that a partial SACK_RSP (0 < rx_count < K) was decoded for THIS batch
+  // (bigblock_partial_sack_this_batch). A TOTAL miss (no partial SACK_RSP decoded) or any
+  // off-rung path returns false -> the normal per-frame BREAK fires unchanged (no masking).
+  bool bigblock_partial_recoverable();
   // ACQUISITION-WINDOW POSITION GUARD — WAIT-FOR-TAIL (fact-doc §22, supersedes the §19
   // defer-and-re-arm REGRESSION). The §17 ftr clamp made the snapshot WAIT for a block-span
   // of FRESH symbols (the COUNT), but the snapshot still fires at a RANDOM ring write-head
@@ -1736,6 +1745,23 @@ public:
   // fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1
   // (skips the load_configuration tail election). Returns 0 on all-pass, 1 on failure.
   static int test_bigblock_climb_election();
+  // HOLD-ON-PARTIAL (inv_holddesign.md §4): proves a 6/8 PARTIAL carve at CFG16 HOLDS
+  // the rung instead of breaking CFG16->CFG15. Builds a CMD instance at the CFG16
+  // big-block rung (real grid, sack_v2, batch=K=8), sets frame_gearshift_just_applied
+  // (the first-big-block state), records a partial SACK_RSP (0<rx_count<K) via the SAME
+  // accept-site field bigblock_partial_sack_this_batch, and drives the synthetic-fire
+  // commander BREAK decision (test_bigblock_hold_apply_break_decision). FAIL-BEFORE
+  // (MERCURY_BIGBLOCK_DEFEAT_HOLD=1 forces the predicate off): the §7.13.33 break fires —
+  // config demotes to CFG15 and frame_shift_threshold doubles. PASS-AFTER (fix on): the
+  // predicate holds, config STAYS at CFG16, frame_shift_threshold is UNCHANGED, and the
+  // gap codewords stay queued for SACK retransmit. CLI: --test-bigblock-hold. Returns 0
+  // on all-pass, 1 on failure.
+  static int test_bigblock_hold_on_partial();
+  // Synthetic-fire helper: applies the EXACT commander BREAK-vs-HOLD decision the
+  // §7.13.33 pat path runs (the bigblock_partial_recoverable() guard at arq_commander.cc
+  // ~:3573). Returns true if HOLD was taken (config unchanged), false if the demote
+  // fired. defeat=1 forces the predicate OFF for the fail-before arm without a revert.
+  bool test_bigblock_hold_apply_break_decision(bool defeat);
   // R039 (race audit 2026-06-06) — OFDM SACK_RSP out-of-window reject test.
   // CLI: --test-sack-oow-reject. Builds a CRC8-VALID SACK_RSP payload with an
   // out-of-window batch_seq_id, drives the REAL decode_sack_v2_frame() (which is
@@ -2505,6 +2531,16 @@ public:
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
   int  frame_gearshift_retry_count;   // §7.13.33: retries on PHY-switched first batch before BREAK (rx_mute timing race)
+  // HOLD-CFG16 (inv_holddesign.md §2.2): commander-evaluable evidence that the CURRENT
+  // big-block batch carved a SACK-RECOVERABLE PARTIAL at CFG16. Set TRUE at the SACK_RSP
+  // accept when 0 < rx_count < data_batch_size on the bigblock CFG16 rung
+  // (arq_commander.cc ~:3022); reset FALSE at the NEW-DATA batch send (:1898) so it
+  // persists across the §7.13.33 single-retry of the SAME batch but never leaks to a fresh
+  // batch. Read by bigblock_partial_recoverable() to SUPPRESS the per-frame BREAK/demote at
+  // :3341/:3527 (HOLD CFG16, let SACK recover the gaps). Default false; only ever true on a
+  // sack_v2 bigblock CFG16 session, so off-rung the predicate is false and every per-frame
+  // BREAK is byte-identical.
+  bool bigblock_partial_sack_this_batch;
 
   // FIX-B — FLOOR-PROBE BACK-OFF state (gearshift-floor-probe-backoff.md §3).
   // probe_backoff_until_ms[i] is the opt_now_ms() timestamp BEFORE which the

@@ -566,6 +566,7 @@ cl_arq_controller::cl_arq_controller()
 	frame_shift_threshold=3;
 	frame_gearshift_just_applied=false;
 	frame_gearshift_retry_count=0;
+	bigblock_partial_sack_this_batch=false;  // HOLD-CFG16 (inv_holddesign.md §2.2)
 
 	turboshift_phase=TURBO_FORWARD;
 	turboshift_active=true;
@@ -4325,6 +4326,47 @@ int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 	if(block_nsymb <= 0) return stock_ftr;          // geometry unavailable -> leave stock
 	int block_ftr = block_nsymb + 10;               // block span + turnaround margin
 	return (block_ftr > stock_ftr) ? block_ftr : stock_ftr;
+}
+
+// bigblock_partial_recoverable(): HOLD-CFG16 predicate (inv_holddesign.md §2.1). PURE
+// commander-side test answering: should the per-frame gearshift BREAK/demote be SUPPRESSED
+// because the current big-block batch carved a SACK-RECOVERABLE PARTIAL at CFG16 that the
+// existing SACK machinery is already recovering at the SAME rung?
+//
+// A 6/8 PARTIAL is recoverable AT CFG16 by design: data_batch_size is pinned to K
+// (arq_common.cc:1175), the 2 gap codewords are selectively re-sent, and the block completes
+// via the block-CRC gate (bigblock_partial_block_crc_ok). The per-frame emergency BREAK
+// (arq_commander.cc:3341/:3527, fired on a first-block ACK-window miss under
+// frame_gearshift_just_applied) tears that down to CFG15 + doubles frame_shift_threshold —
+// a per-frame decision leaking onto the big-block rung. This predicate gates that BREAK.
+//
+// Returns true IFF ALL hold:
+//   (a) bigblock CFG16 rung live  : framing on && M!=MFSK && current==CONFIG_16
+//                                   (mirror of bigblock_block_ftr_or / bigblock_send_one_block
+//                                    self-gate, arq_common.cc:4074-4085 — so the two helpers
+//                                    cannot diverge and every off-rung path is byte-identical).
+//   (b) SACK v2 negotiated + batch == K (>1) : the partial SACK_RSP path is actually available
+//                                   (arq_responder.cc:1565/1619 dispatches for batch>1), else
+//                                   there is no recovery and holding would livelock.
+//   (c) commander evidence of a decoded partial SACK_RSP for THIS batch
+//                                   (bigblock_partial_sack_this_batch, set at the SACK_RSP
+//                                    accept when 0<rx_count<K). A TOTAL miss never sets it ->
+//                                    predicate false -> the normal BREAK fires (no masking).
+// Clause (e) of the design (block-CRC not-rejected) is satisfied implicitly: a partial
+// SACK_RSP is only dispatched when the RSP carved a real partial (a CRC-rejected block routes
+// to re-send, not to a partial bitmap), so a decoded partial SACK_RSP IS positive evidence the
+// block is recoverable. No threshold is touched; this only READS state.
+bool cl_arq_controller::bigblock_partial_recoverable()
+{
+	if(telecom_system == NULL) return false;
+	if(!(telecom_system->bigblock_framing_enabled
+	     && telecom_system->M != MOD_MFSK
+	     && current_configuration == CONFIG_16))
+		return false;                                   // (a) off the bigblock CFG16 rung
+	if(!sack_v2_enabled) return false;                  // (b) no SACK_RSP recovery path
+	int K = telecom_system->bigblock_codeword_count();
+	if(K <= 1 || data_batch_size != K) return false;    // (b) batch not the K-pin big-block batch
+	return bigblock_partial_sack_this_batch;            // (c) decoded partial SACK_RSP this batch
 }
 
 // bigblock_acq_window_fits(): ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). After

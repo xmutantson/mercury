@@ -1896,6 +1896,12 @@ void cl_arq_controller::process_messages_tx_data()
 		}
 		data_ack_received=NO;
 		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
+		// HOLD-CFG16 (inv_holddesign.md §2.2): clear the partial-SACK evidence on a NEW-DATA
+		// batch send so it cannot leak from a prior batch. Reset ONLY here (the new-data
+		// path), NOT on the §7.13.33 retransmit of the SAME batch (:1396 v1 retx-only path,
+		// unreachable on the sack_v2 bigblock session anyway), so the evidence survives the
+		// single-retry window that the HOLD path depends on.
+		bigblock_partial_sack_this_batch = false;
 		clear_snr_arm_for_data_ack_wait(); // §18: arm MUST be false on every data-ACK wait
 		connection_status=RECEIVING_ACKS_DATA;
 		ack_diag_peak_matched = 0;
@@ -3020,6 +3026,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				SACK_TRACE("dar=YES via SACK_RSP path rx_count=%d batch=%d retx=%d",
 					rx_count, data_batch_size, retransmit_count);
 				data_ack_received = YES;
+				// HOLD-CFG16 (inv_holddesign.md §2.2): record commander-side evidence that
+				// THIS batch carved a SACK-RECOVERABLE PARTIAL on the bigblock CFG16 rung
+				// (0 < rx_count < data_batch_size). This is the only field bigblock_partial_
+				// recoverable() can read on the commander (the RX-side n_clean is never seen
+				// here). A partial SACK_RSP can only be dispatched when the RSP carved a real
+				// partial (block-CRC accepted; a CRC-rejected block routes to re-send, not a
+				// partial bitmap), so this implicitly satisfies design clause (e). Persists
+				// across the §7.13.33 single-retry of this batch (reset only at the new-data
+				// send :1898). Gated on the bigblock CFG16 rung so it is false on every stock
+				// per-frame SACK and the predicate below stays off-rung-inert.
+				if(telecom_system != NULL
+				   && telecom_system->bigblock_framing_enabled
+				   && telecom_system->M != MOD_MFSK
+				   && current_configuration == CONFIG_16
+				   && rx_count > 0 && rx_count < data_batch_size)
+				{
+					bigblock_partial_sack_this_batch = true;
+				}
 				// CLEAN-BATCH VIABILITY (§9): a PARTIAL SACK keeps the link alive and
 				// drives retransmit of the missing frames (above), but the batch was
 				// NOT fully delivered — it must NOT promote the rung. Leave the
@@ -3337,6 +3361,28 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// path also sees a reset clean-streak.)
 		clean_batches_at_current_config = 0;
 
+		// HOLD-CFG16 (inv_holddesign.md §2.1) — SUPPRESS this break/demote when the current
+		// batch is a SACK-RECOVERABLE big-block PARTIAL at CFG16. A 6/8 carve is recoverable
+		// at the SAME rung (data_batch_size=K pin, partial SACK_RSP, block-CRC completion);
+		// the per-frame emergency BREAK here would wrongly demote CFG16->CFG15 + double
+		// frame_shift_threshold on the first-block ACK-window miss. Predicate is FALSE on a
+		// total miss (no partial SACK_RSP decoded) and off-rung, so a genuine CFG16 failure
+		// still breaks (no masking). Clear frame_gearshift_just_applied (the climb is proven —
+		// >=1 codeword arrived) so a later genuine full miss is no longer the "first batch
+		// after PHY switch" special case; let the existing SACK retransmit own the gaps.
+		if(frame_gearshift_just_applied && bigblock_partial_recoverable())
+		{
+			frame_gearshift_just_applied = false;
+			frame_gearshift_retry_count = 0;
+			printf("[GEARSHIFT-HOLD] CFG16 big-block PARTIAL is SACK-recoverable — HOLD CFG16 "
+				"(no break/demote, threshold %d unchanged); SACK recovers the gap codewords\n",
+				frame_shift_threshold);
+			fflush(stdout);
+			load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
+			add_message_control(REPEAT_LAST_ACK);
+			return;
+		}
+
 		// Frame gearshift just applied but data failed — BREAK immediately, no retry
 		if(frame_gearshift_just_applied)
 		{
@@ -3512,7 +3558,38 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// batch_seq_id) at a time when CMD is fully in RX mode. If the
 			// retry also fails, BREAK as before — config really is too
 			// aggressive.
+			// HOLD-CFG16 (inv_holddesign.md §2.1) — SUPPRESS the §7.13.33 break/demote on a
+			// SACK-RECOVERABLE big-block PARTIAL at CFG16. PRE-EMPTS both the single-retry and
+			// the BREAK below: a 6/8 carve is recoverable at the SAME rung (data_batch_size=K
+			// pin, partial SACK_RSP, block-CRC completion), so the first-block ACK-window miss
+			// must NOT demote CFG16->CFG15 + double frame_shift_threshold (:3539). The predicate
+			// requires POSITIVE evidence (a partial SACK_RSP was decoded for this batch,
+			// 0<rx_count<K) — a TOTAL miss leaves bigblock_partial_sack_this_batch false so this
+			// is skipped and the normal retry/BREAK fires (no masking). Clear
+			// frame_gearshift_just_applied (climb proven) and let the existing SACK retransmit
+			// recover the gaps; the per-batch failed-record above already kept the batch honest.
 			if(frame_gearshift_just_applied && ack_pattern_time_ms > 0
+			   && bigblock_partial_recoverable())
+			{
+				frame_gearshift_just_applied = false;
+				frame_gearshift_retry_count = 0;
+				printf("[GEARSHIFT-HOLD] CFG16 big-block PARTIAL is SACK-recoverable (pat) — HOLD "
+					"CFG16 (no break/demote, threshold %d unchanged); SACK recovers the gap codewords\n",
+					frame_shift_threshold);
+				fflush(stdout);
+				// The PENDING_ACK->ACK_TIMED_OUT forcing above (the ack_pattern_time_ms>0
+				// timeout block) already armed the gap codewords for retransmit at CFG16 on
+				// the next process_messages_tx_data() tick. RETURN here so a held partial does
+				// NOT fall through to emergency_nack_count++ (design §2.4-ii: the deep-SNR
+				// BREAK-PANIC escape stays intact — a held partial is not counted as a hard
+				// nack) and does NOT config_ladder_down / double frame_shift_threshold. The
+				// config HOLDS at CFG16; the SACK retransmit closes the 2 gaps.
+				telecom_system->data_container.frames_to_read = 4;
+				calculate_receiving_timeout();
+				receiving_timer.start();
+				return;
+			}
+			else if(frame_gearshift_just_applied && ack_pattern_time_ms > 0
 			   && frame_gearshift_retry_count == 0)
 			{
 				frame_gearshift_retry_count = 1;

@@ -933,6 +933,241 @@ int cl_arq_controller::test_bigblock_climb_election()
 }
 
 // ----------------------------------------------------------------------------
+// HOLD-ON-PARTIAL (inv_holddesign.md §2.1/§4) — a 6/8 PARTIAL carve at CFG16 HOLDS
+// the rung instead of breaking CFG16->CFG15.
+//
+// THE BUG (inv_breakpath.md §3, inv_holddesign.md §1.2): the FIRST big-block at CFG16
+// runs under frame_gearshift_just_applied=true (set at the climb SET_CONFIG,
+// arq_commander.cc:5059). When that block carves a 6/8 PARTIAL — recoverable AT CFG16
+// by the SACK machinery (data_batch_size=K pin, partial SACK_RSP, block-CRC completion)
+// — but its SACK_RSP is not decoded in the per-frame-sized CMD receiving window, the
+// §7.13.33 break path (arq_commander.cc ~:3573) DEMOTES CFG16->CFG15 and DOUBLES
+// frame_shift_threshold (:3539). The per-frame BREAK leaks onto the big-block rung.
+//
+// THE FIX: bigblock_partial_recoverable() (arq_common.cc) guards both break sites
+// (arq_commander.cc :3341/:3573). It returns true IFF the bigblock CFG16 rung is live,
+// sack_v2 is on, batch==K(>1), AND the commander recorded a partial SACK_RSP for THIS
+// batch (bigblock_partial_sack_this_batch, set 0<rx_count<K at the SACK_RSP accept).
+// When true the commander HOLDS CFG16: no break, no config_ladder_down, no threshold
+// doubling — the existing SACK retransmit recovers the 2 gap codewords at CFG16.
+//
+// SYNTHETIC-FIRE DECISION: test_bigblock_hold_apply_break_decision(defeat) applies the
+// EXACT §7.13.33 BREAK-vs-HOLD branch the commander runs and returns whether HOLD was
+// taken. defeat=1 forces the predicate OFF (the fail-before arm) WITHOUT a revert build.
+//
+// FAIL-BEFORE (defeat=1, predicate OFF): the break fires — config -> CFG15,
+//   frame_shift_threshold doubles (3->6). HOLD not taken.
+// PASS-AFTER (defeat=0, predicate ON with the recorded partial SACK_RSP): HOLD taken —
+//   config STAYS CFG16, frame_shift_threshold UNCHANGED (still 3), gaps stay queued.
+// CLI: --test-bigblock-hold. Returns 0 on all-pass, 1 on failure.
+// ----------------------------------------------------------------------------
+
+// Synthetic-fire helper: run the commander's §7.13.33 BREAK-vs-HOLD decision verbatim
+// on THIS instance's state. Mirrors arq_commander.cc ~:3573 (the pat-ACK first-block
+// break): if the bigblock partial is recoverable -> HOLD (touch nothing); else -> the
+// demote (config_ladder_down + frame_shift_threshold *= 2). defeat=1 forces the
+// predicate OFF so the SAME binary reproduces the pre-fix demote. Returns true if HOLD.
+bool cl_arq_controller::test_bigblock_hold_apply_break_decision(bool defeat)
+{
+	bool recoverable = defeat ? false : this->bigblock_partial_recoverable();
+	if(this->frame_gearshift_just_applied && recoverable)
+	{
+		// HOLD CFG16 — exactly the production HOLD branch: clear the first-batch flag,
+		// do NOT demote, do NOT double the threshold. The SACK retransmit (the gap
+		// codewords already queued in retransmit_frames[]) recovers the block at CFG16.
+		this->frame_gearshift_just_applied = false;
+		this->frame_gearshift_retry_count  = 0;
+		printf("[TEST-BIGBLOCK-HOLD] decision=HOLD: CFG16 retained, threshold=%d unchanged, "
+			"retx_queued=%d\n", this->frame_shift_threshold, this->retransmit_count);
+		fflush(stdout);
+		return true;
+	}
+	// DEMOTE — the §7.13.33 pat break: lower the ceiling one rung + double the threshold.
+	int working_config = config_ladder_down(this->data_configuration, this->robust_enabled);
+	this->frame_gearshift_just_applied = false;
+	this->frame_gearshift_retry_count  = 0;
+	this->frame_shift_threshold *= 2;
+	this->data_configuration       = working_config;
+	this->negotiated_configuration = working_config;
+	this->current_configuration    = working_config;
+	printf("[TEST-BIGBLOCK-HOLD] decision=DEMOTE: CFG16 -> %d, threshold now %d\n",
+		working_config, this->frame_shift_threshold);
+	fflush(stdout);
+	return false;
+}
+
+int cl_arq_controller::test_bigblock_hold_on_partial()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-BIGBLOCK-HOLD] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	printf("[TEST-BIGBLOCK-HOLD] ===== 6/8 PARTIAL at CFG16 HOLDS the rung "
+	       "(inv_holddesign.md §2.1) =====\n");
+	fflush(stdout);
+
+	// Pin K geometry deterministically (side-effect-free save/restore).
+	const int K_target = BB_TEST_K;     // 8
+	char k_env[16];
+	std::snprintf(k_env, sizeof(k_env), "%d", K_target);
+	const char* prev_k = std::getenv("MERCURY_BIGBLOCK_K");
+	std::string prev_k_saved = prev_k ? std::string(prev_k) : std::string();
+	bool had_prev_k = (prev_k != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_BIGBLOCK_K", k_env);
+#else
+	setenv("MERCURY_BIGBLOCK_K", k_env, 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev_k) _putenv_s("MERCURY_BIGBLOCK_K", prev_k_saved.c_str());
+		else           _putenv_s("MERCURY_BIGBLOCK_K", "");
+#else
+		if(had_prev_k) setenv("MERCURY_BIGBLOCK_K", prev_k_saved.c_str(), 1);
+		else           unsetenv("MERCURY_BIGBLOCK_K");
+#endif
+	};
+
+	// Build a CMD instance at the CFG16 big-block rung (mirror build_pair bringup).
+	auto build_cmd = [&]() -> cl_arq_controller* {
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* a  = new cl_arq_controller();
+		a->telecom_system = ts;
+		a->role            = COMMANDER;
+		a->sack_enabled    = true;
+		a->sack_v2_enabled = true;
+		a->axis3_sack_mode = 1;            // SACK_MODE_ON
+		a->compression_enabled = false;
+		a->bigblock_skip_fifo_delivery = true;
+		a->nMessages          = 255;
+		a->max_data_length    = 170;
+		a->max_message_length = 200;
+		a->max_header_length  = 6;
+		a->init_messages_buffers();
+		// Land on the CFG16 big-block rung via the SAME gearshift entry the climb uses.
+		ts->bigblock_framing_enabled = true;
+		a->load_configuration(CONFIG_16, FULL, YES);   // elects data_batch_size = K = 8
+		// FIRST big-block at CFG16: frame_gearshift_just_applied was set at the climb
+		// SET_CONFIG (arq_commander.cc:5059) and persists into the first block's ACK wait.
+		a->frame_gearshift_just_applied = true;
+		a->frame_gearshift_retry_count  = 1;           // §7.13.33 single-retry already spent
+		a->current_configuration = CONFIG_16;
+		a->data_configuration    = CONFIG_16;
+		a->negotiated_configuration = CONFIG_16;
+		a->frame_shift_threshold = 3;                  // the init value (arq_common.cc:566)
+		// Simulate the 6/8 carve having queued the 2 gap codewords for SACK retransmit.
+		a->retransmit_count = 2;
+		return a;
+	};
+	auto free_cmd = [&](cl_arq_controller* a) {
+		cl_telecom_system* ts = a->telecom_system; delete a; delete ts;
+	};
+
+	// Sanity: the rung elected K=8 (so data_batch_size==K, predicate clause (b)).
+	{
+		cl_arq_controller* a = build_cmd();
+		check(a->data_batch_size == K_target,
+		      "CFG16 rung elected data_batch_size == K == 8 (predicate clause b)");
+		free_cmd(a);
+	}
+
+	// ===================== FAIL-BEFORE (predicate forced OFF) ====================
+	// A 6/8 partial SACK_RSP WAS recorded for this batch, but defeat=1 forces the
+	// predicate off — so the §7.13.33 break fires: CFG16 demotes to CFG15 and
+	// frame_shift_threshold doubles. This is the PRE-FIX behaviour.
+	{
+		cl_arq_controller* a = build_cmd();
+		a->bigblock_partial_sack_this_batch = true;     // 0<rx_count<K was decoded
+		int thr_before = a->frame_shift_threshold;      // 3
+		bool held = a->test_bigblock_hold_apply_break_decision(/*defeat=*/true);
+		int cfg15 = config_ladder_down(CONFIG_16, a->robust_enabled);
+		bool demoted = (!held)
+		            && (a->current_configuration == cfg15)
+		            && (a->frame_shift_threshold == thr_before * 2);
+		printf("[TEST-BIGBLOCK-HOLD] FAIL-BEFORE: held=%d cfg=%d(want %d) thr=%d(want %d)\n",
+			(int)held, a->current_configuration, cfg15, a->frame_shift_threshold,
+			thr_before * 2);
+		fflush(stdout);
+		check(demoted,
+		      "FAIL-BEFORE reproduces: predicate OFF -> 6/8 PARTIAL DEMOTES CFG16->CFG15 "
+		      "+ frame_shift_threshold doubles");
+		free_cmd(a);
+	}
+
+	// ===================== PASS-AFTER (predicate ON, fix) ========================
+	// Same 6/8 partial SACK_RSP recorded; the predicate is ON. The commander HOLDS
+	// CFG16: no demote, frame_shift_threshold UNCHANGED, gaps stay queued for SACK
+	// retransmit. ALSO assert the predicate itself returns true.
+	{
+		cl_arq_controller* a = build_cmd();
+		a->bigblock_partial_sack_this_batch = true;     // 0<rx_count<K was decoded
+		bool pred = a->bigblock_partial_recoverable();
+		int thr_before = a->frame_shift_threshold;      // 3
+		int retx_before = a->retransmit_count;          // 2 gap codewords
+		bool held = a->test_bigblock_hold_apply_break_decision(/*defeat=*/false);
+		bool holds = held
+		          && pred
+		          && (a->current_configuration == CONFIG_16)
+		          && (a->data_configuration == CONFIG_16)
+		          && (a->frame_shift_threshold == thr_before)     // NOT doubled
+		          && (a->retransmit_count == retx_before);        // gaps still queued
+		printf("[TEST-BIGBLOCK-HOLD] PASS-AFTER: pred=%d held=%d cfg=%d(want %d) "
+			"thr=%d(want %d) retx=%d(want %d)\n",
+			(int)pred, (int)held, a->current_configuration, CONFIG_16,
+			a->frame_shift_threshold, thr_before, a->retransmit_count, retx_before);
+		fflush(stdout);
+		check(holds,
+		      "PASS-AFTER: predicate ON -> 6/8 PARTIAL HOLDS CFG16 (no demote, threshold "
+		      "unchanged, gap codewords queued for SACK retransmit)");
+		free_cmd(a);
+	}
+
+	// ===================== NEGATIVE: total miss still breaks =====================
+	// A TOTAL miss (no partial SACK_RSP decoded -> bigblock_partial_sack_this_batch
+	// false) must NOT hold — the predicate is false and the normal break fires. This
+	// proves the fix does not mask a genuine CFG16 failure.
+	{
+		cl_arq_controller* a = build_cmd();
+		a->bigblock_partial_sack_this_batch = false;    // no partial SACK_RSP this batch
+		a->retransmit_count = 0;                        // nothing recovered
+		bool pred = a->bigblock_partial_recoverable();
+		bool held = a->test_bigblock_hold_apply_break_decision(/*defeat=*/false);
+		int cfg15 = config_ladder_down(CONFIG_16, a->robust_enabled);
+		bool breaks = (!pred) && (!held) && (a->current_configuration == cfg15);
+		printf("[TEST-BIGBLOCK-HOLD] NEGATIVE total-miss: pred=%d held=%d cfg=%d(want %d)\n",
+			(int)pred, (int)held, a->current_configuration, cfg15);
+		fflush(stdout);
+		check(breaks,
+		      "NEGATIVE: total miss (no partial SACK_RSP) is NOT held -> normal BREAK fires "
+		      "(no masking of a genuine CFG16 failure)");
+		free_cmd(a);
+	}
+
+	// ===================== NEGATIVE: off-rung never holds ========================
+	// Off the bigblock CFG16 rung (framing off) the predicate is false even with the
+	// partial flag set, so a per-frame break is byte-identical to baseline.
+	{
+		cl_arq_controller* a = build_cmd();
+		a->telecom_system->bigblock_framing_enabled = false;   // off the bigblock rung
+		a->bigblock_partial_sack_this_batch = true;
+		bool pred = a->bigblock_partial_recoverable();
+		check(!pred,
+		      "NEGATIVE: off the bigblock CFG16 rung the predicate is FALSE (per-frame "
+		      "BREAK byte-identical to baseline)");
+		free_cmd(a);
+	}
+
+	restore_env();
+	printf("[TEST-BIGBLOCK-HOLD] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ----------------------------------------------------------------------------
 // The regression.
 // ----------------------------------------------------------------------------
 int cl_arq_controller::test_bigblock_arq_unit()
