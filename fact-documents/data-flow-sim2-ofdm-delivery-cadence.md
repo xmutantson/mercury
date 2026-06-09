@@ -405,3 +405,77 @@ wedge; the geometry-helper ring-zeroing was the sole remaining blocker to full
   VARA's bar); HW confirmation pending (testbed emulator low-pass collapse).
   Numbers + harness: `bigblock_p3_hw/results_simproof.json`,
   `bigblock_p3_hw/measure_compress.cc`.
+
+## §9 MULTI-BATCH WEDGE — 2nd ASSAULT (2026-06-08, bb-d3 @9ee13f6) — STILL ARCHITECTURAL
+
+Re-attacked the §7 wedge on `fix/bigblock-d3-carve`. **Result: re-confirmed
+ARCHITECTURAL STOP — 4 MORE fix attempts (8 total with §7.4), all reverted; tree
+restored to 9ee13f6.** New facts beyond §7:
+
+### §9.1 The bb-d3 BASELINE is broader-broken than §7 framed
+At clean 9ee13f6 the SIM_INPROC stepper delivers **ZERO OFDM data bytes on ANY
+free-flow arm**, not just multi-batch:
+- Legacy 19-B short-text arm (ROBUST_0/MFSK): **WORKS** — `rx="MERCURY-2INST-HELLO"`,
+  CONNECT clean, 0 deadlock-breaks. (The MFSK/ROBUST handshake + small-payload path
+  is the ONLY healthy delivery path.)
+- `--test-bigblock-multicw` (PINNED CFG16, K=8 single block, STOP_AFTER_FIRST_BLOCK):
+  **PASSES its unit asserts** (arm A clean=8/8 byteok) — but that is the narrow
+  pinned single-block path, NOT free-flow.
+- **Free-flow `MERCURY_SIM2_PAYLOAD_BYTES` (the discriminator's CONTROL): 0 bytes.**
+  • Clean climb 20000 B: `switch_seq 100->101->102->0->100`, reaches CONFIG_0, decodes
+    9 `RX-BATCH-SEQ` frames, then collapses to ROBUST_0; `rx_bytes=83/20000 stalled=1`,
+    2 deadlock-breaks (matches `DISCRIMINATOR_RESULT.json` byte-for-byte).
+  • **Pinned CFG16 500 B / 1500 B: ALSO 0/N**, with deadlock-breaks DURING the ROBUST_0
+    CONNECT handshake (128960/327360-B tails abandoned) — i.e. even the pre-OFDM
+    handshake TX wedges when the run is destined for CFG16. So this is NOT a
+    "batch-0-works, only multi-batch-sustain-fails" gap (the §7.1 framing); the
+    free-flow OFDM data delivery is broken from the first SACK batch.
+  • The memory note "pinned CFG16 bytes_ok=1 in iters=4" was on `wf-sim-controlloop`
+    @6f3c83a (the §7 base), NOT on bb-d3 — bb-d3 has diverged.
+
+### §9.2 The 4 new attempts (what + why each failed)
+1. **§7.6 (a) — `process_messages_tx_data` depth>0 deferral guard** (SIM-only, +accessor
+   `arq_sim_inproc_depth()`): batch-0 delivers, but batch-1 STARVES. Live trace
+   (`MERCURY_SIM2_TXDBG`): after batch-0 ACK the CMD is in TRANSMITTING_DATA (conn=1)
+   but is ONLY ever entered at depth=1 (1234 consecutive deferrals) — the depth-0
+   re-entry the guard relies on NEVER happens because the stepper is wedged inside the
+   peer's nested wait (the iteration counter stays `it=0` through the whole window).
+   Link-timeout → re-HAIL → mutual `RECEIVING (conn=2)` deadlock. (a) is FALSIFIED: the
+   deferred-to depth-0 tick is unreachable while the peer holds the stepper.
+2. **§7.6 (b) — blanket symmetric pump at every depth>0** (absolute-identity a/b
+   drain+deliver, drive_decode=false): REGRESSED CONNECT — the symmetric capture feed
+   desyncs the MFSK handshake (re-confirms §7.4 #2).
+3. **Symmetric pump GATED to a nested-TX-drain window** (`g_sim2_in_nested_drain`
+   bracket in `drain_playback_wait` at depth>0) + CONNECTED+OFDM gate: still breaks the
+   pinned-CFG16 turnaround — the gate fires during batch-0's own SACK-ACK turnaround
+   (B's ACK at CFG16 is `is_ofdm_config==true`) and the out-of-cadence delivery corrupts
+   the decode pacing.
+4. **Saturation-keyed stranded-transmitter drain** (`sim2_pump_drain_stranded`: at
+   depth>0, key on the global `playback_buffer`==a/b to name the ACTIVE transmitter
+   ORIENTATION-FREE, act ONLY when its outgoing wire has SATURATED — the precise wedge
+   signal, no-op on a normal turnaround that never fills the wire): does NOT regress the
+   legacy arm (verified identical), but still does not DELIVER the free-flow batch
+   (frames decode — 9 `RX-BATCH-SEQ` — but `rx_have=0`; delivery-to-FIFO is blocked
+   separately, and the ROBUST handshake wedge is upstream of the OFDM gate).
+
+### §9.3 Why localized fixes keep failing — the irreducible coupling
+The single-thread stepper couples THREE things that production runs concurrently on
+separate threads: (i) the depth-0 per-frame DECODE-DRIVE (needs exact single-symbol
+pacing, no interference), (ii) the SACK-ACK turnaround (small nested TX that must NOT
+trigger symmetric delivery), and (iii) a nested multi-frame batch TX that MUST be
+delivered. No single predicate (depth / decode-drive-depth / CONNECTED+OFDM /
+wire-saturation / active-instance) cleanly separates (ii) from (iii) AND leaves (i)
+untouched — every gate that catches (iii) also perturbs (i) or (ii). This is the §7.3
+orientation/reentrancy trap restated with the full coupling.
+
+### §9.4 The ONLY faithful fix is the stepper-core redesign (§7.6 implied, now mandatory)
+Decouple `send_batch()` from the BLOCKING `drain_playback_wait()` under SIM_INPROC:
+the OUTER stepper loop must be the SOLE DAC-drain + RX-consume driver (one symbol per
+instance per outer iteration, both directions, like the two real audio threads), and
+`send_batch` must QUEUE-and-return rather than spin-drain. That removes the nested-drain
+reentrancy entirely (no depth>0 TX-drain ever exists), so (i)/(ii)/(iii) stop sharing a
+call stack. This is a multi-day stepper rewrite with real regression risk to the
+VALIDATED MFSK/legacy/bigblock-unit paths and a full GATE-2 + `--test-sim-clock` +
+`--test-climb-engine` re-validation — NOT a localized helper patch. Recommend a fresh
+design doc + plan-first (CLAUDE.md §4) before any code. Per CLAUDE.md §1.2 (≥3 failed
+attempts ⇒ STOP, architectural) no further localized iteration on the current stepper.
