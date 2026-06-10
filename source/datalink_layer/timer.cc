@@ -122,6 +122,18 @@ cl_timer::cl_timer()
 	microseconds=0;
 	nanoseconds=0;
 	counting=NO;
+	// Value-init the timespecs so an out-of-order stop()/_continue()/update()
+	// (called before the matching start() on some recovery/config-transition
+	// paths) reads tv_nsec=0 instead of uninitialized stack garbage. Without
+	// this, stopTime.tv_nsec - startTime.tv_nsec subtracts garbage and can
+	// overflow signed long (tv_nsec is 4-byte long on MinGW), which UBSan
+	// flags as sub_overflow at timer.cc:152 (also :169/:187). With both
+	// timespecs zeroed, the pre-start read computes 0-0=0 (defined). No effect
+	// on the normal start->stop path (start() overwrites startTime first).
+	startTime.tv_sec=0;
+	startTime.tv_nsec=0;
+	stopTime.tv_sec=0;
+	stopTime.tv_nsec=0;
 }
 
 cl_timer::~cl_timer()
@@ -135,6 +147,12 @@ void cl_timer::reset()
 	miliSeconds=0;
 	microseconds=0;
 	nanoseconds=0;
+	// Keep the timespecs defined too (defensive; start() overwrites startTime
+	// immediately after reset() on the normal path — see ctor note).
+	startTime.tv_sec=0;
+	startTime.tv_nsec=0;
+	stopTime.tv_sec=0;
+	stopTime.tv_nsec=0;
 }
 
 void cl_timer::start()

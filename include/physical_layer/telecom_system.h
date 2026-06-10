@@ -76,32 +76,42 @@ struct st_reinit_subsystems{
 	int pre_equalization_channel=YES;
 };
 
+// Value-init every member (default member initializers) so a default-constructed
+// st_receive_stats — the persistent cl_telecom_system::receive_stats AND every
+// returned-by-value instance — starts fully zeroed. This closes the stale/
+// uninitialized-scalar read (e.g. delay_of_last_decoded_message,
+// freq_offset_of_last_decoded_message) that the receive path can consume on an
+// early-return/first-frame path before any producer writes it (diagnosis §5/H3).
+// UBSan cannot see this class (it's not a bool/enum invalid-value load), so it
+// is a defensive root-cause init, not a band-aid. Purely additive: the normal
+// receive path already overwrites these before use; this only defines the
+// before-first-write state.
 struct st_receive_stats{
-	int iterations_done;
-	int delay;
-	int delay_of_last_decoded_message;
-	int time_peak_symb_location;
-	int time_peak_subsymb_location;
-	int sync_trials;
-	double phase_error_avg;
-	double freq_offset;
-	double freq_offset_of_last_decoded_message;
-	int message_decoded;
-	double SNR;
-	double signal_stregth_dbm;
-	st_power_measurment power_measurment;
-	int crc;
-	int all_zeros;
-	int mfsk_search_raw;  // MFSK anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
-	int ofdm_search_raw;  // OFDM anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
-	bool ofdm_batch_active;  // true when consecutive OFDM frames expected (narrow BATCH window)
-	int frame_overflow_symbols;  // >0: MFSK frame extends beyond captured audio by this many symbols
-	bool frame_data_missing;  // true: preamble found but data symbols are silence (incomplete capture)
-	bool frame_skip_var_aborted;  // true: trial loop aborted on consecutive SKIP-VAR — caller should zero false preamble and advance cursor past noise region
-	double coarse_metric;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
-	double ofdm_drift_per_frame;  // IIR-filtered prediction error (interp samples) for BATCH verify
-	double mean_H;  // mean(|estimated_channel|) over MEASURED subcarriers for the last OFDM trial; -1 if not computed. Test-observability for the SKIP-H gate (write-once per receive, read by unit tests only). See fact-documents/ofdm-fine-timing-magnitude.md §3.5.
-	int last_eff_preamble_nsymb;  // LEVER P: actual preamble-symbol count of the most recently extracted OFDM frame (FULL anchor vs MINI tail). Read by the ARQ position-advance (rx_frame = last_eff_preamble_nsymb + Nsymb). Defaults to preamble_nSymb when amortization is off.
+	int iterations_done = 0;
+	int delay = 0;
+	int delay_of_last_decoded_message = 0;
+	int time_peak_symb_location = 0;
+	int time_peak_subsymb_location = 0;
+	int sync_trials = 0;
+	double phase_error_avg = 0.0;
+	double freq_offset = 0.0;
+	double freq_offset_of_last_decoded_message = 0.0;
+	int message_decoded = 0;
+	double SNR = 0.0;
+	double signal_stregth_dbm = 0.0;
+	st_power_measurment power_measurment = {};
+	int crc = 0;
+	int all_zeros = 0;
+	int mfsk_search_raw = 0;  // MFSK anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
+	int ofdm_search_raw = 0;  // OFDM anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
+	bool ofdm_batch_active = false;  // true when consecutive OFDM frames expected (narrow BATCH window)
+	int frame_overflow_symbols = 0;  // >0: MFSK frame extends beyond captured audio by this many symbols
+	bool frame_data_missing = false;  // true: preamble found but data symbols are silence (incomplete capture)
+	bool frame_skip_var_aborted = false;  // true: trial loop aborted on consecutive SKIP-VAR — caller should zero false preamble and advance cursor past noise region
+	double coarse_metric = 0.0;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
+	double ofdm_drift_per_frame = 0.0;  // IIR-filtered prediction error (interp samples) for BATCH verify
+	double mean_H = -1.0;  // mean(|estimated_channel|) over MEASURED subcarriers for the last OFDM trial; -1 if not computed (default matches the per-receive reset at telecom_system.cc:1052). Test-observability for the SKIP-H gate (write-once per receive, read by unit tests only). See fact-documents/ofdm-fine-timing-magnitude.md §3.5.
+	int last_eff_preamble_nsymb = 0;  // LEVER P: actual preamble-symbol count of the most recently extracted OFDM frame (FULL anchor vs MINI tail). Read by the ARQ position-advance (rx_frame = last_eff_preamble_nsymb + Nsymb). Defaults to preamble_nSymb when amortization is off.
 };
 
 
