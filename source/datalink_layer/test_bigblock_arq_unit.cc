@@ -955,6 +955,102 @@ int cl_arq_controller::test_bigblock_climb_election()
 		free_pair(cmd, tsc, rsp, tsr);
 	}
 
+	// ===================== WALL-B FIX-5: CFG16 CARVE-COOLDOWN RE-ELECTION REFUSAL =====
+	// (fix5/FIX5_DESIGN.md §4; WALLB_HW2 limit cycle.) After a FIX-4 carve-viability demote
+	// arms the cooldown, the gearshift/turbo climb gates MUST refuse to re-elect the
+	// carve-dead CFG16 rung (cap the proposed target at per-frame CFG15) — and the cooldown
+	// must SURVIVE the supershift_proven_ceiling reset that finish_turbo_direction performs.
+	// This drives the production apply_bigblock_cooldown_cap() member + the arm/clear field
+	// discipline on a REAL CMD/RSP pair (load_configuration / framing state real). FAIL-BEFORE
+	// (-DWALLB_FIX5_FAILBEFORE): the cap helpers no-op (-1/0) so CFG16 is NOT refused and the
+	// cooldown never arms -> these checks FAIL (the re-climb limit cycle). PASS-AFTER: refused.
+	{
+		cl_arq_controller *cmd, *rsp; cl_telecom_system *tsc, *tsr;
+		build_pair(cmd, tsc, rsp, tsr);
+		tsc->bigblock_framing_enabled = true;
+		tsr->bigblock_framing_enabled = true;
+		cmd->robust_enabled = YES;            // full ladder in play (CFG15 = config_ladder_down(CFG16))
+		cmd->load_configuration(CONFIG_16, FULL, YES);   // on the big-block rung
+		rsp->load_configuration(CONFIG_16, FULL, YES);
+
+		// (1) BEFORE the demote: no cooldown -> CFG16 election passes through (byte-identical).
+		check(cmd->bigblock_carve_cooldown_batches == 0
+		      && cmd->apply_bigblock_cooldown_cap(CONFIG_16) == CONFIG_16,
+		      "FIX-5: before any demote the cooldown is disarmed and CFG16 election is NOT refused (no-op)");
+
+		// (2) ARM the cooldown exactly as the FIX-4 deadline site does (the production arm).
+		cmd->bigblock_carve_cooldown_span = bigblock_carve_cooldown_next_span(
+			(cmd->bigblock_carve_cooldown_batches > 0) ? cmd->bigblock_carve_cooldown_span : 0,
+			BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+		cmd->bigblock_carve_cooldown_batches = cmd->bigblock_carve_cooldown_span;
+		check(cmd->bigblock_carve_cooldown_batches == BB_CARVE_COOLDOWN_BASE,
+		      "FIX-5: the 1st carve-viability demote arms the cooldown at BASE batches");
+
+		// (3) RE-ELECTION REFUSED: while armed, the climb-cap refuses CFG16 -> per-frame CFG15.
+		check(cmd->apply_bigblock_cooldown_cap(CONFIG_16) == CONFIG_15,
+		      "FIX-5: while the cooldown is armed, the CFG16 big-block rung election is REFUSED (capped to CFG15)");
+
+		// (4) PER-FRAME DELIVERY PATH SELECTED: CFG15 is the FIX-4 fallback rung AND not
+		// carve-gated (decodable per-frame), so the link runs there while held.
+		check(bigblock_carve_fallback_target(CONFIG_16, /*rung_live=*/true,
+		        cmd->emergency_nack_threshold, cmd->emergency_nack_threshold, /*robust*/true) == CONFIG_15
+		      && cmd->apply_bigblock_cooldown_cap(CONFIG_15) == CONFIG_15,
+		      "FIX-5: the per-frame CFG15 delivery rung is selected (FIX-4 fallback == cooldown ceiling, not refused)");
+
+		// (5) TURBO-RESET SURVIVAL (the core invariant): replay finish_turbo_direction's
+		// supershift_proven_ceiling = start_config(=CFG16) reset; the cooldown STILL refuses CFG16.
+		cmd->supershift_proven_ceiling = CONFIG_16;     // <- the :4147 reset that defeats FIX-4
+		check(cmd->apply_bigblock_cooldown_cap(CONFIG_16) == CONFIG_15,
+		      "FIX-5: cooldown SURVIVES the supershift_proven_ceiling=CFG16 reset and STILL refuses CFG16 (limit-cycle break)");
+
+		// (6) CFG15 per-frame data-ACK does NOT clear (INV-B3 — the load-bearing gate). Replay
+		// the production clear gate: current_config==CONFIG_16 && framing live. At CFG15 it is false.
+		{
+			int cfg_at_ack = CONFIG_15;
+			bool bb_live = tsc->bigblock_framing_enabled && tsc->M != MOD_MFSK;
+			if(cfg_at_ack == CONFIG_16 && bb_live) {   // gate FALSE at CFG15 -> no clear
+				cmd->bigblock_carve_cooldown_batches = 0; cmd->bigblock_carve_cooldown_span = 0;
+			}
+			check(cmd->bigblock_carve_cooldown_batches == BB_CARVE_COOLDOWN_BASE,
+			      "FIX-5: a per-frame CFG15 data-ACK does NOT clear the cooldown (INV-B3: only a CFG16 carve clears)");
+		}
+
+		// (7) CFG16 carve-success data-ACK CLEARS the cooldown -> CFG16 re-electable. Replay the
+		// production clear gate with current_config==CONFIG_16 && framing live.
+		{
+			int cfg_at_ack = CONFIG_16;
+			bool bb_live = tsc->bigblock_framing_enabled && tsc->M != MOD_MFSK;
+			if(cmd->bigblock_carve_cooldown_batches > 0 && cfg_at_ack == CONFIG_16 && bb_live) {
+				cmd->bigblock_carve_cooldown_batches = 0; cmd->bigblock_carve_cooldown_span = 0;
+			}
+			check(cmd->bigblock_carve_cooldown_batches == 0
+			      && cmd->apply_bigblock_cooldown_cap(CONFIG_16) == CONFIG_16,
+			      "FIX-5: a CFG16 big-block carve data-ACK CLEARS the cooldown -> CFG16 re-electable");
+		}
+
+		// (8) EXPONENTIAL GROWTH ON REPEAT DEMOTES, CAPPED. Re-arm, then re-demote WHILE active
+		// (carve still dead) -> the span doubles, capped at MAX (no overflow).
+		cmd->bigblock_carve_cooldown_span    = BB_CARVE_COOLDOWN_BASE;   // 24, armed
+		cmd->bigblock_carve_cooldown_batches = BB_CARVE_COOLDOWN_BASE;
+		int span_seq_ok = 1;
+		int expect[] = {48, 96, 192, 384, 384};   // doubling then CAP-clamped, no 768
+		for(int i=0;i<5;i++) {
+			cmd->bigblock_carve_cooldown_span = bigblock_carve_cooldown_next_span(
+				(cmd->bigblock_carve_cooldown_batches > 0) ? cmd->bigblock_carve_cooldown_span : 0,
+				BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+			cmd->bigblock_carve_cooldown_batches = cmd->bigblock_carve_cooldown_span;
+			if(cmd->bigblock_carve_cooldown_span != expect[i]) span_seq_ok = 0;
+		}
+		check(span_seq_ok && cmd->bigblock_carve_cooldown_span == BB_CARVE_COOLDOWN_MAX,
+		      "FIX-5: repeat re-demotes grow the cooldown span exponentially (48->96->192->384), capped at MAX (no overflow)");
+
+		printf("[TEST-CLIMB-ELECT] FIX-5 re-election refusal: cap(CFG16)=%d span_now=%d (MAX=%d)\n",
+		       cmd->apply_bigblock_cooldown_cap(CONFIG_16), cmd->bigblock_carve_cooldown_span,
+		       BB_CARVE_COOLDOWN_MAX);
+		fflush(stdout);
+		free_pair(cmd, tsc, rsp, tsr);
+	}
+
 	restore_env();
 	printf("[TEST-CLIMB-ELECT] %s (%d failure%s)\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

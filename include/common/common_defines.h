@@ -366,6 +366,66 @@ inline int bigblock_carve_fallback_target(int current_config, bool bigblock_rung
 #endif
 }
 
+// WALL-B FIX-5 (WALLB_DIAGNOSIS.md §1.6 limit cycle; fix5/FIX5_DESIGN.md §4): CFG16
+// big-block carve COOLDOWN. After a FIX-4 carve-viability demote fires
+// (arq_commander.cc:3669, supershift_proven_ceiling=CFG15), the CFG16 big-block rung is
+// PROVEN non-viable on THIS channel. But FIX-4's pin has a lifetime of ~one cycle:
+// finish_turbo_direction() UNCONDITIONALLY resets supershift_proven_ceiling to the probe
+// top (=turboshift_last_good=CFG16) on every ROBUST->CFG16 turbo re-climb
+// (arq_commander.cc:4147). So on the pg84 long stream the loop THRASHES:
+// climb->CFG16 carve-park->3 carve-fails->FIX-4 demote->CFG15->gearshift RE-climbs to
+// CFG16 (clean channel, SNR says go)->re-elects the carve-dead rung->re-parks->repeat.
+// Nothing carries cross-cycle "this rung is carve-dead" memory because
+// supershift_proven_ceiling is owned/reset by the turbo state machine.
+//
+// FIX-5 = a SEPARATE CMD-side field bigblock_carve_cooldown_batches that the turbo state
+// machine does NOT touch (so it survives the :4147 reset), armed at the FIX-4 deadline,
+// and consulted as an additional index-cap (->CFG15) at every climb hook. It is an AARF:
+// the 1st demote arms BASE batches; each RE-demote WHILE the cooldown is still active (the
+// carve is STILL dead) DOUBLES the span, capped at MAX (mirrors BREAK_DROP_STEP_MAX's 16x
+// span idiom). A real CFG16 carve clears it; the batch count expires the window for an
+// optimistic re-probe.
+
+// BASE = 1st demote window in BATCHES (~3x the measured ~8-batch elect->deadline distance,
+// so one clean CFG15 run amortizes the prior storm). MAX = 16x BASE (mirroring
+// BREAK_DROP_STEP_MAX's 16x ladder-span idiom). Unit is BATCHES not wall-time: the thrash
+// cadence is dominated by variable deaf-peer BREAK/watchdog retry storms (minutes per
+// cycle), so a wall clock would either expire mid-storm (useless) or need worst-case
+// length (over-long on a fast channel); a batch count self-scales with link speed and is
+// consulted exactly at the re-election decision.
+static const int BB_CARVE_COOLDOWN_BASE = 24;
+static const int BB_CARVE_COOLDOWN_MAX  = 384;
+
+// WALL-B FIX-5: pick the NEXT cooldown span (AARF multiplicative-increase, capped). 1st
+// demote (prev_span<=0) = base; each repeat WHILE the cooldown is still active (re-demote
+// before it expired = the carve is STILL dead) doubles, capped at cap. PURE; the unit test
+// (Part T) replays it directly. FAIL-BEFORE: returns 0 (no cooldown) -> the re-climb limit
+// cycle (0 bytes on pg84) is NOT broken.
+inline int bigblock_carve_cooldown_next_span(int prev_span, int base, int cap) {
+#ifdef WALLB_FIX5_FAILBEFORE
+	(void)prev_span; (void)base; (void)cap;
+	return 0;   // FAIL-BEFORE: no cooldown -> the re-climb limit cycle persists.
+#else
+	int next = (prev_span <= 0) ? base : prev_span * 2;
+	return (next > cap) ? cap : next;
+#endif
+}
+
+// WALL-B FIX-5: the climb-cap CEILING. Returns the cooldown ceiling (CONFIG_15 == the
+// highest per-frame OFDM rung, config_ladder_down(CONFIG_16)) when a CFG16 big-block carve
+// cooldown is active (batches remaining > 0), else -1 (no cap — the no-op normal case, so
+// non-bigblock and clean-CFG16 operation is byte-identical). PURE; Part T replays it.
+// FAIL-BEFORE: returns -1 always (no cap exists) -> CFG16 re-election is never refused.
+inline int bigblock_carve_cooldown_ceiling(int cooldown_batches_remaining, bool robust_enabled) {
+#ifdef WALLB_FIX5_FAILBEFORE
+	(void)cooldown_batches_remaining; (void)robust_enabled;
+	return -1;
+#else
+	if (cooldown_batches_remaining <= 0) return -1;
+	return config_ladder_down(CONFIG_16, robust_enabled);   // CFG15: highest per-frame rung
+#endif
+}
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

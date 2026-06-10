@@ -187,7 +187,29 @@ int cl_arq_controller::elevator_target_from_snr()
 	snr_ideal = supershift_retrigger_target(snr_ideal, measurements.SNR_uplink,
 		last_data_viable_config, optimizer_is_in_control(),
 		robust_enabled, narrowband_enabled == YES);
+	// WALL-B FIX-5: the SNR re-trigger elevator (consumed :5180) and the FRAME-UP elevator
+	// share this method. Folding the cooldown cap HERE covers both climb paths from one
+	// place (the §4.4 hook #3 + the design's "shared by the SNR re-trigger and FRAME-UP
+	// elevator" note). When the cooldown is disarmed (the normal case) this is the identity.
+	snr_ideal = apply_bigblock_cooldown_cap(snr_ideal);
 	return snr_ideal;
+}
+
+// WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.4): apply the CFG16 big-block carve COOLDOWN as an
+// additional index-cap. When the cooldown is armed (bigblock_carve_cooldown_batches > 0)
+// and `proposed` is ABOVE the cooldown ceiling (CFG15), clamp DOWN to CFG15 (the rung
+// election is REFUSED); otherwise return `proposed` UNCHANGED. INDEX-MONOTONE never-raise
+// clamp — composes order-independently with supershift_proven_ceiling / WB-NB ceiling /
+// max_config_override (all "never raise"), so it can only LOWER a target and never
+// introduces a new over-climb (audit §5.3 composition note). Off the cooldown
+// (batches==0, the normal case) bigblock_carve_cooldown_ceiling returns -1 and this is the
+// IDENTITY, so non-bigblock and clean-CFG16 operation is byte-identical (INV-B1 no-op).
+int cl_arq_controller::apply_bigblock_cooldown_cap(int proposed) const
+{
+	int cd = bigblock_carve_cooldown_ceiling(bigblock_carve_cooldown_batches, robust_enabled);
+	if(cd >= 0 && config_ladder_index(proposed) > config_ladder_index(cd))
+		return cd;
+	return proposed;
 }
 
 
@@ -575,6 +597,13 @@ void cl_arq_controller::process_messages_commander()
 			if (target > mode_ceiling) target = mode_ceiling;
 			if (max_config_override >= 0 && target > max_config_override)
 				target = max_config_override;
+			// WALL-B FIX-5 hook (audit R7 — optimizer authority): the Q-table optimizer can
+			// independently propose CFG16 via opt_pending_switch_cfg WITHOUT flowing through
+			// the gearshift/turbo climb gates, so it is a FOURTH producer of a CFG16
+			// SET_CONFIG. AND the cooldown cap here too, else the cooldown leaks via the
+			// optimizer axis and the carve-dead rung is re-elected. Index-monotone never-raise;
+			// no-op off the cooldown (batches==0) so optimizer behavior is otherwise unchanged.
+			target = apply_bigblock_cooldown_cap(target);
 			if (target != current_configuration && is_ofdm_config(target))
 			{
 				printf("[OPT] queue SET_CONFIG: %d -> %d (effective-rate optimizer)\n",
@@ -3669,6 +3698,28 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					data_configuration = carve_fallback;
 					negotiated_configuration = carve_fallback;
 					supershift_proven_ceiling = carve_fallback;
+
+					// WALL-B FIX-5: ARM/EXTEND the CFG16 big-block carve COOLDOWN. The
+					// supershift_proven_ceiling pin above has a lifetime of ~one cycle
+					// (finish_turbo_direction() resets it to the probe top, CFG16, at :4147 on
+					// the next ROBUST->CFG16 re-climb), so on pg84 the loop re-climbs and
+					// re-elects the carve-dead rung -> 0 bytes. This SEPARATE field is NOT
+					// touched by the turbo state machine, so it survives that reset and caps the
+					// climb at CFG15 across cycles. AARF: re-demoting WHILE a prior cooldown is
+					// still active (the carve is STILL dead) GROWS the window; a fresh
+					// (post-expiry) failure starts at BASE. Cleared on a real CFG16 carve
+					// (data-ACK reset, :3804). See fix5/FIX5_DESIGN.md §4.3 + the §5 audit.
+					bigblock_carve_cooldown_span = bigblock_carve_cooldown_next_span(
+						(bigblock_carve_cooldown_batches > 0) ? bigblock_carve_cooldown_span : 0,
+						BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+					bigblock_carve_cooldown_batches = bigblock_carve_cooldown_span;
+					printf("[CFG16-HOLD] FIX-5 ARM: CFG16 big-block carve cooldown ARMED for %d "
+						"batches (span now %d) — climb capped at per-frame CFG%d until a real "
+						"CFG16 carve lands\n",
+						bigblock_carve_cooldown_batches, bigblock_carve_cooldown_span,
+						config_ladder_down(CONFIG_16, robust_enabled));
+					fflush(stdout);
+
 					// Consumed: we are acting on the deadline. Clear the streak so a fresh
 					// per-frame failure re-accumulates from 1 (and we do NOT fall through to
 					// the BREAK gate below).
@@ -3802,6 +3853,30 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
+
+			// WALL-B FIX-5: CLEAR the CFG16 big-block carve cooldown on CARVE SUCCESS. A
+			// data-ACK while current_configuration==CONFIG_16 with big-block framing live
+			// means a real CFG16 carve LANDED (the RSP decoded a big-block codeword and
+			// data-ACKed), so the rung is viable again on THIS channel -> re-enable CFG16.
+			// INV-B3 (the single most load-bearing gate, audit R2): this MUST be gated on
+			// CFG16 + framing-live — a per-frame CFG15 data-ACK (which the CMD gets CONSTANTLY
+			// during the productive cooldown window) must NOT clear it, else the fix becomes a
+			// no-op and CFG16 re-opens immediately. The clear also resets the AARF span so the
+			// NEXT genuine fade is treated fresh (mirrors break_drop_step_after_handshake_decay
+			// decay-on-progress). See fix5/FIX5_DESIGN.md §4.5 + the §5 audit family-B.
+			if(bigblock_carve_cooldown_batches > 0
+			   && current_configuration == CONFIG_16
+			   && telecom_system != NULL
+			   && telecom_system->bigblock_framing_enabled
+			   && telecom_system->M != MOD_MFSK)
+			{
+				printf("[CFG16-HOLD] FIX-5 CLEAR: CFG16 big-block carve LANDED (data-ACK at "
+					"config 16, framing live) -> cooldown cleared (%d->0), CFG16 re-enabled\n",
+					bigblock_carve_cooldown_batches);
+				fflush(stdout);
+				bigblock_carve_cooldown_batches = 0;
+				bigblock_carve_cooldown_span = 0;
+			}
 
 			// CLEAN-BATCH VIABILITY (§9): the panic/aggression resets AND the
 			// data-viable anchor-raise are PROMOTION decisions — they must fire ONLY
@@ -4139,6 +4214,18 @@ void cl_arq_controller::finish_turbo_direction()
 		// Enforce --max-config CLI ceiling
 		if(max_config_override >= 0 && start_config > max_config_override)
 			start_config = max_config_override;
+
+		// WALL-B FIX-5 hook #4 (NON-NEGOTIABLE — finish_turbo_direction start_config):
+		// THIS is the exact site that DEFEATS FIX-4. start_config = turboshift_last_good
+		// (=CFG16 after a clean climb), and the lines below re-install it as BOTH the
+		// proven ceiling AND the data/negotiated/reverse config — unconditionally, on every
+		// ROBUST->CFG16 turbo re-climb — erasing FIX-4's supershift_proven_ceiling=CFG15 pin
+		// (WALLB_DIAGNOSIS.md §1; audit §5.5 hook #4). Because the cooldown field is NOT
+		// touched by the turbo state machine, capping start_config HERE makes the carve-dead
+		// memory survive the re-climb: the link restarts at CFG15 (not CFG16), no re-park.
+		// No-op off the cooldown (apply_bigblock_cooldown_cap is the identity when
+		// bigblock_carve_cooldown_batches==0), so non-bigblock turbo completion is identical.
+		start_config = apply_bigblock_cooldown_cap(start_config);
 
 		// Set ceiling = start config. The SNR→config table is calibrated for AWGN
 		// but fading channels need 3-6 dB more margin. Setting ceiling at start
@@ -5036,6 +5123,13 @@ void cl_arq_controller::process_control_commander()
 							negotiated_configuration, effective_snr,
 							last_data_viable_config, optimizer_is_in_control(),
 							robust_enabled, narrowband_enabled == YES);
+						// WALL-B FIX-5 hook #2 (turbo SNR-SUPERSHIFT probe target): the
+						// LOAD-BEARING hook — this is the path that survives the BREAK->ROBUST_0
+						// collapse and re-climbs (the limit cycle). After every other ceiling
+						// clamp, AND the CFG16 big-block carve cooldown cap so the turbo probe
+						// cannot re-elect the carve-dead CFG16 rung while the cooldown holds.
+						// Index-monotone never-raise; no-op off the cooldown (batches==0).
+						negotiated_configuration = apply_bigblock_cooldown_cap(negotiated_configuration);
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
 						//
@@ -5384,6 +5478,27 @@ void cl_arq_controller::finalize_block_commander()
 		}
 		else if(gear_shift_algorithm==SUCCESS_BASED_LADDER)
 		{
+			// WALL-B FIX-5: DECREMENT the CFG16 big-block carve cooldown ONCE PER COMPLETED
+			// BATCH. finalize_block_commander() runs exactly once per block/batch (both the
+			// SACK-v2 policy path and the v1 inline path below flow through here), the SAME
+			// per-batch cadence as gear_shift_blocked_for_nBlocks / ceiling_success_count.
+			// This is the EXPIRY half (audit R6): the unit is BATCHES not receive() ticks —
+			// decrementing per tick would collapse the window to milliseconds. On reaching 0
+			// the CFG16 rung is re-armed for an optimistic re-probe (cheap: one CFG16 election
+			// attempt); a carve-success then clears it permanently, a re-failure re-arms at
+			// BASE. See fix5/FIX5_DESIGN.md §4.5.
+			if(bigblock_carve_cooldown_batches > 0)
+			{
+				bigblock_carve_cooldown_batches--;
+				if(bigblock_carve_cooldown_batches == 0)
+				{
+					printf("[CFG16-HOLD] FIX-5 EXPIRED: CFG16 big-block carve cooldown elapsed "
+						"(span was %d) — CFG16 rung re-armed for an optimistic re-probe\n",
+						bigblock_carve_cooldown_span);
+					fflush(stdout);
+				}
+			}
+
 			// SACK Design A Step 9 — Multi-axis policy framework dispatch.
 			//
 			// v2 sessions route through the new policy framework entry point
@@ -5449,6 +5564,10 @@ void cl_arq_controller::finalize_block_commander()
 				// probe OFF. INV-2: UP path only; no downward site references back-off.
 				if(probe_rung_suppressed(proposed))
 					ceiling_blocked = true;
+				// WALL-B FIX-5 hook #1 (LADDER UP, v1 inline twin): block a step above the
+				// CFG16 big-block carve cooldown ceiling (CFG15) while the cooldown is armed.
+				if(apply_bigblock_cooldown_cap(proposed) != proposed)
+					ceiling_blocked = true;
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;
@@ -5471,7 +5590,9 @@ void cl_arq_controller::finalize_block_commander()
 					// because each raise must accumulate fresh successes at the new
 					// ceiling. The proper fix is the 2D channel-measurement table; this
 					// is the band-aid until that's built.
-					if(ceiling_blocked)
+					// WALL-B FIX-5 hook #1b (CEILING RECOVERY, v1): never raise the proven ceiling
+					// above the cooldown ceiling — else it would walk the ceiling back to CFG16.
+					if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed)
 					{
 						ceiling_success_count++;
 						if(ceiling_success_count >= 5)
@@ -5612,6 +5733,10 @@ void cl_arq_controller::policy_evaluate_axis1()
 		// path only; no BREAK/demote/panic (downward) site references the back-off.
 		if(probe_rung_suppressed(proposed))
 			ceiling_blocked = true;
+		// WALL-B FIX-5 hook #1 (LADDER UP, v2 policy twin): block a step above the
+		// CFG16 big-block carve cooldown ceiling (CFG15) while the cooldown is armed.
+		if(apply_bigblock_cooldown_cap(proposed) != proposed)
+			ceiling_blocked = true;
 		if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 		{
 			negotiated_configuration=proposed;
@@ -5635,7 +5760,9 @@ void cl_arq_controller::policy_evaluate_axis1()
 		{
 			// Ceiling recovery: 20 → 5 blocks (see comment at first ceiling-recovery
 			// site, ~line 4346). Band-aid until 2D channel measurement lands.
-			if(ceiling_blocked)
+			// WALL-B FIX-5 hook #1b (CEILING RECOVERY, v2): never raise the proven ceiling
+			// above the cooldown ceiling — else it would walk the ceiling back to CFG16.
+			if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed)
 			{
 				ceiling_success_count++;
 				if(ceiling_success_count >= 5)
@@ -9713,6 +9840,175 @@ int cl_arq_controller::test_climb_engine()
 		check(!is_robust_config(fb),
 			"S5b the fallback never lands in the ROBUST tier (it holds the per-frame OFDM ceiling)",
 			is_robust_config(fb) ? 1 : 0, 0);
+	}
+
+	// Part T — WALL-B FIX-5: CFG16 BIG-BLOCK CARVE COOLDOWN (re-election memory;
+	// WALLB_DIAGNOSIS.md §1.6 limit cycle, fix5/FIX5_DESIGN.md §4). FIX-4 demotes
+	// CFG16->CFG15 on a carve-viability deadline and pins supershift_proven_ceiling=CFG15,
+	// but finish_turbo_direction() RESETS that pin to the probe top (CFG16) on every
+	// ROBUST->CFG16 re-climb (arq_commander.cc:4147), so on pg84 the loop THRASHES:
+	// climb->CFG16 carve-park->demote->CFG15->re-climb->re-elect carve-dead rung->repeat,
+	// 0 bytes delivered. FIX-5 adds a SEPARATE CMD-side cooldown (bigblock_carve_cooldown_
+	// batches) the turbo state machine does NOT touch, armed at the demote and consulted as
+	// an additional index-cap (->CFG15) at EVERY climb hook. AARF: 1st demote = BASE, each
+	// re-demote while still active DOUBLES capped at MAX; a real CFG16 carve clears it. This
+	// drives the REAL pure helpers production calls (bigblock_carve_cooldown_next_span /
+	// bigblock_carve_cooldown_ceiling) + the REAL apply_bigblock_cooldown_cap() member +
+	// the REAL arm/grow/clear field discipline. FAIL-BEFORE: -DWALLB_FIX5_FAILBEFORE
+	// compiles the helpers to 0/-1 (no cooldown) -> T0/T1/T2/T4/T5/T6/T7 FAIL. PASS-AFTER:
+	// ALL PASS. CMD-only; no RSP/wire/DSP change.
+	// ================================================================
+	robust_enabled = YES;            // a robust (-R) session: the FULL ladder is in play
+	narrowband_enabled = NO;
+	supershift_proven_ceiling = -1;  // independent of the cooldown (the whole point of FIX-5)
+
+	// T0 — ARM: the 1st carve-viability demote arms the cooldown at BASE batches. Pre-fix
+	// (next_span -> 0): no cooldown exists, the re-climb limit cycle is never broken.
+	{
+		int span = bigblock_carve_cooldown_next_span(/*prev_span=*/0,
+			BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+		check(span == BB_CARVE_COOLDOWN_BASE,
+			"T0 1st carve-viability demote arms the cooldown at BASE batches (the carve-dead memory FIX-4 lacks)",
+			span, BB_CARVE_COOLDOWN_BASE);
+	}
+
+	// T1 — AARF DOUBLING, CAPPED: each RE-demote WHILE the cooldown is still active (carve
+	// STILL dead) doubles the span, 24->48->96->...->capped at MAX (384, =16xBASE, mirrors
+	// BREAK_DROP_STEP_MAX's 16x span idiom). It must NOT overflow past MAX. Pre-fix: 0 always.
+	{
+		int span = BB_CARVE_COOLDOWN_BASE;                                   // 24
+		span = bigblock_carve_cooldown_next_span(span, BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX); // 48
+		check(span == 48, "T1a 1st re-demote while active doubles the span 24->48 (AARF growth)", span, 48);
+		span = bigblock_carve_cooldown_next_span(span, BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX); // 96
+		span = bigblock_carve_cooldown_next_span(span, BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX); // 192
+		span = bigblock_carve_cooldown_next_span(span, BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX); // 384 (cap)
+		check(span == BB_CARVE_COOLDOWN_MAX && span == 384,
+			"T1b sustained re-demotes reach the CAP (384=16xBASE), not 768", span, BB_CARVE_COOLDOWN_MAX);
+		span = bigblock_carve_cooldown_next_span(span, BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX); // stays
+		check(span == BB_CARVE_COOLDOWN_MAX,
+			"T1c further re-demotes stay clamped at the cap (no overflow)", span, BB_CARVE_COOLDOWN_MAX);
+	}
+
+	// T2 — THE CAP CEILING: while batches>0 the cooldown ceiling is CONFIG_15
+	// (== config_ladder_down(CFG16)); while batches==0 it is -1 (no cap — byte-identical).
+	// Pre-fix: -1 always (CFG16 re-election never refused).
+	{
+		int ceil_armed = bigblock_carve_cooldown_ceiling(/*remaining=*/5, /*robust*/true);
+		check(ceil_armed == CONFIG_15 && ceil_armed == config_ladder_down(CONFIG_16, /*robust*/true),
+			"T2a while armed (batches>0) the cooldown ceiling is the highest per-frame rung CFG15",
+			ceil_armed, CONFIG_15);
+		int ceil_off = bigblock_carve_cooldown_ceiling(/*remaining=*/0, /*robust*/true);
+		check(ceil_off == -1,
+			"T2b off the cooldown (batches==0) the ceiling is -1 (NO cap -> non-bigblock/clean-CFG16 byte-identical)",
+			ceil_off, -1);
+	}
+
+	// T3 — apply_bigblock_cooldown_cap() RUNG ELECTION REFUSED: with the cooldown armed,
+	// a proposed climb to CFG16 is capped to CFG15 (the rung election is REFUSED), and a
+	// proposal already at/below CFG15 is returned UNCHANGED (never raised). This is the
+	// member the FOUR climb hooks call. (apply_bigblock_cooldown_cap reads
+	// bigblock_carve_cooldown_batches + robust_enabled.)
+	{
+		bigblock_carve_cooldown_batches = 12;   // armed
+		int capped16 = apply_bigblock_cooldown_cap(CONFIG_16);
+		check(capped16 == CONFIG_15,
+			"T3a armed: a proposed climb to CFG16 is REFUSED -> capped to per-frame CFG15 (the re-election memory)",
+			capped16, CONFIG_15);
+		int cap15 = apply_bigblock_cooldown_cap(CONFIG_15);
+		check(cap15 == CONFIG_15,
+			"T3b armed: a proposal already at CFG15 is returned UNCHANGED (cap never raises)", cap15, CONFIG_15);
+		int cap10 = apply_bigblock_cooldown_cap(CONFIG_10);
+		check(cap10 == CONFIG_10,
+			"T3c armed: a proposal BELOW the ceiling is returned UNCHANGED (index-monotone never-raise)", cap10, CONFIG_10);
+		bigblock_carve_cooldown_batches = 0;    // off
+		int off16 = apply_bigblock_cooldown_cap(CONFIG_16);
+		check(off16 == CONFIG_16,
+			"T3d off the cooldown: CFG16 passes through UNCHANGED (clean-CFG16 byte-identical, INV-B1 no-op)", off16, CONFIG_16);
+	}
+
+	// T4 — PER-FRAME DELIVERY PATH SELECTED, the FIX-4 + FIX-5 composition: the demote
+	// target (bigblock_carve_fallback_target) is CFG15 AND the cooldown ceiling is CFG15,
+	// so after the demote the climb is held at exactly the per-frame rung FIX-4 falls back
+	// to — the productive CFG15 window the diagnosis names (~2479 wire vs 0). The two agree.
+	{
+		int fix4_target = bigblock_carve_fallback_target(CONFIG_16, /*rung_live=*/true,
+			/*nack_count=*/3, /*nack_threshold=*/3, /*robust*/true);
+		int fix5_ceiling = bigblock_carve_cooldown_ceiling(/*remaining=*/BB_CARVE_COOLDOWN_BASE, /*robust*/true);
+		check(fix4_target == CONFIG_15 && fix5_ceiling == CONFIG_15 && fix4_target == fix5_ceiling,
+			"T4 FIX-4 demote target (CFG15) == FIX-5 cooldown ceiling (CFG15): the climb is held at the per-frame delivery rung",
+			fix4_target, fix5_ceiling);
+	}
+
+	// T5 — CLEAR ON CARVE SUCCESS, GATED (INV-B3, the single most load-bearing gate): a
+	// CFG16 big-block carve data-ACK clears the cooldown to 0; a per-frame CFG15 data-ACK
+	// (which the CMD gets CONSTANTLY during the productive window) must NOT clear it (else
+	// the fix is a no-op — re-opens CFG16 immediately). The production clear hook is gated on
+	// current_configuration==CONFIG_16 && big-block framing live; replay that gate here.
+	{
+		// (a) a CFG16 carve success (config==16, framing live) CLEARS:
+		bigblock_carve_cooldown_batches = 48; bigblock_carve_cooldown_span = 48;
+		bool bigblock_live = true;   // framing on, M != MFSK
+		int cfg_at_ack = CONFIG_16;
+		if(cfg_at_ack == CONFIG_16 && bigblock_live) {
+			bigblock_carve_cooldown_batches = 0; bigblock_carve_cooldown_span = 0;
+		}
+		check(bigblock_carve_cooldown_batches == 0 && bigblock_carve_cooldown_span == 0,
+			"T5a a CFG16 big-block carve data-ACK CLEARS the cooldown (carve success = re-enable CFG16)",
+			bigblock_carve_cooldown_batches, 0);
+		// (b) a per-frame CFG15 data-ACK must NOT clear (the INV-B3 gate):
+		bigblock_carve_cooldown_batches = 48; bigblock_carve_cooldown_span = 48;
+		cfg_at_ack = CONFIG_15;
+		if(cfg_at_ack == CONFIG_16 && bigblock_live) {   // gate FALSE -> no clear
+			bigblock_carve_cooldown_batches = 0; bigblock_carve_cooldown_span = 0;
+		}
+		check(bigblock_carve_cooldown_batches == 48,
+			"T5b a per-frame CFG15 data-ACK does NOT clear the cooldown (INV-B3: only a CFG16 carve clears)",
+			bigblock_carve_cooldown_batches, 48);
+		// (c) a CFG16 data-ACK with framing OFF (non-bigblock) must NOT clear either:
+		bigblock_carve_cooldown_batches = 48;
+		bigblock_live = false;
+		cfg_at_ack = CONFIG_16;
+		if(cfg_at_ack == CONFIG_16 && bigblock_live) {   // gate FALSE -> no clear
+			bigblock_carve_cooldown_batches = 0;
+		}
+		check(bigblock_carve_cooldown_batches == 48,
+			"T5c a CFG16 data-ACK with framing OFF does NOT clear (gate requires big-block framing live)",
+			bigblock_carve_cooldown_batches, 48);
+	}
+
+	// T6 — FRESH FADE RESETS SPAN TO BASE (post-expiry): a re-demote when the cooldown has
+	// ALREADY expired (batches==0) is a FRESH failure, so the span resets to BASE, NOT 2xMAX.
+	// This mirrors break_drop_step_after_handshake_decay's "decay on progress, grow on
+	// repeated failure" — directly via the prev_span<=0 branch of next_span (the production
+	// arm passes prev_span = (batches>0) ? span : 0).
+	{
+		// simulate: span had grown to the cap, then the window EXPIRED (batches reached 0):
+		bigblock_carve_cooldown_span = BB_CARVE_COOLDOWN_MAX;  // 384, stale
+		bigblock_carve_cooldown_batches = 0;                   // expired
+		// production arm: prev_span = (batches>0) ? span : 0  -> 0 here (fresh)
+		int prev = (bigblock_carve_cooldown_batches > 0) ? bigblock_carve_cooldown_span : 0;
+		int span = bigblock_carve_cooldown_next_span(prev, BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+		check(span == BB_CARVE_COOLDOWN_BASE,
+			"T6 a re-demote AFTER expiry is a FRESH fade -> span resets to BASE (24), not 2xMAX",
+			span, BB_CARVE_COOLDOWN_BASE);
+	}
+
+	// T7 — TURBO-RESET SURVIVAL (the core invariant): the cooldown survives the
+	// supershift_proven_ceiling reset that defeats FIX-4. Replay finish_turbo_direction's
+	// reset (supershift_proven_ceiling = CFG16) and assert the cooldown still caps the climb
+	// at CFG15 — because the cap reads bigblock_carve_cooldown_batches, NOT
+	// supershift_proven_ceiling. THIS is why FIX-5 is a separate field. Pre-fix: there is no
+	// cooldown field, so the climb re-elects CFG16 the instant the ceiling resets.
+	{
+		bigblock_carve_cooldown_batches = BB_CARVE_COOLDOWN_BASE;   // armed by the demote
+		supershift_proven_ceiling = CONFIG_16;   // <- finish_turbo_direction():4147 just reset it to the probe top
+		// The climb proposes CFG16 (SNR says go, ceiling no longer blocks). FIX-5 still caps:
+		int held = apply_bigblock_cooldown_cap(CONFIG_16);
+		check(held == CONFIG_15,
+			"T7 cooldown SURVIVES the supershift_proven_ceiling reset (CFG16) and STILL caps the climb at CFG15 — the limit-cycle break",
+			held, CONFIG_15);
+		bigblock_carve_cooldown_batches = 0;   // tidy
+		supershift_proven_ceiling = -1;
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",

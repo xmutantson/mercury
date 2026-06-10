@@ -1062,6 +1062,17 @@ public:
   // See §14.
   int elevator_target_from_snr();
 
+  // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.4): apply the CFG16 big-block carve COOLDOWN
+  // as an additional index-cap on a proposed climb target. When the cooldown is armed
+  // (bigblock_carve_cooldown_batches > 0) and `proposed` is above the cooldown ceiling
+  // (CFG15), returns CFG15; otherwise returns `proposed` UNCHANGED. INDEX-MONOTONE
+  // never-raise clamp — composes order-independently with supershift_proven_ceiling /
+  // WB-NB ceiling / max_config_override (all "never raise"). Off the cooldown
+  // (batches==0, the normal case) it is the IDENTITY, so non-bigblock and clean-CFG16
+  // operation is byte-identical. Defined in arq_commander.cc next to
+  // elevator_target_from_snr(). See §4.4 + the §5 audit family-B (INV-B1).
+  int apply_bigblock_cooldown_cap(int proposed) const;
+
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
   // decodes NO LDPC data, so the canonical SNR_uplink producer
@@ -2850,6 +2861,23 @@ public:
                                        // between), break_drop_step is force-set
                                        // high enough to jump straight to ROBUST_0
                                        // instead of walking the ladder.
+  // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.1, WALLB_DIAGNOSIS.md §1.6): CFG16 big-block
+  // carve COOLDOWN. CMD-ONLY (never on the wire — INV-B2). After a FIX-4 carve-viability
+  // demote (arq_commander.cc:3669), the CFG16 big-block rung is proven non-viable on THIS
+  // channel; cap the climb at CFG15 for `bigblock_carve_cooldown_batches` completed batches
+  // so the SNR re-trigger / turbo forward / ladder-up CANNOT re-elect the carve-dead rung.
+  // UNLIKE supershift_proven_ceiling (which finish_turbo_direction() resets to the probe
+  // top at :4147), this field is NOT touched by the turbo state machine, so it SURVIVES the
+  // BREAK->ROBUST_0 collapse + full turbo re-climb that is the limit cycle.
+  // Producers: ARM/extend at the FIX-4 demote (arq_commander.cc:~3672); DECREMENT per
+  // completed batch at the per-batch eval tail (the ceiling_success_count cadence);
+  // CLEAR-on-success at the data-ACK reset (:3804) GATED on
+  // current_configuration==CONFIG_16 && big-block framing live (INV-B3 — a per-frame CFG15
+  // data-ACK must NOT clear it); INIT 0 in ctor + reset_session_state (R3). Consumers:
+  // apply_bigblock_cooldown_cap() at the climb hooks (gearshift LADDER-UP/CEILING-RECOVERY,
+  // turbo SNR-SUPERSHIFT, elevator_target_from_snr, finish_turbo_direction start_config).
+  int bigblock_carve_cooldown_batches{0};  // >0 = CFG16 election suppressed this many more batches
+  int bigblock_carve_cooldown_span{0};     // last window length, for AARF exponential growth
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)
