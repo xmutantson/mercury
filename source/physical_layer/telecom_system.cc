@@ -537,7 +537,13 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 	if(full_nsymb < 1) full_nsymb = 1;            // degenerate guard
 	if(force_full) return full_nsymb;             // retx / after-FAIL re-anchor
 	if(frame_idx_in_batch <= 0) return full_nsymb; // batch anchor (frame 0)
-	return 1;                                      // MINI 1-symbol resync
+	// MINI resync. 2 symbols (was 1): ~2x Schmidl-Cox integration energy + Moose
+	// >=2-symbol CFO minimum met. Clamp to the configured full length so a config
+	// whose full preamble is < MINI_PREAMBLE_NSYMB can never request more than it.
+	int mini = MINI_PREAMBLE_NSYMB;
+	if(mini > full_nsymb) mini = full_nsymb;
+	if(mini < 1) mini = 1;
+	return mini;
 }
 
 int cl_telecom_system::tx_effective_preamble_nsymb() const
@@ -1314,7 +1320,16 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			bool rx_batch_predict_mode = preamble_amortization_enabled
 				&& M != MOD_MFSK
 				&& receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0;
-			if(rx_batch_predict_mode) rx_eff_preamble = 1;
+			// LEVER P: MINI tail-frame preamble length (2, was 1) — must match the
+			// TX schedule (preamble_sched_nsymb) exactly. Clamp to the configured
+			// full length (defensive: a config with full<MINI).
+			if(rx_batch_predict_mode)
+			{
+				rx_eff_preamble = MINI_PREAMBLE_NSYMB;
+				if(rx_eff_preamble > data_container.preamble_nSymb)
+					rx_eff_preamble = data_container.preamble_nSymb;
+				if(rx_eff_preamble < 1) rx_eff_preamble = 1;
+			}
 
 			if(receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
 			{
@@ -1422,6 +1437,67 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 							batch_verified = true;
 						}
 					}
+				}
+
+				// LEVER P: LOW-METRIC FALLBACK (clean single-frame loss, NOT a
+				// mis-extract). The verify / re-pin above accept any peak that
+				// clears the basic preamble_detect_threshold (WB 0.15). But a
+				// Schmidl-Cox sub-peak inside the just-decoded frame's DATA symbols
+				// ALSO clears 0.15 (mis-pin band ~0.24-0.28 on the 1-sym HW
+				// failure). If we EXTRACT at such a mis-pinned offset the frame
+				// CRC-fails, and the low-metric FAIL handler (arq_common.cc) then
+				// flips ofdm_batch_active=false -> the entire batch tail is lost
+				// and SACK cascades. So when the accepted re-pin metric is below
+				// MINI_REPIN_CONFIDENCE (sits in the GAP between the mis-pin band
+				// and a clean MINI/FULL re-pin ~0.9-0.99), DO NOT trust the pin:
+				// declare this frame a clean loss, KEEP the batch lock, and advance
+				// the position chain by exactly one predicted MINI frame so the
+				// NEXT tail frame is still predicted. SACK then re-requests JUST
+				// this frame, which the TX re-sends as a FULL-preamble (force-full)
+				// re-anchor. This converts the catastrophic mis-pin cascade into a
+				// benign single-frame SACK loss. Gate on mfsk_fixed_delay<0 so the
+				// BER/known-delay path is untouched; rx_batch_predict_mode keeps it
+				// OFF for OFF/MFSK/non-batch (byte-identical baseline).
+				if(batch_verified && rx_batch_predict_mode && mfsk_fixed_delay < 0
+					&& receive_stats.coarse_metric < MINI_REPIN_CONFIDENCE)
+				{
+					int mini_active_nsymb = get_active_nsymb();
+					int mini_frame_len = rx_eff_preamble + mini_active_nsymb;
+					int nUnder_snap = (int)data_container.nUnder_processing_events;
+					// End of the (predicted) skipped MINI frame, in SYMBOL units
+					// from the buffer start. Use predicted_pos (NOT the unreliable
+					// re-pin delay) so a mis-pin can't skew the advance.
+					int skipped_frame_end_sym = predicted_pos / sym_samples + mini_frame_len;
+					// Advance the buffer by exactly one MINI frame so the next
+					// dispatch sees fresh audio for the FOLLOWING tail frame, and
+					// bake BOTH that upcoming shift AND the already-applied nUnder
+					// into ofdm_search_raw — then reset nUnder=0. This MATCHES the
+					// established convention at every other frames_to_read-advancing
+					// site (OK-decode arq_common.cc; INCOMPLETE handler; SACK sites):
+					// a nonzero frames_to_read is paired with nUnder=0 so the buffer
+					// shift is fully accounted for once. (Leaving nUnder set would let
+					// the ARQ FAIL post-step subtract it a second time on the next
+					// cycle.) -1 margin mirrors the OK-decode advance.
+					data_container.frames_to_read = mini_frame_len;
+					int next_search_raw = skipped_frame_end_sym - mini_frame_len - nUnder_snap - 1;
+					if(next_search_raw < 0) next_search_raw = 0;
+					int upper_clamp = data_container.buffer_Nsymb
+						- (data_container.Nsymb + rx_eff_preamble);
+					if(upper_clamp > 0 && next_search_raw > upper_clamp)
+						next_search_raw = upper_clamp;
+					receive_stats.ofdm_search_raw = next_search_raw;
+					receive_stats.ofdm_batch_active = true;   // KEEP the batch lock
+					data_container.nUnder_processing_events = 0;
+					// Leave ofdm_drift_per_frame untouched: a mis-pin would poison
+					// the IIR; the next clean tail frame re-centers it.
+					receive_stats.message_decoded = NO;
+					receive_stats.last_eff_preamble_nsymb = rx_eff_preamble;
+					if(g_verbose)
+						printf("[LEVERP-LOWMETRIC] MINI re-pin metric=%.3f < %.2f -> clean-loss skip, search_raw=%d ftr=%d nUnder=%d\n",
+							receive_stats.coarse_metric, MINI_REPIN_CONFIDENCE,
+							next_search_raw, (int)data_container.frames_to_read.load(), nUnder_snap);
+					fflush(stdout);
+					return receive_stats;
 				}
 
 				// LEVER P (INC-3): DEFER-not-search at the buffer edge. Before
@@ -2449,16 +2525,20 @@ skip_h_retry_point:
 			}
 			else if(rx_eff_preamble < 2)
 			{
-				// LEVER P: MINI preamble (1 symbol) — the Moose estimator needs >=2
+				// LEVER P: single-symbol preamble — the Moose estimator needs >=2
 				// preamble symbols for its symbol-to-symbol phase difference, so
 				// reuse the last decoded frame's residual CFO (anchor frame 0
-				// measured it for the batch). The per-symbol CPE_correction +
-				// pilot-based ZF estimator below absorb residual drift per symbol,
-				// so a stale-by-one-frame CFO on a clean/short tail frame is safe.
+				// measured it for the batch). With the 2-symbol MINI
+				// (MINI_PREAMBLE_NSYMB=2) this branch is NO LONGER taken on a MINI
+				// tail frame — rx_eff_preamble==2 falls through to the real Moose
+				// estimator below, so each MINI tail measures its OWN residual CFO
+				// (the principled fix vs the 1-sym stale-CFO reuse that contributed
+				// to the HW desync). This branch now only guards the degenerate case
+				// of a config whose FULL preamble is < 2 symbols (MINI clamps to 1).
 				// Risk under heavy phase noise / fast drift flagged for the PN sim.
 				freq_offset_measured = receive_stats.freq_offset_of_last_decoded_message;
 				if(g_verbose)
-					printf("[WB-FREQ] MINI preamble — reuse last CFO=%.4f Hz\n", freq_offset_measured);
+					printf("[WB-FREQ] single-sym preamble — reuse last CFO=%.4f Hz\n", freq_offset_measured);
 			}
 			else
 			{

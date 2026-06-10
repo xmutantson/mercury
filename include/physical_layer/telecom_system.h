@@ -384,11 +384,39 @@ public:
 	// SACK gates survive untouched; the preamble was only ever timing + CFO.
 	// See fact-documents/data-flow-preamble-amortization.md.
 	//
+	// MINI preamble length (tail-frame Schmidl-Cox resync). The 1-symbol MINI
+	// (HW 2026-06-05) decoded in bursts then DESYNCED on the real CFG16 ceiling:
+	// a single Schmidl-Cox symbol gives too little autocorrelation integration
+	// energy to re-lock reliably (mis-pin metric 0.24-0.28 vs FULL ~0.99) AND is
+	// below the Moose >=2-symbol minimum, so every MINI tail frame reused a stale
+	// CFO. 2 symbols ~double the integration energy -> a more reliable timing
+	// peak, and -- crucially -- enable per-frame Moose CFO (the >=2 guard at
+	// telecom_system.cc passes), so MINI tails measure their own residual instead
+	// of inheriting the anchor's. Airtime: CFG16 tail frame = 2+9 = 11 of 13 sym
+	// (~-15% per tail frame, ~-12-15% batch airtime) vs the 1-sym -20.2% -- still
+	// positive. See fact-documents/data-flow-preamble-amortization.md.
+	static const int MINI_PREAMBLE_NSYMB = 2;
+
+	// MINI re-pin confidence floor. The batch-predict MINI verify/re-pin clears
+	// the basic preamble_detect_threshold (WB 0.15), but a Schmidl-Cox sub-peak
+	// in already-decoded DATA symbols ALSO clears 0.15 (mis-pin band 0.24-0.28
+	// observed on the 1-sym HW failure). Accepting one of those as the tail
+	// frame's preamble extracts at the wrong offset -> CRC-fail -> the low-metric
+	// FAIL handler (arq_common.cc) exits batch mode -> the whole batch tail is
+	// lost and SACK cascades. The floor sits in the GAP between the mis-pin band
+	// (<=~0.28) and a clean MINI/FULL re-pin (~0.9-0.99): below it, the frame is
+	// declared a clean single-frame loss (batch lock kept, position advanced one
+	// MINI frame) so SACK re-requests JUST that frame with a FULL preamble. This
+	// converts the catastrophic mis-pin cascade into a benign 1-frame SACK loss.
+	// Chosen from the FULL-vs-failed-MINI metric separation, NOT tuned to mask.
+	static constexpr double MINI_REPIN_CONFIDENCE = 0.5;
+
 	// Pure schedule predicate (INC-0): how many preamble symbols frame
 	// frame_idx_in_batch emits. force_full forces FULL for retx + after-FAIL
-	// re-anchor frames. full_nsymb is the configured preamble_nSymb. Returns 1
-	// (MINI) for non-anchor non-forced frames; full_nsymb otherwise. STATIC /
-	// PURE so TX and RX get bit-identical results.
+	// re-anchor frames. full_nsymb is the configured preamble_nSymb. Returns the
+	// MINI length (MINI_PREAMBLE_NSYMB, clamped <= full) for non-anchor
+	// non-forced frames; full_nsymb otherwise. STATIC / PURE so TX and RX get
+	// bit-identical results.
 	static int preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb);
 
 	// Master enable for preamble amortization. DEFAULT OFF pending INC-3 (the

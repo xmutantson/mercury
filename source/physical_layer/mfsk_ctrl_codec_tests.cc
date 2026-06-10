@@ -5570,23 +5570,30 @@ int run_mfsk_ctrl_codec_tests() {
 // fact-documents/data-flow-preamble-amortization.md §1.
 // =============================================================================
 
-// §P.1 schedule predicate: anchor=FULL, tail=MINI, force_full=FULL.
+// §P.1 schedule predicate: anchor=FULL, tail=MINI(=MINI_PREAMBLE_NSYMB),
+// force_full=FULL. MINI is 2 symbols (was 1) — see telecom_system.h
+// MINI_PREAMBLE_NSYMB (2x Schmidl-Cox integration + Moose >=2-sym minimum).
 static void test_preamble_sched_predicate() {
 	const char* name = "preamble_sched_predicate";
 	const int full_n = 4;
+	const int mini_n = cl_telecom_system::MINI_PREAMBLE_NSYMB;  // 2
 	// frame 0 -> FULL (anchor)
 	if (cl_telecom_system::preamble_sched_nsymb(0, false, full_n) != full_n) {
 		test_fail(name, "frame 0 (anchor) must be FULL"); return; }
-	// frames 1..24 -> MINI (1)
+	// frames 1..24 -> MINI (MINI_PREAMBLE_NSYMB, clamped <= full_n)
+	int expect_mini = (mini_n < full_n) ? mini_n : full_n;
 	for (int i = 1; i <= 24; i++) {
-		if (cl_telecom_system::preamble_sched_nsymb(i, false, full_n) != 1) {
-			test_fail(name, "tail frame must be MINI=1"); return; }
+		if (cl_telecom_system::preamble_sched_nsymb(i, false, full_n) != expect_mini) {
+			test_fail(name, "tail frame must be MINI=MINI_PREAMBLE_NSYMB"); return; }
 	}
 	// force_full overrides MINI on any tail index (retx / after-FAIL)
 	for (int i = 0; i <= 24; i++) {
 		if (cl_telecom_system::preamble_sched_nsymb(i, true, full_n) != full_n) {
 			test_fail(name, "force_full must be FULL on every index"); return; }
 	}
+	// MINI clamps to the configured full length: full_n=1 -> tail MINI=1.
+	if (cl_telecom_system::preamble_sched_nsymb(1, false, 1) != 1) {
+		test_fail(name, "MINI must clamp to full_n=1"); return; }
 	// degenerate full<1 clamps to 1, anchor still uses it
 	if (cl_telecom_system::preamble_sched_nsymb(0, false, 0) != 1) {
 		test_fail(name, "full<1 must clamp to 1"); return; }
@@ -5615,17 +5622,24 @@ static void test_preamble_sched_tx_rx_symmetry() {
 
 // §P.3 batch preamble-symbol accounting: a 25-frame clean batch carries
 // FULL + 24*MINI preamble symbols (the amortization invariant the win rests
-// on). At FULL=4 that is 4 + 24 = 28 vs the legacy 25*4 = 100.
+// on). At FULL=4, MINI=2 that is 4 + 24*2 = 52 vs the legacy 25*4 = 100 — a
+// 48% preamble-symbol reduction (was 72% with the 1-sym MINI; traded for a
+// reliable timing peak + per-frame Moose CFO on the real ceiling).
 static void test_preamble_sched_batch_accounting() {
 	const char* name = "preamble_sched_batch_accounting";
 	const int full_n = 4, nframes = 25;
+	const int mini_n = cl_telecom_system::MINI_PREAMBLE_NSYMB;  // 2
+	int expect_mini = (mini_n < full_n) ? mini_n : full_n;
 	int amortized = 0, legacy = 0;
 	for (int i = 0; i < nframes; i++) {
 		amortized += cl_telecom_system::preamble_sched_nsymb(i, false, full_n);
 		legacy    += full_n;
 	}
+	int expect_amort = full_n + (nframes - 1) * expect_mini;  // 4 + 24*2 = 52
 	if (legacy != 100)    { test_fail(name, "legacy must be 100"); return; }
-	if (amortized != 28)  { test_fail(name, "amortized must be 28 (4 + 24*1)"); return; }
+	if (amortized != expect_amort)  { test_fail(name, "amortized must be 4 + 24*MINI"); return; }
+	// The amortized total MUST stay below legacy (the win must remain positive).
+	if (amortized >= legacy) { test_fail(name, "amortized must be < legacy"); return; }
 	test_pass(name);
 }
 
@@ -5681,6 +5695,81 @@ static void test_preamble_amort_knob_gates_eff_helpers() {
 	test_pass(name);
 }
 
+// §P.5 TX AIRTIME (geometry): the 2-sym MINI tail frame is genuinely shorter on
+// the wire — a frame is (preamble + data) OFDM symbols, so a MINI tail at
+// CFG16 is (2 + Nsymb) vs the FULL (4 + Nsymb). A 25-frame batch (1 FULL anchor
+// + 24 MINI tails) shrinks ~-12..-15% of total symbols vs the all-FULL legacy
+// waveform. We compute from the loaded CFG16 geometry (preamble_nSymb +
+// get_active_nsymb) — the emitted SAMPLE count is exactly symbols * Nofdm *
+// interp, so the symbol ratio == the sample/airtime ratio. (The full
+// transmit_byte emission needs ARQ-side audio bring-up not present in a bare
+// unit instance; the symbol geometry is the load-bearing quantity and is what
+// tx_last_emitted_frame_samples scales linearly with — see telecom_system.cc
+// eff_frame_samples = Nofdm*(eff_preamble+active_nsymb)*interp.) The closed-loop
+// byte-correct decode + fallback behaviour are HW/FTRT-side.
+static void test_preamble_amort_tx_airtime_cfg16() {
+	const char* name = "preamble_amort_tx_airtime_cfg16";
+	cl_telecom_system ts;
+	ts.load_configuration(CONFIG_16);
+	ts.preamble_amortization_enabled = true;
+
+	int full_pre = ts.data_container.preamble_nSymb;            // CFG16 OFDM preamble (4)
+	int mini_pre = cl_telecom_system::MINI_PREAMBLE_NSYMB;      // 2
+	int active   = ts.get_active_nsymb();                       // CFG16 data symbols
+	if (full_pre <= 0 || active <= 0) {
+		test_fail(name, "CFG16 geometry not loaded (preamble/active <= 0)"); return; }
+	if (mini_pre >= full_pre) {
+		test_fail(name, "MINI must be < FULL for an airtime win"); return; }
+
+	// Frame length in OFDM symbols == proportional to emitted sample count.
+	int full_frame = full_pre + active;
+	int mini_frame = mini_pre + active;
+	if (mini_frame >= full_frame) {
+		test_fail(name, "MINI frame must be shorter than FULL frame"); return; }
+
+	// 25-frame batch: 1 FULL anchor + 24 MINI tails vs 25 FULL legacy.
+	const int nframes = 25;
+	double batch_amort  = (double)full_frame + (double)(nframes - 1) * mini_frame;
+	double batch_legacy = (double)nframes * full_frame;
+	double delta_pct = 100.0 * (batch_amort - batch_legacy) / batch_legacy;
+	printf("    [airtime CFG16] full_pre=%d mini_pre=%d active=%d full_frame=%d mini_frame=%d batch %.0f->%.0f sym (%.1f%%)\n",
+		full_pre, mini_pre, active, full_frame, mini_frame, batch_legacy, batch_amort, delta_pct);
+	fflush(stdout);
+
+	// Expect ~-12..-15%; allow a safe envelope (must be a real, positive win and
+	// not larger than the all-preamble-amortized upper bound of ~-20%).
+	if (delta_pct > -8.0) {
+		test_fail(name, "batch airtime reduction too small (<8%)"); return; }
+	if (delta_pct < -22.0) {
+		test_fail(name, "batch airtime reduction implausibly large (>22%)"); return; }
+	test_pass(name);
+}
+
+// §P.6 LOW-METRIC FALLBACK threshold placement. The fallback declares a clean
+// single-frame loss (KEEP batch, advance one MINI frame, SACK re-requests with
+// a FULL preamble) when the accepted MINI re-pin metric is below
+// MINI_REPIN_CONFIDENCE. The constant MUST sit in the GAP between the observed
+// mis-pin band (data-region Schmidl-Cox sub-peaks, ~0.24-0.28 on the 1-sym HW
+// failure) and a clean MINI/FULL re-pin (~0.9-0.99). This pure test pins the
+// design separation so a future "tune to mask" edit (dropping it to clear a
+// mis-pin, or raising it past a clean peak) trips the suite. The threshold is
+// chosen FROM the separation, not to make a failing run pass.
+static void test_preamble_amort_lowmetric_threshold_placement() {
+	const char* name = "preamble_amort_lowmetric_threshold_placement";
+	double thr = cl_telecom_system::MINI_REPIN_CONFIDENCE;  // 0.5
+	// Must clear the basic WB preamble_detect_threshold (0.15) — otherwise the
+	// fallback could never fire (the verify/re-pin gate is 0.15).
+	if (thr <= 0.15) {
+		test_fail(name, "confidence floor must exceed the 0.15 detect threshold"); return; }
+	// Must sit ABOVE the worst observed mis-pin (0.28) so mis-pins are rejected.
+	if (thr <= 0.28) {
+		test_fail(name, "confidence floor must exceed the 0.28 mis-pin band"); return; }
+	// Must sit BELOW a clean MINI/FULL re-pin (~0.9) so real tail frames are kept.
+	if (thr >= 0.9) {
+		test_fail(name, "confidence floor must be below a clean ~0.9 re-pin"); return; }
+	test_pass(name);
+}
+
 int run_preamble_sched_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5689,6 +5778,8 @@ int run_preamble_sched_tests() {
 	test_preamble_sched_tx_rx_symmetry();
 	test_preamble_sched_batch_accounting();
 	test_preamble_amort_knob_gates_eff_helpers();
+	test_preamble_amort_tx_airtime_cfg16();
+	test_preamble_amort_lowmetric_threshold_placement();
 	printf("=== LEVER P done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }
