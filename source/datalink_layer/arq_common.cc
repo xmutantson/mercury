@@ -6370,6 +6370,45 @@ void cl_arq_controller::advance_last_delivered(int bsi)
 		rsp_last_delivered_batch_seq_id = b;
 }
 
+// D3.1 (data-integrity): the shared LOUD GAP-ABORT teardown. Centralizes the
+// block previously inlined at the FIX-8 re-adopt gate (arq_responder.cc:646-688)
+// so the delivery-time gate and the SET_CONFIG re-baseline path use the IDENTICAL
+// action. Control-port error, DROPPED, clear the bsi family + prev-buffer +
+// carve-arm, reset_session_state(). See D31_INORDER_DESIGN.md §2.
+void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
+{
+	printf("[RSP-V2-GAP-ABORT] %s -> aborting transfer (refusing silent concatenation)\n",
+		reason ? reason : "non-contiguous delivery");
+	fflush(stdout);
+
+	// Control-port error (mirror the PSK-mismatch emit at arq_common.cc:9502-9507).
+	{
+		const char* err_msg = "BATCH GAP - non-contiguous delivery, transfer aborted\r";
+		int elen = (int)strlen(err_msg);
+		for(int e2=0; e2<elen; e2++)
+			tcp_socket_control.message->buffer[e2] = err_msg[e2];
+		tcp_socket_control.message->length = elen;
+		tcp_socket_control.transmit();
+	}
+#ifdef MERCURY_GUI_ENABLED
+	gui_push_monitor_event("[BATCH GAP — non-contiguous delivery, transfer aborted]", false);
+#endif
+	this->link_status = DROPPED;
+
+	// Clear the bsi family + in-flight prev-buffer + carve-arm so a stale prev /
+	// cur cannot misroute the next session's first frame (FIX8_AUDIT §7 R8).
+	rsp_current_expected_batch_seq_id = -1;
+	rsp_prev_batch_seq_id             = -1;
+	rsp_prev_batch_active             = false;
+	rsp_prev_batch_received_count     = 0;
+	rsp_prev_batch_expected_count     = 0;
+	bigblock_partial_armed            = false;
+	for(int i=0; i<this->nMessages; i++)
+		messages_rx_prev[i].status = FREE;
+	reset_session_state();
+	// reset_session_state() set rsp_last_delivered = -1 too.
+}
+
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
                                                 unsigned char batch_seq_id)
 {

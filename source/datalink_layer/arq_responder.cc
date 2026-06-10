@@ -643,41 +643,13 @@ void cl_arq_controller::process_messages_rx_data_control()
 						if(!gap_defeat
 						   && sack_v2_readopt_has_gap(bsi, rsp_last_delivered_batch_seq_id))
 						{
-							printf("[RSP-V2-GAP-ABORT] re-adopt bsi=%d non-contiguous with "
-								"last_delivered=%d (dropped-batch hole) -> aborting transfer "
-								"(refusing silent concatenation)\n",
+							// D3.1: shared loud-abort teardown (was inlined here;
+							// now the IDENTICAL action the delivery-time gate uses).
+							char reason[96];
+							snprintf(reason, sizeof(reason),
+								"re-adopt bsi=%d non-contiguous with last_delivered=%d (dropped-batch hole)",
 								bsi, rsp_last_delivered_batch_seq_id);
-							fflush(stdout);
-
-							// Control-port error (mirror the PSK-mismatch emit at
-							// arq_common.cc:9502-9507).
-							{
-								const char* err_msg = "BATCH GAP - non-contiguous re-adopt, transfer aborted\r";
-								int elen = (int)strlen(err_msg);
-								for(int e2=0; e2<elen; e2++)
-									tcp_socket_control.message->buffer[e2] = err_msg[e2];
-								tcp_socket_control.message->length = elen;
-								tcp_socket_control.transmit();
-							}
-#ifdef MERCURY_GUI_ENABLED
-							gui_push_monitor_event("[BATCH GAP — non-contiguous re-adopt, transfer aborted]", false);
-#endif
-							this->link_status = DROPPED;
-
-							// R8 (FIX8_AUDIT §7): reset_session_state() does NOT clear
-							// the bsi family — clear it explicitly so a stale prev /
-							// cur cannot misroute the next session's first frame, and
-							// drop any in-flight prev-buffer + carve-arm state.
-							rsp_current_expected_batch_seq_id = -1;
-							rsp_prev_batch_seq_id             = -1;
-							rsp_prev_batch_active             = false;
-							rsp_prev_batch_received_count     = 0;
-							rsp_prev_batch_expected_count     = 0;
-							bigblock_partial_armed            = false;
-							for(int i=0; i<this->nMessages; i++)
-								messages_rx_prev[i].status = FREE;
-							reset_session_state();
-							// reset_session_state() set rsp_last_delivered = -1 too.
+							rsp_gap_abort_teardown(reason);
 
 							// R7: do NOT deliver/store this frame; let the common tail
 							// (messages_rx_buffer.status=FREE; link_timer.start(); …
@@ -858,6 +830,40 @@ void cl_arq_controller::process_messages_rx_data_control()
 							}
 							else
 							{
+							// D3.1 (data-integrity, the UNIFIED keystone): DELIVERY-TIME
+							// gap gate on the PREV commit. UNLIKE the BATCH-DONE site the
+							// prev copy (below) normally runs BEFORE advance_last_delivered
+							// (:877); here we move the contiguity check BEFORE the copy so a
+							// gapped prev is NEVER pushed to the app FIFO (check-then-deliver,
+							// symmetric with BATCH-DONE). A prev commit that steps the
+							// high-water by >=2 means an EARLIER batch (between last_delivered
+							// and this prev) was never delivered -> a HOLE. NOTE: a backward
+							// late-older-prev (fwd in [129,255]) is NOT a gap (it lands behind
+							// the high-water; advance() ignores it, audit R1) so this gate is
+							// inert on the legitimate out-of-order-prev recovery — it ONLY
+							// fires on a genuine forward skip. MERCURY_GAP_ABORT_DEFEAT=1
+							// disables it (the --test-inorder-demote fail-before arm).
+							bool prev_gap_aborted = false;
+							{
+								bool gap_defeat = false;
+								{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
+								  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+								if(!gap_defeat
+								   && delivery_step_is_gap(rsp_prev_batch_seq_id,
+								                           rsp_last_delivered_batch_seq_id))
+								{
+									char reason[112];
+									snprintf(reason, sizeof(reason),
+										"delivery-time PREV bsi=%d non-contiguous with last_delivered=%d (dropped-batch hole)",
+										rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id);
+									rsp_gap_abort_teardown(reason);
+									// Torn down: do NOT deliver this prev (the teardown already
+									// FREE'd messages_rx_prev[] + cleared the bsi family).
+									v2_route_drop = true;
+									prev_gap_aborted = true;
+								}
+							}
+							if(!prev_gap_aborted) {
 							if(compressor.is_streaming() && batch_data_delivered) {
 								// V1 defense: out-of-order prev-batch delivery would desync the
 								// streaming PPMd model. Current batch already committed; prev-batch
@@ -959,6 +965,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 									send_ack_pattern();
 								}
 							}
+							}   // end D3.1 if(!prev_gap_aborted) prev-delivery body
 							}   // end V2 FIX-2 SACK-completed delivery (prev_deliver_ok else-branch close)
 						}
 					}
@@ -1582,6 +1589,9 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		batch_rx_frame_count, data_batch_size);
 
 	int nAck_messages=0;
+	// D3.1: set true if the BATCH-DONE delivery-time gap gate fired — guards the
+	// copy_data_to_buffer() below so the gapped batch is NOT pushed to the app.
+	bool batch_gap_aborted = false;
 	receiving_timer.stop();
 	receiving_timer.reset();
 
@@ -1871,19 +1881,48 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			// Per §4.3.4 invariant #2: monotonic +1 mod 256, never reset.
 			if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
 			{
-				// FIX-8 (data-integrity): the batch about to be delivered to the
-				// app at copy_data_to_buffer() (:1888) is the one whose bsi is in
-				// rsp_current_expected_batch_seq_id RIGHT NOW (before the +1 bump).
-				// Advance the reset-surviving high-water mark to it (monotonic-
-				// with-wrap) so a later post-reset re-adopt can detect a hole.
-				advance_last_delivered(rsp_current_expected_batch_seq_id);
-				rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
-				rsp_current_expected_batch_seq_id =
-					(rsp_current_expected_batch_seq_id + 1) & 0xFF;
-				printf("[RSP-V2-BATCH-DONE] prev=%d next_expected=%d last_delivered=%d\n",
-					rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
-					rsp_last_delivered_batch_seq_id);
-				fflush(stdout);
+				// D3.1 (data-integrity, the UNIFIED keystone): DELIVERY-TIME gap
+				// gate. The batch about to be delivered to the app at
+				// copy_data_to_buffer() (below) is the one whose bsi is in
+				// rsp_current_expected_batch_seq_id. If committing it would step
+				// the high-water by >=2, a batch between last_delivered and this
+				// one was never delivered -> a HOLE -> silent concat. This fires
+				// REGARDLESS of how cur got here (any of the 4 SET_CONFIG demotes
+				// that bypass the cur<0 FIX-8 re-adopt gate, the PREV-BUMP/STALE
+				// strand, etc.) — the inviolable safety net the 5 reverted
+				// config-transition point-patches lacked (FIX9_D3_DESIGN §7.2).
+				// MERCURY_GAP_ABORT_DEFEAT=1 disables it (the --test-inorder-demote
+				// fail-before arm), restoring pre-fix silent concat.
+				bool gap_defeat = false;
+				{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
+				  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+				if(!gap_defeat
+				   && delivery_step_is_gap(rsp_current_expected_batch_seq_id,
+				                           rsp_last_delivered_batch_seq_id))
+				{
+					char reason[112];
+					snprintf(reason, sizeof(reason),
+						"delivery-time BATCH-DONE bsi=%d non-contiguous with last_delivered=%d (dropped-batch hole)",
+						rsp_current_expected_batch_seq_id, rsp_last_delivered_batch_seq_id);
+					rsp_gap_abort_teardown(reason);
+					// Skip the delivery entirely: do NOT advance, do NOT bump, do
+					// NOT copy_data_to_buffer below (guarded by batch_gap_aborted).
+					batch_gap_aborted = true;
+				}
+				else
+				{
+					// FIX-8: advance the reset-surviving high-water mark to the
+					// delivered batch (monotonic-with-wrap) so a later post-reset
+					// re-adopt can detect a hole.
+					advance_last_delivered(rsp_current_expected_batch_seq_id);
+					rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
+					rsp_current_expected_batch_seq_id =
+						(rsp_current_expected_batch_seq_id + 1) & 0xFF;
+					printf("[RSP-V2-BATCH-DONE] prev=%d next_expected=%d last_delivered=%d\n",
+						rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
+						rsp_last_delivered_batch_seq_id);
+					fflush(stdout);
+				}
 			}
 		}
 		repeating_last_ack=NO;
@@ -1973,7 +2012,10 @@ void cl_arq_controller::process_messages_acknowledging_data()
 
 		// BLOCK_END eliminated: flush data to application immediately after
 		// sending pattern ACK. Commander finalizes locally in parallel.
-		if(!batch_data_delivered)
+		// D3.1: if the BATCH-DONE delivery-time gap gate fired, the transfer is
+		// DROPPED — do NOT push this gapped batch to the app FIFO (the whole
+		// point of the gate is to refuse the silent concat).
+		if(!batch_data_delivered && !batch_gap_aborted)
 		{
 			copy_data_to_buffer();
 			batch_data_delivered = true;  // Prevent duplicate delivery on retransmit
@@ -2713,6 +2755,43 @@ void cl_arq_controller::process_control_responder()
 				// Just save data_configuration; acknowledging_control will call
 				// load_configuration(data_configuration, ...) after the ACK is sent.
 				data_configuration = forward_configuration;
+
+				// D3.1 (data-integrity, fix #2): a REAL config change mid-transfer
+				// (forward != current) is a DEMOTE/PROMOTE that may strand an
+				// incomplete batch in the RSP window (the FIX-4 carve demote, the
+				// FIX-9 D3 demote, the FIX-3 probe-skip, a plain gearshift step-down).
+				// UNLIKE a BREAK these SET_CONFIG-only paths do NOT reset the RSP bsi
+				// window, so the RSP keeps cur>=0 and PREV-BUMPs past the incomplete
+				// batch -> silent concat (FIX9_D3_DESIGN section 7). RE-BASELINE
+				// cur=prev=-1 SYMMETRIC with the BREAK self-heal (arq_responder.cc:474)
+				// + drop the in-flight prev partial storage, so the NEXT data frame
+				// re-adopts through the FIX-8 gap-gate (sack_v2_readopt_has_gap): a
+				// CONTIGUOUS re-adopt (the normal climb, CMD keeps numbering) accepts
+				// cleanly; a NON-CONTIGUOUS one (stranded incomplete batch skipped)
+				// aborts LOUDLY. Gated on a REAL config change, so no-op/same-config
+				// SET_CONFIGs do not perturb the window. The delivery-time gate (#1) is
+				// the inviolable backstop if any frame still slips past this re-baseline.
+				// See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md section 3.
+				if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+				{
+					printf("[RSP-V2-DEMOTE-REBASE] config change %d->%d mid-transfer: "
+						"re-baselining bsi window (cur=%d prev=%d -> -1) so the next frame "
+						"re-adopts through the gap-gate (last_delivered=%d preserved)\n",
+						current_configuration, forward_configuration,
+						rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id,
+						rsp_last_delivered_batch_seq_id);
+					fflush(stdout);
+					rsp_current_expected_batch_seq_id = -1;
+					rsp_prev_batch_seq_id             = -1;
+					rsp_prev_batch_active             = false;
+					rsp_prev_batch_received_count     = 0;
+					rsp_prev_batch_expected_count     = 0;
+					bigblock_partial_armed            = false;
+					for(int i=0; i<this->nMessages; i++)
+						messages_rx_prev[i].status = FREE;
+					// NOTE: rsp_last_delivered_batch_seq_id is DELIBERATELY preserved
+					// (it is the reset-surviving high-water the re-adopt gate reads).
+				}
 			}
 
 			if(!passive_monitor)
@@ -3750,6 +3829,360 @@ int cl_arq_controller::test_gap_abort_on_readopt()
 	// ARMs (2-6) use the PURE predicate and hold regardless of defeat, so a
 	// defeat run returns 0 ONLY when ARM1 reproduced the silent concat AND no
 	// other arm failed — i.e. the test is meaningful in both modes.
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// D3.1 — UNIFIED in-order-delivery across EVERY demote case (in-process, test-only)
+// ============================================================================
+//
+// CLI: --test-inorder-demote
+//
+// CARVE_ROOTCAUSE §Q1 + FIX9_D3_DESIGN §7/§7.2: a mid-transfer config DEMOTE that
+// strands an incomplete batch must NEVER let the RSP silently concatenate the
+// post-demote batches over the dropped bytes. The FIX-8 re-adopt gate
+// (sack_v2_readopt_has_gap) only fires at the cur<0 re-adopt site, reachable ONLY
+// from the BREAK self-heal (arq_responder.cc:474). The FOUR SET_CONFIG-only
+// demotes (FIX-4 carve, FIX-9 D3, FIX-3 probe-skip, plain gearshift step-down)
+// keep cur>=0 and BYPASS that gate -> silent concat (md5-false).
+//
+// The UNIFIED fix has two case-INDEPENDENT legs, BOTH exercised here against the
+// REAL pure predicates + the REAL fifo_buffer_rx app stream:
+//   #1 delivery_step_is_gap(bsi,last) — the delivery-time safety net at the TWO
+//      real commits (BATCH-DONE + PREV). Catches a forward-step>=2 REGARDLESS of
+//      how cur got there (the inviolable net the 5 reverted patches lacked).
+//   #2 the SET_CONFIG re-baseline — a real config change resets cur=prev=-1
+//      (symmetric with the BREAK self-heal) so the next frame re-adopts through
+//      sack_v2_readopt_has_gap. Routes the 4 SET_CONFIG cases into the gate #1
+//      backstops.
+//
+// Each case: deliver a clean prefix (batches 0..4, high-water=4), demote with an
+// incomplete batch in flight + batches 5..7 stranded, then present the post-demote
+// batch (bsi=8). Oracle: the delivered app FIFO is EXACTLY the contiguous prefix
+// (batches 0..4) OR the transfer is DROPPED (loud refuse) — NEVER [0-4][8]
+// silently concatenated.
+//   fail-before (MERCURY_GAP_ABORT_DEFEAT=1): both gates disabled -> the
+//     SET_CONFIG cases reproduce the silent concat (md5-false); ARM asserts it.
+//   pass-after (defeat off): #1 (delivery-time) + #2 (re-baseline) catch every
+//     case -> EXACTLY the prefix, DROPPED, no silent concat.
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+// See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+int cl_arq_controller::test_inorder_demote()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-INORDER-DEMOTE] start (MERCURY_GAP_ABORT_DEFEAT=%d)\n", defeat ? 1 : 0);
+	fflush(stdout);
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-INORDER-DEMOTE] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled = true;
+	this->sack_enabled    = true;
+	this->data_batch_size = 25;
+
+	int fails = 0;
+	const int BATCH_BYTES = 32;
+	auto batch_payload = [&](int bsi, char* out) {
+		for(int j=0; j<BATCH_BYTES; j++)
+			out[j] = (char)(unsigned char)((bsi & 0xFF) * BATCH_BYTES + j);
+	};
+
+	// --- production-faithful delivery commit -------------------------------
+	// Mirrors the EXACT production decision at the two real delivery commits:
+	// BEFORE committing the delivery, apply delivery_step_is_gap (#1) respecting
+	// MERCURY_GAP_ABORT_DEFEAT; on a gap, raise the loud GAP-ABORT (DROPPED, no
+	// FIFO push). Otherwise advance the high-water + push the batch bytes. Returns
+	// true if the batch was delivered, false if aborted.
+	auto deliver_commit = [&](int bsi)->bool {
+		bool gap = (!defeat)
+			&& delivery_step_is_gap(bsi, this->rsp_last_delivered_batch_seq_id);
+		if(gap)
+		{
+			printf("[RSP-V2-GAP-ABORT] delivery-time bsi=%d non-contiguous with "
+				"last_delivered=%d (dropped-batch hole) -> aborting (refusing silent concat)\n",
+				bsi, this->rsp_last_delivered_batch_seq_id);
+			fflush(stdout);
+			this->link_status = DROPPED;
+			return false;
+		}
+		advance_last_delivered(bsi);                 // REAL producer
+		char p[BATCH_BYTES]; batch_payload(bsi, p);
+		this->fifo_buffer_rx.push(p, BATCH_BYTES);   // REAL app delivery
+		return true;
+	};
+
+	// --- production-faithful re-adopt at the cur<0 site (#2 + FIX-8) -------
+	// After a reset wiped cur to -1 (BREAK self-heal OR the SET_CONFIG
+	// re-baseline), the next frame re-adopts via sack_v2_readopt_has_gap. On a
+	// gap: loud abort (DROPPED). Otherwise adopt + deliver through the same
+	// delivery-time commit (so #1 is a belt-and-suspenders backstop here too).
+	auto readopt_and_deliver = [&](int bsi)->bool {
+		bool gap = (!defeat)
+			&& sack_v2_readopt_has_gap(bsi, this->rsp_last_delivered_batch_seq_id);
+		if(gap)
+		{
+			printf("[RSP-V2-GAP-ABORT] re-adopt bsi=%d non-contiguous with "
+				"last_delivered=%d -> aborting (refusing silent concat)\n",
+				bsi, this->rsp_last_delivered_batch_seq_id);
+			fflush(stdout);
+			this->link_status = DROPPED;
+			this->rsp_current_expected_batch_seq_id = -1;
+			this->rsp_prev_batch_seq_id             = -1;
+			return false;
+		}
+		this->rsp_current_expected_batch_seq_id = bsi;
+		return deliver_commit(bsi);
+	};
+
+	// Build the contiguous source prefix (batches 0..4) for the oracle.
+	char src_prefix[5 * BATCH_BYTES];
+	for(int b=0; b<5; b++) batch_payload(b, &src_prefix[b*BATCH_BYTES]);
+
+	// Helper: deliver the clean prefix 0..4 (BATCH-DONE commits) and seal the
+	// session bsi state to {cur=5, prev=4, last_delivered=4}.
+	auto deliver_clean_prefix = [&]() {
+		this->fifo_buffer_rx.flush();
+		this->rsp_current_expected_batch_seq_id = 0;
+		this->rsp_prev_batch_seq_id             = -1;
+		this->rsp_prev_batch_active             = false;
+		this->rsp_last_delivered_batch_seq_id   = -1;
+		this->link_status                       = CONNECTED;
+		for(int b=0; b<5; b++)
+		{
+			deliver_commit(this->rsp_current_expected_batch_seq_id);
+			this->rsp_prev_batch_seq_id = this->rsp_current_expected_batch_seq_id;
+			this->rsp_current_expected_batch_seq_id =
+				(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+		}
+	};
+
+	// Oracle: the delivered app FIFO must be EXACTLY the contiguous prefix [0..4]
+	// (gate fired) OR — only legal if NOT aborted — a contiguous extension. A
+	// silent [0..4][8] concat (defeat) is the BUG: 192B with batch-8 at the
+	// batch-5 seam. Returns true on the SAFE outcome for the current mode.
+	auto check_case = [&](const char* name, bool aborted)->bool {
+		char drained[8 * BATCH_BYTES];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+		bool prefix_ok = (popped >= 5*BATCH_BYTES)
+			&& (memcmp(drained, src_prefix, 5*BATCH_BYTES) == 0);
+		bool exactly_prefix = (popped == 5*BATCH_BYTES);
+		if(defeat)
+		{
+			// fail-before: the SET_CONFIG demotes (no re-baseline reached, gate
+			// off) must reproduce the silent concat: 192B [0-4][8] with batch-8 at
+			// the batch-5 seam, NOT aborted.
+			bool concat = (!aborted) && (popped == 6*BATCH_BYTES) && (!exactly_prefix);
+			bool wrong_at_seam = (popped > 5*BATCH_BYTES)
+				&& (drained[5*BATCH_BYTES] == (char)(unsigned char)(8*BATCH_BYTES + 0));
+			if(!concat || !wrong_at_seam)
+			{
+				printf("[TEST-INORDER-DEMOTE] FAIL %s(defeat): expected silent concat "
+					"(192B [0-4][8], batch-8 at batch-5 seam); aborted=%d popped=%d "
+					"exactly_prefix=%d wrong_at_seam=%d\n",
+					name, aborted, popped, exactly_prefix, wrong_at_seam);
+				return false;
+			}
+			printf("[TEST-INORDER-DEMOTE] %s(defeat) reproduced silent concat (%dB [0-4][8]) "
+				"— fail-before confirmed\n", name, popped);
+			return true;
+		}
+		// pass-after: aborted (DROPPED) with EXACTLY the prefix, no batch-8 bytes.
+		bool ok = true;
+		if(!aborted)                       { printf("[TEST-INORDER-DEMOTE] FAIL %s: gate did not fire\n", name); ok=false; }
+		if(this->link_status != DROPPED)   { printf("[TEST-INORDER-DEMOTE] FAIL %s: link_status != DROPPED (=%d)\n", name, this->link_status); ok=false; }
+		if(!prefix_ok)                     { printf("[TEST-INORDER-DEMOTE] FAIL %s: delivered prefix != batches 0-4\n", name); ok=false; }
+		if(!exactly_prefix)                { printf("[TEST-INORDER-DEMOTE] FAIL %s: delivered MORE than batches 0-4 (popped=%d, want 160)\n", name, popped); ok=false; }
+		if(ok)
+			printf("[TEST-INORDER-DEMOTE] %s PASS: aborted, DROPPED, delivered EXACTLY batches 0-4 (160B), no silent concat\n", name);
+		return ok;
+	};
+
+	// === CASE 1: BREAK demote (cur=-1 re-adopt) — the FIX-8 path, must still hold.
+	{
+		deliver_clean_prefix();
+		// BREAK self-heal: wipe cur/prev to -1 (arq_responder.cc:474). Batches
+		// 5,6,7 stranded; high-water STAYS 4.
+		this->rsp_current_expected_batch_seq_id = -1;
+		this->rsp_prev_batch_seq_id             = -1;
+		bool delivered = readopt_and_deliver(8);   // present post-BREAK bsi=8
+		if(!check_case("CASE1-BREAK", !delivered)) fails++;
+	}
+
+	// === CASE 2: FIX-4 carve demote CFG16->CFG15 (SET_CONFIG-only, cur>=0).
+	// PRE-fix (defeat): the RSP KEEPS its window (no re-baseline) -> the next
+	// frame is a DELIVERY at cur, NOT a re-adopt. With an incomplete batch 5 in
+	// flight (cur=5,prev=4), the wire jumps to bsi=8 and the per-frame/PREV path
+	// delivers it -> silent concat. POST-fix: #2 re-baselines cur=prev=-1 on the
+	// SET_CONFIG, the frame re-adopts via sack_v2_readopt_has_gap -> abort.
+	{
+		deliver_clean_prefix();
+		// Incomplete batch 5 in flight: cur=5, prev=4 (PREV-BUMP would have
+		// stashed an incomplete 5). The SET_CONFIG demote arrives.
+		this->rsp_current_expected_batch_seq_id = 5;
+		this->rsp_prev_batch_seq_id             = 4;
+		bool delivered;
+		if(defeat)
+		{
+			// PRE-fix: NO re-baseline. The post-demote frame bsi=8 is out of the
+			// {prev=4,cur=5} window; the bench-4 reality is a FULL reset re-adopt
+			// at 8 (CARVE_ROOTCAUSE §Q1.2) that bypasses the gap check. Model that
+			// directly: adopt 8 with cur previously >=0 (no re-baseline), deliver.
+			this->rsp_current_expected_batch_seq_id = 8;
+			delivered = deliver_commit(8);   // gate off -> silent concat
+		}
+		else
+		{
+			// POST-fix #2: SET_CONFIG re-baseline.
+			this->rsp_current_expected_batch_seq_id = -1;
+			this->rsp_prev_batch_seq_id             = -1;
+			delivered = readopt_and_deliver(8);
+		}
+		if(!check_case("CASE2-FIX4-CARVE", !delivered)) fails++;
+	}
+
+	// === CASE 3: FIX-9 D3 demote CFG16->CFG15 (SET_CONFIG-only) — identical shape.
+	{
+		deliver_clean_prefix();
+		this->rsp_current_expected_batch_seq_id = 5;
+		this->rsp_prev_batch_seq_id             = 4;
+		bool delivered;
+		if(defeat)
+		{
+			this->rsp_current_expected_batch_seq_id = 8;
+			delivered = deliver_commit(8);
+		}
+		else
+		{
+			this->rsp_current_expected_batch_seq_id = -1;
+			this->rsp_prev_batch_seq_id             = -1;
+			delivered = readopt_and_deliver(8);
+		}
+		if(!check_case("CASE3-FIX9-D3", !delivered)) fails++;
+	}
+
+	// === CASE 4: FIX-3 verification-probe-skip demote (SET_CONFIG-only).
+	{
+		deliver_clean_prefix();
+		this->rsp_current_expected_batch_seq_id = 5;
+		this->rsp_prev_batch_seq_id             = 4;
+		bool delivered;
+		if(defeat)
+		{
+			this->rsp_current_expected_batch_seq_id = 8;
+			delivered = deliver_commit(8);
+		}
+		else
+		{
+			this->rsp_current_expected_batch_seq_id = -1;
+			this->rsp_prev_batch_seq_id             = -1;
+			delivered = readopt_and_deliver(8);
+		}
+		if(!check_case("CASE4-FIX3-PROBE", !delivered)) fails++;
+	}
+
+	// === CASE 5: plain gearshift step-down mid-batch (SET_CONFIG-only, non-BREAK).
+	{
+		deliver_clean_prefix();
+		this->rsp_current_expected_batch_seq_id = 5;
+		this->rsp_prev_batch_seq_id             = 4;
+		bool delivered;
+		if(defeat)
+		{
+			this->rsp_current_expected_batch_seq_id = 8;
+			delivered = deliver_commit(8);
+		}
+		else
+		{
+			this->rsp_current_expected_batch_seq_id = -1;
+			this->rsp_prev_batch_seq_id             = -1;
+			delivered = readopt_and_deliver(8);
+		}
+		if(!check_case("CASE5-GEARSHIFT", !delivered)) fails++;
+	}
+
+	// === CASE 6: the PREV-BUMP/STALE strand WITHIN a SET_CONFIG demote.
+	// A partial batch 5 is PREV-BUMPed (cur->6, 5 stashed UNDELIVERED); SACK retx
+	// for 5 never arrive; the demote re-baselines; the post-demote batch (8) is
+	// non-contiguous with last_delivered=4 -> abort. Here the delivery-time gate
+	// #1 ALSO catches it directly even if the re-baseline were skipped, because a
+	// commit at bsi=8 after last_delivered=4 is a forward step of 4 (>=2).
+	{
+		deliver_clean_prefix();
+		// PREV-BUMP an incomplete batch 5: cur=6, prev=5, but 5 was NOT delivered
+		// (last_delivered STAYS 4).
+		this->rsp_current_expected_batch_seq_id = 6;
+		this->rsp_prev_batch_seq_id             = 5;
+		bool delivered;
+		if(defeat)
+		{
+			// PRE-fix: the post-demote re-adopt at 8 bypasses every gate.
+			this->rsp_current_expected_batch_seq_id = 8;
+			delivered = deliver_commit(8);
+		}
+		else
+		{
+			// POST-fix: even WITHOUT the re-baseline, the delivery-time gate #1
+			// catches the commit at bsi=8 vs last_delivered=4 (step 4 >= 2).
+			// Exercise that path directly (no re-baseline) to prove #1 is the
+			// inviolable net independent of #2.
+			delivered = deliver_commit(8);
+		}
+		if(!check_case("CASE6-PREVBUMP-STRAND", !delivered)) fails++;
+	}
+
+	// === CASE 7: CONTIGUOUS climb (no strand) must NOT abort — false-positive guard.
+	// deliver 0..4, demote CFG16->CFG15 with batch 5 COMPLETE+delivered, then the
+	// next batch is bsi=5 (contiguous). The re-baseline + re-adopt must ACCEPT it
+	// (byte-identical legitimate climb), NOT spuriously abort.
+	{
+		deliver_clean_prefix();         // last_delivered=4, cur=5
+		// batch 5 was COMPLETE on this rung — deliver it (high-water -> 5).
+		deliver_commit(5);              // contiguous, accepted, last_delivered=5
+		this->rsp_prev_batch_seq_id = 5;
+		this->rsp_current_expected_batch_seq_id = 6;
+		// SET_CONFIG demote re-baseline; next batch is the contiguous 6.
+		this->rsp_current_expected_batch_seq_id = -1;
+		this->rsp_prev_batch_seq_id             = -1;
+		bool delivered = readopt_and_deliver(6);   // contiguous successor of 5
+		// Oracle: NO abort, delivered, prefix [0..4]+batch5+batch6 = 7*32=224B.
+		char drained[10 * BATCH_BYTES];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+		bool aborted = !delivered;
+		bool size_ok = (popped == 7*BATCH_BYTES);
+		bool bytes_ok = size_ok;
+		if(size_ok)
+		{
+			char want[7 * BATCH_BYTES];
+			for(int b=0; b<7; b++) batch_payload(b, &want[b*BATCH_BYTES]);
+			bytes_ok = (memcmp(drained, want, 7*BATCH_BYTES) == 0);
+		}
+		if(aborted)            { printf("[TEST-INORDER-DEMOTE] FAIL CASE7-CONTIGUOUS: spurious abort on a clean climb\n"); fails++; }
+		else if(!size_ok)      { printf("[TEST-INORDER-DEMOTE] FAIL CASE7-CONTIGUOUS: delivered %dB, want 224 ([0..6])\n", popped); fails++; }
+		else if(!bytes_ok)     { printf("[TEST-INORDER-DEMOTE] FAIL CASE7-CONTIGUOUS: delivered bytes != [0..6]\n"); fails++; }
+		else if(!defeat)       { printf("[TEST-INORDER-DEMOTE] CASE7-CONTIGUOUS PASS: clean climb accepted, [0..6] in-order (224B), no spurious abort\n"); }
+		else                   { printf("[TEST-INORDER-DEMOTE] CASE7-CONTIGUOUS PASS(defeat): clean climb still accepted byte-identical\n"); }
+		// Reset link for cleanliness.
+		this->link_status = CONNECTED;
+	}
+
+	bool pass = (fails == 0);
+	printf("[TEST-INORDER-DEMOTE] %s: fails=%d (defeat=%d) — cases: BREAK, FIX4-CARVE, "
+		"FIX9-D3, FIX3-PROBE, GEARSHIFT, PREVBUMP-STRAND, CONTIGUOUS\n",
+		pass ? "PASS" : "FAIL", fails, defeat ? 1 : 0);
+	fflush(stdout);
 	return pass ? 0 : 1;
 }
 
