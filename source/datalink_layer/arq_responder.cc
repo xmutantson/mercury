@@ -1032,6 +1032,34 @@ void cl_arq_controller::process_messages_rx_data_control()
 			fflush(stdout);
 			hail_detected = NO;
 		}
+
+		// CONNECTION_RECEIVED stall recovery (CONNECT_DESIGN.md §2 companion).
+		// Symmetric with the CONNECTED re-arm at :1007 and the LISTENING
+		// HAIL-rescan above. We sent the single START_CONNECTION ACK but no
+		// START_CONNECTION retransmit / TEST_CONNECTION decoded within this
+		// window. The CMD is still inside its ~30 s connect window retransmitting
+		// START_CONNECTION, so do NOT tear down to LISTENING on the first miss —
+		// re-arm a fresh single-control-frame window and keep listening. The
+		// legacy receive() path catches the next START_CONNECTION retransmit
+		// (-> :2020 guard re-ACKs) and Site F (:350) catches TEST_CONNECTION.
+		// This is reachable ONLY because the §2-main re-arm above restarted the
+		// receiving_timer (the stock exit left it stopped, making this else
+		// unreachable in CONNECTION_RECEIVED — rsp_rx_timeout_fired=0 in the
+		// FAIL logs).
+		if(link_status == CONNECTION_RECEIVED)
+		{
+			telecom_system->data_container.frames_to_read =
+				telecom_system->data_container.preamble_nSymb
+				+ telecom_system->get_active_nsymb();
+			telecom_system->data_container.nUnder_processing_events = 0;
+			calculate_receiving_timeout();
+			receiving_timer.start();
+			printf("[CONN-RX-REARM] CONNECTION_RECEIVED window renewed (awaiting "
+				"START_CONNECTION retransmit / TEST_CONNECTION): ftr=%d timeout=%d\n",
+				telecom_system->data_container.frames_to_read.load(),
+				receiving_timeout);
+			fflush(stdout);
+		}
 	}
 }
 
@@ -1252,6 +1280,41 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			fflush(stdout);
 			commander_configured_nb = NO;  // Save original WB for restore on disconnect
 			switch_narrowband_mode(YES);
+		}
+
+		// CONNECTION_RECEIVED re-arm (CONNECT_DESIGN.md §2) — fixes the ~42%
+		// CONNECT race. The START_CONNECTION ACK above was sent exactly ONCE.
+		// The CMD listens ~30 s and retransmits START_CONNECTION many times; if
+		// it missed this single ACK (one-shot TX/RX phase race, Bug #55 shape)
+		// the handshake deadlocks until the dwell expires (root cause: the stock
+		// exit set a whole-frame block-wait ftr at :1233 AND left receiving_timer
+		// STOPPED at :543-544, so the RSP went deaf + un-timed and never re-decoded
+		// a START_CONNECTION retransmit to re-ACK). Re-arm to a SINGLE control-frame
+		// window and RESTART the receiving_timer so (a) the legacy receive() path at
+		// :431 re-decodes a START_CONNECTION retransmit -> the :2020 guard re-runs the
+		// full ACK send, and (b) the timeout `else` at :986 becomes reachable so each
+		// window self-renews (companion branch below). ftr is the SAME single-frame
+		// size the ACK-GATE partial-retx re-arm uses (:1703-1705) and the HAIL handler
+		// primes (:215); Site F (:350) still caps ftr->2 to sample the TEST_CONNECTION
+		// MFSK suffix, so this does not starve the next phase. This is a structural
+		// fix (makes the handshake survive a single lost frame, like the CONNECTED
+		// re-arm at :1007), NOT timeout padding — the window comes from existing
+		// calculate_receiving_timeout() geometry. NO-OP on the happy path: when the
+		// CMD catches the first ACK, TEST_CONNECTION advances state and supersedes
+		// this ftr/timer immediately.
+		if(link_status == CONNECTION_RECEIVED && ack_command == START_CONNECTION)
+		{
+			telecom_system->data_container.frames_to_read =
+				telecom_system->data_container.preamble_nSymb
+				+ telecom_system->get_active_nsymb();
+			telecom_system->data_container.nUnder_processing_events = 0;
+			calculate_receiving_timeout();
+			receiving_timer.start();
+			printf("[CONN-RX-REARM] CONNECTION_RECEIVED re-armed for START_CONNECTION "
+				"retransmit/TEST_CONNECTION: ftr=%d timeout=%d\n",
+				telecom_system->data_container.frames_to_read.load(),
+				receiving_timeout);
+			fflush(stdout);
 		}
 
 		// BW negotiation: deferred WB switch after SWITCH_BANDWIDTH ACK
