@@ -426,6 +426,107 @@ inline int bigblock_carve_cooldown_ceiling(int cooldown_batches_remaining, bool 
 #endif
 }
 
+// WALL-B FIX-9 D3 (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §1/§2 Rank-1, FIX9_D3_DESIGN.md):
+// the CFG16 reverse-ACK STARVATION discriminator. On a CLEAN channel the link climbs to CONFIG_16
+// and SUSTAINS the 25-frame batch; inter-Pi sample-clock drift de-aligns the half-duplex turnaround
+// at the DENSEST constellation; the reverse MFSK ACK+SACK correlator fails to decode (the timeout
+// fires — on HW the window goes pure-silent peak_metric=0.0; in the drift-sim it degrades to a
+// SUB-THRESHOLD partial peak_matched 5/7, peak_metric~0.5 — BOTH are "the reverse ACK did not
+// decode = reverse-ACK loss"). N such consecutive block-failures BREAK off CFG16 -> the ROBUST
+// cascade (0 bytes). D3 demotes CFG16->CFG15 (one rung down, NOT a 2+ rung BREAK toward ROBUST) and
+// holds it, instead of cascading.
+//
+// Returns the fallback config (CONFIG_15) when ALL of:
+//   (D3-1) current_config == CONFIG_16 (the densest 32-QAM rung; FIX9_ROOTCAUSE "Why CFG16": CFG16
+//          is the intersection of densest-constellation x longest-sustained-batch — it de-aligns
+//          first; CFG15 holds the turnaround it lacks, proven by the drift-OFF control).
+//   (D3-2) OFDM IS PROVEN ON THIS CHANNEL: ofdm_proven == true (last_data_viable_config is an OFDM
+//          config — the link delivered DATA at an OFDM rung this session). This is the discriminator
+//          vs a GENUINE deep-SNR collapse: there the anchor is a ROBUST/MFSK rung (OFDM never proved
+//          out), so D3-2 is FALSE and the BREAK->ROBUST escape runs UNTOUCHED. When OFDM IS proven,
+//          a CFG16-specific failure should step DOWN WITHIN OFDM (to CFG15), not abandon OFDM
+//          entirely. NOTE: this is INTENTIONALLY broader than "anchor==CFG16" — the HW repro raised
+//          the anchor into the high OFDM tier before the reverse-ACK starved, but the drift-sim
+//          elects CFG16 speculatively (anchor at the OFDM floor) and BOTH directions de-align; the
+//          shared, faithful signal across both is "OFDM works, CFG16 specifically doesn't".
+//   (D3-3/D3-4) SUSTAINED reverse-ACK loss: starve_fails >= starve_threshold, where starve_fails
+//          counts CONSECUTIVE block-failures AT CFG16 (the ACK timed out, data_ack_received==NO).
+//          A SINGLE transient CFG16 ACK miss does NOT abandon the rung.
+//   (D3-5) the PER-FRAME path (bigblock_rung_live == false): mutually exclusive with FIX-4, which
+//          owns the big-block carve path.
+// Else returns -1 (caller proceeds to the EXISTING BREAK path unchanged — deep-SNR escape intact).
+// This is NOT a generic ACK-timeout rebrand: D3-1 restricts it to CFG16 alone, and D3-2 restricts
+// it to the case where OFDM is proven viable (so the move is a within-OFDM step-down, never an
+// OFDM-abandoning BREAK). A timeout at any other rung, or a CFG16 timeout with no OFDM proven,
+// takes the unchanged BREAK path.
+// PURE; the unit test (Part V) replays it directly. FAIL-BEFORE: -DFIX9_D3_FAILBEFORE -> -1 always
+// (no D3 fallback -> the reverse-ACK-starved link BREAKs to ROBUST_0, 0 bytes).
+inline int cfg16_revack_starve_fallback_target(int current_config, bool ofdm_proven,
+		bool bigblock_rung_live, int starve_fails, int starve_threshold, bool robust_enabled) {
+#ifdef FIX9_D3_FAILBEFORE
+	(void)current_config; (void)ofdm_proven; (void)bigblock_rung_live;
+	(void)starve_fails; (void)starve_threshold; (void)robust_enabled;
+	return -1;   // FAIL-BEFORE stub: no D3 fallback -> the reverse-ACK-starved BREAK cascade runs.
+#else
+	if (bigblock_rung_live) return -1;          // (D3-5) FIX-4 owns the big-block carve path.
+	if (current_config != CONFIG_16) return -1; // (D3-1) only CFG16 has this turnaround fragility.
+	if (!ofdm_proven) return -1;                // (D3-2) deep-SNR collapse (anchor robust) -> BREAK.
+	if (starve_fails < starve_threshold) return -1; // (D3-3/D3-4) the sustained-loss deadline.
+	// (D3) target = the highest per-frame OFDM rung directly below CFG16 (config_ladder_down maps
+	// CFG16 -> CFG15). Guard it is a real per-frame OFDM rung (never robust/MFSK -> never re-enters
+	// the de-aligned-peer regime), exactly like FIX-4.
+	int fallback = config_ladder_down(current_config, robust_enabled);
+	if (!is_ofdm_config(fallback) || is_robust_config(fallback)) return -1;
+	if (fallback >= current_config) return -1;  // must be a genuine demote.
+	return fallback;
+#endif
+}
+
+// WALL-B FIX-9 D3: the sustained-reverse-ACK-silence deadline (BATCHES of consecutive pure-silence
+// block-failures at CFG16 before the per-frame demote). =2 per the root-cause Q4 D3 spec ("2
+// consecutive ACK-silence block-failures with healthy forward SACK history"). TUNABLE.
+static const int CFG16_REVACK_STARVE_FAILS = 2;
+
+// WALL-B FIX-9 D2 (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md): the
+// reverse-data-ACK turnaround-geometry predicate. The reverse MFSK ACK+SACK PHY (the M=16 WB
+// Welch-Costas pattern, send_mfsk_ack_sack) is config-INDEPENDENT in TONE SET — the same correlator
+// pattern fires at every config — but it is EMITTED inside the LIVE config's PTT/turnaround
+// geometry. At the robust tier the RSP keys the ACK with a pre-TX pumped_settle_wait guard
+// (arq_common.cc:6581, the fatter turnaround the OFDM cadence lacks), and the CMD's listen-window
+// budget covers it. At OFDM forward configs that guard is SKIPPED, so under inter-Pi sample-clock
+// drift the ppm-slipped reverse ACK lands OUTSIDE the CMD's tight OFDM-cadence window and the
+// correlator goes pure-silent (the D3 collapse). D2 attacks the ROOT: emit the reverse data-ACK on
+// the SAME robust turnaround geometry (the pre-TX settle + a CMD window widen, in lockstep) at ALL
+// OFDM forward configs, so the slipped ACK STILL lands in window and CFG16 itself HOLDS — the
+// stronger outcome than D3's after-the-fact CFG15 settle (D2 removes D3's trigger; the two compose
+// — D2 = prevention, D3 = recovery if the drift defeats even the robust geometry).
+//
+// Returns true iff the LIVE forward data config is an OFDM rung (where the OFDM-cadence ACK is at
+// risk of the drift-driven turnaround de-alignment). FALSE at the robust tier (the EXISTING
+// is_robust_config guard already fires the settle there — robust path byte-identical) and FALSE for
+// NB (handled by send_mfsk_ack_sack's ack_sack_suffix_len()<=0 early-return). The CMD's
+// calculate_receiving_timeout() and the RSP's send_mfsk_ack_sack() BOTH call this on
+// current_configuration, so the two sides cannot diverge (the FIX9_ROOTCAUSE §5 lockstep invariant).
+// PURE; the unit test (Part W) replays it directly. FAIL-BEFORE: -DFIX9_D2_FAILBEFORE -> false
+// always (no robust geometry at OFDM -> the reverse-ACK-starved link collapses, the D3 path runs).
+inline bool reverse_ack_uses_robust_geometry(int forward_config) {
+#ifdef FIX9_D2_FAILBEFORE
+	(void)forward_config;
+	return false;   // FAIL-BEFORE stub: OFDM keeps the tight cadence -> the drift collapse.
+#else
+	return is_ofdm_config(forward_config) && !is_robust_config(forward_config);
+#endif
+}
+
+// WALL-B FIX-9 D2: the extra CMD listen-window margin (ms) added when the reverse data-ACK is keyed
+// on the robust turnaround geometry. Covers the accumulated per-batch clock-drift arrival jitter
+// the stock per-frame frame_drain (=2*message_transmission_time_ms) did not absorb. The HW evidence
+// showed the correlator going PURE-SILENT (the window CLOSED before the late ACK) rather than a few-
+// ms near-miss, so this is dominated by the settle-flush re-arm gap, not the ~6 ms/batch raw slip.
+// Same order as SACK_ARRIVAL_MARGIN_MS (1000). TUNABLE; gate (b) confirms it suffices (repro HOLDS
+// CFG16). The RSP's matching pre-TX settle (ptt_off+ptt_on) is added SEPARATELY in lockstep.
+static const int ROBUST_ACK_DRIFT_MARGIN_MS = 600;
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

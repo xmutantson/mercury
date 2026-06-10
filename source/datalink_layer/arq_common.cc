@@ -829,6 +829,7 @@ cl_arq_controller::cl_arq_controller()
 	// suspenders for the init() path that re-runs this block.
 	bigblock_carve_cooldown_batches=0;
 	bigblock_carve_cooldown_span=0;
+	cfg16_revack_starve_fails=0;   // WALL-B FIX-9 D3: fresh session never inherits a stale starve count
 	break_recovery_phase=0;
 	break_recovery_retries=0;
 	ceiling_success_count=0;
@@ -1264,6 +1265,17 @@ void cl_arq_controller::calculate_receiving_timeout()
 			                 + pattern_time + ptt_on_delay_ms;
 			int margin       = SACK_ARRIVAL_MARGIN_MS;
 			int timeout = frame_drain + sack_arrival + margin;
+			// WALL-B FIX-9 D2 (FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md §3.3): when the data-ACK
+			// the CMD is waiting for will be keyed on the robust turnaround geometry (the forward
+			// data config is OFDM — reverse_ack_uses_robust_geometry), WIDEN the listen window IN
+			// LOCKSTEP with the RSP's matching pre-TX settle (send_mfsk_ack_sack:6581). The two
+			// (ptt_off+ptt_on) terms mirror the RSP's new pre-key settle EXACTLY; the drift margin
+			// covers the accumulated per-batch clock-slip the stock per-frame frame_drain did not
+			// absorb. Without this the CMD window stays narrow and the slipped robust-geometry ACK
+			// STILL arrives late -> the FIX9_ROOTCAUSE §5 window-mismatch. Robust forward config:
+			// the predicate is FALSE -> adder=0 -> byte-identical.
+			if(reverse_ack_uses_robust_geometry(current_configuration))
+				timeout += ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS;
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -1273,10 +1285,12 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
-			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d batch=%d sack=%d\n",
+			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d batch=%d sack=%d\n",
 				timeout, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
 				margin, sack_enabled ? sack_timeout_extra_ms : 0,
+				reverse_ack_uses_robust_geometry(current_configuration)
+					? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			set_receiving_timeout(timeout);
@@ -3863,6 +3877,8 @@ void cl_arq_controller::reset_session_state()
 	// the supershift_proven_ceiling = -1 reset at :3767.
 	bigblock_carve_cooldown_batches = 0;
 	bigblock_carve_cooldown_span = 0;
+	cfg16_revack_starve_fails = 0;   // WALL-B FIX-9 D3 (R3 parity): clear the CFG16 reverse-ACK
+	                                 // starvation streak on session reset / new CONNECT.
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
 	ceiling_success_count = 0;
@@ -6574,8 +6590,19 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		(unsigned)batch_seq_id, (unsigned)bitmap, (unsigned)crc12, nsymb, current_configuration);
 	fflush(stdout);
 
-	// Guard delay for MFSK modes (same as send_ack_pattern_with_snr)
-	if(is_robust_config(current_configuration))
+	// Guard delay for MFSK modes (same as send_ack_pattern_with_snr).
+	// WALL-B FIX-9 D2 (FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md §3.2): the pre-TX settle ALSO
+	// fires at OFDM forward configs (reverse_ack_uses_robust_geometry), not just the robust tier.
+	// The reverse data-ACK PHY is config-independent in tone set, but at an OFDM config the tight
+	// turnaround gives the CMD's receiver NO time to flush its long-batch capture ring and re-arm
+	// the ACK correlator at the post-batch phase — so under inter-Pi clock drift the ppm-slipped
+	// ACK lands outside the CMD window (correlator pure-silent, the D3 collapse). Keying the ACK
+	// with the robust pre-TX settle (the same fatter turnaround the robust tier already uses) gives
+	// the CMD that re-arm margin. The CMD's calculate_receiving_timeout() widens its listen window
+	// in LOCKSTEP on the SAME predicate (FIX9_ROOTCAUSE §5 invariant). Robust path UNCHANGED (the
+	// first disjunct was already true there — no double-settle).
+	if(is_robust_config(current_configuration)
+	   || reverse_ack_uses_robust_geometry(current_configuration))
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
 		pumped_settle_wait(wait_ms);  // §5.7-B3: virtual-clock-ify (same exit predicate); verbatim msleep on production
