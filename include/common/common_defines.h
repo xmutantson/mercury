@@ -315,6 +315,57 @@ inline int break_drop_step_after_handshake_decay(int step) {
 	return (decayed < 2) ? 2 : decayed;
 }
 
+// WALL-B FIX-4 (WALLB_DIAGNOSIS.md §7 FIX-4): carve-viability deadline. On a CLEAN
+// channel the link holds CFG16 on SACK-trust (the C0-a CFG16-HOLD skip,
+// arq_commander.cc:5006), but the big-block carve fires 0x (wall-C) so the RSP never
+// sends a data-ACK. After K=emergency_nack_threshold (3) consecutive block-failures
+// with ZERO carves, the EXISTING code enters the BREAK cascade — which, on the CFG16
+// big-block rung, is the wall-B free-flow collapse (a deaf-peer cascade to ROBUST_0,
+// 0 bytes on long transfers). emergency_nack_count RESETS to 0 on ANY data-ACK (clean
+// OR partial, arq_commander.cc:3699), so reaching the threshold is exactly "no carve /
+// data-ACK landed within the deadline" — the natural trigger the diagnosis names.
+//
+// This pure decision picks the FALLBACK: when the failing rung is the CFG16 BIG-BLOCK
+// rung specifically and the deadline is reached, fall back to the HIGHEST per-frame
+// OFDM rung (config_ladder_down(CFG16) == CONFIG_15) and run PER-FRAME there, INSTEAD
+// of cascading toward ROBUST_0. Per-frame CFG15 is NOT carve-gated (the RX carve gate
+// and the TX bigblock_send_one_block BOTH require current_configuration == CONFIG_16),
+// so a CFG16-deaf RSP CAN follow this demote: the CMD steps it via the EXISTING,
+// decodable SET_CONFIG control exchange (the SET_CONFIG is sent on the live CFG16 PHY
+// and re-decoded by the RSP on the STOCK per-frame path via the GAP-3 carve-gate
+// fallback, arq_common.cc:8186-8211). This is FIX-1's policy expressed at the
+// block-failure decision point, WITHOUT touching FIX-1's demote targeting
+// (config_ladder_down_n / emergency_previous_config) or FIX-3's RSP receive routing.
+//
+// Returns the per-frame fallback config (CONFIG_15) when the deadline is reached on the
+// CFG16 big-block rung; returns -1 otherwise (caller proceeds to the EXISTING BREAK
+// path unchanged — the generic fade-down BREAK on non-bigblock rungs is byte-identical,
+// and the deep-SNR escape for a genuinely-cratered channel is preserved). PURE; the
+// unit test (Part S) replays it directly.
+inline int bigblock_carve_fallback_target(int current_config, bool bigblock_rung_live,
+		int nack_count, int nack_threshold, bool robust_enabled) {
+#ifdef WALLB_FIX4_FAILBEFORE
+	(void)current_config; (void)bigblock_rung_live; (void)nack_count;
+	(void)nack_threshold; (void)robust_enabled;
+	return -1;   // FAIL-BEFORE stub: no carve-viability fallback exists -> BREAK cascade.
+#else
+	// ONLY the CFG16 big-block rung has a carve that can be non-viable. A non-CFG16
+	// config (no carve) or a non-bigblock rung -> no fallback (let the BREAK path run).
+	if (!bigblock_rung_live) return -1;
+	if (current_config != CONFIG_16) return -1;
+	// Deadline: K consecutive block-failures with zero carves/data-ACKs.
+	if (nack_count < nack_threshold) return -1;
+	// The highest per-frame OFDM rung directly below CFG16. config_ladder_down on the
+	// full ladder maps CFG16(idx 19) -> CFG15(idx 18); on a non-robust live config it
+	// maps CFG16 -> CFG15 too. Guard the result is a real per-frame OFDM rung (never
+	// returns a robust/MFSK target — that would re-enter the deaf-peer regime).
+	int fallback = config_ladder_down(current_config, robust_enabled);
+	if (!is_ofdm_config(fallback) || is_robust_config(fallback)) return -1;
+	if (fallback >= current_config) return -1;   // must be a genuine demote
+	return fallback;
+#endif
+}
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).
