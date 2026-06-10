@@ -471,6 +471,10 @@ int main(int argc, char *argv[])
     bool test_bigblock_fullpath_cli = false; // --test-bigblock-fullpath: LIVE 2-instance CFG16 big-block transfer
                                         // through the REAL receive_bigblock+carve+whiten+FIFO deliver path with
                                         // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
+    bool test_sim_sustain_cli = false;  // --test-sim-sustain: SIM_INPROC PINNED-CFG15 sustained-delivery
+                                        // stepper-wedge regression (payloads 600/2000/4000/8000) with fail-before/
+                                        // pass-after on the same binary. One-shot at startup, exit rc.
+                                        // See fact-documents/SIMFTR_ROOTCAUSE.md §7/§8 fix #1.
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
                                         // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
                                         // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
@@ -999,6 +1003,17 @@ int main(int argc, char *argv[])
             // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
             // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
             test_bigblock_fullpath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sim-sustain") == 0)
+        {
+            // SIM_INPROC STEPPER-WEDGE REGRESSION (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): a
+            // PINNED-CFG15 clean sustained-delivery transfer for payloads 600/2000/4000/8000,
+            // asserting each terminates byte-correct via the genuine delivery break (not the
+            // post-transfer keepalive spin), with fail-before/pass-after on the same binary.
+            // One-shot at startup, then exit rc.
+            test_sim_sustain_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2229,6 +2244,20 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_fullpath();
             printf("[FLAG] Bigblock-fullpath test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_sim_sustain_cli) {
+            // SIM_INPROC STEPPER-WEDGE REGRESSION (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): drive
+            // PINNED-CFG15 clean transfers (payloads 600/2000/4000/8000) and assert each
+            // terminates byte-correct via the genuine delivery break (NOT the post-transfer
+            // keepalive ↔ pumped-wait spin), with fail-before (MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1
+            // -> wedge reproduced -> watchdog-stalled) / pass-after on the SAME binary.
+            printf("[FLAG] --test-sim-sustain: invoking SIM_INPROC PINNED-CFG15 sustained-"
+                   "delivery stepper-wedge regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_sustain();
+            printf("[FLAG] Sim-sustain test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

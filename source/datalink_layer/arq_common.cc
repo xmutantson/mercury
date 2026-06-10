@@ -136,6 +136,31 @@ void arq_set_sim_inproc_pump(sim_inproc_pump_fn fn, void* ctx)
 	g_sim_inproc_pump_ctx = ctx;
 }
 
+// SIM_INPROC post-delivery spin-abort (simftr stepper-wedge fix, fact-documents/
+// SIMFTR_ROOTCAUSE.md §7 fix #1). The 2-instance stepper's outer-loop delivery check
+// (rx_have >= payload_len, arq_commander.cc test_sim_inproc_2) lives at the loop
+// BOTTOM, after both peers' process_main() calls. A complete one-batch transfer whose
+// post-ACK turnaround leaves the COMMANDER in TRANSMITTING_DATA can fall into a
+// self-sustaining idle-keepalive ↔ pumped-wait cycle INSIDE one process_main() call,
+// so process_main never returns and the outer delivery check is never re-reached —
+// even though the RESPONDER already holds every payload byte in fifo_buffer_rx (the
+// transfer SUCCEEDED). The step-pump runs DURING that spin; when it observes the
+// responder holding the full payload it sets this flag, and the spin helpers below
+// return early so process_main unwinds back to the outer loop, which then drains the
+// FIFO and breaks on the (now-true) delivery predicate.
+//
+// FIDELITY: this is a HARNESS-only early-out that fires ONLY post-delivery — by the
+// time it is armed the responder already has all bytes, so there is NO in-flight PHY
+// frame whose single-symbol pacing (9336c23) could be perturbed; the commander is only
+// emitting idle keepalives. It is double-gated: the early-out is reachable ONLY when a
+// pump is installed (g_sim_inproc_pump != nullptr, i.e. ONLY under -m SIM_INPROC) AND
+// this flag is set. Production (-x wasapi/alsa) and the two-process paced sim install
+// no pump, so the flag is never consulted and the spin-loop bodies are byte-identical
+// to before. The flag is reset at the start of every stepper run.
+static bool g_sim_inproc_deliver_done = false;
+void arq_set_sim_inproc_deliver_done(bool on) { g_sim_inproc_deliver_done = on; }
+bool arq_sim_inproc_deliver_done()            { return g_sim_inproc_deliver_done; }
+
 // SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5/§10.7-item-4).
 // process_main()'s top blocks poll tcp_socket_control / tcp_socket_data (accept,
 // recv, transmit). The 2-instance stepper binds NO socket and injects user
@@ -171,16 +196,30 @@ void ptt_busy_wait(cl_timer& t, int delay_ms)
 {
 	const bool sim_clock_on = sim_clock_enabled();
 	// EXIT CONDITION UNCHANGED: virtual (or wall) time must pass delay_ms.
+	// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
+	// double-gated on (pump installed) AND (deliver_done) — both false on every
+	// production / paced-sim path, so the loop body is byte-identical there.
 	while (t.get_elapsed_time_ms() < delay_ms)
+	{
+		if (g_sim_inproc_pump != nullptr && g_sim_inproc_deliver_done)
+			return;
 		sim_spin_or_pump(sim_clock_on);
+	}
 }
 
 void drain_playback_wait()
 {
 	const bool sim_clock_on = sim_clock_enabled();
 	// EXIT CONDITION UNCHANGED: the playback ring must be fully drained.
+	// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
+	// double-gated on (pump installed) AND (deliver_done) — both false on every
+	// production / paced-sim path, so the loop body is byte-identical there.
 	while (size_buffer(playback_buffer) > 0)
+	{
+		if (g_sim_inproc_pump != nullptr && g_sim_inproc_deliver_done)
+			return;
 		sim_spin_or_pump(sim_clock_on);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +257,16 @@ void pumped_settle_wait(int wait_ms)
 	cl_timer t;
 	t.start();
 	while (t.get_elapsed_time_ms() < wait_ms)
+	{
+		// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
+		// unwind the post-transfer keepalive spin once the responder holds the full
+		// payload. Reachable ONLY under -m SIM_INPROC (pump installed) AND post-
+		// delivery (flag set); the msleep production/paced-sim path above already
+		// returned, so this is never consulted off the SIM_INPROC stepper.
+		if (g_sim_inproc_deliver_done)
+			return;
 		sim_spin_or_pump(true);     // pump installed -> advances the shared clock
+	}
 }
 
 // sim_inproc_rx_mute_settle(): the RX_MUTE drain guard (B5 / ADD-ON1). The wait
