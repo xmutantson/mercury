@@ -516,6 +516,12 @@ int main(int argc, char *argv[])
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
                                         // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
+    bool test_inorder_demote_cli = false; // --test-inorder-demote: D3.1 — UNIFIED in-order delivery
+                                        // across EVERY demote case (BREAK + the 4 SET_CONFIG-only demotes +
+                                        // PREV-BUMP strand). fail-before via MERCURY_GAP_ABORT_DEFEAT=1
+                                        // (silent concat on the SET_CONFIG cases), pass-after aborts loudly
+                                        // OR delivers contiguous. One-shot, exits rc.
+                                        // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
@@ -1153,6 +1159,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
             // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
             test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inorder-demote") == 0)
+        {
+            // D3.1 — UNIFIED in-order delivery across EVERY demote case —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_inorder_demote
+            // + bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+            test_inorder_demote_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2480,6 +2496,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_gap_abort_on_readopt();
             printf("[FLAG] Gap-abort test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inorder_demote_cli) {
+            // D3.1 — UNIFIED in-order delivery across EVERY demote case (one-shot, exit rc).
+            printf("[FLAG] --test-inorder-demote: invoking D3.1 unified in-order "
+                   "delivery regression across all demote cases\n");
+            fflush(stdout);
+            int rc = ARQ.test_inorder_demote();
+            printf("[FLAG] In-order-demote test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

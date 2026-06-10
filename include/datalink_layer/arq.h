@@ -599,6 +599,17 @@ public:
   // delivery commits only (BATCH-DONE + PREV-DELIVERED). Internally v2-scoped by
   // the call sites; the helper itself is pure arithmetic.
   void advance_last_delivered(int bsi);
+
+  // D3.1 (data-integrity): the shared LOUD GAP-ABORT teardown. The
+  // case-independent action both the FIX-8 re-adopt gate and the new
+  // delivery-time gate route to: control-port error, DROPPED, clear the bsi
+  // family + prev-buffer + carve-arm, reset_session_state(). Centralizes the
+  // block previously inlined at arq_responder.cc:646-688 so the delivery-time
+  // commits and the SET_CONFIG re-baseline path use the IDENTICAL teardown (no
+  // drift between sites). `reason` is the control-port error string.
+  // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md §2.
+  void rsp_gap_abort_teardown(const char* reason);
+
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
   // receive() landed a frame with messages_rx_buffer.type == SACK_RSP. The
   // function:
@@ -1341,6 +1352,38 @@ public:
     return !(adopted == last || adopted == succ);
   }
 
+  // D3.1 (data-integrity, the UNIFIED keystone): the DELIVERY-TIME contiguity
+  // predicate. Unlike sack_v2_readopt_has_gap (which guards the cur<0 RE-ADOPT
+  // site, reachable only from BREAK/FULL-reset), this guards the TWO real
+  // delivery commits themselves (BATCH-DONE arq_responder.cc:1879 + PREV
+  // arq_responder.cc:905) at the ONE choke point both already call
+  // (advance_last_delivered). It is delivery-time-anchored, NOT
+  // config-transition-anchored: a forward step of >=2 in the high-water mark
+  // means a batch between the last DELIVERED batch and `bsi` was never delivered
+  // -> a HOLE -> the app FIFO would silently concatenate non-contiguous bytes.
+  // This fires REGARDLESS of how rsp_current_expected_batch_seq_id got to `bsi`
+  // (BREAK, any of the 4 SET_CONFIG demotes, the PREV-BUMP/STALE strand, or the
+  // per-frame path), so it is the inviolable safety net that catches even a
+  // residual handshake edge the 5 reverted config-transition point-patches
+  // missed (FIX9_D3_DESIGN §7.2). Returns true iff `bsi` would skip a batch.
+  // Step semantics (mod-256 forward distance fwd = (bsi - last) & 0xFF):
+  //   last < 0     -> false (session-start first delivery is always legal)
+  //   fwd == 0     -> false (duplicate re-delivery of the SAME bsi, INV-4)
+  //   fwd == 1     -> false (contiguous successor, the ONLY legal forward step)
+  //   fwd in [2,128] -> TRUE  (a real forward SKIP = a hole)
+  //   fwd in [129,255] -> false (backward / late OLDER prev — advance() ignores
+  //                       it anyway, no regress, no hole; audit R1)
+  // PURE + static so the SIM_INPROC test drives the EXACT production decision.
+  // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md §2.
+  static bool delivery_step_is_gap(int bsi, int last_delivered_bsi)
+  {
+    if(last_delivered_bsi < 0) return false;
+    unsigned last = (unsigned)(last_delivered_bsi & 0xFF);
+    unsigned b    = (unsigned)(bsi & 0xFF);
+    unsigned fwd  = (b - last) & 0xFFu;
+    return (fwd >= 2u && fwd <= 128u);
+  }
+
   // TURBO step-1 SNR-capability pre-truncation gate (gearshift-climb-engine.md
   // §20 — the CFG15->CFG16 under-climb on clean). PURE so --test-climb-engine can
   // drive it with no live telecom_system / channel.
@@ -1668,6 +1711,28 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
   int test_gap_abort_on_readopt();
+
+  // D3.1 (data-integrity) — UNIFIED in-order-delivery across EVERY demote case.
+  // In-process SIM_INPROC synthetic-fire (CLI --test-inorder-demote). Drives the
+  // REAL delivery-time predicate (delivery_step_is_gap) + the REAL re-adopt
+  // predicate (sack_v2_readopt_has_gap) + the REAL fifo_buffer_rx app stream as
+  // the oracle, through ALL FIVE demote cases with a PARTIAL in-flight batch:
+  //   (1) BREAK demote (cur=-1 re-adopt),
+  //   (2) FIX-4 carve demote CFG16->CFG15 (SET_CONFIG-only, cur>=0),
+  //   (3) FIX-9 D3 demote CFG16->CFG15 (SET_CONFIG-only, cur>=0),
+  //   (4) FIX-3 verification-probe-skip demote (SET_CONFIG-only, cur>=0),
+  //   (5) plain gearshift step-down (SET_CONFIG-only, cur>=0),
+  //   PLUS the PREV-BUMP/STALE strand within a SET_CONFIG demote.
+  // Each asserts the delivered app stream is CONTIGUOUS+IN-ORDER+byte-faithful
+  // (md5/memcmp) OR loudly REFUSED (DROPPED, no silent concat) — NEVER a silent
+  // [0-4][8-] concatenation. fail-before (MERCURY_GAP_ABORT_DEFEAT=1): the
+  // SET_CONFIG demotes keep cur>=0, the FIX-8 re-adopt gate is bypassed, and the
+  // delivery-time gate is the ONLY backstop — with the gate defeated the cases
+  // reproduce the silent concat (md5-false). pass-after (defeat off): #1 (the
+  // delivery-time assertion) + #2 (the SET_CONFIG re-baseline) catch every case.
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+  int test_inorder_demote();
 
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
