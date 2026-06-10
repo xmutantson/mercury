@@ -268,6 +268,53 @@ inline int session_floor_anchor(bool robust_enabled, int start_config) {
 	return start_config;
 }
 
+// WALL-B FIX-2 (WALLB_DIAGNOSIS.md §7 FIX-2; long-run-degradation latch #2): the
+// BREAK-down aggression step `break_drop_step` is a session AARF that doubles on
+// every un-ACKed BREAK recovery (arq_commander.cc:227/:327) but — on the CFG16
+// big-block carve path — has NO decrease (its only reset is the clean-fully-
+// delivered-batch :3708, which never fires when 0 blocks carve). Uncapped, it
+// marches 2->4->8->16->32... and config_ladder_down_n(emergency_prev=16, step)
+// walks 16->14->12->8->0->ROBUST_0 in four deaf-peer cycles, stranding a clean
+// channel at ROBUST_0 with 0 bytes delivered.
+//
+// CAP = 16 = the OFDM span. FULL_CONFIG_LADDER index math: ROBUST_0/1/2 = idx 0..2,
+// CONFIG_0 = idx 3 ... CONFIG_16 = idx 19. The OFDM rungs span CONFIG_16(19)..
+// CONFIG_0(3) = 16 ladder steps. With the step capped at 16, ONE EXHAUSTED BREAK
+// recovery from CFG16 lands at idx 19-16=3 = CONFIG_0 (the LOWEST OFDM rung) — it
+// can never skip the entire OFDM span straight into the ROBUST tier in a single
+// recovery cycle. This BOUNDS THE RATE OF DESCENT (one OFDM-span per cycle), it
+// does NOT forbid reaching ROBUST tiers: from any rung below CFG16 a step of 16
+// still clamps the ladder index to 0 = ROBUST_0 (config_ladder_down_n floors at 0),
+// so a genuinely-cratered channel still escapes downward over successive cycles.
+// The panic single-shot crater (break_drop_step = 100 at arq_commander.cc:3608) is
+// a deliberate SET applied at a SEPARATE site and is consumed for the recovery
+// target BEFORE any doubling, so the cap (applied only at the *=2 sites) never
+// blocks the intended panic jump to ROBUST_0.
+static const int BREAK_DROP_STEP_MAX = 16;   // OFDM ladder span (CONFIG_16 -> CONFIG_0)
+
+// Multiplicative-INCREASE half of the break_drop_step AARF, CAPPED. Production
+// calls this at BOTH doubling sites (arq_commander.cc:227/:327) instead of a bare
+// `break_drop_step *= 2`. PURE; the unit test (Part R) replays it directly.
+inline int break_drop_step_after_double(int step) {
+	int doubled = step * 2;
+	return (doubled > BREAK_DROP_STEP_MAX) ? BREAK_DROP_STEP_MAX : doubled;
+}
+
+// Multiplicative-DECREASE half (the missing AARF decay, mirrors the
+// frame_shift_threshold decay at arq_commander.cc:3737). A successful BREAK-RECOVERY
+// handshake (a recovery SET_CONFIG ACKed at the Phase-2 site, arq_commander.cc:4795)
+// is forward progress, so HALVE the step back toward its base floor (2). This is a
+// single-notch DECAY, NOT a reset to 2: a full reset here was deliberately removed
+// (arq_commander.cc:4798-4811 — it defeated the escalation ladder on the WGN:14->0
+// deep-SNR sweep, crawling one config/BREAK). Halving lets the ladder keep escalating
+// across consecutive UN-ACKed BREAKs while relaxing one notch when a handshake
+// actually completes. Floors at the base aggression 2 (never below). PURE; Part R
+// replays it directly.
+inline int break_drop_step_after_handshake_decay(int step) {
+	int decayed = step / 2;
+	return (decayed < 2) ? 2 : decayed;
+}
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

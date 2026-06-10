@@ -224,9 +224,12 @@ void cl_arq_controller::process_messages_commander()
 				printf("[BREAK] ACK received! Dropping %d step(s): config %d -> %d (robust_enabled=%d)\n",
 					break_drop_step, emergency_previous_config, target, robust_enabled);
 				fflush(stdout);
-				break_drop_step *= 2;  // 2026-05-24: uncapped doubling
-				                       // (was capped at 4). config_ladder_down_n
-				                       // clamps at ROBUST_0 / CONFIG_0.
+				// WALL-B FIX-2: multiplicative-increase half of the AARF, now
+				// CAPPED at the OFDM ladder span (BREAK_DROP_STEP_MAX=16) so one
+				// recovery can never skip the whole OFDM span into ROBUST_0. The
+				// panic crater (=100, :3608) is set at a separate site and consumed
+				// before this doubling, so the cap never blocks the panic jump.
+				break_drop_step = break_drop_step_after_double(break_drop_step);
 
 				emergency_break_active = 0;
 				emergency_nack_count = 0;
@@ -324,7 +327,8 @@ void cl_arq_controller::process_messages_commander()
 				printf("[BREAK] Dropping %d step(s): config %d -> %d\n",
 					break_drop_step, emergency_previous_config, target);
 				fflush(stdout);
-				break_drop_step *= 2;  // uncapped — see ACK-received site above
+				// WALL-B FIX-2: CAPPED doubling — see ACK-received site above.
+				break_drop_step = break_drop_step_after_double(break_drop_step);
 
 				int robust_0 = robust_enabled ? ROBUST_0 : CONFIG_0;
 				messages_control_backup();
@@ -4809,6 +4813,18 @@ void cl_arq_controller::process_control_commander()
 					// 4+ minutes and ran out of dwell time before reaching
 					// ROBUST_0. Now the ladder escalates across consecutive
 					// BREAKs and only resets after a clean data batch.
+					//
+					// WALL-B FIX-2 (the missing AARF DECAY half, mirrors the
+					// frame_shift_threshold decay at :3737): a Phase-2 ACK is
+					// FORWARD PROGRESS (the peer followed the demote and ACKed the
+					// recovery SET_CONFIG), so relax the step ONE NOTCH toward its
+					// base floor. This is a single HALVE, NOT the reset the comment
+					// above warns against -- the escalation ladder still grows
+					// across consecutive UN-ACKed BREAKs (the WGN:14->0 sweep above
+					// only ACKs once, at the end), but a link making coordination
+					// progress no longer keeps a maximally-aggressive step. Floors
+					// at the base aggression 2.
+					break_drop_step = break_drop_step_after_handshake_decay(break_drop_step);
 
 					if(turboshift_phase != TURBO_DONE)
 					{
@@ -9375,6 +9391,130 @@ int cl_arq_controller::test_climb_engine()
 	check(frame_shift_threshold == 12,
 		"I4 repeated FRAME-UP failures with NO clean batch keep the threshold HIGH (bad-channel over-climb still suppressed)",
 		frame_shift_threshold, 12);
+
+	// ================================================================
+	// Part R — WALL-B FIX-2: CAP + DECAY break_drop_step (the SECOND un-decayed
+	// AARF; WALLB_DIAGNOSIS.md §7 FIX-2, §1.3, §2.1). THE wall-B free-flow latch:
+	// break_drop_step doubles UNCAPPED at the two BREAK-recovery sites
+	// (arq_commander.cc:227/:327) and its ONLY decrease is the clean-fully-
+	// delivered-batch reset to 2 (:3708) — which NEVER fires on the CFG16 big-block
+	// carve path (0 carves => no clean batch). So it marches 2->4->8->16->32... and
+	// config_ladder_down_n(emergency_prev=16, step) walks the recovery target
+	// 16->14->12->8->0->ROBUST_0 over four deaf-peer cycles, stranding a CLEAN
+	// channel at ROBUST_0 with 0 bytes. The FIX mirrors the #3 AARF-decay latch
+	// (Part I): (a) CAP the doubling at the OFDM ladder span (BREAK_DROP_STEP_MAX=16)
+	// so one recovery can never skip the whole OFDM span into the ROBUST tier; (b)
+	// add the missing DECREASE half — HALVE on a successful recovery handshake
+	// (Phase-2 ACK, :4795), floored at 2. This drives the REAL pure helpers
+	// production now calls (break_drop_step_after_double /
+	// break_drop_step_after_handshake_decay) + the REAL config_ladder_down_n. FAIL-
+	// BEFORE: revert the two doubling sites to a bare `*=2` and the Phase-2 decay to
+	// nothing — R0/R1 then FAIL (the step reaches 32; no handshake decay exists).
+	// ================================================================
+	robust_enabled = YES;            // a robust (-R) session: the FULL ladder is in play
+	narrowband_enabled = NO;
+
+	// R0 — the CAP: from the base aggression 2, repeated EXHAUSTED doublings must
+	// CAP at BREAK_DROP_STEP_MAX (16), NOT march to 32. Pre-fix: 2->4->8->16->32.
+	{
+		int step = 2;
+		step = break_drop_step_after_double(step);   // 2->4
+		check(step == 4, "R0a first doubling 2->4 (unchanged below the cap)", step, 4);
+		step = break_drop_step_after_double(step);   // 4->8
+		step = break_drop_step_after_double(step);   // 8->16
+		check(step == 16, "R0b doubling reaches the OFDM-span cap (8->16)", step, 16);
+		step = break_drop_step_after_double(step);   // 16->CAP (was 32)
+		check(step == BREAK_DROP_STEP_MAX && step == 16,
+			"R0c the doubling is CAPPED at the OFDM span (16), NOT 32 (the un-decayed march is bounded)",
+			step, 16);
+		step = break_drop_step_after_double(step);   // stays capped
+		check(step == 16, "R0d further doublings stay clamped at the cap", step, 16);
+	}
+
+	// R1 — the CAP bounds the RATE of descent: ONE EXHAUSTED recovery from the
+	// pinned CFG16 with the capped step lands at the LOWEST OFDM rung (CONFIG_0),
+	// it does NOT skip the whole OFDM span straight into the ROBUST tier in a single
+	// cycle. config_ladder_down_n(CFG16, 16) on the full ladder = idx 19-16 = 3 =
+	// CONFIG_0. Pre-fix with step=32 it lands at idx 0 = ROBUST_0 in ONE step.
+	{
+		int target_capped   = config_ladder_down_n(CONFIG_16, BREAK_DROP_STEP_MAX, /*robust*/true);
+		check(target_capped == CONFIG_0,
+			"R1a one capped recovery from CFG16 lands at CONFIG_0 (lowest OFDM rung), not past the OFDM span",
+			config_ladder_index(target_capped), config_ladder_index(CONFIG_0));
+		check(!is_robust_config(target_capped),
+			"R1b the single-cycle capped target is still an OFDM rung (did not skip into the ROBUST tier)",
+			is_robust_config(target_capped) ? 1 : 0, 0);
+		// the pre-fix uncapped step (32) would have skipped to ROBUST_0 in one cycle:
+		int target_uncapped = config_ladder_down_n(CONFIG_16, 32, /*robust*/true);
+		check(config_ladder_index(target_capped) > config_ladder_index(target_uncapped),
+			"R1c the cap keeps the single-cycle target STRICTLY above the pre-fix uncapped (32) ROBUST_0 collapse",
+			config_ladder_index(target_capped), config_ladder_index(target_uncapped));
+	}
+
+	// R2 — the DECAY: a successful BREAK-RECOVERY handshake (Phase-2 ACK) HALVES the
+	// step one notch toward the base floor, it does NOT reset to 2 (that would defeat
+	// the escalation ladder, :4798). Floors at 2. Pre-fix: NO decay half exists, the
+	// step stays latched at the cap across any number of handshakes.
+	{
+		int step = 16;
+		step = break_drop_step_after_handshake_decay(step);   // 16->8
+		check(step == 8, "R2a one recovery handshake HALVES the step 16->8 (single notch, not a reset)",
+			step, 8);
+		step = break_drop_step_after_handshake_decay(step);   // 8->4
+		step = break_drop_step_after_handshake_decay(step);   // 4->2
+		check(step == 2, "R2b sustained recovery handshakes decay the step back to the base floor 2",
+			step, 2);
+		step = break_drop_step_after_handshake_decay(step);   // floor: stays 2
+		check(step == 2, "R2c the decay FLOORS at the base aggression 2 (never below — keeps a useful first drop)",
+			step, 2);
+		// R2d — the decay is a single NOTCH, not a reset: a handshake at the cap (16)
+		// leaves the step at 8 (still aggressive), so a link that escalated to the cap
+		// does not snap all the way back on the FIRST handshake (the :4798 rationale).
+		check(break_drop_step_after_handshake_decay(16) == 8 &&
+			break_drop_step_after_handshake_decay(16) != 2,
+			"R2d a single handshake decay is one notch (16->8), NOT a full reset to 2 (escalation-ladder intent preserved)",
+			break_drop_step_after_handshake_decay(16), 8);
+	}
+
+	// R3 — DEEP-SNR GUARD: the cap bounds the RATE of descent per cycle, it does NOT
+	// forbid reaching the ROBUST tier on a GENUINELY bad channel. From any rung below
+	// CFG16, the capped step (16) still clamps the ladder index to 0 = ROBUST_0
+	// (config_ladder_down_n floors at idx 0) — so a sustained-failure cascade still
+	// escapes downward. And across SUCCESSIVE cycles from CFG16, the capped 16 reaches
+	// CONFIG_0, then a re-doubled-then-capped 16 from CONFIG_0 reaches ROBUST_0. The
+	// cap forbids skipping the OFDM span in ONE cycle, never the descent itself.
+	{
+		// (i) from a mid OFDM rung (CFG8) a capped step still reaches the floor:
+		int from_cfg8 = config_ladder_down_n(CONFIG_8, BREAK_DROP_STEP_MAX, /*robust*/true);
+		check(from_cfg8 == ROBUST_0,
+			"R3a deep-SNR escape intact: a capped step from CONFIG_8 still reaches ROBUST_0 (floor not forbidden)",
+			config_ladder_index(from_cfg8), config_ladder_index(ROBUST_0));
+		// (ii) two-cycle descent from CFG16 reaches ROBUST_0 (cycle1 -> CONFIG_0,
+		// cycle2 from CONFIG_0 with the capped step -> ROBUST_0):
+		int cycle1 = config_ladder_down_n(CONFIG_16, BREAK_DROP_STEP_MAX, /*robust*/true);   // CONFIG_0
+		int cycle2 = config_ladder_down_n(cycle1,     BREAK_DROP_STEP_MAX, /*robust*/true);   // ROBUST_0
+		check(cycle2 == ROBUST_0,
+			"R3b a sustained-failure cascade STILL reaches ROBUST_0 across cycles (cap bounds rate, not reachability)",
+			config_ladder_index(cycle2), config_ladder_index(ROBUST_0));
+	}
+
+	// R4 — PANIC OVERRIDE PRESERVED: the deliberate crater (break_drop_step=100 at
+	// :3608) is a SET, consumed for the recovery target BEFORE any doubling, so it
+	// must STILL jump straight to ROBUST_0. config_ladder_down_n clamps a step of 100
+	// to the floor regardless of the cap (the cap only ever applies at the *=2 sites,
+	// never to the panic SET). The cap must not weaken the panic escape.
+	{
+		int panic_target = config_ladder_down_n(CONFIG_16, 100, /*robust*/true);
+		check(panic_target == ROBUST_0,
+			"R4a panic override (step=100) STILL craters to ROBUST_0 in one shot (cap does not touch the panic SET)",
+			config_ladder_index(panic_target), config_ladder_index(ROBUST_0));
+		// and even if a panic value somehow flowed through the doubling helper, the
+		// clamp keeps it at the cap (>= OFDM span) — never SMALLER than the span, so
+		// a post-panic recovery still drops at least a full OFDM span:
+		check(break_drop_step_after_double(100) == BREAK_DROP_STEP_MAX,
+			"R4b a panic value through the doubling helper clamps to the cap (>= full OFDM span, never under-aggressive)",
+			break_drop_step_after_double(100), BREAK_DROP_STEP_MAX);
+	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
