@@ -363,6 +363,37 @@ public:
 	// in-place (test-only; called from passband_test_EsN0 when enabled).
 	void   apply_watterson_passband(double* buf, int nSamp);
 
+	// ---- CHASE COMBINING (HARQ Type-I soft-combine) — I1 primitive + BER test --
+	// Design: mercury/fact-documents/chase-combine-design.md §3.4 / §4 I1;
+	// audit: mercury/fact-documents/data-flow-chase-buffer.md §0.1.
+	// chase_combine_decode is the PURE math primitive: MRC-style equal-gain* sum of
+	// two single-look LLR vectors, clamped ONCE *after* the sum to ±C_post (NOT each
+	// addend — clamping addends first throttles the gain, CHASE_SCOPE §2.2), then
+	// ldpc.decode(). (*equal-gain in I1: each look already carries its own CSI weight
+	// from the :2962 per-subcarrier weighting, so summing the two already-weighted
+	// looks IS the MRC sum at the LLR layer; the per-look ±40 clamp is the only
+	// pre-existing bound, lifted to ±C_post after the sum.) Returns LDPC iterations.
+	// Default-OFF: this function is never reached unless a --test-chase-* harness or
+	// (later increment) the env-gated CHASE consumer calls it; production decode at
+	// telecom_system.cc:3315 is byte-identical.
+	int    chase_combine_decode(const float* llr_a, const float* llr_b, int n,
+	                            float C_post, int* hd_out);
+	// I1 / I1b / I1c BER harness: TX one known codeword, take TWO independent noise
+	// draws below the single-look knee (each fails alone), snapshot each look's
+	// deinterleaved_data, combine, decode, bit-compare. fsel_mode: 0=AWGN only,
+	// 1=DECORRELATED 2-ray (looks see different null phases), 2=SAME static null
+	// (both looks identical null — proves time-diversity not null-sweep, ≈0 lift).
+	// Invoked by main.cc --test-chase-ber; returns 0 PASS, nonzero FAIL.
+	int    chase_ber_test(int cfg, int frames, float esn0_lo, float esn0_hi,
+	                      float esn0_step, float C_post, int fsel_mode);
+	// Score a combined LDPC hard-decision output the SAME way the production decode
+	// path does (telecom_system.cc:3498-3526): descramble via energy-dispersal,
+	// byte-pack, CRC16 self-check, AND byte-compare the recovered info bytes against
+	// the known TX info bits. Returns true only when CRC16==0 AND bytes match
+	// (genuine, self-validating decode — not a CRC false-accept). hd is the K-info-bit
+	// LDPC output; known_info_bits are the un-scrambled TX info bits.
+	bool   chase_score_decode(int* hd, const int* known_info_bits, int nReal_data);
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.

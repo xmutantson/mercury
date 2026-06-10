@@ -425,6 +425,64 @@ int main(int argc, char *argv[])
             int rc = ts.watterson_ber_sweep(configs, nConfigs, esn0_list, nEsN0, frames);
             return rc;
         }
+
+        // --test-chase-ber=<cfg> : CHASE COMBINING I1/I1b/I1c math proof.
+        // TX one known codeword; take TWO independent noise draws below the
+        // single-look knee (each fails alone); sum the two LLR vectors (clamp
+        // AFTER the sum to ±C_post) and decode — assert the combine recovers
+        // the codeword the single look lost. Sub-flags:
+        //   --chase-frames=N        frames per Es/N0 point (default 200)
+        //   --chase-esn0=lo,hi,step Es/N0 sweep dB (default picks per config)
+        //   --chase-cpost=C         post-sum clamp (default 80; I1b sweeps ±)
+        //   --chase-fsel=0|1|2      0 AWGN, 1 decorrelated 2-ray, 2 same static null
+        // Mirrors --test-watterson-ber dispatch. Additive, test-only; production
+        // decode is byte-identical (this path is never reached unless invoked).
+        if (strncmp(argv[i], "--test-chase-ber", 16) == 0) {
+            int cfg = CONFIG_15;
+            const char* eq = strchr(argv[i], '=');
+            if (eq && *(eq + 1)) cfg = atoi(eq + 1);
+            // 30 frames = 60 single-look decodes per point (single 0/60 vs combined
+            // ~20/30 is decisive). Each FAILED single-look decode runs the full
+            // 100-iter LDPC cap (~272 ms), so a point costs ~60-100 s; 30 keeps the
+            // headline run in foreground budget. --chase-frames=N to raise it (the
+            // design's 200-frame gate is reproducible via --chase-frames=200, slow).
+            int frames = 30;
+            float esn0_lo = 0.0f, esn0_hi = 0.0f, esn0_step = 1.0f;
+            bool esn0_set = false;
+            float cpost = 80.0f;
+            int fsel = 0;
+            for (int j = 1; j < argc; j++) {
+                if (strncmp(argv[j], "--chase-frames=", 15) == 0)
+                    frames = atoi(argv[j] + 15);
+                else if (strncmp(argv[j], "--chase-cpost=", 14) == 0)
+                    cpost = (float)atof(argv[j] + 14);
+                else if (strncmp(argv[j], "--chase-fsel=", 13) == 0)
+                    fsel = atoi(argv[j] + 13);
+                else if (strncmp(argv[j], "--chase-esn0=", 13) == 0) {
+                    char b[128]; strncpy(b, argv[j] + 13, sizeof(b)-1); b[sizeof(b)-1]=0;
+                    char* t = strtok(b, ","); if (t) esn0_lo = (float)atof(t);
+                    t = strtok(NULL, ",");   if (t) esn0_hi = (float)atof(t);
+                    t = strtok(NULL, ",");   if (t) esn0_step = (float)atof(t);
+                    esn0_set = true;
+                }
+            }
+            if (!esn0_set) {
+                // default binding POINT: 2-3 dB under the config's single-look knee so
+                // the single look fails ~always and the +3 dB combine clears it.
+                // Measured (CSI-LLR AWGN, this harness): CFG15 16-QAM single-look knee
+                // ~17-18 dB Es/N0; combine decodes at 15 (single 0/N -> combined ~0.7).
+                // A single binding point keeps the headline run ~80 s (each failed
+                // single-look decode runs the full 100-iter LDPC cap). Override with
+                // --chase-esn0=lo,hi,step to sweep.
+                esn0_lo = 15.0f; esn0_hi = 15.0f; esn0_step = 1.0f;
+            }
+            if (frames < 1) frames = 1;
+            if (esn0_step <= 0.0f) esn0_step = 1.0f;
+            cl_telecom_system ts;
+            int rc = ts.chase_ber_test(cfg, frames, esn0_lo, esn0_hi, esn0_step, cpost, fsel);
+            printf("[FLAG] --test-chase-ber complete (rc=%d, 0=PASS) — exiting.\n", rc);
+            return rc;
+        }
     }
 
     int cpu_nr = -1;

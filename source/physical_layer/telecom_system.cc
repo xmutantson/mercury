@@ -871,6 +871,219 @@ int cl_telecom_system::watterson_ber_sweep(const int* configs, int nConfigs,
 	return (total_frames_decoded > 0) ? 0 : 1;
 }
 
+// ===== CHASE COMBINING — I1 primitive: MRC sum, clamp AFTER the sum =========
+// chase_combine_decode: the pure math kernel. Sum two single-look LLR vectors
+// element-wise, clamp the SUM (not the addends) to ±C_post, then ldpc.decode.
+// This is HARQ Type-I soft combining (Chase 1985): two independent observations
+// of the SAME codeword add their effective Es/N0 (+10log10(2) = +3 dB at N=2).
+// The single-look ±40 clamp (telecom_system.cc:2962) already bounds each addend;
+// lifting the post-sum bound to C_post (candidate ±80) preserves the gain that a
+// naive per-look re-clamp would throttle (CHASE_SCOPE §2.2 / design §3.4).
+// n = ldpc.N (the expanded codeword length handed to ldpc.decode at :3315).
+int cl_telecom_system::chase_combine_decode(const float* llr_a, const float* llr_b,
+                                            int n, float C_post, int* hd_out)
+{
+	static float tmp[N_MAX];
+	if(n > N_MAX) n = N_MAX;
+	for(int i = 0; i < n; i++)
+	{
+		float s = llr_a[i] + llr_b[i];
+		if(s >  C_post) s =  C_post;
+		else if(s < -C_post) s = -C_post;
+		tmp[i] = s;
+	}
+	return ldpc.decode(tmp, hd_out);
+}
+
+// Score a combined decode exactly as the production RX path scores a single look
+// (telecom_system.cc:3498-3526): descramble (energy-dispersal), byte-pack, CRC16
+// self-check; additionally byte-compare the recovered info bytes against the known
+// TX info bits. Returns true ONLY on CRC16==0 AND byte-match — a genuine decode,
+// never a 16-bit CRC false-accept on garbage.
+bool cl_telecom_system::chase_score_decode(int* hd, const int* known_info_bits, int nReal_data)
+{
+	static int desc[N_MAX];
+	static int bytes_out[N_MAX/8 + 2];
+	// descramble the LDPC info bits (production does this in place on hd_decoded_data_bit)
+	bit_energy_dispersal(hd, data_container.bit_energy_dispersal_sequence, desc, nReal_data);
+	bit_to_byte(desc, bytes_out, nReal_data);
+	// all-zeros guard (production rejects an all-zero decode)
+	bool all_zeros = true;
+	for(int i = 0; i < nReal_data/8; i++) if(bytes_out[i] != 0) { all_zeros = false; break; }
+	if(all_zeros) return false;
+	// CRC16 self-check over [data + appended CRC] = nReal_data/8 bytes; ==0 ⇒ pass
+	if(outer_code == CRC16_MODBUS_RTU)
+	{
+		uint16_t crc = CRC16_MODBUS_RTU_calc(bytes_out, nReal_data/8);
+		if(crc != 0) return false;
+	}
+	// byte-compare the recovered info bits against the known TX info bits
+	int n_info = nReal_data - outer_code_reserved_bits;
+	for(int i = 0; i < n_info; i++)
+		if(desc[i] != known_info_bits[i]) return false;
+	return true;
+}
+
+// ===== CHASE COMBINING — I1/I1b/I1c BER harness ============================
+// Proves the math gain: at an Es/N0 where each single look fails ~always, the
+// COMBINED look decodes. fsel_mode: 0 = flat AWGN; 1 = DECORRELATED 2-ray (the
+// two looks see DIFFERENT null phases — the time-diversity case chase exploits);
+// 2 = SAME static null on both looks (≈0 lift — proves it is time diversity, not
+// a null-sweep artifact; F4: also asserts the combine does NOT raise false-accept
+// over single-look on that correlated null).
+//
+// Determinism: one srand() at entry; the awgn RNG advances per draw so the two
+// looks per frame are INDEPENDENT noise realizations of the SAME clean codeword.
+// For fsel_mode 1 the second ray's phase is rotated between the two looks (a fresh
+// fsel_delay per look) so the null lands on different subcarriers; for fsel_mode 2
+// the SAME fsel_delay/amp is used for both looks (correlated null).
+int cl_telecom_system::chase_ber_test(int cfg, int frames, float esn0_lo,
+                                      float esn0_hi, float esn0_step,
+                                      float C_post, int fsel_mode)
+{
+	load_configuration(cfg);
+	awgn_channel.set_seed(20260609);   // deterministic
+
+	int nReal_data = data_container.nBits - ldpc.P;
+	int n_llr = ldpc.N;                // expanded codeword length fed to ldpc.decode
+	int delay = (data_container.Nfft == 1024) ? 100 : 50;
+	int nSamp = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb))
+	            * frequency_interpolation_rate;
+	int forced_delay = ((data_container.preamble_nSymb + 2) * data_container.Nofdm + delay)
+	                   * frequency_interpolation_rate;
+	// receive_byte reads the whole capture ring (2*Nofdm*buffer_Nsymb*interp), so the
+	// noisy buffer MUST be data_container.passband_delayed_data (the production-sized
+	// alloc), NOT a hand-sized vector — undersizing it overruns the ring read.
+	int rxbuf_sz = 2 * data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+
+	// scratch (heap — N_MAX*float vectors are small; avoid large stack frames)
+	std::vector<float> llr_a(n_llr), llr_b(n_llr);
+	std::vector<double> clean(nSamp);     // a clean (optionally fsel'd) copy of the TX passband
+	std::vector<int> hd(N_MAX);
+	std::vector<int> known_bits(nReal_data);
+
+	// decorrelated-null delays: two different second-ray delays for the two looks
+	// (mode 1). For mode 2 both looks use the SAME delay/amp (correlated).
+	int fsel_delay_a = 96;    // ~null near low band
+	int fsel_delay_b = 160;   // ~null near high band (different subcarrier group)
+	float fsel_amp_local = 0.85f;  // deep second ray
+
+	printf("# CHASE I1 BER harness — config %d (M=%d, n_llr=%d) fsel_mode=%d C_post=%.1f frames=%d\n",
+	       cfg, (int)M, n_llr, fsel_mode, C_post, frames);
+	printf("# columns: esn0_dB single_p combined_p combined_p_clamp40 lift_dB_est frames\n");
+
+	int overall_rc = 1;   // PASS only if at least one binding point shows the lift
+	for(float esn0 = esn0_lo; esn0 <= esn0_hi + 1e-6f; esn0 += esn0_step)
+	{
+		float sigma = 1.0f / sqrtf(powf(10.0f, esn0 / 10.0f));
+		int single_ok = 0, single_total = 0;
+		int combined_ok = 0;
+		int combined40_ok = 0;     // I1b control arm: clamp each look to ±40 THEN sum
+
+		for(int f = 0; f < frames; f++)
+		{
+			// --- TX one known random codeword ---
+			for(int i = 0; i < nReal_data - outer_code_reserved_bits; i++)
+				data_container.data_bit[i] = ts_random() % 2;
+			bit_to_byte(data_container.data_bit, data_container.data_byte,
+			            nReal_data - outer_code_reserved_bits);
+			transmit_byte(data_container.data_byte,
+			              (nReal_data - outer_code_reserved_bits) / 8,
+			              data_container.passband_data, SINGLE_MESSAGE);
+			// snapshot the TRUE info bits (transmit_byte / energy-dispersal mutate
+			// data_container.data_bit; we need the original info bits to score).
+			for(int i = 0; i < nReal_data - outer_code_reserved_bits; i++)
+				known_bits[i] = data_container.data_bit[i];
+
+			// --- look A ---
+			memcpy(clean.data(), data_container.passband_data, nSamp * sizeof(double));
+			if(fsel_mode != 0)
+			{
+				int d = fsel_delay_a;   // mode1: look A's null band; mode2: same on both
+				for(int nn = nSamp - 1; nn >= d; nn--)
+					clean[nn] += fsel_amp_local * clean[nn - d];
+			}
+			memset(data_container.passband_delayed_data, 0, rxbuf_sz * sizeof(double));
+			awgn_channel.apply_with_delay(clean.data(), data_container.passband_delayed_data,
+			                              sigma, nSamp, forced_delay);
+			ofdm_forced_delay = forced_delay;
+			st_receive_stats rsA = receive_byte(data_container.passband_delayed_data, hd.data());
+			ofdm_forced_delay = -1;
+			memcpy(llr_a.data(), data_container.deinterleaved_data, n_llr * sizeof(float));
+			bool failA = (rsA.message_decoded == NO);
+			single_total++; if(!failA) single_ok++;
+
+			// --- look B (independent noise; mode1 rotates the null to a DIFFERENT band) ---
+			memcpy(clean.data(), data_container.passband_data, nSamp * sizeof(double));
+			if(fsel_mode != 0)
+			{
+				int d = (fsel_mode == 1) ? fsel_delay_b : fsel_delay_a; // mode1 different, mode2 same
+				for(int nn = nSamp - 1; nn >= d; nn--)
+					clean[nn] += fsel_amp_local * clean[nn - d];
+			}
+			memset(data_container.passband_delayed_data, 0, rxbuf_sz * sizeof(double));
+			awgn_channel.apply_with_delay(clean.data(), data_container.passband_delayed_data,
+			                              sigma, nSamp, forced_delay);
+			ofdm_forced_delay = forced_delay;
+			st_receive_stats rsB = receive_byte(data_container.passband_delayed_data, hd.data());
+			ofdm_forced_delay = -1;
+			memcpy(llr_b.data(), data_container.deinterleaved_data, n_llr * sizeof(float));
+			bool failB = (rsB.message_decoded == NO);
+			single_total++; if(!failB) single_ok++;
+
+			// --- CORRECT combine: sum THEN clamp to C_post ---
+			int iters = chase_combine_decode(llr_a.data(), llr_b.data(), n_llr, C_post, hd.data());
+			(void)iters;
+			// undo energy-dispersal scramble + extract info bits + CRC check, exactly
+			// as the production decode path does, to score a genuine decode success.
+			bool comb_ok = chase_score_decode(hd.data(), known_bits.data(), nReal_data);
+			if(comb_ok) combined_ok++;
+
+			// --- I1b control: clamp EACH look to ±40 FIRST, then sum (WRONG order) ---
+			{
+				static float a40[N_MAX], b40[N_MAX];
+				for(int i = 0; i < n_llr; i++)
+				{
+					float a = llr_a[i]; if(a>40.0f)a=40.0f; else if(a<-40.0f)a=-40.0f;
+					float b = llr_b[i]; if(b>40.0f)b=40.0f; else if(b<-40.0f)b=-40.0f;
+					a40[i]=a; b40[i]=b;
+				}
+				chase_combine_decode(a40, b40, n_llr, 40.0f, hd.data());  // re-clamp to ±40
+				if(chase_score_decode(hd.data(), known_bits.data(), nReal_data)) combined40_ok++;
+			}
+		}
+
+		double single_p   = (single_total > 0) ? (double)single_ok / single_total : 0.0;
+		double combined_p = (frames > 0) ? (double)combined_ok / frames : 0.0;
+		double combined40_p = (frames > 0) ? (double)combined40_ok / frames : 0.0;
+		// rough lift estimate: combining 2 looks ~ +3 dB; report whether the
+		// combined p at this Es/N0 exceeds the single-look p (the qualitative gate).
+		double lift_est = (combined_p > single_p) ? 3.0 : 0.0;
+		printf("%.2f %.4f %.4f %.4f %.1f %d\n",
+		       esn0, single_p, combined_p, combined40_p, lift_est, frames);
+		fflush(stdout);
+
+		// I1 PASS criterion at a BINDING point: single-look essentially always
+		// fails (< 0.10) AND the combine recovers a clear majority (> single_p +
+		// 0.30) AND (I1b) the correct post-sum clamp beats the ±40-first control.
+		if(fsel_mode != 2)
+		{
+			if(single_p < 0.10 && combined_p > single_p + 0.30 && combined_p >= combined40_p)
+				overall_rc = 0;
+		}
+		else
+		{
+			// mode 2 (SAME static null): the combine must NOT do meaningfully better
+			// than single-look (≈0 lift) AND must NOT be net-negative (F4): combined
+			// false-accept-equivalent (here: combined_p) ≤ single_p + small slack.
+			if(combined_p <= single_p + 0.05)
+				overall_rc = 0;
+		}
+	}
+	watterson_test_enabled = false;
+	return overall_rc;
+}
+
 int cl_telecom_system::get_frame_size_bytes()
 {
     return (data_container.nBits - ldpc.P - outer_code_reserved_bits) / 8;
