@@ -429,6 +429,22 @@ on this work. ROBUST_3 (coherent) stays obsolete-for-reach (the road down is mor
 noncoherent = ULTRA). HF Doppler/coherence caps it ~−22 to −24 (the −40/−45 regime is
 LF/MF-only). Name chosen to match the neutral CONFIG/ROBUST register (degree-up from ROBUST).
 
+**FULL DESIGN PROPOSAL (2026-06-01): [[ultra-tier-design.md]]** — the §4 plan that precedes the
+ULTRA build. Quantifies how the four levers STACK to −20 (robust, all-conditions) / −24
+(aspirational, quiet-path only): lever A lower-rate GF(16) RA (R⅐/R⅛/R⅑, ~+2-3 dB but saturates
+~−16/−17 alone), lever B deeper base-pattern combining (R=16/32, +2.2-2.5 dB/doubling, the primary
+detection lever — HW count-gate already alive to −22 at R=4), lever C minimal establish message
+(K=13→K=5-8 GF16 symbols, ~+2-4 dB the +3 dB/halving lever), lever D handshake-frame repetition
+(fixes the §20.9 choreography binder). HF ceiling PROVEN −22/−24 via WSJT-X Table 7 (Q65-15A −22.2
+… Q65-300A −33.8 / FST4 ladder) + the guide's coherence statement (Doppler spread < keying rate;
+FST4-1800 needs <0.089 Hz) crossed with ITU-R F.1487 HF Doppler spread (0.1/0.5/1.0 Hz good/mod/poor
+= MPG/MPM/MPP) — the −40/−45 FST4W regime is LF/MF+GPSDO-only. Mercury's NONcoherent combining
+out-reaches coherent FST4 on disturbed HF (no cross-rep phase needed). Protocol: ULTRA_0/1/2 =
+config-IDs 200-202, CAP_ULTRA=0x08, stop-and-wait (no SACK/streaming/batch), ~0.8 bps @ ULTRA_0 /
+~0.3 @ ULTRA_2, sticky gearshift down-cascade below ROBUST_0. Decomposed into INCR-0..7
+(one-change-one-test, free-rides the merged codec/combining — parameter-extension + protocol, not
+new DSP). HW (INCR-7) gated behind v13.
+
 ## §16 CFO sync EXONERATED — the metric gate is the SOLE ctrl-suffix masker (2026-05-31)
 
 Agent a1fe962c. Isolation sim (branch `sim/ctrl-sync-floor-isolation` @5f2c4d1 off the GF16
