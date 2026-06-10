@@ -3756,6 +3756,10 @@ void cl_arq_controller::reset_all_timers()
 
 void cl_arq_controller::reset_session_state()
 {
+	// FIX-6: drop any RX-delivery tail buffered behind a back-pressured app socket.
+	// A fresh session must not re-emit bytes from the previous connection's stream.
+	rx_deliver_pending_len = 0;
+
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;
 	data_configuration = init_configuration;
@@ -9375,6 +9379,43 @@ void cl_arq_controller::receive()
 }
 
 
+// FIX-6 Mouth B (defense-in-depth, paired with the non-lossy drain in
+// process_buffer_data_responder). cl_fifo_buffer::push() (fifo_buffer.cc:85)
+// copies NOTHING and returns 0 when length > free_size — pre-fix the four
+// producers below ignored that and counted the bytes as delivered, so once
+// Mouth A lets the FIFO legitimately back up (app socket slow) this would move
+// the silent loss one layer up. This helper closes that: if the chunk does not
+// fit, it first DRAINS the FIFO to the app socket (freeing room) and retries;
+// only if it STILL cannot fit (genuinely stuck socket AND full 128 KB FIFO) does
+// it LOUD-LOG and report the shortfall so the caller does not advance delivery
+// accounting for un-stored bytes. Returns the number of bytes actually stored
+// (== len on success). The bench3 stall is fixed by Mouth A alone (the FIFO was
+// drained empty by the lossy pop); Mouth B exists so the fix cannot reintroduce
+// a sibling silent-drop under a faster burst (CLAUDE.md §5).
+int cl_arq_controller::fifo_push_rx(const char* buf, int len)
+{
+	if(len <= 0) return 0;
+
+	int pushed = fifo_buffer_rx.push((char*)buf, len);
+	if(pushed == len) return pushed;
+
+	// Didn't fit: drain the app socket to free room, then retry once.
+	// (Responder-only path; the CMD has no symmetric RX→app drain — audit §4.5.)
+	if(original_role == RESPONDER)
+		process_buffer_data_responder();
+
+	pushed = fifo_buffer_rx.push((char*)buf, len);
+	if(pushed == len) return pushed;
+
+	// Still cannot store the whole chunk — the app reader is stuck and the FIFO is
+	// full. Surface it LOUDLY (never silent) and report the shortfall; the caller
+	// must NOT count the un-stored bytes as delivered.
+	printf("[RX-FIFO-FULL] app socket back-pressured, FIFO full: stored %d of %d bytes (held)\n",
+		pushed, len);
+	fflush(stdout);
+	return pushed;
+}
+
 void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
@@ -9494,10 +9535,12 @@ void cl_arq_controller::copy_data_to_buffer()
 					fwrite(decomp_buf, 1, dec_size, stdout);
 					fflush(stdout);
 				}
-				fifo_buffer_rx.push(decomp_buf, dec_size);
-				total_bytes += dec_size;
-				// Streaming: commit context (raw data = decompressed output)
-				if(compressor.is_streaming())
+				int stored = fifo_push_rx(decomp_buf, dec_size);
+				total_bytes += stored;
+				// Streaming: commit context (raw data = decompressed output).
+				// R1 (audit): commit ONLY on a full store so a held batch is not
+				// double-committed into the PPMd/zstd carry on re-delivery.
+				if(stored == dec_size && compressor.is_streaming())
 					compressor.streaming_commit((unsigned char*)decomp_buf, dec_size);
 				// Reset auth failure counter on success
 				if(cipher_suite.is_active())
@@ -9525,8 +9568,7 @@ void cl_arq_controller::copy_data_to_buffer()
 					(int)(ehdr[1] | (ehdr[2] << 8)),
 					(int)(ehdr[3] | (ehdr[4] << 8)));
 				fflush(stdout);
-				fifo_buffer_rx.push(comp_data, comp_len);
-				total_bytes += comp_len;
+				total_bytes += fifo_push_rx(comp_data, comp_len);
 			}
 		}
 		else if(assembled_size > 0)
@@ -9540,8 +9582,7 @@ void cl_arq_controller::copy_data_to_buffer()
 				fwrite(assembled, 1, assembled_size, stdout);
 				fflush(stdout);
 			}
-			fifo_buffer_rx.push(assembled, assembled_size);
-			total_bytes += assembled_size;
+			total_bytes += fifo_push_rx(assembled, assembled_size);
 		}
 	}
 	else
@@ -9560,8 +9601,7 @@ void cl_arq_controller::copy_data_to_buffer()
 					fwrite(messages_rx[i].data, 1, messages_rx[i].length, stdout);
 					fflush(stdout);
 				}
-				fifo_buffer_rx.push(messages_rx[i].data, messages_rx[i].length);
-				total_bytes += messages_rx[i].length;
+				total_bytes += fifo_push_rx(messages_rx[i].data, messages_rx[i].length);
 				messages_rx[i].status=FREE;
 				copied++;
 			}

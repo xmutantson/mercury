@@ -117,6 +117,10 @@ public:
 	int init();
 	int check_incomming_connection();
 	int transmit();
+	// FIX-6 test seam (NULL in production): see tcp_socket.cc. Lets the
+	// --test-rx-drain-backpressure unit model a back-pressured app socket
+	// (short / would-block send) without real sockets.
+	static int (*g_test_transmit_hook)(const char* buf, int length);
 	int receive();
 	void print_packet_status();
 	int get_status();

@@ -504,6 +504,9 @@ int main(int argc, char *argv[])
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
+    bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
+                                        // must NOT drop popped bytes when the non-blocking app socket back-pressures.
+                                        // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
@@ -1115,6 +1118,15 @@ int main(int argc, char *argv[])
             // at startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.1 / §5.1.
             test_retx_clear_on_recovery_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rx-drain-backpressure") == 0)
+        {
+            // FIX-6 — RX-delivery drain backpressure regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // source/datalink_layer/test_rx_drain.cc + fix6/STALL_ROOTCAUSE.md.
+            test_rx_drain_backpressure_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2409,6 +2421,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_retx_clear_on_recovery();
             printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_rx_drain_backpressure_cli) {
+            // FIX-6 — RX-delivery drain backpressure (one-shot, then exit rc).
+            printf("[FLAG] --test-rx-drain-backpressure: invoking FIX-6 "
+                   "RX-delivery drain backpressure regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rx_drain_backpressure();
+            printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

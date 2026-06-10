@@ -1850,6 +1850,13 @@ public:
   // Returns 0=PASS, 1=FAIL.
   int test_retx_clear_on_recovery();
 
+  // FIX-6 — RX-delivery drain backpressure regression (the deterministic
+  // 61,621-byte stall). CLI: --test-rx-drain-backpressure. FAILS at HEAD
+  // 62cb3dc (lossy drain drops popped bytes on a back-pressured non-blocking
+  // socket), PASSES after the non-lossy drain. See source/datalink_layer/
+  // test_rx_drain.cc + bigblock_p3_hw/_wallb/fix6/.
+  int test_rx_drain_backpressure();
+
   // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
   // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
   // messages_tx[] array-index space DIVERGED from the wire positions (holes + a
@@ -1957,8 +1964,16 @@ public:
   void process_messages_acknowledging_data();
   void process_control_responder();
   void process_buffer_data_responder();
+  // FIX-6: non-lossy RX-delivery send (handles non-blocking-socket back-pressure
+  // by stashing the unsent tail in rx_deliver_pending). Returns false when the
+  // app socket back-pressured and the caller must stop draining for this tick.
+  bool rx_deliver_send(const char* src, int length);
 
   void copy_data_to_buffer();
+  // FIX-6 Mouth B: non-lossy producer push into fifo_buffer_rx (drains the app
+  // socket to free room, surfaces any residual instead of silently dropping).
+  // Returns bytes actually stored (== len on success).
+  int fifo_push_rx(const char* buf, int len);
   void restore_backup_buffer_data();
   void restore_tx_from_compressed();  // Decompress messages_tx back to raw in fifo_buffer_tx
 
@@ -2462,6 +2477,22 @@ public:
   cl_fifo_buffer fifo_buffer_tx;
   cl_fifo_buffer fifo_buffer_rx;
   cl_fifo_buffer fifo_buffer_backup;
+
+  // FIX-6 (non-lossy RX delivery drain). The responder drains fifo_buffer_rx into
+  // the app data socket inside process_buffer_data_responder(). The socket is
+  // non-blocking; on a full OS send buffer send() returns short / would-block.
+  // Pre-fix the popped-and-transformed bytes were DISCARDED (the deterministic
+  // 61,621-byte stall). These hold the transformed-but-unsent TAIL so the next
+  // ARQ tick re-sends it IN ORDER before popping more raw bytes — converting
+  // silent loss into bounded buffering + natural backpressure. The pending unit
+  // is the POST-transform stream (correct for B2F, where the raw bytes are
+  // consumed by the parser and cannot be pushed back into the raw FIFO — audit
+  // R4). Sized MAX_BUFFER_SIZE: a single send unit is what the drain memcpy's into
+  // tcp_socket_data.message->buffer (also MAX_BUFFER_SIZE), so the stashed tail can
+  // never exceed it; the pop budget (~172 B) and the B2F reroll of one popped chunk
+  // are both far under this bound.
+  char rx_deliver_pending[MAX_BUFFER_SIZE];
+  int  rx_deliver_pending_len = 0;
 
   cl_telecom_system* telecom_system;
 

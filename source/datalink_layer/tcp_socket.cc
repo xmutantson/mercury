@@ -233,9 +233,29 @@ int cl_tcp_socket::check_incomming_connection()
 }
 
 
+// FIX-6 (RX-drain backpressure regression seam): when set, transmit() routes
+// through this hook instead of the real send(). It lets the in-process unit test
+// (--test-rx-drain-backpressure) model a back-pressured / would-block app socket
+// WITHOUT real sockets — the exact condition that the bench3 61,621-byte stall hit
+// on RF (a full OS send buffer). The hook receives the bytes the test "accepts"
+// and returns the same short/would-block semantics as a non-blocking send():
+//   >=0 = bytes accepted (may be < length: a short write),
+//   <0  = would-block (EWOULDBLOCK), nothing accepted.
+// Production builds leave it NULL → real send() path, zero behavior change.
+int (*cl_tcp_socket::g_test_transmit_hook)(const char* buf, int length) = nullptr;
+
 int cl_tcp_socket::transmit()
 {
 	int n=0;
+
+	if(g_test_transmit_hook != nullptr)
+	{
+		// Test seam: model the app socket's send() (short / would-block) without RF.
+		n = g_test_transmit_hook(message->buffer, message->length);
+		if(type==TYPE_SERVER) server_sent_packets++; else client_sent_packets++;
+		return n;
+	}
+
 	if (type==TYPE_SERVER)
 	{
 		n= send(connection_fd,message->buffer, message->length,0);
