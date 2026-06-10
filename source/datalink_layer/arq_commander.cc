@@ -1435,6 +1435,10 @@ void cl_arq_controller::process_messages_tx_data()
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
 		v2_dispatch_last_rwi = -1;               // §7.13.30 v2 dispatch throttle
 		v2_dispatch_min_advance_syms = 1;        // §7.13.30 default throttle interval
+		// WALL-B FIX-9 D2 REFINE (§2.1): this is the v1 retransmit-ONLY batch path -> the data-ACK
+		// we are about to wait for IS a retransmit turnaround -> arm the D2 robust reverse-ACK widen
+		// (calculate_receiving_timeout reads this flag). Set BEFORE the calc so the widen fires.
+		data_ack_retx_turnaround = true;
 		calculate_receiving_timeout();
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
@@ -1940,6 +1944,14 @@ void cl_arq_controller::process_messages_tx_data()
 		// ACK pattern detection uses dedicated ack_mfsk — no config switch needed
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
+		// WALL-B FIX-9 D2 REFINE (§2.1): this is the new-data / v2-mixed batch path. The data-ACK we
+		// are about to wait for is a RETRANSMIT turnaround iff the batch carried a retx prefix
+		// (v2_mixed_batch) OR a recent CFG16 reverse-ACK was lost (cfg16_revack_starve_fails>0 — arm
+		// the geometry on a degrading ceiling even if THIS batch is pure new-data). A clean
+		// first-pass batch -> false -> the D2 widen does NOT fire (byte-identical to D2-off; the
+		// ~15% clean cost is recovered). The flag is reset to false here on the clean path so a clean
+		// batch after a retx sequence is cheap again.
+		data_ack_retx_turnaround = (v2_mixed_batch || cfg16_revack_starve_fails > 0);
 		// Recalculate timeout: guard delays from prior ACK detection can leave
 		// receiving_timeout stale, too short for the next ACK round-trip.
 		calculate_receiving_timeout();
@@ -3477,6 +3489,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			emergency_break_retries = 1;
 			emergency_nack_count = 0;
 			cfg16_revack_starve_fails = 0;  // WALL-B FIX-9 D3 (P4): demote off CFG16 -> streak fresh
+			// WALL-B FIX-9 D2 REFINE (§4 Q3 INV-6): BREAK starts a fresh epoch -> clear the
+			// retx-turnaround arm so a stale TRUE cannot widen the post-BREAK control window. The
+			// next data batch re-derives it at the send path.
+			data_ack_retx_turnaround = false;
 
 			// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
 			if(sack_v2_enabled)
@@ -10721,6 +10737,150 @@ int cl_arq_controller::test_climb_engine()
 		check(reverse_ack_uses_robust_geometry(CONFIG_NONE) == false,
 			"W6 CONFIG_NONE -> predicate FALSE (no robust geometry on a non-OFDM sentinel)",
 			reverse_ack_uses_robust_geometry(CONFIG_NONE) ? 1 : 0, 0);
+	}
+
+	// ================================================================
+	// Part W2 — WALL-B FIX-9 D2 REFINE: the robust reverse-ACK geometry fires ONLY on a RETRANSMIT
+	// turnaround, NOT on a clean first-pass batch (_fix9/d2refine/D2_REFINE_DESIGN.md §6 gate (a)).
+	// This drives the SAME gated arithmetic the production calculate_receiving_timeout (CMD widen) +
+	// send_mfsk_ack_sack (RSP settle) use: the D2 geometry is armed iff
+	//   reverse_ack_uses_robust_geometry(cfg)  &&  <retx-turnaround flag>
+	// On a clean first-pass batch the flag is FALSE -> the widen/settle do NOT fire -> the data-ACK
+	// window/timing is BYTE-IDENTICAL to the D3-base (= D2-off), recovering the ~15% clean cost. On a
+	// retransmit turnaround the flag is TRUE -> the FULL D2 geometry fires. FAIL-BEFORE:
+	// -DFIX9_D2REFINE_FAILBEFORE drops the retx requirement (#ifndef-compiled-out) -> D2's
+	// UNCONDITIONAL widen/settle -> W2a/W2a2 FAIL (the clean window widens / the clean ACK settles
+	// when they must not). W2b/W2c/W2d PASS even in the stub (the retx + robust paths still fire).
+	// ================================================================
+	{
+		int saved_ptt_on = ptt_on_delay_ms, saved_ptt_off = ptt_off_delay_ms;
+		int saved_starve = cfg16_revack_starve_fails;
+		bool saved_retx = data_ack_retx_turnaround;
+		ptt_on_delay_ms = 100; ptt_off_delay_ms = 200;     // stock delays
+		int full_margin = ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS;
+
+		// Each W2 check below inlines the PRODUCTION gate EXACTLY (so fail-before/pass-after track the
+		// real code path): the CMD widen gate (arq_common.cc calculate_receiving_timeout) is
+		//   reverse_ack_uses_robust_geometry(cfg)  [&& data_ack_retx_turnaround]
+		// and the RSP settle gate (send_mfsk_ack_sack) is
+		//   reverse_ack_uses_robust_geometry(cfg)  [&& this_ack_is_retx_turnaround]
+		// where the bracketed term is #ifndef-compiled-out under FIX9_D2REFINE_FAILBEFORE (== D2's
+		// unconditional behavior).
+
+		// W2a — CLEAN FIRST-PASS at CFG16 (data_ack_retx_turnaround=FALSE): the CMD data-ACK window
+		// is NOT widened (adder==0) -> byte-identical to the D3-base. THIS is the cost-recovery
+		// assertion. FAIL-BEFORE: the gate ignores the flag -> the clean window widens -> adder ==
+		// full_margin != 0 -> FAIL.
+		cfg16_revack_starve_fails = 0;
+		data_ack_retx_turnaround = false;
+		{
+			int clean_adder =
+				( reverse_ack_uses_robust_geometry(CONFIG_16)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+				  && data_ack_retx_turnaround
+#endif
+				) ? full_margin : 0;
+			check(clean_adder == 0,
+				"W2a CLEAN first-pass CFG16 -> data-ACK window NOT widened (byte-identical to D3-base; recovers the ~15% clean cost)",
+				clean_adder, 0);
+		}
+
+		// W2a2 — the RSP-SETTLE gate on the clean path: the OFDM settle predicate
+		// (reverse_ack_uses_robust_geometry && this_ack_is_retx_turnaround) is FALSE on a clean ACK
+		// -> NO pre-TX settle on the first-pass ACK (recovers the +(ptt_off+ptt_on) per-turnaround).
+		// Mirrors send_mfsk_ack_sack's `ofdm_settle`. FAIL-BEFORE: the retx term is compiled out ->
+		// the clean OFDM ACK settles -> FAIL.
+		{
+			bool clean_ack_is_retx = false;   // the clean call site sets ack_tx_retx_turnaround=false
+			bool ofdm_settle_clean =
+				reverse_ack_uses_robust_geometry(CONFIG_16)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+				&& clean_ack_is_retx
+#endif
+				;
+			check(ofdm_settle_clean == false,
+				"W2a2 CLEAN first-pass CFG16 -> RSP keys NO robust pre-TX settle (tight OFDM turnaround, = D3-base)",
+				ofdm_settle_clean ? 1 : 0, 0);
+		}
+
+		// W2b — RETRANSMIT turnaround at CFG16 (data_ack_retx_turnaround=TRUE): the FULL D2 widen
+		// fires (adder == full_margin) -> the retx turnaround keeps the robust geometry that lands
+		// the ppm-slipped ACK in window. PASSES even in the FAIL-BEFORE stub (retx is the path that
+		// fired unconditionally before too). This is the "still armed on retx" assertion.
+		cfg16_revack_starve_fails = 0;
+		data_ack_retx_turnaround = true;
+		{
+			int retx_adder =
+				( reverse_ack_uses_robust_geometry(CONFIG_16)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+				  && data_ack_retx_turnaround
+#endif
+				) ? full_margin : 0;
+			check(retx_adder == full_margin,
+				"W2b RETRANSMIT turnaround CFG16 -> FULL D2 widen fires (the retx path keeps the robust geometry)",
+				retx_adder, full_margin);
+		}
+
+		// W2b2 — the RSP settle DOES fire on a partial/prev (retx) ACK at OFDM (arm the geometry where
+		// the slip rides). Mirrors send_mfsk_ack_sack with this_ack_is_retx_turnaround=true.
+		{
+			bool retx_ack_is_retx = true;     // partial/prev call sites set ack_tx_retx_turnaround=true
+			bool ofdm_settle_retx =
+				reverse_ack_uses_robust_geometry(CONFIG_16)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+				&& retx_ack_is_retx
+#endif
+				;
+			check(ofdm_settle_retx == true,
+				"W2b2 RETRANSMIT (partial/prev) ACK at CFG16 -> RSP keys the robust pre-TX settle (D2 geometry armed)",
+				ofdm_settle_retx ? 1 : 0, 1);
+		}
+
+		// W2c — arm (ii): a clean batch (data_ack_retx_turnaround starts false) but a DEGRADING
+		// ceiling (cfg16_revack_starve_fails>0) arms the geometry. This mirrors the CMD producer at
+		// arq_commander.cc:1945 (data_ack_retx_turnaround = v2_mixed_batch || starve>0). With
+		// starve>0 the producer sets the flag TRUE -> the widen fires even on a nominally-new-data
+		// batch, so the geometry helps the very turnaround that is slipping (BEFORE D3's 2-fail
+		// deadline). Replays the producer expression + the gated adder.
+		cfg16_revack_starve_fails = 1;        // a recent CFG16 reverse-ACK was lost
+		{
+			bool v2_mixed_batch = false;      // nominally pure new-data
+			// the producer expression (arq_commander.cc:1945):
+			data_ack_retx_turnaround = (v2_mixed_batch || cfg16_revack_starve_fails > 0);
+			int armed_adder =
+				( reverse_ack_uses_robust_geometry(CONFIG_16)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+				  && data_ack_retx_turnaround
+#endif
+				) ? full_margin : 0;
+			check(data_ack_retx_turnaround == true,
+				"W2c degrading ceiling (cfg16_revack_starve_fails>0) ARMS the retx-turnaround flag (arm ii, helps before D3 fires)",
+				data_ack_retx_turnaround ? 1 : 0, 1);
+			check(armed_adder == full_margin,
+				"W2c2 degrading-ceiling clean batch -> D2 widen fires (arm ii: protect the slipping turnaround)",
+				armed_adder, full_margin);
+		}
+
+		// W2d — ROBUST TIER: the RSP settle still fires via the is_robust_config disjunct,
+		// INDEPENDENT of the retx flag (byte-identical robust path; the refine only narrows the OFDM
+		// disjunct). Mirrors send_mfsk_ack_sack `is_robust_config(cfg) || ofdm_settle`.
+		{
+			bool any_retx = false;
+			bool robust_settle =
+				is_robust_config(ROBUST_0)
+				|| ( reverse_ack_uses_robust_geometry(ROBUST_0)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+				     && any_retx
+#endif
+				   );
+			check(robust_settle == true,
+				"W2d ROBUST tier -> settle fires via is_robust_config (byte-identical; independent of the retx gate)",
+				robust_settle ? 1 : 0, 1);
+		}
+
+		ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
+		cfg16_revack_starve_fails = saved_starve;
+		data_ack_retx_turnaround = saved_retx;
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",

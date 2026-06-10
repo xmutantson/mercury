@@ -2156,6 +2156,19 @@ public:
 
   // Commander: retransmit queue (missing frames from last SACK)
   bool sack_retransmit_active;         // True during retransmit batch TX (skip seq renumbering)
+  // WALL-B FIX-9 D2 REFINE (_fix9/d2refine/D2_REFINE_DESIGN.md §2): gate the D2 robust
+  // reverse-ACK geometry (RSP pre-TX settle + CMD listen-window widen) so it fires ONLY on a
+  // RETRANSMIT turnaround, not on a clean first-pass batch (recovers the ~15% clean cost
+  // FIX9_D2_RESULTS.md §4.2 measured). data_ack_retx_turnaround = CMD-side: TRUE when the batch
+  // the CMD just sent contained retransmitted frames OR a recent CFG16 reverse-ACK was lost
+  // (cfg16_revack_starve_fails>0). Set fresh before every post-batch calculate_receiving_timeout;
+  // read by calculate_receiving_timeout to gate the widen. ack_tx_retx_turnaround = RSP-side:
+  // TRUE on the partial/prev send_mfsk_ack_sack call sites (retx turnarounds), FALSE on the clean
+  // first-pass path; read+cleared at the top of send_mfsk_ack_sack to gate the settle. BOTH init
+  // FALSE (ctor + session resets) -> a pure-clean session never fires the geometry (byte-identical
+  // to D2-off / D3-base). NOT on the wire. See §4 cross-layer audit.
+  bool data_ack_retx_turnaround;       // CMD: the data-ACK we are waiting for is a retx turnaround
+  bool ack_tx_retx_turnaround;         // RSP: the ACK we are about to key is a retx turnaround
   int retransmit_count;                // Number of frames to retransmit
   int retransmit_batch_id;             // Crypto batch ID of frames being retransmitted
   unsigned char retransmit_frames[MAX_RETRANSMIT_HEADROOM][MAX_SACK_FRAME_SIZE];

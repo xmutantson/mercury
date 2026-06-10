@@ -939,6 +939,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 									printf("[RSP-MFSK-SACK] prev-delivered path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
 										(unsigned)prev_ack_bsi, (unsigned)bitmap_u32, data_batch_size);
 									fflush(stdout);
+									// WALL-B FIX-9 D2 REFINE (§2.1): prev-delivered = a batch recovered via the
+									// SACK/retransmit prev-storage path -> a RETRANSMIT turnaround -> arm the D2
+									// robust reverse-ACK geometry (settle) for this ACK.
+									ack_tx_retx_turnaround = true;
 									long long mfsk_ms = send_mfsk_ack_sack(prev_ack_bsi, bitmap_u32);
 									if (mfsk_ms > 0)
 									{
@@ -1759,6 +1763,10 @@ void cl_arq_controller::process_messages_acknowledging_data()
 								printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
 									(unsigned)sacked_bsi, (unsigned)bitmap_u32, data_batch_size);
 								fflush(stdout);
+								// WALL-B FIX-9 D2 REFINE (§2.1): partial = NAcking an incomplete batch -> the
+								// CMD will retransmit -> THIS is the retransmit turnaround the drift slip rides
+								// on -> arm the D2 robust reverse-ACK geometry (settle) for this ACK.
+								ack_tx_retx_turnaround = true;
 								long long mfsk_ms = send_mfsk_ack_sack(sacked_bsi, bitmap_u32);
 								if (mfsk_ms > 0)
 								{
@@ -1917,6 +1925,10 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				printf("[RSP-MFSK-SACK] clean path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
 					(unsigned)ack_bsi, (unsigned)bitmap_u32, data_batch_size);
 				fflush(stdout);
+				// WALL-B FIX-9 D2 REFINE (§2.1): clean = a fully-received first-pass batch ACK (the
+				// dominant clean-channel case) -> NOT a retransmit turnaround -> NO robust settle (key
+				// on the tight OFDM turnaround, byte-identical to D2-off / D3-base; recovers the cost).
+				ack_tx_retx_turnaround = false;
 				long long mfsk_ms = send_mfsk_ack_sack(ack_bsi, bitmap_u32);
 				if (mfsk_ms > 0)
 				{

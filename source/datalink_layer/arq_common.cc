@@ -571,6 +571,11 @@ cl_arq_controller::cl_arq_controller()
 	crypto_batch_counter_rx=0;
 	retransmit_count=0;
 	sack_retransmit_active=false;
+	// WALL-B FIX-9 D2 REFINE (_fix9/d2refine/D2_REFINE_DESIGN.md §4 Q3): the retx-turnaround gates
+	// for the D2 robust reverse-ACK geometry. INIT FALSE so a pure-clean session never fires the
+	// settle/widen (byte-identical to D2-off). Both are re-derived per-turnaround, never on the wire.
+	data_ack_retx_turnaround=false;
+	ack_tx_retx_turnaround=false;
 	retransmit_batch_id=-1;
 	for(int i=0;i<MAX_RETRANSMIT_HEADROOM;i++) {
 		retransmit_frame_lengths[i]=0;
@@ -1274,7 +1279,24 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// absorb. Without this the CMD window stays narrow and the slipped robust-geometry ACK
 			// STILL arrives late -> the FIX9_ROOTCAUSE §5 window-mismatch. Robust forward config:
 			// the predicate is FALSE -> adder=0 -> byte-identical.
-			if(reverse_ack_uses_robust_geometry(current_configuration))
+			//
+			// WALL-B FIX-9 D2 REFINE (_fix9/d2refine/D2_REFINE_DESIGN.md §2): gate the widen ALSO on
+			// data_ack_retx_turnaround so it fires ONLY on a RETRANSMIT turnaround (the batch carried
+			// retx frames OR a recent CFG16 reverse-ACK was lost), NOT on a clean first-pass batch —
+			// the clean first-pass ACK decodes WITHOUT the robust geometry (the control proves 0
+			// ACK-timeouts), so the +(ptt+drift) widen there is pure cost (~15% clean, recovered
+			// here). The CMD-widen condition is a SUPERSET of the RSP-settle condition (a CMD retx
+			// batch only exists after an RSP PARTIAL SACK, which set the RSP settle), so the
+			// FIX9_ROOTCAUSE §5 lockstep INV-1 (CMD window ⊇ RSP-keyed ACK window) is PRESERVED — see
+			// §2.2. FAIL-BEFORE (-DFIX9_D2REFINE_FAILBEFORE): drop the gate -> D2's unconditional
+			// widen -> the clean window widens (Part W2a fails).
+			bool d2_geometry_fires =
+				reverse_ack_uses_robust_geometry(current_configuration)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+				&& data_ack_retx_turnaround
+#endif
+				;
+			if(d2_geometry_fires)
 				timeout += ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS;
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
@@ -1285,12 +1307,13 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
-			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d batch=%d sack=%d\n",
+			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) batch=%d sack=%d\n",
 				timeout, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
 				margin, sack_enabled ? sack_timeout_extra_ms : 0,
-				reverse_ack_uses_robust_geometry(current_configuration)
+				d2_geometry_fires
 					? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0,
+				(int)data_ack_retx_turnaround,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			set_receiving_timeout(timeout);
@@ -6590,6 +6613,13 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		(unsigned)batch_seq_id, (unsigned)bitmap, (unsigned)crc12, nsymb, current_configuration);
 	fflush(stdout);
 
+	// WALL-B FIX-9 D2 REFINE (_fix9/d2refine/D2_REFINE_DESIGN.md §2.1): read+clear the per-call
+	// retx-turnaround flag the caller set (partial/prev paths -> TRUE, clean first-pass -> FALSE).
+	// CLEAR immediately after reading so it can never leak to a later non-eligible ACK (the §21.1
+	// shared-state discipline, same as ack_suffix_fec_coded).
+	bool this_ack_is_retx_turnaround = ack_tx_retx_turnaround;
+	ack_tx_retx_turnaround = false;
+
 	// Guard delay for MFSK modes (same as send_ack_pattern_with_snr).
 	// WALL-B FIX-9 D2 (FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md §3.2): the pre-TX settle ALSO
 	// fires at OFDM forward configs (reverse_ack_uses_robust_geometry), not just the robust tier.
@@ -6601,10 +6631,24 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	// the CMD that re-arm margin. The CMD's calculate_receiving_timeout() widens its listen window
 	// in LOCKSTEP on the SAME predicate (FIX9_ROOTCAUSE §5 invariant). Robust path UNCHANGED (the
 	// first disjunct was already true there — no double-settle).
-	if(is_robust_config(current_configuration)
-	   || reverse_ack_uses_robust_geometry(current_configuration))
+	//
+	// WALL-B FIX-9 D2 REFINE: the OFDM settle now ALSO requires this_ack_is_retx_turnaround so it
+	// fires ONLY on a retransmit turnaround (partial/prev ACK), NOT on a clean first-pass ACK — the
+	// clean ACK keys on the tight OFDM turnaround it always used (= D3-base), recovering the ~15%
+	// clean cost. Robust tier UNCHANGED (the is_robust_config disjunct is untouched). FAIL-BEFORE
+	// (-DFIX9_D2REFINE_FAILBEFORE): drop the retx requirement -> D2's unconditional OFDM settle.
+	bool ofdm_settle = reverse_ack_uses_robust_geometry(current_configuration)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+		&& this_ack_is_retx_turnaround
+#endif
+		;
+	if(is_robust_config(current_configuration) || ofdm_settle)
 	{
 		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
+		printf("[TX-MFSK-ACK-SACK] D2 robust-geometry settle=%dms (robust=%d ofdm_retx=%d) on CONFIG_%d\n",
+			wait_ms, is_robust_config(current_configuration) ? 1 : 0,
+			ofdm_settle ? 1 : 0, current_configuration);
+		fflush(stdout);
 		pumped_settle_wait(wait_ms);  // §5.7-B3: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
