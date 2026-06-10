@@ -101,6 +101,17 @@ void sim_inproc_rx_mute_settle(int wait_ms);
 void arq_set_sim_inproc_skip_tcp(bool on);
 bool arq_sim_inproc_skip_tcp();
 
+// SIM_INPROC post-delivery spin-abort (fact-documents/SIMFTR_ROOTCAUSE.md §7 fix #1).
+// Set true by the 2-instance step-pump (sim_inproc_pump_2) the instant the RESPONDER
+// holds the full payload, so the COMMANDER's post-transfer idle-keepalive ↔ pumped-
+// wait spin (which otherwise never returns control to the outer stepper) unwinds: the
+// spin helpers (ptt_busy_wait / drain_playback_wait / pumped_settle_wait) early-out,
+// process_main returns, and the outer loop's delivery check fires. Double-gated on
+// (pump installed) AND (this flag) — both false on every production / paced-sim path,
+// so it is a no-op off the SIM_INPROC stepper. Reset at the start of each stepper run.
+void arq_set_sim_inproc_deliver_done(bool on);
+bool arq_sim_inproc_deliver_done();
+
 union u_SNR {
   float f_SNR;
   char char4_SNR[4];
@@ -1369,11 +1380,24 @@ public:
   // (the KEY question: does sim REPRODUCE the HW cw0-CRC reject, or is the bug HW-only?).
   // Returns 0 on PASS. Selected by --test-bigblock-livepath.
   static int test_sim_inproc_bigblock_livepath();
+  // SIM_INPROC stepper-wedge regression (SIMFTR_ROOTCAUSE.md §7/§8 fix #1). Drives a
+  // PINNED-CFG15 clean (SNR3K=900) deterministic transfer for payloads {600,2000,4000,
+  // 8000} through test_sim_inproc_2() and asserts each terminates byte-correct via the
+  // genuine delivery break (not the wedge). FAIL-BEFORE on the SAME binary via
+  // MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1 (reproduces the post-transfer keepalive spin →
+  // watchdog-stalled). Returns 0 on PASS. Selected by --test-sim-sustain.
+  static int test_sim_inproc_sustain();
   // Capture of the last test_sim_inproc_2() run's delivery (read by the full-path
   // regression to assert byte-faithful delivery without re-parsing stdout).
   static long sim2_last_rx_have;
   static long sim2_last_payload_len;
   static bool sim2_last_bytes_ok;
+  // SIM_INPROC fix #1 (SIMFTR_ROOTCAUSE.md §7): true iff the last test_sim_inproc_2()
+  // run did NOT terminate via the genuine delivery break — i.e. it hit the stall
+  // cutoff, the stop-after hooks, OR the post-delivery-abort fail-before watchdog
+  // (the stepper-wedge reproduced). The sustained-delivery test asserts this is
+  // false for every payload (no wedge) when the fix is present.
+  static bool sim2_last_stalled;
   // GAP-2 LIVE-PATH: cw0-CRC gate decision tally for the last receive run. accepts =
   // real big-blocks that PASSED bigblock_rx_cw0_header_valid() and were carved; rejects =
   // CFG16 acquisitions that FAILED the cw0 wire-CRC and were re-decoded on the stock

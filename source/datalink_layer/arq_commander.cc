@@ -9611,6 +9611,11 @@ int cl_arq_controller::test_sim_inproc()
 	pump_ctx.symbol_period_samples = symbol_period;
 	pump_ctx.scratch = (double*)malloc((size_t)symbol_period * sizeof(double) * 2);
 	arq_set_sim_inproc_pump(sim_inproc_pump, &pump_ctx);
+	// Ensure the SIM_INPROC post-delivery spin-abort (fix #1) is disarmed for this
+	// single-instance stepper: sim_inproc_pump (NOT _2) never arms it, but a prior
+	// test_sim_inproc_2() run in the same process may have left it set — reset so the
+	// spin helpers here behave byte-identically to the unmodified single-instance path.
+	arq_set_sim_inproc_deliver_done(false);
 	check(pump_ctx.scratch != nullptr, "A4 step-pump installed");
 
 	// Non-zero PTT delays so the two PTT waits inside send_batch() MUST advance
@@ -9903,6 +9908,29 @@ struct SimInproc2Ctx {
 	long long clock_samples = 0;
 	long long looped_samples = 0;      // real airtime moved tx->rx
 	long long idle_samples = 0;
+	// SIM_INPROC post-delivery spin-abort (SIMFTR_ROOTCAUSE.md §7 fix #1). The pump
+	// runs DURING the commander's post-transfer keepalive spin; these let it observe
+	// the RESPONDER's delivered-byte count from inside that spin and arm the abort
+	// (arq_set_sim_inproc_deliver_done) the instant the full payload has landed, so
+	// process_main unwinds back to the outer stepper. deliver_rx = the RESPONDER's
+	// arq (whose fifo_buffer_rx the outer loop drains); deliver_target = payload_len;
+	// deliver_drained = pointer to the outer loop's running rx_have (bytes ALREADY
+	// popped out of the FIFO this run) so the cumulative count (drained + currently
+	// buffered) is compared against the target. Null deliver_rx (the single-instance
+	// stepper, sim_inproc_pump) disables the probe — that path is unaffected.
+	cl_arq_controller* deliver_rx = nullptr;
+	long  deliver_target = 0;
+	const int* deliver_drained = nullptr;
+	bool  deliver_defeat = false;      // fail-before A/B hook: skip arming the abort
+	// Pump-call wall watchdog (fail-before arm only). When deliver_defeat is set the
+	// post-delivery abort never arms, so the wedge reproduces. To make that arm
+	// terminate DETERMINISTICALLY (instead of hanging until an outer timeout) the pump
+	// force-aborts after this many calls and sets deliver_stalled so the test reports
+	// the wedge as a FAIL rather than a clean delivery. 0 = disabled (the real fix arm
+	// never needs it — it aborts on the genuine delivery predicate within a few calls).
+	long long deliver_watchdog_calls = 0;
+	long long deliver_watchdog_anchor = -1;  // pump_calls at first full-delivery (fail-before)
+	bool  deliver_stalled = false;     // set true iff the watchdog tripped (wedge seen)
 };
 
 // Reentrancy depth for the co-routine peer-drive (§10.5). 0 = top (tx) level;
@@ -10134,6 +10162,52 @@ void sim_inproc_pump_2(void* ctxv)
 		return;
 	c->pump_calls++;
 
+	// SIM_INPROC post-delivery spin-abort probe (SIMFTR_ROOTCAUSE.md §7 fix #1). Run on
+	// EVERY pump call, REGARDLESS of co-routine depth: the post-transfer wedge spins inside
+	// the RESPONDER's own process_main, which is driven at depth 1 by the COMMANDER's depth-0
+	// pump call — so that depth-0 call never returns and a depth-0-only probe is never
+	// reached. The delivery state (responder's fifo_buffer_rx occupancy) is global, so the
+	// abort can and must be armed from the depth-1 call too. The outer-loop delivery check
+	// (rx_have >= payload_len) lives at the loop BOTTOM, unreachable while either peer is
+	// wedged; this is the one place that CAN observe completion mid-spin. When the cumulative
+	// delivered count (bytes already drained into the outer loop's rx_have PLUS bytes
+	// currently in the responder's fifo_buffer_rx) reaches the payload target, arm the abort
+	// so the spin helpers unwind BOTH peers' process_main back to the outer loop. The transfer
+	// has SUCCEEDED at this point (responder holds every byte), so there is no in-flight PHY
+	// frame whose pacing could be perturbed. deliver_defeat reproduces the pre-fix wedge.
+	if (c->deliver_rx != nullptr && !arq_sim_inproc_deliver_done())
+	{
+		long buffered = (long)c->deliver_rx->fifo_buffer_rx.get_size()
+		              - (long)c->deliver_rx->fifo_buffer_rx.get_free_size();
+		long drained  = (c->deliver_drained != nullptr) ? (long)*c->deliver_drained : 0;
+		bool fully_delivered = (buffered + drained >= c->deliver_target);
+		if (!c->deliver_defeat)
+		{
+			// REAL FIX: arm the post-delivery abort the instant the responder holds the
+			// whole payload, so the spin helpers unwind process_main back to the outer loop.
+			if (fully_delivered)
+				arq_set_sim_inproc_deliver_done(true);
+		}
+		else if (fully_delivered && c->deliver_watchdog_calls > 0)
+		{
+			// FAIL-BEFORE arm: the responder ALREADY holds the full payload (the transfer
+			// SUCCEEDED) but we deliberately do NOT arm the abort — reproducing the wedge.
+			// DELIVERY-ANCHORED watchdog: count pump calls SINCE first-full-delivery; once
+			// the commander/responder have spun deliver_watchdog_calls past the delivery
+			// point without the outer loop ever breaking (== the wedge: process_main never
+			// returned), give up, mark stalled, and force-unwind so the run terminates as a
+			// FAIL. Anchoring on delivery (not absolute pump_calls) makes it batch-size-
+			// independent and guarantees it can only trip on a genuine POST-delivery spin.
+			if (c->deliver_watchdog_anchor < 0)
+				c->deliver_watchdog_anchor = c->pump_calls;
+			else if (c->pump_calls - c->deliver_watchdog_anchor >= c->deliver_watchdog_calls)
+			{
+				c->deliver_stalled = true;
+				arq_set_sim_inproc_deliver_done(true);
+			}
+		}
+	}
+
 	// (1) Drain tx's playback (real signal or idle silence) into the tx->rx wire,
 	//     advancing the shared clock. NEVER writes to a capture here. `sending`
 	//     = real signal was draining this call (tx is actively transmitting a
@@ -10185,6 +10259,8 @@ void sim_inproc_pump_2(void* ctxv)
 	}
 	// DEPTH 1 (we ARE the peer being co-routine-driven): only drained tx->rx wire
 	// above (the reply path). Do NOT deliver into the original sender's capture.
+	// (The post-delivery spin-abort probe runs at the TOP of this function so it fires on
+	// every pump call regardless of co-routine depth — see there.)
 }
 
 // Configure one instance for the 2-instance stepper exactly like the non-TCP
@@ -10261,6 +10337,8 @@ void sim2_activate(MercuryInstance* m)
 long cl_arq_controller::sim2_last_rx_have     = -1;
 long cl_arq_controller::sim2_last_payload_len = -1;
 bool cl_arq_controller::sim2_last_bytes_ok    = false;
+// SIM_INPROC fix #1 (SIMFTR_ROOTCAUSE.md §7): last run's stalled/wedge flag.
+bool cl_arq_controller::sim2_last_stalled     = false;
 // GAP-2 LIVE-PATH (diag/livepath-sim): cw0-CRC gate decision tally (see arq.h).
 long cl_arq_controller::sim2_gate_accepts = 0;
 long cl_arq_controller::sim2_gate_rejects = 0;
@@ -10553,6 +10631,33 @@ int cl_arq_controller::test_sim_inproc_2()
 	// GAP-2 LIVE-PATH: iter at which the stop-after-tx-emits threshold was first met (the
 	// grace window is measured from here). -1 = not yet armed. Loop-local (reset per run).
 	long emit_break_arm_iter = -1;
+
+	// --- SIM_INPROC post-delivery spin-abort wiring (SIMFTR_ROOTCAUSE.md §7 fix #1). ---
+	// Arm the pump's delivery probe so it can unwedge the commander's post-transfer
+	// keepalive spin from INSIDE process_main (the outer delivery check at the loop
+	// bottom is unreachable while A is wedged). The pump compares (rx_have already
+	// drained here) + (bytes currently in B's fifo_buffer_rx) against payload_len and
+	// sets the SIM_INPROC abort flag the instant B holds the whole payload.
+	//   MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1 : fail-before A/B hook — reproduce the PRE-FIX
+	//     wedge on the SAME binary (skip arming the genuine abort). A pump-call watchdog
+	//     then force-terminates the wedged run and marks it stalled so the test reports
+	//     the defect as a FAIL. Production never sets it.
+	const bool defeat_simftr_fix = env_i("MERCURY_SIM2_DEFEAT_SIMFTR_FIX", 0) != 0;
+	arq_set_sim_inproc_deliver_done(false);   // reset for this run
+	pump.deliver_rx       = &B->arq;
+	pump.deliver_target   = payload_len;
+	pump.deliver_drained  = &rx_have;
+	pump.deliver_defeat   = defeat_simftr_fix;
+	pump.deliver_stalled  = false;
+	pump.deliver_watchdog_anchor = -1;
+	// Watchdog only matters for the fail-before arm (the real fix aborts on the genuine
+	// predicate at the delivery instant). It is a DELIVERY-ANCHORED count: pump calls AFTER
+	// the responder holds the full payload, so it can only catch a genuine post-delivery
+	// spin (the wedge), never a transfer still in flight. Default 80 (well into the first
+	// post-transfer idle wait, before the expensive keepalive TX). Env-overridable via
+	// MERCURY_SIM2_SIMFTR_WATCHDOG.
+	pump.deliver_watchdog_calls = env_i("MERCURY_SIM2_SIMFTR_WATCHDOG", 80);
+
 	for (; iters < max_iters; iters++)
 	{
 		if (dbg && (iters % 200 == 0)) {
@@ -10776,12 +10881,19 @@ int cl_arq_controller::test_sim_inproc_2()
 	uint64_t t1 = sim_clock_now_samples();
 	double sim_ms = (t1 - t0) * 1000.0 / SIM_CLOCK_SAMPLE_RATE_HZ;
 	bool bytes_ok = (rx_have >= payload_len && memcmp(rx_buf, payload, payload_len) == 0);
+	// SIM_INPROC fix #1: fold the pump-watchdog wedge signal (fail-before arm) into the
+	// stalled flag so the wedge is reported as a FAIL by the byte-correct G-SMOKE assert.
+	if (pump.deliver_stalled) stalled = true;
+	// Disarm the post-delivery abort flag now this run owns it no longer (the next
+	// stepper run re-resets it; clearing here keeps the global clean for any follow-on).
+	arq_set_sim_inproc_deliver_done(false);
 
 	// FULL-PATH REGRESSION capture (bigblock-whiten-align): record this run's delivery so
 	// test_sim_inproc_bigblock_fullpath() can assert byte-faithful delivery directly.
 	sim2_last_rx_have     = rx_have;
 	sim2_last_payload_len = payload_len;
 	sim2_last_bytes_ok    = bytes_ok;
+	sim2_last_stalled     = stalled;
 
 	if (payload_bytes <= 0) {
 		// Legacy short-text arm: print the string (regression output unchanged).
@@ -10873,6 +10985,210 @@ int cl_arq_controller::test_sim_inproc_2()
 	delete A; delete B;
 
 	printf("[TEST-SIM-2INST] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// SIM_INPROC STEPPER-WEDGE REGRESSION (SIMFTR_ROOTCAUSE.md §7/§8 fix #1).
+//
+// The 2-instance stepper's outer-loop delivery check (rx_have >= payload_len,
+// test_sim_inproc_2) is at the loop BOTTOM. A complete one-batch PINNED-CFG15 clean
+// transfer whose post-ACK turnaround leaves the COMMANDER in TRANSMITTING_DATA falls
+// into a self-sustaining idle-keepalive ↔ pumped-wait spin INSIDE one process_main()
+// call — so process_main never returns, the outer check is never re-reached, and the
+// run hangs to the iter cap (in practice: a wall-clock hang) even though the RESPONDER
+// already holds every payload byte. The fix (arq_common.cc spin helpers + the pump
+// delivery probe) arms a SIM_INPROC-only post-delivery abort the instant the responder
+// holds the full payload, unwinding process_main back to the outer loop.
+//
+// This test drives SINGLE-BATCH payloads {600, 2000, 4000} PINNED CFG15 clean (SNR3K=900,
+// seed=777) through test_sim_inproc_2() and asserts each terminates BYTE-CORRECT via the
+// genuine delivery break (sim2_last_bytes_ok && !sim2_last_stalled). FAIL-BEFORE on the
+// SAME binary via MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1 for the canonical P=4000 wedge: the
+// abort is not armed, the wedge reproduces, and the delivery-anchored watchdog force-
+// terminates it as STALLED (it did NOT self-terminate), so a single process demonstrates
+// fail-before -> pass-after. (At monitor HEAD, 600/4000 HANG to the wall timeout; 2000
+// breaks before the wedge. Post-fix, all three deliver byte-correct in a handful of iters.)
+//
+// MULTI-BATCH (P=8000): exercised only under MERCURY_SIM2_SUSTAIN_MULTIBATCH=1, and
+// REPORTED, NOT asserted. 8000 spans two CFG15 batches and exposes a SEPARATE, pre-existing
+// single-thread-sim limitation — the commander's inter-batch receive-ACK wait does not
+// yield an outer-loop turn for the responder to decode-drive batch 2 (so batch 2 is never
+// decoded). That decode-drive gap is upstream of, and independent of, the post-transfer
+// wedge fix #1 lands; 8000 ALSO hangs at monitor HEAD (not a regression).
+int cl_arq_controller::test_sim_inproc_sustain()
+{
+	printf("[TEST-SIM-SUSTAIN] ===== SIM_INPROC PINNED-CFG15 sustained-delivery "
+	       "stepper-wedge regression (single-batch 600/2000/4000 asserted; 8000 multi-batch "
+	       "diagnostic) =====\n");
+	fflush(stdout);
+
+	// --- save the env we set, so the test leaves the process env clean ---
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_SIM_2INST", "MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG",
+		"MERCURY_SIM2_ROBUST", "MERCURY_SIM2_SNR3K", "MERCURY_SIM2_SEED",
+		"MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS",
+		"MERCURY_SIM2_DEFEAT_SIMFTR_FIX", "MERCURY_SIM2_SIMFTR_WATCHDOG"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key   = keys[i];
+		env_saved[(size_t)i].had   = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	// PINNED CFG15, clean (SNR3K=900), fixed seed — deterministic per GATE-2.
+	set_env("MERCURY_SIM_2INST",  "1");
+	set_env("MERCURY_SIM2_PIN",   "1");   // hold CFG15 (no gearshift)
+	set_env("MERCURY_SIM2_CFG",   "15");
+	set_env("MERCURY_SIM2_ROBUST","0");
+	set_env("MERCURY_SIM2_SNR3K", "900");
+	set_env("MERCURY_SIM2_SEED",  "777");
+	// Iter cap is a backstop only — the wedge hangs INSIDE one process_main call and never
+	// reaches the iter counter, so the pump-call WATCHDOG is what bounds the fail-before arm.
+	set_env("MERCURY_SIM2_MAXITERS",    "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS", "0");          // no stall cutoff — isolate the wedge
+
+	// Single-batch payloads (all <= one CFG15 batch = 25 frames * ~168 B ~= 4200 B). These
+	// are the cases the post-transfer wedge (SIMFTR_ROOTCAUSE.md) covers and that fix #1
+	// resolves end-to-end. 8000 (multi-batch) is run as an INFORMATIONAL diagnostic only
+	// (see below): it exercises a SEPARATE, pre-existing single-thread-sim limitation — the
+	// commander's inter-batch receive-ACK wait does not yield an outer-loop turn for the
+	// RESPONDER to decode-drive the NEXT batch, so batch 2 is never decoded and the run
+	// cannot complete. That decode-drive gap is upstream of, and independent of, the
+	// post-transfer wedge fix; 8000 ALSO hangs at monitor HEAD, so it is not a regression.
+	const long payloads[]     = { 600, 2000, 4000 };
+	const int  npay           = (int)(sizeof(payloads)/sizeof(payloads[0]));
+	const long diag_multibatch = 8000;   // informational only (multi-batch decode-drive gap)
+	int failed = 0;
+
+	auto run_one = [&](long P, bool defeat)->void {
+		char b[32]; snprintf(b,sizeof(b),"%ld",P);
+		set_env("MERCURY_SIM2_PAYLOAD_BYTES", b);
+		set_env("MERCURY_SIM2_DEFEAT_SIMFTR_FIX", defeat ? "1" : "0");
+		// Bound the fail-before wedge so it terminates fast. The watchdog is
+		// DELIVERY-ANCHORED: it counts pump calls AFTER the responder already holds the
+		// full payload, so it can only trip on a genuine POST-delivery spin. 80 post-
+		// delivery calls is well into the commander's idle receive-ACK wait spin (the
+		// FIRST post-transfer wait, ~68 calls) yet stops BEFORE the expensive idle-keepalive
+		// TX — conclusive proof the spin is self-sustaining (process_main did not return)
+		// while keeping wall time low. The watchdog branch is taken ONLY on the fail-before
+		// (deliver_defeat) arm; the pass-after arm aborts on the real predicate AT the
+		// delivery instant (anchor) so the outer loop breaks within ~1 pump call and never
+		// consults the watchdog — it can never false-trip a legitimate transfer.
+		set_env("MERCURY_SIM2_SIMFTR_WATCHDOG", "80");
+		sim2_last_rx_have = -1; sim2_last_payload_len = -1;
+		sim2_last_bytes_ok = false; sim2_last_stalled = false;
+		test_sim_inproc_2();
+	};
+
+	// ---------- FAIL-BEFORE: reproduce the wedge on the same binary -------------------
+	// The canonical single-batch post-transfer wedge is P=4000 (the root-cause repro). At
+	// monitor HEAD it HANGS to the wall timeout; here, in defeat mode, the delivery-anchored
+	// watchdog force-unwinds it and flags `stalled`. (600/2000 may break before the wedge
+	// depending on turnaround timing, so the fail-before assertion is on 4000 — the
+	// deterministic single-batch wedge.)
+	printf("[TEST-SIM-SUSTAIN] --- FAIL-BEFORE arm (MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1: "
+	       "post-delivery abort NOT armed -> stepper wedge) ---\n");
+	fflush(stdout);
+	bool fail_before_reproduced = true;
+	{
+		const long P = 4000;
+		run_one(P, /*defeat=*/true);
+		// The wedge is reproduced iff the run was STALLED — i.e. it did NOT terminate via
+		// the genuine delivery break; instead the delivery-anchored watchdog had to
+		// force-unwind a post-delivery spin that would otherwise never return. (bytes_ok
+		// may read 1 because the outer loop drains B's already-full FIFO after the forced
+		// abort — that is incidental; the WEDGE signal is `stalled`, the watchdog firing.)
+		bool wedged = sim2_last_stalled;
+		printf("[TEST-SIM-SUSTAIN] FAIL-BEFORE P=%ld: rx_have=%ld/%ld bytes_ok=%d stalled=%d "
+		       "-> wedged=%d\n", P, sim2_last_rx_have, sim2_last_payload_len,
+		       (int)sim2_last_bytes_ok, (int)sim2_last_stalled, (int)wedged);
+		fflush(stdout);
+		if (!wedged) fail_before_reproduced = false;
+	}
+	printf("[TEST-SIM-SUSTAIN] %s: FAIL-BEFORE reproduces the stepper wedge (P=4000 did NOT "
+	       "self-terminate -> delivery-anchored watchdog had to force-unwind)\n",
+	       fail_before_reproduced ? "PASS" : "FAIL");
+	if (!fail_before_reproduced) failed++;
+
+	// ---------- PASS-AFTER: the real fix path ----------
+	// Every SINGLE-BATCH payload must terminate byte-correct via the genuine delivery break
+	// (not stalled) — these are the cases the post-transfer wedge fix covers.
+	printf("[TEST-SIM-SUSTAIN] --- PASS-AFTER arm (fix active) ---\n");
+	fflush(stdout);
+	bool pass_after_all_ok = true;
+	for (int i = 0; i < npay; i++) {
+		long P = payloads[i];
+		run_one(P, /*defeat=*/false);
+		bool ok = sim2_last_bytes_ok && !sim2_last_stalled
+		       && (sim2_last_rx_have == P);
+		printf("[TEST-SIM-SUSTAIN] PASS-AFTER P=%ld: rx_have=%ld/%ld bytes_ok=%d stalled=%d "
+		       "-> delivered=%d\n", P, sim2_last_rx_have, sim2_last_payload_len,
+		       (int)sim2_last_bytes_ok, (int)sim2_last_stalled, (int)ok);
+		fflush(stdout);
+		if (!ok) pass_after_all_ok = false;
+	}
+	printf("[TEST-SIM-SUSTAIN] %s: PASS-AFTER delivers all single-batch payloads byte-correct "
+	       "via the delivery break (no wedge)\n", pass_after_all_ok ? "PASS" : "FAIL");
+	if (!pass_after_all_ok) failed++;
+
+	// ---------- MULTI-BATCH DIAGNOSTIC (informational, NOT asserted) ----------
+	// P=8000 spans two CFG15 batches. It exposes a SEPARATE single-thread-sim limitation
+	// (the commander's inter-batch receive-ACK wait does not yield an outer-loop turn for the
+	// responder to decode-drive batch 2), independent of the post-transfer wedge fix #1 lands.
+	// It hangs at monitor HEAD too (not a regression), so we run it under a bounded watchdog
+	// and REPORT the outcome WITHOUT failing the suite — surfacing the next-layer gap without
+	// asserting a fix this change does not make. To keep the suite fast and deterministic the
+	// multi-batch arm is skipped unless MERCURY_SIM2_SUSTAIN_MULTIBATCH=1 is set.
+	if (std::getenv("MERCURY_SIM2_SUSTAIN_MULTIBATCH") != nullptr) {
+		printf("[TEST-SIM-SUSTAIN] --- MULTI-BATCH DIAGNOSTIC P=%ld (informational, not "
+		       "asserted) ---\n", diag_multibatch);
+		fflush(stdout);
+		run_one(diag_multibatch, /*defeat=*/false);
+		bool ok = sim2_last_bytes_ok && !sim2_last_stalled
+		       && (sim2_last_rx_have == diag_multibatch);
+		printf("[TEST-SIM-SUSTAIN] MULTI-BATCH P=%ld: rx_have=%ld/%ld bytes_ok=%d stalled=%d "
+		       "-> delivered=%d (NOTE: multi-batch decode-drive gap is a SEPARATE pre-existing "
+		       "sim limitation, out of scope for the wedge fix; not asserted)\n",
+		       diag_multibatch, sim2_last_rx_have, sim2_last_payload_len,
+		       (int)sim2_last_bytes_ok, (int)sim2_last_stalled, (int)ok);
+		fflush(stdout);
+	} else {
+		printf("[TEST-SIM-SUSTAIN] multi-batch diagnostic (P=%ld) SKIPPED (set "
+		       "MERCURY_SIM2_SUSTAIN_MULTIBATCH=1 to run it; it exercises a separate "
+		       "pre-existing decode-drive gap, not the wedge fix)\n", diag_multibatch);
+		fflush(stdout);
+	}
+
+	restore_env();
+	// Belt-and-suspenders: ensure the global abort flag is clear after the suite.
+	arq_set_sim_inproc_deliver_done(false);
+
+	printf("[TEST-SIM-SUSTAIN] %s (%d failure%s)\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
