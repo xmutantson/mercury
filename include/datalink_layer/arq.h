@@ -1043,6 +1043,69 @@ public:
     return snr_ideal;
   }
 
+  // WALL-B FIX-7A (KEYSTONE) — turbo CEILING SETTLE-vs-BREAK discriminator
+  // (fix7/FIX7_DESIGN.md §1). PURE decision (no member writes, no side effects;
+  // Part U replays it directly, the same idiom as supershift_retrigger_target /
+  // bigblock_carve_cooldown_ceiling). The turbo CEILING handler
+  // (arq_commander.cc:2311-2388) is reached from TWO situations it today treats
+  // identically (UNCONDITIONAL send_break_pattern() → ROBUST_0):
+  //   (1) GENUINE top-config verification ceiling (Bug #59): the link probed the
+  //       top of the proven range, no lower OFDM rung is proven, the probe failed.
+  //       A BREAK-and-fall-back is CORRECT — real uncertainty about the channel.
+  //   (2) SPECULATIVE RE-TRIGGER over-reach (THIS latch): the link was DELIVERING
+  //       DATA at a PROVEN OFDM rung (last_data_viable_config is a real OFDM rung
+  //       raised by clean batches), then the saturating post-EQ EVM-SNR licensed a
+  //       MULTI-rung speculative jump to a config the channel can't carry. The
+  //       probe failure proves only that the SPECULATIVE rung is unreachable — it
+  //       says NOTHING bad about the proven rung the link was just running on.
+  //       BREAKing to ROBUST_0 here is a pure regression: it discards proven
+  //       progress and (in SIM_INPROC / a slow-wire peer) deadlocks on the
+  //       un-drained BREAK-ACK tail and PARKS at ROBUST_0 on a CLEAN channel.
+  // This predicate isolates case (2): only then should the CEILING SETTLE at the
+  // proven anchor and resume DATA there instead of BREAKing. Inputs are exactly
+  // the members live at the CEILING (arq_commander.cc:2311): the turbo phase, the
+  // last-good rung (turboshift_last_good), the data-viability anchor
+  // (last_data_viable_config), and the rung that failed (current_configuration).
+  //   - phase == TURBO_FORWARD : a forward probe (REVERSE already returns before
+  //     the forward BREAK block at :2328; the discriminator must NOT fire on it).
+  //   - is_ofdm_config(settle_config): the last-good rung is a real OFDM rung
+  //     (not ROBUST / not the CONFIG_NONE sentinel that maps to init_configuration).
+  //   - is_ofdm_config(anchor) && !is_robust_config(anchor): the anchor PROVED an
+  //     OFDM rung. At session start the anchor is the ROBUST_0 floor
+  //     (arq_common.cc:722) → FALSE → INERT until a clean OFDM batch genuinely
+  //     raised it (the §16 tier gate in data_anchor_raise_target prevents a ROBUST
+  //     clean from poisoning the anchor into the OFDM tier). No early-session
+  //     misfire (Part M/M2 already prove the t=0 anchor is ROBUST_0 on -R).
+  //   - config_ladder_index(failed) > config_ladder_index(anchor) + 1: the probe
+  //     leapt MORE than +1 rung past the proven anchor. A +1 FRAME-UP edge that
+  //     fails is the normal ladder edge → keep today's BREAK/anchor-demote
+  //     machinery (the index(failed)>index(anchor)+1 clause is the guard that
+  //     leaves the genuine top-config / +1-edge ceiling BREAKing exactly as today).
+  // When TRUE the caller settles INLINE to last_data_viable_config (the
+  // guaranteed-decodable proven rung) and resumes DATA — NO send_break_pattern(),
+  // NO finish_turbo_direction() (which on FORWARD kicks a REVERSE SWITCH_ROLE probe,
+  // or with --skip-turbo-reverse re-installs proven_ceiling=turboshift_last_good,
+  // fighting the ceiling-lowering — R1). When FALSE the caller falls through to the
+  // BYTE-IDENTICAL BREAK. The genuine deep-SNR escape is preserved: a top-config
+  // ceiling (anchor still ROBUST, no proven OFDM rung) and a +1-edge probe both
+  // return FALSE → BREAK to ROBUST_0 as today. See §4 cross-layer audit.
+  bool turbo_ceiling_should_settle(int phase, int settle_config,
+                                   int anchor, int failed_config) const
+  {
+#ifdef WALLB_FIX7A_FAILBEFORE
+    (void)phase; (void)settle_config; (void)anchor; (void)failed_config;
+    return false;   // FAIL-BEFORE stub: no settle path exists -> CEILING always BREAKs
+                    // to ROBUST_0 (the pre-fix behavior; Part U0/U2b/U4 FAIL).
+#else
+    return phase == TURBO_FORWARD
+        && is_ofdm_config(settle_config)
+        && is_ofdm_config(anchor)
+        && !is_robust_config(anchor)
+        && config_ladder_index(failed_config)
+             > config_ladder_index(anchor) + 1;
+#endif
+  }
+
   // REAL FAST-PROBE piece (B) — the SHARED elevator-target method
   // (gearshift-climb-engine.md §14). Computes the SNR-ideal config the controlled
   // elevator (§13) should target, applying the SAME ceiling cap-chain and the SAME

@@ -2340,6 +2340,60 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					return;
 				}
 
+				// WALL-B FIX-7A (KEYSTONE, fix7/FIX7_DESIGN.md §1) — discriminate a
+				// SPECULATIVE RE-TRIGGER over-reach from a genuine top-config ceiling.
+				// The SNR RE-TRIGGER (:5258-5294) can leap MANY rungs up from a freshly
+				// proven OFDM anchor on the saturating post-EQ EVM-SNR (CONFIG_0 anchor →
+				// CFG13 in the repro). CFG13's single OFDM control frame does NOT decode
+				// here ([FTR-FAIL] CONFIG_13 metric=0.000), so the probe NAcks twice and
+				// lands in this CEILING. UNCONDITIONALLY BREAKing to ROBUST_0 here throws
+				// away the proven OFDM rung (last_data_viable_config) the link was just
+				// delivering on — and in SIM_INPROC / a slow-wire peer the BREAK-ACK tail
+				// deadlocks and PARKS at ROBUST_0 on a CLEAN channel. When the failed probe
+				// was a speculative MULTI-rung leap from a PROVEN OFDM anchor, SETTLE at
+				// that anchor and resume DATA there instead. The deep-SNR escape is
+				// preserved: a genuine top-config ceiling (anchor still ROBUST) and a
+				// +1-edge probe fail the discriminator and BREAK exactly as today. See
+				// the PURE helper turbo_ceiling_should_settle (arq.h) + Part U.
+				if(turbo_ceiling_should_settle((int)turboshift_phase, settle_config,
+						last_data_viable_config, failed_config))
+				{
+					int settle_rung = last_data_viable_config;  // the PROVEN OFDM anchor
+					printf("[TURBO] SETTLE (FIX-7A): probe over-reach %d -> settling at "
+						"proven anchor %d, resuming DATA (NO BREAK)\n",
+						failed_config, settle_rung);
+					fflush(stdout);
+
+					// Settle INLINE (NOT via finish_turbo_direction — R1: on FORWARD it
+					// kicks a REVERSE SWITCH_ROLE probe, or with --skip-turbo-reverse
+					// re-installs proven_ceiling=turboshift_last_good, fighting the
+					// ceiling-lowering). This is the same inline settle the BW-NEG fallback
+					// (:2260-2263) uses: phase=TURBO_DONE + connection_status=TRANSMITTING_DATA.
+					turboshift_active = false;
+					turbo_supershift_announce_pending = false;
+					turboshift_phase = TURBO_DONE;
+					data_configuration       = settle_rung;
+					negotiated_configuration = settle_rung;
+					turboshift_last_good     = settle_rung;
+					load_configuration(settle_rung, PHYSICAL_LAYER_ONLY, YES);
+
+					// Lower the proven ceiling below the just-failed speculative rung so the
+					// very next RE-TRIGGER cannot immediately re-leap straight back to it
+					// (the limit-cycle guard, arq.h re-trigger ceiling cap). Matches the
+					// existing CEILING ceiling-lowering intent (:2369-2370).
+					supershift_proven_ceiling = config_ladder_down(failed_config, robust_enabled);
+
+					// Resume DATA at the settled, proven rung — NO send_break_pattern(),
+					// NO ROBUST_0 drop. The BREAK-ladder fields (emergency_break_active,
+					// break_drop_step, emergency_previous_config, breaks_since_last_data_
+					// success) are DELIBERATELY untouched (§4.2 audit / Part U4): the settle
+					// does not enter the BREAK ladder, so it cannot perturb the FIX-2 AARF.
+					connection_status = TRANSMITTING_DATA;
+					watchdog_timer.start();
+					link_timer.start();
+					return;
+				}
+
 				// TURBO_FORWARD or higher ceiling: BREAK to ROBUST_0, then drop to
 				// the SNR-predicted start config (not just 1 step below ceiling).
 				// Dropping 1 step at a time wastes time probing configs that can't work.
@@ -10009,6 +10063,176 @@ int cl_arq_controller::test_climb_engine()
 			held, CONFIG_15);
 		bigblock_carve_cooldown_batches = 0;   // tidy
 		supershift_proven_ceiling = -1;
+	}
+
+	// ================================================================
+	// Part U — WALL-B FIX-7A: turbo CEILING SETTLE-vs-BREAK on a SPECULATIVE
+	// RE-TRIGGER over-reach (fix7/FIX7_DESIGN.md §1+§5, FIX7_ROOTCAUSE.md).
+	// The recorded SIM free-flow collapse (100→101→102→0→4→[RE-TRIGGER]→13→
+	// CEILING→TX-BREAK→park, rx=113/1374) is the turbo PROBE ceiling, NOT the
+	// CFG16 carve path (Parts R/S/T): at the proven CONFIG_0 OFDM anchor the SNR
+	// RE-TRIGGER leaps to CFG13 on the saturating EVM-SNR, CFG13's control frame
+	// does not decode, the probe NAcks twice, and the turbo CEILING UNCONDITIONALLY
+	// BREAKs to ROBUST_0 — discarding the proven OFDM rung on a CLEAN channel.
+	// FIX-7A discriminates a speculative MULTI-rung over-reach from a proven OFDM
+	// anchor (settle there, resume DATA) from a genuine top-config / +1-edge ceiling
+	// (BREAK preserved). This drives the REAL pure helper turbo_ceiling_should_settle
+	// (the SAME one the CEILING handler arq_commander.cc:2343+ calls) + the member-
+	// granularity §4.2 no-perturbation-of-FIX-2 assertion (U4). FAIL-BEFORE: the
+	// helper/predicate does not exist (CEILING unconditionally BREAKs → U0/U4 FAIL).
+	// PASS-AFTER: ALL PASS. CMD-only; no RSP/wire/DSP/PHY change.
+	// ================================================================
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+
+	// U0 — THE over-reach (FAIL-BEFORE / PASS-AFTER): forward probe, last-good is the
+	// OFDM rung CFG4, the proven anchor is CONFIG_0 (raised by the two clean CONFIG_0
+	// batches in the repro), the failed probe is CFG13 (leapt 13 rungs past anchor).
+	// should_settle==TRUE → the CEILING settles at the anchor (CONFIG_0), NOT ROBUST_0.
+	{
+		bool ss = turbo_ceiling_should_settle(/*phase=*/TURBO_FORWARD,
+			/*settle_config=*/CONFIG_4, /*anchor=*/CONFIG_0, /*failed_config=*/CONFIG_13);
+		check(ss == true,
+			"U0 speculative over-reach (FORWARD, last-good CFG4, anchor CONFIG_0, failed CFG13) => SETTLE (not BREAK)",
+			ss ? 1 : 0, 1);
+		// the settle target is the PROVEN anchor (CONFIG_0), the guaranteed-decodable rung
+		int settle_target = CONFIG_0;  // == last_data_viable_config in the repro
+		check(settle_target == CONFIG_0 && is_ofdm_config(settle_target),
+			"U0b settle target == last_data_viable_config == CONFIG_0 (a proven OFDM rung, not ROBUST_0)",
+			settle_target, CONFIG_0);
+	}
+
+	// U1 — GENUINE top-config ceiling: the anchor is still ROBUST_0 (no proven OFDM
+	// rung — e.g. the climb never completed a clean OFDM batch). should_settle==FALSE
+	// => the deep-SNR BREAK to ROBUST_0 is PRESERVED (the historical Bug #59 path).
+	{
+		bool ss = turbo_ceiling_should_settle(TURBO_FORWARD,
+			/*settle_config=*/CONFIG_0, /*anchor=*/ROBUST_0, /*failed_config=*/CONFIG_4);
+		check(ss == false,
+			"U1 genuine ceiling (anchor still ROBUST_0, no proven OFDM rung) => BREAK preserved (deep-SNR escape intact)",
+			ss ? 1 : 0, 0);
+	}
+
+	// U2 — +1-EDGE probe (NOT an over-reach): the anchor is CFG4 and the probe failed
+	// at CFG5 (a single FRAME-UP edge). should_settle==FALSE => today's +1-edge BREAK /
+	// anchor-demote machinery is UNTOUCHED (the index(failed)>index(anchor)+1 guard).
+	{
+		bool ss = turbo_ceiling_should_settle(TURBO_FORWARD,
+			/*settle_config=*/CONFIG_4, /*anchor=*/CONFIG_4, /*failed_config=*/CONFIG_5);
+		check(ss == false,
+			"U2 +1-edge probe (anchor CFG4, failed CFG5) => NOT an over-reach => today's +1-edge BREAK untouched",
+			ss ? 1 : 0, 0);
+		// and a +2 leap from a proven anchor IS an over-reach (the boundary is index+1):
+		bool ss2 = turbo_ceiling_should_settle(TURBO_FORWARD, CONFIG_4, CONFIG_4, CONFIG_6);
+		check(ss2 == true,
+			"U2b +2 leap (anchor CFG4, failed CFG6) IS a speculative over-reach => SETTLE (boundary is index+1)",
+			ss2 ? 1 : 0, 1);
+	}
+
+	// U3 — REVERSE probe: the discriminator must NOT fire on the reverse phase (the
+	// reverse branch already returns before the forward BREAK block at :2328).
+	{
+		bool ss = turbo_ceiling_should_settle(/*phase=*/TURBO_REVERSE,
+			CONFIG_4, CONFIG_0, CONFIG_13);
+		check(ss == false,
+			"U3 REVERSE phase => discriminator FALSE (reverse settle path is separate, :2328)",
+			ss ? 1 : 0, 0);
+		// a ROBUST settle_config (init_configuration fallback) also never settles inline:
+		bool ss2 = turbo_ceiling_should_settle(TURBO_FORWARD, ROBUST_0, CONFIG_0, CONFIG_13);
+		check(ss2 == false,
+			"U3b settle_config==ROBUST_0 (no last-good OFDM rung) => FALSE (is_ofdm_config(settle) guard)",
+			ss2 ? 1 : 0, 0);
+	}
+
+	// U4 — MEMBER-GRANULARITY (the Part L idiom + the §4.2 no-perturbation-of-FIX-2
+	// audit AS a test): prime the real this-> members for the over-reach, replay the
+	// FIX-7A settle's member assignments (the PURE state half; load_configuration is
+	// the PHY side, not asserted here), and assert (a) the settle lands at the proven
+	// anchor with phase=TURBO_DONE and the ceiling lowered below the failed rung, AND
+	// (b) every BREAK-ladder field is UNCHANGED — the settle does NOT enter the BREAK
+	// ladder so it cannot perturb the FIX-2 cap/decay AARF.
+	{
+		// prime: the over-reach state at the CEILING
+		turboshift_phase          = TURBO_FORWARD;
+		turboshift_active         = true;
+		turboshift_last_good      = CONFIG_4;      // the rung jumped FROM (single FRAME-UP)
+		last_data_viable_config   = CONFIG_0;      // the PROVEN anchor (2 clean batches)
+		current_configuration     = CONFIG_13;     // the failed speculative probe rung
+		// data_configuration primed to the FAILED rung (CFG13): in production the CEILING
+		// block sets data_configuration=settle_config BEFORE the BREAK, so without FIX-7A
+		// the settle does NOT run and data_configuration stays the over-reach rung — U4a
+		// then FAILs (the over-reach config is NOT the proven CONFIG_0 anchor).
+		data_configuration        = CONFIG_13;
+		supershift_proven_ceiling = -1;
+		// FIX-2 BREAK-ladder fields seeded with NON-default sentinels so any spurious
+		// write by the settle would be observable:
+		emergency_break_active    = 0;
+		break_drop_step           = 2;
+		emergency_previous_config = CONFIG_9;
+		breaks_since_last_data_success = 3;
+
+		int failed_config = current_configuration;          // 13, as production computes (:2312)
+		int settle_config = (turboshift_last_good >= 0) ?   // 4, as production computes (:2313)
+			turboshift_last_good : init_configuration;
+
+		bool should_settle = turbo_ceiling_should_settle((int)turboshift_phase,
+			settle_config, last_data_viable_config, failed_config);
+		check(should_settle == true,
+			"U4-pre the primed over-reach satisfies the discriminator (drives the settle branch)",
+			should_settle ? 1 : 0, 1);
+
+		if(should_settle)
+		{
+			// replay the FIX-7A settle's PURE member half (arq_commander.cc:2343+),
+			// EXCLUDING load_configuration (PHY-side, needs telecom_system):
+			int settle_rung = last_data_viable_config;
+			turboshift_active = false;
+			turbo_supershift_announce_pending = false;
+			turboshift_phase = TURBO_DONE;
+			data_configuration       = settle_rung;
+			negotiated_configuration = settle_rung;
+			turboshift_last_good     = settle_rung;
+			supershift_proven_ceiling = config_ladder_down(failed_config, robust_enabled);
+			connection_status = TRANSMITTING_DATA;
+		}
+
+		// (a) the settle landed at the proven anchor, phase done, ceiling lowered:
+		check(data_configuration == CONFIG_0,
+			"U4a settle data_configuration == CONFIG_0 (the proven anchor, NOT ROBUST_0)",
+			data_configuration, CONFIG_0);
+		check((int)turboshift_phase == (int)TURBO_DONE,
+			"U4b turboshift_phase == TURBO_DONE after the inline settle (turbo completed at the proven rung)",
+			(int)turboshift_phase, (int)TURBO_DONE);
+		check(supershift_proven_ceiling == config_ladder_down(CONFIG_13, robust_enabled)
+			&& supershift_proven_ceiling == CONFIG_12,
+			"U4c supershift_proven_ceiling lowered to config_ladder_down(CFG13)==CFG12 (re-trigger cannot re-leap to CFG13)",
+			supershift_proven_ceiling, CONFIG_12);
+
+		// (b) THE §4.2 audit assertion: the BREAK-ladder fields are UNTOUCHED — FIX-7A
+		// does NOT perturb the FIX-2 cap/decay AARF (the settle never enters the BREAK ladder):
+		check(emergency_break_active == 0,
+			"U4d emergency_break_active UNCHANGED (==0): the settle did NOT fire a BREAK",
+			emergency_break_active, 0);
+		check(break_drop_step == 2,
+			"U4e break_drop_step UNCHANGED (==2): FIX-7A does not perturb the FIX-2 doubling ladder",
+			break_drop_step, 2);
+		check(emergency_previous_config == CONFIG_9,
+			"U4f emergency_previous_config UNCHANGED (==CFG9): the BREAK target memory is not touched",
+			emergency_previous_config, CONFIG_9);
+		check(breaks_since_last_data_success == 3,
+			"U4g breaks_since_last_data_success UNCHANGED (==3): the panic counter is not touched",
+			breaks_since_last_data_success, 3);
+
+		// tidy — restore sentinels so a later pass/teardown sees a clean state
+		turboshift_phase = TURBO_DONE;
+		current_configuration = CONFIG_NONE;
+		negotiated_configuration = CONFIG_NONE;
+		data_configuration = CONFIG_NONE;
+		last_data_viable_config = ROBUST_0;
+		supershift_proven_ceiling = -1;
+		emergency_previous_config = CONFIG_NONE;
+		break_drop_step = 1;
+		breaks_since_last_data_success = 0;
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
