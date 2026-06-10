@@ -96,6 +96,8 @@ cl_telecom_system::cl_telecom_system()
 	chase_frame_counter = 0;
 	chase_capture_count = 0;
 	chase_test_wrong_llr = nullptr;       // TEST-ONLY F1 producer; default OFF
+	chase_cand_n = 0;                     // I5: empty missing-slot candidate set
+	for(int i = 0; i < CHASE_CAND_MAX; i++) chase_cand_slots[i] = -1;
 	chase_buffer_void();
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
@@ -1109,6 +1111,67 @@ int cl_telecom_system::chase_try_combine(const float* live_llr, int n, int live_
 		return iters;
 	}
 	return -1;                                         // no accept → plain decode
+}
+
+// ===== CHASE COMBINING — I5 slot-identity bookkeeping + injection ============
+// set_chase_candidates: read-only store of the still-missing-slot set (option c).
+// The ARQ layer (which owns messages_rx[]/messages_rx_prev[]) builds this set and pushes
+// it down before the combine. n<=0 clears the set. Bounded to CHASE_CAND_MAX. Pure store
+// — never touches the ring, receive_stats, or data_byte.
+void cl_telecom_system::set_chase_candidates(const int* slots, int n)
+{
+	if(slots == nullptr || n <= 0) { chase_cand_n = 0; return; }
+	if(n > CHASE_CAND_MAX) n = CHASE_CAND_MAX;
+	for(int i = 0; i < n; i++) chase_cand_slots[i] = slots[i];
+	chase_cand_n = n;
+}
+
+// chase_combine_inject: the live-path consumer. Runs chase_try_combine on the live look's
+// LLR against the buffered candidates (config+batch gate, decorrelation gate, CRC16 +
+// STRICT convergence accept — the I4 PHY-side gate). On a FULL accept it descrambles +
+// byte-packs the recovered K info bits into data_container.data_byte EXACTLY as the native
+// success path (telecom_system.cc:4321-4339) so the DOWNSTREAM native parse (arq_common.cc:
+// 7687-7800) injects into messages_rx[loc] byte-/state-indistinguishably from a native
+// decode (INV-CHASE-1). The decoded SLOT/BATCH validation (parts 3+4: id ∈ missing set,
+// batch_seq_id == live id) is the CALLER's job (ARQ owns the header parse) — here we only
+// produce the candidate data_byte; the ARQ glue parses it and DROPS a recovery that lands
+// off the missing set (no inject, message_decoded stays NO). Returns iters (>=0 accept) or
+// -1 (no accept / chase disabled; data_byte untouched). live_llr = deinterleaved_data, n =
+// ldpc.N. [red-team F5] data_byte holds the RAW ciphertext slice; decrypt is at reassembly.
+int cl_telecom_system::chase_combine_inject(const float* live_llr, int n, int live_config,
+                                            int live_batch_seq_id, int* accepted_slot)
+{
+	if(accepted_slot) *accepted_slot = -1;
+	if(!chase_enabled) return -1;                    // default-OFF: never consumes
+	if(n <= 0 || n > N_MAX) return -1;
+	int nReal_data = data_container.nBits - ldpc.P;
+	// chase_try_combine writes the recovered K-info-bits (un-descrambled LDPC output) into
+	// hd_tmp and runs the full PHY-side accept gate (config/batch identity + decorrelation +
+	// CRC16 + strict convergence). The option-c in-set check inside chase_try_combine fires
+	// only for ALREADY-tagged candidates; untagged candidates (the identity wall at capture)
+	// are accepted on the PHY gate here, and the ARQ caller does the decoded-id in-set check.
+	static int hd_tmp[N_MAX];
+	int acc_slot = -1;
+	int iters = chase_try_combine(live_llr, n, live_config, live_batch_seq_id,
+	                              chase_cand_n > 0 ? chase_cand_slots : nullptr, chase_cand_n,
+	                              hd_tmp, &acc_slot);
+	if(iters < 0) return -1;                          // no candidate accepted → plain decode
+	// PRODUCE data_byte EXACTLY as the native success path does (mirror :4321-4339):
+	// descramble the LDPC info bits in place, byte-pack, then write data_byte. This is the
+	// SAME transform a native decode applies, so the downstream parse cannot tell the
+	// difference. hd_tmp is the K-info-bit output as ldpc.decode wrote it.
+	static int hd_desc[N_MAX];
+	static int hd_byte[N_MAX/8 + 2];
+	bit_energy_dispersal(hd_tmp, data_container.bit_energy_dispersal_sequence, hd_desc, nReal_data);
+	bit_to_byte(hd_desc, hd_byte, nReal_data);
+	// Write the recovered RAW info bytes into data_byte: (nReal_data - reserved)/8 bytes,
+	// exactly the count the native path writes to `out` at :4337-4340.
+	int n_out_bytes = (nReal_data - outer_code_reserved_bits) / 8;
+	if(n_out_bytes > N_MAX/8) n_out_bytes = N_MAX/8;
+	for(int i = 0; i < n_out_bytes; i++)
+		data_container.data_byte[i] = hd_byte[i];
+	if(accepted_slot) *accepted_slot = acc_slot;     // candidate's tag (-1 if untagged; ARQ parses id)
+	return iters;
 }
 
 // ===== CHASE COMBINING — I1/I1b/I1c BER harness ============================

@@ -4275,6 +4275,117 @@ bool cl_arq_controller::bigblock_rx_cw0_header_valid()
 	return (calc == wire);
 }
 
+// ===== CHASE COMBINING — I5 ARQ→PHY glue + slot-injection ====================
+// chase_build_missing_set(): the single source of truth for the option-c candidate set.
+// Current batch: slots in [0, data_batch_size) that are NOT RECEIVED/ACKED in messages_rx[].
+// Prev batch (design §7.7 — prev-batch candidates included): when rsp_prev_batch_active, the
+// still-missing messages_rx_prev[] slots are added too (late retx land there). De-duplicated,
+// bounded to `max`. Used by chase_recover_frame (production) AND test_chase_slot_inject.
+int cl_arq_controller::chase_build_missing_set(int* cand, int max) const
+{
+	if(cand == NULL || max <= 0) return 0;
+	int n_cand = 0;
+	int dbs = data_batch_size;
+	if(dbs > nMessages) dbs = nMessages;
+	for(int loc = 0; loc < dbs && n_cand < max; loc++)
+	{
+		char st = messages_rx[loc].status;
+		if(st != RECEIVED && st != ACKED) cand[n_cand++] = loc;
+	}
+	if(rsp_prev_batch_active && messages_rx_prev != NULL)
+	{
+		for(int loc = 0; loc < dbs && n_cand < max; loc++)
+		{
+			char st = messages_rx_prev[loc].status;
+			if(st != RECEIVED && st != ACKED)
+			{
+				bool dup = false;
+				for(int k = 0; k < n_cand; k++) if(cand[k] == loc) { dup = true; break; }
+				if(!dup) cand[n_cand++] = loc;
+			}
+		}
+	}
+	return n_cand;
+}
+
+// chase_recover_frame(): the live-path ARQ consumer for chase combining (design §4 I5;
+// audit §2.3 hook (i), INV-CHASE-1). Called after a DECODE FAIL when chase is enabled. It
+// builds the still-missing-slot set RX owns, pushes it to PHY, runs the speculative combine,
+// and on a PHY-accept validates the decoded slot/batch (parts 3+4) before flipping
+// message_decoded=YES so the EXISTING native parse injects into messages_rx[loc] byte-/state-
+// identically to a native decode. A recovery that lands off the missing set / on a wrong batch
+// is DROPPED. Guarded by telecom_system->chase_enabled — default-OFF → never called.
+bool cl_arq_controller::chase_recover_frame()
+{
+	if(telecom_system == NULL) return false;
+	if(!telecom_system->chase_enabled) return false;        // default-OFF: byte-identical
+	if(!sack_v2_enabled) return false;                      // chase is v2-only (F2)
+	if(telecom_system->M == MOD_MFSK) return false;         // OFDM data path only
+
+	// The live look's pre-decode LLR vector is the exact float* handed to ldpc.decode on
+	// this frame (data_container.deinterleaved_data, length ldpc.N) — still populated on a FAIL.
+	const float* live_llr = telecom_system->data_container.deinterleaved_data;
+	int n = telecom_system->ldpc.N;
+	int live_config = telecom_system->current_configuration;
+	int live_batch_seq_id = (rsp_current_expected_batch_seq_id >= 0)
+		? (rsp_current_expected_batch_seq_id & 0xFF) : -1;
+	if(live_batch_seq_id < 0) return false;                 // no live batch id → v2 gate denies
+
+	// --- Build the still-missing-slot candidate set (option c, the shared helper) ---
+	int cand[cl_telecom_system::CHASE_CAND_MAX];
+	int n_cand = chase_build_missing_set(cand, cl_telecom_system::CHASE_CAND_MAX);
+	if(n_cand == 0) return false;                           // nothing missing → nothing to recover
+	telecom_system->set_chase_candidates(cand, n_cand);
+
+	// --- Run the speculative combine + produce data_byte on a PHY-accept ------
+	int acc_slot = -1;
+	int iters = telecom_system->chase_combine_inject(live_llr, n, live_config,
+	                                                 live_batch_seq_id, &acc_slot);
+	if(iters < 0) return false;                             // no candidate accepted
+
+	// --- Parse the recovered data_byte header (the SAME parse the native path uses) ---
+	// data_byte now holds the recovered RAW info bytes; for v2 DATA the header is
+	// [type, conn_id, seq(EOB=bit7), batch_seq_id, id, (length)]. Validate parts 3+4 at the
+	// ARQ layer where the header parse lives (the I4 caller-enforced checks).
+	int dtype = (int)telecom_system->data_container.data_byte[0] & 0xFF;
+	if(dtype != DATA_LONG && dtype != DATA_SHORT) return false;   // not a DATA frame → drop
+	int d_bsi = (int)telecom_system->data_container.data_byte[3] & 0xFF;   // v2 byte[3]
+	int d_id  = (int)telecom_system->data_container.data_byte[4] & 0xFF;   // v2 byte[4]
+
+	// Part 4: decoded batch_seq_id must equal a LIVE id (current or prev). A wrong-batch
+	// recovery would be [RSP-V2-DROP]'d downstream anyway — reject it here.
+	bool batch_ok = (d_bsi == (rsp_current_expected_batch_seq_id & 0xFF))
+		|| (rsp_prev_batch_seq_id >= 0 && d_bsi == (rsp_prev_batch_seq_id & 0xFF));
+
+	// Part 3: decoded slot (id) must be IN the missing-slot set we seeded the trial with.
+	// FAIL-BEFORE proof (test-only): CHASE_NOSLOTGATE=1 bypasses the in-set/batch gate so a
+	// wrong-slot recovery WOULD inject — the I5 test asserts that by default it must NOT.
+	bool slotgate = true;
+	{ const char* e = std::getenv("CHASE_NOSLOTGATE"); if(e && *e && atoi(e)) slotgate = false; }
+	bool in_set = false;
+	for(int k = 0; k < n_cand; k++) if(cand[k] == d_id) { in_set = true; break; }
+
+	if(slotgate && (!batch_ok || !in_set))
+	{
+		printf("[CHASE-DROP] recovered id=%d bsi=%d off missing-set/batch (in_set=%d batch_ok=%d) "
+			"— NOT injected\n", d_id, d_bsi, (int)in_set, (int)batch_ok);
+		fflush(stdout);
+		return false;                                       // off the missing set → drop, no inject
+	}
+
+	// ACCEPT: data_byte now holds the recovered RAW info bytes. The CALLER (receive(), which
+	// owns the local received_message_stats) flips message_decoded=YES so the native parse
+	// (arq_common.cc:7687) injects this recovered frame into messages_rx[loc] EXACTLY as a
+	// native decode (single-count, SACK bitmap, status=RECEIVED). The raw ciphertext slice is
+	// in data_byte; decrypt is at reassembly (F5). (void)acc_slot — the candidate tag is -1 at
+	// the identity wall; the authoritative slot is the decoded id, validated above.
+	(void)acc_slot;
+	printf("[CHASE-ACCEPT] recovered DATA id=%d bsi=%d iters=%d (combine recovered a NACK'd "
+		"frame) — injecting as native\n", d_id, d_bsi, iters);
+	fflush(stdout);
+	return true;
+}
+
 // (already §5-audited) — it does NOT touch the optimizer/gearshift authority.
 // Returns SUCCESSFUL when the block was carved into the ARQ layer.
 int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
@@ -7437,6 +7548,25 @@ void cl_arq_controller::receive()
 			}
 		}
 		(void)bigblock_rx_handled;
+
+		// CHASE COMBINING — I5 live-path consumer (design §4 I5; audit §2.3 hook (i)).
+		// On a DECODE FAIL (and only when chase is enabled + not a bigblock carve), attempt to
+		// recover the NACK'd frame by soft-combining its buffered failed look with this look.
+		// chase_recover_frame() builds the missing-slot set, runs the speculative combine, and on
+		// a validated accept flips message_decoded=YES so the native parse below injects the
+		// recovered frame into messages_rx[loc] byte-/state-identically (INV-CHASE-1). Guarded by
+		// telecom_system->chase_enabled — CHASE unset → this short-circuits, ZERO production
+		// change (byte-identical). Skipped on a bigblock carve (it owns its own injection).
+		if(telecom_system->chase_enabled
+			&& !bigblock_rx_handled
+			&& received_message_stats.message_decoded == NO
+			&& telecom_system->M != MOD_MFSK)
+		{
+			// On a validated accept, data_byte holds the recovered RAW info bytes; flip
+			// message_decoded=YES so the native parse below injects it as a native frame.
+			if(chase_recover_frame())
+				received_message_stats.message_decoded = YES;
+		}
 
 		auto proc_end = std::chrono::steady_clock::now();
 		double proc_ms = std::chrono::duration<double, std::milli>(proc_end - proc_start).count();

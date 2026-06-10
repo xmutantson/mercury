@@ -498,6 +498,40 @@ public:
 	// --test-chase-false-accept.
 	int    chase_false_accept_test(int cfg, int trials);
 
+	// ---- CHASE COMBINING — I5 slot-identity bookkeeping + injection ------------
+	// Design §3.2/§3.7 / §4 I5; audit §1.3/§2.3/§5.5 (option c), INV-CHASE-1 (the
+	// recovered frame is BYTE-/STATE-INDISTINGUISHABLE from a native decode). The
+	// ARQ→PHY hook is the read-only SETTER shape (hook (i), audit §2.3): the ARQ
+	// layer (which OWNS messages_rx[]/messages_rx_prev[] + the live batch ids) builds
+	// the still-missing-slot set and pushes it DOWN to PHY before the combine; PHY runs
+	// the combine and, on a full accept, writes the recovered RAW info bytes into
+	// data_container.data_byte EXACTLY as the native success path (telecom_system.cc:
+	// 4321-4339). The ARQ layer then flips message_decoded=YES so the EXISTING native
+	// parse (arq_common.cc:7687-7800 + the responder routing) injects into messages_rx[
+	// loc] with ZERO new injection code — single-counting stats.nReceived_data, setting
+	// status=RECEIVED, and updating the SACK bitmap exactly like a native frame.
+	// [red-team F5] data_byte holds the RAW CIPHERTEXT slice on encrypted links — chase
+	// injects the raw slice; decrypt stays at batch reassembly (arq_common.cc:8414-8492),
+	// where the 128-bit Poly1305 tag is the end-to-end backstop.
+	//
+	// set_chase_candidates: read-only store of the still-missing-slot set (option c).
+	// Feeds chase_combine_inject's part-3 in-set check. n<=0 clears the set. Inert when
+	// chase is unused (the live consumer is the only caller; default-OFF).
+	static const int CHASE_CAND_MAX = CHASE_DEPTH;
+	int      chase_cand_slots[CHASE_CAND_MAX];   // the missing-slot candidate set (option c)
+	int      chase_cand_n;                       // valid length of chase_cand_slots
+	void     set_chase_candidates(const int* slots, int n);
+	// chase_combine_inject: run chase_try_combine against the stored candidate set on the
+	// live look's LLR; on a FULL accept (the I4 five-part gate + the in-set check), descramble
+	// + byte-pack the recovered K info bits into data_container.data_byte EXACTLY as the native
+	// success path (mirror :4321-4339) so the downstream native parse is byte-identical, set
+	// *accepted_slot to the decoded slot, and return the LDPC iteration count (>=0 accept).
+	// Returns -1 (data_byte UNTOUCHED, *accepted_slot=-1) when no candidate accepts OR chase is
+	// disabled — the caller then keeps message_decoded=NO (zero regression). live_llr =
+	// data_container.deinterleaved_data, n = ldpc.N.
+	int      chase_combine_inject(const float* live_llr, int n, int live_config,
+	                              int live_batch_seq_id, int* accepted_slot);
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.

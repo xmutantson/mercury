@@ -1470,6 +1470,42 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
 
+  // ---- CHASE COMBINING — I5 ARQ→PHY glue + slot-injection ------------------
+  // chase_recover_frame(): the live-path ARQ glue (design §4 I5; audit §2.3 hook (i)).
+  // Called after receive_byte() returns a DECODE FAIL when chase is enabled. It (1) builds
+  // the still-missing-slot candidate set from messages_rx[].status (current batch) +
+  // messages_rx_prev[].status (prev batch, gated by rsp_prev_batch_active — design §7.7
+  // prev-batch candidates included), (2) pushes it to PHY via set_chase_candidates and runs
+  // telecom_system->chase_combine_inject on the live look's LLR, and (3) on a PHY-accept,
+  // parses the recovered data_byte header (the SAME parse the native path uses), validates
+  // the decoded id ∈ the missing set (part 3) AND the decoded batch_seq_id == a live id
+  // (part 4) — and ONLY then flips received_message_stats.message_decoded=YES so the existing
+  // native parse (arq_common.cc:7687) injects into messages_rx[loc] byte-/state-identically
+  // (INV-CHASE-1). A recovery that lands OFF the missing set / on a wrong batch is DROPPED
+  // (message_decoded stays NO; no inject, no double-count). Returns true iff a recovery was
+  // accepted + injected-as-native. Guarded by telecom_system->chase_enabled — default-OFF →
+  // never called → production byte-identical. NO TX-side change (rotation deferred to I8).
+  bool chase_recover_frame();
+
+  // chase_build_missing_set(): the ONE source of truth for the still-missing-slot candidate
+  // set (option c) — used by chase_recover_frame (production) AND test_chase_slot_inject. Fills
+  // cand[0..n) with the slots in [0, data_batch_size) that are not RECEIVED/ACKED in
+  // messages_rx[] (current batch) UNION the still-missing messages_rx_prev[] slots when
+  // rsp_prev_batch_active (prev-batch candidates, design §7.7). Bounded to `max`. Returns n.
+  int  chase_build_missing_set(int* cand, int max) const;
+
+  // test_chase_slot_inject(): I5 failing-first synthetic-fire test (extends the
+  // test_partial_bsi_advance doctrine — pure state machine, NO DSP/timing). Primes a partial
+  // batch with one missing slot, injects a "chase-recovered" frame for that slot through the
+  // SAME native injection (add_message_rx_data) the live chase path uses, and asserts the slot
+  // flips RECEIVED, stats.nReceived_data SINGLE-increments, the SACK bitmap shows it filled,
+  // and bsi/batch accounting fire identically to a native frame. Prev-batch arm: a missing
+  // prev-batch slot is recoverable too. Negative arm: a chase-recovered frame for a slot NOT
+  // in the missing set is DROPPED (no double-count). FAIL-BEFORE proof via env
+  // CHASE_NOSLOTGATE=1 (test-only) which bypasses the I5 missing-set gate so the wrong-slot
+  // frame WOULD be injected. CLI: --test-chase-slot-inject. Returns 0=PASS, 1=FAIL.
+  int test_chase_slot_inject();
+
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
   //
