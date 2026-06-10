@@ -6918,6 +6918,32 @@ int cl_telecom_system::bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out
 	for(int c=0;c<cont_cols;c++)
 		for(int n=0;n<Ngrid;n++)
 			(ofdm.ofdm_frame+n*Nc+cont[c])->type = PILOT;
+	// APPROACH B — DENSE EDGE PILOTS (B-edgepilots). The TX applies pre_equalization_channel
+	// (band-edge boost up to ~4.78x at j=0/Nc-1, falling to ~1.6 mid-band — measured
+	// [PRE-EQ-COL]) and, with MERCURY_BIGBLOCK_FIR=1, the canceling FIR_tx1/FIR_tx2 band-limit
+	// that DISCIPLINES the wire level to a stock CFG16 frame. The RX must estimate the
+	// pre-eq*FIR effective channel from pilots; that response is STEEPLY CONVEX over the
+	// outermost ~6 subcarriers per edge (per-step Δ|H|: 0.49,0.41,0.35,0.29,0.25 at the low
+	// edge) and nearly flat mid-band. The thin grid's continuous columns sit AT the very edges
+	// (j=0, j=Nc-1) but the next pilot inward is a SCATTERED pilot present only 1 symbol in
+	// scat_dy=4, so most symbols linear-interpolate across the whole convex ramp -> biased H
+	// at j=1..2 / j=Nc-3..Nc-2 -> exactly ONE 32-QAM codeword (cw2) miscorrects (8/8->7/8).
+	// FIX: pin CONTINUOUS pilot columns in the steep edge band (edge_depth columns just inside
+	// each edge, every symbol) so grid_sparse2d_estimator's frequency interpolation only spans
+	// the GENTLE inner ramp. This is the standard pilot-density-at-the-band-edge remedy for a
+	// known-shaped (pre-eq) channel. Symmetric on both edges; TX and RX both rebuild from this
+	// one function so the grids stay bit-identical with no wire negotiation. Re-derived nData /
+	// nBits / pilot sequence below already key off the actual PILOT count, so K adapts.
+	int edge_depth = env_i("MERCURY_BIGBLOCK_EDGE_DEPTH", 2);
+	if(edge_depth < 0) edge_depth = 0;
+	if(edge_depth > Nc/2) edge_depth = Nc/2;
+	for(int d=1;d<=edge_depth;d++)
+	{
+		int jlo = d;            // just inside the low-frequency edge column (0)
+		int jhi = Nc-1-d;       // just inside the high-frequency edge column (Nc-1)
+		if(jlo < Nc) for(int n=0;n<Ngrid;n++) (ofdm.ofdm_frame+n*Nc+jlo)->type = PILOT;
+		if(jhi >= 0 && jhi != jlo) for(int n=0;n<Ngrid;n++) (ofdm.ofdm_frame+n*Nc+jhi)->type = PILOT;
+	}
 	if(scat_dx > 0 && scat_dy > 0)
 	{
 		for(int n=0;n<Ngrid;n++)
@@ -6950,6 +6976,12 @@ int cl_telecom_system::bigblock_rebuild_thin_grid(int& Ngrid_out, int& log2M_out
 	Ngrid_out  = Ngrid;
 	log2M_out  = (int)round(log2((double)M));
 	nBits_out  = ofdm.pilot_configurator.nData * log2M_out;
+	if(const char* e=std::getenv("MERCURY_BIGBLOCK_GRIDDUMP")){ if(*e&&atoi(e)){
+		int kfit = (ldpc.N>0)? nBits_out/ldpc.N : 0;
+		printf("[BB-GRID] edge_depth=%d Ngrid=%d Nc=%d np=%d nData=%d nBits=%d ldpcN=%d Kfit=%d\n",
+		       edge_depth, Ngrid, Nc, np, ofdm.pilot_configurator.nData, nBits_out, ldpc.N, kfit);
+		fflush(stdout);
+	}}
 	(void)Ngi;
 	return ofdm.pilot_configurator.nData;
 }
@@ -7498,6 +7530,37 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 			for(int i=0;i<ldpc.K;i++) if(dec[i]!=(*cw_info_ref)[c][i]){ ierr++; }
 		cw_ok_out[c] = (ierr==0) ? 1 : 0;
 		if(ierr==0) cw_ok++;
+		if(cw_info_ref && env_i("MERCURY_BIGBLOCK_CWMAP",0))
+			printf("[BB-CWMAP] cw=%d ierr=%d cells=[%d..%d)\n", c, ierr,
+			       (int)((long)c*ldpc.N/log2M), (int)(((long)(c+1)*ldpc.N)/log2M));
+	}
+	// CWMAP-2: per-codeword post-EQ EVM split into EDGE vs INTERIOR data cells, to localize
+	// the failing codeword's error energy in frequency. Data cells map sequentially across
+	// the block in (symbol,carrier) raster order; cw c owns deframed[c*320 .. (c+1)*320).
+	if(cw_info_ref && env_i("MERCURY_BIGBLOCK_CWMAP",0))
+	{
+		int edge_band = env_i("MERCURY_BIGBLOCK_CWMAP_EDGEBAND",6);
+		// build per-data-cell subcarrier index (deframer raster order, DATA cells only)
+		std::vector<int> cell_j; cell_j.reserve(nData);
+		for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+			if((ofdm.ofdm_frame+n*Nc+j)->type==DATA) cell_j.push_back(j);
+		for(int c=0;c<Kcw;c++)
+		{
+			double ee=0,ei=0; int ne=0,ni=0;
+			int cell0=(int)((long)c*ldpc.N/log2M), cell1=(int)(((long)(c+1)*ldpc.N)/log2M);
+			for(int d=cell0; d<cell1 && d<nData; d++)
+			{
+				std::complex<double> q=deframed[d];
+				std::complex<double> dec=psk.slice_nearest(q);
+				double e=std::norm(q-dec);
+				int jj=(d<(int)cell_j.size())?cell_j[d]:Nc/2;
+				bool edge=(jj<edge_band)||(jj>=Nc-edge_band);
+				if(edge){ ee+=e; ne++; } else { ei+=e; ni++; }
+			}
+			printf("[BB-CWEVM] cw=%d edgeEVM=%.4f(n=%d) intEVM=%.4f(n=%d)\n",
+			       c, ne?ee/ne:0.0, ne, ni?ei/ni:0.0, ni);
+		}
+		fflush(stdout);
 	}
 	K_out = Kcw;
 	return cw_ok;
@@ -9520,6 +9583,10 @@ void cl_telecom_system::get_pre_equalization_channel()
 			if(m > max_mag) max_mag = m;
 		}
 		printf("[PRE-EQ] Nc=%d min_mag=%.4f max_mag=%.4f\n", data_container.Nc, min_mag, max_mag);
+		if(const char* e=std::getenv("MERCURY_PREEQ_DUMP")){ if(*e&&atoi(e)){
+			for(int i=0;i<data_container.Nc;i++)
+				printf("[PRE-EQ-COL] j=%d mag=%.4f\n", i, std::abs(pre_equalization_channel[i].value));
+		}}
 		fflush(stdout);
 	}
 }

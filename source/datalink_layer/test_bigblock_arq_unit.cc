@@ -2259,6 +2259,37 @@ int cl_arq_controller::test_bigblock_txlevel()
 	       "POST-§18 big-block applies pre-eq + this TX_SIG_OFDM factor + FIR_tx1/2)\n", ofdm_gain);
 	fflush(stdout);
 
+	// === FIRDIAG: fast single-process tx_passband -> [FIR] -> rx_passband(cw_info_ref) ===
+	// Localizes the FIR-on decode failure WITHOUT the slow 2-instance sim. Set
+	// MERCURY_BIGBLOCK_FIRDIAG=1 to run, MERCURY_BIGBLOCK_FIR=1 to apply the canceling FIR
+	// (matches the live wire), and MERCURY_BIGBLOCK_CWMAP=1 to print per-cw error + edge/int EVM.
+	if(const char* fe=std::getenv("MERCURY_BIGBLOCK_FIRDIAG"); fe && *fe && atoi(fe))
+	{
+		ts->bigblock_framing_enabled = true;
+		int blkn = ts->bigblock_tx_total_samples();
+		std::vector<double> pb((size_t)((blkn>0)?blkn:1), 0.0);
+		int nout=0; std::vector<std::vector<int>> cw_info;
+		int K = ts->bigblock_tx_passband(pb.data(), nout, cw_info, nullptr);
+		bool fir = false; { const char* e=std::getenv("MERCURY_BIGBLOCK_FIR"); if(e&&*e&&atoi(e)) fir=true; }
+		if(fir && nout>0)
+		{
+			int pad = (preN + Nsymb) * Nofdm * interp;
+			int total_fir = pad + nout + pad;
+			std::vector<double> fin((size_t)total_fir,0.0), ft1((size_t)total_fir,0.0), ft2((size_t)total_fir,0.0);
+			for(int i=0;i<nout;i++) fin[(size_t)pad+i]=pb[(size_t)i];
+			int rep=(pad<nout)?pad:nout;
+			for(int i=0;i<rep;i++){ fin[(size_t)i]=pb[(size_t)i]; fin[(size_t)(pad+nout)+i]=pb[(size_t)(nout-rep)+i]; }
+			ts->ofdm.FIR_tx1.apply(fin.data(), ft1.data(), total_fir);
+			ts->ofdm.FIR_tx2.apply(ft1.data(), ft2.data(), total_fir);
+			for(int i=0;i<nout;i++) pb[(size_t)i]=ft2[(size_t)pad+i];
+		}
+		std::vector<int> info((size_t)K*ts->ldpc.K,0);
+		int K_out=0; std::vector<int> cw_ok_v; double acq=0.0;
+		int clean = ts->bigblock_rx_passband(pb.data(), nout, info.data(), K_out, cw_ok_v, &acq, &cw_info);
+		printf("[FIRDIAG] FIR=%d K=%d clean=%d/%d acq=%.4f\n", (int)fir, K, clean, K_out, acq);
+		fflush(stdout);
+	}
+
 	delete A; delete ts;
 	restore_env();
 	return 0;
