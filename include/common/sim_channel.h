@@ -534,10 +534,28 @@ private:
 // MODEL: per-acquisition static residual ~N(0,σ_cfo) plus a slow clamped random-
 // walk drift, applied as a continuous frequency shift of the REAL passband.
 // A real passband cannot be naive-multiplied by exp(j·θ); we form the analytic
-// signal with a stateful Type-III Hilbert FIR (the SAME proven construction as
-// cl_sim_phase_noise) and rotate: y[n] = Re{ (x_d + j·x_h)·e^{jφ[n]} } where
-// φ[n] is the continuous CFO phase accumulator. Power-preserving to the Hilbert
-// band edges, so the SNR3k axis is unchanged (CFO applied BEFORE AWGN in process()).
+// signal with a stateful Type-III Hilbert FIR and rotate:
+// y[n] = Re{ (x_d + j·x_h)·e^{jφ[n]} } where φ[n] is the continuous CFO phase
+// accumulator. The frequency shift is MAGNITUDE-PRESERVING across the OFDM band
+// (a true single-sideband translation), matching HW (fact-doc §3.1: HW per-pilot
+// magnitudes SURVIVE; only the per-symbol phases spread — the recoverable kind).
+//
+// FIDELITY (2026-06-07): the analytic transform MUST be band-flat across the FULL
+// OFDM occupancy (carrier 1500 Hz ± 1171.875 Hz = 328.125..2671.875 Hz @ fs=48k),
+// where the BAND-EDGE continual pilots sit (big-block carriers 0 & Nc-1, ~328 Hz
+// & ~2672 Hz). A Type-III Hilbert has a magnitude null at DC, so its lower
+// transition band MUST end well below 328 Hz or it attenuates the carrier-0 pilot
+// ∝ the rotation phase — an AMPLITUDE artifact no frequency correction can undo
+// (the original 65-tap Hamming Hilbert was 0.45 of full magnitude at 328 Hz →
+// pilraw 0.226→0.154 at chanCFO=8, fact-doc §11). The replacement is a 641-tap
+// Blackman-Harris Hilbert: |H|@328Hz = 0.99999, reaches 0.999 by 245 Hz (margin
+// below the 328 Hz edge), in-band ripple < 2e-5. A clean synthesized shift through
+// this transform preserves pilraw (0.226→~0.22), so the cfo=8 cell is now PURE
+// inter-symbol phase-spread = the genuine HW defect (recoverable by tracked AFC),
+// not a non-HW magnitude artifact. Power-preserving across the OFDM band, so the
+// SNR3k axis is unchanged (CFO applied BEFORE AWGN in process()). The longer FIR
+// adds a fixed bulk group delay (D=320 samples, ~6.7 ms) to the WHOLE stream —
+// a constant timing shift the head Schmidl-Cox acquisition absorbs.
 //
 // MAGNITUDE: σ_cfo ~ 5-20 Hz (the post-Moose residual band; Moose clamps ±93.75 Hz
 // WB but leaves a few-Hz residual). Default σ_cfo = 8 Hz static residual drawn
@@ -627,19 +645,36 @@ public:
 	}
 
 	bool enabled() const { return enabled_; }
+	// The per-acquisition drawn STATIC residual frequency (Hz) — for the ideal
+	// whole-buffer SSB shift (cl_sim_awgn::apply_ideal_cfo, fact-doc §13 fidelity fix).
+	double resid_hz() const { return resid_hz_; }
 
 private:
-	static const int HILB_LEN = 65;
+	// 641-tap Type-III Hilbert: band-flat (|H|>0.999) above ~245 Hz, so the OFDM
+	// band (328..2672 Hz) — including the band-edge continual pilots — is preserved
+	// in MAGNITUDE under the SSB frequency shift (fact-doc §11; see header comment).
+	static const int HILB_LEN = 641;
 	static const int DELAY    = (HILB_LEN - 1) / 2;
 	static const int HIST_LEN = HILB_LEN + 1;
 
 	void build_hilbert()
 	{
+		// Ideal antisymmetric Type-III Hilbert taps (odd k only) windowed by a
+		// 4-term Blackman-Harris window. BH (vs the prior 65-tap Hamming) + the
+		// longer length pushes the DC transition band below 245 Hz, leaving the
+		// OFDM band edges (≥328 Hz) at unit magnitude. Pure cosines (no Bessel),
+		// fully deterministic. htap_[k] is the half-kernel; process() uses the
+		// antisymmetry via c·(a−b).
+		const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
 		for (int k = 0; k <= DELAY; k++) htap_[k] = 0.0;
 		for (int k = 1; k <= DELAY; k += 2) {
 			double ideal = 2.0 / (M_PI * (double)k);
-			double w = 0.54 - 0.46 * std::cos(2.0 * M_PI * (double)(DELAY - k) /
-			                                  (double)(HILB_LEN - 1));
+			// Window sample index for tap at distance k from center:
+			//   n = DELAY - k  (mirrors the prior Hamming indexing).
+			double n  = (double)(DELAY - k);
+			double th = 2.0 * M_PI * n / (double)(HILB_LEN - 1);
+			double w  = a0 - a1 * std::cos(th) + a2 * std::cos(2.0 * th)
+			               - a3 * std::cos(3.0 * th);
 			htap_[k] = ideal * w;
 		}
 	}
@@ -932,7 +967,7 @@ public:
 		// AGC transient runs LAST of the deterministic stages (on a fresh burst's
 		// onset, after the signal shaping, before AWGN).
 		sfo_.process(x, n);   // [DOMINANT] sample-rate offset (drifting resample)
-		cfo_.process(x, n);   // secondary cross-frame carrier phase ramp
+		if(!cfo_disabled_) cfo_.process(x, n);   // secondary cross-frame carrier phase ramp
 
 		det_.apply(x, n);   // DETERMINISTIC freq-selective floor (dominant EVM/meanH)
 		pn_.rotate(x, n);   // small residual phase noise on top (near-but-not-zero sd)
@@ -964,6 +999,68 @@ public:
 		if (noise_std_ > 0.0)
 			for (size_t i = 0; i < n; i++)
 				x[i] += noise_std_ * rng_.gauss();
+	}
+
+	// IDEAL whole-buffer CFO: apply the injector's drawn STATIC residual frequency as a
+	// mathematically EXACT analytic (one-sided-FFT Hilbert) SSB shift over the WHOLE
+	// buffer at once. FREE of the streaming FIR-Hilbert's per-subcarrier phase artifact
+	// (the LSB-leakage / finite-FIR imperfection that adds a FIXED, CFO-magnitude-
+	// INDEPENDENT ~0.11 rad non-linear per-subcarrier phase distortion — diagnosed in
+	// fact-doc §13: within-symbol pilot phase residual flat at 0.109 rad for cfo_sigma
+	// 0.25..1.0). A real residual CFO is a clean SSB frequency shift (HW §3.1: pilot
+	// MAGNITUDES survive, only the per-symbol phase spreads) = EXACTLY this. The genuine
+	// off-bench arbiter uses it to test the RX's CFO tracking against a FAITHFUL
+	// impairment. Cross-frame WALK is NOT modeled here (use walk=0). Operates on a local
+	// pow2-padded copy; writes back ONLY the first n samples (caller's buffer length is
+	// preserved). No rng draw / no streaming-injector state change.
+	// Disable the streaming FIR CFO injector for subsequent process() calls (used after
+	// apply_ideal_cfo so the per-chunk AWGN/floor pass does NOT re-apply the FIR CFO).
+	void disable_streaming_cfo() { cfo_disabled_ = true; }
+
+	void apply_ideal_cfo(double* x, size_t n)
+	{
+		double cfo = cfo_.resid_hz();
+		if (cfo == 0.0 || n < 2) return;
+		size_t N = 1; while (N < n) N <<= 1;     // next pow2 (zero-pad into trailing silence)
+		std::vector<std::complex<double>> X(N, std::complex<double>(0,0));
+		for (size_t i = 0; i < n; i++) X[i] = std::complex<double>(x[i], 0.0);
+		sim_fft_inplace(X, false);               // forward FFT
+		size_t half = N / 2;                     // one-sided → analytic signal
+		for (size_t k = 1; k < half; k++)      X[k] *= 2.0;
+		for (size_t k = half + 1; k < N; k++)  X[k] = std::complex<double>(0,0);
+		sim_fft_inplace(X, true);                // inverse FFT → analytic xa
+		double w = 2.0 * M_PI * cfo / 48000.0;
+		for (size_t i = 0; i < n; i++) {
+			std::complex<double> r(std::cos(w * (double)i), std::sin(w * (double)i));
+			x[i] = std::real(X[i] * r);
+		}
+	}
+
+private:
+	// Radix-2 iterative FFT for apply_ideal_cfo (deterministic, no rng). a.size() must be
+	// a power of two on entry.
+	static void sim_fft_inplace(std::vector<std::complex<double>>& a, bool inverse)
+	{
+		size_t N = a.size();
+		for (size_t i = 1, j = 0; i < N; i++) {
+			size_t bit = N >> 1;
+			for (; j & bit; bit >>= 1) j ^= bit;
+			j ^= bit;
+			if (i < j) std::swap(a[i], a[j]);
+		}
+		for (size_t len = 2; len <= N; len <<= 1) {
+			double ang = 2.0 * M_PI / (double)len * (inverse ? 1.0 : -1.0);
+			std::complex<double> wlen(std::cos(ang), std::sin(ang));
+			for (size_t i = 0; i < N; i += len) {
+				std::complex<double> w(1, 0);
+				for (size_t k = 0; k < len / 2; k++) {
+					std::complex<double> u = a[i + k], v = a[i + k + len/2] * w;
+					a[i + k] = u + v; a[i + k + len/2] = u - v;
+					w *= wlen;
+				}
+			}
+		}
+		if (inverse) for (size_t i = 0; i < N; i++) a[i] /= (double)N;
 	}
 
 private:
@@ -1247,6 +1344,7 @@ private:
 	cl_sim_cfo         cfo_;
 	cl_sim_agc_transient agc_;
 	bool   clean_;
+	bool   cfo_disabled_ = false;   // set after apply_ideal_cfo (skip streaming FIR CFO)
 	bool   prev_silent_;
 	double snr_lin_;
 	double peak_ms_;

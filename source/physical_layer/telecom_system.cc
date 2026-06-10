@@ -25,6 +25,7 @@
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
 #include <chrono>
+#include <algorithm> // std::sort — bigblock pre-FFT AFC-track median smoother (Option C)
 #include <vector>  // suffix-FEC soft decode candidate buffers
 #include <cstdlib> // std::getenv / atoi for MERCURY_SIM2_MINI_NSYM (LEVER P MINI knob)
 #include <cstdint> // bigblock WAV I/O: uint32_t/int16_t
@@ -108,6 +109,7 @@ cl_telecom_system::cl_telecom_system()
 	ofdm_forced_delay=-1;
 	test_puncture_nBits=0;
 	last_coarse_freq_offset=0.0;
+	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 	ctrl_nBits=0;
 	ctrl_nsymb=0;
 	mfsk_ctrl_mode=false;
@@ -3169,6 +3171,13 @@ skip_h_retry_point:
 				{
 					receive_stats.freq_offset_of_last_decoded_message=freq_offset_measured;
 					receive_stats.freq_offset=freq_offset_measured;
+					// STALE-CFO scoped reset (long-run-degradation.md §2.2): a fresh
+					// OFDM decode succeeded, so the latched CFO is GOOD again — clear the
+					// consecutive-fail run that gates the poison-CFO scrub at function
+					// exit. On a healthy link this keeps the counter pinned at 0, so the
+					// scrub NEVER fires and the deliberate last-trial / MINI-preamble
+					// (LEVER P) / cfg=6 stickiness is fully preserved.
+					consecutive_ofdm_decode_fails = 0;
 				}
 
 				receive_stats.delay_of_last_decoded_message=receive_stats.delay;
@@ -3300,6 +3309,47 @@ skip_h_retry_point:
 				skip_h_count, time_sync_trials_max + 1,
 				receive_stats.delay, mean_H, pream_energy, data_energy);
 			fflush(stdout);
+		}
+
+		// STALE-CFO SCOPED RESET (long-run-degradation.md §2.2). We are inside the
+		// energy_ok block: a real OFDM preamble was DETECTED and the trial loop ran
+		// (silence / sub-threshold / weak-peak / no-preamble all returned earlier or
+		// skipped this block, so they are correctly EXCLUDED). If the OFDM decode
+		// still failed here, every fresh fine-sync trial failed and the :2510
+		// last-trial fallback mixed the NEXT acquisition at the stale
+		// freq_offset_of_last_decoded_message. That stale value is refreshed ONLY on
+		// success (:3179), so a run of these failures is exactly the poison-latch:
+		// the demod keeps mixing at a dead CFO and can never relock. Count the run;
+		// once it crosses STALE_CFO_RESET_FAILS, SCRUB the stale CFO + the companion
+		// coarse offset so the next acquisition re-measures from scratch.
+		//
+		// SCOPING (preserves the deliberate cfg=6 / LEVER-P stickiness):
+		//  - A SINGLE marginal/dropped frame does NOT trip it (threshold > 1), so the
+		//    last-trial reuse (:2510) and MINI-preamble reuse (:2536) still recover an
+		//    isolated loss by reusing the recent-good CFO.
+		//  - On a healthy link a decode succeeds and resets the counter to 0 (:3179),
+		//    so the scrub NEVER fires -> the session-long last_coarse_freq_offset
+		//    stickiness (arq_common.cc:3850-3854, the ~26% cfg=6 gain) is intact.
+		//  - It fires ONLY in the sustained-failure regime where the stale CFO is
+		//    provably poison, not a useful anchor. This is the cure for the long-run
+		//    WB-OFDM fall-off, scoped to a FAILED-sync run rather than a blanket
+		//    per-receive wipe.
+		if(M != MOD_MFSK && receive_stats.message_decoded != YES)
+		{
+			const int STALE_CFO_RESET_FAILS = 3;
+			consecutive_ofdm_decode_fails++;
+			if(consecutive_ofdm_decode_fails >= STALE_CFO_RESET_FAILS &&
+			   receive_stats.freq_offset_of_last_decoded_message != 0)
+			{
+				printf("[STALE-CFO] %d consecutive OFDM decode fails — scrubbing stale CFO (was %.4f Hz, coarse %.4f Hz) for fresh re-acquisition\n",
+					consecutive_ofdm_decode_fails,
+					receive_stats.freq_offset_of_last_decoded_message,
+					last_coarse_freq_offset);
+				fflush(stdout);
+				receive_stats.freq_offset_of_last_decoded_message = 0;
+				last_coarse_freq_offset = 0.0;
+				consecutive_ofdm_decode_fails = 0;  // armed again; one scrub per run
+			}
 		}
 
 		} // end if(energy_ok)
@@ -4803,6 +4853,7 @@ void cl_telecom_system::init()
 	receive_stats.message_decoded=NO;
 	receive_stats.SNR=-99.9;
 	receive_stats.signal_stregth_dbm=-999;
+	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 
 }
 
@@ -5830,6 +5881,18 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 {
 	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
 	bool wiener = (env_i("MERCURY_SFO_GRID_WIENER", 1) != 0);   // default Wiener time-smooth ON
+	// DDCE default OFF (env-overridable for A/B). NOTE 2026-06-07 (ddce_finalize): a blanket
+	// DDCE-default-ON was ATTEMPTED and REVERTED — it crosses the deterministic-floor 32-QAM
+	// cliff on the single-block chanest decode (phaseRMS 0.124->0.100, bytes_ok 0->1) but
+	// REGRESSES the clean-channel LIVE big-block path: --test-bigblock-multicw drops 8/8->7/8 +
+	// ARM-C byte-faithful->corrupt, and --test-bigblock-fullpath partial-block GATE-HANGS (the
+	// exactly-one-codeword-of-margin signature documented at arq_common.cc:4062-4067). The
+	// data-cell decision-EVM does NOT separate the helped case (single-block decode) from the
+	// hurt case (live 2-instance decode): BOTH run the always-on Schroeder floor at dataEVM
+	// ~0.0137-0.015, so DDCE's benefit is decode-PATH-dependent, not channel-dependent — no
+	// simple measured gate separates them. Conditional DDCE needs an estimator-design pass
+	// (per-codeword convergence-aware DDCE, or restricting it to bigblock_rx_passband and not
+	// the live receive_bigblock carve). Surfaced as path+cost; NOT shipped as a blind default.
 	bool ddce   = (env_i("MERCURY_SFO_GRID_DDCE",   0) != 0);
 	int  wlen   = env_i("MERCURY_SFO_GRID_WIENER_LEN", 5);      // moving-avg half-window (taps=2*L+1)
 
@@ -5850,42 +5913,170 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 			}
 	}
 
+	// (1b) PER-SYMBOL COMMON-PHASE (CPE) de-rotation from the CONTINUAL columns
+	//      (802.11 continual-pilot CPE; FreeDV-700D pilot-assisted-coherent). The
+	//      CONTINUAL carriers carry a pilot at EVERY symbol, so they DIRECTLY observe
+	//      the per-symbol common rotation the channel applies (residual CFO/SFO drift
+	//      + slow time-variation), the dominant un-tracked term: on the HW-faithful
+	//      vector the per-symbol common phase walks NON-LINEARLY by ~2.16 rad over the
+	//      block (measured [AFC-PILTHETA] resid_after_ramp), which the AFC tracker's
+	//      linear-ramp model and the sparse scattered TIME-interp (pilots every ~Dy
+	//      symbols) cannot follow. By measuring cpe[n] from the dense continual columns
+	//      and de-rotating the WHOLE pilot grid by it BEFORE interpolation, the
+	//      time/freq interpolation only has to track the SLOWLY-varying per-carrier
+	//      residual (which sparse pilots CAN follow); cpe[n] is then re-applied to the
+	//      final per-cell H so the published estimate carries the true per-symbol phase
+	//      the equalizer divides out. cpe[n] is referenced to EACH continual carrier's
+	//      OWN time-mean phase, so a static per-carrier channel phase is NOT folded into
+	//      the common term (only the time-VARYING common rotation is captured). On a
+	//      time-invariant channel (per-frame regime) cpe[n]≈0 ⇒ no-op (per-frame path
+	//      does not call this estimator anyway; see SS5 audit §16). MERCURY_SFO_GRID_CPE
+	//      default ON; needs ≥1 continual column (a carrier pilot-known at every symbol).
+	std::vector<double> cpe(NG, 0.0);
+	bool cpe_on = (env_i("MERCURY_SFO_GRID_CPE", 1) != 0);
+	if(cpe_on)
+	{
+		// continual carriers = those with a pilot at EVERY symbol
+		std::vector<int> ccols;
+		for(int j=0;j<NC;j++){ bool all=true;
+			for(int n=0;n<NG;n++) if(!known[(size_t)n*NC+j]){ all=false; break; }
+			if(all) ccols.push_back(j); }
+		if(!ccols.empty())
+		{
+			// per continual carrier, its time-mean H (the static reference phase)
+			std::vector<std::complex<double>> cref(ccols.size(), std::complex<double>(0,0));
+			for(size_t c=0;c<ccols.size();c++){ std::complex<double> a(0,0);
+				for(int n=0;n<NG;n++) a += H[(size_t)n*NC+ccols[c]];
+				cref[c] = a/(double)NG; }
+			// per symbol, common rotation = arg(Σ_c H[n,col_c]·conj(cref_c)) (the phasor
+			// rotating each continual carrier off its own time-mean, magnitude-weighted).
+			for(int n=0;n<NG;n++){
+				std::complex<double> acc(0,0);
+				for(size_t c=0;c<ccols.size();c++)
+					acc += H[(size_t)n*NC+ccols[c]] * std::conj(cref[c]);
+				cpe[n] = (std::abs(acc)>1e-18) ? std::arg(acc) : 0.0;
+			}
+			// de-rotate the whole RAW pilot grid by cpe[n] (interp now tracks only the
+			// slow per-carrier residual; cpe re-applied after step (3)).
+			for(int n=0;n<NG;n++){
+				std::complex<double> r = std::polar(1.0, -cpe[n]);
+				for(int j=0;j<NC;j++) if(known[(size_t)n*NC+j]) H[(size_t)n*NC+j] *= r;
+			}
+		}
+	}
+
 	// (2) TIME interpolation per carrier (symbol axis), then optional Wiener smooth.
+	//
+	// CRITICAL (fix/bigblock-chanest §17): interpolate AND smooth the TIME axis in
+	// POLAR form (magnitude + UNWRAPPED phase), mirroring step (3)'s frequency-axis
+	// polar interp. The block-fold defect was here: a slowly time-varying channel
+	// (det-floor dispersion + residual CFO/SFO walk) rotates each carrier's pilot
+	// phase across the 60-symbol block (measured genie col_phaseRMS = 0.83 rad on the
+	// HW-faithful vector). Complex-LINEAR time interpolation cuts a CHORD across that
+	// rotation (shrinking |H| and losing the ramp), and the complex moving-average
+	// Wiener smooth (±wlen) destructively AVERAGES the walking phasor — exactly the
+	// fold that drove mean|H| -> 0 and bytes_ok=0. Polar interp/smooth tracks the
+	// per-symbol phase ramp instead of folding it, so the per-cell H the equalizer
+	// divides by (out=in/H) captures each cell's TRUE per-symbol phase (the invariant
+	// channel_equalizer already assumes — SS5 audit §16). When the per-symbol step is
+	// small (the per-frame WB/NB regime: a re-acquired ~12-sym frame has negligible
+	// phase walk) polar == complex-linear to first order, so the shared per-frame path
+	// is preserved (A/B verified). Std two-1D scattered-pilot polar interpolation
+	// (Hoeher/Kaiser/Robertson 1997); per-symbol pilot phase tracking is the
+	// FreeDV-700D / 802.11 continual-pilot recipe.
+	bool time_polar = (env_i("MERCURY_SFO_GRID_TIME_POLAR", 1) != 0);   // default polar time axis ON
 	for(int j=0;j<NC;j++)
 	{
 		// collect this carrier's time-pilot symbol indices
 		std::vector<int> ts;
 		for(int n=0;n<NG;n++) if(known[(size_t)n*NC+j]) ts.push_back(n);
 		if(ts.empty()) continue;                      // no time samples — handled by (3)
-		// linear interpolate between consecutive time-pilots
+		// interpolate between consecutive time-pilots (polar: track the phase ramp)
 		for(size_t s=0;s+1<ts.size();s++)
 		{
 			int n0=ts[s], n1=ts[s+1];
 			std::complex<double> H0=H[(size_t)n0*NC+j], H1=H[(size_t)n1*NC+j];
-			for(int n=n0+1;n<n1;n++)
+			if(time_polar)
 			{
-				double t = (double)(n-n0)/(double)(n1-n0);
-				H[(size_t)n*NC+j] = H0*(1.0-t) + H1*t;
-				known[(size_t)n*NC+j] = 1;
+				double m0=std::abs(H0), m1=std::abs(H1);
+				double p0=std::arg(H0), p1=std::arg(H1);
+				double dp=p1-p0;                         // shortest-rotation unwrap
+				while(dp> M_PI) dp-=2.0*M_PI;
+				while(dp<-M_PI) dp+=2.0*M_PI;
+				for(int n=n0+1;n<n1;n++)
+				{
+					double t = (double)(n-n0)/(double)(n1-n0);
+					double m = m0*(1.0-t)+m1*t;
+					double p = p0+dp*t;
+					H[(size_t)n*NC+j] = std::polar(m,p);
+					known[(size_t)n*NC+j] = 1;
+				}
+			}
+			else
+			{
+				for(int n=n0+1;n<n1;n++)
+				{
+					double t = (double)(n-n0)/(double)(n1-n0);
+					H[(size_t)n*NC+j] = H0*(1.0-t) + H1*t;
+					known[(size_t)n*NC+j] = 1;
+				}
 			}
 		}
 		// edge hold (extrapolate flat past the first/last time-pilot)
 		for(int n=0;n<ts.front();n++){ H[(size_t)n*NC+j]=H[(size_t)ts.front()*NC+j]; known[(size_t)n*NC+j]=1; }
 		for(int n=ts.back()+1;n<NG;n++){ H[(size_t)n*NC+j]=H[(size_t)ts.back()*NC+j]; known[(size_t)n*NC+j]=1; }
 		// Wiener/MMSE time-smoother: short centered moving average over the now-dense
-		// column (suppresses pilot noise; on a time-invariant channel it is a near-
-		// optimal MMSE smoother since the true H is constant in n). Smooth ONLY columns
-		// that had ≥2 time-pilots (a single-pilot scattered carrier has nothing to
-		// average and would just blur the freq-interp seed).
-		if(wiener && ts.size()>=2 && wlen>0)
+		// column (suppresses pilot noise). Smooth ONLY columns that had ≥2 time-pilots
+		// (a single-pilot scattered carrier has nothing to average and would just blur
+		// the freq-interp seed). POLAR smooth (magnitude + UNWRAPPED phase separately):
+		// a complex moving-average of a per-symbol phase RAMP shrinks the magnitude and
+		// flattens the ramp (the §3.3/§9 "averaging a ramp is harmful" fold); smoothing
+		// the unwrapped phase preserves the ramp's slope while still suppressing pilot
+		// noise. On a time-INVARIANT channel (per-frame regime) the unwrapped phase is
+		// flat, so the polar smooth == the complex smooth (per-frame preserved).
+		//
+		// CONTINUAL columns (a pilot at EVERY symbol, ts.size()==NG) DIRECTLY observe the
+		// per-symbol channel phase — do NOT time-smooth them (§17 step 3): an 11-tap
+		// moving average over a 0.83-rad/60-sym ramp blurs the per-symbol CPE the decode
+		// needs. Smoothing is for noise suppression on the INTERPOLATED scattered columns
+		// (sparse time-pilots), where the interpolated phase is already a straight line
+		// that benefits from de-noising without losing a per-symbol observation. Gate via
+		// MERCURY_SFO_GRID_SMOOTH_CONT (default 0 = skip smoothing continual columns).
+		bool is_continual = ((int)ts.size() == NG);   // pilot at every symbol → continual
+		bool smooth_cont  = (env_i("MERCURY_SFO_GRID_SMOOTH_CONT", 0) != 0);
+		bool do_smooth    = wiener && ts.size()>=2 && wlen>0 && (!is_continual || smooth_cont);
+		if(do_smooth)
 		{
 			std::vector<std::complex<double>> col(NG);
 			for(int n=0;n<NG;n++) col[n]=H[(size_t)n*NC+j];
-			for(int n=0;n<NG;n++)
+			if(time_polar)
 			{
-				std::complex<double> acc(0,0); int cnt=0;
-				for(int w=n-wlen; w<=n+wlen; w++) if(w>=0&&w<NG){ acc+=col[w]; cnt++; }
-				if(cnt>0) H[(size_t)n*NC+j]=acc/(double)cnt;
+				// build a CONTIGUOUS unwrapped-phase track over the dense column
+				std::vector<double> mag(NG), ph(NG);
+				double acc_ph = std::arg(col[0]); mag[0]=std::abs(col[0]); ph[0]=acc_ph;
+				double prev = std::arg(col[0]);
+				for(int n=1;n<NG;n++){
+					double a=std::arg(col[n]); double d=a-prev;
+					while(d> M_PI) d-=2.0*M_PI;
+					while(d<-M_PI) d+=2.0*M_PI;
+					acc_ph += d; prev = a;
+					mag[n]=std::abs(col[n]); ph[n]=acc_ph;
+				}
+				for(int n=0;n<NG;n++)
+				{
+					double ms=0.0, ps=0.0; int cnt=0;
+					for(int w=n-wlen; w<=n+wlen; w++) if(w>=0&&w<NG){ ms+=mag[w]; ps+=ph[w]; cnt++; }
+					if(cnt>0) H[(size_t)n*NC+j]=std::polar(ms/(double)cnt, ps/(double)cnt);
+				}
+			}
+			else
+			{
+				for(int n=0;n<NG;n++)
+				{
+					std::complex<double> acc(0,0); int cnt=0;
+					for(int w=n-wlen; w<=n+wlen; w++) if(w>=0&&w<NG){ acc+=col[w]; cnt++; }
+					if(cnt>0) H[(size_t)n*NC+j]=acc/(double)cnt;
+				}
 			}
 		}
 	}
@@ -5942,6 +6133,19 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 		}
 		for(int j=0;j<ks.front();j++) H[(size_t)n*NC+j]=H[(size_t)n*NC+ks.front()];
 		for(int j=ks.back()+1;j<NC;j++) H[(size_t)n*NC+j]=H[(size_t)n*NC+ks.back()];
+	}
+
+	// (3b) RE-APPLY the per-symbol CPE removed at (1b): the interpolation tracked the
+	//      slow per-carrier residual on the common-phase-stabilized grid; re-rotating by
+	//      +cpe[n] restores the TRUE per-symbol channel phase into every cell so the
+	//      equalizer's out=in/H divides out the actual per-symbol rotation.
+	if(cpe_on)
+	{
+		for(int n=0;n<NG;n++){
+			if(cpe[n]==0.0) continue;
+			std::complex<double> r = std::polar(1.0, +cpe[n]);
+			for(int j=0;j<NC;j++) H[(size_t)n*NC+j] *= r;
+		}
 	}
 
 	// (4) DDCE (optional): one decision-directed refinement pass. Equalize data cells
@@ -6990,6 +7194,57 @@ static void bigblock_whiten_payload_bits(int* payload_bits, int nbits, unsigned 
 // wire negotiation.
 #define BIGBLOCK_WHITEN_SEED 0x5A3C96E1u
 
+// 1C — BIG-BLOCK TIME/FREQ SYMBOL INTERLEAVER (fact-doc §20; CW0_GAP_VERDICT amplifier D).
+// The big-block packs K LDPC codewords CODEWORD-CONTIGUOUSLY into the QAM-symbol stream
+// (bigblock_build_tx_bits: cw c == tx_bits[c*N..]; psk.mod then maps log2M bits/symbol so
+// cw c == a CONTIGUOUS run of ~N/log2M symbols), and ofdm.framer lays the symbol stream
+// into the grid in symbol-MAJOR DATA-cell raster order. So codeword c occupies a CONTIGUOUS
+// block of grid cells (~7 symbol-rows). A localized channel-estimate error (the deterministic
+// Schroeder all-pass per-cell phase curvature is worst in specific grid regions) therefore
+// piles CONTIGUOUS coded-bit errors into ONE codeword -> that codeword exceeds the LDPC's
+// error-correcting radius -> wire-CRC fail, even though the SAME number of errors SPREAD
+// across all K codewords would be cleared. The per-frame path already block-interleaves
+// (telecom_system.cc:304/352, block_size=nData/10); the big-block had NO interleaver. This
+// adds the SAME classic block (matrix-transpose) time/freq interleaver to the big-block TX
+// (after psk.mod, before framer) and the mirror deinterleaver to every big-block RX demap
+// (after deframer, before psk.demod; CSI weights deinterleaved identically — exactly the
+// per-frame pattern). It spreads each codeword's symbols across the WHOLE time x freq grid so
+// a localized estimate error diffuses across all K codewords. Block (de)interleaver refs:
+// Forney 1971; the existing Mercury per-frame interleaver (interleaver.cc). TX+RX symmetric;
+// the block size is derived from nData IDENTICALLY at TX and every RX site (below) so no wire
+// negotiation is needed. Default-OFF outside the big-block path (only these functions call it).
+//
+// Block size: consecutive symbols (one codeword's run) must land far apart after the transpose
+// so a contiguous bad region scatters across rows AND codewords. The transpose maps input
+// index i*B+j -> output j*nBlocks+i, so two consecutive inputs land nBlocks=nData/B cells apart.
+// Choosing B near K (the codeword count) gives nBlocks ~= symbols-per-codeword, tiling each
+// codeword's run across the full grid (set MERCURY_BIGBLOCK_TFILV=8/=K to enable). DEFAULT = 1
+// (identity / OFF) — see bigblock_tf_block_size below for the measured reason. A degenerate B
+// (<=1, or that does not divide into >1 block) falls back to identity, so the interleaver is a
+// safe no-op when disabled or when the geometry is too small.
+static int bigblock_tf_block_size(int nData)
+{
+	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
+	// DEFAULT = 1 (identity / OFF). MEASURED (fact-doc §20, --test-bigblock-chanest A/B): on
+	// the off-bench arbiter — whose failing mode is the DETERMINISTIC, spatially-SMOOTH
+	// Schroeder all-pass per-cell phase curvature (~0.10-0.19 rad), NOT a localized BURST —
+	// no non-identity B is a net win: B=8 REGRESSES the DDCE-recovered PASS-AFTER arm
+	// (bytes_ok 1->0), and B>=16 DEFEATS the FAIL-BEFORE regression-catcher (the DDCE-OFF arm
+	// starts decoding). The interleaver only helps when errors are CONCENTRATED in a contiguous
+	// region (CW0_GAP_VERDICT amplifier D, a BURSTY channel); the deterministic-floor sim has no
+	// such burst, so spreading does nothing and only disturbs DDCE's per-cell coherence. The
+	// REAL HW channel (HW §3.1: localized fades / impulse noise) IS bursty, so the interleaver is
+	// the correct mechanism THERE and is kept fully implemented + TX/RX-symmetric, gated by
+	// MERCURY_BIGBLOCK_TFILV for the HW bench A/B (set =8 or =K to enable). Shipping it ON by
+	// default would mask the off-bench gate (CLAUDE.md §2 / What-NOT) and is unvalidated on HW.
+	int B = env_i("MERCURY_BIGBLOCK_TFILV", 1);
+	if(B < 1) B = 1;
+	if(B > nData) B = nData;
+	// require at least 2 blocks for the transpose to actually spread; else identity.
+	if(nData / B < 2) B = 1;
+	return B;
+}
+
 static int bigblock_build_tx_bits(cl_ldpc& ldpc, int nBits, unsigned int seed, int kcap,
                                   std::vector<int>& tx_bits,
                                   std::vector<std::vector<int>>& cw_info,
@@ -7053,6 +7308,17 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	// freq-domain grid (data + pilots placed by the thin lattice).
 	std::vector<std::complex<double>> tx_syms(nData);
 	psk.mod(tx_bits.data(), nBits, tx_syms.data());
+	// 1C — time/freq symbol interleave: spread codeword-contiguous symbols across the whole
+	// grid (deinterleaved at every big-block RX demap; see bigblock_tf_block_size). NO-OP
+	// when B==1 (degenerate geometry). TX and RX derive B identically from nData.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> ilv(nData);
+			interleaver(tx_syms.data(), ilv.data(), nData, B);
+			tx_syms.swap(ilv);
+		}
+	}
 	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
 	ofdm.framer(tx_syms.data(), grid.data());
 
@@ -7179,6 +7445,9 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
                                             const std::vector<std::vector<int>>* cw_info_ref)
 {
 	K_out = 0;
+	// §19: reset the located-head stash (acq-fail leaves -1; the guard treats <0 as
+	// "no locatable block" and does NOT defer). Stamped from head_delay once acquired.
+	bigblock_last_rx_head_delay_samples = -1;
 	if(M == MOD_MFSK){ std::cout << "[BIGBLOCK] MFSK unsupported; use cfg 15/16." << std::endl; return 0; }
 	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
 
@@ -7211,17 +7480,44 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		                          &ofdm.FIR_rx_time_sync);
 		std::vector<std::complex<double>> bb_dec(Nofdm*buf_syms);
 		ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
+		// D3 EARLIEST-PREAMBLE EARLY-EXIT (fix/bigblock-d3-carve): the LIVE big-block ring
+		// can hold 2-3 CO-RESIDENT copies of the same one-shot block (the CMD re-emits when
+		// it gets no accepted SACK — trace_falselock §1). With early_exit=0 the Schmidl-Cox
+		// returned the GLOBAL energy-weighted argmax (ofdm.cc weighted=metric*(A2+R)), which
+		// false-locks the FRESHEST/LOUDEST LATER copy near the ring end whose body tail is
+		// FUTURE -> bb_at zero-pads the late codewords -> per-cw CRC-8 demote -> PARTIAL ->
+		// 0 delivered, AND defeats the §22 wait-for-tail recovery (each defer re-snapshots
+		// and re-false-locks a still-later copy, so the head DRIFTS FORWARD, HW 116664->
+		// 132932 — the "inverted §22"). earliest_relative=true makes the coarse SC return the
+		// EARLIEST position at >= 50% of the GLOBAL metric peak (the ORIGINAL block, always
+		// the earliest copy), so a later retransmission cannot shadow it. Now the §22 re-arm
+		// slides the SAME earliest block's tail in-range as designed (head moves EARLIER, not
+		// later). Env MERCURY_BIGBLOCK_EARLIEST=0 reverts to the global argmax for A/B.
+		bool earliest = (std::getenv("MERCURY_BIGBLOCK_EARLIEST")==NULL
+		                 || atoi(std::getenv("MERCURY_BIGBLOCK_EARLIEST"))!=0);
 		TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
-			bb_dec.data(), Nofdm*buf_syms, 1, 1, 0.0, pre_nSymb);
+			bb_dec.data(), Nofdm*buf_syms, 1, 1, earliest ? 0.5 : 0.0, pre_nSymb, earliest);
 		// MATCHED-FILTER SNAP: disambiguate the Schmidl-Cox plateau (±~half-symbol noise-
 		// fragile argmax) by snapping the coarse decimated pick to the preamble matched-
 		// filter peak within ±1 symbol. Sharp single peak at the true start; recovers the
 		// spurious-lobe flip the SC argmax suffers under AWGN. Env-disable for A/B.
 		bool mfsnap = (std::getenv("MERCURY_BIGBLOCK_MFSNAP")==NULL || atoi(std::getenv("MERCURY_BIGBLOCK_MFSNAP"))!=0);
 		long coarse_dec = coarse.delay;
+		// In earliest_relative mode the coarse SC returns the EARLIEST position whose
+		// normalized Schmidl-Cox metric crosses 50% of the global peak — which is the
+		// LEADING EDGE of the preamble plateau (the halfsym metric is ~1.0 across the
+		// WHOLE ~pre_nSymb-symbol preamble, MEASURED: a ~870-sample / ~2.8-symbol plateau
+		// 16214..17087 in the CFG16 K=8 SIM_INPROC acquisition, with the global argmax at
+		// the plateau's far end). The matched-filter snap must therefore search the FULL
+		// plateau width FORWARD of that leading edge to land on the true preamble start.
+		// Widen the MF-snap search to ±(pre_nSymb+1) symbols in earliest mode (covers the
+		// whole preamble plateau + 1 symbol margin); a co-resident retransmission copy is a
+		// FULL block_span (~64 symbols) away, so this window cannot reach it (no re-introduced
+		// false-lock). ±1 symbol when earliest mode is off (the global argmax sits AT the peak).
+		int mf_search_dec = earliest ? ((pre_nSymb+1)*Nofdm) : Nofdm;
 		if(mfsnap)
 			coarse_dec = bigblock_preamble_mf_snap(bb_dec.data(), Nofdm*buf_syms,
-			                                       coarse.delay, pre_nSymb, Nofdm, Nc, Nofdm);
+			                                       coarse.delay, pre_nSymb, Nofdm, Nc, mf_search_dec);
 		long coarse_full = (long)coarse_dec * interp;
 		if(mfsnap)
 		{
@@ -7249,6 +7545,11 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		std::cout << "[BIGBLOCK] RX acquisition FAILED (no preamble found)" << std::endl;
 		return 0;
 	}
+	// §19: stash the located head start (full-rate samples) so the ARQ window-position
+	// guard can test whether the FULL block (head + preamble + Ngrid) fit the captured
+	// window or whether its tail was zero-padded by bb_at (block landed too late / tail
+	// not yet in the ring at snapshot time -> defer one arming cycle, do not carve garbage).
+	bigblock_last_rx_head_delay_samples = head_delay;
 
 	// --- DEMOD: from the data start (head + preamble), rebuild the Ngrid grid. ---
 	long data_start0 = head_delay + (long)pre_nSymb*sym_samples;
@@ -7258,12 +7559,34 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	int margin_interp = margin_syms * sym_samples;
 	float power_normalization = sqrt((double)ofdm.Nfft);
 
-	auto demod_at = [&](long data_start, std::vector<std::complex<double>>& rx)
+	// PRE-FFT TRACKED-CFO de-rotation (attempt #3, Option C): an optional per-
+	// decimated-baseband-sample phase array. When supplied, demod_at de-rotates the
+	// (decimated, post-resampler) baseband block by exp(-j*phase[k]) BEFORE symbol_demod's
+	// FFT. Applied in the TIME domain pre-FFT, so a CONTINUOUS phase ramp (= a genuine
+	// frequency correction) removes BOTH the inter-symbol phase ramp AND the intra-symbol
+	// magnitude loss (the FFT of a frequency-offset signal smears bins; removing the offset
+	// pre-FFT eliminates the smear) — the two obstructions §9 proved a POST-FFT per-symbol
+	// phase fix cannot touch. phase[k] is built by the inter-symbol-increment tracker below.
+	// nullptr => byte-identical to the stock pre-fix demod (no de-rotation).
+	const std::vector<double>* cfo_track_phase = nullptr;
+	// bb_at: produce the decimated, power-normalized TIME-DOMAIN baseband block (Nofdm*Ngrid
+	// complex samples) for a window offset, with the optional pre-FFT CFO de-rotation already
+	// applied. Split out of demod_at so the tracked-CFO estimator (below) can read the time-
+	// domain samples (cyclic-prefix CFO estimate) before/without the FFT.
+	auto bb_at = [&](long data_start, std::vector<std::complex<double>>& dat_bb)
 	{
 		long ms = data_start - margin_interp;
 		int  mi = margin_interp;
 		if(ms < 0){ ms = 0; mi = (int)data_start; }
-		int slice_size = mi + span_interp;
+		// BB-1 (PIPELINE_AUDIT BB-1, rx-baseband D1): add the TRAILING FIR warm-up margin
+		// too, mirroring the per-frame reference (pb_end = extraction_delay + frame_size +
+		// fir_margin, :2480). Without it the FIR epilogue zero-pads/truncates the tail
+		// (~half_taps decimated samples) of the FINAL OFDM data symbol -> last codeword
+		// residual. The trailing read is bounds-guarded (src<rxpb.size() zero-pads) so a
+		// short rxpb just pads zeros into the margin, never the data span. The grid
+		// extraction below still starts at mdec=mi/interp for Nofdm*Ngrid samples, so the
+		// right margin only feeds the FIR lookahead — it does NOT shift the symbol grid.
+		int slice_size = mi + span_interp + margin_interp;
 		std::vector<double> dat_pb(slice_size, 0.0);
 		for(int i=0;i<slice_size;i++){
 			long src=ms+i; dat_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
@@ -7274,10 +7597,20 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		std::vector<std::complex<double>> dat_bb_full((size_t)(slice_size/interp) + 1);
 		int dec_total = slice_size / interp;
 		ofdm.rational_resampler(dat_bb_interp.data(), slice_size, dat_bb_full.data(), interp, DECIMATION);
-		std::vector<std::complex<double>> dat_bb(Nofdm*Ngrid);
+		dat_bb.assign((size_t)Nofdm*Ngrid, std::complex<double>(0,0));
 		int mdec = mi / interp;
 		for(int j=0;j<Nofdm*Ngrid && (mdec+j)<dec_total;j++) dat_bb[j] = dat_bb_full[mdec + j];
 		for(int j=0;j<Nofdm*Ngrid;j++) dat_bb[j] *= power_normalization;
+		// PRE-FFT time-domain de-rotation by the tracked CFO phase (Option C).
+		if(cfo_track_phase && (int)cfo_track_phase->size() == Nofdm*Ngrid)
+			for(int k=0;k<Nofdm*Ngrid;k++){
+				double ph = -(*cfo_track_phase)[k];
+				dat_bb[k] *= std::complex<double>(cos(ph), sin(ph)); }
+	};
+	auto demod_at = [&](long data_start, std::vector<std::complex<double>>& rx)
+	{
+		std::vector<std::complex<double>> dat_bb;
+		bb_at(data_start, dat_bb);
 		rx.assign((size_t)Ngrid*Nc, std::complex<double>(0,0));
 		for(int i=0;i<Ngrid;i++) ofdm.symbol_demod(&dat_bb[(size_t)i*Nofdm], &rx[(size_t)i*Nc]);
 	};
@@ -7327,6 +7660,179 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	else
 	{
 		demod_at(data_start, rx);
+	}
+
+	// ============================================================================
+	// PRE-FFT TRACKED-CFO AFC (attempt #3, Option C) — the principled fix.
+	// ----------------------------------------------------------------------------
+	// The big-block RX does ONE head Schmidl-Cox TIMING acquire and (pre-fix) NO carrier-
+	// frequency correction, so a residual CFO ramps a multi-cycle phasor across the ~1.56 s
+	// block; the block-wide pilot estimate destructively integrates it → mean|H| → 0 → LDPC
+	// decodes noise (fact-doc §3). The per-frame receive_byte path is immune because it re-
+	// runs Moose every ~12-symbol frame and re-mixes in the TIME domain (telecom_system.cc
+	// :2546 / :2645). This block mirrors that recipe WITHIN the big block, with NO TX change:
+	//
+	//   (1) PER-SYMBOL CYCLIC-PREFIX CFO (van de Beek 1997). Each OFDM symbol's guard interval
+	//       (CP) is a copy of the symbol's LAST Ngi samples (gi_adder: out[j]=in[j+Nfft-Ngi]).
+	//       Under a residual CFO δ the CP and its body copy differ in phase by 2π·δ·Nfft/fs.
+	//       C[n] = Σ_{i<Ngi} y[n,i]·conj(y[n, Nfft+i]); δ[n] = arg(C[n])·fs/(2π·Nfft). FULL-BAND,
+	//       NO pilot dependency, high-SNR (Ngi×Nc carriers' energy), unambiguous to ±fs/(2·Nfft)
+	//       ≈ ±23 Hz (WB) — covers the post-Moose residual band. This is a TIME-DOMAIN, per-
+	//       symbol, INSTANTANEOUS-frequency estimate: exactly what tracks the drift, and exactly
+	//       what neither refuted attempt had (attempt #2 was post-FFT 2-band-edge-pilot phase).
+	//   (2) HEAD Moose seeds/sanity-bounds δ and resolves the (mild) CP wrap ambiguity.
+	//   (3) Median-smooth δ[n] (the drift is band-limited; rejects per-symbol jitter), INTEGRATE
+	//       to a CONTINUOUS per-decimated-sample phase (a true frequency ramp, piecewise-constant
+	//       rate per symbol), and RE-DEMOD with that phase removed PRE-FFT in the TIME domain.
+	//       Pre-FFT + continuous tracked ramp removes BOTH the inter-symbol phase ramp AND the
+	//       intra-symbol magnitude loss (the two §9 obstructions a post-FFT fix cannot touch).
+	//
+	// Refs: van de Beek/Sandell/Börjesson 1997 (10.1109/78.611811, ML CP-based CFO/timing for
+	// OFDM); Moose 1994 (10.1109/26.328961); Speth et al. 2001 (10.1109/26.917759). Env
+	// MERCURY_BIGBLOCK_AFCTRACK (default 1) toggles for A/B; =0 ⇒ stock path. Confined to
+	// bigblock_rx_passband (dormant default-off bigblock_framing_enabled); the per-frame path is
+	// untouched. §8 audit: only the PHASE of the time-domain block fed to the unchanged FFT/
+	// estimators changes — no pilot.sequence / per-frame / consumer-invariant change.
+	// ============================================================================
+	std::vector<double> afc_phase;  // owns the storage cfo_track_phase points at
+	if(env_i("MERCURY_BIGBLOCK_AFCTRACK", 1) != 0 && Ngrid >= 3)
+	{
+		// Decimated baseband sample rate and the per-symbol period in those samples.
+		double fs_base = (interp > 0) ? (sampling_frequency / (double)interp) : sampling_frequency;
+		double Tsym    = (fs_base > 0.0) ? ((double)Nofdm / fs_base) : 0.0;  // seconds
+
+		// (1) HEAD Moose: residual CFO at block start (seeds δf[0]). Same estimator the per-
+		// frame path uses; the head preamble lives at [head_delay .. data_start0) full-rate.
+		double cfo0_hz = 0.0;
+		{
+			long pre_start = data_start - (long)pre_nSymb*sym_samples;  // preamble start (full rate)
+			if(pre_start < 0) pre_start = 0;
+			int pre_slice = (pre_nSymb + 1) * sym_samples;
+			std::vector<double> pre_pb(pre_slice, 0.0);
+			for(int i=0;i<pre_slice;i++){ long src=pre_start+i;
+				pre_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
+			std::vector<std::complex<double>> pre_bb_i(pre_slice);
+			ofdm.passband_to_baseband(pre_pb.data(), pre_slice, pre_bb_i.data(),
+			                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+			                          &ofdm.FIR_rx_data, (int)pre_start);
+			std::vector<std::complex<double>> pre_bb((size_t)(pre_slice/interp) + 1);
+			ofdm.rational_resampler(pre_bb_i.data(), pre_slice, pre_bb.data(), interp, DECIMATION);
+			// carrier_sampling_frequency_sync expects in = &baseband[Ngi] (skip the GI).
+			if((int)pre_bb.size() > Ngi + pre_nSymb*Nofdm)
+				cfo0_hz = ofdm.carrier_sampling_frequency_sync(
+					&pre_bb[Ngi], bandwidth/(double)ofdm.Nc, pre_nSymb, sampling_frequency);
+			// Sanity clamp (mirror the per-frame ±1-subcarrier clamp at :2606-2608).
+			double clamp = bandwidth / (double)ofdm.Nc;
+			if(cfo0_hz >  clamp) cfo0_hz =  clamp;
+			if(cfo0_hz < -clamp) cfo0_hz = -clamp;
+		}
+
+		bool diag = (env_i("MERCURY_BIGBLOCK_AFC_DIAG",0) != 0);
+		bool stage2_on = (env_i("MERCURY_BIGBLOCK_AFC_STAGE2", 1) != 0);
+
+		// (2) STAGE 1 — remove the BULK residual with the ACCURATE head Moose (a constant pre-FFT
+		// frequency shift, the same recipe the per-frame path uses). Proven accurate (the recovery
+		// peak coincides with the head-Moose value); shrinks the residual so the continual-pilot
+		// common phase is small + unwraps cleanly for Stage 2.
+		std::vector<double> dfs(Ngrid, cfo0_hz);
+		afc_phase.assign((size_t)Nofdm*Ngrid, 0.0);
+		auto build_and_demod = [&](double acc0){
+			afc_phase.assign((size_t)Nofdm*Ngrid, 0.0);
+			double acc = acc0;
+			for(int n=0;n<Ngrid;n++){
+				double step = (fs_base>0.0) ? (2.0*M_PI*dfs[n]/fs_base) : 0.0;
+				for(int s=0;s<Nofdm;s++){ afc_phase[(size_t)n*Nofdm+s] = acc; acc += step; }
+			}
+			cfo_track_phase = &afc_phase; demod_at(data_start, rx); cfo_track_phase = nullptr;
+		};
+		build_and_demod(0.0);   // rx now Stage-1-corrected (~residual-drift only)
+
+		// (3) STAGE 2 — track the residual DRIFT from the continual pilots' CUMULATIVE common
+		// phase ψ[n]=arg(Σ_{continual j} rx[n,j]·conj(X[n,j])). After Stage 1 ψ is small/slow, so
+		// it UNWRAPS cleanly (the §9 aliasing was on the LARGE un-corrected ramp). Convert the
+		// SMOOTHED ψ to a per-symbol residual frequency (its derivative) and ADD to Stage-1; re-
+		// demod once. dfs then carries Stage1 + Stage2 = the total tracked CFO(t).
+		std::vector<int> cont_cols;
+		for(int j=0;j<Nc;j++){ bool all=true;
+			for(int n=0;n<Ngrid;n++) if((ofdm.ofdm_frame+n*Nc+j)->type!=PILOT){ all=false; break; }
+			if(all) cont_cols.push_back(j); }
+		double psi0=0.0;
+		if(stage2_on && !cont_cols.empty())
+		{
+			std::vector<std::complex<double>> P(Ngrid, std::complex<double>(0,0));
+			{ int pidx=0; for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+				if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+					std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++];
+					for(int c:cont_cols) if(c==j){ P[n]+=rx[(size_t)n*Nc+j]*std::conj(X); break; } } }
+			std::vector<double> psi(Ngrid,0.0); double prev=0.0; bool hp=false;
+			for(int n=0;n<Ngrid;n++){
+				if(std::abs(P[n])<1e-18){ psi[n]=hp?prev:0.0; continue; }
+				double a=atan2(P[n].imag(),P[n].real());
+				if(hp){ while(a-prev> M_PI)a-=2.0*M_PI; while(a-prev<-M_PI)a+=2.0*M_PI; }
+				psi[n]=a; prev=a; hp=true;
+			}
+			int sw = env_i("MERCURY_BIGBLOCK_AFC_WIN", 9); if(sw<1) sw=1;
+			std::vector<double> psis(Ngrid,0.0);
+			for(int n=0;n<Ngrid;n++){ double s=0; int c=0;
+				for(int w=n-sw/2; w<=n+sw/2; w++) if(w>=0&&w<Ngrid){ s+=psi[w]; c++; }
+				psis[n]= c? s/c : psi[n]; }
+			psi0 = psis[0];
+			for(int n=0;n<Ngrid;n++){
+				double dpsi = (n==0)?(psis[1]-psis[0]) : (n==Ngrid-1)?(psis[Ngrid-1]-psis[Ngrid-2])
+				                                                     : 0.5*(psis[n+1]-psis[n-1]);
+				dfs[n] += (Tsym>0.0) ? (dpsi/(2.0*M_PI*Tsym)) : 0.0;   // Stage1 + Stage2(drift)
+			}
+			build_and_demod(psi0);  // start phase = ψ[0] removes the residual common-phase offset too
+		}
+
+		if(diag){
+			double mn=1e9,mx=-1e9,mean=0; for(int n=0;n<Ngrid;n++){ mean+=dfs[n]; if(dfs[n]<mn)mn=dfs[n]; if(dfs[n]>mx)mx=dfs[n]; } mean/=(Ngrid>0?Ngrid:1);
+			std::cout << "[AFC-TRACK] head_cfo=" << cfo0_hz << " cont_cols=" << cont_cols.size()
+			          << " dfs[" << mn << ".." << mx << "] mean=" << mean << " psi0=" << psi0
+			          << " Tsym=" << Tsym << "s | fs_base=" << fs_base
+			          << " Nfft=" << Nfft << " Ngi=" << Ngi << " Nofdm=" << Nofdm << std::endl;
+			// GROUND-TRUTH residual per-symbol common phase from ALL known pilots on the
+			// AFC-corrected rx (this is what a post-FFT CPE corrector would see/remove).
+			// Per symbol n: theta[n]=arg(Σ_pilots rx[n,j]·conj(X)). Unwrap, report span +
+			// RMS of the residual AFTER removing a best-fit linear ramp (= what's left for
+			// a per-symbol CPE corrector to chase that a constant CFO cannot).
+			std::vector<double> th(Ngrid,0.0); { int pidx=0; double prev=0; bool hp=false;
+			  for(int n=0;n<Ngrid;n++){ std::complex<double> acc(0,0);
+			    for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+			      std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++]; acc+=rx[(size_t)n*Nc+j]*std::conj(X); }
+			    double a=(std::abs(acc)>1e-18)?atan2(acc.imag(),acc.real()):(hp?prev:0.0);
+			    if(hp){ while(a-prev>M_PI)a-=2*M_PI; while(a-prev<-M_PI)a+=2*M_PI; } th[n]=a; prev=a; hp=true; } }
+			double thmn=1e9,thmx=-1e9; for(int n=0;n<Ngrid;n++){ if(th[n]<thmn)thmn=th[n]; if(th[n]>thmx)thmx=th[n]; }
+			// best-fit linear ramp residual RMS
+			double Sx=0,Sy=0,Sxx=0,Sxy=0; for(int n=0;n<Ngrid;n++){ Sx+=n; Sy+=th[n]; Sxx+=(double)n*n; Sxy+=(double)n*th[n]; }
+			double den=Ngrid*Sxx-Sx*Sx, sl=0,ic=0; if(fabs(den)>1e-12){ sl=(Ngrid*Sxy-Sx*Sy)/den; ic=(Sy-sl*Sx)/Ngrid; }
+			double rr=0; for(int n=0;n<Ngrid;n++){ double r=th[n]-(ic+sl*n); rr+=r*r; } rr=sqrt(rr/(Ngrid>0?Ngrid:1));
+			std::cout << "[AFC-PILTHETA] theta_span[" << thmn << ".." << thmx << "] slope=" << sl
+			          << " rad/sym  resid_after_ramp_RMS=" << rr << " rad" << std::endl;
+			// WITHIN-SYMBOL pilot phase spread: per symbol, the RMS deviation of each pilot's
+			// phase from that symbol's mean pilot phase. SMALL ⇒ residual is a per-symbol COMMON
+			// phase (CPE-fixable). LARGE ⇒ residual is per-subcarrier (ICI / estimate phase err,
+			// NOT removable by a per-symbol CPE). Averaged over symbols.
+			{ int pidx2=0; double wsum=0; double rsum=0; int wn=0;
+			  for(int n=0;n<Ngrid;n++){ std::vector<double> ph, kk; double cmean=th[n];
+			    for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){
+			      std::complex<double> X=ofdm.pilot_configurator.sequence[pidx2++];
+			      std::complex<double> r=rx[(size_t)n*Nc+j]/X;
+			      double p=atan2(r.imag(),r.real()); double d=p-cmean; while(d>M_PI)d-=2*M_PI; while(d<-M_PI)d+=2*M_PI;
+			      ph.push_back(cmean+d); kk.push_back((double)j); }
+			    if(ph.size()>=2){ double s=0; for(double p:ph){ double d=p-cmean; s+=d*d; }
+			      wsum+=sqrt(s/ph.size());
+			      // per-symbol linear fit phi = a + b*k; residual RMS = the NON-linear part
+			      // (NOT removable by a per-symbol CPE+slope corrector = ICI/selectivity).
+			      double Sx=0,Sy=0,Sxx=0,Sxy=0; int m=ph.size();
+			      for(int t=0;t<m;t++){ Sx+=kk[t]; Sy+=ph[t]; Sxx+=kk[t]*kk[t]; Sxy+=kk[t]*ph[t]; }
+			      double dn=m*Sxx-Sx*Sx, b=0,a=0; if(fabs(dn)>1e-12){ b=(m*Sxy-Sx*Sy)/dn; a=(Sy-b*Sx)/m; }
+			      double rs=0; for(int t=0;t<m;t++){ double e=ph[t]-(a+b*kk[t]); rs+=e*e; } rsum+=sqrt(rs/m);
+			      wn++; } }
+			  std::cout << "[AFC-WITHINSYM] mean within-symbol pilot phase RMS=" << (wn?wsum/wn:-1.0)
+			            << " rad | residual_after_per-sym_LINEAR_fit=" << (wn?rsum/wn:-1.0)
+			            << " rad (small=fixable by CPE+slope, large=ICI/selectivity)" << std::endl; }
+		}
 	}
 
 	// --- CPE/PEG residual-timing de-rotation (STEP-2 tracker) --------
@@ -7418,6 +7924,39 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	std::vector<std::complex<double>> deframed(nData);
 	ofdm.deframer(eq.data(), deframed.data());
 
+	// 1C — time/freq symbol DE-interleave: invert the TX interleaver (bigblock_tx_passband)
+	// so the QAM-symbol stream is back in codeword-contiguous order before psk.demod, and
+	// deinterleave the per-cell CSI |H|^2 the SAME way so each symbol's reliability weight
+	// follows its symbol (exactly the per-frame pattern, telecom_system.cc:2936/2940). The
+	// estimate/equalize/nv all ran in GRID order above (unchanged); only the demap order is
+	// restored here. NO-OP when B==1. The DIAG blocks below read eq/rx in GRID order, so they
+	// remain valid measurements of the (still grid-ordered) channel.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> dil(nData);
+			deinterleaver(deframed.data(), dil.data(), nData, B);
+			deframed.swap(dil);
+			// CSI is std::vector<double> (no free deinterleaver overload); apply the SAME
+			// block-transpose inverse inline (matches deinterleaver() in interleaver.cc).
+			std::vector<double> cil(nData);
+			int nBlocks = nData / B;
+			for(int i=0;i<nBlocks;i++)
+				for(int j=0;j<B;j++)
+					cil[(size_t)i*B+j] = csi_data[(size_t)j*nBlocks+i];
+			for(int i=nBlocks*B;i<nData;i++) cil[i] = csi_data[i];
+			csi_data.swap(cil);
+		}
+	}
+
+	// CHANNEL-ESTIMATION HEALTH stash (fix/bigblock-chanest): always-on mean|H| over the
+	// estimated channel grid so the genuine 2-instance regression can assert the estimate
+	// did not collapse (the DIAG print below is env-gated; this stash is unconditional).
+	{
+		double hmag=0.0; for(int ci=0;ci<Ngrid*Nc;ci++) hmag+=std::abs((ofdm.estimated_channel+ci)->value);
+		bigblock_last_rx_meanh = (Ngrid*Nc>0) ? hmag/(double)(Ngrid*Nc) : -1.0;
+	}
+
 	// [DIAG-RXPB] instrument nv, mean|H|, post-EQ deframed constellation RMS.
 	if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))
 	{
@@ -7428,12 +7967,105 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		double pilraw=0.0; int pidx=0,np=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT){ std::complex<double> X=ofdm.pilot_configurator.sequence[pidx++]; pilraw+=std::abs(rx[(size_t)n*Nc+j]/X); np++; } pilraw/=(np>0?np:1);
 		double crms=0.0; for(int d=0;d<nData;d++) crms+=std::norm(deframed[d]); crms=sqrt(crms/(nData>0?nData:1));
 		double rxrms=0.0; int dn=0; for(int n=0;n<Ngrid;n++)for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ rxrms+=std::norm(rx[(size_t)n*Nc+j]); dn++; } rxrms=sqrt(rxrms/(dn>0?dn:1));
+		// DECISION-DIRECTED post-EQ EVM + per-symbol-row residual common phase.
+		// slice each equalized DATA cell to the nearest 32-QAM point, accumulate the
+		// residual vector (y - ŷ) for EVM and the residual common phase arg(Σ y·conj(ŷ))
+		// per symbol-row n. If Option C left a per-row CPE that the block-avg H cannot
+		// remove, the per-row phases SPREAD even when mean|H| looks healthy.
+		double evm_num=0.0, evm_den=0.0; int evcnt=0;
+		double cpe_min=1e9, cpe_max=-1e9, cpe_abs_sum=0.0; int cpe_rows=0;
+		for(int n=0;n<Ngrid;n++){
+			std::complex<double> rowacc(0,0); int rown=0;
+			for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> y = eq[(size_t)n*Nc+j];
+				if(std::abs(y)<1e-12) continue;          // skip erased cells
+				std::complex<double> yhat = psk.slice_nearest(y);
+				std::complex<double> e = y - yhat;
+				evm_num += std::norm(e); evm_den += std::norm(yhat); evcnt++;
+				rowacc += y*std::conj(yhat); rown++;
+			}
+			if(rown>0){ double ph=atan2(rowacc.imag(),rowacc.real());
+				if(ph<cpe_min)cpe_min=ph; if(ph>cpe_max)cpe_max=ph; cpe_abs_sum+=fabs(ph); cpe_rows++; }
+		}
+		double evm = (evm_den>0.0)? sqrt(evm_num/evm_den) : -1.0;
+		double cpe_mean_abs = (cpe_rows>0)? cpe_abs_sum/cpe_rows : 0.0;
+		// GENIE decomposition: per DATA cell, the true channel H_g = rx / (ŷ·cscale),
+		// where ŷ is the sliced constellation point and cscale maps the unit-power
+		// constellation to the rx scale (cscale = pilot Hbar magnitude proxy). Decompose
+		// the equalizer error into (i) intra-column TIME variation of H_g (residual
+		// ICI/SFO/CFO the per-cell estimate cannot be constant against) vs (ii) the
+		// estimate's per-cell bias. csi_data already holds |H_est|^2 in deframed order.
+		{
+			// constellation rx-scale: mean |rx_data| / mean |ŷ| (decision-directed)
+			double sr=0.0, sy=0.0; int sc=0;
+			std::vector<std::complex<double>> Hg((size_t)Ngrid*Nc, std::complex<double>(0,0));
+			std::vector<char> Hg_ok((size_t)Ngrid*Nc, 0);
+			for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> y = eq[(size_t)n*Nc+j]; if(std::abs(y)<1e-12) continue;
+				std::complex<double> yhat = psk.slice_nearest(y);
+				sr += std::abs(rx[(size_t)n*Nc+j]); sy += std::abs(yhat); sc++;
+			}
+			double cscale = (sy>0.0)? sr/sy : 1.0;
+			for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				std::complex<double> y = eq[(size_t)n*Nc+j]; if(std::abs(y)<1e-12) continue;
+				std::complex<double> yhat = psk.slice_nearest(y);
+				std::complex<double> Xs = yhat*cscale;
+				if(std::abs(Xs)>1e-12){ Hg[(size_t)n*Nc+j]=rx[(size_t)n*Nc+j]/Xs; Hg_ok[(size_t)n*Nc+j]=1; }
+			}
+			// intra-column TIME variation of the genie channel (std/mean of |Hg| per column,
+			// and the per-column phase spread) — averaged over data columns.
+			double col_magcv_sum=0.0, col_phspread_sum=0.0; int col_n=0;
+			for(int j=0;j<Nc;j++){
+				bool isdata=false; for(int n=0;n<Ngrid;n++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ isdata=true; break; }
+				if(!isdata) continue;
+				std::complex<double> macc(0,0); double m1=0,m2=0; int cn=0; double pmin=1e9,pmax=-1e9;
+				for(int n=0;n<Ngrid;n++){ size_t id=(size_t)n*Nc+j; if(!Hg_ok[id]) continue;
+					double mag=std::abs(Hg[id]); m1+=mag; m2+=mag*mag; macc+=Hg[id]; cn++; }
+				if(cn>=4){ double mean=m1/cn; double var=m2/cn-mean*mean; if(var<0)var=0;
+					double cv=(mean>1e-9)?sqrt(var)/mean:0.0;
+					// per-column residual phase spread: derotate by column-mean phase, measure RMS
+					double cmph=atan2(macc.imag(),macc.real()); double ps=0; int pc=0;
+					for(int n=0;n<Ngrid;n++){ size_t id=(size_t)n*Nc+j; if(!Hg_ok[id]) continue;
+						double d=atan2(Hg[id].imag(),Hg[id].real())-cmph;
+						while(d>M_PI)d-=2*M_PI; while(d<-M_PI)d+=2*M_PI; ps+=d*d; pc++; }
+					double phrms=(pc>0)?sqrt(ps/pc):0.0;
+					col_magcv_sum+=cv; col_phspread_sum+=phrms; col_n++; }
+			}
+			double col_magcv = (col_n>0)? col_magcv_sum/col_n : -1.0;
+			double col_phrms = (col_n>0)? col_phspread_sum/col_n : -1.0;
+			// ESTIMATE-vs-GENIE per-DATA-cell phase error: how well the PUBLISHED estimate
+			// H_est tracks the TRUE channel H_g. phase err = arg(H_g·conj(H_est)). This is
+			// the DECISIVE estimator-accuracy metric and the §18 block localizer: clean
+			// ~0.034 rad (estimate≈truth) vs the HW-faithful vector ~0.21 rad (the estimate
+			// undersamples the per-cell non-linear time-walk at the 6-8% lattice) — above the
+			// 32-QAM ~0.1-rad EVM cliff, which is why bytes_ok stays 0 even after the polar
+			// time-axis magnitude-fold fix recovers mean|H|. DIAG-ONLY (env-gated print);
+			// no production behavior change. magRMS carries a decision-directed cscale
+			// offset (genie reconstructs on a unit-power constellation scale) so it is NOT a
+			// real-error metric — read the PHASE only.
+			double estg_ph2=0.0; int estg_n=0;
+			for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++) if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){
+				size_t id=(size_t)n*Nc+j; if(!Hg_ok[id]) continue;
+				std::complex<double> He=(ofdm.estimated_channel+id)->value;
+				if(std::abs(He)<1e-12) continue;
+				double dph=std::arg(Hg[id]*std::conj(He));
+				while(dph>M_PI)dph-=2*M_PI; while(dph<-M_PI)dph+=2*M_PI;
+				estg_ph2+=dph*dph; estg_n++;
+			}
+			double estg_phrms=(estg_n>0)?sqrt(estg_ph2/estg_n):-1.0;
+			std::cout << "[DIAG-GENIE] cscale=" << cscale
+			          << " col_magCV=" << col_magcv << " col_phaseRMS=" << col_phrms
+			          << " est_vs_genie_phaseRMS=" << estg_phrms
+			          << " (data cols=" << col_n << ", n=" << estg_n << ")" << std::endl;
+		}
 		std::cout << "[DIAG-RXPB] nv=" << ofdm.noise_variance_estimate
 		          << " mean|H|=" << Hmag << " |H|[" << Hmin << ".." << Hmax << "]"
 		          << " std|H|=" << Hvar << " nzero(<0.3mean)=" << nzero << "/" << (Ngrid*Nc)
 		          << " pilraw|Y/X|=" << pilraw
 		          << " deframed_rms=" << crms
 		          << " rx_data_rms=" << rxrms
+		          << " DDevm=" << evm << " (n=" << evcnt << ")"
+		          << " rowCPE[" << cpe_min << ".." << cpe_max << "] meanabs=" << cpe_mean_abs
 		          << " last_sel=" << last_channel_selectivity << std::endl;
 	}
 
@@ -7528,6 +8160,16 @@ int cl_telecom_system::bigblock_tx_to_wav(const char* wav_path)
 	// freq-domain grid (data + pilots placed by the thin lattice).
 	std::vector<std::complex<double>> tx_syms(nData);
 	psk.mod(tx_bits.data(), nBits, tx_syms.data());
+	// 1C — time/freq symbol interleave (WAV TX; mirror of bigblock_tx_passband). Deinterleaved
+	// in bigblock_decode_from_wav. NO-OP when B==1.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> ilv(nData);
+			interleaver(tx_syms.data(), ilv.data(), nData, B);
+			tx_syms.swap(ilv);
+		}
+	}
 	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
 	ofdm.framer(tx_syms.data(), grid.data());
 
@@ -7741,10 +8383,13 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	}
 
 	// --- DEMOD: from the data start (head + preamble), rebuild the Ngrid grid. ---
-	// Mirror the production data extraction (telecom_system.cc:2434-2462): process a
-	// slice that includes a FIR_rx_data warm-up margin BEFORE the window start (so the
-	// FIR transient lands in the margin, not in the data), then skip the margin. The
-	// margin is a whole number of symbols so the demod symbol grid stays aligned.
+	// Mirror the production data extraction (telecom_system.cc:2434-2482): process a
+	// slice that includes a FIR_rx_data warm-up margin BOTH BEFORE and AFTER the window
+	// (so the FIR start transient lands in the LEFT margin and the FIR epilogue lands in
+	// the RIGHT margin, not in the data), then skip the left margin. The margin is a
+	// whole number of symbols so the demod symbol grid stays aligned. BB-1 fix: the
+	// trailing (right) margin was previously omitted, truncating the tail of the final
+	// OFDM symbol (see :2480 pb_end = extraction_delay + frame_size + fir_margin).
 	// sample_offset = the slice's absolute passband start so the downconvert oscillator
 	// phase is CONTINUOUS with the TX upconvert (which ran from passband sample 0).
 	long data_start0 = head_delay + (long)pre_nSymb*sym_samples;
@@ -7760,7 +8405,11 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 		long ms = data_start - margin_interp;
 		int  mi = margin_interp;
 		if(ms < 0){ ms = 0; mi = (int)data_start; }
-		int slice_size = mi + span_interp;
+		// BB-1 (PIPELINE_AUDIT BB-1): trailing FIR margin too (mirror per-frame :2480).
+		// Bounds-guarded read below zero-pads past rxpb end; grid extraction still starts
+		// at mdec=mi/interp for Nofdm*Ngrid samples, so the right margin only feeds the
+		// FIR lookahead and does NOT shift the symbol grid.
+		int slice_size = mi + span_interp + margin_interp;
 		std::vector<double> dat_pb(slice_size, 0.0);
 		for(int i=0;i<slice_size;i++){
 			long src=ms+i; dat_pb[i] = (src>=0 && src<(long)rxpb.size()) ? rxpb[src] : 0.0; }
@@ -7923,6 +8572,24 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	ofdm.channel_equalizer(rx.data(), eq.data());
 	std::vector<std::complex<double>> deframed(nData);
 	ofdm.deframer(eq.data(), deframed.data());
+
+	// 1C — time/freq symbol DE-interleave (WAV decode; mirror of bigblock_rx_passband).
+	// Restore codeword-contiguous order before demap; deinterleave CSI the same way. NO-OP B==1.
+	{
+		int B = bigblock_tf_block_size(nData);
+		if(B > 1){
+			std::vector<std::complex<double>> dil(nData);
+			deinterleaver(deframed.data(), dil.data(), nData, B);
+			deframed.swap(dil);
+			std::vector<double> cil(nData);
+			int nBlocks = nData / B;
+			for(int i=0;i<nBlocks;i++)
+				for(int j=0;j<B;j++)
+					cil[(size_t)i*B+j] = csi_data[(size_t)j*nBlocks+i];
+			for(int i=nBlocks*B;i<nData;i++) cil[i] = csi_data[i];
+			csi_data.swap(cil);
+		}
+	}
 
 	// [DIAG-WAV] instrument nv, mean|H|, post-EQ deframed constellation RMS.
 	if(env_i("MERCURY_BIGBLOCK_RXPB_DIAG",0))
@@ -8320,6 +8987,11 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	int interp = frequency_interpolation_rate;
 	int nSamples = data_container.Nofdm * data_container.buffer_Nsymb * interp;
 	if(nSamples <= 0) nSamples = (bigblock_last_tx_samples > 0) ? bigblock_last_tx_samples : 0;
+	// §19: stash the captured-window length (samples) the decode runs over, so the ARQ
+	// window-position guard can compare the located block extent against it WITHOUT
+	// re-deriving buffer_Nsymb at carve time (bigblock_restore_stock_config may have
+	// changed buffer_Nsymb by then). Captured here, BEFORE any rebuild/restore.
+	bigblock_last_rx_capture_nsamples = nSamples;
 
 	// USE-AFTER-FREE ROOT-CAUSE FIX (bigblock-whiten-align): `data` is the caller's
 	// data_container.ready_to_process_passband_delayed_data (live ARQ path,
@@ -9343,6 +10015,7 @@ void cl_telecom_system::load_configuration(int configuration)
 	// so old values would be wrong
 	receive_stats.delay_of_last_decoded_message = -1;
 	receive_stats.freq_offset_of_last_decoded_message = 0;
+	consecutive_ofdm_decode_fails = 0;  // STALE-CFO scoped reset: config change re-acquires fresh
 	receive_stats.mfsk_search_raw = 0;
 	receive_stats.ofdm_search_raw = 0;
 	receive_stats.ofdm_batch_active = false;

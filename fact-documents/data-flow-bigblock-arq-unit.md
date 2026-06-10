@@ -1655,3 +1655,154 @@ pre-correction in §18.4 attempt 2 was wrong because it ignored the preamble's o
 profile). Needs a §5 cross-layer audit against the §7.4 grid freeze + §15-17 window invariants and a
 dedicated fail-before/pass-after regression at the calibrated level. Until then, big-block on HW must
 either run hot (decodes via the over-boost) or stay opt-in. NO monitor merge, NO push, NO attribution.
+
+## §19. ACQUISITION-WINDOW POSITION — the §17 fix made the snapshot WAIT for a block-span of fresh symbols (the COUNT) but NOT WAIT for the block to land EARLY enough in the window (the POSITION); a block whose preamble lands late has its tail still IN THE FUTURE at snapshot time → zero-padded tail → block-wide estimate collapses → cw0 wire-CRC fails. (2026-06-07, branch `fix/bigblock-chanest`, worktree `C:/Users/kamer/mercury_wt/bb-chanest`)
+
+### §19.1 The defect (HW, `bigblock_p3_hw/ACQ_GATE_ANALYSIS.json`)
+
+On the percw HW bench the big-block BBTX-GATE passed only ~5.6% (1/18 attempts), yet EVERY pass
+decoded 8/8 byte-faithful (`[BIGBLOCK-RX] carve K=8 cw_ok_count=8`, rsp.log:2932). LEVEL ruled out
+(the −2.66 dB flat-gain cut lands the block at the per-frame FIR'd RMS; an OLD full-level binary ALSO
+failed). GATE ruled out (8/8 on every accept; the cw0 wire-CRC only rejects genuinely truncated/silent
+blocks). The DECISIVE TRIPLET (all near-perfect Schmidl-Cox locks, metric 0.998–0.999): the ONLY pass
+had `preamble_symbol=0` (delay 0); the two fails had `preamble_symbol=116` and `=128` of the 133-symbol
+window — i.e. ~48–56 of the block's 64 symbols extend PAST the window end. So a clean timing lock is
+NECESSARY but NOT SUFFICIENT: the block POSITION within the captured window decides pass/fail, and the
+block lands at a RANDOM phase each attempt (observed preamble symbols 0,6,7,15,27,30,51,54,71,75,76,
+100,116,128).
+
+### §19.2 ROOT CAUSE — the snapshot fires before the late-landing block's tail has been captured (the ring physically holds only `buffer_Nsymb` symbols of history)
+
+The §17 fix arms `frames_to_read = bigblock_rx_block_nsymb()+10` at every data-path re-arm, so a
+block-span of FRESH symbols accumulates before the snapshot. But the snapshot fires when `frames_to_read`
+counts to 0 (`audioio.c:1394` HW; `arq_commander.cc:10120` sim), at WHATEVER `ring_write_index` the
+write head sits — and the ARMING POINT (when `frames_to_read` was set) has NO phase relationship to when
+the CMD's over-the-air block actually starts. So the block arrives somewhere inside the countdown window.
+When the block starts LATE in the countdown, its tail is STILL ARRIVING (future samples) at the instant
+`frames_to_read` hits 0 — those tail samples are NOT YET in the ring.
+
+The ring `passband_delayed_data` is a DOUBLE-MAPPED buffer of length `2*sp` where the writer mirrors
+`[wi]` into `[wi+sp]` every symbol (`audioio.c:1366-1392`, comment: "Reading sp samples from any
+position in [0,sp) gives a contiguous chronological view via the mirror"). It holds EXACTLY `sp =
+Nofdm*buffer_Nsymb*interp` samples of history. `bigblock_rx_passband` runs Schmidl-Cox over that `sp`
+window to FIND the preamble (`head_delay`, telecom_system.cc:7431-7477) then `bb_at` reads the 64-symbol
+block FORWARD from `data_start = head_delay + pre_nSymb*sym_samples` (telecom_system.cc:7506-7539),
+ZERO-PADDING any read past `rxpb.size()` (`src<rxpb.size()? : 0.0`, :7522). When `head_delay` lands later
+than `(buffer_Nsymb − block_nsymb)` symbols into the window, the forward read runs off the captured
+samples → zero-padded tail → the block-wide sparse-2D pilot estimate integrates over a half-silent grid
+and collapses → cw0's CRC fails even on a perfect lock.
+
+WHY "ENLARGE THE READ" CANNOT WORK (refutes the ACQ_GATE_ANALYSIS "preferred" enlarge-buffer-read
+option as literally stated): reading MORE than `sp` samples from the ring re-reads the `[rwi+sp]` MIRROR
+of the OLDEST data, NOT future samples — the tail physically is not in the buffer yet. The only ways to
+get the full block in-window are (a) grow the ring `buffer_Nsymb` ≥ block_span+slack AND wait for the
+tail to arrive, or (b) DEFER the snapshot one arming cycle so the tail arrives and the block re-lands
+earlier in the (unchanged) window. (b) is root-cause, RX-confined, TX-byte-identical, and reuses the
+§17 `bigblock_block_ftr_or()` mechanism; (a) perturbs the shared `signal_period`/allocation. We take (b).
+
+### §19.3 The fix — a window-position guard at the bigblock RX decode site (Option A, defer-and-re-arm)
+
+In `receive()` (arq_common.cc) on the bigblock-RX branch, AFTER `receive_byte`→`receive_bigblock` has
+located the preamble but BEFORE the carve, check whether the located block fit in the captured window.
+`receive_bigblock` exposes the located head position as `bigblock_last_rx_head_delay_samples` (NEW; set
+in `bigblock_rx_passband` from `head_delay`) and the captured length `bigblock_last_rx_capture_nsamples`
+(NEW; = the `nSamples` it decoded). The guard computes
+`block_end = head_delay + (pre_nSymb + Ngrid)*sym_samples` and, when
+`block_end > capture_nsamples` (the tail was zero-padded), DEFERS: it does NOT carve, re-arms
+`frames_to_read` to `bigblock_rx_block_nsymb()+10` (so a fresh full block-span accumulates and the tail
+arrives), and does NOT wipe the ring (so the just-arrived head is not discarded). A bounded
+defer-counter (`bigblock_rx_defer_count`, reset on every accept) caps consecutive defers so a genuinely
+absent block cannot spin; on cap-exceed it falls through to the stock cw0-CRC gate (which rejects the
+truncated block as today — no regression, just no infinite defer). On the NEXT arming cycle the block
+has fully arrived and re-lands earlier in the window → `block_end ≤ capture_nsamples` → carve 8/8.
+
+Because each defer accumulates ≥ block_span fresh symbols, the re-snapshot is GUARANTEED to contain the
+whole block (the block cannot be longer than block_span), so a single defer suffices in the common case
+and the first-DELIVERED fraction approaches the per-frame acquisition rate (≫ the ~5.6% / ~52%
+one-shot). The guard is gated STRICTLY on `bigblock_framing_enabled && M!=MOD_MFSK &&
+current_configuration==CONFIG_16 && bigblock_last_rx_K>0`; off-rung it is never entered → byte-identical.
+REPRODUCER HOOK: `MERCURY_BIGBLOCK_DEFEAT_ACQGUARD=1` bypasses the defer (carve the truncated block as
+pre-fix) for the fail-before/pass-after A/B. Production never sets it.
+
+### §19.4 S5 cross-layer audit — the new RX members + the snapshot-position decision
+
+1. **Producers**
+   - `bigblock_last_rx_head_delay_samples` (NEW): written ONCE per decode in `bigblock_rx_passband`
+     from the located `head_delay` (telecom_system.cc, after the SC/MF-snap acquire), and reset to −1
+     at the top of `bigblock_rx_passband` (acq-fail leaves it −1). Mirror of the existing
+     `bigblock_last_rx_meanh` stash convention (telecom_system.cc:190 stash, §11 health metric).
+   - `bigblock_last_rx_capture_nsamples` (NEW): written in `receive_bigblock` to the `nSamples` it
+     decoded (telecom_system.cc:8918), so the ARQ guard knows the exact captured length without
+     re-deriving `buffer_Nsymb` (which `bigblock_restore_stock_config` may have changed by carve time).
+   - `bigblock_rx_defer_count` (NEW, ARQ controller): incremented on each defer, reset to 0 on accept.
+   - `frames_to_read` at the defer re-arm: a NEW data-path producer at the bigblock rung — wrapped in
+     the EXISTING `bigblock_block_ftr_or()` so it stays on the §17.5 producer list and cannot diverge.
+2. **Consumers**
+   - `bigblock_last_rx_head_delay_samples` + `bigblock_last_rx_capture_nsamples`: read ONLY by the new
+     guard in `receive()` (arq_common.cc) to compute `block_end` and decide defer-vs-carve. No other
+     reader; both are diagnostic-stash members like `bigblock_last_rx_meanh`.
+   - `bigblock_rx_defer_count`: read only by the guard (cap check). Reset by the guard on accept and by
+     `init_messages_buffers`/connection reset (default 0).
+   - The carve consumers (`bigblock_receive_carve`, `messages_rx[]`, bsi/EOB, SACK) run UNCHANGED on
+     the accept path; on a defer they are SKIPPED entirely (no partial state written).
+3. **Valid states** before any producer writes: `head_delay=-1` (acq fail) and `capture_nsamples=0`
+   (no decode yet). The guard treats `head_delay<0 || capture_nsamples<=0` as "not a locatable block" →
+   does NOT defer (lets the existing cw0-CRC gate handle it as today). `defer_count` defaults 0.
+4. **Invariant the carve consumer assumes** (NEW — INV-10): the carve runs ONLY when the FULL block was
+   captured (`head_delay + block_span_samples ≤ capture_nsamples`). §17's INV-9b guaranteed enough
+   fresh symbols accumulated (the COUNT); INV-10 adds that the located block also FITS the window (the
+   POSITION). The guard establishes INV-10 before every carve; when violated it defers instead of
+   carving a truncated block. Every other carve consumer (whiten, per-cw CRC, bsi, EOB, batch-size
+   election §16) is unchanged and only ever sees a full-block carve.
+5. **What the fix changes**: it adds a DEFER decision BEFORE the carve, keyed on two new RX-stash
+   members. It does NOT touch the carve, the cw0-CRC gate, the channel estimate, nv, pilots, LDPC, the
+   TX, or the per-frame path. Stock per-frame configs (0..15) and MFSK never enter the guard (rung
+   gate false). The defer re-arm reuses `bigblock_block_ftr_or()` (§17.4), so the armed window stays on
+   the audited producer list. The post-carve full-ring wipe (arq_common.cc:7423) runs ONLY on accept;
+   on a defer the ring is left intact so the just-arrived head survives to the next snapshot.
+
+### §19.5 §19.2 vs §17 — these are DISTINCT axes (both required)
+- §17 (COUNT): arm `frames_to_read ≥ block_span` so a block-span of FRESH symbols accumulates before
+  the snapshot. Without it the snapshot fired after one STOCK frame → only the block HEAD was fresh.
+- §19 (POSITION): even with a block-span COUNT armed, the snapshot fires at a random write-head phase,
+  so the block can land late and its tail be unborn at snapshot time. §19 defers until the block
+  fully arrived AND fits the window. §17 is necessary (enough symbols) but not sufficient (right phase);
+  §19 closes the phase axis. Both gated identically on the CFG16 big-block rung.
+
+### §19.6 Regression — `--test-bigblock-chanest` driven at several in-window preamble offsets (fail-before / pass-after)
+The existing chanest harness (`run_block`, test_bigblock_arq_unit.cc) custom-sizes `buffer_Nsymb` to
+fit the whole window, so it can NEVER reproduce the position bug. NEW `--test-bigblock-acqwindow`
+(`test_sim_inproc_bigblock_acqwindow`) drives ONE genuine K=8 block into a FIXED production-sized
+133-symbol window at THREE preamble offsets (symbol 0, mid ~60, near-end ~120) and asserts:
+- FAIL-BEFORE (`MERCURY_BIGBLOCK_DEFEAT_ACQGUARD=1`): the near-end offset carves a TRUNCATED block →
+  cw0-CRC fail / `bytes_ok=0` (the position bug reproduced in-process).
+- PASS-AFTER (guard ON): every offset whose block fits decodes 8/8; the late offset DEFERS
+  (`[BBTX-ACQ-DEFER]`, no carve) and the re-presented complete block decodes 8/8 `bytes_ok=1`.
+Plus CLEAN (offset 0) stays 8/8, and `--test-bigblock-multicw/-fullpath/-arq-unit` + `--test-climb-engine`
+stay green, PER-FRAME byte-identical. NO monitor merge, NO push, NO attribution.
+
+## §20. CFG16 CARVE-COOLDOWN — the climb/election re-election MEMORY (WALL-B FIX-5). On a CLEAN pg84 long stream the loop THRASHES: climb→CFG16 carve-park→3 carve-fails→FIX-4 demote→CFG15→the gearshift RE-CLIMBS to CFG16 (clean channel, SNR says go)→re-elects the carve-dead big-block rung→re-parks on the carve that NEVER fires→repeat; 0/897770 delivered. FIX-4 pins `supershift_proven_ceiling=CFG15` but `finish_turbo_direction()` UNCONDITIONALLY resets it to the probe top (CFG16) on every ROBUST→CFG16 re-climb (arq_commander.cc:4215), so that pin has a lifetime of ~one cycle. (2026-06-09, branch `fix/wallb-cascade`, worktree `C:/Users/kamer/mercury_wt/wallb-fix`. Design+audit: `bigblock_p3_hw/_wallb/fix5/FIX5_DESIGN.md`, `FIX5_AUDIT.md`.)
+
+### §20.1 State family B — `bigblock_carve_cooldown_batches` / `bigblock_carve_cooldown_span` (NEW, CMD-only)
+A SEPARATE CMD-side field the turbo state machine does NOT touch (so it survives the :4215 reset that defeats FIX-4), consulted as an additional INDEX-CAP (→CFG15) at every climb hook. AARF form: 1st demote arms `BB_CARVE_COOLDOWN_BASE`=24 batches; each RE-demote WHILE active DOUBLES, capped at `BB_CARVE_COOLDOWN_MAX`=384 (16×BASE, mirrors `BREAK_DROP_STEP_MAX`'s 16× span idiom). Unit = completed BATCHES not wall-time (the thrash cadence is dominated by variable deaf-peer BREAK/watchdog storms — minutes/cycle; a batch count self-scales with link speed).
+
+1. **Producers**:
+   - ARM/extend: `arq_commander.cc:~3691` — the FIX-4 carve-viability deadline block, immediately after the existing `supershift_proven_ceiling = carve_fallback` pin. `span = bigblock_carve_cooldown_next_span((batches>0)?span:0, BASE, MAX); batches = span;` (re-arm while active = GROW; post-expiry = BASE).
+   - DECREMENT (expiry): `arq_commander.cc:~5466` — the `gear_shift_algorithm==SUCCESS_BASED_LADDER` branch of `finalize_block_commander()`, which runs exactly ONCE PER COMPLETED BATCH (both the SACK-v2 policy path and the v1 inline path flow through here), the same per-batch cadence as `gear_shift_blocked_for_nBlocks`/`ceiling_success_count`. NOT per `receive()` tick (audit R6).
+   - CLEAR-on-success: `arq_commander.cc:~3851` — the data-ACK reset site (where `emergency_nack_count=0`), GATED on `current_configuration==CONFIG_16 && telecom_system->bigblock_framing_enabled && M!=MOD_MFSK` (a real CFG16 carve landed). Clears `_batches`+`_span` to 0 (re-enables CFG16) and resets the AARF.
+   - INIT: member-initializer `{0}` (arq.h) + zeroed in the ctor/init block (`arq_common.cc:~772`) and in `reset_session_state()` (`arq_common.cc:~3803`), mirroring `supershift_proven_ceiling=-1` (audit R3 — a fresh session never inherits a stale cooldown).
+2. **Consumers** (all via the pure member `apply_bigblock_cooldown_cap(proposed)`, an index-monotone never-raise clamp to `bigblock_carve_cooldown_ceiling()`=CFG15 when armed, else identity):
+   - Gearshift LADDER-UP `ceiling_blocked` — BOTH twins: v1 inline `arq_commander.cc:~5541`, v2 policy `~5704`.
+   - Gearshift CEILING-RECOVERY raise — BOTH twins (suppress raising the proven ceiling above CFG15): v1 `~5563`, v2 `~5727`.
+   - Turbo SNR-SUPERSHIFT / step-1 probe target — `arq_commander.cc:~5106` (the LOAD-BEARING hook: this survives the ROBUST collapse and re-climbs).
+   - `elevator_target_from_snr()` return — `arq_commander.cc:191` (shared by the SNR re-trigger :5180 and the FRAME-UP elevator, so capping here covers both).
+   - `finish_turbo_direction()` `start_config` — `arq_commander.cc:~4210` (NON-NEGOTIABLE: the exact site that resets `supershift_proven_ceiling` and defeats FIX-4).
+   - Q-table optimizer `opt_pending_switch_cfg` dispatch — `arq_commander.cc:~599` (audit R7: a FOURTH CFG16 producer that bypasses the gearshift/turbo gates; capped here too).
+3. **Valid states / default-init**: `_batches==0` (default) ⇒ no cap, every climb path no-ops the cooldown — the normal byte-identical state for non-bigblock and clean-CFG16 runs. `_batches>0` ⇒ CFG15 cap active. Boundary: `_batches` reaches 0 by decrement ⇒ re-probe re-enabled, `_span` retained for AARF until a carve-success (reset 0) or a fresh post-expiry demote (starts a new window at BASE).
+4. **Invariants**: **INV-B1** `_batches>0` ⇒ no climb selects index>index(CFG15) — upheld by applying the cap at ALL the producers of `current_config=CONFIG_16` (the 6 enumerated hooks; audit §5.5 proved completeness). **INV-B2** CMD-only, never on the wire, RSP never reads it. **INV-B3** (the single most load-bearing gate, audit R2) a per-frame CFG15 data-ACK must NOT clear the cooldown — only a CFG16 carve does — upheld by the `current_config==CONFIG_16 && framing` clear gate.
+5. **What FIX-5 changes**: it ANDs an INDEPENDENT never-raise cap into the SAME consumer sites as `supershift_proven_ceiling`; the effective ceiling becomes `min(supershift_proven_ceiling-cap, cooldown-cap, WB/NB ceiling, max_config_override)`, all index-monotone clamps ⇒ order-independent, can only LOWER ⇒ no new over-climb. On a non-bigblock channel or a clean CFG16 with a working carve the cooldown is never armed, so behavior is byte-identical (the `--test-bigblock-fullpath` live transfer holds CFG16 and delivers 1200/1200 — the cooldown never arms).
+
+### §20.2 Regression — `--test-climb-engine` Part T (pure helpers) + `--test-bigblock-climb-election` FIX-5 section (real CMD/RSP pair)
+- Part T (arq_commander.cc test_climb_engine, mirrors Parts R/S): T0 arms BASE; T1 AARF doubling capped at MAX (24→48→…→384, no overflow); T2 ceiling=CFG15 armed / −1 off; T3 `apply_bigblock_cooldown_cap` refuses CFG16→CFG15 armed, identity off; T4 FIX-4 target == FIX-5 ceiling; T5 INV-B3 clear-gate (CFG16-carve clears, CFG15-ACK / framing-off do NOT); T6 post-expiry fresh fade resets span to BASE; T7 the cooldown SURVIVES the `supershift_proven_ceiling=CFG16` reset and STILL caps at CFG15 (the limit-cycle break).
+- `--test-bigblock-climb-election` adds an 8-check FIX-5 section on a REAL pair (load_configuration / framing real): re-election REFUSED while armed, per-frame CFG15 delivery rung selected, turbo-reset survival, INV-B3, clear-on-CFG16-carve, exponential growth capped.
+- FAIL-BEFORE via `-DWALLB_FIX5_FAILBEFORE` (the helpers compile to 0/−1 = no cooldown): Part T fails 9 checks, the election section fails 5; PASS-AFTER all green. `--test-bigblock-carve-suspend-unit` (FIX-3), `--test-bigblock-arq-unit`, `--test-bigblock-fullpath` (carve-success unaffected), `--test-probe-backoff`, `--test-data-anchored-promote` all stay green. CMD-only, no RSP/wire/DSP change. NO monitor merge, NO push, NO attribution.

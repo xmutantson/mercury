@@ -442,3 +442,374 @@ wedge; the geometry-helper ring-zeroing was the sole remaining blocker to full
     `MERCURY_BIGBLOCK_FRAMING` or the `--test-bigblock-*` harnesses), so CFG16
     in production runs the byte-identical stock per-frame path and does NOT elect
     the non-decoding block rung (verified `arq_common.cc:1122-1124`).
+
+## §9 MULTI-BATCH WEDGE — 2nd ASSAULT (2026-06-08, bb-d3 @9ee13f6) — STILL ARCHITECTURAL
+
+Re-attacked the §7 wedge on `fix/bigblock-d3-carve`. **Result: re-confirmed
+ARCHITECTURAL STOP — 4 MORE fix attempts (8 total with §7.4), all reverted; tree
+restored to 9ee13f6.** New facts beyond §7:
+
+### §9.1 The bb-d3 BASELINE is broader-broken than §7 framed
+At clean 9ee13f6 the SIM_INPROC stepper delivers **ZERO OFDM data bytes on ANY
+free-flow arm**, not just multi-batch:
+- Legacy 19-B short-text arm (ROBUST_0/MFSK): **WORKS** — `rx="MERCURY-2INST-HELLO"`,
+  CONNECT clean, 0 deadlock-breaks. (The MFSK/ROBUST handshake + small-payload path
+  is the ONLY healthy delivery path.)
+- `--test-bigblock-multicw` (PINNED CFG16, K=8 single block, STOP_AFTER_FIRST_BLOCK):
+  **PASSES its unit asserts** (arm A clean=8/8 byteok) — but that is the narrow
+  pinned single-block path, NOT free-flow.
+- **Free-flow `MERCURY_SIM2_PAYLOAD_BYTES` (the discriminator's CONTROL): 0 bytes.**
+  • Clean climb 20000 B: `switch_seq 100->101->102->0->100`, reaches CONFIG_0, decodes
+    9 `RX-BATCH-SEQ` frames, then collapses to ROBUST_0; `rx_bytes=83/20000 stalled=1`,
+    2 deadlock-breaks (matches `DISCRIMINATOR_RESULT.json` byte-for-byte).
+  • **Pinned CFG16 500 B / 1500 B: ALSO 0/N**, with deadlock-breaks DURING the ROBUST_0
+    CONNECT handshake (128960/327360-B tails abandoned) — i.e. even the pre-OFDM
+    handshake TX wedges when the run is destined for CFG16. So this is NOT a
+    "batch-0-works, only multi-batch-sustain-fails" gap (the §7.1 framing); the
+    free-flow OFDM data delivery is broken from the first SACK batch.
+  • The memory note "pinned CFG16 bytes_ok=1 in iters=4" was on `wf-sim-controlloop`
+    @6f3c83a (the §7 base), NOT on bb-d3 — bb-d3 has diverged.
+
+### §9.2 The 4 new attempts (what + why each failed)
+1. **§7.6 (a) — `process_messages_tx_data` depth>0 deferral guard** (SIM-only, +accessor
+   `arq_sim_inproc_depth()`): batch-0 delivers, but batch-1 STARVES. Live trace
+   (`MERCURY_SIM2_TXDBG`): after batch-0 ACK the CMD is in TRANSMITTING_DATA (conn=1)
+   but is ONLY ever entered at depth=1 (1234 consecutive deferrals) — the depth-0
+   re-entry the guard relies on NEVER happens because the stepper is wedged inside the
+   peer's nested wait (the iteration counter stays `it=0` through the whole window).
+   Link-timeout → re-HAIL → mutual `RECEIVING (conn=2)` deadlock. (a) is FALSIFIED: the
+   deferred-to depth-0 tick is unreachable while the peer holds the stepper.
+2. **§7.6 (b) — blanket symmetric pump at every depth>0** (absolute-identity a/b
+   drain+deliver, drive_decode=false): REGRESSED CONNECT — the symmetric capture feed
+   desyncs the MFSK handshake (re-confirms §7.4 #2).
+3. **Symmetric pump GATED to a nested-TX-drain window** (`g_sim2_in_nested_drain`
+   bracket in `drain_playback_wait` at depth>0) + CONNECTED+OFDM gate: still breaks the
+   pinned-CFG16 turnaround — the gate fires during batch-0's own SACK-ACK turnaround
+   (B's ACK at CFG16 is `is_ofdm_config==true`) and the out-of-cadence delivery corrupts
+   the decode pacing.
+4. **Saturation-keyed stranded-transmitter drain** (`sim2_pump_drain_stranded`: at
+   depth>0, key on the global `playback_buffer`==a/b to name the ACTIVE transmitter
+   ORIENTATION-FREE, act ONLY when its outgoing wire has SATURATED — the precise wedge
+   signal, no-op on a normal turnaround that never fills the wire): does NOT regress the
+   legacy arm (verified identical), but still does not DELIVER the free-flow batch
+   (frames decode — 9 `RX-BATCH-SEQ` — but `rx_have=0`; delivery-to-FIFO is blocked
+   separately, and the ROBUST handshake wedge is upstream of the OFDM gate).
+
+### §9.3 Why localized fixes keep failing — the irreducible coupling
+The single-thread stepper couples THREE things that production runs concurrently on
+separate threads: (i) the depth-0 per-frame DECODE-DRIVE (needs exact single-symbol
+pacing, no interference), (ii) the SACK-ACK turnaround (small nested TX that must NOT
+trigger symmetric delivery), and (iii) a nested multi-frame batch TX that MUST be
+delivered. No single predicate (depth / decode-drive-depth / CONNECTED+OFDM /
+wire-saturation / active-instance) cleanly separates (ii) from (iii) AND leaves (i)
+untouched — every gate that catches (iii) also perturbs (i) or (ii). This is the §7.3
+orientation/reentrancy trap restated with the full coupling.
+
+### §9.4 The ONLY faithful fix is the stepper-core redesign (§7.6 implied, now mandatory)
+Decouple `send_batch()` from the BLOCKING `drain_playback_wait()` under SIM_INPROC:
+the OUTER stepper loop must be the SOLE DAC-drain + RX-consume driver (one symbol per
+instance per outer iteration, both directions, like the two real audio threads), and
+`send_batch` must QUEUE-and-return rather than spin-drain. That removes the nested-drain
+reentrancy entirely (no depth>0 TX-drain ever exists), so (i)/(ii)/(iii) stop sharing a
+call stack. This is a multi-day stepper rewrite with real regression risk to the
+VALIDATED MFSK/legacy/bigblock-unit paths and a full GATE-2 + `--test-sim-clock` +
+`--test-climb-engine` re-validation — NOT a localized helper patch. Recommend a fresh
+design doc + plan-first (CLAUDE.md §4) before any code. Per CLAUDE.md §1.2 (≥3 failed
+attempts ⇒ STOP, architectural) no further localized iteration on the current stepper.
+
+## §10 STEPPER-CORE REWRITE — Phase b §1.5 audit + the no-op-drain change (2026-06-08, bb-d3)
+
+Phase a (commit `535f573`) added the outer-loop symbol-pump skeleton behind
+`MERCURY_SIM2_STEPPER=outer` (drain-before-tick, fixed A-before-B, one-symbol helpers
+`sim_step_drain_one_symbol`/`sim_step_feed_one_symbol`), with `drain_playback_wait`
+NOT yet changed. Phase b makes the SIM_INPROC drain QUEUE-and-return.
+
+### §10.1 The state the fix changes (5-question §1.5 audit)
+**State:** `drain_playback_wait()` exit semantics (`arq_common.cc:178`); `playback_buffer`
+occupancy; the per-direction WIRE rings; the post-TX RX-ring bookkeeping at each of the 9
+drain sites.
+
+1. **Producers of `playback_buffer`:** every TX site via `tx_transfer`→`write_buffer`
+   (`audioio.c:1691`); the call sites surrounding the 9 drains (`arq_common.cc:4998/5450/
+   5461/5695/5701/5832/5836/6294/6301/6505/6509/6687/6691/7032/7036`). DRAIN (occupancy
+   shrink): TODAY the pump `sim2_drain_to_wire`; AFTER this fix (under `outer`) the outer
+   loop's `sim_step_drain_one_symbol`.
+2. **Consumers of `playback_buffer`-empty:** ONLY `drain_playback_wait` itself
+   (`arq_common.cc:215` exit predicate + `:213` NO-PROGRESS floor) and the harness
+   `wire_quiescent` SET_CONFIG gate (`arq_commander.cc:10845`, reads `A/B->audio.play`).
+   The 9 post-TX-bookkeeping tails DO NOT read it (§10.2).
+3. **Valid states / pre-write defaults:** `playback_buffer` empty before any `tx_transfer`;
+   wire rings `clear_buffer`'d at install; RX ring memset-0 before any producer.
+4. **Invariant consumers assume (INV-D):** each TX site runs SYNCHRONOUS post-drain
+   bookkeeping; INV-D = "no site reads `size_buffer(playback_buffer)==0` as a precondition."
+5. **What the fix changes:** under the outer stepper, `drain_playback_wait` returns
+   immediately (queue-and-return); the outer loop is the sole drainer. So the bookkeeping
+   fires while TX symbols are STILL QUEUED. Verified safe per §10.2.
+
+### §10.2 The 9-site post-TX-bookkeeping audit (INV-D) — RESULT: ALL CLEAN
+Every `drain_playback_wait()` site walked + its synchronous post-drain code:
+
+| Site | Function | Post-drain bookkeeping | Reads play-empty? |
+|------|----------|------------------------|-------------------|
+| `:5003` | `send()` single ctrl/data | `last_message_sent_type/code`, `last_received_message_sequence=-1` (STATE-only) | NO |
+| `:5076` | `send_batch()` big-block | capture-ring reset (RX ring only) + `rx_mute=0` + `messages_tx[].PENDING_ACK` + `frames_to_read` arm | NO |
+| `:5466` | `send_batch()` per-frame | capture-ring reset (RX ring only) + `rx_mute=0` + `messages_tx[].PENDING_ACK` + frees batch slots | NO |
+| `:5704` | `send_ack_pattern()` | `rx_mute=1`→reset(RX only)→`rx_mute=0`→`frames_to_read` arm | NO |
+| `:5838` | `send_ack_pattern_with_snr()` | same RX-only flush | NO |
+| `:6304` | `send_mfsk_ack_sack()` | same RX-only flush | NO |
+| `:6511` | break pattern | same RX-only flush | NO |
+| `:6693` | HAIL/beacon pattern | same RX-only flush + `ftr=2` | NO |
+| `:7038` | HAIL pattern | same RX-only flush + `ftr=2` | NO |
+
+**CONCLUSION:** Every site's post-drain code touches ONLY the RX ring
+(`passband_delayed_data` / `capture_buffer` / `ring_write_index` / `frames_to_read`) and
+STATE fields (`rx_mute`, `messages_tx[].status`, `last_message_sent_*`). NONE reads
+`playback_buffer` occupancy. The queued-not-yet-drained TX symbols live in `audio.play`/wire,
+which no post-drain tail touches; `rx_mute` already gates self-echo. The
+`messages_tx[].PENDING_ACK` / `RECEIVING_ACKS_DATA` / `receiving_timer` transition is
+STATE-only and production-faithful to set immediately (production sets it the instant the
+last sample is handed to the DAC, not when it physically egresses). **INV-D HOLDS for all 9
+sites; no site needs an ordering fix.**
+
+### §10.3 The fix (Phase b)
+`drain_playback_wait()` (`arq_common.cc`): add `if (g_sim2_outer_stepper_active) return;`
+at the TOP (after the `sim_clock_on` read), BEFORE the spin loop. Gated on a NEW SIM-internal
+flag `g_sim2_outer_stepper_active` (set true by `test_sim_inproc_2` ONLY while the outer
+stepper loop runs, cleared on exit) — NOT on `arq_sim_inproc_active()` alone, because under
+`legacy` (still runnable until Phase d) the pump-driven blocking drain must stay. Production
+(`pump==null`, flag false) keeps the verbatim unbounded body — G9 byte-identical.
+
+Because the drain now returns immediately under `outer`, `process_main()` no longer blocks;
+the Phase-a outer loop already DRAINS the queued TX one symbol/iter (the top-level catch-up
+drain/feed) and DELIVERS it to the peer with per-frame decode pacing. The nested-drain
+reentrancy (the §9.3 (i)/(ii)/(iii) coupling) never occurs — `process_main` returns after
+queueing, and there is no depth>0 TX-drain. The NO-PROGRESS `[SIM2-DEADLOCK-BREAK]` floor can
+therefore never fire under `outer` (its non-firing is a positive test signal — §6.1 G1).
+
+### §10.4 AS-BUILT (the naive §10.3 plan needed THREE refinements — discovered in implementation)
+The pure "no-op drain for ALL TX sites under the outer flag" of §10.3 BROKE the MFSK handshake
+and stranded the OFDM block. Three discriminations were required (all gated on the outer flag;
+production untouched):
+
+1. **MODULATION + DATA-BATCH gate, not a blanket no-op.** The MFSK CONNECT/HAIL + control-ACK
+   handshake REQUIRES intra-`process_main` co-routine pump delivery: the peer's reply must land
+   in the RX ring BEFORE the same call's `receive_*` poll (the outer loop cannot inject delivery
+   mid-`process_main`, and `send_*_pattern`'s post-TX RX-ring flush would wipe an out-of-band
+   reply). The outer loop alone broke CONNECT (G2: `connected=0`, hit iter cap). Fix: a per-modu-
+   lation + per-frame-type seam. `sim2_activate(m)` tags `g_sim2_active_is_ofdm =
+   is_ofdm_config(m->current_configuration)`; `send_batch()` brackets its body with an RAII
+   `g_sim2_in_data_batch_tx` flag. The drain seam `sim_outer_stepper_paces_active() =
+   outer && active_OFDM && in_data_batch_tx` fires ONLY for the OFDM big-block DATA batch — the
+   MFSK handshake / ACK patterns / control keep the legacy co-routine pump (burst-safe for MFSK,
+   G2 proves it). The OFDM conjunct keeps the 19-B legacy arm BYTE-IDENTICAL (dropping it routes
+   the small MFSK data batch through egress and shifts G2 iters 15→16 — a determinism regression).
+2. **EGRESS-to-WIRE, not no-op-leave-in-play.** A block left in `audio.play` is DISCARDED by the
+   SAME `process_main`'s post-TX ACK path (`clear_buffer(playback_buffer)`, `arq_commander.cc`
+   2915/3140/3240) the instant the CMD enters the ACK wait — the RX never gets it. So the OFDM
+   data drain spins a NEW **drain-ONLY pump** (`sim_inproc_drain_to_wire_only`, installed via
+   `arq_set_sim_inproc_drain_only_pump`) that moves `tx.play → wire` (NO RX deliver, NO decode
+   burst, NO peer-recurse) until play empties. The wire is `AUDIO_PAYLOAD_BUFFER_SIZE`=12.288 MB
+   (~19 blocks) so a single in-flight block never saturates → the spin always terminates (no
+   deadlock floor needed). The OUTER loop then FEEDS `wire → RX` ONE SYMBOL PER ITER (the §8/INV-A
+   decode cadence). Outer-loop drain/feed GRANULARITY is OFDM-gated: OFDM → one symbol/iter (so
+   the CMD's ACK poll interleaves + decode never over-advances a frame boundary); MFSK → whole-
+   buffer catch-up (the pump already moved it → no-op). The end-of-`process_main` §5.7 pacing-floor
+   pump is suppressed in the OFDM PHASE (`sim_outer_stepper_ofdm_phase() = outer && active_OFDM`)
+   so it never bursts the queued block after `send_batch` returns.
+3. **`ptt_busy_wait`/`pumped_settle_wait` disposition.** `ptt_busy_wait` is CLOCK-ONLY on the OFDM
+   data path (`sim_outer_stepper_paces_active()` — advances the virtual clock by `delay_ms`, no
+   pump) so the PTT turnaround does not burst the queued block; on the handshake/ACK path it keeps
+   the verbatim pump spin. `pumped_settle_wait` KEEPS the pump under the outer stepper (its callers
+   are the handshake/control-ACK settle guards that need intra-call delivery; the OFDM data batch
+   is never in play during a `pumped_settle_wait` call). The control-ACK arrival rescan
+   (`arq_common.cc` ~7437) keeps running (pump-driven) for the SET_CONFIG turnaround.
+
+RESULT (verified, `--test-sim-sustain`, ROBUST_0→CFG16 live SET_CONFIG, 1374-B K=8 block):
+- BEFORE (legacy pump): `deadlock_breaks=2`, the OFDM data path WEDGES (multi-MB TX tail abandoned).
+- AFTER (outer): `deadlock_breaks=0`, the CFG16 K=8 block carves **CLEAN 8/8**, bytes reach the RX
+  FIFO (`rx_have=1374/1374`). The (iii) DATA-path nested-drain wedge (§9.3) is GONE.
+- G2 BYTE-IDENTICAL (iters=15 sim_ms=61535 pump calls=507…), G3/G4/G5/G6/G7 ALL PASS, G8 same-seed
+  byte-identical, G9 production diff confined to the gated SIM seams + the SIM_INPROC TU + the new
+  `--test-sim-sustain`.
+
+### §10.5 OPEN — Phase c: the multi-batch ACK-turnaround TIMING (the remaining sustain blocker)
+Full byte-correct SUSTAIN across MANY batches is NOT yet achieved and is the documented Phase-c
+item. ROOT CAUSE (traced, not inferred): under the per-symbol feed, the OFDM big-block ACK
+round-trip overruns the CMD's `receiving_timeout`. The block egresses `play → wire` inside
+`send_batch` (clock +~1.65 s), then the RSP CONSUMES it over the following feed-iters; the virtual
+clock advances on the TX-egress AND (via idle-fills) during the RX-consume, so the data airtime is
+effectively counted ~2× and the ACK arrives at `rx_t≈3700 ms` vs `receiving_timeout=2686 ms`
+(`polls=0`/late → `nAcked_data=0` → the CMD re-sends `bsi=0` → duplicate delivery → `bytes_ok=0`;
+on free-flow the resulting "batch failure" makes the climb COLLAPSE off OFDM and the BREAK/control
+turnaround — still legacy-pump — re-trips the floor). The clean fix is the drain/feed/clock-
+accounting RECONCILIATION the design assigned to Phase c (couple TX-drain-time and RX-consume-time
+to ONE symbol of channel time per iter; route the post-CONNECT control/BREAK turnaround through the
+outer loop). Per CLAUDE.md §1.2, after >3 turnaround-timing attempts this is STOPPED here as a
+distinct Phase-c workstream — Phase b ships the proven DATA-path wedge removal + clean OFDM carve.
+
+### §10.6 C0 — the ACK-turnaround timing fix (clock-attribution instrumented, 2026-06-09)
+PRE-CODE measurement (one-change-one-test, CLAUDE.md §4): a clock-attribution counter
+(`sim2_drain_to_wire` bulk vs `sim_step_drain_one_symbol` per-symbol) on the `--test-sim-sustain`
+outer arm (`MERCURY_SIM2_DBG=1`) pinpointed the double-count EXACTLY. Per-outer-iter clock delta
+(`[C0-ITER]`), batch-1 OFDM block (K=8, 79360 samples = 1653 ms airtime, `receiving_timeout=2686`):
+- `it=11` (`receiving_timer.start` @ clk=1395760, the post-TX timer is AFTER this point): the EGRESS
+  fires `sim2_drain_to_wire` ONCE for the whole block — `bulk=79360(n=1)`. This is the legit TX
+  airtime and it is PRE-TIMER, so it does NOT count against `receiving_timeout`. (Not the bug.)
+- `it=12`: `bulk=174840(n=141)` — **141 `sim2_drain_to_wire` calls add 174840 samples (3643 ms) in
+  ONE outer iter**, inside B/RSP's decode-drive `process_main` ACK turnaround (the nested legacy
+  pump `sim_inproc_pump_2` idle-fills/drains the reverse wire while B waits). The CMD's
+  `receiving_timer` (started @ it=11) accrues this whole 3643 ms → `elapsed=3694ms > 2686ms`,
+  `polls=0` → ACK-timeout → BREAK → re-send `bsi=0` (`fallback=1`) → duplicate → `bytes_ok=0`.
+- The outer loop's OWN per-symbol pacing is correctly bounded: `step=2480(n=2)` per iter (2 symbols).
+
+ROOT CAUSE (single sentence): in the OFDM data phase, the shared virtual clock is advanced INDE-
+PENDENTLY by every per-instance/per-direction `sim2_drain_to_wire` (egress whole-block + the nested
+ACK-turnaround pump's 141 idle-fills), so one outer iteration can jump the clock by HUNDREDS of
+symbol-times — but production's two concurrent audio threads advance ONE shared wall-clock by ONE
+symbol per quantum. The clock is double/over-counted because TX-drain and RX-consume each bump it.
+
+FIX (couple to ONE symbol of channel time per outer iter — the design's §6/§9 keystone): in the
+OFDM data phase (`sim_outer_stepper_ofdm_phase()`), the per-instance/per-direction drains
+(`sim2_drain_to_wire`, `sim_step_drain_one_symbol`) MOVE BYTES but do NOT each bump the shared clock;
+the OUTER LOOP advances the shared clock by EXACTLY ONE symbol ONCE per iteration (both directions
+advance one symbol of wire-time together, sharing one symbol of wall-clock). Consequence: the
+64-symbol block consume costs 64 symbol-times (its airtime, ONCE) paced one-symbol-per-iter by the
+outer loop; the existing RECEIVING_ACKS_DATA restart guard (arq_commander.cc, OFDM phase) pins the
+CMD's `receiving_timer` at ~0 while `wire_a2b>0`; after the block fully consumes, the receiving
+window measures only the genuine ACK round-trip (~ack_pattern 413 ms + ptt/decode margins) which
+fits inside `receiving_timeout=2686ms` → ACK detected → `nAcked_data>0` → no re-send → no duplicate
+→ `bytes_ok=1`. This is NOT widening `receiving_timeout` (forbidden threshold-masking); it removes
+the SPURIOUS clock time the sim injected that production never had.
+
+### §10.7 C0 — CORRECTION: the timing fix is NECESSARY but NOT SUFFICIENT — a DEEPER blocker (the RSP never TRANSMITS the clean big-block data-ACK). STOP per CLAUDE.md §1.2 (2026-06-09)
+The §10.6 timing model was VERIFIED correct but implementing it surfaced a SECOND, dominant blocker
+that the §10.6 timing fix CANNOT resolve. Two fix attempts on the timing (one-change-one-test, both
+reverted, full revalidation owed):
+- ATTEMPT-1 (whole-iter `g_sim2_outer_owns_clock` clock suppression + one tick/iter): HUNG. The
+  clock-driven waits (`ptt_busy_wait`/`pumped_settle_wait`) inside B's nested ACK turnaround exit on
+  `get_elapsed_time_ms() >= delay_ms`; suppressing the clock for the whole OFDM-phase iter froze them
+  → infinite spin inside one `process_main`. (Clock authority cannot be blanket-removed during the
+  nested waits that depend on it.) Reverted.
+- ATTEMPT-2 (gate OFF the `receive_ack_pattern` intra-call re-scan spin under outer+OFDM, so the
+  re-scan's ~94×`pumped_settle_wait(52)`=~4.9 s window no longer inflates the CMD timer): the timing
+  HALF FIXED — `polls=0 → polls=34`, the receiving window no longer overruns before the first poll.
+  But `bytes_ok` STAYED 0: the CMD polled 34× and detected NOTHING (`peak_matched=0/7
+  peak_metric=0.0`). Reverted.
+
+The DEEPER ROOT CAUSE (measured, pristine 5e7cc15 binary, `MERCURY_SIM2_DBG=1`):
+**the RSP carves the clean K=8 block but NEVER TRANSMITS a data-batch ACK on CFG16.** Evidence,
+all from the SAME run:
+- `[BIGBLOCK-ARQ] CLEAN block bsi=0 K=8 -> 1 ACK (all-ones) ... delivered_fifo=1` — the carve
+  (`bigblock_block_to_arq` / `bigblock_arq_decide_and_ack`, test_bigblock_arq_unit.cc:199-264) DELIVERS
+  to the FIFO + bumps bsi, but is DELIVERY-ONLY: it does NOT call `send_ack_pattern` /
+  `send_mfsk_ack_sack`. "1 ACK (all-ones)" is a LOG of the ARQ DECISION, not a wire transmission.
+- The generic clean-batch ACK transmitter is the ACK-GATE (`[RSP-RX-TIMEOUT] Entering ACK-GATE ...`
+  → `send_batch`/`send_ack_pattern`, arq_responder.cc:1490/1983). Across the whole run that print
+  fires **0 times** for the big-block; `stats.nAcks_sent_data = 0` throughout; the ONLY ACK on the
+  wire is the CONNECT handshake (`[TX-ACK-PAT] Sending ACK pattern on CONFIG_100`). There is NO
+  `[TX-ACK-PAT] ... CONFIG_16` and NO `[RSP-MFSK-SACK] clean path`.
+- So no data ACK is EVER on `wire_b2a`. The CMD's `[CMD-ACK-PAT] Timeout peak_metric=0.0` is therefore
+  CORRECT — there is nothing to detect. The CMD BREAKs and re-sends `bsi=0`; the RSP carves it AGAIN
+  (`fallback=1`); the duplicate fills the FIFO → `rx_have=1374/1374 bytes_ok=0`. The timing overrun
+  (§10.6) and the missing transmission are BOTH present, but the missing transmission is the
+  bytes_ok blocker: even with perfect timing there is no ACK to receive.
+
+WHY this was invisible until now: the single-arming `--test-bigblock-fullpath` (G5, bytes_ok=1) and
+`--test-bigblock-multicw` (G6) drive ONE instance's TX→PHY→RX carve and assert on the delivered FIFO /
+`messages_rx[]` DIRECTLY — they never run the 2-instance RSP→CMD data-ACK ROUND TRIP. The 2-instance
+sustain (G1) is the FIRST test that requires the RSP to actually transmit the clean big-block data-ACK
+back to the CMD — and that transmission path is not wired for the big-block carve under the 2-inst
+stepper (the carve, fired from B's decode-drive at depth 1, delivers but does not route to the
+ACK-GATE; B's top-level RECEIVING→ACK-GATE transition would see `rx_received=0` anyway because the
+carve's `copy_data_to_buffer()` already marked the slots ACKED and freed them).
+
+STATUS: STOPPED per CLAUDE.md §1.2 (two timing attempts failed to flip bytes_ok; the third diagnosis
+shows the scoped item — a timing coupling — is NOT the root cause) and §2 (a timing-only fix would
+mask the missing-ACK; forbidden). The C0 scope as written ("couple to one symbol of channel time so
+the batch-ACK completes inside receiving_timeout") presupposes the ACK is transmitted; it is not.
+The TRUE Phase-c fix is TWO coupled changes, both in the RSP/ARQ layer + the stepper clock:
+  (C0-a) WIRE THE CLEAN BIG-BLOCK DATA-ACK TRANSMISSION: after `bigblock_block_to_arq` carves a CLEAN
+         block (n_clean==K) on the live 2-inst path, the RSP must TRANSMIT the clean-batch ACK
+         (`send_mfsk_ack_sack` all-ones / `send_ack_pattern`) on CFG16 — the carve currently only
+         delivers+bumps. Audit `copy_data_to_buffer` freeing the slots before the ACK-GATE counts
+         them (the ACK-GATE's `rx_received` would be 0). This is the ACTUAL bytes_ok blocker.
+  (C0-b) THEN the §10.6 clock-coupling so the now-transmitted ACK round-trip fits receiving_timeout
+         WITHOUT the re-scan's full-window spin inflating the CMD timer. (ATTEMPT-2's re-scan gate is
+         the right shape for the timing half once an ACK actually exists to deliver.)
+This is a cross-layer ARQ change (CLAUDE.md §5), larger than the one-line timing coupling C0 was
+scoped as. NOT shipped; the worktree source is left at pristine 5e7cc15 (only this fact-doc updated).
+The two reverted attempts + this corrected diagnosis are recorded so the next session does not
+re-chase the timing-only framing.
+
+### §10.8 C0-a — THE FIX: wire the CLEAN big-block data-ACK via the production ACK-GATE (2026-06-09, fix/bigblock-d3-carve)
+
+**This is a PRODUCTION ARQ gap, not a sim artifact.** Confirmed by code trace (file:line below): a
+CLEAN big-block carve (n_clean==K) on the LIVE ARQ path delivers to the app FIFO + bumps bsi but
+NEVER transitions the responder to ACKNOWLEDGING_DATA, so the production clean-batch ACK transmitter
+(`process_messages_acknowledging_data`, arq_responder.cc:1489) is NEVER entered for a clean block.
+This is the SAME root cause as the HW "carve then BREAK CFG16->CFG15" win-blocker
+(MEMORY bigblock_livepath_p3 / minus10): the CMD sends the block, the RSP carves+delivers but sends
+no data-ACK, the CMD's clean-ACK wait times out -> first-batch ACK miss -> BREAK -> CFG16->CFG15
+demote + duplicate re-send. The sim merely made it cheaply reproducible.
+
+#### The asymmetry (root cause), file:line
+- CLEAN branch (`bigblock_block_to_arq`, test_bigblock_arq_unit.cc:199-264): on the LIVE path it
+  calls `copy_data_to_buffer()` (`:244`, marks the K slots RECEIVED->ACKED then FREES them),
+  sets `batch_data_delivered=true` (`:245`), and bumps `rsp_current_expected_batch_seq_id` (`:254-257`)
+  — but does NOT set `connection_status`. It stays RECEIVING. No ACK is ever queued.
+- PARTIAL branch (same fn, `:265-375`): on the LIVE path it sets
+  `connection_status = ACKNOWLEDGING_DATA` (`:359`), so the NEXT `process_messages_responder()` tick
+  (arq_responder.cc:38-42) enters the ACK-GATE and transmits the SACK_RSP. The PARTIAL path was
+  fixed (D2, "bigblock-chanest") to route through the audited ACK-GATE; the CLEAN path was NOT.
+- Even the per-frame RX-timeout->ACK-GATE transition (arq_responder.cc:1037-1040,
+  `get_nReceived_messages()!=0 -> ACKNOWLEDGING_DATA`) cannot rescue a clean big-block: the carve's
+  own `copy_data_to_buffer()` already FREED the K slots (arq_common.cc:9259/9264, every slot ->FREE),
+  so `get_nReceived_messages()==0` and the transition never fires.
+
+#### §1.5 CROSS-LAYER AUDIT — state changed: the CLEAN-carve delivery/ACK ordering
+1. **Producers** of the clean-block delivery + ACK state:
+   - The carve `bigblock_block_to_arq` CLEAN branch (test_bigblock_arq_unit.cc:199-264): writes
+     `messages_rx[0..K-1].status`, `last_received_end_of_batch_seq` (`:187`), `batch_rx_frame_count`
+     (`:188`), `rsp_prev_batch_*` (`:221-225`), `rsp_current_expected_batch_seq_id` (`:254-257`),
+     and (live) `copy_data_to_buffer`+`batch_data_delivered` (`:239-246`).
+   - The ACK-GATE clean path (arq_responder.cc:1768-1909): the production clean-batch ACK
+     transmitter — counts `rx_received` (`:1522-1524`), marks RECEIVED->ACKED (`:1773-1780`),
+     bumps `rsp_current_expected_batch_seq_id`/sets `rsp_prev_batch_seq_id` (`:1789-1797`), TX's the
+     all-ones MFSK-SACK ACK (`send_mfsk_ack_sack`, `:1830`), then delivers via `copy_data_to_buffer`
+     gated `!batch_data_delivered` (`:1886-1890`), returns to RECEIVING (`:1909`).
+2. **Consumers**: the CMD clean-batch ACK funnel (arq_commander.cc:3146-3199:
+   `data_ack_received=YES`, `last_batch_fully_acked`, `register_ack`, gearshift promotion). It needs
+   the all-ones ACK to carry the block's bsi. The dedupe/prev-completion consumer
+   (arq_responder.cc:738-784) reads `rsp_prev_batch_*`.
+3. **Valid states / pre-write defaults**: at carve entry the K slots are RECEIVED (set in the same
+   fn `:159-169`), `last_received_end_of_batch_seq=K-1`, `data_batch_size==K` (pinned at the rung),
+   `rsp_current_expected_batch_seq_id` may be -1 (uninitialized until the first DATA stamps it,
+   arq_responder.cc:620) — the carve seeds it (`:254`/`:355`).
+4. **Invariants consumers assume**: (INV-once-deliver) the block is delivered to the app FIFO EXACTLY
+   ONCE; (INV-once-bump) bsi advances EXACTLY ONCE per block; (INV-ack-bsi) the clean ACK carries the
+   block's bsi so the CMD's clean funnel matches; (INV-unit) the unit test
+   (`bigblock_skip_fifo_delivery=true`) reads `messages_rx[]` directly and requires the K slots stay
+   RECEIVED + `rsp_prev_batch_expected_count==K` + one bsi bump (CASE1/CASE3, :1012-1027/:1159-1184).
+5. **What the fix changes**: on the LIVE path ONLY (`!bigblock_skip_fifo_delivery`) the CLEAN branch
+   STOPS doing the in-carve delivery + bsi-bump + prev-bookkeeping and instead transitions
+   `connection_status = ACKNOWLEDGING_DATA` (mirroring the PARTIAL branch :359), handing the clean
+   block to the audited ACK-GATE — which TX's the ACK and delivers exactly once via its own
+   `copy_data_to_buffer` (`:1888`, `batch_data_delivered` left false so it fires) and bumps bsi once
+   (`:1789-1797`). The unit-test path (`bigblock_skip_fifo_delivery==true`) keeps the EXISTING
+   in-carve bookkeeping verbatim (it never enters the live ACK-GATE), so CASE1/CASE3 are unchanged.
+   Per-consumer walk: INV-once-deliver HELD (delivery moves from carve to ACK-GATE, still once;
+   `batch_data_delivered=false` on entry so the ACK-GATE delivers). INV-once-bump HELD (bump moves to
+   the ACK-GATE; the carve no longer bumps on the live path). INV-ack-bsi HELD (the carve seeds
+   `rsp_current_expected_batch_seq_id=block_bsi` when -1; the ACK-GATE sets
+   `rsp_prev_batch_seq_id=that` then bumps, and the ACK carries `ack_bsi=rsp_prev_batch_seq_id`
+   =block_bsi). INV-unit HELD (live split is guarded; unit path verbatim). Per-frame ACK path,
+   SACK bitmap, CMD ACK-wait/break logic: UNCHANGED — the fix only routes the clean big-block into
+   the SAME generic ACK-GATE the per-frame full-batch already uses; no new accounting, no threshold,
+   no per-frame-path edit.
+
+#### Production-impact verdict
+PRODUCTION ARQ GAP. Before this fix, a clean CFG16 big-block in production delivers to the app FIFO
+but transmits no data-ACK; the CMD times out, BREAKs, and re-sends. The fix makes the clean big-block
+ACK via the production ACK-GATE on the real live path (guarded only against the synthetic unit-test
+harness). It LIKELY also fixes the HW carve-then-BREAK win-blocker (same missing-ACK mechanism); HW
+confirmation stays gated on the testbed-emulator recovery (MEMORY testbed_emulator_lowpass_collapse).

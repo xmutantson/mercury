@@ -112,6 +112,18 @@ bool arq_sim_inproc_skip_tcp();
 void arq_set_sim_inproc_deliver_done(bool on);
 bool arq_sim_inproc_deliver_done();
 
+// SIM_INPROC OUTER-STEPPER gate (sim2-stepper-rewrite Phase b). Set true ONLY while
+// the 2-instance OUTER-loop stepper (MERCURY_SIM2_STEPPER=outer) is driving; makes
+// drain_playback_wait() QUEUE-and-return (no spin-drain) because the outer loop is the
+// SOLE DAC-drain driver (one symbol/instance/iter, both directions, like the two real
+// audio threads). The TX symbols are queued by tx_transfer and drained by the outer
+// loop on subsequent iters, so no TX site needs to block. Default false → production +
+// paced sim + the LEGACY pump stepper keep the verbatim blocking drain (byte-identical;
+// gated separately from arq_sim_inproc_active() so the legacy pump path is unaffected
+// until Phase d removes it). See data-flow-sim2-ofdm-delivery-cadence.md §10.
+void arq_set_sim_inproc_outer_stepper(bool on);
+bool arq_sim_inproc_outer_stepper_active();
+
 union u_SNR {
   float f_SNR;
   char char4_SNR[4];
@@ -446,6 +458,14 @@ public:
   // accept after pattern correlator lock. See
   // mercury/fact-documents/mfsk-robust-ack.md §3.2.
   uint16_t CRC12_calc(const char* data_byte, int nBytes);
+
+  // BLOCK-CRC (D2_BLOCKCRC, fix/bigblock-d3-carve): CRC-32 over `nItems` bytes,
+  // reflected (LSB-first) IEEE 802.3 — polynomial 0xEDB88320, init 0xFFFFFFFF,
+  // final XOR 0xFFFFFFFF. The whole-block integrity anchor stacked on top of the
+  // per-codeword CRC-8 (datalink_defines.h BIGBLOCK_BLOCK_CRC_*). Catches a K-block
+  // the 8-bit per-cw gates false-pass; on mismatch the block routes to PARTIAL/SACK
+  // and is never delivered.
+  uint32_t CRC32_calc(const char* data_byte, int nItems);
 
 	//! Updates timers values and check for timeouts.
 	    /*!
@@ -1053,6 +1073,17 @@ public:
   // See §14.
   int elevator_target_from_snr();
 
+  // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.4): apply the CFG16 big-block carve COOLDOWN
+  // as an additional index-cap on a proposed climb target. When the cooldown is armed
+  // (bigblock_carve_cooldown_batches > 0) and `proposed` is above the cooldown ceiling
+  // (CFG15), returns CFG15; otherwise returns `proposed` UNCHANGED. INDEX-MONOTONE
+  // never-raise clamp — composes order-independently with supershift_proven_ceiling /
+  // WB-NB ceiling / max_config_override (all "never raise"). Off the cooldown
+  // (batches==0, the normal case) it is the IDENTITY, so non-bigblock and clean-CFG16
+  // operation is byte-identical. Defined in arq_commander.cc next to
+  // elevator_target_from_snr(). See §4.4 + the §5 audit family-B (INV-B1).
+  int apply_bigblock_cooldown_cap(int proposed) const;
+
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
   // decodes NO LDPC data, so the canonical SNR_uplink producer
@@ -1349,6 +1380,16 @@ public:
   // dangling-data UAF + one-frame wait) delivers 0 bytes; PASS-AFTER delivers all.
   // Returns 0 on PASS. Selected by --test-bigblock-fullpath.
   static int test_sim_inproc_bigblock_fullpath();
+  // STEPPER-CORE REWRITE Phase b durable regression (--test-sim-sustain): drives the OUTER-loop
+  // stepper through a live ROBUST_0->CFG16 SET_CONFIG + OFDM big-block transfer and asserts the
+  // Phase-b headline — the (iii) nested-drain DATA-path wedge is GONE (ZERO [SIM2-DEADLOCK-BREAK])
+  // and the CFG16 K=8 block carves CLEAN 8/8 (per-symbol feed preserves the §8 decode cadence).
+  // FAIL-BEFORE = legacy stepper wedges (deadlock-break, 0 OFDM bytes); PASS-AFTER = no wedge,
+  // clean carve, bytes reach RX. Full multi-batch byte-correct sustain is the documented Phase-c
+  // turnaround-timing item (recorded as a DIAGNOSTIC, not asserted). Returns 0 on PASS.
+  // (MERGE: renamed *_outer() so it coexists with the PINNED-CFG15 sustain test below; both
+  //  run under --test-sim-sustain.)
+  static int test_sim_inproc_sustain_outer();
   // MULTI-CW WINDOW REGRESSION (fact-doc §17): the K>1 full-block byte-faithfulness test
   // the 622-byte synthetic cases and the single-arming fullpath could NOT catch. Drives a
   // FULL K=8 block (1200B, all 8 codewords) through the LIVE receive_bigblock+de-whiten+
@@ -1415,6 +1456,34 @@ public:
   // Reset to -1 by the regression before each arm.
   static int  bigblock_first_clean;
   static int  bigblock_first_K;
+  // CHANNEL-ESTIMATION HEALTH (fix/bigblock-chanest): the big-block RX mean|H| of the FIRST
+  // block carved this run. The genuine 2-instance regression (test_sim_inproc_bigblock_chanest)
+  // asserts it stays healthy (collapses toward 0 when an un-tracked CFO/SFO ramps a rotating
+  // phasor across the 133-symbol block — the off-bench reproduction of the HW [RXACQ] defect).
+  static double bigblock_first_meanh;
+  // D2 DELIVERY-ARMING capture (fix/bigblock-chanest, fact-doc bigblock-delivery-handoff §3/§7):
+  // for the FIRST big-block carved this run, whether the carve ARMED the prev-batch delivery
+  // machinery on a PARTIAL outcome. -1 = no partial block carved yet (or clean); 0 = PARTIAL
+  // but prev NOT armed (the D2 BUG: clean slots stranded -> INV-B violated); 1 = PARTIAL and
+  // the responder was routed to the audited ACK-GATE which arms rsp_prev_batch_active + sends
+  // the SACK (the D2 FIX). test_sim_inproc_bigblock_multicw ARM-D reads this to assert the
+  // delivery-arming fail-before (0) -> pass-after (1) deterministically on the FIRST block,
+  // without depending on the (separate, flaky) D3 selective-repeat recovery transport.
+  static int bigblock_first_partial_prev_armed;
+
+  // GENUINE big-block channel-estimation regression: drive the 2-instance SIM_INPROC CFG16
+  // big-block decode through the REAL ref==NULL path with a CFO/SFO-impaired channel; assert
+  // mean|H| collapse + 0-delivery (fail-before) and recovery to byte-faithful (pass-after).
+  static int test_sim_inproc_bigblock_chanest();
+
+  // ACQUISITION-WINDOW POSITION regression (fact-doc §19): drive ONE genuine K=8 CFG16
+  // big-block into a FIXED production-sized capture window at several IN-WINDOW preamble
+  // offsets (head, mid, near-end) and assert the §19 window-position guard DEFERS a
+  // late-landing block (tail past the window) and decodes 8/8 once the full block fits,
+  // vs the pre-fix DEFEAT_ACQGUARD arm which carves a TRUNCATED block (bytes_ok=0). This
+  // is the off-bench fail-before/pass-after for the HW ~5.6% acquisition-fraction defect
+  // the existing chanest harness cannot reproduce (it custom-sizes buffer_Nsymb to fit).
+  static int test_sim_inproc_bigblock_acqwindow();
 
   // SACK Design A Step 10 — Axis 2 controller (adaptive batch size).
   //
@@ -1542,6 +1611,18 @@ public:
   // the per-frame loop); false when it declined (MFSK / retx / mixed-control /
   // oversized batch -> stock per-frame path). Retx stays STOCK CFG16 per-frame.
   bool bigblock_send_one_block();
+  // bigblock_pack_block(): build the K*sub_len on-wire block payload (cw0 header prefix +
+  // per-codeword app bytes + the whole-block CRC-32 in cw(K-1)'s trailer + per-cw CRC-8
+  // tails) from the current new-data batch (messages_batch_tx[]). Extracted from
+  // bigblock_send_one_block so the V2 FIX-1 cap-reservation rule (the LAST codeword reserves
+  // BIGBLOCK_BLOCK_CRC_BYTES for the block-CRC field, fact-doc §9) lives in ONE place
+  // exercised by BOTH production AND the MAX-PAYLOAD test arm. Returns true + fills
+  // out_payload/out_K/out_sub_len/out_ndata/out_lengths (and stashes bigblock_tx_block_*)
+  // on success; false (decline -> stock per-frame path) when the geometry is too small or
+  // frame 0 does not fit cw0's reduced capacity.
+  bool bigblock_pack_block(int n_data, std::vector<unsigned char>& out_payload,
+                           int& out_K, int& out_sub_len, int& out_ndata,
+                           std::vector<int>& out_lengths);
   // bigblock_receive_carve(): the RX side — after receive_byte()->receive_bigblock()
   // decoded ONE block (stashing telecom_system->bigblock_last_rx_cw_ok + the K
   // decoded info-bit sub-units in `info_bits`), translate it into the ARQ data unit
@@ -1581,6 +1662,60 @@ public:
   // MERCURY_BIGBLOCK_DEFEAT_FIX=1 reproducer hook bypasses the clamp (returns stock_ftr)
   // so the SAME binary reproduces the pre-fix truncated-window corruption for the A/B.
   int bigblock_block_ftr_or(int stock_ftr);
+  // ACQUISITION-WINDOW POSITION GUARD — WAIT-FOR-TAIL (fact-doc §22, supersedes the §19
+  // defer-and-re-arm REGRESSION). The §17 ftr clamp made the snapshot WAIT for a block-span
+  // of FRESH symbols (the COUNT), but the snapshot still fires at a RANDOM ring write-head
+  // phase (the POSITION), so a block whose preamble lands late in the captured window has
+  // its tail STILL ARRIVING (future samples, not yet in the ring) when frames_to_read hits
+  // 0 -> bb_at zero-pads the tail -> the block-wide estimate collapses -> cw0 wire-CRC fails
+  // even on a perfect timing lock. bigblock_acq_window_fits() returns true when the FULL
+  // located block (head + preamble + Ngrid) fits inside the captured window (head_delay +
+  // block_nsymb*sym_samples <= capture_nsamples), i.e. the carve will see a complete block.
+  // When it returns false the receive() guard WAITS-FOR-TAIL: it re-arms frames_to_read to
+  // ONLY ceil(overrun/symbol_period)+1 fresh symbols (NOT a block-span — a block-span re-arm
+  // scrolls the head off the back of the ring, the §19 deadlock), leaves the ring INTACT
+  // (head must survive) and does NOT touch ring_write_index. The ring slides forward by that
+  // short wait so the SAME single transmission's tail arrives in-ring and the block re-lands
+  // earlier in the window -> fits -> carves 8/8 (no NAK/retransmit needed; geometry guarantees
+  // the head stays in-ring since block_span 64 sym <= ring 133 sym). Gated on the CFG16
+  // big-block rung; off-rung the guard is never entered (byte-identical).
+  // bigblock_rx_defer_count caps consecutive WAITS so a genuinely absent block falls through
+  // to the stock cw0-CRC gate instead of spinning. Reset on every accept.
+  bool bigblock_acq_window_fits();
+  int  bigblock_rx_defer_count = 0;
+  // WALL-B FIX-3 — RSP CARVE-SUSPEND WATCHDOG (bigblock_p3_hw/_wallb/fix3). While parked
+  // at CFG16 with the big-block rung elected, the RSP routes ALL CFG16 OFDM audio into the
+  // K=8 carve and block-spans EVERY frames_to_read re-arm to a ~74-symbol block window. The
+  // CMD FIX-4 demote SET_CONFIG (a ~13-symbol control frame, sent ON the CFG16 PHY per
+  // arq_commander.cc:3685-3692/4819-4822) and the BREAK burst then land mid-window: the
+  // carve rejects them on cw0-CRC and the GAP-3 stock fallback re-decodes the SAME oversized
+  // snapshot (control preamble mis-aligned -> FTR fail), so the RSP is structurally deaf to
+  // any control/BREAK at a rung it can only leave via the global LINK watchdog (HW 2026-06-09:
+  // WALLB_HW_VERDICT.json — RSP load_configuration tail …,15,16,16,100,100). After K
+  // consecutive cw0-CRC carve REJECTS with 0 accepts the RSP SUSPENDS the carve route AND
+  // the block-span re-arm FOR THE CFG16 RUNG, but STAYS at CFG16 PHY (it does NOT demote its
+  // own config — the CMD's demote/retransmits are CFG16-PHY until the ACK, so the RSP must
+  // stay at CFG16 to decode them). Suspended, the RSP behaves like the stock CFG16 OFDM
+  // receiver the climb already proved decodes SET_CONFIGs 13->14->15->16, so it decodes the
+  // CFG16-PHY demote, loads CFG15, ACKs; both peers run per-frame CFG15 instead of 0 bytes.
+  // INCREMENTED in the cw0-CRC reject branch (arq_common.cc:8186-8212); RESET to 0 on a real
+  // carve accept (arq_common.cc:8229, the recovery event) and on any arq-layer config change
+  // (load_configuration, arq_common.cc:1839 — only past the no-op guard). On the carve-SUCCESS
+  // path the first accept resets the streak to 0 so it never reaches K -> all three consumers
+  // are NO-OPs (carve-success byte-identical, INV-6). Provably safe: gated on CFG16 &&
+  // big-block-framing && streak>=K, unreachable on the carve-success path; no wire/TX change.
+  int  bigblock_rx_carve_fail_streak = 0;
+  static const int BIGBLOCK_CARVE_SUSPEND_K = 3;  // same scoping idiom as STALE_CFO_RESET_FAILS
+  // True iff the CFG16 carve route should be SUSPENDED (K consecutive cw0-CRC rejects, 0
+  // accepts). MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND=1 forces FALSE (restores the pre-fix deaf
+  // RSP) for the fail-before A/B arm; production never sets it.
+  bool bigblock_carve_suspended();
+  // WALL-B FIX-3 streak state-machine (ONE source of truth, called by the receive() carve-gate
+  // branches AND the unit test). note_carve_reject(): a real CFG16 cw0-CRC carve REJECT ->
+  // ++streak (and log [BB-CARVE-SUSPEND] on the K-th, returning true once it crosses K).
+  // note_carve_accept(): a real block carved -> reset streak to 0 (the recovery event).
+  bool bigblock_note_carve_reject();
+  void bigblock_note_carve_accept();
   // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
   // block carried + its geometry, so the in-process single-block harness can carve
   // it back byte-faithfully (the delivered==TX ground truth, INV-6).
@@ -1593,6 +1728,41 @@ public:
   // the in-process harness carves each sub-codeword its EXACT TX length byte-faithfully
   // (INV-6 with VARIABLE lengths; the production RX reads the same table off the wire).
   std::vector<int> bigblock_tx_block_lengths;
+
+  // ---- V2 FIX-2 (fact-doc §10): assembled-block integrity stash for the PARTIAL /
+  // SACK-completed delivery gate. The whole-block CRC-32 only gates the FULL-CLEAN carve
+  // (bigblock_receive_carve, n_clean==K). A KEPT codeword that the per-cw CRC-8 FALSE-PASSES
+  // (wrong bytes at the ~2^-8 floor) inside a PARTIAL block is transferred to messages_rx_prev[]
+  // and, once the GENUINE gap codewords are recovered, delivered via copy_data_to_buffer at the
+  // prev-batch completion (arq_responder.cc:738-784) with NO block-CRC check. FIX-2 stashes the
+  // block-integrity context HERE at a big-block PARTIAL carve so the completion can REASSEMBLE the
+  // K*sub_len codeword-aligned image from the prev slots and re-verify the SAME block-CRC-32
+  // before delivery; on mismatch the completion does NOT deliver (re-requests the block).
+  // Armed ONLY when cw(K-1) decoded CRC-8-clean at carve (it carries the block-CRC field, so its
+  // value is then trustworthy) -> NO false reject of a genuinely-clean completion. One-shot:
+  // consumed at completion / reset at the start of each carve. Big-block-scoped: a non-big-block
+  // prev completion (armed=false or bsi mismatch) is byte-identical to before.
+  bool          bigblock_partial_armed         = false;
+  int           bigblock_partial_block_bsi     = -1;   // the bsi (0..255) of the stashed block
+  int           bigblock_partial_K             = 0;
+  int           bigblock_partial_sub_len       = 0;
+  int           bigblock_partial_hdr_total     = 0;
+  int           bigblock_partial_cw0_offset    = 0;
+  unsigned int  bigblock_partial_expected_crc32= 0;    // TX block-CRC-32 read from cw(K-1) trailer
+  // V3 FIX (fact-doc §10/§14): the REAL decoded n_data (cw0 header byte payload[1], the count of
+  // filled codewords the TX emitted), parsed at the carve when cw0 is clean. The TX writes
+  // block_payload_bytes[1]=n_data (arq_common.cc:3987), which is <K for an UNDER-FILLED block
+  // (FIFO-drained / end-of-document tick). bigblock_partial_block_crc_ok() MUST reconstruct the
+  // header byte with THIS value (not the hard-coded K) or a genuinely-clean n_data<K PARTIAL block
+  // CRC-mismatches -> false-reject LIVELOCK (the §10 blocker). Stashed at the arm site alongside the
+  // expected CRC-32. Default -1 (unset, defensive) is treated as K at the consumer.
+  int           bigblock_partial_n_data        = -1;   // decoded cw0 n_data (filled-codeword count)
+  std::vector<int> bigblock_partial_lengths;            // per-codeword wire app lengths
+  // Verify the stashed block-CRC-32 over the K-codeword payload reassembled from messages_rx_prev[]
+  // (app bytes per slot + reconstructed cw0 header, with per-cw CRC tails + the block-CRC field
+  // zeroed — the SAME image the TX computed over). Returns true when the block is byte-consistent
+  // (deliver) and false on mismatch (do NOT deliver). Called at the prev-batch completion.
+  bool bigblock_partial_block_crc_ok();
 
   // ---- STEP 3: single-block end-to-end in the 2-instance in-process sim -------
   // test_sim_inproc_bigblock(): a dedicated single-block 2-instance ARQ harness
@@ -1656,6 +1826,18 @@ public:
   // fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1
   // (skips the load_configuration tail election). Returns 0 on all-pass, 1 on failure.
   static int test_bigblock_climb_election();
+  // WALL-B FIX-3 — RSP carve-suspend watchdog UNIT test (bigblock_p3_hw/_wallb/fix3).
+  // CLI: --test-bigblock-carve-suspend-unit. Deterministic in-process test on a REAL RSP
+  // cl_arq_controller at CFG16 (big-block framing on): drives the SHARED streak state machine
+  // (bigblock_note_carve_reject / _accept — the SAME methods the receive() carve-gate branches
+  // call) + the three consumers (bigblock_carve_suspended, bigblock_block_ftr_or revert, the
+  // BREAK-gate predicate) through every transition the AUDIT enumerates. Asserts: streak builds
+  // to K -> suspended; block-span re-arm reverts to stock; DEFEAT env restores the pre-fix deaf
+  // RSP (fail-before); reset-on-accept + reset-on-config-change (INV-3/RISK-A); off-rung NO-OP
+  // (INV-2); first-block-of-fresh-visit carves (RISK-D). Plus a REAL block loopback
+  // (transmit_byte -> receive_byte) under MERCURY_BIGBLOCK_SIM_CARVEFAIL=all confirming the
+  // receive() reject path drives the streak through the actual code. Returns 0 on all-pass.
+  static int test_bigblock_carve_suspend_unit();
   // R039 (race audit 2026-06-06) — OFDM SACK_RSP out-of-window reject test.
   // CLI: --test-sack-oow-reject. Builds a CRC8-VALID SACK_RSP payload with an
   // out-of-window batch_seq_id, drives the REAL decode_sack_v2_frame() (which is
@@ -1693,6 +1875,13 @@ public:
   // reachable), is idempotent on empty, and repeatable across recoveries.
   // Returns 0=PASS, 1=FAIL.
   int test_retx_clear_on_recovery();
+
+  // FIX-6 — RX-delivery drain backpressure regression (the deterministic
+  // 61,621-byte stall). CLI: --test-rx-drain-backpressure. FAILS at HEAD
+  // 62cb3dc (lossy drain drops popped bytes on a back-pressured non-blocking
+  // socket), PASSES after the non-lossy drain. See source/datalink_layer/
+  // test_rx_drain.cc + bigblock_p3_hw/_wallb/fix6/.
+  int test_rx_drain_backpressure();
 
   // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
   // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
@@ -1801,8 +1990,16 @@ public:
   void process_messages_acknowledging_data();
   void process_control_responder();
   void process_buffer_data_responder();
+  // FIX-6: non-lossy RX-delivery send (handles non-blocking-socket back-pressure
+  // by stashing the unsent tail in rx_deliver_pending). Returns false when the
+  // app socket back-pressured and the caller must stop draining for this tick.
+  bool rx_deliver_send(const char* src, int length);
 
   void copy_data_to_buffer();
+  // FIX-6 Mouth B: non-lossy producer push into fifo_buffer_rx (drains the app
+  // socket to free room, surfaces any residual instead of silently dropping).
+  // Returns bytes actually stored (== len on success).
+  int fifo_push_rx(const char* buf, int len);
   void restore_backup_buffer_data();
   void restore_tx_from_compressed();  // Decompress messages_tx back to raw in fifo_buffer_tx
 
@@ -2089,6 +2286,12 @@ public:
                                          //      visibility window). Indicates
                                          //      a stalled retransmit cycle;
                                          //      logged via [RSP-V2-PREV-STALE].
+  // V2 FIX-2 (fact-doc §10): count of SACK-completed big-blocks REJECTED at the
+  // prev-batch completion because the reassembled-block CRC-32 mismatched (a kept
+  // codeword false-passed its per-cw CRC-8). Each reject drops the prev-batch
+  // undelivered so the CMD re-emits the block. Diagnostic; logged via
+  // [RSP-V2-PREV-BLOCKCRC-REJECT]. Initialized to 0 (init_messages_buffers reset path).
+  long long rsp_prev_batch_blockcrc_reject_count = 0;
 
   // SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
   // ALL CMD-side; gated on `sack_v2_enabled` at the call sites. v1 sessions
@@ -2300,6 +2503,22 @@ public:
   cl_fifo_buffer fifo_buffer_tx;
   cl_fifo_buffer fifo_buffer_rx;
   cl_fifo_buffer fifo_buffer_backup;
+
+  // FIX-6 (non-lossy RX delivery drain). The responder drains fifo_buffer_rx into
+  // the app data socket inside process_buffer_data_responder(). The socket is
+  // non-blocking; on a full OS send buffer send() returns short / would-block.
+  // Pre-fix the popped-and-transformed bytes were DISCARDED (the deterministic
+  // 61,621-byte stall). These hold the transformed-but-unsent TAIL so the next
+  // ARQ tick re-sends it IN ORDER before popping more raw bytes — converting
+  // silent loss into bounded buffering + natural backpressure. The pending unit
+  // is the POST-transform stream (correct for B2F, where the raw bytes are
+  // consumed by the parser and cannot be pushed back into the raw FIFO — audit
+  // R4). Sized MAX_BUFFER_SIZE: a single send unit is what the drain memcpy's into
+  // tcp_socket_data.message->buffer (also MAX_BUFFER_SIZE), so the stashed tail can
+  // never exceed it; the pop budget (~172 B) and the B2F reroll of one popped chunk
+  // are both far under this bound.
+  char rx_deliver_pending[MAX_BUFFER_SIZE];
+  int  rx_deliver_pending_len = 0;
 
   cl_telecom_system* telecom_system;
 
@@ -2699,6 +2918,23 @@ public:
                                        // between), break_drop_step is force-set
                                        // high enough to jump straight to ROBUST_0
                                        // instead of walking the ladder.
+  // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.1, WALLB_DIAGNOSIS.md §1.6): CFG16 big-block
+  // carve COOLDOWN. CMD-ONLY (never on the wire — INV-B2). After a FIX-4 carve-viability
+  // demote (arq_commander.cc:3669), the CFG16 big-block rung is proven non-viable on THIS
+  // channel; cap the climb at CFG15 for `bigblock_carve_cooldown_batches` completed batches
+  // so the SNR re-trigger / turbo forward / ladder-up CANNOT re-elect the carve-dead rung.
+  // UNLIKE supershift_proven_ceiling (which finish_turbo_direction() resets to the probe
+  // top at :4147), this field is NOT touched by the turbo state machine, so it SURVIVES the
+  // BREAK->ROBUST_0 collapse + full turbo re-climb that is the limit cycle.
+  // Producers: ARM/extend at the FIX-4 demote (arq_commander.cc:~3672); DECREMENT per
+  // completed batch at the per-batch eval tail (the ceiling_success_count cadence);
+  // CLEAR-on-success at the data-ACK reset (:3804) GATED on
+  // current_configuration==CONFIG_16 && big-block framing live (INV-B3 — a per-frame CFG15
+  // data-ACK must NOT clear it); INIT 0 in ctor + reset_session_state (R3). Consumers:
+  // apply_bigblock_cooldown_cap() at the climb hooks (gearshift LADDER-UP/CEILING-RECOVERY,
+  // turbo SNR-SUPERSHIFT, elevator_target_from_snr, finish_turbo_direction start_config).
+  int bigblock_carve_cooldown_batches{0};  // >0 = CFG16 election suppressed this many more batches
+  int bigblock_carve_cooldown_span{0};     // last window length, for AARF exponential growth
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)

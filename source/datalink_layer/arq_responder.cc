@@ -738,6 +738,50 @@ void cl_arq_controller::process_messages_rx_data_control()
 						if(rsp_prev_batch_active
 						   && rsp_prev_batch_received_count >= rsp_prev_batch_expected_count)
 						{
+							// V2 FIX-2 (fact-doc §10): the SACK-completed assembled-block delivery
+							// gate. If THIS completing prev-batch is a stashed big-block (armed at
+							// the PARTIAL carve, bsi matches), re-verify the whole-block CRC-32 over
+							// the K-codeword image reassembled from messages_rx_prev[] BEFORE
+							// delivering — a KEPT codeword that the per-cw CRC-8 FALSE-PASSED would
+							// otherwise deliver wrong bytes here at the unchanged ~2^-8 floor (the §5
+							// residual). On mismatch: do NOT deliver — clear the prev-batch so the
+							// CMD's ACK-timeout re-emits the whole block (fresh decode). Big-block-
+							// scoped: a non-big-block / non-armed prev completion (bigblock_partial_armed
+							// false or bsi mismatch) is byte-identical to before (gate passes through).
+							// MERCURY_BIGBLOCK_DEFEAT_PARTIALCRC=1 disables the reject on the SAME binary
+							// (restores the pre-fix silent-wrong-byte delivery) for the ARM-G fail-before.
+							bool prev_deliver_ok = true;
+							if(bigblock_partial_armed
+							   && bigblock_partial_block_bsi == rsp_prev_batch_seq_id)
+							{
+								bool defeat_partialcrc = false;
+								{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_PARTIALCRC");
+								  if(e && *e && atoi(e)!=0) defeat_partialcrc = true; }
+								bool crc_ok = bigblock_partial_block_crc_ok();
+								bigblock_partial_armed = false;   // one-shot: consumed at completion
+								if(!crc_ok && !defeat_partialcrc)
+									prev_deliver_ok = false;
+							}
+							if(!prev_deliver_ok)
+							{
+								// REJECT: a kept codeword false-passed its per-cw CRC-8 -> the assembled
+								// block is byte-wrong. Drop the prev-batch WITHOUT delivering and WITHOUT
+								// a clean ACK, so the CMD never sees this block ACKed and its ACK-timeout
+								// re-emits the whole block (a fresh decode is independent of this carve).
+								for(int i=0; i<this->nMessages; i++)
+									messages_rx_prev[i].status = FREE;
+								rsp_prev_batch_active            = false;
+								rsp_prev_batch_received_count    = 0;
+								rsp_prev_batch_expected_count    = 0;
+								rsp_prev_batch_blockcrc_reject_count++;
+								printf("[RSP-V2-PREV-BLOCKCRC-REJECT] prev_batch_seq_id=%d NOT delivered "
+									"(assembled-block CRC-32 mismatch: a kept codeword FALSE-PASSED per-cw "
+									"CRC-8); prev dropped -> CMD re-emits the block (reject_count=%lld)\n",
+									rsp_prev_batch_seq_id, rsp_prev_batch_blockcrc_reject_count);
+								fflush(stdout);
+							}
+							else
+							{
 							if(compressor.is_streaming() && batch_data_delivered) {
 								// V1 defense: out-of-order prev-batch delivery would desync the
 								// streaming PPMd model. Current batch already committed; prev-batch
@@ -832,6 +876,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 									send_ack_pattern();
 								}
 							}
+							}   // end V2 FIX-2 SACK-completed delivery (prev_deliver_ok else-branch close)
 						}
 					}
 					else
@@ -2885,12 +2930,68 @@ void cl_arq_controller::process_control_responder()
 
 }
 
+// FIX-6 (the deterministic 61,621-byte stall): send `length` bytes from `src` to
+// the app data socket NON-LOSSILY. transmit() is a bare non-blocking send(); on a
+// full OS send buffer it returns short (0..length-1) or would-block (<0). Pre-fix
+// the caller IGNORED that return and the already-popped bytes were DISCARDED → the
+// CMD had already ACKed the batch (no retransmit) → permanent byte-deterministic
+// plateau. Here we capture the result and stash the UNSENT TAIL in
+// rx_deliver_pending so the next ARQ tick re-sends it IN ORDER before popping more
+// raw bytes — bounded buffering + natural backpressure, zero loss.
+//   returns true  = fully sent (continue draining),
+//           false = back-pressured, tail stashed, caller must stop draining.
+bool cl_arq_controller::rx_deliver_send(const char* src, int length)
+{
+	if(length <= 0) return true;
+
+	// Defensive: a single send unit can never exceed the socket message buffer
+	// (MAX_BUFFER_SIZE). The original drain assumed this; clamp so a pathological
+	// B2F over-expansion cannot overflow message->buffer. The remainder (if any)
+	// is handled exactly like a short write below.
+	if(length > MAX_BUFFER_SIZE)
+		length = MAX_BUFFER_SIZE;
+
+	memcpy(tcp_socket_data.message->buffer, src, length);
+	tcp_socket_data.message->length = length;
+
+	int n = tcp_socket_data.transmit();
+
+	if(n >= length)
+	{
+		return true;                       // fully sent
+	}
+
+	// Short write (0<=n<length) or would-block (n<0): stash the unsent tail so it
+	// re-sends, in order, next tick. The pending buffer holds at most one send
+	// unit (MAX_BUFFER_SIZE, the socket message buffer bound).
+	int unsent = (n < 0) ? length : (length - n);
+	const char* tail = (n < 0) ? src : (src + n);
+	if(unsent > (int)sizeof(rx_deliver_pending))
+		unsent = (int)sizeof(rx_deliver_pending);   // safety clamp (cannot trigger: length<=buf)
+	// memmove (NOT memcpy): when re-sending the pending tail, src IS
+	// rx_deliver_pending, so tail (src+n) overlaps the destination.
+	memmove(rx_deliver_pending, tail, unsent);
+	rx_deliver_pending_len = unsent;
+	return false;
+}
+
 void cl_arq_controller::process_buffer_data_responder()
 {
 	if(link_status==CONNECTED)
 	{
 		if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
 		{
+			// FIX-6: first re-send any tail the previous tick could not push
+			// (app socket was back-pressured). Stop the whole drain if it is
+			// still congested — do NOT pop more raw bytes ahead of it (INV-1
+			// in-order delivery).
+			if(rx_deliver_pending_len > 0)
+			{
+				if(!rx_deliver_send(rx_deliver_pending, rx_deliver_pending_len))
+					return;                 // still congested; tail re-stashed
+				rx_deliver_pending_len = 0;  // tail fully drained
+			}
+
 			while(fifo_buffer_rx.get_size()!=fifo_buffer_rx.get_free_size())
 			{
 				// Pop raw data from RX FIFO
@@ -2899,10 +3000,16 @@ void cl_arq_controller::process_buffer_data_responder()
 				// data-pop size; v1 (default) identical to legacy macro.
 				int rx_raw_len = fifo_buffer_rx.pop(rx_raw, max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled));
 
+				// Build the to-send unit (`send_buf`/`send_len`). For B2F the unit is
+				// the POST-transform stream (the raw bytes are consumed by the parser
+				// and cannot be re-popped — audit R4); otherwise it is rx_raw verbatim.
+				char b2f_buf[MAX_BUFFER_SIZE * 4]; // LZHUF can be larger than plaintext (rare)
+				const char* send_buf = rx_raw;
+				int send_len = 0;
+
 				// B2F filter: parse incoming stream, reroll plaintext to LZHUF
 				if(b2f_handler.is_initialized())
 				{
-					char b2f_buf[MAX_BUFFER_SIZE * 4]; // LZHUF can be larger than plaintext (rare)
 					int b2f_len = b2f_handler.filter_rx(rx_raw, rx_raw_len,
 						b2f_buf, sizeof(b2f_buf));
 
@@ -2919,28 +3026,37 @@ void cl_arq_controller::process_buffer_data_responder()
 
 					if(b2f_len > 0)
 					{
-						memcpy(tcp_socket_data.message->buffer, b2f_buf, b2f_len);
-						tcp_socket_data.message->length = b2f_len;
+						send_buf = b2f_buf;
+						send_len = b2f_len;
 					}
 					else if(!b2f_handler.is_b2f_session())
 					{
-						memcpy(tcp_socket_data.message->buffer, rx_raw, rx_raw_len);
-						tcp_socket_data.message->length = rx_raw_len;
+						send_buf = rx_raw;
+						send_len = rx_raw_len;
 					}
 					else
 					{
 						// B2F active, parser accumulating partial line -- don't send raw
-						tcp_socket_data.message->length = 0;
+						send_len = 0;
 					}
 				}
 				else
 				{
-					memcpy(tcp_socket_data.message->buffer, rx_raw, rx_raw_len);
-					tcp_socket_data.message->length = rx_raw_len;
+					send_buf = rx_raw;
+					send_len = rx_raw_len;
 				}
 
-				if(tcp_socket_data.message->length > 0)
-					tcp_socket_data.transmit();
+				// FIX-6: non-lossy send. On back-pressure the unsent tail is stashed
+				// in rx_deliver_pending and we STOP draining (the popped raw bytes are
+				// already transformed into send_buf, so nothing is lost — the tail is
+				// re-sent next tick). The B2F parser state already advanced for the
+				// raw bytes we popped, so we must NOT re-pop them; stashing the
+				// transformed tail is the correct non-lossy unit.
+				if(send_len > 0)
+				{
+					if(!rx_deliver_send(send_buf, send_len))
+						return;              // congested; tail stashed, resume next tick
+				}
 			}
 		}
 

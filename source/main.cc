@@ -471,17 +471,29 @@ int main(int argc, char *argv[])
     bool test_bigblock_fullpath_cli = false; // --test-bigblock-fullpath: LIVE 2-instance CFG16 big-block transfer
                                         // through the REAL receive_bigblock+carve+whiten+FIFO deliver path with
                                         // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
-    bool test_sim_sustain_cli = false;  // --test-sim-sustain: SIM_INPROC PINNED-CFG15 sustained-delivery
-                                        // stepper-wedge regression (payloads 600/2000/4000/8000) with fail-before/
-                                        // pass-after on the same binary. One-shot at startup, exit rc.
-                                        // See fact-documents/SIMFTR_ROOTCAUSE.md §7/§8 fix #1.
+    bool test_sim_sustain_cli = false;  // --test-sim-sustain: SIM_INPROC sustain BATTERY (runs BOTH, OR of rc):
+                                        // (1) PINNED-CFG15 sustained-delivery stepper-wedge regression (payloads
+                                        // 600/2000/4000/8000; SIMFTR_ROOTCAUSE.md §7/§8 fix #1), then (2) OUTER-stepper
+                                        // OFDM big-block no-wedge + clean-carve + C0-a byte-correct sustain (Phase b).
+                                        // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
                                         // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
                                         // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
+    bool test_bigblock_chanest_cli = false; // --test-bigblock-chanest: GENUINE (ref==NULL) 2-instance CFG16 big-block
+                                        // decode under a CFO/SFO-impaired channel; reproduces the HW [RXACQ] meanH
+                                        // collapse off-bench (clean passes, CFO/SFO collapses the block estimate).
+    bool test_bigblock_acqwindow_cli = false; // --test-bigblock-acqwindow: §19 acquisition-window POSITION guard —
+                                        // one genuine K=8 block at several in-window preamble offsets in a FIXED
+                                        // production-sized window; near-end (tail past window) DEFERS (guard ON) /
+                                        // carves truncated bytes_ok=0 (DEFEAT_ACQGUARD). Reproduces the HW ~5.6% bug.
     bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
                                         // One-shot at startup, then exit rc. See data-flow-bigblock-arq-unit.md §16.
+    bool test_bigblock_carve_suspend_unit_cli = false; // --test-bigblock-carve-suspend-unit: WALL-B FIX-3 RSP
+                                        // carve-suspend watchdog unit test (streak state machine + the three consumers
+                                        // + a real receive_byte cw0-reject loopback). fail-before via
+                                        // MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND. One-shot at startup, then exit rc.
     bool test_bigblock_txlevel_cli = false; // --test-bigblock-txlevel: measure CFG16 big-block vs stock-OFDM TX
                                         // peak+RMS (HW over-level diag). One-shot at startup, then exit rc.
     bool test_sack_oow_reject_cli = false; // --test-sack-oow-reject: R039 — OFDM SACK_RSP out-of-window
@@ -496,6 +508,9 @@ int main(int argc, char *argv[])
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
+    bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
+                                        // must NOT drop popped bytes when the non-blocking app socket back-pressures.
+                                        // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
@@ -1008,10 +1023,15 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "--test-sim-sustain") == 0)
         {
-            // SIM_INPROC STEPPER-WEDGE REGRESSION (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): a
-            // PINNED-CFG15 clean sustained-delivery transfer for payloads 600/2000/4000/8000,
-            // asserting each terminates byte-correct via the genuine delivery break (not the
-            // post-transfer keepalive spin), with fail-before/pass-after on the same binary.
+            // SIM_INPROC SUSTAIN BATTERY (runs BOTH durable sustain regressions, OR of their rc):
+            //  (1) STEPPER-WEDGE (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): a PINNED-CFG15 clean
+            //      sustained-delivery transfer for payloads 600/2000/4000/8000, asserting each
+            //      terminates byte-correct via the genuine delivery break (not the post-transfer
+            //      keepalive spin), with fail-before/pass-after on the same binary.
+            //  (2) STEPPER-CORE REWRITE Phase b: the OUTER-loop stepper drives a live
+            //      ROBUST_0->CFG16 OFDM big-block transfer; asserts the (iii) DATA-path wedge is
+            //      gone (ZERO [SIM2-DEADLOCK-BREAK]) + the K=8 block carves clean 8/8 + C0-a
+            //      full byte-correct sustain.
             // One-shot at startup, then exit rc.
             test_sim_sustain_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
@@ -1024,6 +1044,27 @@ int main(int argc, char *argv[])
             // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
             // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
             test_bigblock_multicw_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-chanest") == 0)
+        {
+            // GENUINE channel-estimation regression (fix/bigblock-chanest): the 2-instance
+            // CFG16 big-block decode (ref==NULL) under a CFO/SFO-impaired channel. Reproduces
+            // the HW [RXACQ] meanH collapse OFF-BENCH (clean default passes; CFO/SFO collapses
+            // the block-wide estimate -> 0-delivery). One-shot.
+            test_bigblock_chanest_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-acqwindow") == 0)
+        {
+            // §19 acquisition-window POSITION guard regression (fix/bigblock-chanest): drive ONE
+            // genuine K=8 CFG16 block at several in-window preamble offsets in a FIXED production-
+            // sized capture window; assert the near-end (tail-past-window) block DEFERS (guard ON)
+            // / carves a truncated bytes_ok=0 block (DEFEAT_ACQGUARD). Reproduces the HW ~5.6%
+            // acquisition-fraction defect off-bench. One-shot.
+            test_bigblock_acqwindow_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1042,6 +1083,16 @@ int main(int argc, char *argv[])
             // symmetric on both peers, and the elected rung emits + delivers byte-faithful.
             // fail-before/pass-after on the same binary. One-shot at startup, then exit rc.
             test_bigblock_climb_election_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-carve-suspend-unit") == 0)
+        {
+            // WALL-B FIX-3: RSP carve-suspend watchdog unit test — the streak state machine
+            // (bigblock_note_carve_reject/_accept) + the three consumers + a real receive_byte
+            // cw0-reject loopback. fail-before via MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND.
+            // One-shot at startup, then exit rc.
+            test_bigblock_carve_suspend_unit_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -1078,6 +1129,15 @@ int main(int argc, char *argv[])
             // at startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.1 / §5.1.
             test_retx_clear_on_recovery_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rx-drain-backpressure") == 0)
+        {
+            // FIX-6 — RX-delivery drain backpressure regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // source/datalink_layer/test_rx_drain.cc + fix6/STALL_ROOTCAUSE.md.
+            test_rx_drain_backpressure_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2248,16 +2308,27 @@ start_modem:
             exit(rc);
         }
         if (test_sim_sustain_cli) {
-            // SIM_INPROC STEPPER-WEDGE REGRESSION (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): drive
-            // PINNED-CFG15 clean transfers (payloads 600/2000/4000/8000) and assert each
-            // terminates byte-correct via the genuine delivery break (NOT the post-transfer
-            // keepalive ↔ pumped-wait spin), with fail-before (MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1
-            // -> wedge reproduced -> watchdog-stalled) / pass-after on the SAME binary.
-            printf("[FLAG] --test-sim-sustain: invoking SIM_INPROC PINNED-CFG15 sustained-"
-                   "delivery stepper-wedge regression\n");
+            // SIM_INPROC SUSTAIN BATTERY — runs BOTH durable sustain regressions back-to-back on
+            // the SAME binary and exits with the OR of their return codes (any failure -> nonzero):
+            //  (1) STEPPER-WEDGE (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): PINNED-CFG15 clean transfers
+            //      (payloads 600/2000/4000/8000), each must terminate byte-correct via the genuine
+            //      delivery break (NOT the post-transfer keepalive <-> pumped-wait spin), with
+            //      fail-before (MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1 -> wedge -> watchdog-stalled).
+            //  (2) STEPPER-CORE REWRITE Phase b: OUTER-loop stepper, live ROBUST_0->CFG16 OFDM
+            //      big-block transfer; asserts the (iii) data-path wedge is gone (ZERO
+            //      [SIM2-DEADLOCK-BREAK]) + clean K=8 carve + C0-a full byte-correct sustain.
+            printf("[FLAG] --test-sim-sustain: invoking SIM_INPROC sustain battery — "
+                   "(1) PINNED-CFG15 stepper-wedge regression, then "
+                   "(2) OUTER-stepper OFDM big-block no-wedge + clean-carve (Phase b)\n");
             fflush(stdout);
-            int rc = cl_arq_controller::test_sim_inproc_sustain();
-            printf("[FLAG] Sim-sustain test complete (rc=%d) — exiting.\n", rc);
+            int rc1 = cl_arq_controller::test_sim_inproc_sustain();
+            printf("[FLAG] --test-sim-sustain (1) PINNED-CFG15 stepper-wedge: rc=%d\n", rc1);
+            fflush(stdout);
+            int rc2 = cl_arq_controller::test_sim_inproc_sustain_outer();
+            printf("[FLAG] --test-sim-sustain (2) OUTER-stepper big-block: rc=%d\n", rc2);
+            fflush(stdout);
+            int rc = (rc1 != 0 || rc2 != 0) ? 1 : 0;
+            printf("[FLAG] Sim-sustain battery complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
@@ -2273,6 +2344,32 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
             printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_chanest_cli) {
+            // GENUINE channel-estimation regression (fix/bigblock-chanest): drive the 2-instance
+            // CFG16 big-block decode (ref==NULL) under a CFO/SFO-impaired channel; assert the
+            // block-wide estimate collapses (fail-before) and recovers byte-faithful (pass-after).
+            // Reproduces the HW [RXACQ] meanH~0.005 collapse off-bench. One-shot, then exit rc.
+            printf("[FLAG] --test-bigblock-chanest: invoking GENUINE big-block channel-estimation "
+                   "regression (CFO/SFO-impaired 2-instance decode)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_chanest();
+            printf("[FLAG] Bigblock-chanest test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_acqwindow_cli) {
+            // §19 acquisition-window POSITION guard regression: drive ONE genuine K=8 CFG16 block
+            // at several in-window preamble offsets in a FIXED production-sized window; assert the
+            // near-end block (tail past window) DEFERS (guard ON) and carves a truncated bytes_ok=0
+            // block under DEFEAT_ACQGUARD. Off-bench reproduction of the HW ~5.6% defect. One-shot.
+            printf("[FLAG] --test-bigblock-acqwindow: invoking §19 acquisition-window POSITION guard "
+                   "regression (in-window preamble offsets, fixed capture window)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_acqwindow();
+            printf("[FLAG] Bigblock-acqwindow test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
@@ -2296,6 +2393,18 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_bigblock_climb_election();
             printf("[FLAG] Bigblock-climb-election test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_carve_suspend_unit_cli) {
+            // WALL-B FIX-3: RSP carve-suspend watchdog unit test (one-shot, then exit rc).
+            // The streak state machine + the three consumers + a real receive_byte cw0-reject
+            // loopback; fail-before via MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND.
+            printf("[FLAG] --test-bigblock-carve-suspend-unit: invoking WALL-B FIX-3 RSP "
+                   "carve-suspend watchdog unit test\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_carve_suspend_unit();
+            printf("[FLAG] Bigblock-carve-suspend-unit test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
@@ -2336,6 +2445,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_retx_clear_on_recovery();
             printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_rx_drain_backpressure_cli) {
+            // FIX-6 — RX-delivery drain backpressure (one-shot, then exit rc).
+            printf("[FLAG] --test-rx-drain-backpressure: invoking FIX-6 "
+                   "RX-delivery drain backpressure regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rx_drain_backpressure();
+            printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

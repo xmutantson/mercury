@@ -150,6 +150,22 @@ public:
 	// (~24 Hz on RPi CM108) puts MFSK tones at FFT half-bin boundary.
 	double last_coarse_freq_offset;
 
+	// STALE-CFO SCOPED RESET (long-run-degradation.md §2.2): counts CONSECUTIVE
+	// full OFDM-decode failures. The receive() last-trial fallback
+	// (telecom_system.cc:2510) reuses freq_offset_of_last_decoded_message as the
+	// demod mixer when every fresh sync fails; that stale value is written ONLY
+	// on a successful OFDM decode (:3171) and was NEVER cleared on failure, so a
+	// marginal frame that latches an edge-of-range CFO poisons every subsequent
+	// acquisition (the link can never relock -> WB dies -> parks ROBUST until a
+	// process restart). This counter SCOPES the cure: incremented on each failed
+	// OFDM receive, reset to 0 on any OFDM success; when it crosses
+	// STALE_CFO_RESET_FAILS it clears the stale CFO + last_coarse_freq_offset so
+	// the NEXT acquisition re-measures from scratch. A SINGLE dropped frame does
+	// NOT trip it, preserving the deliberate last-trial / MINI-preamble (LEVER P)
+	// reuse and the cfg=6 throughput stickiness (arq_common.cc:3850-3854) on a
+	// healthy link (where the counter stays at 0). Reset in init()/load_configuration.
+	int consecutive_ofdm_decode_fails;
+
 	// MFSK short control frames: punctured LDPC for ACK/control messages
 	int ctrl_nBits;    // interleaved bits to transmit for ctrl frames (0 = no puncturing)
 	int ctrl_nsymb;    // MFSK symbols for ctrl frames
@@ -699,6 +715,27 @@ public:
 	std::vector<int> bigblock_last_rx_cw_ok;
 	int bigblock_last_rx_K = 0;
 	int bigblock_last_rx_cw_ok_count = 0;
+	// CHANNEL-ESTIMATION HEALTH stash (fix/bigblock-chanest): the mean |estimated_channel|
+	// over the last big-block RX. Healthy ~0.24 (the big-block raw |H| scale on the clean
+	// calibrated sim cell); collapses toward ~0 when an un-tracked CFO/SFO ramps a rotating
+	// phasor across the 133-symbol block (the genuine-path defect). Set unconditionally in
+	// bigblock_rx_passband so the genuine 2-instance test can assert on it directly (the
+	// DIAG print is env-gated; this stash is always live).
+	double bigblock_last_rx_meanh = -1.0;
+
+	// ACQUISITION-WINDOW POSITION stash (fix/bigblock-chanest §19): the located head
+	// preamble start (FULL-RATE samples) of the last big-block RX, and the captured-window
+	// length (samples) the decode ran over. The ARQ window-position guard reads BOTH to
+	// decide whether the FULL block (head + preamble + Ngrid) fit inside the captured
+	// window or whether its tail was zero-padded (the block landed too late in the window /
+	// its tail had not yet arrived in the ring at snapshot time). When the block would
+	// overrun the captured samples, the guard DEFERS the carve one arming cycle instead of
+	// decoding a truncated block (§19.3). bigblock_rx_passband resets head_delay to -1 at
+	// entry (acq-fail leaves -1); receive_bigblock stamps capture_nsamples to the nSamples
+	// it decoded. Diagnostic-stash convention (mirrors bigblock_last_rx_meanh); off-rung
+	// they are never read -> production byte-identical.
+	long bigblock_last_rx_head_delay_samples = -1;
+	int  bigblock_last_rx_capture_nsamples   = 0;
 
 	// CFG16 CARVE-GATE HARDENING (cfg16-controlack-hold, GAP3): a one-shot RX
 	// intent override that SUPPRESSES the big-block route in receive_byte for the

@@ -161,6 +161,17 @@ static bool g_sim_inproc_deliver_done = false;
 void arq_set_sim_inproc_deliver_done(bool on) { g_sim_inproc_deliver_done = on; }
 bool arq_sim_inproc_deliver_done()            { return g_sim_inproc_deliver_done; }
 
+// STEPPER-CORE REWRITE Phase b: the DRAIN-TO-WIRE-ONLY pump (arq_commander.cc
+// sim_inproc_drain_to_wire_only). Installed alongside the main pump by the OUTER stepper. Under
+// the OFDM DATA path, drain_playback_wait spins THIS (not the full pump) to EGRESS the big-block
+// out of the TX play ring into the in-flight wire WITHOUT bursting it to the RX — the outer loop
+// then feeds the wire -> RX one symbol per iter (decode pacing preserved). Shares the same ctx.
+static sim_inproc_pump_fn g_sim_inproc_drain_only_pump = nullptr;
+void arq_set_sim_inproc_drain_only_pump(sim_inproc_pump_fn fn)
+{
+	g_sim_inproc_drain_only_pump = fn;
+}
+
 // SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5/§10.7-item-4).
 // process_main()'s top blocks poll tcp_socket_control / tcp_socket_data (accept,
 // recv, transmit). The 2-instance stepper binds NO socket and injects user
@@ -173,6 +184,78 @@ bool arq_sim_inproc_deliver_done()            { return g_sim_inproc_deliver_done
 static bool g_sim_inproc_skip_tcp = false;
 void arq_set_sim_inproc_skip_tcp(bool on) { g_sim_inproc_skip_tcp = on; }
 bool arq_sim_inproc_skip_tcp()            { return g_sim_inproc_skip_tcp; }
+
+// SIM_INPROC OUTER-STEPPER gate (sim2-stepper-rewrite Phase b). Non-null/true ONLY
+// while the 2-instance OUTER-loop stepper (MERCURY_SIM2_STEPPER=outer) is driving.
+// When set, drain_playback_wait() QUEUE-and-returns (no spin-drain): the outer loop
+// is the SOLE DAC-drain driver, so every TX site becomes queue-and-return uniformly
+// with this single seam (tx_transfer already queues, audioio.c:1691). Gated SEPARATELY
+// from arq_sim_inproc_active() so the LEGACY pump stepper (still runnable until Phase d)
+// keeps its pump-driven blocking drain. Production + paced sim never set it (false →
+// verbatim blocking body → byte-identical). See data-flow-sim2-ofdm-delivery-cadence.md §10.
+static bool g_sim_inproc_outer_stepper = false;
+void arq_set_sim_inproc_outer_stepper(bool on) { g_sim_inproc_outer_stepper = on; }
+bool arq_sim_inproc_outer_stepper_active()     { return g_sim_inproc_outer_stepper; }
+
+// SIM_INPROC OUTER-STEPPER active-instance modulation tag (sim2-stepper-rewrite Phase b).
+// sim2_activate(m) records whether the now-active instance is on an OFDM config. The
+// outer-stepper TX-wait seams use it to decide pacing vs co-routine delivery:
+//   - OFDM active  -> the DATA path: drain_playback_wait / ptt_busy_wait QUEUE-and-return
+//     (clock-only); the outer loop paces the big-block ONE SYMBOL PER ITER (the §8 cadence
+//     the per-symbol stepper exists to provide; pumping here would BURST-deliver and break
+//     OFDM decode).
+//   - ROBUST/MFSK active -> the HANDSHAKE / control-ACK path: keep the LEGACY co-routine
+//     pump (the peer's HAIL / control-ACK reply must be delivered INTRA-process_main so the
+//     same call's receive_* poll sees it — the outer loop cannot inject delivery mid-call,
+//     and send_*_pattern's post-TX RX-ring flush would wipe an out-of-band reply; the burst
+//     is harmless for MFSK control frames, G2 proves it). This is the per-modulation seam
+//     that lets ONE uniform process_main serve both the MFSK handshake and the OFDM data
+//     phase. Default false (no active OFDM instance). See §10.4.
+static bool g_sim2_active_is_ofdm = false;
+void arq_set_sim2_active_is_ofdm(bool on) { g_sim2_active_is_ofdm = on; }
+
+// SIM_INPROC OUTER-STEPPER data-batch-TX scope (sim2-stepper-rewrite Phase b). True ONLY
+// while send_batch() is emitting a DATA batch (set at its top, cleared at every exit). This
+// is the precise discriminator the per-modulation tag alone could NOT give: at CFG16 the DATA
+// (big-block, OFDM) needs per-symbol pacing, but the RSP's batch ACK is an MFSK ACK PATTERN
+// sent on the SAME current_configuration=16 — so a config-only gate would wrongly pace the MFSK
+// ACK per-symbol and the CMD's correlator would never see it (nAcked_data stuck at 0 -> the CMD
+// re-sends bsi=0 forever, delivering duplicate blocks -> bytes_ok=0). Requiring this flag
+// confines the per-symbol no-op to the OFDM big-block DATA TX; ACK patterns / control / HAIL keep
+// the legacy co-routine pump (intra-call delivery). See §10.4.
+static bool g_sim2_in_data_batch_tx = false;
+void arq_set_sim2_in_data_batch_tx(bool on) { g_sim2_in_data_batch_tx = on; }
+
+// STEPPER-CORE REWRITE Phase b: count of [SIM2-DEADLOCK-BREAK] floor fires this session. The
+// durable --test-sim-sustain asserts this is 0 (a passing arm NEVER wedges; any fire = a
+// stranded TX tail = a regression). Reset by the test before each run.
+static long g_sim2_deadlock_break_count = 0;
+void arq_reset_sim2_deadlock_break_count() { g_sim2_deadlock_break_count = 0; }
+long arq_get_sim2_deadlock_break_count()   { return g_sim2_deadlock_break_count; }
+
+// True iff the outer stepper is driving AND we are emitting an OFDM DATA batch (send_batch on an
+// OFDM config) — i.e. this TX-wait must EGRESS the big-block out of play (to the wire, via the
+// drain-only pump) so the SAME process_main's post-TX path does not strand it, and leave the
+// per-symbol delivery to the outer loop. OFDM-gated so the ROBUST/MFSK 19-B data batch (the G2
+// arm) stays on the legacy co-routine pump and remains BYTE-IDENTICAL to the legacy stepper
+// (dropping the OFDM conjunct re-routes the small MFSK data batch through egress and shifts
+// G2's iters 15->16 — a determinism regression). FALSE for the MFSK HANDSHAKE / ACK patterns /
+// control frames (legacy co-routine pump delivers them intra-call).
+static inline bool sim_outer_stepper_paces_active()
+{
+	return g_sim_inproc_outer_stepper && g_sim2_active_is_ofdm && g_sim2_in_data_batch_tx;
+}
+
+// True iff the outer stepper is driving AND the active instance is OFDM — i.e. we are in the
+// OFDM DATA PHASE and the outer loop owns clock+delivery. Used by the end-of-process_main
+// pacing-floor pump (which must NOT fire in the OFDM phase even AFTER send_batch returns —
+// the queued block is still in play and a pump would BURST-drain it before the outer loop
+// paces it). The ACK patterns deliver via their OWN drain (in_data_batch_tx is false there,
+// so their drain spins the legacy pump). FALSE for the MFSK handshake (legacy pump runs).
+static inline bool sim_outer_stepper_ofdm_phase()
+{
+	return g_sim_inproc_outer_stepper && g_sim2_active_is_ofdm;
+}
 
 // Single place the step-pump is invoked from inside the spin loops. When no
 // pump is installed this is exactly the prior body: sim_spin_sleep() under the
@@ -194,6 +277,23 @@ static inline void sim_spin_or_pump(bool sim_clock_on)
 // the production path is behaviorally identical.
 void ptt_busy_wait(cl_timer& t, int delay_ms)
 {
+	// STEPPER-CORE REWRITE Phase b (sim2-stepper-rewrite): under the OUTER-loop stepper,
+	// on the OFDM DATA path the PTT on/off turnaround must NOT spin the pump — spinning it
+	// would re-enter the pump's BURST deliver+decode-drive at depth 0 DURING process_main
+	// (right after a batch was queued, sim2_drain_to_wire drains the WHOLE play buffer in
+	// one shot), defeating the outer loop's per-symbol pacing and re-introducing the (iii)
+	// nested-drain coupling this rewrite eliminates. Instead ADVANCE THE SHARED VIRTUAL
+	// CLOCK by delay_ms directly (clock-only tick): the exit predicate is satisfied so any
+	// in-call wait terminates, while the TX drain is left to the OUTER loop's per-symbol
+	// feed. On the ROBUST/MFSK HANDSHAKE path the gate is FALSE -> the verbatim spin body
+	// runs (legacy co-routine pump), so the peer's HAIL/control-ACK reply is delivered
+	// intra-call. Production + paced sim keep the verbatim spin body (byte-identical).
+	if (sim_outer_stepper_paces_active())
+	{
+		if (delay_ms > 0)
+			sim_clock_add_samples((uint64_t)delay_ms * (SIM_CLOCK_SAMPLE_RATE_HZ / 1000));
+		return;
+	}
 	const bool sim_clock_on = sim_clock_enabled();
 	// EXIT CONDITION UNCHANGED: virtual (or wall) time must pass delay_ms.
 	// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
@@ -209,16 +309,88 @@ void ptt_busy_wait(cl_timer& t, int delay_ms)
 
 void drain_playback_wait()
 {
+	// STEPPER-CORE REWRITE Phase b (sim2-stepper-rewrite): under the OUTER-loop stepper, on the
+	// OFDM DATA path drain_playback_wait EGRESSES the big-block out of the TX play ring into the
+	// in-flight WIRE (via the drain-ONLY pump — NO RX deliver, NO decode burst), then returns. The
+	// OUTER loop feeds the wire -> RX ONE SYMBOL PER ITER, so OFDM decode still sees the §8
+	// per-symbol cadence and the nested-drain (i)/(ii)/(iii) call-stack coupling (§9.3) that
+	// defeated all 8 localized fixes is gone (the drain-only pump never delivers, never
+	// re-enters a peer process_main). EGRESS (not no-op) is REQUIRED because the SAME process_main's
+	// post-TX ACK path clear_buffer(playback_buffer)s any residual — a block left in play would be
+	// DISCARDED the instant the CMD enters the ACK wait (rx never gets it). The wire is 12.288 MB
+	// (~19 blocks) so a single in-flight block never saturates it -> the spin always terminates (no
+	// deadlock-break floor needed). INV-D (§10.2): the post-TX bookkeeping touches ONLY the RX ring
+	// + STATE fields; with play now EMPTY the ACK-path flush is harmless. On the ROBUST/MFSK
+	// HANDSHAKE path the gate is FALSE -> the verbatim spin body runs (legacy co-routine pump
+	// delivers the beacon/control intra-call). Production + paced sim leave the gate false.
+	if (sim_outer_stepper_paces_active())
+	{
+		if (g_sim_inproc_drain_only_pump != nullptr)
+			while (size_buffer(playback_buffer) > 0)
+				g_sim_inproc_drain_only_pump(g_sim_inproc_pump_ctx);
+		return;
+	}
 	const bool sim_clock_on = sim_clock_enabled();
-	// EXIT CONDITION UNCHANGED: the playback ring must be fully drained.
-	// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
-	// double-gated on (pump installed) AND (deliver_done) — both false on every
-	// production / paced-sim path, so the loop body is byte-identical there.
+	// EXIT CONDITION UNCHANGED on production + the two-process paced sim: the
+	// playback ring must be fully drained (the real audio DAC always drains it
+	// at the sample rate, so the loop always terminates).
+	//
+	// SIM_INPROC NO-PROGRESS DEADLOCK BREAK (fix/bigblock-d3-carve): the
+	// single-thread cooperative pump (sim_inproc_pump_2) can only drain TX
+	// playback -> the in-flight WIRE while the wire has free space, and it can
+	// only deliver the wire -> RX (freeing the wire) at pump call-DEPTH 0. When
+	// this drain_playback_wait runs NESTED (depth>0 — e.g. driven from the peer's
+	// own wait while the RX is stalled), and the RX is NOT consuming the wire
+	// (the D3 RETXCOPY false-lock arm never carves a deliverable block, so it
+	// never re-arms / drains), the wire SATURATES and the TX playback can never
+	// move -> this loop spins forever (HW has no analogue: a real half-duplex DAC
+	// drains unconditionally; the finite sim "wire" models samples in flight and
+	// a jammed channel must eventually DROP the un-deliverable TX tail). Bound the
+	// SIM_INPROC spin by NO-PROGRESS: if the playback occupancy has not shrunk for
+	// a large number of consecutive pump calls, the channel is jammed -> abandon
+	// the undrainable tail (exit the wait) so the outer stepper regains control
+	// and its own stall/iter cutoff terminates the run. This is a harness-only
+	// flow-control floor: passing arms ALWAYS make progress (the RX consumes the
+	// wire every depth-0 pump), so the guard NEVER fires for them (verified). The
+	// production + paced-sim paths (pump==null) keep the verbatim unbounded body.
+	const bool inproc = arq_sim_inproc_active();
+	// A HEALTHY drain makes progress on (essentially) every pump call: at pump
+	// call-depth 0 each pump moves one TX symbol playback->wire and delivers a
+	// symbol wire->RX, so the playback occupancy strictly shrinks and the
+	// no-progress counter resets. The DEADLOCK case makes ZERO progress on EVERY
+	// pump call (depth>0 + saturated wire). 2000 consecutive no-progress pump
+	// calls is therefore orders of magnitude above any healthy transient yet
+	// bounds the jammed-channel wall time to a few ms; the passing arms never
+	// reach even a handful (verified — they deliver and exit normally).
+	const long NO_PROGRESS_LIMIT = 2000;
+	size_t prev_occ = size_buffer(playback_buffer);
+	long   no_progress = 0;
 	while (size_buffer(playback_buffer) > 0)
 	{
+		// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
+		// double-gated on (pump installed) AND (deliver_done) — both false on every
+		// production / paced-sim path, so the loop body is byte-identical there. Once
+		// the responder holds the full payload there is nothing left to drain that the
+		// outer loop needs, so unwind back to it (it breaks on the delivery predicate).
 		if (g_sim_inproc_pump != nullptr && g_sim_inproc_deliver_done)
 			return;
 		sim_spin_or_pump(sim_clock_on);
+		if (inproc)
+		{
+			size_t occ = size_buffer(playback_buffer);
+			if (occ < prev_occ) { prev_occ = occ; no_progress = 0; }
+			else if (++no_progress >= NO_PROGRESS_LIMIT)
+			{
+				g_sim2_deadlock_break_count++;   // Phase b: assertable by --test-sim-sustain
+				printf("[SIM2-DEADLOCK-BREAK] drain_playback_wait: playback "
+				       "un-drainable for %ld pump calls (wire jammed, RX not "
+				       "consuming) -> abandoning %zu-byte TX tail so the stepper "
+				       "can terminate (harness-only; production DAC always drains)\n",
+				       no_progress, occ);
+				fflush(stdout);
+				break;
+			}
+		}
 	}
 }
 
@@ -248,6 +420,20 @@ void pumped_settle_wait(int wait_ms)
 {
 	if (wait_ms <= 0)
 		return;
+	// STEPPER-CORE REWRITE Phase b: under the OUTER-loop stepper, pumped_settle_wait STILL
+	// pumps (clock-pumping via the step-pump), exactly like the legacy stepper. Its callers
+	// are the HANDSHAKE / ACK-turnaround settle guards (the HAIL listen loop
+	// arq_commander.cc:423, the control-ACK arrival rescan arq_common.cc:7437, the
+	// send_ack_pattern* / send_mfsk_ack_sack ROBUST guards). These need the peer reply
+	// delivered INTRA-process_main (the peer's HAIL/control-ACK reply must land in the RX
+	// ring BEFORE the same call's receive_* poll — the outer loop cannot inject delivery
+	// mid-process_main). The pump's burst delivery is HARMLESS here: these are all MFSK /
+	// ROBUST control frames (G2 proves MFSK decodes under burst), and the OFDM DATA batch is
+	// never in the play buffer during a pumped_settle_wait call (it is drained only by the
+	// now-no-op drain_playback_wait + clock-only ptt_busy_wait inside send_batch, then
+	// send_batch RETURNS — so no pumped_settle_wait fires with a data batch queued). The
+	// OFDM data path's per-symbol pacing is owned entirely by the outer loop. Production +
+	// paced sim keep the verbatim body (byte-identical).
 	if (g_sim_inproc_pump == nullptr)
 	{
 		msleep(wait_ms);            // production + two-process paced sim: verbatim
@@ -632,6 +818,12 @@ cl_arq_controller::cl_arq_controller()
 	break_drop_step=2;  // 2026-05-24: start aggressive (was 1) — first BREAK
 	                    // drops 2 configs, then doubles 4,8,16,32... uncapped.
 	breaks_since_last_data_success=0;
+	// WALL-B FIX-5 (audit R3): a fresh session must NEVER inherit a stale carve cooldown
+	// (it would needlessly cap the new link at CFG15). Mirror supershift_proven_ceiling's
+	// init exactly. Member-initializers in arq.h cover construction; this is belt-and-
+	// suspenders for the init() path that re-runs this block.
+	bigblock_carve_cooldown_batches=0;
+	bigblock_carve_cooldown_span=0;
 	break_recovery_phase=0;
 	break_recovery_retries=0;
 	ceiling_success_count=0;
@@ -1699,6 +1891,14 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	}
 
 	this->current_configuration=configuration;
+
+	// WALL-B FIX-3 (C1 reset): a REAL arq-layer config change (we passed the no-op early-return
+	// at the top, so configuration != the previous current_configuration) starts the new config
+	// with a CLEAN carve-fail streak. This (a) re-arms the carve on the FIRST block of a fresh
+	// CFG16 visit after a session reset + re-climb (RISK-D: a stale streak must not suspend the
+	// first block), and (b) lets a CFG16 carve that suspended -> demoted the link to CFG15 leave
+	// the suspended state cleanly. NO-OP off any big-block path (the streak is 0 there anyway).
+	this->bigblock_rx_carve_fail_streak = 0;
 
 	// Canary check during PHYS_ONLY transitions — track when corruption first appears
 	if(level != FULL)
@@ -3268,7 +3468,19 @@ void cl_arq_controller::process_main()
 	// instance's clock view). When no pump is installed (the two-process paced
 	// sim) sim_spin_or_pump(true) IS sim_spin_sleep() — byte-identical. The
 	// production (sim disabled) branch is the verbatim usleep(2000).
-	if (sim_clock_enabled())
+	//
+	// STEPPER-CORE REWRITE Phase b: under the OUTER-loop stepper, in the OFDM DATA PHASE the
+	// outer loop is the SOLE clock-drain + RX-feed driver, so this end-of-process_main pump
+	// call must NOT fire (one pump = one out-of-order depth-0 deliver+decode-drive that would
+	// BURST-drain the big-block still queued in play AFTER send_batch returned — the exact
+	// polls=0 / nAcked_data=0 / re-send-bsi=0 failure). Gated on the OFDM-PHASE predicate (NOT
+	// the narrower in-data-batch-tx scope, which the send_batch RAII already cleared by here),
+	// so the whole OFDM data phase routes clock+delivery through the outer loop. The MFSK ACK
+	// patterns deliver via their OWN drain (legacy pump). On the ROBUST/MFSK HANDSHAKE the gate
+	// is FALSE -> the legacy pump runs. Paced sim + production are byte-identical.
+	if (sim_outer_stepper_ofdm_phase())
+		;  // OFDM data phase: outer loop owns clock + delivery; no in-process_main pump
+	else if (sim_clock_enabled())
 		sim_spin_or_pump(true);
 	else
 		usleep(2000);
@@ -3592,6 +3804,10 @@ void cl_arq_controller::reset_all_timers()
 
 void cl_arq_controller::reset_session_state()
 {
+	// FIX-6: drop any RX-delivery tail buffered behind a back-pressured app socket.
+	// A fresh session must not re-emit bytes from the previous connection's stream.
+	rx_deliver_pending_len = 0;
+
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;
 	data_configuration = init_configuration;
@@ -3637,6 +3853,11 @@ void cl_arq_controller::reset_session_state()
 	emergency_previous_config = init_configuration;
 	break_drop_step = 2;  // initial aggression — see ctor comment
 	breaks_since_last_data_success = 0;
+	// WALL-B FIX-5 (audit R3): zero the carve cooldown on session reset / new CONNECT so a
+	// fresh session is never capped at CFG15 by a prior session's carve-dead memory. Mirrors
+	// the supershift_proven_ceiling = -1 reset at :3767.
+	bigblock_carve_cooldown_batches = 0;
+	bigblock_carve_cooldown_span = 0;
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
 	ceiling_success_count = 0;
@@ -3897,39 +4118,26 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 // (zero-padded to sub_len). The RX carve (bigblock_block_to_arq) is the exact
 // inverse (INV-6). The block's batch_seq_id = the batch's bsi (one block = one
 // batch, INV-1/P2.6).
-bool cl_arq_controller::bigblock_send_one_block()
+//
+// bigblock_pack_block(): build the K*sub_len on-wire block payload (header in cw0
+// prefix + per-codeword app bytes + the whole-block CRC-32 in cw(K-1)'s trailer +
+// the per-codeword CRC-8 tails) from the current new-data batch. Extracted from
+// bigblock_send_one_block so the CAP-RESERVATION rule (V2 FIX-1, fact-doc §9) lives
+// in ONE place exercised by BOTH production AND the MAX-PAYLOAD test arm — the V1
+// LIVELOCK existed precisely because the test builder reserved the block-CRC field
+// while production (cwc_cap=174 with no K-1 reservation) did NOT. On success returns
+// true and fills out_payload (the packed byte image, == bigblock_tx_block_payload),
+// out_K, out_sub_len, out_ndata, out_lengths; also stashes bigblock_tx_block_*.
+bool cl_arq_controller::bigblock_pack_block(int n_data,
+                                            std::vector<unsigned char>& out_payload,
+                                            int& out_K, int& out_sub_len,
+                                            int& out_ndata,
+                                            std::vector<int>& out_lengths)
 {
 	if(telecom_system == NULL) return false;
-	if(!telecom_system->bigblock_framing_enabled) return false;
-	if(telecom_system->M == MOD_MFSK) return false;
-	// P3 HW FIX: the big-block framing is a CFG16-RUNG mode (validated geometry K=8,
-	// sub_len=ldpc.K/8). It must engage ONLY at CONFIG_16. The flag alone is not enough:
-	// the gearshift starts at ROBUST_0 and climbs through OTHER OFDM configs (CONFIG_0..15,
-	// all is_ofdm_config()==true, all !is_robust_config()). At those rungs the block has a
-	// DIFFERENT, unvalidated geometry (HW-observed CONFIG_0: K=1 sub_len=12) that corrupts
-	// the data path and STALLS the climb (every batch carves clean=0 -> no clean ACK ->
-	// gearshift BREAKs, never reaches CFG16). Gate on the live config == CONFIG_16 so the
-	// stock per-frame path carries CONFIG_0..15 and the block engages only at the validated
-	// rung. (The gearshift AUTO-election of this rung is still P4; here the flag is FORCED.)
-	if(current_configuration != CONFIG_16) return false;
-	// Retx batches stay STOCK CFG16 per-frame framing (P2.5).
-	if(sack_retransmit_active) return false;
-	if(message_batch_counter_tx <= 0) return false;
-
-	// Only emit a block for an all-DATA new-data batch. A CONTROL/ACK frame mixed
-	// into the batch keeps the stock per-frame path (the block carries data only).
-	int n_data = 0;
-	for(int i=0;i<message_batch_counter_tx;i++)
-	{
-		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
-			n_data++;
-		else
-			return false;   // non-data frame present -> decline, stock path handles it
-	}
-	if(n_data <= 0) return false;
-
 	int K = telecom_system->bigblock_codeword_count();
 	if(K <= 0) return false;
+	if(n_data <= 0) return false;
 	if(n_data > K) return false;   // batch larger than the block can carry -> stock path
 
 	// sub_len = systematic info bytes per codeword (ldpc.K/8). The block payload is
@@ -3940,25 +4148,28 @@ bool cl_arq_controller::bigblock_send_one_block()
 	const int alloc_size = N_MAX / 8;
 	if(sub_len > alloc_size) sub_len = alloc_size;
 
-	// PHASE 1 (fact-doc §11): the block carries a SELF-DESCRIBING header ON THE WIRE in
-	// codeword 0's systematic info bits (LDPC-protected): [bsi, n_data, length[0..K-1]].
-	// The bsi makes a multi-block session drift-proof (the block has one acquisition +
-	// no per-frame wire bit-7); the per-codeword length table lets the RX deliver each
-	// sub-codeword its EXACT frame length so VARIABLE-length compressed frames reassemble
-	// byte-faithfully (compression transparency, INV-10). cw0's app bytes start at offset
-	// hdr_total; cw1..K-1 are codeword-aligned at c*sub_len (so the K-bit cw_ok SACK
-	// granularity / selective-repeat keeps frame == codeword).
 	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);   // 2 + 2*K bytes
 	// FAILURE-2 fix: each sub-codeword reserves its LAST byte for an on-wire CRC-8
 	// (BIGBLOCK_CW_CRC_BYTES). The per-codeword app capacity shrinks by that 1 byte:
-	//   cw0  app cap = sub_len - hdr_total - CRC   (header prefix + CRC both reserved)
-	//   cwc  app cap = sub_len            - CRC    (c >= 1)
-	// The CRC byte sits at the FIXED offset BIGBLOCK_CW_CRC_OFFSET(c, sub_len) and covers
-	// the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes (header+app for cw0).
+	//   cw0    app cap = sub_len - hdr_total - CRC          (header prefix + CRC both reserved)
+	//   cwc    app cap = sub_len            - CRC           (1 <= c <= K-2)
+	//   cwK-1  app cap = sub_len            - CRC - BLOCK   (V2 FIX-1: ALSO reserve the 4-byte
+	//                                                         whole-block CRC-32 trailer field)
 	const int cw0_cap = sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES;  // cw0 app capacity
 	if(cw0_cap < 0) return false;                        // sub_len too small for header+CRC
-	const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;             // cwc (c>=1) app capacity
+	const int cwc_cap = sub_len - BIGBLOCK_CW_CRC_BYTES;             // cwc (1<=c<=K-2) app capacity
 	if(cwc_cap < 0) return false;
+	// V2 FIX-1 (LIVELOCK, fact-doc §9): the block-CRC field lives in cw(K-1)'s trailer at
+	// BIGBLOCK_BLOCK_CRC_OFFSET = (K-1)*sub_len + (sub_len-1-4). Reserve it out of cw(K-1)'s
+	// app capacity so a genuinely-clean full block never writes an app byte into the field
+	// (TX would then overwrite it with the CRC AND its CRC image would diverge from the RX
+	// recompute, which zeroes the field -> deterministic false-reject livelock). A defeat hook
+	// MERCURY_BIGBLOCK_DEFEAT_CAPFIX=1 restores the PRE-FIX unreserved cap on the SAME binary so
+	// the MAX-PAYLOAD fail-before is reproducible without a revert build. Production never sets it.
+	bool defeat_capfix = false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_CAPFIX"); if(e && *e && atoi(e)!=0) defeat_capfix = true; }
+	const int cwlast_cap = defeat_capfix ? cwc_cap : (cwc_cap - BIGBLOCK_BLOCK_CRC_BYTES);  // cw(K-1) app cap
+	if(cwlast_cap < 0) return false;
 	// INV-9 guard: frame 0 must fit in the reduced cw0 capacity. The big-block lattice
 	// gives sub_len >> max_frame + hdr_total, so this never fires at the CFG16 rung.
 	{
@@ -3980,7 +4191,8 @@ bool cl_arq_controller::bigblock_send_one_block()
 	std::vector<int> tx_lengths((size_t)K, 0);
 	for(int i=0;i<n_data && i<K;i++)
 	{
-		int cap = (i == 0) ? cw0_cap : cwc_cap;   // CRC byte reserved at the codeword tail
+		// V2 FIX-1: the LAST codeword reserves the block-CRC field too (cwlast_cap).
+		int cap = (i == 0) ? cw0_cap : (i == K - 1 ? cwlast_cap : cwc_cap);
 		int len = messages_batch_tx[i].length;
 		if(len < 0) len = 0;
 		if(len > cap) len = cap;          // a frame longer than the sub-codeword is clamped
@@ -4017,15 +4229,36 @@ bool cl_arq_controller::bigblock_send_one_block()
 		// (remaining bytes of this sub-codeword already 0 = pad)
 	}
 
+	// --- D2_BLOCKCRC: WHOLE-BLOCK CRC-32 ON THE WIRE (fix/bigblock-d3-carve) ----------
+	// Stack a block-level CRC-32 over the ENTIRE assembled K*sub_len payload ON TOP of the
+	// per-codeword CRC-8s. It lives in cw (K-1)'s TRAILER at BIGBLOCK_BLOCK_CRC_OFFSET(K,sub_len)
+	// — the 4 bytes just before that codeword's per-cw CRC-8 tail — so cw0's header/app capacity
+	// is UNCHANGED (a cw0 placement shrank app below the ~155B frames and stalled the block).
+	// Stamped BEFORE the per-cw CRC-8 loop. To keep TX and RX computing the CRC-32 over an
+	// IDENTICAL byte image with NO circular dependency, the CRC-32 covers the payload with TWO
+	// sets of bytes treated as ZERO: (a) its own 4 block-CRC bytes, and (b) all K per-codeword
+	// CRC-8 tail bytes (BIGBLOCK_CW_CRC_OFFSET(c)). At this point in TX BOTH are still 0 (the
+	// per-cw loop has not run, the field is unwritten) so we compute directly; RX explicitly
+	// zeroes the SAME bytes before recomputing. V2 FIX-1 reserves the field out of cw(K-1)'s app
+	// cap above, so no app byte ever occupies the field (TX/RX CRC images match).
+	{
+		long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);   // cw(K-1) trailer, before its CRC-8
+		if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= block_payload_len)
+		{
+			uint32_t bcrc = CRC32_calc((char*)block_payload_bytes.data(), (int)block_payload_len);
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+			{
+				unsigned char by = (unsigned char)((bcrc >> (8*b)) & 0xFF);
+				block_payload[(size_t)bcrc_off + b]       = (int)by;
+				block_payload_bytes[(size_t)bcrc_off + b] = by;
+			}
+		}
+	}
+
 	// --- FAILURE-2 fix: per-codeword CRC-8 ON THE WIRE -------------------------------
-	// After every codeword's header/app bytes are packed (pad bytes already 0), stamp a
-	// CRC-8 over the codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes into its tail
-	// byte BIGBLOCK_CW_CRC_OFFSET(c, sub_len). cw0's CRC covers [header | app | pad]; cwc
-	// covers [app | pad]. The RX recomputes the SAME CRC over the de-whitened payload and
-	// demotes cw_ok[c] on mismatch (the producer the old oracle compare faked). CRC8_calc
-	// is the stock per-frame helper (POLY_CRC8=0xF4); it runs over the byte mirror.
-	// Compute over ALL K codewords (filled + zero-pad) so the RX gate is uniform — a
-	// pad-only codeword has a deterministic CRC over its zero bytes.
+	// Stamp a CRC-8 over each codeword's first BIGBLOCK_CW_CRC_SPAN(sub_len) bytes into its
+	// tail byte. cw0's CRC covers [header | block-CRC | app | pad]; cw(K-1)'s covers
+	// [app | block-CRC field | pad]. Stamped AFTER the block-CRC-32.
 	for(int c=0;c<K;c++)
 	{
 		int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
@@ -4038,14 +4271,67 @@ bool cl_arq_controller::bigblock_send_one_block()
 
 	// Stash the TX block payload + geometry + per-codeword lengths so the in-process
 	// single-block harness (and any RX in the same process) can carve it back
-	// byte-faithfully. The live RX carve reads the wire header off the decoded payload;
-	// the harness uses this stash as ground truth for the delivered==TX assertion (INV-6).
+	// byte-faithfully.
 	bigblock_tx_block_payload = block_payload_bytes;
 	bigblock_tx_block_K       = K;
 	bigblock_tx_block_sub_len = sub_len;
 	bigblock_tx_block_bsi     = (unsigned char)(block_bsi & 0xFF);
 	bigblock_tx_block_ndata   = n_data;
 	bigblock_tx_block_lengths = tx_lengths;
+
+	out_payload = block_payload_bytes;
+	out_K       = K;
+	out_sub_len = sub_len;
+	out_ndata   = n_data;
+	out_lengths = tx_lengths;
+	return true;
+}
+
+bool cl_arq_controller::bigblock_send_one_block()
+{
+	if(telecom_system == NULL) return false;
+	if(!telecom_system->bigblock_framing_enabled) return false;
+	if(telecom_system->M == MOD_MFSK) return false;
+	// P3 HW FIX: the big-block framing is a CFG16-RUNG mode (validated geometry K=8,
+	// sub_len=ldpc.K/8). It must engage ONLY at CONFIG_16. The flag alone is not enough:
+	// the gearshift starts at ROBUST_0 and climbs through OTHER OFDM configs (CONFIG_0..15,
+	// all is_ofdm_config()==true, all !is_robust_config()). At those rungs the block has a
+	// DIFFERENT, unvalidated geometry (HW-observed CONFIG_0: K=1 sub_len=12) that corrupts
+	// the data path and STALLS the climb (every batch carves clean=0 -> no clean ACK ->
+	// gearshift BREAKs, never reaches CFG16). Gate on the live config == CONFIG_16 so the
+	// stock per-frame path carries CONFIG_0..15 and the block engages only at the validated
+	// rung. (The gearshift AUTO-election of this rung is still P4; here the flag is FORCED.)
+	if(current_configuration != CONFIG_16) return false;
+	// Retx batches stay STOCK CFG16 per-frame framing (P2.5).
+	if(sack_retransmit_active) return false;
+	if(message_batch_counter_tx <= 0) return false;
+
+	// Only emit a block for an all-DATA new-data batch. A CONTROL/ACK frame mixed
+	// into the batch keeps the stock per-frame path (the block carries data only).
+	int n_data = 0;
+	for(int i=0;i<message_batch_counter_tx;i++)
+	{
+		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			n_data++;
+		else
+			return false;   // non-data frame present -> decline, stock path handles it
+	}
+	if(n_data <= 0) return false;
+
+	// Build the K*sub_len on-wire block payload (header + app + block-CRC-32 + per-cw CRC-8s)
+	// via the SHARED packer so the V2 FIX-1 cap reservation (fact-doc §9) is identical to the
+	// MAX-PAYLOAD test arm. On decline (geometry too small / frame 0 doesn't fit cw0) -> stock
+	// per-frame path. The packer also stashes bigblock_tx_block_* (the in-process carve ground
+	// truth, INV-6).
+	int K = 0, sub_len = 0, packed_ndata = 0;
+	std::vector<unsigned char> block_payload_bytes;
+	std::vector<int> tx_lengths;
+	if(!bigblock_pack_block(n_data, block_payload_bytes, K, sub_len, packed_ndata, tx_lengths))
+		return false;
+	long block_payload_len = (long)block_payload_bytes.size();
+	// transmit_byte takes an int* payload; mirror the packed byte image.
+	std::vector<int> block_payload((size_t)block_payload_len, 0);
+	for(long i=0;i<block_payload_len;i++) block_payload[(size_t)i] = (int)block_payload_bytes[(size_t)i];
 
 	// Emit ONE big-block through the production transmit_byte (branches to
 	// transmit_bigblock when bigblock_framing_enabled). data = the K*sub_len real
@@ -4251,6 +4537,14 @@ int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 	     && telecom_system->M != MOD_MFSK
 	     && current_configuration == CONFIG_16))
 		return stock_ftr;
+	// WALL-B FIX-3 (C2b): the SINGLE chokepoint reverting ALL SIX block-span re-arm sites
+	// (arq_commander.cc:4802, arq_common.cc:5911/6023/6495/9117/9189) to the stock per-frame
+	// cadence once the carve is SUSPENDED. While suspended the carve never runs, so cw1..7
+	// stale-ring garbage cannot occur (INV-3) — the RSP is decoding STOCK per-frame CFG16
+	// frames (the CFG16-PHY demote SET_CONFIG / per-frame data), which WANT the stock window.
+	// On recovery (a config change to CFG15, or a carve accept resetting the streak) the
+	// block-span re-arm resumes BEFORE the next carve.
+	if(bigblock_carve_suspended()) return stock_ftr;
 	// reproducer hook: restore the pre-fix stock-frame arming for the fail-before A/B.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_FIX");
 	  if(e && *e && atoi(e)!=0) return stock_ftr; }
@@ -4258,6 +4552,83 @@ int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 	if(block_nsymb <= 0) return stock_ftr;          // geometry unavailable -> leave stock
 	int block_ftr = block_nsymb + 10;               // block span + turnaround margin
 	return (block_ftr > stock_ftr) ? block_ftr : stock_ftr;
+}
+
+// bigblock_carve_suspended(): WALL-B FIX-3 — the carve-suspend predicate. Returns true iff
+// the RSP has accumulated K (BIGBLOCK_CARVE_SUSPEND_K=3) consecutive cw0-CRC carve REJECTS
+// with 0 accepts while parked at CFG16, so the CFG16 carve route + block-span re-arm should
+// be SUSPENDED (the RSP then decodes the CFG16-PHY demote SET_CONFIG / BREAK on the stock
+// per-frame path it already proved during the climb). The streak only ever increments on the
+// CFG16 big-block reject branch (arq_common.cc:8186) and resets on accept / config change, so
+// off the CFG16 big-block rung the streak is 0 and this is always false (byte-identical).
+// MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND=1 forces FALSE (restores the pre-fix deaf RSP) for the
+// fail-before A/B arm; production never sets it.
+bool cl_arq_controller::bigblock_carve_suspended()
+{
+	if(bigblock_rx_carve_fail_streak < BIGBLOCK_CARVE_SUSPEND_K) return false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND");
+	  if(e && *e && atoi(e)!=0) return false; }   // reproducer: pre-fix deaf RSP
+	return true;
+}
+
+// WALL-B FIX-3 — streak state machine, the ONE source of truth shared by the receive()
+// carve-gate branches (arq_common.cc:8186/8229) and the unit test
+// (test_bigblock_arq_unit.cc). bigblock_note_carve_reject(): a real CFG16 cw0-CRC carve
+// REJECT — accumulate the consecutive-fail streak; at K (=3) the carve route + block-span
+// re-arm are SUSPENDED. Returns true iff this reject just crossed K (so the caller can fire
+// the [BB-CARVE-SUSPEND] log / SIM tally exactly once). Reset on a real carve accept and on
+// any config change (load_configuration). bigblock_note_carve_accept(): a real block carved
+// -> the carve is viable again, reset the streak to 0 (the recovery event; on the
+// carve-SUCCESS path this fires first so the streak never reaches K -> carve-success
+// byte-identical, INV-6).
+bool cl_arq_controller::bigblock_note_carve_reject()
+{
+	bigblock_rx_carve_fail_streak++;
+	if(bigblock_rx_carve_fail_streak == BIGBLOCK_CARVE_SUSPEND_K
+	   && bigblock_carve_suspended())
+	{
+		printf("[BB-CARVE-SUSPEND] CFG16 big-block carve SUSPENDED after %d consecutive "
+			"cw0-CRC rejects (0 carves) -> RSP decodes CFG16-PHY control/BREAK on the "
+			"stock per-frame path (stays at CFG16 PHY; carve re-arms on a real block or "
+			"a config change)\n", bigblock_rx_carve_fail_streak);
+		fflush(stdout);
+		return true;
+	}
+	return false;
+}
+
+void cl_arq_controller::bigblock_note_carve_accept()
+{
+	bigblock_rx_carve_fail_streak = 0;
+}
+
+// bigblock_acq_window_fits(): ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). After
+// receive_bigblock located the head preamble (bigblock_last_rx_head_delay_samples) and
+// recorded the captured-window length (bigblock_last_rx_capture_nsamples), test whether the
+// FULL block — head + preamble_nSymb + Ngrid OFDM symbols (= bigblock_rx_block_nsymb()
+// symbols counting from head_delay) — fits inside the captured samples. When it does NOT,
+// bb_at zero-padded the tail (the block landed too late in the window / its tail had not yet
+// arrived in the ring at snapshot time), so the carve would see a truncated block and the
+// estimate collapses -> cw0 wire-CRC fails. The receive() guard then DEFERS instead of
+// carving garbage. head_delay<0 (acq fail) or capture<=0 (no decode) => treated as "not a
+// locatable block" -> returns true (let the existing cw0-CRC gate handle it as today; do not
+// defer on a non-block). Geometry from the SAME bigblock_rx_block_nsymb() the §17 sites use.
+bool cl_arq_controller::bigblock_acq_window_fits()
+{
+	if(telecom_system == NULL) return true;
+	long head = telecom_system->bigblock_last_rx_head_delay_samples;
+	int  cap  = telecom_system->bigblock_last_rx_capture_nsamples;
+	if(head < 0 || cap <= 0) return true;            // no locatable block -> do not defer
+	int block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+	if(block_nsymb <= 0) return true;                // geometry unavailable -> do not defer
+	int sym_samples = telecom_system->data_container.Nofdm
+	                  * telecom_system->data_container.interpolation_rate;
+	if(sym_samples <= 0) return true;
+	// block_end = head + (preamble_nSymb + Ngrid)*sym_samples = head + block_nsymb*sym_samples.
+	// bigblock_rx_passband reads forward from data_start = head + preamble_nSymb*sym_samples for
+	// Ngrid*sym_samples; the END coincides with head + block_nsymb*sym_samples.
+	long block_end = head + (long)block_nsymb * (long)sym_samples;
+	return block_end <= (long)cap;
 }
 
 // bigblock_receive_carve(): the RX side of STEP 2. After receive_byte() branched
@@ -4294,6 +4665,30 @@ bool cl_arq_controller::bigblock_rx_cw0_header_valid()
 	if(telecom_system == NULL) return false;
 	int K = telecom_system->bigblock_last_rx_K;
 	if(K <= 0) return false;
+	// WALL-B FIX-3 carve-suspend TEST injection (SIM_INPROC only): force the cw0-CRC carve to
+	// REJECT — the exact HW symptom (the CFG16 carve mis-decodes the block-span window and fails
+	// cw0-CRC) — WITHOUT mutating the underlying passband audio (unlike the D3 RINGPHASE/STALERING
+	// levers, which corrupt the snapshot and would also break the stock decode of the short
+	// CFG16-PHY control frame). This isolates the carve-fail event from the audio so the
+	// carve-suspend watchdog test can verify the RSP decodes the intact control/BREAK on the
+	// stock per-frame path once the carve is suspended. Read each call (rare CFG16 path); zero
+	// production effect (production never sets it). bigblock_block_to_arq still gets a real
+	// decoded block, so the suspend path is exercised against a genuine acquisition.
+	//   MERCURY_BIGBLOCK_SIM_CARVEFAIL < 0 (or "all"): reject EVERY cw0 check (persistent fail,
+	//     Test A/B — the carve never recovers, so the streak reaches K and stays suspended).
+	//   MERCURY_BIGBLOCK_SIM_CARVEFAIL = N > 0: reject the FIRST N cw0 checks of this run then
+	//     pass — a TRANSIENT carve fail (Test C / RISK-A: streak must reset on the first accept
+	//     and the block must still carve byte-faithful, never starved).
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_SIM_CARVEFAIL");
+	  if(e && *e){
+	    int n = (std::string(e)=="all") ? -1 : atoi(e);
+	    if(n < 0) return false;                              // persistent reject
+	    static long carvefail_remaining = -2;                // -2 = "not yet primed this run"
+	    static std::string carvefail_seen = "\x01";
+	    if(carvefail_seen != std::string(e)){ carvefail_seen = e; carvefail_remaining = n; }
+	    if(carvefail_remaining > 0){ carvefail_remaining--; return false; }   // transient reject
+	  }
+	}
 	int sub_len = telecom_system->ldpc.K / 8;
 	if(sub_len <= 0) return false;
 	const int alloc_size = N_MAX / 8;
@@ -4325,6 +4720,44 @@ bool cl_arq_controller::bigblock_rx_cw0_header_valid()
 
 // (already §5-audited) — it does NOT touch the optimizer/gearshift authority.
 // Returns SUCCESSFUL when the block was carved into the ARQ layer.
+//
+// === §1.5 CROSS-LAYER DATA-FLOW AUDIT — block-integrity state (D2_BLOCKCRC) =========
+// New shared state added by this fix: a WHOLE-BLOCK CRC-32 carried in cw (K-1)'s TRAILER
+// (datalink_defines.h BIGBLOCK_BLOCK_CRC_OFFSET(K,sub_len) = the 4 bytes just before that
+// codeword's per-cw CRC-8), 4 bytes uint32 LE, over the assembled K*sub_len de-whitened
+// payload with its own 4 bytes AND all K per-cw CRC-8 tail bytes zeroed.
+//   1. PRODUCERS (writers of the wire CRC-32 field):
+//      - TX: bigblock_send_one_block (arq_common.cc, "D2_BLOCKCRC: WHOLE-BLOCK CRC-32"
+//        block) writes it once per emitted block, BEFORE the per-cw CRC-8 loop (so both
+//        zeroed sets are still 0 at compute) and AFTER all app payloads (input is final).
+//      - Tests: every harness that hand-builds a wire block (test_bigblock_arq_unit.cc
+//        tx_truth builders) must stamp it the SAME way (added in this fix).
+//   2. CONSUMERS (readers/checkers):
+//      - RX: bigblock_receive_carve (THIS function, "D2_BLOCKCRC: WHOLE-BLOCK CRC-32
+//        VERIFY") recomputes over the de-whitened payload (zeroing the block-CRC field +
+//        all per-cw CRC tails) and clears ALL cw_ok on mismatch — ONLY when the per-cw
+//        layer reports the block fully clean (n_clean==K), i.e. the would-be DELIVER path.
+//      - bigblock_rx_cw0_header_valid (the receive() carve GATE) recomputes cw0's per-cw
+//        CRC-8; UNAFFECTED — the block-CRC lives in cw K-1, not cw0, so cw0's header/CRC-8
+//        span is byte-identical to before this fix (no false gate reject of real blocks).
+//   3. VALID STATES: before any producer writes, the 4 field bytes are 0 (the zero
+//      placeholder). On a total acquisition miss (info_bits==NULL) there is no payload ->
+//      the RX check is SKIPPED. A degenerate sub_len that cannot hold the trailer ->
+//      bounds guard skips the check (no false reject of a tiny non-CFG16 geometry).
+//   4. INVARIANTS the consumers assume: (a) TX and RX zero the SAME bytes (block-CRC field
+//      + per-cw CRC tails) before computing -> identical input, no self/circular reference;
+//      (b) the field lives in cw (K-1) so it does NOT shrink cw0's app capacity (a cw0
+//      placement dropped cw0 below the ~155B first frame -> bigblock declined -> block never
+//      emitted; this placement keeps cw0 unchanged and steals 4B from cw K-1's ~174B app);
+//      (c) on mismatch ALL cw_ok are cleared -> the EXISTING PARTIAL/SACK branch of
+//      bigblock_block_to_arq runs (no new delivery path) -> the block is re-sent, never
+//      delivered. The per-cw CRC-8 demote is UNCHANGED and still picks the SACK gaps when
+//      the block-CRC passes; the block-CRC only fires when the per-cw layer said all-clean.
+//   5. WHAT THE FIX CHANGES: it adds a reject decision BEFORE bigblock_block_to_arq. The
+//      only consumer of cw_ok downstream is bigblock_block_to_arq; clearing all bits is a
+//      valid input it already handles (n_clean=0 -> PARTIAL). No optimizer/gearshift state
+//      is touched (the carve never did). The wire grows 4 bytes/block in cw K-1's app
+//      region. No legacy peers exist -> the trailer is unconditional.
 int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		unsigned char fallback_bsi, bool use_wire_header)
 {
@@ -4376,6 +4809,50 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		}
 	}
 
+	// --- D2_BLOCKCRC FALSEPASS REPRODUCER HOOK (fix/bigblock-d3-carve) ----------------
+	// Model the HW NO-GO (WINRUN_FINAL_VERDICT.json): a corrupt K-block whose 8 per-cw
+	// CRC-8 all FALSE-PASS (the LDPC miscorrected each codeword to a valid-but-wrong word
+	// whose recomputed CRC-8 still matched), so the block was DELIVERED with wrong bytes.
+	// MERCURY_BIGBLOCK_FALSEPASS_CW=k corrupts codeword k's DE-WHITENED PAYLOAD bytes and
+	// then RE-STAMPS its per-cw CRC-8 over the corrupt bytes, so the per-cw demote below
+	// PASSES on the wrong data (a self-consistent false-locked window) — exactly the HW
+	// case where ONLY a whole-block CRC can catch it. We mutate the local `payload` AFTER
+	// de-whiten (the byte image the demote + carve consume), corrupting app bytes only (not
+	// the cw's own CRC byte, which we then recompute). Production never sets it.
+	{
+		const char* e = std::getenv("MERCURY_BIGBLOCK_FALSEPASS_CW");
+		int fp_cw = (e && *e) ? atoi(e) : -1;
+		// ONE-SHOT: corrupt only the FIRST block of the run (bigblock_first_clean is still <0
+		// until bigblock_block_to_arq records this first carve). The re-sent copy (after the
+		// block-CRC reject routes the first block to PARTIAL/SACK) is NOT injected -> it delivers
+		// clean, proving the recover-via-re-send pass-after.
+		if(info_bits != NULL && fp_cw >= 0 && fp_cw < K && bigblock_first_clean < 0)
+		{
+			int crc_off  = BIGBLOCK_CW_CRC_OFFSET(fp_cw, sub_len);
+			int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+			int base     = fp_cw * sub_len;
+			// flip the first app byte AFTER any cw0 header prefix so a delivered block is
+			// guaranteed wrong (cw0 header bytes are not app data). Use codeword-interior
+			// bytes well clear of the CRC tail.
+			int app_start = (fp_cw == 0) ? BIGBLOCK_HDR_TOTAL_BYTES(K) : 0;
+			int flip_at   = base + app_start;
+			if(crc_span > 0 && flip_at >= 0 && flip_at < base + crc_span)
+			{
+				payload[(size_t)flip_at] ^= 0xFF;   // corrupt one app byte (wrong on delivery)
+				// re-stamp THIS codeword's per-cw CRC-8 over the now-corrupt bytes so the
+				// per-cw demote PASSES (the false-pass). Block-CRC over the assembled payload
+				// will NOT match the TX's clean-payload CRC-32 -> the block must be rejected.
+				if(crc_off >= 0 && crc_off < (int)((long)K*sub_len))
+					payload[(size_t)crc_off] =
+						(unsigned char)CRC8_calc((char*)&payload[(size_t)base], crc_span);
+				printf("[BIGBLOCK-RX] FALSEPASS-INJECT cw=%d: corrupted app byte @%d + re-stamped "
+					"per-cw CRC-8 (per-cw gate will PASS; only the block CRC-32 can catch this)\n",
+					fp_cw, flip_at);
+				fflush(stdout);
+			}
+		}
+	}
+
 	// --- FAILURE-2 fix: per-codeword WIRE CRC-8 verify -> cw_ok demote --------------
 	// The PHY-layer cw_ok producer (bigblock_rx_passband) is an ORACLE compare on the
 	// single-instance loopback (cw_info_ref) and is FORCED CLEAN (all 1s) on the live
@@ -4411,9 +4888,74 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		}
 	}
 
+	// --- D2_BLOCKCRC: WHOLE-BLOCK CRC-32 VERIFY -> reject (route to PARTIAL/SACK) ------
+	// The block-level integrity anchor (datalink_defines.h BIGBLOCK_BLOCK_CRC_*) stacked ON
+	// TOP of the per-codeword CRC-8. The HW NO-GO (WINRUN_FINAL_VERDICT.json) showed all 8
+	// per-cw CRC-8 false-passing a corrupt K=8 block -> 1374 wrong bytes delivered. This gate
+	// is the SAFETY NET for exactly that case: it fires ONLY when the per-cw layer believes the
+	// block is FULLY CLEAN (n_clean == K) — i.e. it would otherwise DELIVER. When the per-cw
+	// CRC-8 already demoted >=1 codeword the block is going PARTIAL regardless, the gap codeword
+	// is re-sent + re-validated, and re-checking the (expected-mismatching) block-CRC here would
+	// only DEFEAT the per-codeword selective-repeat granularity (CASE D / SACK) — so we skip it.
+	// When n_clean == K, recompute the CRC-32 over the assembled DE-WHITENED payload (with the 4
+	// block-CRC bytes zeroed, the SAME placeholder the TX used so there is no self-reference) and
+	// compare to cw0's header field. On MISMATCH the "all-clean" verdict is FALSE: the block is
+	// corrupt despite all per-cw gates passing, so it MUST NOT be delivered. Clear ALL cw_ok ->
+	// n_clean=0 < K -> bigblock_block_to_arq routes the WHOLE block to the EXISTING PARTIAL/SACK
+	// gap path (re-send), never copy_data_to_buffer. We clear all codewords because a 32-bit block
+	// check localizes nothing — a block-wide false-clean means the whole assembled payload is
+	// suspect, and re-sending the entire block is the byte-faithful action for a life-critical
+	// modem. Skip on a total acquisition miss (info_bits==NULL) and when the geometry cannot hold
+	// the field (degenerate sub_len). §1.5 producer/consumer audit: see the function-header block.
+	// REPRODUCER HOOK (mirrors §17 MERCURY_BIGBLOCK_DEFEAT_FIX / D2 DEFEAT_D2): set
+	// MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC=1 to DISABLE the block-CRC reject on the SAME binary,
+	// restoring the PRE-FIX silent wrong-byte delivery (the per-cw false-pass stands) so the
+	// FALSEPASS fail-before is provable without a revert build. Production never sets it.
+	bool defeat_blockcrc = false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC"); if(e && *e && atoi(e)!=0) defeat_blockcrc = true; }
+	int n_clean_precheck = 0;
+	for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_precheck++;
+	if(info_bits != NULL && !defeat_blockcrc && n_clean_precheck == K)
+	{
+		long total   = (long)K * sub_len;
+		long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);   // cw(K-1) trailer, before its CRC-8
+		if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= total)
+		{
+			// read the wire CRC-32 (uint32 LE) then build the SAME zeroed image the TX computed
+			// over: zero the 4 block-CRC field bytes AND all K per-codeword CRC-8 tail bytes
+			// (the TX computed the block-CRC before either was written = both 0). This decouples
+			// the two CRC layers with no circular dependency.
+			uint32_t wire_bcrc = 0;
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+				wire_bcrc |= ((uint32_t)payload[(size_t)bcrc_off + b]) << (8*b);
+			std::vector<unsigned char> chk(payload.begin(), payload.begin() + total);
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++) chk[(size_t)bcrc_off + b] = 0;
+			for(int c=0;c<K;c++){
+				int cwc_off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+				if(cwc_off >= 0 && cwc_off < total) chk[(size_t)cwc_off] = 0;
+			}
+			uint32_t calc_bcrc = CRC32_calc((char*)chk.data(), (int)total);
+			if(calc_bcrc != wire_bcrc)
+			{
+				printf("[BIGBLOCK-RX] BLOCK-CRC MISMATCH (calc=%08x wire=%08x) — all %d per-cw "
+					"CRC-8 FALSE-PASSED a corrupt K=%d block; REJECTING (clear all cw_ok -> "
+					"PARTIAL/SACK re-send, NOT delivered)\n",
+					(unsigned)calc_bcrc, (unsigned)wire_bcrc, K, K);
+				fflush(stdout);
+				for(int c=0;c<K;c++) cw_ok[c] = 0;   // force PARTIAL: never deliver a block-CRC-failed block
+			}
+		}
+	}
+
 	// --- PHASE 1: parse the cw0 wire header [bsi, n_data, length[0..K-1] uint16 LE] ---
 	unsigned char block_bsi = fallback_bsi;
 	int cw0_offset = 0;
+	// V3 FIX (fact-doc §10/§14): the REAL decoded n_data (cw0 header byte payload[1], the count of
+	// filled codewords the TX emitted). Parsed here when cw0 is clean and STASHED at the FIX-2 arm
+	// site so bigblock_partial_block_crc_ok() rebuilds the header byte with the actual value
+	// (NOT a hard-coded K) — an UNDER-FILLED clean block (n_data<K) would otherwise false-reject
+	// forever (LIVELOCK). -1 == unset (no usable header) -> consumer falls back to K.
+	int wire_n_data = -1;
 	const int* sub_lengths_ptr = nullptr;
 	std::vector<int> wire_lengths;
 	const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
@@ -4425,6 +4967,13 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		// trusted. The wire bsi is authoritative (drift-proof); the length table sizes
 		// each delivered slot. cw0's app bytes start AFTER the header prefix.
 		block_bsi = payload[0];
+		// payload[1] = n_data (filled-codeword count); clamp to [1,K] defensively (the TX
+		// emits n_data in [1,K], bigblock_pack_block() :3921-3922). hdr_total>=2 always (it
+		// is BIGBLOCK_HDR_FIXED_BYTES=2 + 2K) and hdr_total<=sub_len is checked above, so
+		// payload[1] is in-bounds whenever the header is usable.
+		wire_n_data = (int)(unsigned char)payload[1];
+		if(wire_n_data < 1) wire_n_data = 1;
+		if(wire_n_data > K) wire_n_data = K;
 		wire_lengths.assign((size_t)K, 0);
 		for(int c=0;c<K;c++)
 		{
@@ -4433,8 +4982,15 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 			// FAILURE-2 fix: the codeword's tail byte is the CRC, NOT app data — reserve it
 			// so the delivered length can never include the CRC byte (matches the TX caps
 			// cw0_cap/cwc_cap above). cw0 also reserves the header prefix.
+			// V2 FIX-1 (LIVELOCK): the LAST codeword (c==K-1) ALSO carries the 4-byte whole-block
+			// CRC-32 field in its trailer (BIGBLOCK_BLOCK_CRC_OFFSET = cw(K-1)-local [sub_len-1-4 ..
+			// sub_len-1-1]), so its app capacity reserves BIGBLOCK_BLOCK_CRC_BYTES too. Mirrors the
+			// TX cap in bigblock_pack_block(); without it a genuinely-clean full block delivers a
+			// wire length that runs into the block-CRC field and the block-CRC zeroing diverges TX
+			// vs RX -> deterministic false-reject livelock (fact-doc §9).
 			int cap = (c == 0) ? (sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES)
-			                   : (sub_len - BIGBLOCK_CW_CRC_BYTES);
+			          : (c == K - 1) ? (sub_len - BIGBLOCK_CW_CRC_BYTES - BIGBLOCK_BLOCK_CRC_BYTES)
+			                         : (sub_len - BIGBLOCK_CW_CRC_BYTES);
 			if(cap < 0)   cap = 0;
 			if(len < 0)   len = 0;
 			if(len > cap) len = cap;       // never deliver past a codeword's app capacity
@@ -4463,14 +5019,168 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 		sub_lengths_ptr = wire_lengths.data();
 	}
 
+	// --- V2 FIX-2 (fact-doc §10): stash the assembled-block integrity context for the
+	// PARTIAL / SACK-completed delivery gate. The full-clean block-CRC gate above only
+	// fires when n_clean==K; a KEPT codeword that the per-cw CRC-8 FALSE-PASSES inside a
+	// PARTIAL block is otherwise delivered at the prev-batch completion (arq_responder.cc)
+	// with NO block-CRC check (the §5 residual). We stash the TX block-CRC-32 value + the
+	// geometry HERE so the completion can reassemble the K-codeword image from the prev
+	// slots and re-verify the SAME CRC-32 before delivering. ARM only when:
+	//   (a) this is a real header-bearing big-block carve (header_usable + cw0 clean),
+	//   (b) the block is PARTIAL (n_clean < K) — the only path that reaches the prev
+	//       completion; a clean block (n_clean==K) is already gated above and delivers now,
+	//   (c) cw(K-1) decoded CRC-8-clean — it carries the block-CRC field (its CRC-8 span
+	//       covers the field), so the stashed value is trustworthy; if cw(K-1) is itself the
+	//       gap the field is untrustworthy AND never recovered (the app-only retx omits it),
+	//       so we do NOT arm — that one codeword stays at the unchanged per-cw CRC-8 floor,
+	//       and NO false reject of a genuinely-clean completion is ever introduced.
+	// Reset to disarmed first (a clean carve / non-armable PARTIAL clears any stale stash).
+	bigblock_partial_armed  = false;
+	bigblock_partial_n_data = -1;   // V3: clear stale n_data with the rest of the stash
+	{
+		int n_clean_stash = 0;
+		for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_stash++;
+		long total_sl = (long)K * sub_len;
+		long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+		bool cwlast_clean = (K-1 >= 0 && K-1 < (int)cw_ok.size()) ? (cw_ok[K-1] != 0) : false;
+		if(info_bits != NULL && header_usable && cw_ok[0]
+		   && n_clean_stash < K && cwlast_clean
+		   && bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= total_sl)
+		{
+			unsigned int wire_bcrc = 0;
+			for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+				wire_bcrc |= ((unsigned int)payload[(size_t)bcrc_off + b]) << (8*b);
+			bigblock_partial_block_bsi      = (int)(unsigned char)block_bsi;
+			bigblock_partial_K              = K;
+			bigblock_partial_sub_len        = sub_len;
+			bigblock_partial_hdr_total      = hdr_total;
+			bigblock_partial_cw0_offset     = cw0_offset;
+			bigblock_partial_expected_crc32 = wire_bcrc;
+			// V3 FIX (fact-doc §10/§14): stash the REAL decoded n_data (parsed above when cw0 is
+			// clean — a FIX-2 arm precondition, so wire_n_data is always set here). The completion
+			// gate reconstructs cw0's header byte img[1] with THIS value, matching the TX exactly,
+			// so a genuinely-clean UNDER-FILLED (n_data<K) block reassembles byte-identical -> CRC
+			// MATCH -> delivers, instead of false-rejecting forever (the §10 livelock).
+			bigblock_partial_n_data         = (wire_n_data >= 1 && wire_n_data <= K) ? wire_n_data : K;
+			bigblock_partial_lengths.assign((size_t)K, 0);
+			for(int c=0;c<K;c++)
+				bigblock_partial_lengths[(size_t)c] = sub_lengths_ptr ? sub_lengths_ptr[c] : 0;
+			bigblock_partial_armed = true;
+			printf("[BIGBLOCK-RX] FIX-2: armed PARTIAL block-CRC gate bsi=%d K=%d n_data=%d sub_len=%d "
+				"expected_crc32=%08x (verified at prev-batch completion before delivery)\n",
+				bigblock_partial_block_bsi, K, bigblock_partial_n_data, sub_len, wire_bcrc);
+			fflush(stdout);
+		}
+	}
+
 	int rc = bigblock_block_to_arq(cw_ok.data(), K, block_bsi, payload.data(), sub_len,
 		sub_lengths_ptr, cw0_offset);
-	printf("[BIGBLOCK-RX] carve: K=%d cw_ok_count=%d wire_bsi=%u (fallback=%u used_hdr=%d) "
-		"sub_len=%d rc=%d\n",
-		K, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi,
+	// HONEST DIAGNOSTIC (D1 fix, fact-doc bigblock-delivery-handoff §2): report the REAL
+	// per-codeword clean count (n_clean after the wire-CRC-8 demote above), NOT the PHY
+	// forced ORACLE bigblock_last_rx_cw_ok_count. On the live 2-instance RX (cw_info_ref==NULL)
+	// the oracle is FORCED all-1s (telecom_system.cc:8067-8070), so it printed cw_ok_count=8
+	// even when the carve routed PARTIAL clean<K — a misleading log that hid D2 on HW. n_clean
+	// is the count of demoted-clean codewords actually delivered/SACKed by the carve.
+	int n_clean_real = 0;
+	for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_real++;
+	printf("[BIGBLOCK-RX] carve: K=%d n_clean=%d (oracle_cw_ok_count=%d) wire_bsi=%u "
+		"(fallback=%u used_hdr=%d) sub_len=%d rc=%d\n",
+		K, n_clean_real, telecom_system->bigblock_last_rx_cw_ok_count, (unsigned)block_bsi,
 		(unsigned)fallback_bsi, (int)(sub_lengths_ptr != nullptr), sub_len, rc);
 	fflush(stdout);
 	return rc;
+}
+
+// V2 FIX-2 (fact-doc §10): re-verify the stashed whole-block CRC-32 over the K-codeword
+// payload REASSEMBLED from messages_rx_prev[0..K-1] at the prev-batch completion, BEFORE
+// the completion delivers via copy_data_to_buffer (arq_responder.cc). The codeword-aligned
+// wire image (per-cw CRC tails + the block-CRC field) was discarded by
+// bump_bsi_and_transfer_prev (it transfers only per-frame app bytes), so we reconstruct the
+// SAME image the TX computed the CRC-32 over: cw0 = [reconstructed header | app | pad];
+// cwc (c>=1) = [app | pad]; ALL per-cw CRC-8 tail bytes AND the 4 block-CRC field bytes
+// ZEROED (the TX computed the block-CRC with both sets still 0, the RX recompute zeroes them).
+// A KEPT codeword that the per-cw CRC-8 FALSE-PASSED carries WRONG app bytes -> the reassembled
+// image differs from the TX image -> CRC-32 differs from the stashed expected -> return false
+// (do NOT deliver -> re-request). Returns true (deliver) when the block is byte-consistent.
+// Caller guards on bigblock_partial_armed + bsi match.
+bool cl_arq_controller::bigblock_partial_block_crc_ok()
+{
+	int K       = bigblock_partial_K;
+	int sub_len = bigblock_partial_sub_len;
+	int hdr_total   = bigblock_partial_hdr_total;
+	int cw0_offset  = bigblock_partial_cw0_offset;
+	if(K <= 0 || sub_len <= 0) return true;            // nothing to check -> do not block delivery
+	long total = (long)K * (long)sub_len;
+	long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+	if(bcrc_off < 0 || bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES > total) return true;  // degenerate -> skip
+
+	std::vector<unsigned char> img((size_t)total, 0);   // codeword-aligned, zero pad
+
+	// Reconstruct cw0's wire header [bsi, n_data, length[0..K-1] uint16 LE]. The header bytes
+	// are part of the CRC-32 image, so they must match the TX exactly; the TX wrote
+	// [bsi][n_data][lengths] where n_data = the batch's filled-codeword count.
+	// V3 FIX (fact-doc §10/§14): use the REAL decoded n_data stashed at the carve
+	// (bigblock_partial_n_data, = cw0 header byte payload[1]). The PRE-V3 code hard-coded
+	// img[1]=K, which is correct ONLY for a full K-frame batch; an UNDER-FILLED (n_data<K)
+	// block — a FIFO-drained / end-of-document tick, near-certain on a finite document's final
+	// CFG16 tick — then reassembled with img[1]=K != TX n_data, CRC-MISMATCHED, REJECTED, and
+	// re-emitted byte-identical -> re-rejected FOREVER (a deterministic false-reject LIVELOCK on a
+	// genuinely-clean block, the §10 blocker). Falling back to K when n_data is unset (-1) is
+	// safe: arming requires a clean cw0 header, so the value is always parsed when armed.
+	int img_ndata = (bigblock_partial_n_data >= 1 && bigblock_partial_n_data <= K)
+	                ? bigblock_partial_n_data : K;
+	// REPRODUCER HOOK (fact-doc §14, mirrors DEFEAT_CAPFIX / DEFEAT_PARTIALCRC): set
+	// MERCURY_BIGBLOCK_DEFEAT_NDATA=1 to restore the PRE-V3 hard-coded img[1]=K on the SAME
+	// binary, so the n_data<K false-reject LIVELOCK fail-before is reproducible without a
+	// revert build. With it set, a genuinely-clean UNDER-FILLED block reassembles with
+	// img[1]=K != TX n_data -> CRC MISMATCH -> REJECT (the livelock). Production never sets it.
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_NDATA");
+	  if(e && *e && atoi(e)!=0) img_ndata = K; }
+	if(hdr_total >= 2 && hdr_total <= sub_len)
+	{
+		img[0] = (unsigned char)(bigblock_partial_block_bsi & 0xFF);
+		img[1] = (unsigned char)(img_ndata & 0xFF);
+		for(int c=0;c<K;c++)
+		{
+			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+			if(lo + 1 >= sub_len) break;                // header must fit cw0
+			int L = (c < (int)bigblock_partial_lengths.size()) ? bigblock_partial_lengths[(size_t)c] : 0;
+			img[(size_t)lo + 0] = (unsigned char)(L & 0xFF);
+			img[(size_t)lo + 1] = (unsigned char)((L >> 8) & 0xFF);
+		}
+	}
+
+	// Place each codeword's delivered app bytes from messages_rx_prev[] at its base offset.
+	for(int c=0;c<K && c<this->nMessages; c++)
+	{
+		int base = (c == 0) ? cw0_offset : (c * sub_len);
+		int L    = (c < (int)bigblock_partial_lengths.size()) ? bigblock_partial_lengths[(size_t)c] : 0;
+		if(L < 0) L = 0;
+		int avail = messages_rx_prev[c].length;
+		if(avail < 0) avail = 0;
+		int n = (L < avail) ? L : avail;               // deliver-exact: clamp to the stashed wire length
+		for(int j=0;j<n && (base + j) < total; j++)
+			img[(size_t)base + j] = (unsigned char)messages_rx_prev[c].data[j];
+		// bytes [base+n .. base+L) stay 0 (pad) — matches the TX's zero-pad image.
+	}
+
+	// Zero the per-cw CRC-8 tails + the block-CRC field (the SAME placeholders the TX used).
+	for(int c=0;c<K;c++)
+	{
+		long off = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+		if(off >= 0 && off < total) img[(size_t)off] = 0;
+	}
+	for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++) img[(size_t)bcrc_off + b] = 0;
+
+	unsigned int calc = (unsigned int)CRC32_calc((char*)img.data(), (int)total);
+	bool ok = (calc == bigblock_partial_expected_crc32);
+	printf("[BIGBLOCK-RX] FIX-2: prev-batch completion block-CRC %s (calc=%08x expected=%08x "
+		"bsi=%d K=%d n_data=%d) %s\n",
+		ok ? "MATCH" : "MISMATCH", calc, bigblock_partial_expected_crc32,
+		bigblock_partial_block_bsi, K, img_ndata,
+		ok ? "-> deliver" : "-> REJECT (a kept codeword FALSE-PASSED per-cw CRC-8; not delivered)");
+	fflush(stdout);
+	return ok;
 }
 
 
@@ -4603,6 +5313,15 @@ void cl_arq_controller::send(st_message* message, int message_location)
 void cl_arq_controller::send_batch()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
+	// STEPPER-CORE REWRITE Phase b: mark the whole send_batch body as DATA-batch TX so the
+	// outer-stepper TX-wait seams (drain_playback_wait / ptt_busy_wait) QUEUE-and-return
+	// (per-symbol pacing) for the OFDM DATA path ONLY — NOT for the MFSK ACK patterns / control
+	// the RSP sends on the same CFG16 (§10.4). RAII clears it at EVERY exit (the big-block
+	// return + the normal end). No-op outside the outer stepper (the flag is only read there).
+	struct DataBatchTxScope {
+		DataBatchTxScope()  { arq_set_sim2_in_data_batch_tx(true);  }
+		~DataBatchTxScope() { arq_set_sim2_in_data_batch_tx(false); }
+	} _data_batch_tx_scope;
 	// === DIAG: always print TX activity (remove after debug) ===
 	printf("[CMD-TX] CONFIG_%d batch=%d type=%d pream=%d Nsymb=%d\n",
 		current_configuration, message_batch_counter_tx,
@@ -6921,6 +7640,12 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 	// Production + the two-process paced sim leave the pump null
 	// (arq_sim_inproc_active()==false) -> this whole block is skipped ->
 	// byte-identical.
+	//
+	// STEPPER-CORE REWRITE Phase b: this pump-armed control-ACK re-scan RUNS under the
+	// outer stepper too (pumped_settle_wait still pumps for handshake/control-ACK
+	// turnarounds — see its Phase-b note). It delivers the peer's control-ACK reply
+	// INTRA-process_main so A's same-call poll sees it (the outer loop cannot inject
+	// delivery mid-process_main). These are MFSK / control frames; the burst is harmless.
 	if(arq_sim_inproc_active())
 	{
 		// Arrival window: tail span + the responder's PTT/turnaround margin
@@ -7253,6 +7978,113 @@ void cl_arq_controller::receive()
 		int rwi = telecom_system->data_container.ring_write_index;
 		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data, &telecom_system->data_container.passband_delayed_data[rwi], signal_period * sizeof(double));
 
+		// ===== D3 ACQUISITION-NONDETERMINISM SIM INJECTION (fix/bigblock-d3-carve) =====
+		// The in-process SIM_INPROC big-block path delivers 1200/1200 deterministically because
+		// its single-symbol pacing + decode-drive lands the block at a CONSTANT, frame-aligned
+		// head every run, the carve ZEROES the whole ring after each block (no stale carry), and
+		// the CMD emits each block exactly once (no co-resident retransmit copy). HW has NONE of
+		// those properties (independent Pi audio clocks => arbitrary block-arrival phase; a
+		// continuously-running ring carrying the previous burst; and multiple co-resident retx
+		// copies when no SACK is accepted). So D3 — (1) the rwi-relative carve PHASE LOTTERY
+		// (head must be <= cap-block_span to fit, bigblock_acq_window_fits arq_common.cc:4226),
+		// (2) the global energy-argmax FALSE-LOCK onto a fresher retransmit copy (ofdm.cc:2685,
+		// early_exit=0.0 at telecom_system.cc:7434), and (3) the INVERTED §22 wait-for-tail re-arm
+		// (:7460 pushes the head LATER on the rwi-relative snapshot) — is SILENT in sim. These
+		// three env-gated impairments reproduce the HW acquisition behavior so the D3 fix can be
+		// validated off-bench. Production NEVER sets these vars => zero production effect; the
+		// block also gates on CFG16 + big-block framing so the stock per-frame path is untouched.
+		// The snapshot is the SINGLE chokepoint: receive_byte->receive_bigblock acquisition
+		// (telecom_system.cc:7433 time_sync over Nofdm*buf_syms of THIS buffer) AND the carve both
+		// read ready_to_process_passband_delayed_data, so mutating it here moves the head for both.
+		if(telecom_system->bigblock_framing_enabled
+		   && telecom_system->M != MOD_MFSK
+		   && current_configuration == CONFIG_16)
+		{
+			// Read the env EACH PASS (this CFG16+big-block gate is rare relative to the FFT
+			// decode that follows, and test_sim_inproc_bigblock_multicw toggles these vars
+			// between arms in ONE process — a cached-once read would lock arm A's values).
+			int d3_ringphase = -3;   // -3 = disabled; -1 = random; >=0 = fixed right-shift samples
+			const char* e = std::getenv("MERCURY_BIGBLOCK_SIM_RINGPHASE");
+			if(e && *e){
+				if(std::string(e)=="rand" || atoi(e)<0) d3_ringphase = -1;
+				else d3_ringphase = atoi(e);
+			}
+			const char* es = std::getenv("MERCURY_BIGBLOCK_SIM_STALERING");
+			int d3_stalering = (es && *es && atoi(es)!=0) ? 1 : 0;
+			const char* er = std::getenv("MERCURY_BIGBLOCK_SIM_RETXCOPY");
+			int d3_retxcopy = (er && *er && atoi(er)!=0) ? 1 : 0;
+			// xorshift32 RNG state for the random-phase lottery. Re-seeded whenever the seed env
+			// changes (per-arm determinism) so each arm's randomness is reproducible.
+			static unsigned long d3_rng = 0;
+			static std::string   d3_seed_seen = "\x01";   // sentinel "never set"
+			const char* ee = std::getenv("MERCURY_BIGBLOCK_SIM_RINGSEED");
+			std::string seed_now = (ee && *ee) ? std::string(ee) : std::string("");
+			if(seed_now != d3_seed_seen){
+				d3_seed_seen = seed_now;
+				d3_rng = seed_now.empty() ? 0x9E3779B9UL : (unsigned long)strtoul(seed_now.c_str(),nullptr,10);
+				if(d3_rng == 0) d3_rng = 0x9E3779B9UL;
+			}
+			bool d3_active = (d3_ringphase != -3) || d3_stalering==1 || d3_retxcopy==1;
+			if(d3_active && signal_period > 0)
+			{
+				double* snap = telecom_system->data_container.ready_to_process_passband_delayed_data;
+				int sp = signal_period;
+				// Pick the per-snapshot right-shift (how much LATER the block lands in the window).
+				int shift;
+				if(d3_ringphase == -1){
+					// xorshift32 LCG: uniformly random phase in [0,sp) — the independent-clock lottery.
+					d3_rng ^= d3_rng << 13; d3_rng ^= d3_rng >> 17; d3_rng ^= d3_rng << 5;
+					shift = (int)(d3_rng % (unsigned long)sp);
+				} else if(d3_ringphase >= 0){
+					shift = d3_ringphase % sp;
+				} else {
+					shift = 0;   // phase disabled, but stale/retx still apply
+				}
+				// (1)+(2): build the impaired snapshot in a scratch buffer.
+				//   - RINGPHASE: the real block content moves to [shift, shift+sp) (right-shift),
+				//     so its head_delay grows by `shift`. Content past sp is LOST (the HW overrun:
+				//     the tail is FUTURE/unproduced => bb_at zero-pads it, telecom_system.cc:7515).
+				//   - STALERING: the vacated front [0,shift) is filled with the PREVIOUS snapshot
+				//     (stale resident audio) instead of silence — so the window is never clean.
+				//   - RETXCOPY: a FRESHER (slightly higher-energy) copy of the original block head
+				//     is laid near the ring END so the global energy-weighted argmax (early_exit=0)
+				//     locks onto IT (a future-tailed copy) instead of the earlier real block.
+				static std::vector<double> d3_prev;          // last snapshot (stale-ring source)
+				std::vector<double> orig(snap, snap + sp);   // the real (constant-phase) block
+				std::vector<double> out(sp, 0.0);
+				if(d3_stalering==1 && (int)d3_prev.size()==sp)
+					for(int i=0;i<sp;i++) out[i] = d3_prev[i];   // start from the stale burst
+				// right-shift the real block by `shift`, dropping the overrun tail.
+				for(int i=0; i+shift < sp; i++) out[i+shift] = orig[i];
+				if(d3_retxcopy==1){
+					// FALSE-LOCK model: the CMD re-emits the block when no SACK is accepted, so 2+
+					// copies co-reside in the ring (trace_falselock §1, val_cmd_off_A1.log three
+					// "one-block emit bsi=5"). The big-block time_sync passes early_exit=0
+					// (telecom_system.cc:7434) so time_sync_preamble_halfsym (ofdm.cc:2646-2691)
+					// returns the GLOBAL energy-weighted argmax, NOT the earliest preamble — with
+					// multiple copies it picks the FRESHEST/LATEST (least channel-decayed => highest
+					// energy) whose PREAMBLE is in-window but whose BODY tail is future. Lay such a
+					// copy: a LATER head (rpos, in-window so its preamble wins the argmax) at 1.6x
+					// amplitude (fresher), its body overrunning the window end (future => bb_at
+					// zero-pads the late codewords => demote). The real (earlier) block stays too,
+					// but the argmax false-locks the louder later copy -> head jumps FORWARD (the
+					// HW 116664->132932 forward drift), exactly the §22-can't-recover false-lock.
+					int rpos = (sp/2);   // ~half-way: preamble fully in-window, body overruns the end
+					for(int i=0; i+rpos < sp && i < sp; i++) out[i+rpos] += 1.6 * orig[i];
+				}
+				memcpy(snap, out.data(), (size_t)sp * sizeof(double));
+				d3_prev.assign(snap, snap + sp);   // remember for the next snapshot's stale carry
+				static int d3_logn = 0;
+				if(d3_logn < 64){
+					d3_logn++;
+					printf("[BBTX-SIM-D3] inject ringphase=%s shift=%d stalering=%d retxcopy=%d sp=%d\n",
+						(d3_ringphase==-1?"rand":(d3_ringphase>=0?"fixed":"off")),
+						shift, d3_stalering, d3_retxcopy, sp);
+					fflush(stdout);
+				}
+			}
+		}
+
 		// DIAG: ring buffer snapshot debug (verbose only — buffer scan is expensive)
 		if(g_verbose)
 		{
@@ -7358,9 +8190,28 @@ void cl_arq_controller::receive()
 		}
 		else
 		{
+			// WALL-B FIX-3 (C2a): when the CFG16 carve is SUSPENDED (K consecutive cw0-CRC
+			// rejects, 0 accepts), force receive_byte onto the STOCK per-frame decoder for
+			// this acquisition — the SAME bigblock_rx_force_stock path the GAP-3 cw0-CRC
+			// fallback uses — so the carve-parked RSP decodes the CFG16-PHY demote SET_CONFIG
+			// (and per-frame CFG16 traffic) normally instead of routing the audio into the
+			// K=8 carve that keeps rejecting it. Gated on bigblock_carve_suspended() (CFG16 &&
+			// big-block framing && streak>=K), so off-rung / carve-success it is a NO-OP
+			// (byte-identical). The block-span re-arm is reverted in lockstep by the
+			// bigblock_block_ftr_or chokepoint (C2b), so the stock decode also snapshots at
+			// the per-frame cadence the control frame needs.
+			bool carve_suspend_force_stock =
+				(telecom_system->bigblock_framing_enabled
+				 && telecom_system->M != MOD_MFSK
+				 && current_configuration == CONFIG_16
+				 && bigblock_carve_suspended());
+			if(carve_suspend_force_stock)
+				telecom_system->bigblock_rx_force_stock = true;
 			received_message_stats = telecom_system->receive_byte(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
 				telecom_system->data_container.data_byte);
+			if(carve_suspend_force_stock)
+				telecom_system->bigblock_rx_force_stock = false;
 		}
 
 		// STEP 2 — big-block RX carve. When the CFG16-rung framing flag is set and
@@ -7399,7 +8250,114 @@ void cl_arq_controller::receive()
 			(telecom_system->bigblock_framing_enabled
 			 && telecom_system->M != MOD_MFSK
 			 && current_configuration == CONFIG_16
-			 && telecom_system->bigblock_last_rx_K > 0);
+			 && telecom_system->bigblock_last_rx_K > 0
+			 // WALL-B FIX-3 (C2a): once SUSPENDED, receive_byte ran the STOCK per-frame
+			 // decoder (above), so there is no fresh carve to translate — fall through to
+			 // the per-frame parse with the stock received_message_stats. NO-OP off-rung /
+			 // carve-success (streak<K), so the carve-translate path is byte-identical there.
+			 && !bigblock_carve_suspended());
+		// ACQUISITION-WINDOW POSITION GUARD — WAIT-FOR-TAIL (fact-doc §22, supersedes the §19
+		// defer-and-re-arm REGRESSION). Run BEFORE the cw0-CRC gate. When the located block's
+		// tail ran past the captured window (head + block_span > cap: the block landed too late
+		// in the snapshot, so its tail samples are FUTURE — not yet produced into the ring at
+		// snapshot time — and bb_at zero-padded them), the block-wide estimate collapses and the
+		// cw0 CRC fails even on a perfect timing lock.
+		//
+		// §22 ROOT CAUSE of the §19 regression: the §19 recovery re-armed frames_to_read to a
+		// FULL block-span (bigblock_block_ftr_or(0) = block_nsymb+10 = 74 sym) and walked away,
+		// expecting the block to "re-land earlier on the next snapshot." On the LIVE path that
+		// premise is false TWICE: (1) the CMD emits each big-block EXACTLY ONCE then waits on a
+		// positive SACK — there is NO re-presentation, only the SAME single transmission captured
+		// later; (2) waiting a full 74-sym block-span advances ring_write_index by 74 sym, so the
+		// head (typ. sym ~70-124) scrolls clean OFF THE BACK of the 133-sym window before the
+		// next snapshot — destroying the only copy. Result on HW: every attempt deferred, 0
+		// carves, CMD-waits-SACK / RSP-waits-rearrival DEADLOCK (winrun_recovery.json:
+		// accept_frac 0.0, WORSE than the pre-fix 0.056).
+		//
+		// THE FIX: the ring slides forward by symbol_period per produced symbol (audioio.c:1390),
+		// and each snapshot is the most-recent `cap` samples. To bring the missing tail in-ring
+		// we wait ONLY as many fresh symbols as the overrun needs — NOT a block-span. After
+		// wait_syms symbols the window slid forward by wait_syms*symbol_period, so head_new =
+		// head - wait_syms*symbol_period <= cap-block_span (fits) AND the tail (overrun samples
+		// past the old window end) is now inside. Geometric safety (§22.4): block_span(64 sym) <=
+		// ring(133 sym), so when the tail just arrives the head sits at sym ~69 with 64 sym of
+		// head-room behind it — the head STAYS in-ring through the wait. The SAME single
+		// transmission is recovered; no NAK/retransmit needed, so the SACK the CMD is waiting for
+		// IS produced and the deadlock is broken. Leave the ring INTACT (do NOT wipe — unlike the
+		// carve-success path; the head must survive) and do NOT touch ring_write_index (producer-
+		// owned). SKIP the carve this pass; re-attempt on the next snapshot.
+		// MERCURY_BIGBLOCK_DEFEAT_ACQGUARD=1 bypasses the wait (carve the truncated block as
+		// pre-fix) for the fail-before/pass-after A/B. Production never sets it.
+		bool acqguard_defeat = false;
+		{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_ACQGUARD");
+		  if(e && *e && atoi(e) != 0) acqguard_defeat = true; }
+		// Bounded: each wait is SHORT (a few symbols, the overrun), not a block-span, so allow a
+		// few consecutive waits before falling through to the cw0-CRC gate on a genuinely absent
+		// block (no infinite spin). Reset on every accept (:7475 carve-success).
+		const int BIGBLOCK_RX_MAX_DEFERS = 6;
+		if(bigblock_rx_candidate && !acqguard_defeat && !bigblock_acq_window_fits()
+		   && bigblock_rx_defer_count < BIGBLOCK_RX_MAX_DEFERS)
+		{
+			bigblock_rx_defer_count++;
+			// Compute the wait: exactly enough fresh symbols for the overrun tail to arrive, +1
+			// symbol of margin so the tail is comfortably in-ring against a producer race.
+			long head        = telecom_system->bigblock_last_rx_head_delay_samples;
+			long cap_samples = telecom_system->bigblock_last_rx_capture_nsamples;
+			int  block_nsymb = telecom_system->bigblock_rx_block_nsymb();
+			int  sym_samples = telecom_system->data_container.Nofdm
+			                   * telecom_system->data_container.interpolation_rate;
+			long block_span  = (long)block_nsymb * (long)sym_samples;
+			long overrun     = (head >= 0 && sym_samples > 0)
+			                   ? (head + block_span - cap_samples) : 0;
+			int  wait_syms   = 1;   // safe default if geometry is unavailable
+			if(overrun > 0 && sym_samples > 0)
+				wait_syms = (int)((overrun + sym_samples - 1) / sym_samples) + 1;
+			if(wait_syms < 1) wait_syms = 1;
+			// D3 §22 UN-INVERSION (fix/bigblock-d3-carve): the snapshot is rwi-relative, so after
+			// the producer advances ring_write_index by wait_syms symbols the SAME located block's
+			// window offset becomes head1 = head - wait_syms*sym_samples — i.e. it slides EARLIER
+			// (toward the front of the window) by exactly the tail it was missing, landing at
+			// head1 ~ cap - block_span (FITS) with its now-produced tail in-ring. This direction is
+			// correct ONLY because the acquisition now re-locks the SAME EARLIEST copy each pass
+			// (the earliest-preamble early-exit, telecom_system.cc bigblock_rx_passband). With the
+			// old global energy-argmax the re-snapshot false-locked a still-FRESHER later copy, so
+			// head DRIFTED FORWARD (head1 > head, HW 116664->132932) — that forward drift WAS the
+			// "inverted §22". HEAD-SURVIVAL CAP: never wait so long that the block's head scrolls
+			// off the OLDEST edge before the next snapshot (head1 must stay >= 0). The head sits
+			// `head` samples ahead of the window's oldest sample, so the most we can slide is
+			// `head` samples; cap wait_syms to floor(head/sym) so head1 = head - wait_syms*sym >= 0.
+			// (Geometry guarantees this is never binding for a real overrun — block_span < cap, so
+			// when the tail just arrives head ~ cap-block_span, far above 0 — but the cap makes the
+			// re-arm provably head-preserving rather than relying on that invariant holding.)
+			if(head >= 0 && sym_samples > 0)
+			{
+				int max_wait = (int)(head / sym_samples);   // keep head1 = head - wait*sym >= 0
+				if(max_wait >= 1 && wait_syms > max_wait) wait_syms = max_wait;
+			}
+			printf("[BBTX-ACQ-WAIT] CFG16 big-block (K=%d) tail past capture window "
+				"(head=%ld cap=%ld block_nsymb=%d overrun=%ld wait_syms=%d defer=%d/%d) -> "
+				"waiting %d fresh symbols for the tail; same single transmission, ring kept; "
+				"head slides EARLIER to ~%ld (FITS, earliest-lock keeps it the SAME block)\n",
+				telecom_system->bigblock_last_rx_K,
+				head, cap_samples, block_nsymb, overrun, wait_syms,
+				bigblock_rx_defer_count, BIGBLOCK_RX_MAX_DEFERS, wait_syms,
+				head - (long)wait_syms*(long)sym_samples);
+			fflush(stdout);
+			// Re-arm ONLY the short wait (NOT a block-span) and leave the ring intact so the
+			// already-arrived head + body survive while the producer fills the tail. Do NOT carve;
+			// the downstream per-frame parse keys on received_message_stats (forced NO below).
+			MUTEX_LOCK(&capture_prep_mutex);
+			telecom_system->data_container.frames_to_read = wait_syms;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			telecom_system->receive_stats.ofdm_search_raw = 0;
+			telecom_system->receive_stats.ofdm_batch_active = false;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			// clear the RX-K marker so the carve gate below is FALSE; not a delivered block.
+			telecom_system->bigblock_last_rx_K = 0;
+			received_message_stats.message_decoded = NO;
+			bigblock_rx_candidate = false;
+			bigblock_rx_handled = true;   // suppress the per-frame parse for this deferred pass
+		}
 		if(bigblock_rx_candidate && !bigblock_rx_cw0_header_valid())
 		{
 			// GAP-2 LIVE-PATH tally (diag/livepath-sim): this acquisition was a CFG16
@@ -7407,6 +8365,18 @@ void cl_arq_controller::receive()
 			// live-path regression can answer reproduces_cw0crc_reject without re-parsing
 			// stdout. SIM_INPROC-only mutation of a test-static; zero production effect.
 			cl_arq_controller::sim2_gate_rejects++;
+			// WALL-B FIX-3 (C1): a real cw0-CRC carve REJECT while parked at CFG16 with the
+			// big-block rung. Accumulate the consecutive-fail streak (the ONE source of truth
+			// bigblock_note_carve_reject); at K (=3) the carve route + block-span re-arm are
+			// SUSPENDED (bigblock_carve_suspended()) so the RSP decodes the CFG16-PHY demote
+			// SET_CONFIG / BREAK on the stock per-frame path it already proved during the climb,
+			// instead of staying structurally deaf until the global LINK watchdog session-resets
+			// (the HW wall-B 0-delivery). Reset on a real carve accept (below) and on any config
+			// change (load_configuration). This branch only runs while bigblock_rx_candidate
+			// (CFG16 && big-block framing && K>0 && NOT-already-suspended), so off-rung the
+			// streak stays 0 (byte-identical). bigblock_note_carve_reject() logs the
+			// [BB-CARVE-SUSPEND] transition on the K-th reject.
+			bigblock_note_carve_reject();
 			printf("[BBTX-GATE] CFG16 acquisition (K=%d) failed cw0 wire-CRC -> NOT a "
 				"big-block; re-decoding on stock per-frame path (control/stale/noise, "
 				"not carved)\n", telecom_system->bigblock_last_rx_K);
@@ -7423,6 +8393,9 @@ void cl_arq_controller::receive()
 			// downstream per-frame parse keys on the (stock) received_message_stats.
 			telecom_system->bigblock_last_rx_K = 0;
 			bigblock_rx_candidate = false;
+			// §19: this acquisition is abandoned (control/stale/noise, OR a defer-cap
+			// give-up). Reset the defer cap so the NEXT real block can defer afresh.
+			bigblock_rx_defer_count = 0;
 		}
 		if(bigblock_rx_candidate)
 		{
@@ -7440,6 +8413,13 @@ void cl_arq_controller::receive()
 			bigblock_receive_carve(telecom_system->bigblock_rx_infobits.data(),
 				(unsigned char)fallback_bsi, /*use_wire_header=*/true);
 			bigblock_rx_handled = true;
+			bigblock_rx_defer_count = 0;   // §19: full block carved -> reset the defer cap
+			// WALL-B FIX-3 (C1 reset): a real block carved -> the carve is viable again. Reset
+			// the carve-fail streak so a later transient 1-2 reject burst re-accumulates from 0
+			// (a transiently-failing-then-recovering carve is NOT starved, INV-3/RISK-A). On the
+			// carve-SUCCESS path this fires on the FIRST accept, so the streak never reaches K
+			// and bigblock_carve_suspended() is always false (carve-success byte-identical).
+			bigblock_note_carve_accept();
 			// the carve already populated messages_rx[] + advanced ARQ state; the
 			// per-frame parse path below keys on received_message_stats.message_decoded.
 			received_message_stats.message_decoded = NO;
@@ -7979,9 +8959,19 @@ void cl_arq_controller::receive()
 			// positive that wedges RSP at CFG0 during the handshake
 			// (gearshift_v14 finding). RSP doesn't need BREAK recovery
 			// while still in LISTENING.
+			// WALL-B FIX-3 (C3): when the CFG16 carve is SUSPENDED, LIFT the coarse_metric
+			// gate. The carve raises receive_stats.coarse_metric to ~0.5-0.6 on exactly the
+			// frames it eats, which otherwise suppresses the BREAK probe (the HW wall-B: the
+			// CFG16-PHY BREAK is starved on the same oversized snapshot). Lifted ONLY at
+			// streak>=K && CFG16 && big-block framing (bigblock_carve_suspended()) — a state
+			// the gearshift_v1 stock-OFDM-data-carrier 16/16 false-BREAK alias does NOT occur
+			// in (that is stock OFDM DATA mid-batch, streak<K). break_match_threshold (10/16) +
+			// the Schmidl-Cox detect_break_pattern_from_passband still gate the actual match, so
+			// no false BREAK fires on a stock OFDM data run (RISK-B, Test E).
 			if(break_detected == NO && gear_shift_on && role == RESPONDER
 			   && link_status == CONNECTED
-			   && telecom_system->receive_stats.coarse_metric < 0.30)
+			   && (telecom_system->receive_stats.coarse_metric < 0.30
+			       || bigblock_carve_suspended()))
 			{
 				int matched = 0;
 				double metric = telecom_system->detect_break_pattern_from_passband(
@@ -8437,6 +9427,43 @@ void cl_arq_controller::receive()
 }
 
 
+// FIX-6 Mouth B (defense-in-depth, paired with the non-lossy drain in
+// process_buffer_data_responder). cl_fifo_buffer::push() (fifo_buffer.cc:85)
+// copies NOTHING and returns 0 when length > free_size — pre-fix the four
+// producers below ignored that and counted the bytes as delivered, so once
+// Mouth A lets the FIFO legitimately back up (app socket slow) this would move
+// the silent loss one layer up. This helper closes that: if the chunk does not
+// fit, it first DRAINS the FIFO to the app socket (freeing room) and retries;
+// only if it STILL cannot fit (genuinely stuck socket AND full 128 KB FIFO) does
+// it LOUD-LOG and report the shortfall so the caller does not advance delivery
+// accounting for un-stored bytes. Returns the number of bytes actually stored
+// (== len on success). The bench3 stall is fixed by Mouth A alone (the FIFO was
+// drained empty by the lossy pop); Mouth B exists so the fix cannot reintroduce
+// a sibling silent-drop under a faster burst (CLAUDE.md §5).
+int cl_arq_controller::fifo_push_rx(const char* buf, int len)
+{
+	if(len <= 0) return 0;
+
+	int pushed = fifo_buffer_rx.push((char*)buf, len);
+	if(pushed == len) return pushed;
+
+	// Didn't fit: drain the app socket to free room, then retry once.
+	// (Responder-only path; the CMD has no symmetric RX→app drain — audit §4.5.)
+	if(original_role == RESPONDER)
+		process_buffer_data_responder();
+
+	pushed = fifo_buffer_rx.push((char*)buf, len);
+	if(pushed == len) return pushed;
+
+	// Still cannot store the whole chunk — the app reader is stuck and the FIFO is
+	// full. Surface it LOUDLY (never silent) and report the shortfall; the caller
+	// must NOT count the un-stored bytes as delivered.
+	printf("[RX-FIFO-FULL] app socket back-pressured, FIFO full: stored %d of %d bytes (held)\n",
+		pushed, len);
+	fflush(stdout);
+	return pushed;
+}
+
 void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
@@ -8556,10 +9583,12 @@ void cl_arq_controller::copy_data_to_buffer()
 					fwrite(decomp_buf, 1, dec_size, stdout);
 					fflush(stdout);
 				}
-				fifo_buffer_rx.push(decomp_buf, dec_size);
-				total_bytes += dec_size;
-				// Streaming: commit context (raw data = decompressed output)
-				if(compressor.is_streaming())
+				int stored = fifo_push_rx(decomp_buf, dec_size);
+				total_bytes += stored;
+				// Streaming: commit context (raw data = decompressed output).
+				// R1 (audit): commit ONLY on a full store so a held batch is not
+				// double-committed into the PPMd/zstd carry on re-delivery.
+				if(stored == dec_size && compressor.is_streaming())
 					compressor.streaming_commit((unsigned char*)decomp_buf, dec_size);
 				// Reset auth failure counter on success
 				if(cipher_suite.is_active())
@@ -8587,8 +9616,7 @@ void cl_arq_controller::copy_data_to_buffer()
 					(int)(ehdr[1] | (ehdr[2] << 8)),
 					(int)(ehdr[3] | (ehdr[4] << 8)));
 				fflush(stdout);
-				fifo_buffer_rx.push(comp_data, comp_len);
-				total_bytes += comp_len;
+				total_bytes += fifo_push_rx(comp_data, comp_len);
 			}
 		}
 		else if(assembled_size > 0)
@@ -8602,8 +9630,7 @@ void cl_arq_controller::copy_data_to_buffer()
 				fwrite(assembled, 1, assembled_size, stdout);
 				fflush(stdout);
 			}
-			fifo_buffer_rx.push(assembled, assembled_size);
-			total_bytes += assembled_size;
+			total_bytes += fifo_push_rx(assembled, assembled_size);
 		}
 	}
 	else
@@ -8622,8 +9649,7 @@ void cl_arq_controller::copy_data_to_buffer()
 					fwrite(messages_rx[i].data, 1, messages_rx[i].length, stdout);
 					fflush(stdout);
 				}
-				fifo_buffer_rx.push(messages_rx[i].data, messages_rx[i].length);
-				total_bytes += messages_rx[i].length;
+				total_bytes += fifo_push_rx(messages_rx[i].data, messages_rx[i].length);
 				messages_rx[i].status=FREE;
 				copied++;
 			}
@@ -9063,5 +10089,26 @@ uint8_t cl_arq_controller::CRC8_calc(char* data_byte, int nItems)
 	}
 	return crc;
 	//ref: MODBUS over serial line specification and implementation guide V1.02, Dec 20,2006, available at https://modbus.org/docs/Modbus_over_serial_line_V1_02.pdf
+}
+
+uint32_t cl_arq_controller::CRC32_calc(const char* data_byte, int nItems)
+{
+	// Reflected IEEE 802.3 CRC-32 (poly 0xEDB88320, init 0xFFFFFFFF, final XOR
+	// 0xFFFFFFFF). Bit-serial reflected form so the implementation is allocator-free
+	// and matches the standard zlib/Ethernet CRC-32 used across the in-tree ffbase
+	// crc32 family. Used as the big-block whole-block integrity anchor on top of the
+	// per-codeword CRC-8 (datalink_defines.h BIGBLOCK_BLOCK_CRC_*). No table needed —
+	// runs over a 1374-byte block exactly once per RX block (negligible cost).
+	uint32_t crc = 0xFFFFFFFFu;
+	for(int j=0; j < nItems; j++)
+	{
+		crc ^= (uint32_t)(unsigned char)data_byte[j];
+		for(int i=0; i<8; i++)
+		{
+			if(crc & 1u) crc = (crc >> 1) ^ 0xEDB88320u;
+			else         crc = (crc >> 1);
+		}
+	}
+	return crc ^ 0xFFFFFFFFu;
 }
 
