@@ -10,7 +10,7 @@
 // unavailable on this MinGW box (no libasan), so this guard is the detector for
 // that class.
 //
-// HOW: every CNEW over-allocates CANARY_PAD extra elements at the TAIL of the
+// HOW: every CNEW over-allocates CG_PAD extra elements at the TAIL of the
 // block and stamps a known byte pattern (0x5A...) into that slack. The base
 // pointer (offset 0) is returned UNCHANGED, so the [0..count) payload view and
 // `delete[]` semantics are identical to the passthrough macro — call sites need
@@ -55,22 +55,24 @@ inline void canary_clear() {}
 // 2*sp boundary in audioio.c, or an off-by-N in an extraction slice) always
 // lands in the guarded region for the worst-case element type (>= 16 bytes for
 // std::complex<double>) -> at least 256 guarded tail bytes.
-#define CANARY_PAD 16
-#define CANARY_BYTE 0x5A          // 'Z' — distinctive in a hex dump
-#define CANARY_FREE_BYTE 0xDD     // freed-payload poison
+// CG_-prefixed to avoid colliding with arq_common.cc's independent message-
+// buffer canary (which defines its own CANARY_BYTE/CANARY_SIZE at :2037).
+#define CG_PAD 16
+#define CG_BYTE 0x5A          // 'Z' — distinctive in a hex dump
+#define CG_FREE_BYTE 0xDD     // freed-payload poison
 
-#define CANARY_MAX 4096
+#define CG_MAX 4096
 
 struct canary_entry {
     const void* base;             // the new[] base pointer (what we return)
-    size_t total_bytes;           // payload + CANARY_PAD*elem_size
+    size_t total_bytes;           // payload + CG_PAD*elem_size
     size_t payload_bytes;         // user-visible [0..count) bytes
     const char* name;
     int live;                     // 1 = registered, 0 = free slot
 };
 
 inline std::mutex& canary_mutex() { static std::mutex m; return m; }
-inline canary_entry* canary_table() { static canary_entry t[CANARY_MAX]; return t; }
+inline canary_entry* canary_table() { static canary_entry t[CG_MAX]; return t; }
 inline int& canary_count() { static int n = 0; return n; }
 inline int& canary_oob_total() { static int n = 0; return n; }
 
@@ -87,7 +89,7 @@ inline size_t canary_verify_entry(const canary_entry& e) {
     size_t guard = e.total_bytes - e.payload_bytes;
     size_t bad = 0;
     for (size_t i = 0; i < guard; ++i)
-        if (tail[i] != (unsigned char)CANARY_BYTE) ++bad;
+        if (tail[i] != (unsigned char)CG_BYTE) ++bad;
     return bad;
 }
 
@@ -96,16 +98,16 @@ inline size_t canary_verify_entry(const canary_entry& e) {
 inline void canary_register(void* base, size_t elem_size, size_t count) {
     // (name is stamped by the macro after this call via canary_set_name)
     unsigned char* tail = (unsigned char*)base + elem_size * count;
-    memset(tail, CANARY_BYTE, elem_size * CANARY_PAD);
+    memset(tail, CG_BYTE, elem_size * CG_PAD);
     std::lock_guard<std::mutex> lk(canary_mutex());
     canary_entry* t = canary_table();
     int n = canary_count();
     int slot = -1;
     for (int i = 0; i < n; ++i) if (!t[i].live) { slot = i; break; }
-    if (slot < 0) { if (n >= CANARY_MAX) return; slot = n; canary_count() = n + 1; }
+    if (slot < 0) { if (n >= CG_MAX) return; slot = n; canary_count() = n + 1; }
     t[slot].base = base;
     t[slot].payload_bytes = elem_size * count;
-    t[slot].total_bytes = elem_size * (count + CANARY_PAD);
+    t[slot].total_bytes = elem_size * (count + CG_PAD);
     t[slot].name = "(unnamed)";
     t[slot].live = 1;
 }
@@ -123,7 +125,7 @@ inline void canary_set_name(void* base, const char* name) {
 // returned type is exactly type* (so delete[] and indexing are unchanged).
 template <typename T>
 inline T* canary_new(size_t count, const char* name) {
-    T* p = new T[count + CANARY_PAD];
+    T* p = new T[count + CG_PAD];
     canary_register((void*)p, sizeof(T), count);
     canary_set_name((void*)p, name);
     return p;
@@ -154,7 +156,7 @@ inline void canary_free(void* base) {
             }
             // Poison the payload so a UAF read through the dangling pointer
             // sees an obvious sentinel before the allocator reuses the page.
-            memset(base, CANARY_FREE_BYTE, t[i].payload_bytes);
+            memset(base, CG_FREE_BYTE, t[i].payload_bytes);
             t[i].live = 0;
             t[i].base = NULL;
             return;
