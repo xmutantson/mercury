@@ -608,16 +608,33 @@ the next OFDM-only run.
 #### INV-PORT-4: discrete-match threshold scaling
 
 `mfsk_preamble_match_threshold` MUST be in the range
-`(2·preamble_nSymb / M, preamble_nSymb]`.
+`(preamble_nSymb / M, preamble_nSymb]`.
 ~~Below 1/M·N the random-data baseline overruns the threshold (FAR
-explodes).~~ **Corrected 2026-05-28 per
+explodes).~~ ~~**Corrected 2026-05-28 per
 `data-preamble-port-research.md` §15.8:** the detector accepts
 expected-bin OR mirror-bin (Bug #39 image recovery,
 `ofdm.cc:3130, 3228`), so the random-data baseline is `2/M`, not
-`1/M`. The lower bound moves to `2·preamble_nSymb / M`. Above N is
-unreachable. The init() values (7 for WB / NB, against N=16 / N=8
-respectively) sit at 7 vs `2·16/32 = 1` (WB M=32, OK) and
-`2·16/16 = 2` (WB M=16, OK).
+`1/M`. The lower bound moves to `2·preamble_nSymb / M`.~~
+
+**Re-corrected 2026-05-28 per `data-preamble-port-research.md`
+§16**: mirror-bin acceptance was dropped from `time_sync_mfsk_corr`
+because the DATA preamble runs post-Moose-lock — mirror bin carries
+only noise. The random-data baseline reverts to `1/M`. The lower
+bound is `preamble_nSymb / M`. Above N is unreachable.
+
+Current init values (`mfsk.cc:212-217`):
+- M=32 WB ROBUST_0: T=6 vs `16/32 = 0.5` (OK; FAR 5.69e-6/poll).
+- M=16 WB ROBUST_1/2: T=7 vs `16/16 = 1.0` (OK; FAR 2.57e-5/poll).
+- NB M=8: T=7 vs `8/8 = 1.0` (OK; goes through detect_ack_pattern
+  which still has mirror-bin acceptance, so effective p=2/M there;
+  FAR 3.40e-6/poll).
+- NB M=4: T=7 (NB ctrl path; same caveat).
+
+The mirror-drop ONLY applies to the DATA preamble path
+(`time_sync_mfsk_corr`). `detect_ack_pattern` (CONNECT/HAIL/ACK/
+BREAK) is unchanged because those detectors run pre-Moose-lock and
+NB needs mirror-bin to suppress in-alphabet image collisions
+(`ofdm.cc:3341-3375`, Bug #39 origin).
 
 #### INV-PORT-5: deferred template lifecycle
 
