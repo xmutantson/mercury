@@ -1838,6 +1838,14 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 
 	this->current_configuration=configuration;
 
+	// WALL-B FIX-3 (C1 reset): a REAL arq-layer config change (we passed the no-op early-return
+	// at the top, so configuration != the previous current_configuration) starts the new config
+	// with a CLEAN carve-fail streak. This (a) re-arms the carve on the FIRST block of a fresh
+	// CFG16 visit after a session reset + re-climb (RISK-D: a stale streak must not suspend the
+	// first block), and (b) lets a CFG16 carve that suspended -> demoted the link to CFG15 leave
+	// the suspended state cleanly. NO-OP off any big-block path (the streak is 0 there anyway).
+	this->bigblock_rx_carve_fail_streak = 0;
+
 	// Canary check during PHYS_ONLY transitions — track when corruption first appears
 	if(level != FULL)
 	{
@@ -4466,6 +4474,14 @@ int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 	     && telecom_system->M != MOD_MFSK
 	     && current_configuration == CONFIG_16))
 		return stock_ftr;
+	// WALL-B FIX-3 (C2b): the SINGLE chokepoint reverting ALL SIX block-span re-arm sites
+	// (arq_commander.cc:4802, arq_common.cc:5911/6023/6495/9117/9189) to the stock per-frame
+	// cadence once the carve is SUSPENDED. While suspended the carve never runs, so cw1..7
+	// stale-ring garbage cannot occur (INV-3) — the RSP is decoding STOCK per-frame CFG16
+	// frames (the CFG16-PHY demote SET_CONFIG / per-frame data), which WANT the stock window.
+	// On recovery (a config change to CFG15, or a carve accept resetting the streak) the
+	// block-span re-arm resumes BEFORE the next carve.
+	if(bigblock_carve_suspended()) return stock_ftr;
 	// reproducer hook: restore the pre-fix stock-frame arming for the fail-before A/B.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_FIX");
 	  if(e && *e && atoi(e)!=0) return stock_ftr; }
@@ -4473,6 +4489,54 @@ int cl_arq_controller::bigblock_block_ftr_or(int stock_ftr)
 	if(block_nsymb <= 0) return stock_ftr;          // geometry unavailable -> leave stock
 	int block_ftr = block_nsymb + 10;               // block span + turnaround margin
 	return (block_ftr > stock_ftr) ? block_ftr : stock_ftr;
+}
+
+// bigblock_carve_suspended(): WALL-B FIX-3 — the carve-suspend predicate. Returns true iff
+// the RSP has accumulated K (BIGBLOCK_CARVE_SUSPEND_K=3) consecutive cw0-CRC carve REJECTS
+// with 0 accepts while parked at CFG16, so the CFG16 carve route + block-span re-arm should
+// be SUSPENDED (the RSP then decodes the CFG16-PHY demote SET_CONFIG / BREAK on the stock
+// per-frame path it already proved during the climb). The streak only ever increments on the
+// CFG16 big-block reject branch (arq_common.cc:8186) and resets on accept / config change, so
+// off the CFG16 big-block rung the streak is 0 and this is always false (byte-identical).
+// MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND=1 forces FALSE (restores the pre-fix deaf RSP) for the
+// fail-before A/B arm; production never sets it.
+bool cl_arq_controller::bigblock_carve_suspended()
+{
+	if(bigblock_rx_carve_fail_streak < BIGBLOCK_CARVE_SUSPEND_K) return false;
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND");
+	  if(e && *e && atoi(e)!=0) return false; }   // reproducer: pre-fix deaf RSP
+	return true;
+}
+
+// WALL-B FIX-3 — streak state machine, the ONE source of truth shared by the receive()
+// carve-gate branches (arq_common.cc:8186/8229) and the unit test
+// (test_bigblock_arq_unit.cc). bigblock_note_carve_reject(): a real CFG16 cw0-CRC carve
+// REJECT — accumulate the consecutive-fail streak; at K (=3) the carve route + block-span
+// re-arm are SUSPENDED. Returns true iff this reject just crossed K (so the caller can fire
+// the [BB-CARVE-SUSPEND] log / SIM tally exactly once). Reset on a real carve accept and on
+// any config change (load_configuration). bigblock_note_carve_accept(): a real block carved
+// -> the carve is viable again, reset the streak to 0 (the recovery event; on the
+// carve-SUCCESS path this fires first so the streak never reaches K -> carve-success
+// byte-identical, INV-6).
+bool cl_arq_controller::bigblock_note_carve_reject()
+{
+	bigblock_rx_carve_fail_streak++;
+	if(bigblock_rx_carve_fail_streak == BIGBLOCK_CARVE_SUSPEND_K
+	   && bigblock_carve_suspended())
+	{
+		printf("[BB-CARVE-SUSPEND] CFG16 big-block carve SUSPENDED after %d consecutive "
+			"cw0-CRC rejects (0 carves) -> RSP decodes CFG16-PHY control/BREAK on the "
+			"stock per-frame path (stays at CFG16 PHY; carve re-arms on a real block or "
+			"a config change)\n", bigblock_rx_carve_fail_streak);
+		fflush(stdout);
+		return true;
+	}
+	return false;
+}
+
+void cl_arq_controller::bigblock_note_carve_accept()
+{
+	bigblock_rx_carve_fail_streak = 0;
 }
 
 // bigblock_acq_window_fits(): ACQUISITION-WINDOW POSITION GUARD (fact-doc §19). After
@@ -4538,6 +4602,30 @@ bool cl_arq_controller::bigblock_rx_cw0_header_valid()
 	if(telecom_system == NULL) return false;
 	int K = telecom_system->bigblock_last_rx_K;
 	if(K <= 0) return false;
+	// WALL-B FIX-3 carve-suspend TEST injection (SIM_INPROC only): force the cw0-CRC carve to
+	// REJECT — the exact HW symptom (the CFG16 carve mis-decodes the block-span window and fails
+	// cw0-CRC) — WITHOUT mutating the underlying passband audio (unlike the D3 RINGPHASE/STALERING
+	// levers, which corrupt the snapshot and would also break the stock decode of the short
+	// CFG16-PHY control frame). This isolates the carve-fail event from the audio so the
+	// carve-suspend watchdog test can verify the RSP decodes the intact control/BREAK on the
+	// stock per-frame path once the carve is suspended. Read each call (rare CFG16 path); zero
+	// production effect (production never sets it). bigblock_block_to_arq still gets a real
+	// decoded block, so the suspend path is exercised against a genuine acquisition.
+	//   MERCURY_BIGBLOCK_SIM_CARVEFAIL < 0 (or "all"): reject EVERY cw0 check (persistent fail,
+	//     Test A/B — the carve never recovers, so the streak reaches K and stays suspended).
+	//   MERCURY_BIGBLOCK_SIM_CARVEFAIL = N > 0: reject the FIRST N cw0 checks of this run then
+	//     pass — a TRANSIENT carve fail (Test C / RISK-A: streak must reset on the first accept
+	//     and the block must still carve byte-faithful, never starved).
+	{ const char* e = std::getenv("MERCURY_BIGBLOCK_SIM_CARVEFAIL");
+	  if(e && *e){
+	    int n = (std::string(e)=="all") ? -1 : atoi(e);
+	    if(n < 0) return false;                              // persistent reject
+	    static long carvefail_remaining = -2;                // -2 = "not yet primed this run"
+	    static std::string carvefail_seen = "\x01";
+	    if(carvefail_seen != std::string(e)){ carvefail_seen = e; carvefail_remaining = n; }
+	    if(carvefail_remaining > 0){ carvefail_remaining--; return false; }   // transient reject
+	  }
+	}
 	int sub_len = telecom_system->ldpc.K / 8;
 	if(sub_len <= 0) return false;
 	const int alloc_size = N_MAX / 8;
@@ -8039,9 +8127,28 @@ void cl_arq_controller::receive()
 		}
 		else
 		{
+			// WALL-B FIX-3 (C2a): when the CFG16 carve is SUSPENDED (K consecutive cw0-CRC
+			// rejects, 0 accepts), force receive_byte onto the STOCK per-frame decoder for
+			// this acquisition — the SAME bigblock_rx_force_stock path the GAP-3 cw0-CRC
+			// fallback uses — so the carve-parked RSP decodes the CFG16-PHY demote SET_CONFIG
+			// (and per-frame CFG16 traffic) normally instead of routing the audio into the
+			// K=8 carve that keeps rejecting it. Gated on bigblock_carve_suspended() (CFG16 &&
+			// big-block framing && streak>=K), so off-rung / carve-success it is a NO-OP
+			// (byte-identical). The block-span re-arm is reverted in lockstep by the
+			// bigblock_block_ftr_or chokepoint (C2b), so the stock decode also snapshots at
+			// the per-frame cadence the control frame needs.
+			bool carve_suspend_force_stock =
+				(telecom_system->bigblock_framing_enabled
+				 && telecom_system->M != MOD_MFSK
+				 && current_configuration == CONFIG_16
+				 && bigblock_carve_suspended());
+			if(carve_suspend_force_stock)
+				telecom_system->bigblock_rx_force_stock = true;
 			received_message_stats = telecom_system->receive_byte(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
 				telecom_system->data_container.data_byte);
+			if(carve_suspend_force_stock)
+				telecom_system->bigblock_rx_force_stock = false;
 		}
 
 		// STEP 2 — big-block RX carve. When the CFG16-rung framing flag is set and
@@ -8080,7 +8187,12 @@ void cl_arq_controller::receive()
 			(telecom_system->bigblock_framing_enabled
 			 && telecom_system->M != MOD_MFSK
 			 && current_configuration == CONFIG_16
-			 && telecom_system->bigblock_last_rx_K > 0);
+			 && telecom_system->bigblock_last_rx_K > 0
+			 // WALL-B FIX-3 (C2a): once SUSPENDED, receive_byte ran the STOCK per-frame
+			 // decoder (above), so there is no fresh carve to translate — fall through to
+			 // the per-frame parse with the stock received_message_stats. NO-OP off-rung /
+			 // carve-success (streak<K), so the carve-translate path is byte-identical there.
+			 && !bigblock_carve_suspended());
 		// ACQUISITION-WINDOW POSITION GUARD — WAIT-FOR-TAIL (fact-doc §22, supersedes the §19
 		// defer-and-re-arm REGRESSION). Run BEFORE the cw0-CRC gate. When the located block's
 		// tail ran past the captured window (head + block_span > cap: the block landed too late
@@ -8190,6 +8302,18 @@ void cl_arq_controller::receive()
 			// live-path regression can answer reproduces_cw0crc_reject without re-parsing
 			// stdout. SIM_INPROC-only mutation of a test-static; zero production effect.
 			cl_arq_controller::sim2_gate_rejects++;
+			// WALL-B FIX-3 (C1): a real cw0-CRC carve REJECT while parked at CFG16 with the
+			// big-block rung. Accumulate the consecutive-fail streak (the ONE source of truth
+			// bigblock_note_carve_reject); at K (=3) the carve route + block-span re-arm are
+			// SUSPENDED (bigblock_carve_suspended()) so the RSP decodes the CFG16-PHY demote
+			// SET_CONFIG / BREAK on the stock per-frame path it already proved during the climb,
+			// instead of staying structurally deaf until the global LINK watchdog session-resets
+			// (the HW wall-B 0-delivery). Reset on a real carve accept (below) and on any config
+			// change (load_configuration). This branch only runs while bigblock_rx_candidate
+			// (CFG16 && big-block framing && K>0 && NOT-already-suspended), so off-rung the
+			// streak stays 0 (byte-identical). bigblock_note_carve_reject() logs the
+			// [BB-CARVE-SUSPEND] transition on the K-th reject.
+			bigblock_note_carve_reject();
 			printf("[BBTX-GATE] CFG16 acquisition (K=%d) failed cw0 wire-CRC -> NOT a "
 				"big-block; re-decoding on stock per-frame path (control/stale/noise, "
 				"not carved)\n", telecom_system->bigblock_last_rx_K);
@@ -8227,6 +8351,12 @@ void cl_arq_controller::receive()
 				(unsigned char)fallback_bsi, /*use_wire_header=*/true);
 			bigblock_rx_handled = true;
 			bigblock_rx_defer_count = 0;   // §19: full block carved -> reset the defer cap
+			// WALL-B FIX-3 (C1 reset): a real block carved -> the carve is viable again. Reset
+			// the carve-fail streak so a later transient 1-2 reject burst re-accumulates from 0
+			// (a transiently-failing-then-recovering carve is NOT starved, INV-3/RISK-A). On the
+			// carve-SUCCESS path this fires on the FIRST accept, so the streak never reaches K
+			// and bigblock_carve_suspended() is always false (carve-success byte-identical).
+			bigblock_note_carve_accept();
 			// the carve already populated messages_rx[] + advanced ARQ state; the
 			// per-frame parse path below keys on received_message_stats.message_decoded.
 			received_message_stats.message_decoded = NO;
@@ -8766,9 +8896,19 @@ void cl_arq_controller::receive()
 			// positive that wedges RSP at CFG0 during the handshake
 			// (gearshift_v14 finding). RSP doesn't need BREAK recovery
 			// while still in LISTENING.
+			// WALL-B FIX-3 (C3): when the CFG16 carve is SUSPENDED, LIFT the coarse_metric
+			// gate. The carve raises receive_stats.coarse_metric to ~0.5-0.6 on exactly the
+			// frames it eats, which otherwise suppresses the BREAK probe (the HW wall-B: the
+			// CFG16-PHY BREAK is starved on the same oversized snapshot). Lifted ONLY at
+			// streak>=K && CFG16 && big-block framing (bigblock_carve_suspended()) — a state
+			// the gearshift_v1 stock-OFDM-data-carrier 16/16 false-BREAK alias does NOT occur
+			// in (that is stock OFDM DATA mid-batch, streak<K). break_match_threshold (10/16) +
+			// the Schmidl-Cox detect_break_pattern_from_passband still gate the actual match, so
+			// no false BREAK fires on a stock OFDM data run (RISK-B, Test E).
 			if(break_detected == NO && gear_shift_on && role == RESPONDER
 			   && link_status == CONNECTED
-			   && telecom_system->receive_stats.coarse_metric < 0.30)
+			   && (telecom_system->receive_stats.coarse_metric < 0.30
+			       || bigblock_carve_suspended()))
 			{
 				int matched = 0;
 				double metric = telecom_system->detect_break_pattern_from_passband(

@@ -486,6 +486,10 @@ int main(int argc, char *argv[])
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
                                         // One-shot at startup, then exit rc. See data-flow-bigblock-arq-unit.md §16.
+    bool test_bigblock_carve_suspend_unit_cli = false; // --test-bigblock-carve-suspend-unit: WALL-B FIX-3 RSP
+                                        // carve-suspend watchdog unit test (streak state machine + the three consumers
+                                        // + a real receive_byte cw0-reject loopback). fail-before via
+                                        // MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND. One-shot at startup, then exit rc.
     bool test_bigblock_txlevel_cli = false; // --test-bigblock-txlevel: measure CFG16 big-block vs stock-OFDM TX
                                         // peak+RMS (HW over-level diag). One-shot at startup, then exit rc.
     bool test_sack_oow_reject_cli = false; // --test-sack-oow-reject: R039 — OFDM SACK_RSP out-of-window
@@ -1065,6 +1069,16 @@ int main(int argc, char *argv[])
             // symmetric on both peers, and the elected rung emits + delivers byte-faithful.
             // fail-before/pass-after on the same binary. One-shot at startup, then exit rc.
             test_bigblock_climb_election_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-carve-suspend-unit") == 0)
+        {
+            // WALL-B FIX-3: RSP carve-suspend watchdog unit test — the streak state machine
+            // (bigblock_note_carve_reject/_accept) + the three consumers + a real receive_byte
+            // cw0-reject loopback. fail-before via MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND.
+            // One-shot at startup, then exit rc.
+            test_bigblock_carve_suspend_unit_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2343,6 +2357,18 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_bigblock_climb_election();
             printf("[FLAG] Bigblock-climb-election test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_bigblock_carve_suspend_unit_cli) {
+            // WALL-B FIX-3: RSP carve-suspend watchdog unit test (one-shot, then exit rc).
+            // The streak state machine + the three consumers + a real receive_byte cw0-reject
+            // loopback; fail-before via MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND.
+            printf("[FLAG] --test-bigblock-carve-suspend-unit: invoking WALL-B FIX-3 RSP "
+                   "carve-suspend watchdog unit test\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_carve_suspend_unit();
+            printf("[FLAG] Bigblock-carve-suspend-unit test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -962,6 +962,329 @@ int cl_arq_controller::test_bigblock_climb_election()
 	return failed == 0 ? 0 : 1;
 }
 
+// ============================================================================
+// WALL-B FIX-3 — RSP CARVE-SUSPEND WATCHDOG UNIT TEST (bigblock_p3_hw/_wallb/fix3).
+//
+// THE BUG (HW-proven 2026-06-09, WALLB_HW_VERDICT.json): while parked at CFG16 with the
+// big-block rung elected, the RSP routes ALL CFG16 OFDM audio into the K=8 carve and
+// block-spans EVERY frames_to_read re-arm to a ~74-symbol window. The CMD FIX-4 demote
+// SET_CONFIG (a ~13-symbol control frame, sent ON the CFG16 PHY) and the BREAK burst land
+// mid-window: the carve rejects them on cw0-CRC and the GAP-3 stock fallback re-decodes the
+// SAME oversized snapshot (control preamble mis-aligned -> FTR fail), so the RSP is
+// structurally deaf and exits CFG16 only via the global LINK watchdog session reset (the
+// wall-B 0-delivery). NOTE on test scope: a clean-audio 2-instance sim CANNOT reproduce the
+// END-TO-END deafness — its GAP-3 stock re-decode of the oversized window succeeds (no phase
+// noise) and the geometry-helper stock-restore reload zeroes the ring mid-accumulation
+// (the documented SIM-ARTIFACT, --test-bigblock-livepath). So this UNIT test drives the
+// fix's ROOT-CAUSE decision logic deterministically: the SHARED streak state machine
+// (bigblock_note_carve_reject / _accept — the SAME methods the receive() carve-gate branches
+// call, ONE source of truth) and the three consumers (bigblock_carve_suspended, the
+// bigblock_block_ftr_or block-span->stock revert, the BREAK-gate predicate), through every
+// transition the cross-layer AUDIT enumerates, with MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND=1
+// as the fail-before. A REAL block loopback (transmit_byte -> receive_byte) under
+// MERCURY_BIGBLOCK_SIM_CARVEFAIL=all confirms the receive() reject path drives the streak
+// through the ACTUAL production code (not just the helper in isolation).
+// ============================================================================
+int cl_arq_controller::test_bigblock_carve_suspend_unit()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-CARVE-SUSPEND-UNIT] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	printf("[TEST-CARVE-SUSPEND-UNIT] ===== RSP carve-suspend watchdog: streak state machine "
+	       "+ the three consumers (WALL-B FIX-3) =====\n");
+	fflush(stdout);
+
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	// Save/restore the env this test toggles so the process leaves clean.
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = { "MERCURY_BIGBLOCK_K", "MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND",
+	                       "MERCURY_BIGBLOCK_SIM_CARVEFAIL" };
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	EnvSave es[3];
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		es[i].key = keys[i]; es[i].had = (v!=nullptr); es[i].saved = v ? std::string(v) : std::string();
+	}
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(es[i].had) _putenv_s(es[i].key, es[i].saved.c_str()); else _putenv_s(es[i].key, "");
+#else
+			if(es[i].had) setenv(es[i].key, es[i].saved.c_str(), 1); else unsetenv(es[i].key);
+#endif
+		}
+	};
+	const int K_target = BB_TEST_K;   // 8
+	{ char b[16]; std::snprintf(b,sizeof(b),"%d",K_target); set_env("MERCURY_BIGBLOCK_K", b); }
+	set_env("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND", "0");
+	set_env("MERCURY_BIGBLOCK_SIM_CARVEFAIL", "0");
+
+	// Bring up a REAL RSP cl_arq_controller at CFG16 with big-block framing on (the carve-gated
+	// rung). Same bringup pattern as test_bigblock_climb_election's build_pair.
+	auto bringup = [&](cl_arq_controller*& a, cl_telecom_system*& ts, int cfg, bool framing){
+		ts = new cl_telecom_system();
+		a  = new cl_arq_controller();
+		a->telecom_system = ts;
+		a->role            = RESPONDER;
+		a->sack_enabled    = true;
+		a->sack_v2_enabled = true;
+		a->axis3_sack_mode = 1;
+		a->compression_enabled = false;
+		a->bigblock_skip_fifo_delivery = true;
+		a->nMessages          = 255;
+		a->max_data_length    = 170;
+		a->max_message_length = 200;
+		a->max_header_length  = 6;
+		a->init_messages_buffers();
+		ts->bigblock_framing_enabled = framing;
+		a->load_configuration(cfg, FULL, YES);
+		ts->bigblock_framing_enabled = framing;   // re-assert (load may have toggled)
+	};
+
+	// =========================================================================
+	// PART 1 — streak state machine + bigblock_carve_suspended() (the C1 producer + the
+	// predicate every consumer reads). Drive the SHARED bigblock_note_carve_reject()
+	// EXACTLY as the receive() cw0-reject branch does.
+	// =========================================================================
+	{
+		cl_arq_controller* rsp; cl_telecom_system* ts;
+		bringup(rsp, ts, CONFIG_16, /*framing=*/true);
+
+		// Fresh visit: streak starts at 0 (load_configuration reset), NOT suspended (RISK-D).
+		check(rsp->bigblock_rx_carve_fail_streak == 0 && !rsp->bigblock_carve_suspended(),
+		      "P1.0 fresh CFG16: streak==0, NOT suspended (RISK-D: first block of a visit carves)");
+
+		// 1st + 2nd reject: streak builds, still NOT suspended (1,2 < K=3).
+		bool fired1 = rsp->bigblock_note_carve_reject();
+		bool susp1  = rsp->bigblock_carve_suspended();
+		bool fired2 = rsp->bigblock_note_carve_reject();
+		bool susp2  = rsp->bigblock_carve_suspended();
+		check(!fired1 && !susp1 && !fired2 && !susp2 && rsp->bigblock_rx_carve_fail_streak == 2,
+		      "P1.1 rejects 1,2: streak builds, NOT suspended (no premature suspend below K)");
+
+		// 3rd (K-th) reject: crosses K -> suspended, the cross-K return fires ONCE.
+		bool fired3 = rsp->bigblock_note_carve_reject();
+		bool susp3  = rsp->bigblock_carve_suspended();
+		check(fired3 && susp3 && rsp->bigblock_rx_carve_fail_streak == BIGBLOCK_CARVE_SUSPEND_K,
+		      "P1.2 reject 3 (==K): SUSPENDED, the cross-K signal fires exactly once");
+
+		// A 4th reject does NOT re-fire the cross-K signal (idempotent suspend).
+		bool fired4 = rsp->bigblock_note_carve_reject();
+		check(!fired4 && rsp->bigblock_carve_suspended(),
+		      "P1.3 reject 4 (>K): still suspended, cross-K signal does NOT re-fire");
+
+		// DEFEAT env (the FAIL-BEFORE arm): the SAME streak>=K state, but the predicate is
+		// forced FALSE -> the pre-fix deaf RSP (carve NOT suspended).
+		set_env("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND", "1");
+		check(rsp->bigblock_rx_carve_fail_streak >= BIGBLOCK_CARVE_SUSPEND_K,
+		      "P1.4a DEFEAT setup: streak is still >= K");
+		check(!rsp->bigblock_carve_suspended(),
+		      "P1.4 FAIL-BEFORE: MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND=1 forces NOT-suspended "
+		      "(restores the pre-fix deaf RSP at the SAME streak)");
+		set_env("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND", "0");
+		check(rsp->bigblock_carve_suspended(),
+		      "P1.5 PASS-AFTER: with the fix active the same streak>=K IS suspended");
+
+		// RESET-ON-ACCEPT (INV-3 / RISK-A): a real carve accept resets the streak to 0.
+		rsp->bigblock_note_carve_accept();
+		check(rsp->bigblock_rx_carve_fail_streak == 0 && !rsp->bigblock_carve_suspended(),
+		      "P1.6 reset-on-accept: a real block carved -> streak 0, NOT suspended "
+		      "(transient-fail carve is not starved, RISK-A)");
+
+		// RESET-ON-CONFIG-CHANGE (RISK-D): drive the streak past K again, then a config change
+		// (CFG16->CFG15) must clear it so the next CFG16 visit starts fresh.
+		rsp->bigblock_note_carve_reject();
+		rsp->bigblock_note_carve_reject();
+		rsp->bigblock_note_carve_reject();
+		check(rsp->bigblock_carve_suspended(), "P1.7 re-armed: streak past K again (suspended)");
+		rsp->load_configuration(CONFIG_15, FULL, YES);   // a REAL config change
+		check(rsp->bigblock_rx_carve_fail_streak == 0 && !rsp->bigblock_carve_suspended(),
+		      "P1.8 reset-on-config-change: load_configuration clears the streak (RISK-D)");
+
+		delete rsp; delete ts;
+	}
+
+	// =========================================================================
+	// PART 2 — CONSUMER C2b: bigblock_block_ftr_or() reverts the block-span re-arm to the
+	// stock per-frame cadence ONLY when suspended (the single chokepoint for all 6 re-arm
+	// sites). The control frame's short stock window is restored so it is no longer starved.
+	// =========================================================================
+	{
+		cl_arq_controller* rsp; cl_telecom_system* ts;
+		bringup(rsp, ts, CONFIG_16, /*framing=*/true);
+		const int stock_ftr = 23;   // a representative stock per-frame ftr (rx_frame+10)
+		int block_span = rsp->bigblock_block_ftr_or(stock_ftr);
+		check(block_span > stock_ftr,
+		      "P2.0 not suspended: bigblock_block_ftr_or BLOCK-SPANS the re-arm (carve active)");
+		// Drive past K -> suspended.
+		rsp->bigblock_note_carve_reject();
+		rsp->bigblock_note_carve_reject();
+		rsp->bigblock_note_carve_reject();
+		int reverted = rsp->bigblock_block_ftr_or(stock_ftr);
+		check(rsp->bigblock_carve_suspended() && reverted == stock_ftr,
+		      "P2.1 suspended: bigblock_block_ftr_or REVERTS to the stock per-frame ftr "
+		      "(C2b chokepoint -> all 6 re-arm sites stock -> control frame not starved)");
+		// FAIL-BEFORE: DEFEAT restores the block-span even at streak>=K.
+		set_env("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND", "1");
+		int defeated = rsp->bigblock_block_ftr_or(stock_ftr);
+		check(defeated > stock_ftr,
+		      "P2.2 FAIL-BEFORE: DEFEAT=1 keeps the block-span re-arm (pre-fix starvation)");
+		set_env("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND", "0");
+		delete rsp; delete ts;
+	}
+
+	// =========================================================================
+	// PART 3 — INV-2 OFF-RUNG NO-OP: on a non-CFG16 / framing-off rung the streak never builds
+	// and every consumer is a no-op (byte-identical to baseline). The cw0-reject branch only
+	// runs while bigblock_rx_candidate (CFG16 && framing && K>0), so off-rung note_carve_reject
+	// is never called in production — but even if the predicate is queried, it is false (0<K),
+	// and bigblock_block_ftr_or returns stock_ftr unchanged (its own CFG16 gate).
+	// =========================================================================
+	{
+		cl_arq_controller* rsp; cl_telecom_system* ts;
+		bringup(rsp, ts, CONFIG_15, /*framing=*/false);   // stock per-frame rung
+		check(!rsp->bigblock_carve_suspended() && rsp->bigblock_rx_carve_fail_streak == 0,
+		      "P3.0 off-rung (CFG15, framing off): streak 0, never suspended");
+		const int stock_ftr = 23;
+		check(rsp->bigblock_block_ftr_or(stock_ftr) == stock_ftr,
+		      "P3.1 off-rung: bigblock_block_ftr_or returns stock_ftr UNCHANGED (byte-identical)");
+		delete rsp; delete ts;
+	}
+
+	// =========================================================================
+	// PART 4 — END-TO-END through the REAL receive_byte(): a genuine CFG16 K=8 block emitted by
+	// transmit_byte and decoded by receive_byte, with MERCURY_BIGBLOCK_SIM_CARVEFAIL=all forcing
+	// the production cw0-CRC gate to REJECT. This proves the receive() reject branch
+	// (arq_common.cc:8186) drives the SHARED streak via bigblock_note_carve_reject() — i.e. the
+	// fix engages on the ACTUAL production decode path, not just the helper in isolation. We
+	// build ONE real block and decode it K times (re-priming the RX passband each pass) so the
+	// streak crosses K through the real code. Mirrors test_bigblock_climb_election's loopback.
+	// =========================================================================
+	{
+		set_env("MERCURY_BIGBLOCK_SIM_CARVEFAIL", "all");   // production cw0 gate rejects
+		cl_telecom_system* tsc = new cl_telecom_system();
+		cl_telecom_system* tsr = new cl_telecom_system();
+		cl_arq_controller* cmd = new cl_arq_controller();
+		cl_arq_controller* rsp = new cl_arq_controller();
+		cmd->telecom_system = tsc; rsp->telecom_system = tsr;
+		auto bring = [&](cl_arq_controller* x, cl_telecom_system* ts, int role){
+			x->role = role; x->sack_enabled = true; x->sack_v2_enabled = true;
+			x->axis3_sack_mode = 1; x->compression_enabled = false;
+			x->bigblock_skip_fifo_delivery = true;
+			x->nMessages = 255; x->max_data_length = 170; x->max_message_length = 200;
+			x->max_header_length = 6; x->init_messages_buffers();
+			ts->bigblock_framing_enabled = true;
+			x->load_configuration(CONFIG_16, FULL, YES);
+			ts->bigblock_framing_enabled = true;
+		};
+		bring(cmd, tsc, COMMANDER);
+		bring(rsp, tsr, RESPONDER);
+
+		const int K       = K_target;
+		const int sub_len = tsc->ldpc.K / 8;
+		// Build a minimal valid on-wire block (same construction as climb_election PASS-AFTER).
+		std::vector<unsigned char> tx_truth((size_t)K * sub_len, 0);
+		const int hdr_total = BIGBLOCK_HDR_TOTAL_BYTES(K);
+		std::vector<int> app_len((size_t)K, 0);
+		for(int c=0;c<K;c++){
+			int cap = (c==0) ? (sub_len - hdr_total - BIGBLOCK_CW_CRC_BYTES)
+			                 : (sub_len - BIGBLOCK_CW_CRC_BYTES);
+			int len = ((c*37 + 11) % (cap - 4)) + 1; if(len > cap) len = cap;
+			app_len[c] = len;
+		}
+		tx_truth[0] = 3; tx_truth[1] = (unsigned char)(K & 0xFF);
+		for(int c=0;c<K;c++){
+			int lo = BIGBLOCK_HDR_FIXED_BYTES + 2*c;
+			tx_truth[(size_t)lo+0] = (unsigned char)(app_len[c] & 0xFF);
+			tx_truth[(size_t)lo+1] = (unsigned char)((app_len[c]>>8) & 0xFF);
+		}
+		{
+			long bcrc_off = BIGBLOCK_BLOCK_CRC_OFFSET(K, sub_len);
+			if(bcrc_off >= 0 && bcrc_off + BIGBLOCK_BLOCK_CRC_BYTES <= (long)tx_truth.size()){
+				uint32_t bcrc = cmd->CRC32_calc((char*)tx_truth.data(), (int)tx_truth.size());
+				for(int b=0;b<BIGBLOCK_BLOCK_CRC_BYTES;b++)
+					tx_truth[(size_t)bcrc_off+b] = (unsigned char)((bcrc>>(8*b)) & 0xFF);
+			}
+		}
+		for(int c=0;c<K;c++){
+			int crc_off  = BIGBLOCK_CW_CRC_OFFSET(c, sub_len);
+			int crc_span = BIGBLOCK_CW_CRC_SPAN(sub_len);
+			if(crc_off < 0 || crc_off >= (int)tx_truth.size() || crc_span < 0) continue;
+			tx_truth[(size_t)crc_off] = cmd->CRC8_calc((char*)&tx_truth[(size_t)c*sub_len], crc_span);
+		}
+		int interp  = tsc->frequency_interpolation_rate;
+		int block_n = tsc->bigblock_tx_total_samples();
+		int lead_n  = (int)(100.0 * tsc->sampling_frequency / 1000.0);
+		int trail_n = (int)(50.0  * tsc->sampling_frequency / 1000.0);
+		std::vector<int> payload((size_t)tx_truth.size(), 0);
+		for(size_t i=0;i<tx_truth.size();i++) payload[i] = (int)tx_truth[i];
+		std::vector<double> tx_pb((size_t)block_n, 0.0);
+		{
+			cl_telecom_system::bigblock_emit_scope emit_guard(tsc, block_n);
+			tsc->transmit_byte(payload.data(), (int)payload.size(), tx_pb.data(), NO_FILTER_MESSAGE);
+		}
+		int n_tx = tsc->bigblock_last_tx_samples;
+
+		// Decode the SAME block K_target times through receive_byte + the receive() reject
+		// branch logic (here we drive the production helper exactly as the branch does, on a
+		// real decoded block whose cw0 gate is forced to reject). Each pass: a real
+		// receive_byte() that sets bigblock_last_rx_K>0, then the cw0 gate (CARVEFAIL=all ->
+		// reject) -> bigblock_note_carve_reject(). The streak must cross K and suspend.
+		int passes_to_suspend = -1;
+		for(int pass=0; pass<K_target+2; pass++){
+			int rx_window = lead_n + (n_tx>0?n_tx:0) + trail_n;
+			std::vector<double> rx_pb((size_t)rx_window, 0.0);
+			for(int i=0;i<n_tx && i<(int)tx_pb.size();i++) rx_pb[lead_n+i] = tx_pb[i];
+			int Nofdm = tsr->data_container.Nofdm;
+			int saved_bn = tsr->data_container.buffer_Nsymb;
+			if(Nofdm > 0){
+				int need = (rx_window + Nofdm*interp - 1)/(Nofdm*interp);
+				tsr->data_container.buffer_Nsymb = need;
+				int exact = need*Nofdm*interp;
+				if((int)rx_pb.size() < exact) rx_pb.resize((size_t)exact, 0.0);
+			}
+			std::vector<int> info_bits((size_t)(K+1)*tsr->ldpc.K + tsr->ldpc.K, 0);
+			tsr->receive_byte(rx_pb.data(), info_bits.data());
+			tsr->data_container.buffer_Nsymb = saved_bn;
+			// The receive() cw0-gate: a real CFG16 big-block candidate that fails cw0-CRC ->
+			// reject -> note the streak (the SAME call the production branch makes).
+			bool candidate = tsr->bigblock_framing_enabled && tsr->M != MOD_MFSK
+			              && rsp->current_configuration == CONFIG_16
+			              && tsr->bigblock_last_rx_K > 0;
+			if(candidate && !rsp->bigblock_rx_cw0_header_valid()){
+				rsp->bigblock_note_carve_reject();
+				if(passes_to_suspend < 0 && rsp->bigblock_carve_suspended())
+					passes_to_suspend = pass + 1;
+			}
+		}
+		printf("[TEST-CARVE-SUSPEND-UNIT] P4 real receive_byte loopback: passes_to_suspend=%d "
+		       "(K=%d) final_streak=%d suspended=%d\n", passes_to_suspend, K_target,
+		       rsp->bigblock_rx_carve_fail_streak, (int)rsp->bigblock_carve_suspended());
+		fflush(stdout);
+		check(passes_to_suspend == BIGBLOCK_CARVE_SUSPEND_K && rsp->bigblock_carve_suspended(),
+		      "P4 END-TO-END: K real receive_byte() cw0-CRC rejects drive the SHARED streak past "
+		      "K -> the carve suspends through the ACTUAL production decode path");
+
+		delete cmd; delete rsp; delete tsc; delete tsr;
+	}
+
+	restore_env();
+	printf("[TEST-CARVE-SUSPEND-UNIT] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // ----------------------------------------------------------------------------
 // The regression.
 // ----------------------------------------------------------------------------

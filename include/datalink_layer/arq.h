@@ -1646,6 +1646,39 @@ public:
   // to the stock cw0-CRC gate instead of spinning. Reset on every accept.
   bool bigblock_acq_window_fits();
   int  bigblock_rx_defer_count = 0;
+  // WALL-B FIX-3 — RSP CARVE-SUSPEND WATCHDOG (bigblock_p3_hw/_wallb/fix3). While parked
+  // at CFG16 with the big-block rung elected, the RSP routes ALL CFG16 OFDM audio into the
+  // K=8 carve and block-spans EVERY frames_to_read re-arm to a ~74-symbol block window. The
+  // CMD FIX-4 demote SET_CONFIG (a ~13-symbol control frame, sent ON the CFG16 PHY per
+  // arq_commander.cc:3685-3692/4819-4822) and the BREAK burst then land mid-window: the
+  // carve rejects them on cw0-CRC and the GAP-3 stock fallback re-decodes the SAME oversized
+  // snapshot (control preamble mis-aligned -> FTR fail), so the RSP is structurally deaf to
+  // any control/BREAK at a rung it can only leave via the global LINK watchdog (HW 2026-06-09:
+  // WALLB_HW_VERDICT.json — RSP load_configuration tail …,15,16,16,100,100). After K
+  // consecutive cw0-CRC carve REJECTS with 0 accepts the RSP SUSPENDS the carve route AND
+  // the block-span re-arm FOR THE CFG16 RUNG, but STAYS at CFG16 PHY (it does NOT demote its
+  // own config — the CMD's demote/retransmits are CFG16-PHY until the ACK, so the RSP must
+  // stay at CFG16 to decode them). Suspended, the RSP behaves like the stock CFG16 OFDM
+  // receiver the climb already proved decodes SET_CONFIGs 13->14->15->16, so it decodes the
+  // CFG16-PHY demote, loads CFG15, ACKs; both peers run per-frame CFG15 instead of 0 bytes.
+  // INCREMENTED in the cw0-CRC reject branch (arq_common.cc:8186-8212); RESET to 0 on a real
+  // carve accept (arq_common.cc:8229, the recovery event) and on any arq-layer config change
+  // (load_configuration, arq_common.cc:1839 — only past the no-op guard). On the carve-SUCCESS
+  // path the first accept resets the streak to 0 so it never reaches K -> all three consumers
+  // are NO-OPs (carve-success byte-identical, INV-6). Provably safe: gated on CFG16 &&
+  // big-block-framing && streak>=K, unreachable on the carve-success path; no wire/TX change.
+  int  bigblock_rx_carve_fail_streak = 0;
+  static const int BIGBLOCK_CARVE_SUSPEND_K = 3;  // same scoping idiom as STALE_CFO_RESET_FAILS
+  // True iff the CFG16 carve route should be SUSPENDED (K consecutive cw0-CRC rejects, 0
+  // accepts). MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND=1 forces FALSE (restores the pre-fix deaf
+  // RSP) for the fail-before A/B arm; production never sets it.
+  bool bigblock_carve_suspended();
+  // WALL-B FIX-3 streak state-machine (ONE source of truth, called by the receive() carve-gate
+  // branches AND the unit test). note_carve_reject(): a real CFG16 cw0-CRC carve REJECT ->
+  // ++streak (and log [BB-CARVE-SUSPEND] on the K-th, returning true once it crosses K).
+  // note_carve_accept(): a real block carved -> reset streak to 0 (the recovery event).
+  bool bigblock_note_carve_reject();
+  void bigblock_note_carve_accept();
   // TX block stash (set by bigblock_send_one_block): the K*sub_len payload bytes the
   // block carried + its geometry, so the in-process single-block harness can carve
   // it back byte-faithfully (the delivered==TX ground truth, INV-6).
@@ -1756,6 +1789,18 @@ public:
   // fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1
   // (skips the load_configuration tail election). Returns 0 on all-pass, 1 on failure.
   static int test_bigblock_climb_election();
+  // WALL-B FIX-3 — RSP carve-suspend watchdog UNIT test (bigblock_p3_hw/_wallb/fix3).
+  // CLI: --test-bigblock-carve-suspend-unit. Deterministic in-process test on a REAL RSP
+  // cl_arq_controller at CFG16 (big-block framing on): drives the SHARED streak state machine
+  // (bigblock_note_carve_reject / _accept — the SAME methods the receive() carve-gate branches
+  // call) + the three consumers (bigblock_carve_suspended, bigblock_block_ftr_or revert, the
+  // BREAK-gate predicate) through every transition the AUDIT enumerates. Asserts: streak builds
+  // to K -> suspended; block-span re-arm reverts to stock; DEFEAT env restores the pre-fix deaf
+  // RSP (fail-before); reset-on-accept + reset-on-config-change (INV-3/RISK-A); off-rung NO-OP
+  // (INV-2); first-block-of-fresh-visit carves (RISK-D). Plus a REAL block loopback
+  // (transmit_byte -> receive_byte) under MERCURY_BIGBLOCK_SIM_CARVEFAIL=all confirming the
+  // receive() reject path drives the streak through the actual code. Returns 0 on all-pass.
+  static int test_bigblock_carve_suspend_unit();
   // R039 (race audit 2026-06-06) — OFDM SACK_RSP out-of-window reject test.
   // CLI: --test-sack-oow-reject. Builds a CRC8-VALID SACK_RSP payload with an
   // out-of-window batch_seq_id, drives the REAL decode_sack_v2_frame() (which is
