@@ -627,6 +627,7 @@ int main(int argc, char *argv[])
                                         // One-shot at startup, then exit. See fact-documents/sack_partial_bsi_advance.md §5.
     bool test_bigblock_arq_unit_cli = false; // --test-bigblock-arq-unit: P2 big-block ARQ-granularization regression.
     bool test_chase_slot_inject_cli = false; // --test-chase-slot-inject: CHASE I5 slot-identity bookkeeping + injection.
+    bool test_chase_invalidate_cli  = false; // --test-chase-invalidate: CHASE I6 invalidation completeness.
                                         // 3 cases (clean K=8 / one-bad-cw / lost-EOB). MUST FAIL before P2 wiring (the
                                         // bigblock_block_to_arq stub returns BIGBLOCK_ARQ_NOT_WIRED), PASS after.
                                         // One-shot at startup, then exit rc. See fact-documents/data-flow-bigblock-arq-unit.md §6.
@@ -1158,6 +1159,16 @@ int main(int argc, char *argv[])
             // native decode + the missing-set/batch gate drops an off-set recovery. FAIL-BEFORE
             // proof via env CHASE_NOSLOTGATE=1 (bypasses the gate → ARM B inverts → FAIL).
             test_chase_slot_inject_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-chase-invalidate") == 0)
+        {
+            // CHASE I6 invalidation completeness — one-shot at startup, then exit rc. Asserts
+            // each production invalidation source (clear_retx_queue / BREAK / crypto rollover /
+            // staleness age cap) voids the chase ring so a post-invalidation matching look does
+            // NOT combine. FAIL-BEFORE proof via env CHASE_NOINVAL=1.
+            test_chase_invalidate_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2371,6 +2382,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_chase_slot_inject();
             printf("[FLAG] Chase-slot-inject test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_chase_invalidate_cli) {
+            // CHASE I6 invalidation completeness regression (one-shot, exit rc).
+            printf("[FLAG] --test-chase-invalidate: invoking CHASE I6 invalidation-completeness "
+                   "regression (BREAK / recovery / SWITCH_ROLE / crypto rollover / staleness)\n");
+            fflush(stdout);
+            int rc = ARQ.test_chase_invalidate();
+            printf("[FLAG] Chase-invalidate test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

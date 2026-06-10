@@ -420,6 +420,37 @@ public:
 	// Reset/void the whole ring (used by I3 config-change, I6 BREAK/reset; here for
 	// the test to start from a known-empty state).
 	void     chase_buffer_void();
+	// ---- CHASE COMBINING — I6 invalidation completeness ----------------------
+	// Design §3.3 / §4 I6; audit §1.5 (invalidation producers), INV-CHASE-2, red-team F3
+	// (staleness window MUST be << 256 batch-times so a stale candidate cannot alias a
+	// live 8-bit batch_seq_id after the wrap). I3 already voids the ring on
+	// load_configuration(); I6 completes the invalidation surface:
+	//   - BREAK / recovery / gearshift-down / session-reset / SWITCH_ROLE: ARQ voids the
+	//     ring inside clear_retx_queue() (the chase buffer is the retx queue's twin —
+	//     audit §1.5.2) and reset_session_state(), which already call clear_retx_queue().
+	//   - crypto-batch rollover: ARQ voids the ring when the LIVE rx_batch_counter advances
+	//     (the dead crypto_batch_counter_rx is NOT used — red-team F2).
+	//   - STALENESS AGE CAP (F3): an entry older than CHASE_STALE_MAX_FRAMES capture-frames
+	//     is rejected at the gate (chase_combine_allowed) — far below 256 batch-times, so a
+	//     stale candidate cannot survive long enough to alias a wrapped live batch id.
+	// CHASE_STALE_MAX_FRAMES: the staleness window in CAPTURE-frames (failed-decode count).
+	// A SACK retx of a buffered look arrives within ~1 batch (≤ data_batch_size frames); 64 ≈
+	// a couple of batches of FAILs — comfortably above a retx round-trip yet ≪ 256 batch-times
+	// (256*25 = 6400 capture-frames). An entry whose (chase_frame_counter - age_frames) exceeds
+	// this is treated as stale and never summed.
+	static const uint64_t CHASE_STALE_MAX_FRAMES = 64;
+	// TEST-ONLY (I6 FAIL-BEFORE): when true, chase_combine_allowed SKIPS the staleness age cap
+	// so the test can show a too-old candidate WOULD combine without the F3 cap. Default false →
+	// production always enforces the cap. Set only by chase_invalidate_test.
+	bool     chase_stale_disable;
+	// chase_buffer_void_invalidation(): the wrapper the I6 PRODUCTION invalidation sites call
+	// (BREAK at arq_commander.cc:1524, clear_retx_queue, crypto rollover). It delegates to
+	// chase_buffer_void() — EXCEPT under the test-only env CHASE_NOINVAL=1, where it is a no-op
+	// (restoring the pre-I6 world where the ring is NOT voided on recovery), so the I6 test's
+	// FAIL-BEFORE arm shows a post-invalidation matching look WOULD still combine. The getenv
+	// is read inside this wrapper only (never on the ctor/test chase_buffer_void path), and is
+	// gated so production (CHASE unset → ring empty) is byte-identical.
+	void     chase_buffer_void_invalidation();
 	// I2 failing-first test: drive failing + successful receive_byte calls and assert
 	// (1) a FAILED non-all-zeros decode is captured (valid + tagged config + the stored
 	// vector is bit-identical to the deinterleaved_data fed to ldpc.decode);

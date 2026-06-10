@@ -1522,6 +1522,11 @@ void cl_arq_controller::process_messages_tx_data()
 			// config; the retx queue's contents (encrypted under the old config's
 			// crypto batch) are no longer meaningful after BREAK.
 			retransmit_count = 0;
+			// CHASE I6 BREAK invalidation (design §4 I6; audit §1.5.2): the chase LLR ring is
+			// the retx queue's twin — its buffered failed looks are over the OLD config / OLD
+			// crypto batch and are POISON if summed after BREAK restarts at a working config.
+			// Void beside the retx-queue clear. No-op when chase is unset (byte-identical).
+			if(telecom_system != NULL) telecom_system->chase_buffer_void_invalidation();
 			data_configuration = working_config;
 			negotiated_configuration = working_config;
 			emergency_previous_config = working_config;

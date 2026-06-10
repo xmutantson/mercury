@@ -836,6 +836,14 @@ void cl_arq_controller::clear_retx_queue()
 		fflush(stdout);
 	}
 	retransmit_count = 0;
+	// CHASE I6 invalidation (audit §1.5.2): the chase LLR ring is the retx queue's TWIN —
+	// its buffered failed looks are encrypted under the OLD epoch's crypto batch / OLD config
+	// and are POISON if summed after a recovery. Every recovery site routes through here
+	// (BREAK runaway, R029 recovery, watchdog, gearshift-down) and reset_session_state()
+	// (FORCED_ROLE_SWITCH / disconnect / SWITCH_ROLE) calls clear_retx_queue() at its tail, so
+	// voiding the ring HERE covers all of them in one place. Behavioral no-op when chase is
+	// unset (the ring is already empty / never written) — byte-identical production.
+	if(telecom_system != NULL) telecom_system->chase_buffer_void_invalidation();
 }
 
 // R030 (race audit 2026-06-06): resolve which messages_tx[] slot the post-TX
@@ -8590,6 +8598,14 @@ void cl_arq_controller::copy_data_to_buffer()
 					comp_data = decrypt_buf;
 					comp_len = plain_size;
 					rx_batch_counter++;
+					// CHASE I6 crypto-rollover invalidation (audit §1.5.4, red-team F2): the LIVE
+					// rx_batch_counter just advanced — a later frame is encrypted under a new nonce,
+					// so any buffered chase candidate from the OLD batch can never match a new-counter
+					// retx. The per-frame batch_seq_id gate already rejects a cross-batch combine, but
+					// void here too (belt-and-suspenders, the task's explicit crypto-rollover hook).
+					// No-op when chase is unset. Keyed on the LIVE counter, NOT the dead
+					// crypto_batch_counter_rx field.
+					if(telecom_system != NULL) telecom_system->chase_buffer_void_invalidation();
 					printf("[CRYPTO-RX] Decrypted: %d -> %d bytes OK\n",
 						assembled_size, plain_size);
 					fflush(stdout);

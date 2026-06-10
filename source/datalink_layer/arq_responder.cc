@@ -3511,6 +3511,126 @@ int cl_arq_controller::test_chase_slot_inject()
 }
 
 // ============================================================================
+// CHASE COMBINING — I6 invalidation completeness (synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-chase-invalidate
+//
+// Proves (design §4 I6; audit §1.5 invalidation producers, INV-CHASE-2; red-team F2/F3) that
+// every production invalidation source voids the chase ring so a post-invalidation matching
+// look does NOT combine against a stale (old-config / old-epoch) candidate.
+//
+// Sources covered:
+//   - clear_retx_queue() — the SHARED sink for BREAK runaway (arq_commander.cc:1524 also voids
+//     inline), R029 recovery, watchdog, gearshift-down, AND reset_session_state's tail
+//     (FORCED_ROLE_SWITCH / disconnect / SWITCH_ROLE). Voiding the ring there + at the BREAK
+//     site covers that whole recovery surface.
+//   - the crypto-rollover void wrapper (fired at the LIVE rx_batch_counter advance).
+//   - the staleness age cap (F3): a candidate older than CHASE_STALE_MAX_FRAMES capture-frames
+//     is denied at the gate (≪ 256 batch-times → cannot alias a wrapped live batch_seq_id).
+//
+// FAIL-BEFORE: env CHASE_NOINVAL=1 makes chase_buffer_void_invalidation() a no-op AND (via the
+// chase_stale_disable flag) bypasses the staleness cap, so the matching look WOULD still combine
+// — the assertions invert and the run reports FAIL, proving the I6 invalidations are
+// load-bearing.
+//
+// PASS: every source voids/denies. Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_chase_invalidate()
+{
+	bool noinval = false;
+	{ const char* e = std::getenv("CHASE_NOINVAL"); if(e && *e && atoi(e)) noinval = true; }
+
+	// Build a real cl_telecom_system so the ARQ recovery sinks (clear_retx_queue / the crypto
+	// void wrapper) can void its chase ring, and the gate can be exercised against a populated
+	// ring. Mirrors test_bigblock_arq_unit.cc:2124-2126.
+	cl_telecom_system* ts = new cl_telecom_system();
+	this->telecom_system = ts;
+	ts->chase_enabled = true;                 // ARM chase so the ring + gate are live
+	ts->chase_stale_disable = noinval;        // FAIL-BEFORE: bypass the staleness cap under CHASE_NOINVAL
+
+	const int LIVE_CONFIG = CONFIG_15;
+	const int LIVE_BATCH  = 7;                 // a live v2 batch id (>=0 required by the gate)
+	const int CAND_N      = 32;                // ldpc.N at the populated entry (any non-zero length)
+
+	// Helper: populate ONE valid chase ring entry tagged to (LIVE_CONFIG, batch-untagged) with a
+	// fresh capture age, and return its ring slot. Mirrors chase_capture_failed_llr's writes.
+	auto populate_one = [&]() -> int {
+		ts->chase_buffer_void();
+		int slot = ts->chase_buf_head;
+		cl_telecom_system::st_chase_candidate& e = ts->chase_llr_buffer[slot];
+		for(int i = 0; i < CAND_N; i++) e.llr[i] = 1.0f;   // arbitrary non-null vector
+		e.n = CAND_N;
+		e.config = LIVE_CONFIG;
+		e.batch_seq_guess = -1;                // identity wall — untagged (allowed vs a live batch)
+		e.slot_guess = -1;
+		e.age_frames = ts->chase_frame_counter;   // fresh: age delta 0
+		e.valid = true;
+		ts->chase_buf_head = (ts->chase_buf_head + 1) % cl_telecom_system::CHASE_DEPTH;
+		return slot;
+	};
+
+	bool pass = true;
+
+	// ---- ARM 1: clear_retx_queue() (BREAK / recovery / gearshift-down / SWITCH_ROLE sink) ----
+	{
+		int slot = populate_one();
+		bool allowed_before = ts->chase_combine_allowed(slot, LIVE_CONFIG, LIVE_BATCH);
+		clear_retx_queue();                    // the shared recovery sink → voids the ring (I6)
+		bool valid_after   = ts->chase_llr_buffer[slot].valid;
+		bool allowed_after = ts->chase_combine_allowed(slot, LIVE_CONFIG, LIVE_BATCH);
+		// Default: allowed_before=1, ring voided (valid_after=0), allowed_after=0 → PASS.
+		// CHASE_NOINVAL: clear_retx_queue's void is a no-op → valid_after=1, allowed_after=1 → FAIL.
+		bool arm = allowed_before && !valid_after && !allowed_after;
+		printf("[TEST-CHASE-INVAL] ARM_1 clear_retx_queue: allowed_before=%d voided=%d "
+			"allowed_after=%d => %s\n", (int)allowed_before, (int)!valid_after,
+			(int)allowed_after, arm ? "PASS" : "FAIL");
+		fflush(stdout);
+		if(!arm) pass = false;
+	}
+
+	// ---- ARM 2: crypto rollover (the void wrapper fired at the LIVE rx_batch_counter advance) ----
+	{
+		int slot = populate_one();
+		bool allowed_before = ts->chase_combine_allowed(slot, LIVE_CONFIG, LIVE_BATCH);
+		ts->chase_buffer_void_invalidation();  // the exact hook the rx_batch_counter++ site calls
+		bool valid_after   = ts->chase_llr_buffer[slot].valid;
+		bool allowed_after = ts->chase_combine_allowed(slot, LIVE_CONFIG, LIVE_BATCH);
+		bool arm = allowed_before && !valid_after && !allowed_after;
+		printf("[TEST-CHASE-INVAL] ARM_2 crypto-rollover void: allowed_before=%d voided=%d "
+			"allowed_after=%d => %s\n", (int)allowed_before, (int)!valid_after,
+			(int)allowed_after, arm ? "PASS" : "FAIL");
+		fflush(stdout);
+		if(!arm) pass = false;
+	}
+
+	// ---- ARM 3: staleness age cap (F3, ≪ 256 batch-times) ----
+	{
+		int slot = populate_one();
+		// FRESH (age delta 0): allowed within the window.
+		bool allowed_fresh = ts->chase_combine_allowed(slot, LIVE_CONFIG, LIVE_BATCH);
+		// Age the capture clock PAST the window without re-capturing (advance chase_frame_counter).
+		ts->chase_frame_counter += (cl_telecom_system::CHASE_STALE_MAX_FRAMES + 5);
+		bool allowed_stale = ts->chase_combine_allowed(slot, LIVE_CONFIG, LIVE_BATCH);
+		// Default: fresh allowed (1), stale denied (0) → PASS.
+		// CHASE_NOINVAL (chase_stale_disable=true): the cap is bypassed → stale still allowed (1) → FAIL.
+		bool arm = allowed_fresh && !allowed_stale;
+		printf("[TEST-CHASE-INVAL] ARM_3 staleness cap (window=%llu): allowed_fresh=%d "
+			"stale_denied=%d => %s\n",
+			(unsigned long long)cl_telecom_system::CHASE_STALE_MAX_FRAMES,
+			(int)allowed_fresh, (int)!allowed_stale, arm ? "PASS" : "FAIL");
+		fflush(stdout);
+		if(!arm) pass = false;
+	}
+
+	this->telecom_system = NULL;               // detach before freeing (the controller borrowed it)
+	delete ts;
+
+	printf("[TEST-CHASE-INVAL] %s (noinval=%d)\n", pass ? "ALL PASS" : "FAIL", (int)noinval);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
 // R039 — OFDM SACK_RSP out-of-window reject (in-process synthetic-fire, test-only)
 // ============================================================================
 //

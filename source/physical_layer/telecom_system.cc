@@ -98,6 +98,7 @@ cl_telecom_system::cl_telecom_system()
 	chase_test_wrong_llr = nullptr;       // TEST-ONLY F1 producer; default OFF
 	chase_cand_n = 0;                     // I5: empty missing-slot candidate set
 	for(int i = 0; i < CHASE_CAND_MAX; i++) chase_cand_slots[i] = -1;
+	chase_stale_disable = false;          // I6 TEST-ONLY FAIL-BEFORE; default enforces the cap
 	chase_buffer_void();
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
@@ -926,6 +927,18 @@ void cl_telecom_system::chase_buffer_void()
 	chase_buf_head = 0;
 }
 
+// chase_buffer_void_invalidation (I6): the wrapper the PRODUCTION recovery/crypto sites call.
+// Delegates to chase_buffer_void() — EXCEPT under the test-only env CHASE_NOINVAL=1, where it
+// is a no-op so the I6 test's FAIL-BEFORE arm can show that WITHOUT the void a post-recovery
+// matching look would still combine against the stale (old-config/old-epoch) ring. The getenv
+// is read here ONLY (never on the ctor/test path), and production (CHASE unset → empty ring) is
+// byte-identical regardless.
+void cl_telecom_system::chase_buffer_void_invalidation()
+{
+	{ const char* e = std::getenv("CHASE_NOINVAL"); if(e && *e && atoi(e)) return; }  // FAIL-BEFORE
+	chase_buffer_void();
+}
+
 // chase_capture_failed_llr: snapshot a FAILED codeword's LLR vector into the LRU
 // ring, tagged with the active config (batch_seq/slot left -1 — the identity wall;
 // set later by the I3+ consumer once a sibling frame in the batch decodes). No-op
@@ -997,6 +1010,14 @@ bool cl_telecom_system::chase_combine_allowed(int buf_slot, int live_config,
 	if(!e.valid) return false;                       // empty / voided
 	if(e.config != live_config) return false;        // DIFFERENT code — POISON, reject
 	if(live_batch_seq_id < 0) return false;          // v1 / unknown — chase is v2-only (F2)
+	// I6 staleness age cap (red-team F3): an entry older than the staleness window (in
+	// capture-frames) is rejected so a stale candidate cannot survive long enough to alias
+	// a wrapped live 8-bit batch_seq_id. chase_frame_counter is the capture clock (advanced
+	// per capture); age_frames is the entry's capture index. Both monotone, no wrap concern
+	// at uint64. chase_stale_disable is the TEST-ONLY FAIL-BEFORE bypass (default false).
+	if(!chase_stale_disable
+	   && chase_frame_counter > e.age_frames
+	   && (chase_frame_counter - e.age_frames) > CHASE_STALE_MAX_FRAMES) return false;
 	if(e.batch_seq_guess >= 0 && e.batch_seq_guess != live_batch_seq_id)
 		return false;                                // tagged to a DIFFERENT batch — reject
 	return true;

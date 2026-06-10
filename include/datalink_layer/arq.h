@@ -1506,6 +1506,22 @@ public:
   // frame WOULD be injected. CLI: --test-chase-slot-inject. Returns 0=PASS, 1=FAIL.
   int test_chase_slot_inject();
 
+  // test_chase_invalidate(): I6 invalidation-completeness test (design §4 I6; audit §1.5,
+  // INV-CHASE-2, red-team F2/F3). Constructs a cl_telecom_system, populates the chase ring with
+  // a VALID candidate, then drives EACH production invalidation source and asserts the ring is
+  // voided AND a post-invalidation matching look does NOT combine (the gate denies):
+  //   - clear_retx_queue() — the shared sink for BREAK runaway / R029 recovery / watchdog /
+  //     gearshift-down AND reset_session_state's tail (FORCED_ROLE_SWITCH / disconnect /
+  //     SWITCH_ROLE), so it covers that whole surface in one assertion.
+  //   - the crypto-rollover void wrapper (the hook fired at the LIVE rx_batch_counter advance).
+  //   - the staleness age cap (F3): a candidate older than CHASE_STALE_MAX_FRAMES capture-frames
+  //     is denied; a fresh one within the window is allowed.
+  // FAIL-BEFORE: env CHASE_NOINVAL=1 makes chase_buffer_void_invalidation a no-op (the recovery
+  // voids don't fire → the matching look WOULD still combine), and chase_stale_disable bypasses
+  // the staleness cap — both invert the assertions so the run reports FAIL, proving the I6
+  // invalidations are load-bearing. CLI: --test-chase-invalidate. Returns 0=PASS, 1=FAIL.
+  int test_chase_invalidate();
+
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
   //
