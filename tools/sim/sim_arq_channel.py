@@ -328,6 +328,22 @@ def main():
                     help="conservative-PDES lockstep window (chunks) passed to the "
                          "relay. K=1 = strict lockstep (default); relax to 4/8 if "
                          "the strict window starves CONNECT/delivery.")
+    # ---- FIX9 inter-peer drift / PTT turnaround repro (OPT-IN, passthrough) ---
+    # DEFAULT 0 (off) -> byte-identical deterministic A/B. On -> the relay re-times
+    # the forwarded per-direction stream by the given ppm sample-clock skew (and
+    # injects PTT keying latency at TX onsets), reproducing the HW CFG16
+    # half-duplex turnaround de-alignment the conservative-PDES barrier masks
+    # (FIX9_ROOTCAUSE.md). The HW bench measured ~-670 ppm relative skew.
+    ap.add_argument("--drift-ppm-a2b", type=float, default=0.0,
+                    help="relay --drift-ppm-a2b passthrough (sample-clock skew, "
+                         "ppm, on A->B). DEFAULT 0 (off). FIX9 repro: -670.")
+    ap.add_argument("--drift-ppm-b2a", type=float, default=0.0,
+                    help="relay --drift-ppm-b2a passthrough (B->A). DEFAULT 0.")
+    ap.add_argument("--ptt-latency-ms", type=float, default=0.0,
+                    help="relay --ptt-latency-ms passthrough (TX-onset keying "
+                         "latency, ms, per direction). DEFAULT 0 (off).")
+    ap.add_argument("--ptt-latency-jitter-ms", type=float, default=0.0,
+                    help="relay --ptt-latency-jitter-ms passthrough. DEFAULT 0.")
     ap.add_argument("--wire-stamp", type=int, default=0, choices=(0, 1),
                     help="relay --wire-stamp passthrough. DEFAULT 0 (bare 8192, "
                          "compatible with every shipped -x sim mercury). Set 1 "
@@ -362,7 +378,9 @@ def main():
           f"phase_noise={args.phase_noise_deg}deg loss={args.loss} "
           f"burst={args.burst} dwell={args.secs}s "
           f"start={cfg_name(args.start_cfg)} compress={args.compress} "
-          f"barrier_k={args.barrier_k}")
+          f"barrier_k={args.barrier_k} "
+          f"drift_ppm(a2b={args.drift_ppm_a2b},b2a={args.drift_ppm_b2a}) "
+          f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms})")
     print(f"payload={args.payload} ({len(payload)} bytes, md5={payload_md5})\n")
 
     os.system("taskkill /F /IM mercury.exe >nul 2>&1")
@@ -400,6 +418,10 @@ def main():
                      "--phase-noise-deg", str(args.phase_noise_deg),
                      "--barrier-k", str(args.barrier_k),
                      "--wire-stamp", str(args.wire_stamp),
+                     "--drift-ppm-a2b", str(args.drift_ppm_a2b),
+                     "--drift-ppm-b2a", str(args.drift_ppm_b2a),
+                     "--ptt-latency-ms", str(args.ptt_latency_ms),
+                     "--ptt-latency-jitter-ms", str(args.ptt_latency_jitter_ms),
                      "--log", relay_log]
         if args.cell:
             relay_cmd += ["--cell", args.cell]
@@ -556,6 +578,10 @@ def main():
                 "cfo_hz": args.cfo_hz, "phase_noise_deg": args.phase_noise_deg,
                 "loss": args.loss, "burst": args.burst,
                 "secs": args.secs, "start_cfg": args.start_cfg,
+                "drift_ppm_a2b": args.drift_ppm_a2b,
+                "drift_ppm_b2a": args.drift_ppm_b2a,
+                "ptt_latency_ms": args.ptt_latency_ms,
+                "ptt_latency_jitter_ms": args.ptt_latency_jitter_ms,
                 "connected": st.connected,
                 "switch_seq": names,
                 "peak_config": cfg_name(peak) if peak is not None else None,

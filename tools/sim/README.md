@@ -47,6 +47,48 @@ from a tree containing GUARD 1 and point `--bin` at the result.
   lacks the chase-combine feature; non-zero once feat/chase-combine ships its
   `[CHASE]` print).
 
+## Inter-peer sample-clock drift + PTT turnaround model (FIX9, OPT-IN)
+
+The conservative-PDES barrier bounds the a2b/b2a virtual-clock split to
+`K*1024` samples *by design*, so the default sim is a single-clock, barrier-
+locked channel. That **structurally masks** the HW CFG16 climb-collapse, whose
+root cause (`bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md`) is the two RPis'
+**independent soundcard sample-clock drift** (`[CLK-TX] -670.7 ppm`,
+`[CLK-RX] -193.0 ppm`) de-aligning the half-duplex turnaround over the longest
+(25-frame CONFIG_16) batches until the CMD's reverse MFSK-ACK/SACK correlator
+sees silence and BREAKs. These OPT-IN flags add that physical skew back so the
+FIX9 D2/D3 turnaround fixes have a failing-first off-bench vehicle.
+
+| flag | default | effect |
+|------|---------|--------|
+| `--drift-ppm-a2b N` | `0` (off) | re-time the A→B forwarded stream by a sample-clock skew of `N` ppm (`rate_out/rate_in = 1+N/1e6`). Applied AFTER the calibrated channel (noise/taps unchanged). FIX9 repro: `-670`. |
+| `--drift-ppm-b2a N` | `0` (off) | same on B→A, set independently (the two soundcards drift independently). |
+| `--ptt-latency-ms M` | `0` (off) | inject `M` ms of channel-noise silence at each TX onset (silent→signal edge) per direction — the radio PTT/AGC/capture-flush keying delay the sim idealizes to zero. |
+| `--ptt-latency-jitter-ms J` | `0` | ± uniform per-onset jitter on the PTT latency (seeded). Requires `--ptt-latency-ms>0`. |
+
+**Default OFF == byte-identical** to the pre-change (monitor) relay: `ppm==0`
+is a strict identity pass-through (no float reconstruction, no state) and
+`latency==0` injects nothing. Validated by
+`tools/sim/test_sim_relay_drift.py` (model contracts) and the forwarded-wire
+md5 A/B in `bigblock_p3_hw/_fix9/driftsim/byte_identity_check.py` (the PDES
+determinism contract). Drift CANNOT be combined with `--idle-bigstep>1`
+(coalescing silence breaks the continuous resample stream + onset detection);
+the relay errors out on that combination.
+
+> The drift is injected on the FORWARDED audio only — `ch.process()` (Watterson
+> + AWGN + CFO) runs per inbound chunk exactly as before, so the noise PSD /
+> fade realization / SNR3k calibration are untouched. The resampler re-times the
+> already-impaired stream, which (under the modem's local-ADD sim clock,
+> `audioio.c rx_transfer`) skews the receiving peer's virtual clock against the
+> transmitting peer's batch boundaries — the HW de-alignment mechanism.
+
+Repro recipe (highest-config cell + measured HW skew):
+```
+python tools/sim/sim_arq_channel.py --snr 35 --profile wgn --phase-noise-deg 0 \
+    --start-cfg 0 --secs 180 --drift-ppm-a2b -670 --drift-ppm-b2a -193 \
+    --json /tmp/fix9_repro.json
+```
+
 ## Channel calibration (do NOT re-derive without re-validating)
 
 * AWGN matches the BER harness (`telecom_system.cc` f_nyquist / `awgn.cc`); the
