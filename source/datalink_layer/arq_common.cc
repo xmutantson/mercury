@@ -545,6 +545,11 @@ cl_arq_controller::cl_arq_controller()
 	// [RSP-V2-DROP] events for test assertions.
 	rsp_current_expected_batch_seq_id=-1;
 	rsp_prev_batch_seq_id=-1;
+	// FIX-8 (data-integrity): reset-surviving delivery high-water mark. Init -1
+	// here (ctor) and at reset_session_state() ONLY — it must SURVIVE the BREAK
+	// reset + FULL load_configuration so the post-reset adopt gate can detect a
+	// dropped-batch hole. See bigblock_p3_hw/_fix8/FIX8_DESIGN.md §4.2-§4.3.
+	rsp_last_delivered_batch_seq_id=-1;
 	rsp_v2_drop_count=0;
 	test_rsp_bsi_corrupt_at=0;
 	test_rsp_bsi_v2_frame_counter=0;
@@ -3918,6 +3923,14 @@ void cl_arq_controller::reset_session_state()
 	axis3_recent_sack_ok_pos       = 0;
 	axis3_batches_since_off        = 0;
 
+	// FIX-8 (data-integrity): a true session boundary (CONNECT / disconnect /
+	// role-switch — R4/R029) starts a fresh transfer, so the delivery high-water
+	// mark must be cleared. This is the ONLY production clear besides the ctor;
+	// it is deliberately NOT cleared on the BREAK reset (arq_responder.cc:474)
+	// nor the FULL load_configuration, so it SURVIVES the mid-transfer reset that
+	// produces the dropped-batch gap. See bigblock_p3_hw/_fix8/FIX8_DESIGN.md §4.2.
+	rsp_last_delivered_batch_seq_id = -1;
+
 	// R029: a session reset (FORCED_ROLE_SWITCH, disconnect, role-switch) abandons
 	// the entire in-flight TX state. The retransmit queue's frames belong to the
 	// dead session's crypto epoch + bsi window — discard them so they cannot be
@@ -6265,6 +6278,32 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 		rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
 		xferred, rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
 	fflush(stdout);
+}
+
+// FIX-8 (data-integrity): advance the reset-surviving delivery high-water mark
+// to `bsi`, MONOTONIC-with-wrap. Called at the two real delivery commits only.
+//
+// The 8-bit batch_seq_id wraps mod-256, so "forward" is the shorter direction:
+// the forward distance from the current mark `m` to `bsi` is ((bsi - m) & 0xFF),
+// which is in [1,128] for a genuine forward step and in [129,255] for a backward
+// step (a late older prev). We advance ONLY on a forward step (or first-set from
+// -1), so a recovered out-of-order PREV batch delivered after a newer CURRENT
+// already advanced the mark can never regress it (audit R1). A re-delivery of the
+// SAME bsi (distance 0) is a no-op (idempotent). Pure arithmetic; the call sites
+// own the sack_v2_enabled gate.
+void cl_arq_controller::advance_last_delivered(int bsi)
+{
+	int b = bsi & 0xFF;
+	if(rsp_last_delivered_batch_seq_id < 0)
+	{
+		rsp_last_delivered_batch_seq_id = b;
+		return;
+	}
+	int fwd = (b - (rsp_last_delivered_batch_seq_id & 0xFF)) & 0xFF;
+	// fwd in [1,128] = forward step → advance. fwd==0 (same) or [129,255]
+	// (backward / late older prev) → leave the mark where it is.
+	if(fwd >= 1 && fwd <= 128)
+		rsp_last_delivered_batch_seq_id = b;
 }
 
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,

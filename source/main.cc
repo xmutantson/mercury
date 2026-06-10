@@ -507,6 +507,11 @@ int main(int argc, char *argv[])
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
                                         // must NOT drop popped bytes when the non-blocking app socket back-pressures.
                                         // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
+    bool test_gap_abort_cli = false;    // --test-gap-abort: FIX-8 — silent lost-batch GAP on post-reset re-adopt.
+                                        // Reproduces bench-4 (deliver 0-4, BREAK reset with 5-7 undelivered, present 8):
+                                        // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
+                                        // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
+                                        // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
@@ -1127,6 +1132,16 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // source/datalink_layer/test_rx_drain.cc + fix6/STALL_ROOTCAUSE.md.
             test_rx_drain_backpressure_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-abort") == 0)
+        {
+            // FIX-8 — silent lost-batch GAP on post-reset re-adopt regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
+            // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
+            test_gap_abort_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2431,6 +2446,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_rx_drain_backpressure();
             printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_gap_abort_cli) {
+            // FIX-8 — silent lost-batch GAP on post-reset re-adopt (one-shot, exit rc).
+            printf("[FLAG] --test-gap-abort: invoking FIX-8 post-reset re-adopt "
+                   "gap-abort regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_gap_abort_on_readopt();
+            printf("[FLAG] Gap-abort test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
