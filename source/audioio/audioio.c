@@ -76,6 +76,27 @@ extern _Atomic bool shutdown_;
 #endif
 extern int radio_type;
 
+// GUARD 1 (paired with sim_arq_channel.py require_guard_binary / GUARD 2).
+//
+// Under -x sim the device threads (radio_capture_thread/radio_playback_thread)
+// are NEVER created — audioio_init_internal short-circuits to the bridge threads
+// and returns (see the AUDIO_SUBSYSTEM_SIM branch). But a STALE or wrong build
+// that predates the SIM backend would fall through to the real device and LEAK
+// MODEM TONES out of the user's physical speakers (this happened twice; see the
+// harness GUARD-2 comment). To make the leak structurally detectable AND
+// impossible:
+//   (a) the string SIM_AUDIO_GUARD_MARKER is compiled into every guard-protected
+//       binary, so the harness can grep the binary and refuse to launch one that
+//       lacks it (GUARD 2, tools/sim/sim_arq_channel.py), and
+//   (b) g_sim_audio_guard_active is latched true when -x sim is selected; the two
+//       device-open threads abort-before-render if they are ever entered while it
+//       is set (belt-and-suspenders if any future refactor wires a device thread
+//       under sim).
+// Declared here (before the device threads that reference it) and kept in lockstep
+// with SIM_AUDIO_GUARD_MARKER in tools/sim/sim_arq_channel.py.
+static const char SIM_AUDIO_GUARD_MARKER[] = "[SIM-AUDIO-GUARD]";
+static volatile int g_sim_audio_guard_active = 0;
+
 // Audio channel configuration (set from main.cc / GUI settings)
 // 0=LEFT, 1=RIGHT, 2=STEREO (L+R)
 int configured_input_channel = 0;   // Default: LEFT (matches pre-GUI CLI default)
@@ -525,6 +546,14 @@ int validate_audio_config(const char *capture_dev, const char *playback_dev, int
 
 void *radio_playback_thread(void *device_ptr)
 {
+    // GUARD 1: never open a real playback device while -x sim is active.
+    if (g_sim_audio_guard_active) {
+        fprintf(stderr, "FATAL %s: radio_playback_thread entered under -x sim; "
+                "aborting before touching a real audio device.\n",
+                SIM_AUDIO_GUARD_MARKER);
+        fflush(stderr);
+        abort();
+    }
     ffaudio_interface *audio;
 	int device_is_mono = 0;  // Will be set after device opens
 	int out_ch_idx = 0;
@@ -915,6 +944,14 @@ cleanup_play:
 
 void *radio_capture_thread(void *device_ptr)
 {
+    // GUARD 1: never open a real capture device while -x sim is active.
+    if (g_sim_audio_guard_active) {
+        fprintf(stderr, "FATAL %s: radio_capture_thread entered under -x sim; "
+                "aborting before touching a real audio device.\n",
+                SIM_AUDIO_GUARD_MARKER);
+        fflush(stderr);
+        abort();
+    }
     ffaudio_interface *audio;
 	int device_is_mono = 0;  // Will be set after device opens
 	int in_ch_idx = 0;
@@ -1484,7 +1521,7 @@ void list_soundcards(int audio_system)
 // SIM channel backend (-x sim): device-free software channel.
 //
 // Replaces radio_capture_thread + radio_playback_thread with two socket
-// bridges to an external channel relay (tools/sim_channel_relay.py):
+// bridges to an external channel relay (tools/sim/sim_channel_relay.py):
 //   * sim_tx_bridge_thread:  playback_buffer (this peer's TX passband) ->
 //                            TCP send to relay.
 //   * sim_rx_bridge_thread:  TCP recv from relay -> capture_buffer (this
@@ -1515,6 +1552,9 @@ typedef int sim_sock_t;
 
 static sim_sock_t sim_sock = SIM_BAD_SOCK;   // shared by both bridge threads
 static int sim_connected = 0;
+
+// GUARD 1 marker + g_sim_audio_guard_active are declared at file scope near the
+// top of this TU (before the device threads that reference them).
 
 // SIM transport chunk: number of double samples per relay packet. 1024 doubles
 // = ~21 ms at 48 kHz, small enough that channel impairment granularity matches
@@ -1747,7 +1787,12 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
         // Device-free software channel: TX/RX bridge threads instead of
         // WASAPI/ALSA device threads. radio_capture / radio_playback handles
         // are reused to carry the bridge threads so audioio_deinit joins them.
-        printf("[SIM] software channel backend active (no audio device)\n");
+        // GUARD 1: latch the guard flag and print the compiled-in marker so the
+        // device threads abort-before-render if ever entered, and the harness's
+        // GUARD 2 can confirm this binary is sim-safe by grepping the marker.
+        g_sim_audio_guard_active = 1;
+        printf("[SIM] software channel backend active (no audio device) %s\n",
+               SIM_AUDIO_GUARD_MARKER);
         fflush(stdout);
         pthread_create(radio_playback, NULL, sim_tx_bridge_thread, NULL);
         pthread_create(radio_capture,  NULL, sim_rx_bridge_thread, NULL);

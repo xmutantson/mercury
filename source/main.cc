@@ -773,7 +773,7 @@ int main(int argc, char *argv[])
         printf("  -i [device]       Audio capture device (e.g. \"plughw:0,0\" or device name from -z)\n");
         printf("  -o [device]       Audio playback device\n");
         printf("  -x [api]          Sound system: alsa, pulse, dsound, wasapi, sim (default: alsa/wasapi)\n");
-        printf("                    sim = device-free software channel (ARQ loopback via tools/sim_channel_relay.py)\n");
+        printf("                    sim = device-free software channel (ARQ loopback via tools/sim/sim_channel_relay.py)\n");
         printf("  -A [channel]      Audio channel index override (enables multichannel mode)\n");
         printf("  --rx-channel [0|1|2]  RX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 0)\n");
         printf("  --tx-channel [0|1|2]  TX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 2)\n");
