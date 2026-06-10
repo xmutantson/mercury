@@ -298,6 +298,185 @@ class DopplerTap:
 
 
 # ---------------------------------------------------------------------------
+# Inter-peer sample-clock drift model (OPT-IN, DEFAULT OFF).
+# ---------------------------------------------------------------------------
+# WHY this exists (FIX9_ROOTCAUSE.md, bench-5): the two RPis' soundcards run at
+# INDEPENDENT sample rates. The HW logs measured [CLK-TX] drift=-670.7 ppm and
+# [CLK-RX] drift=-193.0 ppm — hundreds of ppm of RELATIVE skew. Over an 8.5 s
+# 25-frame CONFIG_16 OFDM batch that is ~5.7 ms (~274 samples) of timing slip per
+# batch, ACCUMULATING across the retransmit loop until the half-duplex frame
+# boundaries de-align past the receiver's search window — the CMD's MFSK ACK-SACK
+# correlator then sees pure silence (peak_metric=0.0), times out, and BREAKs at
+# CFG16 (the climb-collapse). The committed relay's conservative-PDES BARRIER
+# (counters[key] split <= K chunks) bounds the a2b/b2a virtual-clock split to
+# K*1024 samples BY DESIGN, so it STRUCTURALLY MASKS this drift (FIX9 §3): the
+# default sim is a single-clock, barrier-locked channel and the over-climb
+# regime it reproduces never carries the physical sample-rate skew that breaks
+# the turnaround on HW. This model adds that skew back, OPT-IN, so the FIX9
+# D2/D3 turnaround fixes have a failing-first off-bench vehicle.
+#
+# CONTRACT (default OFF == byte-identical, the PDES determinism A/B baseline):
+#   * ppm == 0.0  -> the resampler is a strict pass-through: input chunk in,
+#     SAME chunk out, no float reconstruction, no state. A seeded WGN cell is
+#     bit-for-bit identical with the model present-but-off (validated:
+#     tools/sim/test_sim_relay_drift.py [1], and a full 2-process cell md5).
+#   * The drift is applied AFTER ch.process() (the calibrated Watterson+AWGN+CFO
+#     channel math): the noise/tap RNG advances per INBOUND chunk exactly as
+#     before — drift only RE-TIMES the already-channel-impaired forwarded audio.
+#     So the noise PSD / fade realization / SNR calibration are untouched; only
+#     the sample-grid the receiving peer's clock tracks is skewed.
+#
+# MODEL: a continuous per-direction fractional resampler. ppm defines the
+# forwarded-stream rate change rate_out/rate_in = (1 + ppm/1e6). It consumes the
+# per-direction stream of 1024-sample channel-output blocks and re-emits it as a
+# drifted stream STILL chunked into exactly-1024-sample wire chunks (the modem
+# reads bare SIM_CHUNK_SAMPLES doubles; chunk SIZE must never change). Because in
+# and out rates differ, one input block does NOT map to one output block: a
+# positive ppm (faster sink clock) occasionally yields an EXTRA output chunk; a
+# negative ppm occasionally HOLDS one back (buffered). That extra/held chunk is
+# precisely the sample the physical clock skew adds/drops, and — because each
+# forwarded chunk advances the receiving peer's local-ADD virtual clock by 1024
+# samples (audioio.c rx_transfer -> sim_clock_add_samples) — it de-aligns that
+# peer's clock against the transmitting peer's batch boundaries, exactly the HW
+# mechanism. Linear interpolation between input samples (one-tap history carried
+# across chunks for continuity); cheap and sufficient at ppm scale (the band is
+# heavily oversampled — OFDM occupies <2.4 kHz of the 24 kHz Nyquist).
+class DriftResampler:
+    """Per-direction fractional resampler modelling sample-clock skew.
+
+    ppm == 0 -> strict identity pass-through (byte-identical, no float work).
+    ppm != 0 -> resample the forwarded stream by (1 + ppm/1e6), emitting only
+    whole 1024-sample wire chunks and carrying the fractional read phase + the
+    one-sample interpolation history across chunks (continuous, no per-chunk
+    edge transient)."""
+
+    def __init__(self, ppm):
+        self.ppm = float(ppm)
+        self.enabled = (self.ppm != 0.0)
+        # ratio = input samples consumed per output sample produced.
+        # rate_out/rate_in = 1 + ppm/1e6  =>  in/out step = 1/(1+ppm/1e6).
+        self.step = 1.0 / (1.0 + self.ppm / 1.0e6) if self.enabled else 1.0
+        self.read_pos = 0.0          # fractional read index into the input stream
+        self.consumed = 0            # whole input samples already discarded
+        self.buf = np.empty(0, dtype=np.float64)   # un-consumed input tail
+        self.last_sample = 0.0       # input sample just before self.buf[0]
+        self.out_carry = []          # produced output samples not yet a full chunk
+        self.in_total = 0            # diag: total input samples seen
+        self.out_total = 0           # diag: total output samples produced
+
+    def process(self, chunk):
+        """Feed one CHUNK_SAMPLES-length list/array of channel-output samples.
+        Returns a list of zero-or-more CHUNK_SAMPLES-length lists (whole wire
+        chunks) ready to forward. ppm==0 -> returns [chunk] unchanged."""
+        if not self.enabled:
+            return [list(chunk)]
+        x = np.asarray(chunk, dtype=np.float64)
+        self.in_total += x.size
+        # Append new input to the working buffer. Indexing convention: index -1
+        # is self.last_sample (the sample just before buf[0]); buf[i] is input
+        # sample (consumed + i). read_pos is an absolute fractional input index.
+        self.buf = np.concatenate((self.buf, x))
+        # Produce output samples while we have enough input to interpolate the
+        # next read position (need buf up to floor(read_pos)+1 relative to base).
+        base = self.consumed                     # absolute index of buf[0]
+        n_buf = self.buf.size
+        out = self.out_carry
+        # highest input index we can interpolate to = base + n_buf - 1
+        last_idx = base + n_buf - 1
+        rp = self.read_pos
+        while rp <= last_idx:
+            i0 = int(math.floor(rp))
+            frac = rp - i0
+            # sample at i0 and i0+1 (relative to base); i0 may be base-1 => use
+            # last_sample (history) for the left tap on the very first sample.
+            li = i0 - base
+            if li < 0:
+                s0 = self.last_sample
+            else:
+                s0 = self.buf[li]
+            ri = li + 1
+            if ri < n_buf:
+                s1 = self.buf[ri]
+            elif ri == n_buf:
+                # need the next input sample we don't have yet -> stop, wait.
+                break
+            else:
+                break
+            out.append((1.0 - frac) * s0 + frac * s1)
+            rp += self.step
+        self.read_pos = rp
+        # Discard fully-consumed input from the buffer (keep one sample of
+        # history before the current read position for the next left tap).
+        keep_from = int(math.floor(self.read_pos)) - base   # first idx still needed
+        drop = keep_from - 1                                 # keep one history sample
+        if drop > 0:
+            drop = min(drop, n_buf)
+            self.last_sample = self.buf[drop - 1]
+            self.buf = self.buf[drop:]
+            self.consumed += drop
+        # Emit whole 1024-sample chunks from the output carry.
+        chunks = []
+        while len(out) >= CHUNK_SAMPLES:
+            chunks.append(out[:CHUNK_SAMPLES])
+            del out[:CHUNK_SAMPLES]
+        self.out_carry = out
+        self.out_total += sum(len(c) for c in chunks)
+        return chunks
+
+
+# ---------------------------------------------------------------------------
+# PTT / half-duplex turnaround latency (OPT-IN, DEFAULT OFF).
+# ---------------------------------------------------------------------------
+# WHY (FIX9_ROOTCAUSE.md §2 Rank-1.3, §3 point 2): on real HW the half-duplex
+# turnaround carries a physical keying + AGC-settle + capture-flush latency at
+# every TX onset that the sim idealizes to zero (the SIM_INPROC/relay PTT spins
+# collapse to deterministic clock advances whose exit predicate always holds).
+# That zero-latency turnaround is half of why the sim can't reproduce the
+# CMD(2.6s)/RSP(12s) post-TX budget de-sync. This model re-injects it.
+#
+# CAN THE RELAY DETECT A DIRECTION SWITCH? YES. The reader already classifies
+# each INBOUND chunk as `silent` (raw pre-channel mean-square < SILENCE_EPS ==
+# the modem TX bridge's memset(0) idle fill) vs carrying signal. A TX ONSET on a
+# direction is the rising edge silent->signal: the peer just keyed up a real
+# burst (HAIL / OFDM batch / MFSK ACK). The relay keys PTT latency to THAT edge.
+#
+# MODEL: on a detected onset for a direction, DELAY the burst by inserting
+# ptt_latency_ms (+/- uniform jitter) worth of channel-noise SILENCE chunks
+# ahead of the first signal chunk, then forward the burst. The injected silence
+# is real channel output (noise floor continues), so the receiver simply sees
+# the burst ARRIVE LATER relative to its own post-TX search window — the keying
+# delay. Per-onset jitter (seeded) varies the turnaround like real keyer/AGC
+# variation. DEFAULT 0 ms == no insertion == byte-identical.
+class PttLatencyModel:
+    """Per-direction TX-onset keying-latency injector. latency_ms==0 -> inert."""
+
+    def __init__(self, latency_ms, jitter_ms, rng):
+        self.latency_ms = max(0.0, float(latency_ms))
+        self.jitter_ms = max(0.0, float(jitter_ms))
+        self.enabled = (self.latency_ms > 0.0)
+        self.rng = rng                  # Xoshiro (deterministic jitter)
+        self.prev_silent = True         # link starts idle (no burst in flight)
+        self.n_onsets = 0
+        self.n_delay_chunks = 0
+
+    def onset_delay_chunks(self, silent):
+        """Given THIS inbound chunk's silent flag, return how many channel-noise
+        silence chunks to inject BEFORE forwarding it (0 unless this is a rising
+        silent->signal edge and the model is enabled). Updates edge state."""
+        inject = 0
+        if self.enabled and self.prev_silent and (not silent):
+            self.n_onsets += 1
+            ms = self.latency_ms
+            if self.jitter_ms > 0.0:
+                # symmetric uniform jitter in [-jitter, +jitter], clamped >= 0
+                ms = max(0.0, ms + (2.0 * self.rng.uniform() - 1.0) * self.jitter_ms)
+            inject = int(round(ms * FS / 1000.0 / CHUNK_SAMPLES))
+            self.n_delay_chunks += inject
+        self.prev_silent = silent
+        return inject
+
+
+# ---------------------------------------------------------------------------
 # Per-direction channel.
 # ---------------------------------------------------------------------------
 class Channel:
@@ -518,6 +697,28 @@ def main():
     ap.add_argument("--fade-depth", type=float, default=0.0,
                     help="(DEPRECATED) old flat-fade depth; use --profile instead")
     ap.add_argument("--seed", type=int, default=1)
+    # ---- Inter-peer sample-clock drift + PTT turnaround model (OPT-IN) -------
+    # DEFAULT OFF (0). On == FIX9 mechanism repro (sample-rate skew that
+    # de-aligns the half-duplex CFG16 turnaround); see DriftResampler /
+    # PttLatencyModel above. Drift is applied AFTER the calibrated channel math
+    # (noise/taps stay calibrated); ppm 0 == strict byte-identical pass-through.
+    ap.add_argument("--drift-ppm-a2b", type=float, default=0.0,
+                    help="sample-clock drift (ppm) on the A->B forwarded stream. "
+                         "rate_out/rate_in = 1 + ppm/1e6. DEFAULT 0 (off, "
+                         "byte-identical). FIX9 HW measured ~-670 ppm relative "
+                         "skew that de-aligns the CFG16 half-duplex turnaround.")
+    ap.add_argument("--drift-ppm-b2a", type=float, default=0.0,
+                    help="sample-clock drift (ppm) on the B->A forwarded stream. "
+                         "DEFAULT 0 (off). Set independently from a2b (the two HW "
+                         "soundcards drift independently: CLK-TX -670, CLK-RX -193).")
+    ap.add_argument("--ptt-latency-ms", type=float, default=0.0,
+                    help="half-duplex keying latency injected at each TX onset "
+                         "(silent->signal edge) per direction, in ms. DEFAULT 0 "
+                         "(off, byte-identical). Models the radio PTT + AGC-settle "
+                         "+ capture-flush turnaround the sim idealizes to zero.")
+    ap.add_argument("--ptt-latency-jitter-ms", type=float, default=0.0,
+                    help="symmetric uniform jitter (ms) on --ptt-latency-ms per "
+                         "onset (seeded). DEFAULT 0. Requires --ptt-latency-ms>0.")
     ap.add_argument("--idle-bigstep", type=int, default=1,
                     help="Q3 FTRT speed-up (EXPERIMENTAL, default OFF=1): when BOTH "
                          "directions are inbound-silent (modem idle gaps), coalesce up "
@@ -547,6 +748,21 @@ def main():
     if args.barrier_k < 1:
         ap.error("--barrier-k must be >= 1")
 
+    drift_on = (args.drift_ppm_a2b != 0.0 or args.drift_ppm_b2a != 0.0)
+    ptt_on = (args.ptt_latency_ms > 0.0)
+    if (args.ptt_latency_jitter_ms > 0.0) and not ptt_on:
+        ap.error("--ptt-latency-jitter-ms requires --ptt-latency-ms > 0")
+    # The idle big-step COALESCES runs of silence (drops chunks) and is gated on
+    # split==0. That defeats BOTH the drift resampler (it needs the CONTINUOUS
+    # per-direction sample stream — dropped silence chunks would skip input) and
+    # the PTT onset-edge detector (a coalesced silence run hides the rising
+    # edge). They are conceptually incompatible; refuse the combination rather
+    # than silently produce a wrong model.
+    if (drift_on or ptt_on) and args.idle_bigstep > 1:
+        ap.error("--drift-ppm-* / --ptt-latency-ms cannot be combined with "
+                 "--idle-bigstep > 1 (coalescing drops/merges chunks and breaks "
+                 "the continuous drift stream + onset-edge detection)")
+
     if args.cell:
         args.snr = parse_cell(args.cell)
 
@@ -573,7 +789,13 @@ def main():
         f"phase_noise={args.phase_noise_deg}deg "
         f"burst={args.burst} loss={args.loss} seed={args.seed} "
         f"barrier_k={args.barrier_k} "
+        f"drift_ppm(a2b={args.drift_ppm_a2b},b2a={args.drift_ppm_b2a}) "
+        f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms}) "
         f"wire={'STAMPED(8200,needs feat/sim-clock modem)' if args.wire_stamp else 'BARE(8192,compatible)'}")
+    if drift_on or ptt_on:
+        log("NOTE: inter-peer drift/PTT model ENABLED — the conservative-PDES "
+            "barrier no longer makes this a byte-identical deterministic A/B; "
+            "this is the FIX9 turnaround-de-alignment repro vehicle.")
 
     # Accept exactly two peers (A and B).
     peers = {}
@@ -599,6 +821,17 @@ def main():
     # not sample-wise).
     ch_a2b = Channel(args, args.seed * 2654435761 & 0xFFFFFFFF)
     ch_b2a = Channel(args, args.seed * 40503 + 7 & 0xFFFFFFFF)
+
+    # Per-direction drift resampler + PTT-latency model (OPT-IN; identity/inert
+    # when the ppm / latency are 0 -> byte-identical default). Applied AFTER
+    # ch.process() in the reader. Independent seeds for the PTT jitter so the two
+    # directions' keyer jitter is uncorrelated (like two physical radios).
+    drift = {"a2b": DriftResampler(args.drift_ppm_a2b),
+             "b2a": DriftResampler(args.drift_ppm_b2a)}
+    ptt = {"a2b": PttLatencyModel(args.ptt_latency_ms, args.ptt_latency_jitter_ms,
+                                  Xoshiro(args.seed * 2246822519 & 0xFFFFFFFF)),
+           "b2a": PttLatencyModel(args.ptt_latency_ms, args.ptt_latency_jitter_ms,
+                                  Xoshiro(args.seed * 3266489917 & 0xFFFFFFFF))}
 
     stop = threading.Event()
     counters = {"a2b": 0, "b2a": 0}      # per-direction chunk counts
@@ -700,13 +933,37 @@ def main():
                 if v > SILENCE_EPS or v < -SILENCE_EPS:
                     silent = False
                     break
+            # --- PTT keying latency (OPT-IN): on a silent->signal onset, inject
+            # ptt_latency_ms of channel-noise SILENCE ahead of the burst so the
+            # far end sees it arrive late (the half-duplex turnaround the sim
+            # idealizes to zero). The injected silence is REAL channel output
+            # (ch.process on zeros -> the calibrated noise floor) and advances the
+            # channel RNG, so it is part of the per-direction stream the drift
+            # resampler re-times. DEFAULT off -> n_inject==0, no-op. ----------
+            n_inject = ptt[key].onset_delay_chunks(silent)
+            wire = []                    # ordered list of CHUNK_SAMPLES blocks
+            if n_inject > 0:
+                zeros = [0.0] * CHUNK_SAMPLES
+                for _ in range(n_inject):
+                    sil_out = ch.process(zeros)          # noise-floor chunk
+                    wire.extend(drift[key].process(sil_out))
             out = ch.process(samples)   # ALWAYS advance channel state (determinism)
-            while not stop.is_set():
-                try:
-                    inq[key].put((out, silent), timeout=0.2)
+            # --- inter-peer sample-clock drift (OPT-IN): re-time the forwarded
+            # stream. ppm==0 -> identity (returns [out], byte-identical). --------
+            wire.extend(drift[key].process(out))
+            # Enqueue every produced wire chunk in order (default off: exactly one
+            # == the un-drifted `out`, so the queue cadence is unchanged). The
+            # barrier/forwarder advances counters[key] by 1 per chunk regardless,
+            # so N drift/PTT chunks are simply N forwarded chunks.
+            for wc in wire:
+                while not stop.is_set():
+                    try:
+                        inq[key].put((wc, silent), timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+                if stop.is_set():
                     break
-                except queue.Full:
-                    continue
 
     CLOSED, FORWARDED, WOULDBLOCK = -1, 1, 0
     WIRE_STAMP = bool(args.wire_stamp)
@@ -728,11 +985,21 @@ def main():
             stop.set()
             return CLOSED
         if counters[key] % 500 == 0:
+            dr = drift[key]
+            pt = ptt[key]
+            drift_s = ""
+            if dr.enabled:
+                # forwarded/input sample ratio realised so far (sanity vs ppm).
+                ratio = (dr.out_total / dr.in_total) if dr.in_total else 0.0
+                drift_s = (f" drift_ppm={dr.ppm:+.1f} out/in={ratio:.6f} "
+                           f"(slip={dr.out_total - dr.in_total:+d}smp)")
+            if pt.enabled:
+                drift_s += f" ptt_onsets={pt.n_onsets} ptt_inj={pt.n_delay_chunks}ch"
             log(f"{key}: {counters[key]} chunks "
                 f"({counters[key]*CHUNK_SAMPLES/FS:.1f}s) "
                 f"vstamp={stamp} split={counters['a2b']-counters['b2a']:+d} "
                 f"P_sig={ch.p_sig:.5f} noise_std={ch.noise_std:.6f} "
-                f"txpeak={ch.peak_diag:.4f}")
+                f"txpeak={ch.peak_diag:.4f}{drift_s}")
         return FORWARDED
 
     def forward_one(key):
