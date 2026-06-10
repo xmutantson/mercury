@@ -3045,15 +3045,36 @@ public:
   // UNLIKE supershift_proven_ceiling (which finish_turbo_direction() resets to the probe
   // top at :4147), this field is NOT touched by the turbo state machine, so it SURVIVES the
   // BREAK->ROBUST_0 collapse + full turbo re-climb that is the limit cycle.
-  // Producers: ARM/extend at the FIX-4 demote (arq_commander.cc:~3672); DECREMENT per
-  // completed batch at the per-batch eval tail (the ceiling_success_count cadence);
+  // WALL-B FIX-9 D3 GENERALIZES the role: the cooldown now means "CFG16 not viable on THIS
+  // channel" from EITHER cause — the big-block carve being dead (FIX-4) OR the per-frame reverse-
+  // ACK being STARVED by clock-drift turnaround de-alignment (D3, FIX9_D3_DESIGN.md). Both arm
+  // sites mean the same thing to every consumer below.
+  // Producers: ARM/extend at the FIX-4 carve demote (arq_commander.cc:~3672) AND at the FIX-9 D3
+  // reverse-ACK-starvation demote (the per-frame sibling, same helper + prev-span discipline);
+  // DECREMENT per completed batch at the per-batch eval tail (the ceiling_success_count cadence);
   // CLEAR-on-success at the data-ACK reset (:3804) GATED on
   // current_configuration==CONFIG_16 && big-block framing live (INV-B3 — a per-frame CFG15
-  // data-ACK must NOT clear it); INIT 0 in ctor + reset_session_state (R3). Consumers:
+  // data-ACK must NOT clear it; under D3's per-frame regime NO carve ever lands so the hold
+  // survives the CFG15 window and expires by batch-count for an optimistic re-probe); INIT 0 in
+  // ctor + reset_session_state (R3). Consumers:
   // apply_bigblock_cooldown_cap() at the climb hooks (gearshift LADDER-UP/CEILING-RECOVERY,
   // turbo SNR-SUPERSHIFT, elevator_target_from_snr, finish_turbo_direction start_config).
   int bigblock_carve_cooldown_batches{0};  // >0 = CFG16 election suppressed this many more batches
   int bigblock_carve_cooldown_span{0};     // last window length, for AARF exponential growth
+  // WALL-B FIX-9 D3 (bigblock_p3_hw/_fix9/FIX9_D3_DESIGN.md §3): consecutive block-failures at
+  // CONFIG_16 whose reverse MFSK ACK+SACK correlator was PURE SILENT (ack_diag_peak_metric==0.0).
+  // This is the PER-FRAME reverse-ACK STARVATION discriminator: the inter-Pi clock drift de-aligns
+  // the half-duplex CFG16 turnaround so the reverse ACK lands outside the CMD's window (a ZERO, not
+  // a garbled match). CMD-ONLY (never on the wire). Producers: ++ at the block-failure path
+  // (arq_commander.cc ~3666) gated on current==CFG16 && ack_diag_peak_metric==0.0; RESET to 0 on
+  // ANY data-ACK (clean OR partial — a partial proves the reverse channel is not silent) and on any
+  // config != CFG16 and when D3 consumes the deadline; INIT 0 in ctor + both session resets (R3
+  // parity with bigblock_carve_cooldown_batches). Consumer: the D3 discriminator
+  // (cfg16_revack_starve_fallback_target) at the block-failure decision point. The demote it
+  // triggers REUSES the FIX-5 bigblock_carve_cooldown_* machinery to hold the climb at CFG15
+  // across cycles (the field's role generalizes from "carve-dead" to "CFG16-not-viable-on-this-
+  // channel"; both arm sites mean the same thing to every cooldown consumer). See FIX9_D3_AUDIT.md.
+  int cfg16_revack_starve_fails{0};
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)

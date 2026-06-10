@@ -3476,6 +3476,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			emergency_break_active = 1;
 			emergency_break_retries = 1;
 			emergency_nack_count = 0;
+			cfg16_revack_starve_fails = 0;  // WALL-B FIX-9 D3 (P4): demote off CFG16 -> streak fresh
 
 			// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
 			if(sack_v2_enabled)
@@ -3650,6 +3651,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// brings the gearshift_data_failed_pat path in line.
 				emergency_break_retries = 3;
 				emergency_nack_count = 0;
+				cfg16_revack_starve_fails = 0;  // WALL-B FIX-9 D3 (P4): demote off CFG16 -> streak fresh
 
 				// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
 				if(sack_v2_enabled)
@@ -3665,11 +3667,36 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// Count toward emergency BREAK. Batch halving doesn't bypass this.
 			emergency_nack_count++;
 
+			// WALL-B FIX-9 D3 (FIX9_D3_DESIGN.md §3, producer P2): count CONSECUTIVE block-failures
+			// AT CONFIG_16 where the reverse MFSK ACK+SACK correlator FAILED TO DECODE (we are in the
+			// data_ack_received==NO branch — the reverse ACK timed out). This is "reverse-ACK loss":
+			// on HW the correlator window goes pure-silent (peak_metric=0.0); in the drift-sim it
+			// degrades to a SUB-THRESHOLD partial (peak_matched 5/7, peak_metric~0.5) — BOTH mean the
+			// ACK did not decode (matched < ack_match_threshold). We do NOT gate on the residual
+			// metric magnitude (that was HW-incidental and never holds in the sim). The CFG16
+			// restriction (D3-1) + the OFDM-proven gate (D3-2, applied at the consumer below) are what
+			// keep this from being a generic ACK-timeout rebrand. On any non-CFG16 rung the streak
+			// resets so a later return to CFG16 starts fresh (P4); the deadline is consumed (reset to
+			// 0) in the D3 demote block below.
+			if(current_configuration == CONFIG_16)
+				cfg16_revack_starve_fails++;
+			else
+				cfg16_revack_starve_fails = 0;
+
 			// Batch halving disabled (batch size is fixed at negotiated value).
 			// Halving causes CMD/RSP batch size mismatch → ACK-GATE desync.
 			printf("[BREAK] Block failure #%d at config %d (threshold=%d, batch=%d)\n",
 				emergency_nack_count, current_configuration, emergency_nack_threshold, data_batch_size);
 			fflush(stdout);
+			if(cfg16_revack_starve_fails > 0)
+			{
+				printf("[CFG16-HOLD] FIX-9 D3: CFG16 reverse-ACK-loss streak %d/%d "
+					"(anchor=%d ofdm_proven=%d peak_metric=%.2f matched=%d/%d)\n",
+					cfg16_revack_starve_fails, CFG16_REVACK_STARVE_FAILS, last_data_viable_config,
+					is_ofdm_config(last_data_viable_config) ? 1 : 0, ack_diag_peak_metric,
+					ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold);
+				fflush(stdout);
+			}
 
 			// === WALL-B FIX-4 — CARVE-VIABILITY DEADLINE -> per-frame CFG15 fallback ===
 			// (WALLB_DIAGNOSIS.md §7 FIX-4, §1.1, §1.6.) On a CLEAN channel the link
@@ -3798,6 +3825,117 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				}
 			}
 
+			// === WALL-B FIX-9 D3 — CFG16 PER-FRAME REVERSE-ACK STARVATION -> per-frame CFG15 ===
+			// (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §1/§2 Rank-1, FIX9_D3_DESIGN.md, FIX9_D3_AUDIT.md.)
+			// The PER-FRAME (FRAMING-UNSET) sibling of FIX-4. On a CLEAN channel the link climbs to
+			// CONFIG_16 and SUSTAINS the 25-frame batch; inter-Pi sample-clock drift (-670 ppm,
+			// pg_wb_rsp_clean_A1.log:13365) de-aligns the half-duplex turnaround so the reverse MFSK
+			// ACK+SACK lands OUTSIDE the CMD's window -> the correlator goes PURE SILENT
+			// (peak_metric=0.0, pg_wb_cmd_clean_A1.log:9674) even though the FORWARD data was
+			// delivering (CLEAN/PARTIAL SACK bitmaps). 3 such block-failures BREAK off CFG16 -> the
+			// ROBUST cascade -> 0 bytes. PRE-EMPT it: when (D3-1) the failing rung is CFG16, (D3-2)
+			// the forward link was sustainably healthy there (last_data_viable_config==CFG16, raised
+			// ONLY after >=2 consecutive CLEAN CFG16 batches — the signal that separates this from a
+			// deep-SNR collapse where the anchor never reaches CFG16), (D3-3/4) the reverse ACK has
+			// been PURE SILENT for CFG16_REVACK_STARVE_FAILS consecutive block-failures, and (D3-5)
+			// we are on the per-frame path (NOT the FIX-4 big-block carve), demote DIRECTLY to the
+			// highest per-frame OFDM rung (config_ladder_down(CFG16)==CFG15, which has the turnaround
+			// margin CFG16 lacks) via the EXISTING decodable SET_CONFIG control exchange, and ARM the
+			// FIX-5 CFG16 cooldown so the climb is held at CFG15 across cycles (the SNR re-trigger
+			// must NOT immediately re-elect the starved rung). NOT a BREAK toward ROBUST. The deep-SNR
+			// escape for a genuinely-cratered channel is PRESERVED (D3-2 is false there). Mutually
+			// exclusive with FIX-4 (D3-5). Fires only when the BREAK would otherwise fire (same outer
+			// guards), so non-CFG16 / non-starved / framing-live operation is byte-identical.
+			{
+				bool d3_bigblock_live = (telecom_system != NULL
+					&& telecom_system->bigblock_framing_enabled
+					&& telecom_system->M != MOD_MFSK);
+				int d3_target = cfg16_revack_starve_fallback_target(
+					current_configuration,
+					/*ofdm_proven=*/is_ofdm_config(last_data_viable_config),
+					/*bigblock_rung_live=*/d3_bigblock_live,
+					cfg16_revack_starve_fails, CFG16_REVACK_STARVE_FAILS, robust_enabled);
+				if(d3_target >= 0
+				   && !config_is_at_bottom(current_configuration, robust_enabled)
+				   && !emergency_break_active
+				   && turboshift_phase == TURBO_DONE
+				   && gear_shift_on == YES)
+				{
+					printf("[CFG16-HOLD] FIX-9 D3 reverse-ACK STARVATION: %d consecutive CFG16 "
+						"reverse-ACK-loss block-failures (OFDM proven on this channel, anchor=%d) -> "
+						"demoting to config %d via SET_CONFIG (NOT the BREAK->ROBUST cascade); CFG15 "
+						"has the half-duplex turnaround margin CFG16 lacks under clock drift\n",
+						cfg16_revack_starve_fails, last_data_viable_config, d3_target);
+					fflush(stdout);
+
+					// Preserve all pending data for resend at the per-frame rung — the SAME FIFO
+					// push-back the gearshift BREAK paths + FIX-4 use, so no bytes are dropped.
+					if(compression_enabled)
+					{
+						restore_tx_from_compressed();
+					}
+					else
+					{
+						for(int i=0; i<nMessages; i++)
+						{
+							if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+								fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
+							messages_tx[i].status = FREE;
+						}
+						fifo_buffer_backup.flush();
+						clear_retx_queue();   // recovery re-queues plaintext; drop stale retx
+					}
+					block_under_tx = NO;
+
+					// Demote to the per-frame rung. Pin the proven ceiling (one-cycle) so the SNR
+					// re-trigger does not immediately re-elect the starved CFG16 rung, and ARM the
+					// FIX-5 cooldown (cross-cycle hold; survives finish_turbo_direction()'s
+					// supershift_proven_ceiling reset at :4147). Identical to the FIX-4 demote.
+					data_configuration = d3_target;
+					negotiated_configuration = d3_target;
+					supershift_proven_ceiling = d3_target;
+
+					// WALL-B FIX-9 D3 REUSES the FIX-5 cooldown machinery: the field's role
+					// generalizes from "carve-dead" to "CFG16-not-viable-on-this-channel" (here:
+					// reverse-ACK starved). AARF: re-demoting WHILE a prior cooldown is still active
+					// (CFG16 STILL starved) GROWS the window; a fresh (post-expiry) failure starts at
+					// BASE. The cooldown's CLEAR-on-success gate (INV-B3: only a CFG16 big-block carve
+					// data-ACK clears) is UNTOUCHED — on the per-frame path no carve ever lands, so the
+					// hold survives the whole CFG15 delivery window and expires by batch-count for an
+					// optimistic CFG16 re-probe. See FIX9_D3_AUDIT.md Q4 INV-2.
+					bigblock_carve_cooldown_span = bigblock_carve_cooldown_next_span(
+						(bigblock_carve_cooldown_batches > 0) ? bigblock_carve_cooldown_span : 0,
+						BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+					bigblock_carve_cooldown_batches = bigblock_carve_cooldown_span;
+					printf("[CFG16-HOLD] FIX-9 D3 ARM: CFG16 cooldown ARMED for %d batches (span now "
+						"%d) — climb capped at per-frame CFG%d until the cooldown expires for a re-probe\n",
+						bigblock_carve_cooldown_batches, bigblock_carve_cooldown_span,
+						config_ladder_down(CONFIG_16, robust_enabled));
+					fflush(stdout);
+
+					// Consumed the deadline: clear BOTH the starve streak and the nack streak so a
+					// fresh per-frame failure re-accumulates from 1 (and we do NOT fall through to the
+					// BREAK gate below). Mirrors the FIX-4 emergency_nack_count=0.
+					cfg16_revack_starve_fails = 0;
+					emergency_nack_count = 0;
+
+					// SACK Design A Step 12 — BREAK supremacy hook (a config MOVE; mirrors the BREAK
+					// paths + FIX-4). Keeps the optimizer Axis-1 cooldown coherent across the path
+					// switch. NOT a BREAK — no send_break_pattern, no emergency_break_active.
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							d3_target, "cfg16_revack_starvation_deadline");
+
+					// Emit the SET_CONFIG control frame on the live CFG16 PHY (the RSP re-decodes it
+					// and follows to per-frame CFG15) and wait for its ACK. Mirrors the FIX-4 demote
+					// and the climb-UP SET_CONFIG emit exactly.
+					cleanup();
+					add_message_control(SET_CONFIG);
+					this->connection_status = TRANSMITTING_CONTROL;
+					return;
+				}
+			}
+
 			// Trigger BREAK when threshold reached and not already at bottom
 			if(emergency_nack_count >= emergency_nack_threshold
 			   && !config_is_at_bottom(current_configuration, robust_enabled)
@@ -3805,6 +3943,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			   && turboshift_phase == TURBO_DONE
 			   && gear_shift_on == YES)
 			{
+				// WALL-B FIX-9 D3 (P4): a genuine BREAK is firing (D3 did NOT pre-empt — either not
+				// CFG16, the anchor was not CFG16, the ACK was garbled-not-silent, or framing was
+				// live). The link is about to leave CFG16 via BREAK recovery, so the reverse-ACK
+				// starvation streak's premise (sustained CFG16) is gone — clear it so a later
+				// re-climb to CFG16 starts fresh.
+				cfg16_revack_starve_fails = 0;
 				// Panic-mode jump: if a previous BREAK fired with no data success
 				// between, the channel cratered hard and the ladder isn't keeping
 				// up. Skip the doubling — set break_drop_step large so the
@@ -3907,6 +4051,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
+
+			// WALL-B FIX-9 D3 (producer P3): ANY data-ACK (clean OR partial) proves the reverse
+			// channel is NOT pure-silent, so the CFG16 reverse-ACK starvation streak resets UNGATED.
+			// (A partial SACK that arrives is itself a reverse-ACK that decoded — the de-alignment
+			// has not yet starved the turnaround to silence.) Symmetric with emergency_nack_count.
+			cfg16_revack_starve_fails = 0;
 
 			// WALL-B FIX-5: CLEAR the CFG16 big-block carve cooldown on CARVE SUCCESS. A
 			// data-ACK while current_configuration==CONFIG_16 with big-block framing live
@@ -10233,6 +10383,228 @@ int cl_arq_controller::test_climb_engine()
 		emergency_previous_config = CONFIG_NONE;
 		break_drop_step = 1;
 		breaks_since_last_data_success = 0;
+	}
+
+	// ================================================================
+	// Part V — WALL-B FIX-9 D3: CFG16 PER-FRAME REVERSE-ACK STARVATION -> per-frame CFG15
+	// (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §1/§2 Rank-1, FIX9_D3_DESIGN.md, FIX9_D3_AUDIT.md).
+	// On a CLEAN channel the link climbs to CONFIG_16 and SUSTAINS the 25-frame batch; inter-Pi
+	// sample-clock drift de-aligns the half-duplex turnaround so the reverse MFSK ACK+SACK goes
+	// PURE SILENT (peak_metric=0.0) even though the FORWARD data was delivering; 3 such block-
+	// failures BREAK off CFG16 -> the ROBUST cascade -> 0 bytes. D3 demotes CFG16->per-frame CFG15
+	// (which has the turnaround margin) instead, holding the proven rung. This drives the REAL pure
+	// helper production calls (cfg16_revack_starve_fallback_target) + the REAL FIX-5 cooldown arm
+	// (bigblock_carve_cooldown_next_span) + the REAL member field discipline. FAIL-BEFORE:
+	// -DFIX9_D3_FAILBEFORE compiles the helper to `return -1;` (no D3 fallback) -> V0/V5/V6/V7 FAIL
+	// (the link has no per-frame fallback and would BREAK to ROBUST_0). PASS-AFTER: ALL PASS.
+	// CMD-only; no RSP/wire/DSP change. The drift-sim A/B is the end-to-end gate.
+	// ================================================================
+	robust_enabled = YES;            // a robust (-R) session: the FULL ladder is in play
+	narrowband_enabled = NO;
+
+	// V0 — THE TRIGGER: CFG16 + OFDM proven on this channel + per-frame (framing off) + the sustained
+	// reverse-ACK-loss deadline reached (starve_fails >= CFG16_REVACK_STARVE_FAILS) -> demote to the
+	// highest per-frame OFDM rung CFG15. Pre-fix (helper -> -1): no fallback, the BREAK cascade runs.
+	{
+		int t = cfg16_revack_starve_fallback_target(CONFIG_16, /*ofdm_proven=*/true,
+			/*bigblock_rung_live=*/false, /*starve_fails=*/CFG16_REVACK_STARVE_FAILS,
+			CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		check(t == CONFIG_15,
+			"V0 CFG16 reverse-ACK starvation deadline (OFDM proven, per-frame, loss streak met) -> per-frame CFG15 (the 0-bytes->hold lever)",
+			t, CONFIG_15);
+	}
+
+	// V1 — NOT-YET: below the deadline (starve_fails 1 < threshold 2) no fallback fires; the link
+	// keeps attempting CFG16 (and the BREAK threshold is likewise not met). A single transient
+	// reverse-ACK miss does NOT abandon CFG16.
+	{
+		int t = cfg16_revack_starve_fallback_target(CONFIG_16, /*ofdm_proven=*/true,
+			/*rung_live=*/false, /*starve_fails=*/CFG16_REVACK_STARVE_FAILS - 1,
+			CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		check(t == -1,
+			"V1 below the loss deadline (1<2) -> NO fallback (one transient reverse-ACK miss keeps CFG16)",
+			t, -1);
+	}
+
+	// V2 — OFDM NOT PROVEN (the deep-SNR discriminator): the anchor is a ROBUST/MFSK rung — OFDM never
+	// delivered DATA this session (a genuine deep-SNR channel where the climb never proved OFDM). Even
+	// a met loss streak at CFG16 does NOT fire D3 -> the BREAK->ROBUST escape is UNTOUCHED. THIS is
+	// what separates the FIX-9 signature (OFDM works, CFG16 specifically de-aligns) from a genuine
+	// channel collapse (OFDM itself is non-viable). is_ofdm_config(ROBUST_0)==false -> ofdm_proven=false.
+	{
+		int t = cfg16_revack_starve_fallback_target(CONFIG_16, /*ofdm_proven=*/false,
+			/*rung_live=*/false, /*starve_fails=*/CFG16_REVACK_STARVE_FAILS + 5,
+			CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		check(t == -1,
+			"V2 OFDM NOT proven (anchor robust/MFSK) -> NO fallback (deep-SNR collapse BREAKs to ROBUST, escape intact)",
+			t, -1);
+		// and the production gate IS is_ofdm_config(anchor): a ROBUST_0 anchor yields ofdm_proven=false:
+		check(is_ofdm_config(ROBUST_0) == false,
+			"V2b is_ofdm_config(ROBUST_0)==false -> a robust anchor correctly reads ofdm_proven=false",
+			is_ofdm_config(ROBUST_0) ? 1 : 0, 0);
+	}
+
+	// V3 — NOT-CFG16: a non-CFG16 rung has no CFG16 turnaround fragility -> -1 (the generic
+	// fade-down BREAK is UNTOUCHED on every other rung).
+	{
+		int t = cfg16_revack_starve_fallback_target(CONFIG_13, /*ofdm_proven=*/true,
+			/*rung_live=*/false, /*starve_fails=*/CFG16_REVACK_STARVE_FAILS + 1,
+			CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		check(t == -1,
+			"V3 non-CFG16 rung -> NO fallback (only CFG16 has the densest-constellation turnaround fragility)",
+			t, -1);
+	}
+
+	// V4 — MUTUALLY EXCLUSIVE WITH FIX-4 (the big-block carve path): when big-block framing IS live,
+	// D3 returns -1 — FIX-4 (bigblock_carve_fallback_target) owns the carve path, D3 owns the
+	// per-frame path. They never both fire on the same failure (FIX9_D3_AUDIT.md INV-5).
+	{
+		int d3 = cfg16_revack_starve_fallback_target(CONFIG_16, /*ofdm_proven=*/true,
+			/*bigblock_rung_live=*/true, /*starve_fails=*/CFG16_REVACK_STARVE_FAILS,
+			CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		check(d3 == -1,
+			"V4a big-block framing live -> D3 returns -1 (FIX-4 owns the carve path; mutually exclusive)",
+			d3, -1);
+		// and FIX-4 returns -1 on the per-frame path -> exactly one of {D3, FIX-4} can fire:
+		int fix4_perframe = bigblock_carve_fallback_target(CONFIG_16, /*rung_live=*/false,
+			/*nack_count=*/CFG16_REVACK_STARVE_FAILS, CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		check(fix4_perframe == -1,
+			"V4b FIX-4 returns -1 on the per-frame path -> at most ONE of {D3,FIX-4} fires per failure",
+			fix4_perframe, -1);
+	}
+
+	// V5 — TARGET IS A PER-FRAME OFDM RUNG: the fallback CFG15 is an OFDM (non-robust, non-MFSK)
+	// per-frame config AND is the HIGHEST rung below CFG16 (config_ladder_down(CFG16)==CFG15) — a
+	// rung the drift-de-aligned RSP CAN follow via the SET_CONFIG control exchange.
+	{
+		int t = cfg16_revack_starve_fallback_target(CONFIG_16, /*ofdm_proven=*/true,
+			/*rung_live=*/false, /*starve_fails=*/CFG16_REVACK_STARVE_FAILS,
+			CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		check(t >= 0 && is_ofdm_config(t) && !is_robust_config(t),
+			"V5a the fallback target is a PER-FRAME OFDM rung (decodable, not robust/MFSK)",
+			(t >= 0 && is_ofdm_config(t) && !is_robust_config(t)) ? 1 : 0, 1);
+		check(t == config_ladder_down(CONFIG_16, /*robust*/true),
+			"V5b the fallback is the HIGHEST per-frame rung directly below CFG16 (config_ladder_down(CFG16))",
+			t, config_ladder_down(CONFIG_16, /*robust*/true));
+		// and STRICTLY above the BREAK cascade's first exhausted-recovery target (CONFIG_0):
+		int break_first = config_ladder_down_n(CONFIG_16, BREAK_DROP_STEP_MAX, /*robust*/true);
+		check(config_ladder_index(t) > config_ladder_index(break_first) && !is_robust_config(t),
+			"V5c the D3 fallback (CFG15) is STRICTLY above the BREAK cascade's first target (the 0-bytes->hold fix)",
+			config_ladder_index(t), config_ladder_index(break_first));
+	}
+
+	// V6 — THE FIX-5 COOLDOWN COMPOSES: the D3 demote arms the SAME cooldown FIX-4 does, via the
+	// SAME helper, and the cooldown ceiling == the D3 fallback target (CFG15). So after the demote
+	// the climb is HELD at exactly the per-frame rung D3 falls back to — the SNR re-trigger cannot
+	// re-elect the starved CFG16 across cycles (FIX9_D3_AUDIT.md Q4 INV-1). Pre-fix: D3 helper -> -1
+	// so this path is never reached.
+	{
+		int d3_target = cfg16_revack_starve_fallback_target(CONFIG_16, /*ofdm_proven=*/true,
+			/*rung_live=*/false, /*starve_fails=*/CFG16_REVACK_STARVE_FAILS,
+			CFG16_REVACK_STARVE_FAILS, /*robust*/true);
+		int armed_span = bigblock_carve_cooldown_next_span(/*prev_span=*/0,
+			BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+		int cd_ceiling = bigblock_carve_cooldown_ceiling(/*remaining=*/armed_span, /*robust*/true);
+		check(d3_target == CONFIG_15 && cd_ceiling == CONFIG_15 && d3_target == cd_ceiling,
+			"V6 D3 demote target (CFG15) == FIX-5 cooldown ceiling (CFG15): the climb is HELD at the per-frame rung across cycles",
+			d3_target, cd_ceiling);
+	}
+
+	// V7 — MEMBER-GRANULARITY (the Part U idiom + the §5 no-perturbation-of-FIX-2 audit AS a test):
+	// prime the real this-> members for the starvation case, replay the D3 demote's PURE member
+	// half (the SET_CONFIG demote state; cleanup/add_message_control are the control side, not
+	// asserted here), and assert (a) the demote lands at per-frame CFG15 with the cooldown ARMED
+	// and the starve+nack streaks consumed, AND (b) every BREAK-ladder field is UNCHANGED — the
+	// demote is a SET_CONFIG, NOT a BREAK, so it cannot perturb the FIX-2 cap/decay AARF.
+	{
+		// prime: the sustained-CFG16 reverse-ACK starvation state at the block-failure point. The
+		// anchor is a MID OFDM rung (CONFIG_7) — OFDM IS proven this session, but the anchor need NOT
+		// be CFG16 (the drift-sim elects CFG16 speculatively; the shared signal is "OFDM works"):
+		turboshift_phase          = TURBO_DONE;
+		current_configuration     = CONFIG_16;
+		data_configuration        = CONFIG_16;
+		negotiated_configuration  = CONFIG_16;
+		last_data_viable_config   = CONFIG_7;      // OFDM proven (is_ofdm_config(CFG7)==true)
+		cfg16_revack_starve_fails = CFG16_REVACK_STARVE_FAILS;  // the reverse-ACK-loss deadline is met
+		supershift_proven_ceiling = -1;
+		bigblock_carve_cooldown_batches = 0;       // no prior cooldown -> fresh arm at BASE
+		bigblock_carve_cooldown_span    = 0;
+		// FIX-2 BREAK-ladder fields seeded with NON-default sentinels so any spurious write shows:
+		emergency_break_active    = 0;
+		break_drop_step           = 2;
+		emergency_previous_config = CONFIG_9;
+		breaks_since_last_data_success = 3;
+		emergency_nack_count      = CFG16_REVACK_STARVE_FAILS;
+
+		bool bigblock_live = false;   // production per-frame path
+		int d3_target = cfg16_revack_starve_fallback_target(current_configuration,
+			is_ofdm_config(last_data_viable_config), bigblock_live,
+			cfg16_revack_starve_fails, CFG16_REVACK_STARVE_FAILS, robust_enabled);
+		check(d3_target == CONFIG_15,
+			"V7-pre the primed starvation state satisfies the D3 discriminator (drives the demote branch)",
+			d3_target, CONFIG_15);
+
+		if(d3_target >= 0)
+		{
+			// replay the D3 demote's PURE member half (arq_commander.cc demote block), EXCLUDING
+			// cleanup()/add_message_control (control-side, needs telecom_system):
+			data_configuration = d3_target;
+			negotiated_configuration = d3_target;
+			supershift_proven_ceiling = d3_target;
+			bigblock_carve_cooldown_span = bigblock_carve_cooldown_next_span(
+				(bigblock_carve_cooldown_batches > 0) ? bigblock_carve_cooldown_span : 0,
+				BB_CARVE_COOLDOWN_BASE, BB_CARVE_COOLDOWN_MAX);
+			bigblock_carve_cooldown_batches = bigblock_carve_cooldown_span;
+			cfg16_revack_starve_fails = 0;
+			emergency_nack_count = 0;
+		}
+
+		// (a) the demote landed at per-frame CFG15, cooldown ARMED at BASE, both streaks consumed:
+		check(data_configuration == CONFIG_15 && negotiated_configuration == CONFIG_15,
+			"V7a demote data/negotiated_configuration == CONFIG_15 (the per-frame rung, NOT ROBUST_0)",
+			data_configuration, CONFIG_15);
+		check(supershift_proven_ceiling == CONFIG_15,
+			"V7b supershift_proven_ceiling pinned to CFG15 (one-cycle; the cooldown holds it cross-cycle)",
+			supershift_proven_ceiling, CONFIG_15);
+		check(bigblock_carve_cooldown_batches == BB_CARVE_COOLDOWN_BASE,
+			"V7c FIX-5 cooldown ARMED at BASE batches by the D3 demote (the cross-cycle CFG16 hold)",
+			bigblock_carve_cooldown_batches, BB_CARVE_COOLDOWN_BASE);
+		check(cfg16_revack_starve_fails == 0,
+			"V7d the starvation streak is CONSUMED (reset to 0) so a fresh per-frame failure re-accumulates from 1",
+			cfg16_revack_starve_fails, 0);
+		check(emergency_nack_count == 0,
+			"V7e emergency_nack_count consumed (the demote pre-empts the BREAK threshold)",
+			emergency_nack_count, 0);
+
+		// (b) THE §5 audit assertion: the BREAK-ladder fields are UNTOUCHED — D3 does NOT perturb
+		// the FIX-2 cap/decay AARF (the demote is a SET_CONFIG, never enters the BREAK ladder):
+		check(emergency_break_active == 0,
+			"V7f emergency_break_active UNCHANGED (==0): the D3 demote did NOT fire a BREAK",
+			emergency_break_active, 0);
+		check(break_drop_step == 2,
+			"V7g break_drop_step UNCHANGED (==2): D3 does not perturb the FIX-2 doubling ladder",
+			break_drop_step, 2);
+		check(emergency_previous_config == CONFIG_9,
+			"V7h emergency_previous_config UNCHANGED (==CFG9): the BREAK target memory is not touched",
+			emergency_previous_config, CONFIG_9);
+		check(breaks_since_last_data_success == 3,
+			"V7i breaks_since_last_data_success UNCHANGED (==3): the panic counter is not touched",
+			breaks_since_last_data_success, 3);
+
+		// tidy — restore sentinels so a later pass/teardown sees a clean state
+		turboshift_phase = TURBO_DONE;
+		current_configuration = CONFIG_NONE;
+		negotiated_configuration = CONFIG_NONE;
+		data_configuration = CONFIG_NONE;
+		last_data_viable_config = ROBUST_0;
+		supershift_proven_ceiling = -1;
+		bigblock_carve_cooldown_batches = 0;
+		bigblock_carve_cooldown_span = 0;
+		cfg16_revack_starve_fails = 0;
+		emergency_previous_config = CONFIG_NONE;
+		break_drop_step = 1;
+		breaks_since_last_data_success = 0;
+		emergency_nack_count = 0;
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
