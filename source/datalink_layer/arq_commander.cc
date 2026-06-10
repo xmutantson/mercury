@@ -919,8 +919,34 @@ void cl_arq_controller::process_messages_tx_control()
 				connection_attempt_timer.reset();
 				connection_attempt_timer.start();
 
-				// NB/WB auto-negotiation: phase transitions
-				if(commander_configured_nb >= 0 && nb_probe_max > 0)
+				// NB/WB auto-negotiation: phase transitions.
+				//
+				// CONNECT race fix (sub-mode A, the dominant clean-channel
+				// failure): gate the NB<->WB probe switch on hail_detected == NO.
+				// The NB/WB probe switch exists ONLY for first-contact discovery
+				// — finding which bandwidth the peer listens in. Once this
+				// commander has RECEIVED a HAIL response (hail_detected == YES,
+				// set at the receive_hail_pattern() success at the HAIL phase),
+				// the peer has answered in the CURRENT mode, so the bandwidth is
+				// already resolved and reachable. START_CONNECTION is only ever
+				// queued AFTER hail_detected == YES (see the HAIL gate that
+				// precedes add_message_control(START_CONNECTION) in
+				// process_messages_commander). Switching mode mid-handshake at
+				// that point is net-harmful: switch_narrowband_mode() runs
+				// load_configuration(FULL) which (1) races the capture thread and
+				// discards the in-flight read ([CAP-STALE], audioio.c:1383) and
+				// (2) rebuilds the ACK-detector template (NB Sidelnikov M=8 <->
+				// WB Welch-Costas M=16), orphaning the START_CONNECTION ACK the
+				// responder already transmitted. The two sides can then never
+				// re-match and the handshake deadlocks until the connect window
+				// expires. Keep retransmitting START_CONNECTION in the
+				// HAIL-confirmed mode instead; first-contact discovery for a peer
+				// that never answers HAIL is UNAFFECTED (hail_detected stays NO,
+				// so the switch still fires). The longer-deadline connection
+				// timeout WB-restore (arq_common.cc:2437) remains the safety net
+				// and resets hail_detected=NO before switching, so it is
+				// consistent with this gate.
+				if(hail_detected == NO && commander_configured_nb >= 0 && nb_probe_max > 0)
 				{
 					if(commander_configured_nb == NO)
 					{
@@ -962,6 +988,19 @@ void cl_arq_controller::process_messages_tx_control()
 							}
 						}
 					}
+				}
+				else if(hail_detected == YES && commander_configured_nb >= 0 &&
+				        nb_probe_max > 0 && narrowband_enabled == YES &&
+				        (connection_attempts % nb_probe_max) == 0)
+				{
+					// Instrumentation only (CONNECT race fix attribution): the
+					// probe-switch gate HELD because the HAIL was already answered
+					// in this mode. Keep retransmitting START_CONNECTION here
+					// instead of switching (which would orphan the in-flight ACK).
+					printf("[NB-NEG] Commander: probe-switch SUPPRESSED at attempt %d "
+						"(hail_detected=YES, retransmitting START_CONNECTION in current mode)\n",
+						connection_attempts);
+					fflush(stdout);
 				}
 			}
 
