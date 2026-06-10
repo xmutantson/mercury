@@ -590,6 +590,15 @@ public:
   // (sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0); safe to call
   // unconditionally.
   void bump_bsi_and_transfer_prev();
+
+  // FIX-8 (data-integrity): advance rsp_last_delivered_batch_seq_id to `bsi`
+  // ONLY if `bsi` is a forward step (mod-256 forward distance in [1,128]) from
+  // the current mark, OR the mark is unset (-1). MONOTONIC-with-wrap (audit R1):
+  // a late out-of-order prev (older) batch delivered after a newer current
+  // already advanced the mark must NOT regress it. Called at the two real
+  // delivery commits only (BATCH-DONE + PREV-DELIVERED). Internally v2-scoped by
+  // the call sites; the helper itself is pure arithmetic.
+  void advance_last_delivered(int bsi);
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
   // receive() landed a frame with messages_rx_buffer.type == SACK_RSP. The
   // function:
@@ -1312,6 +1321,26 @@ public:
     return (rx == cmd_bsi || rx == prev_bsi);
   }
 
+  // FIX-8 (data-integrity): the post-reset re-adopt contiguity predicate. After a
+  // BREAK / FULL-config reset wipes rsp_current_expected_batch_seq_id to -1, the
+  // adopt site (arq_responder.cc:618) takes the next arriving bsi as the new
+  // baseline. If a prior batch was DELIVERED (last_delivered >= 0) and the
+  // adopted bsi is NEITHER the same batch (idempotent duplicate, INV-4) NOR its
+  // mod-256 contiguous successor, then batches between last_delivered and adopted
+  // were silently dropped -> a HOLE. Returns true iff there is a gap (caller must
+  // refuse silent concatenation). PURE + static so --test-gap-abort drives the
+  // EXACT production predicate. last_delivered < 0 (nothing delivered yet) =>
+  // never a gap (the session-start adopt is always legitimate).
+  // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md §4.4-§4.5.
+  static bool sack_v2_readopt_has_gap(int adopted_bsi, int last_delivered_bsi)
+  {
+    if(last_delivered_bsi < 0) return false;
+    unsigned last = (unsigned)(last_delivered_bsi & 0xFF);
+    unsigned succ = (last + 1u) & 0xFFu;
+    unsigned adopted = (unsigned)(adopted_bsi & 0xFF);
+    return !(adopted == last || adopted == succ);
+  }
+
   // TURBO step-1 SNR-capability pre-truncation gate (gearshift-climb-engine.md
   // §20 — the CFG15->CFG16 under-climb on clean). PURE so --test-climb-engine can
   // drive it with no live telecom_system / channel.
@@ -1625,6 +1654,20 @@ public:
   // 'ofdm' variant: should PASS on HEAD (regression guard).
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
+
+  // FIX-8 (data-integrity) — silent lost-batch GAP on post-reset re-adopt.
+  // In-process SIM_INPROC synthetic-fire (CLI --test-gap-abort). Reproduces the
+  // bench-4 sequence: deliver batches 0..4 (high-water=4), force the BREAK reset
+  // (cur=-1, prev=-1) with batches 5,6,7 UNDELIVERED, present a bsi=8 v2 DATA
+  // frame at the adopt site. fail-before (MERCURY_GAP_ABORT_DEFEAT=1): silent
+  // concatenation — fifo_buffer_rx = [0-4 bytes][8 bytes], oracle compare FAILS.
+  // pass-after (defeat off): [RSP-V2-GAP-ABORT], link_status=DROPPED, NO batch-8
+  // bytes appended, delivered prefix == EXACTLY batches 0-4. Variants:
+  // CONTIGUOUS-NOOP (bsi=5 -> no abort), DUPLICATE (bsi=4 -> no abort, INV-4),
+  // PREV-ORDERING (R1 high-water no-regress), NB (R5 batch=1 same gate).
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
+  int test_gap_abort_on_readopt();
 
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
@@ -2187,6 +2230,19 @@ public:
                                          //      same ACK-GATE-PASS moment that bumps
                                          //      current_expected. -1 = no prior batch
                                          //      yet (first session batch in progress).
+  // FIX-8 (data-integrity): reset-surviving high-water mark of the highest
+  // batch_seq_id whose bytes were actually DELIVERED to the app FIFO. Advanced
+  // ONLY at the two real delivery commits (BATCH-DONE arq_responder.cc:1789-1797
+  // and PREV-DELIVERED arq_responder.cc:823) via advance_last_delivered()
+  // (monotonic-with-wrap). UNLIKE rsp_current_expected_batch_seq_id this field
+  // SURVIVES the BREAK reset (arq_responder.cc:474) and the FULL
+  // load_configuration reset — it is cleared ONLY at a true session boundary
+  // (ctor + reset_session_state()). The post-reset adopt site
+  // (arq_responder.cc:618) reads it to REFUSE silent concatenation across a
+  // dropped-batch hole (non-contiguous re-adopt -> loud abort). -1 = nothing
+  // delivered yet this LINK. v2-scoped (sack_v2_enabled). See
+  // bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
+  int rsp_last_delivered_batch_seq_id;
   long long rsp_v2_drop_count;           // RSP: counter of [RSP-V2-DROP] events
                                          //      (frames discarded for unknown
                                          //      batch_seq_id). Validates the Step 4
