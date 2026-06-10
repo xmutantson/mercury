@@ -3681,6 +3681,198 @@ static std::vector<double> build_gf16ra_data_audio(cl_telecom_system& ts,
 	return audio;
 }
 
+// =============================================================================
+// §7 (FADING/CFO MAKE-OR-BREAK) — Watterson HF channel for the data-cliff sweep.
+//
+// Faithful port of the codec2/PathSim reference (David Rowe, ch.c +
+// doppler_spread.m/ch_fading.m, hermes-modem/modem/freedv/), the ITU-R F.1487 /
+// Watterson Gaussian-scatter tap-gain delay-line model [Watterson/Juroshek/
+// Bensema IEEE TCOM 1970; ITU-R F.1487 2000; NTIA 90-255].
+//
+//   - 2 equal-power paths: direct + one delayed by D = round(delay_ms*fs/1000).
+//   - each path tap = independent complex Gaussian with a GAUSSIAN-shaped Doppler
+//     PSD, std-dev sigma = dopplerSpreadHz/2 (doppler_spread.m:11 — the quoted
+//     "spread" is the 2-sigma PSD width).
+//   - power-normalized hf_gain = 1/sqrt(var(g0)+var(g1)) (ch_fading.m:11) so the
+//     two-path sum is unit average power (SNR axis preserved).
+//   - optional CFO (carrier offset) e^{j2pi*cfo*n/fs}; delayed-path carrier phase
+//     e^{-j2pi*fc*D/fs} included.
+//
+// Applied on the COMPLEX ENVELOPE (no Hilbert): mix the clean real passband down
+// with the modem's own RX front end (passband_to_baseband, decim=1, FIR_rx_data
+// LPF removes the 2*fc image) -> apply taps -> re-up-convert with the modem's
+// baseband_to_passband sign convention (out = re*cos + im*sin). The faded
+// passband is rescaled so its in-band power equals the clean reference's p_sig,
+// keeping the snr3k axis bit-exact regardless of the mix round-trip gain.
+// =============================================================================
+struct watterson_profile {
+	const char* name;
+	double delay_ms;
+	double doppler_hz;   // 2-sigma Gaussian-PSD spread
+};
+
+// One independent complex Gaussian Doppler process at fs, length n, with a
+// Gaussian-shaped PSD of std-dev sigma = doppler_hz/2. Direct C++ port of
+// doppler_spread.m: build a Gaussian-magnitude FIR at a low internal rate,
+// filter complex white Gaussian noise, then linearly resample to fs. Resampling
+// a band-limited (doppler<<fs) process with linear interpolation is accurate to
+// far below the fading dynamics. Returns g[0..n-1].
+static void gen_doppler_process(double doppler_hz, double fs, int n,
+                                std::mt19937& rng, std::vector<std::complex<double> >& g)
+{
+	g.assign((size_t)n, std::complex<double>(1.0, 0.0));
+	if (doppler_hz <= 0.0) return;   // n=0 Hz -> static unit gain (no Doppler)
+	const double sigma = doppler_hz / 2.0;
+	// Low internal rate: a few x the spread is plenty to represent a Gaussian PSD
+	// whose energy is within +/- ~3*sigma = 1.5*doppler_hz of DC.
+	const double lowFs = std::ceil(20.0 * doppler_hz);
+	const int Ntaps = 101;                       // odd -> integer group delay
+	// Gaussian-magnitude FIR via frequency sampling (fir2-equivalent: sample the
+	// Gaussian magnitude response, IFFT, window). Build the magnitude on [0,lowFs/2]
+	// then form a linear-phase real FIR by windowed-sinc synthesis.
+	std::vector<double> b((size_t)Ntaps, 0.0);
+	{
+		// Desired magnitude H(f) = exp(-f^2/(2 sigma^2)) for f in [0, lowFs/2].
+		// Linear-phase FIR by inverse-DTFT of the (even) magnitude, Hann-windowed.
+		const int M = Ntaps - 1;
+		for (int k = 0; k < Ntaps; k++) {
+			double tau = (double)k - M / 2.0;     // center tap
+			// h(tau) = (2/lowFs) * integral_0^{lowFs/2} H(f) cos(2pi f tau / ... )
+			// Numerically integrate the even magnitude response.
+			const int NI = 400;
+			double acc = 0.0;
+			for (int i = 0; i <= NI; i++) {
+				double f = (lowFs / 2.0) * (double)i / NI;
+				double H = std::exp(-(f * f) / (2.0 * sigma * sigma));
+				double w = (i == 0 || i == NI) ? 0.5 : 1.0;   // trapezoid
+				acc += w * H * std::cos(2.0 * M_PI * f * tau / lowFs);
+			}
+			acc *= (lowFs / 2.0) / NI * (2.0 / lowFs);
+			double hann = 0.5 - 0.5 * std::cos(2.0 * M_PI * k / M);
+			b[(size_t)k] = acc * hann;
+		}
+	}
+	// Normalize the FIR for UNIT OUTPUT VARIANCE: for unit-variance complex white
+	// input, the filtered output variance = sum(b[k]^2). Scale b so the realized
+	// process has E[|g|^2]=1 regardless of doppler_hz/Ntaps — this makes hf_gain a
+	// FIXED long-run constant (1/sqrt(2) for two equal paths) so per-FRAME fade
+	// power varies naturally (faithful to ch.c's fixed hf_gain; no per-block chase).
+	{
+		double bb = 0.0; for (int k=0;k<Ntaps;k++) bb += b[(size_t)k]*b[(size_t)k];
+		if (bb > 0.0) { double s = 1.0/std::sqrt(bb); for (int k=0;k<Ntaps;k++) b[(size_t)k]*=s; }
+	}
+	// White complex Gaussian at lowFs, length covering n@fs + filter warm-up.
+	int nLow = (int)std::ceil((double)n * lowFs / fs) + Ntaps + 4;
+	std::vector<std::complex<double> > wn((size_t)nLow);
+	std::normal_distribution<double> nd(0.0, 1.0);
+	for (int i = 0; i < nLow; i++) wn[(size_t)i] = std::complex<double>(nd(rng), nd(rng));
+	// FIR filter (drop the first Ntaps warm-up samples).
+	std::vector<std::complex<double> > fl((size_t)nLow, std::complex<double>(0.0,0.0));
+	for (int i = 0; i < nLow; i++) {
+		std::complex<double> acc(0.0, 0.0);
+		int kmax = (i < Ntaps) ? i + 1 : Ntaps;
+		for (int k = 0; k < kmax; k++) acc += b[(size_t)k] * wn[(size_t)(i - k)];
+		fl[(size_t)i] = acc;
+	}
+	// Linear resample lowFs -> fs over the post-warmup region.
+	double step = lowFs / fs;
+	for (int i = 0; i < n; i++) {
+		double pos = (double)Ntaps + (double)i * step;
+		int i0 = (int)std::floor(pos);
+		double frac = pos - i0;
+		if (i0 + 1 >= nLow) { g[(size_t)i] = fl[(size_t)(nLow - 1)]; continue; }
+		g[(size_t)i] = fl[(size_t)i0] * (1.0 - frac) + fl[(size_t)(i0 + 1)] * frac;
+	}
+}
+
+// One-shot calibration of the down/up-convert round-trip gain on a clean signal
+// (g0=1,g1=0,no CFO,no delay). Returns the scalar that maps the re-up-converted
+// passband back to the input passband's in-band power, so the FIXED fading scale
+// hf_gain (unit EXPECTED power) rides on a correctly-scaled envelope. Computed
+// ONCE per (K,repfact) cell — NOT per realization — so block-to-block fade power
+// variation (the dominant slow-fade impairment) is PRESERVED (matches ch.c's
+// fixed hf_gain; per-realization renorm would erase whole-frame fades).
+static double watterson_roundtrip_gain(cl_telecom_system& ts,
+                                       const std::vector<double>& clean, int active)
+{
+	const double fs = ts.sampling_frequency;
+	const double fc = ts.carrier_frequency;
+	const int total = (int)clean.size();
+	std::vector<std::complex<double> > env((size_t)total, std::complex<double>(0.0,0.0));
+	std::vector<double> rt((size_t)total, 0.0);
+	std::vector<double> in(clean);
+	ts.ofdm.passband_to_baseband(in.data(), total, env.data(),
+		fs, fc, ts.carrier_amplitude, 1, &ts.ofdm.FIR_rx_data);
+	for (int n = 0; n < total; n++) {
+		double ph = 2.0 * M_PI * fc * (double)n / fs;
+		rt[(size_t)n] = env[(size_t)n].real() * std::cos(ph) + env[(size_t)n].imag() * std::sin(ph);
+	}
+	double p_in  = suffix_pb_power(clean, active);
+	double p_rt  = suffix_pb_power(rt, active);
+	if (p_rt <= 0.0 || p_in <= 0.0) return 1.0;
+	return std::sqrt(p_in / p_rt);   // amplitude scale to restore clean power
+}
+
+// Apply the Watterson channel + CFO to a clean real passband buffer in place.
+// mix_gain = fixed round-trip calibration (watterson_roundtrip_gain). The fading
+// scale is FIXED (unit expected power) so per-frame fade power varies naturally.
+static void apply_watterson_passband(cl_telecom_system& ts, std::vector<double>& audio,
+                                     int active, const watterson_profile& prof,
+                                     double cfo_hz, double mix_gain, std::mt19937& rng)
+{
+	const double fs = ts.sampling_frequency;
+	const double fc = ts.carrier_frequency;
+	const int total = (int)audio.size();
+
+	// 1) Down-convert clean passband -> complex envelope at fs (modem RX front end;
+	//    decimation=1 so we stay at fs; FIR_rx_data LPF removes the 2*fc image).
+	std::vector<std::complex<double> > env((size_t)total, std::complex<double>(0.0,0.0));
+	ts.ofdm.passband_to_baseband(audio.data(), total, env.data(),
+		fs, fc, ts.carrier_amplitude, /*decimation_rate=*/1, &ts.ofdm.FIR_rx_data);
+
+	// 2) Two independent Gaussian-Doppler tap processes, each E[|g|^2]=1 (the
+	//    generator is unit-variance-normalized). hf_gain = 1/sqrt(2) is the FIXED
+	//    long-run two-path normalization (ch_fading.m:11 with two unit-var paths) —
+	//    NOT measured per block, so per-FRAME fade power varies (whole-frame deep
+	//    fades CAN happen, the dominant slow-fade impairment for short blocks).
+	std::vector<std::complex<double> > g0, g1;
+	gen_doppler_process(prof.doppler_hz, fs, total, rng, g0);
+	gen_doppler_process(prof.doppler_hz, fs, total, rng, g1);
+	const double hf_gain = 1.0 / std::sqrt(2.0);
+
+	// 3) Multipath + CFO on the envelope. D = delayed-path delay in fs samples;
+	//    delayed-path carrier phase rot = e^{-j 2pi fc D / fs}.
+	const int D = (int)std::floor(prof.delay_ms * fs / 1000.0);
+	const double dphi = -2.0 * M_PI * fc * (double)D / fs;
+	const std::complex<double> delay_phase(std::cos(dphi), std::sin(dphi));
+	std::vector<std::complex<double> > y((size_t)total, std::complex<double>(0.0,0.0));
+	for (int n = 0; n < total; n++) {
+		std::complex<double> direct = g0[(size_t)n] * env[(size_t)n];
+		std::complex<double> delayed(0.0, 0.0);
+		if (n - D >= 0) delayed = g1[(size_t)n] * env[(size_t)(n - D)] * delay_phase;
+		std::complex<double> v = hf_gain * (direct + delayed);
+		if (cfo_hz != 0.0) {
+			double ph = 2.0 * M_PI * cfo_hz * (double)n / fs;
+			v *= std::complex<double>(std::cos(ph), std::sin(ph));
+		}
+		y[(size_t)n] = v;
+	}
+
+	// 4) Re-up-convert to real passband (modem baseband_to_passband convention:
+	//    out = re*cos(wc n) + im*sin(wc n)), scaled by the FIXED round-trip gain so
+	//    the AVERAGE faded power == the clean p_sig (per-block fades ride on top).
+	for (int n = 0; n < total; n++) {
+		double ph = 2.0 * M_PI * fc * (double)n / fs;
+		audio[(size_t)n] = mix_gain *
+			(y[(size_t)n].real() * std::cos(ph) + y[(size_t)n].imag() * std::sin(ph));
+	}
+}
+
+// Selected fading profile + CFO for the data-cliff sweep (set by env vars in the
+// P0 test). prof.delay_ms<0 => AWGN-only (channel inert, byte-identical to §3).
+static watterson_profile g_data_fade_prof = { "AWGN", -1.0, 0.0 };
+static double            g_data_fade_cfo  = 0.0;
+
 static void gf16ra_data_cliff_one(cl_telecom_system& ts, int K, int repfact) {
 	int N = gf16ra::configure_k(K, repfact);
 	double R = (double)K / N;
@@ -3723,18 +3915,61 @@ static void gf16ra_data_cliff_one(cl_telecom_system& ts, int K, int repfact) {
 			K, repfact, good, K, (good == K) ? " (genie offset VALID)" : "  <<< HARNESS BUG: offset/extraction wrong");
 	}
 
+	// §7 Watterson channel: fixed round-trip-gain calibration (once per cell; keeps
+	// per-frame fade power varying) + a faded-clean self-check (apply the channel
+	// with NO AWGN; the genie energies + Bessel-I0 must still survive a unit-power
+	// fade — guards a channel-math bug from masquerading as a code FAIL).
+	const bool fade_on = (g_data_fade_prof.delay_ms >= 0.0);
+	double mix_gain = 1.0;
+	if (fade_on) {
+		mix_gain = watterson_roundtrip_gain(ts, ref, active);
+		// faded-clean check: average decode quality over a few fade realizations at
+		// sigma=0 (no noise). Deep fades can still cost symbols, so report the rate.
+		std::mt19937 crng(0xFADEC0DEu + (unsigned)K * 131u + (unsigned)repfact);
+		int faded_ok = 0; const int FK = 5;
+		for (int f = 0; f < FK; f++) {
+			std::vector<double> fa = ref;   // clean signal, no AWGN
+			apply_watterson_passband(ts, fa, active, g_data_fade_prof, g_data_fade_cfo, mix_gain, crng);
+			int interpf = ts.data_container.interpolation_rate;
+			int decf = (int)fa.size() / interpf;
+			std::vector<std::complex<double> > bbf((size_t)decf + 16, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(fa.data(), (int)fa.size(), bbf.data(),
+				ts.sampling_frequency, ts.carrier_frequency + ts.last_coarse_freq_offset,
+				ts.carrier_amplitude, interpf, &ts.ofdm.FIR_rx_data);
+			std::vector<double> Ef((size_t)N * m.M);
+			ts.ofdm.decode_suffix_energies(bbf.data(), decf, 1, 4096 / interpf, 0, N,
+				m.tone_hop_step, m.M, m.nStreams, m.stream_offsets, Ef.data());
+			std::vector<int> rxf(K);
+			gf16ra::soft_decode_k(Ef.data(), 100, GF16RA_ESNO_METRIC, rxf.data());
+			bool aok = true; for (int s = 0; s < K; s++) if (rxf[s] != info[s]) { aok=false; break; }
+			if (aok) faded_ok++;
+		}
+		printf("    [data-cliff K=%d r=%d] FADING=%s delay=%.2fms doppler=%.2fHz cfo=%.1fHz | "
+			"mix_gain=%.4f | faded-clean self-check: %d/%d frames OK (no AWGN)\n",
+			K, repfact, g_data_fade_prof.name, g_data_fade_prof.delay_ms,
+			g_data_fade_prof.doppler_hz, g_data_fade_cfo, mix_gain, faded_ok, FK);
+	}
+
 	// SNR3k sweep — wide enough to bracket the cliff for R=1/2..1/4.
 	// MERCURY_P0_FINE=1 → fine grid (0.1-sigma steps in the R1/2 cliff band) +
 	// more trials, for a defensible P=0.5 crossing on the marginal R1/2 result.
+	// Fading moves the cliff to HIGHER SNR (smaller sigma), so the fading grid
+	// extends below sigma=2.0 (to ~0.7 = SNR ~+9 dB) to bracket deep-fade cliffs.
 	static const double sigmas_coarse[] = {2.0,2.4,2.8,3.2,3.6,4.0,4.4,4.8,5.2,5.6,6.0,6.6,7.2,8.0,9.0,10.0,11.0,12.0};
 	static const double sigmas_fine[]   = {2.8,3.0,3.1,3.2,3.3,3.4,3.5,3.6,3.7,3.8,3.9,4.0,4.2,4.4,4.8};
+	static const double sigmas_fade[]   = {0.7,0.9,1.1,1.3,1.5,1.8,2.1,2.5,2.9,3.3,3.8,4.4,5.2,6.2,7.5,9.0,11.0};
 	bool fine = (getenv("MERCURY_P0_FINE") != NULL);
-	const double* sigmas = fine ? sigmas_fine : sigmas_coarse;
-	const int NS = fine ? (int)(sizeof(sigmas_fine)/sizeof(sigmas_fine[0]))
-	                    : (int)(sizeof(sigmas_coarse)/sizeof(sigmas_coarse[0]));
-	const int NTR = fine ? 200 : 60;
-	printf("    [data-cliff K=%d r=%d N=%d R=%.3f bps(1s)=%.0f bps(2s)=%.0f frame=%.1fs]  (sigma : SNR3k_dB : P_frame : iter_mean)\n",
-		K, repfact, N, R, bps_1s, bps_2s, frame_ms_1s / 1000.0);
+	const double* sigmas = fade_on ? sigmas_fade : (fine ? sigmas_fine : sigmas_coarse);
+	const int NS = fade_on ? (int)(sizeof(sigmas_fade)/sizeof(sigmas_fade[0]))
+	             : (fine ? (int)(sizeof(sigmas_fine)/sizeof(sigmas_fine[0]))
+	                     : (int)(sizeof(sigmas_coarse)/sizeof(sigmas_coarse[0])));
+	// Fading needs more trials per cell (block-fade variance) — NTR=120 default.
+	// MERCURY_FADE_NTR overrides the fading trial count (fast first-pass cliffs).
+	int NTR = fade_on ? (fine ? 240 : 120) : (fine ? 200 : 60);
+	if (fade_on && getenv("MERCURY_FADE_NTR") != NULL) { int v = atoi(getenv("MERCURY_FADE_NTR")); if (v > 0) NTR = v; }
+	printf("    [data-cliff K=%d r=%d N=%d R=%.3f bps(1s)=%.0f bps(2s)=%.0f frame=%.1fs CH=%s]  (sigma : SNR3k_dB : P_frame : iter_mean)\n",
+		K, repfact, N, R, bps_1s, bps_2s, frame_ms_1s / 1000.0,
+		fade_on ? g_data_fade_prof.name : "AWGN");
 	double cliff_snr = 999.0;
 	double prev_snr = 999.0, prev_pf = -1.0, cross_snr = 999.0;
 	for (int si = 0; si < NS; si++) {
@@ -3746,6 +3981,10 @@ static void gf16ra_data_cliff_one(cl_telecom_system& ts, int K, int repfact) {
 			std::vector<int> tt(tx.begin(), tx.end());
 			int act = 0;
 			std::vector<double> audio = build_gf16ra_data_audio(ts, tt, act);
+			// §7 Watterson fading + CFO (in place) BEFORE AWGN — a fresh independent
+			// fade realization per trial (Monte-Carlo over the block-fade ensemble).
+			if (fade_on)
+				apply_watterson_passband(ts, audio, act, g_data_fade_prof, g_data_fade_cfo, mix_gain, rng);
 			std::normal_distribution<double> nd(0.0, sigma);
 			for (size_t i = 0; i < audio.size(); i++) audio[i] += nd(rng);
 
@@ -3782,7 +4021,7 @@ static void gf16ra_data_cliff_one(cl_telecom_system& ts, int K, int repfact) {
 		double pf = (double)ok / NTR;
 		double snr = snr3k_db(p_sig, sigma, fs);
 		double itm = (it_cnt > 0) ? (double)it_sum / it_cnt : -1.0;
-		printf("      %.3f : %7.2f : %.3f : %.1f\n", sigma, snr, pf, itm);
+		printf("      %.3f : %7.2f : %.3f : %.1f\n", sigma, snr, pf, itm); fflush(stdout);
 		if (pf >= 0.5 && snr < cliff_snr) cliff_snr = snr;  // deepest (most negative) SNR with P>=0.5
 		// linear-interpolated P=0.5 crossing between this cell (pf<0.5) and the
 		// previous deeper-or-shallower bracketing cell (pf>=0.5). sigma rises =>
@@ -3793,12 +4032,27 @@ static void gf16ra_data_cliff_one(cl_telecom_system& ts, int K, int repfact) {
 		}
 		prev_snr = snr; prev_pf = pf;
 	}
+	// Genie-AWGN baseline for THIS (K,repfact) cell (§3 measured cliffs) — the
+	// fading penalty is reported against it. K=200: R1/2=-10.12, R1/3=-10.84,
+	// R1/4=-13.34; K=13 R1/2=-11.91; K=400 R1/2=-9.77 (fact-doc §3).
+	double genie = 999.0;
+	if (K == 13  && repfact == 1) genie = -11.91;
+	else if (K == 200 && repfact == 1) genie = -10.12;
+	else if (K == 200 && repfact == 2) genie = -10.84;
+	else if (K == 200 && repfact == 3) genie = -13.34;
+	else if (K == 400 && repfact == 1) genie = -9.77;
 	if (cliff_snr < 900.0) {
 		double rep = (cross_snr < 900.0) ? cross_snr : cliff_snr;
-		printf("    [data-cliff K=%d r=%d] CLIFF(interp P=0.5) SNR3k=%.2f dB (deepest-cell>=0.5 %.2f) | net bps 1-stream=%.0f / 2-stream=%.0f | vs -10 target: %+.2f dB | vs suffix R1/2(-11.75): %+.2f dB\n",
-			K, repfact, rep, cliff_snr, bps_1s, bps_2s, rep - (-10.0), rep - (-11.75));
+		if (fade_on && genie < 900.0)
+			printf("    [data-cliff K=%d r=%d CH=%s] CLIFF(interp P=0.5) SNR3k=%.2f dB (deepest-cell>=0.5 %.2f) | net bps 1-str=%.0f / 2-str=%.0f | vs -10: %+.2f dB | FADING PENALTY vs genie(%.2f): %+.2f dB\n",
+				K, repfact, g_data_fade_prof.name, rep, cliff_snr, bps_1s, bps_2s, rep - (-10.0), genie, rep - genie);
+		else
+			printf("    [data-cliff K=%d r=%d CH=%s] CLIFF(interp P=0.5) SNR3k=%.2f dB (deepest-cell>=0.5 %.2f) | net bps 1-stream=%.0f / 2-stream=%.0f | vs -10 target: %+.2f dB | vs suffix R1/2(-11.75): %+.2f dB\n",
+				K, repfact, fade_on?g_data_fade_prof.name:"AWGN", rep, cliff_snr, bps_1s, bps_2s, rep - (-10.0), rep - (-11.75));
 	} else {
-		printf("    [data-cliff K=%d r=%d] NO CLIFF in swept range (P_frame<0.5 everywhere)\n", K, repfact);
+		printf("    [data-cliff K=%d r=%d CH=%s] NO CLIFF in swept range (P_frame<0.5 everywhere)%s\n",
+			K, repfact, fade_on?g_data_fade_prof.name:"AWGN",
+			fade_on ? "  <-- fading killed this rate even at the highest swept SNR" : "");
 	}
 }
 
@@ -3815,6 +4069,48 @@ static void test_gf16_ra_data_length_cliff_sweep() {
 		ts.ack_mfsk.M, ts.ack_mfsk.nStreams, ts.data_container.Nofdm,
 		ts.frequency_interpolation_rate, gf16ra_data_sym_ms(ts));
 	bool fine = (getenv("MERCURY_P0_FINE") != NULL);
+
+	// §7 FADING/CFO MAKE-OR-BREAK MODE: MERCURY_FADE = MPG|MPM|MPP|ALL selects the
+	// Watterson profile(s); MERCURY_CFO = residual carrier offset Hz (default 0).
+	// In this mode we sweep the DECISION rates (R1/3, R1/4 at K=200 — the rates that
+	// clear -10 on genie AWGN) under fading instead of the full AWGN K-grid.
+	const char* fenv = getenv("MERCURY_FADE");
+	if (fenv != NULL) {
+		g_data_fade_cfo = (getenv("MERCURY_CFO") != NULL) ? atof(getenv("MERCURY_CFO")) : 0.0;
+		// Task profiles (HARDER than canonical F.1487 good/moderate on Doppler;
+		// MPP == canonical poor == codec2 --mpp): MPG 0.5ms/0.5Hz, MPM 1ms/1Hz,
+		// MPP 2ms/1Hz. Canonical F.1487 (milder) cross-checks via MERCURY_FADE=MPGc etc.
+		watterson_profile profs[8]; int np = 0;
+		auto add = [&](const char* nm, double dms, double dhz){ profs[np].name=nm; profs[np].delay_ms=dms; profs[np].doppler_hz=dhz; np++; };
+		if (!strcmp(fenv,"MPG")  || !strcmp(fenv,"ALL")) add("MPG", 0.5, 0.5);
+		if (!strcmp(fenv,"MPM")  || !strcmp(fenv,"ALL")) add("MPM", 1.0, 1.0);
+		if (!strcmp(fenv,"MPP")  || !strcmp(fenv,"ALL")) add("MPP", 2.0, 1.0);
+		if (!strcmp(fenv,"MPGc")) add("MPGc",0.5, 0.1);   // canonical F.1487 good
+		if (!strcmp(fenv,"MPMc")) add("MPMc",1.0, 0.5);   // canonical F.1487 moderate
+		if (!strcmp(fenv,"MPD"))  add("MPD", 4.0, 2.0);   // codec2 'disturbed' (harsher)
+		if (np == 0) { printf("    MERCURY_FADE=%s unrecognized (use MPG|MPM|MPP|ALL|MPGc|MPMc|MPD)\n", fenv); test_pass(name); return; }
+		printf("    === §7 FADING/CFO MAKE-OR-BREAK: %d profile(s), CFO=%.1f Hz, decision rates R1/3 + R1/4 @ K=200 ===\n", np, g_data_fade_cfo);
+		printf("    Genie-AWGN baselines (§3): R1/3=-10.84 dB (52/103 bps), R1/4=-13.34 dB (39/77 bps). VARA -10 multipath: MPG 324 / MPM 383 / MPP 439 client B/min.\n");
+		for (int p = 0; p < np; p++) {
+			g_data_fade_prof = profs[p];
+			printf("    --- profile %s (delay %.2f ms, Doppler %.2f Hz [2-sigma], CFO %.1f Hz) ---\n",
+				profs[p].name, profs[p].delay_ms, profs[p].doppler_hz, g_data_fade_cfo);
+			// MERCURY_FADE_RATE = 2 (R1/3 only) | 3 (R1/4 only) | unset (both).
+			const char* rsel = getenv("MERCURY_FADE_RATE");
+			bool do_r2 = (rsel == NULL) || !strcmp(rsel, "2");
+			bool do_r3 = (rsel == NULL) || !strcmp(rsel, "3");
+			if (do_r2) gf16ra_data_cliff_one(ts, 200, 2);   // R1/3, N=600
+			if (do_r3) gf16ra_data_cliff_one(ts, 200, 3);   // R1/4, N=800
+			// Optional: also R1/2 (the aggressive rate) when MERCURY_FADE_R12 set.
+			if (getenv("MERCURY_FADE_R12") != NULL) gf16ra_data_cliff_one(ts, 200, 1);
+		}
+		g_data_fade_prof.name = "AWGN"; g_data_fade_prof.delay_ms = -1.0; g_data_fade_prof.doppler_hz = 0.0;  // restore
+		g_data_fade_cfo = 0.0;
+		gf16ra::configure(2);
+		test_pass(name);
+		return;
+	}
+
 	printf("    --- transfer cross-check: K=13 R=1/2 on THIS genie axis (suffix §8.4 FEC-reach = -11.75) ---\n");
 	gf16ra_data_cliff_one(ts, 13, 1);
 	printf("    --- DATA length K=200 (= 800 info bits, the ROBUST_3 payload), R=1/2%s ---\n", fine?"":", 1/3, 1/4");
@@ -5147,6 +5443,18 @@ int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
 	printf("=== MFSK ctrl-suffix codec tests (Phase B Wave 1 + Wave 2 v2 + Wave 3) ===\n");
+
+	// §7 FADING/CFO fast path: when MERCURY_FADE is set, run ONLY the data-length
+	// cliff sweep (it self-routes into the Watterson fading branch) and skip the
+	// ~50 ctrl tests + the other heavy MEASURE sweeps (production-path 4000-trial
+	// FAR, HAIL, metric-gate, combining) that dominate runtime and are irrelevant
+	// to the fading make-or-break. SIM-only instrument; no behavior change at the
+	// default `--test` (MERCURY_FADE unset → full suite runs as before).
+	if (getenv("MERCURY_FADE") != NULL) {
+		test_gf16_ra_data_length_cliff_sweep();
+		printf("=== FADING-ONLY run: %d passed, %d failed ===\n", g_passes, g_failures);
+		return g_failures;
+	}
 
 	// §1 codec primitives
 	test_pack_unpack_callsign_body_b36();
