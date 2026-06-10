@@ -777,3 +777,64 @@ SAME `receive_bigblock` + carve + whiten the production HW path uses, so a sim p
 
 (Fix branch `fix/bigblock-whiten-align` off `integ/bigblock-final-2026-06-05`@`c746064`. Net-PHY
 UNCHANGED — buffer-lifetime + RX-wait + FIFO-delivery, not geometry; > VARA 7050 preserved.)
+
+## §17. D1 — TIMING-FAITHFUL big-block SFO repro: SFO is NOT the HW cw1..cw7 corruption (2026-06-06)
+
+On `fix/bigblock-multicw-dewhiten`@`6e08f2e` (block-span RX window clamp shipped) the big-block
+FULLY ENGAGES on HW (climb→CFG16, BIGBLOCK-ELECT, 12-13x carve K=8), but cw0 delivers byte-correct
+(wire_bsi=5, used_hdr=1) while **cw1..cw7 are CORRUPT → per-cw CRC demotes → every block PARTIAL
+clean=0 → 0/1200 byte-faithful (recv=113 = cw0 head only), DETERMINISTIC**. The in-process
+`test_bigblock_multicw` ARM-A reports first_block clean=8/8, rx=1200/1200, bytes_ok=1 (§9/F1: the
+in-proc sim bypasses Schmidl-Cox timing acquisition, so SFO/timing drift is invisible to it).
+
+**HYPOTHESIS tested**: cw0 sits at the block start (fresh acquisition + preamble channel estimate)
+and decodes clean; cw1..cw7 are progressively deeper into the ~74-symbol single-acquisition block
+where SFO accumulates + the channel estimate goes stale, corrupting the later codewords on a real
+channel. The design DEMOTED a separate CPE/PEG (common-phase + SFO-slope) tracker, betting the
+per-symbol continual-pilot estimate ABSORBS SFO across the block.
+
+**Harness (built, `scratch/d1-sfo-repro`@`0fcab7d`, off `6e08f2e`)**: `bigblock_sfo_test()`, entry
+`-m PLOT_PASSBAND -s 16` env `MERCURY_BIGBLOCK_SFO_TEST=1`. TX a FULL K=8 CFG16 big-block via the
+SHARED `bigblock_tx_passband` worker, drift the WHOLE contiguous capture buffer (lead silence +
+block) through ONE stateful `cl_sim_sfo` (Farrow fractional resampler, sim_channel.h), optional
+AWGN, decode via the REAL `bigblock_rx_passband` (ONE acquisition + MF-snap + pilot-EVM fine-timing
++ CPE/PEG track + sparse-2D/flat-ML continual-pilot estimate + CSI-LLR + per-cw LDPC + per-cw
+known-payload gate). This is the timing-faithful complement the in-proc sim cannot be: it runs the
+SAME production PHY worker the live/HW path runs, on a window that DOES span the whole block (so
+the live `frames_to_read` arming bug is bypassed) — the ONLY new impairment vs the in-proc sim is
+genuine SFO timing drift. Block geom (printed): cfg16 K=8, ldpc.N=1600/K=1400, block_samples=79360,
+interp=4, Nofdm=310, Nsymb=9 → ~256-symbol contiguous block on one clock.
+
+**RESULT (clean channel; per-cw clean/8, gradual onset pinned):**
+| ppm | 0 | 25 | 50 | 90 | 100..140 | 150 | 200 | 300 | 400+ |
+|-----|---|----|----|----|----------|-----|-----|-----|------|
+| clean/8 | 8 | 8 | 8 | 8 | 8 | 7 (cw7) | 5 (cw5-7) | 2 (cw2-7) | 0 |
+
+- The degradation is GRADUAL, tail-FIRST (cw7 breaks first, onset walks toward the head as ppm
+  rises), monotone in ppm, deterministic, seed-invariant (static-bias SFO draws no rng).
+- **First corruption at ~150 ppm; 8/8 clean through 140 ppm.** The HW-measured differential
+  Fe-Pi crystal band is ~50-90 ppm — sitting in the all-clean region with ~60 ppm of margin.
+- AWGN at a clean-cell 25 dB Es/N0: IDENTICAL to noiseless (8/8 to 90, cw7 at 150). At a marginal
+  18 dB the decode goes RANDOM-scattered across codewords (no tail-first, no cw0-clean structure,
+  acq_metric 0.91-0.93) — a 32-QAM/0.875 AWGN-floor effect, not the HW signature.
+- `walk_ppm` with a large clamp drives the bias far past the static value within the buffer and
+  collapses even the head acquisition (acq_metric→0.23, 0/8) — an acquisition failure, not a tail
+  effect; the static-bias model (holds acquisition) is the right model for this question.
+
+**VERDICT — the SFO/staleness mechanism is REAL but does NOT explain the HW failure at the HW
+operating point.** (1) At 50-90 ppm (the HW band) the PHY worker decodes the FULL block 8/8
+byte-correct — the design bet that the continual-pilot estimate absorbs SFO across the block HOLDS
+to ~140 ppm. (2) SFO drift NEVER produces the HW cw0-clean/cw1..cw7-ALL-corrupt signature: it is
+tail-first and partial (7/8, 5/8, 2/8), and only reaches "everything dead" at 300-400+ ppm (where
+cw0 ALSO dies — never cw0-only). (3) ppm=0 clean = 8/8 here too (matches the in-proc sim) →
+**the corruption is NOT in `bigblock_rx_passband` at HW conditions.** The HW recv=113=cw0-only
+deterministic defect therefore lives DOWNSTREAM of the PHY worker on the LIVE path (capture-window
+arming / block-span / carve / whiten / per-cw CRC plumbing — i.e. the `6e08f2e` block-span clamp
+did not fully take on HW, or a sibling live-path bug in that chain remains), NOT in PHY timing
+acquisition or channel-tracking. Next: instrument the LIVE receive_bigblock capture window + carve
+on HW (recv=113 vs the 1200-byte block; does `frames_to_read`/`bigblock_rx_block_nsymb` actually
+span all ~256 symbols at decode time on the live ring), per `data-flow-bigblock-arq-unit.md`.
+
+(Scratch/diagnostic harness only — default-off, no production path change. `scratch/d1-sfo-repro`
+off `fix/bigblock-multicw-dewhiten`@`6e08f2e`. cl_sim_sfo + sfo harness lineage already ancestral
+at `6e08f2e` via `2a7a55c` — no cherry-pick needed.)
