@@ -85,6 +85,18 @@ cl_telecom_system::cl_telecom_system()
 	// byte-identical per-frame path. Not wired into the gearshift (that is P4).
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_FRAMING");
 	  if(e && *e && atoi(e) != 0) bigblock_framing_enabled = true; }
+	// CHASE COMBINING (I2+): env-gated default-OFF. CHASE=1 arms the failed-LLR
+	// capture (and, in later increments, the combine consumer). UNSET = byte-identical
+	// production path — chase_capture_failed_llr early-returns and the ring is never
+	// touched. The --test-chase-* harnesses arm it explicitly regardless of env.
+	chase_enabled = false;
+	{ const char* e = std::getenv("CHASE");
+	  if(e && *e && atoi(e) != 0) chase_enabled = true; }
+	chase_buf_head = 0;
+	chase_frame_counter = 0;
+	chase_capture_count = 0;
+	chase_test_wrong_llr = nullptr;       // TEST-ONLY F1 producer; default OFF
+	chase_buffer_void();
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -895,6 +907,45 @@ int cl_telecom_system::chase_combine_decode(const float* llr_a, const float* llr
 	return ldpc.decode(tmp, hd_out);
 }
 
+// ===== CHASE COMBINING — I2 failed-LLR snapshot ring ========================
+// chase_buffer_void: mark every ring entry empty. Used by the ctor, the test, and
+// (later) the I3 config-change / I6 BREAK invalidation hooks.
+void cl_telecom_system::chase_buffer_void()
+{
+	for(int i = 0; i < CHASE_DEPTH; i++)
+	{
+		chase_llr_buffer[i].valid = false;
+		chase_llr_buffer[i].config = CONFIG_NONE;
+		chase_llr_buffer[i].batch_seq_guess = -1;
+		chase_llr_buffer[i].slot_guess = -1;
+		chase_llr_buffer[i].n = 0;
+		chase_llr_buffer[i].age_frames = 0;
+	}
+	chase_buf_head = 0;
+}
+
+// chase_capture_failed_llr: snapshot a FAILED codeword's LLR vector into the LRU
+// ring, tagged with the active config (batch_seq/slot left -1 — the identity wall;
+// set later by the I3+ consumer once a sibling frame in the batch decodes). No-op
+// when chase_enabled is false (the default) — production is byte-identical. This is
+// a PURE read of `llr` + a memcpy; it NEVER mutates receive_stats or `out`.
+void cl_telecom_system::chase_capture_failed_llr(const float* llr, int n, int config)
+{
+	if(!chase_enabled) return;            // default-OFF: byte-identical production
+	if(n <= 0 || n > N_MAX) return;       // guard
+	int slot = chase_buf_head;
+	st_chase_candidate& e = chase_llr_buffer[slot];
+	memcpy(e.llr, llr, n * sizeof(float));
+	e.n = n;
+	e.config = config;
+	e.batch_seq_guess = -1;               // identity wall — set later (F2)
+	e.slot_guess = -1;
+	e.age_frames = chase_frame_counter++;
+	e.valid = true;
+	chase_capture_count++;
+	chase_buf_head = (chase_buf_head + 1) % CHASE_DEPTH;   // LRU overwrite oldest
+}
+
 // Score a combined decode exactly as the production RX path scores a single look
 // (telecom_system.cc:3498-3526): descramble (energy-dispersal), byte-pack, CRC16
 // self-check; additionally byte-compare the recovered info bytes against the known
@@ -1082,6 +1133,186 @@ int cl_telecom_system::chase_ber_test(int cfg, int frames, float esn0_lo,
 	}
 	watterson_test_enabled = false;
 	return overall_rc;
+}
+
+// ===== CHASE COMBINING — I2 failed-LLR snapshot ring test ==================
+// Proves the capture fires on BOTH failure KINDS (iter-cap AND CRC16
+// converged-wrong-codeword, red-team F1), tags correctly, stores the bit-identical
+// LLR vector, and is a strict NO-OP on a successful decode. Returns 0 PASS.
+int cl_telecom_system::chase_buffer_test(int cfg)
+{
+	load_configuration(cfg);
+	awgn_channel.set_seed(20260609);
+	chase_enabled = true;            // ARM the capture for the test (env-independent)
+
+	int nReal_data = data_container.nBits - ldpc.P;
+	int n_llr = ldpc.N;
+	int delay = (data_container.Nfft == 1024) ? 100 : 50;
+	int nSamp = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb))
+	            * frequency_interpolation_rate;
+	int forced_delay = ((data_container.preamble_nSymb + 2) * data_container.Nofdm + delay)
+	                   * frequency_interpolation_rate;
+	int rxbuf_sz = 2 * data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+
+	std::vector<double> clean(nSamp);
+	std::vector<int> hd(N_MAX);
+	int fails = 0;
+
+	printf("# CHASE I2 buffer test — config %d (M=%d, n_llr=%d)\n", cfg, (int)M, n_llr);
+
+	// helper: TX a fresh known codeword into passband_data, return the # of fails seen
+	auto tx_one = [&]() {
+		for(int i = 0; i < nReal_data - outer_code_reserved_bits; i++)
+			data_container.data_bit[i] = ts_random() % 2;
+		bit_to_byte(data_container.data_bit, data_container.data_byte,
+		            nReal_data - outer_code_reserved_bits);
+		transmit_byte(data_container.data_byte,
+		              (nReal_data - outer_code_reserved_bits) / 8,
+		              data_container.passband_data, SINGLE_MESSAGE);
+	};
+	// helper: run one look (clean+optional fsel+AWGN) → receive_byte. Returns the stats.
+	auto run_look = [&](float sigma, int fsel_d) -> st_receive_stats {
+		memcpy(clean.data(), data_container.passband_data, nSamp * sizeof(double));
+		if(fsel_d > 0)
+			for(int nn = nSamp - 1; nn >= fsel_d; nn--)
+				clean[nn] += 0.85f * clean[nn - fsel_d];
+		memset(data_container.passband_delayed_data, 0, rxbuf_sz * sizeof(double));
+		awgn_channel.apply_with_delay(clean.data(), data_container.passband_delayed_data,
+		                              sigma, nSamp, forced_delay);
+		ofdm_forced_delay = forced_delay;
+		st_receive_stats rs = receive_byte(data_container.passband_delayed_data, hd.data());
+		ofdm_forced_delay = -1;
+		return rs;
+	};
+
+	// ---- ASSERTION 1: a FAILED non-all-zeros decode is captured, tagged, content-valid ----
+	// A capture fires at the ORIGINAL-delay fail (subpeak_recover_phase==0), so we detect
+	// it via the chase_capture_count delta (robust to the subpeak ±1-symbol recovery probe
+	// re-decoding the frame at a shifted delay). After each look, if a decode-reaching fail
+	// occurred, exactly one capture must have fired; the newest entry must be tagged with
+	// the active config and hold a non-trivial LLR vector.
+	chase_buffer_void();
+	int captured_itercap = 0, captured_converged = 0;
+	bool tag_ok = true, vec_ok = true;
+
+	// --- ARM A: iter-cap fails (deep AWGN) ---
+	for(int band = 0; band < 3; band++)
+	{
+		float esn0 = 6.0f + band * 2.0f;        // 6, 8, 10 dB → iter-cap fails
+		float sigma = 1.0f / sqrtf(powf(10.0f, esn0 / 10.0f));
+		for(int f = 0; f < 8; f++)
+		{
+			tx_one();
+			uint64_t cap_before = chase_capture_count;
+			st_receive_stats rs = run_look(sigma, 0);
+			if(rs.message_decoded == NO && rs.all_zeros == NO && rs.iterations_done >= 1)
+			{
+				fails++;
+				if(chase_capture_count == cap_before) { vec_ok = false; continue; } // no capture
+				int slot = (chase_buf_head - 1 + CHASE_DEPTH) % CHASE_DEPTH;
+				st_chase_candidate& e = chase_llr_buffer[slot];
+				if(!e.valid || e.config != current_configuration || e.n != n_llr) tag_ok = false;
+				// captured vector must be non-trivial (real soft info, not zeros)
+				bool nonzero = false;
+				for(int i = 0; i < e.n; i++) if(e.llr[i] != 0.0f) { nonzero = true; break; }
+				if(!nonzero) vec_ok = false;
+				bool itercap = (rs.iterations_done > (ldpc.nIteration_max - 1));
+				if(itercap) captured_itercap++; else captured_converged++;
+			}
+		}
+	}
+
+	// --- ARM B (red-team F1): CONVERGED-WRONG-codeword fails (iter<cap, crc!=0) ---
+	// Empirically the CFG15 rate-0.875 SPA decoder almost never converges to a wrong
+	// codeword on AWGN/Watterson — it EXHAUSTS the iter cap (all observed fails iter=101).
+	// So we CONSTRUCT a deterministic converged-wrong input: encode a frame whose info
+	// bits carry a DELIBERATELY-WRONG CRC into a strong-LLR vector in the decoder's input
+	// layout. The decoder converges (iter~1) to this LDPC-valid-but-CRC-broken codeword →
+	// crc!=0, iter<cap → a genuine converged-wrong fail through the REAL receive_byte path.
+	// The OLD (broken) iter-cap-only capture predicate would SKIP these; the F1 fix
+	// (capture on all_zeros==NO, the FULL fail condition) captures them. This arm FAILS
+	// BEFORE the F1 fix.
+	int nVirtual_data = ldpc.N - data_container.nBits;
+	std::vector<float> wrong_llr(ldpc.N);
+	{
+		// build info bits = [random data | WRONG crc] so the descrambled frame fails CRC
+		int frame_size = (nReal_data - outer_code_reserved_bits) / 8;
+		std::vector<int> info_bits(nReal_data, 0);
+		std::vector<int> info_bytes(frame_size, 0);
+		for(int i = 0; i < frame_size; i++) info_bytes[i] = ts_random() % 256;
+		// correct CRC, then corrupt it so the frame is LDPC-valid but CRC-broken
+		uint16_t crc = CRC16_MODBUS_RTU_calc(info_bytes.data(), frame_size);
+		crc ^= 0x5A5A;                       // guarantee a wrong CRC
+		int lsB = crc & 0xff, msB = (crc >> 8) & 0xff;
+		byte_to_bit(info_bytes.data(), info_bits.data(), frame_size);
+		byte_to_bit(&lsB, &info_bits[frame_size*8], 1);
+		byte_to_bit(&msB, &info_bits[(frame_size+1)*8], 1);
+		// replicate the TX/RX codeword layout exactly (energy-dispersal + ldpc.encode +
+		// parity shuffle + virtual expansion), then map each bit b → LLR (b?-40:+40)
+		// (SPA hard-decision: LLR<0 => bit 1).
+		std::vector<int> scrambled(ldpc.N, 0), enc(ldpc.N, 0);
+		bit_energy_dispersal(info_bits.data(), data_container.bit_energy_dispersal_sequence,
+		                     scrambled.data(), nReal_data);
+		for(int i = 0; i < nVirtual_data; i++) scrambled[nReal_data+i] = scrambled[i];
+		ldpc.encode(scrambled.data(), enc.data());
+		for(int i = 0; i < ldpc.P; i++) enc[nReal_data+i] = enc[i+ldpc.K];
+		for(int i = 0; i < ldpc.N; i++) wrong_llr[i] = enc[i] ? -40.0f : 40.0f;
+	}
+	chase_test_wrong_llr = wrong_llr.data();   // overwrite pre-decode LLRs → converge wrong
+	for(int f = 0; f < 5; f++)
+	{
+		tx_one();
+		uint64_t cap_before = chase_capture_count;
+		float sigma = 1.0f / sqrtf(powf(10.0f, 22.0f / 10.0f));   // CLEAN otherwise → decode reaches
+		st_receive_stats rs = run_look(sigma, 0);
+		if(getenv("CHASE_DBG")) fprintf(stderr,"[ARMB] iter=%d crc=0x%04X zeros=%d decoded=%d\n", rs.iterations_done, rs.crc, rs.all_zeros, rs.message_decoded);
+		// CONVERGED-WRONG: decoder satisfied parity (iter 0..cap-1, NOT the iter cap)
+		// but the descrambled frame fails CRC (crc!=0). iter==0 = converged immediately.
+		if(rs.message_decoded == NO && rs.all_zeros == NO && rs.crc != 0
+		   && rs.iterations_done >= 0
+		   && rs.iterations_done <= (ldpc.nIteration_max - 1))   // CONVERGED, not iter-cap
+		{
+			fails++;
+			if(chase_capture_count == cap_before) { vec_ok = false; continue; }
+			captured_converged++;
+			int slot = (chase_buf_head - 1 + CHASE_DEPTH) % CHASE_DEPTH;
+			st_chase_candidate& e = chase_llr_buffer[slot];
+			if(!e.valid || e.config != current_configuration || e.n != n_llr) tag_ok = false;
+		}
+	}
+	chase_test_wrong_llr = nullptr;       // restore
+
+	printf("# fails=%d captured_itercap=%d captured_converged=%d tag_ok=%d vec_ok=%d total_captures=%llu\n",
+	       fails, captured_itercap, captured_converged, (int)tag_ok, (int)vec_ok,
+	       (unsigned long long)chase_capture_count);
+
+	// ---- ASSERTION 2: a SUCCESSFUL decode leaves the ring UNTOUCHED (no-op) ----
+	chase_buffer_void();
+	int head_clean = chase_buf_head;
+	int success = 0;
+	for(int f = 0; f < 12 && success < 1; f++)
+	{
+		tx_one();
+		float sigma = 1.0f / sqrtf(powf(10.0f, 22.0f / 10.0f));   // clean → decode OK
+		st_receive_stats rs = run_look(sigma, 0);
+		if(rs.message_decoded == YES) success++;
+	}
+	bool noop_ok = (chase_buf_head == head_clean);
+	for(int i = 0; i < CHASE_DEPTH; i++) if(chase_llr_buffer[i].valid) noop_ok = false;
+	printf("# success_decodes=%d ring_untouched=%d\n", success, (int)noop_ok);
+
+	// ---- VERDICT ----
+	// G-NOOP: ring untouched on success.
+	// F1: BOTH fail kinds captured (iter-cap AND converged-wrong-codeword), proving
+	//     the predicate is the FULL fail condition, not iter-cap-only.
+	bool pass = tag_ok && vec_ok && noop_ok && success >= 1
+	            && captured_itercap >= 1 && captured_converged >= 1;
+	printf("# I2 VERDICT: tag_ok=%d vec_ok=%d noop_ok=%d itercap>=1=%d converged>=1=%d => %s\n",
+	       (int)tag_ok, (int)vec_ok, (int)noop_ok,
+	       (int)(captured_itercap >= 1), (int)(captured_converged >= 1),
+	       pass ? "PASS" : "FAIL");
+	fflush(stdout);
+	return pass ? 0 : 1;
 }
 
 int cl_telecom_system::get_frame_size_bytes()
@@ -3524,6 +3755,18 @@ skip_h_retry_point:
 				data_container.deinterleaved_data[nReal_data+i]=data_container.deinterleaved_data[i];
 			}
 
+			// CHASE I2 TEST HOOK (F1 producer): when chase_test_wrong_llr is set (only by
+			// --test-chase-buffer ARM B), overwrite the pre-decode LLR vector with the
+			// strong-LLR encoding of an LDPC-valid-but-CRC-broken codeword, so the decoder
+			// converges (iter~0) to a WRONG codeword (crc!=0, iter<cap) — the deterministic
+			// converged-wrong-codeword case the F1 capture predicate must catch. Default
+			// null = production no-op.
+			if(chase_test_wrong_llr != nullptr)
+			{
+				memcpy(data_container.deinterleaved_data, chase_test_wrong_llr,
+				       ldpc.N * sizeof(float));
+			}
+
 			auto t4_ldpc = std::chrono::steady_clock::now();
 			receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit);
 			auto t5_ldpc = std::chrono::steady_clock::now();
@@ -3565,6 +3808,35 @@ skip_h_retry_point:
 			{
 				receive_stats.SNR=-99.9;
 				receive_stats.message_decoded=NO;
+				// CHASE I2: capture the failed look's LLR vector — the ORIGINAL-delay
+				// decode (subpeak_recover_phase == 0), captured ONCE per physical frame
+				// BEFORE the subpeak ±1-symbol recovery probe diverts via `goto`. This is
+				// the genuine retx-combinable look: deinterleaved_data here is the exact
+				// float vector handed to ldpc.decode at :3703. Capturing at phase 0
+				// (not after the subpeak ladder) is correct AND avoids both the
+				// double-buffer hazard (one capture/frame) and the SUBPEAK-REJECT
+				// early-`continue` that bypasses the bottom of the branch. Captured on
+				// ANY non-all-zeros fail — INCLUDING the CRC16 converged-wrong-codeword
+				// fail (crc!=0, iter<cap; red-team F1), the CFG15/16 primary target.
+				// No-op unless chase_enabled (env CHASE=1); production byte-identical.
+				// CHASE I2 capture — guarded by chase_enabled so production (CHASE unset)
+				// is byte-identical (no env read, no buffer touch).
+				if(M != MOD_MFSK && chase_enabled && subpeak_recover_phase == 0)
+				{
+					// FAIL-BEFORE PROOF HOOK: CHASE_OLDPRED=1 restores the BROKEN
+					// iter-cap-only capture predicate (red-team F1's original), which SKIPS
+					// the converged-wrong-codeword fail → --test-chase-buffer ARM B = 0
+					// captures and FAILS. Default = the correct FULL-fail predicate. The
+					// getenv lives INSIDE the chase_enabled guard so production never reads it.
+					bool chase_oldpred = false;
+					{ const char* e = std::getenv("CHASE_OLDPRED"); if(e && *e && atoi(e)) chase_oldpred = true; }
+					bool chase_cap_pred = chase_oldpred
+						? (receive_stats.iterations_done > (ldpc.nIteration_max - 1))  // BROKEN iter-cap-only
+						: (receive_stats.all_zeros == NO);                             // CORRECT full-fail (F1)
+					if(chase_cap_pred)
+						chase_capture_failed_llr(data_container.deinterleaved_data,
+						                         ldpc.N, current_configuration);
+				}
 				if(M != MOD_MFSK)
 				{
 					// Always log OFDM decode failures — needed for HF diagnostics

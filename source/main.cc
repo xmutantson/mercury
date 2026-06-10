@@ -483,6 +483,22 @@ int main(int argc, char *argv[])
             printf("[FLAG] --test-chase-ber complete (rc=%d, 0=PASS) — exiting.\n", rc);
             return rc;
         }
+
+        // --test-chase-buffer[=<cfg>] : CHASE COMBINING I2 — failed-LLR snapshot
+        // ring. Drives failing + successful receive_byte calls and asserts the
+        // capture fires on BOTH fail kinds (iter-cap AND CRC16 converged-wrong-
+        // codeword, red-team F1), tags == active config, stores the bit-identical
+        // LLR vector, and is a strict NO-OP on a successful decode. Test-only;
+        // production capture is env-gated default-OFF (env CHASE=1). Returns rc.
+        if (strncmp(argv[i], "--test-chase-buffer", 19) == 0) {
+            int cfg = CONFIG_15;
+            const char* eq = strchr(argv[i], '=');
+            if (eq && *(eq + 1)) cfg = atoi(eq + 1);
+            cl_telecom_system ts;
+            int rc = ts.chase_buffer_test(cfg);
+            printf("[FLAG] --test-chase-buffer complete (rc=%d, 0=PASS) — exiting.\n", rc);
+            return rc;
+        }
     }
 
     int cpu_nr = -1;

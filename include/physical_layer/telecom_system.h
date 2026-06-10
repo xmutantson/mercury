@@ -386,6 +386,49 @@ public:
 	// Invoked by main.cc --test-chase-ber; returns 0 PASS, nonzero FAIL.
 	int    chase_ber_test(int cfg, int frames, float esn0_lo, float esn0_hi,
 	                      float esn0_step, float C_post, int fsel_mode);
+	// ---- CHASE COMBINING — I2 failed-LLR snapshot ring (no consumer yet) ------
+	// Design §3.3 / audit §0.2 (F2-corrected struct: NO crypto_batch_counter — that
+	// field is dead; the per-frame crypto identity is the decoded batch_seq_id, set
+	// later once a sibling frame decodes). One entry buffers the float LLR vector of
+	// a FAILED OFDM codeword (the exact vector handed to ldpc.decode at :3528).
+	struct st_chase_candidate {
+		float    llr[N_MAX];        // the deinterleaved_data fed to ldpc.decode (len = n)
+		int      n;                 // valid LLR length = ldpc.N at capture
+		int      config;            // current_configuration at capture
+		int      batch_seq_guess;   // -1 = unknown (set later; F2 per-frame identity)
+		int      slot_guess;        // -1 = unknown (identity wall; option c)
+		uint64_t age_frames;        // capture frame index, for LRU/staleness (F3 wrap)
+		bool     valid;             // occupied + summable
+	};
+	static const int CHASE_DEPTH = 32;   // == MAX_SACK_BATCH_SIZE; 32 * ~6.4 KB ≈ 205 KB
+	st_chase_candidate chase_llr_buffer[CHASE_DEPTH];
+	int      chase_buf_head;             // next write slot (LRU ring)
+	uint64_t chase_frame_counter;        // monotone capture-frame index for age_frames
+	bool     chase_enabled;              // env CHASE=1; default OFF (byte-identical when unset)
+	uint64_t chase_capture_count;        // diagnostic: total captures fired (test/instrumentation)
+	const float* chase_test_wrong_llr;   // TEST-ONLY (F1 producer): non-null = overwrite the
+	                                     // pre-decode deinterleaved_data with this strong-LLR
+	                                     // vector of a DIFFERENT valid codeword, so the decoder
+	                                     // converges (iter~1) to a WRONG codeword (crc!=0,
+	                                     // iter<cap) — the deterministic F1 converged-wrong
+	                                     // case. Length = ldpc.N. Default null (no-op).
+	// Capture the FAILED look's LLR vector into the ring (called from the receive_byte
+	// fail branch AFTER the subpeak ladder is exhausted, on ANY non-all-zeros fail —
+	// incl. the CRC16 converged-wrong-codeword fail, red-team F1). No-op when
+	// chase_enabled is false (the default). NEVER mutates receive_stats / out.
+	void     chase_capture_failed_llr(const float* llr, int n, int config);
+	// Reset/void the whole ring (used by I3 config-change, I6 BREAK/reset; here for
+	// the test to start from a known-empty state).
+	void     chase_buffer_void();
+	// I2 failing-first test: drive failing + successful receive_byte calls and assert
+	// (1) a FAILED non-all-zeros decode is captured (valid + tagged config + the stored
+	// vector is bit-identical to the deinterleaved_data fed to ldpc.decode);
+	// (2) a SUCCESSFUL decode leaves the ring UNTOUCHED (no-op invariant);
+	// (3) [red-team F1] a CRC16 CONVERGED-WRONG-codeword fail (iter<cap, crc!=0) IS
+	//     captured — fails before the F1 fix (iter-cap-only predicate would skip it).
+	// Invoked by main.cc --test-chase-buffer; returns 0 PASS, nonzero FAIL.
+	int      chase_buffer_test(int cfg);
+
 	// Score a combined LDPC hard-decision output the SAME way the production decode
 	// path does (telecom_system.cc:3498-3526): descramble via energy-dispersal,
 	// byte-pack, CRC16 self-check, AND byte-compare the recovered info bytes against
