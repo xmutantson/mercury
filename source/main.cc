@@ -499,6 +499,22 @@ int main(int argc, char *argv[])
             printf("[FLAG] --test-chase-buffer complete (rc=%d, 0=PASS) — exiting.\n", rc);
             return rc;
         }
+
+        // --test-chase-identity-gate[=<cfg>] : CHASE COMBINING I3 — identity gate +
+        // first consumer + load_configuration() invalidation hook. Arm A (same config)
+        // ALLOWS the combine and recovers the codeword; Arm B (config change) VOIDS the
+        // ring → the gate DENIES → no combine, no stale CRC-pass. FAIL-BEFORE proof via
+        // env CHASE_NOGATE=1 (bypasses the gate → Arm B's cross-config combine fires).
+        // Test-only; production consumer is env-gated default-OFF (env CHASE=1). Returns rc.
+        if (strncmp(argv[i], "--test-chase-identity-gate", 26) == 0) {
+            int cfg = CONFIG_15;
+            const char* eq = strchr(argv[i], '=');
+            if (eq && *(eq + 1)) cfg = atoi(eq + 1);
+            cl_telecom_system ts;
+            int rc = ts.chase_identity_gate_test(cfg);
+            printf("[FLAG] --test-chase-identity-gate complete (rc=%d, 0=PASS) — exiting.\n", rc);
+            return rc;
+        }
     }
 
     int cpu_nr = -1;

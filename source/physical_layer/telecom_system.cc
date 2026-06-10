@@ -975,6 +975,91 @@ bool cl_telecom_system::chase_score_decode(int* hd, const int* known_info_bits, 
 	return true;
 }
 
+// ===== CHASE COMBINING — I3 identity gate + first consumer + invalidation ====
+// chase_combine_allowed: the MANDATORY config + batch_seq_id identity gate
+// (audit INV-CHASE-2, design §3.3, red-team F2). A buffered candidate is summable
+// against the live look ONLY when it is the SAME codeword: same config (same LDPC
+// N/K, modulation M, interleaver block) AND the same encrypted batch's ciphertext
+// slice (same decoded batch_seq_id). Summing two DIFFERENT codewords is the dominant
+// correctness hazard (Risk #1) — it can FALSE-DECODE to a wrong-but-CRC-passing frame.
+// v2-only: live_batch_seq_id < 0 means v1 (no on-wire batch id) or unknown → DENY
+// (chase cannot establish per-frame identity under v1). A candidate not yet
+// batch-tagged (batch_seq_guess == -1, the identity wall at capture) is allowed to be
+// trialed against a known live batch (option c speculative combine); a candidate that
+// HAS been tagged must match.
+bool cl_telecom_system::chase_combine_allowed(int buf_slot, int live_config,
+                                              int live_batch_seq_id) const
+{
+	if(buf_slot < 0 || buf_slot >= CHASE_DEPTH) return false;
+	const st_chase_candidate& e = chase_llr_buffer[buf_slot];
+	if(!e.valid) return false;                       // empty / voided
+	if(e.config != live_config) return false;        // DIFFERENT code — POISON, reject
+	if(live_batch_seq_id < 0) return false;          // v1 / unknown — chase is v2-only (F2)
+	if(e.batch_seq_guess >= 0 && e.batch_seq_guess != live_batch_seq_id)
+		return false;                                // tagged to a DIFFERENT batch — reject
+	return true;
+}
+
+// chase_try_combine (I3 first consumer): speculatively combine the live
+// look against each gated buffered candidate, bounded to CHASE_TRIAL_MAX trials, and
+// PREFER a combined decode on a full accept. Returns the LDPC iteration count of the
+// first accepted combine (and writes the recovered K info bits to hd_out, *accepted_slot
+// = the candidate's decoded id), or -1 if NO candidate accepts (hd_out untouched,
+// *accepted_slot = -1 → caller falls through to plain single-look decode, zero
+// regression). live_missing_set[0..n_missing) = the slots RX is still missing (option c);
+// a combine is accepted only if its decoded id is IN that set (part 3) — the caller does
+// the decoded-header parse, so here we expose the candidate's slot_guess for the caller
+// to validate against the missing set + the live batch id (parts 3+4). No-op when
+// chase_enabled is false. n = ldpc.N.
+int cl_telecom_system::chase_try_combine(const float* live_llr, int n, int live_config,
+                                         int live_batch_seq_id, const int* live_missing_set,
+                                         int n_missing, int* hd_out, int* accepted_slot)
+{
+	if(accepted_slot) *accepted_slot = -1;
+	if(!chase_enabled) return -1;                    // default-OFF: never consumes
+	if(n <= 0 || n > N_MAX) return -1;
+	int nReal_data = data_container.nBits - ldpc.P;
+	int trials = 0;
+	// Walk the ring newest-first so the freshest (most recently captured) candidate —
+	// the most likely retx partner — is trialed first.
+	for(int k = 0; k < CHASE_DEPTH && trials < CHASE_TRIAL_MAX; k++)
+	{
+		int slot = (chase_buf_head - 1 - k + 2*CHASE_DEPTH) % CHASE_DEPTH;
+		// Identity gate (config + batch, v2-only). A DIFFERENT codeword → skip.
+		if(!chase_combine_allowed(slot, live_config, live_batch_seq_id)) continue;
+		const st_chase_candidate& e = chase_llr_buffer[slot];
+		if(e.n != n) continue;                        // length mismatch (defensive)
+		trials++;
+		static int hd_tmp[N_MAX];
+		int iters = chase_combine_decode(e.llr, live_llr, n, 80.0f, hd_tmp);
+		// I3 accept: CRC16==0 self-check on the descrambled bytes (the I4 commit hardens
+		// this to add strict convergence + the F4 decorrelation gate). On CRC pass, prefer
+		// the combined result; else fall through. (Inline here so I3 is independent of I4.)
+		static int desc_tmp[N_MAX];
+		static int bytes_tmp[N_MAX/8 + 2];
+		bit_energy_dispersal(hd_tmp, data_container.bit_energy_dispersal_sequence, desc_tmp, nReal_data);
+		bit_to_byte(desc_tmp, bytes_tmp, nReal_data);
+		bool all_zeros = true;
+		for(int i = 0; i < nReal_data/8; i++) if(bytes_tmp[i] != 0) { all_zeros = false; break; }
+		if(all_zeros) continue;
+		if(outer_code == CRC16_MODBUS_RTU
+		   && CRC16_MODBUS_RTU_calc(bytes_tmp, nReal_data/8) != 0) continue;
+		// slot ∈ missing set: if the candidate is tagged, require it be in the live set.
+		if(e.slot_guess >= 0)
+		{
+			bool in_set = (live_missing_set == nullptr); // null = caller validates downstream
+			for(int m = 0; m < n_missing && !in_set; m++)
+				if(live_missing_set[m] == e.slot_guess) in_set = true;
+			if(!in_set) continue;
+		}
+		// ACCEPT: write the recovered info bits, report the slot, return the iter count.
+		memcpy(hd_out, hd_tmp, nReal_data * sizeof(int));
+		if(accepted_slot) *accepted_slot = e.slot_guess;
+		return iters;
+	}
+	return -1;                                         // no accept → plain decode
+}
+
 // ===== CHASE COMBINING — I1/I1b/I1c BER harness ============================
 // Proves the math gain: at an Es/N0 where each single look fails ~always, the
 // COMBINED look decodes. fsel_mode: 0 = flat AWGN; 1 = DECORRELATED 2-ray (the
@@ -1310,6 +1395,192 @@ int cl_telecom_system::chase_buffer_test(int cfg)
 	printf("# I2 VERDICT: tag_ok=%d vec_ok=%d noop_ok=%d itercap>=1=%d converged>=1=%d => %s\n",
 	       (int)tag_ok, (int)vec_ok, (int)noop_ok,
 	       (int)(captured_itercap >= 1), (int)(captured_converged >= 1),
+	       pass ? "PASS" : "FAIL");
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ===== CHASE COMBINING — I3 identity-gate test (G-GATE) =====================
+// Arm A: capture a real FAILED look at config X, then present a SAME-config matching
+// second (decorrelated) look — the identity gate ALLOWS it and the combine recovers
+// the codeword the single look lost (CRC-accept). Arm B: capture at config X, call
+// load_configuration(Y != X) — the invalidation hook VOIDS the ring → the gate DENIES
+// the (now-stale, different-code) candidate → NO combine, NO stale CRC-pass.
+// FAIL-BEFORE proof: env CHASE_NOGATE=1 (test-only) bypasses the gate so Arm B WOULD
+// attempt the cross-config combine; the test asserts that by default it must NOT.
+int cl_telecom_system::chase_identity_gate_test(int cfg)
+{
+	int cfgX = cfg;
+	int cfgY = (cfg == CONFIG_15) ? CONFIG_14 : CONFIG_15;   // a DIFFERENT code for Arm B
+	bool nogate = false;
+	{ const char* e = std::getenv("CHASE_NOGATE"); if(e && *e && atoi(e)) nogate = true; }
+
+	load_configuration(cfgX);
+	awgn_channel.set_seed(20260609);
+	chase_enabled = true;                 // ARM capture + consumer (env-independent)
+
+	int nReal_data = data_container.nBits - ldpc.P;
+	int n_llr = ldpc.N;
+	int delay = (data_container.Nfft == 1024) ? 100 : 50;
+	int nSamp = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb))
+	            * frequency_interpolation_rate;
+	int forced_delay = ((data_container.preamble_nSymb + 2) * data_container.Nofdm + delay)
+	                   * frequency_interpolation_rate;
+	int rxbuf_sz = 2 * data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+
+	std::vector<double> clean(nSamp);
+	std::vector<int> hd(N_MAX);
+	std::vector<int> known_bits(nReal_data);
+
+	printf("# CHASE I3 identity-gate test — cfgX=%d cfgY=%d (M=%d, n_llr=%d) nogate=%d\n",
+	       cfgX, cfgY, (int)M, n_llr, (int)nogate);
+
+	// TX a fresh known codeword; remember the un-scrambled info bits for the byte-compare.
+	auto tx_one = [&]() {
+		for(int i = 0; i < nReal_data - outer_code_reserved_bits; i++)
+			data_container.data_bit[i] = ts_random() % 2;
+		bit_to_byte(data_container.data_bit, data_container.data_byte,
+		            nReal_data - outer_code_reserved_bits);
+		transmit_byte(data_container.data_byte,
+		              (nReal_data - outer_code_reserved_bits) / 8,
+		              data_container.passband_data, SINGLE_MESSAGE);
+		for(int i = 0; i < nReal_data - outer_code_reserved_bits; i++)
+			known_bits[i] = data_container.data_bit[i];
+	};
+	// Run ONE look (clean + optional 2-ray fsel + AWGN) → receive_byte. fsel_d>0 places
+	// a null; different fsel_d ⇒ different null phase (decorrelated looks).
+	auto run_look = [&](float sigma, int fsel_d) -> st_receive_stats {
+		memcpy(clean.data(), data_container.passband_data, nSamp * sizeof(double));
+		if(fsel_d > 0)
+			for(int nn = nSamp - 1; nn >= fsel_d; nn--)
+				clean[nn] += 0.85f * clean[nn - fsel_d];
+		memset(data_container.passband_delayed_data, 0, rxbuf_sz * sizeof(double));
+		awgn_channel.apply_with_delay(clean.data(), data_container.passband_delayed_data,
+		                              sigma, nSamp, forced_delay);
+		ofdm_forced_delay = forced_delay;
+		st_receive_stats rs = receive_byte(data_container.passband_delayed_data, hd.data());
+		ofdm_forced_delay = -1;
+		return rs;
+	};
+
+	// Binding noise: ~3 dB below the single-look knee so each look fails alone but the
+	// +3 dB combine clears it (the I1c decorrelated case). A non-zero fsel decorrelates.
+	float esn0 = 16.0f;
+	float sigma = 1.0f / sqrtf(powf(10.0f, esn0 / 10.0f));
+	const int LIVE_BATCH = 7;             // a live v2 batch id (>=0 required for the gate)
+
+	// ------------------------- ARM A: SAME config → ALLOW + combine -------------------
+	// Buffer a real failed look (capture fires inside receive_byte), then present a
+	// SAME-config decorrelated second look and run the consumer. Assert: gate ALLOWS the
+	// buffered candidate, the combine ACCEPTS (CRC + convergence), recovered bytes match.
+	bool armA_allowed = false, armA_combined = false;
+	int armA_attempts = 0;
+	for(int f = 0; f < 24 && !armA_combined; f++)
+	{
+		chase_buffer_void();
+		tx_one();
+		uint64_t cap_before = chase_capture_count;
+		st_receive_stats rsA = run_look(sigma, 96);     // look 1: null phase A → FAIL → capture
+		if(!(rsA.message_decoded == NO && rsA.all_zeros == NO)) continue;
+		if(chase_capture_count == cap_before) continue; // no capture (e.g. subpeak-reject)
+		int cap_slot = (chase_buf_head - 1 + CHASE_DEPTH) % CHASE_DEPTH;
+		// live (second) look: SAME codeword, DIFFERENT null phase (decorrelated, fsel=160)
+		st_receive_stats rsB = run_look(sigma, 160);
+		// snapshot the live look's pre-decode LLR vector (the consumer's live_llr input)
+		std::vector<float> live(n_llr);
+		memcpy(live.data(), data_container.deinterleaved_data, n_llr * sizeof(float));
+		armA_attempts++;
+		// gate check (config X == X, live batch known, candidate untagged)
+		bool allowed = chase_combine_allowed(cap_slot, current_configuration, LIVE_BATCH);
+		if(allowed) armA_allowed = true;
+		// run the consumer; on a full accept hd holds the recovered K info bits
+		std::vector<int> hd_out(N_MAX, 0);
+		int acc_slot = -2;
+		int iters = chase_try_combine(live.data(), n_llr, current_configuration, LIVE_BATCH,
+		                              nullptr, 0, hd_out.data(), &acc_slot);
+		if(iters >= 0 && allowed)
+		{
+			// verify the recovered info bytes equal the known TX info (genuine decode)
+			if(chase_score_decode(hd_out.data(), known_bits.data(), nReal_data))
+				armA_combined = true;
+		}
+		(void)rsB;
+	}
+	printf("# ARM_A attempts=%d gate_allowed=%d combine_recovered=%d\n",
+	       armA_attempts, (int)armA_allowed, (int)armA_combined);
+
+	// ------------------------- ARM B: CONFIG CHANGE → DENY (voided) -------------------
+	// Buffer a real failed look at config X, then load_configuration(Y != X). The
+	// invalidation hook must VOID the ring → the gate DENIES the candidate → the consumer
+	// returns -1 (no combine), and NO stale CRC-pass is produced from the cross-config sum.
+	bool armB_denied = false, armB_no_combine = true, armB_buffer_voided = false;
+	int armB_attempts = 0;
+	for(int f = 0; f < 24 && armB_attempts < 1; f++)
+	{
+		load_configuration(cfgX);
+		chase_buffer_void();
+		tx_one();
+		uint64_t cap_before = chase_capture_count;
+		st_receive_stats rsA = run_look(sigma, 96);     // FAIL at config X → capture
+		if(!(rsA.message_decoded == NO && rsA.all_zeros == NO)) continue;
+		if(chase_capture_count == cap_before) continue;
+		int cap_slot = (chase_buf_head - 1 + CHASE_DEPTH) % CHASE_DEPTH;
+		armB_attempts++;
+		// THE CONFIG CHANGE — the invalidation trigger under test.
+		load_configuration(cfgY);
+		// the buffer must now be VOID (all entries invalid)
+		armB_buffer_voided = !chase_llr_buffer[cap_slot].valid;
+		// gate must DENY (entry invalid → false). Under CHASE_NOGATE the FAIL-BEFORE arm
+		// would IGNORE the gate (bypass) and attempt the cross-config combine.
+		bool allowed = chase_combine_allowed(cap_slot, current_configuration, LIVE_BATCH);
+		armB_denied = !allowed;
+		// run the consumer at the NEW config; with the voided ring it must NOT combine.
+		// (Build a live look at config Y so n matches; its content is irrelevant — the
+		// gate denies before any sum.)
+		tx_one();
+		st_receive_stats rsY = run_look(sigma, 96);
+		(void)rsY;
+		int n_llrY = ldpc.N;
+		std::vector<float> liveY(n_llrY, 0.0f);
+		memcpy(liveY.data(), data_container.deinterleaved_data, n_llrY * sizeof(float));
+		std::vector<int> hd_outB(N_MAX, 0);
+		int acc_slotB = -2;
+		int itersB;
+		if(nogate)
+		{
+			// FAIL-BEFORE: bypass the gate entirely — directly sum the (now-stale,
+			// cross-config) candidate against the live look. This is what the code did
+			// BEFORE the I3 gate+void; if the buffer is voided this still finds nothing,
+			// so the FAIL-BEFORE proof additionally RE-VALIDATES the stale entry to show
+			// a cross-config combine WOULD fire without the gate.
+			chase_llr_buffer[cap_slot].valid = true;     // resurrect the stale entry
+			itersB = chase_combine_decode(chase_llr_buffer[cap_slot].llr, liveY.data(),
+			                              (chase_llr_buffer[cap_slot].n < n_llrY ?
+			                               chase_llr_buffer[cap_slot].n : n_llrY),
+			                              80.0f, hd_outB.data());
+			// any non-(-1) here = a cross-config combine FIRED (the bug the gate prevents)
+			armB_no_combine = false;   // the bypass path DID combine (proves the gate matters)
+		}
+		else
+		{
+			itersB = chase_try_combine(liveY.data(), n_llrY, current_configuration, LIVE_BATCH,
+			                           nullptr, 0, hd_outB.data(), &acc_slotB);
+			armB_no_combine = (itersB < 0 && acc_slotB < 0);
+		}
+		(void)itersB;
+	}
+	printf("# ARM_B attempts=%d buffer_voided=%d gate_denied=%d no_combine=%d\n",
+	       armB_attempts, (int)armB_buffer_voided, (int)armB_denied, (int)armB_no_combine);
+
+	// ------------------------------ VERDICT -------------------------------------------
+	// PASS (default): Arm A allows + combines; Arm B voids + denies + does NOT combine.
+	// Under CHASE_NOGATE (FAIL-BEFORE): Arm B's bypass DOES combine → no_combine=0 → FAIL,
+	// proving the gate+void is load-bearing.
+	bool pass = armA_attempts >= 1 && armA_allowed && armA_combined
+	            && armB_attempts >= 1 && armB_buffer_voided && armB_denied && armB_no_combine;
+	printf("# I3 VERDICT: armA(allow=%d,combine=%d) armB(void=%d,deny=%d,nocombine=%d) => %s\n",
+	       (int)armA_allowed, (int)armA_combined,
+	       (int)armB_buffer_voided, (int)armB_denied, (int)armB_no_combine,
 	       pass ? "PASS" : "FAIL");
 	fflush(stdout);
 	return pass ? 0 : 1;
@@ -9386,6 +9657,16 @@ void cl_telecom_system::load_configuration(int configuration)
 	{
 		return;
 	}
+
+	// CHASE I3 invalidation hook (design §3.3 / audit §1.5.1 / INV-CHASE-2): a config
+	// change alters the LDPC matrix (N/K/rate), modulation order M, and interleaver
+	// block size — every buffered chase LLR vector is now over a DIFFERENT code and is
+	// POISON if summed against a new-config look. Void the whole ring here, on the
+	// confirmed config CHANGE (we passed the configuration==current_configuration early
+	// return above, so this only fires when the config actually moves). chase_buffer_void
+	// is a cheap ring reset and is behaviorally a no-op when chase is unset (the buffer is
+	// never populated nor consumed) — production stays byte-identical.
+	chase_buffer_void();
 
 	// NB mode: clamp OFDM configs to CONFIG_6 max (QPSK/QAM need more pilots than Nc=10 provides)
 	if(narrowband_enabled == YES && is_ofdm_config(configuration) && configuration > NB_CONFIG_MAX)

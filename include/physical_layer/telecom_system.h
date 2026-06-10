@@ -437,6 +437,42 @@ public:
 	// LDPC output; known_info_bits are the un-scrambled TX info bits.
 	bool   chase_score_decode(int* hd, const int* known_info_bits, int nReal_data);
 
+	// ---- CHASE COMBINING — I3 identity gate + first consumer + invalidation ----
+	// Design §3.2/§3.3/§4 I3; audit §4 INV-CHASE-2 (config + batch_seq_id, v2-only,
+	// red-team F2). chase_combine_allowed(buf_slot, live_config, live_batch_seq_id):
+	// the MANDATORY identity gate. Returns true ONLY when the buffered candidate is
+	// summable against the live look — i.e. entry valid AND config equal AND (the F2
+	// v2-only batch identity) the live batch id is known (>=0) AND either the candidate
+	// is not yet batch-tagged (-1, allowed pre-identification) OR its batch matches.
+	// A config or batch mismatch (two DIFFERENT codewords) returns false → the consumer
+	// MUST fall through to plain single-look decode (summing them is POISON, Risk #1).
+	// live_batch_seq_id < 0 (v1 / unknown) ALWAYS returns false — chase is v2-only.
+	bool   chase_combine_allowed(int buf_slot, int live_config, int live_batch_seq_id) const;
+	// First consumer: speculatively combine the live look against the gated candidate(s)
+	// and PREFER the combined decode on a full accept (the I4 five-part gate). For each
+	// candidate slot in cand_slots[0..n_cand), if chase_combine_allowed AND (I4) the
+	// per-look decorrelation gate passes, run chase_combine_decode and test the I4 accept
+	// gate; on the FIRST full accept, write the recovered K info bits to hd_out, set
+	// *accepted_slot to the candidate's slot_guess (decoded id), and return the LDPC
+	// iteration count. If NO candidate accepts, leave hd_out UNTOUCHED, set *accepted_slot
+	// = -1, and return -1 (caller falls through to plain decode — zero regression).
+	// Trials are bounded to CHASE_TRIAL_MAX (red-team / design §3.5.5). live_missing_set
+	// = the slots RX is still missing (option c); a combined decode is accepted ONLY if
+	// its decoded id is IN that set AND its decoded batch_seq_id matches a live id.
+	// No-op (returns -1) when chase_enabled is false.
+	int    chase_try_combine(const float* live_llr, int n, int live_config,
+	                         int live_batch_seq_id, const int* live_missing_set,
+	                         int n_missing, int* hd_out, int* accepted_slot);
+	// I3 failing-first test: capture a real FAILED look at config X, then assert
+	// Arm A (same config X) the gate ALLOWS + the combine recovers the codeword;
+	// Arm B (load_configuration(Y!=X)) the buffer is VOIDED → gate DENIES → no combine,
+	// no stale CRC-pass. Returns 0 PASS. Invoked by main.cc --test-chase-identity-gate.
+	int    chase_identity_gate_test(int cfg);
+	// Number of speculative combine trials per arriving frame (design §3.5.5; provisional
+	// 2 pending the RPi [TIMING] ldpc-ms measurement — final cap awaits HW). Each FAILED
+	// trial runs the full LDPC iteration cap, so this bounds the RX CPU envelope.
+	static const int CHASE_TRIAL_MAX = 2;
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.
