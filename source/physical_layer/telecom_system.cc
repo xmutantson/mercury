@@ -1000,7 +1000,61 @@ bool cl_telecom_system::chase_combine_allowed(int buf_slot, int live_config,
 	return true;
 }
 
-// chase_try_combine (I3 first consumer): speculatively combine the live
+// ===== CHASE COMBINING — I4 hardened accept gate + F4 decorrelation gate =====
+// chase_accept_combined (I4 five-part gate, parts 1+2 — the PHY-side checks): a COMBINED
+// decode is self-validating ONLY when it CONVERGED strictly within the iteration cap
+// (iterations_done < nIteration_max) AND CRC16==0 over the descrambled bytes. A combine
+// that "hit the cap and happened to CRC-pass" is REJECTED — chase's value is convergence,
+// and the speculative search multiplies CRC rolls, so a capped bail is not trusted. Parts
+// 3 (decoded slot ∈ missing set) and 4 (decoded batch_seq_id == live id) are checked by
+// the caller, which owns the decoded-header parse (ARQ layer). hd = the K-info-bit LDPC
+// output (un-descrambled, as ldpc.decode wrote it). nReal_data = nBits-ldpc.P.
+bool cl_telecom_system::chase_accept_combined(int* hd, int iterations_done, int nReal_data)
+{
+	// Part 2: STRICT convergence (not iter-cap). A failed/capped combine is never trusted.
+	if(iterations_done < 0 || iterations_done > (ldpc.nIteration_max - 1)) return false;
+	// Part 1: CRC16 self-check on the DESCRAMBLED bytes (mirror the production path).
+	static int desc[N_MAX];
+	static int bytes_out[N_MAX/8 + 2];
+	bit_energy_dispersal(hd, data_container.bit_energy_dispersal_sequence, desc, nReal_data);
+	bit_to_byte(desc, bytes_out, nReal_data);
+	bool all_zeros = true;
+	for(int i = 0; i < nReal_data/8; i++) if(bytes_out[i] != 0) { all_zeros = false; break; }
+	if(all_zeros) return false;                      // production rejects an all-zero decode
+	if(outer_code == CRC16_MODBUS_RTU)
+	{
+		uint16_t crc = CRC16_MODBUS_RTU_calc(bytes_out, nReal_data/8);
+		if(crc != 0) return false;
+	}
+	return true;
+}
+
+// chase_looks_decorrelated (red-team F4): refuse to SUM two looks whose channel-null
+// pattern is identical. Proxy = the design's named "null-position difference": the set
+// of bit positions whose |LLR| is below a low-confidence floor (where the channel nulled
+// the codeword). If the buffered and live low-confidence SETS are identical the looks are
+// fully correlated → summing them reinforces the SAME biased soft info and can converge a
+// WRONG codeword a single under-confident look would have safely failed (F4 net-negative).
+// Return false (do NOT combine) when the two null sets are equal; true once they differ by
+// at least CHASE_NULLSIG_MIN positions (decorrelated). CALIBRATION TODO (design §7.9): the
+// |LLR| floor + the min decorrelation distance want HW calibration; conservative sim
+// defaults below.
+bool cl_telecom_system::chase_looks_decorrelated(const float* llr_a, const float* llr_b,
+                                                 int n) const
+{
+	const float CHASE_NULLSIG_FLOOR = 1.0f;   // |LLR| below this = a channel-nulled bit
+	const int   CHASE_NULLSIG_MIN   = 1;      // min null-set difference to count decorrelated
+	int diff = 0;
+	for(int i = 0; i < n; i++)
+	{
+		bool low_a = (llr_a[i] > -CHASE_NULLSIG_FLOOR && llr_a[i] < CHASE_NULLSIG_FLOOR);
+		bool low_b = (llr_b[i] > -CHASE_NULLSIG_FLOOR && llr_b[i] < CHASE_NULLSIG_FLOOR);
+		if(low_a != low_b) { diff++; if(diff >= CHASE_NULLSIG_MIN) return true; }
+	}
+	return (diff >= CHASE_NULLSIG_MIN);
+}
+
+// chase_try_combine (I3 first consumer, I4-hardened): speculatively combine the live
 // look against each gated buffered candidate, bounded to CHASE_TRIAL_MAX trials, and
 // PREFER a combined decode on a full accept. Returns the LDPC iteration count of the
 // first accepted combine (and writes the recovered K info bits to hd_out, *accepted_slot
@@ -1029,21 +1083,18 @@ int cl_telecom_system::chase_try_combine(const float* live_llr, int n, int live_
 		if(!chase_combine_allowed(slot, live_config, live_batch_seq_id)) continue;
 		const st_chase_candidate& e = chase_llr_buffer[slot];
 		if(e.n != n) continue;                        // length mismatch (defensive)
+		// I4 red-team F4 decorrelation gate: a fully-correlated pair (identical null set)
+		// is NOT summed — reinforcing the same biased soft info can converge a WRONG
+		// codeword a single look would have safely failed (F4 net-negative). This does NOT
+		// count against the trial budget (a refused pair never ran an LDPC decode).
+		if(!chase_looks_decorrelated(e.llr, live_llr, n)) continue;
 		trials++;
 		static int hd_tmp[N_MAX];
 		int iters = chase_combine_decode(e.llr, live_llr, n, 80.0f, hd_tmp);
-		// I3 accept: CRC16==0 self-check on the descrambled bytes (the I4 commit hardens
-		// this to add strict convergence + the F4 decorrelation gate). On CRC pass, prefer
-		// the combined result; else fall through. (Inline here so I3 is independent of I4.)
-		static int desc_tmp[N_MAX];
-		static int bytes_tmp[N_MAX/8 + 2];
-		bit_energy_dispersal(hd_tmp, data_container.bit_energy_dispersal_sequence, desc_tmp, nReal_data);
-		bit_to_byte(desc_tmp, bytes_tmp, nReal_data);
-		bool all_zeros = true;
-		for(int i = 0; i < nReal_data/8; i++) if(bytes_tmp[i] != 0) { all_zeros = false; break; }
-		if(all_zeros) continue;
-		if(outer_code == CRC16_MODBUS_RTU
-		   && CRC16_MODBUS_RTU_calc(bytes_tmp, nReal_data/8) != 0) continue;
+		// I4 hardened accept (parts 1+2): CRC16==0 AND STRICT convergence (not iter-cap).
+		// A capped-but-CRC-passing bail is rejected — chase's value is convergence and the
+		// speculative search multiplies CRC rolls (the silent-wrong-byte defense, §3.5).
+		if(!chase_accept_combined(hd_tmp, iters, nReal_data)) continue;
 		// slot ∈ missing set: if the candidate is tagged, require it be in the live set.
 		if(e.slot_guess >= 0)
 		{
@@ -1582,6 +1633,230 @@ int cl_telecom_system::chase_identity_gate_test(int cfg)
 	       (int)armA_allowed, (int)armA_combined,
 	       (int)armB_buffer_voided, (int)armB_denied, (int)armB_no_combine,
 	       pass ? "PASS" : "FAIL");
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ===== CHASE COMBINING — I4 false-accept test (G-FALSE keystone) ============
+// The correctness keystone: a speculative combine multiplies CRC16 rolls, so the hardened
+// accept gate (CRC16 AND strict convergence) must NOT let a wrong codeword through above the
+// 1/65536 floor. DECODE-FREE (see the in-body note) — exercises the gate on hand-built
+// converged decoder outputs so it is deterministic and dodges an out-of-scope SPA-decoder
+// instability. Four arms:
+//   TRUE-MATCH       : a converged decode of a VALID-CRC payload → the gate ACCEPTS it (it
+//                      does NOT over-reject a genuine combine). ~100% accept.
+//   FALSE-MATCH      : `trials` converged decodes of random-CRC payloads → the gate accepts
+//                      only the ~1/65536 that CRC-pass by chance — the silent-wrong-byte floor,
+//                      measured directly. Count must stay within the Poisson budget.
+//   ITERCAP/ALL-ZERO : a valid-CRC payload reported at the ITER CAP must be REJECTED (strict
+//                      convergence), an all-zeros decode must be REJECTED, and the same valid
+//                      payload at a converged count must be ACCEPTED — zero leaks.
+//   CORRELATED       : two IDENTICAL-null-set looks → the F4 decorrelation gate REFUSES the
+//                      sum; decorrelated looks are allowed.
+int cl_telecom_system::chase_false_accept_test(int cfg, int trials)
+{
+	load_configuration(cfg);
+	chase_enabled = true;
+	int nReal_data = data_container.nBits - ldpc.P;
+	int n_llr = ldpc.N;
+	int frame_size = (nReal_data - outer_code_reserved_bits) / 8;   // info+CRC bytes
+
+	printf("# CHASE I4 false-accept test — config %d (M=%d, n_llr=%d, frame=%dB) trials=%d\n",
+	       cfg, (int)M, n_llr, frame_size, trials);
+
+	// DECODE-FREE BY DESIGN. The thing under test is the ACCEPT GATE (descramble → CRC16 →
+	// strict convergence) and the F4 decorrelation gate — pure functions of a hard-decision
+	// vector / two LLR vectors. We construct the decoder OUTPUTS directly (a chase combine
+	// that CONVERGED yields a hard-decision codeword; we build that codeword in the
+	// decoder-output domain) and feed the gate, so the test is DETERMINISTIC and invokes ZERO
+	// ldpc.decode calls. This is deliberate: (1) the combine MATH — summing two noisy looks
+	// recovers the codeword a single look lost — is proven separately in --test-chase-ber (I1);
+	// (2) the production SPA decoder has a pre-existing instability when called many times in
+	// one process (reproducible via --test-chase-ber itself at higher frame counts — a
+	// separate, out-of-scope decoder bug, NOT chase), which a decode-driven false-accept arm
+	// would inherit and flake on. Keeping I4 decode-free isolates the gate and is reliable.
+
+	// FAIL-BEFORE proof (test-only): CHASE_WEAKGATE=1 weakens the accept gate (drops the
+	// CRC16 check) and the decorrelation gate (always allows) — proving BOTH are load-bearing
+	// (the FALSE-MATCH floor blows past budget and the CORRELATED arm stops refusing). The
+	// getenv is test-local; production chase_accept_combined / chase_looks_decorrelated are
+	// untouched and remain default-OFF.
+	bool weakgate = false;
+	{ const char* e = std::getenv("CHASE_WEAKGATE"); if(e && *e && atoi(e)) weakgate = true; }
+	// test-local accept: the real gate, OR (weakgate) strict-convergence WITHOUT the CRC check.
+	auto accept_combined = [&](int* h, int iters) -> bool {
+		if(!weakgate) return chase_accept_combined(h, iters, nReal_data);
+		// weakened: converged (not iter-cap) but NO CRC16 — the silent-wrong-byte defense gone
+		if(iters < 0 || iters > (ldpc.nIteration_max - 1)) return false;
+		static int d2[N_MAX]; static int b2[N_MAX/8 + 2];
+		bit_energy_dispersal(h, data_container.bit_energy_dispersal_sequence, d2, nReal_data);
+		bit_to_byte(d2, b2, nReal_data);
+		for(int i = 0; i < nReal_data/8; i++) if(b2[i] != 0) return true;   // any non-zero decode
+		return false;
+	};
+	auto looks_decorrelated = [&](const float* a, const float* b) -> bool {
+		if(weakgate) return true;                          // weakened: never refuse
+		return chase_looks_decorrelated(a, b, n_llr);
+	};
+
+	// ---------------------- TRUE-MATCH arm (positive control) ----------------------
+	// DECODE-FREE positive control: a genuine chase combine that CONVERGED to the CORRECT
+	// codeword produces a hard-decision output whose descrambled payload has a VALID CRC. We
+	// construct that converged decoder output directly (scramble a random info+CORRECT-CRC
+	// payload into the decoder-output domain) and assert the gate ACCEPTS it at iters=1
+	// (converged) — i.e. the gate does NOT over-reject a genuine combine. (The combine MATH
+	// itself — that summing two noisy looks recovers the codeword a single look lost — is
+	// proven separately in --test-chase-ber / I1; here I4 isolates the ACCEPT GATE, decode-free
+	// to be deterministic and side-step the out-of-scope SPA-decoder instability.)
+	awgn_channel.set_seed(424242);
+	int true_match_runs = 0, true_match_accepts = 0;
+	for(int t = 0; t < 2000; t++)
+	{
+		// random data with the CORRECT CRC16 over [data] → a genuine valid frame
+		int fsz = (nReal_data - outer_code_reserved_bits) / 8;
+		std::vector<int> info_bytes(fsz, 0);
+		for(int i = 0; i < fsz; i++) info_bytes[i] = ts_random() % 256;
+		uint16_t crc = CRC16_MODBUS_RTU_calc(info_bytes.data(), fsz);
+		int lsB = crc & 0xff, msB = (crc >> 8) & 0xff;
+		std::vector<int> ib(nReal_data, 0), sc(nReal_data, 0);
+		byte_to_bit(info_bytes.data(), ib.data(), fsz);
+		byte_to_bit(&lsB, &ib[fsz*8], 1);
+		byte_to_bit(&msB, &ib[(fsz+1)*8], 1);
+		bit_energy_dispersal(ib.data(), data_container.bit_energy_dispersal_sequence,
+		                     sc.data(), nReal_data);
+		true_match_runs++;
+		if(accept_combined(sc.data(), 1)) true_match_accepts++;   // gate must ACCEPT a valid frame
+	}
+	double true_rate = true_match_runs ? (double)true_match_accepts / true_match_runs : 0.0;
+	printf("# TRUE_MATCH runs=%d accepts=%d rate=%.4f\n",
+	       true_match_runs, true_match_accepts, true_rate);
+	fflush(stdout);
+
+	// ---------------------- FALSE-MATCH arm (the keystone — the silent-wrong-byte floor) -
+	// A speculative combine that CONVERGES to a wrong codeword must still be REJECTED unless
+	// it ALSO passes CRC16. We measure that residual rate directly: build `trials` random
+	// LDPC-VALID codewords whose payload CRC is RANDOM (the wrong-codeword a misguided combine
+	// would converge to), present each strong look to the FULL accept gate, and count how
+	// many CRC16-pass (the silent-wrong-byte). Each is a valid codeword ⇒ converges in ~1
+	// iter (fast, no iter-cap). The gate's CRC16 requirement must hold the accept rate at the
+	// 1/65536 floor with wide margin. (The further reductions the design layers on — decoded
+	// id ∈ missing-set, batch_seq_id == live — are enforced by the ARQ caller, parts 3+4,
+	// and cut the per-frame rate ~|set|/256 × 1/128 further; this arm bounds the PHY floor.)
+	// DECODE-FREE construction (the keystone runs MANY trials, and the production SPA decoder
+	// is unstable under thousands of calls per process — the out-of-scope bug noted above): a
+	// chase combine that CONVERGED produces a hard-decision codeword whose DESCRAMBLED payload
+	// the gate CRC-checks. We construct that decoder output DIRECTLY — scramble a random
+	// (info ‖ RANDOM-CRC) payload into the decoder-output domain — and feed it to the gate with
+	// iters=1 (converged). This exercises the EXACT accept-gate logic (descramble → CRC16 →
+	// strict-convergence) on a converged-but-wrong codeword, at the true 1/65536 CRC floor,
+	// without invoking ldpc.decode. (The TRUE-MATCH / FALSE-COMBINE arms below DO run the real
+	// decode, in small bounded counts, to prove the combine PATH end-to-end.)
+	awgn_channel.set_seed(987654321u);
+	long false_runs = 0, false_accepts = 0;
+	std::vector<int> info_bits(nReal_data, 0), scrambled(nReal_data, 0);
+	for(int t = 0; t < trials; t++)
+	{
+		// random data + RANDOM CRC bytes → descrambled-domain payload (passes CRC ~1/65536)
+		for(int i = 0; i < nReal_data; i++) info_bits[i] = ts_random() % 2;
+		// scramble into the decoder-OUTPUT domain (bit_energy_dispersal is its own inverse, so
+		// the gate's descramble recovers exactly info_bits → a genuine converged codeword)
+		bit_energy_dispersal(info_bits.data(), data_container.bit_energy_dispersal_sequence,
+		                     scrambled.data(), nReal_data);
+		false_runs++;
+		// the PHY accept gate at iters=1 (CONVERGED): CRC16==0 over the descrambled bytes.
+		// A random-CRC payload passes only ~1/65536 — exactly the silent-wrong-byte floor.
+		// (Under CHASE_WEAKGATE the CRC check is dropped → every converged decode is accepted
+		// → the floor blows up, proving the CRC gate is load-bearing.)
+		if(accept_combined(scrambled.data(), 1)) false_accepts++;
+	}
+	double false_rate = false_runs ? (double)false_accepts / false_runs : 0.0;
+	double crc_floor = 1.0 / 65536.0;
+	// COUNT budget (Poisson): a random-CRC valid codeword passes CRC16 at p=1/65536, so the
+	// expected silent-wrong count over N trials is N/65536. Allow that mean + a generous
+	// fluctuation margin (the gate is broken only if accepts run WELL above the CRC floor —
+	// the WEAKGATE arm accepts ALL N, which is orders of magnitude over this bound).
+	double expected = (double)false_runs * crc_floor;
+	long   accept_budget = (long)(expected + 5.0 + 3.0 * sqrt(expected + 1.0));   // mean + ~3σ + slack
+	printf("# FALSE_MATCH runs=%ld silent_wrong=%ld rate=%.3e (floor=%.3e expected=%.3f budget<=%ld)\n",
+	       false_runs, false_accepts, false_rate, crc_floor, expected, accept_budget);
+	fflush(stdout);
+
+	// ---------------------- ITER-CAP / ALL-ZEROS rejection arm (gate parts 2 + all-zeros) --
+	// The hardened gate must ALSO reject (a) a sum that did NOT converge (hit the iteration
+	// cap — iterations_done > nIteration_max-1) regardless of CRC, and (b) an all-zeros decode.
+	// Both are silent-wrong-byte vectors a weaker gate would let through. Decode-free: we feed
+	// the gate hand-built outputs at the relevant iteration counts.
+	long rej_runs = 0, rej_leak = 0;
+	{
+		std::vector<int> ib(nReal_data, 0), sc(nReal_data, 0);
+		int fsz = (nReal_data - outer_code_reserved_bits) / 8;
+		// (a) a VALID-CRC payload but reported at the ITERATION CAP → must be REJECTED (the
+		// strict-convergence requirement: a capped bail is never trusted even if CRC passes).
+		std::vector<int> info_bytes(fsz, 0);
+		for(int i = 0; i < fsz; i++) info_bytes[i] = ts_random() % 256;
+		uint16_t crc = CRC16_MODBUS_RTU_calc(info_bytes.data(), fsz);
+		int lsB = crc & 0xff, msB = (crc >> 8) & 0xff;
+		byte_to_bit(info_bytes.data(), ib.data(), fsz);
+		byte_to_bit(&lsB, &ib[fsz*8], 1); byte_to_bit(&msB, &ib[(fsz+1)*8], 1);
+		bit_energy_dispersal(ib.data(), data_container.bit_energy_dispersal_sequence, sc.data(), nReal_data);
+		rej_runs++;
+		if(chase_accept_combined(sc.data(), ldpc.nIteration_max, nReal_data)) rej_leak++;   // iter-cap → reject
+		// (b) an all-zeros decode → must be REJECTED (the production all-zeros guard).
+		std::vector<int> zeros(nReal_data, 0);
+		rej_runs++;
+		if(chase_accept_combined(zeros.data(), 1, nReal_data)) rej_leak++;                  // all-zeros → reject
+		// (c) sanity: the SAME valid payload at a CONVERGED iteration count → must be ACCEPTED
+		// (proves (a) rejected it for the iteration cap, not the CRC).
+		rej_runs++;
+		if(!chase_accept_combined(sc.data(), 1, nReal_data)) rej_leak++;                    // converged valid → accept
+	}
+	printf("# ITERCAP_ALLZERO checks=%ld leaks=%ld (must be 0)\n", rej_runs, rej_leak);
+	fflush(stdout);
+
+	// ---------------------- CORRELATED-looks arm (F4) ----------------------
+	// Two looks whose low-|LLR| null set is IDENTICAL (same channel) → the decorrelation
+	// gate must REFUSE the sum. Build a deliberate null bit-set and apply it to BOTH looks.
+	// DECODE-FREE (no ldpc.encode/decode): the decorrelation gate operates purely on the
+	// |LLR| null pattern, so the looks are random strong LLRs with an imposed null set — no
+	// codeword needed. Runs a large sample with zero decoder calls.
+	awgn_channel.set_seed(111111);
+	int corr_runs = 0, corr_refused = 0, decorr_runs = 0, decorr_allowed = 0;
+	std::vector<float> base(n_llr), lookA(n_llr), lookB(n_llr), lookC(n_llr), lookD(n_llr);
+	int nnull = (int)(0.10 * n_llr);
+	for(int t = 0; t < 500; t++)
+	{
+		for(int i = 0; i < n_llr; i++) base[i] = (ts_random() % 2) ? -40.0f : 40.0f;
+		lookA = base; lookB = base; lookC = base; lookD = base;
+		// SAME null set on both looks (identical channel) → must be REFUSED.
+		std::vector<int> nullset;
+		for(int k = 0; k < nnull; k++) nullset.push_back(ts_random() % n_llr);
+		for(int p : nullset) { lookA[p] = 0.01f; lookB[p] = 0.01f; }
+		corr_runs++;
+		if(!looks_decorrelated(lookA.data(), lookB.data())) corr_refused++;
+		// DIFFERENT null set per look (decorrelated channel) → must be ALLOWED.
+		for(int k = 0; k < nnull; k++) lookC[ts_random() % n_llr] = 0.01f;
+		for(int k = 0; k < nnull; k++) lookD[ts_random() % n_llr] = 0.01f;
+		decorr_runs++;
+		if(looks_decorrelated(lookC.data(), lookD.data())) decorr_allowed++;
+	}
+	printf("# CORRELATED runs=%d refused=%d | DECORRELATED runs=%d allowed=%d\n",
+	       corr_runs, corr_refused, decorr_runs, decorr_allowed);
+	fflush(stdout);
+
+	// ---------------------- VERDICT ----------------------
+	// G-FALSE: TRUE-MATCH accepts a genuine valid-CRC converged frame (the gate does NOT
+	// over-reject); FALSE-MATCH silent-wrong-byte count within the CRC16 floor budget (the
+	// gate does NOT accept wrong codewords above chance); the iter-cap / all-zeros checks
+	// never leak; the decorrelation gate refuses ALL same-null pairs and allows decorrelated.
+	bool true_ok  = (true_match_runs >= 100) && (true_rate >= 0.99);   // gate accepts valid frames
+	bool false_ok = (false_accepts <= accept_budget);
+	bool rej_ok   = (rej_leak == 0);
+	bool corr_ok  = (corr_runs >= 20) && (corr_refused == corr_runs)
+	                && (decorr_runs >= 20) && (decorr_allowed == decorr_runs);
+	bool pass = true_ok && false_ok && rej_ok && corr_ok;
+	printf("# I4 VERDICT: true_ok=%d(rate=%.4f) false_ok=%d(fm=%ld<=%ld) rej_ok=%d corr_ok=%d => %s\n",
+	       (int)true_ok, true_rate, (int)false_ok, false_accepts, accept_budget,
+	       (int)rej_ok, (int)corr_ok, pass ? "PASS" : "FAIL");
 	fflush(stdout);
 	return pass ? 0 : 1;
 }

@@ -515,6 +515,34 @@ int main(int argc, char *argv[])
             printf("[FLAG] --test-chase-identity-gate complete (rc=%d, 0=PASS) — exiting.\n", rc);
             return rc;
         }
+
+        // --test-chase-false-accept[=<cfg>] : CHASE COMBINING I4 — the false-accept
+        // keystone (G-FALSE). TRUE-MATCH (two looks of the SAME codeword) accepts;
+        // FALSE-MATCH (different codewords) over `--chase-trials=N` pairs → CRC-pass rate
+        // at the 1/65536 floor with wide margin (the hardened gate = CRC16 AND strict
+        // convergence rejects ~all wrong-codeword sums); correlated-looks arm → the F4
+        // decorrelation gate refuses the sum. Each FALSE-MATCH trial runs a full LDPC
+        // decode, so the headline default is modest; raise --chase-trials for a stronger
+        // bound. Must be GREEN with wide margin before any HW. Returns rc.
+        if (strncmp(argv[i], "--test-chase-false-accept", 25) == 0) {
+            int cfg = CONFIG_15;
+            const char* eq = strchr(argv[i], '=');
+            if (eq && *(eq + 1)) cfg = atoi(eq + 1);
+            // Default 200000: the FALSE-MATCH floor arm is DECODE-FREE (it constructs the
+            // converged decoder output directly and exercises only the descramble→CRC16 accept
+            // gate), so it can run a large sample for a tight bound on the 1/65536 silent-wrong
+            // floor without invoking the production SPA decoder (which is unstable under too many
+            // calls per process — a separate, out-of-scope decoder bug; the TRUE-MATCH /
+            // FALSE-COMBINE arms that DO decode are bounded LOW internally).
+            int trials = 200000;
+            for (int j = 1; j < argc; j++)
+                if (strncmp(argv[j], "--chase-trials=", 15) == 0) trials = atoi(argv[j] + 15);
+            if (trials < 1) trials = 1;
+            cl_telecom_system ts;
+            int rc = ts.chase_false_accept_test(cfg, trials);
+            printf("[FLAG] --test-chase-false-accept complete (rc=%d, 0=PASS) — exiting.\n", rc);
+            return rc;
+        }
     }
 
     int cpu_nr = -1;

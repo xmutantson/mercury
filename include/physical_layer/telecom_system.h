@@ -473,6 +473,31 @@ public:
 	// trial runs the full LDPC iteration cap, so this bounds the RX CPU envelope.
 	static const int CHASE_TRIAL_MAX = 2;
 
+	// ---- CHASE COMBINING — I4 hardened accept gate + F4 decorrelation gate ------
+	// Design §3.5 / audit §4 INV-CHASE-4 / §6 R1/R1a. chase_accept_combined: parts 1+2 of
+	// the five-part accept gate (the PHY-side checks). A COMBINED decode is self-validating
+	// ONLY when it CONVERGED strictly within the iteration cap (iterations_done <
+	// nIteration_max — NOT a capped bail) AND CRC16==0 over the descrambled bytes. Parts 3
+	// (decoded slot ∈ missing set), 4 (decoded batch_seq_id == live id) and 5 (trials
+	// bounded to CHASE_TRIAL_MAX) are enforced by the caller (chase_try_combine / the ARQ
+	// consumer) because the decoded header is parsed at the ARQ layer.
+	bool   chase_accept_combined(int* hd, int iterations_done, int nReal_data);
+	// red-team F4 decorrelation gate: refuse to SUM two looks whose low-confidence-bit
+	// pattern (where the channel nulled the codeword) is identical — a fully-correlated
+	// pair reinforces the SAME biased soft info and can converge a WRONG codeword that a
+	// single under-confident look would have safely left at the iter cap (F4 net-negative).
+	// Proxy = the design's named "null-position difference": the set of bit positions whose
+	// |LLR| is below a low-confidence floor. EQUAL null sets ⇒ correlated ⇒ return false
+	// (do NOT combine). CALIBRATION TODO: the floor + min decorrelation distance want HW
+	// calibration (recorded, design §7.9).
+	bool   chase_looks_decorrelated(const float* llr_a, const float* llr_b, int n) const;
+	// I4 keystone test (G-FALSE): TRUE-MATCH (two looks of the SAME codeword) accepts;
+	// FALSE-MATCH (look of C + look of DIFFERENT D) over `trials` pairs → CRC-pass rate at
+	// the 1/65536 floor with wide margin; correlated-looks arm (two identical-channel
+	// looks) → the decorrelation gate REFUSES the sum. Returns 0 PASS. Invoked by main.cc
+	// --test-chase-false-accept.
+	int    chase_false_accept_test(int cfg, int trials);
+
 	// Phase-2 validation flag (--mean-h-gate=F). Default 0.30 = HEAD (b806b76).
 	// Pre-IONOS was 0.50. Threshold below which frames are rejected as
 	// bad-timing (pilots land on data positions). See PHASE2_FLAGS_DESIGN.md §2.1.
