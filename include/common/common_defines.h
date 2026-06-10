@@ -487,6 +487,46 @@ inline int cfg16_revack_starve_fallback_target(int current_config, bool ofdm_pro
 // consecutive ACK-silence block-failures with healthy forward SACK history"). TUNABLE.
 static const int CFG16_REVACK_STARVE_FAILS = 2;
 
+// WALL-B FIX-9 D2 (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md): the
+// reverse-data-ACK turnaround-geometry predicate. The reverse MFSK ACK+SACK PHY (the M=16 WB
+// Welch-Costas pattern, send_mfsk_ack_sack) is config-INDEPENDENT in TONE SET — the same correlator
+// pattern fires at every config — but it is EMITTED inside the LIVE config's PTT/turnaround
+// geometry. At the robust tier the RSP keys the ACK with a pre-TX pumped_settle_wait guard
+// (arq_common.cc:6581, the fatter turnaround the OFDM cadence lacks), and the CMD's listen-window
+// budget covers it. At OFDM forward configs that guard is SKIPPED, so under inter-Pi sample-clock
+// drift the ppm-slipped reverse ACK lands OUTSIDE the CMD's tight OFDM-cadence window and the
+// correlator goes pure-silent (the D3 collapse). D2 attacks the ROOT: emit the reverse data-ACK on
+// the SAME robust turnaround geometry (the pre-TX settle + a CMD window widen, in lockstep) at ALL
+// OFDM forward configs, so the slipped ACK STILL lands in window and CFG16 itself HOLDS — the
+// stronger outcome than D3's after-the-fact CFG15 settle (D2 removes D3's trigger; the two compose
+// — D2 = prevention, D3 = recovery if the drift defeats even the robust geometry).
+//
+// Returns true iff the LIVE forward data config is an OFDM rung (where the OFDM-cadence ACK is at
+// risk of the drift-driven turnaround de-alignment). FALSE at the robust tier (the EXISTING
+// is_robust_config guard already fires the settle there — robust path byte-identical) and FALSE for
+// NB (handled by send_mfsk_ack_sack's ack_sack_suffix_len()<=0 early-return). The CMD's
+// calculate_receiving_timeout() and the RSP's send_mfsk_ack_sack() BOTH call this on
+// current_configuration, so the two sides cannot diverge (the FIX9_ROOTCAUSE §5 lockstep invariant).
+// PURE; the unit test (Part W) replays it directly. FAIL-BEFORE: -DFIX9_D2_FAILBEFORE -> false
+// always (no robust geometry at OFDM -> the reverse-ACK-starved link collapses, the D3 path runs).
+inline bool reverse_ack_uses_robust_geometry(int forward_config) {
+#ifdef FIX9_D2_FAILBEFORE
+	(void)forward_config;
+	return false;   // FAIL-BEFORE stub: OFDM keeps the tight cadence -> the drift collapse.
+#else
+	return is_ofdm_config(forward_config) && !is_robust_config(forward_config);
+#endif
+}
+
+// WALL-B FIX-9 D2: the extra CMD listen-window margin (ms) added when the reverse data-ACK is keyed
+// on the robust turnaround geometry. Covers the accumulated per-batch clock-drift arrival jitter
+// the stock per-frame frame_drain (=2*message_transmission_time_ms) did not absorb. The HW evidence
+// showed the correlator going PURE-SILENT (the window CLOSED before the late ACK) rather than a few-
+// ms near-miss, so this is dominated by the settle-flush re-arm gap, not the ~6 ms/batch raw slip.
+// Same order as SACK_ARRIVAL_MARGIN_MS (1000). TUNABLE; gate (b) confirms it suffices (repro HOLDS
+// CFG16). The RSP's matching pre-TX settle (ptt_off+ptt_on) is added SEPARATELY in lockstep.
+static const int ROBUST_ACK_DRIFT_MARGIN_MS = 600;
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

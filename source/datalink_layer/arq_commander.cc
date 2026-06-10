@@ -10607,6 +10607,122 @@ int cl_arq_controller::test_climb_engine()
 		emergency_nack_count = 0;
 	}
 
+	// ================================================================
+	// Part W — WALL-B FIX-9 D2: reverse data-ACK on the ROBUST turnaround geometry at ALL OFDM
+	// forward configs (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md).
+	// The reverse MFSK ACK+SACK PHY is config-INDEPENDENT in tone set, but at OFDM forward configs it
+	// is keyed with the tight OFDM turnaround (NO pre-TX settle, narrow CMD listen window). Under
+	// inter-Pi clock drift the ppm-slipped ACK lands outside the CMD window -> the D3 collapse. D2
+	// keys the reverse ACK on the robust geometry (the pre-TX settle + a CMD window widen, IN
+	// LOCKSTEP) at all OFDM configs so CFG16 itself HOLDS. This drives the REAL pure predicate
+	// (reverse_ack_uses_robust_geometry) + the REAL budget-widen arithmetic. FAIL-BEFORE:
+	// -DFIX9_D2_FAILBEFORE compiles the predicate to `return false` (no robust geometry at OFDM) ->
+	// W0/W1/W3/W4/W5 FAIL (the OFDM ACK keeps the tight cadence and the window does not widen).
+	// PASS-AFTER: ALL PASS. The robust-tier no-change assertions (W2/W6) PASS even in the stub.
+	// The drift-sim A/B is the end-to-end gate (repro HOLDS CFG16, D3 dormant).
+	// ================================================================
+	{
+		// W0 — THE TRIGGER GATE: at every OFDM forward config the reverse ACK uses the robust
+		// geometry (so the pre-TX settle fires + the CMD window widens). Pre-fix (predicate->false):
+		// OFDM keeps the tight cadence -> the drift collapse.
+		check(reverse_ack_uses_robust_geometry(CONFIG_16) == true,
+			"W0a CFG16 (densest OFDM) -> reverse ACK uses ROBUST geometry (the drift-collapse root fix)",
+			reverse_ack_uses_robust_geometry(CONFIG_16) ? 1 : 0, 1);
+		check(reverse_ack_uses_robust_geometry(CONFIG_15) == true,
+			"W0b CFG15 (OFDM) -> robust geometry (the fragility is a continuum, not CFG16-only)",
+			reverse_ack_uses_robust_geometry(CONFIG_15) ? 1 : 0, 1);
+
+		// W1 — ALL OFDM rungs CONFIG_6..16 take the robust geometry (the predicate is the simple,
+		// symmetric is_ofdm && !is_robust — no per-config budget table).
+		{
+			bool all_ofdm = true;
+			for(int c = CONFIG_6; c <= CONFIG_16; c++)
+				if(!reverse_ack_uses_robust_geometry(c)) all_ofdm = false;
+			check(all_ofdm == true,
+				"W1 every OFDM rung CONFIG_6..16 -> robust reverse-ACK geometry (uniform, no per-config table)",
+				all_ofdm ? 1 : 0, 1);
+		}
+
+		// W2 — ROBUST TIER UNCHANGED: at ROBUST_0/1/2 the predicate is FALSE (the EXISTING
+		// is_robust_config guard already fires the settle there; D2's OR-clause is redundant -> NO
+		// double-settle, robust path byte-identical). This PASSES even in the FAIL-BEFORE stub.
+		check(reverse_ack_uses_robust_geometry(ROBUST_0) == false
+		   && reverse_ack_uses_robust_geometry(ROBUST_1) == false
+		   && reverse_ack_uses_robust_geometry(ROBUST_2) == false,
+			"W2 ROBUST_0/1/2 -> predicate FALSE (the robust tier already had the guard; byte-identical, no double-settle)",
+			(reverse_ack_uses_robust_geometry(ROBUST_0)
+			 || reverse_ack_uses_robust_geometry(ROBUST_1)
+			 || reverse_ack_uses_robust_geometry(ROBUST_2)) ? 1 : 0, 0);
+
+		// W3 — THE LOCKSTEP BUDGET WIDEN (CMD side): the OFDM data-ACK listen window is WIDER than the
+		// pre-D2 geometric value by EXACTLY the robust-ack-geometry margin (the RSP's matching pre-TX
+		// settle ptt_off+ptt_on + the drift margin), so the CMD window covers the robust-geometry ACK
+		// the RSP now keys (FIX9_ROOTCAUSE §5 lockstep invariant). Replays the production arithmetic
+		// (arq_common.cc:calculate_receiving_timeout) with primed members.
+		{
+			int saved_ptt_on = ptt_on_delay_ms, saved_ptt_off = ptt_off_delay_ms;
+			int saved_mtt = message_transmission_time_ms, saved_apt = ack_pattern_time_ms;
+			ptt_on_delay_ms = 100; ptt_off_delay_ms = 200;     // stock delays
+			message_transmission_time_ms = 320;                 // a representative CFG16 per-frame ms
+			ack_pattern_time_ms = 389;                          // the M=16 WB ACK pattern ms (RSP log:46)
+
+			int pattern_time = ack_pattern_time_ms;
+			int frame_drain  = 2 * message_transmission_time_ms;
+			int sack_arrival = ptt_off_delay_ms + RSP_DECODE_MARGIN_MS + pattern_time + ptt_on_delay_ms;
+			int base_timeout = frame_drain + sack_arrival + SACK_ARRIVAL_MARGIN_MS;  // pre-D2 geometric
+
+			// the D2 adder, gated on the SAME predicate the RSP keys on:
+			int d2_adder_cfg16 = reverse_ack_uses_robust_geometry(CONFIG_16)
+				? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0;
+			int ofdm_timeout = base_timeout + d2_adder_cfg16;
+
+			check(ofdm_timeout == base_timeout + (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS),
+				"W3a CFG16 data-ACK window WIDENED by exactly (ptt_off+ptt_on+drift_margin) (the lockstep CMD widen)",
+				ofdm_timeout - base_timeout, ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS);
+			check(ofdm_timeout > base_timeout,
+				"W3b the OFDM data-ACK window is STRICTLY wider than the pre-D2 geometric value (absorbs the ppm slip)",
+				ofdm_timeout, base_timeout);
+
+			// W3c — the CMD widen >= the RSP's new pre-TX settle (ptt_off+ptt_on): the window cannot be
+			// NARROWER than the extra time the RSP now waits before keying, or the FIX9_ROOTCAUSE §5
+			// window mismatch re-opens. The drift margin makes it strictly larger.
+			check(d2_adder_cfg16 >= (ptt_off_delay_ms + ptt_on_delay_ms),
+				"W3c the CMD widen covers AT LEAST the RSP's new pre-TX settle (lockstep: no window mismatch)",
+				d2_adder_cfg16, ptt_off_delay_ms + ptt_on_delay_ms);
+
+			ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
+			message_transmission_time_ms = saved_mtt; ack_pattern_time_ms = saved_apt;
+		}
+
+		// W4 — ROBUST FORWARD CONFIG: the budget adder is ZERO (predicate FALSE), so the robust-tier
+		// data-ACK window is byte-identical to pre-D2 (no double-margin on the path that already had
+		// the guard). This is the INV-2 byte-identity assertion.
+		{
+			int d2_adder_robust = reverse_ack_uses_robust_geometry(ROBUST_0)
+				? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0;
+			check(d2_adder_robust == 0,
+				"W4 robust forward config -> D2 budget adder == 0 (robust data-ACK window byte-identical, INV-2)",
+				d2_adder_robust, 0);
+		}
+
+		// W5 — D2 REMOVES D3'S TRIGGER (the compose property): the predicate that arms D2 (OFDM
+		// forward config) is TRUE precisely on the rung D3 guards (CFG16 is OFDM), so on a clean OFDM
+		// climb D2's robust-geometry ACK fires BEFORE D3's starvation deadline can accumulate. D2 is
+		// the PREVENTION (reverse ACK survives), D3 the RECOVERY (if drift defeats even robust
+		// geometry). Both gate on CFG16-being-OFDM; no pathological interaction (different loci:
+		// D2 at ACK-TX setup, D3 at block-failure triage).
+		check(reverse_ack_uses_robust_geometry(CONFIG_16) == true
+		   && is_ofdm_config(CONFIG_16) == true,
+			"W5 D2's robust-ACK geometry fires on the SAME CFG16 D3 guards -> D2 (prevention) removes D3's (recovery) trigger; compose, no double-act",
+			(reverse_ack_uses_robust_geometry(CONFIG_16) && is_ofdm_config(CONFIG_16)) ? 1 : 0, 1);
+
+		// W6 — NON-OFDM, NON-ROBUST sentinel (CONFIG_NONE): predicate FALSE (defends against a stray
+		// is_ofdm_config edge). PASSES in the stub too.
+		check(reverse_ack_uses_robust_geometry(CONFIG_NONE) == false,
+			"W6 CONFIG_NONE -> predicate FALSE (no robust geometry on a non-OFDM sentinel)",
+			reverse_ack_uses_robust_geometry(CONFIG_NONE) ? 1 : 0, 0);
+	}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
