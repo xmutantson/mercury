@@ -7869,7 +7869,8 @@ void cl_arq_controller::commit_ack_pattern_consumed()
 	MUTEX_UNLOCK(&capture_prep_mutex);
 }
 
-bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
+bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
+                                            bool multiwindow_scan)
 {
 	// Tail must cover the entire fresh audio region (= initial guard).
 	// Tail = pattern length + margin + SNR suffix. Ensures ACKs arriving early are captured.
@@ -7985,6 +7986,96 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 
 	if(telecom_system->data_container.frames_to_read == 0)
 	{
+		// mw_hit: the multi-window scan validated a real ACK at an older phase
+		// (full correlator >= thresholds). When set, the body's 8-symbol energy
+		// pre-gate (probe_n) MUST be bypassed: under the paced two-process sim
+		// arq_sim_inproc_active()==false leaves probe_n=8*sym_samples, which only
+		// samples the LAST 8 symbols of the snapshot — but a MW-repositioned ACK
+		// sits MID-tail, so that 8-symbol gate would read silence and skip the
+		// (already-validated) correlator, dropping the detection. mw_hit forces
+		// the body past the pre-filter; the body's UNCHANGED correlator then
+		// re-confirms on the chosen phase and returns true.
+		bool mw_hit = false;
+		// ------------------------------------------------------------------
+		// CMD multi-window control-ACK match (CONNECT round-2 fix #2(a)).
+		// CONNECT_FINAL §3/§7, SUBMODE_ROOTCAUSE §7 #2(a), _connect2/CMD_MULTIWINDOW_DESIGN.md.
+		//
+		// The newest-tail snapshot below correlates ONLY the last `tail_nsymb`
+		// (=80 on CONFIG_100 NB) symbols. On the slow 2-phase MFSK handshake the
+		// peer's control ACK arrives once, then trailing idle silence scrolls it
+		// out of the newest tail before this poll's ftr==0 snapshot fires — so
+		// every snapshot reads silence (CMD [CAP-PEAK] pk=0.000000) and the CMD
+		// never advances (sub-mode B, all snr900). The ACK is NOT lost: the ring
+		// retains ~buffer_Nsymb (1301) symbols of history, far more than the ACK
+		// round-trip, so the burst still sits at an OLDER phase.
+		//
+		// When the caller asks for a multi-window scan (the CONNECT control-ACK
+		// wait only, arq_commander.cc:1981), step the search phase back through
+		// the retained ring in ACK-stride increments and pick the FIRST older
+		// phase whose tail RMS clears the energy gate (signal present). We only
+		// MOVE where the snapshot reads; the UNCHANGED detection body below then
+		// runs verbatim on that phase — SAME energy gate, SAME correlator, SAME
+		// ack_match_threshold + ack_metric_threshold. A genuine miss (silence at
+		// every phase) leaves tail_offset at the newest tail and falls through to
+		// the normal miss path (ftr=2; return false), re-polled next tick exactly
+		// as before. This does NOT restart receiving_timer and does NOT shrink ftr
+		// (the §2 happy-path invariant). Production/paced DATA-ACK/BREAK/HAIL pass
+		// multiwindow_scan==false -> byte-identical.
+		//
+		// The double-mapped ring (passband_delayed_data sized 2*signal_period,
+		// data_container.cc:170) makes [rwi + off] for off in [0, tail_offset] a
+		// contiguous, in-bounds tail via the mirror copy.
+		if(multiwindow_scan && tail_offset > 0)
+		{
+			const int rwi_mw = telecom_system->data_container.ring_write_index;
+			const double MW_GATE_RMS = 0.001; // == ACK_ENERGY_GATE_RMS below
+			// Stride one ACK-pattern length per phase so consecutive search
+			// windows overlap by the full search range (no ACK can fall entirely
+			// between two phases). Bound the number of older phases to the ACK
+			// round-trip neighbourhood (not the whole 1301-symbol ring) to keep
+			// the per-poll correlator cost modest.
+			int stride = pattern_len * sym_samples;
+			if(stride < sym_samples) stride = sym_samples;
+			const int MW_MAX_PHASES = 24; // ~24*pattern_len symbols of look-back
+			int chosen_off = -1;
+			for(int ph = 1; ph <= MW_MAX_PHASES; ph++)
+			{
+				int off = tail_offset - ph * stride;
+				if(off < 0) break;
+				// Energy pre-gate (cheap): only correlate phases that hold signal.
+				const double* pp = &telecom_system->data_container
+					.passband_delayed_data[rwi_mw + off];
+				double sumsq = 0.0;
+				for(int i = 0; i < tail_samples; i++) sumsq += pp[i] * pp[i];
+				double rms = std::sqrt(sumsq / tail_samples);
+				if(rms < MW_GATE_RMS) continue;
+				// Run the SAME correlator on this older phase (turbo/non-turbo
+				// share the same accept thresholds; we use the plain ACK
+				// correlator as the gate — the body below re-runs the exact
+				// detector and bookkeeping for the chosen phase).
+				memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+					pp, tail_samples * sizeof(double));
+				int mw_matched = 0; uint32_t mw_mask = 0;
+				double mw_metric = telecom_system->detect_ack_pattern_from_passband(
+					telecom_system->data_container.ready_to_process_passband_delayed_data,
+					tail_samples, &mw_matched, &mw_mask);
+				if(mw_matched >= telecom_system->ack_mfsk.ack_match_threshold
+				   && mw_metric >= ack_metric_threshold)
+				{
+					chosen_off = off;
+					printf("[CMD-ACK-MW] control-ACK found at older phase off=%d "
+						"(newest_tail_off=%d phase=%d matched=%d metric=%.2f)\n",
+						off, tail_offset, ph, mw_matched, mw_metric);
+					fflush(stdout);
+					break;
+				}
+			}
+			if(chosen_off >= 0)
+			{
+				tail_offset = chosen_off; // body below snapshots+detects this phase
+				mw_hit = true;            // bypass the 8-symbol energy pre-gate
+			}
+		}
 		// Snapshot only the tail (newest audio) — smaller copy, shorter mutex hold
 		int rwi = telecom_system->data_container.ring_write_index;
 		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
@@ -8033,9 +8124,13 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 			mtl::log_event_kv("cmd_ack_buffer_energy", "rms=%.4f", tail_rms);
 			energy_logged_this_window = true;
 		}
-		if(tail_rms < ACK_ENERGY_GATE_RMS)
+		if(!mw_hit && tail_rms < ACK_ENERGY_GATE_RMS)
 		{
-			// Silent buffer — skip FFT-heavy ACK search this poll.
+			// Silent buffer — skip FFT-heavy ACK search this poll. (mw_hit
+			// bypasses this pre-filter: the MW scan already validated a real
+			// ACK at this phase with the full correlator; the body's correlator
+			// below re-confirms it. Without the bypass, the 8-symbol pre-gate
+			// reads the silent last-8 of a mid-tail ACK and drops the detection.)
 			ack_diag_poll_count++;
 			MUTEX_LOCK(&capture_prep_mutex);
 			telecom_system->data_container.frames_to_read = 2;

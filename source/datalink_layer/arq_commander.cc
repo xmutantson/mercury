@@ -2003,7 +2003,15 @@ void cl_arq_controller::process_messages_rx_acks_control()
 			// KEY_EXCHANGE_1 must use LDPC path to receive responder's pubkey.
 			if(messages_control.status != ACKED)
 			{
-				if(receive_ack_pattern())
+				// CONNECT round-2 fix #2(a): for the START_CONNECTION control-ACK
+				// wait on the slow 2-phase MFSK handshake, scan multiple
+				// capture-window phases across the retained ring so a gap-displaced
+				// ACK is caught regardless of which ftr==0 phase the snapshot fired
+				// on (sub-mode B miss; CMD [CAP-PEAK] pk=0 with the ACK sitting at
+				// an older phase). Scoped to START_CONNECTION only — the steady
+				// DATA-ACK and other control waits are unaffected.
+				bool mw_scan = (messages_control.data[0] == START_CONNECTION);
+				if(receive_ack_pattern(false, mw_scan))
 				{
 					printf("[CMD-ACK-PAT] Control ACK for code=%d detected! elapsed=%dms link=%d status=%d\n",
 					(int)messages_control.data[0], (int)receiving_timer.get_elapsed_time_ms(), (int)link_status, (int)messages_control.status);

@@ -549,7 +549,18 @@ public:
   // instead of audio the capture thread already advanced past. The caller
   // MUST invoke commit_ack_pattern_consumed() once it has accepted the ACK
   // outcome, otherwise the next poll re-detects the same pattern.
-  bool receive_ack_pattern(bool defer_audio_advance = false);
+  // multiwindow_scan (CONNECT round-2 fix #2(a)): when true, on a miss in the
+  // newest-tail snapshot, additionally run the SAME unchanged ACK correlator at
+  // several OLDER tail-offset phases stepping back through the retained ring
+  // history, accepting on the first phase that clears the SAME thresholds. This
+  // closes the CMD-side control-ACK capture-window-phase miss (sub-mode B): the
+  // ACK burst persists in the ~1301-symbol ring far longer than the newest
+  // 80-symbol tail, so a gap-displaced ACK is still found regardless of which
+  // ftr==0 phase the snapshot fired on. Scoped to the CONNECT handshake control
+  // ACK only (arq_commander.cc:1981); DATA-ACK/BREAK/HAIL pass false ->
+  // byte-identical. Does NOT restart receiving_timer or shrink ftr.
+  bool receive_ack_pattern(bool defer_audio_advance = false,
+                           bool multiwindow_scan = false);
 
   // §7.13.29 — apply the ftr=4 + search_raw resets that
   // receive_ack_pattern(defer_audio_advance=true) skipped. Idempotent.
