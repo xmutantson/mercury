@@ -447,6 +447,11 @@ def main():
                          "quad is free and fails loudly on collision." % DEFAULT_CTRL_BASE)
     ap.add_argument("--start-cfg", type=int, default=100)
     ap.add_argument("--robust", action="store_true", default=None)
+    ap.add_argument("--no-gearshift", action="store_true",
+                    help="omit -g (and add -Q 0) so --start-cfg HOLDS (no "
+                         "climb/demote). PINs a single tier so wire_bps_airtime "
+                         "reads a per-frame wire for THAT config (not a "
+                         "climb-ramp-diluted mix). See GAP1_AIRTIME_WIRE_VERDICT.md.")
     ap.add_argument("--compress", default="off")
     ap.add_argument("--payload", default=DEFAULT_PAYLOAD,
                     help="TX payload file (default payload_incompressible_64k.bin, "
@@ -568,6 +573,16 @@ def main():
 
     logfile = open(os.path.join(MERCURY_ROOT, "sim_arq_channel.log"), "w")
     relay_log = os.path.join(MERCURY_ROOT, "sim_channel_relay.log")
+    # GAP #1: per-direction airtime breakdown the relay writes on graceful
+    # shutdown; the harness reads it below to derive wire_bps_airtime. Scope it
+    # to OUR auto-picked port so concurrent cells don't clobber each other's file.
+    relay_airtime_json = os.path.join(MERCURY_ROOT,
+                                      f"sim_channel_relay_airtime_{args.port}.json")
+    try:
+        if os.path.exists(relay_airtime_json):
+            os.remove(relay_airtime_json)
+    except OSError:
+        pass
     st = State()
     procs, sockets = [], []
     stop = threading.Event()
@@ -576,7 +591,18 @@ def main():
 
     def base_cmd(port, role):
         c = [args.bin, "-m", "ARQ", "-s", str(args.start_cfg), "-W",
-             "-p", str(port), "-x", "sim", "-n", "-g", "-F", args.compress]
+             "-p", str(port), "-x", "sim", "-n", "-F", args.compress]
+        if not args.no_gearshift:
+            c += ["-g"]          # gearshift ON by default; --no-gearshift PINS start-cfg
+        else:
+            # PIN mode: -Q 0 skips the NB probe so the link starts DIRECT-WB at
+            # --start-cfg (main.cc:2858-2859: nb_probe_max==0 && BW_AUTO => start
+            # WB, no NB->WB negotiation). Without -Q 0 the session starts NB CFG14
+            # and waits for the (now-absent) gearshift probe to upgrade, so CONNECT
+            # never reaches the pinned WB tier. Matches the CLAUDE.md -Q 0 recipe.
+            # PINs the config so the airtime wire reads a SINGLE-config per-frame
+            # rate (GAP #1 / GAP1_AIRTIME_WIRE_VERDICT.md §"climb-run caveat").
+            c += ["-Q", "0"]
         if use_robust:
             c += ["-R"]
         return c
@@ -606,6 +632,7 @@ def main():
                      "--turnaround-ppm-a2b", str(args.turnaround_ppm_a2b),
                      "--turnaround-ppm-b2a", str(args.turnaround_ppm_b2a),
                      "--turnaround-jitter-ms", str(args.turnaround_jitter_ms),
+                     "--airtime-json", relay_airtime_json,
                      "--log", relay_log]
         if args.turnaround_drift:
             relay_cmd.append("--turnaround-drift")
@@ -677,6 +704,15 @@ def main():
                 pass
         if relay:
             spawned_pids.append(relay.pid)
+            # GAP #1: give the relay a moment to notice its peer sockets closed
+            # (its readers hit "source closed" -> stop.set() -> graceful shutdown,
+            # which writes the airtime-json + 'relay done' line) BEFORE the hard
+            # terminate(), which would skip that emit. The mercury procs were just
+            # killed above, so the relay's source is already gone.
+            try:
+                relay.wait(timeout=3)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
             try:
                 relay.terminate()
             except OSError:
@@ -742,13 +778,51 @@ def main():
     reached_ofdm = any(1 <= c <= 16 for c in seq)
     stalled = (not reached_ofdm) and rx_bps < 200
 
+    # ---- GAP #1: AIRTIME-DERIVED per-frame wire rate ------------------------
+    # rx_bps above divides delivered bytes by REAL WALL-CLOCK over the whole
+    # window — diluted by the ROBUST->CFGn climb ramp, by idle/turnaround, and by
+    # the harness setup time. That made the sim look ~7-10x under HW in the
+    # CFG16-hold verdict, but that was an apples-to-oranges comparison artifact:
+    # the per-frame CHANNEL wire rate is delivered_bytes*8 / FRAME-AIRTIME, where
+    # frame-airtime = the SIGNAL chunks the relay actually carried in the
+    # delivering direction (data flows CMD/A -> RSP/B == relay direction a2b).
+    # This number maps to the modem's own rbc (Tf airtime model) and to HW
+    # (CFG15 rbc=3348, bench-8 sustained 3060). See the relay's --airtime-json.
+    # PIN a config (--no-gearshift) to read a SINGLE tier's per-frame wire.
+    airtime_secs = None
+    wire_bps_airtime = None
+    airtime_signal_chunks = None
+    airtime_silence_chunks = None
+    airtime_total_virtual_s = None
+    try:
+        if os.path.exists(relay_airtime_json):
+            with open(relay_airtime_json) as af:
+                at = json.load(af)
+            d_dir = at.get("a2b", {})   # CMD(A) -> RSP(B): the delivering direction
+            airtime_signal_chunks = d_dir.get("signal_chunks")
+            airtime_silence_chunks = d_dir.get("silence_chunks")
+            airtime_secs = d_dir.get("signal_airtime_s")
+            airtime_total_virtual_s = d_dir.get("total_virtual_s")
+            if airtime_secs and airtime_secs > 0:
+                wire_bps_airtime = round(res["rx"] * 8 / airtime_secs, 1)
+    except (OSError, ValueError, KeyError):
+        pass
+
     print("\n========== SUMMARY ==========")
     print(f"connected         : {st.connected}")
     print(f"config switch_seq : {names}")
     print(f"peak_config       : {cfg_name(peak) if peak is not None else None}")
     print(f"steady_config     : {cfg_name(steady) if steady is not None else None}")
     print(f"final_config      : {cfg_name(final) if final is not None else None}")
-    print(f"client rx bytes   : {res['rx']}  (~{rx_bps:.0f} bps over {dwell:.0f}s)")
+    print(f"client rx bytes   : {res['rx']}  (~{rx_bps:.0f} bps over {dwell:.0f}s WALL)")
+    if wire_bps_airtime is not None:
+        print(f"wire_bps_airtime  : {wire_bps_airtime} bps  "
+              f"(per-frame CHANNEL wire = rx*8 / {airtime_secs:.1f}s frame-airtime; "
+              f"sig={airtime_signal_chunks} sil={airtime_silence_chunks} chunks a2b)")
+        print(f"                    [HW-representative axis: maps to rbc/HW, NOT the "
+              f"climb-ramp-diluted wall-clock {rx_bps:.0f} bps]")
+    else:
+        print("wire_bps_airtime  : (unavailable -- relay airtime-json not found)")
     print(f"client tx bytes   : {res['tx']}")
     print(f"delivered_bytes   : {delivered_bytes}")
     print(f"recv_md5          : {recv_md5}")
@@ -792,6 +866,17 @@ def main():
                 "wall_secs": round(dwell, 1),
                 "barrier_k": args.barrier_k,
                 "wire_stamp": args.wire_stamp,
+                "no_gearshift": args.no_gearshift,
+                # GAP #1: HW-representative per-frame CHANNEL wire rate (rx*8 /
+                # delivering-direction frame-airtime). Undiluted by climb ramp /
+                # idle / setup. Reconciles with the modem rbc + HW. None if the
+                # relay airtime-json was unavailable. PIN a config (--no-gearshift)
+                # to read a single tier's per-frame wire (else it's a config mix).
+                "wire_bps_airtime": wire_bps_airtime,
+                "airtime_secs": airtime_secs,
+                "airtime_signal_chunks": airtime_signal_chunks,
+                "airtime_silence_chunks": airtime_silence_chunks,
+                "airtime_total_virtual_s": airtime_total_virtual_s,
                 # --- I7 delivered-byte integrity ---
                 "payload": os.path.basename(args.payload),
                 "payload_bytes": len(payload),

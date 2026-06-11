@@ -100,6 +100,7 @@ same MERCURY_SIM_PORT. See tools/sim/sim_arq_channel.py for the full harness.
 """
 
 import argparse
+import json
 import math
 import os
 import queue
@@ -977,6 +978,12 @@ def main():
                          "vstamp=' canary) — a non-stamp modem silently corrupts "
                          "8 bytes/chunk. See _simcal_takeover/ASSESSMENT.md.")
     ap.add_argument("--log", default=None)
+    ap.add_argument("--airtime-json", default=None,
+                    help="write the GAP-#1 per-direction airtime breakdown (signal "
+                         "vs silence forwarded-chunk counts, virtual airtime seconds) "
+                         "to this path on shutdown. The harness reads it to derive the "
+                         "HW-representative per-frame wire rate (delivered_bytes*8 / "
+                         "airtime_secs). No-op when unset (back-compatible).")
     args = ap.parse_args()
     if args.barrier_k < 1:
         ap.error("--barrier-k must be >= 1")
@@ -1094,6 +1101,24 @@ def main():
 
     stop = threading.Event()
     counters = {"a2b": 0, "b2a": 0}      # per-direction chunk counts
+    # ---- GAP #1 airtime accounting (sim-fidelity throughput breakdown) -------
+    # Split each direction's FORWARDED chunks into SIGNAL (the modem was actively
+    # keying a frame on the wire — real OFDM/MFSK airtime) vs SILENCE (inter-frame
+    # gaps, PTT turnaround, ACK-wait idle — the modem TX bridge floods memset(0)).
+    # The classifier is the SAME `silent` flag the reader already computes on the
+    # RAW pre-channel modem samples (an idle TX bridge sends exact zeros, so the
+    # INBOUND raw mean-square is < SILENCE_EPS). This lets the harness derive the
+    # per-frame CHANNEL wire rate = delivered_bytes*8 / (signal_chunks*1024/FS) —
+    # the airtime-budget number that maps to the modem's own rbc and to HW — and
+    # separate it from the wall-clock rate that is diluted by climb ramp + idle.
+    # Coalesced (bigstep) silence advances the SILENCE count by the same step so
+    # the airtime fraction is invariant to coalescing. NOTE: the drift/turnaround
+    # model re-times the FORWARDED stream AFTER ch.process(), but the `silent` flag
+    # is computed on the RAW INBOUND pre-channel sample (reader), so the SIGNAL vs
+    # SILENCE classification is unaffected by drift — the airtime fraction reflects
+    # the modem's keying, the intended axis.
+    sig_chunks = {"a2b": 0, "b2a": 0}    # forwarded chunks carrying frame airtime
+    sil_chunks = {"a2b": 0, "b2a": 0}    # forwarded chunks carrying inter-frame idle
     # Relay-stamped shared clock (Q3, sim-arq-channel.md §10.5b). The relay is the
     # SINGLE authoritative virtual-time source: each forwarded chunk carries an
     # 8-byte LE END-sample-index stamp; both peers SET g_sim_samples to
@@ -1250,6 +1275,16 @@ def main():
     CLOSED, FORWARDED, WOULDBLOCK = -1, 1, 0
     WIRE_STAMP = bool(args.wire_stamp)
 
+    def _account(key, n, silent):
+        """Attribute n forwarded chunks on `key` to SIGNAL (frame airtime) or
+        SILENCE (inter-frame idle / turnaround) per the RAW-inbound silence flag.
+        Pure bookkeeping for the GAP-#1 airtime breakdown; does not touch the wire
+        or the barrier."""
+        if silent:
+            sil_chunks[key] += n
+        else:
+            sig_chunks[key] += n
+
     def _send_stamped(key, out):
         """Forward `out` to the destination peer. In --wire-stamp mode prepend the
         8-byte <Q per-direction END-sample stamp (relay-driven clock, needs the
@@ -1300,13 +1335,14 @@ def main():
         if counters[key] - counters[other] >= BARRIER_K:
             return WOULDBLOCK            # credit-blocked: wait for `other`
         try:
-            out, _silent = inq[key].get_nowait()
+            out, silent = inq[key].get_nowait()
         except queue.Empty:
             return WOULDBLOCK            # reader hasn't produced the chunk yet
         if out is None:                  # reader signalled close
             stop.set()
             return CLOSED
         counters[key] += 1
+        _account(key, 1, silent)
         return _send_stamped(key, out)
 
     def try_bigstep():
@@ -1337,15 +1373,18 @@ def main():
             if a_out is None:
                 stop.set(); return -1
             counters["a2b"] += 1
+            _account("a2b", 1, a_sil)
             return -1 if _send_stamped("a2b", a_out) == CLOSED else 0
         if a_out is None or b_out is None:
             stop.set(); return -1
         if not (a_sil and b_sil):
             # at least one direction carries SIGNAL — forward both 1:1, no skip.
             counters["a2b"] += 1
+            _account("a2b", 1, a_sil)
             if _send_stamped("a2b", a_out) == CLOSED:
                 return -1
             counters["b2a"] += 1
+            _account("b2a", 1, b_sil)
             if _send_stamped("b2a", b_out) == CLOSED:
                 return -1
             return 0
@@ -1362,8 +1401,10 @@ def main():
             if not s:
                 # signal arrived — forward the buffered silence then this signal.
                 counters["a2b"] += a_n
+                _account("a2b", a_n, True)        # coalesced run was all-silence
                 if _send_stamped("a2b", a_last) == CLOSED: return -1
                 counters["a2b"] += 1
+                _account("a2b", 1, False)         # the arriving signal chunk
                 if _send_stamped("a2b", o) == CLOSED: return -1
                 a_last, a_n = None, 0
                 break
@@ -1376,8 +1417,10 @@ def main():
             if o is None: stop.set(); return -1
             if not s:
                 counters["b2a"] += b_n
+                _account("b2a", b_n, True)        # coalesced run was all-silence
                 if _send_stamped("b2a", b_last) == CLOSED: return -1
                 counters["b2a"] += 1
+                _account("b2a", 1, False)         # the arriving signal chunk
                 if _send_stamped("b2a", o) == CLOSED: return -1
                 b_last, b_n = None, 0
                 break
@@ -1385,9 +1428,11 @@ def main():
         # forward the (possibly remaining) coalesced silence tail per direction.
         if a_n > 0:
             counters["a2b"] += a_n
+            _account("a2b", a_n, True)            # coalesced silence tail
             if _send_stamped("a2b", a_last) == CLOSED: return -1
         if b_n > 0:
             counters["b2a"] += b_n
+            _account("b2a", b_n, True)            # coalesced silence tail
             if _send_stamped("b2a", b_last) == CLOSED: return -1
         return max(a_n, b_n, 1)
 
@@ -1446,6 +1491,54 @@ def main():
     log(f"relay done. a2b={counters['a2b']} b2a={counters['b2a']} chunks "
         f"(final split={counters['a2b']-counters['b2a']:+d}, barrier_k={args.barrier_k}, "
         f"wire_stamp={int(WIRE_STAMP)})")
+
+    # ---- GAP #1 airtime breakdown ------------------------------------------
+    # Per direction: where did the simulated wall-clock (virtual channel time) go?
+    #   SIGNAL chunks  -> real frame airtime (OFDM/MFSK keyed on the wire)
+    #   SILENCE chunks -> inter-frame idle + PTT turnaround + ACK-wait
+    # virtual airtime seconds = signal_chunks * CHUNK_SAMPLES / FS. The harness
+    # divides delivered app bytes by the DELIVERING direction's airtime to get the
+    # per-frame CHANNEL wire rate (maps to the modem's rbc and to HW), separate
+    # from the wall-clock rate diluted by climb ramp + idle.
+    def _airtime_s(key):
+        return sig_chunks[key] * CHUNK_SAMPLES / FS
+
+    def _total_s(key):
+        return counters[key] * CHUNK_SAMPLES / FS
+
+    for key in ("a2b", "b2a"):
+        tot = counters[key]
+        frac = (sig_chunks[key] / tot) if tot else 0.0
+        log(f"airtime {key}: signal={sig_chunks[key]} silence={sil_chunks[key]} "
+            f"total={tot} chunks | signal_airtime={_airtime_s(key):.2f}s "
+            f"total_virtual={_total_s(key):.2f}s signal_frac={frac:.3f}")
+
+    if args.airtime_json:
+        try:
+            with open(args.airtime_json, "w") as af:
+                json.dump({
+                    "fs": FS,
+                    "chunk_samples": CHUNK_SAMPLES,
+                    "barrier_k": args.barrier_k,
+                    "wire_stamp": int(WIRE_STAMP),
+                    "a2b": {
+                        "signal_chunks": sig_chunks["a2b"],
+                        "silence_chunks": sil_chunks["a2b"],
+                        "total_chunks": counters["a2b"],
+                        "signal_airtime_s": _airtime_s("a2b"),
+                        "total_virtual_s": _total_s("a2b"),
+                    },
+                    "b2a": {
+                        "signal_chunks": sig_chunks["b2a"],
+                        "silence_chunks": sil_chunks["b2a"],
+                        "total_chunks": counters["b2a"],
+                        "signal_airtime_s": _airtime_s("b2a"),
+                        "total_virtual_s": _total_s("b2a"),
+                    },
+                }, af, indent=1)
+            log(f"wrote airtime breakdown -> {args.airtime_json}")
+        except OSError as e:
+            log(f"WARN: could not write airtime-json {args.airtime_json}: {e}")
     return 0
 
 
