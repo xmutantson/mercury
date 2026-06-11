@@ -66,7 +66,7 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	// SACK Design A Step 1 — DATA_LONG payload capacity is reduced by 1 byte
 	// when sack_v2_enabled. v1 path uses the legacy 4-byte macro; bytes-on-the
 	// -wire and bounds are identical to pre-Step-1.
-	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled)))
+	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled, header_carries_d5)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -75,7 +75,7 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	// SACK Design A Step 2 — DATA_SHORT payload capacity is reduced by 1 byte
 	// when sack_v2_enabled. v1 path uses the legacy 5-byte macro; bytes-on-the
 	// -wire and bounds are identical to pre-Step-2.
-	if(type==DATA_SHORT && length>(max_data_length+max_header_length-effective_data_short_header_length(sack_v2_enabled)))
+	if(type==DATA_SHORT && length>(max_data_length+max_header_length-effective_data_short_header_length(sack_v2_enabled, header_carries_d5)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -89,7 +89,7 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	}
 	{
 		// SACK Design A Step 1 — zero-pad up to effective DATA_LONG payload size.
-		int fill_end = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled);
+		int fill_end = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 		if(fill_end > N_MAX/8) fill_end = N_MAX/8;
 		for(int j=messages_rx[loc].length;j<fill_end;j++)
 		{
@@ -848,8 +848,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 				if(v2_route_to_prev)
 				{
 					int loc = (int)((unsigned char)messages_rx_buffer.id);
-					int eff_long  = effective_data_long_header_length(sack_v2_enabled);
-					int eff_short = effective_data_short_header_length(sack_v2_enabled);
+					int eff_long  = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+					int eff_short = effective_data_short_header_length(sack_v2_enabled, header_carries_d5);
 					int max_long  = max_data_length + max_header_length - eff_long;
 					int max_short = max_data_length + max_header_length - eff_short;
 					bool len_ok = true;
@@ -894,6 +894,40 @@ void cl_arq_controller::process_messages_rx_data_control()
 						messages_rx_prev[loc].batch_seq_id = messages_rx_buffer.batch_seq_id;
 						if(prev_status != RECEIVED && prev_status != ACKED)
 							rsp_prev_batch_received_count++;
+						// D5: a prev-routed frame carries the PREV batch's authoritative
+						// frame count. If the prev was armed with an EOB-INFERRED (too
+						// short) expected_count because the original EOB frame was lost,
+						// re-derive expected_count from the wired count the moment a
+						// surviving frame of that batch reveals it — so the lost-EOB tail
+						// is now INSIDE expected_count, the completion gate waits for it,
+						// and the SACK span (below) requests it instead of silently
+						// dropping it. Clamp to [received_count, data_batch_size]: never
+						// shrink below what we already hold, never exceed the storage
+						// bound. Gated off under MERCURY_D5_INFER_DEFEAT (fail-before).
+						if(rsp_prev_batch_active && rx_buffer_batch_total_frames > 0)
+						{
+							bool d5_infer_defeat = false;
+							{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
+							  if(e && *e && atoi(e)!=0) d5_infer_defeat = true; }
+							if(!d5_infer_defeat)
+							{
+								int wired = rx_buffer_batch_total_frames;
+								if(wired > this->data_batch_size) wired = this->data_batch_size;
+								if(wired < rsp_prev_batch_received_count)
+									wired = rsp_prev_batch_received_count;
+								if(wired > rsp_prev_batch_expected_count)
+								{
+									printf("[RSP-V2-D5-PREVEXP] prev_batch_seq_id=%d "
+										"expected %d -> %d (wired batch_total_frames=%d; "
+										"EOB-inference was short)\n",
+										rsp_prev_batch_seq_id,
+										rsp_prev_batch_expected_count, wired,
+										rx_buffer_batch_total_frames);
+									fflush(stdout);
+									rsp_prev_batch_expected_count = wired;
+								}
+							}
+						}
 
 						printf("[RSP-V2-PREV-RX] bsi=%d id=%d seq=%d/%d len=%d "
 							"prev_received=%d/%d\n",
@@ -1163,14 +1197,41 @@ void cl_arq_controller::process_messages_rx_data_control()
 				// rx_buffer_eob_seq stays -1, so v1 is left byte-for-byte unchanged.
 				if(sack_v2_enabled && rx_buffer_eob_seq >= 0)
 					last_received_end_of_batch_seq = rx_buffer_eob_seq;
+				// D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): promote the wired per-batch frame
+				// count ONLY now, inside the confirmed match-current block (same staging
+				// discipline as the EOB above). A non-zero count on ANY frame of the batch
+				// makes the authoritative length survive the loss of the EOB frame. -1
+				// (unknown) leaves rx_batch_total_frames unchanged so a later frame that
+				// DOES carry it can still latch it.
+				if(sack_v2_enabled && rx_buffer_batch_total_frames > 0)
+					rx_batch_total_frames = rx_buffer_batch_total_frames;
 				int rx_timeout = 0;
 				int effective_batch = data_batch_size;
+				// D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): does the wired per-batch frame
+				// count override the EOB inference for THIS current batch's ACK gate?
+				bool d5_infer_defeat_cur = false;
+				{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
+				  if(e && *e && atoi(e)!=0) d5_infer_defeat_cur = true; }
 				{
 					// Determine actual expected frame count.
 					// With adaptive batch sizing, commander may send fewer frames
 					// than data_batch_size. Use compression header to detect this.
+					// D5: PREFER the wired authoritative count. With a lost EOB frame
+					// the inference (last_received_end_of_batch_seq+1) is the highest
+					// OTHER seq seen, which is SHORT — it would ACK-GATE the current
+					// batch as complete with the tail missing (silent truncation). The
+					// wired count keeps effective_batch at the true length, so
+					// batch_rx_frame_count < effective_batch and the batch falls to the
+					// SACK path (which now spans + requests the lost tail). Fallback to
+					// the EOB inference when the count is unknown / under DEFEAT.
+					if(rx_batch_total_frames > 0 && !d5_infer_defeat_cur)
+					{
+						int wired = rx_batch_total_frames;
+						if(wired < effective_batch)
+							effective_batch = wired;
+					}
 					// End-of-batch flag: commander marks last frame with bit 7
-					if(last_received_end_of_batch_seq >= 0)
+					else if(last_received_end_of_batch_seq >= 0)
 					{
 						int eob = last_received_end_of_batch_seq + 1;
 						if(eob < effective_batch)
@@ -1188,7 +1249,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 						int gate_hdr_size = compressor.get_header_size();
 						int total_compressed = gate_hdr_size + hdr_comp;
 						// SACK Design A Step 1 — effective DATA_LONG header.
-						int mf = max_data_length + max_header_length - effective_data_long_header_length(sack_v2_enabled);
+						int mf = max_data_length + max_header_length - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 						int hdr_expected = (total_compressed + mf - 1) / mf;
 						if(hdr_expected < 1) hdr_expected = 1;
 						if(hdr_expected < effective_batch)
@@ -1760,10 +1821,28 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				if(messages_rx[i].status == RECEIVED) rx_received++;
 
 			int expected = data_batch_size;  // Default for non-compressed
+			// D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): the SACK partial gate compares
+			// rx_received < expected; the bitmap then advertises which slots in
+			// [0, data_batch_size) are missing. With a lost EOB the inference
+			// (last_received_end_of_batch_seq+1) collapses `expected` to exclude
+			// the lost tail → rx_received >= expected → NO SACK is sent for it →
+			// the lost frame is NEVER retransmitted (the SACK dead-end, §4.3). The
+			// wired authoritative count keeps the lost tail INSIDE `expected`, so the
+			// gate fires, the bitmap marks the tail not-received, and CMD retransmits
+			// it → faithful recovery. Fallback to the EOB inference / compression-
+			// header derivation when the count is unknown / under DEFEAT.
+			bool d5_infer_defeat_sack = false;
+			{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
+			  if(e && *e && atoi(e)!=0) d5_infer_defeat_sack = true; }
 			// End-of-batch flag: commander marks last frame with bit 7 in
 			// sequence_number, giving us the actual batch size sent.
 			// Works for all modes (compressed, uncompressed, encrypted).
-			if(last_received_end_of_batch_seq >= 0)
+			if(rx_batch_total_frames > 0 && !d5_infer_defeat_sack)
+			{
+				expected = rx_batch_total_frames;
+				if(expected > data_batch_size) expected = data_batch_size;
+			}
+			else if(last_received_end_of_batch_seq >= 0)
 			{
 				expected = last_received_end_of_batch_seq + 1;
 				if(expected > data_batch_size) expected = data_batch_size;
@@ -1784,7 +1863,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				int gate_hdr_size = compressor.get_header_size();
 				int total_compressed = gate_hdr_size + hdr_comp;
 				// SACK Design A Step 1 — effective DATA_LONG header.
-				int mf = max_data_length + max_header_length - effective_data_long_header_length(sack_v2_enabled);
+				int mf = max_data_length + max_header_length - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 				expected = (total_compressed + mf - 1) / mf;
 				if(expected > data_batch_size) expected = data_batch_size;
 				if(expected < 1) expected = 1;
@@ -2065,6 +2144,13 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
 					rsp_current_expected_batch_seq_id =
 						(rsp_current_expected_batch_seq_id + 1) & 0xFF;
+					// D5: this current batch is delivered; the NEXT batch (the new
+					// rsp_current_expected_batch_seq_id) must latch its OWN authoritative
+					// frame count. Reset so a stale count cannot mis-size the next batch's
+					// effective_batch / SACK span. (last_received_end_of_batch_seq is
+					// already cleared on the SACK-suppress path at :1858/:1887; the
+					// clean-complete path here resets the wired count symmetrically.)
+					rx_batch_total_frames = -1;
 					printf("[RSP-V2-BATCH-DONE] prev=%d next_expected=%d last_delivered=%d\n",
 						rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
 						rsp_last_delivered_batch_seq_id);
@@ -3318,7 +3404,7 @@ void cl_arq_controller::process_buffer_data_responder()
 				char rx_raw[MAX_BUFFER_SIZE];
 				// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 				// data-pop size; v1 (default) identical to legacy macro.
-				int rx_raw_len = fifo_buffer_rx.pop(rx_raw, max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled));
+				int rx_raw_len = fifo_buffer_rx.pop(rx_raw, max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled, header_carries_d5));
 
 				// Build the to-send unit (`send_buf`/`send_len`). For B2F the unit is
 				// the POST-transform stream (the raw bytes are consumed by the parser
@@ -5700,6 +5786,269 @@ int cl_arq_controller::test_v2_pendingack_flip_alias()
 		pass ? "PASS" : "FAIL", prefix_bad_flips,
 		resolved[0], resolved[1], resolved[2], resolved[3], resolved[4],
 		owning_pending, foreign_pending, R);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// D5 — EOB-inference batch truncation (lost-EOB tail → silent skip)
+// ============================================================================
+//
+// CLI: --test-eob-loss-batch-truncation
+//
+// TRACK_C_D2D3D5_DESIGN.md §5.3 / data-flow-prev-bump.md §8. The prev cross-
+// storage's expected_count was INFERRED from last_received_end_of_batch_seq (a
+// single-frame-of-evidence length channel: only the EOB-bit-7 last frame carries
+// it). When the EOB frame is lost, the inference latches a SHORT length, the
+// genuinely-missing tail frame falls outside [0, expected_count) as FREE, the
+// count gate fires, and copy_data_to_buffer() concatenates the present slots —
+// silently dropping the tail (~155 B at CFG16), NO [RSP-V2-GAP-ABORT], md5-false.
+//
+// D5 carries the TX-authoritative per-batch frame count (batch_total_frames) on
+// EVERY data frame, so a surviving frame reveals the true length; the consumers
+// (prev_expected here, the SACK span, the in-place effective_batch) use it over
+// the inference. This test drives the REAL bump_bsi_and_transfer_prev() producer,
+// the REAL prev-completion count gate, the REAL copy_data_to_buffer() delivery
+// via the production messages_rx<->messages_rx_prev pointer swap, and the REAL
+// fifo_buffer_rx as a byte-exact oracle (compression OFF, distinct per-slot
+// bytes slot*16 + j so a skipped slot is detectable in the delivered stream).
+//
+//   fail-before (MERCURY_D5_INFER_DEFEAT=1): prev_expected=29; received_count=29
+//     >= 29 → gate fires with slot 29 FREE → 29 frames delivered, slot-29 bytes
+//     ABSENT → delivered stream != the 30-frame tx prefix (the silent skip).
+//   pass-after (defeat off): prev_expected=30; received_count=29 < 30 → gate HOLDS
+//     (nothing delivered); inject the slot-29 retransmit → received=30 → gate
+//     fires → all 30 frames delivered in order (faithful, byte-exact).
+//
+// Also covers the byte-identical guard: a NO-LOSS 30-frame v2 batch delivers the
+// same 30 frames whether D5 is on or off (wired count == EOB inference).
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_eob_loss_batch_truncation()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-D5-EOBLOSS] start (MERCURY_D5_INFER_DEFEAT=%d)\n", defeat ? 1 : 0);
+	fflush(stdout);
+
+	// --- in-process scaffold (mirror test_inorder_demote) ------------------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 7;   // v2 DATA_SHORT header is 7 bytes with D5
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-D5-EOBLOSS] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled     = true;
+	this->sack_enabled        = true;
+	this->header_carries_d5   = true;    // D5 active on this OFDM-like multi-frame batch
+	this->compression_enabled = false;   // route copy_data_to_buffer() to the byte-exact no-compression leg
+	this->data_batch_size     = 30;
+
+	const int TOTAL   = 30;            // true TX frame count for this batch
+	const int FRAMELEN = 16;          // bytes per frame (distinct per slot)
+	const int LOST    = TOTAL - 1;    // the EOB-marked last frame (slot 29) is lost
+	const int SEALED_BSI = 7;         // the bsi we seal into prev
+
+	// Byte oracle: frame i carries bytes [i*16 + 0 .. i*16 + 15].
+	auto frame_bytes = [&](int i, char* out) {
+		for(int j=0; j<FRAMELEN; j++) out[j] = (char)(unsigned char)(i*16 + j);
+	};
+	// The faithful 30-frame tx prefix (what a non-lossy delivery must equal).
+	char tx_prefix[TOTAL * FRAMELEN];
+	for(int i=0; i<TOTAL; i++) frame_bytes(i, &tx_prefix[i*FRAMELEN]);
+
+	int fails = 0;
+
+	// Helper: seat messages_rx[] with the present frames of the batch.
+	//   present_slot[i]==true → slot i RECEIVED with its oracle bytes.
+	// Sets last_received_end_of_batch_seq to `eob_infer_seq` (the corrupt SHORT
+	// inference the lost EOB leaves) and rx_batch_total_frames to `wired_count`
+	// (the authoritative count a surviving frame revealed; -1 = unknown).
+	auto seat_current = [&](const bool* present_slot, int eob_infer_seq, int wired_count) {
+		for(int i=0; i<this->nMessages; i++)
+		{
+			messages_rx[i].status       = FREE;
+			messages_rx[i].length       = 0;
+			messages_rx[i].batch_seq_id = -1;
+		}
+		for(int i=0; i<TOTAL; i++)
+		{
+			if(present_slot[i])
+			{
+				char b[FRAMELEN]; frame_bytes(i, b);
+				messages_rx[i].type   = DATA_SHORT;
+				messages_rx[i].id     = (char)i;
+				messages_rx[i].length = FRAMELEN;
+				memcpy(messages_rx[i].data, b, FRAMELEN);
+				messages_rx[i].status       = RECEIVED;
+				messages_rx[i].batch_seq_id = SEALED_BSI;
+			}
+		}
+		this->last_received_end_of_batch_seq = eob_infer_seq;
+		this->rx_batch_total_frames          = wired_count;
+		this->rsp_current_expected_batch_seq_id = SEALED_BSI;
+		// fresh prev slate
+		for(int i=0; i<this->nMessages; i++) messages_rx_prev[i].status = FREE;
+		this->rsp_prev_batch_active         = false;
+		this->rsp_prev_batch_received_count = 0;
+		this->rsp_prev_batch_expected_count = 0;
+		this->rsp_last_delivered_batch_seq_id = (SEALED_BSI - 1) & 0xFF;  // contiguous: no D3.1 gap
+		this->link_status = CONNECTED;
+		this->fifo_buffer_rx.flush();
+	};
+
+	// Helper: run the REAL prev-completion count gate + REAL delivery (the exact
+	// production decision at arq_responder.cc:786-905, no big-block carve, gap
+	// gate contiguous by construction). Returns true if it DELIVERED.
+	auto try_prev_deliver = [&]()->bool {
+		if(!(this->rsp_prev_batch_active
+		     && this->rsp_prev_batch_received_count >= this->rsp_prev_batch_expected_count))
+			return false;   // gate HELD — faithful "wait for retx" state
+		// REAL delivery via the production pointer swap (mirrors :876-901).
+		struct st_message* saved_rx = messages_rx;
+		messages_rx = messages_rx_prev;
+		for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+			if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+		copy_data_to_buffer();                 // REAL reassembler → fifo_buffer_rx
+		messages_rx = saved_rx;
+		for(int i=0; i<this->nMessages; i++) messages_rx_prev[i].status = FREE;
+		this->rsp_prev_batch_active         = false;
+		this->rsp_prev_batch_received_count = 0;
+		this->rsp_prev_batch_expected_count = 0;
+		advance_last_delivered(this->rsp_prev_batch_seq_id);
+		return true;
+	};
+
+	// ====================================================================
+	// CASE A — lost-EOB tail: the defect.
+	// 29 frames present (slots 0..28), slot 29 (EOB) lost. The EOB inference
+	// latched 28 (expected=29); the wired count carries the true 30.
+	// ====================================================================
+	{
+		bool present[TOTAL];
+		for(int i=0; i<TOTAL; i++) present[i] = (i != LOST);
+		seat_current(present, /*eob_infer_seq=*/LOST - 1, /*wired_count=*/TOTAL);
+
+		bump_bsi_and_transfer_prev();   // REAL producer → sets expected_count
+
+		int got_expected = this->rsp_prev_batch_expected_count;
+		int got_received = this->rsp_prev_batch_received_count;
+		printf("[TEST-D5-EOBLOSS] CASE-A after bump: prev_expected=%d received=%d "
+			"(infer would give %d, wired count %d)\n",
+			got_expected, got_received, LOST, TOTAL);
+		fflush(stdout);
+
+		if(defeat)
+		{
+			// fail-before: producer used the SHORT inference → expected=29.
+			if(got_expected != LOST) {
+				printf("[TEST-D5-EOBLOSS] CASE-A FAIL(defeat): expected_count=%d (want %d)\n",
+					got_expected, LOST); fails++;
+			}
+			bool delivered = try_prev_deliver();   // 29>=29 → fires
+			char drained[TOTAL * FRAMELEN];
+			int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+			// The bug: 29 frames delivered, slot-29 bytes absent → != tx_prefix.
+			bool faithful_30 = (popped == TOTAL*FRAMELEN)
+				&& (memcmp(drained, tx_prefix, TOTAL*FRAMELEN) == 0);
+			bool truncated_29 = (popped == LOST*FRAMELEN)
+				&& (memcmp(drained, tx_prefix, LOST*FRAMELEN) == 0);
+			printf("[TEST-D5-EOBLOSS] CASE-A(defeat): delivered=%d popped=%dB "
+				"faithful_30=%d truncated_29=%d\n",
+				delivered?1:0, popped, faithful_30?1:0, truncated_29?1:0);
+			fflush(stdout);
+			// fail-before MUST reproduce the silent truncation (the bug), NOT be faithful.
+			if(faithful_30 || !truncated_29) {
+				printf("[TEST-D5-EOBLOSS] CASE-A FAIL(defeat): did not reproduce the "
+					"silent 29-frame truncation\n"); fails++;
+			}
+		}
+		else
+		{
+			// pass-after: producer used the wired count → expected=30.
+			if(got_expected != TOTAL) {
+				printf("[TEST-D5-EOBLOSS] CASE-A FAIL(fix): expected_count=%d (want %d)\n",
+					got_expected, TOTAL); fails++;
+			}
+			// gate HOLDS: received 29 < expected 30 → nothing delivered.
+			bool delivered_early = try_prev_deliver();
+			if(delivered_early) {
+				printf("[TEST-D5-EOBLOSS] CASE-A FAIL(fix): prev delivered with a hole "
+					"(received %d < expected %d should HOLD)\n", got_received, got_expected);
+				fails++;
+			}
+			{
+				char drained0[TOTAL * FRAMELEN];
+				int popped0 = this->fifo_buffer_rx.pop(drained0, (int)sizeof(drained0));
+				if(popped0 != 0) {
+					printf("[TEST-D5-EOBLOSS] CASE-A FAIL(fix): %dB delivered while held\n", popped0);
+					fails++;
+				}
+			}
+			// Inject the slot-29 retransmit into the prev cross-storage (the SACK
+			// span now spans it, so CMD re-sends it). received → 30 → gate fires.
+			{
+				char b[FRAMELEN]; frame_bytes(LOST, b);
+				messages_rx_prev[LOST].type   = DATA_SHORT;
+				messages_rx_prev[LOST].id     = (char)LOST;
+				messages_rx_prev[LOST].length = FRAMELEN;
+				memcpy(messages_rx_prev[LOST].data, b, FRAMELEN);
+				char was = messages_rx_prev[LOST].status;
+				messages_rx_prev[LOST].status = RECEIVED;
+				if(was != RECEIVED && was != ACKED) this->rsp_prev_batch_received_count++;
+			}
+			bool delivered = try_prev_deliver();   // 30>=30 → fires
+			char drained[TOTAL * FRAMELEN];
+			int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+			bool faithful_30 = (popped == TOTAL*FRAMELEN)
+				&& (memcmp(drained, tx_prefix, TOTAL*FRAMELEN) == 0);
+			printf("[TEST-D5-EOBLOSS] CASE-A(fix): after retx delivered=%d popped=%dB "
+				"faithful_30=%d\n", delivered?1:0, popped, faithful_30?1:0);
+			fflush(stdout);
+			if(!delivered || !faithful_30) {
+				printf("[TEST-D5-EOBLOSS] CASE-A FAIL(fix): not faithful after retx "
+					"(delivered=%d popped=%dB)\n", delivered?1:0, popped); fails++;
+			}
+		}
+	}
+
+	// ====================================================================
+	// CASE B — byte-identical guard: a FULL 30-frame batch (no loss) must
+	// deliver the same 30 frames whether D5 is on or off (wired == infer).
+	// ====================================================================
+	{
+		bool present[TOTAL];
+		for(int i=0; i<TOTAL; i++) present[i] = true;   // all 30 present, EOB seen
+		seat_current(present, /*eob_infer_seq=*/TOTAL - 1, /*wired_count=*/TOTAL);
+
+		bump_bsi_and_transfer_prev();
+		int got_expected = this->rsp_prev_batch_expected_count;
+		bool delivered = try_prev_deliver();
+		char drained[TOTAL * FRAMELEN];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+		bool faithful_30 = (popped == TOTAL*FRAMELEN)
+			&& (memcmp(drained, tx_prefix, TOTAL*FRAMELEN) == 0);
+		printf("[TEST-D5-EOBLOSS] CASE-B (no-loss): expected=%d delivered=%d popped=%dB faithful_30=%d\n",
+			got_expected, delivered?1:0, popped, faithful_30?1:0);
+		fflush(stdout);
+		// Both modes: full batch delivers faithfully (wired count == EOB inference == 30).
+		if(got_expected != TOTAL || !delivered || !faithful_30) {
+			printf("[TEST-D5-EOBLOSS] CASE-B FAIL: full batch not delivered faithfully\n");
+			fails++;
+		}
+	}
+
+	bool pass = (fails == 0);
+	printf("[TEST-D5-EOBLOSS] %s: fails=%d (defeat=%d)\n",
+		pass ? "PASS" : "FAIL", fails, defeat ? 1 : 0);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }

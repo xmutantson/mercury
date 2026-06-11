@@ -1275,7 +1275,7 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 	// SACK Design A Step 1 — DATA_LONG payload capacity is reduced by 1 byte
 	// when sack_v2_enabled (the new batch_seq_id byte occupies that space).
 	// In v1 mode the effective value is identical to the legacy 4-byte macro.
-	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled)))
+	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled, header_carries_d5)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -1284,7 +1284,7 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 	// SACK Design A Step 2 — DATA_SHORT payload capacity is reduced by 1 byte
 	// when sack_v2_enabled (the new batch_seq_id byte occupies that space).
 	// In v1 mode the effective value is identical to the legacy 5-byte macro.
-	if(type==DATA_SHORT && length>(max_data_length+max_header_length-effective_data_short_header_length(sack_v2_enabled)))
+	if(type==DATA_SHORT && length>(max_data_length+max_header_length-effective_data_short_header_length(sack_v2_enabled, header_carries_d5)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -11107,6 +11107,10 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 	max_data_length   = 6;
 	max_header_length = 6;
 	sack_v2_enabled   = true;   // production default since Design A Step 14
+	// D5: robust configs do NOT carry the batch_total_frames byte (load_configuration
+	// sets this from is_robust_config), so the v2 DATA_LONG header stays 5 bytes and
+	// max_frame == 7 == COMPRESS_HEADER_SIZE — the deadlock floor C0 asserts.
+	header_carries_d5 = false;
 	robust_enabled    = YES;
 	narrowband_enabled= NO;
 	current_configuration = ROBUST_0;
@@ -11121,7 +11125,7 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 
 	// max_frame the data-fill computes — exposed so the assertion is explicit.
 	int max_frame = max_data_length + max_header_length
-	              - effective_data_long_header_length(sack_v2_enabled);
+	              - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 	check(max_frame == 7,
 		"C0 ROBUST_0 max_frame == 7 (== COMPRESS_HEADER_SIZE, the worst case)",
 		max_frame, 7);
@@ -14640,7 +14644,7 @@ void cl_arq_controller::process_buffer_data_commander()
 			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 			// payload budget. In v1 (default) identical to legacy macro; in v2
 			// loses 1 byte to the batch_seq_id field.
-			int max_frame = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled);
+			int max_frame = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 
 			// ROBUST_0 compression-deadlock fix (data-flow-compress-frame-fill.md
 			// §5). Use compression ONLY when the per-batch budget can hold the

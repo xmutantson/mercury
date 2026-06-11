@@ -269,20 +269,39 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 // SACK Design A Step 1 — gated DATA_LONG header growth.
 // When sack_v2_enabled is false (v1 path / default), DATA_LONG header is 4
 // bytes [type, conn_id, seq_num(EOB bit7), id] — identical to pre-Step-1
-// wire format. When sack_v2_enabled is true, DATA_LONG header grows to 5
-// bytes [type, conn_id, seq_num(EOB bit7), batch_seq_id, id]. The
-// batch_seq_id byte is a placeholder (0) until Step 3 plumbs the real
-// counter. Header growth is the ONLY irreversible wire change in this
-// step; v1↔v1 traffic remains byte-identical. See SACK_DESIGN_A_PLAN.md
-// §4.2.1 and §7 (revised order).
-#define DATA_LONG_HEADER_LENGTH_V2 5
+// wire format. When sack_v2_enabled is true, DATA_LONG header grows to 6
+// bytes [type, conn_id, seq_num(EOB bit7), batch_seq_id, id, batch_total_frames].
+// The batch_seq_id byte (Step 3) and batch_total_frames byte (D5) are both
+// v2-only. Header growth is the ONLY irreversible wire change here; v1↔v1
+// traffic remains byte-identical. See SACK_DESIGN_A_PLAN.md §4.2.1 / §7 and
+// TRACK_C_D2D3D5_DESIGN.md §5.3 (the D5 batch_total_frames carrier).
+//
+// D5 (EOB-inference batch truncation): batch_total_frames is the TX-authoritative
+// per-batch frame count (message_batch_counter_tx, 1..MAX_SACK_BATCH_SIZE),
+// written IDENTICALLY on EVERY data frame of a batch so it survives the loss of
+// any single frame — including the EOB-bit-7-marked last frame, whose loss
+// previously erased the batch length and silently truncated the delivered batch
+// (PREV_BUMP_VERDICT.md §2). 0 on the wire = unknown/legacy (RX falls back to the
+// EOB inference). The byte is the highest-offset header field so the v1/v2 parse
+// of every PRIOR field (type/conn_id/seq/batch_seq_id/id/length) is byte-identical.
+#define DATA_LONG_HEADER_LENGTH_V2 6
+// D5 base (without the batch_total_frames byte) — the v2 DATA_LONG header BEFORE
+// D5. Robust / batch=1 configs use this (D5 is meaningless at batch=1 and the
+// extra byte would steal the scarce ROBUST_0 payload, re-opening the streaming-
+// compression deadlock floor max_frame >= COMPRESS_HEADER_SIZE; see
+// test_robust0_compress_deadlock C0). OFDM multi-frame configs use the +D5 value.
+#define DATA_LONG_HEADER_LENGTH_V2_NO_D5 5
 // SACK Design A Step 2 — gated DATA_SHORT header growth.
 // When sack_v2_enabled is false (v1 path / default), DATA_SHORT header is
 // 5 bytes [type, conn_id, seq_num(EOB bit7), id, length] — identical to
 // pre-Step-2 wire format. When sack_v2_enabled is true, DATA_SHORT header
-// grows to 6 bytes [type, conn_id, seq_num(EOB bit7), batch_seq_id, id,
-// length]. Same placeholder-then-plumb semantics as DATA_LONG_HEADER_LENGTH_V2.
-#define DATA_SHORT_HEADER_LENGTH_V2 6
+// grows to 7 bytes [type, conn_id, seq_num(EOB bit7), batch_seq_id, id,
+// length, batch_total_frames]. Same placeholder-then-plumb semantics as
+// DATA_LONG_HEADER_LENGTH_V2; the batch_total_frames byte (D5) is appended last.
+#define DATA_SHORT_HEADER_LENGTH_V2 7
+// D5 base (without the batch_total_frames byte). Same rationale as
+// DATA_LONG_HEADER_LENGTH_V2_NO_D5 — robust / batch=1 keeps the pre-D5 length.
+#define DATA_SHORT_HEADER_LENGTH_V2_NO_D5 6
 
 //Load config level
 #define FULL 0

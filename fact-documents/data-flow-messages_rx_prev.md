@@ -223,6 +223,70 @@ ROBUST_0 WB — the bitmap that drives the prev/partial path exists. On **NB** r
 at batch=1 (conjunct (b)) and the prev-path stays dead there — unchanged.
 See `data-flow-robust-tier-arq-batch.md` §3.7 / L1.
 
+### 4.5 D5 — the EOB-inference batch-truncation cure (2026-06-15, `fix/d5-wire-integrity`)
+
+**Context**: INV-PROD-2 (§4.2) said `rsp_prev_batch_expected_count` is set from
+`prev_expected = min(data_batch_size, last_received_eob+1, nMessages)`. That
+`last_received_end_of_batch_seq` inference is a **single-frame-of-evidence length
+channel**: only the EOB-bit-7-marked LAST frame of a batch carries the length. When
+that EOB frame is LOST, the inference latches a SHORT value (the highest OTHER seq
+seen), so the genuinely-missing tail frame lands in `[expected_count, data_batch_size)`
+as FREE. The COUNT gate (`received_count >= expected_count`, `arq_responder.cc:915-916`)
+then fires with the tail still absent, `copy_data_to_buffer()` concatenates the present
+slots, and the tail (~155 B at CFG16) is **silently dropped** — no `[RSP-V2-GAP-ABORT]`,
+md5_match FALSE. The SACK partial-gate `expected` (`process_messages_acknowledging_data`)
+collapsed identically, so the RX could never even SACK the lost tail — structurally
+unhealable (the dead-end).
+
+**The fix (D5, commit 99588ef cherry-picked onto monitor)**: carry a TX-authoritative
+per-batch frame count (`batch_total_frames` = `message_batch_counter_tx`) on EVERY v2
+DATA frame, so it survives the loss of any single frame. The three inference consumers
+(prev `prev_expected`; in-place `effective_batch`; SACK `expected`) now PREFER the wired
+count (`rx_batch_total_frames`) over the EOB inference, falling back to the inference
+only when the count is unknown (v1/legacy/NB, or no frame of the batch carried it yet).
+
+**INV-PROD-2 is REVISED**: when `rx_batch_total_frames > 0`, `prev_expected` =
+`min(rx_batch_total_frames, data_batch_size)` — the TRUE TX frame count, not the
+EOB inference. The inference path is now the FALLBACK, not the primary.
+
+**Why the monitor COUNT gate is sufficient for the lost-EOB-tail case (no D4-L1
+SET-gate required here)**: with the wired count `expected_count` becomes the true batch
+length, so every legitimate slot is at index `< expected_count`. A RECEIVED tail slot
+can no longer sit at index `>= expected_count` to over-count (the L1 over-count
+realization required `expected_count < data_batch_size`, which only the SHORT inference
+produced — D5 removes that at the source). Combined with the R7 store-bound (`loc ∈
+[0, data_batch_size)`, §4.3 INV-PROD-3) and the repeat-retx dedup (`prev_status !=
+RECEIVED` before `received_count++`, `arq_responder.cc:895`), `received_count ==
+expected_count` now IMPLIES every slot in `[0, expected_count)` is RECEIVED — the count
+gate is equivalent to a set check for this batch. A lost-EOB tail therefore leaves
+`received_count < expected_count`, the gate HOLDS, and the batch is SACK-recovered
+(faithful) or stale-discarded → D3.1 batch-level gap-abort (`delivery_step_is_gap`) →
+loud `[RSP-V2-GAP-ABORT]`. Faithful-after-retx OR loud-abort — never a silent skip.
+
+**Residual EOB-inference consumer noted (salvage-time audit, monitor-only, BENIGN)**:
+monitor carries a NEWER speculative-SACK (LEVER #2) near-completeness pre-check
+(`process_messages_rx_data_control`, `arq_responder.cc:536-541`, from commits
+88158c2/b1b91b3 — POST-dating D5's base 627c370, so 99588ef could not switch it). It
+re-derives `expected` from `last_received_end_of_batch_seq` and is NOT switched to the
+wired count. This is **NOT a silent-truncation exposure**: that gate only decides WHEN
+to PROMPT-FIRE a speculative SACK (`connection_status = ACKNOWLEDGING_DATA; return;`,
+`:622-623`) — it gates SACK TIMING, never DELIVERY. The actual delivery/ACK decision is
+the downstream ACK-GATE (`process_messages_acknowledging_data`, SACK `expected` at
+`:1845`) which IS D5-cured: it computes the true `expected` from the wired count, holds
+the batch (`rx_received < true_expected`), SACKs the lost tail, and recovers faithfully
+(or D3.1 loud-aborts). A SHORT `expected` here only mildly biases the spec-SACK fire
+moment; it cannot truncate. RECOMMENDED (enhancement, not a correctness fix): switch
+this pre-check to PREFER `rx_batch_total_frames` too, for spec-SACK accuracy under a
+lost-EOB batch. Tracked here; not blocking the D5 integrity merge.
+
+**Scope boundary (what D5 does NOT cover)**: D5 cures the lost-EOB SHORT-inference root
+cause. It does NOT change the `rescan_prev_on_batch_shrink` (R035) path: a mid-batch
+`data_batch_size` SHRINK that orphans a RECEIVED prev slot in `[new_batch, old_batch)`
+is an INDEPENDENT leak (the D4-L2 concern) untouched by D5 — D5 neither opens nor closes
+it. On monitor the reshrink still silently re-derives (`arq_common.cc:1071-1072`); that
+hazard is governed by §4.4 / §8 special-vigilance and is orthogonal to the wire count.
+See `data-flow-d5-eob-batch-truncation.md` §5 for the full D5 audit.
+
 ---
 
 ## §5 The R7 fix — what changed and why
@@ -298,6 +362,11 @@ Before changing any of:
   (`bump_bsi_and_transfer_prev`)
 - `rsp_prev_batch_received_count` / `rsp_prev_batch_expected_count`
   semantics
+- The D5 wired count (`rx_batch_total_frames` / `rx_buffer_batch_total_frames`),
+  the v2 header layout (`DATA_*_HEADER_LENGTH_V2[_NO_D5]`), the
+  `header_carries_d5` per-config gate, or any consumer that re-derives a batch
+  length from `last_received_end_of_batch_seq` (re-opens D5 unless the wired
+  count stays the PRIMARY source — see §4.5 and `data-flow-d5-eob-batch-truncation.md`)
 - `data_batch_size` (Axis 2 dynamic resize, gearshift)
 - `nMessages` allocation
 
@@ -386,3 +455,5 @@ mfsk-vara-parity-plan.md §3 R7.
   `data_batch_size`; its dynamic-resize behavior is referenced in §6
   vigilance note and §8 open question).
 - `mfsk-vara-parity-plan.md` §3 R7 — the bug report that drove this fix.
+- `data-flow-d5-eob-batch-truncation.md` — the D5 lost-EOB batch-truncation
+  fix (the wired `batch_total_frames` count that revises INV-PROD-2; see §4.5).
