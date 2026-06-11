@@ -246,3 +246,62 @@ seed by itself does NOT beat it there (it can regress). The TINTERP-seed COMPOSE
 per-subcarrier phase — that is the cell where LS floors 0/7 and the TINTERP-seed turbo crosses
 7/7 (CELL-B). This matches PCS_VERDICT (2): the 64-QAM det-floor is estimator-limited (genie
 decodes), and the estimator lever's job is to reach genie-class CSI — which CELL-B demonstrates.
+
+## §7 Fleet validation sweep (vs genie, across channels) — bigblock_p3_hw/_cfg17/CFG17_VALIDATE.json
+
+Fleet (.31/.21/.11, 56-core each) rebuilt feat/cfg17 @ 26ae773, 1032 cells, 6 seeds/cell,
+arms {uniform-64 LS-only / pasls (PAS+plain-LS) / stack (PAS+TINTERP-seed-turbo, nvfix OFF) /
+stacknvfix (diag) / genie-PAS}, EsN0 sweeps. Waterfall = lowest EsN0 with ≥99% decode-fraction.
+
+| channel    | uniform | pasls | **stack** | stacknvfix | genie |
+|------------|---------|-------|-----------|------------|-------|
+| clean      | 19      | 17    | 19        | —          | 16    |
+| detfloor   | none    | none  | **18**    | none       | 16    |
+| watt-good  | none    | none  | **19**    | —          | 17    |
+| watt-mod   | none    | none  | none(0.95@22) | —      | 19    |
+| watt-poor  | none    | none  | none(0.29@24) | —      | 23    |
+
+### §7.1 KEY FINDING — the ratio-nvfix MUST be OFF in sim (it MISFIRES on dispersive channels)
+On the det-floor the estimator nv is legitimately LOW (0.0093 @18 dB) while the post-EQ
+measured `variance` is LARGE (dispersive EVM). The ratio-gate `nv < measure_var/8` therefore
+TRIPS and over-softens the LLRs → decode dies. MEASURED (detfloor @18 dB seed12345 TINTERP-
+turbo): **NVFIX=0 → 7/7, NVFIX=1 → 0/7**; the `stacknvfix` arm floors 0.0 across ALL 14-22 dB,
+all 6 seeds. nvfix is a **HW-ONLY gated lever** (the in-sim nv never collapses); its CORRECTNESS
+is proven only via NV_FORCE (`--test-cfg17` CELL-C). Engaging it on a real dispersive sim channel
+ACTIVELY HARMS. Matches MEMORY.md "NVFIX SETBACK" + PCS_VERDICT bench-only scoping. **CORRECTION
+to the §0/§2 composed-stack default: the deployable SIM stack is nvfix-OFF; nvfix engages only
+on the HW post-EQ-EVM collapse (ratio-gate K=8, validated by bench, not sim).**
+
+### §7.2 KEY FINDING — the TINTERP seed is channel-gated (regresses on clean)
+clean waterfall: pasls (PAS+plain-LS) = **17 dB** vs stack (PAS+TINTERP-turbo) = **19 dB** — the
+TINTERP seed REGRESSES 2 dB on clean. detfloor: pasls = NONE vs stack = **18 dB**. The estimator
+lever differentiates ONLY where cold-LS cannot represent the channel (det-floor, fades). The
+deployable CFG17 estimator must be channel-appropriate (plain LS on clean/flat where near-genie;
+TINTERP-seed turbo on dispersive/fading). Confirms §6.1.
+
+### §7.3 Decisive answers
+- **clean**: CFG17 PAS-64 (pasls) full-decodes at **17 dB** (genie 16, CFG16 uniform-32 16 in the
+  SAME vehicle) → CFG17 decodes ~1 dB above CFG16's working point carrying +20% payload (the
+  PCS 15.3 dB figure is the genie-CSI PAS waterfall; the real-LS-estimator working point is 17).
+- **DET-FLOOR (the nv-collapse domain, decisive)**: ONLY the stack decodes (**18 dB**, tracking
+  genie 16 within ~2 dB); uniform/pasls/stacknvfix all FLOOR 0/7 across 14-22 dB. **The TINTERP-
+  seed turbo CLOSES the 64-QAM det-floor gap to genie where PCS-alone floored** — YES.
+- **GOOD fade**: stack full-decodes **19 dB** (genie 17); uniform/pasls floor → YES.
+- **MOD fade**: stack reaches 0.95 frac @22 dB but never full-99% in range (genie 19) → PARTIAL,
+  ~3 dB estimator gap. **POOR fade**: stack tops at 0.29 @24 dB (genie 23) → the estimator does
+  NOT close the gap; the time-varying deep fade outpaces it (the known fade-tier non-beat carries
+  to 64-QAM, exactly as hypothesized).
+
+### §7.4 Wire / VARA-beat math
+CFG17 = M=64 (6 b/sym) vs CFG16 M=32 (5 b/sym), same Nc=50/BW=2344Hz/rate0.875. Data-symbol
+payload edge = **1.197× (+20%)**; per-frame-with-preamble = 1.153× (CFG17 Nsymb=8 < CFG16 9
+dilutes vs the fixed 4-sym preamble). CFG17 per-frame wire = 4451.61 bps. × R=3.69 compression:
+- sustained conservative (1.153× on bench-8 CFG16 3060) = 3527 × 3.69 = **13,016 eff = 0.998× VARA**
+- sustained +20% (1.197×) = 3663 × 3.69 = **13,516 eff = 1.036× VARA (beat)**
+- per-frame PHY ceiling 4451.61 × 3.69 = **16,426 eff = 1.26× VARA** (held-at-per-frame)
+
+**HEADLINE: the composed CFG17 stack DECODES across clean/det-floor/GOOD where CFG16 works,
+carrying +20% wire — with two load-bearing caveats: (1) nvfix OFF in sim (HW-only gated), (2)
+the TINTERP seed channel-gated (clean uses plain-LS PAS). MOD partial / POOR floors (estimator
+gap, the carried-over fade-tier non-beat). Sim PASS is necessary-not-sufficient: the det-floor
+nv-collapse benefit is bench-only-confirmable (the gated follow-on).**
