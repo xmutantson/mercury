@@ -6332,6 +6332,14 @@ void cl_telecom_system::sfo_grid_test()
 	double ppm     = env_f("MERCURY_SIM2_SFO_PPM", 0.0);
 	bool   track   = (env_i("MERCURY_SFO_GRID_TRACK", 0) != 0);     // STEP 2: CPE/PEG corrector
 	bool   no_interp = (env_i("MERCURY_SFO_GRID_NOINTERP", 0) != 0);// negative control
+	// TURBO_EQ_VERDICT.md §5 TINTERP-SEED: MERCURY_SFO_GRID_TURBO_SEED=tinterp drives
+	// the WHOLE recommended stack — it=0 INIT estimate = TINTERP (the warm faded seed)
+	// AND data_aided_channel_estimator keeps that TINTERP H as the low-confidence FLOOR
+	// (ofdm.dd_seed_floor) instead of a cold pilots-only interpolation. Default unset =
+	// byte-identical (plain LS it=0 + pilots-only floor).
+	bool turbo_seed_tinterp = false;
+	{ const char* e = std::getenv("MERCURY_SFO_GRID_TURBO_SEED");
+	  if(e && (std::string(e)=="tinterp" || std::string(e)=="TINTERP")) turbo_seed_tinterp = true; }
 	int    win      = env_i("MERCURY_SFO_GRID_TRACK_WIN", 9);       // CPE/PEG sliding window
 	uint64_t seed   = (uint64_t)env_i("MERCURY_SFO_GRID_SEED", 12345);
 
@@ -6875,10 +6883,12 @@ void cl_telecom_system::sfo_grid_test()
 		ofdm.noise_variance_estimate = (npil>0) ? (nsum/(double)npil) : 0.01;
 		if(ofdm.noise_variance_estimate < 1e-6) ofdm.noise_variance_estimate = 1e-6;
 	}
-	else if(env_i("MERCURY_SFO_GRID_TINTERP_PROD", 0) != 0)
+	else if(env_i("MERCURY_SFO_GRID_TINTERP_PROD", 0) != 0 || turbo_seed_tinterp)
 	{
 		// feat/fade-tinterp REGRESSION HOOK: drive the PRODUCTION TIME_INTERP
 		// estimator (ofdm.cc LS_channel_estimator_tinterp) on the dense Dx=1/Dy=3
+		// (turbo_seed_tinterp also lands here so MERCURY_SFO_GRID_TURBO_SEED=tinterp
+		//  seeds it=0 with the warm faded TINTERP estimate per the §5 recommended stack)
 		// prod lattice — the exact promoted code, including the production cross-
 		// pilot AWGN nv-floor (NOT the harness prototype's known-EsN0 floor). This is
 		// the failing-first regression: on the GOOD (MPG/0.1 Hz) Watterson cell the
@@ -7044,6 +7054,10 @@ void cl_telecom_system::sfo_grid_test()
 		if(turbo_damp > 1.0) turbo_damp = 1.0;
 		double turbo_data_conf = env_f("MERCURY_SFO_GRID_TURBO_DATA_CONF", 0.30);
 		ofdm.dd_data_conf_thresh = turbo_data_conf;
+		// TURBO_EQ_VERDICT.md §5: keep the it=0 (TINTERP) seed H as the low-confidence
+		// floor inside data_aided_channel_estimator. Default false (pilots-only floor,
+		// byte-identical); MERCURY_SFO_GRID_TURBO_SEED=tinterp turns it on.
+		ofdm.dd_seed_floor = turbo_seed_tinterp;
 
 		int    cw_ok = 0, cw_crcfail = 0;
 		long   cw_infoerr = 0, cw_infobits = 0;

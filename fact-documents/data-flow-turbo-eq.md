@@ -176,3 +176,64 @@ divergence → "may not help" not "may regress").
   the base `[SFO-GRID-CODED]` line exactly.
 - **Monotone-safe (C-errprop)**: C-poor at low Es/N0 — TURBO-with-guards
   `codewords_decoded ≥ LS` (never worse), proving I7.
+
+---
+
+## §9 TINTERP-SEED extension (`feat/turbo-tinterp-seed`, TURBO_EQ_VERDICT.md §5)
+
+The faded-front follow-up: the TURBO_EQ_VERDICT.md §1 cold-start finding showed
+plain-LS-seeded turbo floors at 0/K on POOR/1 Hz (the data-aided refiner needs an
+it=0 decode under ~0.05 BER, which plain LS does not deliver). The §5 recommended
+stack seeds it=0 with TINTERP (the warm faded estimator) and keeps the TINTERP H as
+the it≥1 floor. **Measured: it=0 seed-swap breaks the Dy=3 wall (POOR 0/36 → 22/36,
+mean BER 0.204 → 0.013); the it≥1 refinement does NOT add on top (honest negative).**
+Verdict: `bigblock_p3_hw/_turboseed/TURBO_TINTERP_SEED_VERDICT.md`.
+
+### §9.1 NEW gating field (producer-side delta)
+`bool cl_ofdm::dd_seed_floor` (`ofdm.h`, default **false**). Read ONLY inside
+`data_aided_channel_estimator`. **false ⇒ the §2.2 pilots-only-floor behavior,
+byte-identical** (md5-proven BASE-vs-NEW). When true, two deltas in
+`data_aided_channel_estimator` (`ofdm.cc:2072`):
+1. **H floor (dossier §6.4 done right):** a low-confidence DATA cell (`v≥conf_thresh`)
+   falls back to the SNAPSHOT of the INCOMING `estimated_channel` (the it=0 TINTERP
+   seed), MEASURED, instead of UNKNOWN/pilots-only-interp (`ofdm.cc:2122-2131`). The
+   snapshot is taken at function entry, before Pass 1 clobbers `estimated_channel`.
+2. **nv warm-anchor (item 4, the decisive fix):** the nv floor uses
+   `min(estimate_noise_from_pilot_pairs, incoming-TINTERP-nv)` instead of the
+   cross-pilot differential alone (`ofdm.cc:2262-2277`). On a fast (fd=1) fade the
+   cross-pilot differential overcounts the Doppler as noise (~0.40 vs the
+   TINTERP-honest ~0.027), which ALONE collapses the it=1 LLRs (a 13× nv blow-up that
+   reverts the warm seed). The data residual can still RAISE nv (improve-only); the
+   1e-6 floor and the R3 / I1 invariants are preserved.
+
+### §9.2 Harness wiring
+`MERCURY_SFO_GRID_TURBO_SEED=tinterp` (`telecom_system.cc`, sfo_grid_test) sets
+`turbo_seed_tinterp`, which (a) routes the it=0 estimator to
+`LS_channel_estimator_tinterp` (the existing `MERCURY_SFO_GRID_TINTERP_PROD` branch,
+`telecom_system.cc:6878`) and (b) sets `ofdm.dd_seed_floor=true` in the turbo-knob
+block. Default unset = plain LS it=0 + pilots-only floor = byte-identical.
+
+### §9.3 Invariant deltas (audit Q5)
+- **I1 (nv ≥ 1e-6, never collapsed)**: PRESERVED. The warm-anchor only LOWERS the
+  *floor companion* to the honest TINTERP nv (≥ its own 1e-6 floor); nv = max(data
+  residual, that floor) ≥ 1e-6. No new collapse path (R3 untouched — TINTERP's nv is
+  itself a measured residual, not the HW-only post-EQ-EVM collapse).
+- **I6 (loop leaves final-iteration state)**: PRESERVED. The snapshot is a local
+  `std::vector`; the function still writes the full `estimated_channel`+nv on exit.
+- **I7 (monotone-safe)**: PRESERVED and STRENGTHENED — the best-of publish now reverts
+  to the it=0 *TINTERP* seed (a much stronger floor than plain LS) on POOR.
+
+### §9.4 Paired regression test
+`tools/test_turbo_tinterp_seed.py` (sibling of `test_turbo_eq.py`; the latter owns the
+DET-FLOOR cell, this owns the POOR cell). FAILS A3 on BASE (`feat/turbo-eq` ignores
+the env → TINTERP-seed == LS-seed, 0/36, wall unbroken); PASSES on
+`feat/turbo-tinterp-seed` (22/36, mean BER 0.013 < waterfall 0.05). Asserts A1 LS
+floors / A2 GENIE compass / A3 material crossing / A4 monotone-safe / A5 default-off
+deterministic.
+
+### §9.5 Clean-channel note (NOT a regression of this change)
+On flat AWGN, `LS_channel_estimator_tinterp` underperforms plain LS (1/6 vs 6/6) —
+PRE-EXISTING TINTERP behavior, md5-identical on BASE and NEW via the existing
+`MERCURY_SFO_GRID_TINTERP_PROD` hook (verdict §5: "TINTERP does not help clean CFG16").
+`TURBO_SEED=tinterp` is a FADE-tier-only experiment knob (default-off, never set in
+production); the production estimator selection (`channel_estimator`) is untouched.

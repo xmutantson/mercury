@@ -327,6 +327,18 @@ public:
 	// default has zero production effect.
 	double dd_data_conf_thresh;
 
+	// Turbo-EQ TINTERP-SEED (TURBO_EQ_VERDICT.md §5 recommended-stack item 2): when
+	// true, data_aided_channel_estimator keeps the INCOMING estimated_channel H (the
+	// it=0 seed — TINTERP on the FADE tier) as the FLOOR for low-confidence DATA
+	// cells, instead of marking them UNKNOWN and re-interpolating from pilots-only.
+	// On the POOR/1 Hz Watterson fade the pilots-only fallback IS the cold-LS estimate
+	// that fails the Dy=3 Nyquist wall (so the it=1 refiner REGRESSES a 5/6 TINTERP
+	// seed back to 0/6); falling back to the TINTERP floor instead keeps the warm seed
+	// while confident data cells anchor the dense lattice on top of it. Default FALSE
+	// (false ⇒ the prior pilots-only-floor behavior, byte-identical). Read only inside
+	// the turbo loop, so default has zero production effect.
+	bool dd_seed_floor;
+
 	// Pre-allocated buffers for passband_to_baseband (avoids new/delete per call)
 	std::complex<double>* p2b_l_data;
 	std::complex<double>* p2b_data_filtered;

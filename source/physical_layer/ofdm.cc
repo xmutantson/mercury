@@ -90,6 +90,7 @@ cl_ofdm::cl_ofdm()
 	ls_use_crosspilot_nv=false; // fix/cfg16-nv-restore: default = the fix (residual nv)
 	tinterp_smooth_halfwin=0; // feat/fade-tinterp: TIME_INTERP pilot pre-smooth off by default
 	dd_data_conf_thresh=0.30; // Turbo-EQ: data-aided improve-only confidence threshold (read only inside the turbo loop)
+	dd_seed_floor=false; // Turbo-EQ TINTERP-seed: false = pilots-only floor (byte-identical default); true = keep the it=0 (TINTERP) H as the low-confidence floor
 	// Optimized FFT tables
 	fft_twiddle=NULL;
 	fft_scratch=NULL;
@@ -2083,6 +2084,19 @@ void cl_ofdm::data_aided_channel_estimator(std::complex<double>* in,
 	// pilots + reliable neighbors. Default 0.30 (dossier §6.4 "reliable cells").
 	const double conf_thresh = (dd_data_conf_thresh > 0.0) ? dd_data_conf_thresh : 0.30;
 
+	// TINTERP-SEED floor (TURBO_EQ_VERDICT.md §5): snapshot the INCOMING estimate
+	// (the it=0 seed — TINTERP on the FADE tier) BEFORE Pass 1 clobbers it, so a
+	// low-confidence DATA cell can fall back to that warm seed instead of a cold
+	// pilots-only interpolation. Only taken when dd_seed_floor (default false ⇒ the
+	// snapshot is unused and the behavior is byte-identical to the pilots-only floor).
+	std::vector<std::complex<double> > seed_H;
+	double seed_nv = noise_variance_estimate;   // the it=0 (TINTERP) nv — the warm seed
+	if(dd_seed_floor)
+	{
+		seed_H.resize((size_t)Nsymb*Nc);
+		for(int i=0;i<Nsymb*Nc;i++) seed_H[i] = (estimated_channel+i)->value;
+	}
+
 	// Pass 1: write raw per-cell H at PILOTs (rx/X) and reliable DATA cells.
 	// Mark everything else UNKNOWN so the interpolators fill them.
 	int pilot_index = 0;
@@ -2117,6 +2131,15 @@ void cl_ofdm::data_aided_channel_estimator(std::complex<double>* in,
 					// MMSE-style data-aided per-cell channel observation.
 					std::complex<double> Hraw = (*(in+i*Nc+j) * std::conj(xb)) / (mag2 + vv);
 					(estimated_channel+i*Nc+j)->value  = Hraw;
+					(estimated_channel+i*Nc+j)->status  = MEASURED;
+				}
+				else if(dd_seed_floor)
+				{
+					// TINTERP-SEED floor: an uncertain data cell falls back to the
+					// it=0 (TINTERP) seed H, NOT a cold pilots-only interpolation. This
+					// keeps the warm seed under the dense data-aided anchor lattice (the
+					// fix that stops the it=1 regression of a 5/6 TINTERP seed → 0/6).
+					(estimated_channel+i*Nc+j)->value   = seed_H[(size_t)i*Nc+j];
 					(estimated_channel+i*Nc+j)->status  = MEASURED;
 				}
 				else
@@ -2236,6 +2259,21 @@ void cl_ofdm::data_aided_channel_estimator(std::complex<double>* in,
 		}
 		double nv_resid = (ncnt>0) ? nsum/(double)ncnt : 0.01;
 		double nv_floor = estimate_noise_from_pilot_pairs(in);   // cross-pilot AWGN floor
+		if(dd_seed_floor)
+		{
+			// TINTERP-SEED nv anchor (TURBO_EQ_VERDICT.md §5): on a fast (POOR/1 Hz)
+			// fade the cross-pilot DIFFERENTIAL overcounts the Doppler-driven inter-
+			// pilot variation as NOISE (measured ~0.40 vs the TINTERP-honest ~0.027 that
+			// produced the 5/6 it=0 decode), which alone collapses the it=1 demod LLRs
+			// → a 13× nv blow-up that reverts the warm seed. When seeding from TINTERP,
+			// floor the nv at the SMALLER of the cross-pilot AWGN and the incoming
+			// TINTERP nv (the honest post-EQ noise of the seed) so the refinement nv
+			// never EXCEEDS the warm seed's nv. The data-aided residual can still RAISE
+			// it if the data genuinely disagrees — improve-only, never collapse below
+			// true noise (R3 / the 1e-6 floor preserved).
+			double anchor = (seed_nv < nv_floor) ? seed_nv : nv_floor;
+			nv_floor = anchor;
+		}
 		noise_variance_estimate = (nv_resid > nv_floor) ? nv_resid : nv_floor;
 		if(noise_variance_estimate < 1e-6) noise_variance_estimate = 1e-6;
 	}
