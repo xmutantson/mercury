@@ -3895,7 +3895,16 @@ int cl_arq_controller::test_inorder_demote()
 	bool defeat = false;
 	{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 	  if(e && *e && atoi(e)!=0) defeat = true; }
-	printf("[TEST-INORDER-DEMOTE] start (MERCURY_GAP_ABORT_DEFEAT=%d)\n", defeat ? 1 : 0);
+	// WALL-B FIX-9 LOSSLESS-DEMOTE fail-before selector (CASE 8 only): MERCURY_LOSSY_DEMOTE=1 makes
+	// the D3 16->15 re-present model the PRE-FIX (lossy) behavior — re-send the in-flight batch under
+	// a FRESH higher epoch bsi (the cmd_batch_seq_id already advanced past it) -> the RSP sees a
+	// non-contiguous hole -> D3.1 GAP-ABORT. Unset (=0, the fix) models the LOSSLESS re-present under
+	// the CONTIGUOUS bsi (cmd_batch_seq_id rolled back to the in-flight batch) -> no hole, delivered.
+	bool lossy_demote = false;
+	{ const char* e = std::getenv("MERCURY_LOSSY_DEMOTE");
+	  if(e && *e && atoi(e)!=0) lossy_demote = true; }
+	printf("[TEST-INORDER-DEMOTE] start (MERCURY_GAP_ABORT_DEFEAT=%d MERCURY_LOSSY_DEMOTE=%d)\n",
+		defeat ? 1 : 0, lossy_demote ? 1 : 0);
 	fflush(stdout);
 
 	this->nMessages          = 255;
@@ -4200,10 +4209,80 @@ int cl_arq_controller::test_inorder_demote()
 		this->link_status = CONNECTED;
 	}
 
+	// === CASE 8: FIX-9 D3 LOSSLESS contiguous re-demote — the bench-8-vs-sim discriminator.
+	// (data-flow-revack-turnaround-geometry.md §5.3/§6.) Reproduces the sim CFG16-hold md5-mismatch
+	// AND its lossless fix. Setup: deliver 0..4 (last_delivered=4), then DELIVER the in-flight CFG16
+	// batch 5 (advance high-water to 5) — this is the discriminator vs bench-8: a CFG16 batch WAS
+	// delivered (copy_data_to_buffer fires right after the RSP sends its ACK, BEFORE the CMD confirms
+	// receipt). The CMD never saw that ACK and the D3 demote fires.
+	//   FAIL-BEFORE (lossy_demote=1): the demote re-sends the SAME logical bytes under a FRESH higher
+	//     epoch bsi=8 (cmd_batch_seq_id had advanced past 5). On re-adopt the RSP sees
+	//     sack_v2_readopt_has_gap(8, last_delivered=5)=true -> GAP-ABORT, DROPPED, delivered EXACTLY
+	//     [0..5] (the sim md5-mismatch reproduced: correct prefix, guard aborted rather than
+	//     corrupting). The hole was REALLY a duplicate of an already-delivered batch.
+	//   PASS-AFTER (lossy_demote=0, the fix): the demote re-presents the in-flight batch under the
+	//     CONTIGUOUS bsi=6 (next after the delivered 5). sack_v2_readopt_has_gap(6, last_delivered=5)
+	//     =false -> NO abort, batch 6 delivered, link stays CONNECTED, stream continues, no silent
+	//     concat, no false abort. Drives the REAL sack_v2_readopt_has_gap + delivery_step_is_gap +
+	//     fifo_buffer_rx.
+	{
+		deliver_clean_prefix();                 // last_delivered=4, cur=5, prev=4
+		// The in-flight CFG16 batch 5 was DELIVERED to the app at CFG16 (high-water -> 5) BEFORE the
+		// CMD confirmed receipt — the precise pre-demote state the sim reached.
+		deliver_commit(5);                      // contiguous, accepted, last_delivered=5
+		// The D3 16->15 demote fires (the CMD never saw batch 5's ACK). SET_CONFIG re-baselines the
+		// RSP window to cur=prev=-1; high-water (5) SURVIVES the reset (INV-4).
+		this->rsp_current_expected_batch_seq_id = -1;
+		this->rsp_prev_batch_seq_id             = -1;
+		// The demote re-presents the in-flight batch. PRE-fix: fresh epoch 8 (lossy). POST-fix:
+		// contiguous 6 (lossless). This is the ONLY line the production fix changes (the bsi the
+		// re-sent batch carries; the BYTES are identical, preserved by the FIFO push-back).
+		int redemote_bsi = lossy_demote ? 8 : 6;
+		bool delivered = readopt_and_deliver(redemote_bsi);
+		bool aborted   = !delivered;
+
+		char drained[10 * BATCH_BYTES];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+		if(lossy_demote)
+		{
+			// FAIL-BEFORE oracle: the lossy fresh-epoch re-present is REFUSED by the D3.1 guard.
+			// Delivered FIFO == EXACTLY [0..5] (6*32=192B), aborted, DROPPED, NO batch-8 bytes
+			// (the guard correctly refused the apparent hole that was really a duplicate).
+			char want[6 * BATCH_BYTES];
+			for(int b=0; b<6; b++) batch_payload(b, &want[b*BATCH_BYTES]);
+			bool size_ok  = (popped == 6*BATCH_BYTES);
+			bool bytes_ok = size_ok && (memcmp(drained, want, 6*BATCH_BYTES) == 0);
+			bool ok = true;
+			if(!aborted)                     { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS(lossy): lossy fresh-epoch re-present was NOT aborted (silent hole accepted)\n"); ok=false; }
+			if(this->link_status != DROPPED) { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS(lossy): link_status != DROPPED (=%d)\n", this->link_status); ok=false; }
+			if(!size_ok)                     { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS(lossy): delivered %dB, want 192 ([0..5])\n", popped); ok=false; }
+			else if(!bytes_ok)               { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS(lossy): delivered prefix != [0..5]\n"); ok=false; }
+			if(!ok) fails++;
+			else printf("[TEST-INORDER-DEMOTE] CASE8-LOSSLESS(lossy) reproduced the md5-mismatch: fresh-epoch re-present GAP-ABORTed, delivered EXACTLY [0..5] (192B), link DROPPED — fail-before confirmed\n");
+		}
+		else
+		{
+			// PASS-AFTER oracle: the lossless contiguous re-present is ACCEPTED. NO abort, link
+			// CONNECTED, delivered FIFO == [0..6] (7*32=224B) in-order at the correct seam.
+			char want[7 * BATCH_BYTES];
+			for(int b=0; b<7; b++) batch_payload(b, &want[b*BATCH_BYTES]);
+			bool size_ok  = (popped == 7*BATCH_BYTES);
+			bool bytes_ok = size_ok && (memcmp(drained, want, 7*BATCH_BYTES) == 0);
+			bool ok = true;
+			if(aborted)                        { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS: contiguous re-present was spuriously ABORTED (the fix must NOT abort)\n"); ok=false; }
+			if(this->link_status != CONNECTED) { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS: link_status != CONNECTED (=%d)\n", this->link_status); ok=false; }
+			if(!size_ok)                       { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS: delivered %dB, want 224 ([0..6])\n", popped); ok=false; }
+			else if(!bytes_ok)                 { printf("[TEST-INORDER-DEMOTE] FAIL CASE8-LOSSLESS: delivered bytes != [0..6] (wrong seam)\n"); ok=false; }
+			if(!ok) fails++;
+			else printf("[TEST-INORDER-DEMOTE] CASE8-LOSSLESS PASS: lossless contiguous re-present delivered, [0..6] in-order (224B), link CONNECTED, no false abort, no silent concat\n");
+		}
+		this->link_status = CONNECTED;
+	}
+
 	bool pass = (fails == 0);
-	printf("[TEST-INORDER-DEMOTE] %s: fails=%d (defeat=%d) — cases: BREAK, FIX4-CARVE, "
-		"FIX9-D3, FIX3-PROBE, GEARSHIFT, PREVBUMP-STRAND, CONTIGUOUS\n",
-		pass ? "PASS" : "FAIL", fails, defeat ? 1 : 0);
+	printf("[TEST-INORDER-DEMOTE] %s: fails=%d (defeat=%d lossy_demote=%d) — cases: BREAK, FIX4-CARVE, "
+		"FIX9-D3, FIX3-PROBE, GEARSHIFT, PREVBUMP-STRAND, CONTIGUOUS, LOSSLESS\n",
+		pass ? "PASS" : "FAIL", fails, defeat ? 1 : 0, lossy_demote ? 1 : 0);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
