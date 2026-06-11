@@ -6344,7 +6344,27 @@ void cl_telecom_system::sfo_grid_test()
 	ofdm.pilot_configurator.pilot_density = HIGH_DENSITY;
 	ofdm.channel_estimator = LEAST_SQUARE;
 	ofdm.channel_estimator_amplitude_restoration = NO;
-	ofdm.LS_window_width = 0; ofdm.LS_window_hight = 0;   // re-derive in init
+	// MERCURY_SFO_GRID_TRACK_PROD=1 (fade-map commit 7d5c114): engage the GENUINE
+	// PRODUCTION LS tracker window (default_configurations_telecom_system
+	// ofdm_LS_window_width=2 / ofdm_LS_window_hight=8, odd-bumped exactly as
+	// set_configs does) instead of 0/0 -> full-grid. The localized window slides
+	// with the channel symbol-by-symbol so the estimate TRACKS a time-varying fade
+	// the way the real RX decodes (full-grid emits one held estimate that cannot
+	// follow the fade -> measurement artifact). Reused verbatim from the fade-map
+	// branch (sim/sfo-grid-prod-tracker) so this is the SAME tracker, not a bespoke
+	// corrector. Byte-identical when unset (else-branch = original 0/0).
+	if(env_i("MERCURY_SFO_GRID_TRACK_PROD", 0) != 0)
+	{
+		int pw = default_configurations_telecom_system.ofdm_LS_window_width;
+		int ph = default_configurations_telecom_system.ofdm_LS_window_hight;
+		if(pw % 2 == 0) pw++;   // LS window must be odd (symmetric i +/- win/2),
+		if(ph % 2 == 0) ph++;   // mirroring the production odd-bump in set_configs.
+		ofdm.LS_window_width = pw; ofdm.LS_window_hight = ph;  // production tracker
+	}
+	else
+	{
+		ofdm.LS_window_width = 0; ofdm.LS_window_hight = 0;   // re-derive in init
+	}
 	ofdm.init(Nfft, Nc, Ngrid, gi);   // sets Nfft/Nc/Nsymb/gi/Ngi + allocs + configures lattice
 
 	// ====================================================================
@@ -6959,6 +6979,57 @@ void cl_telecom_system::sfo_grid_test()
 		if(cvar < 1e-9) cvar = 1e-9;
 		psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
 
+		// cfg16-nvfix A/B INSTRUMENTATION (sim-validatability of the ~1000x nv-collapse).
+		// nv (cross-pilot differential, ofdm.noise_variance_estimate) is the PRE-equalization
+		// noise the demap is fed; measure_var (ofdm.measure_variance over the post-EQ
+		// constellation, `variance` above) is the TRUE post-EQ noise the Euclidean demapper
+		// needs. The HW collapse = nv << measure_var (over-confident LLR -> 32-QAM inner-bit
+		// flips). Print the ratio per cell and gate the same RATIO-FIX (a0e22c8, K=8) the
+		// production demap uses, so this harness can show whether (1) the collapse REPRODUCES
+		// under tracker+freq-selective, and (2) the ratio-fix RECOVERS the decode where base
+		// collapses. Env unset / no collapse => demap_var==nv => fix==base (proven no-op).
+		double nv_meas    = ofdm.noise_variance_estimate;   // the estimator's nv
+		// PRODUCTION-FAITHFUL measure_var: the production demap (telecom_system.cc:2948) computes
+		// measure_var = ofdm.measure_variance(data_container.equalized_data) i.e. the POST-EQ pilot
+		// residual |Y_pilot/H_est - X_pilot|^2 -- NOT the pre-EQ measure_variance(rx) the harness
+		// uses for its uncoded-BER score above. To make this nvfix A/B identical to the real fix
+		// we recompute measure_var on the EQUALIZED grid `eq` (== data_container.equalized_data in
+		// production). [eq is filled by ofdm.channel_equalizer(rx, eq) above.]
+		double mvar_meas  = ofdm.measure_variance(eq.data());   // POST-EQ, == production measure_var
+		double mvar_preeq = variance;                            // (pre-EQ measure_variance(rx), for reference)
+		double nv_ratio   = (nv_meas > 1e-12) ? (mvar_meas / nv_meas) : 1e12;
+		// GROUND TRUTH: the actual post-EQ data-carrier EVM (|deframed - tx_syms|^2 over DATA
+		// carriers). This is the quantity the Euclidean demap's `variance` SHOULD equal. If it
+		// tracks nv (small), nv is correct and the fix (raising to measure_var) is a regression;
+		// if it tracks measure_var (large), the fix is right. tx_syms[] is the known TX
+		// constellation; deframed[] the post-EQ RX constellation (both in DATA raster order).
+		double true_evm_sum = 0.0; int true_evm_n = 0;
+		for(int d=0; d<nData && d<(int)deframed.size(); d++)
+		{
+			std::complex<double> e = deframed[d] - tx_syms[d];
+			true_evm_sum += e.real()*e.real() + e.imag()*e.imag();
+			true_evm_n++;
+		}
+		double true_data_evm = (true_evm_n>0) ? (true_evm_sum/(double)true_evm_n) : 0.0;
+		printf("[TRUE-EVM] cfg=%d nv=%.6e measure_var_postEQ=%.6e measure_var_preEQ=%.6e true_data_postEQ_evm=%.6e  evm/nv=%.3f  measvarPostEQ/evm=%.3f\n",
+			current_configuration, nv_meas, mvar_meas, mvar_preeq, true_data_evm,
+			(nv_meas>1e-12? true_data_evm/nv_meas : -1.0),
+			(true_data_evm>1e-12? mvar_meas/true_data_evm : -1.0));
+		fflush(stdout);
+		const double NV_COLLAPSE_RATIO_K = 8.0;
+		double demap_variance = nv_meas;
+		bool   nvfix_engaged  = false;
+		if(nv_meas < mvar_meas / NV_COLLAPSE_RATIO_K) { demap_variance = mvar_meas; nvfix_engaged = true; }
+		printf("[FRAME-NV] cfg=%d nv=%.6e mvar=%.6e ratio_mvar_over_nv=%.3f K=%.1f collapse=%s demap_var=%.6e amprest=%d Nsymb=%d\n",
+			current_configuration, nv_meas, mvar_meas, nv_ratio, NV_COLLAPSE_RATIO_K,
+			(nv_ratio > NV_COLLAPSE_RATIO_K ? "YES" : "no"),
+			demap_variance, ofdm.channel_estimator_amplitude_restoration, ofdm.Nsymb);
+		fflush(stdout);
+		// LLR set for the FIX arm (ratio-gated demap_variance). Base arm = `clr` above.
+		std::vector<float> clr_fix(nBits);
+		double cvfix = demap_variance; if(cvfix < 1e-9) cvfix = 1e-9;
+		psk.demod(deframed.data(), nBits, clr_fix.data(), (float)cvfix);
+
 		// CSI-weighted LLR (production telecom_system.cc:2901-2927): scale each data
 		// carrier's bit-LLRs by its normalized |H_k|² so the LDPC discounts the deep-null
 		// carriers a frequency-selective channel produces. On a flat channel all weights
@@ -6978,6 +7049,10 @@ void cl_telecom_system::sfo_grid_test()
 					float v = clr[bi]*(float)w;
 					if(v> 40.0f) v= 40.0f; else if(v<-40.0f) v=-40.0f;
 					clr[bi]=v;
+					// FIX arm gets the identical CSI weighting (only the demap variance differs).
+					float vf = clr_fix[bi]*(float)w;
+					if(vf> 40.0f) vf= 40.0f; else if(vf<-40.0f) vf=-40.0f;
+					clr_fix[bi]=vf;
 				}
 			}
 		}
@@ -6985,8 +7060,12 @@ void cl_telecom_system::sfo_grid_test()
 		int    cw_ok = 0, cw_crcfail = 0;
 		long   cw_infoerr = 0, cw_infobits = 0;
 		long   iter_sum = 0; int iter_min = 1<<30, iter_max = -1;
+		int    fix_ok = 0, fix_crcfail = 0;      // FIX arm (ratio-gated demap_variance)
+		long   fix_infoerr = 0; int fix_iter_max = -1;
 		std::vector<float> cwllr(ldpc.N);
 		std::vector<int>   dec(ldpc.N);
+		std::vector<float> cwllr_f(ldpc.N);
+		std::vector<int>   dec_f(ldpc.N);
 		for(int c=0;c<Kcw;c++)
 		{
 			for(int i=0;i<ldpc.N;i++) cwllr[i] = clr[(size_t)c*ldpc.N + i];
@@ -7003,8 +7082,19 @@ void cl_telecom_system::sfo_grid_test()
 			// has no CRC; exact info recovery is the strict success criterion).
 			bool capped = (iters > (ldpc.nIteration_max - 1));
 			if(ierr == 0 && !capped) cw_ok++; else cw_crcfail++;
+
+			// FIX arm: identical codeword, ratio-gated demap_variance LLR.
+			for(int i=0;i<ldpc.N;i++) cwllr_f[i] = clr_fix[(size_t)c*ldpc.N + i];
+			int iters_f = ldpc.decode(cwllr_f.data(), dec_f.data());
+			if(iters_f > fix_iter_max) fix_iter_max = iters_f;
+			int ierr_f=0;
+			for(int i=0;i<ldpc.K;i++) if(dec_f[i] != cw_info[c][i]) ierr_f++;
+			fix_infoerr += ierr_f;
+			bool capped_f = (iters_f > (ldpc.nIteration_max - 1));
+			if(ierr_f == 0 && !capped_f) fix_ok++; else fix_crcfail++;
 		}
 		double cw_ber = cw_infobits ? (double)cw_infoerr/(double)cw_infobits : 1.0;
+		double fix_ber = cw_infobits ? (double)fix_infoerr/(double)cw_infobits : 1.0;
 		std::cout << "[SFO-GRID-CODED] ===== CODED RESULT (K=" << Kcw
 		          << " x " << ldpc.N << "-bit rate-" << ldpc.rate << " codewords) =====" << std::endl;
 		std::cout << "[SFO-GRID-CODED]   nv=" << ofdm.noise_variance_estimate
@@ -7017,6 +7107,12 @@ void cl_telecom_system::sfo_grid_test()
 		          << "  post_FEC_info_BER=" << cw_ber << std::endl;
 		std::cout << "[SFO-GRID-CODED]   nv_check: " << (ofdm.noise_variance_estimate > 1e-5 ? "OK (not collapsed)" : "COLLAPSED (<1e-5 -> E1 bug)")
 		          << "  iter_cap_check: " << (iter_max < ldpc.nIteration_max ? "OK (no codeword hit cap)" : "CAPPED (BP at 101 -> over-confident LLR)") << std::endl;
+		// nvfix A/B verdict: BASE arm (demap with nv) vs FIX arm (ratio-gated demap_variance).
+		std::cout << "[SFO-GRID-NVFIX-AB]   nvfix_engaged=" << (nvfix_engaged?"YES":"no")
+		          << "  ratio_mvar_over_nv=" << nv_ratio
+		          << "  BASE decoded=" << cw_ok << "/" << Kcw << " post_FEC_BER=" << cw_ber
+		          << "  FIX decoded=" << fix_ok << "/" << Kcw << " post_FEC_BER=" << fix_ber
+		          << "  delta_decoded=" << (fix_ok - cw_ok) << std::endl;
 	}
 
 	// Restore the original grid geometry so the rest of the process is unaffected.
