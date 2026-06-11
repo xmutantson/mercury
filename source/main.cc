@@ -523,6 +523,179 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-live-nvfix: LIVE channel-gated nv-collapse fix failing-first self-test
+// (bench-pinned CFG16 decode-reliability lever). Drives the SFO-GRID coded harness
+// in-process at CFG16 (32-QAM r0.875, the bench-10 held-CFG16 modulation) and asserts
+// the SAME production gate the live C1/C2/C3 sites call:
+//   (A) CLEAN FLAT + injected ~6x collapse: fix OFF FAILS (over-confident LLRs, BP
+//       non-converge) -> fix ON RECOVERS (de-softens toward mvar). Failing-first.
+//   (B) MISFIRE GUARD on DET-FLOOR (Schroeder all-pass, |T|=1, phase-dispersive, the
+//       memory seed12345 @18dB NVFIX=0->7/7 / K8-NVFIX=1->0/7 trap): fix ON must NOT
+//       reduce the decoded count below fix OFF (the channel-state gate must REJECT the
+//       dispersive regime so the documented 7/7->0/7 misfire CANNOT recur).
+//   (C) NO-OP byte-identity on HEALTHY flat (no collapse, ratio~1): fix ON == fix OFF.
+// Sets MERCURY_LIVE_NVFIX (+ the K/RMAX/SEL knobs default to the §10 design) and the
+// harness CHAN/NV_FORCE/SEED keys. fact-documents/data-flow-noise_variance_estimate.md
+// §9/§10. NV_FORCE injects the clean-WGN collapse the in-process sim never reproduces
+// natively (it is an HW analog-EVM artifact); the no-misfire direction is NATIVE.
+static void livenv_set_env(const char* k, const char* v)
+{
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+static void livenv_run_cell(const char* esn0, const char* chan, const char* seed,
+                            const char* nv_force, const char* live_fix,
+                            const char* turbo_seed, const char* turbo_iters,
+                            int& cw_ok, int& cw_tot)
+{
+    const char* keys[] = {
+        "MERCURY_SFO_GRID", "MERCURY_SFO_GRID_ESN0", "MERCURY_SFO_GRID_CHAN",
+        "MERCURY_SFO_GRID_CODED", "MERCURY_SFO_GRID_NSYMB", "MERCURY_SFO_GRID_SEED",
+        "MERCURY_SFO_GRID_NV_FORCE", "MERCURY_SFO_GRID_NVFIX", "MERCURY_SFO_GRID_M64",
+        "MERCURY_SFO_GRID_TURBO_SEED", "MERCURY_SFO_GRID_TURBO_ITERS",
+        "MERCURY_LIVE_NVFIX", "MERCURY_LIVE_NVFIX_K", "MERCURY_LIVE_NVFIX_RMAX",
+        "MERCURY_LIVE_NVFIX_SEL"
+    };
+    const int nk = (int)(sizeof(keys)/sizeof(keys[0]));
+    struct Saved { const char* key; bool had; std::string val; } sv[16];
+    for (int i = 0; i < nk; i++) {
+        const char* g = std::getenv(keys[i]);
+        sv[i].key = keys[i]; sv[i].had = (g != nullptr);
+        sv[i].val = g ? std::string(g) : std::string();
+    }
+    livenv_set_env("MERCURY_SFO_GRID", "1");
+    livenv_set_env("MERCURY_SFO_GRID_ESN0", esn0);
+    livenv_set_env("MERCURY_SFO_GRID_CHAN", chan);
+    livenv_set_env("MERCURY_SFO_GRID_CODED", "1");
+    livenv_set_env("MERCURY_SFO_GRID_NSYMB", "60");
+    livenv_set_env("MERCURY_SFO_GRID_SEED", seed);
+    livenv_set_env("MERCURY_SFO_GRID_NV_FORCE", nv_force);
+    livenv_set_env("MERCURY_SFO_GRID_NVFIX", "0");   // the OLD harness K=8 lever stays OFF
+    livenv_set_env("MERCURY_SFO_GRID_M64", "0");     // CFG16 = 32-QAM (the bench target)
+    livenv_set_env("MERCURY_SFO_GRID_TURBO_SEED", turbo_seed);
+    livenv_set_env("MERCURY_SFO_GRID_TURBO_ITERS", turbo_iters);
+    livenv_set_env("MERCURY_LIVE_NVFIX", live_fix);  // the NEW live gate under test
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_16);   // 32-QAM r0.875, the held-CFG16 modulation
+    ts.sfo_grid_test();
+    cw_ok  = ts.sfo_grid_last_cw_ok;
+    cw_tot = ts.sfo_grid_last_cw_tot;
+
+    for (int i = 0; i < nk; i++) {
+#if defined(_WIN32)
+        _putenv_s(sv[i].key, sv[i].had ? sv[i].val.c_str() : "");
+#else
+        if (sv[i].had) setenv(sv[i].key, sv[i].val.c_str(), 1); else unsetenv(sv[i].key);
+#endif
+    }
+}
+
+static int run_live_nvfix_selftest()
+{
+    printf("[TEST-LIVE-NVFIX] live channel-gated nv-collapse fix self-test (CFG16 32-QAM)\n");
+    int fails = 0;
+
+    // ---- CELL A: CLEAN FLAT + injected ~6x collapse at the WATERFALL EDGE. ----
+    // fix OFF FAILS (over-confident LLRs tip the ~marginal frames to BP non-converge) ->
+    // fix ON RECOVERS (de-softens toward mvar). CHAN=0 (flat); ESN0 swept across the CFG16
+    // 32-QAM r0.875 in-sim waterfall edge {15.0,15.25,15.5} (15.25 healthy=6/6, 15.0=3/6,
+    // 14.5=0/6 MEASURED) where over-confidence is decisive; NV_FORCE=0.0050 forces nv ~6x
+    // below the post-EQ mvar (~0.029 -> ratio ~5.84, the bench-10 clean-WGN signature, IN
+    // the (K_LIVE 4, R_MAX 7.5] gate window -> the gate FIRES). Authoritative CLEAN-PROCESS
+    // A/B (15 cells, fresh process each) MEASURED bare 35/90 -> fix 64/90, fix>=bare EVERY
+    // cell. NOTE: this in-process multi-cell test shares the GLOBAL srand/rand state that
+    // cl_awgn uses (awgn.cc:37,87), so the OFF/ON grids are NOT bit-identical run-to-run
+    // here and per-seed monotonicity is NOT guaranteed in-process (it IS in a clean
+    // process). The robust assertion is therefore on the AGGREGATE: bare must fail
+    // substantially and fix must recover a large net margin of codewords.
+    {
+        const char* esn0s[] = {"15.0","15.25","15.5"};
+        const char* seeds[] = {"12345","23456","34567","45678"};
+        int sum_bare = 0, sum_fix = 0, sum_tot = 0;
+        bool any_bare_fail = false;
+        for (int e = 0; e < 3; e++) for (int s = 0; s < 4; s++) {
+            int b_ok=-1,b_tot=-1, f_ok=-1,f_tot=-1;
+            livenv_run_cell(esn0s[e],"0",seeds[s],"0.0050","0","","1", b_ok,b_tot);  // collapsed, fix OFF
+            livenv_run_cell(esn0s[e],"0",seeds[s],"0.0050","1","","1", f_ok,f_tot);  // collapsed, fix ON
+            if (b_tot>0 && b_ok < b_tot) any_bare_fail = true;
+            sum_bare += (b_ok>0?b_ok:0); sum_fix += (f_ok>0?f_ok:0);
+            sum_tot  += (b_tot>0?b_tot:0);
+            printf("[TEST-LIVE-NVFIX]   CELL-A E=%s seed=%s clean+6x-collapse: bare=%d/%d fix=%d/%d\n",
+                   esn0s[e], seeds[s], b_ok,b_tot, f_ok,f_tot);
+        }
+        // FAILING-FIRST: bare must fail substantially; fix must recover a net margin.
+        // The AUTHORITATIVE clean-process A/B (fresh process per arm, no shared global
+        // rand state) MEASURED bare 35/90 -> fix 64/90 = +32% net, fix>=bare every cell.
+        // THIS in-process run shares the global srand/rand state cl_awgn uses (awgn.cc:37,
+        // 87) across the OFF/ON cells -> the ON grids are not bit-identical to a clean
+        // process -> the measured net lift is a DETERMINISTIC LOWER BOUND (repeatably
+        // +12/72 = +17%). Require >= +1/8 of the budget (9/72): well under the deterministic
+        // +12 so it is a stable regression guard, well over 0 so it cannot pass on noise.
+        bool bare_substantially_fails = any_bare_fail && (sum_bare < sum_tot);
+        int  need = sum_tot / 8;
+        bool fix_recovers_margin = (sum_fix - sum_bare) >= need;
+        bool ok = bare_substantially_fails && fix_recovers_margin;
+        printf("[TEST-LIVE-NVFIX]   CELL-A clean+6x-collapse(edge): bare_sum=%d/%d fix_sum=%d/%d "
+               "net=+%d (need>=+%d, clean-process A/B=+32%%) -> %s\n",
+               sum_bare, sum_tot, sum_fix, sum_tot, sum_fix-sum_bare, need,
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- CELL B: MISFIRE GUARD on DET-FLOOR (the documented 7/7->0/7 trap). ----
+    // CHAN=1 (Schroeder all-pass, |T|=1, phase-dispersive) WITH the TINTERP-seed turbo
+    // estimator active so the det-floor ACTUALLY DECODES (6/6) — this reproduces the
+    // EXACT memory misfire: data-flow-cfg17-shaped-64qam.md §7.1 seed12345 @18dB where the
+    // estimator crosses 7/7 and the naive K=8 ratio-nvfix (nv<mvar/8 -> substitute mvar)
+    // BREAKS it to 0/7 by over-softening the LLRs with the channel-est REPRESENTATION
+    // error. MEASURED: here mvar/nv ratio is ~474 (mvar 4.24 inflated by phase dispersion,
+    // nv 0.0089) >> R_MAX 7.5 -> the channel-state gate REJECTS -> demap_var stays nv ->
+    // decode stays 6/6 with fix ON. The fix ON count must NOT drop below fix OFF.
+    {
+        const char* seeds[] = {"12345","23456","34567"};
+        bool no_regression = true; bool any_decoded = false;
+        int sum_bare=0, sum_fix=0, sum_tot=0;
+        for (int s = 0; s < 3; s++) {
+            int b_ok=-1,b_tot=-1, f_ok=-1,f_tot=-1;
+            livenv_run_cell("18","1",seeds[s],"0","0","tinterp","4", b_ok,b_tot);  // det-floor+est, fix OFF
+            livenv_run_cell("18","1",seeds[s],"0","1","tinterp","4", f_ok,f_tot);  // det-floor+est, fix ON
+            if (!(f_ok >= b_ok)) no_regression = false;
+            if (b_ok > 0) any_decoded = true;
+            sum_bare += (b_ok>0?b_ok:0); sum_fix += (f_ok>0?f_ok:0); sum_tot += (b_tot>0?b_tot:0);
+            printf("[TEST-LIVE-NVFIX]   CELL-B seed=%s det-floor+TINTERP: bare=%d/%d fix=%d/%d %s\n",
+                   seeds[s], b_ok,b_tot, f_ok,f_tot, (f_ok>=b_ok)?"(no-regress)":"(REGRESSED!)");
+        }
+        // The guard is only meaningful if the estimator gives a decode to protect.
+        bool ok = no_regression && any_decoded;
+        printf("[TEST-LIVE-NVFIX]   CELL-B det-floor misfire-guard@18dB: bare_sum=%d/%d fix_sum=%d/%d "
+               "(decode_to_protect=%s no_regress=%s) -> %s\n",
+               sum_bare, sum_tot, sum_fix, sum_tot, any_decoded?"Y":"N", no_regression?"Y":"N",
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- CELL C: NO-OP byte-identity on HEALTHY flat (no collapse). fix ON == fix OFF. ----
+    // CHAN=0 flat, NO forced collapse: the native sim nv is healthy (ratio~1 << K_LIVE 4)
+    // so the lower trigger is never met -> the gate is a strict NO-OP -> identical decode.
+    {
+        int b_ok=-1,b_tot=-1, f_ok=-1,f_tot=-1;
+        livenv_run_cell("16","0","12345","0","0","","1", b_ok,b_tot);  // healthy, fix OFF
+        livenv_run_cell("16","0","12345","0","1","","1", f_ok,f_tot);  // healthy, fix ON
+        bool ok = (b_ok==f_ok) && (b_tot==f_tot);
+        printf("[TEST-LIVE-NVFIX]   CELL-C healthy-flat no-op@16dB: fixOFF=%d/%d fixON=%d/%d -> %s\n",
+               b_ok,b_tot, f_ok,f_tot, ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    printf("[TEST-LIVE-NVFIX] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -755,6 +928,7 @@ int main(int argc, char *argv[])
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
+    bool test_live_nvfix_cli = false;   // --test-live-nvfix: LIVE channel-gated nv-collapse fix failing-first (bench-pinned CFG16 lever).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1377,6 +1551,17 @@ int main(int argc, char *argv[])
             // composed stack (PAS + TINTERP-seed turbo + ratio-nvfix) decodes where a
             // bare arm fails. See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
             test_cfg17_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-live-nvfix") == 0)
+        {
+            // LIVE channel-gated nv-collapse fix self-test (bench-pinned CFG16 lever,
+            // failing-first): drives the SFO-GRID coded harness in-process at CFG16
+            // 32-QAM and asserts the production gate the live C1/C2/C3 sites call
+            // recovers a clean collapsed-nv frame WITHOUT the det-floor misfire. See
+            // fact-documents/data-flow-noise_variance_estimate.md §9/§10.
+            test_live_nvfix_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2727,6 +2912,18 @@ start_modem:
             fflush(stdout);
             int rc = run_cfg17_selftest();
             printf("[FLAG] CFG17 composition self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_live_nvfix_cli) {
+            // LIVE channel-gated nv-collapse fix self-test (one-shot, then exit rc).
+            // Constructs cl_telecom_system in-process and drives the SFO-GRID coded
+            // harness — no ARQ/audio/TCP state needed.
+            printf("[FLAG] --test-live-nvfix: invoking LIVE channel-gated nv-collapse "
+                   "fix self-test (bench-pinned CFG16 decode-reliability lever)\n");
+            fflush(stdout);
+            int rc = run_live_nvfix_selftest();
+            printf("[FLAG] live-nvfix self-test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
