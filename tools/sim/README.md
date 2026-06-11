@@ -105,12 +105,33 @@ gave held-CFG16 **~1992 bps** (too optimistic, link ~50 %+ active); the accrual 
 drops it toward the HW **~600 bps** by making the long-batch reverse-ACK miss its
 window ~80 %+ of the time while the short CFG15 batch still lands.
 
-Calibration: `30.0 ms/s` × a ~28-frame CFG16 batch (~4.78 s airtime) = ~143 ms
-late-shift `>` the ~90 ms CMD reverse-ACK window half-width → MISS; × a ~6-frame
-CFG15 batch (~1.02 s) = ~31 ms `<` the window → LANDS. Validated by
-`tools/sim/test_sim_relay_turnaround_batchlen.py` (the model anchors: CFG16
-miss-fraction ≥ 0.80, CFG15 ≤ 0.05; monotone in batch length; accrual-OFF
-byte-identical to the legacy model).
+**CROSS-DIRECTION application (v2 — `SIMTURNCAL_VERDICT.json`).** The forward
+(`a2b` OFDM) and reverse (`b2a` MFSK ACK) directions are **separate**
+`TurnaroundDrift` instances. The accrual amount is keyed to the **forward** batch
+airtime, but the late silence must be inserted into the **reverse** turnaround GAP
+(delaying the `b2a` ACK onset) — **not** into the forward signal. The v1 model
+added the late accrual to each direction's *own* just-ended burst and spent it
+inserting silence **ahead of the FORWARD signal onset**, which de-aligned the
+forward OFDM decode (relay `ins=90313 samp`/286 ms into the forward signal;
+`FTR-FAIL ×414`, metric collapse, modem `proc_died`; held-CFG16 stuck ~1897 bps).
+The v2 fix couples the two directions through a shared **`TurnaroundCoupler`**:
+each direction **publishes** its just-ended forward-burst airtime on its
+signal→silence falling edge and **consumes** the *other* direction's pending
+forward airtime at its own ACK onset. So the long forward `a2b` OFDM batch pushes
+the short `b2a` ACK late (the bench-9 collapse) while the forward OFDM samples stay
+**bit-exact** (the forward instance only publishes; it consumes only the tiny
+reverse-ACK airtime, realized harmlessly in its own turnaround gap).
+
+Calibration: `30.0 ms/s` × a ~28-frame CFG16 forward batch (~4.78 s airtime) =
+~143 ms (~6881 samp) reverse-ACK late-shift `>` the ~90 ms (4320 samp) CMD
+reverse-ACK window half-width → MISS; × a ~6-frame CFG15 forward batch (~1.02 s) =
+~31 ms (~1475 samp) `<` the window → LANDS. Validated by
+`tools/sim/test_sim_relay_turnaround_xdir.py` (the v2 contracts: forward OFDM
+bit-exact with accrual ON — the v1 regression; reverse-ACK onset delayed by
+`30 ms/s × forward-batch-airtime`; CFG16 forward batch → reverse-ACK MISS /
+CFG15 → LAND; CFG16 miss-fraction ≥ 0.80, CFG15 ≤ 0.05; accrual-OFF
+byte-identical to the legacy model). `tools/sim/test_sim_relay_turnaround_batchlen.py`
+(the v1 self-accrual test) is **superseded** and now delegates to the v2 test.
 
 **Default OFF == byte-identical** to the pre-change (monitor) relay: `ppm==0`
 is a strict identity pass-through (no float reconstruction, no state) and

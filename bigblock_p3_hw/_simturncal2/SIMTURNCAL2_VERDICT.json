@@ -1,0 +1,48 @@
+{
+  "task": "Correct the v1 batch-length turnaround accrual mechanism so it delays the REVERSE-ACK ARRIVAL via the turnaround GAP (keyed to the FORWARD a2b OFDM batch airtime), leaving the forward OFDM bit-exact. Env-gated, default-off byte-identical. Failing-test-first.",
+  "branch": "sim/turnaround-calibrate (extended; worktree C:/Users/kamer/mercury_wt/simturncal off 8606389)",
+  "substrate": "inner mercury repo (x:/.../mercury, 582 commits); tools/sim/sim_channel_relay.py",
+
+  "v1_mechanism_error_corrected": {
+    "diagnosis": "The v1 accrual (sim_channel_relay.py v1 lines 678-717) added the one-sided LATE offset to EACH DIRECTION's OWN just-ended burst (self.cur_burst_samples) and spent it at THAT SAME instance's next signal ONSET by inserting silence AHEAD of the burst (v1 lines 705-712). The forward (a2b OFDM) and reverse (b2a MFSK ACK) directions are SEPARATE TurnaroundDrift instances (main: turn['a2b']/turn['b2a']), so the long FORWARD batch accrued ~6608 samp and inserted it INTO the forward OFDM signal -> de-aligned the forward decode (relay ins=90313 samp/286 ms; FTR-FAIL x414, SKIP-VAR x116, 3-consec-abort x31, metric->0.12-0.25, proc_died; held-CFG16 ~1897 bps, 3.2x too optimistic vs bench-9 597.6).",
+    "hw_mechanism_modeled": "bench-9: the CMD finishes its FORWARD a2b OFDM batch, drops PTT, opens its receive window; keyer/AGC/capture-flush/scheduling latency accumulated DURING the forward batch makes the REVERSE b2a MFSK ACK arrive LATE at the CMD in proportion to the FORWARD batch airtime, landing OUTSIDE the CMD receiving_timeout window -> matched=0/7 -> D3 reverse-ACK-starvation -> active 18.9%, whole-window 597.6. Calibration constant 30 ms/s (firmware common_defines.h:589)."
+  },
+
+  "fix": {
+    "mechanism": "CROSS-DIRECTION coupling via a shared TurnaroundCoupler. Each TurnaroundDrift PUBLISHES its just-ended forward-burst airtime to the coupler on its signal->silence FALLING edge (burst end), and CONSUMES the OTHER direction's pending forward airtime at its OWN silent->signal ACK ONSET, adding accrual_ms_per_s * forward_burst_s of one-sided LATE offset to its acc. The existing silence-onset insert then delays THIS direction's ACK signal onset by inserting silence in its turnaround GAP. So the LONG forward a2b OFDM batch pushes the SHORT reverse b2a MFSK ACK late (the bench-9 collapse) while the FORWARD OFDM signal is NEVER touched: the forward instance only PUBLISHES; it CONSUMES only the tiny reverse-ACK airtime, realized harmlessly in its own gap.",
+    "key_difference_from_v1": "v1 accrued a direction's OWN burst into its OWN onset (self-accrual) -> silence into the forward signal. v2 accrues the OTHER direction's forward-burst airtime (consumed from the shared coupler) -> silence only into the reverse ACK's turnaround gap.",
+    "default_accrual_ms_per_s": 30.0,
+    "gating": "OPT-IN: --turnaround-batch-accrual OR env MERCURY_SIM_BATCH_ACCRUAL=1; requires --turnaround-drift. accrual_ms_per_s defaults to 0.0 in the TurnaroundDrift ctor; with accrual off NOTHING publishes so consume() always returns 0 -> the legacy per-direction model is byte-identical for every existing caller.",
+    "files_changed": [
+      "tools/sim/sim_channel_relay.py (NEW TurnaroundCoupler class; TurnaroundDrift ctor +coupler/+direction; burst-end PUBLISH on signal->silence falling edge; onset CONSUME from coupler instead of v1 self-accrual; prev_was_signal edge state; main() shares one TurnaroundCoupler across turn['a2b']/turn['b2a']; constant + module comments)",
+      "tools/sim/test_sim_relay_turnaround_xdir.py (NEW failing-first v2 test)",
+      "tools/sim/test_sim_relay_turnaround_batchlen.py (SUPERSEDED v1 self-accrual test -> thin shim delegating to the xdir test)",
+      "tools/sim/README.md (bench-9 v2 cross-direction calibration section)"
+    ]
+  },
+
+  "validation": {
+    "failing_test_first": "test_sim_relay_turnaround_xdir.py FAILS before the fix (no TurnaroundCoupler -> 'X*: FAIL ... not implemented yet', exit 1) and PASSES after.",
+    "v2_contracts_passing": {
+      "X0_default_off_byte_identical": "coupled accrual=0 == legacy uncoupled TurnaroundDrift over 200 mixed chunks on BOTH directions [OK]",
+      "X1_forward_ofdm_bit_exact": "CFG16-length forward a2b OFDM batch under accrual ON: forward signal bit-exact at its OWN index, silence inserted into forward signal = 0, forward accrual onsets = 0 (the v1 regression that inserted ~90313 samp into the forward) [OK]; coupler PUBLISHED 229376 samp fwd airtime to feed the reverse ACK",
+      "X2_reverse_ack_delayed": "reverse b2a ACK onset shift = 6881 samp == 30 ms/s * 4.78 s fwd airtime * FS/1000 (exact, ppm=0/jit=0; |err|<=2) [OK]",
+      "X3_batch_length_step": "CFG16 fwd batch -> reverse shift 7102 > 4320 window half-width (MISS); CFG15 fwd batch -> reverse shift 1695 < 4320 (LAND); step=True. miss-fraction CFG16=1.00 (HW 0.875, gate>=0.80), CFG15=0.00 (HW ~0.0, gate<=0.05) over 128 seeds [OK]"
+    },
+    "legacy_tests_pass": [
+      "test_sim_relay_turnaround.py PASS (M1-M3 faithful: forward bursts bit-exact, ppm slip, per-key-up jitter, default-off identity)",
+      "test_sim_relay_drift.py PASS",
+      "test_sim_relay_turnaround_batchlen.py PASS (now delegates to the xdir test)"
+    ],
+    "end_to_end_relay_engagement": "2-peer relay smoke test (real sim_channel_relay.py process, airtime-json): accrual OFF -> turnaround_batch_accrual_ms_per_s=0.0, a2b/b2a accr_onsets=0 (legacy faithful byte-identical). accrual ON via MERCURY_SIM_BATCH_ACCRUAL=1 -> 30.0 ms/s engaged; b2a (reverse ACK) accr_onsets=3 / accr_samples=20644 (delayed by the long forward batches) while a2b (forward OFDM) accr_onsets=1 / accr_samples=246 (only the tiny reverse-ACK airtime, in its own gap). The asymmetry (b2a 20644 >> a2b 246) confirms the cross-direction coupling: the long forward batch pushes the reverse ACK late, the forward OFDM is never burdened."
+  },
+
+  "anchors": {
+    "bench9_held_cfg16": {"whole_window_wire_bps": 597.6, "active_delivery_fraction": 0.189, "revack_matched_0of7_fraction": 0.875, "batch_frames": "25-30", "source": "bigblock_p3_hw/HW_BENCH9/ARMA_CALIBRATION.json"},
+    "bench8_held_cfg15": {"sustained_wire_bps": 3059.9, "complete_byte_faithful": true, "d2_reverse_ack_fires": 0, "source": "bigblock_p3_hw/HW_BENCH8/BENCH8_VERDICT.json"},
+    "cmd_window_half_width_ms": 90.0,
+    "calibration_constant_ms_per_s": 30.0
+  },
+
+  "commit": "see branch_commit field"
+}

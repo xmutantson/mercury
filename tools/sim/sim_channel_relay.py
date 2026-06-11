@@ -158,6 +158,12 @@ WGN_TO_SNR3K = 2.4            # channel SNR3k = WGN_label + 2.4 dB (testbed map)
 # on ~87.5% of turnarounds, whole-window wire ~600 bps) while a ~6-frame CFG15
 # batch (~1.02 s) accrues only ~31 ms (< the window -> LANDS, sustained ~3060
 # bps, NOT halved). See ARMA_CALIBRATION.json / BENCH9_VERDICT.json.
+#
+# CROSS-DIRECTION (v2, SIMTURNCAL_VERDICT.json): the accrual is keyed to the
+# FORWARD (a2b OFDM) batch airtime but the LATE silence is inserted into the
+# REVERSE (b2a MFSK ACK) turnaround GAP via a shared TurnaroundCoupler — the
+# forward OFDM signal stays BIT-EXACT. The v1 per-direction self-accrual instead
+# inserted silence into the FORWARD signal and de-aligned the OFDM decode.
 DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S = 30.0
 
 # ITU-R F.1487 / ARSFI mid-latitude HF channel profiles.
@@ -528,6 +534,74 @@ class PttLatencyModel:
 
 
 # ---------------------------------------------------------------------------
+# CROSS-DIRECTION turnaround coupler (bench-9 batch-length accrual, v2).
+# ---------------------------------------------------------------------------
+# WHY (SIMTURNCAL_VERDICT.json — the v1 mechanism error this corrects): the
+# bench-9 collapse is a HALF-DUPLEX turnaround coupling between the TWO directions
+# — the LONG forward a2b OFDM batch causes the SHORT reverse b2a MFSK ACK to land
+# LATE. The forward and reverse directions are SEPARATE TurnaroundDrift instances
+# (turn["a2b"], turn["b2a"]); the accrual amount is keyed to the FORWARD (a2b)
+# batch airtime but the LATE silence must be inserted into the REVERSE (b2a)
+# turnaround GAP (delaying the b2a ACK onset). A per-instance accrual (v1) instead
+# spent the offset inserting silence AHEAD OF the FORWARD signal onset, breaking
+# the forward OFDM decode (relay ins=90313 samp into the forward; FTR-FAIL x414).
+#
+# This tiny shared object carries the cross-direction hand-off: the just-ended
+# forward burst PUBLISHES its airtime (samples held on the channel) here on its
+# signal->silence falling edge; the reverse direction CONSUMES it at its next
+# silent->signal ACK onset and turns it into a one-sided LATE offset. The forward
+# instance never inserts that offset into its own signal — it only publishes; the
+# reverse instance never holds a long forward batch — it only consumes. So the
+# forward OFDM samples stay BIT-EXACT and the reverse ACK arrives late, exactly
+# the HW mechanism. Default-OFF (accrual==0): publish/consume are inert no-ops, so
+# the legacy per-direction model is byte-identical.
+#
+# Symmetry note: BOTH directions publish-on-burst-end AND consume-on-onset against
+# the SAME coupler. In practice the a2b OFDM batch is the LONG burst that pushes
+# the b2a ACK late (the bench-9 collapse); the b2a ACK is short, so what IT
+# publishes (consumed by the a2b next onset) is a tiny offset realized harmlessly
+# in the a2b turnaround gap — never inside a forward signal burst (a SIGNAL chunk
+# never inserts under the v2 path; see TurnaroundDrift.process M-accrual branch).
+class TurnaroundCoupler:
+    """Shared cross-direction hand-off for the bench-9 batch-length accrual.
+
+    pending_samples == the airtime (wire samples) of the most recently ENDED
+    forward burst, waiting to be consumed by the OTHER direction's next ACK
+    onset and turned into a one-sided LATE turnaround offset there. publish() is
+    called by a direction on its signal->silence burst-end; consume() by the
+    other direction on its silent->signal onset. Inert (no effect) unless the
+    batch-length accrual is enabled on the consuming instance."""
+
+    def __init__(self):
+        # airtime (samples) of the last forward burst that ended on the channel,
+        # not yet consumed by the reverse onset. ONE slot (the half-duplex link
+        # carries one direction at a time, so the reverse ACK that follows a
+        # forward batch consumes exactly that batch's airtime).
+        self.pending_samples = 0
+        # diagnostics
+        self.n_published = 0
+        self.n_consumed = 0
+        self.total_published_samples = 0
+
+    def publish(self, burst_samples):
+        """A direction's forward burst just ended; record its airtime so the
+        OTHER direction's next ACK onset can be pushed late in proportion."""
+        if burst_samples > 0:
+            self.pending_samples = burst_samples
+            self.n_published += 1
+            self.total_published_samples += burst_samples
+
+    def consume(self):
+        """The other direction is keying up its ACK; take (and clear) the pending
+        forward-burst airtime to size this onset's one-sided late offset."""
+        s = self.pending_samples
+        self.pending_samples = 0
+        if s > 0:
+            self.n_consumed += 1
+        return s
+
+
+# ---------------------------------------------------------------------------
 # FAITHFUL turnaround-timing de-alignment model (the DEFAULT drift path).
 # ---------------------------------------------------------------------------
 # WHY this SUPERSEDES DriftResampler (SIMFIDELITY_ROOTCAUSE.md §1-§3, derived
@@ -595,22 +669,36 @@ class TurnaroundDrift:
     (byte-identical, the N2 contract)."""
 
     def __init__(self, ppm, jitter_ms, rng, enabled=True,
-                 accrual_ms_per_s=0.0):
+                 accrual_ms_per_s=0.0, coupler=None, direction=None):
         self.ppm = float(ppm)
         self.jitter_ms = max(0.0, float(jitter_ms))
-        # BATCH-LENGTH-DEPENDENT one-sided LATE accrual (bench-9). ms of late-shift
-        # per SECOND of forward batch airtime held; added to acc at the NEXT
-        # (reverse) onset in proportion to how long the previous burst ran. 0 ==
-        # legacy symmetric-jitter model (byte-identical). See the module constant
-        # DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S and the bench-9 calibration.
+        # BATCH-LENGTH-DEPENDENT one-sided LATE accrual (bench-9, v2 CROSS-DIRECTION).
+        # ms of late-shift per SECOND of FORWARD batch airtime held on the channel
+        # by the OTHER direction. The accrual amount is keyed to the FORWARD (a2b)
+        # batch airtime but the LATE silence is inserted in the REVERSE (b2a)
+        # turnaround GAP (delaying the b2a ACK onset). 0 == legacy symmetric-jitter
+        # model (byte-identical). See DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S +
+        # TurnaroundCoupler + the bench-9 calibration. SIMTURNCAL_VERDICT.json
+        # diagnoses why the v1 per-direction self-accrual (silence into the FORWARD
+        # signal) was wrong; this couples the two directions instead.
         self.accrual_ms_per_s = max(0.0, float(accrual_ms_per_s))
+        # shared cross-direction hand-off (TurnaroundCoupler). This direction
+        # PUBLISHES its just-ended forward-burst airtime here (so the OTHER
+        # direction's ACK onset can be pushed late) and CONSUMES the OTHER
+        # direction's pending forward airtime at its OWN onset. None -> uncoupled
+        # (the accrual is then inert: no forward burst is ever published TO it, so
+        # consume() returns 0 — preserves the legacy / test-double behaviour).
+        self.coupler = coupler
+        self.direction = direction
         self.rng = rng                 # Xoshiro (deterministic per-onset jitter)
         self.enabled = bool(enabled) and (self.ppm != 0.0 or self.jitter_ms > 0.0
                                           or self.accrual_ms_per_s > 0.0)
         # length (samples) of the CURRENT forward signal-burst run — the batch the
-        # modem is holding on the channel right now. Reset to 0 at each turnaround
-        # (silence). Consumed at the next onset to size the one-sided late accrual.
+        # modem is holding on the channel right now. Reset to 0 when this burst
+        # ENDS (signal->silence falling edge), at which point its airtime is
+        # PUBLISHED to the coupler for the OTHER direction's next ACK onset.
         self.cur_burst_samples = 0
+        self.prev_was_signal = False   # signal/silence edge state for burst-end
         # diagnostics for the accrual term
         self.n_accrual_onsets = 0
         self.accrual_samples_total = 0.0
@@ -660,36 +748,56 @@ class TurnaroundDrift:
         # jitter. Symmetric uniform in [-jitter, +jitter] samples. This is the
         # per-key-up dither that random-walks the ACK arrival index.
         onset = (self.prev_silent and not silent)
+        burst_end = (self.prev_was_signal and silent)
+        # BURST-END PUBLISH (bench-9 v2): a forward burst just ended on the channel
+        # (signal->silence falling edge). PUBLISH its airtime to the shared coupler
+        # so the OTHER direction's next ACK onset can be pushed LATE in proportion
+        # to how long THIS direction held the half-duplex channel. The forward
+        # OFDM batch is the long burst; the reverse ACK is short. Inert unless the
+        # batch-length accrual + a coupler are present (default-off byte-identical).
+        if burst_end and self.accrual_ms_per_s > 0.0 and self.coupler is not None \
+                and self.cur_burst_samples > 0:
+            self.coupler.publish(self.cur_burst_samples)
+        if burst_end:
+            self.cur_burst_samples = 0
         if onset:
             self.n_onsets += 1
             if self.jitter_ms > 0.0:
                 jsamp = (2.0 * self.rng.uniform() - 1.0) * self.jitter_ms \
                         * FS / 1000.0
                 self.acc += jsamp
-            # BATCH-LENGTH ACCRUAL (bench-9): the just-ENDED forward burst held the
-            # half-duplex channel for `cur_burst_samples`; the keyer/AGC/
-            # capture-flush/scheduling turnaround latency accumulated over that
-            # hold and pushes THIS reverse onset systematically LATE, in proportion
-            # to the burst length. One-sided (always +, never cancels), so a long
-            # CFG16 batch (~28 frames) accrues enough late-shift to push the
-            # reverse ACK OUT of the CMD window while a short CFG15 batch does not
-            # — the bench-9 STEP the symmetric jitter alone cannot produce. The
-            # offset (samples) = accrual_ms_per_s * burst_seconds * FS/1000.
-            if self.accrual_ms_per_s > 0.0 and self.cur_burst_samples > 0:
-                burst_s = self.cur_burst_samples / FS
-                add = self.accrual_ms_per_s * burst_s * FS / 1000.0
-                self.acc += add
-                self.n_accrual_onsets += 1
-                self.accrual_samples_total += add
-                if add > self.max_accrual_onset:
-                    self.max_accrual_onset = add
+            # CROSS-DIRECTION BATCH-LENGTH ACCRUAL (bench-9 v2, SIMTURNCAL_VERDICT):
+            # CONSUME the OTHER direction's just-ended FORWARD-burst airtime from
+            # the shared coupler. The keyer/AGC/capture-flush/scheduling turnaround
+            # latency accumulated DURING that forward batch pushes THIS direction's
+            # ACK onset systematically LATE, in proportion to the FORWARD batch
+            # airtime (one-sided, always +, never cancels). A long CFG16 forward
+            # batch (~28 frames) makes this reverse ACK miss the CMD window; a short
+            # CFG15 forward batch does not — the bench-9 STEP. The offset (samples)
+            # = accrual_ms_per_s * forward_burst_seconds * FS/1000. CRITICAL: the
+            # airtime is the OTHER direction's (consumed from the coupler), NOT this
+            # instance's own just-ended burst — so the FORWARD direction (whose
+            # coupler holds only the tiny reverse-ACK airtime, or nothing) never
+            # accrues a large offset into its OWN signal onset (the v1 bug that
+            # inserted ~90313 samp into the forward OFDM burst and de-aligned it).
+            if self.accrual_ms_per_s > 0.0 and self.coupler is not None:
+                fwd_samples = self.coupler.consume()
+                if fwd_samples > 0:
+                    burst_s = fwd_samples / FS
+                    add = self.accrual_ms_per_s * burst_s * FS / 1000.0
+                    self.acc += add
+                    self.n_accrual_onsets += 1
+                    self.accrual_samples_total += add
+                    if add > self.max_accrual_onset:
+                        self.max_accrual_onset = add
             # this onset starts a NEW burst; reset the run-length accumulator. The
             # samples of THIS chunk are counted below in the signal branch.
             self.cur_burst_samples = 0
             # snapshot the owed offset AT the onset (jitter + accrual applied,
-            # before it is spent on inserted silence) — the reverse-ACK shift.
+            # before it is spent on inserted silence) — this direction's ACK shift.
             self.last_onset_acc = self.acc
         self.prev_silent = silent
+        self.prev_was_signal = (not silent)
         if abs(self.acc) > self.max_abs_offset:
             self.max_abs_offset = abs(self.acc)
 
@@ -1206,12 +1314,26 @@ def main():
     # direction: ±ppm crystal slip + seeded per-key-up jitter realized as integer
     # silence insert/drop (signal samples bit-exact). enabled only with
     # --turnaround-drift. Independent jitter seeds per direction (two radios).
+    #
+    # CROSS-DIRECTION batch-length accrual (bench-9 v2, SIMTURNCAL_VERDICT.json):
+    # the two directions SHARE one TurnaroundCoupler. Each direction PUBLISHES its
+    # just-ended forward-burst airtime to the coupler (signal->silence falling
+    # edge) and CONSUMES the OTHER direction's pending forward airtime at its OWN
+    # ACK onset, turning it into a one-sided LATE turnaround offset. So the long
+    # FORWARD a2b OFDM batch makes the SHORT reverse b2a MFSK ACK arrive late
+    # (the bench-9 collapse) — and the FORWARD OFDM signal is NEVER touched (the
+    # v1 regression: silence inserted into the forward signal). Inert unless the
+    # accrual is enabled (default-off byte-identical: consume() always returns 0
+    # because nothing publishes with accrual off).
+    turn_coupler = TurnaroundCoupler()
     turn = {"a2b": TurnaroundDrift(args.turnaround_ppm_a2b, args.turnaround_jitter_ms,
                                    Xoshiro(args.seed * 2718281829 & 0xFFFFFFFF),
-                                   enabled=turn_on, accrual_ms_per_s=accrual_ms_per_s),
+                                   enabled=turn_on, accrual_ms_per_s=accrual_ms_per_s,
+                                   coupler=turn_coupler, direction="a2b"),
             "b2a": TurnaroundDrift(args.turnaround_ppm_b2a, args.turnaround_jitter_ms,
                                    Xoshiro(args.seed * 3141592653 & 0xFFFFFFFF),
-                                   enabled=turn_on, accrual_ms_per_s=accrual_ms_per_s)}
+                                   enabled=turn_on, accrual_ms_per_s=accrual_ms_per_s,
+                                   coupler=turn_coupler, direction="b2a")}
 
     stop = threading.Event()
     counters = {"a2b": 0, "b2a": 0}      # per-direction chunk counts
