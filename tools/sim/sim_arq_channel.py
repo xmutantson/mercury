@@ -97,6 +97,78 @@ DEFAULT_RELAY_PORT = 52100        # relay listen port (independent of the quad)
 RSP_PORT = DEFAULT_CTRL_BASE      # rebound in main() after pick_free_ports
 CMD_PORT = DEFAULT_CTRL_BASE + 4  # rebound in main() after pick_free_ports
 
+# ============================================================================
+# VIRTUAL-TIME RUN BOUND (host-load-independence)
+# ============================================================================
+# The modem core clock is VIRTUAL (sim_clock.cc:43-52: virtual_ns = samples *
+# 1e9 / 48000; advanced ONLY by sim_clock_add_samples(len) per forwarded chunk
+# in audioio.c rx_transfer:1753-1754). Every climb-path deadline (gearshift
+# receiving_timeout, PTT turnaround, barrier) reads this virtual clock, NOT the
+# wall clock. The trajectory is therefore a function of VIRTUAL time only and is
+# host-load-independent BY CONSTRUCTION.
+#
+# The ONE place that broke that property was this harness's run loop, which
+# bounded the whole monitored run by `time.time() - start < args.secs` (REAL
+# seconds). Under host CPU saturation fewer VIRTUAL seconds fit the REAL budget,
+# so the ROBUST_0->CFG16 climb truncated (e.g. stalled at CONFIG_13) and the
+# SAME seed produced a DIFFERENT trajectory idle-vs-hammered. That is the bug.
+#
+# THE FIX: bound the run by VIRTUAL time (and/or transfer completion), with only
+# a GENEROUS real-time watchdog that guards a true wedge and never truncates a
+# legit-but-slow climb. Virtual seconds are read from the relay log, which is the
+# SINGLE authoritative virtual-time source (sim_channel_relay.py:980,998-1002):
+# each forwarded chunk carries vstamp = counters[key]*CHUNK_SAMPLES, the
+# monotonic per-direction END sample index. virtual_seconds = vstamp / FS. The
+# relay forwards under the conservative-PDES barrier (the two per-direction
+# counters stay within BARRIER_K chunks), so we take the MIN of the two
+# directions as the conservative virtual-clock FLOOR.
+SIM_FS = 48000.0              # passband wire sample rate (sim_channel_relay.py FS)
+# Relay stats line (sim_channel_relay.py:998-1002), emitted every 500 chunks:
+#   [HH:MM:SS] a2b: 1500 chunks (32.0s) vstamp=1536000 split=+0 P_sig=...
+RELAY_VSTAMP_RE = re.compile(r"\b(a2b|b2a):\s+\d+\s+chunks\s+\([\d.]+s\)\s+vstamp=(\d+)")
+# Generous real-time watchdog: a healthy climb runs MUCH faster than real time
+# (FTRT), so a real run never legitimately exceeds this multiple of the virtual
+# budget. It ONLY fires on a true wedge (relay not forwarding / a process hung).
+REAL_WATCHDOG_MULT = 20.0     # real-seconds ceiling = 20x the virtual budget ...
+REAL_WATCHDOG_FLOOR = 600.0   # ... but never less than this (short virtual runs)
+# If the relay's virtual clock does not advance for this many REAL seconds while
+# the run has not completed, the channel is wedged (no forwarding) -> abort.
+VCLOCK_STALL_REAL_S = 90.0
+
+
+def read_relay_virtual_seconds(relay_log_path):
+    """Return (virtual_seconds, ok) parsed from the relay log's vstamp stats
+    lines. virtual_seconds = min(a2b_vstamp, b2a_vstamp) / FS = the conservative
+    virtual-clock floor (the slower of the two barrier-locked directions). ok is
+    False until BOTH directions have emitted at least one vstamp (pre-CONNECT /
+    log-not-yet-written), at which point virtual_seconds is 0.0 / ok False so the
+    caller falls back to its grace window rather than the real clock.
+
+    Reads the tail only (the vstamps are monotonic; the last line per direction
+    is the latest). Robust to a partially-written/locked log: any read error ->
+    (last_known, False)."""
+    a2b = b2a = None
+    try:
+        with open(relay_log_path, "r", errors="replace") as f:
+            for line in f:
+                m = RELAY_VSTAMP_RE.search(line)
+                if not m:
+                    continue
+                key, stamp = m.group(1), int(m.group(2))
+                if key == "a2b":
+                    a2b = stamp
+                else:
+                    b2a = stamp
+    except OSError:
+        return (0.0, False)
+    if a2b is None and b2a is None:
+        return (0.0, False)
+    # If only one direction has logged a vstamp yet, use it (the barrier keeps
+    # the other within BARRIER_K chunks; the floor is conservative either way).
+    stamps = [s for s in (a2b, b2a) if s is not None]
+    return (min(stamps) / SIM_FS, True)
+
+
 # Mercury prints "[GEARSHIFT] SET_CONFIG: forward=N ..." on every config change
 # (arq_commander.cc:692) and "loaded config N" on load. Track both.
 SETCFG_RE = re.compile(r"SET_CONFIG:\s*forward=(\d+)")
@@ -348,9 +420,21 @@ def log_output(proc, label, logfile, t0, st):
         pass
 
 
+# LOAD-TOLERANT socket timeouts. Under heavy host CPU load a CONNECT-clean modem
+# peer can be slow to accept/produce because its process is starved of CPU, NOT
+# because it is dead. The OLD small timeouts (connect 5s, tx 30s) could declare a
+# merely-starved peer dead and END the run -> a different (truncated) trajectory
+# under load = the SAME host-load-coupling bug class as the run cap. These are
+# generous so a starved-but-alive peer is never falsely killed; true death is
+# detected by p.poll() in the monitor loop, and a true channel wedge by the
+# virtual-clock stall watchdog -- not by a short socket timeout.
+CONNECT_TIMEOUT_S = 30.0          # startup connect (retry loop also present)
+TX_SOCK_TIMEOUT_S = 120.0         # TX-FIFO push: generous; timeout -> RETRY not die
+
+
 def tcp_send(port, commands, label, retries=20, delay=1.0):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5)
+    sock.settimeout(CONNECT_TIMEOUT_S)
     for attempt in range(retries):
         try:
             sock.connect(("127.0.0.1", port))
@@ -361,7 +445,7 @@ def tcp_send(port, commands, label, retries=20, delay=1.0):
             time.sleep(delay)
             sock.close()
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
+            sock.settimeout(CONNECT_TIMEOUT_S)
     for c in commands:
         sock.sendall(c.encode())
         time.sleep(0.3)
@@ -380,7 +464,7 @@ def tx_thread_fn(sock, stop, res, payload, st):
     also dirties the delivered-bps window with pre-connect bytes the modem
     silently drops. Gating on st.connected starts the measured stream at link-up,
     which is exactly the window the I7 delivered-bps A/B wants."""
-    sock.settimeout(30)
+    sock.settimeout(TX_SOCK_TIMEOUT_S)
     md5 = hashlib.md5()
     # Park until the link connects (or the run ends). Cheap poll; the harness
     # sets st.connected on the "link_status:Connected to" log line.
@@ -392,13 +476,23 @@ def tx_thread_fn(sock, stop, res, payload, st):
             res["tx"] += len(payload)
             md5.update(payload)
             res["tx_md5_hex"] = md5.hexdigest()
-        except (socket.timeout, ConnectionError, OSError):
+        except socket.timeout:
+            # The modem TX FIFO is backed up (slow/starved peer), NOT dead. Do
+            # NOT end TX on a timeout -- retry. A truly dead peer is caught by
+            # p.poll() in the monitor loop; a wedged channel by the vclock-stall
+            # watchdog. Killing TX here on a load-induced stall would truncate the
+            # trajectory under host load = the bug we are fixing.
+            continue
+        except (ConnectionError, OSError):
             break
         time.sleep(0.03)
 
 
 def rx_thread_fn(sock, stop, res):
     """Accumulate delivered bytes + their streaming md5 (recv_md5)."""
+    # Short timeout is fine here: rx ALREADY continues-on-timeout (a quiet RX
+    # gap is normal), so a starved peer is never declared dead by this thread.
+    # 2s only sets the stop-flag check cadence; keep it.
     sock.settimeout(2)
     md5 = hashlib.md5()
     while not stop.is_set():
@@ -436,7 +530,21 @@ def main():
     # deprecated flat-fade knobs (superseded by --profile); kept for compat.
     ap.add_argument("--fade-hz", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--fade-depth", type=float, default=0.0, help=argparse.SUPPRESS)
-    ap.add_argument("--secs", type=int, default=180)
+    # --secs is now a VIRTUAL-time dwell budget (sim/virtual-time-runbound):
+    # the run is bounded by virtual time / transfer completion, not real seconds.
+    ap.add_argument("--secs", type=int, default=180,
+                    help="VIRTUAL-time dwell budget in seconds (sim_clock, parsed "
+                         "from the relay vstamp). The run is bounded by VIRTUAL "
+                         "time / transfer completion, NOT real wall-clock seconds "
+                         "-> host-load-independent trajectory. A generous real "
+                         "watchdog (REAL_WATCHDOG_MULT x) only guards a true wedge.")
+    ap.add_argument("--target-bytes", type=int, default=0,
+                    help="if >0, the run also COMPLETES as soon as delivered_bytes "
+                         ">= this (with md5 match). 0 = no byte target (climb-sim: "
+                         "loop the payload until the virtual-time budget is spent).")
+    # --port keeps monitor's COLLISION-PROOF auto-pick (DEFAULT_RELAY_PORT, advanced
+    # if busy) + --ctrl-base, NOT virtual-time-runbound's fixed 52100, so concurrent
+    # sims (now load-independent and therefore run in parallel) never collide.
     ap.add_argument("--port", type=int, default=DEFAULT_RELAY_PORT,
                     help="relay listen port PREFERENCE; auto-advanced if busy. "
                          "Auto-pick keeps concurrent sims collision-proof.")
@@ -461,11 +569,15 @@ def main():
                     help="conservative-PDES lockstep window (chunks) passed to the "
                          "relay. K=1 = strict lockstep (default); relax to 4/8 if "
                          "the strict window starves CONNECT/delivery.")
-    ap.add_argument("--relay-seed", type=int, default=1,
+    # --seed is the sim/virtual-time-runbound alias for --relay-seed (same dest):
+    # both name the relay channel-RNG seed passthrough. Unified onto one argument
+    # so the relay receives "--seed" exactly ONCE (a duplicate would be silently
+    # last-wins). Same seed -> bit-identical channel realization -> reproducible A/B.
+    ap.add_argument("--relay-seed", "--seed", type=int, default=1, dest="relay_seed",
                     help="relay --seed passthrough (seeds the deterministic AWGN + "
                          "per-key-up turnaround-jitter walk). Use MATCHED seeds across "
                          "a D2-ON vs D2-OFF A/B so both arms see the identical channel "
-                         "+ jitter realization. DEFAULT 1.")
+                         "+ jitter realization. DEFAULT 1. (--seed is an alias.)")
     # ---- FIX9 inter-peer drift / PTT turnaround repro (OPT-IN, passthrough) ---
     # DEFAULT 0 (off) -> byte-identical deterministic A/B. On -> the relay re-times
     # the forwarded per-direction stream by the given ppm sample-clock skew (and
@@ -588,6 +700,13 @@ def main():
     stop = threading.Event()
     t0 = time.time()
     relay = None
+    # Run-bound bookkeeping (hoisted so they exist even if launch raises before
+    # the monitor loop). vsecs = last virtual seconds seen; bounded_by = which
+    # bound ended the run (virtual_secs / completion / proc_died / vclock_stall /
+    # real_watchdog / error).
+    vsecs = 0.0
+    vclock_ok = False
+    bounded_by = "error"
 
     def base_cmd(port, role):
         c = [args.bin, "-m", "ARQ", "-s", str(args.start_cfg), "-W",
@@ -618,6 +737,10 @@ def main():
     try:
         # 1. relay first so the peers can connect immediately.
         relay_cmd = [sys.executable, RELAY, "--port", str(args.port),
+                     # --seed and --relay-seed are unified onto args.relay_seed
+                     # (see argparse): pass the channel RNG seed to the relay ONCE.
+                     # A double "--seed" here would let the relay's argparse take
+                     # the LAST one silently -- the kind of collision we resolve.
                      "--seed", str(args.relay_seed),
                      "--snr", str(args.snr), "--loss", str(args.loss),
                      "--profile", args.profile,
@@ -661,11 +784,11 @@ def main():
         time.sleep(1)
 
         cmd_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        cmd_data.settimeout(5)
+        cmd_data.settimeout(CONNECT_TIMEOUT_S)   # load-tolerant connect
         cmd_data.connect(("127.0.0.1", CMD_PORT + 1))
         sockets.append(cmd_data)
         rsp_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        rsp_data.settimeout(5)
+        rsp_data.settimeout(CONNECT_TIMEOUT_S)   # load-tolerant connect
         rsp_data.connect(("127.0.0.1", RSP_PORT + 1))
         sockets.append(rsp_data)
         threading.Thread(target=tx_thread_fn, args=(cmd_data, stop, res, payload, st),
@@ -677,15 +800,89 @@ def main():
         cmd_ctrl = tcp_send(CMD_PORT, ["MYCALL TESTA\r\n", "CONNECT TESTA TESTB\r\n"], "CMD")
         sockets.append(cmd_ctrl)
 
+        # ============================================================
+        # VIRTUAL-TIME / COMPLETION-BOUND run loop (NOT real-time bound).
+        # ============================================================
+        # The run ends when ANY of:
+        #   (a) VIRTUAL time (relay vstamp / FS) reaches args.secs   [climb-sim]
+        #   (b) transfer COMPLETION: delivered_bytes >= --target-bytes [I7]
+        #   (c) a process died, OR
+        #   (d) a GENEROUS real-time watchdog fires (true wedge guard only), OR
+        #   (e) the virtual clock STALLS (relay stopped forwarding = wedge).
+        # Bound (d)/(e) NEVER truncate a healthy-but-slow climb: a healthy climb
+        # runs FTRT (real << virtual), and (e) only fires when virtual time is
+        # frozen. The decisive load-independence property comes from (a): same
+        # seed -> same virtual budget -> identical trajectory idle vs hammered.
         start = time.time()
-        print(f"\n=== monitoring {args.secs}s ===\n")
+        real_watchdog_s = max(args.secs * REAL_WATCHDOG_MULT, REAL_WATCHDOG_FLOOR)
+        print(f"\n=== monitoring up to {args.secs}s VIRTUAL "
+              f"(real watchdog {real_watchdog_s:.0f}s, "
+              f"target_bytes={args.target_bytes or 'none'}) ===\n")
         dead = False
-        while time.time() - start < args.secs and not dead:
+        bounded_by = "virtual_secs"     # default expected exit (overwrites hoist)
+        last_vsecs = -1.0
+        last_vadvance_real = time.time()
+        last_report_v = 0.0
+        while not dead:
             time.sleep(1)
+            now = time.time()
+            real_elapsed = now - start
+
+            # --- (a) virtual-time budget (the load-independent bound) ---------
+            vsecs, vclock_ok = read_relay_virtual_seconds(relay_log)
+            if vclock_ok and vsecs >= args.secs:
+                bounded_by = "virtual_secs"
+                print(f"[BOUND] virtual budget reached: "
+                      f"vsecs={vsecs:.1f} >= {args.secs} (real {real_elapsed:.0f}s)")
+                break
+
+            # --- (b) transfer completion (byte target + md5) -----------------
+            if args.target_bytes > 0 and res["rx"] >= args.target_bytes:
+                ref = _md5_of_looped_prefix(payload, res["rx"])
+                if res.get("recv_md5_hex") == ref:
+                    bounded_by = "completion"
+                    print(f"[BOUND] transfer complete: delivered={res['rx']} "
+                          f">= {args.target_bytes}, md5 match "
+                          f"(vsecs={vsecs:.1f}, real {real_elapsed:.0f}s)")
+                    break
+
+            # --- (c) a process exited ----------------------------------------
             for i, p in enumerate(procs):
                 if p.poll() is not None:
                     print(f"[WARN] {'RSP' if i == 0 else 'CMD'} exited code {p.returncode}")
                     dead = True
+                    bounded_by = "proc_died"
+            if dead:
+                break
+
+            # --- (e) virtual-clock STALL (relay wedged: no forwarding) --------
+            if vclock_ok and vsecs > last_vsecs + 1e-6:
+                last_vsecs = vsecs
+                last_vadvance_real = now
+            elif vclock_ok and (now - last_vadvance_real) > VCLOCK_STALL_REAL_S:
+                # Virtual time has been frozen for VCLOCK_STALL_REAL_S real
+                # seconds while running -> the channel is wedged, not slow.
+                bounded_by = "vclock_stall"
+                print(f"[BOUND][WEDGE] virtual clock frozen at vsecs={vsecs:.1f} "
+                      f"for {now - last_vadvance_real:.0f}s real -> aborting wedge")
+                dead = True
+                break
+
+            # --- (d) GENEROUS real-time watchdog (true-wedge ceiling only) ----
+            if real_elapsed > real_watchdog_s:
+                bounded_by = "real_watchdog"
+                print(f"[BOUND][WATCHDOG] real {real_elapsed:.0f}s exceeded "
+                      f"{real_watchdog_s:.0f}s while vsecs={vsecs:.1f} "
+                      f"(< {args.secs}) -> ceiling guard, run was abnormally slow")
+                dead = True
+                break
+
+            # progress line (every ~10 virtual seconds)
+            if vclock_ok and vsecs >= last_report_v + 10.0:
+                last_report_v = vsecs
+                print(f"[T+v{vsecs:7.1f}] (real {real_elapsed:6.0f}s) "
+                      f"rx={res['rx']}B cfg={cfg_name(st.switch_seq[-1]) if st.switch_seq else '-'}")
+                sys.stdout.flush()
     except KeyboardInterrupt:
         pass
     finally:
@@ -773,7 +970,20 @@ def main():
 
     # deep-SNR stall: never reached a USABLE OFDM config (>= CONFIG_1) AND
     # throughput is tiny (link pinned at robust / CONFIG_0).
-    dwell = max(1.0, time.time() - t0)
+    #
+    # RATE DENOMINATOR IS VIRTUAL TIME, not wall time. rx_bps measured against
+    # real seconds is host-load-dependent (a hammered run takes more real time
+    # for the same delivered bytes -> a LOWER, meaningless bps). The delivered
+    # bytes accrue in VIRTUAL time, so the only load-independent rate is
+    # bytes*8 / virtual_seconds. Re-read the relay log AFTER teardown for the
+    # final vstamp (the log persists past relay.terminate()).
+    final_vsecs, final_vok = read_relay_virtual_seconds(relay_log)
+    if final_vok and final_vsecs > 0:
+        virtual_secs = final_vsecs
+    else:
+        virtual_secs = vsecs if vsecs > 0 else 0.0
+    real_secs = max(1.0, time.time() - t0)
+    dwell = max(1.0, virtual_secs)        # VIRTUAL dwell (load-independent)
     rx_bps = res["rx"] * 8 / dwell
     reached_ofdm = any(1 <= c <= 16 for c in seq)
     stalled = (not reached_ofdm) and rx_bps < 200
@@ -814,13 +1024,21 @@ def main():
     print(f"peak_config       : {cfg_name(peak) if peak is not None else None}")
     print(f"steady_config     : {cfg_name(steady) if steady is not None else None}")
     print(f"final_config      : {cfg_name(final) if final is not None else None}")
-    print(f"client rx bytes   : {res['rx']}  (~{rx_bps:.0f} bps over {dwell:.0f}s WALL)")
+    # virtual-time-runbound: dwell/rx_bps are now measured in VIRTUAL seconds
+    # (load-independent); bounded_by names which run-bound ended the run.
+    print(f"bounded_by        : {bounded_by}")
+    print(f"virtual_secs      : {virtual_secs:.1f}s  (real {real_secs:.1f}s, "
+          f"FTRT {real_secs/max(1e-6,virtual_secs):.2f}x real/virtual)")
+    print(f"client rx bytes   : {res['rx']}  (~{rx_bps:.0f} bps over "
+          f"{dwell:.0f}s VIRTUAL)")
+    # monitor: per-frame CHANNEL wire from the relay airtime-json (HW-representative
+    # axis), independent of the climb-ramp-diluted virtual-clock rx_bps above.
     if wire_bps_airtime is not None:
         print(f"wire_bps_airtime  : {wire_bps_airtime} bps  "
               f"(per-frame CHANNEL wire = rx*8 / {airtime_secs:.1f}s frame-airtime; "
               f"sig={airtime_signal_chunks} sil={airtime_silence_chunks} chunks a2b)")
         print(f"                    [HW-representative axis: maps to rbc/HW, NOT the "
-              f"climb-ramp-diluted wall-clock {rx_bps:.0f} bps]")
+              f"climb-ramp-diluted {rx_bps:.0f} bps]")
     else:
         print("wire_bps_airtime  : (unavailable -- relay airtime-json not found)")
     print(f"client tx bytes   : {res['tx']}")
@@ -844,7 +1062,11 @@ def main():
                 "cfo_hz": args.cfo_hz, "phase_noise_deg": args.phase_noise_deg,
                 "loss": args.loss, "burst": args.burst,
                 "secs": args.secs, "start_cfg": args.start_cfg,
+                # --seed/--relay-seed are unified onto args.relay_seed; emit both
+                # JSON keys (same value) so consumers of either key keep working.
                 "relay_seed": args.relay_seed,
+                "seed": args.relay_seed,
+                "target_bytes": args.target_bytes,
                 # auto-picked ports (so cleanup/inspection is PORT-SCOPED, never
                 # a system-wide kill — multiple concurrent sims are collision-proof)
                 "ports": chosen_ports,
@@ -863,7 +1085,15 @@ def main():
                 "final_config": cfg_name(final) if final is not None else None,
                 "rx_bytes": res["rx"], "tx_bytes": res["tx"],
                 "rx_bps": round(rx_bps, 1),
-                "wall_secs": round(dwell, 1),
+                # --- VIRTUAL-time run bound (host-load-independence) ---
+                # virtual_secs is the load-INDEPENDENT clock the trajectory and
+                # rx_bps are measured against; wall_secs is the real time the run
+                # took (varies with host load); bounded_by names which bound ended
+                # the run. wall_secs == virtual_secs ONLY by coincidence; a
+                # healthy FTRT run has wall_secs < virtual_secs.
+                "virtual_secs": round(virtual_secs, 1),
+                "wall_secs": round(real_secs, 1),
+                "bounded_by": bounded_by,
                 "barrier_k": args.barrier_k,
                 "wire_stamp": args.wire_stamp,
                 "no_gearshift": args.no_gearshift,
