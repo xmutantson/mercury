@@ -1117,6 +1117,55 @@ public:
     return snr_ideal;
   }
 
+  // CFG16-acq2 D2/D3 (bigblock_p3_hw/_cfg16acqd2d3/AUDIT_AND_DESIGN.md §4) — the
+  // CLAMP-TO-SELF / YIELD-TO-DATA discriminator. PURE (no member writes; the unit
+  // test Part D2D3 replays it directly). ROOT CAUSE of the natural-climb CONFIG_13
+  // wedge (D2+D3): in the in-turbo SUPERSHIFT branch (arq_commander.cc:5343) the
+  // D1 acq-fix correctly computes the SNR target = CONFIG_16, but
+  // supershift_retrigger_target RE-CLAMPS it to leap_cap = config_ladder_up_n(anchor,
+  // RETRIGGER_MAX_LEAP) — and from an un-ratcheted CONFIG_0 anchor (idx 3) that
+  // leap_cap = config_ladder_up_n(CONFIG_0, 13) = CONFIG_13 == the CURRENT config.
+  // The code then UNCONDITIONALLY emits add_message_control(SET_CONFIG) (:5476) and
+  // stays TRANSMITTING_CONTROL — a NO-OP SET_CONFIG-to-self that the peer ACKs, turbo
+  // re-triggers, and the SAME 16->clamp-to-13 fires again: an infinite CONTROL spin
+  // that STARVES data TX (executed: 72 "Transmitting control" vs 8 "Transmitting
+  // data", ~113 B delivered, ab2/runs/fix_WGN_40_s1). No clean DATA batch flows, so
+  // the delivery-gated anchor-raise (data_anchor_raise_target, arq_commander.cc:4278)
+  // never fires, the anchor stays CONFIG_0, and the leap_cap stays CONFIG_13 forever.
+  //
+  // This predicate detects that exact clamp-to-self: the FULLY-clamped turbo target
+  // (after the leap_cap + every ceiling/cooldown cap) lands AT OR BELOW the current
+  // config -> there is NO forward config change to announce -> emitting a SET_CONFIG
+  // is a pure no-op spin. When TRUE the caller SETTLES the turbo at the current rung
+  // and YIELDS to DATA TX (the SAME terminal state the CFG16-HOLD top-config branch
+  // uses, arq_commander.cc:5515-5543) so a clean CONFIG_13 batch can DELIVER and
+  // ratchet the anchor CONFIG_0 -> CONFIG_13; the next SUPERSHIFT re-trigger then has
+  // leap_cap = config_ladder_up_n(CONFIG_13, 13) = CONFIG_16 (Part NM6 asserts this
+  // exact site) and the climb reaches CFG16 (the H1 reverse-ACK lever then holds it).
+  //
+  // The caller must NOT pin supershift_proven_ceiling on this yield: the clamp is a
+  // TEMPORARY leap_cap bound that lifts once the anchor ratchets — pinning a proven
+  // ceiling here would forbid the later climb to CFG16. (Contrast the CFG16-HOLD
+  // branch, which legitimately pins the ceiling because CFG16 IS the top.)
+  //
+  // BYTE-IDENTICAL on a real upshift: when the clamped target is STRICTLY ABOVE the
+  // current config (a genuine config change, the normal climb), this returns FALSE
+  // and the caller emits the SET_CONFIG exactly as before. The SNR-capped-step-1
+  // path (negotiated = current+1) is likewise > current -> FALSE -> unchanged. The
+  // branch fires ONLY on the genuine no-op clamp-to-self that is today a control spin.
+  // PURE; index-only comparison (no member reads beyond the two passed configs).
+  bool supershift_clamp_yields_to_data(int clamped_target, int current_config) const
+  {
+#ifdef CFG16ACQ2_D2D3_FAILBEFORE
+    // FAIL-BEFORE: the pre-fix behavior -- NEVER yield (always emit the SET_CONFIG,
+    // even on a clamp-to-self). Part D2D3-1 FAILs (the wedge is not broken).
+    (void)clamped_target; (void)current_config;
+    return false;
+#else
+    return config_ladder_index(clamped_target) <= config_ladder_index(current_config);
+#endif
+  }
+
   // WALL-B FIX-7A (KEYSTONE) — turbo CEILING SETTLE-vs-BREAK discriminator
   // (fix7/FIX7_DESIGN.md §1). PURE decision (no member writes, no side effects;
   // Part U replays it directly, the same idiom as supershift_retrigger_target /

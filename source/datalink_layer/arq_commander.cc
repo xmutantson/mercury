@@ -5440,6 +5440,54 @@ void cl_arq_controller::process_control_commander()
 						// cannot re-elect the carve-dead CFG16 rung while the cooldown holds.
 						// Index-monotone never-raise; no-op off the cooldown (batches==0).
 						negotiated_configuration = apply_bigblock_cooldown_cap(negotiated_configuration);
+						// CFG16-acq2 D2/D3 (bigblock_p3_hw/_cfg16acqd2d3/AUDIT_AND_DESIGN.md §4):
+						// YIELD-TO-DATA on a CLAMP-TO-SELF. The D1 acq-fix lets the SUPERSHIFT
+						// branch above compute negotiated_configuration = CFG16 from the EVM-floored
+						// SNR, but supershift_retrigger_target (:5432) RE-CLAMPS it to leap_cap =
+						// config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP). From an un-ratcheted
+						// CONFIG_0 anchor that leap_cap == CONFIG_13 == current_configuration, so the
+						// clamp produces NO forward config change. Pre-fix the code fell through to
+						// add_message_control(SET_CONFIG) below and re-entered TRANSMITTING_CONTROL —
+						// a NO-OP SET_CONFIG-to-self the peer ACKs, turbo re-triggers, the SAME
+						// 16->clamp-to-13 fires again: an infinite CONTROL spin that STARVES data TX
+						// (executed: 72 ctrl vs 8 data, ab2/runs/fix_WGN_40_s1). No clean DATA batch
+						// flows -> the delivery-gated anchor-raise (:4278) never fires -> the anchor
+						// stays CONFIG_0 -> the leap_cap stays CONFIG_13 forever (the D2/D3 wedge).
+						//
+						// When the FULLY-clamped target lands at/below current there is nothing to
+						// announce: SETTLE the turbo at the current rung and transition straight to
+						// DATA (the SAME terminal state the CFG16-HOLD top-config branch uses below,
+						// :5515-5543) so a clean CONFIG_13 batch can DELIVER and ratchet the anchor
+						// CONFIG_0 -> CONFIG_13; the next SUPERSHIFT re-trigger then has leap_cap =
+						// config_ladder_up_n(CONFIG_13,13) = CONFIG_16 (Part NM6 asserts that exact
+						// site) and the climb reaches CFG16 (the H1 reverse-ACK lever holds it).
+						//
+						// We DELIBERATELY do NOT pin supershift_proven_ceiling here (unlike the
+						// CFG16-HOLD branch): the clamp is a TEMPORARY leap_cap bound that lifts once
+						// the anchor ratchets — pinning a ceiling would forbid the later climb to
+						// CFG16. BYTE-IDENTICAL on a real upshift (clamped target > current ->
+						// supershift_clamp_yields_to_data()==false -> the SET_CONFIG path is unchanged).
+						if(supershift_clamp_yields_to_data(negotiated_configuration, current_configuration))
+						{
+							printf("[TURBO] CLAMP-TO-SELF: target re-clamped to %d <= current %d "
+								"(leap_cap from anchor %d) — yielding to DATA TX so a clean batch "
+								"ratchets the anchor (no no-op SET_CONFIG spin)\n",
+								negotiated_configuration, current_configuration, last_data_viable_config);
+							fflush(stdout);
+							// Mirror the CFG16-HOLD terminal state (turbo done, settle at current),
+							// but WITHOUT pinning supershift_proven_ceiling (the clamp is temporary).
+							turboshift_active = false;
+							turbo_supershift_announce_pending = false;
+							turbo_snr_ack_enabled = false;
+							turbo_received_snr = -99.0f;
+							turboshift_phase = TURBO_DONE;
+							turboshift_last_good = current_configuration;
+							data_configuration = current_configuration;
+							negotiated_configuration = current_configuration;
+							reverse_configuration = current_configuration;
+							this->connection_status = TRANSMITTING_DATA;
+							return;
+						}
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
 						//
@@ -11202,6 +11250,114 @@ int cl_arq_controller::test_climb_engine()
 
 		sack_v2_enabled = saved_sack;
 		measurements.SNR_uplink = saved_snr;
+	}
+
+	// ================================================================
+	// Part D2D3 — CFG16-acq2 D2/D3: the CLAMP-TO-SELF / YIELD-TO-DATA fix that BREAKS
+	// the natural-climb CONFIG_13 wedge (bigblock_p3_hw/_cfg16acqd2d3/AUDIT_AND_DESIGN.md).
+	// D1 (Part NM) computes the climb target = CFG16, but supershift_retrigger_target
+	// RE-CLAMPS it to leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP). This Part
+	// drives the REAL supershift_retrigger_target() + the REAL supershift_clamp_yields_to_data()
+	// + the REAL config_ladder helpers (no hand-rolled map), replaying the exact production
+	// chain at arq_commander.cc:5432 (the D2 clamp) + :5443 (the new D3 yield gate).
+	//
+	// FAIL-BEFORE (-DCFG16ACQ2_D2D3_FAILBEFORE compiles supershift_clamp_yields_to_data to
+	// always return false): D2D3-1 FAILs (the clamp-to-self is NOT recognised -> the code
+	// would emit a no-op SET_CONFIG and SPIN -> the wedge). PASS-AFTER: ALL PASS. The
+	// byte-identical real-upshift arm (D2D3-3) PASSES in both.
+	// ================================================================
+	{
+		int    saved_anchor = last_data_viable_config;
+		double saved_snr2   = measurements.SNR_uplink;
+		bool   saved_sack2  = sack_v2_enabled;
+		int    saved_ceil   = supershift_proven_ceiling;
+
+		robust_enabled = NO;          // OFDM tier
+		narrowband_enabled = NO;
+		max_config_override = -1;
+		optimizer_disabled = true;    // optimizer_is_in_control()==false (anchor clamp applies)
+		sack_v2_enabled = true;       // SACK negotiated (the D1 margin is 0 in the saturated band)
+		supershift_proven_ceiling = -1;
+		measurements.SNR_uplink = 15.0;
+
+		// Reproduce the exact production turbo SUPERSHIFT chain at a CURRENT=CONFIG_13 rung:
+		//   raw target = get_configuration(15.0 - climb_effective_snr_margin_db(15.0)) = CFG16,
+		//   then negotiated = supershift_retrigger_target(CFG16, anchor, ...).
+		auto turbo_clamped_target = [&](int anchor) -> int {
+			int raw = get_configuration(measurements.SNR_uplink
+				- climb_effective_snr_margin_db(measurements.SNR_uplink));
+			// caller-side WB/proven caps (none active here), then the D2 helper:
+			return supershift_retrigger_target(raw, measurements.SNR_uplink, anchor,
+				optimizer_is_in_control(), robust_enabled, narrowband_enabled == YES);
+		};
+
+		// D2D3-0 — confirm the D1 raw target is CFG16 AND the D2 clamp pulls it back to
+		// CONFIG_13 from a CONFIG_0 anchor (the leap_cap = up_n(CONFIG_0,13) = CONFIG_13).
+		// This is the executed [TURBO] SNR-SUPERSHIFT "13 -> 16" / [GEARSHIFT] "forward=13"
+		// pair from ab2/runs/fix_WGN_40_s1. Drives the REAL helpers; PASSES in both arms.
+		{
+			int raw = get_configuration(measurements.SNR_uplink
+				- climb_effective_snr_margin_db(measurements.SNR_uplink));
+			check(raw == CONFIG_16,
+				"D2D3-0a D1: raw climb target from EVM-floor SNR 15.0 + SACK == CFG16",
+				raw, CONFIG_16);
+			int clamped0 = turbo_clamped_target(/*anchor=*/CONFIG_0);
+			check(clamped0 == CONFIG_13,
+				"D2D3-0b D2: from a CONFIG_0 anchor the leap_cap re-clamps CFG16 -> CONFIG_13",
+				clamped0, CONFIG_13);
+		}
+
+		// D2D3-1 — THE WEDGE-BREAK (the failing-test-first case). current==CONFIG_13,
+		// anchor==CONFIG_0: the clamped target == CONFIG_13 == current -> a clamp-to-self.
+		// The fix MUST recognise this and YIELD (return true) instead of emitting a no-op
+		// SET_CONFIG that spins control and starves data. FAIL-BEFORE: returns false -> the
+		// wedge (no yield, the spin continues). PASS-AFTER: true.
+		{
+			last_data_viable_config = CONFIG_0;       // the un-ratcheted anchor (the wedge)
+			int clamped = turbo_clamped_target(last_data_viable_config);
+			bool yields = supershift_clamp_yields_to_data(clamped, /*current=*/CONFIG_13);
+			check(yields == true,
+				"D2D3-1 anchor CONFIG_0 + current CONFIG_13: clamp-to-self CONFIG_13 -> YIELD to DATA (break the no-op SET_CONFIG spin)",
+				yields ? 1 : 0, 1);
+		}
+
+		// D2D3-2 — THE RATCHET RELEASES THE CLIMB. After a clean CONFIG_13 batch raises the
+		// anchor CONFIG_0 -> CONFIG_13 (the yield let data flow), the SAME turbo chain now
+		// clamps the CFG16 target to leap_cap = up_n(CONFIG_13,13) = CONFIG_16 > current 13:
+		// a REAL upshift, so supershift_clamp_yields_to_data == FALSE (proceed with the
+		// SET_CONFIG to CFG16). This is the end-to-end uncap: yield -> ratchet -> reach CFG16.
+		{
+			last_data_viable_config = CONFIG_13;      // anchor ratcheted by a clean CFG13 batch
+			int clamped = turbo_clamped_target(last_data_viable_config);
+			check(clamped == CONFIG_16,
+				"D2D3-2a anchor CONFIG_13: the CFG16 target is NO LONGER clamped (leap_cap up_n(13,13)=CFG16)",
+				clamped, CONFIG_16);
+			bool yields = supershift_clamp_yields_to_data(clamped, /*current=*/CONFIG_13);
+			check(yields == false,
+				"D2D3-2b anchor CONFIG_13: clamped target CFG16 > current 13 -> NO yield, climb to CFG16 proceeds",
+				yields ? 1 : 0, 0);
+		}
+
+		// D2D3-3 — BYTE-IDENTICAL real-upshift guard: any clamped target STRICTLY ABOVE
+		// current is a genuine config change -> NEVER yield (the SET_CONFIG path is
+		// unchanged). PASSES in the FAIL-BEFORE stub too (the stub already returns false).
+		{
+			check(supershift_clamp_yields_to_data(CONFIG_14, CONFIG_13) == false,
+				"D2D3-3a real upshift CFG14 > current CFG13 -> NO yield (byte-identical SET_CONFIG path)",
+				supershift_clamp_yields_to_data(CONFIG_14, CONFIG_13) ? 1 : 0, 0);
+			// a clamp BELOW current (defensive: a demote target) is ALSO a no-op SET_CONFIG
+			// -> yield (post-fix); the predicate is index<=current, not just ==.
+			check(supershift_clamp_yields_to_data(CONFIG_10, CONFIG_13)
+			      == (supershift_clamp_yields_to_data(CONFIG_13, CONFIG_13)),
+				"D2D3-3b clamp BELOW current is handled the SAME as clamp-to-self (index<=current)",
+				supershift_clamp_yields_to_data(CONFIG_10, CONFIG_13) ? 1 : 0,
+				supershift_clamp_yields_to_data(CONFIG_13, CONFIG_13) ? 1 : 0);
+		}
+
+		last_data_viable_config = saved_anchor;
+		measurements.SNR_uplink = saved_snr2;
+		sack_v2_enabled = saved_sack2;
+		supershift_proven_ceiling = saved_ceil;
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
