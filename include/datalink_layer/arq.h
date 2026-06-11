@@ -273,13 +273,22 @@ struct st_message
 // See SACK_DESIGN_A_PLAN.md §4.2.1, §6 reversibility analysis (these
 // helpers are the irreversibility mitigation — the new wire bytes are
 // ONLY emitted when sack_v2_enabled is true on both peers).
-inline int effective_data_long_header_length(bool sack_v2)
+// D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): `with_d5` selects whether the v2 header
+// includes the batch_total_frames byte. It is TRUE for OFDM multi-frame configs
+// (where lost-EOB batch truncation is possible and the +1 byte is negligible),
+// FALSE for robust / batch=1 configs (D5 is meaningless at batch=1 and the byte
+// would steal the scarce ROBUST_0 payload — see test_robust0_compress_deadlock
+// C0). Default TRUE so the prevailing OFDM call sites are unchanged; the robust
+// path + the load_configuration sizing pass the live header_carries_d5 flag.
+inline int effective_data_long_header_length(bool sack_v2, bool with_d5 = true)
 {
-	return sack_v2 ? DATA_LONG_HEADER_LENGTH_V2 : DATA_LONG_HEADER_LENGTH;
+	if(!sack_v2) return DATA_LONG_HEADER_LENGTH;
+	return with_d5 ? DATA_LONG_HEADER_LENGTH_V2 : DATA_LONG_HEADER_LENGTH_V2_NO_D5;
 }
-inline int effective_data_short_header_length(bool sack_v2)
+inline int effective_data_short_header_length(bool sack_v2, bool with_d5 = true)
 {
-	return sack_v2 ? DATA_SHORT_HEADER_LENGTH_V2 : DATA_SHORT_HEADER_LENGTH;
+	if(!sack_v2) return DATA_SHORT_HEADER_LENGTH;
+	return with_d5 ? DATA_SHORT_HEADER_LENGTH_V2 : DATA_SHORT_HEADER_LENGTH_V2_NO_D5;
 }
 
 // SACK: Double-buffered crypto batch storage for partial batch handling.
@@ -987,6 +996,49 @@ public:
     return base_threshold;
   }
 
+  // CFG16-acq2 (data-flow-snr-measurements.md §9) -- the SACK-trusted, REGIME-AWARE
+  // climb SNR margin. PURE (the bool member + the passed SNR). The UP-climb target sites
+  // that compute get_configuration(SNR - <margin>) -- elevator_target_from_snr() (the
+  // FRAME-UP + re-trigger elevator) and the in-turbo SNR-SUPERSHIFT -- call THIS helper
+  // (passing the SAME SNR they map) instead of the bare SUPERSHIFT_MARGIN_DB constant.
+  //
+  // THE DOUBLE-COUNT, only in the SATURATED regime: the responder's POST-EQ EVM-SNR
+  // (ofdm.cc:2288) FLOORS at ~14.5 dB on a clean channel (channel-INDEPENDENT: WGN:40 ==
+  // WGN:50, var=0.0355) and round-trips through the 4-bit MFSK suffix to a hard 15.0.
+  // That is NOT a channel-SNR estimate -- it is an equalizer/pilot residual that has
+  // SATURATED. The 6.0 dB AWGN fading margin is designed for an estimate that TRACKS the
+  // channel; subtracting it from a SATURATED EVM number double-counts the margin and caps
+  // the natural climb at CONFIG_13 (get_configuration(15-6=9)=13) even where pinned CFG16
+  // 32-QAM is PROVEN viable (decisive verdict §2a). When SACK Design A is negotiated the
+  // channel recovers partial-batch loss (SACK_RSP patches missing frames), so the fading
+  // margin is redundant -- but ONLY where the estimate has saturated. Below the saturation
+  // knee the EVM-SNR still TRACKS the channel (e.g. SNR=2.0 is a genuine marginal reading,
+  // not a floor), where the fading margin is still EARNED. So the reduced margin is gated
+  // on snr >= CFG16_EVM_SATURATION_KNEE_DB (13.0, == the get_configuration CFG16 boundary):
+  // only an estimate that already claims CFG16-capable-by-the-table is trusted without the
+  // extra margin. This is regime-aware, not a flat reduction -- FP-J3c (marginal SNR=2.0 ->
+  // no spurious jump) stays BYTE-IDENTICAL even under SACK.
+  //
+  // OFF SACK (NB / legacy / non-SACK): full SUPERSHIFT_MARGIN_DB at every SNR -> byte-
+  // identical. Over-climb safety (§15 WGN:-10): the deep-SNR (SNR~1.0) reading is BELOW
+  // the knee -> full margin anyway; and even above the knee the is_ofdm_config(anchor) gate
+  // in supershift_retrigger_target (anchor-gated, NOT value-gated -- §8.3) clamps to +1
+  // while the anchor is ROBUST. BOTH backstops hold.
+  double climb_effective_snr_margin_db(double snr) const
+  {
+#ifdef CFG16ACQ2_FAILBEFORE
+    // FAIL-BEFORE: the pre-fix behavior -- ALWAYS the full 6.0 dB margin, so the SACK
+    // climb still caps at CONFIG_13 (Part NM1 FAILs). PASS-AFTER: the gated branch below
+    // returns the reduced margin in the saturated regime and the climb elects CFG16.
+    (void)snr;
+    return (double)SUPERSHIFT_MARGIN_DB;
+#else
+    if(sack_v2_enabled && snr >= (double)CFG16_EVM_SATURATION_KNEE_DB)
+      return (double)SACK_CLIMB_SNR_MARGIN_DB;
+    return (double)SUPERSHIFT_MARGIN_DB;
+#endif
+  }
+
   // CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13) -- PURE
   // policy for the SUPERSHIFT re-trigger target. af14a9e HARD-CLAMPED the
   // SNR-driven re-trigger to last_data_viable_config+1 (anchor+1), which made
@@ -1072,6 +1124,55 @@ public:
        config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
       snr_ideal = anchor_cap;
     return snr_ideal;
+  }
+
+  // CFG16-acq2 D2/D3 (bigblock_p3_hw/_cfg16acqd2d3/AUDIT_AND_DESIGN.md §4) — the
+  // CLAMP-TO-SELF / YIELD-TO-DATA discriminator. PURE (no member writes; the unit
+  // test Part D2D3 replays it directly). ROOT CAUSE of the natural-climb CONFIG_13
+  // wedge (D2+D3): in the in-turbo SUPERSHIFT branch (arq_commander.cc:5343) the
+  // D1 acq-fix correctly computes the SNR target = CONFIG_16, but
+  // supershift_retrigger_target RE-CLAMPS it to leap_cap = config_ladder_up_n(anchor,
+  // RETRIGGER_MAX_LEAP) — and from an un-ratcheted CONFIG_0 anchor (idx 3) that
+  // leap_cap = config_ladder_up_n(CONFIG_0, 13) = CONFIG_13 == the CURRENT config.
+  // The code then UNCONDITIONALLY emits add_message_control(SET_CONFIG) (:5476) and
+  // stays TRANSMITTING_CONTROL — a NO-OP SET_CONFIG-to-self that the peer ACKs, turbo
+  // re-triggers, and the SAME 16->clamp-to-13 fires again: an infinite CONTROL spin
+  // that STARVES data TX (executed: 72 "Transmitting control" vs 8 "Transmitting
+  // data", ~113 B delivered, ab2/runs/fix_WGN_40_s1). No clean DATA batch flows, so
+  // the delivery-gated anchor-raise (data_anchor_raise_target, arq_commander.cc:4278)
+  // never fires, the anchor stays CONFIG_0, and the leap_cap stays CONFIG_13 forever.
+  //
+  // This predicate detects that exact clamp-to-self: the FULLY-clamped turbo target
+  // (after the leap_cap + every ceiling/cooldown cap) lands AT OR BELOW the current
+  // config -> there is NO forward config change to announce -> emitting a SET_CONFIG
+  // is a pure no-op spin. When TRUE the caller SETTLES the turbo at the current rung
+  // and YIELDS to DATA TX (the SAME terminal state the CFG16-HOLD top-config branch
+  // uses, arq_commander.cc:5515-5543) so a clean CONFIG_13 batch can DELIVER and
+  // ratchet the anchor CONFIG_0 -> CONFIG_13; the next SUPERSHIFT re-trigger then has
+  // leap_cap = config_ladder_up_n(CONFIG_13, 13) = CONFIG_16 (Part NM6 asserts this
+  // exact site) and the climb reaches CFG16 (the H1 reverse-ACK lever then holds it).
+  //
+  // The caller must NOT pin supershift_proven_ceiling on this yield: the clamp is a
+  // TEMPORARY leap_cap bound that lifts once the anchor ratchets — pinning a proven
+  // ceiling here would forbid the later climb to CFG16. (Contrast the CFG16-HOLD
+  // branch, which legitimately pins the ceiling because CFG16 IS the top.)
+  //
+  // BYTE-IDENTICAL on a real upshift: when the clamped target is STRICTLY ABOVE the
+  // current config (a genuine config change, the normal climb), this returns FALSE
+  // and the caller emits the SET_CONFIG exactly as before. The SNR-capped-step-1
+  // path (negotiated = current+1) is likewise > current -> FALSE -> unchanged. The
+  // branch fires ONLY on the genuine no-op clamp-to-self that is today a control spin.
+  // PURE; index-only comparison (no member reads beyond the two passed configs).
+  bool supershift_clamp_yields_to_data(int clamped_target, int current_config) const
+  {
+#ifdef CFG16ACQ2_D2D3_FAILBEFORE
+    // FAIL-BEFORE: the pre-fix behavior -- NEVER yield (always emit the SET_CONFIG,
+    // even on a clamp-to-self). Part D2D3-1 FAILs (the wedge is not broken).
+    (void)clamped_target; (void)current_config;
+    return false;
+#else
+    return config_ladder_index(clamped_target) <= config_ladder_index(current_config);
+#endif
   }
 
   // WALL-B FIX-7A (KEYSTONE) — turbo CEILING SETTLE-vs-BREAK discriminator
@@ -1734,6 +1835,23 @@ public:
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
   int test_inorder_demote();
 
+  // D5 — EOB-inference batch truncation (TRACK_C_D2D3D5_DESIGN.md §5.3 /
+  // data-flow-prev-bump.md §8). CLI: --test-eob-loss-batch-truncation. Drives
+  // the REAL bump_bsi_and_transfer_prev() (the prev_expected producer), the REAL
+  // prev-completion count gate, the REAL copy_data_to_buffer() prev delivery, and
+  // the REAL fifo_buffer_rx as a byte-exact oracle. A 30-frame batch loses its
+  // EOB-marked tail frame (slot 29); the EOB inference latches a SHORT length
+  // (29) while the wired batch_total_frames carries the true 30.
+  //   fail-before (MERCURY_D5_INFER_DEFEAT=1): prev_expected=29, the count gate
+  //     fires with slot 29 FREE, copy_data_to_buffer delivers the 29-frame batch —
+  //     the lost tail is SILENTLY skipped, the delivered bytes != the 30-frame
+  //     tx prefix (md5-false).
+  //   pass-after (defeat off): prev_expected=30, received_count=29<30 → the gate
+  //     HOLDS (nothing delivered); inject the slot-29 retransmit → received=30 →
+  //     the gate fires → the full 30-frame batch delivers in order (faithful).
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  int test_eob_loss_batch_truncation();
+
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
   //
@@ -2240,6 +2358,14 @@ public:
   bool sack_enabled;                   // Negotiated: both sides have CAP_SACK
   bool sack_v2_enabled;                // SACK Design A scaffolding (Step 6): both sides have CAP_SACK_V2.
                                        // NEGOTIATE-ONLY at this step — gates no behavior yet.
+  // D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): does the v2 DATA header carry the
+  // batch_total_frames byte on THIS config? TRUE for OFDM multi-frame configs,
+  // FALSE for robust / batch=1 (D5 is meaningless at batch=1 and the byte would
+  // steal the scarce ROBUST_0 payload, re-opening the streaming-compression
+  // deadlock floor). Recomputed in load_configuration() from the config being
+  // loaded so TX and RX (both re-run load_configuration on the SET_CONFIG
+  // handshake) agree on the wire header length. Default true (set in init).
+  bool header_carries_d5;
   bool enable_sack_v2;                 // Harness-compat no-op since CAP_SACK_V2 was removed
                                        // (2026-05-24). SACK v2 is unconditional; --enable-sack-v2
                                        // and --disable-sack-v2 still toggle this for tools that
@@ -2828,7 +2954,7 @@ public:
   bool compression_viable_for_batch() const
   {
     if(!compression_enabled) return false;
-    int eff_long = effective_data_long_header_length(sack_v2_enabled);
+    int eff_long = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
     int max_frame = max_data_length + max_header_length - eff_long;
     int batch_capacity = data_batch_size * max_frame;
     if(cipher_suite.is_active()) batch_capacity -= AUTH_TAG_SIZE;
@@ -3418,6 +3544,20 @@ private:
   // storage block. v1 (no bsi routing) keeps writing last_received_end_of_batch
   // _seq directly in receive() and leaves this field unused (-1).
   int rx_buffer_eob_seq;               // staged EOB seq for current v2 frame, or -1
+  // D5 (EOB-inference batch truncation, TRACK_C_D2D3D5_DESIGN.md §5.3): the
+  // TX-authoritative per-batch frame count carried on the wire (batch_total_frames
+  // header byte) on EVERY v2 DATA frame of a batch. Unlike last_received_end_of_batch
+  // _seq (single-frame EOB evidence — erased when the last frame is lost), this
+  // survives the loss of any single frame, so a lost-EOB tail leaves received_count <
+  // expected_count and the batch is held (then SACK-recovered) or loud-aborted rather
+  // than silently truncated. Staged per-frame in receive() (rx_buffer_batch_total
+  // _frames, mirroring rx_buffer_eob_seq), promoted to rx_batch_total_frames ONLY
+  // inside the confirmed match-current / match-prev storage block. -1 = unknown
+  // (v1/legacy/NB, or no frame of this batch seen yet) → consumers fall back to the
+  // EOB inference. MERCURY_D5_INFER_DEFEAT=1 forces the fallback on the SAME binary
+  // (the fail-before arm). Reset to -1 at session init + on every bsi bump/teardown.
+  int rx_buffer_batch_total_frames;    // staged batch_total_frames for current v2 frame, or -1
+  int rx_batch_total_frames;           // promoted authoritative per-batch frame count, or -1
   char last_message_sent_type;
   char last_message_sent_code;
 

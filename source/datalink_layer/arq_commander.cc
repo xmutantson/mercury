@@ -178,7 +178,10 @@ int cl_arq_controller::break_target_with_anchor(int raw_target) const
 // non-const). See §13/§14.
 int cl_arq_controller::elevator_target_from_snr()
 {
-	int snr_ideal = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+	// CFG16-acq2 (§9): SACK-trusted, regime-aware margin (reduced only in the EVM-saturated
+	// band under SACK; full SUPERSHIFT_MARGIN_DB otherwise -> byte-identical off-SACK / sub-knee).
+	int snr_ideal = get_configuration(measurements.SNR_uplink
+		- climb_effective_snr_margin_db(measurements.SNR_uplink));
 	if(narrowband_enabled == YES && snr_ideal > NB_CONFIG_MAX)
 		snr_ideal = NB_CONFIG_MAX;
 	// Enforce proven ceiling from prior BREAK failures.
@@ -1275,7 +1278,7 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 	// SACK Design A Step 1 — DATA_LONG payload capacity is reduced by 1 byte
 	// when sack_v2_enabled (the new batch_seq_id byte occupies that space).
 	// In v1 mode the effective value is identical to the legacy 4-byte macro.
-	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled)))
+	if(type==DATA_LONG && length>(max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled, header_carries_d5)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -1284,7 +1287,7 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 	// SACK Design A Step 2 — DATA_SHORT payload capacity is reduced by 1 byte
 	// when sack_v2_enabled (the new batch_seq_id byte occupies that space).
 	// In v1 mode the effective value is identical to the legacy 5-byte macro.
-	if(type==DATA_SHORT && length>(max_data_length+max_header_length-effective_data_short_header_length(sack_v2_enabled)))
+	if(type==DATA_SHORT && length>(max_data_length+max_header_length-effective_data_short_header_length(sack_v2_enabled, header_carries_d5)))
 	{
 		success=MESSAGE_LENGTH_ERROR;
 		return success;
@@ -1965,9 +1968,18 @@ void cl_arq_controller::process_messages_tx_data()
 		// and a single-frame batch (cannot go partial) stays below BATCH_MAY_BE_PARTIAL_THRESHOLD.
 		// FAIL-BEFORE (-DH1_FAILBEFORE): drop the is_ofdm disjunct -> the fresh-partial widen does not
 		// fire -> Part W2e fails (lockstep INV-1 violated).
+		// CFG16-acq2 (F3): the H1 partial-widen disjunct is WB-OFDM only. is_ofdm_config()
+		// is purely numeric (config 0..16) and is TRUE for NB-OFDM configs too, so the bare
+		// is_ofdm gate would arm H1 on NB sessions — but the SACK suffix that the +600ms
+		// CMD widen protects rides ONLY the WB MFSK ACK suffix (ack_sack_suffix_len()>0 iff
+		// M>=16); on NB there is no partial-SACK suffix to land, so the widen is pure
+		// +ROBUST_ACK_DRIFT_MARGIN_MS retx-latency cost. Gate the disjunct additionally on
+		// narrowband_enabled != YES (== ack_sack_suffix_len()>0) so H1 arms on WB-OFDM only.
+		// Byte-identical on WB; removes the NB mis-fire. (W2e6 covers this in --test-climb-engine.)
 		data_ack_retx_turnaround = (v2_mixed_batch || cfg16_revack_starve_fails > 0
 #ifndef H1_FAILBEFORE
 			|| (is_ofdm_config(current_configuration)
+			    && narrowband_enabled != YES
 			    && data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
 #endif
 			);
@@ -5349,7 +5361,14 @@ void cl_arq_controller::process_control_commander()
 						int snr_target = -1;
 						if(is_ofdm_config(current_configuration) && effective_snr > -90)
 						{
-							snr_target = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
+							// CFG16-acq2 (§9): SACK-trusted margin. Off SACK this is the bare
+							// SUPERSHIFT_MARGIN_DB (byte-identical). Under SACK the margin is 0
+							// so the EVM-floored 15.0 -> get_configuration(15) = CFG16, letting
+							// the natural climb ELECT CFG16 (the reverse-ACK H1 lever then holds
+							// it). Every ceiling clamp below + the is_ofdm_config(anchor)-gated
+							// supershift_retrigger_target (:5414) still bound the result (§8.3).
+							snr_target = get_configuration(effective_snr
+								- climb_effective_snr_margin_db(effective_snr));
 							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 							if(snr_target > cfg_ceiling)
 								snr_target = cfg_ceiling;
@@ -5421,6 +5440,54 @@ void cl_arq_controller::process_control_commander()
 						// cannot re-elect the carve-dead CFG16 rung while the cooldown holds.
 						// Index-monotone never-raise; no-op off the cooldown (batches==0).
 						negotiated_configuration = apply_bigblock_cooldown_cap(negotiated_configuration);
+						// CFG16-acq2 D2/D3 (bigblock_p3_hw/_cfg16acqd2d3/AUDIT_AND_DESIGN.md §4):
+						// YIELD-TO-DATA on a CLAMP-TO-SELF. The D1 acq-fix lets the SUPERSHIFT
+						// branch above compute negotiated_configuration = CFG16 from the EVM-floored
+						// SNR, but supershift_retrigger_target (:5432) RE-CLAMPS it to leap_cap =
+						// config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP). From an un-ratcheted
+						// CONFIG_0 anchor that leap_cap == CONFIG_13 == current_configuration, so the
+						// clamp produces NO forward config change. Pre-fix the code fell through to
+						// add_message_control(SET_CONFIG) below and re-entered TRANSMITTING_CONTROL —
+						// a NO-OP SET_CONFIG-to-self the peer ACKs, turbo re-triggers, the SAME
+						// 16->clamp-to-13 fires again: an infinite CONTROL spin that STARVES data TX
+						// (executed: 72 ctrl vs 8 data, ab2/runs/fix_WGN_40_s1). No clean DATA batch
+						// flows -> the delivery-gated anchor-raise (:4278) never fires -> the anchor
+						// stays CONFIG_0 -> the leap_cap stays CONFIG_13 forever (the D2/D3 wedge).
+						//
+						// When the FULLY-clamped target lands at/below current there is nothing to
+						// announce: SETTLE the turbo at the current rung and transition straight to
+						// DATA (the SAME terminal state the CFG16-HOLD top-config branch uses below,
+						// :5515-5543) so a clean CONFIG_13 batch can DELIVER and ratchet the anchor
+						// CONFIG_0 -> CONFIG_13; the next SUPERSHIFT re-trigger then has leap_cap =
+						// config_ladder_up_n(CONFIG_13,13) = CONFIG_16 (Part NM6 asserts that exact
+						// site) and the climb reaches CFG16 (the H1 reverse-ACK lever holds it).
+						//
+						// We DELIBERATELY do NOT pin supershift_proven_ceiling here (unlike the
+						// CFG16-HOLD branch): the clamp is a TEMPORARY leap_cap bound that lifts once
+						// the anchor ratchets — pinning a ceiling would forbid the later climb to
+						// CFG16. BYTE-IDENTICAL on a real upshift (clamped target > current ->
+						// supershift_clamp_yields_to_data()==false -> the SET_CONFIG path is unchanged).
+						if(supershift_clamp_yields_to_data(negotiated_configuration, current_configuration))
+						{
+							printf("[TURBO] CLAMP-TO-SELF: target re-clamped to %d <= current %d "
+								"(leap_cap from anchor %d) — yielding to DATA TX so a clean batch "
+								"ratchets the anchor (no no-op SET_CONFIG spin)\n",
+								negotiated_configuration, current_configuration, last_data_viable_config);
+							fflush(stdout);
+							// Mirror the CFG16-HOLD terminal state (turbo done, settle at current),
+							// but WITHOUT pinning supershift_proven_ceiling (the clamp is temporary).
+							turboshift_active = false;
+							turbo_supershift_announce_pending = false;
+							turbo_snr_ack_enabled = false;
+							turbo_received_snr = -99.0f;
+							turboshift_phase = TURBO_DONE;
+							turboshift_last_good = current_configuration;
+							data_configuration = current_configuration;
+							negotiated_configuration = current_configuration;
+							reverse_configuration = current_configuration;
+							this->connection_status = TRANSMITTING_DATA;
+							return;
+						}
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
 						//
@@ -10986,7 +11053,8 @@ int cl_arq_controller::test_climb_engine()
 			(void)cfg;
 			return (v2_mixed || starve > 0
 #ifndef H1_FAILBEFORE
-			        || (is_ofdm_config(cfg) && batch >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+			        || (is_ofdm_config(cfg) && narrowband_enabled != YES
+			            && batch >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
 #endif
 			       );
 		};
@@ -11042,10 +11110,254 @@ int cl_arq_controller::test_climb_engine()
 				armed_single ? 1 : 0, 0);
 		}
 
+		// W2e6 — CFG16-acq2 (F3) NB OVER-WIDEN TIGHTEN. is_ofdm_config() is purely numeric
+		// and TRUE for NB-OFDM configs too, so the pre-tighten H1 disjunct would arm on a
+		// multi-frame NB batch (a +600ms NB retx-latency cost) even though NB carries NO
+		// SACK suffix to protect (ack_sack_suffix_len()==0). With the narrowband_enabled!=YES
+		// gate H1 must NOT arm on NB; it MUST still arm on the IDENTICAL WB batch. FAIL-BEFORE
+		// (no NB gate): armed_nb==true -> this check FAILS. PASS-AFTER: armed_nb==false.
+		{
+			int saved_nb = narrowband_enabled;
+			narrowband_enabled = YES;                        // an NB session
+			bool armed_nb = h1_producer(/*v2_mixed=*/false, /*starve=*/0,
+			                            /*batch=*/25, CONFIG_16);
+			check(armed_nb == false,
+				"W2e6 NB multi-frame OFDM batch -> H1 does NOT arm (no SACK suffix on NB; no +600ms NB cost)",
+				armed_nb ? 1 : 0, 0);
+			narrowband_enabled = NO;                         // the WB session
+			bool armed_wb = h1_producer(/*v2_mixed=*/false, /*starve=*/0,
+			                            /*batch=*/25, CONFIG_16);
+			check(armed_wb == true,
+				"W2e6b the IDENTICAL WB multi-frame CFG16 batch -> H1 STILL arms (WB widen preserved)",
+				armed_wb ? 1 : 0, 1);
+			narrowband_enabled = saved_nb;
+		}
+
 		ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
 		cfg16_revack_starve_fails = saved_starve;
 		data_batch_size = saved_batch;
 		data_ack_retx_turnaround = saved_retx;
+	}
+
+	// ================================================================
+	// Part NM — CFG16-acq2: the SACK-TRUSTED CLIMB SNR MARGIN that lets the natural
+	// ROBUST_0->CFG16 climb ELECT CFG16 (data-flow-snr-measurements.md §9). ROOT CAUSE
+	// (executed, bigblock_p3_hw/_cfg16decisive + _cfg16acq2): the responder's POST-EQ
+	// EVM-SNR floors at ~14.5 dB on a clean channel (channel-INDEPENDENT: WGN:40==WGN:50,
+	// var=0.0355) and round-trips through the 4-bit MFSK suffix to a hard 15.0 at the
+	// commander. The climb target get_configuration(SNR - SUPERSHIFT_MARGIN_DB) =
+	// get_configuration(15.0 - 6.0) = get_configuration(9.0) = CONFIG_13 -> the natural
+	// climb caps at CONFIG_13 and NEVER elects CFG16, even though pinned CFG16 32-QAM is
+	// PROVEN viable retx-free (decisive verdict §2a). The 6.0 dB is an AWGN fading margin
+	// that is REDUNDANT under SACK (the SACK_RSP patches partial-batch loss). This drives
+	// the REAL climb_effective_snr_margin_db() member + the REAL get_configuration() table.
+	// FAIL-BEFORE (-DCFG16ACQ2_FAILBEFORE compiles the helper to always return
+	// SUPERSHIFT_MARGIN_DB): NM1/NM2 FAIL (the SACK arm still caps at CONFIG_13). PASS-AFTER:
+	// ALL PASS. The byte-identical (NM3) and over-climb-safe (NM4) arms PASS in both.
+	// ================================================================
+	{
+		bool   saved_sack = sack_v2_enabled;
+		double saved_snr  = measurements.SNR_uplink;
+
+		// NM1 — the BINDING case: SACK negotiated + the EVM-floored clean SNR (15.0, >= the
+		// 13.0 saturation knee). Pre-fix the 6.0 margin caps the target at CONFIG_13; post-fix
+		// the reduced SACK margin (0.0) lets get_configuration(15.0)=CONFIG_16 -> ELECT CFG16.
+		sack_v2_enabled = true;
+		measurements.SNR_uplink = 15.0;
+		{
+			double m = climb_effective_snr_margin_db(measurements.SNR_uplink);
+			int target = get_configuration(measurements.SNR_uplink - m);
+			check(target == CONFIG_16,
+				"NM1 SACK on + EVM-floor SNR 15.0 (>= knee) -> climb target = CFG16 (was CFG13 under the 6dB double-count)",
+				target, CONFIG_16);
+		}
+
+		// NM2 — the margin is the reduced SACK value in the SATURATED band (SNR >= knee).
+		check((double)climb_effective_snr_margin_db(15.0) == (double)SACK_CLIMB_SNR_MARGIN_DB,
+			"NM2 SACK on + SNR>=knee -> margin == SACK_CLIMB_SNR_MARGIN_DB (0.0)",
+			(int)(climb_effective_snr_margin_db(15.0)*10), (int)(SACK_CLIMB_SNR_MARGIN_DB*10));
+
+		// NM3 — BYTE-IDENTICAL off SACK: full 6.0 dB margin, target stays legacy CONFIG_13
+		// at the same 15.0 SNR. PASSES in the FAIL-BEFORE stub too.
+		sack_v2_enabled = false;
+		check((double)climb_effective_snr_margin_db(15.0) == (double)SUPERSHIFT_MARGIN_DB,
+			"NM3 SACK off -> full SUPERSHIFT_MARGIN_DB (6.0) at every SNR (non-SACK/NB/legacy byte-identical)",
+			(int)(climb_effective_snr_margin_db(15.0)*10), (int)(SUPERSHIFT_MARGIN_DB*10));
+		{
+			int target_off = get_configuration(measurements.SNR_uplink - climb_effective_snr_margin_db(15.0));
+			check(target_off == CONFIG_13,
+				"NM3b SACK off -> 15.0 SNR still caps at CONFIG_13 (legacy fading-margin behavior preserved)",
+				target_off, CONFIG_13);
+		}
+
+		// NM4 — REGIME-AWARE: a genuinely MARGINAL SNR (2.0, BELOW the 13.0 knee) keeps the
+		// FULL margin EVEN UNDER SACK -> get_configuration(2.0-6.0)=CONFIG_4, NO spurious jump.
+		// This is the FP-J3c invariant preserved under SACK (the EVM estimate TRACKS at 2.0,
+		// it has NOT saturated, so the fading margin is still EARNED). A flat margin reduction
+		// would over-climb here to CONFIG_10 — the regime gate is why this fix is surgical.
+		sack_v2_enabled = true;
+		measurements.SNR_uplink = 2.0;
+		{
+			double m = climb_effective_snr_margin_db(measurements.SNR_uplink);
+			check((double)m == (double)SUPERSHIFT_MARGIN_DB,
+				"NM4 SACK on + MARGINAL SNR 2.0 (< knee) -> FULL margin (estimate tracks, not saturated)",
+				(int)(m*10), (int)(SUPERSHIFT_MARGIN_DB*10));
+			// get_configuration(2.0-6.0=-4.0) -> CONFIG_5 (-4.0 not > -4, falls to > -5);
+			// the SAME value FP-J3b/FP-J3c assert. A flat margin-0 would give CONFIG_10.
+			int target_marg = get_configuration(measurements.SNR_uplink - m);
+			check(target_marg == CONFIG_5,
+				"NM4b SACK on + marginal SNR 2.0 -> CONFIG_5 (NO spurious over-climb; FP-J3c preserved under SACK)",
+				target_marg, CONFIG_5);
+		}
+
+		// NM5 — OVER-CLIMB SAFETY at deep SNR: the MFSK-placeholder round-trip (~1.0, well
+		// below the knee) gets the FULL margin AND, even if it didn't, the is_ofdm_config(anchor)
+		// gate in supershift_retrigger_target clamps a ROBUST anchor to anchor+1 (§8.3).
+		measurements.SNR_uplink = 1.0;
+		{
+			int snr_ideal_deep = get_configuration(measurements.SNR_uplink
+				- climb_effective_snr_margin_db(measurements.SNR_uplink));
+			int clamped = supershift_retrigger_target(snr_ideal_deep, measurements.SNR_uplink,
+				/*anchor=*/ROBUST_2, /*optimizer_owns=*/false,
+				/*robust_en=*/true, /*narrowband=*/false);
+			check(clamped == config_ladder_up_n(ROBUST_2, 1, true, false),
+				"NM5 SACK on + deep SNR 1.0 + ROBUST anchor -> over-climb BLOCKED (full margin + anchor gate, §8.3)",
+				clamped, config_ladder_up_n(ROBUST_2, 1, true, false));
+		}
+
+		// NM6 — THE END-TO-END-DECISIVE site: the elevator at a PROVEN CONFIG_13 OFDM anchor.
+		// Diag (bigblock_p3_hw/_cfg16acq2/diagrun2) confirmed the elevator's RAW target rises
+		// 13->16 with the fix (margin 0.0 at SNR=15), and from a CONFIG_13 anchor the
+		// RETRIGGER_MAX_LEAP=13 leap_cap = config_ladder_up_n(CONFIG_13,13) = CONFIG_16, so the
+		// MAX_LEAP clamp does NOT re-cap it. This is the moment where the SNR-margin fix is
+		// DECISIVE: pre-fix get_configuration(15-6)=CONFIG_13 == current -> the elevator targets
+		// the SAME rung -> NO climb (the verdict's CONFIG_13 cap); post-fix get_configuration(15)=
+		// CONFIG_16 > current -> the elevator can target CFG16. (From a CONFIG_0 anchor MAX_LEAP
+		// caps the FIRST leap at CONFIG_13 in BOTH arms; the fix's effect surfaces once the anchor
+		// has ratcheted to CONFIG_13.) Replays the REAL elevator chain end-to-end.
+		sack_v2_enabled = true;
+		measurements.SNR_uplink = 15.0;
+		supershift_proven_ceiling = -1;          // clean climb, no prior BREAK ceiling
+		{
+			int saved_anchor = last_data_viable_config;
+			last_data_viable_config = CONFIG_13;  // the anchor has ratcheted to CONFIG_13
+			int elev = elevator_target_from_snr();
+			check(elev == CONFIG_16,
+				"NM6 SACK on + SNR 15.0 + PROVEN CONFIG_13 anchor -> elevator targets CFG16 (MAX_LEAP from 13 == 16; the decisive uncap)",
+				elev, CONFIG_16);
+			last_data_viable_config = saved_anchor;
+		}
+
+		sack_v2_enabled = saved_sack;
+		measurements.SNR_uplink = saved_snr;
+	}
+
+	// ================================================================
+	// Part D2D3 — CFG16-acq2 D2/D3: the CLAMP-TO-SELF / YIELD-TO-DATA fix that BREAKS
+	// the natural-climb CONFIG_13 wedge (bigblock_p3_hw/_cfg16acqd2d3/AUDIT_AND_DESIGN.md).
+	// D1 (Part NM) computes the climb target = CFG16, but supershift_retrigger_target
+	// RE-CLAMPS it to leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP). This Part
+	// drives the REAL supershift_retrigger_target() + the REAL supershift_clamp_yields_to_data()
+	// + the REAL config_ladder helpers (no hand-rolled map), replaying the exact production
+	// chain at arq_commander.cc:5432 (the D2 clamp) + :5443 (the new D3 yield gate).
+	//
+	// FAIL-BEFORE (-DCFG16ACQ2_D2D3_FAILBEFORE compiles supershift_clamp_yields_to_data to
+	// always return false): D2D3-1 FAILs (the clamp-to-self is NOT recognised -> the code
+	// would emit a no-op SET_CONFIG and SPIN -> the wedge). PASS-AFTER: ALL PASS. The
+	// byte-identical real-upshift arm (D2D3-3) PASSES in both.
+	// ================================================================
+	{
+		int    saved_anchor = last_data_viable_config;
+		double saved_snr2   = measurements.SNR_uplink;
+		bool   saved_sack2  = sack_v2_enabled;
+		int    saved_ceil   = supershift_proven_ceiling;
+
+		robust_enabled = NO;          // OFDM tier
+		narrowband_enabled = NO;
+		max_config_override = -1;
+		optimizer_disabled = true;    // optimizer_is_in_control()==false (anchor clamp applies)
+		sack_v2_enabled = true;       // SACK negotiated (the D1 margin is 0 in the saturated band)
+		supershift_proven_ceiling = -1;
+		measurements.SNR_uplink = 15.0;
+
+		// Reproduce the exact production turbo SUPERSHIFT chain at a CURRENT=CONFIG_13 rung:
+		//   raw target = get_configuration(15.0 - climb_effective_snr_margin_db(15.0)) = CFG16,
+		//   then negotiated = supershift_retrigger_target(CFG16, anchor, ...).
+		auto turbo_clamped_target = [&](int anchor) -> int {
+			int raw = get_configuration(measurements.SNR_uplink
+				- climb_effective_snr_margin_db(measurements.SNR_uplink));
+			// caller-side WB/proven caps (none active here), then the D2 helper:
+			return supershift_retrigger_target(raw, measurements.SNR_uplink, anchor,
+				optimizer_is_in_control(), robust_enabled, narrowband_enabled == YES);
+		};
+
+		// D2D3-0 — confirm the D1 raw target is CFG16 AND the D2 clamp pulls it back to
+		// CONFIG_13 from a CONFIG_0 anchor (the leap_cap = up_n(CONFIG_0,13) = CONFIG_13).
+		// This is the executed [TURBO] SNR-SUPERSHIFT "13 -> 16" / [GEARSHIFT] "forward=13"
+		// pair from ab2/runs/fix_WGN_40_s1. Drives the REAL helpers; PASSES in both arms.
+		{
+			int raw = get_configuration(measurements.SNR_uplink
+				- climb_effective_snr_margin_db(measurements.SNR_uplink));
+			check(raw == CONFIG_16,
+				"D2D3-0a D1: raw climb target from EVM-floor SNR 15.0 + SACK == CFG16",
+				raw, CONFIG_16);
+			int clamped0 = turbo_clamped_target(/*anchor=*/CONFIG_0);
+			check(clamped0 == CONFIG_13,
+				"D2D3-0b D2: from a CONFIG_0 anchor the leap_cap re-clamps CFG16 -> CONFIG_13",
+				clamped0, CONFIG_13);
+		}
+
+		// D2D3-1 — THE WEDGE-BREAK (the failing-test-first case). current==CONFIG_13,
+		// anchor==CONFIG_0: the clamped target == CONFIG_13 == current -> a clamp-to-self.
+		// The fix MUST recognise this and YIELD (return true) instead of emitting a no-op
+		// SET_CONFIG that spins control and starves data. FAIL-BEFORE: returns false -> the
+		// wedge (no yield, the spin continues). PASS-AFTER: true.
+		{
+			last_data_viable_config = CONFIG_0;       // the un-ratcheted anchor (the wedge)
+			int clamped = turbo_clamped_target(last_data_viable_config);
+			bool yields = supershift_clamp_yields_to_data(clamped, /*current=*/CONFIG_13);
+			check(yields == true,
+				"D2D3-1 anchor CONFIG_0 + current CONFIG_13: clamp-to-self CONFIG_13 -> YIELD to DATA (break the no-op SET_CONFIG spin)",
+				yields ? 1 : 0, 1);
+		}
+
+		// D2D3-2 — THE RATCHET RELEASES THE CLIMB. After a clean CONFIG_13 batch raises the
+		// anchor CONFIG_0 -> CONFIG_13 (the yield let data flow), the SAME turbo chain now
+		// clamps the CFG16 target to leap_cap = up_n(CONFIG_13,13) = CONFIG_16 > current 13:
+		// a REAL upshift, so supershift_clamp_yields_to_data == FALSE (proceed with the
+		// SET_CONFIG to CFG16). This is the end-to-end uncap: yield -> ratchet -> reach CFG16.
+		{
+			last_data_viable_config = CONFIG_13;      // anchor ratcheted by a clean CFG13 batch
+			int clamped = turbo_clamped_target(last_data_viable_config);
+			check(clamped == CONFIG_16,
+				"D2D3-2a anchor CONFIG_13: the CFG16 target is NO LONGER clamped (leap_cap up_n(13,13)=CFG16)",
+				clamped, CONFIG_16);
+			bool yields = supershift_clamp_yields_to_data(clamped, /*current=*/CONFIG_13);
+			check(yields == false,
+				"D2D3-2b anchor CONFIG_13: clamped target CFG16 > current 13 -> NO yield, climb to CFG16 proceeds",
+				yields ? 1 : 0, 0);
+		}
+
+		// D2D3-3 — BYTE-IDENTICAL real-upshift guard: any clamped target STRICTLY ABOVE
+		// current is a genuine config change -> NEVER yield (the SET_CONFIG path is
+		// unchanged). PASSES in the FAIL-BEFORE stub too (the stub already returns false).
+		{
+			check(supershift_clamp_yields_to_data(CONFIG_14, CONFIG_13) == false,
+				"D2D3-3a real upshift CFG14 > current CFG13 -> NO yield (byte-identical SET_CONFIG path)",
+				supershift_clamp_yields_to_data(CONFIG_14, CONFIG_13) ? 1 : 0, 0);
+			// a clamp BELOW current (defensive: a demote target) is ALSO a no-op SET_CONFIG
+			// -> yield (post-fix); the predicate is index<=current, not just ==.
+			check(supershift_clamp_yields_to_data(CONFIG_10, CONFIG_13)
+			      == (supershift_clamp_yields_to_data(CONFIG_13, CONFIG_13)),
+				"D2D3-3b clamp BELOW current is handled the SAME as clamp-to-self (index<=current)",
+				supershift_clamp_yields_to_data(CONFIG_10, CONFIG_13) ? 1 : 0,
+				supershift_clamp_yields_to_data(CONFIG_13, CONFIG_13) ? 1 : 0);
+		}
+
+		last_data_viable_config = saved_anchor;
+		measurements.SNR_uplink = saved_snr2;
+		sack_v2_enabled = saved_sack2;
+		supershift_proven_ceiling = saved_ceil;
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
@@ -11099,6 +11411,10 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 	max_data_length   = 6;
 	max_header_length = 6;
 	sack_v2_enabled   = true;   // production default since Design A Step 14
+	// D5: robust configs do NOT carry the batch_total_frames byte (load_configuration
+	// sets this from is_robust_config), so the v2 DATA_LONG header stays 5 bytes and
+	// max_frame == 7 == COMPRESS_HEADER_SIZE — the deadlock floor C0 asserts.
+	header_carries_d5 = false;
 	robust_enabled    = YES;
 	narrowband_enabled= NO;
 	current_configuration = ROBUST_0;
@@ -11113,7 +11429,7 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 
 	// max_frame the data-fill computes — exposed so the assertion is explicit.
 	int max_frame = max_data_length + max_header_length
-	              - effective_data_long_header_length(sack_v2_enabled);
+	              - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 	check(max_frame == 7,
 		"C0 ROBUST_0 max_frame == 7 (== COMPRESS_HEADER_SIZE, the worst case)",
 		max_frame, 7);
@@ -14632,7 +14948,7 @@ void cl_arq_controller::process_buffer_data_commander()
 			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 			// payload budget. In v1 (default) identical to legacy macro; in v2
 			// loses 1 byte to the batch_seq_id field.
-			int max_frame = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled);
+			int max_frame = max_data_length+max_header_length-effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 
 			// ROBUST_0 compression-deadlock fix (data-flow-compress-frame-fill.md
 			// §5). Use compression ONLY when the per-batch budget can hold the
