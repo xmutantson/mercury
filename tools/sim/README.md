@@ -53,11 +53,23 @@ The conservative-PDES barrier bounds the a2b/b2a virtual-clock split to
 `K*1024` samples *by design*, so the default sim is a single-clock, barrier-
 locked channel. That **structurally masks** the HW CFG16 climb-collapse, whose
 root cause (`bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md`) is the two RPis'
-**independent soundcard sample-clock drift** (`[CLK-TX] -670.7 ppm`,
-`[CLK-RX] -193.0 ppm`) de-aligning the half-duplex turnaround over the longest
+**independent soundcard sample-clock drift** ~~(`[CLK-TX] -670.7 ppm`,
+`[CLK-RX] -193.0 ppm`)~~ de-aligning the half-duplex turnaround over the longest
 (25-frame CONFIG_16) batches until the CMD's reverse MFSK-ACK/SACK correlator
 sees silence and BREAKs. These OPT-IN flags add that physical skew back so the
 FIX9 D2/D3 turnaround fixes have a failing-first off-bench vehicle.
+
+> **CORRECTION (C4, 2026-06-10):** the ~~`[CLK-TX] -670.7 ppm` / `[CLK-RX]
+> -193.0 ppm`~~ figures struck above were a **measurement artifact**, NOT the
+> real crystal skew. Those tags (now renamed `[TX-PUSH-RATE]` /
+> `[RX-DELIVER-RATE]` in `audioio.c`) report a PRODUCER-PUSH-RATE / 10 s-window
+> *quantization* metric that includes zero-fill silence — it swings ±2000 ppm
+> in 10 s on a static pair, which no crystal can do (see the audioio.c comment
+> + SIMFIDELITY_ROOTCAUSE.md §1). The **true inter-Pi sample-clock skew is
+> ±8.16 ppm** (tone method, CLOCK_VERDICT.md §2). The `-670` repro value in the
+> table below is therefore an ~80× over-statement; use `±8` for a physically
+> faithful skew. The drift de-alignment mechanism is real; only the magnitude
+> was wrong.
 
 | flag | default | effect |
 |------|---------|--------|
