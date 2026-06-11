@@ -659,6 +659,39 @@ CONFIG_16 (5664.7 bps).
 // conservatism upward on the first batch close. Raised to 6.0 dB.
 #define SUPERSHIFT_MARGIN_DB 6.0
 
+// CFG16-acq2 (data-flow-snr-measurements.md §9): SACK-trusted climb SNR margin.
+// The 6.0 dB SUPERSHIFT_MARGIN_DB is an AWGN-table FADING-MARGIN safety net designed
+// for a session WITHOUT partial-batch recovery. But the climb's SNR_uplink at the high
+// OFDM configs is NOT an AWGN channel-SNR estimate — it is the responder's POST-EQ
+// EVM-SNR (ofdm.cc:2288, -10*log10(EVM_variance)), which FLOORS at ~14.5 dB on a clean
+// channel (proven channel-INDEPENDENT: WGN:40 and WGN:50 give byte-identical var=0.0355
+// / SNR=14.5; bigblock_p3_hw/_cfg16decisive). Quantized through the 4-bit MFSK suffix
+// (mfsk.cc:626) it round-trips to a hard 15.0 (tone 10) at the commander. Subtracting a
+// further 6.0 dB fading margin from this already-floored EVM number DOUBLE-COUNTS the
+// margin: get_configuration(15.0 - 6.0) = get_configuration(9.0) = CONFIG_13, so the
+// natural climb caps at CONFIG_13 and NEVER elects CFG16 — even though pinned CFG16
+// 32-QAM is PROVEN viable retx-free at this op-point (decisive verdict §2a: 131 OFDM-OK
+// decodes). When SACK Design A (sack_v2_enabled) is negotiated the channel absorbs
+// partial-batch loss (the SACK_RSP patches missing frames), so the fading margin is
+// redundant — the climb may trust the SAME no-margin ceiling get_configuration(SNR) that
+// turbo_snr_truncates_probe() (arq.h) and finish_turbo_direction() (arq_commander.cc)
+// already trust under SACK. This makes the SNR-trust CONSISTENT across all climb sites.
+// Default-off: applied ONLY when sack_v2_enabled — non-SACK / NB / legacy sessions keep
+// the full 6.0 dB margin BYTE-IDENTICAL. Over-climb safety is unchanged: the deep-SNR
+// (WGN:-10) over-climb is blocked by is_ofdm_config(anchor) in supershift_retrigger_target
+// (anchor-gated, NOT value-gated — §8.3), which this fix does not touch.
+#define SACK_CLIMB_SNR_MARGIN_DB 0.0
+
+// CFG16-acq2: the EVM-saturation knee. The responder's post-EQ EVM-SNR floors at ~14.5 dB
+// (quantizes to 15.0); below ~13 the estimate still TRACKS the channel (a genuine marginal
+// reading where the fading margin is earned). The SACK-trusted margin reduction
+// (climb_effective_snr_margin_db) applies ONLY at/above this knee, so it fixes the saturated
+// double-count (15.0 -> CFG16) without over-climbing on a genuinely marginal channel (e.g.
+// SNR=2.0 stays full-margin -> CONFIG_4, no spurious jump). 13.0 == the get_configuration()
+// CFG16 boundary (telecom_system.cc): only an estimate already claiming CFG16-capable-by-table
+// is trusted without the extra fading margin.
+#define CFG16_EVM_SATURATION_KNEE_DB 13.0
+
 // Re-trigger supershift if measured SNR suggests we're this many configs below optimal.
 // Checked after each ladder gearshift SET_CONFIG success (fresh OFDM SNR available).
 #define SUPERSHIFT_RETRIGGER_CONFIGS 3

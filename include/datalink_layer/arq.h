@@ -987,6 +987,49 @@ public:
     return base_threshold;
   }
 
+  // CFG16-acq2 (data-flow-snr-measurements.md §9) -- the SACK-trusted, REGIME-AWARE
+  // climb SNR margin. PURE (the bool member + the passed SNR). The UP-climb target sites
+  // that compute get_configuration(SNR - <margin>) -- elevator_target_from_snr() (the
+  // FRAME-UP + re-trigger elevator) and the in-turbo SNR-SUPERSHIFT -- call THIS helper
+  // (passing the SAME SNR they map) instead of the bare SUPERSHIFT_MARGIN_DB constant.
+  //
+  // THE DOUBLE-COUNT, only in the SATURATED regime: the responder's POST-EQ EVM-SNR
+  // (ofdm.cc:2288) FLOORS at ~14.5 dB on a clean channel (channel-INDEPENDENT: WGN:40 ==
+  // WGN:50, var=0.0355) and round-trips through the 4-bit MFSK suffix to a hard 15.0.
+  // That is NOT a channel-SNR estimate -- it is an equalizer/pilot residual that has
+  // SATURATED. The 6.0 dB AWGN fading margin is designed for an estimate that TRACKS the
+  // channel; subtracting it from a SATURATED EVM number double-counts the margin and caps
+  // the natural climb at CONFIG_13 (get_configuration(15-6=9)=13) even where pinned CFG16
+  // 32-QAM is PROVEN viable (decisive verdict §2a). When SACK Design A is negotiated the
+  // channel recovers partial-batch loss (SACK_RSP patches missing frames), so the fading
+  // margin is redundant -- but ONLY where the estimate has saturated. Below the saturation
+  // knee the EVM-SNR still TRACKS the channel (e.g. SNR=2.0 is a genuine marginal reading,
+  // not a floor), where the fading margin is still EARNED. So the reduced margin is gated
+  // on snr >= CFG16_EVM_SATURATION_KNEE_DB (13.0, == the get_configuration CFG16 boundary):
+  // only an estimate that already claims CFG16-capable-by-the-table is trusted without the
+  // extra margin. This is regime-aware, not a flat reduction -- FP-J3c (marginal SNR=2.0 ->
+  // no spurious jump) stays BYTE-IDENTICAL even under SACK.
+  //
+  // OFF SACK (NB / legacy / non-SACK): full SUPERSHIFT_MARGIN_DB at every SNR -> byte-
+  // identical. Over-climb safety (§15 WGN:-10): the deep-SNR (SNR~1.0) reading is BELOW
+  // the knee -> full margin anyway; and even above the knee the is_ofdm_config(anchor) gate
+  // in supershift_retrigger_target (anchor-gated, NOT value-gated -- §8.3) clamps to +1
+  // while the anchor is ROBUST. BOTH backstops hold.
+  double climb_effective_snr_margin_db(double snr) const
+  {
+#ifdef CFG16ACQ2_FAILBEFORE
+    // FAIL-BEFORE: the pre-fix behavior -- ALWAYS the full 6.0 dB margin, so the SACK
+    // climb still caps at CONFIG_13 (Part NM1 FAILs). PASS-AFTER: the gated branch below
+    // returns the reduced margin in the saturated regime and the climb elects CFG16.
+    (void)snr;
+    return (double)SUPERSHIFT_MARGIN_DB;
+#else
+    if(sack_v2_enabled && snr >= (double)CFG16_EVM_SATURATION_KNEE_DB)
+      return (double)SACK_CLIMB_SNR_MARGIN_DB;
+    return (double)SUPERSHIFT_MARGIN_DB;
+#endif
+  }
+
   // CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13) -- PURE
   // policy for the SUPERSHIFT re-trigger target. af14a9e HARD-CLAMPED the
   // SNR-driven re-trigger to last_data_viable_config+1 (anchor+1), which made
