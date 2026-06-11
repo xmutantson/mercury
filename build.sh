@@ -334,6 +334,7 @@ source/datalink_layer/timer.cc
 source/physical_layer/awgn.cc
 source/physical_layer/crc16_modbus_rtu.cc
 source/physical_layer/data_container.cc
+source/physical_layer/dist_matcher.cc
 source/physical_layer/error_rate.cc
 source/physical_layer/fir_filter.cc
 source/physical_layer/interleaver.cc

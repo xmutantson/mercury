@@ -24,6 +24,7 @@
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
+#include "physical_layer/dist_matcher.h" // PAS/PCS distribution matcher (lever #2, feat/pcs)
 #include <chrono>
 #include <algorithm> // std::sort — bigblock pre-FFT AFC-track median smoother (Option C)
 #include <vector>  // suffix-FEC soft decode candidate buffers
@@ -6343,6 +6344,27 @@ void cl_telecom_system::sfo_grid_test()
 	int    win      = env_i("MERCURY_SFO_GRID_TRACK_WIN", 9);       // CPE/PEG sliding window
 	uint64_t seed   = (uint64_t)env_i("MERCURY_SFO_GRID_SEED", 12345);
 
+	// ---- PCS / 64-QAM override (lever #2, fact-documents/data-flow-pas-shaping.md) ----
+	// MERCURY_SFO_GRID_M64=1 runs the harness at MOD_64QAM (the PAS-able 8x8 square,
+	// psk.cc:159-225) instead of the config's M — additive sim plumbing for the
+	// clean-front 64-QAM gear (DEEPDSP_PROGRAM.md §2 L-C "M64 override"). The config
+	// table is NOT changed; M + psk are saved here and restored at teardown.
+	// MERCURY_SFO_GRID_PCS=1 then turns on Probabilistic Amplitude Shaping: the CODED
+	// TX fill draws shaped amplitude bits from the distribution matcher and the RX
+	// demaps with the amplitude-bit log-prior (LLR de-shaping). Both default OFF =>
+	// the whole harness is byte-identical to the base when unset.
+	bool pcs_m64 = (env_i("MERCURY_SFO_GRID_M64", 0) != 0);
+	bool pcs     = (env_i("MERCURY_SFO_GRID_PCS", 0) != 0);
+	if(pcs) pcs_m64 = true;   // PAS requires the square 64-QAM rails
+	double pcs_lambda = env_f("MERCURY_SFO_GRID_PCS_LAMBDA", 0.04);  // Maxwell-Boltzmann steepness
+	int    pcs_rail_L = env_i("MERCURY_SFO_GRID_PCS_RAIL_L", 32);    // DM rail blocklength (<=34, __int128-exact)
+	int    saved_M_pcs = M;
+	if(pcs_m64 && M != MOD_64QAM)
+	{
+		M = MOD_64QAM;
+		psk.set_predefined_constellation(M);   // rebuild the 64-QAM constellation + demod buffers
+	}
+
 	// --- Rebuild the OFDM grid at Nsymb=Ngrid (32QAM, 33% pilots Dx=1/Dy=3). ---
 	int saved_Nsymb = ofdm.Nsymb;
 	int Nc    = ofdm.Nc;
@@ -6501,16 +6523,131 @@ void cl_telecom_system::sfo_grid_test()
 	std::vector<int> tx_bits(nBits);
 	std::vector<std::vector<int>> cw_info(Kcw);    // per-codeword info bits (for BER/CRC)
 	ts_srandom((unsigned int)seed);
+
+	// ---- PAS / PCS setup (fact-documents/data-flow-pas-shaping.md §1-§4) -------
+	// 64-QAM per-symbol bit order (psk.cc :260/:328-331 enumerated):
+	//   pos 0 = sign_re, pos 1,2 = |re| amp (hi,lo), pos 3 = sign_im, pos 4,5 = |im| amp.
+	// Amplitude Gray map (hi,lo)->|a|: 00->7, 01->5, 11->3, 10->1; level index 0..3
+	// (0=|1| nearest origin .. 3=|7|). pas_amp_pos[] marks the 4 amplitude bit
+	// positions; pas_sign_pos the 2 sign positions. The DM emits level indices; we
+	// Gray-encode each to (hi,lo) and stream them into the amplitude positions.
+	cl_dist_matcher dm;
+	static const int LEV_AMP[4]   = {1,3,5,7};            // level index -> magnitude
+	// level index -> (hi,lo) amplitude bits (inverse of the Gray map above)
+	static const int LEV_HILO[4][2] = { {1,0}, {1,1}, {0,1}, {0,0} }; // idx0=|1|..idx3=|7|
+	const int pas_amp_pos[4]  = {1,2,4,5};
+	bool pas_on = (pcs && coded && M == MOD_64QAM);
+	if(pas_on)
+	{
+		if(!dm.configure_maxwell_boltzmann(4, LEV_AMP, pcs_lambda, pcs_rail_L))
+		{
+			std::cout << "[SFO-GRID-PCS] DM configure FAILED (lambda=" << pcs_lambda
+			          << " rail_L=" << pcs_rail_L << ") -> falling back to uniform 64-QAM." << std::endl;
+			pas_on = false;
+		}
+		else
+		{
+			std::cout << "[SFO-GRID-PCS] DM ready: levels{1,3,5,7} counts{"
+			          << dm.level_count(0) << "," << dm.level_count(1) << ","
+			          << dm.level_count(2) << "," << dm.level_count(3) << "}"
+			          << " rail_L=" << dm.block_len() << " k_info=" << dm.info_bits()
+			          << " (DM rate " << (double)dm.info_bits()/(double)(2*dm.block_len()) << ")"
+			          << " lambda=" << pcs_lambda << std::endl;
+
+			// PAS power re-normalization (fact-documents/data-flow-pas-shaping.md §0):
+			// set_constellation normalized to unit UNIFORM power; under the shaped prior
+			// the true average power is < 1, which at fixed Es/N0 would LOSE SNR. Build
+			// the per-64-QAM-index prior P(idx)=0.25·P(level_re)·P(level_im) (signs uniform)
+			// and rescale the constellation so the SHAPED average power = 1 — the freed
+			// energy expands the minimum distance, and THAT expansion is the shaping gain.
+			double levp[4];
+			{
+				double tot=(double)(dm.level_count(0)+dm.level_count(1)+dm.level_count(2)+dm.level_count(3));
+				if(tot<1.0) tot=1.0;
+				for(int l=0;l<4;l++) levp[l]=(double)dm.level_count(l)/tot;
+			}
+			std::vector<double> sym_prob(64, 0.0);
+			for(int idx=0; idx<64; ++idx)
+			{
+				// per-symbol bit roles (psk.cc enumeration): (b4,b3)=ampRe Gray, (b1,b0)=ampIm.
+				int b4=(idx>>4)&1, b3=(idx>>3)&1, b1=(idx>>1)&1, b0=idx&1;
+				// Gray (hi,lo)->level index: invert LEV_HILO ({1,0}=idx0..{0,0}=idx3).
+				auto hilo2lev = [&](int hi,int lo)->int{
+					for(int l=0;l<4;l++) if(LEV_HILO[l][0]==hi && LEV_HILO[l][1]==lo) return l; return 0; };
+				int lre=hilo2lev(b4,b3), lim=hilo2lev(b1,b0);
+				sym_prob[idx] = 0.25 * levp[lre] * levp[lim];   // 0.5*0.5 for the two uniform signs
+			}
+			psk.rescale_shaped_power(sym_prob.data());
+		}
+	}
+
 	if(coded)
 	{
 		std::vector<int> enc(ldpc.N);
 		std::vector<int> info(ldpc.K);
+		// PAS amplitude-bit source: a pre-shaped stream of amplitude bits the size of
+		// the whole coded grid. Each rail block (block_len levels) is filled from the
+		// DM (k_info random payload bits -> block_len levels -> 2*block_len amp bits).
+		// We stream Gray (hi,lo) pairs from this buffer into the amplitude positions of
+		// the per-symbol info bits below. This makes the TRANSMITTED 64-QAM amplitudes
+		// Maxwell-Boltzmann-distributed (the shaping gain) while the LDPC still protects
+		// the assembled info bits systematically.
+		std::vector<int> amp_bit_stream;   // shaped amplitude bits (hi,lo,hi,lo,...)
+		size_t amp_cursor = 0;
+		if(pas_on)
+		{
+			int Lr  = dm.block_len();
+			int kdm = dm.info_bits();
+			// enough rail blocks to cover ALL amplitude bit positions in the grid:
+			// 4 amplitude bits/symbol * nData symbols = 4*nData amp bits = 2*nData levels.
+			long need_levels = 2L*(long)nData;
+			long n_blocks    = (need_levels + Lr - 1) / Lr;
+			std::vector<int> in_bits(kdm), out_levels(Lr);
+			for(long blk=0; blk<n_blocks; ++blk)
+			{
+				for(int i=0;i<kdm;i++) in_bits[i] = (int)(ts_random()%2);
+				if(!dm.shape(in_bits.data(), out_levels.data()))
+				{ std::cout << "[SFO-GRID-PCS] dm.shape FAILED — abort PAS." << std::endl; pas_on=false; break; }
+				for(int p=0;p<Lr;p++)
+				{
+					int lev = out_levels[p];
+					amp_bit_stream.push_back(LEV_HILO[lev][0]);  // hi
+					amp_bit_stream.push_back(LEV_HILO[lev][1]);  // lo
+				}
+			}
+		}
+		// Track the global symbol-grid bit position so amplitude vs sign positions are
+		// identified by (globalbit % 6). The harness maps tx_bits contiguously, so the
+		// info bits we assemble here land at the SAME positions psk.mod groups them into.
+		long global_bit = 0;
 		for(int c=0;c<Kcw;c++)
 		{
-			for(int i=0;i<ldpc.K;i++) info[i] = (int)(ts_random()%2);
+			for(int i=0;i<ldpc.K;i++)
+			{
+				int bit;
+				if(pas_on)
+				{
+					int posinsym = (int)((global_bit) % 6);
+					bool is_amp = (posinsym==pas_amp_pos[0]||posinsym==pas_amp_pos[1]
+					             ||posinsym==pas_amp_pos[2]||posinsym==pas_amp_pos[3]);
+					if(is_amp && amp_cursor < amp_bit_stream.size())
+						bit = amp_bit_stream[amp_cursor++];     // shaped amplitude bit
+					else
+						bit = (int)(ts_random()%2);             // uniform sign bit (or amp exhausted)
+				}
+				else
+				{
+					bit = (int)(ts_random()%2);
+				}
+				info[i] = bit;
+				global_bit++;
+			}
 			cw_info[c] = info;
 			ldpc.encode(info.data(), enc.data());   // enc = [K info | P parity] = N bits
 			for(int i=0;i<ldpc.N;i++) tx_bits[(size_t)c*ldpc.N + i] = enc[i];
+			// The P parity bits also advance the global symbol position (they are mapped
+			// to symbols too); keep global_bit in sync with the mapped stream.
+			global_bit += ldpc.P;
 		}
 		// Any leftover bits past K*N are random filler (not scored).
 		for(int i=Kcw*ldpc.N; i<nBits; i++) tx_bits[i] = (int)(ts_random()%2);
@@ -7011,11 +7148,38 @@ void cl_telecom_system::sfo_grid_test()
 	// it did NOT collapse to ~1e-6 (over-confident LLRs -> BP iter caps at 101).
 	if(coded)
 	{
+		// ---- PAS LLR de-shaping prior table (fact-documents/data-flow-pas-shaping.md §4) -
+		// Per-output-bit-position log-prior log_prior[pos] = ln P(bit=0) − ln P(bit=1)
+		// under the shaped amplitude distribution; pos 0,3 (sign) = 0 (uniform). Built
+		// from the DM composition. Passed to demod_pas; demod (uniform) used otherwise.
+		double pas_log_prior[6] = {0,0,0,0,0,0};
+		if(pas_on)
+		{
+			// Marginal P(amp bit=0) for the 'hi' and 'lo' positions over the 4 levels.
+			double tot = (double)(dm.level_count(0)+dm.level_count(1)+dm.level_count(2)+dm.level_count(3));
+			if(tot < 1.0) tot = 1.0;
+			double phi0=0.0, plo0=0.0;   // P(hi=0), P(lo=0)
+			for(int lev=0; lev<4; ++lev)
+			{
+				double p = (double)dm.level_count(lev)/tot;
+				if(LEV_HILO[lev][0]==0) phi0 += p;
+				if(LEV_HILO[lev][1]==0) plo0 += p;
+			}
+			auto lp = [](double p0){ double a=(p0<1e-12?1e-12:p0), b=(1.0-p0<1e-12?1e-12:1.0-p0);
+			                          return std::log(a)-std::log(b); };
+			// positions: 1,4 = 'hi'; 2,5 = 'lo' (pas_amp_pos={1,2,4,5}; sign at 0,3=0).
+			pas_log_prior[1] = lp(phi0);
+			pas_log_prior[4] = lp(phi0);
+			pas_log_prior[2] = lp(plo0);
+			pas_log_prior[5] = lp(plo0);
+		}
+
 		// Per-carrier LLR for the whole grid (production demapper + production nv).
 		std::vector<float> clr(nBits);
 		double cvar = ofdm.noise_variance_estimate;   // the estimator's nv (NOT measure_variance)
 		if(cvar < 1e-9) cvar = 1e-9;
-		psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
+		if(pas_on) psk.demod_pas(deframed.data(), nBits, clr.data(), (float)cvar, pas_log_prior);
+		else       psk.demod    (deframed.data(), nBits, clr.data(), (float)cvar);
 
 		// CSI-weighted LLR (production telecom_system.cc:2901-2927): scale each data
 		// carrier's bit-LLRs by its normalized |H_k|² so the LDPC discounts the deep-null
@@ -7149,7 +7313,8 @@ void cl_telecom_system::sfo_grid_test()
 			ofdm.channel_equalizer(rx.data(), eq.data());
 			ofdm.deframer(eq.data(), deframed.data());
 			double cvar2 = ofdm.noise_variance_estimate; if(cvar2 < 1e-9) cvar2 = 1e-9;
-			psk.demod(deframed.data(), nBits, clr.data(), (float)cvar2);
+			if(pas_on) psk.demod_pas(deframed.data(), nBits, clr.data(), (float)cvar2, pas_log_prior);
+			else       psk.demod    (deframed.data(), nBits, clr.data(), (float)cvar2);
 			if(csi)
 			{
 				double mean_w=0.0; for(int d=0;d<nData;d++) mean_w+=csi_data[d];
@@ -7201,6 +7366,14 @@ void cl_telecom_system::sfo_grid_test()
 	ofdm.channel_estimator_amplitude_restoration=NO;
 	ofdm.LS_window_width=0; ofdm.LS_window_hight=0;
 	ofdm.init(Nfft, Nc, saved_Nsymb, gi);
+
+	// Restore M + the constellation if the PCS/M64 override changed them, so the
+	// rest of the process (and a later -s call) sees the config's modulation.
+	if(pcs_m64 && M != saved_M_pcs)
+	{
+		M = saved_M_pcs;
+		psk.set_predefined_constellation(M);
+	}
 }
 
 // ============================================================================
