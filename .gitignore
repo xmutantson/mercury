@@ -47,6 +47,8 @@ TEST_ACOUSTIC_CONTROL.ps1
 *.log
 benchmark_results/
 benchmark_results_nb/
+# GAP#1 sim airtime breakdown run-artifacts (port-scoped, written to repo root)
+sim_channel_relay_airtime_*.json
 
 # Development-only test/debug scripts
 tools/crash_loop_test.py
