@@ -7174,9 +7174,26 @@ void cl_telecom_system::sfo_grid_test()
 			pas_log_prior[5] = lp(plo0);
 		}
 
+		// ---- CFG17 composition: NV_FORCE + ratio-nvfix (default-OFF, byte-identical) ----
+		// MERCURY_SFO_GRID_NV_FORCE>0: override the estimator's nv with a tiny forced
+		// value, REPRODUCING the HW-only ~1000x post-EQ-EVM nv-collapse (which the
+		// in-process sim never reproduces, PCS_VERDICT.md / nvfix a0e22c8) so the
+		// ratio-gate is testable in sim. Default unset/<=0 -> nv untouched.
+		double nv_force = env_f("MERCURY_SFO_GRID_NV_FORCE", 0.0);
+		if(nv_force > 0.0) ofdm.noise_variance_estimate = nv_force;
+		// MERCURY_SFO_GRID_NVFIX=1: apply the production RATIO-GATED demap-variance
+		// (telecom_system.cc:2992-2999) -> demap_variance = (nv < measure_var/K) ?
+		// measure_var : nv, K=8. `variance` (=measure_variance(rx), :7102) IS the
+		// post-EQ measured noise the Euclidean demapper needs. Default unset -> raw nv
+		// (byte-identical to base). NO-OP whenever nv >= variance/8 (always true in sim
+		// UNLESS NV_FORCE collapses it) so even enabled it is a NO-OP on a healthy nv.
+		bool   nvfix = (env_i("MERCURY_SFO_GRID_NVFIX", 0) != 0);
+		const double NV_COLLAPSE_RATIO_K = 8.0;
+
 		// Per-carrier LLR for the whole grid (production demapper + production nv).
 		std::vector<float> clr(nBits);
 		double cvar = ofdm.noise_variance_estimate;   // the estimator's nv (NOT measure_variance)
+		if(nvfix && cvar < variance / NV_COLLAPSE_RATIO_K) cvar = variance;   // ratio-gate (a0e22c8)
 		if(cvar < 1e-9) cvar = 1e-9;
 		if(pas_on) psk.demod_pas(deframed.data(), nBits, clr.data(), (float)cvar, pas_log_prior);
 		else       psk.demod    (deframed.data(), nBits, clr.data(), (float)cvar);
@@ -7312,7 +7329,9 @@ void cl_telecom_system::sfo_grid_test()
 					if(di<nData) csi_data[di]=H.real()*H.real()+H.imag()*H.imag(); di++; } }
 			ofdm.channel_equalizer(rx.data(), eq.data());
 			ofdm.deframer(eq.data(), deframed.data());
-			double cvar2 = ofdm.noise_variance_estimate; if(cvar2 < 1e-9) cvar2 = 1e-9;
+			double cvar2 = ofdm.noise_variance_estimate;
+			if(nvfix && cvar2 < variance / NV_COLLAPSE_RATIO_K) cvar2 = variance;   // ratio-gate (a0e22c8)
+			if(cvar2 < 1e-9) cvar2 = 1e-9;
 			if(pas_on) psk.demod_pas(deframed.data(), nBits, clr.data(), (float)cvar2, pas_log_prior);
 			else       psk.demod    (deframed.data(), nBits, clr.data(), (float)cvar2);
 			if(csi)
@@ -7346,6 +7365,9 @@ void cl_telecom_system::sfo_grid_test()
 		std::cout << "[SFO-GRID-CODED]   codewords_decoded=" << cw_ok << "/" << Kcw
 		          << "  fail=" << cw_crcfail
 		          << "  post_FEC_info_BER=" << cw_ber << std::endl;
+		// CFG17 composition self-test snapshot (additive; read by run_cfg17_selftest).
+		sfo_grid_last_cw_ok  = cw_ok;
+		sfo_grid_last_cw_tot = Kcw;
 		std::cout << "[SFO-GRID-CODED]   nv_check: " << (ofdm.noise_variance_estimate > 1e-5 ? "OK (not collapsed)" : "COLLAPSED (<1e-5 -> E1 bug)")
 		          << "  iter_cap_check: " << (iter_max < ldpc.nIteration_max ? "OK (no codeword hit cap)" : "CAPPED (BP at 101 -> over-confident LLR)") << std::endl;
 	}
@@ -9809,6 +9831,23 @@ void cl_telecom_system::load_configuration(int configuration)
 	else if(configuration==CONFIG_16)
 	{
 		_modulation=MOD_32QAM;
+		_ldpc_rate=14/16.0;
+		ofdm_preamble_configurator_Nsymb=4;
+		ofdm_channel_estimator=LEAST_SQUARE;
+	}
+	else if(configuration==CONFIG_17)
+	{
+		// CONFIG_17 = shaped-64-QAM top-gear SKELETON. Identical to CONFIG_16 except
+		// the constellation (MOD_64QAM, psk.cc:159-225 — already Gray-coded, already
+		// power-normalized) and the OFDM dimensioning, which ALREADY has MOD_64QAM
+		// branches (Nsymb=8: telecom_system.cc:4809/4818; Dx=1: :4829; Dy=3:
+		// :4841/4850). Reuses the SAME rate-14/16 QC-LDPC matrix as CFG15/CFG16 — no
+		// new matrix, no ABI/build risk, byte-identical-safe. Production follow-on:
+		// rate-2/3 QC-LDPC PAS (the canonical PAS rate for 64-QAM) — HELD until after
+		// the CFG16-acquisition fix. DEFAULT-NOT-SELECTED (WB_CONFIG_MAX=CONFIG_16 →
+		// the climb engine never elects this rung). See
+		// fact-documents/data-flow-cfg17-shaped-64qam.md.
+		_modulation=MOD_64QAM;
 		_ldpc_rate=14/16.0;
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;

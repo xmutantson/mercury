@@ -511,6 +511,13 @@ public:
 	// CONT_COLS, SCAT_DX, SCAT_DY. See fact-doc §13.
 	void sfo_grid_test();
 
+	// CFG17 composition self-test result snapshot (--test-cfg17 / run_cfg17_selftest).
+	// Populated at the end of sfo_grid_test()'s coded block (additive — does NOT alter
+	// any printed output or production behavior). Lets the in-process composition test
+	// read the decode outcome without parsing stdout. -1 = not-run / no coded block.
+	int sfo_grid_last_cw_ok  = -1;   // codewords decoded clean this run
+	int sfo_grid_last_cw_tot = -1;   // total codewords this run (Kcw)
+
 	// TEST 3 (sparse-capable 2D channel interpolator — the §13.5 production gap).
 	// On a frequency-SELECTIVE channel (MERCURY_SFO_GRID_CHAN=1 det-floor / =2 two-ray)
 	// the flat-ML H̄ shortcut FAILS (one global scalar cannot represent |H|+phase varying

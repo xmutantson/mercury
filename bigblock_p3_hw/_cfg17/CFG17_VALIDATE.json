@@ -1,0 +1,967 @@
+{
+  "title": "CFG17 shaped-64-QAM fleet validation vs genie across channels",
+  "branch": "feat/cfg17 @ 26ae773 (off monitor 10729d4)",
+  "vehicle": "SFO-GRID coded-BER harness (-m PLOT_PASSBAND -s 16, MERCURY_SFO_GRID_* env), M64 override -> MOD_64QAM, K=6-7 rate-0.875 LDPC codewords per cell",
+  "fleet": [
+    "192.168.2.31 SpicyPancake",
+    "192.168.2.21 ChorizoSlice",
+    "192.168.2.11 InstantGrits"
+  ],
+  "seeds_per_cell": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    12345
+  ],
+  "total_cells": 1032,
+  "arms": {
+    "uniform": "uniform-64-QAM, single-pass LS, no nvfix (the bare baseline)",
+    "pasls": "PAS-shaped-64-QAM, single-pass LS (isolates the PAS lever)",
+    "stack": "CFG17 FULL STACK for SIM = PAS + TINTERP-seed turbo (4 iter), nvfix OFF",
+    "stacknvfix": "diagnostic: stack WITH ratio-nvfix engaged (quantifies the sim misfire)",
+    "genie": "PAS-64 with EXACT per-subcarrier CSI (isolates the LDPC/SNR ceiling)"
+  },
+  "channel_defs": {
+    "clean": "AWGN, CHAN=0",
+    "detfloor": "Schroeder all-pass phase-dispersive det-floor, CHAN=1 (the nv-collapse domain; |H|=1, per-subcarrier phase dispersion the flat-ML/cold-LS H cannot represent)",
+    "watt-good": "Watterson 2-tap, depth=2 dB, fd=0.5 Hz",
+    "watt-mod": "Watterson 2-tap, depth=4 dB, fd=1.0 Hz",
+    "watt-poor": "Watterson 2-tap, depth=6 dB, fd=1.5 Hz"
+  },
+  "waterfall_dB_99pct": {
+    "clean": {
+      "uniform": 19.0,
+      "pasls": 17.0,
+      "stack": 19.0,
+      "genie": 16.0
+    },
+    "detfloor": {
+      "uniform": null,
+      "pasls": null,
+      "stack": 18.0,
+      "stacknvfix": null,
+      "genie": 16.0
+    },
+    "watt-good": {
+      "uniform": null,
+      "pasls": null,
+      "stack": 19.0,
+      "genie": 17.0
+    },
+    "watt-mod": {
+      "uniform": null,
+      "stack": null,
+      "genie": 19.0
+    },
+    "watt-poor": {
+      "uniform": null,
+      "stack": null,
+      "genie": 23.0
+    }
+  },
+  "per_channel_decode_fraction": {
+    "clean": {
+      "esn0_rows": [
+        {
+          "esn0": 13.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 14.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 15.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.286,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.286,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 16.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.976,
+            "full_seeds": "5/6"
+          },
+          "stack": {
+            "frac": 0.071,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 17.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stack": {
+            "frac": 0.714,
+            "full_seeds": "1/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 18.0,
+          "uniform": {
+            "frac": 0.81,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stack": {
+            "frac": 0.976,
+            "full_seeds": "5/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 19.0,
+          "uniform": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "pasls": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 20.0,
+          "uniform": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "pasls": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        }
+      ],
+      "waterfall_dB": {
+        "uniform": 19.0,
+        "pasls": 17.0,
+        "stack": 19.0,
+        "genie": 16.0
+      }
+    },
+    "detfloor": {
+      "esn0_rows": [
+        {
+          "esn0": 14.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 15.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.238,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 16.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.024,
+            "full_seeds": "0/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 17.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.738,
+            "full_seeds": "0/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 18.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 19.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 20.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 21.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 22.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "stacknvfix": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        }
+      ],
+      "waterfall_dB": {
+        "uniform": null,
+        "pasls": null,
+        "stack": 18.0,
+        "stacknvfix": null,
+        "genie": 16.0
+      }
+    },
+    "watt-good": {
+      "esn0_rows": [
+        {
+          "esn0": 13.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 14.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 15.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.071,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 16.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.929,
+            "full_seeds": "4/6"
+          }
+        },
+        {
+          "esn0": 17.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.405,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 18.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.024,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.929,
+            "full_seeds": "4/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 19.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.071,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 20.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "pasls": {
+            "frac": 0.119,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        }
+      ],
+      "waterfall_dB": {
+        "uniform": null,
+        "pasls": null,
+        "stack": 19.0,
+        "genie": 17.0
+      }
+    },
+    "watt-mod": {
+      "esn0_rows": [
+        {
+          "esn0": 13.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 14.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 15.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 16.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.548,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 17.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.024,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.881,
+            "full_seeds": "3/6"
+          }
+        },
+        {
+          "esn0": 18.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.19,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.976,
+            "full_seeds": "5/6"
+          }
+        },
+        {
+          "esn0": 19.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.381,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 20.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.714,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 21.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.929,
+            "full_seeds": "3/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 22.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.952,
+            "full_seeds": "4/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        }
+      ],
+      "waterfall_dB": {
+        "uniform": null,
+        "stack": null,
+        "genie": 19.0
+      }
+    },
+    "watt-poor": {
+      "esn0_rows": [
+        {
+          "esn0": 14.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 15.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 16.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.167,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 17.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.524,
+            "full_seeds": "0/6"
+          }
+        },
+        {
+          "esn0": 18.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.857,
+            "full_seeds": "2/6"
+          }
+        },
+        {
+          "esn0": 19.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.905,
+            "full_seeds": "3/6"
+          }
+        },
+        {
+          "esn0": 20.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.071,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.929,
+            "full_seeds": "3/6"
+          }
+        },
+        {
+          "esn0": 21.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.143,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.952,
+            "full_seeds": "4/6"
+          }
+        },
+        {
+          "esn0": 22.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.167,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 0.976,
+            "full_seeds": "5/6"
+          }
+        },
+        {
+          "esn0": 23.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.214,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        },
+        {
+          "esn0": 24.0,
+          "uniform": {
+            "frac": 0.0,
+            "full_seeds": "0/6"
+          },
+          "stack": {
+            "frac": 0.286,
+            "full_seeds": "0/6"
+          },
+          "genie": {
+            "frac": 1.0,
+            "full_seeds": "6/6"
+          }
+        }
+      ],
+      "waterfall_dB": {
+        "uniform": null,
+        "stack": null,
+        "genie": 23.0
+      }
+    }
+  },
+  "KEY_FINDING_nvfix_must_be_off_in_sim": {
+    "observation": "On the det-floor, the ratio-nvfix (cvar=(nv<measure_var/8)?measure_var:nv) MISFIRES: the legit-low estimator nv (0.0093 @18dB) is < the large post-EQ measured variance on the dispersive channel /8, so the gate trips and over-softens the LLRs.",
+    "evidence": "detfloor @18dB seed12345 TINTERP-turbo: NVFIX=0 -> 7/7; NVFIX=1 -> 0/7. stacknvfix arm floors 0.0 across ALL 14-22 dB and all 6 seeds.",
+    "conclusion": "nvfix is a HW-ONLY gated lever (the in-sim nv never collapses). It MUST be OFF in sim; its CORRECTNESS is proven only in the NV_FORCE forced-collapse regime (--test-cfg17 CELL-C). Engaging it on a real dispersive sim channel ACTIVELY HARMS the decode. This matches the MEMORY.md 'NVFIX SETBACK' note and PCS_VERDICT scoping (bench-only benefit)."
+  },
+  "KEY_FINDING_tinterp_seed_is_channel_gated": {
+    "observation": "The TINTERP-seed turbo HELPS on dispersive/time-varying channels (det-floor, fades) but REGRESSES on clean AWGN and full-grid-LS.",
+    "evidence": "clean waterfall: pasls(PAS+plain-LS)=17dB vs stack(PAS+TINTERP-turbo)=19dB. detfloor: pasls=NONE vs stack=18dB. The estimator lever is the differentiator ONLY where cold-LS cannot represent the channel (det-floor, fades).",
+    "conclusion": "The deployable CFG17 estimator must be channel-appropriate: plain LS on clean/flat (where it is near-genie), TINTERP-seed turbo on dispersive/fading. Matches fact-doc data-flow-cfg17-shaped-64qam.md S6.1 and PCS_VERDICT (2)."
+  },
+  "wire_rate_math": {
+    "phy_params": {
+      "CFG16": "M=32(5b/sym) Nc=50 Nsymb=9 nBits=1500 BW=2344Hz rate0.875 -> info 1312.5/frame",
+      "CFG17": "M=64(6b/sym) Nc=50 Nsymb=8 nBits=1596 BW=2344Hz rate0.875 -> info 1396.5/frame"
+    },
+    "data_symbol_payload_edge": "1.197x (= 6/5 bits/sym, the +20% headline, preamble-amortized)",
+    "per_frame_with_preamble_ratio": "1.153x (CFG17's shorter 8-symbol frame slightly dilutes the +20% against the fixed 4-symbol preamble)",
+    "cfg17_per_frame_wire_bps": 4451.61,
+    "compression_edge_R": 3.69,
+    "VARA_eff": 13048,
+    "scenarios": {
+      "sustained_conservative_x1.153_on_cfg16_3060": "3527 bps x3.69 = 13016 eff = 0.998x VARA (parity)",
+      "sustained_+20pct_x1.197_on_cfg16_3060": "3663 bps x3.69 = 13516 eff = 1.036x VARA (beat)",
+      "per_frame_PHY_ceiling_4451.61": "x3.69 = 16426 eff = 1.259x VARA (the held-at-per-frame ceiling once CFG17 is acquired)"
+    }
+  }
+}

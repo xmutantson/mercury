@@ -383,6 +383,146 @@ static int run_pas_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-cfg17: CFG17 shaped-64-QAM COMPOSITION self-test (failing-test-first).
+// Drives the SFO-GRID harness in-process for three decisive cells and asserts the
+// COMPOSED stack decodes where a BARE arm fails — proving each of the three deep
+// levers (PAS, TINTERP-seed turbo estimator, ratio-nvfix) is live in the CFG17
+// gear. The harness rebuilds the grid at MOD_64QAM (MERCURY_SFO_GRID_M64/_PCS), so
+// CFG17 itself need not be production-elected for the composition to be exercised.
+// See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
+static void cfg17_set_env(const char* k, const char* v)
+{
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+// Save+restore so the harness's env-gated default-off paths are not perturbed for
+// any later in-process work. Run ONE harness cell with the given env, return the
+// decoded codeword count via the additive sfo_grid_last_cw_* snapshot.
+static void cfg17_run_cell(const char* esn0, const char* chan, const char* m64,
+                           const char* pcs, const char* coded, const char* nsymb,
+                           const char* turbo_seed, const char* turbo_iters,
+                           const char* nvfix, const char* nv_force,
+                           int& cw_ok, int& cw_tot)
+{
+    // The complete env key set the harness reads for these cells.
+    const char* keys[] = {
+        "MERCURY_SFO_GRID", "MERCURY_SFO_GRID_ESN0", "MERCURY_SFO_GRID_CHAN",
+        "MERCURY_SFO_GRID_M64", "MERCURY_SFO_GRID_PCS", "MERCURY_SFO_GRID_CODED",
+        "MERCURY_SFO_GRID_NSYMB", "MERCURY_SFO_GRID_TURBO_SEED",
+        "MERCURY_SFO_GRID_TURBO_ITERS", "MERCURY_SFO_GRID_NVFIX",
+        "MERCURY_SFO_GRID_NV_FORCE"
+    };
+    const int nk = (int)(sizeof(keys)/sizeof(keys[0]));
+    struct Saved { const char* key; bool had; std::string val; } sv[16];
+    for (int i = 0; i < nk; i++) {
+        const char* g = std::getenv(keys[i]);
+        sv[i].key = keys[i]; sv[i].had = (g != nullptr);
+        sv[i].val = g ? std::string(g) : std::string();
+    }
+    cfg17_set_env("MERCURY_SFO_GRID", "1");
+    cfg17_set_env("MERCURY_SFO_GRID_ESN0", esn0);
+    cfg17_set_env("MERCURY_SFO_GRID_CHAN", chan);
+    cfg17_set_env("MERCURY_SFO_GRID_M64", m64);
+    cfg17_set_env("MERCURY_SFO_GRID_PCS", pcs);
+    cfg17_set_env("MERCURY_SFO_GRID_CODED", coded);
+    cfg17_set_env("MERCURY_SFO_GRID_NSYMB", nsymb);
+    cfg17_set_env("MERCURY_SFO_GRID_TURBO_SEED", turbo_seed);
+    cfg17_set_env("MERCURY_SFO_GRID_TURBO_ITERS", turbo_iters);
+    cfg17_set_env("MERCURY_SFO_GRID_NVFIX", nvfix);
+    cfg17_set_env("MERCURY_SFO_GRID_NV_FORCE", nv_force);
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_16);   // sizes OFDM/LDPC; harness overrides M to 64
+    ts.sfo_grid_test();
+    cw_ok  = ts.sfo_grid_last_cw_ok;
+    cw_tot = ts.sfo_grid_last_cw_tot;
+
+    for (int i = 0; i < nk; i++) {
+#if defined(_WIN32)
+        _putenv_s(sv[i].key, sv[i].had ? sv[i].val.c_str() : "");
+#else
+        if (sv[i].had) setenv(sv[i].key, sv[i].val.c_str(), 1); else unsetenv(sv[i].key);
+#endif
+    }
+}
+
+static int run_cfg17_selftest()
+{
+    printf("[TEST-CFG17] CFG17 shaped-64-QAM composition self-test (PAS + TINTERP-seed + ratio-nvfix)\n");
+    int fails = 0;
+
+    // ---- Cell A: PAS lever, clean @ 16 dB. uniform-64 FAILS, PAS-shaped-64 DECODES. ----
+    // uniform-64 waterfall ~17.6 dB; PAS waterfall ~15.3 dB (PCS_VERDICT.md). At 16 dB
+    // clean (CHAN=0) the bare uniform arm is below its waterfall (0/K) while the PAS
+    // shaping gain (~2.3 dB vs uniform-64, genie-confirmed) crosses the LDPC waterfall
+    // (K/K). This is the decisive clean-front composition cell: PAS makes 64-QAM decode
+    // at ~CFG16's working point while carrying 6 bits/sym (MEASURED: u64 0/7, PAS 7/7).
+    {
+        int u_ok=-1,u_tot=-1, p_ok=-1,p_tot=-1;
+        cfg17_run_cell("16","0","1","0","1","60","","1","0","0", u_ok,u_tot);   // uniform-64 (bare)
+        cfg17_run_cell("16","0","1","1","1","60","","1","0","0", p_ok,p_tot);   // PAS-shaped-64 (composed)
+        bool bare_fail = (u_tot>0 && u_ok <  u_tot);
+        bool comp_pass = (p_tot>0 && p_ok == p_tot);
+        bool ok = bare_fail && comp_pass;
+        printf("[TEST-CFG17]   CELL-A PAS clean@16dB: uniform-64=%d/%d (bare%s) PAS-64=%d/%d (composed%s) -> %s\n",
+               u_ok,u_tot, bare_fail?"_FAILS_OK":"_DECODED_unexpected",
+               p_ok,p_tot, comp_pass?"_DECODES_OK":"_FAILED",
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell B: TINTERP-seed estimator lever, freq-selective det-floor @ 18 dB. ----
+    // CHAN=1 (det-floor freq-selective) dense Dx=1/Dy=3 lattice: the bare single-pass LS
+    // estimator FLOORS (0/K — the per-subcarrier dispersive phase a flat-ML/cold-LS H
+    // cannot represent), while the COMPOSED TINTERP-seed turbo estimator (it=0 warm
+    // TINTERP seed + data_aided_channel_estimator + dd_seed_floor) CROSSES (K/K). GENIE
+    // decodes K/K here (the det-floor is estimator-limited, NOT modulation-limited —
+    // RESEARCH_cfg17-64qam.md §0/§7, PCS_VERDICT.md) so this proves the estimator stack
+    // reaches the genie-class CSI CFG17 requires. MEASURED reproducible over 4 seeds:
+    // LS 0/7, TINTERP-seed turbo 7/7 (post-FEC BER 0.458 -> 0).
+    {
+        int ls_ok=-1,ls_tot=-1, tb_ok=-1,tb_tot=-1;
+        cfg17_run_cell("18","1","1","1","1","60","","1","0","0", ls_ok,ls_tot);          // LS-only PAS-64 single-pass (bare)
+        cfg17_run_cell("18","1","1","1","1","60","tinterp","4","0","0", tb_ok,tb_tot);   // TINTERP-seed turbo PAS-64 (composed)
+        bool bare_floor = (ls_tot>0 && ls_ok == 0);
+        bool comp_cross = (tb_tot>0 && tb_ok == tb_tot);
+        bool ok = bare_floor && comp_cross;
+        printf("[TEST-CFG17]   CELL-B estimator detfloor@18dB CHAN1: LS-only=%d/%d (bare%s) TINTERP-turbo=%d/%d (composed%s) -> %s\n",
+               ls_ok,ls_tot, bare_floor?"_FLOORS_OK":"_decoded_unexpected",
+               tb_ok,tb_tot, comp_cross?"_CROSSES_OK":"_FAILED",
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell C: ratio-nvfix lever, collapsed-nv regime @ 16 dB clean. ----
+    // NV_FORCE=1e-6 reproduces the HW-only post-EQ-EVM nv-collapse (the in-process sim
+    // never reproduces it — PCS_VERDICT.md / nvfix a0e22c8): the bare demap (NVFIX=0)
+    // over-confidently flips inner 64-QAM bits -> BP iter-cap -> decode FAILS; with
+    // NVFIX=1 the ratio-gate (nv < measure_var/8 ? measure_var : nv) substitutes the
+    // measured post-EQ noise -> decode RECOVERS. Clean channel so PAS alone would decode
+    // absent the forced collapse -> isolates the nvfix as the cause of recovery.
+    {
+        int raw_ok=-1,raw_tot=-1, fix_ok=-1,fix_tot=-1;
+        cfg17_run_cell("16","0","1","1","1","60","","1","0","1e-6", raw_ok,raw_tot);   // collapsed nv, NO nvfix (bare)
+        cfg17_run_cell("16","0","1","1","1","60","","1","1","1e-6", fix_ok,fix_tot);   // collapsed nv, ratio-nvfix (composed)
+        bool bare_fail = (raw_tot>0 && raw_ok <  raw_tot);
+        bool comp_pass = (fix_tot>0 && fix_ok >  raw_ok);   // nvfix strictly improves on the collapse
+        bool ok = bare_fail && comp_pass;
+        printf("[TEST-CFG17]   CELL-C nvfix nv-collapse@16dB: raw-nv=%d/%d (bare%s) ratio-nvfix=%d/%d (composed%s) -> %s\n",
+               raw_ok,raw_tot, bare_fail?"_FAILS_OK":"_decoded_unexpected",
+               fix_ok,fix_tot, comp_pass?"_RECOVERS_OK":"_FAILED",
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    printf("[TEST-CFG17] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -608,6 +748,7 @@ int main(int argc, char *argv[])
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
+    bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1220,6 +1361,16 @@ int main(int argc, char *argv[])
             // Pure cl_dist_matcher check, no Mercury/ARQ state needed. See
             // fact-documents/data-flow-pas-shaping.md §6 + tools/test_pas_shaping.py.
             test_pas_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cfg17") == 0)
+        {
+            // CFG17 shaped-64-QAM COMPOSITION self-test (feat/cfg17, failing-first):
+            // drives the SFO-GRID harness in-process for three cells and asserts the
+            // composed stack (PAS + TINTERP-seed turbo + ratio-nvfix) decodes where a
+            // bare arm fails. See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
+            test_cfg17_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2548,6 +2699,18 @@ start_modem:
             fflush(stdout);
             int rc = run_pas_selftest();
             printf("[FLAG] PAS self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_cfg17_cli) {
+            // CFG17 shaped-64-QAM composition self-test (one-shot, then exit rc).
+            // Constructs cl_telecom_system instances in-process and drives the
+            // SFO-GRID harness — no ARQ/audio/TCP state needed.
+            printf("[FLAG] --test-cfg17: invoking CFG17 shaped-64-QAM composition "
+                   "self-test (PAS + TINTERP-seed turbo + ratio-nvfix)\n");
+            fflush(stdout);
+            int rc = run_cfg17_selftest();
+            printf("[FLAG] CFG17 composition self-test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
