@@ -350,6 +350,10 @@ public:
 	bool fsel_test_enabled;
 	double fsel_amp;     // second-ray amplitude (linear), default 0.6
 	int    fsel_delay;   // second-ray delay in passband samples, default 128
+	// cfg16-nvfix: 2nd-ray Doppler (Hz). <=0 (default) = STATIC ray (original).
+	// >0 = TIME-VARYING (Watterson 2-tap, AR(1) Doppler): collapses the cross-pilot
+	// nv below the post-EQ EVM (the condition the 32-QAM demap LLR bug needs).
+	double fsel_fd;
 
 	// fix/cfg16-nv-restore: fast single-point BER override for PLOT_PASSBAND.
 	// ber_single_esn0 <= -900 (default) = normal full sweep. Otherwise evaluate

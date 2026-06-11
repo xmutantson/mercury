@@ -66,6 +66,7 @@ cl_telecom_system::cl_telecom_system()
 	fsel_test_enabled     = false; // fix/cfg16-nv-restore: --fsel-test=on enables (BER loopback only)
 	fsel_amp              = 0.6;   // second-ray amplitude (linear)
 	fsel_delay            = 128;   // second-ray delay in passband samples (~Nfft/8 @ interp=4, within GI)
+	fsel_fd               = 0.0;   // cfg16-nvfix: 2nd-ray Doppler (Hz); 0 = static (original)
 	ber_single_esn0       = -999.0f; // fix/cfg16-nv-restore: <=-900 = normal full sweep
 	ber_frames_override   = 0;     // 0 = use sweep default frame count
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
@@ -494,17 +495,62 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			sigma_calibrated = true;
 		}
 
-		// fix/cfg16-nv-restore: optional static 2-ray frequency-selective channel,
-		// applied to the TX passband BEFORE AWGN. Off by default (production BER
-		// unchanged). y[n] = x[n] + fsel_amp * x[n-fsel_delay]; iterate backward so
-		// the in-place tap reads only unmodified earlier samples. This is the
-		// condition the LS-path nv bug needs (flat AWGN cannot reproduce it).
+		// fix/cfg16-nv-restore: optional 2-ray frequency-selective channel, applied
+		// to the TX passband BEFORE AWGN. Off by default (production BER unchanged).
+		// Static case (fsel_fd<=0): y[n] = x[n] + fsel_amp * x[n-fsel_delay].
+		//
+		// cfg16-nvfix: TIME-VARYING (Watterson 2-tap) case (fsel_fd>0): the second
+		// ray's gain g(t) drifts at Doppler fsel_fd via the SAME AR(1)/Ornstein-
+		// Uhlenbeck low-pass the in-tree Watterson uses (sfo_grid_test, ~:6518):
+		//   g(n) = rho*g(n-1) + sqrt(1-rho^2)*N(0,1),  rho = exp(-2*pi*fd/f_sym)
+		// updated ONCE per OFDM symbol (f_sym = Fs/Nofdm). This is the condition the
+		// cross-pilot differential nv estimator (ofdm.cc:1499-1504, delta of same-
+		// column pilots Dy symbols apart) collapses on: a SLOW fade leaves consecutive
+		// same-carrier pilots highly correlated -> small delta -> nv UNDER-reports,
+		// while the per-symbol post-EQ EVM (measure_var) stays large because the
+		// channel MOVED between the pilot rows. That nv<<EVM gap is what feeds the
+		// 32-QAM demap over-confident LLRs (the bug); a STATIC ray cannot make it
+		// (its pilots are time-invariant so the cross-pilot delta is just noise).
+		// g(t) is a real, slowly-varying tap gain around the mean fsel_amp (passband
+		// is real; a real OU-modulated tap drives the same pilot-drift collapse).
 		if(fsel_test_enabled && M != MOD_MFSK && fsel_delay > 0)
 		{
 			int nSamp = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb)) * this->frequency_interpolation_rate;
-			for(int n = nSamp - 1; n >= fsel_delay; n--)
+			if(fsel_fd <= 0.0)
 			{
-				data_container.passband_data[n] += fsel_amp * data_container.passband_data[n - fsel_delay];
+				// STATIC 2-ray (original behavior, byte-identical).
+				for(int n = nSamp - 1; n >= fsel_delay; n--)
+				{
+					data_container.passband_data[n] += fsel_amp * data_container.passband_data[n - fsel_delay];
+				}
+			}
+			else
+			{
+				// TIME-VARYING 2-ray: per-passband-symbol AR(1) Doppler-filtered gain.
+				int sym_samp = data_container.Nofdm * this->frequency_interpolation_rate;
+				double Fs    = (double)sampling_frequency;
+				double f_sym = (sym_samp>0) ? (Fs / (double)sym_samp) : 1.0;
+				double rho   = std::exp(-2.0*M_PI*fsel_fd / f_sym);
+				if(rho > 0.999999) rho = 0.999999;
+				double inn   = std::sqrt(1.0 - rho*rho);
+				// Deterministic per-(esn0,frame) RNG so a cell is reproducible.
+				cl_sim_xoshiro frng((uint64_t)(0x5EED1234u ^ (uint64_t)lerror_rate.Frames_total
+				                    ^ ((uint64_t)(EsN0*1000.0) << 16)));
+				// scatter-ray gain drifts around mean fsel_amp; std = 0.5*fsel_amp.
+				double dev   = 0.5 * fsel_amp;
+				double g     = fsel_amp;   // start at the mean
+				int    cur_sym = -1;
+				for(int n = nSamp - 1; n >= fsel_delay; n--)
+				{
+					int sidx = n / (sym_samp>0?sym_samp:1);
+					if(sidx != cur_sym)
+					{
+						// advance the OU process once per OFDM symbol
+						g = rho*g + (1.0-rho)*fsel_amp + (inn*dev)*frng.gauss();
+						cur_sym = sidx;
+					}
+					data_container.passband_data[n] += g * data_container.passband_data[n - fsel_delay];
+				}
 			}
 		}
 
@@ -2908,9 +2954,39 @@ skip_h_retry_point:
 				// CSI from DFT-smoothed estimated_channel gives per-subcarrier |H|²,
 				// normalized by mean to prevent LLR saturation.
 				variance = ofdm.noise_variance_estimate;
-				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f Nsymb=%d amprest=%d\n",
+
+				// CFG16 32-QAM freq-selective decode fix (re-applied to monitor; equiv of 2d540d9,
+				// fact-documents/data-flow-noise_variance_estimate.md §4/§5).
+				//
+				// noise_variance_estimate (cross-pilot differential, A.1.4 commit 9c3fc40) measures
+				// the PRE-equalization channel noise σ²/|X|² in raw bins. The demapper below operates
+				// on the EQUALIZED constellation (Y/H), whose per-symbol noise is σ²·E[1/|H|²] plus
+				// the DFT-smoother/interpolation residual EVM — a larger quantity that does NOT vanish
+				// when the channel is frequency-selective (where the post-EQ EVM diverges from the
+				// pre-EQ nv). On such a channel nv UNDER-estimates the equalized noise; feeding it to
+				// psk.demod scaled LLRs over-confident; the E3 clip let those wrong-sign LLRs reach
+				// ±40, flipping inner 32-QAM bit signs → BP hit the iter cap → CRC fail → 0 bps.
+				// 16-QAM (CFG15) tolerated the wrong magnitude (larger min-distance); 32-QAM did not.
+				//
+				// Root fix: scale the demap by demap_variance = max(noise_variance_estimate,
+				// measure_var). measure_var (telecom_system.cc above = ofdm.measure_variance, the mean
+				// post-EQ pilot residual |Y_pilot/H − X|²) IS the noise variance on the equalized
+				// constellation the Euclidean demapper needs (psk.cc LLR = ΔD/variance) — a MEASURED
+				// quantity, not a tuned constant. max() keeps the cross-pilot estimate where it is
+				// legitimately larger (fast-varying channel / very low SNR).
+				//
+				// Scope (CLAUDE.md §5 — see PLAN.md §5 audit): demap_variance feeds ONLY the two
+				// psk.demod LLR calls below. The local `variance` is left UNCHANGED so (a) the
+				// LS-path SNR report (10*log10(1/variance)) and the gearshift that consumes it are
+				// byte-identical, and (b) ofdm.noise_variance_estimate itself is untouched, so the
+				// MMSE-ZF erasure (ofdm.cc alpha=H²/(H²+nv)) and the SKIP-VAR sync gate are unchanged.
+				// MFSK never reaches this branch (own guard-bin estimate), so A.1.4 ROBUST is unaffected.
+				double demap_variance = (measure_var > ofdm.noise_variance_estimate)
+					? measure_var : ofdm.noise_variance_estimate;
+
+				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f demap_var=%.6e Nsymb=%d amprest=%d\n",
 					receive_stats.sync_trials, current_configuration,
-					ofdm.noise_variance_estimate, measure_var, ofdm.Nsymb,
+					ofdm.noise_variance_estimate, measure_var, demap_variance, ofdm.Nsymb,
 					ofdm.channel_estimator_amplitude_restoration);
 				fflush(stdout);
 
@@ -2939,7 +3015,7 @@ skip_h_retry_point:
 
 				ofdm.deframer(data_container.equalized_data,data_container.ofdm_deframed_data);
 				deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
-				psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
+				psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,(float)demap_variance);
 
 				// Normalize CSI weights by mean → average weight = 1.0.
 				// This preserves relative per-subcarrier quality (tells LDPC which
@@ -2972,7 +3048,7 @@ skip_h_retry_point:
 					// Phase-2: --csi-llr=off — uniform LLR path (pre-IONOS behavior).
 					ofdm.deframer(data_container.equalized_data,data_container.ofdm_deframed_data);
 					deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
-					psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,variance);
+					psk.demod(data_container.ofdm_time_freq_deinterleaved_data,data_container.nBits,data_container.demodulated_data,(float)demap_variance);
 				}
 			}
 

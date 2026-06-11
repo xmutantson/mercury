@@ -435,6 +435,7 @@ int main(int argc, char *argv[])
     int ber_frames_cli = 0;            // --ber-frames=<N>: frames for single-point BER (0 = default)
     double fsel_amp_cli = -1.0;        // --fsel-amp=<lin>: override 2-ray amplitude (<0 = default 0.6)
     int fsel_delay_cli = -1;           // --fsel-delay=<samples>: override 2-ray delay (<0 = default 128)
+    double fsel_fd_cli = -1.0;         // --fsel-fd=<Hz>: 2-ray Doppler (<0 = unset; 0=static, >0=Watterson time-varying)
     double ack_metric_threshold_cli = -1; // --ack-metric-threshold=F: <0 = default(0.5)
     int emergency_nack_cli = -1;       // --emergency-nack=N: -1=default(3), >=0=override
     int wb_match_bias_cli = 0;         // --wb-match-threshold-bias=N: 0=HEAD, +1=revert 7076a4b 8→7
@@ -802,6 +803,12 @@ int main(int argc, char *argv[])
         else if (strncmp(argv[i], "--fsel-delay=", 13) == 0)
         {
             fsel_delay_cli = atoi(argv[i] + 13);
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--fsel-fd=", 10) == 0)
+        {
+            fsel_fd_cli = atof(argv[i] + 10);
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2003,11 +2010,14 @@ start_modem:
     }
     if (fsel_amp_cli >= 0.0) telecom_system.fsel_amp = fsel_amp_cli;
     if (fsel_delay_cli >= 0) telecom_system.fsel_delay = fsel_delay_cli;
+    if (fsel_fd_cli >= 0.0) telecom_system.fsel_fd = fsel_fd_cli;
     if (fsel_test_cli != -1) {
         telecom_system.fsel_test_enabled = (fsel_test_cli == 1);
-        printf("[FLAG] --fsel-test=%s (amp=%.2f delay=%d)\n",
+        printf("[FLAG] --fsel-test=%s (amp=%.2f delay=%d fd=%.2fHz %s)\n",
                telecom_system.fsel_test_enabled ? "on" : "off",
-               telecom_system.fsel_amp, telecom_system.fsel_delay);
+               telecom_system.fsel_amp, telecom_system.fsel_delay,
+               telecom_system.fsel_fd,
+               telecom_system.fsel_fd > 0.0 ? "TIME-VARYING/Watterson" : "static");
     }
     if (ber_esn0_cli > -900.0f) {
         telecom_system.ber_single_esn0 = ber_esn0_cli;
