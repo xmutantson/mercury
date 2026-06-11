@@ -456,6 +456,11 @@ def main():
                     help="conservative-PDES lockstep window (chunks) passed to the "
                          "relay. K=1 = strict lockstep (default); relax to 4/8 if "
                          "the strict window starves CONNECT/delivery.")
+    ap.add_argument("--relay-seed", type=int, default=1,
+                    help="relay --seed passthrough (seeds the deterministic AWGN + "
+                         "per-key-up turnaround-jitter walk). Use MATCHED seeds across "
+                         "a D2-ON vs D2-OFF A/B so both arms see the identical channel "
+                         "+ jitter realization. DEFAULT 1.")
     # ---- FIX9 inter-peer drift / PTT turnaround repro (OPT-IN, passthrough) ---
     # DEFAULT 0 (off) -> byte-identical deterministic A/B. On -> the relay re-times
     # the forwarded per-direction stream by the given ppm sample-clock skew (and
@@ -587,6 +592,7 @@ def main():
     try:
         # 1. relay first so the peers can connect immediately.
         relay_cmd = [sys.executable, RELAY, "--port", str(args.port),
+                     "--seed", str(args.relay_seed),
                      "--snr", str(args.snr), "--loss", str(args.loss),
                      "--profile", args.profile,
                      "--cfo-hz", str(args.cfo_hz),
@@ -764,6 +770,7 @@ def main():
                 "cfo_hz": args.cfo_hz, "phase_noise_deg": args.phase_noise_deg,
                 "loss": args.loss, "burst": args.burst,
                 "secs": args.secs, "start_cfg": args.start_cfg,
+                "relay_seed": args.relay_seed,
                 # auto-picked ports (so cleanup/inspection is PORT-SCOPED, never
                 # a system-wide kill — multiple concurrent sims are collision-proof)
                 "ports": chosen_ports,
