@@ -22,6 +22,7 @@
 
 #include <iostream>
 #include <complex>
+#include <vector>
 #include <fstream>
 #include <chrono>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include <iostream>
 #include <complex>
 #include "physical_layer/telecom_system.h"
+#include "physical_layer/dist_matcher.h"   // --test-pas PAS/PCS DM bijection self-test
 #include "physical_layer/mfsk_ctrl_codec_tests.h"
 #include "common/sim_clock_tests.h"
 #include "datalink_layer/arq.h"
@@ -332,6 +334,55 @@ static int test_shutdown_atomic()
     return pass ? 0 : 1;
 }
 
+// --test-pas: PAS/PCS distribution-matcher integrity self-test (feat/pcs).
+// (1) BIJECTION deshape(shape(x))==x over many random k-bit blocks for several
+//     (lambda, rail_L) configs — a precision/overflow bug shows here (the
+//     life-critical data-integrity guard, fact-documents/data-flow-pas-shaping.md §6).
+// (2) CONSTANT-COMPOSITION: every shaped block has EXACTLY the target counts.
+// (3) HISTOGRAM: aggregated level histogram matches the Maxwell-Boltzmann target.
+// Returns 0 on full pass, 1 on any failure.
+static int run_pas_selftest()
+{
+    printf("[TEST-PAS] PAS/PCS distribution-matcher bijection + composition self-test\n");
+    const int amps[4] = {1,3,5,7};
+    struct Cfg { double lam; int L; } cfgs[] = { {0.02,32},{0.04,32},{0.06,32},{0.04,16},{0.04,24},{0.08,34} };
+    int fails = 0;
+    unsigned int rng = 0xC0FFEEu;
+    auto nextbit = [&](){ rng = rng*1664525u + 1013904223u; return (int)((rng>>23)&1u); };
+    for (auto &cf : cfgs)
+    {
+        cl_dist_matcher dm;
+        if (!dm.configure_maxwell_boltzmann(4, amps, cf.lam, cf.L))
+        { printf("[TEST-PAS]   FAIL configure lam=%.2f L=%d\n", cf.lam, cf.L); fails++; continue; }
+        int k = dm.info_bits(), L = dm.block_len();
+        std::vector<int> inb(k), lev(L), outb(k);
+        long target[4] = { dm.level_count(0), dm.level_count(1), dm.level_count(2), dm.level_count(3) };
+        long hist[4] = {0,0,0,0};
+        int  trials = 200000, bad = 0, compbad = 0;
+        for (int t = 0; t < trials; ++t)
+        {
+            for (int b = 0; b < k; ++b) inb[b] = nextbit();
+            if (!dm.shape(inb.data(), lev.data())) { bad++; continue; }
+            // constant composition check
+            long cc[4] = {0,0,0,0};
+            for (int p = 0; p < L; ++p) { if (lev[p]<0||lev[p]>3){bad++;break;} cc[lev[p]]++; hist[lev[p]]++; }
+            if (cc[0]!=target[0]||cc[1]!=target[1]||cc[2]!=target[2]||cc[3]!=target[3]) compbad++;
+            if (!dm.deshape(lev.data(), outb.data())) { bad++; continue; }
+            for (int b = 0; b < k; ++b) if (outb[b] != inb[b]) { bad++; break; }
+        }
+        double htot = (double)trials * L;
+        printf("[TEST-PAS]   lam=%.2f L=%d k=%d counts{%ld,%ld,%ld,%ld} bijection_bad=%d comp_bad=%d "
+               "hist{%.3f,%.3f,%.3f,%.3f} target{%.3f,%.3f,%.3f,%.3f} -> %s\n",
+               cf.lam, L, k, target[0],target[1],target[2],target[3], bad, compbad,
+               hist[0]/htot,hist[1]/htot,hist[2]/htot,hist[3]/htot,
+               target[0]/(double)L,target[1]/(double)L,target[2]/(double)L,target[3]/(double)L,
+               (bad==0 && compbad==0) ? "PASS" : "FAIL");
+        if (bad != 0 || compbad != 0) fails++;
+    }
+    printf("[TEST-PAS] %s (%d config failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -556,6 +607,7 @@ int main(int argc, char *argv[])
                                         // a real compressible payload; asserts >0 application bytes are staged. FAILS on
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
+    bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1159,6 +1211,15 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
             // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
             test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-pas") == 0)
+        {
+            // PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
+            // Pure cl_dist_matcher check, no Mercury/ARQ state needed. See
+            // fact-documents/data-flow-pas-shaping.md §6 + tools/test_pas_shaping.py.
+            test_pas_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2476,6 +2537,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_retx_clear_on_recovery();
             printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_pas_cli) {
+            // PAS/PCS distribution-matcher bijection + composition self-test
+            // (one-shot, then exit rc). No Mercury/ARQ state needed.
+            printf("[FLAG] --test-pas: invoking PAS/PCS distribution-matcher "
+                   "bijection self-test\n");
+            fflush(stdout);
+            int rc = run_pas_selftest();
+            printf("[FLAG] PAS self-test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

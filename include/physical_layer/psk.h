@@ -53,6 +53,29 @@ public:
 	void deinit();
 	void mod(const int *in,int nItems,std::complex <double> *out);
 	void demod(const std::complex <double> *in,int nItems,float *out,float variance);
+	// PAS / PCS LLR de-shaping demapper (fact-documents/data-flow-pas-shaping.md §4).
+	// Identical to demod() but adds a per-output-bit a-priori log-prior
+	// log_prior[k] = ln P(bit_k=0) − ln P(bit_k=1) to each bit LLR, accounting for
+	// the non-uniform (Maxwell-Boltzmann) amplitude distribution the distribution
+	// matcher imposed. log_prior is indexed by the SAME per-symbol output position
+	// as demod's out (0..nBits-1, MSB-first); pass 0.0 for the (uniform) sign-bit
+	// positions. log_prior has nBits entries (one per per-symbol bit position).
+	// demod() itself is UNCHANGED so all production / non-PAS paths are byte-identical.
+	void demod_pas(const std::complex <double> *in,int nItems,float *out,float variance,
+	               const double* log_prior);
+	// PAS / PCS constellation power re-normalization. set_constellation() normalizes
+	// to unit AVERAGE power assuming a UNIFORM symbol distribution. Under PAS the
+	// symbols are NON-uniform (Maxwell-Boltzmann amplitudes), so the actual average
+	// power < 1 — which at a fixed Es/N0 would LOSE SNR. This rescales every point so
+	// the shaped average power E[|x|²] = 1, spending the freed energy on a LARGER
+	// minimum distance — that expansion IS the shaping gain. sym_prob[i] = the prior
+	// probability of constellation index i (sum to 1); the scale is 1/sqrt(sum
+	// sym_prob[i]*|constellation[i]|²) applied to the (already-unit-uniform-power)
+	// constellation. Call AFTER set_predefined_constellation(MOD_64QAM). No effect on
+	// non-PAS paths (only invoked when PCS is enabled).
+	void rescale_shaped_power(const double* sym_prob);
+	int  symbol_count() const { return nSymbols; }
+	int  bits_per_symbol() const { return nBits; }
 	// Turbo-EQ soft re-modulation (RESEARCH_turbo-eq.md §3/§4.3). From per-bit
 	// a-priori LLRs (SAME order/sign as demod() output), emit the soft symbol mean
 	// xbar_out[sym] = E[x] (virtual-pilot value) and variance v_out[sym] =
