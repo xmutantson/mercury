@@ -88,6 +88,7 @@ cl_ofdm::cl_ofdm()
 	noise_variance_estimate=0.01; // Safe default (SNR ~20dB)
 	ls_nv_debug_enabled=false; // fix/cfg16-nv-restore: opt-in [LS-NV-DBG] logging
 	ls_use_crosspilot_nv=false; // fix/cfg16-nv-restore: default = the fix (residual nv)
+	tinterp_smooth_halfwin=0; // feat/fade-tinterp: TIME_INTERP pilot pre-smooth off by default
 	// Optimized FFT tables
 	fft_twiddle=NULL;
 	fft_scratch=NULL;
@@ -1871,6 +1872,170 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 /*
  * Ref J. . -J. van de Beek, O. Edfors, M. Sandell, S. K. Wilson and P. O. Borjesson, "On channel estimation in OFDM systems," 1995 IEEE 45th Vehicular Technology Conference. Countdown to the Wireless Twenty-First Century, Chicago, IL, USA, 1995, pp. 815-819 vol.2, doi: 10.1109/VETEC.1995.504981.
  */
+}
+
+// feat/fade-tinterp: FADE-tier per-carrier LINEAR TIME-INTERPOLATION estimator.
+//
+// PROMOTED, byte-for-byte in logic, from the sim-proven MERCURY_SFO_GRID_TINTERP
+// prototype (compute_program/jobs/fade-estimator-prototypes/estimator_candidates.cc.frag,
+// 900-cell verdict ESTIMATOR_PROTOTYPES_VERDICT.md). The prototype crossed FULL-decode
+// viability on the GOOD (MPG/0.1 Hz) Watterson fade where the production LS-3x9
+// window delivers ZERO codewords, and reached ARQ-viable mean-fraction on MODERATE
+// (MPM/0.5 Hz). It is the cheap NONCOHERENT fade lever (no rate drop, no coherent
+// demod) — see fact-documents/fade-estimator-prototypes.md.
+//
+// Mechanism: on the dense Dx=1/Dy=3 lattice EVERY carrier carries a pilot every Dy
+// symbols, so each carrier's H(t) is a 1-D time series sampled every Dy symbols.
+// Linear-interpolate H BETWEEN consecutive time-pilots per carrier (hold at the
+// edges). This FOLLOWS a Doppler fade where the held LS window AVERAGES (and lags)
+// it. A trailing freq-interp pass fills any all-data carrier (Dx=1 => none, but the
+// pass is kept for safety / future denser-pilot or thinned lattices).
+//
+// nv (the cross-layer hazard): the pilot-residual EVM against the interpolated H,
+// FLOORED at the cross-pilot differential AWGN estimate (estimate_noise_from_pilot_
+// pairs, the same pre-EQ thermal-floor estimator the ZF path trusts). A noise-
+// suppressing time-interpolation drives the pilot residual BELOW the true noise
+// floor on a slow/clean channel; without the floor nv collapses toward 1e-6, the
+// MMSE erasure alpha=|H|^2/(|H|^2+nv) saturates to 1 (no erasure), and psk.demod's
+// LLR=dD/nv goes ~1000x over-confident -> BP iter-caps at 101 -> CRC fail. This is
+// the E1/cfg16-nvfix collapse class (fade-estimator-prototypes.md §4.1). The harness
+// prototype floored at the KNOWN Es/N0 10^(-EsN0/10); production has no known Es/N0,
+// so we floor at the cross-pilot differential measurement of the SAME quantity. Every
+// downstream consumer of noise_variance_estimate (channel_equalizer MMSE erasure
+// ofdm.cc:2200, psk.demod LLR scale, the SKIP-VAR sync gate telecom_system.cc:2871,
+// arq_common diag) sees an honest floor — see data-flow-noise_variance_estimate.md.
+//
+// Default-OFF: reached ONLY when channel_estimator == TIME_INTERP. With the FADE
+// tier ungated the production decode path stays on LEAST_SQUARE => byte-identical.
+//
+// Ref: H. Mostofi & D. C. Cox, "Pilot-symbol aided channel estimation for OFDM with
+// fast fading channels," IEEE Trans. Wireless Comm. 2005 (Xplore 1247797); codec2
+// FreeDV-700D HF linear time-interpolation.
+void cl_ofdm::LS_channel_estimator_tinterp(std::complex <double>*in)
+{
+	const int N = Nsymb;            // symbols (time)
+	const int C = Nc;               // carriers (freq)
+	if(N <= 0 || C <= 0)
+	{
+		// degenerate frame: fall back to the LS estimator so consumers still get a
+		// MEASURED estimate + a valid nv (matches the harness "carrier has no pilot"
+		// safety; never hit in production where N,C>0).
+		LS_channel_estimator(in);
+		return;
+	}
+
+	const int sm = (tinterp_smooth_halfwin > 0) ? tinterp_smooth_halfwin : 0;
+
+	// raw LS at every pilot cell: Hp = Y/X. known[] marks pilot anchors.
+	std::vector<std::complex<double>> Hp((size_t)N*C, std::complex<double>(0,0));
+	std::vector<char> known((size_t)N*C, 0);
+	{
+		int pidx = 0;
+		for(int n=0;n<N;n++) for(int j=0;j<C;j++)
+			if((ofdm_frame + n*C + j)->type == PILOT)
+			{
+				std::complex<double> X = pilot_configurator.sequence[pidx++];
+				if(std::abs(X) > 1e-12)
+				{
+					Hp[(size_t)n*C+j] = *(in + n*C + j) / X;
+					known[(size_t)n*C+j] = 1;
+				}
+			}
+	}
+
+	// per carrier: gather pilot-symbol indices, linear-interpolate in time.
+	std::vector<std::complex<double>> H((size_t)N*C, std::complex<double>(0,0));
+	for(int j=0;j<C;j++)
+	{
+		std::vector<int> pn;
+		for(int n=0;n<N;n++) if(known[(size_t)n*C+j]) pn.push_back(n);
+		if(pn.empty())
+		{
+			// carrier has no time-pilot: leave zero -> filled by freq-interp below.
+			for(int n=0;n<N;n++) H[(size_t)n*C+j] = std::complex<double>(0,0);
+			continue;
+		}
+		// optional pre-smooth of the sampled pilot series (suppress pilot noise).
+		std::vector<std::complex<double>> ps(pn.size());
+		for(size_t a=0;a<pn.size();a++)
+		{
+			if(sm <= 0){ ps[a] = Hp[(size_t)pn[a]*C+j]; continue; }
+			std::complex<double> acc(0,0); int cnt=0;
+			for(int w=(int)a-sm; w<=(int)a+sm; w++)
+				if(w>=0 && w<(int)pn.size()){ acc += Hp[(size_t)pn[w]*C+j]; cnt++; }
+			ps[a] = (cnt>0) ? acc/(double)cnt : Hp[(size_t)pn[a]*C+j];
+		}
+		// linear interp across the band of symbols, hold at edges.
+		for(int n=0;n<pn[0];n++)            H[(size_t)n*C+j] = ps[0];
+		for(int n=pn.back()+1;n<N;n++)      H[(size_t)n*C+j] = ps[pn.size()-1];
+		for(size_t a=0;a+1<pn.size();a++)
+		{
+			int n0=pn[a], n1=pn[a+1];
+			std::complex<double> h0=ps[a], h1=ps[a+1];
+			for(int n=n0;n<=n1;n++)
+			{
+				double t = (n1>n0) ? (double)(n-n0)/(double)(n1-n0) : 0.0;
+				H[(size_t)n*C+j] = h0*(1.0-t) + h1*t;
+			}
+		}
+	}
+
+	// frequency-interp to fill any all-data carriers (Dx=1 -> none, but safe).
+	for(int n=0;n<N;n++)
+	{
+		std::vector<int> have;
+		for(int j=0;j<C;j++) if(std::abs(H[(size_t)n*C+j]) > 0.0) have.push_back(j);
+		if(have.empty()) continue;
+		for(int j=0;j<have[0];j++)        H[(size_t)n*C+j] = H[(size_t)n*C+have[0]];
+		for(int j=have.back()+1;j<C;j++)  H[(size_t)n*C+j] = H[(size_t)n*C+have.back()];
+		for(size_t a=0;a+1<have.size();a++)
+		{
+			int j0=have[a], j1=have[a+1];
+			std::complex<double> h0=H[(size_t)n*C+j0], h1=H[(size_t)n*C+j1];
+			for(int j=j0;j<=j1;j++)
+			{
+				double t = (j1>j0) ? (double)(j-j0)/(double)(j1-j0) : 0.0;
+				H[(size_t)n*C+j] = h0*(1.0-t) + h1*t;
+			}
+		}
+	}
+
+	// publish the interpolated estimate (every cell MEASURED, like LS post-interp).
+	for(int ci=0; ci<N*C; ci++)
+	{
+		(estimated_channel+ci)->value  = H[ci];
+		(estimated_channel+ci)->status = MEASURED;
+	}
+
+	// DFT smoothing is INTENTIONALLY NOT applied here: the time-interpolation IS the
+	// smoother for the fade case, and smooth_channel_estimate_dft() re-imposes a
+	// per-symbol frequency window that would re-average across the band (the LS path
+	// runs it because its per-cell window leaves high-freq estimate noise; the
+	// interpolated H is already low-noise). Matches the prototype, which published H
+	// directly with no DFT pass.
+
+	// nv = pilot-residual EVM against the interpolated H, FLOORED at the cross-pilot
+	// differential AWGN estimate. The harness prototype floored at the known Es/N0
+	// 10^(-EsN0/10); estimate_noise_from_pilot_pairs(in) measures the SAME pre-EQ
+	// thermal floor sigma^2/|X|^2 from adjacent same-column pilot deltas, so it is the
+	// production-available AWGN floor. max(residual, floor) keeps nv honest both ways:
+	// it cannot collapse below the true noise on a clean/slow channel (the E1 class),
+	// and it still rises with real residual estimation error on a fast fade.
+	{
+		double nsum = 0.0; int npil = 0; int pidx = 0;
+		for(int n=0;n<N;n++) for(int j=0;j<C;j++)
+			if((ofdm_frame + n*C + j)->type == PILOT)
+			{
+				std::complex<double> X = pilot_configurator.sequence[pidx++];
+				std::complex<double> resid = *(in + n*C + j) - H[(size_t)n*C+j]*X;
+				nsum += resid.real()*resid.real() + resid.imag()*resid.imag();
+				npil++;
+			}
+		double nv_resid = (npil>0) ? nsum/(double)npil : 0.01;
+		double nv_floor = estimate_noise_from_pilot_pairs(in);   // cross-pilot AWGN floor
+		noise_variance_estimate = (nv_resid > nv_floor) ? nv_resid : nv_floor;
+		if(noise_variance_estimate < 1e-6) noise_variance_estimate = 1e-6;
+	}
 }
 
 void cl_ofdm::CPE_correction(std::complex<double>* in)

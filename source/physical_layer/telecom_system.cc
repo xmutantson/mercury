@@ -2731,6 +2731,18 @@ skip_h_retry_point:
 				{
 					ofdm.LS_channel_estimator(data_container.ofdm_symbol_demodulated_data);
 				}
+				else if (ofdm.channel_estimator==TIME_INTERP)
+				{
+					// feat/fade-tinterp FADE tier: per-carrier linear time-
+					// interpolation across the Dy pilot lattice (tracks slow Doppler
+					// fade where the LS window averages and lags). Reached only when
+					// the FADE-tier gate set channel_estimator=TIME_INTERP; the
+					// default path stays LEAST_SQUARE (byte-identical). nv carries the
+					// cross-pilot AWGN floor so the MMSE-erasure (ofdm.cc:2200), the
+					// psk.demod LLR scale, and the SKIP-VAR gate below do not regress.
+					// See data-flow-noise_variance_estimate.md.
+					ofdm.LS_channel_estimator_tinterp(data_container.ofdm_symbol_demodulated_data);
+				}
 
 				mean_H = -1.0;
 				int h_count = 0;
@@ -6752,6 +6764,22 @@ void cl_telecom_system::sfo_grid_test()
 		ofdm.noise_variance_estimate = (npil>0) ? (nsum/(double)npil) : 0.01;
 		if(ofdm.noise_variance_estimate < 1e-6) ofdm.noise_variance_estimate = 1e-6;
 	}
+	else if(env_i("MERCURY_SFO_GRID_TINTERP_PROD", 0) != 0)
+	{
+		// feat/fade-tinterp REGRESSION HOOK: drive the PRODUCTION TIME_INTERP
+		// estimator (ofdm.cc LS_channel_estimator_tinterp) on the dense Dx=1/Dy=3
+		// prod lattice — the exact promoted code, including the production cross-
+		// pilot AWGN nv-floor (NOT the harness prototype's known-EsN0 floor). This is
+		// the failing-first regression: on the GOOD (MPG/0.1 Hz) Watterson cell the
+		// final `else { LS_channel_estimator }` decodes 0/K codewords; this branch
+		// decodes K/K, proving the promoted production estimator carries the win and
+		// the nv-floor (no 1e-6 collapse). A/B vs the prod else on the SAME seed.
+		int sm = env_i("MERCURY_SFO_GRID_TINTERP_SMOOTH", 0);
+		ofdm.tinterp_smooth_halfwin = (sm > 0) ? sm : 0;
+		ofdm.LS_channel_estimator_tinterp(rx.data());
+		std::cout << "[SFO-GRID-EST] cand=TINTERP_PROD smooth=" << ofdm.tinterp_smooth_halfwin
+		          << " nv=" << ofdm.noise_variance_estimate << std::endl;
+	}
 	else
 	{
 		ofdm.LS_channel_estimator(rx.data());   // pilots -> interpolate across 60-grid
@@ -9559,6 +9587,27 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_channel_estimator = ZERO_FORCE;
 	}
 	ofdm.channel_estimator=ofdm_channel_estimator;
+
+	// feat/fade-tinterp FADE TIER GATE (default-OFF, byte-identical when unset).
+	// When MERCURY_FADE_TINTERP is set non-zero, promote the WB LS estimator to the
+	// per-carrier linear TIME-INTERPOLATION estimator (TIME_INTERP) for this config.
+	// Scope: WB LS configs ONLY — the gate fires AFTER the NB->ZF override above, so
+	// NB/ZF configs (Nc=10, sparse pilots) are never touched, and MFSK never reaches
+	// any channel estimator (telecom_system.cc:2304 branches to mfsk.demod). This is
+	// the FADE-tier selector the prototype verdict specified; a config-tier flag can
+	// drive it the same way (set ofdm.channel_estimator=TIME_INTERP at tier select).
+	// The estimator carries the cross-pilot AWGN nv-floor so every shared-state
+	// consumer is safe — see data-flow-noise_variance_estimate.md.
+	{
+		const char* _ft = std::getenv("MERCURY_FADE_TINTERP");
+		if(_ft && atoi(_ft) != 0 && ofdm.channel_estimator == LEAST_SQUARE)
+		{
+			ofdm.channel_estimator = TIME_INTERP;
+			ofdm.tinterp_smooth_halfwin = 0;   // pre-smooth adds nothing on MPG/MPM/MPP
+			const char* _fs = std::getenv("MERCURY_FADE_TINTERP_SMOOTH");
+			if(_fs && *_fs) ofdm.tinterp_smooth_halfwin = atoi(_fs);
+		}
+	}
 
 	awgn_channel.set_seed(rand());
 

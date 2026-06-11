@@ -137,6 +137,17 @@ public:
 	void deframer(std::complex <double>* in, std::complex <double>* out);
 	void ZF_channel_estimator(std::complex <double>*in);
 	void LS_channel_estimator(std::complex <double>*in);
+	// feat/fade-tinterp: FADE-tier per-carrier LINEAR TIME-INTERPOLATION estimator.
+	// On the dense Dx=1/Dy=3 lattice every carrier carries a pilot every Dy symbols,
+	// so each carrier's H(t) is a time series sampled every Dy symbols; linear-
+	// interpolate H BETWEEN consecutive time-pilots per carrier (hold at edges), then
+	// freq-interp fill. Tracks a slow Doppler fade the LS window only averages. nv =
+	// pilot-residual against the interpolated H, FLOORED at the cross-pilot
+	// differential AWGN estimate (estimate_noise_from_pilot_pairs) so a noise-
+	// suppressing time-smooth cannot go over-confident below the true noise floor
+	// (the E1/cfg16-nvfix collapse class — see fade-estimator-prototypes.md §4.1).
+	// Mostofi & Cox 2005, IEEE Trans. Wireless (Xplore 1247797); FreeDV-700D.
+	void LS_channel_estimator_tinterp(std::complex <double>*in);
 	// A.1.4: cross-pilot differential noise variance estimator.
 	// Replaces pilot-residual estimator (which collapsed to 0 for ZF post-E1
 	// commit 38f5c60, biased low by (N-1)/N for LS). For adjacent pilot pairs
@@ -289,6 +300,13 @@ public:
 	// cross-pilot nv (pre-fix/monitor behavior) so one binary runs both arms.
 	// Default false = the fix (restored pilot residual). --ls-crosspilot-nv=on.
 	bool ls_use_crosspilot_nv;
+
+	// feat/fade-tinterp: optional pilot pre-smooth half-window for the TIME_INTERP
+	// estimator (the "tinterp_s" candidate; the 900-cell sweep showed the pre-smooth
+	// adds nothing on MPG/MPM/MPP, so default 0). Set >0 to MA-smooth the per-carrier
+	// raw pilot LS series before linear time-interpolation. Read only when
+	// channel_estimator == TIME_INTERP, so default has zero production effect.
+	int tinterp_smooth_halfwin;
 
 	// Pre-allocated buffers for passband_to_baseband (avoids new/delete per call)
 	std::complex<double>* p2b_l_data;

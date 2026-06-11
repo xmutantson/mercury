@@ -67,6 +67,14 @@
 
 #define ZERO_FORCE 0
 #define LEAST_SQUARE 1
+// FADE tier (feat/fade-tinterp): per-carrier LINEAR TIME-INTERPOLATION across the
+// Dy=3 pilot lattice (Mostofi & Cox 2005; FreeDV-700D HF time-interp). A NONCOHERENT
+// rate-0.875 estimator that TRACKS a slow Doppler fade where the LS window AVERAGES
+// (and lags) it. Default-OFF: selected only when the FADE-tier gate sets
+// ofdm.channel_estimator = TIME_INTERP (env MERCURY_FADE_TINTERP / config tier).
+// See fact-documents/data-flow-noise_variance_estimate.md and
+// fact-documents/fade-estimator-prototypes.md (900-cell sim verdict).
+#define TIME_INTERP 2
 
 #define NO_OUTER_CODE 0
 #define CRC16_MODBUS_RTU 1
