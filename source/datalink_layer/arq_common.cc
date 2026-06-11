@@ -5089,6 +5089,9 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 	// Reset to disarmed first (a clean carve / non-armable PARTIAL clears any stale stash).
 	bigblock_partial_armed  = false;
 	bigblock_partial_n_data = -1;   // V3: clear stale n_data with the rest of the stash
+	// C6 MEASURE-ONLY: clear the cw(K-1)-gap residual-exposure one-shot on EVERY carve entry
+	// (sibling lifecycle of the FIX-2 stash). Set below only when the residual pattern holds.
+	bigblock_residual_armed = false;
 	{
 		int n_clean_stash = 0;
 		for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_stash++;
@@ -5121,6 +5124,47 @@ int cl_arq_controller::bigblock_receive_carve(const int* info_bits,
 			printf("[BIGBLOCK-RX] FIX-2: armed PARTIAL block-CRC gate bsi=%d K=%d n_data=%d sub_len=%d "
 				"expected_crc32=%08x (verified at prev-batch completion before delivery)\n",
 				bigblock_partial_block_bsi, K, bigblock_partial_n_data, sub_len, wire_bcrc);
+			fflush(stdout);
+		}
+	}
+
+	// --- C6 MEASURE-ONLY (block-crc-upgrade-design.md §7 [?], bigblock-integrity.md §5/§12):
+	// detect the cw(K-1)-gap PARTIAL block-CRC RESIDUAL-EXPOSURE pattern and arm a one-shot
+	// signal for the prev-batch completion to COUNT (it never refuses or alters delivery).
+	// The FIX-2 PARTIAL gate above arms ONLY when cw(K-1) decoded clean (it carries the
+	// block-CRC-32 field); when cw(K-1) is ITSELF the gap the block is delivered with NO
+	// whole-block CRC-32 re-verify, so any OTHER kept codeword that FALSE-PASSED its per-cw
+	// CRC-8 rides the unchanged 2^-8 floor. We arm the residual one-shot when, on a real
+	// header-bearing PARTIAL carve (header_usable + cw0 clean), cw(K-1) is the gap (cw_ok[K-1]==0)
+	// AND there is >=1 OTHER kept codeword (cw_ok[c]==1, c != K-1) that this carve will deliver.
+	// The prev-batch completion increments bigblock_partial_crc_residual_count + logs
+	// [PARTIAL-CRC-RESIDUAL] when such a block is actually DELIVERED (counting here would
+	// over-count blocks that never complete). NO delivery behaviour change; per-cw CRC-8
+	// UNWEAKENED. Mutually exclusive with the FIX-2 arm above (that requires cwlast_clean).
+	{
+		// REPRODUCER HOOK (mirrors DEFEAT_BLOCKCRC / DEFEAT_NDATA): set
+		// MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL=1 to SUPPRESS the residual-exposure arming on the
+		// SAME binary, so the prev-batch completion never increments the counter — the test's
+		// FAIL-BEFORE (counter stays 0). Production never sets it. MEASURE-ONLY hook: disabling
+		// it changes nothing about delivery (the carve/delivery behaviour is identical either way;
+		// only the diagnostic counter is suppressed).
+		bool defeat_c6 = false;
+		{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL");
+		  if(e && *e && atoi(e)!=0) defeat_c6 = true; }
+		int n_clean_resid = 0;
+		for(int c=0;c<K;c++) if(cw_ok[c]) n_clean_resid++;
+		bool cwlast_gap = (K-1 >= 0 && K-1 < (int)cw_ok.size()) ? (cw_ok[K-1] == 0) : false;
+		int other_kept = n_clean_resid - (cwlast_gap ? 0 : 1);   // kept slots besides cw(K-1)
+		if(!defeat_c6 && info_bits != NULL && header_usable && cw_ok[0]
+		   && n_clean_resid < K && cwlast_gap && other_kept >= 1)
+		{
+			bigblock_residual_armed     = true;
+			bigblock_residual_block_bsi = (int)(unsigned char)block_bsi;
+			bigblock_residual_kept_slots = other_kept;
+			printf("[BIGBLOCK-RX] C6: armed cw(K-1)-gap residual-exposure measure bsi=%d K=%d "
+				"n_clean=%d other_kept=%d (cw(K-1) is the gap -> block-CRC-32 NOT armable; "
+				"%d kept slot(s) ride the per-cw CRC-8 floor; counted at delivery)\n",
+				bigblock_residual_block_bsi, K, n_clean_resid, other_kept, other_kept);
 			fflush(stdout);
 		}
 	}
@@ -5233,6 +5277,35 @@ bool cl_arq_controller::bigblock_partial_block_crc_ok()
 		ok ? "-> deliver" : "-> REJECT (a kept codeword FALSE-PASSED per-cw CRC-8; not delivered)");
 	fflush(stdout);
 	return ok;
+}
+
+// C6 MEASURE-ONLY (block-crc-upgrade-design.md §7 [?], bigblock-integrity.md §5/§12): count a
+// DELIVERED PARTIAL big-block whose cw(K-1) was in the gap — the sub-case where the whole-block
+// CRC-32 (FIX-2) could NOT arm (cw(K-1) carries the CRC-32 field at BIGBLOCK_BLOCK_CRC_OFFSET, so
+// when it is itself the gap the field is never recovered and the carve's `cwlast_clean` arm
+// precondition is FALSE). Such a block is delivered WITHOUT the block-CRC-32 net, so any OTHER kept
+// codeword that FALSE-PASSED its per-cw CRC-8 rides the unchanged 2^-8 floor — the residual the
+// CRC-32 exists to eliminate, which §7 asks to QUANTIFY before deciding the CLOSE (refuse-deliver /
+// second-CRC). The carve arms `bigblock_residual_armed` (one-shot, bsi-tagged) when the pattern
+// holds; this helper, called from the prev-batch completion AFTER delivery, increments the counter
+// and logs [PARTIAL-CRC-RESIDUAL] when the delivered bsi matches. MEASURE-ONLY: it changes NO
+// delivery behaviour, never weakens the per-cw CRC-8, and refuses nothing — the block was already
+// delivered by the caller. Big-block-scoped + bsi-gated, so a non-big-block / non-residual prev
+// completion is byte-identical to before (the armed flag is false or the bsi mismatches). One-shot:
+// the armed flag is cleared here regardless, so a stale arm cannot re-count a later block.
+void cl_arq_controller::note_bigblock_partial_crc_residual(int delivered_bsi)
+{
+	if(bigblock_residual_armed && bigblock_residual_block_bsi == delivered_bsi)
+	{
+		bigblock_partial_crc_residual_count++;
+		printf("[PARTIAL-CRC-RESIDUAL] prev_batch_seq_id=%d DELIVERED with cw(K-1) in the gap -> "
+			"whole-block CRC-32 NOT armable (cw(K-1) carries the CRC-32 field); %d other kept "
+			"codeword(s) delivered at the per-cw CRC-8 2^-8 floor (residual_count=%lld) -- "
+			"MEASURE-ONLY, delivery unchanged\n",
+			delivered_bsi, bigblock_residual_kept_slots, bigblock_partial_crc_residual_count);
+		fflush(stdout);
+	}
+	bigblock_residual_armed = false;   // one-shot: consumed at this completion (armed or not)
 }
 
 
@@ -6426,6 +6499,7 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 	rsp_prev_batch_received_count     = 0;
 	rsp_prev_batch_expected_count     = 0;
 	bigblock_partial_armed            = false;
+	bigblock_residual_armed           = false;   // C6 measure-only: clear the cw(K-1)-gap residual one-shot
 	for(int i=0; i<this->nMessages; i++)
 		messages_rx_prev[i].status = FREE;
 	reset_session_state();

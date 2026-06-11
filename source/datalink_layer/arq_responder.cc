@@ -916,6 +916,16 @@ void cl_arq_controller::process_messages_rx_data_control()
 								rsp_last_delivered_batch_seq_id);
 							fflush(stdout);
 
+							// C6 MEASURE-ONLY (block-crc-upgrade-design.md §7 [?], bigblock-integrity.md
+							// §5/§12): if THIS just-delivered prev-batch is a big-block whose cw(K-1) was
+							// the gap (so the whole-block CRC-32 FIX-2 gate could NOT arm — cw(K-1) carries
+							// the CRC-32 field) AND >=1 OTHER kept codeword was delivered relying only on
+							// the per-cw CRC-8, COUNT it (residual-exposure population §7 quantifies before
+							// deciding the CLOSE). DELIVERY IS UNCHANGED — the block was already delivered
+							// above; the helper only COUNTS + LOGS. Same production helper the unit test
+							// drives, so the increment is exercised, not copied.
+							note_bigblock_partial_crc_residual(rsp_prev_batch_seq_id);
+
 							// climb-engine Bug 1 (gearshift-climb-engine.md §4): emit a CLEAN
 							// (all-ones) MFSK ACK+SACK for the prev batch we just FULLY delivered
 							// via the retransmit/prev-storage path. Historically this path delivered

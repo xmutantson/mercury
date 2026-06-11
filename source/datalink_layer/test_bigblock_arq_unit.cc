@@ -3142,6 +3142,111 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 			      "the stashed real n_data (fail-before/pass-after on the same binary)");
 		}
 
+		// ---- C6 MEASURE-ONLY: cw(K-1)-gap PARTIAL block-CRC RESIDUAL-EXPOSURE counter ----
+		// (block-crc-upgrade-design.md §7 [?], bigblock-integrity.md §5/§12 — QUANTIFY-FIRST.)
+		// THE SUB-CASE: cw(K-1) is the gap, so the whole-block CRC-32 (FIX-2) cannot arm (cw(K-1)
+		// carries the CRC-32 field); >=1 OTHER kept codeword then delivers relying only on the
+		// per-cw CRC-8 — the 2^-8 residual the CRC-32 exists to eliminate. This block QUANTIFIES
+		// how often the win hits that sub-case by COUNTING it (it changes NO delivery behaviour).
+		//
+		// We drive the PRODUCTION carve (carve_partial -> bigblock_receive_carve) for a cwKm1-gap
+		// block (gap=K-1, so cw0..cw(K-2) are KEPT and ride per-cw CRC-8 only — one of them
+		// FALSE-PASSES per-cw CRC-8 via MERCURY_BIGBLOCK_FALSEPASS_CW), then call the SAME
+		// production helper the responder prev-completion calls (note_bigblock_partial_crc_residual)
+		// — so the counter increment is EXERCISED, not copied. Assert:
+		//   FAIL-BEFORE (MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL=1): the carve does NOT arm the residual
+		//     signal -> the helper does NOT increment -> counter stays at its prior value.
+		//   PASS-AFTER (defeat unset): the carve arms -> the helper increments by EXACTLY 1.
+		{
+			const int bsi_r  = 51;
+			const int gap_cw = K - 1;       // cw(K-1) IS the gap -> block-CRC-32 NOT armable
+			const int fp_cw  = 4;           // a KEPT codeword that FALSE-PASSES per-cw CRC-8
+			std::vector<unsigned char> wire;
+			std::vector<std::vector<unsigned char>> truth;
+			std::vector<int> wlen;
+			build_wire_nd(bsi_r, /*nd=*/K, wire, truth, wlen);
+
+			// FAIL-BEFORE: defeat the residual arming on the SAME binary. The carve still routes
+			// PARTIAL + delivers identically; only the diagnostic arm is suppressed.
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL", "1");
+#else
+			setenv("MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL", "1", 1);
+#endif
+			// Inject a kept-codeword false-pass so the kept slots genuinely ride the per-cw CRC-8
+			// floor (the residual). The FALSEPASS hook keys on bigblock_first_clean<0.
+			bigblock_first_clean = -1; bigblock_first_K = -1;
+			char fpb[16]; snprintf(fpb, sizeof(fpb), "%d", fp_cw);
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_FALSEPASS_CW", fpb);
+#else
+			setenv("MERCURY_BIGBLOCK_FALSEPASS_CW", fpb, 1);
+#endif
+			carve_partial(bsi_r, wire, gap_cw);   // production carve (return is the FIX-2 arm, not ours)
+			// Read the PRODUCTION residual one-shot the carve set (NOT the FIX-2 arm carve_partial
+			// returns). cwKm1-gap never arms FIX-2 — only the C6 residual signal arms here.
+			bool armed_before = B->bigblock_residual_armed;
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_FALSEPASS_CW", "");
+#else
+			unsetenv("MERCURY_BIGBLOCK_FALSEPASS_CW");
+#endif
+			long long resid_at_start = B->bigblock_partial_crc_residual_count;
+			B->note_bigblock_partial_crc_residual(bsi_r);     // SAME helper the responder calls
+			long long resid_after_before = B->bigblock_partial_crc_residual_count;
+			bool no_count_before = (!armed_before) && (resid_after_before == resid_at_start);
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL", "");
+#else
+			unsetenv("MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL");
+#endif
+
+			// PASS-AFTER: defeat unset -> the carve arms the residual signal -> the helper counts it.
+			bigblock_first_clean = -1; bigblock_first_K = -1;
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_FALSEPASS_CW", fpb);
+#else
+			setenv("MERCURY_BIGBLOCK_FALSEPASS_CW", fpb, 1);
+#endif
+			carve_partial(bsi_r, wire, gap_cw);    // production carve
+			// Read the PRODUCTION residual one-shot the carve set (the C6 arm; cwKm1-gap never
+			// arms FIX-2). Snapshot the kept-slot count BEFORE the helper, which leaves it intact.
+			bool armed_after = B->bigblock_residual_armed;
+			int  kept_after  = B->bigblock_residual_kept_slots;
+			int  bsi_after   = B->bigblock_residual_block_bsi;
+#if defined(_WIN32)
+			_putenv_s("MERCURY_BIGBLOCK_FALSEPASS_CW", "");
+#else
+			unsetenv("MERCURY_BIGBLOCK_FALSEPASS_CW");
+#endif
+			long long resid_before_count = B->bigblock_partial_crc_residual_count;
+			B->note_bigblock_partial_crc_residual(bsi_r);     // SAME helper the responder calls
+			long long resid_after_count = B->bigblock_partial_crc_residual_count;
+			bool counts_after = armed_after
+			                 && (resid_after_count == resid_before_count + 1)
+			                 && (kept_after >= 1)
+			                 && (bsi_after == bsi_r);
+
+			bool c6_pass = no_count_before && counts_after;
+			printf("[TEST-SIM-BIGBLOCK] C6 MEASURE residual cw(K-1)-gap (gap=%d fp_cw=%d bsi=%d): %s "
+			       "(armed_before=%d no_count_before=%d armed_after=%d counts_after=%d "
+			       "kept_slots=%d count=%lld)\n",
+			       gap_cw, fp_cw, bsi_r, c6_pass?"PASS":"FAIL",
+			       (int)armed_before, (int)no_count_before, (int)armed_after, (int)counts_after,
+			       kept_after, (long long)B->bigblock_partial_crc_residual_count);
+			fflush(stdout);
+			printf("[TEST-SIM-BIGBLOCK] C6 NOTE: this is MEASURE-ONLY (block-crc-upgrade-design.md "
+			       "§7). The cw(K-1)-gap PARTIAL block is DELIVERED unchanged; the counter quantifies "
+			       "the residual-exposure sub-case (a kept codeword false-passing per-cw CRC-8 with "
+			       "the block-CRC-32 NOT armable). The CLOSE (refuse-deliver / second-CRC) is deferred "
+			       "pending the measured rate.\n");
+			fflush(stdout);
+			class_total++; if(c6_pass) class_pass++;
+			check(c6_pass, "C6 MEASURE: a DELIVERED cw(K-1)-gap PARTIAL block with >=1 kept codeword "
+			      "riding the per-cw CRC-8 floor is COUNTED (residual-exposure quantified) — and NOT "
+			      "counted when the arming is defeated (fail-before counter stays 0); delivery unchanged");
+		}
+
 		bool matrix_pass = (class_pass == class_total);
 		printf("[TEST-SIM-BIGBLOCK] CLASS-COMPLETE MATRIX: %d/%d classes pass\n",
 		       class_pass, class_total);
