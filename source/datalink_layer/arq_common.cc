@@ -563,6 +563,7 @@ cl_arq_controller::cl_arq_controller()
 	// for harness compat (--enable-sack-v2 / --disable-sack-v2 are no-ops now).
 	sack_enabled=false;       // Set at TEST_CONNECTION negotiation.
 	sack_v2_enabled=false;    // Set at TEST_CONNECTION negotiation.
+	header_carries_d5=true;   // D5: recomputed per-config in load_configuration() (robust → false).
 	enable_sack_v2=true;
 	radio_batch_size=25;
 	crypto_batch_size=20;
@@ -855,6 +856,8 @@ cl_arq_controller::cl_arq_controller()
 	last_received_message_sequence=255;
 	last_received_end_of_batch_seq=-1;
 	rx_buffer_eob_seq=-1;  // R038: per-frame v2 EOB staging (set in receive())
+	rx_buffer_batch_total_frames=-1;  // D5: per-frame batch_total_frames staging (set in receive())
+	rx_batch_total_frames=-1;          // D5: promoted authoritative per-batch frame count, or -1
 	data_ack_received=NO;
 	repeating_last_ack=NO;
 	disconnect_requested=NO;
@@ -1967,6 +1970,17 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// WB OFDM fails on VB-Cable (cause under investigation — likely TX clipping
 	// or Moose freq sync issue, not VB-Cable itself). On real radio, the buffer
 	// starts zeroed (memset in set_size) and VB-Cable latency is not an issue.
+	// D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): the v2 DATA header carries the
+	// batch_total_frames byte EXCEPT at robust configs (ROBUST_0..2), which are
+	// pinned to data_batch_size=1 — D5 is meaningless at batch=1 (a 1-frame batch
+	// has no lost-tail-of-batch hazard) and the extra header byte would steal the
+	// scarce ROBUST_0 payload, dropping max_frame below COMPRESS_HEADER_SIZE and
+	// re-opening the streaming-compression deadlock (test_robust0_compress_deadlock
+	// C0). Computed from the config being loaded; TX and RX both re-run
+	// load_configuration on the SET_CONFIG handshake, so they agree on the wire
+	// header length per-config. The header buffer is sized for whichever this is.
+	this->header_carries_d5 = !is_robust_config(configuration);
+
 	int nBytes_header=0;
 	if (ACK_MULTI_ACK_RANGE_HEADER_LENGTH>nBytes_header) nBytes_header=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	if (CONTROL_ACK_CONTROL_HEADER_LENGTH>nBytes_header) nBytes_header=CONTROL_ACK_CONTROL_HEADER_LENGTH;
@@ -1979,9 +1993,12 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// blew past the buffer and exit(0) at line ~3286). Cost is one extra byte
 	// of header buffer per frame — negligible (≤0.7% of payload at CFG15).
 	{
-		int eff_long = effective_data_long_header_length(true);
+		// Size for the v2 header (the §7.13.34 unconditional-v2 sizing), now
+		// with the D5 byte ONLY when this config carries it (robust → no D5,
+		// preserving the ROBUST_0 deadlock floor).
+		int eff_long = effective_data_long_header_length(true, this->header_carries_d5);
 		if (eff_long>nBytes_header) nBytes_header=eff_long;
-		int eff_short = effective_data_short_header_length(true);
+		int eff_short = effective_data_short_header_length(true, this->header_carries_d5);
 		if (eff_short>nBytes_header) nBytes_header=eff_short;
 	}
 
@@ -5316,11 +5333,16 @@ void cl_arq_controller::send(st_message* message, int message_location)
 	int header_length=0;
 	if(message->type==DATA_LONG)
 	{
-		// SACK Design A Steps 1+3 — DATA_LONG header growth + batch_seq_id plumbing.
+		// SACK Design A Steps 1+3 + D5 — DATA_LONG header growth + batch_seq_id +
+		// batch_total_frames plumbing.
 		// v1 (default): 4 bytes [type, conn_id, seq(EOB bit7), id].
-		// v2: 5 bytes [type, conn_id, seq(EOB bit7), batch_seq_id, id].
+		// v2: 6 bytes [type, conn_id, seq(EOB bit7), batch_seq_id, id, batch_total_frames].
 		// batch_seq_id source (v2 only): message->batch_seq_id field, masked mod 256.
 		// Sentinel -1 (unset, defensive — should not happen for v2 DATA TX) → 0.
+		// batch_total_frames (D5): this single-frame send() path is NOT the batched
+		// DATA TX path (all DATA goes through send_batch(), which writes the real
+		// message_batch_counter_tx); emit 0 = unknown here so the v2 header stays
+		// well-formed without claiming a length it does not know.
 		message_TxRx_byte_buffer[0]=message->type;
 		message_TxRx_byte_buffer[1]=connection_id;
 		message_TxRx_byte_buffer[2]=message->sequence_number;
@@ -5330,18 +5352,21 @@ void cl_arq_controller::send(st_message* message, int message_location)
 			if(bsi < 0) bsi = 0;  // defensive: caller should have assigned
 			message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 			message_TxRx_byte_buffer[4]=message->id;
+			if(header_carries_d5)
+				message_TxRx_byte_buffer[5]=(char)0;  // D5: batch_total_frames unknown on single send()
 		}
 		else
 		{
 			message_TxRx_byte_buffer[3]=message->id;
 		}
-		header_length=effective_data_long_header_length(sack_v2_enabled);
+		header_length=effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 	}
 	else if (message->type==DATA_SHORT)
 	{
-		// SACK Design A Steps 2+3 — DATA_SHORT header growth + batch_seq_id plumbing.
+		// SACK Design A Steps 2+3 + D5 — DATA_SHORT header growth + batch_seq_id +
+		// batch_total_frames plumbing.
 		// v1 (default): 5 bytes [type, conn_id, seq(EOB bit7), id, length].
-		// v2: 6 bytes [type, conn_id, seq(EOB bit7), batch_seq_id, id, length].
+		// v2: 7 bytes [type, conn_id, seq(EOB bit7), batch_seq_id, id, length, batch_total_frames].
 		message_TxRx_byte_buffer[0]=message->type;
 		message_TxRx_byte_buffer[1]=connection_id;
 		message_TxRx_byte_buffer[2]=message->sequence_number;
@@ -5352,13 +5377,15 @@ void cl_arq_controller::send(st_message* message, int message_location)
 			message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 			message_TxRx_byte_buffer[4]=message->id;
 			message_TxRx_byte_buffer[5]=message->length;
+			if(header_carries_d5)
+				message_TxRx_byte_buffer[6]=(char)0;  // D5: batch_total_frames unknown on single send()
 		}
 		else
 		{
 			message_TxRx_byte_buffer[3]=message->id;
 			message_TxRx_byte_buffer[4]=message->length;
 		}
-		header_length=effective_data_short_header_length(sack_v2_enabled);
+		header_length=effective_data_short_header_length(sack_v2_enabled, header_carries_d5);
 	}
 	else if (message->type==ACK_RANGE || message->type==ACK_MULTI)
 	{
@@ -5617,9 +5644,29 @@ void cl_arq_controller::send_batch()
 
 		header_length=0;
 
+		// D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): the TX-authoritative per-batch frame
+		// count carried on EVERY data frame so a lost EOB frame cannot erase the
+		// length. message_batch_counter_tx is the count of frames the CMD packed into
+		// THIS radio batch (the same value the EOB bit-7 marker on frame [count-1]
+		// signals). On a SACK retransmit (sack_retransmit_active) the radio batch is
+		// the retx queue, NOT the original crypto batch, so message_batch_counter_tx
+		// here is the retx-frame count — which would mislead the RX about the original
+		// batch's length. Emit 0 (unknown) on retx so the RX keeps the count it already
+		// latched from the original batch's frames (the prev cross-storage is keyed on
+		// the ORIGINAL bsi and was already armed with the wired count before any retx).
+		int batch_total_frames_wire = 0;  // 0 = unknown/legacy
+		if(!sack_retransmit_active)
+		{
+			int btf = message_batch_counter_tx;
+			if(btf < 1) btf = 0;            // nothing to claim
+			else if(btf > 255) btf = 255;  // single byte; MAX_SACK_BATCH_SIZE=32 ≪ 255
+			batch_total_frames_wire = btf;
+		}
+
 		if(messages_batch_tx[i].type==DATA_LONG)
 		{
-			// SACK Design A Steps 1+3 — DATA_LONG header growth + batch_seq_id plumbing.
+			// SACK Design A Steps 1+3 + D5 — DATA_LONG header growth + batch_seq_id +
+			// batch_total_frames plumbing.
 			// See cl_arq_controller::send() for full format documentation.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
@@ -5630,16 +5677,19 @@ void cl_arq_controller::send_batch()
 				if(bsi < 0) bsi = 0;  // defensive
 				message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 				message_TxRx_byte_buffer[4]=messages_batch_tx[i].id;
+				if(header_carries_d5)
+					message_TxRx_byte_buffer[5]=(char)(batch_total_frames_wire & 0xFF);  // D5
 			}
 			else
 			{
 				message_TxRx_byte_buffer[3]=messages_batch_tx[i].id;
 			}
-			header_length=effective_data_long_header_length(sack_v2_enabled);
+			header_length=effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 		}
 		else if (messages_batch_tx[i].type==DATA_SHORT)
 		{
-			// SACK Design A Steps 2+3 — DATA_SHORT header growth + batch_seq_id plumbing.
+			// SACK Design A Steps 2+3 + D5 — DATA_SHORT header growth + batch_seq_id +
+			// batch_total_frames plumbing.
 			// See cl_arq_controller::send() for full format documentation.
 			message_TxRx_byte_buffer[0]=messages_batch_tx[i].type;
 			message_TxRx_byte_buffer[1]=connection_id;
@@ -5651,13 +5701,15 @@ void cl_arq_controller::send_batch()
 				message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 				message_TxRx_byte_buffer[4]=messages_batch_tx[i].id;
 				message_TxRx_byte_buffer[5]=messages_batch_tx[i].length;
+				if(header_carries_d5)
+					message_TxRx_byte_buffer[6]=(char)(batch_total_frames_wire & 0xFF);  // D5
 			}
 			else
 			{
 				message_TxRx_byte_buffer[3]=messages_batch_tx[i].id;
 				message_TxRx_byte_buffer[4]=messages_batch_tx[i].length;
 			}
-			header_length=effective_data_short_header_length(sack_v2_enabled);
+			header_length=effective_data_short_header_length(sack_v2_enabled, header_carries_d5);
 		}
 		else if (messages_batch_tx[i].type==ACK_RANGE || messages_batch_tx[i].type==ACK_MULTI)
 		{
@@ -6377,10 +6429,32 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	}
 
 	// Determine expected count for the *new* prev (the batch we're
-	// about to seal). Mirror the EOB-or-data_batch_size inference used
-	// by `process_messages_acknowledging_data`'s rx_received counter.
+	// about to seal). D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): PREFER the
+	// TX-authoritative per-batch frame count carried on EVERY data frame
+	// (rx_batch_total_frames) over the single-frame EOB inference
+	// (last_received_end_of_batch_seq). The EOB inference is wrong on the
+	// EOB-loss path — it latches the highest OTHER seq seen, so the missing
+	// tail frame falls outside [0, expected) and is silently dropped. The
+	// wired count survives any single frame's loss, so the lost tail stays
+	// INSIDE expected_count, the prev is held (received < expected) and
+	// SACK-recovered, then delivered faithfully; or stale-discarded → the
+	// next current commit trips the batch-level gap gate → loud GAP-ABORT.
+	// Fallback to the EOB inference when the count is unknown (v1/legacy/NB,
+	// or no frame of this batch carried it). MERCURY_D5_INFER_DEFEAT=1 forces
+	// the old EOB inference on the SAME binary (the fail-before arm).
+	bool d5_infer_defeat = false;
+	{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
+	  if(e && *e && atoi(e)!=0) d5_infer_defeat = true; }
 	int prev_expected = data_batch_size;
-	if(last_received_end_of_batch_seq >= 0)
+	if(rx_batch_total_frames > 0 && !d5_infer_defeat)
+	{
+		// Wired, authoritative count. Clamp to [1, data_batch_size]: the
+		// crypto batch never exceeds data_batch_size frames, and the
+		// transfer/delivery loops iterate [0, data_batch_size).
+		prev_expected = rx_batch_total_frames;
+		if(prev_expected > data_batch_size) prev_expected = data_batch_size;
+	}
+	else if(last_received_end_of_batch_seq >= 0)
 	{
 		int eob = last_received_end_of_batch_seq + 1;
 		if(eob < prev_expected) prev_expected = eob;
@@ -6433,6 +6507,12 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	rsp_prev_batch_active            = true;
 	rsp_prev_batch_received_count    = xferred_received;
 	rsp_prev_batch_expected_count    = prev_expected;
+	// D5: the wired count + EOB inference describe the batch we just SEALED into
+	// prev (consumed above for prev_expected). Reset both so the NEW current batch
+	// (N+1) latches its OWN authoritative count from its own frames, and a stale
+	// EOB seq from batch N cannot poison batch N+1's effective_batch / SACK span.
+	rx_batch_total_frames            = -1;
+	last_received_end_of_batch_seq   = -1;
 	printf("[RSP-V2-PREV-BUMP] prev_batch_seq_id=%d next_expected=%d "
 		"transferred=%d received_on_transfer=%d/%d (cross-storage routing armed)\n",
 		rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
@@ -6500,6 +6580,10 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 	rsp_prev_batch_expected_count     = 0;
 	bigblock_partial_armed            = false;
 	bigblock_residual_armed           = false;   // C6 measure-only: clear the cw(K-1)-gap residual one-shot
+	// D5: clear the wired count + EOB inference on a loud teardown so a fresh
+	// adopt re-baselines the batch length from the next session's own frames.
+	rx_batch_total_frames             = -1;
+	last_received_end_of_batch_seq    = -1;
 	for(int i=0; i<this->nMessages; i++)
 		messages_rx_prev[i].status = FREE;
 	reset_session_state();
@@ -8963,6 +9047,12 @@ void cl_arq_controller::receive()
 				// keeps writing last_received_end_of_batch_seq directly here
 				// (byte-for-byte unchanged).
 				rx_buffer_eob_seq = -1;
+				// D5: stage the per-frame batch_total_frames (-1 = none on this frame /
+				// v1 / legacy). Reset here PRE-ROUTING like rx_buffer_eob_seq; the
+				// DATA_LONG / DATA_SHORT parse below fills it from the wire byte, and the
+				// responder promotes it to rx_batch_total_frames ONLY inside the confirmed
+				// match-current / match-prev storage block (mirrors the R038 EOB staging).
+				rx_buffer_batch_total_frames = -1;
 				if((message_TxRx_byte_buffer[2] & 0x80)
 					&& (messages_rx_buffer.type == DATA_LONG || messages_rx_buffer.type == DATA_SHORT))
 				{
@@ -9022,13 +9112,21 @@ void cl_arq_controller::receive()
 					// batch_seq_id is stored on messages_rx_buffer and (for diagnostics)
 					// on last_received_batch_seq_id. NO routing/RX decision keys off it
 					// yet — pure scaffolding per Step 3 (decision is Step 4+).
-					int eff_hdr = effective_data_long_header_length(sack_v2_enabled);
+					int eff_hdr = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 					if(sack_v2_enabled)
 					{
 						int bsi = (unsigned char)message_TxRx_byte_buffer[3];
 						messages_rx_buffer.batch_seq_id = bsi;
 						last_received_batch_seq_id = bsi;
 						messages_rx_buffer.id=message_TxRx_byte_buffer[4];
+						// D5: stage batch_total_frames (offset [5], appended last) ONLY when
+						// this config carries it (robust → not on the wire). 0 = unknown/
+						// legacy → stays -1 (RX keeps any prior count).
+						if(header_carries_d5)
+						{
+							int btf = (unsigned char)message_TxRx_byte_buffer[5];
+							rx_buffer_batch_total_frames = (btf > 0) ? btf : -1;
+						}
 					}
 					else
 					{
@@ -9058,7 +9156,7 @@ void cl_arq_controller::receive()
 					// v1 (default): byte[3] = id, byte[4] = length.
 					// v2: byte[3] = batch_seq_id, byte[4] = id, byte[5] = length.
 					// batch_seq_id is stored but no decision branches on it (Step 4+).
-					int eff_hdr = effective_data_short_header_length(sack_v2_enabled);
+					int eff_hdr = effective_data_short_header_length(sack_v2_enabled, header_carries_d5);
 					if(sack_v2_enabled)
 					{
 						int bsi = (unsigned char)message_TxRx_byte_buffer[3];
@@ -9066,6 +9164,14 @@ void cl_arq_controller::receive()
 						last_received_batch_seq_id = bsi;
 						messages_rx_buffer.id=message_TxRx_byte_buffer[4];
 						messages_rx_buffer.length=(unsigned char)message_TxRx_byte_buffer[5];
+						// D5: stage batch_total_frames (offset [6], appended last) ONLY when
+						// this config carries it (robust → not on the wire). 0 = unknown/
+						// legacy → stays -1 (RX keeps any prior count).
+						if(header_carries_d5)
+						{
+							int btf = (unsigned char)message_TxRx_byte_buffer[6];
+							rx_buffer_batch_total_frames = (btf > 0) ? btf : -1;
+						}
 					}
 					else
 					{
@@ -9994,7 +10100,7 @@ void cl_arq_controller::restore_backup_buffer_data()
 	// SACK Design A Step 1 — effective DATA_LONG header length gates per-frame
 	// payload capacity. In v1 (default) this is the legacy 4-byte value; in v2
 	// it grows by 1 byte (matching the wire format the prior batch was sent in).
-	int eff_long_hdr = effective_data_long_header_length(sack_v2_enabled);
+	int eff_long_hdr = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
 	int nBackedup_bytes, data_read_size, nMessages;
 	nBackedup_bytes=fifo_buffer_backup.get_size()-fifo_buffer_backup.get_free_size();
 	if(nBackedup_bytes!=0 && (max_data_length+max_header_length-eff_long_hdr)!=0)

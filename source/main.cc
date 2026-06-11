@@ -713,6 +713,12 @@ int main(int argc, char *argv[])
                                         // (silent concat on the SET_CONFIG cases), pass-after aborts loudly
                                         // OR delivers contiguous. One-shot, exits rc.
                                         // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+    bool test_eob_loss_batch_truncation_cli = false; // --test-eob-loss-batch-truncation: D5 — EOB-inference
+                                        // batch truncation. A 30-frame batch loses its EOB-marked tail; the
+                                        // wired batch_total_frames recovers the true length. fail-before via
+                                        // MERCURY_D5_INFER_DEFEAT=1 (silent 29-frame skip), pass-after holds
+                                        // then delivers all 30 faithfully after the retx. One-shot, exits rc.
+                                        // See TRACK_C_D2D3D5_DESIGN.md §5.3 / data-flow-prev-bump.md §8.
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
@@ -1381,6 +1387,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_inorder_demote
             // + bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
             test_inorder_demote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-eob-loss-batch-truncation") == 0)
+        {
+            // D5 — EOB-inference batch truncation (lost-EOB tail silent skip) —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_eob_loss_batch_truncation
+            // + TRACK_C_D2D3D5_DESIGN.md §5.3.
+            test_eob_loss_batch_truncation_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2741,6 +2757,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inorder_demote();
             printf("[FLAG] In-order-demote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_eob_loss_batch_truncation_cli) {
+            // D5 — EOB-inference batch truncation (lost-EOB tail silent skip) (one-shot, exit rc).
+            printf("[FLAG] --test-eob-loss-batch-truncation: invoking D5 lost-EOB "
+                   "batch-truncation regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_eob_loss_batch_truncation();
+            printf("[FLAG] EOB-loss-batch-truncation test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

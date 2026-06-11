@@ -273,13 +273,22 @@ struct st_message
 // See SACK_DESIGN_A_PLAN.md §4.2.1, §6 reversibility analysis (these
 // helpers are the irreversibility mitigation — the new wire bytes are
 // ONLY emitted when sack_v2_enabled is true on both peers).
-inline int effective_data_long_header_length(bool sack_v2)
+// D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): `with_d5` selects whether the v2 header
+// includes the batch_total_frames byte. It is TRUE for OFDM multi-frame configs
+// (where lost-EOB batch truncation is possible and the +1 byte is negligible),
+// FALSE for robust / batch=1 configs (D5 is meaningless at batch=1 and the byte
+// would steal the scarce ROBUST_0 payload — see test_robust0_compress_deadlock
+// C0). Default TRUE so the prevailing OFDM call sites are unchanged; the robust
+// path + the load_configuration sizing pass the live header_carries_d5 flag.
+inline int effective_data_long_header_length(bool sack_v2, bool with_d5 = true)
 {
-	return sack_v2 ? DATA_LONG_HEADER_LENGTH_V2 : DATA_LONG_HEADER_LENGTH;
+	if(!sack_v2) return DATA_LONG_HEADER_LENGTH;
+	return with_d5 ? DATA_LONG_HEADER_LENGTH_V2 : DATA_LONG_HEADER_LENGTH_V2_NO_D5;
 }
-inline int effective_data_short_header_length(bool sack_v2)
+inline int effective_data_short_header_length(bool sack_v2, bool with_d5 = true)
 {
-	return sack_v2 ? DATA_SHORT_HEADER_LENGTH_V2 : DATA_SHORT_HEADER_LENGTH;
+	if(!sack_v2) return DATA_SHORT_HEADER_LENGTH;
+	return with_d5 ? DATA_SHORT_HEADER_LENGTH_V2 : DATA_SHORT_HEADER_LENGTH_V2_NO_D5;
 }
 
 // SACK: Double-buffered crypto batch storage for partial batch handling.
@@ -1734,6 +1743,23 @@ public:
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
   int test_inorder_demote();
 
+  // D5 — EOB-inference batch truncation (TRACK_C_D2D3D5_DESIGN.md §5.3 /
+  // data-flow-prev-bump.md §8). CLI: --test-eob-loss-batch-truncation. Drives
+  // the REAL bump_bsi_and_transfer_prev() (the prev_expected producer), the REAL
+  // prev-completion count gate, the REAL copy_data_to_buffer() prev delivery, and
+  // the REAL fifo_buffer_rx as a byte-exact oracle. A 30-frame batch loses its
+  // EOB-marked tail frame (slot 29); the EOB inference latches a SHORT length
+  // (29) while the wired batch_total_frames carries the true 30.
+  //   fail-before (MERCURY_D5_INFER_DEFEAT=1): prev_expected=29, the count gate
+  //     fires with slot 29 FREE, copy_data_to_buffer delivers the 29-frame batch —
+  //     the lost tail is SILENTLY skipped, the delivered bytes != the 30-frame
+  //     tx prefix (md5-false).
+  //   pass-after (defeat off): prev_expected=30, received_count=29<30 → the gate
+  //     HOLDS (nothing delivered); inject the slot-29 retransmit → received=30 →
+  //     the gate fires → the full 30-frame batch delivers in order (faithful).
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  int test_eob_loss_batch_truncation();
+
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
   //
@@ -2240,6 +2266,14 @@ public:
   bool sack_enabled;                   // Negotiated: both sides have CAP_SACK
   bool sack_v2_enabled;                // SACK Design A scaffolding (Step 6): both sides have CAP_SACK_V2.
                                        // NEGOTIATE-ONLY at this step — gates no behavior yet.
+  // D5 (TRACK_C_D2D3D5_DESIGN.md §5.3): does the v2 DATA header carry the
+  // batch_total_frames byte on THIS config? TRUE for OFDM multi-frame configs,
+  // FALSE for robust / batch=1 (D5 is meaningless at batch=1 and the byte would
+  // steal the scarce ROBUST_0 payload, re-opening the streaming-compression
+  // deadlock floor). Recomputed in load_configuration() from the config being
+  // loaded so TX and RX (both re-run load_configuration on the SET_CONFIG
+  // handshake) agree on the wire header length. Default true (set in init).
+  bool header_carries_d5;
   bool enable_sack_v2;                 // Harness-compat no-op since CAP_SACK_V2 was removed
                                        // (2026-05-24). SACK v2 is unconditional; --enable-sack-v2
                                        // and --disable-sack-v2 still toggle this for tools that
@@ -2828,7 +2862,7 @@ public:
   bool compression_viable_for_batch() const
   {
     if(!compression_enabled) return false;
-    int eff_long = effective_data_long_header_length(sack_v2_enabled);
+    int eff_long = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
     int max_frame = max_data_length + max_header_length - eff_long;
     int batch_capacity = data_batch_size * max_frame;
     if(cipher_suite.is_active()) batch_capacity -= AUTH_TAG_SIZE;
@@ -3418,6 +3452,20 @@ private:
   // storage block. v1 (no bsi routing) keeps writing last_received_end_of_batch
   // _seq directly in receive() and leaves this field unused (-1).
   int rx_buffer_eob_seq;               // staged EOB seq for current v2 frame, or -1
+  // D5 (EOB-inference batch truncation, TRACK_C_D2D3D5_DESIGN.md §5.3): the
+  // TX-authoritative per-batch frame count carried on the wire (batch_total_frames
+  // header byte) on EVERY v2 DATA frame of a batch. Unlike last_received_end_of_batch
+  // _seq (single-frame EOB evidence — erased when the last frame is lost), this
+  // survives the loss of any single frame, so a lost-EOB tail leaves received_count <
+  // expected_count and the batch is held (then SACK-recovered) or loud-aborted rather
+  // than silently truncated. Staged per-frame in receive() (rx_buffer_batch_total
+  // _frames, mirroring rx_buffer_eob_seq), promoted to rx_batch_total_frames ONLY
+  // inside the confirmed match-current / match-prev storage block. -1 = unknown
+  // (v1/legacy/NB, or no frame of this batch seen yet) → consumers fall back to the
+  // EOB inference. MERCURY_D5_INFER_DEFEAT=1 forces the fallback on the SAME binary
+  // (the fail-before arm). Reset to -1 at session init + on every bsi bump/teardown.
+  int rx_buffer_batch_total_frames;    // staged batch_total_frames for current v2 frame, or -1
+  int rx_batch_total_frames;           // promoted authoritative per-batch frame count, or -1
   char last_message_sent_type;
   char last_message_sent_code;
 
