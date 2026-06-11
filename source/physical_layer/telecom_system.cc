@@ -7270,6 +7270,20 @@ void cl_telecom_system::sfo_grid_test()
 		// Score per iteration; the error-prop guards (§6) keep it monotone-safe.
 		int turbo_iters = env_i("MERCURY_SFO_GRID_TURBO_ITERS", 1);
 		if(turbo_iters < 1) turbo_iters = 1;
+		// ---- P1-A PHASE 2: RX clipping-noise cancellation (DAR / Bussgang) ----------
+		// MERCURY_SFO_GRID_CLIP_CANCEL=1 (default 0 = OFF = byte-identical). When ON (AND
+		// pbloop is ON so a clip distortion EXISTS), each turbo feedback pass reconstructs
+		// the per-symbol freq-domain clip distortion d̂ from the just-decoded bits (re-encode
+		// → re-mod → re-frame → replay the SAME peak_clip), propagates it through the current
+		// channel estimate Ĥ, and subtracts Ĥ·d̂ from a WORKING COPY of rx before the
+		// re-estimate/re-eq/re-decode. (data-flow-papr-cut.md §9; Kim & Stüber, "Clipping
+		// noise mitigation for OFDM by decision-aided reconstruction", IEEE Comms Lett.,
+		// IEEEXplore 740112 / 1214054.) The clip is a deterministic memoryless nonlinearity
+		// with TX-known depth (ofdm.data_papr_cut), so correct decisions reconstruct d̂ EXACTLY
+		// and the in-band clip noise is removed. The shared `rx` is NEVER mutated; the
+		// monotone-best publish (:7328-7329) keeps this never-worse-than-OFF. NO-OP when the
+		// clip is inert (data_papr_cut>=~11 dB → d̂≈0, §8).
+		bool clip_cancel = (env_i("MERCURY_SFO_GRID_CLIP_CANCEL", 0) != 0) && pbloop && coded;
 		double turbo_damp = env_f("MERCURY_SFO_GRID_TURBO_DAMP", 0.7);
 		if(turbo_damp < 0.0) turbo_damp = 0.0;
 		if(turbo_damp > 1.0) turbo_damp = 1.0;
@@ -7361,13 +7375,82 @@ void cl_telecom_system::sfo_grid_test()
 			std::vector<double> vsoft(nData);
 			psk.soft_remod(fb_bits.data(), nBits, xbar.data(), vsoft.data());
 
+			// ---- DAR clip-noise cancellation (§9.4): reconstruct Ĥ·d̂, subtract from rx ----
+			// Default: the re-estimate consumes the shared, untouched rx (byte-identical).
+			// When clip_cancel: build a working copy rx_cancel = rx − Ĥ·d̂ and route the
+			// re-estimate/re-eq through it. rx_cancel is local to this iteration; `rx` is
+			// never mutated (cross-layer audit §9.5 Q1).
+			std::complex<double>* rx_work = rx.data();
+			std::vector<std::complex<double>> rx_cancel;       // empty unless cancelling
+			if(clip_cancel)
+			{
+				// 1) Regenerate the TX coded bits from the HARD decisions captured at :7315.
+				//    Re-encode each decoded info codeword; un-decoded filler bits past Kcw*N
+				//    are copied verbatim from the original tx_bits (they were not the subject
+				//    of the decode and their TX value is known to the harness).
+				std::vector<int> re_bits(nBits);
+				std::vector<int> re_info(ldpc.K), re_enc(ldpc.N);
+				for(int c=0;c<Kcw;c++)
+				{
+					for(int i=0;i<ldpc.K;i++) re_info[i] = dec_all[(size_t)c*ldpc.K+i];
+					ldpc.encode(re_info.data(), re_enc.data());
+					for(int i=0;i<ldpc.N;i++) re_bits[(size_t)c*ldpc.N+i] = re_enc[i];
+				}
+				for(int i=Kcw*ldpc.N; i<nBits; i++) re_bits[i] = tx_bits[i];   // filler = known TX
+
+				// 2) Re-mod → re-frame to the CLEAN (pre-clip) freq-domain grid.
+				std::vector<std::complex<double>> re_syms(nData);
+				psk.mod(re_bits.data(), nBits, re_syms.data());
+				std::vector<std::complex<double>> re_grid_clean((size_t)Ngrid*Nc);
+				ofdm.framer(re_syms.data(), re_grid_clean.data());
+
+				// 3) Reconstruct d̂ by replaying the SAME per-symbol PBLOOP clip (§9.2),
+				//    then 4) subtract Ĥ·d̂ from rx into the working copy. Ĥ is the current
+				//    iteration's channel estimate (estimated_channel.value); on flat/clean
+				//    grids Ĥ≈1, on selective it carries the per-carrier response.
+				rx_cancel.assign(rx.begin(), rx.end());            // working copy of received grid
+				std::vector<std::complex<double>> sym_bb((size_t)Nofdm);
+				std::vector<std::complex<double>> sym_fd((size_t)Nc);
+				double dpow_tot=0.0, sigpow_tot=0.0;
+				for(int n=0;n<Ngrid;n++)
+				{
+					ofdm.symbol_mod(&re_grid_clean[(size_t)n*Nc], sym_bb.data());
+					ofdm.peak_clip(sym_bb.data(), Nofdm, ofdm.data_papr_cut);   // SAME clip as TX
+					ofdm.symbol_demod(sym_bb.data(), sym_fd.data());           // clipped, freq domain
+					for(int j=0;j<Nc;j++)
+					{
+						size_t k = (size_t)n*Nc + j;
+						std::complex<double> dhat = sym_fd[j] - re_grid_clean[k];   // d̂_k
+						std::complex<double> H = (ofdm.estimated_channel+k)->value; // Ĥ_k
+						rx_cancel[k] -= H * dhat;                                   // rx − Ĥ·d̂
+						dpow_tot   += dhat.real()*dhat.real()+dhat.imag()*dhat.imag();
+						sigpow_tot += re_grid_clean[k].real()*re_grid_clean[k].real()
+						             +re_grid_clean[k].imag()*re_grid_clean[k].imag();
+					}
+				}
+				// INERT-CLIP GUARD: when the clip never fired (data_papr_cut loose enough that
+				// the composite PAPR never exceeded it, §8 → d̂ is machine-zero, ~1e-32) the
+				// subtraction is a no-op physically but a ~1e-32 LSB nudge numerically, which
+				// at a knife-edge SNR can chaotically flip a marginal LDPC codeword. Skip the
+				// commit entirely below the engagement floor so rx_work stays the SHARED rx —
+				// bit-identical to OFF wherever the clip is inert (the default-10 dB regime).
+				bool clip_engaged = (sigpow_tot > 0.0) && (dpow_tot > 1e-12 * sigpow_tot);
+				if(clip_engaged) rx_work = rx_cancel.data();   // else rx_work stays = rx.data()
+				if(env_i("MERCURY_SFO_GRID_CLIP_CANCEL_DIAG", 0) != 0)
+					std::cout << "[SFO-GRID-CLIPCANCEL] it=" << it << " cut=" << ofdm.data_papr_cut
+					          << " dB  reconstructed clip-noise power frac (||d̂||²/||x||²)="
+					          << (sigpow_tot>0? dpow_tot/sigpow_tot : 0.0)
+					          << (clip_engaged ? " (subtracted Ĥ·d̂ from rx)" : " (INERT: skipped, rx unchanged)")
+					          << std::endl;
+			}
+
 			// Data-aided channel re-estimate over the dense lattice, then re-eq/demap.
-			ofdm.data_aided_channel_estimator(rx.data(), xbar.data(), vsoft.data());
+			ofdm.data_aided_channel_estimator(rx_work, xbar.data(), vsoft.data());
 			// refresh CSI weights from the refined H
 			{ int di=0; for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
 				if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ std::complex<double> H=(ofdm.estimated_channel+n*Nc+j)->value;
 					if(di<nData) csi_data[di]=H.real()*H.real()+H.imag()*H.imag(); di++; } }
-			ofdm.channel_equalizer(rx.data(), eq.data());
+			ofdm.channel_equalizer(rx_work, eq.data());   // rx_work == rx (OFF) or rx_cancel (DAR)
 			ofdm.deframer(eq.data(), deframed.data());
 			double cvar2 = ofdm.noise_variance_estimate;
 			if(nvfix && cvar2 < variance / NV_COLLAPSE_RATIO_K) cvar2 = variance;   // ratio-gate (a0e22c8)

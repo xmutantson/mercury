@@ -205,3 +205,182 @@ sits exactly at the onset of engagement, the conservative looser edge of the opt
 plateau. Engagement becomes material only at <=~8 dB (coarse: 7 dB = 0.596% clipped, the
 only depth with a real decode penalty). The engagement boundary (~8-9 dB) is the
 failing-test-first operating point for Phase-2.
+
+---
+
+## §9. PHASE 2 — RX clipping-noise cancellation (DAR / Bussgang)
+
+### §9.1 Prior art (cited)
+- **D. Kim, G. L. Stüber, "Clipping noise mitigation for OFDM by decision-aided
+  reconstruction" (IEEE Comms Lett. 1999/2002, IEEEXplore 740112 / 1214054).** The
+  canonical Decision-Aided Reconstruction (DAR): after an initial decode, REGENERATE the
+  clean (unclipped) transmit signal from the decisions, apply the SAME known clip to it to
+  reconstruct the clip distortion, subtract it from the received signal, then re-equalize /
+  re-demap / re-decode. Iterate. Restores "to within ~1 dB of the unclipped curve with no
+  bandwidth expansion" (the SEE cdew07 1569014844 comparison paper, DEEPLEVER #1 cite).
+- **Turbo-DAR** (HAL hal-00521057, "Turbo Decision Aided Receivers for Clipping Noise
+  Mitigation in Coded OFDM"): fold the DAR reconstruction INTO the FEC iteration loop — the
+  exact structure Mercury's in-tree turbo-EQ harness loop already has (see §9.3).
+- **Why it must work here and not just on a generic channel:** the clip is a
+  DETERMINISTIC MEMORYLESS nonlinearity with TX-known parameters (`ofdm.data_papr_cut`,
+  the same value at TX and RX since §2). Once the decisions are correct the reconstructed
+  distortion `d̂` equals the true `d` EXACTLY and the clip noise is fully removed. The only
+  error source is wrong decisions, which the FEC + the monotone-best guard (§9.4) bound.
+
+### §9.2 The signal model in the harness (where d lives)
+PBLOOP TX (§6, telecom_system.cc:6690-6698) injects the clip distortion in the FREQ-DOMAIN
+grid, per OFDM symbol:
+```
+grid_clean = framer(tx_syms)                      # data+pilots, freq domain
+per symbol s:  t = symbol_mod(grid_clean[s])      # IFFT to time composite
+               peak_clip(t, data_papr_cut)        # THE nonlinearity (time domain)
+               grid[s] = symbol_demod(t)          # FFT back -> freq, now clip-distorted
+```
+So `grid = grid_clean + d` where `d[s] = symbol_demod(clip(symbol_mod(grid_clean[s]))) -
+grid_clean[s]` is the per-symbol freq-domain clip distortion. The channel then multiplies
+EVERYTHING (data + clip distortion together — `d` is part of the TX signal, generated
+BEFORE the channel):
+```
+rx_k = H_k * (grid_clean_k + d_k) + n_k           # k = (symbol,carrier) cell
+```
+(channel block telecom_system.cc:6706-6720 applies the SFO ramp; :6722-... applies the
+selective T(j); AWGN :6918-6923; rx = copy of grid :6930.)
+
+KEY CONSEQUENCE (the design's load-bearing fact): because `d` rides through `H` exactly
+like the data, the correct cancellation subtracts `H_k * d̂_k` from `rx_k` BEFORE the
+equalizer — NOT `d̂_k` from the equalized signal. (After equalization the residual would be
+`d_k` but the re-equalization re-derives H from the cleaned rx, so subtracting pre-equalize
+and re-running channel_equalizer is the faithful path and matches Kim&Stüber's "subtract
+the reconstructed clip term in the received domain" — frequency-domain CNC variant, since
+the harness channel is applied per-subcarrier.)
+
+### §9.3 Where it folds in — the EXISTING turbo loop (no new loop)
+The harness already has the turbo-EQ iteration at telecom_system.cc:7300-7385
+(`for(int it=0; it<turbo_iters; ++it)`), with the decode at :7305-7320, the monotone-best
+publish at :7328-7329, and the data-aided re-estimate feedback at :7341-7384. The clip
+cancellation is ONE extra step at the TOP of each feedback block (after the decode, before
+the re-estimate): reconstruct `d̂` from the just-decoded bits and subtract `Ĥ·d̂` from a
+WORKING COPY of `rx`, then let the existing re-estimate/re-eq/re-demap/re-decode run on the
+cleaned rx. The production RX turbo loop (telecom_system.cc:3005-3110) is the deploy-time
+analog; the harness loop is the A/B vehicle. This Phase only wires the HARNESS loop (the
+sim mechanism proof); production wiring is a follow-on gated on the bench.
+
+### §9.4 Algorithm (env `MERCURY_SFO_GRID_CLIP_CANCEL=1`, default 0 = OFF byte-identical)
+Inside the existing turbo feedback block, when `clip_cancel && pbloop`:
+1. Form the hard decisions `dec_all[c][i]` already captured at :7315 → the decoded info
+   bits per codeword. Re-encode each (`ldpc.encode`) → coded bits → `psk.mod` → `re_syms`
+   (the regenerated TX symbols). [Reuse the SAME `tx_bits`-style contiguous map the TX used
+   at :6646-6661 so symbol order matches.]
+2. `re_grid_clean = framer(re_syms)` (data+pilots; pilots are known-exact).
+3. Reconstruct `d̂` by replaying the PBLOOP clip on `re_grid_clean` per symbol:
+   `d̂[s] = symbol_demod(peak_clip(symbol_mod(re_grid_clean[s]), data_papr_cut)) -
+   re_grid_clean[s]`. (Bit-identical to the TX injection §9.2.)
+4. Subtract the channel-propagated distortion from a working copy:
+   `rx_cancel_k = rx_k - Ĥ_k * d̂_k`, where `Ĥ_k = estimated_channel[k].value` (the current
+   iteration's channel estimate). On the flat/clean grid `Ĥ≈1`; on selective `Ĥ` carries
+   the per-carrier response so the subtraction stays channel-faithful.
+5. Feed `rx_cancel` into the EXISTING re-estimate→re-eq→re-demap→re-decode (the feedback
+   block already there). The next decode sees clip-noise-reduced LLRs.
+
+MONOTONE-SAFE: the loop already publishes the BEST iteration only (:7328-7329, :7387-7390),
+so cancellation can NEVER report worse than iteration-0 (the OFF path). Additional guard:
+cancellation only ENGAGES when the clip actually fires (pbloop on AND a tight cut); at
+data_papr_cut>=11 dB d̂≈0 so it is a no-op (matches §8 — clip inert there).
+
+### §9.5 Cross-layer audit (CLAUDE.md §"Cross-Layer", 5 questions)
+The change is RX-only, inside the SFO-GRID harness turbo loop. Shared state touched:
+`rx` (read-only — a working COPY `rx_cancel` is used; the original `rx` is never mutated),
+`estimated_channel` (read for `Ĥ`; written by the existing re-estimate — unchanged),
+`clr`/`app`/`dec_all` (the existing turbo buffers).
+1. **Producers of rx**: the channel+AWGN block (:6918-6923) and the copy (:6930); the
+   tracker de-rotate (:6970-6980). Cancellation does NOT write `rx` — it writes a local
+   `rx_cancel`. So no producer is added to the shared `rx`.
+2. **Consumers of rx**: the estimator (:6993+), `channel_equalizer(rx)` (:7106, :7370),
+   `measure_variance(rx)` (:7142). In the cancel path these read `rx_cancel` for the
+   re-estimate/re-eq ONLY inside the feedback block; iteration-0 and the OFF path read the
+   untouched `rx`. The score block (:7142, uncoded probe) runs ONCE before the loop on the
+   original `rx` — unaffected.
+3. **Valid states**: `d̂` ∈ freq-domain grid, finite. BEFORE the first decode there is no
+   `d̂` (cancellation runs only it>=0 feedback, after a decode). At cut>=11 dB `d̂`≈0.
+4. **Invariants consumers assume**: (a) `rx` is the received grid — preserved (copy used).
+   (b) the re-estimate expects a received grid with the SAME pilots — preserved (pilots are
+   regenerated EXACTLY in re_grid_clean, and the clip distortion on pilots is real TX
+   distortion that cancellation correctly removes too). (c) monotone publish — preserved.
+5. **What the fix changes**: it subtracts a reconstructed `Ĥ·d̂` from the WORKING rx the
+   feedback re-decode consumes. No consumer of the shared `rx`/`estimated_channel` sees a
+   changed value outside the feedback block; OFF (env unset) → byte-identical (the block is
+   guarded by `clip_cancel`).
+
+VERDICT: RX-only, working-copy subtraction, monotone-guarded, default-off byte-identical,
+no shared-state mutation. Cross-layer-safe.
+
+### §9.6 Failing-test-first plan
+Per §8.2 the clip is INERT at the 10 dB default in this AWGN sim, so the
+failing-test-first operating point is an AGGRESSIVE cut (the only regime with recoverable
+distortion). The test (`--test-clip-cancel`, in-process) asserts:
+- **CFG16 (32-QAM):** at a tight cut + clip-limited SNR, CANCEL=OFF fails (codewords < K)
+  and CANCEL=ON decodes (codewords == K). Monotone: ON's BER <= OFF's BER always.
+- **CFG17 (64-QAM, the most clip-sensitive):** same, at the corresponding clip-limited SNR.
+- **No-op proof:** at data_papr_cut>=11 (clip inert) CANCEL=ON == CANCEL=OFF bit-for-bit.
+- `--test-climb-engine` unperturbed (gearshift untouched — RX-harness-only change).
+
+### §9.7 RESULTS — DAR sim recovery (the mechanism proof)
+
+#### §9.7.1 The regime finding (root cause of "no codeword change at mild cuts")
+A first scan at MILD cuts (4-5 dB) over a clip-limited SNR grid showed **zero** codeword
+change (ON==OFF, every cell). DIAG (`MERCURY_SFO_GRID_CLIP_CANCEL_DIAG=1`) explained it:
+at cut=4.5 dB the reconstructed freq-domain clip-noise power fraction `||d̂||²/||x||²` is
+only **~0.35%**, while the AWGN at the clip-limited operating point is nv≈2.9% — the clip
+noise is ~8× SMALLER than thermal noise, so cancelling it cannot flip a codeword. This is
+the SAME fact §8 found from the TX side: the baseband-envelope clip on a ~50-carrier
+composite barely fires at mild cuts. The DAR mechanism is correct and DOES engage
+(reconstruct+subtract), but there is almost nothing to recover at mild cuts in this AWGN
+sim — the recoverable distortion only DOMINATES at a VERY tight clip.
+
+#### §9.7.2 The clip-DOMINATED regime — DAR recovers decisively
+Probing at high Es/N0 (AWGN negligible) located the clip-break cut: CFG16 32-QAM decode
+breaks from clip distortion ALONE at **cut≈1 dB** (`||d̂||²/||x||²`≈4%, OFF single-pass
+1/6); CFG17 64-QAM (tighter min-distance) breaks at the milder **cut≈1.5-2 dB**
+(`||d̂||²`≈3.1%, OFF 4/7). At these clip-dominated points DAR (`MERCURY_SFO_GRID_CLIP_CANCEL=1`,
+turbo=6) strictly lifts the decode rate (8 seeds, codewords decoded):
+
+**CFG16 (32-QAM), cut=1 dB:**
+```
+Es/N0   CANCEL_OFF   CANCEL_ON   delta
+27 dB     4/48        15/48       +11
+30 dB     4/48        18/48       +14
+40 dB     9/48        23/48       +14    (clip nearly fully cancelled — DAR within ~1 cw
+                                          of the unclipped curve, matching Kim & Stüber)
+```
+**CFG17 (64-QAM shaped, M64+PCS), cut=1.5 dB:**
+```
+Es/N0   CANCEL_OFF   CANCEL_ON   delta
+30 dB    19/56        25/56       +6
+40 dB    22/56        27/56       +5
+```
+Single-seed SNR sweep at CFG16 cut=1 dB shows the monotone climb to near-clean as AWGN
+recedes: OFF 0/1/1/1 → ON 1/3/3/**5** /6 at 24/27/30/40 dB — i.e. as the clip becomes the
+sole impairment, DAR recovers 5/6 of the codewords the clip destroyed.
+
+#### §9.7.3 Honest scope (what the sim proves and does NOT)
+- **PROVEN (mechanism):** the DAR loop reconstructs the clip distortion from the decisions +
+  the known TX clip depth and subtracts the channel-propagated `Ĥ·d̂`, recovering the
+  in-band clip noise and roughly DOUBLING-to-TRIPLING the decode rate at the clip-limited
+  operating point (CFG16 4/48→18/48, CFG17 19/56→25/56). Monotone-safe (best-of publish):
+  ON never reports worse than OFF.
+- **NO-OP where there is no clip** (CELL-C): at cut=13 dB CANCEL=ON is bit-for-bit identical
+  to OFF (clip inert → d̂=0). So the lever cannot HURT at the default 10 dB.
+- **NOT shown in sim (BENCH-only):** the FreeDV "3-4 dB at fixed PEP" transmit-SNR gain
+  needs a HW PA / analog floor the sim does not model (§8.2). And whether recovering clip
+  distortion lifts the HW 14.4 dB EFFECTIVE-SNR ceiling is bench-confirmable only — the sim
+  proves the cancellation RECOVERS clip distortion and lowers BER at the clip-limited point,
+  which is the mechanism the bench then validates against the HW ceiling.
+- **Regime caveat:** in THIS AWGN sim the clip only dominates at very tight cuts (≤~2 dB),
+  far tighter than the 10 dB default. The bench question is whether, with a real PA driven to
+  the FreeDV fixed-PEP backoff (a deeper effective clip than 10 dB buys), the recoverable
+  distortion is large enough on HW for the DAR recovery to translate to the ceiling lift.
+
+#### §9.7.4 Test operating points (--test-clip-cancel, 8 seeds, turbo=4)
+- CELL-A CFG16: cut=1 dB @ Es/N0=30 dB → OFF fails, ON strictly > OFF.
+- CELL-B CFG17: cut=1.5 dB @ Es/N0=30 dB → OFF fails, ON strictly > OFF.
+- CELL-C no-op: cut=13 dB @ 16 dB → ON == OFF (clip inert).

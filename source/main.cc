@@ -383,6 +383,19 @@ static int run_pas_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// P1-A Phase 2 RX clip-noise-cancellation (DAR) test operating points. The clip is
+// INERT at >=11 dB and even at mild cuts (4-7 dB) the freq-domain clip noise is SMALL
+// vs AWGN (data-flow-papr-cut.md §8/§9.7), so the failing-test-first point is the
+// CLIP-DOMINATED regime: a VERY tight cut where the clip distortion ALONE breaks decode
+// (clip-noise power >> AWGN). There DAR has real distortion to recover and strictly
+// lifts the decode rate (§9.7 scan). CFG16 = 32-QAM (clip breaks at ~1 dB); CFG17 =
+// 64-QAM, tighter min-distance => clip breaks at a milder ~1.5 dB cut. High Es/N0 keeps
+// the clip the DOMINANT impairment so the recovery is not masked by thermal noise.
+#define CLIP_CANCEL_A_CUT   "1"      // CFG16 clip-dominated clip depth (dB)
+#define CLIP_CANCEL_A_ESN0  "30"     // CFG16 Es/N0 (clip dominant; §9.7 OFF 4/48 -> ON 18/48)
+#define CLIP_CANCEL_B_CUT   "1.5"    // CFG17 clip-dominated clip depth (dB)
+#define CLIP_CANCEL_B_ESN0  "30"     // CFG17 Es/N0 (clip dominant)
+
 // --test-cfg17: CFG17 shaped-64-QAM COMPOSITION self-test (failing-test-first).
 // Drives the SFO-GRID harness in-process for three decisive cells and asserts the
 // COMPOSED stack decodes where a BARE arm fails — proving each of the three deep
@@ -520,6 +533,138 @@ static int run_cfg17_selftest()
     }
 
     printf("[TEST-CFG17] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
+// --test-clip-cancel: P1-A Phase 2 RX clipping-noise cancellation (DAR / Bussgang)
+// self-test (failing-test-first). Drives the SFO-GRID PBLOOP harness in-process at an
+// AGGRESSIVE clip depth (the only regime with recoverable clip distortion in this AWGN
+// sim — data-flow-papr-cut.md §8) and a clip-limited SNR, and asserts CLIP_CANCEL=OFF
+// fails while CLIP_CANCEL=ON recovers (more codewords decoded), monotone-safe. Covered
+// for CFG16 (32-QAM) and CFG17 (64-QAM, the most clip-sensitive). Plus a clip-INERT
+// no-op proof (data_papr_cut>=11 dB => d̂≈0 => ON == OFF). See data-flow-papr-cut.md §9.
+//
+// Runs ONE harness cell with the given env and returns decoded codeword count via the
+// additive sfo_grid_last_cw_* snapshot. Env save/restore so later in-process work is
+// not perturbed. m64="1" + pcs="1" select the CFG17 64-QAM stack (as --test-cfg17).
+static void clipcancel_run_cell(const char* esn0, const char* cut, const char* cancel,
+                                const char* m64, const char* pcs, const char* turbo_iters,
+                                const char* seed, int& cw_ok, int& cw_tot)
+{
+    const char* keys[] = {
+        "MERCURY_SFO_GRID", "MERCURY_SFO_GRID_CODED", "MERCURY_SFO_GRID_PBLOOP",
+        "MERCURY_SFO_GRID_CLIP_CANCEL", "MERCURY_DATA_PAPR_CUT", "MERCURY_SFO_GRID_ESN0",
+        "MERCURY_SFO_GRID_M64", "MERCURY_SFO_GRID_PCS", "MERCURY_SFO_GRID_TURBO_ITERS",
+        "MERCURY_SFO_GRID_SEED", "MERCURY_SFO_GRID_NSYMB"
+    };
+    const int nk = (int)(sizeof(keys)/sizeof(keys[0]));
+    struct Saved { const char* key; bool had; std::string val; } sv[16];
+    for (int i = 0; i < nk; i++) {
+        const char* g = std::getenv(keys[i]);
+        sv[i].key = keys[i]; sv[i].had = (g != nullptr);
+        sv[i].val = g ? std::string(g) : std::string();
+    }
+    cfg17_set_env("MERCURY_SFO_GRID", "1");
+    cfg17_set_env("MERCURY_SFO_GRID_CODED", "1");
+    cfg17_set_env("MERCURY_SFO_GRID_PBLOOP", "1");
+    cfg17_set_env("MERCURY_SFO_GRID_CLIP_CANCEL", cancel);
+    cfg17_set_env("MERCURY_DATA_PAPR_CUT", cut);
+    cfg17_set_env("MERCURY_SFO_GRID_ESN0", esn0);
+    cfg17_set_env("MERCURY_SFO_GRID_M64", m64);
+    cfg17_set_env("MERCURY_SFO_GRID_PCS", pcs);
+    cfg17_set_env("MERCURY_SFO_GRID_TURBO_ITERS", turbo_iters);
+    cfg17_set_env("MERCURY_SFO_GRID_SEED", seed);
+    cfg17_set_env("MERCURY_SFO_GRID_NSYMB", "60");
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_16);   // sizes OFDM/LDPC; harness overrides M for CFG17
+    ts.sfo_grid_test();
+    cw_ok  = ts.sfo_grid_last_cw_ok;
+    cw_tot = ts.sfo_grid_last_cw_tot;
+
+    for (int i = 0; i < nk; i++) {
+#if defined(_WIN32)
+        _putenv_s(sv[i].key, sv[i].had ? sv[i].val.c_str() : "");
+#else
+        if (sv[i].had) setenv(sv[i].key, sv[i].val.c_str(), 1); else unsetenv(sv[i].key);
+#endif
+    }
+}
+
+// Aggregate a cell over several seeds (the per-cell granularity is 6 codewords; seeds
+// give statistical power for the OFF-fail / ON-recover comparison).
+static void clipcancel_agg(const char* esn0, const char* cut, const char* cancel,
+                           const char* m64, const char* pcs, const char* turbo_iters,
+                           const char* const* seeds, int nseeds, int& ok_sum, int& tot_sum)
+{
+    ok_sum = 0; tot_sum = 0;
+    for (int s = 0; s < nseeds; s++) {
+        int ok=-1, tot=-1;
+        clipcancel_run_cell(esn0, cut, cancel, m64, pcs, turbo_iters, seeds[s], ok, tot);
+        if (tot > 0) { ok_sum += (ok<0?0:ok); tot_sum += tot; }
+    }
+}
+
+static int run_clip_cancel_selftest()
+{
+    printf("[TEST-CLIP-CANCEL] P1-A Phase 2 RX clipping-noise cancellation (DAR/Bussgang) self-test\n");
+    int fails = 0;
+    static const char* seeds[] = {"12345","1","7","99","555","8","314","2718"};
+    const int NS = (int)(sizeof(seeds)/sizeof(seeds[0]));
+    const char* TI = "4";   // turbo iterations (DAR feedback passes)
+
+    // ---- CELL A: CFG16 (32-QAM) DAR recovery at an aggressive clip + clip-limited SNR.
+    // The clip is inert at >=11 dB (data-flow-papr-cut.md §8), so a TIGHT cut is the only
+    // regime with recoverable distortion. CANCEL=OFF leaves residual clip noise that
+    // breaks decode on a fraction of seeds; CANCEL=ON reconstructs Ĥ·d̂ from the decisions
+    // and subtracts it -> strictly more codewords decoded. (Operating point from the
+    // §9.6 scan; see data-flow-papr-cut.md §9.7.)
+    {
+        int off_ok=0, off_tot=0, on_ok=0, on_tot=0;
+        clipcancel_agg(CLIP_CANCEL_A_ESN0, CLIP_CANCEL_A_CUT, "0", "0","0", TI, seeds, NS, off_ok, off_tot);
+        clipcancel_agg(CLIP_CANCEL_A_ESN0, CLIP_CANCEL_A_CUT, "1", "0","0", TI, seeds, NS, on_ok,  on_tot);
+        bool off_fails = (off_tot>0 && off_ok < off_tot);   // OFF leaves codewords undecoded
+        bool on_better = (on_ok > off_ok);                  // DAR strictly recovers
+        bool ok = off_fails && on_better;
+        printf("[TEST-CLIP-CANCEL]   CELL-A CFG16 cut=%s dB @%s dB: CANCEL_OFF=%d/%d (%s) CANCEL_ON=%d/%d (%s) -> %s\n",
+               CLIP_CANCEL_A_CUT, CLIP_CANCEL_A_ESN0, off_ok,off_tot, off_fails?"FAILS_OK":"decoded_unexpected",
+               on_ok,on_tot, on_better?"RECOVERS_OK":"NO_GAIN", ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- CELL B: CFG17 (64-QAM, the most clip-sensitive) DAR recovery. Same structure
+    // on the shaped-64-QAM stack (M64+PCS). 64-QAM's tighter min-distance makes the clip
+    // distortion bite harder, so the DAR recovery is the decisive enabler the bench needs.
+    {
+        int off_ok=0, off_tot=0, on_ok=0, on_tot=0;
+        clipcancel_agg(CLIP_CANCEL_B_ESN0, CLIP_CANCEL_B_CUT, "0", "1","1", TI, seeds, NS, off_ok, off_tot);
+        clipcancel_agg(CLIP_CANCEL_B_ESN0, CLIP_CANCEL_B_CUT, "1", "1","1", TI, seeds, NS, on_ok,  on_tot);
+        bool off_fails = (off_tot>0 && off_ok < off_tot);
+        bool on_better = (on_ok > off_ok);
+        bool ok = off_fails && on_better;
+        printf("[TEST-CLIP-CANCEL]   CELL-B CFG17 cut=%s dB @%s dB: CANCEL_OFF=%d/%d (%s) CANCEL_ON=%d/%d (%s) -> %s\n",
+               CLIP_CANCEL_B_CUT, CLIP_CANCEL_B_ESN0, off_ok,off_tot, off_fails?"FAILS_OK":"decoded_unexpected",
+               on_ok,on_tot, on_better?"RECOVERS_OK":"NO_GAIN", ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- CELL C: clip-INERT no-op proof. At cut=13 dB the clip never fires (§8/§9.7:
+    // reconstructed d̂ is machine-zero ~1e-32) so the INERT-CLIP GUARD skips the subtraction
+    // entirely and CANCEL=ON is BIT-IDENTICAL to OFF — proves the lever cannot HURT where
+    // there is no clip distortion (the default-10 dB regime). Run at a high Es/N0 (22 dB)
+    // where all seeds decode, so any divergence would be unambiguous (the guard makes it 0).
+    {
+        int off_ok=0, off_tot=0, on_ok=0, on_tot=0;
+        clipcancel_agg("22", "13", "0", "0","0", TI, seeds, NS, off_ok, off_tot);
+        clipcancel_agg("22", "13", "1", "0","0", TI, seeds, NS, on_ok,  on_tot);
+        bool noop = (off_ok == on_ok) && (off_tot == on_tot) && (off_tot > 0);
+        printf("[TEST-CLIP-CANCEL]   CELL-C clip-inert no-op cut=13 dB @22 dB: OFF=%d/%d ON=%d/%d -> %s\n",
+               off_ok,off_tot, on_ok,on_tot, noop?"PASS(identical)":"FAIL(diverged)");
+        if(!noop) fails++;
+    }
+
+    printf("[TEST-CLIP-CANCEL] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
     return fails==0 ? 0 : 1;
 }
 
@@ -749,6 +894,7 @@ int main(int argc, char *argv[])
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
+    bool test_clip_cancel_cli = false;  // --test-clip-cancel: P1-A Phase 2 RX clip-noise cancellation (DAR) failing-first (feat/clipfix-papr-tune).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1371,6 +1517,18 @@ int main(int argc, char *argv[])
             // composed stack (PAS + TINTERP-seed turbo + ratio-nvfix) decodes where a
             // bare arm fails. See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
             test_cfg17_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-clip-cancel") == 0)
+        {
+            // P1-A Phase 2 — RX clipping-noise cancellation (DAR/Bussgang) self-test
+            // (feat/clipfix-papr-tune, failing-first): drives the SFO-GRID PBLOOP harness
+            // in-process at an aggressive clip depth + clip-limited SNR and asserts
+            // CLIP_CANCEL=OFF fails while CLIP_CANCEL=ON recovers, monotone-safe, for
+            // both CFG16 (32-QAM) and CFG17 (64-QAM), plus a clip-inert no-op proof.
+            // See fact-documents/data-flow-papr-cut.md §9.
+            test_clip_cancel_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2711,6 +2869,17 @@ start_modem:
             fflush(stdout);
             int rc = run_cfg17_selftest();
             printf("[FLAG] CFG17 composition self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_clip_cancel_cli) {
+            // P1-A Phase 2 RX clip-noise cancellation (DAR) self-test (one-shot, exit rc).
+            // Drives the SFO-GRID PBLOOP harness in-process — no ARQ/audio/TCP state.
+            printf("[FLAG] --test-clip-cancel: invoking P1-A Phase 2 RX clipping-noise "
+                   "cancellation (DAR/Bussgang) self-test\n");
+            fflush(stdout);
+            int rc = run_clip_cancel_selftest();
+            printf("[FLAG] clip-cancel self-test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
