@@ -68,7 +68,16 @@ extern int g_verbose;
 #define TX_WAV 10  // ULTRA audio render: one frame -> S16LE WAV, no audio device (sim instrument)
 #define SIM_INPROC 11  // single-process in-process self-loopback feasibility prototype (no device/TCP/threads)
 
-#define NUMBER_OF_CONFIGS 17
+// NUMBER_OF_CONFIGS = 18 to make CONFIG_17 (shaped-64-QAM gear, default-NOT-
+// selected) REACHABLE via -s 17 / the SFO-GRID harness. This is the table-size /
+// monitor-decoder-array bound (arq.h:3214 monitor_decoders[], arq_common.cc
+// parallel-decode loops, telecom_system.cc:9677 load_configuration range guard) —
+// NOT the gearshift ceiling. The gearshift/optimizer ceiling is WB_CONFIG_MAX,
+// LEFT at CONFIG_16 (below), so the climb engine NEVER auto-elects CFG17. The only
+// behavioral delta from this bump is MONITOR_MODE initializing one extra (CFG17)
+// parallel decoder; ARQ / PLOT_PASSBAND / SFO-GRID production paths are
+// byte-identical with CFG17 unused. See fact-documents/data-flow-cfg17-shaped-64qam.md §1.2.
+#define NUMBER_OF_CONFIGS 18
 #define CONFIG_NONE -1
 #define CONFIG_0 0
 #define CONFIG_1 1
@@ -87,6 +96,15 @@ extern int g_verbose;
 #define CONFIG_14 14
 #define CONFIG_15 15
 #define CONFIG_16 16
+// CONFIG_17 = shaped-64-QAM top-gear SKELETON (LDPC rate-14/16). DEFAULT-NOT-
+// SELECTED: WB_CONFIG_MAX stays CONFIG_16, FULL_CONFIG_LADDER does NOT list it,
+// is_ofdm_config caps at 16 — so no climb/optimizer/D3 path elects it. Reachable
+// ONLY via explicit -s 17 or the SFO-GRID harness (the composition vehicle for
+// PAS + TINTERP-seed turbo + ratio-nvfix). The D3 demote-gate (==CONFIG_16 ->
+// ||==CONFIG_17) + optimizer/effective-rate-table registration + the WB_CONFIG_MAX
+// /is_ofdm_config/ladder bumps are HELD for after the CFG16-acquisition fix to
+// avoid concurrent gearshift changes (RESEARCH_cfg17-64qam.md §4.5).
+#define CONFIG_17 17
 
 // ROBUST (MFSK) configurations - values 100+ to avoid collision with OFDM configs
 #define NUMBER_OF_ROBUST_CONFIGS 3
@@ -724,6 +742,7 @@ inline const char* config_to_string(int config) {
 		case CONFIG_14: return "CONFIG 14 (8PSK 14/16, ~3390 bps)";
 		case CONFIG_15: return "CONFIG 15 (16QAM 14/16, ~5088 bps)";
 		case CONFIG_16: return "CONFIG 16 (32QAM 14/16, ~5665 bps)";
+		case CONFIG_17: return "CONFIG 17 (64QAM-PAS 14/16, ~6546 bps)";
 		default: return "UNKNOWN";
 	}
 }
@@ -765,6 +784,7 @@ inline const char* config_to_short_string(int config) {
 		case CONFIG_14: return "CFG 14 8PSK";
 		case CONFIG_15: return "CFG 15 16QAM";
 		case CONFIG_16: return "CFG 16 32QAM";
+		case CONFIG_17: return "CFG 17 64QAM";
 		default: return "???";
 	}
 }
