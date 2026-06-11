@@ -46,6 +46,80 @@ extern cbuf_handle_t playback_buffer;
 // Test mode: artificial TX carrier offset in Hz (for testing frequency sync)
 extern "C" double test_tx_carrier_offset;
 
+// ---------------------------------------------------------------------------
+// LIVE channel-gated nv-collapse demap-variance (bench-pinned CFG16 lever).
+// fact-documents/data-flow-noise_variance_estimate.md §9/§10.
+//
+// On clean WGN at the analog EVM ceiling, the estimator nv (noise_variance_estimate)
+// under-reports the true post-EQ per-symbol noise by ~6x vs mvar (measure_variance).
+// The LDPC LLRs scale by nv -> over-confident -> the ~1.6 dB-marginal CFG16 frames
+// non-converge (iter=101). On a flat channel mvar IS the real per-symbol noise, so
+// substituting it de-softens the LLRs correctly. On a DISPERSIVE channel mvar is
+// inflated by channel-estimation REPRESENTATION error (NOT real noise), so the same
+// substitution OVER-softens and BREAKS decode (the documented det-floor 7/7->0/7
+// misfire, data-flow-cfg17-shaped-64qam.md §7.1). The discriminator MUST be channel
+// state, not the ratio alone (clean ratio<=6.9, dispersive>8 -> no single K separates
+// them), so the gate is a CONSERVATIVE composite:
+//   channel_is_flat := (0 <= selectivity < SEL_FLAT) && (mvar <= R_MAX * nv)
+// and fires the substitution only when ALSO collapsed: nv < mvar / K_LIVE.
+//
+// Returns the demap variance to feed psk.demod. Default (env unset) = raw nv =
+// byte-identical to the pre-fix behavior. Env-gated MERCURY_LIVE_NVFIX (default 0).
+// Parameters are empirically anchored to 3501 bench-10 [FRAME-NV] frames
+// (mvar/nv min 0.98 / max 6.93 / mean 5.44, PHASE0_VERDICT a_nv_collapse).
+//
+// `selectivity` is cl_telecom_system::last_channel_selectivity (std|H|/mean|H| over
+// DATA cells, telecom_system.cc:2774-2802; -1 sentinel = no estimate = NOT flat).
+static double live_nvfix_demap_var(double nv, double mvar, double selectivity)
+{
+	double demap_var = nv;                       // default = today's behavior (raw nv)
+	const char* e = std::getenv("MERCURY_LIVE_NVFIX");
+	bool fix_on = (e && *e && atoi(e) != 0);
+	if(fix_on)
+	{
+		// Knobs overridable for the SFO-GRID K/R sweep; default to the §10 design.
+		const char* ek = std::getenv("MERCURY_LIVE_NVFIX_K");
+		const char* er = std::getenv("MERCURY_LIVE_NVFIX_RMAX");
+		const char* es = std::getenv("MERCURY_LIVE_NVFIX_SEL");
+		double K_LIVE  = (ek && *ek) ? atof(ek) : 4.0;    // lower collapse trigger (§10.3)
+		double R_MAX   = (er && *er) ? atof(er) : 7.5;    // upper dispersive-reject (§10.2)
+		double SEL_FLAT= (es && *es) ? atof(es) : 0.15;   // magnitude-flat boundary (:8338)
+		if(K_LIVE  <= 0.0) K_LIVE  = 4.0;
+		if(R_MAX   <= 0.0) R_MAX   = 7.5;
+		// channel_is_flat composite: magnitude-flat AND phase/representation-flat.
+		bool mag_flat   = (selectivity >= 0.0) && (selectivity < SEL_FLAT);
+		bool phase_flat = (nv > 0.0) && (mvar <= R_MAX * nv);   // ratio<=R_MAX upper bound
+		bool collapsed  = (nv > 0.0) && (nv < mvar / K_LIVE);   // worth de-softening
+		if(mag_flat && phase_flat && collapsed)
+			demap_var = mvar;                    // de-soften the over-confident LLRs
+	}
+	if(demap_var < 1e-9) demap_var = 1e-9;       // existing floor, unchanged (I1)
+	return demap_var;
+}
+
+// Channel selectivity std|H|/mean|H| over DATA cells of `est` (Ngrid x Nc grid),
+// the SAME definition as cl_telecom_system::last_channel_selectivity (:2820-2846).
+// Used by C2/C3 (bigblock paths) which do NOT update last_channel_selectivity (it is
+// set only in the standard receive path) -> a fresh local compute keeps the gate's
+// magnitude-flat check honest there. Returns -1 (NOT-flat sentinel) if undeterminable.
+static double live_nvfix_selectivity(const cl_ofdm& ofdm, int nsym)
+{
+	double s_sum = 0.0, s_sumsq = 0.0; int s_count = 0;
+	for(int i = 0; i < nsym; i++)
+		for(int j = 0; j < ofdm.Nc; j++)
+			if((ofdm.ofdm_frame + i*ofdm.Nc + j)->type == DATA)
+			{
+				double mag = std::abs(ofdm.estimated_channel[i*ofdm.Nc + j].value);
+				s_sum += mag; s_sumsq += mag*mag; s_count++;
+			}
+	if(s_count <= 1) return -1.0;
+	double s_mean = s_sum / s_count;
+	double s_var  = (s_sumsq / s_count) - (s_mean * s_mean);
+	if(s_var < 0.0) s_var = 0.0;
+	double s_std  = sqrt(s_var);
+	return (s_mean > 1e-12) ? (s_std / s_mean) : -1.0;
+}
+
 
 
 cl_telecom_system::cl_telecom_system()
@@ -2920,11 +2994,25 @@ skip_h_retry_point:
 				// by normalized |H_k|² → tells LDPC which bits to trust.
 				// CSI from DFT-smoothed estimated_channel gives per-subcarrier |H|²,
 				// normalized by mean to prevent LLR saturation.
-				variance = ofdm.noise_variance_estimate;
+				// C1 (standard live ARQ decode, the bench-10 held-CFG16 path):
+				// channel-gated nv-collapse fix. Default (MERCURY_LIVE_NVFIX unset) =
+				// raw nv = byte-identical. mvar(=measure_var, :2915) and the channel
+				// selectivity are already in scope, so no new producer call is needed.
+				// fact-documents/data-flow-noise_variance_estimate.md §9/§10.
+				variance = live_nvfix_demap_var(ofdm.noise_variance_estimate,
+				                                measure_var, last_channel_selectivity);
+				// Original [FRAME-NV] line preserved verbatim (byte-identical stdout when
+				// the fix is OFF — the bench-10 parser reads this format). The fix's effect
+				// on the demap scalar is reported on a SEPARATE gated line below.
 				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f Nsymb=%d amprest=%d\n",
 					receive_stats.sync_trials, current_configuration,
 					ofdm.noise_variance_estimate, measure_var, ofdm.Nsymb,
 					ofdm.channel_estimator_amplitude_restoration);
+				if(variance != ofdm.noise_variance_estimate)
+					printf("[LIVE-NVFIX] C1 trial=%d cfg=%d nv=%.6e mvar=%.4f sel=%.4f demap_var=%.6e (fired)\n",
+						receive_stats.sync_trials, current_configuration,
+						ofdm.noise_variance_estimate, measure_var,
+						last_channel_selectivity, variance);
 				fflush(stdout);
 
 				if(csi_llr_enabled) {
@@ -7194,6 +7282,23 @@ void cl_telecom_system::sfo_grid_test()
 		std::vector<float> clr(nBits);
 		double cvar = ofdm.noise_variance_estimate;   // the estimator's nv (NOT measure_variance)
 		if(nvfix && cvar < variance / NV_COLLAPSE_RATIO_K) cvar = variance;   // ratio-gate (a0e22c8)
+		// LIVE channel-gated nv-collapse fix path (MERCURY_LIVE_NVFIX): route the SAME
+		// production gate the live C1/C2/C3 sites call, so the failing-first test drives
+		// the REAL gate logic in-process (NV_FORCE injects the collapse; CHAN=0 flat must
+		// recover, CHAN=1 det-floor must stay decoding = misfire guard). `variance`
+		// (=measure_variance(rx), :7102) is mvar; selectivity is computed from the same
+		// estimated_channel grid. Default unset -> no effect (cvar untouched). When the
+		// live env IS set it OVERRIDES the harness K=8 lever above for an apples-to-apples
+		// live A/B. fact-documents/data-flow-noise_variance_estimate.md §9/§10.
+		if(env_i("MERCURY_LIVE_NVFIX", 0) != 0)
+		{
+			double sel = live_nvfix_selectivity(ofdm, Ngrid);
+			double nv_in = ofdm.noise_variance_estimate;
+			cvar = live_nvfix_demap_var(nv_in, variance, sel);
+			std::cout << "[LIVE-NVFIX-DIAG] nv=" << nv_in << " mvar=" << variance
+			          << " ratio=" << (nv_in>0?variance/nv_in:-1.0) << " sel=" << sel
+			          << " demap_var=" << cvar << " fired=" << (cvar!=nv_in?1:0) << std::endl;
+		}
 		if(cvar < 1e-9) cvar = 1e-9;
 		if(pas_on) psk.demod_pas(deframed.data(), nBits, clr.data(), (float)cvar, pas_log_prior);
 		else       psk.demod    (deframed.data(), nBits, clr.data(), (float)cvar);
@@ -8522,8 +8627,15 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 	}
 
 	// --- LLR + CSI weighting + LDPC per codeword ---
+	// C2 (bigblock_rx_passband, default-off bigblock path): channel-gated nv-collapse
+	// fix. Default (MERCURY_LIVE_NVFIX unset) = raw nv = byte-identical. Unlike C1 this
+	// path does NOT update last_channel_selectivity (set only in the standard receive
+	// path), so compute mvar (post-EQ measure_variance of the equalized grid `eq`) and
+	// selectivity LOCALLY for valid gate inputs. fact-doc §9/§10.
 	std::vector<float> clr(nBits);
-	double cvar = ofdm.noise_variance_estimate; if(cvar<1e-9) cvar=1e-9;
+	double c2_mvar = ofdm.measure_variance(eq.data());
+	double c2_sel  = live_nvfix_selectivity(ofdm, Ngrid);
+	double cvar = live_nvfix_demap_var(ofdm.noise_variance_estimate, c2_mvar, c2_sel);
 	psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
 	{
 		double mean_w=0.0; for(int d=0;d<nData;d++) mean_w+=csi_data[d];
@@ -9070,8 +9182,13 @@ int cl_telecom_system::bigblock_decode_from_wav(const char* wav_path)
 	}
 
 	// --- LLR + CSI weighting + LDPC per codeword (mirrors sfo_grid_test coded) ---
+	// C3 (bigblock_decode_from_wav, the WAV-decode mirror of C2): channel-gated
+	// nv-collapse fix. Default (MERCURY_LIVE_NVFIX unset) = raw nv = byte-identical.
+	// mvar + selectivity computed locally (same reason as C2). fact-doc §9/§10.
 	std::vector<float> clr(nBits);
-	double cvar = ofdm.noise_variance_estimate; if(cvar<1e-9) cvar=1e-9;
+	double c3_mvar = ofdm.measure_variance(eq.data());
+	double c3_sel  = live_nvfix_selectivity(ofdm, Ngrid);
+	double cvar = live_nvfix_demap_var(ofdm.noise_variance_estimate, c3_mvar, c3_sel);
 	psk.demod(deframed.data(), nBits, clr.data(), (float)cvar);
 	{
 		double mean_w=0.0; for(int d=0;d<nData;d++) mean_w+=csi_data[d];
