@@ -88,7 +88,12 @@ public:
 	      \param encoded_data is the corrected data without the LDPC parity bits.
 	      \return number of iterations used to decode the message, the message maybe corrupt if this reaches the max number of iterations allowed.
 	   */
-	int decode(const float* data,  int*  decoded_data);
+	//! Turbo-EQ (RESEARCH_turbo-eq.md §4.2): optional trailing app_llr. When
+	//! non-null AND the active decoder is SPA, receives the a-posteriori LLR for
+	//! all N coded bits (the keystone for decision-directed channel re-estimation).
+	//! Default null = byte-identical for every existing caller. GBF leaves it
+	//! untouched (no soft output).
+	int decode(const float* data,  int*  decoded_data, double* app_llr = nullptr);
 
 	// Abort flag for parallel monitor decode: when another decoder succeeds,
 	// set this to true so remaining decoders exit their LDPC iteration loop early.

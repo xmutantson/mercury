@@ -26,6 +26,7 @@
 
 
 void interleaver(int* in, int* out, int nItems, int block_size);
+void interleaver(float* in, float* out, int nItems, int block_size);   // Turbo-EQ (§4.3)
 void interleaver(std::complex<double>* in, std::complex<double>* out, int nItems, int block_size);
 void deinterleaver(int* in, int* out, int nItems, int block_size);
 void deinterleaver(float* in, float* out, int nItems, int block_size);

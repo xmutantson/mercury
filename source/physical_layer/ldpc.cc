@@ -278,16 +278,19 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
   }
 
 
- int cl_ldpc::decode(const float* data,  int*  decoded_data)
+ int cl_ldpc::decode(const float* data,  int*  decoded_data, double* app_llr)
  {
 	 int iterations_done=0;
  	if(decoding_algorithm_val==GBF)
  	{
+ 		// GBF has no soft output. The turbo loop (RESEARCH_turbo-eq.md §4.2 R2)
+ 		// forces SPA when MERCURY_TURBO_ITERS>1; if a config is GBF-only the loop
+ 		// no-ops to iteration 0 (app_llr left untouched → caller treats as no soft).
  		iterations_done=decode_GBF(data,decoded_data,QCmatrixC,Cwidth,Cwidth,N,K,P,nIteration_max_val,eta_val);
  	}
  	else if(decoding_algorithm_val==SPA)
  	{
- 		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort);
+ 		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort,app_llr);
  	}
  	return iterations_done;
  }

@@ -774,6 +774,12 @@ public:
 	struct st_channel_complex *pre_equalization_channel;
 	void get_pre_equalization_channel();
 
+	// Turbo-EQ (RESEARCH_turbo-eq.md §4.2): persistent per-frame buffer that
+	// receives the LDPC a-posteriori LLR (N coded bits) from ldpc.decode when the
+	// iterative decision-directed CE loop is enabled (MERCURY_TURBO_ITERS>1). Empty
+	// + unused when turbo is OFF (default) ⇒ zero allocation, byte-identical path.
+	std::vector<double> turbo_app_llr;
+
 	cl_configuration_telecom_system default_configurations_telecom_system;
 
 	int outer_code;

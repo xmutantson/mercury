@@ -3001,9 +3001,115 @@ skip_h_retry_point:
 			}
 
 			auto t4_ldpc = std::chrono::steady_clock::now();
-			receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit);
+			// Turbo-EQ (RESEARCH_turbo-eq.md §4.1/§4.2). MERCURY_TURBO_ITERS (default 1
+			// = OFF, byte-identical) caps the iterative decision-directed CE loop. When
+			// >1 AND this is an OFDM (non-MFSK) frame, capture the LDPC a-posteriori LLR
+			// so the post-decode turbo refinement (the CRC-fail block below) can soft-
+			// re-modulate the codeword into virtual pilots and re-estimate the channel.
+			// app_llr is nullptr when OFF => ldpc.decode is byte-identical for every
+			// existing caller. SPA-only (GBF leaves it untouched => loop no-ops, safe).
+			static int turbo_iters_env = -2;
+			static double turbo_damp_prod = 0.7;
+			static double turbo_conf_prod = 0.30;
+			if(turbo_iters_env == -2)
+			{
+				const char* te = std::getenv("MERCURY_TURBO_ITERS");
+				turbo_iters_env = (te && *te) ? atoi(te) : 1;
+				if(turbo_iters_env < 1) turbo_iters_env = 1;
+				const char* td = std::getenv("MERCURY_TURBO_DAMP");
+				if(td && *td){ turbo_damp_prod = atof(td); if(turbo_damp_prod<0.0) turbo_damp_prod=0.0; if(turbo_damp_prod>1.0) turbo_damp_prod=1.0; }
+				const char* tc = std::getenv("MERCURY_TURBO_DATA_CONF");
+				if(tc && *tc) turbo_conf_prod = atof(tc);
+			}
+			bool turbo_on = (turbo_iters_env > 1) && (M != MOD_MFSK);
+			if(turbo_on) ofdm.dd_data_conf_thresh = turbo_conf_prod;
+			double* turbo_app_ptr = nullptr;
+			if(turbo_on)
+			{
+				if((int)turbo_app_llr.size() < ldpc.N) turbo_app_llr.assign(ldpc.N, 0.0);
+				turbo_app_ptr = turbo_app_llr.data();
+			}
+			receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit,turbo_app_ptr);
 			auto t5_ldpc = std::chrono::steady_clock::now();
 			timing_ldpc_ms += std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
+
+			// ---- TURBO-EQ production refinement (RESEARCH_turbo-eq.md §4) ----------
+			// SIM-FIRST BOUNDARY: the MECHANISM (data-aided CE breaks the Dy=3 pilot
+			// Nyquist wall + tightens 32-QAM EVM) is PROVEN on the SFO-GRID harness
+			// (det-floor cell: post-FEC BER 0.50 LS -> 0.12 turbo -> 0 genie; see
+			// tools/test_turbo_eq.py). This production wiring runs the SAME loop on the
+			// live RX grid, but the 2-process ARQ climb does NOT run on Linux/fleet
+			// (CONNECT gap) so it is HW-CONFIRM-PENDING. Monotone-safe by construction
+			// (best-of publish) + default-OFF byte-identical (turbo_on=false).
+			if(turbo_on && ldpc.N == (int)turbo_app_llr.size() && receive_stats.iterations_done > 0)
+			{
+				// frame_crc: CRC16 of the post-dispersal hard bits (mirror of the gate :3053).
+				auto frame_crc = [&](const int* bits_post_disp)->int{
+					bit_to_byte((int*)bits_post_disp, data_container.hd_decoded_data_byte, nReal_data);
+					bool allz=true; for(int i=0;i<nReal_data/8;i++) if(data_container.hd_decoded_data_byte[i]!=0){allz=false;break;}
+					if(allz) return -1;
+					if(outer_code==CRC16_MODBUS_RTU) return (int)CRC16_MODBUS_RTU_calc(data_container.hd_decoded_data_byte, nReal_data/8);
+					return 0;
+				};
+				std::vector<int> best_bits(data_container.hd_decoded_data_bit, data_container.hd_decoded_data_bit + nReal_data);
+				int it0_disp[N_MAX];
+				bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, it0_disp, nReal_data);
+				int best_crc = frame_crc(it0_disp);
+				int best_iter = 0;
+				int unsat_prev = receive_stats.iterations_done;   // BP iters = §6.5 monotone surrogate
+				for(int it=1; it < turbo_iters_env && best_crc != 0; ++it)
+				{
+					// 1) extrinsic L_ext = app - L_ch (clip ±40, damp), in decoder bit order.
+					std::vector<float> lext(data_container.nBits);
+					double damp = turbo_damp_prod;
+					for(int i=0;i<data_container.nBits;i++)
+					{
+						double e = turbo_app_llr[i] - (double)data_container.deinterleaved_data[i];
+						if(e> 40.0) e= 40.0; else if(e<-40.0) e=-40.0;
+						lext[i]=(float)(damp*e);
+					}
+					// 2) bit-interleave extrinsic -> psk.demod bit order; soft_remod -> symbols
+					//    in time/freq-DEINTERLEAVED order; time/freq-interleave -> data-carrier order.
+					std::vector<float> demod_order(data_container.nBits);
+					interleaver(lext.data(), demod_order.data(), data_container.nBits, bit_interleaver_block_size);
+					std::vector<std::complex<double>> xbar_d(data_container.nData), xbar_g(data_container.nData);
+					std::vector<double> v_d(data_container.nData), v_g(data_container.nData);
+					psk.soft_remod(demod_order.data(), data_container.nBits, xbar_d.data(), v_d.data());
+					interleaver(xbar_d.data(), xbar_g.data(), data_container.nData, time_freq_interleaver_block_size);
+					{ std::vector<std::complex<double>> vin(data_container.nData), vout(data_container.nData);
+					  for(int i=0;i<data_container.nData;i++) vin[i]=std::complex<double>(v_d[i],0.0);
+					  interleaver(vin.data(), vout.data(), data_container.nData, time_freq_interleaver_block_size);
+					  for(int i=0;i<data_container.nData;i++) v_g[i]=vout[i].real(); }
+					// 3) data-aided channel re-estimate over the live grid; re-eq -> re-demap -> re-decode.
+					ofdm.data_aided_channel_estimator(data_container.ofdm_symbol_demodulated_data, xbar_g.data(), v_g.data());
+					ofdm.channel_equalizer(data_container.ofdm_symbol_demodulated_data, data_container.equalized_data);
+					double tvar = ofdm.noise_variance_estimate;
+					ofdm.deframer(data_container.equalized_data, data_container.ofdm_deframed_data);
+					deinterleaver(data_container.ofdm_deframed_data, data_container.ofdm_time_freq_deinterleaved_data, data_container.nData, time_freq_interleaver_block_size);
+					psk.demod(data_container.ofdm_time_freq_deinterleaved_data, data_container.nBits, data_container.demodulated_data, (float)tvar);
+					deinterleaver(data_container.demodulated_data, data_container.deinterleaved_data, data_container.nBits, bit_interleaver_block_size);
+					for(int i=ldpc.P-1;i>=0;i--) data_container.deinterleaved_data[i+nReal_data+nVirtual_data]=data_container.deinterleaved_data[i+nReal_data];
+					for(int i=0;i<nVirtual_data;i++) data_container.deinterleaved_data[nReal_data+i]=data_container.deinterleaved_data[i];
+					int it_iters = ldpc.decode(data_container.deinterleaved_data, data_container.hd_decoded_data_bit, turbo_app_ptr);
+					// 4) score CRC; keep best (monotone-or-revert §6.5). Never worse than it=0.
+					int it_disp[N_MAX];
+					bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, it_disp, nReal_data);
+					int it_crc = frame_crc(it_disp);
+					bool improved = (it_crc==0) || (it_iters < unsat_prev);
+					if(it_crc==0 || (best_crc!=0 && improved))
+					{ for(int i=0;i<nReal_data;i++) best_bits[i]=data_container.hd_decoded_data_bit[i]; best_crc=it_crc; best_iter=it; }
+					if(!improved) break;
+					unsat_prev = it_iters;
+				}
+				// Publish the BEST iteration's hard bits (monotone-safe; never worse than it=0).
+				for(int i=0;i<nReal_data;i++) data_container.hd_decoded_data_bit[i]=best_bits[i];
+				receive_stats.iterations_done = best_iter;
+				if(best_iter>0)
+				{
+					printf("[TURBO] cfg=%d best_iter=%d crc=0x%04X (data-aided CE refined the frame)\n", current_configuration, best_iter, best_crc & 0xFFFF);
+					fflush(stdout);
+				}
+			}
 
 			bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, data_container.hd_decoded_data_bit, nReal_data);
 
@@ -6226,6 +6332,14 @@ void cl_telecom_system::sfo_grid_test()
 	double ppm     = env_f("MERCURY_SIM2_SFO_PPM", 0.0);
 	bool   track   = (env_i("MERCURY_SFO_GRID_TRACK", 0) != 0);     // STEP 2: CPE/PEG corrector
 	bool   no_interp = (env_i("MERCURY_SFO_GRID_NOINTERP", 0) != 0);// negative control
+	// TURBO_EQ_VERDICT.md §5 TINTERP-SEED: MERCURY_SFO_GRID_TURBO_SEED=tinterp drives
+	// the WHOLE recommended stack — it=0 INIT estimate = TINTERP (the warm faded seed)
+	// AND data_aided_channel_estimator keeps that TINTERP H as the low-confidence FLOOR
+	// (ofdm.dd_seed_floor) instead of a cold pilots-only interpolation. Default unset =
+	// byte-identical (plain LS it=0 + pilots-only floor).
+	bool turbo_seed_tinterp = false;
+	{ const char* e = std::getenv("MERCURY_SFO_GRID_TURBO_SEED");
+	  if(e && (std::string(e)=="tinterp" || std::string(e)=="TINTERP")) turbo_seed_tinterp = true; }
 	int    win      = env_i("MERCURY_SFO_GRID_TRACK_WIN", 9);       // CPE/PEG sliding window
 	uint64_t seed   = (uint64_t)env_i("MERCURY_SFO_GRID_SEED", 12345);
 
@@ -6699,8 +6813,13 @@ void cl_telecom_system::sfo_grid_test()
 		for(int ci=0; ci<Ngrid*Nc; ci++){ (ofdm.estimated_channel+ci)->value = std::complex<double>(1.0,0.0);
 			(ofdm.estimated_channel+ci)->status = MEASURED; }
 	}
-	else if(thin && env_i("MERCURY_SFO_GRID_GENIE", 0))
+	else if(env_i("MERCURY_SFO_GRID_GENIE", 0))
 	{
+		// Turbo-EQ (RESEARCH_turbo-eq.md §7): the `thin &&` guard is dropped so GENIE is
+		// also reachable on the DENSE Dx=1/Dy=3 production lattice — the compass the turbo
+		// lever chases (GENIE decodes the POOR/1 Hz Watterson where LS fails the Dy=3
+		// Nyquist wall). The genie H is lattice-independent (true H at every cell), so this
+		// is additive: the prior thin&&GENIE behavior is unchanged.
 		// GENIE estimate: hand the equalizer the EXACT channel (Tchan[j] × the SFO ramp
 		// at symbol n, if the tracker is OFF). Isolates the LDPC/SNR decodability limit on
 		// the selective channel from the estimator quality — if genie still FAILS to decode
@@ -6764,10 +6883,12 @@ void cl_telecom_system::sfo_grid_test()
 		ofdm.noise_variance_estimate = (npil>0) ? (nsum/(double)npil) : 0.01;
 		if(ofdm.noise_variance_estimate < 1e-6) ofdm.noise_variance_estimate = 1e-6;
 	}
-	else if(env_i("MERCURY_SFO_GRID_TINTERP_PROD", 0) != 0)
+	else if(env_i("MERCURY_SFO_GRID_TINTERP_PROD", 0) != 0 || turbo_seed_tinterp)
 	{
 		// feat/fade-tinterp REGRESSION HOOK: drive the PRODUCTION TIME_INTERP
 		// estimator (ofdm.cc LS_channel_estimator_tinterp) on the dense Dx=1/Dy=3
+		// (turbo_seed_tinterp also lands here so MERCURY_SFO_GRID_TURBO_SEED=tinterp
+		//  seeds it=0 with the warm faded TINTERP estimate per the §5 recommended stack)
 		// prod lattice — the exact promoted code, including the production cross-
 		// pilot AWGN nv-floor (NOT the harness prototype's known-EsN0 floor). This is
 		// the failing-first regression: on the GOOD (MPG/0.1 Hz) Watterson cell the
@@ -6919,28 +7040,131 @@ void cl_telecom_system::sfo_grid_test()
 			}
 		}
 
+		// ---- TURBO-EQ harness loop (RESEARCH_turbo-eq.md §7) -------------------
+		// MERCURY_SFO_GRID_TURBO_ITERS (default 1 = OFF, byte-identical to the
+		// single-pass coded decode below). When >1: after decoding all Kcw
+		// codewords, capture each codeword's a-posteriori LLR (the keystone),
+		// re-encode (re-mod), soft_remod to per-data-symbol (x̄,v) virtual pilots,
+		// re-estimate the channel data-aided, re-equalize, re-demap, re-decode.
+		// Score per iteration; the error-prop guards (§6) keep it monotone-safe.
+		int turbo_iters = env_i("MERCURY_SFO_GRID_TURBO_ITERS", 1);
+		if(turbo_iters < 1) turbo_iters = 1;
+		double turbo_damp = env_f("MERCURY_SFO_GRID_TURBO_DAMP", 0.7);
+		if(turbo_damp < 0.0) turbo_damp = 0.0;
+		if(turbo_damp > 1.0) turbo_damp = 1.0;
+		double turbo_data_conf = env_f("MERCURY_SFO_GRID_TURBO_DATA_CONF", 0.30);
+		ofdm.dd_data_conf_thresh = turbo_data_conf;
+		// TURBO_EQ_VERDICT.md §5: keep the it=0 (TINTERP) seed H as the low-confidence
+		// floor inside data_aided_channel_estimator. Default false (pilots-only floor,
+		// byte-identical); MERCURY_SFO_GRID_TURBO_SEED=tinterp turns it on.
+		ofdm.dd_seed_floor = turbo_seed_tinterp;
+
 		int    cw_ok = 0, cw_crcfail = 0;
 		long   cw_infoerr = 0, cw_infobits = 0;
 		long   iter_sum = 0; int iter_min = 1<<30, iter_max = -1;
 		std::vector<float> cwllr(ldpc.N);
 		std::vector<int>   dec(ldpc.N);
-		for(int c=0;c<Kcw;c++)
+
+		// Per-codeword a-posteriori LLR (all N coded bits), captured for the turbo
+		// feedback; and the channel-LLR (clr) the decode consumed, for extrinsic.
+		std::vector<double> app(Kcw>0 ? (size_t)Kcw*ldpc.N : 0);
+		std::vector<int>    dec_all(Kcw>0 ? (size_t)Kcw*ldpc.K : 0);
+		std::vector<double> lext_prev(Kcw>0 ? (size_t)Kcw*ldpc.N : 0, 0.0); // damping state
+
+		// Best-so-far (monotone-or-revert §6.5): keep the iteration with the most
+		// decoded codewords; never publish a WORSE result than iteration 0.
+		int    best_ok = -1; long best_infoerr = 0; double best_ber = 1.0;
+		int    best_it = 0;
+
+		for(int it=0; it<turbo_iters; ++it)
 		{
-			for(int i=0;i<ldpc.N;i++) cwllr[i] = clr[(size_t)c*ldpc.N + i];
-			int iters = ldpc.decode(cwllr.data(), dec.data());
-			iter_sum += iters;
-			if(iters < iter_min) iter_min = iters;
-			if(iters > iter_max) iter_max = iters;
-			// Info-bit errors of THIS codeword (dec[0..K-1] vs the TX info bits).
-			int ierr=0;
-			for(int i=0;i<ldpc.K;i++) if(dec[i] != cw_info[c][i]) ierr++;
-			cw_infoerr  += ierr;
-			cw_infobits += ldpc.K;
-			// "decoded" = converged before the iter cap AND info matches (the harness
-			// has no CRC; exact info recovery is the strict success criterion).
-			bool capped = (iters > (ldpc.nIteration_max - 1));
-			if(ierr == 0 && !capped) cw_ok++; else cw_crcfail++;
+			int    it_ok = 0, it_crcfail = 0;
+			long   it_infoerr = 0, it_infobits = 0;
+			iter_sum = 0; iter_min = 1<<30; iter_max = -1;
+			for(int c=0;c<Kcw;c++)
+			{
+				for(int i=0;i<ldpc.N;i++) cwllr[i] = clr[(size_t)c*ldpc.N + i];
+				// Capture app_llr only when we will use it (it<last iteration).
+				double* app_ptr = (turbo_iters>1 && it<turbo_iters-1) ? &app[(size_t)c*ldpc.N] : nullptr;
+				int iters = ldpc.decode(cwllr.data(), dec.data(), app_ptr);
+				iter_sum += iters;
+				if(iters < iter_min) iter_min = iters;
+				if(iters > iter_max) iter_max = iters;
+				int ierr=0;
+				for(int i=0;i<ldpc.K;i++){ if(dec[i] != cw_info[c][i]) ierr++; if(Kcw>0) dec_all[(size_t)c*ldpc.K+i]=dec[i]; }
+				it_infoerr  += ierr;
+				it_infobits += ldpc.K;
+				bool capped = (iters > (ldpc.nIteration_max - 1));
+				if(ierr == 0 && !capped) it_ok++; else it_crcfail++;
+			}
+			double it_ber = it_infobits ? (double)it_infoerr/(double)it_infobits : 1.0;
+
+			// iteration 0 result is the single-pass baseline (also the default-OFF path).
+			if(it==0){ cw_ok=it_ok; cw_crcfail=it_crcfail; cw_infoerr=it_infoerr; cw_infobits=it_infobits; }
+
+			// Track best (monotone-safe publish): prefer more decoded codewords, then
+			// fewer info errors. Guarantees turbo never reports worse than iteration 0.
+			if(it_ok > best_ok || (it_ok==best_ok && it_infoerr < best_infoerr))
+			{ best_ok=it_ok; best_infoerr=it_infoerr; best_ber=it_ber; best_it=it; }
+
+			if(turbo_iters>1)
+				std::cout << "[SFO-GRID-TURBO]   it=" << it << " codewords_decoded=" << it_ok
+				          << "/" << Kcw << " post_FEC_info_BER=" << it_ber
+				          << " nv=" << ofdm.noise_variance_estimate << std::endl;
+
+			// Early exit: all codewords decoded (the CRC-equivalent success gate).
+			if(it_ok==Kcw) break;
+			// Last iteration: no feedback to compute.
+			if(it>=turbo_iters-1) break;
+
+			// ---- FEEDBACK (§3/§6): re-mod → soft_remod → data-aided re-estimate ----
+			// Build per-bit a-priori LLR for the next demod from the decoder extrinsic.
+			// L_ext = app − L_ch (the decoder's NEW info), clip ±40, damp λ.
+			std::vector<float> fb_bits(nBits, 0.0f);   // a-priori LLRs in clr/deframed order
+			for(int c=0;c<Kcw;c++)
+			{
+				for(int i=0;i<ldpc.N;i++)
+				{
+					size_t gi = (size_t)c*ldpc.N + i;
+					double lext = app[gi] - (double)clr[gi];
+					if(lext >  40.0) lext =  40.0; else if(lext < -40.0) lext = -40.0;
+					lext = turbo_damp*lext + (1.0-turbo_damp)*lext_prev[gi];
+					lext_prev[gi] = lext;
+					if(gi < (size_t)nBits) fb_bits[gi] = (float)lext;
+				}
+			}
+			// soft_remod the a-priori LLRs → per-data-symbol (x̄,v). The harness has NO
+			// bit-interleaver (tx_bits are codewords mod'd directly, :6398-6410), so the
+			// LLR order IS the data-symbol order — no de-interleave needed.
+			std::vector<std::complex<double>> xbar(nData);
+			std::vector<double> vsoft(nData);
+			psk.soft_remod(fb_bits.data(), nBits, xbar.data(), vsoft.data());
+
+			// Data-aided channel re-estimate over the dense lattice, then re-eq/demap.
+			ofdm.data_aided_channel_estimator(rx.data(), xbar.data(), vsoft.data());
+			// refresh CSI weights from the refined H
+			{ int di=0; for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+				if((ofdm.ofdm_frame+n*Nc+j)->type==DATA){ std::complex<double> H=(ofdm.estimated_channel+n*Nc+j)->value;
+					if(di<nData) csi_data[di]=H.real()*H.real()+H.imag()*H.imag(); di++; } }
+			ofdm.channel_equalizer(rx.data(), eq.data());
+			ofdm.deframer(eq.data(), deframed.data());
+			double cvar2 = ofdm.noise_variance_estimate; if(cvar2 < 1e-9) cvar2 = 1e-9;
+			psk.demod(deframed.data(), nBits, clr.data(), (float)cvar2);
+			if(csi)
+			{
+				double mean_w=0.0; for(int d=0;d<nData;d++) mean_w+=csi_data[d];
+				mean_w = (nData>0)?mean_w/(double)nData:1.0; if(mean_w<1e-9) mean_w=1.0;
+				for(int d=0;d<nData;d++){ double w=csi_data[d]/mean_w;
+					for(int b=0;b<log2M;b++){ size_t bi=(size_t)d*log2M+b; if(bi>=(size_t)nBits) break;
+						float vv=clr[bi]*(float)w; if(vv>40.0f)vv=40.0f; else if(vv<-40.0f)vv=-40.0f; clr[bi]=vv; } }
+			}
 		}
+
+		// Publish the BEST iteration (monotone-or-revert §6.5): turbo never reports a
+		// worse result than the single-pass iteration 0.
+		if(turbo_iters>1 && best_ok >= 0)
+		{ cw_ok=best_ok; cw_infoerr=best_infoerr; cw_crcfail=Kcw-best_ok; cw_infobits=(long)Kcw*ldpc.K; }
+
 		double cw_ber = cw_infobits ? (double)cw_infoerr/(double)cw_infobits : 1.0;
 		std::cout << "[SFO-GRID-CODED] ===== CODED RESULT (K=" << Kcw
 		          << " x " << ldpc.N << "-bit rate-" << ldpc.rate << " codewords) =====" << std::endl;
@@ -6949,6 +7173,11 @@ void cl_telecom_system::sfo_grid_test()
 		          << "  iter_mean=" << (Kcw? (double)iter_sum/(double)Kcw : 0.0)
 		          << " iter_min=" << (iter_max<0?0:iter_min) << " iter_max=" << (iter_max<0?0:iter_max)
 		          << "  iter_cap=" << ldpc.nIteration_max << std::endl;
+		// Turbo summary on a SEPARATE line so the base [SFO-GRID-CODED] lines stay
+		// byte-identical when turbo is OFF (default).
+		if(turbo_iters>1)
+			std::cout << "[SFO-GRID-CODED]   turbo_iters=" << turbo_iters
+			          << "  best_it=" << best_it << std::endl;
 		std::cout << "[SFO-GRID-CODED]   codewords_decoded=" << cw_ok << "/" << Kcw
 		          << "  fail=" << cw_crcfail
 		          << "  post_FEC_info_BER=" << cw_ber << std::endl;

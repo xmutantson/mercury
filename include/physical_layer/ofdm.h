@@ -148,6 +148,16 @@ public:
 	// (the E1/cfg16-nvfix collapse class — see fade-estimator-prototypes.md §4.1).
 	// Mostofi & Cox 2005, IEEE Trans. Wireless (Xplore 1247797); FreeDV-700D.
 	void LS_channel_estimator_tinterp(std::complex <double>*in);
+	// Turbo-EQ DATA-AIDED (decision-directed) channel estimator (RESEARCH_turbo-eq.md
+	// §4.4). Writes estimated_channel for pilots (rx/X) AND reliable data cells
+	// (rx·conj(x̄)/(|x̄|²+v)) from the soft re-modulated decoded codeword, then
+	// interpolates/smooths/re-estimates nv. The decoded data lives at EVERY symbol,
+	// so the channel is sampled every symbol — this breaks the Dy=3 pilot Nyquist
+	// wall that stops LS/TINTERP on the POOR/1 Hz fade. nv floored at the cross-pilot
+	// AWGN estimate + 1e-6 (I1, the HW-only nv-collapse guard is preserved).
+	//   xbar/v : soft symbol mean/variance in DEFRAMED DATA-cell raster order, len nData.
+	void data_aided_channel_estimator(std::complex<double>* in,
+	                                  std::complex<double>* xbar, double* v);
 	// A.1.4: cross-pilot differential noise variance estimator.
 	// Replaces pilot-residual estimator (which collapsed to 0 for ZF post-E1
 	// commit 38f5c60, biased low by (N-1)/N for LS). For adjacent pilot pairs
@@ -307,6 +317,27 @@ public:
 	// raw pilot LS series before linear time-interpolation. Read only when
 	// channel_estimator == TIME_INTERP, so default has zero production effect.
 	int tinterp_smooth_halfwin;
+
+	// Turbo-EQ (RESEARCH_turbo-eq.md §4.4/§6.4): IMPROVE-ONLY confidence threshold
+	// on the soft-symbol variance v. A decoded data cell is used as a virtual-pilot
+	// anchor in data_aided_channel_estimator ONLY when v < this threshold (a
+	// reasonably converged symbol); uncertain cells are interpolated from pilots +
+	// reliable neighbors (keeps the pilots-only estimate as the floor → no harm).
+	// Default 0.30. Env MERCURY_TURBO_DATA_CONF. Read only inside the turbo loop, so
+	// default has zero production effect.
+	double dd_data_conf_thresh;
+
+	// Turbo-EQ TINTERP-SEED (TURBO_EQ_VERDICT.md §5 recommended-stack item 2): when
+	// true, data_aided_channel_estimator keeps the INCOMING estimated_channel H (the
+	// it=0 seed — TINTERP on the FADE tier) as the FLOOR for low-confidence DATA
+	// cells, instead of marking them UNKNOWN and re-interpolating from pilots-only.
+	// On the POOR/1 Hz Watterson fade the pilots-only fallback IS the cold-LS estimate
+	// that fails the Dy=3 Nyquist wall (so the it=1 refiner REGRESSES a 5/6 TINTERP
+	// seed back to 0/6); falling back to the TINTERP floor instead keeps the warm seed
+	// while confident data cells anchor the dense lattice on top of it. Default FALSE
+	// (false ⇒ the prior pilots-only-floor behavior, byte-identical). Read only inside
+	// the turbo loop, so default has zero production effect.
+	bool dd_seed_floor;
 
 	// Pre-allocated buffers for passband_to_baseband (avoids new/delete per call)
 	std::complex<double>* p2b_l_data;

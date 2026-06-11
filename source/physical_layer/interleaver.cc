@@ -57,6 +57,27 @@ void interleaver(std::complex<double>* in, std::complex<double>* out, int nItems
 	}
 }
 
+// Turbo-EQ (RESEARCH_turbo-eq.md §4.3): float overload of interleaver, mirror of
+// the int/complex versions. Used to re-interleave the decoder extrinsic LLRs back
+// to psk.demod bit order before soft re-modulation. Identical permutation as the
+// int interleaver, so a demod->deinterleave->interleave round-trip is the identity.
+void interleaver(float* in, float* out, int nItems, int block_size)
+{
+	int nBlocks=nItems/block_size;
+
+	for(int i=0;i<nBlocks;i++)
+	{
+		for(int j=0;j<block_size;j++)
+		{
+			out[j*nBlocks+i]=in[i*block_size+j];
+		}
+	}
+	for(int i=nBlocks*block_size;i<nItems;i++)
+	{
+		out[i]=in[i];
+	}
+}
+
 void deinterleaver(int* in, int* out, int nItems, int block_size)
 {
 	int nBlocks=nItems/block_size;
