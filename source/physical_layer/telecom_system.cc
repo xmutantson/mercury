@@ -6663,6 +6663,46 @@ void cl_telecom_system::sfo_grid_test()
 	std::vector<std::complex<double>> grid((size_t)Ngrid*Nc);
 	ofdm.framer(tx_syms.data(), grid.data());   // data + pilots placed by lattice
 
+	// --- P1-A CLIPPING LEVER: optional TIME-DOMAIN clip so the PAPR hard-clip actually
+	// RUNS on this grid. (data-flow-papr-cut.md §6.) The freq-domain harness below NEVER
+	// builds a time-domain signal, so the clip — a time-domain nonlinearity — is otherwise
+	// INERT and a data_papr_cut sweep would be a NULL result. MERCURY_SFO_GRID_PBLOOP=1
+	// turns this on (default 0 = OFF = byte-identical: the grid is untouched).
+	//
+	// MODEL: the COMPLEX BASEBAND ENVELOPE clip — the exact model of the cited prior art
+	// (Kim & Stüber, "Iterative estimation and cancellation of clipping noise for OFDM",
+	// IEEE Comms Lett. 2002, IEEEXplore 1214054; the P1-A motivation in
+	// _research/DEEPLEVER_COMPLETENESS.md lever #1). For each OFDM symbol the Nc subcarriers
+	// are IFFT'd to the time-domain composite (symbol_mod), the composite's complex
+	// magnitude is hard-clipped at ofdm.data_papr_cut via the existing peak_clip(complex)
+	// overload (ofdm.cc:2490), and the clipped composite is FFT'd back (symbol_demod) into
+	// `grid`. The clip's in-band distortion now lives in the grid and flows through the
+	// existing channel/AWGN/estimate/decode/BER path. This isolates the clip nonlinearity
+	// with ZERO resampler/FIR alignment artifact: at data_papr_cut=99 (no clip) the
+	// symbol_mod/symbol_demod pair is an exact identity (verified: no-clip => BER unchanged
+	// from PBLOOP-off), so the clip-OFF control is measured through the SAME loopback as
+	// every clip depth (apples-to-apples). Production clips the REAL PASSBAND composite
+	// after upconvert; the baseband-envelope clip is the standard PAPR-literature model and
+	// captures the same in-band distortion (the carrier-phase asymmetry of the real-passband
+	// clip is a second-order difference). Per-symbol clip == production's whole-data-burst
+	// clip in the AWGN-stationary regime (every symbol has the same average power here).
+	bool pbloop = (env_i("MERCURY_SFO_GRID_PBLOOP", 0) != 0);
+	if(pbloop)
+	{
+		std::vector<std::complex<double>> sym_bb((size_t)Nofdm);   // one symbol's composite
+		for(int i=0;i<Ngrid;i++)
+		{
+			ofdm.symbol_mod(&grid[(size_t)i*Nc], sym_bb.data());           // Nc carriers -> Nofdm time samples
+			ofdm.peak_clip(sym_bb.data(), Nofdm, ofdm.data_papr_cut);      // THE LEVER (complex envelope clip)
+			ofdm.symbol_demod(sym_bb.data(), &grid[(size_t)i*Nc]);         // back to carriers (post-clip)
+		}
+
+		if(env_i("MERCURY_SFO_GRID_PBLOOP_DIAG", 0) != 0)
+			std::cout << "[SFO-GRID-PBLOOP] data_papr_cut=" << ofdm.data_papr_cut
+			          << " dB  Nofdm=" << Nofdm << " Ngrid=" << Ngrid
+			          << " model=baseband-envelope-clip (clip loopback ACTIVE)" << std::endl;
+	}
+
 	// --- CHANNEL: flat unity H + the SFO per-symbol subcarrier phase ramp. ---
 	// tau_n = accumulated timing slip (samples) at symbol n; phase(k) = -2*pi*k*tau_n/Nfft.
 	// k index runs over the active subcarriers as the modulator places them
@@ -10083,6 +10123,32 @@ void cl_telecom_system::load_configuration(int configuration)
 
 	ofdm.preamble_papr_cut=default_configurations_telecom_system.ofdm_preamble_papr_cut;
 	ofdm.data_papr_cut=default_configurations_telecom_system.ofdm_data_papr_cut;
+
+	// P1-A PAPR-cut tunable (DEEPLEVER_COMPLETENESS.md lever #2): runtime override of the
+	// hard-clip depth WITHOUT changing the defaults (10 dB data / 7 dB preamble stay the
+	// default — default-off byte-identical when the env vars are unset). This is the single
+	// producer of the live ofdm.{data,preamble}_papr_cut (data-flow-papr-cut.md §2); every
+	// consumer — TX data clip, preamble clip, all control/ACK/SACK/hail clips, block-TX, and
+	// the RX preamble correlation-template replay at telecom_system.cc:~10402 — reads this
+	// live value, so the override propagates everywhere and the RX template still matches TX.
+	// Sentinel: "off"/"none"/"no" (or any value >=90) maps to 99 dB == effectively no clip
+	// (the bare-constructor no-clip semantics, ofdm.cc:82-83). Re-applied on every config
+	// switch because load_configuration() re-runs (intended).
+	{
+		auto papr_env = [](const char* k, double cur) -> double {
+			const char* e = std::getenv(k);
+			if(!e || !*e) return cur;                  // unset -> keep default (byte-identical)
+			char c0 = e[0];
+			if(c0=='o' || c0=='O' || c0=='n' || c0=='N')  // "off"/"none"/"no" -> no-clip sentinel
+				return 99.0;
+			double v = atof(e);
+			if(v <= 0.0) return cur;                   // bad/zero -> keep default (no silent 0)
+			if(v >= 90.0) return 99.0;                 // very large -> no-clip
+			return v;                                  // a real dB cut
+		};
+		ofdm.data_papr_cut     = papr_env("MERCURY_DATA_PAPR_CUT",     ofdm.data_papr_cut);
+		ofdm.preamble_papr_cut = papr_env("MERCURY_PREAMBLE_PAPR_CUT", ofdm.preamble_papr_cut);
+	}
 
 	ofdm.LS_window_width=default_configurations_telecom_system.ofdm_LS_window_width;
 	ofdm.LS_window_hight=default_configurations_telecom_system.ofdm_LS_window_hight;
