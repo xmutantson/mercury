@@ -77,6 +77,40 @@ FIX9 D2/D3 turnaround fixes have a failing-first off-bench vehicle.
 | `--drift-ppm-b2a N` | `0` (off) | same on B→A, set independently (the two soundcards drift independently). |
 | `--ptt-latency-ms M` | `0` (off) | inject `M` ms of channel-noise silence at each TX onset (silent→signal edge) per direction — the radio PTT/AGC/capture-flush keying delay the sim idealizes to zero. |
 | `--ptt-latency-jitter-ms J` | `0` | ± uniform per-onset jitter on the PTT latency (seeded). Requires `--ptt-latency-ms>0`. |
+| `--turnaround-batch-accrual` | `off` | **bench-9 BATCH-LENGTH-DEPENDENT turnaround accrual** (rides on `--turnaround-drift`). Adds a *one-sided* late-shift to the reverse-ACK proportional to how long the forward batch held the channel. Default rate `30.0 ms/s` (`--turnaround-accrual-ms-per-s`). Env mirror: `MERCURY_SIM_BATCH_ACCRUAL=1`. **OFF == legacy symmetric-jitter model, byte-identical.** |
+
+### Why the batch-length accrual (bench-9 calibration)
+
+The `--turnaround-jitter-ms` term above is **zero-mean symmetric**: its accumulated
+offset is a random walk whose magnitude grows only as `~sqrt(n_keyups)`. So a long
+CFG16 batch (25-30 frames, one reverse-ACK turnaround) misses its window only
+`~sqrt(3)=1.7×` more than a short CFG15 batch — **not** the bench-9 STEP. The HW
+ground truth (`bigblock_p3_hw/HW_BENCH9/ARMA_CALIBRATION.json`) is a step, not a
+ratio:
+
+* **held-CFG16** (`-s 16`, no `-g`, WGN:40 clean, real ±8 ppm + PTT/capture jitter):
+  reverse-ACK `matched=0/7` on **14/16** turnarounds = **87.5 % full window miss**,
+  link active **18.9 %** of wall, whole-window wire **597.6 bps** (in-burst 3057);
+  40 D3 reverse-ACK-starvation demotes over the transfer.
+* **held-CFG15** short batches under the SAME drift (bench-8): reverse-ACK lands in
+  the window on essentially every batch — sustained **3060 bps** (NOT halved),
+  `d2_reverse_ack_fires=0`, 100 % high-rung.
+
+The physical cause: a **longer forward batch holds the half-duplex channel longer**,
+so keyer/AGC/capture-flush/scheduling turnaround latency **accumulates within the
+batch** and pushes the single end-of-batch reverse-ACK **systematically late** in
+proportion to the batch length. That is a one-sided, batch-length-dependent offset —
+which a zero-mean symmetric walk cannot produce. The legacy faithful model therefore
+gave held-CFG16 **~1992 bps** (too optimistic, link ~50 %+ active); the accrual term
+drops it toward the HW **~600 bps** by making the long-batch reverse-ACK miss its
+window ~80 %+ of the time while the short CFG15 batch still lands.
+
+Calibration: `30.0 ms/s` × a ~28-frame CFG16 batch (~4.78 s airtime) = ~143 ms
+late-shift `>` the ~90 ms CMD reverse-ACK window half-width → MISS; × a ~6-frame
+CFG15 batch (~1.02 s) = ~31 ms `<` the window → LANDS. Validated by
+`tools/sim/test_sim_relay_turnaround_batchlen.py` (the model anchors: CFG16
+miss-fraction ≥ 0.80, CFG15 ≤ 0.05; monotone in batch length; accrual-OFF
+byte-identical to the legacy model).
 
 **Default OFF == byte-identical** to the pre-change (monitor) relay: `ppm==0`
 is a strict identity pass-through (no float reconstruction, no state) and

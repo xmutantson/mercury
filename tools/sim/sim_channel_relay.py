@@ -147,6 +147,19 @@ CENTER_HZ = 1500.0            # OFDM center frequency (modem default)
 
 WGN_TO_SNR3K = 2.4            # channel SNR3k = WGN_label + 2.4 dB (testbed map)
 
+# BATCH-LENGTH-DEPENDENT turnaround accrual (bench-9 calibration). One-sided LATE
+# offset (ms) added per SECOND of forward batch airtime held on the channel — the
+# keyer/AGC/capture-flush/scheduling turnaround latency that ACCUMULATES inside a
+# long batch and pushes the single end-of-batch reverse-ACK late, in proportion
+# to how long the batch was. 0 == the legacy symmetric-jitter model (default,
+# byte-identical). The DEFAULT (when the new mode is selected) is calibrated to
+# the bench-9 step: a ~28-frame CFG16 batch (~4.78 s airtime) accrues ~143 ms of
+# late-shift (> the CMD reverse-ACK ~90 ms window half-width -> MISS, matched=0/7
+# on ~87.5% of turnarounds, whole-window wire ~600 bps) while a ~6-frame CFG15
+# batch (~1.02 s) accrues only ~31 ms (< the window -> LANDS, sustained ~3060
+# bps, NOT halved). See ARMA_CALIBRATION.json / BENCH9_VERDICT.json.
+DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S = 30.0
+
 # ITU-R F.1487 / ARSFI mid-latitude HF channel profiles.
 #   delay spread dtau (s), Doppler spread fd (Hz, 2-sigma Gaussian).
 PROFILES = {
@@ -581,11 +594,32 @@ class TurnaroundDrift:
     seeded per-onset jitter (M3). enabled==False -> strict identity pass-through
     (byte-identical, the N2 contract)."""
 
-    def __init__(self, ppm, jitter_ms, rng, enabled=True):
+    def __init__(self, ppm, jitter_ms, rng, enabled=True,
+                 accrual_ms_per_s=0.0):
         self.ppm = float(ppm)
         self.jitter_ms = max(0.0, float(jitter_ms))
+        # BATCH-LENGTH-DEPENDENT one-sided LATE accrual (bench-9). ms of late-shift
+        # per SECOND of forward batch airtime held; added to acc at the NEXT
+        # (reverse) onset in proportion to how long the previous burst ran. 0 ==
+        # legacy symmetric-jitter model (byte-identical). See the module constant
+        # DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S and the bench-9 calibration.
+        self.accrual_ms_per_s = max(0.0, float(accrual_ms_per_s))
         self.rng = rng                 # Xoshiro (deterministic per-onset jitter)
-        self.enabled = bool(enabled) and (self.ppm != 0.0 or self.jitter_ms > 0.0)
+        self.enabled = bool(enabled) and (self.ppm != 0.0 or self.jitter_ms > 0.0
+                                          or self.accrual_ms_per_s > 0.0)
+        # length (samples) of the CURRENT forward signal-burst run — the batch the
+        # modem is holding on the channel right now. Reset to 0 at each turnaround
+        # (silence). Consumed at the next onset to size the one-sided late accrual.
+        self.cur_burst_samples = 0
+        # diagnostics for the accrual term
+        self.n_accrual_onsets = 0
+        self.accrual_samples_total = 0.0
+        self.max_accrual_onset = 0.0
+        # the signed owed offset (samples) at the MOST RECENT onset, captured
+        # AFTER the M3 jitter + batch-length accrual were applied but BEFORE it is
+        # spent as inserted silence. This is the reverse-ACK arrival shift the
+        # window-miss test reads (positive == LATE == toward a window miss).
+        self.last_onset_acc = 0.0
         # acc = signed fractional sample offset still owed to the OUTPUT (the wire
         # the receiver clocks on). acc>0 => insert silence (ACK arrives later);
         # acc<0 => drop silence (ACK arrives earlier). NEVER reset (M2).
@@ -624,7 +658,7 @@ class TurnaroundDrift:
 
         # M3: at a silent->signal rising edge (PTT key-up) add a bounded seeded
         # jitter. Symmetric uniform in [-jitter, +jitter] samples. This is the
-        # DOMINANT trigger that random-walks the ACK arrival index.
+        # per-key-up dither that random-walks the ACK arrival index.
         onset = (self.prev_silent and not silent)
         if onset:
             self.n_onsets += 1
@@ -632,6 +666,29 @@ class TurnaroundDrift:
                 jsamp = (2.0 * self.rng.uniform() - 1.0) * self.jitter_ms \
                         * FS / 1000.0
                 self.acc += jsamp
+            # BATCH-LENGTH ACCRUAL (bench-9): the just-ENDED forward burst held the
+            # half-duplex channel for `cur_burst_samples`; the keyer/AGC/
+            # capture-flush/scheduling turnaround latency accumulated over that
+            # hold and pushes THIS reverse onset systematically LATE, in proportion
+            # to the burst length. One-sided (always +, never cancels), so a long
+            # CFG16 batch (~28 frames) accrues enough late-shift to push the
+            # reverse ACK OUT of the CMD window while a short CFG15 batch does not
+            # — the bench-9 STEP the symmetric jitter alone cannot produce. The
+            # offset (samples) = accrual_ms_per_s * burst_seconds * FS/1000.
+            if self.accrual_ms_per_s > 0.0 and self.cur_burst_samples > 0:
+                burst_s = self.cur_burst_samples / FS
+                add = self.accrual_ms_per_s * burst_s * FS / 1000.0
+                self.acc += add
+                self.n_accrual_onsets += 1
+                self.accrual_samples_total += add
+                if add > self.max_accrual_onset:
+                    self.max_accrual_onset = add
+            # this onset starts a NEW burst; reset the run-length accumulator. The
+            # samples of THIS chunk are counted below in the signal branch.
+            self.cur_burst_samples = 0
+            # snapshot the owed offset AT the onset (jitter + accrual applied,
+            # before it is spent on inserted silence) — the reverse-ACK shift.
+            self.last_onset_acc = self.acc
         self.prev_silent = silent
         if abs(self.acc) > self.max_abs_offset:
             self.max_abs_offset = abs(self.acc)
@@ -654,6 +711,10 @@ class TurnaroundDrift:
                 self.acc -= k
                 self.n_inserted += k
             self.out.extend(x)
+            # BATCH-LENGTH ACCRUAL bookkeeping: this signal chunk extends the
+            # current held forward burst (consumed at the NEXT onset to size the
+            # one-sided late accrual). Inert unless accrual is enabled.
+            self.cur_burst_samples += n
         else:
             # SILENCE chunk: this is where we pay down the owed offset. Insert
             # extra silence samples (acc>=+1) or drop silence samples (acc<=-1).
@@ -950,9 +1011,35 @@ def main():
                          "(default -8.16, CLOCK_VERDICT DIR2; reciprocal sign).")
     ap.add_argument("--turnaround-jitter-ms", type=float, default=6.0,
                     help="bounded SEEDED per-PTT-key-up turnaround jitter (ms, "
-                         "symmetric uniform) for --turnaround-drift — the DOMINANT "
-                         "trigger that random-walks the ACK arrival index out of "
-                         "the CMD window. DEFAULT 6.0. Calibrated to bench-7.")
+                         "symmetric uniform) for --turnaround-drift — the per-key-up "
+                         "dither on the ACK arrival index. DEFAULT 6.0. Bench-7 cal.")
+    # ---- BATCH-LENGTH-DEPENDENT turnaround accrual (bench-9 calibration) -------
+    # The symmetric jitter above is ZERO-MEAN: its accumulated |offset| grows only
+    # as ~sqrt(n_keyups), so a long CFG16 batch misses its reverse-ACK window only
+    # ~sqrt(3)x more than a short CFG15 batch — NOT the bench-9 STEP (CFG16 87.5%
+    # miss, whole-window 597.6 bps; CFG15 ~0% miss, sustained 3060 bps). The real
+    # mechanism is BATCH-LENGTH-DEPENDENT: a longer forward batch holds the
+    # half-duplex channel longer, so keyer/AGC/capture-flush latency accumulates
+    # WITHIN the batch and pushes the single end-of-batch reverse-ACK SYSTEMATICALLY
+    # LATE in proportion to the batch length. This OPT-IN knob adds that one-sided
+    # accrual (ms of late-shift per second of forward batch airtime held). DEFAULT
+    # 0 == OFF == the legacy symmetric-jitter model (byte-identical). Selecting
+    # --turnaround-batch-accrual uses DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S; override
+    # with --turnaround-accrual-ms-per-s. Env mirror: MERCURY_SIM_BATCH_ACCRUAL=1.
+    ap.add_argument("--turnaround-batch-accrual", action="store_true",
+                    help="enable the bench-9 BATCH-LENGTH-DEPENDENT turnaround "
+                         "accrual on top of --turnaround-drift: a long CFG16 batch "
+                         "accrues enough one-sided late-shift that the reverse ACK "
+                         "MISSES the CMD window (~600 bps whole-window) while a short "
+                         "CFG15 batch lands (~3060 bps). Requires --turnaround-drift. "
+                         "DEFAULT OFF (legacy symmetric model, byte-identical). "
+                         "Env mirror: MERCURY_SIM_BATCH_ACCRUAL=1.")
+    ap.add_argument("--turnaround-accrual-ms-per-s", type=float, default=-1.0,
+                    help="ms of one-sided LATE turnaround shift accrued per SECOND "
+                         "of forward batch airtime held (the bench-9 batch-length "
+                         f"axis). DEFAULT {DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S} when "
+                         "--turnaround-batch-accrual is set; <0 means 'use the "
+                         "default'. Only applies with --turnaround-batch-accrual.")
     ap.add_argument("--idle-bigstep", type=int, default=1,
                     help="Q3 FTRT speed-up (EXPERIMENTAL, default OFF=1): when BOTH "
                          "directions are inbound-silent (modem idle gaps), coalesce up "
@@ -993,6 +1080,26 @@ def main():
     turn_on = bool(args.turnaround_drift)
     if (args.ptt_latency_jitter_ms > 0.0) and not ptt_on:
         ap.error("--ptt-latency-jitter-ms requires --ptt-latency-ms > 0")
+    # ---- BATCH-LENGTH-DEPENDENT turnaround accrual gate (bench-9, OPT-IN) ------
+    # Selected by --turnaround-batch-accrual OR the env mirror
+    # MERCURY_SIM_BATCH_ACCRUAL=1 (the env-gate the task requires so the existing
+    # default is unchanged unless the calibrated model is explicitly chosen). The
+    # accrual rides ON TOP of --turnaround-drift (it is the systematic batch-length
+    # axis; the ppm + symmetric jitter remain as small dither), so it requires the
+    # faithful turnaround model to be on. accrual_ms_per_s==0 -> legacy model
+    # (byte-identical). <0 override -> use the calibrated default.
+    accrual_env = os.environ.get("MERCURY_SIM_BATCH_ACCRUAL", "0").strip()
+    accrual_on = bool(args.turnaround_batch_accrual) or accrual_env in ("1", "true", "yes", "on")
+    if args.turnaround_accrual_ms_per_s is not None and args.turnaround_accrual_ms_per_s >= 0.0:
+        accrual_ms_per_s = float(args.turnaround_accrual_ms_per_s)
+    else:
+        accrual_ms_per_s = DEFAULT_TURNAROUND_ACCRUAL_MS_PER_S
+    if not accrual_on:
+        accrual_ms_per_s = 0.0           # OFF -> legacy symmetric model
+    if accrual_on and not turn_on:
+        ap.error("--turnaround-batch-accrual / MERCURY_SIM_BATCH_ACCRUAL requires "
+                 "--turnaround-drift (the batch-length accrual rides on the "
+                 "faithful turnaround-timing model).")
     # The faithful turnaround model is the CORRECTED axis; the old tone-resampler
     # is the WRONG axis. They model the same physical event two different (and
     # incompatible) ways — refuse to run both at once so an A/B is unambiguous.
@@ -1040,8 +1147,15 @@ def main():
         f"drift_ppm(a2b={args.drift_ppm_a2b},b2a={args.drift_ppm_b2a}) "
         f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms}) "
         f"turnaround_drift={turn_on}(ppm a2b={args.turnaround_ppm_a2b},"
-        f"b2a={args.turnaround_ppm_b2a},jit={args.turnaround_jitter_ms}ms) "
+        f"b2a={args.turnaround_ppm_b2a},jit={args.turnaround_jitter_ms}ms,"
+        f"batch_accrual={'%.1f ms/s' % accrual_ms_per_s if accrual_ms_per_s > 0 else 'OFF'}) "
         f"wire={'STAMPED(8200,needs feat/sim-clock modem)' if args.wire_stamp else 'BARE(8192,compatible)'}")
+    if accrual_ms_per_s > 0:
+        log(f"NOTE: BATCH-LENGTH turnaround accrual ENABLED ({accrual_ms_per_s:.1f} "
+            "ms late-shift per second of forward batch airtime) — bench-9 step: a "
+            "long CFG16 batch accrues enough one-sided late-shift that the reverse "
+            "ACK misses the CMD window (~600 bps whole-window) while a short CFG15 "
+            "batch lands (~3060 bps). OPT-IN; legacy default unchanged.")
     if turn_on:
         log("NOTE: FAITHFUL turnaround-drift model ENABLED (SIMFIDELITY M1-M4) — "
             "integer silence insert/drop re-times bursts (signal samples "
@@ -1094,10 +1208,10 @@ def main():
     # --turnaround-drift. Independent jitter seeds per direction (two radios).
     turn = {"a2b": TurnaroundDrift(args.turnaround_ppm_a2b, args.turnaround_jitter_ms,
                                    Xoshiro(args.seed * 2718281829 & 0xFFFFFFFF),
-                                   enabled=turn_on),
+                                   enabled=turn_on, accrual_ms_per_s=accrual_ms_per_s),
             "b2a": TurnaroundDrift(args.turnaround_ppm_b2a, args.turnaround_jitter_ms,
                                    Xoshiro(args.seed * 3141592653 & 0xFFFFFFFF),
-                                   enabled=turn_on)}
+                                   enabled=turn_on, accrual_ms_per_s=accrual_ms_per_s)}
 
     stop = threading.Event()
     counters = {"a2b": 0, "b2a": 0}      # per-direction chunk counts
@@ -1317,6 +1431,11 @@ def main():
                 drift_s += (f" turn_ppm={tr.ppm:+.2f} onsets={tr.n_onsets} "
                             f"ins={tr.n_inserted} drop={tr.n_dropped} "
                             f"offset={tr.acc:+.1f}smp peak={tr.max_abs_offset:.1f}smp")
+                if tr.accrual_ms_per_s > 0.0:
+                    drift_s += (f" accrual={tr.accrual_ms_per_s:.1f}ms/s "
+                                f"accr_onsets={tr.n_accrual_onsets} "
+                                f"accr_smp={tr.accrual_samples_total:.0f} "
+                                f"accr_max={tr.max_accrual_onset:.0f}smp")
             log(f"{key}: {counters[key]} chunks "
                 f"({counters[key]*CHUNK_SAMPLES/FS:.1f}s) "
                 f"vstamp={stamp} split={counters['a2b']-counters['b2a']:+d} "
@@ -1521,12 +1640,16 @@ def main():
                     "chunk_samples": CHUNK_SAMPLES,
                     "barrier_k": args.barrier_k,
                     "wire_stamp": int(WIRE_STAMP),
+                    "turnaround_drift": bool(turn_on),
+                    "turnaround_batch_accrual_ms_per_s": accrual_ms_per_s,
                     "a2b": {
                         "signal_chunks": sig_chunks["a2b"],
                         "silence_chunks": sil_chunks["a2b"],
                         "total_chunks": counters["a2b"],
                         "signal_airtime_s": _airtime_s("a2b"),
                         "total_virtual_s": _total_s("a2b"),
+                        "turn_accrual_onsets": turn["a2b"].n_accrual_onsets,
+                        "turn_accrual_samples": turn["a2b"].accrual_samples_total,
                     },
                     "b2a": {
                         "signal_chunks": sig_chunks["b2a"],
@@ -1534,6 +1657,8 @@ def main():
                         "total_chunks": counters["b2a"],
                         "signal_airtime_s": _airtime_s("b2a"),
                         "total_virtual_s": _total_s("b2a"),
+                        "turn_accrual_onsets": turn["b2a"].n_accrual_onsets,
+                        "turn_accrual_samples": turn["b2a"].accrual_samples_total,
                     },
                 }, af, indent=1)
             log(f"wrote airtime breakdown -> {args.airtime_json}")

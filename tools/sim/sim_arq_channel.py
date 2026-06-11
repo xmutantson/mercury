@@ -611,7 +611,18 @@ def main():
                     help="relay --turnaround-ppm-b2a passthrough (default -8.16).")
     ap.add_argument("--turnaround-jitter-ms", type=float, default=6.0,
                     help="relay --turnaround-jitter-ms passthrough (per-key-up "
-                         "turnaround jitter; the dominant trigger). DEFAULT 6.0.")
+                         "turnaround dither). DEFAULT 6.0.")
+    ap.add_argument("--turnaround-batch-accrual", action="store_true",
+                    help="relay --turnaround-batch-accrual passthrough: the bench-9 "
+                         "BATCH-LENGTH-DEPENDENT turnaround accrual (long CFG16 batch "
+                         "-> reverse ACK misses the CMD window -> ~600 bps whole-"
+                         "window; short CFG15 batch lands -> ~3060 bps). Requires "
+                         "--turnaround-drift. DEFAULT off (legacy symmetric model). "
+                         "Env mirror: MERCURY_SIM_BATCH_ACCRUAL=1.")
+    ap.add_argument("--turnaround-accrual-ms-per-s", type=float, default=-1.0,
+                    help="relay --turnaround-accrual-ms-per-s passthrough (ms late-"
+                         "shift per second of forward batch airtime; <0 = use the "
+                         "calibrated default). Only with --turnaround-batch-accrual.")
     ap.add_argument("--wire-stamp", type=int, default=0, choices=(0, 1),
                     help="relay --wire-stamp passthrough. DEFAULT 0 (bare 8192, "
                          "compatible with every shipped -x sim mercury). Set 1 "
@@ -755,10 +766,16 @@ def main():
                      "--turnaround-ppm-a2b", str(args.turnaround_ppm_a2b),
                      "--turnaround-ppm-b2a", str(args.turnaround_ppm_b2a),
                      "--turnaround-jitter-ms", str(args.turnaround_jitter_ms),
+                     "--turnaround-accrual-ms-per-s", str(args.turnaround_accrual_ms_per_s),
                      "--airtime-json", relay_airtime_json,
                      "--log", relay_log]
         if args.turnaround_drift:
             relay_cmd.append("--turnaround-drift")
+        # batch-length accrual: explicit flag OR the env mirror (which the relay
+        # subprocess also reads directly, but pass the flag too for log clarity).
+        _accrual_env = os.environ.get("MERCURY_SIM_BATCH_ACCRUAL", "0").strip()
+        if args.turnaround_batch_accrual or _accrual_env in ("1", "true", "yes", "on"):
+            relay_cmd.append("--turnaround-batch-accrual")
         if args.cell:
             relay_cmd += ["--cell", args.cell]
         if args.burst:
@@ -1076,6 +1093,10 @@ def main():
                 "turnaround_ppm_a2b": args.turnaround_ppm_a2b,
                 "turnaround_ppm_b2a": args.turnaround_ppm_b2a,
                 "turnaround_jitter_ms": args.turnaround_jitter_ms,
+                "turnaround_batch_accrual": bool(args.turnaround_batch_accrual)
+                    or os.environ.get("MERCURY_SIM_BATCH_ACCRUAL", "0").strip()
+                       in ("1", "true", "yes", "on"),
+                "turnaround_accrual_ms_per_s": args.turnaround_accrual_ms_per_s,
                 "ptt_latency_ms": args.ptt_latency_ms,
                 "ptt_latency_jitter_ms": args.ptt_latency_jitter_ms,
                 "connected": st.connected,
