@@ -505,6 +505,10 @@ int main(int argc, char *argv[])
     bool test_batch_shrink_strands_prev_cli = false; // --test-batch-shrink-strands-prev: R035 — data_batch_size
                                         // shrink strands the active prev. Drives the REAL set_data_batch_size chokepoint;
                                         // asserts prev counters re-derived (gate reachable) + streaming defense on orphan. One-shot, exits rc.
+    bool test_prevbump_frame_hole_cli = false; // --test-prevbump-frame-hole: D4 — PREV-BUMP cross-storage
+                                        // WITHIN-batch frame-hole silent-wrong-bytes. Drives the REAL prev gate + helper +
+                                        // copy_data_to_buffer + set_data_batch_size chokepoint + fifo_buffer_rx oracle.
+                                        // MERCURY_PREVBUMP_DEFEAT=1 = fail-before (count-only gate). One-shot, exits rc.
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
@@ -1131,6 +1135,16 @@ int main(int argc, char *argv[])
             // one-shot at startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.3 / §5.2.
             test_batch_shrink_strands_prev_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-prevbump-frame-hole") == 0)
+        {
+            // D4 — PREV-BUMP cross-storage within-batch frame-hole silent-wrong-
+            // bytes regression — one-shot at startup, then exit with the test's rc.
+            // See source/datalink_layer/arq_responder.cc test_prevbump_frame_hole
+            // + fact-documents/data-flow-prev-bump.md.
+            test_prevbump_frame_hole_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2466,6 +2480,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_batch_shrink_strands_prev();
             printf("[FLAG] Batch-shrink-strands-prev test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_prevbump_frame_hole_cli) {
+            // D4 — PREV-BUMP cross-storage within-batch frame-hole (one-shot, exit rc).
+            printf("[FLAG] --test-prevbump-frame-hole: invoking D4 PREV-BUMP "
+                   "within-batch frame-hole silent-wrong-bytes regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_prevbump_frame_hole();
+            printf("[FLAG] Prevbump-frame-hole test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

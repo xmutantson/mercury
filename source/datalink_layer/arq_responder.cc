@@ -783,8 +783,33 @@ void cl_arq_controller::process_messages_rx_data_control()
 						// path the current-batch uses — no parallel pipeline,
 						// no duplicated logic). After delivery, clear prev
 						// slots back to FREE and deactivate.
+						//
+						// D4 (data-flow-prev-bump.md §5, the PREV-BUMP within-batch
+						// frame-hole fix): the gate is a SET check, not a COUNT
+						// check. The standing `received_count >= expected_count` is
+						// a CARDINALITY test — a RECEIVED tail slot in
+						// [expected_count, data_batch_size) (L1) can satisfy the
+						// count while a slot INSIDE [0, expected_count) is still
+						// FREE. copy_data_to_buffer (below) silently skips that
+						// within-batch hole (silent-wrong-bytes), and the batch-level
+						// D3.1 gate (delivery_step_is_gap, no slot argument) cannot
+						// see it. prev_batch_is_frame_complete() requires every slot
+						// in [0, expected_count) RECEIVED-or-ACKED, so a holed batch
+						// is HELD until the SACK-driven retransmit completes the set
+						// (the bitmap already marks the missing low slot) or the
+						// stale-discard / demote-rebase clears it. BYTE-IDENTICAL on
+						// the faithful path (helper true when the set is complete) —
+						// the count gate already fired there, so no faithful prev
+						// delivery is delayed. MERCURY_PREVBUMP_DEFEAT=1 disables the
+						// SET check on the SAME binary (restores the pre-fix
+						// count-only gate) for the --test-prevbump-frame-hole
+						// fail-before arm.
+						bool prevhole_defeat = false;
+						{ const char* e = std::getenv("MERCURY_PREVBUMP_DEFEAT");
+						  if(e && *e && atoi(e)!=0) prevhole_defeat = true; }
 						if(rsp_prev_batch_active
-						   && rsp_prev_batch_received_count >= rsp_prev_batch_expected_count)
+						   && rsp_prev_batch_received_count >= rsp_prev_batch_expected_count
+						   && (prevhole_defeat || prev_batch_is_frame_complete()))
 						{
 							// V2 FIX-2 (fact-doc §10): the SACK-completed assembled-block delivery
 							// gate. If THIS completing prev-batch is a stashed big-block (armed at
@@ -4731,6 +4756,17 @@ int cl_arq_controller::test_batch_shrink_strands_prev()
 		streaming_before ? 1 : 0);
 	fflush(stdout);
 
+	// D4 (data-flow-prev-bump.md §5, L2): the orphaned-frame outcome changed. The
+	// reshrink used to silently re-derive the counters + reset streaming and let
+	// the SHORTER batch deliver as "complete" (losing the orphaned frame's bytes).
+	// It now routes an orphan through the LOUD rsp_gap_abort_teardown (DROPPED).
+	// MERCURY_PREVBUMP_DEFEAT=1 restores the pre-fix silent re-derive — that arm
+	// still validates the original R035 counter re-derivation + streaming defense.
+	bool prevhole_defeat = false;
+	{ const char* e = std::getenv("MERCURY_PREVBUMP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) prevhole_defeat = true; }
+	this->link_status = CONNECTED;   // pre-shrink link state for the abort to act on
+
 	// --- Step 2: SHRINK via the REAL chokepoint (NOT a direct assign) --------
 	set_data_batch_size(NEW_BATCH);
 
@@ -4738,7 +4774,7 @@ int cl_arq_controller::test_batch_shrink_strands_prev()
 	bool pass = true;
 
 	// (a) Vacuity guard: the pre-fix model MUST show the gate was unreachable
-	//     (else the test proves nothing).
+	//     (else the test proves nothing). Holds in both modes.
 	if(prefix_gate_reachable)
 	{
 		printf("[TEST-BATCH-SHRINK] FAIL(vacuous): pre-fix gate was already reachable "
@@ -4747,6 +4783,8 @@ int cl_arq_controller::test_batch_shrink_strands_prev()
 	}
 
 	// (b) data_batch_size actually shrank to NEW_BATCH (chokepoint stored it).
+	//     The chokepoint stores it AFTER the rescan in both modes (the abort
+	//     teardown does NOT re-enter set_data_batch_size — re-entrancy-safe).
 	if(this->data_batch_size != NEW_BATCH)
 	{
 		printf("[TEST-BATCH-SHRINK] FAIL: data_batch_size=%d (expected %d)\n",
@@ -4754,52 +4792,410 @@ int cl_arq_controller::test_batch_shrink_strands_prev()
 		pass = false;
 	}
 
-	// (c) expected_count re-derived to min(OLD,NEW)=NEW_BATCH (gate now reachable).
-	if(this->rsp_prev_batch_expected_count != NEW_BATCH)
+	if(prevhole_defeat)
 	{
-		printf("[TEST-BATCH-SHRINK] FAIL: expected_count=%d (expected re-derived to %d)\n",
-			this->rsp_prev_batch_expected_count, NEW_BATCH);
-		pass = false;
+		// PRE-FIX (defeat) arm: silent re-derive + streaming defense, NO abort.
+		// (c) expected_count re-derived to min(OLD,NEW)=NEW_BATCH (gate reachable).
+		if(this->rsp_prev_batch_expected_count != NEW_BATCH)
+		{ printf("[TEST-BATCH-SHRINK] FAIL(defeat): expected_count=%d (re-derived to %d)\n", this->rsp_prev_batch_expected_count, NEW_BATCH); pass = false; }
+		// (d) received_count recomputed to the count within [0,NEW_BATCH) = 9.
+		if(this->rsp_prev_batch_received_count != reachable_received)
+		{ printf("[TEST-BATCH-SHRINK] FAIL(defeat): received_count=%d (recomputed to %d)\n", this->rsp_prev_batch_received_count, reachable_received); pass = false; }
+		// (e) link NOT dropped (the pre-fix silent path keeps the link).
+		if(this->link_status == DROPPED)
+		{ printf("[TEST-BATCH-SHRINK] FAIL(defeat): link DROPPED (the loud abort fired under defeat)\n"); pass = false; }
+		// (f) the orphan fired the streaming defense (RESET, not DISABLE).
+		bool streaming_after = compressor.is_streaming();
+		if(!streaming_after)
+		{ printf("[TEST-BATCH-SHRINK] FAIL(defeat): streaming was DISABLED (expected streaming_reset, which keeps it active)\n"); pass = false; }
+		printf("[TEST-BATCH-SHRINK] %s(defeat): data_batch_size=%d expected=%d received=%d "
+		       "prefix_reachable=%d streaming=%d (orphan in [%d,%d) drove the silent re-derive "
+		       "+ desync defense — pre-fix R035 behavior)\n",
+			pass ? "PASS" : "FAIL", this->data_batch_size,
+			this->rsp_prev_batch_expected_count, this->rsp_prev_batch_received_count,
+			prefix_gate_reachable ? 1 : 0, streaming_after ? 1 : 0, NEW_BATCH, OLD_BATCH);
+	}
+	else
+	{
+		// POST-FIX (default) arm: the orphan routes through the LOUD teardown.
+		// (c) link DROPPED.
+		if(this->link_status != DROPPED)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: orphan reshrink did NOT loud-abort (link_status=%d, want DROPPED)\n", this->link_status); pass = false; }
+		// (d) prev/bsi family cleared by the teardown (no stale prev can misroute).
+		if(this->rsp_prev_batch_active || this->rsp_prev_batch_seq_id != -1
+		   || this->rsp_current_expected_batch_seq_id != -1)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: prev/bsi family not cleared (active=%d prev=%d cur=%d)\n", this->rsp_prev_batch_active, this->rsp_prev_batch_seq_id, this->rsp_current_expected_batch_seq_id); pass = false; }
+		printf("[TEST-BATCH-SHRINK] %s: reshrink %d->%d orphaned slot 12 -> "
+		       "[RSP-V2-GAP-ABORT] loud teardown, link DROPPED, prev family cleared "
+		       "(D4 L2: byte-faithful-OR-loud-abort; no silent truncated delivery)\n",
+			pass ? "PASS" : "FAIL", OLD_BATCH, NEW_BATCH);
+	}
+	(void)streaming_before;
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// D4 — PREV-BUMP cross-storage WITHIN-batch frame-hole silent-wrong-bytes
+//      regression (in-process synthetic-fire, test-only)
+// ============================================================================
+//
+// CLI: --test-prevbump-frame-hole
+//
+// data-flow-prev-bump.md §4/§5 + CFG16_ACQ_D2D3_VERDICT.md §3: the cross-storage
+// prev-batch is delivered when its RECEIVED-slot COUNT reaches expected_count
+// (arq_responder.cc:786). The delivery reassembler copy_data_to_buffer()
+// (arq_common.cc:9712/9863) then concatenates ACKED slots in index order and
+// SILENTLY skips any non-ACKED hole. The D3.1 batch-level contiguity gate
+// (delivery_step_is_gap, no slot argument) accepts the delivery (bsi IS
+// contiguous) and never aborts. Two producer realizations let the COUNT reach
+// expected_count while a slot INSIDE [0,expected_count) is still FREE -> a
+// within-batch frame HOLE -> silent-wrong-bytes:
+//   L1: EOB-derived expected_count < data_batch_size, so RECEIVED tail slots in
+//       [expected_count, data_batch_size) count toward the gate while a low slot
+//       stays FREE (the dominant, orphaned_received==0 leak).
+//   L2: the R035 reshrink lowers expected/received to the new bound and drops an
+//       orphaned RECEIVED frame, delivering the SHORTER batch as "complete".
+//
+// This test drives the REAL cross-storage delivery to byte-faithful-OR-loud-abort:
+//   - L1 arm + L1-CLEAN false-positive guard: arm messages_rx_prev[], apply the
+//     EXACT production gate decision (count gate + the REAL
+//     prev_batch_is_frame_complete() helper, respecting MERCURY_PREVBUMP_DEFEAT),
+//     run the REAL copy_data_to_buffer() through the same messages_rx<->prev
+//     pointer swap the production prev path uses, and use the REAL fifo_buffer_rx
+//     as the byte oracle. Each slot carries DISTINCT per-slot bytes so the oracle
+//     detects both a missing frame AND wrong-at-seam concatenation.
+//   - L2 arm: arm an active prev with a RECEIVED orphan beyond the new bound,
+//     SHRINK via the REAL set_data_batch_size() chokepoint, assert the orphan
+//     routes through the loud rsp_gap_abort_teardown() ([RSP-V2-GAP-ABORT],
+//     DROPPED) rather than a silent truncated delivery.
+//
+// fail-before (MERCURY_PREVBUMP_DEFEAT=1): the gate is COUNT-only and the reshrink
+//   delivers the truncated batch -> L1 silently drops {24,25}; L2 silently drops
+//   the orphan. The arms ASSERT the silent-wrong-bytes reproduces.
+// pass-after (defeat off): L1 gate held by the SET check (then faithful on
+//   retransmit); L2 loud-aborts. byte-faithful-OR-loud-abort holds.
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_prevbump_frame_hole()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_PREVBUMP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-PREVBUMP-HOLE] start (MERCURY_PREVBUMP_DEFEAT=%d)\n", defeat ? 1 : 0);
+	fflush(stdout);
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-PREVBUMP-HOLE] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled = true;
+	this->sack_enabled    = true;
+	// Drive the NO-COMPRESSION leg of copy_data_to_buffer (arq_common.cc:9863) so
+	// each delivered slot pushes its own bytes verbatim — a byte-exact oracle.
+	// compression_viable_for_batch() returns false when compression_enabled==false.
+	this->compression_enabled = false;
+	// OFDM (non-robust) config so the set_data_batch_size chokepoint takes the
+	// OFDM branch (arq_common.cc:1200) for the L2 shrink. CONFIG_0 == 0 is OFDM.
+	this->current_configuration = 0;
+	this->link_status = CONNECTED;
+
+	int fails = 0;
+
+	// Per-slot synthetic payload: SLOT_BYTES bytes/slot, byte = (slot*SLOT_BYTES+j).
+	// Distinct per slot so a skipped hole AND a wrong-at-seam concat are detectable.
+	const int SLOT_BYTES = 16;
+	auto fill_slot = [&](int idx, int bsi) {
+		for(int j=0; j<SLOT_BYTES; j++)
+			messages_rx_prev[idx].data[j] = (char)(unsigned char)(idx * SLOT_BYTES + j);
+		messages_rx_prev[idx].length       = SLOT_BYTES;
+		messages_rx_prev[idx].status       = RECEIVED;
+		messages_rx_prev[idx].batch_seq_id = bsi;
+	};
+	auto clear_prev = [&]() {
+		for(int i=0; i<this->nMessages; i++)
+		{
+			messages_rx_prev[i].status = FREE;
+			messages_rx_prev[i].length = 0;
+		}
+	};
+
+	// Production-faithful prev-delivery: apply the EXACT gate at arq_responder.cc:786
+	// (count gate + the REAL prev_batch_is_frame_complete() SET helper, respecting
+	// MERCURY_PREVBUMP_DEFEAT), then drive the REAL copy_data_to_buffer() through the
+	// SAME messages_rx<->messages_rx_prev pointer swap the production path uses
+	// (arq_responder.cc:876-901). Returns true iff the gate fired AND delivered.
+	auto try_prev_deliver = [&]()->bool {
+		bool count_ok = (rsp_prev_batch_active
+		                 && rsp_prev_batch_received_count >= rsp_prev_batch_expected_count);
+		// The fix: also require the per-slot SET completeness (helper). Under defeat,
+		// model the PRE-FIX count-only gate so the silent-wrong-bytes reproduces.
+		bool set_ok = defeat ? true : prev_batch_is_frame_complete();
+		if(!(count_ok && set_ok))
+			return false;
+		// Deliver via the production pointer swap (mirror arq_responder.cc:876-901).
+		struct st_message* saved_rx = messages_rx;
+		messages_rx = messages_rx_prev;
+		for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+			if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+		copy_data_to_buffer();                  // REAL reassembler + REAL fifo push
+		messages_rx = saved_rx;
+		for(int i=0; i<this->nMessages; i++)
+			messages_rx_prev[i].status = FREE;
+		rsp_prev_batch_active         = false;
+		rsp_prev_batch_received_count = 0;
+		rsp_prev_batch_expected_count = 0;
+		return true;
+	};
+
+	// ========================================================================
+	// L1-CLEAN arm (false-positive guard): a frame-COMPLETE prev (no hole) must
+	// deliver byte-identical in BOTH modes (helper true on the faithful path).
+	// expected_count = 6, slots {0..5} all RECEIVED.
+	// ========================================================================
+	{
+		this->fifo_buffer_rx.flush();
+		clear_prev();
+		this->data_batch_size = 6;
+		const int CLEAN_BSI = 3;
+		for(int i=0; i<6; i++) fill_slot(i, CLEAN_BSI);
+		rsp_prev_batch_seq_id         = CLEAN_BSI;
+		rsp_prev_batch_active         = true;
+		rsp_prev_batch_received_count = 6;
+		rsp_prev_batch_expected_count = 6;
+
+		bool delivered = try_prev_deliver();
+		char drained[8 * SLOT_BYTES];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+		char want[6 * SLOT_BYTES];
+		for(int i=0; i<6; i++)
+			for(int j=0; j<SLOT_BYTES; j++)
+				want[i*SLOT_BYTES+j] = (char)(unsigned char)(i*SLOT_BYTES+j);
+		bool ok = delivered && (popped == 6*SLOT_BYTES)
+		          && (memcmp(drained, want, 6*SLOT_BYTES) == 0);
+		if(!ok)
+		{
+			printf("[TEST-PREVBUMP-HOLE] FAIL L1-CLEAN: complete prev not delivered "
+				"byte-identical (delivered=%d popped=%d want=%d)\n",
+				delivered, popped, 6*SLOT_BYTES);
+			fails++;
+		}
+		else
+			printf("[TEST-PREVBUMP-HOLE] L1-CLEAN PASS: complete prev delivered "
+				"byte-identical (%dB, slots 0..5) in both modes\n", popped);
+		fflush(stdout);
 	}
 
-	// (d) received_count recomputed to the count within [0,NEW_BATCH) = 9.
-	if(this->rsp_prev_batch_received_count != reachable_received)
+	// ========================================================================
+	// L1 arm: EOB-short expected_count + a LOW hole covered by TAIL slots.
+	// data_batch_size=30, expected_count=26 (EOB at seq 25). RECEIVED {0..23,26,27}
+	// → received_count=26 reaches expected_count=26, but {24,25} (inside [0,26))
+	// are FREE. PRE-FIX: count gate fires, copy_data_to_buffer concatenates the 26
+	// ACKED slots {0..23,26,27}, silently dropping {24,25} → a byte jump 23->26
+	// (silent-wrong-bytes). POST-FIX: prev_batch_is_frame_complete() is false → gate
+	// HELD; the {24,25} retransmits arrive → the full received set {0..27} delivers
+	// in order (the reassembler iterates [0,data_batch_size), so the legitimate tail
+	// 26,27 are part of the faithful stream — the fix only ensures NO LOW slot is
+	// skipped).
+	// ========================================================================
 	{
-		printf("[TEST-BATCH-SHRINK] FAIL: received_count=%d (expected recomputed to %d)\n",
-			this->rsp_prev_batch_received_count, reachable_received);
-		pass = false;
+		this->fifo_buffer_rx.flush();
+		clear_prev();
+		this->data_batch_size = 30;
+		const int L1_BSI    = 9;
+		const int EXPECTED  = 26;   // EOB-short: < data_batch_size (30)
+		// RECEIVED: {0..23} (24 slots) + tail {26,27} (2 slots) = 26 total.
+		// HOLE: {24,25} inside [0,EXPECTED).
+		for(int i=0; i<=23; i++) fill_slot(i, L1_BSI);
+		fill_slot(26, L1_BSI);
+		fill_slot(27, L1_BSI);
+		rsp_prev_batch_seq_id         = L1_BSI;
+		rsp_prev_batch_active         = true;
+		rsp_prev_batch_received_count = 26;   // count reaches EXPECTED via tail slots
+		rsp_prev_batch_expected_count = EXPECTED;
+
+		// Vacuity guard: the COUNT gate MUST be reached (else the test proves nothing).
+		bool count_reached = (rsp_prev_batch_received_count >= rsp_prev_batch_expected_count);
+		if(!count_reached)
+		{
+			printf("[TEST-PREVBUMP-HOLE] FAIL L1(vacuous): count gate not reached "
+				"(received=%d expected=%d)\n",
+				rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
+			fails++;
+		}
+
+		bool delivered_first = try_prev_deliver();
+		char drained[40 * SLOT_BYTES];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+
+		// Two reference byte-streams:
+		//  - DEFEAT (the BUG): the count gate fires with {24,25} FREE; the reassembler
+		//    concatenates the 26 ACKED slots {0..23,26,27} in index order = 26*16=416B,
+		//    so slot-26's bytes land at the slot-24 stream position (the hole skipped) —
+		//    NOT a contiguous prefix (a SILENT byte jump 23->26).
+		//  - PASS-AFTER (faithful): the gate HOLDS until the {24,25} retransmits land;
+		//    then ALL received slots {0..27} deliver in index order = 28*16=448B, a
+		//    fully CONTIGUOUS in-order byte stream (no hole, no jump). copy_data_to_buffer
+		//    iterates [0,data_batch_size) so the legitimate tail slots 26,27 are part of
+		//    the faithful delivery — the point of the fix is that no LOW slot is skipped.
+		char holed[26 * SLOT_BYTES];      // the buggy concat {0..23,26,27}
+		{
+			int off = 0;
+			int idxs[26]; { int n=0; for(int i=0;i<=23;i++) idxs[n++]=i; idxs[n++]=26; idxs[n++]=27; }
+			for(int k=0; k<26; k++)
+				for(int j=0; j<SLOT_BYTES; j++)
+					holed[off++] = (char)(unsigned char)(idxs[k]*SLOT_BYTES + j);
+		}
+		char faithful[28 * SLOT_BYTES];   // the in-order complete set {0..27}
+		for(int i=0; i<28; i++)
+			for(int j=0; j<SLOT_BYTES; j++)
+				faithful[i*SLOT_BYTES+j] = (char)(unsigned char)(i*SLOT_BYTES+j);
+
+		if(defeat)
+		{
+			// FAIL-BEFORE: the count-only gate fired and delivered the HOLED batch.
+			bool delivered = delivered_first;
+			bool size_is_count = (popped == 26*SLOT_BYTES);   // 26 ACKED slots pushed
+			bool wrong_at_seam = (popped >= 25*SLOT_BYTES)
+				&& (drained[24*SLOT_BYTES] == (char)(unsigned char)(26*SLOT_BYTES + 0));
+			bool matches_holed = size_is_count
+				&& (memcmp(drained, holed, 26*SLOT_BYTES) == 0);
+			bool is_faithful = (popped == 28*SLOT_BYTES)
+				&& (memcmp(drained, faithful, 28*SLOT_BYTES) == 0);
+			if(!delivered)         { printf("[TEST-PREVBUMP-HOLE] FAIL L1(defeat): count gate did NOT fire (expected the pre-fix premature delivery)\n"); fails++; }
+			else if(!size_is_count){ printf("[TEST-PREVBUMP-HOLE] FAIL L1(defeat): delivered %dB, expected 26 ACKED slots = %dB\n", popped, 26*SLOT_BYTES); fails++; }
+			else if(!wrong_at_seam){ printf("[TEST-PREVBUMP-HOLE] FAIL L1(defeat): slot-24 seam not the slot-26 bytes — hole-skip not reproduced\n"); fails++; }
+			else if(!matches_holed){ printf("[TEST-PREVBUMP-HOLE] FAIL L1(defeat): delivered bytes != the buggy {0..23,26,27} concat\n"); fails++; }
+			else if(is_faithful)   { printf("[TEST-PREVBUMP-HOLE] FAIL L1(defeat): delivered bytes were faithful — silent-wrong-bytes NOT reproduced\n"); fails++; }
+			else
+				printf("[TEST-PREVBUMP-HOLE] L1(defeat) reproduced silent-wrong-bytes: "
+					"count gate fired with a {24,25} HOLE, copy_data_to_buffer dropped it, "
+					"delivered 26 ACKED slots (%dB) with slot-26 bytes at the slot-24 seam "
+					"(a silent byte jump 23->26, NOT a contiguous in-order stream) — "
+					"fail-before confirmed\n", popped);
+		}
+		else
+		{
+			// PASS-AFTER step 1: the SET helper holds the gate — NOTHING delivered yet.
+			if(delivered_first) { printf("[TEST-PREVBUMP-HOLE] FAIL L1: gate fired with a {24,25} hole still open (SET check missing)\n"); fails++; }
+			if(popped != 0)     { printf("[TEST-PREVBUMP-HOLE] FAIL L1: %dB delivered while the prev was incomplete (must hold, not deliver)\n", popped); fails++; }
+			// PASS-AFTER step 2: the SACK-driven retransmits for {24,25} arrive →
+			// the prev is now frame-complete → the gate fires → FAITHFUL in-order {0..27}.
+			fill_slot(24, L1_BSI);   // missing low slots filled by the CMD retransmit
+			fill_slot(25, L1_BSI);
+			// received_count now reflects the 2 newly-RECEIVED low slots (28 total).
+			rsp_prev_batch_received_count = 28;
+			bool delivered_second = try_prev_deliver();
+			char drained2[40 * SLOT_BYTES];
+			int popped2 = this->fifo_buffer_rx.pop(drained2, (int)sizeof(drained2));
+			bool faithful_ok = delivered_second
+				&& (popped2 == 28*SLOT_BYTES)
+				&& (memcmp(drained2, faithful, 28*SLOT_BYTES) == 0);
+			if(!delivered_second) { printf("[TEST-PREVBUMP-HOLE] FAIL L1: gate did NOT fire after the {24,25} retransmits completed the set\n"); fails++; }
+			else if(!faithful_ok) { printf("[TEST-PREVBUMP-HOLE] FAIL L1: post-retransmit delivery not the faithful in-order {0..27} stream (popped=%d, want %d)\n", popped2, 28*SLOT_BYTES); fails++; }
+			else
+				printf("[TEST-PREVBUMP-HOLE] L1 PASS: gate HELD on the {24,25} hole, then "
+					"delivered the FAITHFUL in-order {0..27} stream (%dB) once the "
+					"retransmits completed the set — byte-faithful, no silent drop, no jump\n", popped2);
+		}
+		// Clear any residue.
+		clear_prev();
+		rsp_prev_batch_active = false;
+		rsp_prev_batch_received_count = 0;
+		rsp_prev_batch_expected_count = 0;
+		fflush(stdout);
 	}
 
-	// (e) the gate is now REACHABLE (received can reach expected as the missing
-	//     in-window slot arrives): expected==NEW_BATCH and reachable slots exist.
-	bool postfix_gate_reachable =
-		(this->rsp_prev_batch_expected_count <= NEW_BATCH);
-	if(!postfix_gate_reachable)
+	// ========================================================================
+	// L2 arm: R035 reshrink orphans an in-flight RECEIVED frame. Arm prev
+	// expected=11 with a RECEIVED orphan at index 12, [0..9] complete; shrink
+	// data_batch_size 15->10 via the REAL set_data_batch_size(10) chokepoint.
+	// PRE-FIX: the reshrink delivers the truncated batch (orphan's bytes lost) —
+	// modeled by the pre-fix-equivalent reachable-gate check; POST-FIX: the orphan
+	// routes through the LOUD rsp_gap_abort_teardown() (DROPPED, no silent delivery).
+	// Drives the REAL set_data_batch_size + the REAL teardown.
+	// ========================================================================
 	{
-		printf("[TEST-BATCH-SHRINK] FAIL: post-fix gate still unreachable "
-		       "(expected_count=%d > new_batch=%d)\n",
-			this->rsp_prev_batch_expected_count, NEW_BATCH);
-		pass = false;
+		this->fifo_buffer_rx.flush();
+		clear_prev();
+		this->link_status = CONNECTED;
+		this->current_configuration = 0;     // OFDM branch of the chokepoint
+		this->data_batch_size = 15;
+		const int OLD_BATCH = 15;
+		const int NEW_BATCH = 10;
+		const int L2_BSI    = 7;
+		// [0..9] RECEIVED (complete prefix in the NEW bound) + orphan at 12.
+		for(int i=0; i<=9; i++) fill_slot(i, L2_BSI);
+		fill_slot(12, L2_BSI);               // orphan in [NEW_BATCH, OLD_BATCH)
+		rsp_prev_batch_seq_id         = L2_BSI;
+		rsp_prev_batch_active         = true;
+		rsp_prev_batch_received_count = 11;  // 10 + the orphan
+		rsp_prev_batch_expected_count = OLD_BATCH;   // 15 (frozen at old size)
+
+		// Streaming on so the (pre-fix) streaming-reset path is exercisable.
+		compressor.init();
+		compressor.streaming_enable();
+		this->batch_data_delivered = true;
+
+		// SHRINK via the REAL chokepoint (NOT a direct assign).
+		set_data_batch_size(NEW_BATCH);
+
+		if(defeat)
+		{
+			// FAIL-BEFORE: the reshrink did NOT loud-abort — it lowered the counters
+			// and (would have) delivered the truncated batch. Assert the pre-fix
+			// state: NOT DROPPED, prev still active, counters re-derived to the new
+			// bound (the orphan's bytes are now unreachable = silently lost).
+			bool not_dropped   = (this->link_status != DROPPED);
+			bool still_active  = (rsp_prev_batch_active);
+			bool counters_rebased = (rsp_prev_batch_expected_count == NEW_BATCH)
+				&& (rsp_prev_batch_received_count == 10);   // 10 in [0,NEW_BATCH)
+			if(!not_dropped)       { printf("[TEST-PREVBUMP-HOLE] FAIL L2(defeat): link DROPPED — the loud abort fired under defeat (expected the silent truncation)\n"); fails++; }
+			else if(!still_active) { printf("[TEST-PREVBUMP-HOLE] FAIL L2(defeat): prev not active after shrink (expected silent re-derive)\n"); fails++; }
+			else if(!counters_rebased){ printf("[TEST-PREVBUMP-HOLE] FAIL L2(defeat): counters not re-derived to the new bound (expected=%d received=%d)\n", rsp_prev_batch_expected_count, rsp_prev_batch_received_count); fails++; }
+			else
+				printf("[TEST-PREVBUMP-HOLE] L2(defeat) reproduced silent orphan-drop: "
+					"reshrink %d->%d re-derived expected->%d received->%d and KEPT the "
+					"prev active (orphan slot 12 now unreachable, bytes silently lost), "
+					"link NOT DROPPED — fail-before confirmed\n",
+					OLD_BATCH, NEW_BATCH, rsp_prev_batch_expected_count, rsp_prev_batch_received_count);
+		}
+		else
+		{
+			// PASS-AFTER: the orphan routed through the LOUD teardown.
+			bool dropped     = (this->link_status == DROPPED);
+			bool prev_clear  = (!rsp_prev_batch_active)
+				&& (rsp_prev_batch_seq_id == -1)
+				&& (rsp_current_expected_batch_seq_id == -1);
+			char l2drain[40 * SLOT_BYTES];
+			bool no_delivery = (this->fifo_buffer_rx.pop(l2drain, (int)sizeof(l2drain)) == 0);
+			bool ok = true;
+			if(!dropped)     { printf("[TEST-PREVBUMP-HOLE] FAIL L2: orphan reshrink did NOT loud-abort (link_status=%d, want DROPPED)\n", this->link_status); ok=false; }
+			if(!prev_clear)  { printf("[TEST-PREVBUMP-HOLE] FAIL L2: prev/bsi family not cleared by the teardown (active=%d prev=%d cur=%d)\n", rsp_prev_batch_active, rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id); ok=false; }
+			if(!no_delivery) { printf("[TEST-PREVBUMP-HOLE] FAIL L2: bytes were silently delivered before/around the abort\n"); ok=false; }
+			if(!ok) fails++;
+			else
+				printf("[TEST-PREVBUMP-HOLE] L2 PASS: reshrink %d->%d orphaned slot 12 -> "
+					"[RSP-V2-GAP-ABORT] loud teardown, link DROPPED, prev family cleared, "
+					"no silent truncated delivery (byte-faithful-OR-loud-abort)\n",
+					OLD_BATCH, NEW_BATCH);
+		}
+		fflush(stdout);
 	}
 
-	// (f) the orphaned RECEIVED slot (12) triggered the streaming defense, which
-	//     RESETS (not DISABLES) streaming — streaming must still be active.
-	bool streaming_after = compressor.is_streaming();
-	if(!streaming_after)
-	{
-		printf("[TEST-BATCH-SHRINK] FAIL: streaming was DISABLED by the shrink "
-		       "(expected streaming_reset, which keeps it active)\n");
-		pass = false;
-	}
-
-	printf("[TEST-BATCH-SHRINK] %s: data_batch_size=%d expected=%d received=%d "
-	       "prefix_reachable=%d postfix_reachable=%d streaming %d->%d "
-	       "(orphan in [%d,%d) drove the desync defense)\n",
-		pass ? "PASS" : "FAIL", this->data_batch_size,
-		this->rsp_prev_batch_expected_count, this->rsp_prev_batch_received_count,
-		prefix_gate_reachable ? 1 : 0, postfix_gate_reachable ? 1 : 0,
-		streaming_before ? 1 : 0, streaming_after ? 1 : 0,
-		NEW_BATCH, OLD_BATCH);
+	bool pass = (fails == 0);
+	printf("[TEST-PREVBUMP-HOLE] %s: fails=%d (defeat=%d) — arms: L1-CLEAN, L1 (EOB-short tail "
+		"covers a low hole), L2 (reshrink orphan)\n",
+		pass ? "PASS" : "FAIL", fails, defeat ? 1 : 0);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }

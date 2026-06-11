@@ -1047,10 +1047,49 @@ void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
 	if(new_expected > new_batch) new_expected = new_batch;
 	if(new_expected < 1)         new_expected = 1;
 
-	// If RECEIVED prev data is orphaned beyond the new bound, the prev batch can
-	// no longer be delivered intact. Fire the streaming defense (same guard +
-	// handshake as the in-order delivery leg) BEFORE the data is discarded, so
-	// the next TX batch detects RX-cold and resets — no silent PPMd desync.
+	printf("[RSP-V2-PREV-RESHRINK] data_batch_size %d->%d prev_batch_seq_id=%d "
+		"received %d->%d expected %d->%d orphaned_received=%d\n",
+		old_batch, new_batch, rsp_prev_batch_seq_id,
+		rsp_prev_batch_received_count, new_received,
+		old_expected, new_expected, orphaned_received);
+	fflush(stdout);
+
+	// D4 (data-flow-prev-bump.md §5, L2): a RECEIVED prev frame orphaned beyond the
+	// new (smaller) bound can NEVER be delivered intact — its bytes sit at an index
+	// the delivery loop (i<data_batch_size=new) no longer reads, so a silent
+	// re-derive + later deliver would push the SHORTER batch as "complete" and lose
+	// the orphaned frame's bytes (silent-wrong-bytes, invisible to the batch-level
+	// D3.1 gate). Extend the D3.1 "byte-faithful-OR-loud-abort" promise to this
+	// within-batch frame-drop case: route through the SAME loud teardown the
+	// batch-level gate uses ([RSP-V2-GAP-ABORT], DROPPED, refuse silent
+	// concatenation). The teardown clears the prev/bsi family + reset_session_state()
+	// (which subsumes the old streaming_reset desync defense — no double reset). It
+	// does NOT call set_data_batch_size, so calling it from inside this rescan
+	// (which runs at the set_data_batch_size chokepoint BEFORE data_batch_size is
+	// stored) is re-entrancy-safe; the chokepoint's trailing `this->data_batch_size
+	// = clamped` is harmless on a now-DROPPED link. MERCURY_PREVBUMP_DEFEAT=1
+	// restores the pre-fix silent truncation for the --test-prevbump-frame-hole
+	// (and --test-batch-shrink-strands-prev) fail-before arm.
+	bool prevhole_defeat = false;
+	{ const char* e = std::getenv("MERCURY_PREVBUMP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) prevhole_defeat = true; }
+	if(orphaned_received > 0 && !prevhole_defeat)
+	{
+		char reason[128];
+		snprintf(reason, sizeof(reason),
+			"PREV frame orphaned by data_batch_size shrink %d->%d "
+			"(orphaned_received=%d, prev bsi=%d) — within-batch frame hole",
+			old_batch, new_batch, orphaned_received, rsp_prev_batch_seq_id);
+		// Re-derive the counters first (diagnostic parity) even though the teardown
+		// clears them — keeps the log line above truthful about the new bound.
+		rsp_prev_batch_received_count = new_received;
+		rsp_prev_batch_expected_count = new_expected;
+		rsp_gap_abort_teardown(reason);
+		return;   // link DROPPED + prev family cleared; nothing more to re-derive
+	}
+
+	// No orphan (or defeat): fire the streaming desync defense (the original R035
+	// leg) BEFORE the silent re-derive so the next TX batch detects RX-cold.
 	if(orphaned_received > 0 && compressor.is_streaming() && batch_data_delivered)
 	{
 		compressor.streaming_reset();
@@ -1059,13 +1098,6 @@ void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
 			old_batch, new_batch, orphaned_received);
 		fflush(stdout);
 	}
-
-	printf("[RSP-V2-PREV-RESHRINK] data_batch_size %d->%d prev_batch_seq_id=%d "
-		"received %d->%d expected %d->%d orphaned_received=%d\n",
-		old_batch, new_batch, rsp_prev_batch_seq_id,
-		rsp_prev_batch_received_count, new_received,
-		old_expected, new_expected, orphaned_received);
-	fflush(stdout);
 
 	rsp_prev_batch_received_count = new_received;
 	rsp_prev_batch_expected_count = new_expected;
@@ -6438,6 +6470,39 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 		rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
 		xferred, rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
 	fflush(stdout);
+}
+
+// D4 (data-flow-prev-bump.md §5): the WITHIN-batch frame-completeness predicate
+// for the cross-storage prev delivery gate. Returns true IFF every slot in
+// [0, expected_count) of messages_rx_prev[] is RECEIVED-or-ACKED. The standing
+// gate `received_count >= expected_count` (arq_responder.cc:786) is a CARDINALITY
+// test: a RECEIVED tail slot in [expected_count, data_batch_size) (L1) — or a
+// reshrink that re-derived the count past an orphaned frame (L2) — can satisfy the
+// count while a slot INSIDE [0, expected_count) is still FREE. copy_data_to_buffer
+// then silently skips that within-batch hole (silent-wrong-bytes), and the
+// batch-level D3.1 contiguity gate (delivery_step_is_gap, no slot argument) cannot
+// see it. This is the SET check the gate needs. BYTE-IDENTICAL on the faithful
+// path (true exactly when the set is complete) — so the faithful prev delivery is
+// unchanged; only a frame-holed batch is held (until the SACK-driven retransmit
+// completes the set, or the stale-discard / demote-rebase clears it).
+bool cl_arq_controller::prev_batch_is_frame_complete() const
+{
+	int e = rsp_prev_batch_expected_count;
+	// Defensive clamp: never read past the allocated slot range. expected_count is
+	// derived from min(data_batch_size, eob+1) by the producer (arq_common.cc:6382)
+	// but bound it here against data_batch_size and nMessages so a stale/diverged
+	// expected can never index out of bounds.
+	if(e > this->data_batch_size) e = this->data_batch_size;
+	if(e > this->nMessages)       e = this->nMessages;
+	if(e <= 0) return false;   // nothing to deliver yet — not "complete"
+	if(messages_rx_prev == NULL) return false;
+	for(int i = 0; i < e; i++)
+	{
+		int s = messages_rx_prev[i].status;
+		if(s != RECEIVED && s != ACKED)
+			return false;       // a low-index hole — the batch is NOT frame-complete
+	}
+	return true;
 }
 
 // FIX-8 (data-integrity): advance the reset-surviving delivery high-water mark

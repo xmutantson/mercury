@@ -403,6 +403,23 @@ public:
   // leg). `new_batch` is the post-clamp value about to be stored. See
   // data-flow-arq-recovery-cluster.md §4.3 / §5.2.
   void rescan_prev_on_batch_shrink(int new_batch);
+
+  // D4 (data-flow-prev-bump.md §5): the WITHIN-batch frame-completeness predicate
+  // for the cross-storage prev delivery gate (arq_responder.cc:786). The standing
+  // gate `received_count >= expected_count` is a CARDINALITY test — it fires when
+  // the NUMBER of RECEIVED prev slots reaches expected_count, NOT that the RECEIVED
+  // SET == {0..expected_count-1}. Two producer realizations let the COUNT reach
+  // expected_count while a slot INSIDE [0,expected_count) is still FREE → a
+  // within-batch HOLE that copy_data_to_buffer (arq_common.cc:9712/9863) silently
+  // skips (silent-wrong-bytes), invisible to the batch-level D3.1 contiguity gate
+  // (delivery_step_is_gap, no slot argument). This returns true IFF every slot in
+  // [0, expected_count) of messages_rx_prev[] is RECEIVED-or-ACKED — the SET check
+  // the gate needs. The gate becomes
+  //   active && received_count >= expected_count && prev_batch_is_frame_complete()
+  // so a tail slot in [expected,data_batch_size) can no longer cover a missing low
+  // slot. BYTE-IDENTICAL on the faithful path (true when the set is complete).
+  // expected_count is clamped to [0,data_batch_size,nMessages] defensively.
+  bool prev_batch_is_frame_complete() const;
   // R029 (race audit 2026-06-06) — the SINGLE owner of zeroing the TX retransmit
   // queue. The retransmit_frames[] / retransmit_count parallel arrays hold frames
   // captured (and, under encryption, byte-encoded) for the LIVE crypto epoch +
@@ -2161,6 +2178,31 @@ public:
   // orphaned slot fires a single streaming_reset (streaming stays active).
   // Returns 0=PASS, 1=FAIL.
   int test_batch_shrink_strands_prev();
+
+  // D4 (data-flow-prev-bump.md §5.4) — the PREV-BUMP cross-storage WITHIN-batch
+  // frame-hole silent-wrong-bytes regression. CLI: --test-prevbump-frame-hole.
+  // Drives the REAL cross-storage delivery: arms messages_rx_prev[] with the L1 /
+  // L2 hole topologies, applies the EXACT production gate decision (the count gate
+  // + the REAL prev_batch_is_frame_complete() helper, respecting
+  // MERCURY_PREVBUMP_DEFEAT), runs the REAL copy_data_to_buffer() through the same
+  // pointer-swap the production prev path uses, and uses the REAL fifo_buffer_rx as
+  // the byte oracle.
+  //   L1 arm: data_batch_size=30, EOB → expected_count=26; RECEIVED {0..23,26,27}
+  //     (count 26 reaches expected) with a HOLE at {24,25} inside [0,26). PRE-FIX
+  //     (defeat): count gate fires → copy_data_to_buffer concatenates ACKED slots,
+  //     SILENTLY dropping {24,25} → delivered bytes ≠ the in-order [0..25] prefix
+  //     (silent-wrong-bytes reproduced). POST-FIX: prev_batch_is_frame_complete()
+  //     is false → gate held; inject the {24,25} retransmits → faithful [0..25].
+  //   L2 arm: arm prev expected=11 with a RECEIVED orphan at index 12; shrink via
+  //     the REAL set_data_batch_size(10) chokepoint. PRE-FIX: truncated batch
+  //     delivered (orphaned frame's bytes lost). POST-FIX: [RSP-V2-GAP-ABORT]
+  //     fires, link_status==DROPPED, no silent delivery.
+  //   L1-CLEAN arm (false-positive guard): a frame-COMPLETE prev (no hole) must
+  //     still deliver byte-identical (helper true) in both modes.
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  // See fact-documents/data-flow-prev-bump.md + the D4 escalation
+  // bigblock_p3_hw/_cfg16acqd2d3/CFG16_ACQ_D2D3_VERDICT.md §3.
+  int test_prevbump_frame_hole();
 
   // R029 (race audit 2026-06-06) — stale-retx-queue-cleared-on-recovery test.
   // CLI: --test-retx-clear-on-recovery. Populates retransmit_count>0 with a known
