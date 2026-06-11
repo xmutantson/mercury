@@ -560,6 +560,35 @@ public:
   // outcome, otherwise the next poll re-detects the same pattern.
   bool receive_ack_pattern(bool defer_audio_advance = false);
 
+  // Multi-window DATA-ACK/SACK correlator (Track A, mwcorr;
+  // fact-documents/data-flow-data-ack-sack-correlator.md). The steady
+  // SACK-suffix probe in process_messages_rx_acks_data() only correlates the
+  // NEWEST tail of the capture ring; on a long held-CFG16 forward batch the
+  // reverse ACK+SACK arrives once, late and mis-phased, then trailing idle
+  // silence scrolls it out of the newest tail before the snapshot fires
+  // (bench-9 matched=0/7, peak_metric=0.00). The burst is NOT lost — the
+  // double-mapped ring (data_container.cc:170) retains ~buffer_Nsymb (~1301)
+  // symbols, far more than the ACK round-trip, so it sits at an OLDER phase.
+  //
+  // mw_find_ack_sack_phase() steps the search phase back through the retained
+  // ring history in ACK-pattern-length strides, energy-gating each phase, and
+  // runs the SAME decode_ack_sack_from_passband() + CRC12 check at each
+  // energetic phase. It accepts the FIRST older phase whose decode passes CRC12
+  // and returns its tail-offset in *chosen_off (>=0 on a hit, -1 on a genuine
+  // all-silence/all-CRC-fail miss). It ONLY locates a phase — the caller
+  // re-snapshots that phase and re-runs the EXACT existing decode body + the
+  // bsi-window/bitmap/dedupe sanity verbatim, so acceptance semantics are
+  // unchanged. It writes NOTHING to the ring or frames_to_read; it reads the
+  // ring under capture_prep_mutex exactly as the existing snapshot does.
+  // Gated by mw_data_ack_multiwindow_enabled() (env MERCURY_DATA_ACK_MULTIWINDOW,
+  // default OFF -> caller is byte-identical to monitor 627c370).
+  bool mw_find_ack_sack_phase(int rwi, int tail_offset, int tail_samples,
+                              int sym_samples, int pattern_len, int* chosen_off);
+
+  // Cached env gate for the multi-window DATA-ACK/SACK scan. Reads
+  // MERCURY_DATA_ACK_MULTIWINDOW once (no getenv in the hot poll loop).
+  bool mw_data_ack_multiwindow_enabled();
+
   // §7.13.29 — apply the ftr=4 + search_raw resets that
   // receive_ack_pattern(defer_audio_advance=true) skipped. Idempotent.
   void commit_ack_pattern_consumed();
@@ -1812,6 +1841,19 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
   int test_gap_abort_on_readopt();
+
+  // Multi-window DATA-ACK/SACK correlator regression (Track A, mwcorr;
+  // CLI --test-data-ack-multiwindow). Self-contained, in-process, no IONOS/RF.
+  // Loads a WB config, synthesizes a real ACK+SACK passband burst via
+  // generate_ack_sack_pattern_passband(), places it at an OLDER ring phase with
+  // the newest tail filled with silence, and asserts:
+  //   fail-before  : the newest-tail decode MISSES (decoded=false / matched<thr);
+  //   pass-after   : mw_find_ack_sack_phase() (env ON) recovers the SAME
+  //                  bsi/bitmap with CRC12 pass at the older phase;
+  //   no-false-acc : a pure-silence ring yields no phase in BOTH modes.
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  // See fact-documents/data-flow-data-ack-sack-correlator.md §7.
+  int test_data_ack_multiwindow();
 
   // D3.1 (data-integrity) — UNIFIED in-order-delivery across EVERY demote case.
   // In-process SIM_INPROC synthetic-fire (CLI --test-inorder-demote). Drives the

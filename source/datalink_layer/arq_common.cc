@@ -7888,6 +7888,147 @@ void cl_arq_controller::commit_ack_pattern_consumed()
 	MUTEX_UNLOCK(&capture_prep_mutex);
 }
 
+// Multi-window DATA-ACK/SACK correlator gate. Reads MERCURY_DATA_ACK_MULTIWINDOW
+// once (cached) so the hot poll loop pays no getenv() cost. Default OFF ->
+// process_messages_rx_acks_data() is byte-identical to monitor 627c370.
+// fact-documents/data-flow-data-ack-sack-correlator.md §4/§6.
+bool cl_arq_controller::mw_data_ack_multiwindow_enabled()
+{
+	// -1 = unread, 0 = off, 1 = on.
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_DATA_ACK_MULTIWINDOW");
+		cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+// Multi-window DATA-ACK/SACK phase search. Steps the search phase back through
+// the retained capture-ring history in ACK-pattern-length strides, energy-gating
+// each phase, and runs the SAME decode_ack_sack_from_passband() + CRC12 check at
+// each energetic phase. Returns true and sets *chosen_off to the tail-offset of
+// the FIRST older phase whose decode passes CRC12; returns false (and *chosen_off
+// = -1) on a genuine all-silence / all-CRC-fail miss.
+//
+// ONLY locates a phase. Writes NOTHING to the ring or frames_to_read; reads the
+// ring under capture_prep_mutex exactly as the existing snapshot does. The caller
+// re-snapshots the chosen phase and re-runs the EXACT decode body + bsi-window /
+// bitmap / dedupe sanity verbatim, so acceptance semantics are unchanged. The
+// CRC12 gate here is the discriminator that makes an older-phase accept safe —
+// a noise/silence phase cannot pass CRC12 (mfsk-robust-ack.md §3.2). Sizing of
+// the look-back is ∝ the forward batch airtime (data_batch_size *
+// message_transmission_time_ms), the quantity the late shift is proportional to
+// (fact-documents/data-flow-data-ack-sack-correlator.md §1/§6), clamped to the
+// retained ring depth and a hard ceiling.
+bool cl_arq_controller::mw_find_ack_sack_phase(int rwi, int tail_offset,
+	int tail_samples, int sym_samples, int pattern_len, int* chosen_off)
+{
+	if(chosen_off) *chosen_off = -1;
+	if(tail_offset <= 0 || tail_samples <= 0 || sym_samples <= 0) return false;
+#if MFSK_ACK_SACK_ENABLED
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0) return false;
+
+	const double MW_GATE_RMS = 0.001; // == ACK_ENERGY_GATE_RMS (arq_common.cc:7947)
+	// Stride one ACK-pattern length per phase so consecutive search windows
+	// overlap by the full search range (no ACK can fall entirely between two
+	// phases). The double-mapped ring (data_container.cc:170) makes [rwi+off]
+	// for off in [0, tail_offset] a contiguous, in-bounds tail.
+	int stride = pattern_len * sym_samples;
+	if(stride < sym_samples) stride = sym_samples;
+
+	// Look-back depth: size to the held-CFG16 forward batch airtime (the late
+	// shift is ∝ data_batch_size * message_transmission_time_ms), expressed in
+	// stride steps, then clamp to the retained ring depth and a hard ceiling.
+	const int MW_DATA_ACK_MAX_PHASES = 64;     // hard ceiling on per-poll cost
+	int max_phases = MW_DATA_ACK_MAX_PHASES;
+	{
+		// Batch-airtime-driven look-back: how many ACK-pattern strides cover the
+		// forward batch's worth of accrued late shift. message_transmission_time_ms
+		// is one DATA frame's airtime; data_batch_size frames is the held batch.
+		long long batch_airtime_ms =
+			(long long)data_batch_size * (long long)message_transmission_time_ms;
+		double fs = telecom_system->sampling_frequency; // ring capture rate
+		if(batch_airtime_ms > 0 && fs > 0.0)
+		{
+			// Upper bound on where the late ACK could sit = the batch airtime in
+			// ring samples (the late shift is ∝ the forward batch airtime). Add a
+			// 2-stride margin for the ACK round-trip slack, then convert to phases.
+			long long batch_samples =
+				(long long)((double)batch_airtime_ms * fs / 1000.0);
+			long long batch_phases = (batch_samples / (long long)stride) + 2;
+			if(batch_phases < 1) batch_phases = 1;
+			if(batch_phases < (long long)max_phases)
+				max_phases = (int)batch_phases;
+		}
+	}
+	// Clamp to the retained ring depth: the oldest probe must keep off >= 0.
+	{
+		int max_by_ring = tail_offset / stride;
+		if(max_phases > max_by_ring) max_phases = max_by_ring;
+	}
+	if(max_phases < 1) return false;
+
+	bool hit = false;
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi_mw = (rwi >= 0) ? rwi
+		: telecom_system->data_container.ring_write_index.load();
+	for(int ph = 1; ph <= max_phases; ph++)
+	{
+		int off = tail_offset - ph * stride;
+		if(off < 0) break;
+		// Cheap energy pre-gate: only decode phases that hold signal.
+		const double* pp = &telecom_system->data_container
+			.passband_delayed_data[rwi_mw + off];
+		double sumsq = 0.0;
+		for(int i = 0; i < tail_samples; i++) sumsq += pp[i] * pp[i];
+		double rms = std::sqrt(sumsq / tail_samples);
+		if(rms < MW_GATE_RMS) continue;
+
+		// Decode this older phase with the SAME detector + CRC12 gate the body
+		// uses. memcpy into the scratch buffer (decode reads from there).
+		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+			pp, tail_samples * sizeof(double));
+		uint8_t  mw_bsi = 0;
+		uint32_t mw_bitmap = 0;
+		uint16_t mw_crc12 = 0;
+		int      mw_matched = 0;
+		bool mw_decoded = telecom_system->decode_ack_sack_from_passband(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, &mw_bsi, &mw_bitmap, &mw_crc12, &mw_matched);
+		if(!mw_decoded) continue;
+		// CRC12 verification — identical to the body (arq_commander.cc:2755-2774).
+		char crc_input[5];
+		crc_input[0] = (char)mw_bsi;
+		crc_input[1] = (char)((mw_bitmap >> 24) & 0xFF);
+		crc_input[2] = (char)((mw_bitmap >> 16) & 0xFF);
+		crc_input[3] = (char)((mw_bitmap >>  8) & 0xFF);
+		crc_input[4] = (char)( mw_bitmap        & 0xFF);
+		uint16_t expected_crc12 = CRC12_calc(crc_input, 5);
+		if(mw_crc12 != expected_crc12) continue;
+
+		// Real ACK+SACK frame at this older phase. Hand the offset back; the
+		// caller re-snapshots + re-runs the body's bsi-window/bitmap/dedupe
+		// sanity verbatim (an older phase for the WRONG batch is still rejected
+		// there).
+		if(chosen_off) *chosen_off = off;
+		hit = true;
+		printf("[CMD-MFSK-ACK-SACK-MW] late ACK+SACK found at older phase off=%d "
+			"(newest_tail_off=%d phase=%d/%d matched=%d bsi=%u bitmap=0x%08x)\n",
+			off, tail_offset, ph, max_phases, mw_matched,
+			(unsigned)mw_bsi, (unsigned)mw_bitmap);
+		fflush(stdout);
+		break;
+	}
+	MUTEX_UNLOCK(&capture_prep_mutex);
+	return hit;
+#else
+	(void)rwi; (void)tail_offset; (void)tail_samples;
+	(void)sym_samples; (void)pattern_len;
+	return false;
+#endif
+}
+
 bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 {
 	// Tail must cover the entire fresh audio region (= initial guard).
