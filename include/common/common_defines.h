@@ -527,6 +527,19 @@ inline bool reverse_ack_uses_robust_geometry(int forward_config) {
 // CFG16). The RSP's matching pre-TX settle (ptt_off+ptt_on) is added SEPARATELY in lockstep.
 static const int ROBUST_ACK_DRIFT_MARGIN_MS = 600;
 
+// WALL-B FIX-9 H1 (bigblock_p3_hw/_revackgeom/data-flow-revack-turnaround-geometry.md §5.1): the
+// smallest forward batch (frames) at which the RSP can answer with a PARTIAL SACK (and therefore
+// arm its pre-TX settle, arq_responder.cc:1789). The D2-REFINE producer (arq_commander.cc:1954)
+// arms data_ack_retx_turnaround ONLY on a v2-mixed/degrading batch, which is FALSE on the FIRST
+// partial of a FRESH OFDM batch — the RSP settles that partial ACK while the CMD listen window is
+// still narrow (the §5.1 INV-1 lockstep break -> the partial SACK lands outside -> the silent
+// reverse-ACK miss that drives the D3 starvation deadline). H1 PRE-ARMS the CMD widen for any
+// fresh OFDM batch large enough to go partial, restoring lockstep BEFORE the partial is known. A
+// single-frame batch (data_batch_size==1) can never go partial (one frame is all-or-nothing), so
+// the threshold is the smallest MULTI-frame batch =2. Robust/NB are excluded by the is_ofdm_config
+// gate on the disjunct (this constant only sizes the OFDM arm). TUNABLE.
+static const int BATCH_MAY_BE_PARTIAL_THRESHOLD = 2;
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

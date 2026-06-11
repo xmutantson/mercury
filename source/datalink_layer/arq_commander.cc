@@ -1947,11 +1947,30 @@ void cl_arq_controller::process_messages_tx_data()
 		// WALL-B FIX-9 D2 REFINE (§2.1): this is the new-data / v2-mixed batch path. The data-ACK we
 		// are about to wait for is a RETRANSMIT turnaround iff the batch carried a retx prefix
 		// (v2_mixed_batch) OR a recent CFG16 reverse-ACK was lost (cfg16_revack_starve_fails>0 — arm
-		// the geometry on a degrading ceiling even if THIS batch is pure new-data). A clean
-		// first-pass batch -> false -> the D2 widen does NOT fire (byte-identical to D2-off; the
-		// ~15% clean cost is recovered). The flag is reset to false here on the clean path so a clean
-		// batch after a retx sequence is cheap again.
-		data_ack_retx_turnaround = (v2_mixed_batch || cfg16_revack_starve_fails > 0);
+		// the geometry on a degrading ceiling even if THIS batch is pure new-data).
+		//
+		// WALL-B FIX-9 H1 (data-flow-revack-turnaround-geometry.md §5.1, INV-1 lockstep): ALSO pre-arm
+		// the widen on a FRESH first-pass OFDM batch big enough to go PARTIAL. The D2-REFINE gate
+		// above (v2_mixed || starve>0) is FALSE on the first partial of a fresh CFG16 batch, yet the
+		// RSP arms its pre-TX settle on that partial (arq_responder.cc:1789) -> the settled partial
+		// SACK lands at/outside the still-NARROW CMD window -> the silent reverse-ACK miss that
+		// accumulates the D3 starvation deadline (the ~133s clean CFG16 demote). A missed partial is
+		// NOT a full block-failure, so cfg16_revack_starve_fails does NOT increment — the D2-REFINE
+		// degrading-ceiling arm only fires AFTER a full failure, too late. H1 restores lockstep BEFORE
+		// the partial is known: on any OFDM forward config with a multi-frame batch (where a partial
+		// SACK is possible) the CMD window is pre-widened by ROBUST_ACK_DRIFT_MARGIN_MS (~600ms,
+		// bounded cost, recovered many-fold vs a D3 demote+re-climb of ~25-40s of wire). On a clean
+		// FULL OFDM batch the RSP stays narrow (arq_responder.cc:1980), so the CMD is merely over-wide
+		// (cost, not correctness). Robust/NB are UNTOUCHED: the new disjunct is is_ofdm_config-gated
+		// and a single-frame batch (cannot go partial) stays below BATCH_MAY_BE_PARTIAL_THRESHOLD.
+		// FAIL-BEFORE (-DH1_FAILBEFORE): drop the is_ofdm disjunct -> the fresh-partial widen does not
+		// fire -> Part W2e fails (lockstep INV-1 violated).
+		data_ack_retx_turnaround = (v2_mixed_batch || cfg16_revack_starve_fails > 0
+#ifndef H1_FAILBEFORE
+			|| (is_ofdm_config(current_configuration)
+			    && data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+#endif
+			);
 		// Recalculate timeout: guard delays from prior ACK detection can leave
 		// receiving_timeout stale, too short for the next ACK round-trip.
 		calculate_receiving_timeout();
@@ -3884,6 +3903,46 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						cfg16_revack_starve_fails, last_data_viable_config, d3_target);
 					fflush(stdout);
 
+					// WALL-B FIX-9 LOSSLESS DEMOTE (data-flow-revack-turnaround-geometry.md §5.3): the
+					// in-flight CFG16 batch that starved the reverse-ACK was ALREADY DELIVERED to the
+					// app by the RSP (copy_data_to_buffer fires right after the RSP sends the ACK the
+					// CMD missed), advancing rsp_last_delivered. The bytes are NOT lost (the FIFO
+					// push-back below preserves them) — but the PRE-fix re-send rebuilt the batch under
+					// a FRESH epoch (cmd_batch_seq_id had advanced past the in-flight bsi), so the RSP
+					// saw the re-presented (duplicate) batch as a NON-CONTIGUOUS hole and the D3.1
+					// in-order guard GAP-ABORTed (the _cfg16hold2 clean-cell md5-mismatch). The bytes
+					// were correct; the bsi-epoch LABEL was wrong. Roll cmd_batch_seq_id back to the
+					// in-flight batch's ORIGINAL bsi so the re-sent batch carries the CONTIGUOUS bsi
+					// the RSP last expected -> sack_v2_readopt_has_gap sees a duplicate-of-delivered
+					// (==last) or next (==last+1), NOT a >=2 jump -> NO abort (or a clean dedup).
+					// Capture the in-flight batch's bsi BEFORE freeing messages_tx[] (the v2 in-order
+					// path only; the compression path's restore_tx_from_compressed() owns its own
+					// re-stage and is unchanged). All non-FREE frames of the stranded block share the
+					// SAME batch_seq_id (one batch is in flight on the per-frame path), so the EARLIEST
+					// (mod-256) non-FREE bsi is the in-flight batch. Robust/NB never reach this
+					// CFG16-only leg.
+					int min_inflight_bsi = -1;
+					if(sack_v2_enabled && !compression_enabled)
+					{
+						for(int i=0; i<nMessages; i++)
+						{
+							if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+							{
+								int b = messages_tx[i].batch_seq_id & 0xFF;
+								if(min_inflight_bsi < 0)
+									min_inflight_bsi = b;
+								else
+								{
+									// keep the mod-256-EARLIER bsi (forward distance b->cur in [1,128]
+									// means cur is later, so b is earlier).
+									unsigned fwd = ((unsigned)(min_inflight_bsi - b)) & 0xFFu;
+									if(fwd >= 1u && fwd <= 128u)
+										min_inflight_bsi = b;
+								}
+							}
+						}
+					}
+
 					// Preserve all pending data for resend at the per-frame rung — the SAME FIFO
 					// push-back the gearshift BREAK paths + FIX-4 use, so no bytes are dropped.
 					if(compression_enabled)
@@ -3902,6 +3961,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						clear_retx_queue();   // recovery re-queues plaintext; drop stale retx
 					}
 					block_under_tx = NO;
+
+					// Roll the bsi epoch back to the in-flight batch so the re-sent batch is
+					// CONTIGUOUS with the RSP's delivery high-water (the lossless re-present). Only
+					// when an in-flight bsi was actually captured (else leave the counter untouched).
+					if(min_inflight_bsi >= 0)
+					{
+						printf("[CFG16-HOLD] FIX-9 LOSSLESS DEMOTE: rolling cmd_batch_seq_id %d -> %d "
+							"so the re-sent batch carries the in-flight (contiguous) bsi (no D3.1 GAP-ABORT)\n",
+							cmd_batch_seq_id & 0xFF, min_inflight_bsi);
+						fflush(stdout);
+						cmd_batch_seq_id = min_inflight_bsi;
+					}
 
 					// Demote to the per-frame rung. Pin the proven ceiling (one-cycle) so the SNR
 					// re-trigger does not immediately re-elect the starved CFG16 rung, and ARM the
@@ -10880,6 +10951,100 @@ int cl_arq_controller::test_climb_engine()
 
 		ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
 		cfg16_revack_starve_fails = saved_starve;
+		data_ack_retx_turnaround = saved_retx;
+	}
+
+	// ================================================================
+	// Part W2e — WALL-B FIX-9 H1: PRE-ARM the CMD reverse-ACK widen on the FIRST PARTIAL of a fresh
+	// OFDM batch (data-flow-revack-turnaround-geometry.md §5.1, INV-1 lockstep). The D2-REFINE
+	// producer (arq_commander.cc:1954) arms data_ack_retx_turnaround = (v2_mixed_batch ||
+	// cfg16_revack_starve_fails>0) — which is FALSE on a FRESH first-pass CFG16 batch (no retx prefix,
+	// no prior starve fail). But if THAT batch arrives PARTIAL the RSP arms its pre-TX settle
+	// (arq_responder.cc:1789, delaying the ACK by ptt_off+ptt_on) while the CMD window is still
+	// NARROW (adder==0) -> the settled partial SACK lands at/outside the narrow CMD window -> the
+	// silent miss that drives the D3 starvation deadline (the ~133s clean demote in the CFG16-hold
+	// verdict). The miss is NOT a full block-failure, so cfg16_revack_starve_fails does NOT increment
+	// — W2c's degrading-ceiling arm only fires AFTER a full failure. H1 closes the gap by pre-arming
+	// the widen for any fresh OFDM batch big enough to go partial (data_batch_size>=
+	// BATCH_MAY_BE_PARTIAL_THRESHOLD). This drives the REAL H1 producer expression + the REAL gated
+	// adder. FAIL-BEFORE: -DH1_FAILBEFORE drops the new is_ofdm disjunct -> the fresh-partial CMD
+	// window is NOT widened -> the lockstep oracle (CMD window >= RSP-settled partial arrival) FAILS.
+	// PASS-AFTER: armed -> adder==full_margin -> lockstep restored. Config-purity (ROBUST / single-
+	// frame) PASSES even in the stub.
+	// ================================================================
+	{
+		int saved_ptt_on = ptt_on_delay_ms, saved_ptt_off = ptt_off_delay_ms;
+		int saved_starve = cfg16_revack_starve_fails;
+		int saved_batch  = data_batch_size;
+		bool saved_retx  = data_ack_retx_turnaround;
+		ptt_on_delay_ms = 100; ptt_off_delay_ms = 200;     // stock delays
+		int full_margin = ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS;
+
+		// The H1 producer expression (mirrors arq_commander.cc:1954 AFTER the fix). The bracketed
+		// is_ofdm disjunct is #ifndef-compiled-out under H1_FAILBEFORE (== the pre-H1 producer).
+		auto h1_producer = [&](bool v2_mixed, int starve, int batch, int cfg)->bool {
+			(void)cfg;
+			return (v2_mixed || starve > 0
+#ifndef H1_FAILBEFORE
+			        || (is_ofdm_config(cfg) && batch >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+#endif
+			       );
+		};
+		// The gated CMD adder (mirrors arq_common.cc:1293-1300).
+		auto cmd_adder = [&](int cfg, bool retx_flag)->int {
+			return ( reverse_ack_uses_robust_geometry(cfg) && retx_flag ) ? full_margin : 0;
+		};
+
+		// W2e — FRESH FIRST-PASS PARTIAL at CFG16: v2_mixed_batch=false, starve=0, multi-frame batch.
+		// The producer must arm the flag (H1 disjunct) so the CMD widen fires and the window covers
+		// the RSP's settled partial SACK. FAIL-BEFORE: producer->false -> adder==0 -> the settled
+		// partial arrival is OUTSIDE the (un-widened) window -> lockstep INV-1 violated.
+		cfg16_revack_starve_fails = 0;
+		data_batch_size = 25;                  // a fresh first-pass multi-frame CFG16 batch
+		{
+			bool armed = h1_producer(/*v2_mixed=*/false, /*starve=*/0,
+			                         /*batch=*/data_batch_size, CONFIG_16);
+			int adder = cmd_adder(CONFIG_16, armed);
+			// The RSP delays the partial ACK by its pre-TX settle (ptt_off+ptt_on) — the CMD window
+			// MUST cover at least that extra arrival delay (the §5.1 lockstep oracle).
+			int rsp_partial_settle = ptt_off_delay_ms + ptt_on_delay_ms;
+
+			check(armed == true,
+				"W2e fresh first-pass PARTIAL CFG16 -> H1 ARMS the CMD widen (data_ack_retx_turnaround=true before any full failure)",
+				armed ? 1 : 0, 1);
+			check(adder >= rsp_partial_settle,
+				"W2e2 fresh-partial CMD window >= RSP pre-TX settle (lockstep INV-1: the settled partial SACK lands IN window)",
+				adder, rsp_partial_settle);
+			check(adder == full_margin,
+				"W2e3 fresh-partial CMD widen == full margin (ptt_off+ptt_on+drift)",
+				adder, full_margin);
+		}
+
+		// W2e4 — CONFIG-PURITY: a fresh first-pass batch at ROBUST_0 -> the H1 disjunct is
+		// is_ofdm-gated -> NO arm from H1 (the robust tier already has its own settle via
+		// is_robust_config; H1 must not double-act). PASSES even in the FAIL-BEFORE stub.
+		{
+			bool armed_robust = h1_producer(/*v2_mixed=*/false, /*starve=*/0,
+			                                /*batch=*/25, ROBUST_0);
+			check(armed_robust == false,
+				"W2e4 fresh first-pass batch at ROBUST_0 -> H1 does NOT arm (is_ofdm-gated; robust tier untouched, INV-2)",
+				armed_robust ? 1 : 0, 0);
+		}
+
+		// W2e5 — SINGLE-FRAME batch (data_batch_size==1, < threshold) can never go partial (one frame
+		// is all-or-nothing) -> H1 does NOT arm (no needless widen on a batch that cannot strand a
+		// partial). PASSES even in the stub.
+		{
+			bool armed_single = h1_producer(/*v2_mixed=*/false, /*starve=*/0,
+			                                /*batch=*/1, CONFIG_16);
+			check(armed_single == false,
+				"W2e5 single-frame CFG16 batch (cannot go partial) -> H1 does NOT arm (no needless widen)",
+				armed_single ? 1 : 0, 0);
+		}
+
+		ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
+		cfg16_revack_starve_fails = saved_starve;
+		data_batch_size = saved_batch;
 		data_ack_retx_turnaround = saved_retx;
 	}
 
