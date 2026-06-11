@@ -35,12 +35,20 @@ def _quad_set(picked):
     return set(picked)
 
 
-def test_default_quad_when_free():
-    """[T-DEFAULT] with nothing held, the first pick is the documented default
-    quad (7002/7003/7006/7007 + 52100). Stable for deterministic re-runs."""
+def test_default_quad_shape():
+    """[T-DEFAULT] the first pick is a VALID quad: ctrl/data = base/base+1,
+    base+4/base+5, base advances from DEFAULT_CTRL_BASE by a stride multiple, and
+    every member is genuinely free. (We do NOT assert base==7002 — a concurrent
+    sibling holding 7002 is exactly the case the auto-pick exists for; on a busy
+    machine the picker correctly advances, and that must not fail this test.)"""
     r = m.pick_free_ports()
-    assert r == (7002, 7003, 7006, 7007, 52100), r
-    print("[T-DEFAULT] free machine -> default quad 7002/7003/7006/7007+52100  PASS")
+    rsp, rsp_d, cmd, cmd_d, relay = r
+    assert rsp_d == rsp + 1 and cmd == rsp + 4 and cmd_d == rsp + 5, r
+    assert (rsp - m.DEFAULT_CTRL_BASE) % m.PORT_PICK_STRIDE == 0, r
+    assert rsp >= m.DEFAULT_CTRL_BASE, r
+    for p in (rsp, rsp_d, cmd, cmd_d, relay):
+        assert m._port_free(p), f"picked port {p} not free"
+    print(f"[T-DEFAULT] valid free quad picked from base {rsp}: {r}  PASS")
 
 
 def test_two_concurrent_invocations_non_colliding():
@@ -120,7 +128,7 @@ def test_relay_avoids_quad():
 
 def main():
     tests = [
-        test_default_quad_when_free,
+        test_default_quad_shape,
         test_two_concurrent_invocations_non_colliding,
         test_three_way_non_colliding,
         test_ctrl_base_override_pins_base,
