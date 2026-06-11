@@ -523,6 +523,157 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-coherent-tier: COHERENT QPSK low-rate tier (faded-front lever) self-test.
+// Drives the SFO-GRID Watterson coded-BER harness in-process for four decisive
+// cells and asserts the EXISTING production QPSK tier (CONFIG_9 r1/2 DATAC3-class,
+// CONFIG_7 r5/16 DATAC4-class) DECODES the CCIR MPP/MPD fade where the high-rate
+// QAM gears (CFG15 16-QAM r0.875, CFG16 32-QAM r0.875) FLOOR at 0/N — including
+// with a GENIE-exact channel, proving the QAM failure is fundamental to the
+// constellation+rate (not the estimator). The tier is PRE-EXISTING
+// (telecom_system.cc:9768-9788) — no DSP is invented; this test registers and
+// guards the lever. See fact-documents/data-flow-coherent-tier-config.md §2/§4.
+//
+// fail-before/pass-after: MERCURY_COHERENT_TIER_FAILBEFORE=1 drops the QPSK arm's
+// EsN0 ~8 dB below its waterfall so the "tier decodes" assertions FAIL — the lever
+// is provably disarmed before it is armed.
+static void coherent_set_env(const char* k, const char* v)
+{
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+// Run ONE Watterson SFO-GRID coded cell at the given config and return cw_ok/tot.
+// esn0/depth/fd/dly are strings; genie selects the GENIE-exact-CSI branch. Env is
+// saved+restored so the harness's default-off paths are not perturbed.
+static void coherent_run_cell(int cfg, const char* esn0, const char* depth,
+                              const char* fd, const char* dly, const char* genie,
+                              const char* seed, int& cw_ok, int& cw_tot)
+{
+    const char* keys[] = {
+        "MERCURY_SFO_GRID", "MERCURY_SFO_GRID_CODED", "MERCURY_SFO_GRID_ESN0",
+        "MERCURY_SFO_GRID_CHAN", "MERCURY_SFO_GRID_WATT_DEPTH_DB",
+        "MERCURY_SFO_GRID_WATT_FD_HZ", "MERCURY_SFO_GRID_WATT_DLY",
+        "MERCURY_SFO_GRID_GENIE", "MERCURY_SFO_GRID_SEED"
+    };
+    const int nk = (int)(sizeof(keys)/sizeof(keys[0]));
+    struct Saved { const char* key; bool had; std::string val; } sv[16];
+    for (int i = 0; i < nk; i++) {
+        const char* g = std::getenv(keys[i]);
+        sv[i].key = keys[i]; sv[i].had = (g != nullptr);
+        sv[i].val = g ? std::string(g) : std::string();
+    }
+    coherent_set_env("MERCURY_SFO_GRID", "1");
+    coherent_set_env("MERCURY_SFO_GRID_CODED", "1");
+    coherent_set_env("MERCURY_SFO_GRID_ESN0", esn0);
+    coherent_set_env("MERCURY_SFO_GRID_CHAN", "3");          // Watterson 2-path
+    coherent_set_env("MERCURY_SFO_GRID_WATT_DEPTH_DB", depth);
+    coherent_set_env("MERCURY_SFO_GRID_WATT_FD_HZ", fd);
+    coherent_set_env("MERCURY_SFO_GRID_WATT_DLY", dly);
+    coherent_set_env("MERCURY_SFO_GRID_GENIE", genie);
+    coherent_set_env("MERCURY_SFO_GRID_SEED", seed);
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(cfg);   // CONFIG_7/9 (QPSK) or CONFIG_15/16 (QAM)
+    ts.sfo_grid_test();
+    cw_ok  = ts.sfo_grid_last_cw_ok;
+    cw_tot = ts.sfo_grid_last_cw_tot;
+
+    for (int i = 0; i < nk; i++) {
+#if defined(_WIN32)
+        _putenv_s(sv[i].key, sv[i].had ? sv[i].val.c_str() : "");
+#else
+        if (sv[i].had) setenv(sv[i].key, sv[i].val.c_str(), 1); else unsetenv(sv[i].key);
+#endif
+    }
+}
+
+static int run_coherent_tier_selftest()
+{
+    printf("[TEST-COHERENT] coherent QPSK low-rate tier (faded-front lever) self-test\n");
+    int fails = 0;
+    const char* seed = "12345";
+
+    // fail-before knob: drop the QPSK arm well below its MPP waterfall so the
+    // "tier decodes" assertions FAIL (the lever is disarmed before it is armed).
+    bool failbefore = false;
+    { const char* e = std::getenv("MERCURY_COHERENT_TIER_FAILBEFORE");
+      failbefore = (e && e[0] && e[0] != '0'); }
+    const char* qpsk_esn0_canon = failbefore ? "-2" : "6";   // CONFIG_9 MPP-canon: 6 dB = 2/2; -2 dB = 0/2
+    const char* qpsk_esn0_deep  = failbefore ? "-4" : "4";   // CONFIG_7 MPD: 4 dB = 2/2; -4 dB = 0/2
+    if (failbefore)
+        printf("[TEST-COHERENT]   (FAILBEFORE active: QPSK EsN0 forced below waterfall)\n");
+
+    // ---- Cell A: DATAC3-class lever, MPP-canon. CFG15 16-QAM FAILS, CONFIG_9 QPSK r1/2 DECODES. ----
+    // depth6/fd1/dly96 = CCIR MultiPath-Poor (1 Hz Doppler, 2 ms delay). MEASURED
+    // 6-seed unanimous: CFG15 0/5, CONFIG_9 2/2 BER0 (data-flow-coherent-tier-config.md §2.1).
+    {
+        int q_ok=-1,q_tot=-1, h_ok=-1,h_tot=-1;
+        coherent_run_cell(15, "6", "6", "1", "96", "0", seed, h_ok,h_tot);                 // CFG15 16-QAM (high-rate, bare)
+        coherent_run_cell( 9, qpsk_esn0_canon, "6", "1", "96", "0", seed, q_ok,q_tot);     // CONFIG_9 QPSK r1/2 (tier)
+        bool qam_fail  = (h_tot>0 && h_ok < h_tot);
+        bool tier_pass = (q_tot>0 && q_ok == q_tot);
+        bool ok = qam_fail && tier_pass;
+        printf("[TEST-COHERENT]   CELL-A DATAC3 MPP-canon: CFG15-16QAM=%d/%d (high-rate%s) CONFIG9-QPSK-r1/2=%d/%d (tier%s) -> %s\n",
+               h_ok,h_tot, qam_fail?"_FLOORS_OK":"_decoded_unexpected",
+               q_ok,q_tot, tier_pass?"_DECODES_OK":"_FAILED", ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell B: same fade, CFG16 32-QAM also FLOORS while CONFIG_9 DECODES. ----
+    {
+        int q_ok=-1,q_tot=-1, h_ok=-1,h_tot=-1;
+        coherent_run_cell(16, "6", "6", "1", "96", "0", seed, h_ok,h_tot);                 // CFG16 32-QAM (high-rate, bare)
+        coherent_run_cell( 9, qpsk_esn0_canon, "6", "1", "96", "0", seed, q_ok,q_tot);     // CONFIG_9 QPSK r1/2 (tier)
+        bool qam_fail  = (h_tot>0 && h_ok < h_tot);
+        bool tier_pass = (q_tot>0 && q_ok == q_tot);
+        bool ok = qam_fail && tier_pass;
+        printf("[TEST-COHERENT]   CELL-B DATAC3 MPP-canon: CFG16-32QAM=%d/%d (high-rate%s) CONFIG9-QPSK-r1/2=%d/%d (tier%s) -> %s\n",
+               h_ok,h_tot, qam_fail?"_FLOORS_OK":"_decoded_unexpected",
+               q_ok,q_tot, tier_pass?"_DECODES_OK":"_FAILED", ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell C: GENIE bound. CFG15 FLOORS even with the EXACT channel handed to ----
+    // the equalizer -> the QAM failure is FUNDAMENTAL (constellation+rate), NOT an
+    // estimator deficiency. CONFIG_9 decodes on the PRODUCTION LS estimator (no genie).
+    // MEASURED: CFG15 genie 0/5 (BER 0.168), CONFIG_9 2/2 (§2.2).
+    {
+        int q_ok=-1,q_tot=-1, g_ok=-1,g_tot=-1;
+        coherent_run_cell(15, "6", "6", "1", "96", "1", seed, g_ok,g_tot);                 // CFG15 16-QAM GENIE-exact CSI
+        coherent_run_cell( 9, qpsk_esn0_canon, "6", "1", "96", "0", seed, q_ok,q_tot);     // CONFIG_9 QPSK r1/2 production LS
+        bool genie_fail = (g_tot>0 && g_ok < g_tot);
+        bool tier_pass  = (q_tot>0 && q_ok == q_tot);
+        bool ok = genie_fail && tier_pass;
+        printf("[TEST-COHERENT]   CELL-C GENIE-bound MPP-canon: CFG15-16QAM-GENIE=%d/%d (perfect-CSI%s) CONFIG9-QPSK-LS=%d/%d (tier%s) -> %s\n",
+               g_ok,g_tot, genie_fail?"_STILL_FLOORS_OK":"_decoded_unexpected",
+               q_ok,q_tot, tier_pass?"_DECODES_OK":"_FAILED", ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell D: DATAC4-class deep tier on MPD. depth6/fd2/dly192 = CCIR MPD ----
+    // (2 Hz Doppler, 4 ms delay). CFG16 32-QAM FLOORS, CONFIG_7 QPSK r5/16 DECODES.
+    // The lower code rate buys the harder fade. MEASURED @ EsN0=4: CFG16 0/6,
+    // CONFIG_7 2/2 (§2.4).
+    {
+        int q_ok=-1,q_tot=-1, h_ok=-1,h_tot=-1;
+        coherent_run_cell(16, "4", "6", "2", "192", "0", seed, h_ok,h_tot);                // CFG16 32-QAM on MPD (high-rate, bare)
+        coherent_run_cell( 7, qpsk_esn0_deep, "6", "2", "192", "0", seed, q_ok,q_tot);     // CONFIG_7 QPSK r5/16 deep tier
+        bool qam_fail  = (h_tot>0 && h_ok < h_tot);
+        bool tier_pass = (q_tot>0 && q_ok == q_tot);
+        bool ok = qam_fail && tier_pass;
+        printf("[TEST-COHERENT]   CELL-D DATAC4 MPD: CFG16-32QAM=%d/%d (high-rate%s) CONFIG7-QPSK-r5/16=%d/%d (deep-tier%s) -> %s\n",
+               h_ok,h_tot, qam_fail?"_FLOORS_OK":"_decoded_unexpected",
+               q_ok,q_tot, tier_pass?"_DECODES_OK":"_FAILED", ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    printf("[TEST-COHERENT] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -749,6 +900,7 @@ int main(int argc, char *argv[])
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
+    bool test_coherent_tier_cli = false; // --test-coherent-tier: coherent QPSK low-rate tier (CONFIG_9 r1/2, CONFIG_7 r5/16) decodes MPP/MPD where CFG15/16 floor (feat/coherent-tier).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1371,6 +1523,18 @@ int main(int argc, char *argv[])
             // composed stack (PAS + TINTERP-seed turbo + ratio-nvfix) decodes where a
             // bare arm fails. See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
             test_cfg17_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-coherent-tier") == 0)
+        {
+            // Coherent QPSK low-rate tier (feat/coherent-tier, failing-first):
+            // drives the SFO-GRID Watterson harness in-process for four cells and
+            // asserts the EXISTING production QPSK tier (CONFIG_9 r1/2, CONFIG_7
+            // r5/16) decodes the CCIR MPP/MPD fade where CFG15/16 QAM gears floor —
+            // GENIE-bounded so the QAM failure is proven fundamental. No DSP is
+            // invented. See fact-documents/data-flow-coherent-tier-config.md §2/§4.
+            test_coherent_tier_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2711,6 +2875,18 @@ start_modem:
             fflush(stdout);
             int rc = run_cfg17_selftest();
             printf("[FLAG] CFG17 composition self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_coherent_tier_cli) {
+            // Coherent QPSK low-rate tier self-test (one-shot, then exit rc).
+            // Constructs cl_telecom_system instances in-process and drives the
+            // SFO-GRID Watterson harness — no ARQ/audio/TCP state needed.
+            printf("[FLAG] --test-coherent-tier: invoking coherent QPSK low-rate "
+                   "tier (faded-front) self-test\n");
+            fflush(stdout);
+            int rc = run_coherent_tier_selftest();
+            printf("[FLAG] coherent-tier self-test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
