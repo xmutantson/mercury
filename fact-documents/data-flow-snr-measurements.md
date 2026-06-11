@@ -843,3 +843,141 @@ caveat is acceptable (the "one rung then jump" ordering). The parent must wire-t
   `arq.h:740-741`), §18 / Part N (the data-ACK SNR-leak bug — why Plan B is rejected).
 - This doc §1.5/§1.7/§7 (the existing CMD-side §1.5 producer + §1.7 enablement the fix builds
   on; the fix changes only the VALUE that arrives at `arq_common.cc:5576`, not the site).
+
+## §9 SHIPPED FIX (CFG16-acq2, 2026-06-11) — the SACK-trusted climb SNR margin
+
+**Branch**: `feat/cfg16-acq` off monitor `7a285e4` (the reverse-ACK H1 lever already merged).
+**Driving work item** (DIFFERENT from §8): §8 chased the ROBUST_2→CONFIG_0 boundary (SNR_uplink
+≈ 1.0, the MFSK placeholder). This fix is the HIGH-CONFIG end: the natural ROBUST_0→CFG16 climb
+caps at **CONFIG_13** and never elects CFG16, on a CLEAN channel where pinned CFG16 32-QAM is
+PROVEN viable (decisive verdict `bigblock_p3_hw/_cfg16decisive/CFG16_DECISIVE_VERDICT.md` §2a).
+
+### §9.1 Root cause (executed; bigblock_p3_hw/_cfg16acq2/ROOTCAUSE_AND_FIX.md)
+
+The climb target is `get_configuration(SNR_uplink − SUPERSHIFT_MARGIN_DB)`, `SUPERSHIFT_MARGIN_DB=6.0`.
+- `SNR_uplink` at the high OFDM configs = the responder's POST-EQ EVM-SNR (`ofdm.cc:2288`,
+  `−10·log10(EVM_variance)`) round-tripped through the 4-bit MFSK suffix (`mfsk.cc:626`).
+- That EVM-SNR FLOORS at ~14.5 dB on a clean channel and is **channel-NOISE-INDEPENDENT**:
+  pinned-CFG16 at WGN:40 vs WGN:50 is BYTE-IDENTICAL (`var=0.0355 meanH=0.979 SNR=14.5` both;
+  a ~10 dB channel-SNR delta → 0 dB measured-SNR delta). It is an equalizer/pilot residual, NOT
+  a capacity estimate. Quantized → tone 10 → the commander reads a hard **15.0**.
+- `get_configuration(15.0 − 6.0) = get_configuration(9.0) = CONFIG_13` (table `telecom_system.cc:10193`,
+  CFG16 needs `SNR>13`). The in-turbo SNR-SUPERSHIFT (`arq_commander.cc:5353`) then has
+  `snr_target(13) == current(13)` → no climb; loops `[TURBO] SNR-capped step-1: 13->14 (target=13)`
+  forever (RSP receives `SET_CONFIG forward=13` 55×, never 14+).
+
+**The defect**: subtracting a 6.0 dB AWGN FADING MARGIN from an already-floored POST-EQ EVM number
+DOUBLE-COUNTS the margin and structurally forbids CFG16, even though CFG16 decodes pinned (131
+OFDM-OK 32-QAM decodes) and SACK is negotiated. **Discrimination verdict: BOTH** — the EVM floor is
+a REAL residual (HW too), but the climb's CONSUMPTION of it as an AWGN estimate-minus-6 is the
+fixable defect. NOT a per-frame PHY/nvfix ceiling (CFG16 decodes pinned), NOT a drift-tax
+mis-calibration (WGN:50≡WGN:40), NOT the cold-acq "0 bytes" (that smoke's conn=False is the
+pre-existing MFSK CONNECT race — CMD stayed Idle, never hailed; orthogonal).
+
+The codebase ALREADY half-trusted SACK against this estimator (`arq_commander.cc:5427-5440` comment;
+`turbo_snr_truncates_probe()` returns false under SACK; `finish_turbo_direction()` skips the snr-cap
+under SACK) — but ONLY for truncation/ceiling, NEVER for the `snr_target` COMPUTATION. That is the gap.
+
+### §9.2 The fix
+
+New PURE member `climb_effective_snr_margin_db(snr)` (`arq.h`, next to `supershift_retrigger_target`):
+returns the reduced `SACK_CLIMB_SNR_MARGIN_DB` (0.0, `common_defines.h`) ONLY when
+`sack_v2_enabled && snr >= CFG16_EVM_SATURATION_KNEE_DB` (13.0); otherwise `SUPERSHIFT_MARGIN_DB`
+(6.0). It is **REGIME-AWARE, not a flat reduction**: the EVM-SNR has SATURATED only at/above the
+knee (the ~14.5 floor), where the fading margin is the double-count; BELOW the knee the estimate
+still TRACKS the channel (e.g. SNR=2.0 is a genuine marginal reading) and the full margin is EARNED.
+A flat reduction would over-climb at marginal SNR (2.0 -> CONFIG_10); the knee gate keeps the
+marginal-SNR anti-thrash (FP-J3c) byte-identical even under SACK. Under SACK in the saturated band
+the climb trusts the SAME no-margin `get_configuration(SNR)` ceiling that `turbo_snr_truncates_probe()`
+already trusts. Applied at the **two UP-climb target sites** (each passes the SAME SNR it maps):
+- `elevator_target_from_snr()` (`arq_commander.cc:181`) — FRAME-UP elevator + SUPERSHIFT re-trigger.
+- in-turbo SNR-SUPERSHIFT (`arq_commander.cc:5353`) — the binding loop site.
+
+NOT applied at the turbo CEILING BREAK-DROP target (`arq_commander.cc:2439`) — that is a
+recovery-DOWN computation after a probe FAILURE; reducing its margin would re-probe a just-failed
+config. NOT applied at `finish_turbo_direction` (`:4476`) — that site's `snr_config` is unused
+under SACK (the cap at `:4500` is `!sack_v2_enabled`-gated), so the margin there is already inert.
+
+### §9.3 §5 cross-layer audit (gearshift/SNR shared state)
+
+**Shared state changed**: the SNR→config climb-TARGET selection (reads `measurements.SNR_uplink`
++ `sack_v2_enabled`; writes `snr_target`/`snr_ideal`/`negotiated_configuration`).
+
+1. **Producers of the inputs**: `SNR_uplink` — §1 (unchanged; the CMD climb producer is the
+   §1.5 suffix decode `arq_common.cc:8021`). `sack_v2_enabled` — set once at SACK negotiation
+   (CAP_SACK_V2 handshake); a session-stable bool, never mutated mid-climb. The fix adds NO new
+   producer of either.
+2. **Consumers of the climb target**: the FRAME-UP elevator (`:4402`), the SUPERSHIFT re-trigger
+   (`:5565`), the in-turbo SNR-SUPERSHIFT (`:5353`). All three route through the SHARED
+   `supershift_retrigger_target` chokepoint (`:5414`/`elevator_target_from_snr`) which applies the
+   `is_ofdm_config(anchor)` gate + RETRIGGER_MAX_LEAP + proven-ceiling. The fix changes the INPUT
+   margin; it does NOT touch any of those clamps.
+3. **Valid states before any producer writes**: `SNR_uplink` sentinel `-99.9` (≤ -90 → the
+   `effective_snr > -90` gate is unmet → the branch is skipped → fix INERT until a real SNR
+   arrives). `sack_v2_enabled=false` until negotiated → fix INERT (full 6.0 margin) for the whole
+   pre-SACK handshake and for every non-SACK/NB/legacy session.
+4. **Invariants consumers assume**: "a multi-rung jump requires `is_ofdm_config(anchor)`" (§15) —
+   UNCHANGED, the fix does not weaken it. "the target ≤ min(proven_ceiling, WB/NB ceiling)" —
+   UNCHANGED (those clamps run after the margin). The fix only relaxes the conservative
+   `−6 dB` on the SNR→config MAPPING, under SACK.
+5. **What the fix changes / over-climb safety**: a smaller margin RAISES the SNR-ideal at every
+   SNR. At the CLEAN high-config op-point that is the GOAL (15.0 → CFG16). At DEEP SNR (WGN:-10,
+   SNR_uplink ≈ 1.0) the SNR-ideal rises from CONFIG_5 to ~CONFIG_10, BUT the
+   `is_ofdm_config(anchor)` gate clamps it to anchor+1 while the anchor is still ROBUST (the §8.3
+   anchor-gated, value-INDEPENDENT proof) — so NO over-climb is licensed until OFDM is proven.
+   `--test-climb-engine` Part NM4 asserts exactly this (deep SNR + ROBUST anchor → clamp to
+   anchor+1).
+
+### §9.4 F3 — H1 NB over-widen tighten
+
+Separately (same branch): the H1 partial-widen producer (`arq_commander.cc:1968`) armed on
+`is_ofdm_config(cfg)`, which is purely numeric (`config 0..16`, `common_defines.h:98`) and TRUE for
+NB-OFDM configs too. So H1 could arm on a multi-frame NB batch → a +ROBUST_ACK_DRIFT_MARGIN_MS
+(~600 ms) NB retx-latency cost — but NB carries NO SACK suffix (`ack_sack_suffix_len()==0` for M<16,
+`mfsk.h:194`), so the widen protects nothing on NB. Tightened with `narrowband_enabled != YES`
+(WB-OFDM only). Byte-identical on WB; removes the NB mis-fire. `--test-climb-engine` W2e6/W2e6b cover it.
+
+### §9.6 The MAX_LEAP interaction (executed refinement, diagrun2 ground truth)
+
+A live diag (CFG16ACQ2_DIAG print inside elevator_target_from_snr) on the natural climb confirmed
+the fix raises the elevator's RAW SNR target from CONFIG_13 to CONFIG_16:
+`elevator: SNR_uplink=15.00 sack_v2=1 margin=0.0 -> snr_ideal=16` (vs the pre-fix raw 13). But the
+elevator then passes snr_ideal through `supershift_retrigger_target`, whose `RETRIGGER_MAX_LEAP=13`
+leap_cap (`config_ladder_up_n(anchor, 13)`) bounds a single jump:
+- From a FRESH **CONFIG_0** anchor, `leap_cap = config_ladder_up_n(CONFIG_0, 13) = CONFIG_13`, so
+  the raw 16 is re-capped to CONFIG_13 for the FIRST leap — in BOTH arms (MAX_LEAP, not the SNR
+  margin, is the binding cap on the first leap off CONFIG_0).
+- Once the anchor RATCHETS to **CONFIG_13** (a clean CFG13 batch credits it), `leap_cap =
+  config_ladder_up_n(CONFIG_13, 13) = CONFIG_16` — MAX_LEAP no longer binds, and HERE the SNR
+  margin is DECISIVE: pre-fix `get_configuration(15-6) = CONFIG_13 == current` -> the elevator
+  targets the same rung -> NO climb (the verdict's CONFIG_13 cap); post-fix
+  `get_configuration(15) = CONFIG_16 > current` -> the elevator targets CFG16.
+
+So the SNR-margin fix is the correct removal of the CONFIG_13 SNR-cap the verdict named; MAX_LEAP is
+a SEPARATE, anchor-gated bound that ratchets up as the anchor proves rungs and that the fix
+correctly does NOT touch (it is the §15 over-climb backstop). NM6 (`--test-climb-engine`) asserts the
+decisive site: a PROVEN CONFIG_13 anchor + SNR 15.0 -> the elevator targets CFG16 (pre-fix: 13).
+
+### §9.7 End-to-end (executed, both arms reach CFG16 on the current monitor)
+
+IMPORTANT correction to the decisive verdict's "caps at CONFIG_13 on BOTH arms": that was measured
+off `monitor de428f6` WITHOUT the reverse-ACK lever merged. On the CURRENT monitor (`7a285e4`, lever
+merged) the natural ROBUST_0->CFG16 climb at WGN:40 REACHES and HOLDS CFG16 on BOTH the FAILBEFORE
+and PASS-AFTER arms (449 OFDM-OK CFG16 decodes; `bigblock_p3_hw/_cfg16acq2/natruns/`). The lever's
++1-step verification probes now succeed under drift, so the climb ascends 13->14->15->16 via the
+in-turbo SNR-capped-step-1 ladder. The SNR-margin fix's contribution is to ALSO let the ELEVATOR
+target CFG16 directly from the ratcheted CONFIG_13 anchor (fewer drift-exposed turnarounds than the
+4-step ladder; more robust on marginal seeds where a +1 probe can miss). The fix is the correct,
+gated root-cause removal of the SNR-cap; the lever is what makes the verification turnarounds
+survive. They are complementary: the verdict's "lever inert on the natural path" holds for the
+DATA-stage lever, but the lever's CONTROL-stage verification-probe survival is exactly what lets the
+climb pass each rung — confirming the verdict §3 hypothesis ("the acquisition probe is the same
+drift-tax mechanism at the verification stage").
+
+### §9.5 Test (failing-first) + artifacts
+
+`--test-climb-engine` Part NM (NM1-NM4) + W2e6/W2e6b. FAIL-BEFORE `-DCFG16ACQ2_FAILBEFORE`
+(margin pinned at 6.0) → NM1 FAILs. PASS-AFTER → ALL PASS. End-to-end natural-climb proof
+(climb reaches CFG16 under drift AFTER the fix, caps at CONFIG_13 BEFORE) in
+`bigblock_p3_hw/_cfg16acq2/`. Related: §8 (the ROBUST→CONFIG_0 boundary, the OTHER EVM-estimator
+symptom), `gearshift-climb-engine.md` §15/§16, the decisive verdict `_cfg16decisive/`.

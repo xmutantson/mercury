@@ -996,6 +996,49 @@ public:
     return base_threshold;
   }
 
+  // CFG16-acq2 (data-flow-snr-measurements.md §9) -- the SACK-trusted, REGIME-AWARE
+  // climb SNR margin. PURE (the bool member + the passed SNR). The UP-climb target sites
+  // that compute get_configuration(SNR - <margin>) -- elevator_target_from_snr() (the
+  // FRAME-UP + re-trigger elevator) and the in-turbo SNR-SUPERSHIFT -- call THIS helper
+  // (passing the SAME SNR they map) instead of the bare SUPERSHIFT_MARGIN_DB constant.
+  //
+  // THE DOUBLE-COUNT, only in the SATURATED regime: the responder's POST-EQ EVM-SNR
+  // (ofdm.cc:2288) FLOORS at ~14.5 dB on a clean channel (channel-INDEPENDENT: WGN:40 ==
+  // WGN:50, var=0.0355) and round-trips through the 4-bit MFSK suffix to a hard 15.0.
+  // That is NOT a channel-SNR estimate -- it is an equalizer/pilot residual that has
+  // SATURATED. The 6.0 dB AWGN fading margin is designed for an estimate that TRACKS the
+  // channel; subtracting it from a SATURATED EVM number double-counts the margin and caps
+  // the natural climb at CONFIG_13 (get_configuration(15-6=9)=13) even where pinned CFG16
+  // 32-QAM is PROVEN viable (decisive verdict §2a). When SACK Design A is negotiated the
+  // channel recovers partial-batch loss (SACK_RSP patches missing frames), so the fading
+  // margin is redundant -- but ONLY where the estimate has saturated. Below the saturation
+  // knee the EVM-SNR still TRACKS the channel (e.g. SNR=2.0 is a genuine marginal reading,
+  // not a floor), where the fading margin is still EARNED. So the reduced margin is gated
+  // on snr >= CFG16_EVM_SATURATION_KNEE_DB (13.0, == the get_configuration CFG16 boundary):
+  // only an estimate that already claims CFG16-capable-by-the-table is trusted without the
+  // extra margin. This is regime-aware, not a flat reduction -- FP-J3c (marginal SNR=2.0 ->
+  // no spurious jump) stays BYTE-IDENTICAL even under SACK.
+  //
+  // OFF SACK (NB / legacy / non-SACK): full SUPERSHIFT_MARGIN_DB at every SNR -> byte-
+  // identical. Over-climb safety (§15 WGN:-10): the deep-SNR (SNR~1.0) reading is BELOW
+  // the knee -> full margin anyway; and even above the knee the is_ofdm_config(anchor) gate
+  // in supershift_retrigger_target (anchor-gated, NOT value-gated -- §8.3) clamps to +1
+  // while the anchor is ROBUST. BOTH backstops hold.
+  double climb_effective_snr_margin_db(double snr) const
+  {
+#ifdef CFG16ACQ2_FAILBEFORE
+    // FAIL-BEFORE: the pre-fix behavior -- ALWAYS the full 6.0 dB margin, so the SACK
+    // climb still caps at CONFIG_13 (Part NM1 FAILs). PASS-AFTER: the gated branch below
+    // returns the reduced margin in the saturated regime and the climb elects CFG16.
+    (void)snr;
+    return (double)SUPERSHIFT_MARGIN_DB;
+#else
+    if(sack_v2_enabled && snr >= (double)CFG16_EVM_SATURATION_KNEE_DB)
+      return (double)SACK_CLIMB_SNR_MARGIN_DB;
+    return (double)SUPERSHIFT_MARGIN_DB;
+#endif
+  }
+
   // CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13) -- PURE
   // policy for the SUPERSHIFT re-trigger target. af14a9e HARD-CLAMPED the
   // SNR-driven re-trigger to last_data_viable_config+1 (anchor+1), which made
@@ -1081,6 +1124,55 @@ public:
        config_ladder_index(snr_ideal) > config_ladder_index(anchor_cap))
       snr_ideal = anchor_cap;
     return snr_ideal;
+  }
+
+  // CFG16-acq2 D2/D3 (bigblock_p3_hw/_cfg16acqd2d3/AUDIT_AND_DESIGN.md §4) — the
+  // CLAMP-TO-SELF / YIELD-TO-DATA discriminator. PURE (no member writes; the unit
+  // test Part D2D3 replays it directly). ROOT CAUSE of the natural-climb CONFIG_13
+  // wedge (D2+D3): in the in-turbo SUPERSHIFT branch (arq_commander.cc:5343) the
+  // D1 acq-fix correctly computes the SNR target = CONFIG_16, but
+  // supershift_retrigger_target RE-CLAMPS it to leap_cap = config_ladder_up_n(anchor,
+  // RETRIGGER_MAX_LEAP) — and from an un-ratcheted CONFIG_0 anchor (idx 3) that
+  // leap_cap = config_ladder_up_n(CONFIG_0, 13) = CONFIG_13 == the CURRENT config.
+  // The code then UNCONDITIONALLY emits add_message_control(SET_CONFIG) (:5476) and
+  // stays TRANSMITTING_CONTROL — a NO-OP SET_CONFIG-to-self that the peer ACKs, turbo
+  // re-triggers, and the SAME 16->clamp-to-13 fires again: an infinite CONTROL spin
+  // that STARVES data TX (executed: 72 "Transmitting control" vs 8 "Transmitting
+  // data", ~113 B delivered, ab2/runs/fix_WGN_40_s1). No clean DATA batch flows, so
+  // the delivery-gated anchor-raise (data_anchor_raise_target, arq_commander.cc:4278)
+  // never fires, the anchor stays CONFIG_0, and the leap_cap stays CONFIG_13 forever.
+  //
+  // This predicate detects that exact clamp-to-self: the FULLY-clamped turbo target
+  // (after the leap_cap + every ceiling/cooldown cap) lands AT OR BELOW the current
+  // config -> there is NO forward config change to announce -> emitting a SET_CONFIG
+  // is a pure no-op spin. When TRUE the caller SETTLES the turbo at the current rung
+  // and YIELDS to DATA TX (the SAME terminal state the CFG16-HOLD top-config branch
+  // uses, arq_commander.cc:5515-5543) so a clean CONFIG_13 batch can DELIVER and
+  // ratchet the anchor CONFIG_0 -> CONFIG_13; the next SUPERSHIFT re-trigger then has
+  // leap_cap = config_ladder_up_n(CONFIG_13, 13) = CONFIG_16 (Part NM6 asserts this
+  // exact site) and the climb reaches CFG16 (the H1 reverse-ACK lever then holds it).
+  //
+  // The caller must NOT pin supershift_proven_ceiling on this yield: the clamp is a
+  // TEMPORARY leap_cap bound that lifts once the anchor ratchets — pinning a proven
+  // ceiling here would forbid the later climb to CFG16. (Contrast the CFG16-HOLD
+  // branch, which legitimately pins the ceiling because CFG16 IS the top.)
+  //
+  // BYTE-IDENTICAL on a real upshift: when the clamped target is STRICTLY ABOVE the
+  // current config (a genuine config change, the normal climb), this returns FALSE
+  // and the caller emits the SET_CONFIG exactly as before. The SNR-capped-step-1
+  // path (negotiated = current+1) is likewise > current -> FALSE -> unchanged. The
+  // branch fires ONLY on the genuine no-op clamp-to-self that is today a control spin.
+  // PURE; index-only comparison (no member reads beyond the two passed configs).
+  bool supershift_clamp_yields_to_data(int clamped_target, int current_config) const
+  {
+#ifdef CFG16ACQ2_D2D3_FAILBEFORE
+    // FAIL-BEFORE: the pre-fix behavior -- NEVER yield (always emit the SET_CONFIG,
+    // even on a clamp-to-self). Part D2D3-1 FAILs (the wedge is not broken).
+    (void)clamped_target; (void)current_config;
+    return false;
+#else
+    return config_ladder_index(clamped_target) <= config_ladder_index(current_config);
+#endif
   }
 
   // WALL-B FIX-7A (KEYSTONE) — turbo CEILING SETTLE-vs-BREAK discriminator
