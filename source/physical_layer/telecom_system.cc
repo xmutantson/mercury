@@ -2968,12 +2968,23 @@ skip_h_retry_point:
 				// ±40, flipping inner 32-QAM bit signs → BP hit the iter cap → CRC fail → 0 bps.
 				// 16-QAM (CFG15) tolerated the wrong magnitude (larger min-distance); 32-QAM did not.
 				//
-				// Root fix: scale the demap by demap_variance = max(noise_variance_estimate,
-				// measure_var). measure_var (telecom_system.cc above = ofdm.measure_variance, the mean
-				// post-EQ pilot residual |Y_pilot/H − X|²) IS the noise variance on the equalized
-				// constellation the Euclidean demapper needs (psk.cc LLR = ΔD/variance) — a MEASURED
-				// quantity, not a tuned constant. max() keeps the cross-pilot estimate where it is
-				// legitimately larger (fast-varying channel / very low SNR).
+				// Root fix: substitute demap_variance = measure_var ONLY when nv has
+				// catastrophically collapsed. measure_var (telecom_system.cc above =
+				// ofdm.measure_variance, the mean post-EQ pilot residual |Y_pilot/H − X|²) IS the
+				// noise variance on the equalized constellation the Euclidean demapper needs
+				// (psk.cc LLR = ΔD/variance) — a MEASURED quantity, not a tuned constant.
+				//
+				// RATIO-GATE (cfg16-nvfix v2): the EARLIER UNCONDITIONAL max(nv,measure_var) REGRESSED
+				// — on common frequency-selective channels measure_var legitimately exceeds nv by a
+				// modest factor (~1.0× flat, up to ~3.0× under amp=0.6/dly=64; MEASURED, see
+				// _cfg16hold2/meas_fsel_*.log), and forcing demap_variance up to measure_var there
+				// raised the demap noise where nv was LEGITIMATELY low → CFG15/CFG16 BER 4-10× WORSE.
+				// The HARDWARE bug is a different regime: nv COLLAPSES ~1000× below the true post-EQ
+				// noise (HW-only post-EQ-EVM phenomenon the in-process sim never reproduces). So gate
+				// the substitution on a RATIO: only override when nv < measure_var / K. With K=8 the
+				// worst legitimate freq-selective ratio observed (measure_var/nv ≈ 2.98) is far below
+				// the K threshold → the gate is a NO-OP on flat AND freq-selective (byte-identical to
+				// base, both confirmed by A/B), engaging ONLY on the catastrophic ~1000× collapse.
 				//
 				// Scope (CLAUDE.md §5 — see PLAN.md §5 audit): demap_variance feeds ONLY the two
 				// psk.demod LLR calls below. The local `variance` is left UNCHANGED so (a) the
@@ -2981,8 +2992,12 @@ skip_h_retry_point:
 				// byte-identical, and (b) ofdm.noise_variance_estimate itself is untouched, so the
 				// MMSE-ZF erasure (ofdm.cc alpha=H²/(H²+nv)) and the SKIP-VAR sync gate are unchanged.
 				// MFSK never reaches this branch (own guard-bin estimate), so A.1.4 ROBUST is unaffected.
-				double demap_variance = (measure_var > ofdm.noise_variance_estimate)
-					? measure_var : ofdm.noise_variance_estimate;
+				// HELD UNMERGED: the improvement is HW-only-validatable (collapse isn't in sim) —
+				// for the bench-9 HW A/B. In sim it is a proven NO-OP (this branch's whole point).
+				const double NV_COLLAPSE_RATIO_K = 8.0;
+				double demap_variance = ofdm.noise_variance_estimate;
+				if(ofdm.noise_variance_estimate < measure_var / NV_COLLAPSE_RATIO_K)
+					demap_variance = measure_var;
 
 				printf("[FRAME-NV] trial=%d cfg=%d nv=%.6e mvar=%.4f demap_var=%.6e Nsymb=%d amprest=%d\n",
 					receive_stats.sync_trials, current_configuration,
