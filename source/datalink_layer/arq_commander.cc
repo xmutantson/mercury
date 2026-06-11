@@ -2748,6 +2748,42 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							telecom_system->data_container.ready_to_process_passband_delayed_data,
 							tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
 
+						// Multi-window recovery (Track A, mwcorr;
+						// fact-documents/data-flow-data-ack-sack-correlator.md §6).
+						// The newest-tail decode just MISSED (decoded==false). On a
+						// long held-CFG16 forward batch the reverse ACK+SACK arrives
+						// once, late and mis-phased, then trailing idle silence
+						// scrolls it out of the newest tail before this poll fired
+						// (bench-9 matched=0/7, peak_metric=0.00 PURE-SILENT). The
+						// burst is NOT lost — it sits at an OLDER ring phase. Scan
+						// back through the retained history (ACK-pattern strides,
+						// energy-gated, SAME decode + CRC12), and if a CRC-valid
+						// ACK+SACK is found at an older phase, re-snapshot that phase
+						// and re-run the decode here so the UNCHANGED CRC12 +
+						// bsi-window + bitmap + dedupe body below validates it
+						// verbatim. Env-gated (MERCURY_DATA_ACK_MULTIWINDOW, default
+						// OFF -> byte-identical to monitor 627c370). A genuine
+						// all-silence miss returns no phase and leaves the snapshot
+						// at the newest tail (this poll falls through unchanged).
+						if(!decoded && mw_data_ack_multiwindow_enabled())
+						{
+							int chosen_off = -1;
+							if(mw_find_ack_sack_phase(rwi_mfsk, tail_offset,
+								tail_samples, sym_samples, pattern_len, &chosen_off)
+								&& chosen_off >= 0)
+							{
+								MUTEX_LOCK(&capture_prep_mutex);
+								memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+									&telecom_system->data_container.passband_delayed_data[rwi_mfsk + chosen_off],
+									tail_samples * sizeof(double));
+								MUTEX_UNLOCK(&capture_prep_mutex);
+								rx_bsi = 0; rx_bitmap = 0; rx_crc12 = 0; mfsk_matched = 0;
+								decoded = telecom_system->decode_ack_sack_from_passband(
+									telecom_system->data_container.ready_to_process_passband_delayed_data,
+									tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+							}
+						}
+
 						// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
 						// On mismatch, treat as no-ACK — the timeout-retransmit path
 						// is the safe fallback when a corrupted "looks like a clean

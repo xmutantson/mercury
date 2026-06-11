@@ -3855,6 +3855,249 @@ int cl_arq_controller::test_gap_abort_on_readopt()
 }
 
 // ============================================================================
+// Track A — multi-window DATA-ACK/SACK correlator (in-process, test-only)
+// ============================================================================
+//
+// CLI: --test-data-ack-multiwindow
+//
+// fact-documents/data-flow-data-ack-sack-correlator.md §1/§7. The steady
+// SACK-suffix probe in process_messages_rx_acks_data() correlates ONLY the
+// newest tail of the capture ring. On a long held-CFG16 forward batch the
+// reverse ACK+SACK arrives ONCE, late and mis-phased, then trailing idle
+// silence scrolls it out of the newest tail before the snapshot fires
+// (bench-9 matched=0/7, peak_metric=0.00 PURE-SILENT). The burst is NOT lost —
+// the double-mapped ring (data_container.cc:170) retains ~buffer_Nsymb (~1301)
+// symbols, so it sits at an OLDER phase.
+//
+// This test synthesizes a REAL ACK+SACK passband burst with the production
+// encoder (generate_ack_sack_pattern_passband), places it at an OLDER ring
+// phase, fills the newest tail with silence, and asserts:
+//   ARM1 fail-before : the newest-tail decode MISSES (decoded=false).
+//   ARM2 pass-after  : mw_find_ack_sack_phase() recovers the SAME bsi/bitmap
+//                      with a CRC12 pass at the older phase.
+//   ARM3 no-false-acc: a pure-silence ring returns NO phase.
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_data_ack_multiwindow()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-DATA-ACK-MW] SKIP: MFSK_ACK_SACK_ENABLED == 0 (suffix path compiled out)\n");
+	fflush(stdout);
+	return 0;
+#else
+	if(telecom_system == nullptr)
+	{
+		printf("[TEST-DATA-ACK-MW] ERROR: telecom_system is null\n");
+		fflush(stdout);
+		return 1;
+	}
+
+	// --- Step 0: load a WB config so ack_mfsk.M==16 -> suffix path exists -----
+	telecom_system->narrowband_enabled = NO;
+	this->narrowband_enabled           = NO;
+	telecom_system->load_configuration(CONFIG_15);
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+	{
+		printf("[TEST-DATA-ACK-MW] ERROR: ack_sack_suffix_len()=%d (need WB M>=16)\n",
+			telecom_system->ack_mfsk.ack_sack_suffix_len());
+		fflush(stdout);
+		return 1;
+	}
+
+	// Prime the members the multi-window sizing reads (held-CFG16 batch airtime).
+	this->data_batch_size              = 25;
+	this->message_transmission_time_ms = 191; // ~ one WB DATA frame airtime
+
+	// --- Step 1: compute the SACK-probe geometry (mirror arq_commander.cc) ----
+	cl_data_container& dc = telecom_system->data_container;
+	int ack_nsymb     = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int pattern_len   = telecom_system->ack_mfsk.ack_snr_pattern_nsymb();
+	int sack_suffix   = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	if(sack_suffix > pattern_len - ack_nsymb)
+		pattern_len = ack_nsymb + sack_suffix;
+	int mfsk_tail_nsymb = ack_nsymb + pattern_len + 16;
+	int buffer_Nsymb  = dc.buffer_Nsymb.load();  // atomic -> int
+	int sym_samples   = dc.Nofdm * dc.interpolation_rate;
+	int signal_period = sym_samples * buffer_Nsymb;
+	int tail_samples  = mfsk_tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	int tail_offset   = signal_period - tail_samples;
+
+	printf("[TEST-DATA-ACK-MW] geom: ack_nsymb=%d pattern_len=%d suffix=%d "
+		"sym_samples=%d signal_period=%d tail_samples=%d tail_offset=%d buffer_Nsymb=%d\n",
+		ack_nsymb, pattern_len, sack_suffix, sym_samples, signal_period,
+		tail_samples, tail_offset, buffer_Nsymb);
+	fflush(stdout);
+
+	// --- Step 2: synthesize a REAL ACK+SACK burst ----------------------------
+	// Choose a bsi/bitmap and compute the matching CRC12 exactly as the RSP TX
+	// does (send_mfsk_ack_sack -> generate_ack_sack_pattern_passband).
+	uint8_t  tx_bsi    = 7;
+	uint32_t tx_bitmap = 0x00A5F003u; // a non-trivial partial bitmap, != all-ones
+	char crc_input[5];
+	crc_input[0] = (char)tx_bsi;
+	crc_input[1] = (char)((tx_bitmap >> 24) & 0xFF);
+	crc_input[2] = (char)((tx_bitmap >> 16) & 0xFF);
+	crc_input[3] = (char)((tx_bitmap >>  8) & 0xFF);
+	crc_input[4] = (char)( tx_bitmap        & 0xFF);
+	uint16_t tx_crc12 = CRC12_calc(crc_input, 5);
+
+	int burst_len = telecom_system->ack_sack_pattern_passband_samples;
+	if(burst_len <= 0 || burst_len > tail_samples)
+	{
+		printf("[TEST-DATA-ACK-MW] ERROR: bad burst_len=%d (tail_samples=%d)\n",
+			burst_len, tail_samples);
+		fflush(stdout);
+		return 1;
+	}
+	double* burst = (double*)calloc(burst_len, sizeof(double));
+	int gen = telecom_system->generate_ack_sack_pattern_passband(
+		burst, tx_bsi, tx_bitmap, tx_crc12);
+	if(gen != burst_len)
+	{
+		printf("[TEST-DATA-ACK-MW] ERROR: generate returned %d (expected %d)\n",
+			gen, burst_len);
+		fflush(stdout);
+		free(burst);
+		return 1;
+	}
+
+	// --- Step 3: lay out the ring -------------------------------------------
+	// ring_write_index=0 so the snapshot reads passband_delayed_data[0 + off].
+	// Place the burst at an OLDER phase well before tail_offset; fill the newest
+	// tail with silence. Write to BOTH mirror halves (data_container.cc:170-171
+	// double-map invariant) so [rwi+off] is contiguous for off in [0, signal_period].
+	dc.ring_write_index = 0;
+	int rwi = dc.ring_write_index.load();  // atomic -> int for arithmetic/args
+	int total = 2 * signal_period;
+	memset(dc.passband_delayed_data, 0, (size_t)total * sizeof(double));
+	// Older phase: place the burst at the START of a reachable probe window so
+	// the scan's stride lands a window-start exactly on the burst (the detector
+	// then locks the base pattern at offset 0 of that window). The helper probes
+	// off = tail_offset - ph*stride; pick ph so off > 0 and the burst fits.
+	int stride    = pattern_len * sym_samples;
+	int burst_ph  = 2;                            // 2 strides into history
+	int burst_off = tail_offset - burst_ph * stride;
+	if(burst_off < 0)
+	{
+		// Tail too shallow for 2 strides — fall back to one stride.
+		burst_ph  = 1;
+		burst_off = tail_offset - stride;
+	}
+	if(burst_off < 0) burst_off = 0;
+	if(burst_off + burst_len > signal_period)
+		burst_off = signal_period - burst_len;  // keep burst inside the first half
+	for(int i = 0; i < burst_len; i++)
+	{
+		dc.passband_delayed_data[burst_off + i]                 = burst[i];
+		dc.passband_delayed_data[signal_period + burst_off + i] = burst[i];
+	}
+	printf("[TEST-DATA-ACK-MW] layout: burst_off=%d burst_len=%d stride=%d "
+		"(newest tail [%d,%d) is SILENT)\n",
+		burst_off, burst_len, stride, tail_offset, tail_offset + tail_samples);
+	fflush(stdout);
+
+	int fails = 0;
+
+	// --- ARM1: fail-before — the newest-tail decode MISSES -------------------
+	{
+		memcpy(dc.ready_to_process_passband_delayed_data,
+			&dc.passband_delayed_data[rwi + tail_offset],
+			(size_t)tail_samples * sizeof(double));
+		uint8_t  rx_bsi = 0; uint32_t rx_bitmap = 0; uint16_t rx_crc12 = 0;
+		int matched = 0;
+		bool decoded = telecom_system->decode_ack_sack_from_passband(
+			dc.ready_to_process_passband_delayed_data, tail_samples,
+			&rx_bsi, &rx_bitmap, &rx_crc12, &matched);
+		bool newest_tail_miss = !decoded;
+		printf("[TEST-DATA-ACK-MW] ARM1 newest-tail decode: decoded=%d matched=%d -> %s\n",
+			decoded ? 1 : 0, matched,
+			newest_tail_miss ? "MISS (expected)" : "UNEXPECTED HIT");
+		if(!newest_tail_miss)
+		{
+			printf("[TEST-DATA-ACK-MW] ARM1 FAIL: newest tail decoded a SILENT window\n");
+			fails++;
+		}
+		else printf("[TEST-DATA-ACK-MW] ARM1 PASS: late ACK MISSED at newest tail (the bug)\n");
+		fflush(stdout);
+	}
+
+	// --- ARM2: pass-after — multi-window recovers the SAME bsi/bitmap --------
+	// The helper itself is gate-INDEPENDENT (the env gate lives at the call-site
+	// in process_messages_rx_acks_data); the unit test exercises the recovery
+	// mechanism directly. The end-to-end env-gate wiring is exercised by the
+	// 2-process climb-sim hot-wash (MERCURY_DATA_ACK_MULTIWINDOW set before launch).
+	{
+		int chosen_off = -1;
+		bool found = mw_find_ack_sack_phase(rwi, tail_offset,
+			tail_samples, sym_samples, pattern_len, &chosen_off);
+		if(!found || chosen_off < 0)
+		{
+			printf("[TEST-DATA-ACK-MW] ARM2 FAIL: multi-window scan did NOT find the late ACK\n");
+			fails++;
+		}
+		else
+		{
+			// Re-snapshot at the chosen phase + re-decode (mirror the call-site).
+			memcpy(dc.ready_to_process_passband_delayed_data,
+				&dc.passband_delayed_data[rwi + chosen_off],
+				(size_t)tail_samples * sizeof(double));
+			uint8_t  rx_bsi = 0; uint32_t rx_bitmap = 0; uint16_t rx_crc12 = 0;
+			int matched = 0;
+			bool decoded = telecom_system->decode_ack_sack_from_passband(
+				dc.ready_to_process_passband_delayed_data, tail_samples,
+				&rx_bsi, &rx_bitmap, &rx_crc12, &matched);
+			// CRC12 re-check (the body's gate).
+			char ci[5];
+			ci[0]=(char)rx_bsi; ci[1]=(char)((rx_bitmap>>24)&0xFF);
+			ci[2]=(char)((rx_bitmap>>16)&0xFF); ci[3]=(char)((rx_bitmap>>8)&0xFF);
+			ci[4]=(char)(rx_bitmap&0xFF);
+			uint16_t want_crc = CRC12_calc(ci, 5);
+			bool crc_ok = decoded && (rx_crc12 == want_crc);
+			bool content_ok = crc_ok && (rx_bsi == tx_bsi) && (rx_bitmap == tx_bitmap);
+			printf("[TEST-DATA-ACK-MW] ARM2 recovered@off=%d: decoded=%d matched=%d "
+				"bsi=%u(want %u) bitmap=0x%08x(want 0x%08x) crc_ok=%d content_ok=%d\n",
+				chosen_off, decoded ? 1 : 0, matched,
+				(unsigned)rx_bsi, (unsigned)tx_bsi,
+				(unsigned)rx_bitmap, (unsigned)tx_bitmap,
+				crc_ok ? 1 : 0, content_ok ? 1 : 0);
+			if(!content_ok)
+			{
+				printf("[TEST-DATA-ACK-MW] ARM2 FAIL: recovered phase did not yield "
+					"the SAME bsi/bitmap with CRC12 pass\n");
+				fails++;
+			}
+			else printf("[TEST-DATA-ACK-MW] ARM2 PASS: late ACK+SACK RECOVERED at older phase\n");
+		}
+		fflush(stdout);
+	}
+
+	// --- ARM3: no-false-accept — pure silence yields no phase ----------------
+	{
+		memset(dc.passband_delayed_data, 0, (size_t)total * sizeof(double));
+		int chosen_off = -1;
+		bool found = mw_find_ack_sack_phase(rwi, tail_offset,
+			tail_samples, sym_samples, pattern_len, &chosen_off);
+		printf("[TEST-DATA-ACK-MW] ARM3 silent-ring scan: found=%d chosen_off=%d -> %s\n",
+			found ? 1 : 0, chosen_off,
+			(!found && chosen_off < 0) ? "NO false-accept (expected)" : "FALSE ACCEPT");
+		if(found || chosen_off >= 0)
+		{
+			printf("[TEST-DATA-ACK-MW] ARM3 FAIL: multi-window scan ACCEPTED a silent ring\n");
+			fails++;
+		}
+		else printf("[TEST-DATA-ACK-MW] ARM3 PASS: silent ring rejected\n");
+		fflush(stdout);
+	}
+
+	free(burst);
+	bool pass = (fails == 0);
+	printf("[TEST-DATA-ACK-MW] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+#endif
+}
+
+// ============================================================================
 // D3.1 — UNIFIED in-order-delivery across EVERY demote case (in-process, test-only)
 // ============================================================================
 //
