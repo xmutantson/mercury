@@ -344,6 +344,24 @@ def main():
                          "latency, ms, per direction). DEFAULT 0 (off).")
     ap.add_argument("--ptt-latency-jitter-ms", type=float, default=0.0,
                     help="relay --ptt-latency-jitter-ms passthrough. DEFAULT 0.")
+    # ---- FAITHFUL turnaround-timing window-miss model (SIMFIDELITY M1-M4) ------
+    # The CORRECTED drift axis: a turnaround-timing WINDOW-MISS (reverse ACK lands
+    # outside the CMD listen window) realized by integer silence insert/drop with
+    # SIGNAL samples bit-exact. The right vehicle for the CFG16 reverse-ACK
+    # collapse + the FIX9 D2 A/B (D2 widens the window, which fixes a window-miss
+    # but NOT the old tone-smear). DEFAULT off -> byte-identical.
+    ap.add_argument("--turnaround-drift", action="store_true",
+                    help="relay --turnaround-drift passthrough (FAITHFUL window-"
+                         "miss model). DEFAULT off. The corrected axis for the "
+                         "CFG16 reverse-ACK collapse + D2 A/B.")
+    ap.add_argument("--turnaround-ppm-a2b", type=float, default=8.16,
+                    help="relay --turnaround-ppm-a2b passthrough (physical crystal "
+                         "slip, default +8.16; NOT the -670 [CLK-TX] artifact).")
+    ap.add_argument("--turnaround-ppm-b2a", type=float, default=-8.16,
+                    help="relay --turnaround-ppm-b2a passthrough (default -8.16).")
+    ap.add_argument("--turnaround-jitter-ms", type=float, default=6.0,
+                    help="relay --turnaround-jitter-ms passthrough (per-key-up "
+                         "turnaround jitter; the dominant trigger). DEFAULT 6.0.")
     ap.add_argument("--wire-stamp", type=int, default=0, choices=(0, 1),
                     help="relay --wire-stamp passthrough. DEFAULT 0 (bare 8192, "
                          "compatible with every shipped -x sim mercury). Set 1 "
@@ -380,7 +398,10 @@ def main():
           f"start={cfg_name(args.start_cfg)} compress={args.compress} "
           f"barrier_k={args.barrier_k} "
           f"drift_ppm(a2b={args.drift_ppm_a2b},b2a={args.drift_ppm_b2a}) "
-          f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms})")
+          f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms}) "
+          f"turnaround_drift={args.turnaround_drift}"
+          f"(ppm a2b={args.turnaround_ppm_a2b},b2a={args.turnaround_ppm_b2a},"
+          f"jit={args.turnaround_jitter_ms}ms)")
     print(f"payload={args.payload} ({len(payload)} bytes, md5={payload_md5})\n")
 
     os.system("taskkill /F /IM mercury.exe >nul 2>&1")
@@ -422,7 +443,12 @@ def main():
                      "--drift-ppm-b2a", str(args.drift_ppm_b2a),
                      "--ptt-latency-ms", str(args.ptt_latency_ms),
                      "--ptt-latency-jitter-ms", str(args.ptt_latency_jitter_ms),
+                     "--turnaround-ppm-a2b", str(args.turnaround_ppm_a2b),
+                     "--turnaround-ppm-b2a", str(args.turnaround_ppm_b2a),
+                     "--turnaround-jitter-ms", str(args.turnaround_jitter_ms),
                      "--log", relay_log]
+        if args.turnaround_drift:
+            relay_cmd.append("--turnaround-drift")
         if args.cell:
             relay_cmd += ["--cell", args.cell]
         if args.burst:
@@ -580,6 +606,10 @@ def main():
                 "secs": args.secs, "start_cfg": args.start_cfg,
                 "drift_ppm_a2b": args.drift_ppm_a2b,
                 "drift_ppm_b2a": args.drift_ppm_b2a,
+                "turnaround_drift": args.turnaround_drift,
+                "turnaround_ppm_a2b": args.turnaround_ppm_a2b,
+                "turnaround_ppm_b2a": args.turnaround_ppm_b2a,
+                "turnaround_jitter_ms": args.turnaround_jitter_ms,
                 "ptt_latency_ms": args.ptt_latency_ms,
                 "ptt_latency_jitter_ms": args.ptt_latency_jitter_ms,
                 "connected": st.connected,

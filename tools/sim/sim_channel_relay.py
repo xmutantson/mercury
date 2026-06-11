@@ -77,10 +77,22 @@ tools/test_sim_relay_noise.py checks the noise PSD match numerically.
   * clean    : --snr 30                          (over-climb to CONFIG_16, no collapse)
   * wgn10    : --cell WGN:10 --profile mpm        (climbs then collapses on fades)
   * wgn-10   : --cell WGN:-10 --profile mpp       (deep-SNR STALL on ROBUST/CONFIG_0)
+  * CFG16 reverse-ACK collapse (the bench-7 turnaround window-miss):
+       --snr 40 --profile wgn --turnaround-drift
+    The FAITHFUL drift path (TurnaroundDrift, SIMFIDELITY_ROOTCAUSE.md): the
+    reverse MFSK ACK lands OUTSIDE the CMD's fixed listen window because
+    accumulated per-key-up jitter + the PHYSICAL ±8 ppm slip walk its arrival
+    INDEX out of the window (the ACK TONES are bit-exact; only their wire time
+    shifts — integer silence insert/drop in the turnaround gaps). This is the
+    RIGHT axis for the climb->CFG16->ACK-decay->D3->demote->0-byte trajectory
+    and the FIX-9 D2 A/B. The old --drift-ppm-* tone-resampler is the WRONG axis
+    (tone-smear, ~80x-too-large −670 ppm artifact) — SUPERSEDED, kept only for
+    back-compat; see the DriftResampler header.
 
 Usage:
     python tools/sim/sim_channel_relay.py --port 52100 --snr 12 [--profile mpm]
             [--cfo-hz 0.0] [--phase-noise-deg 0.2] [--cell WGN:-10]
+            [--turnaround-drift]  # FAITHFUL CFG16 reverse-ACK collapse (default skew axis)
             [--burst --loss 0.02] [--seed 1] [--log relay.log]
 
 Then launch two Mercury -x sim processes with MERCURY_SIM_ROLE A / B and the
@@ -298,8 +310,33 @@ class DopplerTap:
 
 
 # ---------------------------------------------------------------------------
-# Inter-peer sample-clock drift model (OPT-IN, DEFAULT OFF).
+# Inter-peer sample-clock drift model — OLD TONE-RESAMPLER AXIS (OPT-IN, kept
+# behind --drift-ppm-*, but SUPERSEDED — do NOT use as the default vehicle).
 # ---------------------------------------------------------------------------
+# *** SUPERSEDED 2026-06-10 (SIMFIDELITY_ROOTCAUSE.md). READ THIS FIRST. ***
+# This DriftResampler models the collapse as a continuous LINEAR-INTERPOLATION
+# fractional resampler driven by the −670 ppm [CLK-TX] number. BOTH premises are
+# now known wrong:
+#   (1) WRONG AXIS: linear interp is a 2-tap low-pass that SMEARS the narrowband
+#       MFSK ACK tones, so the CMD correlator drops on tone QUALITY (the ACK
+#       lands IN the window but correlates weakly). The REAL HW failure is a
+#       TURNAROUND-TIMING WINDOW-MISS: the reverse ACK is BIT-CLEAN (bench-7
+#       bitmap 0x01ffffff, CRC-valid) but lands OUTSIDE the CMD's fixed listen
+#       window (peak_metric=0.0). Different mechanism — which is exactly why D2
+#       (a wider window) was "unprovable" against this model: a wider window
+#       can't restore a smeared correlation.
+#   (2) WRONG MAGNITUDE: −670/−817 ppm is a [CLK-TX] software ARTIFACT (a
+#       10 s-window producer-push-rate quantization, SIMFIDELITY §1), ~80× the
+#       PHYSICAL ±8.16 ppm crystal skew (CLOCK_VERDICT.md §2).
+# The CORRECTED, DEFAULT-faithful model is `TurnaroundDrift` (--turnaround-drift)
+# below: integer silence insert/drop that re-positions the ACK by WINDOW-MISS
+# with the tones BIT-EXACT, ±8 ppm slip + per-key-up jitter. Use that for the
+# CFG16 collapse repro and the D2 A/B. DriftResampler is retained only so the old
+# --drift-ppm-* invocations still parse (it is the WRONG axis; never the default).
+#
+# (Original rationale below, preserved for history — its −670 framing is the
+# artifact the SUPERSEDED note above corrects.)
+#
 # WHY this exists (FIX9_ROOTCAUSE.md, bench-5): the two RPis' soundcards run at
 # INDEPENDENT sample rates. The HW logs measured [CLK-TX] drift=-670.7 ppm and
 # [CLK-RX] drift=-193.0 ppm — hundreds of ppm of RELATIVE skew. Over an 8.5 s
@@ -474,6 +511,176 @@ class PttLatencyModel:
             self.n_delay_chunks += inject
         self.prev_silent = silent
         return inject
+
+
+# ---------------------------------------------------------------------------
+# FAITHFUL turnaround-timing de-alignment model (the DEFAULT drift path).
+# ---------------------------------------------------------------------------
+# WHY this SUPERSEDES DriftResampler (SIMFIDELITY_ROOTCAUSE.md §1-§3, derived
+# from bench-7's HW logs): the real HW collapse is NOT a tone/grid distortion.
+# The reverse MFSK ACK+SACK is transmitted INTACT and FULL-CONTENT (bench-7 RSP
+# bitmap = 0x01ffffff = 25/25, CRC-valid) but the CMD's correlator reports
+# peak_metric=0.0 mask=1111111111111111 — the ACK simply does NOT land in the
+# CMD's fixed `receiving_timeout` listen window. It is a TURNAROUND-TIMING
+# WINDOW-MISS: accumulated half-duplex PTT/capture-flush/scheduling jitter (the
+# DOMINANT trigger) plus the small PHYSICAL ±8.16 ppm crystal slip (CLOCK_VERDICT
+# §2 — NOT the −670/−817 ppm [CLK-TX] number, which §1 proves is a 10 s-window
+# producer-push-rate QUANTIZATION ARTIFACT, ~80× too large) walks the ACK's
+# ARRIVAL INDEX out of the window, with no per-frame timing recovery to absorb it.
+# CFG15 collapses the SAME way once de-aligned; the forward OFDM stays healthy.
+#
+# WHY DriftResampler (the OLD --drift-ppm-* path) is the WRONG axis (kept behind
+# its flag, NOT the default — N1): it is a continuous LINEAR-INTERPOLATION
+# fractional resampler. Linear interp is a 2-tap low-pass that SMEARS the
+# narrowband MFSK ACK tones, so the CMD correlator drops on tone QUALITY (a
+# metric sag, ACK lands IN the right window but correlates poorly) — a DIFFERENT
+# failure axis than HW. That is exactly why D2 (a wider listen window + fatter
+# turnaround geometry) was "unprovable in sim": a wider window cannot restore a
+# smeared correlation. The faithful model fails by WINDOW-MISS, which is what D2
+# addresses, so D2 becomes sim-provable.
+#
+# MODEL (M1-M4 of SIMFIDELITY_ROOTCAUSE §3.2):
+#   M1 (tone fidelity): every SIGNAL sample passes BIT-EXACT. Timing skew is
+#      realized ONLY by inserting/dropping WHOLE SILENCE samples in the
+#      turnaround GAPS (where the wire already carries the noise floor / zeros),
+#      shifting subsequent chunk boundaries. The ACK's tones are never touched —
+#      only their wire arrival INDEX moves. (Assert: the ACK samples that DO
+#      arrive are bit-identical to the un-drifted ACK.)
+#   M2 (accumulating ±8 ppm crystal slip): a cumulative timing offset that grows
+#      with samples forwarded at the PHYSICAL ppm rate (default ±8.16, sign per
+#      direction), NEVER reset per-batch (no per-frame timing recovery).
+#   M3 (per-key-up jitter, the DOMINANT trigger): at each TX-onset edge
+#      (silent->signal, i.e. each PTT key-up) add a bounded SEEDED random extra
+#      offset (a few ms; the PTT/capture-flush/scheduling jitter). Seeded =>
+#      reproducible A/B; variable per key-up => the ACK position RANDOM-WALKS,
+#      matching the bench's non-monotone mask decay.
+#   M4: the relay relaxes the PDES barrier in drift-mode ONLY (main()); drift-OFF
+#      stays byte-identical (N2).
+#
+# REALIZATION (how integer insert/drop in silence keeps 1024-sample wire chunks
+# AND preserves every signal sample): a streaming silence-aware re-timer. The
+# model maintains (a) a fractional sample-offset accumulator `acc` (advanced by
+# M2 per sample + M3 per onset), and (b) a flat per-direction output sample
+# stream into which inbound samples flow. When `acc` crosses an integer N>0 it
+# owes N inserted samples (sink slower than source -> ACK arrives LATER); N<0 it
+# owes N dropped samples. The owed insert/drop is APPLIED inside SILENCE runs
+# only: on a silent inbound chunk the model pads (insert) or skips (drop) silence
+# samples; a SIGNAL chunk is copied verbatim with ZERO insert/drop, so signal
+# samples are bit-exact. Output is re-chunked to exactly CHUNK_SAMPLES; a partial
+# tail is carried. The injected silence samples are real channel output (the
+# reader feeds ch.process(zeros) noise floor), so the receiver sees the SAME
+# tones at a SHIFTED time — exactly the HW failure axis.
+class TurnaroundDrift:
+    """Per-direction FAITHFUL timing-de-alignment re-timer (M1-M3).
+
+    Re-positions the reverse-ACK (and every burst) by an INTEGER number of wire
+    samples relative to the receiver's listen window, realizing the offset by
+    insert/drop of WHOLE SILENCE samples in turnaround gaps. SIGNAL samples pass
+    BIT-EXACT (M1). The offset = a cumulative ±ppm crystal slip (M2) + a bounded
+    seeded per-onset jitter (M3). enabled==False -> strict identity pass-through
+    (byte-identical, the N2 contract)."""
+
+    def __init__(self, ppm, jitter_ms, rng, enabled=True):
+        self.ppm = float(ppm)
+        self.jitter_ms = max(0.0, float(jitter_ms))
+        self.rng = rng                 # Xoshiro (deterministic per-onset jitter)
+        self.enabled = bool(enabled) and (self.ppm != 0.0 or self.jitter_ms > 0.0)
+        # acc = signed fractional sample offset still owed to the OUTPUT (the wire
+        # the receiver clocks on). acc>0 => insert silence (ACK arrives later);
+        # acc<0 => drop silence (ACK arrives earlier). NEVER reset (M2).
+        self.acc = 0.0
+        self.prev_silent = True        # link starts idle
+        self.out = []                  # flat output-sample carry (re-chunked)
+        # diagnostics
+        self.n_onsets = 0
+        self.in_total = 0
+        self.out_total = 0
+        self.n_inserted = 0            # silence samples inserted (cumulative)
+        self.n_dropped = 0             # silence samples dropped (cumulative)
+        self.max_abs_offset = 0.0      # peak |acc| reached (samples)
+
+    def _emit_chunks(self):
+        """Pull whole CHUNK_SAMPLES blocks from the flat output carry."""
+        chunks = []
+        out = self.out
+        while len(out) >= CHUNK_SAMPLES:
+            chunks.append(out[:CHUNK_SAMPLES])
+            del out[:CHUNK_SAMPLES]
+        return chunks
+
+    def process(self, chunk, silent):
+        """Feed one CHUNK_SAMPLES channel-output block + its inbound-silent flag.
+        Returns a list of zero-or-more CHUNK_SAMPLES wire blocks. enabled==False
+        -> returns [chunk] verbatim (identity)."""
+        if not self.enabled:
+            return [list(chunk)]
+        x = list(chunk)
+        n = len(x)
+        self.in_total += n
+
+        # M2: accumulate the physical crystal slip over the samples we forward.
+        self.acc += n * (self.ppm / 1.0e6)
+
+        # M3: at a silent->signal rising edge (PTT key-up) add a bounded seeded
+        # jitter. Symmetric uniform in [-jitter, +jitter] samples. This is the
+        # DOMINANT trigger that random-walks the ACK arrival index.
+        onset = (self.prev_silent and not silent)
+        if onset:
+            self.n_onsets += 1
+            if self.jitter_ms > 0.0:
+                jsamp = (2.0 * self.rng.uniform() - 1.0) * self.jitter_ms \
+                        * FS / 1000.0
+                self.acc += jsamp
+        self.prev_silent = silent
+        if abs(self.acc) > self.max_abs_offset:
+            self.max_abs_offset = abs(self.acc)
+
+        if not silent:
+            # SIGNAL chunk: tones BIT-EXACT (M1 — never interpolate/alter them).
+            # At a key-up ONSET with a POSITIVE owed offset, realize the
+            # turnaround LATENCY by inserting whole SILENCE samples AHEAD of the
+            # burst (the physical "keyed up late" — the burst arrives later in the
+            # window). This is still M1-clean: the inserted samples are silence,
+            # the burst samples are copied verbatim. A NEGATIVE owed offset (drop)
+            # cannot eat signal, so it stays in `acc` and is paid down in the next
+            # silence gap (you can only compress idle time, not a live burst).
+            if onset and self.acc >= 1.0:
+                k = int(math.floor(self.acc))
+                # silence value = the channel-output noise floor of THIS edge is
+                # in the burst itself; use a near-zero pad (the gap noise already
+                # advanced the RNG). A flat low pad is spectrally inert pre-burst.
+                self.out.extend([0.0] * k)
+                self.acc -= k
+                self.n_inserted += k
+            self.out.extend(x)
+        else:
+            # SILENCE chunk: this is where we pay down the owed offset. Insert
+            # extra silence samples (acc>=+1) or drop silence samples (acc<=-1).
+            # Take the silence VALUE from the channel-output silence itself (the
+            # noise floor), so injected/retained silence is statistically the
+            # same band noise — never a hard zero discontinuity in a faded cell.
+            if self.acc >= 1.0:
+                k = int(math.floor(self.acc))
+                # insert k silence samples by repeating the chunk's mean-noise
+                # tail value pattern; cheap + spectrally inert at noise level.
+                pad = [x[i % n] for i in range(k)] if n else [0.0] * k
+                self.out.extend(pad)
+                self.out.extend(x)
+                self.acc -= k
+                self.n_inserted += k
+            elif self.acc <= -1.0:
+                k = min(int(math.floor(-self.acc)), n)
+                # drop the first k silence samples of this chunk (advance output
+                # past them); the remaining (n-k) silence samples still flow.
+                self.out.extend(x[k:])
+                self.acc += k
+                self.n_dropped += k
+            else:
+                self.out.extend(x)
+
+        chunks = self._emit_chunks()
+        self.out_total += sum(len(c) for c in chunks)
+        return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +926,32 @@ def main():
     ap.add_argument("--ptt-latency-jitter-ms", type=float, default=0.0,
                     help="symmetric uniform jitter (ms) on --ptt-latency-ms per "
                          "onset (seeded). DEFAULT 0. Requires --ptt-latency-ms>0.")
+    # ---- FAITHFUL turnaround-timing de-alignment model (SIMFIDELITY M1-M4) ----
+    # This is the CORRECTED drift mechanism (SIMFIDELITY_ROOTCAUSE.md): a
+    # turnaround-timing WINDOW-MISS (the reverse ACK lands outside the CMD's fixed
+    # listen window due to accumulated PTT/scheduling jitter + the PHYSICAL ±8 ppm
+    # slip), realized by INTEGER insert/drop of WHOLE SILENCE samples — SIGNAL
+    # samples (the ACK tones) pass BIT-EXACT. Enable with --turnaround-drift. This
+    # is the DEFAULT faithful path; the old --drift-ppm-* tone-resampler is kept
+    # behind its flag but is the WRONG axis (tone-smear, not window-miss).
+    ap.add_argument("--turnaround-drift", action="store_true",
+                    help="enable the FAITHFUL turnaround-timing window-miss model "
+                         "(M1-M4, SIMFIDELITY_ROOTCAUSE). Injects ±ppm crystal "
+                         "slip + per-key-up jitter as integer silence insert/drop "
+                         "(tones bit-exact), and relaxes the PDES barrier. The "
+                         "RIGHT axis for the CFG16 reverse-ACK collapse + D2 A/B.")
+    ap.add_argument("--turnaround-ppm-a2b", type=float, default=8.16,
+                    help="PHYSICAL crystal slip (ppm) on A->B for --turnaround-drift "
+                         "(default +8.16, CLOCK_VERDICT DIR1). NOT the -670 [CLK-TX] "
+                         "artifact (~80x too large; a producer-push quantization).")
+    ap.add_argument("--turnaround-ppm-b2a", type=float, default=-8.16,
+                    help="PHYSICAL crystal slip (ppm) on B->A for --turnaround-drift "
+                         "(default -8.16, CLOCK_VERDICT DIR2; reciprocal sign).")
+    ap.add_argument("--turnaround-jitter-ms", type=float, default=6.0,
+                    help="bounded SEEDED per-PTT-key-up turnaround jitter (ms, "
+                         "symmetric uniform) for --turnaround-drift — the DOMINANT "
+                         "trigger that random-walks the ACK arrival index out of "
+                         "the CMD window. DEFAULT 6.0. Calibrated to bench-7.")
     ap.add_argument("--idle-bigstep", type=int, default=1,
                     help="Q3 FTRT speed-up (EXPERIMENTAL, default OFF=1): when BOTH "
                          "directions are inbound-silent (modem idle gaps), coalesce up "
@@ -750,18 +983,26 @@ def main():
 
     drift_on = (args.drift_ppm_a2b != 0.0 or args.drift_ppm_b2a != 0.0)
     ptt_on = (args.ptt_latency_ms > 0.0)
+    turn_on = bool(args.turnaround_drift)
     if (args.ptt_latency_jitter_ms > 0.0) and not ptt_on:
         ap.error("--ptt-latency-jitter-ms requires --ptt-latency-ms > 0")
+    # The faithful turnaround model is the CORRECTED axis; the old tone-resampler
+    # is the WRONG axis. They model the same physical event two different (and
+    # incompatible) ways — refuse to run both at once so an A/B is unambiguous.
+    if turn_on and drift_on:
+        ap.error("--turnaround-drift (faithful window-miss) cannot be combined "
+                 "with --drift-ppm-* (the old tone-resampler axis). Use one.")
     # The idle big-step COALESCES runs of silence (drops chunks) and is gated on
     # split==0. That defeats BOTH the drift resampler (it needs the CONTINUOUS
-    # per-direction sample stream — dropped silence chunks would skip input) and
-    # the PTT onset-edge detector (a coalesced silence run hides the rising
-    # edge). They are conceptually incompatible; refuse the combination rather
-    # than silently produce a wrong model.
-    if (drift_on or ptt_on) and args.idle_bigstep > 1:
-        ap.error("--drift-ppm-* / --ptt-latency-ms cannot be combined with "
-                 "--idle-bigstep > 1 (coalescing drops/merges chunks and breaks "
-                 "the continuous drift stream + onset-edge detection)")
+    # per-direction sample stream — dropped silence chunks would skip input), the
+    # PTT onset-edge detector (a coalesced silence run hides the rising edge), and
+    # the faithful turnaround model (it pays the timing offset down IN the silence
+    # runs the big-step would elide). They are conceptually incompatible; refuse
+    # the combination rather than silently produce a wrong model.
+    if (drift_on or ptt_on or turn_on) and args.idle_bigstep > 1:
+        ap.error("--drift-ppm-* / --ptt-latency-ms / --turnaround-drift cannot be "
+                 "combined with --idle-bigstep > 1 (coalescing drops/merges chunks "
+                 "and breaks the continuous drift stream + onset-edge detection)")
 
     if args.cell:
         args.snr = parse_cell(args.cell)
@@ -791,8 +1032,16 @@ def main():
         f"barrier_k={args.barrier_k} "
         f"drift_ppm(a2b={args.drift_ppm_a2b},b2a={args.drift_ppm_b2a}) "
         f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms}) "
+        f"turnaround_drift={turn_on}(ppm a2b={args.turnaround_ppm_a2b},"
+        f"b2a={args.turnaround_ppm_b2a},jit={args.turnaround_jitter_ms}ms) "
         f"wire={'STAMPED(8200,needs feat/sim-clock modem)' if args.wire_stamp else 'BARE(8192,compatible)'}")
-    if drift_on or ptt_on:
+    if turn_on:
+        log("NOTE: FAITHFUL turnaround-drift model ENABLED (SIMFIDELITY M1-M4) — "
+            "integer silence insert/drop re-times bursts (signal samples "
+            "BIT-EXACT), ±ppm crystal slip + per-key-up jitter walk the reverse "
+            "ACK out of the CMD window; PDES barrier RELAXED (drift-mode only). "
+            "This is the corrected window-miss vehicle (NOT the tone-smear axis).")
+    elif drift_on or ptt_on:
         log("NOTE: inter-peer drift/PTT model ENABLED — the conservative-PDES "
             "barrier no longer makes this a byte-identical deterministic A/B; "
             "this is the FIX9 turnaround-de-alignment repro vehicle.")
@@ -832,6 +1081,16 @@ def main():
                                   Xoshiro(args.seed * 2246822519 & 0xFFFFFFFF)),
            "b2a": PttLatencyModel(args.ptt_latency_ms, args.ptt_latency_jitter_ms,
                                   Xoshiro(args.seed * 3266489917 & 0xFFFFFFFF))}
+    # FAITHFUL turnaround-timing model (M1-M3; SIMFIDELITY_ROOTCAUSE §3.2). Per
+    # direction: ±ppm crystal slip + seeded per-key-up jitter realized as integer
+    # silence insert/drop (signal samples bit-exact). enabled only with
+    # --turnaround-drift. Independent jitter seeds per direction (two radios).
+    turn = {"a2b": TurnaroundDrift(args.turnaround_ppm_a2b, args.turnaround_jitter_ms,
+                                   Xoshiro(args.seed * 2718281829 & 0xFFFFFFFF),
+                                   enabled=turn_on),
+            "b2a": TurnaroundDrift(args.turnaround_ppm_b2a, args.turnaround_jitter_ms,
+                                   Xoshiro(args.seed * 3141592653 & 0xFFFFFFFF),
+                                   enabled=turn_on)}
 
     stop = threading.Event()
     counters = {"a2b": 0, "b2a": 0}      # per-direction chunk counts
@@ -877,6 +1136,21 @@ def main():
     # next chunk, which it always eventually does — the credit gate can never
     # starve both directions at once (one of them is always <= other + K).
     BARRIER_K = max(1, args.barrier_k)
+    # M4 (SIMFIDELITY §3.2): the faithful turnaround model inserts/drops whole
+    # SILENCE samples per direction, which changes the per-direction chunk COUNT
+    # slightly (an inserted silence run emits an extra chunk; a dropped run emits
+    # one fewer). With strict K=1 the barrier throttles whichever direction ran a
+    # chunk ahead, re-coupling the clocks and re-absorbing the offset (it would
+    # mask the de-alignment, FIX9 §3). So in --turnaround-drift mode ONLY, give a
+    # MODEST extra credit so the insert/drop can compound across a batch WITHOUT
+    # pinning a large inter-peer split (a large split de-syncs the CONNECT/climb
+    # FSM — the physical de-alignment is only a few-hundred-samples << 1 chunk per
+    # batch, NOT seconds). K=4 (~85 ms) is comfortably above the per-batch offset
+    # and well below the ~1.3 s that desyncs CONNECT. drift-OFF keeps the user K
+    # (default strict 1) => N2 byte-identity untouched (gated on turn_on; applied
+    # AFTER --barrier-k so an explicit larger --barrier-k still wins).
+    if turn_on:
+        BARRIER_K = max(BARRIER_K, 4)
     # Bounded inbound queues: a reader thread per direction blocks on the socket,
     # applies the channel, and hands the processed chunk to the forwarder. The
     # small maxsize back-pressures a reader whose direction is K-credit-blocked so
@@ -946,11 +1220,19 @@ def main():
                 zeros = [0.0] * CHUNK_SAMPLES
                 for _ in range(n_inject):
                     sil_out = ch.process(zeros)          # noise-floor chunk
-                    wire.extend(drift[key].process(sil_out))
+                    # injected PTT silence is always silent for the turnaround
+                    # re-timer (it pays offset down there too); drift then turn.
+                    for dc in drift[key].process(sil_out):
+                        wire.extend(turn[key].process(dc, True))
             out = ch.process(samples)   # ALWAYS advance channel state (determinism)
             # --- inter-peer sample-clock drift (OPT-IN): re-time the forwarded
             # stream. ppm==0 -> identity (returns [out], byte-identical). --------
-            wire.extend(drift[key].process(out))
+            # --- FAITHFUL turnaround re-timer (M1-M3, OPT-IN): integer silence
+            # insert/drop that re-positions bursts; SIGNAL chunks bit-exact.
+            # turnaround-OFF -> identity. drift and turnaround are mutually
+            # exclusive (validated in main), so the chain is one or the other. -----
+            for dc in drift[key].process(out):
+                wire.extend(turn[key].process(dc, silent))
             # Enqueue every produced wire chunk in order (default off: exactly one
             # == the un-drifted `out`, so the queue cadence is unchanged). The
             # barrier/forwarder advances counters[key] by 1 per chunk regardless,
@@ -995,6 +1277,11 @@ def main():
                            f"(slip={dr.out_total - dr.in_total:+d}smp)")
             if pt.enabled:
                 drift_s += f" ptt_onsets={pt.n_onsets} ptt_inj={pt.n_delay_chunks}ch"
+            tr = turn[key]
+            if tr.enabled:
+                drift_s += (f" turn_ppm={tr.ppm:+.2f} onsets={tr.n_onsets} "
+                            f"ins={tr.n_inserted} drop={tr.n_dropped} "
+                            f"offset={tr.acc:+.1f}smp peak={tr.max_abs_offset:.1f}smp")
             log(f"{key}: {counters[key]} chunks "
                 f"({counters[key]*CHUNK_SAMPLES/FS:.1f}s) "
                 f"vstamp={stamp} split={counters['a2b']-counters['b2a']:+d} "
