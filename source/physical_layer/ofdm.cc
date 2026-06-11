@@ -89,6 +89,7 @@ cl_ofdm::cl_ofdm()
 	ls_nv_debug_enabled=false; // fix/cfg16-nv-restore: opt-in [LS-NV-DBG] logging
 	ls_use_crosspilot_nv=false; // fix/cfg16-nv-restore: default = the fix (residual nv)
 	tinterp_smooth_halfwin=0; // feat/fade-tinterp: TIME_INTERP pilot pre-smooth off by default
+	dd_data_conf_thresh=0.30; // Turbo-EQ: data-aided improve-only confidence threshold (read only inside the turbo loop)
 	// Optimized FFT tables
 	fft_twiddle=NULL;
 	fft_scratch=NULL;
@@ -2032,6 +2033,208 @@ void cl_ofdm::LS_channel_estimator_tinterp(std::complex <double>*in)
 				npil++;
 			}
 		double nv_resid = (npil>0) ? nsum/(double)npil : 0.01;
+		double nv_floor = estimate_noise_from_pilot_pairs(in);   // cross-pilot AWGN floor
+		noise_variance_estimate = (nv_resid > nv_floor) ? nv_resid : nv_floor;
+		if(noise_variance_estimate < 1e-6) noise_variance_estimate = 1e-6;
+	}
+}
+
+// Turbo-EQ DATA-AIDED (decision-directed) channel estimator (RESEARCH_turbo-eq.md
+// §3/§4.4). The keystone of Lever #1: after the first LDPC decode, the decoded
+// codeword is soft-re-modulated to per-data-symbol soft estimates (x̄, v) which act
+// as VIRTUAL PILOTS at EVERY data subcarrier. Because the decoded data lives at
+// every symbol, the channel is now sampled every symbol (not every Dy=3) — this is
+// what breaks the Dy=3 pilot Nyquist wall that stops the LS/TINTERP estimator on
+// the POOR/1 Hz Watterson fade (the documented TINTERP wall; the GENIE compass).
+//
+//   in    : the raw post-FFT received grid (Nsymb*Nc), same buffer LS reads.
+//   xbar  : soft symbol means in DEFRAMED DATA-cell raster order (deframer order),
+//           length = nData (number of DATA cells). PILOTs are NOT in this array.
+//   v     : soft symbol variances, same order/length as xbar (∈[0,1] for unit-Es).
+//
+// Per cell (n,j):
+//   PILOT : Ĥ = rx/X, treated as a PERFECT virtual pilot (the iteration-1 floor).
+//   DATA  : Ĥ_raw = rx·conj(x̄)/(|x̄|²+v)  (MMSE-style; the +v term is the soft-symbol
+//           uncertainty, prevents division blow-up at x̄≈0). Used as an anchor ONLY
+//           when v is below dd_data_conf_thresh (the IMPROVE-ONLY guard, dossier §6.4:
+//           keep pilots-only as the floor; an uncertain cell is interpolated, not
+//           trusted). Worst case (all data cells uncertain) ⇒ this ≈ the pilots-only
+//           LS estimate ⇒ no harm.
+// Then the SAME interpolate_linear_col / interpolate_bilinear_matrix /
+// smooth_channel_estimate_dft smoothing the LS estimator uses runs over the now
+// time-dense anchor lattice. nv is re-estimated from the pilot + reliable-data
+// residual, FLOORED at estimate_noise_from_pilot_pairs (cross-pilot AWGN) + 1e-6 —
+// the EXACT I1 guard TINTERP uses (the HW-only nv-collapse guard is NOT removed; R3).
+//
+// Otnes/Tüchler 2004 (iterative CE for turbo equalization of time-varying freq-
+// selective channels); EURASIP 2010 (per-symbol mean/var init {0,1}, pilots perfect).
+void cl_ofdm::data_aided_channel_estimator(std::complex<double>* in,
+                                           std::complex<double>* xbar, double* v)
+{
+	if(Nsymb <= 0 || Nc <= 0)
+	{
+		LS_channel_estimator(in);   // degenerate-frame fallback (matches TINTERP guard)
+		return;
+	}
+
+	// IMPROVE-ONLY confidence threshold on the soft-symbol variance: only trust a
+	// data cell as a virtual-pilot anchor when v < thresh (a reasonably converged
+	// symbol). Cells above thresh are left UNKNOWN → filled by interpolation from
+	// pilots + reliable neighbors. Default 0.30 (dossier §6.4 "reliable cells").
+	const double conf_thresh = (dd_data_conf_thresh > 0.0) ? dd_data_conf_thresh : 0.30;
+
+	// Pass 1: write raw per-cell H at PILOTs (rx/X) and reliable DATA cells.
+	// Mark everything else UNKNOWN so the interpolators fill them.
+	int pilot_index = 0;
+	int data_index  = 0;   // walks DATA cells in the SAME raster order deframer uses
+	for(int i=0;i<Nsymb;i++)
+	{
+		for(int j=0;j<Nc;j++)
+		{
+			int t = (ofdm_frame+i*Nc+j)->type;
+			if(t==PILOT)
+			{
+				std::complex<double> X = pilot_configurator.sequence[pilot_index++];
+				if(std::abs(X) > 1e-12)
+				{
+					(estimated_channel+i*Nc+j)->value  = *(in+i*Nc+j) / X;
+					(estimated_channel+i*Nc+j)->status  = MEASURED;
+				}
+				else
+				{
+					(estimated_channel+i*Nc+j)->status  = UNKNOWN;
+					(estimated_channel+i*Nc+j)->value   = 0;
+				}
+			}
+			else if(t==DATA)
+			{
+				std::complex<double> xb = xbar[data_index];
+				double vv = v[data_index];
+				data_index++;
+				double mag2 = xb.real()*xb.real() + xb.imag()*xb.imag();
+				if(vv < conf_thresh && (mag2 + vv) > 1e-12)
+				{
+					// MMSE-style data-aided per-cell channel observation.
+					std::complex<double> Hraw = (*(in+i*Nc+j) * std::conj(xb)) / (mag2 + vv);
+					(estimated_channel+i*Nc+j)->value  = Hraw;
+					(estimated_channel+i*Nc+j)->status  = MEASURED;
+				}
+				else
+				{
+					(estimated_channel+i*Nc+j)->status  = UNKNOWN;   // interpolate
+					(estimated_channel+i*Nc+j)->value   = 0;
+				}
+			}
+			else
+			{
+				(estimated_channel+i*Nc+j)->status = UNKNOWN;
+				(estimated_channel+i*Nc+j)->value  = 0;
+			}
+		}
+	}
+
+	// Pass 2: fill any UNKNOWN cell by interpolation. Per carrier, linear-interpolate
+	// in TIME between MEASURED anchors (hold at edges); any carrier with no anchor is
+	// freq-filled. This is the dense-lattice analog of LS's column interpolation, but
+	// over the time-dense data-aided anchor set (the Nyquist-wall break).
+	for(int j=0;j<Nc;j++)
+	{
+		// gather measured rows on this carrier
+		int first=-1, last=-1;
+		for(int n=0;n<Nsymb;n++)
+			if((estimated_channel+n*Nc+j)->status==MEASURED){ if(first<0) first=n; last=n; }
+		if(first<0) continue;   // no anchor on this carrier → handled by freq-fill below
+		// hold at edges
+		for(int n=0;n<first;n++)
+			(estimated_channel+n*Nc+j)->value = (estimated_channel+first*Nc+j)->value;
+		for(int n=last+1;n<Nsymb;n++)
+			(estimated_channel+n*Nc+j)->value = (estimated_channel+last*Nc+j)->value;
+		// linear interp between consecutive anchors
+		int prev=first;
+		for(int n=first+1;n<=last;n++)
+		{
+			if((estimated_channel+n*Nc+j)->status==MEASURED)
+			{
+				int n0=prev, n1=n;
+				std::complex<double> h0=(estimated_channel+n0*Nc+j)->value;
+				std::complex<double> h1=(estimated_channel+n1*Nc+j)->value;
+				for(int m=n0+1;m<n1;m++)
+				{
+					double t = (n1>n0)? (double)(m-n0)/(double)(n1-n0) : 0.0;
+					(estimated_channel+m*Nc+j)->value = h0*(1.0-t) + h1*t;
+				}
+				prev=n;
+			}
+		}
+		for(int n=first;n<=last;n++)
+			(estimated_channel+n*Nc+j)->status = MEASURED;
+	}
+	// Freq-fill any all-data carrier that ended up with no anchor (Dx=1 ⇒ none in
+	// production, but keep for safety / thinned lattices).
+	for(int n=0;n<Nsymb;n++)
+	{
+		int firstc=-1,lastc=-1;
+		for(int j=0;j<Nc;j++)
+			if((estimated_channel+n*Nc+j)->status==MEASURED){ if(firstc<0) firstc=j; lastc=j; }
+		if(firstc<0) continue;
+		for(int j=0;j<firstc;j++)
+			(estimated_channel+n*Nc+j)->value = (estimated_channel+n*Nc+firstc)->value;
+		for(int j=lastc+1;j<Nc;j++)
+			(estimated_channel+n*Nc+j)->value = (estimated_channel+n*Nc+lastc)->value;
+		int prevc=firstc;
+		for(int j=firstc+1;j<=lastc;j++)
+		{
+			if((estimated_channel+n*Nc+j)->status==MEASURED)
+			{
+				std::complex<double> h0=(estimated_channel+n*Nc+prevc)->value;
+				std::complex<double> h1=(estimated_channel+n*Nc+j)->value;
+				for(int m=prevc+1;m<j;m++)
+				{
+					double t=(j>prevc)? (double)(m-prevc)/(double)(j-prevc):0.0;
+					(estimated_channel+n*Nc+m)->value = h0*(1.0-t)+h1*t;
+				}
+				prevc=j;
+			}
+		}
+		for(int j=0;j<Nc;j++)
+			(estimated_channel+n*Nc+j)->status = MEASURED;
+	}
+
+	// DFT smoothing (same denoiser the LS path applies post-interp).
+	smooth_channel_estimate_dft();
+
+	// nv = pilot+reliable-data residual against the final H, FLOORED at the cross-pilot
+	// AWGN estimate (I1). The data-aided residual can only ADD to the pre-EQ floor; it
+	// cannot collapse nv below the true noise (the E1/cfg16-nvfix collapse class).
+	{
+		double nsum = 0.0; int ncnt = 0; int pidx = 0; int didx = 0;
+		for(int i=0;i<Nsymb;i++)
+		{
+			for(int j=0;j<Nc;j++)
+			{
+				int t = (ofdm_frame+i*Nc+j)->type;
+				if(t==PILOT)
+				{
+					std::complex<double> X = pilot_configurator.sequence[pidx++];
+					std::complex<double> resid = *(in+i*Nc+j) - (estimated_channel+i*Nc+j)->value * X;
+					nsum += resid.real()*resid.real() + resid.imag()*resid.imag();
+					ncnt++;
+				}
+				else if(t==DATA)
+				{
+					std::complex<double> xb = xbar[didx];
+					double vv = v[didx];
+					didx++;
+					if(vv < conf_thresh)
+					{
+						std::complex<double> resid = *(in+i*Nc+j) - (estimated_channel+i*Nc+j)->value * xb;
+						nsum += resid.real()*resid.real() + resid.imag()*resid.imag();
+						ncnt++;
+					}
+				}
+			}
+		}
+		double nv_resid = (ncnt>0) ? nsum/(double)ncnt : 0.01;
 		double nv_floor = estimate_noise_from_pilot_pairs(in);   // cross-pilot AWGN floor
 		noise_variance_estimate = (nv_resid > nv_floor) ? nv_resid : nv_floor;
 		if(noise_variance_estimate < 1e-6) noise_variance_estimate = 1e-6;

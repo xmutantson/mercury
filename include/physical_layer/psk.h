@@ -53,6 +53,12 @@ public:
 	void deinit();
 	void mod(const int *in,int nItems,std::complex <double> *out);
 	void demod(const std::complex <double> *in,int nItems,float *out,float variance);
+	// Turbo-EQ soft re-modulation (RESEARCH_turbo-eq.md §3/§4.3). From per-bit
+	// a-priori LLRs (SAME order/sign as demod() output), emit the soft symbol mean
+	// xbar_out[sym] = E[x] (virtual-pilot value) and variance v_out[sym] =
+	// E|x|² − |xbar|² (its reliability) via an exact sum over the constellation.
+	// nItems = number of LLRs (= nData*nBits); writes nItems/nBits symbols.
+	void soft_remod(const float* llr, int nItems, std::complex<double>* xbar_out, double* v_out);
 	// Nearest-constellation-point hard slicer (min Euclidean distance). Used by the
 	// sparse-2D channel interpolator's optional DDCE pass (grid_sparse2d_estimator).
 	// Returns (0,0) if the constellation is not initialized.

@@ -40,7 +40,8 @@ int decode_SPA(
 		int K,
 		int P,
 		int nIteration_max,
-		std::atomic<bool>* abort_flag
+		std::atomic<bool>* abort_flag,
+		double* app_llr
 )
 {
 	int Cout[N_MAX];
@@ -217,6 +218,20 @@ int decode_SPA(
 	for( i=0;i<K;i++)
 	{
 		LLRo[i]=(LLRtmp[i]<0);
+	}
+	// Turbo-EQ keystone (RESEARCH_turbo-eq.md §4.2): expose the full a-posteriori
+	// LLR vector for ALL N coded bits. LLRtmp[i] = LLRi[i] + Σ_j R[i][j] is computed
+	// every BP iteration at :167-173 (and equals the input LLRi[i] when the frame
+	// is already valid before iterating, :60). Copied here ONLY when app_llr is
+	// non-null → zero cost + byte-identical for every existing caller.
+	// The extrinsic for soft re-modulation is app_llr[i] − LLRi[i] (= Σ_j R[i][j],
+	// the pure decoder contribution); the caller forms it.
+	if(app_llr)
+	{
+		for(i=0;i<N;i++)
+		{
+			app_llr[i]=LLRtmp[i];
+		}
 	}
 	return iteration;
 

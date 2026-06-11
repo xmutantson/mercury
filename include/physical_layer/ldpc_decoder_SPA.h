@@ -46,7 +46,11 @@ int decode_SPA(
 		int K,
 		int P,
 		int nIteration_max,
-		std::atomic<bool>* abort_flag = nullptr
+		std::atomic<bool>* abort_flag = nullptr,
+		double* app_llr = nullptr   // Turbo-EQ: when non-null, receives the
+		                            // a-posteriori LLR for all N coded bits
+		                            // (RESEARCH_turbo-eq.md §4.2). Default null
+		                            // = byte-identical for every existing caller.
 );
 
 
