@@ -1929,11 +1929,42 @@ public:
   // expected CRC-32. Default -1 (unset, defensive) is treated as K at the consumer.
   int           bigblock_partial_n_data        = -1;   // decoded cw0 n_data (filled-codeword count)
   std::vector<int> bigblock_partial_lengths;            // per-codeword wire app lengths
+
+  // ---- C6 MEASURE-ONLY: cw(K-1)-gap PARTIAL block-CRC RESIDUAL EXPOSURE counter -------
+  // (block-crc-upgrade-design.md §7 [?] + bigblock-integrity.md §5/§12 — QUANTIFY-FIRST).
+  // The whole-block CRC-32 (FIX-2) re-verifies the assembled block at prev-batch completion,
+  // but it is ARMED ONLY when cw(K-1) decoded CRC-8-clean (cw(K-1) carries the CRC-32 field at
+  // BIGBLOCK_BLOCK_CRC_OFFSET — when it is ITSELF the gap the field is never recovered, so the
+  // stash cannot arm; the carve's arm precondition `cwlast_clean` is FALSE, arq_common.cc:5097).
+  // In that sub-case the block is delivered WITHOUT the block-CRC-32 gate, so any OTHER kept
+  // codeword that FALSE-PASSED its per-cw CRC-8 falls back to the 2^-8 floor the CRC-32 exists to
+  // eliminate. This is the residual exposure §7 asks to MEASURE before deciding the CLOSE.
+  // MEASURE-ONLY: this stash arms a one-shot signal at the carve (when cw(K-1) is the gap AND
+  // >=1 other kept slot is delivered) and the prev-batch completion increments the counter +
+  // logs [PARTIAL-CRC-RESIDUAL] when such a block is actually DELIVERED. NO delivery behaviour
+  // changes; the per-cw CRC-8 is NOT weakened; nothing is refused. Sibling one-shot of the
+  // bigblock_partial_* stash (set at the carve, consumed at prev-batch completion, reset per carve).
+  bool          bigblock_residual_armed         = false; // cw(K-1)-gap PARTIAL with >=1 other kept slot
+  int           bigblock_residual_block_bsi      = -1;    // bsi (0..255) of the residual-exposed block
+  int           bigblock_residual_kept_slots     = 0;     // count of kept (cw_ok==1) slots besides cw(K-1)
+  // Count of DELIVERED PARTIAL blocks where cw(K-1) was in the gap (block-CRC-32 NOT armable) AND
+  // >=1 other kept slot was delivered relying only on the per-cw CRC-8 floor — the residual-exposure
+  // population §7 asks to quantify. Diagnostic only; logged via [PARTIAL-CRC-RESIDUAL]. 0 at init.
+  long long     bigblock_partial_crc_residual_count = 0;
+
   // Verify the stashed block-CRC-32 over the K-codeword payload reassembled from messages_rx_prev[]
   // (app bytes per slot + reconstructed cw0 header, with per-cw CRC tails + the block-CRC field
   // zeroed — the SAME image the TX computed over). Returns true when the block is byte-consistent
   // (deliver) and false on mismatch (do NOT deliver). Called at the prev-batch completion.
   bool bigblock_partial_block_crc_ok();
+
+  // C6 MEASURE-ONLY: count a DELIVERED PARTIAL big-block whose cw(K-1) was the gap (block-CRC-32
+  // NOT armable) AND >=1 other kept codeword rode the per-cw CRC-8 floor — the residual-exposure
+  // population block-crc-upgrade-design.md §7 asks to QUANTIFY. Called from the prev-batch
+  // completion AFTER delivery; increments bigblock_partial_crc_residual_count + logs
+  // [PARTIAL-CRC-RESIDUAL] when bigblock_residual_armed and the delivered bsi matches. Clears the
+  // one-shot. Changes NO delivery behaviour (the block is already delivered by the caller).
+  void note_bigblock_partial_crc_residual(int delivered_bsi);
 
   // ---- STEP 3: single-block end-to-end in the 2-instance in-process sim -------
   // test_sim_inproc_bigblock(): a dedicated single-block 2-instance ARQ harness
