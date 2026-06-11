@@ -865,7 +865,24 @@ void *radio_playback_thread(void *device_ptr)
         // printf("n = %lld total written = %u\n", n, total_written);
 
 		// Clock-drift: accumulate frames played and periodically report rate.
-		// Counts only frames that were actually delivered to the audio sink.
+		//
+		// CLARIFICATION (SIMFIDELITY_ROOTCAUSE.md §1, 2026-06-10): the
+		// [CLK-TX] drift this reports is a PRODUCER-PUSH-RATE / QUANTIZATION
+		// metric, NOT the codec crystal frequency. `samples_read` is ALWAYS
+		// one whole `period_bytes` quantum — including the "play zeros if there
+		// is nothing to play" branch above (line ~734), so this window count
+		// folds in silence/zero-fill and any ESYNC-dropped chunk. The 10 s
+		// window also closes a fraction of a period late (the numerator is
+		// quantized in whole periods; the denominator drifts up to one period),
+		// so a ~±10 ms error on a 10 s window already reads as ±1000 ppm. That
+		// is why [CLK-TX] swings -631 -> +2163 -> -817 ppm across consecutive
+		// windows on the SAME pair (a physical crystal cannot do that). The
+		// REAL inter-Pi sample-clock skew is ±8.16 ppm (CLOCK_VERDICT.md §2,
+		// tone method); the hundreds-of-ppm here is a software measurement
+		// artifact (push-rate vs wall, dominated by 10 s-window quantization).
+		// Do NOT treat [CLK-TX] as the crystal. (Symbol left as-is to avoid
+		// churn; a future cleanup may report sink-ACCEPTED frames over an
+		// exact-period window, or rename to [TX-PUSH-RATE].)
 		clk_tx_window_frames += samples_read;
 		{
 			struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);

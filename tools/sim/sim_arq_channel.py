@@ -54,17 +54,20 @@ Options:
   --loss F          impulse/burst erasure fraction (orthogonal to fading)
   --burst           Gilbert-Elliott bursty impulse dropout (impulse-noise knob)
   --secs N          dwell seconds (default 180)
-  --port N          relay base TCP port (default 52100)
+  --port N          relay TCP port PREFERENCE (default 52100; auto-advanced if busy)
+  --ctrl-base N     pin the control/data quad base (default auto-pick from 7002)
   --start-cfg N     mercury -s config (default 100 = ROBUST_0)
   --robust          pass -R (start in robust tier; default on for start-cfg>=100)
   --compress on|off (default off, so we read RAW PHY gearshift behavior)
   --payload PATH    TX payload file (default payload_incompressible_64k.bin)
   --json PATH       write a machine-readable result summary
 
-NOTE: this harness taskkills ALL mercury.exe at start AND teardown (process-
-global). Run cells SEQUENTIALLY — two concurrent invocations will kill each
-other's modem processes. The calibrator drives one cell at a time for this
-reason.
+NOTE: ports are AUTO-PICKED at startup (a free control/data quad {base, base+1,
+base+4, base+5} plus a free relay port; base advances on collision). Cleanup is
+PORT-SCOPED — only PIDs holding THIS run's ports are killed, never a system-wide
+`taskkill /IM mercury.exe`. So two (or N) invocations run CONCURRENTLY without
+killing each other's modems or colliding on ports. Use --ctrl-base to pin the
+base for a deterministic re-run.
 
 Verdict: prints whether over-climb->collapse and/or deep-SNR stall reproduced,
 plus the config-switch timeline (same fields the muething HW harness records:
@@ -82,8 +85,17 @@ DEFAULT_BIN = os.path.join(MERCURY_ROOT, "mercury.exe")
 RELAY = os.path.join(HERE, "sim_channel_relay.py")
 DEFAULT_PAYLOAD = os.path.join(HERE, "payload_incompressible_64k.bin")
 
-RSP_PORT = 7002
-CMD_PORT = 7006
+# Control/data ports are AUTO-PICKED at startup (see pick_free_ports) so multiple
+# sim cells can run concurrently without colliding — the historical hardcoded
+# 7002/7006 quad was the single root cause of three consecutive "port-blocked"
+# calibration runs (a live bench experiment owned 7002/7006/52100). These module
+# constants are the *defaults the auto-picker probes FIRST* (base=7002), and the
+# --ctrl-base override pins the base for determinism. The chosen quad is recorded
+# in the result JSON so cleanup is PORT-SCOPED, never a system-wide taskkill.
+DEFAULT_CTRL_BASE = 7002          # RSP ctrl; data=+1, CMD ctrl=+4, CMD data=+5
+DEFAULT_RELAY_PORT = 52100        # relay listen port (independent of the quad)
+RSP_PORT = DEFAULT_CTRL_BASE      # rebound in main() after pick_free_ports
+CMD_PORT = DEFAULT_CTRL_BASE + 4  # rebound in main() after pick_free_ports
 
 # Mercury prints "[GEARSHIFT] SET_CONFIG: forward=N ..." on every config change
 # (arq_commander.cc:692) and "loaded config N" on load. Track both.
@@ -154,6 +166,115 @@ def require_guard_binary(bin_path):
               "(source/audioio/audioio.c) and point --bin at it.", file=sys.stderr)
         sys.exit(2)
     print(f"[SIM-AUDIO-GUARD] OK: {bin_path} contains the device-open guard marker.")
+
+
+# ---------------------------------------------------------------------------
+# PORT AUTO-PICK — collision-proof concurrent sims (root-cause fix)
+# ---------------------------------------------------------------------------
+# The harness binds FIVE TCP ports per run:
+#   RSP ctrl = base       RSP data = base+1
+#   CMD ctrl = base+4     CMD data = base+5    relay = a separate free port
+# These were hardcoded (7002/7006 + 52100), so a concurrent run (e.g. a live
+# bench experiment) holding them blocked every retry. pick_free_ports bind-probes
+# a whole quad at once; on ANY member being busy it advances base by +8 and
+# retries (cap PORT_PICK_TRIES). The relay port is probed independently. A
+# --ctrl-base override pins the base for deterministic re-runs.
+PORT_PICK_TRIES = 20
+PORT_PICK_STRIDE = 8              # quad is 6 wide; +8 leaves a 2-port guard gap
+
+
+def _port_free(port):
+    """True iff a fresh TCP socket can bind 127.0.0.1:port RIGHT NOW.
+
+    No SO_REUSEADDR: we want the probe to FAIL if anything (a live modem, a
+    sibling experiment, a lingering zombie) already holds the port, so the quad
+    we hand out is genuinely free. The probe socket is closed immediately so the
+    real owner can bind it microseconds later."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def pick_free_ports(ctrl_base=None, relay_pref=None, tries=PORT_PICK_TRIES):
+    """Return (rsp_ctrl, rsp_data, cmd_ctrl, cmd_data, relay_port).
+
+    Probe the quad {base, base+1, base+4, base+5} for a base starting at
+    ctrl_base (default DEFAULT_CTRL_BASE); on collision advance by PORT_PICK_STRIDE
+    and retry up to `tries`. The relay port is probed from relay_pref upward,
+    avoiding the chosen quad. Raises RuntimeError if no free quad/relay is found.
+
+    Determinism: pass ctrl_base to pin the base (it still verifies the quad is
+    free and FAILS LOUDLY rather than silently colliding)."""
+    base0 = DEFAULT_CTRL_BASE if ctrl_base is None else ctrl_base
+    quad = None
+    for i in range(tries):
+        base = base0 + i * PORT_PICK_STRIDE
+        members = (base, base + 1, base + 4, base + 5)
+        if all(_port_free(p) for p in members):
+            quad = members
+            break
+    if quad is None:
+        raise RuntimeError(
+            f"pick_free_ports: no free ctrl/data quad after {tries} tries from "
+            f"base {base0} (stride {PORT_PICK_STRIDE}). Ports busy — is a sibling "
+            f"sim/bench experiment running? Check netstat for :{base0}..")
+    # Relay port: independent, just needs to be free and not collide with the quad.
+    relay0 = DEFAULT_RELAY_PORT if relay_pref is None else relay_pref
+    relay_port = None
+    for i in range(tries * PORT_PICK_STRIDE):
+        cand = relay0 + i
+        if cand in quad:
+            continue
+        if _port_free(cand):
+            relay_port = cand
+            break
+    if relay_port is None:
+        raise RuntimeError(
+            f"pick_free_ports: no free relay port near {relay0}.")
+    return (*quad, relay_port)
+
+
+def _pids_on_ports(ports):
+    """Return the set of PIDs holding (LISTENING/ESTABLISHED on) any of `ports`,
+    parsed from `netstat -ano` (Windows). Used for PORT-SCOPED teardown so we
+    NEVER system-wide-taskkill mercury.exe (a sibling bench run shares the box)."""
+    want = {str(p) for p in ports}
+    pids = set()
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return pids
+    for line in out.splitlines():
+        parts = line.split()
+        # TCP  127.0.0.1:7002  0.0.0.0:0  LISTENING  12345
+        if len(parts) >= 5 and parts[0].upper() == "TCP":
+            local = parts[1]
+            if ":" in local:
+                lport = local.rsplit(":", 1)[1]
+                if lport in want:
+                    pid = parts[-1]
+                    if pid.isdigit() and pid != "0":
+                        pids.add(pid)
+    return pids
+
+
+def kill_port_scoped(ports, my_pids):
+    """Kill ONLY the PIDs holding our ports (plus our own spawned PIDs). Never a
+    /IM mercury.exe sweep — a concurrent bench run on different ports must survive."""
+    targets = set(str(p) for p in my_pids if p)
+    targets |= _pids_on_ports(ports)
+    for pid in targets:
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                          capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 class State:
@@ -316,7 +437,14 @@ def main():
     ap.add_argument("--fade-hz", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--fade-depth", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--secs", type=int, default=180)
-    ap.add_argument("--port", type=int, default=52100)
+    ap.add_argument("--port", type=int, default=DEFAULT_RELAY_PORT,
+                    help="relay listen port PREFERENCE; auto-advanced if busy. "
+                         "Auto-pick keeps concurrent sims collision-proof.")
+    ap.add_argument("--ctrl-base", type=int, default=None,
+                    help="pin the control-port quad base (RSP=base, RSP-data=base+1, "
+                         "CMD=base+4, CMD-data=base+5) for deterministic re-runs. "
+                         "Default: auto-pick starting at %d. Probe still verifies the "
+                         "quad is free and fails loudly on collision." % DEFAULT_CTRL_BASE)
     ap.add_argument("--start-cfg", type=int, default=100)
     ap.add_argument("--robust", action="store_true", default=None)
     ap.add_argument("--compress", default="off")
@@ -328,6 +456,11 @@ def main():
                     help="conservative-PDES lockstep window (chunks) passed to the "
                          "relay. K=1 = strict lockstep (default); relax to 4/8 if "
                          "the strict window starves CONNECT/delivery.")
+    ap.add_argument("--relay-seed", type=int, default=1,
+                    help="relay --seed passthrough (seeds the deterministic AWGN + "
+                         "per-key-up turnaround-jitter walk). Use MATCHED seeds across "
+                         "a D2-ON vs D2-OFF A/B so both arms see the identical channel "
+                         "+ jitter realization. DEFAULT 1.")
     # ---- FIX9 inter-peer drift / PTT turnaround repro (OPT-IN, passthrough) ---
     # DEFAULT 0 (off) -> byte-identical deterministic A/B. On -> the relay re-times
     # the forwarded per-direction stream by the given ppm sample-clock skew (and
@@ -344,6 +477,24 @@ def main():
                          "latency, ms, per direction). DEFAULT 0 (off).")
     ap.add_argument("--ptt-latency-jitter-ms", type=float, default=0.0,
                     help="relay --ptt-latency-jitter-ms passthrough. DEFAULT 0.")
+    # ---- FAITHFUL turnaround-timing window-miss model (SIMFIDELITY M1-M4) ------
+    # The CORRECTED drift axis: a turnaround-timing WINDOW-MISS (reverse ACK lands
+    # outside the CMD listen window) realized by integer silence insert/drop with
+    # SIGNAL samples bit-exact. The right vehicle for the CFG16 reverse-ACK
+    # collapse + the FIX9 D2 A/B (D2 widens the window, which fixes a window-miss
+    # but NOT the old tone-smear). DEFAULT off -> byte-identical.
+    ap.add_argument("--turnaround-drift", action="store_true",
+                    help="relay --turnaround-drift passthrough (FAITHFUL window-"
+                         "miss model). DEFAULT off. The corrected axis for the "
+                         "CFG16 reverse-ACK collapse + D2 A/B.")
+    ap.add_argument("--turnaround-ppm-a2b", type=float, default=8.16,
+                    help="relay --turnaround-ppm-a2b passthrough (physical crystal "
+                         "slip, default +8.16; NOT the -670 [CLK-TX] artifact).")
+    ap.add_argument("--turnaround-ppm-b2a", type=float, default=-8.16,
+                    help="relay --turnaround-ppm-b2a passthrough (default -8.16).")
+    ap.add_argument("--turnaround-jitter-ms", type=float, default=6.0,
+                    help="relay --turnaround-jitter-ms passthrough (per-key-up "
+                         "turnaround jitter; the dominant trigger). DEFAULT 6.0.")
     ap.add_argument("--wire-stamp", type=int, default=0, choices=(0, 1),
                     help="relay --wire-stamp passthrough. DEFAULT 0 (bare 8192, "
                          "compatible with every shipped -x sim mercury). Set 1 "
@@ -357,6 +508,27 @@ def main():
     # mercury process. If args.bin lacks the GUARD-1 marker this exits(2) here
     # and nothing is spawned — the leak is structurally impossible.
     require_guard_binary(args.bin)
+
+    # AUTO-PICK a free control/data quad + relay port (collision-proof). Rebind
+    # the module-level RSP_PORT/CMD_PORT the nested launch/socket code uses, and
+    # args.port (the relay port). On collision the picker advances the base; a
+    # --ctrl-base pins it for deterministic re-runs.
+    global RSP_PORT, CMD_PORT
+    try:
+        RSP_PORT, _rsp_data, CMD_PORT, _cmd_data, relay_port = pick_free_ports(
+            ctrl_base=args.ctrl_base, relay_pref=args.port)
+    except RuntimeError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        sys.exit(3)
+    args.port = relay_port
+    chosen_ports = {
+        "rsp_ctrl": RSP_PORT, "rsp_data": RSP_PORT + 1,
+        "cmd_ctrl": CMD_PORT, "cmd_data": CMD_PORT + 1,
+        "relay": relay_port,
+    }
+    my_ports = [RSP_PORT, RSP_PORT + 1, CMD_PORT, CMD_PORT + 1, relay_port]
+    print(f"[PORTS] auto-picked quad: RSP ctrl={RSP_PORT} data={RSP_PORT+1} | "
+          f"CMD ctrl={CMD_PORT} data={CMD_PORT+1} | relay={relay_port}")
 
     # Load the fixed incompressible payload.
     if not os.path.isfile(args.payload):
@@ -380,10 +552,18 @@ def main():
           f"start={cfg_name(args.start_cfg)} compress={args.compress} "
           f"barrier_k={args.barrier_k} "
           f"drift_ppm(a2b={args.drift_ppm_a2b},b2a={args.drift_ppm_b2a}) "
-          f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms})")
+          f"ptt_latency_ms={args.ptt_latency_ms}(jit={args.ptt_latency_jitter_ms}) "
+          f"turnaround_drift={args.turnaround_drift}"
+          f"(ppm a2b={args.turnaround_ppm_a2b},b2a={args.turnaround_ppm_b2a},"
+          f"jit={args.turnaround_jitter_ms}ms)")
     print(f"payload={args.payload} ({len(payload)} bytes, md5={payload_md5})\n")
 
-    os.system("taskkill /F /IM mercury.exe >nul 2>&1")
+    # PORT-SCOPED pre-clean: kill only whatever lingers on OUR auto-picked ports
+    # (a prior crashed run of THIS cell), NOT a system-wide /IM mercury.exe sweep
+    # — a concurrent bench experiment on different ports must survive. The picker
+    # already verified the quad was free, so this is normally a no-op; it catches
+    # a TIME_WAIT/zombie that grabbed a port between probe and launch.
+    kill_port_scoped(my_ports, [])
     time.sleep(1)
 
     logfile = open(os.path.join(MERCURY_ROOT, "sim_arq_channel.log"), "w")
@@ -412,6 +592,7 @@ def main():
     try:
         # 1. relay first so the peers can connect immediately.
         relay_cmd = [sys.executable, RELAY, "--port", str(args.port),
+                     "--seed", str(args.relay_seed),
                      "--snr", str(args.snr), "--loss", str(args.loss),
                      "--profile", args.profile,
                      "--cfo-hz", str(args.cfo_hz),
@@ -422,7 +603,12 @@ def main():
                      "--drift-ppm-b2a", str(args.drift_ppm_b2a),
                      "--ptt-latency-ms", str(args.ptt_latency_ms),
                      "--ptt-latency-jitter-ms", str(args.ptt_latency_jitter_ms),
+                     "--turnaround-ppm-a2b", str(args.turnaround_ppm_a2b),
+                     "--turnaround-ppm-b2a", str(args.turnaround_ppm_b2a),
+                     "--turnaround-jitter-ms", str(args.turnaround_jitter_ms),
                      "--log", relay_log]
+        if args.turnaround_drift:
+            relay_cmd.append("--turnaround-drift")
         if args.cell:
             relay_cmd += ["--cell", args.cell]
         if args.burst:
@@ -482,17 +668,23 @@ def main():
                 s.close()
             except OSError:
                 pass
+        spawned_pids = []
         for p in procs:
+            spawned_pids.append(p.pid)
             try:
                 p.kill()
             except OSError:
                 pass
         if relay:
+            spawned_pids.append(relay.pid)
             try:
                 relay.terminate()
             except OSError:
                 pass
-        os.system("taskkill /F /IM mercury.exe >nul 2>&1")
+        # PORT-SCOPED teardown: kill our spawned PIDs + anything still holding our
+        # auto-picked ports. NEVER a /IM mercury.exe sweep — the BK8/sibling bench
+        # run shares this machine on different ports and must not be touched.
+        kill_port_scoped(my_ports, spawned_pids)
         logfile.close()
 
     # ---- delivered-byte md5 (I7) ----
@@ -578,8 +770,16 @@ def main():
                 "cfo_hz": args.cfo_hz, "phase_noise_deg": args.phase_noise_deg,
                 "loss": args.loss, "burst": args.burst,
                 "secs": args.secs, "start_cfg": args.start_cfg,
+                "relay_seed": args.relay_seed,
+                # auto-picked ports (so cleanup/inspection is PORT-SCOPED, never
+                # a system-wide kill — multiple concurrent sims are collision-proof)
+                "ports": chosen_ports,
                 "drift_ppm_a2b": args.drift_ppm_a2b,
                 "drift_ppm_b2a": args.drift_ppm_b2a,
+                "turnaround_drift": args.turnaround_drift,
+                "turnaround_ppm_a2b": args.turnaround_ppm_a2b,
+                "turnaround_ppm_b2a": args.turnaround_ppm_b2a,
+                "turnaround_jitter_ms": args.turnaround_jitter_ms,
                 "ptt_latency_ms": args.ptt_latency_ms,
                 "ptt_latency_jitter_ms": args.ptt_latency_jitter_ms,
                 "connected": st.connected,
