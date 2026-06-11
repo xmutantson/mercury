@@ -558,6 +558,37 @@ static const int ROBUST_ACK_DRIFT_MARGIN_MS = 600;
 // gate on the disjunct (this constant only sizes the OFDM arm). TUNABLE.
 static const int BATCH_MAY_BE_PARTIAL_THRESHOLD = 2;
 
+// TURNAROUND BATCH-AIRTIME RE-PHASE (bench-9; bigblock_p3_hw/_turnaroundfix/TURNAROUND_FIX_DESIGN.md §5.1)
+// ----------------------------------------------------------------------------------------------------
+// ROOT CAUSE (HW-confirmed, BENCH9_VERDICT.json): the CMD reverse-ACK listen window
+// (calculate_receiving_timeout, arq_common.cc CMD branch) is built ENTIRELY from PER-FRAME / fixed
+// terms — frame_drain = 2*message_transmission_time_ms + sack_arrival(fixed) + margin. There is NO
+// term proportional to FORWARD BATCH AIRTIME. But on a held-CFG16 25-30-frame batch the half-duplex
+// channel is occupied ~4.78s, so keyer/AGC/capture-flush/scheduling latency + the ±8.16ppm crystal
+// slip accumulate WITHIN the batch and push the single end-of-batch reverse SACK systematically LATE
+// in proportion to batch airtime. The CMD window opens at the right phase for a ~2-frame batch and
+// ~143ms too EARLY for a ~28-frame batch -> the SACK slides fully past the window (matched=0/7, 81%
+// stall on bench-9). This is a ONE-SIDED, batch-length-proportional MIS-PHASE, NOT a too-narrow
+// window: H1 (a fixed +600ms widen, ROBUST_ACK_DRIFT_MARGIN_MS) was ACTIVE in the bench-9 binary
+// 627c370 and the pinned held-CFG16 STILL stalled 81% — widening a window whose CENTER is ~143ms off
+// past its ~90ms half-width cannot recapture a one-sided slide.
+//
+// FIX: add a batch-airtime-keyed late-shift (re-CENTER the window LATER by the accrued amount so the
+// SACK lands back in the middle). Calibrated to the SAME 30 ms/s the relay sim uses
+// (sim/turnaround-calibrate @8606389, TurnaroundDrift.accrual_ms_per_s default 30.0,
+// late_offset = accrual_ms_per_s * burst_airtime_s) so HW and sim share ONE locked constant. This is
+// the ARDOP "adjust for keying-offset" discipline in static-calibrated form and the structural analog
+// of PACTOR's fixed turnaround idle scaled to batch length (prior art: TURNAROUND_FIX_DESIGN.md §3).
+//
+// DEFAULT-OFF: gated by MERCURY_TURNAROUND_REPHASE (see turnaround_rephase_enabled_common,
+// arq_common.cc). With the env UNSET production is BYTE-IDENTICAL to monitor tip 627c370. Even when
+// ENABLED the term only bites on OFDM multi-frame batches (is_ofdm_config && data_batch_size >=
+// BATCH_MAY_BE_PARTIAL_THRESHOLD); CFG15-short / robust / NB / single-frame degenerate to ~0 accrual.
+static const int TURNAROUND_ACCRUAL_MS_PER_S = 30; // relay-locked (8606389); ms late-shift per s of fwd batch airtime
+// Small fixed guard added with the accrual to cover the residual spread of the SACK arrival around the
+// re-centered phase (the accrual cancels the MEAN late-shift; the guard covers the variance). Bounded.
+static const int ACCRUAL_PHASE_GUARD_MS    = 150;
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

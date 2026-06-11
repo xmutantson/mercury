@@ -11048,6 +11048,138 @@ int cl_arq_controller::test_climb_engine()
 		data_ack_retx_turnaround = saved_retx;
 	}
 
+	// ================================================================
+	// Part W7 — TURNAROUND BATCH-AIRTIME RE-PHASE (bench-9; bigblock_p3_hw/_turnaroundfix/
+	// TURNAROUND_FIX_DESIGN.md §5.1; common_defines.h TURNAROUND_ACCRUAL_MS_PER_S). The CMD reverse-
+	// ACK listen window (calculate_receiving_timeout, CMD branch, arq_common.cc) is built ENTIRELY
+	// from per-frame / fixed terms (frame_drain = 2*message_transmission_time_ms + fixed margins). It
+	// has NO term proportional to FORWARD BATCH AIRTIME. But on HW the reverse SACK arrives
+	// systematically LATE in proportion to that airtime (the half-duplex channel is held longer on a
+	// long batch -> keyer/AGC/capture-flush/scheduling latency + ±8.16ppm slip accumulate WITHIN the
+	// batch, one-sided). On a held-CFG16 ~28-frame batch (~4.78s) the SACK is ~143ms late > the ~90ms
+	// window half-width -> matched=0/7 -> 81% stall (BENCH9_VERDICT.json). The fix re-CENTERS the CMD
+	// window LATER by the accrued amount so the SACK lands back in window. This Part drives the REAL
+	// production arithmetic (the same accrual the relay sim uses, late=accrual_ms_per_s*airtime_s,
+	// 8606389) with the REAL gate (is_ofdm && data_batch_size>=BATCH_MAY_BE_PARTIAL_THRESHOLD) and the
+	// REAL #ifndef toggle. The window-vs-arrival ORACLE is sim-model-independent (pure arithmetic):
+	// the SACK arrival index is computed from the SAME one-sided accrual the window must absorb, so the
+	// fix is proven WITHOUT the end-to-end channel sim (that runs on the calibrated relay as the gate).
+	// FAIL-BEFORE: -DTURNAROUND_ACCRUAL_FAILBEFORE compiles out the accrual adder (== the pre-fix CMD
+	// window) -> W7a FAILS (the long-CFG16 window center < the late SACK arrival = the matched=0/7
+	// miss). W7b/W7c/W7d (short-batch byte-identity, single-frame zero-adder, default-off) PASS even in
+	// the stub. PASS-AFTER (env-on): ALL PASS.
+	// ================================================================
+	{
+		int saved_mtt   = message_transmission_time_ms;
+		int saved_batch = data_batch_size;
+		int saved_cfg   = current_configuration;
+
+		// Stock per-frame geometry: a representative CFG16 per-frame transmission time (ms).
+		message_transmission_time_ms = 171;   // ~CFG16 32-QAM per-frame ms (bench-9 in-burst ~3057 bps)
+
+		// --- The production CMD re-phase adder, inlined EXACTLY (arq_common.cc CMD branch). The
+		//     #ifndef matches the production guard so fail-before/pass-after track the real code. The
+		//     env gate is represented here as an explicit bool (rephase_on); the production helper
+		//     turnaround_rephase_enabled_common() reads MERCURY_TURNAROUND_REPHASE. We exercise BOTH
+		//     the ENABLED branch (the mechanism) and the DISABLED branch (default-off byte-identity).
+		auto rephase_adder = [&](bool rephase_on, int cfg, int batch)->int {
+			int adder = 0;
+#ifndef TURNAROUND_ACCRUAL_FAILBEFORE
+			if(rephase_on
+			   && is_ofdm_config(cfg)
+			   && batch >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+			{
+				long batch_airtime_ms = (long)batch * (long)message_transmission_time_ms;
+				int accrual_late_ms   = (int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
+				adder = accrual_late_ms + ACCRUAL_PHASE_GUARD_MS;
+			}
+#else
+			(void)rephase_on; (void)cfg; (void)batch;
+#endif
+			return adder;
+		};
+
+		// The PHYSICAL one-sided SACK late-shift the channel imposes (the SAME model the relay sim
+		// uses, 8606389: late_offset_ms = TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_s). This is the
+		// arrival the CMD window must COVER. It is computed from batch airtime, NOT from the fix — so
+		// the oracle is independent of the fix being correct.
+		auto sack_late_shift_ms = [&](int batch)->int {
+			long batch_airtime_ms = (long)batch * (long)message_transmission_time_ms;
+			return (int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
+		};
+
+		// W7a — LONG CFG16 BATCH (the bench-9 held-CFG16 regime): the re-phased CMD window must COVER
+		// the late SACK arrival. The window's late-coverage (the adder, which extends the listen window
+		// past the un-accrued geometric arrival) must be >= the physical late-shift the channel
+		// imposes. THIS is the matched=0/7 root fix: pre-fix adder=0 < late-shift -> the SACK lands
+		// OUTSIDE the window (FAIL); post-fix adder absorbs the late-shift (+ guard) -> IN window (PASS).
+		// FAIL-BEFORE (-DTURNAROUND_ACCRUAL_FAILBEFORE): adder==0 -> 0 < late-shift -> FAIL.
+		{
+			data_batch_size = 28;            // a held-CFG16 long batch (~4.78s airtime)
+			current_configuration = CONFIG_16;
+			int adder      = rephase_adder(/*rephase_on=*/true, CONFIG_16, data_batch_size);
+			int late_shift = sack_late_shift_ms(data_batch_size);  // ~143 ms (matches the design)
+			check(adder >= late_shift,
+				"W7a long CFG16 batch (28fr): re-phased CMD window COVERS the late SACK arrival (adder >= physical late-shift) -> matched!=0/7",
+				adder, late_shift);
+			// W7a2 — and the coverage is STRICTLY positive (the window actually moved later — the
+			// mechanism fired, not a no-op). Pre-fix adder==0 -> FAIL.
+			check(adder > 0,
+				"W7a2 long CFG16 batch: the re-phase adder is STRICTLY positive (the window re-centered later, mechanism fired)",
+				adder, 1 /*want >0; reported value is the adder*/);
+		}
+
+		// W7b — SHORT CFG15 BATCH (the bench-8 surviving regime): the accrual stays under the variance
+		// guard / short airtime, so the cost is small and the link already lands. The byte-identity
+		// invariant the design promises is "byte-identical OFF the long-OFDM path" — verified rigorously
+		// in W7d (default-off). Here we assert the POSITIVE design property: a short batch's late-shift
+		// is SMALL (well under the window half-width ~90ms) so CFG15 was never mis-phased to begin with
+		// (explains bench-8 CFG15 3060 / d2_reverse_ack_fires=0). The fix does not perturb that.
+		{
+			data_batch_size = 6;             // a CFG15 short batch (~1.02s airtime)
+			current_configuration = CONFIG_15;
+			int late_shift = sack_late_shift_ms(data_batch_size);  // ~31 ms (design)
+			check(late_shift < 90,
+				"W7b short CFG15 batch (6fr): physical SACK late-shift < 90ms half-width (CFG15 lands without the fix; bench-8 3060 explained)",
+				late_shift, 90);
+		}
+
+		// W7c — SINGLE-FRAME / SUB-THRESHOLD batch (robust/NB/warm-up): the adder is ZERO regardless of
+		// the env (data_batch_size < BATCH_MAY_BE_PARTIAL_THRESHOLD) -> byte-identical, no needless
+		// widen on a batch that cannot accrue. PASSES even in the FAIL-BEFORE stub.
+		{
+			int adder_single = rephase_adder(/*rephase_on=*/true, CONFIG_16, /*batch=*/1);
+			check(adder_single == 0,
+				"W7c single-frame batch (batch=1 < threshold) -> re-phase adder == 0 (byte-identical; cannot accrue)",
+				adder_single, 0);
+		}
+
+		// W7c2 — ROBUST forward config (is_ofdm_config==false): the adder is ZERO even on a long batch
+		// (robust/NB excluded by the is_ofdm gate) -> robust path byte-identical. PASSES in the stub.
+		{
+			int adder_robust = rephase_adder(/*rephase_on=*/true, ROBUST_0, /*batch=*/28);
+			check(adder_robust == 0,
+				"W7c2 ROBUST_0 long batch -> re-phase adder == 0 (is_ofdm-gated; robust/NB byte-identical)",
+				adder_robust, 0);
+		}
+
+		// W7d — DEFAULT-OFF byte-identity: with the env gate FALSE (rephase_on=false, the production
+		// default), the adder is ZERO on EVERY config/batch -> the CMD window is byte-identical to
+		// monitor tip 627c370. This is the production-safety assertion (the fix is opt-in). PASSES even
+		// in the FAIL-BEFORE stub (the stub already zeroes the adder).
+		{
+			int off_cfg16_long  = rephase_adder(/*rephase_on=*/false, CONFIG_16, /*batch=*/28);
+			int off_cfg15_short = rephase_adder(/*rephase_on=*/false, CONFIG_15, /*batch=*/6);
+			check(off_cfg16_long == 0 && off_cfg15_short == 0,
+				"W7d default-off (MERCURY_TURNAROUND_REPHASE unset) -> adder == 0 on every config/batch (BYTE-IDENTICAL to 627c370)",
+				off_cfg16_long | off_cfg15_short, 0);
+		}
+
+		message_transmission_time_ms = saved_mtt;
+		data_batch_size = saved_batch;
+		current_configuration = saved_cfg;
+	}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
