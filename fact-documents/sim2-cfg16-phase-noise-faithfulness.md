@@ -367,3 +367,45 @@ verified); the PN perturbation is seed-deterministic.
 decode-frac / meanH. Gate cell: `MERCURY_SIM_2INST=1 MERCURY_SIM2_PIN=1 MERCURY_SIM2_ROBUST=0
 MERCURY_SIM2_CFG=15|16 MERCURY_SIM2_SNR3K=900 MERCURY_SIM2_PAYLOAD_BYTES=4500
 MERCURY_SIM2_STALL_ITERS=110000 MERCURY_SIM2_SEED=12345 mercury.exe -m SIM_INPROC -n`.
+
+## §11. nv-COLLAPSE REPRODUCED on sfo_grid → nvfix BENEFIT sim-validatable (2026-06-10, TODO-A)
+
+The GAP2 study (`bigblock_p3_hw/_simfidelity/complete/GAP2_NVCOLLAPSE_VERDICT.md`) left ONE
+residual sim-TODO: the ratio-gated nvfix (`fix/cfg16-nvfix` a0e22c8, K=8) was proven
+NO-REGRESSION in sim but its BENEFIT could not be shown, because the deterministic
+frame-repeating freq-selective EVM floor that triggers the ~1000× nv-collapse sat on the
+SIM_INPROC vehicle (the §9 `cl_sim_det_floor`) and the sfo_grid harness stayed in a coupled
+regime (ratio < K=8 → nvfix inert). This section closes it. Full verdict:
+`bigblock_p3_hw/_simfidelity/finish/NVFIX_BENEFIT_SIMVALIDATABLE_VERDICT.md`.
+
+### §11.1 The floor was already ported; the missing piece was the COLLAPSING nv path
+The §9 all-pass is already on the sfo_grid production-acquisition path as `chan_sel=1`
+(`telecom_system.cc:6342-6347`, closed-form `A(e^{jw})^ap_n`), applied as a STATIC
+frame-repeating per-carrier taper `Tchan[j]` (same every symbol, `:6678-6679`). The collapse
+appears only on the nv path that CANCELS a static ripple = the cross-pilot differential
+(`ofdm.cc:1499-1503`). GAP2 scored the PRODUCTION residual nv (`ofdm.cc:1816-1845`,
+fix/cfg16-nv-restore), which RETAINS the ripple → never collapses (ratio 1.8–2.8). The HW
+collapse (commit 2d540d9) was the PRE-restore regime where nv WAS the cross-pilot. Driving
+the harness with `--ls-crosspilot-nv=on` (`main.cc:2007`, the literal pre-fix A.1.4 arm) puts
+nv back on the collapsing path — the one-line wiring that makes the benefit show.
+
+### §11.2 Result (chan_sel=1, --ls-crosspilot-nv=on, CFG16 32-QAM, TRACK_PROD on)
+- COLLAPSE reproduces: nv 1e-6 vs measure_var 0.05 vs true post-EQ EVM 0.029 (mvar/evm 1.73),
+  ratio ≈ 5e4 >> K, **SNR-insensitive** (EsN0 180–450 identical) = the chan_sel=1 signature =
+  the HW ~1000× decoupling. (Sim is more extreme than HW's 1.7e-4 because the ripple is exactly
+  static → cross-pilot delta exactly 0, clamped to the 1e-6 floor, `ofdm.cc:1516`.)
+- BENEFIT shown: BASE (collapsed nv) decodes 2/6 .. 5/6 codewords; FIX (ratio-gated
+  demap_variance, the a0e22c8 gate) decodes 6/6; **delta_decoded +1 .. +4** as the floor
+  strengthens (ap_g 0.15→0.40, D=4, N=3). FIX recovers EVERY codeword the collapse destroys.
+- NO-REGRESSION (failing-first): production residual nv on the SAME floor → ratio < K, nvfix
+  inert, BASE == FIX (the GAP2 regime where the benefit was unreachable). FLAT control
+  (chan_sel=0) + cross-pilot → no static ripple to cancel → no collapse, full decode.
+
+### §11.3 Verdict + repro
+The nvfix is now FULLY sim-validatable (no-regression AND benefit). bench-9 is confirmation,
+not the gate. Test (3 assertions, CI-style):
+`bigblock_p3_hw/_simfidelity/finish/test_nvfix_collapse_benefit.py` → PASS. Instrumentation
+(harness-only, no production PHY change) committed on `fix/cfg16-nvfix`. Repro cell:
+`MERCURY_SFO_GRID=1 MERCURY_SFO_GRID_CHAN=1 MERCURY_SFO_GRID_TRACK_PROD=1 MERCURY_SFO_GRID_CODED=1
+MERCURY_SFO_GRID_ESN0=200 MERCURY_SFO_GRID_AP_G=0.40 MERCURY_SFO_GRID_AP_DLY=4 MERCURY_SFO_GRID_AP_N=3
+mercury.exe -m PLOT_PASSBAND -s 16 --ls-crosspilot-nv=on` → `[SFO-GRID-NVFIX-AB] ... delta_decoded=4`.
