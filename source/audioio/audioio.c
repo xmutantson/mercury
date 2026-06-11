@@ -841,7 +841,7 @@ void *radio_playback_thread(void *device_ptr)
                 // iteration risks the same backpressure. Drop the remaining
                 // bytes for this chunk and break out so the producer thread
                 // moves on to the next iteration. The lost ~10 ms of audio
-                // shows up as a clock-drift glitch in [CLK-TX-GLITCH] but
+                // shows up as a push-rate glitch in [TX-PUSH-GLITCH] but
                 // the thread stays real-time.
                 printf("detected underrun, dropping %lld samples (%.1fms)\n",
                        (long long)n / (long long)frame_size,
@@ -864,25 +864,27 @@ void *radio_playback_thread(void *device_ptr)
         }
         // printf("n = %lld total written = %u\n", n, total_written);
 
-		// Clock-drift: accumulate frames played and periodically report rate.
+		// Push-rate: accumulate frames played and periodically report rate.
+		// Tag is [TX-PUSH-RATE] — producer-push-rate vs wall, NOT the crystal;
+		// true skew via tone method is ±8 ppm.
 		//
-		// CLARIFICATION (SIMFIDELITY_ROOTCAUSE.md §1, 2026-06-10): the
-		// [CLK-TX] drift this reports is a PRODUCER-PUSH-RATE / QUANTIZATION
-		// metric, NOT the codec crystal frequency. `samples_read` is ALWAYS
-		// one whole `period_bytes` quantum — including the "play zeros if there
-		// is nothing to play" branch above (line ~734), so this window count
-		// folds in silence/zero-fill and any ESYNC-dropped chunk. The 10 s
-		// window also closes a fraction of a period late (the numerator is
-		// quantized in whole periods; the denominator drifts up to one period),
-		// so a ~±10 ms error on a 10 s window already reads as ±1000 ppm. That
-		// is why [CLK-TX] swings -631 -> +2163 -> -817 ppm across consecutive
-		// windows on the SAME pair (a physical crystal cannot do that). The
-		// REAL inter-Pi sample-clock skew is ±8.16 ppm (CLOCK_VERDICT.md §2,
-		// tone method); the hundreds-of-ppm here is a software measurement
-		// artifact (push-rate vs wall, dominated by 10 s-window quantization).
-		// Do NOT treat [CLK-TX] as the crystal. (Symbol left as-is to avoid
-		// churn; a future cleanup may report sink-ACCEPTED frames over an
-		// exact-period window, or rename to [TX-PUSH-RATE].)
+		// CLARIFICATION (SIMFIDELITY_ROOTCAUSE.md §1, 2026-06-10; tag renamed
+		// from the misleading [CLK-TX] in C4, 2026-06-10): the drift this
+		// reports is a PRODUCER-PUSH-RATE / QUANTIZATION metric, NOT the codec
+		// crystal frequency. `samples_read` is ALWAYS one whole `period_bytes`
+		// quantum — including the "play zeros if there is nothing to play"
+		// branch above (line ~734), so this window count folds in
+		// silence/zero-fill and any ESYNC-dropped chunk. The 10 s window also
+		// closes a fraction of a period late (the numerator is quantized in
+		// whole periods; the denominator drifts up to one period), so a ~±10 ms
+		// error on a 10 s window already reads as ±1000 ppm. That is why this
+		// metric swings -631 -> +2163 -> -817 ppm across consecutive windows on
+		// the SAME pair (a physical crystal cannot do that). The REAL inter-Pi
+		// sample-clock skew is ±8.16 ppm (CLOCK_VERDICT.md §2, tone method);
+		// the hundreds-of-ppm here is a software measurement artifact (push-rate
+		// vs wall, dominated by 10 s-window quantization). Do NOT treat
+		// [TX-PUSH-RATE] as the crystal. (A future cleanup may report
+		// sink-ACCEPTED frames over an exact-period window.)
 		clk_tx_window_frames += samples_read;
 		{
 			struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
@@ -892,7 +894,7 @@ void *radio_playback_thread(void *device_ptr)
 			if (dt_call > 0.025) {
 				double dt_total = (now.tv_sec - clk_tx_start.tv_sec) +
 				                  (now.tv_nsec - clk_tx_start.tv_nsec) * 1e-9;
-				printf("[CLK-TX-GLITCH] dt_call=%.1fms samples=%d total_t=%.3fs\n",
+				printf("[TX-PUSH-GLITCH] dt_call=%.1fms samples=%d total_t=%.3fs\n",
 					dt_call * 1000.0, samples_read, dt_total);
 				fflush(stdout);
 				clk_tx_glitch_count++;
@@ -904,7 +906,7 @@ void *radio_playback_thread(void *device_ptr)
 				double dt_total = (now.tv_sec - clk_tx_start.tv_sec) +
 				                  (now.tv_nsec - clk_tx_start.tv_nsec) * 1e-9;
 				double drift_ppm = (rate - 48000.0) / 48000.0 * 1e6;
-				printf("[CLK-TX] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
+				printf("[TX-PUSH-RATE] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
 					dt_window, (long long)clk_tx_window_frames, rate, drift_ppm, dt_total,
 					clk_tx_glitch_count);
 				fflush(stdout);
@@ -1149,7 +1151,12 @@ void *radio_capture_thread(void *device_ptr)
 		int frames_read = r / frame_size;
 		int frames_to_write = frames_read;
 
-		// Clock-drift: accumulate frames and periodically report rate
+		// Deliver-rate: accumulate frames and periodically report rate.
+		// Tag is [RX-DELIVER-RATE] — consumer-deliver-rate vs wall, NOT the
+		// crystal; true skew via tone method is ±8 ppm. Same PRODUCER/CONSUMER
+		// vs wall window-quantization artifact as [TX-PUSH-RATE] above (renamed
+		// from the misleading [CLK-RX] in C4, 2026-06-10); see that comment +
+		// SIMFIDELITY_ROOTCAUSE.md §1. Do NOT treat as the crystal.
 		clk_rx_cum_frames += frames_read;
 		clk_rx_window_frames += frames_read;
 		{
@@ -1162,7 +1169,7 @@ void *radio_capture_thread(void *device_ptr)
 				// >25 ms gap — log with absolute time for correlation w/ [T] events
 				double dt_total = (now.tv_sec - clk_rx_start.tv_sec) +
 				                  (now.tv_nsec - clk_rx_start.tv_nsec) * 1e-9;
-				printf("[CLK-RX-GLITCH] dt_call=%.1fms frames=%d total_t=%.3fs\n",
+				printf("[RX-DELIVER-GLITCH] dt_call=%.1fms frames=%d total_t=%.3fs\n",
 					dt_call * 1000.0, frames_read, dt_total);
 				fflush(stdout);
 				clk_rx_glitch_count++;
@@ -1174,7 +1181,7 @@ void *radio_capture_thread(void *device_ptr)
 				double dt_total = (now.tv_sec - clk_rx_start.tv_sec) +
 				                  (now.tv_nsec - clk_rx_start.tv_nsec) * 1e-9;
 				double drift_ppm = (rate - 48000.0) / 48000.0 * 1e6;
-				printf("[CLK-RX] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
+				printf("[RX-DELIVER-RATE] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
 					dt_window, (long long)clk_rx_window_frames, rate, drift_ppm, dt_total,
 					clk_rx_glitch_count);
 				fflush(stdout);
