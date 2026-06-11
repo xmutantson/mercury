@@ -1357,6 +1357,48 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 
 	double *buffer_temp = (double *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(double) * 2);
 
+	// ---------------------------------------------------------------------
+	// SIM REVERSE-ACK STARVATION FIDELITY (env MERCURY_SIM_REVACK_STARVE,
+	// default-off byte-identical). See fact-documents/data-flow-sim-capture-ring.md.
+	//
+	// HW vs SIM gap: on HW the capture DMA scrolls the decode ring in REAL TIME
+	// during the CMD's post-batch reverse-ACK listen window, DECOUPLED from the
+	// modem's decode-poll cadence; on a long forward OFDM batch this real-time
+	// scroll walks the reverse ACK/SACK's tail-snapshot position out of the
+	// finite tail window the CMD polls (the bench-9 matched=0/7 collapse). In the
+	// 2-process sim the ring scrolls EXACTLY one symbol per data-ACK poll
+	// (arq_commander.cc:2902-2909 throttle, lockstep with the prep thread), so the
+	// reverse ACK always lands in the tail and decodes (block-success 100%,
+	// whole-window ~2x the HW anchor). This injects the missing real-time scroll:
+	// after a LONG forward batch (detected via rx_mute accumulation), during the
+	// listen window the prep thread scrolls EXTRA channel-silence symbols into the
+	// ring AHEAD of the poll, in proportion to the FORWARD batch airtime — so the
+	// reverse-ACK tail position drifts out of the poll window exactly as on HW. A
+	// SHORT CFG15/CONNECT forward burst is below the threshold -> no extra scroll
+	// -> CFG15 + the MFSK handshake stay byte-faithful (the bench-9 step).
+	const char *revack_env = getenv("MERCURY_SIM_REVACK_STARVE");
+	int revack_starve_on = (revack_env && revack_env[0] && revack_env[0] != '0');
+	// Calibration knobs (env overridable for the A/B sweep). MIN_SYMS gates the
+	// mechanism to long OFDM batches (CFG16 batch ~25-30 frames * (Nsymb+preamble)
+	// >> a CFG15 ~6-frame batch and >> a single MFSK CONNECT frame). RATE = extra
+	// silence symbols scrolled per muted-batch symbol during the listen window.
+	int   revack_min_syms = 600;   // muted symbols (~forward batch) to arm starve
+	double revack_rate     = 30.0; // window length (prep ticks) per 100 muted syms
+	int   revack_max_extra = 400;  // cap window length (prep ticks)
+	int   revack_per_tick  = 8;    // extra silence symbols scrolled per prep tick
+	{
+		const char *e;
+		if((e = getenv("MERCURY_SIM_REVACK_MIN_SYMS")) && e[0]) revack_min_syms = atoi(e);
+		if((e = getenv("MERCURY_SIM_REVACK_RATE"))     && e[0]) revack_rate     = atof(e);
+		if((e = getenv("MERCURY_SIM_REVACK_MAX"))      && e[0]) revack_max_extra = atoi(e);
+		if((e = getenv("MERCURY_SIM_REVACK_PERTICK"))  && e[0]) revack_per_tick  = atoi(e);
+		if(revack_per_tick < 1) revack_per_tick = 1;
+	}
+	int  revack_prev_mute = 0;        // rx_mute edge state
+	long revack_muted_syms = 0;       // forward-batch length accumulator (muted symbols)
+	int  revack_credit = 0;           // remaining prep ticks of extra scroll this window
+	int  revack_armed = 0;            // this listen window followed a long enough batch
+
 	while (!shutdown_)
     {
 		cl_data_container *data_container_ptr = &telecom_ptr->data_container;
@@ -1394,6 +1436,40 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 		if(data_container_ptr->rx_mute) {
 			memset(buffer_temp, 0, symbol_period * sizeof(double));
 			data_container_ptr->rx_mute_samples += symbol_period;
+		}
+
+		// SIM REVERSE-ACK STARVATION: track the forward-batch length via rx_mute
+		// and arm a SUSTAINED listen-window extra-scroll on the falling (TX->RX)
+		// edge. The scroll runs for revack_credit PREP TICKS (not a one-shot
+		// burst), each tick adding revack_per_tick extra silence symbols — so the
+		// ring keeps MOVING throughout the window and any reverse ACK/SACK that
+		// arrives is displaced from the finite tail snapshot BEFORE the modem's
+		// next data-ACK poll, producing a CLEAN total miss (silent tail) rather
+		// than a partial/decodable fragment. This mirrors the HW real-time DMA
+		// scroll across the whole turnaround, not just its first instant.
+		if(revack_starve_on) {
+			int mute_now = data_container_ptr->rx_mute ? 1 : 0;
+			if(mute_now) {
+				// Forward TX in progress: accumulate the batch length, clear any
+				// stale window (a new forward batch supersedes the prior one).
+				revack_muted_syms += 1;
+				revack_credit = 0;
+				revack_armed = 0;
+			} else if(revack_prev_mute && !mute_now) {
+				// Falling edge: the forward batch just ended; the reverse-ACK
+				// listen window begins. Arm a SUSTAINED scroll spanning the
+				// window iff the batch was long (CFG16-grade). The window length
+				// (in prep ticks) scales with the forward batch airtime so a
+				// longer CFG16 batch starves a proportionally longer window.
+				if(revack_muted_syms >= revack_min_syms) {
+					revack_credit = (int)(revack_muted_syms * revack_rate / 100.0);
+					if(revack_credit > revack_max_extra) revack_credit = revack_max_extra;
+					if(revack_credit < 0) revack_credit = 0;
+					revack_armed = (revack_credit > 0);
+				}
+				revack_muted_syms = 0;
+			}
+			revack_prev_mute = mute_now;
 		}
 
 		MUTEX_LOCK(&capture_prep_mutex);
@@ -1450,6 +1526,53 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 				}
 				data_container_ptr->ring_write_index =
 					(wi + symbol_period) % sp;
+			}
+
+			// SIM REVERSE-ACK STARVATION: scroll EXTRA channel-silence symbols
+			// into the ring during the listen window after a long forward batch.
+			// SUSTAINED across the window: each prep tick consumes ONE window tick
+			// (revack_credit--) and scrolls revack_per_tick extra silence symbols,
+			// so the ring keeps MOVING for the whole armed window. This advances
+			// ring_write_index AHEAD of the modem's data-ACK poll (throttled to 1
+			// symbol of ring advance per receive(), arq_commander.cc:2902-2909), so
+			// the reverse ACK/SACK that arrives mid-window is displaced from the
+			// finite tail snapshot BEFORE the next poll reads it — a CLEAN total
+			// miss (silent tail), the HW real-time DMA scroll across the whole
+			// turnaround. Each extra symbol is SILENCE (the turnaround-gap noise
+			// floor), written via the SAME double-mapped ring write, and counts as
+			// an overrun shift (nUnder) exactly like a real prep overrun. The
+			// modem's own post-TX ring reset (arq_common.cc:5519) cleared the ring,
+			// so this only ever displaces reverse-direction turnaround audio on the
+			// CMD — never forward data (which the RSP decodes on ITS ring). The
+			// window ends (revack_armed=0) when revack_credit drains or the next
+			// forward TX rearms. Default-off: revack_credit is 0 unless armed.
+			if(revack_armed && revack_credit > 0) {
+				int k;
+				for(k = 0; k < revack_per_tick; k++) {
+					if(data_container_ptr->data_ready == 1 && data_container_ptr->frames_to_read <= 0)
+						data_container_ptr->nUnder_processing_events++;
+					int wi2 = data_container_ptr->ring_write_index;
+					int remaining2 = sp - wi2;
+					if(remaining2 >= symbol_period) {
+						memset(&data_container_ptr->passband_delayed_data[wi2], 0,
+							symbol_period * sizeof(double));
+						memset(&data_container_ptr->passband_delayed_data[wi2 + sp], 0,
+							symbol_period * sizeof(double));
+					} else {
+						memset(&data_container_ptr->passband_delayed_data[wi2], 0,
+							remaining2 * sizeof(double));
+						memset(&data_container_ptr->passband_delayed_data[wi2 + sp], 0,
+							remaining2 * sizeof(double));
+						int wrap2 = symbol_period - remaining2;
+						memset(&data_container_ptr->passband_delayed_data[0], 0,
+							wrap2 * sizeof(double));
+						memset(&data_container_ptr->passband_delayed_data[sp], 0,
+							wrap2 * sizeof(double));
+					}
+					data_container_ptr->ring_write_index = (wi2 + symbol_period) % sp;
+				}
+				revack_credit--;
+				if(revack_credit <= 0) revack_armed = 0;
 			}
 
 			data_container_ptr->frames_to_read--;
