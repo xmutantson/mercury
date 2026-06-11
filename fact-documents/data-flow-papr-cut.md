@@ -193,3 +193,15 @@ esn0   off     15      13      10      7
   only depth with a real, recoverable clip-distortion BER cost in the sim. Phase-2 must show
   the RX cancellation recovers the 7 dB (or tighter) penalty back toward the 10-dB/off curve.
 - Translation to the HW 14.4 dB effective-SNR ceiling is BENCH-only (sim has no analog floor).
+
+### §8.3 Knee-zoom (16 seeds, continuous metrics) — `papr_knee_cfg16.csv`
+Captures mean post-FEC info BER + LDPC iter_mean per cut at {15.0, 15.25, 15.5} dB to
+resolve sub-cliff differences the binary decode-count hides. Result: cuts
+**{off, 15, 13, 12, 11} are BIT-FOR-BIT identical in ALL THREE metrics** (frac_decoded,
+mean_BER, mean_itermean) at every SNR point — proof the clip produces the IDENTICAL channel
+realization (it never fires at >=11 dB). At **10 dB** a vanishing engagement appears
+(mean_BER 0.01399->0.01397 @15.0; 0.00368->0.00370 @15.25) with NO decode change — 10 dB
+sits exactly at the onset of engagement, the conservative looser edge of the optimum
+plateau. Engagement becomes material only at <=~8 dB (coarse: 7 dB = 0.596% clipped, the
+only depth with a real decode penalty). The engagement boundary (~8-9 dB) is the
+failing-test-first operating point for Phase-2.
