@@ -511,6 +511,9 @@ cl_arq_controller::cl_arq_controller()
 	data_configuration=CONFIG_0;
 	forward_configuration=CONFIG_NONE;
 	reverse_configuration=CONFIG_NONE;
+	// SE-RECLAIM: default-safe FULL grid both directions (data-flow-se-reclaim.md §4).
+	forward_grid=GRID_FULL;
+	reverse_grid=GRID_FULL;
 
 	gear_shift_on=NO;
 	robust_enabled=NO;
@@ -1710,8 +1713,26 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// telecom_system->load_configuration may deinit/reinit buffers that
 	// the audio callback accesses (passband_delayed_data, etc.)
 	telecom_system->data_container.frames_to_read = 0;
-	printf("[CFG] Calling telecom_system->load_configuration(%d) nb=%d\n",
-		configuration, telecom_system->narrowband_enabled);
+
+	// SE-RECLAIM (data-flow-se-reclaim.md §2/§6): push the negotiated grid selector
+	// to the PHY so the materializer derives the (Ngi,Dy,Nsymb) grid that matches
+	// this direction's config. The grid is direction-keyed exactly like the config:
+	// the DATA (forward) config carries forward_grid; the ACK (reverse) config
+	// carries reverse_grid. Both ends set the SAME selector from the SET_CONFIG wire
+	// so RX and TX derive IDENTICAL geometry (INV-2). Default forward/reverse_grid ==
+	// GRID_FULL until the Stage-3 gate elects RECLAIM => byte-identical until then.
+	// Only CONFIG_15 materializes RECLAIM; the PHY ignores the selector elsewhere.
+	{
+		int grid_for_cfg = GRID_FULL;
+		if(configuration == data_configuration)        grid_for_cfg = forward_grid;
+		else if(configuration == ack_configuration)    grid_for_cfg = reverse_grid;
+		else if(configuration == forward_configuration) grid_for_cfg = forward_grid;
+		else if(configuration == reverse_configuration) grid_for_cfg = reverse_grid;
+		telecom_system->pending_grid = is_valid_grid(grid_for_cfg) ? grid_for_cfg : GRID_FULL;
+	}
+
+	printf("[CFG] Calling telecom_system->load_configuration(%d) grid=%d nb=%d\n",
+		configuration, telecom_system->pending_grid, telecom_system->narrowband_enabled);
 	fflush(stdout);
 	telecom_system->load_configuration(configuration);
 	printf("[CFG] telecom_system->load_configuration done\n");

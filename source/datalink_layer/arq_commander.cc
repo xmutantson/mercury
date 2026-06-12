@@ -704,10 +704,17 @@ int cl_arq_controller::add_message_control(char code)
 			negotiated_configuration = forward_configuration;
 			messages_control.data[1] = forward_configuration;
 			messages_control.data[2] = reverse_configuration;
-			messages_control.length = 3;
+			// SE-RECLAIM grid selector (data-flow-se-reclaim.md §2 producer, INV-4/INV-5).
+			// data[3]/data[4] ride the same CRC16+LDPC+ACK SET_CONFIG codeword as the
+			// config indices. Default forward_grid/reverse_grid == GRID_FULL (0) until
+			// the Stage-3 gate elects RECLAIM, so length-5 FULL/FULL is byte-identical on
+			// the wire to a legacy length-3 frame (transmit_byte zero-pads the tail).
+			messages_control.data[3] = (char)forward_grid;
+			messages_control.data[4] = (char)reverse_grid;
+			messages_control.length = 5;
 
-			printf("[GEARSHIFT] SET_CONFIG: forward=%d reverse=%d (SNR down=%.1f up=%.1f) link_status=%d\n",
-				forward_configuration, reverse_configuration,
+			printf("[GEARSHIFT] SET_CONFIG: forward=%d reverse=%d fwd_grid=%d rev_grid=%d (SNR down=%.1f up=%.1f) link_status=%d\n",
+				forward_configuration, reverse_configuration, forward_grid, reverse_grid,
 				measurements.SNR_downlink, measurements.SNR_uplink, (int)link_status);
 			fflush(stdout);
 #ifdef MERCURY_GUI_ENABLED

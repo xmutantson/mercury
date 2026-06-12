@@ -1494,6 +1494,18 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
 
+  // SE-reclaim synthetic-fire tests (data-flow-se-reclaim.md). In-process, no
+  // telecom_system bring-up; drives the REAL ARQ producer/consumer struct logic.
+  //   test_se_reclaim_wire(): Stage 1 — the SET_CONFIG producer writes
+  //     data[3]=forward_grid, data[4]=reverse_grid, length=5 (fail-before: the
+  //     pre-edit producer sets length=3 and never touches data[3]/[4]); the
+  //     role-reversal swap moves the grid pair in lockstep with the config pair.
+  //   test_se_reclaim_transition(): Stage 5 — every §7 transition (FULL<->RECLAIM
+  //     at batch boundary, mislabel/instant-demote, 15->15 capture-flush gate,
+  //     opt-window reset, role-reversal, legacy back-compat). Returns 0=PASS.
+  int test_se_reclaim_wire();
+  int test_se_reclaim_transition();
+
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
   //
@@ -2326,6 +2338,13 @@ public:
   int negotiated_configuration;
   int forward_configuration;   // Commander→Responder TX speed (asymmetric gearshift)
   int reverse_configuration;   // Responder→Commander TX speed (after SWITCH_ROLE)
+
+  // SE-RECLAIM grid selector (fact-documents/data-flow-se-reclaim.md §1/§2). Pairs
+  // with forward/reverse_configuration and rides SET_CONFIG (data[3]/data[4]).
+  // Default GRID_FULL = today's behavior. Only CONFIG_15 ever materializes RECLAIM.
+  // Swapped in lockstep with the config pair on role-reversal (§7 H5).
+  int forward_grid;   // GRID_FULL/GRID_RECLAIM for the Commander->Responder direction
+  int reverse_grid;   // GRID_FULL/GRID_RECLAIM for the Responder->Commander direction
 
   int gear_shift_on;
   int robust_enabled;

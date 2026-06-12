@@ -37,6 +37,7 @@
 #include <complex>
 #include "physical_layer/telecom_system.h"
 #include "physical_layer/mfsk_ctrl_codec_tests.h"
+#include "physical_layer/test_se_reclaim.h"
 #include "common/sim_clock_tests.h"
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
@@ -379,6 +380,13 @@ int main(int argc, char *argv[])
             int failed = run_preamble_sched_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-se-reclaim : SE-reclaim grid-selector wire + materializer suite
+        // (data-flow-se-reclaim.md Stages 1-2). Fast + deterministic; drives the
+        // real CRC16+LDPC OFDM wire + load_configuration grid materializer.
+        if (strcmp(argv[i], "--test-se-reclaim") == 0) {
+            int failed = run_se_reclaim_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;
@@ -462,6 +470,8 @@ int main(int argc, char *argv[])
                                         // 'ofdm' should PASS on HEAD (regression guard for the existing OFDM SACK_RSP path).
                                         // One-shot at startup, then exit. See fact-documents/sack_partial_bsi_advance.md §5.
     bool test_bigblock_arq_unit_cli = false; // --test-bigblock-arq-unit: P2 big-block ARQ-granularization regression.
+    bool test_se_reclaim_wire_cli = false; // --test-se-reclaim-wire: SE-reclaim grid producer/role-reversal (data-flow-se-reclaim.md §2/§7).
+    bool test_se_reclaim_transition_cli = false; // --test-se-reclaim-transition: SE-reclaim full transition regression (§7).
                                         // 3 cases (clean K=8 / one-bad-cw / lost-EOB). MUST FAIL before P2 wiring (the
                                         // bigblock_block_to_arq stub returns BIGBLOCK_ARQ_NOT_WIRED), PASS after.
                                         // One-shot at startup, then exit rc. See fact-documents/data-flow-bigblock-arq-unit.md §6.
@@ -986,6 +996,23 @@ int main(int argc, char *argv[])
             // fact-documents/data-flow-bigblock-arq-unit.md §6. FAILS before P2
             // wiring (the bigblock_block_to_arq stub), PASSES after.
             test_bigblock_arq_unit_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-se-reclaim-wire") == 0)
+        {
+            // SE-reclaim Stage-1 grid-selector producer + role-reversal regression
+            // (data-flow-se-reclaim.md §2/§7). FAILS before the producer writes
+            // data[3]/data[4]+length=5, PASSES after. One-shot, then exit rc.
+            test_se_reclaim_wire_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-se-reclaim-transition") == 0)
+        {
+            // SE-reclaim Stage-5 transition regression (the fact-doc-paired mandatory
+            // test, data-flow-se-reclaim.md §7). One-shot, then exit rc.
+            test_se_reclaim_transition_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2214,6 +2241,24 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_bigblock_arq_unit();
             printf("[FLAG] Bigblock-arq-unit test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_se_reclaim_wire_cli) {
+            printf("[FLAG] --test-se-reclaim-wire: invoking SE-reclaim grid "
+                   "producer/role-reversal regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_se_reclaim_wire();
+            printf("[FLAG] SE-reclaim wire test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_se_reclaim_transition_cli) {
+            printf("[FLAG] --test-se-reclaim-transition: invoking SE-reclaim "
+                   "transition regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_se_reclaim_transition();
+            printf("[FLAG] SE-reclaim transition test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

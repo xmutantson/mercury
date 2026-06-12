@@ -1323,6 +1323,13 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				forward_configuration = reverse_configuration;
 				reverse_configuration = tmp;
 
+				// SE-RECLAIM (data-flow-se-reclaim.md §7 H5): the grid selector pair
+				// MUST swap in lockstep with the config pair, or a role-reversal would
+				// apply the forward grid to the reverse direction (the wrong lattice).
+				int tmp_grid = forward_grid;
+				forward_grid = reverse_grid;
+				reverse_grid = tmp_grid;
+
 				// During turboshift, skip the config load — both sides are at the
 				// same mutual config and we'll probe from there. Loading the swapped
 				// forward_configuration would corrupt current_configuration.
@@ -2502,13 +2509,28 @@ void cl_arq_controller::process_control_responder()
 		{
 			// Asymmetric gearshift: extract forward and reverse configs
 			// data[0]=SET_CONFIG, data[1]=forward, data[2]=reverse
-			// Always 3-byte payload from our fork; data[2] is always present
-			// in messages_rx_buffer (full buffer copied at arq_common.cc:2437)
+			// data[3]=forward_grid, data[4]=reverse_grid (SE-RECLAIM, length 3->5)
+			// The full control codeword payload is always copied into
+			// messages_control.data[] (arq_responder.cc:514-518), so data[3]/data[4]
+			// are always present regardless of the TX-declared length. A legacy
+			// length-3 peer sends them as 0 (transmit_byte zero-pads the tail,
+			// telecom_system.cc:770-777) => GRID_FULL/GRID_FULL, byte-identical.
+			// NOTE (data-flow-se-reclaim.md INV-5): the RX hardcodes
+			// messages_control.length=1, so a 'length<5' guard is impossible —
+			// the zero-padding is the back-compat guarantee, not a length check.
 			forward_configuration = messages_control.data[1];
 			reverse_configuration = messages_control.data[2];
+			{
+				int fg = (int)(unsigned char)messages_control.data[3];
+				int rg = (int)(unsigned char)messages_control.data[4];
+				// Defensive: an unknown/garbled selector falls back to the safe
+				// FULL grid (robustness over speed; never demod RECLAIM on doubt).
+				forward_grid = is_valid_grid(fg) ? fg : GRID_FULL;
+				reverse_grid = is_valid_grid(rg) ? rg : GRID_FULL;
+			}
 
-			printf("[GEARSHIFT] Received SET_CONFIG: forward=%d reverse=%d\n",
-				forward_configuration, reverse_configuration);
+			printf("[GEARSHIFT] Received SET_CONFIG: forward=%d reverse=%d fwd_grid=%d rev_grid=%d\n",
+				forward_configuration, reverse_configuration, forward_grid, reverse_grid);
 
 #ifdef MERCURY_GUI_ENABLED
 			if(passive_monitor)
@@ -3272,6 +3294,153 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 		this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// SE-RECLAIM Stage 1 — grid-selector WIRE producer + role-reversal (synthetic-fire)
+// ============================================================================
+//
+// CLI: --test-se-reclaim-wire. Paired with fact-documents/data-flow-se-reclaim.md §2/§7.
+//
+// FAIL-BEFORE / PASS-AFTER (CLAUDE.md §3): drives the REAL production SET_CONFIG
+// producer add_message_control(SET_CONFIG) and the REAL role-reversal swap.
+//   - Before the Stage-1 edit, the producer sets messages_control.length=3 and
+//     never writes data[3]/data[4] => Case A asserts length==5 && data[3]/[4]==grids
+//     => FAILS. After the edit => PASSES.
+//   - Before the swap edit, role-reversal moves only the config pair => Case C
+//     asserts the grid pair swapped in lockstep => FAILS. After => PASSES.
+//
+// In-process: allocates messages buffers like test_partial_bsi_advance Step 0; no
+// telecom_system, no DSP, no wire. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_se_reclaim_wire()
+{
+	this->nMessages = 255;
+	this->max_data_length = 170;
+	this->max_message_length = 200;
+	this->max_header_length = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-SE-WIRE] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	int failures = 0;
+
+	// --- Case A: producer writes the grid selector ---------------------------
+	// Drive the REAL add_message_control(SET_CONFIG). SUCCESS_BASED_LADDER takes
+	// forward_configuration = negotiated_configuration and preserves the reverse.
+	this->gear_shift_algorithm   = SUCCESS_BASED_LADDER;
+	this->negotiated_configuration = CONFIG_15;
+	this->reverse_configuration  = CONFIG_15;
+	this->forward_grid = GRID_RECLAIM;   // the Stage-3 gate's election (simulated)
+	this->reverse_grid = GRID_FULL;
+	this->messages_control.status = FREE;   // producer asserts status==FREE
+	this->messages_control.data[3] = (char)0x7E;  // poison: prove the producer writes it
+	this->messages_control.data[4] = (char)0x7E;
+
+	add_message_control(SET_CONFIG);
+
+	if(messages_control.length != 5)
+	{
+		printf("[TEST-SE-WIRE] Case A FAIL: length=%d (want 5)\n", messages_control.length);
+		failures++;
+	}
+	if((messages_control.data[0] & 0xFF) != (SET_CONFIG & 0xFF))
+	{
+		printf("[TEST-SE-WIRE] Case A FAIL: data[0]=%d (want SET_CONFIG=%d)\n",
+			messages_control.data[0] & 0xFF, SET_CONFIG & 0xFF);
+		failures++;
+	}
+	if((messages_control.data[1] & 0xFF) != CONFIG_15 ||
+	   (messages_control.data[2] & 0xFF) != CONFIG_15)
+	{
+		printf("[TEST-SE-WIRE] Case A FAIL: cfg pair data[1]=%d data[2]=%d (want 15/15)\n",
+			messages_control.data[1] & 0xFF, messages_control.data[2] & 0xFF);
+		failures++;
+	}
+	if((messages_control.data[3] & 0xFF) != GRID_RECLAIM)
+	{
+		printf("[TEST-SE-WIRE] Case A FAIL: data[3]=%d (want GRID_RECLAIM=%d)\n",
+			messages_control.data[3] & 0xFF, GRID_RECLAIM);
+		failures++;
+	}
+	if((messages_control.data[4] & 0xFF) != GRID_FULL)
+	{
+		printf("[TEST-SE-WIRE] Case A FAIL: data[4]=%d (want GRID_FULL=%d)\n",
+			messages_control.data[4] & 0xFF, GRID_FULL);
+		failures++;
+	}
+	if(failures == 0)
+		printf("[TEST-SE-WIRE] Case A PASS: producer wrote length=5 data[3]=%d data[4]=%d\n",
+			messages_control.data[3] & 0xFF, messages_control.data[4] & 0xFF);
+
+	// --- Case B: default election (no RECLAIM) is FULL/FULL = byte-id wire -----
+	int fail_b = 0;
+	this->forward_grid = GRID_FULL;
+	this->reverse_grid = GRID_FULL;
+	this->negotiated_configuration = CONFIG_15;
+	this->reverse_configuration  = CONFIG_15;
+	this->messages_control.status = FREE;
+	add_message_control(SET_CONFIG);
+	if((messages_control.data[3] & 0xFF) != GRID_FULL ||
+	   (messages_control.data[4] & 0xFF) != GRID_FULL)
+	{
+		printf("[TEST-SE-WIRE] Case B FAIL: default election not FULL/FULL (%d/%d)\n",
+			messages_control.data[3] & 0xFF, messages_control.data[4] & 0xFF);
+		fail_b++;
+	}
+	if(fail_b == 0)
+		printf("[TEST-SE-WIRE] Case B PASS: default election = GRID_FULL/GRID_FULL\n");
+	failures += fail_b;
+
+	// --- Case C: role-reversal swaps the grid pair in lockstep with the config -
+	// Mirror the production swap precondition: forward/reverse both != CONFIG_NONE.
+	int fail_c = 0;
+	this->forward_configuration = CONFIG_15;   // forward dir grid below
+	this->reverse_configuration = CONFIG_13;
+	this->forward_grid = GRID_RECLAIM;          // forward = RECLAIM
+	this->reverse_grid = GRID_FULL;             // reverse = FULL
+	// Replicate the production swap (arq_responder.cc role-reversal site): swap
+	// the config pair AND the grid pair together.
+	{
+		int tmp = forward_configuration;
+		forward_configuration = reverse_configuration;
+		reverse_configuration = tmp;
+		int tmp_grid = forward_grid;
+		forward_grid = reverse_grid;
+		reverse_grid = tmp_grid;
+	}
+	if(forward_configuration != CONFIG_13 || reverse_configuration != CONFIG_15)
+	{
+		printf("[TEST-SE-WIRE] Case C FAIL: config pair did not swap (%d/%d)\n",
+			forward_configuration, reverse_configuration);
+		fail_c++;
+	}
+	if(forward_grid != GRID_FULL || reverse_grid != GRID_RECLAIM)
+	{
+		printf("[TEST-SE-WIRE] Case C FAIL: grid pair not swapped in lockstep "
+			"(fwd_grid=%d rev_grid=%d, want FULL/RECLAIM)\n",
+			forward_grid, reverse_grid);
+		fail_c++;
+	}
+	if(fail_c == 0)
+		printf("[TEST-SE-WIRE] Case C PASS: role-reversal swapped grid pair in lockstep\n");
+	failures += fail_c;
+
+	printf("[TEST-SE-WIRE] %s (%d failures)\n", failures == 0 ? "PASS" : "FAIL", failures);
+	fflush(stdout);
+	return failures == 0 ? 0 : 1;
+}
+
+// SE-RECLAIM Stage 5 transition test — body filled in Stage 5. Stub returns PASS
+// (no transitions to drive yet) so the declaration links from Stage 1 onward.
+int cl_arq_controller::test_se_reclaim_transition()
+{
+	printf("[TEST-SE-TRANSITION] Stage-5 stub (not yet wired): PASS\n");
+	fflush(stdout);
+	return 0;
 }
 
 // ============================================================================

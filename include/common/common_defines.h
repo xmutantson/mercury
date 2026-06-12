@@ -97,6 +97,20 @@ extern int g_verbose;
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
 inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 
+// SE-RECLAIM grid selector (fact-documents/data-flow-se-reclaim.md §1). A
+// per-direction enum that pairs with (forward_configuration, reverse_configuration)
+// and rides the SET_CONFIG handshake (data[3]=forward_grid, data[4]=reverse_grid,
+// length 3->5). Today the OFDM grid (Ngi/Dy/Nsymb/nData) is derived 100% from the
+// config index; the selector lets CONFIG_15 map to TWO grids (FULL vs RECLAIM) so
+// the sim-proven clean-front CP/pilot reclaim can ship without a new CONFIG_17 rung.
+//
+// DEFAULT-SAFE: GRID_FULL=0. A legacy peer that sends a 3-byte SET_CONFIG transmits
+// data[3]=data[4]=0 (transmit_byte zero-pads the codeword tail,
+// telecom_system.cc:770-777) => parsed as GRID_FULL/GRID_FULL, byte-identical.
+// Only CONFIG_15 ever materializes the RECLAIM grid (§2); every other rung ignores it.
+enum se_grid_t { GRID_FULL = 0, GRID_RECLAIM = 1 };
+inline bool is_valid_grid(int g) { return g == GRID_FULL || g == GRID_RECLAIM; }
+
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor
 // for the PRODUCTION enhanced CONNECT suffix at the robust tier. R=4 is the §20
 // sim/HW-validated operating point (= cl_mfsk::MAX_CONNECT_PREAMBLE_REPS); R=1

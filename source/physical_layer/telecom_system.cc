@@ -149,6 +149,7 @@ cl_telecom_system::cl_telecom_system()
 	carrier_frequency=0;
 	current_configuration=CONFIG_NONE;
 	last_configuration=CONFIG_NONE;
+	pending_grid=GRID_FULL;   // SE-RECLAIM: default-safe FULL grid (data-flow-se-reclaim.md §4)
 	outer_code=NO_OUTER_CODE;
 	outer_code_reserved_bits=0;
 	bit_energy_dispersal_seed=0;
@@ -9047,24 +9048,57 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.pilot_configurator.seed=default_configurations_telecom_system.ofdm_pilot_configurator_seed;
 	ofdm.pilot_configurator.pilot_density=default_configurations_telecom_system.ofdm_pilot_density;
 
-	// ===== SE-RECLAIM ARM-A (SIM FEASIBILITY, default-OFF = byte-identical) =====
+	// ===== SE-RECLAIM grid materializer (data-flow-se-reclaim.md §2) =====
 	// Cancellation-free spectral-efficiency reclaim on the reliable CFG15 rung
-	// (16-QAM r0.875), per _research/SE_RECLAIM_ARMA_VERDICT dive:
-	//   (1) REDUCED / channel-matched CP: MERCURY_SE_NGI overrides ofdm.gi for the
-	//       clean/good front (clean-front delay spread ~0.3-0.5 ms << the stock
-	//       Ngi=54 -> 4.5 ms GI). gi = Ngi/Nfft. Prior art: Qualcomm US9485678B2
-	//       "Effective utilization of cyclic prefix ... under benign channel
-	//       conditions"; IEEE doc 8301857 (variable-CP coded OFDM throughput).
-	//   (2) SPARSER TIME-PILOTS: MERCURY_SE_DY overrides the pilot time-axis spacing
-	//       Dy (stock 3). The clean front's long coherence time over-samples Dy=3;
-	//       relaxing it reclaims pilot REs. Setting an EXPLICIT Dy here also skips the
-	//       AUTO_SELLECT resolution in init() (Dy is only auto-set when == AUTO_SELLECT).
-	// Both are PER-RE-POWER-PRESERVING (no data-power steal -> no LDPC-threshold risk),
-	// unlike superimposed pilots (refuted ARM-B). GATED to CONFIG_15 ONLY so every other
-	// rung is untouched. When neither env is set, the block is a no-op and the render is
-	// byte-identical to HEAD (proven by the default-off cmp). This is a SIM measurement
-	// vehicle: it does NOT carry the geometry on the wire / handshake the optimizer
-	// (that is the production scope IF this passes).
+	// (16-QAM r0.875), per _research/SE_RECLAIM_ARMA_VERDICT:
+	//   (1) REDUCED / channel-matched CP: a smaller Ngi for the clean/good front
+	//       (clean-front delay spread ~0.3-0.5 ms << the stock Ngi=54 -> 4.5 ms GI).
+	//       gi = Ngi/Nfft. Prior art: Qualcomm US9485678B2 (CP utilization under
+	//       benign channels); IEEE doc 8301857 (variable-CP coded OFDM throughput).
+	//   (2) SPARSER TIME-PILOTS: a larger Dy (stock 3). The clean front's long
+	//       coherence time over-samples Dy=3; relaxing it reclaims pilot REs. An
+	//       EXPLICIT Dy here skips the AUTO_SELLECT resolution in init().
+	// Both are PER-RE-POWER-PRESERVING (no data-power steal -> no LDPC-threshold
+	// risk), unlike superimposed pilots (refuted ARM-B). GATED to CONFIG_15 ONLY.
+	//
+	// PRODUCTION PATH: the grid is materialized DETERMINISTICALLY from the
+	// negotiated selector pending_grid (set by the ARQ layer from the SET_CONFIG
+	// wire, INV-2). RX and TX derive IDENTICAL geometry because both set the same
+	// pending_grid. pending_grid==GRID_FULL (the default) leaves the stock grid =>
+	// byte-identical to HEAD. pending_grid==GRID_RECLAIM applies RECLAIM-PILOTS
+	// (Ngi=54, Dy=5, Nsymb=10 => nData=400, rbc~3826.7, verdict 1.082x) — the
+	// LOWEST-RISK target (full CP, full preamble => ZERO sync risk, INV-9). The
+	// reduced-CP RECLAIM-FULL (Ngi=18, rbc~4329.5, 1.224x) is GATED OFF pending
+	// the Stage-4 loopback sync-margin check (INV-9: TX FIR 97 > Ngi*interp 72);
+	// MERCURY_SE_RECLAIM_FULL=1 opts into it for that A/B only.
+	//
+	// nData stays 400 by SHRINKING Nsymb (12->10), never growing it: the LDPC
+	// codeword is fixed (N=1600 -> 400 16-QAM REs); the framer maps EXACTLY
+	// nData=N/log2M REs; nData>400 overruns (telecom_system.cc:275, INV-1). Dy is
+	// clamped <=5 (Dy>=6 FLOORS the LS estimator, INV-6).
+	if(configuration == CONFIG_15 && pending_grid == GRID_RECLAIM)
+	{
+		// RECLAIM-PILOTS (shippable, full CP): Ngi=54, Dy=5, Nsymb=10.
+		int reclaim_ngi   = 54;
+		int reclaim_dy    = 5;
+		int reclaim_nsymb = 10;
+		// RECLAIM-FULL (reduced CP, 1.224x) only behind the Stage-4 A/B flag.
+		{
+			const char* rf = std::getenv("MERCURY_SE_RECLAIM_FULL");
+			if(rf && *rf && atoi(rf) != 0)
+				reclaim_ngi = 18;
+		}
+		if(reclaim_dy > 5) reclaim_dy = 5;   // INV-6 hard clamp
+		ofdm.gi = (double)reclaim_ngi / (double)default_configurations_telecom_system.ofdm_Nfft;
+		ofdm.pilot_configurator.Dy = reclaim_dy;   // explicit -> init() leaves it as-is
+		ofdm.Nsymb = reclaim_nsymb;                // explicit -> init() leaves it as-is
+	}
+
+	// SIM A/B ESCAPE HATCH (measurement-only, NOT a production path): the
+	// MERCURY_SE_* envs override the grid directly so the verdict sweep / e2e A/B
+	// can drive arbitrary (Ngi,Dy,Nsymb) cells from BOTH ends without a negotiated
+	// selector. Applied AFTER the materializer so an explicit env wins; with no env
+	// set this block is a no-op (default-off byte-identical). GATED to CONFIG_15.
 	if(configuration == CONFIG_15)
 	{
 		const char* se_ngi = std::getenv("MERCURY_SE_NGI");
@@ -9079,23 +9113,14 @@ void cl_telecom_system::load_configuration(int configuration)
 		{
 			int dy = atoi(se_dy);
 			if(dy >= 1 && dy <= 64)
-				ofdm.pilot_configurator.Dy = dy;   // explicit -> init() leaves it as-is
+				ofdm.pilot_configurator.Dy = dy;
 		}
-		// SPARSER PILOTS RECLAIM = FEWER SYMBOLS, NOT MORE DATA REs. The LDPC codeword
-		// is fixed (N=1600 bits -> 400 16-QAM data symbols for CFG15), and the framer
-		// maps EXACTLY nData = N/log2M data REs (ofdm.cc:982 framer reads in[0..nData)).
-		// Freeing pilot REs by raising Dy must therefore be cashed in by SHRINKING Nsymb
-		// so the grid still has ~400 data REs (the codeword still fits) and the frame is
-		// SHORTER in time (Tf drops -> wire rises). MERCURY_SE_NSYMB sets the symbol count
-		// explicitly (init() leaves it since it's != AUTO_SELLECT). The sweep picks the
-		// Nsymb that yields nData==400 for each Dy. Growing nData past 400 (Nsymb too big
-		// for the Dy) overruns the codeword buffer; the sweep clamps Nsymb to keep nData>=400.
 		const char* se_nsymb = std::getenv("MERCURY_SE_NSYMB");
 		if(se_nsymb && *se_nsymb)
 		{
 			int ns = atoi(se_nsymb);
 			if(ns >= 1 && ns <= 256)
-				ofdm.Nsymb = ns;   // explicit -> init() leaves it as-is
+				ofdm.Nsymb = ns;
 		}
 	}
 

@@ -728,6 +728,15 @@ public:
 	void load_configuration(int configuration);
 	int last_configuration;
 	int current_configuration;
+
+	// SE-RECLAIM grid materializer input (data-flow-se-reclaim.md §2). The ARQ
+	// layer sets pending_grid (GRID_FULL/GRID_RECLAIM) from the negotiated
+	// SET_CONFIG selector BEFORE calling load_configuration; the materializer
+	// reads it to pick the (config,grid)->{Ngi,Dy,Nsymb} grid for CONFIG_15.
+	// Default GRID_FULL => today's geometry, byte-identical. Only CONFIG_15
+	// honors RECLAIM; every other config ignores it. RX and TX derive IDENTICAL
+	// geometry because both set the SAME pending_grid from the wire selector.
+	int pending_grid;
 	void return_to_last_configuration();
 	int get_configuration(double SNR);  // returns CONFIG_0..16 (never CONFIG_NONE)
 
