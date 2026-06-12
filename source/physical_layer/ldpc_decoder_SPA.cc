@@ -21,6 +21,23 @@
  */
 
 #include "physical_layer/ldpc_decoder_SPA.h"
+#include <cstdlib>   // getenv (DX-1 env-gated diagnostic; default-off, byte-identical when off)
+#include <cstdio>    // fprintf for the trajectory dump
+
+// DX-1 diagnostic (default OFF, byte-identical when off): when MERCURY_LDPC_DX is set
+// in the environment, decode_SPA emits, for each decoded codeword, the per-iteration
+// unsatisfied-parity-check count trajectory nOnes[1..iter] to stderr. This is the
+// oscillation / trapping-set classifier from the LDPC-decoder DX investigation
+// (_research/LDPC_DECODER_DX_VERDICT.json). It reads ONLY the nOnes value the decoder
+// already computes (this file, ~line 189) and writes ONLY when the env var is present;
+// it never alters R/Q/LLR state or the return value, so the decode is bit-for-bit
+// unchanged when the flag is unset. One static read of the env on first call.
+static int dx_ldpc_log_enabled()
+{
+	static int s = -1;
+	if (s == -1) { const char* e = std::getenv("MERCURY_LDPC_DX"); s = (e && *e && atoi(e) != 0) ? 1 : 0; }
+	return s;
+}
 
 int decode_SPA(
 		const float LLRi[],
@@ -48,6 +65,12 @@ int decode_SPA(
 	int iteration=0;
 	int i,j,nOnes;
 	double LLRtmp[N_MAX];
+
+	// DX-1 (default-off): per-iteration unsatisfied-check trajectory buffer. Only touched
+	// when the env flag is set; otherwise this is a single cheap branch that records nothing.
+	const int dx_log = dx_ldpc_log_enabled();
+	int dx_traj[256];
+	int dx_traj_len = 0;
 
 	for( i=0;i<N;i++)
 	{
@@ -189,6 +212,12 @@ int decode_SPA(
 				nOnes+=Cout[i];
 			}
 
+			// DX-1 (default-off): record this iteration's unsatisfied-check count.
+			if(dx_log && dx_traj_len < 256)
+			{
+				dx_traj[dx_traj_len++] = nOnes;
+			}
+
 			if(nOnes==0)
 			{
 				break;
@@ -218,6 +247,21 @@ int decode_SPA(
 	{
 		LLRo[i]=(LLRtmp[i]<0);
 	}
+
+	// DX-1 (default-off): emit the per-iteration nOnes trajectory for this codeword.
+	// Format: "[LDPC-DX] iters=<I> final_nOnes=<W> conv=<0|1> traj=w1|w2|...". A converged
+	// frame ends with final_nOnes 0; a non-converging (iter=max) frame shows the limit-cycle
+	// or high-plateau the DX investigation classifies. Writing only — decode state untouched.
+	if(dx_log && dx_traj_len>0)
+	{
+		int final_w = dx_traj[dx_traj_len-1];
+		fprintf(stderr,"[LDPC-DX] N=%d K=%d iters=%d final_nOnes=%d conv=%d traj=",
+				N,K,iteration,final_w,(final_w==0)?1:0);
+		for(int t=0;t<dx_traj_len;t++)
+			fprintf(stderr,"%d%s",dx_traj[t],(t+1<dx_traj_len)?"|":"");
+		fprintf(stderr,"\n");
+	}
+
 	return iteration;
 
 }
