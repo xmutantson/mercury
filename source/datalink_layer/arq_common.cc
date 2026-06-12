@@ -1271,7 +1271,18 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// separate pattern_time inflation is needed for v2 SACK.
 			int pattern_time = ack_pattern_time_ms;
 			int frame_drain  = 2 * message_transmission_time_ms;
-			int sack_arrival = ptt_off_delay_ms + RSP_DECODE_MARGIN_MS
+			// TURNAROUND-LATENCY LEVER #2: config-keyed RSP-decode→key-up budget.
+			// DEFAULT (env gate off) this returns RSP_DECODE_MARGIN_MS (300) for
+			// every config -> sack_arrival / timeout BYTE-IDENTICAL to pre-lever.
+			// With MERCURY_TURNAROUND_RSP_MARGIN set it tightens to
+			// RSP_DECODE_MARGIN_OFDM_MS (150) at the OFDM tier (the big-block
+			// one-acquisition decode whose real turn is ~120-150 ms) while KEEPING
+			// 300 at the robust/MFSK tier. Keyed on current_configuration — the
+			// SAME live-PHY config the D2 widen gate below reads (line 1299), so
+			// the two window terms stay consistent. See rsp_decode_margin_ms() /
+			// TURNAROUND_LATENCY_AUDIT.md §2.
+			int rsp_decode_budget = rsp_decode_margin_ms(current_configuration);
+			int sack_arrival = ptt_off_delay_ms + rsp_decode_budget
 			                 + pattern_time + ptt_on_delay_ms;
 			int margin       = SACK_ARRIVAL_MARGIN_MS;
 			int timeout = frame_drain + sack_arrival + margin;
@@ -1314,7 +1325,7 @@ void cl_arq_controller::calculate_receiving_timeout()
 				timeout += sack_timeout_extra_ms;
 			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) batch=%d sack=%d\n",
 				timeout, frame_drain, sack_arrival,
-				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
+				ptt_off_delay_ms, rsp_decode_budget, pattern_time, ptt_on_delay_ms,
 				margin, sack_enabled ? sack_timeout_extra_ms : 0,
 				d2_geometry_fires
 					? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0,

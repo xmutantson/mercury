@@ -11442,7 +11442,90 @@ int cl_arq_controller::test_climb_engine()
 		supershift_proven_ceiling = saved_ceil;
 	}
 
-printf("[TEST-CLIMB] %s (%d failure%s)\n",
+// ================================================================
+	// Part X — TURNAROUND-LATENCY LEVER #2: config-keyed RSP_DECODE_MARGIN.
+	// (TURNAROUND_LATENCY_AUDIT.md §2 / §9 #1; author xmutantson.) The CMD's
+	// post-TX listen window budgets the RSP turn as RSP_DECODE_MARGIN_MS=300, an
+	// over-budget at the OFDM tier where the real event-driven turn (ring-flush +
+	// key-up) is ~120-150 ms. The lever keys the margin: OFDM tier → 150, robust/
+	// MFSK tier → 300. This drives the REAL pure policy rsp_decode_margin_for()
+	// AND the REAL window arithmetic from calculate_receiving_timeout()
+	// (arq_common.cc:1274) with primed members, asserting the OFDM window shrinks
+	// by EXACTLY the margin delta and STILL brackets the worst measured ACK edge
+	// (the in-tree SACK calib anchor — geometric arrival ~1768 ms; arq.h:319).
+	// FAIL-BEFORE (-DTURNAROUND_RSP_MARGIN_FAILBEFORE): rsp_decode_margin_for()
+	// drops the OFDM reduction (returns 300 even lever-on) → X1/X2 FAIL. X3
+	// (robust purity) + X4 (default-off byte-identity) PASS in BOTH builds.
+	// ================================================================
+	{
+		// X1 — the PURE policy: lever-ON at the OFDM tier returns the tightened
+		// margin; the delta off the 300 default is EXACTLY (300-150). FAIL-BEFORE
+		// returns 300 (no reduction) → delta 0 → FAIL.
+		int ofdm_on = rsp_decode_margin_for(CONFIG_16, /*lever_on=*/true);
+		check(ofdm_on == RSP_DECODE_MARGIN_OFDM_MS,
+			"X1 lever-ON OFDM (CFG16) RSP-decode budget tightened to RSP_DECODE_MARGIN_OFDM_MS (150)",
+			ofdm_on, RSP_DECODE_MARGIN_OFDM_MS);
+		check((RSP_DECODE_MARGIN_MS - ofdm_on) == (RSP_DECODE_MARGIN_MS - RSP_DECODE_MARGIN_OFDM_MS),
+			"X1b OFDM margin delta off the 300 default == (300-150) = the reclaimed window",
+			RSP_DECODE_MARGIN_MS - ofdm_on, RSP_DECODE_MARGIN_MS - RSP_DECODE_MARGIN_OFDM_MS);
+
+		// X2 — the WINDOW still BRACKETS the ACK edge (no new miss). Replay the
+		// production calculate_receiving_timeout() arithmetic (arq_common.cc:1272-
+		// 1277) with the tightened budget and assert the OFDM listen window still
+		// exceeds the worst measured ACK arrival. The SACK calib (arq.h:317-320)
+		// recorded worst arrival 2102 ms; the geometric estimate is 1768 ms. The
+		// tightened window = frame_drain + (ptt_off + 150 + pattern + ptt_on) +
+		// SACK_ARRIVAL_MARGIN_MS must still cover 2102 ms with margin to spare.
+		{
+			int saved_ptt_on = ptt_on_delay_ms, saved_ptt_off = ptt_off_delay_ms;
+			ptt_on_delay_ms = 100; ptt_off_delay_ms = 200;       // stock delays
+			int pattern_time = 389;                               // M=16 WB ACK pattern ms
+			int frame_drain  = 2 * 320;                           // representative CFG16 per-frame ms
+			const int WORST_ACK_ARRIVAL_MS = 2102;                // SACK calib observed worst (arq.h:319)
+
+			int budget_on  = rsp_decode_margin_for(CONFIG_16, /*lever_on=*/true);
+			int budget_off = rsp_decode_margin_for(CONFIG_16, /*lever_on=*/false);
+			int win_on  = frame_drain
+			            + (ptt_off_delay_ms + budget_on  + pattern_time + ptt_on_delay_ms)
+			            + SACK_ARRIVAL_MARGIN_MS;
+			int win_off = frame_drain
+			            + (ptt_off_delay_ms + budget_off + pattern_time + ptt_on_delay_ms)
+			            + SACK_ARRIVAL_MARGIN_MS;
+
+			check(win_on > WORST_ACK_ARRIVAL_MS,
+				"X2 tightened OFDM listen window STILL brackets the worst measured ACK arrival (no new window-miss)",
+				win_on, WORST_ACK_ARRIVAL_MS);
+			check((win_off - win_on) == (RSP_DECODE_MARGIN_MS - RSP_DECODE_MARGIN_OFDM_MS),
+				"X2b the OFDM window is tighter than the 300-default by EXACTLY the margin delta (~150 ms reclaimed)",
+				win_off - win_on, RSP_DECODE_MARGIN_MS - RSP_DECODE_MARGIN_OFDM_MS);
+
+			ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
+		}
+
+		// X3 — ROBUST-TIER PURITY: even with the lever ON, the robust/MFSK tier
+		// KEEPS the full RSP_DECODE_MARGIN_MS (300) — a robust frame-time decode
+		// genuinely takes longer, so its budget is NOT cut. PASSES in the
+		// FAIL-BEFORE stub too (the stub returns 300 everywhere).
+		check(rsp_decode_margin_for(ROBUST_0, /*lever_on=*/true) == RSP_DECODE_MARGIN_MS,
+			"X3 lever-ON ROBUST_0 keeps the full 300 ms budget (robust decode genuinely slower; tier untouched)",
+			rsp_decode_margin_for(ROBUST_0, true), RSP_DECODE_MARGIN_MS);
+		check(rsp_decode_margin_for(ROBUST_1, /*lever_on=*/true) == RSP_DECODE_MARGIN_MS
+		   && rsp_decode_margin_for(ROBUST_2, /*lever_on=*/true) == RSP_DECODE_MARGIN_MS,
+			"X3b lever-ON ROBUST_1/2 also keep 300 (no OFDM-tier cut at the robust tier)",
+			(rsp_decode_margin_for(ROBUST_1, true) == RSP_DECODE_MARGIN_MS
+			 && rsp_decode_margin_for(ROBUST_2, true) == RSP_DECODE_MARGIN_MS) ? 1 : 0, 1);
+
+		// X4 — DEFAULT-OFF BYTE-IDENTITY: lever OFF returns 300 for EVERY config
+		// (OFDM and robust alike) — the production window with the gate unset is
+		// byte-identical to pre-lever. PASSES in BOTH builds (the safety floor).
+		check(rsp_decode_margin_for(CONFIG_16, /*lever_on=*/false) == RSP_DECODE_MARGIN_MS
+		   && rsp_decode_margin_for(ROBUST_0, /*lever_on=*/false) == RSP_DECODE_MARGIN_MS,
+			"X4 lever-OFF (default) returns 300 for OFDM AND robust -> CMD window byte-identical to pre-lever",
+			(rsp_decode_margin_for(CONFIG_16, false) == RSP_DECODE_MARGIN_MS
+			 && rsp_decode_margin_for(ROBUST_0, false) == RSP_DECODE_MARGIN_MS) ? 1 : 0, 1);
+	}
+
+	printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

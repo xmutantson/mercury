@@ -27,6 +27,7 @@
 #include "common/sim_clock.h"
 #include <unistd.h>
 #include <cstdint>
+#include <cstdlib>   // std::getenv / atoi (rsp_decode_margin_ms env gate, lever #2)
 #include <vector>
 #include "tcp_socket.h"
 #include "fifo_buffer.h"
@@ -322,6 +323,21 @@ static_assert(MAX_SACK_BATCH_SIZE <= 128,
 // margin (see SACK_FIX_PLAN.md §2.7 / §11.1).
 #define RSP_DECODE_MARGIN_MS   300  // one-frame RSP decode budget
 #define SACK_ARRIVAL_MARGIN_MS 1000 // jitter + LDPC decode tail safety
+
+// TURNAROUND-LATENCY LEVER #2 (TURNAROUND_LATENCY_AUDIT.md §2 / §9 #1):
+// config-keyed RSP-decode→key-up budget. RSP_DECODE_MARGIN_MS=300 is the CMD's
+// *budget estimate* of the RSP turn (NOT an RSP sleep — the RSP is event-driven:
+// it keys the moment decode completes, arq_responder.cc:1785/2067/2084). 300 ms
+// was sized as a worst single-frame decode (one CFG16 frame is 317 ms airtime;
+// §2.2). But the big-block OFDM batch decodes ALL K codewords from ONE
+// acquisition and the real OFDM-tier "finished-decode → key-up" gap is dominated
+// by ring-flush + key-up scheduling ≈ 120–150 ms, NOT a full frame-time of LDPC
+// (§2.3). RSP_DECODE_MARGIN_OFDM_MS keys the tighter OFDM-tier estimate; the
+// robust/MFSK tier KEEPS the full 300 (a robust frame is msg_time 1266 ms at
+// CONFIG_0 — decode genuinely takes longer there). LEVER IS DEFAULT-OFF (the
+// helper returns 300 for every config unless MERCURY_TURNAROUND_RSP_MARGIN is
+// set), so the un-gated build is byte-identical. See rsp_decode_margin_ms().
+#define RSP_DECODE_MARGIN_OFDM_MS 150 // tightened OFDM-tier RSP turn budget (lever #2)
 
 struct st_crypto_batch_buffer {
 	int batch_id;           // crypto batch counter mod 8, or -1 if empty
@@ -825,6 +841,59 @@ public:
   // predicate the consumers gate on and the unit test drives. See §9.
   bool promotion_allowed_on_batch(bool batch_fully_acked) const
   { return batch_fully_acked; }
+
+  // TURNAROUND-LATENCY LEVER #2 — config-keyed RSP-decode→key-up budget (the
+  // sack_arrival term of the CMD post-TX listen window, arq_common.cc:1274 and
+  // the test-harness replay arq_commander.cc:10907).
+  //
+  // RSP_DECODE_MARGIN_MS=300 is the CMD's *budget estimate* of the RSP turn — it
+  // is NOT an RSP sleep (the RSP is event-driven: it keys the moment decode
+  // completes, arq_responder.cc:1785/2067/2084). 300 was sized as a worst
+  // single-frame decode (one CFG16 frame is 317 ms airtime). But the big-block
+  // OFDM batch decodes ALL K codewords from ONE acquisition and the real
+  // OFDM-tier "finished-decode → key-up" gap is ring-flush + key-up scheduling ≈
+  // 120-150 ms, not a full frame-time of LDPC. So at the OFDM tier the 300 is an
+  // OVER-budget that the CMD listen window pays in full; tightening it to
+  // RSP_DECODE_MARGIN_OFDM_MS (150) reclaims ~150 ms of window AND aligns the
+  // budget with the real turn (it does NOT cut the actual ACK edge — the RSP
+  // already keys at decode-done; this only narrows the CMD's over-estimate).
+  // The robust/MFSK tier KEEPS the full 300 (a robust frame-time decode, e.g.
+  // msg_time 1266 ms at CONFIG_0, genuinely takes longer). See
+  // TURNAROUND_LATENCY_AUDIT.md §2 / §9 #1.
+  //
+  // rsp_decode_margin_for() is the PURE policy (no env, no member reads beyond
+  // forward_config + lever_on) so the unit test (Part X) drives it directly.
+  // FAIL-BEFORE (-DTURNAROUND_RSP_MARGIN_FAILBEFORE) compiles the OFDM-tier
+  // reduction OUT — the helper returns 300 for every config even with lever_on
+  // (== the pre-lever code), so Part X1/X2 FAIL on the un-fixed path and PASS
+  // after. Robust-tier purity (X3) and default-off byte-identity (X4) PASS in
+  // BOTH builds.
+  static int rsp_decode_margin_for(int forward_config, bool lever_on)
+  {
+#ifndef TURNAROUND_RSP_MARGIN_FAILBEFORE
+    // OFDM (non-robust) tier under the lever: the tightened event-driven turn.
+    if(lever_on
+       && is_ofdm_config(forward_config) && !is_robust_config(forward_config))
+      return RSP_DECODE_MARGIN_OFDM_MS;
+#else
+    (void)forward_config; (void)lever_on;   // FAIL-BEFORE: no tier reduction
+#endif
+    return RSP_DECODE_MARGIN_MS;            // robust/MFSK tier, or lever OFF
+  }
+
+  // Production wrapper: read the env gate ONCE (cached — no getenv() in the hot
+  // path) and key the margin. DEFAULT (gate unset/0) → lever_on=false → 300 for
+  // every config → the CMD window is BYTE-IDENTICAL to pre-lever.
+  int rsp_decode_margin_ms(int forward_config) const
+  {
+    static int cached = -1;   // -1 = unread, 0 = off, 1 = on
+    if(cached < 0)
+    {
+      const char* e = std::getenv("MERCURY_TURNAROUND_RSP_MARGIN");
+      cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+    }
+    return rsp_decode_margin_for(forward_config, /*lever_on=*/cached != 0);
+  }
 
   // SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11) — the number of
   // CONSECUTIVE clean batches a rung must deliver before it may RAISE the anchor.
