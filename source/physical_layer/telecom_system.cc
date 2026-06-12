@@ -492,6 +492,117 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			sigma_calibrated = true;
 		}
 
+		// ===== SE-RECLAIM mild-delay-spread channel (SIM FEASIBILITY, default-OFF) =====
+		// The whole ARM-A question is whether a SHORTENED CP still covers the clean-front
+		// delay spread and whether SPARSER pilots still track the mild frequency-selectivity.
+		// Flat AWGN would TRIVIALLY pass (no delay spread, flat channel) and FALSELY validate
+		// the reclaim. So when MERCURY_SE_CHAN != 0 we apply a faithful 2-path Watterson HF
+		// channel to the TX passband BEFORE AWGN (Watterson 1970 / CCIR-520; the standard HF
+		// model): path-0 = fixed LOS at delay 0, path-1 = a scatter ray at delay tau samples
+		// whose REAL gain a(t) is a slow Doppler-filtered process (AR(1) low-pass at fd Hz,
+		// one update per OFDM symbol), about a mean amplitude se_amp. A 2-tap real passband
+		// IR [1, a(t) at +tau] produces genuine frequency-selective fading across the 3 kHz
+		// band (notch depth ~ a, notch freq ~ 1/tau) plus the slow time-variation that
+		// stresses sparse time-pilots. tau is set from a physical delay spread in ms.
+		//   MERCURY_SE_CHAN: 0=flat AWGN floor (default), 1=CCIR-GOOD(~0.5ms,0.1Hz),
+		//                    2=NVIS(~0.3ms,0.2Hz). Override raw values with the knobs below.
+		//   MERCURY_SE_DSPREAD_MS, MERCURY_SE_FD_HZ, MERCURY_SE_AMP, MERCURY_SE_CHAN_SEED.
+		// Power-normalized so the per-sample signal power is preserved (so the EsN0 sigma
+		// calibration stays meaningful across channel arms). Default-off = production BER path.
+		int se_chan = 0;
+		{ const char* e = std::getenv("MERCURY_SE_CHAN"); if(e && *e) se_chan = atoi(e); }
+		if(se_chan != 0 && M != MOD_MFSK)
+		{
+			double dspread_ms = (se_chan == 2) ? 0.3 : 0.5;   // GOOD vs NVIS default
+			double fd_hz      = (se_chan == 2) ? 0.2 : 0.1;
+			double se_amp     = 0.32;   // scatter mean amplitude (~ -10 dB path, mild selective)
+			unsigned se_seed  = 6912;
+			{ const char* e=std::getenv("MERCURY_SE_DSPREAD_MS"); if(e&&*e) dspread_ms=atof(e); }
+			{ const char* e=std::getenv("MERCURY_SE_FD_HZ");      if(e&&*e) fd_hz=atof(e); }
+			{ const char* e=std::getenv("MERCURY_SE_AMP");        if(e&&*e) se_amp=atof(e); }
+			{ const char* e=std::getenv("MERCURY_SE_CHAN_SEED");  if(e&&*e) se_seed=(unsigned)atoi(e); }
+
+			int    interp = this->frequency_interpolation_rate;
+			int    nSamp  = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb)) * interp;
+			double fs     = this->sampling_frequency;            // passband sample rate
+			int    tau    = (int)llround(dspread_ms * 1e-3 * fs);// scatter delay in passband samples
+			if(tau < 1) tau = 1;
+			// per-OFDM-symbol Doppler update period (samples), AR(1) pole rho.
+			int    sym_samp = data_container.Nofdm * interp;
+			double f_sym    = fs / (double)sym_samp;             // OFDM-symbol rate (Hz)
+			double rho      = std::exp(-2.0 * M_PI * fd_hz / f_sym);
+			// AR(1) Rayleigh-magnitude-ish slow process; a static per-frame RNG keeps the
+			// fade phase-continuous ACROSS frames (a real HF channel does not reset per frame).
+			static unsigned se_rng_state = 0; static bool se_rng_init = false;
+			static double se_g = 0.0;
+			if(!se_rng_init || std::getenv("MERCURY_SE_CHAN_RESET")) { se_rng_state = se_seed; se_g = 0.0; se_rng_init = true; }
+			auto urand = [&]() -> double {                       // xorshift -> U(-1,1)
+				se_rng_state ^= se_rng_state << 13; se_rng_state ^= se_rng_state >> 17; se_rng_state ^= se_rng_state << 5;
+				return ((double)(se_rng_state & 0xFFFFFFu) / 16777215.0) * 2.0 - 1.0;
+			};
+			// Backward in-place 2-tap (reads only earlier, unmodified samples), with a(t)
+			// advanced once per OFDM symbol so the selectivity drifts at the Doppler rate.
+			for(int n = nSamp - 1; n >= 0; n--)
+			{
+				if((n % sym_samp) == sym_samp - 1)               // symbol boundary: advance fade
+					se_g = rho * se_g + std::sqrt(1.0 - rho * rho) * urand();
+				double a = se_amp * (1.0 + 0.5 * se_g);          // real scatter gain about se_amp
+				if(n >= tau)
+					data_container.passband_data[n] += a * data_container.passband_data[n - tau];
+			}
+			// renormalize to preserve average passband power (so EsN0 sigma stays calibrated)
+			double psum = 0.0;
+			for(int n = 0; n < nSamp; n++) psum += data_container.passband_data[n] * data_container.passband_data[n];
+			double prms = std::sqrt(psum / (double)nSamp);
+			if(prms > 1e-12)
+			{
+				// target rms = the pre-channel rms; recompute from the no-channel energy is
+				// unavailable here, so normalize the multi-path gain by sqrt(1+a^2) (mean tap
+				// energy) which restores unit-ish power for a 2-tap [1,a] IR.
+				double g = 1.0 / std::sqrt(1.0 + se_amp * se_amp);
+				for(int n = 0; n < nSamp; n++) data_container.passband_data[n] *= g;
+			}
+		}
+
+		// ===== SE-RECLAIM ARM-B: SINGLE-SHOT SUPERIMPOSED-PILOT CONTROL (default-OFF) =====
+		// Cheap control to confirm the SP NO-GO WITHOUT building the >=4-iter turbo/SIC
+		// loop. The dive (and primary sources Kammoun arXiv:1309.0834, Nokia arXiv:2506.20248)
+		// predict single-shot SP on 16-QAM/SISO/high-SNR hits a high-SNR self-noise FLOOR.
+		// MODEL (faithful to "Mercury's current single-pass estimator only"): with the pilot
+		// superimposed on data at power fraction rho, the data is scaled by sqrt(1-rho) AND
+		// the pilot-on-data interference that a single-pass LS estimator CANNOT cancel becomes
+		// an irreducible Gaussian self-noise of variance ~ rho * P_data on every data symbol
+		// (Kammoun: at high SNR "the noise caused by the data distortion is higher than the
+		// additive Gaussian noise" -> a BER floor lower-bounded by (1/2)(1/c1)). We inject
+		// exactly that on the passband data region (after the preamble), BEFORE AWGN. This is
+		// a DELIBERATE control: if it floors, SP is confirmed dead; if it unexpectedly clears
+		// 3536, we flag it (do NOT then build the turbo loop). MERCURY_SE_SP_RHO=0 -> off.
+		double sp_rho = 0.0;
+		{ const char* e = std::getenv("MERCURY_SE_SP_RHO"); if(e && *e) sp_rho = atof(e); }
+		if(sp_rho > 0.0 && sp_rho < 1.0 && M != MOD_MFSK)
+		{
+			int interp     = this->frequency_interpolation_rate;
+			int nSamp      = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb)) * interp;
+			int pre_samp   = data_container.preamble_nSymb * data_container.Nofdm * interp; // skip preamble
+			// data-region RMS (for the self-noise scale)
+			double psum = 0.0; int cnt = 0;
+			for(int n = pre_samp; n < nSamp; n++) { psum += data_container.passband_data[n]*data_container.passband_data[n]; cnt++; }
+			double prms = (cnt>0) ? std::sqrt(psum/(double)cnt) : 0.0;
+			double data_scale = std::sqrt(1.0 - sp_rho);          // power-sharing: data keeps (1-rho)
+			double si_std     = std::sqrt(sp_rho) * prms;          // residual data-pilot interference std
+			static unsigned sp_rng = 0; static bool sp_init = false;
+			if(!sp_init) { sp_rng = 0x5eed51c0u; sp_init = true; }
+			auto sp_gauss = [&]() -> double {                      // Box-Muller-ish from xorshift
+				sp_rng ^= sp_rng<<13; sp_rng ^= sp_rng>>17; sp_rng ^= sp_rng<<5;
+				double u1 = ((double)(sp_rng & 0xFFFFFFu)/16777216.0); if(u1<1e-12) u1=1e-12;
+				sp_rng ^= sp_rng<<13; sp_rng ^= sp_rng>>17; sp_rng ^= sp_rng<<5;
+				double u2 = ((double)(sp_rng & 0xFFFFFFu)/16777216.0);
+				return std::sqrt(-2.0*std::log(u1)) * std::cos(2.0*M_PI*u2);
+			};
+			for(int n = pre_samp; n < nSamp; n++)
+				data_container.passband_data[n] = data_scale * data_container.passband_data[n] + si_std * sp_gauss();
+		}
+
 		// fix/cfg16-nv-restore: optional static 2-ray frequency-selective channel,
 		// applied to the TX passband BEFORE AWGN. Off by default (production BER
 		// unchanged). y[n] = x[n] + fsel_amp * x[n-fsel_delay]; iterate backward so
@@ -3406,6 +3517,26 @@ void cl_telecom_system::calculate_parameters()
 	else
 		Shannon_limit= 10.0*log10((pow(2,(rb*ldpc.rate)/bandwidth)-1)*log2M_eff*bandwidth/rb);
 	sampling_frequency=frequency_interpolation_rate*(bandwidth/ofdm.Nc)*ofdm.Nfft;
+
+	// SE-RECLAIM ARM-A: emit the authoritative net-wire (rbc, the coded payload bit
+	// rate that ALREADY folds in the CP overhead via Ts=Tu*(1+gi), the pilot overhead
+	// via nData, and the preamble overhead via Tf). MERCURY_SE_WIRE=1 prints it so the
+	// sweep can read the realized net wire per (Ngi,Dy) cell directly from the modem,
+	// not from airtime arithmetic. Default-off (no print) = unchanged behavior.
+	if(M != MOD_MFSK)
+	{
+		const char* sw = std::getenv("MERCURY_SE_WIRE");
+		if(sw && atoi(sw) != 0)
+		{
+			int Ngi_eff = (int)llround(ofdm.gi * (double)ofdm.Nfft);
+			printf("[SE-RECLAIM] cfg=%d M=%.0f Ngi=%d Dy=%d nData=%d Nsymb=%d pre=%d "
+			       "Tu=%.6g Ts=%.6g Tf=%.6g rb=%.2f rbc=%.2f CR=%.4f\n",
+			       current_configuration, M, Ngi_eff, ofdm.pilot_configurator.Dy,
+			       ofdm.pilot_configurator.nData, ofdm.Nsymb,
+			       ofdm.preamble_configurator.Nsymb, Tu, Ts, Tf, rb, rbc, LDPC_real_CR);
+			fflush(stdout);
+		}
+	}
 }
 
 void cl_telecom_system::set_mfsk_ctrl_mode(bool enable)
@@ -5344,8 +5475,18 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 	if(ber_single_esn0 > -900.0f)
 	{
 		int nf = (ber_frames_override > 0) ? ber_frames_override : nFrames_per_point;
-		float b = passband_test_EsN0(ber_single_esn0, nf).BER;
-		std::cout<<ber_single_esn0<<";"<<b<<std::endl;
+		cl_error_rate er = passband_test_EsN0(ber_single_esn0, nf);
+		std::cout<<ber_single_esn0<<";"<<er.BER<<std::endl;
+		// SE-RECLAIM: also emit frame-decode stats so the ARM-A sweep can read the
+		// frame-decode rate (= 1 - FER) directly, not infer it from BER. Default-on
+		// print is harmless (extra stderr-style line on stdout); production ARQ never
+		// enters this single-point path. frames_ok / frames_total / FER.
+		std::cout<<"[SE-FER] esn0="<<ber_single_esn0
+		         <<" frames="<<(long)er.Frames_total
+		         <<" frame_err="<<(long)er.Error_frames_total
+		         <<" fer="<<er.FER
+		         <<" decode_rate="<<(1.0 - er.FER)
+		         <<" ber="<<er.BER<<std::endl;
 		BER_plot.close();
 		return;
 	}
@@ -8905,6 +9046,58 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.pilot_configurator.boost=default_configurations_telecom_system.ofdm_pilot_configurator_pilot_boost;
 	ofdm.pilot_configurator.seed=default_configurations_telecom_system.ofdm_pilot_configurator_seed;
 	ofdm.pilot_configurator.pilot_density=default_configurations_telecom_system.ofdm_pilot_density;
+
+	// ===== SE-RECLAIM ARM-A (SIM FEASIBILITY, default-OFF = byte-identical) =====
+	// Cancellation-free spectral-efficiency reclaim on the reliable CFG15 rung
+	// (16-QAM r0.875), per _research/SE_RECLAIM_ARMA_VERDICT dive:
+	//   (1) REDUCED / channel-matched CP: MERCURY_SE_NGI overrides ofdm.gi for the
+	//       clean/good front (clean-front delay spread ~0.3-0.5 ms << the stock
+	//       Ngi=54 -> 4.5 ms GI). gi = Ngi/Nfft. Prior art: Qualcomm US9485678B2
+	//       "Effective utilization of cyclic prefix ... under benign channel
+	//       conditions"; IEEE doc 8301857 (variable-CP coded OFDM throughput).
+	//   (2) SPARSER TIME-PILOTS: MERCURY_SE_DY overrides the pilot time-axis spacing
+	//       Dy (stock 3). The clean front's long coherence time over-samples Dy=3;
+	//       relaxing it reclaims pilot REs. Setting an EXPLICIT Dy here also skips the
+	//       AUTO_SELLECT resolution in init() (Dy is only auto-set when == AUTO_SELLECT).
+	// Both are PER-RE-POWER-PRESERVING (no data-power steal -> no LDPC-threshold risk),
+	// unlike superimposed pilots (refuted ARM-B). GATED to CONFIG_15 ONLY so every other
+	// rung is untouched. When neither env is set, the block is a no-op and the render is
+	// byte-identical to HEAD (proven by the default-off cmp). This is a SIM measurement
+	// vehicle: it does NOT carry the geometry on the wire / handshake the optimizer
+	// (that is the production scope IF this passes).
+	if(configuration == CONFIG_15)
+	{
+		const char* se_ngi = std::getenv("MERCURY_SE_NGI");
+		if(se_ngi && *se_ngi)
+		{
+			int ngi = atoi(se_ngi);
+			if(ngi >= 1 && ngi <= 200)   // clamp: positive, < Nfft
+				ofdm.gi = (double)ngi / (double)default_configurations_telecom_system.ofdm_Nfft;
+		}
+		const char* se_dy = std::getenv("MERCURY_SE_DY");
+		if(se_dy && *se_dy)
+		{
+			int dy = atoi(se_dy);
+			if(dy >= 1 && dy <= 64)
+				ofdm.pilot_configurator.Dy = dy;   // explicit -> init() leaves it as-is
+		}
+		// SPARSER PILOTS RECLAIM = FEWER SYMBOLS, NOT MORE DATA REs. The LDPC codeword
+		// is fixed (N=1600 bits -> 400 16-QAM data symbols for CFG15), and the framer
+		// maps EXACTLY nData = N/log2M data REs (ofdm.cc:982 framer reads in[0..nData)).
+		// Freeing pilot REs by raising Dy must therefore be cashed in by SHRINKING Nsymb
+		// so the grid still has ~400 data REs (the codeword still fits) and the frame is
+		// SHORTER in time (Tf drops -> wire rises). MERCURY_SE_NSYMB sets the symbol count
+		// explicitly (init() leaves it since it's != AUTO_SELLECT). The sweep picks the
+		// Nsymb that yields nData==400 for each Dy. Growing nData past 400 (Nsymb too big
+		// for the Dy) overruns the codeword buffer; the sweep clamps Nsymb to keep nData>=400.
+		const char* se_nsymb = std::getenv("MERCURY_SE_NSYMB");
+		if(se_nsymb && *se_nsymb)
+		{
+			int ns = atoi(se_nsymb);
+			if(ns >= 1 && ns <= 256)
+				ofdm.Nsymb = ns;   // explicit -> init() leaves it as-is
+		}
+	}
 
 	// nIdentical_sections derives from subcarrier spacing in configure().
 	// WB (Nc>=50): every-4th → 4 identical sections (period Nfft/4)
