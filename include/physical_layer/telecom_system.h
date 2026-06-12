@@ -737,6 +737,10 @@ public:
 	// honors RECLAIM; every other config ignores it. RX and TX derive IDENTICAL
 	// geometry because both set the SAME pending_grid from the wire selector.
 	int pending_grid;
+	// The grid the PHY currently has MATERIALIZED. load_configuration's same-config
+	// early-return must ALSO fall through on a grid change (a 15->15 FULL<->RECLAIM
+	// switch), or the new grid never installs (data-flow-se-reclaim.md §7 H2/H3).
+	int current_grid;
 	void return_to_last_configuration();
 	int get_configuration(double SNR);  // returns CONFIG_0..16 (never CONFIG_NONE)
 

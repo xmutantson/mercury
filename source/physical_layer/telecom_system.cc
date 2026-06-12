@@ -150,6 +150,7 @@ cl_telecom_system::cl_telecom_system()
 	current_configuration=CONFIG_NONE;
 	last_configuration=CONFIG_NONE;
 	pending_grid=GRID_FULL;   // SE-RECLAIM: default-safe FULL grid (data-flow-se-reclaim.md §4)
+	current_grid=GRID_FULL;   // SE-RECLAIM: grid the PHY currently has materialized
 	outer_code=NO_OUTER_CODE;
 	outer_code_reserved_bits=0;
 	bit_energy_dispersal_seed=0;
@@ -8709,7 +8710,14 @@ void cl_telecom_system::load_configuration()
 
 void cl_telecom_system::load_configuration(int configuration)
 {
-	if(configuration==current_configuration)
+	// SE-RECLAIM (data-flow-se-reclaim.md §7 H2/H3): the effective grid this config
+	// will materialize. Only CONFIG_15 honors pending_grid; every other config is
+	// always FULL. The same-config early-return must fall through on a grid change
+	// (15->15 FULL<->RECLAIM) so the new Ngi/Dy/Nsymb lattice + buffer geometry
+	// actually install — otherwise the new grid is silently never applied.
+	int effective_grid = (configuration == CONFIG_15 && pending_grid == GRID_RECLAIM)
+		? GRID_RECLAIM : GRID_FULL;
+	if(configuration==current_configuration && effective_grid==current_grid)
 	{
 		return;
 	}
@@ -8912,10 +8920,31 @@ void cl_telecom_system::load_configuration(int configuration)
 		last_configuration=current_configuration;
 		current_configuration=configuration;
 	}
+	// SE-RECLAIM: capture the grid change BEFORE updating current_grid, so the
+	// reinit trigger below can see it, then commit current_grid (it tracks the grid
+	// the init() at the end of this function materializes; the actual geometry is
+	// applied there via the reinit flags set just below).
+	bool se_grid_changed = (effective_grid != current_grid);
+	current_grid = effective_grid;
 	if(_modulation!=M || ofdm_preamble_configurator_Nsymb!=ofdm.preamble_configurator.Nsymb)
 	{
 		reinit_subsystems.microphone=YES;
 		reinit_subsystems.speaker=YES;
+		reinit_subsystems.telecom_system=YES;
+		reinit_subsystems.data_container=YES;
+		reinit_subsystems.ofdm=YES;
+		reinit_subsystems.psk=YES;
+		reinit_subsystems.pre_equalization_channel=YES;
+	}
+
+	// SE-RECLAIM (data-flow-se-reclaim.md §7 H2/H3): a 15->15 GRID change keeps the
+	// modulation/preamble/rate identical, so none of the triggers above fire — but
+	// the grid changes ofdm.gi/Nsymb/Dy (=> Nofdm, the pilot lattice, the frame
+	// geometry). FORCE the data_container/ofdm/psk reinit (and the channel re-est /
+	// pre-eq) so the new lattice + buffer sizes actually install. Without this, the
+	// stale grid's buffers would demodulate the new grid (whole-batch decode loss).
+	if(se_grid_changed)
+	{
 		reinit_subsystems.telecom_system=YES;
 		reinit_subsystems.data_container=YES;
 		reinit_subsystems.ofdm=YES;

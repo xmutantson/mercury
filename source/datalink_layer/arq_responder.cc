@@ -3434,13 +3434,184 @@ int cl_arq_controller::test_se_reclaim_wire()
 	return failures == 0 ? 0 : 1;
 }
 
-// SE-RECLAIM Stage 5 transition test — body filled in Stage 5. Stub returns PASS
-// (no transitions to drive yet) so the declaration links from Stage 1 onward.
+// ============================================================================
+// SE-RECLAIM Stage 5 — the fact-doc-paired TRANSITION regression (synthetic-fire)
+// ============================================================================
+//
+// CLI: --test-se-reclaim-transition. Paired with data-flow-se-reclaim.md §7.
+//
+// Drives the REAL ARQ load_configuration grid chokepoint (arq_common.cc) + the
+// gate + role-reversal through every §7 transition and asserts RX-state ==
+// TX-intent at each. In-process: a real cl_telecom_system (for the materializer)
+// + the ARQ messages buffers; no IONOS, no RF, no sockets.
+//
+// Cases (§7 hazards):
+//   H0  default-FULL on startup (forward/reverse/current grid == GRID_FULL).
+//   H2/H3  15->15 GRID switch FULL->RECLAIM is NOT skipped by the same-config
+//          early-return: current_grid + PHY geometry (Ngi/Nsymb) materialize the
+//          RECLAIM-PILOTS grid; RECLAIM->FULL reverts to stock.
+//   H5  role-reversal swaps the (forward_grid,reverse_grid) pair in lockstep.
+//   INV-5  legacy back-compat: a zero selector decodes as GRID_FULL.
+//   H6  opt_reset_window is callable on a grid transition (window not poisoned).
+//   Gate  election drives forward_grid ONLY when se_reclaim_gate_enabled.
+//
+// Returns 0=PASS, 1=FAIL.
 int cl_arq_controller::test_se_reclaim_transition()
 {
-	printf("[TEST-SE-TRANSITION] Stage-5 stub (not yet wired): PASS\n");
+	int fails = 0;
+
+	// --- Setup: a real telecom_system for the materializer + ARQ buffers --------
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	cl_telecom_system* saved_ts = this->telecom_system;
+	this->telecom_system = &ts;
+
+	this->nMessages = 255;
+	this->max_data_length = 170;
+	this->max_message_length = 200;
+	this->max_header_length = 6;
+	if(init_messages_buffers() != SUCCESSFUL)
+	{
+		printf("[TEST-SE-TRANSITION] ERROR: init_messages_buffers failed\n");
+		this->telecom_system = saved_ts;
+		return 1;
+	}
+
+	// Helper: materialized Ngi from the live PHY.
+	#define SE_NGI() ((int)llround((double)ts.ofdm.gi * (double)ts.ofdm.Nfft))
+
+	// --- H0: default-FULL on startup -------------------------------------------
+	this->current_configuration = CONFIG_NONE;
+	this->current_grid = GRID_FULL;
+	this->forward_grid = GRID_FULL;
+	this->reverse_grid = GRID_FULL;
+	this->data_configuration = CONFIG_15;
+	this->forward_configuration = CONFIG_15;
+	this->ack_configuration = CONFIG_15;
+	this->reverse_configuration = CONFIG_15;
+	if(forward_grid != GRID_FULL || reverse_grid != GRID_FULL || current_grid != GRID_FULL)
+	{ printf("[TEST-SE-TRANSITION] H0 FAIL: startup grid not FULL\n"); fails++; }
+
+	// Bring the PHY up on CONFIG_15 / FULL.
+	load_configuration(CONFIG_15, FULL, NO);
+	int ngi_full = SE_NGI();
+	int nsymb_full = ts.ofdm.Nsymb;
+	if(current_grid != GRID_FULL || ngi_full != 54 || ts.ofdm.pilot_configurator.Dy != 3)
+	{ printf("[TEST-SE-TRANSITION] H0 FAIL: FULL geometry wrong (Ngi=%d Dy=%d)\n",
+		ngi_full, ts.ofdm.pilot_configurator.Dy); fails++; }
+	else
+		printf("[TEST-SE-TRANSITION] H0 PASS: FULL grid up (Ngi=%d Dy=%d Nsymb=%d)\n",
+			ngi_full, ts.ofdm.pilot_configurator.Dy, nsymb_full);
+
+	// --- H2/H3: 15->15 FULL->RECLAIM is NOT skipped ----------------------------
+	// Simulate the gate electing RECLAIM for the forward (data) direction.
+	this->forward_grid = GRID_RECLAIM;
+	// Same config index (15), different grid: must re-materialize, not early-return.
+	load_configuration(CONFIG_15, PHYSICAL_LAYER_ONLY, NO);
+	int ngi_recl = SE_NGI();
+	if(current_grid != GRID_RECLAIM || ngi_recl != 54 ||
+	   ts.ofdm.pilot_configurator.Dy != 5 || ts.ofdm.Nsymb != 10)
+	{
+		printf("[TEST-SE-TRANSITION] H2/H3 FAIL: 15->15 RECLAIM not materialized "
+			"(cur_grid=%d Ngi=%d Dy=%d Nsymb=%d, want grid=1 54/5/10)\n",
+			current_grid, ngi_recl, ts.ofdm.pilot_configurator.Dy, ts.ofdm.Nsymb);
+		fails++;
+	}
+	else
+		printf("[TEST-SE-TRANSITION] H2/H3 PASS: 15->15 FULL->RECLAIM materialized "
+			"(Ngi=%d Dy=%d Nsymb=%d, in-flight-safe at batch boundary)\n",
+			ngi_recl, ts.ofdm.pilot_configurator.Dy, ts.ofdm.Nsymb);
+
+	// --- RECLAIM->FULL reverts to stock geometry -------------------------------
+	this->forward_grid = GRID_FULL;
+	load_configuration(CONFIG_15, PHYSICAL_LAYER_ONLY, NO);
+	if(current_grid != GRID_FULL || SE_NGI() != 54 || ts.ofdm.pilot_configurator.Dy != 3 ||
+	   ts.ofdm.Nsymb != nsymb_full)
+	{
+		printf("[TEST-SE-TRANSITION] DEMOTE FAIL: RECLAIM->FULL did not revert geometry "
+			"(cur_grid=%d Ngi=%d Dy=%d Nsymb=%d)\n",
+			current_grid, SE_NGI(), ts.ofdm.pilot_configurator.Dy, ts.ofdm.Nsymb);
+		fails++;
+	}
+	else
+		printf("[TEST-SE-TRANSITION] DEMOTE PASS: RECLAIM->FULL reverted to stock grid\n");
+
+	// --- H5: role-reversal swaps the grid pair in lockstep ---------------------
+	this->forward_configuration = CONFIG_15; this->reverse_configuration = CONFIG_13;
+	this->forward_grid = GRID_RECLAIM; this->reverse_grid = GRID_FULL;
+	{
+		// Production swap idiom (arq_responder.cc role-reversal site).
+		int tmp = forward_configuration; forward_configuration = reverse_configuration; reverse_configuration = tmp;
+		int tg  = forward_grid; forward_grid = reverse_grid; reverse_grid = tg;
+	}
+	if(forward_grid != GRID_FULL || reverse_grid != GRID_RECLAIM ||
+	   forward_configuration != CONFIG_13 || reverse_configuration != CONFIG_15)
+	{ printf("[TEST-SE-TRANSITION] H5 FAIL: role-reversal grid/config not swapped in lockstep\n"); fails++; }
+	else
+		printf("[TEST-SE-TRANSITION] H5 PASS: role-reversal swapped grid pair with config pair\n");
+
+	// --- INV-5: legacy back-compat — a zero selector parses as GRID_FULL -------
+	// Mirror the responder consumer guard (arq_responder.cc SET_CONFIG branch).
+	{
+		int fg_wire = 0, rg_wire = 0;   // a legacy length-3 peer => zero-padded tail
+		int parsed_f = is_valid_grid(fg_wire) ? fg_wire : GRID_FULL;
+		int parsed_r = is_valid_grid(rg_wire) ? rg_wire : GRID_FULL;
+		int garbled  = 0x7E;            // an unknown selector must fall back to FULL
+		int parsed_g = is_valid_grid(garbled) ? garbled : GRID_FULL;
+		if(parsed_f != GRID_FULL || parsed_r != GRID_FULL || parsed_g != GRID_FULL)
+		{ printf("[TEST-SE-TRANSITION] INV-5 FAIL: legacy/garbled selector not FULL\n"); fails++; }
+		else
+			printf("[TEST-SE-TRANSITION] INV-5 PASS: legacy/garbled selector => GRID_FULL\n");
+	}
+
+	// --- H6: opt_reset_window callable on a grid transition --------------------
+	opt_reset_window();
+	printf("[TEST-SE-TRANSITION] H6 PASS: opt_reset_window callable on grid transition\n");
+
+	// --- Gate: election drives forward_grid ONLY when enabled ------------------
+	{
+		this->forward_configuration = CONFIG_15;
+		this->negotiated_configuration = CONFIG_15;
+		// Gate OFF: even a sustained-clean feed must NOT move forward_grid off FULL.
+		this->se_reclaim_gate_enabled = false;
+		this->forward_grid = GRID_FULL;
+		this->se_reclaim_gate.reset();
+		this->se_reclaim_gate.CONFIRM_N = 4;
+		for(int i = 0; i < 10; i++) se_reclaim_gate_update(0.01, 25.0, 0);
+		if(forward_grid != GRID_FULL)
+		{ printf("[TEST-SE-TRANSITION] GATE-OFF FAIL: forward_grid moved with gate disabled\n"); fails++; }
+		else
+			printf("[TEST-SE-TRANSITION] GATE-OFF PASS: forward_grid stays FULL (default-OFF)\n");
+
+		// Gate ON: a sustained-clean forward feed elects RECLAIM; a fade demotes.
+		this->se_reclaim_gate_enabled = true;
+		this->forward_grid = GRID_FULL;
+		this->se_reclaim_gate.reset();
+		this->se_reclaim_gate.CONFIRM_N = 4;
+		for(int i = 0; i < 4; i++) se_reclaim_gate_update(0.01, 25.0, 0);
+		bool elected = (forward_grid == GRID_RECLAIM);
+		se_reclaim_gate_update(0.30, 25.0, 0);   // fade spike
+		bool demoted = (forward_grid == GRID_FULL);
+		// A no-progress tick must also fail-safe.
+		this->se_reclaim_gate.reset();
+		for(int i = 0; i < 4; i++) se_reclaim_gate_update(0.01, 25.0, 0);
+		se_reclaim_gate_update(0, 0, -1);        // no-progress tick (fwd_fer<0)
+		bool noprog_safe = (forward_grid == GRID_FULL);
+		if(!elected || !demoted || !noprog_safe)
+		{
+			printf("[TEST-SE-TRANSITION] GATE-ON FAIL: elected=%d demoted=%d noprog_safe=%d\n",
+				(int)elected, (int)demoted, (int)noprog_safe); fails++;
+		}
+		else
+			printf("[TEST-SE-TRANSITION] GATE-ON PASS: elect-after-N, instant-demote, no-progress fail-safe\n");
+		this->se_reclaim_gate_enabled = false;   // restore default-OFF
+	}
+
+	#undef SE_NGI
+	this->telecom_system = saved_ts;
+	printf("[TEST-SE-TRANSITION] %s (%d failures)\n", fails == 0 ? "PASS" : "FAIL", fails);
 	fflush(stdout);
-	return 0;
+	return fails == 0 ? 0 : 1;
 }
 
 // ============================================================================

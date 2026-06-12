@@ -302,3 +302,60 @@ If it regresses → keep the shippable target at RECLAIM-PILOTS (Ngi=54, zero sy
 - ARDOP / PACTOR negotiated-config handshake — analog for the two-phase wire negotiation.
 - Verdict: `_research/SE_RECLAIM_ARMA_VERDICT.json` (agent aeda12d0). Experiment branch:
   `sim/se-reclaim-cp-pilots @ d364fcf` (env-gated ARM-A hooks, default-off byte-identical).
+
+---
+
+## §10 IMPLEMENTATION STATUS (Stages 0-5 built; Stage 6 held)
+
+Built on `sim/se-reclaim-cp-pilots` on top of `d364fcf`. Default-off, byte-identical
+to the baseline; Stage 6 (optimizer election) HELD behind the default-off gate flag.
+
+**What shipped:**
+- §1 enum `se_grid_t {GRID_FULL=0, GRID_RECLAIM=1}` (common_defines.h), ARQ pair
+  `forward_grid`/`reverse_grid` + tracker `current_grid` (arq.h).
+- Stage 1 wire: SET_CONFIG `data[3]`/`data[4]` + length 3→5 (arq_commander.cc producer,
+  arq_responder.cc consumer), role-reversal lockstep swap, legacy zero → FULL.
+- Stage 2 materializer: `pending_grid` member (telecom_system.h) → deterministic
+  `(CONFIG_15,GRID_RECLAIM)→{Ngi,Dy,Nsymb}` (telecom_system.cc); ARQ pushes the
+  direction-keyed grid at the single load_configuration chokepoint (arq_common.cc).
+  RECLAIM-PILOTS = 54/5/10 (rbc 3826.7); RECLAIM-FULL = 18/5/10 (rbc 4329.5,
+  `MERCURY_SE_RECLAIM_FULL`-gated).
+- Stage 3 gate: `cl_se_reclaim_gate` (se_reclaim_gate.h), default-OFF flag
+  `se_reclaim_gate_enabled` (`MERCURY_SE_RECLAIM_GATE`). Slow-promote CONFIRM_N=10 /
+  instant-demote / no-progress fail-safe; fed FORWARD selectivity+SNR+FER. The
+  gate-feed is NOT called from the CMD reverse-link point (INV-4); the RSP-forward
+  ACK-suffix transport is the held Stage-6 wiring.
+- Stage 4 sync verify: loopback Schmidl-Cox lock + mean_H, Ngi=18 vs Ngi=54.
+- Stage 5 transition test (`--test-se-reclaim-transition`) + the 15→15 fix below.
+
+**Key finding (Stage 5, caught by the transition test — H2/H3):** the same-config
+early-return EXISTS AT TWO LAYERS — the ARQ wrapper (`cl_arq_controller::load_configuration`,
+arq_common.cc) AND the PHY (`cl_telecom_system::load_configuration`, telecom_system.cc:8712).
+A 15→15 FULL↔RECLAIM grid switch was SILENTLY DROPPED by BOTH, because the config index
+is unchanged and the modulation/preamble/ldpc-rate reinit triggers don't fire on a grid-only
+change. FIX (both layers): a `current_grid` tracker per layer + the early-return falls through
+when `effective_grid != current_grid`; the PHY additionally FORCES
+`reinit_subsystems.{telecom_system,data_container,ofdm,psk,pre_equalization_channel}=YES`
+on a grid change so the new Ngi/Dy/Nsymb lattice + buffer geometry actually install. INV-10
+(use_last_good timing invalidation) is satisfied for free because the now-reached tail of
+load_configuration already resets `delay_/freq_offset_of_last_decoded_message`
+(telecom_system.cc:9591-9596). This is the canonical §7 H2/H3 hazard — predicted by the audit,
+caught fail-before by the paired test, fixed at root cause.
+
+**Test evidence:** `--test-se-reclaim` (6 suite tests: wire round-trip/legacy, materializer
+FULL/PILOTS/FULL-ab/nData-400, gate safety×3, sync-margin), `--test-se-reclaim-wire`
+(producer + role-reversal), `--test-se-reclaim-transition` (H0/H2-H3/H5/INV-5/H6/gate).
+Fail-before/pass-after confirmed at every stage; full `mercury --test` green (56/0); default-off
+CFG15 BER bit-identical to `d364fcf` (`6;0.0474205 8;0.00607659 10;0` both).
+
+**Sync-margin result (Stage 4, honest):** at 20 dB SNR3k clean AWGN loopback, Ngi=18
+RECLAIM-FULL locks 12/12 (= Ngi=54) with mean_H 0.978 vs 0.998 — WITHIN the acceptance band,
+so the 97-tap TX FIR (> 72-sample Ngi=18 GI budget, INV-9) does not degrade clean-front lock.
+SHIP TARGET stays RECLAIM-PILOTS (1.08x, Ngi=54, zero sync risk); RECLAIM-FULL (1.224x) is
+loopback-sync-safe but held behind the flag + bench (the verdict knee collapses Ngi=18 on a
+moderate fade).
+
+**Still open / held [?]:** Stage-6 optimizer rate-table election + the RSP-forward ACK-suffix
+transport (both behind the default-off gate, bench-gated on the EsN0↔SNR3k mapping); the
+end-to-end pinned-CFG15 RECLAIM-vs-FULL A/B with compress-ON (the realized e2e wire vs 3826
+after ARQ/turnaround overhead).

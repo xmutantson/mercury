@@ -2346,6 +2346,11 @@ public:
   // Swapped in lockstep with the config pair on role-reversal (§7 H5).
   int forward_grid;   // GRID_FULL/GRID_RECLAIM for the Commander->Responder direction
   int reverse_grid;   // GRID_FULL/GRID_RECLAIM for the Responder->Commander direction
+  // SE-RECLAIM: the grid the PHY currently has MATERIALIZED (data-flow-se-reclaim.md
+  // §7 H2/H3). Tracked so a 15->15 grid switch (same config index, FULL<->RECLAIM)
+  // is NOT skipped by load_configuration's same-config early-return — without this
+  // the stale grid's capture buffer/Nofdm would be demodulated on the new lattice.
+  int current_grid;   // GRID_FULL/GRID_RECLAIM currently installed in the PHY
 
   // SE-RECLAIM forward-link gate (data-flow-se-reclaim.md §3). DEFAULT-OFF
   // feature flag (se_reclaim_gate_enabled=false) so production behavior is

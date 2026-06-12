@@ -514,6 +514,7 @@ cl_arq_controller::cl_arq_controller()
 	// SE-RECLAIM: default-safe FULL grid both directions (data-flow-se-reclaim.md §4).
 	forward_grid=GRID_FULL;
 	reverse_grid=GRID_FULL;
+	current_grid=GRID_FULL;   // PHY starts on the stock FULL grid
 	// SE-RECLAIM gate DEFAULT-OFF (§3): production behavior unchanged until the
 	// bench A/B (Stage 6). MERCURY_SE_RECLAIM_GATE=1 arms it for the A/B only.
 	se_reclaim_gate_enabled=false;
@@ -1700,14 +1701,39 @@ int cl_arq_controller::se_reclaim_gate_update(double fwd_selectivity, double fwd
 
 void cl_arq_controller::load_configuration(int configuration, int level, int backup_configuration)
 {
-	printf("[CFG] load_configuration(%d) current=%d level=%s backup=%s\n",
-		configuration, this->current_configuration,
+	// SE-RECLAIM (data-flow-se-reclaim.md §6/§7 H2/H3): resolve the grid this
+	// direction's config maps to BEFORE the same-config early-return, so a 15->15
+	// grid switch (same config index, FULL<->RECLAIM) is NOT skipped. The grid is
+	// direction-keyed exactly like the config (DATA/forward -> forward_grid,
+	// ACK/reverse -> reverse_grid). Default GRID_FULL until the gate elects RECLAIM.
+	int grid_for_cfg = GRID_FULL;
+	if(configuration == data_configuration)         grid_for_cfg = forward_grid;
+	else if(configuration == ack_configuration)     grid_for_cfg = reverse_grid;
+	else if(configuration == forward_configuration) grid_for_cfg = forward_grid;
+	else if(configuration == reverse_configuration) grid_for_cfg = reverse_grid;
+	if(!is_valid_grid(grid_for_cfg)) grid_for_cfg = GRID_FULL;
+	// Only CONFIG_15 has a RECLAIM grid; force FULL elsewhere so current_grid never
+	// drifts and a non-15 same-config call still takes the early-return.
+	if(configuration != CONFIG_15) grid_for_cfg = GRID_FULL;
+
+	printf("[CFG] load_configuration(%d) current=%d grid=%d cur_grid=%d level=%s backup=%s\n",
+		configuration, this->current_configuration, grid_for_cfg, this->current_grid,
 		level == FULL ? "FULL" : "PHYS_ONLY",
 		backup_configuration == YES ? "YES" : "NO");
-	if(configuration==this->current_configuration)
+	if(configuration==this->current_configuration && grid_for_cfg==this->current_grid)
 	{
-		printf("[CFG] Already on config %d, skipping\n", configuration);
+		printf("[CFG] Already on config %d grid %d, skipping\n", configuration, grid_for_cfg);
 		return;
+	}
+	if(configuration==this->current_configuration && grid_for_cfg!=this->current_grid)
+	{
+		// 15->15 GRID change: same config index but a different grid. Proceed with a
+		// FULL PHY re-init + capture flush (below) so the new Ngi/Dy/Nsymb lattice and
+		// buffer geometry replace the stale grid's — never demod the new grid on the
+		// old buffer (§7 H2/H3). Force the FULL deinit/reinit path for the geometry
+		// change even when the caller passed PHYSICAL_LAYER_ONLY.
+		printf("[CFG] GRID SWITCH on config %d: %d -> %d (full PHY re-init + flush)\n",
+			configuration, this->current_grid, grid_for_cfg);
 	}
 	if(current_configuration!=CONFIG_NONE)
 	{
@@ -1754,28 +1780,21 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// the audio callback accesses (passband_delayed_data, etc.)
 	telecom_system->data_container.frames_to_read = 0;
 
-	// SE-RECLAIM (data-flow-se-reclaim.md §2/§6): push the negotiated grid selector
-	// to the PHY so the materializer derives the (Ngi,Dy,Nsymb) grid that matches
-	// this direction's config. The grid is direction-keyed exactly like the config:
-	// the DATA (forward) config carries forward_grid; the ACK (reverse) config
-	// carries reverse_grid. Both ends set the SAME selector from the SET_CONFIG wire
-	// so RX and TX derive IDENTICAL geometry (INV-2). Default forward/reverse_grid ==
-	// GRID_FULL until the Stage-3 gate elects RECLAIM => byte-identical until then.
-	// Only CONFIG_15 materializes RECLAIM; the PHY ignores the selector elsewhere.
-	{
-		int grid_for_cfg = GRID_FULL;
-		if(configuration == data_configuration)        grid_for_cfg = forward_grid;
-		else if(configuration == ack_configuration)    grid_for_cfg = reverse_grid;
-		else if(configuration == forward_configuration) grid_for_cfg = forward_grid;
-		else if(configuration == reverse_configuration) grid_for_cfg = reverse_grid;
-		telecom_system->pending_grid = is_valid_grid(grid_for_cfg) ? grid_for_cfg : GRID_FULL;
-	}
+	// SE-RECLAIM (data-flow-se-reclaim.md §2/§6): push the grid selector resolved
+	// above (grid_for_cfg) to the PHY so the materializer derives the (Ngi,Dy,Nsymb)
+	// grid that matches this direction's config. Both ends set the SAME selector from
+	// the SET_CONFIG wire so RX and TX derive IDENTICAL geometry (INV-2). Default
+	// GRID_FULL until the gate elects RECLAIM => byte-identical until then.
+	telecom_system->pending_grid = grid_for_cfg;
 
 	printf("[CFG] Calling telecom_system->load_configuration(%d) grid=%d nb=%d\n",
 		configuration, telecom_system->pending_grid, telecom_system->narrowband_enabled);
 	fflush(stdout);
 	telecom_system->load_configuration(configuration);
-	printf("[CFG] telecom_system->load_configuration done\n");
+	// SE-RECLAIM: record the grid the PHY now holds so a later 15->15 grid switch is
+	// detected by the same-config early-return (§7 H2/H3).
+	this->current_grid = grid_for_cfg;
+	printf("[CFG] telecom_system->load_configuration done (grid=%d)\n", this->current_grid);
 	fflush(stdout);
 
 	// Note: after config switch (e.g. MFSK→OFDM), the zeroed buffer may still
