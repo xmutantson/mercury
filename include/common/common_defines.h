@@ -505,6 +505,76 @@ inline int cfg16_revack_starve_fallback_target(int current_config, bool ofdm_pro
 // consecutive ACK-silence block-failures with healthy forward SACK history"). TUNABLE.
 static const int CFG16_REVACK_STARVE_FAILS = 2;
 
+// ===========================================================================
+// CONSERVATIVE CHEAP REVERSE-ACK-MISS RECOVERY (lever 2; author xmutantson)
+// _research/ACTIVE_FRACTION_OVERHAUL_DESIGN.md §2, CONSERVATIVE arm only
+// (data-flow-cheap-ack-retry.md). The #1 clean-front throughput lever: a
+// transient reverse-ACK miss on a HEALTHY forward CFG16 channel becomes a bounded
+// re-listen at CFG16 (one extra ~3.5 s turnaround, NO config change) instead of
+// the BREAK -> ROBUST_0 -> ~30 s robust crawl cascade (50-60% of all idle time).
+//
+// The defect: `data_ack_received == NO` (arq_commander.cc:3608) is OVERLOADED — it
+// fires identically for "RSP got the batch, ACK lost" (transient, forward healthy)
+// and "RSP got nothing" (genuine forward collapse). The demote is CORRECT for
+// genuine loss; the defect is it fires on the transient case too. The CONSERVATIVE
+// discriminator defers the BREAK ONLY when there is POSITIVE recent forward-decode
+// proof (a fresh SACK_RSP showed the RSP IS decoding our forward data) AND within a
+// bounded budget. Genuine forward collapse NEVER has that proof (no recent SACK_RSP
+// => stale/0 frac) => the cheap-retry CANNOT arm on genuine loss => ZERO
+// genuine-loss-recovery regression (the conservative arm's safety guarantee).
+//
+// cheap_ack_retry_allowed() — PURE; the unit test (--test-cheap-ack-retry) replays
+// it directly. Returns true iff ALL hold (AND-of-evidence, conservative):
+//   - cheap_retry_enabled : env MERCURY_CHEAP_ACK_RETRY (read at the call site,
+//     passed in so the helper stays pure). Default false => byte-identical baseline.
+//   - current_config == CONFIG_16 && is_ofdm_config : CFG16-only scope (the audited
+//     turnaround-limited rung; in-burst CFG16 ~ CFG15, so re-listening is cheap).
+//   - link_connected && turbo_done && gear_shift_on : the SAME outer guards the
+//     BREAK threshold uses (arq_commander.cc:4039-4043).
+//   - retries_used < CHEAP_RETRY_BUDGET : bounded (D-b). A GENUINE loss costs only
+//     CHEAP_RETRY_BUDGET extra CFG16 turnarounds before the existing demote.
+//   - recent_forward_decode_frac >= CHEAP_FWD_HEALTH_FRAC : the LOAD-BEARING
+//     conservative gate (D-a). POSITIVE proof from a recent SACK_RSP bitmap that
+//     the RSP decoded >= CHEAP_FWD_HEALTH_FRAC of our forward frames. Genuine
+//     collapse never has this => fail-to-BREAK (incl. the cold first batch with no
+//     history, recent_forward_decode_frac==0.0 — the deliberate conservative
+//     fail-safe; the AGGRESSIVE cold-start arm is HELD per the user-ratified
+//     staging and is NOT built here).
+// Else false => the caller proceeds to the EXISTING D3/BREAK path UNCHANGED — the
+// genuine-loss recovery is preserved bit-for-bit (the safety contract).
+// FAIL-BEFORE: -DCHEAP_ACK_RETRY_FAILBEFORE -> false always (no cheap-retry -> the
+// reverse-ACK-miss BREAK cascade runs); mirrors -DFIX9_D3_FAILBEFORE.
+inline bool cheap_ack_retry_allowed(bool cheap_retry_enabled, int current_config,
+		bool link_connected, bool turbo_done, bool gear_shift_on,
+		int retries_used, int retry_budget,
+		double recent_forward_decode_frac, double fwd_health_frac) {
+#ifdef CHEAP_ACK_RETRY_FAILBEFORE
+	(void)cheap_retry_enabled; (void)current_config; (void)link_connected;
+	(void)turbo_done; (void)gear_shift_on; (void)retries_used; (void)retry_budget;
+	(void)recent_forward_decode_frac; (void)fwd_health_frac;
+	return false;   // FAIL-BEFORE stub: no cheap-retry -> the BREAK->ROBUST_0 cascade runs.
+#else
+	if (!cheap_retry_enabled) return false;          // env gate: default-off byte-identical.
+	if (current_config != CONFIG_16) return false;   // CFG16-only scope.
+	if (!is_ofdm_config(current_config)) return false;
+	if (!link_connected) return false;
+	if (!turbo_done) return false;                   // not mid-turboshift.
+	if (!gear_shift_on) return false;                // gearshift owns config transitions.
+	if (retries_used >= retry_budget) return false;  // (D-b) bounded budget exhausted.
+	// (D-a) the LOAD-BEARING conservative gate: POSITIVE recent forward-decode proof.
+	if (recent_forward_decode_frac < fwd_health_frac) return false;
+	return true;
+#endif
+}
+
+// CHEAP_RETRY_BUDGET: extra CFG16 re-listen turnarounds permitted before the
+// existing BREAK/D3 demote is allowed. Small so a GENUINE loss is bounded at
+// ~CHEAP_RETRY_BUDGET * 3.5 s. TUNABLE (design §2.4, default 2-3 -> 3).
+static const int CHEAP_RETRY_BUDGET = 3;
+// CHEAP_FWD_HEALTH_FRAC: a batch with >= this fraction of frames decoded proves
+// the forward channel is healthy (in-burst CFG16 ~ CFG15, design §2.4). TUNABLE.
+static const double CHEAP_FWD_HEALTH_FRAC = 0.50;
+
 // WALL-B FIX-9 D2 (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md): the
 // reverse-data-ACK turnaround-geometry predicate. The reverse MFSK ACK+SACK PHY (the M=16 WB
 // Welch-Costas pattern, send_mfsk_ack_sack) is config-INDEPENDENT in TONE SET — the same correlator

@@ -1578,6 +1578,12 @@ public:
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
 
+  // CONSERVATIVE cheap reverse-ACK-miss recovery (lever 2; xmutantson; failing-first).
+  // Drives the PURE cheap_ack_retry_allowed() discriminator + the real member-field
+  // discipline through T1-T5 (T2/T3/T5 are the SAFETY gates). Returns 0 pass, 1 fail.
+  // FAIL-BEFORE: -DCHEAP_ACK_RETRY_FAILBEFORE. See data-flow-cheap-ack-retry.md §5.
+  int test_cheap_ack_retry();
+
   // ROBUST_0 + streaming-compression deadlock regression
   // (data-flow-compress-frame-fill.md). Drives the REAL
   // process_buffer_data_commander() data-fill path at ROBUST_0 frame
@@ -3310,6 +3316,29 @@ public:
   // across cycles (the field's role generalizes from "carve-dead" to "CFG16-not-viable-on-this-
   // channel"; both arm sites mean the same thing to every cooldown consumer). See FIX9_D3_AUDIT.md.
   int cfg16_revack_starve_fails{0};
+
+  // CONSERVATIVE CHEAP REVERSE-ACK-MISS RECOVERY (lever 2; author xmutantson;
+  // _research/ACTIVE_FRACTION_OVERHAUL_DESIGN.md §2, data-flow-cheap-ack-retry.md §2).
+  // recent_forward_decode_frac: rolling fraction of forward frames the RSP decoded,
+  // taken from the most recent SACK_RSP bitmap (rx_count/data_batch_size) or a clean
+  // full-batch ACK (1.0). This is REVERSE EVIDENCE OF FORWARD HEALTH recorded on a
+  // PRIOR turnaround — it survives a LATER turnaround whose ACK is lost, so it is the
+  // freshest proof the RSP is still decoding our forward CFG16 data. Producer: the
+  // SACK_RSP partial handler (arq_commander.cc ~3146) + the clean-full-ACK path; RESET
+  // to 0.0 in ctor + both session resets (R3 parity with cfg16_revack_starve_fails) so
+  // a cold first batch reads "no proof" => the cheap-retry fails safe to BREAK.
+  // Consumer: cheap_ack_retry_allowed() (the D-a gate). Genuine forward collapse never
+  // has fresh SACK_RSP => stays 0.0/stale => the cheap-retry CANNOT arm => zero
+  // genuine-loss-recovery regression (the conservative arm's safety guarantee).
+  double recent_forward_decode_frac{0.0};
+  // cheap_ack_retries_used: consecutive cheap-retries taken at CFG16 with NO delivery
+  // between. Producer: ++ at the cheap-retry path; RESET to 0 on ANY data-ACK
+  // (symmetric with emergency_nack_count) and on any config != CFG16; INIT 0 in ctor +
+  // both session resets. Consumer: cheap_ack_retry_allowed() (the D-b bounded budget).
+  // When it reaches CHEAP_RETRY_BUDGET the gate goes false and the EXISTING D3/BREAK
+  // demote runs — bounding a genuine ACK-deaf-reverse-path loss to N extra turnarounds.
+  int cheap_ack_retries_used{0};
+
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)

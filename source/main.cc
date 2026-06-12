@@ -755,6 +755,7 @@ int main(int argc, char *argv[])
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
+    bool test_cheap_ack_retry_cli = false; // --test-cheap-ack-retry: conservative cheap reverse-ACK-miss recovery (lever 2, xmutantson) failing-first.
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1377,6 +1378,20 @@ int main(int argc, char *argv[])
             // composed stack (PAS + TINTERP-seed turbo + ratio-nvfix) decodes where a
             // bare arm fails. See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
             test_cfg17_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cheap-ack-retry") == 0)
+        {
+            // CONSERVATIVE cheap reverse-ACK-miss recovery (lever 2; xmutantson;
+            // failing-first). Drives the PURE cheap_ack_retry_allowed() discriminator
+            // + the real member-field discipline through T1-T5: T1 transient-miss-on-
+            // healthy stays CFG16 (no BREAK); T2 genuine-loss still demotes (safety);
+            // T3 deep-SNR anti-thrash intact (safety); T4 budget bound; T5 byte-
+            // identical default-off. FAIL-BEFORE: -DCHEAP_ACK_RETRY_FAILBEFORE -> the
+            // helper returns false -> T1/T4 FAIL. See
+            // fact-documents/data-flow-cheap-ack-retry.md §5.
+            test_cheap_ack_retry_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2842,6 +2857,21 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_clean_batch_viability();
             printf("[FLAG] Clean-batch-viability test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_cheap_ack_retry_cli) {
+            // CONSERVATIVE cheap reverse-ACK-miss recovery (lever 2; xmutantson;
+            // one-shot, then exit rc). Drives the PURE cheap_ack_retry_allowed()
+            // discriminator + the real member-field discipline through T1-T5 (T2/T3/T5
+            // are the SAFETY gates: genuine-loss still demotes, deep-SNR anti-thrash
+            // intact, default-off byte-identical). See
+            // fact-documents/data-flow-cheap-ack-retry.md §5.
+            printf("[FLAG] --test-cheap-ack-retry: invoking conservative cheap "
+                   "reverse-ACK-miss recovery regression (T1-T5)\n");
+            fflush(stdout);
+            int rc = ARQ.test_cheap_ack_retry();
+            printf("[FLAG] Cheap-ack-retry test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

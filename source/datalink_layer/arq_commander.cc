@@ -3147,6 +3147,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					rx_count, data_batch_size, retransmit_count);
 				fflush(stdout);
 
+				// CONSERVATIVE CHEAP REVERSE-ACK-MISS RECOVERY producer (lever 2; xmutantson;
+				// data-flow-cheap-ack-retry.md §2). This SACK_RSP bitmap is the RSP's per-frame
+				// decode result for the batch — direct, REVERSE evidence of forward health.
+				// Roll recent_forward_decode_frac so a LATER turnaround whose ACK is LOST can
+				// still prove (via this prior frac) that the RSP is decoding our forward data
+				// and take the cheap re-listen instead of the BREAK -> ROBUST_0 cascade. (This
+				// path itself set data_ack_received=YES below, so it never enters the miss
+				// branch — it RECORDS the evidence for the next miss.) Default-off via the env
+				// gate on the consumer, so this producer is inert on the byte-identical baseline.
+				if(data_batch_size > 0)
+					recent_forward_decode_frac =
+						(double)rx_count / (double)data_batch_size;
+
 				SACK_TRACE("dar=YES via SACK_RSP path rx_count=%d batch=%d retx=%d",
 					rx_count, data_batch_size, retransmit_count);
 				data_ack_received = YES;
@@ -3634,6 +3647,56 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// the next config transition.
 			opt_pending_switch_cfg = -1;
 
+			// ===== CONSERVATIVE CHEAP REVERSE-ACK-MISS RECOVERY (lever 2; xmutantson) =====
+			// _research/ACTIVE_FRACTION_OVERHAUL_DESIGN.md §2 (CONSERVATIVE arm only),
+			// data-flow-cheap-ack-retry.md. The #1 clean-front throughput lever. BEFORE
+			// the gearshift-retry / FIX-9 D3 / BREAK chain advances any of
+			// emergency_nack_count / cfg16_revack_starve_fails / panic / anchor, check the
+			// CONSERVATIVE forward-health discriminator. If a recent SACK_RSP PROVES the RSP
+			// is still decoding our forward CFG16 data (D-a, recent_forward_decode_frac >=
+			// CHEAP_FWD_HEALTH_FRAC) AND a bounded budget remains (D-b), the miss is on the
+			// REVERSE path, not a forward collapse: re-queue + re-listen at CFG16 (NO config
+			// change — both ends stay CFG16, strictly safer than a demote) instead of the
+			// BREAK -> ROBUST_0 -> ~30 s crawl. The PENDING_ACK -> ACK_TIMED_OUT flip already
+			// ran above (:3576-3580), so the batch is already queued for resend; we just must
+			// NOT advance the demote counters and must return so the existing TX path resends
+			// at CFG16. When the discriminator is FALSE (forward unhealthy — incl. the cold
+			// first batch with no SACK history — OR budget exhausted) we fall through and the
+			// EXISTING gearshift/D3/BREAK path fires BIT-FOR-BIT (the genuine-loss safety
+			// contract). Default-OFF (env unset) => the helper returns false => byte-identical.
+			// We skip the PHY-switch first-batch case (frame_gearshift_just_applied) so the
+			// existing §7.13.33 single-retry owns it (orthogonal — that is a forward-PHY race,
+			// not a held-CFG16 reverse-ACK miss).
+			{
+				static const bool cheap_retry_enabled =
+					(std::getenv("MERCURY_CHEAP_ACK_RETRY") != nullptr);
+				if(!frame_gearshift_just_applied
+				   && cheap_ack_retry_allowed(cheap_retry_enabled, current_configuration,
+				        /*link_connected=*/(link_status == CONNECTED),
+				        /*turbo_done=*/(turboshift_phase == TURBO_DONE),
+				        /*gear_shift_on=*/(gear_shift_on == YES),
+				        cheap_ack_retries_used, CHEAP_RETRY_BUDGET,
+				        recent_forward_decode_frac, CHEAP_FWD_HEALTH_FRAC))
+				{
+					cheap_ack_retries_used++;
+					printf("[CHEAP-RETRY] CFG16 reverse-ACK miss %d/%d, forward_healthy=1 "
+						"(fwd_frac=%.2f >= %.2f) — re-listening at CFG16 (NO BREAK, NO demote, "
+						"NO config change); the batch is already queued (ACK_TIMED_OUT) for resend\n",
+						cheap_ack_retries_used, CHEAP_RETRY_BUDGET,
+						recent_forward_decode_frac, CHEAP_FWD_HEALTH_FRAC);
+					fflush(stdout);
+					// Do NOT advance emergency_nack_count / cfg16_revack_starve_fails / the
+					// panic accelerant / the anchor-demote streak. Do NOT change config. The
+					// failed-batch optimizer accounting (opt_record_batch failed=true,
+					// notify_cooldown_tick, opt_pending_switch_cfg=-1) already ran above — the
+					// batch delivered 0 bytes this turn, which is honest. cleanup() already ran
+					// at the top of this evaluation (:3605) and frees ONLY ACKED/FAILED_ slots,
+					// never the ACK_TIMED_OUT resend batch — so the queued resend is preserved.
+					// Return so the next stepper iteration resends the ACK_TIMED_OUT batch at CFG16.
+					return;
+				}
+			}
+
 			// Frame gearshift just applied but data failed — BREAK immediately.
 			// §7.13.33 — retry once before BREAK: on a CFG7→CFG15 PHY-switch,
 			// the FIRST batch can fail not because CFG15 is too aggressive
@@ -3729,6 +3792,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				cfg16_revack_starve_fails++;
 			else
 				cfg16_revack_starve_fails = 0;
+
+			// CONSERVATIVE CHEAP REVERSE-ACK-MISS RECOVERY (lever 2; xmutantson): the cheap-retry
+			// budget is CFG16-scoped (mirrors cfg16_revack_starve_fails P4) — a miss on any other
+			// rung resets it so a later return to CFG16 starts with the full budget. (Reaching here
+			// means the cheap-retry did NOT pre-empt this miss: not CFG16, OR budget exhausted, OR
+			// forward unhealthy — so resetting off-CFG16 is the only mutation needed here.)
+			if(current_configuration != CONFIG_16)
+				cheap_ack_retries_used = 0;
 
 			// Batch halving disabled (batch size is fixed at negotiated value).
 			// Halving causes CMD/RSP batch size mismatch → ACK-GATE desync.
@@ -4156,6 +4227,17 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// (A partial SACK that arrives is itself a reverse-ACK that decoded — the de-alignment
 			// has not yet starved the turnaround to silence.) Symmetric with emergency_nack_count.
 			cfg16_revack_starve_fails = 0;
+
+			// CONSERVATIVE CHEAP REVERSE-ACK-MISS RECOVERY (lever 2; xmutantson;
+			// data-flow-cheap-ack-retry.md §2). ANY delivery resets the cheap-retry budget
+			// (symmetric with emergency_nack_count / cfg16_revack_starve_fails) so a later
+			// transient miss gets the full budget again. A CLEAN full-batch ACK is the
+			// strongest forward-health proof (all frames decoded) -> recent_forward_decode_frac
+			// = 1.0; a PARTIAL SACK already rolled the exact rx_count/data_batch_size at its
+			// producer site (~:3146). Default-off via the env gate on the consumer.
+			cheap_ack_retries_used = 0;
+			if(last_batch_fully_acked)
+				recent_forward_decode_frac = 1.0;
 
 			// WALL-B FIX-5: CLEAR the CFG16 big-block carve cooldown on CARVE SUCCESS. A
 			// data-ACK while current_configuration==CONFIG_16 with big-block framing live
@@ -11362,6 +11444,243 @@ int cl_arq_controller::test_climb_engine()
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// CONSERVATIVE CHEAP REVERSE-ACK-MISS RECOVERY regression (lever 2; xmutantson).
+// CLI --test-cheap-ack-retry. _research/ACTIVE_FRACTION_OVERHAUL_DESIGN.md §5,
+// data-flow-cheap-ack-retry.md §5. Drives the PURE cheap_ack_retry_allowed()
+// discriminator + the REAL member-field discipline (recent_forward_decode_frac /
+// cheap_ack_retries_used) + the REAL deep-SNR anchor-demote helper through T1-T5.
+// Pattern of test_climb_engine Part E (the pure-decision replay + state priming).
+// FAIL-BEFORE: -DCHEAP_ACK_RETRY_FAILBEFORE compiles cheap_ack_retry_allowed() to
+// `return false` -> T1 (no cheap-retry => the BREAK fires => not-CFG16-held) and T4
+// (no budget bound to reach => same false) FAIL. PASS-AFTER: ALL PASS. T2/T3/T5 are
+// the SAFETY gates (genuine-loss still demotes; deep-SNR anti-thrash intact;
+// default-off byte-identical) and pass on BOTH the FAIL-BEFORE and PASS-AFTER builds.
+// CMD-only; no RSP/wire/DSP change. The sim/bench A/B is the end-to-end gate.
+// ===========================================================================
+int cl_arq_controller::test_cheap_ack_retry()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-CHEAP-ACK] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-CHEAP-ACK] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	max_config_override = -1;
+	optimizer_disabled = true;
+	// Synthetic-fire priming: no init()/load_configuration ran, so the BREAK threshold
+	// member is uninitialized — set it to the production default (arq_common.cc:825).
+	emergency_nack_threshold = 3;
+
+	// The call site computes allow_cheap_retry from the LIVE controller state via
+	// cheap_ack_retry_allowed(). Replay it with the SAME argument expressions the
+	// production call site (arq_commander.cc, the miss-eval cheap-retry block) uses.
+	// cheap_retry_enabled=true here models MERCURY_CHEAP_ACK_RETRY set (the env gate is
+	// the ONLY thing default-off; the discriminator logic is exercised either way).
+	auto allow = [&](bool enabled) -> bool {
+		return cheap_ack_retry_allowed(enabled, current_configuration,
+			/*link_connected=*/(link_status == CONNECTED),
+			/*turbo_done=*/(turboshift_phase == TURBO_DONE),
+			/*gear_shift_on=*/(gear_shift_on == YES),
+			cheap_ack_retries_used, CHEAP_RETRY_BUDGET,
+			recent_forward_decode_frac, CHEAP_FWD_HEALTH_FRAC);
+	};
+
+	// Prime a HEALTHY held-CFG16 turnaround: link CONNECTED, turbo done, gearshift on,
+	// a recent SACK_RSP proved 90% of forward frames decoded, fresh budget.
+	auto prime_healthy_cfg16 = [&]() {
+		current_configuration          = CONFIG_16;
+		link_status                    = CONNECTED;
+		turboshift_phase               = TURBO_DONE;
+		gear_shift_on                  = YES;
+		recent_forward_decode_frac     = 0.90;   // D-a: forward healthy (>= 0.50)
+		cheap_ack_retries_used         = 0;      // D-b: fresh budget
+		emergency_nack_count           = 0;
+		emergency_break_active         = 0;
+		breaks_since_last_data_success = 0;
+		anchor_consec_break_fails      = 0;
+		cfg16_revack_starve_fails      = 0;
+	};
+
+	// ===============================================================
+	// T1 — TRANSIENT MISS ON A HEALTHY CFG16 CHANNEL (the bug).
+	// The discriminator must ARM (cheap-retry), so the miss is absorbed WITHOUT
+	// advancing emergency_nack_count toward the BREAK threshold, WITHOUT touching the
+	// panic accelerant, and WITHOUT changing config (stays CFG16). FAIL-BEFORE: the
+	// helper returns false => the miss falls through, emergency_nack_count climbs to
+	// threshold, the BREAK fires (emergency_break_active=1) and config demotes => FAIL.
+	// ===============================================================
+	prime_healthy_cfg16();
+	// Replay CHEAP_RETRY_BUDGET consecutive transient misses. On each, the production
+	// block: if allow_cheap_retry -> ++cheap_ack_retries_used + RETURN (no nack++, no
+	// panic, no config change). Model EXACTLY that here.
+	bool t1_all_held = true;
+	for(int m=0; m<CHEAP_RETRY_BUDGET; m++)
+	{
+		if(allow(/*enabled=*/true))
+		{
+			cheap_ack_retries_used++;   // the ONLY mutation the cheap-retry path makes
+			// emergency_nack_count / panic / anchor / config are NOT touched (the return).
+		}
+		else
+		{
+			// The pre-fix / FAIL-BEFORE path: this miss advances toward BREAK.
+			emergency_nack_count++;
+			if(emergency_nack_count >= emergency_nack_threshold)
+			{
+				emergency_break_active = 1;                 // BREAK fired
+				current_configuration  = config_ladder_down(current_configuration, robust_enabled);
+			}
+			t1_all_held = false;
+		}
+	}
+	check(t1_all_held && emergency_break_active == 0,
+		"T1 transient miss on healthy CFG16: NO BREAK fired (cheap-retry absorbed it)",
+		emergency_break_active, 0);
+	check(current_configuration == CONFIG_16,
+		"T1b stays at CFG16 (NO config change — both ends hold CFG16, safer than a demote)",
+		current_configuration, CONFIG_16);
+	check(emergency_nack_count == 0,
+		"T1c emergency_nack_count NOT advanced toward BREAK threshold on the absorbed miss",
+		emergency_nack_count, 0);
+	check(breaks_since_last_data_success == 0 && anchor_consec_break_fails == 0,
+		"T1d panic accelerant + anchor-demote streak NOT advanced (no spurious panic)",
+		breaks_since_last_data_success + anchor_consec_break_fails, 0);
+	check(cheap_ack_retries_used == CHEAP_RETRY_BUDGET,
+		"T1e the budget recorded exactly CHEAP_RETRY_BUDGET cheap re-listens",
+		cheap_ack_retries_used, CHEAP_RETRY_BUDGET);
+
+	// ===============================================================
+	// T2 — GENUINE LOSS MUST STILL DEMOTE (the SAFETY case, no-regression).
+	// Identical priming EXCEPT recent_forward_decode_frac=0.0 (silent line — no recent
+	// SACK_RSP proved forward decode). The discriminator must be FALSE from the FIRST
+	// miss (forward unhealthy), so the EXISTING BREAK path fires at the SAME threshold
+	// it does today. Asserted on BOTH builds (the helper is false here either way).
+	// ===============================================================
+	prime_healthy_cfg16();
+	recent_forward_decode_frac = 0.0;     // genuine forward collapse: NO decode proof
+	check(allow(/*enabled=*/true) == false,
+		"T2 genuine loss (fwd_frac=0.0): discriminator FALSE from miss #1 (cheap-retry never arms)",
+		allow(true) ? 1 : 0, 0);
+	// Drive the REAL miss-eval increment chain — with the cheap-retry never arming, this
+	// is byte-identical to the pre-fix path: emergency_nack_count climbs to threshold and
+	// the BREAK fires.
+	for(int m=0; m<emergency_nack_threshold; m++)
+	{
+		if(allow(/*enabled=*/true)) { cheap_ack_retries_used++; continue; }
+		emergency_nack_count++;
+	}
+	bool t2_break_armed = (emergency_nack_count >= emergency_nack_threshold)
+		&& !config_is_at_bottom(current_configuration, robust_enabled)
+		&& !emergency_break_active
+		&& turboshift_phase == TURBO_DONE
+		&& gear_shift_on == YES;
+	check(t2_break_armed,
+		"T2b BREAK fires at the SAME threshold on genuine loss (genuine-loss recovery PRESERVED)",
+		emergency_nack_count, emergency_nack_threshold);
+
+	// ===============================================================
+	// T3 — DEEP-SNR ANTI-THRASH INTACT (the SAFETY case, Part-E interaction).
+	// A genuine deep-SNR cliff is forward-UNHEALTHY (no recent SACK_RSP => frac low),
+	// so the cheap-retry NEVER suppresses the BREAK there, and the K-consecutive
+	// anchor-rung BREAK escape (anchor_demote_target — the SAME pure helper production
+	// calls at the BREAK block) still reaches ANCHOR_DEMOTE_BREAK_FAILS and demotes the
+	// anchor. The discriminator's NEGATIVE branch is what protects Part E.
+	// ===============================================================
+	last_data_viable_config        = CONFIG_0;   // the anchor rung (deep-SNR)
+	current_configuration          = CONFIG_0;   // AT the anchor rung
+	recent_forward_decode_frac     = 0.0;        // deep-SNR: forward NOT decoding
+	cheap_ack_retries_used         = 0;
+	anchor_consec_break_fails      = 0;
+	breaks_since_last_data_success = 0;
+	// At CONFIG_0 the cheap-retry is out of scope (CFG16-only) AND forward-unhealthy —
+	// doubly false. Confirm it cannot suppress the deep-SNR BREAK.
+	check(allow(/*enabled=*/true) == false,
+		"T3 deep-SNR cliff (CONFIG_0, fwd_frac=0.0): cheap-retry FALSE (cannot suppress the BREAK)",
+		allow(true) ? 1 : 0, 0);
+	// Replay the REAL anchor-rung BREAK-fire demotion (the same expression as the BREAK
+	// block + test_climb_engine Part E). K consecutive anchor-rung BREAKs must demote.
+	auto break_fire_at_anchor = [&]() -> bool {
+		bool demoted_now = false;
+		if(current_configuration == last_data_viable_config)
+		{
+			anchor_consec_break_fails++;
+			int demoted = anchor_demote_target(last_data_viable_config,
+				anchor_consec_break_fails, robust_enabled);
+			if(anchor_consec_break_fails >= ANCHOR_DEMOTE_BREAK_FAILS)
+			{
+				if(demoted != last_data_viable_config)
+				{
+					last_data_viable_config = demoted;
+					demoted_now = true;
+				}
+				anchor_consec_break_fails = 0;
+			}
+		}
+		return demoted_now;
+	};
+	bool t3_d1 = break_fire_at_anchor();   // 1/K
+	bool t3_d2 = break_fire_at_anchor();   // 2/K
+	bool t3_d3 = break_fire_at_anchor();   // K/K -> demote
+	check(!t3_d1 && !t3_d2 && t3_d3,
+		"T3b K-th consecutive anchor-rung BREAK DEMOTES the anchor (deep-SNR escape intact)",
+		t3_d3 ? 1 : 0, 1);
+	check(config_ladder_index(last_data_viable_config) < config_ladder_index(CONFIG_0),
+		"T3c the demoted anchor is strictly below CONFIG_0 (the thrash escape fires)",
+		config_ladder_index(last_data_viable_config), config_ladder_index(CONFIG_0));
+
+	// ===============================================================
+	// T4 — BUDGET BOUND (a healthy-but-ACK-deaf reverse path is FINITE).
+	// Forward stays healthy (frac=0.9) but the reverse ACK never lands. After
+	// CHEAP_RETRY_BUDGET cheap-retries the discriminator goes FALSE (retries_used >=
+	// budget) so the BREAK/D3 demote eventually runs — no infinite re-listen.
+	// FAIL-BEFORE: the helper is always false, so cheap_ack_retries_used never climbs;
+	// the test still asserts the post-budget gate is false (true on both builds), but
+	// the "armed for exactly budget then stops" shape is the PASS-AFTER signature.
+	// ===============================================================
+	prime_healthy_cfg16();
+	int t4_armed = 0;
+	for(int m=0; m<CHEAP_RETRY_BUDGET + emergency_nack_threshold; m++)
+	{
+		if(allow(/*enabled=*/true)) { cheap_ack_retries_used++; t4_armed++; continue; }
+		emergency_nack_count++;   // post-budget: falls through to the BREAK chain
+	}
+	check(t4_armed == CHEAP_RETRY_BUDGET,
+		"T4 cheap-retry armed for EXACTLY CHEAP_RETRY_BUDGET turnarounds then stopped (bounded)",
+		t4_armed, CHEAP_RETRY_BUDGET);
+	check(allow(/*enabled=*/true) == false,
+		"T4b after the budget the discriminator is FALSE even with fwd_frac healthy (finite re-listen)",
+		allow(true) ? 1 : 0, 0);
+	check(emergency_nack_count >= emergency_nack_threshold,
+		"T4c post-budget misses fall through and reach the BREAK threshold (the demote is reached)",
+		emergency_nack_count >= emergency_nack_threshold ? 1 : 0, 1);
+
+	// ===============================================================
+	// T5 — BYTE-IDENTICAL DEFAULT-OFF (the SAFETY case).
+	// With the env gate UNSET (cheap_retry_enabled=false) the discriminator returns
+	// FALSE for the EXACT T1-healthy inputs that armed it above => the miss path is
+	// identical to the pre-fix BREAK path (no behavior change with the env off).
+	// ===============================================================
+	prime_healthy_cfg16();   // the inputs that ARM the cheap-retry when enabled
+	check(allow(/*enabled=*/true) == true,
+		"T5 sanity: the healthy inputs DO arm the cheap-retry when the env gate is ON",
+		allow(true) ? 1 : 0, 1);
+	check(allow(/*enabled=*/false) == false,
+		"T5b env gate OFF (default): discriminator FALSE on the SAME inputs => byte-identical baseline",
+		allow(false) ? 1 : 0, 0);
+
+	printf("[TEST-CHEAP-ACK] DONE: %d failures\n", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }
