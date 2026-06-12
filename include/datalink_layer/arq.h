@@ -33,6 +33,7 @@
 #include "physical_layer/telecom_system.h"
 #include "datalink_config.h"
 #include "datalink_defines.h"
+#include "se_reclaim_gate.h"   // SE-RECLAIM forward-link gate (data-flow-se-reclaim.md §3)
 #include "common/common_defines.h"
 #include "audioio/audioio.h"
 #include "compression/mercury_compress.h"
@@ -2345,6 +2346,18 @@ public:
   // Swapped in lockstep with the config pair on role-reversal (§7 H5).
   int forward_grid;   // GRID_FULL/GRID_RECLAIM for the Commander->Responder direction
   int reverse_grid;   // GRID_FULL/GRID_RECLAIM for the Responder->Commander direction
+
+  // SE-RECLAIM forward-link gate (data-flow-se-reclaim.md §3). DEFAULT-OFF
+  // feature flag (se_reclaim_gate_enabled=false) so production behavior is
+  // unchanged until the bench A/B confirms gate reliability (Stage 6 held). When
+  // enabled, the gate's election drives forward_grid ONLY at a SET_CONFIG/batch
+  // boundary; default-safe FULL, slow-promote (confirm-N) / instant-demote.
+  bool se_reclaim_gate_enabled;     // default false (set via env MERCURY_SE_RECLAIM_GATE=1)
+  cl_se_reclaim_gate se_reclaim_gate;
+  // Helper: run one forward measurement through the gate and (if enabled) elect
+  // forward_grid for the NEXT SET_CONFIG. Returns the elected grid. Pure wrt
+  // production state except forward_grid. fwd_fer<0 / a no-progress tick demotes.
+  int se_reclaim_gate_update(double fwd_selectivity, double fwd_snr_db, int fwd_fer);
 
   int gear_shift_on;
   int robust_enabled;

@@ -5188,6 +5188,18 @@ void cl_arq_controller::finalize_block_commander()
 		double cs_sel = telecom_system->get_channel_selectivity();
 		bool snr_real = (cs_snr != -99.0);
 		bool sel_real = (cs_sel != -1.0);
+
+		// SE-RECLAIM gate-feed hook (data-flow-se-reclaim.md §3, audit INV-4):
+		// the gate MUST be fed the RSP-reported FORWARD selectivity/SNR/FER, NOT
+		// these CMD-side values — cs_sel here is the CMD's REVERSE link (the CMD
+		// receives MFSK ACKs, not OFDM data), so feeding it would mis-elect. The
+		// correct forward signal arrives on the ACK suffix, which is the HELD
+		// Stage-6 wiring (gated behind se_reclaim_gate_enabled, default-OFF). Until
+		// then the gate is dormant and forward_grid stays GRID_FULL (byte-identical).
+		// se_reclaim_gate_update(forward_selectivity, forward_snr, forward_fer) is
+		// the entry point; it is unit-proven via --test-se-reclaim (Stage 3) and is
+		// deliberately NOT called from this reverse-link observation point.
+
 		if(snr_real || sel_real)
 		{
 			printf("[CHANNEL-STATE] snr_proxy=%+6.1f selectivity=%5.3f cfg=%d\n",

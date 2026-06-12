@@ -514,6 +514,14 @@ cl_arq_controller::cl_arq_controller()
 	// SE-RECLAIM: default-safe FULL grid both directions (data-flow-se-reclaim.md §4).
 	forward_grid=GRID_FULL;
 	reverse_grid=GRID_FULL;
+	// SE-RECLAIM gate DEFAULT-OFF (§3): production behavior unchanged until the
+	// bench A/B (Stage 6). MERCURY_SE_RECLAIM_GATE=1 arms it for the A/B only.
+	se_reclaim_gate_enabled=false;
+	{
+		const char* g = std::getenv("MERCURY_SE_RECLAIM_GATE");
+		if(g && *g && atoi(g) != 0) se_reclaim_gate_enabled=true;
+	}
+	se_reclaim_gate.reset();
 
 	gear_shift_on=NO;
 	robust_enabled=NO;
@@ -1656,6 +1664,38 @@ int cl_arq_controller::get_configuration(double SNR)
 	int configuration;
 	configuration =telecom_system->get_configuration(SNR);
 	return configuration;
+}
+
+// SE-RECLAIM forward-link gate driver (data-flow-se-reclaim.md §3). Feeds one
+// RSP-measured FORWARD (fwd_selectivity, fwd_snr_db, fwd_fer) through the gate
+// and, IFF the default-OFF flag is enabled AND the forward config is CONFIG_15
+// (the only rung that materializes RECLAIM), elects forward_grid for the NEXT
+// SET_CONFIG. fwd_fer<0 means a no-progress / silent-link tick (decode-
+// independent demote). When the flag is off this is a strict no-op on
+// forward_grid (it stays GRID_FULL) => production behavior unchanged.
+int cl_arq_controller::se_reclaim_gate_update(double fwd_selectivity, double fwd_snr_db, int fwd_fer)
+{
+	se_grid_t g;
+	if(fwd_fer < 0)
+		g = se_reclaim_gate.no_progress_tick();   // decode-independent fail-safe
+	else
+		g = se_reclaim_gate.update(fwd_selectivity, fwd_snr_db, fwd_fer);
+
+	if(!se_reclaim_gate_enabled)
+	{
+		// Default-OFF: the gate still TRACKS (so --test can observe it) but never
+		// drives the wire. forward_grid stays at its current value (GRID_FULL).
+		return forward_grid;
+	}
+
+	// Election only applies when the forward rung is CONFIG_15; every other rung
+	// has no RECLAIM grid, so force FULL there (robustness: never elect RECLAIM
+	// on a config that cannot materialize it).
+	if(forward_configuration == CONFIG_15 || negotiated_configuration == CONFIG_15)
+		forward_grid = (int)g;
+	else
+		forward_grid = GRID_FULL;
+	return forward_grid;
 }
 
 void cl_arq_controller::load_configuration(int configuration, int level, int backup_configuration)
