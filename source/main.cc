@@ -758,6 +758,7 @@ int main(int argc, char *argv[])
                                         // a real compressible payload; asserts >0 application bytes are staged. FAILS on
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
+    bool test_forgiving_ack_cli = false; // --test-forgiving-ack: Tier-1 decouple state-machine regression (data-flow-forgiving-ack.md §6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
@@ -1363,6 +1364,18 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
             // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
             test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-forgiving-ack") == 0)
+        {
+            // FORGIVING-ACK Tier-1 decouple regression (feat/forgiving-ack-tier1,
+            // failing-first). Drives the -g-ON state machine through a forward-healthy
+            // reverse-ACK miss (counter HELD vs sails-to-BREAK), a genuine link death
+            // (still BREAKs), and the consecutive-forgiven bound (escalates). Replays
+            // the PURE forgiving_ack_should_decouple() helper directly. See
+            // fact-documents/data-flow-forgiving-ack.md §6.
+            test_forgiving_ack_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2699,6 +2712,19 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_retx_clear_on_recovery();
             printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_forgiving_ack_cli) {
+            // FORGIVING-ACK Tier-1 decouple regression (one-shot, then exit rc).
+            // Drives the -g-ON failure taxonomy: forward-healthy miss HELD vs
+            // sails-to-BREAK, genuine death still BREAKs, the consec-forgiven bound
+            // escalates. See fact-documents/data-flow-forgiving-ack.md §6.
+            printf("[FLAG] --test-forgiving-ack: invoking Tier-1 forgiving-ACK "
+                   "decouple regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_forgiving_ack();
+            printf("[FLAG] Forgiving-ACK test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

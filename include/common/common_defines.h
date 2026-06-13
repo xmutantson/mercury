@@ -558,6 +558,76 @@ static const int ROBUST_ACK_DRIFT_MARGIN_MS = 600;
 // gate on the disjunct (this constant only sizes the OFDM arm). TUNABLE.
 static const int BATCH_MAY_BE_PARTIAL_THRESHOLD = 2;
 
+// ===========================================================================
+// FORGIVING-ACK (Tier 1 — fact-documents/data-flow-forgiving-ack.md)
+// ===========================================================================
+// The turnaround-cascade ROOT FIX (judge verdict 2026-06-13): a FORWARD-HEALTHY
+// reverse-ACK miss must NOT feed emergency_nack_count -> BREAK -> ROBUST_0. The
+// gap from the ~0.69 structural active-fraction ceiling to the measured
+// 0.08-0.26 is a SINGLE mechanism: ONE dropped forward-healthy reverse-ACK
+// detonates a 100-365 s BREAK->ROBUST_0 robust crawl (ARQ_TIME_BUDGET_AUDIT
+// §5/§8.3). This makes such a miss CHEAP (one same-gear re-air), so the
+// reverse-ACK is no longer load-bearing.
+//
+// THE DISCRIMINATOR (Stage 0): the CMD does NOT see the RSP's forward-decode
+// count (batch_rx_frame_count is RSP-side / wrong-side, and the would-be signal
+// recent_forward_decode_frac DOES NOT EXIST). We derive a CMD-side per-batch
+// forward-health latch from what the CMD ACTUALLY knows at the reverse-ACK-
+// decision point:
+//   (FH-1) the forward link reached a SUSTAINABLY-HEALTHY OFDM rung:
+//          is_ofdm_config(last_data_viable_config). last_data_viable_config is
+//          raised ONLY after the SUSTAINED-ANCHOR gate (OFDM N=2 consecutive
+//          CLEAN batches, arq_commander.cc:4266 via data_anchor_raise_target) —
+//          the SAME persistent forward-health signal FIX-9 D3 already trusts
+//          (arq_commander.cc:3890). A partial / single retransmit-rescued batch
+//          never raises it. This separates "ACK missed but link alive" from a
+//          deep-SNR collapse (anchor robust -> FH-1 false -> still BREAK).
+//   (FH-2) the link is CONNECTED (link_status == CONNECTED).
+//   (FH-3) turbo is DONE (turboshift_phase == TURBO_DONE) — not mid-handshake.
+//   (FH-4) the forgiven-bound is not exhausted: consec_forgiven <
+//          FORGIVING_ACK_MAX_CONSEC. This is the LIFE-CRITICAL inverse-cascade
+//          safety: a forward channel that DEGRADES from healthy to dead AFTER
+//          the anchor was set cannot wedge the link forever re-airing into a
+//          dead link — it BREAKs within FORGIVING_ACK_MAX_CONSEC batches.
+//
+// SAFETY (do NOT disable the net): when ANY of FH-1..FH-4 is false the helper
+// returns false and control falls through to the EXISTING emergency_nack_count++
+// / BREAK path unchanged. A genuine link death (forward also dead, link lost,
+// or sustained misses with no success) STILL BREAKs -> ROBUST_0.
+//
+// PURE; --test-forgiving-ack replays it directly. FAIL-BEFORE
+// (-DFORGIVING_ACK_FAILBEFORE): always false -> the forward-healthy miss feeds
+// emergency_nack_count, which sails to the BREAK threshold (the demote fires).
+inline bool forgiving_ack_should_decouple(bool forward_anchor_ofdm,
+		bool link_connected, bool turbo_done,
+		int consec_forgiven, int max_consec_forgiven) {
+#ifdef FORGIVING_ACK_FAILBEFORE
+	(void)forward_anchor_ofdm; (void)link_connected; (void)turbo_done;
+	(void)consec_forgiven; (void)max_consec_forgiven;
+	return false;   // FAIL-BEFORE stub: the forward-healthy miss is NOT forgiven
+	                // -> emergency_nack_count++ -> sails to the BREAK threshold.
+#else
+	if (!forward_anchor_ofdm) return false;  // (FH-1) anchor not sustainably-OFDM-healthy
+	                                         //        (deep-SNR collapse) -> existing BREAK.
+	if (!link_connected)      return false;  // (FH-2) link down -> existing recovery.
+	if (!turbo_done)          return false;  // (FH-3) mid-handshake -> existing path.
+	if (consec_forgiven >= max_consec_forgiven) return false;  // (FH-4) bound exhausted ->
+	                                         //        STOP forgiving, fall through to BREAK
+	                                         //        (inverse-cascade safety).
+	return true;   // forward-healthy reverse-ACK miss -> decouple: cheap same-gear re-air.
+#endif
+}
+
+// FORGIVING-ACK bound: max consecutive forward-healthy reverse-ACK misses the
+// fix will forgive (re-air same-gear) with NO landed data-ACK between, before it
+// stops forgiving and lets the existing BREAK->ROBUST_0 escalation run. Reset to
+// 0 on ANY data-ACK (clean OR partial — the reverse channel landed) and on any
+// demote / session reset. The inverse-cascade safety bound (INV-FA-2): a link
+// that goes dead AFTER the anchor was healthy BREAKs within this many batches.
+// TUNABLE; =8 (an 8-batch re-air burst is ~cheap relative to one 100-365 s
+// cascade, while bounding the worst-case wedge to a handful of same-gear airings).
+static const int FORGIVING_ACK_MAX_CONSEC = 8;
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

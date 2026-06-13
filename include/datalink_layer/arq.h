@@ -1477,6 +1477,16 @@ public:
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
 
+  // FORGIVING-ACK Tier-1 decouple regression (--test-forgiving-ack). Drives the
+  // -g-ON failure taxonomy: (1) a forward-healthy reverse-ACK miss keeps
+  // emergency_nack_count at 0 (fail-before: it sails to the BREAK threshold);
+  // (2) a genuine link death STILL escalates to BREAK with the fix on; (3) the
+  // consecutive-forgiven bound escalates after FORGIVING_ACK_MAX_CONSEC; (4) a
+  // data-ACK resets the forgiven streak. Replays the PURE
+  // forgiving_ack_should_decouple() helper + the integrated counter loop.
+  // Returns 0 on pass, 1 on fail. See fact-documents/data-flow-forgiving-ack.md §6.
+  int test_forgiving_ack();
+
   // ROBUST_0 + streaming-compression deadlock regression
   // (data-flow-compress-frame-fill.md). Drives the REAL
   // process_buffer_data_commander() data-fill path at ROBUST_0 frame
@@ -3184,6 +3194,17 @@ public:
   // across cycles (the field's role generalizes from "carve-dead" to "CFG16-not-viable-on-this-
   // channel"; both arm sites mean the same thing to every cooldown consumer). See FIX9_D3_AUDIT.md.
   int cfg16_revack_starve_fails{0};
+  // FORGIVING-ACK (Tier 1 — fact-documents/data-flow-forgiving-ack.md §1/§2):
+  // consecutive FORWARD-HEALTHY reverse-ACK misses the fix FORGAVE (re-aired
+  // same-gear) with NO landed data-ACK between. CMD-ONLY (never on the wire).
+  // Producer-INCREMENT: the forgiving-ack branch in process_messages_commander()
+  // (just before emergency_nack_count++). Producer-RESET to 0: on ANY data-ACK
+  // (clean OR partial) at the success block, on the FRAME-UP / FIX-4 / FIX-9-D3
+  // demotes, and in ctor + reset_session_state. SOLE consumer:
+  // forgiving_ack_should_decouple()'s bound check (FORGIVING_ACK_MAX_CONSEC) —
+  // the inverse-cascade safety so the link cannot loop forever re-airing into a
+  // dead forward channel. Gated default-off by env MERCURY_FORGIVING_ACK.
+  int forgiving_ack_consec_forgiven{0};
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)

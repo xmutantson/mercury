@@ -3687,6 +3687,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				emergency_break_retries = 3;
 				emergency_nack_count = 0;
 				cfg16_revack_starve_fails = 0;  // WALL-B FIX-9 D3 (P4): demote off CFG16 -> streak fresh
+				forgiving_ack_consec_forgiven = 0;  // FORGIVING-ACK (P4 parity): demote -> streak fresh
 
 				// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
 				if(sack_v2_enabled)
@@ -3697,6 +3698,81 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				calculate_receiving_timeout();
 				receiving_timer.start();
 				return;
+			}
+
+			// ===========================================================================
+			// FORGIVING-ACK (Tier 1 — fact-documents/data-flow-forgiving-ack.md §5/§7)
+			// ===========================================================================
+			// THE TURNAROUND-CASCADE ROOT FIX. A FORWARD-HEALTHY reverse-ACK miss (the
+			// forward batch was decoding fine — the link is alive — but the reverse SACK
+			// came back pure-silent / not-matched) must NOT feed emergency_nack_count ->
+			// BREAK -> ROBUST_0. The gap from the ~0.69 structural active-fraction ceiling
+			// to the measured 0.08-0.26 is this ONE mechanism: one dropped forward-healthy
+			// reverse-ACK detonates a 100-365 s robust crawl (ARQ_TIME_BUDGET_AUDIT §5/§8.3).
+			// Here we make such a miss CHEAP: we DECOUPLE it from the demote by NOT
+			// advancing emergency_nack_count (nor cfg16_revack_starve_fails), so the BREAK
+			// gate (:4027) never trips and the EXISTING same-gear retransmit path re-airs the
+			// batch (we mark PENDING_ACK->ACK_TIMED_OUT below so the re-air is prompt on the
+			// non-pattern SACK path too). We do NOT touch break_drop_step, the panic counter,
+			// or the demote anchor.
+			//
+			// THE DISCRIMINATOR (Stage 0) is CMD-VISIBLE ONLY (the RSP's forward-decode
+			// count is the wrong side): (FH-1) is_ofdm_config(last_data_viable_config) — the
+			// forward link reached a SUSTAINABLY-HEALTHY OFDM rung (raised only after the
+			// SUSTAINED-ANCHOR gate, OFDM N=2 consecutive CLEAN batches at :4266; the SAME
+			// signal FIX-9 D3 trusts); (FH-2) link CONNECTED; (FH-3) turbo DONE; (FH-4) the
+			// forgiven-bound is not exhausted.
+			//
+			// LIFE-CRITICAL SAFETY (do NOT disable the net): a GENUINE link death (forward
+			// also dead -> anchor robust -> FH-1 false; link lost -> FH-2 false; mid-
+			// handshake -> FH-3 false) STILL takes the unchanged emergency_nack_count++ ->
+			// BREAK -> ROBUST_0 path. And even from a healthy anchor, after
+			// FORGIVING_ACK_MAX_CONSEC consecutive forgiven misses with NO landed data-ACK
+			// the bound (FH-4) trips and the existing BREAK escalation runs — so a link that
+			// DEGRADES from healthy to dead AFTER the anchor was set cannot wedge forever
+			// re-airing into a dead forward channel (the inverse-cascade safety, INV-FA-2).
+			//
+			// DEFAULT-OFF: env MERCURY_FORGIVING_ACK (unset => byte-identical to base; the
+			// guard short-circuits before any state read/write). FAIL-BEFORE proof:
+			// -DFORGIVING_ACK_FAILBEFORE makes forgiving_ack_should_decouple() return false
+			// -> the forward-healthy miss feeds emergency_nack_count -> sails to BREAK.
+			{
+				static const bool forgiving_ack_env =
+					(std::getenv("MERCURY_FORGIVING_ACK") != nullptr);
+				if(forgiving_ack_env
+				   && forgiving_ack_should_decouple(
+				          /*forward_anchor_ofdm=*/is_ofdm_config(last_data_viable_config),
+				          /*link_connected=*/(link_status == CONNECTED),
+				          /*turbo_done=*/(turboshift_phase == TURBO_DONE),
+				          forgiving_ack_consec_forgiven, FORGIVING_ACK_MAX_CONSEC))
+				{
+					forgiving_ack_consec_forgiven++;
+					printf("[FORGIVING-ACK] forward-healthy reverse-ACK miss at config %d "
+						"(anchor=%d OFDM-proven) — DECOUPLED from BREAK: same-gear re-air "
+						"(forgiven %d/%d, emergency_nack_count held at %d)\n",
+						current_configuration, last_data_viable_config,
+						forgiving_ack_consec_forgiven, FORGIVING_ACK_MAX_CONSEC,
+						emergency_nack_count);
+					fflush(stdout);
+					// Make the same-gear re-air prompt on BOTH reverse-ACK PHY paths: the
+					// pattern-ACK path already forced PENDING_ACK->ACK_TIMED_OUT (:3566); do
+					// the same here so the non-pattern SACK path re-airs immediately instead
+					// of waiting each frame's individual ack_timeout (~13 s). This is the
+					// SAME marking the pattern path uses; it does not advance any counter.
+					for(int i=0; i<nMessages; i++)
+					{
+						if(messages_tx[i].status == PENDING_ACK)
+							messages_tx[i].status = ACK_TIMED_OUT;
+					}
+					// Decouple complete: skip emergency_nack_count++ / cfg16_revack_starve_fails++
+					// / the FIX-4 / FIX-9-D3 / BREAK blocks for THIS turnaround. Fall through to
+					// the normal non-break tail (connection_status=TRANSMITTING_DATA) which
+					// re-airs the pending batch at the SAME gear. The optimizer already recorded
+					// this as a failed (zero-byte) batch (:3612) and drained its cooldown (:3620),
+					// so the throughput layer still sees the lost airtime — only the climb-engine
+					// demote is suppressed.
+					goto forgiving_ack_skip_break;
+				}
 			}
 
 			// Count toward emergency BREAK. Batch halving doesn't bypass this.
@@ -3840,6 +3916,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// per-frame failure re-accumulates from 1 (and we do NOT fall through to
 					// the BREAK gate below).
 					emergency_nack_count = 0;
+					forgiving_ack_consec_forgiven = 0;  // FORGIVING-ACK parity: config MOVE -> streak fresh
 
 					// SACK Design A Step 12 — BREAK supremacy hook (a config MOVE; mirrors the
 					// BREAK paths). Keeps the optimizer Axis-1 cooldown coherent across the
@@ -4005,6 +4082,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// BREAK gate below). Mirrors the FIX-4 emergency_nack_count=0.
 					cfg16_revack_starve_fails = 0;
 					emergency_nack_count = 0;
+					forgiving_ack_consec_forgiven = 0;  // FORGIVING-ACK parity: config MOVE -> streak fresh
 
 					// SACK Design A Step 12 — BREAK supremacy hook (a config MOVE; mirrors the BREAK
 					// paths + FIX-4). Keeps the optimizer Axis-1 cooldown coherent across the path
@@ -4131,6 +4209,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				receiving_timer.start();
 				return;
 			}
+
+			// FORGIVING-ACK (Tier 1): a forward-healthy reverse-ACK miss jumps here,
+			// skipping emergency_nack_count++ / cfg16_revack_starve_fails++ / FIX-4 /
+			// FIX-9-D3 / the BREAK gate for THIS turnaround. Control falls out of the
+			// data_ack_received==NO block to the common non-break tail
+			// (connection_status=TRANSMITTING_DATA) which re-airs the pending batch at
+			// the SAME gear. (Label at the block top-level, after all inner { } scopes
+			// have closed, so the goto crosses no in-scope initialization.)
+			forgiving_ack_skip_break: ;
 		}
 		else
 		{
@@ -4138,6 +4225,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
+
+			// FORGIVING-ACK (Tier 1 — fact-documents/data-flow-forgiving-ack.md §1):
+			// ANY data-ACK (clean OR partial) proves the reverse channel LANDED, so the
+			// forgiven-miss streak resets UNGATED — symmetric with emergency_nack_count
+			// and cfg16_revack_starve_fails. This makes the FORGIVING_ACK_MAX_CONSEC
+			// bound per-STALL, not cumulative: a turnaround that lands clears the budget
+			// so a later miss is forgiven fresh.
+			forgiving_ack_consec_forgiven = 0;
 
 			// WALL-B FIX-9 D3 (producer P3): ANY data-ACK (clean OR partial) proves the reverse
 			// channel is NOT pure-silent, so the CFG16 reverse-ACK starvation streak resets UNGATED.
@@ -7558,6 +7653,226 @@ int cl_arq_controller::test_clean_batch_viability()
 // OFDM tier) still need hardware. Part (c) is the multi-rung assertion the old
 // tests LACKED — it drives the real anchor-advance gate + real +1 clamp + real
 // Axis-2 across multiple rungs, which is where the dormancy lived.
+// ============================================================================
+// FORGIVING-ACK Tier-1 decouple regression (--test-forgiving-ack).
+// fact-documents/data-flow-forgiving-ack.md §6. Each assertion is fail-before
+// (-DFORGIVING_ACK_FAILBEFORE makes forgiving_ack_should_decouple() return false)
+// / pass-after. Returns 0 on pass, 1 on fail.
+//
+// The integrated loop FAITHFULLY mirrors the production decision at the
+// emergency_nack_count++ site (arq_commander.cc, the forgiving-ack branch + the
+// BREAK gate): on each modeled reverse-ACK miss it calls the SAME pure helper
+// with the SAME CMD-visible arguments and mutates the SAME counters
+// (forgiving_ack_consec_forgiven / emergency_nack_count) under the SAME bound,
+// then checks the SAME BREAK predicate (emergency_nack_count >=
+// emergency_nack_threshold). The synthetic-fire member-state drive is the
+// established --test-climb-engine pattern.
+int cl_arq_controller::test_forgiving_ack()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-FORGIVING-ACK] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-FORGIVING-ACK] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Whether the fix is COMPILED-LIVE: under -DFORGIVING_ACK_FAILBEFORE the helper
+	// is the always-false stub, so the "forward-healthy" arms behave like the base
+	// (counter sails to BREAK). We assert the BASE/FAILBEFORE behavior in that mode
+	// and the FIXED behavior otherwise — so the SAME binary's test is a true
+	// fail-before/pass-after toggle.
+#ifdef FORGIVING_ACK_FAILBEFORE
+	const bool fix_live = false;
+#else
+	const bool fix_live = true;
+#endif
+
+	emergency_nack_threshold = 3;   // production default (arq_common.cc:640).
+
+	// --- Part P: PURE helper truth table (forgiving_ack_should_decouple) --------
+	// FH-1 anchor-OFDM, FH-2 link-connected, FH-3 turbo-done, FH-4 bound not hit.
+	{
+		bool d_healthy = forgiving_ack_should_decouple(
+			/*forward_anchor_ofdm=*/true, /*link_connected=*/true,
+			/*turbo_done=*/true, /*consec_forgiven=*/0, FORGIVING_ACK_MAX_CONSEC);
+		check(d_healthy == fix_live,
+			"P1 forward-healthy (OFDM anchor + connected + turbo-done + under-bound) DECOUPLES",
+			d_healthy ? 1 : 0, fix_live ? 1 : 0);
+
+		// FH-1 false: anchor NOT OFDM (deep-SNR collapse) -> NEVER decouple (genuine death).
+		bool d_robust = forgiving_ack_should_decouple(false, true, true, 0, FORGIVING_ACK_MAX_CONSEC);
+		check(d_robust == false,
+			"P2 anchor-robust (deep-SNR collapse) does NOT decouple -> existing BREAK (SAFETY)",
+			d_robust ? 1 : 0, 0);
+
+		// FH-2 false: link down -> NEVER decouple.
+		bool d_down = forgiving_ack_should_decouple(true, false, true, 0, FORGIVING_ACK_MAX_CONSEC);
+		check(d_down == false,
+			"P3 link-not-connected does NOT decouple -> existing recovery (SAFETY)",
+			d_down ? 1 : 0, 0);
+
+		// FH-3 false: mid-handshake -> NEVER decouple.
+		bool d_turbo = forgiving_ack_should_decouple(true, true, false, 0, FORGIVING_ACK_MAX_CONSEC);
+		check(d_turbo == false,
+			"P4 turbo-not-done (mid-handshake) does NOT decouple -> existing path (SAFETY)",
+			d_turbo ? 1 : 0, 0);
+
+		// FH-4 false: bound exhausted -> NEVER decouple (inverse-cascade safety).
+		bool d_bound = forgiving_ack_should_decouple(true, true, true,
+			FORGIVING_ACK_MAX_CONSEC, FORGIVING_ACK_MAX_CONSEC);
+		check(d_bound == false,
+			"P5 forgiven-bound exhausted does NOT decouple -> falls through to BREAK (SAFETY)",
+			d_bound ? 1 : 0, 0);
+	}
+
+	// Lambda that REPLAYS the production :3703 decision for ONE modeled miss with
+	// the given CMD-visible signals. Mutates emergency_nack_count /
+	// forgiving_ack_consec_forgiven EXACTLY as production does, and returns whether
+	// the BREAK gate would fire after this miss. The env gate is modeled as
+	// always-on here (the test exercises the FIX path; default-off byte-identity is
+	// proven separately by the --test-climb-engine md5 vs base).
+	auto model_one_miss = [&](bool anchor_ofdm, bool connected, bool turbo_done) -> bool {
+		if(forgiving_ack_should_decouple(anchor_ofdm, connected, turbo_done,
+		      forgiving_ack_consec_forgiven, FORGIVING_ACK_MAX_CONSEC))
+		{
+			forgiving_ack_consec_forgiven++;   // forgiven: same-gear re-air, no ++.
+			return false;                       // BREAK gate NOT reached this turnaround.
+		}
+		emergency_nack_count++;                 // NOT forgiven: counts toward BREAK.
+		// Production BREAK gate (the -g-ON + turbo-done + not-at-bottom guards are
+		// modeled true here; we assert on the counter threshold itself).
+		return (emergency_nack_count >= emergency_nack_threshold);
+	};
+
+	// --- Part A: a string of FORWARD-HEALTHY misses keeps the counter at 0 -------
+	// (the ROOT proof). FAIL-BEFORE: the stub does not decouple -> the counter
+	// SAILS toward / past the BREAK threshold (the design's "sails to #7"); a BREAK
+	// fires. PASS-AFTER: the counter stays 0, no BREAK across many misses.
+	{
+		emergency_nack_count = 0;
+		forgiving_ack_consec_forgiven = 0;
+		bool any_break = false;
+		int N = 7;   // the design's "sails to #7" — well past threshold=3.
+		// Cap drives at the bound so PASS-AFTER never trips the inverse-cascade
+		// safety inside this "all-healthy" arm (we test the bound separately in C).
+		if(N > FORGIVING_ACK_MAX_CONSEC) N = FORGIVING_ACK_MAX_CONSEC;
+		for(int k=0; k<N; k++)
+			if(model_one_miss(/*anchor_ofdm=*/true, /*connected=*/true, /*turbo_done=*/true))
+				any_break = true;
+
+		if(fix_live) {
+			check(emergency_nack_count == 0,
+				"A1 (PASS-AFTER) forward-healthy misses HOLD emergency_nack_count at 0",
+				emergency_nack_count, 0);
+			check(!any_break,
+				"A2 (PASS-AFTER) forward-healthy misses fire NO BREAK",
+				any_break ? 1 : 0, 0);
+			check(forgiving_ack_consec_forgiven == N,
+				"A3 (PASS-AFTER) every forward-healthy miss was FORGIVEN (re-aired same-gear)",
+				forgiving_ack_consec_forgiven, N);
+		} else {
+			check(emergency_nack_count >= emergency_nack_threshold,
+				"A1 (FAIL-BEFORE) forward-healthy miss SAILS emergency_nack_count to BREAK threshold",
+				emergency_nack_count, emergency_nack_threshold);
+			check(any_break,
+				"A2 (FAIL-BEFORE) forward-healthy miss FIRES BREAK (the demote)",
+				any_break ? 1 : 0, 1);
+		}
+	}
+
+	// --- Part B: SAFETY — a GENUINE link death STILL escalates to BREAK ----------
+	// (with the fix LIVE). Forward also dead (anchor robust) => the helper returns
+	// false even fix-live, so the counter ++s to threshold and BREAK fires.
+	{
+		emergency_nack_count = 0;
+		forgiving_ack_consec_forgiven = 0;
+		bool any_break = false;
+		for(int k=0; k<emergency_nack_threshold; k++)
+			if(model_one_miss(/*anchor_ofdm=*/false /*deep-SNR collapse*/,
+			      /*connected=*/true, /*turbo_done=*/true))
+				any_break = true;
+		check(emergency_nack_count == emergency_nack_threshold,
+			"B1 (SAFETY) genuine death (anchor robust) ++s emergency_nack_count to threshold",
+			emergency_nack_count, emergency_nack_threshold);
+		check(any_break,
+			"B2 (SAFETY) genuine death STILL fires BREAK with the fix on (net NOT disabled)",
+			any_break ? 1 : 0, 1);
+		check(forgiving_ack_consec_forgiven == 0,
+			"B3 (SAFETY) genuine death forgives NOTHING (forgiven streak stays 0)",
+			forgiving_ack_consec_forgiven, 0);
+	}
+
+	// --- Part C: SAFETY — the consecutive-forgiven BOUND escalates ---------------
+	// A forward channel that DEGRADES from healthy-anchor to dead AFTER the anchor
+	// was set: drive FORGIVING_ACK_MAX_CONSEC+ forward-healthy misses with NO
+	// success between. The first MAX are forgiven (counter 0); the (MAX+1)-th hits
+	// FH-4 -> NOT forgiven -> ++ -> escalation. Proves the link cannot loop forever
+	// re-airing into a dead forward channel (INV-FA-2 inverse-cascade safety).
+	if(fix_live) {
+		emergency_nack_count = 0;
+		forgiving_ack_consec_forgiven = 0;
+		// First MAX misses: all forgiven.
+		for(int k=0; k<FORGIVING_ACK_MAX_CONSEC; k++)
+			(void)model_one_miss(true, true, true);
+		check(forgiving_ack_consec_forgiven == FORGIVING_ACK_MAX_CONSEC,
+			"C1 first MAX forward-healthy misses all FORGIVEN (counter held)",
+			forgiving_ack_consec_forgiven, FORGIVING_ACK_MAX_CONSEC);
+		check(emergency_nack_count == 0,
+			"C2 emergency_nack_count still 0 at the bound (no demote yet)",
+			emergency_nack_count, 0);
+		// The (MAX+1)-th: bound exhausted -> NOT forgiven -> counter ++s.
+		(void)model_one_miss(true, true, true);
+		check(emergency_nack_count == 1,
+			"C3 (SAFETY) bound exhausted -> next miss ESCALATES (emergency_nack_count++)",
+			emergency_nack_count, 1);
+		// Continue past threshold -> BREAK eventually fires (link wedged-into-dead is escaped).
+		bool any_break = false;
+		for(int k=1; k<emergency_nack_threshold; k++)
+			if(model_one_miss(true, true, true))
+				any_break = true;
+		check(any_break,
+			"C4 (SAFETY) sustained post-bound misses fire BREAK (escape the dead-link wedge)",
+			any_break ? 1 : 0, 1);
+	} else {
+		printf("[TEST-FORGIVING-ACK] SKIP C (fix not compiled-live; bound is a FIX-only path)\n");
+		fflush(stdout);
+	}
+
+	// --- Part D: a data-ACK (clean OR partial) RESETS the forgiven streak --------
+	// (the bound is per-STALL, not cumulative). Forgive some, then model a success
+	// reset, then forgive again from a fresh budget.
+	if(fix_live) {
+		emergency_nack_count = 0;
+		forgiving_ack_consec_forgiven = 0;
+		for(int k=0; k<3; k++) (void)model_one_miss(true, true, true);
+		check(forgiving_ack_consec_forgiven == 3, "D1 forgave 3 misses",
+			forgiving_ack_consec_forgiven, 3);
+		// Model the success reset (production: data_ack_received==YES block).
+		emergency_nack_count = 0;
+		forgiving_ack_consec_forgiven = 0;
+		check(forgiving_ack_consec_forgiven == 0,
+			"D2 data-ACK RESETS the forgiven streak (bound is per-stall, not cumulative)",
+			forgiving_ack_consec_forgiven, 0);
+		// A later miss is forgiven fresh.
+		bool brk = model_one_miss(true, true, true);
+		check(forgiving_ack_consec_forgiven == 1 && !brk,
+			"D3 post-reset miss is FORGIVEN fresh (no carry-over toward the bound)",
+			forgiving_ack_consec_forgiven, 1);
+	} else {
+		printf("[TEST-FORGIVING-ACK] SKIP D (fix not compiled-live; reset is a FIX-only path)\n");
+		fflush(stdout);
+	}
+
+	printf("[TEST-FORGIVING-ACK] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 int cl_arq_controller::test_climb_engine()
 {
 	int failed = 0;

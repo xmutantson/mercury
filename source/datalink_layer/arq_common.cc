@@ -835,6 +835,7 @@ cl_arq_controller::cl_arq_controller()
 	bigblock_carve_cooldown_batches=0;
 	bigblock_carve_cooldown_span=0;
 	cfg16_revack_starve_fails=0;   // WALL-B FIX-9 D3: fresh session never inherits a stale starve count
+	forgiving_ack_consec_forgiven=0;  // FORGIVING-ACK (Tier 1): fresh session never inherits a stale forgiven streak
 	break_recovery_phase=0;
 	break_recovery_retries=0;
 	ceiling_success_count=0;
@@ -3902,6 +3903,8 @@ void cl_arq_controller::reset_session_state()
 	bigblock_carve_cooldown_span = 0;
 	cfg16_revack_starve_fails = 0;   // WALL-B FIX-9 D3 (R3 parity): clear the CFG16 reverse-ACK
 	                                 // starvation streak on session reset / new CONNECT.
+	forgiving_ack_consec_forgiven = 0;  // FORGIVING-ACK (Tier 1, R3 parity): clear the forgiven
+	                                    // miss streak on session reset / new CONNECT.
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
 	ceiling_success_count = 0;
