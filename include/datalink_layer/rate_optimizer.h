@@ -83,12 +83,41 @@ public:
     //
     // Diag: emits one `[OPT-EVAL]` line per fire (including no-op
     // evaluations after the gate passes) for offline trace analysis.
+    //
+    // current_selectivity: the PHY channel-state metric
+    // last_channel_selectivity = std(|H[k]|)/mean(|H[k]|) over data subcarriers
+    // (cl_telecom_system::get_channel_selectivity()). Sentinel -1.0 = no
+    // estimate. FADED-LABEL CLASSIFIER (default-off, env MERCURY_FADED_LABEL):
+    // when the env is set AND current_selectivity >= the faded knee, the label
+    // classifier emits a faded label (mpg/mpm/mpp) instead of the nearest AWGN
+    // bucket, arming the optimizer to HOLD the coherent-QPSK tier (cfg9/cfg7) on
+    // a fade. DEFAULT -1.0 + env-unset => byte-identical AWGN-only behavior. See
+    // fact-documents/data-flow-faded-label-classifier.md.
     int evaluate(int current_cfg,
                  double current_eff_bps,
                  double current_sack_rate,
                  int window_count,
                  int config_ceiling,
-                 bool is_nb = false);
+                 bool is_nb = false,
+                 double current_selectivity = -1.0);
+
+    // True iff the faded-label classifier is armed (env MERCURY_FADED_LABEL set
+    // to a non-empty, non-"0" value). Read once + cached on first call. The
+    // controller (opt_evaluate_batch_end) consults this to decide whether to
+    // pass a real selectivity AND whether to apply the max_sack faded reconcile.
+    // DEFAULT-OFF: returns false unless the env is explicitly set.
+    bool faded_label_enabled() const;
+
+    // Classify a faded channel label {mpg, mpm, mpp} from the PHY selectivity
+    // (+ optional SNR proxy). Returns "" when the channel is NOT faded
+    // (selectivity below the knee, or sentinel) OR the classifier is disarmed.
+    // PUBLIC so the controller can use it for the max_sack reconcile decision
+    // (it must know "is this faded" to decide whether to let evaluate() run on a
+    // floored-fade sack). Thresholds are ENV-overridable (see .cc); the defaults
+    // are documented starting points (the sel>=0.15 estimator knee +
+    // HW-faded-bench bands), bench-tuned later — NOT a guessed cliff.
+    std::string classify_faded_label(double selectivity,
+                                     double snr_proxy = -99.0) const;
 
     // Drain the cooldown counter once per batch-end (regardless of whether
     // evaluate() ran or short-circuited). Cheap; no-op when counter is 0.
@@ -197,16 +226,44 @@ private:
     int    n_configs_loaded_nb;
     int    n_channels_loaded_nb;
 
+    // FADED-LABEL CLASSIFIER state (default-off). Read once + cached on the
+    // first faded_label_enabled() / classify_faded_label() call. -1 = not yet
+    // resolved. The env flag + thresholds are resolved together so the
+    // classifier is a pure function of (selectivity, snr_proxy) after init.
+    //   faded_enabled_cached : 0/1, env MERCURY_FADED_LABEL.
+    //   faded_sel_knee       : selectivity >= this => faded. Default 0.15 (the
+    //                          estimator's "selective channel" knee,
+    //                          telecom_system.cc:8338). Env MERCURY_FADED_SEL_KNEE.
+    //   faded_sel_mpm/mpp    : selectivity bands for fade DEPTH (mpg<mpm<mpp).
+    //                          Env MERCURY_FADED_SEL_MPM / _MPP. Defaults are
+    //                          documented starting points; bench-tuned later.
+    //   faded_snr_floor      : optional snr_proxy floor below which even a
+    //                          selective channel is treated as undecodable
+    //                          (return "" => AWGN/floor path). -1 disables.
+    //                          Env MERCURY_FADED_SNR_FLOOR.
+    mutable int    faded_enabled_cached;
+    mutable double faded_sel_knee;
+    mutable double faded_sel_mpm;
+    mutable double faded_sel_mpp;
+    mutable double faded_snr_floor;
+    void faded_resolve_env() const;  // idempotent lazy env read
+
     // Identify the channel label that best matches our current observations
     // AT THE CURRENT CONFIG. Returns the channel-label key (e.g. "wgn22")
     // for the cell in the table whose sack_rate_mean is closest to
     // current_sack_rate, with eff_bps_mean as a tiebreaker. Returns "" if
     // the table[current_cfg] row is empty (caller falls back to channel_axis).
     // is_nb selects WB (table) vs NB (table_nb).
+    // current_selectivity: PHY selectivity (sentinel -1.0). When the faded
+    // classifier is armed AND selectivity reports faded, this returns the faded
+    // label (mpg/mpm/mpp) — overriding the AWGN-bucket nearest-distance pick —
+    // so the optimizer consults the faded rows + HOLDs the QPSK tier. Default
+    // -1.0 + disarmed => unchanged AWGN-only nearest-bucket selection.
     std::string identify_channel_label(int current_cfg,
                                        double current_sack_rate,
                                        double current_eff_bps,
-                                       bool is_nb) const;
+                                       bool is_nb,
+                                       double current_selectivity = -1.0) const;
 
     // Look up cell. Returns NULL if missing. Caller checks valid flag.
     const st_rate_cell* get_cell(int cfg, const std::string& bucket,

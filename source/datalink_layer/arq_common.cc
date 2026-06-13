@@ -4145,14 +4145,55 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 	int    min_cfg  = rate_opt.min_calibrated_cfg(is_nb);
 	double max_sack = rate_opt.max_calibrated_sack_rate(is_nb);
 	if (min_cfg >= 0 && current_configuration < min_cfg) return false;
-	if (max_sack >= 0.0 && get_current_sack_rate() > max_sack) return false;
+
+	// FADED-LABEL CLASSIFIER (default-off, env MERCURY_FADED_LABEL). Read the
+	// PHY selectivity (std|H|/mean|H| over data subcarriers) so the optimizer's
+	// label classifier can emit a faded label and HOLD the coherent-QPSK tier.
+	// On a sack_v2 session (required above) the COMMANDER decodes the OFDM
+	// SACK_RSP control frame, so get_channel_selectivity() reflects the (reverse)
+	// channel — a valid forward-fade proxy on a symmetric HF fade. -1.0 sentinel
+	// when the env is unset OR telecom_system is not wired (test-mode pre-init)
+	// => the optimizer's faded branch is unreachable => byte-identical.
+	double cur_selectivity = -1.0;
+	const bool faded_armed = rate_opt.faded_label_enabled();
+	if (faded_armed && telecom_system != NULL)
+		cur_selectivity = telecom_system->get_channel_selectivity();
+
+	// max_sack RECONCILE (the §0 blocker-2 fix). A floored fade drives sack ->
+	// ~1.0 > max_sack, which today silences the optimizer BEFORE evaluate() so
+	// it never learns to HOLD. Under the env, if the channel CLASSIFIES as faded
+	// AND we are sitting on a coherent-QPSK tier gear, let evaluate() RUN so it
+	// can HOLD cfg9/7 (the candidate loop still refuses to climb to a floored
+	// QAM gear — its faded cells are invalid). We do NOT open the gate for:
+	//   - the env-unset/clean front (faded_armed false) => byte-identical;
+	//   - an AWGN-noise channel (high sack, low selectivity => classify_faded
+	//     returns "" ) => gate still trips, gearshift/BREAK owns it (duty i);
+	//   - a QAM gear on a fade (current cfg not in the QPSK tier) => still gated,
+	//     so a floored QAM gear's descent stays with gearshift, not the optimizer.
+	bool faded_hold_bypass = false;
+	if (faded_armed) {
+		const bool on_qpsk_tier =
+			(current_configuration == CONFIG_7 ||
+			 current_configuration == CONFIG_8 ||
+			 current_configuration == CONFIG_9);
+		const double snr_proxy = (telecom_system != NULL)
+			? telecom_system->get_correlator_snr_proxy() : -99.0;
+		if (on_qpsk_tier &&
+		    !rate_opt.classify_faded_label(cur_selectivity, snr_proxy).empty())
+			faded_hold_bypass = true;
+	}
+
+	if (max_sack >= 0.0 && get_current_sack_rate() > max_sack &&
+	    !faded_hold_bypass)
+		return false;
 
 	int target = rate_opt.evaluate(current_configuration,
 	                               get_current_effective_rate_bps(),
 	                               get_current_sack_rate(),
 	                               get_current_window_count(),
 	                               is_nb ? NB_CONFIG_MAX : WB_CONFIG_MAX,
-	                               is_nb);
+	                               is_nb,
+	                               cur_selectivity);
 
 	if (target == current_configuration) return false;
 	if (out_recommended_cfg) *out_recommended_cfg = target;

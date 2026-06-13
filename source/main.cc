@@ -524,6 +524,267 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// ============================================================================
+// --test-faded-label: FADED / SELECTIVITY CHANNEL-LABEL CLASSIFIER self-test.
+//
+// Proves the "needs-labeling" piece that lets the effective-rate optimizer HOLD
+// the coherent-QPSK tier (CONFIG_9/CONFIG_7) on a real fade instead of climbing
+// back to the floored 16/32-QAM gears. Two parts, both in-process (drives
+// cl_rate_optimizer directly — no ARQ/PHY/audio):
+//
+//   PART A — the CLASSIFIER (the new mechanism): classify_faded_label(sel) maps
+//   the PHY selectivity (std|H|/mean|H|) -> {mpg,mpm,mpp} or "" (not faded). A
+//   clean selectivity (< knee) must yield "" (no clean regression); selective
+//   bands must yield the right depth label.
+//
+//   PART B — the HOLD ELECTION (fail-before / pass-after): with the classifier
+//   ARMED (env MERCURY_FADED_LABEL) + a faded selectivity, the optimizer at
+//   cfg9 HOLDs cfg9 (does NOT climb to the floored QAM gears). FAIL-BEFORE
+//   (MERCURY_FADED_LABEL_FAILBEFORE=1, which forces the classifier disarmed):
+//   the SAME faded selectivity produces NO faded label -> the optimizer climbs
+//   back to a QAM gear (the bug). CLEAN: a clean selectivity -> QAM wins.
+//
+// Self-contained: writes a tiny HW-grounded faded table (the CCIR thresholds
+// from FADED_PARITY_VERDICT.json) to a temp file and loads it, so the test does
+// not depend on the env-gated coherent_faded vehicle (which lives on
+// feat/coherent-tier). See fact-documents/data-flow-faded-label-classifier.md.
+// ============================================================================
+
+// One cell JSON helper for the synthetic faded table.
+static std::string faded_cell(double eff, double sack, bool failed) {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "{\"eff_bps_mean\":%.1f,\"eff_bps_min\":%.1f,\"eff_bps_max\":%.1f,"
+        "\"eff_bps_sigma\":0.0,\"sack_rate_mean\":%.3f,\"batch_count_mean\":8.0,"
+        "\"frame_loss_pct\":%s,\"n_runs\":2,\"n_failed_runs\":%d,"
+        "\"failed\":%s,\"break_fired\":false}",
+        eff, eff, eff, sack, failed ? "100.0" : "0.0",
+        failed ? 2 : 0, failed ? "true" : "false");
+    return std::string(buf);
+}
+
+// Write the HW-grounded synthetic faded table. cfg7/9 carry the QPSK-tier fades
+// (cfg9 mpg@2250/mpp@3293, mpm FLOORS; cfg7 mpm@1274, mpg/mpp FAIL); cfg15/16
+// (QAM) FLOOR every fade. clean/wgn16 rows keep the QAM gears winning the clean
+// front. Returns the temp path (caller sets MERCURY_RATE_TABLE to it).
+static std::string write_faded_test_table() {
+    std::string path = "effective_rate_table.faded_test.json";
+    std::ofstream o(path.c_str());
+    o << "{\n  \"schema_version\":1,\n  \"synthetic\":true,\n"
+         "  \"note\":\"--test-faded-label synthetic HW-grounded faded table.\",\n"
+         "  \"table\":{\n";
+    // cfg : { clean, wgn16, mpg, mpm, mpp }
+    // Values: HW-measured CCIR thresholds (FADED_PARITY_VERDICT.json) for the
+    // faded rows; representative clean/wgn16 for the gear ladder.
+    struct Row { int cfg; double clean, wgn16; double mpg; bool mpg_f;
+                 double mpm; bool mpm_f; double mpp; bool mpp_f; };
+    Row rows[] = {
+        // cfg  clean   wgn16   mpg   mpg_f  mpm   mpm_f  mpp   mpp_f
+        {  7,    650,    650,    0,   true,  1274, false,   0,  true  }, // QPSK r5/16 deep: only MPM
+        {  9,   1094,    943,  2250, false,    0,  true, 3293, false  }, // QPSK r1/2: MPG+MPP, MPM floors
+        { 15,   3118,   1925,    0,   true,    0,  true,    0,  true  }, // 16-QAM: floors all fades
+        { 16,   3635,   2100,    0,   true,    0,  true,    0,  true  }, // 32-QAM: floors all fades
+    };
+    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); ++i) {
+        const Row& r = rows[i];
+        o << "    \"" << r.cfg << "\":{\n";
+        o << "      \"clean\":" << faded_cell(r.clean, 0.0, false) << ",\n";
+        o << "      \"wgn16\":" << faded_cell(r.wgn16, 0.10, false) << ",\n";
+        o << "      \"mpg\":"   << faded_cell(r.mpg, r.mpg_f?1.0:0.15, r.mpg_f) << ",\n";
+        o << "      \"mpm\":"   << faded_cell(r.mpm, r.mpm_f?1.0:0.20, r.mpm_f) << ",\n";
+        o << "      \"mpp\":"   << faded_cell(r.mpp, r.mpp_f?1.0:0.10, r.mpp_f) << "\n";
+        o << "    }" << (i + 1 < sizeof(rows)/sizeof(rows[0]) ? "," : "") << "\n";
+    }
+    o << "  }\n}\n";
+    o.close();
+    return path;
+}
+
+// Drive the optimizer to its first recommendation given (cfg, eff, sack, sel).
+// The label-hysteresis streak (LABEL_STREAK_REQUIRED) means the first few evals
+// only build the streak; loop until a change or a generous cap.
+static int faded_first_reco(cl_rate_optimizer& opt, int cfg,
+                            double eff, double sack, double sel) {
+    opt.reset_session_state();
+    for (int i = 0; i < 16; i++) {
+        int t = opt.evaluate(cfg, eff, sack, /*window*/20, /*ceiling*/16,
+                             /*nb*/false, sel);
+        if (t != cfg) return t;
+    }
+    return cfg;
+}
+
+static int run_faded_label_selftest() {
+    printf("[TEST-FADED-LABEL] faded/selectivity channel-label classifier self-test\n");
+
+    bool failbefore = false;
+    { const char* e = std::getenv("MERCURY_FADED_LABEL_FAILBEFORE");
+      failbefore = (e && e[0] && e[0] != '0'); }
+#ifdef FADED_LABEL_FAILBEFORE
+    failbefore = true;   // compile-time fail-before (CLAUDE.md fail-before/pass-after)
+#endif
+
+    // PROVE-FAIL mode (CLAUDE.md "a test that FAILS before the fix"): disarm the
+    // classifier BUT keep the PASS-AFTER (HOLD) assertions. Without the
+    // classifier the faded selectivity yields no faded label -> the optimizer
+    // climbs to QAM -> the HOLD assertions (reco==cfg9/cfg7) FAIL -> rc=1. This
+    // is the literal fail-before: run `MERCURY_FADED_LABEL_PROVEFAIL=1
+    // --test-faded-label` and observe rc=1 + FAILs; the plain pass-after run is
+    // rc=0. (The FAILBEFORE mode above instead asserts the bug manifests, which
+    // documents/pins the broken behavior; PROVEFAIL is the stricter rc-flip.)
+    bool provefail = false;
+    { const char* e = std::getenv("MERCURY_FADED_LABEL_PROVEFAIL");
+      provefail = (e && e[0] && e[0] != '0'); }
+
+    // ARM the classifier for pass-after; DISARM it for fail-before/prove-fail.
+    // We set the process env so faded_label_enabled() (cached on first use)
+    // resolves to the intended state. classify_faded_label() / evaluate() read
+    // this through the same gate the production path uses.
+    if (failbefore || provefail) {
+#if defined(_WIN32)
+        _putenv("MERCURY_FADED_LABEL=");          // empty => disarmed
+#else
+        unsetenv("MERCURY_FADED_LABEL");
+#endif
+        printf("[TEST-FADED-LABEL]   (%s active: classifier DISARMED — "
+               "a faded selectivity must NOT yield a faded label%s)\n",
+               provefail ? "PROVEFAIL" : "FAILBEFORE",
+               provefail ? "; HOLD assertions kept => expect rc=1" : "");
+    } else {
+#if defined(_WIN32)
+        _putenv("MERCURY_FADED_LABEL=1");
+#else
+        setenv("MERCURY_FADED_LABEL", "1", 1);
+#endif
+    }
+
+    // Faded selectivity samples per the depth bands (defaults: knee 0.15, mpm
+    // 0.30, mpp 0.50). A clean sample sits below the knee.
+    const double SEL_CLEAN = 0.05;   // < knee -> not faded
+    const double SEL_MPG   = 0.20;   // [knee,mpm) -> Good
+    const double SEL_MPM   = 0.38;   // [mpm,mpp)  -> Moderate
+    const double SEL_MPP   = 0.60;   // >= mpp     -> Poor
+
+    int fails = 0;
+    auto check = [&](const char* desc, bool ok, const char* got) {
+        printf("[TEST-FADED-LABEL]   %-52s %-6s -> %s\n",
+               desc, got, ok ? "OK" : "FAIL");
+        if (!ok) fails++;
+    };
+
+    // ---- PART A: the CLASSIFIER (selectivity -> label). Uses a throwaway
+    // optimizer instance (no table needed for the pure classifier). ----
+    cl_rate_optimizer clf;
+    {
+        std::string lc = clf.classify_faded_label(SEL_CLEAN);
+        std::string lg = clf.classify_faded_label(SEL_MPG);
+        std::string lm = clf.classify_faded_label(SEL_MPM);
+        std::string lp = clf.classify_faded_label(SEL_MPP);
+        std::string ls = clf.classify_faded_label(-1.0);   // sentinel
+        if (failbefore) {
+            // Disarmed: every selectivity must classify as "" (no faded label).
+            check("(A1) clean sel -> not faded (disarmed)", lc.empty(), lc.empty()?"\"\"":lc.c_str());
+            check("(A2) MPG sel  -> not faded (disarmed)",  lg.empty(), lg.empty()?"\"\"":lg.c_str());
+            check("(A3) MPM sel  -> not faded (disarmed)",  lm.empty(), lm.empty()?"\"\"":lm.c_str());
+            check("(A4) MPP sel  -> not faded (disarmed)",  lp.empty(), lp.empty()?"\"\"":lp.c_str());
+        } else {
+            check("(A1) clean sel -> \"\" (not faded, no clean regression)", lc.empty(), lc.empty()?"\"\"":lc.c_str());
+            check("(A2) MPG sel   -> mpg",  lg == "mpg", lg.empty()?"\"\"":lg.c_str());
+            check("(A3) MPM sel   -> mpm",  lm == "mpm", lm.empty()?"\"\"":lm.c_str());
+            check("(A4) MPP sel   -> mpp",  lp == "mpp", lp.empty()?"\"\"":lp.c_str());
+            check("(A5) sentinel  -> \"\" (no estimate)", ls.empty(), ls.empty()?"\"\"":ls.c_str());
+        }
+    }
+
+    // ---- PART B: the HOLD election (drives the optimizer against the
+    // HW-grounded faded table). ----
+    std::string tbl = write_faded_test_table();
+    cl_rate_optimizer opt;
+    if (!opt.load(tbl.c_str())) {
+        printf("[TEST-FADED-LABEL]   FAILED to load synthetic table %s\n", tbl.c_str());
+        return 1;
+    }
+
+    char gotbuf[16];
+    auto reco_check = [&](const char* desc, int got, bool want_hold_qpsk,
+                          int lo, int hi) {
+        // want_hold_qpsk=true : got must be a QPSK-tier gear in [lo,hi] (HOLD).
+        // want_hold_qpsk=false: got must be a QAM gear in [lo,hi] (climb/win).
+        bool ok = (got >= lo && got <= hi);
+        snprintf(gotbuf, sizeof(gotbuf), "reco=%d", got);
+        (void)want_hold_qpsk;
+        check(desc, ok, gotbuf);
+    };
+
+    // THE BUG the classifier fixes: on a fade, the (sack, eff) observation can
+    // look like an AWGN bucket — selectivity is the missing axis. So we feed an
+    // observation that on (sack, eff) ALONE matches the cfg's wgn16 row (sack
+    // 0.10, the wgn16 eff), paired with a faded SELECTIVITY. Disarmed, the
+    // distance classifier picks wgn16 -> the QAM gears' wgn16 cells are VALID ->
+    // the optimizer CLIMBS to a QAM gear (the misclassification bug). Armed, the
+    // selectivity forces the faded label -> the QAM gears' faded cells are
+    // INVALID -> the optimizer HOLDs the QPSK tier. This isolates the
+    // classifier: SAME table, SAME (sack,eff), ONLY selectivity + the env differ.
+    const double EFF_LOOKS_WGN16_CFG9 = 943.0;   // == cfg9 wgn16 cell
+    const double EFF_LOOKS_WGN16_CFG7 = 650.0;   // == cfg7 wgn16 cell
+    const double SACK_WGN16           = 0.10;
+
+    // (B1) cfg9, observation looks like wgn16, but selectivity = POOR fade.
+    {
+        int got = faded_first_reco(opt, 9, EFF_LOOKS_WGN16_CFG9, SACK_WGN16, SEL_MPP);
+        if (failbefore)
+            reco_check("(B1) cfg9 MPP-as-wgn16 (disarmed) -> climbs to QAM (bug)", got, false, 15, 16);
+        else
+            reco_check("(B1) cfg9 MPP sel -> HOLD cfg9 (no QAM on fade)", got, true, 9, 9);
+    }
+
+    // (B2) cfg9, observation looks like wgn16, but selectivity = GOOD fade.
+    {
+        int got = faded_first_reco(opt, 9, EFF_LOOKS_WGN16_CFG9, SACK_WGN16, SEL_MPG);
+        if (failbefore)
+            reco_check("(B2) cfg9 MPG-as-wgn16 (disarmed) -> climbs to QAM (bug)", got, false, 15, 16);
+        else
+            reco_check("(B2) cfg9 MPG sel -> HOLD cfg9", got, true, 9, 9);
+    }
+
+    // (B3) cfg7, observation looks like wgn16, but selectivity = MODERATE fade.
+    // The DEEP-tier win: cfg7 r5/16 decodes MPM where cfg9 r1/2 floors (cfg9's
+    // mpm cell is invalid) and the QAM gears all floor -> armed, the ONLY valid
+    // mpm cell is cfg7 -> HOLD cfg7. Disarmed -> wgn16 -> climbs to QAM (bug).
+    {
+        int got = faded_first_reco(opt, 7, EFF_LOOKS_WGN16_CFG7, SACK_WGN16, SEL_MPM);
+        if (failbefore)
+            reco_check("(B3) cfg7 MPM-as-wgn16 (disarmed) -> climbs to QAM (bug)", got, false, 9, 16);
+        else
+            reco_check("(B3) cfg7 MPM sel -> HOLD cfg7 (deep-tier win)", got, true, 7, 7);
+    }
+
+    // (B4) NO CLEAN REGRESSION: cfg9 on a CLEAN channel (clean selectivity ->
+    // classifier returns "" -> AWGN path) must CLIMB to a QAM gear. This holds
+    // in BOTH armed and disarmed modes (the classifier is inert on clean) ->
+    // proves the faded labeling never demotes a clean channel.
+    {
+        int got = faded_first_reco(opt, 9, 1094.0, 0.0, SEL_CLEAN);
+        reco_check("(B4) cfg9 CLEAN -> climb to QAM (high gear wins clean)",
+                   got, false, 15, 16);
+    }
+
+    // (B5) NO QPSK-ON-AWGN: a QAM gear on a noisy-but-AWGN label (wgn16, LOW
+    // selectivity) must NOT be demoted to the QPSK tier — AWGN is not a fade.
+    // The classifier returns "" (sel below knee) -> AWGN bucket -> stays QAM.
+    {
+        int got = faded_first_reco(opt, 15, 1925.0, 0.10, SEL_CLEAN);
+        reco_check("(B5) cfg15 wgn16 (low sel) -> stay/climb QAM (AWGN != fade)",
+                   got, false, 15, 16);
+    }
+
+    remove(tbl.c_str());  // clean up the synthetic table artifact
+
+    printf("[TEST-FADED-LABEL] %s (%d assertion failure%s)\n",
+           fails == 0 ? "ALL PASS" : "FAILED", fails, fails == 1 ? "" : "s");
+    return fails == 0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -762,6 +1023,7 @@ int main(int argc, char *argv[])
     bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
+    bool test_faded_label_cli = false;  // --test-faded-label: faded/selectivity channel-label classifier HOLD election, fail-before/pass-after (data-flow-faded-label-classifier.md §6).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1409,6 +1671,18 @@ int main(int argc, char *argv[])
             // composed stack (PAS + TINTERP-seed turbo + ratio-nvfix) decodes where a
             // bare arm fails. See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
             test_cfg17_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-faded-label") == 0)
+        {
+            // FADED / SELECTIVITY channel-label classifier self-test
+            // (feat/faded-label-classifier, fail-before/pass-after): drives
+            // cl_rate_optimizer to prove the selectivity classifier emits a
+            // faded label that HOLDs the coherent-QPSK tier (cfg9/cfg7) on a
+            // fade + does not regress clean->QAM election. See
+            // fact-documents/data-flow-faded-label-classifier.md §6.
+            test_faded_label_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2776,6 +3050,18 @@ start_modem:
             fflush(stdout);
             int rc = run_cfg17_selftest();
             printf("[FLAG] CFG17 composition self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_faded_label_cli) {
+            // Faded/selectivity channel-label classifier self-test (one-shot,
+            // then exit rc). Pure cl_rate_optimizer drive — no ARQ/PHY/audio/TCP
+            // state needed. Fail-before/pass-after via MERCURY_FADED_LABEL_FAILBEFORE.
+            printf("[FLAG] --test-faded-label: invoking faded/selectivity "
+                   "channel-label classifier HOLD-election self-test\n");
+            fflush(stdout);
+            int rc = run_faded_label_selftest();
+            printf("[FLAG] faded-label self-test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -228,7 +228,80 @@ cl_rate_optimizer::cl_rate_optimizer()
     , n_configs_loaded_nb(0)
     , n_channels_loaded_nb(0)
     , label_streak_count(0)
+    , faded_enabled_cached(-1)   // -1 = env not yet resolved
+    , faded_sel_knee(0.15)       // resolved lazily in faded_resolve_env()
+    , faded_sel_mpm(0.30)
+    , faded_sel_mpp(0.50)
+    , faded_snr_floor(-1.0)       // disabled by default
 {}
+
+// FADED-LABEL CLASSIFIER — lazy, idempotent env resolution.
+// Reads MERCURY_FADED_LABEL (the master enable) + the threshold overrides ONCE.
+// DEFAULT-OFF: when MERCURY_FADED_LABEL is unset/empty/"0", faded_enabled_cached
+// is 0 and classify_faded_label() always returns "" => byte-identical AWGN path.
+// Thresholds are env-overridable; the defaults are the documented starting
+// points (the sel>=0.15 estimator knee + HW-faded-bench depth bands), bench-tuned
+// later — NOT a guessed cliff.
+void cl_rate_optimizer::faded_resolve_env() const {
+    if (faded_enabled_cached >= 0) return;  // already resolved
+    const char* e = std::getenv("MERCURY_FADED_LABEL");
+    faded_enabled_cached = (e && e[0] && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+    // Threshold overrides (only consulted at all when armed; harmless if read
+    // while disarmed). atof on a bad/empty string yields 0.0 — guard each so a
+    // malformed env can't collapse a band to 0 and force everything to "faded".
+    const char* k  = std::getenv("MERCURY_FADED_SEL_KNEE");
+    const char* m  = std::getenv("MERCURY_FADED_SEL_MPM");
+    const char* p  = std::getenv("MERCURY_FADED_SEL_MPP");
+    const char* sf = std::getenv("MERCURY_FADED_SNR_FLOOR");
+    if (k  && k[0])  { double v = atof(k);  if (v > 0.0) faded_sel_knee = v; }
+    if (m  && m[0])  { double v = atof(m);  if (v > 0.0) faded_sel_mpm  = v; }
+    if (p  && p[0])  { double v = atof(p);  if (v > 0.0) faded_sel_mpp  = v; }
+    if (sf && sf[0]) { faded_snr_floor = atof(sf); }  // may be negative (dB)
+    // Keep the bands monotone (knee <= mpm <= mpp) even under odd overrides so
+    // the depth ladder is well-ordered.
+    if (faded_sel_mpm < faded_sel_knee) faded_sel_mpm = faded_sel_knee;
+    if (faded_sel_mpp < faded_sel_mpm)  faded_sel_mpp = faded_sel_mpm;
+}
+
+bool cl_rate_optimizer::faded_label_enabled() const {
+    faded_resolve_env();
+    return faded_enabled_cached == 1;
+}
+
+// Map (selectivity, snr_proxy) -> faded label {mpg, mpm, mpp} or "" (not faded).
+//
+// selectivity = std(|H[k]|)/mean(|H[k]|) over data subcarriers — the PHY's
+// frequency-selectivity depth. The CCIR fade ladder MPG (0.1Hz/0.5ms) <
+// MPM (0.5Hz/1ms) < MPP (1Hz/2ms) increases Doppler+delay spread => increases
+// selectivity, so selectivity MAGNITUDE is the natural fade-DEPTH discriminator.
+//
+//   sel <  knee          -> "" (flat/clean — NOT a fade; AWGN path unchanged)
+//   knee <= sel <  mpm   -> "mpg"  (shallow fade)
+//   mpm  <= sel <  mpp   -> "mpm"  (moderate fade)
+//   sel  >= mpp          -> "mpp"  (deep fade)
+//
+// snr_proxy (optional, default -99 = unknown): if a FINITE floor is configured
+// (MERCURY_FADED_SNR_FLOOR) AND a real proxy is below it, the channel is too
+// weak even for the QPSK tier — return "" so the optimizer doesn't elect a tier
+// that will also floor (the floor/BREAK path owns that). -99 (unknown proxy) or
+// floor disabled => selectivity alone decides. The modem SNR saturates ~14.4 dB
+// (FADED_PARITY_VERDICT §matrix1) so the proxy is a coarse guard only, NOT the
+// primary axis.
+std::string cl_rate_optimizer::classify_faded_label(double selectivity,
+                                                    double snr_proxy) const {
+    faded_resolve_env();
+    if (faded_enabled_cached != 1) return "";          // disarmed
+    if (!std::isfinite(selectivity)) return "";        // defensive
+    if (selectivity < faded_sel_knee) return "";       // flat/clean -> not faded
+    // Optional weak-channel guard: a real proxy below the configured floor =>
+    // undecodable even on QPSK => let the floor/BREAK path own it.
+    if (faded_snr_floor > -90.0 && snr_proxy > -90.0 &&
+        std::isfinite(snr_proxy) && snr_proxy < faded_snr_floor)
+        return "";
+    if (selectivity >= faded_sel_mpp) return "mpp";
+    if (selectivity >= faded_sel_mpm) return "mpm";
+    return "mpg";
+}
 
 // Parse a "table" or "table_nb" section. Shared between WB and NB load
 // so the per-section logic stays in one place. Returns count of valid
@@ -462,7 +535,8 @@ const st_rate_cell* cl_rate_optimizer::get_cell(int cfg, const std::string& buck
 std::string cl_rate_optimizer::identify_channel_label(int current_cfg,
                                                       double current_sack_rate,
                                                       double current_eff_bps,
-                                                      bool is_nb) const {
+                                                      bool is_nb,
+                                                      double current_selectivity) const {
     // H1: defensive — non-finite observations come from upstream bugs.
     // Returning "" forces the channel_axis fallback in evaluate(), which is
     // less precise but safe.
@@ -476,6 +550,30 @@ std::string cl_rate_optimizer::identify_channel_label(int current_cfg,
     if (cit == active_table.end()) return "";
     const std::map<std::string, st_rate_cell>& row = cit->second;
     if (row.empty()) return "";
+
+    // FADED-LABEL OVERRIDE (default-off, env MERCURY_FADED_LABEL). When armed
+    // AND the PHY selectivity classifies the channel as faded, emit the faded
+    // label (mpg/mpm/mpp) INSTEAD of the AWGN-bucket nearest-distance pick — so
+    // the optimizer consults the faded rows and HOLDs the coherent-QPSK tier
+    // (cfg9/cfg7) rather than climbing back to the floored QAM gears. We only
+    // override when the faded label is a VALID cell at current_cfg, preserving
+    // the consumer invariant "the returned label has a valid stay_cell at
+    // current_cfg" (rate_optimizer.cc:597, evaluate). If the faded label is NOT
+    // valid here (e.g. cfg9 on MPM, which floors), we fall THROUGH to the
+    // unchanged AWGN search — the optimizer then sees the floored stay_cell and
+    // the gearshift/BREAK descent (which owns floored-config transitions) takes
+    // over. classify_faded_label() returns "" when disarmed or sel<knee, so this
+    // block is a strict no-op with the env unset => byte-identical AWGN path.
+    if (faded_label_enabled()) {
+        std::string fl = classify_faded_label(current_selectivity);
+        if (!fl.empty()) {
+            std::map<std::string, st_rate_cell>::const_iterator
+                ft = row.find(fl);
+            if (ft != row.end() && ft->second.valid)
+                return fl;  // faded label is decodable here -> HOLD this tier
+            // else: faded but this config floors the fade -> AWGN fallthrough.
+        }
+    }
 
     // Normalize the two axes so they're comparable. SACK rate is in [0,1].
     // eff_bps spans 0..several thousand. Use a soft normalization: divide
@@ -517,7 +615,8 @@ int cl_rate_optimizer::evaluate(int current_cfg,
                                 double current_sack_rate,
                                 int window_count,
                                 int config_ceiling,
-                                bool is_nb) {
+                                bool is_nb,
+                                double current_selectivity) {
     ++eval_count;
 
     // Hard kill: table missing → caller stays put.
@@ -550,7 +649,8 @@ int cl_rate_optimizer::evaluate(int current_cfg,
     std::string current_label = identify_channel_label(current_cfg,
                                                        current_sack_rate,
                                                        current_eff_bps,
-                                                       is_nb);
+                                                       is_nb,
+                                                       current_selectivity);
     if (current_label.empty()) {
         // Fallback: nearest bucket on the cross-config mean axis. Less
         // accurate but better than refusing to act.

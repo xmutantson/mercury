@@ -66,6 +66,9 @@ fact-documents/
 
 # Test result JSONs at repo root (benchmark/loopback output, not source)
 /v2_*.json
+# --test-faded-label synthetic table artifact (written + removed by the test;
+# ignored so a crashed run never leaves it staged)
+/effective_rate_table.faded_test.json
 
 # Cross-built binaries
 /mercury_aarch64
