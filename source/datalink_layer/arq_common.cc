@@ -858,6 +858,7 @@ cl_arq_controller::cl_arq_controller()
 	break_recovery_retries=0;
 	ceiling_success_count=0;
 	break_detected=NO;
+	break_probe_consec_match=0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	hail_detected=NO;
 	hail_sent=NO;
 
@@ -3995,6 +3996,12 @@ void cl_arq_controller::reset_session_state()
 	break_recovery_retries = 0;
 	ceiling_success_count = 0;
 	break_detected = NO;
+	break_probe_consec_match = 0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
+	// fix/break-fh-gate: age the forward-health latch out on session reset so a stale
+	// forward-OFDM decode from a prior session never suppresses an early BREAK. The
+	// receive-frame index is monotonic (never reset); subtracting the window guarantees
+	// break_fh_suppress() reads "not recent" until a fresh forward OFDM frame decodes.
+	last_forward_ofdm_decode_frame = rx_receive_frame_index - (BREAK_FH_LATCH_FRAMES + 1);
 	hail_detected = NO;
 	hail_sent = NO;
 
@@ -4713,6 +4720,64 @@ bool cl_arq_controller::bigblock_carve_suspended()
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND");
 	  if(e && *e && atoi(e)!=0) return false; }   // reproducer: pre-fix deaf RSP
 	return true;
+}
+
+// BREAK forward-health gate (fix/break-fh-gate). Default-OFF env MERCURY_BREAK_FH_GATE.
+// Cached once: getenv is a syscall, and this is polled on every failed-decode receive().
+// break_fh_gate_test_override: UNIT-TEST seam only (-1 = honor env, 0/1 = force). It lets
+// run_break_fh_gate_tests() exercise BOTH gate states in one process despite the cached env
+// read; production NEVER sets it, so the env path is unchanged -> default-off byte-identical.
+int cl_arq_controller::break_fh_gate_test_override = -1;
+bool cl_arq_controller::break_fh_gate_enabled()
+{
+	if(break_fh_gate_test_override >= 0) return break_fh_gate_test_override != 0;
+	static const bool en = (std::getenv("MERCURY_BREAK_FH_GATE") != nullptr);
+	return en;
+}
+
+// FIX-A forward-health LATCH. Returns true (probe should be SUPPRESSED) iff the gate
+// is enabled AND a forward OFDM frame decoded within the last BREAK_FH_LATCH_FRAMES
+// receive() iterations. When the env is unset this is unconditionally false, so the
+// receive() BREAK gate is bit-identical to 48103fa.
+bool cl_arq_controller::break_fh_suppress() const
+{
+	if(!break_fh_gate_enabled()) return false;
+	// last_forward_ofdm_decode_frame inits far in the past => not recent at session start.
+	return (rx_receive_frame_index - last_forward_ofdm_decode_frame) <= BREAK_FH_LATCH_FRAMES;
+}
+
+// FIX-B K-of-N corroboration. The caller passes the per-frame match decision
+// (metric>=threshold && matched>=break_match_threshold, already evaluated). When the
+// env is unset this is a pure pass-through (single-shot, returns probe_matched) so the
+// receive() gate is bit-identical. When set, break_detected is returned true only after
+// BREAK_KOFN_K consecutive matches; any non-match (or a suppressed/aged frame) resets the
+// streak — a real BREAK is retried/sustained and survives K-of-N, the per-batch alias does not.
+bool cl_arq_controller::break_kofn_corroborate(bool probe_matched)
+{
+	if(!break_fh_gate_enabled())
+		return probe_matched;             // byte-identical: one match detonates
+	if(!probe_matched)
+	{
+		break_probe_consec_match = 0;     // streak broken
+		return false;
+	}
+	break_probe_consec_match++;
+	if(break_probe_consec_match >= BREAK_KOFN_K)
+	{
+		break_probe_consec_match = 0;     // consumed: re-arm for the next independent BREAK
+		return true;
+	}
+	return false;                         // need more corroboration
+}
+
+// FIX-D: the WALL-B FIX-3 carve-suspend gate-lift, gated on MERCURY_BREAK_FH_GATE.
+// When the FH gate is enabled, return false so the only-remaining OFDM-alias guard
+// (coarse_metric<0.30) is NOT lifted in carve-suspend state (the marginal-CFG16 alias
+// domain). When unset, return bigblock_carve_suspended() exactly -> bit-identical.
+bool cl_arq_controller::break_fh_carve_lift()
+{
+	if(break_fh_gate_enabled()) return false;
+	return bigblock_carve_suspended();
 }
 
 // WALL-B FIX-3 — streak state machine, the ONE source of truth shared by the receive()
@@ -8272,6 +8337,11 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance)
 
 void cl_arq_controller::receive()
 {
+	// BREAK forward-health gate (fix/break-fh-gate): monotonic receive() iteration
+	// counter. ALWAYS maintained but read ONLY by the env-gated FH suppressor, so
+	// when MERCURY_BREAK_FH_GATE is unset nothing consumes it -> byte-identical.
+	rx_receive_frame_index++;
+
 	int signal_period = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate; // in samples
 	int symbol_period = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
 
@@ -8996,6 +9066,14 @@ void cl_arq_controller::receive()
 					telecom_system->receive_stats.ofdm_search_raw = upper_clamp;
 				telecom_system->receive_stats.ofdm_batch_active = true;
 
+				// BREAK forward-health gate (fix/break-fh-gate) FIX-A: a forward OFDM
+				// frame just decoded successfully (this is the M!=MOD_MFSK else-branch).
+				// Latch the receive() iteration index; the BREAK probe (decode-FAIL
+				// else-branch below) is suppressed while this is recent. Write is
+				// unconditional but read ONLY by the env-gated break_fh_suppress() ->
+				// byte-identical when MERCURY_BREAK_FH_GATE is unset.
+				last_forward_ofdm_decode_frame = rx_receive_frame_index;
+
 				// Opportunistic scan success: reset failure counter
 				if(passive_monitor) monitor_consec_ofdm_fail = 0;
 
@@ -9283,10 +9361,25 @@ void cl_arq_controller::receive()
 			// in (that is stock OFDM DATA mid-batch, streak<K). break_match_threshold (10/16) +
 			// the Schmidl-Cox detect_break_pattern_from_passband still gate the actual match, so
 			// no false BREAK fires on a stock OFDM data run (RISK-B, Test E).
+			//
+			// fix/break-fh-gate (workflow w2ee37gd6):
+			//   FIX-D: the WALL-B FIX-3 carve-suspend lift (|| bigblock_carve_suspended()) is
+			//          the ONLY remaining OFDM-alias guard once the failed-CFG16-frame coarse
+			//          metric drops below 0.30 — but a SUSPENDED carve at CFG16 is EXACTLY the
+			//          marginal-decode state in which the 50-subcarrier OFDM argmax aliases the
+			//          8 WB break_tones to matched>=10. When the FH gate is enabled we do NOT
+			//          honor the lift (break_fh_carve_lift() returns false), so the coarse<0.30
+			//          gate stands and the forward-health latch / K-of-N below carry the load.
+			//          When the env is unset, break_fh_carve_lift()==bigblock_carve_suspended()
+			//          exactly -> byte-identical to 48103fa.
+			//   FIX-A: && !break_fh_suppress() — suppress the probe entirely while a forward
+			//          OFDM frame decoded within the recent window (a real BREAK comes AFTER the
+			//          commander stops forward OFDM, so the latch has aged out). No-op when off.
 			if(break_detected == NO && gear_shift_on && role == RESPONDER
 			   && link_status == CONNECTED
+			   && !break_fh_suppress()
 			   && (telecom_system->receive_stats.coarse_metric < 0.30
-			       || bigblock_carve_suspended()))
+			       || break_fh_carve_lift()))
 			{
 				int matched = 0;
 				double metric = telecom_system->detect_break_pattern_from_passband(
@@ -9304,9 +9397,15 @@ void cl_arq_controller::receive()
 						telecom_system->ack_mfsk.break_match_threshold, metric);
 					fflush(stdout);
 				}
-				// Require break_match_threshold (WB:12/16, NB M=8:24/32, NB M=4:40/48)
-				if(metric >= telecom_system->ack_pattern_detection_threshold
-				   && matched >= telecom_system->ack_mfsk.break_match_threshold)
+				// Require break_match_threshold (WB:10/16, NB M=8:24/32, NB M=4:40/48).
+				// fix/break-fh-gate FIX-B: the per-frame match decision is routed through
+				// break_kofn_corroborate(), which when the env is unset is a pure pass-through
+				// (single-shot -> byte-identical) and when set requires BREAK_KOFN_K consecutive
+				// matches before detonating (the per-batch alias is a one-frame transient; a real
+				// BREAK is retried/sustained so survives K-of-N).
+				bool probe_matched = (metric >= telecom_system->ack_pattern_detection_threshold
+				                      && matched >= telecom_system->ack_mfsk.break_match_threshold);
+				if(break_kofn_corroborate(probe_matched))
 				{
 					printf("[BREAK] Emergency pattern detected! metric=%.2f matched=%d/%d (coarse=%.2f)\n",
 						metric, matched, telecom_system->ack_mfsk.ack_pattern_nsymb,
