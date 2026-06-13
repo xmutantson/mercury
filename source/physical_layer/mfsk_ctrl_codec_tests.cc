@@ -5783,6 +5783,234 @@ static void test_ofdm_fine_timing_magnitude_clean_no_regression() {
 	}
 }
 
+// =============================================================================
+// §23 BREAK forward-health gate (fix/break-fh-gate, workflow w2ee37gd6)
+//
+// ROOT CAUSE: the responder BREAK probe runs in the decode-FAIL else-branch on the
+// SAME failed passband buffer (arq_common.cc:9342+). Its only OFDM-alias guard is
+// coarse_metric<0.30, which is INVERTED on the failure path: a marginal CFG16 frame
+// has LOW coarse so the gate PASSES, the 50 OFDM subcarriers argmax against the 8 WB
+// break_tones reach matched>=10 (>= break_match_threshold), and ONE probe detonates a
+// self-demote to ROBUST_0 + SACK wipe.
+//
+// The fix adds two corroborating mitigations, BOTH gated on MERCURY_BREAK_FH_GATE
+// (default-off -> byte-identical):
+//   FIX-A forward-health LATCH (break_fh_suppress): a forward OFDM frame decoded within
+//         the last BREAK_FH_LATCH_FRAMES receive() iterations SUPPRESSES the probe.
+//   FIX-B K-of-N (break_kofn_corroborate): BREAK_KOFN_K consecutive matches required.
+//   FIX-D (break_fh_carve_lift): when the FH gate is on, the WALL-B FIX-3 carve-suspend
+//         gate-lift is NOT honored (the only OFDM guard stands).
+//
+// The two tests below mirror RC.test:
+//   (A) the held-CFG16 marginal-OFDM ALIAS: a probe match arriving while a forward OFDM
+//       frame is recently latched. FAIL-BEFORE (gate off): one match detonates BREAK.
+//       PASS-AFTER (gate on + recent forward decode): SUPPRESSED. Plus the K-of-N proof
+//       (a single non-suppressed match does not detonate until K corroborate).
+//   (B) a GENUINE WB BREAK pattern (generate_break_pattern_passband -> detect) with NO
+//       recent forward decode: the detector still reaches matched>=threshold AND the
+//       gate detects BREAK in BOTH env states (sustained matches survive K-of-N).
+//
+// The gate-enable is toggled via the test-only seam break_fh_gate_test_override so both
+// states run in one process; production leaves it at -1 (env path).
+// =============================================================================
+
+// Drive the production decision helpers on a controller in a chosen gate state.
+// matched-true means "this frame's probe cleared metric && matched>=threshold".
+// Returns whether break_detected WOULD be set this frame (FH suppression first, then
+// K-of-N). This mirrors the receive() block at arq_common.cc:9342-9395 exactly:
+//   if(!break_fh_suppress() && (coarse<0.30 || carve_lift)) { ... if(break_kofn_corroborate(matched)) break_detected=YES; }
+static bool break_fh_eval_frame(cl_arq_controller& arq, bool gate_on,
+                                bool recent_forward_ofdm, bool probe_matched) {
+	cl_arq_controller::break_fh_gate_test_override = gate_on ? 1 : 0;
+	// Model the forward-health latch: advance the receive-frame index one tick, and if a
+	// forward OFDM frame is "recent" latch it AT this tick (delta 0 <= window).
+	arq.rx_receive_frame_index++;
+	if (recent_forward_ofdm)
+		arq.last_forward_ofdm_decode_frame = arq.rx_receive_frame_index;
+	if (arq.break_fh_suppress())
+		return false;   // FIX-A: probe suppressed entirely
+	return arq.break_kofn_corroborate(probe_matched);   // FIX-B
+}
+
+static void test_break_fh_gate() {
+	const char* name = "break_fh_gate";
+
+	// ---- Test A: the held-CFG16 marginal-OFDM ALIAS ----
+	// A single probe match while a forward OFDM frame is recently latched.
+	{
+		// FAIL-BEFORE (gate off): one match -> break_detected would be set.
+		cl_arq_controller arq_off;
+		bool tripped_off = break_fh_eval_frame(arq_off, /*gate_on=*/false,
+		                                       /*recent_forward_ofdm=*/true, /*probe_matched=*/true);
+		if (!tripped_off) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "A FAIL-BEFORE: gate-off single alias match did NOT trip BREAK (expected detonation)");
+			return;
+		}
+		// PASS-AFTER (gate on + recent forward decode): suppressed.
+		cl_arq_controller arq_on;
+		bool tripped_on = break_fh_eval_frame(arq_on, /*gate_on=*/true,
+		                                      /*recent_forward_ofdm=*/true, /*probe_matched=*/true);
+		if (tripped_on) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "A PASS-AFTER: gate-on alias match was NOT suppressed by forward-health latch");
+			return;
+		}
+	}
+
+	// ---- FIX-D: the WALL-B FIX-3 carve-suspend gate-lift is gated ----
+	// When the FH gate is ON the lift must NOT be honored (the coarse<0.30 OFDM-alias
+	// guard stands). When OFF it must equal bigblock_carve_suspended() exactly (byte-id).
+	{
+		cl_arq_controller arq;
+		// Force carve-suspend state (streak past K) so bigblock_carve_suspended()==true.
+		arq.bigblock_rx_carve_fail_streak = cl_arq_controller::BIGBLOCK_CARVE_SUSPEND_K;
+		cl_arq_controller::break_fh_gate_test_override = 0;   // gate OFF
+		bool lift_off    = arq.break_fh_carve_lift();
+		bool suspend_off = arq.bigblock_carve_suspended();
+		cl_arq_controller::break_fh_gate_test_override = 1;   // gate ON
+		bool lift_on     = arq.break_fh_carve_lift();
+		if (lift_off != suspend_off) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "D gate-OFF: break_fh_carve_lift() != bigblock_carve_suspended() (byte-identical broken)");
+			return;
+		}
+		if (lift_on) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "D gate-ON: carve-suspend lift was honored (the only OFDM-alias guard was dropped)");
+			return;
+		}
+	}
+
+	// ---- Test A': latch ages out -> probe runs again; and K-of-N needs K matches ----
+	{
+		cl_arq_controller arq;
+		cl_arq_controller::break_fh_gate_test_override = 1;
+		// Latch a forward OFDM decode, then advance the receive index past the window
+		// WITHOUT another forward decode: break_fh_suppress() must read "not recent".
+		arq.rx_receive_frame_index = 100;
+		arq.last_forward_ofdm_decode_frame = 100;
+		arq.rx_receive_frame_index = 100 + cl_arq_controller::BREAK_FH_LATCH_FRAMES;   // boundary: still recent
+		if (!arq.break_fh_suppress()) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "A' boundary: at exactly BREAK_FH_LATCH_FRAMES the latch should still suppress");
+			return;
+		}
+		arq.rx_receive_frame_index = 100 + cl_arq_controller::BREAK_FH_LATCH_FRAMES + 1; // just aged out
+		if (arq.break_fh_suppress()) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "A' aged-out: latch should NOT suppress once past the window");
+			return;
+		}
+		// Now (latch aged out) K-of-N must take BREAK_KOFN_K consecutive matches.
+		arq.break_probe_consec_match = 0;
+		int detonations = 0, frames_to_detonate = 0;
+		for (int f = 0; f < cl_arq_controller::BREAK_KOFN_K; f++) {
+			frames_to_detonate++;
+			if (arq.break_kofn_corroborate(/*probe_matched=*/true)) detonations++;
+		}
+		if (detonations != 1 || frames_to_detonate != cl_arq_controller::BREAK_KOFN_K) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			char b[160];
+			snprintf(b, sizeof(b), "A' K-of-N: expected exactly 1 detonation after K=%d matches, got %d in %d frames",
+				cl_arq_controller::BREAK_KOFN_K, detonations, frames_to_detonate);
+			test_fail(name, b);
+			return;
+		}
+		// A non-match between matches resets the streak (no detonation from a flapping alias).
+		arq.break_probe_consec_match = 0;
+		bool d1 = arq.break_kofn_corroborate(true);    // 1/K
+		bool d2 = arq.break_kofn_corroborate(false);   // reset
+		bool d3 = arq.break_kofn_corroborate(true);    // 1/K again
+		if (d1 || d2 || d3) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "A' K-of-N reset: a non-match between two matches must NOT detonate (flap suppressed)");
+			return;
+		}
+	}
+
+	// ---- Test B: a GENUINE WB BREAK pattern, NO recent forward decode ----
+	// The detector must still reach matched>=threshold on a real BREAK, and the gate must
+	// detect it in BOTH env states (sustained -> survives K-of-N).
+	{
+		cl_telecom_system ts;
+		ts.operation_mode = ARQ_MODE;
+		ts.load_configuration(CONFIG_0);   // WB; M=16 ack_mfsk brings break_tones + thresholds up
+		if (ts.ack_pattern_passband_samples <= 0) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "B: ack_pattern_passband_samples<=0 after init (no WB break pattern)");
+			return;
+		}
+
+		// Generate the real BREAK pattern into a buffer sized like the receive() snapshot.
+		std::vector<double> brk((size_t)ts.ack_pattern_passband_samples + 4096, 0.0);
+		int written = ts.generate_break_pattern_passband(brk.data());
+		if (written <= 0) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			test_fail(name, "B: generate_break_pattern_passband returned 0");
+			return;
+		}
+
+		int matched = 0;
+		double metric = ts.detect_break_pattern_from_passband(brk.data(), written, &matched);
+		bool real_break_match = (metric >= ts.ack_pattern_detection_threshold
+		                         && matched >= ts.ack_mfsk.break_match_threshold);
+		printf("    [BREAK-FH B] real BREAK: matched=%d/%d (thr=%d) metric=%.2f detect_thr=%.2f\n",
+			matched, ts.ack_mfsk.ack_pattern_nsymb, ts.ack_mfsk.break_match_threshold,
+			metric, ts.ack_pattern_detection_threshold);
+		if (!real_break_match) {
+			cl_arq_controller::break_fh_gate_test_override = -1;
+			char b[200];
+			snprintf(b, sizeof(b),
+				"B: a GENUINE BREAK did not clear the detector (matched=%d need>=%d, metric=%.2f need>=%.2f) — detector regression",
+				matched, ts.ack_mfsk.break_match_threshold, metric, ts.ack_pattern_detection_threshold);
+			test_fail(name, b);
+			return;
+		}
+
+		// In BOTH gate states: NO recent forward OFDM decode -> latch does NOT suppress ->
+		// the (sustained) real-BREAK match detonates. Gate-off: one match. Gate-on: after K.
+		for (int gate_on = 0; gate_on <= 1; gate_on++) {
+			cl_arq_controller arq;
+			arq.break_probe_consec_match = 0;
+			// Push the (sentinel) latch far in the past relative to the current index.
+			arq.rx_receive_frame_index = 1000;
+			arq.last_forward_ofdm_decode_frame = -1000000;
+			bool detonated = false;
+			// A real BREAK burst is retried/sustained: feed up to K frames, none with a
+			// recent forward decode (commander has stopped forward OFDM during BREAK).
+			for (int f = 0; f < cl_arq_controller::BREAK_KOFN_K; f++) {
+				if (break_fh_eval_frame(arq, /*gate_on=*/gate_on != 0,
+				                        /*recent_forward_ofdm=*/false, /*probe_matched=*/real_break_match)) {
+					detonated = true;
+					break;
+				}
+			}
+			if (!detonated) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				char b[160];
+				snprintf(b, sizeof(b),
+					"B: genuine BREAK NOT detected with gate_%s (no recent forward decode) — a real BREAK must survive the gate",
+					gate_on ? "ON" : "OFF");
+				test_fail(name, b);
+				return;
+			}
+		}
+	}
+
+	cl_arq_controller::break_fh_gate_test_override = -1;   // restore production env path
+	test_pass(name);
+}
+
+int run_break_fh_gate_tests() {
+	g_failures = 0;
+	g_passes   = 0;
+	printf("=== BREAK forward-health gate tests (fix/break-fh-gate) ===\n");
+	test_break_fh_gate();
+	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
+	return g_failures;
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -5910,6 +6138,10 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (the keystone)
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
+
+	// §23 BREAK forward-health gate (fix/break-fh-gate): FH-latch suppression of the
+	// held-CFG16 marginal-OFDM alias + K-of-N corroboration + genuine-BREAK survives.
+	test_break_fh_gate();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

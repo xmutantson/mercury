@@ -3188,6 +3188,57 @@ public:
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)
   int break_detected;             // YES if BREAK pattern detected by responder
+
+  // ---- BREAK forward-health gate (fix/break-fh-gate) ---------------------
+  // ROOT CAUSE (workflow w2ee37gd6): the responder BREAK probe
+  // (detect_break_pattern_from_passband, arq_common.cc:9292) runs on the SAME
+  // failed passband buffer in the decode-FAIL else-branch. Its only OFDM-alias
+  // guard is the entry-gate coarse_metric<0.30 (arq_common.cc:9288) which is
+  // INVERTED on the failure path: a marginal CFG16 frame has LOW coarse_metric
+  // so the gate PASSES, the 50 OFDM subcarriers argmax against the 8 WB
+  // break_tones (mfsk.cc:316) reaching matched>=10 (mfsk.cc:328) under
+  // always_fine, and ONE probe detonates a self-demote to ROBUST_0 + SACK wipe
+  // (arq_responder.cc:439-489). Two corroborating mitigations, BOTH gated on
+  // MERCURY_BREAK_FH_GATE (default-off -> the new code is unread -> byte-identical):
+  //   FIX-A forward-health LATCH: a forward OFDM frame decoded within the last
+  //         BREAK_FH_LATCH_FRAMES receive() iterations SUPPRESSES the probe. A
+  //         real commander BREAK comes AFTER the commander STOPS forward OFDM
+  //         (emergency_break_active) so the latch ages out -> probe still runs.
+  //   FIX-B K-of-N: require BREAK_KOFN_K consecutive probe matches before
+  //         break_detected=YES. A real BREAK is retried/sustained -> survives;
+  //         the per-batch alias is a one-frame transient -> does not.
+  // rx_receive_frame_index: monotonic, incremented once per receive() call. It
+  // is ALWAYS maintained (not env-gated) but its ONLY consumer is the env-gated
+  // FH suppressor, so when the env is unset nothing reads it -> behavior is
+  // bit-identical. last_forward_ofdm_decode_frame snapshots it at every
+  // successful forward OFDM decode (arq_common.cc:8976 else-branch).
+  static const long long BREAK_FH_LATCH_FRAMES = 8;  // recent-forward-decode window (receive() iters); bench-tunable
+  static const int       BREAK_KOFN_K          = 2;  // consecutive probe matches required to detonate; bench-tunable
+  long long rx_receive_frame_index{0};
+  long long last_forward_ofdm_decode_frame{-1000000};  // far in the past => not recent at start
+  int       break_probe_consec_match{0};               // K-of-N accumulator (reset on non-match / consume / reset)
+  // True iff the env MERCURY_BREAK_FH_GATE is set (cached once). The ONE gate-enable
+  // source of truth shared by break_fh_suppress(), break_kofn_corroborate(),
+  // break_fh_carve_lift(). break_fh_gate_test_override is a UNIT-TEST seam (-1 = honor
+  // env, 0/1 = force) so the test can exercise both gate states in one process; production
+  // leaves it at -1, so the env path is unchanged (default-off byte-identical).
+  static int  break_fh_gate_test_override;
+  static bool break_fh_gate_enabled();
+  // True iff the gate is enabled AND a forward OFDM frame decoded within the last
+  // BREAK_FH_LATCH_FRAMES receive() iterations (probe should be suppressed). When the
+  // env is unset, returns false unconditionally (byte-identical).
+  bool break_fh_suppress() const;
+  // K-of-N corroboration. probe_matched = the per-frame match decision (metric &&
+  // matched>=threshold already evaluated by the caller). Returns whether
+  // break_detected should be SET this frame. When the env is unset it is a
+  // pass-through (returns probe_matched, single-shot -> byte-identical); when set
+  // it requires BREAK_KOFN_K consecutive matches. A non-match resets the streak.
+  bool break_kofn_corroborate(bool probe_matched);
+  // FIX-D: the WALL-B FIX-3 carve-suspend gate-lift, gated. When the FH gate is
+  // enabled, returns false (do NOT lift the coarse<0.30 OFDM-alias guard in
+  // carve-suspend state). When the env is unset, returns bigblock_carve_suspended()
+  // exactly -> the receive() BREAK gate is bit-identical to 48103fa.
+  bool break_fh_carve_lift();
   int hail_detected;              // YES if HAIL beacon detected (responder LISTENING)
   int hail_sent;                  // YES if commander has sent HAIL in current CONNECTING phase
 

@@ -41,4 +41,10 @@ int run_ofdm_fine_timing_tests();
 // fact-documents/data-flow-preamble-amortization.md §1.
 int run_preamble_sched_tests();
 
+// fix/break-fh-gate: run ONLY the §23 BREAK forward-health gate suite (FH-latch
+// suppression of the held-CFG16 marginal-OFDM alias + K-of-N corroboration +
+// genuine-BREAK survival, in both gate states). Fast + deterministic. Returns the
+// number of failed tests (0 = all pass). Wired via main.cc --test-break-fh.
+int run_break_fh_gate_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_

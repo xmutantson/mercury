@@ -581,6 +581,14 @@ int main(int argc, char *argv[])
             int failed = run_preamble_sched_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-break-fh : fix/break-fh-gate §23 BREAK forward-health gate suite
+        // (FH-latch suppression of the held-CFG16 marginal-OFDM alias + K-of-N
+        // corroboration + genuine-BREAK survival, both gate states). Fast +
+        // deterministic. Also included in the full --test suite.
+        if (strcmp(argv[i], "--test-break-fh") == 0) {
+            int failed = run_break_fh_gate_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;
