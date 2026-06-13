@@ -11642,6 +11642,156 @@ int cl_arq_controller::test_climb_engine()
 		data_ack_retx_turnaround = saved_retx;
 	}
 
+	// ================================================================
+	// Part W3 — FORGIVING-ACK STAGE 3: batch-airtime listen-window RE-CENTER
+	// (data-flow-forgiving-ack.md §S3; judge runner_up_grafts #3, the cheap
+	// byte-identical COMPLEMENT). The stock CMD window center, frame_drain=2*mtt,
+	// has NO forward-BATCH-airtime term, so on a long held-CFG16 batch it is
+	// centered TOO EARLY and the reverse SACK (which cannot return until the RSP
+	// RECEIVED the whole batch, ~data_batch_size*mtt + turnaround) lands OUTSIDE
+	// the window. Stage 3 ADDS the omitted forward airtime so the LATE edge extends
+	// to the true SACK arrival, while the EARLY edge / width are PRESERVED. This
+	// drives the REAL production helper turnaround_rephase_adder_ms().
+	//
+	// THE CENTERING ORACLE: model the earliest physical SACK arrival back at the
+	// CMD (relative to the CMD's last-frame key-down), and assert the listen window
+	// COVERS it AFTER the re-center but does NOT before. FAIL-BEFORE:
+	// -DTURNAROUND_REPHASE_FAILBEFORE compiles the helper to return 0 -> adder==0 ->
+	// the long-batch SACK arrival is OUTSIDE the un-recentered window -> W3a FAILS.
+	// PASS-AFTER: adder>0 -> arrival IN window. Byte-identity (W3c/W3d) and width-
+	// growth-only (W3b) PASS even in the stub.
+	// ================================================================
+	{
+		int saved_ptt_on = ptt_on_delay_ms, saved_ptt_off = ptt_off_delay_ms;
+		int saved_mtt = message_transmission_time_ms, saved_apt = ack_pattern_time_ms;
+		int saved_batch = data_batch_size;
+		int saved_cfg = current_configuration;
+		ptt_on_delay_ms = 100; ptt_off_delay_ms = 200;     // stock delays
+		message_transmission_time_ms = 320;                 // representative CFG16 per-frame ms
+		ack_pattern_time_ms = 389;                          // M=16 WB ACK pattern ms
+
+		// The stock (pre-Stage-3) window value the production formula computes (the
+		// SAME arithmetic as calculate_receiving_timeout, COMMANDER branch). No D2
+		// adder here (clean first-pass); the re-center is orthogonal to D2.
+		int pattern_time = ack_pattern_time_ms;
+		int frame_drain  = 2 * message_transmission_time_ms;
+		int sack_arrival_geom = ptt_off_delay_ms + RSP_DECODE_MARGIN_MS + pattern_time + ptt_on_delay_ms;
+		int base_timeout = frame_drain + sack_arrival_geom + SACK_ARRIVAL_MARGIN_MS;  // stock window
+
+		// THE PHYSICAL SACK ARRIVAL (relative to the CMD's last-frame key-down):
+		// the RSP cannot key the SACK until it RECEIVED the whole forward batch
+		// (data_batch_size*mtt of forward airtime measured from the CMD's FIRST
+		// data frame; ~ (data_batch_size-2)*mtt still in flight after the CMD's
+		// frame_drain reference) + the turnaround (ptt_off + rsp_decode + pattern +
+		// ptt_on). This is the instant the window center must reach.
+		auto sack_arrival_instant = [&](int batch)->int {
+			int forward_airtime_after_framedrain =
+				batch * message_transmission_time_ms - frame_drain;   // (batch-2)*mtt
+			if(forward_airtime_after_framedrain < 0) forward_airtime_after_framedrain = 0;
+			return forward_airtime_after_framedrain + sack_arrival_geom;
+		};
+
+		// --- W3a: LONG held-CFG16 batch — the centering miss (fail-before) / hit (pass-after) ---
+		current_configuration = CONFIG_16;
+		data_batch_size = 25;                  // a long held-CFG16 batch
+		{
+			int adder = turnaround_rephase_adder_ms(
+				/*rephase_env=*/true,          // env ON for the test (production reads getenv)
+				/*forward_is_ofdm=*/is_ofdm_config(current_configuration),
+				/*data_batch_size=*/data_batch_size,
+				/*message_transmission_time_ms=*/message_transmission_time_ms,
+				/*batch_partial_threshold=*/BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				/*guard_ms=*/TURNAROUND_REPHASE_GUARD_MS);
+			int window_after = base_timeout + adder;
+			int arrival = sack_arrival_instant(data_batch_size);
+
+			// THE ORACLE: the re-centered window must reach the SACK arrival instant.
+			// Pre-fix (adder==0) the window is base_timeout < arrival -> the SACK is
+			// OUTSIDE -> the pure-silent miss. Post-fix (adder>0) arrival <= window.
+			check(arrival <= window_after,
+				"W3a long held-CFG16 batch: re-centered window COVERS the forward-batch-airtime SACK arrival (centering miss closed)",
+				window_after, arrival);
+			// Sanity tell: the STOCK window genuinely does NOT cover it (the bug is real,
+			// not a no-op test). This is an invariant of the geometry, not the fix, so it
+			// holds in BOTH arms — it documents WHY the re-center is needed.
+			check(base_timeout < arrival,
+				"W3a2 STOCK 2*mtt-centered window does NOT cover the long-batch SACK arrival (the centering miss the re-center fixes)",
+				base_timeout, arrival);
+		}
+
+		// --- W3b: WIDTH-MONOTONE — the re-center only GROWS the window (never shrinks),
+		// so the EARLY edge / existing width are preserved (move CENTER later, keep WIDTH). ---
+		{
+			int adder = turnaround_rephase_adder_ms(true,
+				is_ofdm_config(current_configuration), data_batch_size,
+				message_transmission_time_ms, BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				TURNAROUND_REPHASE_GUARD_MS);
+			check(base_timeout + adder >= base_timeout,
+				"W3b re-center is ADD-only: window width never shrinks (early-SACK coverage preserved)",
+				base_timeout + adder, base_timeout);
+		}
+
+		// --- W3c: CFG15-SHORT byte-identity — a SHORT OFDM batch (< the held-CFG16 size)
+		// gets a SMALLER re-center, and a 1-FRAME batch gets ZERO (byte-identical). The
+		// gate exempts MFSK/robust; here we prove the single-frame OFDM path is also
+		// byte-identical, and that a short CFG15 batch never gets a held-CFG16-sized shift. ---
+		current_configuration = CONFIG_15;
+		{
+			int adder_single = turnaround_rephase_adder_ms(true,
+				is_ofdm_config(CONFIG_15), /*batch=*/1,
+				message_transmission_time_ms, BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				TURNAROUND_REPHASE_GUARD_MS);
+			check(adder_single == 0,
+				"W3c single-frame CFG15 batch -> re-center adder == 0 (cannot go partial; byte-identical)",
+				adder_single, 0);
+
+			int adder_short = turnaround_rephase_adder_ms(true,
+				is_ofdm_config(CONFIG_15), /*batch=*/4,
+				message_transmission_time_ms, BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				TURNAROUND_REPHASE_GUARD_MS);
+			int adder_long = turnaround_rephase_adder_ms(true,
+				is_ofdm_config(CONFIG_16), /*batch=*/25,
+				message_transmission_time_ms, BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				TURNAROUND_REPHASE_GUARD_MS);
+			// MONOTONE (stub-tolerant: both arms): a short batch NEVER gets a LARGER
+			// re-center than a long held batch. Under the fix this is strict (790 < 7510);
+			// in the FAIL-BEFORE stub both are 0 (0 <= 0). The shift scales with batch
+			// airtime — it is NOT a fixed widen — so only W3a flips fail-before/pass-after.
+			check(adder_short <= adder_long,
+				"W3c2 short CFG15 batch re-center <= long held-batch re-center (the shift scales with batch airtime, not a fixed widen)",
+				adder_short, adder_long);
+		}
+
+		// --- W3d: ROBUST/MFSK byte-identity — the gate is is_ofdm_config, so at ROBUST_0
+		// the adder is ZERO regardless of batch size or env (CFG15-short/robust/NB UNCHANGED). ---
+		{
+			int adder_robust = turnaround_rephase_adder_ms(true,
+				is_ofdm_config(ROBUST_0), /*batch=*/25,
+				message_transmission_time_ms, BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				TURNAROUND_REPHASE_GUARD_MS);
+			check(adder_robust == 0,
+				"W3d ROBUST_0 forward config -> re-center adder == 0 (is_ofdm-gated; robust/MFSK byte-identical)",
+				adder_robust, 0);
+		}
+
+		// --- W3e: ENV-OFF byte-identity — with the env flag off the adder is ZERO even on
+		// a long held-CFG16 batch (default-off ≡ byte-identical to e538d56). ---
+		{
+			int adder_envoff = turnaround_rephase_adder_ms(/*rephase_env=*/false,
+				is_ofdm_config(CONFIG_16), /*batch=*/25,
+				message_transmission_time_ms, BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				TURNAROUND_REPHASE_GUARD_MS);
+			check(adder_envoff == 0,
+				"W3e env MERCURY_TURNAROUND_REPHASE OFF -> re-center adder == 0 (default-off byte-identical)",
+				adder_envoff, 0);
+		}
+
+		ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
+		message_transmission_time_ms = saved_mtt; ack_pattern_time_ms = saved_apt;
+		data_batch_size = saved_batch;
+		current_configuration = saved_cfg;
+	}
+
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);

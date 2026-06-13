@@ -1317,6 +1317,36 @@ void cl_arq_controller::calculate_receiving_timeout()
 				;
 			if(d2_geometry_fires)
 				timeout += ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS;
+			// FORGIVING-ACK STAGE 3 (data-flow-forgiving-ack.md §S3): batch-airtime
+			// listen-window RE-CENTER (the cheap, byte-identical COMPLEMENT). The stock
+			// frame_drain (=2*message_transmission_time_ms) is a PER-FRAME center with NO
+			// term proportional to the forward BATCH airtime — so on a long held-CFG16
+			// batch (25-30 frames) the window is centered (batch-2) frame-times TOO EARLY
+			// and the reverse SACK (which cannot return until the RSP RECEIVED the whole
+			// batch, ~data_batch_size*mtt + turnaround) lands at/after the late edge. The
+			// RSP branch of THIS function already sizes on data_batch_size*mtt; this removes
+			// the CMD-vs-RSP asymmetry. We ADD the forward airtime the per-frame frame_drain
+			// omitted (data_batch_size*mtt - 2*mtt, clamped >=0) + a small phase guard, so
+			// the LATE edge extends to the true SACK arrival while the EARLY edge and the
+			// whole existing width are PRESERVED (the window only GROWS, the center only
+			// moves LATER — no config loses early-SACK coverage). GATED is_ofdm_config &&
+			// data_batch_size>=BATCH_MAY_BE_PARTIAL_THRESHOLD && env MERCURY_TURNAROUND_REPHASE:
+			// ROBUST/MFSK, single-frame batches, and the unset env all yield adder==0 =>
+			// BYTE-IDENTICAL. This reduces the centering-MISS PROBABILITY (Stage-1 of the
+			// cascade); it is the COMPLEMENT to Tier 1 (miss CHEAP) + Tier 2 (miss FREE), NOT
+			// the primary fix, and it does NOT touch the bench-only DMA capture-ring generator
+			// (Tier 3b). FAIL-BEFORE: -DTURNAROUND_REPHASE_FAILBEFORE -> adder==0 -> the window
+			// stays centered at 2*mtt -> the long-batch SACK arrival is OUTSIDE it (Part W3).
+			static const bool turnaround_rephase_env =
+				(std::getenv("MERCURY_TURNAROUND_REPHASE") != nullptr);
+			int rephase_adder = turnaround_rephase_adder_ms(
+				/*rephase_env=*/turnaround_rephase_env,
+				/*forward_is_ofdm=*/is_ofdm_config(current_configuration),
+				/*data_batch_size=*/data_batch_size,
+				/*message_transmission_time_ms=*/message_transmission_time_ms,
+				/*batch_partial_threshold=*/BATCH_MAY_BE_PARTIAL_THRESHOLD,
+				/*guard_ms=*/TURNAROUND_REPHASE_GUARD_MS);
+			timeout += rephase_adder;
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -1326,13 +1356,14 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
-			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) batch=%d sack=%d\n",
+			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) + s3_rephase=%d batch=%d sack=%d\n",
 				timeout, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
 				margin, sack_enabled ? sack_timeout_extra_ms : 0,
 				d2_geometry_fires
 					? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0,
 				(int)data_ack_retx_turnaround,
+				rephase_adder,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			set_receiving_timeout(timeout);

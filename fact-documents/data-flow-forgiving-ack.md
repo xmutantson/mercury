@@ -551,3 +551,156 @@ the Tier-1 base `55957ea`.
   base-vs-Tier-2 (env-off) shows ONE differing line — a `[TIMING] total=46.2ms vs
   45.1ms` wall-clock instrumentation line (the same jitter present between any two
   runs of the SAME binary), i.e. NO behavioral delta.
+
+---
+
+# STAGE 3 — the batch-airtime listen-window RE-CENTER (the cheap, byte-identical COMPLEMENT)
+
+**Context** (judge verdict, `tasks/w1sx2th28.output` result.judge `runner_up_grafts`
+#3 + result.judge `why`): the CMD reverse-ACK listen window
+(`calculate_receiving_timeout`, COMMANDER branch) is CENTERED on a per-frame
+estimate — `frame_drain = 2 * message_transmission_time_ms` (TWO frame-times) —
+with **NO term proportional to the forward BATCH airtime**. On a long held-CFG16
+batch (25–30 frames) the reverse SACK cannot physically return until the RSP has
+RECEIVED the whole batch, so it lands at/after the window's late edge (Stage-1 of
+the cascade: the centering miss). The RSP branch of the SAME function already sizes
+on `data_batch_size * message_transmission_time_ms` (the `else` branch,
+`arq_common.cc`) — Stage 3 removes the CMD-vs-RSP asymmetry.
+
+**HONEST SCOPE — this is the COMPLEMENT, NOT the primary fix.** Per the judge `why`:
+the dominant HW miss is the real-time DMA capture-ring scroll → `nUnder` force-FAIL
+(`telecom_system.cc:1790-1795`), which the SACK hits even when it lands INSIDE the
+ARQ window. The batch-airtime re-center is **necessary-but-INSUFFICIENT**: it
+reduces the centering-miss PROBABILITY (Stage-1). Tier 1 (forgiving-ACK) makes a
+residual miss CHEAP; Tier 2 (cumulative n_r) makes it FREE; the bench-gated Tier 3b
+(ring-relative correlator) is the only piece that touches the dominant generator.
+Stage 3 is the probability-reducer LAYER, landed because it is nearly free and is
+the prerequisite continuous-ARQ needs (CONTINUOUS_ARQ_DESIGN_V2 §3.6
+INV-WINDOW-PHASE-1). **Do not expect it to move the HW active fraction by itself.**
+
+## §S3.0 The change (pure arithmetic, ADD-only — never shrink the window)
+
+- **Helper** (`common_defines.h`, after the Tier-2 `cumulative_ack_covers`):
+  `turnaround_rephase_adder_ms(rephase_env, forward_is_ofdm, data_batch_size,
+  message_transmission_time_ms, batch_partial_threshold, guard_ms)` — PURE.
+  Returns the **forward-batch airtime the per-frame `frame_drain` omitted**, plus a
+  fixed phase guard:
+  ```
+  forward_airtime_above_framedrain = max(0, data_batch_size*mtt - 2*mtt)
+  adder = forward_airtime_above_framedrain + TURNAROUND_REPHASE_GUARD_MS(150)
+  ```
+  We subtract the `2*mtt` the stock `frame_drain` ALREADY accounts for, so the adder
+  is the *additional* airtime only. `TURNAROUND_REPHASE_GUARD_MS=150` absorbs the
+  ~300–500 ms real-time scheduling/PTT/capture jitter (NOT a ppm term — the
+  ±8.16 ppm crystal is ~65 µs/batch, negligible; timing-budget lens §4).
+- **Wire site** (`arq_common.cc`, `calculate_receiving_timeout` COMMANDER branch,
+  immediately after the D2 widen): `timeout += rephase_adder;` where `rephase_adder`
+  comes from the helper, with the env read once via a cached
+  `static const bool turnaround_rephase_env = getenv("MERCURY_TURNAROUND_REPHASE")`.
+  We **ADD** to the stock `timeout` (frame_drain + sack_arrival + margin) — we never
+  replace/shrink it — so the EARLY edge and the entire existing WIDTH are preserved
+  by construction. The window only GROWS; the center only moves LATER. The
+  `[CMD-POST-TX-CALIB]` print now carries `+ s3_rephase=%d`.
+- **Gate**: `is_ofdm_config(current_configuration) && data_batch_size >=
+  BATCH_MAY_BE_PARTIAL_THRESHOLD(2)` **AND** env `MERCURY_TURNAROUND_REPHASE`. Any
+  closed term → `adder == 0` → **byte-identical**.
+
+## §S3.1 Cross-layer audit (the §5 questions for the window-CENTER term)
+
+1. **Producers of the listen window** (`receiving_timeout`, set via
+   `set_receiving_timeout`): the COMMANDER branch of `calculate_receiving_timeout`
+   (the only site Stage 3 touches), called from `arq_common.cc:1253` (the
+   SACK-batch recompute path) and `:2188`. The RSP branch (`else`, sizes on
+   `data_batch_size*mtt`) is UNTOUCHED. The new term is appended AFTER the D2 widen
+   and BEFORE the turboshift `+2000` and the `sack_timeout_extra_ms` override, so it
+   composes additively with all of them.
+2. **Consumers of the listen window**: the ARQ receive-timeout deadline that decides
+   when a reverse-ACK is declared MISSED (the `data_ack_received==NO` branch that
+   feeds the Tier-1 forgiving-ACK decision and, if not forgiven,
+   `emergency_nack_count`). Stage 3 makes the deadline LATER for long OFDM batches,
+   so a SACK that previously landed past the (early) deadline is now declared
+   RECEIVED — which is exactly the centering-miss reduction. No consumer assumes an
+   UPPER bound on the window; the only invariant is "wide enough to cover the SACK,"
+   which Stage 3 strengthens.
+3. **Valid states**: before any data batch, `data_batch_size` is the negotiated
+   value (≥1; robust chokepoint forces 1, `set_data_batch_size`). At
+   `data_batch_size==1` the term is 0 (single frame cannot go partial; `2*mtt`
+   already covers a 1-frame airtime). At robust/MFSK `is_ofdm_config` is false →
+   term 0. At a fresh OFDM connect `current_configuration` is the OFDM config (set by
+   `load_configuration`), so the gate reads the live PHY config correctly (same
+   `current_configuration` the D2 predicate and H1 already read here).
+4. **Invariants maintained**:
+   - **INV-S3-WIDTH** (width never shrinks): the term is ADDED and clamped `>= 0`, so
+     `timeout_after >= timeout_before` for every input — the early edge / existing
+     coverage are preserved. (Part W3b.)
+   - **INV-S3-BYTEID** (CFG15-short / robust / MFSK / single-frame / env-off are
+     byte-identical): the gate returns 0 on each. (Parts W3c/W3d/W3e.)
+   - **INV-S3-LOCKSTEP** (composes with D2/H1): the D2 widen
+     (`+ptt_off+ptt_on+drift`) and the H1 pre-arm are applied BEFORE the Stage-3
+     term; Stage 3 only widens further, so the FIX-9 §5 lockstep invariant (CMD
+     window ⊇ RSP-keyed ACK window) is STRENGTHENED, never weakened.
+   - **INV-S3-TIER1** (composes with forgiving-ACK): Stage 3 reduces how OFTEN the
+     `data_ack_received==NO` branch is reached on a long OFDM batch; Tier 1 forgives
+     the residual. They are orthogonal (Stage 3 at window-sizing; Tier 1 at the
+     miss-triage), so a miss Stage 3 fails to prevent is still caught by Tier 1.
+5. **What the fix changes**: it alters ONLY the upper bound (late edge) of the CMD
+   listen window for held OFDM batches. Walking each consumer: the miss-declaration
+   deadline moves later (intended); nothing reads the window as an exact equality or
+   an upper limit; the RSP side is untouched (no CMD/RSP batch-size divergence — the
+   root failure mode of the climb-fix family). No shared ARQ state machine field
+   (`batch_seq_id`, `cmd_batch_seq_id`, the SACK trackers) is read or written.
+
+## §S3.2 The test (`--test-climb-engine` Part W3, fail-before / pass-after)
+
+Part W3 (appended to `test_climb_engine`, after Part W2e) replays the REAL
+production helper `turnaround_rephase_adder_ms()` with primed members
+(mtt=320, pattern=389, stock ptt 100/200):
+- **W3a** (the load-bearing CENTERING ORACLE): for a long held-CFG16 batch (25
+  frames) the modelled earliest SACK arrival `((batch-2)*mtt + sack_arrival_geom) =
+  8349 ms` must be `<=` the re-centered window. PASS-AFTER: `window = base(2629) +
+  adder(7510) = 10139 >= 8349` → IN window. FAIL-BEFORE
+  (`-DTURNAROUND_REPHASE_FAILBEFORE` → helper returns 0): `window = 2629 < 8349` →
+  the SACK is OUTSIDE → **W3a FAILS** (the pure-silent centering miss).
+- **W3a2** (geometry sanity, both arms): the STOCK `2*mtt` window genuinely does NOT
+  cover the long-batch arrival (`2629 < 8349`) — documents WHY the re-center is
+  needed; holds in both arms.
+- **W3b** (INV-S3-WIDTH, both arms): `base + adder >= base` (ADD-only).
+- **W3c / W3c2** (INV-S3-BYTEID + airtime-scaling): single-frame CFG15 batch →
+  adder 0; a short CFG15 batch's re-center `<=` a long held batch's (scales with
+  batch airtime, not a fixed widen).
+- **W3d** (INV-S3-BYTEID): ROBUST_0 forward config → adder 0 (is_ofdm-gated).
+- **W3e** (default-off): env OFF → adder 0 even on a long held-CFG16 batch.
+
+## §S3.3 Validation results (2026-06-13)
+
+- **PASS-AFTER** (clean o3, env not consulted in-test — the helper is driven
+  directly with `rephase_env=true`): `--test-climb-engine` **ALL PASS (0 failures)**,
+  rc=0. Part W3 numbers (mtt=320): W3a re-centered window `10139 >= ` SACK arrival
+  `8349` (centering miss CLOSED); W3a2 stock `2629 < 8349` (the miss is real);
+  W3b ADD-only `10139 >= 2629`; W3c single-frame adder `0`; W3c2 short `790 <=`
+  long `7510`; W3d ROBUST_0 adder `0`; W3e env-off adder `0`.
+- **FAIL-BEFORE** (`-DTURNAROUND_REPHASE_FAILBEFORE`, clean o3): rc=1 with EXACTLY
+  ONE flip — **W3a FAILS** (`got=2629 want=8349`: the un-recentered `2*mtt` window
+  does NOT cover the long-batch SACK arrival → the pure-silent centering miss). All
+  byte-identity / width / scaling assertions (W3a2/W3b/W3c/W3c2/W3d/W3e) still PASS
+  (they are stub-tolerant). True fail-before → pass-after toggle on the load-bearing
+  centering oracle.
+- **Full `mercury --test` rc=0** (4256 lines, 14 PASS/passed summary tallies, ZERO
+  FAIL/FAILURE lines; the `[DECOMPRESS] CRC16 mismatch`/`[STREAMING] Reset` lines are
+  the streaming-desync-SAFETY test asserting `corrupt=0`, not failures). build.sh o3
+  clean (only the pre-existing winsock/WASAPI `-Wformat` warnings).
+- **DEFAULT-OFF BYTE-IDENTITY vs `e538d56`** (env `MERCURY_TURNAROUND_REPHASE`
+  unset): the env-off render md5s of the production-wire deterministic tests are
+  IDENTICAL between a freshly-built base-e538d56 binary and the Stage-3 binary —
+  `--test-forgiving-ack` (`840701295f54…`), `--test-cumulative-ack` (`92a688048…`),
+  `--test-sack-oow-reject` (`d159633b8…`), `--test-gap-abort` (`b6c8cf939…`). For
+  `--test-climb-engine`, the Stage-3 render with the new additive Part-W3 lines
+  stripped is byte-identical to base (`a0ca421db5…`) — the ONLY delta is the new W3
+  assertions; no existing climb-engine behavior changed. The re-center is fully
+  inert without the opt-in (the helper returns 0 before any member read).
+- **HONEST**: this is the COMPLEMENT (probability-reducer), not the primary fix.
+  The unit proves the window-geometry re-center is correct, composes with D2/H1/Tier-1,
+  and is byte-identical default-off — it does NOT (and cannot, on this sim) prove a
+  HW active-fraction move; the dominant DMA capture-ring generator is the bench-gated
+  Tier 3b. Validatable here precisely because it is a deterministic window-sizing
+  arithmetic, not the un-reproducible ring-scroll miss.
