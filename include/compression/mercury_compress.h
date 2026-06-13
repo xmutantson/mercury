@@ -76,6 +76,7 @@ public:
     void streaming_disable();
     void streaming_reset();
     void streaming_commit(const unsigned char* raw_data, int raw_len);
+    void ppmd_model_reset();   // Reset ONLY the PPMd model (keep zstd prefix) — see .cc
     void set_pending_raw(const unsigned char* data, int len);
     void commit_pending();     // Move pending_raw → prefix + mark warm
     void clear_pending();
@@ -100,7 +101,16 @@ private:
     // Streaming state
     bool streaming_active;
     int stream_batch_count;       // Batches since last reset (0 = next compress is fresh)
-    bool ppmd_model_warm;         // PPMd model has been used at least once without reset
+    bool ppmd_model_warm;         // A streaming batch has been COMMITTED since the last
+                                  // reset (zstd OR PPMd). Governs PPMd-only mode (compress_block),
+                                  // raw-win/doesn't-fit reset, and RX desync detection.
+    bool ppmd_model_initialized;  // The PPMd model has ACTUALLY been Ppmd8_Init()-ed (and not
+                                  // reset) since streaming began. ONLY this flag may gate the
+                                  // Init-skip in ppmd_compress/ppmd_decompress — ppmd_model_warm
+                                  // can be true after a zstd-only batch whose commit never touched
+                                  // the PPMd model, which would otherwise encode/decode into an
+                                  // uninitialized model (segfault). See ppmd_compress() for the
+                                  // root-cause comment.
 
     unsigned char* zstd_prefix;
     int zstd_prefix_len;

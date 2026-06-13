@@ -112,6 +112,7 @@ cl_compressor::cl_compressor()
 	streaming_active = false;
 	stream_batch_count = 0;
 	ppmd_model_warm = false;
+	ppmd_model_initialized = false;
 	zstd_prefix = nullptr;
 	zstd_prefix_len = 0;
 	pending_raw = nullptr;
@@ -212,6 +213,10 @@ void cl_compressor::streaming_enable()
 
 	stream_batch_count = 0;
 	ppmd_model_warm = false;
+	// Note: the PPMd model is NOT Ppmd8_Init()-ed here — it is lazily initialized
+	// on the first ppmd_compress/ppmd_decompress call (or after a reset). Mark it
+	// uninitialized so the first PPMd use Init()s before encoding/decoding.
+	ppmd_model_initialized = false;
 	streaming_active = true;
 
 	printf("[STREAMING] Enabled: PPMd carry + zstd prefix (32KB)\n");
@@ -226,6 +231,7 @@ void cl_compressor::streaming_disable()
 	if (ppmd_ctx)
 		Ppmd8_Init((CPpmd8*)ppmd_ctx, PPMD_ORDER, PPMD8_RESTORE_METHOD_RESTART);
 	ppmd_model_warm = false;
+	ppmd_model_initialized = false;
 	stream_batch_count = 0;
 
 	free(zstd_prefix);
@@ -248,6 +254,11 @@ void cl_compressor::streaming_reset()
 	if (ppmd_ctx)
 		Ppmd8_Init((CPpmd8*)ppmd_ctx, PPMD_ORDER, PPMD8_RESTORE_METHOD_RESTART);
 	ppmd_model_warm = false;
+	// The explicit Ppmd8_Init above leaves the model in a valid RESTART state, but
+	// the streaming contract is "next streaming PPMd batch starts fresh": mark it
+	// uninitialized so the next ppmd_compress/decompress Re-Init()s deterministically
+	// (matches the prior behavior where warm==false forced a re-Init).
+	ppmd_model_initialized = false;
 	zstd_prefix_len = 0;
 	pending_raw_len = 0;
 	stream_batch_count = 0;
@@ -312,6 +323,22 @@ void cl_compressor::streaming_commit(const unsigned char* raw_data, int raw_len)
 	stream_batch_count++;
 }
 
+// Reset ONLY the PPMd streaming model (leave the zstd prefix / committed window
+// intact). Used when a streaming batch is carried by zstd/raw rather than PPMd:
+// the PPMd model must not carry symbols across a non-PPMd batch, because TX and
+// RX diverge there (TX may have speculatively run ppmd_compress to compare; RX
+// only ran zstd). Resetting the PPMd model on BOTH sides at every non-PPMd batch
+// keeps the model in lock-step: any PPMd batch is then either the fresh start of
+// a PPMd run (both sides just reset) or a continuation of an all-PPMd run (both
+// sides carried identically). The zstd prefix is unaffected and keeps warming.
+void cl_compressor::ppmd_model_reset()
+{
+	if (!streaming_active) return;
+	// Mark uninitialized so the next ppmd_compress/decompress Re-Init()s fresh and
+	// deterministically on both sides. No Ppmd8_Init here — it is lazy.
+	ppmd_model_initialized = false;
+}
+
 // ---------- Shannon entropy (bits per byte) ----------
 
 float cl_compressor::quick_entropy(const unsigned char* data, int len)
@@ -341,9 +368,19 @@ int cl_compressor::ppmd_compress(const unsigned char* in, int in_len,
 
 	CPpmd8* p = (CPpmd8*)ppmd_ctx;
 
-	// Streaming: skip Init if model is warm (carries context from previous batch)
-	if (!streaming_active || !ppmd_model_warm)
+	// ROOT-CAUSE GUARD: skip Ppmd8_Init ONLY when the PPMd model is actually
+	// initialized AND carries valid streaming context. ppmd_model_warm is NOT a
+	// safe gate here: streaming_commit() sets warm=true after ANY committed batch
+	// (including a zstd-only batch that never exercised the PPMd model), so a warm
+	// model can be one that was only Ppmd8_Construct()+Alloc()-ed, never
+	// RestartModel()-ed. Encoding into that uninitialized model dereferences
+	// uninitialized context pointers -> segfault. Gating on ppmd_model_initialized
+	// guarantees the model is RESTART-initialized before the first symbol.
+	if (!streaming_active || !ppmd_model_initialized)
+	{
 		Ppmd8_Init(p, PPMD_ORDER, PPMD8_RESTORE_METHOD_RESTART);
+		ppmd_model_initialized = true;
+	}
 
 	CByteOutBuf outStream;
 	outStream.vt.Write = ByteOutBuf_Write;
@@ -374,9 +411,17 @@ int cl_compressor::ppmd_decompress(const unsigned char* in, int in_len,
 
 	CPpmd8* p = (CPpmd8*)ppmd_ctx;
 
-	// Streaming: skip Init if model is warm (carries context from previous batch)
-	if (!streaming_active || !ppmd_model_warm)
+	// ROOT-CAUSE GUARD (RX mirror of ppmd_compress): skip Ppmd8_Init only when the
+	// PPMd model is actually initialized. The RX side NEVER speculatively runs PPMd
+	// (it only decodes the chosen algo), so after a zstd batch the RX PPMd model is
+	// guaranteed uninitialized while ppmd_model_warm is true (set by the RX
+	// streaming_commit). Decoding a later PPMd frame against that model would read
+	// uninitialized context -> segfault. Gate on ppmd_model_initialized, not warm.
+	if (!streaming_active || !ppmd_model_initialized)
+	{
 		Ppmd8_Init(p, PPMD_ORDER, PPMD8_RESTORE_METHOD_RESTART);
+		ppmd_model_initialized = true;
+	}
 
 	CByteInBuf inStream;
 	inStream.vt.Read = ByteInBuf_Read;
@@ -453,11 +498,21 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 	// Use heap workspace split in two halves for zstd and PPMd output
 	int half = workspace_size / 2;
 
-	// Streaming mode with warm model: PPMd only.
+	// Streaming mode with a WARM, INITIALIZED PPMd model: PPMd only.
 	// Must NOT try both algorithms — trying PPMd advances the model state.
 	// If zstd were chosen, the RX side would decompress with zstd (no PPMd
 	// model advancement) → model desync on next streaming batch.
-	if (streaming_active && ppmd_model_warm)
+	//
+	// Gate on ppmd_model_initialized, NOT ppmd_model_warm: ppmd_model_warm is set
+	// after ANY committed batch (including zstd-only batches), but PPMd-only mode
+	// is only safe once PPMd has actually carried a batch and initialized the model
+	// on BOTH sides. While the streaming context is warm but PPMd has not yet
+	// carried (e.g. a leading zstd run), stay in the cold try-both branch so PPMd
+	// is only adopted when it wins — at which point the model is initialized in
+	// lock-step on TX and RX. (ppmd_model_reset() drops this flag whenever a
+	// non-PPMd batch is committed, so a single zstd batch mid-stream re-arms
+	// try-both rather than forcing PPMd-only against a diverged model.)
+	if (streaming_active && ppmd_model_initialized)
 	{
 		if (entropy < ENTROPY_SKIP_ALL)
 		{
@@ -535,6 +590,17 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 		}
 		return -1;
 	}
+
+	// Streaming: a zstd-carried batch must NOT leave the PPMd model "carrying".
+	// The cold try-both branch above may have speculatively run ppmd_compress
+	// (advancing the TX model) before zstd won; the RX runs zstd-only and never
+	// touches its PPMd model. Drop the PPMd model on BOTH sides at every non-PPMd
+	// batch so the next PPMd batch Re-Init()s fresh in lock-step. (RAW wins are
+	// already handled by the streaming_reset() above; this covers the zstd-wins
+	// path, which previously left ppmd_model_warm=true → PPMd-only mode against a
+	// model the RX never initialized → segfault.) The zstd prefix is untouched.
+	if (streaming_active && best_algo != COMPRESS_ALGO_PPMD)
+		ppmd_model_reset();
 
 	// Write header: [algo_flags:1][comp_size:2 LE][orig_size:2 LE][crc16:2 LE if streaming]
 	uout[0] = (unsigned char)(best_algo |
@@ -654,6 +720,18 @@ int cl_compressor::decompress_block(const char* in, int in_len, char* out, int o
 			return -1;
 		}
 	}
+
+	// RX mirror of compress_block's post-batch PPMd model reset: any NON-PPMd
+	// streaming batch (zstd OR raw) leaves the RX PPMd model untouched (only zstd /
+	// memcpy ran). The TX resets its PPMd model after every non-PPMd chosen algo,
+	// so the RX MUST do the same on every non-PPMd decoded algo to stay in
+	// lock-step. Otherwise ppmd_model_warm could stay true while the model is
+	// uninitialized (or, after a RAW batch, the two sides' init state could
+	// diverge), and the next PPMd frame's warm path would decode into an
+	// uninitialized/diverged model (segfault or desync). PPMd frames legitimately
+	// carry the model — they are the only algo that must NOT reset it.
+	if (streaming_active && result > 0 && algo != COMPRESS_ALGO_PPMD)
+		ppmd_model_reset();
 
 	return result;
 }
