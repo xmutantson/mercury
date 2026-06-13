@@ -86,6 +86,7 @@ priming inside `streaming_enable`):
 | C4 | `decompress_block()` CRC16 | `compress_crc16(plaintext)` vs header CRC. Second line of defense for any residual desync. |
 | C5 | ARQ RX `copy_data_to_buffer` (arq_common.cc:8624) | `decompress_block` return >0 ⇒ push + `streaming_commit`; <=0 ⇒ `streaming_reset` + push RAW. A version-mismatch (-1) routes here → raw fallback, NO corruption. |
 | C6 | ARQ ratio EMA (arq_common.cc:8651) | `dec_size / comp_payload`. Unaffected (priming only changes payload size, not the math). |
+| C7 | GUI compression-algo indicator (`g_gui_state.compression_algo`, stored at `arq_common.cc` RX + `arq_commander.cc` TX; read at `gui_main.cc` as `1=PPMd / 2=zstd / else RAW`) | **NEW (added in integration audit).** Reads the algo nibble of the header byte for display only. The dict stamps the version into bits 5-7, so a primed PPMd byte (`0x25`) no longer equals `1` → the indicator mislabeled every primed frame as **RAW**. **FIX (integration):** both store sites mask `comp_data[0] / comp_buf[0]` with `COMPRESS_ALGO_MASK` (0x03) before `.store()`, so the display reflects only the algo nibble. Cosmetic, `#ifdef MERCURY_GUI_ENABLED` (headless RPi unaffected, byte-identical); the wire/decode path (C2/C4, `mercury_compress.cc:738`) already masked correctly, so round-trip integrity was never affected. This consumer was missed by the original §3 audit. |
 
 ---
 

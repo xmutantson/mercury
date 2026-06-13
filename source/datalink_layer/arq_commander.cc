@@ -14766,8 +14766,10 @@ void cl_arq_controller::process_buffer_data_commander()
 #ifdef MERCURY_GUI_ENABLED
 						// Monitor tap: plaintext before compression
 						gui_push_monitor_text(staging, raw_size, true);
-						// Push algo to GUI (read from compressed header byte 0)
-						g_gui_state.compression_algo.store((int)(unsigned char)comp_buf[0]);
+						// Push algo to GUI (read from compressed header byte 0).
+						// Mask off the dict-version bits (5-7) so the algo nibble (bits 0-1)
+						// is not mislabeled as RAW when a dict-primed frame stamps a version.
+						g_gui_state.compression_algo.store((int)((unsigned char)comp_buf[0] & COMPRESS_ALGO_MASK));
 #endif
 					}
 					else

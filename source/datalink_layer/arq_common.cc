@@ -9824,8 +9824,10 @@ void cl_arq_controller::copy_data_to_buffer()
 					compress_ratio_estimate = 0.7f * compress_ratio_estimate + 0.3f * measured;
 				}
 #ifdef MERCURY_GUI_ENABLED
-				// Push algo to GUI from decompressed header (responder side)
-				g_gui_state.compression_algo.store((int)(unsigned char)comp_data[0]);
+				// Push algo to GUI from decompressed header (responder side).
+				// Mask off the dict-version bits (5-7) so the algo nibble (bits 0-1)
+				// is not mislabeled as RAW when a dict-primed frame stamps a version.
+				g_gui_state.compression_algo.store((int)((unsigned char)comp_data[0] & COMPRESS_ALGO_MASK));
 #endif
 			}
 			else
