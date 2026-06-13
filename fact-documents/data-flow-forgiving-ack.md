@@ -1,7 +1,8 @@
 # Data-Flow Audit: Forgiving-ACK (Tier 1 — decouple forward-healthy reverse-ACK miss from the BREAK→ROBUST_0 demote; Tier 2 — cumulative-n_r self-healing SACK)
 
-**Status**: Authoritative as of 2026-06-13 on `feat/forgiving-ack-tier1` (off
-`integ/overnight-shippable` @ `f359f01`). Tier 1 is the standalone root fix; the
+**Status**: Authoritative as of 2026-06-13 on `integ/overnight-shippable` (the
+shippable base @ `eb465c3`, advanced by the **MF hardening pass** — see the
+ADVERSARIAL-SAFETY MUST-FIXES note below). Tier 1 is the standalone root fix; the
 **TIER 2** section below (cumulative-n_r status report, built on top of the Tier-1
 commit `55957ea`) is also authoritative. Every change to `emergency_nack_count`,
 the BREAK trigger, `break_drop_step`, `breaks_since_last_data_success`, the
@@ -31,6 +32,26 @@ guarantees the link cannot loop forever re-airing into a dead link.
 **Default-off**: the whole tier is gated by env `MERCURY_FORGIVING_ACK`
 (default-off ≡ byte-identical to the monitor base). The fail-before stub is
 `-DFORGIVING_ACK_FAILBEFORE`.
+
+**ADVERSARIAL-SAFETY MUST-FIXES (2026-06-13, the MF hardening pass — these TIGHTEN
+safety, never loosen; default-off byte-identical preserved).** A 4-agent
+adversarial review (`tasks/4b578e73…/wmmcvu4c6.output`) found the stack
+default-off-inert but NOT enable-ready: the no-silent-byte-loss property rested on
+an undocumented numeric coupling and §T2.4 documented a forward-rejection the code
+did not perform. Five hardenings landed:
+- **MF-1** — guard the load-bearing `nResends` margin (INV-FA-NRESENDS): a
+  compile-time `static_assert` (common_defines.h) + a runtime FAIL-LOUD guard in
+  `set_nResends` (arq_common.cc). See §FA-NRESENDS / §4 INV-FA-NRESENDS.
+- **MF-2** — the missing regression: `--test-forgiving-ack` Part E (forward-DEAD
+  link, nResends exhaustion, fail-before `-DFORGIVING_ACK_NRESENDS_FAILBEFORE`).
+- **MF-3** — the missing cross-layer audit of `messages_tx[].nResends/status/
+  FAILED_/fifo_buffer_tx` (§FA-NRESENDS) + correction of the false §3/§4 FH
+  "distinguishes live-vs-dead" implication (the genuine-death net is the FH-4 bound
+  ALONE — §4 INV-FA-2 correction).
+- **MF-4** — the false §T2.4 safety claim corrected + the structural forward-n_r
+  clamp added to `cumulative_ack_covers` (cumulative path only, default-off).
+- **MF-5** — `--test-cumulative-ack` Part F (forward-n_r rejection, fail-before
+  `-DCUMULATIVE_ACK_FWD_FAILBEFORE`).
 
 ---
 
@@ -196,6 +217,30 @@ latch inherits its correctness, it does not re-derive it.
   misses with no success — so a forward channel that DEGRADES from healthy to
   dead AFTER the anchor was set cannot wedge the link forever; it BREAKs within
   N batches.
+  - **[CORRECTION 2026-06-13, MF-3 — sharpen what "(a)" actually buys.]** The
+    adversarial review (`tasks/4b578e73…/wmmcvu4c6.output`) showed the three
+    health signals do NOT distinguish a live link from one that DIED AFTER the
+    anchor was raised, so the real genuine-death net is the **FH-4 bound ALONE**,
+    not "(a)+(b)":
+    - **FH-2** (`link_status==CONNECTED`) has NO data-plane forward-death
+      transition — `link_status` drops only on user disconnect
+      (`arq_commander.cc:520`), crypto/PSK fail (`:2314/:5066/:5129`), handshake
+      echo CRC/cap mismatch (`:4775/:4794/:4882`), or inbound CLOSE_CONNECTION
+      (`:5746`). It stays CONNECTED for the whole session on a forward-dead link.
+    - **FH-1** (`is_ofdm_config(last_data_viable_config)`) is STICKY while
+      forgiving — its sole lowering path is the anchor-DEMOTE
+      (`arq_commander.cc:4087`, inside the BREAK-firing block), and the forgiving
+      `goto forgiving_ack_skip_break` jumps OVER that block, so FH-1 cannot fall
+      while the fix is forgiving.
+    - **FH-3** (`turbo_done`) is TRUE on any held link.
+    Therefore a link that dies AFTER the OFDM anchor was raised is forgiven for
+    the FULL `FORGIVING_ACK_MAX_CONSEC` (8) misses + `emergency_nack_threshold`
+    (3) NACKs (~28–38 s at ~3.5 s/turnaround) before BREAK. The bound is the sole
+    death-detector and (b) is the part that matters; (a) only excludes links that
+    were NEVER sustainably-OFDM-healthy (cold/robust/mid-handshake). The chosen
+    `FORGIVING_ACK_MAX_CONSEC=8` is justified against this worst-case
+    stall-before-rescue latency in §FA-NRESENDS (it also sets the load-bearing
+    nResends margin — lowering it would shorten the stall AND widen the margin).
 - **INV-FA-3 (no shared-state corruption)**: the fix WRITES only
   `forgiving_ack_consec_forgiven` (new, CMD-only) and the re-enqueue of the
   failed batch's frames (the SAME FIFO push-back the gearshift/FIX-4/FIX-9 BREAK
@@ -218,6 +263,24 @@ latch inherits its correctness, it does not re-derive it.
   `cmd_batch_seq_id` or load a new config), so the re-air carries the
   contiguous bsi by construction. The fix never crosses a config boundary, so the
   lossless-demote bsi-rollback (FIX-9) is N/A here.
+  - **[CORRECTION 2026-06-13, MF-3 — the omission this claim hid.]** "the EXISTING
+    same-gear retransmit machinery" IS the `nResends`-bounded
+    `process_messages_tx_data` path that DROPS a frame to `FAILED_` on budget
+    exhaustion (`arq_commander.cc:1727-1746`). Every forgiven re-air decrements the
+    per-frame `nResends`; if that budget is exhausted BEFORE the bound-BREAK
+    re-queues the batch, the frame is silently lost. This invariant said nothing
+    about it — see the new **§FA-NRESENDS** for the producer/consumer audit of
+    `messages_tx[].nResends/status/FAILED_` and the load-bearing **INV-FA-NRESENDS**
+    margin that closes the gap.
+- **INV-FA-NRESENDS (no silent forward-byte loss before the BREAK)** — see
+  **§FA-NRESENDS**. The live per-frame resend budget MUST stay strictly greater
+  than `FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold` (production `20 > 8+3
+  = 11`), else a forgiven re-air depletes a frame to `FAILED_` (permanent silent
+  byte loss + streaming-model desync) BEFORE the rescuing bound-BREAK re-queues
+  it. Guarded by a compile-time `static_assert` (common_defines.h) + a runtime
+  guard in `set_nResends` (arq_common.cc) that FAILS LOUD on a margin-violating
+  config when `MERCURY_FORGIVING_ACK` is enabled; pinned by `--test-forgiving-ack`
+  Part E.
 
 ---
 
@@ -268,6 +331,123 @@ states (§3) AND the FORGIVING_ACK_MAX_CONSEC bound (INV-FA-2).
 
 ---
 
+## §FA-NRESENDS — the messages_tx[].nResends cross-layer audit (MF-3, added 2026-06-13)
+
+**Why this section exists.** The original §1–§5 audit covered
+`emergency_nack_count` / `forgiving_ack_consec_forgiven` / the BREAK machinery but
+NEVER mentioned `messages_tx[].nResends`, `nLost_data`, or `FAILED_`. Two
+independent adversarial reviewers reached OPPOSITE life-or-death verdicts on the
+SAME code precisely because of this omission
+(`tasks/4b578e73…/wmmcvu4c6.output`): the forgiving re-air feeds the
+`nResends`-bounded TX path that can drop a frame to `FAILED_` (silent byte loss),
+and whether it does turns ENTIRELY on an undocumented numeric coupling. Per
+CLAUDE.md §"Cross-Layer Data-Flow Audits", here is the producer/consumer audit of
+that shared state and the invariant that makes the coupling safe.
+
+This is a PHY/ARQ ↔ application-FIFO cross-layer interaction: the forgiving-ACK
+decision (ARQ) drives same-gear re-airs (PHY) that deplete a per-frame counter
+whose exhaustion discards application plaintext (application FIFO).
+
+### §FA-N.1 Producers (every writer of `messages_tx[].nResends` / `.status` / `FAILED_`)
+
+- **Seed**: `messages_tx[i].nResends = this->nResends` at enqueue
+  (`arq_commander.cc:1314`). `this->nResends` is the controller-wide budget seated
+  by `set_nResends(default_configuration_ARQ.nResends)` (`arq_common.cc:2044`,
+  called from `load_configuration()` on the connect path); production value
+  `nResends=20` (`datalink_config.cc:56`). The in-ctor default is `3`
+  (`arq_common.cc:521`) but `load_configuration` OVERWRITES it before any data
+  transfer — production is **20**, not 3 (this is the exact constant the two
+  reviewers disagreed over).
+- **Decrement + FAILED_**: `process_messages_tx_data()` on an `ACK_TIMED_OUT`
+  slot: `if(--messages_tx[i].nResends>0){ resend }` ELSE `{ stats.nLost_data++;
+  messages_tx[i].status=FAILED_; }` (`arq_commander.cc:1727-1746`). EVERY re-air
+  (forgiven OR not — both mark the batch `ACK_TIMED_OUT` and re-present it)
+  decrements the budget; exhaustion → `FAILED_`.
+- **Cleanup zeroes a FAILED_ slot**: on `status==FAILED_`, cleanup sets
+  `length=0; nResends=0; status=FREE; type=NONE` ("SEND FAILED TO USER",
+  `arq_common.cc:3237-3245`) — the bytes are reported failed and discarded.
+- **Backup-copy discard**: `finalize_block_commander()` `fifo_buffer_backup.flush()`
+  (`arq_commander.cc:5799`) and the FIX-4 carve re-queue path's
+  `fifo_buffer_backup.flush()` (`arq_commander.cc:3915`) drop the only recoverable
+  plaintext copy once the block resolves (including via `FAILED_`).
+- **SACK-refresh (partial)**: a partial-SACK retransmit refreshes the budget only
+  when already 0: `if(messages_tx[id].nResends==0) messages_tx[id].nResends =
+  nResends` (`arq_common.cc:6039-6040`, `:5601-5602`) — a mid-depletion frame is
+  NOT topped up by a partial.
+
+### §FA-N.2 Consumers (every reader that depends on the budget surviving)
+
+- **The decrement test itself** (`arq_commander.cc:1729`) — reads the budget to
+  decide resend-vs-FAILED_.
+- **The bound-BREAK re-queue** (the rescue the forgiving path SUPPRESSES for the
+  forgiven window): on BREAK, all `status != FREE && length > 0` frames are pushed
+  back to `fifo_buffer_tx` (`arq_commander.cc:3909-3912`, and
+  `restore_tx_from_compressed()` for compressed sessions, `:3905`) BEFORE any
+  frame reaches `FAILED_`. This is the ONLY thing that converts a stalled batch
+  back into recoverable bytes — and it does not fire until
+  `emergency_nack_count >= emergency_nack_threshold`.
+- **Application** — consumes the delivered FIFO; a `FAILED_`-dropped frame is a
+  silent hole, and in the streaming-compressed deployment mode (PPMd/zstd) the
+  hole DESYNCS the decompression model → silent-WRONG-bytes for the remainder of
+  the stream (not a localized gap). This widens the blast radius of a margin
+  violation from "one dropped batch" to "corrupted stream tail".
+
+### §FA-N.3 Valid states + the timing the invariant turns on
+
+On a forward-DEAD-after-anchor held-OFDM link (forward-healthy anchor ⇒ each miss
+FORGIVEN until the bound; reverse ACK never lands), the per-frame budget is
+decremented on EVERY miss. The rescuing bound-BREAK does not fire until
+`FORGIVING_ACK_MAX_CONSEC` (8) forgives have elapsed AND then
+`emergency_nack_threshold` (3) NON-forgiven NACKs accumulate `emergency_nack_count`
+to the gate — i.e. the BREAK fires on miss `8 + 3 = 11`. So the budget must
+OUTLAST 11 decrements:
+
+> **INV-FA-NRESENDS**: the live per-frame `nResends` budget MUST be STRICTLY
+> GREATER than `FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold`. Production:
+> `20 > 8 + 3 = 11` ✓ (9 resends of headroom). If violated (e.g. a low-latency
+> profile lowering `nResends` to ≤11, or raising `FORGIVING_ACK_MAX_CONSEC`), a
+> frame reaches `FAILED_` BEFORE the bound-BREAK re-queues the batch =
+> **PERMANENT SILENT BYTE LOSS** (+ streaming-model desync). With the ctor default
+> 3 the loss is at miss 3 (the constant Pass 3 of the review built its
+> "6th-defect" break on — it does NOT fire in production because `load_configuration`
+> seats 20).
+
+### §FA-N.4 The guards (MF-1) and the test (MF-2)
+
+- **Compile-time** (`include/common/common_defines.h`, beside
+  `FORGIVING_ACK_MAX_CONSEC`): a `static_assert(PRODUCTION_NRESENDS_REF >
+  FORGIVING_ACK_MAX_CONSEC + EMERGENCY_NACK_THRESHOLD_REF)` locks the DESIGN
+  constant — an edit RAISING `FORGIVING_ACK_MAX_CONSEC` past the margin fails the
+  BUILD loudly. The reference constants are documented twins of the runtime sources
+  (`arq_common.cc:842`, `datalink_config.cc:56`).
+- **Runtime** (`set_nResends`, `arq_common.cc`): the authoritative guard reads the
+  ACTUAL live `nResends` and `emergency_nack_threshold`; when
+  `MERCURY_FORGIVING_ACK` is enabled AND `nResends <= FORGIVING_ACK_MAX_CONSEC +
+  emergency_nack_threshold`, it prints `[FATAL][FORGIVING-ACK] INV-FA-NRESENDS
+  VIOLATED …` and `abort()`s — refusing to run rather than silently risk byte
+  loss. Gated on the env so a low-latency profile that lowers `nResends` WITHOUT
+  enabling forgiving-ACK is not spuriously refused; with the env unset the guard
+  never reads/aborts ⇒ **default-off byte-identical**.
+- **Test** (`--test-forgiving-ack` Part E, MF-2): models the forward-DEAD held-OFDM
+  link, decrements a representative frame's budget on every re-air, and asserts the
+  bound-BREAK fires (miss 11) BEFORE any frame reaches `FAILED_` (no `nLost_data`,
+  bytes preserved). FAIL-BEFORE (`-DFORGIVING_ACK_NRESENDS_FAILBEFORE`, budget=3):
+  the frame reaches `FAILED_` at miss 3 < BREAK at miss 11 ⇒ E3 FAILS, proving the
+  margin is load-bearing. PASS-AFTER (budget=20): zero `FAILED_`.
+
+### §FA-N.5 Why `FORGIVING_ACK_MAX_CONSEC=8` (re-justified, MF-3)
+
+`FORGIVING_ACK_MAX_CONSEC` sets BOTH the worst-case dead-link stall-before-rescue
+(≈ `(8+3)×~3.5 s ≈ 28–38 s`, §4 INV-FA-2 correction) AND the nResends margin
+headroom (`20 - 11 = 9`). =8 keeps the forgive burst ≥ a couple of real
+turnarounds (so a transient 1–2-batch reverse-ACK miss is forgiven, the whole
+point) while bounding both the stall AND the budget consumption to a handful of
+same-gear airings. It could be LOWERED (e.g. 4–6) to shorten the dead-link stall
+and widen the margin further; it MUST NOT be RAISED above `nResends - 3 - 1 = 16`
+without also raising `nResends` (the static_assert enforces this at build time).
+
+---
+
 ## §6 Regression test (paired with this document, per CLAUDE.md)
 
 `--test-forgiving-ack` (new CLI flag, in-process synthetic-fire; no IONOS/RF)
@@ -293,6 +473,14 @@ fail-before (`-DFORGIVING_ACK_FAILBEFORE`) / pass-after.
 - **RESET #4** — a data-ACK (clean OR partial) after some forgiven misses resets
   `forgiving_ack_consec_forgiven` to 0 ⇒ a later miss is forgiven fresh ⇒ assert
   PASS. Proves the bound is per-stall, not cumulative.
+- **NRESENDS MARGIN #E (Part E, MF-2)** — the nResends-exhaustion / no-silent-loss
+  proof (§FA-NRESENDS). Models a forward-DEAD held-OFDM link, decrements a
+  representative frame's per-frame budget on every re-air, and asserts the
+  bound-BREAK re-queues the batch (bytes preserved) BEFORE any frame reaches
+  `FAILED_`. FAIL-BEFORE (`-DFORGIVING_ACK_NRESENDS_FAILBEFORE`, budget=3): a frame
+  hits `FAILED_` at miss 3 < BREAK at miss 11 ⇒ E3 FAILS (loss is real, margin is
+  load-bearing). PASS-AFTER (budget=20): zero `FAILED_`, `nLost_data==0`. (Under
+  `-DFORGIVING_ACK_FAILBEFORE` Part E is SKIPPED — the margin is a fix-only path.)
 
 Full `--test` must remain GREEN; default-off (env unset) render md5 must equal
 the base (`integ/overnight-shippable`).
@@ -441,21 +629,30 @@ CONSUMERS (CMD reads the bsi field):
   cmd_batch_seq_id)`.
 - The startup MFSK arm (`arq_commander.cc:130`): same in-window check.
 - Tier-2 wrap: a pure helper `cumulative_ack_covers(rx_n_r, target_bsi, cap_on,
-  per_batch_in_window)`. When `cap_on`, `target_bsi` is addressed iff it lies in
-  `[n_r - W .. n_r + 1]` (mod 256): sub-range (a) `((n_r - target) & 0xFF) <=
-  CUMULATIVE_ACK_WINDOW` = at-or-below the high-water = CONFIRMED DELIVERED (the
-  cumulative ACK / self-heal); sub-range (b) `target == (n_r+1)&0xFF` = the
-  in-flight PARTIAL batch the 30-bit selective bitmap describes (the contiguous
-  successor; Mercury is batch-level stop-and-wait so the only batch above n_r is
-  n_r+1). The forward overhang is BOUNDED to EXACTLY 1, so a corrupt n_r still
-  cannot ACK a far-future / unsent batch (§T2.4 safety preserved). When `!cap_on`
-  it returns `per_batch_in_window` (byte-identical fallback). This REPLACES the
-  `rx_bsi==cmd_bsi||rx_bsi==prev_bsi` acceptance test ONLY when the cap is on — it
-  GENERALIZES "prev (one batch back)" to "any batch ≤ n_r within W (plus the
-  partial n_r+1)", which is exactly the self-heal (a later n_r covers an earlier
-  missed report). All apply sites call it TWICE (target=cmd_bsi, target=prev_bsi)
-  and OR the results — the outstanding batch is one of those, and the bitmap→
-  messages_tx[] slot mapping is by INDEX (independent of the bsi value), unchanged.
+  per_batch_in_window, cmd_outstanding_bsi=-1)` (the `cmd_outstanding_bsi`
+  parameter is the **MF-4** addition). When `cap_on`, `target_bsi` is addressed
+  iff it lies in `[n_r - W .. n_r + 1]` (mod 256): sub-range (a) `((n_r - target)
+  & 0xFF) <= CUMULATIVE_ACK_WINDOW` = at-or-below the high-water = CONFIRMED
+  DELIVERED (the cumulative ACK / self-heal); sub-range (b) `target == (n_r+1)&0xFF`
+  = the in-flight PARTIAL batch the 30-bit selective bitmap describes (the
+  contiguous successor; Mercury is batch-level stop-and-wait so the only batch
+  above n_r is n_r+1). The forward overhang of the TARGET vs n_r is bounded to 1.
+  ~~so a corrupt n_r still cannot ACK a far-future / unsent batch (§T2.4 safety
+  preserved).~~ **[CORRECTED 2026-06-13, MF-4: the target-overhang bound did NOT
+  protect against a corrupt FORWARD n_r — see §T2.4. The window is anchored from
+  the received n_r, so a forward n_r slides the whole `[n_r-W..n_r+1]` window
+  forward over unsent batches. MF-4 adds the `cmd_outstanding_bsi` clamp: when the
+  caller supplies `prev_bsi` (all three apply sites do), an n_r forward of it —
+  `(n_r-prev_bsi)&0xFF in [1,128]` — falls back to per-batch, structurally
+  rejecting it.]** When `!cap_on` it returns `per_batch_in_window` (byte-identical
+  fallback). This REPLACES the `rx_bsi==cmd_bsi||rx_bsi==prev_bsi` acceptance test
+  ONLY when the cap is on — it GENERALIZES "prev (one batch back)" to "any batch ≤
+  n_r within W (plus the partial n_r+1), provided n_r is NOT forward of the
+  outstanding batch", which is exactly the self-heal (a later n_r covers an earlier
+  missed report). All apply sites call it TWICE (target=cmd_bsi, target=prev_bsi),
+  **each now passing `cmd_outstanding_bsi=prev_bsi`**, and OR the results — the
+  outstanding batch is one of those, and the bitmap→messages_tx[] slot mapping is
+  by INDEX (independent of the bsi value), unchanged.
 
 ## §T2.4 Why "≤ n_r acked" is safe against the CMD TX queue (stop-and-wait model)
 
@@ -467,10 +664,40 @@ n_r:
 - **n_r == prev_bsi** ⇒ the outstanding batch is confirmed delivered ⇒ identical
   to today's clean-ACK-for-prev acceptance.
 - **n_r > prev_bsi** is impossible in steady stop-and-wait (RSP cannot have
-  delivered a batch the CMD never sent); the bounded window only looks BACKWARD
-  from n_r, never forward, so a corrupt n_r ahead of `cmd_batch_seq_id` is
-  rejected by the per-batch fallback edge (it is NOT within `[n_r-W..n_r]` for
-  any target the CMD holds) — no future/unsent batch is ever ACKed.
+  delivered a batch the CMD never sent) — so a LEGITIMATE n_r is always
+  `<= prev_bsi`.
+  - ~~the bounded window only looks BACKWARD from n_r, never forward, so a corrupt
+    n_r ahead of `cmd_batch_seq_id` is rejected by the per-batch fallback edge (it
+    is NOT within `[n_r-W..n_r]` for any target the CMD holds) — no future/unsent
+    batch is ever ACKed.~~ **[CORRECTED 2026-06-13, MF-4 — this was FALSE.]** The
+    pre-MF-4 `cumulative_ack_covers` measured its backward window `[n_r-W..n_r]`
+    from the *received* n_r, with NO term tying it to what the CMD had actually
+    sent. So a corrupt n_r AHEAD of `prev_bsi` was NOT rejected: for `cmd_bsi=20`
+    the apply ACCEPTED n_r in `{18..28}` (11 of 256 values) vs the per-batch
+    `{19,20}` (2 of 256) — a 5.5× mis-ACK-surface widening, INCLUDING n_r up to
+    `+CUMULATIVE_ACK_WINDOW` ahead of `cmd_bsi` (e.g. `covers(prev=19, n_r=27)`:
+    `back=8<=W` ⇒ true), i.e. into batches the CMD had NOT fully sent. A corrupt
+    `n_r==cmd_bsi` with an all-ones bitmap (both under one CRC) would then retire
+    the whole current batch as delivered though it never was = SILENT LOSS. The
+    "rejected by the per-batch fallback edge" rejection **did not exist in the
+    code**; the real protection was CRC alone (CRC8 OFDM SACK_RSP / CRC12 MFSK)
+    plus the producer guarantee `n_r <= prev_bsi`.
+  - **MF-4 FIX (this tree):** `cumulative_ack_covers` now takes the CMD's
+    outstanding batch (`cmd_outstanding_bsi = prev_bsi`, supplied at all three
+    apply sites — `arq_commander.cc:134/2802/3010`) and STRUCTURALLY REJECTS any
+    n_r forward of it: when `(n_r - prev_bsi)&0xFF` is in `[1,128]` it falls back
+    to the legacy per-batch acceptance (`per_batch_in_window`). This restores the
+    forward-rejection this section originally CLAIMED and shrinks the corrupt-bsi
+    mis-ACK surface from up to `2+W` values back toward the legacy 2-value
+    per-batch surface, removing the `+W`-ahead-of-unsent acceptance — the only
+    path by which a CRC false-pass could retire a batch the CMD never delivered.
+    The clamp is on the cumulative path only (`cap_on`, default-off
+    `MERCURY_CUMULATIVE_ACK`) ⇒ **default-off byte-identical**. The legitimate
+    `n_r == prev_bsi` (and its `n_r+1` in-flight overhang and backward self-heal
+    within W) are UNAFFECTED (`(n_r-prev_bsi)&0xFF == 0`, not in `[1,128]`).
+    Pinned by `--test-cumulative-ack` Part F (MF-5), fail-before
+    `-DCUMULATIVE_ACK_FWD_FAILBEFORE` (the forward n_r WRONGLY accepted) /
+    pass-after (rejected).
 - **n_r < prev_bsi (a STALE/old report)** ⇒ `prev_bsi` is NOT within `[n_r-W..n_r]`
   forward of n_r ⇒ NOT accepted as a confirmation of the current batch ⇒ the CMD
   keeps waiting / re-airs (Tier 1). Correct: an old report must not retire a
@@ -521,9 +748,22 @@ fail-before/pass-after toggle in the SAME binary.
 - **D (COMPOSE-TIER-1)**: a forgiven (Tier-1) re-air whose own ACK is also lost is
   retired by the next n_r (the self-heal subsumes the re-air); assert the batch
   is covered without any further re-air.
+- **F (FORWARD-n_r REJECTION, MF-5)**: the MF-4 clamp proof. An integrated apply
+  replay (OR the two `cumulative_ack_covers(cmd_bsi)`/`(prev_bsi)` calls with
+  `cmd_outstanding_bsi=prev_bsi`, exactly as the apply sites now do) at
+  `cmd_bsi=20`/`prev_bsi=19`. F1: a forward `n_r=prev_bsi+2` (=21) is REJECTED. F2:
+  `n_r=prev_bsi+W` (=27, the MAX pre-clamp widening) is REJECTED. F3/F4
+  (REGRESSION): a legitimate `n_r==outstanding` and the in-flight `n_r+1` overhang
+  STILL retire the batch. F5 (REGRESSION): a legitimate backward self-heal within W
+  is UNAFFECTED by the clamp. FAIL-BEFORE (`-DCUMULATIVE_ACK_FWD_FAILBEFORE`,
+  clamp disabled): F1/F2 WRONGLY accept the forward n_r ⇒ FAIL; the regression
+  arms still PASS (the clamp does not over-reject). PASS-AFTER: F1/F2 reject. The
+  pre-existing P7/P8 only tested the +1 overhang / +2-rejected at a FIXED `n_r=12`
+  and NEVER drove an n_r ahead of the outstanding batch — the exact corrupt-forward
+  case that slipped through.
 
 Full `--test` GREEN; default-off (`MERCURY_CUMULATIVE_ACK` unset) render md5 ==
-the Tier-1 base `55957ea`.
+the base.
 
 ## §T2.7 Validation results (2026-06-13)
 

@@ -926,6 +926,43 @@ void cl_arq_controller::set_nResends(int nResends)
 	{
 		this->nResends=nResends;
 	}
+
+	// MF-1 (adversarial-safety TIER-1 BLOCKER) — RUNTIME guard on the load-bearing
+	// nResends margin (INV-FA-NRESENDS; common_defines.h static_assert is the
+	// compile-time twin). set_nResends() is THE producer of the live per-frame
+	// resend budget (called from load_configuration(), arq_common.cc:2044, on the
+	// connect path), so it is the authoritative point at which the ACTUAL live
+	// nResends becomes known. The forgiving-ACK no-silent-byte-loss property
+	// requires nResends > FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold: a
+	// forward-healthy miss decrements the per-frame budget on every re-air, and the
+	// rescuing bound-BREAK does not re-queue the batch until FORGIVING_ACK_MAX_CONSEC
+	// forgives + emergency_nack_threshold NACKs have elapsed. If the budget is
+	// smaller, a frame reaches FAILED_ (arq_commander.cc:1744) and its bytes are
+	// flushed (arq_commander.cc:5799/:3915) BEFORE the rescue = PERMANENT SILENT
+	// BYTE LOSS (+ a streaming-compressed model desync). We FAIL LOUD rather than
+	// silently risk byte loss on a life-critical link.
+	//
+	// Gated on MERCURY_FORGIVING_ACK (the only mode in which depletion-to-FAILED_
+	// before BREAK is reachable) so a legitimate low-latency profile that LOWERS
+	// nResends WITHOUT enabling forgiving-ACK is not spuriously refused. With the
+	// env unset (default), this guard never reads/aborts -> BYTE-IDENTICAL.
+	{
+		static const bool forgiving_ack_env = (getenv("MERCURY_FORGIVING_ACK") != NULL);
+		if(forgiving_ack_env &&
+		   !(this->nResends > FORGIVING_ACK_MAX_CONSEC + this->emergency_nack_threshold))
+		{
+			printf("[FATAL][FORGIVING-ACK] INV-FA-NRESENDS VIOLATED: live nResends=%d "
+			       "is NOT > FORGIVING_ACK_MAX_CONSEC(%d) + emergency_nack_threshold(%d) "
+			       "= %d. A forward-healthy forgiving-ACK miss would deplete a frame to "
+			       "FAILED_ (SILENT BYTE LOSS) BEFORE the rescuing bound-BREAK. Refusing "
+			       "to run with MERCURY_FORGIVING_ACK enabled on a margin-violating "
+			       "config. See fact-documents/data-flow-forgiving-ack.md §FA-NRESENDS.\n",
+			       this->nResends, FORGIVING_ACK_MAX_CONSEC, this->emergency_nack_threshold,
+			       FORGIVING_ACK_MAX_CONSEC + this->emergency_nack_threshold);
+			fflush(stdout);
+			abort();
+		}
+	}
 }
 
 

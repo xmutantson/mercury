@@ -131,11 +131,13 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
 	bool per_batch_in_window =
 		((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+	// MF-4: pass prev_bsi as the CMD's outstanding (highest legitimately-sent) batch
+	// so cumulative_ack_covers structurally rejects an n_r forward of it (corruption).
 	bool covered =
 		cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-			cumulative_ack_enabled, per_batch_in_window)
+			cumulative_ack_enabled, per_batch_in_window, (int)prev_bsi)
 		|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-			cumulative_ack_enabled, per_batch_in_window);
+			cumulative_ack_enabled, per_batch_in_window, (int)prev_bsi);
 	if(!covered)
 		return false;
 
@@ -2799,11 +2801,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
 							bool per_batch_in_window =
 								((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+							// MF-4: prev_bsi = the CMD's outstanding batch -> reject a
+							// forward (corrupt) n_r ahead of it (no future-batch ACK).
 							bool bsi_in_window =
 								cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-									cumulative_ack_enabled, per_batch_in_window)
+									cumulative_ack_enabled, per_batch_in_window, (int)prev_bsi)
 								|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-									cumulative_ack_enabled, per_batch_in_window);
+									cumulative_ack_enabled, per_batch_in_window, (int)prev_bsi);
 							// Sanity 2: bitmap=0 means "received nothing" — RSP
 							// never sends a SACK in that case (no batch_started),
 							// so treat as a false decode.
@@ -3003,11 +3007,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
 							bool per_batch_in_window =
 								sack_v2_bsi_in_window((int)rx_bsi, cmd_batch_seq_id);
+							// MF-4: prev_bsi = the CMD's outstanding batch -> reject a
+							// forward (corrupt) n_r ahead of it (no future-batch ACK).
 							bool covered =
 								cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-									cumulative_ack_enabled, per_batch_in_window)
+									cumulative_ack_enabled, per_batch_in_window, (int)prev_bsi)
 								|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-									cumulative_ack_enabled, per_batch_in_window);
+									cumulative_ack_enabled, per_batch_in_window, (int)prev_bsi);
 							if(decoded && !covered)
 							{
 								printf("[CMD-SACK-V2-OOW] rx_bsi=%u not in window {cmd=%u,prev=%u} (cum=%d) — discarding (treat as CRC fail)\n",
@@ -7738,6 +7744,20 @@ int cl_arq_controller::test_forgiving_ack()
 	const bool fix_live = true;
 #endif
 
+	// MF-2: the modeled per-frame resend budget for the nResends-exhaustion arm
+	// (Part E). PRODUCTION margin is 20 (datalink_config.cc:56). Under
+	// -DFORGIVING_ACK_NRESENDS_FAILBEFORE we model a deliberately-too-small budget
+	// (3, the bare ctor default) to PROVE the margin is load-bearing: with 3 a frame
+	// reaches FAILED_ (silent loss) BEFORE the rescuing bound-BREAK, so the
+	// "no FAILED_ before BREAK" assertion FAILS-before; with 20 it PASSES-after.
+#ifdef FORGIVING_ACK_NRESENDS_FAILBEFORE
+	const int  e_nresends_budget   = 3;
+	const bool e_nresends_failbefore = true;
+#else
+	const int  e_nresends_budget   = 20;   // == production datalink_config.cc:56
+	const bool e_nresends_failbefore = false;
+#endif
+
 	emergency_nack_threshold = 3;   // production default (arq_common.cc:640).
 
 	// --- Part P: PURE helper truth table (forgiving_ack_should_decouple) --------
@@ -7914,6 +7934,84 @@ int cl_arq_controller::test_forgiving_ack()
 		fflush(stdout);
 	}
 
+	// --- Part E (MF-2): nResends MARGIN — no SILENT BYTE LOSS before the BREAK ----
+	// The adversarial review found that the forgiving re-air feeds the SAME
+	// nResends-bounded process_messages_tx_data path that drops to FAILED_
+	// (arq_commander.cc:1727-1746: `if(--nResends>0) resend; else {nLost_data++;
+	// status=FAILED_;}`), and that a FAILED_ frame is cleared to FREE/length=0
+	// (arq_common.cc:3237-3245) + fifo_buffer_backup.flush'd (arq_commander.cc:5799/
+	// :3915) = PERMANENT SILENT BYTE LOSS. The no-loss property requires the live
+	// nResends budget to OUTLAST the worst-case run of misses before the rescuing
+	// bound-BREAK re-queues the batch: FORGIVING_ACK_MAX_CONSEC forgives + then
+	// emergency_nack_threshold NACKs => the BREAK fires on miss
+	// (FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold). nResends MUST exceed that.
+	//
+	// We model a forward-DEAD-after-anchor held-OFDM link (forward-healthy anchor so
+	// each miss is FORGIVEN until the bound, reverse ACK never lands) and a single
+	// representative frame's per-frame budget, decremented on EVERY re-air (forgiven
+	// or not — every miss re-airs the batch through process_messages_tx_data). We
+	// detect (a) the miss index at which a frame would reach FAILED_ (budget exhausts)
+	// and (b) the miss index at which the bound-BREAK fires (re-queue, bytes preserved).
+	// SAFE iff the BREAK precedes FAILED_.
+	if(fix_live) {
+		emergency_nack_count = 0;
+		forgiving_ack_consec_forgiven = 0;
+		int frame_nResends = e_nresends_budget;   // production 20 / fail-before 3
+		int failed_at_miss = -1;                  // first miss index reaching FAILED_
+		int break_at_miss  = -1;                  // miss index the bound-BREAK fires
+		const int total_misses = FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold + 2;
+		for(int m = 1; m <= total_misses; m++)
+		{
+			// Every miss re-airs the still-pending batch -> one nResends decrement
+			// (arq_commander.cc:1729). On exhaustion the frame becomes FAILED_ (silent loss).
+			if(failed_at_miss < 0)
+			{
+				if(--frame_nResends > 0) { /* resent, still pending */ }
+				else                     { failed_at_miss = m; /* FAILED_ / nLost_data++ */ }
+			}
+			// The forgiving / BREAK decision for THIS miss (forward-healthy anchor).
+			bool brk = model_one_miss(/*anchor_ofdm=*/true, /*connected=*/true,
+			                          /*turbo_done=*/true);
+			if(brk && break_at_miss < 0)
+				break_at_miss = m;
+		}
+
+		// The bound-BREAK MUST fire (the genuine-death net escalates) at exactly
+		// FORGIVING_ACK_MAX_CONSEC forgives + emergency_nack_threshold NACKs.
+		const int expect_break_at = FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold;
+		check(break_at_miss == expect_break_at,
+			"E1 (SAFETY) the bound-BREAK fires at FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold",
+			break_at_miss, expect_break_at);
+
+		if(e_nresends_failbefore) {
+			// FAIL-BEFORE: too-small budget (3) -> a frame reaches FAILED_ at miss 3,
+			// BEFORE the BREAK at miss 11 -> SILENT BYTE LOSS. The "no FAILED_ before
+			// BREAK" assertion (E3) FAILS, proving the margin is load-bearing.
+			check(failed_at_miss > 0 && failed_at_miss < break_at_miss,
+				"E2 (FAIL-BEFORE proof) too-small nResends reaches FAILED_ BEFORE the BREAK (loss is real)",
+				failed_at_miss, break_at_miss - 1 /* any value < break */);
+			check(!(failed_at_miss > 0 && failed_at_miss < break_at_miss),
+				"E3 (FAIL-BEFORE) NO frame reaches FAILED_ before the BREAK -> EXPECTED TO FAIL with budget=3",
+				failed_at_miss > 0 ? failed_at_miss : 0, 0);
+		} else {
+			// PASS-AFTER: the production margin (20 > 11) -> NO frame ever reaches
+			// FAILED_; the BREAK re-queues the still-pending batch (bytes preserved).
+			check(failed_at_miss == -1,
+				"E2 (PASS-AFTER) production nResends margin: NO frame reaches FAILED_ (zero silent loss)",
+				failed_at_miss, -1);
+			check(break_at_miss > 0 && (failed_at_miss == -1),
+				"E3 (PASS-AFTER) the bound-BREAK re-queues the batch BEFORE any FAILED_ (bytes preserved)",
+				(break_at_miss > 0 && failed_at_miss == -1) ? 1 : 0, 1);
+			// The load-bearing inequality, asserted directly (INV-FA-NRESENDS).
+			check(e_nresends_budget > FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold,
+				"E4 (INV-FA-NRESENDS) live nResends > FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold",
+				e_nresends_budget, FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold + 1 /* min ok */);
+		}
+	} else {
+		printf("[TEST-FORGIVING-ACK] SKIP E (fix not compiled-live; nResends margin is a FIX-only path)\n");
+		fflush(stdout);
+	}
+
 	printf("[TEST-FORGIVING-ACK] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
@@ -7956,6 +8054,17 @@ int cl_arq_controller::test_cumulative_ack()
 	const bool fix_live = true;
 #endif
 
+	// MF-5: whether the MF-4 forward-n_r clamp is COMPILED-LIVE. Under
+	// -DCUMULATIVE_ACK_FWD_FAILBEFORE the clamp is disabled (pre-MF-4 behavior), so a
+	// forward (corrupt) n_r ahead of the CMD's outstanding batch is WRONGLY ACCEPTED;
+	// with the clamp live it is REJECTED (falls to per-batch). The clamp only matters
+	// when the cumulative recovery is also live, so fwd_clamp_live implies fix_live.
+#if defined(CUMULATIVE_ACK_FAILBEFORE) || defined(CUMULATIVE_ACK_FWD_FAILBEFORE)
+	const bool fwd_clamp_live = false;
+#else
+	const bool fwd_clamp_live = true;
+#endif
+
 	// model_covered: REPLAY of the production apply window for a report carrying
 	// rx_n_r against an outstanding batch the CMD is waiting on. Mirrors the apply
 	// sites' "cumulative_ack_covers(cmd_bsi) || cumulative_ack_covers(prev_bsi)"
@@ -7967,12 +8076,14 @@ int cl_arq_controller::test_cumulative_ack()
 		unsigned rx = (unsigned)(rx_n_r & 0xFF);
 		return (rx == cmd_bsi || rx == prev_bsi);
 	};
+	// MF-4: mirror production EXACTLY — pass prev_bsi as the CMD's outstanding batch
+	// so the forward-n_r clamp is exercised by the integrated apply arms below.
 	auto model_covered = [&](int rx_n_r, int cmd_seq, bool cap_on) -> bool {
 		unsigned cmd_bsi  = (unsigned)(cmd_seq & 0xFF);
 		unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
 		bool pbw = per_batch_window(rx_n_r, cmd_seq);
-		return cumulative_ack_covers(rx_n_r, (int)cmd_bsi, cap_on, pbw)
-		    || cumulative_ack_covers(rx_n_r, (int)prev_bsi, cap_on, pbw);
+		return cumulative_ack_covers(rx_n_r, (int)cmd_bsi, cap_on, pbw, (int)prev_bsi)
+		    || cumulative_ack_covers(rx_n_r, (int)prev_bsi, cap_on, pbw, (int)prev_bsi);
 	};
 
 	// --- Part P: PURE helper truth tables ---------------------------------------
@@ -8004,6 +8115,69 @@ int cl_arq_controller::test_cumulative_ack()
 			"P10 apply: cap-off returns per_batch_in_window (true)", cumulative_ack_covers(12,0,false,true)?1:0, 1);
 		check(cumulative_ack_covers(12, 0, false, false) == false,
 			"P11 apply: cap-off returns per_batch_in_window (false)", cumulative_ack_covers(12,0,false,false)?1:0, 0);
+	}
+
+	// --- Part F (MF-5): FORWARD-n_r REJECTION (the MF-4 structural clamp) --------
+	// The producer NEVER legitimately emits an n_r AHEAD of the CMD's outstanding
+	// batch (the RSP only delivers batches the CMD sent; stop-and-wait => outstanding
+	// = prev_bsi). A report carrying n_r forward of prev_bsi can ONLY be CRC-residual
+	// corruption. Pre-MF-4, cumulative_ack_covers measured its backward window from
+	// that FORWARD n_r and ACCEPTED a corrupt n_r up to +W ahead of cmd_bsi (the 5.5x
+	// mis-ACK surface widening; the OLD §T2.4 "rejected by the per-batch fallback edge"
+	// was FALSE). The clamp falls such an n_r back to the legacy per-batch surface.
+	// The existing P7/P8 only test the +1 overhang ACCEPTED / +2 rejected at a FIXED
+	// n_r=12; they NEVER drive an n_r ahead of the CMD's outstanding batch — the exact
+	// corrupt-forward case that slipped through. This Part pins it.
+	{
+		// Integrated apply replay: OR the two production target calls (cmd_bsi, prev_bsi)
+		// with prev_bsi as the outstanding batch, exactly as the apply sites now do.
+		auto apply_covered = [](int rx_n_r, int cmd_seq, bool cap_on) -> bool {
+			unsigned cmd_bsi  = (unsigned)(cmd_seq & 0xFF);
+			unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+			unsigned rx = (unsigned)(rx_n_r & 0xFF);
+			bool pbw = (rx == cmd_bsi || rx == prev_bsi);
+			return cumulative_ack_covers(rx_n_r, (int)cmd_bsi, cap_on, pbw, (int)prev_bsi)
+			    || cumulative_ack_covers(rx_n_r, (int)prev_bsi, cap_on, pbw, (int)prev_bsi);
+		};
+		const int cmd_seq = 20;   // cmd_bsi=20, prev_bsi=19 (the outstanding batch)
+		printf("[TEST-CUMULATIVE-ACK] NOTE Part F: MF-4 forward-clamp is %s\n",
+			fwd_clamp_live ? "LIVE (pass-after)" : "DISABLED (fail-before)");
+		fflush(stdout);
+
+		// F1: a forward n_r = prev_bsi+2 (=21) — pre-clamp WRONGLY covered cmd_bsi=20
+		// (back=1<=W); the clamp rejects it (falls to per-batch, which does NOT name 21).
+		// FAIL-BEFORE (-DCUMULATIVE_ACK_FWD_FAILBEFORE): wrongly accepted -> covered=true
+		// -> the (got==want==false) assertion FAILS. PASS-AFTER: rejected -> covered=false.
+		check(apply_covered(/*n_r=*/21, cmd_seq, /*cap=*/true) == false,
+			"F1 (MF-5) forward n_r=prev_bsi+2 is REJECTED (no ACK of an unsent batch)",
+			apply_covered(21, cmd_seq, true) ? 1 : 0, /*want rejected=*/0);
+
+		// F2: forward n_r = prev_bsi+W (=27), the MAX pre-clamp widening — also rejected.
+		check(apply_covered(/*n_r=*/27, cmd_seq, /*cap=*/true) == false,
+			"F2 (MF-5) forward n_r=prev_bsi+W is REJECTED (closes the +W-ahead mis-ACK surface)",
+			apply_covered(27, cmd_seq, true) ? 1 : 0, /*want rejected=*/0);
+
+		// F3 (REGRESSION): a LEGITIMATE n_r == outstanding (prev_bsi=19) STILL retires the
+		// outstanding batch in BOTH clamp arms (the clamp must not over-reject). cap-on
+		// (fix_live) -> covered; cap-off -> per-batch (rx==prev) also covered.
+		check(apply_covered(/*n_r=*/19, cmd_seq, /*cap=*/true) == true,
+			"F3 (MF-5 regression) legitimate n_r==outstanding STILL retires the batch",
+			apply_covered(19, cmd_seq, true) ? 1 : 0, 1);
+
+		// F4 (REGRESSION): the legitimate in-flight +1 overhang (n_r==prev_bsi names the
+		// in-flight cmd_bsi=n_r+1) is preserved — the clamp only rejects n_r AHEAD of the
+		// outstanding batch, never the outstanding batch itself or its bitmap successor.
+		check(apply_covered(/*n_r=*/19, cmd_seq, /*cap=*/true) == true,
+			"F4 (MF-5 regression) legitimate in-flight n_r+1 overhang still accepted",
+			apply_covered(19, cmd_seq, true) ? 1 : 0, 1);
+
+		// F5 (REGRESSION): a legitimate OLDER n_r self-heal within W (n_r=19 covering a
+		// lost-report batch 12, back=7<=W) is preserved — the clamp does not touch the
+		// backward window. (Direct helper call with the outstanding batch supplied.)
+		check(cumulative_ack_covers(/*n_r=*/19, /*target=*/12, /*cap=*/true,
+				/*pbw=*/false, /*outstanding=*/19) == fix_live,
+			"F5 (MF-5 regression) backward self-heal within W is UNAFFECTED by the clamp",
+			cumulative_ack_covers(19, 12, true, false, 19) ? 1 : 0, fix_live ? 1 : 0);
 	}
 
 	// --- Part A: SELF-HEAL — a LOST report is recovered by the NEXT report -------

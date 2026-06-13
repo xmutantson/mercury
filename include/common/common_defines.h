@@ -628,6 +628,46 @@ inline bool forgiving_ack_should_decouple(bool forward_anchor_ofdm,
 // cascade, while bounding the worst-case wedge to a handful of same-gear airings).
 static const int FORGIVING_ACK_MAX_CONSEC = 8;
 
+// ---------------------------------------------------------------------------
+// MF-1 (adversarial-safety TIER-1 BLOCKER) — the LOAD-BEARING nResends margin.
+// fact-documents/data-flow-forgiving-ack.md §FA-NRESENDS (INV-FA-NRESENDS).
+//
+// The whole "no silent forward-byte loss" property of forgiving-ACK rests on an
+// implicit numeric coupling that two independent reviewers reached OPPOSITE
+// life-or-death verdicts over (tasks/4b578e73…/wmmcvu4c6.output): the LIVE
+// per-frame resend budget (production nResends=20, datalink_config.cc:56, seated
+// via set_nResends at arq_common.cc:2044) MUST stay STRICTLY GREATER than the
+// number of misses that can elapse before the rescuing bound-BREAK re-queues the
+// still-pending batch — i.e. FORGIVING_ACK_MAX_CONSEC (8 forgives) +
+// emergency_nack_threshold (3 NACKs) = 11. If nResends <= 11, a forward-healthy
+// miss depletes the per-frame budget to FAILED_ (arq_commander.cc:1744-1745) ->
+// cleanup zeroes the slot (arq_common.cc:3237-3245) -> fifo_buffer_backup.flush
+// (arq_commander.cc:5799 / :3915) drops the only recovery copy = PERMANENT SILENT
+// BYTE LOSS (and, in the streaming-compressed deployment mode, a PPMd/zstd model
+// desync that corrupts the REMAINDER of the stream), all BEFORE the bound-BREAK
+// that would have re-queued the bytes.
+//
+// COMPILE-TIME defense (this static_assert): locks the DESIGN constant
+// FORGIVING_ACK_MAX_CONSEC against a documented reference threshold + the
+// production nResends, so an edit that RAISES FORGIVING_ACK_MAX_CONSEC past the
+// margin fails the build LOUDLY. The reference constants below MUST be kept in
+// sync with their runtime sources (FAIL-LOUD on drift is the point) — the
+// authoritative RUNTIME guard lives in set_nResends() and checks the ACTUAL live
+// values, catching a runtime config (datalink_config.cc) edit the static_assert
+// cannot see.
+static const int EMERGENCY_NACK_THRESHOLD_REF = 3;   // == arq_common.cc:842 default
+static const int PRODUCTION_NRESENDS_REF       = 20;  // == datalink_config.cc:56
+// The inequality the no-silent-byte-loss property depends on (INV-FA-NRESENDS):
+//   nResends  >  FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold
+static_assert(PRODUCTION_NRESENDS_REF >
+              FORGIVING_ACK_MAX_CONSEC + EMERGENCY_NACK_THRESHOLD_REF,
+              "INV-FA-NRESENDS VIOLATED: the live nResends budget (production "
+              "PRODUCTION_NRESENDS_REF) must be STRICTLY GREATER than "
+              "FORGIVING_ACK_MAX_CONSEC + emergency_nack_threshold, else a "
+              "forward-healthy forgiving-ACK miss depletes a frame to FAILED_ "
+              "(silent byte loss) BEFORE the rescuing bound-BREAK. See "
+              "fact-documents/data-flow-forgiving-ack.md §FA-NRESENDS.");
+
 // ===========================================================================
 // FORGIVING-ACK TIER 2 — cumulative-n_r status report (self-healing spine)
 // fact-documents/data-flow-forgiving-ack.md TIER 2.
@@ -689,17 +729,52 @@ inline unsigned char cumulative_ack_bsi_field(unsigned char per_batch_bsi,
 //                           unsent batch (§T2.4 safety preserved).
 //                      A STALE (older) n_r leaves a newer outstanding batch outside
 //                      [n_r-W .. n_r+1] ⇒ UNaddressed ⇒ the CMD keeps waiting / re-airs.
+//
+// MF-4 (adversarial-safety TIER-2 BLOCKER) — STRUCTURAL FORWARD-n_r REJECTION.
+// The RSP can only deliver batches the CMD has SENT, and the CMD is batch-level
+// stop-and-wait, so a LEGITIMATE n_r is ALWAYS <= the CMD's outstanding batch
+// (prev_bsi = cmd_batch_seq_id-1). A report carrying an n_r STRICTLY AHEAD of the
+// outstanding batch can therefore ONLY be a CRC-residual corruption — and without
+// this clamp the backward window [n_r-W..n_r] is measured from that FORWARD n_r and
+// still reaches the current/prev batch, ACCEPTING a corrupt n_r up to +CUMULATIVE_
+// ACK_WINDOW ahead of cmd_bsi (the 5.5x mis-ACK-surface widening the review found;
+// the old §T2.4 "rejected by the per-batch fallback edge" claim was FALSE — no such
+// rejection existed). When the caller supplies the outstanding batch
+// (cmd_outstanding_bsi >= 0) we structurally REJECT any n_r forward of it — i.e.
+// (n_r - cmd_outstanding_bsi)&0xFF in [1,128] — by falling back to the legacy
+// per-batch acceptance (per_batch_in_window). This restores the forward-rejection
+// the doc CLAIMS and shrinks the corrupt-bsi mis-ACK surface from up to (2+W) values
+// back toward the legacy 2-value per-batch surface, removing the +W-ahead-of-unsent
+// acceptance — the only path by which a CRC false-pass could retire a batch the CMD
+// never delivered (silent loss). cmd_outstanding_bsi defaults to -1 (no clamp) for
+// the pure truth-table tests that model window math without an outstanding batch.
+// This whole helper engages only when cap_on (MERCURY_CUMULATIVE_ACK, DEFAULT-OFF),
+// so the clamp is default-off byte-identical.
+//
 // -DCUMULATIVE_ACK_FAILBEFORE pins this to the per-batch fallback even when cap_on,
 // so the self-heal assertion fails before / passes after in the same binary.
+// -DCUMULATIVE_ACK_FWD_FAILBEFORE disables ONLY the MF-4 forward clamp (pre-clamp
+// behavior) so the MF-5 forward-n_r-rejection assertion fails before / passes after.
 inline bool cumulative_ack_covers(int rx_n_r, int target_bsi, bool cap_on,
-		bool per_batch_in_window) {
+		bool per_batch_in_window, int cmd_outstanding_bsi = -1) {
 #ifdef CUMULATIVE_ACK_FAILBEFORE
-	(void)rx_n_r; (void)target_bsi; (void)cap_on;
+	(void)rx_n_r; (void)target_bsi; (void)cap_on; (void)cmd_outstanding_bsi;
 	return per_batch_in_window;   // FAIL-BEFORE: no cumulative recovery (per-batch only).
 #else
 	if (!cap_on) return per_batch_in_window;
 	unsigned nr   = (unsigned)(rx_n_r     & 0xFF);
 	unsigned tgt  = (unsigned)(target_bsi & 0xFF);
+#ifndef CUMULATIVE_ACK_FWD_FAILBEFORE
+	// MF-4 clamp: reject an n_r strictly AHEAD of the CMD's outstanding batch.
+	if (cmd_outstanding_bsi >= 0) {
+		unsigned outstanding = (unsigned)(cmd_outstanding_bsi & 0xFF);
+		unsigned fwd = (nr - outstanding) & 0xFFu;   // forward distance outstanding->n_r
+		if (fwd >= 1u && fwd <= 128u)                // n_r is ahead of what the CMD has sent
+			return per_batch_in_window;              // -> corruption-only: legacy per-batch only
+	}
+#else
+	(void)cmd_outstanding_bsi;   // FWD-FAILBEFORE: clamp disabled (pre-MF-4 behavior).
+#endif
 	unsigned succ = (nr + 1u) & 0xFFu;            // the selective-bitmap batch n_r+1
 	if (tgt == succ) return true;                 // (b) in-flight partial batch (overhang 1)
 	unsigned back = (nr - tgt) & 0xFFu;           // forward distance target->n_r (mod 256)
