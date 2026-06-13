@@ -142,17 +142,28 @@
 // CLI-only and are now unconditional in the codebase.
 #define CAP_WB_CAPABLE   0x01   // Supports wideband upgrade after NB connection
 #define CAP_ENCRYPTION   0x02   // Supports hybrid PQ encryption (X25519 + ML-KEM-768)
+// CAP_CUMULATIVE_ACK (FORGIVING-ACK Tier 2 — fact-documents/data-flow-forgiving-ack.md
+// §T2.1): the peer interprets the SACK's 8-bit bsi field as a CUMULATIVE n_r
+// (= rsp_last_delivered_batch_seq_id, the contiguous delivery high-water) instead
+// of a per-batch bsi. SEMANTICS-only — no wire-width change. Engages ONLY when
+// BOTH ends advertise it (the both_support pattern, like CAP_ENCRYPTION) AND the
+// env opt-in MERCURY_CUMULATIVE_ACK gates the local advertise, so default-off ≡
+// byte-identical + interop-safe with any non-Tier-2 peer (which never sets bit 2 →
+// both_support false → per-batch fallback). This reclaims the 0x04 slot the former
+// CAP_SUFFIX_FEC used before it was removed in cleanup/drop-suffix-fec-cap.
+#define CAP_CUMULATIVE_ACK 0x04 // Supports cumulative-n_r (high-water) SACK semantics
 // The enhanced ctrl-suffix (GF(16) RA FEC + base-pattern combining) on the MFSK
 // CONNECT handshake (tier2-suffix-fec-design.md §21) is NOT capability-negotiated:
 // Mercury shipped no version, so there are no legacy peers, and the GF(16) RA
 // codeword is systematic (backward-compatible by construction). It is the
 // unconditional default at the robust tier, triggered by the gearshift config
-// (is_robust_config). The former CAP_SUFFIX_FEC (0x04) negotiation bit was
-// removed in cleanup/drop-suffix-fec-cap.
-// Bits 0..1 are the negotiable cap bits carried in the 2-bit MFSK ctrl-suffix cap
-// fields (TEST_ACK echoed_cap/own_cap, TEST_CONN local_cap). Packers/unpackers
-// mask to this; higher bits are not on the MFSK wire.
-#define CAP_NEGOTIABLE_MASK 0x03
+// (is_robust_config). (The §21 3rd-bit was removed in cleanup/drop-suffix-fec-cap;
+// the slot is now CAP_CUMULATIVE_ACK above.)
+// Bits 0..2 are the negotiable cap bits carried in the MFSK ctrl-suffix cap
+// fields (TEST_ACK echoed_cap/own_cap, TEST_CONN local_cap), which use the formerly
+// reserved payload bits for bit 2 (the §21 precedent; no payload-width change), and
+// the full LDPC TEST_CONNECTION/ACK capability byte. Packers/unpackers mask to this.
+#define CAP_NEGOTIABLE_MASK 0x07
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };

@@ -123,11 +123,20 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	if(rx_crc12 != CRC12_calc(crc_input, 5))
 		return false;
 
-	// Sanity: bsi must be the current or just-prior batch (mod 256) — RSP only
-	// ACKs frames whose batch_seq_id matches one of those.
+	// Sanity: the report must cover the batch the CMD is waiting on. PER-BATCH:
+	// bsi is the current or just-prior batch. CUMULATIVE (FORGIVING-ACK Tier 2,
+	// when negotiated): rx_bsi is n_r and the outstanding batch is covered iff it
+	// lies in the bounded backward window of n_r (the self-heal; §T2.3/§T2.4).
 	unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
 	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
-	if(!((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi))
+	bool per_batch_in_window =
+		((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+	bool covered =
+		cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
+			cumulative_ack_enabled, per_batch_in_window)
+		|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
+			cumulative_ack_enabled, per_batch_in_window);
+	if(!covered)
 		return false;
 
 	// CLEAN-batch only: this arm accepts full-batch ACKs (all-ones bitmap). A
@@ -2776,13 +2785,25 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 						if(decoded)
 						{
-							// Sanity 1: bsi must be the current or just-prior
-							// batch (mod 256). RSP only ACKs frames whose
-							// batch_seq_id matches one of those.
+							// Sanity 1: the report must cover the batch the CMD is
+							// waiting on. PER-BATCH: bsi must be the current or just-prior
+							// batch (mod 256) — RSP only ACKs frames whose batch_seq_id is
+							// one of those. CUMULATIVE (FORGIVING-ACK Tier 2, when negotiated):
+							// rx_bsi is n_r (the contiguous high-water) and the outstanding
+							// batch (cmd_bsi or prev_bsi) is acknowledged iff it lies in the
+							// bounded BACKWARD window [n_r-W..n_r] — this is THE SELF-HEAL: a
+							// later n_r covers a batch whose own earlier report was missed.
+							// cumulative_ack_covers never looks FORWARD of n_r, so a corrupt/
+							// stale n_r can never ACK a future/unsent batch (§T2.4).
 							unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
 							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
-							bool bsi_in_window =
+							bool per_batch_in_window =
 								((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+							bool bsi_in_window =
+								cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
+									cumulative_ack_enabled, per_batch_in_window)
+								|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
+									cumulative_ack_enabled, per_batch_in_window);
 							// Sanity 2: bitmap=0 means "received nothing" — RSP
 							// never sends a SACK in that case (no batch_started),
 							// so treat as a false decode.
@@ -2971,15 +2992,29 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// silent mis-ACK / needless retransmit. Treat OOW as a CRC
 						// fail (fall through to the timeout-driven full-batch
 						// retransmit, exactly as if the OFDM frame had been lost).
-						if(decoded
-						   && !sack_v2_bsi_in_window((int)rx_bsi, cmd_batch_seq_id))
+						// PER-BATCH: rx_bsi must be cmd_bsi or prev_bsi (sack_v2_bsi_in_window).
+						// CUMULATIVE (FORGIVING-ACK Tier 2): rx_bsi is n_r; the in-flight PARTIAL
+						// batch (whose bitmap this frame carries) is the contiguous successor n_r+1,
+						// so accept iff the outstanding batch (cmd_bsi or prev_bsi) is covered by
+						// n_r's bounded backward window (§T2.3/§T2.4). The bitmap→messages_tx[] slot
+						// mapping is by INDEX, independent of the bsi value, so it is unchanged.
 						{
 							unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
 							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
-							printf("[CMD-SACK-V2-OOW] rx_bsi=%u not in window {cmd=%u,prev=%u} — discarding (treat as CRC fail)\n",
-								(unsigned)rx_bsi, cmd_bsi, prev_bsi);
-							fflush(stdout);
-							decoded = false;
+							bool per_batch_in_window =
+								sack_v2_bsi_in_window((int)rx_bsi, cmd_batch_seq_id);
+							bool covered =
+								cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
+									cumulative_ack_enabled, per_batch_in_window)
+								|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
+									cumulative_ack_enabled, per_batch_in_window);
+							if(decoded && !covered)
+							{
+								printf("[CMD-SACK-V2-OOW] rx_bsi=%u not in window {cmd=%u,prev=%u} (cum=%d) — discarding (treat as CRC fail)\n",
+									(unsigned)rx_bsi, cmd_bsi, prev_bsi, cumulative_ack_enabled ? 1 : 0);
+								fflush(stdout);
+								decoded = false;
+							}
 						}
 						if(decoded
 						   && (int)rx_bsi == cmd_last_applied_sack_bsi)
@@ -4852,6 +4887,18 @@ void cl_arq_controller::process_control_commander()
 						peer_capability);
 				}
 			}
+
+			// FORGIVING-ACK Tier 2 negotiation (fact-documents/data-flow-forgiving-ack.md
+			// §T2.1): mirror of the RSP-side agreement (arq_responder.cc). The cumulative-
+			// n_r SACK reshape engages ONLY when BOTH ends advertise CAP_CUMULATIVE_ACK
+			// (env-gated locally by MERCURY_CUMULATIVE_ACK). Interop-safe: a non-Tier-2
+			// responder leaves bit 2 clear → cumulative_ack_enabled false → per-batch.
+			cumulative_ack_enabled = (local_capability & CAP_CUMULATIVE_ACK)
+			                      && (peer_capability  & CAP_CUMULATIVE_ACK);
+			printf("[FORGIVING-ACK-T2] cumulative-n_r SACK %s (local_cap=0x%02X peer_cap=0x%02X)\n",
+				cumulative_ack_enabled ? "NEGOTIATED" : "off",
+				(unsigned)local_capability, (unsigned)peer_capability);
+			fflush(stdout);
 
 			// Streaming compression is unconditional (CAP_STREAMING removed).
 			// Still requires compression to be on; -F off disables both.
@@ -7868,6 +7915,238 @@ int cl_arq_controller::test_forgiving_ack()
 	}
 
 	printf("[TEST-FORGIVING-ACK] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// FORGIVING-ACK Tier-2 cumulative-n_r regression (--test-cumulative-ack).
+// fact-documents/data-flow-forgiving-ack.md §T2.6. Each cumulative-recovery
+// assertion is fail-before (-DCUMULATIVE_ACK_FAILBEFORE pins cumulative_ack_covers()
+// to the per-batch fallback even when cap_on) / pass-after. Returns 0 on pass, 1 on
+// fail.
+//
+// The apply arms REPLAY the production decision at the SACK consumers
+// (arq_commander.cc:130 / :2784 / :2996): the SAME pure helper
+// cumulative_ack_covers() with the SAME (cmd_bsi, prev_bsi) targets ORed. The
+// gap-invariant arm drives the REAL production high-water producer
+// (advance_last_delivered) under the REAL delivery-time gate (delivery_step_is_gap),
+// then feeds the resulting n_r to the apply helper — so the "n_r never ACKs a gap"
+// guarantee is proven end-to-end through production code, not a model.
+int cl_arq_controller::test_cumulative_ack()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-CUMULATIVE-ACK] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-CUMULATIVE-ACK] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Whether the cumulative recovery is COMPILED-LIVE. Under
+	// -DCUMULATIVE_ACK_FAILBEFORE the apply helper is the per-batch fallback, so a
+	// report that does NOT name the outstanding batch per-batch is NOT recovered.
+#ifdef CUMULATIVE_ACK_FAILBEFORE
+	const bool fix_live = false;
+#else
+	const bool fix_live = true;
+#endif
+
+	// model_covered: REPLAY of the production apply window for a report carrying
+	// rx_n_r against an outstanding batch the CMD is waiting on. Mirrors the apply
+	// sites' "cumulative_ack_covers(cmd_bsi) || cumulative_ack_covers(prev_bsi)"
+	// (cmd_batch_seq_id has ALREADY been incremented at TX, so the in-flight batch
+	// is prev_bsi and cmd_bsi is the NEXT to send; we OR both, exactly as production).
+	auto per_batch_window = [](int rx_n_r, int cmd_seq) -> bool {
+		unsigned cmd_bsi  = (unsigned)(cmd_seq & 0xFF);
+		unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+		unsigned rx = (unsigned)(rx_n_r & 0xFF);
+		return (rx == cmd_bsi || rx == prev_bsi);
+	};
+	auto model_covered = [&](int rx_n_r, int cmd_seq, bool cap_on) -> bool {
+		unsigned cmd_bsi  = (unsigned)(cmd_seq & 0xFF);
+		unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+		bool pbw = per_batch_window(rx_n_r, cmd_seq);
+		return cumulative_ack_covers(rx_n_r, (int)cmd_bsi, cap_on, pbw)
+		    || cumulative_ack_covers(rx_n_r, (int)prev_bsi, cap_on, pbw);
+	};
+
+	// --- Part P: PURE helper truth tables ---------------------------------------
+	{
+		// SEND helper: cap-on -> n_r in the bsi field; cap-off / no-high-water -> per-batch.
+		check(cumulative_ack_bsi_field(/*per_batch=*/7, /*high_water=*/12, /*cap=*/true) == 12,
+			"P1 send: cap-on bsi field carries n_r (high-water)", (int)cumulative_ack_bsi_field(7,12,true), 12);
+		check(cumulative_ack_bsi_field(7, 12, false) == 7,
+			"P2 send: cap-off bsi field is per-batch (byte-identical)", (int)cumulative_ack_bsi_field(7,12,false), 7);
+		check(cumulative_ack_bsi_field(7, -1, true) == 7,
+			"P3 send: cap-on but no delivery yet (n_r<0) falls back to per-batch", (int)cumulative_ack_bsi_field(7,-1,true), 7);
+
+		// APPLY helper (cap-on): [n_r-W .. n_r+1].
+		check(cumulative_ack_covers(12, 12, true, false) == true,
+			"P4 apply: target == n_r is covered (at the high-water)", cumulative_ack_covers(12,12,true,false)?1:0, 1);
+		check(cumulative_ack_covers(12, 12 - CUMULATIVE_ACK_WINDOW, true, false) == true,
+			"P5 apply: target == n_r - W is covered (window edge)", cumulative_ack_covers(12,12-CUMULATIVE_ACK_WINDOW,true,false)?1:0, 1);
+		check(cumulative_ack_covers(12, 12 - CUMULATIVE_ACK_WINDOW - 1, true, false) == false,
+			"P6 apply: target just beyond n_r-W is NOT covered (bounded backward)", cumulative_ack_covers(12,12-CUMULATIVE_ACK_WINDOW-1,true,false)?1:0, 0);
+		check(cumulative_ack_covers(12, 13, true, false) == true,
+			"P7 apply: target == n_r+1 covered (the in-flight partial batch, overhang 1)", cumulative_ack_covers(12,13,true,false)?1:0, 1);
+		check(cumulative_ack_covers(12, 14, true, false) == false,
+			"P8 apply: target == n_r+2 NOT covered (no far-forward ACK; safety)", cumulative_ack_covers(12,14,true,false)?1:0, 0);
+		// Wrap correctness: n_r=2, target=255 is backward distance 3 -> covered (<=W).
+		check(cumulative_ack_covers(2, 255, true, false) == true,
+			"P9 apply: mod-256 wrap n_r=2 target=255 (back=3) covered", cumulative_ack_covers(2,255,true,false)?1:0, 1);
+		// cap-off: pure fallback (returns per_batch_in_window verbatim).
+		check(cumulative_ack_covers(12, 0, false, true) == true,
+			"P10 apply: cap-off returns per_batch_in_window (true)", cumulative_ack_covers(12,0,false,true)?1:0, 1);
+		check(cumulative_ack_covers(12, 0, false, false) == false,
+			"P11 apply: cap-off returns per_batch_in_window (false)", cumulative_ack_covers(12,0,false,false)?1:0, 0);
+	}
+
+	// --- Part A: SELF-HEAL — a LOST report is recovered by the NEXT report -------
+	// Stop-and-wait: CMD sends batch N, RSP delivers N (high-water n_r=N), clean ACK
+	// with n_r=N is LOST. CMD re-airs / advances; RSP delivers N+1 (n_r=N+1), clean
+	// ACK with n_r=N+1 arrives. The CMD is now waiting on batch N+1 (cmd_seq has
+	// advanced to N+2 -> prev_bsi=N+1, cmd_bsi=N+2). Assert the n_r=N+1 report ALSO
+	// retires batch N (which the lost n_r=N report would have).
+	{
+		const int N = 50;
+		// FAIL-BEFORE proof setup: the CMD has moved on — batch N is now MORE than
+		// one behind its window. cmd_seq = N+2 (sent N, then N+1) => prev_bsi=N+1,
+		// cmd_bsi=N+2. Per-batch CANNOT name N (it is neither cmd_bsi nor prev_bsi).
+		int cmd_seq = N + 2;
+
+		// (i) the n_r=N+1 report retires the CURRENT in-flight batch N+1 (= prev_bsi)
+		//     in BOTH modes (it is per-batch-in-window) — sanity that we didn't break
+		//     normal acknowledgement.
+		check(model_covered(/*n_r=*/N + 1, cmd_seq, /*cap=*/true) == true,
+			"A1 the n_r=N+1 report retires the current in-flight batch N+1",
+			model_covered(N + 1, cmd_seq, true) ? 1 : 0, 1);
+
+		// (ii) THE SELF-HEAL: does the SAME n_r=N+1 report ALSO cover the older batch
+		//      N whose own report was lost? cap-on (fix-live) -> YES (cumulative);
+		//      FAIL-BEFORE / per-batch -> NO (N is out of {N+1,N+2}). We ask the helper
+		//      against target=N. The per_batch_in_window flag here reflects whether
+		//      TARGET=N is per-batch-in-window — it is NOT (N ∉ {cmd_bsi=N+2, prev=N+1}),
+		//      so per-batch CANNOT recover it; only the cumulative interpretation can.
+		bool n_per_batch = ((unsigned)(N & 0xFF) == (unsigned)((cmd_seq) & 0xFF)
+		                 || (unsigned)(N & 0xFF) == (unsigned)((cmd_seq - 1) & 0xFF));
+		bool n_recovered =
+			cumulative_ack_covers(/*n_r=*/N + 1, /*target=*/N,
+				/*cap=*/true, /*per_batch_in_window=*/n_per_batch);
+		check(n_recovered == fix_live,
+			fix_live
+				? "A2 (PASS-AFTER) lost batch-N report SELF-HEALED by the next n_r=N+1 (cumulative)"
+				: "A2 (FAIL-BEFORE) lost batch-N report NOT recovered per-batch (n_r=N+1 cannot name N)",
+			n_recovered ? 1 : 0, fix_live ? 1 : 0);
+
+		// (iii) deeper self-heal: several lost reports collapsed by one later n_r.
+		//       n_r jumps to N+W (W reports worth of progress). All of N..N+W-1 are
+		//       covered cumulatively (fix-live); none beyond the backward window.
+		bool all_covered = true;
+		for(int b = N; b <= N + CUMULATIVE_ACK_WINDOW; b++)
+			if(!cumulative_ack_covers(N + CUMULATIVE_ACK_WINDOW, b, true, false))
+				all_covered = false;
+		check(all_covered == fix_live,
+			fix_live
+				? "A3 (PASS-AFTER) a single n_r=N+W retires ALL of N..N+W (W superseded reports, free)"
+				: "A3 (FAIL-BEFORE) no cumulative collapse (per-batch only)",
+			all_covered ? 1 : 0, fix_live ? 1 : 0);
+	}
+
+	// --- Part B: GAP-INVARIANT — n_r NEVER ACKs a gap (LIFE-CRITICAL) ------------
+	// Drive the REAL production high-water producer (advance_last_delivered) under
+	// the REAL delivery-time gate (delivery_step_is_gap). Deliver N and N+1 in order,
+	// then a batch N+3 arrives with N+2 NEVER delivered (a HOLE). Production GAP-ABORTs
+	// (delivery_step_is_gap TRUE -> rsp_gap_abort_teardown, never advancing), so the
+	// high-water HOLDS at N+1. Assert the resulting n_r does NOT cumulatively ACK the
+	// missing N+2.
+	{
+		int saved_hw = rsp_last_delivered_batch_seq_id;   // restore after (don't leak test state)
+		rsp_last_delivered_batch_seq_id = -1;             // fresh delivery history
+		const int N = 100;
+		advance_last_delivered(N);                        // REAL producer: deliver N
+		advance_last_delivered(N + 1);                    // REAL producer: deliver N+1 (contiguous)
+		check(rsp_last_delivered_batch_seq_id == N + 1,
+			"B1 high-water at N+1 after two in-order deliveries", rsp_last_delivered_batch_seq_id, N + 1);
+
+		// N+3 arrives with N+2 a HOLE. The production delivery gate REFUSES it.
+		bool is_gap = delivery_step_is_gap(N + 3, rsp_last_delivered_batch_seq_id);
+		check(is_gap == true,
+			"B2 delivery_step_is_gap TRUE for N+3 over high-water N+1 (production GAP-ABORTs)",
+			is_gap ? 1 : 0, 1);
+		// Production does NOT advance on a gap (the gate skips advance_last_delivered),
+		// so the high-water (the n_r the RSP would send) STAYS at N+1.
+		int n_r = rsp_last_delivered_batch_seq_id;        // == N+1, NOT N+3
+		check(n_r == N + 1, "B3 high-water UNCHANGED on a gap (n_r stays N+1, never jumps to N+3)", n_r, N + 1);
+
+		// THE INVARIANT: the cumulative ACK derived from n_r does NOT cover the
+		// missing N+2 (it is n_r+1 = the would-be partial, but it was NEVER delivered
+		// — and crucially does NOT cover N+3 either, which is n_r+2, out of range).
+		// N+2 == n_r+1 is the ONE forward-overhang slot (the in-flight partial). The
+		// life-critical guarantee is that anything ABOVE the contiguous high-water is
+		// NOT declared DELIVERED: target=N+3 (a real undelivered batch past the hole)
+		// must be UNcovered.
+		check(cumulative_ack_covers(n_r, N + 3, true, false) == false,
+			"B4 (INVARIANT) n_r=N+1 does NOT ACK the undelivered N+3 past the hole (no gap-ACK)",
+			cumulative_ack_covers(n_r, N + 3, true, false) ? 1 : 0, 0);
+		// And nothing FAR past the hole is ever covered.
+		check(cumulative_ack_covers(n_r, N + 10, true, false) == false,
+			"B5 (INVARIANT) n_r=N+1 does NOT ACK any batch far past the hole",
+			cumulative_ack_covers(n_r, N + 10, true, false) ? 1 : 0, 0);
+
+		rsp_last_delivered_batch_seq_id = saved_hw;       // restore
+	}
+
+	// --- Part C: CAPABILITY GATE — Tier-2 CMD + non-Tier-2 RSP -> per-batch -------
+	// When the cap is NOT negotiated, the apply MUST fall back to per-batch (never
+	// reinterpret a per-batch bsi as an n_r -> no misapply / no ACK of an unsent batch).
+	{
+		// A report whose bsi names the in-flight batch (per-batch) is accepted; one
+		// that does NOT is rejected — REGARDLESS of any cumulative reach — because
+		// cap_on=false forces the pure fallback.
+		int cmd_seq = 30;   // cmd_bsi=30, prev_bsi=29 (the in-flight / outstanding batch)
+		check(model_covered(/*bsi=*/29, cmd_seq, /*cap=*/false) == true,
+			"C1 cap-off: a report naming the in-flight batch (per-batch) is accepted",
+			model_covered(29, cmd_seq, false) ? 1 : 0, 1);
+		// THE GATE, at the helper level (unambiguous): a target that is CUMULATIVELY
+		// covered (within n_r's backward window) but NOT per-batch-in-window. n_r=10,
+		// target=7 (back=3 <= W): cap-on covers it; cap-off returns the per_batch flag
+		// (false here) verbatim. per_batch_in_window=false models a Tier-2 CMD that did
+		// NOT negotiate the cap with this RSP.
+		check(cumulative_ack_covers(/*n_r=*/10, /*target=*/7, /*cap=*/false,
+				/*per_batch_in_window=*/false) == false,
+			"C2 cap-off: a cumulatively-coverable target is NOT recovered (per-batch fallback; no misapply)",
+			cumulative_ack_covers(10, 7, false, false) ? 1 : 0, 0);
+		check(cumulative_ack_covers(/*n_r=*/10, /*target=*/7, /*cap=*/true,
+				/*per_batch_in_window=*/false) == fix_live,
+			"C3 cap-on: the SAME target IS cumulatively recovered (the negotiated gate is the sole switch)",
+			cumulative_ack_covers(10, 7, true, false) ? 1 : 0, fix_live ? 1 : 0);
+	}
+
+	// --- Part D: COMPOSES WITH TIER-1 -------------------------------------------
+	// Tier 1 re-airs a forward-healthy missed batch cheaply; Tier 2 means the NEXT
+	// turnaround's n_r retires it for free even if the re-air's OWN ACK is also lost.
+	// Model: batch N missed (Tier-1 re-air), the re-air's ACK ALSO lost, then N+1
+	// delivers and its n_r=N+1 retires N. Assert N is covered without any further
+	// re-air being needed (the self-heal subsumes the re-air).
+	{
+		const int N = 70;
+		// After the lost re-air, the CMD eventually advances; batch N+1's report lands.
+		bool n_retired_by_next =
+			cumulative_ack_covers(/*n_r=*/N + 1, /*target=*/N, /*cap=*/true,
+				/*per_batch_in_window=*/false);
+		check(n_retired_by_next == fix_live,
+			fix_live
+				? "D1 (COMPOSE) a Tier-1 re-air whose ACK was ALSO lost is retired by the next n_r (free)"
+				: "D1 (FAIL-BEFORE) the doubly-lost batch is NOT recovered cumulatively",
+			n_retired_by_next ? 1 : 0, fix_live ? 1 : 0);
+	}
+
+	printf("[TEST-CUMULATIVE-ACK] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

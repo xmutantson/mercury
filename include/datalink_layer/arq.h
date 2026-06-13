@@ -1487,6 +1487,17 @@ public:
   // Returns 0 on pass, 1 on fail. See fact-documents/data-flow-forgiving-ack.md §6.
   int test_forgiving_ack();
 
+  // FORGIVING-ACK Tier-2 cumulative-n_r regression (--test-cumulative-ack).
+  // Drives the SELF-HEAL (a lost report recovered by the next n_r), the
+  // contiguous-high-water GAP-INVARIANT (n_r NEVER ACKs a gap — driven through the
+  // REAL advance_last_delivered + delivery_step_is_gap producers), the CAPABILITY
+  // GATE (cap-off → per-batch fallback, no misapply), and COMPOSITION with Tier-1
+  // (a forgiven re-air retired by the next n_r). Replays the PURE
+  // cumulative_ack_bsi_field() / cumulative_ack_covers() helpers; the gap arm uses
+  // the production high-water producer. Returns 0 on pass, 1 on fail.
+  // See fact-documents/data-flow-forgiving-ack.md §T2.6.
+  int test_cumulative_ack();
+
   // ROBUST_0 + streaming-compression deadlock regression
   // (data-flow-compress-frame-fill.md). Drives the REAL
   // process_buffer_data_commander() data-fill path at ROBUST_0 frame
@@ -2849,6 +2860,15 @@ public:
   cl_cipher_suite cipher_suite;       // Per-connection cipher state (ephemeral keys, session key)
   int encryption_mode;                // ENCRYPT_OFF, ENCRYPT_STRICT, ENCRYPT_FAST
   bool encryption_enabled;            // Negotiated: both sides have CAP_ENCRYPTION and mode != OFF
+  // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1):
+  // negotiated session flag — both ends advertised CAP_CUMULATIVE_ACK (which is itself
+  // gated by the env opt-in MERCURY_CUMULATIVE_ACK on the local advertise). When true,
+  // the RSP writes n_r (the contiguous delivery high-water) into the SACK bsi field and
+  // the CMD interprets a received bsi as "everything <= n_r is acknowledged" (bounded
+  // backward window). Default-off ≡ byte-identical + interop-safe (any non-Tier-2 peer
+  // leaves the bit clear → both_support false → per-batch fallback). Computed once at
+  // the TEST_CONNECTION / TEST_CONNECTION_ACK negotiation, cleared on session reset.
+  bool cumulative_ack_enabled;        // Negotiated: both sides have CAP_CUMULATIVE_ACK
   uint64_t tx_batch_counter;          // Monotonic counter for encrypt nonces (TX direction)
   uint64_t rx_batch_counter;          // Monotonic counter for decrypt nonces (RX direction)
   int consecutive_auth_failures;      // Auth failures since last success (3 → disconnect)

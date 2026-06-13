@@ -396,7 +396,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 				// arq_commander.cc:466-475:
 				//   data[0]   = TEST_CONNECTION
 				//   data[1..4]= u_SNR.char4_SNR (float SNR_uplink)
-				//   data[5]   = local_capability (peer's cap byte; gated to 2 bits)
+				//   data[5]   = local_capability (peer's cap byte; MFSK ctrl carries the
+				//               low 3 negotiable bits CAP_NEGOTIABLE_MASK=0x07)
 				//   data[6]   = peer SSID
 				//   length    = 7
 				//   sequence_number = control_batch_size - 1 so the consumer
@@ -952,14 +953,20 @@ void cl_arq_controller::process_messages_rx_data_control()
 									if (data_batch_size >= 30)      bitmap_u32 = 0x3FFFFFFFu;
 									else if (data_batch_size <= 0)  bitmap_u32 = 0u;
 									else                            bitmap_u32 = (1u << data_batch_size) - 1u;
-									printf("[RSP-MFSK-SACK] prev-delivered path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
-										(unsigned)prev_ack_bsi, (unsigned)bitmap_u32, data_batch_size);
+									// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): n_r in the bsi field when
+									// negotiated (the prev-deliver high-water was just advanced at :911).
+									unsigned char wire_bsi = cumulative_ack_bsi_field(
+										prev_ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+									printf("[RSP-MFSK-SACK] prev-delivered path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
+										(unsigned)prev_ack_bsi, (unsigned)wire_bsi,
+										rsp_last_delivered_batch_seq_id, cumulative_ack_enabled ? 1 : 0,
+										(unsigned)bitmap_u32, data_batch_size);
 									fflush(stdout);
 									// WALL-B FIX-9 D2 REFINE (§2.1): prev-delivered = a batch recovered via the
 									// SACK/retransmit prev-storage path -> a RETRANSMIT turnaround -> arm the D2
 									// robust reverse-ACK geometry (settle) for this ACK.
 									ack_tx_retx_turnaround = true;
-									long long mfsk_ms = send_mfsk_ack_sack(prev_ack_bsi, bitmap_u32);
+									long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
 									if (mfsk_ms > 0)
 									{
 										printf("[TX-ACK-SACK] prev-delivered via MFSK suffix wire_ms=%lld\n", mfsk_ms);
@@ -1780,14 +1787,27 @@ void cl_arq_controller::process_messages_acknowledging_data()
 									if (sack_bitmap[i])
 										bitmap_u32 |= (1u << i);
 								}
-								printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
-									(unsigned)sacked_bsi, (unsigned)bitmap_u32, data_batch_size);
+								// FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md
+								// §T2.0/§T2.3): when the cumulative cap is negotiated, the bsi FIELD
+								// carries n_r (the contiguous delivery high-water,
+								// rsp_last_delivered_batch_seq_id) instead of the partial batch's bsi.
+								// The 30-bit bitmap is UNCHANGED — it still describes the in-flight
+								// PARTIAL batch, which in Mercury's stop-and-wait is exactly the
+								// contiguous successor n_r+1 (the CMD applies the bitmap by SLOT INDEX
+								// to its current messages_tx[], independent of the bsi value). Default-
+								// off ⇒ field == sacked_bsi (byte-identical).
+								unsigned char wire_bsi = cumulative_ack_bsi_field(
+									sacked_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+								printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
+									(unsigned)sacked_bsi, (unsigned)wire_bsi,
+									rsp_last_delivered_batch_seq_id, cumulative_ack_enabled ? 1 : 0,
+									(unsigned)bitmap_u32, data_batch_size);
 								fflush(stdout);
 								// WALL-B FIX-9 D2 REFINE (§2.1): partial = NAcking an incomplete batch -> the
 								// CMD will retransmit -> THIS is the retransmit turnaround the drift slip rides
 								// on -> arm the D2 robust reverse-ACK geometry (settle) for this ACK.
 								ack_tx_retx_turnaround = true;
-								long long mfsk_ms = send_mfsk_ack_sack(sacked_bsi, bitmap_u32);
+								long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
 								if (mfsk_ms > 0)
 								{
 									printf("[TX-ACK-SACK] partial via MFSK suffix wire_ms=%lld\n",
@@ -1803,7 +1823,11 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							}
 							if (!used_mfsk_path)
 							{
-								send_sack_v2_frame(sack_bitmap, data_batch_size, sacked_bsi);
+								// FORGIVING-ACK Tier 2: same bsi-field reshape on the OFDM SACK_RSP
+								// transport (n_r in the field when negotiated; bitmap unchanged).
+								unsigned char wire_bsi = cumulative_ack_bsi_field(
+									sacked_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+								send_sack_v2_frame(sack_bitmap, data_batch_size, wire_bsi);
 							}
 						}
 					}
@@ -1971,14 +1995,23 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					bitmap_u32 = 0u;
 				else
 					bitmap_u32 = (1u << data_batch_size) - 1u;
-				printf("[RSP-MFSK-SACK] clean path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
-					(unsigned)ack_bsi, (unsigned)bitmap_u32, data_batch_size);
+				// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): the clean-ACK bsi field carries n_r
+				// (the contiguous delivery high-water) when negotiated. THE SELF-HEAL: if an
+				// EARLIER clean ACK was missed, the high-water is now AHEAD of this batch's
+				// own bsi, so n_r retroactively confirms the earlier batch FOR FREE on this
+				// turnaround. The all-ones bitmap is unchanged. Default-off ⇒ field == ack_bsi.
+				unsigned char wire_bsi = cumulative_ack_bsi_field(
+					ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+				printf("[RSP-MFSK-SACK] clean path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
+					(unsigned)ack_bsi, (unsigned)wire_bsi,
+					rsp_last_delivered_batch_seq_id, cumulative_ack_enabled ? 1 : 0,
+					(unsigned)bitmap_u32, data_batch_size);
 				fflush(stdout);
 				// WALL-B FIX-9 D2 REFINE (§2.1): clean = a fully-received first-pass batch ACK (the
 				// dominant clean-channel case) -> NOT a retransmit turnaround -> NO robust settle (key
 				// on the tight OFDM turnaround, byte-identical to D2-off / D3-base; recovers the cost).
 				ack_tx_retx_turnaround = false;
-				long long mfsk_ms = send_mfsk_ack_sack(ack_bsi, bitmap_u32);
+				long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
 				if (mfsk_ms > 0)
 				{
 					printf("[TX-ACK-SACK] clean via MFSK suffix wire_ms=%lld\n",
@@ -2398,6 +2431,20 @@ void cl_arq_controller::process_control_responder()
 					peer_capability);
 			}
 		}
+
+		// FORGIVING-ACK Tier 2 negotiation (fact-documents/data-flow-forgiving-ack.md
+		// §T2.1): the cumulative-n_r SACK reshape engages ONLY when BOTH ends advertise
+		// CAP_CUMULATIVE_ACK (the local advertise is itself env-gated by
+		// MERCURY_CUMULATIVE_ACK, so default-off ≡ both_support false ≡ per-batch +
+		// byte-identical). SAME both_support pattern as encryption above. Interop-safe:
+		// a non-Tier-2 commander leaves bit 2 clear → cumulative_ack_enabled false →
+		// per-batch fallback on the RSP send AND the CMD apply.
+		cumulative_ack_enabled = (local_capability & CAP_CUMULATIVE_ACK)
+		                      && (peer_capability  & CAP_CUMULATIVE_ACK);
+		printf("[FORGIVING-ACK-T2] cumulative-n_r SACK %s (local_cap=0x%02X peer_cap=0x%02X)\n",
+			cumulative_ack_enabled ? "NEGOTIATED" : "off",
+			(unsigned)local_capability, (unsigned)peer_capability);
+		fflush(stdout);
 
 		// Streaming compression is unconditional (CAP_STREAMING removed).
 		// Still requires compression to be on; -F off disables both.

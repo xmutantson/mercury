@@ -62,6 +62,23 @@ static inline bool sack_rx_trace_enabled_common()
 	} \
 } while(0)
 
+// FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1): the LOCAL
+// advertise gate. We ONLY set CAP_CUMULATIVE_ACK in local_capability when the env
+// opt-in MERCURY_CUMULATIVE_ACK is present. Default-off ⇒ the bit is never set ⇒
+// both_support is false on BOTH ends ⇒ the reshape never engages ⇒ byte-identical to
+// the Tier-1 base + interop-safe with any non-Tier-2 peer. Returns the cap bit to OR
+// into local_capability (0 when the env is unset). Cached like SACK_TRACE.
+static inline uint8_t cumulative_ack_advertise_bit()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_CUMULATIVE_ACK");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached ? (uint8_t)CAP_CUMULATIVE_ACK : (uint8_t)0;
+}
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -736,6 +753,7 @@ cl_arq_controller::cl_arq_controller()
 	batch_uncompressed_size=0;
 	encryption_mode=ENCRYPT_OFF;
 	encryption_enabled=false;
+	cumulative_ack_enabled=false;  // FORGIVING-ACK Tier 2: fresh session never inherits a negotiated cap
 	tx_batch_counter=0;
 	rx_batch_counter=0;
 	consecutive_auth_failures=0;
@@ -3547,7 +3565,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -3644,7 +3662,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -3680,7 +3698,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -3698,7 +3716,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -3717,7 +3735,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -3923,6 +3941,9 @@ void cl_arq_controller::reset_session_state()
 	// Encryption — wipe all key material (volatile memset, compiler can't elide)
 	cipher_suite.wipe();
 	encryption_enabled = false;
+	// FORGIVING-ACK Tier 2: clear the negotiated cumulative-ACK cap on session reset /
+	// new CONNECT so it is re-negotiated from scratch (never carries across a reset).
+	cumulative_ack_enabled = false;
 #ifdef MERCURY_GUI_ENABLED
 	g_gui_state.encryption_active.store(false);
 	// Don't clear psk_mismatch here — let it persist so the GUI shows the error.

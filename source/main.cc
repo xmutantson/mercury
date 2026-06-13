@@ -759,6 +759,7 @@ int main(int argc, char *argv[])
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_forgiving_ack_cli = false; // --test-forgiving-ack: Tier-1 decouple state-machine regression (data-flow-forgiving-ack.md §6).
+    bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
@@ -1376,6 +1377,19 @@ int main(int argc, char *argv[])
             // the PURE forgiving_ack_should_decouple() helper directly. See
             // fact-documents/data-flow-forgiving-ack.md §6.
             test_forgiving_ack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cumulative-ack") == 0)
+        {
+            // FORGIVING-ACK Tier-2 cumulative-n_r regression (feat/forgiving-ack-tier1,
+            // failing-first under -DCUMULATIVE_ACK_FAILBEFORE). Drives the SELF-HEAL
+            // (a lost report recovered by the next n_r), the contiguous-high-water
+            // GAP-INVARIANT (n_r NEVER ACKs a gap — via the REAL advance_last_delivered
+            // + delivery_step_is_gap producers), the CAPABILITY GATE (cap-off ->
+            // per-batch fallback), and COMPOSITION with Tier-1. See
+            // fact-documents/data-flow-forgiving-ack.md §T2.6.
+            test_cumulative_ack_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2725,6 +2739,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_forgiving_ack();
             printf("[FLAG] Forgiving-ACK test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_cumulative_ack_cli) {
+            // FORGIVING-ACK Tier-2 cumulative-n_r regression (one-shot, then exit rc).
+            // Drives the self-heal (a lost report recovered by the next n_r), the
+            // contiguous-high-water gap-invariant (n_r never ACKs a gap), the
+            // capability gate (cap-off -> per-batch fallback), and composition with
+            // Tier-1. See fact-documents/data-flow-forgiving-ack.md §T2.6.
+            printf("[FLAG] --test-cumulative-ack: invoking Tier-2 cumulative-n_r "
+                   "self-heal regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_cumulative_ack();
+            printf("[FLAG] Cumulative-ACK test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
