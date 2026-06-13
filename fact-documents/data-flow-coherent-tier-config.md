@@ -185,3 +185,97 @@ emulator, confirm the optimizer elects the QPSK tier on a real MPP/MPD label, an
 measure the throughput-vs-MFSK win) queues later and is owned by a separate agent
 with the bench lease. This branch is sim-proven and default-not-selected: safe to
 hold and merge independently.
+
+## §6 Optimizer-election investigation (2026-06-12) — WHO elects the tier
+
+The §2 work proved the PHY *decodes* the fade; this section pins down whether the
+*optimizer* ELECTS the tier, traced from the executed optimizer code
+(`rate_optimizer.cc`, `arq_common.cc`).
+
+### §6.1 Two production blockers (the live optimizer NEVER auto-elects on a fade)
+1. **No faded label exists in the production table.** `effective_rate_table.json`
+   has `channels_tested=[clean, wgn30..wgn16]` — AWGN-only (MEASURED). The label
+   classifier `identify_channel_label()` (`rate_optimizer.cc:462-513`) can only
+   return a label that is a VALID cell in `table[current_cfg]`. With no faded
+   label, a real fade is ALWAYS misclassified as the nearest AWGN bucket
+   (`wgn16`). It can never emit "mpg/mpm/mpp". This is the "AWGN-only-calibrated
+   classifier" the SE-reclaim audit flagged — CONFIRMED as the binding blocker.
+2. **The `max_calibrated_sack` gate slams the optimizer shut on a hard fade.**
+   `opt_evaluate_batch_end()` returns false before `evaluate()` whenever
+   `get_current_sack_rate() > max_sack` (`arq_common.cc:4093`). Production
+   `max_sack = 0.42` (MEASURED, cfg15/wgn20). A floored fade drives sack → ~1.0
+   → gate trips → optimizer SILENT → gearshift/BREAK owns the link.
+
+### §6.2 Mechanism split — gearshift owns DESCENT, optimizer owns HOLD
+On a hard fade CFG15/16 floor → sack→~1 → §6.1(2) gate → gearshift walks the
+ladder DOWN (`FULL_CONFIG_LADDER`, `common_defines.h:172-177`: …15→14→…→9→8→7),
+passing THROUGH CONFIG_9/CONFIG_7. So the QPSK tier is REACHED by the
+**gearshift**, not the optimizer. The optimizer's genuine, achievable
+contribution is (a) HOLDING the right QPSK gear once reached and (b) refusing to
+climb back into the floored QAM gears on a faded label — while still climbing OFF
+a low gear TO the QAM gears on a CLEAN label. The "optimizer elects the tier from
+a floored QAM gear" framing is NOT how the layers divide; a floored config cannot
+self-identify the fade (its own faded cell is `failed`→invalid→skipped by
+`identify_channel_label`), so the optimizer is correctly silent there.
+
+### §6.3 The achievable elections, MEASURED on the HW-grounded vehicle
+Probed via `cl_rate_optimizer` directly against the §7 HW-grounded table:
+- **cfg7 on MPM → HOLD cfg7** (cfg9's mpm cell is failed→invalid candidate;
+  cfg7 r5/16 is the only QPSK gear that decodes the Moderate fade). The decisive
+  deep-tier election, expressed as a HOLD via the candidate-validity gate
+  (`rate_optimizer.cc:640-641`).
+- **cfg9 on MPP → HOLD cfg9** and **cfg9 on MPG → HOLD cfg9** (all QAM cells
+  failed on the fade → no upshift).
+- **cfg16 on clean → HOLD cfg16**; **cfg9 on clean → climb to CFG16**
+  (high gear wins clean = default-not-selected on clean by construction).
+- **cfg15 on wgn16 → stay/climb QAM** (AWGN ≠ fade — no QPSK demote).
+
+### §6.4 Verdict: NEEDS-ROWS (vehicle) + NEEDS-LABELING (production)
+For the env-gated SIM/BENCH vehicle the fix is purely the HW-grounded faded ROWS
+(§7) + the paired election test (§8) — DONE this session. For the PRODUCTION
+optimizer to auto-elect on a REAL fade, §6.1's TWO blockers must be cleared
+first: add a faded label to the production classifier (a runtime channel-state
+faded detector feeding `identify_channel_label`) AND reconcile the `max_sack`
+gate so a floored-but-recoverable fade does not lock the optimizer out before it
+can demote. That is the bigger, separately-scoped "labeling work" — it is NOT
+shipped here and the production table is UNCHANGED (default-not-selected).
+
+## §7 HW-grounded faded rows (2026-06-12)
+`effective_rate_table.coherent_faded.json` faded rows were re-seeded from the
+HW-MEASURED CCIR thresholds in
+`bigblock_p3_hw/HW_BENCH_FADED/FADED_PARITY_VERDICT.json` (IONOS dial S:N, NOT
+the ~10 dB-optimistic SFO-GRID sim — the standing sim-fidelity caveat). Channels
+were changed from the synthetic `[mpp,mpd]` to the bench's actual `[mpg,mpm,mpp]`:
+
+| cfg | mpg (Good) | mpm (Moderate) | mpp (Poor) | source |
+|---|---|---|---|---|
+| 9 (QPSK r1/2)  | 2250 (MPG@8 dB) | **FLOORS** | 3293 (MPP@14 dB) | HW faithful cells |
+| 7 (QPSK r5/16) | not-charac → FAIL | **1274 (MPM@12-14 dB)** | did-not-decode → FAIL | HW faithful cells |
+| 15 (16-QAM)    | FLOOR | FLOOR | FLOOR | §2.1/§2.2 + HW |
+| 16 (32-QAM)    | FLOOR | FLOOR | FLOOR | §2.1/§2.2 + HW |
+
+clean/wgn rows preserved EXACTLY (production-measured) → QAM gears keep winning
+the clean front. The decisive HW finding: **cfg7 r5/16 is the ONLY config that
+decodes the Moderate fade; cfg9 r1/2 floors it** — the deep-tier value, now
+table-realized.
+
+HONEST SCOPE: this is a RELATIVE-robustness vehicle. The HW thresholds are
+~8-14 dB WORSE than the optimistic sim and ~12-18 dB short of the FreeDV
+DATAC3/DATAC4 absolute anchors (`FADED_PARITY_VERDICT.json`); the 1.77× compress
+edge does NOT close that absolute gap. The tier DECODES where the QAM gears floor
+(a robustness win), it is NOT a throughput beat vs VARA on the faded front.
+
+## §8 Paired election regression test
+`--test-coherent-tier-election` (`source/main.cc`, sibling of
+`--test-coherent-tier`): drives `cl_rate_optimizer` (self-contained — no
+ARQ/PHY/audio) against the §7 vehicle and asserts the §6.3 achievable elections.
+Fail-before/pass-after via `MERCURY_COHERENT_ELECTION_FAILBEFORE=1`, which points
+the optimizer at the AWGN-only PRODUCTION table (no faded label) → the three
+faded-HOLD assertions FAIL (the fade is misclassified as AWGN and climbs to QAM),
+proving the HW-grounded faded rows are exactly what arm the faded election. The
+clean assertions PASS in BOTH modes → the change does NOT alter clean behavior.
+VERIFIED: pass-after rc=0 (6/6 OK), fail-before rc=1 (3 faded asserts fail, clean
+asserts hold); `--test-coherent-tier` ALL PASS (PHY decode unchanged);
+`--test-climb-engine` ALL PASS; full `--test` 56+7 pass, 0 fail; default-load
+(no env) consults the PRODUCTION table (min_cfg=6/max_sack=0.42) — the faded
+vehicle is inert by default, clean-front byte-identical by construction.

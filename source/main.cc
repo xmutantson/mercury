@@ -674,6 +674,124 @@ static int run_coherent_tier_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-coherent-tier-election: OPTIMIZER-ELECTION regression for the coherent
+// QPSK faded tier. The sibling --test-coherent-tier proves the PHY *decodes* the
+// fade where the QAM gears floor; THIS test proves the effective-rate OPTIMIZER
+// *elects* the QPSK tier on a faded channel label and still elects the high QAM
+// gears on a clean label (default-not-selected on clean by construction).
+//
+// It drives cl_rate_optimizer (self-contained — no ARQ/PHY/audio) against the
+// env-gated faded vehicle effective_rate_table.coherent_faded.json, whose faded
+// rows are the HW-MEASURED CCIR thresholds (bigblock_p3_hw/HW_BENCH_FADED). The
+// assertions cover only the elections the OPTIMIZER genuinely owns: holding the
+// correct QPSK gear per fade depth (cfg7 r5/16 on the Moderate fade where cfg9
+// r1/2 floors; cfg9 on the Poor/Good fades) and never climbing to a QAM gear on
+// a faded label, while climbing OFF a low gear to QAM on a clean label.
+//
+// The initial descent from a floored QAM gear DOWN into the QPSK region is NOT
+// an optimizer job — a floored config drives sack -> ~1 which trips the
+// max_calibrated_sack gate (arq_common.cc:4093) so the optimizer goes silent and
+// gearshift/BREAK owns that descent (it walks the ladder through CONFIG_9/7).
+// The optimizer's contribution is HOLDING the right QPSK gear once reached and
+// refusing to climb back into the floored QAM gears on a fade. See
+// fact-documents/data-flow-coherent-tier-config.md §3.4 (INV-2) / §6.
+//
+// fail-before/pass-after: MERCURY_COHERENT_ELECTION_FAILBEFORE=1 points the
+// optimizer at the PRODUCTION effective_rate_table.json (which is AWGN-only —
+// NO faded label exists) instead of the faded vehicle. With no faded rows the
+// "elects QPSK on a faded label" assertions cannot pass -> the test FAILS,
+// proving the HW-grounded faded rows are precisely what arm the faded election.
+//
+// Returns the optimizer's first recommended config change for (cfg,eff,sack),
+// or cfg itself if it holds. The label-hysteresis streak (LABEL_STREAK_REQUIRED)
+// means the first few evals only build the streak; loop until a change or a
+// generous cap.
+static int coherent_first_reco(cl_rate_optimizer& opt, int cfg,
+                               double eff, double sack)
+{
+    opt.reset_session_state();
+    for (int i = 0; i < 16; i++) {
+        int t = opt.evaluate(cfg, eff, sack, /*window*/20, /*ceiling*/16, /*nb*/false);
+        if (t != cfg) return t;
+    }
+    return cfg;
+}
+
+static int run_coherent_tier_election_selftest()
+{
+    printf("[TEST-COHERENT-ELECT] coherent QPSK tier OPTIMIZER-ELECTION self-test\n");
+
+    bool failbefore = false;
+    { const char* e = std::getenv("MERCURY_COHERENT_ELECTION_FAILBEFORE");
+      failbefore = (e && e[0] && e[0] != '0'); }
+
+    // Pick the table: faded vehicle (armed) vs production AWGN-only (disarmed).
+    const char* faded_path = "effective_rate_table.coherent_faded.json";
+    const char* prod_path  = "effective_rate_table.json";
+    const char* path = failbefore ? prod_path : faded_path;
+    if (failbefore)
+        printf("[TEST-COHERENT-ELECT]   (FAILBEFORE active: loading AWGN-only "
+               "production table %s — no faded label exists)\n", prod_path);
+
+    cl_rate_optimizer opt;
+    if (!opt.load(path)) {
+        printf("[TEST-COHERENT-ELECT]   FAILED to load %s (run from the worktree "
+               "root)\n", path);
+        return 1;
+    }
+
+    int fails = 0;
+    auto check = [&](const char* desc, int got, int want_lo, int want_hi,
+                     bool want_qpsk) {
+        // want_qpsk=true : got must be a QPSK tier gear (7/8/9) in [want_lo,want_hi].
+        // want_qpsk=false: got must be a QAM gear (>= want_lo) — high-gear-wins-clean.
+        bool ok = want_qpsk ? (got >= want_lo && got <= want_hi)
+                            : (got >= want_lo && got <= want_hi);
+        printf("[TEST-COHERENT-ELECT]   %-48s reco=%2d -> %s\n",
+               desc, got, ok ? "OK" : "FAIL");
+        if (!ok) fails++;
+    };
+
+    // ---- (1) DEEP-TIER HOLD on the Moderate fade. cfg7 r5/16 DECODES MPM (HW
+    // ~1274 bps) where cfg9 r1/2 FLOORS (HW: None at all swept S:N). The
+    // optimizer must HOLD cfg7 and NOT climb to cfg9 (cfg9's mpm cell is failed
+    // -> invalid candidate). This is the decisive deep-tier election. ----
+    check("(1) cfg7 on MPM -> HOLD deep tier",
+          coherent_first_reco(opt, 7, 1274.0, 0.20), 7, 7, true);
+
+    // ---- (2) FORWARD-TIER HOLD on the Poor fade. cfg9 DECODES MPP (HW ~3293).
+    // Must HOLD cfg9 — the QAM gears all floor every fade (failed cells). ----
+    check("(2) cfg9 on MPP -> HOLD forward tier (no QAM on fade)",
+          coherent_first_reco(opt, 9, 3293.0, 0.10), 9, 9, true);
+
+    // ---- (3) FORWARD-TIER HOLD on the Good fade. cfg9 DECODES MPG (HW ~2250).
+    // Must HOLD cfg9. ----
+    check("(3) cfg9 on MPG -> HOLD forward tier",
+          coherent_first_reco(opt, 9, 2250.0, 0.15), 9, 9, true);
+
+    // ---- (4) DEFAULT-NOT-SELECTED ON CLEAN: a high-rate QAM gear at clean must
+    // HOLD (never demote to the QPSK tier). cfg16 is the top gear; on clean it
+    // stays cfg16. ----
+    check("(4) cfg16 CLEAN -> HOLD high gear (never QPSK)",
+          coherent_first_reco(opt, 16, 3635.0, 0.0), 15, 16, false);
+
+    // ---- (5) HIGH-GEAR-WINS-CLEAN: a low QPSK gear sitting on a CLEAN channel
+    // must CLIMB to the QAM gears (the QPSK tier is a faded-front lever, not a
+    // clean-front gear). cfg9 on clean -> elect a QAM gear (>= CONFIG_15). ----
+    check("(5) cfg9 CLEAN -> climb to QAM (high gear wins clean)",
+          coherent_first_reco(opt, 9, 1094.0, 0.0), 15, 16, false);
+
+    // ---- (6) NO-QPSK-ON-AWGN: a mid QAM gear on a noisy-but-AWGN label (wgn16)
+    // must NOT be demoted to the QPSK tier — AWGN is not a fade. Stays/climbs in
+    // the QAM region. ----
+    check("(6) cfg15 wgn16 -> stay/climb QAM (AWGN != fade)",
+          coherent_first_reco(opt, 15, 1925.0, 0.10), 15, 16, false);
+
+    printf("[TEST-COHERENT-ELECT] %s (%d assertion failure%s)\n",
+           fails == 0 ? "ALL PASS" : "FAILED", fails, fails == 1 ? "" : "s");
+    return fails == 0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -901,6 +1019,7 @@ int main(int argc, char *argv[])
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_coherent_tier_cli = false; // --test-coherent-tier: coherent QPSK low-rate tier (CONFIG_9 r1/2, CONFIG_7 r5/16) decodes MPP/MPD where CFG15/16 floor (feat/coherent-tier).
+    bool test_coherent_election_cli = false; // --test-coherent-tier-election: optimizer ELECTS the QPSK tier on a faded label + high-gear-wins-clean (feat/coherent-tier).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1535,6 +1654,19 @@ int main(int argc, char *argv[])
             // GENIE-bounded so the QAM failure is proven fundamental. No DSP is
             // invented. See fact-documents/data-flow-coherent-tier-config.md §2/§4.
             test_coherent_tier_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-coherent-tier-election") == 0)
+        {
+            // Coherent QPSK tier OPTIMIZER-ELECTION regression (feat/coherent-tier,
+            // failing-first): drives cl_rate_optimizer against the HW-grounded
+            // env-gated faded vehicle and asserts the optimizer ELECTS/HOLDS the
+            // QPSK tier on faded labels (cfg7 on MPM, cfg9 on MPP/MPG) while the
+            // high QAM gears win the CLEAN front (default-not-selected on clean).
+            // Sibling of --test-coherent-tier (which proves the PHY decodes).
+            // FAILBEFORE=1 loads the AWGN-only production table (no faded label).
+            test_coherent_election_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2887,6 +3019,18 @@ start_modem:
             fflush(stdout);
             int rc = run_coherent_tier_selftest();
             printf("[FLAG] coherent-tier self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_coherent_election_cli) {
+            // Coherent QPSK tier OPTIMIZER-ELECTION self-test (one-shot, exit rc).
+            // Pure cl_rate_optimizer drive — no ARQ/PHY/audio/TCP state needed.
+            printf("[FLAG] --test-coherent-tier-election: invoking coherent QPSK "
+                   "tier optimizer-election self-test\n");
+            fflush(stdout);
+            int rc = run_coherent_tier_election_selftest();
+            printf("[FLAG] coherent-tier-election self-test complete (rc=%d) — "
+                   "exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

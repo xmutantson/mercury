@@ -1,9 +1,10 @@
 {
   "schema_version": 1,
-  "calibration_date": "2026-06-11T00:00:00Z",
-  "mercury_head": "627c370",
+  "calibration_date": "2026-06-12T00:00:00Z",
+  "mercury_head": "6d94935",
   "synthetic": true,
-  "note": "SIM/BENCH faded-front vehicle. Load via MERCURY_RATE_TABLE. Derived from GROUNDED SFO-GRID Watterson coded cells (fact-documents/data-flow-coherent-tier-config.md \u00a72): on CCIR MPP/MPD, CFG15/16 floor (failed=true) and the coherent QPSK tier (CONFIG_9 r1/2, CONFIG_7 r5/16) decodes -> the optimizer elects the QPSK tier on the mpp/mpd labels ONLY. Clean/WGN rows are the PRODUCTION-measured values so the high-rate QAM gears keep winning the clean front (default-not-selected on clean by construction). NOT the production table; the bench must re-measure on HW before any row is promoted to effective_rate_table.json.",
+  "note": "SIM/BENCH faded-front vehicle (HW-GROUNDED). Load via MERCURY_RATE_TABLE. Faded rows are the HW-MEASURED CCIR thresholds from bigblock_p3_hw/HW_BENCH_FADED/FADED_PARITY_VERDICT.json (IONOS dial S:N, NOT the ~10dB-optimistic SFO-GRID sim): cfg9 r1/2 carries MPG@8 (~2250) and MPP@14 (~3293) but FLOORS the Moderate fade (MPM); cfg7 r5/16 (deep tier) carries MPM@12-14 (~1274) where cfg9 floors. cfg15/16 (16/32-QAM r0.875) FLOOR every CCIR fade (fundamental to constellation+rate, GENIE-bounded \u00a72.2). On a faded label the optimizer elects the QPSK tier ONLY (cfg7 on MPM, cfg9 on MPG/MPP); clean/wgn rows carry PRODUCTION-measured values so the high-rate QAM gears keep winning the clean front (default-not-selected on clean by construction). NOT the production table; effective_rate_table.json is UNCHANGED -> the live optimizer never auto-elects the QPSK tier on a real faded channel (the production label classifier is AWGN-only-calibrated and has no faded label) until faded-front labeling lands. This vehicle is for sim/bench election validation only.",
+  "hw_source": "bigblock_p3_hw/HW_BENCH_FADED/FADED_PARITY_VERDICT.json",
   "calibration_setup": {
     "compress": false,
     "sack": true,
@@ -23,10 +24,27 @@
     "wgn30",
     "wgn22",
     "wgn16",
-    "mpp",
-    "mpd"
+    "mpg",
+    "mpm",
+    "mpp"
   ],
   "channel_definitions": {
+    "mpg": [
+      "WATTERSON",
+      "DEPTH:6",
+      "FD_HZ:0.1",
+      "DLY_MS:0.5",
+      "PROFILE:CCIR-MPG",
+      "BANDWIDTH:3000"
+    ],
+    "mpm": [
+      "WATTERSON",
+      "DEPTH:6",
+      "FD_HZ:0.5",
+      "DLY_MS:1",
+      "PROFILE:CCIR-MPM",
+      "BANDWIDTH:3000"
+    ],
     "mpp": [
       "WATTERSON",
       "DEPTH:6",
@@ -34,15 +52,19 @@
       "DLY_MS:2",
       "PROFILE:CCIR-MPP",
       "BANDWIDTH:3000"
-    ],
-    "mpd": [
-      "WATTERSON",
-      "DEPTH:6",
-      "FD_HZ:2",
-      "DLY_MS:4",
-      "PROFILE:CCIR-MPD",
-      "BANDWIDTH:3000"
     ]
+  },
+  "hw_thresholds_dial_db": {
+    "cfg9": {
+      "MPG": 8,
+      "MPM": null,
+      "MPP": 14
+    },
+    "cfg7": {
+      "MPG": null,
+      "MPM": 12,
+      "MPP": null
+    }
   },
   "table": {
     "7": {
@@ -98,30 +120,43 @@
         "failed": false,
         "break_fired": false
       },
-      "mpp": {
-        "eff_bps_mean": 660.0,
-        "eff_bps_min": 660.0,
-        "eff_bps_max": 660.0,
+      "mpg": {
+        "eff_bps_mean": 0.0,
+        "eff_bps_min": 0.0,
+        "eff_bps_max": 0.0,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.15,
+        "sack_rate_mean": 1.0,
+        "batch_count_mean": 8.0,
+        "frame_loss_pct": 100.0,
+        "n_runs": 2,
+        "n_failed_runs": 2,
+        "failed": true,
+        "break_fired": false
+      },
+      "mpm": {
+        "eff_bps_mean": 1274.0,
+        "eff_bps_min": 1274.0,
+        "eff_bps_max": 1274.0,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.2,
         "batch_count_mean": 8.0,
         "frame_loss_pct": 0.0,
-        "n_runs": 1,
+        "n_runs": 2,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false
       },
-      "mpd": {
-        "eff_bps_mean": 640.0,
-        "eff_bps_min": 640.0,
-        "eff_bps_max": 640.0,
+      "mpp": {
+        "eff_bps_mean": 0.0,
+        "eff_bps_min": 0.0,
+        "eff_bps_max": 0.0,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.25,
+        "sack_rate_mean": 1.0,
         "batch_count_mean": 8.0,
-        "frame_loss_pct": 0.0,
-        "n_runs": 1,
-        "n_failed_runs": 0,
-        "failed": false,
+        "frame_loss_pct": 100.0,
+        "n_runs": 2,
+        "n_failed_runs": 2,
+        "failed": true,
         "break_fired": false
       }
     },
@@ -178,29 +213,42 @@
         "failed": false,
         "break_fired": false
       },
-      "mpp": {
-        "eff_bps_mean": 940.0,
-        "eff_bps_min": 940.0,
-        "eff_bps_max": 940.0,
+      "mpg": {
+        "eff_bps_mean": 2250.0,
+        "eff_bps_min": 2250.0,
+        "eff_bps_max": 2250.0,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.05,
+        "sack_rate_mean": 0.15,
         "batch_count_mean": 8.0,
         "frame_loss_pct": 0.0,
-        "n_runs": 1,
-        "n_failed_runs": 0,
+        "n_runs": 3,
+        "n_failed_runs": 1,
         "failed": false,
         "break_fired": false
       },
-      "mpd": {
-        "eff_bps_mean": 470.0,
-        "eff_bps_min": 470.0,
-        "eff_bps_max": 470.0,
+      "mpm": {
+        "eff_bps_mean": 0.0,
+        "eff_bps_min": 0.0,
+        "eff_bps_max": 0.0,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.5,
+        "sack_rate_mean": 1.0,
+        "batch_count_mean": 8.0,
+        "frame_loss_pct": 100.0,
+        "n_runs": 2,
+        "n_failed_runs": 2,
+        "failed": true,
+        "break_fired": false
+      },
+      "mpp": {
+        "eff_bps_mean": 3293.0,
+        "eff_bps_min": 3293.0,
+        "eff_bps_max": 3293.0,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.1,
         "batch_count_mean": 8.0,
         "frame_loss_pct": 0.0,
-        "n_runs": 1,
-        "n_failed_runs": 0,
+        "n_runs": 2,
+        "n_failed_runs": 1,
         "failed": false,
         "break_fired": false
       }
@@ -258,7 +306,7 @@
         "failed": false,
         "break_fired": false
       },
-      "mpp": {
+      "mpg": {
         "eff_bps_mean": 0.0,
         "eff_bps_min": 0.0,
         "eff_bps_max": 0.0,
@@ -271,7 +319,20 @@
         "failed": true,
         "break_fired": true
       },
-      "mpd": {
+      "mpm": {
+        "eff_bps_mean": 0.0,
+        "eff_bps_min": 0.0,
+        "eff_bps_max": 0.0,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 1.0,
+        "batch_count_mean": 8.0,
+        "frame_loss_pct": 100.0,
+        "n_runs": 1,
+        "n_failed_runs": 1,
+        "failed": true,
+        "break_fired": true
+      },
+      "mpp": {
         "eff_bps_mean": 0.0,
         "eff_bps_min": 0.0,
         "eff_bps_max": 0.0,
@@ -338,7 +399,7 @@
         "failed": false,
         "break_fired": false
       },
-      "mpp": {
+      "mpg": {
         "eff_bps_mean": 0.0,
         "eff_bps_min": 0.0,
         "eff_bps_max": 0.0,
@@ -351,7 +412,20 @@
         "failed": true,
         "break_fired": true
       },
-      "mpd": {
+      "mpm": {
+        "eff_bps_mean": 0.0,
+        "eff_bps_min": 0.0,
+        "eff_bps_max": 0.0,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 1.0,
+        "batch_count_mean": 8.0,
+        "frame_loss_pct": 100.0,
+        "n_runs": 1,
+        "n_failed_runs": 1,
+        "failed": true,
+        "break_fired": true
+      },
+      "mpp": {
         "eff_bps_mean": 0.0,
         "eff_bps_min": 0.0,
         "eff_bps_max": 0.0,
