@@ -373,6 +373,8 @@ source/gui/widgets/waterfall.cc
 source/gui/dialogs/setup_dialog.cc
 source/gui/dialogs/soundcard_dialog.cc
 source/compression/mercury_compress.cc
+source/compression/winlink_dict.cc
+source/compression/test_winlink_dict.cc
 source/compression/lzhuf_buffer.cc
 source/crypto/mercury_crypto.cc
 "

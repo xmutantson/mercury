@@ -14,6 +14,7 @@
  */
 
 #include "compression/mercury_compress.h"
+#include "compression/winlink_dict.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -118,6 +119,15 @@ cl_compressor::cl_compressor()
 	pending_raw = nullptr;
 	pending_raw_len = 0;
 	pending_raw_capacity = 0;
+
+	// Winlink dict priming is DEFAULT-ON but version-guarded. The MERCURY_NO_DICT
+	// environment variable (build/runtime kill-switch) forces the cold path so the
+	// stream is byte-identical to the pre-dict baseline (used by the no-regression
+	// A/B and as a field escape hatch). Disabling on EITHER peer (or a dict-version
+	// mismatch) cleanly degrades to cold on both — see prime_with_dict / the
+	// streaming-header dict-tag fail-safe in compress_block/decompress_block.
+	dict_priming_enabled = (getenv("MERCURY_NO_DICT") == nullptr);
+	dict_version_active = 0;
 }
 
 cl_compressor::~cl_compressor()
@@ -217,10 +227,74 @@ void cl_compressor::streaming_enable()
 	// on the first ppmd_compress/ppmd_decompress call (or after a reset). Mark it
 	// uninitialized so the first PPMd use Init()s before encoding/decoding.
 	ppmd_model_initialized = false;
+	dict_version_active = 0;
 	streaming_active = true;
 
 	printf("[STREAMING] Enabled: PPMd carry + zstd prefix (32KB)\n");
 	fflush(stdout);
+
+	// Winlink dict priming: warm the brand-new stream with the firmware-baked
+	// universal dictionary so the FIRST small message compresses as if warm. Done
+	// AFTER streaming_active=true (prime_with_dict drives decompress_block /
+	// streaming_commit, which require an active stream). Role-independent and
+	// deterministic — see prime_with_dict().
+	if (dict_priming_enabled)
+		prime_with_dict();
+}
+
+// Role-independent in-place priming. BOTH peers run the IDENTICAL sequence on the
+// IDENTICAL firmware-baked bytes, so the PPMd model + zstd prefix end in the SAME
+// state on TX and RX (the bit-exact agreement the streaming CRC16 demands):
+//
+//   1. decompress_block(WINLINK_DICT_COMPRESSED) — a single deterministic forward
+//      pass over the dict symbols through the SHARED PPMd model (PPMd8 uses one
+//      model object for enc+dec). This is why decompress-on-both-sides is exact:
+//      the TX's eventual ppmd_compress and the RX's ppmd_decompress both continue
+//      from the same model state. (Verified: a compress-warmed TX and a
+//      decompress-warmed RX compress/decode a subsequent message bit-exact AND to
+//      the same wire bytes as two decompress-warmed peers.)
+//   2. streaming_commit(WINLINK_DICT_RAW) — loads the raw dict into the zstd
+//      prefix (32 KB back-reference window) AND sets ppmd_model_warm.
+//
+// The dict bytes are NEVER transmitted (baked into both ends). On any failure the
+// stream is reset to the cold/un-primed state (fail-safe). Sets dict_version_active.
+int cl_compressor::prime_with_dict()
+{
+	if (!streaming_active || !zstd_prefix || !workspace) return 0;
+	if (WINLINK_DICT_COMPRESSED_LEN == 0 || WINLINK_DICT_RAW_LEN == 0) return 0;
+
+	// (1) Warm the PPMd model via a forward decode of the baked compressed dict.
+	//     workspace is the scratch sink (>= raw dict length; dict is < 4 KB).
+	if ((int)WINLINK_DICT_RAW_LEN > workspace_size) return 0;  // safety; dict is tiny
+	int d = decompress_block((const char*)WINLINK_DICT_COMPRESSED,
+		(int)WINLINK_DICT_COMPRESSED_LEN, (char*)workspace, workspace_size);
+	if (d != (int)WINLINK_DICT_RAW_LEN)
+	{
+		// Self-inconsistent firmware (baked compressed blob != raw). Never prime
+		// against a bad model — fall back to cold so behavior == pre-dict baseline.
+		printf("[DICT] Prime decode failed (d=%d, expected %u) — staying cold\n",
+			d, WINLINK_DICT_RAW_LEN);
+		fflush(stdout);
+		streaming_reset();
+		return 0;
+	}
+
+	// (2) Load the raw dict into the zstd prefix window (and mark the model warm).
+	streaming_commit((const unsigned char*)WINLINK_DICT_RAW, (int)WINLINK_DICT_RAW_LEN);
+
+	// The dict batch is a "warm-up" the wire never saw: do NOT let it count as a
+	// transmitted streaming batch (otherwise the very first real frame would be
+	// tagged streaming with stream_batch_count>0 even though the peer's cold path
+	// might not be primed). stream_batch_count is left as streaming_commit set it
+	// (==1) so the first REAL frame carries COMPRESS_FLAG_STREAMING — both peers
+	// are primed identically, so this is correct and symmetric.
+	dict_version_active = WINLINK_DICT_VERSION;
+
+	printf("[DICT] Primed v%d: raw=%u compressed=%u (zstd prefix=%d, PPMd warm)\n",
+		WINLINK_DICT_VERSION, WINLINK_DICT_RAW_LEN, WINLINK_DICT_COMPRESSED_LEN,
+		zstd_prefix_len);
+	fflush(stdout);
+	return WINLINK_DICT_VERSION;
 }
 
 void cl_compressor::streaming_disable()
@@ -232,6 +306,7 @@ void cl_compressor::streaming_disable()
 		Ppmd8_Init((CPpmd8*)ppmd_ctx, PPMD_ORDER, PPMD8_RESTORE_METHOD_RESTART);
 	ppmd_model_warm = false;
 	ppmd_model_initialized = false;
+	dict_version_active = 0;
 	stream_batch_count = 0;
 
 	free(zstd_prefix);
@@ -262,6 +337,12 @@ void cl_compressor::streaming_reset()
 	zstd_prefix_len = 0;
 	pending_raw_len = 0;
 	stream_batch_count = 0;
+	// A reset is a desync RECOVERY: the stream drops to the cold/un-primed state
+	// and STAYS cold for the rest of the session. Re-priming on one side without
+	// the peer re-priming in lock-step would re-desync; "fail-safe, never corrupt"
+	// prefers the (lower-ratio) cold path. dict_version_active=0 makes subsequent
+	// TX frames carry the dict-tag 0 (cold) so the peer agrees.
+	dict_version_active = 0;
 
 	printf("[STREAMING] Reset\n");
 	fflush(stdout);
@@ -603,8 +684,12 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 		ppmd_model_reset();
 
 	// Write header: [algo_flags:1][comp_size:2 LE][orig_size:2 LE][crc16:2 LE if streaming]
+	// algo_flags bits 5-7 carry the ACTIVE dict version (0 = cold) so the RX can
+	// detect a dict-version mismatch BEFORE decoding against a wrongly-primed model
+	// and fall back to cold (fail-safe). Only meaningful when streaming.
 	uout[0] = (unsigned char)(best_algo |
-		(streaming_active && stream_batch_count > 0 ? COMPRESS_FLAG_STREAMING : 0));
+		(streaming_active && stream_batch_count > 0 ? COMPRESS_FLAG_STREAMING : 0) |
+		(streaming_active ? ((dict_version_active << COMPRESS_DICTVER_SHIFT) & COMPRESS_DICTVER_MASK) : 0));
 	uout[1] = (unsigned char)(best_comp_size & 0xFF);
 	uout[2] = (unsigned char)((best_comp_size >> 8) & 0xFF);
 	uout[3] = (unsigned char)(in_len & 0xFF);
@@ -652,8 +737,33 @@ int cl_compressor::decompress_block(const char* in, int in_len, char* out, int o
 	// Parse header
 	int algo = uin[0] & COMPRESS_ALGO_MASK;
 	bool is_streaming_frame = (uin[0] & COMPRESS_FLAG_STREAMING) != 0;
+	int frame_dict_ver = (uin[0] & COMPRESS_DICTVER_MASK) >> COMPRESS_DICTVER_SHIFT;
 	int comp_size = uin[1] | (uin[2] << 8);
 	int orig_size = uin[3] | (uin[4] << 8);
+
+	// VERSION-LOCK FAIL-SAFE (the safety case): the TX stamped the dict version it
+	// primed with into bits 5-7. If it differs from the version WE primed with, the
+	// two models diverge from byte zero — decoding this frame against our model
+	// would produce garbage (and a wrong dict could even decode to a wrong length).
+	// Detect it HERE, before touching the model: drop OUR priming to cold and bail.
+	// The CRC16 below would also catch it, but the explicit version check fails safe
+	// deterministically (no reliance on a CRC collision being improbable) and makes
+	// the mismatch loud. We only enforce when WE are primed (dict_version_active!=0)
+	// OR the TX claims a dict (frame_dict_ver!=0) on a streaming frame — i.e. any
+	// disagreement about the active dict.
+	if (streaming_active && is_streaming_frame && frame_dict_ver != dict_version_active)
+	{
+		printf("[DICT] Version mismatch (frame v%d != ours v%d) — falling back to cold\n",
+			frame_dict_ver, dict_version_active);
+		fflush(stdout);
+		// streaming_reset() drops our primed model to cold AND sets
+		// dict_version_active=0, so subsequent agreement is at the cold tag. Return
+		// error so the caller pushes raw (no corruption); the TX's CRC-less view
+		// will re-sync once both sides are cold (the TX also resets on the next
+		// raw-win / its own desync path). NEVER decompress against a mismatched dict.
+		streaming_reset();
+		return -1;
+	}
 
 	// Streaming desync detection: TX reset but our model is warm
 	if (streaming_active && !is_streaming_frame && ppmd_model_warm)

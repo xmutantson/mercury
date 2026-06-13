@@ -43,6 +43,15 @@
 #define COMPRESS_ALGO_MASK           0x03
 #define COMPRESS_FLAG_STREAMING      0x04
 
+// Winlink dictionary version tag in the streaming algo_flags byte (bits 5-7,
+// 3-bit field, 0..7). 0 = no dict / cold; 1..7 = a specific firmware-baked dict.
+// The TX stamps its ACTIVE dict version into every streaming frame; an RX whose
+// active dict version differs falls back to the cold path (fail-safe — a wrong
+// dict primes a different model and would otherwise decompress to garbage).
+// Bits 3-4 remain reserved (0).
+#define COMPRESS_DICTVER_SHIFT       5
+#define COMPRESS_DICTVER_MASK        0xE0    // bits 5-7
+
 // Entropy thresholds (bits per byte, 0.0 = constant, 8.0 = random)
 #define ENTROPY_SKIP_ALL        7.5f   // Incompressible — send raw
 #define ENTROPY_ZSTD_ONLY       6.0f   // Mixed — try zstd only
@@ -83,7 +92,24 @@ public:
     bool is_streaming() const { return streaming_active; }
     int get_header_size() const { return streaming_active ? COMPRESS_HEADER_SIZE : COMPRESS_HEADER_SIZE_LEGACY; }
 
+    // ---- Winlink dictionary priming (v1 universal static dict) ----
+    // Enable/disable dict priming. Default-ON (version-guarded). When disabled,
+    // streaming_enable() does NOT prime and the cold path is byte-identical to the
+    // pre-dict baseline. Must be set IDENTICALLY on both peers (a build/runtime
+    // posture), independent of the per-frame version-lock fail-safe.
+    void set_dict_priming(bool on) { dict_priming_enabled = on; }
+    bool dict_priming() const { return dict_priming_enabled; }
+    // The dict version this compressor is primed with (0 = not primed / cold).
+    int  active_dict_version() const { return dict_version_active; }
+
 private:
+    // Role-independent in-place priming: decompress the firmware-baked compressed
+    // dict (one deterministic forward pass through the shared PPMd model, identical
+    // on TX and RX) then load the raw dict into the zstd prefix. Zero wire cost.
+    // Sets dict_version_active on success. Called from streaming_enable() when
+    // dict_priming_enabled. Returns the dict version primed (0 on failure/disabled).
+    int prime_with_dict();
+
     float quick_entropy(const unsigned char* data, int len);
     int ppmd_compress(const unsigned char* in, int in_len, unsigned char* out, int out_cap);
     int ppmd_decompress(const unsigned char* in, int in_len, int orig_len, unsigned char* out, int out_cap);
@@ -118,6 +144,10 @@ private:
     unsigned char* pending_raw;   // Raw data from last compress, waiting for ACK
     int pending_raw_len;
     int pending_raw_capacity;
+
+    // Winlink dict priming
+    bool dict_priming_enabled;    // Posture: prime new streams with the baked dict
+    int  dict_version_active;     // 0 = stream not primed (cold); else WINLINK_DICT_VERSION
 };
 
 #endif

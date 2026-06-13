@@ -40,6 +40,7 @@
 #include "physical_layer/dist_matcher.h"   // --test-pas PAS/PCS DM bijection self-test
 #include "physical_layer/mfsk_ctrl_codec_tests.h"
 #include "common/sim_clock_tests.h"
+#include "compression/test_winlink_dict.h"
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
@@ -544,6 +545,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test") == 0) {
             int failed = run_mfsk_ctrl_codec_tests();
             failed += run_sim_clock_tests();
+            failed += run_winlink_dict_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock
+        // regression suite and exit. Fast + deterministic; drives the production
+        // cl_compressor end-to-end (primed lift, bit-exact, version-mismatch
+        // fail-safe, kill-switch, bulk no-regression, attachment inertness,
+        // streaming desync). See source/compression/test_winlink_dict.cc.
+        if (strcmp(argv[i], "--test-winlink-dict") == 0) {
+            int failed = run_winlink_dict_tests();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sim-clock : run ONLY the sim-clock unit suite and exit. The
