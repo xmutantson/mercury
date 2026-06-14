@@ -1698,6 +1698,15 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
 
+  // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
+  // In-process synthetic-fire (CLI --test-spec-sack), modelled on
+  // test_partial_bsi_advance. Forces frame-k still-decoding at the
+  // window-fraction deadline -> asserts the SACK fires IN-WINDOW with bit_k=0 ->
+  // CMD retransmits k -> RSP re-receives k byte-faithful -> asserts NO
+  // double-delivery and NO silent loss. turnaround-eff.md §9.
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  int test_spec_sack();
+
   // FIX-8 (data-integrity) — silent lost-batch GAP on post-reset re-adopt.
   // In-process SIM_INPROC synthetic-fire (CLI --test-gap-abort). Reproduces the
   // bench-4 sequence: deliver batches 0..4 (high-water=4), force the BREAK reset
