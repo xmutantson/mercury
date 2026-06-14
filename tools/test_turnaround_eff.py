@@ -188,14 +188,42 @@ def main():
     fired_off = "[RSP-SPEC-SACK] deadline fired" in out_off
     fired_on = "[RSP-SPEC-SACK] deadline fired" in out_on
     deliv_on = "no-double-delivery OK" in out_on and "delivery OK" in out_on
-    if rc_off == 0 and rc_on == 0 and (not fired_off) and fired_on and deliv_on:
+    struggle_ok = "STRUGGLE PASS-AFTER" in out_on
+    if (rc_off == 0 and rc_on == 0 and (not fired_off) and fired_on
+            and deliv_on and struggle_ok):
         print("[TEST-SS] PASS: fail-before stalls (env off, gate idle); pass-after "
               "fires in-window bit_k=0 -> retx -> byte-faithful single in-order "
-              "delivery (no double-delivery, no silent loss)")
+              "delivery (no double-delivery, no silent loss); struggling first "
+              "batch gated by near-completeness (no flood)")
     else:
         print(f"[TEST-SS] FAIL: rc_off={rc_off} rc_on={rc_on} fired_off={fired_off} "
-              f"fired_on={fired_on} deliv_on={deliv_on}")
+              f"fired_on={fired_on} deliv_on={deliv_on} struggle_ok={struggle_ok}")
         fails.append("TEST-SS")
+
+    # ---- TEST-SS-FLOOD: struggling-batch FAIL-BEFORE (minfrac=0 reproduces) ----
+    # The near-completeness gate's regression. With MERCURY_SPEC_SACK=1 +
+    # MERCURY_SPEC_SACK_MINFRAC=0 the gate behaves as it did pre-fix: it prompt-
+    # fires on a struggling near-empty first batch -> models the retx flood
+    # (the runaway-BREAK trigger the fix prevents). The test asserts the flood
+    # reproduces (fail-before). With the default minfrac=70 (TEST-SS above) it
+    # does NOT fire (pass-after). Both arms exit 0 (the in-process test treats
+    # minfrac=0 as the demonstrable-bug arm, not a failure).
+    env_fb = dict(os.environ)
+    env_fb["MERCURY_SPEC_SACK"] = "1"
+    env_fb["MERCURY_SPEC_SACK_MINFRAC"] = "0"
+    p_fb = subprocess.run([binary, "--test-spec-sack"], env=env_fb,
+                          capture_output=True, text=True, timeout=120)
+    out_fb = p_fb.stdout + p_fb.stderr
+    flood_reproduced = ("runaway-BREAK reproduced" in out_fb
+                        and "STRUGGLE FAIL-BEFORE" in out_fb)
+    if p_fb.returncode == 0 and flood_reproduced and struggle_ok:
+        print("[TEST-SS-FLOOD] PASS: fail-before (minfrac=0) reproduces the "
+              "struggling-batch SPEC_SACK flood that trips runaway-BREAK; "
+              "pass-after (minfrac=70 default) gates it off")
+    else:
+        print(f"[TEST-SS-FLOOD] FAIL: rc={p_fb.returncode} "
+              f"flood_reproduced={flood_reproduced} struggle_ok={struggle_ok}")
+        fails.append("TEST-SS-FLOOD")
 
     print()
     if fails:
