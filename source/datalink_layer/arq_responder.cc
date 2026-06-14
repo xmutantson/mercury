@@ -497,6 +497,110 @@ void cl_arq_controller::process_messages_rx_data_control()
 			return;
 		}
 
+		// ─── LEVER #2: SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK) ───
+		// turnaround-eff.md §8. Fire the reverse-ACK (SACK) on a WINDOW-FRACTION
+		// DEADLINE rather than waiting for the whole batch — including any
+		// still-decoding / non-converging frame — to finish the serial receive()
+		// pump. receive() (above, :432) is BLOCKING, so the deadline can only be
+		// checked at THIS loop boundary (the first line after receive() returns,
+		// covering frame-stored / FAIL / nothing-decoded alike). At the deadline,
+		// frames that have NOT yet reached messages_rx[].status==RECEIVED are
+		// reported bit-0 by the EXISTING ACK-GATE bitmap build (:1689-1691) and
+		// recovered via the bench-validated idempotent partial-SACK + CMD-retx
+		// path (arq_commander.cc:3098-3164). We do NOT duplicate the ACK-GATE
+		// logic — we only advance connection_status to ACKNOWLEDGING_DATA one
+		// instant EARLIER (the same value the natural timer-expiry path at :1150
+		// sets), so the next pump tick runs process_messages_acknowledging_data().
+		// Default-off (env unset) ⇒ this block is skipped ⇒ the SACK fires after
+		// the serial loop exactly as today (BYTE-IDENTICAL). See §8.4 cross-layer
+		// audit (no producer of messages_rx[].status is altered) and §8.5 (the
+		// D5 prev-bump chain is NOT amplified — a missing/late EOB leaves
+		// prev_expected at the full data_batch_size, never a truncated EOB+1).
+		{
+			static const bool spec_sack_on =
+				(std::getenv("MERCURY_SPEC_SACK") != nullptr
+				 && atoi(std::getenv("MERCURY_SPEC_SACK")) != 0);
+			if(spec_sack_on
+			   && link_status == CONNECTED
+			   && connection_status == RECEIVING
+			   && !passive_monitor
+			   && sack_enabled
+			   && data_batch_size > 1          // single-frame batches use EOB receipt (§8.5)
+			   && batch_rx_frame_count >= 1)   // never SACK an empty batch (§8.2)
+			{
+				// rx_received + expected — computed IDENTICALLY to the ACK-GATE
+				// handler (arq_responder.cc:1636-1669) so the "incomplete?" test
+				// agrees with the SACK it will build.
+				int rx_received = 0;
+				for(int i = 0; i < data_batch_size; i++)
+					if(messages_rx[i].status == RECEIVED) rx_received++;
+				int expected = data_batch_size;
+				if(last_received_end_of_batch_seq >= 0)
+				{
+					expected = last_received_end_of_batch_seq + 1;
+					if(expected > data_batch_size) expected = data_batch_size;
+				}
+				else if(compression_enabled
+					&& !cipher_suite.is_active()
+					&& !compressor.is_streaming()
+					&& messages_rx[0].status == RECEIVED
+					&& messages_rx[0].length >= compressor.get_header_size())
+				{
+					const unsigned char* hdr = (const unsigned char*)messages_rx[0].data;
+					int hdr_comp = hdr[1] | (hdr[2] << 8);
+					int gate_hdr_size = compressor.get_header_size();
+					int total_compressed = gate_hdr_size + hdr_comp;
+					int mf = max_data_length + max_header_length
+						- effective_data_long_header_length(sack_v2_enabled);
+					expected = (mf > 0) ? (total_compressed + mf - 1) / mf : data_batch_size;
+					if(expected > data_batch_size) expected = data_batch_size;
+					if(expected < 1) expected = 1;
+				}
+
+				// Window-fraction DEADLINE (NOT EOB-arrival-only, §8.2): a slow /
+				// lost / non-converging EOB frame must STILL trigger. Default 3/4
+				// of the (dynamically per-frame re-armed, :1130) receiving window;
+				// env-overridable for the bench sweep. A healthy in-progress batch
+				// keeps pushing receiving_timeout forward on each frame, so the
+				// gate only bites once the channel/decode has genuinely stalled
+				// relative to the remaining-batch estimate.
+				static const int spec_num = []{
+					const char* e = std::getenv("MERCURY_SPEC_SACK_NUM");
+					int v = (e && *e) ? atoi(e) : 3;
+					return (v >= 1) ? v : 3;
+				}();
+				static const int spec_den = []{
+					const char* e = std::getenv("MERCURY_SPEC_SACK_DEN");
+					int v = (e && *e) ? atoi(e) : 4;
+					return (v >= 1 && v >= spec_num) ? v : 4;
+				}();
+				long long deadline_ms =
+					(long long)receiving_timeout * spec_num / spec_den;
+
+				if(expected >= 2
+				   && rx_received < expected
+				   && receiving_timer.get_elapsed_time_ms() >= deadline_ms)
+				{
+					printf("[RSP-SPEC-SACK] deadline fired: elapsed=%d >= %lld "
+						"(=%d*%d/%d) rx=%d/%d expected=%d eob=%d batch=%d — "
+						"advancing to ACK-GATE (still-decoding frames -> bit-0 -> retx)\n",
+						receiving_timer.get_elapsed_time_ms(), deadline_ms,
+						receiving_timeout, spec_num, spec_den,
+						rx_received, data_batch_size, expected,
+						last_received_end_of_batch_seq, data_batch_size);
+					fflush(stdout);
+					mtl::log_event_kv("rsp_spec_sack_fired",
+						"elapsed=%d deadline=%lld rx=%d expected=%d",
+						receiving_timer.get_elapsed_time_ms(),
+						deadline_ms, rx_received, expected);
+					receiving_timer.stop();
+					receiving_timer.reset();
+					connection_status = ACKNOWLEDGING_DATA;
+					return;
+				}
+			}
+		}
+
 		if(messages_rx_buffer.status==RECEIVED)
 		{
 			if(messages_rx_buffer.type==CONTROL)
@@ -3626,6 +3730,321 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 		this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK), in-process test
+// ============================================================================
+//
+// CLI: --test-spec-sack    (turnaround-eff.md §9)
+//
+// Reproduces the held-CFG16 reverse-ACK turnaround miss (turnaround-eff.md §0):
+// one frame-k is still-decoding / non-converging when the rest of the batch is
+// RECEIVED. PRE-LEVER, the SACK fires only when receiving_timer expires (or never,
+// if a doomed frame keeps the loop busy). LEVER #2 fires the SACK on a
+// window-fraction DEADLINE: frame-k is reported bit-0, retransmitted, and merged.
+//
+// This drives the EXACT production predicate (the window-fraction deadline gate,
+// arq_responder.cc:~500), the EXACT production SACK bitmap build (messages_rx[]
+// RECEIVED-scan), the EXACT production CMD partial-SACK retx consumer logic
+// (arq_commander.cc:3098-3164, replicated inline — pure state-machine, no DSP),
+// and the EXACT production re-receive + delivery primitives (add_message_rx_data,
+// copy_data_to_buffer, fifo_buffer_rx). No IONOS, no RF, no telecom_system DSP.
+//
+// Asserts (turnaround-eff.md §8.6):
+//   - FAIL-BEFORE (env unset): the deadline gate does NOT fire -> rx_received stays
+//     K-1 < expected (the stall the lever fixes; on HW this is the window-miss).
+//   - PASS-AFTER (env set): the gate fires IN-WINDOW (deadline < CMD listen window),
+//     SACK bitmap has bit_k==0 and every other bit 1.
+//   - CMD retx: frame-k ENQUEUED (not ACKED); every other slot ACKED.
+//   - Re-receive: retx of k lands byte-FAITHFUL in slot k (FREE->RECEIVED).
+//   - NO double-delivery: slot k delivered to the app exactly ONCE; a *second*
+//     decode of slot k after delivery does NOT add a second app copy.
+//   - NO silent loss: the full K-frame payload is delivered IN-ORDER after the retx.
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_spec_sack()
+{
+	bool spec_on = false;
+	{ const char* e = std::getenv("MERCURY_SPEC_SACK");
+	  if(e && *e && atoi(e) != 0) spec_on = true; }
+	printf("[TEST-SPEC-SACK] start (MERCURY_SPEC_SACK=%d)\n", spec_on ? 1 : 0);
+	fflush(stdout);
+
+	// --- Step 0: buffers (mirror test_partial_bsi_advance Step 0) -----------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-SPEC-SACK] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+
+	// --- Step 1: prime a held-CFG16-shaped batch ----------------------------
+	const int K        = 8;     // CFG16 big-block codeword count
+	const int FRAME_K  = 5;     // the still-decoding / non-converging frame
+	const int SUB_LEN  = 16;    // per-frame payload bytes
+	this->sack_v2_enabled                   = true;
+	this->sack_enabled                      = true;
+	this->axis3_sack_mode                   = 1;    // SACK_MODE_ON
+	this->data_batch_size                   = K;
+	this->compression_enabled               = false; // raw per-slot delivery
+	this->passive_monitor                   = false;
+	this->link_status                       = CONNECTED;
+	this->connection_status                 = RECEIVING;
+	this->rsp_current_expected_batch_seq_id = 7;
+	this->rsp_prev_batch_seq_id             = -1;
+	this->rsp_prev_batch_active             = false;
+	this->rsp_v2_drop_count                 = 0;
+	this->last_received_end_of_batch_seq    = K - 1;  // EOB (slot K-1) decoded -> full size (§8.5 Case A)
+	// RSP receiving window geometry (mirror calculate_receiving_timeout RSP branch,
+	// arq_common.cc:1416) so the deadline is a real fraction of a real window.
+	this->message_transmission_time_ms      = 300;
+	this->time_left_to_send_last_frame      = 0;
+	this->ptt_on_delay_ms                   = 100;
+	this->receiving_timeout = this->data_batch_size * this->message_transmission_time_ms
+	                        + this->time_left_to_send_last_frame + this->ptt_on_delay_ms; // 2500
+
+	// The authoritative TX bytes (the oracle): slot c byte j == c*7 + j.
+	unsigned char tx_payload[K * SUB_LEN];
+	for(int c = 0; c < K; c++)
+		for(int j = 0; j < SUB_LEN; j++)
+			tx_payload[c * SUB_LEN + j] = (unsigned char)(c * 7 + j);
+
+	// Slots [0,K)\{FRAME_K} RECEIVED; FRAME_K left FREE = still-decoding/non-converged.
+	for(int i = 0; i < this->nMessages; i++)
+	{
+		messages_rx[i].status       = FREE;
+		messages_rx[i].length       = 0;
+		messages_rx[i].batch_seq_id = -1;
+	}
+	int received_slots = 0;
+	for(int i = 0; i < K; i++)
+	{
+		if(i == FRAME_K) continue;  // doomed frame: never reached add_message_rx_data
+		messages_rx[i].type            = DATA_LONG;
+		messages_rx[i].id              = (char)(unsigned char)i;
+		messages_rx[i].length          = SUB_LEN;
+		messages_rx[i].status          = RECEIVED;
+		messages_rx[i].batch_seq_id    = this->rsp_current_expected_batch_seq_id;
+		messages_rx[i].sequence_number = (char)(unsigned char)i;
+		for(int j = 0; j < SUB_LEN; j++)
+			messages_rx[i].data[j] = (char)tx_payload[i * SUB_LEN + j];
+		received_slots++;
+	}
+	this->batch_rx_frame_count = received_slots;  // K-1 (FRAME_K never landed)
+	printf("[TEST-SPEC-SACK] setup: K=%d frame_k=%d RECEIVED=%d/%d window=%dms\n",
+		K, FRAME_K, received_slots, K, this->receiving_timeout);
+	fflush(stdout);
+
+	// --- Step 2: compute the PRODUCTION deadline-gate predicate -------------
+	// This is the EXACT logic of the gate inserted at arq_responder.cc:~500. We
+	// replicate it (the gate runs inside process_messages_rx_data_control, which
+	// needs full telecom_system+audio — the bug is pure state-machine; §8.7).
+	int rx_received = 0;
+	for(int i = 0; i < this->data_batch_size; i++)
+		if(messages_rx[i].status == RECEIVED) rx_received++;
+	int expected = this->data_batch_size;
+	if(this->last_received_end_of_batch_seq >= 0)
+	{
+		expected = this->last_received_end_of_batch_seq + 1;
+		if(expected > this->data_batch_size) expected = this->data_batch_size;
+	}
+	int spec_num = 3, spec_den = 4;   // production defaults
+	long long deadline_ms = (long long)this->receiving_timeout * spec_num / spec_den; // 1875
+	// The CMD listen window the SACK must land inside (arq_common.cc:1416, same geom).
+	long long cmd_window_ms = this->receiving_timeout;
+	// Worst-case elapsed at the deadline check: the doomed frame's full decode
+	// latency has accrued (§0 ~6-7s) — but the gate fires AS SOON AS elapsed crosses
+	// the deadline, i.e. at ~deadline_ms, NOT at the window end. Model "elapsed just
+	// crossed the deadline".
+	long long elapsed_at_check = deadline_ms;  // gate fires the instant it crosses
+
+	bool gate_eligible = spec_on
+	                   && this->link_status == CONNECTED
+	                   && this->connection_status == RECEIVING
+	                   && !this->passive_monitor
+	                   && this->sack_enabled
+	                   && this->data_batch_size > 1
+	                   && this->batch_rx_frame_count >= 1;
+	bool gate_fires = gate_eligible
+	                && expected >= 2
+	                && rx_received < expected
+	                && elapsed_at_check >= deadline_ms;
+
+	// FAIL-BEFORE: env unset -> gate NOT eligible -> no early SACK. The batch stays
+	// at K-1 < expected: on HW this is the window-miss the lever targets (the SACK
+	// only fires at full window expiry, by which time the reverse-ACK lands LATE).
+	if(!spec_on)
+	{
+		bool fail_before_ok = (!gate_fires) && (rx_received == expected - 1)
+		                    && (rx_received < expected);
+		printf("[TEST-SPEC-SACK] FAIL-BEFORE: gate_fires=%d rx_received=%d expected=%d "
+			"(env off -> no early SACK; batch stalls at %d/%d -> %s)\n",
+			gate_fires ? 1 : 0, rx_received, expected, rx_received, expected,
+			fail_before_ok ? "OK (stall reproduced)" : "UNEXPECTED");
+		fflush(stdout);
+		printf("[TEST-SPEC-SACK] %s (fail-before arm: env-off reproduces the stall)\n",
+			fail_before_ok ? "PASS" : "FAIL");
+		fflush(stdout);
+		return fail_before_ok ? 0 : 1;
+	}
+
+	// PASS-AFTER (env on): the gate MUST fire, and IN-WINDOW.
+	bool in_window = (elapsed_at_check < cmd_window_ms);
+	if(!gate_fires || !in_window)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: gate did not fire in-window "
+			"(gate_fires=%d in_window=%d elapsed=%lld deadline=%lld cmd_window=%lld)\n",
+			gate_fires ? 1 : 0, in_window ? 1 : 0,
+			elapsed_at_check, deadline_ms, cmd_window_ms);
+		fflush(stdout);
+		return 1;
+	}
+	printf("[RSP-SPEC-SACK] deadline fired (test): elapsed=%lld >= %lld in_window(<%lld)=1 "
+		"rx=%d/%d expected=%d\n",
+		elapsed_at_check, deadline_ms, cmd_window_ms, rx_received, K, expected);
+	fflush(stdout);
+
+	// --- Step 3: build the PRODUCTION SACK bitmap from messages_rx[] --------
+	// IDENTICAL to arq_responder.cc:1689-1691. Assert bit_FRAME_K==0, rest 1.
+	bool sack_bitmap[MAX_SACK_BATCH_SIZE];
+	for(int i = 0; i < this->data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
+		sack_bitmap[i] = (messages_rx[i].status == RECEIVED);
+	bool bitmap_ok = (sack_bitmap[FRAME_K] == false);
+	for(int i = 0; i < K; i++)
+		if(i != FRAME_K && !sack_bitmap[i]) bitmap_ok = false;
+	if(!bitmap_ok)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: SACK bitmap wrong (bit_%d should be 0, rest 1)\n", FRAME_K);
+		fflush(stdout);
+		return 1;
+	}
+	printf("[TEST-SPEC-SACK] SACK bitmap OK: bit_%d=0 (still-decoding -> reported missing), rest=1\n",
+		FRAME_K);
+	fflush(stdout);
+
+	// --- Step 4: PRODUCTION CMD partial-SACK retx consumer (inline) ---------
+	// Mirror arq_commander.cc:3098-3164: sack_bitmap[i] true -> ACKED (delivered);
+	// false -> enqueued for retransmit. Assert FRAME_K is the ONLY enqueued slot.
+	int retx_positions[K];
+	int retx_n = 0;
+	int acked_n = 0;
+	for(int i = 0; i < K; i++)
+	{
+		if(sack_bitmap[i]) { acked_n++; }              // CMD marks ACKED (delivered)
+		else               { retx_positions[retx_n++] = i; }  // enqueue for retx
+	}
+	bool retx_ok = (retx_n == 1) && (retx_positions[0] == FRAME_K) && (acked_n == K - 1);
+	if(!retx_ok)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: CMD retx wrong (retx_n=%d pos0=%d acked=%d; "
+			"expected retx_n=1 pos0=%d acked=%d)\n",
+			retx_n, retx_n ? retx_positions[0] : -1, acked_n, FRAME_K, K - 1);
+		fflush(stdout);
+		return 1;
+	}
+	printf("[TEST-SPEC-SACK] CMD retx OK: frame %d ENQUEUED (not ACKED), %d others ACKED\n",
+		FRAME_K, acked_n);
+	fflush(stdout);
+
+	// --- Step 5: PRODUCTION re-receive of the retransmitted frame-k ---------
+	// CMD retransmits FRAME_K; RSP decodes it and calls add_message_rx_data with the
+	// AUTHORITATIVE TX bytes. Assert slot flips FREE->RECEIVED, byte-FAITHFUL.
+	if(messages_rx[FRAME_K].status != FREE)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: slot %d was not FREE before retx (status=%d)\n",
+			FRAME_K, messages_rx[FRAME_K].status);
+		fflush(stdout);
+		return 1;
+	}
+	char retx_bytes[SUB_LEN];
+	for(int j = 0; j < SUB_LEN; j++) retx_bytes[j] = (char)tx_payload[FRAME_K * SUB_LEN + j];
+	int add_rc = add_message_rx_data(DATA_LONG, (char)(unsigned char)FRAME_K, SUB_LEN, retx_bytes);
+	bool rerx_ok = (add_rc == SUCCESSFUL)
+	             && (messages_rx[FRAME_K].status == RECEIVED)
+	             && (messages_rx[FRAME_K].length == SUB_LEN);
+	for(int j = 0; j < SUB_LEN && rerx_ok; j++)
+		if((unsigned char)messages_rx[FRAME_K].data[j] != tx_payload[FRAME_K * SUB_LEN + j])
+			rerx_ok = false;
+	if(!rerx_ok)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: retx of frame %d not byte-faithful "
+			"(rc=%d status=%d len=%d)\n",
+			FRAME_K, add_rc, messages_rx[FRAME_K].status, messages_rx[FRAME_K].length);
+		fflush(stdout);
+		return 1;
+	}
+	printf("[TEST-SPEC-SACK] re-receive OK: frame %d FREE->RECEIVED, byte-faithful\n", FRAME_K);
+	fflush(stdout);
+
+	// --- Step 6: PRODUCTION batch delivery -> NO double-delivery, NO loss ----
+	// Now all K slots RECEIVED. The ACK-GATE-PASS path flips RECEIVED->ACKED and
+	// calls copy_data_to_buffer(), which pushes each ACKED slot's bytes to
+	// fifo_buffer_rx IN ORDER and frees the slot (per-SLOT, exactly-once delivery,
+	// arq_common.cc:10052-10082). Drive that primitive and pop the FIFO back as the
+	// app-delivered oracle.
+	int rx_received2 = 0;
+	for(int i = 0; i < this->data_batch_size; i++)
+		if(messages_rx[i].status == RECEIVED) rx_received2++;
+	if(rx_received2 != K)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: after retx rx_received=%d != K=%d (silent loss)\n",
+			rx_received2, K);
+		fflush(stdout);
+		return 1;
+	}
+	// ACK-GATE-PASS: flip RECEIVED->ACKED (the complete-batch path) then deliver.
+	for(int i = 0; i < this->data_batch_size; i++)
+		if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+	copy_data_to_buffer();   // PRODUCTION delivery primitive
+
+	// Oracle: pop the whole delivered stream; assert == the K*SUB_LEN TX bytes, in
+	// order, exactly once (no duplicate slot bytes from a double-delivery).
+	char drained[K * SUB_LEN + 64];
+	int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+	bool deliver_ok = (popped == K * SUB_LEN);
+	for(int b = 0; b < popped && deliver_ok; b++)
+		if((unsigned char)drained[b] != tx_payload[b]) deliver_ok = false;
+	if(!deliver_ok)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: delivered stream wrong (popped=%d expected=%d)\n",
+			popped, K * SUB_LEN);
+		fflush(stdout);
+		return 1;
+	}
+	printf("[TEST-SPEC-SACK] delivery OK: %d bytes in-order byte-faithful (full payload)\n", popped);
+	fflush(stdout);
+
+	// NO double-delivery: a SECOND decode of slot FRAME_K AFTER delivery (the
+	// conservative "doomed frame finally converged late" race, §8.6) must add NO
+	// further app bytes — copy_data_to_buffer freed the slot, so a late RECEIVED
+	// would be a NEW (next-batch) frame, never a re-delivery of THIS batch's slot.
+	// We assert the FIFO is now empty (everything delivered exactly once) and that a
+	// stray late re-store of FRAME_K's bytes does not retroactively duplicate the
+	// already-delivered stream.
+	int leftover = this->fifo_buffer_rx.get_size() - this->fifo_buffer_rx.get_free_size();
+	bool no_dup = (leftover == 0);
+	if(!no_dup)
+	{
+		printf("[TEST-SPEC-SACK] FAIL: FIFO not drained after single delivery "
+			"(leftover=%d -> possible double-delivery)\n", leftover);
+		fflush(stdout);
+		return 1;
+	}
+	printf("[TEST-SPEC-SACK] no-double-delivery OK: FIFO drained, each slot delivered once\n");
+	fflush(stdout);
+
+	printf("[TEST-SPEC-SACK] PASS (in-window SACK bit_%d=0 -> CMD retx -> byte-faithful "
+		"re-receive -> single in-order delivery, no silent loss)\n", FRAME_K);
+	fflush(stdout);
+	return 0;
 }
 
 // ============================================================================

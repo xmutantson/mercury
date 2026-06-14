@@ -30,6 +30,15 @@ TEST-1k SUBPEAK-KILL OFF-PATH: MERCURY_SUBPEAK_KILL=1 alone (no EARLYTERM) does
         the env is inert on the decode path. The multiplier drop + wall-clock are
         Pi-confirmed (turnaround-eff.md §7).
 
+TEST-SS  LEVER #2 SPECULATIVE/PROMPT SACK (turnaround-eff.md §8/§9): the in-process
+        --test-spec-sack regression. FAIL-BEFORE (MERCURY_SPEC_SACK unset): the
+        window-fraction deadline gate does NOT fire, the batch stalls at K-1/K
+        (the reverse-ACK window-miss the lever targets). PASS-AFTER
+        (MERCURY_SPEC_SACK=1): the gate fires IN-WINDOW with bit_k=0, CMD
+        retransmits k, RSP re-receives k byte-faithful, the full payload is
+        delivered once in-order (no double-delivery, no silent loss). Both arms
+        exit 0.
+
 Exit 0 = all pass.
 """
 import hashlib
@@ -161,6 +170,32 @@ def main():
     else:
         print("[TEST-1k] FAIL: SUBPEAK_KILL changed the coded render!")
         fails.append("TEST-1k")
+
+    # ---- TEST-SS: LEVER #2 speculative/prompt SACK (in-process) -----------
+    # fail-before (env off) + pass-after (env on); both exit 0.
+    def _spec_sack(env_on):
+        env = dict(os.environ)
+        if env_on:
+            env["MERCURY_SPEC_SACK"] = "1"
+        else:
+            env.pop("MERCURY_SPEC_SACK", None)
+        p = subprocess.run([binary, "--test-spec-sack"], env=env,
+                           capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout + p.stderr
+
+    rc_off, out_off = _spec_sack(False)
+    rc_on, out_on = _spec_sack(True)
+    fired_off = "[RSP-SPEC-SACK] deadline fired" in out_off
+    fired_on = "[RSP-SPEC-SACK] deadline fired" in out_on
+    deliv_on = "no-double-delivery OK" in out_on and "delivery OK" in out_on
+    if rc_off == 0 and rc_on == 0 and (not fired_off) and fired_on and deliv_on:
+        print("[TEST-SS] PASS: fail-before stalls (env off, gate idle); pass-after "
+              "fires in-window bit_k=0 -> retx -> byte-faithful single in-order "
+              "delivery (no double-delivery, no silent loss)")
+    else:
+        print(f"[TEST-SS] FAIL: rc_off={rc_off} rc_on={rc_on} fired_off={fired_off} "
+              f"fired_on={fired_on} deliv_on={deliv_on}")
+        fails.append("TEST-SS")
 
     print()
     if fails:

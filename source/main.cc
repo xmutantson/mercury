@@ -732,6 +732,11 @@ int main(int argc, char *argv[])
                                         // (silent concat on the SET_CONFIG cases), pass-after aborts loudly
                                         // OR delivers contiguous. One-shot, exits rc.
                                         // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+    bool test_spec_sack_cli = false;    // --test-spec-sack: LEVER #2 — speculative/prompt SACK. Frame-k still-decoding
+                                        // at the window-fraction deadline -> in-window SACK bit_k=0 -> CMD retx ->
+                                        // byte-faithful re-receive -> single in-order delivery, no silent loss.
+                                        // fail-before via env-off (stall reproduced), pass-after via MERCURY_SPEC_SACK=1.
+                                        // One-shot, exits rc. See fact-documents/turnaround-eff.md §8/§9.
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
@@ -1427,6 +1432,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_inorder_demote
             // + bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
             test_inorder_demote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-spec-sack") == 0)
+        {
+            // LEVER #2 — speculative/prompt SACK — one-shot at startup, then exit
+            // with the test's rc. fail-before (env off) / pass-after
+            // (MERCURY_SPEC_SACK=1). See source/datalink_layer/arq_responder.cc
+            // test_spec_sack + fact-documents/turnaround-eff.md §8/§9.
+            test_spec_sack_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2814,6 +2829,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inorder_demote();
             printf("[FLAG] In-order-demote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_spec_sack_cli) {
+            // LEVER #2 — speculative/prompt SACK (one-shot, exit rc).
+            printf("[FLAG] --test-spec-sack: invoking LEVER #2 speculative-SACK "
+                   "regression (window-fraction deadline -> partial SACK -> retx)\n");
+            fflush(stdout);
+            int rc = ARQ.test_spec_sack();
+            printf("[FLAG] Spec-SACK test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
