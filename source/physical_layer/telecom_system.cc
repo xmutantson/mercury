@@ -10113,6 +10113,33 @@ void cl_telecom_system::load_configuration(int configuration)
 	// See mfsk-vara-parity-plan.md §2.1 Q3.
 	if(is_robust_config(configuration))
 		ldpc.nIteration_max = 200;
+
+	// SOLUTION B (fix/ldpc-decode-accel): iteration cap for OFDM configs.
+	// MEASURED (HW [TIMING] logs): an OK CFG16 frame converges fast (median
+	// iter=3, p95=8, p99=16, max 80) and early-terminates on the syndrome
+	// check; a NON-converging frame burns the FULL nIteration_max=100 SPA
+	// iterations (~1.5-3.3 s LDPC each) and fails anyway (iter=101). Each
+	// failing OTA frame triggers ~4.5 such 100-iter decodes (sub-peak probe)
+	// => ~6-7 s injected, pushing the reverse-ACK SACK past the CMD window.
+	// Capping the OFDM/CFG16 SPA at N bounds that fail-spike to N iterations
+	// without touching ROBUST (rate-1/16, which needs 200 at the waterfall).
+	// The fail-detection threshold (iterations_done > nIteration_max-1,
+	// telecom_system.cc:3147/:3172, harness :7278) tracks nIteration_max, so a
+	// frame that does not converge by N is still classified FAIL exactly as
+	// before — only the wasted iterations 31..100 are skipped. OK frames that
+	// converge at iter<=N are unaffected (byte-identical). The expected OK-frame
+	// loss is the mass of the convergence tail in (N,100], measured ~0.5-0.7%
+	// at N=30 from the iter distribution. Default unset => no cap (byte-
+	// identical to @465956e). Scoped to is_ofdm_config; ROBUST untouched.
+	{
+		const char* ec = std::getenv("MERCURY_LDPC_ITERCAP");
+		if(ec && *ec && is_ofdm_config(configuration) && !is_robust_config(configuration))
+		{
+			int cap = atoi(ec);
+			if(cap >= 1 && cap < ldpc.nIteration_max)
+				ldpc.nIteration_max = cap;
+		}
+	}
 	ldpc.print_nIteration=default_configurations_telecom_system.ldpc_print_nIteration;
 
 	outer_code=default_configurations_telecom_system.outer_code;
