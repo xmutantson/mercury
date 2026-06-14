@@ -21,6 +21,31 @@
  */
 
 #include "physical_layer/ldpc_decoder_SPA.h"
+#include <cstdlib>   // std::getenv / atoi for the MERCURY_LDPC_FWDBACK gate
+
+// SOLUTION A (fix/ldpc-decode-accel): forward-backward check-node update.
+// The original SPA check-node update (below, default path) recomputes the full
+// leave-one-out tanh product SEPARATELY for every outgoing edge of a check node
+// => O(dc^2) tanh per check (dc=46 for CFG16 rate-14/16 => ~46*46 ~= 2116 tanh
+// per check, P=200 checks => ~414k tanh per BP iteration; ldpc_decoder_SPA.cc
+// FACTS). The forward-backward (prefix/suffix product) form computes the SAME
+// leave-one-out product in O(dc): one pass of forward partials F[i]=prod(t[0..i-1])
+// and one pass of backward partials B[i]=prod(t[i+1..dc-1]), out[i]=F[i]*B[i].
+// Output is mathematically identical to the original; the only possible delta is
+// floating-point product RE-ASSOCIATION in the last ULP (proven via the coded
+// SFO-GRID BER diff — see FACTS / the branch verdict).
+//
+// Gate: MERCURY_LDPC_FWDBACK unset/0 => the ORIGINAL O(dc^2) loop runs
+// bit-for-bit (default-off byte-identical). The env is read once per process
+// (static cache) so the gate adds nothing to the hot path.
+static inline bool ldpc_fwdback_enabled()
+{
+	static const int v = []{
+		const char* e = std::getenv("MERCURY_LDPC_FWDBACK");
+		return (e && *e) ? atoi(e) : 0;
+	}();
+	return v != 0;
+}
 
 int decode_SPA(
 		const float LLRi[],
@@ -126,12 +151,25 @@ int decode_SPA(
 		int iindex,Cindex,i1index,i1;
 		double temp;
 
+		// SOLUTION A scratch (forward-backward path only). Sized to the max
+		// check-node degree across all Mercury LDPC matrices (CFG16 rate-14/16
+		// dc=46, mercury_normal_14_16.cc:28); 64 leaves margin. Stack-resident
+		// => no heap churn, reused every iteration.
+		const bool fwdback = ldpc_fwdback_enabled();
+		const int  CW_SCRATCH = 64;            // >= max Cwidth (46)
+		double  fb_t   [CW_SCRATCH];           // tanh(0.5*Q) per valid edge slot
+		double  fb_pref[CW_SCRATCH];           // forward partial product (exclusive)
+		int     fb_slot[CW_SCRATCH];           // original Cindex of each valid edge
+
 		for(iteration=1;iteration<=nIteration_max;iteration++)
 		{
 			// Early exit: another parallel decoder already succeeded
 			if(abort_flag && abort_flag->load(std::memory_order_relaxed))
 				return -iteration;
 
+			if(!fwdback)
+			{
+			// --- ORIGINAL O(dc^2) check-node update (default, byte-identical) ---
 			for ( iindex=0;iindex<P;iindex++)
 			{
 				for ( Cindex=0;Cindex<CWidth;Cindex++)
@@ -163,6 +201,53 @@ int decode_SPA(
 					}
 
 				}
+			}
+			}
+			else
+			{
+			// --- SOLUTION A: O(dc) forward-backward leave-one-out product -------
+			// For each check node, gather the valid edges' tanh(0.5*Q) into fb_t[]
+			// (preserving the original Cindex slot order in fb_slot[]), then form
+			// the leave-one-out product out[k] = prod(fb_t[m], m!=k) via a forward
+			// prefix pass + a single backward sweep. The product set, ordering and
+			// per-edge tanh argument are IDENTICAL to the O(dc^2) loop; only the
+			// multiply ordering changes (FP last-ULP reassociation, proven benign
+			// by the coded BER diff). The temp==±1 saturation clamp is applied to
+			// the SAME leave-one-out product value before 2*atanh, exactly as above.
+			for ( iindex=0;iindex<P;iindex++)
+			{
+				int nv=0;   // number of valid (non -1) edges in this check row
+				for ( Cindex=0;Cindex<CWidth;Cindex++)
+				{
+					int vj=*(C+iindex*CWidthMax+Cindex);
+					if(vj!=-1)
+					{
+						int vi=V_pos[iindex*CWidthMax+Cindex];
+						fb_t[nv]   = tanh(0.5* (double)*(Q+vj*VWidthMax+vi));
+						fb_slot[nv]= Cindex;
+						nv++;
+					}
+				}
+				if(nv==0) continue;
+
+				// Forward exclusive-prefix products: fb_pref[k] = prod(fb_t[0..k-1]).
+				fb_pref[0]=1.0;
+				for(int k=1;k<nv;k++)
+					fb_pref[k]=fb_pref[k-1]*fb_t[k-1];
+
+				// Backward sweep carries suffix product; out[k]=fb_pref[k]*suffix.
+				double suffix=1.0;
+				for(int k=nv-1;k>=0;k--)
+				{
+					temp = fb_pref[k]*suffix;     // leave-one-out product, edge k
+					if(temp==1)  temp= 0.9999999; // SAME clamp as the original loop
+					if(temp==-1) temp=-0.9999999;
+					int Cidx=fb_slot[k];
+					j=*(C+iindex*CWidthMax+Cidx);
+					*(R+j*VWidthMax+V_pos[iindex*CWidthMax+Cidx])=2*atanh(temp);
+					suffix*=fb_t[k];
+				}
+			}
 			}
 
 			for( i=0;i<N;i++)

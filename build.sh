@@ -197,6 +197,44 @@ else
     else
         CXXFLAGS="$CXXFLAGS $(pkg-config --cflags glfw3)"
         LDFLAGS="$(pkg-config --libs glfw3) -lGL -lpulse -lasound -lpthread -lrt $EXTRA_LDFLAGS"
+
+        # SOLUTION F (fix/ldpc-decode-accel): ARM CPU tuning for the on-Pi build.
+        # `build.sh o3` runs natively on the aarch64 Pi 5 (Cortex-A76; confirmed
+        # via tools/mercury_deploy_rpi.py:467/695 "both Pi 5 aarch64"). The stock
+        # build is plain -O3 with NO -mcpu/-mtune, so the SPA LDPC hot loop
+        # (tanh/atanh-heavy) is generated for a generic ARMv8 baseline. -mcpu=native
+        # lets gcc emit Cortex-A76-tuned scheduling + the A76 FP/SIMD ISA, which is
+        # the cheapest win on the iteration-bound decode.
+        #
+        # We do NOT add -ffast-math: it drops the NaN/Inf guards the SPA temp-clamp
+        # (ldpc_decoder_SPA.cc temp==+/-1 saturation -> 2*atanh) and the OFDM
+        # variance/LLR clamps rely on. -fno-math-errno is safe (we never read errno
+        # from libm) and lets math calls be treated as pure -> better scheduling.
+        #
+        # Native ONLY (skipped for MERCURY_CROSS_BUILD, handled above): a cross host
+        # may not be the target uarch, and -mcpu=native there would mistune. Guarded
+        # by a compile probe so a toolchain that rejects -mcpu=native falls back to
+        # the explicit Cortex-A76 target, then to no tuning (never breaks the build).
+        # This block is aarch64-Linux-only => the Windows/macOS render is untouched.
+        ARCH_M=$(uname -m 2>/dev/null || echo unknown)
+        if [ "$ARCH_M" = "aarch64" ] || [ "$ARCH_M" = "arm64" ]; then
+            cpu_probe() { echo 'int main(){return 0;}' | "$CXX" "$1" -x c++ - -o /dev/null 2>/dev/null; }
+            ARM_TUNE=""
+            if cpu_probe "-mcpu=native"; then
+                ARM_TUNE="-mcpu=native"
+            elif cpu_probe "-mcpu=cortex-a76"; then
+                ARM_TUNE="-mcpu=cortex-a76"
+            fi
+            ARM_MATH=""
+            if cpu_probe "-fno-math-errno"; then
+                ARM_MATH="-fno-math-errno"
+            fi
+            if [ -n "$ARM_TUNE$ARM_MATH" ]; then
+                echo "  (aarch64 tuning: ${ARM_TUNE:-none} ${ARM_MATH})"
+                CXXFLAGS="$CXXFLAGS $ARM_TUNE $ARM_MATH"
+                CFLAGS="$CFLAGS $ARM_TUNE $ARM_MATH"
+            fi
+        fi
     fi
 fi
 
