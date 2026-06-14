@@ -2168,6 +2168,20 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		int subpeak_recover_phase = 0;     // 0=not started, 1=tried +sym, 2=tried -sym
 		int subpeak_orig_delay = -1;       // delay at which v2 was first armed (full-rate samples)
 		bool subpeak_recover_in_flight = false; // true between goto-back and next LDPC verdict
+		// feat/turnaround-eff #1 SUB-PEAK / TRIAL MULTIPLIER KILL (fact-documents/
+		// turnaround-eff.md §4). MERCURY_SUBPEAK_KILL=1: (b) cap the ±1-sym sub-peak
+		// goto to ONE probe (the +sym side — the empirically-dominant sub-peak per
+		// the :3163 comment), gated on the candidate being in range AND mean_H
+		// surviving (the v2-arm gate already requires mean_H>=0.5); (c) run the
+		// sub-peak probe decode with the EAGER shared non-convergence detector
+		// (ldpc.early_term_speculative). A wrong-position decode bails ~iter 8 and
+		// only ONE extra full SPA is paid (was up to 2). Default unset =>
+		// subpeak_recover_phase<2 (two probes), no speculative flag => byte-identical.
+		static const int subpeak_kill = []{
+			const char* e = std::getenv("MERCURY_SUBPEAK_KILL");
+			return (e && *e) ? atoi(e) : 0;
+		}();
+		double subpeak_arm_mean_H = -1.0;  // mean_H captured when the goto was armed
 		// §7.13.29 (Proposal B) — SACK_RSP cross-check pays more trials so the
 		// search escapes Schmidl-Cox sub-peak false locks. Default 2 stays for
 		// normal data RX where extra trials waste CPU on real LDPC failures.
@@ -3031,6 +3045,12 @@ skip_h_retry_point:
 				turbo_app_ptr = turbo_app_llr.data();
 			}
 			receive_stats.iterations_done=ldpc.decode(data_container.deinterleaved_data,data_container.hd_decoded_data_bit,turbo_app_ptr);
+			// feat/turnaround-eff #1(c): the speculative flag is per-decode — clear
+			// it immediately so only the sub-peak probe just decoded was eager. The
+			// PRIMARY (aligned, trial-0) decode is never #1-early-termed. No-op when
+			// MERCURY_SUBPEAK_KILL is off (flag never set). (#3's MERCURY_SYND_
+			// EARLYTERM is independent and stays in effect for the primary decode.)
+			ldpc.early_term_speculative = false;
 			auto t5_ldpc = std::chrono::steady_clock::now();
 			timing_ldpc_ms += std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
 
@@ -3166,11 +3186,14 @@ skip_h_retry_point:
 				// the partial-batch SACK-retx round-trip stall PPMd+zstd
 				// streaming decompression on the receiver. One-shot per frame:
 				// max 2 retries (+sym then -sym), then fall through.
+				// feat/turnaround-eff #1(b): MERCURY_SUBPEAK_KILL caps the probe
+				// budget to ONE (+sym only — the dominant sub-peak side). Default
+				// (off): 2 probes (+sym then -sym), byte-identical.
 				if(M != MOD_MFSK
 					&& receive_stats.coarse_metric >= 0.97
 					&& mean_H >= 0.5
 					&& receive_stats.iterations_done > (ldpc.nIteration_max-1)
-					&& subpeak_recover_phase < 2)
+					&& subpeak_recover_phase < (subpeak_kill ? 1 : 2))
 				{
 					int sym_samples = data_container.Nofdm * frequency_interpolation_rate;
 					int buf_size_full = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
@@ -3185,6 +3208,15 @@ skip_h_retry_point:
 					{
 						subpeak_recover_phase++;
 						subpeak_recover_in_flight = true;
+						// feat/turnaround-eff #1(c): mark the sub-peak re-decode
+						// SPECULATIVE so the SPA applies the EAGER shared
+						// non-convergence detector (mode 2) — a wrong-position
+						// decode bails ~iter 8 instead of burning to the cap. The
+						// flag is cleared right after the decode (:ofdm decode
+						// site) so only this probe is affected. mean_H at arm time
+						// is the #1(a) ranking input (a real sub-peak keeps mean_H
+						// healthy; recorded for the recover log).
+						if(subpeak_kill) { ldpc.early_term_speculative = true; subpeak_arm_mean_H = mean_H; }
 						printf("[SUBPEAK-PROBE] phase=%d orig_delay=%d new_delay=%d metric=%.3f mean_H=%.3f iter=%d — retry ±1 OFDM sym\n",
 							subpeak_recover_phase, subpeak_orig_delay, candidate,
 							receive_stats.coarse_metric, mean_H, receive_stats.iterations_done);
@@ -3264,10 +3296,16 @@ skip_h_retry_point:
 					// have lost but v2 reclaimed without an SACK round-trip.
 					if(subpeak_recover_in_flight)
 					{
-						printf("[SUBPEAK-RECOVER] phase=%d orig_delay=%d saved_delay=%d shift=%+d iter=%d — frame reclaimed (no SACK retx needed)\n",
-							subpeak_recover_phase, subpeak_orig_delay,
-							receive_stats.delay, receive_stats.delay - subpeak_orig_delay,
-							receive_stats.iterations_done);
+						if(subpeak_kill)
+							printf("[SUBPEAK-RECOVER] phase=%d orig_delay=%d saved_delay=%d shift=%+d iter=%d arm_meanH=%.3f — frame reclaimed (no SACK retx needed)\n",
+								subpeak_recover_phase, subpeak_orig_delay,
+								receive_stats.delay, receive_stats.delay - subpeak_orig_delay,
+								receive_stats.iterations_done, subpeak_arm_mean_H);
+						else
+							printf("[SUBPEAK-RECOVER] phase=%d orig_delay=%d saved_delay=%d shift=%+d iter=%d — frame reclaimed (no SACK retx needed)\n",
+								subpeak_recover_phase, subpeak_orig_delay,
+								receive_stats.delay, receive_stats.delay - subpeak_orig_delay,
+								receive_stats.iterations_done);
 						fflush(stdout);
 					}
 				}
@@ -7243,6 +7281,14 @@ void cl_telecom_system::sfo_grid_test()
 		int    cw_ok = 0, cw_crcfail = 0;
 		long   cw_infoerr = 0, cw_infobits = 0;
 		long   iter_sum = 0; int iter_min = 1<<30, iter_max = -1;
+		// feat/turnaround-eff measurement (turnaround-eff.md §6 TEST-3): the REAL
+		// early-term iteration (cl_ldpc::last_early_term_iter) — the harness
+		// reports iter_max as the decode_SPA RETURN value (= nIteration_max+1 on a
+		// fail/early-term, the FAIL sentinel), so the actual iteration the shared
+		// detector quit at is tracked SEPARATELY. Printed on a dedicated line only
+		// when at least one codeword tripped => base [SFO-GRID-CODED] lines stay
+		// byte-identical when MERCURY_SYND_EARLYTERM is off (default).
+		long   et_sum = 0; int et_min = 1<<30, et_max = -1, et_count = 0;
 		std::vector<float> cwllr(ldpc.N);
 		std::vector<int>   dec(ldpc.N);
 
@@ -7271,6 +7317,15 @@ void cl_telecom_system::sfo_grid_test()
 				iter_sum += iters;
 				if(iters < iter_min) iter_min = iters;
 				if(iters > iter_max) iter_max = iters;
+				// feat/turnaround-eff: capture the real early-term iteration if the
+				// shared detector tripped on this codeword (-1 => no trip).
+				if(ldpc.last_early_term_iter >= 0)
+				{
+					int et = ldpc.last_early_term_iter;
+					et_sum += et; et_count++;
+					if(et < et_min) et_min = et;
+					if(et > et_max) et_max = et;
+				}
 				int ierr=0;
 				for(int i=0;i<ldpc.K;i++){ if(dec[i] != cw_info[c][i]) ierr++; if(Kcw>0) dec_all[(size_t)c*ldpc.K+i]=dec[i]; }
 				it_infoerr  += ierr;
@@ -7370,6 +7425,16 @@ void cl_telecom_system::sfo_grid_test()
 		sfo_grid_last_cw_tot = Kcw;
 		std::cout << "[SFO-GRID-CODED]   nv_check: " << (ofdm.noise_variance_estimate > 1e-5 ? "OK (not collapsed)" : "COLLAPSED (<1e-5 -> E1 bug)")
 		          << "  iter_cap_check: " << (iter_max < ldpc.nIteration_max ? "OK (no codeword hit cap)" : "CAPPED (BP at 101 -> over-confident LLR)") << std::endl;
+		// feat/turnaround-eff (turnaround-eff.md §6 TEST-3): the shared
+		// non-convergence detector's REAL early-term iteration, on a DEDICATED tag
+		// so the [SFO-GRID-CODED] lines above stay byte-identical when off. Printed
+		// only when >=1 codeword tripped (MERCURY_SYND_EARLYTERM set). The decode
+		// still RETURNED nIteration_max+1 (FAIL sentinel) for every consumer; this
+		// line shows how many wasted iterations were skipped.
+		if(et_count > 0)
+			std::cout << "[SFO-GRID-EARLYTERM]   tripped=" << et_count << "/" << Kcw
+			          << "  et_iter_mean=" << (double)et_sum/(double)et_count
+			          << " et_iter_min=" << et_min << " et_iter_max=" << et_max << std::endl;
 	}
 
 	// Restore the original grid geometry so the rest of the process is unaffected.

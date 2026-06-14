@@ -290,7 +290,22 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
  	}
  	else if(decoding_algorithm_val==SPA)
  	{
- 		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort,app_llr);
+ 		// feat/turnaround-eff (fact-documents/turnaround-eff.md §2/§3/§4):
+ 		// select the shared non-convergence detector mode.
+ 		//   mode 2 (#1(c) eager)  when this is a SPECULATIVE wrong-position
+ 		//                         decode (early_term_speculative set by the
+ 		//                         sub-peak / extra-trial caller);
+ 		//   mode 1 (#3 standard)  when MERCURY_SYND_EARLYTERM is set;
+ 		//   mode 0 (OFF)          otherwise => byte-identical (loop to the cap).
+ 		// Speculative TAKES PRECEDENCE (a wrong-position decode is doomed; bail
+ 		// eagerly even if #3's env is unset).
+ 		static const int synd_earlyterm_env = []{
+ 			const char* e = std::getenv("MERCURY_SYND_EARLYTERM");
+ 			return (e && *e) ? atoi(e) : 0;
+ 		}();
+ 		int et_mode = early_term_speculative ? 2 : (synd_earlyterm_env != 0 ? 1 : 0);
+ 		last_early_term_iter = -1;
+ 		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort,app_llr,et_mode,&last_early_term_iter);
  	}
  	return iterations_done;
  }
