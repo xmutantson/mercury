@@ -773,6 +773,7 @@ int main(int argc, char *argv[])
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
+    bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -1480,6 +1481,16 @@ int main(int argc, char *argv[])
             // exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §9.8.
             test_clean_batch_viability_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-decode-marathon") == 0)
+        {
+            // LEVER C (feat/decode-marathon) §3 integrity gate: parallel big-block
+            // decode == serial, byte-faithful + in-order + no cross-frame corruption,
+            // with a shared-workspace fail-before. One-shot at startup, then exit rc.
+            // See fact-documents/decode-marathon-C.md §8.
+            test_decode_marathon_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2877,6 +2888,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_climb_engine();
             printf("[FLAG] Climb-engine test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_decode_marathon_cli) {
+            // LEVER C (feat/decode-marathon) §3: prove the multi-core big-block
+            // codeword decode is byte-identical to serial (out_infobits + cw_ok),
+            // in-order, with NO cross-frame corruption, and that a shared-workspace
+            // pool DIVERGES (fail-before). One-shot, then exit rc.
+            extern int test_decode_marathon_run();
+            printf("[FLAG] --test-decode-marathon: invoking LEVER C parallel==serial "
+                   "big-block decode integrity gate\n");
+            fflush(stdout);
+            int rc = test_decode_marathon_run();
+            printf("[FLAG] Decode-marathon test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

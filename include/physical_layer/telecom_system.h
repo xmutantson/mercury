@@ -32,6 +32,11 @@
 #include "ofdm.h"
 #include "ldpc.h"
 #include "interleaver.h"
+// LEVER C (feat/decode-marathon): forward-declare the big-block multi-core decode
+// pool so the threading headers stay out of this widely-included header. The pool
+// is heap-owned + lazily constructed ONLY when MERCURY_LDPC_MULTICORE is set; the
+// default (serial) path never touches it (fact-documents/decode-marathon-C.md).
+class cl_ldpc_decode_pool;
 #include "physical_config.h"
 #include "physical_defines.h"
 #include "misc.h"
@@ -634,6 +639,20 @@ public:
 	                         std::vector<int>& cw_ok_out,
 	                         double* acq_metric_out = nullptr,
 	                         const std::vector<std::vector<int>>* cw_info_ref = nullptr);
+
+	// LEVER C (feat/decode-marathon): multi-core big-block codeword decode pool.
+	// Heap-owned + lazily constructed ONLY when MERCURY_LDPC_MULTICORE>=2; nullptr
+	// (and never instantiated) on the default serial path => byte-identical render.
+	// bigblock_decode_codewords() is the single replacement for the serial codeword
+	// loop in bigblock_rx_passband: it reads MERCURY_LDPC_MULTICORE, and on >=2 it
+	// ensures the pool (cloned for the active config, clamped to cores-1) and
+	// decodes across it; on 0/1/unset it runs the original serial loop bit-for-bit.
+	// Either way it fills DISJOINT out_infobits[c*K..]/cw_ok_out[c] and returns the
+	// cw_ok count, JOINING before return (slot-order serial layout preserved).
+	cl_ldpc_decode_pool* ldpc_decode_pool = nullptr;
+	int bigblock_decode_codewords(const float* clr, int Kcw,
+	                              int* out_infobits, std::vector<int>& cw_ok_out,
+	                              const std::vector<std::vector<int>>* cw_info_ref);
 
 	// Big-block preamble matched-filter SNAP. The Schmidl-Cox autocorrelation metric is
 	// flat across the whole 4-symbol preamble plateau, so its (energy-weighted) argmax is
