@@ -47,10 +47,19 @@ int decode_SPA(
 		int P,
 		int nIteration_max,
 		std::atomic<bool>* abort_flag = nullptr,
-		double* app_llr = nullptr   // Turbo-EQ: when non-null, receives the
+		double* app_llr = nullptr,  // Turbo-EQ: when non-null, receives the
 		                            // a-posteriori LLR for all N coded bits
 		                            // (RESEARCH_turbo-eq.md §4.2). Default null
 		                            // = byte-identical for every existing caller.
+		int early_term_mode = 0,    // feat/turnaround-eff (turnaround-eff.md §2):
+		                            // 0=OFF (byte-identical, loop runs to the cap);
+		                            // 1=#3 syndrome early-term (warmup=12,confirm=8);
+		                            // 2=#1(c) eager speculative (warmup=8,confirm=6).
+		                            // Both use floor=P/2 (swept lossless). On a
+		                            // detector trip decode_SPA returns the canonical
+		                            // FAIL sentinel nIteration_max+1.
+		int* out_early_term_iter = nullptr // measurement-only: real iter at trip,
+		                            // else -1. No control-flow effect.
 );
 
 

@@ -47,6 +47,84 @@ static inline bool ldpc_fwdback_enabled()
 	return v != 0;
 }
 
+// ============================================================================
+// SHARED NON-CONVERGENCE DETECTOR (feat/turnaround-eff, fact-documents/
+// turnaround-eff.md §2). ONE implementation; #3 (env MERCURY_SYND_EARLYTERM,
+// mode 1) and #1(c) (cl_ldpc::early_term_speculative, mode 2) both call it.
+//
+// Check-Sum Variation criterion (D. Li, X. Huang et al., "A Unified Early
+// Stopping Criterion for Binary and Nonbinary LDPC Codes Based on Check-Sum
+// Variation Patterns," IEEE Comm. Letters 14(11):1053-1055, 2010): for a
+// DECODABLE block the syndrome weight eventually DESCENDS toward 0 (the
+// existing nOnes==0 break catches success); for an UNDECODABLE block it
+// fluctuates/plateaus in a range above 0.
+//
+// EMPIRICAL CAVEAT (measured on this code/channel, turnaround-eff.md §6): a
+// real-but-slow CFG16 converger is NOT monotone per-iteration — it can find a
+// LOW early minimum, then RISE and oscillate in the 30s-50s for 30+ iterations
+// before the final descent (trace conv@45/conv@62). So "no new minimum for N
+// iters" alone FALSELY kills slow convergers. The robust, LOSSLESS gate is the
+// SYNDROME FLOOR: a real converger ALWAYS dips its running minimum BELOW a
+// meaningful fraction of the check count P on its way down; a truly-stuck frame
+// (the clean-WGN non-convergence this branch targets, §0) never gets close —
+// its running minimum stays HIGH (often pinned at P). We therefore trip ONLY
+// when the running minimum has STALLED *and is still above the floor*.
+//
+// floor = P/2: swept on the 27-cell grid (1674 codewords) — at floor>=P/2 the
+// detector loses ZERO of 416 convergers at EVERY (warmup,confirm) while catching
+// ~89% of 1258 failers at mean iter ~12 (turnaround-eff.md §6). Lowering the
+// floor toward P/8 starts costing convergers => P/2 is the lossless setting.
+//
+// Caller carries `min_nones` (lowest syndrome weight so far, init INT_MAX) and
+// `best_synd_iter` (iteration that set it). Returns true => declare
+// non-convergence, quit now (frame stays classified FAIL via the
+// nIteration_max+1 sentinel the caller returns).
+static inline bool spa_nonconverge_detect(
+		int iteration, int nOnes, int& min_nones, int& best_synd_iter,
+		int warmup, int confirm, int floor)
+{
+	// Track the running minimum (a NEW strict minimum == still descending).
+	if(nOnes < min_nones) { min_nones = nOnes; best_synd_iter = iteration; }
+
+	// Guard 1: syndrome-depth >= warmup (>=5). Protects the early plateau of a
+	// slow converger before its descent kicks in.
+	if(iteration < warmup) return false;
+
+	// Guard 2: FLOOR. Only a frame whose running minimum NEVER dropped below the
+	// floor is a candidate. A real converger has already dipped below P/2 by
+	// here, so min_nones<=floor => never trip (LOSSLESS). min_nones<=0 also fails
+	// this gate (defensive: a 0 min would have hit the success break anyway).
+	if(min_nones <= floor) return false;
+
+	// Guard 3: confirm window. The high-floor minimum has not improved for
+	// `confirm` consecutive iterations => stuck above the floor => undecodable.
+	return (iteration - best_synd_iter) >= confirm;
+}
+
+// Per-call override of the mode-1 (MERCURY_SYND_EARLYTERM) warmup/confirm for
+// the campaign sweep. Read once (static). Mode 2 (#1 speculative) uses fixed
+// eager constants. Mode-1 defaults warmup=12, confirm=8 (swept LOSSLESS on the
+// 27-cell grid at floor=P/2, mean catch iter ~12; turnaround-eff.md §6). Both
+// satisfy depth>=5.
+static inline void spa_earlyterm_params(int mode, int& warmup, int& confirm)
+{
+	if(mode == 2) { warmup = 8; confirm = 6; return; }   // #1(c) eager wrong-pos
+	// mode 1 (#3): defaults + optional env overrides.
+	static const int w = []{
+		const char* e = std::getenv("MERCURY_SYND_WARMUP");
+		int v = (e && *e) ? atoi(e) : 12;
+		if(v < 5) v = 5;   // depth>=5 invariant (turnaround-eff.md §2 Guard 1)
+		return v;
+	}();
+	static const int c = []{
+		const char* e = std::getenv("MERCURY_SYND_CONFIRM");
+		int v = (e && *e) ? atoi(e) : 8;
+		if(v < 2) v = 2;
+		return v;
+	}();
+	warmup = w; confirm = c;
+}
+
 int decode_SPA(
 		const float LLRi[],
 		int LLRo[],
@@ -66,7 +144,9 @@ int decode_SPA(
 		int P,
 		int nIteration_max,
 		std::atomic<bool>* abort_flag,
-		double* app_llr
+		double* app_llr,
+		int early_term_mode,
+		int* out_early_term_iter
 )
 {
 	int Cout[N_MAX];
@@ -74,6 +154,27 @@ int decode_SPA(
 	int iteration=0;
 	int i,j,nOnes;
 	double LLRtmp[N_MAX];
+
+	// feat/turnaround-eff: shared non-convergence detector state + params.
+	// early_term_mode==0 (default) => the detector is NEVER called => the loop
+	// runs to the cap exactly as before (byte-identical).
+	if(out_early_term_iter) *out_early_term_iter = -1;
+	int et_min_nones = 0x7FFFFFFF;   // INT_MAX: lowest syndrome weight so far
+	int et_best_iter = 0;            // iteration that set et_min_nones
+	int et_warmup = 0, et_confirm = 0, et_floor = 0;
+	if(early_term_mode != 0)
+	{
+		spa_earlyterm_params(early_term_mode, et_warmup, et_confirm);
+		// FLOOR = P/2 (swept lossless, turnaround-eff.md §6). MERCURY_SYND_FLOOR
+		// overrides as a PERCENT of P for the campaign sweep (e.g. 50 => P/2).
+		et_floor = P / 2;
+		static const int floor_pct = []{
+			const char* e = std::getenv("MERCURY_SYND_FLOOR");
+			int v = (e && *e) ? atoi(e) : -1;   // -1 => use P/2 default
+			return v;
+		}();
+		if(floor_pct >= 0) et_floor = (P * floor_pct) / 100;
+	}
 
 	for( i=0;i<N;i++)
 	{
@@ -278,6 +379,28 @@ int decode_SPA(
 			if(nOnes==0)
 			{
 				break;
+			}
+
+			// feat/turnaround-eff: shared non-convergence early-term (§2/§3).
+			// Runs ONLY when early_term_mode != 0 (env MERCURY_SYND_EARLYTERM
+			// mode 1, or the #1(c) speculative flag mode 2). On a trip the frame
+			// has NOT converged (nOnes != 0 here), so we return the canonical
+			// FAIL sentinel nIteration_max+1 — every consumer's
+			// `iterations_done > nIteration_max-1` FAIL predicate fires exactly
+			// as for a natural cap-out. The real early-term iter is exposed for
+			// measurement only.
+			if(early_term_mode != 0 &&
+			   spa_nonconverge_detect(iteration, nOnes, et_min_nones,
+			                          et_best_iter, et_warmup, et_confirm, et_floor))
+			{
+				if(out_early_term_iter) *out_early_term_iter = iteration;
+				// Publish app_llr exactly as the fall-through path would (the
+				// caller may consume it); LLRtmp already holds the a-posteriori
+				// LLR for this iteration.
+				if(app_llr)
+					for(int ai=0; ai<N; ai++) app_llr[ai]=LLRtmp[ai];
+				for(int oi=0; oi<K; oi++) LLRo[oi]=(LLRtmp[oi]<0);
+				return nIteration_max + 1;
 			}
 
 

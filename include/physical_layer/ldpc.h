@@ -100,6 +100,24 @@ public:
 	// NULL means no abort checking (normal operation).
 	std::atomic<bool>* decode_abort{nullptr};
 
+	// feat/turnaround-eff #1(c) SPECULATIVE wrong-position flag (fact-documents/
+	// turnaround-eff.md §4). When true, decode_SPA applies the SHARED
+	// non-convergence detector in the EAGER mode-2 (warmup=8,confirm=6,floor=P/2):
+	// a wrong-position sub-peak/extra-trial decode bails ~iter 8 instead of burning
+	// to the cap. The caller (telecom_system.cc sub-peak path) sets this TRUE
+	// immediately before a speculative decode and clears it immediately after, so
+	// the PRIMARY (aligned) decode is never early-termed by #1. Default false =>
+	// byte-identical for every existing caller.
+	bool early_term_speculative{false};
+
+	// feat/turnaround-eff measurement-only (fact-documents/turnaround-eff.md §2):
+	// the ACTUAL iteration at which the shared detector declared non-convergence
+	// on the LAST decode (-1 if it did not trip). The production return value is
+	// still nIteration_max+1 (the canonical FAIL sentinel); this exposes the real
+	// early-term iter so the regression test can prove the wasted iterations were
+	// skipped. No control-flow consumer.
+	int last_early_term_iter{-1};
+
 };
 
 
