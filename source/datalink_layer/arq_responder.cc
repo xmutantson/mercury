@@ -576,16 +576,41 @@ void cl_arq_controller::process_messages_rx_data_control()
 				long long deadline_ms =
 					(long long)receiving_timeout * spec_num / spec_den;
 
+				// NEAR-COMPLETENESS gate (BUGFIX, §8.8): the deadline must ONLY
+				// prompt-fire when the batch is MOSTLY decoded (a few stragglers),
+				// never on a STRUGGLING first batch where most frames are still
+				// decoding. Without this, a near-empty batch at the deadline reports
+				// most slots bit-0 -> CMD enqueues every missing slot
+				// (arq_commander.cc:3098-3164) -> trips the runaway-BREAK
+				// retransmit_count>=2*data_batch_size (arq_commander.cc:1549) ->
+				// ROBUST_0 demote; AND the early deadline truncates the decode the
+				// slow frames still needed, MANUFACTURING the misses. We require
+				// rx_received >= minfrac*expected (percent, env MERCURY_SPEC_SACK_MINFRAC,
+				// default 70). Below the fraction we DO NOT prompt-fire and fall
+				// through to the existing natural path (let decode catch up / the
+				// normal timer at :1150). This confines lever #2 to its intended
+				// regime — a few stragglers, not a mostly-empty batch.
+				static const int spec_minfrac_pct = []{
+					const char* e = std::getenv("MERCURY_SPEC_SACK_MINFRAC");
+					int v = (e && *e) ? atoi(e) : 70;
+					return (v >= 0 && v <= 100) ? v : 70;
+				}();
+				// Integer near-completeness test: rx_received*100 >= minfrac*expected.
+				bool near_complete =
+					((long long)rx_received * 100 >= (long long)spec_minfrac_pct * expected);
+
 				if(expected >= 2
 				   && rx_received < expected
+				   && near_complete
 				   && receiving_timer.get_elapsed_time_ms() >= deadline_ms)
 				{
 					printf("[RSP-SPEC-SACK] deadline fired: elapsed=%d >= %lld "
-						"(=%d*%d/%d) rx=%d/%d expected=%d eob=%d batch=%d — "
+						"(=%d*%d/%d) rx=%d/%d expected=%d (minfrac=%d%% near_complete=1) "
+						"eob=%d batch=%d — "
 						"advancing to ACK-GATE (still-decoding frames -> bit-0 -> retx)\n",
 						receiving_timer.get_elapsed_time_ms(), deadline_ms,
 						receiving_timeout, spec_num, spec_den,
-						rx_received, data_batch_size, expected,
+						rx_received, data_batch_size, expected, spec_minfrac_pct,
 						last_received_end_of_batch_seq, data_batch_size);
 					fflush(stdout);
 					mtl::log_event_kv("rsp_spec_sack_fired",
@@ -3811,6 +3836,12 @@ int cl_arq_controller::test_spec_sack()
 	}
 	int spec_num = 3, spec_den = 4;   // production defaults
 	long long deadline_ms = (long long)this->receiving_timeout * spec_num / spec_den; // 1875
+	// NEAR-COMPLETENESS gate (BUGFIX §8.8): production default minfrac=70%.
+	int spec_minfrac_pct = 70;
+	{ const char* e = std::getenv("MERCURY_SPEC_SACK_MINFRAC");
+	  if(e && *e) { int v = atoi(e); if(v >= 0 && v <= 100) spec_minfrac_pct = v; } }
+	bool near_complete =
+		((long long)rx_received * 100 >= (long long)spec_minfrac_pct * expected);
 	// The CMD listen window the SACK must land inside (arq_common.cc:1416, same geom).
 	long long cmd_window_ms = this->receiving_timeout;
 	// Worst-case elapsed at the deadline check: the doomed frame's full decode
@@ -3829,6 +3860,7 @@ int cl_arq_controller::test_spec_sack()
 	bool gate_fires = gate_eligible
 	                && expected >= 2
 	                && rx_received < expected
+	                && near_complete
 	                && elapsed_at_check >= deadline_ms;
 
 	// FAIL-BEFORE: env unset -> gate NOT eligible -> no early SACK. The batch stays
@@ -3994,8 +4026,162 @@ int cl_arq_controller::test_spec_sack()
 	printf("[TEST-SPEC-SACK] no-double-delivery OK: FIFO drained, each slot delivered once\n");
 	fflush(stdout);
 
+	// --- Step 7: STRUGGLING-FIRST-BATCH regime (BUGFIX §8.8) ----------------
+	// The regime the ORIGINAL 1-missing test never modeled: a struggling first
+	// batch where MOST frames are still RECEIVED==false at the deadline. PRE-FIX
+	// (no near-completeness gate) the deadline gate FIRES here, reports most slots
+	// bit-0, CMD enqueues every missing slot (arq_commander.cc:3098-3164), and
+	// retransmit_count races to the runaway-BREAK threshold
+	// (2*data_batch_size, arq_commander.cc:1549) -> ROBUST_0 demote. The early
+	// deadline ALSO truncates the decode the slow frames still needed.
+	//
+	// FAIL-BEFORE (minfrac=0, i.e. gate as it was): gate fires on a near-empty
+	//   batch, the modeled CMD enqueue floods retransmit_count to >=2*batch ->
+	//   runaway-BREAK trips.
+	// PASS-AFTER (production minfrac=70): rx_received < minfrac*expected ->
+	//   near_complete=false -> gate does NOT prompt-fire (falls through to the
+	//   natural path) -> NO flood -> NO runaway-BREAK trip.
+	{
+		// Re-prime: only RECEIVED_STRUGGLE of K slots have decoded by the deadline.
+		const int RECEIVED_STRUGGLE = 2;   // 2/8 = 25% < 70% minfrac -> must NOT fire
+		for(int i = 0; i < this->nMessages; i++)
+		{
+			messages_rx[i].status       = FREE;
+			messages_rx[i].length       = 0;
+			messages_rx[i].batch_seq_id = -1;
+		}
+		int s_received = 0;
+		for(int i = 0; i < K && s_received < RECEIVED_STRUGGLE; i++)
+		{
+			messages_rx[i].type            = DATA_LONG;
+			messages_rx[i].id              = (char)(unsigned char)i;
+			messages_rx[i].length          = SUB_LEN;
+			messages_rx[i].status          = RECEIVED;
+			messages_rx[i].batch_seq_id    = this->rsp_current_expected_batch_seq_id;
+			messages_rx[i].sequence_number = (char)(unsigned char)i;
+			s_received++;
+		}
+		this->batch_rx_frame_count = s_received;
+		this->last_received_end_of_batch_seq = K - 1;   // full-size batch expected
+
+		// Recompute the PRODUCTION near-completeness predicate (mirror Step 2 +
+		// the production gate at arq_responder.cc:~580). Read minfrac from env
+		// (default 70). MERCURY_SPEC_SACK_MINFRAC=0 reproduces the pre-fix gate.
+		int s_rx = 0;
+		for(int i = 0; i < this->data_batch_size; i++)
+			if(messages_rx[i].status == RECEIVED) s_rx++;
+		int s_expected = this->data_batch_size;
+		if(this->last_received_end_of_batch_seq >= 0)
+		{
+			s_expected = this->last_received_end_of_batch_seq + 1;
+			if(s_expected > this->data_batch_size) s_expected = this->data_batch_size;
+		}
+		int s_minfrac = 70;
+		{ const char* e = std::getenv("MERCURY_SPEC_SACK_MINFRAC");
+		  if(e && *e) { int v = atoi(e); if(v >= 0 && v <= 100) s_minfrac = v; } }
+		bool s_near = ((long long)s_rx * 100 >= (long long)s_minfrac * s_expected);
+
+		bool s_gate_eligible = spec_on
+		                     && this->link_status == CONNECTED
+		                     && this->connection_status == RECEIVING
+		                     && !this->passive_monitor
+		                     && this->sack_enabled
+		                     && this->data_batch_size > 1
+		                     && this->batch_rx_frame_count >= 1;
+		bool s_gate_fires = s_gate_eligible
+		                  && s_expected >= 2
+		                  && s_rx < s_expected
+		                  && s_near
+		                  && elapsed_at_check >= deadline_ms;   // elapsed crossed deadline
+
+		// Model the runaway-BREAK consequence (arq_commander.cc:3098-3164 ->
+		// :1549). When the gate fires on a struggling batch, CMD enqueues every
+		// bit-0 slot: a single fire contributes (expected - rx_received) missing
+		// slots to retransmit_count. The pre-fix gate fires AGAIN at the next
+		// batch's deadline (still struggling — the early deadline truncated the
+		// decode the slow frames needed, manufacturing the misses), so the
+		// contributions ACCUMULATE in the persistent retransmit_count until it
+		// crosses the runaway threshold 2*data_batch_size and trips BREAK ->
+		// ROBUST_0. We model that accumulation: count how many such fires it takes
+		// to trip (bounded). With the fix the gate NEVER fires -> zero enqueue ->
+		// the loop never advances -> no trip (structural).
+		int per_fire_enqueue = s_gate_fires ? (s_expected - s_rx) : 0;
+		int runaway_threshold = 2 * this->data_batch_size;
+		int modeled_retx_count = 0;
+		int fires_to_trip = 0;
+		bool runaway_trip = false;
+		if(s_gate_fires && per_fire_enqueue > 0)
+		{
+			// Each successive struggling-batch deadline appends per_fire_enqueue
+			// (bounded by MAX_RETRANSMIT_HEADROOM at the capture site). Cap the
+			// model loop so a degenerate input cannot spin.
+			while(modeled_retx_count < runaway_threshold && fires_to_trip < 64)
+			{
+				int room = MAX_RETRANSMIT_HEADROOM - modeled_retx_count;
+				if(room <= 0) break;
+				int add = (per_fire_enqueue < room) ? per_fire_enqueue : room;
+				modeled_retx_count += add;
+				fires_to_trip++;
+			}
+			runaway_trip = (modeled_retx_count >= runaway_threshold);
+		}
+
+		printf("[TEST-SPEC-SACK] STRUGGLE: rx=%d/%d expected=%d minfrac=%d%% near=%d "
+			"gate_fires=%d per_fire_enqueue=%d runaway_thresh=2*batch=%d "
+			"fires_to_trip=%d modeled_retx=%d trip=%d\n",
+			s_rx, K, s_expected, s_minfrac, s_near ? 1 : 0,
+			s_gate_fires ? 1 : 0, per_fire_enqueue, runaway_threshold,
+			fires_to_trip, modeled_retx_count, runaway_trip ? 1 : 0);
+		fflush(stdout);
+
+		if(s_minfrac == 0)
+		{
+			// FAIL-BEFORE arm (gate as it was, no near-completeness): the gate MUST
+			// fire on the struggling batch AND the accumulated enqueue MUST reach the
+			// runaway-BREAK threshold. Assert the bug reproduces end-to-end.
+			bool fail_before_reproduced =
+				s_gate_fires && (per_fire_enqueue >= 1) && runaway_trip;
+			printf("[TEST-SPEC-SACK] STRUGGLE FAIL-BEFORE (minfrac=0): gate_fires=%d "
+				"per_fire_enqueue=%d fires_to_trip=%d runaway_trip=%d -> %s\n",
+				s_gate_fires ? 1 : 0, per_fire_enqueue, fires_to_trip,
+				runaway_trip ? 1 : 0,
+				fail_before_reproduced ? "OK (struggling-batch flood -> runaway-BREAK "
+				                         "reproduced)"
+				                       : "UNEXPECTED (bug did NOT reproduce)");
+			fflush(stdout);
+			if(!fail_before_reproduced)
+			{
+				printf("[TEST-SPEC-SACK] FAIL: struggling-batch flood -> runaway-BREAK did "
+					"not reproduce with minfrac=0 (the bug must be demonstrable)\n");
+				fflush(stdout);
+				return 1;
+			}
+		}
+		else
+		{
+			// PASS-AFTER arm (production minfrac=70): the gate must NOT fire on the
+			// struggling batch -> NO flood -> NO runaway-BREAK trip.
+			if(s_gate_fires || runaway_trip)
+			{
+				printf("[TEST-SPEC-SACK] FAIL: struggling first batch (rx=%d/%d, %d%% < "
+					"minfrac=%d%%) STILL prompt-fired (gate_fires=%d) or tripped runaway "
+					"(trip=%d) — near-completeness gate did not confine lever #2\n",
+					s_rx, K, (s_rx * 100) / s_expected, s_minfrac,
+					s_gate_fires ? 1 : 0, runaway_trip ? 1 : 0);
+				fflush(stdout);
+				return 1;
+			}
+			printf("[TEST-SPEC-SACK] STRUGGLE PASS-AFTER (minfrac=%d): struggling batch "
+				"(rx=%d/%d=%d%% < minfrac) did NOT prompt-fire -> no flood -> no "
+				"runaway-BREAK trip (falls through to natural path)\n",
+				s_minfrac, s_rx, K, (s_rx * 100) / s_expected);
+			fflush(stdout);
+		}
+	}
+
 	printf("[TEST-SPEC-SACK] PASS (in-window SACK bit_%d=0 -> CMD retx -> byte-faithful "
-		"re-receive -> single in-order delivery, no silent loss)\n", FRAME_K);
+		"re-receive -> single in-order delivery, no silent loss; struggling-batch "
+		"flood gated by near-completeness)\n", FRAME_K);
 	fflush(stdout);
 	return 0;
 }
