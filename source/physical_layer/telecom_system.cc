@@ -25,6 +25,8 @@
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
 #include "physical_layer/dist_matcher.h" // PAS/PCS distribution matcher (lever #2, feat/pcs)
+#include "physical_layer/ldpc_decode_pool.h" // LEVER C: multi-core big-block decode pool (feat/decode-marathon)
+#include <thread> // LEVER C: std::thread::hardware_concurrency() for the pool clamp
 #include <chrono>
 #include <algorithm> // std::sort — bigblock pre-FFT AFC-track median smoother (Option C)
 #include <vector>  // suffix-FEC soft decode candidate buffers
@@ -167,7 +169,10 @@ cl_telecom_system::cl_telecom_system()
 
 cl_telecom_system::~cl_telecom_system()
 {
-
+	// LEVER C (feat/decode-marathon): tear down the big-block decode pool if it was
+	// ever lazily constructed (default-off path leaves it nullptr). ~cl_ldpc_decode_pool
+	// joins all worker threads and frees each worker's private R/Q/V_pos.
+	if(ldpc_decode_pool) { delete ldpc_decode_pool; ldpc_decode_pool = nullptr; }
 }
 
 void cl_telecom_system::init_tx_gain_defaults()
@@ -8630,25 +8635,80 @@ int cl_telecom_system::bigblock_rx_passband(const double* pb, int nSamples,
 		}
 	}
 
-	cw_ok_out.assign(Kcw, 0);
-	int cw_ok=0;
-	std::vector<float> cwllr(ldpc.N); std::vector<int> dec(ldpc.N);
+	// LEVER C (feat/decode-marathon): the per-codeword decode loop. Default-off
+	// (MERCURY_LDPC_MULTICORE unset/0/1) => the SERIAL loop runs bit-for-bit inside
+	// bigblock_decode_codewords; >=2 => the codewords are decoded across a private
+	// thread pool (each worker owns a PRIVATE cl_ldpc R/Q/V_pos) and JOINED before
+	// return. Either way out_infobits[c*K..]/cw_ok_out[c] are filled in DISJOINT
+	// slices and the cw_ok count is returned, so the downstream carve/SACK/copy_data
+	// see the EXACT serial layout (fact-documents/decode-marathon-C.md §4/§5).
+	int cw_ok = bigblock_decode_codewords(clr.data(), Kcw, out_infobits, cw_ok_out, cw_info_ref);
+	K_out = Kcw;
+	return cw_ok;
+}
+
+// LEVER C (feat/decode-marathon): decode all Kcw big-block codewords, serially by
+// default and across a multi-core pool when MERCURY_LDPC_MULTICORE>=2. The two
+// branches are byte-identical by construction: decode_SPA is a pure function of
+// (LLRi, frozen matrices/params) with no cross-codeword state, so a private
+// per-worker cl_ldpc (freshly-zeroed R/Q/V_pos at every decode entry) yields the
+// SAME bits as the serial decode regardless of which worker runs codeword c. See
+// fact-documents/decode-marathon-C.md §4 INV-BITEXACT.
+int cl_telecom_system::bigblock_decode_codewords(
+		const float* clr, int Kcw,
+		int* out_infobits, std::vector<int>& cw_ok_out,
+		const std::vector<std::vector<int>>* cw_info_ref)
+{
+	cw_ok_out.assign((size_t)Kcw, 0);
+	if(Kcw <= 0) return 0;
+
+	const int N = ldpc.N;
+	const int K = ldpc.K;
+
+	// Pool worker count: MERCURY_LDPC_MULTICORE = requested worker threads.
+	// 0/1/unset => SERIAL (default-off byte-identical). >=2 => parallel, clamped to
+	// min(Kcw, hw_concurrency-2) so capture-prep + the main/keyer thread each keep a
+	// core during turnaround (fact-documents/decode-marathon-C.md §6). At least 2 if
+	// the user asked for parallel and >=2 codewords exist.
+	int req = 0;
+	{ const char* e = std::getenv("MERCURY_LDPC_MULTICORE"); if(e && *e) req = atoi(e); }
+
+	if(req >= 2 && Kcw >= 2)
+	{
+		unsigned hw = std::thread::hardware_concurrency();
+		int hw_cap = (hw >= 4) ? (int)hw - 2 : ((hw >= 2) ? (int)hw - 1 : 1);
+		if(hw_cap < 1) hw_cap = 1;
+		int n_workers = req;
+		if(n_workers > hw_cap) n_workers = hw_cap;
+		if(n_workers > Kcw)    n_workers = Kcw;
+		if(n_workers >= 2)
+		{
+			if(!ldpc_decode_pool) ldpc_decode_pool = new cl_ldpc_decode_pool();
+			// Clone the PRIMARY ldpc's config into each worker once for this config;
+			// ensure() reuses an existing pool when the config + worker count match.
+			ldpc_decode_pool->ensure(ldpc, n_workers);
+			return ldpc_decode_pool->decode_batch(clr, Kcw, N, K,
+			                                      out_infobits, cw_ok_out, cw_info_ref);
+		}
+		// fall through to serial (n_workers collapsed to 1)
+	}
+
+	// --- SERIAL path (default-off byte-identical; the original loop verbatim) ---
+	int cw_ok = 0;
+	std::vector<float> cwllr((size_t)N);
+	std::vector<int>   dec((size_t)N);
 	for(int c=0;c<Kcw;c++)
 	{
-		for(int i=0;i<ldpc.N;i++) cwllr[i]=clr[(size_t)c*ldpc.N+i];
+		for(int i=0;i<N;i++) cwllr[(size_t)i] = clr[(size_t)c*N + i];
 		ldpc.decode(cwllr.data(), dec.data());
-		// extract the K info bits of this codeword into out_infobits (sub-unit c)
-		for(int i=0;i<ldpc.K;i++)
-			out_infobits[(size_t)c*ldpc.K + i] = dec[i];
-		// per-codeword clean gate: compare against the known info bits when the caller
-		// supplied them (loopback byte-correct); else (P2) the caller validates via CRC.
+		for(int i=0;i<K;i++)
+			out_infobits[(size_t)c*K + i] = dec[(size_t)i];
 		int ierr=0;
 		if(cw_info_ref && (int)cw_info_ref->size() > c)
-			for(int i=0;i<ldpc.K;i++) if(dec[i]!=(*cw_info_ref)[c][i]){ ierr++; }
-		cw_ok_out[c] = (ierr==0) ? 1 : 0;
+			for(int i=0;i<K;i++) if(dec[(size_t)i] != (*cw_info_ref)[c][(size_t)i]){ ierr++; }
+		cw_ok_out[(size_t)c] = (ierr==0) ? 1 : 0;
 		if(ierr==0) cw_ok++;
 	}
-	K_out = Kcw;
 	return cw_ok;
 }
 

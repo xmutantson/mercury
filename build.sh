@@ -378,6 +378,8 @@ source/physical_layer/fir_filter.cc
 source/physical_layer/interleaver.cc
 source/physical_layer/interpolator.cc
 source/physical_layer/ldpc.cc
+source/physical_layer/ldpc_decode_pool.cc
+source/physical_layer/test_decode_marathon.cc
 source/physical_layer/ldpc_decoder_GBF.cc
 source/physical_layer/ldpc_decoder_SPA.cc
 source/physical_layer/mercury_met_2_16.cc
