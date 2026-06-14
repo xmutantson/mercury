@@ -47,6 +47,45 @@ static inline bool ldpc_fwdback_enabled()
 	return v != 0;
 }
 
+// LEVER D (feat/decode-marathon): LAYERED / row-layered / horizontal-shuffled BP.
+// The default path above is FLOODING: within one iteration every check node reads
+// the SAME old var->check messages (Q snapshot), and the var nodes are updated only
+// AFTER all checks have run. Layered BP instead processes the check rows ONE AT A
+// TIME and immediately propagates each updated check->var message into a running
+// a-posteriori sum L[v] = LLRi[v] + sum_all R[v][slot], so a LATER row in the SAME
+// iteration reads var->check messages already refreshed by the EARLIER rows of that
+// iteration ("the most recent information is disseminated"). On the QC/IRA matrices
+// of mercury_normal_*.cc this is the natural row-layered schedule. Standard result:
+// ~2x faster convergence (about HALF the iterations) at bit-comparable BER, often a
+// slightly LOWER non-converger floor.
+//   D. Hocevar, "A reduced complexity decoder architecture via layered decoding of
+//   LDPC codes," IEEE Workshop on Signal Processing Systems (SIPS), 2004, pp. 107-112
+//   (doi:10.1109/SIPS.2004.1363033) — the ~2x-iteration / 50%-logic result.
+//   M. M. Mansour and N. R. Shanbhag, "High-throughput LDPC decoders," IEEE Trans.
+//   VLSI 11(6):976-996, 2003 — the turbo-decoding-message-passing (layered) schedule.
+//   E. Sharon, S. Litsyn, J. Goldberger, "Efficient serial message-passing schedules
+//   for LDPC decoding," IEEE Trans. Inf. Theory 53(11):4076-4091, 2007 — serial-C
+//   schedule, same ~2x convergence acceleration, BER comparable-or-better.
+//
+// The per-edge check-node math is UNCHANGED: each outgoing R is 2*atanh of the same
+// leave-one-out product of tanh(0.5*Q) over the OTHER edges of the row, with the
+// same +-1 saturation clamp. Only WHEN the var->check extrinsic Q is formed (from
+// the LATEST L instead of a frozen snapshot) differs. The leave-one-out product
+// reuses the EXACT O(dc^2) or (with MERCURY_LDPC_FWDBACK) O(dc) forward-backward
+// kernel — lever D composes cleanly with A. The syndrome / #3 early-term detector
+// run on the layered L[v] hard decision unchanged.
+//
+// Gate: MERCURY_LDPC_LAYERED unset/0 => the FLOODING loop above runs bit-for-bit
+// (default-off byte-identical render). Read once per process (static cache).
+static inline bool ldpc_layered_enabled()
+{
+	static const int v = []{
+		const char* e = std::getenv("MERCURY_LDPC_LAYERED");
+		return (e && *e) ? atoi(e) : 0;
+	}();
+	return v != 0;
+}
+
 // ============================================================================
 // SHARED NON-CONVERGENCE DETECTOR (feat/turnaround-eff, fact-documents/
 // turnaround-eff.md §2). ONE implementation; #3 (env MERCURY_SYND_EARLYTERM,
@@ -262,6 +301,127 @@ int decode_SPA(
 		double  fb_pref[CW_SCRATCH];           // forward partial product (exclusive)
 		int     fb_slot[CW_SCRATCH];           // original Cindex of each valid edge
 
+		// LEVER D scratch: V_pos of each valid edge of the row currently being
+		// processed (so the in-row APP write-back addresses R[v][slot] directly).
+		int     fb_vslot[CW_SCRATCH];          // V_pos[iindex][Cindex] per valid edge
+
+		const bool layered = ldpc_layered_enabled();
+		if(layered)
+		{
+		// ====================================================================
+		// LEVER D: LAYERED (row-by-row) BP. Runs ONLY when MERCURY_LDPC_LAYERED
+		// is set; otherwise the FLOODING loop in the else-branch runs bit-for-bit
+		// (default-off byte-identical). See the header comment for the citations.
+		// ====================================================================
+		// Running a-posteriori LLR: L[v] = LLRi[v] + sum_all R[v][slot].
+		// R is all-zero here (init at :179-188), so L == LLRi at entry. As each
+		// row's outgoing messages are recomputed below, L is updated INCREMENTALLY
+		// (L += R_new - R_old) so the next row reads the freshest extrinsic.
+		double L[N_MAX];
+		for(i=0;i<N;i++) L[i]=LLRi[i];
+
+		for(iteration=1;iteration<=nIteration_max;iteration++)
+		{
+			// Early exit: another parallel decoder already succeeded.
+			if(abort_flag && abort_flag->load(std::memory_order_relaxed))
+				return -iteration;
+
+			// --- One sweep over the P check rows (the layers) -------------
+			for( iindex=0;iindex<P;iindex++)
+			{
+				// Gather this row's valid edges: tanh(0.5*Q) where the var->check
+				// extrinsic Q = L[v] - R[v][slot] uses the LATEST L (already
+				// refreshed by the earlier rows of THIS iteration = the layered
+				// win). Record each edge's V-slot so the write-back is O(1).
+				int nv=0;
+				for( Cindex=0;Cindex<CWidth;Cindex++)
+				{
+					int vj=*(C+iindex*CWidthMax+Cindex);
+					if(vj!=-1)
+					{
+						int vi=V_pos[iindex*CWidthMax+Cindex];
+						double q = L[vj] - *(R+vj*VWidthMax+vi);   // extrinsic Q
+						fb_t[nv]    = tanh(0.5*q);
+						fb_slot[nv] = vj;                          // var-node index
+						fb_vslot[nv]= vi;                          // its V-slot
+						nv++;
+					}
+				}
+				if(nv==0) continue;
+
+				if(!fwdback)
+				{
+					// O(dc^2) leave-one-out product (composes with A: same kernel
+					// as the flooding default path, just fed layered-fresh Q).
+					for(int k=0;k<nv;k++)
+					{
+						temp=1;
+						for(int m=0;m<nv;m++) if(m!=k) temp*=fb_t[m];
+						if(temp==1)  temp= 0.9999999;   // SAME clamp as flooding
+						if(temp==-1) temp=-0.9999999;
+						double Rnew = 2*atanh(temp);
+						int vj=fb_slot[k], vi=fb_vslot[k];
+						double* Rcell = R+vj*VWidthMax+vi;
+						L[vj] += Rnew - *Rcell;          // incremental APP update
+						*Rcell = Rnew;
+					}
+				}
+				else
+				{
+					// O(dc) forward-backward leave-one-out product (lever A kernel).
+					fb_pref[0]=1.0;
+					for(int k=1;k<nv;k++) fb_pref[k]=fb_pref[k-1]*fb_t[k-1];
+					double suffix=1.0;
+					for(int k=nv-1;k>=0;k--)
+					{
+						temp = fb_pref[k]*suffix;        // leave-one-out product
+						if(temp==1)  temp= 0.9999999;
+						if(temp==-1) temp=-0.9999999;
+						double Rnew = 2*atanh(temp);
+						int vj=fb_slot[k], vi=fb_vslot[k];
+						double* Rcell = R+vj*VWidthMax+vi;
+						L[vj] += Rnew - *Rcell;          // incremental APP update
+						*Rcell = Rnew;
+						suffix*=fb_t[k];
+					}
+				}
+			}
+
+			// Hard decision + syndrome from the layered APP L[v].
+			for( i=0;i<N;i++) LLRbin[i]=(L[i]<0);
+			nOnes=0;
+			for( i=0;i<P;i++)
+			{
+				Cout[i]=LLRbin[*(C+i*CWidthMax+0)];
+				for( j=1;j<CWidth;j++)
+					if(*(C+i*CWidthMax+j)!=-1) Cout[i]^=LLRbin[*(C+i*CWidthMax+j)];
+				nOnes+=Cout[i];
+			}
+
+			// Keep LLRtmp in sync so the function's shared epilogue (hard-decision
+			// LLRo[0..K) at :426 and the optional app_llr publish at :437) operate
+			// on the layered APP exactly as the flooding path's LLRtmp would.
+			for( i=0;i<N;i++) LLRtmp[i]=L[i];
+
+			if(nOnes==0) break;
+
+			// #3 shared non-convergence early-term — operates on the layered
+			// syndrome unchanged (composes with #3). On a trip return the same
+			// canonical FAIL sentinel.
+			if(early_term_mode != 0 &&
+			   spa_nonconverge_detect(iteration, nOnes, et_min_nones,
+			                          et_best_iter, et_warmup, et_confirm, et_floor))
+			{
+				if(out_early_term_iter) *out_early_term_iter = iteration;
+				if(app_llr)
+					for(int ai=0; ai<N; ai++) app_llr[ai]=LLRtmp[ai];
+				for(int oi=0; oi<K; oi++) LLRo[oi]=(LLRtmp[oi]<0);
+				return nIteration_max + 1;
+			}
+		}
+		}
+		else
+		{
 		for(iteration=1;iteration<=nIteration_max;iteration++)
 		{
 			// Early exit: another parallel decoder already succeeded
@@ -422,6 +582,7 @@ int decode_SPA(
 				start+=d[section];
 			}
 		}
+		}   // end else (flooding loop; layered branch above)
 	}
 	for( i=0;i<K;i++)
 	{
