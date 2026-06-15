@@ -22,6 +22,7 @@
 
 #include "physical_layer/ldpc_decoder_SPA.h"
 #include <cstdlib>   // std::getenv / atoi for the MERCURY_LDPC_FWDBACK gate
+#include <vector>    // LEVER G: int16 message-state buffers (fixed-point min-sum)
 
 // SOLUTION A (fix/ldpc-decode-accel): forward-backward check-node update.
 // The original SPA check-node update (below, default path) recomputes the full
@@ -136,6 +137,112 @@ static inline bool ldpc_minsum_enabled()
 	return v != 0;
 }
 
+// ============================================================================
+// LEVER G (feat/decode-marathon): FIXED-POINT (int16) MIN-SUM. Quantizes the
+// min-sum decode STATE (the messages R/Q and the a-posteriori APP) to int16 with
+// a fixed LLR scale + saturation, so the check-node / var-node / syndrome run in
+// integer (saturating) arithmetic. The min-sum check node (lever E, ms_check_row)
+// uses NO transcendentals — only compare/min/add/sign — so it quantizes cleanly
+// to integer (unlike the SPA tanh/atanh kernel, which needs float). On NEON this
+// gives ~2x the lanes (8x int16 vs 4x float per 128-bit reg) on the Pi5/A76; the
+// Windows build here proves the QUANTIZATION CORRECTNESS (BER parity), the actual
+// SIMD speedup is Pi-only.
+//
+// Standard result (cited, not invented): a well-scaled fixed-point (int16, even
+// int8) normalized/offset min-sum is within ~0.1 dB of float min-sum.
+//   T. Zhang, Z. Wang, K. K. Parhi, "On finite precision implementation of low
+//     density parity check codes decoder," IEEE ISCAS 2001, vol.4 pp.202-205 —
+//     finite-precision BP quantization, the few-bit-LLR result.
+//   J. Chen, A. Dholakia, E. Eleftheriou, M. P. C. Fossorier, X.-Y. Hu,
+//     "Reduced-complexity decoding of LDPC codes," IEEE Trans. Commun.
+//     53(8):1288-1299, 2005 — quantized normalized/offset min-sum, the scale +
+//     uniform-quantizer treatment.
+//   A. Inan (xdsopl), https://github.com/xdsopl/LDPC — open-source saturating
+//     fixed-point (int8_t code_type, FACTOR scale) NMS/OMS/SCMS reference: the
+//     channel LLR is the float LLR x a constant FACTOR, clamped to the integer
+//     range, and the whole decode runs in saturating integer arithmetic.
+//   AFF3CT (aff3ct.github.io) — production quantized min-sum BP with a fixed-point
+//     Q-format channel LLR + saturating message arithmetic.
+//
+// SCALE / Q-FORMAT (the quantization design):
+//   * The float SPA/MS path caps the per-edge check->var message magnitude at the
+//     SPA saturation ceiling 2*atanh(0.9999999) ~= 16.6355 (ms_check_row clamps to
+//     MS_MAG_MAX). So the natural LLR dynamic range of interest is ~[-16.64, 16.64]
+//     plus the raw channel LLRi (which can spike larger early).
+//   * Scale S (= MERCURY_LDPC_FIXEDPOINT_SCALE, default 64 => Q-format Q9.6, 6
+//     fractional bits, resolution 1/64 ~= 0.0156). 16.6355 maps to ~1065 << 32767,
+//     so int16 has ample headroom for both the messages and the var-node APP sum.
+//   * Saturation magnitude CAP (= MERCURY_LDPC_FIXEDPOINT_SAT, default 4096 fixed
+//     units = +-64.0 LLR). Every quantized value (channel LLR, message, APP) is
+//     clamped to +-CAP. This (a) bounds the var-node accumulator so the int32
+//     running sum over <= dc(46) messages (<= 46*4096 ~= 188k) never overflows
+//     int32 before being clamped back to +-CAP, and (b) keeps a degree-1 / unset
+//     row from injecting a runaway value, exactly as the float MS_MAG_MAX guard.
+//     The min-sum magnitude ceiling is taken as min(CAP, S*16.6355) so the int
+//     kernel shares the float kernel's dynamic range.
+// Gate: MERCURY_LDPC_FIXEDPOINT unset/0 => the FLOAT min-sum (or SPA) kernel runs
+// bit-for-bit. REQUIRES MERCURY_LDPC_MINSUM (gated below so fixed-point only
+// engages on the min-sum path — the SPA tanh/atanh kernel needs float). Read once.
+static inline bool ldpc_fixedpoint_enabled()
+{
+	static const int v = []{
+		const char* e = std::getenv("MERCURY_LDPC_FIXEDPOINT");
+		return (e && *e) ? atoi(e) : 0;
+	}();
+	return v != 0;
+}
+
+// LLR scale S (fixed-point Q-format multiplier). Default 64 (Q9.6). Clamped to a
+// sane (0,1024] range so a fat-fingered env can't underflow to 0 or overflow the
+// quantizer. Read once.
+static inline int ldpc_fixedpoint_scale()
+{
+	static const int s = []{
+		const char* e = std::getenv("MERCURY_LDPC_FIXEDPOINT_SCALE");
+		int v = (e && *e) ? atoi(e) : 64;
+		if(v < 1)    v = 64;       // reject 0/negative => default
+		if(v > 1024) v = 1024;     // keep S*16.64 well inside int16
+		return v;
+	}();
+	return s;
+}
+
+// Saturation magnitude CAP in fixed-point units. Default 4096 (= +-64.0 LLR at
+// S=64). Clamped to (0, 16384] so CAP + a single message can never approach the
+// int16 bound when (rarely) the saturating-add lands one step past CAP before the
+// clamp. Read once.
+static inline int ldpc_fixedpoint_sat()
+{
+	static const int c = []{
+		const char* e = std::getenv("MERCURY_LDPC_FIXEDPOINT_SAT");
+		int v = (e && *e) ? atoi(e) : 4096;
+		if(v < 1)     v = 4096;    // reject 0/negative => default
+		if(v > 16384) v = 16384;   // headroom below INT16_MAX=32767
+		return v;
+	}();
+	return c;
+}
+
+// Quantize a float LLR to int16 with scale S, saturating at +-cap. round-to-nearest.
+static inline short fp_quantize(double x, int S, int cap)
+{
+	double q = x * (double)S;
+	// round half away from zero (symmetric, sign-preserving)
+	long r = (long)(q >= 0.0 ? q + 0.5 : q - 0.5);
+	if(r >  cap) r =  cap;
+	if(r < -cap) r = -cap;
+	return (short)r;
+}
+
+// Saturating add of two int (already-clamped) operands, clamped to +-cap. The
+// inputs are <= cap so the sum fits int32; we only clamp the result.
+static inline int fp_sat(int v, int cap)
+{
+	if(v >  cap) return  cap;
+	if(v < -cap) return -cap;
+	return v;
+}
+
 // Variant: 0=NMS (default), 1=OMS, 2=SCMS. Read once.
 enum { MS_NMS = 0, MS_OMS = 1, MS_SCMS = 2 };
 static inline int ldpc_minsum_variant()
@@ -217,6 +324,57 @@ static inline void ms_check_row(const double* q, int nv, double alpha,
 			mval = alpha * mag;
 		}
 		rout[k] = (sp ? -mval : mval);
+	}
+}
+
+// LEVER G: FIXED-POINT (int16) min-sum leave-one-out check-node update for ONE
+// check row, the integer analogue of ms_check_row. Inputs q16[0..nv) are int16
+// var->check extrinsics already in the fixed-point LLR domain (scale S, clamped to
+// +-cap). Output rout16[k] is the int16 leave-one-out check->var message.
+//   variant MS_NMS:  rout16[k] = round( (alpha_q * s_lo[k] * min_lo[k]) / S )
+//                    where alpha_q = round(alpha * S) is the Q-format NMS scale.
+//   variant MS_OMS:  rout16[k] = s_lo[k] * max( min_lo[k] - beta_q, 0 )
+//                    where beta_q = round(alpha * S) is the offset in fixed units.
+// Same two-smallest-magnitude trick, all integer compares/min/add/sign + ONE
+// fixed-point multiply-then-shift for NMS. No libm, NEON-int16-friendly.
+//   ms_mag_cap = min(cap, round(S * 16.6355)) so the int kernel shares the float
+//   MS_MAG_MAX dynamic range (a degree-1 / unset-min2 row can never run away).
+static inline void ms_check_row_i16(const short* q16, int nv, int alpha_q,
+                                     int variant, int S, int ms_mag_cap,
+                                     short* rout16)
+{
+	int min1 = ms_mag_cap, min2 = ms_mag_cap;   // unset min2 defaults to the cap
+	int imin1 = 0;
+	int neg_parity = 0;
+	for(int m=0; m<nv; m++)
+	{
+		int v  = (int)q16[m];
+		int aq = v < 0 ? -v : v;
+		if(aq > ms_mag_cap) aq = ms_mag_cap;    // clamp into the shared MS range
+		if(v < 0) neg_parity ^= 1;
+		if(aq < min1) { min2 = min1; min1 = aq; imin1 = m; }
+		else if(aq < min2) { min2 = aq; }
+	}
+	for(int k=0; k<nv; k++)
+	{
+		int mag = (k==imin1) ? min2 : min1;     // leave-one-out magnitude
+		int sp  = neg_parity ^ ((q16[k] < 0) ? 1 : 0);
+		int mval;
+		if(variant == MS_OMS)
+		{
+			mval = mag - alpha_q;               // alpha_q = offset beta in fixed units
+			if(mval < 0) mval = 0;
+		}
+		else // MS_NMS (and SCMS check node == NMS)
+		{
+			// alpha * mag in Q-format: (alpha_q * mag) is Q(2*frac); divide by S to
+			// return to Q(frac). Round-to-nearest, then clamp to the cap.
+			long prod = (long)alpha_q * (long)mag;
+			long half = S / 2;
+			mval = (int)((prod + half) / S);
+		}
+		if(mval > ms_mag_cap) mval = ms_mag_cap;
+		rout16[k] = (short)(sp ? -mval : mval);
 	}
 }
 
@@ -449,8 +607,208 @@ int decode_SPA(
 		const int    ms_variant= minsum ? ldpc_minsum_variant() : MS_NMS;
 		const double ms_alpha  = minsum ? ldpc_minsum_alpha()   : 0.8;
 
+		// LEVER G (fixed-point int16 min-sum): engages ONLY when both the min-sum
+		// gate AND the fixed-point gate are set (the SPA tanh/atanh kernel needs
+		// float; quantizing it makes no sense, so fixed-point is min-sum-only). When
+		// off, fixedpoint==false => the float kernels above run bit-for-bit.
+		const bool   fixedpoint = minsum && ldpc_fixedpoint_enabled();
+		const int    fp_S       = fixedpoint ? ldpc_fixedpoint_scale() : 64;
+		const int    fp_cap     = fixedpoint ? ldpc_fixedpoint_sat()   : 4096;
+		// alpha in Q-format (NMS scale / OMS offset, fixed units). round(alpha*S).
+		const int    fp_alpha_q = (int)(ms_alpha * (double)fp_S + 0.5);
+		// shared MS magnitude ceiling: min(cap, round(S*16.6355)) so the int kernel
+		// matches the float MS_MAG_MAX dynamic range.
+		int fp_mag_cap = (int)(16.63553233343869 * (double)fp_S + 0.5);
+		if(fp_mag_cap > fp_cap) fp_mag_cap = fp_cap;
+		// int16 message state (heap, sized at runtime; allocated ONLY when the lever
+		// is engaged => zero cost / zero allocation on the default-off path). R16/Q16
+		// mirror the float R/Q matrices (N*VWidthMax int16); the per-edge scratch
+		// fb_q16/fb_rout16 mirror fb_q/fb_rout.
+		std::vector<short> R16, Q16, L16, LLR16q;
+		short  fb_q16  [CW_SCRATCH];
+		short  fb_rout16[CW_SCRATCH];
+		if(fixedpoint)
+		{
+			R16.assign((size_t)N*VWidthMax, 0);
+			Q16.assign((size_t)N*VWidthMax, 0);
+			L16.assign((size_t)N, 0);
+			LLR16q.assign((size_t)N, 0);
+			// Quantize the channel LLR once at decode entry (float -> int16).
+			for(int vi2=0; vi2<N; vi2++)
+				LLR16q[(size_t)vi2] = fp_quantize((double)LLRi[vi2], fp_S, fp_cap);
+		}
+
 		const bool layered = ldpc_layered_enabled();
-		if(layered)
+		// ====================================================================
+		// LEVER G: FIXED-POINT (int16) MIN-SUM path. A clean alternative to the
+		// float branches below. Runs ONLY when fixedpoint==true (min-sum + the
+		// MERCURY_LDPC_FIXEDPOINT gate). Composes with D (layered) and with #3
+		// (the syndrome early-term reads the int16 APP hard decision). On the
+		// default-off path this whole branch is skipped (byte-identical).
+		// ====================================================================
+		if(fixedpoint)
+		{
+			// Q16 init: var->check messages start at the quantized channel LLR
+			// (mirrors the float Q init at the section loop below). For the LAYERED
+			// schedule Q16 doubles as the SCMS prior-message store (the layered
+			// kernel never re-reads it for the message itself), so seed it to the
+			// quantized LLR exactly like the float layered path seeds Q to LLRi.
+			{
+				int start=0, end=0, width=0;
+				for (int section=0;section<dWidth;section+=2)
+				{
+					end+=d[section];
+					width=d[section+1];
+					for( i=start;i<end;i++)
+						for( j=0;j<width;j++)
+							Q16[(size_t)i*VWidthMax+j] = LLR16q[(size_t)i];
+					start+=d[section];
+				}
+			}
+			// Running APP for the LAYERED schedule: L16[v] = LLR16q[v] + sum R16[v][*]
+			// (R16 all-zero here => L16 == LLR16q at entry). Saturating.
+			if(layered)
+				for(i=0;i<N;i++) L16[(size_t)i] = LLR16q[(size_t)i];
+
+			for(iteration=1;iteration<=nIteration_max;iteration++)
+			{
+				if(abort_flag && abort_flag->load(std::memory_order_relaxed))
+					return -iteration;
+
+				if(layered)
+				{
+					// --- LEVER G + D: LAYERED int16 min-sum ---------------------
+					for( iindex=0;iindex<P;iindex++)
+					{
+						int nv=0;
+						for( Cindex=0;Cindex<CWidth;Cindex++)
+						{
+							int vj=*(C+iindex*CWidthMax+Cindex);
+							if(vj!=-1)
+							{
+								int vi=V_pos[iindex*CWidthMax+Cindex];
+								int q = (int)L16[(size_t)vj] - (int)R16[(size_t)vj*VWidthMax+vi];
+								q = fp_sat(q, fp_cap);
+								if(ms_variant == MS_SCMS)
+								{
+									int qprev = (int)Q16[(size_t)vj*VWidthMax+vi];
+									Q16[(size_t)vj*VWidthMax+vi] = (short)q;   // remember raw
+									if((qprev < 0) != (q < 0)) q = 0;          // erase
+								}
+								fb_q16[nv]  = (short)q;
+								fb_slot[nv] = vj;
+								fb_vslot[nv]= vi;
+								nv++;
+							}
+						}
+						if(nv==0) continue;
+						ms_check_row_i16(fb_q16, nv, fp_alpha_q, ms_variant, fp_S,
+						                 fp_mag_cap, fb_rout16);
+						for(int k=0;k<nv;k++)
+						{
+							int Rnew = (int)fb_rout16[k];
+							int vj=fb_slot[k], vi=fb_vslot[k];
+							short* Rcell = &R16[(size_t)vj*VWidthMax+vi];
+							int Lnew = (int)L16[(size_t)vj] + Rnew - (int)*Rcell;
+							L16[(size_t)vj] = (short)fp_sat(Lnew, fp_cap);
+							*Rcell = (short)Rnew;
+						}
+					}
+					// Hard decision + syndrome from the int16 APP L16.
+					for( i=0;i<N;i++) LLRbin[i]=(L16[(size_t)i]<0);
+				}
+				else
+				{
+					// --- LEVER G: FLOODING int16 min-sum -----------------------
+					for ( iindex=0;iindex<P;iindex++)
+					{
+						int nv=0;
+						for ( Cindex=0;Cindex<CWidth;Cindex++)
+						{
+							int vj=*(C+iindex*CWidthMax+Cindex);
+							if(vj!=-1)
+							{
+								int vi=V_pos[iindex*CWidthMax+Cindex];
+								fb_q16[nv]  = Q16[(size_t)vj*VWidthMax+vi]; // raw Q
+								fb_slot[nv] = Cindex;
+								fb_vslot[nv]= vi;
+								nv++;
+							}
+						}
+						if(nv==0) continue;
+						// SCMS-without-layered => NMS (check node identical).
+						int eff_variant = (ms_variant==MS_SCMS) ? MS_NMS : ms_variant;
+						ms_check_row_i16(fb_q16, nv, fp_alpha_q, eff_variant, fp_S,
+						                 fp_mag_cap, fb_rout16);
+						for(int k=0;k<nv;k++)
+						{
+							int Cidx=fb_slot[k];
+							j=*(C+iindex*CWidthMax+Cidx);
+							R16[(size_t)j*VWidthMax+fb_vslot[k]] = fb_rout16[k];
+						}
+					}
+					// APP: LLR16q[v] + sum_j R16[v][j] (saturating), hard decision.
+					for( i=0;i<N;i++)
+					{
+						int app = (int)LLR16q[(size_t)i];
+						for ( j=0;j<VWidth;j++)
+							app += (int)R16[(size_t)i*VWidthMax+j];
+						app = fp_sat(app, fp_cap);
+						L16[(size_t)i] = (short)app;
+						LLRbin[i] = (app < 0);
+					}
+				}
+
+				// Syndrome on the int16 hard decision (kernel-agnostic).
+				nOnes=0;
+				for( i=0;i<P;i++)
+				{
+					Cout[i]=LLRbin[*(C+i*CWidthMax+0)];
+					for( j=1;j<CWidth;j++)
+						if(*(C+i*CWidthMax+j)!=-1) Cout[i]^=LLRbin[*(C+i*CWidthMax+j)];
+					nOnes+=Cout[i];
+				}
+
+				// Keep LLRtmp (float-domain) in sync from the int16 APP so the
+				// shared epilogue (LLRo / app_llr publish) operates uniformly. The
+				// dequantize is LLRtmp = L16 / S.
+				for( i=0;i<N;i++) LLRtmp[i] = (double)L16[(size_t)i] / (double)fp_S;
+
+				if(nOnes==0) break;
+
+				// #3 shared non-convergence early-term on the int16 syndrome.
+				if(early_term_mode != 0 &&
+				   spa_nonconverge_detect(iteration, nOnes, et_min_nones,
+				                          et_best_iter, et_warmup, et_confirm, et_floor))
+				{
+					if(out_early_term_iter) *out_early_term_iter = iteration;
+					if(app_llr)
+						for(int ai=0; ai<N; ai++) app_llr[ai]=LLRtmp[ai];
+					for(int oi=0; oi<K; oi++) LLRo[oi]=(LLRtmp[oi]<0);
+					return nIteration_max + 1;
+				}
+
+				// FLOODING: rebuild Q16 = L16 - R16 (saturating) for the next
+				// iteration. LAYERED already folds the APP incrementally (L16).
+				if(!layered)
+				{
+					int start=0, end=0, width=0;
+					for (int section=0;section<dWidth;section+=2)
+					{
+						end+=d[section];
+						width=d[section+1];
+						for( i=start;i<end;i++)
+							for( j=0;j<width;j++)
+							{
+								int q = (int)L16[(size_t)i] - (int)R16[(size_t)i*VWidthMax+j];
+								Q16[(size_t)i*VWidthMax+j] = (short)fp_sat(q, fp_cap);
+							}
+						start+=d[section];
+					}
+				}
+			}
+		}
+		else if(layered)
 		{
 		// ====================================================================
 		// LEVER D: LAYERED (row-by-row) BP. Runs ONLY when MERCURY_LDPC_LAYERED
