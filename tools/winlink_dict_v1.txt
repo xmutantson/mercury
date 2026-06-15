@@ -1,4 +1,35 @@
 <?xml version="1.0"?>
+//WL2K
+//WL2K ICS-213 General Message - Resource Request
+//WL2K ICS-309 Communications Log
+//WL2K Winlink Check In
+//WL2K Field Situation Report
+//WL2K Radiogram
+//WL2K Severe Weather Report
+73 de
+de
+73,
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/plain; charset="iso-8859-1"
+Content-Type: text/html; charset=ISO-8859-1
+Content-Disposition: attachment;
+ name="RMS_Express_Form_
+Content-Type: text/xml;
+Content-Transfer-Encoding: base64
+Content-Transfer-Encoding: 8bit
+Content-Type: text/plain; charset=ISO-8859-1
+X-Source:
+X-Location:  (GRID SQUARE)
+Message-ID:
+Date:
+From:
+Mbo:
+Subject:
+To:
+Mid:
+Body:
 ICS-309 COMMUNICATIONS LOG
 INCIDENT NAME:
 OPERATIONAL PERIOD:
@@ -6,130 +37,108 @@ TASK NUMBER:
 RADIO OPERATOR:
 STATION ID:
 DATE/TIME:
-FROM:
-TO:
-SUBJECT:
-ICS-213 GENERAL MESSAGE
-INCIDENT NAME:
-TO (Name/Position):
-FROM (Name/Position):
-SUBJECT:
-DATE:
-TIME:  local
-MESSAGE:
-Request the following resources be delivered to
-no later than  today:
-Current shelter population is
-APPROVED BY (Name/Position):
-SIGNATURE: /s/
-REPLY:
-DATE:
-TIME:
-SIGNATURE:
 FIELD SITUATION REPORT
 Are local communications systems operational?
 Are commercial power, water, sewer and natural gas services operational?
 Is the local hospital operational and accepting patients?
 Are roads open and passable?
 Additional comments:
-WINLINK CHECK IN/OUT
-Status: Check In
-Group/Net Name:
-Band:
-Mode:
-Power:
-Comments:
-ARRL RADIOGRAM
-NUMBER  PRECEDENCE  HX  STATION OF ORIGIN  CHECK  PLACE OF ORIGIN  TIME FILED  DATE
-TO:
-THIS RADIO MESSAGE WAS RECEIVED AT
-BREAK FOR TEXT
-Net control checking in for the evening traffic net. Conditions
-fair on 80 meters, some QSB. Pieces of traffic to pass for the
-district. Nothing further at this time. Standing by.
-Thanks for the update. Please confirm receipt and relay to net control.
-Let me know if you need anything else.
-Acknowledged and understood. Will advise. Out.
-73,
-73 de
-de
-//WL2K ICS-213 General Message - Resource Request
-//WL2K ICS-309 Communications Log
-//WL2K Winlink Check In
-//WL2K Field Situation Report
-//WL2K Radiogram
-//WL2K Severe Weather Report
-//WL2K
-Content-Transfer-Encoding: quoted-printable
-Content-Type: text/html; charset=ISO-8859-1
-X-Location: 00-00.00N/000-00.00W
-Subject: //WL2K
-Mid:
-Body:
-Content-Transfer-Encoding: 8bit
-Content-Type: text/plain; charset=ISO-8859-1
-Date: 2026/01/01 00:00
-From:
-Mbo:
-Subject:
-To:
-RMS Express Form
-<?xml version="1.0" encoding="UTF-8"?>
+Position report
+Latitude:
+Longitude:
+Grid square:
+SEVERE WEATHER REPORT
+Reported By:
+Type of Event:
+Time of Event:
+Winlink Check-in
+0. HEADER
+  0a: Organization:
+  0b: Subject:
+  0c: Event/Exercise ID:
+1. STATION
+  1a. Date/Time:
+  1b. To:
+  1c. From:
+  1d. Station Contact Name:
+  1e. Initial Operators:
+2. SESSION
+  2a. Type:
+  2b. Service:
+  2c. Band:
+  2d. Session:
+3. LOCATION
+  3a. Location:
+  3b. Latitude:
+  3c. Longitude:
+  3d. MGRS:
+  3e. Grid Square:
+  3f. Location sources:
+4a COMMENTS:
+Map file name:
+[No changes or editing of this message are allowed]
+<?xml version="1.0"?>
 <RMS_Express_Form>
-<form_parameters>
-<xml_file_name>RMS_Express_Form_ICS213_Initial_Viewer.xml</xml_file_name>
-<form_version>
-<display_form>
-<reply_template>
-</form_parameters>
-<variables>
-</variables>
+  <form_parameters>
+    <xml_file_version>1.0</xml_file_version>
+    <rms_express_version>1.7.21.0</rms_express_version>
+    <submission_datetime></submission_datetime>
+    <senders_callsign></senders_callsign>
+    <grid_square></grid_square>
+    <display_form>ICS213_Initial_Viewer.html</display_form>
+    <reply_template>ICS213_SendReply.0</reply_template>
+  </form_parameters>
+  <variables>
+    <msgto></msgto>
+    <msgcc></msgcc>
+    <msgsender></msgsender>
+    <msgsubject></msgsubject>
+    <msgbody></msgbody>
+    <msgp2p>False</msgp2p>
+    <msgro>False</msgro>
+    <msgisreply>False</msgisreply>
+    <msgisforward>False</msgisforward>
+    <msgisacknowledgement>False</msgisacknowledgement>
+    <msgseqnum></msgseqnum>
+    <showdr></showdr>
+    <exbtn>true</exbtn>
+    <isexercise></isexercise>
+    <formtitle></formtitle>
+    <inc_name></inc_name>
+    <to_name></to_name>
+    <txtstr></txtstr>
+    <fm_name></fm_name>
+    <subjectline></subjectline>
+    <mdate></mdate>
+    <mtime></mtime>
+    <mapfilename>ICS-213</mapfilename>
+    <message></message>
+    <message2></message2>
+    <approved_name></approved_name>
+    <approved_postitle></approved_postitle>
+    <maplat></maplat>
+    <maplon></maplon>
+    <mgrs></mgrs>
+    <grid></grid>
+    <locationsource>Grid square</locationsource>
+    <location_source>GRID SQUARE</location_source>
+    <themsgsender></themsgsender>
+    <templateversion>ICS 213  v.43.7</templateversion>
+  </variables>
 </RMS_Express_Form>
+------------------------------------
+Express Sending Station:
+Senders Express Version: 1.7.21.0
+Senders Template Version: ICS 213  v.43.
+GENERAL MESSAGE (ICS 213)
+** THIS IS AN EXERCISE **
 1. Incident Name:
-2. To (Name/Position):
-3. From (Name/Position):
+2. To (Name and Position):
+3. From (Name and Position):
 4. Subject:
 5. Date:
 6. Time:
 7. Message:
 8. Approved by:
-Position/Title:
-Message Number:
-Precedence: Routine
-Handling: ROUTINE
-Date/Time:
-Call Sign:
-Tactical Call:
-Sender:
-Recipient:
-Group/Net Name:
-Location:
-County:
-State:
-Grid square:
-Latitude:
-Longitude:
-Speed:
-Course:
-Comment:
-Position report
-SEVERE WEATHER REPORT
-Reported By:
-Type of Event:
-Time of Event:
-WINLINK THRIVING
-This message was sent via Winlink.
-Sent via Winlink
-Telnet
-VARA HF
-VARA FM
-Pactor
-Ardop
-Packet
-Winlink Check In
-Status: Net
-Status: Check Out
-Comments:
-Band:
-Mode:
-Power:
+8a. Position/Title:
+    [Sender:  Lat: , Lon:, MGRS: ; Location source: Grid square]

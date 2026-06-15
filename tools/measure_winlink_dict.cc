@@ -24,6 +24,12 @@
 #include <string>
 #include <vector>
 
+// GENUINE RMS Express .mime messages — the exact B2F-unrolled wire bytes the modem
+// compresses (extracted from C:/RMS Express/KG7VSN/Messages, CRLF-faithful). These
+// carry the real text/plain rendered form body AND the base64 form-XML attachment,
+// exactly as transmitted. The synthetic corpus below is kept for continuity.
+#include "winlink_real_corpus.inc"
+
 // One Mercury batch through a fresh (cold or primed) streaming context.
 static int mercury_wire(const std::string& m, bool prime)
 {
@@ -53,8 +59,49 @@ static int vara_wire(const std::string& m)
 
 struct Sample { const char* name; std::string body; };
 
+// Measure one corpus: per-sample cold/primed/vara + aggregate x-VARA edge. Returns
+// 0 if every batch round-tripped bit-exact, else 1.
+static int measure_corpus(const char* title, std::vector<Sample>& corpus)
+{
+	printf("=== %s (dict v%d, raw=%u compressed=%u) ===\n",
+		title, WINLINK_DICT_VERSION, WINLINK_DICT_RAW_LEN, WINLINK_DICT_COMPRESSED_LEN);
+	printf("%-18s %6s | merc-cold       merc-primed     | vara(lzhuf)\n", "sample", "orig");
+
+	long sum_orig = 0, sum_cold = 0, sum_primed = 0, sum_vara = 0;
+	int any_fail = 0;
+	for (auto& s : corpus) {
+		int orig   = (int)s.body.size();
+		int cold   = mercury_wire(s.body, false);
+		int primed = mercury_wire(s.body, true);
+		int vara   = vara_wire(s.body);
+		if (cold <= 0 || primed <= 0) { any_fail = 1; }
+		double cr = cold   > 0 ? (double)orig / cold   : 0;
+		double pr = primed > 0 ? (double)orig / primed : 0;
+		double vr = vara   > 0 ? (double)orig / vara   : 0;
+		printf("%-18s %6d | %5d (%.2fx)   %5d (%.2fx)   | %5d (%.2fx)\n",
+			s.name, orig, cold, cr, primed, pr, vara, vr);
+		sum_orig += orig; sum_cold += cold; sum_primed += primed; sum_vara += vara;
+	}
+	double edge_cold   = sum_cold   > 0 ? (double)sum_vara / sum_cold   : 0;
+	double edge_primed = sum_primed > 0 ? (double)sum_vara / sum_primed : 0;
+	printf("---\n");
+	printf("aggregate orig=%ld  merc_cold=%ld  merc_primed=%ld  vara=%ld\n",
+		sum_orig, sum_cold, sum_primed, sum_vara);
+	printf("aggregate x-VARA edge: cold=%.3f  primed=%.3f  (>1.0 = Mercury beats VARA wire)\n",
+		edge_cold, edge_primed);
+	printf("round-trip integrity: %s\n\n", any_fail ? "FAIL (a batch did not round-trip)" : "OK (all bit-exact)");
+	return any_fail ? 1 : 0;
+}
+
 int main()
 {
+	// --- GENUINE real-traffic corpus (actual RMS Express .mime, CRLF-faithful) ---
+	std::vector<Sample> real_corpus;
+	real_corpus.push_back({"ics213-real",   std::string(MSG_ICS213_REAL,  sizeof(MSG_ICS213_REAL)-1)});
+	real_corpus.push_back({"ics213-real2",  std::string(MSG_ICS213_REAL2, sizeof(MSG_ICS213_REAL2)-1)});
+	real_corpus.push_back({"aar-real",      std::string(MSG_AAR_REAL,     sizeof(MSG_AAR_REAL)-1)});
+	real_corpus.push_back({"plain-real",    std::string(MSG_PLAIN_REAL,   sizeof(MSG_PLAIN_REAL)-1)});
+
 	std::vector<Sample> corpus;
 
 	// --- 1. Short Winlink check-in (text body, no form) ---
@@ -115,34 +162,8 @@ int main()
 		"antenna project. Bring the analyzer if you have it; mine is acting up. I will\n"
 		"grab coffee on the way. Let me know what time works. 73.\n"});
 
-	printf("=== measure_winlink_dict (dict v%d, raw=%u compressed=%u) ===\n",
-		WINLINK_DICT_VERSION, WINLINK_DICT_RAW_LEN, WINLINK_DICT_COMPRESSED_LEN);
-	printf("%-18s %5s | merc-cold      merc-primed    | vara(lzhuf)\n", "sample", "orig");
-
-	long sum_orig = 0, sum_cold = 0, sum_primed = 0, sum_vara = 0;
-	int any_fail = 0;
-	for (auto& s : corpus) {
-		int orig   = (int)s.body.size();
-		int cold   = mercury_wire(s.body, false);
-		int primed = mercury_wire(s.body, true);
-		int vara   = vara_wire(s.body);
-		if (cold <= 0 || primed <= 0) { any_fail = 1; }
-		double cr = cold   > 0 ? (double)orig / cold   : 0;
-		double pr = primed > 0 ? (double)orig / primed : 0;
-		double vr = vara   > 0 ? (double)orig / vara   : 0;
-		printf("%-18s %5d | %4d (%.2fx)   %4d (%.2fx)   | %4d (%.2fx)\n",
-			s.name, orig, cold, cr, primed, pr, vara, vr);
-		sum_orig += orig; sum_cold += cold; sum_primed += primed; sum_vara += vara;
-	}
-
 	// x-VARA edge = VARA total wire / Mercury total wire. >1 => Mercury smaller => beat.
-	double edge_cold   = sum_cold   > 0 ? (double)sum_vara / sum_cold   : 0;
-	double edge_primed = sum_primed > 0 ? (double)sum_vara / sum_primed : 0;
-	printf("---\n");
-	printf("aggregate orig=%ld  merc_cold=%ld  merc_primed=%ld  vara=%ld\n",
-		sum_orig, sum_cold, sum_primed, sum_vara);
-	printf("aggregate x-VARA edge: cold=%.3f  primed=%.3f  (>1.0 = Mercury beats VARA wire)\n",
-		edge_cold, edge_primed);
-	printf("round-trip integrity: %s\n", any_fail ? "FAIL (a batch did not round-trip)" : "OK (all bit-exact)");
-	return any_fail ? 1 : 0;
+	int f1 = measure_corpus("REAL RMS Express .mime traffic", real_corpus);
+	int f2 = measure_corpus("synthetic corpus (legacy continuity)", corpus);
+	return (f1 || f2) ? 1 : 0;
 }

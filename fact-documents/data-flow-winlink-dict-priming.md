@@ -295,3 +295,61 @@ where it should. All cold AND primed round-trips bit-exact; `--test-winlink-dict
 §7 1.664 figure because this corpus is deliberately form-heavy (where the lever
 lives); the LOAD-BEARING result is the +0.43 aggregate DELTA from enrichment, all
 on the form classes the campaign targets.
+
+## §10. v1 rebuilt from GENUINE RMS Express form bytes (2026-06-14)
+
+§9's enrichment used RESEARCHED/APPROXIMATED form boilerplate. The OWNER has a live
+RMS Express install at `C:/RMS Express` carrying the EXACT bytes real Winlink traffic
+transmits. The §9 approximations were replaced with the genuine bytes; v1 stays v1
+(still unshipped — no deployed peers, so changing v1 BYTES is safe).
+
+### §10.1 What the real install actually carries [verified, firsthand]
+
+- **Form library**: `C:/RMS Express/Standard Templates/` (ICS USA Forms, General Forms,
+  Radiogram & RRI Forms, Weather Forms, …). `.txt` templates define the message
+  scaffold via `<var X>` markers; `.html` are the viewers. e.g.
+  `ICS USA Forms/ICS213 General Message.txt`, `General Forms/Winlink Check-in.txt`.
+- **Real transmitted messages**: `C:/RMS Express/KG7VSN/Messages/*.mime` — 79 actual
+  `.mime` files = the exact B2F payload the modem compresses (FBB transfers these
+  LZHUF-compressed; `b2f_handler.cc:460` `lzhuf_decode_buffer` unrolls to THIS
+  plaintext). 4 carry full RMS_Express_Form attachments (ICS-213 ×2, AAR, …).
+- **CRITICAL CORRECTION to §9**: a form `.mime` is `multipart/mixed`. The form XML is a
+  **base64** attachment part (`Content-Transfer-Encoding: base64`), NOT raw XML on the
+  wire. base64 is incompressible → the §9 raw-`<RMS_Express_Form>` scaffold only helps
+  the small fraction of paths where raw XML appears. The dict's real leverage is the
+  **text/plain rendered body** + the **MIME/RFC822 envelope**, which ARE on the wire
+  verbatim. The genuine ICS-213 body (`GENERAL MESSAGE (ICS 213)`, `1. Incident Name:`,
+  `2. To (Name and Position):` … `8a. Position/Title:`, the `[Sender: … Lat: … Lon: …
+  MGRS: … Location source:` line, `Express Sending Station:` / `Senders Express
+  Version:` / `Senders Template Version:`) replaces §9's invented numbered fields.
+- **CRLF**: real `.mime` is uniformly CRLF. The dict is now CRLF too, so its scaffold
+  matches the on-wire bytes byte-for-byte (LZ back-refs need exact match). CRLF beat an
+  LF-normalized variant on real traffic (primed edge 1.339 vs 1.329).
+- A trimmed genuine XML scaffold (real `<form_parameters>` + the common `<variables>`
+  header: msgto/msgcc/msgsender/…/msgseqnum) is kept — small priming cost, helps the
+  raw-XML paths and the few P2P/text-mode forms. Proven RFC822/B2F headers retained.
+
+Result: raw 2643 → **3703 B**, compressed 1303 → **1400 B**. `WINLINK_DICT_VERSION=1`
+unchanged. Generator self-check PASS (un-primed decode(COMPRESSED)==RAW).
+
+### §10.2 Measured delta on GENUINE traffic (the new headline)
+
+`tools/measure_winlink_dict.cc` now measures a REAL corpus (`winlink_real_corpus.inc`,
+the actual `.mime` bytes) AND keeps the §9 synthetic corpus for continuity. x-VARA
+edge = (Σ VARA/LZHUF wire)/(Σ Mercury wire), >1 = Mercury wins. Real-corpus primed wire:
+
+| sample (real .mime) | orig | 1747 v1 | 2643 §9-approx | 3703 genuine |
+|---------------------|------|---------|----------------|--------------|
+| ics213-real         | 5959 | 2640    | 2581           | **2439**     |
+| ics213-real2        | 6767 | 2917    | 2855           | **2700**     |
+| aar-real            | 7433 | 3220    | 3199           | **3144**     |
+| plain-real          |  461 |  196    |  196           | **152**      |
+| **Σ primed wire**   |20620 | 8973    | 8831           | **8435**     |
+| **primed x-VARA edge** |   | 1.259   | 1.279          | **1.339**    |
+
+The genuine-bytes dict beats the §9 approximation on EVERY real form (+0.060 aggregate
+edge, −396 B / −4.5% wire) — the approximation's invented uppercase/numbered fields and
+LF endings simply didn't appear in real traffic. (The §9 synthetic corpus regresses
+under the genuine dict — expected: that corpus IS the approximation being replaced; it
+is not real traffic.) Cold edge 1.103 unchanged. All cold AND primed round-trips
+bit-exact; `--test-winlink-dict` 12/12 green with the genuine dict.
