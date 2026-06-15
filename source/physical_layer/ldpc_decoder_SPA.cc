@@ -87,6 +87,140 @@ static inline bool ldpc_layered_enabled()
 }
 
 // ============================================================================
+// LEVER E (feat/decode-marathon): MIN-SUM CHECK-NODE UPDATE — the ONLY lossy
+// lever, but a DECODE-QUALITY candidate. The default SPA/BP check node computes
+//   R_out[k] = 2*atanh( prod_{m!=k} tanh(0.5*Q[m]) )                       (SPA)
+// which is two libm transcendentals per edge and — critically — the NAIVE
+// saturating tanh/atanh SPA with NO normalization/self-correction is exactly the
+// decoder that fact-document cfg16_decode_loss_is_ldpc_bp pins the clean ~21%
+// CFG16 loss to (BP NON-CONVERGENCE). Min-sum replaces the transcendental product
+// with the magnitude minimum + the product of signs:
+//   R_out[k] = ( prod_{m!=k} sign(Q[m]) ) * f( min_{m!=k} |Q[m]| )         (MS)
+// computed in O(dc) via the TWO-SMALLEST-MAGNITUDE trick (min1 = smallest |Q|,
+// min2 = second-smallest, total sign-product s_all): the leave-one-out minimum is
+// min1 for every edge EXCEPT the edge that OWNS min1, which gets min2; the
+// leave-one-out sign is s_all XOR sign(Q[k]). No libm, NEON-friendly, ~1 compare
+// + 1 multiply per edge vs the tanh/atanh pair.
+//
+// The normalization f() is what restores SPA-like convergence (plain MS
+// OVER-estimates the check reliability and converges to a worse floor):
+//   NMS (variant "nms", DEFAULT):  f(x) = alpha * x        (alpha ~ 0.75-0.875)
+//   OMS (variant "oms"):           f(x) = max(x - beta, 0) (beta = alpha knob)
+//   SCMS(variant "scms"):          NMS check node + var-node SELF-CORRECTION
+//                                  (erase a var->check message whose SIGN flipped
+//                                  vs the previous iteration => it is unreliable).
+// Default NMS with alpha~0.8 is the standard "keeps SPA convergence" setting.
+//
+// References (cited, not invented):
+//   M. P. C. Fossorier, M. Mihaljevic, H. Imai, "Reduced complexity iterative
+//     decoding of low-density parity check codes based on belief propagation,"
+//     IEEE Trans. Commun. 47(5):673-680, 1999 — the min-sum / two-min check node.
+//   J. Chen and M. P. C. Fossorier, "Near optimum universal belief propagation
+//     based decoding of LDPC codes," IEEE Trans. Commun. 50(3):406-414, 2002, and
+//     "Density evolution for two improved BP-based decoding algorithms over AWGN,"
+//     IEEE Comm. Letters 6(5):208-210, 2002 — Normalized-BP (NMS) / Offset-BP (OMS)
+//     with the alpha~0.8 / beta scaling that recovers near-SPA performance.
+//   V. Savin, "Self-corrected min-sum decoding of LDPC codes," IEEE ISIT 2008,
+//     pp. 146-150 (doi:10.1109/ISIT.2008.4594965, arXiv:0803.1090) — SCMS: erase
+//     unreliable (sign-flipping) var-node messages => near-SPA at MS complexity,
+//     independent of noise-variance estimation error.
+//
+// Gate: MERCURY_LDPC_MINSUM unset/0 => the SPA tanh/atanh kernel runs bit-for-bit
+// (default-off byte-identical render). Read once per process (static cache).
+static inline bool ldpc_minsum_enabled()
+{
+	static const int v = []{
+		const char* e = std::getenv("MERCURY_LDPC_MINSUM");
+		return (e && *e) ? atoi(e) : 0;
+	}();
+	return v != 0;
+}
+
+// Variant: 0=NMS (default), 1=OMS, 2=SCMS. Read once.
+enum { MS_NMS = 0, MS_OMS = 1, MS_SCMS = 2 };
+static inline int ldpc_minsum_variant()
+{
+	static const int v = []{
+		const char* e = std::getenv("MERCURY_LDPC_MINSUM_VARIANT");
+		if(!e || !*e) return MS_NMS;
+		// Accept names ("nms"/"oms"/"scms") or the numeric 0/1/2.
+		if(e[0]=='o' || e[0]=='O') return MS_OMS;
+		if(e[0]=='s' || e[0]=='S') return MS_SCMS;
+		if(e[0]=='n' || e[0]=='N') return MS_NMS;
+		int n = atoi(e);
+		return (n==1) ? MS_OMS : (n==2) ? MS_SCMS : MS_NMS;
+	}();
+	return v;
+}
+
+// alpha (NMS scale) / beta (OMS offset). Default 0.8 (Chen-Fossorier). Clamped to
+// (0,1] for NMS sanity; OMS reuses the same knob as the magnitude offset. Read once.
+static inline double ldpc_minsum_alpha()
+{
+	static const double a = []{
+		const char* e = std::getenv("MERCURY_LDPC_MS_ALPHA");
+		double v = (e && *e) ? atof(e) : 0.8;
+		if(!(v > 0.0)) v = 0.8;     // reject 0/negative/NaN => default
+		if(v > 4.0)    v = 4.0;     // sane upper clamp (offset can exceed 1)
+		return v;
+	}();
+	return a;
+}
+
+// Min-sum leave-one-out check-node update for ONE check row, computed via the
+// two-smallest-magnitude trick. Inputs: q[0..nv) = the var->check extrinsics of
+// the row's valid edges (already the leave-NOTHING-out Q the caller gathered).
+// Output: rout[k] = normalized leave-one-out check->var message for edge k.
+//   variant MS_NMS:  rout[k] = alpha * s_lo[k] * min_lo[k]
+//   variant MS_OMS:  rout[k] = s_lo[k] * max(min_lo[k] - alpha, 0)
+// where min_lo[k] = min over m!=k of |q[m]|, s_lo[k] = product over m!=k of sign(q[m]).
+// O(nv): one pass to find (min1, min2, idx of min1, total sign-parity), one pass
+// to emit. No libm. (SCMS's var-node erasure is applied by the caller to q BEFORE
+// this call — the check node itself is NMS for SCMS.)
+static inline void ms_check_row(const double* q, int nv, double alpha,
+                                int variant, double* rout)
+{
+	// Magnitude ceiling matching the SPA path's saturation: the SPA kernel clamps
+	// the leave-one-out tanh product to +-0.9999999, so its output magnitude tops
+	// out at 2*atanh(0.9999999) ~= 16.635. Cap min-sum to the SAME ceiling so the
+	// two kernels share a dynamic range (and so a degree-1 check / unset min2 can
+	// never inject a runaway 1e300 LLR). 2*atanh(0.9999999) is a compile-time const.
+	const double MS_MAG_MAX = 16.63553233343869;   // = 2*atanh(0.9999999)
+	// First pass: two smallest magnitudes + which edge owns the smallest + the
+	// parity of negative signs (sign 0 -> +). MS convention: |q|=0 forces the
+	// leave-one-out min through that edge to 0.
+	double min1 = MS_MAG_MAX, min2 = MS_MAG_MAX;   // unset min2 defaults to ceiling
+	int    imin1 = 0;
+	int    neg_parity = 0;          // running parity of strictly-negative q
+	for(int m=0; m<nv; m++)
+	{
+		double aq = q[m] < 0.0 ? -q[m] : q[m];
+		if(aq > MS_MAG_MAX) aq = MS_MAG_MAX;        // clamp into the SPA range
+		if(q[m] < 0.0) neg_parity ^= 1;
+		if(aq < min1) { min2 = min1; min1 = aq; imin1 = m; }
+		else if(aq < min2) { min2 = aq; }
+	}
+	const double offset = alpha;    // OMS uses alpha as the magnitude offset beta
+	for(int k=0; k<nv; k++)
+	{
+		double mag = (k==imin1) ? min2 : min1;   // leave-one-out magnitude
+		// leave-one-out sign parity: drop this edge's sign from the total.
+		int sp = neg_parity ^ ((q[k] < 0.0) ? 1 : 0);
+		double mval;
+		if(variant == MS_OMS)
+		{
+			mval = mag - offset;
+			if(mval < 0.0) mval = 0.0;
+		}
+		else // MS_NMS (and MS_SCMS check node == NMS)
+		{
+			mval = alpha * mag;
+		}
+		rout[k] = (sp ? -mval : mval);
+	}
+}
+
+// ============================================================================
 // SHARED NON-CONVERGENCE DETECTOR (feat/turnaround-eff, fact-documents/
 // turnaround-eff.md §2). ONE implementation; #3 (env MERCURY_SYND_EARLYTERM,
 // mode 1) and #1(c) (cl_ldpc::early_term_speculative, mode 2) both call it.
@@ -305,6 +439,16 @@ int decode_SPA(
 		// processed (so the in-row APP write-back addresses R[v][slot] directly).
 		int     fb_vslot[CW_SCRATCH];          // V_pos[iindex][Cindex] per valid edge
 
+		// LEVER E scratch: raw var->check extrinsic q[] (min-sum operates on |q|,
+		// not tanh(0.5*q)) and the per-edge min-sum check->var output rout[].
+		double  fb_q   [CW_SCRATCH];           // raw Q per valid edge (min-sum input)
+		double  fb_rout[CW_SCRATCH];           // min-sum check->var output per edge
+
+		// LEVER E gates (read once via static-cached helpers; cheap to hoist here).
+		const bool   minsum    = ldpc_minsum_enabled();
+		const int    ms_variant= minsum ? ldpc_minsum_variant() : MS_NMS;
+		const double ms_alpha  = minsum ? ldpc_minsum_alpha()   : 0.8;
+
 		const bool layered = ldpc_layered_enabled();
 		if(layered)
 		{
@@ -329,10 +473,11 @@ int decode_SPA(
 			// --- One sweep over the P check rows (the layers) -------------
 			for( iindex=0;iindex<P;iindex++)
 			{
-				// Gather this row's valid edges: tanh(0.5*Q) where the var->check
-				// extrinsic Q = L[v] - R[v][slot] uses the LATEST L (already
-				// refreshed by the earlier rows of THIS iteration = the layered
-				// win). Record each edge's V-slot so the write-back is O(1).
+				// Gather this row's valid edges: the var->check extrinsic
+				// Q = L[v] - R[v][slot] uses the LATEST L (already refreshed by the
+				// earlier rows of THIS iteration = the layered win). For the SPA
+				// kernels store tanh(0.5*Q); for min-sum (LEVER E) store the RAW Q.
+				// Record each edge's V-slot so the write-back is O(1).
 				int nv=0;
 				for( Cindex=0;Cindex<CWidth;Cindex++)
 				{
@@ -341,7 +486,29 @@ int decode_SPA(
 					{
 						int vi=V_pos[iindex*CWidthMax+Cindex];
 						double q = L[vj] - *(R+vj*VWidthMax+vi);   // extrinsic Q
-						fb_t[nv]    = tanh(0.5*q);
+						if(minsum)
+						{
+							// SCMS (Savin ISIT 2008): erase this var->check message
+							// (send 0 to the check node) when its SIGN flipped vs the
+							// previous iteration => it is unreliable. The prior RAW
+							// message is stashed per-edge in the otherwise-unused Q[]
+							// workspace (the layered path never reads Q after its init
+							// at :401-417, where Q == LLRi, so the first iteration
+							// compares against LLRi — a genuine reversal). We track the
+							// raw computed sign (not the erased 0) so a one-shot flip
+							// does not pin the edge erased forever.
+							if(ms_variant == MS_SCMS)
+							{
+								double qprev = *(Q+vj*VWidthMax+vi);
+								*(Q+vj*VWidthMax+vi) = q;                // remember raw
+								if((qprev < 0.0) != (q < 0.0)) q = 0.0; // erase (send 0)
+							}
+							fb_q[nv] = q;
+						}
+						else
+						{
+							fb_t[nv] = tanh(0.5*q);
+						}
 						fb_slot[nv] = vj;                          // var-node index
 						fb_vslot[nv]= vi;                          // its V-slot
 						nv++;
@@ -349,7 +516,21 @@ int decode_SPA(
 				}
 				if(nv==0) continue;
 
-				if(!fwdback)
+				if(minsum)
+				{
+					// LEVER E: min-sum check node (NMS/OMS; SCMS uses the NMS
+					// kernel after the var-node erasure above). O(dc), no libm.
+					ms_check_row(fb_q, nv, ms_alpha, ms_variant, fb_rout);
+					for(int k=0;k<nv;k++)
+					{
+						double Rnew = fb_rout[k];
+						int vj=fb_slot[k], vi=fb_vslot[k];
+						double* Rcell = R+vj*VWidthMax+vi;
+						L[vj] += Rnew - *Rcell;          // incremental APP update
+						*Rcell = Rnew;
+					}
+				}
+				else if(!fwdback)
 				{
 					// O(dc^2) leave-one-out product (composes with A: same kernel
 					// as the flooding default path, just fed layered-fresh Q).
@@ -428,7 +609,47 @@ int decode_SPA(
 			if(abort_flag && abort_flag->load(std::memory_order_relaxed))
 				return -iteration;
 
-			if(!fwdback)
+			if(minsum)
+			{
+			// --- LEVER E: MIN-SUM check node (FLOODING schedule) ---------------
+			// Replaces the SPA tanh/atanh leave-one-out product with the
+			// magnitude-min + sign-product, O(dc), no libm. Reads the SAME
+			// materialized var->check Q[] the SPA path reads; writes the SAME
+			// R[j*VWidthMax+V_pos] cells. NMS (default) scales the min by alpha;
+			// OMS subtracts alpha as an offset. SCMS (a VAR-node modification
+			// needing the prior-iteration message) requires the LAYERED schedule
+			// (which owns a free per-edge message store in Q[]); under FLOODING,
+			// SCMS degrades to NMS — the check node is identical, only the var-node
+			// erasure is unavailable here. Documented as the LEVER E composition
+			// constraint (decode-marathon-E.md §2).
+			for ( iindex=0;iindex<P;iindex++)
+			{
+				int nv=0;
+				for ( Cindex=0;Cindex<CWidth;Cindex++)
+				{
+					int vj=*(C+iindex*CWidthMax+Cindex);
+					if(vj!=-1)
+					{
+						int vi=V_pos[iindex*CWidthMax+Cindex];
+						fb_q[nv]    = (double)*(Q+vj*VWidthMax+vi);  // raw Q
+						fb_slot[nv] = Cindex;                        // C-slot
+						fb_vslot[nv]= vi;                            // V-slot
+						nv++;
+					}
+				}
+				if(nv==0) continue;
+				// SCMS-without-layered => NMS (check node identical).
+				int eff_variant = (ms_variant==MS_SCMS) ? MS_NMS : ms_variant;
+				ms_check_row(fb_q, nv, ms_alpha, eff_variant, fb_rout);
+				for(int k=0;k<nv;k++)
+				{
+					int Cidx=fb_slot[k];
+					j=*(C+iindex*CWidthMax+Cidx);
+					*(R+j*VWidthMax+fb_vslot[k])=fb_rout[k];
+				}
+			}
+			}
+			else if(!fwdback)
 			{
 			// --- ORIGINAL O(dc^2) check-node update (default, byte-identical) ---
 			for ( iindex=0;iindex<P;iindex++)
