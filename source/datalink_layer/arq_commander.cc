@@ -11129,7 +11129,14 @@ int cl_arq_controller::test_climb_engine()
 		auto rephase_adder = [&](bool rephase_on, int cfg, int batch)->int {
 			int adder = 0;
 #ifndef TURNAROUND_ACCRUAL_FAILBEFORE
+			// CFG15-ONLY SCOPE — mirrors the production gate (arq_common.cc CMD branch).
+			// A1 is a HW-proven WIN on CFG15 only (PHASE1_VERDICT.md); CFG16/above
+			// degenerate to adder==0 (held-CFG16 stall is acquisition-dominated, not a
+			// reverse-ACK miss, so re-phasing its window just adds idle latency).
 			if(rephase_on
+#ifndef CFG15_SCOPE_FAILBEFORE
+			   && cfg == CONFIG_15      // FAIL-BEFORE (-DCFG15_SCOPE_FAILBEFORE) drops this gate = the un-gated A1
+#endif
 			   && is_ofdm_config(cfg)
 			   && batch >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
 			{
@@ -11152,25 +11159,44 @@ int cl_arq_controller::test_climb_engine()
 			return (int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
 		};
 
-		// W7a — LONG CFG16 BATCH (the bench-9 held-CFG16 regime): the re-phased CMD window must COVER
-		// the late SACK arrival. The window's late-coverage (the adder, which extends the listen window
-		// past the un-accrued geometric arrival) must be >= the physical late-shift the channel
-		// imposes. THIS is the matched=0/7 root fix: pre-fix adder=0 < late-shift -> the SACK lands
-		// OUTSIDE the window (FAIL); post-fix adder absorbs the late-shift (+ guard) -> IN window (PASS).
-		// FAIL-BEFORE (-DTURNAROUND_ACCRUAL_FAILBEFORE): adder==0 -> 0 < late-shift -> FAIL.
+		// W7a/W7a2 -- CFG15-ONLY SCOPE (HW A/B PHASE1_VERDICT.md): A1 is a PROVEN WIN on CFG15 (whole-
+		// window 3.4x) but NET-NEGATIVE on held-CFG16 (ww 606 vs 907, D3 starvation 32 vs 17) -- the
+		// held-CFG16 stall is ACQUISITION-dominated, NOT a reverse-ACK miss, so re-phasing CFG16's window
+		// just adds idle latency. The gate (current_configuration == CONFIG_15) restricts the re-phase to
+		// CFG15; CFG16 (and any config above CFG15, untested) degenerates to adder==0 = the pre-A1 byte-
+		// identical window. W7a/W7a2 assert the SCOPING on a LONG held-CFG16 batch (bench-9 regime): adder
+		// == 0. FAIL-BEFORE (the un-gated A1, pre-this-fix): adder>0 on CFG16 -> W7a/W7a2 FAIL. PASS-AFTER
+		// (CFG15-gate present): adder==0 on CFG16. W7a3 covers the CFG15 proven-win path (adder>0).
 		{
 			data_batch_size = 28;            // a held-CFG16 long batch (~4.78s airtime)
 			current_configuration = CONFIG_16;
-			int adder      = rephase_adder(/*rephase_on=*/true, CONFIG_16, data_batch_size);
-			int late_shift = sack_late_shift_ms(data_batch_size);  // ~143 ms (matches the design)
-			check(adder >= late_shift,
-				"W7a long CFG16 batch (28fr): re-phased CMD window COVERS the late SACK arrival (adder >= physical late-shift) -> matched!=0/7",
-				adder, late_shift);
-			// W7a2 — and the coverage is STRICTLY positive (the window actually moved later — the
-			// mechanism fired, not a no-op). Pre-fix adder==0 -> FAIL.
-			check(adder > 0,
-				"W7a2 long CFG16 batch: the re-phase adder is STRICTLY positive (the window re-centered later, mechanism fired)",
-				adder, 1 /*want >0; reported value is the adder*/);
+			int adder_cfg16 = rephase_adder(/*rephase_on=*/true, CONFIG_16, data_batch_size);
+			check(adder_cfg16 == 0,
+				"W7a long CFG16 batch (28fr): re-phase adder == 0 (CFG15-only scope; held-CFG16 stall is acquisition-dominated, NOT a reverse-ACK miss -> no widen)",
+				adder_cfg16, 0);
+			// W7a2 -- and NOT positive. The un-gated A1 (pre-this-fix) would have widened CFG16's window
+			// here; the CFG15-gate suppresses it. Pre-this-fix (no CFG15-gate) adder>0 -> FAIL.
+			check(adder_cfg16 <= 0,
+				"W7a2 long CFG16 batch: the re-phase adder is NOT positive (CFG16 window NOT re-centered; CFG15-only scope holds)",
+				adder_cfg16, 0 /*want <=0; reported value is the adder*/);
+		}
+
+		// W7a3 -- CFG15 LONG BATCH (the PROVEN-WIN config, unchanged by the scoping): the re-phased CMD
+		// window must still COVER the late SACK arrival on CFG15. The adder must be >= the physical
+		// late-shift AND strictly positive (the mechanism still fires on its proven config). THIS is the
+		// matched=0/7 root fix on CFG15: post-fix CFG15 adder absorbs the late-shift (+ guard) -> IN
+		// window. FAIL-BEFORE (-DTURNAROUND_ACCRUAL_FAILBEFORE): adder==0 -> 0 < late-shift -> FAIL.
+		{
+			data_batch_size = 28;            // a long CFG15 batch (same airtime regime as bench-9)
+			current_configuration = CONFIG_15;
+			int adder_cfg15 = rephase_adder(/*rephase_on=*/true, CONFIG_15, data_batch_size);
+			int late_shift  = sack_late_shift_ms(data_batch_size);  // ~143 ms (matches the design)
+			check(adder_cfg15 >= late_shift,
+				"W7a3 long CFG15 batch (28fr): re-phased CMD window COVERS the late SACK arrival (adder >= physical late-shift) -> the PROVEN-WIN config still re-phases",
+				adder_cfg15, late_shift);
+			check(adder_cfg15 > 0,
+				"W7a3b long CFG15 batch: the re-phase adder is STRICTLY positive (CFG15 window re-centered later, mechanism fires on its proven config)",
+				adder_cfg15, 1 /*want >0; reported value is the adder*/);
 		}
 
 		// W7b — SHORT CFG15 BATCH (the bench-8 surviving regime): the accrual stays under the variance

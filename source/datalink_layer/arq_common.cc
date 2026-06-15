@@ -1359,9 +1359,19 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// center; this re-centers by exactly the batch-proportional accrual, paid only where it
 			// bites. FAIL-BEFORE (-DTURNAROUND_ACCRUAL_FAILBEFORE): drop the adder -> the long-CFG16
 			// window stays mis-centered -> Part W7a fails (window center < SACK arrival).
+			// CFG15-ONLY SCOPE (HW A/B PHASE1_VERDICT.md): A1 is a PROVEN WIN on CFG15
+			// (whole-window 3.4x) but NET-NEGATIVE on held-CFG16 (ww 606 vs 907, D3
+			// starvation 32 vs 17) because the held-CFG16 stall is ACQUISITION-dominated,
+			// NOT a reverse-ACK miss — so re-phasing CFG16's window just adds idle latency.
+			// Restrict the re-phase to current_configuration == CONFIG_15 (the only config
+			// the HW A/B proved a win); CFG16 and any config above CFG15 are UNTESTED here
+			// and default-safe (adder=0, the pre-A1 byte-identical window). The is_ofdm /
+			// batch-threshold conjuncts remain belt-and-suspenders (a CONFIG_15-only check
+			// already implies OFDM and a multi-frame batch on the live path).
 			int turnaround_rephase_adder = 0;
 #ifndef TURNAROUND_ACCRUAL_FAILBEFORE
 			if(turnaround_rephase_enabled_common()
+			   && current_configuration == CONFIG_15
 			   && is_ofdm_config(current_configuration)
 			   && data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
 			{

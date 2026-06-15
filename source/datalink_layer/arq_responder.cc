@@ -4767,9 +4767,11 @@ int cl_arq_controller::test_cumulative_ack()
 
 	int fails = 0;
 
-	// A held-CFG16-class long forward batch (the bench-9 regime).
+	// A long CFG15 forward batch (the PROVEN-WIN config; A1 is CFG15-only-scoped,
+	// PHASE1_VERDICT.md). Airtime regime matches the bench-9 long-batch turnaround.
 	this->data_batch_size              = 28;
-	this->message_transmission_time_ms = 171;   // ~ one CFG16 DATA frame airtime
+	this->message_transmission_time_ms = 171;   // ~ one wideband DATA frame airtime (long-batch regime)
+	this->current_configuration        = CONFIG_15;  // the CFG15-only-scoped proven-win config
 
 	// ====================================================================
 	// PART A — A1 WINDOW-vs-ARRIVAL ORACLE (sim-model-independent arithmetic).
@@ -4786,7 +4788,8 @@ int cl_arq_controller::test_cumulative_ack()
 		(int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
 	int window_adder_ms = 0;
 	if(a1_on
-	   && is_ofdm_config(CONFIG_16)
+	   && this->current_configuration == CONFIG_15   // CFG15-only scope (mirrors the production gate)
+	   && is_ofdm_config(this->current_configuration)
 	   && this->data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
 	{
 		window_adder_ms =
