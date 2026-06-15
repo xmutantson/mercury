@@ -581,9 +581,9 @@ int main(int argc, char *argv[])
     output_dev[0] = 0;
 
 #if defined(__linux__)
-	printf("\e[0;31mMercury Version %s\e[0m\n", VERSION__);
+	printf("\e[0;31mMercury Version %s (build %s)\e[0m\n", VERSION__, MERCURY_BUILD_ID);
 #elif defined(_WIN32)
-	printf("Mercury Version %s\n", VERSION__);
+	printf("Mercury Version %s (build %s)\n", VERSION__, MERCURY_BUILD_ID);
 #endif
 
 

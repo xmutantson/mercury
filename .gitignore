@@ -13,6 +13,9 @@ mercury
 *.gch
 *.pch
 
+# Auto-generated build-id header (written by build.sh, deterministic per commit)
+include/common/build_id.h
+
 # Compiled Dynamic libraries
 *.so
 *.dylib
