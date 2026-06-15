@@ -726,6 +726,12 @@ int main(int argc, char *argv[])
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
                                         // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
+    bool test_data_ack_multiwindow_cli = false; // --test-data-ack-multiwindow: Track A — multi-window
+                                        // DATA-ACK/SACK correlator. Synthesizes a real ACK+SACK burst at an
+                                        // OLDER ring phase with a silent newest tail: fail-before (newest-tail
+                                        // decode MISSES), pass-after (mw_find_ack_sack_phase recovers it with
+                                        // CRC12 pass), no-false-accept on pure silence. One-shot, exits rc.
+                                        // See fact-documents/data-flow-data-ack-sack-correlator.md §7.
     bool test_inorder_demote_cli = false; // --test-inorder-demote: D3.1 — UNIFIED in-order delivery
                                         // across EVERY demote case (BREAK + the 4 SET_CONFIG-only demotes +
                                         // PREV-BUMP strand). fail-before via MERCURY_GAP_ABORT_DEFEAT=1
@@ -1383,6 +1389,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
             // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
             test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-data-ack-multiwindow") == 0)
+        {
+            // Track A — multi-window DATA-ACK/SACK correlator regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_data_ack_multiwindow
+            // + fact-documents/data-flow-data-ack-sack-correlator.md §7.
+            test_data_ack_multiwindow_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2792,6 +2808,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_gap_abort_on_readopt();
             printf("[FLAG] Gap-abort test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_data_ack_multiwindow_cli) {
+            // Track A — multi-window DATA-ACK/SACK correlator (one-shot, exit rc).
+            printf("[FLAG] --test-data-ack-multiwindow: invoking multi-window "
+                   "DATA-ACK/SACK correlator regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_data_ack_multiwindow();
+            printf("[FLAG] Data-ACK-multiwindow test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
