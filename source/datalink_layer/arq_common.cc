@@ -82,6 +82,26 @@ static inline bool d5_loud_abort_enabled_common()
 	return cached != 0;
 }
 
+// TURNAROUND BATCH-AIRTIME RE-PHASE gate (bench-9; common_defines.h
+// TURNAROUND_ACCRUAL_MS_PER_S; TURNAROUND_FIX_DESIGN.md §5.1). DEFAULT-OFF: with
+// MERCURY_TURNAROUND_REPHASE unset the CMD receive-window arithmetic is BYTE-IDENTICAL to
+// monitor tip 8bf97d9 (the held lever was authored against 627c370, an ancestor of this
+// monitor — the CMD reverse-ACK window arithmetic is unchanged between the two). Set
+// MERCURY_TURNAROUND_REPHASE=1 to enable the batch-airtime-keyed re-phase that re-centers
+// the CMD reverse-ACK window LATER on long OFDM batches so the systematically-late SACK
+// lands back in window (the bench-9 matched=0/7 root fix). The constant (30 ms/s) is locked
+// to the relay sim's accrual rate (8606389) so HW and the calibrated sim share ONE number.
+static inline bool turnaround_rephase_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_TURNAROUND_REPHASE");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -1319,6 +1339,38 @@ void cl_arq_controller::calculate_receiving_timeout()
 				;
 			if(d2_geometry_fires)
 				timeout += ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS;
+			// TURNAROUND BATCH-AIRTIME RE-PHASE (bench-9; common_defines.h
+			// TURNAROUND_ACCRUAL_MS_PER_S; TURNAROUND_FIX_DESIGN.md §5.1). The CMD window above is
+			// built from PER-FRAME terms (frame_drain = 2*message_transmission_time_ms) + fixed
+			// margins — it has NO term proportional to forward batch airtime, yet the reverse SACK
+			// arrives systematically LATE in proportion to that airtime (the half-duplex channel is
+			// held longer on a long batch, so keyer/AGC/capture-flush/scheduling latency + ±8.16ppm
+			// slip accumulate WITHIN the batch). On a held-CFG16 ~28-frame batch (~4.78s) the SACK
+			// is ~143ms late > the ~90ms window half-width -> matched=0/7 -> 81% stall (bench-9).
+			// Re-CENTER the window LATER by the accrued amount (+ a small variance guard) so the
+			// SACK lands back in the middle. The accrual mirrors the relay sim EXACTLY:
+			// late_offset_ms = TURNAROUND_ACCRUAL_MS_PER_S * (batch_airtime_ms/1000) (8606389,
+			// TurnaroundDrift.accrual_ms_per_s default 30.0) so HW and the calibrated sim share ONE
+			// number. GATED: only on OFDM multi-frame batches (is_ofdm_config && data_batch_size >=
+			// BATCH_MAY_BE_PARTIAL_THRESHOLD) — CFG15-short / robust / NB / single-frame degenerate
+			// to ~0 accrual (short batch airtime), preserving the W2a clean-cost-recovery invariant.
+			// DEFAULT-OFF (turnaround_rephase_enabled_common); UNSET => BYTE-IDENTICAL to 627c370.
+			// WHY this beats H1: H1 added a FIXED 600ms widen symmetric about the WRONG (too-early)
+			// center; this re-centers by exactly the batch-proportional accrual, paid only where it
+			// bites. FAIL-BEFORE (-DTURNAROUND_ACCRUAL_FAILBEFORE): drop the adder -> the long-CFG16
+			// window stays mis-centered -> Part W7a fails (window center < SACK arrival).
+			int turnaround_rephase_adder = 0;
+#ifndef TURNAROUND_ACCRUAL_FAILBEFORE
+			if(turnaround_rephase_enabled_common()
+			   && is_ofdm_config(current_configuration)
+			   && data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+			{
+				long batch_airtime_ms = (long)data_batch_size * (long)message_transmission_time_ms;
+				int accrual_late_ms   = (int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
+				turnaround_rephase_adder = accrual_late_ms + ACCRUAL_PHASE_GUARD_MS;
+				timeout += turnaround_rephase_adder;
+			}
+#endif
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -1328,13 +1380,14 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
-			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) batch=%d sack=%d\n",
+			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) + turn_rephase=%d batch=%d sack=%d\n",
 				timeout, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
 				margin, sack_enabled ? sack_timeout_extra_ms : 0,
 				d2_geometry_fires
 					? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0,
 				(int)data_ack_retx_turnaround,
+				turnaround_rephase_adder,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			set_receiving_timeout(timeout);
