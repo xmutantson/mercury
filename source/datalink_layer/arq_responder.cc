@@ -4893,6 +4893,193 @@ int cl_arq_controller::test_inorder_demote()
 }
 
 // ============================================================================
+// D5 INTERIM LOUD-ABORT — LOST-EOB bumped-batch truncation (in-process
+// synthetic-fire, test-only). CLI: --test-d5-lost-eob.
+// ============================================================================
+//
+// PREV_BUMP_VERDICT.md §2: when the EOB (tail) frame of a bumped batch is LOST,
+// last_received_end_of_batch_seq reflects a LOWER index, so
+// bump_bsi_and_transfer_prev()'s inference sets prev_expected SHORTER than the
+// TX's true data_batch_size. The SET-gate over [0, expected_count) is satisfied,
+// so the genuinely-missing tail frame in [expected_count, data_batch_size) is
+// SILENTLY DROPPED (the >26KB md5 divergence: a ~155-byte one-frame skip per
+// truncated batch). This test drives the REAL bump_bsi_and_transfer_prev() with
+// that exact LOST-EOB shape and asserts:
+//   ARM1 fail-before (MERCURY_D5_LOUD_ABORT unset, the production default): the
+//        bump SEALS a short prev (expected_count=29 < 30, prev active, link NOT
+//        DROPPED) — the silent truncation (frame 29 excluded). This is the bug.
+//   ARM2 pass-after (MERCURY_D5_LOUD_ABORT=1): the bump detects the FREE tail in
+//        [29,30) and raises [RSP-V2-GAP-ABORT] -> link DROPPED, NO short prev
+//        armed (active==false), bsi family cleared. Loud, never silent.
+//   ARM3 no-false-positive (BOTH modes): a COMPLETE batch (no FREE tail at/after
+//        the inferred EOB) must NOT abort.
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_d5_lost_eob_abort()
+{
+	bool loud = false;
+	{ const char* e = std::getenv("MERCURY_D5_LOUD_ABORT");
+	  if(e && *e && atoi(e)!=0) loud = true; }
+	printf("[TEST-D5-LOST-EOB] start (MERCURY_D5_LOUD_ABORT=%d)\n", loud ? 1 : 0);
+	fflush(stdout);
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-D5-LOST-EOB] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled = true;
+	this->sack_enabled    = true;
+
+	int fails = 0;
+	const int DBS = 30;        // a held-CFG16 full batch (the TX put 30 frames here)
+	const int FRAME_BYTES = 16;
+
+	// Reset all messages_rx + prev slots to FREE (a clean batch window). Helper to
+	// stamp a RECEIVED data frame into messages_rx[i].
+	auto reset_rx = [&]() {
+		for(int i=0; i<this->nMessages; i++)
+		{
+			messages_rx[i].status       = FREE;
+			messages_rx[i].length       = 0;
+			messages_rx[i].batch_seq_id = -1;
+			messages_rx_prev[i].status  = FREE;
+			messages_rx_prev[i].length  = 0;
+		}
+	};
+	auto mark_received = [&](int i) {
+		messages_rx[i].status       = RECEIVED;
+		messages_rx[i].type         = DATA_LONG;
+		messages_rx[i].length       = FRAME_BYTES;
+		messages_rx[i].batch_seq_id = 12;
+		for(int j=0; j<FRAME_BYTES; j++)
+			messages_rx[i].data[j] = (char)(unsigned char)(i*FRAME_BYTES + j);
+	};
+
+	// Common pre-bump session state: a single in-flight batch (no stale prev), the
+	// adopt-time bsi already set so the bump's guard (sack_v2 && cur>=0) passes.
+	auto arm_session = [&]() {
+		this->data_batch_size                   = DBS;
+		this->rsp_current_expected_batch_seq_id = 12;
+		this->rsp_prev_batch_seq_id             = -1;
+		this->rsp_prev_batch_active             = false;
+		this->rsp_prev_batch_received_count     = 0;
+		this->rsp_prev_batch_expected_count     = 0;
+		this->rsp_last_delivered_batch_seq_id   = 11;
+		this->link_status                       = CONNECTED;
+	};
+
+	// === ARM1/ARM2 — LOST-EOB batch (TX sent 30, tail frame 29 lost). ===
+	// Frames [0,29) RECEIVED; frame 29 FREE. last_received_end_of_batch_seq=28 so
+	// the production inference yields prev_expected = min(30, 28+1) = 29 < 30 — the
+	// exact `expected_prev=29 statuses{ACK=29 FREE=1}` shape from the verdict trace.
+	{
+		reset_rx();
+		arm_session();
+		for(int i=0; i<29; i++) mark_received(i);   // [0,29) received
+		// frame 29 stays FREE (the lost EOB tail)
+		this->last_received_end_of_batch_seq = 28;  // stale/aliased lower EOB
+
+		// Drive the REAL producer.
+		bump_bsi_and_transfer_prev();
+
+		if(!loud)
+		{
+			// FAIL-BEFORE oracle: the bump sealed a SHORT prev and DID NOT abort —
+			// the silent truncation. expected_count==29 (<30), prev active, link
+			// CONNECTED, bsi family advanced (cur 12->13). Frame 29 is excluded.
+			bool short_seal   = (this->rsp_prev_batch_expected_count == 29);
+			bool prev_active  = (this->rsp_prev_batch_active == true);
+			bool not_dropped  = (this->link_status != DROPPED);
+			bool ok = short_seal && prev_active && not_dropped;
+			if(!ok)
+			{
+				printf("[TEST-D5-LOST-EOB] FAIL ARM1(fail-before): expected SILENT short-seal "
+					"(expected_count==29 prev_active link!=DROPPED); got expected_count=%d "
+					"active=%d link_status=%d\n",
+					this->rsp_prev_batch_expected_count, this->rsp_prev_batch_active ? 1 : 0,
+					this->link_status);
+				fails++;
+			}
+			else
+				printf("[TEST-D5-LOST-EOB] ARM1(fail-before) reproduced SILENT truncation: "
+					"prev sealed expected_count=29<30 (tail frame 29 excluded), link not "
+					"DROPPED — the >26KB md5 divergence mechanism. CONFIRMED.\n");
+		}
+		else
+		{
+			// PASS-AFTER oracle: the bump detected the FREE tail and LOUD-aborted —
+			// link DROPPED, NO short prev armed (teardown cleared it), bsi family
+			// reset to -1. Never silent.
+			bool dropped     = (this->link_status == DROPPED);
+			bool no_prev     = (this->rsp_prev_batch_active == false)
+			                   && (this->rsp_prev_batch_expected_count == 0);
+			bool bsi_cleared = (this->rsp_current_expected_batch_seq_id == -1)
+			                   && (this->rsp_prev_batch_seq_id == -1);
+			bool ok = dropped && no_prev && bsi_cleared;
+			if(!ok)
+			{
+				printf("[TEST-D5-LOST-EOB] FAIL ARM2(pass-after): expected LOUD GAP-ABORT "
+					"(link DROPPED, no short prev, bsi cleared); got link_status=%d active=%d "
+					"expected_count=%d cur=%d prev=%d\n",
+					this->link_status, this->rsp_prev_batch_active ? 1 : 0,
+					this->rsp_prev_batch_expected_count,
+					this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id);
+				fails++;
+			}
+			else
+				printf("[TEST-D5-LOST-EOB] ARM2(pass-after) PASS: LOST-EOB short-prev raised "
+					"[RSP-V2-GAP-ABORT], link DROPPED, no short prev armed, bsi cleared — "
+					"loud, never silent.\n");
+		}
+	}
+
+	// === ARM3 — no-false-positive: a COMPLETE batch must NEVER abort (both modes).
+	// All 30 frames RECEIVED, EOB at index 29. prev_expected = min(30,30) = 30, so
+	// prev_expected < data_batch_size is FALSE -> the D5 guard never even evaluates
+	// the tail. The bump seals a normal complete prev. Proves the guard is inert on
+	// the healthy path in BOTH modes.
+	{
+		reset_rx();
+		arm_session();
+		for(int i=0; i<DBS; i++) mark_received(i);   // all 30 received
+		this->last_received_end_of_batch_seq = 29;   // true EOB
+
+		bump_bsi_and_transfer_prev();
+
+		bool not_dropped = (this->link_status != DROPPED);
+		bool full_seal   = (this->rsp_prev_batch_expected_count == 30);
+		bool prev_active = (this->rsp_prev_batch_active == true);
+		bool ok = not_dropped && full_seal && prev_active;
+		if(!ok)
+		{
+			printf("[TEST-D5-LOST-EOB] FAIL ARM3(no-false-positive, loud=%d): a COMPLETE batch "
+				"was disturbed; got link_status=%d expected_count=%d active=%d\n",
+				loud ? 1 : 0, this->link_status, this->rsp_prev_batch_expected_count,
+				this->rsp_prev_batch_active ? 1 : 0);
+			fails++;
+		}
+		else
+			printf("[TEST-D5-LOST-EOB] ARM3(no-false-positive, loud=%d) PASS: complete batch "
+				"sealed normally (expected_count=30, prev active, link CONNECTED) — guard inert "
+				"on the healthy path.\n", loud ? 1 : 0);
+	}
+
+	bool pass = (fails == 0);
+	printf("[TEST-D5-LOST-EOB] %s: fails=%d (loud=%d)\n",
+		pass ? "PASS" : "FAIL", fails, loud ? 1 : 0);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
 // R039 — OFDM SACK_RSP out-of-window reject (in-process synthetic-fire, test-only)
 // ============================================================================
 //

@@ -1754,6 +1754,31 @@ public:
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
   int test_inorder_demote();
 
+  // D5 INTERIM LOUD-ABORT regression (Phase 0.2; CLI --test-d5-lost-eob).
+  // In-process synthetic-fire (no IONOS/RF). Drives the REAL
+  // bump_bsi_and_transfer_prev() with a LOST-EOB batch: data_batch_size=30,
+  // frames [0,29) RECEIVED, the EOB tail frame 29 FREE (lost), and
+  // last_received_end_of_batch_seq=28 so the production inference sets
+  // prev_expected=29 < 30 (the exact PREV_BUMP_VERDICT §2 `expected_prev=29
+  // statuses{ACK=29 FREE=1}` shape). Arms:
+  //   ARM1 fail-before (MERCURY_D5_LOUD_ABORT unset): the bump SEALS a short
+  //        prev (rsp_prev_batch_expected_count==29 < 30, active, link NOT
+  //        DROPPED) -> the genuinely-missing tail frame 29 is silently excluded
+  //        (the silent truncation the >26KB md5 divergence is made of).
+  //   ARM2 pass-after (MERCURY_D5_LOUD_ABORT=1): the bump detects the FREE tail
+  //        in [29,30) and raises [RSP-V2-GAP-ABORT] -> link DROPPED, NO short
+  //        prev armed (active==false), bsi family cleared. Loud, never silent.
+  //   ARM3 no-false-positive (both modes): a COMPLETE legitimately-short batch
+  //        (EOB received at index 19, frames [0,20) all RECEIVED, tail [20,30)
+  //        FREE because TX never sent them) reaches the bump only artificially
+  //        here; assert the loud-abort does NOT fire (the FREE tail past a
+  //        RECEIVED EOB with received==expected is benign) — guards against
+  //        aborting a legitimate adaptive-short batch.
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  // See fact-documents/data-flow-messages_rx_prev.md §4 INV-D5 +
+  // bigblock_p3_hw/_prevbump/PREV_BUMP_VERDICT.md §2/§4.
+  int test_d5_lost_eob_abort();
+
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
   //

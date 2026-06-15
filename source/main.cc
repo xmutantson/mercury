@@ -732,6 +732,12 @@ int main(int argc, char *argv[])
                                         // (silent concat on the SET_CONFIG cases), pass-after aborts loudly
                                         // OR delivers contiguous. One-shot, exits rc.
                                         // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+    bool test_d5_lost_eob_cli = false;  // --test-d5-lost-eob: D5 INTERIM LOUD-ABORT. Drives the REAL
+                                        // bump_bsi_and_transfer_prev() with a LOST-EOB batch (prev_expected
+                                        // inferred short + FREE tail). fail-before (MERCURY_D5_LOUD_ABORT
+                                        // unset) = silent short-seal; pass-after (=1) = loud [RSP-V2-GAP-ABORT].
+                                        // One-shot, exits rc. See PREV_BUMP_VERDICT.md §2/§4 +
+                                        // fact-documents/data-flow-messages_rx_prev.md §4.
     bool test_spec_sack_cli = false;    // --test-spec-sack: LEVER #2 — speculative/prompt SACK. Frame-k still-decoding
                                         // at the window-fraction deadline -> in-window SACK bit_k=0 -> CMD retx ->
                                         // byte-faithful re-receive -> single in-order delivery, no silent loss.
@@ -1406,6 +1412,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_inorder_demote
             // + bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
             test_inorder_demote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-d5-lost-eob") == 0)
+        {
+            // D5 INTERIM LOUD-ABORT — LOST-EOB bumped-batch truncation regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_d5_lost_eob_abort
+            // + bigblock_p3_hw/_prevbump/PREV_BUMP_VERDICT.md §2/§4.
+            test_d5_lost_eob_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2786,6 +2802,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inorder_demote();
             printf("[FLAG] In-order-demote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_d5_lost_eob_cli) {
+            // D5 INTERIM LOUD-ABORT — LOST-EOB bumped-batch truncation (one-shot, exit rc).
+            printf("[FLAG] --test-d5-lost-eob: invoking D5 interim loud-abort regression "
+                   "(LOST-EOB short-prev -> silent-seal fail-before / loud GAP-ABORT pass-after)\n");
+            fflush(stdout);
+            int rc = ARQ.test_d5_lost_eob_abort();
+            printf("[FLAG] D5-lost-eob test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

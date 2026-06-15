@@ -62,6 +62,26 @@ static inline bool sack_rx_trace_enabled_common()
 	} \
 } while(0)
 
+// D5 INTERIM LOUD-ABORT gate (Phase 0.2; bigblock_p3_hw/_prevbump/PREV_BUMP_VERDICT.md
+// §2/§4 dir-2). DEFAULT-OFF: with MERCURY_D5_LOUD_ABORT unset, bump_bsi_and_transfer_prev()
+// is BYTE-IDENTICAL to monitor tip 8bf97d9 (the suspect short-prev is sealed exactly as
+// before). Set MERCURY_D5_LOUD_ABORT=1 to convert the SILENT EOB-truncation tail-drop
+// (the >26KB md5 divergence: a one-frame ~155-byte silent skip per truncated batch) into a
+// LOUD [RSP-V2-GAP-ABORT] teardown (correct-prefix + refuse, integrity-sound). This is the
+// INTERIM safety; the byte-faithful root cure is the TX-authoritative wire-carried per-batch
+// frame count (PREV_BUMP_VERDICT §4 dir-1 = A4, architectural, Phase 3). See
+// fact-documents/data-flow-messages_rx_prev.md §4 (D5 invariant).
+static inline bool d5_loud_abort_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_D5_LOUD_ABORT");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -6490,6 +6510,64 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	{
 		if(messages_rx_prev[i].status != FREE)
 			messages_rx_prev[i].status = FREE;
+	}
+
+	// D5 INTERIM LOUD-ABORT (Phase 0.2; PREV_BUMP_VERDICT.md §2/§4 dir-2;
+	// fact-documents/data-flow-messages_rx_prev.md §4 INV-D5). DEFAULT-OFF
+	// (d5_loud_abort_enabled_common; MERCURY_D5_LOUD_ABORT). ROOT DEFECT: when the
+	// EOB (tail) frame of the bumped batch is LOST, last_received_end_of_batch_seq
+	// reflects a LOWER index, so prev_expected is inferred SHORTER than the TX's
+	// true frame count (data_batch_size). The SET-gate prev_batch_is_frame_complete()
+	// checks only [0, expected_count) — which IS complete — so it PASSES and the
+	// genuinely-missing tail frame(s) in [expected_count, data_batch_size) are SILENTLY
+	// DROPPED (the byte-attributed >26KB md5 divergence: a one-frame ~155-byte skip per
+	// truncated batch — PREV_BUMP_VERDICT §2 trace `expected_prev=29 statuses{ACK=29
+	// FREE=1}`, the FREE slot is exactly the tail index). The gate cannot catch it
+	// because expected_count ITSELF is the corrupted value (§3).
+	//
+	// WHY THIS IS SAFE (no false-positive on a legitimate adaptive-short batch): the
+	// bump is only reached on the PARTIAL-SACK path (rx_received < expected,
+	// arq_responder.cc:1801) — a batch with a genuine hole. A LEGITIMATELY short batch
+	// whose received EOB sets expected = EOB+1 has rx_received == expected (all frames
+	// up to the received EOB present) -> it ACK-GATE-PASSes COMPLETE and NEVER reaches
+	// this bump. So at the bump, a FREE slot at/after the inferred EOB
+	// (i in [prev_expected, data_batch_size)) is a frame the inference declared "not in
+	// the batch" that the TX may genuinely have sent and lost. The integrity-conservative
+	// action (PREV_BUMP §4 dir-2: "loud-abort unless the shortness is PROVEN legitimate")
+	// is to REFUSE rather than seal-and-silently-drop. The full byte-faithful cure is the
+	// wire-carried TX count (dir-1 = A4, Phase 3).
+	if(d5_loud_abort_enabled_common() && prev_expected < this->data_batch_size)
+	{
+		bool free_tail = false;
+		int  free_tail_idx = -1;
+		for(int i = prev_expected; i < this->data_batch_size && i < this->nMessages; i++)
+		{
+			if(messages_rx_prev[i].status == FREE)
+			{
+				free_tail = true;
+				free_tail_idx = i;
+				break;
+			}
+		}
+		if(free_tail)
+		{
+			char reason[160];
+			snprintf(reason, sizeof(reason),
+				"PREV bump EOB-short truncation: prev_expected=%d < data_batch_size=%d "
+				"with FREE tail slot %d in [%d,%d) (suspect lost-EOB; refusing silent tail-drop)",
+				prev_expected, this->data_batch_size, free_tail_idx,
+				prev_expected, this->data_batch_size);
+			// rsp_gap_abort_teardown() emits [RSP-V2-GAP-ABORT], sets link DROPPED,
+			// clears the bsi family + prev buffer + carve-arm, and resets the session
+			// (the IDENTICAL refuse action the D3.1 delivery-time gate uses). Correct
+			// prefix already delivered; the truncated batch is refused, not silently
+			// concatenated short. Return WITHOUT arming the short prev (the source
+			// messages_rx[] slots were already freed by the transfer loop above; the
+			// teardown frees messages_rx_prev[] and resets all counters, so no stale
+			// state survives).
+			rsp_gap_abort_teardown(reason);
+			return;
+		}
 	}
 
 	rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;

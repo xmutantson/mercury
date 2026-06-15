@@ -52,11 +52,22 @@ Sets:
 - `rsp_prev_batch_expected_count = prev_expected` (computed as EOB+1 or
   `data_batch_size`, then clamped to `[1, nMessages]` at line 4072)
 
-**Note on the clamp at 4072**: `prev_expected` can be up to `nMessages`
-(255) in theory, but in practice it's always `≤ data_batch_size` because
-`last_received_end_of_batch_seq` is set from a frame ID that was
-validated to be `< data_batch_size` by `add_message_rx_data:54`. So
+**Note on the clamp** (line numbers now `arq_common.cc:6447-6454` on
+monitor `8bf97d9`; the `4085-4103` / `4072` refs above predate the §6g
+hoist): `prev_expected` can be up to `nMessages` (255) in theory, but in
+practice it's always `≤ data_batch_size` because `last_received_end_of_batch_seq`
+is set from a frame ID that was validated to be `< data_batch_size`. So
 `expected_count` is **effectively** capped at `data_batch_size`.
+
+> ~~`prev_expected` is always the TRUE batch length.~~ **CORRECTED
+> 2026-06-15 (D5):** `prev_expected` can be inferred STRICTLY SHORTER
+> than the TX's true frame count when the EOB (tail) frame of the bumped
+> batch is LOST. Then `last_received_end_of_batch_seq` reflects a LOWER
+> index (a stale/aliased earlier EOB), so `prev_expected < data_batch_size`
+> while a genuinely-sent-but-lost tail frame occupies a FREE slot in
+> `[prev_expected, data_batch_size)`. The SET-gate (§2.1) checks only
+> `[0, expected_count)`, passes, and the tail frame is silently dropped.
+> This is **D5** — see §4.5 (INV-D5) and `PREV_BUMP_VERDICT.md` §2.
 
 ### 1.3 Live retransmit storage path (Step 8a — match-prev branch)
 
@@ -223,6 +234,55 @@ ROBUST_0 WB — the bitmap that drives the prev/partial path exists. On **NB** r
 at batch=1 (conjunct (b)) and the prev-path stays dead there — unchanged.
 See `data-flow-robust-tier-arq-batch.md` §3.7 / L1.
 
+### 4.5 INV-D5 — the EOB-short-inference truncation (the lost-EOB tail-drop)
+
+**Defect (D5, `PREV_BUMP_VERDICT.md` §2; byte-attributed):** the producer
+`bump_bsi_and_transfer_prev()` (§1.2) infers
+`prev_expected = min(data_batch_size, last_received_end_of_batch_seq+1)`.
+When the EOB (tail) frame of the bumped batch is **LOST**,
+`last_received_end_of_batch_seq` reflects a LOWER index, so `prev_expected`
+is set SHORTER than the TX's true `data_batch_size`. The §2.1 SET-gate
+(`rsp_prev_batch_received_count >= rsp_prev_batch_expected_count`,
+`arq_responder.cc:916`/`:3653`) checks only `[0, expected_count)` — which
+IS complete — so it PASSES, and the genuinely-missing tail frame in
+`[expected_count, data_batch_size)` (a FREE slot) is **silently dropped**.
+Trace: `cum_before=31113 … expected_prev=29 statuses{ACK=29 FREE=1}` — the
+FREE slot is exactly index 29 (the tail); TX sent 30. A one-frame ~155-byte
+silent skip per truncated batch, accumulating across the climb (the >26KB
+md5 divergence). The gate cannot catch it: `expected_count` ITSELF is the
+corrupted value (consumer §2.1 trusts a producer invariant the lost-EOB
+path violates — the canonical CLAUDE.md §5 failure mode).
+
+**Why no false-positive on a legitimate adaptive-short batch:** the bump is
+only reached on the PARTIAL-SACK path (`rx_received < expected`,
+`arq_responder.cc:1801`). A legitimately-short batch whose **received** EOB
+sets `expected = EOB+1` has `rx_received == expected` (all frames up to the
+received EOB present) → it ACK-GATE-PASSes COMPLETE and **never reaches the
+bump**. So at the bump, a FREE slot at/after the inferred EOB is a frame the
+inference declared "not in the batch" that the TX may genuinely have sent
+and lost. (This corrects `data-flow-prev-bump.md` §5.6, which ruled "no D5"
+by considering only a RECEIVED tail — the LOST-EOB tail IS the defect.)
+
+**INTERIM PRODUCER-SIDE GUARD (Phase 0.2, branch `feat/delivery-layer-phase01`,
+`arq_common.cc` `bump_bsi_and_transfer_prev()`):** when
+`prev_expected < data_batch_size` AND a FREE slot exists in
+`[prev_expected, data_batch_size)`, raise the existing `rsp_gap_abort_teardown()`
+([RSP-V2-GAP-ABORT], DROPPED, bsi family + prev buffer cleared) INSTEAD of
+arming the short prev. Converts the silent-wrong-bytes skip into a loud
+correct-prefix + teardown (integrity-sound). **DEFAULT-OFF** (env
+`MERCURY_D5_LOUD_ABORT`, `d5_loud_abort_enabled_common()`); unset → BYTE-IDENTICAL
+to monitor `8bf97d9`. This is `PREV_BUMP_VERDICT.md` §4 **direction 2** (the
+conservative safety net): more aborts, never a silent drop. The byte-faithful
+**root cure** is the TX-authoritative wire-carried per-batch frame count
+(direction 1 = A4, architectural, Phase 3) — set `expected_count` from the
+wire, not the inference; a lost EOB then leaves `received < expected` so the
+SET-gate HOLDS and the tail is recovered via retransmit.
+
+**Producer change vs consumers:** the fix constrains the PRODUCER (refuse the
+ambiguous short-inference) and touches NO consumer; the §2.1 SET-gate is
+unchanged. Regression: `--test-d5-lost-eob` (fail-before = silent short-seal;
+pass-after = loud GAP-ABORT; ARM3 no-false-positive on a complete batch).
+
 ---
 
 ## §5 The R7 fix — what changed and why
@@ -321,6 +381,13 @@ zone could become stranded.
   `arq_responder.cc:2700+` (function `test_partial_bsi_advance`) —
   exercises §1.5 / §2.4 synthetic-fire path. Does NOT inject bit-errored
   IDs.
+- `--test-d5-lost-eob` (`test_d5_lost_eob_abort`, `arq_responder.cc`) —
+  the §4.5 INV-D5 regression. Drives the REAL `bump_bsi_and_transfer_prev()`
+  with a LOST-EOB batch (`prev_expected`=29 inferred, FREE tail slot 29 in
+  a 30-frame batch). ARM1 fail-before (`MERCURY_D5_LOUD_ABORT` unset) =
+  silent short-seal; ARM2 pass-after (=1) = loud `[RSP-V2-GAP-ABORT]`,
+  DROPPED, no short prev armed; ARM3 (both modes) = no false-positive on a
+  complete batch.
 
 ### Recommended regression test for R7 (NOT yet implemented)
 
