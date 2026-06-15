@@ -25,6 +25,20 @@
 
 #define VERSION__ "0.4.2"
 
+// MERCURY_BUILD_ID — git short-rev (+ "-dirty") of the BUILT source, baked
+// deterministically by build.sh into the generated include/common/build_id.h
+// (same source -> same id -> same md5 on every Pi). The header is .gitignored
+// and may be absent on a from-scratch compile that skipped build.sh, so guard
+// with a fallback here. VERSION__ stays a plain string literal: arq_common.cc's
+// "VERSION Mercury " VERSION__ "\r" relies on string-literal concatenation, so
+// the build-id is a SEPARATE macro, never folded into VERSION__.
+#if __has_include("common/build_id.h")
+#include "common/build_id.h"
+#endif
+#ifndef MERCURY_BUILD_ID
+#define MERCURY_BUILD_ID "unknown"
+#endif
+
 // Compile-time gate for the MFSK ACK+SACK signaling (WB-only). RSP sends
 // ACK/SACK via the MFSK pattern + 52-bit suffix [bsi:8 | bitmap:32 |
 // crc12:12] and CMD listens for it. When 0, falls back to the legacy
