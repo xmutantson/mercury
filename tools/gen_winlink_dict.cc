@@ -37,17 +37,25 @@ int main(int argc, char** argv)
     if (sz > 0 && fread(&raw[0], 1, sz, f) != (size_t)sz) { fclose(f); return 2; }
     fclose(f);
 
-    // Compress RAW with the production compressor on a FRESH stream — exactly the
-    // first batch of an empty streaming context. This is what the firmware will
-    // decompress to warm the model. (We do NOT commit; we only need the wire bytes
-    // for the FIRST/only dict batch, which is what prime_with_dict decompresses.)
-    cl_compressor c; c.init(); c.streaming_enable();
+    // Compress RAW with the production compressor on a FRESH, UN-PRIMED stream —
+    // exactly the first batch of an empty streaming context. This is what the
+    // firmware's prime_with_dict() decompresses to warm the model, and it runs on a
+    // brand-new (not-yet-primed) stream, so the canonical COMPRESSED blob MUST be
+    // produced on an un-primed stream too. set_dict_priming(false) is REQUIRED here:
+    // if priming were left on, streaming_enable() would seed this context with the
+    // PREVIOUSLY-baked dict before compressing, and the resulting blob would only
+    // round-trip against an identically-primed RX — never the firmware's fresh prime
+    // path (decode would fail and the dict would silently stay cold). (We do NOT
+    // commit; we only need the wire bytes for the FIRST/only dict batch.)
+    cl_compressor c; c.set_dict_priming(false); c.init(); c.streaming_enable();
     std::vector<char> out(raw.size() * 2 + 4096);
     int w = c.compress_block(raw.data(), (int)raw.size(), out.data(), (int)out.size());
     if (w <= 0) { fprintf(stderr, "compress_block failed (%d)\n", w); c.deinit(); return 1; }
 
-    // Self-check: a fresh RX decompresses COMPRESSED back to RAW bit-exact.
-    cl_compressor rx; rx.init(); rx.streaming_enable();
+    // Self-check: a fresh, UN-PRIMED RX decompresses COMPRESSED back to RAW
+    // bit-exact — mirroring the firmware's prime_with_dict() which decodes the blob
+    // on a brand-new (not-yet-primed) stream.
+    cl_compressor rx; rx.set_dict_priming(false); rx.init(); rx.streaming_enable();
     std::vector<char> back(raw.size() + 4096);
     int d = rx.decompress_block(out.data(), w, back.data(), (int)back.size());
     bool ok = (d == (int)raw.size() && memcmp(back.data(), raw.data(), raw.size()) == 0);

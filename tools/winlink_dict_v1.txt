@@ -73,3 +73,63 @@ From:
 Mbo:
 Subject:
 To:
+RMS Express Form
+<?xml version="1.0" encoding="UTF-8"?>
+<RMS_Express_Form>
+<form_parameters>
+<xml_file_name>RMS_Express_Form_ICS213_Initial_Viewer.xml</xml_file_name>
+<form_version>
+<display_form>
+<reply_template>
+</form_parameters>
+<variables>
+</variables>
+</RMS_Express_Form>
+1. Incident Name:
+2. To (Name/Position):
+3. From (Name/Position):
+4. Subject:
+5. Date:
+6. Time:
+7. Message:
+8. Approved by:
+Position/Title:
+Message Number:
+Precedence: Routine
+Handling: ROUTINE
+Date/Time:
+Call Sign:
+Tactical Call:
+Sender:
+Recipient:
+Group/Net Name:
+Location:
+County:
+State:
+Grid square:
+Latitude:
+Longitude:
+Speed:
+Course:
+Comment:
+Position report
+SEVERE WEATHER REPORT
+Reported By:
+Type of Event:
+Time of Event:
+WINLINK THRIVING
+This message was sent via Winlink.
+Sent via Winlink
+Telnet
+VARA HF
+VARA FM
+Pactor
+Ardop
+Packet
+Winlink Check In
+Status: Net
+Status: Check Out
+Comments:
+Band:
+Mode:
+Power:
