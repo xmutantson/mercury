@@ -32,6 +32,7 @@
 
 #include <map>
 #include <vector>  // §20: per-bin power accumulator for base-pattern combining
+#include <cstdlib> // std::getenv for the MERCURY_FFT_FLOAT gate (marathon lever H/I)
 
 namespace {
 // FFT plan cache. pocketfft's c2c() builds a new plan on every call, allocating
@@ -56,6 +57,68 @@ const pocketfft::detail::pocketfft_c<double>& get_fft_plan(size_t n)
 		                   std::forward_as_tuple(n)).first;
 	}
 	return it->second;
+}
+
+// --- Marathon lever H/I: SINGLE-PRECISION OFDM FFT (env MERCURY_FFT_FLOAT) ---
+// CONTAINED scope. The OFDM/channel-estimator chain stays std::complex<double>
+// everywhere; only the transform kernel inside fft()/ifft() runs in float when
+// the env is set. We convert complex<double> -> complex<float> at the transform
+// boundary, run a pocketfft_c<float> plan (its own size-keyed cache, parallel to
+// the double cache above), and convert back to complex<double> on the way out.
+// DEFAULT OFF => the double path is taken bit-for-bit (render md5 unchanged).
+//
+// Rationale (HONEST: the FFT is NOT the OFDM bottleneck — the LDPC decode is;
+// this is a completionist throughput lever): single-precision NEON on the Pi5
+// A76 packs 4 floats vs 2 doubles per 128-bit reg, ~2x the FFT throughput, and
+// float FFT is the HF-modem standard (VARA, codec2). Numerical impact is bounded
+// — a 256-pt FFT in float carries ~1e-6 relative error, far below the post-EQ
+// EVM / LDPC LLR scale, so decode is unaffected (verified by the marathon test).
+//
+// The env is read ONCE into a function-local static so the per-FFT hot path is a
+// single branch, never a getenv() call. Single-threaded access per the cache
+// comment above => no init race.
+bool fft_float_enabled()
+{
+	static const bool on = (std::getenv("MERCURY_FFT_FLOAT") != nullptr);
+	return on;
+}
+
+std::map<size_t, pocketfft::detail::pocketfft_c<float>>& fft_plan_cache_f()
+{
+	static std::map<size_t, pocketfft::detail::pocketfft_c<float>> cache;
+	return cache;
+}
+const pocketfft::detail::pocketfft_c<float>& get_fft_plan_f(size_t n)
+{
+	auto& cache = fft_plan_cache_f();
+	auto it = cache.find(n);
+	if (it == cache.end())
+	{
+		it = cache.emplace(std::piecewise_construct,
+		                   std::forward_as_tuple(n),
+		                   std::forward_as_tuple(n)).first;
+	}
+	return it->second;
+}
+
+// Run an n-point complex FFT in single precision: convert in -> float scratch,
+// execute the cached float plan in place, convert back to the double out buffer.
+// fct = the pocketfft exec factor (1/N forward-scaled fft, 1.0 ifft); fwd as in
+// the double path. Caller has already copied/placed nothing — we read from `in`
+// and write to `out`, matching the double-path contract.
+void run_fft_float(const std::complex<double>* in, std::complex<double>* out,
+                   size_t n, float fct, bool fwd)
+{
+	static thread_local std::vector<std::complex<float>> scratch;
+	if (scratch.size() < n) scratch.resize(n);
+	for (size_t k = 0; k < n; ++k)
+		scratch[k] = std::complex<float>((float)in[k].real(), (float)in[k].imag());
+	const auto& plan = get_fft_plan_f(n);
+	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<float>*>(scratch.data()),
+	          fct, fwd);
+	for (size_t k = 0; k < n; ++k)
+		out[k] = std::complex<double>((double)scratch[k].real(),
+		                              (double)scratch[k].imag());
 }
 } // anonymous namespace
 
@@ -385,6 +448,13 @@ void cl_ofdm::gi_remover(std::complex <double>* in, std::complex <double>* out)
 
 void cl_ofdm::fft(std::complex <double>* in, std::complex <double>* out)
 {
+	// Marathon lever H/I: single-precision transform when MERCURY_FFT_FLOAT set
+	// (contained — buffers stay complex<double>, only the kernel runs in float).
+	if (fft_float_enabled())
+	{
+		run_fft_float(in, out, (size_t)Nfft, 1.0f / (float)Nfft, true);
+		return;
+	}
 	// Single std::copy (compiler emits memcpy), then in-place FFT with the
 	// 1/Nfft scale folded into pocketfft's exec factor — removes the second
 	// pass over Nfft samples that the explicit divide loop did.
@@ -395,6 +465,11 @@ void cl_ofdm::fft(std::complex <double>* in, std::complex <double>* out)
 }
 void cl_ofdm::fft(std::complex <double>* in, std::complex <double>* out, int _Nfft)
 {
+	if (fft_float_enabled())
+	{
+		run_fft_float(in, out, (size_t)_Nfft, 1.0f / (float)_Nfft, true);
+		return;
+	}
 	std::copy(in, in + _Nfft, out);
 	const auto& plan = get_fft_plan((size_t)_Nfft);
 	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(out),
@@ -434,6 +509,11 @@ void cl_ofdm::_fft(std::complex <double> *v, int n)
 
 void cl_ofdm::ifft(std::complex <double>* in, std::complex <double>* out)
 {
+	if (fft_float_enabled())
+	{
+		run_fft_float(in, out, (size_t)Nfft, 1.0f, false);
+		return;
+	}
 	std::copy(in, in + Nfft, out);
 	const auto& plan = get_fft_plan((size_t)Nfft);
 	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(out), 1.0, false);
@@ -441,6 +521,11 @@ void cl_ofdm::ifft(std::complex <double>* in, std::complex <double>* out)
 
 void cl_ofdm::ifft(std::complex <double>* in, std::complex <double>* out,int _Nfft)
 {
+	if (fft_float_enabled())
+	{
+		run_fft_float(in, out, (size_t)_Nfft, 1.0f, false);
+		return;
+	}
 	std::copy(in, in + _Nfft, out);
 	const auto& plan = get_fft_plan((size_t)_Nfft);
 	plan.exec(reinterpret_cast<pocketfft::detail::cmplx<double>*>(out), 1.0, false);
