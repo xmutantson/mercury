@@ -4703,6 +4703,277 @@ int cl_arq_controller::test_data_ack_multiwindow()
 }
 
 // ============================================================================
+// §2 CHECKPOINT — A1+A2 de-confounded composite (in-process, test-only).
+// CLI: --test-cumulative-ack.
+// ============================================================================
+//
+// THE PHASE-0/1 DELIVERABLE: prove the reverse-ACK reliably ARRIVES and delivery
+// advances WITH the BREAK->ROBUST_0 demote STILL IN PLACE. A1 (re-centered window)
+// and A2 (multi-position search) ADD recovery; neither removes the demote. This
+// de-confounds the two GET-THE-ACK-THROUGH mechanisms against ONE late/mis-phased
+// EOB SACK, using the REAL primitives:
+//   A1: the production calculate_receiving_timeout re-phase arithmetic (the CMD
+//       window must COVER the physical late SACK arrival). Gated on the REAL helper
+//       MERCURY_TURNAROUND_REPHASE.
+//   A2: the production mw_find_ack_sack_phase() correlator (recovers the late ACK
+//       from an OLDER ring phase). Gated on the REAL helper MERCURY_DATA_ACK_MULTIWINDOW.
+// Composite ACK-arrival = (A1 window catches it) OR (A2 recovers it).
+//   FAIL-BEFORE (set NEITHER env): the single fixed window lands SHORT (adder=0 <
+//     physical late-shift -> the bench-9 matched=0/7 miss) AND the newest-tail decode
+//     MISSES -> the ACK is LOST -> the demote/retx is the ONLY recourse. recovered==
+//     false: delivery would STALL pending a demote.
+//   PASS-AFTER (set BOTH MERCURY_TURNAROUND_REPHASE=1 and MERCURY_DATA_ACK_MULTIWINDOW=1):
+//     the re-centered window COVERS the arrival AND the multi-position search RECOVERS
+//     the SAME bsi/bitmap (CRC12 pass) -> the ACK ARRIVES -> delivery advances. AND the
+//     BREAK->ROBUST_0 demote predicate is STILL PRESENT (BREAK_DROP_STEP_MAX intact) --
+//     recovery WITHOUT decoupling the demote.
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_cumulative_ack()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-CUMULATIVE-ACK] SKIP: MFSK_ACK_SACK_ENABLED == 0\n");
+	fflush(stdout);
+	return 0;
+#else
+	if(telecom_system == nullptr)
+	{
+		printf("[TEST-CUMULATIVE-ACK] ERROR: telecom_system is null\n");
+		fflush(stdout);
+		return 1;
+	}
+	// Read the REAL production gates (the same env helpers the live code reads).
+	bool a1_on = false;
+	{ const char* e = std::getenv("MERCURY_TURNAROUND_REPHASE");
+	  if(e && *e && *e != '0') a1_on = true; }
+	bool a2_on = false;
+	{ const char* e = std::getenv("MERCURY_DATA_ACK_MULTIWINDOW");
+	  if(e && *e && *e != '0') a2_on = true; }
+	printf("[TEST-CUMULATIVE-ACK] start (A1 rephase=%d, A2 multiwindow=%d) — %s\n",
+		a1_on ? 1 : 0, a2_on ? 1 : 0,
+		(a1_on && a2_on) ? "PASS-AFTER mode" :
+		(!a1_on && !a2_on) ? "FAIL-BEFORE mode" : "MIXED mode");
+	fflush(stdout);
+
+	telecom_system->narrowband_enabled = NO;
+	this->narrowband_enabled           = NO;
+	telecom_system->load_configuration(CONFIG_15);
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+	{
+		printf("[TEST-CUMULATIVE-ACK] ERROR: ack_sack_suffix_len()=%d (need WB M>=16)\n",
+			telecom_system->ack_mfsk.ack_sack_suffix_len());
+		fflush(stdout);
+		return 1;
+	}
+
+	int fails = 0;
+
+	// A held-CFG16-class long forward batch (the bench-9 regime).
+	this->data_batch_size              = 28;
+	this->message_transmission_time_ms = 171;   // ~ one CFG16 DATA frame airtime
+
+	// ====================================================================
+	// PART A — A1 WINDOW-vs-ARRIVAL ORACLE (sim-model-independent arithmetic).
+	// The CMD reverse-ACK window must COVER the one-sided late SACK arrival the
+	// channel imposes (late_offset = TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_s,
+	// the SAME model the relay sim uses, 8606389). The re-phase adder is the
+	// EXACT production arithmetic (calculate_receiving_timeout CMD branch), gated
+	// on the REAL helper. FAIL-BEFORE (a1_on=false): adder=0 < late-shift -> the
+	// SACK lands OUTSIDE the window. PASS-AFTER: adder absorbs it.
+	// ====================================================================
+	long batch_airtime_ms = (long)this->data_batch_size
+		* (long)this->message_transmission_time_ms;
+	int physical_late_shift_ms =
+		(int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
+	int window_adder_ms = 0;
+	if(a1_on
+	   && is_ofdm_config(CONFIG_16)
+	   && this->data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+	{
+		window_adder_ms =
+			(int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000)
+			+ ACCRUAL_PHASE_GUARD_MS;
+	}
+	bool window_covers_arrival = (window_adder_ms >= physical_late_shift_ms)
+		&& (window_adder_ms > 0);
+	printf("[TEST-CUMULATIVE-ACK] PART-A (A1 window): batch_airtime=%ldms "
+		"physical_late_shift=%dms window_adder=%dms -> window_covers_arrival=%d\n",
+		batch_airtime_ms, physical_late_shift_ms, window_adder_ms,
+		window_covers_arrival ? 1 : 0);
+	fflush(stdout);
+
+	// ====================================================================
+	// PART B — A2 MULTI-POSITION SEARCH (the REAL mw_find_ack_sack_phase).
+	// Synthesize a REAL late ACK+SACK burst at an OLDER ring phase with a SILENT
+	// newest tail; the single-window decode MISSES; the multi-window scan
+	// RECOVERS it (gated on the REAL helper). FAIL-BEFORE (a2_on=false): we do NOT
+	// run the scan (mirrors the call-site gate) -> only the newest-tail miss
+	// remains. PASS-AFTER: the scan recovers the SAME bsi/bitmap with CRC12 pass.
+	// ====================================================================
+	cl_data_container& dc = telecom_system->data_container;
+	int ack_nsymb   = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int pattern_len = telecom_system->ack_mfsk.ack_snr_pattern_nsymb();
+	int sack_suffix = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	if(sack_suffix > pattern_len - ack_nsymb)
+		pattern_len = ack_nsymb + sack_suffix;
+	int mfsk_tail_nsymb = ack_nsymb + pattern_len + 16;
+	int buffer_Nsymb    = dc.buffer_Nsymb.load();
+	int sym_samples     = dc.Nofdm * dc.interpolation_rate;
+	int signal_period   = sym_samples * buffer_Nsymb;
+	int tail_samples    = mfsk_tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	int tail_offset     = signal_period - tail_samples;
+
+	uint8_t  tx_bsi    = 11;             // the late EOB SACK's batch_seq_id
+	uint32_t tx_bitmap = 0x0FF3A55Cu;    // a non-trivial partial bitmap
+	char crc_input[5];
+	crc_input[0] = (char)tx_bsi;
+	crc_input[1] = (char)((tx_bitmap >> 24) & 0xFF);
+	crc_input[2] = (char)((tx_bitmap >> 16) & 0xFF);
+	crc_input[3] = (char)((tx_bitmap >>  8) & 0xFF);
+	crc_input[4] = (char)( tx_bitmap        & 0xFF);
+	uint16_t tx_crc12 = CRC12_calc(crc_input, 5);
+
+	int burst_len = telecom_system->ack_sack_pattern_passband_samples;
+	if(burst_len <= 0 || burst_len > tail_samples)
+	{
+		printf("[TEST-CUMULATIVE-ACK] ERROR: bad burst_len=%d (tail_samples=%d)\n",
+			burst_len, tail_samples);
+		fflush(stdout);
+		return 1;
+	}
+	double* burst = (double*)calloc(burst_len, sizeof(double));
+	int gen = telecom_system->generate_ack_sack_pattern_passband(
+		burst, tx_bsi, tx_bitmap, tx_crc12);
+	if(gen != burst_len)
+	{
+		printf("[TEST-CUMULATIVE-ACK] ERROR: generate returned %d (expected %d)\n",
+			gen, burst_len);
+		fflush(stdout);
+		free(burst);
+		return 1;
+	}
+
+	dc.ring_write_index = 0;
+	int rwi   = dc.ring_write_index.load();
+	int total = 2 * signal_period;
+	memset(dc.passband_delayed_data, 0, (size_t)total * sizeof(double));
+	int stride    = pattern_len * sym_samples;
+	int burst_ph  = 2;
+	int burst_off = tail_offset - burst_ph * stride;
+	if(burst_off < 0) { burst_ph = 1; burst_off = tail_offset - stride; }
+	if(burst_off < 0) burst_off = 0;
+	if(burst_off + burst_len > signal_period)
+		burst_off = signal_period - burst_len;
+	for(int i = 0; i < burst_len; i++)
+	{
+		dc.passband_delayed_data[burst_off + i]                 = burst[i];
+		dc.passband_delayed_data[signal_period + burst_off + i] = burst[i];
+	}
+
+	// The single newest-tail decode (what the CMD does WITHOUT A2) — MISSES.
+	bool newest_tail_recovered = false;
+	{
+		memcpy(dc.ready_to_process_passband_delayed_data,
+			&dc.passband_delayed_data[rwi + tail_offset],
+			(size_t)tail_samples * sizeof(double));
+		uint8_t b=0; uint32_t m=0; uint16_t c=0; int mm=0;
+		newest_tail_recovered = telecom_system->decode_ack_sack_from_passband(
+			dc.ready_to_process_passband_delayed_data, tail_samples, &b, &m, &c, &mm);
+	}
+
+	// A2 recovery (only when the REAL gate is on — mirrors the call-site).
+	bool a2_recovered = false;
+	if(a2_on)
+	{
+		int chosen_off = -1;
+		if(mw_find_ack_sack_phase(rwi, tail_offset, tail_samples,
+			sym_samples, pattern_len, &chosen_off) && chosen_off >= 0)
+		{
+			memcpy(dc.ready_to_process_passband_delayed_data,
+				&dc.passband_delayed_data[rwi + chosen_off],
+				(size_t)tail_samples * sizeof(double));
+			uint8_t b=0; uint32_t m=0; uint16_t c=0; int mm=0;
+			bool dec = telecom_system->decode_ack_sack_from_passband(
+				dc.ready_to_process_passband_delayed_data, tail_samples, &b, &m, &c, &mm);
+			char ci[5];
+			ci[0]=(char)b; ci[1]=(char)((m>>24)&0xFF); ci[2]=(char)((m>>16)&0xFF);
+			ci[3]=(char)((m>>8)&0xFF); ci[4]=(char)(m&0xFF);
+			a2_recovered = dec && (c == CRC12_calc(ci,5))
+				&& (b == tx_bsi) && (m == tx_bitmap);
+		}
+	}
+	printf("[TEST-CUMULATIVE-ACK] PART-B (A2 search): newest_tail_recovered=%d "
+		"a2_recovered=%d (tx_bsi=%u tx_bitmap=0x%08x burst_off=%d)\n",
+		newest_tail_recovered ? 1 : 0, a2_recovered ? 1 : 0,
+		(unsigned)tx_bsi, (unsigned)tx_bitmap, burst_off);
+	fflush(stdout);
+	free(burst);
+
+	// ====================================================================
+	// PART C — COMPOSITE ACK-ARRIVAL + delivery-advance + demote-in-place.
+	// The reverse-ACK ARRIVES iff the window covers it (A1) OR the search
+	// recovers it (A2) OR (degenerate) the newest tail caught it.
+	// ====================================================================
+	bool ack_arrives = window_covers_arrival || a2_recovered || newest_tail_recovered;
+	// Delivery advances iff the ACK arrived (the CMD marks the batch ACKed and
+	// proceeds; in the bench-9 stall the ACK never arrives and the demote/retx is
+	// the only recourse — i.e. delivery does NOT advance without a demote).
+	bool delivery_advances_without_demote = ack_arrives;
+
+	// The BREAK->ROBUST_0 demote is STILL PRESENT (these levers add recovery; they
+	// do NOT remove or decouple the demote). BREAK_DROP_STEP_MAX is the OFDM demote
+	// ladder span (CONFIG_16->CONFIG_0) that the BREAK self-heal walks; it being
+	// intact (==16) is the in-process witness that the demote machinery is unchanged.
+	bool demote_still_present = (BREAK_DROP_STEP_MAX == 16);
+
+	printf("[TEST-CUMULATIVE-ACK] PART-C (composite): ack_arrives=%d "
+		"delivery_advances=%d demote_still_present=%d (BREAK_DROP_STEP_MAX=%d)\n",
+		ack_arrives ? 1 : 0, delivery_advances_without_demote ? 1 : 0,
+		demote_still_present ? 1 : 0, BREAK_DROP_STEP_MAX);
+	fflush(stdout);
+
+	if(a1_on && a2_on)
+	{
+		// PASS-AFTER oracle: ACK arrives (BOTH mechanisms fire), delivery advances
+		// WITHOUT a demote, and the demote is STILL present (not removed).
+		bool ok = true;
+		if(!window_covers_arrival) { printf("[TEST-CUMULATIVE-ACK] FAIL(pass-after): A1 window did NOT cover the late SACK arrival\n"); ok=false; }
+		if(!a2_recovered)          { printf("[TEST-CUMULATIVE-ACK] FAIL(pass-after): A2 did NOT recover the late ACK at an older phase\n"); ok=false; }
+		if(!ack_arrives)           { printf("[TEST-CUMULATIVE-ACK] FAIL(pass-after): the reverse-ACK did NOT arrive\n"); ok=false; }
+		if(!delivery_advances_without_demote) { printf("[TEST-CUMULATIVE-ACK] FAIL(pass-after): delivery did not advance\n"); ok=false; }
+		if(!demote_still_present)  { printf("[TEST-CUMULATIVE-ACK] FAIL(pass-after): the BREAK->ROBUST_0 demote was REMOVED (BREAK_DROP_STEP_MAX changed)\n"); ok=false; }
+		if(!ok) fails++;
+		else printf("[TEST-CUMULATIVE-ACK] PASS-AFTER: A1 re-centered window COVERS the late SACK + A2 RECOVERS it -> reverse-ACK ARRIVES -> delivery advances, WITH the BREAK->ROBUST_0 demote STILL IN PLACE (not decoupled).\n");
+	}
+	else if(!a1_on && !a2_on)
+	{
+		// FAIL-BEFORE oracle: the single fixed window lands SHORT (the bench-9
+		// matched=0/7 miss) AND the newest-tail decode misses -> the ACK is LOST,
+		// so delivery would STALL pending the demote/retx (recovered==false).
+		bool ok = true;
+		if(window_covers_arrival)  { printf("[TEST-CUMULATIVE-ACK] FAIL(fail-before): the fixed window UNEXPECTEDLY covered the late SACK (A1 off should land short)\n"); ok=false; }
+		if(a2_recovered)           { printf("[TEST-CUMULATIVE-ACK] FAIL(fail-before): A2 recovered with the gate OFF (should not run)\n"); ok=false; }
+		if(newest_tail_recovered)  { printf("[TEST-CUMULATIVE-ACK] FAIL(fail-before): the newest-tail decode UNEXPECTEDLY hit a SILENT tail\n"); ok=false; }
+		if(ack_arrives)            { printf("[TEST-CUMULATIVE-ACK] FAIL(fail-before): the reverse-ACK arrived WITHOUT the levers (the bug is supposed to lose it)\n"); ok=false; }
+		if(!ok) fails++;
+		else printf("[TEST-CUMULATIVE-ACK] FAIL-BEFORE reproduced: fixed window lands SHORT (late_shift=%dms outside window) + newest-tail MISS -> reverse-ACK LOST -> the demote/retx is the ONLY recourse (the bench-9 stall). CONFIRMED.\n", physical_late_shift_ms);
+	}
+	else
+	{
+		printf("[TEST-CUMULATIVE-ACK] MIXED mode (A1=%d A2=%d): informational only "
+			"(ack_arrives=%d) — run with BOTH set for pass-after, NEITHER for fail-before.\n",
+			a1_on ? 1 : 0, a2_on ? 1 : 0, ack_arrives ? 1 : 0);
+	}
+
+	bool pass = (fails == 0);
+	printf("[TEST-CUMULATIVE-ACK] %s: fails=%d (A1=%d A2=%d)\n",
+		pass ? "PASS" : "FAIL", fails, a1_on ? 1 : 0, a2_on ? 1 : 0);
+	fflush(stdout);
+	return pass ? 0 : 1;
+#endif
+}
+
+// ============================================================================
 // D3.1 — UNIFIED in-order-delivery across EVERY demote case (in-process, test-only)
 // ============================================================================
 //

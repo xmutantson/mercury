@@ -744,6 +744,12 @@ int main(int argc, char *argv[])
                                         // unset) = silent short-seal; pass-after (=1) = loud [RSP-V2-GAP-ABORT].
                                         // One-shot, exits rc. See PREV_BUMP_VERDICT.md §2/§4 +
                                         // fact-documents/data-flow-messages_rx_prev.md §4.
+    bool test_cumulative_ack_cli = false; // --test-cumulative-ack: §2 CHECKPOINT — A1+A2 de-confounded
+                                        // composite. Proves the reverse-ACK ARRIVES + delivery advances
+                                        // WITH the BREAK->ROBUST_0 demote still in place. fail-before (set
+                                        // NEITHER MERCURY_TURNAROUND_REPHASE nor MERCURY_DATA_ACK_MULTIWINDOW)
+                                        // = ACK lost; pass-after (set BOTH=1) = window covers + search
+                                        // recovers -> ACK arrives, demote intact. One-shot, exits rc.
     bool test_spec_sack_cli = false;    // --test-spec-sack: LEVER #2 — speculative/prompt SACK. Frame-k still-decoding
                                         // at the window-fraction deadline -> in-window SACK bit_k=0 -> CMD retx ->
                                         // byte-faithful re-receive -> single in-order delivery, no silent loss.
@@ -1438,6 +1444,15 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_d5_lost_eob_abort
             // + bigblock_p3_hw/_prevbump/PREV_BUMP_VERDICT.md §2/§4.
             test_d5_lost_eob_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cumulative-ack") == 0)
+        {
+            // §2 CHECKPOINT — A1+A2 de-confounded composite (reverse-ACK arrives +
+            // delivery advances WITH the demote in place) — one-shot, exit rc. See
+            // source/datalink_layer/arq_responder.cc test_cumulative_ack.
+            test_cumulative_ack_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2838,6 +2853,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_d5_lost_eob_abort();
             printf("[FLAG] D5-lost-eob test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_cumulative_ack_cli) {
+            // §2 CHECKPOINT — A1+A2 de-confounded composite (one-shot, exit rc).
+            printf("[FLAG] --test-cumulative-ack: invoking the A1+A2 §2 checkpoint "
+                   "(reverse-ACK arrives + delivery advances WITH the demote in place)\n");
+            fflush(stdout);
+            int rc = ARQ.test_cumulative_ack();
+            printf("[FLAG] Cumulative-ack checkpoint complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

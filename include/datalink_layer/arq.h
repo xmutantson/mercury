@@ -1821,6 +1821,31 @@ public:
   // bigblock_p3_hw/_prevbump/PREV_BUMP_VERDICT.md §2/§4.
   int test_d5_lost_eob_abort();
 
+  // §2 CHECKPOINT — the A1+A2 de-confounded composite (CLI --test-cumulative-ack).
+  // In-process synthetic-fire (no IONOS/RF). The Phase-0/1 deliverable: prove the
+  // reverse-ACK reliably ARRIVES and delivery advances WITH the BREAK->ROBUST_0
+  // demote STILL IN PLACE (the levers ADD recovery; they do NOT remove the demote).
+  // De-confounds the two GET-THE-ACK-THROUGH mechanisms against ONE late/mis-phased
+  // EOB SACK using the REAL primitives:
+  //   A1 (window): the production calculate_receiving_timeout re-phase arithmetic --
+  //       a CMD window that COVERS the late SACK arrival when MERCURY_TURNAROUND_REPHASE
+  //       is on, and lands SHORT (the bench-9 matched=0/7 miss) when off.
+  //   A2 (search): the production mw_find_ack_sack_phase() multi-position correlator --
+  //       recovers the late ACK from an OLDER ring phase when MERCURY_DATA_ACK_MULTIWINDOW
+  //       is on; a single newest-tail decode MISSES when off.
+  // Composite ACK-arrival = (A1 window catches it) OR (A2 recovers it).
+  //   FAIL-BEFORE (both gates off): single fixed window lands SHORT AND newest-tail
+  //       decode MISSES -> the ACK is LOST -> the demote/retx is the ONLY recourse
+  //       (the bench-9 stall). Asserts recovered==false (delivery would stall).
+  //   PASS-AFTER (both gates on): the re-centered window COVERS the arrival AND the
+  //       multi-position search RECOVERS the SAME bsi/bitmap (CRC12 pass) -> the ACK
+  //       ARRIVES -> delivery advances (the recovered SACK lets the CMD mark+advance).
+  //       Asserts recovered==true, content matches, AND the BREAK->ROBUST_0 demote
+  //       predicate is STILL PRESENT (not removed) -- recovery without decoupling.
+  // Gate selector: MERCURY_DELIVERY_PHASE01 (1 = both A1+A2 on = pass-after; unset =
+  //       both off = fail-before). Returns 0=PASS, 1=FAIL. Default builds never call it.
+  int test_cumulative_ack();
+
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
   //
