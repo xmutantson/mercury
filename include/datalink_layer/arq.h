@@ -560,6 +560,16 @@ public:
   // (combine the repeated control-ACK); otherwise → 1 (single block). No-op /
   // byte-identical when the flag is off. CMD-side.
   void set_recovery_ack_reps_for_wait(bool control_ack);
+  // RECOVERY-ACK robustness (recovery-ack-robustness.md §6.3, recovery-window
+  // coupling): re-derive the ms-mirror ack_pattern_time_ms from the (possibly
+  // rep-bumped) telecom ack_pattern_passband_samples, using the SAME ceil formula
+  // as load_configuration. The bare reps bump updates ack_pattern_passband_samples
+  // but leaves ack_pattern_time_ms at its R=1 value; calculate_receiving_timeout's
+  // recovery/CMD listen-window geometry reads the ms-mirror, so without this the
+  // window is sized for a 390 ms ACK while the RSP keys a 1557 ms R=4 ACK. Called
+  // from set_recovery_ack_reps_for_wait after every rep change. Byte-identical when
+  // reps stay 1 (recomputes the same 390). CMD-side.
+  void recompute_ack_pattern_time_ms();
   void send_ack_pattern_with_snr(float snr);  // TX ACK + 4 MFSK symbols encoding SNR
   // Level 3: RX + detect ACK pattern, returns true if detected.
   //
@@ -3332,6 +3342,12 @@ public:
   // leaves it at -1, so the env path is unchanged (default-off byte-identical).
   static int  break_fh_gate_test_override;
   static bool break_fh_gate_enabled();
+  // recovery_ack_robust_test_override: UNIT-TEST seam (-1 = honor env, 0/1 = force) for
+  // set_recovery_ack_reps_for_wait, mirroring break_fh_gate_test_override. Lets
+  // test_recovery_window_covers_robust_ack drive the robust rep bump in-process despite the
+  // cached MERCURY_RECOVERY_ACK_ROBUST read. Production leaves it at -1 → env path unchanged
+  // → default-off byte-identical.
+  static int  recovery_ack_robust_test_override;
   // True iff the gate is enabled AND a forward OFDM frame decoded within the last
   // BREAK_FH_LATCH_FRAMES receive() iterations (probe should be suppressed). When the
   // env is unset, returns false unconditionally (byte-identical).

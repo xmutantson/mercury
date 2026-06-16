@@ -5540,6 +5540,139 @@ static void test_recovery_ack_robust_marginal() {
 }
 
 // =============================================================================
+// RECOVERY-WINDOW COUPLING (recovery-ack-robustness.md §6.3 / RECOVERY_WINDOW_WIDEN_DESIGN
+// §5). The SIBLING of test_recovery_ack_robust_marginal: that test proves the RX detector
+// COMBINES the R=4 ACK; THIS test proves the CMD recovery LISTEN WINDOW is sized for the
+// R=4 ACK's airtime. The bug: set_recovery_ack_reps() bumps ack_pattern_passband_samples to
+// the R=4 value (74752 samples = 1558 ms) but the ms-mirror ack_pattern_time_ms — which
+// calculate_receiving_timeout's COMMANDER recovery branch reads as `pattern_time`
+// (arq_common.cc:1315) — stays at the STALE R=1 value (390 ms). The window is then sized for
+// a 390 ms ACK while the RSP keys a 1558 ms ACK. The fix re-derives ack_pattern_time_ms from
+// the post-bump passband samples inside set_recovery_ack_reps_for_wait
+// (recompute_ack_pattern_time_ms), using the SAME ceil formula as load_configuration
+// (arq_common.cc:2206), so the window auto-tracks the on-air ACK with no magic constant.
+//
+// FAIL-BEFORE: build with -DRECOVERY_WINDOW_FAILBEFORE (drops the recompute_ack_pattern_time_ms
+// call in set_recovery_ack_reps_for_wait) -> apt stays 390 after the R=4 bump -> the apt_r4 /
+// window-grows asserts FAIL. PASS-AFTER (default build): apt tracks 1558, window grows by the
+// airtime delta. BYTE-IDENTICAL-WHEN-OFF: the test seam left at -1 (env unset) -> the bump
+// early-returns, reps stay 1, apt stays 390, window unchanged.
+static void test_recovery_window_covers_robust_ack() {
+	const char* name = "recovery_window_covers_robust_ack";
+
+	// A configured telecom at WB ROBUST_0 (M=16 ACK) gives the R=1 ack_pattern_passband_samples.
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	if (ts.ack_pattern_passband_samples <= 0) {
+		test_fail(name, "ack_pattern_passband_samples<=0 after ROBUST_0 load (no WB ACK pattern)"); return;
+	}
+
+	// Wire a COMMANDER ARQ controller onto it. Prime the geometry members
+	// calculate_receiving_timeout's COMMANDER ack_pattern branch reads (stock testbed values,
+	// mirroring the W3 harness in test_climb_engine). current_configuration = ROBUST_0 keeps
+	// reverse_ack_uses_robust_geometry()==FALSE and the CFG15-only turnaround re-phase OFF, so
+	// the ONLY thing that moves the window between R=1 and R=4 is the pattern_time term — the
+	// clean isolation the assert needs.
+	cl_arq_controller arq;
+	arq.telecom_system            = &ts;
+	arq.current_configuration     = ROBUST_0;
+	arq.ptt_on_delay_ms           = 100;
+	arq.ptt_off_delay_ms          = 200;
+	arq.message_transmission_time_ms = 320;
+	arq.data_batch_size           = 1;
+	arq.sack_enabled              = false;
+	arq.sack_timeout_extra_ms     = 0;
+	arq.gear_shift_on             = NO;
+	arq.data_ack_retx_turnaround  = false;
+
+	// Establish the R=1 baseline EXACTLY as production load_configuration does
+	// (arq_common.cc:2206): derive the ms-mirror from the R=1 passband samples.
+	arq.recompute_ack_pattern_time_ms();
+	const int apt_r1 = arq.ack_pattern_time_ms;
+	const int apt_r1_expect = (int)ceil(1000.0 * ts.ack_pattern_passband_samples / ts.sampling_frequency);
+	if (apt_r1 != apt_r1_expect) {
+		char b[160]; snprintf(b, sizeof(b),
+			"R=1 baseline ack_pattern_time_ms=%d != ceil-formula %d", apt_r1, apt_r1_expect);
+		test_fail(name, b); return;
+	}
+	arq.set_role(COMMANDER);                 // role=COMMANDER + first window calc
+	arq.calculate_receiving_timeout();
+	const int win_r1 = arq.receiving_timeout;
+
+	// The R=4 airtime the RSP actually keys (mirror set_recovery_ack_reps' R*16 sizing).
+	ts.set_recovery_ack_reps(4);
+	const int airtime_r4_ms = (int)ceil(1000.0 * ts.ack_pattern_passband_samples / ts.sampling_frequency);
+	ts.set_recovery_ack_reps(1);             // restore; the production bump path re-applies it
+
+	// Drive the PRODUCTION robust bump via the real code path. The test seam forces the env
+	// gate true in-process (production leaves it -1). set_recovery_ack_reps_for_wait bumps reps
+	// to RECOVERY_ACK_REPS(4) AND (post-fix) refreshes the ms-mirror.
+	cl_arq_controller::recovery_ack_robust_test_override = 1;
+	arq.set_recovery_ack_reps_for_wait(/*control_ack=*/true);
+	const int apt_r4 = arq.ack_pattern_time_ms;
+	arq.calculate_receiving_timeout();
+	const int win_r4 = arq.receiving_timeout;
+
+	// BYTE-IDENTICAL-WHEN-OFF leg: the data arm resets reps to 1 -> the ms-mirror returns to
+	// the R=1 value and the window returns to win_r1 (no robust residue on the data deadline).
+	arq.set_recovery_ack_reps_for_wait(/*control_ack=*/false);
+	const int apt_after_reset = arq.ack_pattern_time_ms;
+	arq.calculate_receiving_timeout();
+	const int win_after_reset = arq.receiving_timeout;
+	cl_arq_controller::recovery_ack_robust_test_override = -1;   // restore env-honoring
+
+	printf("  [MEASURE] recovery listen window vs robust-ACK airtime:\n");
+	printf("    R=1: ack_pattern_time_ms=%d  window=%d ms\n", apt_r1, win_r1);
+	printf("    R=4: ack_pattern_time_ms=%d  window=%d ms   (R=4 ACK airtime=%d ms)   <- FAIL-BEFORE stays %d\n",
+		apt_r4, win_r4, airtime_r4_ms, apt_r1);
+	printf("    data-arm reset: ack_pattern_time_ms=%d  window=%d ms (back to R=1)\n",
+		apt_after_reset, win_after_reset);
+
+	// --- ASSERTS ---
+	// (a) HEADLINE / FAIL-BEFORE: the ms-mirror tracks the R=4 airtime (~1558 ms), ~4x the
+	// R=1 value. On the pre-fix binary (-DRECOVERY_WINDOW_FAILBEFORE) apt_r4 stays 390 -> FAIL.
+	if (apt_r4 != airtime_r4_ms) {
+		char b[200]; snprintf(b, sizeof(b),
+			"ack_pattern_time_ms did NOT track the R=4 ACK: got %d, expected %d (the stale-cache bug — "
+			"set_recovery_ack_reps_for_wait must re-derive the ms-mirror)", apt_r4, airtime_r4_ms);
+		test_fail(name, b); return;
+	}
+	if (!(apt_r4 >= 3 * apt_r1)) {
+		char b[200]; snprintf(b, sizeof(b),
+			"R=4 ms-mirror %d is not materially larger than R=1 %d (expected ~4x)", apt_r4, apt_r1);
+		test_fail(name, b); return;
+	}
+	// (b) The recovery window GREW by at least the airtime delta (the pattern_time term flows
+	// 1:1 into sack_arrival -> timeout). FAIL-BEFORE: window unchanged -> 0 < delta -> FAIL.
+	if (!((win_r4 - win_r1) >= (apt_r4 - apt_r1))) {
+		char b[220]; snprintf(b, sizeof(b),
+			"recovery window did NOT grow by the airtime delta: win R1=%d -> R4=%d (grew %d) < apt delta %d",
+			win_r1, win_r4, win_r4 - win_r1, apt_r4 - apt_r1);
+		test_fail(name, b); return;
+	}
+	// (c) The window now BRACKETS the full on-air R=4 ACK airtime (the protocol invariant
+	// "window >= RTT_geometry + ACK_airtime"). The geometry adds frame_drain+ptt+margins on
+	// top, so this is comfortably true post-fix and false-by-construction at the stale 390.
+	if (!(win_r4 >= airtime_r4_ms)) {
+		char b[200]; snprintf(b, sizeof(b),
+			"recovery window %d ms does NOT cover the R=4 ACK airtime %d ms", win_r4, airtime_r4_ms);
+		test_fail(name, b); return;
+	}
+	// (d) DATA-ARM SHIELD / byte-identical-when-off: resetting reps to 1 returns the ms-mirror
+	// AND the window to the R=1 values (the data deadline never inherits the robust 1558).
+	if (apt_after_reset != apt_r1 || win_after_reset != win_r1) {
+		char b[220]; snprintf(b, sizeof(b),
+			"data-arm reset did NOT restore R=1 geometry: apt %d (want %d), window %d (want %d)",
+			apt_after_reset, apt_r1, win_after_reset, win_r1);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] window tracks the on-air ACK: R=1 apt=%d win=%d -> R=4 apt=%d win=%d (>= airtime %d); data-arm resets to R=1 (byte-identical).\n",
+		apt_r1, win_r1, apt_r4, win_r4, airtime_r4_ms);
+	test_pass(name);
+}
+
+// =============================================================================
 // §21 PRODUCTION CAP/adaptive wiring — gate tests (tier2-suffix-fec-design.md §21)
 // =============================================================================
 //
@@ -6399,6 +6532,13 @@ int run_mfsk_ctrl_codec_tests() {
 	// clean-channel turnaround-straddle marginality (R=1 coin-flip -> R=4 reliable)
 	// + FAR=0 on noise (bar unchanged) + byte-identical-when-off.
 	test_recovery_ack_robust_marginal();
+
+	// RECOVERY-WINDOW COUPLING (recovery-ack-robustness.md §6.3): the SIBLING of the
+	// detector-tail fix — the CMD recovery LISTEN WINDOW must be sized for the R=4 ACK
+	// airtime, not the stale R=1 value. ack_pattern_time_ms (the ms-mirror
+	// calculate_receiving_timeout reads) must track the rep bump. Fail-before
+	// (-DRECOVERY_WINDOW_FAILBEFORE) / pass-after; byte-identical when the robust path is off.
+	test_recovery_window_covers_robust_ack();
 
 	// §21 PRODUCTION robust-tier-trigger behavior (tier2-suffix-fec-design.md §21,
 	// CAP_SUFFIX_FEC negotiation removed in cleanup/drop-suffix-fec-cap): ACK gate

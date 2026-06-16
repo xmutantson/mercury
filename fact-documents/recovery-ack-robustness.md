@@ -217,6 +217,71 @@ active, the TX that produced the buffer DID emit R reps → TX/RX rep counts mat
 clean ACK + FAR-on-noise + the §6.3 tail-span invariant, wired into
 `mercury.exe --test`. See §7.
 
+### §6.5 SECOND SIBLING BUG — the listen-window ms-mirror (`ack_pattern_time_ms`)
+
+**Found after the HW A/B (RECOVACK_VERDICT.md RED), closes the §4 audit's
+incomplete note at §6 question-4 above.** The §6 note (lines ~177-182) claimed
+"the recovery wait timeout already includes generous frame_drain + guards; R=4
+ACK (~1.4 s) fits the multi-second recovery window." ~~That audit was INCOMPLETE~~
+— it checked the window's *total wall-clock* (true: 3212 ms > 1557 ms) but NOT
+the window's *arrival-geometry phase*. **Correction (2026-06-16):** the CMD
+recovery listen window in `calculate_receiving_timeout` COMMANDER branch
+(arq_common.cc:1315) builds its `sack_arrival` center from
+`pattern_time = ack_pattern_time_ms`. `ack_pattern_time_ms` is the **ms-mirror**
+of `ack_pattern_passband_samples`, recomputed ONLY in `load_configuration`
+(arq_common.cc:2206) from the **R=1** sample count. The robust bump
+(`set_recovery_ack_reps_for_wait` → `set_recovery_ack_reps`,
+telecom_system.cc:4083) updates `ack_pattern_passband_samples` to the R=4 value
+(74752 samples ≈ 1557 ms) but **NEVER re-derived `ack_pattern_time_ms`** → the
+window's arrival-geometry stayed sized for a 390 ms ACK while the RSP keys a
+1557 ms ACK. The §6.3 tail fix widened the RX *detector* span (R×16); this is the
+**ms-mirror sibling the tail fix did not couple** — the exact same stale-cache
+class, one layer up (ARQ listen window vs PHY detector).
+
+**HW-confirmed mismatch (RECOVACK_VERDICT FIX arm):** every `[CMD-POST-TX-CALIB]`
+printed `pattern=390` while every RSP `[TX-ACK-PAT]` printed
+`RECOVERY-ROBUST: emitting 4 ACK base reps (64 symbols)`. The geometry term was
+short by 1167 ms → the listen mis-phased relative to when the combinable
+64-symbol block is actually complete → recovery thrash (51 breaks vs BASE 0).
+
+**FIX (this branch):** `recompute_ack_pattern_time_ms()` (arq_common.cc) re-derives
+`ack_pattern_time_ms` from the post-bump `ack_pattern_passband_samples` using the
+SAME ceil formula as load_configuration; called at the end of
+`set_recovery_ack_reps_for_wait` after every rep change. The window then
+auto-tracks the on-air ACK with NO magic constant: on a robust control-ACK wait
+`pattern_time` 390 → 1557; on the data arm (`control_ack=false`, reps reset to 1)
+it returns to 390 (data deadline never inherits the robust value). reps stay 1 when
+`MERCURY_RECOVERY_ACK_ROBUST` is unset → recomputes the identical 390 →
+byte-identical.
+
+**Producer/consumer table (`ack_pattern_time_ms`):**
+- Producers: arq_common.cc:732 (init=0); :2206 (load_configuration, R=1); the NEW
+  `recompute_ack_pattern_time_ms()` (set_recovery_ack_reps_for_wait, post-bump);
+  arq_commander.cc:10817/:10844 (test-only hardcode 389/restore — unchanged).
+- Consumers (each re-walked, all hold): (1) `calculate_receiving_timeout` recovery
+  branch (:1315) — the one the fix corrects (window now covers the keyed ACK);
+  (2) `recalculate_ack_timeout_for_batch` (:1435) — data-ACK deadline, shielded
+  because the data arm resets reps→1 first; (3) load_configuration deadlines
+  (:2227-2228) — slack (+3000) ≫ the 1167 ms delta; (4) the `ack_pattern_time_ms>0`
+  sign gates (arq_responder/commander) — sign-only, unaffected;
+  (5) `SWITCH_BANDWIDTH` recv (arq_commander.cc) — also benefits (refreshed before
+  read).
+- Invariants: **INV-A** window ⊇ keyed ACK — RESTORED. **INV-B** data arm
+  single-block — preserved (reset path). **INV-C** byte-identical-when-off —
+  reps=1 recomputes 390. **INV-D** combine span ≤ ring — untouched (§6.3).
+
+**Regression test:** `test_recovery_window_covers_robust_ack`
+(`mfsk_ctrl_codec_tests.cc`, always-on under `--test`) — sibling of
+`test_recovery_ack_robust_marginal`. Builds a COMMANDER ARQ controller on a
+configured ROBUST_0 telecom, drives the PRODUCTION robust bump (via the
+`recovery_ack_robust_test_override` unit seam, mirroring
+`break_fh_gate_test_override`), asserts `ack_pattern_time_ms` tracks the R=4
+airtime (~4× R=1), the window grows by ≥ the airtime delta and brackets the full
+R=4 ACK, and the data-arm reset restores R=1. **Fail-before**
+(`-DRECOVERY_WINDOW_FAILBEFORE` drops the recompute call): apt stays at the R=1
+value → assert FAILS (verified: `--test` 58/1, only this test fails).
+**Pass-after** (default): apt tracks → `--test` 59/0.
+
 ---
 
 ## §7 Fail-before / pass-after (in-process, AWGN cliff) — MEASURED

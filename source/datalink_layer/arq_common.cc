@@ -4740,6 +4740,10 @@ bool cl_arq_controller::bigblock_carve_suspended()
 // run_break_fh_gate_tests() exercise BOTH gate states in one process despite the cached env
 // read; production NEVER sets it, so the env path is unchanged -> default-off byte-identical.
 int cl_arq_controller::break_fh_gate_test_override = -1;
+// recovery_ack_robust_test_override: UNIT-TEST seam only (-1 = honor env, 0/1 = force),
+// mirroring break_fh_gate_test_override. Production NEVER sets it, so set_recovery_ack_reps_for_wait
+// honors the cached env -> default-off byte-identical.
+int cl_arq_controller::recovery_ack_robust_test_override = -1;
 bool cl_arq_controller::break_fh_gate_enabled()
 {
 	if(break_fh_gate_test_override >= 0) return break_fh_gate_test_override != 0;
@@ -6436,11 +6440,43 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 // is off or NB (ack_pattern_time_ms<=0): reps stay 1.
 void cl_arq_controller::set_recovery_ack_reps_for_wait(bool control_ack)
 {
-	if(!recovery_ack_robust_enabled_common()) return;   // default-off: leave reps at 1
+	// Gate: env (cached) unless the unit-test seam forces it. Production leaves the
+	// override at -1 -> honors the env -> default-off byte-identical.
+	const bool robust = (recovery_ack_robust_test_override >= 0)
+		? (recovery_ack_robust_test_override != 0)
+		: recovery_ack_robust_enabled_common();
+	if(!robust) return;                                  // default-off: leave reps at 1
 	if(ack_pattern_time_ms <= 0) return;                 // pattern-ACK path only
 	int reps = (control_ack ? RECOVERY_ACK_REPS : 1);
 	if(telecom_system->ack_mfsk.recovery_ack_reps != reps)
 		telecom_system->set_recovery_ack_reps(reps);
+	// recovery-window coupling (recovery-ack-robustness.md §6.3): set_recovery_ack_reps
+	// updates ack_pattern_passband_samples but NOT its ms-mirror ack_pattern_time_ms,
+	// which calculate_receiving_timeout's recovery/CMD listen-window geometry reads.
+	// Refresh the mirror so the window auto-tracks the on-air ACK airtime (R=4 → 1557 ms;
+	// data arm reps=1 → back to 390 ms). Unconditional here so BOTH the bump and the
+	// reset re-sync; refreshing to an unchanged value is a no-op (byte-identical).
+#ifndef RECOVERY_WINDOW_FAILBEFORE
+	recompute_ack_pattern_time_ms();
+#endif
+}
+
+// RECOVERY-ACK robustness (recovery-ack-robustness.md §6.3): re-derive the ms-mirror
+// ack_pattern_time_ms from the current telecom ack_pattern_passband_samples, using the
+// SAME ceil formula as load_configuration (arq_common.cc:2206). Keeps the listen-window
+// geometry term (calculate_receiving_timeout) in step with the on-air ACK length after a
+// recovery-ack rep change. reps=1 → passband==load_configuration value → recomputes the
+// identical 390 → byte-identical when MERCURY_RECOVERY_ACK_ROBUST is off.
+void cl_arq_controller::recompute_ack_pattern_time_ms()
+{
+	if(telecom_system->ack_pattern_passband_samples > 0)
+	{
+		ack_pattern_time_ms = (int)ceil(1000.0 * telecom_system->ack_pattern_passband_samples / telecom_system->sampling_frequency);
+	}
+	else
+	{
+		ack_pattern_time_ms = 0;
+	}
 }
 
 // Transmit ACK + SNR suffix pattern (turboshift only)
