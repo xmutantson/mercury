@@ -63,21 +63,23 @@ static inline bool sack_rx_trace_enabled_common()
 } while(0)
 
 // TURNAROUND BATCH-AIRTIME RE-PHASE gate (bench-9; common_defines.h
-// TURNAROUND_ACCRUAL_MS_PER_S; TURNAROUND_FIX_DESIGN.md §5.1). DEFAULT-OFF: with
-// MERCURY_TURNAROUND_REPHASE unset the CMD receive-window arithmetic is BYTE-IDENTICAL to
-// monitor tip 8bf97d9 (the held lever was authored against 627c370, an ancestor of this
-// monitor — the CMD reverse-ACK window arithmetic is unchanged between the two). Set
-// MERCURY_TURNAROUND_REPHASE=1 to enable the batch-airtime-keyed re-phase that re-centers
-// the CMD reverse-ACK window LATER on long OFDM batches so the systematically-late SACK
-// lands back in window (the bench-9 matched=0/7 root fix). The constant (30 ms/s) is locked
-// to the relay sim's accrual rate (8606389) so HW and the calibrated sim share ONE number.
+// TURNAROUND_ACCRUAL_MS_PER_S; TURNAROUND_FIX_DESIGN.md §5.1). DEFAULT-ON (HW A/B
+// PHASE1_VERDICT.md: CFG15 whole-window 3.4x win) but the re-phase remains CFG15-ONLY by the
+// CONFIG_15 conjunct at the call-site (arq_common.cc CMD branch) — every other config still
+// gets adder=0 = byte-identical to the pre-A1 window, so the proven CFG16 harm stays gated off.
+// The batch-airtime-keyed re-phase re-centers the CMD reverse-ACK window LATER on long CFG15
+// OFDM batches so the systematically-late SACK lands back in window (the bench-9 matched=0/7
+// root fix). The constant (30 ms/s) is locked to the relay sim's accrual rate (8606389) so HW
+// and the calibrated sim share ONE number. A/B retained: MERCURY_TURNAROUND_REPHASE=0 reverts
+// to the pre-A1 byte-identical window (adder=0 everywhere).
 static inline bool turnaround_rephase_enabled_common()
 {
 	static int cached = -1;
 	if(cached < 0)
 	{
+		// DEFAULT-ON: unset (or any non-"0" value) -> enabled; explicit "0" disables.
 		const char* e = std::getenv("MERCURY_TURNAROUND_REPHASE");
-		cached = (e && *e && *e != '0') ? 1 : 0;
+		cached = (e && *e && *e == '0') ? 0 : 1;
 	}
 	return cached != 0;
 }
@@ -8017,17 +8019,21 @@ void cl_arq_controller::commit_ack_pattern_consumed()
 }
 
 // Multi-window DATA-ACK/SACK correlator gate. Reads MERCURY_DATA_ACK_MULTIWINDOW
-// once (cached) so the hot poll loop pays no getenv() cost. Default OFF ->
-// process_messages_rx_acks_data() is byte-identical to monitor 8bf97d9.
-// fact-documents/data-flow-data-ack-sack-correlator.md §4/§6.
+// once (cached) so the hot poll loop pays no getenv() cost. DEFAULT-ON: recovery-only-
+// additive — fires ONLY when the newest-tail ACK already MISSED (!decoded) and re-runs the
+// UNCHANGED CRC12+bsi-window+bitmap+dedupe acceptance body verbatim, so it can only ADD an
+// already-missed ACK, never alter WHICH bytes deliver (CRC12 rejects a silent ring).
+// A/B retained: MERCURY_DATA_ACK_MULTIWINDOW=0 disables -> process_messages_rx_acks_data()
+// byte-identical to the pre-A2 path. fact-documents/data-flow-data-ack-sack-correlator.md §4/§6.
 bool cl_arq_controller::mw_data_ack_multiwindow_enabled()
 {
 	// -1 = unread, 0 = off, 1 = on.
 	static int cached = -1;
 	if(cached < 0)
 	{
+		// DEFAULT-ON: unset (or any non-zero value) -> enabled; explicit "0" disables.
 		const char* e = std::getenv("MERCURY_DATA_ACK_MULTIWINDOW");
-		cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+		cached = (e && *e && atoi(e) == 0) ? 0 : 1;
 	}
 	return cached == 1;
 }
