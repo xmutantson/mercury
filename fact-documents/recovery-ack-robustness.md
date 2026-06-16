@@ -284,6 +284,118 @@ value → assert FAILS (verified: `--test` 58/1, only this test fails).
 
 ---
 
+## §6.6 THIRD SIBLING BUG — the BREAK generator is NOT reps-agnostic (DELTA-1)
+
+**Branch:** `feat/recovery-ack-deltas` (off `feat/recovery-window-msmirror @5484bf06`).
+The same stale-shared-state class as §6.3 (detector tail) and §6.5 (ms-mirror), one
+more consumer: the BREAK passband sizing.
+
+**Bug (verified on branch):** `generate_break_pattern_passband`
+(telecom_system.cc:~4560) modulates only `ack_mfsk.ack_pattern_nsymb` (16) base
+symbols (`generate_break_pattern` emits one block; BREAK reps were never part of the §4
+robust-ACK design), but it `peak_clip`ed and **RETURNED** the SHARED
+`ack_pattern_passband_samples`, which `set_recovery_ack_reps()`
+(telecom_system.cc:~4083) inflates to `R*16 = 79360` (WB) whenever the robust recovery
+ACK is armed. **`send_break_pattern()`** (arq_common.cc:~7275) then sized its alloc,
+its trailing-edge ramp `memcpy`, AND (load-bearing) its `tx_transfer` length from
+`ack_pattern_passband_samples` — so on the FIX arm a BREAK keyed `79360 − 19840 ≈
+59520` trailing **memset-zero** samples = **~1240 ms of dead-air PTT hold** (vs ~413 ms)
+on EVERY BREAK→ROBUST_0 demote. The BREAK demote sites (arq_commander.cc:2237/2284/
+2495/2563/2625/2672 + phase sites) call `send_break_pattern()` WITHOUT the data-arm reps
+reset (arq_commander.cc:1956), so the over-sized BREAK fires on every recovery thrash —
+amplifying the RECOVACK_VERDICT FIX-arm crawl. Invisible default-off (reps=1 →
+`ack_pattern_passband_samples == 16*Nofdm*interp` == the local base length).
+
+**Fix (DELTA-1):** make `generate_break_pattern_passband` reps-agnostic — compute a
+LOCAL base length `break_samples = ack_pattern_nsymb * Nofdm * frequency_interpolation_rate`
+and use it for BOTH the `peak_clip` and the `return`, mirroring how
+`generate_ack_pattern_passband` sizes from `ack_base_total_nsymb()`
+(telecom_system.cc:~3650). COUPLED consumer fix: `send_break_pattern()` now sizes
+`pattern_samples` from the generator's RETURN VALUE (the authoritative BREAK base length)
+instead of re-reading the shared `ack_pattern_passband_samples`, and pre-sizes its work
+buffers from `ack_pattern_nsymb` (reps-independent). With reps=1 the local base ==
+`ack_pattern_passband_samples` exactly → **byte-identical default-off** (SFO-GRID render
+md5 unchanged; the change is in the TX BREAK path the PLOT_PASSBAND render does not
+exercise).
+
+**Producer/consumer of `ack_pattern_passband_samples` (DELTA-1 adds the BREAK consumer):**
+- Producers: telecom_system.cc:120 (init 0); :10755 (load_configuration, R=1 =
+  `ack_pattern_nsymb*Nofdm*interp`); :4083 (`set_recovery_ack_reps`, R×16).
+- Consumers: `generate_ack_pattern_passband` (R×16 ACK, intended); `receive_ack_pattern`
+  capture tail (§6.3, R×16); **`generate_break_pattern_passband` / `send_break_pattern`
+  (BREAK — NEW: must use the BASE 16-symbol size, NOT R×16; this is the DELTA-1 fix);**
+  `detect_*_from_passband` sign-gates (`>0` only).
+- Invariant the BREAK consumer violated: the BREAK burst is ALWAYS one base block; sizing
+  it from the ACK's reps-inflated member over-keys. DELTA-1 restores BREAK ⟂ recovery-ACK
+  reps.
+
+**Test:** `test_recovery_break_reps_agnostic` (mfsk_ctrl_codec_tests.cc, always-on under
+`--test`): forces reps=4 via `set_recovery_ack_reps`, asserts
+`generate_break_pattern_passband` returns the R=1 base length (19840), NOT the inflated
+`ack_pattern_passband_samples` (79360). **FAIL-BEFORE** (`-DRECOVERY_BREAK_REPS_FAILBEFORE`
+restores the shared-member sizing): returns 79360 → assert FAILS (verified: exit 1,
+"~1240 ms dead-air"). **PASS-AFTER** (default): returns 19840 → pass. Byte-identical
+anchor: at reps=1 the returned length == `ack_pattern_passband_samples`.
+
+---
+
+## §6.7 DELTA-2 — CFO refine on the combining arm + THE SIM DECISION-GATE VERDICT
+
+**Hypothesis (Delta-2):** the clean-channel recovery-ACK miss is a CONSTANT carrier-
+frequency-offset (CFO) straddle. Noncoherent rep-combining (§4) is BLIND to a constant
+CFO (it rotates every rep identically), so R=4 cannot fix it — wire the turbo-arm's CFO
+refine (`detect_ack_snr_from_passband`'s `carrier_frequency_sync_wb_ctrl` +
+sign-corrected `effective_carrier − ctrl_residual` re-mix, telecom_system.cc:~3867) onto
+the non-turbo COMBINING arm `detect_ack_pattern_from_passband`. Gated on
+`recovery_ack_reps>1` → default-off byte-identical (reps=1 → refine path not taken; the
+ONLY default-path change is capturing `best_offset` into a local that nothing reads).
+
+**SIM DECISION GATE (`test_recovery_ack_cfo_gate`, the load-bearing discriminator) —
+VERDICT: STOP (CLAUDE.md §2).** The in-process gate builds the production ACK passband,
+injects a constant CFO via `last_coarse_freq_offset` (the modem-faithful wrong-LO path),
+and sweeps {combining-only vs combining+refine} × CFO with the Phase-1 mechanism read.
+**Findings (measured, op_cfo≈24 Hz, high-SNR clean, NT=240):**
+
+1. The MFSK matched-count detector tolerates a **WIDE ±~21 Hz CFO plateau** (16/16 from
+   −21..+21 Hz de-rotation, measured) then falls off a **RAZOR cliff (~1.5 Hz wide:
+   works→0 between 23.5 and 25 Hz)**. There is **NO marginal 6-7/16 coin-flip band that a
+   CFO produces** — the cliff is near-binary.
+2. DELTA-2's refine **DOES correct a constant CFO** — at the cliff it lifts the matched
+   MEAN (7.9 → 13.0 at the FAR-safe floor) — so the mechanism is real and the wiring
+   works. BUT at the razor-cliff operating point it **cannot reliably clear the 7/16 bar
+   to >0.95** (P_ref 0.75 @ floor 5; best 0.86 @ floor 3), because where the first detect
+   drops below the refine bootstrap floor the estimator never engages, and lowering the
+   floor to engage more **inflates FAR** (floor 3 ≈ 2× the count-gate false-accepts; floor
+   5 ≈ 1.4×; floor 6 ≈ 1.1×) — a refine gives noise a SECOND independent draw at the bar.
+3. **Phase-1 mechanism: NOT cleanly constant-CFO.** The detector's wide CFO tolerance +
+   razor cliff means CFO is **not** the binding clean-recovery marginality — exactly as
+   §3/§7 already stated: the clean 6-7/16 miss is a **per-symbol TIMING straddle / hard
+   peak-bin quantization**, which the §4 base-pattern combining already addresses; a CFO
+   refine is the wrong lever for it.
+
+**CONCLUSION — DELTA-2 is HELD default-off, NOT relied on; do NOT proceed to HW on
+DELTA-2; do NOT build speculative further CFO fixes (CLAUDE.md §2 STOP).** The code is
+retained (gated, FAR-safe `RECOVERY_REFINE_BOOTSTRAP_MIN=5`, byte-identical-off) because
+the wiring is correct and harmless when off, and the gate test is the always-on
+regression that records the verdict. The honest re-scope: the clean-recovery limiter is
+timing/quantization (the §4 lever) + the listen-window phase (§6.5), NOT CFO. The
+RECOVACK_VERDICT FIX-arm crawl is better explained by the §6.5 ms-mirror window mis-phase
++ the §6.6 dead-air BREAK than by a CFO miss the combining arm could refine.
+
+**Phase-1 diagnostic instrumentation (kept, env-gated `MERCURY_RECOVERY_ACK_DIAG`,
+default-off log-only):** on a recovery poll it prints the per-symbol miss MASK and a
+de-rotation CFO-grid sweep (−30..+30 Hz) showing where `matched` peaks — the same
+discriminator the gate test automates, available on real captures.
+
+**Tests (`--test-recovery-ack` focused runner + full `--test`):** the gate RUNS and
+records GO/STOP; a clean STOP is a SUCCESSFUL diagnostic (the test PASSES — it correctly
+told us DELTA-2 is not the fix), failing only if the measurement infrastructure breaks
+(no CFO cliff found). `--test` 61/0, `--test-climb-engine` ALL PASS, SFO-GRID render
+default-off byte-identical (CFG15 `04f20c78…`, CFG16 `24e5b7c3…` == base == monitor
+9afe802).
+
+---
+
 ## §7 Fail-before / pass-after (in-process, AWGN cliff) — MEASURED
 
 `test_recovery_ack_robust_marginal` drives the production ACK TX

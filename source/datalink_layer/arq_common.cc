@@ -7299,10 +7299,25 @@ void cl_arq_controller::send_break_pattern()
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
 	ptt_on_delay_timer.start();
 
-	int pattern_samples = telecom_system->ack_pattern_passband_samples;
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §6.6, DELTA-1): the BREAK
+	// burst is ALWAYS one 16-symbol base block. ack_pattern_passband_samples is the
+	// SHARED ACK-sizing member that set_recovery_ack_reps() inflates to R*16 while the
+	// robust recovery ACK is armed; the BREAK demote sites do NOT reset reps first, so
+	// reading ack_pattern_passband_samples here over-sizes the alloc, the trailing-edge
+	// ramp memcpy, and (load-bearing) the tx_transfer length below → ~1.17 s of
+	// memset-zero dead-air on the PTT for every recovery-thrash BREAK. Size from the
+	// generator's own return (the authoritative BREAK base length, reps-agnostic).
+	// With reps=1 (default-off) the generator returns ack_pattern_passband_samples
+	// EXACTLY → pattern_samples unchanged → byte-identical.
 	int symbol_period = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
 
-	int padded_size = pattern_samples + 2 * symbol_period;
+	// Pre-size the work buffers to the MAX possible base length so the generator's
+	// write never overflows, independent of any transient reps state. The BREAK base
+	// is ack_pattern_nsymb symbols regardless of recovery_ack_reps.
+	int break_alloc_samples = telecom_system->ack_mfsk.ack_pattern_nsymb
+		* telecom_system->data_container.Nofdm * telecom_system->frequency_interpolation_rate;
+
+	int padded_size = break_alloc_samples + 2 * symbol_period;
 	double *raw_output = new double[padded_size];
 	double *filtered1 = new double[padded_size];
 	double *filtered2 = new double[padded_size];
@@ -7311,8 +7326,11 @@ void cl_arq_controller::send_break_pattern()
 
 	memset(raw_output, 0, padded_size * sizeof(double));
 
-	// Generate BREAK pattern passband (different tones from ACK)
-	telecom_system->generate_break_pattern_passband(&raw_output[symbol_period]);
+	// Generate BREAK pattern passband (different tones from ACK). Returns the actual
+	// base-block sample count it wrote — the authoritative TX length.
+	int pattern_samples = telecom_system->generate_break_pattern_passband(&raw_output[symbol_period]);
+	if(pattern_samples <= 0 || pattern_samples > break_alloc_samples)
+		pattern_samples = break_alloc_samples;  // defensive: never read past the alloc
 
 	memcpy(&raw_output[0], &raw_output[symbol_period], symbol_period * sizeof(double));
 	memcpy(&raw_output[symbol_period + pattern_samples], &raw_output[pattern_samples], symbol_period * sizeof(double));
