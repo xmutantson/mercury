@@ -68,6 +68,8 @@ cl_mfsk::cl_mfsk()
 	ack_suffix_fec_coded = false; // §21: ACK-suffix FEC off by default (separate
 	                              // from the CONNECT flag; held off this increment)
 	connect_preamble_reps = 1; // Tier-2 base-pattern combining off by default (§20)
+	recovery_ack_reps = 1;     // RECOVERY-ACK robustness off by default
+	                           // (recovery-ack-robustness.md §4) → byte-identical
 }
 
 cl_mfsk::~cl_mfsk()
@@ -563,6 +565,36 @@ void cl_mfsk::generate_ack_pattern(std::complex<double>* pattern_out)
 		{
 			pattern_out[s * Nc + stream_offsets[st] + actual_tone] = std::complex<double>(amp, 0.0);
 		}
+	}
+}
+
+// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): emit the ACK base
+// block ack_base_total_nsymb() = recovery_ack_reps * ack_pattern_nsymb symbols.
+// Each rep is IDENTICAL — symbol s of every rep carries the SAME tone (per-rep-
+// LOCAL hop index s, NOT a continued abs index) so the RX detector can sum the
+// energy of rep-r symbol s onto rep-0 symbol s (same expected bin). reps=1 →
+// exactly the generate_ack_pattern single 16-symbol block (byte-identical).
+// Mirrors generate_connect_pattern's §20 layout.
+void cl_mfsk::generate_ack_pattern_reps(std::complex<double>* pattern_out)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+	if (ack_pattern_nsymb <= 0) return;
+
+	double amp = sqrt((double)Nc / nStreams);
+
+	int total_base = ack_base_total_nsymb();   // reps * ack_pattern_nsymb (clamped)
+	for (int abs_b = 0; abs_b < total_base; abs_b++)
+	{
+		int s = abs_b % ack_pattern_nsymb;   // index WITHIN the base block
+		for (int k = 0; k < Nc; k++)
+			pattern_out[abs_b * Nc + k] = std::complex<double>(0.0, 0.0);
+
+		int tone_base = ack_tones[s % ack_pattern_len];
+		int actual_tone = (tone_base + s * tone_hop_step) % M;
+
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[abs_b * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
 	}
 }
 

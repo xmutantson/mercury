@@ -289,6 +289,12 @@ public:
 	// count (connect_base_total_nsymb()).
 	int  set_connect_preamble_reps(int reps);
 
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4). Set the bare-ACK
+	// base-block rep count for the recovery / control-ACK turnaround; recomputes
+	// ack_pattern_passband_samples for R×16 symbols. reps=1 (default) → byte-
+	// identical. Returns the on-wire base symbol count (ack_base_total_nsymb()).
+	int  set_recovery_ack_reps(int reps);
+
 	bool decode_ctrl_suffix_from_passband_soft(double* data, int size,
 	                                            mfsk_ctrl_frame_type expected_type,
 	                                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,

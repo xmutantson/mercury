@@ -479,8 +479,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 				gui_push_monitor_event("[BREAK -> ROBUST_0]", false);
 #endif
 
-			// Send ACK to confirm BREAK received (suppressed in monitor mode)
-			send_ack_pattern();
+			// Send ACK to confirm BREAK received (suppressed in monitor mode).
+			// control_ack=true: this BREAK-recovery turnaround opts into the robust
+			// noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST is set
+			// (recovery-ack-robustness.md §4); default-off → single block.
+			send_ack_pattern(/*control_ack=*/true);
 
 			// Drop to ROBUST_0 (commander will send SET_CONFIG at ROBUST_0)
 			int target = robust_enabled ? ROBUST_0 : CONFIG_0;
@@ -1494,7 +1497,12 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			else
 			{
 				if(g_verbose) { printf("[ACK-CTRL] Sending ACK pattern (no config switch)\n"); fflush(stdout); }
-				send_ack_pattern();
+				// control_ack=true: this is the SET_CONFIG / control-code ACK
+				// response — the BREAK-recovery Phase-1 turnaround (the SUSTAINING
+				// crawl, cfg15_stall_root_cause.md). Opts into the robust
+				// noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST is set
+				// (recovery-ack-robustness.md §4); default-off → single block.
+				send_ack_pattern(/*control_ack=*/true);
 			}
 			// If config changed (e.g., SET_CONFIG), load the new data config now.
 			// ACK was sent on old config (correct — commander is still on old config),

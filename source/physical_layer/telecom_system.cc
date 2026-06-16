@@ -3642,13 +3642,18 @@ int cl_telecom_system::generate_ack_pattern_passband(double* out)
 
 	if(ack_pattern_passband_samples <= 0) return 0;
 
-	int nsymb = ack_mfsk.ack_pattern_nsymb;
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): emit
+	// recovery_ack_reps copies of the 16-symbol base block (R×16 symbols, R≤4 →
+	// ≤64 ≤ alloc_Nsymb 128). recovery_ack_reps=1 (default) → nsymb=16 → the
+	// single-block path, BYTE-IDENTICAL. ack_pattern_passband_samples is kept in
+	// step by set_recovery_ack_reps().
+	int nsymb = ack_mfsk.ack_base_total_nsymb();
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	// Generate subcarrier-domain ACK pattern (nsymb * Nc complex values)
-	// Reuse ofdm_framed_data buffer (allocated for Nsymb * Nc, nsymb=16 fits easily)
+	// Reuse ofdm_framed_data buffer (allocated for alloc_Nsymb * Nc, R×16 fits)
 	// Always use dedicated ack_mfsk (M=16, nStreams=1) — config-independent
-	ack_mfsk.generate_ack_pattern(data_container.ofdm_framed_data);
+	ack_mfsk.generate_ack_pattern_reps(data_container.ofdm_framed_data);
 
 
 	// IFFT each symbol to time domain
@@ -3695,7 +3700,13 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 		sampling_frequency, effective_carrier, carrier_amplitude,
 		M, &ofdm.FIR_rx_data);
 
-	// Run matched-filter ACK detector — always use dedicated ack_mfsk (config-independent)
+	// Run matched-filter ACK detector — always use dedicated ack_mfsk (config-independent).
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): combine_reps =
+	// recovery_ack_reps noncoherently sums per-symbol FFT energy across the R
+	// aligned base reps BEFORE the argmax/count, lifting a turnaround-straddled
+	// symbol's true-tone bin back over the peak (root cause §3). reps=1 (default)
+	// → the single-block path, BYTE-IDENTICAL. ack_pattern_nsymb stays the BASE
+	// block length (16); detect_ack_pattern strides R base blocks internally.
 	double metric = ofdm.detect_ack_pattern(
 		data_container.baseband_data_interpolated, size / M,
 		1,
@@ -3703,7 +3714,8 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
-		out_matched, 0, nullptr, nullptr, 0, out_match_mask);
+		out_matched, 0, nullptr, nullptr, 0, out_match_mask,
+		/*always_fine=*/false, /*combine_reps=*/ack_mfsk.recovery_ack_reps);
 
 	// Cache correlator metric (normalized to dB) as the §3.1 SNR proxy for the
 	// 2D channel-state lookup (fact-doc channel-state-2d-lookup.md). detect_ack_pattern
@@ -4053,6 +4065,25 @@ int cl_telecom_system::set_connect_preamble_reps(int reps)
 		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
 		* data_container.Nofdm * frequency_interpolation_rate;
 	return ack_mfsk.connect_base_total_nsymb();
+}
+
+// RECOVERY-ACK robustness (recovery-ack-robustness.md §4). Set the number of
+// noncoherent base-block reps for the bare ACK pattern (the recovery / control-
+// ACK turnaround). Recomputes ack_pattern_passband_samples for the R×16-symbol
+// block so the TX sizing and every consumer derived from it stay consistent.
+// reps=1 (default) → R*16=16 → ack_pattern_passband_samples is identical to the
+// load_configuration value → BYTE-IDENTICAL. Must be called AFTER
+// load_configuration. Returns the total base symbols on the wire.
+int cl_telecom_system::set_recovery_ack_reps(int reps)
+{
+	if (reps < 1) reps = 1;
+	if (reps > cl_mfsk::MAX_RECOVERY_ACK_REPS)
+		reps = cl_mfsk::MAX_RECOVERY_ACK_REPS;
+	ack_mfsk.recovery_ack_reps = reps;
+	ack_pattern_passband_samples =
+		ack_mfsk.ack_base_total_nsymb()
+		* data_container.Nofdm * frequency_interpolation_rate;
+	return ack_mfsk.ack_base_total_nsymb();
 }
 
 // =============================================================================

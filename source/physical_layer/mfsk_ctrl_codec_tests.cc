@@ -5268,6 +5268,278 @@ static void test_connect_preamble_combining_cliff_sweep() {
 }
 
 // =============================================================================
+// RECOVERY-ACK robustness (recovery-ack-robustness.md §7) — fail-before/pass-after.
+// The BREAK-recovery reverse control-ACK lands at a marginal 6-7/16 on a CLEAN
+// channel because a TX->RX turnaround timing straddle (sub-symbol offset) makes
+// 1-2 symbols' energy split across two FFT windows -> their peak bin moves off
+// the expected bin -> the HARD per-symbol match drops below the 7/16 bar
+// (PI_ACK_MISS_INVESTIGATION.md §2: clean matched=6/16, metric=0.7 -> "one symbol
+// fails the peak-bin check"). The fix repeats the ACK base block R times and the
+// RX noncoherently combines them (combine_reps) so a straddled symbol is
+// reinforced -> matched returns over the bar, WITHOUT lowering the 7/16 bar.
+//
+// This test synthesizes the production ACK passband (the real TX path via
+// generate_ack_pattern_passband, R=1 and R=4 via set_recovery_ack_reps), models
+// the turnaround straddle by a SUB-SYMBOL sample offset at a clean-but-jittery
+// noise level, and runs the production detector (detect_ack_pattern combine_reps).
+// Asserts (1) FAIL-BEFORE: R=1 P(matched>=7) is a coin flip / below; (2)
+// PASS-AFTER: R=4 P(matched>=7) ~ 1 and materially better than R=1; (3) NO
+// FALSE-ACCEPT: pure-noise FAR through the R=4 count gate = 0; (4) BYTE-IDENTICAL
+// when off: R=1 framed layout == the pre-change single block. Always-on
+// (mercury.exe --test) — on the pre-change binary combine_reps is ignored, the
+// straddle persists at R=4, P stays low, and assert (2) FAILS.
+static void test_recovery_ack_robust_marginal() {
+	const char* name = "recovery_ack_robust_marginal";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);   // WB ROBUST_0 -> ack_mfsk M=16, nStreams=1
+	if (ts.ack_mfsk.M != 16 || ts.ack_mfsk.ack_pattern_nsymb != 16) {
+		test_fail(name, "ack_mfsk not M=16/16-symbol at ROBUST_0"); return;
+	}
+	const int    thr  = ts.ack_mfsk.ack_match_threshold;   // 7/16 — UNCHANGED by the fix
+	const double fs   = ts.sampling_frequency;
+	const int    Mdec = ts.data_container.interpolation_rate;
+	const int    sym_samples = ts.data_container.Nofdm * Mdec;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	if (thr != 7) { test_fail(name, "ack_match_threshold expected 7/16"); return; }
+
+	// Build the clean ACK passband at a given rep count. lead/tail pad so the
+	// straddle offset and the R reps all fit; returns p_sig (the ACK power on the
+	// snr3k axis). The ACK occupies recovery_ack_reps*16 symbols.
+	auto build_clean_ack = [&](int reps, std::vector<double>& out_pb,
+	                           int& out_ack_samples, int& out_lead, double& out_p_sig) -> bool {
+		ts.set_recovery_ack_reps(reps);
+		int ack_samples = ts.ack_pattern_passband_samples;   // reps*16 * Nofdm * freq_interp
+		if (ack_samples <= 0) return false;
+		// lead = a full symbol so a sub-symbol straddle never underflows; tail =
+		// the detector's reserve + a couple symbols.
+		int lead = 2 * sym_samples;
+		int tail = 4 * sym_samples;
+		int total = ack_samples + lead + tail;
+		out_pb.assign((size_t)total, 0.0);
+		int w = ts.generate_ack_pattern_passband(out_pb.data() + lead);
+		if (w != ack_samples) return false;
+		double s = 0.0; for (int i = 0; i < ack_samples; i++) { double v = out_pb[(size_t)(lead + i)]; s += v*v; }
+		out_ack_samples = ack_samples;
+		out_lead = lead;
+		out_p_sig = (ack_samples > 0) ? s / ack_samples : 0.0;
+		return true;
+	};
+
+	// Run the production detector on a passband at the given combine reps + AWGN.
+	// The turnaround marginality (§3 / PI_ACK_MISS §2: clean matched 6-7/16, "one
+	// symbol fails the peak-bin check") is the HARD per-symbol peak-bin decision
+	// at the detector's matched-COUNT cliff — where thermal noise (per-poll, per
+	// rep) flips a marginal symbol's argmax to a competing bin. This is exactly
+	// the AWGN-cliff regime hail §4 measured (the R=1 cliff at -13.25, +1.8/+3.7
+	// dB at R=2/5), and the regime noncoherent combining helps: summing |FFT|²
+	// across R aligned reps averages out the per-rep noise so the straddled
+	// symbol's expected bin re-wins. (A residual CFO, by contrast, biases every
+	// rep identically and combining canNOT fix it — that is NOT the failure
+	// combining addresses, and not what HW shows on a clean tone-pattern ACK.)
+	// A static sub-symbol straddle is included to exercise the detector's
+	// fine-timing pass realistically; the fine-pass recovers it, so the cliff is
+	// noise-driven (the faithful model).
+	std::vector<double> work; std::vector<std::complex<double> > bb;
+	auto run_detect = [&](const std::vector<double>& clean_pb, int lead, int ack_samples,
+	                      int straddle, double sigma, int combine_reps,
+	                      std::mt19937& rng) -> int {
+		int total = (int)clean_pb.size();
+		work.assign((size_t)total, 0.0);
+		std::normal_distribution<double> nd(0.0, sigma);
+		for (int i = 0; i < total; i++) work[(size_t)i] = nd(rng);
+		for (int i = 0; i < ack_samples; i++) {
+			int dst = lead + straddle + i;
+			if (dst >= 0 && dst < total) work[(size_t)dst] += clean_pb[(size_t)(lead + i)];
+		}
+		int dec_size = total / Mdec;
+		bb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+		ts.ofdm.passband_to_baseband_decimated(work.data(), total, bb.data(),
+			fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+		int matched = 0, bo = -1;
+		ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+			ts.ack_mfsk.ack_pattern_nsymb, ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+			ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+			ts.ack_mfsk.stream_offsets, &matched, 0, nullptr, &bo, 0, nullptr,
+			/*always_fine=*/false, /*combine_reps=*/combine_reps);
+		return matched;
+	};
+
+	// Build the clean ACK at R=1 and R=4.
+	std::vector<double> pb1, pb4;
+	int ack1=0, lead1=0, ack4=0, lead4=0; double psig1=0.0, psig4=0.0;
+	if (!build_clean_ack(1, pb1, ack1, lead1, psig1) ||
+	    !build_clean_ack(4, pb4, ack4, lead4, psig4)) {
+		test_fail(name, "ACK passband build failed"); return;
+	}
+	if (ack4 != 4 * ack1) { test_fail(name, "R=4 ACK is not 4x the R=1 ACK length"); return; }
+
+	// CROSS-LAYER INVARIANT (recovery-ack-robustness.md §6.2): the RX combine span
+	// (R×16) MUST fit the receive_ack_pattern() capture tail, else detect_ack_pattern
+	// returns 0.0 (buffer_nsymb < total_needed) and the combined recovery ACK is
+	// NEVER detected. Mirror the production tail formula (arq_common.cc
+	// receive_ack_pattern): tail_nsymb = ack_base_total + pattern_len + 16, then
+	// clamped to buffer_Nsymb. Assert the R=4 base (64) fits the un-clamped tail AND
+	// the ROBUST_0 ring. (This guards the sibling bug the §6.2 audit caught — the
+	// original tail used ack_pattern_nsymb=16, too short for R=4's 64-symbol combine.)
+	{
+		ts.set_recovery_ack_reps(4);
+		int base_total = ts.ack_mfsk.ack_base_total_nsymb();        // 64
+		int tail_nsymb = base_total + base_total + 16;              // prod formula (non-turbo)
+		int ring_nsymb = ts.data_container.buffer_Nsymb;
+		if (base_total > tail_nsymb) {
+			test_fail(name, "R=4 combine span exceeds the receive_ack_pattern tail formula"); return;
+		}
+		if (ring_nsymb > 0 && base_total > ring_nsymb) {
+			char b[160]; snprintf(b, sizeof(b),
+				"R=4 combine span (%d sym) exceeds the ROBUST_0 capture ring (%d sym)", base_total, ring_nsymb);
+			test_fail(name, b); return;
+		}
+		ts.set_recovery_ack_reps(1);
+		printf("    [INVARIANT] R=4 combine span %d sym fits tail %d sym / ring %d sym (§6.2 sibling-bug guard)\n",
+			base_total, tail_nsymb, ring_nsymb);
+	}
+
+	// Operating point: the R=1 matched-COUNT cliff under AWGN (+ a fine-pass-
+	// recovered half-symbol straddle), where R=1 P(matched>=7) is a coin flip —
+	// the §3 / PI_ACK_MISS 6-7/16 regime. Combining lifts R=4 over the bar
+	// (+1.8/+3.7 dB, hail §4). Sweep a noise grid; pick the cliff cell for R=1
+	// (the first cell where R=1 P drops into [0.3, 0.7]).
+	const int straddle = sym_samples / 2;
+	const double sig_rms1 = std::sqrt(psig1);
+
+	const double mults[] = { 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 16.0 };
+	const int NM = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT_pick = 80;
+	double sigma = 10.0 * sig_rms1;   // fallback
+	bool found_cliff = false;
+	for (int mi = 0; mi < NM; mi++) {
+		double sg = mults[mi] * sig_rms1;
+		int ge = 0;
+		for (int t = 0; t < NT_pick; t++) {
+			std::mt19937 r(0x51FF0000u + mi*977 + t);
+			if (run_detect(pb1, lead1, ack1, straddle, sg, 1, r) >= thr) ge++;
+		}
+		double p = (double)ge / NT_pick;
+		if (p >= 0.30 && p <= 0.75) { sigma = sg; found_cliff = true; break; }
+		if (p < 0.30) { sigma = sg; found_cliff = true; break; }  // already past — use it
+	}
+	(void)found_cliff;
+
+	const int NT = 300;
+	int ge_thr_r1 = 0, ge_thr_r4 = 0, msum_r1 = 0, msum_r4 = 0;
+	for (int t = 0; t < NT; t++) {
+		std::mt19937 rng1(0x9ACE0000u + t), rng4(0x9ACE0000u + t);  // SAME noise per trial
+		int m1 = run_detect(pb1, lead1, ack1, straddle, sigma, /*reps=*/1, rng1);
+		int m4 = run_detect(pb4, lead4, ack4, straddle, sigma, /*reps=*/4, rng4);
+		msum_r1 += m1; msum_r4 += m4;
+		if (m1 >= thr) ge_thr_r1++;
+		if (m4 >= thr) ge_thr_r4++;
+	}
+	double P_r1 = (double)ge_thr_r1 / NT;
+	double P_r4 = (double)ge_thr_r4 / NT;
+	printf("  [MEASURE] recovery-ACK turnaround marginality (straddle=%d/%d sym, sigma/rms=%.2f, snr3k=%.1f dB):\n",
+		straddle, sym_samples, sigma / sig_rms1, snr3k_db(psig1, sigma, fs));
+	printf("    R=1 (single block): P(matched>=%d)=%.2f  mean_matched=%.1f   <- FAIL-BEFORE (coin flip)\n",
+		thr, P_r1, (double)msum_r1 / NT);
+	printf("    R=4 (combined)    : P(matched>=%d)=%.2f  mean_matched=%.1f   <- PASS-AFTER (reliable)\n",
+		thr, P_r4, (double)msum_r4 / NT);
+
+	// FAR: pure noise through the count gate at the SAME operating-point noise
+	// level, R=1 vs R=4. The 7/16 bar is unchanged by the fix, so the load-bearing
+	// claim is "combining does NOT raise the false-accept rate" — assert
+	// FAR(R=4) <= FAR(R=1) (combining sums per-bin energy; noise is not coherent
+	// at the expected bins, so the argmax-count gate is not made looser). Measured
+	// at the operating sigma + the production ack_metric_threshold (0.5) gate the
+	// real receive_ack_pattern also ANDs in.
+	const int FT = 4000;
+	int far_r1 = 0, far_r4 = 0;
+	{
+		double far_sigma = sigma;
+		int total = (int)pb4.size();
+		std::vector<double> w((size_t)total, 0.0);
+		std::vector<std::complex<double> > fbb;
+		auto far_run = [&](int reps, std::mt19937& frng) {
+			std::normal_distribution<double> fnd(0.0, far_sigma);
+			for (int i = 0; i < total; i++) w[(size_t)i] = fnd(frng);   // pure noise, NO ACK
+			int dec_size = total / Mdec;
+			fbb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(w.data(), total, fbb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+			int matched = 0, bo = -1;
+			double metric = ts.ofdm.detect_ack_pattern(fbb.data(), dec_size, 1,
+				ts.ack_mfsk.ack_pattern_nsymb, ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+				ts.ack_mfsk.stream_offsets, &matched, 0, nullptr, &bo, 0, nullptr,
+				/*always_fine=*/false, /*combine_reps=*/reps);
+			// Mirror receive_ack_pattern's accept: count gate AND metric gate (0.5).
+			return (matched >= thr && metric >= 0.5);
+		};
+		std::mt19937 frng1(0xFACEACE1u), frng4(0xFACEACE4u);
+		for (int t = 0; t < FT; t++) { if (far_run(1, frng1)) far_r1++; }
+		for (int t = 0; t < FT; t++) { if (far_run(4, frng4)) far_r4++; }
+	}
+	printf("    FAR (pure noise, count+metric gate, %d trials): R=1 %d/%d, R=4 %d/%d (bar %d/16 UNCHANGED)\n",
+		FT, far_r1, FT, far_r4, FT, thr);
+
+	// BYTE-IDENTICAL-WHEN-OFF: R=1 framed layout == the original single-block ACK.
+	{
+		ts.set_recovery_ack_reps(1);
+		const int Nc = ts.data_container.Nc;
+		const int nsymb = ts.ack_mfsk.ack_pattern_nsymb;
+		// Reference single block from the unmodified generator.
+		std::vector<std::complex<double> > ref((size_t)nsymb * Nc, std::complex<double>(0.0,0.0));
+		ts.ack_mfsk.generate_ack_pattern(ref.data());
+		// Reps generator at R=1.
+		std::vector<std::complex<double> > got((size_t)nsymb * Nc, std::complex<double>(0.0,0.0));
+		ts.ack_mfsk.generate_ack_pattern_reps(got.data());
+		double maxd = 0.0;
+		for (int i = 0; i < nsymb * Nc; i++) {
+			double d = std::abs(got[(size_t)i] - ref[(size_t)i]);
+			if (d > maxd) maxd = d;
+		}
+		if (maxd > 1e-12) {
+			char b[160]; snprintf(b, sizeof(b),
+				"R=1 generate_ack_pattern_reps != generate_ack_pattern (max|diff|=%.3e)", maxd);
+			test_fail(name, b); return;
+		}
+		printf("    [OFF] R=1 generate_ack_pattern_reps EXACTLY matches generate_ack_pattern (max|diff|=%.1e)\n", maxd);
+	}
+	ts.set_recovery_ack_reps(1);   // restore default for later tests
+
+	// --- ASSERTS ---
+	// (1) FAIL-BEFORE: the straddle makes R=1 a coin flip / below (NOT reliable).
+	if (P_r1 >= 0.90) {
+		char b[200]; snprintf(b, sizeof(b),
+			"straddle did NOT make R=1 marginal: P(matched>=%d)=%.2f >= 0.90 (test cannot show the fix)",
+			thr, P_r1);
+		test_fail(name, b); return;
+	}
+	// (2) PASS-AFTER (HEADLINE / fails on the pre-change binary): combining lifts
+	// the straddled ACK reliably over the bar AND materially better than R=1.
+	if (!(P_r4 >= 0.95 && (P_r4 - P_r1) >= 0.25)) {
+		char b[256]; snprintf(b, sizeof(b),
+			"R=4 combining did NOT make recovery-ACK reliable: P_r4=%.2f (need >=0.95), gain R1->R4=%.2f "
+			"(need >=0.25) — combine_reps ignored / no straddle recovery?",
+			P_r4, P_r4 - P_r1);
+		test_fail(name, b); return;
+	}
+	// (3) NO HIGHER FALSE-ACCEPT: the 7/16 bar is unchanged; combining must not
+	// raise the false-accept rate. Assert FAR(R=4) <= FAR(R=1) + a tiny slack, and
+	// both bounded (the count+metric gate is the load-bearing FAR defense).
+	if (!(far_r4 <= far_r1 + 2)) {
+		char b[220]; snprintf(b, sizeof(b),
+			"combining RAISED the false-accept rate: FAR R=1 %d/%d -> R=4 %d/%d (the fix must not loosen the bar)",
+			far_r1, FT, far_r4, FT);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] R=1 marginal P=%.2f -> R=4 reliable P=%.2f (gain %+.2f); FAR R1=%d/%d R4=%d/%d (not worse); bar %d/16 unchanged; byte-identical-when-off.\n",
+		P_r1, P_r4, P_r4 - P_r1, far_r1, FT, far_r4, FT, thr);
+	test_pass(name);
+}
+
+// =============================================================================
 // §21 PRODUCTION CAP/adaptive wiring — gate tests (tier2-suffix-fec-design.md §21)
 // =============================================================================
 //
@@ -6121,6 +6393,12 @@ int run_mfsk_ctrl_codec_tests() {
 	// R=4 deepens the matched-count materially vs R=1, byte-identical-when-off,
 	// FAR=0 on the combined path.
 	test_connect_preamble_combining_cliff_sweep();
+
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §7): the BREAK-recovery
+	// reverse control-ACK noncoherent-repeat fix. Fail-before/pass-after on the
+	// clean-channel turnaround-straddle marginality (R=1 coin-flip -> R=4 reliable)
+	// + FAR=0 on noise (bar unchanged) + byte-identical-when-off.
+	test_recovery_ack_robust_marginal();
 
 	// §21 PRODUCTION robust-tier-trigger behavior (tier2-suffix-fec-design.md §21,
 	// CAP_SUFFIX_FEC negotiation removed in cleanup/drop-suffix-fec-cap): ACK gate

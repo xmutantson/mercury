@@ -144,6 +144,26 @@ public:
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
+
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4). The BREAK-recovery
+	// reverse control-ACK lands at a marginal 6-7/16 on a CLEAN channel because a
+	// turnaround timing straddle knocks 1-2 symbols off the HARD per-symbol
+	// peak-bin decision (root cause §3). recovery_ack_reps>1 emits the
+	// ack_pattern_nsymb base block R times (per-rep-LOCAL hop, IDENTICAL to
+	// generate_connect_pattern's §20 layout) so the RX detector
+	// (ofdm.detect_ack_pattern, combine_reps param) noncoherently sums per-symbol
+	// FFT energy across the R aligned reps BEFORE the argmax/count — lifting a
+	// straddled symbol's true-tone bin back over the peak (+2.2-2.5 dB/doubling,
+	// hail §4). recovery_ack_reps=1 (default, ctor) → R*16=16 → BYTE-IDENTICAL to
+	// pre-change. Gated at the call sites by MERCURY_RECOVERY_ACK_ROBUST.
+	static const int MAX_RECOVERY_ACK_REPS = 4;
+	int recovery_ack_reps;   // default 1 (set in init())
+	int ack_base_total_nsymb() const {
+		int r = recovery_ack_reps;
+		if (r < 1) r = 1;
+		if (r > MAX_RECOVERY_ACK_REPS) r = MAX_RECOVERY_ACK_REPS;
+		return r * ack_pattern_nsymb;
+	}
 	int break_match_threshold; // Min matched symbols for BREAK detection
 	int hail_match_threshold;  // Min matched symbols for undirected HAIL detection
 	// Phase-2 validation: --wb-match-threshold-bias=N added to ack/break/hail
@@ -323,6 +343,15 @@ public:
 	// Generate ACK pattern: ack_pattern_nsymb symbols of known tones
 	// pattern_out: ack_pattern_nsymb * Nc complex values
 	void generate_ack_pattern(std::complex<double>* pattern_out);
+
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): emit the ACK base
+	// block ack_base_total_nsymb() (= recovery_ack_reps * ack_pattern_nsymb)
+	// symbols. Each rep is IDENTICAL — symbol s of every rep carries the SAME
+	// tone (per-rep-LOCAL hop index s, NOT a continued abs index) so the RX
+	// detector can sum rep-r symbol s onto rep-0 symbol s (same expected bin).
+	// reps=1 → exactly generate_ack_pattern's single 16-symbol block
+	// (byte-identical). pattern_out: ack_base_total_nsymb() * Nc complex values.
+	void generate_ack_pattern_reps(std::complex<double>* pattern_out);
 
 	// Generate BREAK pattern: same structure as ACK but with break_tones
 	void generate_break_pattern(std::complex<double>* pattern_out);

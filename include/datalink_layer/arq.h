@@ -547,7 +547,19 @@ public:
 	   */
   void send(st_message* message, int message_location);
   void send_batch();
-  void send_ack_pattern();   // Level 3: TX short tone pattern instead of LDPC ACK
+  // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
+  // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
+  // opts into the robust noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST
+  // is set (recovery-ack-robustness.md §4). Data-ACK callers pass false (default)
+  // → single block, no airtime change. Default false → byte-identical.
+  void send_ack_pattern(bool control_ack = false);
+
+  // RECOVERY-ACK robustness (recovery-ack-robustness.md §4/§6.2): set the RX
+  // combine_reps the next ACK-pattern wait will correlate with. control_ack=true
+  // + MERCURY_RECOVERY_ACK_ROBUST + ack_pattern_time_ms>0 → RECOVERY_ACK_REPS
+  // (combine the repeated control-ACK); otherwise → 1 (single block). No-op /
+  // byte-identical when the flag is off. CMD-side.
+  void set_recovery_ack_reps_for_wait(bool control_ack);
   void send_ack_pattern_with_snr(float snr);  // TX ACK + 4 MFSK symbols encoding SNR
   // Level 3: RX + detect ACK pattern, returns true if detected.
   //
