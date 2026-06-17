@@ -47,4 +47,12 @@ int run_preamble_sched_tests();
 // number of failed tests (0 = all pass). Wired via main.cc --test-break-fh.
 int run_break_fh_gate_tests();
 
+// feat/revack-geometry: run ONLY the §24 coordinated recovery-ACK geometry suite
+// (INV-G both peers compute the SAME deterministic config-derived key offset + the
+// CMD snapshot is CENTERED on the deterministic ACK block; fail-before/pass-after on
+// REVACK_GEOMETRY_FAILBEFORE). Fast + deterministic, pure geometry (no audio).
+// Returns the number of failed tests (0 = all pass). Wired via main.cc
+// --test-revack-geometry. Also included in the full --test suite.
+int run_revack_geometry_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_

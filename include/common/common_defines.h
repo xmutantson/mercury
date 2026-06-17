@@ -629,6 +629,25 @@ static const int TURNAROUND_ACCRUAL_MS_PER_S = 30; // relay-locked (8606389); ms
 // re-centered phase (the accrual cancels the MEAN late-shift; the guard covers the variance). Bounded.
 static const int ACCRUAL_PHASE_GUARD_MS    = 150;
 
+// COORDINATED RECOVERY-ACK GEOMETRY (fact-documents/data-flow-revack-geometry.md; gated by
+// MERCURY_REVACK_GEOMETRY, DEFAULT-OFF) ---------------------------------------------------------
+// The SHARED, CONFIG-DERIVED key offset BOTH peers compute identically: the deterministic
+// "forward-frame EOT -> recovery ACK on air" turnaround. HW-MEASURED (tt_verdict.json
+// rsp_decode_to_ack_onair = 400.94ms, sd 0.15ms, spread 0.68ms -> DETERMINISTIC, not ±8ppm drift
+// which would be ±39ms). It is the keyer/AGC/PTT turnaround, NOT the channel time-sync, hence
+// config-derivable and identical on both sides. Decomposes into the constants both peers already
+// share: ptt_off_delay_ms (200) + RSP_DECODE_MARGIN_MS (300) brackets it; we pin a single named
+// constant to the measured value so the RSP re-anchor and the CMD center read ONE number (they
+// cannot diverge). When the env is set, the RSP keys the ACK at fwd_eot + REVACK_KEY_OFFSET_MS
+// instead of the noisy receive_stats.delay-derived wait, and the CMD predicts the SAME arrival.
+static const int REVACK_KEY_OFFSET_MS = 401; // HW-measured deterministic RSP fwd-EOT -> ACK-on-air
+
+// The jitter half-width (ms) the CMD center allows around the predicted arrival. tt_verdict.json:
+// ackstart-winopen sd 15.6ms, const-window margin sd 15.9ms spread 56ms (~2 ROBUST_0 symbols at
+// 24.3ms/sym). Used by the focused test's INV-G tolerance and to bound the center placement so a
+// genuine ~±2-symbol jitter still lands the full block inside the searched tail.
+static const int REVACK_JITTER_HALFWIDTH_MS = 50; // ~±2 ROBUST_0 symbols of bounded arrival jitter
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

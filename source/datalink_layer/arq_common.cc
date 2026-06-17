@@ -84,6 +84,29 @@ static inline bool turnaround_rephase_enabled_common()
 	return cached != 0;
 }
 
+// COORDINATED RECOVERY-ACK GEOMETRY gate (fact-documents/data-flow-revack-geometry.md).
+// DEFAULT-OFF, byte-identical-when-off. This is a NEW gate — it does NOT reuse
+// MERCURY_RECOVERY_ACK_REPHASE (the FALSIFIED capture fix), MERCURY_TURNAROUND_REPHASE (A1, the
+// CFG15 listen-window DURATION re-phase) or MERCURY_RECOVERY_ACK_ROBUST (the R=4 reps experiment).
+// When SET, both peers re-anchor the recovery/data-ACK turnaround to the HW-MEASURED deterministic
+// config-derived key offset (REVACK_KEY_OFFSET_MS): the RSP keys the ACK at forward-frame-EOT +
+// the constant (NOT the noisy receive_stats.delay), and the CMD CENTERS its scored snapshot on the
+// SAME computed arrival instant so the unchanged correlator catches the full block on the FIRST
+// scored poll. tt_verdict.json proved rsp_decode->ack_onair = 400.94ms sd 0.15ms (DETERMINISTIC,
+// not drift). Unset => the RSP keeps the delay-derived wait_ms and the CMD keeps the newest-tail
+// snapshot => byte-identical to base 4dcdc53.
+static inline bool revack_geometry_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		// DEFAULT-OFF: enabled only when set to a non-empty, non-"0" value.
+		const char* e = std::getenv("MERCURY_REVACK_GEOMETRY");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -6303,6 +6326,28 @@ void cl_arq_controller::send_ack_pattern()
 		              * 1000 + 47999) / 48000;
 		wait_ms += ptt_off_delay_ms + ptt_on_delay_ms;
 
+		// COORDINATED RECOVERY-ACK GEOMETRY (RSP re-anchor; data-flow-revack-geometry.md §2.1).
+		// When MERCURY_REVACK_GEOMETRY is set, key the recovery ACK at a DETERMINISTIC
+		// config-derived offset from the forward-frame EOT (REVACK_KEY_OFFSET_MS, the HW-measured
+		// 401ms keyer/AGC/PTT turnaround) instead of the NOISY receive_stats.delay-derived wait
+		// above. "Now" = right after the RSP captured+decoded the forward frame
+		// (ack_turnaround_timer started at entry), so wait_ms == the fwd-EOT -> key offset
+		// directly. The on-air ACK WAVEFORM/symbol-count is UNCHANGED (no wire-format break; only
+		// the KEY INSTANT moves). The CMD predicts the SAME instant from the SAME constant
+		// (receive_ack_pattern center, §2.2) -> the ACK lands centered in the first scored
+		// snapshot. UNSET => the delay-derived wait_ms above is kept => byte-identical to base.
+#ifndef REVACK_GEOMETRY_FAILBEFORE
+		if(revack_geometry_enabled_common())
+		{
+			int revack_wait_ms = REVACK_KEY_OFFSET_MS;
+			printf("[TX-ACK-PAT] REVACK-GEOMETRY re-anchor: deterministic wait %dms "
+				"(was delay-derived %dms; remaining=%dsym delay=%dsym)\n",
+				revack_wait_ms, wait_ms, remaining_sym, delay_sym);
+			fflush(stdout);
+			wait_ms = revack_wait_ms;
+		}
+#endif
+
 		if(wait_ms > 0)
 		{
 			printf("[TX-ACK-PAT] Waiting %dms (remaining=%dsym delay=%dsym buf=%dsym frame=%dsym ptt_off=%d ptt_on=%d)\n",
@@ -8278,6 +8323,33 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 	if(tail_samples > signal_period)
 		tail_samples = signal_period;
 	int tail_offset = signal_period - tail_samples;
+
+	// COORDINATED RECOVERY-ACK GEOMETRY (CMD center; data-flow-revack-geometry.md §2.2).
+	// When MERCURY_REVACK_GEOMETRY is set on an OFDM config, the RSP keys the recovery ACK at the
+	// DETERMINISTIC config-derived instant fwd_eot + REVACK_KEY_OFFSET_MS (send_ack_pattern §2.1).
+	// A freshly-arrived ACK therefore lands at the NEWEST tail (the last ack_nsymb symbols of the
+	// snapshot), where the sliding correlator's combinable window can STRADDLE the newest edge
+	// (only part of the block present) -> matched below threshold on the first scored poll. CENTER
+	// the snapshot on the predicted block: shift the scored window EARLIER by half the slack
+	// (tail_nsymb - ack_nsymb)/2 so the just-arrived block sits at ~sym 16 of the 48-symbol tail,
+	// fully present + bracketed by ~±2 symbols of jitter slack on each side (REVACK_JITTER_HALFWIDTH_MS).
+	// The correlator (detect_ack_pattern) is UNCHANGED — it still slides the whole snapshot and uses
+	// the SAME accept thresholds; we only MOVE where the snapshot reads, like the multiwindow_scan
+	// repositioner below, but to a CONFIG-PREDICTED phase rather than an energy-hunted older one.
+	// Clamped to [0, tail_offset] so the biased snapshot never reads before the ring origin.
+	// UNSET (or non-OFDM) => tail_offset stays at the newest tail => byte-identical to base.
+#ifndef REVACK_GEOMETRY_FAILBEFORE
+	if(revack_geometry_enabled_common()
+	   && is_ofdm_config(current_configuration)
+	   && tail_nsymb > ack_nsymb)
+	{
+		int center_bias_sym     = (tail_nsymb - ack_nsymb) / 2;
+		int center_bias_samples = center_bias_sym * sym_samples;
+		if(center_bias_samples > tail_offset) center_bias_samples = tail_offset;
+		if(center_bias_samples < 0)            center_bias_samples = 0;
+		tail_offset -= center_bias_samples;
+	}
+#endif
 
 	// ------------------------------------------------------------------
 	// SIM_INPROC control-ACK arrival-window re-scan (ADDITIVE; pump-armed
