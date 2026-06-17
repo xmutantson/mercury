@@ -250,10 +250,37 @@ void cl_arq_controller::process_messages_commander()
 		}
 		else
 		{
+		// Recovery-turnaround timing (env-gated): the CMD's recovery capture
+		// window is [receiving_timer.start, +receiving_timeout]. This is the
+		// SCORE site — each tick snapshots the ring tail and runs the ACK
+		// correlator (receive_ack_pattern). Log the window geometry (elapsed vs
+		// timeout) on EVERY poll so the parser can place each snapshot relative
+		// to the RSP's ACK on-air interval. T_cmd_snapshot/score.
+		if(mtl::turnaround_timing_enabled())
+		{
+			static long long last_break_poll_us = -1;
+			long long t = mtl::now_us();
+			// Throttle to ~one log / 50ms to avoid flooding (the poll spins fast);
+			// still fine enough to bracket the ~390ms ACK on-air interval.
+			if(last_break_poll_us < 0 || (t - last_break_poll_us) >= 50000)
+			{
+				mtl::log_turn_kv(this->role, "cmd_break_capture_score",
+					"elapsed_ms=%lld timeout_ms=%d cfg=%d",
+					(long long)receiving_timer.get_elapsed_time_ms(),
+					receiving_timeout, current_configuration);
+				last_break_poll_us = t;
+			}
+		}
 		if(receiving_timer.get_elapsed_time_ms() < receiving_timeout)
 		{
 			if(receive_ack_pattern())
 			{
+				// Recovery-turnaround timing (env-gated): the recovery ACK was
+				// DETECTED inside the window. T_cmd recovery SUCCESS.
+				mtl::log_turn_kv(this->role, "cmd_break_ack_detected",
+					"elapsed_ms=%lld timeout_ms=%d",
+					(long long)receiving_timer.get_elapsed_time_ms(),
+					receiving_timeout);
 				// Use ROBUST_0 as coordination layer, then probe target config.
 				// Phase 1: send SET_CONFIG at ROBUST_0 (guaranteed delivery).
 				// Phase 2: send SET_CONFIG at target to verify it works (2 tries).
@@ -337,6 +364,13 @@ void cl_arq_controller::process_messages_commander()
 		}
 		else
 		{
+			// Recovery-turnaround timing (env-gated): the window
+			// [start, +receiving_timeout] CLOSED with no ACK detected. This is
+			// the MISS — the recovery ACK arrived outside the scored window (or
+			// never). T_cmd window-expired/miss.
+			mtl::log_turn_kv(this->role, "cmd_break_window_expired",
+				"timeout_ms=%d retries_left=%d", receiving_timeout,
+				emergency_break_retries - 1);
 			// Timeout — retry BREAK
 			emergency_break_retries--;
 			if(emergency_break_retries > 0)
@@ -13292,6 +13326,24 @@ int cl_arq_controller::test_sim_inproc_2()
 	// turned OFF so it HOLDS the target rung (no further churn) and the payload flows as
 	// real big-blocks. Default -1 = disabled (every existing arm is byte-identical).
 	const long force_setconfig = env_i("MERCURY_SIM2_FORCE_SETCONFIG", -1);
+	// RECOVERY-TURNAROUND TIMING (feat/turnaround-timing-instr): MERCURY_SIM2_FORCE_BREAK=1
+	// fires the PRODUCTION emergency-BREAK recovery handshake ONCE, AFTER CONNECT, on a
+	// quiescent wire. The natural BREAK trigger (3 consecutive block-failures, :3585) cannot
+	// be reached in this stepper because the CFG16 big-block multi-codeword TX wedges the wire
+	// ("playback un-drainable", the documented SIM_INPROC depth-1 turnaround deadlock) BEFORE
+	// the third failure accrues. This knob bypasses that: at the injection point below it runs
+	// the EXACT production fire sequence (arq_commander.cc:3680-3694 — emergency_break_active=1,
+	// send_break_pattern(), frames_to_read=4, calculate_receiving_timeout(), receiving_timer
+	// .start()) on A=CMD, then the lockstep pump carries the recovery handshake: A's BREAK
+	// pattern drains (pumped), B=RSP decodes it (process_messages_rx_data_control BREAK branch),
+	// keys the recovery ACK (send_ack_pattern — the SAME keyer the data-ACK uses), and A's
+	// recovery state machine (process_messages_commander) opens + scores the capture window.
+	// The MERCURY_TURNAROUND_TIMING [TT] events on both sides then reconstruct the recovery
+	// turnaround geometry. The BREAK + ACK patterns are SHORT (no big-block), so the pump does
+	// NOT wedge. HARNESS-ONLY; default 0 = disabled (every existing arm byte-identical). NOTE:
+	// the in-process drain is VIRTUAL-time, so on-air DURATIONS are not HW-real — this measures
+	// the deterministic code-geometry ORDERING (which event precedes which), not RF latency.
+	const bool force_break = env_i("MERCURY_SIM2_FORCE_BREAK", 0) != 0;
 	// FAIL-BEFORE A/B HOOK for the first-block-race harness fix (see the payload-stage block):
 	// MERCURY_SIM2_DEFEAT_FIRSTBLOCK_FIX=1 reproduces the PRE-FIX artifact behavior so the SAME
 	// binary shows fail-before (gate_ran==false). Production never sets it.
@@ -13543,6 +13595,8 @@ int cl_arq_controller::test_sim_inproc_2()
 	// GAP-2 LIVE-PATH: one-shot guard for the forced SET_CONFIG jump (fired at most once,
 	// once the commander is CONNECTED and its control channel is idle).
 	bool force_setconfig_done = false;
+	// RECOVERY-TURNAROUND TIMING: one-shot guard for the MERCURY_SIM2_FORCE_BREAK fire.
+	bool force_break_done = false;
 	// GAP-2 LIVE-PATH: iter at which the stop-after-tx-emits threshold was first met (the
 	// grace window is measured from here). -1 = not yet armed. Loop-local (reset per run).
 	long emit_break_arm_iter = -1;
@@ -13825,6 +13879,56 @@ int cl_arq_controller::test_sim_inproc_2()
 		bool wire_quiescent =
 		    size_buffer(wire_a2b) == 0 && size_buffer(wire_b2a) == 0 &&
 		    size_buffer(A->audio.play) == 0 && size_buffer(B->audio.play) == 0;
+
+		// RECOVERY-TURNAROUND TIMING (feat/turnaround-timing-instr): fire the production
+		// emergency-BREAK recovery handshake ONCE on a quiescent, CONNECTED, control-idle
+		// link. Mirrors the production fire at arq_commander.cc:3680-3694 EXACTLY (no new
+		// recovery logic — it just reaches the same entry the block-failure threshold would,
+		// which the stepper cannot organically reach: the CFG16 big-block wedges the wire
+		// first). The pump then carries A's short BREAK pattern -> B's BREAK decode + recovery
+		// ACK (send_ack_pattern) -> A's recovery capture window (process_messages_commander),
+		// emitting the [TT] recovery events on both sides. Default-off (force_break==false) =>
+		// byte-identical (every existing arm leaves this branch dead).
+		if (force_break && !force_break_done &&
+		    A->arq.link_status == CONNECTED && B->arq.link_status == CONNECTED &&
+		    A->arq.connection_status != TRANSMITTING_CONTROL &&
+		    A->arq.connection_status != RECEIVING_ACKS_CONTROL &&
+		    A->arq.messages_control.status == FREE &&
+		    wire_quiescent)
+		{
+			sim2_activate(A);
+			printf("[SIM2-FORCEBREAK] CONNECTED at cfg=%d; firing PRODUCTION emergency-BREAK "
+			       "recovery handshake (arq_commander.cc:3680-3694 sequence)\n",
+			       A->arq.current_configuration);
+			fflush(stdout);
+			// EXACT production BREAK-fire sequence (arq_commander.cc:3682-3693): arm the
+			// BREAK state, send the pattern, THEN open the recovery capture window. This is
+			// byte-faithful to production ordering (window t=0 anchors at PTT-off, NOT
+			// before the BREAK TX).
+			//
+			// SIM CAVEAT (measured, feat/turnaround-timing-instr): the lockstep pump
+			// co-routine-re-enters process_messages_commander DURING send_break_pattern()'s
+			// drain_playback_wait (a single-process-sim re-entrancy with no half-duplex DAC
+			// analogue). On that re-entry emergency_break_active is already 1 but the window
+			// is not yet (re)started, so the scorer runs against the STALE receiving_timer +
+			// any prior-turnaround ACK in A's capture ring. Combined with cl_timer reading
+			// the VIRTUAL sim-clock (timer.cc cl_timer_clock_read -> sim_clock_fill_timespec)
+			// while the [TT] events read the WALL steady_clock, the sim CANNOT yield a
+			// production-faithful wall-clock window-vs-ACK offset — it only proves the
+			// instrumentation fires at every recovery site and the EVENT ORDER. The
+			// wall-clock geometry is an HW-only measurement (the [TT] clock IS wall-clock on
+			// HW, where there is no pump re-entry and cl_timer reads the same wall clock).
+			A->arq.emergency_previous_config = A->arq.current_configuration;
+			A->arq.emergency_break_active    = 1;
+			A->arq.emergency_break_retries   = 3;
+			A->arq.send_break_pattern();
+			A->ts.data_container.frames_to_read = 4;
+			A->arq.calculate_receiving_timeout();
+			A->arq.receiving_timer.start();
+			force_break_done = true;
+			// The recovery state machine now runs on A's subsequent process_main ticks
+			// (emergency_break_active==1 -> process_messages_commander recovery branch).
+		}
 		if (force_setconfig >= 0 && !force_setconfig_done &&
 		    A->arq.link_status == CONNECTED && B->arq.link_status == CONNECTED &&
 		    A->arq.connection_status != TRANSMITTING_CONTROL &&

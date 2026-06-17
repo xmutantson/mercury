@@ -3915,6 +3915,21 @@ void cl_arq_controller::ptt_off()
 
 void cl_arq_controller::process_messages()
 {
+	// Recovery-turnaround timing: periodic UTC<->monotonic anchor (env-gated
+	// MERCURY_TURNAROUND_TIMING; no-op + byte-identical when unset). One per
+	// process every ~2s lets the parser fit each process's steady_clock epoch to
+	// the shared UTC wall clock and place CMD/RSP events on one timeline.
+	if(mtl::turnaround_timing_enabled())
+	{
+		static long long last_anchor_us = -1;
+		long long t = mtl::now_us();
+		if(last_anchor_us < 0 || (t - last_anchor_us) >= 2000000)
+		{
+			mtl::log_turn_anchor(this->role);
+			last_anchor_us = t;
+		}
+	}
+
 	this->update_status();
 	if(this->role==COMMANDER)
 	{
@@ -6371,6 +6386,10 @@ void cl_arq_controller::send_ack_pattern()
 
 	// Transmit the filtered ACK pattern (skip padding at start)
 	printf("[TX-ACK-PAT] Audio start at t=%dms (%d samples)\n", (int)ack_turnaround_timer.get_elapsed_time_ms(), pattern_samples); fflush(stdout);
+	// Recovery-turnaround timing (env-gated): the ACK pattern goes ON AIR now.
+	// T_ack_on_air[start]. (Shared by data-ACK + recovery-ACK; the parser scopes
+	// to recovery via proximity to the rsp_break_* events.)
+	mtl::log_turn_kv(this->role, "rsp_ack_onair_start", "samples=%d", pattern_samples);
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
 	// Wait for playback to drain
@@ -6378,6 +6397,9 @@ void cl_arq_controller::send_ack_pattern()
 
 	printf("[TX-ACK-PAT] Audio done at t=%dms\n", (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
 	mtl::log_event("rsp_ack_audio_done");
+	// Recovery-turnaround timing (env-gated): ACK pattern audio drained.
+	// T_ack_on_air[end].
+	mtl::log_turn(this->role, "rsp_ack_onair_done");
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -7242,6 +7264,9 @@ void cl_arq_controller::send_break_pattern()
 	if(passive_monitor) return;
 	printf("[TX-BREAK] Sending BREAK pattern on CONFIG_%d\n", current_configuration);
 	fflush(stdout);
+	// Recovery-turnaround timing (env-gated): CMD fires the BREAK that starts the
+	// recovery handshake. T_cmd_break.
+	mtl::log_turn_kv(this->role, "cmd_break_fire", "cfg=%d", current_configuration);
 
 	// Window-stabilization cooldown after BREAK. The optimizer's 50-batch
 	// rolling window has stale "BREAK-era" failed batches in it that would
@@ -7313,9 +7338,11 @@ void cl_arq_controller::send_break_pattern()
 		delete[] pilot_buffer;
 	}
 
+	mtl::log_turn(this->role, "cmd_break_audio_start");
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
 	drain_playback_wait();
+	mtl::log_turn(this->role, "cmd_break_audio_done");
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -7351,6 +7378,11 @@ void cl_arq_controller::send_break_pattern()
 	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
+	// Recovery-turnaround timing (env-gated): CMD has released PTT after the
+	// BREAK; the TX->RX turnaround is complete and the capture window is about to
+	// be opened (calculate_receiving_timeout + receiving_timer.start at the
+	// caller). T_cmd_break PTT-off edge.
+	mtl::log_turn_kv(this->role, "cmd_break_ptt_off", "ptt_off_ms=%d", ptt_off_delay_ms);
 }
 
 // =============================================================================
