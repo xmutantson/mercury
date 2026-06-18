@@ -4331,7 +4331,7 @@ int cl_arq_controller::test_config_tag_passband_roundtrip()
 // drives the FULL chain end-to-end with the REAL primitives on a REAL passband:
 //
 //   W3 GEARSHIFT DRIVE — the CMD's add_message_control(SET_CONFIG) chokepoint takes
-//      the UNILATERAL path (inband_unilateral_drop) instead of queueing a SET_CONFIG
+//      the UNILATERAL path (inband_unilateral_config_change) instead of queueing a SET_CONFIG
 //      control handshake: it loads the dropped config directly. Assert: ZERO
 //      SET_CONFIG frames queued, CMD current_configuration tracks to the new rung,
 //      the one-shot re-route returns the CMD to TRANSMITTING_DATA.
@@ -4417,7 +4417,7 @@ int cl_arq_controller::test_inband_drop()
 	cmd->role = COMMANDER;
 	cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
 	// FULL load so the message buffers (messages_tx[], message_TxRx_byte_buffer,
-	// fifo_buffer_*) exist — inband_unilateral_drop refills TX through them.
+	// fifo_buffer_*) exist — inband_unilateral_config_change refills TX through them.
 	cmd->load_configuration(CFG_FROM, FULL, NO);
 	cmd->link_status = CONNECTED;
 	cmd->connection_status = TRANSMITTING_DATA;
@@ -5097,7 +5097,7 @@ int cl_arq_controller::test_inband_fallback()
 // send_break_pattern() regardless of MERCURY_INBAND_RATE, so a degradation can
 // still detonate the BREAK->ROBUST_0 cascade with inband ON. Stage 4c gates them
 // so that, under inband, a degradation that today BREAKs instead routes to a
-// TAG-DEMOTE (one rung down via the chokepoint -> inband_unilateral_drop -> the W1
+// TAG-DEMOTE (one rung down via the chokepoint -> inband_unilateral_config_change -> the W1
 // CONFIG_TAG; the RX down-ladder catches a missed tag), REUSING the CFG16 D3 demote
 // machinery (inband_route_failure_demote). The ONLY commander BREAK permitted under
 // inband is the SESSION_DEAD_BATCHES true-session-loss floor.
@@ -5321,7 +5321,7 @@ int cl_arq_controller::test_inband_no_break()
 
 	// ====================================================================
 	// PART D — byte-identical OFF: with the feature OFF, the demote helper is INERT
-	// (it does not apply a unilateral drop — inband_unilateral_drop returns false), so
+	// (it does not apply a unilateral drop — inband_unilateral_config_change returns false), so
 	// the Class-A site falls through to the legacy BREAK (exercised in production).
 	// ====================================================================
 	{
@@ -5340,6 +5340,366 @@ int cl_arq_controller::test_inband_no_break()
 		delete cmd; delete ts;
 	}
 #endif
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 4d: D1 repeat-until-followed + D4 climb/auto-demote
+// ============================================================================
+//
+// CLI: --test-inband-retag  (inband-reliability-design.md §1.6 / §4.6)
+//
+// Stage 4d hardens the unilateral CONFIG_TAG into a reliable BREAK-free climb transport:
+//   D1 REPEAT-UNTIL-FOLLOWED: after a change the sender RE-EMITS the tag on every batch
+//      until a returning SACK confirms the RX is at the announced config, then STOPS.
+//   D4 CLIMB + AUTO-DEMOTE: a CLIMB the RX cannot follow after R re-tags AUTO-DEMOTES to
+//      the last-confirmed config via the tag — NEVER a BREAK.
+//   RESIDUAL: a turbo speculative-climb fail under inband AUTO-DEMOTES (not a BREAK).
+//
+// Four parts drive the PRODUCTION functions directly (no masking — these are the EXACT
+// functions send_batch / the ACK-poll / the gearshift call):
+//   PART A — CLIMB-FOLLOWED: a CONFIG_9->CONFIG_11 climb through the chokepoint; the CMD
+//     climbs UNILATERALLY (no SET_CONFIG) + arms the re-tag; an RX at CONFIG_9 FOLLOWS UP
+//     from the real passband tag, both ARQ + PHY-twin tracking to CONFIG_11.
+//   PART B — REPEAT-UNTIL-FOLLOWED: inband_tag_firing_decision (the production emit's
+//     decision) re-emits on B0..B2, parity HELD across the repeats, the announce-bsi
+//     anchor latched once; a SACK confirm DISARMS; B3 emits NOTHING (zero steady state).
+//   PART C — AUTO-DEMOTE: an un-confirmed CLIMB past R re-tags ->
+//     inband_retag_escalate_if_climb_exhausted demotes to last-confirmed, BREAK-count==0.
+//   PART D — TURBO-GATED: the body the gated turbo BREAK sites call
+//     (inband_route_failure_demote) routes a turbo-climb-fail to a tag-demote with
+//     BREAK-count==0 (vs the legacy ROBUST_0 cascade).
+//
+// fail-before (-DINBAND_RETAG_FAILBEFORE): the firing policy is forced back to fire-once
+// (no repeat) AND the auto-demote is removed — so a lost climb is never followed and a
+// hopeless climb stays armed forever / would fall to a BREAK. The B/C asserts FAIL.
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_retag()
+{
+	const char* TAG = "[TEST-INBAND-RETAG]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). ---
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	auto set_inband = [&](bool on){
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_RATE", on ? "1" : "");
+#else
+		if(on) setenv("MERCURY_INBAND_RATE", "1", 1); else unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+	set_inband(true);
+
+	// Build a fresh COMMANDER at `cfg`, inband forced on. FULL load so the TX buffers
+	// exist (the unilateral change + demote refill TX through them).
+	auto make_cmd = [&](int cfg, cl_telecom_system** out_ts) -> cl_arq_controller* {
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* cmd = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE;
+		cmd->telecom_system = ts;
+		cmd->narrowband_enabled = NO;
+		cmd->role = COMMANDER;
+		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
+		cmd->load_configuration(cfg, FULL, NO);
+		cmd->link_status = CONNECTED;
+		cmd->connection_status = TRANSMITTING_DATA;
+		cmd->sack_v2_enabled = true;
+		cmd->gear_shift_on = YES;
+		cmd->robust_enabled = NO;
+		cmd->inband_rate_enabled = 1;       // force-resolve the cached flag ON
+		cmd->send_break_pattern_count = 0;  // zero the BREAK instrument
+		*out_ts = ts;
+		return cmd;
+	};
+
+	const int CFG_LO  = CONFIG_9;   // ladder idx 12
+	const int CFG_HI  = CONFIG_11;  // ladder idx 14 (a 2-rung CLIMB above CFG_LO)
+
+	// ========================================================================
+	// PART A — CLIMB-FOLLOWED: the chokepoint climbs CONFIG_9 -> CONFIG_11, the RX
+	// follows UP, both ends + the PHY twin track.
+	// ========================================================================
+	{
+		cl_telecom_system* ts_cmd = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_LO, &ts_cmd);
+		check(cmd->current_configuration == CFG_LO,
+			"A0 CMD starts at CONFIG_9", cmd->current_configuration, CFG_LO);
+
+		// Drive a gearshift CLIMB through the production chokepoint exactly as the
+		// FRAME-UP / optimizer producers do for an UP move: set the target, then
+		// add_message_control(SET_CONFIG). The chokepoint takes the UNILATERAL path
+		// (inband_unilateral_config_change is direction-agnostic) and ARMS the D1 re-tag.
+		cmd->negotiated_configuration = CFG_HI;
+		cmd->add_message_control(SET_CONFIG);
+		cmd->connection_status = TRANSMITTING_CONTROL;   // the caller's forced transition
+
+		check(cmd->current_configuration == CFG_HI,
+			"A1 CMD CLIMBED to CONFIG_11 UNILATERALLY (no SET_CONFIG ACK)",
+			cmd->current_configuration, CFG_HI);
+		check(ts_cmd->current_configuration == CFG_HI,
+			"A1b CMD PHY twin coherent at CONFIG_11", ts_cmd->current_configuration, CFG_HI);
+		check(cmd->messages_control.status == FREE,
+			"A2 NO SET_CONFIG control frame on the wire (unilateral climb)",
+			cmd->messages_control.status, FREE);
+		// D1 ARM: a climb is announced but NOT yet confirmed -> the re-tag is armed for
+		// CONFIG_11, the pre-announce config (CONFIG_9) recorded for the climb-up predicate.
+		check(cmd->inband_retag_armed,
+			"A3 D1 re-tag ARMED for the climb (awaiting RX follow confirm)",
+			cmd->inband_retag_armed ? 1 : 0, 1);
+		check(cmd->inband_retag_config == CFG_HI,
+			"A4 re-tag config is the climbed-to CONFIG_11", cmd->inband_retag_config, CFG_HI);
+		check(cmd->inband_pre_announce_config == CFG_LO,
+			"A5 pre-announce config (CONFIG_9) recorded (the climb-up basis)",
+			cmd->inband_pre_announce_config, CFG_LO);
+
+		// The unilateral one-shot re-routes the CMD back to TRANSMITTING_DATA.
+		cmd->process_messages_tx_control();
+		check(cmd->connection_status == TRANSMITTING_DATA,
+			"A6 CMD re-routed to TRANSMITTING_DATA (unilateral climb)",
+			cmd->connection_status, TRANSMITTING_DATA);
+
+		// --- RX FOLLOWS UP from the real passband tag ---
+		const int climb_bsi = 9;
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts_rx->operation_mode = ARQ_MODE;
+		rx->telecom_system = ts_rx;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->load_configuration(CFG_LO, FULL, NO);   // RX has been decoding CONFIG_9
+		rx->sack_v2_enabled = true;
+		rx->inband_rate_enabled = 1;
+		rx->rsp_current_expected_batch_seq_id = (climb_bsi - 1) & 0xFF;
+		rx->rsp_prev_batch_seq_id = (climb_bsi - 2) & 0xFF;
+		rx->rsp_last_delivered_batch_seq_id = (climb_bsi - 1) & 0xFF;
+		check(rx->current_configuration == CFG_LO, "A7 RX starts at CONFIG_9",
+			rx->current_configuration, CFG_LO);
+
+		// W1: build the climb tag (CONFIG_11) — the SAME tones+keyer the production emit
+		// produces. Parity 1 (the first change after a fresh ctor flips 0->1).
+		int tones[gf16ra::GF16RA_MAX_N]; int n_tones = 0; uint8_t built_bsi_lsb = 0;
+		const uint8_t TX_PARITY = 1;
+		bool built = cmd->build_config_tag_tones(CFG_HI, climb_bsi, TX_PARITY,
+			tones, &n_tones, &built_bsi_lsb);
+		check(built, "A8 W1 build_config_tag_tones for the CLIMB config", built ? 1 : 0, 1);
+
+		int sym_samples = ts_rx->data_container.Nofdm * ts_rx->data_container.interpolation_rate;
+		int signal_period = sym_samples * ts_rx->data_container.buffer_Nsymb;
+		int base_total = ts_rx->ack_mfsk.config_tag_sync_nsymb();
+		int burst_nsymb = base_total + n_tones;
+		int burst_samples = burst_nsymb * ts_rx->data_container.Nofdm * ts_rx->frequency_interpolation_rate;
+		std::vector<double> burst((size_t)burst_samples + 64, 0.0);
+		int written = ts_rx->generate_config_tag_pattern_passband(burst.data(), tones, n_tones);
+		check(written == burst_samples, "A9 W1 keyed the climb tag to passband",
+			written, burst_samples);
+		{
+			MUTEX_LOCK(&capture_prep_mutex);
+			for(int i = 0; i < 2 * signal_period; i++)
+				ts_rx->data_container.passband_delayed_data[i] = 0.0;
+			ts_rx->data_container.ring_write_index = 0;
+			int place_end = signal_period - 8 * sym_samples;
+			int place_start = place_end - written;
+			if(place_start < 0) place_start = 0;
+			for(int i = 0; i < written && (place_start + i) < signal_period; i++)
+				ts_rx->data_container.passband_delayed_data[place_start + i] = burst[i];
+			MUTEX_UNLOCK(&capture_prep_mutex);
+		}
+
+		int followed_cfg = -999;
+		int followed = rx->inband_detect_follow_from_capture(
+			(uint8_t)(climb_bsi & 0x7), /*expect_parity=*/0xFF, &followed_cfg);
+		check(followed == 1, "A10 RX FOLLOWS the CLIMB tag UP", followed, 1);
+		check(followed_cfg == CFG_HI, "A11 RX follows UP to CONFIG_11 FROM THE TAG",
+			followed_cfg, CFG_HI);
+		check(rx->current_configuration == CFG_HI,
+			"A12 RX ARQ config tracks UP to CONFIG_11", rx->current_configuration, CFG_HI);
+		check(ts_rx->current_configuration == CFG_HI,
+			"A13 RX PHY twin coherent at CONFIG_11 (no cross-layer desync)",
+			ts_rx->current_configuration, CFG_HI);
+		check(rx->current_configuration == ts_rx->current_configuration,
+			"A14 RX ARQ config == PHY-twin config after the climb",
+			rx->current_configuration, ts_rx->current_configuration);
+
+		delete cmd; delete rx; delete ts_cmd; delete ts_rx;
+	}
+
+	// ========================================================================
+	// PART B — REPEAT-UNTIL-FOLLOWED: re-emit each batch until a SACK confirms, THEN STOP.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_LO, &ts);
+		// Arm the climb via the production chokepoint (CONFIG_9 -> CONFIG_11), as PART A.
+		cmd->negotiated_configuration = CFG_HI;
+		cmd->add_message_control(SET_CONFIG);
+		cmd->process_messages_tx_control();   // re-route, slot freed
+		check(cmd->inband_retag_armed, "B0 re-tag armed for the climb",
+			cmd->inband_retag_armed ? 1 : 0, 1);
+
+		// Drive the PRODUCTION firing decision per batch (the exact function send_batch's
+		// emit_config_tag_passband calls). B0 = the change batch; B1, B2 = repeats.
+		const int B0_bsi = 20, B1_bsi = 21, B2_bsi = 22, B3_bsi = 23;
+		uint8_t p0 = 0xFF, p1 = 0xFF, p2 = 0xFF, p3 = 0xFF;
+
+		// B0 = the change batch (always emits in BOTH arms).
+		bool e0 = cmd->inband_tag_firing_decision(CFG_HI, B0_bsi, &p0);
+		check(e0, "B1 B0 EMITS the tag (fresh change)", e0 ? 1 : 0, 1);
+		check(cmd->inband_retag_count == 1, "B2 retag_count==1 after B0",
+			cmd->inband_retag_count, 1);
+		check(cmd->inband_announce_bsi == B0_bsi,
+			"B3 announce-bsi anchor latched to B0's bsi", cmd->inband_announce_bsi, B0_bsi);
+
+#ifdef INBAND_RETAG_FAILBEFORE
+		// FAIL-BEFORE: model the OLD fire-once policy — once the config is announced, a
+		// later batch at the SAME config no longer re-emits. Disarm so clause (b) (the
+		// repeat) cannot fire. The SAME positive B4/B5 asserts below then FAIL (a lost
+		// climb is never re-announced -> never followed), proving the repeat is load-bearing.
+		cmd->inband_retag_armed = false;
+#endif
+		// B1, B2 = repeats (pass-after: RE-EMIT; fail-before: do NOT -> these FAIL).
+		bool e1 = cmd->inband_tag_firing_decision(CFG_HI, B1_bsi, &p1);
+		check(e1, "B4 B1 RE-EMITS the tag (repeat-until-followed)", e1 ? 1 : 0, 1);
+		bool e2 = cmd->inband_tag_firing_decision(CFG_HI, B2_bsi, &p2);
+		check(e2, "B5 B2 RE-EMITS the tag (repeat-until-followed)", e2 ? 1 : 0, 1);
+		check(cmd->inband_retag_count == 3, "B6 retag_count reached 3 (R floor) across B0..B2",
+			cmd->inband_retag_count, 3);
+		// PARITY HELD across the repeats (the load-bearing §1.5 invariant): B1/B2 carry the
+		// SAME epoch parity as B0 — a repeat must NOT look like a fresh change to the RX.
+		check(p1 == p0 && p2 == p0,
+			"B7 epoch parity HELD across B0->B2 (one epoch; RX HINGE not re-run)",
+			(p1 == p0 && p2 == p0) ? 1 : 0, 1);
+		// The anchor did NOT move on the repeats (latched once on B0).
+		check(cmd->inband_announce_bsi == B0_bsi,
+			"B8 announce-bsi anchor UNCHANGED across the repeats", cmd->inband_announce_bsi, B0_bsi);
+
+		// A returning SACK at-or-after the announce bsi CONFIRMS -> DISARM (BOTH arms; the
+		// confirm consumer is unconditional). Pass-after: armed -> disarms. Fail-before: the
+		// armed flag was already cleared by the fire-once model, so there is nothing to
+		// disarm and B10 still reads disarmed — the load-bearing fail is B4/B5 above.
+		bool confirmed = cmd->inband_retag_confirm_from_sack(B0_bsi);
+		(void)confirmed;
+		check(!cmd->inband_retag_armed, "B10 re-tag DISARMED on confirm (repeat STOPS)",
+			cmd->inband_retag_armed ? 1 : 0, 0);
+		// B11 records the confirmed config as last-confirmed (pass-after). In fail-before the
+		// fire-once model already disarmed, so the confirm is a no-op and last-confirmed stays
+		// CONFIG_NONE -> B11 FAILS (a second load-bearing fail-before signal).
+		check(cmd->inband_last_confirmed_config == CFG_HI,
+			"B11 last-confirmed config recorded == CONFIG_11", cmd->inband_last_confirmed_config, CFG_HI);
+		// B3: after the confirm, the steady state emits NOTHING (zero re-tag overhead).
+		bool e3 = cmd->inband_tag_firing_decision(CFG_HI, B3_bsi, &p3);
+		check(!e3, "B12 B3 emits NOTHING after confirm (zero steady-state re-tag)", e3 ? 1 : 0, 0);
+		(void)p3;
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART C — AUTO-DEMOTE: a CLIMB the RX cannot follow for R retries -> demote to
+	// last-confirmed, BREAK-count == 0.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_LO, &ts);
+		// Establish a LAST-CONFIRMED floor at CONFIG_9 (the RX provably reached it) — model
+		// it as a confirmed change to the starting config so the demote has a real floor.
+		cmd->inband_last_confirmed_config = CFG_LO;
+
+		// Arm a CLIMB to CONFIG_11 via the chokepoint.
+		cmd->negotiated_configuration = CFG_HI;
+		cmd->add_message_control(SET_CONFIG);
+		cmd->process_messages_tx_control();
+		check(cmd->current_configuration == CFG_HI && cmd->inband_retag_armed,
+			"C0 CMD climbed to CONFIG_11 + re-tag armed",
+			(cmd->current_configuration == CFG_HI && cmd->inband_retag_armed) ? 1 : 0, 1);
+
+		// Re-emit R times with NO confirm (the RX cannot follow the climb).
+		int R = cmd->inband_retag_min_count();
+		for(int b = 0; b < R; b++)
+		{
+			uint8_t pp = 0xFF;
+			cmd->inband_tag_firing_decision(CFG_HI, 30 + b, &pp);
+		}
+		check(cmd->inband_retag_count >= R, "C1 re-tagged the climb R times with no confirm",
+			cmd->inband_retag_count >= R ? 1 : 0, 1);
+
+#ifndef INBAND_RETAG_FAILBEFORE
+		// The escalation: the un-confirmed climb past R AUTO-DEMOTES to last-confirmed.
+		bool demoted = cmd->inband_retag_escalate_if_climb_exhausted();
+#else
+		// FAIL-BEFORE: the auto-demote is REMOVED — the hopeless climb is never escalated.
+		// The SAME positive C2/C3 asserts below then FAIL (the climb stays stuck at CONFIG_11),
+		// proving the auto-demote is load-bearing (without it a climb the RX can't follow
+		// would, in production, eventually fall to a BREAK cascade).
+		bool demoted = false;
+#endif
+		// === The pass-after expectation (run in BOTH arms; fail-before FAILS it) ===
+		check(demoted, "C2 the unfollowable climb AUTO-DEMOTED (escalation routed)",
+			demoted ? 1 : 0, 1);
+		check(cmd->current_configuration == CFG_LO,
+			"C3 demoted to the LAST-CONFIRMED config CONFIG_9 (not BREAK, not ROBUST_0)",
+			cmd->current_configuration, CFG_LO);
+		check(cmd->send_break_pattern_count == 0,
+			"C4 BREAK-count == 0 (the climb-miss did NOT cascade)",
+			cmd->send_break_pattern_count, 0);
+		// A FRESH re-tag is armed for the demote target (D1 again, for the demote).
+		check(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO,
+			"C5 a FRESH re-tag armed for the demote target CONFIG_9",
+			(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO) ? 1 : 0, 1);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART D — TURBO-GATED: a turbo-climb-fail under inband routes to the tag-demote
+	// (inband_route_failure_demote, the EXACT body the gated turbo BREAK sites call),
+	// BREAK-count == 0.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_HI, &ts);   // CMD speculatively climbed to CONFIG_11
+		cmd->inband_last_confirmed_config = CFG_LO;        // last config the RX provably reached
+		check(cmd->current_configuration == CFG_HI,
+			"D0 CMD at the speculative climb rung CONFIG_11", cmd->current_configuration, CFG_HI);
+
+		// The gated turbo sites compute demote_target = last-confirmed (CONFIG_9) and call
+		// inband_route_failure_demote — exactly this. (Driving the helper is the faithful
+		// synthetic-fire of all three turbo sites' inband branch; the real PHY BREAK needs
+		// an audio pipeline a synthetic CMD lacks.)
+		int demote_target = (cmd->inband_last_confirmed_config != CONFIG_NONE)
+			? cmd->inband_last_confirmed_config
+			: config_ladder_down(CFG_HI, NO);
+		bool routed = cmd->inband_route_failure_demote(demote_target, "turbo_forward_climb_unfollowable");
+		check(routed, "D1 the turbo-climb-fail ROUTED to a tag-demote (not a BREAK)",
+			routed ? 1 : 0, 1);
+		check(cmd->current_configuration == CFG_LO,
+			"D2 turbo-climb-fail DEMOTED to last-confirmed CONFIG_9 (not ROBUST_0)",
+			cmd->current_configuration, CFG_LO);
+		check(cmd->send_break_pattern_count == 0,
+			"D3 BREAK-count == 0 (the turbo-climb-fail did NOT cascade to ROBUST_0)",
+			cmd->send_break_pattern_count, 0);
+		check(cmd->messages_control.status == FREE,
+			"D4 NO SET_CONFIG control frame on the wire (unilateral tag demote)",
+			cmd->messages_control.status, FREE);
+		delete cmd; delete ts;
+	}
 
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);

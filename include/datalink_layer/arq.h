@@ -1851,6 +1851,15 @@ public:
   // current_configuration here); `batch_seq_id` is its bsi (binds the tag).
   int emit_config_tag_passband(int batch_cfg, int batch_seq_id);
 
+  // STAGE 4d (D1) — the CONFIG_TAG FIRING-POLICY DECISION + announce state machine,
+  // factored out of emit_config_tag_passband (the production emit calls this; the
+  // directed test --test-inband-retag drives it directly without the passband side
+  // effects). Returns true to EMIT (a CHANGE or an armed REPEAT) / false for steady
+  // state. On true it has mutated the announce state (parity toggle/hold, last-announced
+  // latch, announce-bsi anchor, R counter) exactly as the production emit needs, and
+  // written *out_parity. See the definition comment for the change-vs-repeat parity rule.
+  bool inband_tag_firing_decision(int batch_cfg, int batch_seq_id, uint8_t* out_parity);
+
   // ---- In-band rate adaptation (Stage 3b W2) — DETECT+FOLLOW from the capture.
   // Called from the RX first-frame path at/near the [RSP-V2-ADOPT] adopt site. Pulls
   // the CONFIG_TAG burst out of the captured passband tail (the burst W1 keyed right
@@ -1970,6 +1979,17 @@ public:
   // removed -> a Class-A degradation BREAKs under inband (BREAK-count>0). Returns 0=PASS,
   // 1=FAIL. inband-reliability-design.md §5.6, data-flow-perbatch-config.md §S4C.
   int test_inband_no_break();
+
+  // STAGE 4d D1+D4 TEST (CLI --test-inband-retag). Drives the PRODUCTION repeat-until-
+  // followed + climb/auto-demote functions: PART A a CONFIG_9->CONFIG_11 chokepoint climb
+  // the RX FOLLOWS UP (both ends + PHY twin); PART B inband_tag_firing_decision re-emits
+  // each batch until a SACK confirms then STOPS (parity HELD across the repeats, anchor
+  // latched once); PART C an un-confirmed climb past R AUTO-DEMOTES to last-confirmed with
+  // BREAK-count==0; PART D the body the gated turbo BREAK sites call routes a turbo-climb-
+  // fail to a tag-demote (BREAK-count==0). fail-before (-DINBAND_RETAG_FAILBEFORE): fire-
+  // once + no auto-demote -> the lost climb is never followed / the hopeless climb stays
+  // armed -> B/C FAIL. Returns 0=PASS, 1=FAIL. inband-reliability-design.md §1.6 / §4.6.
+  int test_inband_retag();
 
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on
@@ -3115,6 +3135,42 @@ public:
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
 
+  // ── STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (inband-reliability-
+  //    design.md §1/§4) ──
+  // After a committed config change the sender RE-EMITS the CONFIG_TAG on EVERY
+  // subsequent batch (emit_config_tag_passband firing-policy clause (b)) until a
+  // returning SACK proves the RX is operating at the announced config; then it STOPS
+  // (back to zero steady-state overhead). The confirm is IMPLICIT (design §1.1/§5.2): a
+  // SACK acking a bsi at-or-after inband_announce_bsi proves the RX demodulated a batch
+  // sent AT the announced config (it could not have produced that SACK otherwise). The
+  // R floor (inband_retag_min, default 3, MERCURY_INBAND_RETAG_MIN) is the give-up
+  // trigger: a CLIMB still un-confirmed after R re-tags AUTO-DEMOTES to the last-
+  // confirmed config via the tag (NEVER a BREAK, design §4.3). All members ADDITIVE,
+  // gated by MERCURY_INBAND_RATE (default-off byte-identical). Init in arq_common.cc
+  // next to the other inband state + reset_session_state.
+  bool inband_retag_armed   = false;        // a change announced but NOT yet confirmed -> re-emit
+  int  inband_retag_config  = CONFIG_NONE;  // the announced config being repeated
+  int  inband_announce_bsi  = -1;           // bsi of the FIRST batch at retag_config (confirm anchor)
+  int  inband_retag_count   = 0;            // re-tags emitted since arm (the R counter)
+  int  inband_retag_min     = -1;           // cached MERCURY_INBAND_RETAG_MIN (-1=unresolved, default 3)
+  int  inband_last_confirmed_config = CONFIG_NONE; // highest config a SACK has CONFIRMED (demote floor)
+  int  inband_pre_announce_config   = CONFIG_NONE; // config BEFORE the announced change (climb-up basis)
+  // Resolve+cache the R floor (>=1). MERCURY_INBAND_RETAG_MIN, default 3.
+  int  inband_retag_min_count();
+  // D1 implicit-confirm consumer: a returning SACK acked bsi `rx_bsi`. If the re-tag is
+  // armed and rx_bsi is at-or-after inband_announce_bsi (mod-256 forward distance), the
+  // announced config is CONFIRMED FOLLOWED: DISARM the re-tag, record
+  // inband_last_confirmed_config, and STOP re-emitting. No-op when not armed / stale bsi.
+  // Returns true if it disarmed (confirmed). Called from every SACK accept site.
+  bool inband_retag_confirm_from_sack(int rx_bsi);
+  // D4 escalation: called after an armed re-tag emit. If the re-tag has reached the R
+  // floor with NO confirm AND the announcement was a CLIMB-UP (the down-ladder cannot
+  // rescue a lost climb), AUTO-DEMOTE to inband_last_confirmed_config via the chokepoint
+  // tag (inband_route_failure_demote) — NEVER a BREAK. A DROP that is un-confirmed is
+  // rescued by the RX down-ladder + the continuing re-tag, so it does not escalate here.
+  // Returns true if it routed an auto-demote. COMMANDER-only (uses the demote helper).
+  bool inband_retag_escalate_if_climb_exhausted();
+
   // ── STAGE 4 — the bounded down-ladder lost-tag resync state (design §4/§7) ──
   // The down-window depth D is owner-tunable via MERCURY_INBAND_DOWN_D (default 4,
   // per the codeword study, §4.2); SESSION_DEAD_BATCHES via
@@ -3149,7 +3205,7 @@ public:
   void inband_free_down_decoders();
 
   // Stage 3b GEARSHIFT DRIVE (unilateral drop). When MERCURY_INBAND_RATE is set,
-  // add_message_control(SET_CONFIG) takes the UNILATERAL path (inband_unilateral_drop)
+  // add_message_control(SET_CONFIG) takes the UNILATERAL path (inband_unilateral_config_change)
   // instead of queueing a SET_CONFIG control handshake: it loads the gearshift
   // target config directly (so the next send_batch transmits at the new rung and
   // the W1 emit announces it via the passband tag) and re-fills TX. Because EVERY
@@ -3167,7 +3223,7 @@ public:
   // SET_CONFIG ACK-apply refill at arq_commander.cc:5291-5293). NO control frame is
   // queued. Returns true if the drop applied (target valid + a real change), false
   // if it was a no-op (same config / invalid target) so the builder can fall back.
-  bool inband_unilateral_drop(int target_cfg);
+  bool inband_unilateral_config_change(int target_cfg);
 
   // ── STAGE 4c — D5: BREAK truly obsolete (inband-reliability-design.md §5,
   //    data-flow-perbatch-config.md §S4C) ──
@@ -3185,7 +3241,7 @@ public:
   // GAP-ABORT), sets the config owners to demote_target so the chokepoint reads it
   // (negotiated_configuration), pins supershift_proven_ceiling, resets the nack/
   // starve streaks, runs the optimizer supremacy hook, then add_message_control(
-  // SET_CONFIG) (which under inband becomes inband_unilateral_drop + the tag) and
+  // SET_CONFIG) (which under inband becomes inband_unilateral_config_change + the tag) and
   // sets connection_status=TRANSMITTING_CONTROL. Returns true if it routed the
   // demote (caller must `return` — the demote owns the next transition). MUST be
   // called only with a valid lower rung (caller checks !config_is_at_bottom).

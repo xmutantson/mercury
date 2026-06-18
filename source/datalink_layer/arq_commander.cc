@@ -736,7 +736,7 @@ int cl_arq_controller::add_message_control(char code)
 				int inband_target = (gear_shift_algorithm==SNR_BASED)
 					? get_configuration(measurements.SNR_downlink)
 					: negotiated_configuration;
-				if(inband_unilateral_drop(inband_target))
+				if(inband_unilateral_config_change(inband_target))
 				{
 					// Unilateral path took it: NO control frame on the wire.
 					messages_control.status = FREE;
@@ -1377,6 +1377,25 @@ void cl_arq_controller::process_messages_tx_data()
 	// batch-prep work (retx prefix, compression of new-data frames,
 	// pad to size, etc.).
 	mtl::log_event("cmd_tx_data_entry");
+
+	// STAGE 4d (D4 ESCALATION): before building the next batch, check whether an armed
+	// CLIMB re-tag has exhausted its R floor with NO returning SACK confirm. The previous
+	// send_batch() emitted the re-tag (incrementing inband_retag_count); a SACK confirm
+	// would have DISARMED it via inband_retag_confirm_from_sack at the ACK-poll. If it is
+	// STILL armed past R AND it was a CLIMB-UP (the down-ladder is down-only and cannot
+	// rescue a lost climb), AUTO-DEMOTE to the last-confirmed config via the chokepoint tag
+	// — NEVER a BREAK (design §4.1(b)/§4.3). The demote routes a SET_CONFIG through the
+	// chokepoint (-> inband_unilateral_config_change + the W1 tag) and forces
+	// TRANSMITTING_CONTROL; the inband_unilateral_armed one-shot re-routes back to
+	// TRANSMITTING_DATA in process_messages_tx_control. Return so the demote owns the next
+	// transition (do not also build a climb batch this cycle). No-op when inband is off /
+	// not armed / not a climb / within R.
+	if(inband_rate_feature_enabled() && inband_retag_escalate_if_climb_exhausted())
+	{
+		this->connection_status = TRANSMITTING_CONTROL;
+		return;
+	}
+
 	// SACK retransmit path (v1 only): send only the missing frames from last SACK
 	// as a standalone retransmit-only batch.
 	//
@@ -2520,6 +2539,36 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					return;
 				}
 
+				// STAGE 4d (RESIDUAL — turbo speculative-climb fail gate, design §4.3 /
+				// Stage-4c residual). A TURBO_FORWARD speculative climb that the RX could
+				// not follow must NOT cascade to ROBUST_0 under inband — it AUTO-DEMOTES to
+				// the last-confirmed config via the CONFIG_TAG, exactly like a D1 climb that
+				// exhausted its R floor (this IS a speculative climb the RX did not follow).
+				// Route to inband_route_failure_demote (BREAK-count stays 0); only if the
+				// demote is a no-op (already at the floor / invalid) fall through to the
+				// legacy BREAK below. Cancel the failed turbo state first so the demote starts
+				// clean. Gated OFF -> byte-identical legacy BREAK.
+				if(inband_rate_feature_enabled())
+				{
+					int demote_target = (inband_last_confirmed_config != CONFIG_NONE)
+						? inband_last_confirmed_config
+						: config_ladder_down(failed_config, robust_enabled);
+					turboshift_active = false;
+					turbo_supershift_announce_pending = false;
+					// Free the failed turbo control slot so the demote's add_message_control(
+					// SET_CONFIG) can claim it (add_message_control requires status==FREE).
+					messages_control.ack_timeout=0;
+					messages_control.id=0;
+					messages_control.length=0;
+					messages_control.nResends=0;
+					messages_control.status=FREE;
+					messages_control.type=NONE;
+					if(inband_route_failure_demote(demote_target, "turbo_forward_climb_unfollowable"))
+						return;   // demoted via the tag; the demote owns the next transition
+					// no-op demote (no lower rung): fall through to the legacy BREAK -> the
+					// SESSION_DEAD_BATCHES floor is the genuine true-loss path.
+				}
+
 				// TURBO_FORWARD or higher ceiling: BREAK to ROBUST_0, then drop to
 				// the SNR-predicted start config (not just 1 step below ceiling).
 				// Dropping 1 step at a time wastes time probing configs that can't work.
@@ -2596,6 +2645,34 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					printf("[TURBO] SWITCH_ROLE failed %d times, BREAK to settle at config %d\n",
 						turbo_switch_role_retries, settle_config);
 					fflush(stdout);
+
+					// STAGE 4d (RESIDUAL — turbo speculative-climb fail gate, design §4.3 /
+					// Stage-4c residual). A failed turbo SWITCH_ROLE is the role-swap arm of a
+					// speculative climb the RX could not complete; under inband it AUTO-DEMOTES
+					// to the last-confirmed config via the CONFIG_TAG, NOT the ROBUST_0 cascade.
+					// End the turbo state, free the pending control slot (so the demote's
+					// SET_CONFIG wins it), then route the tag-demote (BREAK-count stays 0). A
+					// no-op demote falls through to the legacy BREAK -> SESSION_DEAD_BATCHES floor.
+					if(inband_rate_feature_enabled())
+					{
+						int demote_target = (inband_last_confirmed_config != CONFIG_NONE)
+							? inband_last_confirmed_config : settle_config;
+						turbo_switch_role_retries = 0;
+						turboshift_phase = TURBO_DONE;
+						turboshift_active = false;
+						turbo_supershift_announce_pending = false;
+						turbo_snr_ack_enabled = false;
+						turbo_received_snr = -99.0f;
+						messages_control.ack_timeout=0;
+						messages_control.id=0;
+						messages_control.length=0;
+						messages_control.nResends=0;
+						messages_control.status=FREE;
+						messages_control.type=NONE;
+						if(inband_route_failure_demote(demote_target, "turbo_switch_role_unfollowable"))
+							return;   // demoted via the tag; the demote owns the next transition
+						// no-op demote (no lower rung): fall through to the legacy BREAK.
+					}
 
 					turbo_switch_role_retries = 0;
 					turboshift_phase = TURBO_DONE;
@@ -2674,6 +2751,24 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				messages_control.nResends=0;
 				messages_control.status=FREE;
 				messages_control.type=NONE;
+
+				// STAGE 4d (RESIDUAL — turbo/frame speculative-climb fail gate, design §4.3
+				// / Stage-4c residual). A FRAME-UP climb the RX could not follow AUTO-DEMOTES
+				// to the last-confirmed config via the CONFIG_TAG under inband, NOT the
+				// ROBUST_0 BREAK cascade. (Under inband a config change rides the tag, not a
+				// SET_CONFIG handshake, so this NAck path is normally unreachable for a config
+				// change — but gate it anyway so a residual SET_CONFIG fail demotes, never
+				// cascades.) The failed control slot was freed just above. Route the tag-demote;
+				// a no-op falls through to the legacy BREAK -> the SESSION_DEAD_BATCHES floor.
+				// Gated OFF -> byte-identical legacy BREAK.
+				if(inband_rate_feature_enabled())
+				{
+					int demote_target = (inband_last_confirmed_config != CONFIG_NONE)
+						? inband_last_confirmed_config : working_config;
+					if(inband_route_failure_demote(demote_target, "frame_up_climb_unfollowable"))
+						return;   // demoted via the tag; the demote owns the next transition
+					// no-op demote (no lower rung): fall through to the legacy BREAK.
+				}
 
 				// Reset config state to the working config
 				data_configuration = working_config;
@@ -2765,7 +2860,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 //      re-sent batch is contiguous with the RSP delivery high-water (no D3.1 GAP-ABORT),
 //   2. FIFO push-back / restore_tx_from_compressed (preserve in-flight bytes),
 //   3. set the config owners to demote_target (so the chokepoint at :736-739 reads
-//      negotiated_configuration -> inband_unilateral_drop(demote_target) -> tag),
+//      negotiated_configuration -> inband_unilateral_config_change(demote_target) -> tag),
 //   4. pin supershift_proven_ceiling, reset the nack + revack-starve streaks,
 //   5. policy_axis1_supremacy_on_move (keep the optimizer cooldown coherent),
 //   6. add_message_control(SET_CONFIG) (under inband: the unilateral drop + W1 tag)
@@ -2871,7 +2966,7 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	}
 
 	// (6) Emit the demote through the CHOKEPOINT. Under inband, add_message_control(
-	// SET_CONFIG) takes the unilateral path (inband_unilateral_drop(negotiated_configuration))
+	// SET_CONFIG) takes the unilateral path (inband_unilateral_config_change(negotiated_configuration))
 	// which applies the config NOW and the next send_batch W1-emits the CONFIG_TAG; the
 	// inband_unilateral_armed one-shot re-routes connection_status back to TRANSMITTING_DATA
 	// in process_messages_tx_control. Mirrors the D3 demote (:4113-4115) exactly.
@@ -3103,6 +3198,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// climb-engine Bug 1: record this clean batch bsi so a REPEATED clean for
 									// the same bsi is deduped (no double-count of nBatches_fully_acked).
 									cmd_last_applied_clean_bsi = (int)rx_bsi;
+									// STAGE 4d (D1 CONFIRM): a CLEAN SACK at-or-after the announce bsi proves the
+									// RX demodulated a batch sent at the announced config -> DISARM the re-tag
+									// (design §1.1/§1.3 consumer 1). No-op when not armed / stale bsi / inband off.
+									inband_retag_confirm_from_sack((int)rx_bsi);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									printf("[CMD-MFSK-ACK-SACK] CLEAN batch_seq_id=%u (cmd_batch_seq_id=%d) "
 										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
@@ -3124,6 +3223,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										sack_bitmap[i] = ((rx_bitmap >> i) & 1u) ? true : false;
 									sack_detected = true;
 									cmd_last_applied_sack_bsi = (int)rx_bsi;
+									// STAGE 4d (D1 CONFIRM): a PARTIAL SACK still PROVES the RX demodulated the
+									// batch at the announced config (it decoded SOME frames of it), so a PARTIAL
+									// confirms exactly like a CLEAN (design §1.7 ruling). DISARM the re-tag.
+									inband_retag_confirm_from_sack((int)rx_bsi);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
 									sack_arrival_history_next_idx =
@@ -3276,6 +3379,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						{
 							sack_detected = true;
 							cmd_last_applied_sack_bsi = (int)rx_bsi;
+							// STAGE 4d (D1 CONFIRM): an OFDM SACK_RSP at-or-after the announce bsi
+							// proves the RX demodulated the batch at the announced config -> DISARM
+							// the re-tag (design §1.1/§1.3 consumer 1). No-op when not armed / inband off.
+							inband_retag_confirm_from_sack((int)rx_bsi);
 							int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 							sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
 							sack_arrival_history_next_idx =

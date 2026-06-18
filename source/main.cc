@@ -742,6 +742,7 @@ int main(int argc, char *argv[])
     bool test_inband_fallback_cli = false;  // --test-inband-fallback: in-band Stage 4 — LOST-TAG DOWN-LADDER.
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
+    bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
                                         // Gearshift-driven unilateral drop (W3), tag on the real passband (W1),
                                         // RX follows from the passband tag (W2 + HINGE), SACK confirms (bsi),
                                         // ZERO SET_CONFIG on the wire, both ends config-track, PHY-twin coherent,
@@ -1477,6 +1478,18 @@ int main(int argc, char *argv[])
             // reaches the SESSION_DEAD_BATCHES BREAK. See arq_responder.cc
             // test_inband_no_break + data-flow-perbatch-config.md §S4C.
             test_inband_no_break_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-retag") == 0)
+        {
+            // In-band rate adaptation Stage 4d — D1 repeat-until-followed + D4 climb/
+            // auto-demote (one-shot at startup, exit rc). Drives the production firing
+            // decision + the chokepoint climb-follow + the auto-demote: a lost climb is
+            // re-tagged until a SACK confirms (then STOPS), a hopeless climb auto-demotes
+            // to last-confirmed (BREAK-count==0), a turbo-climb-fail routes to a tag-demote.
+            // See arq_responder.cc test_inband_retag + inband-reliability-design.md §1/§4.
+            test_inband_retag_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2961,6 +2974,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_no_break();
             printf("[FLAG] Inband-no-break test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_retag_cli) {
+            // In-band rate adaptation Stage 4d — D1 repeat + D4 climb/auto-demote TEST
+            // (one-shot, exit rc). Builds its own CMD/RX/telecom_system instances internally.
+            printf("[FLAG] --test-inband-retag: invoking in-band rate-adapt Stage-4d "
+                   "D1 repeat-until-followed + D4 climb/auto-demote regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_retag();
+            printf("[FLAG] Inband-retag test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
