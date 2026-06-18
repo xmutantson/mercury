@@ -4844,22 +4844,21 @@ int cl_arq_controller::test_inorder_demote()
 	bool lossy_demote = false;
 	{ const char* e = std::getenv("MERCURY_LOSSY_DEMOTE");
 	  if(e && *e && atoi(e)!=0) lossy_demote = true; }
-	// M6 BREAK-PATH LOSSLESS-REQUEUE selector (CASE 1 only): MERCURY_BREAK_LOSSLESS_REQUEUE
-	// mirrors the PRODUCTION knob break_lossless_requeue_enabled(). UNSET (the default, fail-
-	// before): the BREAK strands the in-flight batch and the recovery re-sends it under a FRESH
-	// (advanced) epoch bsi (cmd_batch_seq_id was never rolled back) -> the post-BREAK re-adopt
-	// sees a NON-CONTIGUOUS hole vs the delivery high-water -> RSP-V2-GAP-ABORT. SET (the fix,
-	// pass-after): the BREAK rolls cmd_batch_seq_id back to the EARLIEST in-flight bsi (= high-
-	// water+1) BEFORE send_break_pattern(), so the recovery re-send carries the CONTIGUOUS bsi
-	// the RSP expects next -> no hole, delivered, link stays CONNECTED. Same knob, same effect
+	// M6 BREAK-PATH LOSSLESS-REQUEUE selector (CASE 1 only). Mirrors the PRODUCTION knob
+	// break_lossless_requeue_enabled(), which is DEFAULT-ON 2026-06-18 (proven fix ships
+	// default-on). DEFAULT (no env): the fix arm — the BREAK rolls cmd_batch_seq_id back to
+	// the EARLIEST in-flight bsi (= high-water+1) BEFORE send_break_pattern(), so the recovery
+	// re-send carries the CONTIGUOUS bsi the RSP expects next -> no hole, delivered, link stays
+	// CONNECTED. MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE set (the escape hatch / fail-before):
+	// the BREAK strands the in-flight batch and the recovery re-sends it under a FRESH (advanced)
+	// epoch bsi (cmd_batch_seq_id was never rolled back) -> the post-BREAK re-adopt sees a
+	// NON-CONTIGUOUS hole vs the delivery high-water -> RSP-V2-GAP-ABORT. Same knob/semantics
 	// the production fix has on the wire bsi; the BYTES are identical (FIFO push-back preserves
 	// them). Independent of MERCURY_GAP_ABORT_DEFEAT (which still exercises the silent-concat
 	// fail-before for the integrity-guard regression).
-	bool break_lossless = false;
-	{ const char* e = std::getenv("MERCURY_BREAK_LOSSLESS_REQUEUE");
-	  if(e && *e && atoi(e)!=0) break_lossless = true; }
+	bool break_lossless = (std::getenv("MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE") == nullptr);
 	printf("[TEST-INORDER-DEMOTE] start (MERCURY_GAP_ABORT_DEFEAT=%d MERCURY_LOSSY_DEMOTE=%d "
-		"MERCURY_BREAK_LOSSLESS_REQUEUE=%d)\n",
+		"break_lossless_enabled=%d [default-on; MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE clears])\n",
 		defeat ? 1 : 0, lossy_demote ? 1 : 0, break_lossless ? 1 : 0);
 	fflush(stdout);
 

@@ -4722,16 +4722,21 @@ bool cl_arq_controller::bigblock_carve_suspended()
 	return true;
 }
 
-// BREAK forward-health gate (fix/break-fh-gate). Default-OFF env MERCURY_BREAK_FH_GATE.
+// BREAK forward-health gate (fix/break-fh-gate). DEFAULT-ON 2026-06-18 (proven fix; owner
+// policy = proven fixes ship default-on). The gate is ENABLED unless the escape hatch
+// MERCURY_BREAK_FH_GATE_DISABLE is set, which restores the pre-fix default-off behavior for
+// an A/B revert. This is ONLY the env-enable half — every downstream forward-health
+// sub-condition (break_fh_suppress's BREAK_FH_LATCH_FRAMES recency check, break_kofn_corroborate's
+// K-of-N streak, break_fh_carve_lift's coarse-metric guard) is unchanged.
 // Cached once: getenv is a syscall, and this is polled on every failed-decode receive().
 // break_fh_gate_test_override: UNIT-TEST seam only (-1 = honor env, 0/1 = force). It lets
-// run_break_fh_gate_tests() exercise BOTH gate states in one process despite the cached env
-// read; production NEVER sets it, so the env path is unchanged -> default-off byte-identical.
+// run_break_fh_gate_tests() exercise BOTH gate states in one process despite the cached env read.
 int cl_arq_controller::break_fh_gate_test_override = -1;
 bool cl_arq_controller::break_fh_gate_enabled()
 {
 	if(break_fh_gate_test_override >= 0) return break_fh_gate_test_override != 0;
-	static const bool en = (std::getenv("MERCURY_BREAK_FH_GATE") != nullptr);
+	// Default-ON: enabled unless the *_DISABLE escape hatch is present.
+	static const bool en = (std::getenv("MERCURY_BREAK_FH_GATE_DISABLE") == nullptr);
 	return en;
 }
 

@@ -55,16 +55,18 @@ static inline bool sack_rx_trace_enabled()
 // [RSP-V2-GAP-ABORT] terminally kills the transfer. The FIX-9 D3 SET_CONFIG demote
 // (~:3950-4018) already captures the earliest in-flight bsi BEFORE freeing
 // messages_tx[] and rolls cmd_batch_seq_id back to it, so the re-send is contiguous.
-// This knob ports that capture+rollback into the BREAK path. DEFAULT-OFF: unset (or
-// explicit "0") -> disabled => the BREAK path is BYTE-IDENTICAL to the pre-M6
-// behavior. Any other non-empty value enables the lossless requeue.
+// This knob ports that capture+rollback into the BREAK path. DEFAULT-ON 2026-06-18
+// (proven fix; owner policy = proven fixes ship default-on). The fix is ENABLED unless
+// the escape hatch MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE is set (any non-empty value),
+// which restores the pre-M6 BYTE-IDENTICAL BREAK behavior for an A/B revert.
 static inline bool break_lossless_requeue_enabled()
 {
 	static int cached = -1;
 	if(cached < 0)
 	{
-		const char* e = std::getenv("MERCURY_BREAK_LOSSLESS_REQUEUE");
-		cached = (e && *e && *e != '0') ? 1 : 0;
+		// Default-ON: enabled unless the *_DISABLE escape hatch is present.
+		const char* dis = std::getenv("MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE");
+		cached = (dis == nullptr) ? 1 : 0;
 	}
 	return cached != 0;
 }
