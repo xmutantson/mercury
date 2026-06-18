@@ -82,6 +82,10 @@ cl_telecom_system::cl_telecom_system()
 	// on BOTH peers (the R-B pin), and the live TX/RX paths (bigblock_send_one_block /
 	// bigblock_receive_carve) engage at the CFG16 OFDM rung. Default unset = stock OFF =
 	// byte-identical per-frame path. Not wired into the gearshift (that is P4).
+	// HELD 2026-06-17: cannot be a simple default-flip — the big-block path is NOT wired
+	// into the gearshift/optimizer (no climb can reach it) and the whole family is gated
+	// behind the unresolved CFG16-acquisition D1->D5 chain (CLAUDE.md STOP-gate). Needs
+	// gearshift wiring + the CFG16-acq fix before it can ship. Keep default-off.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_FRAMING");
 	  if(e && *e && atoi(e) != 0) bigblock_framing_enabled = true; }
 	receive_stats.iterations_done=-1;
@@ -3022,6 +3026,9 @@ skip_h_retry_point:
 
 			auto t4_ldpc = std::chrono::steady_clock::now();
 			// Turbo-EQ (RESEARCH_turbo-eq.md §4.1/§4.2). MERCURY_TURBO_ITERS (default 1
+			// unproven, default-off pending proof 2026-06-17: measured a sim NON-BEAT
+			// standalone (neither headline cell crosses the per-frame LDPC threshold; root
+			// blocker = cold-start), no HW net-win. Keep default-off until proven.
 			// = OFF, byte-identical) caps the iterative decision-directed CE loop. When
 			// >1 AND this is an OFDM (non-MFSK) frame, capture the LDPC a-posteriori LLR
 			// so the post-decode turbo refinement (the CRC-fail block below) can soft-
@@ -6376,6 +6383,9 @@ void cl_telecom_system::sfo_grid_test()
 	double ppm     = env_f("MERCURY_SIM2_SFO_PPM", 0.0);
 	bool   track   = (env_i("MERCURY_SFO_GRID_TRACK", 0) != 0);     // STEP 2: CPE/PEG corrector
 	bool   no_interp = (env_i("MERCURY_SFO_GRID_NOINTERP", 0) != 0);// negative control
+	// HELD 2026-06-17: cannot be a simple default-flip — sim-harness-scoped, CHANNEL-GATED
+	// (REGRESSES ~2 dB on clean), and the production FADE-tier estimator-selector wiring is
+	// the unlanded follow-on (HW confirm pending). Keep default-off.
 	// TURBO_EQ_VERDICT.md §5 TINTERP-SEED: MERCURY_SFO_GRID_TURBO_SEED=tinterp drives
 	// the WHOLE recommended stack — it=0 INIT estimate = TINTERP (the warm faded seed)
 	// AND data_aided_channel_estimator keeps that TINTERP H as the low-confidence FLOOR
@@ -7858,6 +7868,8 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	// the stock RX relies on. The big-block preamble matched-filter reference is updated to
 	// match (bigblock_preamble_mf_snap, this file) since pre-eq reshapes the preamble too.
 	bool apply_preeq = (M != MOD_MFSK && pre_equalization_channel != NULL);
+	// QUARANTINED 2026-06-17: MERCURY_BIGBLOCK_NOPREEQ=1 DISABLES big-block pre-eq
+	// (an A/B escape hatch that turns off the fix); pre-eq is the default. do-not-enable.
 	{ const char* e=std::getenv("MERCURY_BIGBLOCK_NOPREEQ"); if(e && atoi(e)!=0) apply_preeq=false; }
 	if(apply_preeq)
 	{
@@ -9585,6 +9597,8 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	// before any rebuild/restore can move the data_container allocation, and run the whole
 	// decode (normalize + bigblock_rx_passband) against the snapshot. nSamples doubles are
 	// in-bounds here (data is sized Nofdm*buffer_Nsymb*interp at the live config, == nSamples).
+	// QUARANTINED 2026-06-17: MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1 re-enables a use-after-free
+	// (memory-safety defect); test-only fail-before hook, the snapshot is the fix. do-not-enable.
 	// REPRODUCER HOOK (bigblock-whiten-align): MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1 SKIPS this
 	// snapshot (restores the pre-fix dangling-`data` use-after-free) for the standalone UAF
 	// fail-before demo. The full-path regression (test_sim_inproc_bigblock_fullpath) does
@@ -10165,6 +10179,10 @@ void cl_telecom_system::load_configuration(int configuration)
 	// The estimator carries the cross-pilot AWGN nv-floor so every shared-state
 	// consumer is safe — see data-flow-noise_variance_estimate.md.
 	{
+		// HELD 2026-06-17: cannot be a global default-flip — TIME_INTERP is CHANNEL-GATED
+		// (sim-proven to beat VARA on GOOD/MOD fades but REGRESSES on clean). No production
+		// fade-tier SELECTOR is wired, so flipping it globally would fire on clean and
+		// regress. Ship requires the fade-tier selector + IONOS faithful-fade HW confirm.
 		const char* _ft = std::getenv("MERCURY_FADE_TINTERP");
 		if(_ft && atoi(_ft) != 0 && ofdm.channel_estimator == LEAST_SQUARE)
 		{
