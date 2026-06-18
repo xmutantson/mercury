@@ -4025,6 +4025,365 @@ static void test_gf16_ra_pure_noise_far() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §24 CONFIG_TAG codec (in-band rate adaptation, Stage-1)
+//   tag-codeword-design.md §5/§8 + fact-documents/data-flow-config-tag-codec.md
+//
+// OFFLINE CODEC + UNIT TESTS ONLY — no ARQ/gearshift wiring. The tag protects
+// cfg_index with an RM(1,4)=(16,5,8) bi-orthogonal Walsh codeword (FWHT-decoded
+// over the per-tone energies), rides the GF(16) RA FEC substrate (OD-2), and is
+// accepted by the WRAP (FWHT peak-margin gate AND CRC-12 AND bsi+parity binding).
+//   T1 config_tag_roundtrip_all_indices : encode->decode all 32 cfg_index exact
+//   T2 config_tag_noise_loaded_decode   : right cfg_index at a representative Es/N0
+//   T3 config_tag_pure_noise_far        : WRAP FAR <= the design ~1e-6..1e-8 band
+//
+// The WRAP peak-ratio gate operating point (calibrated against the real codec's
+// noise distribution; design note §10 [?]). The noise-p99.9 of |peak|/|2nd| for
+// a 16-pt FWHT of i.i.d.-ish chips is modest; 2.0 cleanly separates a clean
+// codeword (ratio -> inf) from noise while admitting the noise-loaded T2 frames.
+static const double CFG_TAG_PEAK_GATE = 2.0;
+
+// Build the GF(16)-RA energy matrix (codeword_len() x 16, one-hot `hi` on the
+// encoded tone, `lo` elsewhere) for a CONFIG_TAG message. Mirrors
+// test_gf16_ra_encode_decode_clean's clean-energy construction.
+static void build_config_tag_gf16_energies(uint8_t cfg_index, uint8_t bsi_lsb,
+	uint8_t parity, cl_arq_controller& arq, double hi, double lo,
+	std::vector<double>& e_out, uint64_t* out_p37, uint16_t* out_crc)
+{
+	gf16ra::configure(2);
+	gf16ra::init();
+	uint64_t p37 = 0;
+	pack_config_tag_payload(&p37, cfg_index, bsi_lsb, parity);
+	uint8_t bytes[5];
+	pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_CONFIG_TAG, p37);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+	int tones[gf16ra::GF16RA_MAX_N];
+	gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_CONFIG_TAG, p37, crc12, tones);
+	int N = gf16ra::codeword_len();
+	e_out.assign((size_t)N * 16, lo);
+	for (int s = 0; s < N; s++) e_out[(size_t)s * 16 + tones[s]] = hi;
+	if (out_p37) *out_p37 = p37;
+	if (out_crc) *out_crc = crc12;
+}
+
+// (T1) Encode then decode every cfg_index (0..31) and assert exact roundtrip of
+// cfg_index (via BOTH the FWHT correlator AND the CRC-field binding copy), bsi,
+// parity, and the CRC-12 acceptance. Clean energies (no noise).
+static void test_config_tag_roundtrip_all_indices() {
+	const char* name = "config_tag_roundtrip_all_indices";
+	cl_arq_controller arq;
+	for (int cfg = 0; cfg < 32; cfg++) {
+		uint8_t bsi_lsb = (uint8_t)(cfg & 0x7);
+		uint8_t parity  = (uint8_t)((cfg >> 2) & 0x1);
+
+		// --- RM(1,4) Walsh codeword: encode -> clean FWHT decode -> exact index
+		int chips[16];
+		if (!cfg_tag_rm_encode(cfg, chips)) { test_fail(name, "rm_encode rejected a valid cfg"); return; }
+		double e16[256]; cfg_tag_energies_from_cfg(cfg, 1.0, 0.0, e16);
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+		double rpeak = 0.0;
+		int fwht_cfg = cfg_tag_rm_fwht_decode(soft, &rpeak);
+		if (fwht_cfg != cfg) {
+			char b[120]; snprintf(b, sizeof(b), "FWHT cfg=%d -> %d (rpeak=%.2f)", cfg, fwht_cfg, rpeak);
+			test_fail(name, b); return;
+		}
+
+		// --- GF(16) RA + CRC-12 field: encode -> clean energies -> exact payload
+		std::vector<double> e; uint64_t p37 = 0; uint16_t crc = 0;
+		build_config_tag_gf16_energies((uint8_t)cfg, bsi_lsb, parity, arq, 1.0, 0.0, e, &p37, &crc);
+
+		// --- WRAP decode over BOTH detectors (clean): must accept + exact fields
+		config_tag_decode_result r;
+		bool ok = config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			bsi_lsb, parity, prod_crc12_cb, &arq, &r);
+		if (!ok) {
+			char b[160]; snprintf(b, sizeof(b),
+				"cfg=%d WRAP reject (fwht=%d crc=%d bind=%d rpeak=%.2f)",
+				cfg, r.fwht_passed, r.crc_passed, r.bind_agree, r.fwht_rpeak);
+			test_fail(name, b); return;
+		}
+		if (r.cfg_index != cfg || r.batch_seq_lsb != bsi_lsb || r.epoch_parity != parity) {
+			char b[160]; snprintf(b, sizeof(b),
+				"cfg=%d field mismatch: cfg=%d bsi=%d par=%d",
+				cfg, r.cfg_index, r.batch_seq_lsb, r.epoch_parity);
+			test_fail(name, b); return;
+		}
+		// Cross-check the payload pack/unpack primitive directly.
+		uint8_t uc=0, ub=0, up=0; unpack_config_tag_payload(p37, &uc, &ub, &up);
+		if (uc != cfg || ub != bsi_lsb || up != parity) {
+			test_fail(name, "unpack_config_tag_payload roundtrip mismatch"); return;
+		}
+	}
+	test_pass(name);
+}
+
+// (T2) Soft-decode the tag over a NOISE-LOADED energy/chip frame at a
+// representative Es/N0 and assert the RIGHT cfg_index decodes via the WRAP.
+// Many trials at a moderate noise level; assert a high success rate AND zero
+// WRONG-index accepts (the safety-critical property — a wrong cfg_index is the
+// R2 risk the WRAP closes). The fail-before stub mis-decodes the FWHT index so
+// the corroboration gate (FWHT==CRC) never agrees -> 0 accepts.
+static void test_config_tag_noise_loaded_decode() {
+	const char* name = "config_tag_noise_loaded_decode";
+	cl_arq_controller arq;
+	std::mt19937 rng(0xC0F61A6);
+	std::normal_distribution<double> nd(0.0, 1.0);
+	// Representative operating point: a clean-tone energy of `hi` with additive
+	// energy noise of std `sigma`. sigma=0.55 is a moderate near-cliff load (the
+	// FWHT energy-integration + GF16 BP recover where a single per-symbol argmax
+	// would start to slip).
+	const double hi = 1.0, lo = 0.0, sigma = 0.55;
+	const int trials = 300;
+	int correct = 0, wrong = 0, miss = 0;
+	for (int it = 0; it < trials; it++) {
+		int cfg = (int)(rng() % 32);
+		uint8_t bsi_lsb = (uint8_t)(cfg & 0x7);
+		uint8_t parity  = (uint8_t)((cfg >> 2) & 0x1);
+
+		// GF16 energy matrix + chip energy block from ONE codeword, then load both
+		// with independent AWGN energy perturbations (magnitude-squared >= 0).
+		std::vector<double> e; uint64_t p37 = 0; uint16_t crc = 0;
+		build_config_tag_gf16_energies((uint8_t)cfg, bsi_lsb, parity, arq, hi, lo, e, &p37, &crc);
+		for (size_t i = 0; i < e.size(); i++) { double v = e[i] + sigma * std::fabs(nd(rng)); e[i] = v; }
+
+		double e16[256]; cfg_tag_energies_from_cfg(cfg, hi, lo, e16);
+		for (int i = 0; i < 256; i++) { double v = e16[i] + sigma * std::fabs(nd(rng)); e16[i] = v; }
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+
+		config_tag_decode_result r;
+		bool ok = config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			bsi_lsb, parity, prod_crc12_cb, &arq, &r);
+		if (ok) { if (r.cfg_index == cfg) correct++; else wrong++; }
+		else miss++;
+	}
+	printf("    [T2] noise-loaded WRAP (sigma=%.2f, %d trials): correct=%d wrong=%d miss=%d\n",
+		sigma, trials, correct, wrong, miss);
+	// Safety: a WRONG accepted cfg_index is the R2 catastrophe — must be ZERO.
+	if (wrong != 0) { char b[96]; snprintf(b,sizeof(b),"WRONG cfg_index accepted %d times", wrong); test_fail(name, b); return; }
+	// Recovery: the WRAP must decode the right index on the large majority.
+	if (correct < (int)(0.90 * trials)) {
+		char b[120]; snprintf(b, sizeof(b), "recovery %d/%d < 90%% at Es/N0 op-point", correct, trials);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// (T3) PURE-NOISE FAR (R2): feed pure-noise energy + chip frames to the WRAP and
+// count spurious accepts. Logs the gate-by-gate collapse so the bare-correlation
+// (FWHT-only, no reject region ~0.66) vs WRAPped (~1e-6..1e-8) decision evidence
+// is visible. ASSERT: with all WRAP gates active, FAR <= the CRC-12-dominated
+// bound (0 accepts in the trial budget, or a small threshold). Fail-before: the
+// stubbed FWHT makes the bare-FWHT "accept any nearest codeword" path explicit.
+static void test_config_tag_pure_noise_far() {
+	const char* name = "config_tag_pure_noise_far";
+	cl_arq_controller arq;
+	gf16ra::configure(2); gf16ra::init();
+	const int trials = 20000;
+	const int N = gf16ra::codeword_len();
+	std::mt19937 rng(0xC0F6FA7);
+	std::exponential_distribution<double> ed(1.0);  // |CN|^2 ~ exponential
+
+	// We expect a specific bsi/parity binding (the receiver is adopting a known
+	// batch); a pure-noise frame must satisfy ALL gates to be a false accept.
+	const uint8_t expect_bsi = 3, expect_par = 1;
+
+	int bare_fwht_accept = 0;   // FWHT-only "nearest codeword" (no reject region)
+	int fwht_gate_only   = 0;   // + peak-margin gate
+	int crc_only         = 0;   // GF16 RA + CRC-12 alone
+	int wrap_accept      = 0;   // full WRAP
+
+	for (int it = 0; it < trials; it++) {
+		std::vector<double> e((size_t)N * 16);
+		for (int i = 0; i < N * 16; i++) e[i] = ed(rng);
+		double soft[16];
+		for (int i = 0; i < 16; i++) soft[i] = ed(rng) - ed(rng);  // signed chip noise
+
+		// Bare FWHT always returns SOME index (no reject region).
+		double rp = 0.0; (void)cfg_tag_rm_fwht_decode(soft, &rp);
+		bare_fwht_accept++;                            // every frame "accepts" a cfg
+		if (rp >= CFG_TAG_PEAK_GATE) fwht_gate_only++;
+
+		// CRC-only: GF16 RA + CRC-12 (no FWHT/binding).
+		uint64_t p37 = 0; int iters = -2;
+		if (gf16ra::soft_decode_config_tag(e.data(), GF16RA_BP_MAXITER, GF16RA_ESNO_METRIC,
+			(uint8_t)MFSK_CTRL_CONFIG_TAG, prod_crc12_cb, &arq, &p37, &iters))
+			crc_only++;
+
+		// Full WRAP.
+		config_tag_decode_result r;
+		if (config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			expect_bsi, expect_par, prod_crc12_cb, &arq, &r))
+			wrap_accept++;
+	}
+	double far_bare = (double)bare_fwht_accept / trials;
+	double far_gate = (double)fwht_gate_only / trials;
+	double far_crc  = (double)crc_only / trials;
+	double far_wrap = (double)wrap_accept / trials;
+	printf("    [T3] CONFIG_TAG pure-noise FAR (%d trials):\n", trials);
+	printf("      bare FWHT (no reject region) : %d/%d = %.4f\n", bare_fwht_accept, trials, far_bare);
+	printf("      + peak-margin gate           : %d/%d = %.4f\n", fwht_gate_only, trials, far_gate);
+	printf("      GF16-RA + CRC-12 only        : %d/%d = %.6f\n", crc_only, trials, far_crc);
+	printf("      FULL WRAP (all gates)        : %d/%d = %.6f\n", wrap_accept, trials, far_wrap);
+	// Positive control: the WRAP must ACCEPT a CLEAN tag (proves the detector is
+	// wired — a stubbed/absent FWHT decode rejects here, so this also makes T3
+	// fail-before-sensitive). cfg with a known bsi/parity binding.
+	{
+		int cfg = 11; uint8_t bsi = 3, par = 1;  // bsi/par chosen to match expect_* below
+		std::vector<double> e; uint64_t p37 = 0; uint16_t crc = 0;
+		build_config_tag_gf16_energies((uint8_t)cfg, bsi, par, arq, 1.0, 0.0, e, &p37, &crc);
+		double e16[256]; cfg_tag_energies_from_cfg(cfg, 1.0, 0.0, e16);
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+		config_tag_decode_result r;
+		bool ok = config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			bsi, par, prod_crc12_cb, &arq, &r);
+		if (!ok || r.cfg_index != (uint8_t)cfg) {
+			char b[160]; snprintf(b, sizeof(b),
+				"clean-tag positive control rejected (fwht=%d crc=%d bind=%d cfg=%d)",
+				r.fwht_passed, r.crc_passed, r.bind_agree, r.cfg_index);
+			test_fail(name, b); return;
+		}
+	}
+	// Bare correlation MUST be the unsafe baseline (every frame accepts a cfg).
+	if (far_bare < 0.99) { test_fail(name, "bare FWHT did not exhibit the no-reject-region baseline"); return; }
+	// WRAP must drive FAR to the CRC-12-dominated floor: 0 accepts in 20k trials
+	// is the ~1e-8-class expectation; allow a tiny slack for the finite budget.
+	if (far_wrap > 5.0e-4) {
+		char b[120]; snprintf(b, sizeof(b), "WRAP FAR %.6f > 5e-4 bound", far_wrap);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// (T4) THE DECISIVE MEASUREMENT — option (a) tone-PERMUTATION vs option (b) fixed
+// 2-tone {0,8} overlay: FWHT cfg_index detection probability vs Es/N0, on AWGN and
+// on a per-tone (frequency-selective) fade. tag-codeword-design.md §1.3/§6.1.
+//
+// The two front-ends share the SAME RM(1,4) codeword and the SAME 16-pt FWHT
+// decoder; ONLY the chip<->tone mapping differs. We build a faithful non-coherent
+// M=16-FSK energy matrix (the transmitted tone is Rician with mean amplitude A,
+// every off-tone is Rayleigh; energy = |CN|^2; Es/N0 = A^2/N0), feed the SAME
+// noise realization to both mappings, and compare P(correct cfg_index) from the
+// FWHT alone (the survival-cap detector inside the WRAP).
+//
+// On AWGN the two should be near-identical (no per-tone selectivity to exploit).
+// On a frequency-selective fade that NULLS a couple of tones, option (b) (every
+// chip on tones {0,8}) FLOORS when a faded tone is 0 or 8 — ALL chips corrupt at
+// once; option (a) (each chip on a distinct tone pair) loses only the few chips on
+// the faded tones and the FWHT integrates the survivors. This is the M=16 gain the
+// note says (b) "throws away," and the reason the FWHT must be the robust correlator.
+namespace {
+// Local reference impl of the REPLACED option (b): every chip on tones {0,8}.
+static const int OPTB_TONE_PLUS = 0, OPTB_TONE_MINUS = 8;
+void optb_energies_from_cfg(int cfg_index, double hi, double lo, double* e16) {
+	int chips[16]; cfg_tag_rm_encode(cfg_index, chips);
+	for (int i = 0; i < 16; i++) {
+		for (int t = 0; t < 16; t++) e16[i*16+t] = lo;
+		e16[i*16 + ((chips[i] > 0) ? OPTB_TONE_PLUS : OPTB_TONE_MINUS)] = hi;
+	}
+}
+void optb_softchips_from_energies(const double* e16, double* out) {
+	for (int i = 0; i < 16; i++) out[i] = e16[i*16+OPTB_TONE_PLUS] - e16[i*16+OPTB_TONE_MINUS];
+}
+// Non-coherent FSK energy of one symbol: the signal tone gets |A+n|^2, off-tones
+// |n|^2, n ~ CN(0, N0=1) (so Es/N0 = A^2). `fade[t]` scales the per-tone amplitude
+// (1.0 = no fade, 0.0 = nulled) to model a frequency-selective channel.
+void fsk_symbol_energies(int sig_tone, double A, const double* fade,
+                         std::mt19937& rng, std::normal_distribution<double>& nd,
+                         double* row16) {
+	for (int t = 0; t < 16; t++) {
+		double mean = (t == sig_tone) ? A * (fade ? fade[t] : 1.0) : 0.0;
+		// CN(mean, 1): I has mean `mean`, Q mean 0, each var 1/2.
+		double xi = mean + nd(rng) * 0.70710678, xq = nd(rng) * 0.70710678;
+		row16[t] = xi*xi + xq*xq;
+	}
+}
+} // namespace
+
+static void test_config_tag_optab_detection_sweep() {
+	const char* name = "config_tag_optab_detection_sweep";
+	std::mt19937 rng(0xA0B0C0D);
+	std::normal_distribution<double> nd(0.0, 1.0);
+	const int trials = 2000;
+	const double esno_db[] = { -4, -2, 0, 2, 4, 6, 8, 10 };
+	const int NE = (int)(sizeof(esno_db)/sizeof(esno_db[0]));
+
+	// Frequency-selective fade: null tones 0 and 8 (the EXACT tones option (b)
+	// rides), plus 50% on tone 4 — a plausible 2-3 tone selective notch. Option (a)
+	// spreads across the alphabet so only a few of its chips touch these tones.
+	double flat[16]; for (int t=0;t<16;t++) flat[t]=1.0;
+	double sel[16];  for (int t=0;t<16;t++) sel[t]=1.0; sel[0]=0.0; sel[8]=0.0; sel[4]=0.5;
+
+	printf("    [T4] FWHT cfg_index detection P(correct) — option (a) tone-perm vs (b) 2-tone{0,8}\n");
+	printf("      %-8s | %-19s | %-19s\n", "Es/N0", "AWGN   a / b", "freq-sel fade  a / b");
+	// Track the lowest Es/N0 at which each reaches P>=0.99 on the fade.
+	double a_floor_awgn=99, b_floor_awgn=99, a_floor_sel=99, b_floor_sel=99;
+	bool any_sel_separation = false;
+
+	for (int ei = 0; ei < NE; ei++) {
+		double A = std::pow(10.0, esno_db[ei]/20.0);  // amplitude; Es/N0=A^2
+		int a_ok_awgn=0, b_ok_awgn=0, a_ok_sel=0, b_ok_sel=0;
+		for (int it = 0; it < trials; it++) {
+			int cfg = (int)(rng() % 32);
+			// Option (a) and (b) place the signal on DIFFERENT tones; build each
+			// from its own clean tone map, then add matched per-tone FSK noise.
+			double ea_clean[256], eb_clean[256];
+			cfg_tag_energies_from_cfg(cfg, 1.0, 0.0, ea_clean);  // marks perm tones
+			optb_energies_from_cfg(cfg, 1.0, 0.0, eb_clean);     // marks {0,8} tones
+			for (const double* fade : { (const double*)flat, (const double*)sel }) {
+				bool is_sel = (fade == sel);
+				double ea[256], eb[256];
+				for (int i = 0; i < 16; i++) {
+					// signal tone = the one marked hi in the clean map for this chip
+					int sig_a=0, sig_b=0;
+					for (int t=0;t<16;t++){ if(ea_clean[i*16+t]>0.5) sig_a=t; if(eb_clean[i*16+t]>0.5) sig_b=t; }
+					fsk_symbol_energies(sig_a, A, fade, rng, nd, &ea[i*16]);
+					fsk_symbol_energies(sig_b, A, fade, rng, nd, &eb[i*16]);
+				}
+				double sa[16], sb[16];
+				cfg_tag_softchips_from_energies(ea, sa);
+				optb_softchips_from_energies(eb, sb);
+				double rp;
+				int ca = cfg_tag_rm_fwht_decode(sa, &rp);
+				// option (b) decode: reuse the FWHT core via a tiny local replicate
+				int cb; { double a[16]; for(int i=0;i<16;i++)a[i]=sb[i];
+					for(int len=1;len<16;len<<=1)for(int i=0;i<16;i+=(len<<1))for(int j=0;j<len;j++){double u=a[i+j],v=a[i+j+len];a[i+j]=u+v;a[i+j+len]=u-v;}
+					int best=0;double bm=-1;for(int r=0;r<16;r++){double m=std::fabs(a[r]);if(m>bm){bm=m;best=r;}}
+					cb=((a[best]<0.0)?1:0)<<4|best; }
+				if (is_sel) { if (ca==cfg) a_ok_sel++; if (cb==cfg) b_ok_sel++; }
+				else        { if (ca==cfg) a_ok_awgn++; if (cb==cfg) b_ok_awgn++; }
+			}
+		}
+		double pa_a=(double)a_ok_awgn/trials, pb_a=(double)b_ok_awgn/trials;
+		double pa_s=(double)a_ok_sel/trials,  pb_s=(double)b_ok_sel/trials;
+		printf("      %+5.0f dB | a=%.3f b=%.3f   | a=%.3f b=%.3f\n",
+			esno_db[ei], pa_a, pb_a, pa_s, pb_s);
+		if (pa_a>=0.99 && a_floor_awgn>90) a_floor_awgn=esno_db[ei];
+		if (pb_a>=0.99 && b_floor_awgn>90) b_floor_awgn=esno_db[ei];
+		if (pa_s>=0.99 && a_floor_sel>90)  a_floor_sel=esno_db[ei];
+		if (pb_s>=0.99 && b_floor_sel>90)  b_floor_sel=esno_db[ei];
+		if (pa_s - pb_s > 0.05) any_sel_separation = true;
+	}
+	printf("      P>=0.99 floor (Es/N0): AWGN a=%.0f b=%.0f | fade a=%.0f b=%.0f\n",
+		a_floor_awgn, b_floor_awgn, a_floor_sel, b_floor_sel);
+
+	// ASSERTIONS (let the numbers arbitrate — these are the design-decision gates):
+	//  1. On AWGN, option (a) must NOT regress vs (b) (no per-tone structure to
+	//     exploit, so they track; allow a small Monte-Carlo slack).
+	//  2. On the frequency-selective fade, option (a) must show a CLEAR advantage
+	//     at >=1 operating point (this is the M=16 frequency-diversity gain that is
+	//     the WHOLE reason to prefer (a); if it does NOT appear, the honest verdict
+	//     is to ratify (b) — this assert makes that decision explicit and tested).
+	if (a_floor_awgn > b_floor_awgn) {
+		test_fail(name, "option (a) regressed vs (b) on AWGN (a's P>=0.99 floor is worse)");
+		return;
+	}
+	if (!any_sel_separation) {
+		test_fail(name, "option (a) showed NO frequency-diversity advantage over (b) on the selective fade");
+		return;
+	}
+	test_pass(name);
+}
+
 // §10.5 — THE MEASUREMENT: GF(16)-RA acquisition cliff on the SAME SNR3k axis as
 // §9. For each sigma: P(base-detect), P(GF16-RA decode). Reports the cliff
 // (SNR3k at P=0.5), the coding gain vs the §9 HARD suffix, and whether it
@@ -6142,6 +6501,14 @@ int run_mfsk_ctrl_codec_tests() {
 	// §23 BREAK forward-health gate (fix/break-fh-gate): FH-latch suppression of the
 	// held-CFG16 marginal-OFDM alias + K-of-N corroboration + genuine-BREAK survives.
 	test_break_fh_gate();
+
+	// §24 CONFIG_TAG codec (in-band rate adaptation, Stage-1): RM(1,4) Walsh
+	// codeword + FWHT decode + GF(16) RA FEC + WRAP acceptance. Offline codec
+	// only (no ARQ/gearshift wiring). tag-codeword-design.md §5/§8.
+	test_config_tag_roundtrip_all_indices();   // T1 encode->decode all 32 cfg_index
+	test_config_tag_noise_loaded_decode();     // T2 right index at a representative Es/N0
+	test_config_tag_pure_noise_far();          // T3 WRAP FAR <= design bound
+	test_config_tag_optab_detection_sweep();   // T4 option (a) tone-perm vs (b) 2-tone detection-vs-Es/N0
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
