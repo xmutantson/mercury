@@ -4138,7 +4138,10 @@ int cl_arq_controller::test_config_tag_passband_roundtrip()
 		"combined suffix length = RM16 + gf39 = 55", n_tones, CFG_TAG_RM_N + gf16ra::codeword_len());
 
 	// --- TX: key the tag to passband audio --------------------------------------
-	int base_total = ts->ack_mfsk.connect_base_total_nsymb();
+	// Stage 3c: the base is the TRIMMED tag acquisition sync, not the full
+	// connect base — size the buffer from config_tag_sync_nsymb() so the
+	// `written == burst_samples` assertion stays exact.
+	int base_total = ts->ack_mfsk.config_tag_sync_nsymb();
 	int burst_nsymb = base_total + n_tones;
 	int burst_samples = burst_nsymb * ts->data_container.Nofdm * ts->frequency_interpolation_rate;
 	// Generous padding so the RX detector + suffix-energy windows have headroom.
@@ -4513,7 +4516,7 @@ int cl_arq_controller::test_inband_drop()
 	// window inband_detect_follow_from_capture reads (signal_period - tail .. signal_period).
 	int sym_samples = ts_rx->data_container.Nofdm * ts_rx->data_container.interpolation_rate;
 	int signal_period = sym_samples * ts_rx->data_container.buffer_Nsymb;
-	int base_total = ts_rx->ack_mfsk.connect_base_total_nsymb();
+	int base_total = ts_rx->ack_mfsk.config_tag_sync_nsymb();   // Stage 3c: trimmed tag base
 	int burst_nsymb = base_total + n_tones;
 	int burst_samples = burst_nsymb * ts_rx->data_container.Nofdm * ts_rx->frequency_interpolation_rate;
 	std::vector<double> burst((size_t)burst_samples + 64, 0.0);

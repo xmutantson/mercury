@@ -4383,6 +4383,243 @@ static void test_config_tag_optab_detection_sweep() {
 	test_pass(name);
 }
 
+// =============================================================================
+// Stage 3c — CONFIG_TAG ACQUISITION-SYNC TRIM SWEEP (the airtime optimization).
+// =============================================================================
+// THE GATE FOR THIS INCREMENT. The CONFIG_TAG burst prepends a base
+// acquisition-sync pattern so the RX base-correlator can LOCATE the burst. A
+// free-standing CONNECT burst is blind-located (full 16-symbol base); but after
+// Stage 3b the tag rides at a DETERMINISTIC OFFSET (right after frame-0), so the
+// RX already knows ~where it is → the acquisition sync can be TRIMMED. Only the
+// SYNC shrinks; the 55-symbol payload suffix (RM(1,4)+GF(16)-RA+CRC) is intact.
+//
+// This sweep drives the ACTUAL production functions at base lengths
+// {16,12,10,8,6,5,4,3,2}:
+//   TX: cl_telecom_system::generate_config_tag_pattern_passband (keys the burst
+//       at tag_sync_nsymb_override base symbols).
+//   RX: cl_telecom_system::decode_config_tag_from_passband (the REAL
+//       base-correlator presence detect + per-tone-energy/FWHT-chip extraction),
+//       then config_tag_wrap_decode (FWHT cfg_index + GF(16) RA + CRC-12 + binding).
+// at the operating Es/N0 (6 dB, the M=16 robust-layer op point the Stage-3a
+// round-trip uses) WITH timing jitter (random ± a fraction of a symbol around the
+// deterministic offset, since that offset is approximate not exact). For each
+// length it reports detection+decode rate, picks the MINIMUM length keeping
+// detection >= 99%, and reports the resulting burst-size reduction. A FAR check
+// on pure noise confirms the trimmed count-gate does not false-trigger.
+static void test_config_tag_sync_trim_sweep() {
+	const char* name = "config_tag_sync_trim_sweep (deterministic-offset acquisition-sync trim)";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_8);   // WB OFDM (M=16 robust ctrl-suffix available)
+	cl_arq_controller arq;
+	arq.telecom_system = &ts;          // build_config_tag_tones reads telecom_system->ack_mfsk
+	if (ts.ack_mfsk.ack_sack_suffix_len() <= 0) {
+		test_fail(name, "WB M>=16 ctrl-suffix not available (CONFIG_8 load failed?)"); return;
+	}
+
+	const int FULL_BASE = ts.ack_mfsk.connect_pattern_nsymb;   // 16 (the un-trimmed base)
+	const double fs = ts.sampling_frequency;
+	const int Nofdm = ts.data_container.Nofdm;
+	const int interp = ts.frequency_interpolation_rate;
+	const int sym_samples = Nofdm * interp;
+
+	// Build the combined CONFIG_TAG suffix tones (RM16 || gf16ra39 = 55). Announce
+	// CONFIG_10 (a different config than the loaded one so the decode target is
+	// unambiguous), bind to bsi/parity exactly as the production emit does.
+	const int ANNOUNCE_CFG = CONFIG_10;
+	const int ann_ladder = config_ladder_index(ANNOUNCE_CFG);
+	const int BSI = 43;
+	const uint8_t PARITY = 1;
+	int tones[gf16ra::GF16RA_MAX_N];
+	int n_tones = 0; uint8_t bsi_lsb = 0;
+	if (!arq.build_config_tag_tones(ANNOUNCE_CFG, BSI, PARITY, tones, &n_tones, &bsi_lsb)) {
+		test_fail(name, "build_config_tag_tones failed"); return;
+	}
+	if (n_tones != CFG_TAG_RM_N + (int)gf16ra::codeword_len()) {
+		test_fail(name, "combined suffix length != RM16+gf39"); return;
+	}
+
+	// Decode a passband buffer of length n; return present + accept(cfg/binding).
+	auto decode_pb = [&](double* buf, int n, int* out_cfg, bool* out_accept) -> bool {
+		std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+		double chips[16] = {0.0};
+		int n_syms = 0, matched = 0;
+		bool present = ts.decode_config_tag_from_passband(buf, n,
+			energies.data(), chips, &n_syms, &matched);
+		if (!present) { if(out_cfg)*out_cfg=-1; if(out_accept)*out_accept=false; return false; }
+		config_tag_decode_result r;
+		bool accept = config_tag_wrap_decode(energies.data(), chips, CFG_TAG_PEAK_GATE,
+			bsi_lsb, PARITY, prod_crc12_cb, &arq, &r);
+		if (out_cfg)    *out_cfg = accept ? (int)r.cfg_index : -1;
+		if (out_accept) *out_accept = accept;
+		return present;
+	};
+
+	// Operating point: Es/N0 = 6 dB (the Stage-3a round-trip op point at the M=16
+	// robust layer). Timing jitter: the deterministic offset is approximate, so the
+	// burst start is randomly shifted +/- JIT_SYM_FRAC of a symbol around its nominal
+	// placement in a padded buffer. The RX correlator must re-acquire from the base.
+	const double EsN0 = 6.0;
+	const int    NT   = 1000;         // trials per length (tight CI on a 0.99 target)
+	const double JIT_SYM_FRAC = 0.5;  // +/- half a symbol of offset jitter
+	const int    jit_max = (int)(JIT_SYM_FRAC * sym_samples);
+
+	// Lengths to sweep, from the full base DOWN (incl. 14/11 near the cliff).
+	const int lens[] = { 16, 14, 12, 11, 10, 8, 6, 5, 4, 3, 2 };
+	const int NL = (int)(sizeof(lens)/sizeof(lens[0]));
+
+	printf("  [MEASURE] CONFIG_TAG acquisition-sync trim — detection vs base length\n");
+	printf("    op Es/N0=%.0f dB, +/-%.0f%% symbol timing jitter, %d trials/len, payload suffix=%d sym (fixed)\n",
+		EsN0, JIT_SYM_FRAC*100.0, NT, n_tones);
+	printf("    %-5s %-7s %-9s %-7s %-9s %-10s %-8s\n",
+		"len", "thr", "burst_sym", "samples", "seconds", "detect%", "accept%");
+
+	int    chosen_len = FULL_BASE;     // the minimum length that holds >=99% detect
+	double full_samples = (double)(FULL_BASE + n_tones) * sym_samples;
+
+	for (int li = 0; li < NL; li++) {
+		int L = lens[li];
+		if (L > FULL_BASE) continue;
+		ts.ack_mfsk.tag_sync_nsymb_override = L;   // drive the TX+RX base length
+		int thr = ts.ack_mfsk.config_tag_sync_match_threshold();
+		int burst_nsymb = L + n_tones;
+		int burst_samples = burst_nsymb * sym_samples;
+
+		// Clean reference burst (for power calibration + jittered placement).
+		const int pad = jit_max + 4096;
+		std::vector<double> clean((size_t)burst_samples + 2*pad, 0.0);
+		int written = ts.generate_config_tag_pattern_passband(clean.data() + pad, tones, n_tones);
+		if (written != burst_samples) {
+			char m[96]; snprintf(m,sizeof(m),"L=%d: generate wrote %d != %d", L, written, burst_samples);
+			ts.ack_mfsk.tag_sync_nsymb_override = -1; test_fail(name, m); return;
+		}
+
+		// Calibrate sigma from the burst passband power (same formula as the
+		// Stage-3a round-trip), so Es/N0 is meaningful on this exact burst.
+		double P_sig = 0.0;
+		for (int i = 0; i < burst_samples; i++) { double s = clean[pad+i]; P_sig += s*s; }
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		double f_nyquist = fs / 2.0;
+		double sigma = std::sqrt(2.0 * P_sig * f_nyquist / (std::pow(10.0, EsN0/10.0) * ts.bandwidth));
+
+		std::mt19937 rng((uint32_t)(0x7A60C0DE + L*977));
+		std::normal_distribution<double> nd(0.0, sigma);
+		std::uniform_int_distribution<int> jit(-jit_max, jit_max);
+		int detect_ok = 0, accept_ok = 0;
+		std::vector<double> noisy((size_t)clean.size(), 0.0);
+		for (int t = 0; t < NT; t++) {
+			// Re-key the clean burst at a JITTERED offset (the deterministic offset is
+			// only approximate), then add AWGN over the whole padded buffer.
+			int shift = jit(rng);
+			std::fill(noisy.begin(), noisy.end(), 0.0);
+			ts.generate_config_tag_pattern_passband(noisy.data() + pad + shift, tones, n_tones);
+			for (size_t i = 0; i < noisy.size(); i++) noisy[i] += nd(rng);
+
+			int cfg = -2; bool accept = false;
+			bool present = decode_pb(noisy.data(), (int)noisy.size(), &cfg, &accept);
+			if (present) detect_ok++;
+			if (accept && cfg == ann_ladder) accept_ok++;
+		}
+		double Pd = (double)detect_ok / NT;
+		double Pa = (double)accept_ok / NT;
+		printf("    %-5d %-7d %-9d %-7d %-9.3f %-10.4f %-8.4f\n",
+			L, thr, burst_nsymb, burst_samples, burst_samples/fs, Pd, Pa);
+
+		// The chosen length is the SMALLEST L with both detect AND accept >= 0.99.
+		if (Pd >= 0.99 && Pa >= 0.99) chosen_len = L;
+	}
+	ts.ack_mfsk.tag_sync_nsymb_override = -1;   // restore (no production leak)
+
+	// Report THE NUMBER for the chosen length + the shipping default.
+	double chosen_samples = (double)(chosen_len + n_tones) * sym_samples;
+	double reduction_pct = 100.0 * (1.0 - chosen_samples / full_samples);
+	printf("    --- swept minimum: len=%d -> %.0f samples (%.3f s) vs full len=%d -> %.0f samples (%.3f s) = %.1f%% reduction ---\n",
+		chosen_len, chosen_samples, chosen_samples/fs, FULL_BASE, full_samples, full_samples/fs, reduction_pct);
+	printf("    --- shipping default CFG_TAG_SYNC_NSYMB_DEFAULT=%d ---\n",
+		cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT);
+
+	// --- FAR: pure-noise must NOT false-trigger at the SHIPPING default length. ---
+	{
+		ts.ack_mfsk.tag_sync_nsymb_override = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT;
+		int burst_nsymb = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT + n_tones;
+		int burst_samples = burst_nsymb * sym_samples;
+		const int pad = 4096;
+		std::vector<double> ref((size_t)burst_samples + 2*pad, 0.0);
+		ts.generate_config_tag_pattern_passband(ref.data() + pad, tones, n_tones);
+		double P_sig = 0.0;
+		for (int i = 0; i < burst_samples; i++) { double s = ref[pad+i]; P_sig += s*s; }
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		double sigma = std::sqrt(P_sig);   // ~0 dB noise floor, NO signal present
+		std::mt19937 rng(0x4FA12B0D);
+		std::normal_distribution<double> nd(0.0, sigma);
+		int false_accepts = 0;
+		const int FT = 2000;
+		std::vector<double> noise((size_t)ref.size(), 0.0);
+		for (int t = 0; t < FT; t++) {
+			for (size_t i = 0; i < noise.size(); i++) noise[i] = nd(rng);
+			int cfg=-2; bool accept=false;
+			decode_pb(noise.data(), (int)noise.size(), &cfg, &accept);
+			if (accept) false_accepts++;
+		}
+		ts.ack_mfsk.tag_sync_nsymb_override = -1;
+		printf("    --- FAR @ default len=%d: %d/%d pure-noise wrap-accepts ---\n",
+			cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT, false_accepts, FT);
+		if (false_accepts > 0) {
+			test_fail(name, "pure-noise FALSE-ACCEPT at the shipping default length (FAR not held)");
+			return;
+		}
+	}
+
+	// --- ASSERTIONS (let the numbers arbitrate the trim) ---
+	// 1. The shipping default must itself hold >=99% detect+accept at the op SNR
+	//    with jitter (re-run it directly so the assertion is on the default, not a
+	//    grid point that happened to pass).
+	{
+		ts.ack_mfsk.tag_sync_nsymb_override = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT;
+		int burst_nsymb = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT + n_tones;
+		int burst_samples = burst_nsymb * sym_samples;
+		const int pad = jit_max + 4096;
+		std::vector<double> ref((size_t)burst_samples + 2*pad, 0.0);
+		ts.generate_config_tag_pattern_passband(ref.data() + pad, tones, n_tones);
+		double P_sig = 0.0;
+		for (int i = 0; i < burst_samples; i++) { double s = ref[pad+i]; P_sig += s*s; }
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		double f_nyquist = fs / 2.0;
+		double sigma = std::sqrt(2.0 * P_sig * f_nyquist / (std::pow(10.0, EsN0/10.0) * ts.bandwidth));
+		std::mt19937 rng(0x515DEFA1);
+		std::normal_distribution<double> nd(0.0, sigma);
+		std::uniform_int_distribution<int> jit(-jit_max, jit_max);
+		int detect_ok = 0, accept_ok = 0;
+		std::vector<double> noisy((size_t)ref.size(), 0.0);
+		for (int t = 0; t < NT; t++) {
+			int shift = jit(rng);
+			std::fill(noisy.begin(), noisy.end(), 0.0);
+			ts.generate_config_tag_pattern_passband(noisy.data() + pad + shift, tones, n_tones);
+			for (size_t i = 0; i < noisy.size(); i++) noisy[i] += nd(rng);
+			int cfg=-2; bool accept=false;
+			bool present = decode_pb(noisy.data(), (int)noisy.size(), &cfg, &accept);
+			if (present) detect_ok++;
+			if (accept && cfg == ann_ladder) accept_ok++;
+		}
+		ts.ack_mfsk.tag_sync_nsymb_override = -1;
+		double Pd = (double)detect_ok/NT, Pa = (double)accept_ok/NT;
+		printf("    --- default len=%d @ op SNR + jitter: detect=%.4f accept=%.4f (target >=0.99) ---\n",
+			cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT, Pd, Pa);
+		if (Pd < 0.99 || Pa < 0.99) {
+			test_fail(name, "shipping default length does NOT hold >=99% detect+accept at op SNR + jitter");
+			return;
+		}
+	}
+
+	// 2. The default must be a genuine trim (strictly shorter than the full base).
+	if (cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT >= FULL_BASE) {
+		test_fail(name, "default base length is not a trim (>= full base)"); return;
+	}
+
+	test_pass(name);
+}
+
 // §25 — CONFIG_TAG in-band rate adaptation Stage 2: emit/detect/FOLLOW wrapper.
 // The follow logic lives on cl_arq_controller (it drives the production
 // load_configuration coherent ARQ+PHY-twin switch); this wrapper instantiates a
@@ -6572,6 +6809,14 @@ int run_mfsk_ctrl_codec_tests() {
 	// SACK confirm (bsi), ZERO SET_CONFIG on the wire, both ends config-track,
 	// PHY-twin coherent, + the R7 mixed-config gap-gate. data-flow-perbatch-config.md §12.
 	test_inband_drop_stage3b();
+
+	// Stage 3c CONFIG_TAG ACQUISITION-SYNC TRIM. The tag rides a deterministic
+	// offset (right after frame-0), so the RX knows ~where the burst is and the
+	// acquisition sync can be trimmed below the full 16-symbol base. Sweeps the base
+	// length DOWN at the op Es/N0 with timing jitter, picks the swept minimum that
+	// holds >=99% detect+accept, confirms the FAR is held, and asserts the shipping
+	// default is a genuine trim. unilateral-config-tag-design.md §11 Stage 3c.
+	test_config_tag_sync_trim_sweep();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

@@ -2549,9 +2549,12 @@ int cl_arq_controller::emit_config_tag_passband(int batch_cfg, int batch_seq_id)
 	if(!build_config_tag_tones(batch_cfg, batch_seq_id, parity, tones, &n_tones, &bsi_lsb))
 		return 0;
 
-	// Key the tag to passband audio (the Stage-3a keyer). The burst occupies
-	// connect_base_total_nsymb() base reps + n_tones suffix symbols.
-	int base_total  = telecom_system->ack_mfsk.connect_base_total_nsymb();
+	// Key the tag to passband audio (the Stage-3a keyer). Stage 3c: the burst
+	// occupies the TRIMMED acquisition sync (config_tag_sync_nsymb() base symbols)
+	// + n_tones suffix symbols. The tag rides a deterministic offset (right after
+	// frame-0) so it does NOT carry the full blind-acquire base — that is the
+	// airtime saving. The 55-symbol payload suffix is UNCHANGED.
+	int base_total  = telecom_system->ack_mfsk.config_tag_sync_nsymb();
 	int burst_nsymb = base_total + n_tones;
 	int burst_samples = burst_nsymb * telecom_system->data_container.Nofdm
 		* telecom_system->frequency_interpolation_rate;
@@ -2836,8 +2839,11 @@ int cl_arq_controller::inband_detect_follow_from_capture(uint8_t expect_bsi_lsb,
 	// Pull the captured passband tail the same way the ACK ctrl-suffix decode does
 	// (arq_common.cc:7822-7833): the tag burst rides AFTER frame 0, so it sits in the
 	// tail of the captured window. Size the tail to hold the full CONFIG_TAG burst
-	// (base reps + RM16 + gf16ra39) plus margin, clamped to the ring (signal_period).
-	int base_total = telecom_system->ack_mfsk.connect_base_total_nsymb();
+	// (base + RM16 + gf16ra39) plus margin, clamped to the ring (signal_period).
+	// Stage 3c: the base is the TRIMMED tag acquisition sync (config_tag_sync_nsymb())
+	// — the burst is SHORTER, so this tail is sized to the actual emitted burst plus
+	// the +16-symbol margin (which absorbs the deterministic-offset jitter).
+	int base_total = telecom_system->ack_mfsk.config_tag_sync_nsymb();
 	// The tag's gf16ra block is N=39 at repfact=2 (the codec doc §5/§7 default; the
 	// SAME N decode_config_tag_from_passband self-configures + restores internally).
 	// We only need it to SIZE the capture tail (the decode self-configures), so use a

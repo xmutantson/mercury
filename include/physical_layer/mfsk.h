@@ -272,6 +272,61 @@ public:
 	void generate_config_tag_mfsk_pattern(std::complex<double>* pattern_out,
 	                                       const int* tones, int n_suffix);
 
+	// In-band rate adaptation (Stage 3c) — CONFIG_TAG ACQUISITION-SYNC TRIM.
+	// =====================================================================
+	// The CONFIG_TAG burst (generate_config_tag_mfsk_pattern) prepends a base
+	// acquisition-sync pattern so the RX base-correlator (detect_ack_pattern on
+	// connect_tones) can LOCATE the burst. A free-standing CONNECT burst must be
+	// blind-located, so it carries a FULL connect_pattern_nsymb (=16) base block.
+	// But after Stage 3b the tag rides at a DETERMINISTIC OFFSET — keyed right
+	// after the first OFDM DATA frame of a batch — so the RX
+	// (decode_config_tag_from_passband, reading the capture-tail) already knows
+	// approximately WHERE the burst is. A known-offset acquire needs FAR fewer
+	// base-sync symbols than a cold blind acquire, so the acquisition sync can be
+	// TRIMMED. THIS IS THE ONLY PART THAT SHRINKS — the 55-symbol payload suffix
+	// (RM(1,4) FWHT cfg_index + GF(16) RA binding/FEC + CRC-12) is UNTOUCHED.
+	//
+	// config_tag_sync_nsymb() returns the number of base-sync symbols the tag
+	// burst emits (TX) and the RX correlator searches for, default
+	// CFG_TAG_SYNC_NSYMB_DEFAULT (the swept minimum, see Stage-3c verdict), clamped
+	// to [1, connect_pattern_nsymb]. Env MERCURY_INBAND_TAG_SYNC_REPS overrides it
+	// (cached once; named "REPS" historically — the base block was reps×16 — but it
+	// now directly sets the base-sync symbol COUNT, the real airtime lever). The
+	// tag base uses combine_reps=1 (no noncoherent rep-combining — the deterministic
+	// offset replaces rep-integration as the acquisition aid), so it is DECOUPLED
+	// from connect_preamble_reps: the CONNECT handshake's hardware-validated
+	// reps×16 acquisition is UNCHANGED.
+	//
+	// CROSS-LAYER: this is tag-path-LOCAL. connect_pattern_nsymb,
+	// connect_preamble_reps, connect_match_threshold, and connect_base_total_nsymb()
+	// are NOT modified — only the CONFIG_TAG TX keyer + RX decoder consult
+	// config_tag_sync_nsymb()/config_tag_sync_match_threshold(). The CONNECT
+	// ctrl-suffix path, ACK/SACK, BREAK, HAIL all keep their full base.
+	int config_tag_sync_nsymb() const;
+	// The matched-count gate for the tag base, scaled from connect_match_threshold
+	// by the base-length ratio (ceil), floored at CFG_TAG_SYNC_MATCH_MIN so a 1- or
+	// 2-symbol base can't be trivially false-triggered. At the full 16-symbol base
+	// this returns connect_match_threshold (= the CONNECT gate, byte-identical).
+	int config_tag_sync_match_threshold() const;
+	// Emit `nsymb` base-sync symbols (a prefix of the connect base sequence, NO
+	// rep-combining) at the FRONT of pattern_out. The per-symbol-LOCAL hop index is
+	// `s` (matching detect_ack_pattern's `p` indexing), so the RX correlator —
+	// searching the SAME connect_tones with combine_reps=1 — aligns symbol-for-symbol.
+	void generate_config_tag_base(std::complex<double>* pattern_out, int nsymb);
+	// The minimum base length that holds detection on the cliff (Stage-3c sweep,
+	// test_config_tag_sync_trim_sweep). The sweep MEASURED, at the op Es/N0 (6 dB)
+	// with +/-50% symbol timing jitter: len=16/12/10 all hold >=99% detect+accept,
+	// len=8 drops to ~98%/~95%, len<=6 falls off. 10 is the swept minimum that holds
+	// >=99% on BOTH detect and accept (8.5% burst-size reduction vs the full 16; the
+	// 55-symbol payload suffix dominates the burst, so the sync trim is bounded).
+	static const int CFG_TAG_SYNC_NSYMB_DEFAULT = 10;  // swept minimum (>=99% @ op SNR + jitter)
+	static const int CFG_TAG_SYNC_MATCH_MIN     = 4;   // count-gate floor (FAR backstop)
+	// Test-only override of config_tag_sync_nsymb() (the env cache is process-static,
+	// so the Stage-3c sweep — which must vary the base length across iterations in one
+	// process — sets this instead). -1 = unset (use env/default). NEVER set in
+	// production; the sweep restores it to -1 when done.
+	int tag_sync_nsymb_override = -1;
+
 	// RX-side capture buffer populated by the ACK detector hook
 	// (cl_telecom_system::detect_ack_snr_from_passband). Each entry is the
 	// de-hopped payload tone (0..M-1) for the corresponding SACK suffix

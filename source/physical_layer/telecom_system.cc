@@ -4122,9 +4122,11 @@ int cl_telecom_system::generate_config_tag_pattern_passband(double* out,
 	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;       // NB unsupported (M<16)
 	if(ack_mfsk.connect_pattern_nsymb <= 0) return 0;
 
-	// Base occupies connect_base_total_nsymb() (R×16 when combining; =16 default).
-	// The CONFIG_TAG suffix is n_suffix = gf16ra::codeword_len() symbols.
-	int base_total = ack_mfsk.connect_base_total_nsymb();
+	// Stage 3c: the base is the TRIMMED acquisition sync (config_tag_sync_nsymb(),
+	// default a swept minimum < the full 16) — the tag rides a deterministic offset
+	// so it does NOT need a full blind-acquire base. The CONFIG_TAG suffix is
+	// n_suffix = RM(1,4)+gf16ra symbols (UNCHANGED — only the sync shrinks).
+	int base_total = ack_mfsk.config_tag_sync_nsymb();
 	int nsymb = base_total + n_suffix;
 	int n_samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
 	if(n_samples <= 0) return 0;
@@ -4456,26 +4458,34 @@ bool cl_telecom_system::decode_config_tag_from_passband(double* data, int size,
 		M, &ofdm.FIR_rx_data);
 
 	// --- THE PRESENCE DETECTOR: the base-pattern correlator. ---
+	// Stage 3c: search the TRIMMED tag base (config_tag_sync_nsymb() symbols,
+	// combine_reps=1) — the deterministic offset replaces blind-acquire
+	// rep-integration. tag_sync is DECOUPLED from connect_preamble_reps so the
+	// CONNECT handshake's full reps×16 base is untouched. The gate scales with the
+	// base length (config_tag_sync_match_threshold()).
+	int tag_sync_nsymb = ack_mfsk.config_tag_sync_nsymb();
+	int tag_sync_thr   = ack_mfsk.config_tag_sync_match_threshold();
 	int matched = 0;
 	int best_offset = -1;
 	double metric = ofdm.detect_ack_pattern(
 		data_container.baseband_data_interpolated, dec_size,
 		1,
-		ack_mfsk.connect_pattern_nsymb,
+		tag_sync_nsymb,
 		ack_mfsk.connect_tones, /*base_len=*/8,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
 		&best_offset, /*reserve_after=*/N,
 		/*out_match_mask=*/nullptr, /*always_fine=*/false,
-		/*combine_reps=*/ack_mfsk.connect_preamble_reps);
+		/*combine_reps=*/1);
 
 	if(out_matched) *out_matched = matched;
 
 	// The real gate (telecom_system.cc:4157 — IDENTICAL to the ctrl-suffix). A
 	// no-tag frame on a real noise floor does not reach this — the steady-state
-	// cheap reject (design §3.2 outcome 2 / R2 false-trigger bound).
-	if(matched < ack_mfsk.connect_match_threshold ||
+	// cheap reject (design §3.2 outcome 2 / R2 false-trigger bound). The
+	// count-gate is the trimmed-base-scaled threshold (FAR-floored).
+	if(matched < tag_sync_thr ||
 	   metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
 	{ restore_gf(); return false; }
 
@@ -4484,7 +4494,7 @@ bool cl_telecom_system::decode_config_tag_from_passband(double* data, int size,
 	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
 		data_container.baseband_data_interpolated,
 		bandwidth / (double)data_container.Nc,
-		ack_mfsk.connect_pattern_nsymb,
+		tag_sync_nsymb,
 		best_offset,
 		ack_mfsk.connect_tones, /*pattern_len=*/8,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
@@ -4504,15 +4514,15 @@ bool cl_telecom_system::decode_config_tag_from_passband(double* data, int size,
 		double remetric = ofdm.detect_ack_pattern(
 			data_container.baseband_data_interpolated, dec_size,
 			1,
-			ack_mfsk.connect_pattern_nsymb,
+			tag_sync_nsymb,
 			ack_mfsk.connect_tones, /*base_len=*/8,
 			ack_mfsk.tone_hop_step, ack_mfsk.M,
 			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
 			&rebest_offset, /*reserve_after=*/N,
 			/*out_match_mask=*/nullptr, /*always_fine=*/false,
-			/*combine_reps=*/ack_mfsk.connect_preamble_reps);
-		if(rematched >= ack_mfsk.connect_match_threshold &&
+			/*combine_reps=*/1);
+		if(rematched >= tag_sync_thr &&
 		   remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
 		{
 			matched = rematched;
@@ -4522,11 +4532,13 @@ bool cl_telecom_system::decode_config_tag_from_passband(double* data, int size,
 	}
 
 	// --- BLOCK 1: the RM(1,4) FWHT codeword (16 symbols), at the start of the
-	// suffix (right after ALL R base reps). Extract its 16×16 energy matrix and
+	// suffix (right after the TRIMMED tag base). Extract its 16×16 energy matrix and
 	// fold each symbol's antipodal tone pair into the 16 FWHT soft chips. The chip
 	// for position i = e[i][perm[i]] - e[i][perm[i]^0xF]
 	// (cfg_tag_softchips_from_energies / cfg_tag_energies_from_cfg). ---
-	int base_total = ack_mfsk.connect_base_total_nsymb();
+	// Stage 3c: the suffix offset is the TRIMMED tag base (config_tag_sync_nsymb()),
+	// matching the TX keyer's abs_s = config_tag_sync_nsymb() + s.
+	int base_total = ack_mfsk.config_tag_sync_nsymb();
 	double rm_e[CFG_TAG_RM_N * 16];
 	ofdm.decode_suffix_energies(
 		data_container.baseband_data_interpolated, dec_size,
