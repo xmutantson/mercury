@@ -258,6 +258,20 @@ public:
 	                                  mfsk_ctrl_frame_type type,
 	                                  uint64_t payload38, uint16_t crc12);
 
+	// In-band rate adaptation (Stage 3a) — CONFIG_TAG keying.
+	// MIRROR of generate_ctrl_suffix_pattern: same CONNECT base pattern + a
+	// one-tone-per-symbol suffix, BUT the suffix tones come from the
+	// gf16ra::encode_config_tag codeword (N = gf16ra::codeword_len() symbols,
+	// the configure(2)=39 R=1/3 substrate) rather than pack_ctrl_suffix. The
+	// CONFIG_TAG uses the [type:3|payload:37] split (so MFSK_CTRL_CONFIG_TAG=4
+	// survives the type field), which pack_ctrl_suffix does NOT understand — hence
+	// a dedicated keyer. `n_suffix` is gf16ra::codeword_len(); `tones` is that
+	// many GF(16) tones (0..M-1). The base is identical to the ctrl-suffix base so
+	// the SAME detect_ack_pattern correlator locates it. Stage 3a is a SELF-
+	// CONTAINED robust burst; the in-line append into send_batch is Stage 3b.
+	void generate_config_tag_mfsk_pattern(std::complex<double>* pattern_out,
+	                                       const int* tones, int n_suffix);
+
 	// RX-side capture buffer populated by the ACK detector hook
 	// (cl_telecom_system::detect_ack_snr_from_passband). Each entry is the
 	// de-hopped payload tone (0..M-1) for the corresponding SACK suffix

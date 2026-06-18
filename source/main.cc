@@ -725,6 +725,13 @@ int main(int argc, char *argv[])
                                         // Reproduces bench-4 (deliver 0-4, BREAK reset with 5-7 undelivered, present 8):
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
+    bool test_config_tag_passband_cli = false; // --test-config-tag-passband: in-band rate-adapt Stage 3a —
+                                        // PASSBAND ROUND-TRIP. TX keys the combined RM+gf16ra suffix to real passband
+                                        // audio, passes it through CLEAN and AWGN, RX detects it on the passband (real
+                                        // base-correlator presence detector) + decodes the right cfg_index, and proves an
+                                        // OFDM data frame still LDPC-decodes with the suffix appended. fail-before:
+                                        // rebuild with -DSTAGE3A_FAILBEFORE (RX ignores the passband suffix). One-shot,
+                                        // exits rc. unilateral-config-tag-design.md §11 Stage 3.
     bool test_config_tag_follow_cli = false; // --test-config-tag-follow: in-band rate-adapt Stage 2 — emit/detect/FOLLOW.
                                         // Forces a CONFIG_10->CONFIG_8 batch-boundary switch; asserts the RX follows the
                                         // config FROM THE TAG (load_configuration) with the PHY twin switching coherently.
@@ -1404,6 +1411,15 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_config_tag_follow
             // + mercury/fact-documents/unilateral-config-tag-design.md §11.
             test_config_tag_follow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-config-tag-passband") == 0)
+        {
+            // In-band rate adaptation Stage 3a — PASSBAND ROUND-TRIP (one-shot at
+            // startup, exit rc). See arq_responder.cc test_config_tag_passband_
+            // roundtrip + unilateral-config-tag-design.md §11 Stage 3.
+            test_config_tag_passband_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2834,6 +2850,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_config_tag_follow();
             printf("[FLAG] Config-tag-follow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_config_tag_passband_cli) {
+            // In-band rate adaptation Stage 3a — PASSBAND ROUND-TRIP (one-shot, exit rc).
+            printf("[FLAG] --test-config-tag-passband: invoking in-band rate-adapt "
+                   "Stage-3a passband round-trip regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_config_tag_passband_roundtrip();
+            printf("[FLAG] Config-tag-passband test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

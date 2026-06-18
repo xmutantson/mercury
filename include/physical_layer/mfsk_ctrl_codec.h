@@ -248,6 +248,10 @@ static const int GF16RA_MAX_N   = 64;  // buffer ceiling for out_tones / energie
 int  configure(int repfact);
 int  codeword_len();   // current N (= K + NC); valid after configure()/init()
 int  parity_len();     // current NC (= repfact*K)
+int  current_repfact();// the repfact configure() last set (for save/restore — the
+                       // graph is process-global; a caller that temporarily
+                       // configure()s a different repfact must restore it so a
+                       // concurrent consumer at another repfact is not corrupted).
 
 // One-time construction of the GF(16) field tables and the RA graph for the
 // current repfact (interleaver, accumulator weights). Idempotent until the next
@@ -332,6 +336,15 @@ void pack_config_tag_typed40_msb(unsigned char out_bytes[5], uint8_t type,
 // sign(bin) -> complement bit; the peak/2nd-peak magnitude ratio is the WRAP
 // peak-margin gate input.
 static const int CFG_TAG_RM_N = 16;  // codeword length (chips)
+
+// WRAP gate-1 / presence subpeak energy-ratio threshold: the FWHT peak-to-2nd-
+// peak ratio over the 16 RM soft chips must exceed this for a tag to be PRESENT
+// (tag-codeword-design.md §4.2). A real RM(1,4) codeword concentrates FWHT energy
+// in one Walsh bin (rpeak large); a noise floor spreads it (rpeak ~ 1). This is
+// the production presence gate that replaces the Stage-2 energy_sum<=1e-12
+// artifact (which false-passes on any real noise floor). Shared by the codec WRAP
+// decoder, the ARQ detect-and-follow presence check, and the unit tests.
+static const double CFG_TAG_PEAK_GATE = 2.0;
 
 // Build the 16 +/-1 chips of the RM(1,4) codeword for cfg_index (0..31). The
 // chip array is written to out_chips[0..15]. Returns false if cfg_index >= 32.

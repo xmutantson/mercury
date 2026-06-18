@@ -4037,11 +4037,10 @@ static void test_gf16_ra_pure_noise_far() {
 //   T2 config_tag_noise_loaded_decode   : right cfg_index at a representative Es/N0
 //   T3 config_tag_pure_noise_far        : WRAP FAR <= the design ~1e-6..1e-8 band
 //
-// The WRAP peak-ratio gate operating point (calibrated against the real codec's
-// noise distribution; design note §10 [?]). The noise-p99.9 of |peak|/|2nd| for
-// a 16-pt FWHT of i.i.d.-ish chips is modest; 2.0 cleanly separates a clean
+// The WRAP peak-ratio gate operating point is now the shared production constant
+// CFG_TAG_PEAK_GATE (mfsk_ctrl_codec.h) — the noise-p99.9 of |peak|/|2nd| for a
+// 16-pt FWHT of i.i.d.-ish chips is modest; 2.0 cleanly separates a clean
 // codeword (ratio -> inf) from noise while admitting the noise-loaded T2 frames.
-static const double CFG_TAG_PEAK_GATE = 2.0;
 
 // Build the GF(16)-RA energy matrix (codeword_len() x 16, one-hot `hi` on the
 // encoded tone, `lo` elsewhere) for a CONFIG_TAG message. Mirrors
@@ -4396,6 +4395,21 @@ static void test_config_tag_follow_stage2() {
 	delete arq;
 	if (rc == 0) test_pass(name);
 	else         test_fail(name, "RX did not follow the config FROM THE TAG (see [TEST-INBAND-FOLLOW] log)");
+}
+
+// §26 — CONFIG_TAG in-band rate adaptation Stage 3a: PASSBAND ROUND-TRIP wrapper.
+// Makes the tag ride the REAL OFDM passband: TX keys the combined RM+gf16ra suffix
+// to passband audio, passes it through CLEAN + AWGN, the RX detects it on the
+// passband (real base-correlator presence detector) + decodes the right cfg_index,
+// and proves an OFDM data frame still LDPC-decodes with the suffix appended.
+// unilateral-config-tag-design.md §11 Stage 3.
+static void test_config_tag_passband_stage3a() {
+	const char* name = "config_tag_passband_stage3a (TX->AWGN->RX passband detect+decode, payload uncorrupted)";
+	cl_arq_controller* arq = new cl_arq_controller();
+	int rc = arq->test_config_tag_passband_roundtrip();
+	delete arq;
+	if (rc == 0) test_pass(name);
+	else         test_fail(name, "config-tag passband round-trip failed (see [TEST-INBAND-PB] log)");
 }
 
 // §10.5 — THE MEASUREMENT: GF(16)-RA acquisition cliff on the SAME SNR3k axis as
@@ -6530,6 +6544,12 @@ int run_mfsk_ctrl_codec_tests() {
 	// boundary switch and asserts the RX follows FROM THE TAG with the PHY twin
 	// switching coherently. unilateral-config-tag-design.md §11 Stage 2.
 	test_config_tag_follow_stage2();
+
+	// §26 CONFIG_TAG in-band rate adaptation Stage 3a — PASSBAND ROUND-TRIP.
+	// Makes the tag ride the REAL OFDM passband (TX key -> CLEAN+AWGN -> RX base-
+	// correlator detect + decode), and proves an OFDM data frame still LDPC-decodes
+	// with the suffix appended. unilateral-config-tag-design.md §11 Stage 3.
+	test_config_tag_passband_stage3a();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

@@ -940,6 +940,47 @@ void cl_mfsk::generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
 	}
 }
 
+// In-band rate adaptation (Stage 3a): CONNECT base pattern + the CONFIG_TAG
+// GF(16) RA codeword as the suffix. MIRROR of generate_ctrl_suffix_pattern; the
+// ONLY difference is the suffix tones come from `tones[]` (the
+// gf16ra::encode_config_tag codeword the ARQ layer already built) instead of
+// pack_ctrl_suffix. Same base, same one-hot per-symbol tone placement, same hop
+// formula and base_total offset — so the SAME detect_ack_pattern correlator
+// locates it and the SAME decode_suffix_energies extracts the per-tone energy
+// matrix the config_tag_wrap_decode consumes. n_suffix MUST be
+// gf16ra::codeword_len().
+void cl_mfsk::generate_config_tag_mfsk_pattern(std::complex<double>* pattern_out,
+                                               const int* tones, int n_suffix)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+	if (n_suffix <= 0 || tones == NULL) return;
+	if (connect_pattern_nsymb <= 0) return;
+
+	// First: the IDENTICAL CONNECT base pattern (R×16 WB symbols) so the existing
+	// base correlator (detect_ack_pattern on connect_tones) finds the burst — the
+	// same robust always-on detector the ctrl-suffix uses (design §3.1).
+	generate_connect_pattern(pattern_out);
+
+	// The suffix follows ALL R base reps (combining is on the base, not the
+	// suffix), exactly as generate_ctrl_suffix_pattern. abs_s uses base_total so
+	// TX and the RX suffix-decode offset (passed connect_base_total_nsymb()) stay
+	// phase-consistent — the SAME hop discipline the ctrl-suffix uses.
+	int base_total = connect_base_total_nsymb();
+	double amp = sqrt((double)Nc / nStreams);
+	for (int s = 0; s < n_suffix; s++) {
+		int abs_s = base_total + s;  // suffix index after ALL base reps
+		for (int k = 0; k < Nc; k++)
+			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+
+		int tone = tones[s];
+		if (tone < 0 || tone >= M) tone = 0;  // defensive clamp
+		int actual_tone = (tone + abs_s * tone_hop_step) % M;
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
+	}
+}
+
 // Generate ACK pattern + 4 SNR suffix symbols
 void cl_mfsk::generate_ack_snr_pattern(std::complex<double>* pattern_out, float snr)
 {

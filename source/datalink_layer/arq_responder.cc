@@ -3997,6 +3997,249 @@ int cl_arq_controller::test_config_tag_follow()
 }
 
 // ============================================================================
+// In-band rate adaptation — STAGE 3a PASSBAND ROUND-TRIP
+// ============================================================================
+//
+// CLI: --test-config-tag-passband  (unilateral-config-tag-design.md §11 Stage 3a)
+//
+// Stage 2 proved emit/detect/follow on an IDEALIZED energy artifact (the tag did
+// NOT ride the real OFDM passband). Stage 3a makes the tag ride the REAL passband:
+//   1. TX: build_config_tag_tones -> generate_config_tag_pattern_passband keys the
+//      combined RM(1,4)+GF(16) suffix to passband audio (MIRROR of the existing
+//      ctrl-suffix generate_ctrl_suffix_pattern_passband).
+//   2. CHANNEL: pass the burst through CLEAN, then AWGN.
+//   3. RX: decode_config_tag_from_passband (the REAL base-correlator presence
+//      detector — NOT energy_sum<=1e-12) extracts the per-tone energy matrix +
+//      FWHT soft chips from the passband, then config_tag_wrap_decode accepts.
+//   4. PAYLOAD: a real OFDM data frame (transmit_byte -> AWGN -> receive_byte)
+//      LDPC-decodes byte-faithful WITH the config-tag burst appended after it,
+//      proving the suffix does not corrupt the payload.
+//
+// fail-before (-DSTAGE3A_FAILBEFORE): the RX ignores the passband suffix
+// (decode_config_tag_from_passband returns false) -> no cfg_index decode -> FAIL.
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_config_tag_passband_roundtrip()
+{
+	const char* TAG = "[TEST-INBAND-PB]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// CONFIG_8 = a WB OFDM config (16-QAM tier) whose load brings ack_mfsk (M=16)
+	// up so the robust ctrl-suffix layer is available. The tag ANNOUNCES configs;
+	// the burst itself rides the M=16 robust layer regardless of the OFDM config.
+	const int TEST_CFG = CONFIG_8;
+	cl_telecom_system* ts = new cl_telecom_system();
+	ts->operation_mode = ARQ_MODE;
+	ts->load_configuration(TEST_CFG);
+	this->telecom_system = ts;   // build_config_tag_tones reads telecom_system->ack_mfsk
+
+	if(ts->ack_mfsk.ack_sack_suffix_len() <= 0) {
+		check(false, "WB M>=16 (ack_sack_suffix_len>0)", ts->ack_mfsk.ack_sack_suffix_len(), 1);
+		this->telecom_system = NULL; delete ts;
+		printf("%s FAILURES (failed=%d)\n", TAG, failed);
+		return 1;
+	}
+
+	// --- Build the combined CONFIG_TAG suffix tones (RM16 || gf16ra39 = 55) ------
+	// Announce CONFIG_10 (a DIFFERENT config than TEST_CFG so the decode target is
+	// unambiguous). The ladder index of the announced config is what the tag carries.
+	const int ANNOUNCE_CFG = CONFIG_10;
+	int ann_ladder = config_ladder_index(ANNOUNCE_CFG);
+	int tones[gf16ra::GF16RA_MAX_N];
+	int n_tones = 0;
+	uint8_t bsi_lsb = 0;
+	const int BSI = 43;
+	const uint8_t PARITY = 1;
+	bool built = build_config_tag_tones(ANNOUNCE_CFG, BSI, PARITY, tones, &n_tones, &bsi_lsb);
+	check(built, "build_config_tag_tones succeeds", built ? 1 : 0, 1);
+	check(n_tones == CFG_TAG_RM_N + gf16ra::codeword_len(),
+		"combined suffix length = RM16 + gf39 = 55", n_tones, CFG_TAG_RM_N + gf16ra::codeword_len());
+
+	// --- TX: key the tag to passband audio --------------------------------------
+	int base_total = ts->ack_mfsk.connect_base_total_nsymb();
+	int burst_nsymb = base_total + n_tones;
+	int burst_samples = burst_nsymb * ts->data_container.Nofdm * ts->frequency_interpolation_rate;
+	// Generous padding so the RX detector + suffix-energy windows have headroom.
+	int pad = 8192;
+	std::vector<double> clean((size_t)burst_samples + 2 * pad, 0.0);
+	int written = ts->generate_config_tag_pattern_passband(clean.data() + pad, tones, n_tones);
+	check(written == burst_samples,
+		"generate_config_tag_pattern_passband wrote burst_samples", written, burst_samples);
+
+	// Helper: detect+decode a passband buffer, return the decoded cfg_index (-1 on
+	// no-decode), and whether the wrap-decode accepted with the right binding.
+	auto decode_pb = [&](double* buf, int n, int* out_cfg_idx, bool* out_accept,
+	                     int* out_matched) -> bool {
+		std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+		double chips[16] = {0.0};
+		int n_syms = 0, matched = 0;
+		bool present = ts->decode_config_tag_from_passband(buf, n,
+			energies.data(), chips, &n_syms, &matched);
+		if(out_matched) *out_matched = matched;
+		if(!present) { if(out_cfg_idx) *out_cfg_idx = -1; if(out_accept) *out_accept = false; return false; }
+		config_tag_decode_result r;
+		// Production CRC-12 callback (NEVER inline — same as the ARQ detect path).
+		auto crc12_cb = [](void* ctx, const unsigned char* d, int nn) -> uint16_t {
+			return ((cl_arq_controller*)ctx)->CRC12_calc((const char*)d, nn) & 0x0FFF;
+		};
+		bool accept = config_tag_wrap_decode(energies.data(), chips, CFG_TAG_PEAK_GATE,
+			bsi_lsb, PARITY, crc12_cb, this, &r);
+		if(out_cfg_idx) *out_cfg_idx = accept ? (int)r.cfg_index : -1;
+		if(out_accept)  *out_accept  = accept;
+		return present;
+	};
+
+	// --- CLEAN passband round-trip ----------------------------------------------
+	// These POSITIVE assertions are UNCONDITIONAL: under -DSTAGE3A_FAILBEFORE the RX
+	// ignores the passband suffix (decode_config_tag_from_passband returns false),
+	// so present/accept/cfg_idx FAIL — the genuine fail-before (proves the passband
+	// detect+decode is load-bearing, not a tautology).
+	{
+		int cfg_idx = -2; bool accept = false; int matched = 0;
+		bool present = decode_pb(clean.data(), (int)clean.size(), &cfg_idx, &accept, &matched);
+		check(present, "CLEAN: RX detects the burst on the real passband (base correlator)",
+			present ? 1 : 0, 1);
+		check(accept, "CLEAN: config_tag_wrap_decode ACCEPTS (FWHT+CRC+binding)", accept ? 1 : 0, 1);
+		check(cfg_idx == ann_ladder, "CLEAN: decoded cfg_index == announced ladder index",
+			cfg_idx, ann_ladder);
+	}
+
+	// --- AWGN passband round-trip (Es/N0 ~ 6 dB at the M=16 robust layer) --------
+	// The MFSK suffix rides the most-robust layer; 6 dB is comfortably above its
+	// floor (the GF(16) RA substrate is rate-1/3). Calibrate sigma from the burst
+	// passband power so the SNR is meaningful.
+	{
+		double P_sig = 0.0;
+		for(int i = 0; i < burst_samples; i++) {
+			double s = clean[pad + i];
+			P_sig += s * s;
+		}
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		double f_nyquist = ts->sampling_frequency / 2.0;
+		double EsN0 = 6.0;
+		float sigma = (float)sqrt(2.0 * P_sig * f_nyquist / (pow(10.0, EsN0 / 10.0) * ts->bandwidth));
+
+		std::vector<double> noisy((size_t)clean.size(), 0.0);
+		ts->awgn_channel.apply_with_delay(clean.data(), noisy.data(), sigma,
+			(int)clean.size(), 0);
+
+		int cfg_idx = -2; bool accept = false; int matched = 0;
+		bool present = decode_pb(noisy.data(), (int)noisy.size(), &cfg_idx, &accept, &matched);
+		(void)matched;
+		check(present, "AWGN(6dB): RX detects the burst on the noisy passband",
+			present ? 1 : 0, 1);
+		check(accept, "AWGN(6dB): config_tag_wrap_decode ACCEPTS", accept ? 1 : 0, 1);
+		check(cfg_idx == ann_ladder, "AWGN(6dB): decoded cfg_index == announced ladder index",
+			cfg_idx, ann_ladder);
+	}
+
+	// --- REAL noise floor, NO tag: the presence detector must NOT false-trigger --
+	// Pure AWGN (no burst). The base correlator must reject (matched < threshold)
+	// — this is the production presence gate replacing energy_sum<=1e-12, which
+	// would have FALSE-PASSED here (a real noise floor's energy_sum >> 1e-12).
+	{
+		std::vector<double> noise_only((size_t)clean.size(), 0.0);
+		double P_sig = 0.0;
+		for(int i = 0; i < burst_samples; i++) { double s = clean[pad + i]; P_sig += s * s; }
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		float sigma = (float)sqrt(P_sig);   // ~0 dB noise floor (no signal present)
+		ts->awgn_channel.apply_with_delay(noise_only.data(), noise_only.data(), sigma,
+			(int)noise_only.size(), 0);   // in==0 -> pure noise
+
+		int cfg_idx = -2; bool accept = false; int matched = 0;
+		bool present = decode_pb(noise_only.data(), (int)noise_only.size(), &cfg_idx, &accept, &matched);
+		check(!present || !accept,
+			"NOISE-FLOOR: presence detector does NOT false-trigger (no tag accepted)",
+			(present && accept) ? 1 : 0, 0);
+	}
+
+	// --- PAYLOAD UNCORRUPTED: a real OFDM data frame still LDPC-decodes with the
+	// config-tag burst APPENDED after it (the real attach geometry — burst rides
+	// AFTER the OFDM frame). Use the production passband_test_EsN0 first to confirm
+	// the OFDM config decodes clean, then prove appending the suffix does not move
+	// the payload bits. ---
+	{
+		// Baseline: the OFDM config decodes near-zero BER clean (high Es/N0).
+		cl_error_rate er = ts->passband_test_EsN0(40.0f, 3);
+		check(er.BER < 1e-6, "PAYLOAD: OFDM data frame LDPC-decodes clean (BER~0) at CONFIG_8",
+			(long)(er.BER * 1e9), 0);
+
+		// Now the combined-frame integrity: emit ONE OFDM data frame to passband,
+		// APPEND the config-tag burst, and decode the OFDM payload from the FRONT of
+		// the combined buffer. The OFDM receive_byte reads only the frame region; the
+		// appended suffix lives strictly after it. Byte-faithful payload == suffix
+		// did not corrupt the frame.
+		int nReal = ts->data_container.nBits - ts->ldpc.P;
+		int nPayloadBytes = (nReal - ts->outer_code_reserved_bits) / 8;
+		for(int i = 0; i < nReal - ts->outer_code_reserved_bits; i++)
+			ts->data_container.data_bit[i] = (i * 1103515245 + 12345) & 1;  // deterministic
+		bit_to_byte(ts->data_container.data_bit, ts->data_container.data_byte,
+			nReal - ts->outer_code_reserved_bits);
+		ts->transmit_byte(ts->data_container.data_byte, nPayloadBytes,
+			ts->data_container.passband_data, SINGLE_MESSAGE);
+
+		int frame_samples = (ts->data_container.Nofdm *
+			(ts->data_container.Nsymb + ts->data_container.preamble_nSymb)) *
+			ts->frequency_interpolation_rate;
+
+		// Combined buffer: [OFDM frame | config-tag burst]. Sized to the FULL
+		// passband_delayed_data capacity (2*Nofdm*buffer_Nsymb*interp) so receive_byte
+		// — which reads a full buffer window from the forced-delay position — cannot
+		// overrun (the production BER path passes exactly that buffer).
+		int delay = (ts->data_container.Nfft == 1024) ? 100 : 50;
+		int rx_delay = ((ts->data_container.preamble_nSymb + 2) * ts->data_container.Nofdm + delay)
+			* ts->frequency_interpolation_rate;
+		size_t combined_cap = (size_t)2 * ts->data_container.Nofdm
+			* ts->data_container.buffer_Nsymb * ts->frequency_interpolation_rate;
+		size_t need = (size_t)rx_delay + frame_samples + burst_samples + pad;
+		if(combined_cap < need) combined_cap = need;
+		std::vector<double> combined(combined_cap, 0.0);
+		// Place the OFDM frame at rx_delay (the forced-delay position receive_byte
+		// expects), then the burst right after the frame.
+		for(int i = 0; i < frame_samples; i++)
+			combined[rx_delay + i] = ts->data_container.passband_data[i];
+		int burst2 = ts->generate_config_tag_pattern_passband(
+			combined.data() + rx_delay + frame_samples, tones, n_tones);
+		check(burst2 == burst_samples, "PAYLOAD: appended burst keyed after the OFDM frame",
+			burst2, burst_samples);
+
+		// Decode the OFDM payload from the combined buffer at the forced delay.
+		ts->ofdm_forced_delay = rx_delay;
+		ts->receive_byte(combined.data(), ts->data_container.hd_decoded_data_byte);
+		ts->ofdm_forced_delay = -1;
+		byte_to_bit(ts->data_container.hd_decoded_data_byte,
+			ts->data_container.hd_decoded_data_bit, nPayloadBytes);
+		int bit_errs = 0;
+		for(int i = 0; i < nReal - ts->outer_code_reserved_bits; i++)
+			if(ts->data_container.data_bit[i] != ts->data_container.hd_decoded_data_bit[i]) bit_errs++;
+		check(bit_errs == 0,
+			"PAYLOAD: OFDM frame LDPC-decodes BYTE-FAITHFUL with the suffix appended",
+			bit_errs, 0);
+
+		// And the appended suffix is STILL decodable from the same combined buffer
+		// (the data frame did not clobber the burst).
+		int cfg_idx = -2; bool accept = false; int matched = 0;
+		bool present = decode_pb(combined.data() + rx_delay + frame_samples - pad,
+			burst_samples + 2 * pad, &cfg_idx, &accept, &matched);
+		(void)present; (void)accept; (void)matched;
+		check(present && accept && cfg_idx == ann_ladder,
+			"PAYLOAD: the appended suffix STILL decodes to the right cfg after the frame",
+			cfg_idx, ann_ladder);
+	}
+
+	this->telecom_system = NULL;
+	delete ts;
+
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK), in-process test
 // ============================================================================
 //

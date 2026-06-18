@@ -2438,6 +2438,74 @@ bool cl_arq_controller::inband_rate_feature_enabled()
 	return inband_rate_enabled == 1;
 }
 
+// In-band rate adaptation (Stage 3a): build the combined CONFIG_TAG suffix tones.
+// The tag rides TWO concatenated suffix blocks (tag-codeword-design.md §1.3, the
+// WRAP detector that config_tag_wrap_decode consumes):
+//   [ RM(1,4) Walsh codeword : CFG_TAG_RM_N=16 symbols ]   (the FWHT cfg_index)
+//   [ GF(16) RA + CRC-12 msg : gf16ra::codeword_len()=39 ] (binding + corroborate)
+// Both carry the SAME cfg_index. The RM tones are the perm-tone realization
+// (cfg_tag_energies_from_cfg's per-symbol lit tone); the gf16ra tones are the
+// systematic+parity codeword. Returns the combined RM16||gf39 tone array.
+bool cl_arq_controller::build_config_tag_tones(int batch_cfg, int batch_seq_id,
+                                               uint8_t parity,
+                                               int* out_tones, int* out_n,
+                                               uint8_t* out_bsi_lsb)
+{
+	if(out_n) *out_n = 0;
+	if(out_tones == NULL) return false;
+
+	int ladder_idx = config_ladder_index(batch_cfg);
+	if(ladder_idx < 0 || ladder_idx > 31) return false;
+	if(telecom_system == NULL) return false;
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // M<16
+
+	uint8_t bsi_lsb = (uint8_t)(batch_seq_id & 0x7);
+
+	// Configure the gf16ra graph to the N=39 R=1/3 substrate (OD-2). This is the
+	// SAME configure(2) the RX independently sets (decode_config_tag_from_passband)
+	// — the builder no longer relies on a process-global side effect. SAVE/RESTORE
+	// the prior repfact: gf16ra is process-global and the legacy CONNECT FEC path
+	// runs at configure(3) (set_suffix_fec, N=52) — leaving the global at 2 would
+	// mis-size a subsequent CONNECT-FEC capture (CLAUDE.md §5 cross-layer guard).
+	int saved_repfact = gf16ra::current_repfact();
+	gf16ra::configure(2);
+	gf16ra::init();
+	int N_gf = gf16ra::codeword_len();   // 39
+	if(N_gf <= 0 || N_gf > gf16ra::GF16RA_MAX_N) {
+		if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+		return false;
+	}
+
+	// --- RM(1,4) block tones: per symbol i, the lit tone is perm[i] (chip +1) or
+	// perm[i]^0xF (chip -1), the EXACT one-hot cfg_tag_energies_from_cfg renders. ---
+	int rm_chips[CFG_TAG_RM_N];
+	if(!cfg_tag_rm_encode(ladder_idx, rm_chips)) return false;
+	for(int i = 0; i < CFG_TAG_RM_N; i++)
+	{
+		int tplus = CFG_TAG_TONE_PERM[i] & 0xF;
+		out_tones[i] = (rm_chips[i] > 0) ? tplus : (tplus ^ 0xF);
+	}
+
+	// --- GF(16) RA + CRC-12 message block (binding copy of cfg_index + bsi_lsb +
+	// epoch_parity, CRC-12-protected). ---
+	uint64_t p37 = 0;
+	pack_config_tag_payload(&p37, (uint8_t)ladder_idx, bsi_lsb, parity);
+	unsigned char bytes[5];
+	pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_CONFIG_TAG, p37);
+	uint16_t crc12 = CRC12_calc((const char*)bytes, 5) & 0x0FFF;
+	gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_CONFIG_TAG, p37, crc12,
+		out_tones + CFG_TAG_RM_N);
+
+	if(out_n) *out_n = CFG_TAG_RM_N + N_gf;   // 55
+	if(out_bsi_lsb) *out_bsi_lsb = bsi_lsb;
+
+	// Restore the global gf16ra repfact (cross-layer guard, see top of fn). The
+	// caller derives the gf16ra block length from *out_n - CFG_TAG_RM_N, NOT from
+	// gf16ra::codeword_len(), so it does not depend on the global staying at 2.
+	if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	return true;
+}
+
 int cl_arq_controller::emit_config_tag_if_changed(int batch_cfg, int batch_seq_id,
                                                   double hi, double lo,
                                                   double* out_energies /*N*16*/,
@@ -2465,31 +2533,32 @@ int cl_arq_controller::emit_config_tag_if_changed(int batch_cfg, int batch_seq_i
 	inband_tx_epoch_parity ^= 1;
 	inband_last_announced_config = batch_cfg;
 
-	uint8_t bsi_lsb = (uint8_t)(batch_seq_id & 0x7);
 	uint8_t parity  = inband_tx_epoch_parity;
 
-	// Build the GF(16) RA + CRC-12 protected message (the binding copy of cfg_index
-	// + bsi_lsb + epoch_parity rides as plain CRC-protected bits) and the RM(1,4)
-	// FWHT codeword for the cfg_index. Identical construction to the Stage-1 test
-	// helper build_config_tag_gf16_energies, in production form.
-	gf16ra::configure(2);   // N=39, R=1/3 (the OD-2 floor substrate)
-	gf16ra::init();
-
-	uint64_t p37 = 0;
-	pack_config_tag_payload(&p37, (uint8_t)ladder_idx, bsi_lsb, parity);
-
-	unsigned char bytes[5];
-	pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_CONFIG_TAG, p37);
-	uint16_t crc12 = CRC12_calc((const char*)bytes, 5) & 0x0FFF;
-
-	int N = gf16ra::codeword_len();
+	// Build the GF(16) RA + CRC-12 protected message + the RM(1,4) FWHT codeword
+	// via the shared builder (also used by the Stage-3a passband round-trip). It
+	// configures gf16ra(2) and returns the combined RM16+gf16ra39 tone array; here
+	// we additionally render the idealized clean energy/chip artifacts the Stage-2
+	// directed test consumes (the passband path re-derives these from real audio).
 	int tones[gf16ra::GF16RA_MAX_N];
-	gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_CONFIG_TAG, p37, crc12, tones);
+	int n_tones = 0;
+	uint8_t bsi_lsb = 0;
+	if(!build_config_tag_tones(batch_cfg, batch_seq_id, parity,
+	                           tones, &n_tones, &bsi_lsb))
+		return 0;
+
+	// gf16ra block length = total tones minus the 16-symbol RM prefix (derived from
+	// n_tones, NOT gf16ra::codeword_len() — build_config_tag_tones restores the
+	// process-global repfact, so the global no longer reflects the tag's N=39).
+	int N = n_tones - CFG_TAG_RM_N;   // 39
 
 	if(out_energies)
 	{
+		// Idealized gf16ra block energies (the Stage-2 artifact). The gf16ra tones
+		// are the LAST N entries of the combined array (after the 16 RM tones).
+		const int* gf_tones = tones + CFG_TAG_RM_N;
 		for(int s = 0; s < N * 16; s++) out_energies[s] = lo;
-		for(int s = 0; s < N; s++) out_energies[(size_t)s * 16 + tones[s]] = hi;
+		for(int s = 0; s < N; s++) out_energies[(size_t)s * 16 + gf_tones[s]] = hi;
 	}
 	if(out_chips)
 	{
@@ -2532,20 +2601,30 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 	if(energies == NULL || chip_soft == NULL || n_syms <= 0)
 		return 0;
 
-	// CHEAP always-on PRESENCE check first (firing policy): only run the expensive
-	// config_tag_wrap_decode when a suffix is actually present. A real suffix lights
-	// one tone per symbol well above the noise floor; an absent suffix is an
-	// all-(near)-zero energy block. Sum the energy; if it is effectively zero the
-	// frame carries no tag and we return immediately (the steady-state no-tag case).
-	double energy_sum = 0.0;
-	for(int s = 0; s < n_syms * 16; s++) energy_sum += energies[s];
-	if(energy_sum <= 1e-12)
-		return 0;   // no suffix present -> no tag -> no cost beyond the sum
+	// REAL always-on PRESENCE check (design §3.1 — replaces the Stage-2 artifact
+	// gate energy_sum<=1e-12, which is NOT a production detector: a real passband
+	// has a noise floor whose energy_sum is far above 1e-12, so the old gate
+	// false-PASSED on every noisy no-tag frame and let pure noise reach the WRAP
+	// decoder). The PHY base-correlator (decode_config_tag_from_passband) is the
+	// FIRST-line presence detector. THIS is the SUBPEAK ENERGY-RATIO gate the
+	// design references: the FWHT peak-to-2nd-peak ratio over the 16 RM soft chips.
+	// A real codeword concentrates FWHT energy in ONE Walsh bin (rpeak large);
+	// noise spreads it (rpeak -> ~1). Gate on rpeak >= CFG_TAG_PEAK_GATE so a noise
+	// floor (no codeword) is cheaply rejected BEFORE the expensive gf16ra BP — the
+	// same peak-margin the WRAP decoder re-checks as gate-1.
+	{
+		double rpeak = 0.0;
+		(void)cfg_tag_rm_fwht_decode(chip_soft, &rpeak);
+		if(rpeak < CFG_TAG_PEAK_GATE)
+			return 0;   // no codeword present -> no tag (steady-state / noise floor)
+	}
 
 	// Suffix present: run the WRAP decoder. The bsi_lsb + epoch_parity binding gates
 	// are honoured INSIDE the wrap-decode (bind_agree). Pass the production CRC-12.
+	// The WRAP re-applies the SAME peak gate as gate-1 (CFG_TAG_PEAK_GATE) plus the
+	// GF(16)+CRC-12 accept and the cfg_index corroboration + binding gates.
 	config_tag_decode_result r;
-	bool ok = config_tag_wrap_decode(energies, chip_soft, /*peak_ratio_gate=*/2.0,
+	bool ok = config_tag_wrap_decode(energies, chip_soft, /*peak_ratio_gate=*/CFG_TAG_PEAK_GATE,
 		expect_bsi_lsb, expect_parity, arq_inband_crc12_cb, this, &r);
 	if(!ok)
 	{

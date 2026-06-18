@@ -249,6 +249,35 @@ public:
 	                                       ctrl_crc12_fn crc12_fn = nullptr,
 	                                       void* crc12_ctx = nullptr);
 
+	// ---- In-band rate adaptation (Stage 3a) — CONFIG_TAG on the real passband ----
+	// TX: emit the CONFIG_TAG MFSK ctrl-suffix burst as passband audio. MIRROR of
+	// generate_ctrl_suffix_pattern_passband: CONNECT base pattern + a one-tone-per-
+	// symbol suffix, but the suffix is the gf16ra::encode_config_tag codeword
+	// (configure(2) = N=39 R=1/3) built by the ARQ layer. The burst is SELF-SIZED
+	// (it computes its own sample count from connect_base_total_nsymb()+N — it does
+	// NOT read ctrl_suffix_pattern_passband_samples, which is sized for the CONNECT
+	// FEC mode, not the tag). `tones` is N=gf16ra::codeword_len() GF(16) tones.
+	// Returns samples written, or 0 if unsupported (NB / M<16). Stage 3a is a self-
+	// contained robust burst; the in-line append into send_batch is Stage 3b.
+	int generate_config_tag_pattern_passband(double* out,
+	                                          const int* tones, int n_suffix);
+
+	// RX: detect the CONFIG_TAG burst on the real passband and extract the per-tone
+	// ENERGY matrix + soft FWHT chips, then hand them to the ARQ wrap-decoder.
+	// MIRROR of decode_ctrl_suffix_from_passband's front half: passband→baseband
+	// decimate, detect_ack_pattern base correlator (THE real always-on presence
+	// detector — gate on matched>=connect_match_threshold && metric>=
+	// CTRL_DETECT_METRIC_MIN, design §3.1), control mini-Moose v2 CFO correction,
+	// then decode_suffix_energies over N symbols. Writes the N*M energy matrix into
+	// out_energies (caller-sized to >= N*M) and the 16 RM soft chips into
+	// out_chips[16]; sets *out_n_syms = N and *out_matched. Returns true iff the
+	// base correlator locked (a burst is present); false = no tag present (the
+	// steady-state no-tag frame on a real noise floor). The CRC/FWHT/binding
+	// acceptance is the ARQ layer's config_tag_wrap_decode, NOT here.
+	bool decode_config_tag_from_passband(double* data, int size,
+	                                      double* out_energies, double* out_chips,
+	                                      int* out_n_syms, int* out_matched);
+
 	// ---- Suffix FEC (connect-suffix-fec-research.md) — MEASURED PROTOTYPE ----
 	// CRC-aided SOFT list decode of the 13-symbol ctrl-suffix. ZERO airtime
 	// (Tier 1): no wire-format change, the suffix bytes are byte-identical to

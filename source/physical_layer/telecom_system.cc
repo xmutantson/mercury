@@ -4106,6 +4106,60 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 	return ctrl_suffix_pattern_passband_samples;
 }
 
+// In-band rate adaptation (Stage 3a): emit the CONFIG_TAG burst as passband
+// audio. MIRROR of generate_ctrl_suffix_pattern_passband — identical IFFT +
+// power-normalization + baseband-to-passband + peak-clip pipeline — but the
+// suffix is keyed from the gf16ra::encode_config_tag codeword `tones[]` (the ARQ
+// layer already built it via emit_config_tag_if_changed) instead of
+// pack_ctrl_suffix. SELF-SIZED: the CONFIG_TAG codeword (configure(2)=N=39)
+// differs from the CONNECT FEC length (configure(3)=N=52), so this does NOT read
+// ctrl_suffix_pattern_passband_samples — it computes its own nsymb/sample count.
+// Returns samples written, or 0 if unsupported (NB / M<16) or n_suffix invalid.
+int cl_telecom_system::generate_config_tag_pattern_passband(double* out,
+	const int* tones, int n_suffix)
+{
+	if(out == NULL || tones == NULL || n_suffix <= 0) return 0;
+	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;       // NB unsupported (M<16)
+	if(ack_mfsk.connect_pattern_nsymb <= 0) return 0;
+
+	// Base occupies connect_base_total_nsymb() (R×16 when combining; =16 default).
+	// The CONFIG_TAG suffix is n_suffix = gf16ra::codeword_len() symbols.
+	int base_total = ack_mfsk.connect_base_total_nsymb();
+	int nsymb = base_total + n_suffix;
+	int n_samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	if(n_samples <= 0) return 0;
+
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	// Key the base + the gf16ra config-tag tones into the framed data buffer.
+	ack_mfsk.generate_config_tag_mfsk_pattern(data_container.ofdm_framed_data,
+		tones, n_suffix);
+
+	for(int i = 0; i < nsymb; i++)
+	{
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	}
+
+	// Reuse the ACK gain channel — same MFSK pattern family on the wire as the
+	// ctrl-suffix (so the tag rides the SAME robust layer, design §2.2/§3.1).
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	ofdm.peak_clip(out, n_samples, ofdm.data_papr_cut);
+
+	return n_samples;
+}
+
 // RX: detect CONNECT base + decode the 52-bit ctrl-suffix.
 // Reuses ofdm.detect_ack_pattern parameterized on connect_tones, then
 // ofdm.decode_suffix_tones, then ack_mfsk.unpack_ctrl_suffix. Returns
@@ -4334,6 +4388,173 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 	// Consume the capture: caller gets a one-shot view of this match.
 	ack_mfsk.last_connect_capture_valid = false;
 	return ok;
+}
+
+// In-band rate adaptation (Stage 3a): RX-side CONFIG_TAG detect + energy-matrix
+// extraction from the real passband. MIRROR of decode_ctrl_suffix_from_passband's
+// front half (passband→baseband decimate, detect_ack_pattern base correlator,
+// control mini-Moose v2 CFO correction). THE base correlator IS the real always-
+// on presence detector the design §3.1 references — it returns a match count +
+// metric; the SAME gate the ctrl-suffix uses (matched>=connect_match_threshold &&
+// metric>=CTRL_DETECT_METRIC_MIN) cheaply rejects steady-state no-tag frames and
+// does NOT false-trigger on a real noise floor (proved by
+// test_mfsk_connect_no_hail_false_trigger). On a lock, extract the N-symbol per-
+// tone ENERGY matrix (decode_suffix_energies — same de-hop math the gf16ra
+// decoder consumes) + the 16 RM soft chips, and hand them to the ARQ layer's
+// config_tag_wrap_decode for the CRC/FWHT/binding acceptance.
+bool cl_telecom_system::decode_config_tag_from_passband(double* data, int size,
+	double* out_energies, double* out_chips, int* out_n_syms, int* out_matched)
+{
+	if(out_matched) *out_matched = 0;
+	if(out_n_syms) *out_n_syms = 0;
+	if(data == NULL || out_energies == NULL || out_chips == NULL) return false;
+	if(ack_mfsk.ack_sack_suffix_len() <= 0) return false;       // NB (M<16)
+	if(ack_mfsk.connect_pattern_nsymb <= 0) return false;
+
+#ifdef STAGE3A_FAILBEFORE
+	// FAIL-BEFORE arm: the RX IGNORES the passband suffix entirely (no base
+	// correlation, no energy extraction). The Stage-3a test then sees no detect ->
+	// no cfg_index -> FAIL (proves the passband detect+decode is load-bearing).
+	// Rebuild with -DSTAGE3A_FAILBEFORE to take this path.
+	(void)data; (void)size; (void)out_energies; (void)out_chips;
+	return false;
+#endif
+
+	// The CONFIG_TAG rides TWO concatenated suffix blocks (the WRAP detector,
+	// tag-codeword-design.md §1.3 / config_tag_wrap_decode): a 16-symbol RM(1,4)
+	// Walsh/Hadamard codeword block (the FWHT cfg_index detector) FOLLOWED BY the
+	// N=39 GF(16) RA + CRC-12 message block (the binding-bits + corroboration
+	// copy). Total suffix = CFG_TAG_RM_N (16) + gf16ra::codeword_len() (39) = 55.
+	//
+	// Configure the gf16ra graph to N=39 (configure(2)) so codeword_len() is the
+	// tag length (NOT the CONNECT FEC's configure(3)=52). THIS is the RX
+	// gf16ra::configure(2) independence the Stage-2 verify flagged: the RX must NOT
+	// rely on the TX having set the process-global repfact. SAVE/RESTORE the prior
+	// repfact (the legacy CONNECT FEC runs at configure(3)) — this RX only needs the
+	// gf16ra symbol COUNT (N_gf) for the energy-extraction windows, NOT the graph
+	// itself (the BP decode is config_tag_wrap_decode, which self-configures), so we
+	// restore before returning. (CLAUDE.md §5 cross-layer guard.)
+	int saved_repfact = gf16ra::current_repfact();
+	gf16ra::configure(2);
+	gf16ra::init();
+	int N_gf = gf16ra::codeword_len();   // 39
+	auto restore_gf = [&]() {
+		if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	};
+	if(N_gf <= 0 || N_gf > gf16ra::GF16RA_MAX_N) { restore_gf(); return false; }
+	const int N_rm = CFG_TAG_RM_N;       // 16
+	int N = N_rm + N_gf;                  // 55 suffix symbols total
+
+	// --- Polyphase decimated path: mix + FIR + decimate (identical preprocessing
+	// to decode_ctrl_suffix_from_passband). ---
+	int M = data_container.interpolation_rate;
+	int dec_size = size / M;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		M, &ofdm.FIR_rx_data);
+
+	// --- THE PRESENCE DETECTOR: the base-pattern correlator. ---
+	int matched = 0;
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		ack_mfsk.connect_pattern_nsymb,
+		ack_mfsk.connect_tones, /*base_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&best_offset, /*reserve_after=*/N,
+		/*out_match_mask=*/nullptr, /*always_fine=*/false,
+		/*combine_reps=*/ack_mfsk.connect_preamble_reps);
+
+	if(out_matched) *out_matched = matched;
+
+	// The real gate (telecom_system.cc:4157 — IDENTICAL to the ctrl-suffix). A
+	// no-tag frame on a real noise floor does not reach this — the steady-state
+	// cheap reject (design §3.2 outcome 2 / R2 false-trigger bound).
+	if(matched < ack_mfsk.connect_match_threshold ||
+	   metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
+	{ restore_gf(); return false; }
+
+	// --- Control-frame mini-Moose v2 CFO correction (mirror of the ctrl-suffix
+	// path; same SIGN-CORRECTED apply + re-detect fail-safe). ---
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		ack_mfsk.connect_pattern_nsymb,
+		best_offset,
+		ack_mfsk.connect_tones, /*pattern_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if(fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency,
+			effective_carrier - ctrl_residual,
+			carrier_amplitude,
+			M, &ofdm.FIR_rx_data);
+
+		int rematched = 0;
+		int rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size,
+			1,
+			ack_mfsk.connect_pattern_nsymb,
+			ack_mfsk.connect_tones, /*base_len=*/8,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+			&rebest_offset, /*reserve_after=*/N,
+			/*out_match_mask=*/nullptr, /*always_fine=*/false,
+			/*combine_reps=*/ack_mfsk.connect_preamble_reps);
+		if(rematched >= ack_mfsk.connect_match_threshold &&
+		   remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
+		{
+			matched = rematched;
+			best_offset = rebest_offset;
+			if(out_matched) *out_matched = matched;
+		}
+	}
+
+	// --- BLOCK 1: the RM(1,4) FWHT codeword (16 symbols), at the start of the
+	// suffix (right after ALL R base reps). Extract its 16×16 energy matrix and
+	// fold each symbol's antipodal tone pair into the 16 FWHT soft chips. The chip
+	// for position i = e[i][perm[i]] - e[i][perm[i]^0xF]
+	// (cfg_tag_softchips_from_energies / cfg_tag_energies_from_cfg). ---
+	int base_total = ack_mfsk.connect_base_total_nsymb();
+	double rm_e[CFG_TAG_RM_N * 16];
+	ofdm.decode_suffix_energies(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		best_offset, /*pattern_nsymb=*/base_total,
+		/*suffix_len=*/N_rm,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		rm_e);
+	cfg_tag_softchips_from_energies(rm_e, out_chips);
+
+	// --- BLOCK 2: the GF(16) RA + CRC-12 message (N_gf=39 symbols), immediately
+	// AFTER the RM block. Extract its N_gf×16 energy matrix into out_energies (the
+	// gf16ra::soft_decode_config_tag input). The base offset advances by N_rm so
+	// the hop index abs_s stays phase-consistent with the TX keyer (which keyed
+	// the gf16ra tones at abs_s = base_total + N_rm + s). ---
+	ofdm.decode_suffix_energies(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		best_offset, /*pattern_nsymb=*/base_total + N_rm,
+		/*suffix_len=*/N_gf,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		out_energies);
+
+	if(out_n_syms) *out_n_syms = N_gf;   // out_energies holds N_gf gf16ra symbols
+	restore_gf();   // cross-layer guard: leave the global repfact as we found it
+	return true;
 }
 
 // =============================================================================

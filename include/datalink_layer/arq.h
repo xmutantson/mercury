@@ -1805,6 +1805,37 @@ public:
   // switched batch's config NEVER follows -> FAIL. Returns 0=PASS, 1=FAIL.
   int test_config_tag_follow();
 
+  // ---- In-band rate adaptation (Stage 3a) — make the tag ride the REAL passband.
+  // Build the combined CONFIG_TAG suffix tone array that the passband keyer
+  // (cl_telecom_system::generate_config_tag_pattern_passband) transmits. The tag
+  // rides TWO concatenated suffix blocks (tag-codeword-design.md §1.3 / the WRAP
+  // detector): [ RM(1,4) Walsh codeword : CFG_TAG_RM_N=16 symbols ]
+  // [ GF(16) RA + CRC-12 message : gf16ra::codeword_len()=39 symbols ]. The RM
+  // tones come from cfg_tag_rm_encode (the perm-tone realization,
+  // cfg_tag_energies_from_cfg); the gf16ra tones from gf16ra::encode_config_tag.
+  // Both carry the SAME cfg_index so the FWHT detector and the CRC field
+  // corroborate (Gate-3). out_tones must hold >= CFG_TAG_RM_N + gf16ra
+  // codeword_len() ints; *out_n returns that count (55). Also returns the bsi_lsb
+  // and parity it bound (for the RX binding gates). gf16ra::configure(2) is set
+  // internally (the gf16ra block is the N=39 R=1/3 substrate). Returns true on
+  // success; false if cfg_index off the ladder or M<16. Shared by the production
+  // emit and the Stage-3a passband round-trip test.
+  bool build_config_tag_tones(int batch_cfg, int batch_seq_id, uint8_t parity,
+                              int* out_tones, int* out_n,
+                              uint8_t* out_bsi_lsb);
+
+  // Stage-3a PASSBAND ROUND-TRIP test (CLI --test-config-tag-passband). TX builds
+  // the combined RM+gf16ra suffix, keys it to real passband audio
+  // (generate_config_tag_pattern_passband), passes it through CLEAN and AWGN
+  // channels, then the RX detects the burst on the passband
+  // (decode_config_tag_from_passband — the real base-correlator presence detector,
+  // NOT an energy artifact) and decodes it via config_tag_wrap_decode. Asserts the
+  // right cfg_index decodes AND that an OFDM data frame preceding the suffix still
+  // LDPC-decodes (the suffix does not corrupt the payload). fail-before
+  // (-DSTAGE3A_FAILBEFORE): the RX ignores the passband suffix -> no decode -> FAIL.
+  // Returns 0=PASS, 1=FAIL.
+  int test_config_tag_passband_roundtrip();
+
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on
   // test_partial_bsi_advance. Forces frame-k still-decoding at the

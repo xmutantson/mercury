@@ -438,6 +438,7 @@ int configure(int repfact)
 
 int codeword_len() { return g_N; }
 int parity_len()   { return g_NC; }
+int current_repfact() { return g_repfact; }
 
 bool init()
 {
@@ -975,11 +976,18 @@ bool config_tag_wrap_decode(const double* energies,
 	r.fwht_rpeak = rpeak;
 	r.fwht_passed = (rpeak >= peak_ratio_gate);
 
-	// Gate-2: GF(16) RA + CRC-12 over the 3-bit-typed field.
+	// Gate-2: GF(16) RA + CRC-12 over the 3-bit-typed field. The CONFIG_TAG rides
+	// the configure(2)=N=39 substrate; ensure the process-global gf16ra graph is at
+	// repfact=2 for THIS decode and restore the prior value (the legacy CONNECT FEC
+	// runs at configure(3)=N=52 — this decode must neither depend on nor corrupt it;
+	// CLAUDE.md §5 cross-layer guard). Self-contained so any caller is safe.
+	int saved_repfact = gf16ra::current_repfact();
+	if(saved_repfact != 2) { gf16ra::configure(2); gf16ra::init(); }
 	uint64_t p37 = 0; int iters = -2;
 	bool gf_ok = gf16ra::soft_decode_config_tag(energies, CFG_TAG_BP_MAXITER,
 		CFG_TAG_ESNO_METRIC, (uint8_t)MFSK_CTRL_CONFIG_TAG,
 		crc12_fn, crc12_ctx, &p37, &iters);
+	if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
 	r.crc_passed = gf_ok;
 
 	uint8_t crc_cfg = 0, bsi_lsb = 0, parity = 0;
