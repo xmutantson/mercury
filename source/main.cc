@@ -738,6 +738,13 @@ int main(int argc, char *argv[])
                                         // fail-before: rebuild with -DSTAGE2_FAILBEFORE (RX ignores tag -> stays CFG10).
                                         // One-shot, exits rc. unilateral-config-tag-design.md §11 Stage 2.
                                         // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
+    bool test_inband_drop_cli = false;  // --test-inband-drop: in-band rate-adapt Stage 3b — LOOPBACK DROP.
+                                        // Gearshift-driven unilateral drop (W3), tag on the real passband (W1),
+                                        // RX follows from the passband tag (W2 + HINGE), SACK confirms (bsi),
+                                        // ZERO SET_CONFIG on the wire, both ends config-track, PHY-twin coherent,
+                                        // + the R7 mixed-config gap-gate case. fail-before: MERCURY_INBAND_RATE
+                                        // unset OR -DINBAND_STAGE3B_FAILBEFORE. One-shot, exits rc.
+                                        // data-flow-perbatch-config.md §12 / unilateral-config-tag-design.md §11 Stage 3.
     bool test_data_ack_multiwindow_cli = false; // --test-data-ack-multiwindow: Track A — multi-window
                                         // DATA-ACK/SACK correlator. Synthesizes a real ACK+SACK burst at an
                                         // OLDER ring phase with a silent newest tail: fail-before (newest-tail
@@ -1420,6 +1427,16 @@ int main(int argc, char *argv[])
             // startup, exit rc). See arq_responder.cc test_config_tag_passband_
             // roundtrip + unilateral-config-tag-design.md §11 Stage 3.
             test_config_tag_passband_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-drop") == 0)
+        {
+            // In-band rate adaptation Stage 3b — LOOPBACK DROP TEST (one-shot at
+            // startup, exit rc). Gearshift-driven unilateral drop + tag on the real
+            // passband + RX follow + SACK confirm + ZERO SET_CONFIG. See
+            // arq_responder.cc test_inband_drop + data-flow-perbatch-config.md §12.
+            test_inband_drop_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2860,6 +2877,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_config_tag_passband_roundtrip();
             printf("[FLAG] Config-tag-passband test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_drop_cli) {
+            // In-band rate adaptation Stage 3b — LOOPBACK DROP TEST (one-shot, exit rc).
+            // Builds its own CMD/RSP + telecom_system internally.
+            printf("[FLAG] --test-inband-drop: invoking in-band rate-adapt Stage-3b "
+                   "loopback drop regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_drop();
+            printf("[FLAG] Inband-drop test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

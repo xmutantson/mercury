@@ -796,6 +796,30 @@ void cl_arq_controller::process_messages_rx_data_control()
 							printf("[RSP-V2-ADOPT] current_expected_batch_seq_id=%d "
 								"(first v2 DATA frame this session)\n", bsi);
 							fflush(stdout);
+
+							// STAGE 3b W2 (data-flow-perbatch-config.md §12 W2): on the
+							// first DATA frame of a batch, attempt to FOLLOW a CONFIG_TAG
+							// from the captured passband (the burst W1 keyed after frame 0).
+							// On a valid+bound tag this switches config (ARQ + PHY twin) AND
+							// fires the HINGE side-effects (capture-flush + D3.1 re-baseline),
+							// which re-baseline rsp_current_expected_batch_seq_id back to -1
+							// so the NEXT data frame re-adopts at the new config through the
+							// gap-gate. No-op unless MERCURY_INBAND_RATE is set + a tag is
+							// present. expect_parity=0xFF: the RX does not track the TX parity
+							// across a possibly-lost tag (Stage 4); the bsi_lsb binding +
+							// CRC-12 + FWHT peak margin are the accept gates.
+							if(inband_rate_feature_enabled())
+							{
+								int fc = current_configuration;
+								int fol = inband_detect_follow_from_capture(
+									(uint8_t)(bsi & 0x7), /*expect_parity=*/0xFF, &fc);
+								if(fol == 1)
+								{
+									printf("[RSP-V2-ADOPT] tag-follow to CONFIG_%d on adopt "
+										"of bsi=%d (HINGE re-baselined window)\n", fc, bsi);
+									fflush(stdout);
+								}
+							}
 						}
 					}
 					if(!fix8_gap_aborted)
@@ -4233,6 +4257,318 @@ int cl_arq_controller::test_config_tag_passband_roundtrip()
 
 	this->telecom_system = NULL;
 	delete ts;
+
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 3b LOOPBACK DROP TEST
+// ============================================================================
+//
+// CLI: --test-inband-drop   (unilateral-config-tag-design.md §11 Stage 3 /
+//                            data-flow-perbatch-config.md §12.5)
+//
+// Stage 3b wires the tag into the PRODUCTION send/receive/gearshift flow. This test
+// drives the FULL chain end-to-end with the REAL primitives on a REAL passband:
+//
+//   W3 GEARSHIFT DRIVE — the CMD's add_message_control(SET_CONFIG) chokepoint takes
+//      the UNILATERAL path (inband_unilateral_drop) instead of queueing a SET_CONFIG
+//      control handshake: it loads the dropped config directly. Assert: ZERO
+//      SET_CONFIG frames queued, CMD current_configuration tracks to the new rung,
+//      the one-shot re-route returns the CMD to TRANSMITTING_DATA.
+//   W1 EMIT — build the dropped batch's first OFDM data frame + the CONFIG_TAG burst
+//      keyed to passband (the same generate_config_tag_pattern_passband W1 calls in
+//      send_batch), placed at the RX capture tail.
+//   W2 DETECT+FOLLOW — the RX runs inband_detect_follow_from_capture over the captured
+//      passband: decode_config_tag_from_passband (the real base correlator) →
+//      detect_and_follow_config_tag → load_configuration (ARQ + PHY twin coherent) →
+//      the HINGE side-effects (capture-flush + D3.1 re-baseline). Assert: the RX
+//      FOLLOWS to the dropped config, BOTH config copies track, the PHY twin is
+//      coherent.
+//   SACK CONFIRM — build the dropped batch's SACK_RSP (bsi + bitmap + CRC8) and run
+//      the CMD's REAL decode_sack_v2_frame. Assert: bsi confirms (the implicit
+//      confirmation the sender + receiver re-converged, design §5.2).
+//   R7 — a mixed-config NON-contiguous re-adopt drives sack_v2_readopt_has_gap.
+//      Assert: the gap-gate LOUD-aborts (no silent concat) even though config AND
+//      frame count both changed.
+//
+// fail-before: with MERCURY_INBAND_RATE UNSET (or -DINBAND_STAGE3B_FAILBEFORE), W3
+// falls through to the legacy SET_CONFIG builder (a control frame IS queued -> the
+// ZERO-SET_CONFIG assert FAILS) and W2 is a no-op (the RX does NOT follow -> the
+// follow assert FAILS). pass-after (flag set): all asserts hold. Returns 0=PASS,
+// 1=FAIL.
+int cl_arq_controller::test_inband_drop()
+{
+	const char* TAG = "[TEST-INBAND-DROP]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). The
+	// fail-before arm runs the SAME binary with the env UNSET (the harness wrapper
+	// drives that arm); here the on-path is the pass-after. -DINBAND_STAGE3B_FAILBEFORE
+	// additionally forces the no-follow / SET_CONFIG-queued behaviour for a same-binary
+	// fail-before. ---
+#ifndef INBAND_STAGE3B_FAILBEFORE
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+#else
+	// FAIL-BEFORE: force the env OFF so W3 takes the legacy SET_CONFIG path and W2
+	// is a no-op — proving the wiring is load-bearing.
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_RATE", "");
+#else
+	unsetenv("MERCURY_INBAND_RATE");
+#endif
+	auto restore_env = [&]() {};
+	printf("%s INBAND_STAGE3B_FAILBEFORE: feature forced OFF (legacy SET_CONFIG path,"
+		" no follow)\n", TAG);
+	fflush(stdout);
+#endif
+
+	const int CFG_FROM = CONFIG_10;                                   // ladder idx 13
+	const int CFG_TO   = config_ladder_down(CFG_FROM, /*robust*/NO);  // CONFIG_9, idx 12
+
+	// ========================================================================
+	// PART A — W3 GEARSHIFT DRIVE (unilateral drop, no SET_CONFIG on the wire)
+	// ========================================================================
+	cl_telecom_system* ts_cmd = new cl_telecom_system();
+	cl_arq_controller* cmd    = new cl_arq_controller();
+	ts_cmd->operation_mode = ARQ_MODE;
+	cmd->telecom_system    = ts_cmd;
+	cmd->narrowband_enabled = NO;
+	cmd->role = COMMANDER;
+	cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
+	// FULL load so the message buffers (messages_tx[], message_TxRx_byte_buffer,
+	// fifo_buffer_*) exist — inband_unilateral_drop refills TX through them.
+	cmd->load_configuration(CFG_FROM, FULL, NO);
+	cmd->link_status = CONNECTED;
+	cmd->connection_status = TRANSMITTING_DATA;
+	cmd->sack_v2_enabled = true;
+
+	check(cmd->current_configuration == CFG_FROM,
+		"A0 CMD starts at CONFIG_10", cmd->current_configuration, CFG_FROM);
+	check(ts_cmd->current_configuration == CFG_FROM,
+		"A0b CMD PHY twin at CONFIG_10", ts_cmd->current_configuration, CFG_FROM);
+
+	// Drive the gearshift DROP through the production chokepoint exactly as the
+	// FRAME-DOWN / optimizer producers do: set the target in negotiated_configuration,
+	// then add_message_control(SET_CONFIG). The caller forces TRANSMITTING_CONTROL after
+	// (we mirror that), and process_messages_tx_control() neutralises it on the
+	// unilateral path.
+	cmd->negotiated_configuration = CFG_TO;
+	cmd->add_message_control(SET_CONFIG);
+	cmd->connection_status = TRANSMITTING_CONTROL;   // the caller's forced transition
+
+	// W3 effect: on the inband path NO control frame is queued (messages_control stays
+	// FREE), the config is loaded directly, and the one-shot re-route flag is armed.
+#ifndef INBAND_STAGE3B_FAILBEFORE
+	check(cmd->current_configuration == CFG_TO,
+		"A1 CMD config dropped to CONFIG_9 UNILATERALLY (no SET_CONFIG ACK)",
+		cmd->current_configuration, CFG_TO);
+	check(ts_cmd->current_configuration == CFG_TO,
+		"A1b CMD PHY twin coherent at CONFIG_9", ts_cmd->current_configuration, CFG_TO);
+	check(cmd->messages_control.status == FREE,
+		"A2 NO SET_CONFIG control frame queued (status FREE)", cmd->messages_control.status, FREE);
+	// The neutraliser flips the CMD back to TRANSMITTING_DATA so the next batch goes
+	// out at the dropped config (with the W1 tag), not into an empty control TX.
+	cmd->process_messages_tx_control();
+	check(cmd->connection_status == TRANSMITTING_DATA,
+		"A3 CMD re-routed to TRANSMITTING_DATA (unilateral; no control handshake)",
+		cmd->connection_status, TRANSMITTING_DATA);
+#else
+	// FAIL-BEFORE: legacy path queued a real SET_CONFIG control frame.
+	check(cmd->messages_control.status != FREE,
+		"A2(FB) legacy path QUEUED a SET_CONFIG control frame (status != FREE)",
+		cmd->messages_control.status != FREE ? 1 : 0, 1);
+	check(cmd->messages_control.data[0] == SET_CONFIG,
+		"A2b(FB) the queued control frame IS SET_CONFIG", cmd->messages_control.data[0], SET_CONFIG);
+#endif
+
+	// ZERO SET_CONFIG on the wire: count how many SET_CONFIG control frames the CMD
+	// would put on the wire. On the inband path the chokepoint never queues one.
+	int setconfig_on_wire =
+		(cmd->messages_control.status != FREE
+		 && cmd->messages_control.data != NULL
+		 && cmd->messages_control.data[0] == SET_CONFIG) ? 1 : 0;
+#ifndef INBAND_STAGE3B_FAILBEFORE
+	check(setconfig_on_wire == 0,
+		"A4 ZERO SET_CONFIG frames on the wire (unilateral drop)", setconfig_on_wire, 0);
+#else
+	check(setconfig_on_wire == 1,
+		"A4(FB) the legacy path emits a SET_CONFIG frame", setconfig_on_wire, 1);
+#endif
+
+	const int dropped_bsi = 7;   // the bsi of the first batch at the dropped config
+
+	// ========================================================================
+	// PART B — W1 EMIT (real passband) + W2 DETECT+FOLLOW (the RX follows)
+	// ========================================================================
+	// Build a second instance as the RX, started at CFG_FROM (it has been decoding
+	// CONFIG_10). It must FOLLOW the drop to CONFIG_9 from the passband tag.
+	cl_telecom_system* ts_rx = new cl_telecom_system();
+	cl_arq_controller* rx    = new cl_arq_controller();
+	ts_rx->operation_mode = ARQ_MODE;
+	rx->telecom_system    = ts_rx;
+	rx->narrowband_enabled = NO;
+	rx->role = RESPONDER;
+	rx->load_configuration(CFG_FROM, FULL, NO);   // sizes messages_rx_prev[] etc.
+	rx->sack_v2_enabled = true;
+	// Prime an ACTIVE bsi window so the HINGE D3.1 re-baseline path is EXERCISED (it
+	// only fires when rsp_current_expected_batch_seq_id >= 0).
+	rx->rsp_current_expected_batch_seq_id = (dropped_bsi - 1) & 0xFF;
+	rx->rsp_prev_batch_seq_id = (dropped_bsi - 2) & 0xFF;
+	rx->rsp_last_delivered_batch_seq_id = (dropped_bsi - 1) & 0xFF;
+
+	check(rx->current_configuration == CFG_FROM,
+		"B0 RX starts at CONFIG_10", rx->current_configuration, CFG_FROM);
+
+	// W1: build the CONFIG_TAG burst announcing the dropped config (CFG_TO), keyed to
+	// passband — the SAME tones+keyer send_batch's emit_config_tag_passband produces.
+	// (We build it on the RX's telecom_system so ack_mfsk geometry matches the RX
+	// decode; the tag rides the M=16 layer identically on both peers.)
+	int tones[gf16ra::GF16RA_MAX_N];
+	int n_tones = 0;
+	uint8_t built_bsi_lsb = 0;
+	const uint8_t TX_PARITY = 1;
+	bool built = cmd->build_config_tag_tones(CFG_TO, dropped_bsi, TX_PARITY,
+		tones, &n_tones, &built_bsi_lsb);
+	check(built, "B1 W1 build_config_tag_tones for the dropped config", built ? 1 : 0, 1);
+
+	// Key the burst to passband and place it in the RX capture ring TAIL — exactly the
+	// window inband_detect_follow_from_capture reads (signal_period - tail .. signal_period).
+	int sym_samples = ts_rx->data_container.Nofdm * ts_rx->data_container.interpolation_rate;
+	int signal_period = sym_samples * ts_rx->data_container.buffer_Nsymb;
+	int base_total = ts_rx->ack_mfsk.connect_base_total_nsymb();
+	int burst_nsymb = base_total + n_tones;
+	int burst_samples = burst_nsymb * ts_rx->data_container.Nofdm * ts_rx->frequency_interpolation_rate;
+	std::vector<double> burst((size_t)burst_samples + 64, 0.0);
+	int written = ts_rx->generate_config_tag_pattern_passband(burst.data(), tones, n_tones);
+	check(written == burst_samples, "B2 W1 keyed the tag burst to passband",
+		written, burst_samples);
+
+	// Place the burst so it ends near the ring boundary (the W2 tail read window).
+	// passband_delayed_data is 2*signal_period; the W2 read is at [ring_write_index +
+	// (signal_period - tail_samples), ...). With ring_write_index=0, place the burst so
+	// its end lands at signal_period (well inside the tail window).
+	{
+		MUTEX_LOCK(&capture_prep_mutex);
+		// fresh ring
+		for(int i = 0; i < 2 * signal_period; i++)
+			ts_rx->data_container.passband_delayed_data[i] = 0.0;
+		ts_rx->data_container.ring_write_index = 0;
+		// Place the burst ending at ~signal_period - margin (inside the tail window).
+		int place_end = signal_period - 8 * sym_samples;   // small margin from the edge
+		int place_start = place_end - written;
+		if(place_start < 0) place_start = 0;
+		for(int i = 0; i < written && (place_start + i) < signal_period; i++)
+			ts_rx->data_container.passband_delayed_data[place_start + i] = burst[i];
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+
+	// W2: the RX detects + follows from the captured passband. expect_parity=0xFF
+	// (production wiring), bsi_lsb binds.
+	int rx_cfg_before = rx->current_configuration;
+	int followed_cfg = -999;
+	int followed = rx->inband_detect_follow_from_capture(
+		(uint8_t)(dropped_bsi & 0x7), /*expect_parity=*/0xFF, &followed_cfg);
+
+#ifndef INBAND_STAGE3B_FAILBEFORE
+	check(followed == 1, "B3 W2 RX FOLLOWS from the passband tag", followed, 1);
+	check(followed_cfg == CFG_TO, "B4 W2 RX follows to CONFIG_9 FROM THE TAG", followed_cfg, CFG_TO);
+	check(rx->current_configuration == CFG_TO,
+		"B5 RX ARQ config tracks to CONFIG_9", rx->current_configuration, CFG_TO);
+	check(ts_rx->current_configuration == CFG_TO,
+		"B6 RX PHY twin coherent at CONFIG_9 (no cross-layer desync)",
+		ts_rx->current_configuration, CFG_TO);
+	check(rx->current_configuration == ts_rx->current_configuration,
+		"B7 RX ARQ config == PHY-twin config", rx->current_configuration,
+		ts_rx->current_configuration);
+	// HINGE D3.1 re-baseline fired: the bsi window was reset to -1 (next frame
+	// re-adopts through the gap-gate) and last_delivered was PRESERVED.
+	check(rx->rsp_current_expected_batch_seq_id == -1,
+		"B8 HINGE re-baselined rsp_current_expected_batch_seq_id to -1",
+		rx->rsp_current_expected_batch_seq_id, -1);
+	check(rx->rsp_last_delivered_batch_seq_id == ((dropped_bsi - 1) & 0xFF),
+		"B9 HINGE preserved rsp_last_delivered_batch_seq_id",
+		rx->rsp_last_delivered_batch_seq_id, (dropped_bsi - 1) & 0xFF);
+#else
+	check(followed == 0, "B3(FB) RX does NOT follow (feature off)", followed, 0);
+	check(rx->current_configuration == rx_cfg_before,
+		"B5(FB) RX stuck at CONFIG_10 (no follow)", rx->current_configuration, rx_cfg_before);
+#endif
+	(void)rx_cfg_before;
+
+	// ========================================================================
+	// PART C — SACK CONFIRM (the implicit confirmation, design §5.2)
+	// ========================================================================
+	// Build the dropped batch's SACK_RSP payload [bsi | bitmap | CRC8] and run the
+	// CMD's REAL decode_sack_v2_frame. A SACK whose bsi matches the dropped batch IS
+	// proof the RX decoded at the announced config.
+	{
+		const int NF = 4;                 // small batch for the SACK
+		int bitmap_bytes = (NF + 7) / 8;  // 1
+		unsigned char payload[1 + 1 + 1];
+		payload[0] = (unsigned char)(dropped_bsi & 0xFF);
+		payload[1] = 0x0F;                // all 4 frames RECEIVED (bits 0..3)
+		payload[1 + bitmap_bytes] = cmd->CRC8_calc((char*)payload, 1 + bitmap_bytes);
+		// Stage it into the CMD's messages_rx_buffer the way receive() would (SACK_RSP).
+		cmd->messages_rx_buffer.type = SACK_RSP;
+		cmd->messages_rx_buffer.status = RECEIVED;
+		for(int b = 0; b < 1 + bitmap_bytes + 1; b++)
+			cmd->messages_rx_buffer.data[b] = (char)payload[b];
+
+		bool out_bm[MAX_SACK_BATCH_SIZE] = {false};
+		unsigned char out_bsi = 0xFF;
+		bool ok = cmd->decode_sack_v2_frame(out_bm, NF, &out_bsi);
+		check(ok, "C0 CMD decode_sack_v2_frame accepts the SACK (CRC8)", ok ? 1 : 0, 1);
+		check(out_bsi == (unsigned char)(dropped_bsi & 0xFF),
+			"C1 SACK confirms the DROPPED batch bsi (implicit confirmation)",
+			out_bsi, dropped_bsi & 0xFF);
+	}
+
+	// ========================================================================
+	// PART R7 — mixed-config NON-contiguous re-adopt -> gap-gate LOUD aborts
+	// ========================================================================
+	// Two consecutive batches differing in config AND frame count, with a DROPPED
+	// batch between them (non-contiguous bsi). The [RSP-V2-ADOPT] gap-gate
+	// (sack_v2_readopt_has_gap) must LOUD-abort (no silent concat). The gate is
+	// config-orthogonal (bsi-keyed) so it survives the mixed-config/mixed-N case.
+	{
+		int last_delivered = 10;       // batch 10 delivered (say at CONFIG_12, N=25)
+		int contiguous_bsi = 11;       // the normal next batch
+		int gap_bsi        = 13;       // batch 11 + 12 dropped (non-contiguous), e.g. ROBUST_0 N=1
+		bool contiguous_gap = cl_arq_controller::sack_v2_readopt_has_gap(contiguous_bsi, last_delivered);
+		bool noncontig_gap  = cl_arq_controller::sack_v2_readopt_has_gap(gap_bsi, last_delivered);
+		check(!contiguous_gap,
+			"R7a contiguous mixed-config re-adopt ACCEPTS (no gap)", contiguous_gap ? 1 : 0, 0);
+		check(noncontig_gap,
+			"R7b NON-contiguous mixed-config/mixed-N re-adopt LOUD-aborts (gap detected)",
+			noncontig_gap ? 1 : 0, 1);
+	}
+
+	delete cmd; delete rx; delete ts_cmd; delete ts_rx;
+	restore_env();
 
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);

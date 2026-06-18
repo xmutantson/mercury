@@ -740,6 +740,7 @@ cl_arq_controller::cl_arq_controller()
 	inband_last_announced_config=CONFIG_NONE;
 	inband_tx_epoch_parity=0;
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
+	inband_unilateral_armed=false;  // Stage 3b: set by the SET_CONFIG builder unilateral path
 
 	gear_shift_on=NO;
 	robust_enabled=NO;
@@ -2506,6 +2507,70 @@ bool cl_arq_controller::build_config_tag_tones(int batch_cfg, int batch_seq_id,
 	return true;
 }
 
+// In-band rate adaptation (Stage 3b W1): EMIT the CONFIG_TAG onto the REAL passband.
+// data-flow-perbatch-config.md §12 W1. Builds the combined RM+gf16ra suffix and keys
+// it to passband audio via the Stage-3a keyer, then tx_transfers the burst. Called
+// from send_batch right after the first OFDM data frame, at a deterministic offset.
+int cl_arq_controller::emit_config_tag_passband(int batch_cfg, int batch_seq_id)
+{
+	// Feature off -> never emit (zero cost, byte-identical default).
+	if(!inband_rate_feature_enabled())
+		return 0;
+	if(telecom_system == NULL)
+		return 0;
+	// The tag rides the M=16 robust ctrl-suffix layer; unavailable on NB / M<16.
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+
+	int ladder_idx = config_ladder_index(batch_cfg);
+	if(ladder_idx < 0 || ladder_idx > 31)
+		return 0;
+
+	// FIRING POLICY (owner-locked): emit ONLY on a committed config change. No change
+	// since the last-announced config -> NO tag (the steady state, zero overhead).
+	if(batch_cfg == inband_last_announced_config)
+		return 0;
+
+	// Committed change: toggle the epoch parity (ARDOP Even/Odd, design §2.1) and
+	// latch the new announced config (the SAME bookkeeping emit_config_tag_if_changed
+	// does — this is the production passband twin of that idealized-artifact emit).
+	inband_tx_epoch_parity ^= 1;
+	inband_last_announced_config = batch_cfg;
+	uint8_t parity = inband_tx_epoch_parity;
+
+	// Build the combined RM16 || gf16ra39 tone array (same builder the Stage-3a
+	// round-trip test uses).
+	int tones[gf16ra::GF16RA_MAX_N];
+	int n_tones = 0;
+	uint8_t bsi_lsb = 0;
+	if(!build_config_tag_tones(batch_cfg, batch_seq_id, parity, tones, &n_tones, &bsi_lsb))
+		return 0;
+
+	// Key the tag to passband audio (the Stage-3a keyer). The burst occupies
+	// connect_base_total_nsymb() base reps + n_tones suffix symbols.
+	int base_total  = telecom_system->ack_mfsk.connect_base_total_nsymb();
+	int burst_nsymb = base_total + n_tones;
+	int burst_samples = burst_nsymb * telecom_system->data_container.Nofdm
+		* telecom_system->frequency_interpolation_rate;
+	if(burst_samples <= 0)
+		return 0;
+
+	std::vector<double> burst((size_t)burst_samples, 0.0);
+	int written = telecom_system->generate_config_tag_pattern_passband(
+		burst.data(), tones, n_tones);
+	if(written <= 0)
+		return 0;
+
+	// Transmit the burst on the wire, right after frame 0 (deterministic offset).
+	tx_transfer(burst.data(), (size_t)written);
+
+	printf("[INBAND-TX] CONFIG_TAG passband emit cfg=%d (ladder_idx=%d) bsi_lsb=%u "
+		"parity=%u burst_samples=%d\n",
+		batch_cfg, ladder_idx, (unsigned)bsi_lsb, (unsigned)parity, written);
+	fflush(stdout);
+	return written;
+}
+
 int cl_arq_controller::emit_config_tag_if_changed(int batch_cfg, int batch_seq_id,
                                                   double hi, double lo,
                                                   double* out_energies /*N*16*/,
@@ -2662,9 +2727,212 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 
 	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
 
+	// === STAGE 3b HINGE PORT (data-flow-perbatch-config.md §3.2 / §12.2) ===
+	// A REAL config change mid-stream (followed_config != current at entry) must
+	// replicate the TWO side-effects the SET_CONFIG RSP handler performs, else the
+	// tag-follow path silently corrupts. Both are PORTED VERBATIM from
+	// arq_responder.cc (the SET_CONFIG handler) so the two paths are behaviourally
+	// identical — only the trigger differs (passband tag vs control handshake).
+	//
+	// HINGE-1: capture-buffer flush (arq_responder.cc:2945-2964). Stale OFDM
+	// preambles (identical preamble structure across all OFDM configs) cause
+	// Schmidl-Cox false-locks at the new config without this. Guarded by the
+	// capture_prep_mutex like the source.
+	{
+		int buf_samples = telecom_system->data_container.Nofdm
+			* telecom_system->data_container.buffer_Nsymb
+			* telecom_system->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		// circular_buf_reset asserts on a NULL ring; the audio capture ring is absent
+		// in SIM_INPROC / synthetic-fire (no device init). Guard it — the PHY-allocated
+		// passband_delayed_data memset below is the load-bearing stale-preamble flush
+		// and is always present. (The production receive path always has the ring.)
+		if(capture_buffer != NULL)
+			circular_buf_reset(capture_buffer);
+		if(telecom_system->data_container.passband_delayed_data != NULL && buf_samples > 0)
+			memset(telecom_system->data_container.passband_delayed_data, 0,
+				2 * buf_samples * sizeof(double));
+		telecom_system->data_container.ring_write_index = 0;
+		telecom_system->receive_stats.ofdm_search_raw = 0;
+		telecom_system->receive_stats.ofdm_batch_active = false;
+		telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		printf("[INBAND-RX] HINGE capture-flush for tag-follow to CONFIG_%d\n",
+			followed_config);
+		fflush(stdout);
+	}
+
+	// HINGE-2: D3.1 bsi-window re-baseline + prev-storage drop
+	// (arq_responder.cc:3012-3031). A per-batch demote/promote may strand an
+	// incomplete batch in the RSP window; without re-baselining cur=prev=-1 the RSP
+	// keeps cur>=0 and PREV-BUMPs past the incomplete batch -> silent concat. The
+	// next data frame then re-adopts through the [RSP-V2-ADOPT] gap-gate (contiguous
+	// climb accepts; a non-contiguous stranded-batch hole aborts LOUDLY).
+	// rsp_last_delivered_batch_seq_id is DELIBERATELY preserved (the reset-surviving
+	// high-water the re-adopt gate reads). Gated on a REAL change + an active window.
+	if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+	{
+		printf("[INBAND-RX] HINGE D3.1 re-baseline: tag-follow %d->%d mid-transfer "
+			"(cur=%d prev=%d -> -1; last_delivered=%d preserved)\n",
+			current_configuration, followed_config,
+			rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id,
+			rsp_last_delivered_batch_seq_id);
+		fflush(stdout);
+		rsp_current_expected_batch_seq_id = -1;
+		rsp_prev_batch_seq_id             = -1;
+		rsp_prev_batch_active             = false;
+		rsp_prev_batch_received_count     = 0;
+		rsp_prev_batch_expected_count     = 0;
+		bigblock_partial_armed            = false;
+		for(int i=0; i<this->nMessages; i++)
+			messages_rx_prev[i].status = FREE;
+		// rsp_last_delivered_batch_seq_id intentionally NOT reset.
+	}
+
 	if(out_followed_config) *out_followed_config = followed_config;
 	return 1;
 #endif
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 3b GEARSHIFT DRIVE (unilateral drop, CMD side)
+// ============================================================================
+// data-flow-perbatch-config.md §3.1 (the SET_CONFIG-deletion replacement) + §12.
+// When MERCURY_INBAND_RATE is set, the gearshift/optimizer/demote DROP decision
+// sets the next batch config DIRECTLY instead of queueing a SET_CONFIG handshake.
+// This loads `target_cfg` on the CMD (PHYSICAL_LAYER_ONLY) so the next send_batch
+// transmits at the new rung AND the W1 emit announces it via the passband tag, then
+// re-fills the TX messages for the new config's sizes — MIRRORING the SET_CONFIG
+// ACK-apply refill (arq_commander.cc:5291-5309). NO control frame is queued. The
+// reverse direction (RSP->CMD) is left to its own owner (forward/reverse split,
+// design OD-4); this drop owns the forward (CMD->RSP) config only.
+bool cl_arq_controller::inband_unilateral_drop(int target_cfg)
+{
+	if(!inband_rate_feature_enabled())
+		return false;
+	// Only a real change to a valid OFDM/robust config is a drop. A no-op same-config
+	// or off-ladder target falls back to the (now suppressed) handshake builder.
+	if(target_cfg == CONFIG_NONE || target_cfg == current_configuration)
+		return false;
+	if(!(is_ofdm_config(target_cfg) || is_robust_config(target_cfg)))
+		return false;
+	if(config_ladder_index(target_cfg) < 0)
+		return false;
+
+	printf("[INBAND-TX] UNILATERAL DROP %d -> %d (no SET_CONFIG; next batch tags the "
+		"new config on the passband)\n", current_configuration, target_cfg);
+	fflush(stdout);
+
+	// Advance the forward-direction config owners (the design KEEPs forward/reverse,
+	// only the transport moves off the SET_CONFIG wire onto the tag). data_configuration
+	// is the staging member load_configuration consumes; forward_configuration is the
+	// CMD->RSP TX-speed owner. Reverse is left to the other direction's owner.
+	forward_configuration = target_cfg;
+	data_configuration    = target_cfg;
+	negotiated_configuration = target_cfg;  // keep the "switch pending" predicate consistent
+
+	// Load the new config NOW (no ACK round-trip). PHYSICAL_LAYER_ONLY + backup=YES
+	// mirrors the SET_CONFIG ACK-apply (arq_commander.cc:5244): backup so a later
+	// ACK-on-old-PHY restore still works, PHYSICAL_LAYER_ONLY so message buffers are
+	// not torn down mid-flight. This writes BOTH the ARQ current_configuration AND the
+	// PHY twin coherently (the D1 coherent switch).
+	load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+
+	// Re-fill TX messages for the new config's message sizes — VERBATIM from the
+	// SET_CONFIG ACK-apply refill (arq_commander.cc:5291-5309). Free all messages_tx[]
+	// then restore any pending data from fifo_buffer_backup into fifo_buffer_tx so the
+	// next process_messages_tx_data re-encodes at the new config. For producers that
+	// already restored to fifo_buffer_tx + flushed backup (the FRAME-UP path,
+	// arq_commander.cc:4457-4472, and the drop-test harness), backup is empty so this
+	// restore is a no-op and the tx-FIFO data is preserved (correct).
+	for(int i=0;i<nMessages;i++)
+		messages_tx[i].status = FREE;
+	int data_read_size;
+	for(int i=0;i<get_nTotal_messages();i++)
+	{
+		data_read_size = fifo_buffer_backup.pop(message_TxRx_byte_buffer,
+			max_data_length + max_header_length);
+		if(data_read_size != 0)
+			fifo_buffer_tx.push(message_TxRx_byte_buffer, data_read_size);
+		else
+			break;
+	}
+	fifo_buffer_backup.flush();
+
+	return true;
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 3b W2 (detect+follow from the capture, RX side)
+// ============================================================================
+// data-flow-perbatch-config.md §12 W2. Pull the CONFIG_TAG burst out of the captured
+// passband tail (the burst W1 keyed right after frame 0), run the REAL base-correlator
+// presence detector (decode_config_tag_from_passband), then FOLLOW via
+// detect_and_follow_config_tag (which switches BOTH config copies coherently AND ports
+// the SET_CONFIG HINGE side-effects). Hooked at the [RSP-V2-ADOPT] adopt site.
+int cl_arq_controller::inband_detect_follow_from_capture(uint8_t expect_bsi_lsb,
+                                                         uint8_t expect_parity,
+                                                         int* out_followed_config)
+{
+	if(out_followed_config) *out_followed_config = current_configuration;
+	if(!inband_rate_feature_enabled())
+		return 0;
+	if(telecom_system == NULL)
+		return 0;
+	// The tag rides the M=16 robust layer; unavailable on NB / M<16.
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+
+	// Pull the captured passband tail the same way the ACK ctrl-suffix decode does
+	// (arq_common.cc:7822-7833): the tag burst rides AFTER frame 0, so it sits in the
+	// tail of the captured window. Size the tail to hold the full CONFIG_TAG burst
+	// (base reps + RM16 + gf16ra39) plus margin, clamped to the ring (signal_period).
+	int base_total = telecom_system->ack_mfsk.connect_base_total_nsymb();
+	// The tag's gf16ra block is N=39 at repfact=2 (the codec doc §5/§7 default; the
+	// SAME N decode_config_tag_from_passband self-configures + restores internally).
+	// We only need it to SIZE the capture tail (the decode self-configures), so use a
+	// save/restore to read the authoritative N without leaving the global perturbed.
+	int N_gf;
+	{
+		int saved_rf = gf16ra::current_repfact();
+		gf16ra::configure(2); gf16ra::init();
+		N_gf = gf16ra::codeword_len();   // 39
+		if(saved_rf != 2) { gf16ra::configure(saved_rf); gf16ra::init(); }
+	}
+	if(N_gf <= 0) N_gf = 39;
+	int suffix_nsymb = CFG_TAG_RM_N + N_gf;            // 55
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_nsymb = base_total + suffix_nsymb + 16;   // + margin
+	int tail_samples = tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	if(tail_samples <= 0) return 0;
+	int tail_offset = signal_period - tail_samples;
+
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
+		(size_t)tail_samples * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+
+	// REAL base-correlator presence detect + per-tone energy / FWHT-chip extraction.
+	std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+	double chips[16] = {0.0};
+	int n_syms = 0, matched = 0;
+	bool present = telecom_system->decode_config_tag_from_passband(
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		tail_samples, energies.data(), chips, &n_syms, &matched);
+	if(!present)
+		return 0;   // no burst in the tail -> no tag (steady state / lost tag = Stage 4)
+
+	// Wrap-decode + bind gates + FOLLOW (load_configuration both copies + HINGE port).
+	int followed_cfg = current_configuration;
+	int followed = detect_and_follow_config_tag(energies.data(), chips, n_syms,
+		expect_bsi_lsb, expect_parity, &followed_cfg);
+	if(out_followed_config) *out_followed_config = followed_cfg;
+	return followed;
 }
 
 void cl_arq_controller::return_to_last_configuration()
@@ -6345,10 +6613,31 @@ void cl_arq_controller::send_batch()
 	// (variable: anchor FULL, tail MINI). The frames are contiguous, so the wire
 	// sees one gapless waveform; per-frame tx_transfer granularity is preserved
 	// for the sim pacing / capture-prep symbol cadence.
+	// STAGE 3b W1 (data-flow-perbatch-config.md §12 W1): announce a committed config
+	// change with a CONFIG_TAG riding the robust M=16 layer, keyed onto the passband
+	// right after the FIRST OFDM DATA frame (a deterministic offset; Stage-3c trims
+	// the acquisition sync). Fires once per batch, only when MERCURY_INBAND_RATE is set
+	// AND the batch's config differs from the last-announced config (zero steady-state
+	// overhead). Gated to DATA batches (the tag announces the DATA config) and the OFDM
+	// tier (the robust suffix layer is M=16; emit_config_tag_passband no-ops on NB/M<16
+	// and on retx batches, which carry no fresh config). The bsi binding comes from the
+	// first data frame's batch_seq_id.
+	bool inband_tag_emitted_this_batch = false;
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
 		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, off=%d size=%d\n", i, message_batch_counter_tx, frame_pack_off[i], frame_len[i]); fflush(stdout); }
 		tx_transfer(&batch_frames_output_data_filtered2[frame_pack_off[i]], frame_len[i]);
+
+		// Emit the tag right AFTER the first DATA frame (deterministic offset).
+		if(!inband_tag_emitted_this_batch
+			&& !sack_retransmit_active
+			&& (messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT))
+		{
+			inband_tag_emitted_this_batch = true;   // attempt only once per batch
+			int tag_bsi = messages_batch_tx[i].batch_seq_id;
+			if(tag_bsi < 0) tag_bsi = 0;
+			emit_config_tag_passband(current_configuration, tag_bsi);
+		}
 	}
 
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }

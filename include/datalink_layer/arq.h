@@ -1836,6 +1836,50 @@ public:
   // Returns 0=PASS, 1=FAIL.
   int test_config_tag_passband_roundtrip();
 
+  // ---- In-band rate adaptation (Stage 3b W1) — EMIT the tag on the wire.
+  // Called from send_batch right AFTER the first OFDM data frame's tx_transfer, at
+  // a DETERMINISTIC offset (Stage-3c trims the acquisition sync later). When
+  // MERCURY_INBAND_RATE is set AND batch_cfg differs from the last-announced config,
+  // builds the combined RM+gf16ra CONFIG_TAG suffix (build_config_tag_tones), keys it
+  // to passband audio (generate_config_tag_pattern_passband — the Stage-3a keyer),
+  // and tx_transfers the burst so it rides the real wire after frame 0. Toggles the
+  // epoch parity + latches inband_last_announced_config (the same committed-change
+  // bookkeeping as emit_config_tag_if_changed). No-op (returns 0) when the feature is
+  // off, the config is unchanged, the config is off-ladder, or the robust layer is
+  // unavailable (M<16 / NB). Returns the number of passband samples emitted, 0 if no
+  // tag was sent. `batch_cfg` is the config of the batch being sent (=
+  // current_configuration here); `batch_seq_id` is its bsi (binds the tag).
+  int emit_config_tag_passband(int batch_cfg, int batch_seq_id);
+
+  // ---- In-band rate adaptation (Stage 3b W2) — DETECT+FOLLOW from the capture.
+  // Called from the RX first-frame path at/near the [RSP-V2-ADOPT] adopt site. Pulls
+  // the CONFIG_TAG burst out of the captured passband tail (the burst W1 keyed right
+  // after frame 0), runs the REAL base-correlator presence detector
+  // (decode_config_tag_from_passband), and on a valid+bound tag FOLLOWS via
+  // detect_and_follow_config_tag — which load_configuration()s the announced config
+  // (ARQ + PHY twin coherent) AND ports the SET_CONFIG HINGE side-effects (capture-
+  // flush + D3.1 re-baseline). No-op when MERCURY_INBAND_RATE is off. `expect_bsi_lsb`
+  // is the low-3 of the bsi the RX is adopting (the binding gate). `expect_parity` is
+  // the epoch_parity to require, or 0xFF to skip (the RX does not track the TX parity
+  // across a lost tag — Stage 4 — so the production wiring passes 0xFF). Returns 1 if
+  // the RX followed a new config, 0 otherwise. *out_followed_config (if non-NULL)
+  // receives the followed raw config id (or current_configuration if no follow).
+  int inband_detect_follow_from_capture(uint8_t expect_bsi_lsb,
+                                        uint8_t expect_parity,
+                                        int* out_followed_config);
+
+  // Stage-3b LOOPBACK DROP TEST (CLI --test-inband-drop). Two-instance in-process
+  // loopback (CMD+RSP, real passband, shared virtual clock). With MERCURY_INBAND_RATE
+  // on, the gearshift DROPS one rung; W1 keys the tag onto the real passband after
+  // frame 0; W2 follows from the passband tag; the SACK returns + confirms (bsi). The
+  // test asserts: RX follows from the tag, current_configuration tracks on BOTH ends
+  // (ARQ + PHY-twin coherent), ZERO SET_CONFIG frames on the wire, byte-faithful
+  // delivery across the drop. Plus the R7 mixed-config-consecutive-batches gap-gate
+  // case. fail-before (MERCURY_INBAND_RATE off OR -DINBAND_STAGE3B_FAILBEFORE): the
+  // gearshift queues SET_CONFIG / the RX does not follow -> SET_CONFIG count > 0 / RX
+  // stuck at the old config. Returns 0=PASS, 1=FAIL.
+  int test_inband_drop();
+
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on
   // test_partial_bsi_advance. Forces frame-k still-decoding at the
@@ -2979,6 +3023,27 @@ public:
   int     inband_last_announced_config; // CONFIG_NONE until the first tag
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
+
+  // Stage 3b GEARSHIFT DRIVE (unilateral drop). When MERCURY_INBAND_RATE is set,
+  // add_message_control(SET_CONFIG) takes the UNILATERAL path (inband_unilateral_drop)
+  // instead of queueing a SET_CONFIG control handshake: it loads the gearshift
+  // target config directly (so the next send_batch transmits at the new rung and
+  // the W1 emit announces it via the passband tag) and re-fills TX. Because EVERY
+  // gearshift/optimizer/demote producer funnels through add_message_control(SET_CONFIG)
+  // AND its callers force connection_status=TRANSMITTING_CONTROL after it returns,
+  // the builder sets this one-shot flag; process_messages_tx_control() reads it at
+  // the SINGLE control-TX entry, clears it, and re-routes connection_status back to
+  // TRANSMITTING_DATA (neutralising the caller's forced control transition in one
+  // place). Default-off: the flag is never set, so the SET_CONFIG handshake path is
+  // byte-identical. Declared/init in arq_common.cc next to the other inband state.
+  bool    inband_unilateral_armed;      // one-shot: builder took the unilateral path
+  // Run the unilateral config drop on the CMD: load `target_cfg` directly
+  // (PHYSICAL_LAYER_ONLY), advance forward_configuration/data_configuration, and
+  // re-fill the TX messages for the new config's frame sizes (mirroring the
+  // SET_CONFIG ACK-apply refill at arq_commander.cc:5291-5293). NO control frame is
+  // queued. Returns true if the drop applied (target valid + a real change), false
+  // if it was a no-op (same config / invalid target) so the builder can fall back.
+  bool inband_unilateral_drop(int target_cfg);
 
   int gear_shift_on;
   int robust_enabled;

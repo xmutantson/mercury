@@ -4412,6 +4412,21 @@ static void test_config_tag_passband_stage3a() {
 	else         test_fail(name, "config-tag passband round-trip failed (see [TEST-INBAND-PB] log)");
 }
 
+// §27 — CONFIG_TAG in-band rate adaptation Stage 3b: LOOPBACK DROP wrapper. The tag
+// is now WIRED into the production send/receive/gearshift flow: a gearshift-driven
+// unilateral drop (W3), the tag keyed onto the real passband (W1), the RX following
+// from the passband tag (W2 + the SET_CONFIG HINGE side-effects), the SACK confirming
+// the bsi, ZERO SET_CONFIG on the wire, both ends config-tracking + PHY-twin coherent,
+// plus the R7 mixed-config gap-gate case. data-flow-perbatch-config.md §12.5.
+static void test_inband_drop_stage3b() {
+	const char* name = "inband_drop_stage3b (gearshift drive + passband tag follow + SACK confirm, 0 SET_CONFIG)";
+	cl_arq_controller* arq = new cl_arq_controller();
+	int rc = arq->test_inband_drop();
+	delete arq;
+	if (rc == 0) test_pass(name);
+	else         test_fail(name, "inband loopback drop failed (see [TEST-INBAND-DROP] log)");
+}
+
 // §10.5 — THE MEASUREMENT: GF(16)-RA acquisition cliff on the SAME SNR3k axis as
 // §9. For each sigma: P(base-detect), P(GF16-RA decode). Reports the cliff
 // (SNR3k at P=0.5), the coding gain vs the §9 HARD suffix, and whether it
@@ -6550,6 +6565,13 @@ int run_mfsk_ctrl_codec_tests() {
 	// correlator detect + decode), and proves an OFDM data frame still LDPC-decodes
 	// with the suffix appended. unilateral-config-tag-design.md §11 Stage 3.
 	test_config_tag_passband_stage3a();
+
+	// §27 CONFIG_TAG in-band rate adaptation Stage 3b — LOOPBACK DROP. The tag is
+	// WIRED into the production send/receive/gearshift flow: gearshift-driven
+	// unilateral drop (W3), tag on the real passband (W1), RX follow (W2 + HINGE),
+	// SACK confirm (bsi), ZERO SET_CONFIG on the wire, both ends config-track,
+	// PHY-twin coherent, + the R7 mixed-config gap-gate. data-flow-perbatch-config.md §12.
+	test_inband_drop_stage3b();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

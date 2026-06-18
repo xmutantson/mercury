@@ -717,6 +717,38 @@ int cl_arq_controller::add_message_control(char code)
 				messages_control.type = NONE;
 				return success;
 			}
+			// STAGE 3b GEARSHIFT DRIVE (data-flow-perbatch-config.md §3.1 / §12 W3):
+			// when MERCURY_INBAND_RATE is set, the rate change is announced by a
+			// passband CONFIG_TAG on the next batch (W1 emit) and followed unilaterally
+			// (W2), NOT by a SET_CONFIG control handshake. EVERY gearshift/optimizer/
+			// demote/BREAK producer funnels through THIS builder (the §3.1 chokepoint),
+			// so intercepting here catches them all with one change. The target is the
+			// gearshift's chosen forward config: negotiated_configuration for the ladder
+			// path (the producers set it before calling us), or get_configuration(SNR)
+			// for the SNR-based path. On a successful unilateral drop we DO NOT queue a
+			// control frame: free the slot, arm the one-shot re-route flag (consumed in
+			// process_messages_tx_control to put connection_status back to
+			// TRANSMITTING_DATA — neutralising the caller's forced TRANSMITTING_CONTROL),
+			// and return. Flag-off / no-op target -> fall through to the legacy builder
+			// (byte-identical). Placed AFTER the messages_control.data null-guard above.
+			if(inband_rate_feature_enabled())
+			{
+				int inband_target = (gear_shift_algorithm==SNR_BASED)
+					? get_configuration(measurements.SNR_downlink)
+					: negotiated_configuration;
+				if(inband_unilateral_drop(inband_target))
+				{
+					// Unilateral path took it: NO control frame on the wire.
+					messages_control.status = FREE;
+					messages_control.type   = NONE;
+					inband_unilateral_armed = true;   // consumed in process_messages_tx_control
+					success = SUCCESSFUL;
+					return success;
+				}
+				// No-op drop (same config / invalid target): fall through to the legacy
+				// builder so behaviour matches the flag-off path for that degenerate case.
+			}
+
 			messages_control.data[0]=code;
 			messages_control.id=0;
 
@@ -931,6 +963,24 @@ int cl_arq_controller::add_message_control(char code)
 
 void cl_arq_controller::process_messages_tx_control()
 {
+	// STAGE 3b GEARSHIFT DRIVE neutraliser (data-flow-perbatch-config.md §12 W3):
+	// the unilateral SET_CONFIG builder (add_message_control) queued NO control frame
+	// but its callers force connection_status=TRANSMITTING_CONTROL after it returns.
+	// When the one-shot flag is armed, re-route straight back to TRANSMITTING_DATA so
+	// the next batch goes out at the dropped config (with the W1 passband tag) instead
+	// of spinning in an empty control-TX. Single chokepoint on the consuming side
+	// (mirrors the single chokepoint in the builder). Default-off: never armed ->
+	// byte-identical. messages_control is already FREE (the builder freed it).
+	if(inband_unilateral_armed)
+	{
+		inband_unilateral_armed = false;
+		connection_status = TRANSMITTING_DATA;
+		printf("[INBAND-TX] unilateral drop applied — resuming DATA at CONFIG_%d "
+			"(no control handshake)\n", current_configuration);
+		fflush(stdout);
+		return;
+	}
+
 	if(messages_control.status==ADDED_TO_LIST&&message_batch_counter_tx<control_batch_size)
 	{
 		messages_batch_tx[message_batch_counter_tx]=messages_control;
