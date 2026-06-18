@@ -766,6 +766,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 						// MERCURY_GAP_ABORT_DEFEAT=1 disables the abort on the SAME
 						// binary (restores pre-fix silent-concat) for the
 						// --test-gap-abort fail-before arm.
+						// QUARANTINED 2026-06-17: proven-broken (=1 defeats the loud
+						// D3.1 in-order integrity guard => silent non-contiguous
+						// delivery; BENCH-9 + cfg15_stall confirm the guard is the
+						// no-silent-wrong-bytes backstop). do-not-enable.
 						bool gap_defeat = false;
 						{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 						  if(e && *e && atoi(e)!=0) gap_defeat = true; }
@@ -4829,6 +4833,9 @@ int cl_arq_controller::test_inorder_demote()
 	bool defeat = false;
 	{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 	  if(e && *e && atoi(e)!=0) defeat = true; }
+	// QUARANTINED 2026-06-17: MERCURY_LOSSY_DEMOTE=1 reproduces the PRE-FIX lossy D3 16->15
+	// re-present that GAP-ABORTs (proven-broken); the lossless re-present (unset) is the fix.
+	// do-not-enable.
 	// WALL-B FIX-9 LOSSLESS-DEMOTE fail-before selector (CASE 8 only): MERCURY_LOSSY_DEMOTE=1 makes
 	// the D3 16->15 re-present model the PRE-FIX (lossy) behavior — re-send the in-flight batch under
 	// a FRESH higher epoch bsi (the cmd_batch_seq_id already advanced past it) -> the RSP sees a

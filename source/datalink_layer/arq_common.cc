@@ -1698,6 +1698,9 @@ int cl_arq_controller::init(int tcp_base_port, int gear_shift_on, int initial_mo
 	// Phase 3c (Effective-Rate Optimizer) — load calibration table once at
 	// init. Inert if missing; only enables on parse success. Path override
 	// via MERCURY_RATE_TABLE env var; defaults to relative path.
+	// QUARANTINED 2026-06-17: do NOT point MERCURY_RATE_TABLE at effective_rate_table.v14.json
+	// (configs 14/15/16 rows MISSING — mounting it corrupts the optimizer; phy-stack verdict).
+	// The validated default (relative-path) table is the only safe load. do-not-mount-v14.
 	opt_load_rate_table();
 
 	print_stats_timer.start();
@@ -2304,6 +2307,10 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// regardless of tier (for pinned-config sim/HW A/B). The env knob, when set,
 	// WINS over the tier trigger. Cached on first call (no getenv() in the hot
 	// config-switch path on Pi).
+	// NOTE 2026-06-17: these envs are TEST-FORCE ONLY, not a default-flip decision. The
+	// production fix (suffix-FEC + CONNECT reps at the robust tier) ALREADY applies when
+	// the env is UNSET via the is_robust_config() trigger below. Leave both UNSET in prod;
+	// no HW net-win verdict exists for forcing them on a non-robust tier.
 	{
 		static int  fec_env_cached   = 0;
 		static int  fec_env_force     = -1;   // -1 = unset, 0/1 = forced value
@@ -4563,6 +4570,9 @@ bool cl_arq_controller::bigblock_send_one_block()
 	//
 	// A/B escape hatches: MERCURY_BIGBLOCK_FIR=1 -> old (decode-breaking) FIR path;
 	// MERCURY_BIGBLOCK_NOGAINCUT=1 -> raw hot block (the previous default, +2.3 dB).
+	// QUARANTINED 2026-06-17: both proven-broken (FIR=1 restores the decode-breaking
+	// FIR level-discipline path; NOGAINCUT=1 re-introduces the hot, decode-degrading
+	// +2.3 dB level). The self-calibrating default (unset) is the fix. do-not-enable.
 	bool bb_apply_fir = false;
 	{ const char* e=std::getenv("MERCURY_BIGBLOCK_FIR"); if(e && atoi(e)!=0) bb_apply_fir=true; }
 	bool bb_no_gaincut = false;
@@ -6572,6 +6582,10 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	// Fallback to the EOB inference when the count is unknown (v1/legacy/NB,
 	// or no frame of this batch carried it). MERCURY_D5_INFER_DEFEAT=1 forces
 	// the old EOB inference on the SAME binary (the fail-before arm).
+	// QUARANTINED 2026-06-17: proven-broken (=1 re-enables the EOB-inference
+	// that silently drops a lost-EOB tail frame => ~155B SILENT SKIP /
+	// silent-wrong-bytes on CFG16-reaching runs, prev-bump verdict; the
+	// wire-authoritative count b0aed8e is the cure). do-not-enable.
 	bool d5_infer_defeat = false;
 	{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
 	  if(e && *e && atoi(e)!=0) d5_infer_defeat = true; }
