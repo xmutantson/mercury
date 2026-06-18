@@ -1868,6 +1868,22 @@ public:
                                         uint8_t expect_parity,
                                         int* out_followed_config);
 
+  // ── STAGE 3d — PRE-FRAME detect+follow from a snapshot (data-flow-perbatch-
+  // config.md §15) ── The DVB-S2 PLHEADER twin of inband_detect_follow_from_capture:
+  // the TX now keys the CONFIG_TAG burst BEFORE frame 0, so the RX runs this over the
+  // SAME captured snapshot the OFDM acquisition is about to consume (receive() passes
+  // ready_to_process_passband_delayed_data + signal_period) BEFORE receive_byte
+  // demodulates frame 0. On a valid tag for a config != current it switches BOTH config
+  // copies + runs the HINGE; the HINGE flushes the LIVE ring, NOT this `snapshot`
+  // buffer, so frame 0 is preserved and decodes SEAMLESSLY at the new config. Binds
+  // NEITHER bsi NOR parity (the pre-frame detect runs before frame 0 decodes, so the
+  // batch bsi is unknown) — the FWHT peak + GF(16)+CRC-12 + cfg_index corroboration are
+  // the ~1e-8-FAR accept gates. A no-tag window is cheaply rejected (zero added latency,
+  // INV-3d-B). Returns 1 if it followed a new config, 0 otherwise. No-op (returns 0)
+  // when MERCURY_INBAND_RATE is off — byte-identical default.
+  int inband_detect_follow_from_snapshot(double* snapshot, int len,
+                                         int* out_followed_config);
+
   // ── STAGE 4 — the bounded down-ladder lost-tag resync (design §4 / §7) ──
   // The §3.2 outcome-3 recovery: the RX's first-frame decode FAILED at
   // current_configuration AND no CRC-valid CONFIG_TAG was heard (a lost tag in a
@@ -1930,6 +1946,19 @@ public:
   // drop is unrecoverable -> BREAK-count>0. Returns 0=PASS, 1=FAIL. design §4/§7,
   // data-flow-perbatch-config.md §13.6.
   int test_inband_fallback();
+
+  // STAGE 3d PRE-FRAME (SEAMLESS) TEST (CLI --test-inband-seamless). Builds the REAL
+  // wire window [tag burst][OFDM frame] (the DVB-S2 PLHEADER pre-frame order) and drives
+  // the PRODUCTION RX pre-frame path (inband_detect_follow_from_snapshot then receive_byte
+  // over the SAME snapshot). Asserts the four §15 invariants: (a) SEAMLESS — on a
+  // CONFIG_10->CONFIG_9 change the FIRST OFDM frame decodes BYTE-FAITHFULLY at CONFIG_9
+  // (fail-before: it is LOST at CONFIG_10); (b) NO-DEAD-TIME — a no-change window adds
+  // zero latency (the absent-tag detect is a bounded cheap reject, no wait); (c)
+  // CORRECT-CODE — the tag cfg_index == the config the frames are modulated at; (d)
+  // LOST-TAG -> the Stage-4 down-ladder still resyncs, BREAK-count==0. fail-before
+  // (-DINBAND_STAGE3D_FAILBEFORE or flag-off): the pre-frame detect is a no-op -> the
+  // first frame is LOST. Returns 0=PASS, 1=FAIL. data-flow-perbatch-config.md §15.
+  int test_inband_seamless();
 
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on

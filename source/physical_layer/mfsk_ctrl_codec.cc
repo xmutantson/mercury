@@ -1000,8 +1000,14 @@ bool config_tag_wrap_decode(const double* energies,
 	}
 
 	// Gate-3/4/5: cfg_index corroboration (FWHT == CRC field) + bsi + parity.
+	// expect_bsi_lsb == 0xFF and expect_parity == 0xFF are the "do not bind on this
+	// field" sentinels (Stage 3d §15): the PRE-FRAME tag detect runs BEFORE frame 0
+	// decodes, so the RX does not yet know the batch bsi to bind against — it relies on
+	// the FWHT peak + GF(16)+CRC-12 + cfg_index corroboration (the ~1e-8 FAR gates).
+	// No existing caller passes 0xFF for bsi (they pass a real 0..7), so the sentinel is
+	// purely additive (byte-identical for them).
 	bool corroborate = gf_ok && (fwht_cfg == (int)crc_cfg);
-	bool bsi_ok      = gf_ok && (bsi_lsb == (uint8_t)(expect_bsi_lsb & 0x7));
+	bool bsi_ok      = gf_ok && (expect_bsi_lsb == 0xFF || bsi_lsb == (uint8_t)(expect_bsi_lsb & 0x7));
 	bool parity_ok   = gf_ok && (expect_parity == 0xFF || parity == (uint8_t)(expect_parity & 0x1));
 	r.bind_agree = corroborate && bsi_ok && parity_ok;
 

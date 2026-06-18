@@ -5086,6 +5086,454 @@ int cl_arq_controller::test_inband_fallback()
 }
 
 // ============================================================================
+// In-band rate adaptation — STAGE 3d PRE-FRAME (SEAMLESS) TEST
+// ============================================================================
+//
+// CLI: --test-inband-seamless  (data-flow-perbatch-config.md §15)
+//
+// Stage 3d moves the CONFIG_TAG from AFTER frame 0 to BEFORE frame 0 (the DVB-S2
+// PLHEADER model), so the RX switches config FIRST and decodes the first frame of a
+// change-batch SEAMLESSLY at the new config — no first-frame loss / retx. This test
+// builds the REAL wire window [tag burst][OFDM frame] and drives the PRODUCTION RX
+// pre-frame path (inband_detect_follow_from_snapshot, the exact helper receive()
+// calls, then receive_byte over the SAME snapshot). It asserts the four §15 invariants:
+//
+//   (a) SEAMLESS    — on a CONFIG_10->CONFIG_9 change, the RX (at CONFIG_10) detects the
+//       pre-frame tag, switches to CONFIG_9, and receive_byte decodes the FIRST OFDM
+//       frame BYTE-FAITHFULLY at CONFIG_9 (not a decode-fail / lost frame). FAIL-BEFORE
+//       (the tag IGNORED, modeling the old after-frame ordering / no pre-frame detect):
+//       the RX stays at CONFIG_10 and receive_byte FAILS to decode the CONFIG_9 frame
+//       (the first frame is LOST).
+//   (b) NO-DEAD-TIME — a NO-CHANGE window (frame at CONFIG_10, NO tag) reaches the same
+//       pre-frame detect, which returns 0 (cheap reject of the absent tag) and does NOT
+//       switch config nor block; receive_byte then decodes the frame identically. The
+//       per-call cost of the absent-tag detect is measured and asserted bounded — the RX
+//       never waits for an absent tag.
+//   (c) CORRECT-CODE — the emitted tag's cfg_index (decoded back from the burst) maps to
+//       EXACTLY the config the following frame is modulated at (CONFIG_9).
+//   (d) LOST-TAG -> DOWN-LADDER — a change frame with the tag LOST (no burst on the wire)
+//       is NOT recovered by the pre-frame detect (returns 0) but DOES fall through to the
+//       Stage-4 bounded down-ladder, which resyncs to CONFIG_9 with BREAK-count == 0.
+//
+// fail-before (-DINBAND_STAGE3D_FAILBEFORE OR MERCURY_INBAND_RATE unset): the pre-frame
+// detect is a no-op -> the first frame is decoded at the OLD config and LOST. pass-after
+// (flag set): seamless first-frame decode at the new config. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_seamless()
+{
+	const char* TAG = "[TEST-INBAND-SEAMLESS]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). ---
+#ifndef INBAND_STAGE3D_FAILBEFORE
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+#else
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_RATE", "");
+#else
+	unsetenv("MERCURY_INBAND_RATE");
+#endif
+	auto restore_env = [&]() {};
+	printf("%s INBAND_STAGE3D_FAILBEFORE: feature forced OFF (no pre-frame detect; the "
+		"first frame is decoded at the OLD config and LOST)\n", TAG);
+	fflush(stdout);
+#endif
+
+	const int CFG_FROM = CONFIG_10;                                  // ladder idx 13
+	const int CFG_TO   = config_ladder_down(CFG_FROM, /*robust*/NO); // CONFIG_9, idx 12
+
+	// ── Helper: build the REAL wire window for ONE batch's first frame at `frame_cfg`,
+	// OPTIONALLY prepended with a CONFIG_TAG burst announcing `tag_cfg` (the Stage-3d
+	// pre-frame order: [tag burst][OFDM frame]). `with_tag=false` models a no-tag window
+	// (no-change steady state, or a lost-tag change). Returns the buffer_Nsymb span; the
+	// frame's preamble delay (for the scoped/throwaway decoders) is in *out_forced_delay,
+	// and the truth payload bytes in `truth_bytes`. ──
+	auto build_window = [&](int frame_cfg, bool with_tag, int tag_cfg, int tag_bsi,
+	                        std::vector<double>& win, int& out_len,
+	                        std::vector<int>& truth_bytes, int* out_forced_delay,
+	                        int* out_buf_nsymb) {
+		cl_telecom_system* ts = new cl_telecom_system();
+		ts->operation_mode = ARQ_MODE;
+		ts->narrowband_enabled = NO;
+		ts->data_container.buffer_Nsymb_min = 300;   // alloc large (window span)
+		ts->load_configuration(frame_cfg);
+		// A controller bound to THIS telecom_system, so build_config_tag_tones reads the
+		// WB-loaded ack_mfsk (M=16) of `ts` — NOT the global ARQ's (possibly NB) one.
+		cl_arq_controller* tg = new cl_arq_controller();
+		tg->telecom_system = ts;
+		tg->narrowband_enabled = NO;
+		int interp = ts->frequency_interpolation_rate;
+		int Nofdm  = ts->data_container.Nofdm;
+		int preN   = ts->data_container.preamble_nSymb;
+		int Nsymb  = ts->data_container.Nsymb;
+		int frame_bytes = ts->get_frame_size_bytes();
+		if(frame_bytes <= 0) frame_bytes = 1;
+		truth_bytes.assign((size_t)frame_bytes, 0);
+		for(int i = 0; i < frame_bytes; i++) truth_bytes[i] = (i * 37 + 11) & 0xFF;
+		std::vector<int> payload(truth_bytes.begin(), truth_bytes.end());
+		ts->transmit_byte(payload.data(), frame_bytes,
+			ts->data_container.passband_data, SINGLE_MESSAGE);
+
+		// The tag burst is keyed FIRST (the pre-frame order). Build it on this same
+		// telecom_system so the ack_mfsk geometry matches; reserve enough lead BEFORE the
+		// frame preamble that the whole burst fits in front of frame 0.
+		int sym_samples = Nofdm * interp;
+		int tag_written = 0;
+		std::vector<double> tag_burst;
+		if(with_tag)
+		{
+			int tones[gf16ra::GF16RA_MAX_N];
+			int n_tones = 0; uint8_t built_bsi_lsb = 0;
+			const uint8_t TX_PARITY = 1;
+			bool built = tg->build_config_tag_tones(tag_cfg, tag_bsi, TX_PARITY,
+				tones, &n_tones, &built_bsi_lsb);
+			(void)built;
+			int base_total  = ts->ack_mfsk.config_tag_sync_nsymb();
+			int burst_nsymb = base_total + n_tones;
+			int burst_samples = burst_nsymb * Nofdm * interp;
+			tag_burst.assign((size_t)burst_samples + 64, 0.0);
+			tag_written = ts->generate_config_tag_pattern_passband(tag_burst.data(), tones, n_tones);
+		}
+
+		// Lead margin: leave room for the tag burst (if any) + a few symbols, then place
+		// the frame preamble. forced_delay is measured from window start to the preamble.
+		int lead_syms = with_tag ? ((tag_written + sym_samples - 1) / sym_samples + 4) : 8;
+		int forced_delay = (lead_syms * Nofdm + 2 * Nofdm) * interp;  // preamble start
+		float sigma = 1e-3f;
+		int n_frame = (Nofdm * (Nsymb + preN)) * interp;
+		ts->awgn_channel.apply_with_delay(
+			ts->data_container.passband_data,
+			ts->data_container.passband_delayed_data,
+			sigma, n_frame, forced_delay);
+
+		int need_syms = ts->data_container.buffer_Nsymb;     // 300 (forced)
+		int exact = need_syms * sym_samples;
+		win.assign((size_t)exact, 0.0);
+		for(int i = 0; i < exact; i++)
+			win[i] = ts->data_container.passband_delayed_data[i];
+		// Overlay the tag burst at the HEAD (offset 0), BEFORE the frame preamble.
+		if(with_tag)
+			for(int i = 0; i < tag_written && i < exact; i++)
+				win[i] += tag_burst[i];
+
+		out_len = exact;
+		if(out_forced_delay) *out_forced_delay = forced_delay;
+		if(out_buf_nsymb)    *out_buf_nsymb    = need_syms;
+		tg->telecom_system = NULL;   // tg does not own ts; avoid a double-free
+		delete tg;
+		delete ts;
+	};
+
+	// ── Helper: build an RX at `cur_cfg`, point its capture ring at `win`, run the
+	// PRODUCTION pre-frame detect (inband_detect_follow_from_snapshot) then receive_byte
+	// over the SAME snapshot (mirroring receive() lines ~9774-9813). Returns whether the
+	// first frame decoded + the post-detect config + the decoded bytes. ──
+	auto run_preframe = [&](int cur_cfg, std::vector<double>& win, int forced_delay,
+	                        int buf_nsymb, int* out_followed, int* out_cfg_after,
+	                        int* out_decoded, std::vector<int>* out_bytes,
+	                        double* out_detect_ms, double* out_member_rms) {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode = ARQ_MODE;
+		ts_rx->data_container.buffer_Nsymb_min = buf_nsymb;   // PRE-load: alloc large
+		rx->telecom_system = ts_rx;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->load_configuration(cur_cfg, FULL, NO);
+		rx->sack_v2_enabled = true;
+		rx->link_status = CONNECTED;
+		rx->connection_status = RECEIVING;
+		rx->rsp_current_expected_batch_seq_id = 5;   // active window so the HINGE fires
+
+		int Nofdm  = ts_rx->data_container.Nofdm;
+		int interp = ts_rx->frequency_interpolation_rate;
+		int signal_period = Nofdm * interp * ts_rx->data_container.buffer_Nsymb;
+		// Snapshot the window into ready_to_process_* (what receive() reads), and seed the
+		// live ring too (so the HINGE flush has something coherent to clear).
+		MUTEX_LOCK(&capture_prep_mutex);
+		ts_rx->data_container.ring_write_index = 0;
+		for(int i = 0; i < (int)win.size() && i < signal_period; i++)
+		{
+			ts_rx->data_container.passband_delayed_data[i] = win[i];
+			ts_rx->data_container.ready_to_process_passband_delayed_data[i] = win[i];
+		}
+		MUTEX_UNLOCK(&capture_prep_mutex);
+
+		// PRODUCTION STEP 1: pre-frame tag detect over the snapshot (timed for INV-3d-B).
+		auto t0 = std::chrono::steady_clock::now();
+		int followed_cfg = cur_cfg;
+		int followed = 0;
+#ifndef INBAND_STAGE3D_FAILBEFORE
+		followed = rx->inband_detect_follow_from_snapshot(
+			ts_rx->data_container.ready_to_process_passband_delayed_data,
+			signal_period, &followed_cfg);
+#endif
+		auto t1 = std::chrono::steady_clock::now();
+		if(out_detect_ms) *out_detect_ms =
+			std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+		// PRODUCTION STEP 2: receive_byte over the PRODUCTION MEMBER BUFFER — exactly
+		// what receive() does at arq_common.cc:~9913. A MODULATION-boundary follow
+		// (8PSK CONFIG_10 -> QPSK CONFIG_9) reallocs + ZEROES that member buffer; the
+		// FIX re-stages the captured frame-0 samples back into it so the production
+		// decode sees REAL audio. We DECODE FROM THE MEMBER BUFFER (not a local copy),
+		// so a regression of the re-stage (or the realloc-then-decode-member bug it
+		// fixes) is caught here: with the buffer zeroed, RMS==0 and decode fails.
+		// The post-follow member pointer/size may differ from the pre-follow one (the
+		// realloc) — re-read both LIVE from data_container.
+		ts_rx->ofdm_forced_delay = forced_delay;
+		double*  member   = ts_rx->data_container.ready_to_process_passband_delayed_data;
+		long member_len = (long)ts_rx->data_container.Nofdm
+		                * ts_rx->frequency_interpolation_rate
+		                * ts_rx->data_container.buffer_Nsymb;
+
+		// INSTRUMENT: the production member buffer MUST be non-zero post-follow (the
+		// re-stage put frame 0 back). RMS==0 => the realloc zeroed it and nothing
+		// re-staged => the production frame-0 decode is doomed (the bug this proves).
+		double member_rms = 0.0;
+		if(member != NULL && member_len > 0)
+		{
+			double sumsq = 0.0;
+			for(long i = 0; i < member_len; i++) sumsq += member[i] * member[i];
+			member_rms = sqrt(sumsq / (double)member_len);
+		}
+		if(out_member_rms) *out_member_rms = member_rms;
+
+		std::vector<int> info_bits((size_t)N_MAX, 0);
+		st_receive_stats st = ts_rx->receive_byte(member, info_bits.data());
+		int decoded = (st.message_decoded == YES) ? 1 : 0;
+
+		if(out_followed)  *out_followed  = followed;
+		if(out_cfg_after) *out_cfg_after = rx->current_configuration;
+		if(out_decoded)   *out_decoded   = decoded;
+		if(out_bytes)
+		{
+			out_bytes->assign(info_bits.begin(),
+				info_bits.begin() + (decoded ? ts_rx->get_frame_size_bytes() : 0));
+		}
+		(void)followed_cfg;
+		delete rx; delete ts_rx;
+	};
+
+	// ========================================================================
+	// PART A — SEAMLESS: the change-batch FIRST frame decodes at the NEW config
+	// ========================================================================
+	{
+		std::vector<double> win; int wlen = 0; std::vector<int> truth; int fdelay = 0; int bufN = 0;
+		const int CHANGE_BSI = 6;
+		build_window(CFG_TO, /*with_tag=*/true, /*tag_cfg=*/CFG_TO, CHANGE_BSI,
+			win, wlen, truth, &fdelay, &bufN);
+
+		int followed = 0, cfg_after = -1, decoded = 0; std::vector<int> got; double dms = 0; double mrms = 0;
+		run_preframe(CFG_FROM, win, fdelay, bufN, &followed, &cfg_after, &decoded, &got, &dms, &mrms);
+
+#ifndef INBAND_STAGE3D_FAILBEFORE
+		check(followed == 1,
+			"A0 RX FOLLOWS the pre-frame tag (CONFIG_10 -> CONFIG_9) BEFORE frame-0 demod",
+			followed, 1);
+		check(cfg_after == CFG_TO,
+			"A1 RX config switched to CONFIG_9 before the first frame", cfg_after, CFG_TO);
+		// The DECISIVE production probe: after the modulation-boundary follow reallocs +
+		// zeroes the member ready_to_process_* buffer, the FIX re-stages frame 0 back into
+		// it. RMS>0 proves the PRODUCTION member buffer (not a local copy) holds real audio
+		// at decode time. -DINBAND_STAGE3D_FRAME0_FAILBEFORE skips the re-stage => RMS==0.
+		check(mrms > 1e-6,
+			"A1b PRODUCTION-BUFFER: ready_to_process_* member buffer is NON-ZERO post-follow "
+			"(frame 0 re-staged, not decoding from a zeroed buffer); rms*1e6",
+			(long)(mrms * 1e6), 1);
+		check(decoded == 1,
+			"A2 SEAMLESS: the FIRST OFDM frame DECODES at the new config (no loss)", decoded, 1);
+		// Byte-faithful: every decoded byte matches the truth payload.
+		bool byte_faithful = (decoded == 1) && ((int)got.size() == (int)truth.size());
+		if(byte_faithful)
+			for(size_t i = 0; i < truth.size(); i++)
+				if((got[i] & 0xFF) != (truth[i] & 0xFF)) { byte_faithful = false; break; }
+		check(byte_faithful,
+			"A3 SEAMLESS: the first frame is BYTE-FAITHFUL at the new config",
+			byte_faithful ? 1 : 0, 1);
+#else
+		check(followed == 0,
+			"A0(FB) NO pre-frame follow (feature off / old after-frame ordering)", followed, 0);
+		check(cfg_after == CFG_FROM,
+			"A1(FB) RX stuck at CONFIG_10 (no pre-frame switch)", cfg_after, CFG_FROM);
+		check(decoded == 0,
+			"A2(FB) the FIRST frame is LOST: CONFIG_9 frame fails to decode at CONFIG_10",
+			decoded, 0);
+#endif
+	}
+
+#ifndef INBAND_STAGE3D_FAILBEFORE
+	// ========================================================================
+	// PART B — NO-DEAD-TIME: a no-change window adds ZERO latency (no wait for a tag)
+	// ========================================================================
+	{
+		// No-change: the RX is at CONFIG_10 and the frame is at CONFIG_10, with NO tag.
+		std::vector<double> win; int wlen = 0; std::vector<int> truth; int fdelay = 0; int bufN = 0;
+		build_window(CFG_FROM, /*with_tag=*/false, /*tag_cfg=*/CFG_FROM, /*bsi=*/0,
+			win, wlen, truth, &fdelay, &bufN);
+
+		int followed = 0, cfg_after = -1, decoded = 0; std::vector<int> got; double dms = 0; double mrms = 0;
+		run_preframe(CFG_FROM, win, fdelay, bufN, &followed, &cfg_after, &decoded, &got, &dms, &mrms);
+
+		check(followed == 0,
+			"B0 NO-CHANGE: the pre-frame detect returns 0 (no tag -> no follow)", followed, 0);
+		check(cfg_after == CFG_FROM,
+			"B1 NO-CHANGE: config UNCHANGED (RX did not switch on an absent tag)",
+			cfg_after, CFG_FROM);
+		check(decoded == 1,
+			"B2 NO-CHANGE: the frame still decodes (RX did not block waiting for a tag)",
+			decoded, 1);
+		bool byte_faithful = (decoded == 1) && ((int)got.size() == (int)truth.size());
+		if(byte_faithful)
+			for(size_t i = 0; i < truth.size(); i++)
+				if((got[i] & 0xFF) != (truth[i] & 0xFF)) { byte_faithful = false; break; }
+		check(byte_faithful, "B3 NO-CHANGE: the frame is byte-faithful (identical to base)",
+			byte_faithful ? 1 : 0, 1);
+		// The absent-tag detect is a single bounded base-correlation pass (NO blocking, NO
+		// reserved slot). It returns on the cheap count-gate reject. Assert it is bounded
+		// (a hard wall-clock cap — far above the real cost — that a BLOCKING wait would
+		// blow through). The RX never sleeps waiting for an absent tag.
+		check(dms < 250.0,
+			"B4 NO-DEAD-TIME: the absent-tag detect is bounded (no wait for an absent tag); ms*1000",
+			(long)(dms * 1000.0), 250000);
+		printf("%s B4-note: no-change pre-frame detect cost = %.3f ms (a single base-correlation "
+			"pass; zero added wait vs base)\n", TAG, dms);
+		fflush(stdout);
+	}
+
+	// ========================================================================
+	// PART C — CORRECT-CODE: the tag's cfg_index == the config the frames use
+	// ========================================================================
+	{
+		// Build the tag burst announcing CFG_TO (the config the change-batch frames use)
+		// and decode it BACK; assert the recovered cfg_index maps to CFG_TO.
+		cl_telecom_system* ts = new cl_telecom_system();
+		ts->operation_mode = ARQ_MODE; ts->narrowband_enabled = NO;
+		ts->data_container.buffer_Nsymb_min = 64;
+		ts->load_configuration(CFG_TO);
+		cl_arq_controller* tg = new cl_arq_controller();
+		tg->telecom_system = ts; tg->narrowband_enabled = NO;
+		int tones[gf16ra::GF16RA_MAX_N]; int n_tones = 0; uint8_t bsl = 0;
+		const int TAG_BSI = 6; const uint8_t TX_PARITY = 1;
+		bool built = tg->build_config_tag_tones(CFG_TO, TAG_BSI, TX_PARITY, tones, &n_tones, &bsl);
+		check(built, "C0 build the CONFIG_TAG for CONFIG_9", built ? 1 : 0, 1);
+
+		int base_total = ts->ack_mfsk.config_tag_sync_nsymb();
+		int burst_nsymb = base_total + n_tones;
+		int interp = ts->frequency_interpolation_rate;
+		int burst_samples = burst_nsymb * ts->data_container.Nofdm * interp;
+		std::vector<double> burst((size_t)burst_samples + 64, 0.0);
+		int written = ts->generate_config_tag_pattern_passband(burst.data(), tones, n_tones);
+
+		std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+		double chips[16] = {0.0}; int nsy = 0, matched = 0;
+		bool present = ts->decode_config_tag_from_passband(
+			burst.data(), written, energies.data(), chips, &nsy, &matched);
+		check(present, "C1 the tag burst is detected (base correlator)", present ? 1 : 0, 1);
+
+		config_tag_decode_result r;
+		// Production CRC-12 callback (NEVER inline — same as the ARQ detect path / the
+		// Stage-3a round-trip test at arq_responder.cc:4167).
+		auto crc12_cb = [](void* ctx, const unsigned char* d, int nn) -> uint16_t {
+			return ((cl_arq_controller*)ctx)->CRC12_calc((const char*)d, nn) & 0x0FFF;
+		};
+		bool ok = config_tag_wrap_decode(energies.data(), chips, CFG_TAG_PEAK_GATE,
+			/*expect_bsi_lsb=*/(uint8_t)(TAG_BSI & 0x7), /*expect_parity=*/TX_PARITY,
+			crc12_cb, this, &r);
+		check(ok, "C2 the tag WRAP-decodes (FWHT + GF16 + CRC12 + binding)", ok ? 1 : 0, 1);
+		int decoded_cfg = (r.cfg_index < FULL_CONFIG_LADDER_SIZE)
+			? FULL_CONFIG_LADDER[r.cfg_index] : -1;
+		check(decoded_cfg == CFG_TO,
+			"C3 CORRECT-CODE: the tag cfg_index == the config the frames are modulated at",
+			decoded_cfg, CFG_TO);
+		tg->telecom_system = NULL; delete tg;   // tg does not own ts
+		delete ts;
+	}
+
+	// ========================================================================
+	// PART D — LOST-TAG -> the Stage-4 down-ladder still recovers (BREAK==0)
+	// ========================================================================
+	{
+		// A change-batch frame at CONFIG_9 with NO tag on the wire (the tag was lost in a
+		// fade). The pre-frame detect cannot follow (no burst) -> the first frame fails at
+		// CONFIG_10 -> the Stage-4 bounded down-ladder must resync to CONFIG_9, BREAK==0.
+		std::vector<double> win; int wlen = 0; std::vector<int> truth; int fdelay = 0; int bufN = 0;
+		build_window(CFG_TO, /*with_tag=*/false, /*tag_cfg=*/CFG_TO, /*bsi=*/6,
+			win, wlen, truth, &fdelay, &bufN);
+
+		// First confirm the pre-frame detect does NOT follow (no tag present).
+		int followed = 0, cfg_after = -1, decoded = 0; double dms = 0; double mrms = 0;
+		run_preframe(CFG_FROM, win, fdelay, bufN, &followed, &cfg_after, &decoded, NULL, &dms, &mrms);
+		check(followed == 0,
+			"D0 LOST-TAG: the pre-frame detect does NOT follow (no burst on the wire)",
+			followed, 0);
+		check(decoded == 0,
+			"D1 LOST-TAG: the first frame FAILS at the old config (the down-ladder symptom)",
+			decoded, 0);
+
+		// Now drive the PRODUCTION Stage-4 entry over the same window; it must resync.
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode = ARQ_MODE;
+		ts_rx->data_container.buffer_Nsymb_min = bufN;
+		rx->telecom_system = ts_rx;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->load_configuration(CFG_FROM, FULL, NO);
+		rx->sack_v2_enabled = true;
+		rx->link_status = CONNECTED;
+		rx->connection_status = RECEIVING;
+		rx->rsp_current_expected_batch_seq_id = 5;
+		rx->inband_test_forced_down_delay = fdelay;
+
+		int Nofdm = ts_rx->data_container.Nofdm;
+		int interp = ts_rx->frequency_interpolation_rate;
+		int signal_period = Nofdm * interp * ts_rx->data_container.buffer_Nsymb;
+		MUTEX_LOCK(&capture_prep_mutex);
+		ts_rx->data_container.ring_write_index = 0;
+		for(int i = 0; i < (int)win.size() && i < signal_period; i++)
+			ts_rx->data_container.passband_delayed_data[i] = win[i];
+		MUTEX_UNLOCK(&capture_prep_mutex);
+
+		rx->inband_terminal_break_due = false;
+		rx->inband_try_down_ladder_on_decode_fail();
+		check(rx->inband_terminal_break_due == false,
+			"D2 LOST-TAG: BREAK-count == 0 (the down-ladder recovered, no BREAK)",
+			rx->inband_terminal_break_due ? 1 : 0, 0);
+		check(rx->current_configuration == CFG_TO,
+			"D3 LOST-TAG: the down-ladder resynced to the true config CONFIG_9",
+			rx->current_configuration, CFG_TO);
+		delete rx; delete ts_rx;
+	}
+#endif
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK), in-process test
 // ============================================================================
 //

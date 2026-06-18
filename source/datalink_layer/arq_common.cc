@@ -2551,9 +2551,10 @@ int cl_arq_controller::emit_config_tag_passband(int batch_cfg, int batch_seq_id)
 
 	// Key the tag to passband audio (the Stage-3a keyer). Stage 3c: the burst
 	// occupies the TRIMMED acquisition sync (config_tag_sync_nsymb() base symbols)
-	// + n_tones suffix symbols. The tag rides a deterministic offset (right after
-	// frame-0) so it does NOT carry the full blind-acquire base — that is the
-	// airtime saving. The 55-symbol payload suffix is UNCHANGED.
+	// + n_tones suffix symbols. Stage 3d: the tag is now keyed as a PRE-FRAME
+	// announcement (BEFORE frame 0, the DVB-S2 PLHEADER order — arq_common.cc:7048),
+	// not after it; either way it rides a deterministic offset (no full blind-acquire
+	// base) — that is the airtime saving. The 55-symbol payload suffix is UNCHANGED.
 	int base_total  = telecom_system->ack_mfsk.config_tag_sync_nsymb();
 	int burst_nsymb = base_total + n_tones;
 	int burst_samples = burst_nsymb * telecom_system->data_container.Nofdm
@@ -2887,6 +2888,124 @@ int cl_arq_controller::inband_detect_follow_from_capture(uint8_t expect_bsi_lsb,
 	int followed_cfg = current_configuration;
 	int followed = detect_and_follow_config_tag(energies.data(), chips, n_syms,
 		expect_bsi_lsb, expect_parity, &followed_cfg);
+	if(out_followed_config) *out_followed_config = followed_cfg;
+	return followed;
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 3d (PRE-FRAME detect+follow from a snapshot)
+// ============================================================================
+// data-flow-perbatch-config.md §15. The pre-frame twin of inband_detect_follow_from_
+// capture: the TX now keys the CONFIG_TAG burst BEFORE frame 0 (the DVB-S2 PLHEADER
+// move), so the RX runs this over the SAME captured snapshot the OFDM acquisition is
+// about to consume — BEFORE receive_byte demodulates frame 0. On a valid+bound tag for
+// a config different from current it switches BOTH config copies + runs the HINGE
+// (capture-flush of the LIVE ring + D3.1 re-baseline) so frame 0 then decodes SEAMLESSLY
+// at the new config. The HINGE flush clears passband_delayed_data (the live ring), NOT
+// the caller's snapshot buffer — so the frame-0 samples receive_byte reads are
+// preserved (§15 INV-3d-A).
+//
+// Differences from inband_detect_follow_from_capture:
+//  - reads a CALLER-PROVIDED snapshot (the full signal_period window receive() already
+//    copied into ready_to_process_passband_delayed_data), NOT the ring tail. The tag is
+//    now at the HEAD (before frame 0); decode_config_tag_from_passband does a sliding
+//    best_offset search over the whole window, so it locates the tag wherever it sits.
+//  - binds NEITHER bsi NOR parity (0xFF/0xFF): the pre-frame detect runs before frame 0
+//    decodes, so the batch bsi is unknown. The FWHT peak + GF(16)+CRC-12 + cfg_index
+//    corroboration (~1e-8 FAR) are the accept gates. A no-tag window is cheaply rejected
+//    by the count-gate inside decode_config_tag_from_passband (§15 INV-3d-B: zero added
+//    latency on a no-change batch — no waiting for an absent tag).
+int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int len,
+                                                          int* out_followed_config)
+{
+	if(out_followed_config) *out_followed_config = current_configuration;
+	if(!inband_rate_feature_enabled())
+		return 0;
+	if(telecom_system == NULL || snapshot == NULL || len <= 0)
+		return 0;
+	// The tag rides the M=16 robust layer; unavailable on NB / M<16.
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+
+	// REAL base-correlator presence detect over the whole snapshot. The count-gate
+	// inside cheaply rejects a no-tag window (no burst at any offset) — that is the
+	// no-dead-time guarantee: a no-change batch reaches here, gets a cheap false, and
+	// falls straight through to receive_byte with no added wait.
+	std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+	double chips[16] = {0.0};
+	int n_syms = 0, matched = 0;
+	bool present = telecom_system->decode_config_tag_from_passband(
+		snapshot, len, energies.data(), chips, &n_syms, &matched);
+	if(!present)
+		return 0;   // no tag in this window -> steady state / lost tag (Stage 4 recovers)
+
+	// ─── FRAME-0 PRESERVATION (data-flow-perbatch-config.md §15 INV-3d-A) ───
+	// A REAL config change that crosses a MODULATION boundary (e.g. 8PSK CONFIG_10 ->
+	// QPSK CONFIG_9) makes load_configuration set reinit_subsystems.data_container=YES
+	// (telecom_system.cc:10272-10277), which FREES + reallocs + ZEROES the member
+	// ready_to_process_passband_delayed_data (data_container.cc:170-173). `snapshot`
+	// IS that member buffer (receive() passes it in), so the FOLLOW below would
+	// DANGLE the caller's pointer AND leave the production receive_byte (the very next
+	// production step, arq_common.cc:~9913) decoding frame 0 from a ZEROED buffer ->
+	// frame 0 LOST. Save the captured wire samples HERE (a private copy, like the
+	// down-ladder stages its decode, arq_common.cc:3159), run the FOLLOW, then RE-STAGE
+	// the saved samples into the freshly-allocated member buffer at the NEW config —
+	// so the production receive_byte sees the REAL frame-0 samples and decodes them
+	// SEAMLESSLY at the tagged config. This is the same decode-from-capture discipline
+	// the Stage-4 down-ladder uses (decode the captured audio at the target config,
+	// not the live ring the HINGE flushes), but with the SINGLE tag-announced config
+	// (no blind search — the tag gives the config directly).
+	std::vector<double> frame0_capture((size_t)len);
+	memcpy(frame0_capture.data(), snapshot, (size_t)len * sizeof(double));
+
+	// Wrap-decode (bsi + parity UNBOUND) + FOLLOW (load_configuration both copies + the
+	// HINGE port). detect_and_follow_config_tag no-ops if the decoded cfg == current
+	// (a stale re-detect of the previous tag), so a no-change is safe.
+	int cfg_before = current_configuration;
+	int followed_cfg = current_configuration;
+	int followed = detect_and_follow_config_tag(energies.data(), chips, n_syms,
+		/*expect_bsi_lsb=*/0xFF, /*expect_parity=*/0xFF, &followed_cfg);
+
+	// On a REAL switch, RE-STAGE the saved capture into the member buffer the follow
+	// just (re)allocated at the new config. NOTE: after the switch `snapshot` (the OLD
+	// member pointer) may be dangling — re-read the LIVE member pointer + size from
+	// data_container and never touch `snapshot` again. The new member buffer holds
+	// Nofdm*buffer_Nsymb*interp samples (data_container.cc:172); clamp the copy to it.
+	// receive() snapshots at ring index 0 (arq_common.cc:9359), so frame 0 sits at the
+	// buffer HEAD — re-stage at index 0. zero any tail the smaller new buffer can't hold.
+#ifdef INBAND_STAGE3D_FRAME0_FAILBEFORE
+	// FAIL-BEFORE arm: SKIP the re-stage. The follow's modulation-boundary realloc has
+	// already ZEROED the member buffer, so the production receive_byte then decodes
+	// frame 0 from a zeroed buffer -> RMS=0 -> decoded==0. This is the EXACT prior
+	// (rejected) production behaviour. Rebuild with -DINBAND_STAGE3D_FRAME0_FAILBEFORE.
+	(void)cfg_before; (void)frame0_capture;
+	if(followed == 1)
+	{
+		printf("[INBAND-RX] FRAME0_FAILBEFORE: re-stage SKIPPED (member buffer left "
+			"zeroed by the realloc) — frame 0 will fail\n");
+		fflush(stdout);
+	}
+#else
+	if(followed == 1 && followed_cfg != cfg_before)
+	{
+		double* member = telecom_system->data_container.ready_to_process_passband_delayed_data;
+		long new_len = (long)telecom_system->data_container.Nofdm
+		             * telecom_system->data_container.buffer_Nsymb
+		             * telecom_system->data_container.interpolation_rate;
+		if(member != NULL && new_len > 0)
+		{
+			long copy_len = (len < new_len) ? len : new_len;
+			memcpy(member, frame0_capture.data(), (size_t)copy_len * sizeof(double));
+			if(copy_len < new_len)
+				memset(&member[copy_len], 0, (size_t)(new_len - copy_len) * sizeof(double));
+			printf("[INBAND-RX] frame-0 RE-STAGED into reinit'd member buffer "
+				"(%ld samples) at CONFIG_%d -> production receive_byte decodes "
+				"frame 0 SEAMLESSLY (no zeroed-buffer loss)\n", copy_len, followed_cfg);
+			fflush(stdout);
+		}
+	}
+#endif
+
 	if(out_followed_config) *out_followed_config = followed_cfg;
 	return followed;
 }
@@ -6961,35 +7080,46 @@ void cl_arq_controller::send_batch()
 		delete[] pilot_buffer;
 	}
 
+	// STAGE 3d W1 (data-flow-perbatch-config.md §15): announce a committed config
+	// change with a CONFIG_TAG riding the robust M=16 layer, keyed onto the passband
+	// as a PRE-FRAME ANNOUNCEMENT (the DVB-S2 PLHEADER model) — BEFORE the FIRST OFDM
+	// DATA frame, so the wire order is [tag burst][frame 0][frame 1]... and the RX
+	// switches config FIRST, then demodulates frame 0 SEAMLESSLY at the new config (no
+	// first-frame loss / retx). This replaces the Stage-3b after-frame-0 emit, whose
+	// ordering forced the RX to decode frame 0 at the OLD config (fails) and only learn
+	// the change from the trailing tag — losing every change-batch's first frame.
+	//
+	// The emit fires once per batch, only when MERCURY_INBAND_RATE is set AND the
+	// batch's config differs from the last-announced config (NO-CHANGE => the emit
+	// returns 0: nothing on the wire, no slot, no silence — zero steady-state overhead).
+	// Gated to DATA batches (the tag announces the DATA config) and the OFDM tier (the
+	// robust suffix layer is M=16; emit_config_tag_passband no-ops on NB/M<16 and on
+	// retx batches, which carry no fresh config). The bsi binding comes from the FIRST
+	// data frame in the batch (computed before the loop so the tag announces the bsi the
+	// RX will see on frame 0). CORRECT-CODE (§15 INV-3d-C): the tag is built for
+	// current_configuration — the EXACT config the following frames below are modulated
+	// at (transmit_byte already encoded them at current_configuration above).
+	if(inband_rate_feature_enabled() && !sack_retransmit_active)
+	{
+		int tag_bsi = -1;
+		for(int i=0;i<message_batch_counter_tx;i++)
+		{
+			if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			{ tag_bsi = messages_batch_tx[i].batch_seq_id; break; }
+		}
+		if(tag_bsi >= 0)
+			emit_config_tag_passband(current_configuration, (tag_bsi < 0) ? 0 : tag_bsi);
+	}
+
 	// LEVER P: transmit each frame at its actual packed offset and actual length
 	// (variable: anchor FULL, tail MINI). The frames are contiguous, so the wire
 	// sees one gapless waveform; per-frame tx_transfer granularity is preserved
-	// for the sim pacing / capture-prep symbol cadence.
-	// STAGE 3b W1 (data-flow-perbatch-config.md §12 W1): announce a committed config
-	// change with a CONFIG_TAG riding the robust M=16 layer, keyed onto the passband
-	// right after the FIRST OFDM DATA frame (a deterministic offset; Stage-3c trims
-	// the acquisition sync). Fires once per batch, only when MERCURY_INBAND_RATE is set
-	// AND the batch's config differs from the last-announced config (zero steady-state
-	// overhead). Gated to DATA batches (the tag announces the DATA config) and the OFDM
-	// tier (the robust suffix layer is M=16; emit_config_tag_passband no-ops on NB/M<16
-	// and on retx batches, which carry no fresh config). The bsi binding comes from the
-	// first data frame's batch_seq_id.
-	bool inband_tag_emitted_this_batch = false;
+	// for the sim pacing / capture-prep symbol cadence. The CONFIG_TAG (if any) was
+	// keyed onto the wire JUST ABOVE, so it precedes frame 0 (§15 INV-3d-A).
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
 		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, off=%d size=%d\n", i, message_batch_counter_tx, frame_pack_off[i], frame_len[i]); fflush(stdout); }
 		tx_transfer(&batch_frames_output_data_filtered2[frame_pack_off[i]], frame_len[i]);
-
-		// Emit the tag right AFTER the first DATA frame (deterministic offset).
-		if(!inband_tag_emitted_this_batch
-			&& !sack_retransmit_active
-			&& (messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT))
-		{
-			inband_tag_emitted_this_batch = true;   // attempt only once per batch
-			int tag_bsi = messages_batch_tx[i].batch_seq_id;
-			if(tag_bsi < 0) tag_bsi = 0;
-			emit_config_tag_passband(current_configuration, tag_bsi);
-		}
 	}
 
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
@@ -9761,6 +9891,46 @@ void cl_arq_controller::receive()
 #endif
 
 		auto proc_start = std::chrono::steady_clock::now();
+
+		// ─── STAGE 3d: PRE-FRAME CONFIG_TAG DETECT+FOLLOW (data-flow-perbatch-config.md §15) ───
+		// The DVB-S2 PLHEADER model: a config CHANGE is announced by a robust M=16
+		// CONFIG_TAG burst the TX keyed BEFORE frame 0 (W1, the pre-frame move). Run the
+		// tag detector over the SAME captured snapshot the OFDM acquisition is about to
+		// consume, BEFORE receive_byte demodulates frame 0. The tag rides the robust-MFSK
+		// base correlator (decode_config_tag_from_passband -> detect_ack_pattern over
+		// ack_mfsk.connect_tones), which is ORTHOGONAL to the OFDM Schmidl-Cox preamble
+		// template — so it runs "in parallel" with OFDM acquisition on the same window and
+		// the two never confuse each other (§15 WALL-CHECK). On a valid+bound tag for a
+		// config DIFFERENT from current, this switches BOTH config copies coherently
+		// (load_configuration) + runs the HINGE (capture-flush of the LIVE ring + D3.1
+		// re-baseline). A MODULATION-boundary switch makes load_configuration realloc +
+		// ZERO the member ready_to_process_* buffer receive_byte reads next, so the
+		// follow SAVES the captured frame-0 samples and RE-STAGES them into the reinit'd
+		// member buffer at the new config (inband_detect_follow_from_snapshot, the
+		// down-ladder decode-from-capture discipline) — so frame 0 is preserved and
+		// decodes SEAMLESSLY at the new config (§15 INV-3d-A). NO-CHANGE / steady state:
+		// the tag's count-gate (config_tag_sync_match_threshold) cheaply rejects a no-tag
+		// window and returns 0 — receive_byte then fires on the SAME snapshot with ZERO
+		// added latency (the RX never blocks waiting for an absent tag, §15 INV-3d-B). A
+		// tag sent-but-NOT-detected (lost in a fade) falls through to receive_byte at the
+		// old config (fails) and is recovered by the Stage-4 down-ladder (§15 INV-3d-D).
+		// Default-off (feature flag): the whole block is skipped -> byte-identical.
+		if(inband_rate_feature_enabled()
+		   && !passive_monitor
+		   && telecom_system->M != MOD_MFSK
+		   && is_ofdm_config(current_configuration))
+		{
+			int pre_followed_cfg = current_configuration;
+			int pre_followed = inband_detect_follow_from_snapshot(
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				signal_period, &pre_followed_cfg);
+			if(pre_followed == 1)
+			{
+				printf("[INBAND-RX] PRE-FRAME tag-follow to CONFIG_%d before frame-0 demod "
+					"(seamless switch; snapshot preserved)\n", pre_followed_cfg);
+				fflush(stdout);
+			}
+		}
 
 		// Monitor mode with parallel decoders: try all 17 OFDM configs sequentially.
 		// Falls through to single receive_byte() for MFSK modes or if decoders not ready.
