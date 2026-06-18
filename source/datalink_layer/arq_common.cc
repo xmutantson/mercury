@@ -934,6 +934,9 @@ cl_arq_controller::~cl_arq_controller()
 	{
 		delete[] messages_control_bu.data;
 	}
+	// In-band rate adaptation (Stage 4): free the scoped down-window decoder bank
+	// (no-op if never allocated — the common flag-off / never-lost-a-tag case).
+	inband_free_down_decoders();
 	this->deinit_messages_buffers();
 }
 
@@ -2725,69 +2728,16 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 		(unsigned)r.batch_seq_lsb, (unsigned)r.epoch_parity);
 	fflush(stdout);
 
-	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
-
 	// === STAGE 3b HINGE PORT (data-flow-perbatch-config.md §3.2 / §12.2) ===
 	// A REAL config change mid-stream (followed_config != current at entry) must
 	// replicate the TWO side-effects the SET_CONFIG RSP handler performs, else the
-	// tag-follow path silently corrupts. Both are PORTED VERBATIM from
-	// arq_responder.cc (the SET_CONFIG handler) so the two paths are behaviourally
-	// identical — only the trigger differs (passband tag vs control handshake).
-	//
-	// HINGE-1: capture-buffer flush (arq_responder.cc:2945-2964). Stale OFDM
-	// preambles (identical preamble structure across all OFDM configs) cause
-	// Schmidl-Cox false-locks at the new config without this. Guarded by the
-	// capture_prep_mutex like the source.
-	{
-		int buf_samples = telecom_system->data_container.Nofdm
-			* telecom_system->data_container.buffer_Nsymb
-			* telecom_system->data_container.interpolation_rate;
-		MUTEX_LOCK(&capture_prep_mutex);
-		// circular_buf_reset asserts on a NULL ring; the audio capture ring is absent
-		// in SIM_INPROC / synthetic-fire (no device init). Guard it — the PHY-allocated
-		// passband_delayed_data memset below is the load-bearing stale-preamble flush
-		// and is always present. (The production receive path always has the ring.)
-		if(capture_buffer != NULL)
-			circular_buf_reset(capture_buffer);
-		if(telecom_system->data_container.passband_delayed_data != NULL && buf_samples > 0)
-			memset(telecom_system->data_container.passband_delayed_data, 0,
-				2 * buf_samples * sizeof(double));
-		telecom_system->data_container.ring_write_index = 0;
-		telecom_system->receive_stats.ofdm_search_raw = 0;
-		telecom_system->receive_stats.ofdm_batch_active = false;
-		telecom_system->receive_stats.delay_of_last_decoded_message = -1;
-		MUTEX_UNLOCK(&capture_prep_mutex);
-		printf("[INBAND-RX] HINGE capture-flush for tag-follow to CONFIG_%d\n",
-			followed_config);
-		fflush(stdout);
-	}
-
-	// HINGE-2: D3.1 bsi-window re-baseline + prev-storage drop
-	// (arq_responder.cc:3012-3031). A per-batch demote/promote may strand an
-	// incomplete batch in the RSP window; without re-baselining cur=prev=-1 the RSP
-	// keeps cur>=0 and PREV-BUMPs past the incomplete batch -> silent concat. The
-	// next data frame then re-adopts through the [RSP-V2-ADOPT] gap-gate (contiguous
-	// climb accepts; a non-contiguous stranded-batch hole aborts LOUDLY).
-	// rsp_last_delivered_batch_seq_id is DELIBERATELY preserved (the reset-surviving
-	// high-water the re-adopt gate reads). Gated on a REAL change + an active window.
-	if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
-	{
-		printf("[INBAND-RX] HINGE D3.1 re-baseline: tag-follow %d->%d mid-transfer "
-			"(cur=%d prev=%d -> -1; last_delivered=%d preserved)\n",
-			current_configuration, followed_config,
-			rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id,
-			rsp_last_delivered_batch_seq_id);
-		fflush(stdout);
-		rsp_current_expected_batch_seq_id = -1;
-		rsp_prev_batch_seq_id             = -1;
-		rsp_prev_batch_active             = false;
-		rsp_prev_batch_received_count     = 0;
-		rsp_prev_batch_expected_count     = 0;
-		bigblock_partial_armed            = false;
-		for(int i=0; i<this->nMessages; i++)
-			messages_rx_prev[i].status = FREE;
-		// rsp_last_delivered_batch_seq_id intentionally NOT reset.
-	}
+	// tag-follow path silently corrupts. The coherent load_configuration + both HINGE
+	// side-effects (capture-flush + D3.1 re-baseline) are PORTED VERBATIM from
+	// arq_responder.cc (the SET_CONFIG handler) and factored into
+	// inband_adopt_resynced_config so the tag-follow path (here) AND the Stage-4
+	// down-ladder share ONE implementation — only the trigger differs (passband tag
+	// vs blind down-window decode). See data-flow-perbatch-config.md §13.2(c).
+	inband_adopt_resynced_config(followed_config);
 
 	if(out_followed_config) *out_followed_config = followed_config;
 	return 1;
@@ -2933,6 +2883,395 @@ int cl_arq_controller::inband_detect_follow_from_capture(uint8_t expect_bsi_lsb,
 		expect_bsi_lsb, expect_parity, &followed_cfg);
 	if(out_followed_config) *out_followed_config = followed_cfg;
 	return followed;
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 4: the bounded down-ladder lost-tag resync
+// ============================================================================
+// design §4 (FALLBACK_DOWN_LADDER) + §7 (BREAK_ROLE);
+// data-flow-perbatch-config.md §13. The §3.2 outcome-3 recovery: the RX's
+// first-frame decode FAILED at current_configuration AND no CRC-valid CONFIG_TAG
+// was heard (a lost tag in a fade). Instead of BREAKing (the old cascade), run a
+// BOUNDED down-window blind decode and ADOPT the config that actually decodes.
+// The CRITICAL invariant (INV-S4-1): a config is adopted ONLY on a real CRC/LDPC
+// pass (message_decoded==YES) — NEVER a guess (a wrong adopt = silent-wrong-bytes).
+
+// Resolve + cache the down-window depth D (env MERCURY_INBAND_DOWN_D, default 4 per
+// the codeword study, design §4.2). Clamped to [1, INBAND_DOWN_D_MAX].
+int cl_arq_controller::inband_down_window_depth()
+{
+	if(inband_down_d < 0)
+	{
+		int d = 4;  // owner default (design §4.2 / OD-7)
+		const char* e = std::getenv("MERCURY_INBAND_DOWN_D");
+		if(e && *e) { int v = atoi(e); if(v != 0) d = v; }
+		if(d < 1) d = 1;
+		if(d > INBAND_DOWN_D_MAX) d = INBAND_DOWN_D_MAX;
+		inband_down_d = d;
+	}
+	return inband_down_d;
+}
+
+// Resolve + cache SESSION_DEAD_BATCHES (env MERCURY_INBAND_DEAD_BATCHES, default 3,
+// design §4.3 / OD-7). The terminal BREAK fires only after this many CONSECUTIVE
+// total-loss batches (even ROBUST_0 failed). Clamped to >= 1.
+int cl_arq_controller::inband_session_dead_limit()
+{
+	if(inband_dead_batches_limit < 0)
+	{
+		int n = 3;  // owner default (design §4.3 / OD-7)
+		const char* e = std::getenv("MERCURY_INBAND_DEAD_BATCHES");
+		if(e && *e) { int v = atoi(e); if(v != 0) n = v; }
+		if(n < 1) n = 1;
+		inband_dead_batches_limit = n;
+	}
+	return inband_dead_batches_limit;
+}
+
+void cl_arq_controller::inband_free_down_decoders()
+{
+	for(int i = 0; i <= INBAND_DOWN_D_MAX; i++)
+	{
+		if(inband_down_decoders[i] != NULL)
+		{
+			delete inband_down_decoders[i];
+			inband_down_decoders[i] = NULL;
+		}
+		inband_down_decoder_cfg[i] = -1;
+	}
+	inband_down_decoders_built = false;
+	inband_down_buffer_nsymb = 0;
+}
+
+// Lazily (re)build the scoped down-window decoder bank for FULL_CONFIG_LADDER[lo..hi].
+// AT MOST INBAND_DOWN_D_MAX+1 decoders — never the full NUMBER_OF_CONFIGS bank
+// (the RPi bound, INV-S4-2). Slot i holds FULL_CONFIG_LADDER[lo+i]; rebuilt only
+// when a slot's config id changes (the window slides as cur drops). All decoders in
+// the bank share ONE buffer_Nsymb (the largest config in the CURRENT window — the
+// lowest ladder index = the most-robust = the most symbols), so they can all process
+// the SAME captured snapshot. Returns the count of live decoders [lo,hi].
+int cl_arq_controller::inband_ensure_down_decoders(int lo_idx, int hi_idx)
+{
+	if(lo_idx < 0) lo_idx = 0;
+	if(hi_idx >= FULL_CONFIG_LADDER_SIZE) hi_idx = FULL_CONFIG_LADDER_SIZE - 1;
+	if(hi_idx < lo_idx) return 0;
+	int count = hi_idx - lo_idx + 1;
+	if(count > INBAND_DOWN_D_MAX + 1) { lo_idx = hi_idx - INBAND_DOWN_D_MAX; count = INBAND_DOWN_D_MAX + 1; }
+
+	// Determine the common buffer_Nsymb the bank must use = the largest OFDM frame in
+	// the window. The lowest ladder index in the window is the most robust (most
+	// symbols). Probe it once with a throwaway decoder (the SAME idiom
+	// init_monitor_decoders uses, arq_common.cc:1746-1753).
+	int want_buffer_nsymb;
+	{
+		int low_cfg = FULL_CONFIG_LADDER[lo_idx];
+		cl_telecom_system tmp;
+		tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+		tmp.load_configuration(low_cfg);
+		want_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
+		// tmp destructs here, freeing its buffers.
+	}
+	// If the bandwidth changed (NB/WB) the cached buffer size is stale -> rebuild all.
+	if(inband_down_decoders_built && want_buffer_nsymb != inband_down_buffer_nsymb)
+		inband_free_down_decoders();
+	inband_down_buffer_nsymb = want_buffer_nsymb;
+
+	for(int i = 0; i < count; i++)
+	{
+		int cfg = FULL_CONFIG_LADDER[lo_idx + i];
+		// Reuse an existing slot iff it already holds this exact config (window slide
+		// keeps most decoders; only the newly-exposed rung is built).
+		if(inband_down_decoders[i] != NULL && inband_down_decoder_cfg[i] == cfg)
+			continue;
+		if(inband_down_decoders[i] != NULL)
+		{
+			delete inband_down_decoders[i];
+			inband_down_decoders[i] = NULL;
+		}
+		inband_down_decoders[i] = new cl_telecom_system();
+		inband_down_decoders[i]->narrowband_enabled = telecom_system->narrowband_enabled;
+		// Force the common (largest-in-window) buffer so every decoder can process the
+		// same snapshot, exactly as the monitor bank does (arq_common.cc:1762).
+		inband_down_decoders[i]->data_container.buffer_Nsymb_min = inband_down_buffer_nsymb;
+		inband_down_decoders[i]->load_configuration(cfg);
+		// TEST-ONLY: a synthetic clean-wire frame is positioned deterministically, so
+		// the test bypasses blind Schmidl-Cox acquisition with a forced delay (production
+		// leaves this -1 and the scoped decoders acquire real OTA audio normally).
+		inband_down_decoders[i]->ofdm_forced_delay = inband_test_forced_down_delay;
+		inband_down_decoder_cfg[i] = cfg;
+	}
+	// Free any slots beyond the current window (a narrower window than last time).
+	for(int i = count; i <= INBAND_DOWN_D_MAX; i++)
+	{
+		if(inband_down_decoders[i] != NULL)
+		{
+			delete inband_down_decoders[i];
+			inband_down_decoders[i] = NULL;
+		}
+		inband_down_decoder_cfg[i] = -1;
+	}
+	inband_down_decoders_built = true;
+	return count;
+}
+
+int cl_arq_controller::inband_down_ladder_resync(const double* audio, int audio_len,
+                                                 int D, uint8_t expect_bsi_lsb,
+                                                 int* out_decoded, int* out_decoded_len)
+{
+	inband_down_decode_attempts = 0;
+	if(out_decoded_len) *out_decoded_len = 0;
+
+	// Feature off -> never run (byte-identical default; the RX decode path is unchanged).
+	if(!inband_rate_feature_enabled()) return -1;
+
+#ifdef INBAND_STAGE4_FAILBEFORE
+	// FAIL-BEFORE arm: the down-ladder is DISABLED. The lost-tag drop is then
+	// unrecoverable -> the caller takes the legacy retx/BREAK path -> BREAK fires
+	// (proves the ladder is load-bearing). Rebuild with -DINBAND_STAGE4_FAILBEFORE.
+	(void)audio; (void)audio_len; (void)D; (void)expect_bsi_lsb; (void)out_decoded;
+	printf("[INBAND-RX] STAGE4_FAILBEFORE: down-ladder disabled (no resync)\n");
+	fflush(stdout);
+	return -1;
+#else
+	if(audio == NULL || audio_len <= 0) return -1;
+	if(telecom_system == NULL) return -1;
+
+	if(D < 1) D = inband_down_window_depth();
+	if(D > INBAND_DOWN_D_MAX) D = INBAND_DOWN_D_MAX;
+
+	int cur_idx = config_ladder_index(current_configuration);
+	if(cur_idx < 0)
+	{
+		// current_configuration is not on the ladder (e.g. CONFIG_NONE / a bandwidth
+		// variant not in FULL_CONFIG_LADDER) -> cannot scope a down-window. No resync.
+		return -1;
+	}
+	int lo_idx = cur_idx - D; if(lo_idx < 0) lo_idx = 0;
+	int hi_idx = cur_idx;
+
+	int n = inband_ensure_down_decoders(lo_idx, hi_idx);
+	if(n <= 0) return -1;
+
+	printf("[INBAND-RX] DOWN-LADDER lost-tag resync: cur=CONFIG_%d (idx=%d) window "
+		"FULL_CONFIG_LADDER[%d..%d] (D=%d, %d decoders, bsi_lsb=%u)\n",
+		current_configuration, cur_idx, lo_idx, hi_idx, D, n, (unsigned)expect_bsi_lsb);
+	fflush(stdout);
+
+	// Search from cur DOWNWARD (closest-to-current first; a drop only moves toward
+	// robust, design §4.1). Adopt the FIRST config whose decode PASSES its CRC/LDPC
+	// (message_decoded==YES) — NEVER a guess (INV-S4-1).
+	for(int idx = hi_idx; idx >= lo_idx; idx--)
+	{
+		int slot = idx - lo_idx;
+		cl_telecom_system* dec = inband_down_decoders[slot];
+		if(dec == NULL) continue;
+		int cfg = FULL_CONFIG_LADDER[idx];
+
+		// Copy the captured snapshot into this decoder's own scratch (never the
+		// primary's buffers — the staging discipline parallel_monitor_decode uses,
+		// arq_common.cc:1913-1917).
+		int dec_buf_len = dec->data_container.Nofdm
+			* dec->data_container.buffer_Nsymb.load()
+			* dec->data_container.interpolation_rate;
+		int copy_len = (audio_len < dec_buf_len) ? audio_len : dec_buf_len;
+		memcpy(dec->data_container.ready_to_process_passband_delayed_data,
+			audio, (size_t)copy_len * sizeof(double));
+		if(copy_len < dec_buf_len)
+			memset(&dec->data_container.ready_to_process_passband_delayed_data[copy_len],
+				0, (size_t)(dec_buf_len - copy_len) * sizeof(double));
+
+		inband_down_decode_attempts++;
+		st_receive_stats stats = dec->receive_byte(
+			dec->data_container.ready_to_process_passband_delayed_data,
+			dec->data_container.data_byte);
+
+		if(stats.message_decoded == YES)
+		{
+			// REAL CRC/LDPC pass at CONFIG_cfg -> this is the true (dropped) config.
+			// Stage the decoded bytes BEFORE load_configuration (which may deinit the
+			// primary on a cross-modulation switch, destroying its data_byte — the
+			// SAME hazard parallel_monitor_decode guards, arq_common.cc:1930-1938).
+			int dec_len = dec->get_frame_size_bytes();
+			if(dec_len > N_MAX / 8) dec_len = N_MAX / 8;
+			memcpy(inband_down_decoded_buf, dec->data_container.data_byte,
+				(size_t)dec_len * sizeof(int));
+			if(out_decoded)
+				memcpy(out_decoded, inband_down_decoded_buf, (size_t)dec_len * sizeof(int));
+			if(out_decoded_len) *out_decoded_len = dec_len;
+
+			printf("[INBAND-RX] DOWN-LADDER RESYNC: CONFIG_%d DECODED (idx=%d, attempt "
+				"%d/%d, SNR=%.1f iter=%d) -> adopting (CRC/LDPC pass, not a guess)\n",
+				cfg, idx, inband_down_decode_attempts, n, stats.SNR, stats.iterations_done);
+			fflush(stdout);
+
+			// ADOPT (design §4.3 terminate-success). Reuse the EXACT Stage-3b follow
+			// machinery: load_configuration switches BOTH the ARQ copy AND the PHY twin
+			// coherently, then the HINGE side-effects (capture-flush + D3.1 re-baseline)
+			// run so the rest of the batch demods cleanly at the new config and the next
+			// frame re-adopts through the [RSP-V2-ADOPT] gap-gate. Only on a REAL change.
+			if(cfg != current_configuration)
+				inband_adopt_resynced_config(cfg);
+
+			// A successful decode means the link is ALIVE -> reset the terminal-BREAK
+			// dead-batch streak (design §7: BREAK is the rare true-loss backstop only).
+			inband_session_dead_batches = 0;
+			return cfg;
+		}
+	}
+
+	// None of the D+1 window configs decoded. The caller steps the dead-batch streak;
+	// only SESSION_DEAD_BATCHES consecutive total-losses reach BREAK (design §4.3).
+	printf("[INBAND-RX] DOWN-LADDER: no config in window [%d..%d] decoded (%d attempts)\n",
+		lo_idx, hi_idx, inband_down_decode_attempts);
+	fflush(stdout);
+	return -1;
+#endif
+}
+
+// Adopt a config the down-ladder resynced to (design §4.3). Factored out of
+// detect_and_follow_config_tag so the tag-follow AND the down-ladder share ONE
+// coherent-switch + HINGE-port implementation (no divergence). Switches BOTH config
+// copies (ARQ + PHY twin) and runs the SET_CONFIG HINGE side-effects.
+void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
+{
+	printf("[INBAND-RX] DOWN-LADDER adopt: CONFIG_%d (was %d)\n",
+		followed_config, current_configuration);
+	fflush(stdout);
+
+	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
+
+	// HINGE-1: capture-buffer flush (IDENTICAL to detect_and_follow_config_tag and the
+	// SET_CONFIG RSP handler — stale OFDM preambles false-lock Schmidl-Cox at the new
+	// config without it).
+	{
+		int buf_samples = telecom_system->data_container.Nofdm
+			* telecom_system->data_container.buffer_Nsymb
+			* telecom_system->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		if(capture_buffer != NULL)
+			circular_buf_reset(capture_buffer);
+		if(telecom_system->data_container.passband_delayed_data != NULL && buf_samples > 0)
+			memset(telecom_system->data_container.passband_delayed_data, 0,
+				2 * buf_samples * sizeof(double));
+		telecom_system->data_container.ring_write_index = 0;
+		telecom_system->receive_stats.ofdm_search_raw = 0;
+		telecom_system->receive_stats.ofdm_batch_active = false;
+		telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+
+	// HINGE-2: D3.1 bsi-window re-baseline + prev-storage drop (IDENTICAL to
+	// detect_and_follow_config_tag — rsp_last_delivered DELIBERATELY preserved).
+	if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+	{
+		rsp_current_expected_batch_seq_id = -1;
+		rsp_prev_batch_seq_id             = -1;
+		rsp_prev_batch_active             = false;
+		rsp_prev_batch_received_count     = 0;
+		rsp_prev_batch_expected_count     = 0;
+		bigblock_partial_armed            = false;
+		for(int i=0; i<this->nMessages; i++)
+			messages_rx_prev[i].status = FREE;
+	}
+}
+
+// STAGE 4 production entry (design §4/§7, data-flow-perbatch-config.md §13.1
+// S4-ENTRY/S4-TERM). Called from the RX receive loop ONLY when: the feature is on,
+// the link is CONNECTED+RECEIVING, NO data frame decoded this pass, and the current
+// config is OFDM (the lost-tag precondition). Pulls the captured first-frame
+// snapshot, energy-gates it (no decode attempts during silence), runs the bounded
+// down-ladder, and on none-pass advances the terminal-BREAK dead-batch streak. The
+// dead-batch streak reaching SESSION_DEAD_BATCHES is the ONLY remaining BREAK
+// trigger on the inband path; this routine sets inband_terminal_break_due so the
+// caller's existing BREAK machinery fires (design §7 — BREAK mechanism unchanged).
+void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
+{
+	if(!inband_rate_feature_enabled()) return;
+	if(telecom_system == NULL) return;
+
+	// Pull the captured passband window the same way the W2 tag decode does
+	// (inband_detect_follow_from_capture / the ACK ctrl-suffix decode). The down-ladder
+	// needs the FULL first-frame snapshot (a whole OFDM frame, not just the tag tail),
+	// so read the whole signal_period window the primary just failed to decode.
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	if(signal_period <= 0) return;
+
+	// === Energy gate (IDENTICAL to parallel_monitor_decode, arq_common.cc:1838-1852).
+	// No OFDM frame present in the window -> no lost tag, just silence between frames.
+	// Skip the D+1 decodes (the RPi-cost guard for idle ticks). ===
+	{
+		MUTEX_LOCK(&capture_prep_mutex);
+		int rwi = telecom_system->data_container.ring_write_index;
+		const double* win = &telecom_system->data_container.passband_delayed_data[rwi];
+		double peak = 0;
+		for(int i = 0; i < signal_period; i += 64)
+		{
+			double v = fabs(win[i]);
+			if(v > peak) peak = v;
+		}
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		if(peak < 0.05) return;   // silence -> not a lost tag; do not burn decodes
+	}
+
+	// Copy the window out under the capture lock, then run the bounded ladder.
+	std::vector<double> snapshot((size_t)signal_period, 0.0);
+	{
+		MUTEX_LOCK(&capture_prep_mutex);
+		int rwi = telecom_system->data_container.ring_write_index;
+		memcpy(snapshot.data(),
+			&telecom_system->data_container.passband_delayed_data[rwi],
+			(size_t)signal_period * sizeof(double));
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+
+	uint8_t bsi_lsb = (rsp_current_expected_batch_seq_id >= 0)
+		? (uint8_t)(rsp_current_expected_batch_seq_id & 0x7) : 0xFF;
+
+	int decoded_len = 0;
+	int winner = inband_down_ladder_resync(snapshot.data(), signal_period,
+		/*D=*/inband_down_window_depth(), bsi_lsb,
+		/*out_decoded=*/NULL, &decoded_len);
+
+	if(winner >= 0)
+	{
+		// RESYNC SUCCESS (design §4.3 terminate-success). The ladder already
+		// load_configuration'd the winner + ran the HINGE re-baseline + reset the
+		// dead-batch streak. The next receive() pass acquires the rest of the batch at
+		// the new config and delivers through the existing SACK path (the returning
+		// SACK is the implicit confirm). BREAK is NOT reached. Re-arm the receiving
+		// window for the new config so the loop keeps pumping.
+		calculate_receiving_timeout();
+		receiving_timer.start();
+		printf("[INBAND-RX] DOWN-LADDER resync OK -> CONFIG_%d; BREAK avoided "
+			"(dead_batches reset)\n", winner);
+		fflush(stdout);
+		return;
+	}
+
+	// None of the D+1 window configs decoded -> a total-loss batch. Advance the
+	// terminal-BREAK dead-batch streak (design §4.3 terminate-failure). Only when it
+	// reaches SESSION_DEAD_BATCHES consecutive total-losses do we fall through to
+	// BREAK — the ONLY remaining BREAK path on the inband path.
+	inband_session_dead_batches++;
+	int limit = inband_session_dead_limit();
+	printf("[INBAND-RX] DOWN-LADDER total-loss batch %d/%d (even the window floor "
+		"failed to decode)\n", inband_session_dead_batches, limit);
+	fflush(stdout);
+
+	if(inband_session_dead_batches >= limit)
+	{
+		// TRUE SESSION LOSS (design §7). Hand off to the EXISTING BREAK machinery —
+		// the mechanism is unchanged; only the TRIGGER moved from a per-batch ACK miss
+		// to this terminal floor. The caller checks inband_terminal_break_due right
+		// after this routine returns and runs the standard BREAK→ROBUST_0 path.
+		printf("[INBAND-RX] DOWN-LADDER reached SESSION_DEAD_BATCHES=%d -> TRUE session "
+			"loss, falling through to BREAK (the only remaining BREAK path)\n", limit);
+		fflush(stdout);
+		inband_terminal_break_due = true;
+		inband_session_dead_batches = 0;   // armed once; reset so BREAK isn't re-fired
+	}
 }
 
 void cl_arq_controller::return_to_last_configuration()
@@ -4482,6 +4821,13 @@ void cl_arq_controller::reset_session_state()
 	forward_configuration = CONFIG_NONE;
 	reverse_configuration = CONFIG_NONE;
 	ack_configuration = init_configuration;
+
+	// In-band rate adaptation (Stage 4): a fresh session is never one batch from
+	// the terminal-BREAK floor; the lost-tag dead-batch streak resets here (mirrors
+	// the ctor in-class init). The scoped down-window decoder bank is NOT torn down
+	// here (it is bandwidth-keyed, not session-keyed — kept across reconnects on the
+	// same NB/WB; freed in inband_free_down_decoders on a NB/WB switch / dtor).
+	inband_session_dead_batches = 0;
 
 	// Turboshift — fresh state for next connection
 	turboshift_phase = TURBO_FORWARD;

@@ -1868,6 +1868,43 @@ public:
                                         uint8_t expect_parity,
                                         int* out_followed_config);
 
+  // ── STAGE 4 — the bounded down-ladder lost-tag resync (design §4 / §7) ──
+  // The §3.2 outcome-3 recovery: the RX's first-frame decode FAILED at
+  // current_configuration AND no CRC-valid CONFIG_TAG was heard (a lost tag in a
+  // fade). Run a BOUNDED down-window blind decode over the captured first-frame
+  // snapshot and ADOPT the config that actually decodes (CRC/LDPC pass) — never a
+  // guess. Search set = FULL_CONFIG_LADDER[max(0,cur_idx-D) .. cur_idx], from cur
+  // DOWNWARD (closest-to-current first; a drop only moves toward robust). At most
+  // D+1 scoped decoders / decode attempts (RPi bound — NOT the NUMBER_OF_CONFIGS
+  // monitor bank). On a win: load_configuration(winner) (ARQ+PHY-twin coherent) +
+  // the SAME Stage-3b HINGE side-effects (capture-flush + D3.1 re-baseline); the
+  // decoded bytes go out via *out_decoded / *out_decoded_len for delivery through
+  // the existing SACK path (the returning SACK is the implicit confirm).
+  // Returns the WINNING raw config id (>=0) on a decode pass, or -1 if NONE of the
+  // D+1 window configs decoded. No-op (returns -1) when MERCURY_INBAND_RATE is off.
+  // `audio`/`audio_len` is the captured first-frame passband snapshot. `D` is the
+  // down-window depth (clamped to [1, INBAND_DOWN_D_MAX]). `expect_bsi_lsb` binds
+  // (currently advisory — the CRC/LDPC pass is the adopt gate). When out_decoded is
+  // non-NULL it receives the winner's decoded bytes (length in *out_decoded_len).
+  int inband_down_ladder_resync(const double* audio, int audio_len, int D,
+                                uint8_t expect_bsi_lsb,
+                                int* out_decoded, int* out_decoded_len);
+
+  // Coherent ARQ+PHY-twin config switch + the SET_CONFIG HINGE side-effects
+  // (capture-flush + D3.1 re-baseline). Shared by the tag-follow path
+  // (detect_and_follow_config_tag) and the Stage-4 down-ladder so the two adopt
+  // paths are behaviourally IDENTICAL (one HINGE implementation, no divergence).
+  // Caller guarantees followed_config != current_configuration (a real change).
+  void inband_adopt_resynced_config(int followed_config);
+
+  // Lazily (re)build the scoped down-window decoder bank for the configs in
+  // FULL_CONFIG_LADDER[lo_idx .. hi_idx] (hi_idx-lo_idx+1 <= INBAND_DOWN_D_MAX+1).
+  // Each decoder is sized to its OWN config (NOT CONFIG_0's max buffer). Cached
+  // across batches keyed by config id; only (re)allocates slots whose config
+  // changed. Never allocates the full NUMBER_OF_CONFIGS bank. Returns the count of
+  // live decoders in [lo_idx,hi_idx].
+  int inband_ensure_down_decoders(int lo_idx, int hi_idx);
+
   // Stage-3b LOOPBACK DROP TEST (CLI --test-inband-drop). Two-instance in-process
   // loopback (CMD+RSP, real passband, shared virtual clock). With MERCURY_INBAND_RATE
   // on, the gearshift DROPS one rung; W1 keys the tag onto the real passband after
@@ -1879,6 +1916,20 @@ public:
   // gearshift queues SET_CONFIG / the RX does not follow -> SET_CONFIG count > 0 / RX
   // stuck at the old config. Returns 0=PASS, 1=FAIL.
   int test_inband_drop();
+
+  // STAGE 4 LOST-TAG DOWN-LADDER TEST (CLI --test-inband-fallback). In-process: an
+  // RX at CONFIG_x, the TX drops to CONFIG_(x-k) and keys the first frame at the
+  // dropped config but the CONFIG_TAG is FORCED LOST (suffix omitted/corrupted).
+  // Asserts: (1) the OLD-config first-frame decode fails; (2) the bounded down-
+  // ladder decodes at the TRUE config within D rungs (message_decoded==YES, a real
+  // CRC/LDPC pass — never a guess); (3) the SACK bsi confirms; (4) BREAK-count==0;
+  // (5) decode attempts <= D+1 (RPi bound); (6) sweep D in {1..5} -> resync-success
+  // vs D (k-rung drop resyncs iff D>=k); (7) sweep SESSION_DEAD_BATCHES -> BREAK
+  // fires at exactly the Nth consecutive total-loss batch. fail-before
+  // (-DINBAND_STAGE4_FAILBEFORE or flag-off): the ladder is disabled -> the lost-tag
+  // drop is unrecoverable -> BREAK-count>0. Returns 0=PASS, 1=FAIL. design §4/§7,
+  // data-flow-perbatch-config.md §13.6.
+  int test_inband_fallback();
 
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on
@@ -3023,6 +3074,39 @@ public:
   int     inband_last_announced_config; // CONFIG_NONE until the first tag
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
+
+  // ── STAGE 4 — the bounded down-ladder lost-tag resync state (design §4/§7) ──
+  // The down-window depth D is owner-tunable via MERCURY_INBAND_DOWN_D (default 4,
+  // per the codeword study, §4.2); SESSION_DEAD_BATCHES via
+  // MERCURY_INBAND_DEAD_BATCHES (default 3). Both resolved once + cached. The scoped
+  // decoder bank holds AT MOST INBAND_DOWN_D_MAX+1 decoders — never the full
+  // NUMBER_OF_CONFIGS monitor bank (the RPi bound, INV-S4-2). Each slot is sized to
+  // its OWN config, lazily (re)built keyed by config id, cached across batches.
+  static const int INBAND_DOWN_D_MAX = 8;     // hard cap on D (window <= D+1 wide)
+  cl_telecom_system* inband_down_decoders[INBAND_DOWN_D_MAX + 1] = {};  // scoped bank
+  int  inband_down_decoder_cfg[INBAND_DOWN_D_MAX + 1] = {};             // config id per slot (-1=empty)
+  bool inband_down_decoders_built = false;    // any slot allocated yet?
+  int  inband_down_buffer_nsymb = 0;          // common buffer_Nsymb for the bank (largest window cfg)
+  int  inband_down_d = -1;                    // cached MERCURY_INBAND_DOWN_D (-1=unresolved)
+  int  inband_session_dead_batches = 0;       // consecutive total-loss batches -> terminal BREAK
+  int  inband_dead_batches_limit = -1;        // cached MERCURY_INBAND_DEAD_BATCHES (-1=unresolved)
+  bool inband_terminal_break_due = false;     // set when the dead-batch streak hit the limit (caller fires BREAK)
+  int  inband_test_forced_down_delay = -1;    // TEST-ONLY: forced preamble delay for scoped decoders (-1=real acquisition)
+  // RX receive-loop entry: when receive() returned with NO decoded data frame at the
+  // current OFDM config (a possible lost tag), run the bounded down-ladder. On a
+  // resync it adopts the true config (BREAK avoided); on a total-loss batch it
+  // advances the dead-batch streak and, at SESSION_DEAD_BATCHES, sets
+  // inband_terminal_break_due so the caller's existing BREAK machinery fires. The
+  // ONLY remaining BREAK trigger on the inband path. No-op when the flag is off.
+  void inband_try_down_ladder_on_decode_fail();
+  int  inband_down_decode_attempts = 0;       // diagnostic: decode attempts in the LAST ladder run
+  int  inband_down_decoded_buf[N_MAX / 8] = {};  // staging for the winning decoder's bytes
+  // Resolve+cache the down-window depth D (clamped to [1,INBAND_DOWN_D_MAX]).
+  int  inband_down_window_depth();
+  // Resolve+cache SESSION_DEAD_BATCHES (>=1).
+  int  inband_session_dead_limit();
+  // Tear down the scoped down-window bank (NB/WB switch or session reset).
+  void inband_free_down_decoders();
 
   // Stage 3b GEARSHIFT DRIVE (unilateral drop). When MERCURY_INBAND_RATE is set,
   // add_message_control(SET_CONFIG) takes the UNILATERAL path (inband_unilateral_drop)

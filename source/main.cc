@@ -739,6 +739,7 @@ int main(int argc, char *argv[])
                                         // One-shot, exits rc. unilateral-config-tag-design.md §11 Stage 2.
                                         // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
     bool test_inband_drop_cli = false;  // --test-inband-drop: in-band rate-adapt Stage 3b — LOOPBACK DROP.
+    bool test_inband_fallback_cli = false;  // --test-inband-fallback: in-band Stage 4 — LOST-TAG DOWN-LADDER.
                                         // Gearshift-driven unilateral drop (W3), tag on the real passband (W1),
                                         // RX follows from the passband tag (W2 + HINGE), SACK confirms (bsi),
                                         // ZERO SET_CONFIG on the wire, both ends config-track, PHY-twin coherent,
@@ -1437,6 +1438,18 @@ int main(int argc, char *argv[])
             // passband + RX follow + SACK confirm + ZERO SET_CONFIG. See
             // arq_responder.cc test_inband_drop + data-flow-perbatch-config.md §12.
             test_inband_drop_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-fallback") == 0)
+        {
+            // In-band rate adaptation Stage 4 — LOST-TAG DOWN-LADDER TEST (one-shot at
+            // startup, exit rc). Forces a tag-loss on a drop batch; asserts the bounded
+            // down-ladder resyncs within D rungs on a real CRC/LDPC pass, the SACK
+            // confirms, BREAK-count==0, decode attempts<=D+1 (RPi bound), and sweeps D /
+            // SESSION_DEAD_BATCHES. See arq_responder.cc test_inband_fallback +
+            // data-flow-perbatch-config.md §13.
+            test_inband_fallback_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2888,6 +2901,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_drop();
             printf("[FLAG] Inband-drop test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_fallback_cli) {
+            // In-band rate adaptation Stage 4 — LOST-TAG DOWN-LADDER TEST (one-shot, exit rc).
+            // Builds its own telecom_system instances internally.
+            printf("[FLAG] --test-inband-fallback: invoking in-band rate-adapt Stage-4 "
+                   "lost-tag down-ladder regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_fallback();
+            printf("[FLAG] Inband-fallback test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

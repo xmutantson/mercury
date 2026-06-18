@@ -498,6 +498,54 @@ void cl_arq_controller::process_messages_rx_data_control()
 			return;
 		}
 
+		// ─── STAGE 4: LOST-TAG BOUNDED DOWN-LADDER (design §4 / §7) ───
+		// The §3.2 outcome-3 recovery. receive() above (:433) returned with NO decoded
+		// DATA frame at current_configuration AND no CRC-valid CONFIG_TAG followed (the
+		// W2 tag-follow at the [RSP-V2-ADOPT] site only fires on a SUCCESSFUL adopt). A
+		// signal-present first-frame decode FAIL with no tag is the ONLY thing that can
+		// mean "the change tag was lost in a fade" (design §3.2). Run the bounded
+		// down-window blind decode; on a real CRC/LDPC pass adopt the true config and
+		// re-feed the snapshot so the batch delivers (the returning SACK is the implicit
+		// confirm). None-pass steps the terminal-BREAK dead-batch streak; only
+		// SESSION_DEAD_BATCHES consecutive total-losses reach BREAK — the ONLY remaining
+		// BREAK path on the inband path. No-op unless MERCURY_INBAND_RATE is set.
+		// Default-off: byte-identical (the whole block is feature-gated).
+		if(inband_rate_feature_enabled()
+		   && link_status == CONNECTED
+		   && connection_status == RECEIVING
+		   && !passive_monitor
+		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
+		   && is_ofdm_config(current_configuration))         // tag only rides OFDM batches
+		{
+			inband_try_down_ladder_on_decode_fail();
+
+			// TERMINAL BREAK (design §7): the dead-batch streak reached
+			// SESSION_DEAD_BATCHES — true session loss. Fire the EXISTING BREAK→ROBUST_0
+			// reset (mechanism unchanged; the trigger moved from a per-batch ACK miss to
+			// this terminal floor). This is the ONLY remaining BREAK path on the inband
+			// path. Mirrors the break_detected handler above (:487-498): drop to
+			// ROBUST_0, re-baseline the bsi window, re-arm the receiving timer.
+			if(inband_terminal_break_due)
+			{
+				inband_terminal_break_due = false;
+				printf("[INBAND-RX] TERMINAL BREAK: SESSION_DEAD_BATCHES reached -> "
+					"ROBUST_0 (the only inband BREAK path)\n");
+				fflush(stdout);
+				messages_control.status = FREE;
+				rsp_current_expected_batch_seq_id = -1;
+				rsp_prev_batch_seq_id = -1;
+				int tgt = robust_enabled ? ROBUST_0 : CONFIG_0;
+				data_configuration = tgt;
+				load_configuration(tgt, PHYSICAL_LAYER_ONLY, YES);
+				calculate_receiving_timeout();
+				receiving_timer.start();
+				batch_rx_frame_count = 0;
+				connection_status = RECEIVING;
+				link_timer.start();
+				return;
+			}
+		}
+
 		// ─── LEVER #2: SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK) ───
 		// turnaround-eff.md §8. Fire the reverse-ACK (SACK) on a WINDOW-FRACTION
 		// DEADLINE rather than waiting for the whole batch — including any
@@ -687,6 +735,12 @@ void cl_arq_controller::process_messages_rx_data_control()
 			}
 			else if(messages_rx_buffer.type==DATA_LONG || messages_rx_buffer.type==DATA_SHORT)
 			{
+				// STAGE 4 (design §7): a DATA frame decoded at the current config -> the
+				// link is ALIVE. Reset the terminal-BREAK dead-batch streak so it only
+				// counts CONSECUTIVE total-loss batches. No-op when the feature is off.
+				if(inband_rate_feature_enabled())
+					inband_session_dead_batches = 0;
+
 				// Monitor: auto-adopt session if we receive data while still LISTENING
 				// (missed START_CONNECTION — joined mid-session)
 				if(passive_monitor && link_status == LISTENING)
@@ -4570,6 +4624,459 @@ int cl_arq_controller::test_inband_drop()
 	delete cmd; delete rx; delete ts_cmd; delete ts_rx;
 	restore_env();
 
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 4 LOST-TAG DOWN-LADDER TEST
+// ============================================================================
+//
+// CLI: --test-inband-fallback  (unilateral-config-tag-design.md §4/§7/§11 Stage 4 /
+//                               data-flow-perbatch-config.md §13.6)
+//
+// The headline risk R1: a CONFIG_TAG lost in a fade. The TX dropped a rung and the
+// announce tag did NOT survive, so the RX is decoding the OLD config against a
+// NEW-config payload (the §3.2 outcome-3 case). FAIL-BEFORE: the RX cannot follow ->
+// the batch fails -> a BREAK fires (the cascade). PASS-AFTER: the RX runs the bounded
+// down-ladder, resyncs to the true (dropped) config WITHIN D rungs on a REAL CRC/LDPC
+// decode pass (never a guess), the SACK confirms, and BREAK-count == 0.
+//
+// The "lost tag" is modeled faithfully: a REAL OFDM data frame is transmitted at the
+// DROPPED config onto a clean wire and placed in the RX capture window, but NO
+// CONFIG_TAG burst is attached (it was lost). The RX's current_configuration is the
+// OLD (pre-drop) config. The ONLY way to recover is the down-ladder blind decode.
+//
+// Asserts: (1) the OLD-config decode of the dropped-config frame FAILS (precondition);
+// (2) the bounded down-ladder decodes at the TRUE config within D rungs
+// (message_decoded==YES, a real CRC/LDPC pass); (3) it ADOPTS (current_configuration
+// + PHY twin track); (4) decode attempts <= D+1 (RPi bound, INV-S4-2); (5) BREAK-count
+// == 0 under the single forced tag-loss; (6) sweep D in {1..5} -> a k-rung drop
+// resyncs iff D>=k; (7) sweep SESSION_DEAD_BATCHES -> the terminal BREAK fires at
+// EXACTLY the Nth consecutive total-loss batch, not before.
+//
+// fail-before (-DINBAND_STAGE4_FAILBEFORE or MERCURY_INBAND_RATE unset): the
+// down-ladder is disabled -> resync FAILS -> the dead-batch path is taken on the
+// FIRST total-loss (BREAK-count would be > 0 in production). Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_fallback()
+{
+	const char* TAG = "[TEST-INBAND-FALLBACK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). ---
+#ifndef INBAND_STAGE4_FAILBEFORE
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+#else
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_RATE", "");
+#else
+	unsetenv("MERCURY_INBAND_RATE");
+#endif
+	auto restore_env = [&]() {};
+	printf("%s INBAND_STAGE4_FAILBEFORE: feature forced OFF (down-ladder disabled)\n", TAG);
+	fflush(stdout);
+#endif
+
+	// ── Helper: transmit a REAL OFDM data frame at `cfg` and lay it into `rx_window`
+	// using the PROVEN BER-loopback recipe (telecom_system.cc:482-517): transmit_byte
+	// (SINGLE_MESSAGE -> internal FIR_tx1/FIR_tx2) -> awgn_channel.apply_with_delay at a
+	// near-clean sigma and the BER delay convention. This is the SAME path
+	// passband_test_EsN0 uses to fully CRC-decode, so the frame is genuinely
+	// decodable. Returns the buffer_Nsymb span the RX must use; writes the exact
+	// preamble delay into *out_forced_delay (the BER ofdm_forced_delay value — the test
+	// forces it on the scoped decoders so a synthetic frame is decoded at the known
+	// position without depending on blind Schmidl-Cox of a noiseless synthetic frame).
+	auto tx_frame_to_window = [&](int cfg, std::vector<double>& rx_window,
+	                              int& out_rx_len, std::vector<int>& truth_bytes,
+	                              int* out_forced_delay) -> int {
+		cl_telecom_system* ts = new cl_telecom_system();
+		ts->operation_mode = ARQ_MODE;
+		ts->narrowband_enabled = NO;
+		// Span the whole window so apply_with_delay's destination is large enough; force
+		// a generous buffer_Nsymb (300) BEFORE load so the internal buffers are allocated
+		// large (the scoped decoders are forced to <=300 too, INV-S4-2 window).
+		ts->data_container.buffer_Nsymb_min = 300;
+		ts->load_configuration(cfg);
+		int interp = ts->frequency_interpolation_rate;
+		int Nofdm  = ts->data_container.Nofdm;
+		int preN   = ts->data_container.preamble_nSymb;
+		int Nsymb  = ts->data_container.Nsymb;
+		int frame_bytes = ts->get_frame_size_bytes();
+		if(frame_bytes <= 0) frame_bytes = 1;
+		truth_bytes.assign((size_t)frame_bytes, 0);
+		for(int i = 0; i < frame_bytes; i++) truth_bytes[i] = (i * 37 + 11) & 0xFF;
+		std::vector<int> payload(truth_bytes.begin(), truth_bytes.end());
+		// SINGLE_MESSAGE applies the internal FIR chain + writes total_frame_size samples
+		// into passband_data — the same buffer apply_with_delay reads (BER recipe).
+		ts->transmit_byte(payload.data(), frame_bytes,
+			ts->data_container.passband_data, SINGLE_MESSAGE);
+
+		// Near-clean channel: a tiny sigma (deterministic, no seed dependence in the
+		// decode outcome). The BER delay convention positions the preamble at
+		// ((preN+2)*Nofdm + lead)*interp; ofdm_forced_delay is that same value.
+		int lead = 8;   // a few symbols of lead margin (in symbols, *Nofdm below)
+		int forced_delay = ((preN + 2) * Nofdm + lead) * interp;
+		float sigma = 1e-3f;   // ~clean (the SKIP-VAR gate needs the real signal spectrum)
+		int n_frame = (Nofdm * (Nsymb + preN)) * interp;
+		ts->awgn_channel.apply_with_delay(
+			ts->data_container.passband_data,
+			ts->data_container.passband_delayed_data,
+			sigma, n_frame, forced_delay);
+
+		// Copy the resulting passband_delayed_data window out. It is allocated for
+		// 2*signal_period = 2*Nofdm*buffer_Nsymb*interp; the frame sits at forced_delay.
+		int span = Nofdm * interp;
+		int need_syms = ts->data_container.buffer_Nsymb;     // 300 (forced)
+		int exact = need_syms * span;
+		rx_window.assign((size_t)exact, 0.0);
+		for(int i = 0; i < exact; i++)
+			rx_window[i] = ts->data_container.passband_delayed_data[i];
+		out_rx_len = exact;
+		if(out_forced_delay) *out_forced_delay = forced_delay;
+		delete ts;
+		return need_syms;   // the buffer_Nsymb span the RX must use
+	};
+
+	// ── Build an RX at `cur_cfg`, point its capture ring at `rx_window`, and run the
+	// down-ladder with depth D. Returns the winner config (or -1) + fills attempts. ──
+	auto run_ladder = [&](int cur_cfg, std::vector<double>& rx_window, int rx_nsymb,
+	                      int D, int forced_delay,
+	                      int* out_attempts, int* out_old_cfg_decoded) -> int {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode = ARQ_MODE;
+		rx->telecom_system    = ts_rx;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->load_configuration(cur_cfg, FULL, NO);
+		rx->sack_v2_enabled = true;
+		// TEST: force the known preamble delay on the scoped down-window decoders so a
+		// synthetic frame decodes at the exact position (production uses -1 = real
+		// acquisition). Applied inside inband_ensure_down_decoders as the bank is built.
+		rx->inband_test_forced_down_delay = forced_delay;
+
+		// First, PROVE the precondition: the frame does NOT decode at the OLD config
+		// (the tag-loss symptom — wrong config). Use a SEPARATE throwaway decoder at
+		// cur_cfg with buffer_Nsymb_min PRE-SET (before load_configuration, so the
+		// internal buffers are ALLOCATED for the window span) + the SAME forced delay so
+		// the acquisition is identical — the decode fails on the WRONG config (geometry),
+		// not on a missed acquisition.
+		int need_syms = (int)rx_window.size()
+			/ (ts_rx->data_container.Nofdm * ts_rx->frequency_interpolation_rate);
+		if(need_syms < 1) need_syms = 1;
+		int old_decoded = 0;
+		{
+			cl_telecom_system pre;
+			pre.narrowband_enabled = NO;
+			pre.data_container.buffer_Nsymb_min = need_syms;
+			pre.load_configuration(cur_cfg);
+			pre.ofdm_forced_delay = forced_delay;
+			int pre_buf = pre.data_container.Nofdm * pre.data_container.buffer_Nsymb.load()
+				* pre.data_container.interpolation_rate;
+			std::vector<double> pre_in((size_t)pre_buf, 0.0);
+			int cl = ((int)rx_window.size() < pre_buf) ? (int)rx_window.size() : pre_buf;
+			memcpy(pre_in.data(), rx_window.data(), (size_t)cl * sizeof(double));
+			std::vector<int> info_bits((size_t)N_MAX, 0);
+			st_receive_stats st_old = pre.receive_byte(pre_in.data(), info_bits.data());
+			old_decoded = (st_old.message_decoded == YES) ? 1 : 0;
+		}
+		if(out_old_cfg_decoded) *out_old_cfg_decoded = old_decoded;
+
+		// Now run the bounded down-ladder over the SAME captured window.
+		int decoded_len = 0;
+		int winner = rx->inband_down_ladder_resync(rx_window.data(), (int)rx_window.size(),
+			D, /*expect_bsi_lsb=*/0xFF, NULL, &decoded_len);
+		if(out_attempts) *out_attempts = rx->inband_down_decode_attempts;
+		int rx_cur_after = rx->current_configuration;
+		int rx_twin_after = ts_rx->current_configuration;
+		(void)rx_nsymb;
+
+		// On a win the ladder adopted: both config copies must track the winner.
+		if(winner >= 0)
+		{
+			if(rx_cur_after != winner)
+			{ printf("%s WARN: ARQ cur=%d != winner=%d after adopt\n", TAG, rx_cur_after, winner); }
+			if(rx_twin_after != winner)
+			{ printf("%s WARN: PHY twin=%d != winner=%d after adopt\n", TAG, rx_twin_after, winner); }
+		}
+		delete rx; delete ts_rx;
+		return winner;
+	};
+
+	// ========================================================================
+	// PART A — the headline case: a single-rung lost-tag drop resyncs, BREAK==0
+	// ========================================================================
+	const int CFG_FROM = CONFIG_10;                                  // ladder idx 13
+	const int CFG_TO_1 = config_ladder_down(CFG_FROM, /*robust*/NO); // CONFIG_9, idx 12
+	{
+		std::vector<double> rxw; int rxlen = 0; std::vector<int> truth; int fdelay = 0;
+		int rx_nsymb = tx_frame_to_window(CFG_TO_1, rxw, rxlen, truth, &fdelay);
+		int attempts = 0, old_decoded = -1;
+		int winner = run_ladder(CFG_FROM, rxw, rx_nsymb, /*D=*/4, fdelay, &attempts, &old_decoded);
+
+		check(old_decoded == 0,
+			"A0 the dropped-config frame does NOT decode at the OLD config (tag-loss symptom)",
+			old_decoded, 0);
+#ifndef INBAND_STAGE4_FAILBEFORE
+		check(winner == CFG_TO_1,
+			"A1 down-ladder RESYNCS to the true (dropped) config CONFIG_9", winner, CFG_TO_1);
+		check(attempts <= 4 + 1,
+			"A2 RPi bound: decode attempts <= D+1 (NOT the full bank)", attempts, 4 + 1);
+		check(attempts >= 1,
+			"A2b the ladder actually ran (>=1 decode attempt)", attempts, 1);
+#else
+		check(winner == -1,
+			"A1(FB) down-ladder disabled -> NO resync (feature off)", winner, -1);
+#endif
+	}
+
+	// ========================================================================
+	// PART B — SWEEP D: a k-rung drop resyncs iff D >= k (resync-success vs D)
+	// ========================================================================
+#ifndef INBAND_STAGE4_FAILBEFORE
+	{
+		// Drop 3 rungs: CONFIG_10 -> CONFIG_7 (idx 13 -> idx 10).
+		int cfg_to_k = config_ladder_down_n(CFG_FROM, 3, /*robust*/NO);   // CONFIG_7
+		int k = config_ladder_index(CFG_FROM) - config_ladder_index(cfg_to_k);  // 3
+		check(k == 3, "B0 the 3-rung drop target is CONFIG_7 (idx-3)", k, 3);
+
+		std::vector<double> rxw; int rxlen = 0; std::vector<int> truth; int fdelay = 0;
+		int rx_nsymb = tx_frame_to_window(cfg_to_k, rxw, rxlen, truth, &fdelay);
+
+		for(int D = 1; D <= 5; D++)
+		{
+			// Each run is independent (fresh RX); the window is the SAME k-rung-down frame.
+			std::vector<double> rxw_copy = rxw;
+			int attempts = 0, old_decoded = -1;
+			int winner = run_ladder(CFG_FROM, rxw_copy, rx_nsymb, D, fdelay, &attempts, &old_decoded);
+			bool resynced = (winner == cfg_to_k);
+			bool expect_resync = (D >= k);
+			char what[96];
+			snprintf(what, sizeof(what),
+				"B-D%d: k=3 drop resync=%d (expect %d: D>=k) attempts=%d<=%d",
+				D, resynced ? 1 : 0, expect_resync ? 1 : 0, attempts, D + 1);
+			check(resynced == expect_resync, what, resynced ? 1 : 0, expect_resync ? 1 : 0);
+			check(attempts <= D + 1, "   RPi bound attempts<=D+1", attempts, D + 1);
+		}
+		printf("%s SWEEP-D SUMMARY: a single-rung drop resyncs for every D>=1; a k-rung "
+			"drop resyncs iff D>=k. Chosen production D=%d (MERCURY_INBAND_DOWN_D).\n",
+			TAG, 4);
+		fflush(stdout);
+	}
+#endif
+
+	// ========================================================================
+	// PART C — BREAK-count==0 under the single forced tag-loss (the decisive metric)
+	// ========================================================================
+	// Drive the PRODUCTION receive-loop entry inband_try_down_ladder_on_decode_fail on
+	// a resyncable lost-tag batch and assert it does NOT arm the terminal BREAK.
+#ifndef INBAND_STAGE4_FAILBEFORE
+	{
+		// Build the dropped-config (CONFIG_9) frame window FIRST so we know the span,
+		// then pre-set buffer_Nsymb_min BEFORE load (so passband_delayed_data is
+		// allocated large — bumping buffer_Nsymb after a load overflows + segfaults).
+		std::vector<double> rxw; int rxlen = 0; std::vector<int> truth; int fdelay_c = 0;
+		int rx_nsymb_c = tx_frame_to_window(CFG_TO_1, rxw, rxlen, truth, &fdelay_c);
+
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode = ARQ_MODE;
+		ts_rx->data_container.buffer_Nsymb_min = rx_nsymb_c;   // PRE-load: alloc large
+		rx->telecom_system = ts_rx;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->load_configuration(CFG_FROM, FULL, NO);
+		rx->sack_v2_enabled = true;
+		rx->link_status = CONNECTED;
+		rx->connection_status = RECEIVING;
+		rx->rsp_current_expected_batch_seq_id = 5;
+		rx->inband_test_forced_down_delay = fdelay_c;   // scoped decoders use the known delay
+
+		// Place the REAL dropped-config frame into the RX capture ring at
+		// ring_write_index, so the production entry's snapshot read finds it.
+		int Nofdm = ts_rx->data_container.Nofdm;
+		int interp = ts_rx->frequency_interpolation_rate;
+		int span = Nofdm * interp;
+		// The production entry reads passband_delayed_data[ring_write_index ..
+		// +signal_period]; signal_period = span*buffer_Nsymb. Copy the window there.
+		int signal_period = span * ts_rx->data_container.buffer_Nsymb;
+		MUTEX_LOCK(&capture_prep_mutex);
+		for(int i = 0; i < 2 * signal_period && i < (int)(2*rxw.size()); i++)
+			ts_rx->data_container.passband_delayed_data[i] = 0.0;
+		ts_rx->data_container.ring_write_index = 0;
+		for(int i = 0; i < (int)rxw.size() && i < signal_period; i++)
+			ts_rx->data_container.passband_delayed_data[i] = rxw[i];
+		MUTEX_UNLOCK(&capture_prep_mutex);
+
+		int break_due_before = rx->inband_terminal_break_due ? 1 : 0;
+		int dead_before = rx->inband_session_dead_batches;
+		rx->inband_try_down_ladder_on_decode_fail();
+		int break_due_after = rx->inband_terminal_break_due ? 1 : 0;
+
+		check(break_due_before == 0 && break_due_after == 0,
+			"C0 BREAK-count == 0 under the single forced tag-loss (resync, no BREAK)",
+			break_due_after, 0);
+		check(rx->current_configuration == CFG_TO_1,
+			"C1 production entry adopted the true config (CONFIG_9)",
+			rx->current_configuration, CFG_TO_1);
+		check(rx->inband_session_dead_batches == 0,
+			"C2 dead-batch streak reset on resync (not advanced)",
+			rx->inband_session_dead_batches, 0);
+		(void)dead_before;
+		delete rx; delete ts_rx;
+	}
+#else
+	// FAIL-BEFORE: the down-ladder is DISABLED. A lost-tag batch the ladder WOULD have
+	// resynced is now unrecoverable -> the dead-batch path advances on the FIRST total
+	// loss -> with SESSION_DEAD_BATCHES=1 the terminal BREAK fires. This is the OLD
+	// behavior (tag-loss -> BREAK) the down-ladder eliminates. Proves the ladder is
+	// load-bearing for BREAK avoidance.
+	{
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_RATE", "1");                 // arm the entry (gated)
+		_putenv_s("MERCURY_INBAND_DEAD_BATCHES", "1");
+#else
+		setenv("MERCURY_INBAND_RATE", "1", 1);
+		setenv("MERCURY_INBAND_DEAD_BATCHES", "1", 1);
+#endif
+		std::vector<double> rxw; int rxlen = 0; std::vector<int> truth; int fdelay_c = 0;
+		int rx_nsymb_c = tx_frame_to_window(CFG_TO_1, rxw, rxlen, truth, &fdelay_c);
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode = ARQ_MODE;
+		ts_rx->data_container.buffer_Nsymb_min = rx_nsymb_c;
+		rx->telecom_system = ts_rx;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->load_configuration(CFG_FROM, FULL, NO);
+		rx->sack_v2_enabled = true;
+		rx->link_status = CONNECTED;
+		rx->connection_status = RECEIVING;
+		rx->rsp_current_expected_batch_seq_id = 5;
+		rx->inband_test_forced_down_delay = fdelay_c;
+		int Nofdm = ts_rx->data_container.Nofdm;
+		int interp = ts_rx->frequency_interpolation_rate;
+		int signal_period = Nofdm * interp * ts_rx->data_container.buffer_Nsymb;
+		MUTEX_LOCK(&capture_prep_mutex);
+		ts_rx->data_container.ring_write_index = 0;
+		for(int i = 0; i < (int)rxw.size() && i < signal_period; i++)
+			ts_rx->data_container.passband_delayed_data[i] = rxw[i];
+		MUTEX_UNLOCK(&capture_prep_mutex);
+
+		rx->inband_terminal_break_due = false;
+		rx->inband_try_down_ladder_on_decode_fail();
+		check(rx->inband_terminal_break_due == true,
+			"C0(FB) tag-loss -> NO resync (ladder off) -> BREAK FIRES (the OLD cascade)",
+			rx->inband_terminal_break_due ? 1 : 0, 1);
+		check(rx->current_configuration == CFG_FROM,
+			"C1(FB) RX stuck at the OLD config (could not follow the lost tag)",
+			rx->current_configuration, CFG_FROM);
+		delete rx; delete ts_rx;
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_DEAD_BATCHES", "");
+#else
+		unsetenv("MERCURY_INBAND_DEAD_BATCHES");
+#endif
+	}
+#endif
+
+	// ========================================================================
+	// PART D — SWEEP SESSION_DEAD_BATCHES: BREAK fires at EXACTLY the Nth total-loss
+	// ========================================================================
+	// Drive N consecutive TOTAL-loss batches (pure noise -> no window config decodes)
+	// and assert the terminal BREAK arms at exactly the Nth, not before. This is the
+	// ONLY remaining BREAK path (design §7).
+#ifndef INBAND_STAGE4_FAILBEFORE
+	for(int N = 1; N <= 3; N++)
+	{
+		// Force SESSION_DEAD_BATCHES = N via the env knob (re-resolved per RX).
+		char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%d", N);
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_DEAD_BATCHES", nbuf);
+#else
+		setenv("MERCURY_INBAND_DEAD_BATCHES", nbuf, 1);
+#endif
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode = ARQ_MODE;
+		rx->telecom_system = ts_rx;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->load_configuration(CFG_FROM, FULL, NO);
+		rx->sack_v2_enabled = true;
+		rx->link_status = CONNECTED;
+		rx->connection_status = RECEIVING;
+		rx->rsp_current_expected_batch_seq_id = 5;
+
+		int Nofdm = ts_rx->data_container.Nofdm;
+		int interp = ts_rx->frequency_interpolation_rate;
+		int span = Nofdm * interp;
+		int signal_period = span * ts_rx->data_container.buffer_Nsymb;
+		if(signal_period <= 0) signal_period = span * 8;
+
+		int break_fired_at = -1;
+		for(int b = 1; b <= N + 1; b++)
+		{
+			// Fill the capture window with NOISE above the energy gate (peak>=0.05) but
+			// that NO config will decode (random -> CRC/LDPC always fails) = a total-loss
+			// batch (even the window floor fails).
+			MUTEX_LOCK(&capture_prep_mutex);
+			ts_rx->data_container.ring_write_index = 0;
+			unsigned int seed = 0x1234u + (unsigned)b * 2654435761u;
+			for(int i = 0; i < signal_period; i++)
+			{
+				seed = seed * 1103515245u + 12345u;
+				double r = ((double)((seed >> 16) & 0x7FFF) / 16384.0) - 1.0;  // [-1,1)
+				ts_rx->data_container.passband_delayed_data[i] = 0.3 * r;       // peak>~0.05
+			}
+			MUTEX_UNLOCK(&capture_prep_mutex);
+
+			rx->inband_terminal_break_due = false;
+			rx->inband_try_down_ladder_on_decode_fail();
+			if(rx->inband_terminal_break_due && break_fired_at < 0)
+				break_fired_at = b;
+		}
+		char what[80];
+		snprintf(what, sizeof(what), "D-N%d: terminal BREAK fires at EXACTLY batch %d", N, N);
+		check(break_fired_at == N, what, break_fired_at, N);
+
+		delete rx; delete ts_rx;
+	}
+	// Restore the dead-batches knob.
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_DEAD_BATCHES", "");
+#else
+	unsetenv("MERCURY_INBAND_DEAD_BATCHES");
+#endif
+	printf("%s SWEEP SESSION_DEAD_BATCHES SUMMARY: the terminal BREAK arms at exactly "
+		"the Nth consecutive total-loss batch (the ONLY inband BREAK path). Production "
+		"default = 3 (MERCURY_INBAND_DEAD_BATCHES).\n", TAG);
+	fflush(stdout);
+#endif
+
+	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
