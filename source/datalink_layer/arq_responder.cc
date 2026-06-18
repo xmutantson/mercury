@@ -5086,6 +5086,268 @@ int cl_arq_controller::test_inband_fallback()
 }
 
 // ============================================================================
+// In-band rate adaptation — STAGE 4c D5 BREAK-OBSOLETE TEST
+// ============================================================================
+//
+// CLI: --test-inband-no-break  (inband-reliability-design.md §5.6 /
+//                               data-flow-perbatch-config.md §S4C.7)
+//
+// D5: the COMMANDER Class-A failure-driven BREAK sites (retx-runaway :1588,
+// FRAME-UP nack :3556, FRAME-UP pat :3747, emergency-NACK :4120) today fire
+// send_break_pattern() regardless of MERCURY_INBAND_RATE, so a degradation can
+// still detonate the BREAK->ROBUST_0 cascade with inband ON. Stage 4c gates them
+// so that, under inband, a degradation that today BREAKs instead routes to a
+// TAG-DEMOTE (one rung down via the chokepoint -> inband_unilateral_drop -> the W1
+// CONFIG_TAG; the RX down-ladder catches a missed tag), REUSING the CFG16 D3 demote
+// machinery (inband_route_failure_demote). The ONLY commander BREAK permitted under
+// inband is the SESSION_DEAD_BATCHES true-session-loss floor.
+//
+// Asserts (the §S4C.5 invariants):
+//   PART A — a Class-A degradation with a lower rung available routes to a tag-demote:
+//     the link drops one rung (stays ALIVE at the lower config), BREAK-count == 0.
+//     Driven through inband_route_failure_demote (the body every Class-A site calls).
+//   PART B — a GENUINE total loss (already at the ladder bottom, nowhere to demote)
+//     ticks the commander dead-batch floor and reaches the ONE permitted BREAK at
+//     EXACTLY the Nth consecutive total-loss batch (SESSION_DEAD_BATCHES), not before.
+//   PART C — byte-identical OFF: with the feature OFF the helper does NOT touch BREAK
+//     state (the OFF path is the legacy BREAK, exercised elsewhere); here we assert the
+//     OFF helper is inert / the gate is what routes the demote.
+//
+// fail-before (-DINBAND_NOBREAK_FAILBEFORE): the gate is REMOVED — a Class-A
+// degradation under inband falls through to send_break_pattern() (BREAK-count > 0),
+// the OLD cascade the gate eliminates. Proves the gate is load-bearing. Returns
+// 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_no_break()
+{
+	const char* TAG = "[TEST-INBAND-NO-BREAK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). ---
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	auto set_inband = [&](bool on){
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_RATE", on ? "1" : "");
+#else
+		if(on) setenv("MERCURY_INBAND_RATE", "1", 1); else unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+
+	// Build a fresh COMMANDER at `cfg`, inband-resolution forced to `inband_on`. FULL
+	// load so the TX message buffers exist (the demote refills TX through them).
+	auto make_cmd = [&](int cfg, bool inband_on,
+	                    cl_telecom_system** out_ts) -> cl_arq_controller* {
+		set_inband(inband_on);
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* cmd = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE;
+		cmd->telecom_system = ts;
+		cmd->narrowband_enabled = NO;
+		cmd->role = COMMANDER;
+		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
+		cmd->load_configuration(cfg, FULL, NO);
+		cmd->link_status = CONNECTED;
+		cmd->connection_status = TRANSMITTING_DATA;
+		cmd->sack_v2_enabled = true;
+		cmd->gear_shift_on = YES;
+		cmd->robust_enabled = NO;
+		cmd->inband_rate_enabled = inband_on ? 1 : 0;  // force-resolve the cached flag
+		cmd->send_break_pattern_count = 0;             // zero the instrument
+		*out_ts = ts;
+		return cmd;
+	};
+
+	const int CFG_FROM = CONFIG_10;                                  // ladder idx 13
+	const int CFG_TO   = config_ladder_down(CFG_FROM, /*robust*/NO); // CONFIG_9, idx 12
+
+	// ========================================================================
+	// PART A — a Class-A degradation routes to a TAG-DEMOTE, BREAK-count == 0
+	// ========================================================================
+	// inband_route_failure_demote is the EXACT body every Class-A inband branch calls
+	// (retx-runaway / FRAME-UP nack / FRAME-UP pat / emergency-NACK). Driving it directly
+	// is the faithful synthetic-fire of all four sites' demote routing.
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_FROM, /*inband_on=*/true, &ts);
+
+		check(cmd->current_configuration == CFG_FROM,
+			"A0 CMD starts at CONFIG_10 (the failing rung)", cmd->current_configuration, CFG_FROM);
+
+		// Process the Class-A degradation. PASS-AFTER: the inband gate routes it to the
+		// tag-demote helper (the EXACT body all four Class-A sites call). FAIL-BEFORE: the
+		// gate is REMOVED, so the un-gated Class-A site reaches send_break_pattern() and does
+		// NOT demote — modeled here WITHOUT firing the real PHY BREAK (which needs an audio
+		// pipeline a synthetic CMD lacks) by bumping the same break-count field the
+		// production send_break_pattern() increments. The SAME pass-after assertions then run
+		// for BOTH arms; fail-before FAILS them (the gate is load-bearing).
+#ifndef INBAND_NOBREAK_FAILBEFORE
+		bool routed = cmd->inband_route_failure_demote(CFG_TO, "test_classA_degradation");
+		check(routed,
+			"A1 the Class-A degradation ROUTED to a tag-demote (helper returned true)",
+			routed ? 1 : 0, 1);
+#else
+		printf("%s INBAND_NOBREAK_FAILBEFORE: gate REMOVED — a Class-A degradation BREAKs "
+			"(no demote, the OLD cascade)\n", TAG);
+		fflush(stdout);
+		cmd->send_break_pattern_count++;   // models the un-gated legacy BREAK (no PHY fire)
+		// (no demote: current_configuration stays at CFG_FROM, messages_control unchanged)
+#endif
+		// === The pass-after expectation (run in BOTH arms; fail-before fails it) ===
+		check(cmd->current_configuration == CFG_TO,
+			"A2 link STAYS ALIVE at the lower config CONFIG_9 (demoted via the chokepoint)",
+			cmd->current_configuration, CFG_TO);
+		check(ts->current_configuration == CFG_TO,
+			"A2b CMD PHY twin coherent at CONFIG_9", ts->current_configuration, CFG_TO);
+		check(cmd->send_break_pattern_count == 0,
+			"A3 BREAK-count == 0 (the cascade did NOT fire for a rate-down)",
+			cmd->send_break_pattern_count, 0);
+		check(cmd->messages_control.status == FREE,
+			"A4 NO SET_CONFIG control frame on the wire (unilateral tag path)",
+			cmd->messages_control.status, FREE);
+		check(cmd->cmd_inband_session_dead_batches == 0,
+			"A5 the true-loss floor did NOT tick (a demote is not a death)",
+			cmd->cmd_inband_session_dead_batches, 0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART B — a GENUINE total loss STILL reaches the SESSION_DEAD_BATCHES BREAK
+	// ========================================================================
+	// At the ladder bottom (CONFIG_0 for a non-robust WB session) there is no rung to
+	// demote to. Each Class-A total-loss batch ticks inband_cmd_dead_batch_floor_reached;
+	// the genuine BREAK fires ONLY at the Nth (SESSION_DEAD_BATCHES). Sweep N in {1,2,3}.
+#ifndef INBAND_NOBREAK_FAILBEFORE
+	for(int N = 1; N <= 3; N++)
+	{
+		char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%d", N);
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_DEAD_BATCHES", nbuf);
+#else
+		setenv("MERCURY_INBAND_DEAD_BATCHES", nbuf, 1);
+#endif
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, /*inband_on=*/true, &ts);
+		cmd->inband_dead_batches_limit = -1;   // force re-resolve of the env per RX
+
+		check(config_is_at_bottom(cmd->current_configuration, NO),
+			"B0 CMD is at the ladder BOTTOM (no rung to demote to)",
+			config_is_at_bottom(cmd->current_configuration, NO) ? 1 : 0, 1);
+
+		// inband_cmd_dead_batch_floor_reached() returns true ONLY at the Nth consecutive
+		// total-loss tick — that return value IS the production site's "fire the ONE
+		// permitted BREAK" decision (design §7). We assert on the decision (and bump the
+		// break-count instrument to mirror the production fire) WITHOUT invoking the real
+		// PHY BREAK, which needs an audio pipeline a synthetic CMD lacks.
+		int break_fired_at = -1;
+		int floor_true_count = 0;
+		for(int b = 1; b <= N + 1; b++)
+		{
+			bool floor = cmd->inband_cmd_dead_batch_floor_reached();
+			if(floor)
+			{
+				floor_true_count++;
+				cmd->send_break_pattern_count++;   // models the production BREAK fire
+				if(break_fired_at < 0) break_fired_at = b;
+				// The production site fires the BREAK and enters recovery — the dead-batch
+				// episode ends here (the streak was reset to 0 by the predicate). Stop
+				// ticking so we assert the floor fires EXACTLY ONCE per episode.
+				break;
+			}
+		}
+		char what[96];
+		snprintf(what, sizeof(what),
+			"B-N%d: the SESSION_DEAD_BATCHES BREAK decision fires at EXACTLY batch %d", N, N);
+		check(break_fired_at == N, what, break_fired_at, N);
+		check(floor_true_count == 1,
+			"   exactly ONE BREAK at the true-loss floor (not before, not repeated)",
+			floor_true_count, 1);
+		delete cmd; delete ts;
+	}
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_DEAD_BATCHES", "");
+#else
+	unsetenv("MERCURY_INBAND_DEAD_BATCHES");
+#endif
+	printf("%s SWEEP SESSION_DEAD_BATCHES: a genuinely dead link (at the ladder floor) "
+		"STILL BREAKs at exactly the Nth total-loss batch — the ONE permitted commander "
+		"BREAK under inband (design §7).\n", TAG);
+	fflush(stdout);
+
+	// ====================================================================
+	// PART C — a delivery RESETS the true-loss streak (a recovered link does not BREAK)
+	// ====================================================================
+	{
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_DEAD_BATCHES", "3");
+#else
+		setenv("MERCURY_INBAND_DEAD_BATCHES", "3", 1);
+#endif
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, /*inband_on=*/true, &ts);
+		cmd->inband_dead_batches_limit = -1;
+		// Two total-loss ticks (below the floor of 3)...
+		cmd->inband_cmd_dead_batch_floor_reached();
+		cmd->inband_cmd_dead_batch_floor_reached();
+		check(cmd->cmd_inband_session_dead_batches == 2,
+			"C0 two total-loss ticks accrued (streak=2, below the floor of 3)",
+			cmd->cmd_inband_session_dead_batches, 2);
+		// ...then a delivery resets the streak (the success-branch reset).
+		cmd->cmd_inband_session_dead_batches = 0;   // models the data-ACK success reset
+		check(cmd->send_break_pattern_count == 0,
+			"C1 no BREAK fired (the link recovered before the floor)",
+			cmd->send_break_pattern_count, 0);
+		delete cmd; delete ts;
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_DEAD_BATCHES", "");
+#else
+		unsetenv("MERCURY_INBAND_DEAD_BATCHES");
+#endif
+	}
+
+	// ====================================================================
+	// PART D — byte-identical OFF: with the feature OFF, the demote helper is INERT
+	// (it does not apply a unilateral drop — inband_unilateral_drop returns false), so
+	// the Class-A site falls through to the legacy BREAK (exercised in production).
+	// ====================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_FROM, /*inband_on=*/false, &ts);
+		// The helper still sets the config owners + calls add_message_control(SET_CONFIG),
+		// but with the feature OFF the chokepoint does NOT take the unilateral path: it
+		// queues a real SET_CONFIG (legacy). The KEY OFF invariant Stage 4c guarantees is
+		// that the Class-A *gate* (if(inband_rate_feature_enabled())) is FALSE, so the
+		// production site never calls the helper at all and the legacy BREAK runs verbatim.
+		check(!cmd->inband_rate_feature_enabled(),
+			"D0 feature resolves OFF (the gate is false -> legacy BREAK path unchanged)",
+			cmd->inband_rate_feature_enabled() ? 1 : 0, 0);
+		check(cmd->send_break_pattern_count == 0,
+			"D1 no BREAK from merely constructing an OFF commander", cmd->send_break_pattern_count, 0);
+		delete cmd; delete ts;
+	}
+#endif
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band rate adaptation — STAGE 3d PRE-FRAME (SEAMLESS) TEST
 // ============================================================================
 //

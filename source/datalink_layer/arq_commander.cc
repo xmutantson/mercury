@@ -1590,6 +1590,43 @@ void cl_arq_controller::process_messages_tx_data()
 		   && turboshift_phase == TURBO_DONE
 		   && gear_shift_on == YES)
 		{
+			// STAGE 4c — Class-A site A1 (retx-queue runaway). Under inband, the collapsed
+			// retx queue DEMOTES one rung via the CONFIG_TAG (the demote's clear_retx_queue
+			// flushes the runaway queue) instead of BREAKing; at the bottom it ticks the
+			// true-loss floor and BREAKs only at SESSION_DEAD_BATCHES. Byte-identical OFF.
+			if(inband_rate_feature_enabled())
+			{
+				int working_config = config_ladder_down(data_configuration, robust_enabled);
+				if(working_config != data_configuration
+				   && inband_route_failure_demote(working_config, "retx_queue_runaway"))
+					return;
+				// At the bottom (no lower rung): tick the dead-batch floor; BREAK only at N.
+				if(inband_cmd_dead_batch_floor_reached())
+				{
+					for(int i=0; i<nMessages; i++)
+					{
+						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+							fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
+						messages_tx[i].status = FREE;
+					}
+					fifo_buffer_backup.flush();
+					block_under_tx = NO;
+					retransmit_count = 0;
+					emergency_previous_config = current_configuration;
+					emergency_break_active = 1;
+					emergency_break_retries = 3;
+					emergency_nack_count = 0;
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							working_config, "inband_session_dead_batches_floor");
+					send_break_pattern();
+					telecom_system->data_container.frames_to_read = 4;
+					calculate_receiving_timeout();
+					receiving_timer.start();
+				}
+				return;
+			}
+
 			printf("[BREAK] retx queue runaway (count=%d, threshold=2*batch=%d) — "
 				"channel collapsed, forcing BREAK\n",
 				retransmit_count, 2 * data_batch_size);
@@ -2716,6 +2753,158 @@ void cl_arq_controller::process_messages_rx_acks_control()
 	}
 }
 
+// ============================================================================
+// STAGE 4c — D5: BREAK truly obsolete. The reusable tag-demote that replaces a
+// COMMANDER Class-A send_break_pattern() under inband.
+// (inband-reliability-design.md §5.3 / data-flow-perbatch-config.md §S4C.)
+// ============================================================================
+// Lifts the CFG16 D3 reverse-ACK demote body (arq_commander.cc:3978-4117) into ONE
+// helper so each Class-A site routes a degradation to a TAGGED demote instead of the
+// BREAK->ROBUST cascade. The structure is VERBATIM from D3:
+//   1. lossless bsi rollback (cmd_batch_seq_id <- earliest in-flight bsi) so the
+//      re-sent batch is contiguous with the RSP delivery high-water (no D3.1 GAP-ABORT),
+//   2. FIFO push-back / restore_tx_from_compressed (preserve in-flight bytes),
+//   3. set the config owners to demote_target (so the chokepoint at :736-739 reads
+//      negotiated_configuration -> inband_unilateral_drop(demote_target) -> tag),
+//   4. pin supershift_proven_ceiling, reset the nack + revack-starve streaks,
+//   5. policy_axis1_supremacy_on_move (keep the optimizer cooldown coherent),
+//   6. add_message_control(SET_CONFIG) (under inband: the unilateral drop + W1 tag)
+//      + connection_status=TRANSMITTING_CONTROL.
+// NO send_break_pattern, NO emergency_break_active. The caller `return`s after this.
+bool cl_arq_controller::inband_route_failure_demote(int demote_target, const char* reason)
+{
+	if(demote_target < 0 || demote_target == current_configuration)
+		return false;   // no lower rung / no-op — caller must route to the dead-batch floor
+
+	printf("[INBAND-NOBREAK] Class-A degradation (%s): demoting %d -> %d via the CONFIG_TAG "
+		"(NOT the BREAK->ROBUST cascade); the RX down-ladder catches a missed tag\n",
+		reason ? reason : "?", current_configuration, demote_target);
+	fflush(stdout);
+
+	// (1) LOSSLESS DEMOTE bsi rollback — capture the earliest in-flight bsi BEFORE we
+	// free messages_tx[] (the v2 in-order path only; the compression path owns its own
+	// re-stage). Identical to the D3 demote (:4018-4038). All non-FREE frames of the
+	// stranded block share one batch_seq_id on the per-frame path; keep the mod-256
+	// earliest.
+	int min_inflight_bsi = -1;
+	if(sack_v2_enabled && !compression_enabled)
+	{
+		for(int i=0; i<nMessages; i++)
+		{
+			if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+			{
+				int b = messages_tx[i].batch_seq_id & 0xFF;
+				if(min_inflight_bsi < 0)
+					min_inflight_bsi = b;
+				else
+				{
+					unsigned fwd = ((unsigned)(min_inflight_bsi - b)) & 0xFFu;
+					if(fwd >= 1u && fwd <= 128u)
+						min_inflight_bsi = b;
+				}
+			}
+		}
+	}
+
+	// (2) Preserve all pending data for resend at the demoted rung — the SAME FIFO
+	// push-back the BREAK paths + D3 demote use, so no bytes are dropped.
+	if(compression_enabled)
+	{
+		restore_tx_from_compressed();
+	}
+	else
+	{
+		for(int i=0; i<nMessages; i++)
+		{
+			if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+				fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
+			messages_tx[i].status = FREE;
+		}
+		fifo_buffer_backup.flush();
+		clear_retx_queue();   // recovery re-queues plaintext; drop stale retx
+	}
+	block_under_tx = NO;
+
+	// Roll the bsi epoch back to the in-flight batch so the re-sent batch is CONTIGUOUS
+	// with the RSP delivery high-water (D3 :4062-4069). Only when an in-flight bsi was
+	// actually captured (else leave the counter untouched).
+	if(min_inflight_bsi >= 0)
+	{
+		printf("[INBAND-NOBREAK] LOSSLESS DEMOTE: rolling cmd_batch_seq_id %d -> %d "
+			"so the re-sent batch carries the in-flight (contiguous) bsi (no D3.1 GAP-ABORT)\n",
+			cmd_batch_seq_id & 0xFF, min_inflight_bsi);
+		fflush(stdout);
+		cmd_batch_seq_id = min_inflight_bsi;
+	}
+
+	// (3) Advance the config owners. negotiated_configuration is what the chokepoint
+	// (add_message_control SET_CONFIG, :736-739, SUCCESS_BASED_LADDER path) reads as the
+	// inband target. (4) Pin the proven ceiling so the SNR re-trigger does not
+	// immediately re-elect the failing rung. (D3 :4075-4077.)
+	data_configuration       = demote_target;
+	negotiated_configuration = demote_target;
+	supershift_proven_ceiling = demote_target;
+
+	// Consume the deadline: clear BOTH the nack streak and the revack-starve streak so a
+	// fresh per-frame failure re-accumulates from 1. (D3 :4100-4101.)
+	cfg16_revack_starve_fails = 0;
+	emergency_nack_count = 0;
+
+	// (5) Optimizer Axis-1 supremacy hook (a config MOVE; mirrors the BREAK paths + D3).
+	// CROSS-LAYER NOTE (CLAUDE.md §5): when Axis-3 was ON/OFF this hook transitions it to
+	// PROBE and tries to queue a SET_LINK_PARAMS (axis3_send_set_link_params, :14834), which
+	// would OCCUPY messages_control and block the SET_CONFIG demote below. The SET_LINK_PARAMS
+	// is best-effort (the helper's own busy-check + the EOB-self-correct safety net cover a
+	// skipped one, :6628), but the SET_CONFIG demote is LOAD-BEARING (it IS the tag/transition).
+	// So the demote takes priority: we clear any supremacy-queued SET_LINK_PARAMS before
+	// queueing the SET_CONFIG. (In the production D3-demote context Axis-3 is already PROBE so
+	// nothing is queued; this guard makes the reused helper robust to the ON/OFF case too.)
+	if(sack_v2_enabled)
+		policy_axis1_supremacy_on_move(current_configuration, demote_target, reason);
+	if(messages_control.status != FREE && messages_control.data != NULL
+	   && messages_control.length > 0 && messages_control.data[0] == SET_LINK_PARAMS)
+	{
+		// A supremacy-queued SET_LINK_PARAMS — defer it to the next cycle so the SET_CONFIG
+		// demote (the load-bearing transition) wins the single control slot this batch.
+		messages_control.status = FREE;
+		messages_control.type   = NONE;
+	}
+
+	// (6) Emit the demote through the CHOKEPOINT. Under inband, add_message_control(
+	// SET_CONFIG) takes the unilateral path (inband_unilateral_drop(negotiated_configuration))
+	// which applies the config NOW and the next send_batch W1-emits the CONFIG_TAG; the
+	// inband_unilateral_armed one-shot re-routes connection_status back to TRANSMITTING_DATA
+	// in process_messages_tx_control. Mirrors the D3 demote (:4113-4115) exactly.
+	cleanup();
+	add_message_control(SET_CONFIG);
+	this->connection_status = TRANSMITTING_CONTROL;
+	return true;
+}
+
+// STAGE 4c — the commander-side true-session-loss floor (the ONLY commander BREAK
+// permitted under inband). A Class-A degradation that occurs WHILE already at the
+// ladder bottom (nowhere to demote to) is a true-loss tick. Increment the streak; the
+// genuine send_break_pattern() fires ONLY when it reaches SESSION_DEAD_BATCHES (the SAME
+// MERCURY_INBAND_DEAD_BATCHES the RX terminal floor uses, so both sides break together).
+bool cl_arq_controller::inband_cmd_dead_batch_floor_reached()
+{
+	cmd_inband_session_dead_batches++;
+	int limit = inband_session_dead_limit();   // shared MERCURY_INBAND_DEAD_BATCHES, default 3
+	printf("[INBAND-NOBREAK] true-loss tick: at ladder bottom, no rung to demote — "
+		"commander dead-batch streak %d/%d\n",
+		cmd_inband_session_dead_batches, limit);
+	fflush(stdout);
+	if(cmd_inband_session_dead_batches >= limit)
+	{
+		printf("[INBAND-NOBREAK] SESSION_DEAD_BATCHES floor reached (%d) — the link is "
+			"genuinely dead; the ONE permitted BREAK fires (design §7)\n", limit);
+		fflush(stdout);
+		cmd_inband_session_dead_batches = 0;   // armed once; reset so BREAK isn't re-fired
+		return true;
+	}
+	return false;
+}
+
 void cl_arq_controller::process_messages_rx_acks_data()
 {
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
@@ -3563,6 +3752,38 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			int working_config = config_ladder_down(data_configuration, robust_enabled);
 			frame_shift_threshold *= 2;
 
+			// STAGE 4c — Class-A site A2 (FRAME-UP data fail, nack). Under inband, the
+			// failed up-probe DEMOTES one rung via the CONFIG_TAG instead of BREAKing. The
+			// gearshift bookkeeping above (frame_gearshift reset + probe_backoff_arm +
+			// frame_shift_threshold) already ran (it must — the probe DID fail). If
+			// working_config is a real lower rung, tag-demote; if it equals data_configuration
+			// (already at the bottom), route to the true-loss floor. Byte-identical OFF.
+			if(inband_rate_feature_enabled())
+			{
+				if(working_config != data_configuration
+				   && inband_route_failure_demote(working_config, "frame_gearshift_data_failed_nack"))
+					return;
+				// At the bottom (no lower rung): tick the dead-batch floor; BREAK only at N.
+				if(inband_cmd_dead_batch_floor_reached())
+				{
+					emergency_previous_config = current_configuration;
+					emergency_break_active = 1;
+					emergency_break_retries = 1;
+					emergency_nack_count = 0;
+					cfg16_revack_starve_fails = 0;
+					data_ack_retx_turnaround = false;
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							working_config, "inband_session_dead_batches_floor");
+					send_break_pattern();
+					telecom_system->data_container.frames_to_read = 4;
+					calculate_receiving_timeout();
+					receiving_timer.start();
+				}
+				// Below the floor (or demote took it): do not run the legacy BREAK.
+				return;
+			}
+
 			// This config failed during data — cap future SUPERSHIFT attempts
 			if(supershift_proven_ceiling < 0 || working_config < supershift_proven_ceiling)
 				supershift_proven_ceiling = working_config;
@@ -3754,6 +3975,33 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				probe_backoff_arm(data_configuration);
 				int working_config = config_ladder_down(data_configuration, robust_enabled);
 				frame_shift_threshold *= 2;
+
+				// STAGE 4c — Class-A site A3 (FRAME-UP data fail, pat). Same routing as A2:
+				// under inband the failed up-probe DEMOTES one rung via the CONFIG_TAG; at the
+				// bottom it ticks the true-loss floor and BREAKs only at SESSION_DEAD_BATCHES.
+				// Byte-identical OFF.
+				if(inband_rate_feature_enabled())
+				{
+					if(working_config != data_configuration
+					   && inband_route_failure_demote(working_config, "frame_gearshift_data_failed_pat"))
+						return;
+					if(inband_cmd_dead_batch_floor_reached())
+					{
+						emergency_previous_config = current_configuration;
+						emergency_break_active = 1;
+						emergency_break_retries = 3;
+						emergency_nack_count = 0;
+						cfg16_revack_starve_fails = 0;
+						if(sack_v2_enabled)
+							policy_axis1_supremacy_on_move(current_configuration,
+								working_config, "inband_session_dead_batches_floor");
+						send_break_pattern();
+						telecom_system->data_container.frames_to_read = 4;
+						calculate_receiving_timeout();
+						receiving_timer.start();
+					}
+					return;
+				}
 
 				printf("[GEARSHIFT] FRAME UP DATA FAILED (pat): config %d -> BREAK to %d (threshold %d)\n",
 					data_configuration, working_config, frame_shift_threshold);
@@ -4124,6 +4372,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			   && turboshift_phase == TURBO_DONE
 			   && gear_shift_on == YES)
 			{
+				// STAGE 4c — Class-A site A4 (emergency-NACK threshold). Under inband, a
+				// degradation that today BREAKs instead routes to a TAG-DEMOTE one rung down
+				// (the RX down-ladder catches a missed tag) — NEVER the BREAK->ROBUST cascade.
+				// We are NOT at the ladder bottom here (the outer guard), so a lower rung
+				// exists. Byte-identical when the feature is OFF (the legacy BREAK below runs
+				// unchanged). (data-flow-perbatch-config.md §S4C, design §5.3.)
+				if(inband_rate_feature_enabled())
+				{
+					int demote_target = config_ladder_down(current_configuration, robust_enabled);
+					if(inband_route_failure_demote(demote_target, "emergency_nack_threshold"))
+						return;
+					// Same-config / no-op (should not happen with the outer not-at-bottom
+					// guard) — fall through to the legacy BREAK as a safety net.
+				}
 				// WALL-B FIX-9 D3 (P4): a genuine BREAK is firing (D3 did NOT pre-empt — either not
 				// CFG16, the anchor was not CFG16, the ACK was garbled-not-silent, or framing was
 				// live). The link is about to leave CFG16 via BREAK recovery, so the reverse-ACK
@@ -4225,6 +4487,40 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				receiving_timer.start();
 				return;
 			}
+			// STAGE 4c — the commander-side TRUE-SESSION-LOSS floor (design §5.4 / §7).
+			// The BREAK guard above is FALSE because the link is already at the ladder
+			// bottom (config_is_at_bottom) — there is no rung left to tag-demote to. Under
+			// inband this is the ONLY place a commander BREAK is permitted: tick the
+			// dead-batch streak and fire send_break_pattern() ONLY when it reaches
+			// SESSION_DEAD_BATCHES (the SAME MERCURY_INBAND_DEAD_BATCHES the RX terminal
+			// floor uses). When the feature is OFF this branch is inert (the OFF path never
+			// reaches here under inband semantics — config_is_at_bottom OFF just retransmits,
+			// byte-identical). Gated on inband + the same BREAK preconditions so non-inband
+			// at-bottom operation is unchanged.
+			else if(inband_rate_feature_enabled()
+			        && emergency_nack_count >= emergency_nack_threshold
+			        && config_is_at_bottom(current_configuration, robust_enabled)
+			        && !emergency_break_active
+			        && turboshift_phase == TURBO_DONE
+			        && gear_shift_on == YES)
+			{
+				if(inband_cmd_dead_batch_floor_reached())
+				{
+					// Genuinely dead link at the floor — the ONE permitted BREAK (design §7).
+					emergency_previous_config = current_configuration;
+					emergency_break_active = 1;
+					emergency_break_retries = 3;
+					if(sack_v2_enabled)
+						policy_axis1_supremacy_on_move(current_configuration,
+							current_configuration, "inband_session_dead_batches_floor");
+					send_break_pattern();
+					telecom_system->data_container.frames_to_read = 4;
+					calculate_receiving_timeout();
+					receiving_timer.start();
+					return;
+				}
+				// Below the floor: keep retrying at the bottom rung (no BREAK yet).
+			}
 		}
 		else
 		{
@@ -4232,6 +4528,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
+			// STAGE 4c: any delivery (clean OR partial) proves the link is NOT dead, so
+			// the commander true-loss floor streak resets UNGATED (symmetric with
+			// emergency_nack_count). Keeps the SESSION_DEAD_BATCHES BREAK reachable ONLY
+			// for a genuinely dead link.
+			cmd_inband_session_dead_batches = 0;
 
 			// WALL-B FIX-9 D3 (producer P3): ANY data-ACK (clean OR partial) proves the reverse
 			// channel is NOT pure-silent, so the CFG16 reverse-ACK starvation streak resets UNGATED.

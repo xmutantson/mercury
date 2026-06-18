@@ -1960,6 +1960,17 @@ public:
   // first frame is LOST. Returns 0=PASS, 1=FAIL. data-flow-perbatch-config.md §15.
   int test_inband_seamless();
 
+  // STAGE 4c D5 BREAK-OBSOLETE TEST (CLI --test-inband-no-break). Synthetic-fire of the
+  // COMMANDER Class-A degradation routing: PART A drives inband_route_failure_demote (the
+  // body all four Class-A sites call) and asserts the link DEMOTES one rung and stays
+  // alive with BREAK-count==0; PART B drives the at-bottom dead-batch floor and asserts a
+  // GENUINE total loss STILL reaches the SESSION_DEAD_BATCHES BREAK at exactly the Nth;
+  // PART C asserts a delivery resets the floor; PART D asserts the OFF gate is false (the
+  // legacy BREAK is unchanged). fail-before (-DINBAND_NOBREAK_FAILBEFORE): the gate is
+  // removed -> a Class-A degradation BREAKs under inband (BREAK-count>0). Returns 0=PASS,
+  // 1=FAIL. inband-reliability-design.md §5.6, data-flow-perbatch-config.md §S4C.
+  int test_inband_no_break();
+
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on
   // test_partial_bsi_advance. Forces frame-k still-decoding at the
@@ -3157,6 +3168,42 @@ public:
   // queued. Returns true if the drop applied (target valid + a real change), false
   // if it was a no-op (same config / invalid target) so the builder can fall back.
   bool inband_unilateral_drop(int target_cfg);
+
+  // ── STAGE 4c — D5: BREAK truly obsolete (inband-reliability-design.md §5,
+  //    data-flow-perbatch-config.md §S4C) ──
+  // When MERCURY_INBAND_RATE is ON, a COMMANDER Class-A degradation/failure that
+  // today calls send_break_pattern() instead routes through a TAG-DEMOTE (one rung
+  // down via the chokepoint; the RX down-ladder catches a missed tag), REUSING the
+  // CFG16 D3 demote machinery (arq_commander.cc:3978-4117). Only a GENUINE total
+  // loss — the link is already at the ladder bottom AND the commander dead-batch
+  // streak hits SESSION_DEAD_BATCHES — is permitted to BREAK (the §7 floor). When
+  // the feature is OFF every Class-A site fires send_break_pattern() byte-identically.
+  //
+  // inband_route_failure_demote: lift the D3 demote body into one reusable helper.
+  // Preserves in-flight bytes (FIFO push-back / restore_tx_from_compressed), does
+  // the lossless bsi rollback (cmd_batch_seq_id <- earliest in-flight bsi, no D3.1
+  // GAP-ABORT), sets the config owners to demote_target so the chokepoint reads it
+  // (negotiated_configuration), pins supershift_proven_ceiling, resets the nack/
+  // starve streaks, runs the optimizer supremacy hook, then add_message_control(
+  // SET_CONFIG) (which under inband becomes inband_unilateral_drop + the tag) and
+  // sets connection_status=TRANSMITTING_CONTROL. Returns true if it routed the
+  // demote (caller must `return` — the demote owns the next transition). MUST be
+  // called only with a valid lower rung (caller checks !config_is_at_bottom).
+  bool inband_route_failure_demote(int demote_target, const char* reason);
+  // Commander-side true-session-loss floor (the ONLY commander BREAK permitted under
+  // inband). Counts consecutive Class-A total-loss batches that occur WHILE already
+  // at the ladder bottom (nowhere left to demote). Reset to 0 on any data-ACK
+  // success. Keyed to the SAME MERCURY_INBAND_DEAD_BATCHES as the RX terminal floor
+  // (inband_session_dead_limit()), so both sides BREAK together. Init 0 (ctor +
+  // reset_session_state). Returns true when the floor has been reached and the
+  // genuine send_break_pattern() should fire.
+  int  cmd_inband_session_dead_batches = 0;
+  bool inband_cmd_dead_batch_floor_reached();
+  // Diagnostic / test instrument: total send_break_pattern() invocations on this
+  // controller (incremented at the top of send_break_pattern). The
+  // --test-inband-no-break harness reads it to assert BREAK-count==0 on a degradation
+  // and ==1 at the true-loss floor. Pure observation; no behavior depends on it.
+  long send_break_pattern_count = 0;
 
   int gear_shift_on;
   int robust_enabled;

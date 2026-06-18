@@ -4953,6 +4953,9 @@ void cl_arq_controller::reset_session_state()
 	// here (it is bandwidth-keyed, not session-keyed — kept across reconnects on the
 	// same NB/WB; freed in inband_free_down_decoders on a NB/WB switch / dtor).
 	inband_session_dead_batches = 0;
+	// STAGE 4c: the commander-side true-session-loss floor — a fresh session is never
+	// one batch from the BREAK floor (mirrors the RX-side reset above + the ctor init).
+	cmd_inband_session_dead_batches = 0;
 
 	// Turboshift — fresh state for next connection
 	turboshift_phase = TURBO_FORWARD;
@@ -8224,6 +8227,10 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 void cl_arq_controller::send_break_pattern()
 {
 	if(passive_monitor) return;
+	// STAGE 4c instrument: count BREAK emissions (the --test-inband-no-break harness
+	// reads this to assert BREAK-count==0 on a degradation-demote and ==1 at the
+	// true-loss floor). Observation only — no production behavior depends on it.
+	send_break_pattern_count++;
 	printf("[TX-BREAK] Sending BREAK pattern on CONFIG_%d\n", current_configuration);
 	fflush(stdout);
 

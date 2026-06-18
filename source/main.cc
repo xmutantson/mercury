@@ -741,6 +741,7 @@ int main(int argc, char *argv[])
     bool test_inband_drop_cli = false;  // --test-inband-drop: in-band rate-adapt Stage 3b — LOOPBACK DROP.
     bool test_inband_fallback_cli = false;  // --test-inband-fallback: in-band Stage 4 — LOST-TAG DOWN-LADDER.
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
+    bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
                                         // Gearshift-driven unilateral drop (W3), tag on the real passband (W1),
                                         // RX follows from the passband tag (W2 + HINGE), SACK confirms (bsi),
                                         // ZERO SET_CONFIG on the wire, both ends config-track, PHY-twin coherent,
@@ -1464,6 +1465,18 @@ int main(int argc, char *argv[])
             // down-ladder. See arq_responder.cc test_inband_seamless +
             // data-flow-perbatch-config.md §15.
             test_inband_seamless_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-no-break") == 0)
+        {
+            // In-band rate adaptation Stage 4c — D5 BREAK-OBSOLETE TEST (one-shot at
+            // startup, exit rc). Drives the COMMANDER Class-A degradation routing: a
+            // degradation that today BREAKs routes to a TAG-DEMOTE (BREAK-count==0, link
+            // alive at a lower config) under inband, while a GENUINE total loss STILL
+            // reaches the SESSION_DEAD_BATCHES BREAK. See arq_responder.cc
+            // test_inband_no_break + data-flow-perbatch-config.md §S4C.
+            test_inband_no_break_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2937,6 +2950,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_seamless();
             printf("[FLAG] Inband-seamless test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_no_break_cli) {
+            // In-band rate adaptation Stage 4c — D5 BREAK-OBSOLETE TEST (one-shot, exit rc).
+            // Builds its own CMD/telecom_system instances internally.
+            printf("[FLAG] --test-inband-no-break: invoking in-band rate-adapt Stage-4c "
+                   "D5 BREAK-obsolete regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_no_break();
+            printf("[FLAG] Inband-no-break test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
