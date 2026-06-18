@@ -46,6 +46,28 @@ static inline bool sack_rx_trace_enabled()
 	}
 	return cached != 0;
 }
+
+// M6 — BREAK-path lossless requeue (data-flow-arq-recovery-cluster.md §5.6).
+// The Anchor-rung emergency BREAK (~:4071-4177) calls send_break_pattern() and
+// returns WITHOUT rolling cmd_batch_seq_id back to the stranded in-flight batch
+// -> on recovery the re-sent batch carries a FRESH (advanced) epoch bsi -> the RSP
+// re-adopts a NON-CONTIGUOUS bsi (>=2 jump from its delivery high-water) ->
+// [RSP-V2-GAP-ABORT] terminally kills the transfer. The FIX-9 D3 SET_CONFIG demote
+// (~:3950-4018) already captures the earliest in-flight bsi BEFORE freeing
+// messages_tx[] and rolls cmd_batch_seq_id back to it, so the re-send is contiguous.
+// This knob ports that capture+rollback into the BREAK path. DEFAULT-OFF: unset (or
+// explicit "0") -> disabled => the BREAK path is BYTE-IDENTICAL to the pre-M6
+// behavior. Any other non-empty value enables the lossless requeue.
+static inline bool break_lossless_requeue_enabled()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_BREAK_LOSSLESS_REQUEUE");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
 #define SACK_TRACE(fmt, ...) do { \
 	if(sack_rx_trace_enabled()) { \
 		printf("[SACK-RX-TRACE] " fmt "\n", ##__VA_ARGS__); \
@@ -4159,6 +4181,57 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					printf("[BREAK] Lowered ceiling to %d\n", new_ceiling);
 					fflush(stdout);
 				}
+				// === M6 — BREAK-PATH LOSSLESS REQUEUE (data-flow-arq-recovery-cluster.md §5.6) ===
+				// The stranded in-flight batch(es) live in messages_tx[] right now (the FIFO
+				// push-back + FREE that recovers their bytes happens LATER, in the BREAK recovery
+				// handler at :288-296 / :376-384, and that handler does NOT touch cmd_batch_seq_id).
+				// PRE-FIX the recovery re-sends those bytes under a FRESH epoch bsi (cmd_batch_seq_id
+				// had advanced past the in-flight bsi), so after the RSP's BREAK self-heal
+				// (rsp_current/prev reset to -1, arq_responder.cc:474; delivery high-water SURVIVES)
+				// the re-adopt sees sack_v2_readopt_has_gap(fresh_bsi, high-water)=true (a >=2 jump)
+				// -> [RSP-V2-GAP-ABORT] terminally kills the transfer. The bytes were preserved; the
+				// bsi-epoch LABEL was wrong. Roll cmd_batch_seq_id back to the EARLIEST (mod-256)
+				// in-flight batch's ORIGINAL bsi — by construction the next bsi the RSP expects after
+				// its delivery high-water (un-ACKed-but-delivered => ==high-water, a dedup; or
+				// un-ACKed-and-undelivered => ==high-water+1, the contiguous successor) — so the
+				// recovery re-send is CONTIGUOUS and the GAP-ABORT does NOT fire. Identical capture
+				// to the FIX-9 D3 demote (:3968-3988) under the SAME preconditions
+				// (sack_v2_enabled && !compression_enabled — the compression path's
+				// restore_tx_from_compressed() owns its own re-stage and is unchanged). DEFAULT-OFF
+				// (break_lossless_requeue_enabled): unset => this whole block is skipped =>
+				// BYTE-IDENTICAL to the pre-M6 BREAK. NOT a change to the demote/BREAK itself — only
+				// the bsi bookkeeping is corrected.
+				if(break_lossless_requeue_enabled() && sack_v2_enabled && !compression_enabled)
+				{
+					int min_inflight_bsi = -1;
+					for(int i=0; i<nMessages; i++)
+					{
+						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+						{
+							int b = messages_tx[i].batch_seq_id & 0xFF;
+							if(min_inflight_bsi < 0)
+								min_inflight_bsi = b;
+							else
+							{
+								// keep the mod-256-EARLIER bsi (forward distance b->min in
+								// [1,128] means min is later, so b is earlier).
+								unsigned fwd = ((unsigned)(min_inflight_bsi - b)) & 0xFFu;
+								if(fwd >= 1u && fwd <= 128u)
+									min_inflight_bsi = b;
+							}
+						}
+					}
+					if(min_inflight_bsi >= 0)
+					{
+						printf("[BREAK] M6 LOSSLESS REQUEUE: rolling cmd_batch_seq_id %d -> %d "
+							"so the post-BREAK re-send carries the in-flight (contiguous) bsi "
+							"(no RSP-V2-GAP-ABORT on recovery)\n",
+							cmd_batch_seq_id & 0xFF, min_inflight_bsi);
+						fflush(stdout);
+						cmd_batch_seq_id = min_inflight_bsi;
+					}
+				}
+
 				printf("[BREAK] Sending emergency BREAK pattern\n");
 				fflush(stdout);
 				emergency_previous_config = current_configuration;
