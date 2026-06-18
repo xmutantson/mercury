@@ -23,7 +23,9 @@
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
+#include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 in-band rate-adapt config tag
 #include <time.h>
+#include <vector>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -730,6 +732,14 @@ cl_arq_controller::cl_arq_controller()
 	data_configuration=CONFIG_0;
 	forward_configuration=CONFIG_NONE;
 	reverse_configuration=CONFIG_NONE;
+
+	// In-band rate adaptation (Stage 2) — additive, MERCURY_INBAND_RATE-gated.
+	// Benign defaults so a default-off build never reads a stale value: the
+	// feature flag is resolved lazily (-1 = unresolved) so the env is read once,
+	// last-announced starts at CONFIG_NONE (the first emit always tags), parity 0.
+	inband_last_announced_config=CONFIG_NONE;
+	inband_tx_epoch_parity=0;
+	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
 
 	gear_shift_on=NO;
 	robust_enabled=NO;
@@ -2390,6 +2400,192 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 			fflush(stdout);
 		}
 	}
+}
+
+// =============================================================================
+// In-band rate adaptation — Stage 2 emit / detect+follow.
+// unilateral-config-tag-design.md §3/§5/§6 + data-flow-perbatch-config.md.
+//
+// The tag rides the robust M=16 MFSK ctrl-suffix layer (Stage-1 codec in
+// physical_layer/mfsk_ctrl_codec.{h,cc}). Stage 2 wires the EMIT (TX, on a
+// committed config change only — zero steady-state tags) and the DETECT+FOLLOW
+// (RX, a cheap always-on presence-check, then the expensive wrap-decode only when
+// a suffix is present), with the coherent follow = load_configuration(...,
+// PHYSICAL_LAYER_ONLY, ...) which switches BOTH the ARQ current_configuration AND
+// the PHY twin (cl_telecom_system::current_configuration) in one call (the audit's
+// D1 coherent switch). Stage 2 builds an IDEALIZED clean energy block; the real
+// passband attach on the OFDM data frame is Stage 3+ (the §4.6 cost). ALL of this
+// is MERCURY_INBAND_RATE-gated so default-off is byte-identical.
+// =============================================================================
+
+// CRC-12 callback wrapping the PRODUCTION cl_arq_controller::CRC12_calc — the
+// codec NEVER inlines the CRC (mfsk_ctrl_codec.h §13.5 / v1 bug #1); the ctx is
+// the cl_arq_controller. Mirrors the test's prod_crc12_cb so the TX/RX share one
+// CRC definition.
+static uint16_t arq_inband_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* arq = static_cast<cl_arq_controller*>(ctx);
+	return arq->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
+bool cl_arq_controller::inband_rate_feature_enabled()
+{
+	if(inband_rate_enabled < 0)
+	{
+		const char* e = std::getenv("MERCURY_INBAND_RATE");
+		inband_rate_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return inband_rate_enabled == 1;
+}
+
+int cl_arq_controller::emit_config_tag_if_changed(int batch_cfg, int batch_seq_id,
+                                                  double hi, double lo,
+                                                  double* out_energies /*N*16*/,
+                                                  double* out_chips /*[16]*/,
+                                                  uint8_t* out_bsi_lsb,
+                                                  uint8_t* out_parity)
+{
+	// FIRING POLICY (owner-locked): emit the tag ONLY on a committed config change.
+	// Feature off -> never emit (zero cost, byte-identical default).
+	if(!inband_rate_feature_enabled())
+		return 0;
+
+	// cfg_index encoded into the tag is the LADDER INDEX (design §2.1), not the raw
+	// config id. A config not on the ladder cannot be announced.
+	int ladder_idx = config_ladder_index(batch_cfg);
+	if(ladder_idx < 0 || ladder_idx > 31)
+		return 0;
+
+	// No change since the last-announced config -> NO tag (the steady state).
+	if(batch_cfg == inband_last_announced_config)
+		return 0;
+
+	// Committed change: toggle the epoch parity (ARDOP Even/Odd, design §2.1) and
+	// latch the new announced config.
+	inband_tx_epoch_parity ^= 1;
+	inband_last_announced_config = batch_cfg;
+
+	uint8_t bsi_lsb = (uint8_t)(batch_seq_id & 0x7);
+	uint8_t parity  = inband_tx_epoch_parity;
+
+	// Build the GF(16) RA + CRC-12 protected message (the binding copy of cfg_index
+	// + bsi_lsb + epoch_parity rides as plain CRC-protected bits) and the RM(1,4)
+	// FWHT codeword for the cfg_index. Identical construction to the Stage-1 test
+	// helper build_config_tag_gf16_energies, in production form.
+	gf16ra::configure(2);   // N=39, R=1/3 (the OD-2 floor substrate)
+	gf16ra::init();
+
+	uint64_t p37 = 0;
+	pack_config_tag_payload(&p37, (uint8_t)ladder_idx, bsi_lsb, parity);
+
+	unsigned char bytes[5];
+	pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_CONFIG_TAG, p37);
+	uint16_t crc12 = CRC12_calc((const char*)bytes, 5) & 0x0FFF;
+
+	int N = gf16ra::codeword_len();
+	int tones[gf16ra::GF16RA_MAX_N];
+	gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_CONFIG_TAG, p37, crc12, tones);
+
+	if(out_energies)
+	{
+		for(int s = 0; s < N * 16; s++) out_energies[s] = lo;
+		for(int s = 0; s < N; s++) out_energies[(size_t)s * 16 + tones[s]] = hi;
+	}
+	if(out_chips)
+	{
+		double e16[256];
+		cfg_tag_energies_from_cfg(ladder_idx, hi, lo, e16);
+		cfg_tag_softchips_from_energies(e16, out_chips);
+	}
+	if(out_bsi_lsb) *out_bsi_lsb = bsi_lsb;
+	if(out_parity)  *out_parity  = parity;
+
+	printf("[INBAND-TX] CONFIG_TAG emit cfg=%d (ladder_idx=%d) bsi_lsb=%u parity=%u\n",
+		batch_cfg, ladder_idx, (unsigned)bsi_lsb, (unsigned)parity);
+	fflush(stdout);
+	return 1;
+}
+
+int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
+                                                    const double* chip_soft,
+                                                    int n_syms,
+                                                    uint8_t expect_bsi_lsb,
+                                                    uint8_t expect_parity,
+                                                    int* out_followed_config)
+{
+	if(out_followed_config) *out_followed_config = current_configuration;
+
+	// Feature off -> never run the presence-check or decode path (byte-identical).
+	if(!inband_rate_feature_enabled())
+		return 0;
+
+#ifdef STAGE2_FAILBEFORE
+	// FAIL-BEFORE arm: the RX IGNORES the tag entirely. The switched batch then
+	// stays at the old config and the directed test FAILS (proves the follow is
+	// load-bearing). Rebuild with -DSTAGE2_FAILBEFORE to take this path.
+	(void)energies; (void)chip_soft; (void)n_syms;
+	(void)expect_bsi_lsb; (void)expect_parity;
+	printf("[INBAND-RX] STAGE2_FAILBEFORE: tag ignored (no follow)\n");
+	fflush(stdout);
+	return 0;
+#else
+	if(energies == NULL || chip_soft == NULL || n_syms <= 0)
+		return 0;
+
+	// CHEAP always-on PRESENCE check first (firing policy): only run the expensive
+	// config_tag_wrap_decode when a suffix is actually present. A real suffix lights
+	// one tone per symbol well above the noise floor; an absent suffix is an
+	// all-(near)-zero energy block. Sum the energy; if it is effectively zero the
+	// frame carries no tag and we return immediately (the steady-state no-tag case).
+	double energy_sum = 0.0;
+	for(int s = 0; s < n_syms * 16; s++) energy_sum += energies[s];
+	if(energy_sum <= 1e-12)
+		return 0;   // no suffix present -> no tag -> no cost beyond the sum
+
+	// Suffix present: run the WRAP decoder. The bsi_lsb + epoch_parity binding gates
+	// are honoured INSIDE the wrap-decode (bind_agree). Pass the production CRC-12.
+	config_tag_decode_result r;
+	bool ok = config_tag_wrap_decode(energies, chip_soft, /*peak_ratio_gate=*/2.0,
+		expect_bsi_lsb, expect_parity, arq_inband_crc12_cb, this, &r);
+	if(!ok)
+	{
+		// Half-heard / mis-bound tag -> self-rejected by the CRC + binding gates.
+		// No follow; stay at the current config (Stage 4 will add the down-ladder
+		// fallback — out of scope here).
+		return 0;
+	}
+
+	// r.cfg_index is a LADDER INDEX; map back to a raw config id.
+	if(r.cfg_index > 31)
+		return 0;
+	int followed_config = (r.cfg_index < FULL_CONFIG_LADDER_SIZE)
+		? FULL_CONFIG_LADDER[r.cfg_index] : -1;
+	if(followed_config < 0)
+		return 0;
+
+	// Tag decodes, cfg_index == current -> no change (design §3.2 outcome 2). Zero
+	// action. (Should not normally happen — the TX only tags on a change — but a
+	// stale re-detect of the previous tag lands here and is a no-op.)
+	if(followed_config == current_configuration)
+		return 0;
+
+	// FOLLOW (design §3.2 outcome 1): switch to the announced config. This single
+	// ARQ call writes current_configuration (arq_common.cc) AND reconfigures the PHY
+	// twin telecom_system->current_configuration (telecom_system.cc) coherently, so
+	// the PHY demod and the ARQ buffer-sizing agree at the new config for the rest
+	// of the batch. PHYSICAL_LAYER_ONLY (no message-buffer deinit/reinit) + NO
+	// backup mirror the SET_CONFIG ack-turnaround follow convention.
+	printf("[INBAND-RX] CONFIG_TAG follow: cfg_index=%u (ladder) -> CONFIG_%d "
+		"(was %d) bsi_lsb=%u parity=%u\n",
+		(unsigned)r.cfg_index, followed_config, current_configuration,
+		(unsigned)r.batch_seq_lsb, (unsigned)r.epoch_parity);
+	fflush(stdout);
+
+	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
+
+	if(out_followed_config) *out_followed_config = followed_config;
+	return 1;
+#endif
 }
 
 void cl_arq_controller::return_to_last_configuration()

@@ -725,6 +725,11 @@ int main(int argc, char *argv[])
                                         // Reproduces bench-4 (deliver 0-4, BREAK reset with 5-7 undelivered, present 8):
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
+    bool test_config_tag_follow_cli = false; // --test-config-tag-follow: in-band rate-adapt Stage 2 — emit/detect/FOLLOW.
+                                        // Forces a CONFIG_10->CONFIG_8 batch-boundary switch; asserts the RX follows the
+                                        // config FROM THE TAG (load_configuration) with the PHY twin switching coherently.
+                                        // fail-before: rebuild with -DSTAGE2_FAILBEFORE (RX ignores tag -> stays CFG10).
+                                        // One-shot, exits rc. unilateral-config-tag-design.md §11 Stage 2.
                                         // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
     bool test_data_ack_multiwindow_cli = false; // --test-data-ack-multiwindow: Track A — multi-window
                                         // DATA-ACK/SACK correlator. Synthesizes a real ACK+SACK burst at an
@@ -1389,6 +1394,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
             // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
             test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-config-tag-follow") == 0)
+        {
+            // In-band rate adaptation Stage 2 — emit/detect/FOLLOW directed
+            // loopback (one-shot at startup, exit rc). See
+            // source/datalink_layer/arq_responder.cc test_config_tag_follow
+            // + mercury/fact-documents/unilateral-config-tag-design.md §11.
+            test_config_tag_follow_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2808,6 +2823,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_gap_abort_on_readopt();
             printf("[FLAG] Gap-abort test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_config_tag_follow_cli) {
+            // In-band rate adaptation Stage 2 — emit/detect/FOLLOW directed loopback
+            // (one-shot, exit rc). Builds its own CMD/RSP + telecom_system internally.
+            printf("[FLAG] --test-config-tag-follow: invoking in-band rate-adapt "
+                   "Stage-2 emit/detect/FOLLOW regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_config_tag_follow();
+            printf("[FLAG] Config-tag-follow test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

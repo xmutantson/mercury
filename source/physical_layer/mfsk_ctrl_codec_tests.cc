@@ -4384,6 +4384,20 @@ static void test_config_tag_optab_detection_sweep() {
 	test_pass(name);
 }
 
+// §25 — CONFIG_TAG in-band rate adaptation Stage 2: emit/detect/FOLLOW wrapper.
+// The follow logic lives on cl_arq_controller (it drives the production
+// load_configuration coherent ARQ+PHY-twin switch); this wrapper instantiates a
+// throwaway controller, runs the member test, and maps its 0/1 verdict into the
+// file's pass/fail counters. unilateral-config-tag-design.md §11 Stage 2.
+static void test_config_tag_follow_stage2() {
+	const char* name = "config_tag_follow_stage2 (emit/detect/FOLLOW, PHY-twin coherent)";
+	cl_arq_controller* arq = new cl_arq_controller();
+	int rc = arq->test_config_tag_follow();
+	delete arq;
+	if (rc == 0) test_pass(name);
+	else         test_fail(name, "RX did not follow the config FROM THE TAG (see [TEST-INBAND-FOLLOW] log)");
+}
+
 // §10.5 — THE MEASUREMENT: GF(16)-RA acquisition cliff on the SAME SNR3k axis as
 // §9. For each sigma: P(base-detect), P(GF16-RA decode). Reports the cliff
 // (SNR3k at P=0.5), the coding gain vs the §9 HARD suffix, and whether it
@@ -6509,6 +6523,13 @@ int run_mfsk_ctrl_codec_tests() {
 	test_config_tag_noise_loaded_decode();     // T2 right index at a representative Es/N0
 	test_config_tag_pure_noise_far();          // T3 WRAP FAR <= design bound
 	test_config_tag_optab_detection_sweep();   // T4 option (a) tone-perm vs (b) 2-tone detection-vs-Es/N0
+
+	// §25 CONFIG_TAG in-band rate adaptation Stage 2 — emit/detect/FOLLOW.
+	// Drives the production cl_arq_controller emit_config_tag_if_changed +
+	// detect_and_follow_config_tag through a forced CONFIG_10->CONFIG_8 batch-
+	// boundary switch and asserts the RX follows FROM THE TAG with the PHY twin
+	// switching coherently. unilateral-config-tag-design.md §11 Stage 2.
+	test_config_tag_follow_stage2();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

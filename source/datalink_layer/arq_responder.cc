@@ -22,6 +22,8 @@
 
 #include "datalink_layer/arq.h"
 #include "common/timing_log.h"
+#include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 config-tag follow test
+#include <vector>
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -3794,6 +3796,204 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 		this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// In-band rate adaptation — Stage 2 directed loopback follow test
+// (unilateral-config-tag-design.md §11 Stage 2; data-flow-perbatch-config.md §8.2)
+// ============================================================================
+//
+// Forces a config switch at a batch boundary (CONFIG_10 -> CONFIG_8) and asserts
+// the RX FOLLOWS the config FROM THE TAG (not from a SET_CONFIG handshake — none
+// is used here), with the PHY twin switching coherently.
+//
+// Flow (mirrors the production hooks):
+//   1. TX (a cl_arq_controller at CONFIG_10) commits a switch to CONFIG_8 and
+//      calls emit_config_tag_if_changed() -> builds the CONFIG_TAG energy block +
+//      soft chips + the (bsi_lsb, parity) binding for the FIRST frame of the new
+//      batch.
+//   2. RX (a SEPARATE cl_arq_controller, each with a REAL cl_telecom_system loaded
+//      at CONFIG_10) feeds that energy block into detect_and_follow_config_tag()
+//      on the first frame of the batch.
+//   3. ASSERT the RX followed: BOTH the ARQ current_configuration AND the PHY twin
+//      telecom_system->current_configuration == CONFIG_8 (the coherent switch),
+//      and the switch came from the tag (out_followed_config == CONFIG_8).
+//
+// The forced config switch is exercised in BOTH directions of the test's logic:
+// it also confirms NO follow when the config is unchanged (the steady state) and
+// that the bsi_lsb/epoch_parity binding is honoured (a mis-bound tag is rejected).
+//
+// fail-before (-DSTAGE2_FAILBEFORE): detect_and_follow_config_tag() ignores the
+// tag -> the RX stays at CONFIG_10 -> the switched batch's config never follows ->
+// this test FAILS. pass-after: RX follows, both copies == CONFIG_8.
+//
+// Requires MERCURY_INBAND_RATE to be set so the emit/detect paths are active; the
+// test sets it itself (save/restore) so it runs inside the default --test battery.
+// Returns 0=PASS, 1=FAIL. Default builds never call this except via the test flag.
+int cl_arq_controller::test_config_tag_follow()
+{
+	const char* TAG = "[TEST-INBAND-FOLLOW]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore) --------
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+#if defined(_WIN32)
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+
+	const int CFG_FROM = CONFIG_10;   // ladder index 13
+	const int CFG_TO   = CONFIG_8;    // ladder index 11
+
+	// --- Build two independent instances, each with a REAL telecom_system -------
+	// Heap-allocate (cl_telecom_system is large; mirrors test_bigblock_arq_unit).
+	// load_configuration() is reachable here because this is a cl_arq_controller
+	// member fn (same-class access on any instance).
+	cl_telecom_system* ts_tx = new cl_telecom_system();
+	cl_telecom_system* ts_rx = new cl_telecom_system();
+	cl_arq_controller* tx    = new cl_arq_controller();
+	cl_arq_controller* rx    = new cl_arq_controller();
+	ts_tx->operation_mode = ARQ_MODE;
+	ts_rx->operation_mode = ARQ_MODE;
+	tx->telecom_system = ts_tx;
+	rx->telecom_system = ts_rx;
+	tx->narrowband_enabled = NO;
+	rx->narrowband_enabled = NO;
+
+	// Both peers START at CONFIG_10 (the TX has been transmitting at CFG10; the RX
+	// is decoding at CFG10). PHYSICAL_LAYER_ONLY + NO backup, the follow convention.
+	tx->load_configuration(CFG_FROM, PHYSICAL_LAYER_ONLY, NO);
+	rx->load_configuration(CFG_FROM, PHYSICAL_LAYER_ONLY, NO);
+
+	check(tx->current_configuration == CFG_FROM,
+		"TX starts at CONFIG_10 (ARQ)", tx->current_configuration, CFG_FROM);
+	check(rx->current_configuration == CFG_FROM,
+		"RX starts at CONFIG_10 (ARQ)", rx->current_configuration, CFG_FROM);
+	check(rx->telecom_system->current_configuration == CFG_FROM,
+		"RX PHY twin starts at CONFIG_10", rx->telecom_system->current_configuration, CFG_FROM);
+
+	// --- Sanity: with cfg UNCHANGED, the TX emits NO tag (steady state) ----------
+	{
+		std::vector<double> e0((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+		double chips0[16] = {0.0};
+		uint8_t b0 = 0, p0 = 0;
+		// Latch the announced config to CFG_FROM first (the TX has already been
+		// sending CFG10), so a same-config "emit" is a true steady-state no-op.
+		int emitted_seed = tx->emit_config_tag_if_changed(CFG_FROM, /*bsi=*/41,
+			/*hi=*/1.0, /*lo=*/0.0, e0.data(), chips0, &b0, &p0);
+		check(emitted_seed == 1, "TX first announce of CONFIG_10 emits a tag (epoch start)",
+			emitted_seed, 1);
+		// A SECOND emit at the SAME config -> no change -> NO tag.
+		int emitted_again = tx->emit_config_tag_if_changed(CFG_FROM, /*bsi=*/42,
+			1.0, 0.0, e0.data(), chips0, &b0, &p0);
+		check(emitted_again == 0, "TX re-emit at unchanged CONFIG_10 emits NO tag (steady state)",
+			emitted_again, 0);
+	}
+
+	// --- TX commits the switch CONFIG_10 -> CONFIG_8 and emits the tag ----------
+	const int new_batch_seq_id = 43;   // the bsi of the FIRST batch at the new cfg
+	std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+	double chip_soft[16] = {0.0};
+	uint8_t tag_bsi_lsb = 0, tag_parity = 0;
+	int emitted = tx->emit_config_tag_if_changed(CFG_TO, new_batch_seq_id,
+		/*hi=*/1.0, /*lo=*/0.0, energies.data(), chip_soft, &tag_bsi_lsb, &tag_parity);
+	check(emitted == 1, "TX emits a CONFIG_TAG on the committed CONFIG_10->CONFIG_8 change",
+		emitted, 1);
+	check(tag_bsi_lsb == (uint8_t)(new_batch_seq_id & 0x7),
+		"TX tag bsi_lsb binds to the batch", tag_bsi_lsb, new_batch_seq_id & 0x7);
+
+	int n_syms = gf16ra::codeword_len();
+
+	// --- RX detect+follow on the FIRST frame of the switched batch -------------
+	// The RX is adopting batch bsi=new_batch_seq_id; pass its low-3 + the expected
+	// epoch parity as the binding the wrap-decode must agree with.
+	int followed_cfg = -999;
+	int followed = rx->detect_and_follow_config_tag(energies.data(), chip_soft, n_syms,
+		/*expect_bsi_lsb=*/(uint8_t)(new_batch_seq_id & 0x7),
+		/*expect_parity=*/tag_parity, &followed_cfg);
+
+	// THE STAGE-2 ASSERTIONS:
+	check(followed == 1, "RX FOLLOWS the tag (detect+follow returns 1)", followed, 1);
+	check(followed_cfg == CFG_TO, "RX follows to CONFIG_8 FROM THE TAG", followed_cfg, CFG_TO);
+	check(rx->current_configuration == CFG_TO,
+		"RX ARQ current_configuration == CONFIG_8 after follow", rx->current_configuration, CFG_TO);
+	// THE CROSS-LAYER ASSERTION (audit D1): the PHY twin switched coherently with
+	// the ARQ copy in the SAME load_configuration call.
+	check(rx->telecom_system->current_configuration == CFG_TO,
+		"RX PHY twin current_configuration == CONFIG_8 (coherent switch)",
+		rx->telecom_system->current_configuration, CFG_TO);
+	// And the two copies AGREE (the silent-desync guard CLAUDE.md §5 exists for).
+	check(rx->current_configuration == rx->telecom_system->current_configuration,
+		"RX ARQ config == PHY-twin config (no cross-layer desync)",
+		rx->current_configuration, rx->telecom_system->current_configuration);
+
+	// --- Negative: a MIS-BOUND tag (wrong bsi_lsb) must NOT follow --------------
+	// Re-emit a fresh change so there IS a tag to (mis)bind against. Switch back to
+	// CFG_FROM so the RX (now at CFG_TO) has a real change to follow, but feed the
+	// WRONG bsi_lsb so the binding gate rejects it -> no follow.
+	{
+		std::vector<double> e2((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+		double cs2[16] = {0.0};
+		uint8_t b2 = 0, p2 = 0;
+		int emit2 = tx->emit_config_tag_if_changed(CFG_FROM, /*bsi=*/50, 1.0, 0.0,
+			e2.data(), cs2, &b2, &p2);
+		check(emit2 == 1, "TX emits a tag on the CONFIG_8->CONFIG_10 change-back", emit2, 1);
+		int before = rx->current_configuration;   // CFG_TO
+		int fc2 = -999;
+		int follow2 = rx->detect_and_follow_config_tag(e2.data(), cs2, gf16ra::codeword_len(),
+			/*WRONG bsi_lsb=*/(uint8_t)((b2 + 1) & 0x7), /*parity=*/p2, &fc2);
+		check(follow2 == 0, "RX does NOT follow a MIS-BOUND tag (wrong bsi_lsb)", follow2, 0);
+		check(rx->current_configuration == before,
+			"RX config unchanged after a mis-bound tag", rx->current_configuration, before);
+
+		// Now the CORRECT binding DOES follow (proves the negative wasn't a fluke).
+		int fc3 = -999;
+		int follow3 = rx->detect_and_follow_config_tag(e2.data(), cs2, gf16ra::codeword_len(),
+			/*correct bsi_lsb=*/b2, /*parity=*/p2, &fc3);
+		check(follow3 == 1 && fc3 == CFG_FROM && rx->current_configuration == CFG_FROM,
+			"RX follows the CORRECTLY-bound change-back to CONFIG_10",
+			rx->current_configuration, CFG_FROM);
+		check(rx->telecom_system->current_configuration == CFG_FROM,
+			"RX PHY twin tracks the change-back (coherent)",
+			rx->telecom_system->current_configuration, CFG_FROM);
+	}
+
+	// --- No-tag presence check: an empty (all-zero) energy block -> no follow ---
+	{
+		std::vector<double> empty((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+		double cs[16] = {0.0};
+		int before = rx->current_configuration;
+		int fc = -999;
+		int f = rx->detect_and_follow_config_tag(empty.data(), cs, gf16ra::codeword_len(),
+			0, 0xFF, &fc);
+		check(f == 0 && rx->current_configuration == before,
+			"RX presence-check: empty frame -> no tag -> no follow",
+			rx->current_configuration, before);
+	}
+
+	delete tx; delete rx; delete ts_tx; delete ts_rx;
+	restore_env();
+
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
 }
 
 // ============================================================================

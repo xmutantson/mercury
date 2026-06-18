@@ -1747,6 +1747,64 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_partial_bsi_advance(const char* transport);
 
+  // ====================================================================
+  // In-band rate adaptation — Stage 2 emit / detect+follow / directed test
+  // (unilateral-config-tag-design.md §3/§5/§6; data-flow-perbatch-config.md)
+  // ====================================================================
+  // ALL three are no-ops (early-return) unless MERCURY_INBAND_RATE is set, so a
+  // default-off build is byte-identical to the SET_CONFIG baseline. The codec
+  // primitives live in include/physical_layer/mfsk_ctrl_codec.h (Stage 1).
+
+  // Resolve + cache the MERCURY_INBAND_RATE env flag. Returns true iff the
+  // feature is enabled. Cheap after the first call (cached in inband_rate_enabled).
+  bool inband_rate_feature_enabled();
+
+  // TX EMIT (design §6). Decide whether the batch about to be sent at config
+  // `batch_cfg` differs from the last-announced config and, if so, build the
+  // CONFIG_TAG ctrl-suffix artifacts for the FIRST frame of the batch:
+  //   - the GF(16) RA energy matrix (out_energies, N*16 row-major)
+  //   - the RM(1,4) FWHT soft-chip block (out_chips[16])
+  //   - the binding fields actually encoded (out_bsi_lsb, out_parity)
+  // `batch_seq_id` is the cmd_batch_seq_id of the batch (its low 3 bits bind the
+  // tag, design §2.1). cfg_index encoded into the tag is config_ladder_index(
+  // batch_cfg). On a committed change this toggles inband_tx_epoch_parity and
+  // updates inband_last_announced_config. `hi`/`lo` are the per-tone clean
+  // one-hot energies (Stage 2 uses an idealized energy block; the production
+  // passband attach is Stage 3+ per §4.6). Returns 1 if a tag was emitted (config
+  // changed), 0 if not (config unchanged, or feature off, or batch_cfg invalid).
+  int emit_config_tag_if_changed(int batch_cfg, int batch_seq_id,
+                                 double hi, double lo,
+                                 double* out_energies /*N*16*/,
+                                 double* out_chips /*[16]*/,
+                                 uint8_t* out_bsi_lsb, uint8_t* out_parity);
+
+  // RX DETECT+FOLLOW (design §3.2 outcome 1). Cheap always-on suffix-PRESENCE
+  // check on the first frame of a batch; only if a suffix is present run the
+  // expensive config_tag_wrap_decode. On a VALID tag whose ladder-index maps to a
+  // config != current_configuration AND whose bsi_lsb/epoch_parity bind, FOLLOW:
+  // load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO) — which switches
+  // BOTH the ARQ current_configuration AND the PHY twin
+  // (cl_telecom_system::current_configuration) coherently in one call (the audit's
+  // D1 coherent switch). Writes *out_followed_config (the raw config id) on a
+  // follow. Returns 1 on follow, 0 on no-tag / unchanged / feature-off.
+  //   energies/chip_soft : the captured CONFIG_TAG energy matrix (N*16) + soft
+  //                        chips (the same blocks emit_config_tag_if_changed builds)
+  //   n_syms             : N = gf16ra::codeword_len() (presence check scans these)
+  //   expect_bsi_lsb     : the cmd bsi low-3 the RX is adopting (bind gate-3)
+  //   expect_parity      : the epoch_parity the RX expects, or 0xFF to skip
+  int detect_and_follow_config_tag(const double* energies, const double* chip_soft,
+                                   int n_syms, uint8_t expect_bsi_lsb,
+                                   uint8_t expect_parity, int* out_followed_config);
+
+  // Directed in-process loopback test (Stage 2). Forces a config switch at a
+  // batch boundary (CONFIG_10 -> CONFIG_8) and asserts the RX follows the config
+  // FROM THE TAG (load_configuration via detect_and_follow_config_tag), with the
+  // PHY twin switching coherently. Builds a real cl_telecom_system per side so the
+  // follow exercises the production load_configuration path. fail-before
+  // (-DSTAGE2_FAILBEFORE): the RX ignores the tag and stays at CONFIG_10 -> the
+  // switched batch's config NEVER follows -> FAIL. Returns 0=PASS, 1=FAIL.
+  int test_config_tag_follow();
+
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on
   // test_partial_bsi_advance. Forces frame-k still-decoding at the
@@ -2869,6 +2927,27 @@ public:
   int negotiated_configuration;
   int forward_configuration;   // Commander→Responder TX speed (asymmetric gearshift)
   int reverse_configuration;   // Responder→Commander TX speed (after SWITCH_ROLE)
+
+  // ====================================================================
+  // In-band rate adaptation — Stage 2 (unilateral-config-tag-design.md §5)
+  // ====================================================================
+  // ADDITIVE state, gated by the MERCURY_INBAND_RATE env flag. With the flag
+  // unset NONE of this is read or written on a production path (the emit/detect
+  // helpers early-return before touching it), so default-off is byte-identical
+  // to the SET_CONFIG baseline. cfg_index in the tag is a LADDER INDEX into
+  // FULL_CONFIG_LADDER[] (design §2.1), NOT a raw config id.
+  //
+  // inband_last_announced_config: the raw config id the TX last attached a
+  //   CONFIG_TAG for. CONFIG_NONE = nothing announced yet (the first emit on a
+  //   fresh session always tags). Updated only inside emit_config_tag_if_changed.
+  // inband_tx_epoch_parity: toggles on every committed config CHANGE (the ARDOP
+  //   Even/Odd analog, design §2.1) — distinguishes a fresh change from a stale
+  //   re-detect of the previous tag. RX honours it via the wrap-decode bind gate.
+  // inband_rate_enabled: cached MERCURY_INBAND_RATE flag (resolved once via
+  //   inband_rate_feature_enabled()).
+  int     inband_last_announced_config; // CONFIG_NONE until the first tag
+  uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
+  int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
 
   int gear_shift_on;
   int robust_enabled;
