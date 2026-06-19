@@ -2792,9 +2792,35 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				return;
 			}
 
+			// RANK-3 FIX (data-flow-inband-ondemote-zerobyte.md §3.1/§7): under inband, a
+			// generic control-ACK failure (a missed reverse-link / recovery SET_CONFIG ACK)
+			// must NOT escalate to the legacy BREAK->ROBUST_0 cascade. Config changes ride the
+			// passband CONFIG_TAG, not the SET_CONFIG handshake; rate/loss handling belongs to
+			// the forward-data tag-demote (arq_commander.cc:4513), the RX down-ladder, and the
+			// SESSION_DEAD_BATCHES floor — NOT this control-ACK miss. The un-gated escalation
+			// here is what fired send_break_pattern() on the ON arm (parking the TX at cfg=100)
+			// while the inband path was still recovering, RACING it. Gate it OFF: cancel the
+			// stale control slot benignly (it was already managed by the caller) and do NOT
+			// count toward / fire the BREAK. The control twin to the gated forward-data path
+			// (:4513). Byte-identical when the feature is OFF (the legacy block below runs).
+			if(inband_rate_feature_enabled())
+			{
+				printf("[INBAND-TX] control-ACK miss at config %d: BREAK escalation SUPPRESSED "
+					"(inband owns rate/loss via tag-demote + down-ladder + dead-batch floor)\n",
+					current_configuration);
+				fflush(stdout);
+				messages_control.ack_timeout = 0;
+				messages_control.id          = 0;
+				messages_control.length      = 0;
+				messages_control.nResends    = 0;
+				messages_control.status      = FREE;
+				messages_control.type        = NONE;
+				// Do NOT bump emergency_nack_count, do NOT send_break_pattern. Fall through to
+				// the normal cleanup at the end of this handler (receiving_timer stop/reset).
+			}
 			// Track control failures toward BREAK threshold.
 			// Only during connected data exchange (not connection setup or turboshift).
-			if(link_status == CONNECTED && turboshift_phase == TURBO_DONE
+			else if(link_status == CONNECTED && turboshift_phase == TURBO_DONE
 				&& gear_shift_on == YES && !emergency_break_active)
 			{
 				emergency_nack_count++;
@@ -12984,6 +13010,22 @@ int cl_arq_controller::test_sim_inproc_2()
 	// turned OFF so it HOLDS the target rung (no further churn) and the payload flows as
 	// real big-blocks. Default -1 = disabled (every existing arm is byte-identical).
 	const long force_setconfig = env_i("MERCURY_SIM2_FORCE_SETCONFIG", -1);
+	// IN-BAND DOWN-LADDER RESYNC repro (data-flow-inband-ondemote-zerobyte.md §6 /
+	// --test-inband-down-resync). MERCURY_SIM2_INBAND_LAG=1 drives the EXACT HW 0-byte
+	// path the directed test_inband_fallback structurally cannot reach: under
+	// MERCURY_INBAND_RATE (the wrapper sets it), the COMMANDER (A) DEMOTES to a real
+	// ROBUST rung via the production chokepoint while its announce CONFIG_TAG is
+	// SUPPRESSED (inband_test_suppress_announce_tx) — so the RESPONDER (B) never hears
+	// the tag, its current_configuration LAGS at the start OFDM rung, its primary OFDM
+	// decode fails, and its production inband_try_down_ladder_on_decode_fail() must
+	// resync from a PRIMARY-config-sized capture snapshot over a window that includes the
+	// ROBUST rung. Before the Rank-1 snapshot-sizing fix the ROBUST frame overruns the
+	// primary-sized snapshot -> EVERY trial-decode fails -> 0 bytes (the wedge). After the
+	// fix the down-ladder decodes ROBUST, B adopts it, and the batch delivers
+	// byte-faithful. Default 0 = disabled (every existing arm is byte-identical). The
+	// demote target is MERCURY_SIM2_INBAND_DEMOTE_CFG (default ROBUST_0=100).
+	const bool inband_lag = env_i("MERCURY_SIM2_INBAND_LAG", 0) != 0;
+	const long inband_demote_cfg = env_i("MERCURY_SIM2_INBAND_DEMOTE_CFG", ROBUST_0);
 	// FAIL-BEFORE A/B HOOK for the first-block-race harness fix (see the payload-stage block):
 	// MERCURY_SIM2_DEFEAT_FIRSTBLOCK_FIX=1 reproduces the PRE-FIX artifact behavior so the SAME
 	// binary shows fail-before (gate_ran==false). Production never sets it.
@@ -13087,6 +13129,22 @@ int cl_arq_controller::test_sim_inproc_2()
 		B->arq.gear_shift_on = NO;
 		printf("[TEST-SIM-2INST] FORCE_SETCONFIG=%ld: gearshift off up front (harness is the "
 		       "sole config driver; CONNECT unaffected)\n", force_setconfig);
+		fflush(stdout);
+	}
+
+	// IN-BAND DOWN-LADDER RESYNC repro setup. The harness is the SOLE config driver
+	// (gearshift off both peers) so A's demote-to-ROBUST is the only transition, and the
+	// COMMANDER's announce CONFIG_TAG is dropped so B never follows -> B's production
+	// down-ladder is forced. CONNECT (the MFSK handshake) is gearshift-independent so it
+	// still completes. inband_test_suppress_announce_tx only affects emit_config_tag_passband
+	// (it skips the tx_transfer); B receives no announce and lags. The recover leg
+	// (un-suppress so A re-announces once B has resynced) is driven inside the loop.
+	if (inband_lag) {
+		A->arq.gear_shift_on = NO;
+		B->arq.gear_shift_on = NO;
+		A->arq.inband_test_suppress_announce_tx = true;   // CMD->RSP announce dropped
+		printf("[TEST-SIM-2INST] INBAND_LAG=1: gearshift off both peers; A announce SUPPRESSED "
+		       "(B will lag -> production down-ladder resync). demote_cfg=%ld\n", inband_demote_cfg);
 		fflush(stdout);
 	}
 
@@ -13235,6 +13293,11 @@ int cl_arq_controller::test_sim_inproc_2()
 	// GAP-2 LIVE-PATH: one-shot guard for the forced SET_CONFIG jump (fired at most once,
 	// once the commander is CONNECTED and its control channel is idle).
 	bool force_setconfig_done = false;
+	// IN-BAND DOWN-LADDER RESYNC: one-shot guard for the forced demote-to-ROBUST + a
+	// flag for the recover leg (un-suppress A's announce once B has resynced, i.e. the
+	// first byte delivered means B adopted the demoted config via the down-ladder).
+	bool inband_lag_demote_done = false;
+	bool inband_lag_recovered   = false;
 	// GAP-2 LIVE-PATH: iter at which the stop-after-tx-emits threshold was first met (the
 	// grace window is measured from here). -1 = not yet armed. Loop-local (reset per run).
 	long emit_break_arm_iter = -1;
@@ -13563,6 +13626,60 @@ int cl_arq_controller::test_sim_inproc_2()
 			A->arq.gear_shift_on = NO;
 			B->arq.gear_shift_on = NO;
 			force_setconfig_done = true;
+		}
+
+		// --- IN-BAND DOWN-LADDER RESYNC: fire ONE production demote A->ROBUST once both
+		//     peers are CONNECTED and A's control channel is idle, with A's announce tag
+		//     SUPPRESSED (set up front). This is the gearshift's OWN demote mechanism (the
+		//     §3.1 chokepoint): set negotiated_configuration to the ROBUST target and call
+		//     add_message_control(SET_CONFIG) — under MERCURY_INBAND_RATE that takes the
+		//     UNILATERAL path (inband_unilateral_config_change loads ROBUST NOW; the next
+		//     send_batch W1-emits the tag, which we drop). A then transmits the payload as
+		//     ROBUST data frames; B, still at the start OFDM rung (announce never heard),
+		//     fails its primary OFDM decode and runs the production down-ladder over a window
+		//     that includes the ROBUST rung. The wire is left quiescent at injection (no
+		//     in-flight frame) exactly as the FORCE_SETCONFIG path requires. ---
+		if (inband_lag && !inband_lag_demote_done &&
+		    A->arq.link_status == CONNECTED && B->arq.link_status == CONNECTED &&
+		    A->arq.connection_status != TRANSMITTING_CONTROL &&
+		    A->arq.connection_status != RECEIVING_ACKS_CONTROL &&
+		    A->arq.messages_control.status == FREE &&
+		    size_buffer(wire_a2b) == 0 && size_buffer(wire_b2a) == 0 &&
+		    size_buffer(A->audio.play) == 0 && size_buffer(B->audio.play) == 0)
+		{
+			sim2_activate(A);
+			printf("[SIM2-INBAND-LAG] CONNECTED at cfg=%d; firing production DEMOTE -> "
+			       "CONFIG_%ld (announce suppressed -> B must down-ladder resync)\n",
+			       A->arq.current_configuration, inband_demote_cfg);
+			fflush(stdout);
+			// Restore any TX-staged frames to the FIFO so the demote re-encodes them at the
+			// ROBUST config (mirrors the production demote refill / the FORCE_SETCONFIG path).
+			for (int i = A->arq.nMessages - 1; i >= 0; i--) {
+				if (A->arq.messages_tx[i].status != FREE && A->arq.messages_tx[i].length > 0)
+					A->arq.fifo_buffer_tx.push_front(A->arq.messages_tx[i].data,
+					                                 A->arq.messages_tx[i].length);
+				A->arq.messages_tx[i].status = FREE;
+			}
+			A->arq.block_under_tx = NO;
+			A->arq.negotiated_configuration = (int)inband_demote_cfg;
+			A->arq.add_message_control(SET_CONFIG);          // unilateral drop + (suppressed) tag
+			A->arq.connection_status = TRANSMITTING_CONTROL; // neutralised by inband_unilateral_armed
+			inband_lag_demote_done = true;
+		}
+
+		// RECOVER leg: once B has delivered its FIRST byte the down-ladder DID resync B onto
+		// the demoted config (a total-loss down-ladder delivers nothing), so the §6
+		// demote->down-ladder->recover sequence has crossed its pivot. Un-suppress A's
+		// announce so any subsequent config change re-announces normally (B follows by tag,
+		// the implicit-confirm recover path) — proving the link is healthy post-resync, not
+		// permanently leaning on the down-ladder.
+		if (inband_lag && inband_lag_demote_done && !inband_lag_recovered && rx_have > 0)
+		{
+			A->arq.inband_test_suppress_announce_tx = false;
+			inband_lag_recovered = true;
+			printf("[SIM2-INBAND-LAG] B resynced via down-ladder (rx_have=%d) -> announce "
+			       "UN-suppressed (recover leg armed)\n", rx_have);
+			fflush(stdout);
 		}
 
 		// --- Track the commander's config switches (the climb path). ---
@@ -14315,6 +14432,163 @@ int cl_arq_controller::test_sim_inproc_sustain_outer()
 
 	restore_env();
 	printf("[TEST-SIM-SUSTAIN] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// IN-BAND DOWN-LADDER RESYNC REGRESSION (data-flow-inband-ondemote-zerobyte.md §6).
+//
+// Reproduces — and fixes — the HW 0-byte defect that the directed test_inband_fallback
+// structurally CANNOT reach (it forces a known preamble delay, pre-sizes the ring to the
+// decoder buffer, and only drops OFDM->OFDM single rungs). This drives the LIVE 2-instance
+// SIM_INPROC passband through the PRODUCTION inband_try_down_ladder_on_decode_fail with a
+// PRIMARY-derived capture snapshot over a window that spans the MFSK ROBUST rung — the exact
+// geometry the snapshot-sizing bug truncates.
+//
+// Setup (both peers, MERCURY_INBAND_RATE=1): CONNECT + pin at a low OFDM rung (CONFIG_1),
+// then the COMMANDER demotes to ROBUST_0 via the production chokepoint with its announce
+// CONFIG_TAG SUPPRESSED. The RESPONDER never hears the tag -> it LAGS at CONFIG_1 -> its
+// primary OFDM decode fails on the incoming ROBUST_0 frames -> its down-ladder must resync
+// over window [ROBUST_0 .. CONFIG_1].
+//
+//   FAIL-BEFORE (MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX=1): the snapshot is sized by the
+//     CONFIG_1 primary buffer (~128 sym) and the robust ring floor is NOT seated, so the
+//     ROBUST_0 frame (~336 sym) is truncated/zero-padded -> EVERY trial-decode fails ->
+//     0 batches decode -> 0 bytes delivered (the HW signature, reproduced in sim).
+//   PASS-AFTER (default): the snapshot is sized to the window-largest (ROBUST_0) buffer and
+//     the primary ring is pre-seated to hold a full robust frame, so the down-ladder DECODES
+//     ROBUST_0, the RESPONDER adopts it, and the payload delivers BYTE-FAITHFUL through the
+//     demote->down-ladder->recover sequence.
+//
+// The ONLY variable between the two arms is the Rank-1 snapshot/ring sizing fix — proving
+// the fix is load-bearing and that the down-ladder now decodes the ROBUST rung.
+int cl_arq_controller::test_inband_down_resync()
+{
+	printf("[TEST-INBAND-DOWN-RESYNC] ===== in-band down-ladder ROBUST resync: 0-byte "
+	       "fail-before (snapshot truncation) -> byte-faithful pass-after (Rank-1 fix) =====\n");
+	fflush(stdout);
+
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_INBAND_RATE", "MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX",
+		"MERCURY_SIM_2INST", "MERCURY_SIM2_INBAND_LAG", "MERCURY_SIM2_INBAND_DEMOTE_CFG",
+		"MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST", "MERCURY_SIM2_SNR3K",
+		"MERCURY_SIM2_SEED", "MERCURY_SIM2_PAYLOAD_BYTES", "MERCURY_SIM2_MAXITERS",
+		"MERCURY_SIM2_STALL_ITERS", "MERCURY_INBAND_DOWN_D", "MERCURY_INBAND_DEAD_BATCHES"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key   = keys[i];
+		env_saved[(size_t)i].had   = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name){
+		printf("[TEST-INBAND-DOWN-RESYNC] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	// =====================================================================================
+	// PART 1 (OPTIONAL, env MERCURY_INBAND_DOWN_E2E=1) — END-TO-END FAIL-BEFORE: the snapshot
+	// truncation reproduces 0-byte delivery through the LIVE 2-instance stepper (CONNECT+pin at
+	// CONFIG_1, CMD demote to ROBUST_0 with announce SUPPRESSED, RESPONDER down-ladder forced).
+	// This is the most literal §6 reproduction, BUT in the single-thread stepper the deeply-
+	// lagged MFSK-A/OFDM-B mismatch is sensitive to CONNECT/HAIL timing and can churn, so it is
+	// NOT a deterministic regression gate. It is kept env-gated for manual investigation; the
+	// DETERMINISTIC before/after is PART 2 (the directed decode proof on the same production
+	// down-ladder). Default OFF -> the automated --test-inband-down-resync runs PART 2 only.
+	// =====================================================================================
+	{
+		const char* e2e = std::getenv("MERCURY_INBAND_DOWN_E2E");
+		if(e2e && *e2e && atoi(e2e) != 0)
+		{
+		const long PAYLOAD = 160;
+		printf("[TEST-INBAND-DOWN-RESYNC] --- PART 1 (E2E, env-gated): FAIL-BEFORE "
+		       "(MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX=1: primary-sized snapshot truncates ROBUST_0) ---\n");
+		fflush(stdout);
+		set_env("MERCURY_INBAND_RATE",               "1");
+		set_env("MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX", "1");
+		set_env("MERCURY_SIM_2INST",                 "1");
+		set_env("MERCURY_SIM2_INBAND_LAG",           "1");
+		set_env("MERCURY_SIM2_INBAND_DEMOTE_CFG",    "100");   // ROBUST_0
+		set_env("MERCURY_SIM2_PIN",                  "0");     // harness drives the demote
+		set_env("MERCURY_SIM2_CFG",                  "1");     // CONNECT/data at CONFIG_1 (low OFDM)
+		set_env("MERCURY_SIM2_ROBUST",               "1");     // robust enabled (ROBUST_0 demote valid)
+		set_env("MERCURY_SIM2_SNR3K",                "900");   // clean
+		set_env("MERCURY_SIM2_SEED",                 "12345");
+		set_env("MERCURY_SIM2_MAXITERS",             "200000");
+		set_env("MERCURY_SIM2_STALL_ITERS",          "40000"); // bound the 0-byte fail-before arm
+		set_env("MERCURY_INBAND_DOWN_D",             "4");     // window reaches ROBUST_0 from CONFIG_1
+		set_env("MERCURY_INBAND_DEAD_BATCHES",       "400");
+		{ char b[32]; snprintf(b,sizeof(b),"%ld",PAYLOAD); set_env("MERCURY_SIM2_PAYLOAD_BYTES", b); }
+		sim2_last_rx_have = -1; sim2_last_payload_len = -1;
+		sim2_last_bytes_ok = false; sim2_last_stalled = false;
+		test_sim_inproc_2();
+		long before_rx       = sim2_last_rx_have;
+		bool before_bytes_ok = sim2_last_bytes_ok;
+		printf("[TEST-INBAND-DOWN-RESYNC] PART 1 E2E FAIL-BEFORE: rx_have=%ld/%ld bytes_ok=%d stalled=%d\n",
+		       before_rx, sim2_last_payload_len, (int)before_bytes_ok, (int)sim2_last_stalled);
+		fflush(stdout);
+		check(!before_bytes_ok && before_rx < PAYLOAD,
+		      "PART 1 (E2E): FAIL-BEFORE reproduced end-to-end — down-ladder truncated -> ROBUST_0 "
+		      "never decodes -> 0-byte delivery (the HW defect, in sim)");
+		}
+	}
+
+	// =====================================================================================
+	// PART 2 — DIRECTED DECODE PROOF of the Rank-1 fix on the production down-ladder. Lays a
+	// REAL ROBUST_0 frame into a PRODUCTION RX whose primary config is CONFIG_1 (small ring)
+	// and runs the PRODUCTION inband_try_down_ladder_on_decode_fail (the buggy site):
+	//   defeat=true  -> truncated snapshot -> ROBUST_0 does NOT decode -> RX does not adopt.
+	//   defeat=false -> ring seated + window-largest sizing -> ROBUST_0 DECODES (byte-faithful
+	//                   CRC/LDPC pass) -> RX ADOPTS ROBUST_0.
+	// This is the deterministic before/after on the EXACT fix (no fragile live-link timing).
+	// =====================================================================================
+	printf("[TEST-INBAND-DOWN-RESYNC] --- PART 2: DIRECTED decode proof "
+	       "(production down-ladder, real ROBUST_0 frame, real CONFIG_1 ring) ---\n");
+	fflush(stdout);
+	set_env("MERCURY_INBAND_RATE", "1");
+	printf("[TEST-INBAND-DOWN-RESYNC]   PART 2a: DEFEAT (truncated snapshot)\n"); fflush(stdout);
+	set_env("MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX", "1");
+	int rc_defeat = test_inband_down_resync_directed(/*defeat=*/true);
+	check(rc_defeat == 0,
+	      "PART 2a DEFEAT: truncated snapshot -> ROBUST_0 does NOT decode -> RX does not adopt "
+	      "(the HW 0-byte root, directly on the production down-ladder)");
+
+	printf("[TEST-INBAND-DOWN-RESYNC]   PART 2b: FIX (window-largest snapshot + ring seated)\n");
+	fflush(stdout);
+	set_env("MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX", "0");
+	int rc_fix = test_inband_down_resync_directed(/*defeat=*/false);
+	check(rc_fix == 0,
+	      "PART 2b FIX: full snapshot -> ROBUST_0 DECODES (real CRC/LDPC pass, byte-faithful) "
+	      "-> RX adopts ROBUST_0");
+
+	restore_env();
+	printf("[TEST-INBAND-DOWN-RESYNC] %s (%d failure%s)\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

@@ -689,6 +689,10 @@ int main(int argc, char *argv[])
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
                                         // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
                                         // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
+    bool test_inband_down_resync_cli = false; // --test-inband-down-resync: in-band down-ladder ROBUST resync —
+                                        // CMD demote-to-ROBUST_0 with announce SUPPRESSED forces the RSP's
+                                        // production down-ladder; fail-before (primary-sized snapshot truncates
+                                        // ROBUST_0 -> 0 bytes) -> pass-after (Rank-1 snapshot+ring sizing fix).
     bool test_bigblock_chanest_cli = false; // --test-bigblock-chanest: GENUINE (ref==NULL) 2-instance CFG16 big-block
                                         // decode under a CFO/SFO-impaired channel; reproduces the HW [RXACQ] meanH
                                         // collapse off-bench (clean passes, CFO/SFO collapses the block estimate).
@@ -1310,6 +1314,18 @@ int main(int argc, char *argv[])
             // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
             // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
             test_bigblock_multicw_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-down-resync") == 0)
+        {
+            // IN-BAND DOWN-LADDER RESYNC REGRESSION (data-flow-inband-ondemote-zerobyte.md §6):
+            // a CMD demote-to-ROBUST_0 with the announce CONFIG_TAG SUPPRESSED forces the RSP's
+            // production inband_try_down_ladder_on_decode_fail to resync from a PRIMARY-derived
+            // snapshot over a window spanning the MFSK ROBUST rung. FAIL-BEFORE truncates the
+            // ROBUST_0 frame -> 0-byte delivery (the HW defect); PASS-AFTER (Rank-1 snapshot+ring
+            // sizing fix) decodes ROBUST_0 + delivers byte-faithful. One-shot, then exit rc.
+            test_inband_down_resync_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2789,6 +2805,19 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
             printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_down_resync_cli) {
+            // IN-BAND DOWN-LADDER RESYNC REGRESSION (data-flow-inband-ondemote-zerobyte.md §6):
+            // CMD demote-to-ROBUST_0 with announce SUPPRESSED -> RSP down-ladder must resync from
+            // a primary-derived snapshot over a ROBUST-spanning window. Fail-before (truncation ->
+            // 0 bytes) -> pass-after (Rank-1 fix -> ROBUST_0 decodes, byte-faithful). One-shot.
+            printf("[FLAG] --test-inband-down-resync: invoking in-band down-ladder ROBUST "
+                   "resync regression (fail-before 0-byte -> pass-after byte-faithful)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_inband_down_resync();
+            printf("[FLAG] Inband-down-resync test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

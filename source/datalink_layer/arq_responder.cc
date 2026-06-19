@@ -498,6 +498,22 @@ void cl_arq_controller::process_messages_rx_data_control()
 			return;
 		}
 
+		// ─── STAGE 4 RANK-1 PREREQUISITE: seat the robust ring floor (once) ───
+		// The down-ladder reads the PRIMARY capture ring; that ring must physically hold a
+		// full ROBUST-rung frame or no snapshot-length change can recover the (never-captured)
+		// samples (data-flow-inband-ondemote-zerobyte.md §7/§8). Seat buffer_Nsymb_min to the
+		// ROBUST floor the FIRST time the responder is CONNECTED+RECEIVING under inband and the
+		// ring is between frames (no active batch) so the re-apply flush is harmless. Idempotent
+		// (the seat short-circuits once buffer_Nsymb_min >= floor); no-op when off / defeat set.
+		if(inband_rate_feature_enabled()
+		   && link_status == CONNECTED
+		   && connection_status == RECEIVING
+		   && !passive_monitor
+		   && !telecom_system->receive_stats.ofdm_batch_active)   // between frames: flush is safe
+		{
+			inband_seat_robust_ring_floor();
+		}
+
 		// ─── STAGE 4: LOST-TAG BOUNDED DOWN-LADDER (design §4 / §7) ───
 		// The §3.2 outcome-3 recovery. receive() above (:433) returned with NO decoded
 		// DATA frame at current_configuration AND no CRC-valid CONFIG_TAG followed (the
@@ -5081,6 +5097,225 @@ int cl_arq_controller::test_inband_fallback()
 
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// IN-BAND DOWN-LADDER ROBUST RESYNC — DIRECTED DECODE PROOF
+// (data-flow-inband-ondemote-zerobyte.md §2.4/§6/§7, Rank-1 fix)
+// ============================================================================
+//
+// Proves the Rank-1 snapshot+ring-sizing fix on the EXACT production path the directed
+// test_inband_fallback structurally AVOIDS: it lays a REAL ROBUST_0 (MFSK, ~336-symbol)
+// data frame into a PRODUCTION RX whose primary config is a LOW OFDM rung (CONFIG_1, ring
+// ~212 symbols), then calls the PRODUCTION inband_try_down_ladder_on_decode_fail() — which
+// sizes the capture snapshot itself (the buggy site). NO buffer_Nsymb_min pre-force, NO
+// ofdm_forced_delay — real acquisition, the real primary ring.
+//
+//   defeat=true  (MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX path): the ring stays CONFIG_1-sized
+//     (~212 sym) and the snapshot is primary-sized, so the 336-symbol ROBUST_0 frame does
+//     NOT fit / is truncated -> the down-ladder's ROBUST_0 trial-decode FAILS -> the RX
+//     does NOT adopt (current_configuration stays CONFIG_1). This is the HW 0-byte root.
+//   defeat=false (the fix): inband_seat_robust_ring_floor grows the primary ring to the
+//     ROBUST floor (~804 sym) and the snapshot is sized to the window-largest buffer, so a
+//     FULL ROBUST_0 frame fits -> the down-ladder DECODES it (real CRC/LDPC pass) -> the RX
+//     ADOPTS ROBUST_0 and the decoded bytes are BYTE-FAITHFUL to the transmitted frame.
+//
+// The ONLY variable is the fix. Returns 0 on the expected outcome for `defeat`, else 1.
+/*static*/ int cl_arq_controller::test_inband_down_resync_directed(bool defeat)
+{
+	const char* TAG = "[TEST-INBAND-DOWN-DIRECT]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what) {
+		printf("%s %s: %s\n", TAG, cond ? "PASS" : "FAIL", what);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	const int RX_CFG    = CONFIG_1;   // low OFDM rung (ladder idx 4): ring ~212 sym
+	const int ROBUST_CFG = ROBUST_0;  // MFSK 1/16, ~336-sym frame (idx 0; in [0..4] for D=4)
+
+	// --- 1. Generate a REAL ROBUST_0 data frame on a near-clean wire (the BER recipe,
+	//        telecom_system.cc:482-517 / the test_inband_fallback tx_frame_to_window). The
+	//        frame is laid into a TX-side passband_delayed_data at a known preamble delay;
+	//        we then copy the whole frame span out for the RX ring. ---
+	std::vector<double> frame_audio;
+	std::vector<int>    truth_bytes;
+	int frame_span_samples = 0;
+	{
+		cl_telecom_system* ts = new cl_telecom_system();
+		ts->operation_mode     = ARQ_MODE;
+		ts->narrowband_enabled = NO;
+		ts->load_configuration(ROBUST_CFG);   // natural ROBUST_0 buffer (~804 sym)
+		int interp = ts->frequency_interpolation_rate;
+		int Nofdm  = ts->data_container.Nofdm;
+		int preN   = ts->data_container.preamble_nSymb;
+		int Nsymb  = ts->data_container.Nsymb;
+		int frame_bytes = ts->get_frame_size_bytes();
+		if(frame_bytes <= 0) frame_bytes = 1;
+		truth_bytes.assign((size_t)frame_bytes, 0);
+		for(int i = 0; i < frame_bytes; i++) truth_bytes[i] = (i * 37 + 11) & 0xFF;
+		std::vector<int> payload(truth_bytes.begin(), truth_bytes.end());
+		ts->transmit_byte(payload.data(), frame_bytes,
+			ts->data_container.passband_data, SINGLE_MESSAGE);
+		// Position the preamble a few symbols in (the BER delay convention); near-clean sigma.
+		int lead = 8;
+		int forced_delay = ((preN + 2) * Nofdm + lead) * interp;
+		float sigma = 1e-3f;
+		int n_frame = (Nofdm * (Nsymb + preN)) * interp;
+		ts->awgn_channel.apply_with_delay(
+			ts->data_container.passband_data,
+			ts->data_container.passband_delayed_data,
+			sigma, n_frame, forced_delay);
+		// The frame occupies [0, forced_delay + n_frame). Copy that whole span out.
+		int span = forced_delay + n_frame + Nofdm * interp;   // + 1 symbol tail margin
+		int ring_cap = ts->data_container.Nofdm * ts->data_container.buffer_Nsymb.load()
+			* ts->data_container.interpolation_rate;
+		if(span > ring_cap) span = ring_cap;
+		frame_audio.assign((size_t)span, 0.0);
+		for(int i = 0; i < span; i++)
+			frame_audio[i] = ts->data_container.passband_delayed_data[i];
+		frame_span_samples = span;
+		delete ts;
+	}
+	check(frame_span_samples > 0 && !truth_bytes.empty(),
+	      "D0 generated a real ROBUST_0 frame (TX recipe, near-clean wire)");
+
+	// The seat + down-ladder take capture_prep_mutex (MUTEX_LOCK). In this standalone
+	// directed test (no audio device) the global mutex may be NULL — create it so the
+	// production locks are real (uncontended: single thread). Mirrors test_sim_inproc_2.
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// --- 2. Build a PRODUCTION RX at the LOW OFDM rung, CONNECTED+RECEIVING, inband ON,
+	//        robust enabled. NO buffer_Nsymb_min pre-force: the primary ring is the
+	//        CONFIG_1-natural size — exactly the geometry the bug truncates. ---
+	cl_telecom_system* ts_rx = new cl_telecom_system();
+	cl_arq_controller* rx    = new cl_arq_controller();
+	ts_rx->operation_mode  = ARQ_MODE;
+	ts_rx->narrowband_enabled = NO;
+	rx->telecom_system     = ts_rx;
+	rx->narrowband_enabled = NO;
+	rx->role               = RESPONDER;
+	rx->robust_enabled     = YES;
+	rx->sack_v2_enabled    = true;
+	rx->load_configuration(RX_CFG, FULL, NO);
+	rx->link_status        = CONNECTED;
+	rx->connection_status  = RECEIVING;
+	rx->inband_down_d      = 4;            // window [0..4] from CONFIG_1 reaches ROBUST_0
+	rx->inband_dead_batches_limit = 1000;  // do not BREAK during the directed attempt(s)
+	// inband_test_forced_down_delay stays -1 (real acquisition — the production path).
+
+	int rx_ring_cap = ts_rx->data_container.Nofdm * ts_rx->data_container.buffer_Nsymb.load()
+		* ts_rx->data_container.interpolation_rate;
+	int rx_buf_nsymb_before = ts_rx->data_container.buffer_Nsymb.load();
+
+	// --- 3. The fix-arm seats the robust ring floor (grows the primary ring to hold a full
+	//        ROBUST_0 frame); the defeat arm leaves the ring CONFIG_1-sized (truncation). The
+	//        production RX receive path calls inband_seat_robust_ring_floor at this same point
+	//        (arq_responder.cc, before the down-ladder). We invoke it directly here. ---
+	if(!defeat)
+		rx->inband_seat_robust_ring_floor();
+	rx_ring_cap = ts_rx->data_container.Nofdm * ts_rx->data_container.buffer_Nsymb.load()
+		* ts_rx->data_container.interpolation_rate;
+	int rx_buf_nsymb_after = ts_rx->data_container.buffer_Nsymb.load();
+	printf("%s ring buffer_Nsymb: before=%d after=%d (defeat=%d)\n",
+	       TAG, rx_buf_nsymb_before, rx_buf_nsymb_after, (int)defeat);
+	fflush(stdout);
+
+	// --- 4. Lay the ROBUST_0 frame into the RX's REAL capture ring, modeling the PRODUCTION
+	//        ROLLING ring faithfully: the capture-prep thread writes the incoming frame one
+	//        symbol at a time, so when a 336-symbol ROBUST_0 frame arrives into a ring that
+	//        can only hold rx_ring_cap samples, the ring ends up holding the LAST rx_ring_cap
+	//        samples of the frame. If rx_ring_cap < the full frame, the PREAMBLE (frame start)
+	//        has SCROLLED OUT -> no acquisition possible (the HW lag signature). We model that
+	//        by laying the TAIL window [frame_span - rx_ring_cap, frame_span). With the seated
+	//        804-sym ring the WHOLE frame (preamble first) fits -> acquisition + decode. ---
+	int copy = (frame_span_samples < rx_ring_cap) ? frame_span_samples : rx_ring_cap;
+	int src_off = frame_span_samples - copy;   // tail window (0 when the whole frame fits)
+	for(int i = 0; i < copy; i++)
+		ts_rx->data_container.passband_delayed_data[i] = frame_audio[(size_t)(src_off + i)];
+	// Zero any ring tail beyond the laid window (defensive; the ring is freshly allocated).
+	for(int i = copy; i < rx_ring_cap; i++)
+		ts_rx->data_container.passband_delayed_data[i] = 0.0;
+	ts_rx->data_container.ring_write_index = 0;
+	ts_rx->data_container.data_ready       = 1;
+	rx->messages_rx_buffer.status          = FREE;   // != RECEIVED (no frame this pass)
+	rx->rsp_current_expected_batch_seq_id  = -1;
+	printf("%s laid frame span=%d into ring_cap=%d (copy=%d from off=%d, preamble_scrolled_out=%d)\n",
+	       TAG, frame_span_samples, rx_ring_cap, copy, src_off, (int)(src_off > 0));
+	fflush(stdout);
+
+	// --- 5. Run the PRODUCTION down-ladder entry (the buggy snapshot-sizing site). It reads
+	//        the ring, sizes the snapshot, builds the D+1 bank, and trial-decodes. On a real
+	//        ROBUST_0 CRC/LDPC pass it ADOPTS ROBUST_0 (current_configuration tracks it). ---
+	int cfg_before = rx->current_configuration;
+	rx->inband_try_down_ladder_on_decode_fail();
+	int cfg_after = rx->current_configuration;
+	printf("%s down-ladder: cur %d -> %d (winner expected=%d on fix, none on defeat)\n",
+	       TAG, cfg_before, cfg_after, ROBUST_CFG);
+	fflush(stdout);
+
+	if(defeat)
+	{
+		// Truncated snapshot -> ROBUST_0 cannot decode -> the RX does NOT adopt it.
+		check(cfg_after != ROBUST_CFG,
+		      "DEFEAT: truncated snapshot -> ROBUST_0 does NOT decode -> RX does not adopt "
+		      "(the HW 0-byte root, reproduced directly)");
+	}
+	else
+	{
+		// Full snapshot -> ROBUST_0 decodes (real CRC/LDPC pass) -> the RX ADOPTS it.
+		check(cfg_after == ROBUST_CFG,
+		      "FIX: full snapshot (ring seated + window-largest sizing) -> ROBUST_0 DECODES "
+		      "-> RX adopts ROBUST_0");
+		check(rx_buf_nsymb_after > rx_buf_nsymb_before,
+		      "FIX: the robust ring floor was seated (primary ring grew to hold a robust frame)");
+
+		// BYTE-FAITHFULNESS: the production adopt above FLUSHED the ring (HINGE-1 capture flush,
+		// inband_adopt_resynced_config), so re-lay the SAME frame into the (still-seated, 804)
+		// ring and run inband_down_ladder_resync DIRECTLY to capture the decoded bytes
+		// (out_decoded, staged BEFORE the adopt). current_configuration is now ROBUST_0, so the
+		// down-window center is ROBUST_0 (idx 0) — the bank includes it. The adopt fired on a
+		// REAL CRC/LDPC pass (INV-S4-1), so the recovered bytes must match the TX truth bytes.
+		int win_cap = ts_rx->data_container.Nofdm * ts_rx->data_container.buffer_Nsymb.load()
+			* ts_rx->data_container.interpolation_rate;
+		int relay = (frame_span_samples < win_cap) ? frame_span_samples : win_cap;
+		int relay_off = frame_span_samples - relay;
+		for(int i = 0; i < relay; i++)
+			ts_rx->data_container.passband_delayed_data[i] = frame_audio[(size_t)(relay_off + i)];
+		for(int i = relay; i < win_cap; i++)
+			ts_rx->data_container.passband_delayed_data[i] = 0.0;
+		ts_rx->data_container.ring_write_index = 0;
+		std::vector<int> got((size_t)(N_MAX / 8), 0);
+		int got_len = 0;
+		int win2 = rx->inband_down_ladder_resync(
+			ts_rx->data_container.passband_delayed_data, win_cap,
+			rx->inband_down_window_depth(), /*expect_bsi_lsb=*/0xFF,
+			got.data(), &got_len);
+		bool bytes_ok = (win2 == ROBUST_CFG) && (got_len >= (int)truth_bytes.size());
+		if(bytes_ok)
+		{
+			for(size_t i = 0; i < truth_bytes.size(); i++)
+				if((got[i] & 0xFF) != (truth_bytes[i] & 0xFF)) { bytes_ok = false; break; }
+		}
+		check(bytes_ok,
+		      "FIX: the down-ladder-decoded ROBUST_0 bytes are BYTE-FAITHFUL to the transmitted "
+		      "frame (real CRC/LDPC pass, not a guess)");
+	}
+
+	delete rx; delete ts_rx;
+
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+
+	printf("%s %s (failed=%d, defeat=%d)\n", TAG,
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, (int)defeat);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }

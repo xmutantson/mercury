@@ -1574,6 +1574,15 @@ public:
   // (MERGE: renamed *_outer() so it coexists with the PINNED-CFG15 sustain test below; both
   //  run under --test-sim-sustain.)
   static int test_sim_inproc_sustain_outer();
+  // IN-BAND DOWN-LADDER RESYNC REGRESSION (data-flow-inband-ondemote-zerobyte.md §6):
+  // drives the LIVE 2-instance SIM_INPROC through a CMD demote-to-ROBUST_0 with the
+  // announce CONFIG_TAG SUPPRESSED, forcing the RESPONDER's production down-ladder to
+  // resync from a PRIMARY-derived snapshot over a window spanning the MFSK ROBUST rung.
+  // FAIL-BEFORE (MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX=1): the primary-sized snapshot
+  // truncates the ROBUST_0 frame -> 0-byte delivery (the HW defect, in sim). PASS-AFTER
+  // (Rank-1 snapshot+ring sizing fix): the down-ladder decodes ROBUST_0 and the payload
+  // delivers byte-faithful. Returns 0 on PASS. Selected by --test-inband-down-resync.
+  static int test_inband_down_resync();
   // MULTI-CW WINDOW REGRESSION (fact-doc §17): the K>1 full-block byte-faithfulness test
   // the 622-byte synthetic cases and the single-arming fullpath could NOT catch. Drives a
   // FULL K=8 block (1200B, all 8 codewords) through the LIVE receive_bigblock+de-whiten+
@@ -1955,6 +1964,16 @@ public:
   // drop is unrecoverable -> BREAK-count>0. Returns 0=PASS, 1=FAIL. design §4/§7,
   // data-flow-perbatch-config.md §13.6.
   int test_inband_fallback();
+
+  // IN-BAND DOWN-LADDER ROBUST RESYNC — DIRECTED DECODE PROOF
+  // (data-flow-inband-ondemote-zerobyte.md §2.4/§6/§7, Rank-1 fix). Lays a REAL ROBUST_0
+  // frame into a PRODUCTION RX whose primary config is a LOW OFDM rung (CONFIG_1, small
+  // ring) and runs the PRODUCTION inband_try_down_ladder_on_decode_fail (the buggy
+  // snapshot-sizing site) with REAL acquisition. defeat=true: the truncated primary-sized
+  // snapshot -> ROBUST_0 does NOT decode -> no adopt (the HW 0-byte root, direct).
+  // defeat=false (fix): the robust ring floor is seated + the snapshot is window-largest-
+  // sized -> ROBUST_0 DECODES -> RX adopts ROBUST_0. Returns 0 on the expected outcome.
+  static int test_inband_down_resync_directed(bool defeat);
 
   // STAGE 3d PRE-FRAME (SEAMLESS) TEST (CLI --test-inband-seamless). Builds the REAL
   // wire window [tag burst][OFDM frame] (the DVB-S2 PLHEADER pre-frame order) and drives
@@ -3277,6 +3296,14 @@ public:
   int  inband_dead_batches_limit = -1;        // cached MERCURY_INBAND_DEAD_BATCHES (-1=unresolved)
   bool inband_terminal_break_due = false;     // set when the dead-batch streak hit the limit (caller fires BREAK)
   int  inband_test_forced_down_delay = -1;    // TEST-ONLY: forced preamble delay for scoped decoders (-1=real acquisition)
+  // TEST-ONLY: when true, emit_config_tag_passband runs its firing-decision state
+  // machine (parity/latch/R-counter advance as if announced) but DOES NOT key the
+  // announce burst onto the wire (the tx_transfer is skipped). This forces the RX to
+  // never hear the CONFIG_TAG, so its current_configuration LAGS the TX and the
+  // production down-ladder must resync from a primary-derived capture snapshot — the
+  // exact HW 0-byte path (data-flow-inband-ondemote-zerobyte.md §6). Default false →
+  // production keys the burst normally (byte-identical when off).
+  bool inband_test_suppress_announce_tx = false;
   // RX receive-loop entry: when receive() returned with NO decoded data frame at the
   // current OFDM config (a possible lost tag), run the bounded down-ladder. On a
   // resync it adopts the true config (BREAK avoided); on a total-loss batch it
@@ -3292,6 +3319,22 @@ public:
   int  inband_session_dead_limit();
   // Tear down the scoped down-window bank (NB/WB switch or session reset).
   void inband_free_down_decoders();
+  // RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §2.4/§7): the buffer_Nsymb the
+  // down-window decoder BANK uses for the CURRENT RX config = the largest (most-robust)
+  // config in the window [cur-D..cur]. The captured snapshot is sized to THIS (not the
+  // primary) so a robust-rung frame is not truncated. Returns 0 if cur is off-ladder.
+  int  inband_down_window_buffer_nsymb();
+  // RANK-1 FIX: the buffer_Nsymb of the deepest reachable rung (ROBUST_0). The primary
+  // capture ring is seated to at least this (in symbols) so a full robust frame fits.
+  int  inband_robust_floor_buffer_nsymb();
+  // RANK-1 FIX: seat the primary capture ring's buffer_Nsymb_min to the ROBUST floor
+  // (re-applying the PHY config if the ring is currently smaller) so the down-ladder can
+  // read a full robust frame. Idempotent; no-op when off / defeat set / already seated.
+  void inband_seat_robust_ring_floor();
+  // FAIL-BEFORE / A-B knob: MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX (cached). 1 = pre-fix
+  // primary-config snapshot sizing + no ring seat (reproduces the 0-byte truncation).
+  bool inband_down_defeat_snapfix();
+  int  inband_down_defeat_snapfix_cached = -1;   // -1=unresolved, 0=off (fixed), 1=defeat
 
   // Stage 3b GEARSHIFT DRIVE (unilateral drop). When MERCURY_INBAND_RATE is set,
   // add_message_control(SET_CONFIG) takes the UNILATERAL path (inband_unilateral_config_change)

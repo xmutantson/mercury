@@ -10998,6 +10998,45 @@ void cl_telecom_system::load_configuration(int configuration)
 		ack_pattern_detection_threshold);
 }
 
+// Grow the capture ring (passband_delayed_data etc.) to hold at least `min_nsymb` symbols
+// WITHOUT a config change. Both load_configuration paths SKIP a same-config re-apply
+// (telecom_system.cc:10052 / arq_common.cc:1998), so the in-band down-ladder's robust ring
+// floor (data-flow-inband-ondemote-zerobyte.md §7) cannot be seated by re-loading the same
+// config. This re-runs data_container.set_size with the CURRENT geometry + the raised
+// buffer_Nsymb_min, re-allocating passband_delayed_data at the larger size. Holds
+// capture_prep_mutex across the realloc (Bug #42). No-op if already large enough or no
+// config is loaded. Idempotent.
+void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
+{
+	if(min_nsymb <= 0) return;
+	if(current_configuration == CONFIG_NONE) return;
+	if(data_container.Nofdm <= 0) return;
+	if(data_container.buffer_Nsymb >= min_nsymb && data_container.buffer_Nsymb_min >= min_nsymb)
+		return;   // already seated
+
+	MUTEX_LOCK(&capture_prep_mutex);
+	data_container.buffer_Nsymb_min = min_nsymb;
+	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),
+	// branching on the live modulation. set_size frees + re-allocates all data_container
+	// buffers honoring buffer_Nsymb_min (data_container.cc:161), so the ring grows.
+	if(M == MOD_MFSK)
+	{
+		int M_eff = 1 << mfsk.bits_per_symbol();
+		data_container.set_size(ofdm.Nsymb, ofdm.Nc, M_eff, ofdm.Nfft,
+			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	else
+	{
+		data_container.set_size(ofdm.pilot_configurator.nData, ofdm.Nc, M, ofdm.Nfft,
+			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	data_container.ring_write_index = 0;
+	data_container.data_ready = 0;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+}
+
 void cl_telecom_system::return_to_last_configuration()
 {
 	int tmp;

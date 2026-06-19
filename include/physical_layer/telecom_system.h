@@ -818,6 +818,11 @@ public:
 
 	void load_configuration();
 	void load_configuration(int configuration);
+	// Grow the capture ring to >= min_nsymb symbols WITHOUT a config change (a same-config
+	// re-load is skipped). Re-runs data_container.set_size with the current geometry + the
+	// raised buffer_Nsymb_min. Used to seat the in-band down-ladder robust ring floor
+	// (data-flow-inband-ondemote-zerobyte.md §7). Mutex-protected; idempotent.
+	void force_resize_capture_ring(int min_nsymb);
 	int last_configuration;
 	int current_configuration;
 	void return_to_last_configuration();

@@ -2792,6 +2792,21 @@ int cl_arq_controller::emit_config_tag_passband(int batch_cfg, int batch_seq_id)
 	if(written <= 0)
 		return 0;
 
+	// TEST-ONLY (data-flow-inband-ondemote-zerobyte.md §6 fail-before repro): drop the
+	// announce burst so the RX never hears the tag and its config LAGS the TX, forcing
+	// the production down-ladder to resync from a primary-derived snapshot. The firing-
+	// decision state machine already advanced above (parity/latch/R-counter), so the TX
+	// behaves as if it announced — only the wire write is skipped. Default false (off) →
+	// the burst is keyed normally; byte-identical for every production path.
+	if(inband_test_suppress_announce_tx)
+	{
+		printf("[INBAND-TX] CONFIG_TAG announce SUPPRESSED (test) cfg=%d bsi_lsb=%u "
+			"parity=%u (RX will lag -> down-ladder resync)\n",
+			batch_cfg, (unsigned)bsi_lsb, (unsigned)parity);
+		fflush(stdout);
+		return written;
+	}
+
 	// Transmit the burst on the wire, right after frame 0 (deterministic offset).
 	tx_transfer(burst.data(), (size_t)written);
 
@@ -3593,6 +3608,110 @@ int cl_arq_controller::inband_session_dead_limit()
 	return inband_dead_batches_limit;
 }
 
+// Return the buffer_Nsymb the down-window decoder bank WILL use for the CURRENT RX
+// config — i.e. the LARGEST (most-robust = lowest ladder index) config in the window
+// [cur-D .. cur]. This is the SAME value inband_ensure_down_decoders forces onto every
+// trial decoder (arq_common.cc:3636), computed here BEFORE the snapshot is captured so
+// the capture length can match the bank (the Rank-1 fix,
+// data-flow-inband-ondemote-zerobyte.md §2.4/§7). Returns 0 if the current config is not
+// on the ladder. NB/WB resolves via telecom_system->narrowband_enabled, exactly like the
+// bank probe.
+int cl_arq_controller::inband_down_window_buffer_nsymb()
+{
+	if(telecom_system == NULL) return 0;
+	int cur_idx = config_ladder_index(current_configuration);
+	if(cur_idx < 0) return 0;
+	int D = inband_down_window_depth();
+	int lo_idx = cur_idx - D; if(lo_idx < 0) lo_idx = 0;
+	// The bank caps the window at INBAND_DOWN_D_MAX+1 wide (lo bumped up), so the LARGEST
+	// config it actually scopes is FULL_CONFIG_LADDER[lo_idx] after that same clamp.
+	int count = cur_idx - lo_idx + 1;
+	if(count > INBAND_DOWN_D_MAX + 1) lo_idx = cur_idx - INBAND_DOWN_D_MAX;
+	int low_cfg = FULL_CONFIG_LADDER[lo_idx];
+	cl_telecom_system tmp;
+	tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+	tmp.load_configuration(low_cfg);
+	int n = tmp.data_container.buffer_Nsymb.load();
+	return n;   // tmp destructs here, freeing its buffers
+}
+
+// Return the buffer_Nsymb of the DEEPEST reachable down-ladder rung (FULL_CONFIG_LADDER[0]
+// = ROBUST_0 when robust_enabled, else CONFIG_0). The primary capture ring MUST be at
+// least this large (in symbols) so a full robust-rung frame physically fits in the ring
+// the down-ladder reads — otherwise no snapshot-length change can help (the bytes are not
+// in the ring). Mirrors init_monitor_decoders's CONFIG_0 probe (arq_common.cc:1767-1773),
+// but anchored on the ROBUST floor (the MFSK frame is the largest, ~336 sym). Rank-1 fix
+// (data-flow-inband-ondemote-zerobyte.md §7 / §8 [?]). Returns 0 on error.
+int cl_arq_controller::inband_robust_floor_buffer_nsymb()
+{
+	if(telecom_system == NULL) return 0;
+	int floor_cfg = FULL_CONFIG_LADDER[0];   // ROBUST_0 (the most-robust, largest frame)
+	cl_telecom_system tmp;
+	tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+	tmp.load_configuration(floor_cfg);
+	int n = tmp.data_container.buffer_Nsymb.load();
+	return n;   // tmp destructs here
+}
+
+// FAIL-BEFORE / A-B knob (data-flow-inband-ondemote-zerobyte.md §6): resolve+cache
+// MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX. When 1 the down-ladder snapshot is sized by the
+// PRIMARY config (the pre-fix behavior) AND the robust ring floor is NOT seated, so the
+// SAME binary reproduces the 0-byte down-ladder truncation. Default 0 = the Rank-1 fix is
+// active. Production never sets it. -1 = unresolved, cached on first call.
+bool cl_arq_controller::inband_down_defeat_snapfix()
+{
+	if(inband_down_defeat_snapfix_cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX");
+		inband_down_defeat_snapfix_cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return inband_down_defeat_snapfix_cached == 1;
+}
+
+// RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §7 / §8 [?]): seat the primary capture
+// ring's buffer_Nsymb_min to the DEEPEST reachable down-ladder rung (ROBUST_0) so the ring
+// PHYSICALLY holds a full robust-rung frame the down-ladder can read. Without this the
+// primary ring (sized for a high-OFDM config, ~128 sym) is far smaller than a ROBUST_0
+// frame (~336 sym), so no snapshot-length change can recover the missing samples — they
+// were never captured. Mirrors init_monitor_decoders's primary buffer_Nsymb_min seat
+// (arq_common.cc:1794), but anchored on the ROBUST floor. Sets buffer_Nsymb_min and, if it
+// GREW, re-applies the current PHY config so passband_delayed_data is re-allocated at the
+// larger size NOW (load_configuration honors buffer_Nsymb_min via data_container::set_size,
+// data_container.cc:161). No-op when the feature is off, the defeat knob is set, or the
+// floor already fits. Idempotent. Called from the RX receive path before the down-ladder.
+void cl_arq_controller::inband_seat_robust_ring_floor()
+{
+	if(!inband_rate_feature_enabled()) return;
+	if(inband_down_defeat_snapfix()) return;          // fail-before arm: leave the ring small
+	if(telecom_system == NULL) return;
+	int floor_nsymb = inband_robust_floor_buffer_nsymb();
+	if(floor_nsymb <= 0) return;
+	if(telecom_system->data_container.buffer_Nsymb_min >= floor_nsymb)
+		return;                                       // already seated (idempotent)
+
+	telecom_system->data_container.buffer_Nsymb_min = floor_nsymb;
+	// If the current ring is already >= the floor (e.g. the RX is parked at ROBUST itself)
+	// the seat alone is enough; the next config switch keeps it. If the current ring is
+	// SMALLER (the RX is lagged at a high-OFDM rung — the exact down-ladder case), re-apply
+	// the current PHY config so the ring is re-allocated at the larger size immediately.
+	if(telecom_system->data_container.buffer_Nsymb < floor_nsymb
+	   && current_configuration != CONFIG_NONE
+	   && config_ladder_index(current_configuration) >= 0)
+	{
+		printf("[INBAND-RX] seating robust ring floor: buffer_Nsymb_min=%d (was ring %d) "
+			"-> resizing the CONFIG_%d capture ring to hold a full robust frame\n",
+			floor_nsymb, (int)telecom_system->data_container.buffer_Nsymb,
+			current_configuration);
+		fflush(stdout);
+		// BOTH load_configuration paths SKIP a same-config re-apply (arq_common.cc:1998,
+		// telecom_system.cc:10052), so re-loading the current config would NOT re-run
+		// data_container.set_size() (the ONLY place buffer_Nsymb_min is honored) and the
+		// ring would keep its old (small) size. force_resize_capture_ring re-runs set_size
+		// with the current geometry + the raised floor (mutex-protected), growing the ring.
+		telecom_system->force_resize_capture_ring(floor_nsymb);
+	}
+}
+
 void cl_arq_controller::inband_free_down_decoders()
 {
 	for(int i = 0; i <= INBAND_DOWN_D_MAX; i++)
@@ -3861,11 +3980,37 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 
 	// Pull the captured passband window the same way the W2 tag decode does
 	// (inband_detect_follow_from_capture / the ACK ctrl-suffix decode). The down-ladder
-	// needs the FULL first-frame snapshot (a whole OFDM frame, not just the tag tail),
-	// so read the whole signal_period window the primary just failed to decode.
+	// needs the FULL first-frame snapshot (a whole OFDM frame, not just the tag tail).
+	//
+	// RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §2.4/§7): the snapshot MUST be
+	// sized to the buffer_Nsymb the decoder BANK uses — the LARGEST (most-robust) config
+	// in the down-window — NOT the primary config's buffer_Nsymb. The bank force-sizes
+	// every trial decoder to inband_down_window_buffer_nsymb (arq_common.cc:3636); when
+	// the window spans the ROBUST rungs a ROBUST_0 frame (~336 sym) is far larger than a
+	// high-OFDM primary buffer (~13-128 sym), so a primary-sized snapshot truncates EVERY
+	// trial-decode to zero-pad -> 0/N decodes -> 0 bytes (the HW 0-byte defect). Size the
+	// snapshot from the window-largest config so the captured window contains a full
+	// robust-rung frame. The primary capture RING is pre-sized to hold a robust frame (the
+	// buffer_Nsymb_min seat in inband_seat_robust_ring_floor, §8 [?]), so reading
+	// signal_period samples from [rwi, rwi+ring_cap) is contiguous and valid.
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
-	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int prim_buf_nsymb = telecom_system->data_container.buffer_Nsymb;   // physical ring nsymb
+	int win_buf_nsymb  = prim_buf_nsymb;
+	// FAIL-BEFORE / A-B DEFEAT (data-flow-inband-ondemote-zerobyte.md §6 repro): when
+	// MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX=1 force the OLD primary-config sizing so the SAME
+	// binary reproduces the 0-byte down-ladder truncation. Production never sets it; the
+	// regression --test-inband-down-resync runs the defeat arm (fail-before) then the
+	// fixed arm (pass-after).
+	if(!inband_down_defeat_snapfix())
+	{
+		int w = inband_down_window_buffer_nsymb();   // the bank's largest-cfg buffer_Nsymb
+		if(w > win_buf_nsymb) win_buf_nsymb = w;     // grow to the robust-rung frame size
+	}
+	// Clamp to the physical ring capacity so the read never spills past the contiguous
+	// double-mapped region (defensive: the ring floor seat should already make this a no-op).
+	if(win_buf_nsymb > prim_buf_nsymb) win_buf_nsymb = prim_buf_nsymb;
+	int signal_period = sym_samples * win_buf_nsymb;
 	if(signal_period <= 0) return;
 
 	// === Energy gate (IDENTICAL to parallel_monitor_decode, arq_common.cc:1838-1852).
