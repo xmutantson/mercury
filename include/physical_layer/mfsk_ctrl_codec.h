@@ -50,6 +50,18 @@ enum mfsk_ctrl_frame_type : uint8_t {
 	MFSK_CTRL_TEST_ACK   = 2,  // RSP → CMD: cap echo + own cap + SSID
 	MFSK_CTRL_TEST_CONN  = 3,  // reserved (Wave 2+ — quantized SNR + cap)
 	MFSK_CTRL_CONFIG_TAG = 4,  // OD-1: in-band rate-adaptation config tag (3-bit type)
+	// Stage 4e (D2 NACK first-class, inband-reliability-design.md §2): the RX
+	// FAST-signals "I could not follow / could not decode" on the reverse robust layer.
+	// Rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as CONFIG_TAG, type=5 (the first
+	// free 3-bit code after the 2->3 widen). Codes 6,7 remain free.
+	MFSK_CTRL_NACK       = 5,
+};
+
+// Stage 4e (D2) NACK reason codes (2-bit field in the NACK payload).
+enum mfsk_ctrl_nack_reason : uint8_t {
+	NACK_DECODE_FAIL        = 0,  // the down-ladder could not decode the batch at any window config
+	NACK_UNFOLLOWABLE_CLIMB = 1,  // a tag was heard announcing a config the RX cannot adopt
+	// 2, 3 reserved (e.g. BUFFER_FULL, NB_ONLY)
 };
 
 // =============================================================================
@@ -444,5 +456,53 @@ bool config_tag_wrap_decode(const double* energies,
                             uint8_t expect_bsi_lsb, uint8_t expect_parity,
                             ctrl_crc12_fn crc12_fn, void* crc12_ctx,
                             config_tag_decode_result* out);
+
+// =============================================================================
+// Stage 4e (D2 NACK first-class, inband-reliability-design.md §2) — NACK codec
+// =============================================================================
+//
+// The NACK rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as the CONFIG_TAG, with
+// type=MFSK_CTRL_NACK=5. The RM(1,4) Walsh prefix carries `rx_cfg_index` (the FWHT
+// cfg corroboration, exactly as the tag's prefix carries cfg_index); the gf16ra/
+// CRC-12 message carries the 37-bit NACK payload below. Decode is the SAME WRAP
+// (FWHT peak + GF(16)+CRC-12 + cfg corroboration), type-discriminated to NACK.
+//
+// NACK payload (37 bits) — MSB-first, the SAME bit-slot discipline as
+// pack_config_tag_payload:
+//   bits 36..32 : rx_cfg_index        (5)  the LADDER INDEX the RX is ACTUALLY running
+//   bits 31..29 : rx_expected_bsi_lsb (3)  rsp_current_expected_batch_seq_id & 0x7
+//   bits 28..27 : reason              (2)  mfsk_ctrl_nack_reason
+//   bit  26     : epoch_parity        (1)  echo of the last-seen tag parity (binding)
+//   bits 25..0  : reserved            (26) TX sends 0, RX ignores
+void pack_nack_payload(uint64_t* p37, uint8_t rx_cfg_index,
+                       uint8_t rx_expected_bsi_lsb, uint8_t reason,
+                       uint8_t epoch_parity);
+
+bool unpack_nack_payload(uint64_t p37, uint8_t* rx_cfg_index,
+                         uint8_t* rx_expected_bsi_lsb, uint8_t* reason,
+                         uint8_t* epoch_parity);
+
+// NACK WRAP decode (mirror of config_tag_wrap_decode, type=MFSK_CTRL_NACK). Accepts
+// ONLY if the FWHT peak-margin passes AND the GF(16)+CRC-12 type-5 decode passes AND
+// the FWHT cfg_index corroborates the CRC-field rx_cfg_index. The binding bits
+// (bsi/reason/parity) are surfaced to the caller (the sender applies its own
+// parity/in-window policy in inband_handle_nack — they are NOT gated here, so the
+// codec stays policy-free). Returns true on accept; writes the decoded fields.
+struct nack_decode_result {
+	uint8_t rx_cfg_index;
+	uint8_t rx_expected_bsi_lsb;
+	uint8_t reason;
+	uint8_t epoch_parity;
+	double  fwht_rpeak;
+	bool    fwht_passed;
+	bool    crc_passed;
+	bool    cfg_corroborate;   // FWHT cfg_index == CRC-field rx_cfg_index
+};
+
+bool nack_wrap_decode(const double* energies,
+                      const double* chip_soft,
+                      double peak_ratio_gate,
+                      ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                      nack_decode_result* out);
 
 #endif // INC_MFSK_CTRL_CODEC_H_

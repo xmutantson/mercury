@@ -3152,6 +3152,31 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							}
 						}
 
+						// STAGE 4e (D2 NACK first-class, INV-E3 mutual exclusion): the
+						// ACK/SACK decode MISSED (decoded==false). Try a NACK decode of the
+						// SAME reverse tail (type=MFSK_CTRL_NACK) ONLY now -- try ACK/SACK
+						// FIRST so a real ACK/SACK is never stolen. On a CRC-valid NACK whose
+						// echoed parity matches the current epoch, the sender ACCELERATES the
+						// Stage-4d auto-demote to the RX config (BREAK-count==0), short-
+						// circuiting the R-retry wait. No-op when inband off / no NACK present.
+#ifndef INBAND_NACK_FAILBEFORE
+						if(!decoded && inband_rate_feature_enabled())
+						{
+							uint8_t nack_rx_cfg = 0, nack_reason = 0, nack_bsi = 0, nack_parity = 0;
+							if(inband_decode_nack_from_capture(&nack_rx_cfg, &nack_reason,
+								&nack_bsi, &nack_parity) == 1)
+							{
+								printf("[CMD-NACK] decoded NACK rx_cfg_idx=%u reason=%u "
+									"bsi_lsb=%u parity=%u -- applying accelerated-demote policy\n",
+									(unsigned)nack_rx_cfg, (unsigned)nack_reason,
+									(unsigned)nack_bsi, (unsigned)nack_parity);
+								fflush(stdout);
+								if(inband_handle_nack(nack_rx_cfg, nack_reason, nack_parity))
+									mfsk_handled_this_poll = true;
+							}
+						}
+#endif
+
 						if(decoded)
 						{
 							// Sanity 1: bsi must be the current or just-prior

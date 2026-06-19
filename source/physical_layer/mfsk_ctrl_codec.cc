@@ -1016,3 +1016,85 @@ bool config_tag_wrap_decode(const double* energies,
 	if (out) *out = r;
 	return accept;
 }
+
+// =============================================================================
+// Stage 4e (D2 NACK first-class) — NACK payload codec + WRAP decode
+// =============================================================================
+//
+// The NACK rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as the CONFIG_TAG (only the
+// type discriminator [5 vs 4] and the payload field layout differ), so encode/decode
+// reuse gf16ra::encode_config_tag / soft_decode_config_tag verbatim (type-parameterized).
+
+void pack_nack_payload(uint64_t* p37, uint8_t rx_cfg_index,
+                       uint8_t rx_expected_bsi_lsb, uint8_t reason,
+                       uint8_t epoch_parity)
+{
+	if (!p37) return;
+	uint64_t v = 0;
+	v |= ((uint64_t)(rx_cfg_index        & 0x1F)) << 32;  // bits 36..32
+	v |= ((uint64_t)(rx_expected_bsi_lsb & 0x07)) << 29;  // bits 31..29
+	v |= ((uint64_t)(reason              & 0x03)) << 27;  // bits 28..27
+	v |= ((uint64_t)(epoch_parity        & 0x01)) << 26;  // bit  26
+	// reserved (bits 25..0) MUST be zero on TX
+	*p37 = v & ((1ULL << 37) - 1ULL);
+}
+
+bool unpack_nack_payload(uint64_t p37, uint8_t* rx_cfg_index,
+                         uint8_t* rx_expected_bsi_lsb, uint8_t* reason,
+                         uint8_t* epoch_parity)
+{
+	if (!rx_cfg_index || !rx_expected_bsi_lsb || !reason || !epoch_parity) return false;
+	uint64_t v = p37 & ((1ULL << 37) - 1ULL);
+	*rx_cfg_index        = (uint8_t)((v >> 32) & 0x1F);
+	*rx_expected_bsi_lsb = (uint8_t)((v >> 29) & 0x07);
+	*reason              = (uint8_t)((v >> 27) & 0x03);
+	*epoch_parity        = (uint8_t)((v >> 26) & 0x01);
+	return true;
+}
+
+bool nack_wrap_decode(const double* energies,
+                      const double* chip_soft,
+                      double peak_ratio_gate,
+                      ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                      nack_decode_result* out)
+{
+	nack_decode_result r;
+	r.rx_cfg_index = 0; r.rx_expected_bsi_lsb = 0; r.reason = 0; r.epoch_parity = 0;
+	r.fwht_rpeak = 0.0; r.fwht_passed = false; r.crc_passed = false; r.cfg_corroborate = false;
+	if (out) *out = r;
+	if (!energies || !chip_soft || !crc12_fn) return false;
+
+	// Gate-1: FWHT correlator over the 16 RM soft chips (the rx_cfg_index codeword).
+	double rpeak = 0.0;
+	int fwht_cfg = cfg_tag_rm_fwht_decode(chip_soft, &rpeak);
+	r.fwht_rpeak = rpeak;
+	r.fwht_passed = (rpeak >= peak_ratio_gate);
+
+	// Gate-2: GF(16) RA + CRC-12 over the 3-bit-typed field, type=MFSK_CTRL_NACK.
+	// Same configure(2)=N=39 substrate + save/restore as config_tag_wrap_decode.
+	int saved_repfact = gf16ra::current_repfact();
+	if (saved_repfact != 2) { gf16ra::configure(2); gf16ra::init(); }
+	uint64_t p37 = 0; int iters = -2;
+	bool gf_ok = gf16ra::soft_decode_config_tag(energies, CFG_TAG_BP_MAXITER,
+		CFG_TAG_ESNO_METRIC, (uint8_t)MFSK_CTRL_NACK,
+		crc12_fn, crc12_ctx, &p37, &iters);
+	if (saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	r.crc_passed = gf_ok;
+
+	uint8_t crc_cfg = 0, bsi_lsb = 0, reason = 0, parity = 0;
+	if (gf_ok) {
+		unpack_nack_payload(p37, &crc_cfg, &bsi_lsb, &reason, &parity);
+		r.rx_cfg_index = crc_cfg; r.rx_expected_bsi_lsb = bsi_lsb;
+		r.reason = reason; r.epoch_parity = parity;
+	} else {
+		r.rx_cfg_index = (uint8_t)fwht_cfg;   // surface the FWHT estimate for logging
+	}
+
+	// Gate-3: cfg_index corroboration (FWHT == CRC field). The sender applies its own
+	// parity/in-window policy in inband_handle_nack — kept out of the codec.
+	r.cfg_corroborate = gf_ok && (fwht_cfg == (int)crc_cfg);
+
+	bool accept = r.fwht_passed && r.crc_passed && r.cfg_corroborate;
+	if (out) *out = r;
+	return accept;
+}

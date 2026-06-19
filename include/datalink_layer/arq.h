@@ -1991,6 +1991,28 @@ public:
   // armed -> B/C FAIL. Returns 0=PASS, 1=FAIL. inband-reliability-design.md §1.6 / §4.6.
   int test_inband_retag();
 
+  // STAGE 4e D2 NACK TEST (CLI --test-inband-nack). PART A NACK-EMIT: drive the RX to a
+  // down-ladder total-loss -> assert a NACK is emitted (type 5, reason DECODE_FAIL,
+  // correct rx_cfg + parity) via the REAL build_nack_tones round-trip (the sender
+  // decodes it from the passband); drive a tag announcing an un-adoptable config ->
+  // assert NACK reason UNFOLLOWABLE_CLIMB; drive a NORMAL follow -> assert NO NACK (no
+  // chatter). PART B NACK-HANDLE: feed the sender a NACK whose rx_cfg is below the
+  // announced config -> assert it AUTO-DEMOTES to the RX config IMMEDIATELY
+  // (BREAK-count==0) WITHOUT inband_retag_count>=R (faster than the R-retry give-up).
+  // fail-before (-DINBAND_NACK_FAILBEFORE): the NACK emit is a no-op + the handle is
+  // removed -> the EMIT and the EARLY-demote asserts FAIL. Returns 0=PASS, 1=FAIL.
+  // inband-reliability-design.md §2.6.
+  int test_inband_nack();
+
+  // STAGE 4e D3 PERIODIC RE-ANNOUNCE TEST (CLI --test-inband-reannounce). Run N+1
+  // PRODUCTION firing decisions at a STEADY config with no change -> assert the tag is
+  // SILENT for batches 1..N-1 and FIRES on batch N (periodic), parity HELD across the
+  // re-announce, the counter resets. Inject a change at batch 3 -> assert the periodic
+  // clock resets (next periodic at 3+N). fail-before (-DINBAND_REANNOUNCE_FAILBEFORE):
+  // force N=0 -> the periodic never fires -> the FIRES-on-N assert FAILS. Returns
+  // 0=PASS, 1=FAIL. inband-reliability-design.md §3.6.
+  int test_inband_reannounce();
+
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
   // In-process synthetic-fire (CLI --test-spec-sack), modelled on
   // test_partial_bsi_advance. Forces frame-k still-decoding at the
@@ -3170,6 +3192,73 @@ public:
   // rescued by the RX down-ladder + the continuing re-tag, so it does not escalate here.
   // Returns true if it routed an auto-demote. COMMANDER-only (uses the demote helper).
   bool inband_retag_escalate_if_climb_exhausted();
+
+  // ── STAGE 4e — D2 NACK first-class (inband-reliability-design.md §2,
+  //    data-flow-perbatch-config.md §S4E) ──
+  // A new reverse-direction ctrl frame (MFSK_CTRL_NACK=5) lets the RX FAST-signal
+  // "I could not follow / could not decode" instead of staying silent until the
+  // sender's R-retry timeout. It rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as the
+  // CONFIG_TAG (the RM prefix carries rx_cfg_index, the gf16ra/CRC-12 message carries
+  // the 37-bit NACK payload), keyed via generate_config_tag_pattern_passband. The
+  // sender, on a valid NACK whose rx_cfg is BELOW the announced config, AUTO-DEMOTES
+  // IMMEDIATELY to the RX config (reusing inband_route_failure_demote, BREAK-count==0)
+  // — accelerating the Stage-4d R-retry give-up to a single batch. D2 is an
+  // OPTIMIZATION: with NO NACK the Stage-4d R-retry auto-demote still fires.
+  // All members ADDITIVE, gated by MERCURY_INBAND_RATE (default-off byte-identical).
+
+  // The epoch parity the RX last SAW on an adopted/followed tag — echoed in the NACK so
+  // the sender can reject a stale NACK that crosses a fresh change. Init 0.
+  uint8_t inband_rx_seen_parity = 0;
+  // Throttle: one DECODE_FAIL NACK per dead-batch streak segment. Set on the first
+  // DECODE_FAIL emit; cleared on any down-ladder resync / data delivery (so a NEW
+  // dead-streak re-emits one NACK). Init false.
+  bool inband_nack_emitted_for_dead_streak = false;
+
+  // Build the NACK suffix tones (RM(1,4) Walsh prefix carrying rx_cfg_index +
+  // gf16ra RA + CRC-12 message carrying the NACK payload), type=MFSK_CTRL_NACK.
+  // Mirrors build_config_tag_tones. Returns true on success; false if rx_cfg off the
+  // ladder or M<16. out_tones holds RM16+gf16ra39 tones; *out_n the total count.
+  bool build_nack_tones(int rx_cfg, uint8_t rx_expected_bsi_lsb, uint8_t reason,
+                        uint8_t epoch_parity, int* out_tones, int* out_n);
+
+  // RX EMIT (producer): key a NACK onto the reverse robust passband layer (the SAME
+  // keyer the CONFIG_TAG uses). `reason` is mfsk_ctrl_nack_reason. The payload is
+  // computed from current_configuration (-> ladder index), rsp_current_expected_batch_
+  // seq_id, the reason, and inband_rx_seen_parity. No-op (returns 0) when the feature is
+  // off / M<16 / current off-ladder. Returns the passband samples emitted (0 if none).
+  // Called ONLY on a genuine cannot-follow (INV-E1): a down-ladder total-loss
+  // (DECODE_FAIL) or an un-adoptable tag (UNFOLLOWABLE_CLIMB).
+  int inband_emit_nack(uint8_t reason);
+
+  // SENDER decode (consumer): pull the reverse ctrl tail (SAME window math as the MFSK
+  // ACK/SACK decode), run decode_config_tag_from_passband + nack_wrap_decode
+  // (type=MFSK_CTRL_NACK). On a CRC-valid NACK writes *out_rx_cfg_index / *out_reason /
+  // *out_parity / *out_bsi_lsb and returns 1; 0 otherwise. No-op when the feature is off.
+  // Called from the commander reverse-frame poll ONLY AFTER the ACK/SACK decode misses
+  // (INV-E3 mutual exclusion).
+  int inband_decode_nack_from_capture(uint8_t* out_rx_cfg_index, uint8_t* out_reason,
+                                      uint8_t* out_bsi_lsb, uint8_t* out_parity);
+
+  // SENDER handle (consumer): apply the NACK policy. If a re-tag is armed and the RX's
+  // raw config (from rx_cfg_index) is BELOW the announced inband_retag_config by ladder
+  // index (could not follow a climb), OR reason==UNFOLLOWABLE_CLIMB, AUTO-DEMOTE to the
+  // RX config via inband_route_failure_demote (BREAK-count==0) IMMEDIATELY (does NOT
+  // wait for inband_retag_count>=R) and set inband_last_confirmed_config = the RX config.
+  // Rejects a stale NACK whose echoed parity != inband_tx_epoch_parity (INV-E3). Returns
+  // true if it routed the accelerated demote. COMMANDER-only (uses the demote helper).
+  bool inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason, uint8_t epoch_parity);
+
+  // ── STAGE 4e — D3 periodic re-announce backstop (inband-reliability-design.md §3,
+  //    OD-3) ── Re-emit the CURRENT-config tag every N DATA batches independent of
+  // change, HOLDING the epoch parity (NOT a change), so a desynced/late-joining peer
+  // re-syncs without waiting for the next config change. The counter increments per
+  // DATA-batch firing decision and resets to 0 on ANY emit (change/repeat/periodic) so
+  // the periodic clause never double-emits. N is MERCURY_INBAND_REANNOUNCE_N (default 8,
+  // 0=disabled). Init 0 (ctor + reset_session_state).
+  int  inband_batches_since_announce = 0;
+  int  inband_reannounce_n_cached    = -1;   // cached MERCURY_INBAND_REANNOUNCE_N (-1=unresolved)
+  // Resolve+cache N (>=0; 0=disabled). MERCURY_INBAND_REANNOUNCE_N, default 8.
+  int  inband_reannounce_n();
 
   // ── STAGE 4 — the bounded down-ladder lost-tag resync state (design §4/§7) ──
   // The down-window depth D is owner-tunable via MERCURY_INBAND_DOWN_D (default 4,

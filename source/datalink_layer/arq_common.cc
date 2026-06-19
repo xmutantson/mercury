@@ -751,6 +751,14 @@ cl_arq_controller::cl_arq_controller()
 	inband_last_confirmed_config=CONFIG_NONE;
 	inband_pre_announce_config=CONFIG_NONE;
 
+	// STAGE 4e — D2 NACK first-class + D3 periodic re-announce (design §2/§3). A fresh
+	// session has seen no tag (parity echo 0), no dead-streak NACK emitted, and the
+	// re-announce clock at 0.
+	inband_rx_seen_parity=0;
+	inband_nack_emitted_for_dead_streak=false;
+	inband_batches_since_announce=0;
+	inband_reannounce_n_cached=-1;  // unresolved; inband_reannounce_n() caches it
+
 	gear_shift_on=NO;
 	robust_enabled=NO;
 	narrowband_enabled=NO;
@@ -2519,6 +2527,133 @@ bool cl_arq_controller::build_config_tag_tones(int batch_cfg, int batch_seq_id,
 	return true;
 }
 
+// In-band rate adaptation (STAGE 4e D2 NACK): build the NACK suffix tones. IDENTICAL
+// structure to build_config_tag_tones — the RM(1,4) Walsh prefix carries rx_cfg_index
+// (the FWHT cfg corroboration) and the gf16ra RA + CRC-12 message carries the NACK
+// payload — the ONLY differences are the type (MFSK_CTRL_NACK vs CONFIG_TAG) and the
+// payload field layout (pack_nack_payload vs pack_config_tag_payload). Returns the
+// combined RM16||gf39 tone array (the SAME generate_config_tag_pattern_passband keyer
+// + decode_config_tag_from_passband energy-extractor consume it).
+bool cl_arq_controller::build_nack_tones(int rx_cfg, uint8_t rx_expected_bsi_lsb,
+                                         uint8_t reason, uint8_t epoch_parity,
+                                         int* out_tones, int* out_n)
+{
+	if(out_n) *out_n = 0;
+	if(out_tones == NULL) return false;
+
+	int ladder_idx = config_ladder_index(rx_cfg);
+	if(ladder_idx < 0 || ladder_idx > 31) return false;
+	if(telecom_system == NULL) return false;
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // M<16
+
+	// Configure the gf16ra graph to N=39 R=1/3 (the SAME substrate the tag uses).
+	// SAVE/RESTORE the process-global repfact (cross-layer guard, CLAUDE.md §5).
+	int saved_repfact = gf16ra::current_repfact();
+	gf16ra::configure(2);
+	gf16ra::init();
+	int N_gf = gf16ra::codeword_len();   // 39
+	if(N_gf <= 0 || N_gf > gf16ra::GF16RA_MAX_N) {
+		if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+		return false;
+	}
+
+	// --- RM(1,4) block tones carrying rx_cfg_index (the FWHT corroboration). ---
+	int rm_chips[CFG_TAG_RM_N];
+	if(!cfg_tag_rm_encode(ladder_idx, rm_chips)) {
+		if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+		return false;
+	}
+	for(int i = 0; i < CFG_TAG_RM_N; i++)
+	{
+		int tplus = CFG_TAG_TONE_PERM[i] & 0xF;
+		out_tones[i] = (rm_chips[i] > 0) ? tplus : (tplus ^ 0xF);
+	}
+
+	// --- GF(16) RA + CRC-12 NACK message block (type=MFSK_CTRL_NACK). ---
+	uint64_t p37 = 0;
+	pack_nack_payload(&p37, (uint8_t)ladder_idx, rx_expected_bsi_lsb, reason, epoch_parity);
+	unsigned char bytes[5];
+	pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_NACK, p37);
+	uint16_t crc12 = CRC12_calc((const char*)bytes, 5) & 0x0FFF;
+	gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_NACK, p37, crc12, out_tones + CFG_TAG_RM_N);
+
+	if(out_n) *out_n = CFG_TAG_RM_N + N_gf;   // 55
+
+	if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	return true;
+}
+
+// In-band rate adaptation (STAGE 4e D2 NACK): RX EMIT the NACK onto the reverse robust
+// passband layer (the SAME keyer the CONFIG_TAG uses). Called ONLY on a genuine
+// cannot-follow (INV-E1): a down-ladder total-loss (NACK_DECODE_FAIL) or an un-adoptable
+// tag (NACK_UNFOLLOWABLE_CLIMB). The payload reports where the RX ACTUALLY is
+// (current_configuration -> ladder index), the bsi it is waiting on, the reason, and the
+// echoed epoch parity (inband_rx_seen_parity) so the sender can reject a stale NACK.
+int cl_arq_controller::inband_emit_nack(uint8_t reason)
+{
+	// Feature off -> never emit (zero cost, byte-identical default).
+	if(!inband_rate_feature_enabled())
+		return 0;
+	if(telecom_system == NULL)
+		return 0;
+	// The NACK rides the M=16 robust ctrl-suffix layer; unavailable on NB / M<16.
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+
+	int ladder_idx = config_ladder_index(current_configuration);
+	if(ladder_idx < 0 || ladder_idx > 31)
+		return 0;
+
+#ifdef INBAND_NACK_FAILBEFORE
+	// FAIL-BEFORE arm: the NACK emit is a NO-OP. The RX stays SILENT on a cannot-follow,
+	// so the sender only learns via the slow R-retry timeout — the EMIT assert FAILS.
+	(void)reason;
+	printf("[INBAND-RX] NACK_FAILBEFORE: NACK emit suppressed (RX stays silent)\n");
+	fflush(stdout);
+	return 0;
+#else
+	uint8_t bsi_lsb = (rsp_current_expected_batch_seq_id >= 0)
+		? (uint8_t)(rsp_current_expected_batch_seq_id & 0x7) : 0;
+
+	int tones[gf16ra::GF16RA_MAX_N];
+	int n_tones = 0;
+	if(!build_nack_tones(current_configuration, bsi_lsb, reason, inband_rx_seen_parity,
+	                     tones, &n_tones))
+		return 0;
+
+	int base_total  = telecom_system->ack_mfsk.config_tag_sync_nsymb();
+	int burst_nsymb = base_total + n_tones;
+	int burst_samples = burst_nsymb * telecom_system->data_container.Nofdm
+		* telecom_system->frequency_interpolation_rate;
+	if(burst_samples <= 0)
+		return 0;
+
+	std::vector<double> burst((size_t)burst_samples, 0.0);
+	int written = telecom_system->generate_config_tag_pattern_passband(
+		burst.data(), tones, n_tones);
+	if(written <= 0)
+		return 0;
+
+	// The keyed burst goes onto the wire via the playback ring (the SAME path ACK/SACK
+	// emits use). In production the playback ring is always allocated (audioio_init); a
+	// half-initialized controller (e.g. an in-process down-ladder unit test with no audio
+	// pipeline) leaves it NULL — guard so the NACK is a clean no-op there rather than
+	// asserting in write_buffer. This mirrors the function's other null-checks
+	// (telecom_system == NULL) and is byte-identical in production (playback_buffer != NULL).
+	if(playback_buffer == NULL)
+		return 0;
+
+	tx_transfer(burst.data(), (size_t)written);
+
+	printf("[INBAND-RX] NACK emit reason=%u rx_cfg=%d (ladder_idx=%d) bsi_lsb=%u "
+		"parity=%u burst_samples=%d\n",
+		(unsigned)reason, current_configuration, ladder_idx, (unsigned)bsi_lsb,
+		(unsigned)inband_rx_seen_parity, written);
+	fflush(stdout);
+	return written;
+#endif
+}
+
 // In-band rate adaptation (STAGE 4d D1): the FIRING-POLICY DECISION + state machine for
 // the CONFIG_TAG, factored out of emit_config_tag_passband so the directed test can drive
 // the EXACT production decision without the passband side effects. Returns true (emit) /
@@ -2532,14 +2667,43 @@ bool cl_arq_controller::build_config_tag_tones(int batch_cfg, int batch_seq_id,
 //     like a fresh change to the RX and needlessly re-run the HINGE re-baseline).
 //   - On the FIRST armed emit at this config, latch inband_announce_bsi (the implicit-
 //     confirm anchor). Every armed emit increments inband_retag_count (the R counter).
+//
+// STAGE 4e (D3 PERIODIC RE-ANNOUNCE, OD-3): a THIRD emit clause (c) re-emits the
+// CURRENT-config tag every N DATA batches INDEPENDENT of change, so a desynced/late-
+// joining peer re-syncs without waiting for the next config change. The counter
+// inband_batches_since_announce increments once per CALL (one call == one DATA batch's
+// firing decision) and RESETS to 0 on ANY emit (change/repeat/periodic) — so a
+// change/repeat that fires the tag also resets the periodic clock and the periodic clause
+// NEVER double-emits (single early-out per call). The re-announce HOLDS the epoch parity
+// (it is NOT a change, INV-E5) — IDENTICAL to a D1 repeat. N = inband_reannounce_n()
+// (MERCURY_INBAND_REANNOUNCE_N, default 8; 0 = disabled).
 bool cl_arq_controller::inband_tag_firing_decision(int batch_cfg, int batch_seq_id,
                                                    uint8_t* out_parity)
 {
+	// One CALL == one DATA-batch firing decision (single call site, arq_common.cc emit).
+	// Tick the periodic re-announce clock BEFORE deciding so a reset-on-emit lands at 0.
+	inband_batches_since_announce++;
+
 	bool is_change = (batch_cfg != inband_last_announced_config);
 	bool is_repeat = (inband_retag_armed && batch_cfg == inband_retag_config && !is_change);
-	if(!is_change && !is_repeat)
-		return false;   // steady state / already-followed -> nothing to emit
 
+	// Clause (c) PERIODIC RE-ANNOUNCE: fires ONLY when neither a change nor a repeat is
+	// already emitting (the OR precedence — change/repeat carry fresh-epoch/armed
+	// semantics; the periodic is the fallback) AND N batches have elapsed with no emit AND
+	// there IS a config to re-announce (inband_last_announced_config set). It re-announces
+	// the CURRENT batch config; it holds parity (not a change).
+	int N = inband_reannounce_n();
+	bool is_reannounce = (!is_change && !is_repeat
+		&& N > 0 && inband_batches_since_announce >= N
+		&& inband_last_announced_config != CONFIG_NONE
+		&& batch_cfg == inband_last_announced_config);
+
+	if(!is_change && !is_repeat && !is_reannounce)
+		return false;   // steady state / already-followed -> nothing to emit (clock keeps ticking)
+
+	// PARITY: toggles + latches ONLY on a CHANGE. A REPEAT and a PERIODIC RE-ANNOUNCE both
+	// HOLD the epoch (INV-E5 — a re-flipped parity would look like a fresh change to the RX
+	// and needlessly re-run the HINGE re-baseline).
 	if(is_change)
 	{
 		inband_tx_epoch_parity ^= 1;
@@ -2557,6 +2721,19 @@ bool cl_arq_controller::inband_tag_firing_decision(int batch_cfg, int batch_seq_
 			is_change ? "fresh change" : "repeat-until-followed");
 		fflush(stdout);
 	}
+	else if(is_reannounce)
+	{
+		printf("[INBAND-TX] PERIODIC RE-ANNOUNCE of CONFIG_%d after %d batches (parity HELD "
+			"%u; no change — late-joiner/desync backstop)\n",
+			batch_cfg, inband_batches_since_announce, (unsigned)inband_tx_epoch_parity);
+		fflush(stdout);
+	}
+
+	// RESET the periodic clock on ANY emit (change/repeat/periodic) — the no-double-emit
+	// guarantee (INV-E6/E7): a change at batch k resets the clock so the next periodic is at
+	// k+N, not the absolute Nth batch; and a change/repeat that already fired the tag this
+	// batch prevents the periodic clause from ALSO firing (it shares this single exit).
+	inband_batches_since_announce = 0;
 	return true;
 }
 
@@ -2753,13 +2930,31 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 		return 0;
 	}
 
+	// STAGE 4e (D2): the tag DECODED + bound (CRC-valid, cfg corroborated). Latch the
+	// epoch parity the RX just SAW so a future NACK echoes it (the sender rejects a NACK
+	// that crosses a fresh change, §S4E.4). This is the only producer of inband_rx_seen_parity.
+	inband_rx_seen_parity = r.epoch_parity & 0x1;
+
 	// r.cfg_index is a LADDER INDEX; map back to a raw config id.
 	if(r.cfg_index > 31)
 		return 0;
 	int followed_config = (r.cfg_index < FULL_CONFIG_LADDER_SIZE)
 		? FULL_CONFIG_LADDER[r.cfg_index] : -1;
 	if(followed_config < 0)
+	{
+		// STAGE 4e (D2 UNFOLLOWABLE_CLIMB, INV-E1): a tag was HEARD + CRC-valid but the
+		// announced config maps to no config this RX can adopt (the ladder index is in
+		// range but FULL_CONFIG_LADDER[idx] is not a runnable config for this peer — e.g.
+		// above its WB cap / NB-only). Do NOT silently ignore: FAST-signal the sender so it
+		// demotes to where the RX actually is, instead of re-tagging an unreachable config
+		// for R batches. The NACK reports current_configuration (the RX's real rung).
+		printf("[INBAND-RX] CONFIG_TAG announced un-adoptable ladder_idx=%u (no runnable "
+			"config) -> NACK UNFOLLOWABLE_CLIMB (RX at CONFIG_%d)\n",
+			(unsigned)r.cfg_index, current_configuration);
+		fflush(stdout);
+		inband_emit_nack((uint8_t)NACK_UNFOLLOWABLE_CLIMB);
 		return 0;
+	}
 
 	// Tag decodes, cfg_index == current -> no change (design §3.2 outcome 2). Zero
 	// action. (Should not normally happen — the TX only tags on a change — but a
@@ -2992,6 +3187,173 @@ bool cl_arq_controller::inband_retag_escalate_if_climb_exhausted()
 	// the climb simply stops being re-tagged (the RX stays at the lower config it never
 	// left, which is exactly the safe outcome of an unfollowable climb).
 	return inband_route_failure_demote(demote_target, "climb_unfollowable_autodemote");
+}
+
+// ============================================================================
+// In-band rate adaptation — STAGE 4e D2 NACK first-class (sender side)
+// inband-reliability-design.md §2.3, data-flow-perbatch-config.md §S4E
+// ============================================================================
+
+// SENDER decode (consumer 1): the reverse ctrl tail snapshot is already in
+// ready_to_process_passband_delayed_data (the commander reverse-frame poll snapshots it
+// for the ACK/SACK decode). Run the SAME energy extractor (decode_config_tag_from_passband)
+// + the type-5 NACK WRAP decode. Returns 1 on a CRC-valid NACK (fields written), 0 else.
+// Called ONLY after the ACK/SACK decode MISSES (INV-E3 mutual exclusion).
+int cl_arq_controller::inband_decode_nack_from_capture(uint8_t* out_rx_cfg_index,
+                                                       uint8_t* out_reason,
+                                                       uint8_t* out_bsi_lsb,
+                                                       uint8_t* out_parity)
+{
+	if(!inband_rate_feature_enabled())
+		return 0;
+	if(telecom_system == NULL)
+		return 0;
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+
+	// The reverse tail the caller already snapshotted is the SAME window the ACK/SACK
+	// decode read (ready_to_process_passband_delayed_data, tail_samples). Re-decode it as a
+	// NACK burst (the NACK rides the SAME RM16+gf39 substrate). Size the window the SAME
+	// way the W2 tag decode does (the tail holds the burst).
+	int base_total = telecom_system->ack_mfsk.config_tag_sync_nsymb();
+	int N_gf;
+	{
+		int saved_rf = gf16ra::current_repfact();
+		gf16ra::configure(2); gf16ra::init();
+		N_gf = gf16ra::codeword_len();   // 39
+		if(saved_rf != 2) { gf16ra::configure(saved_rf); gf16ra::init(); }
+	}
+	if(N_gf <= 0) N_gf = 39;
+	int suffix_nsymb = CFG_TAG_RM_N + N_gf;            // 55
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_nsymb = base_total + suffix_nsymb + 16;   // + margin (same as W2)
+	int tail_samples = tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	if(tail_samples <= 0) return 0;
+	int tail_offset = signal_period - tail_samples;
+
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
+		(size_t)tail_samples * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+
+	std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+	double chips[16] = {0.0};
+	int n_syms = 0, matched = 0;
+	bool present = telecom_system->decode_config_tag_from_passband(
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		tail_samples, energies.data(), chips, &n_syms, &matched);
+	if(!present)
+		return 0;
+
+	nack_decode_result r;
+	bool ok = nack_wrap_decode(energies.data(), chips, /*peak_ratio_gate=*/CFG_TAG_PEAK_GATE,
+		arq_inband_crc12_cb, this, &r);
+	if(!ok)
+		return 0;
+
+	if(out_rx_cfg_index) *out_rx_cfg_index = r.rx_cfg_index;
+	if(out_reason)       *out_reason       = r.reason;
+	if(out_bsi_lsb)      *out_bsi_lsb      = r.rx_expected_bsi_lsb;
+	if(out_parity)       *out_parity       = r.epoch_parity;
+	return 1;
+}
+
+// SENDER handle (consumer 2): apply the NACK policy. rx_cfg_index is a LADDER INDEX.
+// REJECT a stale NACK whose echoed parity != the current TX epoch (the RX is NACKing an
+// OLD epoch the sender already moved past, INV-E3). If a re-tag is armed and the RX's raw
+// config is BELOW the announced inband_retag_config by ladder index (could not follow a
+// climb), OR reason==UNFOLLOWABLE_CLIMB, AUTO-DEMOTE to the RX config via the SAME
+// chokepoint tag-demote (inband_route_failure_demote, BREAK-count==0) IMMEDIATELY — this
+// SHORT-CIRCUITS the Stage-4d R-retry give-up (it does NOT require retag_count>=R). Sets
+// inband_last_confirmed_config to the RX config (the provably-reachable floor we just met).
+// Returns true if it routed the accelerated demote. INV-E4: D2 only makes the demote
+// EARLIER; with no NACK the Stage-4d R-retry path still demotes.
+bool cl_arq_controller::inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason,
+                                           uint8_t epoch_parity)
+{
+	if(!inband_rate_feature_enabled())
+		return false;
+
+	// Stale-epoch reject (INV-E3): the NACK must echo the CURRENT announcement epoch.
+	if((epoch_parity & 0x1) != (inband_tx_epoch_parity & 0x1))
+	{
+		printf("[INBAND-TX] NACK stale epoch (echoed parity=%u != current %u) -> ignored\n",
+			(unsigned)(epoch_parity & 0x1), (unsigned)(inband_tx_epoch_parity & 0x1));
+		fflush(stdout);
+		return false;
+	}
+
+	if(rx_cfg_index > 31)
+		return false;
+	int rx_raw_cfg = (rx_cfg_index < FULL_CONFIG_LADDER_SIZE)
+		? FULL_CONFIG_LADDER[rx_cfg_index] : -1;
+	if(rx_raw_cfg < 0)
+		return false;
+
+	// The accelerated-demote trigger: either the RX explicitly cannot follow the climb
+	// (UNFOLLOWABLE_CLIMB), or it is stuck BELOW the announced config (DECODE_FAIL while
+	// we announced something higher). A DROP NACK at-or-above the announced config is NOT
+	// a climb-miss (the RX is already where we want it or higher) -> no demote.
+	int rx_idx        = config_ladder_index(rx_raw_cfg);
+	int announced_idx = (inband_retag_armed)
+		? config_ladder_index(inband_retag_config) : -1;
+	bool rx_below_announced = (inband_retag_armed && announced_idx >= 0
+		&& rx_idx >= 0 && rx_idx < announced_idx);
+	bool unfollowable = (reason == (uint8_t)NACK_UNFOLLOWABLE_CLIMB);
+
+	if(!rx_below_announced && !unfollowable)
+	{
+		// A DECODE_FAIL NACK that is NOT a climb-miss (the RX is at-or-above the
+		// announced config). Nothing to accelerate — the existing SACK/retx path owns it.
+		printf("[INBAND-TX] NACK reason=%u rx_cfg=CONFIG_%d (idx=%d) not a climb-miss "
+			"(announced idx=%d) -> no accelerated demote\n",
+			(unsigned)reason, rx_raw_cfg, rx_idx, announced_idx);
+		fflush(stdout);
+		return false;
+	}
+
+	// No demote needed if the RX is already where we'd demote to (the link already meets
+	// it) — but still record it as the confirmed floor + disarm any failed climb re-tag.
+	printf("[INBAND-TX] NACK reason=%u: RX at CONFIG_%d (idx=%d) BELOW announced "
+		"(idx=%d) -> ACCELERATED AUTO-DEMOTE to the RX config NOW (no R-retry wait, "
+		"NOT a BREAK)\n",
+		(unsigned)reason, rx_raw_cfg, rx_idx, announced_idx);
+	fflush(stdout);
+
+	// Record the provably-reachable floor + disarm the failed climb's re-tag BEFORE the
+	// demote (inband_route_failure_demote -> the chokepoint ARMS a FRESH re-tag for the RX
+	// config; leaving the climb armed would race the fresh arm — same discipline as the
+	// R-retry escalation).
+	inband_last_confirmed_config = rx_raw_cfg;
+	inband_retag_armed   = false;
+	inband_retag_config  = CONFIG_NONE;
+	inband_announce_bsi  = -1;
+	inband_retag_count   = 0;
+
+	// Route the demote to the RX's ACTUAL config (we met it exactly where it told us it is).
+	// A no-op demote (already at rx_raw_cfg) returns false and leaves the link there — the
+	// climb simply stops being re-tagged, which is the correct outcome.
+	return inband_route_failure_demote(rx_raw_cfg, "nack_accelerated_demote");
+}
+
+// Resolve+cache N (the periodic re-announce period, >=0; 0=disabled).
+// MERCURY_INBAND_REANNOUNCE_N, default 8 (design §3.2). A negative env is treated as the
+// default; 0 disables the periodic backstop.
+int cl_arq_controller::inband_reannounce_n()
+{
+	if(inband_reannounce_n_cached < 0)
+	{
+		int n = 8;  // owner default (design §3.2 / OD-3)
+		const char* e = std::getenv("MERCURY_INBAND_REANNOUNCE_N");
+		if(e && *e) { int v = atoi(e); if(v >= 0) n = v; }
+		inband_reannounce_n_cached = n;
+	}
+	return inband_reannounce_n_cached;
 }
 
 // ============================================================================
@@ -3441,6 +3803,11 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 		followed_config, current_configuration);
 	fflush(stdout);
 
+	// STAGE 4e (D2): a successful adopt (tag-follow OR down-ladder) means the RX recovered
+	// sync -> re-arm the DECODE_FAIL NACK throttle so a FRESH later dead-streak emits one
+	// NACK again (§S4E.4). Idempotent (no-op when the feature is off / flag already false).
+	inband_nack_emitted_for_dead_streak = false;
+
 	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
 
 	// HINGE-1: capture-buffer flush (IDENTICAL to detect_and_follow_config_tag and the
@@ -3547,10 +3914,26 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 		// window for the new config so the loop keeps pumping.
 		calculate_receiving_timeout();
 		receiving_timer.start();
+		// STAGE 4e (D2): a resync ends the dead-batch streak -> re-arm the NACK throttle so
+		// a FRESH future dead-streak can emit one DECODE_FAIL NACK again (§S4E.4).
+		inband_nack_emitted_for_dead_streak = false;
 		printf("[INBAND-RX] DOWN-LADDER resync OK -> CONFIG_%d; BREAK avoided "
 			"(dead_batches reset)\n", winner);
 		fflush(stdout);
 		return;
+	}
+
+	// STAGE 4e (D2 NACK first-class): even the down-ladder window floor failed to decode —
+	// a genuine cannot-follow (INV-E1). FAST-signal the sender instead of staying silent
+	// until its R-retry timeout: emit a DECODE_FAIL NACK reporting where the RX actually is
+	// (current_configuration). Throttle to ONE NACK per dead-batch streak segment
+	// (inband_nack_emitted_for_dead_streak) so a deep fade does not congest the reverse
+	// channel (design §2.2 / §2.7). The NACK lets the sender re-tag/demote one batch sooner.
+	if(!inband_nack_emitted_for_dead_streak)
+	{
+		int nacked = inband_emit_nack((uint8_t)NACK_DECODE_FAIL);
+		if(nacked > 0)
+			inband_nack_emitted_for_dead_streak = true;
 	}
 
 	// None of the D+1 window configs decoded -> a total-loss batch. Advance the
@@ -5143,6 +5526,12 @@ void cl_arq_controller::reset_session_state()
 	inband_retag_count = 0;
 	inband_last_confirmed_config = CONFIG_NONE;
 	inband_pre_announce_config = CONFIG_NONE;
+	// STAGE 4e: a fresh session has seen no tag (parity echo 0), no dead-streak NACK
+	// emitted, and the periodic re-announce clock at 0. The N cache is env-keyed (resolved
+	// once + cached), so NOT reset here — same discipline as inband_retag_min.
+	inband_rx_seen_parity = 0;
+	inband_nack_emitted_for_dead_streak = false;
+	inband_batches_since_announce = 0;
 
 	// Turboshift — fresh state for next connection
 	turboshift_phase = TURBO_FORWARD;

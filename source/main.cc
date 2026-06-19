@@ -743,6 +743,8 @@ int main(int argc, char *argv[])
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
+    bool test_inband_nack_cli = false;  // --test-inband-nack: in-band Stage 4e — D2 NACK first-class.
+    bool test_inband_reannounce_cli = false;  // --test-inband-reannounce: in-band Stage 4e — D3 periodic re-announce.
                                         // Gearshift-driven unilateral drop (W3), tag on the real passband (W1),
                                         // RX follows from the passband tag (W2 + HINGE), SACK confirms (bsi),
                                         // ZERO SET_CONFIG on the wire, both ends config-track, PHY-twin coherent,
@@ -1490,6 +1492,28 @@ int main(int argc, char *argv[])
             // to last-confirmed (BREAK-count==0), a turbo-climb-fail routes to a tag-demote.
             // See arq_responder.cc test_inband_retag + inband-reliability-design.md §1/§4.
             test_inband_retag_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-nack") == 0)
+        {
+            // In-band rate adaptation Stage 4e — D2 NACK first-class (one-shot at startup,
+            // exit rc). The RX FAST-signals a genuine cannot-follow (an un-adoptable climb /
+            // a down-ladder total-loss) with a NACK; the sender auto-demotes to the RX config
+            // IMMEDIATELY (BREAK-count==0), faster than the R-retry give-up. See
+            // arq_responder.cc test_inband_nack + inband-reliability-design.md §2.
+            test_inband_nack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-reannounce") == 0)
+        {
+            // In-band rate adaptation Stage 4e — D3 periodic re-announce (one-shot at startup,
+            // exit rc). With no change for N=8 batches the tag re-emits holding the SAME epoch
+            // parity (the late-joiner/desync backstop); the counter resets on any emit (no
+            // double-emit). See arq_responder.cc test_inband_reannounce +
+            // inband-reliability-design.md §3.
+            test_inband_reannounce_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2985,6 +3009,28 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_retag();
             printf("[FLAG] Inband-retag test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_nack_cli) {
+            // In-band rate adaptation Stage 4e — D2 NACK first-class TEST (one-shot, exit rc).
+            // Builds its own CMD/RX/telecom_system instances internally.
+            printf("[FLAG] --test-inband-nack: invoking in-band rate-adapt Stage-4e "
+                   "D2 NACK first-class regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_nack();
+            printf("[FLAG] Inband-nack test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_reannounce_cli) {
+            // In-band rate adaptation Stage 4e — D3 periodic re-announce TEST (one-shot, exit rc).
+            // Builds its own CMD/telecom_system instances internally.
+            printf("[FLAG] --test-inband-reannounce: invoking in-band rate-adapt Stage-4e "
+                   "D3 periodic re-announce regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_reannounce();
+            printf("[FLAG] Inband-reannounce test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
