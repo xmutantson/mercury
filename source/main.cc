@@ -524,6 +524,38 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test wall-clock watchdog. `--test` is a Monte-Carlo suite with no internal
+// time bound; on the RPi bench a wedged test used to hang forever, pinning a
+// core at 99% (stacked orphans -> thermal throttle -> CPU jitter that tips OFDM
+// acquisition onto sub-peaks). Arm a detached timer thread on entry to any
+// --test* dispatch: if the suite has not returned (and exited the process) by
+// the deadline, force a NON-ZERO exit so a wedged test can never hang. On normal
+// completion main() returns first and the still-sleeping detached thread is
+// abandoned with the process, so the watchdog never fires on a healthy run.
+// Deadline is MERCURY_TEST_WATCHDOG_S seconds (default 600; <=0 disables).
+static void arm_test_watchdog() {
+    long deadline_s = 600;
+    const char* env = getenv("MERCURY_TEST_WATCHDOG_S");
+    if (env && *env) {
+        char* end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env) deadline_s = v;
+    }
+    if (deadline_s <= 0) return;   // explicitly disabled
+    std::thread([deadline_s]() {
+        std::this_thread::sleep_for(std::chrono::seconds(deadline_s));
+        fprintf(stderr,
+            "\n[TEST-WATCHDOG] --test exceeded %ld s wall clock — aborting with "
+            "non-zero exit 70 (set MERCURY_TEST_WATCHDOG_S to tune, <=0 to disable).\n",
+            deadline_s);
+        fflush(stderr);
+        // Exit 70 (EX_SOFTWARE): non-zero so callers see failure, and distinct
+        // from GNU `timeout`'s own 124 so a wedged-test self-abort is
+        // distinguishable from an external timeout kill in deploy/CI logs.
+        _exit(70);
+    }).detach();
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -543,6 +575,7 @@ int main(int argc, char *argv[])
     // init so the test process stays minimal.
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
+            arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             int failed = run_mfsk_ctrl_codec_tests();
             failed += run_sim_clock_tests();
             failed += run_winlink_dict_tests();
