@@ -8,6 +8,8 @@
 
 #include <alsa/asoundlib.h>
 #include <time.h>
+#include <errno.h>
+#include <stdio.h>
 
 
 int ffalsa_init(ffaudio_init_conf *conf)
@@ -307,7 +309,34 @@ int ffalsa_open(ffaudio_buf *b, ffaudio_conf *conf, ffuint flags)
 		dev += FFS_LEN("plug");
 
 	int mode = ((flags & 0x0f) == FFAUDIO_DEV_PLAYBACK) ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE;
-	if (0 != (e = snd_pcm_open(&b->pcm, dev, mode, 0/*SND_PCM_NONBLOCK*/))) {
+	// Robustness: a transiently-busy sound card (a prior instance not fully
+	// released, PulseAudio/pipewire grabbing it, another app) makes
+	// snd_pcm_open() return -EBUSY (-16) or -EAGAIN (-11). Historically that
+	// fatally killed the audio thread and the whole link. Retry on those
+	// transient errors with a short bounded backoff before giving up. A
+	// successful open (e==0) and every NON-transient error are unchanged: they
+	// fall straight through as before. Covers BOTH capture and playback because
+	// this is the single snd_pcm_open chokepoint (direction is in `mode`).
+	{
+		const int   open_retry_max   = 20;   // attempts after the first
+		const ffuint open_retry_ms   = 150;  // backoff per attempt
+		// ~20 x 150 ms = ~3 s total worst-case wait before terminal failure.
+		int attempt = 0;
+		while (0 != (e = snd_pcm_open(&b->pcm, dev, mode, 0/*SND_PCM_NONBLOCK*/))
+		       && (e == -EBUSY || e == -EAGAIN)
+		       && attempt < open_retry_max) {
+			attempt++;
+			fprintf(stderr, "[AUDIO-OPEN-RETRY] %s busy (%d), attempt %d/%d\n",
+			        dev, e, attempt, open_retry_max);
+			fflush(stderr);
+			struct timespec _rts = {
+				.tv_sec  = open_retry_ms / 1000,
+				.tv_nsec = (open_retry_ms % 1000) * 1000000,
+			};
+			nanosleep(&_rts, NULL);
+		}
+	}
+	if (e != 0) {
 		b->errfunc = "snd_pcm_open";
 		b->err = e;
 		goto end;
