@@ -3097,6 +3097,19 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 		return false;
 	}
 
+	// The guard ONLY arms once the link is CONNECTED (the ESTABLISHED-but-stalled
+	// control-plane livelock it backstops; arq.h §"CONNECT-LIVENESS GUARD"). While
+	// CONNECTING/NEGOTIATING/Idle/Dropped there is LEGITIMATELY no forward-DATA progress
+	// yet (the handshake hasn't established the link), so accruing a no-data streak there
+	// would false-fire a BREAK mid-handshake and prevent the link from ever connecting
+	// (HW A/B: ON arm fired at link=CONNECTING and delivered 0 bytes). Hold the streak at
+	// 0 until CONNECTED so a slow connect can never trip the guard.
+	if(link_status != CONNECTED)
+	{
+		cmd_inband_liveness_no_progress_polls = 0;
+		return false;
+	}
+
 	// Control-TX / Idle / control-ACK-wait with NO forward DATA progress: accrue.
 	cmd_inband_liveness_no_progress_polls++;
 	if(cmd_inband_liveness_no_progress_polls < inband_liveness_stall_polls_count())

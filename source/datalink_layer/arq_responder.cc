@@ -5809,6 +5809,44 @@ int cl_arq_controller::test_inband_liveness()
 		delete cmd; delete ts;
 	}
 
+	// ========================================================================
+	// PART E — CONNECTING-PHASE NO-FIRE: a slow connect handshake (link NOT yet
+	// CONNECTED) has LEGITIMATELY no forward-DATA progress; the guard must NOT count the
+	// no-data streak toward a BREAK while CONNECTING (HW A/B regression: the ON arm fired
+	// at link=CONNECTING and never connected). It arms ONLY once CONNECTED.
+	// fail-before (pre-fix, no link_status gate): the guard FIRES at N during connect ->
+	// E1 FAILS. pass-after: stays silent for > N polls while CONNECTING.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		// Model the slow connect handshake: link CONNECTING (not CONNECTED), control-TX,
+		// nAcked_data flat at 0 — exactly the HW false-fire condition.
+		cmd->link_status = CONNECTING;
+		cmd->connection_status = TRANSMITTING_CONTROL;
+		bool fired = false;
+		for(int p = 1; p <= STALL_N + 4; p++)   // well past the threshold
+			if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+		check(!fired, "E1 the guard does NOT fire during CONNECTING (no connect-phase BREAK)",
+			fired ? 1 : 0, 0);
+		check(cmd->cmd_inband_liveness_no_progress_polls == 0,
+			"E2 the no-data streak does NOT accrue while CONNECTING (held at 0)",
+			cmd->cmd_inband_liveness_no_progress_polls, 0);
+		check(cmd->emergency_break_active == 0,
+			"E3 no BREAK state armed during the connect handshake",
+			cmd->emergency_break_active, 0);
+		// And once it transitions to CONNECTED with the stall persisting, the real
+		// livelock backstop DOES fire (the guard is armed, not disabled).
+		cmd->link_status = CONNECTED;
+		int fired_at = -1;
+		for(int p = 1; p <= STALL_N + 2; p++)
+			if(cmd->inband_connect_liveness_guard()) { fired_at = p; break; }
+		check(fired_at == STALL_N,
+			"E4 once CONNECTED the stalled-livelock backstop fires at EXACTLY N",
+			fired_at, STALL_N);
+		delete cmd; delete ts;
+	}
+
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);
