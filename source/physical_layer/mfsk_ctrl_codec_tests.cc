@@ -5822,6 +5822,11 @@ static void test_ofdm_fine_timing_magnitude_clean_no_regression() {
 static bool break_fh_eval_frame(cl_arq_controller& arq, bool gate_on,
                                 bool recent_forward_ofdm, bool probe_matched) {
 	cl_arq_controller::break_fh_gate_test_override = gate_on ? 1 : 0;
+	// DATA-PHASE benefit tests run with a data batch in flight: the control-phase guard in
+	// break_fh_suppress()/break_kofn_corroborate() makes the gate inert at frame_count==0, so
+	// these existing alias/BREAK cases must assert the data-phase behavior (frame_count>0).
+	// The dedicated control-phase test below leaves frame_count==0 to prove the FIX.
+	if (arq.batch_rx_frame_count <= 0) arq.batch_rx_frame_count = 1;
 	// Model the forward-health latch: advance the receive-frame index one tick, and if a
 	// forward OFDM frame is "recent" latch it AT this tick (delta 0 <= window).
 	arq.rx_receive_frame_index++;
@@ -5886,6 +5891,7 @@ static void test_break_fh_gate() {
 	{
 		cl_arq_controller arq;
 		cl_arq_controller::break_fh_gate_test_override = 1;
+		arq.batch_rx_frame_count = 1;   // data phase: the control-phase guard is past
 		// Latch a forward OFDM decode, then advance the receive index past the window
 		// WITHOUT another forward decode: break_fh_suppress() must read "not recent".
 		arq.rx_receive_frame_index = 100;
@@ -5993,6 +5999,68 @@ static void test_break_fh_gate() {
 					"B: genuine BREAK NOT detected with gate_%s (no recent forward decode) — a real BREAK must survive the gate",
 					gate_on ? "ON" : "OFF");
 				test_fail(name, b);
+				return;
+			}
+		}
+	}
+
+	// ---- Test C: CONTROL-PHASE inertness (fix/break-fh-control-phase) ----
+	// ROOT CAUSE of the CFG15 0-byte regression: the forward-health latch (:9391) is set on
+	// ANY decoded OFDM frame INCLUDING the SET_CONFIG control frame, before the type is parsed
+	// (:9439). During the SET_CONFIG handshake batch_rx_frame_count==0 (no DATA batch yet), so
+	// the gate WRONGLY engaged on the control round-trip -> the SET_CONFIG never consummated ->
+	// [BREAK] retries exhausted -> CFG15->CFG0 -> 0 bytes. FIX: both predicates go inert at
+	// batch_rx_frame_count<=0 (behave exactly as gate-OFF), so a needed control-phase BREAK is
+	// never suppressed/corroborate-gated. This test FAILS-BEFORE the guards (gate engages at
+	// frame_count==0) and PASSES-AFTER.
+	{
+		cl_arq_controller::break_fh_gate_test_override = 1;   // gate ENABLED (default-on prod state)
+
+		// (a) CONTROL phase (batch_rx_frame_count==0) with a RECENT forward OFDM decode (the
+		//     SET_CONFIG ACK just decoded, latching :9391). The gate must be INERT:
+		//       break_fh_suppress()==false (never suppress) AND
+		//       break_kofn_corroborate(p)==p (pass-through == gate-off semantics).
+		{
+			cl_arq_controller arq;
+			arq.batch_rx_frame_count = 0;                       // control/SET_CONFIG phase
+			arq.rx_receive_frame_index = 500;
+			arq.last_forward_ofdm_decode_frame = 500;           // recent forward (control) OFDM frame
+			// FAIL-BEFORE: without the guard, suppress() returns true here (latch is recent).
+			if (arq.break_fh_suppress()) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(a): control-phase (frame_count==0) break_fh_suppress() engaged — a needed SET_CONFIG BREAK would be suppressed (REGRESSION)");
+				return;
+			}
+			// FAIL-BEFORE: without the guard, corroborate(true) returns false (needs K) here.
+			arq.break_probe_consec_match = 0;
+			if (arq.break_kofn_corroborate(true) != true) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(a): control-phase break_kofn_corroborate(true) did not pass-through (gate corroborate-gated the control BREAK — REGRESSION)");
+				return;
+			}
+			if (arq.break_kofn_corroborate(false) != false) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(a): control-phase break_kofn_corroborate(false) must pass-through false");
+				return;
+			}
+		}
+
+		// (b) DATA phase (batch_rx_frame_count>0) with the SAME recent-forward state: the gate
+		//     STILL suppresses + corroborate-gates (the data-phase benefit is PRESERVED).
+		{
+			cl_arq_controller arq;
+			arq.batch_rx_frame_count = 3;                       // data batch in flight
+			arq.rx_receive_frame_index = 500;
+			arq.last_forward_ofdm_decode_frame = 500;           // recent forward OFDM data frame
+			if (!arq.break_fh_suppress()) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(b): DATA-phase break_fh_suppress() did NOT suppress on a recent forward decode — the gate benefit was lost");
+				return;
+			}
+			arq.break_probe_consec_match = 0;
+			if (arq.break_kofn_corroborate(true) != false) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(b): DATA-phase break_kofn_corroborate(true) detonated on a single match — K-of-N benefit lost");
 				return;
 			}
 		}

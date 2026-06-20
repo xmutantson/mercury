@@ -4747,6 +4747,17 @@ bool cl_arq_controller::break_fh_gate_enabled()
 bool cl_arq_controller::break_fh_suppress() const
 {
 	if(!break_fh_gate_enabled()) return false;
+	// Control/SET_CONFIG phase scoping (fix/break-fh-control-phase). The forward-health
+	// latch last_forward_ofdm_decode_frame (:9391) is set on ANY decoded OFDM frame,
+	// INCLUDING control/SET_CONFIG frames, before the frame type is parsed (:9439). During
+	// the SET_CONFIG handshake batch_rx_frame_count is 0 (no DATA batch is being received —
+	// it only counts stored DATA frames, incremented at arq_responder.cc:1190). With no
+	// data batch in flight a BREAK is the legitimate retry of an un-consummated control
+	// round-trip; suppressing it here detonated the CFG15 0-byte regression. So the gate is
+	// inert (never suppress) until at least one data frame of the current batch has landed.
+#ifndef BREAKFH_CONTROL_DEFEAT   // -D to prove the FAIL-BEFORE (control-phase) test case
+	if(batch_rx_frame_count <= 0) return false;   // control/SET_CONFIG phase: never suppress a needed BREAK
+#endif
 	// last_forward_ofdm_decode_frame inits far in the past => not recent at session start.
 	return (rx_receive_frame_index - last_forward_ofdm_decode_frame) <= BREAK_FH_LATCH_FRAMES;
 }
@@ -4761,6 +4772,16 @@ bool cl_arq_controller::break_kofn_corroborate(bool probe_matched)
 {
 	if(!break_fh_gate_enabled())
 		return probe_matched;             // byte-identical: one match detonates
+	// Control/SET_CONFIG phase: no data batch in flight (batch_rx_frame_count==0) — pass
+	// through exactly as if the gate were OFF (do NOT corroborate-gate). See the symmetric
+	// guard in break_fh_suppress(); together they make the whole FH gate inert during the
+	// SET_CONFIG handshake (the CFG15 0-byte regression root cause) while preserving the
+	// data-phase K-of-N benefit. NOTE: this leaves break_probe_consec_match untouched in the
+	// control phase, so it does not pollute a streak that a later data-phase BREAK will use.
+#ifndef BREAKFH_CONTROL_DEFEAT   // -D to prove the FAIL-BEFORE (control-phase) test case
+	if(batch_rx_frame_count <= 0)
+		return probe_matched;             // control phase: gate inert, single-shot like gate-off
+#endif
 	if(!probe_matched)
 	{
 		break_probe_consec_match = 0;     // streak broken
