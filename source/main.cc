@@ -32,6 +32,11 @@
 #include <atomic>   // R006: std::atomic<bool> shutdown_ (cross-thread termination flag)
 #include <thread>   // R006: --test-shutdown-atomic cross-thread smoke
 #include <type_traits> // R006: static_assert shutdown_ is atomic
+#include <cstring>  // FIX-C: memset for sigaction struct init (explicit, not transitive)
+#include <csignal>  // FIX-C: SIGTERM/SIGINT graceful-shutdown handler (raise/SIGTERM)
+#ifndef _WIN32
+#include <signal.h> // FIX-C: POSIX sigaction/sigemptyset/struct sigaction
+#endif
 #include <math.h>
 #include <unistd.h>
 #include <iostream>
@@ -335,6 +340,118 @@ static int test_shutdown_atomic()
     return pass ? 0 : 1;
 }
 
+// ============================================================================
+// FIX-C — graceful SIGTERM / SIGINT shutdown (ALSA capture-substream leak fix)
+// ============================================================================
+//
+// PROBLEM (RPi Fe-Pi / sgtl5000 capture-substream leak, root cause of a recurring
+// testbed wedge that required a physical power-cycle): Mercury installed NO
+// handler for SIGTERM/SIGINT, so the default disposition (terminate) killed the
+// process the instant the bench/butler did `kill mercury` (or even a plain
+// SIGTERM). The audio threads' ALSA cleanup — radio_capture_thread / radio_-
+// playback_thread fall-through to `audio->free(b)` (audioio.c:1332 / :938) which
+// calls ffalsa_free -> snd_pcm_close(b->pcm) (ffaudio/alsa.c:191) — only runs
+// when the thread loop observes `shutdown_ == true` and winds down, after which
+// audioio_deinit() pthread_joins all three (audioio.c:1840-1842). With no handler
+// that orderly wind-down never started: the threads were torn down mid-loop,
+// snd_pcm_close never ran, and the Fe-Pi capture substream leaked
+// (`arecord -l` shows Subdevices: 0/1 with no holder; every later snd_pcm_open
+// returns -16 EBUSY until power-cycle).
+//
+// FIX: install an async-signal-safe SIGTERM + SIGINT handler whose ONLY action
+// is a single atomic store `shutdown_ = true`. That is the exact flip the audio
+// threads already poll (`while(!shutdown_)`), so a graceful kill now triggers the
+// SAME orderly wind-down a clean exit does: threads stop -> snd_pcm_close (PCM
+// released) -> audioio_deinit joins -> process exits with the substream FREED.
+//
+// async-signal-safety: a std::atomic<bool> store is async-signal-safe (it is a
+// lock-free atomic — guaranteed by the --test-shutdown-atomic is_lock_free()
+// check above; on this target bool is always-lock-free). The handler does NOT
+// printf, does NOT lock, does NOT touch any non-atomic state — the only things a
+// handler is permitted to do are the atomic store and `return`. sigaction (not
+// signal()) is used for portable, well-defined semantics, and SA_RESTART is
+// deliberately OMITTED so a blocked syscall (e.g. snd_pcm_readi waiting on a
+// capture period) returns EINTR and the audio loop re-checks `shutdown_` at once
+// rather than waiting out the full period.
+#ifndef _WIN32
+extern "C" void mercury_termination_signal_handler(int /*signum*/)
+{
+    // ONLY async-signal-safe action: flip the termination flag the audio
+    // threads + main loops already poll. No printf, no lock, no allocation.
+    shutdown_.store(true, std::memory_order_seq_cst);
+}
+
+// Install the SIGTERM/SIGINT handler. Call once, early in main(), BEFORE any
+// audio thread is launched. Idempotent and side-effect-free apart from the
+// disposition change.
+static void install_termination_handlers()
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = mercury_termination_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    // No SA_RESTART: let blocked syscalls (snd_pcm_readi etc.) return EINTR so
+    // the audio loops re-check shutdown_ immediately instead of one period late.
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+}
+#else
+// Windows build: no POSIX signals on the RPi-leak path; keep a no-op so the
+// call site in main() stays unconditional and the bench/Linux path is the only
+// place the handler actually arms.
+static void install_termination_handlers() {}
+#endif
+
+// --test-sigterm-handler: directed regression for the FIX-C graceful-shutdown
+// handler. Installs the SIGTERM/SIGINT disposition exactly as main() does, then
+// raises SIGTERM at ITSELF and asserts the handler flipped shutdown_ to true.
+// This is the in-process fail-before/pass-after: on a tree WITHOUT the handler
+// installed, raise(SIGTERM) terminates the process (default disposition) and the
+// "PASS" line below is never printed -> the wrapping `timeout ... ; echo rc=$?`
+// in the bench check sees a non-zero, signal-killed exit. With the handler the
+// store is observed and the test exits 0. (The ALSA-close half of FIX-C is
+// proven RPi-side: arecord -l shows the substream released after SIGTERM.)
+static int test_sigterm_handler()
+{
+#ifndef _WIN32
+    shutdown_.store(false);
+    install_termination_handlers();
+    if (shutdown_.load()) {
+        printf("[TEST-SIGTERM-HANDLER] FAIL: shutdown_ already true before raise\n");
+        fflush(stdout);
+        return 1;
+    }
+    raise(SIGTERM);   // delivered synchronously on this thread
+    bool flipped = shutdown_.load();
+    if (!flipped) {
+        printf("[TEST-SIGTERM-HANDLER] FAIL: SIGTERM did not set shutdown_=true "
+               "(handler not installed?)\n");
+        fflush(stdout);
+        return 1;
+    }
+    // Also confirm SIGINT (Ctrl-C) drives the same flag.
+    shutdown_.store(false);
+    raise(SIGINT);
+    bool flipped_int = shutdown_.load();
+    shutdown_.store(false);   // leave the flag clear for any later in-proc test
+    if (!flipped_int) {
+        printf("[TEST-SIGTERM-HANDLER] FAIL: SIGINT did not set shutdown_=true\n");
+        fflush(stdout);
+        return 1;
+    }
+    printf("[TEST-SIGTERM-HANDLER] PASS: SIGTERM+SIGINT both set shutdown_=true "
+           "(async-signal-safe atomic store; lock_free=%d)\n",
+           shutdown_.is_lock_free() ? 1 : 0);
+    fflush(stdout);
+    return 0;
+#else
+    printf("[TEST-SIGTERM-HANDLER] SKIP: POSIX signals not used on Windows path\n");
+    fflush(stdout);
+    return 0;
+#endif
+}
+
 // --test-pas: PAS/PCS distribution-matcher integrity self-test (feat/pcs).
 // (1) BIJECTION deshape(shape(x))==x over many random k-bit blocks for several
 //     (lambda, rail_L) configs — a precision/overflow bug shows here (the
@@ -534,6 +651,16 @@ int main(int argc, char *argv[])
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    // FIX-C: arm the graceful SIGTERM/SIGINT handler BEFORE any audio thread is
+    // launched. The handler's only action is `shutdown_ = true`, which drives
+    // the audio threads' orderly wind-down (snd_pcm_close on both PCMs) +
+    // audioio_deinit join — so a `kill mercury` / Ctrl-C releases the ALSA
+    // capture substream instead of leaking it (RPi Fe-Pi EBUSY-until-power-cycle
+    // bug). Installed this early so it is also armed for the long-running
+    // --test paths and any pre-mode work; it is a pure disposition change with
+    // no effect until a signal actually arrives.
+    install_termination_handlers();
+
     // --test : run built-in unit tests and exit. Phase B Wave 1 (this
     // build) wires the MFSK ctrl-suffix codec suite (alphabet, payload
     // pack/unpack, CRC12 corruption, base-pattern cross-correlation,
@@ -561,6 +688,19 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_liveness();
             }
+            // FIX-C graceful-shutdown handler: handler installed above, this
+            // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
+            // clears the flag so the rest of the process is unperturbed.
+            failed += test_sigterm_handler();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
+        // regression (handler installed -> SIGTERM/SIGINT set shutdown_=true)
+        // and exit. install_termination_handlers() already ran above, so the
+        // self-raise(SIGTERM) inside is caught; on a tree WITHOUT the handler it
+        // would terminate the process (signal-killed exit) = the fail-before.
+        if (strcmp(argv[i], "--test-sigterm-handler") == 0) {
+            int failed = test_sigterm_handler();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock
