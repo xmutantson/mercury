@@ -1988,6 +1988,14 @@ public:
   // first frame is LOST. Returns 0=PASS, 1=FAIL. data-flow-perbatch-config.md §15.
   int test_inband_seamless();
 
+  // IN-BAND DOWN-LADDER DELIVERY REGRESSION (CLI --test-inband-downladder). PART A: a
+  // COMPLETE in-flight prev batch survives a TERMINAL-BREAK -> ROBUST_0 reshrink (fail-
+  // before MERCURY_PREBREAK_DELIVER_DEFEAT=1 orphans -> 0 bytes; pass-after flushes ->
+  // N*SUB_LEN bytes). PART B: a silent (0-peak) snapshot does NOT tick the dead-batch
+  // streak. Drives the production deliver_complete_inflight_before_break + reshrink +
+  // inband_try_down_ladder_on_decode_fail. data-flow-inband-downladder.md §3/§5.3.
+  int test_inband_downladder();
+
   // STAGE 4c D5 BREAK-OBSOLETE TEST (CLI --test-inband-no-break). Synthetic-fire of the
   // COMMANDER Class-A degradation routing: PART A drives inband_route_failure_demote (the
   // body all four Class-A sites call) and asserts the link DEMOTES one rung and stays
@@ -3311,6 +3319,10 @@ public:
   // inband_terminal_break_due so the caller's existing BREAK machinery fires. The
   // ONLY remaining BREAK trigger on the inband path. No-op when the flag is off.
   void inband_try_down_ladder_on_decode_fail();
+  // FIX #3 (data-flow-inband-downladder.md §3/§5.3): flush a COMPLETE in-flight prev batch
+  // to the app BEFORE a BREAK -> ROBUST_0 reseed reshrink can orphan its RECEIVED frames.
+  // Feature-gated (inband only); returns 1 if a prev batch was delivered, else 0.
+  int  deliver_complete_inflight_before_break();
   int  inband_down_decode_attempts = 0;       // diagnostic: decode attempts in the LAST ladder run
   int  inband_down_decoded_buf[N_MAX / 8] = {};  // staging for the winning decoder's bytes
   // Resolve+cache the down-window depth D (clamped to [1,INBAND_DOWN_D_MAX]).

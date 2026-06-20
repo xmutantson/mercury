@@ -546,6 +546,14 @@ int main(int argc, char *argv[])
             int failed = run_mfsk_ctrl_codec_tests();
             failed += run_sim_clock_tests();
             failed += run_winlink_dict_tests();
+            // In-band down-ladder DELIVERY regression (BREAK-orphan + silent-snapshot). A
+            // member test on a throwaway controller (its own buffers; PART B builds its own
+            // minimal telecom_system). Fast + deterministic, no IONOS/RF. data-flow-inband-
+            // downladder.md §3/§5.3.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_downladder();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock
@@ -745,6 +753,7 @@ int main(int argc, char *argv[])
     bool test_inband_drop_cli = false;  // --test-inband-drop: in-band rate-adapt Stage 3b — LOOPBACK DROP.
     bool test_inband_fallback_cli = false;  // --test-inband-fallback: in-band Stage 4 — LOST-TAG DOWN-LADDER.
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
+    bool test_inband_downladder_cli = false;  // --test-inband-downladder: down-ladder BREAK-orphan + silent-snapshot regression.
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
     bool test_inband_nack_cli = false;  // --test-inband-nack: in-band Stage 4e — D2 NACK first-class.
@@ -1484,6 +1493,18 @@ int main(int argc, char *argv[])
             // down-ladder. See arq_responder.cc test_inband_seamless +
             // data-flow-perbatch-config.md §15.
             test_inband_seamless_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-downladder") == 0)
+        {
+            // In-band down-ladder DELIVERY regression (one-shot at startup, exit rc).
+            // PART A: a COMPLETE in-flight prev batch survives a TERMINAL-BREAK -> ROBUST_0
+            // reshrink (fail-before MERCURY_PREBREAK_DELIVER_DEFEAT=1 orphans -> 0 bytes;
+            // pass-after flushes via deliver_complete_inflight_before_break -> N*SUB_LEN
+            // bytes). PART B: a silent (0-peak) snapshot does NOT tick the dead-batch streak.
+            // See arq_responder.cc test_inband_downladder + data-flow-inband-downladder.md.
+            test_inband_downladder_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3016,6 +3037,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_seamless();
             printf("[FLAG] Inband-seamless test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_downladder_cli) {
+            // In-band down-ladder DELIVERY regression (one-shot, exit rc). PART A drives the
+            // BREAK-orphan defect on synthetic ARQ buffers; PART B builds its own minimal
+            // telecom_system internally for the silent-snapshot directed pass.
+            printf("[FLAG] --test-inband-downladder: invoking in-band down-ladder "
+                   "BREAK-orphan + silent-snapshot regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_downladder();
+            printf("[FLAG] Inband-downladder test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -473,6 +473,12 @@ void cl_arq_controller::process_messages_rx_data_control()
 			// bsi window via [RSP-V2-ADOPT] at arq_responder.cc:393-398.
 			// Cost: one batch of bootstrap latency on every BREAK (acceptable
 			// — BREAK is already a hard recovery event).
+			// FIX #3 (data-flow-inband-downladder.md §3): under inband, deliver a COMPLETE
+			// in-flight prev batch BEFORE the ROBUST_0 reseed reshrink orphans its RECEIVED
+			// frames. Feature-gated -> no-op (returns 0) on the legacy BREAK path, so the
+			// default/legacy behaviour here is byte-identical. Must run BEFORE the bsi reset
+			// just below clears the prev state.
+			deliver_complete_inflight_before_break();
 			rsp_current_expected_batch_seq_id = -1;
 			rsp_prev_batch_seq_id = -1;
 
@@ -531,8 +537,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && connection_status == RECEIVING
 		   && !passive_monitor
 		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
-		   && is_ofdm_config(current_configuration))         // tag only rides OFDM batches
+		   && is_ofdm_config(current_configuration)           // tag only rides OFDM batches
+		   && rsp_current_expected_batch_seq_id >= 0)         // IN-FLIGHT active batch only
 		{
+			// FIRING GATE (data-flow-inband-downladder.md §2/§5.2, defect #2): the
+			// `messages_rx_buffer.status != RECEIVED` term alone fires on EVERY benign
+			// inter-frame receive() pass that stored no frame — including idle / no-active-
+			// batch passes. Under a lossy demote those benign ticks accumulated into the
+			// terminal-BREAK streak and detonated a FALSE BREAK (HW 0-byte). Require an
+			// IN-FLIGHT ACTIVE batch (rsp_current_expected_batch_seq_id >= 0 i.e. bsi_lsb !=
+			// 255): a lost CONFIG_TAG can only happen WITHIN a batch we are tracking. A
+			// no-active-batch pass (between batches / pre-adopt) is NOT a lost tag and must
+			// never tick the dead-batch streak. The per-decoder prescan inside the resync
+			// (the energy backstop) handles the signal-present-but-silent-snapshot case.
 			inband_try_down_ladder_on_decode_fail();
 
 			// TERMINAL BREAK (design §7): the dead-batch streak reached
@@ -547,6 +564,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 				printf("[INBAND-RX] TERMINAL BREAK: SESSION_DEAD_BATCHES reached -> "
 					"ROBUST_0 (the only inband BREAK path)\n");
 				fflush(stdout);
+				// FIX #3 (data-flow-inband-downladder.md §3): deliver a COMPLETE in-flight
+				// prev batch BEFORE the ROBUST_0 reseed reshrinks data_batch_size and orphans
+				// its RECEIVED frames into a stale-discard (0 bytes). Runs while the prev state
+				// is still live (before the bsi reset / load_configuration below).
+				deliver_complete_inflight_before_break();
 				messages_control.status = FREE;
 				rsp_current_expected_batch_seq_id = -1;
 				rsp_prev_batch_seq_id = -1;
@@ -6934,6 +6956,239 @@ int cl_arq_controller::test_inband_seamless()
 		delete rx; delete ts_rx;
 	}
 #endif
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// IN-BAND DOWN-LADDER DELIVERY — BREAK-ORPHAN + SILENT-SNAPSHOT REGRESSION
+// (data-flow-inband-downladder.md §3/§5.3 ; CLI: --test-inband-downladder)
+// ============================================================================
+//
+// Captures the HW 0-byte defect's CROSS-LAYER leg (defect #3) and the silent-
+// snapshot streak-tick leg (defect #1/#2) as an in-process synthetic-fire (no
+// IONOS, no RF). Mirrors test_spec_sack / test_partial_bsi_advance Step-0 setup.
+//
+// PART A — DEFECT #3 (the deliverable bytes must survive a TERMINAL BREAK):
+//   An in-flight COMPLETE prev batch (N RECEIVED == expected) is held when a
+//   TERMINAL-BREAK -> ROBUST_0 reseed reshrinks data_batch_size. The reshrink
+//   (rescan_prev_on_batch_shrink) orphans the RECEIVED prev slots -> the prev
+//   goes incomplete -> stale-discard -> 0 bytes delivered.
+//     FAIL-BEFORE (MERCURY_PREBREAK_DELIVER_DEFEAT=1): the pre-BREAK flush is
+//       disabled; we then run the EXACT reshrink the ROBUST_0 reseed runs
+//       (set_data_batch_size(1) -> rescan_prev_on_batch_shrink) and assert the
+//       prev is orphaned (received < expected) -> 0 app bytes (the bug).
+//     PASS-AFTER (defeat unset): deliver_complete_inflight_before_break() flushes
+//       the COMPLETE prev to the app BEFORE the reshrink -> N*SUB_LEN bytes land
+//       in fifo_buffer_rx and the subsequent reshrink is a clean no-op.
+//   Drives the PRODUCTION helper + the PRODUCTION reshrink + the PRODUCTION
+//   copy_data_to_buffer / fifo_buffer_rx delivery primitives.
+//
+// PART B — DEFECT #1/#2 (a silent snapshot must NOT tick the dead-batch streak):
+//   A minimal RX at a low OFDM rung with a ZEROED staged capture buffer drives
+//   the PRODUCTION inband_try_down_ladder_on_decode_fail(). The window-level +
+//   per-decoder energy gates must classify the silent window as a no-signal pass
+//   and leave inband_session_dead_batches UNCHANGED (a benign inter-frame tick
+//   must never march toward a FALSE TERMINAL BREAK).
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this (separate CLI + --test).
+int cl_arq_controller::test_inband_downladder()
+{
+	const char* TAG = "[TEST-INBAND-DOWNLADDER]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// Force MERCURY_INBAND_RATE on for the duration (save + restore), like test_inband_no_break.
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	set_env("MERCURY_INBAND_RATE", "1");
+	auto restore_env = [&]() {
+		set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	};
+
+	// ========================================================================
+	// PART A — DEFECT #3: a COMPLETE in-flight prev batch survives a TERMINAL BREAK
+	// ========================================================================
+	// Run BOTH arms (fail-before defeat=1, pass-after defeat=0) in this ONE process so
+	// the only variable is the fix. Each arm rebuilds the synthetic RX state from scratch.
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 0);
+		set_env("MERCURY_PREBREAK_DELIVER_DEFEAT", defeat ? "1" : "");
+
+		// --- Step 0: buffers (mirror test_spec_sack Step 0) ---
+		this->nMessages          = 255;
+		this->max_data_length    = 170;
+		this->max_message_length = 200;
+		this->max_header_length  = 6;
+		int alloc_rc = init_messages_buffers();
+		if(alloc_rc != SUCCESSFUL)
+		{
+			printf("%s ERROR: init_messages_buffers() failed (rc=%d)\n", TAG, alloc_rc);
+			fflush(stdout);
+			restore_env();
+			return 1;
+		}
+		this->fifo_buffer_rx.set_size(262144);
+		this->fifo_buffer_rx.flush();
+
+		// --- Step 1: an in-flight COMPLETE CFG15-shaped prev batch (N == expected) ---
+		const int N       = 25;   // CFG15 OFDM batch size
+		const int SUB_LEN = 16;   // per-frame payload bytes
+		this->sack_v2_enabled                   = true;
+		this->sack_enabled                      = true;
+		this->axis3_sack_mode                   = 1;     // SACK_MODE_ON
+		this->compression_enabled               = false; // raw per-slot delivery (FIFO observable)
+		this->passive_monitor                   = false;
+		this->link_status                       = CONNECTED;
+		this->connection_status                 = RECEIVING;
+		this->inband_rate_enabled               = 1;     // force-resolve the cached flag ON
+		this->data_batch_size                   = N;
+		this->batch_data_delivered              = false;
+		this->rsp_current_expected_batch_seq_id = 4;     // a current batch exists (in-flight)
+		this->rsp_last_delivered_batch_seq_id   = 3;     // prev (bsi=3) is the contiguous next deliver
+		this->rsp_prev_batch_seq_id             = 3;
+		this->rsp_prev_batch_active             = true;
+		this->rsp_prev_batch_received_count     = N;     // COMPLETE
+		this->rsp_prev_batch_expected_count     = N;
+
+		// Populate N RECEIVED prev slots with the oracle payload (slot c byte j == c*7+j).
+		for(int i = 0; i < this->nMessages; i++)
+		{
+			messages_rx_prev[i].status       = FREE;
+			messages_rx_prev[i].length       = 0;
+			messages_rx_prev[i].batch_seq_id = -1;
+			messages_rx[i].status            = FREE;
+		}
+		for(int i = 0; i < N; i++)
+		{
+			messages_rx_prev[i].type            = DATA_LONG;
+			messages_rx_prev[i].id              = (char)(unsigned char)i;
+			messages_rx_prev[i].length          = SUB_LEN;
+			messages_rx_prev[i].status          = RECEIVED;
+			messages_rx_prev[i].batch_seq_id    = 3;
+			messages_rx_prev[i].sequence_number = (char)(unsigned char)i;
+			for(int j = 0; j < SUB_LEN; j++)
+				messages_rx_prev[i].data[j] = (char)(i * 7 + j);
+		}
+
+		auto fifo_bytes = [&]() -> int {
+			return this->fifo_buffer_rx.get_size() - this->fifo_buffer_rx.get_free_size();
+		};
+		check(fifo_bytes() == 0, "A0 app FIFO empty at start of arm", fifo_bytes(), 0);
+
+		// --- Step 2: the pre-BREAK flush (production helper). Defeat=1 -> returns 0 (no flush). ---
+		int delivered_batches = deliver_complete_inflight_before_break();
+
+		// --- Step 3: the ROBUST_0 reseed reshrink. load_configuration(ROBUST_0) pins
+		//             data_batch_size=1 via set_data_batch_size (arq_common.cc:2175) ->
+		//             rescan_prev_on_batch_shrink orphans any still-active prev slots in
+		//             [1, N). Model that exact reshrink directly (we cannot call
+		//             load_configuration without a telecom_system here). is_robust_config
+		//             must see a robust current_configuration for the batch=1 clamp path. ---
+		int saved_cfg = this->current_configuration;
+		this->current_configuration = robust_enabled ? ROBUST_0 : CONFIG_0;
+		set_data_batch_size(1);   // -> rescan_prev_on_batch_shrink(1): the orphan site
+		this->current_configuration = saved_cfg;
+
+		if(defeat)
+		{
+			// FAIL-BEFORE: no flush ran; the reshrink orphaned the RECEIVED prev slots in
+			// [1, N) -> received_count collapsed below expected -> the batch is no longer
+			// deliverable -> a real run stale-discards it -> 0 app bytes. Assert the orphan.
+			check(rsp_prev_batch_received_count < N,
+				"A1-FAILBEFORE reshrink ORPHANED the complete prev (received < N)",
+				rsp_prev_batch_received_count, N - 1);
+			check(fifo_bytes() == 0,
+				"A2-FAILBEFORE 0 app bytes delivered (the HW 0-byte defect)",
+				fifo_bytes(), 0);
+		}
+		else
+		{
+			// PASS-AFTER: the flush delivered the COMPLETE prev to the app BEFORE the reshrink;
+			// the reshrink then saw rsp_prev_batch_active==false and was a clean no-op.
+			check(delivered_batches == 1,
+				"A1-PASSAFTER the complete prev was flushed before BREAK (helper returned 1)",
+				delivered_batches, 1);
+			check(fifo_bytes() == N * SUB_LEN,
+				"A2-PASSAFTER all N frames delivered to the app FIFO (no orphan)",
+				fifo_bytes(), N * SUB_LEN);
+			check(rsp_prev_batch_active == false,
+				"A3-PASSAFTER prev cleared -> the ROBUST_0 reshrink was a clean no-op",
+				rsp_prev_batch_active ? 1 : 0, 0);
+		}
+	}
+	set_env("MERCURY_PREBREAK_DELIVER_DEFEAT", "");
+
+	// ========================================================================
+	// PART B — DEFECT #1/#2: a SILENT snapshot must NOT tick the dead-batch streak
+	// ========================================================================
+	// Build a minimal PRODUCTION RX at a low OFDM rung and ZERO its staged capture buffer,
+	// then drive the production down-ladder entry. The energy gates must treat the silent
+	// window as a no-signal pass and leave inband_session_dead_batches UNCHANGED.
+	{
+		// The down-ladder takes capture_prep_mutex; create it if NULL (standalone test).
+#if defined(_WIN32)
+		bool created_mutex = false;
+		if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode    = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		rx->telecom_system       = ts_rx;
+		rx->narrowband_enabled   = NO;
+		rx->role                 = RESPONDER;
+		rx->robust_enabled       = YES;
+		rx->sack_v2_enabled      = true;
+		rx->inband_rate_enabled  = 1;          // force the feature ON
+		rx->load_configuration(CONFIG_1, FULL, NO);   // low OFDM rung
+		rx->link_status          = CONNECTED;
+		rx->connection_status    = RECEIVING;
+		rx->inband_dead_batches_limit = 1000;  // never BREAK during the directed pass
+		rx->rsp_current_expected_batch_seq_id = 4;   // an in-flight batch (so the firing gate would allow it)
+		rx->inband_session_dead_batches = 0;
+
+		// ZERO the staged capture buffer the production snapshot reads -> a silent window.
+		int sp = ts_rx->data_container.Nofdm * ts_rx->data_container.buffer_Nsymb.load()
+		       * ts_rx->data_container.interpolation_rate;
+		if(ts_rx->data_container.ready_to_process_passband_delayed_data != NULL && sp > 0)
+			memset(ts_rx->data_container.ready_to_process_passband_delayed_data, 0,
+				(size_t)sp * sizeof(double));
+
+		int streak_before = rx->inband_session_dead_batches;
+		// Drive the production down-ladder entry over the SILENT staged window. The window-
+		// level energy gate (snapshot peak < 0.05) returns immediately WITHOUT ticking.
+		rx->inband_try_down_ladder_on_decode_fail();
+		int streak_after = rx->inband_session_dead_batches;
+		check(streak_after == streak_before,
+			"B1 a silent (0-peak) snapshot did NOT tick the dead-batch streak",
+			streak_after, streak_before);
+		check(rx->inband_terminal_break_due == false,
+			"B2 a silent snapshot did NOT arm a TERMINAL BREAK",
+			rx->inband_terminal_break_due ? 1 : 0, 0);
+
+		delete rx; delete ts_rx;
+#if defined(_WIN32)
+		if(created_mutex && capture_prep_mutex != NULL)
+		{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	}
 
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);

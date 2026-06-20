@@ -3864,6 +3864,24 @@ int cl_arq_controller::inband_down_ladder_resync(const double* audio, int audio_
 			memset(&dec->data_container.ready_to_process_passband_delayed_data[copy_len],
 				0, (size_t)(dec_buf_len - copy_len) * sizeof(double));
 
+		// PER-DECODER PRESCAN (data-flow-inband-downladder.md §1/§5.1): gate THIS trial
+		// decoder on the energy of ITS OWN staged copy. A silent (0-peak) per-decoder buffer
+		// — e.g. copy_len==0 or an all-zero snapshot — cannot carry a lost tag; running
+		// receive_byte over it only burns a [PRESCAN] no-signal-found decode and, worse,
+		// would be miscounted as a decode "total-loss" upstream. Skip it WITHOUT incrementing
+		// inband_down_decode_attempts (a silent buffer is a no-attempt, not a failed attempt),
+		// so the caller's none-pass return cannot tick the terminal-BREAK streak on silence.
+		{
+			double dpeak = 0;
+			for(int i = 0; i < copy_len; i += 64)
+			{
+				double v = fabs(dec->data_container.ready_to_process_passband_delayed_data[i]);
+				if(v > dpeak) dpeak = v;
+			}
+			if(dpeak < 0.05)
+				continue;   // silent per-decoder snapshot -> not a lost tag; no attempt counted
+		}
+
 		inband_down_decode_attempts++;
 		st_receive_stats stats = dec->receive_byte(
 			dec->data_container.ready_to_process_passband_delayed_data,
@@ -3964,6 +3982,83 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 	}
 }
 
+// FIX #3 — DECOUPLE BREAK FROM DELIVERY (data-flow-inband-downladder.md §3/§5.3).
+// A TERMINAL-BREAK -> ROBUST_0 reseed runs load_configuration(ROBUST_0) which pins
+// data_batch_size=1 (arq_common.cc:2175) -> set_data_batch_size -> rescan_prev_on_batch_shrink
+// (arq_common.cc:1243) which ORPHANS any RECEIVED prev slots in [1, old_batch) -> the prev
+// becomes incomplete -> [RSP-V2-PREV-STALE] discards it -> 0 in-order deliveries -> 0 bytes
+// (defect #3, the cross-layer leg of the HW 0-byte bug). The prev batch may already be
+// COMPLETE (received >= expected) but not yet frame-driven-delivered (delivery is normally
+// triggered by the NEXT batch's first frame, arq_responder.cc:1045 — a frame that a BREAK
+// pre-empts). Deliver a COMPLETE in-flight prev batch HERE, before the reseed reshrink can
+// orphan it, reusing the EXACT pointer-swap + copy_data_to_buffer delivery discipline +
+// the delivery-time gap gate (no parallel pipeline, no relaxed integrity). A genuinely
+// PARTIAL prev (a real hole) is left undelivered (delivering a gapped batch would corrupt
+// the app stream — that is correct). Feature-gated (inband only) so the legacy/default BREAK
+// path is byte-identical. Returns the number of prev batches delivered (0 or 1).
+int cl_arq_controller::deliver_complete_inflight_before_break()
+{
+	if(!inband_rate_feature_enabled()) return 0;   // legacy BREAK path byte-identical
+	if(!sack_v2_enabled)               return 0;
+	if(!rsp_prev_batch_active)         return 0;
+	// FAIL-BEFORE / A-B DEFEAT (--test-inband-downladder): MERCURY_PREBREAK_DELIVER_DEFEAT=1
+	// disables the pre-BREAK flush on the SAME binary so the regression reproduces the
+	// reshrink-orphan -> stale-discard -> 0-byte defect (#3). Production never sets it.
+	{ const char* e = std::getenv("MERCURY_PREBREAK_DELIVER_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return 0; }
+	// Only a COMPLETE prev batch is safely deliverable in order. An incomplete prev has a
+	// real gap -> leave it (the reshrink/stale-discard of a genuinely-incomplete batch is
+	// correct; we only rescue already-complete-but-undelivered data the BREAK would zero).
+	if(rsp_prev_batch_received_count < rsp_prev_batch_expected_count) return 0;
+	if(rsp_prev_batch_expected_count < 1) return 0;
+
+	// Delivery-time gap gate (IDENTICAL to the frame-driven prev-deliver, arq_responder.cc:
+	// 1110-1123): a prev commit that steps the high-water by >=2 means an earlier batch was
+	// never delivered -> a HOLE. Do NOT push a gapped prev to the app FIFO; let the standard
+	// teardown handle it. MERCURY_GAP_ABORT_DEFEAT honored (same env the inorder-demote
+	// fail-before arm uses) for parity with the frame-driven path.
+	{
+		bool gap_defeat = false;
+		{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
+		  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+		if(!gap_defeat
+		   && delivery_step_is_gap(rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id))
+			return 0;
+	}
+
+	printf("[RSP-V2-PREBREAK-DELIVER] flushing COMPLETE prev_batch_seq_id=%d (received=%d/%d) "
+		"to app BEFORE ROBUST_0 reseed — preventing reshrink-orphan (defect #3)\n",
+		rsp_prev_batch_seq_id, rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
+	fflush(stdout);
+
+	// Reuse the frame-driven prev-deliver discipline (arq_responder.cc:1134-1164): swap the
+	// messages_rx pointer to messages_rx_prev so the UNCHANGED compression/decrypt/delivery
+	// loop runs verbatim against the prev storage, mark RECEIVED -> ACKED for the ACKED-only
+	// copy, deliver, then restore + clear prev state so the subsequent ROBUST_0 reshrink is a
+	// clean no-op (rsp_prev_batch_active==false -> rescan_prev_on_batch_shrink early-returns).
+	struct st_message* saved_rx = messages_rx;
+	bool saved_data_delivered   = batch_data_delivered;
+	messages_rx                 = messages_rx_prev;
+	batch_data_delivered        = false;
+	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+		if(messages_rx[i].status == RECEIVED)
+			messages_rx[i].status = ACKED;
+	copy_data_to_buffer();
+	messages_rx          = saved_rx;
+	batch_data_delivered = saved_data_delivered;
+	for(int i=0; i<this->nMessages; i++)
+		messages_rx_prev[i].status = FREE;
+	advance_last_delivered(rsp_prev_batch_seq_id);
+	rsp_prev_batch_active         = false;
+	rsp_prev_batch_received_count = 0;
+	rsp_prev_batch_expected_count = 0;
+	rsp_prev_batch_delivered_count++;
+	printf("[RSP-V2-PREBREAK-DELIVERED] prev_batch_seq_id=%d delivered before BREAK "
+		"(last_delivered=%d)\n", rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id);
+	fflush(stdout);
+	return 1;
+}
+
 // STAGE 4 production entry (design §4/§7, data-flow-perbatch-config.md §13.1
 // S4-ENTRY/S4-TERM). Called from the RX receive loop ONLY when: the feature is on,
 // the link is CONNECTED+RECEIVING, NO data frame decoded this pass, and the current
@@ -3978,67 +4073,69 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 	if(!inband_rate_feature_enabled()) return;
 	if(telecom_system == NULL) return;
 
-	// Pull the captured passband window the same way the W2 tag decode does
-	// (inband_detect_follow_from_capture / the ACK ctrl-suffix decode). The down-ladder
-	// needs the FULL first-frame snapshot (a whole OFDM frame, not just the tag tail).
+	// RANK-1 ROOT FIX (data-flow-inband-downladder.md §1/§5.1): read the SAME staged
+	// snapshot the PRIMARY decode path and the PRE-FRAME tag-follow read — NOT a forward
+	// read from the live ring write head.
 	//
-	// RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §2.4/§7): the snapshot MUST be
-	// sized to the buffer_Nsymb the decoder BANK uses — the LARGEST (most-robust) config
-	// in the down-window — NOT the primary config's buffer_Nsymb. The bank force-sizes
-	// every trial decoder to inband_down_window_buffer_nsymb (arq_common.cc:3636); when
-	// the window spans the ROBUST rungs a ROBUST_0 frame (~336 sym) is far larger than a
-	// high-OFDM primary buffer (~13-128 sym), so a primary-sized snapshot truncates EVERY
-	// trial-decode to zero-pad -> 0/N decodes -> 0 bytes (the HW 0-byte defect). Size the
-	// snapshot from the window-largest config so the captured window contains a full
-	// robust-rung frame. The primary capture RING is pre-sized to hold a robust frame (the
-	// buffer_Nsymb_min seat in inband_seat_robust_ring_floor, §8 [?]), so reading
-	// signal_period samples from [rwi, rwi+ring_cap) is contiguous and valid.
-	int sym_samples = telecom_system->data_container.Nofdm
-	                * telecom_system->data_container.interpolation_rate;
-	int prim_buf_nsymb = telecom_system->data_container.buffer_Nsymb;   // physical ring nsymb
-	int win_buf_nsymb  = prim_buf_nsymb;
-	// FAIL-BEFORE / A-B DEFEAT (data-flow-inband-ondemote-zerobyte.md §6 repro): when
-	// MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX=1 force the OLD primary-config sizing so the SAME
-	// binary reproduces the 0-byte down-ladder truncation. Production never sets it; the
-	// regression --test-inband-down-resync runs the defeat arm (fail-before) then the
-	// fixed arm (pass-after).
-	if(!inband_down_defeat_snapfix())
-	{
-		int w = inband_down_window_buffer_nsymb();   // the bank's largest-cfg buffer_Nsymb
-		if(w > win_buf_nsymb) win_buf_nsymb = w;     // grow to the robust-rung frame size
-	}
-	// Clamp to the physical ring capacity so the read never spills past the contiguous
-	// double-mapped region (defensive: the ring floor seat should already make this a no-op).
-	if(win_buf_nsymb > prim_buf_nsymb) win_buf_nsymb = prim_buf_nsymb;
-	int signal_period = sym_samples * win_buf_nsymb;
+	// The prior 1b1ee01 attempt grew the snapshot LENGTH but still read
+	// `passband_delayed_data[rwi]` FORWARD from the ring write index. That region is the
+	// content the capture thread is ABOUT to overwrite (post-frame zero-pad / a head-of-ring
+	// noise transient), NOT the frame body. receive() (arq_common.cc:10434-10435) already
+	// copied the head-aligned real frame into the STAGED member buffer
+	// ready_to_process_passband_delayed_data and the primary receive_byte demodulated frame
+	// 0 from THERE; the PRE-FRAME tag-follow (inband_detect_follow_from_snapshot,
+	// arq_common.cc:10652-10654) and parallel_monitor_decode (:10668) both read that staged
+	// buffer for exactly this reason. Reading the live ring instead gave every trial decoder
+	// mostly zero-pad -> [PRESCAN] max_peak=0.000000 -> 0/N decodes even during live traffic
+	// (the HW 0-byte defect, §1). Mirror the primary: snapshot the staged buffer over the
+	// SAME signal_period the primary just decoded.
+	int signal_period = telecom_system->data_container.Nofdm
+	                  * telecom_system->data_container.buffer_Nsymb
+	                  * telecom_system->data_container.interpolation_rate;
 	if(signal_period <= 0) return;
 
-	// === Energy gate (IDENTICAL to parallel_monitor_decode, arq_common.cc:1838-1852).
-	// No OFDM frame present in the window -> no lost tag, just silence between frames.
-	// Skip the D+1 decodes (the RPi-cost guard for idle ticks). ===
-	{
-		MUTEX_LOCK(&capture_prep_mutex);
-		int rwi = telecom_system->data_container.ring_write_index;
-		const double* win = &telecom_system->data_container.passband_delayed_data[rwi];
-		double peak = 0;
-		for(int i = 0; i < signal_period; i += 64)
-		{
-			double v = fabs(win[i]);
-			if(v > peak) peak = v;
-		}
-		MUTEX_UNLOCK(&capture_prep_mutex);
-		if(peak < 0.05) return;   // silence -> not a lost tag; do not burn decodes
-	}
-
-	// Copy the window out under the capture lock, then run the bounded ladder.
+	// Copy the staged window out under the capture lock (the staged member buffer is what
+	// receive() filled and what the primary receive_byte / tag-follow read this pass). The
+	// down-ladder bank then stages a copy into each trial decoder's own scratch and
+	// zero-pads any larger robust-rung buffer (inband_down_ladder_resync, :3860-3865).
+	// FAIL-BEFORE / A-B DEFEAT (§6 repro): MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX=1 forces the
+	// OLD wrong-buffer read (the live ring forward from rwi) so the SAME binary reproduces
+	// the 0-byte truncation. Production never sets it; --test-inband-downladder runs the
+	// defeat arm (fail-before, snapshot silent -> no decode) then the fixed arm (pass-after).
 	std::vector<double> snapshot((size_t)signal_period, 0.0);
 	{
 		MUTEX_LOCK(&capture_prep_mutex);
-		int rwi = telecom_system->data_container.ring_write_index;
-		memcpy(snapshot.data(),
-			&telecom_system->data_container.passband_delayed_data[rwi],
-			(size_t)signal_period * sizeof(double));
+		if(inband_down_defeat_snapfix())
+		{
+			int rwi = telecom_system->data_container.ring_write_index;
+			memcpy(snapshot.data(),
+				&telecom_system->data_container.passband_delayed_data[rwi],
+				(size_t)signal_period * sizeof(double));
+		}
+		else
+		{
+			memcpy(snapshot.data(),
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				(size_t)signal_period * sizeof(double));
+		}
 		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+
+	// === Energy gate (IDENTICAL to parallel_monitor_decode, arq_common.cc:1838-1852), now
+	// computed over the SAME snapshot the trial decoders will consume — so the gate REGION
+	// and the decode REGION can never disagree (§1: the old gate read the noisy ring head
+	// while the decode buffer was empty, letting a 0.086 head transient pass into a silent
+	// decode). A 0.000-peak / silent snapshot is a no-signal inter-frame pass, NOT a lost
+	// tag — return WITHOUT touching the dead-batch streak (caller's gate already required a
+	// primary-decode FAIL; this guards the benign inter-frame case). ===
+	{
+		double peak = 0;
+		for(int i = 0; i < signal_period; i += 64)
+		{
+			double v = fabs(snapshot[i]);
+			if(v > peak) peak = v;
+		}
+		if(peak < 0.05) return;   // silence -> not a lost tag; do not burn decodes / tick the streak
 	}
 
 	uint8_t bsi_lsb = (rsp_current_expected_batch_seq_id >= 0)
@@ -4064,6 +4161,23 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 		inband_nack_emitted_for_dead_streak = false;
 		printf("[INBAND-RX] DOWN-LADDER resync OK -> CONFIG_%d; BREAK avoided "
 			"(dead_batches reset)\n", winner);
+		fflush(stdout);
+		return;
+	}
+
+	// NO-REAL-ATTEMPT GUARD (data-flow-inband-downladder.md §1/§5.1/§5.2): if EVERY trial
+	// decoder's per-decoder prescan found silence, inband_down_ladder_resync made ZERO real
+	// decode attempts (inband_down_decode_attempts==0). That is a no-signal inter-frame pass,
+	// NOT a total-loss batch — it must NOT NACK and must NOT tick the terminal-BREAK streak
+	// (defect #2: ticking the streak on benign silent passes is what accumulated 3 false
+	// "total-loss" ticks into a FALSE BREAK). The window-level energy gate above already
+	// guards the common case; this is the per-decoder backstop for a window whose primary
+	// peak passed but whose every trial copy was silent (size/offset mismatch). Leave the
+	// streak untouched and return.
+	if(inband_down_decode_attempts == 0)
+	{
+		printf("[INBAND-RX] DOWN-LADDER: no trial decoder saw signal (all silent) -> "
+			"no-signal pass, NOT a total-loss (dead-batch streak unchanged)\n");
 		fflush(stdout);
 		return;
 	}
