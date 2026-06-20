@@ -554,6 +554,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_downladder();
             }
+            // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
+            // Member test on a throwaway controller (builds its own telecom_system). Fast +
+            // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_liveness();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock
@@ -754,6 +761,7 @@ int main(int argc, char *argv[])
     bool test_inband_fallback_cli = false;  // --test-inband-fallback: in-band Stage 4 — LOST-TAG DOWN-LADDER.
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_downladder_cli = false;  // --test-inband-downladder: down-ladder BREAK-orphan + silent-snapshot regression.
+    bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
     bool test_inband_nack_cli = false;  // --test-inband-nack: in-band Stage 4e — D2 NACK first-class.
@@ -1505,6 +1513,18 @@ int main(int argc, char *argv[])
             // bytes). PART B: a silent (0-peak) snapshot does NOT tick the dead-batch streak.
             // See arq_responder.cc test_inband_downladder + data-flow-inband-downladder.md.
             test_inband_downladder_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-liveness") == 0)
+        {
+            // In-band CONNECT-LIVENESS GUARD regression (one-shot at startup, exit rc).
+            // Drives the production guard into a control-plane livelock (control-TX, no
+            // forward-DATA progress) and asserts it fires the retained true-loss BREAK
+            // within the bound. fail-before: rebuild with -DINBAND_LIVENESS_FAILBEFORE (the
+            // guard tracks but never recovers -> the livelock is unbounded -> asserts FAIL).
+            // See arq_responder.cc test_inband_liveness + data-flow-inband-connect-liveness.md.
+            test_inband_liveness_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3049,6 +3069,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_downladder();
             printf("[FLAG] Inband-downladder test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_liveness_cli) {
+            // In-band CONNECT-LIVENESS GUARD regression (one-shot, exit rc). Builds its own
+            // CMD/telecom_system instances internally.
+            printf("[FLAG] --test-inband-liveness: invoking in-band connect-liveness guard "
+                   "(control-plane livelock backstop) regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_liveness();
+            printf("[FLAG] Inband-liveness test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -215,6 +215,14 @@ int cl_arq_controller::apply_bigblock_cooldown_cap(int proposed) const
 
 void cl_arq_controller::process_messages_commander()
 {
+	// In-band CONNECT-LIVENESS GUARD (data-flow-inband-connect-liveness.md §2). Once per
+	// poll, observe forward-DATA progress; if a connect/negotiate handshake is livelocked
+	// (no nAcked_data advance for N control-plane polls) fire the retained true-loss BREAK.
+	// Gated ON inband (byte-identical OFF). Skip while a BREAK is already recovering — the
+	// emergency-break state machine below owns the resync; do not stack a second BREAK.
+	if(!emergency_break_active && inband_connect_liveness_guard())
+		return;   // recovery fired; the emergency-break SM serves the next poll
+
 	// Emergency BREAK state machine: poll for ACK after sending BREAK pattern
 	if(emergency_break_active)
 	{
@@ -3024,6 +3032,136 @@ bool cl_arq_controller::inband_cmd_dead_batch_floor_reached()
 		return true;
 	}
 	return false;
+}
+
+// ============================================================================
+// In-band CONNECT-LIVENESS GUARD — the control-plane livelock backstop.
+// data-flow-inband-connect-liveness.md §2. The retained §7 true-loss BREAK is
+// wired only to a DATA-loss tick; a connect/negotiate handshake that stalls with
+// ZERO forward DATA progress (HW: link_status==CONNECTED, ~92% TRANSMITTING_CONTROL,
+// nAcked_data flat at 0) never ticks it, and link_timer is kicked by every control-ACK
+// so the 10s session drop never fires. The guard observes stats.nAcked_data (the
+// commander's monotonic forward-DATA-delivered counter) once per poll: if it makes NO
+// advance across N consecutive polls WHILE NOT in a data-bearing phase, it fires the
+// SAME true-loss send_break_pattern() recovery (BREAK->ROBUST_0, exactly how legacy
+// recovers). Bounded to INBAND_LIVENESS_MAX_BREAKS per session, then a real session reset.
+// (INBAND_LIVENESS_MAX_BREAKS is defined in arq.h so the regression test in
+// arq_responder.cc sees the SAME bound.)
+// ============================================================================
+
+int cl_arq_controller::inband_liveness_stall_polls_count()
+{
+	if(inband_liveness_stall_polls < 0)
+	{
+		int n = 200;  // owner default: ~tens of polls is a normal connect; 200 data-less
+		              // control-plane polls is unambiguously a livelock (design §2)
+		const char* e = std::getenv("MERCURY_INBAND_LIVENESS_POLLS");
+		if(e && *e) { int v = atoi(e); if(v != 0) n = v; }
+		if(n < 1) n = 1;
+		inband_liveness_stall_polls = n;
+	}
+	return inband_liveness_stall_polls;
+}
+
+bool cl_arq_controller::inband_connect_liveness_guard()
+{
+	// OFF -> never entered (byte-identical default). Guard is commander-only.
+	if(!inband_rate_feature_enabled())
+		return false;
+
+#ifdef INBAND_LIVENESS_FAILBEFORE
+	// FAIL-BEFORE arm: the guard is INERT — it only tracks the streak (so the test can
+	// observe it growing unbounded) but NEVER fires a recovery. Rebuild with
+	// -DINBAND_LIVENESS_FAILBEFORE to reproduce the livelock.
+#endif
+
+	// A data-bearing phase (actively pushing or awaiting data) is forward progress by
+	// definition for liveness purposes: hold the streak at 0 so a slow data batch can
+	// never trip the guard, and so a normal rate change (which stays in / quickly returns
+	// to the DATA phases, with nAcked_data climbing) is invisible to it.
+	bool data_phase = (connection_status == TRANSMITTING_DATA
+	                || connection_status == RECEIVING_ACKS_DATA);
+
+	// Forward-DATA-delivered advance since the last sample?
+	if(stats.nAcked_data != cmd_inband_liveness_last_acked)
+	{
+		cmd_inband_liveness_last_acked    = stats.nAcked_data;
+		cmd_inband_liveness_no_progress_polls = 0;
+		cmd_inband_liveness_breaks        = 0;   // a delivery proves liveness; rearm the bound
+		return false;
+	}
+	if(data_phase)
+	{
+		// In a data phase but nAcked_data hasn't ticked yet (mid-batch) — NOT a stall.
+		cmd_inband_liveness_no_progress_polls = 0;
+		return false;
+	}
+
+	// Control-TX / Idle / control-ACK-wait with NO forward DATA progress: accrue.
+	cmd_inband_liveness_no_progress_polls++;
+	if(cmd_inband_liveness_no_progress_polls < inband_liveness_stall_polls_count())
+		return false;
+
+	// --- Stall confirmed: the connect/negotiate handshake is livelocked. ---
+	cmd_inband_liveness_no_progress_polls = 0;   // re-arm the window for any next stall
+
+#ifdef INBAND_LIVENESS_FAILBEFORE
+	printf("[INBAND-LIVENESS] FAILBEFORE: stall detected but recovery DISABLED — livelock "
+		"persists (cmd_inband_liveness_breaks=%d)\n", cmd_inband_liveness_breaks);
+	fflush(stdout);
+	return false;   // no recovery: the livelock is reproduced (test asserts BREAK-count==0)
+#else
+	if(cmd_inband_liveness_breaks >= INBAND_LIVENESS_MAX_BREAKS)
+	{
+		// Bounded escalation: repeated liveness BREAKs did not recover the link -> it is
+		// genuinely dead. Drop the session via the SAME path the link_timer watchdog uses
+		// (reset_session_state + reset_all_timers) so the guard cannot thrash forever.
+		printf("[INBAND-LIVENESS] %d liveness BREAKs did not recover — hard session reset "
+			"(DROPPED)\n", cmd_inband_liveness_breaks);
+		fflush(stdout);
+		link_status = DROPPED;
+		reset_session_state();
+		reset_all_timers();
+		cmd_inband_liveness_breaks = 0;
+		cmd_inband_liveness_last_acked = stats.nAcked_data;
+		return true;
+	}
+
+	cmd_inband_liveness_breaks++;
+	printf("[INBAND-LIVENESS] no forward-DATA progress for %d control-plane polls "
+		"(nAcked_data=%d, connection_status=%d, link=%d) — connect/negotiate LIVELOCK; "
+		"firing the retained true-loss BREAK (#%d/%d) to resync\n",
+		inband_liveness_stall_polls_count(), stats.nAcked_data,
+		(int)connection_status, (int)link_status,
+		cmd_inband_liveness_breaks, INBAND_LIVENESS_MAX_BREAKS);
+	fflush(stdout);
+
+	// Fire the SAME §7 true-loss BREAK recovery (arq_commander.cc:4665-4678): BREAK ->
+	// ROBUST_0 resync via the emergency-break state machine. Cancel any stale control slot
+	// first (it owns nothing the resync needs).
+	messages_control.ack_timeout = 0;
+	messages_control.id          = 0;
+	messages_control.length      = 0;
+	messages_control.nResends    = 0;
+	messages_control.status      = FREE;
+	messages_control.type        = NONE;
+
+	emergency_previous_config = current_configuration;
+	emergency_break_active     = 1;
+	emergency_break_retries    = 3;
+	// Axis-1 supremacy re-asserts the config on the wire for the resync (it may queue a
+	// FRESH SET_LINK_PARAMS via axis3 — that is the recovery's new control op, NOT the
+	// stale handshake we just cancelled above).
+	if(sack_v2_enabled)
+		policy_axis1_supremacy_on_move(current_configuration,
+			current_configuration, "inband_connect_liveness_stall");
+	send_break_pattern();
+	if(telecom_system != NULL)
+		telecom_system->data_container.frames_to_read = 4;
+	calculate_receiving_timeout();
+	receiving_timer.start();
+	return true;   // recovery fired; caller returns (the emergency-break SM owns next poll)
+#endif
 }
 
 void cl_arq_controller::process_messages_rx_acks_data()

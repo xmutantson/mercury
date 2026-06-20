@@ -5605,6 +5605,217 @@ int cl_arq_controller::test_inband_no_break()
 }
 
 // ============================================================================
+// In-band CONNECT-LIVENESS GUARD regression — --test-inband-liveness
+// data-flow-inband-connect-liveness.md §4.
+// ============================================================================
+//
+// Drives the PRODUCTION guard (inband_connect_liveness_guard) directly. The guard fires
+// the SAME §7 true-loss send_break_pattern() recovery on a control-plane livelock (no
+// forward-DATA progress for N control-plane polls). To exercise the DECISION + BOUND
+// without the real PHY BREAK (which needs an audio pipeline a synthetic CMD lacks), the
+// guard's send_break_pattern() is no-op'd via passive_monitor=true; the emergency-break
+// state the guard sets BEFORE that call (emergency_break_active, the cmd_inband_liveness_*
+// fields) is the observable. A tiny env override (MERCURY_INBAND_LIVENESS_POLLS) shrinks
+// the threshold so the directed loop is fast.
+//
+//   PART A — STALL FIRES: in control-TX with nAcked_data flat, the guard accrues the
+//     no-progress streak and fires a BREAK at EXACTLY the threshold (not before).
+//   PART B — DATA RESETS: a data delivery (nAcked_data advance) resets the streak +
+//     re-arms the bound, so the guard does NOT false-fire during data flow.
+//   PART C — BOUNDED: after INBAND_LIVENESS_MAX_BREAKS unrecovered stalls the guard
+//     escalates to a hard session reset (DROPPED) instead of thrashing forever.
+//   PART D — BYTE-IDENTICAL OFF: with the feature OFF the guard is INERT (returns false,
+//     touches nothing).
+//
+// fail-before (-DINBAND_LIVENESS_FAILBEFORE): the guard tracks the streak but NEVER fires
+// a recovery -> PART A/C assertions FAIL (the livelock is unbounded). Returns 0=PASS,1=FAIL.
+int cl_arq_controller::test_inband_liveness()
+{
+	const char* TAG = "[TEST-INBAND-LIVENESS]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Save + restore the env knobs we mutate. ---
+	const char* prev_ir = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_ir_s = prev_ir ? std::string(prev_ir) : std::string();
+	bool had_ir = (prev_ir != NULL);
+	const char* prev_lp = std::getenv("MERCURY_INBAND_LIVENESS_POLLS");
+	std::string prev_lp_s = prev_lp ? std::string(prev_lp) : std::string();
+	bool had_lp = (prev_lp != NULL);
+	auto putenv_kv = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	auto restore_env = [&](){
+		putenv_kv("MERCURY_INBAND_RATE",            had_ir ? prev_ir_s.c_str() : "");
+		putenv_kv("MERCURY_INBAND_LIVENESS_POLLS",  had_lp ? prev_lp_s.c_str() : "");
+	};
+
+	const int STALL_N = 5;   // shrink the threshold so the directed loop is fast
+
+	auto make_cmd = [&](bool inband_on, cl_telecom_system** out_ts) -> cl_arq_controller* {
+		putenv_kv("MERCURY_INBAND_RATE", inband_on ? "1" : "");
+		char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%d", STALL_N);
+		putenv_kv("MERCURY_INBAND_LIVENESS_POLLS", nbuf);
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* cmd = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE;
+		cmd->telecom_system = ts;
+		cmd->narrowband_enabled = NO;
+		cmd->role = COMMANDER;
+		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;
+		cmd->load_configuration(CONFIG_10, FULL, NO);
+		cmd->link_status = CONNECTED;
+		// The livelock signature: stuck in control-TX with NO forward DATA.
+		cmd->connection_status = TRANSMITTING_CONTROL;
+		cmd->sack_v2_enabled = true;
+		cmd->gear_shift_on = YES;
+		cmd->robust_enabled = NO;
+		cmd->inband_rate_enabled = inband_on ? 1 : 0;
+		cmd->inband_liveness_stall_polls = -1;       // force env re-resolve
+		cmd->send_break_pattern_count = 0;
+		// No-op the real PHY BREAK so the guard's DECISION is observed without an audio
+		// pipeline (the emergency-break state is still set by the guard before the call).
+		cmd->passive_monitor = true;
+		*out_ts = ts;
+		return cmd;
+	};
+
+	// ========================================================================
+	// PART A — a control-plane STALL fires a BREAK at EXACTLY the threshold
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		check(cmd->inband_liveness_stall_polls_count() == STALL_N,
+			"A0 threshold resolves from env", cmd->inband_liveness_stall_polls_count(), STALL_N);
+
+		// Model the livelocked handshake: a STALE control message wedged PENDING_ACK with a
+		// distinctive id. The guard must cancel THIS stale slot as part of recovery.
+		const int STALE_ID = 0x5A;
+		cmd->messages_control.status = PENDING_ACK;
+		cmd->messages_control.id     = STALE_ID;
+
+		int fired_at = -1;
+		for(int p = 1; p <= STALL_N + 2; p++)
+		{
+			bool fired = cmd->inband_connect_liveness_guard();   // stats.nAcked_data held flat
+			if(fired) { fired_at = p; break; }
+		}
+		// PASS-AFTER: the guard fires within the bound, at exactly N. FAIL-BEFORE: never.
+		check(fired_at == STALL_N, "A1 the liveness guard fires at EXACTLY the threshold",
+			fired_at, STALL_N);
+		check(cmd->emergency_break_active == 1,
+			"A2 the recovery armed the emergency-break state machine (BREAK->ROBUST_0)",
+			cmd->emergency_break_active, 1);
+		check(cmd->cmd_inband_liveness_breaks == 1,
+			"A3 exactly ONE liveness BREAK fired (bound counter)", cmd->cmd_inband_liveness_breaks, 1);
+		// The stale PENDING_ACK handshake (id=STALE_ID) was cancelled (the guard freed it;
+		// the recovery may re-queue a FRESH control op, but the OLD wedged slot is gone —
+		// no orphaned handshake spins forever).
+		bool stale_gone = !(cmd->messages_control.status == PENDING_ACK
+		                 && cmd->messages_control.id == STALE_ID);
+		check(stale_gone,
+			"A4 the stale PENDING_ACK handshake was cancelled (no orphaned spin)",
+			stale_gone ? 1 : 0, 1);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART B — a DATA delivery resets the streak (no false-fire during data flow)
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		// Accrue right up to (but not past) the threshold...
+		for(int p = 1; p < STALL_N; p++) cmd->inband_connect_liveness_guard();
+		check(cmd->cmd_inband_liveness_no_progress_polls == STALL_N - 1,
+			"B0 streak accrued to N-1 (one short of firing)",
+			cmd->cmd_inband_liveness_no_progress_polls, STALL_N - 1);
+		// ...then a data delivery advances nAcked_data: the next poll resets the streak.
+		cmd->stats.nAcked_data += 1;
+		bool fired = cmd->inband_connect_liveness_guard();
+		check(!fired, "B1 no BREAK after a data delivery (streak reset, not fired)", fired ? 1 : 0, 0);
+		check(cmd->cmd_inband_liveness_no_progress_polls == 0,
+			"B2 the no-progress streak reset to 0 on the data advance",
+			cmd->cmd_inband_liveness_no_progress_polls, 0);
+		// And being in a DATA phase holds the streak at 0 even with nAcked_data flat.
+		cmd->connection_status = TRANSMITTING_DATA;
+		for(int p = 0; p < STALL_N + 2; p++) cmd->inband_connect_liveness_guard();
+		check(cmd->cmd_inband_liveness_no_progress_polls == 0,
+			"B3 a data-bearing phase never trips the guard (mid-batch is not a stall)",
+			cmd->cmd_inband_liveness_no_progress_polls, 0);
+		check(cmd->emergency_break_active == 0, "B4 no BREAK fired during data flow",
+			cmd->emergency_break_active, 0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART C — BOUNDED: repeated unrecovered stalls escalate to a hard reset
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		int breaks = 0, dropped_at = -1;
+		// Each episode: clear the in-flight BREAK (model "BREAK did not recover") and run
+		// the guard through another N data-less polls; count fires until the hard reset.
+		for(int episode = 1; episode <= 6 && dropped_at < 0; episode++)
+		{
+			cmd->emergency_break_active = 0;   // model: prior BREAK did not recover the link
+			cmd->link_status = CONNECTED;
+			cmd->connection_status = TRANSMITTING_CONTROL;
+			bool fired = false;
+			for(int p = 1; p <= STALL_N; p++)
+				if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+			if(fired)
+			{
+				if(cmd->link_status == DROPPED) dropped_at = episode;
+				else                            breaks++;
+			}
+		}
+		check(breaks == INBAND_LIVENESS_MAX_BREAKS,
+			"C0 exactly MAX_BREAKS liveness BREAKs before the hard reset",
+			breaks, INBAND_LIVENESS_MAX_BREAKS);
+		check(dropped_at == INBAND_LIVENESS_MAX_BREAKS + 1,
+			"C1 the (MAX_BREAKS+1)th stall escalates to a hard session reset (DROPPED)",
+			dropped_at, INBAND_LIVENESS_MAX_BREAKS + 1);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART D — BYTE-IDENTICAL OFF: the guard is inert when the feature is OFF
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/false, &ts);
+		bool fired = false;
+		for(int p = 1; p <= STALL_N + 4; p++)
+			if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+		check(!cmd->inband_rate_feature_enabled(),
+			"D0 feature resolves OFF", cmd->inband_rate_feature_enabled() ? 1 : 0, 0);
+		check(!fired, "D1 OFF: the guard never fires (legacy byte-identical)", fired ? 1 : 0, 0);
+		check(cmd->cmd_inband_liveness_no_progress_polls == 0,
+			"D2 OFF: the guard does not even accrue the streak",
+			cmd->cmd_inband_liveness_no_progress_polls, 0);
+		check(cmd->emergency_break_active == 0, "D3 OFF: no BREAK state touched",
+			cmd->emergency_break_active, 0);
+		delete cmd; delete ts;
+	}
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band rate adaptation — STAGE 4d: D1 repeat-until-followed + D4 climb/auto-demote
 // ============================================================================
 //

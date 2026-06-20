@@ -3399,6 +3399,30 @@ public:
   // genuine send_break_pattern() should fire.
   int  cmd_inband_session_dead_batches = 0;
   bool inband_cmd_dead_batch_floor_reached();
+  // ---- In-band CONNECT-LIVENESS GUARD (data-flow-inband-connect-liveness.md) ----
+  // The retained true-loss BREAK is wired only to a DATA-loss tick
+  // (inband_cmd_dead_batch_floor_reached). A connect/negotiate handshake that stalls
+  // with ZERO forward DATA progress (the HW livelock: link_status==CONNECTED, ~92% of
+  // polls in TRANSMITTING_CONTROL, nAcked_data flat at 0) never ticks that floor, and
+  // link_timer is kicked by every control-ACK so the 10s session drop never fires.
+  // The guard is the BACKSTOP: when stats.nAcked_data makes NO advance across N
+  // consecutive polls WHILE NOT in a data-bearing phase, it fires the SAME §7 true-loss
+  // send_break_pattern() recovery (BREAK->ROBUST_0 resync, exactly how legacy recovers).
+  // cmd_inband_liveness_last_acked: snapshot of stats.nAcked_data at the last advance.
+  // cmd_inband_liveness_no_progress_polls: consecutive no-data-progress control polls.
+  // cmd_inband_liveness_breaks: liveness-BREAKs fired this session (bounded). All three
+  // init 0 (ctor + reset_session_state) and reset on any data delivery.
+  int  cmd_inband_liveness_last_acked = 0;
+  int  cmd_inband_liveness_no_progress_polls = 0;
+  int  cmd_inband_liveness_breaks = 0;
+  int  inband_liveness_stall_polls = -1;   // unresolved; cached from env on first use
+  // liveness-BREAKs per session before a hard session reset (shared by the guard +
+  // its regression test in arq_responder.cc).
+  #define INBAND_LIVENESS_MAX_BREAKS 3
+  int  inband_liveness_stall_polls_count();   // MERCURY_INBAND_LIVENESS_POLLS, default 200
+  bool inband_connect_liveness_guard();       // once-per-poll commander watchdog (gated ON);
+                                              // returns true if it fired a recovery (caller returns)
+  int  test_inband_liveness();                // --test-inband-liveness regression
   // Diagnostic / test instrument: total send_break_pattern() invocations on this
   // controller (incremented at the top of send_break_pattern). The
   // --test-inband-no-break harness reads it to assert BREAK-count==0 on a degradation

@@ -5776,6 +5776,14 @@ void cl_arq_controller::reset_session_state()
 	// STAGE 4c: the commander-side true-session-loss floor — a fresh session is never
 	// one batch from the BREAK floor (mirrors the RX-side reset above + the ctor init).
 	cmd_inband_session_dead_batches = 0;
+	// CONNECT-LIVENESS GUARD (data-flow-inband-connect-liveness.md §2/§3): a fresh session
+	// has delivered nothing and is not stalled — clear the no-progress streak, the last-
+	// delivered snapshot, and the per-session liveness-BREAK bound (mirrors the ctor init).
+	// The env-keyed threshold cache (inband_liveness_stall_polls) is NOT reset (resolved
+	// once + cached, same discipline as inband_dead_batches_limit).
+	cmd_inband_liveness_last_acked = 0;
+	cmd_inband_liveness_no_progress_polls = 0;
+	cmd_inband_liveness_breaks = 0;
 	// STAGE 4d: a fresh session has nothing announced, so the D1 re-tag is disarmed and
 	// nothing is confirmed (mirrors the ctor init). The R floor cache (inband_retag_min)
 	// is env-keyed not session-keyed, so it is NOT reset here (resolved once + cached).
